@@ -96,11 +96,20 @@ def test_validate_D3_magnetic_missing_magmom_completed(mini_lib):
     assert len(warns) == 1
 
 
-def test_validate_D3prime_counts_missing_no_magmom(mini_lib):
+def test_validate_D3prime_counts_missing_no_magmom_but_ispin(mini_lib):
+    # 含磁但 counts 缺失:无法补 MAGMOM,但仍补 ISPIN=2 保自旋极化(审轮3 P1-2)
     comp, warns = ib.validate_and_complete_incar(
         {'ENCUT': 400}, ['Fe', 'C'], [], lib_root=mini_lib)
     assert 'MAGMOM' not in comp
+    assert comp.get('ISPIN') == 2
     assert len(warns) == 1
+
+
+def test_incar_dict_to_str_no_duplicate_system():
+    # 同时有 SYSTEM 键与 system_name 参数 → 只输出一行 SYSTEM(审轮3 P3-1)
+    txt = ib.incar_dict_to_str({'SYSTEM': 'a', 'ENCUT': 400}, 'b')
+    assert txt.count('SYSTEM = ') == 1
+    assert 'SYSTEM = b' in txt
 
 
 def test_validate_D4_user_ispin1_respected(mini_lib):

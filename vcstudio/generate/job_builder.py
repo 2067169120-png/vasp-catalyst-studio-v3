@@ -85,6 +85,8 @@ def build_job_dir(poscar_path, incar, out_dir, *,
     if 'ENCUT' in incar_dict:
         raw_encut = incar_dict['ENCUT']
         try:
+            if isinstance(raw_encut, bool):   # .TRUE./.FALSE. 被 parse 成 bool,非合法 ENCUT
+                raise ValueError
             encut = int(float(raw_encut))
         except (TypeError, ValueError):
             raise ValueError(

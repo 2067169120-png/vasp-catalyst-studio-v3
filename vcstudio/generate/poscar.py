@@ -72,8 +72,11 @@ def read_cell_vectors(content: str) -> list[list[float]]:
 
     if scale == 0:
         raise ValueError('POSCAR 缩放因子为 0(无物理意义)')
-    factor = scale if scale > 0 else 1.0  # 负 scale=目标体积;TODO(M1) 按 det 反解,暂 factor=1.0
-    return [[c * factor for c in v] for v in raw]
+    if scale < 0:
+        # 负 scale = 目标体积(VASP 语义)。M1 暂不支持;绝不静默生成错误晶格,显式报错。
+        raise NotImplementedError(
+            'POSCAR 负缩放因子(=目标体积)暂不支持;请提供正缩放因子的 POSCAR(TODO: 按 det 反解)')
+    return [[c * scale for c in v] for v in raw]
 
 
 def read_poscar(path: str | os.PathLike) -> str:

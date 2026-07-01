@@ -56,8 +56,8 @@ def incar_dict_to_str(incar: dict, system_name: str = '') -> str:
     if name:
         lines.append(f'SYSTEM = {name}')
     for key, val in incar.items():
-        if key.startswith('_'):
-            continue
+        if key.startswith('_') or (name and key.upper() == 'SYSTEM'):
+            continue  # name 已写 SYSTEM 头 → 跳过 dict 里的 SYSTEM 键,避免重复行
         if isinstance(val, bool):
             val = '.TRUE.' if val else '.FALSE.'
         lines.append(f'{key} = {val}')
@@ -193,9 +193,13 @@ def validate_and_complete_incar(incar_dict, elements, counts,
                     f'(每磁性原子 {DEFAULT_MAGMOM}μB)并设 ISPIN=2;顺序须与 POSCAR '
                     f'物种一致,可自行覆盖。')
             else:
-                # D3':含磁但 counts 缺失/畸形 → 无法生成 MAGMOM,只 warn
+                # D3':含磁但 counts 缺失/畸形 → 无法生成 MAGMOM,但仍补 ISPIN=2 保自旋极化
+                # (否则 VASP 默认 ISPIN=1 跑成非磁,静默错磁态)。
+                if 'ISPIN' not in present:
+                    completions['ISPIN'] = 2
                 warnings.append(
                     f'体系含磁性元素 {mags} 但 POSCAR 未提供可用 counts(VASP4/畸形),'
-                    f'无法生成 MAGMOM;VASP 将默认磁矩,可能收敛到错误磁态。')
+                    f'无法生成 MAGMOM;已设 ISPIN=2 保证自旋极化,VASP 将用默认磁矩'
+                    f'(可能非最优),建议提供 counts 以写入正确 MAGMOM。')
         # else:用户已带 MAGMOM → 完全不动(不重复补)
     return completions, warnings

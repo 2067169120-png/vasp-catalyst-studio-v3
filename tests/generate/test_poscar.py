@@ -100,11 +100,10 @@ def test_cell_vectors_zero_scale_raises():
         poscar.read_cell_vectors('t\n0.0\n2 0 0\n0 2 0\n0 0 2\nFe\n1\n')
 
 
-@pytest.mark.xfail(reason='负 scale=目标体积 未实现;M1 用 factor=1.0 占位', strict=True)
-def test_cell_vectors_negative_scale_is_target_volume():
-    assert poscar.read_cell_vectors(VASP_NEGSCALE) == [[4.0, 0.0, 0.0],
-                                                       [0.0, 4.0, 0.0],
-                                                       [0.0, 0.0, 4.0]]
+def test_cell_vectors_negative_scale_raises():
+    # 负 scale=目标体积,M1 暂不支持 → 显式 raise(不静默生成错误晶格,审轮3 P1-1)
+    with pytest.raises(NotImplementedError):
+        poscar.read_cell_vectors(VASP_NEGSCALE)
 
 
 # ── read_poscar ──────────────────────────────────────────────────────────────

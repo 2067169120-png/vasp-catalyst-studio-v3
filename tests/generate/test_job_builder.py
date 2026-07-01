@@ -149,6 +149,14 @@ def test_validate_false_without_encut_ok(tmp_path, mini_lib):
     assert 'ENCUT' not in (out / 'INCAR').read_text(encoding='utf-8')
 
 
+def test_bool_encut_clear_error(tmp_path, mini_lib):
+    # ENCUT = .TRUE. 被 parse 成 bool → 清晰 ValueError,而非静默转 1(审轮3 P2-1)
+    pos = _write_poscar(tmp_path, POSCAR_CN)
+    with pytest.raises(ValueError, match='ENCUT'):
+        job_builder.build_job_dir(pos, 'ENCUT = .TRUE.\n', str(tmp_path / 'j'),
+                                  lib_root=mini_lib)
+
+
 def test_idempotent_rerun(tmp_path, mini_lib):
     pos = _write_poscar(tmp_path, POSCAR_FEC)
     out = tmp_path / 'job1'
