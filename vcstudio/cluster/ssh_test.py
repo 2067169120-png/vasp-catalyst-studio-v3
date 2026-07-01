@@ -73,7 +73,8 @@ def check_connection(profile, password: str | None = None, *,
             connect_kwargs['password'] = password
 
         if profile.use_jump and profile.jump_host:
-            connect_kwargs['sock'] = _open_jump_channel(profile, password, factory)
+            connect_kwargs['sock'] = _open_jump_channel(
+                profile, password, factory, trust_new=trust_new, known_hosts_path=kh)
 
         try:
             client.connect(**connect_kwargs)
@@ -83,7 +84,7 @@ def check_connection(profile, password: str | None = None, *,
             # 未知主机指纹或 SSH 协议层错误 → 请界面确认信任
             return ConnectionResult(ok=False, needs_trust=not trust_new,
                               message=f'无法确认主机指纹或 SSH 错误:{e};确认后可信任重试')
-        except (OSError, Exception) as e:  # 网络不可达等
+        except (OSError, EOFError) as e:  # 网络不可达/超时等
             return ConnectionResult(ok=False, message=f'连接失败:{e}')
 
         _in, out, _err = client.exec_command('whoami')
@@ -106,10 +107,26 @@ def check_connection(profile, password: str | None = None, *,
             pass
 
 
-def _open_jump_channel(profile, password, factory):
-    """经跳板机开 direct-tcpip 通道,作为目标连接的 sock。"""
+def _open_jump_channel(profile, password, factory, *,
+                       trust_new: bool = False,
+                       known_hosts_path: str | os.PathLike | None = None):
+    """经跳板机开 direct-tcpip 通道,作为目标连接的 sock。
+
+    跳板机(bastion)同样按 trust_new 门控主机指纹:未知指纹默认拒绝(防 MITM),
+    与主连接路径一致,不因经跳板机而放宽。
+    """
     jump = factory()
-    jump.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        jump.load_system_host_keys()
+    except Exception:
+        pass
+    if known_hosts_path is not None and Path(known_hosts_path).is_file():
+        try:
+            jump.load_host_keys(str(known_hosts_path))
+        except Exception:
+            pass
+    jump.set_missing_host_key_policy(
+        paramiko.AutoAddPolicy() if trust_new else paramiko.RejectPolicy())
     jkwargs = dict(hostname=profile.jump_host, port=int(profile.jump_port),
                    username=profile.jump_user or profile.username, timeout=15,
                    allow_agent=False, look_for_keys=False)
