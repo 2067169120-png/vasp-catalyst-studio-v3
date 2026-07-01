@@ -7,12 +7,13 @@ INCAR 处理遵循决策1:**原文透传 + 追加补全**——用户 INCAR 一�
 """
 from __future__ import annotations
 
+import math
 import os
 import shutil
 from collections import OrderedDict
 
 from vcstudio.generate.poscar import read_poscar, parse_poscar_species, read_cell_vectors
-from vcstudio.generate.potcar import build_potcar
+from vcstudio.generate.potcar import build_potcar, max_enmax
 from vcstudio.generate.kpoints import recommend_kpoints, kpoints_str
 from vcstudio.generate.incar_builder import (
     parse_incar, validate_and_complete_incar, incar_dict_to_str,
@@ -79,12 +80,20 @@ def build_job_dir(poscar_path, incar, out_dir, *,
         completions, warnings = validate_and_complete_incar(
             incar_dict, elements, counts, lib_root)
 
-    raw_encut = completions.get('ENCUT') or incar_dict.get('ENCUT') or 400
-    try:
-        encut = int(float(raw_encut))
-    except (TypeError, ValueError):
-        raise ValueError(
-            f'INCAR 的 ENCUT 非数字: {raw_encut!r};请提供数值(如 ENCUT = 500)。')
+    # ENCUT(仅供 POTCAR 的 ENMAX≤ENCUT 检查;从不写入 INCAR)。用成员判断避免把
+    # 用户 ENCUT=0 等假值吞掉;三种来源互斥:用户显式 > 校验补全 > (无则)VASP 默认 max ENMAX。
+    if 'ENCUT' in incar_dict:
+        raw_encut = incar_dict['ENCUT']
+        try:
+            encut = int(float(raw_encut))
+        except (TypeError, ValueError):
+            raise ValueError(
+                f'INCAR 的 ENCUT 非数字: {raw_encut!r};请提供数值(如 ENCUT = 500)。')
+    elif 'ENCUT' in completions:
+        encut = int(completions['ENCUT'])
+    else:
+        # validate=False 且用户未写 ENCUT:VASP 默认取 max ENMAX,用它检查即等价放行
+        encut = int(math.ceil(max_enmax(elements, lib_root)))
 
     potcar_text = build_potcar(elements, encut=encut, lib_root=lib_root)
 

@@ -131,6 +131,24 @@ def test_nonnumeric_encut_clear_error(tmp_path, mini_lib):
                                   lib_root=mini_lib)
 
 
+def test_encut_zero_not_swallowed(tmp_path, mini_lib):
+    # 用户 ENCUT=0 不被 or 链吞成 400 → 原样用于 ENMAX 检查 → PotcarError(审轮2 P1)
+    pos = _write_poscar(tmp_path, POSCAR_CN)
+    with pytest.raises(PotcarError):
+        job_builder.build_job_dir(pos, {'ENCUT': 0}, str(tmp_path / 'j'),
+                                  validate=False, lib_root=mini_lib)
+
+
+def test_validate_false_without_encut_ok(tmp_path, mini_lib):
+    # validate=False 且无 ENCUT:按 VASP 语义(默认 max ENMAX)放行,不注入 ENCUT 到 INCAR
+    pos = _write_poscar(tmp_path, POSCAR_CN)
+    out = tmp_path / 'j'
+    res = job_builder.build_job_dir(pos, 'IBRION = 2\n', str(out),
+                                    validate=False, lib_root=mini_lib)
+    assert res['ok'] is True
+    assert 'ENCUT' not in (out / 'INCAR').read_text(encoding='utf-8')
+
+
 def test_idempotent_rerun(tmp_path, mini_lib):
     pos = _write_poscar(tmp_path, POSCAR_FEC)
     out = tmp_path / 'job1'
