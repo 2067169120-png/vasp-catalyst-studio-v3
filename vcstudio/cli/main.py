@@ -48,6 +48,11 @@ def cmd_gen(args) -> int:
     return 0
 
 
+def cmd_gui(args) -> int:
+    from vcstudio.gui.app import main as gui_main
+    return gui_main()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog='vcs', description='VASP Catalyst Studio — 轻量化 DFT 自动化')
@@ -64,6 +69,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help='关闭 INCAR 校验补全(原文照抄,不追加)')
     g.add_argument('--lib-root', default=None, help='POTCAR 库根(覆盖 config)')
     g.set_defaults(func=cmd_gen)
+
+    gui_p = sub.add_parser('gui', help='打开图形界面(生成 + 集群配置)')
+    gui_p.set_defaults(func=cmd_gui)
     return parser
 
 
