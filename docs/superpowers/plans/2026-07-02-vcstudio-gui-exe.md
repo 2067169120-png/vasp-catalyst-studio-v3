@@ -1697,53 +1697,26 @@ git commit -m "feat(gui): app 入口 — Notebook 两页;python -m vcstudio.gui 
 
 ---
 
-### Task 12: 打包(PyInstaller spec + 构建脚本)+ gitignore + 删残留
+### Task 12: 打包(PyInstaller 单文件 CLI)+ gitignore + 删残留
 
 **Files:**
-- Create: `packaging/vcstudio.spec`
 - Create: `packaging/build_exe.py`
 - Modify: `.gitignore`
-- Delete(磁盘): `_internal/`(312MB 残留,未跟踪)
+- Delete(磁盘,需用户明确同意): `_internal/`(312MB 残留,未跟踪)
 
 **Interfaces:**
-- Produces: `dist/VASP Catalyst Studio.exe`(单文件)。
+- Produces: `dist/VASP Catalyst Studio.exe`(仓库根 `dist/` 下单文件;实测 ~19MB)。
 
-- [ ] **Step 1: 创建 `packaging/vcstudio.spec`**
+> **不手写 `.spec`**:PyInstaller 6.x 的 `EXE(onefile=True)` 并非合法参数、spec 语法版本脆弱。改用稳定 CLI flags(`--onefile --windowed`),`--collect-submodules keyring.backends` 收全动态后端,产物/工作目录落仓库根 `dist/`、`build/`(现有 gitignore 已忽略)。
 
-```python
-# -*- mode: python ; coding: utf-8 -*-
-# PyInstaller 配方:单文件、无控制台窗口。排除无关重包以瘦身。
-from PyInstaller.utils.hooks import collect_submodules
-
-hiddenimports = collect_submodules('keyring.backends')
-
-a = Analysis(
-    ['../vcstudio/gui/__main__.py'],
-    pathex=['..'],
-    binaries=[],
-    datas=[],
-    hiddenimports=hiddenimports + ['paramiko'],
-    excludes=['numpy', 'sklearn', 'scipy', 'PIL', 'matplotlib',
-              'pandas', 'pytest', 'tkinter.test'],
-    noarchive=False,
-)
-pyz = PYZ(a.pure)
-
-exe = EXE(
-    pyz, a.scripts, a.binaries, a.datas, [],
-    name='VASP Catalyst Studio',
-    console=False,          # --windowed
-    onefile=True,
-    disable_windowed_traceback=False,
-)
-```
-
-- [ ] **Step 2: 创建 `packaging/build_exe.py`**
+- [ ] **Step 1: 创建 `packaging/build_exe.py`**
 
 ```python
-"""一键打包:调 PyInstaller 用 vcstudio.spec 出单文件 EXE 到 dist/。
+"""一键打包:PyInstaller 出单文件、无控制台窗口的 EXE 到 <repo>/dist/。
 
 用法:python packaging/build_exe.py
+不手写 .spec(版本脆弱),用稳定 CLI flags;产物/工作目录落仓库根,
+与 .gitignore 的 build/ dist/ 对齐。keyring 后端动态加载,用 --collect-submodules 收全。
 中文注释允许,英文标识符。
 """
 from __future__ import annotations
@@ -1753,27 +1726,37 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SPEC = os.path.join(HERE, 'vcstudio.spec')
+ROOT = os.path.dirname(HERE)
+ENTRY = os.path.join(ROOT, 'vcstudio', 'gui', '__main__.py')
+
+EXCLUDES = ['numpy', 'sklearn', 'scipy', 'PIL', 'matplotlib', 'pandas', 'pytest']
 
 
 def main() -> int:
-    cmd = [sys.executable, '-m', 'PyInstaller', '--clean', '--noconfirm', SPEC]
+    cmd = [sys.executable, '-m', 'PyInstaller',
+           '--onefile', '--windowed', '--clean', '--noconfirm',
+           '--name', 'VASP Catalyst Studio',
+           '--collect-submodules', 'keyring.backends',
+           '--paths', ROOT,
+           '--distpath', os.path.join(ROOT, 'dist'),
+           '--workpath', os.path.join(ROOT, 'build'),
+           '--specpath', os.path.join(ROOT, 'build')]
+    for m in EXCLUDES:
+        cmd += ['--exclude-module', m]
+    cmd.append(ENTRY)
     print('运行:', ' '.join(cmd))
-    return subprocess.call(cmd, cwd=HERE)
+    return subprocess.call(cmd, cwd=ROOT)
 
 
 if __name__ == '__main__':
     raise SystemExit(main())
 ```
 
-- [ ] **Step 3: 更新 `.gitignore`(在文件末尾追加)**
+- [ ] **Step 2: 更新 `.gitignore`(追加;`build/`、`dist/` 现有已忽略)**
 
 ```gitignore
-# 打包产物 / 残留
+# PyInstaller 旧残留
 _internal/
-/build/
-/dist/
-*.spec.bak
 
 # 用户本地敏感/机器相关配置(绝不入 git)
 clusters.yaml
@@ -1781,22 +1764,22 @@ known_hosts
 /config.local.yaml
 ```
 
-- [ ] **Step 4: 删掉 312MB 残留 `_internal/`**
-
-Run: `rm -rf _internal`
-Expected: 目录消失(它是未跟踪的旧 PyInstaller 产物,已被上一步 gitignore 覆盖)。
-> ⚠️ 执行前口头向用户确认一次(见 Global Constraints:不静默删除)。
-
-- [ ] **Step 5: 打包出 EXE**
+- [ ] **Step 3: 打包出 EXE**
 
 Run: `python packaging/build_exe.py`
-Expected: 结束后存在 `packaging/dist/VASP Catalyst Studio.exe`(onefile 模式产物在 spec 所在目录的 `dist/`)。
+Expected: 成功后存在 `dist/VASP Catalyst Studio.exe`。若报缺失隐藏导入,加 `--hidden-import <名>` 再试并记录最终命令。
 
-- [ ] **Step 6: Commit(spec + 脚本 + gitignore;dist/ 不入 git)**
+- [ ] **Step 4: 删掉 312MB 残留 `_internal/`(需先获用户明确同意)**
+
+Run: `rm -rf _internal`
+Expected: 目录消失(未跟踪的旧 PyInstaller 产物,已被 gitignore 覆盖)。
+> ⚠️ 破坏性、不可逆:执行前必须获得用户明确同意(见 Global Constraints)。
+
+- [ ] **Step 5: Commit(脚本 + gitignore;dist/ build/ 不入 git)**
 
 ```bash
-git add packaging/vcstudio.spec packaging/build_exe.py .gitignore
-git commit -m "build(gui): PyInstaller 单文件配方 + 构建脚本;gitignore 残留/产物/敏感配置"
+git add packaging/build_exe.py .gitignore
+git commit -m "build(gui): PyInstaller 单文件构建脚本(CLI flags)+ gitignore 残留/敏感配置"
 ```
 
 ---
@@ -1809,12 +1792,12 @@ REQUIRED SUB-SKILL 提示:本任务用 `superpowers:verification-before-completi
 
 - [ ] **Step 1: 确认残留已清、产物已出**
 
-Run: `ls "packaging/dist/" && test ! -d _internal && echo "_internal 已删"`
+Run: `ls "dist/" && test ! -d _internal && echo "_internal 已删"`
 Expected: 列出 `VASP Catalyst Studio.exe`;打印 `_internal 已删`。
 
 - [ ] **Step 2: 双击 EXE,验「生成」页(用冒烟测试那套真实输入)**
 
-手动:双击 `packaging/dist/VASP Catalyst Studio.exe`。
+手动:双击 `dist/VASP Catalyst Studio.exe`。
 - 赝势库设为 `E:/V2.0.0/results/inputs/potpaw54/potpaw54/potpaw54/potpaw_PBE/paw_pbe`;关掉再开,确认被记住。
 - 3 个正向:①molecule + `molecule_Li2S.vasp`+`mol_Li2S/INCAR`;②bulk + `Fe.vasp`+极简 INCAR;③slab + `Pt_surface_001_ads_top.vasp`。各点[一键生成]→日志出「已生成/元素/KPOINTS/警告」,输出目录含 INCAR/POTCAR/KPOINTS/POSCAR 四件套;点[打开输出文件夹]能在资源管理器打开。
 - 2 个负向:①INCAR 里 ENCUT=100 → 日志红字「ENMAX 超过 ENCUT」;②含 H/O 的 POSCAR → 「元素未登记」。界面不崩、不弹 traceback。
