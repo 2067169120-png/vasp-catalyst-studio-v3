@@ -620,9 +620,9 @@ git commit -m "feat(cluster): ClusterProfile 模型 + clusters.yaml 读写(模�
 **Interfaces:**
 - Consumes: `ClusterProfile`。
 - Produces:
-  - `TestResult`(dataclass:`ok:bool, whoami:str='', scheduler:str='', message:str='', needs_trust:bool=False`)
+  - `ConnectionResult`(dataclass:`ok:bool, whoami:str='', scheduler:str='', message:str='', needs_trust:bool=False`)
   - `default_known_hosts_path() -> Path`
-  - `test_connection(profile, password=None, *, trust_new=False, known_hosts_path=None, client_factory=None) -> TestResult`
+  - `check_connection(profile, password=None, *, trust_new=False, known_hosts_path=None, client_factory=None) -> ConnectionResult`
 - 说明:`client_factory` 缺省用 `paramiko.SSHClient`,测试注入假客户端。`command -v sbatch qsub bsub` 探测调度器。跳板机用 direct-tcpip 通道作 `sock`。
 
 - [ ] **Step 1: 写失败测试 `tests/test_ssh_test.py`**
@@ -631,7 +631,7 @@ git commit -m "feat(cluster): ClusterProfile 模型 + clusters.yaml 读写(模�
 import pytest
 
 from vcstudio.cluster.profiles import ClusterProfile
-from vcstudio.cluster.ssh_test import test_connection, TestResult
+from vcstudio.cluster.ssh_test import check_connection, ConnectionResult
 
 
 class FakeChannelFile:
@@ -665,7 +665,7 @@ def test_successful_key_auth_reports_whoami_and_scheduler():
     fake = FakeClient({'whoami': 'alice\n', 'command -v': '/usr/bin/sbatch\n'})
     prof = ClusterProfile(name='c', hostname='h', username='alice',
                           auth='key', key_path='/k/id_rsa')
-    res = test_connection(prof, client_factory=lambda: fake, trust_new=True)
+    res = check_connection(prof, client_factory=lambda: fake, trust_new=True)
     assert res.ok is True
     assert res.whoami == 'alice'
     assert res.scheduler == 'Slurm'
@@ -676,7 +676,7 @@ def test_successful_key_auth_reports_whoami_and_scheduler():
 def test_password_auth_passes_password():
     fake = FakeClient({'whoami': 'bob\n', 'command -v': '/bin/qsub\n'})
     prof = ClusterProfile(name='c', hostname='h', username='bob', auth='password')
-    res = test_connection(prof, password='pw', client_factory=lambda: fake, trust_new=True)
+    res = check_connection(prof, password='pw', client_factory=lambda: fake, trust_new=True)
     assert res.ok is True and res.scheduler == 'PBS'
     assert fake.connect_kwargs['password'] == 'pw'
 
@@ -685,7 +685,7 @@ def test_auth_failure_is_friendly():
     import paramiko
     fake = FakeClient({}, raise_on_connect=paramiko.AuthenticationException())
     prof = ClusterProfile(name='c', hostname='h', username='x', auth='password')
-    res = test_connection(prof, password='bad', client_factory=lambda: fake, trust_new=True)
+    res = check_connection(prof, password='bad', client_factory=lambda: fake, trust_new=True)
     assert res.ok is False and '认证' in res.message
 
 
@@ -693,7 +693,7 @@ def test_unknown_host_needs_trust():
     import paramiko
     fake = FakeClient({}, raise_on_connect=paramiko.ssh_exception.SSHException('unknown'))
     prof = ClusterProfile(name='c', hostname='h', username='x', auth='key', key_path='/k')
-    res = test_connection(prof, client_factory=lambda: fake, trust_new=False)
+    res = check_connection(prof, client_factory=lambda: fake, trust_new=False)
     assert res.ok is False and res.needs_trust is True
 ```
 
@@ -726,7 +726,7 @@ _SCHED_PROBES = [('Slurm', 'sbatch'), ('PBS', 'qsub'), ('LSF', 'bsub')]
 
 
 @dataclass
-class TestResult:
+class ConnectionResult:
     ok: bool
     whoami: str = ''
     scheduler: str = ''
@@ -749,10 +749,10 @@ def _detect_scheduler(client) -> str:
     return 'Shell'
 
 
-def test_connection(profile, password: str | None = None, *,
+def check_connection(profile, password: str | None = None, *,
                     trust_new: bool = False,
                     known_hosts_path: str | os.PathLike | None = None,
-                    client_factory=None) -> TestResult:
+                    client_factory=None) -> ConnectionResult:
     """连一次集群并回报结果。client_factory 缺省 paramiko.SSHClient(测试可注入)。"""
     factory = client_factory or paramiko.SSHClient
     kh = Path(known_hosts_path) if known_hosts_path is not None else default_known_hosts_path()
@@ -785,13 +785,13 @@ def test_connection(profile, password: str | None = None, *,
         try:
             client.connect(**connect_kwargs)
         except paramiko.AuthenticationException:
-            return TestResult(ok=False, message='认证失败:用户名/密钥/密码不正确')
+            return ConnectionResult(ok=False, message='认证失败:用户名/密钥/密码不正确')
         except paramiko.ssh_exception.SSHException as e:
             # 未知主机指纹或 SSH 协议层错误 → 请界面确认信任
-            return TestResult(ok=False, needs_trust=not trust_new,
+            return ConnectionResult(ok=False, needs_trust=not trust_new,
                               message=f'无法确认主机指纹或 SSH 错误:{e};确认后可信任重试')
         except (OSError, Exception) as e:  # 网络不可达等
-            return TestResult(ok=False, message=f'连接失败:{e}')
+            return ConnectionResult(ok=False, message=f'连接失败:{e}')
 
         _in, out, _err = client.exec_command('whoami')
         who = out.read().decode(errors='replace').strip()
@@ -804,7 +804,7 @@ def test_connection(profile, password: str | None = None, *,
             except Exception:
                 pass
 
-        return TestResult(ok=True, whoami=who, scheduler=sched,
+        return ConnectionResult(ok=True, whoami=who, scheduler=sched,
                           message=f'已连上 {profile.hostname},whoami={who},检测到 {sched}')
     finally:
         try:
@@ -1098,8 +1098,10 @@ def validate_cluster_inputs(profile: ClusterProfile, has_password: bool) -> list
     if not profile.username:
         errs.append('未填用户名')
     if profile.auth == 'key':
-        if not profile.key_path or not os.path.isfile(profile.key_path):
-            errs.append('SSH 密钥文件不存在或未选择')
+        # 只校验"是否填了密钥路径";路径存在性交由实际连接时报错
+        # (与测试契约一致:key_path 非空即视为已选择)。
+        if not profile.key_path:
+            errs.append('SSH 密钥文件未选择')
     else:
         if not has_password:
             errs.append('密码认证但未提供密码')
@@ -1361,7 +1363,7 @@ git commit -m "feat(gui): 生成页 — 赝势库持久化 + 一键生成(复用
 - Create: `vcstudio/gui/cluster_tab.py`
 
 **Interfaces:**
-- Consumes: `profiles.load_profiles/save_profiles/ClusterProfile`、`secrets`、`ssh_test.test_connection`、`runner`、`logic.profile_from_form/validate_cluster_inputs`、`widgets`。
+- Consumes: `profiles.load_profiles/save_profiles/ClusterProfile`、`secrets`、`ssh_test.check_connection`、`runner`、`logic.profile_from_form/validate_cluster_inputs`、`widgets`。
 - Produces: `cluster_tab.ClusterTab(ttk.Frame)`。
 
 - [ ] **Step 1: 创建 `vcstudio/gui/cluster_tab.py`**
@@ -1538,10 +1540,8 @@ class ClusterTab(ttk.Frame):
 
     def _save(self):
         prof = self._current_profile()
-        has_pw = prof.auth != 'password' or secrets.get_password(prof.name) is not None
-        errs = validate_cluster_inputs(prof, has_password=True if prof.auth == 'key' else has_pw or True)
-        # 保存阶段不强制已有密码(可后填),仅校验非密码字段
-        errs = [e for e in errs if '密码' not in e]
+        # 保存阶段不强制已有密码(可后填):校验非密码字段,密码类错误一律滤掉
+        errs = [e for e in validate_cluster_inputs(prof, has_password=True) if '密码' not in e]
         if errs:
             self.log.write('❌ ' + '；'.join(errs))
             return
@@ -1566,7 +1566,7 @@ class ClusterTab(ttk.Frame):
             return
         self.test_btn.configure(state='disabled')
         self.log.write('⏳ 连接中…')
-        q = runner.submit(ssh_test.test_connection, prof, pw, trust_new=trust_new)
+        q = runner.submit(ssh_test.check_connection, prof, pw, trust_new=trust_new)
         self.after(150, lambda: self._poll_test(q))
 
     def _poll_test(self, q):
@@ -1844,4 +1844,4 @@ Expected: 全 passed。
 
 - **Spec 覆盖**:两页界面(生成 Task 9 / 集群 Task 10-11)、复用 build_job_dir(Task 9)、config 持久化+冻结路径(Task 3)、密钥+密码且密码走 keyring 绝不明文(Task 4/10)、密钥只存路径(Task 5 模型无密码字段)、测连接+未知指纹确认(Task 6)、去 numpy(Task 2)、paramiko/keyring 依赖(Task 1)、集群页本版只做连接、提交置灰、资源参数推迟(Task 10)、打包单文件+删 _internal+gitignore(Task 12)、错误友好不弹 traceback(Task 9/10 的 poll 分支)、验收矩阵(Task 13)。全部有对应任务。
 - **占位符**:无 TBD/TODO;每个代码步给了完整实现。
-- **类型一致**:`build_job_dir` 返回键(warnings/out_dir/elements/kpoints)在 Task 9 一致使用;`ClusterProfile` 字段在 profiles/logic/ssh_test/cluster_tab 一致;`TestResult`(ok/whoami/scheduler/message/needs_trust)在 ssh_test 与 cluster_tab 一致;`submit/poll` 在 runner 与两个 tab 一致。
+- **类型一致**:`build_job_dir` 返回键(warnings/out_dir/elements/kpoints)在 Task 9 一致使用;`ClusterProfile` 字段在 profiles/logic/ssh_test/cluster_tab 一致;`ConnectionResult`(ok/whoami/scheduler/message/needs_trust)在 ssh_test 与 cluster_tab 一致;`submit/poll` 在 runner 与两个 tab 一致。
