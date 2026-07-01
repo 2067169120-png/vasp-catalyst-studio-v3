@@ -10,11 +10,19 @@ readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
     "PyYAML>=6.0",
-    "numpy>=1.21",
+    "paramiko>=3.0",
+    "keyring>=24.0",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
 
 [project.scripts]
 vcs = "vcstudio.cli.main:main"
+vcs-gui = "vcstudio.gui.app:main"
 
 [tool.setuptools.packages.find]
 include = ["vcstudio*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
