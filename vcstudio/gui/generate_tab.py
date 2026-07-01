@@ -16,7 +16,6 @@ from vcstudio.gui import runner
 from vcstudio.gui.logic import parse_kpoints_field, validate_generate_inputs
 from vcstudio.shared.config import load_config, set_potcar_lib_root
 from vcstudio.generate.job_builder import build_job_dir
-from vcstudio.generate.potcar import PotcarError
 
 
 class GenerateTab(ttk.Frame):
@@ -30,7 +29,6 @@ class GenerateTab(ttk.Frame):
         # 赝势库(全局,持久化)
         self.lib_row = FileRow(self, '赝势库 POTCAR', mode='dir')
         self.lib_row.grid(row=0, column=0, sticky='w')
-        self.lib_row.var.trace_add('write', lambda *a: None)  # 变更即时可读
 
         ttk.Separator(self, orient='horizontal').grid(row=1, column=0, sticky='ew', pady=6)
 
