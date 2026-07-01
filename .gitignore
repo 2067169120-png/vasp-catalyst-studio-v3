@@ -10,3 +10,7 @@ venv/
 # 本地生成的作业目录
 job*/
 /scratch/
+
+# results/ 建议输出目录:忽略生成内容,保留目录占位
+/results/*
+!/results/.gitkeep

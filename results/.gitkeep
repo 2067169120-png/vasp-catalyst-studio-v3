@@ -1,0 +1,3 @@
+# 占位文件:保留 results/ 目录。
+# 建议把生成的作业放这里,例如:vcs gen --poscar POSCAR --incar my.incar -o results/job1/
+# 生成内容默认不入 git(见 .gitignore),仅保留本目录。
