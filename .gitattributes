@@ -1,0 +1,2 @@
+# 仓库内统一 LF;消除 Windows 下 CRLF 转换警告
+* text=auto eol=lf
