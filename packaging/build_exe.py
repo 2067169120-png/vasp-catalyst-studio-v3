@@ -1,0 +1,41 @@
+"""一键打包:PyInstaller 出单文件、无控制台窗口的 EXE 到 <repo>/dist/。
+
+用法:python packaging/build_exe.py
+
+不手写 .spec(PyInstaller 6.x 的 spec 语法版本脆弱,EXE(onefile=True) 并非合法参数),
+改用稳定的 CLI flags:--onefile --windowed。产物落仓库根 dist/,工作目录 build/,
+与 .gitignore 的 build/ dist/ 对齐。keyring 后端是动态加载,用 --collect-submodules 收全。
+中文注释允许,英文标识符。
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+ENTRY = os.path.join(ROOT, 'vcstudio', 'gui', '__main__.py')
+
+# 排除无关重包以瘦身(numpy 已从依赖移除,这里再兜底排除)
+EXCLUDES = ['numpy', 'sklearn', 'scipy', 'PIL', 'matplotlib', 'pandas', 'pytest']
+
+
+def main() -> int:
+    cmd = [sys.executable, '-m', 'PyInstaller',
+           '--onefile', '--windowed', '--clean', '--noconfirm',
+           '--name', 'VASP Catalyst Studio',
+           '--collect-submodules', 'keyring.backends',
+           '--paths', ROOT,
+           '--distpath', os.path.join(ROOT, 'dist'),
+           '--workpath', os.path.join(ROOT, 'build'),
+           '--specpath', os.path.join(ROOT, 'build')]
+    for m in EXCLUDES:
+        cmd += ['--exclude-module', m]
+    cmd.append(ENTRY)
+    print('运行:', ' '.join(cmd))
+    return subprocess.call(cmd, cwd=ROOT)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

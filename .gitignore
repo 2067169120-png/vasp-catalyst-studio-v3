@@ -14,3 +14,11 @@ job*/
 # results/ 建议输出目录:忽略生成内容,保留目录占位
 /results/*
 !/results/.gitkeep
+
+# PyInstaller 旧残留(build/ dist/ 上面已忽略)
+_internal/
+
+# 用户本地敏感/机器相关配置(绝不入 git)
+clusters.yaml
+known_hosts
+/config.local.yaml
