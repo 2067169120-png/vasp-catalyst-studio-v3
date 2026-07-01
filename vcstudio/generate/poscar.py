@@ -19,7 +19,9 @@ def parse_poscar_species(content: str) -> tuple[list[str], list[int]]:
     """从 POSCAR 文本解析 ``(elements, counts)``(POSCAR 物种顺序)。
 
     - VASP5(第6行是元素符号):返回 (元素列表, 计数列表)。
-    - VASP4(第6行是数字)或文本过短/畸形:返回 ``([], [])``,调用方据此降级。
+    - VASP4(第6行是数字)或文本过短:返回 ``([], [])``,调用方完全降级。
+    - 元素行有效但计数行无法解析:返回 (元素列表, [])。**有意保留物种**——仍可
+      拼 POTCAR / 推荐 KPOINTS,仅 counts 降级(不写 MAGMOM),比丢弃元素更有用。
 
     位置解析,不删除行(删内部空行会移位)。可容忍尾部空行。元素顺序即
     POTCAR 拼接顺序与 MAGMOM 顺序。
@@ -68,7 +70,9 @@ def read_cell_vectors(content: str) -> list[list[float]]:
             raise ValueError(f'POSCAR 第{i + 1}行不是合法晶格矢量(需 3 个分量)')
         raw.append([float(x) for x in parts[:3]])
 
-    factor = scale if scale > 0 else 1.0  # TODO(M1): 负 scale=目标体积,后续按 det 反解
+    if scale == 0:
+        raise ValueError('POSCAR 缩放因子为 0(无物理意义)')
+    factor = scale if scale > 0 else 1.0  # 负 scale=目标体积;TODO(M1) 按 det 反解,暂 factor=1.0
     return [[c * factor for c in v] for v in raw]
 
 

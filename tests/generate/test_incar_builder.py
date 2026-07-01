@@ -111,6 +111,14 @@ def test_validate_D4_user_ispin1_respected(mini_lib):
     assert len(warns) == 1
 
 
+def test_validate_D4_float_ispin_respected(mini_lib):
+    # 用户写 ISPIN=1.0(浮点)也应识别为关自旋 → D4,不补 MAGMOM(审 P1-1)
+    comp, warns = ib.validate_and_complete_incar(
+        {'ENCUT': 400, 'ISPIN': 1.0}, ['Fe'], [1], lib_root=mini_lib)
+    assert comp == {}
+    assert len(warns) == 1
+
+
 def test_validate_does_not_mutate_input(mini_lib):
     d = {'ENCUT': 400}
     ib.validate_and_complete_incar(d, ['Fe'], [1], lib_root=mini_lib)

@@ -123,6 +123,14 @@ def test_enmax_exceeds_encut_bubbles(tmp_path, mini_lib):
                                   lib_root=mini_lib)
 
 
+def test_nonnumeric_encut_clear_error(tmp_path, mini_lib):
+    # 用户 ENCUT 非数字 → 清晰 ValueError(提及 ENCUT),而非 cryptic float 崩溃(审 P0-1)
+    pos = _write_poscar(tmp_path, POSCAR_CN)
+    with pytest.raises(ValueError, match='ENCUT'):
+        job_builder.build_job_dir(pos, 'ENCUT = auto\n', str(tmp_path / 'j'),
+                                  lib_root=mini_lib)
+
+
 def test_idempotent_rerun(tmp_path, mini_lib):
     pos = _write_poscar(tmp_path, POSCAR_FEC)
     out = tmp_path / 'job1'

@@ -80,7 +80,11 @@ def build_job_dir(poscar_path, incar, out_dir, *,
             incar_dict, elements, counts, lib_root)
 
     raw_encut = completions.get('ENCUT') or incar_dict.get('ENCUT') or 400
-    encut = int(float(raw_encut))
+    try:
+        encut = int(float(raw_encut))
+    except (TypeError, ValueError):
+        raise ValueError(
+            f'INCAR 的 ENCUT 非数字: {raw_encut!r};请提供数值(如 ENCUT = 500)。')
 
     potcar_text = build_potcar(elements, encut=encut, lib_root=lib_root)
 

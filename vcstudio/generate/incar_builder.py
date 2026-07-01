@@ -119,9 +119,10 @@ def _as_int(v):
     if isinstance(v, int):
         return v
     try:
-        return int(str(v).strip())
+        f = float(str(v).strip())
     except (ValueError, TypeError):
         return None
+    return int(f) if f == int(f) else None  # '2.0'/2.0 → 2(识别浮点写法的 ISPIN);'1.5' → None
 
 
 def _as_number(v):

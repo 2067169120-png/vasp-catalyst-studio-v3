@@ -94,6 +94,12 @@ def test_cell_vectors_too_few_lines_raises():
         poscar.read_cell_vectors('title\n1.0\n3 0 0\n')
 
 
+def test_cell_vectors_zero_scale_raises():
+    # scale=0 无物理意义 → 报错(审 P2-2)
+    with pytest.raises(ValueError):
+        poscar.read_cell_vectors('t\n0.0\n2 0 0\n0 2 0\n0 0 2\nFe\n1\n')
+
+
 @pytest.mark.xfail(reason='负 scale=目标体积 未实现;M1 用 factor=1.0 占位', strict=True)
 def test_cell_vectors_negative_scale_is_target_volume():
     assert poscar.read_cell_vectors(VASP_NEGSCALE) == [[4.0, 0.0, 0.0],
