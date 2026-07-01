@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vcstudio"
+version = "0.1.0"
+description = "VASP Catalyst Studio — 轻量化 DFT 自动化:POSCAR+用户INCAR → 输入四件套 / 多集群提交 / 零token监控 / LLM分析"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "PyYAML>=6.0",
+    "numpy>=1.21",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+vcs = "vcstudio.cli.main:main"
+
+[tool.setuptools.packages.find]
+include = ["vcstudio*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
