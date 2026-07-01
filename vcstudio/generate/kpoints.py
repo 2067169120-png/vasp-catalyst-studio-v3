@@ -25,12 +25,10 @@ def recommend_kpoints(cell_vectors: list, calc_type: str = 'slab') -> list:
     Returns:
         [kx, ky, kz](Gamma-centered Monkhorst-Pack)。
     """
-    import numpy as np
-
     if calc_type == 'molecule':
         return [1, 1, 1]
 
-    lengths = [np.linalg.norm(v) for v in cell_vectors[:3]]
+    lengths = [math.sqrt(sum(c * c for c in v[:3])) for v in cell_vectors[:3]]
 
     target_spacing = 0.03  # Å⁻¹
     kpts = [max(1, int(math.ceil(1.0 / (target_spacing * l)))) for l in lengths]
