@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import yaml
@@ -34,6 +35,9 @@ def find_config_path() -> Path | None:
     beside = Path(__file__).resolve().parents[2] / 'config.yaml'  # shared → vcstudio → 包根
     if beside.is_file():
         return beside
+    user = user_config_path()
+    if user.is_file():
+        return user
     return None
 
 
@@ -59,3 +63,44 @@ def get_potcar_lib_root(config: dict | None = None) -> str:
     """返回本地 PAW_PBE 库根路径;config 缺省则自动 load_config()。"""
     cfg = config if config is not None else load_config()
     return cfg['potcar_lib_root']
+
+
+def user_config_dir() -> Path:
+    """用户级配置目录:Windows %APPDATA%/vcstudio,否则 ~/.config/vcstudio。"""
+    base = os.environ.get('APPDATA') or os.path.join(os.path.expanduser('~'), '.config')
+    return Path(base) / 'vcstudio'
+
+
+def user_config_path() -> Path:
+    """用户级 config.yaml 路径(冻结版可写落点)。"""
+    return user_config_dir() / 'config.yaml'
+
+
+def writable_config_path() -> Path:
+    """决定写配置落到哪:env 显式 > 冻结用用户目录 > 已有文件原地 > 用户目录兜底。"""
+    env = os.environ.get('VCSTUDIO_CONFIG')
+    if env:
+        return Path(env)
+    if getattr(sys, 'frozen', False):
+        return user_config_path()
+    found = find_config_path()
+    if found is not None:
+        return found
+    return user_config_path()
+
+
+def save_config(cfg: dict, path: str | os.PathLike | None = None) -> Path:
+    """把配置 dict 写入 yaml(UTF-8)。path 缺省用 writable_config_path()。"""
+    target = Path(path) if path is not None else writable_config_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target, 'w', encoding='utf-8') as f:
+        yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+    return target
+
+
+def set_potcar_lib_root(path_str: str, config_path: str | os.PathLike | None = None) -> Path:
+    """只更新 potcar_lib_root 并持久化,其余键原样保留。返回写入路径。"""
+    resolved = Path(config_path) if config_path is not None else writable_config_path()
+    cfg = load_config(resolved)
+    cfg['potcar_lib_root'] = path_str
+    return save_config(cfg, resolved)
