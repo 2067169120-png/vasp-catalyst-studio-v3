@@ -68,6 +68,24 @@ def incar_dict_to_str(incar: dict, system_name: str = '') -> str:
 _TRUE_TOKENS = {'.true.', '.t.', 't', 'true'}
 _FALSE_TOKENS = {'.false.', '.f.', 'f', 'false'}
 _INT_RE = re.compile(r'[+-]?\d+$')
+_STAR_RE = re.compile(r'\d+\*')   # MAGMOM/LDAUU 星乘写法,如 16*0
+
+
+def _is_number(tok: str) -> bool:
+    try:
+        float(tok)
+        return True
+    except ValueError:
+        return False
+
+
+def _scalar(tok: str):
+    if _INT_RE.match(tok):
+        return int(tok)
+    try:
+        return float(tok)
+    except ValueError:
+        return tok            # 字符串(ALGO/LREAL/PREC 等)
 
 
 def _parse_value(raw: str):
@@ -77,14 +95,16 @@ def _parse_value(raw: str):
         return True
     if low in _FALSE_TOKENS:
         return False
-    if len(raw.split()) > 1:
-        return raw            # 多值串整体保留(MAGMOM/LDAUU 不拆)
-    if _INT_RE.match(raw):
-        return int(raw)
-    try:
-        return float(raw)
-    except ValueError:
-        return raw            # 字符串(ALGO/LREAL/PREC 等)
+    parts = raw.split()
+    if len(parts) > 1:
+        # 老式 INCAR 惯例:标量值后直接跟英文说明、无 #/! 注释符(VASP 只读首
+        # token),如 'ENCUT = 400.0  cut-off energy (eV)'。首 token 是数字且次
+        # token 不像值(非数字/非星乘)→ 取首 token;否则真·多值串整体保留
+        # (MAGMOM/LDAUU/DIPOL 不拆)。
+        if _is_number(parts[0]) and not (_is_number(parts[1]) or _STAR_RE.match(parts[1])):
+            return _scalar(parts[0])
+        return raw
+    return _scalar(raw)
 
 
 def parse_incar(text: str) -> "OrderedDict":
