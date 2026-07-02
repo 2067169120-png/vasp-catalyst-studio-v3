@@ -24,6 +24,40 @@ POTCAR_VARIANT = {
     'Sc': 'Sc_sv', 'Y': 'Y_sv', 'Zr': 'Zr_sv', 'Hf': 'Hf_pv',
     'Tc': 'Tc_pv', 'Re': 'Re_pv', 'Os': 'Os_pv', 'Ir': 'Ir',
     'Rh': 'Rh_pv', 'Ag': 'Ag', 'Au': 'Au', 'Cd': 'Cd',
+    # ── 2026-07-02 扩充:28 元素,逐一对用户 potpaw_PBE.54 全集核对 TITEL+ENMAX ──
+    # 吸附/催化刚需(*H/*O/*OH/H2O、氧化物载体):
+    'H': 'H',          # ENMAX 250.0
+    'O': 'O',          # ENMAX 400.0(全表最大;补全规则 1.3×max 取整 → ENCUT 520)
+    # 卤素:
+    'F': 'F',          # 400.0
+    'Cl': 'Cl',        # 262.5
+    'Br': 'Br',        # 216.3
+    'I': 'I',          # 175.6
+    # 碱金属 / 碱土(锂硫/掺杂/载体常用):
+    'Na': 'Na_pv',     # 259.6
+    'K': 'K_sv',       # 259.3
+    'Rb': 'Rb_sv',     # 220.1
+    'Cs': 'Cs_sv',     # 220.3
+    'Be': 'Be',        # 247.5
+    'Mg': 'Mg',        # 126.1
+    'Ca': 'Ca_sv',     # 266.6
+    'Sr': 'Sr_sv',     # 229.4
+    'Ba': 'Ba_sv',     # 187.2
+    # 主族 p 区:
+    'Al': 'Al',        # 240.3
+    'Si': 'Si',        # 245.3
+    'Ga': 'Ga_d',      # 282.7
+    'Ge': 'Ge_d',      # 310.3
+    'As': 'As',        # 208.7
+    'Se': 'Se',        # 211.6
+    'Sn': 'Sn_d',      # 241.1
+    'Sb': 'Sb',        # 172.1
+    'Te': 'Te',        # 175.0
+    'Pb': 'Pb_d',      # 237.8
+    'Bi': 'Bi_d',      # 242.8
+    # 镧系(载体/助剂;Ce 做 CeO2 请自行在 INCAR 给 DFT+U,工具不代设):
+    'La': 'La',        # 219.3
+    'Ce': 'Ce',        # 273.0
 }
 
 _ENMAX_RE = re.compile(r'ENMAX\s*=\s*([0-9.]+)')

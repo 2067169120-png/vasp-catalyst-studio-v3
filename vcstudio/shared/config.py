@@ -104,3 +104,22 @@ def set_potcar_lib_root(path_str: str, config_path: str | os.PathLike | None = N
     cfg = load_config(resolved)
     cfg['potcar_lib_root'] = path_str
     return save_config(cfg, resolved)
+
+
+# ── UI 状态记忆(跨会话回填最近使用的路径等;与科学配置无关) ─────────────────────
+def get_ui_state(config: dict | None = None) -> dict:
+    """返回 config 的 'ui' 小节(dict);缺失 → {}。"""
+    cfg = config if config is not None else load_config()
+    ui = cfg.get('ui')
+    return dict(ui) if isinstance(ui, dict) else {}
+
+
+def set_ui_state(config_path: str | os.PathLike | None = None, **kv) -> Path:
+    """合并更新 'ui' 小节并持久化(None 值跳过,不清除既有键)。返回写入路径。"""
+    resolved = Path(config_path) if config_path is not None else writable_config_path()
+    cfg = load_config(resolved)
+    ui = cfg.get('ui')
+    ui = dict(ui) if isinstance(ui, dict) else {}
+    ui.update({k: v for k, v in kv.items() if v is not None})
+    cfg['ui'] = ui
+    return save_config(cfg, resolved)

@@ -1,12 +1,17 @@
-"""GUI 纯逻辑 helpers:字段解析/校验、表单↔profile 映射。**不 import tkinter**,可单测。
+"""GUI 纯逻辑 helpers:字段解析/校验、表单↔profile 映射、即时预览。**不 import tkinter**,可单测。
 
 中文注释允许,英文标识符。
 """
 from __future__ import annotations
 
+import math
 import os
 
 from vcstudio.cluster.profiles import ClusterProfile
+from vcstudio.generate.incar_builder import parse_incar, validate_and_complete_incar
+from vcstudio.generate.kpoints import recommend_kpoints
+from vcstudio.generate.poscar import parse_poscar_species, read_cell_vectors, read_poscar
+from vcstudio.generate.potcar import PotcarError
 
 
 def parse_kpoints_field(text: str):
@@ -36,6 +41,70 @@ def validate_generate_inputs(poscar: str, incar: str, out_dir: str, lib_root: st
     if not out_dir:
         errs.append('未设置输出目录')
     return errs
+
+
+# ── 即时预览(选完文件立刻看到,不必等生成) ──────────────────────────────────
+def poscar_preview(path: str, calc_type: str = 'slab') -> str:
+    """POSCAR 解析摘要(多行中文文本)。任何解析问题 → 单行友好提示,绝不抛异常。"""
+    if not path or not os.path.isfile(path):
+        return '(选择 POSCAR 后自动解析)'
+    try:
+        content = read_poscar(path)
+    except (OSError, UnicodeDecodeError) as e:
+        return f'⚠ POSCAR 读取失败:{e}'
+    lines = [f'体系:{(content.splitlines() or [""])[0].strip() or "(无标题行)"}']
+    elements, counts = parse_poscar_species(content)
+    if not elements:
+        return lines[0] + '\n⚠ 第 6 行无元素符号(VASP4/畸形):无法拼 POTCAR,请转 VASP5 格式'
+    if counts and len(counts) == len(elements):
+        pair = ' · '.join(f'{el} {c}' for el, c in zip(elements, counts))
+        lines.append(f'元素/计数:{pair}(共 {sum(counts)} 原子)')
+    else:
+        lines.append(f'元素:{" ".join(elements)}(⚠ 计数行缺失,MAGMOM 将降级)')
+    try:
+        cell = read_cell_vectors(content)
+        lens = [math.sqrt(sum(c * c for c in v)) for v in cell]
+        lines.append('晶格 |a| |b| |c|:' + ' / '.join(f'{x:.2f}' for x in lens) + ' Å')
+        kpts = recommend_kpoints(cell, calc_type)
+        lines.append(f'推荐 K 网格({calc_type}):{kpts[0]} × {kpts[1]} × {kpts[2]}')
+    except (ValueError, NotImplementedError) as e:
+        lines.append(f'⚠ 晶格解析:{e}')
+    return '\n'.join(lines)
+
+
+def incar_preview(incar_path: str, poscar_path: str, lib_root: str,
+                  validate: bool = True) -> str:
+    """INCAR 校验预览:生成前预告"将补全什么/警告什么"。绝不抛异常、绝不写文件。"""
+    if not incar_path or not os.path.isfile(incar_path):
+        return '(选择 INCAR 后自动预览校验)'
+    if not validate:
+        return '校验补全已关闭:INCAR 将严格照抄,不追加任何键。'
+    try:
+        incar_dict = parse_incar(read_poscar(incar_path))
+    except (OSError, UnicodeDecodeError) as e:
+        return f'⚠ INCAR 读取失败:{e}'
+    if not poscar_path or not os.path.isfile(poscar_path):
+        return '(选择 POSCAR 后可预览 ENCUT/MAGMOM 补全)'
+    elements, counts = parse_poscar_species(read_poscar(poscar_path))
+    if not elements:
+        return '⚠ POSCAR 无元素行,无法预览补全'
+    if not lib_root:
+        return '⚠ 未设置赝势库路径,无法预览 ENCUT 补全'
+    try:
+        completions, warnings = validate_and_complete_incar(
+            incar_dict, elements, counts, lib_root)
+    except PotcarError as e:
+        return f'⚠ 无法预览补全:{e}'
+    except (OSError, ValueError) as e:
+        return f'⚠ 预览失败:{e}'
+    lines = []
+    if completions:
+        lines.append('将补全(追加于 INCAR 文末,原文一字不改):')
+        lines.extend(f'  {k} = {v}' for k, v in completions.items())
+    else:
+        lines.append('无缺项:INCAR 原文透传,不追加任何键。')
+    lines.extend(f'⚠ {w}' for w in warnings)
+    return '\n'.join(lines)
 
 
 def profile_from_form(name: str, fields: dict) -> ClusterProfile:

@@ -25,9 +25,10 @@ vcs gen --poscar POSCAR --incar my.incar --calc-type slab -o results/job1/
 生成 `results/job1/`,含:
 
 - `INCAR` —— 你的原文 + 校验补全(缺 ENCUT/MAGMOM/ISPIN 才追加,原文一字不改)
-- `POTCAR` —— 按 POSCAR 物种顺序本地拼接,ENMAX≤ENCUT 硬校验
+- `POTCAR` —— 按 POSCAR 物种顺序本地拼接,ENMAX≤ENCUT 硬校验(元素表覆盖 62 种,含 H/O/卤素/碱土)
 - `KPOINTS` —— 自动推荐(或 `--kpoints "5 5 1"` 指定)
 - `POSCAR` —— 原样拷入
+- `job.yaml` —— 任务台账:状态机 + 输入溯源(sha256)+ 补全审计,贯穿后续提交/监控/分析
 
 ## 配置
 

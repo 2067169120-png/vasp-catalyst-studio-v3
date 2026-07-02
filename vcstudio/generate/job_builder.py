@@ -63,7 +63,7 @@ def build_job_dir(poscar_path, incar, out_dir, *,
         lib_root: POTCAR 库根(缺省从 config 读)。
 
     Returns:
-        {'ok','out_dir','warnings','kpoints','elements'}。
+        {'ok','out_dir','warnings','kpoints','elements','completions','calc_type'}。
         VASP4/畸形 POSCAR → ValueError;ENMAX>ENCUT/库缺失 → PotcarError(冒泡)。
     """
     content = read_poscar(poscar_path)
@@ -114,4 +114,6 @@ def build_job_dir(poscar_path, incar, out_dir, *,
     shutil.copyfile(poscar_path, os.path.join(out_dir, 'POSCAR'))
 
     return {'ok': True, 'out_dir': str(out_dir), 'warnings': warnings,
-            'kpoints': kpts, 'elements': elements}
+            'kpoints': kpts, 'elements': elements,
+            # 附加回传(向后兼容的新增键):manifest/预览用
+            'completions': dict(completions), 'calc_type': calc_type}
