@@ -1,0 +1,233 @@
+"""提交编排测试:注入假 client/sftp,验证 preflight/上传/提交/状态刷新与 manifest 回写。"""
+import posixpath
+
+import pytest
+
+from vcstudio.cluster.profiles import ClusterProfile
+from vcstudio.cluster import submitter
+from vcstudio.generate.job_builder import build_job_dir
+from vcstudio.shared import manifest
+
+
+# ── 假件:模仿 paramiko 的最小表面 ──
+class _FakeChannel:
+    def __init__(self, status=0):
+        self._status = status
+
+    def recv_exit_status(self):
+        return self._status
+
+
+class _FakeStream:
+    def __init__(self, data=b'', status=0):
+        self._data = data
+        self.channel = _FakeChannel(status)
+
+    def read(self):
+        return self._data
+
+
+class FakeClient:
+    """exec_command 按 (子串, 输出) 剧本表回放;记录全部命令供断言。
+
+    exit_codes: {命令子串: 退出码},未命中默认 0。
+    """
+
+    def __init__(self, script=None, exit_codes=None):
+        self.script = list(script or [])
+        self.exit_codes = dict(exit_codes or {})
+        self.commands = []
+
+    def exec_command(self, cmd, timeout=None):
+        self.commands.append(cmd)
+        status = 0
+        for needle, code in self.exit_codes.items():
+            if needle in cmd:
+                status = code
+                break
+        for needle, out in self.script:
+            if needle in cmd:
+                return _FakeStream(), _FakeStream(out.encode(), status), _FakeStream()
+        return _FakeStream(), _FakeStream(b'', status), _FakeStream()
+
+
+class _FakeRemoteFile:
+    def __init__(self, store, path):
+        self.store, self.path = store, path
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def write(self, text):
+        self.store[self.path] = text
+
+
+class FakeSFTP:
+    def __init__(self):
+        self.uploaded = {}     # remote → local
+        self.written = {}      # remote → text
+
+    def put(self, local, remote):
+        self.uploaded[remote] = local
+
+    def file(self, path, mode='w'):
+        return _FakeRemoteFile(self.written, path)
+
+
+def _profile(**kw):
+    base = dict(name='1w', hostname='h', username='sk2067', auth='key', key_path='k',
+                remote_root='/work/sk2067/jobs', scheduler='PBS',
+                scheduler_bin='/opt/torque-6.1.2/bin',
+                queue='batch', nodes=1, ppn=12, walltime='24:00:00',
+                env_lines=['source /opt/intel.sh'], vasp_cmd='mpirun -np 12 vasp_std > log 2>&1',
+                script_mode='auto')
+    base.update(kw)
+    return ClusterProfile(**base)
+
+
+def _job_dir(tmp_path):
+    lib = tmp_path / 'lib'
+    (lib / 'C').mkdir(parents=True)
+    (lib / 'C' / 'POTCAR').write_text(
+        ' fake PAW_PBE C\n   ENMAX  =  273.214; ENMIN = 200.000 eV\n', encoding='utf-8')
+    poscar = tmp_path / 'POSCAR'
+    poscar.write_text('C atom\n1.0\n10 0 0\n0 10 0\n0 0 10\nC\n1\nCartesian\n0 0 0\n',
+                      encoding='utf-8')
+    out = tmp_path / 'zn_job'
+    res = build_job_dir(str(poscar), 'ENCUT = 400\n', str(out),
+                        calc_type='slab', lib_root=str(lib))
+    manifest.create_from_build(str(out), res, poscar_path=str(poscar), validate=True)
+    return str(out)
+
+
+def test_preflight_catches_problems(tmp_path):
+    d = _job_dir(tmp_path)
+    assert submitter.preflight(_profile(), d) == []
+    assert any('remote_root' in e for e in submitter.preflight(_profile(remote_root=''), d))
+    assert any('绝对路径' in e for e in submitter.preflight(_profile(remote_root='rel/path'), d))
+    assert any('队列' in e for e in submitter.preflight(_profile(queue=''), d))
+    assert any('ppn' in e for e in submitter.preflight(_profile(ppn=0), d))
+    assert any('VASP' in e for e in submitter.preflight(_profile(vasp_cmd=''), d))
+    assert any('暂不支持' in e for e in submitter.preflight(_profile(scheduler='LSF'), d))
+    assert any('模板' in e for e in submitter.preflight(
+        _profile(script_mode='template', template_path=str(tmp_path / 'nope.sh')), d))
+    empty = tmp_path / 'empty'
+    empty.mkdir()
+    assert any('缺 INCAR' in e for e in submitter.preflight(_profile(), str(empty)))
+
+
+def test_submit_job_happy_path_pbs(tmp_path):
+    d = _job_dir(tmp_path)
+    client = FakeClient(script=[('qsub', '8812345.cluster.hpc\n')])
+    sftp = FakeSFTP()
+    m = submitter.submit_job(client, sftp, _profile(), d)
+
+    remote = '/work/sk2067/jobs/zn_job'
+    # 上传:四件套 put + 脚本 write
+    for f in ('INCAR', 'POTCAR', 'KPOINTS', 'POSCAR'):
+        assert posixpath.join(remote, f) in sftp.uploaded
+    script = sftp.written[posixpath.join(remote, 'vcs_job.sh')]
+    assert '#PBS -q batch' in script and 'source /opt/intel.sh' in script
+    assert '\r' not in script                                  # CRLF 消毒
+    # 命令:mkdir + qsub(带 scheduler_bin 全路径)
+    assert any(c.startswith(f'mkdir -p {remote}') for c in client.commands)
+    assert any('/opt/torque-6.1.2/bin/qsub' in c for c in client.commands)
+    # manifest 回写
+    assert m['state'] == 'SUBMITTED'
+    assert m['scheduler_job_id'] == '8812345'
+    assert m['cluster'] == '1w' and m['remote_dir'] == remote
+    assert [h['state'] for h in m['state_history']] == ['CREATED', 'UPLOADED', 'SUBMITTED']
+    assert m['attempts'][0]['job_id'] == '8812345'
+    assert manifest.load_manifest(d)['state'] == 'SUBMITTED'   # 已落盘
+
+
+def test_submit_job_failure_keeps_uploaded(tmp_path):
+    d = _job_dir(tmp_path)
+    client = FakeClient(script=[('qsub', 'qsub: Unauthorized Request\n')])
+    with pytest.raises(RuntimeError, match='提交失败'):
+        submitter.submit_job(client, FakeSFTP(), _profile(), d)
+    assert manifest.load_manifest(d)['state'] == 'UPLOADED'    # 留痕但不冒充已提交
+
+
+def test_refresh_job_states(tmp_path):
+    d = _job_dir(tmp_path)
+    client = FakeClient(script=[('qsub', '8812345.cluster.hpc\n')])
+    submitter.submit_job(client, FakeSFTP(), _profile(), d)
+
+    # 排队 → QUEUED
+    m = submitter.refresh_job(FakeClient(), _profile(), d, live_states={'8812345': 'QUEUED'})
+    assert m['state'] == 'QUEUED'
+    # 运行 → RUNNING
+    m = submitter.refresh_job(FakeClient(), _profile(), d, live_states={'8812345': 'RUNNING'})
+    assert m['state'] == 'RUNNING'
+    # 调度器消失 + 收敛 + OSZICAR E0 → DONE + 能量
+    done_client = FakeClient(script=[
+        ('grep -c', '1\n'),
+        ('tail -2', '   5 F= -.43561190E+03 E0= -.43561154E+03  d E =-.10E-05\n'),
+    ])
+    m = submitter.refresh_job(done_client, _profile(), d, live_states={})
+    assert m['state'] == 'DONE'
+    assert m['results']['energy_e0_eV'] == pytest.approx(-435.61154)
+    # 消失 + 未收敛 → UNCONVERGED(交修复区)
+    d2 = _job_dir(tmp_path / 'second')
+    submitter.submit_job(FakeClient(script=[('qsub', '99.cluster\n')]), FakeSFTP(), _profile(), d2)
+    m2 = submitter.refresh_job(FakeClient(script=[('grep -c', '0\n')]),
+                               _profile(), d2, live_states={})
+    assert m2['state'] == 'UNCONVERGED'
+
+
+def test_run_cmd_check_raises_on_nonzero_exit():
+    client = FakeClient(exit_codes={'mkdir': 1})
+    with pytest.raises(RuntimeError, match='mkdir'):
+        submitter.run_cmd(client, 'mkdir -p /nope', check=True)
+    submitter.run_cmd(client, 'mkdir -p /nope')        # 默认不查退出码,行为不变
+
+
+def test_submit_job_stops_when_mkdir_fails(tmp_path):
+    """远程 mkdir 失败(无权限等)必须立刻报错,不能静默继续 sftp.put。"""
+    d = _job_dir(tmp_path)
+    client = FakeClient(script=[('qsub', '88.c\n')], exit_codes={'mkdir': 1})
+    sftp = FakeSFTP()
+    with pytest.raises(RuntimeError, match='mkdir'):
+        submitter.submit_job(client, sftp, _profile(), d)
+    assert sftp.uploaded == {}                         # 一个文件都没上传
+    assert manifest.load_manifest(d)['state'] == 'CREATED'
+
+
+def test_submit_and_refresh_quote_spaced_remote_dir(tmp_path):
+    """remote_root 带空格 → mkdir/qsub/grep/tail 里的路径全部要引号(sftp 是协议路径,不引)。"""
+    d = _job_dir(tmp_path)
+    prof = _profile(remote_root='/work/my jobs')
+    client = FakeClient(script=[('qsub', '77.c\n')])
+    sftp = FakeSFTP()
+    m = submitter.submit_job(client, sftp, prof, d)
+
+    remote = '/work/my jobs/zn_job'
+    assert m['remote_dir'] == remote
+    assert f"mkdir -p '{remote}'" in client.commands
+    assert any(f"'{remote}/vcs_job.sh'" in c for c in client.commands)
+    assert posixpath.join(remote, 'INCAR') in sftp.uploaded
+    # 自动脚本里的 cd 同样要引号
+    assert f"cd '{remote}'" in sftp.written[posixpath.join(remote, 'vcs_job.sh')]
+
+    done_client = FakeClient(script=[
+        ('grep -c', '1\n'),
+        ('tail -2', '   5 F= -.5E+01 E0= -.5E+01  d E =-.1E-05\n'),
+    ])
+    m = submitter.refresh_job(done_client, prof, d, live_states={})
+    assert m['state'] == 'DONE'
+    assert any(f"'{remote}/OUTCAR'" in c for c in done_client.commands)
+    assert any(f"'{remote}/OSZICAR'" in c for c in done_client.commands)
+
+
+def test_build_script_text_template_mode(tmp_path):
+    d = _job_dir(tmp_path)
+    tpl = tmp_path / 'my_job.sh'
+    tpl.write_text('#!/bin/bash\n#PBS -N {short}\ncd X/{dir}\nmpirun -np {cores} vasp\n',
+                   encoding='utf-8')
+    prof = _profile(script_mode='template', template_path=str(tpl))
+    text = submitter.build_script_text(prof, d)
+    assert '#PBS -N zn_job' in text and 'cd X/zn_job' in text and '-np 12' in text

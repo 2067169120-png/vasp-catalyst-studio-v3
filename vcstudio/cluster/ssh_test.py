@@ -51,6 +51,7 @@ def check_connection(profile, password: str | None = None, *,
     kh = Path(known_hosts_path) if known_hosts_path is not None else default_known_hosts_path()
 
     client = factory()
+    jump = None
     try:
         try:
             client.load_system_host_keys()
@@ -73,7 +74,7 @@ def check_connection(profile, password: str | None = None, *,
             connect_kwargs['password'] = password
 
         if profile.use_jump and profile.jump_host:
-            connect_kwargs['sock'] = _open_jump_channel(
+            connect_kwargs['sock'], jump = _open_jump_channel(
                 profile, password, factory, trust_new=trust_new, known_hosts_path=kh)
 
         try:
@@ -101,40 +102,51 @@ def check_connection(profile, password: str | None = None, *,
         return ConnectionResult(ok=True, whoami=who, scheduler=sched,
                           message=f'已连上 {profile.hostname},whoami={who},检测到 {sched}')
     finally:
-        try:
-            client.close()
-        except Exception:
-            pass
+        for c in (client, jump):
+            if c is None:
+                continue
+            try:
+                c.close()
+            except Exception:
+                pass
 
 
 def _open_jump_channel(profile, password, factory, *,
                        trust_new: bool = False,
                        known_hosts_path: str | os.PathLike | None = None):
-    """经跳板机开 direct-tcpip 通道,作为目标连接的 sock。
+    """经跳板机开 direct-tcpip 通道。返回 (sock, jump_client),jump 由调用方负责 close。
 
     跳板机(bastion)同样按 trust_new 门控主机指纹:未知指纹默认拒绝(防 MITM),
     与主连接路径一致,不因经跳板机而放宽。
     """
     jump = factory()
     try:
-        jump.load_system_host_keys()
-    except Exception:
-        pass
-    if known_hosts_path is not None and Path(known_hosts_path).is_file():
         try:
-            jump.load_host_keys(str(known_hosts_path))
+            jump.load_system_host_keys()
         except Exception:
             pass
-    jump.set_missing_host_key_policy(
-        paramiko.AutoAddPolicy() if trust_new else paramiko.RejectPolicy())
-    jkwargs = dict(hostname=profile.jump_host, port=int(profile.jump_port),
-                   username=profile.jump_user or profile.username, timeout=15,
-                   allow_agent=False, look_for_keys=False)
-    if profile.auth == 'key':
-        jkwargs['key_filename'] = profile.key_path
-    else:
-        jkwargs['password'] = password
-    jump.connect(**jkwargs)
-    transport = jump.get_transport()
-    return transport.open_channel(
-        'direct-tcpip', (profile.hostname, int(profile.port)), ('127.0.0.1', 0))
+        if known_hosts_path is not None and Path(known_hosts_path).is_file():
+            try:
+                jump.load_host_keys(str(known_hosts_path))
+            except Exception:
+                pass
+        jump.set_missing_host_key_policy(
+            paramiko.AutoAddPolicy() if trust_new else paramiko.RejectPolicy())
+        jkwargs = dict(hostname=profile.jump_host, port=int(profile.jump_port),
+                       username=profile.jump_user or profile.username, timeout=15,
+                       allow_agent=False, look_for_keys=False)
+        if profile.auth == 'key':
+            jkwargs['key_filename'] = profile.key_path
+        else:
+            jkwargs['password'] = password
+        jump.connect(**jkwargs)
+        transport = jump.get_transport()
+        sock = transport.open_channel(
+            'direct-tcpip', (profile.hostname, int(profile.port)), ('127.0.0.1', 0))
+        return sock, jump
+    except BaseException:
+        try:
+            jump.close()
+        except Exception:
+            pass
+        raise

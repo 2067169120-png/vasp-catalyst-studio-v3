@@ -23,6 +23,7 @@ class FakeClient:
         self.raise_on_connect = raise_on_connect
         self.connect_kwargs = None
         self.policy = None
+        self.closed = False
         self.transport = FakeTransport()
     def set_missing_host_key_policy(self, p): self.policy = p
     def load_system_host_keys(self, *a): pass
@@ -37,7 +38,7 @@ class FakeClient:
                 return (None, FakeChannelFile(val), FakeChannelFile(''))
         return (None, FakeChannelFile(''), FakeChannelFile(''))
     def get_transport(self): return self.transport
-    def close(self): pass
+    def close(self): self.closed = True
 
 
 def test_successful_key_auth_reports_whoami_and_scheduler():
@@ -106,3 +107,30 @@ def test_jump_channel_used_as_sock_and_gated():
     assert dest == ('h', 22)
     # 跳板机同样按 trust_new 门控:trust_new=True → AutoAddPolicy
     assert jump.policy.__class__.__name__ == 'AutoAddPolicy'
+
+
+def test_jump_client_closed_after_check():
+    """一次性测连不许留下活的跳板连接(每测一次漏一条的回归防线)。"""
+    target = FakeClient({'whoami': 'alice\n'})
+    jump = FakeClient({})
+    clients = iter([target, jump])
+    prof = ClusterProfile(name='c', hostname='h', username='alice',
+                          auth='key', key_path='/k',
+                          use_jump=True, jump_host='bastion')
+    res = check_connection(prof, client_factory=lambda: next(clients), trust_new=True)
+    assert res.ok is True
+    assert target.closed and jump.closed
+
+
+def test_jump_client_closed_on_target_auth_failure():
+    import paramiko
+    target = FakeClient({}, raise_on_connect=paramiko.AuthenticationException())
+    jump = FakeClient({})
+    clients = iter([target, jump])
+    prof = ClusterProfile(name='c', hostname='h', username='x', auth='password',
+                          use_jump=True, jump_host='bastion')
+    res = check_connection(prof, password='pw',
+                           client_factory=lambda: next(clients), trust_new=True)
+    assert res.ok is False
+    assert target.closed and jump.closed
+
