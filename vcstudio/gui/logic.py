@@ -114,6 +114,11 @@ def profile_from_form(name: str, fields: dict) -> ClusterProfile:
             return int(str(v).strip())
         except (TypeError, ValueError):
             return default
+    env_raw = fields.get('env_lines')
+    if isinstance(env_raw, str):                      # 多行文本框 → 逐行列表
+        env_lines = [ln.strip() for ln in env_raw.splitlines() if ln.strip()]
+    else:
+        env_lines = [str(x).strip() for x in (env_raw or []) if str(x).strip()]
     return ClusterProfile(
         name=name,
         hostname=(fields.get('hostname') or '').strip(),
@@ -127,6 +132,15 @@ def profile_from_form(name: str, fields: dict) -> ClusterProfile:
         jump_port=_int(fields.get('jump_port'), 22),
         remote_root=(fields.get('remote_root') or '').strip(),
         scheduler=fields.get('scheduler') or 'Slurm',
+        scheduler_bin=(fields.get('scheduler_bin') or '').strip(),
+        queue=(fields.get('queue') or '').strip(),
+        nodes=_int(fields.get('nodes'), 1),
+        ppn=_int(fields.get('ppn'), 0),
+        walltime=(fields.get('walltime') or '').strip() or '24:00:00',
+        env_lines=env_lines,
+        vasp_cmd=(fields.get('vasp_cmd') or '').strip(),
+        script_mode=fields.get('script_mode') or 'auto',
+        template_path=(fields.get('template_path') or '').strip(),
     )
 
 

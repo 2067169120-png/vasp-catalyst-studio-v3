@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field, fields as dc_fields
 from pathlib import Path
 
 import yaml
@@ -17,7 +17,7 @@ from vcstudio.shared.config import user_config_dir
 
 @dataclass
 class ClusterProfile:
-    """一个集群的连接配置(不含密码)。auth ∈ {'key','password'}。"""
+    """一个集群的连接+提交配置(不含密码)。auth ∈ {'key','password'}。"""
     name: str
     hostname: str = ''
     port: int = 22
@@ -30,6 +30,17 @@ class ClusterProfile:
     jump_port: int = 22
     remote_root: str = ''
     scheduler: str = 'Slurm'     # Slurm | PBS | LSF | Shell
+    scheduler_bin: str = ''      # 调度器命令目录(如 1w 的 /opt/torque-6.1.2/bin;空=走 PATH)
+    # ── S2 资源参数(自动脚本轨) ──
+    queue: str = ''              # 队列/分区
+    nodes: int = 1
+    ppn: int = 0                 # 每节点核数(0=未设置)
+    walltime: str = '24:00:00'
+    env_lines: list = field(default_factory=list)   # module load / source …(逐行)
+    vasp_cmd: str = ''           # 完整执行行(mpirun -np … vasp_std > log 2>&1)
+    # ── S2 提交脚本双轨 ──
+    script_mode: str = 'auto'    # 'auto'(参数生成) | 'template'(用户模板透传)
+    template_path: str = ''      # 用户模板本地路径(仅路径;内容逐字复用,只填占位符)
 
 
 def default_clusters_path() -> Path:
@@ -38,15 +49,31 @@ def default_clusters_path() -> Path:
 
 
 def load_profiles(path: str | os.PathLike | None = None) -> dict:
-    """读 clusters.yaml → {name: ClusterProfile}。文件不存在 → {}。"""
+    """读 clusters.yaml → {name: ClusterProfile}。文件不存在/损坏/形状不对 → {}。
+
+    GUI 各页 __init__ 同步调用本函数:任何解析问题都兜成空表(同 ledger 兜底口径),
+    绝不让一份坏配置拖死启动。
+    """
     target = Path(path) if path is not None else default_clusters_path()
     if not target.is_file():
         return {}
-    with open(target, 'r', encoding='utf-8') as f:
-        data = yaml.safe_load(f) or {}
+    try:
+        with open(target, 'r', encoding='utf-8') as f:
+            data = yaml.safe_load(f) or {}
+    except (yaml.YAMLError, OSError, UnicodeDecodeError):
+        return {}
+    clusters = data.get('clusters') if isinstance(data, dict) else None
+    if not isinstance(clusters, dict):
+        return {}
+    known = {f.name for f in dc_fields(ClusterProfile)}
     out: dict = {}
-    for name, d in (data.get('clusters') or {}).items():
-        fields = {k: v for k, v in (d or {}).items() if k != 'name'}
+    for name, d in clusters.items():
+        if d is None:
+            d = {}
+        if not isinstance(d, dict):
+            continue                     # 单条目损坏只跳过该条,不拖累其余集群
+        # 只取已知字段:老 yaml 缺新字段 → 走默认;未来版本多出的字段 → 忽略不炸(前后兼容)
+        fields = {k: v for k, v in d.items() if k != 'name' and k in known}
         out[name] = ClusterProfile(name=name, **fields)
     return out
 
