@@ -1,0 +1,337 @@
+"""「任务」页 v1:台账列表 + 上传提交 + 查询状态 + 打开目录。
+
+状态真相在各作业目录的 job.yaml(ledger 只记路径);所有远程动作走后台线程,
+未知主机指纹沿用测连接的确认流程。批量提交前有一次汇总确认(首次提交安全阀)。
+中文注释允许,英文标识符。
+"""
+from __future__ import annotations
+
+import os
+import sys
+
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog
+
+from vcstudio.gui.widgets import LogBox
+from vcstudio.gui import runner
+from vcstudio.cluster import ledger, submitter
+from vcstudio.cluster.connection import open_client, close_quiet, ConnectError
+from vcstudio.cluster.profiles import load_profiles
+from vcstudio.shared import secrets
+
+_STATE_TAG = {
+    'CREATED': ('draft', '#4b5563'), 'UPLOADED': ('up', '#1d4ed8'),
+    'SUBMITTED': ('q', '#7e22ce'), 'QUEUED': ('q', '#7e22ce'),
+    'RUNNING': ('run', '#1d4ed8'), 'DONE': ('ok', '#15803d'),
+    'FAILED': ('err', '#b91c1c'), 'UNCONVERGED': ('warn', '#a16207'),
+    'NEEDS_HUMAN': ('warn', '#a16207'),
+}
+
+
+class JobsTab(ttk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent, padding=10)
+        self.profiles = {}
+        self._build()
+        self.reload()
+
+    def _build(self):
+        bar = ttk.Frame(self)
+        bar.grid(row=0, column=0, sticky='ew', pady=3)
+        ttk.Label(bar, text='目标集群').grid(row=0, column=0, padx=(0, 4))
+        self.profile_var = tk.StringVar()
+        self.profile_cb = ttk.Combobox(bar, textvariable=self.profile_var, width=18, state='readonly')
+        self.profile_cb.grid(row=0, column=1, padx=4)
+        ttk.Button(bar, text='⟳ 刷新列表', command=self.reload).grid(row=0, column=2, padx=4)
+        self.submit_btn = ttk.Button(bar, text='📤 上传并提交(选中)', command=self._on_submit)
+        self.submit_btn.grid(row=0, column=3, padx=4)
+        self.status_btn = ttk.Button(bar, text='🔄 查询状态', command=self._on_refresh_status)
+        self.status_btn.grid(row=0, column=4, padx=4)
+        self.fetch_btn = ttk.Button(bar, text='📥 拉回结果(选中)', command=self._on_fetch)
+        self.fetch_btn.grid(row=0, column=5, padx=4)
+        ttk.Button(bar, text='📂 打开目录', command=self._open_dir).grid(row=0, column=6, padx=4)
+        ttk.Button(bar, text='🗑 移出台账', command=self._remove).grid(row=0, column=7, padx=4)
+
+        cols = ('state', 'task', 'cluster', 'jobid', 'energy', 'updated')
+        self.tree = ttk.Treeview(self, columns=cols, show='tree headings', selectmode='extended')
+        self.tree.heading('#0', text='作业目录')
+        self.tree.column('#0', width=230, anchor='w')
+        for cid, text, w in (('state', '状态', 110), ('task', '类型', 90),
+                             ('cluster', '集群', 90), ('jobid', '作业号', 80),
+                             ('energy', 'E0 (eV)', 100), ('updated', '更新时间', 130)):
+            self.tree.heading(cid, text=text)
+            self.tree.column(cid, width=w, anchor='w')
+        for st, (tag, color) in _STATE_TAG.items():
+            self.tree.tag_configure(st, foreground=color)
+        self.tree.grid(row=1, column=0, sticky='nsew', pady=3)
+        self.tree.bind('<Double-1>', lambda e: self._open_dir())
+        sb = ttk.Scrollbar(self, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        sb.grid(row=1, column=1, sticky='ns')
+
+        self.log = LogBox(self, height=6)
+        self.log.grid(row=2, column=0, columnspan=2, sticky='nsew')
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+        self.rowconfigure(2, weight=0)
+
+    # ── 列表 ──
+    def reload(self):
+        self.profiles = load_profiles()
+        self.profile_cb['values'] = list(self.profiles)
+        if self.profiles and not self.profile_var.get():
+            self.profile_var.set(next(iter(self.profiles)))
+        self.tree.delete(*self.tree.get_children())
+        for job_dir, m in ledger.load_all():
+            name = os.path.basename(os.path.normpath(job_dir))
+            if m is None:
+                self.tree.insert('', 'end', iid=job_dir, text=name,
+                                 values=('缺 job.yaml/目录', '', '', '', '', ''))
+                continue
+            state = m.get('state', '?')
+            hist = m.get('state_history') or []
+            updated = hist[-1].get('at', '') if hist else m.get('created_at', '')
+            energy = m.get('results', {}).get('energy_e0_eV', '')
+            self.tree.insert(
+                '', 'end', iid=job_dir, text=name, tags=(state,),
+                values=(state, f"{m.get('task_type','')}/{m.get('calc_type','')}",
+                        m.get('cluster') or '', m.get('scheduler_job_id') or '',
+                        f'{energy:.4f}' if isinstance(energy, float) else energy,
+                        updated))
+
+    def _selected(self) -> list:
+        return list(self.tree.selection())
+
+    def _profile(self):
+        p = self.profiles.get(self.profile_var.get())
+        if p is None:
+            self.log.write('❌ 请先在集群页配置并保存一个集群,再在上方选择')
+        return p
+
+    def _password_for(self, prof):
+        if prof.auth != 'password':
+            return None
+        pw = secrets.get_password(prof.name)
+        if pw is None:
+            pw = simpledialog.askstring('密码', f'输入 {prof.username}@{prof.hostname} 的密码:', show='*')
+        return pw
+
+    # ── 提交 ──
+    def _on_submit(self, trust_new=False):
+        dirs = self._selected()
+        if not dirs:
+            self.log.write('❌ 请先在列表中选中要提交的作业(可多选)')
+            return
+        prof = self._profile()
+        if prof is None:
+            return
+        # preflight 先行:有问题就地列明,不出手
+        problems = []
+        for d in dirs:
+            errs = submitter.preflight(prof, d)
+            if errs:
+                problems.append(f'{os.path.basename(d)}: ' + '；'.join(errs))
+        if problems:
+            for p in problems:
+                self.log.write(f'❌ {p}')
+            return
+        if not trust_new and not messagebox.askyesno(
+                '确认提交',
+                f'将上传并提交 {len(dirs)} 个作业到「{prof.name}」\n'
+                f'远程根目录:{prof.remote_root}\n脚本模式:{prof.script_mode}\n\n继续?'):
+            return
+        pw = self._password_for(prof)
+        self.submit_btn.configure(state='disabled')
+        self.log.write(f'⏳ 连接并提交 {len(dirs)} 个作业…')
+        q = runner.submit(_submit_batch, prof, pw, dirs, trust_new)
+        self.after(200, lambda: self._poll_submit(q, prof, pw, dirs))
+
+    def _poll_submit(self, q, prof, pw, dirs):
+        item = runner.poll(q)
+        if item is None:
+            self.after(200, lambda: self._poll_submit(q, prof, pw, dirs))
+            return
+        kind, payload = item
+        self.submit_btn.configure(state='normal')
+        if kind == 'error':
+            self.log.write(f'❌ 提交异常:{payload}')
+            return
+        if payload.get('needs_trust'):
+            if messagebox.askyesno('未知主机', f"{payload['message']}\n\n是否信任该主机并重试?"):
+                self._on_submit(trust_new=True)
+            else:
+                self.log.write('已取消(未信任主机)')
+            return
+        for dir_, ok, msg in payload['results']:
+            self.log.write(('✅' if ok else '❌') + f' {os.path.basename(dir_)}:{msg}')
+        self.reload()
+
+    # ── 查状态 ──
+    def _on_refresh_status(self, trust_new=False):
+        prof = self._profile()
+        if prof is None:
+            return
+        targets = []
+        for job_dir, m in ledger.load_all():
+            if m and m.get('scheduler_job_id') and m.get('cluster') == prof.name \
+                    and m.get('state') in ('SUBMITTED', 'QUEUED', 'RUNNING'):
+                targets.append(job_dir)
+        if not targets:
+            self.log.write(f'ℹ 「{prof.name}」上没有待查询的作业(SUBMITTED/QUEUED/RUNNING)')
+            return
+        pw = self._password_for(prof)
+        self.status_btn.configure(state='disabled')
+        self.log.write(f'⏳ 查询 {len(targets)} 个作业状态…')
+        q = runner.submit(_refresh_batch, prof, pw, targets, trust_new)
+        self.after(200, lambda: self._poll_status(q))
+
+    def _poll_status(self, q):
+        item = runner.poll(q)
+        if item is None:
+            self.after(200, lambda: self._poll_status(q))
+            return
+        kind, payload = item
+        self.status_btn.configure(state='normal')
+        if kind == 'error':
+            self.log.write(f'❌ 查询异常:{payload}')
+            return
+        if payload.get('needs_trust'):
+            if messagebox.askyesno('未知主机', f"{payload['message']}\n\n是否信任该主机并重试?"):
+                self._on_refresh_status(trust_new=True)
+            return
+        for dir_, msg in payload['results']:
+            self.log.write(f'🔄 {os.path.basename(dir_)}:{msg}')
+        self.reload()
+
+    # ── 拉回结果(S3) ──
+    def _on_fetch(self, trust_new=False):
+        dirs = [d for d in self._selected()]
+        if not dirs:
+            self.log.write('❌ 请先选中要拉回结果的作业(通常是 DONE/UNCONVERGED 的)')
+            return
+        prof = self._profile()
+        if prof is None:
+            return
+        pw = self._password_for(prof)
+        self.fetch_btn.configure(state='disabled')
+        self.log.write(f'⏳ 拉回 {len(dirs)} 个作业的 CONTCAR/OSZICAR/OUTCAR…')
+        q = runner.submit(_fetch_batch, prof, pw, dirs, trust_new)
+        self.after(200, lambda: self._poll_fetch(q))
+
+    def _poll_fetch(self, q):
+        item = runner.poll(q)
+        if item is None:
+            self.after(200, lambda: self._poll_fetch(q))
+            return
+        kind, payload = item
+        self.fetch_btn.configure(state='normal')
+        if kind == 'error':
+            self.log.write(f'❌ 拉回异常:{payload}')
+            return
+        if payload.get('needs_trust'):
+            if messagebox.askyesno('未知主机', f"{payload['message']}\n\n是否信任该主机并重试?"):
+                self._on_fetch(trust_new=True)
+            return
+        for dir_, ok, msg in payload['results']:
+            self.log.write(('✅' if ok else '❌') + f' {os.path.basename(dir_)}:{msg}')
+        self.reload()
+
+    # ── 其他 ──
+    def _open_dir(self):
+        for d in self._selected()[:1]:
+            if os.path.isdir(d):
+                try:
+                    if sys.platform == 'win32':
+                        os.startfile(d)  # noqa
+                    else:
+                        import subprocess
+                        subprocess.Popen(['xdg-open', d])
+                except Exception as e:
+                    self.log.write(f'⚠ 无法打开目录:{e}')
+
+    def _remove(self):
+        dirs = self._selected()
+        if dirs and messagebox.askyesno('移出台账', f'把 {len(dirs)} 个作业移出台账?(不删除磁盘文件)'):
+            for d in dirs:
+                ledger.unregister(d)
+            self.reload()
+
+
+# ── 后台线程体(不碰 Tk) ─────────────────────────────────────────────────────
+def _job_errors():
+    """单作业可失败的异常集:一条作业出错(含连接抖动的 SSHException)只失败那一条,
+    不打断整批。paramiko 延迟导入,保持本模块可在无 paramiko 环境导入。"""
+    from paramiko.ssh_exception import SSHException
+    return (ValueError, RuntimeError, OSError, SSHException)
+
+
+def _submit_batch(prof, pw, dirs, trust_new):
+    try:
+        client, jump = open_client(prof, pw, trust_new=trust_new)
+    except ConnectError as e:
+        if e.needs_trust:
+            return {'needs_trust': True, 'message': str(e), 'results': []}
+        raise RuntimeError(str(e))
+    results = []
+    try:
+        sftp = client.open_sftp()
+        for d in dirs:
+            try:
+                m = submitter.submit_job(client, sftp, prof, d)
+                results.append((d, True, f"已提交,作业号 {m['scheduler_job_id']}"))
+            except _job_errors() as e:
+                results.append((d, False, str(e)))
+        sftp.close()
+    finally:
+        close_quiet(client, jump)
+    return {'needs_trust': False, 'results': results}
+
+
+def _fetch_batch(prof, pw, dirs, trust_new):
+    try:
+        client, jump = open_client(prof, pw, trust_new=trust_new)
+    except ConnectError as e:
+        if e.needs_trust:
+            return {'needs_trust': True, 'message': str(e), 'results': []}
+        raise RuntimeError(str(e))
+    results = []
+    try:
+        sftp = client.open_sftp()
+        for d in dirs:
+            try:
+                fetched, missing = submitter.fetch_results(client, sftp, d)
+                msg = '已拉回 ' + ('、'.join(fetched) if fetched else '(无)')
+                if missing:
+                    msg += f'(远端缺 {"、".join(missing)})'
+                results.append((d, bool(fetched), msg))
+            except _job_errors() as e:
+                results.append((d, False, str(e)))
+        sftp.close()
+    finally:
+        close_quiet(client, jump)
+    return {'needs_trust': False, 'results': results}
+
+
+def _refresh_batch(prof, pw, dirs, trust_new):
+    try:
+        client, jump = open_client(prof, pw, trust_new=trust_new)
+    except ConnectError as e:
+        if e.needs_trust:
+            return {'needs_trust': True, 'message': str(e), 'results': []}
+        raise RuntimeError(str(e))
+    results = []
+    try:
+        live = submitter.query_states(client, prof)
+        for d in dirs:
+            try:
+                m = submitter.refresh_job(client, prof, d, live_states=live)
+                note = m['state']
+                e0 = m.get('results', {}).get('energy_e0_eV')
+                if e0 is not None:
+                    note += f'(E0={e0:.4f} eV)'
+                results.append((d, note))
+            except _job_errors() as e:
+                results.append((d, f'查询失败:{e}'))
+    finally:
+        close_quiet(client, jump)
+    return {'needs_trust': False, 'results': results}

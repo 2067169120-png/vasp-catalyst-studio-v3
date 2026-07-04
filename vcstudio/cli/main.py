@@ -46,14 +46,16 @@ def cmd_gen(args) -> int:
     print(f"已生成: {res['out_dir']}")
     print(f"元素: {res['elements']}  KPOINTS: {res['kpoints']}")
 
-    # 落 job.yaml(任务台账雏形)。失败只告警:绝不因台账问题撤销已生成的四件套。
+    # 落 job.yaml + 登记台账。失败只告警:绝不因台账问题撤销已生成的四件套。
     try:
         from vcstudio.shared import manifest
+        from vcstudio.cluster import ledger
         manifest.create_from_build(res['out_dir'], res, poscar_path=args.poscar,
                                    validate=not args.no_validate)
-        print('已写 job.yaml (state=CREATED)')
+        ledger.register(res['out_dir'])
+        print('已写 job.yaml 并登记台账 (state=CREATED)')
     except Exception as e:
-        print(f'警告: job.yaml 写入失败(不影响四件套): {e}', file=sys.stderr)
+        print(f'警告: job.yaml/台账写入失败(不影响四件套): {e}', file=sys.stderr)
     return 0
 
 

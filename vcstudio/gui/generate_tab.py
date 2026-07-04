@@ -184,9 +184,11 @@ class GenerateTab(ttk.Frame):
                 payload['out_dir'], payload,
                 poscar_path=self._last_run['poscar'],
                 validate=self._last_run['validate'])
-            self.log.write('📝 已写 job.yaml(状态 CREATED,供后续提交/监控追踪)')
+            from vcstudio.cluster import ledger
+            ledger.register(payload['out_dir'])
+            self.log.write('📝 已写 job.yaml 并登记台账(到「任务」页可上传提交)')
         except Exception as e:
-            self.log.write(f'⚠ job.yaml 写入失败(不影响四件套):{e}')
+            self.log.write(f'⚠ job.yaml/台账写入失败(不影响四件套):{e}')
 
     def _open_out(self):
         if self._out_dir and os.path.isdir(self._out_dir):
