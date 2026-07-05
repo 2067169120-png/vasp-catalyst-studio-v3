@@ -11,7 +11,7 @@ import sys
 import time
 
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox, simpledialog, filedialog
 
 from vcstudio.gui.widgets import LogBox
 from vcstudio.gui import runner
@@ -20,7 +20,7 @@ from vcstudio.cluster.connection import open_client, close_quiet, ConnectError
 from vcstudio.cluster.profiles import load_profiles
 from vcstudio.project import report
 from vcstudio.shared import secrets
-from vcstudio.shared.config import user_config_dir
+from vcstudio.shared import manifest as manifest_mod
 
 _STATE_TAG = {
     'CREATED': ('draft', '#4b5563'), 'UPLOADED': ('up', '#1d4ed8'),
@@ -58,13 +58,14 @@ class JobsTab(ttk.Frame):
         ttk.Button(bar, text='📂 打开目录', command=self._open_dir).grid(row=0, column=8, padx=4)
         ttk.Button(bar, text='🗑 移出台账', command=self._remove).grid(row=0, column=9, padx=4)
 
-        cols = ('state', 'task', 'cluster', 'jobid', 'energy', 'updated')
+        cols = ('state', 'task', 'cluster', 'jobid', 'energy', 'diag', 'updated')
         self.tree = ttk.Treeview(self, columns=cols, show='tree headings', selectmode='extended')
         self.tree.heading('#0', text='作业目录')
         self.tree.column('#0', width=230, anchor='w')
-        for cid, text, w in (('state', '状态', 110), ('task', '类型', 90),
-                             ('cluster', '集群', 90), ('jobid', '作业号', 80),
-                             ('energy', 'E0 (eV)', 100), ('updated', '更新时间', 130)):
+        for cid, text, w in (('state', '状态', 100), ('task', '类型', 84),
+                             ('cluster', '集群', 84), ('jobid', '作业号', 74),
+                             ('energy', 'E0 (eV)', 96), ('diag', '诊断', 150),
+                             ('updated', '更新时间', 128)):
             self.tree.heading(cid, text=text)
             self.tree.column(cid, width=w, anchor='w')
         for st, (tag, color) in _STATE_TAG.items():
@@ -92,18 +93,23 @@ class JobsTab(ttk.Frame):
             name = os.path.basename(os.path.normpath(job_dir))
             if m is None:
                 self.tree.insert('', 'end', iid=job_dir, text=name,
-                                 values=('缺 job.yaml/目录', '', '', '', '', ''))
+                                 values=('缺 job.yaml/目录', '', '', '', '', '', ''))
                 continue
             state = m.get('state', '?')
             hist = m.get('state_history') or []
             updated = hist[-1].get('at', '') if hist else m.get('created_at', '')
-            energy = m.get('results', {}).get('energy_e0_eV', '')
+            res = m.get('results') or {}
+            energy = res.get('energy_e0_eV', '')
+            dgn = res.get('diagnosis') or {}
+            diag = ''
+            if dgn.get('failure_class') and state in ('FAILED', 'UNCONVERGED', 'NEEDS_HUMAN'):
+                diag = dgn['failure_class'] + ('♻可续算' if dgn.get('restartable') else '')
             self.tree.insert(
                 '', 'end', iid=job_dir, text=name, tags=(state,),
                 values=(state, f"{m.get('task_type','')}/{m.get('calc_type','')}",
                         m.get('cluster') or '', m.get('scheduler_job_id') or '',
                         f'{energy:.4f}' if isinstance(energy, float) else energy,
-                        updated))
+                        diag, updated))
 
     def _selected(self) -> list:
         return list(self.tree.selection())
@@ -244,17 +250,22 @@ class JobsTab(ttk.Frame):
 
     # ── 续算(有界恢复) ──
     def _on_continue(self, trust_new=False):
-        dirs = self._selected()
-        if not dirs:
+        sel = self._selected()
+        if not sel:
             self.log.write('❌ 请先选中要续算的作业(仅未收敛/墙钟/ZBRENT 等可续算)')
             return
         prof = self._profile()
         if prof is None:
             return
+        dirs, skipped = _filter_continuable(sel)
+        if not dirs:
+            self.log.write('❌ 选中作业均不可续算(需:已结束 + 诊断标可续算 + 未达 3 轮上限)')
+            return
+        tail = f'(跳过 {skipped} 个不可续算/仍在跑)' if skipped else ''
         if not trust_new and not messagebox.askyesno(
                 '确认续算',
-                f'将对选中的 {len(dirs)} 个作业从 CONTCAR 续算并重投到「{prof.name}」\n'
-                f'仅"可续算"分类会被处理;INCAR 冻结;每作业上限 3 轮。\n\n继续?'):
+                f'将对 {len(dirs)} 个可续算作业从 CONTCAR 续算并重投到「{prof.name}」{tail}\n'
+                f'INCAR 冻结;每作业上限 3 轮。\n\n继续?'):
             return
         pw = self._password_for(prof)
         self.continue_btn.configure(state='disabled')
@@ -286,9 +297,15 @@ class JobsTab(ttk.Frame):
         if not dirs:
             self.log.write('ℹ 台账为空,无可报告的作业')
             return
-        out = user_config_dir() / 'reports' / f'run-report-{time.strftime("%Y%m%d-%H%M%S")}.html'
+        path = filedialog.asksaveasfilename(       # 用户自选落点(与项目页导出 CSV 一致,不塞隐藏目录)
+            title='保存运行报告', defaultextension='.html',
+            initialfile=f'run-report-{time.strftime("%Y%m%d-%H%M%S")}.html',
+            filetypes=[('HTML 报告', '*.html'), ('Markdown', '*.md')])
+        if not path:
+            return
+        fmt = 'md' if str(path).lower().endswith('.md') else 'html'
         try:
-            p = report.write_report(dirs, out, title='VASP 批量运行报告')
+            p = report.write_report(dirs, path, title='VASP 批量运行报告', fmt=fmt)
         except Exception as e:                                       # noqa: BLE001 报告失败不该崩界面
             self.log.write(f'❌ 生成报告失败:{e}')
             return
@@ -378,6 +395,28 @@ def _fetch_batch(prof, pw, dirs, trust_new):
     return {'needs_trust': False, 'results': results}
 
 
+def _filter_continuable(dirs):
+    """本地预筛(证据都在 job.yaml):终态 + diagnosis.restartable + 未达轮次上限。
+
+    返回 (可续算 dirs, 跳过数)。避免把整批原样送去连接后逐个失败刷屏,且不对仍在跑的
+    作业出手(与 submitter.continue_from_contcar 的状态门一致)。纯函数,可离线测。
+    """
+    eligible, skipped = [], 0
+    for d in dirs:
+        m = manifest_mod.load_manifest(d)
+        res = (m or {}).get('results') or {}
+        dgn = res.get('diagnosis') or {}
+        rounds = int(res.get('continue_rounds', 0))
+        if (m is not None
+                and m.get('state') not in ('UPLOADED', 'SUBMITTED', 'QUEUED', 'RUNNING')
+                and dgn.get('restartable')
+                and rounds < submitter.CONTINUE_MAX_ROUNDS):
+            eligible.append(d)
+        else:
+            skipped += 1
+    return eligible, skipped
+
+
 def _continue_batch(prof, pw, dirs, trust_new):
     """CONTCAR 续算批量线程体:每作业调 submitter.continue_from_contcar(不可续算的自失败)。"""
     try:
@@ -413,7 +452,11 @@ def _refresh_batch(prof, pw, dirs, trust_new):
             try:
                 m = submitter.refresh_job(client, prof, d, live_states=live)
                 note = m['state']
-                e0 = m.get('results', {}).get('energy_e0_eV')
+                res = m.get('results') or {}
+                dgn = res.get('diagnosis') or {}
+                if dgn.get('failure_class') and m['state'] in ('FAILED', 'UNCONVERGED', 'NEEDS_HUMAN'):
+                    note += f" [{dgn['failure_class']}{'·可续算' if dgn.get('restartable') else ''}] {dgn.get('evidence', '')}"
+                e0 = res.get('energy_e0_eV')
                 if e0 is not None:
                     note += f'(E0={e0:.4f} eV)'
                 results.append((d, note))

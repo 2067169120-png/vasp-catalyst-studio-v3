@@ -1,5 +1,32 @@
 """jobs_tab 后台批量函数测试(不建 Tk 窗口,只测线程体):连接关闭责任与单作业失败隔离。"""
 from vcstudio.gui import jobs_tab
+from vcstudio.shared import manifest as mm
+
+
+def _mk_job(tmp_path, name, state, *, restartable=None, rounds=0):
+    d = tmp_path / name
+    d.mkdir()
+    m = mm.new_manifest(job_id=name, system='s', task_type='relax', calc_type='slab', inputs={})
+    if state != 'CREATED':
+        mm.set_state(m, state)
+    res = {}
+    if restartable is not None:
+        res['diagnosis'] = {'failure_class': 'NONCONVERGED', 'restartable': restartable}
+    if rounds:
+        res['continue_rounds'] = rounds
+    m['results'] = res
+    mm.save_manifest(d, m)
+    return str(d)
+
+
+def test_filter_continuable_partitions_selection(tmp_path):
+    ok = _mk_job(tmp_path, 'ok', 'UNCONVERGED', restartable=True)
+    running = _mk_job(tmp_path, 'run', 'RUNNING', restartable=True)      # 仍在跑 → 跳过
+    hardfail = _mk_job(tmp_path, 'seg', 'FAILED', restartable=False)     # 不可续算 → 跳过
+    capped = _mk_job(tmp_path, 'cap', 'UNCONVERGED', restartable=True, rounds=3)  # 到顶 → 跳过
+    nodiag = _mk_job(tmp_path, 'done', 'DONE')                           # 无诊断 → 跳过
+    eligible, skipped = jobs_tab._filter_continuable([ok, running, hardfail, capped, nodiag])
+    assert eligible == [ok] and skipped == 4
 
 
 class FakeSFTP:
