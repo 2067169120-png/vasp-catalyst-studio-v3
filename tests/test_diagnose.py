@@ -99,6 +99,43 @@ def test_scan_log_none_when_clean():
     assert dg.scan_log('') is None
 
 
+# ── 已知 VASP 内部错误签名(Custodian 交叉核对) ──
+def test_scan_vasp_error_signatures():
+    assert dg.scan_vasp_error(' TOO FEW BANDS\n')[0] == 'TOO_FEW_BANDS'
+    assert dg.scan_vasp_error('Tetrahedron method fails (number of k-points < 4)')[0] == 'TETRAHEDRON'
+    assert dg.scan_vasp_error('LAPACK: Routine ZPOTRF failed')[0] == 'ZPOTRF'
+    assert dg.scan_vasp_error('BRMIX: very serious problems')[0] == 'BRMIX'
+    assert dg.scan_vasp_error('Error EDDDAV: Call to ZHEGV failed')[0] == 'EDDDAV'
+    assert dg.scan_vasp_error('ERROR RSPHER')[0] == 'LREAL'
+    assert dg.scan_vasp_error('internal error in subroutine PRICEL')[0] == 'SYMMETRY'
+    assert dg.scan_vasp_error('VERY BAD NEWS! internal error in subroutine XXX')[0] == 'VASP_INTERNAL'
+
+
+def test_scan_vasp_error_no_false_positive():
+    assert dg.scan_vasp_error('running fine, ionic step 5 converged\n') is None
+    assert dg.scan_vasp_error('BRMIX') is None                 # 裸 BRMIX(正常混合类型回显)不误报
+    assert dg.scan_vasp_error('') is None
+
+
+def test_classify_known_vasp_error_is_needs_human():
+    d = classify(outcar_size=90000, oszicar_size=3000, converged=False,
+                 log_tail='some output\n Tetrahedron method fails\n')
+    assert d.failure_class == 'TETRAHEDRON' and d.state == 'NEEDS_HUMAN' and not d.restartable
+
+
+def test_classify_zbrent_still_restartable_over_error_table():
+    """ZBRENT 仍走 scan_log 可续算路径,不被通用错误表吞成 NEEDS_HUMAN。"""
+    d = classify(outcar_size=90000, log_tail='ZBRENT: fatal error in bracketing\n')
+    assert d.failure_class == dg.ZBRENT and d.restartable
+
+
+def test_converged_ignores_benign_error_text_in_log():
+    """收敛成功的作业即便日志里有可自恢复告警,也不被误判(收敛短路在前)。"""
+    d = classify(converged=True, energy=-100.0,
+                 log_tail='WARNING: Sub-Space-Matrix is not hermitian in DAV\n')
+    assert d.failure_class == dg.CONVERGED and d.state == 'DONE'
+
+
 # ── 有输出:退出码 137 = OOM ──
 def test_exit_137_is_oom():
     d = classify(outcar_size=90000, exit_code=137)

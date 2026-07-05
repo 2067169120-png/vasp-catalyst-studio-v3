@@ -63,6 +63,37 @@ _OOM_EXIT = 137             # 128+9(SIGKILL),常见 OOM/超墙钟被杀
 _ZBRENT_RE = re.compile(r'ZBRENT:\s*fatal', re.IGNORECASE)
 _SEGV_RE = re.compile(r'sigsegv|segmentation fault', re.IGNORECASE)
 
+# 已知 VASP 内部错误签名(字面串核对自 pymatgen Custodian VaspErrorHandler)。
+# 命中 → 具体命名 + 标准补救提示,状态 NEEDS_HUMAN:这些几乎都靠改 INCAR
+# (ISMEAR/LREAL/ALGO/SYMPREC/NBANDS…)修复,而本平台守方法学主权**绝不自动改用户 INCAR**,
+# 故只精确诊断并给建议交人工,不自动出手(区别于 Custodian 的 in-situ 保姆)。
+# 顺序 = 优先级(具体在前,泛化兜底在后);只收清晰致命项,避开可自恢复的告警(如单次
+# Sub-Space-Matrix not hermitian),防误报。
+_VASP_ERROR_TABLE = [
+    (re.compile(r'TOO FEW BANDS'), 'TOO_FEW_BANDS', '能带不足:增大 NBANDS'),
+    (re.compile(r'Tetrahedron method fails|Routine TETIRR needs special values'), 'TETRAHEDRON',
+     '四面体积分失败(金属/slab 常见):ISMEAR 改 0 或 1、SIGMA≈0.05,或加密 k 点'),
+    (re.compile(r'LAPACK: Routine ZPOTRF failed|Routine ZPOTRF ZTRTRI'), 'ZPOTRF',
+     'ZPOTRF 分解失败(常因原子过近/晶胞塌缩):检查结构是否重叠'),
+    (re.compile(r'BRMIX: very serious problems'), 'BRMIX',
+     '电荷混合严重发散:检查初始结构/磁矩,或调 AMIX/BMIX/IMIX'),
+    (re.compile(r'Error EDDDAV: Call to ZHEGV failed'), 'EDDDAV',
+     'Davidson 本征求解失败:试 ALGO=Normal 或 All'),
+    (re.compile(r'Call to routine ZHEEV failed|EDDIAG: Call to (?:routine )?ZHEEV'), 'ZHEEV',
+     '对角化 ZHEEV 失败:试 ALGO=Normal'),
+    (re.compile(r'ERROR RSPHER|REAL_OPTLAY: internal error|REAL_OPT: internal ERROR'), 'LREAL',
+     '实空间投影错误:试 LREAL=.FALSE.'),
+    (re.compile(r'internal error in subroutine PRICEL|POSMAP|group operation missing'
+                r'|Inconsistent Bravais lattice|non-integer element in rotation matrix'), 'SYMMETRY',
+     '对称性判定错误:试 ISYM=0 或调 SYMPREC'),
+    (re.compile(r'supplied exchange-correlation table'), 'FEXCF',
+     'XC 表错误:检查 POTCAR/GGA 设置是否匹配'),
+    (re.compile(r'One of the lattice vectors is very long .*AMIN'), 'AMIN',
+     '长晶胞混合问题:设 AMIN=0.01'),
+    (re.compile(r'VERY BAD NEWS|internal error in subroutine'), 'VASP_INTERNAL',
+     'VASP 内部错误:查 OUTCAR/stdout 详情人工处理'),
+]
+
 
 @dataclass
 class Diagnosis:
@@ -100,6 +131,16 @@ def scan_log(log_tail: str) -> str | None:
     nonempty = [ln.strip() for ln in log_tail.splitlines() if ln.strip()]
     if len(nonempty) >= 3 and all(ln == '1' for ln in nonempty[-3:]):
         return SIGSEGV
+    return None
+
+
+def scan_vasp_error(log_tail: str):
+    """扫已知 VASP 内部错误签名 → (label, 补救提示) 或 None(Custodian 字面串)。"""
+    if not log_tail:
+        return None
+    for rx, label, hint in _VASP_ERROR_TABLE:
+        if rx.search(log_tail):
+            return label, hint
     return None
 
 
@@ -159,6 +200,10 @@ def classify(*, scheduler_reason: str | None = None, exit_code: int | None = Non
     if exit_code == _OOM_EXIT:                      # 137 = OOM/被杀
         return Diagnosis(OOM, FAILURE_TO_STATE[OOM], False,
                          f'退出码 {exit_code}(128+9 SIGKILL)——疑 OOM/超墙钟被杀')
+    ve = scan_vasp_error(log_tail)                  # 已知 VASP 内部错误(命名+建议,交人工)
+    if ve is not None:
+        label, hint = ve
+        return Diagnosis(label, 'NEEDS_HUMAN', False, f'命中 VASP 已知错误 {label}:{hint}')
     if scheduler_reason == R_FAILED:               # 泛化失败无更具体信号 → 交人工
         return Diagnosis(UNKNOWN, FAILURE_TO_STATE[UNKNOWN], False,
                          '调度器报失败但无具体原因/日志签名,需人工')
