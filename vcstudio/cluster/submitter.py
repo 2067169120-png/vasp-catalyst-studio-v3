@@ -14,6 +14,7 @@ import shlex
 import time
 
 from vcstudio.cluster import script_builder
+from vcstudio.cluster import diagnose
 from vcstudio.cluster.schedulers import (
     JobScriptSpec, get_dialect, QUEUED, RUNNING, GONE,
 )
@@ -156,16 +157,21 @@ def query_states(client, profile) -> dict:
     return dialect.parse_status(out)
 
 
-def refresh_job(client, profile, job_dir: str, live_states: dict | None = None) -> dict:
-    """按调度器现状更新一个作业的 manifest;GONE 时做收敛判定+能量提取。
+def refresh_job(client, profile, job_dir: str, live_states: dict | None = None,
+                terminal_reasons: dict | None = None) -> dict:
+    """按调度器现状更新一个作业的 manifest;终态时做取证 + 失败分类。
 
-    live_states 可传入 query_states 结果避免逐作业重复查询。
+    live_states/terminal_reasons 可传入 query_scheduler 结果避免逐作业重复查询。
+    终态分支不再只有 DONE/UNCONVERGED:调 diagnose.classify 综合 调度器原因 + 退出码 +
+    OUTCAR/OSZICAR 完整性 + 日志签名 + 收敛串 + 能量合理性 → DONE/UNCONVERGED/FAILED/
+    NEEDS_HUMAN,并把结构化诊断写回 results.diagnosis + 失败时追加 attempts(可审计)。
     """
     m = manifest_mod.load_manifest(job_dir)
     if m is None or not m.get('scheduler_job_id'):
         return m
     states = live_states if live_states is not None else query_states(client, profile)
-    u = states.get(str(m['scheduler_job_id']), GONE)
+    jid = str(m['scheduler_job_id'])
+    u = states.get(jid, GONE)
 
     if u == QUEUED:
         if m['state'] != 'QUEUED':
@@ -178,21 +184,88 @@ def refresh_job(client, profile, job_dir: str, live_states: dict | None = None) 
             manifest_mod.save_manifest(job_dir, m)
         return m
 
-    # GONE:调度器已无此作业 → 收敛判定(grep 'reached required accuracy',旧版实测口径)
+    # 终态(GONE / 调度器终态原因)→ 取证 + 分类(复活 FAILED/NEEDS_HUMAN)
     remote = m.get('remote_dir') or ''
-    out, _ = run_cmd(client, f'grep -c "reached required accuracy" '
-                             f'{shlex.quote(remote + "/OUTCAR")} 2>/dev/null || echo 0')
-    converged = _first_int(out) > 0
+    reason = (terminal_reasons or {}).get(jid)
+    outcar_size, oszicar_size = _stat_sizes(client, remote)
+    converged = _grep_converged(client, remote)
+    exit_code, log_tail = _read_log(client, remote)
     energy = _read_e0(client, remote)
+
+    d = diagnose.classify(
+        scheduler_reason=reason, exit_code=exit_code,
+        outcar_size=outcar_size, oszicar_size=oszicar_size,
+        log_tail=log_tail, converged=converged, energy=energy)
+
     if energy is not None:
         m.setdefault('results', {})['energy_e0_eV'] = energy
-    if converged:
-        manifest_mod.set_state(m, 'DONE', note='reached required accuracy')
-    else:
-        manifest_mod.set_state(m, 'UNCONVERGED',
-                               note='调度器已结束但未见收敛标志(可能超墙钟/中断,待修复区处理)')
+    m.setdefault('results', {})['diagnosis'] = {
+        'failure_class': d.failure_class,
+        'restartable': d.restartable,
+        'evidence': d.evidence,
+        'scheduler_reason': reason,
+        'exit_code': exit_code,
+        'outcar_bytes': outcar_size,
+        'classified_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+    }
+    if d.failure_class != diagnose.CONVERGED:
+        m.setdefault('attempts', []).append({
+            'n': len(m.get('attempts') or []) + 1,
+            'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'result': 'failed',
+            'failure_class': d.failure_class,
+            'to_state': d.state,
+        })
+    manifest_mod.set_state(m, d.state, note=f'{d.failure_class}: {d.evidence}')
     manifest_mod.save_manifest(job_dir, m)
     return m
+
+
+def _stat_sizes(client, remote: str):
+    """一次 stat 取 OUTCAR/OSZICAR 字节数 → (outcar, oszicar);缺失文件对应 None。
+
+    与收敛 grep 分开:区分"缺输出/启动即死"(size None/0)与"跑了但没收敛",
+    堵掉旧版 '|| echo 0' 把缺 OUTCAR 误当未收敛的假阴性(缺口分析 P0)。
+    """
+    if not remote:
+        return None, None
+    out, _ = run_cmd(client, f"cd {shlex.quote(remote)} && "
+                             f"stat -c '%n %s' OUTCAR OSZICAR 2>/dev/null")
+    sizes = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].lstrip('-').isdigit():
+            sizes[parts[0]] = int(parts[1])
+    return sizes.get('OUTCAR'), sizes.get('OSZICAR')
+
+
+def _grep_converged(client, remote: str) -> bool:
+    """OUTCAR 是否含 'reached required accuracy'(电子步达精度;缺文件 → False)。"""
+    if not remote:
+        return False
+    out, _ = run_cmd(client, f'grep -c "reached required accuracy" '
+                             f'{shlex.quote(remote + "/OUTCAR")} 2>/dev/null || echo 0')
+    return _first_int(out) > 0
+
+
+def _read_log(client, remote: str):
+    """取合并 stdout 日志:EXIT 标记(退出码)+ 尾部文本(供 diagnose.scan_log 扫签名)。
+
+    脚本 run_block 尾部 echo "EXIT: $?";PBS -j oe 合并到 <name>.o<num>,Slurm 到
+    slurm-<jid>.out。用 glob 兜住命名差异,一次 SSH 取回。→ (exit_code|None, tail)。
+    """
+    if not remote:
+        return None, ''
+    out, _ = run_cmd(
+        client,
+        f"cd {shlex.quote(remote)} && "
+        f"grep -h 'EXIT:' *.o* slurm-*.out vasp.out log 2>/dev/null | tail -1; "
+        f"echo '___VCSLOG___'; "
+        f"tail -n 20 *.o* slurm-*.out vasp.out log 2>/dev/null")
+    marker, _sep, tail = out.partition('___VCSLOG___')
+    mm = re.search(r'EXIT:\s*(-?\d+)', marker)
+    exit_code = int(mm.group(1)) if mm else None
+    return exit_code, tail
 
 
 def _first_int(text: str) -> int:

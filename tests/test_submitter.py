@@ -171,12 +171,15 @@ def test_refresh_job_states(tmp_path):
     m = submitter.refresh_job(done_client, _profile(), d, live_states={})
     assert m['state'] == 'DONE'
     assert m['results']['energy_e0_eV'] == pytest.approx(-435.61154)
-    # 消失 + 未收敛 → UNCONVERGED(交修复区)
+    assert m['results']['diagnosis']['failure_class'] == 'CONVERGED'
+    # 消失 + 有输出但未收敛 → NONCONVERGED → UNCONVERGED(可续算)
     d2 = _job_dir(tmp_path / 'second')
     submitter.submit_job(FakeClient(script=[('qsub', '99.cluster\n')]), FakeSFTP(), _profile(), d2)
-    m2 = submitter.refresh_job(FakeClient(script=[('grep -c', '0\n')]),
-                               _profile(), d2, live_states={})
+    m2 = submitter.refresh_job(
+        FakeClient(script=[('grep -c', '0\n'), ('stat -c', 'OUTCAR 90000\nOSZICAR 3000\n')]),
+        _profile(), d2, live_states={})
     assert m2['state'] == 'UNCONVERGED'
+    assert m2['results']['diagnosis']['failure_class'] == 'NONCONVERGED'
 
 
 def test_run_cmd_check_raises_on_nonzero_exit():
@@ -221,6 +224,45 @@ def test_submit_and_refresh_quote_spaced_remote_dir(tmp_path):
     assert m['state'] == 'DONE'
     assert any(f"'{remote}/OUTCAR'" in c for c in done_client.commands)
     assert any(f"'{remote}/OSZICAR'" in c for c in done_client.commands)
+
+
+def test_refresh_job_no_output_is_needs_human(tmp_path):
+    """缺 OUTCAR/OSZICAR(启动即死/缺 POTCAR)→ NO_OUTPUT → NEEDS_HUMAN,不再误当未收敛。"""
+    d = _job_dir(tmp_path)
+    submitter.submit_job(FakeClient(script=[('qsub', '55.c\n')]), FakeSFTP(), _profile(), d)
+    client = FakeClient(script=[('grep -c', '0\n')])      # stat/log 未脚本 → 空 = 零输出
+    m = submitter.refresh_job(client, _profile(), d, live_states={})
+    assert m['state'] == 'NEEDS_HUMAN'
+    assert m['results']['diagnosis']['failure_class'] == 'NO_OUTPUT'
+
+
+def test_refresh_job_sigsegv_is_failed_with_attempt(tmp_path):
+    """日志段错误签名 → SIGSEGV → FAILED,并追加一条 failed attempt。"""
+    d = _job_dir(tmp_path)
+    submitter.submit_job(FakeClient(script=[('qsub', '56.c\n')]), FakeSFTP(), _profile(), d)
+    client = FakeClient(script=[
+        ('grep -c', '0\n'),
+        ('stat -c', 'OUTCAR 90000\nOSZICAR 3000\n'),
+        ('___VCSLOG___', 'EXIT: 139\n___VCSLOG___\nrunning\n1\n1\n1\n'),
+    ])
+    m = submitter.refresh_job(client, _profile(), d, live_states={})
+    assert m['state'] == 'FAILED'
+    assert m['results']['diagnosis']['failure_class'] == 'SIGSEGV'
+    assert any(a.get('result') == 'failed' for a in m['attempts'])
+
+
+def test_refresh_job_converged_but_positive_energy_needs_human(tmp_path):
+    """收敛串在场但 E0>0(结构重叠)→ BAD_ENERGY → NEEDS_HUMAN(防收敛却是垃圾数入表)。"""
+    d = _job_dir(tmp_path)
+    submitter.submit_job(FakeClient(script=[('qsub', '57.c\n')]), FakeSFTP(), _profile(), d)
+    client = FakeClient(script=[
+        ('grep -c', '1\n'),
+        ('tail -2', '   5 F= 0.5E+01 E0= 0.5E+01  d E =0.1E-05\n'),
+        ('stat -c', 'OUTCAR 90000\nOSZICAR 3000\n'),
+    ])
+    m = submitter.refresh_job(client, _profile(), d, live_states={})
+    assert m['state'] == 'NEEDS_HUMAN'
+    assert m['results']['diagnosis']['failure_class'] == 'BAD_ENERGY'
 
 
 def test_build_script_text_template_mode(tmp_path):
