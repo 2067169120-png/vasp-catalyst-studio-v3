@@ -11,6 +11,7 @@ import os
 import posixpath
 import re
 import shlex
+import shutil
 import time
 
 from vcstudio.cluster import script_builder
@@ -306,6 +307,81 @@ def fetch_results(client, sftp, job_dir: str, files=FETCH_FILES):
     res['fetched_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
     manifest_mod.save_manifest(job_dir, m)
     return fetched, missing
+
+
+# ── 有界恢复:CONTCAR 续算(对齐论文 bounded recovery;人工触发,冻结 INCAR) ──────
+CONTINUE_MAX_ROUNDS = 3
+
+
+def _read_remote_text(client, path: str) -> str:
+    out, _ = run_cmd(client, f'cat {shlex.quote(path)} 2>/dev/null')
+    return out
+
+
+def continue_from_contcar(client, profile, job_dir: str,
+                          max_rounds: int = CONTINUE_MAX_ROUNDS) -> dict:
+    """把一个可续算作业从 CONTCAR 接着跑(cp CONTCAR POSCAR + 冻结 INCAR 重投同一脚本)。
+
+    有界恢复(论文核心 + 交接三不变式):
+    - 只对 diagnose 标 restartable 的分类(未收敛/墙钟/ZBRENT)出手,否则拒绝;
+    - CONTCAR 必须通过 valid_poscar 校验(防拿半个结构续出垃圾);
+    - **INCAR 逐字冻结**(方法学主权,无可比性护栏前的安全默认);
+    - continue_rounds 硬上限(默认 3),到顶停机交人工(防死循环);
+    - 清远端 WAVECAR/CHGCAR 去混合历史(原版实测);记 prev_job_id 溯源。
+    失败抛 ValueError/RuntimeError(中文)。成功返回更新后的 manifest(state=SUBMITTED)。
+    """
+    m = manifest_mod.load_manifest(job_dir)
+    if m is None:
+        raise ValueError('作业目录缺 job.yaml,无法续算')
+    diag = (m.get('results') or {}).get('diagnosis') or {}
+    if not diag.get('restartable'):
+        raise ValueError(
+            f"该作业不可自动续算(分类 {diag.get('failure_class', '?')});"
+            f'仅 未收敛/墙钟/ZBRENT 等可从 CONTCAR 续算,硬崩/缺输出需人工')
+    rounds = int((m.get('results') or {}).get('continue_rounds', 0))
+    if rounds >= max_rounds:
+        raise RuntimeError(f'已续算 {rounds} 次达上限 {max_rounds},停机交人工(防死循环)')
+    remote = m.get('remote_dir')
+    if not remote:
+        raise ValueError('该作业无 remote_dir(未提交过),无法续算')
+
+    contcar = _read_remote_text(client, posixpath.join(remote, 'CONTCAR'))
+    if not diagnose.valid_poscar(contcar):
+        raise RuntimeError('远端 CONTCAR 缺失或不完整,不能续算(防半个结构续出垃圾),请人工检查')
+
+    # 本地也留证:备份旧 POSCAR,用 CONTCAR 覆盖(保持本地目录与远端一致)
+    local_poscar = os.path.join(job_dir, 'POSCAR')
+    if os.path.isfile(local_poscar):
+        shutil.copyfile(local_poscar, f'{local_poscar}.bak{rounds + 1}')
+    with open(local_poscar, 'w', encoding='utf-8', newline='') as f:
+        f.write(contcar)
+
+    # 远端:CONTCAR→POSCAR + 清混合历史,再重投同一脚本(INCAR 不动)
+    run_cmd(client, f'cd {shlex.quote(remote)} && cp CONTCAR POSCAR && rm -f WAVECAR CHGCAR',
+            check=True)
+    dialect = get_dialect(profile.scheduler)
+    out, err = run_cmd(client, dialect.submit_cmd(
+        posixpath.join(remote, SCRIPT_NAME), getattr(profile, 'scheduler_bin', '')))
+    job_id = dialect.parse_job_id(out)
+    if not job_id:
+        raise RuntimeError(f'续算重投失败,{dialect.name} 返回:{(out or err).strip()[:300]}')
+
+    prev = m.get('scheduler_job_id')
+    m['scheduler_job_id'] = job_id
+    m.setdefault('results', {})['continue_rounds'] = rounds + 1
+    m.setdefault('attempts', []).append({
+        'n': len(m.get('attempts') or []) + 1,
+        'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'result': 'continued',
+        'action': 'contcar_restart',
+        'prev_job_id': prev,
+        'job_id': job_id,
+        'round': rounds + 1,
+    })
+    manifest_mod.set_state(m, 'SUBMITTED',
+                           note=f'CONTCAR 续算 第{rounds + 1}轮(prev {prev} → {job_id},INCAR 冻结)')
+    manifest_mod.save_manifest(job_dir, m)
+    return m
 
 
 def _read_e0(client, remote_dir: str):

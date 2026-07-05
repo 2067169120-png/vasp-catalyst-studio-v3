@@ -1,4 +1,5 @@
 """提交编排测试:注入假 client/sftp,验证 preflight/上传/提交/状态刷新与 manifest 回写。"""
+import os
 import posixpath
 
 import pytest
@@ -263,6 +264,53 @@ def test_refresh_job_converged_but_positive_energy_needs_human(tmp_path):
     m = submitter.refresh_job(client, _profile(), d, live_states={})
     assert m['state'] == 'NEEDS_HUMAN'
     assert m['results']['diagnosis']['failure_class'] == 'BAD_ENERGY'
+
+
+_VALID_CONTCAR = ('C slab\n1.0\n10 0 0\n0 10 0\n0 0 12\nC O\n2 1\nCartesian\n'
+                  '0 0 0\n1 0 0\n0 1 0\n')
+
+
+def _restartable_job(tmp_path, rounds=0, restartable=True, fclass='NONCONVERGED'):
+    d = _job_dir(tmp_path)
+    submitter.submit_job(FakeClient(script=[('qsub', '100.c\n')]), FakeSFTP(), _profile(), d)
+    m = manifest.load_manifest(d)
+    m.setdefault('results', {})['diagnosis'] = {'failure_class': fclass, 'restartable': restartable}
+    if rounds:
+        m['results']['continue_rounds'] = rounds
+    manifest.save_manifest(d, m)
+    return d
+
+
+def test_continue_from_contcar_happy(tmp_path):
+    d = _restartable_job(tmp_path)
+    client = FakeClient(script=[('cat', _VALID_CONTCAR), ('qsub', '201.c\n')])
+    m = submitter.continue_from_contcar(client, _profile(), d)
+    assert m['state'] == 'SUBMITTED' and m['scheduler_job_id'] == '201'
+    assert m['results']['continue_rounds'] == 1
+    att = m['attempts'][-1]
+    assert att['action'] == 'contcar_restart' and att['prev_job_id'] == '100' and att['round'] == 1
+    assert os.path.isfile(os.path.join(d, 'POSCAR.bak1'))       # 旧 POSCAR 留证
+    assert 'cp CONTCAR POSCAR' in ' '.join(client.commands)     # 远端提升 + 冻结 INCAR
+    assert any('rm -f WAVECAR CHGCAR' in c for c in client.commands)  # 清混合历史
+
+
+def test_continue_refuses_non_restartable(tmp_path):
+    d = _restartable_job(tmp_path, restartable=False, fclass='SIGSEGV')
+    with pytest.raises(ValueError, match='不可自动续算'):
+        submitter.continue_from_contcar(FakeClient(), _profile(), d)
+
+
+def test_continue_refuses_at_round_cap(tmp_path):
+    d = _restartable_job(tmp_path, rounds=3)
+    with pytest.raises(RuntimeError, match='上限'):
+        submitter.continue_from_contcar(FakeClient(), _profile(), d, max_rounds=3)
+
+
+def test_continue_refuses_invalid_contcar(tmp_path):
+    d = _restartable_job(tmp_path)
+    client = FakeClient(script=[('cat', 'garbage\nshort\n')])   # CONTCAR 不完整
+    with pytest.raises(RuntimeError, match='CONTCAR'):
+        submitter.continue_from_contcar(client, _profile(), d)
 
 
 def test_build_script_text_template_mode(tmp_path):
