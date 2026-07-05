@@ -104,12 +104,19 @@ def save_manifest(job_dir: str | os.PathLike, manifest: dict) -> Path:
 
 
 def load_manifest(job_dir: str | os.PathLike) -> dict | None:
-    """读 job.yaml → dict;不存在返回 None(调用方自行决定如何降级)。"""
+    """读 job.yaml → dict;不存在/损坏/形状不对 → None(调用方一律按"不可读"降级)。
+
+    手改坏一份 job.yaml(制表符/截断/编码)不能拖垮批量报告或 GUI 台账刷新——
+    每个调用方都把 None 当"无 manifest",故解析异常在此统一兜成 None(同 load_profiles 口径)。
+    """
     p = manifest_path(job_dir)
     if not p.is_file():
         return None
-    with open(p, 'r', encoding='utf-8') as f:
-        data = yaml.safe_load(f)
+    try:
+        with open(p, 'r', encoding='utf-8') as f:
+            data = yaml.safe_load(f)
+    except (yaml.YAMLError, OSError, UnicodeDecodeError):
+        return None
     return data if isinstance(data, dict) else None
 
 

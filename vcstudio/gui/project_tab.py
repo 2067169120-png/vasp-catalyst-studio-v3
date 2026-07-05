@@ -13,7 +13,7 @@ from tkinter import ttk, filedialog, messagebox
 
 from vcstudio.gui.widgets import FileRow, LogBox
 from vcstudio.gui import runner
-from vcstudio.project import adsorption
+from vcstudio.project import adsorption, report
 from vcstudio.shared.config import load_config
 
 
@@ -74,7 +74,8 @@ class ProjectTab(ttk.Frame):
         ttk.Button(pbtn, text='⟳ 刷新', command=self._reload_projects).grid(row=0, column=0, padx=4)
         ttk.Button(pbtn, text='Σ 计算 ΔE', command=self._on_delta).grid(row=0, column=1, padx=4)
         ttk.Button(pbtn, text='📊 导出 CSV', command=self._on_export).grid(row=0, column=2, padx=4)
-        ttk.Button(pbtn, text='📂 打开项目目录', command=self._open_project).grid(row=0, column=3, padx=4)
+        ttk.Button(pbtn, text='📄 导出报告(含ΔE)', command=self._on_report).grid(row=0, column=3, padx=4)
+        ttk.Button(pbtn, text='📂 打开项目目录', command=self._open_project).grid(row=0, column=4, padx=4)
 
         ttk.Label(self, text='项目日志 / ΔE 结果').grid(row=2, column=0, sticky='w', pady=(6, 0))
         self.log = LogBox(self, height=12)
@@ -201,6 +202,44 @@ class ProjectTab(ttk.Frame):
             self.log.write(f'✅ 已导出:{out}')
         except OSError as e:
             self.log.write(f'❌ 导出失败:{e}')
+
+    def _member_dirs(self, proj):
+        """项目全部成员作业目录(清洁表面 + 气相参考 + 组态族)。"""
+        mem = proj.get('members') or {}
+        return [d for d in ([mem.get('clean_slab'), mem.get('gas_ref')]
+                            + list(mem.get('configs') or [])) if d]
+
+    def _on_report(self):
+        proj = self._current_project()
+        if not proj:
+            return
+        dirs = self._member_dirs(proj)
+        if not dirs:
+            self.log.write('❌ 项目无成员作业')
+            return
+        out = filedialog.asksaveasfilename(
+            title='导出项目运行报告', defaultextension='.html',
+            initialfile=f"{proj['name']}_report.html",
+            filetypes=[('HTML 报告(含ΔE)', '*.html'), ('Markdown', '*.md')])
+        if not out:
+            return
+        s = adsorption.delta_e_rows(proj)               # HTML 报告嵌 ΔE 表(md 不嵌)
+        fmt = 'md' if str(out).lower().endswith('.md') else 'html'
+        try:
+            p = report.write_report(dirs, out, title=f"{proj['name']} 运行报告",
+                                    fmt=fmt, delta_e=s)
+        except Exception as e:                          # noqa: BLE001 报告失败不该崩界面
+            self.log.write(f'❌ 生成报告失败:{e}')
+            return
+        self.log.write(f'✅ 报告已生成:{p}')
+        try:
+            if sys.platform == 'win32':
+                os.startfile(str(p))  # noqa
+            else:
+                import subprocess
+                subprocess.Popen(['xdg-open', str(p)])
+        except Exception as e:                          # noqa: BLE001
+            self.log.write(f'⚠ 已生成但无法自动打开:{e}')
 
     def _open_project(self):
         proj = self._current_project()

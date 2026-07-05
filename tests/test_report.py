@@ -50,6 +50,18 @@ def test_collect_jobs_missing_manifest(tmp_path):
     assert rows[0]['state'] == '缺 job.yaml'
 
 
+def test_collect_jobs_corrupt_manifest_no_crash(tmp_path):
+    """手改坏一份 job.yaml 不能拖垮整份报告(load_manifest 兜成 None)。"""
+    good = _job(tmp_path, 'good', 'DONE', energy=-1.0)
+    bad = tmp_path / 'bad'
+    bad.mkdir()
+    (bad / 'job.yaml').write_text('state: [unclosed\n\tbad tab', encoding='utf-8')
+    rows = report.collect_jobs([good, str(bad)])                 # 不抛
+    assert len(rows) == 2 and any(r['state'] == '缺 job.yaml' for r in rows)
+    h = report.render_html(rows, report.summarize(rows))         # 报告整体仍生成
+    assert h.startswith('<!doctype html>') and 'good' in h
+
+
 def test_summarize_counts_and_problems(tmp_path):
     s = report.summarize(report.collect_jobs(_sample(tmp_path)))
     assert s['total'] == 5 and s['n_done'] == 1
