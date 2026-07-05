@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
@@ -17,7 +18,9 @@ from vcstudio.gui import runner
 from vcstudio.cluster import ledger, submitter
 from vcstudio.cluster.connection import open_client, close_quiet, ConnectError
 from vcstudio.cluster.profiles import load_profiles
+from vcstudio.project import report
 from vcstudio.shared import secrets
+from vcstudio.shared.config import user_config_dir
 
 _STATE_TAG = {
     'CREATED': ('draft', '#4b5563'), 'UPLOADED': ('up', '#1d4ed8'),
@@ -49,8 +52,11 @@ class JobsTab(ttk.Frame):
         self.status_btn.grid(row=0, column=4, padx=4)
         self.fetch_btn = ttk.Button(bar, text='📥 拉回结果(选中)', command=self._on_fetch)
         self.fetch_btn.grid(row=0, column=5, padx=4)
-        ttk.Button(bar, text='📂 打开目录', command=self._open_dir).grid(row=0, column=6, padx=4)
-        ttk.Button(bar, text='🗑 移出台账', command=self._remove).grid(row=0, column=7, padx=4)
+        self.continue_btn = ttk.Button(bar, text='♻ 续算(选中)', command=self._on_continue)
+        self.continue_btn.grid(row=0, column=6, padx=4)
+        ttk.Button(bar, text='📄 导出报告', command=self._on_report).grid(row=0, column=7, padx=4)
+        ttk.Button(bar, text='📂 打开目录', command=self._open_dir).grid(row=0, column=8, padx=4)
+        ttk.Button(bar, text='🗑 移出台账', command=self._remove).grid(row=0, column=9, padx=4)
 
         cols = ('state', 'task', 'cluster', 'jobid', 'energy', 'updated')
         self.tree = ttk.Treeview(self, columns=cols, show='tree headings', selectmode='extended')
@@ -236,6 +242,66 @@ class JobsTab(ttk.Frame):
             self.log.write(('✅' if ok else '❌') + f' {os.path.basename(dir_)}:{msg}')
         self.reload()
 
+    # ── 续算(有界恢复) ──
+    def _on_continue(self, trust_new=False):
+        dirs = self._selected()
+        if not dirs:
+            self.log.write('❌ 请先选中要续算的作业(仅未收敛/墙钟/ZBRENT 等可续算)')
+            return
+        prof = self._profile()
+        if prof is None:
+            return
+        if not trust_new and not messagebox.askyesno(
+                '确认续算',
+                f'将对选中的 {len(dirs)} 个作业从 CONTCAR 续算并重投到「{prof.name}」\n'
+                f'仅"可续算"分类会被处理;INCAR 冻结;每作业上限 3 轮。\n\n继续?'):
+            return
+        pw = self._password_for(prof)
+        self.continue_btn.configure(state='disabled')
+        self.log.write(f'⏳ 连接并续算 {len(dirs)} 个作业…')
+        q = runner.submit(_continue_batch, prof, pw, dirs, trust_new)
+        self.after(200, lambda: self._poll_continue(q))
+
+    def _poll_continue(self, q):
+        item = runner.poll(q)
+        if item is None:
+            self.after(200, lambda: self._poll_continue(q))
+            return
+        kind, payload = item
+        self.continue_btn.configure(state='normal')
+        if kind == 'error':
+            self.log.write(f'❌ 续算异常:{payload}')
+            return
+        if payload.get('needs_trust'):
+            if messagebox.askyesno('未知主机', f"{payload['message']}\n\n是否信任该主机并重试?"):
+                self._on_continue(trust_new=True)
+            return
+        for dir_, ok, msg in payload['results']:
+            self.log.write(('✅' if ok else '❌') + f' {os.path.basename(dir_)}:{msg}')
+        self.reload()
+
+    # ── 导出报告 ──
+    def _on_report(self):
+        dirs = [jd for jd, _ in ledger.load_all()]
+        if not dirs:
+            self.log.write('ℹ 台账为空,无可报告的作业')
+            return
+        out = user_config_dir() / 'reports' / f'run-report-{time.strftime("%Y%m%d-%H%M%S")}.html'
+        try:
+            p = report.write_report(dirs, out, title='VASP 批量运行报告')
+        except Exception as e:                                       # noqa: BLE001 报告失败不该崩界面
+            self.log.write(f'❌ 生成报告失败:{e}')
+            return
+        self.log.write(f'✅ 报告已生成:{p}')
+        try:
+            if sys.platform == 'win32':
+                os.startfile(str(p))  # noqa
+            else:
+                import subprocess
+                subprocess.Popen(['xdg-open', str(p)])
+        except Exception as e:                                       # noqa: BLE001
+            self.log.write(f'⚠ 已生成但无法自动打开:{e}')
+
     # ── 其他 ──
     def _open_dir(self):
         for d in self._selected()[:1]:
@@ -307,6 +373,27 @@ def _fetch_batch(prof, pw, dirs, trust_new):
             except _job_errors() as e:
                 results.append((d, False, str(e)))
         sftp.close()
+    finally:
+        close_quiet(client, jump)
+    return {'needs_trust': False, 'results': results}
+
+
+def _continue_batch(prof, pw, dirs, trust_new):
+    """CONTCAR 续算批量线程体:每作业调 submitter.continue_from_contcar(不可续算的自失败)。"""
+    try:
+        client, jump = open_client(prof, pw, trust_new=trust_new)
+    except ConnectError as e:
+        if e.needs_trust:
+            return {'needs_trust': True, 'message': str(e), 'results': []}
+        raise RuntimeError(str(e))
+    results = []
+    try:
+        for d in dirs:
+            try:
+                m = submitter.continue_from_contcar(client, prof, d)
+                results.append((d, True, f"已续算重投,新作业号 {m['scheduler_job_id']}"))
+            except _job_errors() as e:
+                results.append((d, False, str(e)))
     finally:
         close_quiet(client, jump)
     return {'needs_trust': False, 'results': results}

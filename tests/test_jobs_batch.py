@@ -104,3 +104,27 @@ def test_fetch_batch_survives_ssh_exception(monkeypatch):
     payload = jobs_tab._fetch_batch(object(), None, ['bad', 'good'], False)
     assert [r[1] for r in payload['results']] == [False, True]
     assert client.closed and jump.closed
+
+
+# ── 续算批量:关闭责任 + 单作业失败隔离(不可续算的自失败不打断整批) ──
+def test_continue_batch_closes_client_and_jump(monkeypatch):
+    client, jump = _patch_open(monkeypatch)
+    monkeypatch.setattr(jobs_tab.submitter, 'continue_from_contcar',
+                        lambda c, p, d: {'scheduler_job_id': '9'})
+    payload = jobs_tab._continue_batch(object(), None, ['d1'], False)
+    assert payload['results'] == [('d1', True, '已续算重投,新作业号 9')]
+    assert client.closed and jump.closed
+
+
+def test_continue_batch_survives_error(monkeypatch):
+    client, jump = _patch_open(monkeypatch)
+
+    def flaky(c, p, d):
+        if d == 'bad':
+            raise RuntimeError('不可自动续算')
+        return {'scheduler_job_id': '9'}
+
+    monkeypatch.setattr(jobs_tab.submitter, 'continue_from_contcar', flaky)
+    payload = jobs_tab._continue_batch(object(), None, ['bad', 'good'], False)
+    assert [r[1] for r in payload['results']] == [False, True]
+    assert client.closed and jump.closed
