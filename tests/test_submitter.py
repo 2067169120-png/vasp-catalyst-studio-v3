@@ -270,10 +270,12 @@ _VALID_CONTCAR = ('C slab\n1.0\n10 0 0\n0 10 0\n0 0 12\nC O\n2 1\nCartesian\n'
                   '0 0 0\n1 0 0\n0 1 0\n')
 
 
-def _restartable_job(tmp_path, rounds=0, restartable=True, fclass='NONCONVERGED'):
+def _restartable_job(tmp_path, rounds=0, restartable=True, fclass='NONCONVERGED',
+                     state='UNCONVERGED'):
     d = _job_dir(tmp_path)
     submitter.submit_job(FakeClient(script=[('qsub', '100.c\n')]), FakeSFTP(), _profile(), d)
     m = manifest.load_manifest(d)
+    manifest.set_state(m, state)                # 模拟已从调度器返回的终态
     m.setdefault('results', {})['diagnosis'] = {'failure_class': fclass, 'restartable': restartable}
     if rounds:
         m['results']['continue_rounds'] = rounds
@@ -292,10 +294,31 @@ def test_continue_from_contcar_happy(tmp_path):
     assert os.path.isfile(os.path.join(d, 'POSCAR.bak1'))       # 旧 POSCAR 留证
     assert 'cp CONTCAR POSCAR' in ' '.join(client.commands)     # 远端提升 + 冻结 INCAR
     assert any('rm -f WAVECAR CHGCAR' in c for c in client.commands)  # 清混合历史
+    assert 'diagnosis' not in m['results']                      # 上一轮诊断已消费,防再次误用
+
+
+def test_continue_refuses_live_job(tmp_path):
+    """状态门:仍在队列/运行中的作业绝不续算(防往活作业双提交冲垮结果)。"""
+    d = _restartable_job(tmp_path, state='RUNNING')
+    with pytest.raises(ValueError, match='仍在队列/运行中'):
+        submitter.continue_from_contcar(FakeClient(), _profile(), d)
+
+
+def test_continue_consumes_diagnosis_blocks_double(tmp_path):
+    """续算后再点一次:诊断已消费(restartable 不在)→ 按不可续算拒绝,不重复出手。"""
+    d = _restartable_job(tmp_path)
+    client = FakeClient(script=[('cat', _VALID_CONTCAR), ('qsub', '201.c\n')])
+    submitter.continue_from_contcar(client, _profile(), d)
+    # 新作业还是 SUBMITTED,状态门先拦;即便人为置终态,诊断也已被消费
+    m = manifest.load_manifest(d)
+    manifest.set_state(m, 'UNCONVERGED')
+    manifest.save_manifest(d, m)
+    with pytest.raises(ValueError, match='不可自动续算'):
+        submitter.continue_from_contcar(FakeClient(), _profile(), d)
 
 
 def test_continue_refuses_non_restartable(tmp_path):
-    d = _restartable_job(tmp_path, restartable=False, fclass='SIGSEGV')
+    d = _restartable_job(tmp_path, restartable=False, fclass='SIGSEGV', state='FAILED')
     with pytest.raises(ValueError, match='不可自动续算'):
         submitter.continue_from_contcar(FakeClient(), _profile(), d)
 
@@ -311,6 +334,28 @@ def test_continue_refuses_invalid_contcar(tmp_path):
     client = FakeClient(script=[('cat', 'garbage\nshort\n')])   # CONTCAR 不完整
     with pytest.raises(RuntimeError, match='CONTCAR'):
         submitter.continue_from_contcar(client, _profile(), d)
+
+
+def test_read_log_targets_job_number(tmp_path):
+    """续算后旧 .o<旧号> 仍在:_read_log 按本作业号精确定位,不用宽通配 *.o*(否则误读旧轮)。"""
+    client = FakeClient()
+    submitter._read_log(client, '/work/j', '8812345')
+    cmd = ' '.join(client.commands)
+    assert '*.o8812345' in cmd and 'slurm-8812345.out' in cmd
+    assert '*.o*' not in cmd
+
+
+def test_query_states_raises_on_failed_query(tmp_path):
+    """qstat/squeue 抖动(无哨兵)→ 抛错本轮跳过,绝不把空输出误判成作业全终态。"""
+    client = FakeClient(script=[('qstat', 'qstat: cannot connect to server\n')])
+    with pytest.raises(RuntimeError, match='查询失败'):
+        submitter.query_states(client, _profile())
+
+
+def test_query_states_empty_with_sentinel_is_no_jobs(tmp_path):
+    """成功但用户无在跑作业(有哨兵)→ 空 dict,不误报失败。"""
+    client = FakeClient(script=[('qstat', '___VCSQOK___\n')])
+    assert submitter.query_states(client, _profile()) == {}
 
 
 def test_build_script_text_template_mode(tmp_path):

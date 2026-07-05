@@ -150,12 +150,22 @@ def submit_job(client, sftp, profile, job_dir: str) -> dict:
 
 
 # ── 状态刷新(含最小收敛判定,S3 雏形) ────────────────────────────────────────
+_QOK = '___VCSQOK___'
+
+
 def query_states(client, profile) -> dict:
-    """调度器一次性查询当前用户全部作业 → {job_id: QUEUED|RUNNING}。"""
+    """调度器一次性查询当前用户全部作业 → {job_id: QUEUED|RUNNING}。
+
+    在命令尾追加 `&& echo 哨兵`:qstat/squeue 退出码非零(调度器抖动/不可达)时哨兵
+    不出现 → 抛错本轮跳过,**绝不**把空输出误判成"所有作业都结束了"再逐个标终态
+    (瞬时一次抖动会永久错标 RUNNING 作业为 FAILED/UNCONVERGED,原版用跨轮确认防此)。
+    """
     dialect = get_dialect(profile.scheduler)
-    out, _ = run_cmd(client, dialect.status_cmd(
-        profile.username, getattr(profile, 'scheduler_bin', '')))
-    return dialect.parse_status(out)
+    cmd = dialect.status_cmd(profile.username, getattr(profile, 'scheduler_bin', ''))
+    out, _ = run_cmd(client, f'{cmd} && echo {_QOK}')
+    if _QOK not in out:
+        raise RuntimeError('调度器状态查询失败(qstat/squeue 无响应或报错);本轮跳过,不误判作业已结束')
+    return dialect.parse_status(out.replace(_QOK, ''))
 
 
 def refresh_job(client, profile, job_dir: str, live_states: dict | None = None,
@@ -190,7 +200,7 @@ def refresh_job(client, profile, job_dir: str, live_states: dict | None = None,
     reason = (terminal_reasons or {}).get(jid)
     outcar_size, oszicar_size = _stat_sizes(client, remote)
     converged = _grep_converged(client, remote)
-    exit_code, log_tail = _read_log(client, remote)
+    exit_code, log_tail = _read_log(client, remote, jid)
     energy = _read_e0(client, remote)
 
     d = diagnose.classify(
@@ -249,20 +259,28 @@ def _grep_converged(client, remote: str) -> bool:
     return _first_int(out) > 0
 
 
-def _read_log(client, remote: str):
-    """取合并 stdout 日志:EXIT 标记(退出码)+ 尾部文本(供 diagnose.scan_log 扫签名)。
+def _read_log(client, remote: str, job_id: str = ''):
+    """取本作业的 stdout 日志:EXIT 标记(退出码)+ 尾部文本(供 diagnose.scan_log 扫签名)。
 
     脚本 run_block 尾部 echo "EXIT: $?";PBS -j oe 合并到 <name>.o<num>,Slurm 到
-    slurm-<jid>.out。用 glob 兜住命名差异,一次 SSH 取回。→ (exit_code|None, tail)。
+    slurm-<jid>.out。**按本作业号定位**:续算在同一目录重投,旧 attempt 的 .o<旧号>
+    仍在,通配 *.o* + tail -1 会按字母序读到旧作业(o100 < o99),把新一轮误分类;
+    故用 *.o<本号> / slurm-<本号>.out 精确锁定,再以每次覆盖的 vasp.out/log 兜底。
+    → (exit_code|None, tail)。
     """
     if not remote:
         return None, ''
+    num = str(job_id).split('.')[0].strip()
+    if num:
+        targets = f'*.o{num} slurm-{num}.out vasp.out log'
+    else:                                        # 无作业号 → 退回宽通配(单作业目录仍准)
+        targets = '*.o* slurm-*.out vasp.out log'
     out, _ = run_cmd(
         client,
         f"cd {shlex.quote(remote)} && "
-        f"grep -h 'EXIT:' *.o* slurm-*.out vasp.out log 2>/dev/null | tail -1; "
+        f"grep -h 'EXIT:' {targets} 2>/dev/null | tail -1; "
         f"echo '___VCSLOG___'; "
-        f"tail -n 20 *.o* slurm-*.out vasp.out log 2>/dev/null")
+        f"tail -n 20 {targets} 2>/dev/null")
     marker, _sep, tail = out.partition('___VCSLOG___')
     mm = re.search(r'EXIT:\s*(-?\d+)', marker)
     exit_code = int(mm.group(1)) if mm else None
@@ -333,6 +351,11 @@ def continue_from_contcar(client, profile, job_dir: str,
     m = manifest_mod.load_manifest(job_dir)
     if m is None:
         raise ValueError('作业目录缺 job.yaml,无法续算')
+    # 状态门(严重 bug 防护):仍在队列/运行中的作业绝不续算——否则会往活作业目录里
+    # cp CONTCAR POSCAR + 重投第二个实例,两个 VASP 同写 OUTCAR 冲垮结果,且旧作业号被
+    # 覆盖成孤儿。restartable 诊断是上一轮终态留下的,重投后必须消费掉(见函数尾)。
+    if m.get('state') in ('UPLOADED', 'SUBMITTED', 'QUEUED', 'RUNNING'):
+        raise ValueError(f"该作业仍在队列/运行中(状态 {m['state']}),不能续算;请先查询状态确认已结束")
     diag = (m.get('results') or {}).get('diagnosis') or {}
     if not diag.get('restartable'):
         raise ValueError(
@@ -368,6 +391,8 @@ def continue_from_contcar(client, profile, job_dir: str,
 
     prev = m.get('scheduler_job_id')
     m['scheduler_job_id'] = job_id
+    # 消费掉上一轮的终态诊断:新作业尚未诊断,restartable=True 不能被下一次误用
+    m.setdefault('results', {}).pop('diagnosis', None)
     m.setdefault('results', {})['continue_rounds'] = rounds + 1
     m.setdefault('attempts', []).append({
         'n': len(m.get('attempts') or []) + 1,
