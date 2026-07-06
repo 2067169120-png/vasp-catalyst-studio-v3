@@ -10,7 +10,8 @@ def _make_fixture(tmp_path):
     lib = tmp_path / 'lib'
     (lib / 'C').mkdir(parents=True)
     (lib / 'C' / 'POTCAR').write_text(
-        ' fake PAW_PBE C\n   ENMAX  =  273.214; ENMIN = 200.000 eV\n',
+        ' fake PAW_PBE C\n   TITEL  = PAW_PBE C 08Apr2002\n'
+        '   ENMAX  =  273.214; ENMIN = 200.000 eV\n',
         encoding='utf-8')
     poscar = tmp_path / 'POSCAR'
     poscar.write_text(
@@ -42,6 +43,20 @@ def test_create_from_build_writes_job_yaml(tmp_path):
     # 缺 ENCUT → 有补全项 → 来源标记 user+completion
     assert 'ENCUT' in loaded['inputs']['completions']
     assert loaded['inputs']['incar_source'] == 'user+completion'
+
+
+def test_manifest_records_potcar_provenance(tmp_path):
+    """发刊级溯源(审查#2):赝势身份(variant/TITEL/ENMAX)+ POTCAR sha256 落入 job.yaml。"""
+    poscar, lib = _make_fixture(tmp_path)
+    out = tmp_path / 'job2'
+    res = build_job_dir(poscar, 'ENCUT = 400\n', str(out),
+                        calc_type='molecule', lib_root=lib)
+    manifest.create_from_build(str(out), res, poscar_path=poscar, validate=True)
+    loaded = manifest.load_manifest(str(out))
+    pv = loaded['inputs']['potcar']
+    assert pv == [{'element': 'C', 'variant': 'C',
+                   'titel': 'PAW_PBE C 08Apr2002', 'enmax': 273.214}]
+    assert loaded['inputs']['potcar_sha256'] == manifest.sha256_file(out / 'POTCAR')
 
 
 def test_incar_source_labels():

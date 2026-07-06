@@ -152,7 +152,12 @@ def create_from_build(job_dir: str | os.PathLike, build_result: dict, *,
         'completions': completions,
         'elements': list(build_result.get('elements') or []),
         'kpoints': list(build_result.get('kpoints') or []),
+        # 赝势身份(发刊级溯源):哪套 POTCAR 算的,结果永远可答
+        'potcar': list(build_result.get('potcar') or []),
     }
+    potcar_file = job_dir / 'POTCAR'
+    if potcar_file.is_file():
+        inputs['potcar_sha256'] = sha256_file(potcar_file)
     m = new_manifest(
         job_id=f'{job_dir.resolve().name}-{time.strftime("%Y%m%d-%H%M%S")}',
         system=system or _poscar_system_name(poscar_path),

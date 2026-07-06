@@ -101,6 +101,38 @@ def read_enmax(variant_name: str, lib_root: str | None = None) -> float:
     return float(m.group(1))
 
 
+_TITEL_RE = re.compile(r'TITEL\s*=\s*(.+)')
+
+
+def potcar_provenance(elements: list, lib_root: str | None = None,
+                      _force_variant: dict | None = None) -> list:
+    """赝势身份溯源:按物种顺序返回 [{'element','variant','titel','enmax'}]。
+
+    发刊级 provenance(审查#2):方法学论文必须能回答"用的哪套 POTCAR"——
+    TITEL 行(如 'PAW_PBE Ta_pv 07Sep2000')+ ENMAX 落入 job.yaml,结果永远可追。
+    与 build_potcar 同源读库;文件缺失/缺行 → PotcarError(绝不静默)。
+    """
+    root = _resolve_root(lib_root)
+    override = _force_variant or {}
+    out = []
+    for el in elements:
+        v = override.get(el) or variant(el)
+        path = os.path.join(root, v, 'POTCAR')
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                head = f.read(4096)
+        except FileNotFoundError:
+            raise PotcarError(f'POTCAR 不存在: {path}')
+        tm = _TITEL_RE.search(head)
+        em = _ENMAX_RE.search(head)
+        if not em:
+            raise PotcarError(f'POTCAR 缺 ENMAX 行: {path}')
+        out.append({'element': el, 'variant': v,
+                    'titel': tm.group(1).strip() if tm else '',
+                    'enmax': float(em.group(1))})
+    return out
+
+
 def build_potcar(elements: list, encut: int = 400,
                  lib_root: str | None = None,
                  _force_variant: dict | None = None) -> str:

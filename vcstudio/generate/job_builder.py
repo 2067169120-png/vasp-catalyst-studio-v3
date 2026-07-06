@@ -13,7 +13,7 @@ import shutil
 from collections import OrderedDict
 
 from vcstudio.generate.poscar import read_poscar, parse_poscar_species, read_cell_vectors
-from vcstudio.generate.potcar import build_potcar, max_enmax
+from vcstudio.generate.potcar import build_potcar, max_enmax, potcar_provenance
 from vcstudio.generate.kpoints import recommend_kpoints, kpoints_str
 from vcstudio.generate.incar_builder import (
     parse_incar, validate_and_complete_incar, incar_dict_to_str,
@@ -116,4 +116,6 @@ def build_job_dir(poscar_path, incar, out_dir, *,
     return {'ok': True, 'out_dir': str(out_dir), 'warnings': warnings,
             'kpoints': kpts, 'elements': elements,
             # 附加回传(向后兼容的新增键):manifest/预览用
-            'completions': dict(completions), 'calc_type': calc_type}
+            'completions': dict(completions), 'calc_type': calc_type,
+            # 赝势身份溯源(审查#2):variant/TITEL/ENMAX 供 manifest 落档
+            'potcar': potcar_provenance(elements, lib_root)}
