@@ -209,12 +209,13 @@ def refresh_job(client, profile, job_dir: str, live_states: dict | None = None,
     outcar_size, oszicar_size = _stat_sizes(client, remote)
     converged = _grep_converged(client, remote, m.get('task_type') or 'relax')
     exit_code, log_tail = _read_log(client, remote, jid)
-    energy = _read_e0(client, remote)
+    energy, oszicar_tail = _read_oszicar(client, remote)
 
     d = diagnose.classify(
         scheduler_reason=reason, exit_code=exit_code,
         outcar_size=outcar_size, oszicar_size=oszicar_size,
-        log_tail=log_tail, converged=converged, energy=energy)
+        log_tail=log_tail, converged=converged, energy=energy,
+        oszicar_tail=oszicar_tail)
 
     if energy is not None:
         # 物理合理性闸(审查#4):BAD_ENERGY 的垃圾数不进 energy_e0_eV(防经自由能路径
@@ -429,17 +430,25 @@ def continue_from_contcar(client, profile, job_dir: str,
     return m
 
 
-def _read_e0(client, remote_dir: str):
-    """OSZICAR 末行 E0(eV);拿不到 → None(绝不编数)。"""
+def _read_oszicar(client, remote_dir: str):
+    """OSZICAR 尾部一次取数 → (E0|None, tail_text)。
+
+    tail -150 覆盖最后一个离子步的完整 SCF 块(供 diagnose 震荡扫描)且必含末行
+    E0(取最后一个匹配)。拿不到 E0 → None(绝不编数)。"""
     if not remote_dir:
-        return None
-    out, _ = run_cmd(client, f'tail -2 {shlex.quote(remote_dir + "/OSZICAR")} 2>/dev/null')
+        return None, ''
+    out, _ = run_cmd(client, f'tail -n 150 {shlex.quote(remote_dir + "/OSZICAR")} 2>/dev/null')
     m = None
     for m in _E0_RE.finditer(out):
         pass                                   # 取最后一个匹配
     if m is None:
-        return None
+        return None, out
     try:
-        return float(m.group(1))
+        return float(m.group(1)), out
     except ValueError:
-        return None
+        return None, out
+
+
+def _read_e0(client, remote_dir: str):
+    """兼容入口:只要 E0。"""
+    return _read_oszicar(client, remote_dir)[0]

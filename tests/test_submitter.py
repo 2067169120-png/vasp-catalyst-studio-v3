@@ -167,7 +167,7 @@ def test_refresh_job_states(tmp_path):
     # 调度器消失 + 收敛 + OSZICAR E0 → DONE + 能量
     done_client = FakeClient(script=[
         ('grep -c', '1\n'),
-        ('tail -2', '   5 F= -.43561190E+03 E0= -.43561154E+03  d E =-.10E-05\n'),
+        ('tail -n 150', '   5 F= -.43561190E+03 E0= -.43561154E+03  d E =-.10E-05\n'),
     ])
     m = submitter.refresh_job(done_client, _profile(), d, live_states={})
     assert m['state'] == 'DONE'
@@ -219,7 +219,7 @@ def test_submit_and_refresh_quote_spaced_remote_dir(tmp_path):
 
     done_client = FakeClient(script=[
         ('grep -c', '1\n'),
-        ('tail -2', '   5 F= -.5E+01 E0= -.5E+01  d E =-.1E-05\n'),
+        ('tail -n 150', '   5 F= -.5E+01 E0= -.5E+01  d E =-.1E-05\n'),
     ])
     m = submitter.refresh_job(done_client, prof, d, live_states={})
     assert m['state'] == 'DONE'
@@ -258,7 +258,7 @@ def test_refresh_job_converged_but_positive_energy_needs_human(tmp_path):
     submitter.submit_job(FakeClient(script=[('qsub', '57.c\n')]), FakeSFTP(), _profile(), d)
     client = FakeClient(script=[
         ('grep -c', '1\n'),
-        ('tail -2', '   5 F= 0.5E+01 E0= 0.5E+01  d E =0.1E-05\n'),
+        ('tail -n 150', '   5 F= 0.5E+01 E0= 0.5E+01  d E =0.1E-05\n'),
         ('stat -c', 'OUTCAR 90000\nOSZICAR 3000\n'),
     ])
     m = submitter.refresh_job(client, _profile(), d, live_states={})

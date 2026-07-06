@@ -171,6 +171,41 @@ def test_has_output_not_converged_is_nonconverged_restartable():
     assert d.failure_class == dg.NONCONVERGED and d.state == 'UNCONVERGED' and d.restartable
 
 
+# ── SCF 震荡(原版 healer/lis_sac_status 生产口径移植) ──
+def _oszicar_block(n_iters, last_de):
+    lines = ['   1 F= -.38712683E+03 E0= -.38712683E+03  d E =-.387127E+03']
+    for i in range(1, n_iters + 1):
+        de = last_de if i == n_iters else '-0.5E+00'
+        lines.append(f'DAV:  {i}    -0.385031793E+03   {de}   -0.129E+02  4696   0.1E+00')
+    return '\n'.join(lines) + '\n'
+
+
+def test_scan_oszicar_sloshing_hit():
+    tail = _oszicar_block(85, '0.8E-01')          # 85 步 + |dE|=0.08 > 1e-2 → 震荡
+    ev = dg.scan_oszicar_sloshing(tail)
+    assert ev is not None and '85' in ev
+    d = classify(outcar_size=90000, oszicar_size=9000, oszicar_tail=tail)
+    assert d.failure_class == dg.SCF_SLOSHING and d.state == 'NEEDS_HUMAN' and not d.restartable
+
+
+def test_scan_oszicar_slow_but_converging_not_sloshing():
+    assert dg.scan_oszicar_sloshing(_oszicar_block(85, '0.3E-02')) is None   # dE 小=慢收敛
+    assert dg.scan_oszicar_sloshing(_oszicar_block(40, '0.8E-01')) is None   # 步数少
+    assert dg.scan_oszicar_sloshing('') is None
+    # 无震荡 → 仍走可续算的 NONCONVERGED
+    d = classify(outcar_size=90000, oszicar_tail=_oszicar_block(40, '0.8E-01'))
+    assert d.failure_class == dg.NONCONVERGED and d.restartable
+
+
+def test_sloshing_only_checks_last_ionic_block():
+    """前面离子步曾震荡但最后一步正常 → 不报(只看最后一块)。"""
+    bad = _oszicar_block(85, '0.8E-01')
+    good_last = bad + '   2 F= -.38800000E+03 E0= -.38800000E+03  d E =-.87E+00\n' \
+        + 'DAV:   1    -0.388E+03   -0.5E+00   -0.1E+02  4696   0.1E+00\n' \
+        + 'DAV:   2    -0.388E+03   -0.1E-03   -0.1E+02  4696   0.1E-02\n'
+    assert dg.scan_oszicar_sloshing(good_last) is None
+
+
 # ── 状态映射与可续算集自洽 ──
 def test_state_map_and_restartable_consistency():
     for cls, state in dg.FAILURE_TO_STATE.items():

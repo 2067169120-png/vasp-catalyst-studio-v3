@@ -28,6 +28,7 @@ SIGSEGV = 'SIGSEGV'               # 段错误——硬失败
 SILENT_EXIT = 'SILENT_EXIT'       # 退出 0 但无 OUTCAR——诡异,交人工
 NO_OUTPUT = 'NO_OUTPUT'           # 启动即死/缺 POTCAR,零输出——交人工
 BAD_ENERGY = 'BAD_ENERGY'         # 有收敛串但能量不合理——交人工(防收敛却是垃圾数)
+SCF_SLOSHING = 'SCF_SLOSHING'     # 电子步震荡(NELM 打满且 dE 不降)——盲目续算必复现,交人工
 UNKNOWN = 'UNKNOWN'               # 规则不覆盖——交人工
 
 # 分类 → job.yaml 状态(复活死态 FAILED/NEEDS_HUMAN)
@@ -43,6 +44,7 @@ FAILURE_TO_STATE = {
     SILENT_EXIT: 'NEEDS_HUMAN',
     NO_OUTPUT: 'NEEDS_HUMAN',
     BAD_ENERGY: 'NEEDS_HUMAN',
+    SCF_SLOSHING: 'NEEDS_HUMAN',
     UNKNOWN: 'NEEDS_HUMAN',
 }
 
@@ -148,6 +150,38 @@ def scan_log(log_tail: str) -> str | None:
     return None
 
 
+# SCF 震荡阈值(移植原版生产口径 lis_sac_status:scf_iters>=80 且 |dE|>1e-2 判真震荡;
+# heal_agent 的 CONVERGENCE_STALL 用 DAV>60——取保守的 80+能量证据双条件防误报)
+_SLOSH_MIN_ITERS = 80
+_SLOSH_MIN_DE = 1e-2
+_SCF_LINE_RE = re.compile(r'^(?:DAV|RMM|CG|DIA|NONE):\s*(\d+)\s+\S+\s+([+-]?[\d.E+-]+)', re.MULTILINE)
+
+
+def scan_oszicar_sloshing(oszicar_tail: str) -> str | None:
+    """OSZICAR 尾部 → 最后一个离子步的 SCF 块是否呈电子震荡。
+
+    判据(两条同时满足才报,防误报):最后一个离子步的电子步数 ≥ 80(NELM 默认 60,
+    ≥80 意味着用户加大了 NELM 仍打满)且末行 |dE| > 1e-2 eV(远未收敛而非慢收敛)。
+    命中返回证据串,否则 None。纯文本解析,离线可测。
+    """
+    if not oszicar_tail:
+        return None
+    # 取最后一个离子步块:按 'F=' 行切,取其后(或全文若无 F= 行)的 SCF 行
+    last_block = oszicar_tail.rsplit('F=', 1)[-1] if 'F=' in oszicar_tail else oszicar_tail
+    matches = _SCF_LINE_RE.findall(last_block)
+    if not matches:
+        return None
+    n_iter = int(matches[-1][0])
+    try:
+        de = abs(float(matches[-1][1].replace('E', 'e')))
+    except ValueError:
+        return None
+    if n_iter >= _SLOSH_MIN_ITERS and de > _SLOSH_MIN_DE:
+        return (f'末离子步电子步数 {n_iter}(NELM 打满)且 |dE|={de:.3g} eV 仍远未收敛'
+                f'——SCF 震荡,同 INCAR 续算必复现;建议人工调 ALGO/AMIX/SIGMA 或查结构')
+    return None
+
+
 def scan_vasp_error(log_tail: str):
     """扫已知 VASP 内部错误签名 → (label, 补救提示) 或 None(Custodian 字面串)。"""
     if not log_tail:
@@ -175,7 +209,7 @@ def _reason_to_class(reason: str | None) -> str | None:
 
 def classify(*, scheduler_reason: str | None = None, exit_code: int | None = None,
              outcar_size=None, oszicar_size=None, log_tail: str = '',
-             converged: bool = False, energy=None) -> Diagnosis:
+             converged: bool = False, energy=None, oszicar_tail: str = '') -> Diagnosis:
     """单一决策点:所有取证证据 → Diagnosis。
 
     优先级:①收敛串在场 → 判能量合理性(CONVERGED / BAD_ENERGY);②零输出 →
@@ -222,6 +256,9 @@ def classify(*, scheduler_reason: str | None = None, exit_code: int | None = Non
     if scheduler_reason == R_FAILED:               # 泛化失败无更具体信号 → 交人工
         return Diagnosis(UNKNOWN, FAILURE_TO_STATE[UNKNOWN], False,
                          '调度器报失败但无具体原因/日志签名,需人工')
+    slosh = scan_oszicar_sloshing(oszicar_tail)     # 电子震荡:盲目续算必复现 → 交人工
+    if slosh is not None:
+        return Diagnosis(SCF_SLOSHING, FAILURE_TO_STATE[SCF_SLOSHING], False, slosh)
     # 有输出、无硬崩信号、未见收敛串 → SCF/几何未收敛(可 CONTCAR 续算)
     return Diagnosis(NONCONVERGED, 'UNCONVERGED', True,
                      '有输出但未见"reached required accuracy"——SCF/几何未收敛,可从 CONTCAR 续算')
