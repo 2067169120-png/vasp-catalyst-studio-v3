@@ -55,6 +55,24 @@ def test_generate_report_origin_ok_and_ai_ok(tmp_path):
     assert 'report_figs/ads_bar.png' in h            # Origin 图相对路径嵌入
     assert '中文解读OK' in h and 'English para.' in h   # AI 章节持久化
     assert 'no ZPE' in h
+    # 原版章节移植(任务A收尾):统计 / 计算参数表 / 方法学约定
+    assert 'ΔE 汇总统计' in h and '最强吸附' in h
+    assert '计算参数' in h and 'ENCUT' in h
+    assert '方法学约定' in h and '未含 ZPE/熵' in h
+
+
+def test_delta_e_color_semantics(tmp_path):
+    """ΔE 颜色语义(原版口径):>0 红、<-3 绿。"""
+    from vcstudio.project import report
+    rows = report.collect_jobs([])
+    de = {'rows': [
+        {'name': 'strong', 'state': 'DONE', 'e_config': -10.0, 'delta_e': -4.2, 'note': ''},
+        {'name': 'bad', 'state': 'DONE', 'e_config': -1.0, 'delta_e': 0.5, 'note': ''},
+        {'name': 'mid', 'state': 'DONE', 'e_config': -5.0, 'delta_e': -1.5, 'note': ''},
+    ]}
+    h = report.render_html(rows, report.summarize(rows), delta_e=de)
+    assert h.count('#15803d;font-weight:600') == 1      # 仅 strong 绿
+    assert h.count('#b91c1c;font-weight:600') == 1      # 仅 bad 红
 
 
 def test_generate_report_falls_back_to_svg_and_degrades_ai(tmp_path):

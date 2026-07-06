@@ -69,6 +69,31 @@ def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
     summary = report.summarize(rows)
     sections: list = []
 
+    # ── 0a. ΔE 汇总统计(原版 summary-stats 移植,零依赖) ──
+    des = [r['delta_e'] for r in delta['rows'] if isinstance(r.get('delta_e'), (int, float))]
+    if des:
+        strongest = min(delta['rows'], key=lambda r: r['delta_e']
+                        if isinstance(r.get('delta_e'), (int, float)) else 1e9)
+        sections.append(
+            '<h2>ΔE 汇总统计</h2><p>'
+            f'有效组态 {len(des)} 个;最强吸附 <b>{_esc(strongest["name"])}</b>'
+            f'(ΔE = {min(des):.4f} eV);最弱 ΔE = {max(des):.4f} eV;'
+            f'平均 ΔE = {sum(des) / len(des):.4f} eV。</p>')
+
+    # ── 0b. 计算参数表(原版 INCAR parameters 表移植;读共享 INCAR 真实键) ──
+    inc0 = {}
+    for d in dirs:
+        inc0 = incar_summary_from_dir(d)
+        if inc0:
+            break
+    if inc0:
+        prow = ''.join(f'<tr><td><code>{_esc(k)}</code></td><td class="num">{_esc(v)}</td></tr>'
+                       for k, v in inc0.items())
+        sections.append(
+            '<h2>计算参数(成员共享 INCAR 关键键)</h2>'
+            f'<table><thead><tr><th>键</th><th>值</th></tr></thead><tbody>{prow}</tbody></table>'
+            "<p class='dim'>完整输入与赝势身份(variant/TITEL/ENMAX)见各作业 job.yaml 的 inputs 小节。</p>")
+
     # ── 1. ΔE 图表(Origin 优先,SVG 兜底) ──
     band = config.get('ideal_window')            # 可配理想窗口 (lo, hi);默认不画
     band_label = config.get('ideal_window_label', '理想窗口')
@@ -136,6 +161,17 @@ def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
                                          caption=f'{os.path.basename(d)} / {png}'))
     if gallery:
         sections.append('<h2>结构图(POV-Ray)</h2>' + ''.join(gallery))
+
+    # ── 4. 方法学约定(原版 methods 节的通用版;论文同款口径,项目专用内容不写死) ──
+    conv = ['E<sub>ads</sub> = E(slab+ads) − E(slab) − E(ref),负值 = 有利吸附;'
+            'ΔE 着色:&lt; −3 eV 强吸附(绿)、&gt; 0(红)。',
+            '全部能量为 DFT 电子能(OSZICAR E0),未含 ZPE/熵修正。',
+            '成员全部 DONE 才给 ΔE;能量经物理合理性闸(E≥0/|E|&gt;10⁴ 拒收)。']
+    if fed:
+        conv.insert(1, f'μ<sub>Li</sub> = (E(Li₂S) − E(S₈)/8) / 2 = {fed["mu_li"]:.4f} eV'
+                       '(由分子库估算);ΔG 参照 S8* = 0,U<sub>L</sub> = −max(ΔG/Δn·e)(CHE)。')
+    sections.append('<h2>方法学约定</h2><ul>'
+                    + ''.join(f'<li>{c}</li>' for c in conv) + '</ul>')
 
     html_text = report.render_html(rows, summary, title=f'{name} 完整报告',
                                    delta_e=delta, extra_html=''.join(sections))

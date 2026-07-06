@@ -106,7 +106,7 @@ class PBSDialect(SchedulerDialect):
         return ''
 
     def status_cmd(self, user, bin_path=''):
-        return f'{_bin(bin_path, "qstat")} -u {user} 2>/dev/null'
+        return f'{_bin(bin_path, "qstat")} -u {shlex.quote(str(user))} 2>/dev/null'
 
     def parse_status(self, raw):
         """兼容两种 qstat 输出:`qstat -u user`(≥10 列,S 在第 10 列)与裸 `qstat`(6 列,S 在第 5 列)。"""
@@ -128,7 +128,7 @@ class PBSDialect(SchedulerDialect):
         return result
 
     def cancel_cmd(self, job_id, bin_path=''):
-        return f'{_bin(bin_path, "qdel")} {job_id} 2>&1'
+        return f'{_bin(bin_path, "qdel")} {shlex.quote(str(job_id))} 2>&1'
 
 
 class SlurmDialect(SchedulerDialect):
@@ -170,7 +170,7 @@ class SlurmDialect(SchedulerDialect):
         return m.group(1) if m else ''
 
     def status_cmd(self, user, bin_path=''):
-        return f'{_bin(bin_path, "squeue")} -u {user} -o "%i|%t" --noheader 2>/dev/null'
+        return f'{_bin(bin_path, "squeue")} -u {shlex.quote(str(user))} -o "%i|%t" --noheader 2>/dev/null'
 
     def parse_status(self, raw):
         result = {}
@@ -193,7 +193,7 @@ class SlurmDialect(SchedulerDialect):
         return result
 
     def cancel_cmd(self, job_id, bin_path=''):
-        return f'{_bin(bin_path, "scancel")} {job_id} 2>&1'
+        return f'{_bin(bin_path, "scancel")} {shlex.quote(str(job_id))} 2>&1'
 
 
 _DIALECTS = {'PBS': PBSDialect, 'Slurm': SlurmDialect}

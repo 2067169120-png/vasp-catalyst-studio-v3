@@ -146,12 +146,23 @@ def render_html(rows: list, summary: dict, *, title: str = 'VASP 批量运行报
         f'<td class="dim">{esc(r["updated"])}</td></tr>'
         for r in rows)
 
+    def de_color(v):
+        """ΔE 颜色语义(原版口径):< -3 强吸附(绿)、> 0 不利(红)、其余默认。"""
+        if not isinstance(v, (int, float)):
+            return ''
+        if v > 0:
+            return 'color:#b91c1c;font-weight:600'
+        if v < -3:
+            return 'color:#15803d;font-weight:600'
+        return ''
+
     de_section = ''
     if delta_e and delta_e.get('rows'):
         de_rows = ''.join(
             f'<tr><td>{esc(r.get("name"))}</td><td>{chip(r.get("state",""))}</td>'
             f'<td class="num">{esc(_fmt_energy(r.get("e_config")))}</td>'
-            f'<td class="num">{esc(_fmt_energy(r.get("delta_e")))}</td>'
+            f'<td class="num" style="{de_color(r.get("delta_e"))}">'
+            f'{esc(_fmt_energy(r.get("delta_e")))}</td>'
             f'<td class="dim">{esc(r.get("note",""))}</td></tr>'
             for r in delta_e['rows'])
         de_section = (
