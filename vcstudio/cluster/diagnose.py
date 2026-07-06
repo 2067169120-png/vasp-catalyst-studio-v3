@@ -62,6 +62,9 @@ _ENERGY_ABSURD = 10000.0
 _OOM_EXIT = 137             # 128+9(SIGKILL),常见 OOM/超墙钟被杀
 _ZBRENT_RE = re.compile(r'ZBRENT:\s*fatal', re.IGNORECASE)
 _SEGV_RE = re.compile(r'sigsegv|segmentation fault', re.IGNORECASE)
+# OOM 的日志直接证据:Slurm slurmstepd 的 oom-kill 行 / 内核 oom_kill / MPI 被 SIGKILL 收尸
+_OOM_LOG_RE = re.compile(r'oom-kill|oom_kill|out of memory'
+                         r'|APPLICATION TERMINATED WITH THE EXIT STRING: Killed', re.IGNORECASE)
 
 # 已知 VASP 内部错误签名(字面串核对自 pymatgen Custodian VaspErrorHandler)。
 # 命中 → 具体命名 + 标准补救提示,状态 NEEDS_HUMAN:这些几乎都靠改 INCAR
@@ -79,8 +82,16 @@ _VASP_ERROR_TABLE = [
      '电荷混合严重发散:检查初始结构/磁矩,或调 AMIX/BMIX/IMIX'),
     (re.compile(r'Error EDDDAV: Call to ZHEGV failed'), 'EDDDAV',
      'Davidson 本征求解失败:试 ALGO=Normal 或 All'),
+    (re.compile(r'WARNING in EDDRMM: call to ZHEGV failed'), 'EDDRMM',
+     'RMM-DIIS 本征求解失败:试 ALGO=Normal 或减小 POTIM,并删 WAVECAR/CHGCAR'),
+    (re.compile(r'EDWAV: internal error, the gradient is not orthogonal'), 'EDWAV',
+     '梯度不正交(ALGO=All/Damped 常见):试 ALGO=Fast 或 Normal'),
     (re.compile(r'Call to routine ZHEEV failed|EDDIAG: Call to (?:routine )?ZHEEV'), 'ZHEEV',
      '对角化 ZHEEV 失败:试 ALGO=Normal'),
+    (re.compile(r'while reading plane|while reading WAVECAR'), 'WAVECAR_CORRUPT',
+     'WAVECAR 损坏/不匹配:删除 WAVECAR 后重跑'),
+    (re.compile(r'Error reading item|Error code was IERR=\s*5'), 'INCAR_READ',
+     'INCAR 读取错误(键名/格式笔误):检查 INCAR 拼写'),
     (re.compile(r'ERROR RSPHER|REAL_OPTLAY: internal error|REAL_OPT: internal ERROR'), 'LREAL',
      '实空间投影错误:试 LREAL=.FALSE.'),
     (re.compile(r'internal error in subroutine PRICEL|POSMAP|group operation missing'
@@ -105,14 +116,15 @@ class Diagnosis:
 
 
 def energy_implausible(e) -> bool:
-    """通用物理合理性:None(拿不到)/ 正总能(结构重叠)/ |E|>1e4(爆掉)→ 不可信。"""
+    """通用物理合理性:None(拿不到)/ E≥0(正=结构重叠;恰为 0 只能是解析垃圾)/
+    |E|>1e4(爆掉)→ 不可信。真实束缚体系的 DFT 总能恒为负。"""
     if e is None:
         return True
     try:
         v = float(e)
     except (TypeError, ValueError):
         return True
-    return v > 0 or abs(v) > _ENERGY_ABSURD
+    return v >= 0 or abs(v) > _ENERGY_ABSURD
 
 
 def scan_log(log_tail: str) -> str | None:
@@ -126,6 +138,8 @@ def scan_log(log_tail: str) -> str | None:
         return None
     if _ZBRENT_RE.search(log_tail):
         return ZBRENT
+    if _OOM_LOG_RE.search(log_tail):
+        return OOM
     if _SEGV_RE.search(log_tail):
         return SIGSEGV
     nonempty = [ln.strip() for ln in log_tail.splitlines() if ln.strip()]

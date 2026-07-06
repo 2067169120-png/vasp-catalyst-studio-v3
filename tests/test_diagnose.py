@@ -111,6 +111,29 @@ def test_scan_vasp_error_signatures():
     assert dg.scan_vasp_error('VERY BAD NEWS! internal error in subroutine XXX')[0] == 'VASP_INTERNAL'
 
 
+def test_scan_vasp_error_round2_signatures():
+    """review-round2 收尾:补齐撞额度时漏掉的 Custodian 签名。"""
+    assert dg.scan_vasp_error('WARNING in EDDRMM: call to ZHEGV failed')[0] == 'EDDRMM'
+    assert dg.scan_vasp_error('EDWAV: internal error, the gradient is not orthogonal')[0] == 'EDWAV'
+    assert dg.scan_vasp_error('while reading WAVECAR, plane wave coefficients changed')[0] == 'WAVECAR_CORRUPT'
+    assert dg.scan_vasp_error('Error reading item ''IMAGES'' from file INCAR.')[0] == 'INCAR_READ'
+
+
+def test_scan_log_oom_text_evidence():
+    """Slurm oom-kill / MPI SIGKILL 收尸行 = OOM 直接证据 → FAILED。"""
+    assert dg.scan_log('slurmstepd: error: Detected 1 oom-kill event(s)\n') == dg.OOM
+    assert dg.scan_log('APPLICATION TERMINATED WITH THE EXIT STRING: Killed (signal 9)\n') == dg.OOM
+    d = classify(outcar_size=90000, log_tail='slurmstepd: error: Detected 1 oom-kill event(s)\n')
+    assert d.failure_class == dg.OOM and d.state == 'FAILED'
+
+
+def test_energy_zero_is_implausible():
+    """E0 恰为 0.0 只能是解析垃圾(真实束缚体系总能恒负)→ 不可信。"""
+    assert dg.energy_implausible(0.0)
+    d = classify(converged=True, energy=0.0, outcar_size=90000)
+    assert d.failure_class == dg.BAD_ENERGY
+
+
 def test_scan_vasp_error_no_false_positive():
     assert dg.scan_vasp_error('running fine, ionic step 5 converged\n') is None
     assert dg.scan_vasp_error('BRMIX') is None                 # 裸 BRMIX(正常混合类型回显)不误报

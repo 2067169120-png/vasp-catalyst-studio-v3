@@ -207,7 +207,7 @@ def refresh_job(client, profile, job_dir: str, live_states: dict | None = None,
     remote = m.get('remote_dir') or ''
     reason = (terminal_reasons or {}).get(jid)
     outcar_size, oszicar_size = _stat_sizes(client, remote)
-    converged = _grep_converged(client, remote)
+    converged = _grep_converged(client, remote, m.get('task_type') or 'relax')
     exit_code, log_tail = _read_log(client, remote, jid)
     energy = _read_e0(client, remote)
 
@@ -261,11 +261,20 @@ def _stat_sizes(client, remote: str):
     return sizes.get('OUTCAR'), sizes.get('OSZICAR')
 
 
-def _grep_converged(client, remote: str) -> bool:
-    """OUTCAR 是否含 'reached required accuracy'(电子步达精度;缺文件 → False)。"""
+# 收敛标志按任务类型分流(review-round2 收尾):'reached required accuracy' 是**离子弛豫**
+# 收敛标志,static/dos/band(NSW=0)永远不出这行,用它判会把收敛的静态作业误判未收敛;
+# 静态类作业查电子收敛标志 'aborting loop because EDIFF is reached'。
+_IONIC_MARK = 'reached required accuracy'
+_ELEC_MARK = 'aborting loop because EDIFF is reached'
+_STATIC_TASKS = ('static', 'dos', 'band')
+
+
+def _grep_converged(client, remote: str, task_type: str = 'relax') -> bool:
+    """OUTCAR 是否含对应任务类型的收敛标志(缺文件 → False)。"""
     if not remote:
         return False
-    out, _ = run_cmd(client, f'grep -c "reached required accuracy" '
+    mark = _ELEC_MARK if task_type in _STATIC_TASKS else _IONIC_MARK
+    out, _ = run_cmd(client, f'grep -c "{mark}" '
                              f'{shlex.quote(remote + "/OUTCAR")} 2>/dev/null || echo 0')
     return _first_int(out) > 0
 

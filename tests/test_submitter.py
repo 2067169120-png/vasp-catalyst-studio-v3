@@ -336,6 +336,17 @@ def test_continue_refuses_invalid_contcar(tmp_path):
         submitter.continue_from_contcar(client, _profile(), d)
 
 
+def test_grep_converged_static_uses_electronic_mark(tmp_path):
+    """static/dos/band(NSW=0)永远不出'reached required accuracy'(离子标志),
+    改查电子收敛标志,否则收敛的静态作业被误判未收敛(review-round2 收尾)。"""
+    client = FakeClient(script=[('grep -c', '1\n')])
+    submitter._grep_converged(client, '/w/j', 'static')
+    assert 'aborting loop because EDIFF is reached' in client.commands[-1]
+    client2 = FakeClient(script=[('grep -c', '1\n')])
+    submitter._grep_converged(client2, '/w/j', 'relax')
+    assert 'reached required accuracy' in client2.commands[-1]
+
+
 def test_read_log_targets_job_number(tmp_path):
     """续算后旧 .o<旧号> 仍在:_read_log 按本作业号精确定位,不用宽通配 *.o*(否则误读旧轮)。"""
     client = FakeClient()
