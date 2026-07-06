@@ -68,7 +68,32 @@ def test_analyze_http_error_retries_then_fails():
         return 429, b'rate limited'
 
     out = ai.analyze({'x': 1}, api_key='k', transport=bad)
-    assert not out['ok'] and 'HTTP 429' in out['error'] and len(calls) == 2  # 重试一次
+    assert not out['ok'] and 'HTTP 429' in out['error'] and len(calls) == 4  # 重试预算(网关抖动)
+
+
+def test_analyze_strips_rejected_params_and_extracts_fenced_json():
+    """真实网关行为回放:400 拒 temperature → 剥参重试;Claude 回 ```json 围栏 → 提取。"""
+    calls = []
+
+    def gw(url, body, headers, timeout):
+        calls.append(body.decode('utf-8'))
+        if 'temperature' in calls[-1]:
+            return 400, b'{"error":{"message":"`temperature` is deprecated for this model."}}'
+        content = ('```json\n{"analysis_zh":"zh","paragraph_en":"en",'
+                   '"caveats":["c1"],"confidence":"high"}\n```')
+        import json as j
+        return 200, j.dumps({'choices': [{'message': {'content': content}}]}).encode()
+
+    out = ai.analyze({'x': 1}, api_key='k', transport=gw)
+    assert out['ok'] and out['analysis_zh'] == 'zh' and out['confidence'] == 'high'
+    assert len(calls) == 2 and 'temperature' not in calls[-1]   # 剥参后第二次成功
+
+
+def test_extract_json_variants():
+    assert ai._extract_json('{"a":1}') == '{"a":1}'
+    assert ai._extract_json('```json\n{"a":1}\n```') == '{"a":1}'
+    assert ai._extract_json('前言 {"a":1} 后语') == '{"a":1}'
+    assert ai._extract_json('no json here') == 'no json here'   # 原样(上层报解析失败)
 
 
 def test_analyze_bad_json_degrades():
