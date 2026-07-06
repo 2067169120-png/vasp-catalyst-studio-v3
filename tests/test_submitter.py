@@ -93,7 +93,8 @@ def _job_dir(tmp_path):
     lib = tmp_path / 'lib'
     (lib / 'C').mkdir(parents=True)
     (lib / 'C' / 'POTCAR').write_text(
-        ' fake PAW_PBE C\n   ENMAX  =  273.214; ENMIN = 200.000 eV\n', encoding='utf-8')
+        ' fake PAW_PBE C\n   TITEL  = PAW_PBE C 08Apr2002\n'
+        '   ENMAX  =  273.214; ENMIN = 200.000 eV\n', encoding='utf-8')
     poscar = tmp_path / 'POSCAR'
     poscar.write_text('C atom\n1.0\n10 0 0\n0 10 0\n0 0 10\nC\n1\nCartesian\n0 0 0\n',
                       encoding='utf-8')
@@ -118,6 +119,17 @@ def test_preflight_catches_problems(tmp_path):
     empty = tmp_path / 'empty'
     empty.mkdir()
     assert any('缺 INCAR' in e for e in submitter.preflight(_profile(), str(empty)))
+
+
+def test_preflight_potcar_titel_gate(tmp_path):
+    """原版防线移植:POTCAR TITEL 段数 ≠ 物种数(截断/手改)→ 拒绝提交。"""
+    d = _job_dir(tmp_path)
+    assert submitter.preflight(_profile(), d) == []            # 完好 → 放行
+    potcar = os.path.join(d, 'POTCAR')
+    text = open(potcar, encoding='utf-8').read()
+    open(potcar, 'w', encoding='utf-8').write(text + text)     # 复制一份 → TITEL 数翻倍
+    errs = submitter.preflight(_profile(), d)
+    assert any('TITEL' in e and '截断/手改' in e for e in errs)
 
 
 def test_submit_job_happy_path_pbs(tmp_path):

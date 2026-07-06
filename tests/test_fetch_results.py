@@ -68,7 +68,8 @@ def _job(tmp_path):
     lib = tmp_path / 'lib'
     (lib / 'C').mkdir(parents=True)
     (lib / 'C' / 'POTCAR').write_text(
-        ' fake PAW_PBE C\n   ENMAX  =  273.214; ENMIN = 200.000 eV\n', encoding='utf-8')
+        ' fake PAW_PBE C\n   TITEL  = PAW_PBE C 08Apr2002\n'
+        '   ENMAX  =  273.214; ENMIN = 200.000 eV\n', encoding='utf-8')
     poscar = tmp_path / 'POSCAR'
     poscar.write_text('C atom\n1.0\n10 0 0\n0 10 0\n0 0 10\nC\n1\nCartesian\n0 0 0\n',
                       encoding='utf-8')

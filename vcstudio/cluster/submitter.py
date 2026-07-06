@@ -48,8 +48,13 @@ def preflight(profile, job_dir: str) -> list:
     for f in _INPUT_FILES:
         if not os.path.isfile(os.path.join(job_dir, f)):
             errs.append(f'作业目录缺 {f}(先在生成页产出四件套)')
-    if manifest_mod.load_manifest(job_dir) is None:
+    m0 = manifest_mod.load_manifest(job_dir)
+    if m0 is None:
         errs.append('作业目录缺 job.yaml(旧目录可重新生成一次以补台账)')
+    else:
+        # POTCAR TITEL 闸(原版提交前防线):截断/拼错的 POTCAR 会给出"收敛但静默错"
+        # 的能量——TITEL 段数必须等于 POSCAR 物种数,不等拒绝提交
+        errs += _potcar_gate(job_dir, m0)
     if not profile.remote_root:
         errs.append('集群配置未填远程工作目录 remote_root')
     elif not str(profile.remote_root).startswith('/'):
@@ -73,6 +78,23 @@ def preflight(profile, job_dir: str) -> list:
     else:
         errs.append(f'未知脚本模式: {mode!r}')
     return errs
+
+
+def _potcar_gate(job_dir: str, m: dict) -> list:
+    """本地 POTCAR 的 TITEL 段数 == manifest 物种数,否则拒提交(读不到不硬拦)。"""
+    elements = (m.get('inputs') or {}).get('elements') or []
+    if not elements:
+        return []
+    try:
+        with open(os.path.join(job_dir, 'POTCAR'), 'r', encoding='utf-8',
+                  errors='replace') as f:
+            n_titel = f.read().count('TITEL')
+    except OSError:
+        return []                                       # 缺文件已有独立检查项
+    if n_titel != len(elements):
+        return [f'POTCAR 完整性检查失败:TITEL 段数 {n_titel} ≠ 物种数 {len(elements)}'
+                f'({" ".join(elements)});文件疑被截断/手改,请重新生成后再提交']
+    return []
 
 
 def _spec_for(profile, job_dir: str) -> JobScriptSpec:
