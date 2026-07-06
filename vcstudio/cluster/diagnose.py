@@ -29,6 +29,7 @@ SILENT_EXIT = 'SILENT_EXIT'       # 退出 0 但无 OUTCAR——诡异,交人工
 NO_OUTPUT = 'NO_OUTPUT'           # 启动即死/缺 POTCAR,零输出——交人工
 BAD_ENERGY = 'BAD_ENERGY'         # 有收敛串但能量不合理——交人工(防收敛却是垃圾数)
 SCF_SLOSHING = 'SCF_SLOSHING'     # 电子步震荡(NELM 打满且 dE 不降)——盲目续算必复现,交人工
+USER_STOPPED = 'USER_STOPPED'     # STOPCAR 人工叫停——不是失败,人决定下一步
 UNKNOWN = 'UNKNOWN'               # 规则不覆盖——交人工
 
 # 分类 → job.yaml 状态(复活死态 FAILED/NEEDS_HUMAN)
@@ -45,6 +46,7 @@ FAILURE_TO_STATE = {
     NO_OUTPUT: 'NEEDS_HUMAN',
     BAD_ENERGY: 'NEEDS_HUMAN',
     SCF_SLOSHING: 'NEEDS_HUMAN',
+    USER_STOPPED: 'NEEDS_HUMAN',
     UNKNOWN: 'NEEDS_HUMAN',
 }
 
@@ -157,6 +159,26 @@ _SLOSH_MIN_DE = 1e-2
 _SCF_LINE_RE = re.compile(r'^(?:DAV|RMM|CG|DIA|NONE):\s*(\d+)\s+\S+\s+([+-]?[\d.E+-]+)', re.MULTILINE)
 
 
+def last_block_scf_iters(oszicar_tail: str) -> int:
+    """OSZICAR 尾部最后一个离子步块的电子步数(解析不出 → 0)。"""
+    if not oszicar_tail:
+        return 0
+    last_block = oszicar_tail.rsplit('F=', 1)[-1] if 'F=' in oszicar_tail else oszicar_tail
+    matches = _SCF_LINE_RE.findall(last_block)
+    return int(matches[-1][0]) if matches else 0
+
+
+def nelm_saturated(oszicar_tail: str, nelm: int = 60) -> bool:
+    """末离子步电子步数 ≥ NELM → 电子未收敛(即便日志出现 EDIFF-reached 串)。
+
+    网研核对(custodian NonConvergingErrorHandler + VASP5 行为):VASP5 在 NELM 耗尽时
+    **同样**打印 'aborting loop because EDIFF is reached',静态作业只看该串会假阳性;
+    必须叠加本守卫。NELM 从用户 INCAR 读,缺省 60(VASP 默认)。
+    """
+    n = last_block_scf_iters(oszicar_tail)
+    return n > 0 and n >= max(int(nelm or 60), 1)
+
+
 def scan_oszicar_sloshing(oszicar_tail: str) -> str | None:
     """OSZICAR 尾部 → 最后一个离子步的 SCF 块是否呈电子震荡。
 
@@ -209,7 +231,9 @@ def _reason_to_class(reason: str | None) -> str | None:
 
 def classify(*, scheduler_reason: str | None = None, exit_code: int | None = None,
              outcar_size=None, oszicar_size=None, log_tail: str = '',
-             converged: bool = False, energy=None, oszicar_tail: str = '') -> Diagnosis:
+             converged: bool = False, energy=None, oszicar_tail: str = '',
+             nelm: int = 60, clean_exit: bool | None = None,
+             stopped: bool = False) -> Diagnosis:
     """单一决策点:所有取证证据 → Diagnosis。
 
     优先级:①收敛串在场 → 判能量合理性(CONVERGED / BAD_ENERGY);②零输出 →
@@ -218,13 +242,24 @@ def classify(*, scheduler_reason: str | None = None, exit_code: int | None = Non
     """
     rcls = _reason_to_class(scheduler_reason)
 
-    # ① 收敛串在场:成功当且仅当能量物理合理
+    # ⓪ STOPCAR 人工叫停:不是失败,人决定下一步(防被误判 NONCONVERGED 而盲目续算)
+    if stopped and not converged:
+        return Diagnosis(USER_STOPPED, FAILURE_TO_STATE[USER_STOPPED], False,
+                         'OUTCAR 见 soft stop(STOPCAR 人工叫停);非失败,由人决定续算/放弃')
+
+    # ① 收敛串在场:成功当且仅当 能量物理合理 且 末离子步电子真收敛
     if converged:
+        if nelm_saturated(oszicar_tail, nelm):
+            # VASP5 陷阱:NELM 耗尽同样打印 EDIFF-reached 串——收敛标志是假阳性
+            return Diagnosis(SCF_SLOSHING, FAILURE_TO_STATE[SCF_SLOSHING], False,
+                             f'收敛标志在场但末离子步电子步打满 NELM={nelm}——电子实未收敛'
+                             f'(VASP5 对 NELM 耗尽同样打印 EDIFF-reached),能量不可信,需人工')
         if energy_implausible(energy):
             return Diagnosis(BAD_ENERGY, FAILURE_TO_STATE[BAD_ENERGY], False,
                              f'OUTCAR 报收敛但能量不合理(E={energy});疑结构重叠/SCF 发散,需人工核对')
+        tail_note = '' if clean_exit in (True, None) else '(注:未见 timing 页脚,收尾非干净退出)'
         return Diagnosis(CONVERGED, 'DONE', False,
-                         f'OUTCAR 达到要求精度,E0={energy} eV')
+                         f'OUTCAR 达到要求精度,E0={energy} eV{tail_note}')
 
     # ② 零输出:OUTCAR 与 OSZICAR 都空/缺
     if _empty(outcar_size) and _empty(oszicar_size):
@@ -259,9 +294,17 @@ def classify(*, scheduler_reason: str | None = None, exit_code: int | None = Non
     slosh = scan_oszicar_sloshing(oszicar_tail)     # 电子震荡:盲目续算必复现 → 交人工
     if slosh is not None:
         return Diagnosis(SCF_SLOSHING, FAILURE_TO_STATE[SCF_SLOSHING], False, slosh)
-    # 有输出、无硬崩信号、未见收敛串 → SCF/几何未收敛(可 CONTCAR 续算)
+    # 有输出、无硬崩信号、未见收敛串 → SCF/几何未收敛(可 CONTCAR 续算)。
+    # 干净退出页脚(General timing)细化证据:有页脚=跑满自然结束(NSW/NELM 耗尽),
+    # 无页脚=中途被杀(墙钟/OOM 未留其他痕迹)——两者都可续算,但人看得懂差别
+    if clean_exit is True:
+        detail = 'VASP 正常收尾但未达收敛判据(NSW/NELM 耗尽)'
+    elif clean_exit is False:
+        detail = '无 timing 页脚——中途被杀(疑墙钟/资源)'
+    else:
+        detail = 'SCF/几何未收敛'
     return Diagnosis(NONCONVERGED, 'UNCONVERGED', True,
-                     '有输出但未见"reached required accuracy"——SCF/几何未收敛,可从 CONTCAR 续算')
+                     f'有输出但未见收敛标志——{detail},可从 CONTCAR 续算')
 
 
 # ── CONTCAR 续算前校验(valid_poscar 移植) ─────────────────────────────────────

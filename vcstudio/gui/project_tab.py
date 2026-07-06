@@ -148,6 +148,8 @@ class ProjectTab(ttk.Frame):
             self.log.write(f'✅ {member} → {d}')
         for member, msg in payload['errors']:
             self.log.write(f'❌ {member}:{msg}')
+        for pri, aname, msg in payload.get('advisories') or []:
+            self.log.write(f'⚠ 方法学[{pri}·{aname}]:{msg}')
         self.log.write(f"📁 project.yaml:{payload['project_path']}")
         self.log.write('➡ 到「任务」页选中这组作业上传提交;全部 DONE 后回本页算 ΔE')
         self._reload_projects()

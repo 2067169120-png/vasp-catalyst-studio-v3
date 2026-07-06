@@ -99,8 +99,41 @@ def create_project(root: str | os.PathLike, name: str, *,
     }
     ppath = save_project(root, project)
     register_project(ppath)
+    advisories = _project_advisories(incar_path, config_dirs, ref_poscar,
+                                     generated, lib_root)
     return {'ok': True, 'project_path': str(ppath), 'project': project,
-            'generated': generated, 'errors': errors}
+            'generated': generated, 'errors': errors, 'advisories': advisories}
+
+
+def _project_advisories(incar_path, config_dirs, ref_poscar, generated, lib_root):
+    """方法学顾问(warn-only,失败静默降级为空——顾问绝不能挡生成)。"""
+    try:
+        from vcstudio.generate.incar_builder import parse_incar
+        from vcstudio.generate.poscar import (read_poscar, parse_poscar_species,
+                                              read_cell_vectors)
+        from vcstudio.generate import potcar as potcar_mod
+        from vcstudio.project import advisor
+        with open(incar_path, 'r', encoding='utf-8', errors='replace') as f:
+            incar = parse_incar(f.read())
+        gas = None
+        if ref_poscar:
+            text = read_poscar(ref_poscar)
+            els, cnts = parse_poscar_species(text)
+            gas = {'elements': els, 'counts': cnts, 'cell': read_cell_vectors(text)}
+        unified = None
+        if 'ENCUT' not in {str(k).upper() for k in incar}:
+            union = set()
+            for d in ([g[1] for g in generated]):
+                m = manifest_mod.load_manifest(d)
+                union.update((m or {}).get('inputs', {}).get('elements') or [])
+            if union:
+                import math
+                mx = potcar_mod.max_enmax(sorted(union), lib_root)
+                unified = int(math.ceil(1.3 * mx / 50.0) * 50)
+        return advisor.advise(incar, has_configs=bool(config_dirs),
+                              gas=gas, unified_encut=unified)
+    except Exception:                                    # noqa: BLE001 顾问失败绝不挡生成
+        return []
 
 
 def save_project(root: str | os.PathLike, project: dict) -> Path:

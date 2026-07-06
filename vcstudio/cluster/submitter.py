@@ -207,7 +207,7 @@ def refresh_job(client, profile, job_dir: str, live_states: dict | None = None,
     remote = m.get('remote_dir') or ''
     reason = (terminal_reasons or {}).get(jid)
     outcar_size, oszicar_size = _stat_sizes(client, remote)
-    converged = _grep_converged(client, remote, m.get('task_type') or 'relax')
+    converged, clean_exit, stopped = _grep_marks(client, remote, m.get('task_type') or 'relax')
     exit_code, log_tail = _read_log(client, remote, jid)
     energy, oszicar_tail = _read_oszicar(client, remote)
 
@@ -215,7 +215,8 @@ def refresh_job(client, profile, job_dir: str, live_states: dict | None = None,
         scheduler_reason=reason, exit_code=exit_code,
         outcar_size=outcar_size, oszicar_size=oszicar_size,
         log_tail=log_tail, converged=converged, energy=energy,
-        oszicar_tail=oszicar_tail)
+        oszicar_tail=oszicar_tail, nelm=_read_nelm(job_dir),
+        clean_exit=clean_exit, stopped=stopped)
 
     if energy is not None:
         # 物理合理性闸(审查#4):BAD_ENERGY 的垃圾数不进 energy_e0_eV(防经自由能路径
@@ -270,14 +271,45 @@ _ELEC_MARK = 'aborting loop because EDIFF is reached'
 _STATIC_TASKS = ('static', 'dos', 'band')
 
 
-def _grep_converged(client, remote: str, task_type: str = 'relax') -> bool:
-    """OUTCAR 是否含对应任务类型的收敛标志(缺文件 → False)。"""
+# 干净退出页脚 + STOPCAR 叫停(网研核对:Kitchin/sisl 口径 completed≠converged;
+# pymatgen Outcar.is_stopped 的 soft stop 双空格字面串)
+_CLEAN_EXIT_MARK = 'General timing and accounting informations for this job'
+_STOP_MARK = 'soft stop encountered'
+
+
+def _grep_marks(client, remote: str, task_type: str = 'relax'):
+    """一次 SSH 取 OUTCAR 三个标志计数 → (converged, clean_exit, stopped)。
+
+    缺文件时三者 (False, False, False);clean_exit 独立于收敛(被杀作业绝不写页脚)。
+    """
     if not remote:
-        return False
+        return False, False, False
     mark = _ELEC_MARK if task_type in _STATIC_TASKS else _IONIC_MARK
-    out, _ = run_cmd(client, f'grep -c "{mark}" '
-                             f'{shlex.quote(remote + "/OUTCAR")} 2>/dev/null || echo 0')
-    return _first_int(out) > 0
+    o = shlex.quote(remote + '/OUTCAR')
+    out, _ = run_cmd(
+        client,
+        f'grep -c "{mark}" {o} 2>/dev/null || echo 0; '
+        f'grep -c "{_CLEAN_EXIT_MARK}" {o} 2>/dev/null || echo 0; '
+        f'grep -c "{_STOP_MARK}" {o} 2>/dev/null || echo 0')
+    nums = [_first_int(ln) for ln in out.splitlines() if ln.strip()]
+    nums += [0] * (3 - len(nums))
+    return nums[0] > 0, nums[1] > 0, nums[2] > 0
+
+
+def _grep_converged(client, remote: str, task_type: str = 'relax') -> bool:
+    """兼容入口:只要收敛位。"""
+    return _grep_marks(client, remote, task_type)[0]
+
+
+def _read_nelm(job_dir: str) -> int:
+    """本地作业目录 INCAR 的 NELM(缺失/读不到 → VASP 默认 60)。"""
+    try:
+        from vcstudio.generate.incar_builder import parse_incar
+        with open(os.path.join(job_dir, 'INCAR'), 'r', encoding='utf-8', errors='replace') as f:
+            v = parse_incar(f.read()).get('NELM')
+        return int(v) if isinstance(v, (int, float)) and int(v) > 0 else 60
+    except (OSError, ValueError, TypeError):
+        return 60
 
 
 def _read_log(client, remote: str, job_id: str = ''):

@@ -206,6 +206,34 @@ def test_sloshing_only_checks_last_ionic_block():
     assert dg.scan_oszicar_sloshing(good_last) is None
 
 
+# ── 网研核对的取证升级:STOPCAR / VASP5 假阳性守卫 / 干净退出页脚 ──
+def test_user_stopped_not_misjudged_nonconverged():
+    """STOPCAR 叫停 ≠ 失败:标 USER_STOPPED 交人工,防盲目续算。"""
+    d = classify(outcar_size=90000, oszicar_size=3000, stopped=True)
+    assert d.failure_class == dg.USER_STOPPED and d.state == 'NEEDS_HUMAN' and not d.restartable
+
+
+def test_vasp5_nelm_trap_converged_flag_is_false_positive():
+    """VASP5 陷阱:NELM 耗尽同样打印 EDIFF-reached——收敛标志+末块打满 NELM → 不可信。"""
+    tail = _oszicar_block(60, '0.5E-01')            # 60 步(默认 NELM)打满
+    assert dg.nelm_saturated(tail, 60)
+    d = classify(converged=True, energy=-100.0, oszicar_tail=tail, nelm=60,
+                 outcar_size=90000)
+    assert d.failure_class == dg.SCF_SLOSHING and d.state == 'NEEDS_HUMAN'
+    # 真收敛(末块 12 步远未打满)不受影响
+    ok = classify(converged=True, energy=-100.0, oszicar_tail=_oszicar_block(12, '0.1E-04'),
+                  nelm=60, outcar_size=90000)
+    assert ok.failure_class == dg.CONVERGED
+
+
+def test_clean_exit_refines_nonconverged_evidence():
+    d1 = classify(outcar_size=90000, clean_exit=True)
+    assert d1.failure_class == dg.NONCONVERGED and '正常收尾' in d1.evidence
+    d2 = classify(outcar_size=90000, clean_exit=False)
+    assert d2.failure_class == dg.NONCONVERGED and '中途被杀' in d2.evidence
+    assert d1.restartable and d2.restartable          # 两者都可续算
+
+
 # ── 状态映射与可续算集自洽 ──
 def test_state_map_and_restartable_consistency():
     for cls, state in dg.FAILURE_TO_STATE.items():
