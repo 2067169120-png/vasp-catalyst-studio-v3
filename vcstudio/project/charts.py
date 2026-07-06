@@ -17,10 +17,11 @@ from __future__ import annotations
 import html
 import math
 
-PUB_COLORS = ['#4C72B0', '#DD8452', '#55A868', '#C44E52',
-              '#8172B2', '#937860', '#DA8BC3', '#8C8C8C']
-BAND_FILL = '#E8ECF1'          # 理想窗口带(原版 Cui 带灰蓝)
-RDS_COLOR = '#C44E52'          # 决速步高亮
+# Paul Tol "bright" 色板:期刊出版标准、色盲安全(对齐论文级配色,替换原版 seaborn deep)
+PUB_COLORS = ['#4477AA', '#EE6677', '#228833', '#CCBB44',
+              '#66CCEE', '#AA3377', '#BBBBBB', '#222255']
+BAND_FILL = '#EAF0F6'          # 理想窗口带(更柔和的蓝灰)
+RDS_COLOR = '#EE6677'          # 决速步高亮(Tol 红)
 _FONT = "font-family='Segoe UI,Microsoft YaHei,sans-serif'"
 
 

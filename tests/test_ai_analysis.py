@@ -53,11 +53,11 @@ def test_analyze_happy_with_fake_transport():
     assert seen['body']['messages'][0]['role'] == 'system'
 
 
-def test_analyze_no_key_degrades():
-    out = ai.analyze({'x': 1}, api_key=None, transport=lambda *a: (_ for _ in ()).throw(AssertionError))
-    # load_api_key 可能返回 None(测试机无 keyring 条目)→ 降级提示
-    if not out['ok']:
-        assert 'API key' in out['error']
+def test_analyze_no_key_degrades(monkeypatch):
+    monkeypatch.setattr(ai, 'load_api_key', lambda: None)   # 隔离 keyring(机器上可能存了真 key)
+    out = ai.analyze({'x': 1}, api_key=None,
+                     transport=lambda *a: (_ for _ in ()).throw(AssertionError))
+    assert not out['ok'] and 'API key' in out['error']
 
 
 def test_analyze_http_error_retries_then_fails():

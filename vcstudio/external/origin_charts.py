@@ -15,15 +15,15 @@ import os
 import shutil
 import subprocess
 
-PUB_COLORS = ['#4C72B0', '#DD8452', '#55A868', '#C44E52',
-              '#8172B2', '#937860', '#DA8BC3', '#8C8C8C']
+PUB_COLORS = ['#4477AA', '#EE6677', '#228833', '#CCBB44',
+              '#66CCEE', '#AA3377', '#BBBBBB', '#222255']
 
 # ── runner:在系统 Python 里跑的独立脚本(只依赖 originpro/numpy,不依赖 vcstudio) ──
 RUNNER_SOURCE = r'''# -*- coding: utf-8 -*-
 """vcstudio Origin 渲染 runner(自动生成,勿手改):spec.json → PNG + result.json"""
 import json, math, os, sys
 
-PUB = ['#4C72B0', '#DD8452', '#55A868', '#C44E52', '#8172B2', '#937860', '#DA8BC3', '#8C8C8C']
+PUB = ['#4477AA', '#EE6677', '#228833', '#CCBB44', '#66CCEE', '#AA3377', '#BBBBBB', '#222255']
 
 
 def _nan(v):
