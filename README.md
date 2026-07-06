@@ -1,45 +1,39 @@
 # VASP Catalyst Studio (vcstudio)
 
-> 轻量化 DFT 自动化:交 **POSCAR + 你自己的 INCAR** → 自动生成 VASP 输入四件套 →(后续)多集群提交 / 零 token 监控 / LLM 分析出图。
+> 轻量化 VASP 自动化桌面平台:**生成输入 → 多集群提交 → 失败诊断 → 有界恢复 → ΔE/自由能分析 → 出版级报告**。Windows 单文件 EXE,确定性核心零 token,LLM 只在分析层。
 
-独立轻量脚本包,无 GUI。核心原则:**尊重用户 INCAR,绝不强改方法学**。
+📖 完整用法与代码分区块地图见 **[使用说明.md](使用说明.md)**。
 
-📖 **完整用法见 [使用说明.md](使用说明.md)。**
+## 架构(对齐 OpenClaw 论文的分层,全部已实现)
 
-## 四区(里程碑)
-
-| 区 | 状态 | 职责 |
+| 层 | 模块 | 职责与验证条件 |
 |---|---|---|
-| generate 生成区 | **M1(已完成)** | POSCAR + 用户 INCAR → INCAR/POTCAR/KPOINTS(本地拼 + 校验补全) |
-| cluster 集群区 | M2 | DPDispatcher 薄封装:多调度器(Torque/Slurm/LSF/Shell)提交/查询/回收 |
-| monitor 监控区 | M3 | 纯 Python 零 token 轮询:sloshing/收敛/失败检测 → 契约文件 |
-| analyze 分析区 | M4 | 读契约 → 吸附能图/台阶/火山 + Word 报告 + 可选 LLM 讨论 |
+| 生成 | `vcstudio/generate/` | POSCAR+用户 INCAR → 四件套;缺项才补全,**绝不改用户键**;`job.yaml` 记 sha256 溯源 |
+| 提交 | `cluster/{schedulers,script_builder,submitter,connection}` | PBS/Slurm 双方言(纯函数);preflight 不过不出手;脚本双轨(auto/模板透传) |
+| 监控+失败验证 | `submitter.refresh_job` + `cluster/diagnose.py` | 调度器终态原因+退出码+输出完整性+日志签名+收敛串+能量合理性 → 12+11 类分类 → 4 个终态;查询哨兵防瞬时抖动误判 |
+| 有界恢复 | `submitter.continue_from_contcar` | 仅可续算分类;CONTCAR 校验;INCAR 冻结;**上限 3 轮**;规则不覆盖 → NEEDS_HUMAN 停机 |
+| 分析+报告 | `project/` + `external/` | ΔE 门控(全 DONE 才给数)、Li-S 放电路径(ΔG/PDS/U_L)、Origin/SVG 双引擎图表、POV-Ray 结构图、LLM 双语分析(真实 INCAR 注入,禁编造文献) |
+
+三条不变式:①方法学主权(用户 INCAR/模板逐字透传)②确定性核心零 token ③显式状态绝不静默(job.yaml 状态机 + 审计历史)。
+
+## 科学约定
+
+- `E_ads = E(slab+ads) − E(slab) − E(ref)`,负 = 有利吸附
+- `μ_Li = (E(Li₂S) − E(S₈)/8) / 2`;放电路径 ΔG 参照 S8* = 0;U_L = −max(ΔG/Δn_e)(CHE)
+- 全部能量为 DFT 电子能(未含 ZPE/熵),报告与 AI 提示词均明示
+- 凭据(集群密码/LLM key)只进 Windows 凭据库,不落明文
 
 ## 快速开始
 
-```bash
-pip install -e .
-vcs gen --poscar POSCAR --incar my.incar --calc-type slab -o results/job1/
-```
+**GUI**:双击 `dist\VASP Catalyst Studio.exe`(四页:生成/吸附能项目/任务/集群)。
+**CLI**:`pip install -e .` 后 `vcs gen --poscar POSCAR --incar my.incar --calc-type slab -o results/job1/`。
+**重打包**:双击 `重新打包EXE.bat`。**测试**:`python -m pytest`(207 用例;Origin 真机冒烟 `VCS_ORIGIN_SMOKE=1`)。
 
-生成 `results/job1/`,含:
-
-- `INCAR` —— 你的原文 + 校验补全(缺 ENCUT/MAGMOM/ISPIN 才追加,原文一字不改)
-- `POTCAR` —— 按 POSCAR 物种顺序本地拼接,ENMAX≤ENCUT 硬校验(元素表覆盖 62 种,含 H/O/卤素/碱土)
-- `KPOINTS` —— 自动推荐(或 `--kpoints "5 5 1"` 指定)
-- `POSCAR` —— 原样拷入
-- `job.yaml` —— 任务台账:状态机 + 输入溯源(sha256)+ 补全审计,贯穿后续提交/监控/分析
-
-## 配置
-
-`config.yaml` 的 `potcar_lib_root` 指向本地 PAW_PBE 库根。**首次使用请改成你自己的库路径。** 也可用环境变量 `VCSTUDIO_CONFIG` 指定配置文件,或用 CLI `--lib-root` 临时覆盖。详见 [使用说明.md](使用说明.md)。
-
-## 目录结构
+## 目录
 
 ```
-vcstudio/        核心包(generate 生成区 / shared 配置 / cli 入口)
-config.yaml      本地配置(赝势库路径等)
-results/         建议的作业输出目录(生成内容默认不入 git)
-使用说明.md       完整使用文档
-README.md        本文件(简介)
+vcstudio/       核心包(generate/cluster/project/external/gui/shared/cli)
+tests/          207 测试   docs/superpowers/specs/  设计文档
+config.yaml     本地配置(赝势库/分子库/理想窗口/llm 端点)
+dist/           打包产物 EXE(gitignore)   results/  作业输出(不入 git)
 ```
