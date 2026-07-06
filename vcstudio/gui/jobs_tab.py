@@ -47,7 +47,7 @@ class JobsTab(ttk.Frame):
         self.profile_cb = ttk.Combobox(bar, textvariable=self.profile_var, width=18, state='readonly')
         self.profile_cb.grid(row=0, column=1, padx=4)
         ttk.Button(bar, text='⟳ 刷新列表', command=self.reload).grid(row=0, column=2, padx=4)
-        self.submit_btn = ttk.Button(bar, text='📤 上传并提交(选中)', command=self._on_submit)
+        self.submit_btn = ttk.Button(bar, text='📤 上传并提交(选中)', style='Accent.TButton', command=self._on_submit)
         self.submit_btn.grid(row=0, column=3, padx=4)
         self.status_btn = ttk.Button(bar, text='🔄 查询状态', command=self._on_refresh_status)
         self.status_btn.grid(row=0, column=4, padx=4)

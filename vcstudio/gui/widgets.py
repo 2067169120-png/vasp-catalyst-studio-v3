@@ -44,7 +44,10 @@ class LogBox(ttk.Frame):
 
     def __init__(self, parent, height: int = 12):
         super().__init__(parent)
-        self.text = tk.Text(self, height=height, wrap='word', state='disabled')
+        self.text = tk.Text(self, height=height, wrap='word', state='disabled',
+                            background='#FFFFFF', foreground='#1F2937',
+                            font=('Consolas', 9), relief='solid', borderwidth=1,
+                            highlightthickness=0, padx=6, pady=4)
         scroll = ttk.Scrollbar(self, command=self.text.yview)
         self.text.configure(yscrollcommand=scroll.set)
         self.text.grid(row=0, column=0, sticky='nsew')

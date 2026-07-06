@@ -77,7 +77,7 @@ class GenerateTab(ttk.Frame):
 
         btns = ttk.Frame(self)
         btns.grid(row=8, column=0, pady=6)
-        self.run_btn = ttk.Button(btns, text='▶ 一键生成', command=self._on_run)
+        self.run_btn = ttk.Button(btns, text='▶ 一键生成', style='Accent.TButton', command=self._on_run)
         self.run_btn.grid(row=0, column=0, padx=6)
         self.open_btn = ttk.Button(btns, text='📂 打开输出文件夹', command=self._open_out, state='disabled')
         self.open_btn.grid(row=0, column=1, padx=6)

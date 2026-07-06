@@ -57,7 +57,7 @@ class ProjectTab(ttk.Frame):
 
         gbar = ttk.Frame(new)
         gbar.grid(row=6, column=0, pady=4)
-        self.gen_btn = ttk.Button(gbar, text='🚀 批量生成并登记台账', command=self._on_generate)
+        self.gen_btn = ttk.Button(gbar, text='🚀 批量生成并登记台账', style='Accent.TButton', command=self._on_generate)
         self.gen_btn.grid(row=0, column=0, padx=6)
         ttk.Label(gbar, text='类型自动:表面/组态=slab,气相参考=molecule(Γ点)',
                   foreground='#666666').grid(row=0, column=1, padx=6)
