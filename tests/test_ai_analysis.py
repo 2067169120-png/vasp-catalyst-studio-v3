@@ -102,3 +102,15 @@ def test_analyze_bad_json_degrades():
 
     out = ai.analyze({'x': 1}, api_key='k', transport=weird)
     assert not out['ok'] and '解析失败' in out['error']
+
+
+def test_catalyst_context_heuristics():
+    """类型化机理语境(原版 _CATALYST_CONTEXT 框架移植,无编造数值)。"""
+    assert 'single/dual-atom' in ai.catalyst_context(['Zn', 'N', 'C'])
+    assert 'dichalcogenide' in ai.catalyst_context(['Mo', 'S'])
+    assert 'transition-metal surface' in ai.catalyst_context(['Pt'])
+    assert ai.catalyst_context(['Si', 'O']) == '' or 'oxide' in ai.catalyst_context(['Si', 'O'])
+    assert ai.catalyst_context([]) == ''
+    p = ai.build_payload(project_name='p', delta_rows=[], incar_summary={},
+                         slab_elements=['Zn', 'N', 'C'])
+    assert 'catalyst_context' in p and 'd-orbital' in p['catalyst_context']

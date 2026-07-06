@@ -32,8 +32,40 @@ SYSTEM_PROMPT = (
     '"caveats" (array of strings, honest limitations), "confidence" (high/medium/low).')
 
 
+# 催化剂类型机理语境(移植原版 _CATALYST_CONTEXT 的类型化框架;只给机理概念,
+# 不带原版那些无来源的文献数值——守禁编造原则)。按 slab 元素组成启发式判型。
+_TM = {'Sc', 'Ti', 'V', 'Cr', 'Mn', 'Fe', 'Co', 'Ni', 'Cu', 'Zn', 'Y', 'Zr', 'Nb',
+       'Mo', 'Ru', 'Rh', 'Pd', 'Ag', 'W', 'Re', 'Os', 'Ir', 'Pt', 'Au', 'Ta', 'Hf'}
+
+
+def catalyst_context(elements: list) -> str:
+    """slab 元素组成 → 机理语境提示(判不出 → 空串,提示词不加戏)。"""
+    els = set(elements or [])
+    tms = els & _TM
+    if tms and {'N', 'C'} <= els and len(tms) <= 2:
+        return ('Catalyst class hint: single/dual-atom catalyst (TM-N-C coordination). '
+                'Consider metal-center d-orbital splitting under the N-coordination field, '
+                'metal–adsorbate orbital hybridization, and charge transfer at the M site.')
+    if tms and 'S' in els and not ({'N', 'C'} & els) and len(tms) == 1:
+        return ('Catalyst class hint: transition-metal dichalcogenide (TMD) surface. '
+                'Consider basal-plane vs edge-site activity, S-vacancy effects, and '
+                'd-band interaction with the adsorbate frontier orbitals.')
+    if tms and ('O' in els) and len(tms) <= 2:
+        return ('Catalyst class hint: oxide (or oxidized) surface. Consider surface '
+                'lattice-oxygen participation, cation oxidation state, and possible '
+                'polaronic/charge-transfer effects on adsorption.')
+    if len(tms) >= 2:
+        return ('Catalyst class hint: bimetallic/heterostructure surface. Consider '
+                'ligand and strain effects on the d-band center and site-dependent binding.')
+    if tms:
+        return ('Catalyst class hint: transition-metal surface. Consider d-band-center '
+                'arguments and coordination-number effects on binding strength.')
+    return ''
+
+
 def build_payload(*, project_name: str, delta_rows: list, incar_summary: dict,
-                  kpoints=None, path_result: dict | None = None) -> dict:
+                  kpoints=None, path_result: dict | None = None,
+                  slab_elements: list | None = None) -> dict:
     """项目结果 → 喂给 LLM 的结构化数据(数值为数字;真实计算参数;含失败统计)。"""
     ok_rows = [r for r in delta_rows if r.get('delta_e') is not None]
     payload = {
@@ -47,6 +79,9 @@ def build_payload(*, project_name: str, delta_rows: list, incar_summary: dict,
     }
     if kpoints:
         payload['kpoints'] = list(kpoints)
+    ctx = catalyst_context(slab_elements or [])
+    if ctx:
+        payload['catalyst_context'] = ctx
     if path_result:
         payload['discharge_path'] = {
             'delta_G_eV': {s['label']: s['G'] for s in path_result['steps']},
@@ -62,9 +97,13 @@ def build_prompt(payload: dict) -> str:
     return (
         'Analyze these VASP adsorption results. Data (JSON):\n'
         + json.dumps(payload, ensure_ascii=False, indent=1)
-        + '\n\nTasks: 1) interpret the adsorption-strength trend across configurations; '
-          '2) if discharge_path present, interpret the potential-determining step; '
-          '3) note anything anomalous (positive E_ads, missing configs). '
+        + '\n\nTasks: 1) interpret the adsorption-strength trend across configurations, '
+          'and WHY (electronic structure: orbital hybridization, charge transfer, '
+          'd-band arguments where applicable — use catalyst_context if provided); '
+          '2) if the series spans related species (e.g. chain lengths), explain HOW '
+          'binding evolves along the series and what that implies for the application; '
+          '3) if discharge_path present, interpret the potential-determining step; '
+          '4) note anything anomalous (positive E_ads, missing configs). '
           'Remember: no invented references or parameters. '
           # 键名约束放末尾(recency):Claude 系模型会无视只写在 system 里的 schema 自创结构
           'Output MUST be a single JSON object with EXACTLY these four keys and no others: '

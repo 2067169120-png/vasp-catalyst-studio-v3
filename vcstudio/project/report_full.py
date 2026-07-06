@@ -134,9 +134,14 @@ def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
         inc = incar_summary_from_dir(d)
         if inc:
             break
+    slab_dir = (proj.get('members') or {}).get('clean_slab')
+    slab_els = []
+    if slab_dir:
+        from vcstudio.shared import manifest as _mm
+        slab_els = ((_mm.load_manifest(slab_dir) or {}).get('inputs') or {}).get('elements') or []
     payload = ai_analysis.build_payload(
         project_name=name, delta_rows=delta['rows'],
-        incar_summary=inc, path_result=fed)
+        incar_summary=inc, path_result=fed, slab_elements=slab_els)
     ai_out = ai_analyze(payload)
     sections.append('<h2>AI 分析</h2>')
     if ai_out.get('ok'):
