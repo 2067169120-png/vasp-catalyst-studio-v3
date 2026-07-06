@@ -118,11 +118,20 @@ def render_bar(op, c, out_dir, width):
     return png
 
 
+def _strip_common_prefix(names):
+    """剥离全员公共前缀(截到最后一个 '_'):'Zn-Ta_S8'... → 'S8'...,防 X 轴标签重叠。"""
+    if len(names) < 2:
+        return names
+    pref = os.path.commonprefix(names)
+    k = pref.rfind('_') + 1
+    return [n[k:] or n for n in names] if k > 0 else names
+
+
 def _render_bar_single(op, c, out_dir, width):
     """单体系出版级柱状图(原版 _fig_ads_bar 口径):NPG 逐物种配色 + 数值标注 +
     物种名下置 + 隐藏 X 刻度 + 网格 + 阴影理想窗口带(失败降级为参考线)。"""
     d = c['data']
-    species = [str(x) for x in d['cols']]
+    species = _strip_common_prefix([str(x) for x in d['cols']])
     vals = [_nan(v) for v in d['matrix'][0]]
     n = len(species)
     x_spacing = 2.0
@@ -351,6 +360,10 @@ def render_charts(specs: list, out_dir, *, opju_path=None, width: int = 2400,
     py = python_exe or find_python(configured_python)
     if not py:
         return {'ok': False, 'images': {}, 'error': '未找到系统 Python(Origin 出图需要装了 originpro 的 Python)'}
+    # 必须绝对路径:Origin 进程工作目录与本进程不同,相对路径 save_fig 会存错地方/失败
+    out_dir = os.path.abspath(str(out_dir))
+    if opju_path:
+        opju_path = os.path.abspath(str(opju_path))
     os.makedirs(out_dir, exist_ok=True)
     runner = os.path.join(out_dir, '_origin_runner.py')
     spec_file = os.path.join(out_dir, '_origin_spec.json')
