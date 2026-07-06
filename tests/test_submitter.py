@@ -358,6 +358,32 @@ def test_query_states_empty_with_sentinel_is_no_jobs(tmp_path):
     assert submitter.query_states(client, _profile()) == {}
 
 
+def test_query_scheduler_returns_terminal_reasons(tmp_path):
+    """Slurm 终态原因(TO/CA/NF/OOM)被捕获并随状态一起返回(审查#1 接线)。"""
+    prof = _profile()
+    prof.scheduler = 'Slurm'
+    client = FakeClient(script=[('squeue', '101|R\n102|TO\n103|CA\n___VCSQOK___\n')])
+    states, reasons = submitter.query_scheduler(client, prof)
+    assert states == {'101': 'RUNNING'}
+    assert reasons == {'102': 'TIMEOUT', '103': 'CANCELLED'}
+
+
+def test_refresh_job_timeout_reason_beats_exit137(tmp_path):
+    """超墙钟:调度器 TIMEOUT + 退出码 137 → WALLTIME 可续算,不误判 OOM(审查#8)。"""
+    d = _job_dir(tmp_path)
+    submitter.submit_job(FakeClient(script=[('qsub', '77.c\n')]), FakeSFTP(), _profile(), d)
+    client = FakeClient(script=[
+        ('grep -c', '0\n'),
+        ('stat -c', 'OUTCAR 90000\nOSZICAR 3000\n'),
+        ('___VCSLOG___', 'EXIT: 137\n___VCSLOG___\nrunning\n'),
+    ])
+    m = submitter.refresh_job(client, _profile(), d, live_states={},
+                              terminal_reasons={'77': 'TIMEOUT'})
+    assert m['results']['diagnosis']['failure_class'] == 'WALLTIME'
+    assert m['results']['diagnosis']['restartable'] is True
+    assert m['state'] == 'UNCONVERGED'
+
+
 def test_build_script_text_template_mode(tmp_path):
     d = _job_dir(tmp_path)
     tpl = tmp_path / 'my_job.sh'

@@ -66,10 +66,12 @@ def test_path_from_project_picks_lowest_energy(tmp_path):
         d = tmp_path / name
         d.mkdir()
         (d / 'OSZICAR').write_text(f' 1 F= {e0} E0= {e0:.5E}\n', encoding='utf-8')
-    rows = [{'name': f'ads_{sp}_a', 'e_config': e} for sp, e in
+    rows = [{'name': f'ads_{sp}_a', 'e_config': e, 'state': 'DONE'} for sp, e in
             (('S8', -100.0), ('Li2S8', -105.0), ('Li2S6', -95.0),
              ('Li2S4', -100.0), ('Li2S2', -103.0), ('Li2S', -104.0))]
-    rows.append({'name': 'ads_Li2S8_b', 'e_config': -104.0})      # 次稳组态应被忽略
+    rows.append({'name': 'ads_Li2S8_b', 'e_config': -104.0, 'state': 'DONE'})  # 次稳忽略
+    # 非 DONE(BAD_ENERGY 等)的能量绝不漏进 ΔG(审查#3):更低能量但 NEEDS_HUMAN → 忽略
+    rows.append({'name': 'ads_Li2S8_bad', 'e_config': -200.0, 'state': 'NEEDS_HUMAN'})
     out = fe.path_from_project_and_molecules(rows, e_slab=-90.0,
                                              molecules_dir=tmp_path)
-    assert out['steps'][1]['G'] == pytest.approx(-1.0)            # 取了 -105 那个
+    assert out['steps'][1]['G'] == pytest.approx(-1.0)            # 取了 -105(DONE 里最稳)

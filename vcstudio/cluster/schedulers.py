@@ -54,6 +54,16 @@ class SchedulerDialect:
         """原始查询输出 → {job_id: QUEUED|RUNNING};不在字典里的作业视为 GONE。"""
         raise NotImplementedError
 
+    def parse_terminal(self, raw: str) -> dict:
+        """原始查询输出 → {job_id: 终态原因 token}(供 diagnose.classify 消歧)。
+
+        Slurm 的 squeue 会短暂显示 TO/CA/NF/OOM/F 等终态——能看到就别丢
+        (缺口分析 P0:超墙钟 SIGKILL 137 若无调度器原因会被误判 OOM→FAILED,
+        困死本可续算的作业)。PBS 的 C 态天然歧义(成功/失败同码)→ 保守返回空,
+        由 OUTCAR/日志取证裁决(取证才是权威)。看不到终态窗口时同样回落取证。
+        """
+        return {}
+
     def cancel_cmd(self, job_id: str, bin_path: str = '') -> str:
         raise NotImplementedError
 
@@ -127,6 +137,9 @@ class SlurmDialect(SchedulerDialect):
     _MAP = {'PD': QUEUED, 'PR': QUEUED, 'S': QUEUED, 'RQ': QUEUED,
             'R': RUNNING, 'CG': RUNNING,
             'CD': GONE, 'F': GONE, 'TO': GONE, 'CA': GONE, 'NF': GONE, 'OOM': GONE}
+    # 终态原因(squeue 短暂可见窗口)→ diagnose 的原因 token;CD=正常完成不发原因
+    _TERMINAL = {'TO': 'TIMEOUT', 'OOM': 'OOM', 'CA': 'CANCELLED',
+                 'NF': 'NODE_FAIL', 'F': 'FAILED'}
 
     def directives(self, spec):
         return [
@@ -167,6 +180,16 @@ class SlurmDialect(SchedulerDialect):
                 u = self._MAP.get(parts[1].strip(), None)
                 if u in (QUEUED, RUNNING):
                     result[parts[0].strip()] = u
+        return result
+
+    def parse_terminal(self, raw):
+        result = {}
+        for line in raw.strip().splitlines():
+            parts = line.strip().split('|')
+            if len(parts) >= 2 and parts[0].strip():
+                reason = self._TERMINAL.get(parts[1].strip())
+                if reason:
+                    result[parts[0].strip()] = reason
         return result
 
     def cancel_cmd(self, job_id, bin_path=''):

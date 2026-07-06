@@ -74,7 +74,7 @@ def create_project(root: str | os.PathLike, name: str, *,
         member = f'{name}_ads_{_stem(p)}'
         try:
             config_dirs.append(_gen(member, p, 'slab'))
-        except (ValueError, OSError, Exception) as e:   # PotcarError 亦在此兜住
+        except Exception as e:   # PotcarError 亦在此兜住
             errors.append((member, str(e)))
 
     # 3) 气相参考(可选;molecule 类型 → Γ 点)
@@ -83,7 +83,7 @@ def create_project(root: str | os.PathLike, name: str, *,
         member = f'{name}_ref'
         try:
             ref_dir = _gen(member, ref_poscar, 'molecule')
-        except (ValueError, OSError, Exception) as e:
+        except Exception as e:
             errors.append((member, str(e)))
 
     project = {

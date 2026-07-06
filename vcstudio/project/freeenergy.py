@@ -121,8 +121,10 @@ def path_from_project_and_molecules(delta_rows: list, e_slab: float,
     mol_e = load_molecule_energies(molecules_dir)
     system_e = {}
     for sp, _, _ in LIS_PRESET:
+        # 只取 DONE 成员(审查#3):NEEDS_HUMAN/BAD_ENERGY 的能量不得漏进 ΔG/U_L
         cands = [r['e_config'] for r in delta_rows
-                 if r.get('e_config') is not None and _species_in_name(sp, r.get('name', ''))]
+                 if r.get('e_config') is not None and r.get('state') == 'DONE'
+                 and _species_in_name(sp, r.get('name', ''))]
         if cands:
             system_e[sp] = min(cands)
     return discharge_path(system_e, mol_e, mu_li=mu_li)

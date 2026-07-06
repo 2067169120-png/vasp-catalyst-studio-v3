@@ -180,9 +180,10 @@ def classify(*, scheduler_reason: str | None = None, exit_code: int | None = Non
 
     # ② 零输出:OUTCAR 与 OSZICAR 都空/缺
     if _empty(outcar_size) and _empty(oszicar_size):
-        if rcls in (OOM, NODE_FAIL, CANCELLED):
-            return Diagnosis(rcls, FAILURE_TO_STATE[rcls], rcls in RESTARTABLE,
-                             f'调度器报 {scheduler_reason} 且无任何输出(杀于产出前)')
+        if rcls is not None:
+            # 零输出连 CONTCAR 都没有 → 即便 WALLTIME 也无从续算,restartable=False
+            return Diagnosis(rcls, FAILURE_TO_STATE[rcls], False,
+                             f'调度器报 {scheduler_reason} 且无任何输出(杀于产出前,无 CONTCAR 可续)')
         if exit_code == 0:
             return Diagnosis(SILENT_EXIT, FAILURE_TO_STATE[SILENT_EXIT], False,
                              '退出码 0 但 OUTCAR 为空——沉默退出,疑输入/环境问题,需人工')

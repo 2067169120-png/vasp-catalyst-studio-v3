@@ -261,6 +261,14 @@ class JobsTab(ttk.Frame):
                 continue
             manifests = [manifest_mod.load_manifest(d) for d in dirs]
             if not all(m and m.get('state') == 'DONE' for m in manifests):
+                # 全员终态但有非 DONE → 项目被卡,明说卡在谁(审查#9:不许静默永不出报告)
+                terminal = ('DONE', 'FAILED', 'NEEDS_HUMAN', 'UNCONVERGED')
+                if all(m and m.get('state') in terminal for m in manifests):
+                    stuck = [os.path.basename(os.path.normpath(d))
+                             for d, m in zip(dirs, manifests)
+                             if m and m.get('state') != 'DONE']
+                    self.log.write(f"⚠ 项目「{proj['name']}」被卡:{', '.join(stuck[:5])} "
+                                   f"未 DONE(修复/续算后才会自动出报告)")
                 continue
             out = os.path.join(proj.get('root', ''), f"{proj['name']}_完整报告.html")
             newest = max((os.path.getmtime(manifest_mod.manifest_path(d))
@@ -521,10 +529,11 @@ def _refresh_batch(prof, pw, dirs, trust_new):
         raise RuntimeError(str(e))
     results = []
     try:
-        live = submitter.query_states(client, prof)
+        live, reasons = submitter.query_scheduler(client, prof)
         for d in dirs:
             try:
-                m = submitter.refresh_job(client, prof, d, live_states=live)
+                m = submitter.refresh_job(client, prof, d, live_states=live,
+                                          terminal_reasons=reasons)
                 note = m['state']
                 res = m.get('results') or {}
                 dgn = res.get('diagnosis') or {}

@@ -67,9 +67,9 @@ def test_submit_batch_closes_client_and_jump(monkeypatch):
 
 def test_refresh_batch_closes_client_and_jump(monkeypatch):
     client, jump = _patch_open(monkeypatch)
-    monkeypatch.setattr(jobs_tab.submitter, 'query_states', lambda c, p: {})
+    monkeypatch.setattr(jobs_tab.submitter, 'query_scheduler', lambda c, p: ({}, {}))
     monkeypatch.setattr(jobs_tab.submitter, 'refresh_job',
-                        lambda c, p, d, live_states: {'state': 'DONE', 'results': {}})
+                        lambda c, p, d, live_states, terminal_reasons=None: {'state': 'DONE', 'results': {}})
     payload = jobs_tab._refresh_batch(object(), None, ['d1'], False)
     assert payload['results'] == [('d1', 'DONE')]
     assert client.closed and jump.closed
@@ -104,9 +104,9 @@ def test_submit_batch_survives_ssh_exception(monkeypatch):
 def test_refresh_batch_survives_ssh_exception(monkeypatch):
     from paramiko.ssh_exception import SSHException
     client, jump = _patch_open(monkeypatch)
-    monkeypatch.setattr(jobs_tab.submitter, 'query_states', lambda c, p: {})
+    monkeypatch.setattr(jobs_tab.submitter, 'query_scheduler', lambda c, p: ({}, {}))
 
-    def flaky(c, p, d, live_states):
+    def flaky(c, p, d, live_states, terminal_reasons=None):
         if d == 'bad':
             raise SSHException('boom')
         return {'state': 'DONE', 'results': {}}

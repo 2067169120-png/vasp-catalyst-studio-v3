@@ -153,19 +153,27 @@ def submit_job(client, sftp, profile, job_dir: str) -> dict:
 _QOK = '___VCSQOK___'
 
 
-def query_states(client, profile) -> dict:
-    """调度器一次性查询当前用户全部作业 → {job_id: QUEUED|RUNNING}。
+def query_scheduler(client, profile) -> tuple:
+    """调度器一次查询 → ({job_id: QUEUED|RUNNING}, {job_id: 终态原因})。
 
     在命令尾追加 `&& echo 哨兵`:qstat/squeue 退出码非零(调度器抖动/不可达)时哨兵
     不出现 → 抛错本轮跳过,**绝不**把空输出误判成"所有作业都结束了"再逐个标终态
     (瞬时一次抖动会永久错标 RUNNING 作业为 FAILED/UNCONVERGED,原版用跨轮确认防此)。
+    终态原因(Slurm TO/CA/NF/OOM 短暂可见)喂 diagnose 消歧——超墙钟 137 若无原因
+    会被误判 OOM→FAILED 困死可续算作业(审查确认的接线断点)。
     """
     dialect = get_dialect(profile.scheduler)
     cmd = dialect.status_cmd(profile.username, getattr(profile, 'scheduler_bin', ''))
     out, _ = run_cmd(client, f'{cmd} && echo {_QOK}')
     if _QOK not in out:
         raise RuntimeError('调度器状态查询失败(qstat/squeue 无响应或报错);本轮跳过,不误判作业已结束')
-    return dialect.parse_status(out.replace(_QOK, ''))
+    raw = out.replace(_QOK, '')
+    return dialect.parse_status(raw), dialect.parse_terminal(raw)
+
+
+def query_states(client, profile) -> dict:
+    """兼容入口:只要统一态。新代码请用 query_scheduler(带终态原因)。"""
+    return query_scheduler(client, profile)[0]
 
 
 def refresh_job(client, profile, job_dir: str, live_states: dict | None = None,
@@ -209,7 +217,10 @@ def refresh_job(client, profile, job_dir: str, live_states: dict | None = None,
         log_tail=log_tail, converged=converged, energy=energy)
 
     if energy is not None:
-        m.setdefault('results', {})['energy_e0_eV'] = energy
+        # 物理合理性闸(审查#4):BAD_ENERGY 的垃圾数不进 energy_e0_eV(防经自由能路径
+        # 漏进 ΔG/U_L 图),原始值留 raw_energy_e0_eV 供人工核查
+        key = 'raw_energy_e0_eV' if d.failure_class == diagnose.BAD_ENERGY else 'energy_e0_eV'
+        m.setdefault('results', {})[key] = energy
     m.setdefault('results', {})['diagnosis'] = {
         'failure_class': d.failure_class,
         'restartable': d.restartable,
