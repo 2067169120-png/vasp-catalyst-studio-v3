@@ -268,3 +268,31 @@ def test_valid_poscar_rejects_truncated_coords():
 def test_valid_poscar_rejects_empty_and_short():
     assert not dg.valid_poscar('')
     assert not dg.valid_poscar('a\nb\nc\n')
+
+
+# ── 运行中活体健康(原版 lis_sac_status 生产经验移植) ──
+def test_next_poll_count():
+    assert dg.next_poll_count(0, True) == 1
+    assert dg.next_poll_count(2, True) == 3
+    assert dg.next_poll_count(5, False) == 0          # 一旦干净立即清零
+
+
+def test_live_health_sloshing_needs_two_polls():
+    bad = _oszicar_block(85, '0.8E-01')
+    r1 = dg.live_health(bad, ionic_steps=3, prev=None)
+    assert r1['sloshing_polls'] == 1 and r1['warning'] == ''      # 第 1 轮:只计数不告警
+    r2 = dg.live_health(bad, ionic_steps=3, prev=r1)
+    assert r2['sloshing_polls'] == 2 and 'SCF 震荡' in r2['warning']
+    assert '不自动 qdel' in r2['warning']                          # 告警不动手
+    ok = dg.live_health(_oszicar_block(12, '0.1E-04'), ionic_steps=4, prev=r2)
+    assert ok['sloshing_polls'] == 0 and ok['warning'] == ''       # 恢复健康即清零
+
+
+def test_live_health_zero_step_stall_needs_three_polls():
+    prev = None
+    for i in range(1, 4):
+        prev = dg.live_health('', ionic_steps=0, prev=prev)
+        assert prev['zero_step_polls'] == i
+    assert '首步假死' in prev['warning']                            # 第 3 轮才告警
+    moved = dg.live_health('', ionic_steps=1, prev=prev)
+    assert moved['zero_step_polls'] == 0 and moved['warning'] == ''

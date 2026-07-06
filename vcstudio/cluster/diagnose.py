@@ -204,6 +204,38 @@ def scan_oszicar_sloshing(oszicar_tail: str) -> str | None:
     return None
 
 
+# ── 运行中作业活体健康(移植原版 lis_sac_status 生产经验) ─────────────────────
+SLOSH_CONFIRM_POLLS = 2      # 连续确认 2 轮才告警震荡(过滤单轮瞬态,原版标定)
+ZERO_STEP_CONFIRM_POLLS = 3  # 连续 3 轮 0 离子步才告警首步假死(给大体系首步 SCF 时间)
+
+
+def next_poll_count(prev: int, hit: bool) -> int:
+    """跨轮确认计数器:本轮命中 +1,否则清零(原版 next_sloshing_state 同款)。"""
+    return (int(prev or 0) + 1) if hit else 0
+
+
+def live_health(oszicar_tail: str, ionic_steps: int, prev: dict | None) -> dict:
+    """运行中作业健康评估 → {'sloshing_polls','zero_step_polls','warning'}。
+
+    在作业烧掉整个墙钟前抓出病态(原版经验:活体监控省机时):
+    - SCF 震荡(scan_oszicar_sloshing 同判据)连续 ≥2 轮 → 告警;
+    - 首步假死(离子步恒 0)连续 ≥3 轮 → 告警。
+    只告警绝不自动取消(方法学主权 + human-in-the-loop;原版 AUTO_CANCEL 的人道版)。
+    """
+    prev = prev or {}
+    slosh_ev = scan_oszicar_sloshing(oszicar_tail)
+    sp = next_poll_count(prev.get('sloshing_polls', 0), slosh_ev is not None)
+    zp = next_poll_count(prev.get('zero_step_polls', 0), ionic_steps == 0)
+    warning = ''
+    if sp >= SLOSH_CONFIRM_POLLS:
+        warning = (f'SCF 震荡已连续 {sp} 轮确认:{slosh_ev};'
+                   f'建议人工取消并调 ALGO/AMIX(本工具不自动 qdel)')
+    elif zp >= ZERO_STEP_CONFIRM_POLLS:
+        warning = (f'首步假死已连续 {zp} 轮确认(0 离子步):首个 SCF 卡死,'
+                   f'建议人工检查结构/并行设置(本工具不自动 qdel)')
+    return {'sloshing_polls': sp, 'zero_step_polls': zp, 'warning': warning}
+
+
 def scan_vasp_error(log_tail: str):
     """扫已知 VASP 内部错误签名 → (label, 补救提示) 或 None(Custodian 字面串)。"""
     if not log_tail:

@@ -213,6 +213,7 @@ def refresh_job(client, profile, job_dir: str, live_states: dict | None = None,
     states = live_states if live_states is not None else query_states(client, profile)
     jid = str(m['scheduler_job_id'])
     u = states.get(jid, GONE)
+    remote = m.get('remote_dir') or ''
 
     if u == QUEUED:
         if m['state'] != 'QUEUED':
@@ -222,11 +223,14 @@ def refresh_job(client, profile, job_dir: str, live_states: dict | None = None,
     if u == RUNNING:
         if m['state'] != 'RUNNING':
             manifest_mod.set_state(m, 'RUNNING')
-            manifest_mod.save_manifest(job_dir, m)
+        # 活体健康(原版 lis_sac_status 经验):运行中即查 SCF 震荡/首步假死+进度,
+        # 病态作业在烧完墙钟前就被抓出来;跨轮确认计数器防瞬态误报;只告警不 qdel
+        m.setdefault('results', {})['live'] = _live_check(
+            client, remote, (m.get('results') or {}).get('live'))
+        manifest_mod.save_manifest(job_dir, m)
         return m
 
     # 终态(GONE / 调度器终态原因)→ 取证 + 分类(复活 FAILED/NEEDS_HUMAN)
-    remote = m.get('remote_dir') or ''
     reason = (terminal_reasons or {}).get(jid)
     outcar_size, oszicar_size = _stat_sizes(client, remote)
     converged, clean_exit, stopped = _grep_marks(client, remote, m.get('task_type') or 'relax')
@@ -265,6 +269,39 @@ def refresh_job(client, profile, job_dir: str, live_states: dict | None = None,
     manifest_mod.set_state(m, d.state, note=f'{d.failure_class}: {d.evidence}')
     manifest_mod.save_manifest(job_dir, m)
     return m
+
+
+def _live_check(client, remote: str, prev: dict | None) -> dict:
+    """运行中作业一次 SSH 活体取数 → live dict(健康计数器+进度)。
+
+    取 离子步数(grep -c 'F=' 全文精确)/ 当前 |F|max(OUTCAR 'FORCES: max atom'
+    末行,原版 running_progress 口径)/ OSZICAR 尾部(震荡扫描),交 diagnose.live_health
+    做跨轮确认。远端取数失败 → 保留上轮计数器不误清零。
+    """
+    if not remote:
+        return dict(prev or {})
+    q = shlex.quote
+    out, _ = run_cmd(
+        client,
+        f'grep -c "F=" {q(remote + "/OSZICAR")} 2>/dev/null || echo 0; '
+        f"echo '___VCSLIVE___'; "
+        f'grep "FORCES: max atom" {q(remote + "/OUTCAR")} 2>/dev/null | tail -1; '
+        f"echo '___VCSLIVE___'; "
+        f'tail -n 200 {q(remote + "/OSZICAR")} 2>/dev/null')
+    parts = out.split('___VCSLIVE___')
+    if len(parts) != 3:
+        return dict(prev or {})                     # 取数异常:保留上轮计数,不误清零
+    steps = _first_int(parts[0])
+    fmax = ''
+    toks = parts[1].split()
+    if 'RMS' in toks:                                # 'FORCES: max atom, RMS  0.031  0.012'
+        i = toks.index('RMS')
+        if len(toks) > i + 1:
+            fmax = toks[i + 1]
+    live = diagnose.live_health(parts[2], steps, prev)
+    live['ionic_steps'] = steps
+    live['fmax'] = fmax
+    return live
 
 
 def _stat_sizes(client, remote: str):

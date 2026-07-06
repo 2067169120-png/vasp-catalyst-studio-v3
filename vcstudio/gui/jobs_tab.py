@@ -113,6 +113,13 @@ class JobsTab(ttk.Frame):
             diag = ''
             if dgn.get('failure_class') and state in ('FAILED', 'UNCONVERGED', 'NEEDS_HUMAN'):
                 diag = dgn['failure_class'] + ('♻可续算' if dgn.get('restartable') else '')
+            elif state == 'RUNNING':
+                live = res.get('live') or {}
+                if live.get('warning'):
+                    diag = '⚠' + live['warning'][:24]
+                elif live.get('ionic_steps') is not None:
+                    diag = f"{live['ionic_steps']}步" + (
+                        f" |F|max={live['fmax']}" if live.get('fmax') else '')
             self.tree.insert(
                 '', 'end', iid=job_dir, text=name, tags=(state,),
                 values=(state, f"{m.get('task_type','')}/{m.get('calc_type','')}",
@@ -558,6 +565,13 @@ def _refresh_batch(prof, pw, dirs, trust_new):
                 dgn = res.get('diagnosis') or {}
                 if dgn.get('failure_class') and m['state'] in ('FAILED', 'UNCONVERGED', 'NEEDS_HUMAN'):
                     note += f" [{dgn['failure_class']}{'·可续算' if dgn.get('restartable') else ''}] {dgn.get('evidence', '')}"
+                live = res.get('live') or {}
+                if m['state'] == 'RUNNING':
+                    if live.get('warning'):
+                        note += f" ⚠{live['warning']}"
+                    elif live.get('ionic_steps') is not None:
+                        note += f"({live['ionic_steps']} 离子步" + (
+                            f",|F|max={live['fmax']}" if live.get('fmax') else '') + ')'
                 e0 = res.get('energy_e0_eV')
                 if e0 is not None:
                     note += f'(E0={e0:.4f} eV)'

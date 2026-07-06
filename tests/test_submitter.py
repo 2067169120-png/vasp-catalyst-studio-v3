@@ -415,3 +415,24 @@ def test_build_script_text_template_mode(tmp_path):
     prof = _profile(script_mode='template', template_path=str(tpl))
     text = submitter.build_script_text(prof, d)
     assert '#PBS -N zn_job' in text and 'cd X/zn_job' in text and '-np 12' in text
+
+
+def test_refresh_job_running_live_health(tmp_path):
+    """RUNNING 分支活体取数:离子步/|F|max 进度入 manifest;跨轮计数器持久化。"""
+    d = _job_dir(tmp_path)
+    submitter.submit_job(FakeClient(script=[('qsub', '61.c\n')]), FakeSFTP(), _profile(), d)
+    live_out = ('4\n___VCSLIVE___\n  FORCES: max atom, RMS   0.031456   0.0122\n'
+                '___VCSLIVE___\nDAV:  12  -0.38E+03  -0.1E-04  x  x  x\n')
+    client = FakeClient(script=[('___VCSLIVE___', live_out)])
+    m = submitter.refresh_job(client, _profile(), d, live_states={'61': 'RUNNING'})
+    live = m['results']['live']
+    assert m['state'] == 'RUNNING' and live['ionic_steps'] == 4
+    assert live['fmax'] == '0.031456'
+    assert live['sloshing_polls'] == 0 and live['warning'] == ''
+    # 后续轮:0 离子步 → 计数器从 manifest 恢复并累加,第 3 轮告警首步假死
+    stall = '0\n___VCSLIVE___\n\n___VCSLIVE___\n\n'
+    for expect in (1, 2, 3):
+        m = submitter.refresh_job(FakeClient(script=[('___VCSLIVE___', stall)]),
+                                  _profile(), d, live_states={'61': 'RUNNING'})
+        assert m['results']['live']['zero_step_polls'] == expect
+    assert '首步假死' in m['results']['live']['warning']
