@@ -55,16 +55,17 @@ class JobsTab(ttk.Frame):
         self.fetch_btn.grid(row=0, column=5, padx=4)
         self.continue_btn = ttk.Button(bar, text='♻ 续算(选中)', command=self._on_continue)
         self.continue_btn.grid(row=0, column=6, padx=4)
-        ttk.Button(bar, text='📄 导出报告', command=self._on_report).grid(row=0, column=7, padx=4)
-        ttk.Button(bar, text='📂 打开目录', command=self._open_dir).grid(row=0, column=8, padx=4)
-        ttk.Button(bar, text='🗑 移出台账', command=self._remove).grid(row=0, column=9, padx=4)
+        ttk.Button(bar, text='🔁 重新判定(选中)', command=self._on_rejudge).grid(row=0, column=7, padx=4)
+        ttk.Button(bar, text='📄 导出报告', command=self._on_report).grid(row=0, column=8, padx=4)
+        ttk.Button(bar, text='📂 打开目录', command=self._open_dir).grid(row=0, column=9, padx=4)
+        ttk.Button(bar, text='🗑 移出台账', command=self._remove).grid(row=0, column=10, padx=4)
         # S5 自动轮询:GUI 开着时定时查(默认关;5/15/30 分钟)
         self.auto_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bar, text='自动刷新', variable=self.auto_var).grid(row=0, column=10, padx=(12, 2))
+        ttk.Checkbutton(bar, text='自动刷新', variable=self.auto_var).grid(row=0, column=11, padx=(12, 2))
         self.auto_interval_var = tk.StringVar(value='15')
         ttk.Combobox(bar, textvariable=self.auto_interval_var, values=('5', '15', '30'),
-                     width=4, state='readonly').grid(row=0, column=11)
-        ttk.Label(bar, text='分钟').grid(row=0, column=12)
+                     width=4, state='readonly').grid(row=0, column=12)
+        ttk.Label(bar, text='分钟').grid(row=0, column=13)
 
         cols = ('state', 'task', 'cluster', 'jobid', 'energy', 'diag', 'updated')
         self.tree = ttk.Treeview(self, columns=cols, show='tree headings', selectmode='extended')
@@ -185,6 +186,24 @@ class JobsTab(ttk.Frame):
         for dir_, ok, msg in payload['results']:
             self.log.write(('✅' if ok else '❌') + f' {os.path.basename(dir_)}:{msg}')
         self.reload()
+
+    # ── 重新判定:对选中作业强制重跑取证(NEEDS_HUMAN/FAILED 的正规出口) ──
+    def _on_rejudge(self, trust_new=False):
+        """人工在远端修好后点这里:重跑取证,收敛了就正规进 DONE(带能量),
+        项目随之解锁自动报告。绝不手工改状态(显式状态不变式:判定只能来自证据)。"""
+        dirs = [d for d in self._selected()
+                if (manifest_mod.load_manifest(d) or {}).get('scheduler_job_id')]
+        if not dirs:
+            self.log.write('❌ 请选中至少一个提交过的作业(有作业号才能重判)')
+            return
+        prof = self._profile()
+        if prof is None:
+            return
+        pw = self._password_for(prof)
+        self.status_btn.configure(state='disabled')
+        self.log.write(f'⏳ 重新判定 {len(dirs)} 个作业(重跑远端取证)…')
+        q = runner.submit(_refresh_batch, prof, pw, dirs, trust_new)
+        self.after(200, lambda: self._poll_status(q))
 
     # ── 查状态(手动按钮 / S5 自动轮询共用) ──
     def _on_refresh_status(self, trust_new=False, auto=False):
