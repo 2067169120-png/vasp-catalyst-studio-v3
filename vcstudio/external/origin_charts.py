@@ -186,18 +186,28 @@ def render_ladder(op, c, out_dir, width):
     steps = d['steps']
     n = len(steps)
     half = 0.35
-    xs, ys = [], []
+    nan = float('nan')
+    # 学位论文 FED 惯例(张洪毅 图4.3):水平台阶实线,台阶间连接线虚线,跃迁标 ΔG
+    xs, ys, cxs, cys = [], [], [], []
     for i, s in enumerate(steps):
-        xs += [i - half, i + half]
-        ys += [s['G'], s['G']]
+        xs += [i - half, i + half, nan]                      # NaN 断段:各台阶独立实线
+        ys += [s['G'], s['G'], nan]
+        if i + 1 < n:
+            cxs += [i + half, i + 1 - half, nan]             # 连接线(虚)
+            cys += [s['G'], steps[i + 1]['G'], nan]
     wks = op.new_sheet('w', lname=str(c['name'])[:12])
     wks.from_list(0, xs, 'coord')
     wks.from_list(1, ys, 'G')
+    wks.from_list(2, cxs, 'cx')
+    wks.from_list(3, cys, 'conn')
     gp = op.new_graph(template='line')
     gl = gp[0]
+    pc = gl.add_plot(wks, coly=3, colx=2, type='l')          # 连接线:灰细虚(垫底)
+    pc.color = '#9AA7B4'
+    pc.lt_exec('set %C -w 700'); pc.lt_exec('set %C -d 1')
     p = gl.add_plot(wks, coly=1, colx=0, type='l')
     p.color = U0_COLOR
-    p.lt_exec('set %C -w 1200')                              # 主线:蓝实粗
+    p.lt_exec('set %C -w 1200')                              # 台阶:蓝实粗
     try:
         p.set_int('line.width', 3)                           # 保底(某些模板 -w 不生效)
     except Exception:
@@ -230,6 +240,12 @@ def render_ladder(op, c, out_dir, width):
         if s.get('sub_label'):
             _lab(gl, s['sub_label'], i - 0.14, s['G'] - dy * 1.05, pt=10,
                  color='150,150,150')
+    for i in range(n - 1):                                    # 跃迁 ΔG 标注(论文图4.3 惯例)
+        d_g = steps[i + 1]['G'] - steps[i]['G']
+        ymid = (steps[i]['G'] + steps[i + 1]['G']) / 2.0
+        col = '200,30,30' if i == pds else '90,90,90'
+        # 放连接线中点右下(物种名在台阶上方,错开避碰)
+        _lab(gl, '%+.2f' % d_g, i + 0.55, ymid - dy * 0.55, pt=10, color=col)
     ax0 = -0.6                                               # 左下标注块(原版口径)
     if pds is not None:
         d_g = steps[pds + 1]['G'] - steps[pds]['G']
