@@ -156,7 +156,10 @@ def scan_log(log_tail: str) -> str | None:
 # heal_agent 的 CONVERGENCE_STALL 用 DAV>60——取保守的 80+能量证据双条件防误报)
 _SLOSH_MIN_ITERS = 80
 _SLOSH_MIN_DE = 1e-2
-_SCF_LINE_RE = re.compile(r'^(?:DAV|RMM|CG|DIA|NONE):\s*(\d+)\s+\S+\s+([+-]?[\d.E+-]+)', re.MULTILINE)
+# 电子步算法行前缀(原版 _SCF_TAGS 全集:DAV/RMM/EDDAV/CG/DMP/QDMP + DIA/NONE)
+_SCF_LINE_RE = re.compile(
+    r'^(?:DAV|RMM|EDDAV|CG|DMP|QDMP|DIA|NONE):\s*(\d+)\s+\S+\s+([+-]?[\d.E+-]+)',
+    re.MULTILINE)
 
 
 def last_block_scf_iters(oszicar_tail: str) -> int:
@@ -182,25 +185,30 @@ def nelm_saturated(oszicar_tail: str, nelm: int = 60) -> bool:
 def scan_oszicar_sloshing(oszicar_tail: str) -> str | None:
     """OSZICAR 尾部 → 最后一个离子步的 SCF 块是否呈电子震荡。
 
-    判据(两条同时满足才报,防误报):最后一个离子步的电子步数 ≥ 80(NELM 默认 60,
-    ≥80 意味着用户加大了 NELM 仍打满)且末行 |dE| > 1e-2 eV(远未收敛而非慢收敛)。
+    判据(两条同时满足才报,防误报;原版真实 Co 组标定):任一 SCF 块电子步数 ≥ 80
+    且该块末行 |dE| > 1e-2 eV(远未收敛而非慢收敛)。**扫尾部全部块取最坏块**而非只看
+    最后一块——原版经验:刚好在新离子步起步时只看末块会漏判。
     命中返回证据串,否则 None。纯文本解析,离线可测。
     """
     if not oszicar_tail:
         return None
-    # 取最后一个离子步块:按 'F=' 行切,取其后(或全文若无 F= 行)的 SCF 行
-    last_block = oszicar_tail.rsplit('F=', 1)[-1] if 'F=' in oszicar_tail else oszicar_tail
-    matches = _SCF_LINE_RE.findall(last_block)
-    if not matches:
+    blocks = [b for b in
+              (_SCF_LINE_RE.findall(seg) for seg in oszicar_tail.split('F='))
+              if b]
+    if not blocks:
         return None
-    n_iter = int(matches[-1][0])
+    worst = max(blocks, key=lambda b: int(b[-1][0]))   # 电子步数最多的块最像震荡
+    n_iter = int(worst[-1][0])
     try:
-        de = abs(float(matches[-1][1].replace('E', 'e')))
+        de = abs(float(worst[-1][1].replace('E', 'e')))
     except ValueError:
         return None
     if n_iter >= _SLOSH_MIN_ITERS and de > _SLOSH_MIN_DE:
-        return (f'末离子步电子步数 {n_iter}(NELM 打满)且 |dE|={de:.3g} eV 仍远未收敛'
-                f'——SCF 震荡,同 INCAR 续算必复现;建议人工调 ALGO/AMIX/SIGMA 或查结构')
+        flips = sum(1 for a, b in zip(worst, worst[1:])
+                    if (float(a[1]) > 0) != (float(b[1]) > 0))
+        return (f'SCF 块电子步数 {n_iter}(NELM 打满)且末步 |dE|={de:.3g} eV 仍远未收敛'
+                f'({flips} 次变号)——SCF 震荡,同 INCAR 续算必复现;'
+                f'建议人工调 ALGO/AMIX/SIGMA 或查结构')
     return None
 
 

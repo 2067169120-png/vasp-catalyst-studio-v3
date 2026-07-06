@@ -215,23 +215,36 @@ def delta_e_rows(project: dict) -> dict:
     slab_state, e_slab = _member_info(members.get('clean_slab'))
     has_ref = bool(members.get('gas_ref'))
     ref_state, e_ref = _member_info(members.get('gas_ref')) if has_ref else ('无', None)
+    # 逐物种气相参考(原版 lis_sac_analysis 口径):project['species_refs']=
+    # {物种: E_mol};组态名以 '_<物种>' 结尾即匹配。与单一 gas_ref 互斥,优先。
+    species_refs = dict(project.get('species_refs') or {})
 
     rows = []
     for cdir in (members.get('configs') or []):
         name = os.path.basename(os.path.normpath(cdir))
         st, e_cfg = _member_info(cdir)
         delta, note = None, ''
+        sp_ref = None
+        if species_refs:
+            sp = next((s for s in sorted(species_refs, key=len, reverse=True)
+                       if name.endswith('_' + s)), None)
+            sp_ref = species_refs.get(sp)
         blockers = []
         if st != 'DONE' or e_cfg is None:
             blockers.append('组态未完成')
         if slab_state != 'DONE' or e_slab is None:
             blockers.append('清洁表面未完成')
-        if has_ref and (ref_state != 'DONE' or e_ref is None):
+        if species_refs and sp_ref is None:
+            blockers.append('无匹配物种参考能量')
+        elif has_ref and not species_refs and (ref_state != 'DONE' or e_ref is None):
             blockers.append('气相参考未完成')
         if not blockers:
-            delta = e_cfg - e_slab - (e_ref if has_ref else 0.0)
-            if not has_ref:
-                note = '未设气相参考:此值为 E(slab+ads)−E(slab)'
+            if sp_ref is not None:
+                delta = e_cfg - e_slab - sp_ref
+            else:
+                delta = e_cfg - e_slab - (e_ref if has_ref else 0.0)
+                if not has_ref:
+                    note = '未设气相参考:此值为 E(slab+ads)−E(slab)'
         else:
             note = '；'.join(blockers)
         rows.append({'name': name, 'state': st, 'e_config': e_cfg,
