@@ -37,6 +37,7 @@ class JobsTab(ttk.Frame):
         self.profiles = {}
         self._build()
         self.reload()
+        self._schedule_auto()                            # S5 轮询链启动(开关随时生效)
 
     def _build(self):
         bar = ttk.Frame(self)
@@ -57,6 +58,13 @@ class JobsTab(ttk.Frame):
         ttk.Button(bar, text='📄 导出报告', command=self._on_report).grid(row=0, column=7, padx=4)
         ttk.Button(bar, text='📂 打开目录', command=self._open_dir).grid(row=0, column=8, padx=4)
         ttk.Button(bar, text='🗑 移出台账', command=self._remove).grid(row=0, column=9, padx=4)
+        # S5 自动轮询:GUI 开着时定时查(默认关;5/15/30 分钟)
+        self.auto_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text='自动刷新', variable=self.auto_var).grid(row=0, column=10, padx=(12, 2))
+        self.auto_interval_var = tk.StringVar(value='15')
+        ttk.Combobox(bar, textvariable=self.auto_interval_var, values=('5', '15', '30'),
+                     width=4, state='readonly').grid(row=0, column=11)
+        ttk.Label(bar, text='分钟').grid(row=0, column=12)
 
         cols = ('state', 'task', 'cluster', 'jobid', 'energy', 'diag', 'updated')
         self.tree = ttk.Treeview(self, columns=cols, show='tree headings', selectmode='extended')
@@ -178,8 +186,8 @@ class JobsTab(ttk.Frame):
             self.log.write(('✅' if ok else '❌') + f' {os.path.basename(dir_)}:{msg}')
         self.reload()
 
-    # ── 查状态 ──
-    def _on_refresh_status(self, trust_new=False):
+    # ── 查状态(手动按钮 / S5 自动轮询共用) ──
+    def _on_refresh_status(self, trust_new=False, auto=False):
         prof = self._profile()
         if prof is None:
             return
@@ -189,8 +197,15 @@ class JobsTab(ttk.Frame):
                     and m.get('state') in ('SUBMITTED', 'QUEUED', 'RUNNING'):
                 targets.append(job_dir)
         if not targets:
-            self.log.write(f'ℹ 「{prof.name}」上没有待查询的作业(SUBMITTED/QUEUED/RUNNING)')
+            if not auto:
+                self.log.write(f'ℹ 「{prof.name}」上没有待查询的作业(SUBMITTED/QUEUED/RUNNING)')
             return
+        if auto:
+            if str(self.status_btn['state']) == 'disabled':
+                return                                   # 上一轮还在跑,跳过本轮
+            if prof.auth == 'password' and secrets.get_password(prof.name) is None:
+                self.log.write('⚠ 自动刷新需先手动查询一次并保存密码(keyring),本轮跳过')
+                return
         pw = self._password_for(prof)
         self.status_btn.configure(state='disabled')
         self.log.write(f'⏳ 查询 {len(targets)} 个作业状态…')
@@ -214,6 +229,59 @@ class JobsTab(ttk.Frame):
         for dir_, msg in payload['results']:
             self.log.write(f'🔄 {os.path.basename(dir_)}:{msg}')
         self.reload()
+        self._maybe_auto_reports()
+
+    # ── S5 自动轮询 + 全 DONE 自动报告 ──
+    def _schedule_auto(self):
+        try:
+            minutes = int(self.auto_interval_var.get())
+        except (ValueError, tk.TclError):
+            minutes = 15
+        self.after(max(1, minutes) * 60000, self._auto_tick)
+
+    def _auto_tick(self):
+        if self.auto_var.get():
+            self._on_refresh_status(auto=True)
+        self._schedule_auto()                            # 无论开关,链条保持(开关随时生效)
+
+    def _maybe_auto_reports(self):
+        """项目成员全 DONE 且报告缺失/过期 → 后台生成完整报告(用户决策:全自动)。"""
+        from vcstudio.project import adsorption, report_full
+        from vcstudio.shared.config import load_config
+        try:
+            cfg = load_config()
+        except Exception:                                # noqa: BLE001
+            cfg = {}
+        for pth in adsorption.list_projects():
+            proj = adsorption.load_project(pth)
+            if not proj:
+                continue
+            dirs = report_full._member_dirs(proj)
+            if not dirs:
+                continue
+            manifests = [manifest_mod.load_manifest(d) for d in dirs]
+            if not all(m and m.get('state') == 'DONE' for m in manifests):
+                continue
+            out = os.path.join(proj.get('root', ''), f"{proj['name']}_完整报告.html")
+            newest = max((os.path.getmtime(manifest_mod.manifest_path(d))
+                          for d in dirs if manifest_mod.manifest_path(d).is_file()),
+                         default=0)
+            if os.path.isfile(out) and os.path.getmtime(out) >= newest:
+                continue                                 # 报告已新鲜
+            self.log.write(f"📄 项目「{proj['name']}」全部 DONE,后台生成完整报告…")
+            q = runner.submit(report_full.generate_project_report, proj, out, config=cfg)
+            self.after(500, lambda qq=q, o=out: self._poll_report(qq, o))
+
+    def _poll_report(self, q, out):
+        item = runner.poll(q)
+        if item is None:
+            self.after(500, lambda: self._poll_report(q, out))
+            return
+        kind, payload = item
+        if kind == 'error':
+            self.log.write(f'❌ 自动报告失败:{payload}')
+        else:
+            self.log.write(f'✅ 完整报告已生成:{out}(含图表/结构图/AI 分析)')
 
     # ── 拉回结果(S3) ──
     def _on_fetch(self, trust_new=False):
@@ -386,6 +454,12 @@ def _fetch_batch(prof, pw, dirs, trust_new):
                 msg = '已拉回 ' + ('、'.join(fetched) if fetched else '(无)')
                 if missing:
                     msg += f'(远端缺 {"、".join(missing)})'
+                if 'CONTCAR' in fetched:                 # 全自动渲结构图(缓存,失败跳过)
+                    from vcstudio.external import povray_render
+                    rr = povray_render.render_poscar_views(
+                        os.path.join(d, 'CONTCAR'), os.path.join(d, 'figs'),
+                        os.path.basename(os.path.normpath(d)))
+                    msg += ',结构图 ✓' if rr['ok'] else f",结构图跳过({rr['error'][:60]})"
                 results.append((d, bool(fetched), msg))
             except _job_errors() as e:
                 results.append((d, False, str(e)))

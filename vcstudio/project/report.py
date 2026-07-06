@@ -110,8 +110,9 @@ def render_markdown(rows: list, summary: dict, *, title: str = 'VASP 批量运�
 
 # ── 自包含 HTML(单文件,内联 CSS,浏览器直接开;零外链零依赖) ──────────────────
 def render_html(rows: list, summary: dict, *, title: str = 'VASP 批量运行报告',
-                delta_e=None) -> str:
-    """delta_e:可选,adsorption.delta_e_rows 的返回(有则嵌入 ΔE 表)。"""
+                delta_e=None, extra_html: str = '') -> str:
+    """delta_e:可选,ΔE 表;extra_html:可选,插在 ΔE 表后的附加章节
+    (图表/结构图/AI 分析,由 report_full 组装,内容需自行转义)。"""
     def esc(x):
         return html.escape(str(x if x is not None else ''))
 
@@ -162,7 +163,8 @@ def render_html(rows: list, summary: dict, *, title: str = 'VASP 批量运行报
         title=esc(title),
         meta=f'生成时间 {time.strftime("%Y-%m-%d %H:%M:%S")}　·　作业 {summary["total"]}'
              f'　·　完成 {summary["n_done"]}　·　问题 {summary["n_problem"]}',
-        cards=cards, problems=prob_section, delta_e=de_section, all_rows=all_rows)
+        cards=cards, problems=prob_section,
+        delta_e=de_section + (extra_html or ''), all_rows=all_rows)
 
 
 _HTML_SHELL = """<!doctype html><html lang="zh"><head><meta charset="utf-8">

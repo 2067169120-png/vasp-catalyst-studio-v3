@@ -13,7 +13,7 @@ from tkinter import ttk, filedialog, messagebox
 
 from vcstudio.gui.widgets import FileRow, LogBox
 from vcstudio.gui import runner
-from vcstudio.project import adsorption, report
+from vcstudio.project import adsorption, report_full
 from vcstudio.shared.config import load_config
 
 
@@ -213,31 +213,39 @@ class ProjectTab(ttk.Frame):
         proj = self._current_project()
         if not proj:
             return
-        dirs = self._member_dirs(proj)
-        if not dirs:
+        if not self._member_dirs(proj):
             self.log.write('❌ 项目无成员作业')
             return
         out = filedialog.asksaveasfilename(
-            title='导出项目运行报告', defaultextension='.html',
-            initialfile=f"{proj['name']}_report.html",
-            filetypes=[('HTML 报告(含ΔE)', '*.html'), ('Markdown', '*.md')])
+            title='导出完整报告', defaultextension='.html',
+            initialfile=f"{proj['name']}_完整报告.html",
+            filetypes=[('HTML 完整报告', '*.html')])
         if not out:
             return
-        s = adsorption.delta_e_rows(proj)               # HTML 报告嵌 ΔE 表(md 不嵌)
-        fmt = 'md' if str(out).lower().endswith('.md') else 'html'
         try:
-            p = report.write_report(dirs, out, title=f"{proj['name']} 运行报告",
-                                    fmt=fmt, delta_e=s)
-        except Exception as e:                          # noqa: BLE001 报告失败不该崩界面
-            self.log.write(f'❌ 生成报告失败:{e}')
+            cfg = load_config()
+        except Exception:                               # noqa: BLE001
+            cfg = {}
+        self.log.write('⏳ 生成完整报告(Origin 图表 + 结构图 + AI 分析,可能需一两分钟)…')
+        q = runner.submit(report_full.generate_project_report, proj, out, config=cfg)
+        self.after(300, lambda: self._poll_report(q, out))
+
+    def _poll_report(self, q, out):
+        item = runner.poll(q)
+        if item is None:
+            self.after(300, lambda: self._poll_report(q, out))
             return
-        self.log.write(f'✅ 报告已生成:{p}')
+        kind, payload = item
+        if kind == 'error':
+            self.log.write(f'❌ 生成报告失败:{payload}')
+            return
+        self.log.write(f'✅ 完整报告已生成:{out}')
         try:
             if sys.platform == 'win32':
-                os.startfile(str(p))  # noqa
+                os.startfile(str(out))  # noqa
             else:
                 import subprocess
-                subprocess.Popen(['xdg-open', str(p)])
+                subprocess.Popen(['xdg-open', str(out)])
         except Exception as e:                          # noqa: BLE001
             self.log.write(f'⚠ 已生成但无法自动打开:{e}')
 
