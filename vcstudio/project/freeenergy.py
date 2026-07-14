@@ -72,13 +72,19 @@ def mu_li_from_molecules(mol_energies: dict) -> float:
 
 
 def discharge_path(system_energies: dict, mol_energies: dict, *,
-                   mu_li: float | None = None, preset=None) -> dict:
+                   mu_li: float | None = None, preset=None,
+                   g_corr: dict | None = None) -> dict:
     """放电路径 → charts.ladder 契约(steps+pds_index+u_l)+ 电化学量。
 
     system_energies: {物种: E(slab+X)};preset 各态物种必须齐(缺 → ValueError 点名)。
-    返回 {'steps':[{label,G,sub_label}], 'pds_index', 'u_l', 'mu_li', 'per_electron':[...]}
+    g_corr(可选): {物种: ZPE−TS 校正 eV}(project.thermo.load_corrections 产物);
+    提供则逐态叠加到 E(slab+X),结果为含振动热校正的 ΔG(投稿级);
+    不提供保持纯电子能口径(报告须明示)。返回带 'thermo_corrected' 标志。
+    返回 {'steps':[{label,G,sub_label}], 'pds_index', 'u_l', 'mu_li',
+          'per_electron':[...], 'thermo_corrected': bool}
     """
     preset = preset or LIS_PRESET
+    g_corr = dict(g_corr or {})
     if mu_li is None:
         mu_li = mu_li_from_molecules(mol_energies)
     missing = [sp for sp, _, _ in preset if sp not in system_energies]
@@ -89,10 +95,10 @@ def discharge_path(system_energies: dict, mol_energies: dict, *,
             if mol not in mol_energies:
                 raise ValueError(f'缺沉淀分子能量:{mol}')
     ref_sp = preset[0][0]
-    e_ref = system_energies[ref_sp]
+    e_ref = system_energies[ref_sp] + g_corr.get(ref_sp, 0.0)
     steps, nlis = [], []
     for sp, n_li, precip in preset:
-        g = (system_energies[sp]
+        g = (system_energies[sp] + g_corr.get(sp, 0.0)
              + sum(cnt * mol_energies[mol] for mol, cnt in precip)
              - n_li * mu_li) - e_ref
         sub = ' + '.join(f'{cnt}×{mol}' for mol, cnt in precip)
@@ -108,15 +114,18 @@ def discharge_path(system_energies: dict, mol_energies: dict, *,
     u_l = -max(per_e) if per_e else None
     return {'steps': steps, 'pds_index': pds,
             'u_l': (round(u_l, 4) if u_l is not None else None),
-            'mu_li': round(mu_li, 6), 'per_electron': [round(x, 4) for x in per_e]}
+            'mu_li': round(mu_li, 6), 'per_electron': [round(x, 4) for x in per_e],
+            'thermo_corrected': bool(g_corr)}
 
 
 def path_from_project_and_molecules(delta_rows: list, e_slab: float,
-                                    molecules_dir, *, mu_li=None) -> dict:
+                                    molecules_dir, *, mu_li=None,
+                                    g_corr: dict | None = None) -> dict:
     """便捷入口:项目 ΔE 行(带 e_config)+ 旧分子目录 → 放电路径。
 
     组态名需含物种名(如 ads_Li2S4_on_slab / Li2S6_top):按物种子串匹配唯一组态;
     多个匹配取 E 最低(最稳组态,常规口径)。
+    g_corr 透传 discharge_path(逐物种 ZPE−TS 校正,见 project.thermo)。
     """
     mol_e = load_molecule_energies(molecules_dir)
     system_e = {}
@@ -127,7 +136,7 @@ def path_from_project_and_molecules(delta_rows: list, e_slab: float,
                  and _species_in_name(sp, r.get('name', ''))]
         if cands:
             system_e[sp] = min(cands)
-    return discharge_path(system_e, mol_e, mu_li=mu_li)
+    return discharge_path(system_e, mol_e, mu_li=mu_li, g_corr=g_corr)
 
 
 def _species_in_name(species: str, name: str) -> bool:

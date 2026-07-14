@@ -109,8 +109,10 @@ def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
     if fed:
         ladder = charts.ladder_data(fed['steps'], u_l=fed['u_l'])
         origin_specs.append({'kind': 'ladder', 'name': 'fed', 'data': ladder})
+        corr_note = ('含 ZPE−TS 振动校正(298.15 K)' if fed.get('thermo_corrected')
+                     else '电子能未含 ZPE/熵')
         svg_parts['fed'] = charts.render_ladder_svg(
-            ladder, title=f'Li-S 放电路径(μ_Li={fed["mu_li"]:.3f} eV,电子能未含 ZPE/熵)')
+            ladder, title=f'Li-S 放电路径(μ_Li={fed["mu_li"]:.3f} eV,{corr_note})')
     origin_images = {}
     if origin_specs:
         r = origin_render(origin_specs, str(figs_dir),
@@ -168,9 +170,16 @@ def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
         sections.append('<h2>结构图(POV-Ray)</h2>' + ''.join(gallery))
 
     # ── 4. 方法学约定(原版 methods 节的通用版;论文同款口径,项目专用内容不写死) ──
+    if fed and fed.get('thermo_corrected'):
+        meta = fed.get('thermo_meta') or {}
+        corr_line = ('ΔG 已含吸附态振动热校正(谐振子 ZPE − T·S<sub>vib</sub>,298.15 K;'
+                     '物种:' + '、'.join(
+                         f'{sp} {v["g_corr"]:+.3f} eV' for sp, v in meta.items()) + ')。')
+    else:
+        corr_line = '全部能量为 DFT 电子能(OSZICAR E0),未含 ZPE/熵修正。'
     conv = ['E<sub>ads</sub> = E(slab+ads) − E(slab) − E(ref),负值 = 有利吸附;'
             'ΔE 着色:&lt; −3 eV 强吸附(绿)、&gt; 0(红)。',
-            '全部能量为 DFT 电子能(OSZICAR E0),未含 ZPE/熵修正。',
+            corr_line,
             '成员全部 DONE 才给 ΔE;能量经物理合理性闸(E≥0/|E|&gt;10⁴ 拒收)。']
     if fed:
         conv.insert(1, f'μ<sub>Li</sub> = (E(Li₂S) − E(S₈)/8) / 2 = {fed["mu_li"]:.4f} eV'
@@ -187,14 +196,33 @@ def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
 
 
 def _try_fed(delta, config, log):
-    """分子库目录已配置时算放电路径;缺物种/失败 → None + 日志,不阻塞报告。"""
+    """分子库目录已配置时算放电路径;缺物种/失败 → None + 日志,不阻塞报告。
+
+    热校正(投稿级):config['freq_dirs'] = {物种: 频率作业目录} 时,自动解析各
+    OUTCAR 频率(IBRION=5/6)做 ZPE−TS 校正并叠进 ΔG;有虚频的物种记日志提醒。
+    未配置保持电子能口径(报告方法学节明示)。
+    """
     mol_dir = (config or {}).get('lis_molecules_dir') or ''
     if not mol_dir or not os.path.isdir(mol_dir):
         return None
+    g_corr, corr_meta = None, {}
+    freq_dirs = (config or {}).get('freq_dirs') or {}
+    if freq_dirs:
+        from vcstudio.project import thermo
+        corr_meta = thermo.load_corrections(freq_dirs)
+        if corr_meta:
+            g_corr = {sp: v['g_corr'] for sp, v in corr_meta.items()}
+            for sp, v in corr_meta.items():
+                if v['n_imag']:
+                    log(f'⚠ {sp} 频率计算含 {v["n_imag"]} 个虚频'
+                        f'({v["imag_cm1"]} cm⁻¹):校正已按实频计,请人工核查构型')
     try:
         slab_state, e_slab = delta['slab']
-        return freeenergy.path_from_project_and_molecules(
-            delta['rows'], e_slab=e_slab, molecules_dir=mol_dir)
+        fed = freeenergy.path_from_project_and_molecules(
+            delta['rows'], e_slab=e_slab, molecules_dir=mol_dir, g_corr=g_corr)
+        if corr_meta:
+            fed['thermo_meta'] = corr_meta
+        return fed
     except ValueError as e:
         log(f'自由能路径未生成:{e}')
         return None
