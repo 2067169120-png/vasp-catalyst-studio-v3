@@ -107,6 +107,10 @@ class Api:
             if prof is None:
                 return {'ok': False, 'message': f'集群「{name}」不存在,请先在集群页保存',
                         'scheduler': '', 'needs_trust': False}
+            # 前端在 keyring 已存密码时故意传 null;回退取 keyring 密码,
+            # 否则 password=None 恒认证失败(存过密码后 retest 永远挂)。
+            if prof.auth == 'password' and not password:
+                password = self._secrets.get_password(name)
             res = self._ssh().check_connection(prof, password, trust_new=bool(trust_new))
             # 成功 + 显式给了密码 + 该 profile 走密码认证 → 顺手存 keyring
             if res.ok and password and prof.auth == 'password':

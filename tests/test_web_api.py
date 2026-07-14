@@ -104,6 +104,26 @@ def test_test_connection_failure_does_not_save():
     assert '认证失败' in out['message']
 
 
+def test_test_connection_falls_back_to_keyring_password():
+    # cluster.js 在 keyring 已存密码时故意传 None;test_connection 须回退取 keyring 密码,
+    # 否则 check_connection 拿到 password=None 恒认证失败(retest 永远失败)。
+    seen = {}
+    secrets = types.SimpleNamespace(
+        get_password=lambda n: 'kr-pw',
+        set_password=lambda n, pw: None)
+
+    def _check(prof, password, trust_new=False):
+        seen['password'] = password
+        return types.SimpleNamespace(ok=True, message='ok', scheduler='PBS', needs_trust=False)
+
+    ssh = types.SimpleNamespace(check_connection=_check)
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='password')}
+    api = Api(profiles_mod=_fake_profiles(store), secrets_mod=secrets, ssh_test_mod=ssh)
+    out = api.test_connection('c1', None, False)
+    assert seen['password'] == 'kr-pw'
+    assert out['ok'] is True
+
+
 def test_test_connection_unknown_profile_error():
     api = Api(profiles_mod=_fake_profiles({}))
     out = api.test_connection('nope', 'pw', False)
