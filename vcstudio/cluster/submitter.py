@@ -198,6 +198,58 @@ def query_states(client, profile) -> dict:
     return query_scheduler(client, profile)[0]
 
 
+def query_queue_detail(client, profile) -> list:
+    """调度器全量明细(该用户所有在队/在跑作业,含外部提交的)。
+
+    → [{'job_id','state','name','workdir'}]。用途:「集群队列」视图 + 认领外部任务。
+    同 query_scheduler 的哨兵防抖:查询失败抛错,绝不静默返回空当"队列空"。
+    """
+    dialect = get_dialect(profile.scheduler)
+    cmd = dialect.detail_cmd(profile.username, getattr(profile, 'scheduler_bin', ''))
+    out, _ = run_cmd(client, f'{cmd} && echo {_QOK}')
+    if _QOK not in out:
+        raise RuntimeError('调度器队列查询失败(qstat/squeue 无响应或报错)')
+    return dialect.parse_detail(out.replace(_QOK, ''))
+
+
+def adopt_external_job(local_dir: str, profile, job_id: str, remote_dir: str,
+                       name: str = '', task_type: str = 'relax') -> dict:
+    """认领一个非本软件提交的集群作业:落 job.yaml + 入台账,之后查状态/拉回/续算全走原生路径。
+
+    local_dir 是用户指定的本地目录(存在则直接用,不存在则创建;作为结果落点)。
+    不上传/不动远端——认领只是登记事实:该作业号在该集群、结果在 remote_dir。
+    状态置 SUBMITTED,下一次「查询状态」会按调度器现状推进(QUEUED/RUNNING/终态取证)。
+    """
+    if not str(remote_dir).startswith('/'):
+        raise ValueError('远程目录需为绝对路径(以 / 开头)')
+    os.makedirs(local_dir, exist_ok=True)
+    existing = manifest_mod.load_manifest(local_dir)
+    if existing and existing.get('scheduler_job_id'):
+        raise ValueError(f'该本地目录已关联作业号 {existing["scheduler_job_id"]},'
+                         f'请换一个目录或先移出台账')
+    dir_name = os.path.basename(os.path.normpath(local_dir))
+    m = existing or manifest_mod.new_manifest(
+        job_id=f'external-{dir_name}-{time.strftime("%Y%m%d-%H%M%S")}',
+        system=name or dir_name, task_type=task_type, calc_type='slab',
+        inputs={'adopted': True, 'adopted_from': f'{profile.name}:{job_id}'})
+    m['cluster'] = profile.name
+    m['remote_dir'] = remote_dir
+    m['scheduler_job_id'] = str(job_id)
+    m['task_type'] = task_type
+    m.setdefault('attempts', []).append({
+        'n': len(m.get('attempts') or []) + 1,
+        'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'result': 'adopted',
+        'job_id': str(job_id),
+        'cluster': profile.name,
+    })
+    manifest_mod.set_state(m, 'SUBMITTED', note=f'认领外部作业 {job_id}(remote: {remote_dir})')
+    manifest_mod.save_manifest(local_dir, m)
+    from vcstudio.cluster import ledger
+    ledger.register(local_dir)
+    return m
+
+
 def refresh_job(client, profile, job_dir: str, live_states: dict | None = None,
                 terminal_reasons: dict | None = None) -> dict:
     """按调度器现状更新一个作业的 manifest;终态时做取证 + 失败分类。
@@ -517,6 +569,108 @@ def continue_from_contcar(client, profile, job_dir: str,
     })
     manifest_mod.set_state(m, 'SUBMITTED',
                            note=f'CONTCAR 续算 第{rounds + 1}轮(prev {prev} → {job_id},INCAR 冻结)')
+    manifest_mod.save_manifest(job_dir, m)
+    return m
+
+
+# ── 改参续算(S6 修复引擎):白名单键受控修改 INCAR 后重投 ─────────────────────
+# 只放非方法学"数值旋钮":收敛算法/展宽/混合/步长/迭代上限/能带数。ENCUT/泛函/
+# IVDW/ISPIN/赝势这类**决定可比性**的键绝不进白名单(方法学主权不破)。
+INCAR_TUNE_WHITELIST = frozenset({
+    'ALGO', 'ISMEAR', 'SIGMA', 'AMIX', 'BMIX', 'AMIX_MAG', 'BMIX_MAG', 'IMIX',
+    'POTIM', 'IBRION', 'NELM', 'NELMIN', 'NSW', 'NBANDS', 'LREAL', 'ISYM',
+    'SYMPREC', 'AMIN', 'MAXMIX', 'NCORE', 'KPAR', 'EDIFF',
+})
+_TUNE_BANNER = '# --- vcstudio 改参续算 第{round}轮 {at} ---'
+
+
+def continue_with_incar_changes(client, sftp, profile, job_dir: str,
+                                changes: dict,
+                                max_rounds: int = CONTINUE_MAX_ROUNDS,
+                                restart_from_contcar: bool = True) -> dict:
+    """诊断建议 → 受控改参重投:白名单键追加覆盖到 INCAR 文末(原文一字不删),
+    可选 CONTCAR→POSCAR,清 WAVECAR/CHGCAR,重投同一脚本。
+
+    与冻结续算共用状态门/轮次上限;差异:
+    - changes 仅允许 INCAR_TUNE_WHITELIST 键(违例 ValueError 点名,绝不静默丢弃);
+    - 放宽 restartable 限制:SCF_SLOSHING/EDDDAV 等 NEEDS_HUMAN 类正是改参对象,
+      故只要求终态(不在队/不在跑),不要求 diagnose.restartable;
+    - INCAR 修改以"追加覆盖块"落地(VASP 取同键末次出现值;原文保留可审计),
+      同步上传远端;attempts 记录完整 changes。
+    """
+    if not changes:
+        raise ValueError('未提供任何 INCAR 修改项')
+    bad = [k for k in changes if str(k).upper() not in INCAR_TUNE_WHITELIST]
+    if bad:
+        raise ValueError(
+            f'以下键不在改参白名单,拒绝修改:{", ".join(bad)}。'
+            f'白名单(非方法学旋钮):{", ".join(sorted(INCAR_TUNE_WHITELIST))}')
+    m = manifest_mod.load_manifest(job_dir)
+    if m is None:
+        raise ValueError('作业目录缺 job.yaml,无法改参续算')
+    if m.get('state') in ('UPLOADED', 'SUBMITTED', 'QUEUED', 'RUNNING'):
+        raise ValueError(f"该作业仍在队列/运行中(状态 {m['state']}),不能改参重投")
+    rounds = int((m.get('results') or {}).get('continue_rounds', 0))
+    if rounds >= max_rounds:
+        raise RuntimeError(f'已续算 {rounds} 次达上限 {max_rounds},停机交人工(防死循环)')
+    remote = m.get('remote_dir')
+    if not remote:
+        raise ValueError('该作业无 remote_dir(未提交过),无法改参续算')
+
+    # 1) 本地 INCAR:备份 + 追加覆盖块(原文保留)
+    local_incar = os.path.join(job_dir, 'INCAR')
+    if not os.path.isfile(local_incar):
+        raise ValueError('本地作业目录缺 INCAR')
+    with open(local_incar, 'r', encoding='utf-8', errors='replace') as f:
+        incar_text = f.read()
+    shutil.copyfile(local_incar, f'{local_incar}.bak{rounds + 1}')
+    at = time.strftime('%Y-%m-%dT%H:%M:%S')
+    block = '\n' + _TUNE_BANNER.format(round=rounds + 1, at=at) + '\n'
+    block += ''.join(f'{str(k).upper()} = {v}\n' for k, v in changes.items())
+    new_text = (incar_text if incar_text.endswith('\n') else incar_text + '\n') + block
+    with open(local_incar, 'w', encoding='utf-8', newline='') as f:
+        f.write(new_text)
+
+    # 2) 可选 CONTCAR 续结构(结构没跑几步/硬崩时也允许保持原 POSCAR 重跑)
+    if restart_from_contcar:
+        contcar = _read_remote_text(client, posixpath.join(remote, 'CONTCAR'))
+        if diagnose.valid_poscar(contcar):
+            local_poscar = os.path.join(job_dir, 'POSCAR')
+            if os.path.isfile(local_poscar):
+                shutil.copyfile(local_poscar, f'{local_poscar}.bak{rounds + 1}')
+            with open(local_poscar, 'w', encoding='utf-8', newline='') as f:
+                f.write(contcar)
+            run_cmd(client, f'cd {shlex.quote(remote)} && cp CONTCAR POSCAR', check=True)
+
+    # 3) 上传新 INCAR + 清混合历史,重投同一脚本
+    sftp.put(local_incar, posixpath.join(remote, 'INCAR'))
+    run_cmd(client, f'cd {shlex.quote(remote)} && rm -f WAVECAR CHGCAR', check=True)
+    dialect = get_dialect(profile.scheduler)
+    out, err = run_cmd(client, dialect.submit_cmd(
+        posixpath.join(remote, SCRIPT_NAME), getattr(profile, 'scheduler_bin', '')))
+    job_id = dialect.parse_job_id(out)
+    if not job_id:
+        raise RuntimeError(f'改参重投失败,{dialect.name} 返回:{(out or err).strip()[:300]}')
+
+    prev = m.get('scheduler_job_id')
+    m['scheduler_job_id'] = job_id
+    m.setdefault('results', {}).pop('diagnosis', None)
+    m.setdefault('results', {})['continue_rounds'] = rounds + 1
+    m.setdefault('attempts', []).append({
+        'n': len(m.get('attempts') or []) + 1,
+        'at': at,
+        'result': 'continued',
+        'action': 'incar_tuned_restart',
+        'incar_changes': {str(k).upper(): str(v) for k, v in changes.items()},
+        'from_contcar': bool(restart_from_contcar),
+        'prev_job_id': prev,
+        'job_id': job_id,
+        'round': rounds + 1,
+    })
+    manifest_mod.set_state(
+        m, 'SUBMITTED',
+        note=f'改参续算 第{rounds + 1}轮({", ".join(f"{str(k).upper()}={v}" for k, v in changes.items())};'
+             f'prev {prev} → {job_id})')
     manifest_mod.save_manifest(job_dir, m)
     return m
 

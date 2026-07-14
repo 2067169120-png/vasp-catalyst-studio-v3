@@ -67,6 +67,15 @@ class SchedulerDialect:
     def cancel_cmd(self, job_id: str, bin_path: str = '') -> str:
         raise NotImplementedError
 
+    # ── 全量明细(P0:外部任务可见/可认领)。基类退化为 status 口径(无名字/目录) ──
+    def detail_cmd(self, user: str, bin_path: str = '') -> str:
+        return self.status_cmd(user, bin_path)
+
+    def parse_detail(self, raw: str) -> list:
+        """原始查询输出 → [{'job_id','state','name','workdir'}](仅在队/在跑)。"""
+        return [{'job_id': k, 'state': v, 'name': '', 'workdir': ''}
+                for k, v in self.parse_status(raw).items()]
+
 
 def _bin(bin_path: str, exe: str) -> str:
     """scheduler_bin 非空时用全路径(1w 的 torque 不在默认 PATH,实测必须),带引号防空格。"""
@@ -129,6 +138,25 @@ class PBSDialect(SchedulerDialect):
 
     def cancel_cmd(self, job_id, bin_path=''):
         return f'{_bin(bin_path, "qdel")} {shlex.quote(str(job_id))} 2>&1'
+
+    def parse_detail(self, raw):
+        """qstat -u 全量明细:作业名在第 4 列(≥10 列格式)。PBS 拿不到工作目录(留空,
+        认领时由用户补)。"""
+        out = []
+        for line in raw.splitlines():
+            parts = line.split()
+            if not parts or not re.match(r'\d', parts[0]):
+                continue
+            jid = parts[0].split('.')[0]
+            if len(parts) >= 10 and parts[9] in self._STATES:
+                u, name = self._MAP[parts[9]], parts[3]
+            elif len(parts) >= 5 and parts[4] in self._STATES:
+                u, name = self._MAP[parts[4]], (parts[1] if len(parts) > 1 else '')
+            else:
+                continue
+            if u in (QUEUED, RUNNING):
+                out.append({'job_id': jid, 'state': u, 'name': name, 'workdir': ''})
+        return out
 
 
 class SlurmDialect(SchedulerDialect):
@@ -194,6 +222,23 @@ class SlurmDialect(SchedulerDialect):
 
     def cancel_cmd(self, job_id, bin_path=''):
         return f'{_bin(bin_path, "scancel")} {shlex.quote(str(job_id))} 2>&1'
+
+    def detail_cmd(self, user, bin_path=''):
+        # %Z=工作目录:认领外部任务时 remote_dir 直接可得,免手填
+        return (f'{_bin(bin_path, "squeue")} -u {shlex.quote(str(user))} '
+                f'-o "%i|%t|%j|%Z" --noheader 2>/dev/null')
+
+    def parse_detail(self, raw):
+        out = []
+        for line in raw.strip().splitlines():
+            parts = [p.strip() for p in line.split('|')]
+            if len(parts) >= 2 and parts[0]:
+                u = self._MAP.get(parts[1])
+                if u in (QUEUED, RUNNING):
+                    out.append({'job_id': parts[0], 'state': u,
+                                'name': parts[2] if len(parts) > 2 else '',
+                                'workdir': parts[3] if len(parts) > 3 else ''})
+        return out
 
 
 _DIALECTS = {'PBS': PBSDialect, 'Slurm': SlurmDialect}

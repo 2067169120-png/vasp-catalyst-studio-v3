@@ -135,14 +135,20 @@ def _poscar_system_name(poscar_path: str | os.PathLike) -> str:
 def create_from_build(job_dir: str | os.PathLike, build_result: dict, *,
                       poscar_path: str | os.PathLike,
                       validate: bool = True,
-                      task_type: str = 'relax',
+                      task_type: str | None = None,
                       system: str = '') -> dict:
     """在 build_job_dir 成功后落一份 job.yaml。返回 manifest dict。
 
     build_result 即 build_job_dir 的返回值({'ok','out_dir','warnings','kpoints',
     'elements','completions'})。本函数不抛业务异常上抛给调用方决定是否降级
     (生成成功但 manifest 写失败时,调用方应告警而非撤销生成)。
+
+    task_type=None(默认)→ 用 build_result['task_type'](build_job_dir 按 INCAR 的
+    NSW/IBRION 推断:NSW=0→static、IBRION=5/6→freq),再退 'relax'。修复静态作业
+    被按 relax 收敛标志('reached required accuracy')误判未收敛的正确性 bug。
     """
+    if task_type is None:
+        task_type = str(build_result.get('task_type') or 'relax')
     completions = dict(build_result.get('completions') or {})
     job_dir = Path(job_dir)
     inputs = {

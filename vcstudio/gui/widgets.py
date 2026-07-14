@@ -4,6 +4,8 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk, filedialog
 
+from vcstudio.gui import style as _style
+
 
 class FileRow(ttk.Frame):
     """一行:标签 + 输入框 + [浏览…]。mode='openfile' 选文件,'dir' 选目录。
@@ -46,8 +48,8 @@ class LogBox(ttk.Frame):
         super().__init__(parent)
         self.text = tk.Text(self, height=height, wrap='word', state='disabled',
                             background='#FFFFFF', foreground='#1F2937',
-                            font=('Consolas', 9), relief='solid', borderwidth=1,
-                            highlightthickness=0, padx=6, pady=4)
+                            font=_style.FONT_MONO, relief='solid', borderwidth=1,
+                            highlightthickness=0, padx=8, pady=6)
         scroll = ttk.Scrollbar(self, command=self.text.yview)
         self.text.configure(yscrollcommand=scroll.set)
         self.text.grid(row=0, column=0, sticky='nsew')

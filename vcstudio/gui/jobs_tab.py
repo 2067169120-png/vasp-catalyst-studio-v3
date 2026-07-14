@@ -40,32 +40,43 @@ class JobsTab(ttk.Frame):
         self._schedule_auto()                            # S5 轮询链启动(开关随时生效)
 
     def _build(self):
+        # 工具栏按语义分两行(原 14 控件挤一行会溢出):
+        # 行1 = 集群 + 提交/续算 + 状态类;行2 = 结果类 + 台账维护 + 自动刷新
         bar = ttk.Frame(self)
-        bar.grid(row=0, column=0, sticky='ew', pady=3)
+        bar.grid(row=0, column=0, sticky='ew', pady=(3, 0))
         ttk.Label(bar, text='目标集群').grid(row=0, column=0, padx=(0, 4))
         self.profile_var = tk.StringVar()
-        self.profile_cb = ttk.Combobox(bar, textvariable=self.profile_var, width=18, state='readonly')
+        self.profile_cb = ttk.Combobox(bar, textvariable=self.profile_var, width=16, state='readonly')
         self.profile_cb.grid(row=0, column=1, padx=4)
-        ttk.Button(bar, text='⟳ 刷新列表', command=self.reload).grid(row=0, column=2, padx=4)
         self.submit_btn = ttk.Button(bar, text='📤 上传并提交(选中)', style='Accent.TButton', command=self._on_submit)
-        self.submit_btn.grid(row=0, column=3, padx=4)
-        self.status_btn = ttk.Button(bar, text='🔄 查询状态', command=self._on_refresh_status)
-        self.status_btn.grid(row=0, column=4, padx=4)
-        self.fetch_btn = ttk.Button(bar, text='📥 拉回结果(选中)', command=self._on_fetch)
-        self.fetch_btn.grid(row=0, column=5, padx=4)
+        self.submit_btn.grid(row=0, column=2, padx=4)
         self.continue_btn = ttk.Button(bar, text='♻ 续算(选中)', command=self._on_continue)
-        self.continue_btn.grid(row=0, column=6, padx=4)
-        ttk.Button(bar, text='🔁 重新判定(选中)', command=self._on_rejudge).grid(row=0, column=7, padx=4)
-        ttk.Button(bar, text='📄 导出报告', command=self._on_report).grid(row=0, column=8, padx=4)
-        ttk.Button(bar, text='📂 打开目录', command=self._open_dir).grid(row=0, column=9, padx=4)
-        ttk.Button(bar, text='🗑 移出台账', command=self._remove).grid(row=0, column=10, padx=4)
+        self.continue_btn.grid(row=0, column=3, padx=4)
+        self.tune_btn = ttk.Button(bar, text='🔧 改参续算(选中)', command=self._on_tune_continue)
+        self.tune_btn.grid(row=0, column=4, padx=4)
+        self.status_btn = ttk.Button(bar, text='🔄 查询状态', command=self._on_refresh_status)
+        self.status_btn.grid(row=0, column=5, padx=4)
+        self.queue_btn = ttk.Button(bar, text='🌐 集群队列', command=self._on_queue_view)
+        self.queue_btn.grid(row=0, column=6, padx=4)
+
+        bar2 = ttk.Frame(self)
+        bar2.grid(row=1, column=0, sticky='ew', pady=(2, 3))
+        ttk.Button(bar2, text='⟳ 刷新列表', command=self.reload).grid(row=0, column=0, padx=(0, 4))
+        self.fetch_btn = ttk.Button(bar2, text='📥 拉回结果(选中)', command=self._on_fetch)
+        self.fetch_btn.grid(row=0, column=1, padx=4)
+        ttk.Button(bar2, text='🔁 重新判定(选中)', command=self._on_rejudge).grid(row=0, column=2, padx=4)
+        ttk.Button(bar2, text='📄 导出报告', command=self._on_report).grid(row=0, column=3, padx=4)
+        ttk.Button(bar2, text='📂 打开目录', command=self._open_dir).grid(row=0, column=4, padx=4)
+        ttk.Button(bar2, text='🗑 移出台账', command=self._remove).grid(row=0, column=5, padx=4)
+        self.clean_btn = ttk.Button(bar2, text='🧹 清理失效条目', command=self._clean_stale)
+        self.clean_btn.grid(row=0, column=6, padx=4)
         # S5 自动轮询:GUI 开着时定时查(默认关;5/15/30 分钟)
         self.auto_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bar, text='自动刷新', variable=self.auto_var).grid(row=0, column=11, padx=(12, 2))
+        ttk.Checkbutton(bar2, text='自动刷新', variable=self.auto_var).grid(row=0, column=7, padx=(12, 2))
         self.auto_interval_var = tk.StringVar(value='15')
-        ttk.Combobox(bar, textvariable=self.auto_interval_var, values=('5', '15', '30'),
-                     width=4, state='readonly').grid(row=0, column=12)
-        ttk.Label(bar, text='分钟').grid(row=0, column=13)
+        ttk.Combobox(bar2, textvariable=self.auto_interval_var, values=('5', '15', '30'),
+                     width=4, state='readonly').grid(row=0, column=8)
+        ttk.Label(bar2, text='分钟').grid(row=0, column=9)
 
         cols = ('state', 'task', 'cluster', 'jobid', 'energy', 'diag', 'updated')
         self.tree = ttk.Treeview(self, columns=cols, show='tree headings', selectmode='extended')
@@ -79,17 +90,20 @@ class JobsTab(ttk.Frame):
             self.tree.column(cid, width=w, anchor='w')
         for st, (tag, color) in _STATE_TAG.items():
             self.tree.tag_configure(st, foreground=color)
-        self.tree.grid(row=1, column=0, sticky='nsew', pady=3)
+        self.tree.grid(row=2, column=0, sticky='nsew', pady=3)
         self.tree.bind('<Double-1>', lambda e: self._open_dir())
         sb = ttk.Scrollbar(self, orient='vertical', command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
-        sb.grid(row=1, column=1, sticky='ns')
+        sb.grid(row=2, column=1, sticky='ns')
+
+        self.stale_lbl = ttk.Label(self, text='', foreground='#a16207')
+        self.stale_lbl.grid(row=3, column=0, sticky='w')
 
         self.log = LogBox(self, height=6)
-        self.log.grid(row=2, column=0, columnspan=2, sticky='nsew')
+        self.log.grid(row=4, column=0, columnspan=2, sticky='nsew')
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
-        self.rowconfigure(2, weight=0)
+        self.rowconfigure(2, weight=1)
+        self.rowconfigure(4, weight=0)
 
     # ── 列表 ──
     def reload(self):
@@ -98,11 +112,11 @@ class JobsTab(ttk.Frame):
         if self.profiles and not self.profile_var.get():
             self.profile_var.set(next(iter(self.profiles)))
         self.tree.delete(*self.tree.get_children())
+        self._stale = []          # 失效条目(目录/manifest 没了)不进树,汇总一行
         for job_dir, m in ledger.load_all():
             name = os.path.basename(os.path.normpath(job_dir))
             if m is None:
-                self.tree.insert('', 'end', iid=job_dir, text=name,
-                                 values=('缺 job.yaml/目录', '', '', '', '', '', ''))
+                self._stale.append(job_dir)
                 continue
             state = m.get('state', '?')
             hist = m.get('state_history') or []
@@ -126,6 +140,22 @@ class JobsTab(ttk.Frame):
                         m.get('cluster') or '', m.get('scheduler_job_id') or '',
                         f'{energy:.4f}' if isinstance(energy, float) else energy,
                         diag, updated))
+        self.stale_lbl.configure(
+            text=(f'⚠ 已隐藏 {len(self._stale)} 个失效条目(目录或 job.yaml 已不存在)'
+                  f'——点「🧹 清理失效条目」一键移出台账' if self._stale else ''))
+
+    def _clean_stale(self):
+        stale = getattr(self, '_stale', [])
+        if not stale:
+            self.log.write('ℹ 没有失效条目,无需清理')
+            return
+        if messagebox.askyesno('清理失效条目',
+                               f'将把 {len(stale)} 个失效条目(目录或 job.yaml 已不存在)移出台账。\n'
+                               f'不删除磁盘文件。继续?'):
+            for d in stale:
+                ledger.unregister(d)
+            self.log.write(f'🧹 已清理 {len(stale)} 个失效条目')
+            self.reload()
 
     def _selected(self) -> list:
         return list(self.tree.selection())
@@ -134,6 +164,10 @@ class JobsTab(ttk.Frame):
         p = self.profiles.get(self.profile_var.get())
         if p is None:
             self.log.write('❌ 请先在集群页配置并保存一个集群,再在上方选择')
+            goto = getattr(self, 'goto_cluster_tab', None)
+            if goto and messagebox.askyesno(
+                    '未配置集群', '还没有配置集群(提交/查询的前置条件)。\n现在去「集群」页配置?'):
+                goto()
         return p
 
     def _password_for(self, prof):
@@ -317,8 +351,51 @@ class JobsTab(ttk.Frame):
         else:
             self.log.write(f'✅ 完整报告已生成:{out}(含图表/结构图/AI 分析)')
 
-    # ── 拉回结果(S3) ──
-    def _on_fetch(self, trust_new=False):
+    # ── 拉回结果(S3):预设可选(轻量默认 / DOS·Bader / 自定义) ──
+    _FETCH_PRESETS = (
+        ('轻量(默认):CONTCAR + OSZICAR + OUTCAR',
+         ('CONTCAR', 'OSZICAR', 'OUTCAR')),
+        ('DOS/Bader:轻量 + vasprun.xml + DOSCAR + CHGCAR + AECCAR0/2(大文件,较慢)',
+         ('CONTCAR', 'OSZICAR', 'OUTCAR', 'vasprun.xml', 'DOSCAR',
+          'CHGCAR', 'AECCAR0', 'AECCAR2')),
+    )
+
+    def _ask_fetch_files(self, n_jobs):
+        """预设选择弹窗。返回文件元组或 None(取消)。"""
+        win = tk.Toplevel(self)
+        win.title(f'拉回结果 — {n_jobs} 个作业')
+        win.geometry('560x240')
+        win.grab_set()
+        choice = tk.IntVar(value=0)
+        for i, (label, _files) in enumerate(self._FETCH_PRESETS):
+            ttk.Radiobutton(win, text=label, value=i, variable=choice).pack(
+                anchor='w', padx=12, pady=(10 if i == 0 else 2, 2))
+        ttk.Radiobutton(win, text='自定义(逗号分隔文件名):', value=99,
+                        variable=choice).pack(anchor='w', padx=12, pady=2)
+        custom_var = tk.StringVar(value='CONTCAR, OUTCAR, vasprun.xml')
+        ttk.Entry(win, textvariable=custom_var, width=56).pack(anchor='w', padx=32)
+        result = {}
+
+        def _ok():
+            c = choice.get()
+            if c == 99:
+                files = tuple(f.strip() for f in custom_var.get().split(',') if f.strip())
+                if not files:
+                    messagebox.showinfo('拉回结果', '自定义文件列表为空', parent=win)
+                    return
+            else:
+                files = self._FETCH_PRESETS[c][1]
+            result['files'] = files
+            win.destroy()
+
+        btns = ttk.Frame(win)
+        btns.pack(pady=10)
+        ttk.Button(btns, text='✔ 开始拉回', style='Accent.TButton', command=_ok).pack(side='left', padx=6)
+        ttk.Button(btns, text='取消', command=win.destroy).pack(side='left', padx=6)
+        win.wait_window()
+        return result.get('files')
+
+    def _on_fetch(self, trust_new=False, files=None):
         dirs = [d for d in self._selected()]
         if not dirs:
             self.log.write('❌ 请先选中要拉回结果的作业(通常是 DONE/UNCONVERGED 的)')
@@ -326,16 +403,20 @@ class JobsTab(ttk.Frame):
         prof = self._profile()
         if prof is None:
             return
+        if files is None:
+            files = self._ask_fetch_files(len(dirs))
+            if files is None:
+                return
         pw = self._password_for(prof)
         self.fetch_btn.configure(state='disabled')
-        self.log.write(f'⏳ 拉回 {len(dirs)} 个作业的 CONTCAR/OSZICAR/OUTCAR…')
-        q = runner.submit(_fetch_batch, prof, pw, dirs, trust_new)
-        self.after(200, lambda: self._poll_fetch(q))
+        self.log.write(f'⏳ 拉回 {len(dirs)} 个作业的 {"、".join(files)}…')
+        q = runner.submit(_fetch_batch, prof, pw, dirs, trust_new, files)
+        self.after(200, lambda: self._poll_fetch(q, files))
 
-    def _poll_fetch(self, q):
+    def _poll_fetch(self, q, files=None):
         item = runner.poll(q)
         if item is None:
-            self.after(200, lambda: self._poll_fetch(q))
+            self.after(200, lambda: self._poll_fetch(q, files))
             return
         kind, payload = item
         self.fetch_btn.configure(state='normal')
@@ -344,7 +425,7 @@ class JobsTab(ttk.Frame):
             return
         if payload.get('needs_trust'):
             if messagebox.askyesno('未知主机', f"{payload['message']}\n\n是否信任该主机并重试?"):
-                self._on_fetch(trust_new=True)
+                self._on_fetch(trust_new=True, files=files)
             return
         for dir_, ok, msg in payload['results']:
             self.log.write(('✅' if ok else '❌') + f' {os.path.basename(dir_)}:{msg}')
@@ -388,6 +469,198 @@ class JobsTab(ttk.Frame):
         if payload.get('needs_trust'):
             if messagebox.askyesno('未知主机', f"{payload['message']}\n\n是否信任该主机并重试?"):
                 self._on_continue(trust_new=True)
+            return
+        for dir_, ok, msg in payload['results']:
+            self.log.write(('✅' if ok else '❌') + f' {os.path.basename(dir_)}:{msg}')
+        self.reload()
+
+    # ── 集群队列(P0:外部任务可见/可认领) ──
+    def _on_queue_view(self, trust_new=False):
+        prof = self._profile()
+        if prof is None:
+            return
+        pw = self._password_for(prof)
+        self.queue_btn.configure(state='disabled')
+        self.log.write(f'⏳ 查询「{prof.name}」上 {prof.username} 的全部队列作业…')
+        q = runner.submit(_queue_detail, prof, pw, trust_new)
+        self.after(200, lambda: self._poll_queue(q, prof))
+
+    def _poll_queue(self, q, prof):
+        item = runner.poll(q)
+        if item is None:
+            self.after(200, lambda: self._poll_queue(q, prof))
+            return
+        kind, payload = item
+        self.queue_btn.configure(state='normal')
+        if kind == 'error':
+            self.log.write(f'❌ 队列查询异常:{payload}')
+            return
+        if payload.get('needs_trust'):
+            if messagebox.askyesno('未知主机', f"{payload['message']}\n\n是否信任该主机并重试?"):
+                self._on_queue_view(trust_new=True)
+            return
+        self._show_queue_window(prof, payload['jobs'])
+
+    def _show_queue_window(self, prof, jobs):
+        """集群队列窗口:标注 已纳管/未纳入,未纳入的可认领。"""
+        known = {str((m or {}).get('scheduler_job_id')): d
+                 for d, m in ledger.load_all() if m and m.get('scheduler_job_id')}
+        win = tk.Toplevel(self)
+        win.title(f'集群队列 — {prof.name}({prof.username} 的全部在队/在跑作业)')
+        win.geometry('720x420')
+        cols = ('state', 'name', 'workdir', 'managed')
+        tree = ttk.Treeview(win, columns=cols, show='tree headings', selectmode='browse')
+        tree.heading('#0', text='作业号')
+        tree.column('#0', width=90, anchor='w')
+        for cid, text, w in (('state', '状态', 80), ('name', '作业名', 160),
+                             ('workdir', '远程目录', 240), ('managed', '纳管', 110)):
+            tree.heading(cid, text=text)
+            tree.column(cid, width=w, anchor='w')
+        if not jobs:
+            self.log.write(f'ℹ 「{prof.name}」队列为空(该用户当前没有在队/在跑作业)')
+        for j in jobs:
+            managed = '✔ 已纳管' if str(j['job_id']) in known else '○ 未纳入'
+            tree.insert('', 'end', iid=str(j['job_id']), text=str(j['job_id']),
+                        values=('运行中' if j['state'] == 'RUNNING' else '排队中',
+                                j.get('name') or '', j.get('workdir') or '', managed))
+        tree.pack(fill='both', expand=True, padx=8, pady=(8, 4))
+        hint = ttk.Label(win, text='「○ 未纳入」= 不是本软件提交的作业(如终端手动 sbatch)。'
+                                   '选中后点「认领」纳入台账,即可查状态/拉回/续算。')
+        hint.pack(anchor='w', padx=8)
+        btns = ttk.Frame(win)
+        btns.pack(pady=6)
+        ttk.Button(btns, text='📌 认领选中作业', style='Accent.TButton',
+                   command=lambda: self._adopt_dialog(win, tree, prof, known)).pack(side='left', padx=6)
+        ttk.Button(btns, text='关闭', command=win.destroy).pack(side='left', padx=6)
+
+    def _adopt_dialog(self, win, tree, prof, known):
+        sel = tree.selection()
+        if not sel:
+            messagebox.showinfo('认领', '请先选中一个「○ 未纳入」的作业', parent=win)
+            return
+        jid = sel[0]
+        if jid in known:
+            messagebox.showinfo('认领', f'作业 {jid} 已在台账中,无需认领', parent=win)
+            return
+        vals = tree.item(jid, 'values')
+        name, workdir = vals[1], vals[2]
+        remote = workdir or simpledialog.askstring(
+            '远程目录', f'调度器未提供作业 {jid} 的工作目录,请输入远程绝对路径:',
+            parent=win)
+        if not remote:
+            return
+        local = filedialog.askdirectory(
+            title=f'为作业 {jid}({name})选择/新建本地目录(结果将拉回到这里)',
+            parent=win)
+        if not local:
+            return
+        try:
+            submitter.adopt_external_job(local, prof, jid, remote, name=name)
+            self.log.write(f'📌 已认领作业 {jid} → {local}(下次「查询状态」即可追踪)')
+            tree.item(jid, values=(vals[0], name, remote, '✔ 已纳管'))
+            self.reload()
+        except (ValueError, RuntimeError) as e:
+            messagebox.showerror('认领失败', str(e), parent=win)
+
+    # ── 改参续算(S6:诊断建议 → 白名单键受控修改重投) ──
+    def _on_tune_continue(self, trust_new=False):
+        sel = self._selected()
+        if len(sel) != 1:
+            self.log.write('❌ 改参续算一次处理一个作业:请只选中一个已结束的作业')
+            return
+        d = sel[0]
+        m = manifest_mod.load_manifest(d)
+        if m is None:
+            self.log.write('❌ 该条目缺 job.yaml')
+            return
+        if m.get('state') in ('UPLOADED', 'SUBMITTED', 'QUEUED', 'RUNNING'):
+            self.log.write(f"❌ 该作业仍在队列/运行中(状态 {m['state']}),不能改参重投")
+            return
+        prof = self._profile()
+        if prof is None:
+            return
+        dgn = (m.get('results') or {}).get('diagnosis') or {}
+        hint = ''
+        if dgn.get('failure_class'):
+            hint = f"诊断:{dgn['failure_class']} — {dgn.get('evidence', '')}"
+        changes = self._ask_incar_changes(os.path.basename(d), hint)
+        if not changes:
+            return
+        pw = self._password_for(prof)
+        self.tune_btn.configure(state='disabled')
+        self.log.write(f'⏳ 改参续算 {os.path.basename(d)}:' +
+                       ', '.join(f'{k}={v}' for k, v in changes.items()))
+        q = runner.submit(_tune_batch, prof, pw, d, changes, trust_new,
+                          getattr(self, '_tune_from_contcar', True))
+        self.after(200, lambda: self._poll_tune(q))
+
+    def _ask_incar_changes(self, job_name, hint):
+        """弹窗收集白名单 INCAR 修改(每行 KEY = VALUE)。返回 dict 或 None(取消)。"""
+        win = tk.Toplevel(self)
+        win.title(f'改参续算 — {job_name}')
+        win.geometry('560x360')
+        win.grab_set()
+        if hint:
+            ttk.Label(win, text=hint, foreground='#a16207', wraplength=520).pack(
+                anchor='w', padx=10, pady=(8, 2))
+        ttk.Label(win, text='输入要修改的 INCAR 键值(每行一个,如 ALGO = Normal):').pack(
+            anchor='w', padx=10, pady=(6, 2))
+        txt = tk.Text(win, height=6, width=60)
+        txt.pack(fill='both', expand=True, padx=10)
+        ttk.Label(win, foreground='#64748B', wraplength=520, text=(
+            '白名单(非方法学旋钮):' + ', '.join(sorted(submitter.INCAR_TUNE_WHITELIST)) +
+            '。ENCUT/泛函/IVDW/ISPIN 不可改(保 ΔE 可比性)。'
+            '修改以追加块写入 INCAR 文末(原文保留,VASP 取末次出现值),并计入续算轮次(上限 3)。')).pack(
+            anchor='w', padx=10, pady=4)
+        from_contcar = tk.BooleanVar(value=True)
+        ttk.Checkbutton(win, text='同时从 CONTCAR 续算结构(推荐;取消则保持原 POSCAR 重跑)',
+                        variable=from_contcar).pack(anchor='w', padx=10)
+        result = {}
+
+        def _ok():
+            raw = txt.get('1.0', 'end').strip()
+            changes = {}
+            for line in raw.splitlines():
+                if '=' not in line:
+                    continue
+                k, _, v = line.partition('=')
+                k, v = k.strip().upper(), v.strip()
+                if k and v:
+                    changes[k] = v
+            if not changes:
+                messagebox.showinfo('改参续算', '未输入有效的 KEY = VALUE 行', parent=win)
+                return
+            bad = [k for k in changes if k not in submitter.INCAR_TUNE_WHITELIST]
+            if bad:
+                messagebox.showerror('改参续算', f'不在白名单:{", ".join(bad)}', parent=win)
+                return
+            result['changes'] = changes
+            result['from_contcar'] = from_contcar.get()
+            win.destroy()
+
+        btns = ttk.Frame(win)
+        btns.pack(pady=8)
+        ttk.Button(btns, text='✔ 确认重投', style='Accent.TButton', command=_ok).pack(side='left', padx=6)
+        ttk.Button(btns, text='取消', command=win.destroy).pack(side='left', padx=6)
+        win.wait_window()
+        if 'changes' not in result:
+            return None
+        self._tune_from_contcar = result['from_contcar']
+        return result['changes']
+
+    def _poll_tune(self, q):
+        item = runner.poll(q)
+        if item is None:
+            self.after(200, lambda: self._poll_tune(q))
+            return
+        kind, payload = item
+        self.tune_btn.configure(state='normal')
+        if kind == 'error':
+            self.log.write(f'❌ 改参续算异常:{payload}')
+            return
+        if payload.get('needs_trust'):
+            if messagebox.askyesno('未知主机', f"{payload['message']}\n\n是否信任该主机并重试?"):
+                self._on_tune_continue(trust_new=True)
             return
         for dir_, ok, msg in payload['results']:
             self.log.write(('✅' if ok else '❌') + f' {os.path.basename(dir_)}:{msg}')
@@ -472,7 +745,7 @@ def _submit_batch(prof, pw, dirs, trust_new):
     return {'needs_trust': False, 'results': results}
 
 
-def _fetch_batch(prof, pw, dirs, trust_new):
+def _fetch_batch(prof, pw, dirs, trust_new, files=submitter.FETCH_FILES):
     try:
         client, jump = open_client(prof, pw, trust_new=trust_new)
     except ConnectError as e:
@@ -484,7 +757,7 @@ def _fetch_batch(prof, pw, dirs, trust_new):
         sftp = client.open_sftp()
         for d in dirs:
             try:
-                fetched, missing = submitter.fetch_results(client, sftp, d)
+                fetched, missing = submitter.fetch_results(client, sftp, d, files=files)
                 msg = '已拉回 ' + ('、'.join(fetched) if fetched else '(无)')
                 if missing:
                     msg += f'(远端缺 {"、".join(missing)})'
@@ -541,6 +814,45 @@ def _continue_batch(prof, pw, dirs, trust_new):
                 results.append((d, True, f"已续算重投,新作业号 {m['scheduler_job_id']}"))
             except _job_errors() as e:
                 results.append((d, False, str(e)))
+    finally:
+        close_quiet(client, jump)
+    return {'needs_trust': False, 'results': results}
+
+
+def _queue_detail(prof, pw, trust_new):
+    """集群队列全量明细线程体。"""
+    try:
+        client, jump = open_client(prof, pw, trust_new=trust_new)
+    except ConnectError as e:
+        if e.needs_trust:
+            return {'needs_trust': True, 'message': str(e), 'jobs': []}
+        raise RuntimeError(str(e))
+    try:
+        jobs = submitter.query_queue_detail(client, prof)
+    finally:
+        close_quiet(client, jump)
+    return {'needs_trust': False, 'jobs': jobs}
+
+
+def _tune_batch(prof, pw, job_dir, changes, trust_new, from_contcar=True):
+    """改参续算线程体(单作业)。"""
+    try:
+        client, jump = open_client(prof, pw, trust_new=trust_new)
+    except ConnectError as e:
+        if e.needs_trust:
+            return {'needs_trust': True, 'message': str(e), 'results': []}
+        raise RuntimeError(str(e))
+    results = []
+    try:
+        sftp = client.open_sftp()
+        try:
+            m = submitter.continue_with_incar_changes(
+                client, sftp, prof, job_dir, changes,
+                restart_from_contcar=from_contcar)
+            results.append((job_dir, True, f"已改参重投,新作业号 {m['scheduler_job_id']}"))
+        except _job_errors() as e:
+            results.append((job_dir, False, str(e)))
+        sftp.close()
     finally:
         close_quiet(client, jump)
     return {'needs_trust': False, 'results': results}

@@ -1,0 +1,211 @@
+"""双角色评审落地项测试:认领外部任务 / 改参续算 / task_type 推断 / 队列明细解析。"""
+import os
+
+import pytest
+
+from vcstudio.cluster import submitter, ledger
+from vcstudio.cluster.schedulers import SlurmDialect, PBSDialect
+from vcstudio.generate.job_builder import build_job_dir, _infer_task_type
+from vcstudio.shared import manifest
+
+from tests.test_submitter import (          # 复用假件与工装
+    FakeClient, FakeSFTP, _profile, _job_dir,
+)
+
+
+# ── task_type 推断(静态作业误判修复) ────────────────────────────────────────
+def test_infer_task_type_static_when_nsw_absent_or_zero():
+    assert _infer_task_type({'ENCUT': 400}) == 'static'
+    assert _infer_task_type({'NSW': 0}) == 'static'
+
+
+def test_infer_task_type_relax_and_freq():
+    assert _infer_task_type({'NSW': 100, 'IBRION': 2}) == 'relax'
+    assert _infer_task_type({'NSW': 1, 'IBRION': 5}) == 'freq'
+    assert _infer_task_type({'IBRION': 6}) == 'freq'
+
+
+def test_build_job_dir_returns_task_type_and_manifest_uses_it(tmp_path):
+    lib = tmp_path / 'lib'
+    (lib / 'C').mkdir(parents=True)
+    (lib / 'C' / 'POTCAR').write_text(
+        ' fake PAW_PBE C\n   TITEL  = PAW_PBE C 08Apr2002\n'
+        '   ENMAX  =  273.214; ENMIN = 200.000 eV\n', encoding='utf-8')
+    poscar = tmp_path / 'POSCAR'
+    poscar.write_text('C atom\n1.0\n10 0 0\n0 10 0\n0 0 10\nC\n1\nCartesian\n0 0 0\n',
+                      encoding='utf-8')
+    out = tmp_path / 'static_job'
+    res = build_job_dir(str(poscar), 'ENCUT = 400\nNSW = 0\n', str(out),
+                        calc_type='slab', lib_root=str(lib))
+    assert res['task_type'] == 'static'
+    m = manifest.create_from_build(str(out), res, poscar_path=str(poscar))
+    assert m['task_type'] == 'static'
+
+    out2 = tmp_path / 'relax_job'
+    res2 = build_job_dir(str(poscar), 'ENCUT = 400\nNSW = 200\nIBRION = 2\n',
+                         str(out2), calc_type='slab', lib_root=str(lib))
+    assert res2['task_type'] == 'relax'
+
+
+def test_single_job_generation_gets_advisor_warnings(tmp_path):
+    """单作业生成路径也要抓 slab 无偶极修正 这类 warn-only 防呆。"""
+    lib = tmp_path / 'lib'
+    (lib / 'C').mkdir(parents=True)
+    (lib / 'C' / 'POTCAR').write_text(
+        ' fake PAW_PBE C\n   TITEL  = PAW_PBE C 08Apr2002\n'
+        '   ENMAX  =  273.214; ENMIN = 200.000 eV\n', encoding='utf-8')
+    poscar = tmp_path / 'POSCAR'
+    poscar.write_text('C atom\n1.0\n10 0 0\n0 10 0\n0 0 10\nC\n1\nCartesian\n0 0 0\n',
+                      encoding='utf-8')
+    res = build_job_dir(str(poscar), 'ENCUT = 400\nNSW = 100\n',
+                        str(tmp_path / 'slab_job'), calc_type='slab',
+                        lib_root=str(lib))
+    assert any('IDIPOL' in w or '偶极' in w for w in res['warnings'])
+
+
+# ── 认领外部任务 ─────────────────────────────────────────────────────────────
+def test_adopt_external_job_registers_and_tracks(tmp_path):
+    led = tmp_path / 'jobs.json'
+    local = tmp_path / 'adopted_job'
+    prof = _profile(scheduler='Slurm')
+    # ledger.register 用默认路径;打桩到 tmp
+    import vcstudio.cluster.ledger as ledger_mod
+    orig = ledger_mod.default_ledger_path
+    ledger_mod.default_ledger_path = lambda: led
+    try:
+        m = submitter.adopt_external_job(str(local), prof, '88123',
+                                         '/work/u/mn_li2s4', name='mn_li2s4')
+    finally:
+        ledger_mod.default_ledger_path = orig
+    assert m['scheduler_job_id'] == '88123'
+    assert m['cluster'] == prof.name
+    assert m['remote_dir'] == '/work/u/mn_li2s4'
+    assert m['state'] == 'SUBMITTED'
+    assert (m['inputs'] or {}).get('adopted') is True
+    # 已入台账 + job.yaml 落盘
+    assert str(local.resolve()) in ledger.list_dirs(led)
+    assert manifest.load_manifest(str(local))['scheduler_job_id'] == '88123'
+
+
+def test_adopt_rejects_relative_remote_and_double_adopt(tmp_path):
+    led = tmp_path / 'jobs.json'
+    local = tmp_path / 'j'
+    prof = _profile()
+    with pytest.raises(ValueError):
+        submitter.adopt_external_job(str(local), prof, '1', 'work/rel/path')
+    import vcstudio.cluster.ledger as ledger_mod
+    orig = ledger_mod.default_ledger_path
+    ledger_mod.default_ledger_path = lambda: led
+    try:
+        submitter.adopt_external_job(str(local), prof, '2', '/abs/dir')
+        with pytest.raises(ValueError):
+            submitter.adopt_external_job(str(local), prof, '3', '/abs/other')
+    finally:
+        ledger_mod.default_ledger_path = orig
+
+
+# ── 队列全量明细解析 ─────────────────────────────────────────────────────────
+def test_slurm_parse_detail_with_workdir():
+    d = SlurmDialect()
+    raw = ('101|R|mn_li2s4|/work/u/mn_li2s4\n'
+           '102|PD|co_slab|/work/u/co_slab\n'
+           '103|CD|done_job|/work/u/x\n')
+    out = d.parse_detail(raw)
+    assert [(j['job_id'], j['state']) for j in out] == \
+        [('101', 'RUNNING'), ('102', 'QUEUED')]
+    assert out[0]['workdir'] == '/work/u/mn_li2s4'
+    assert out[1]['name'] == 'co_slab'
+
+
+def test_pbs_parse_detail_names():
+    d = PBSDialect()
+    raw = ('Job ID    Username Queue  Jobname  SessID NDS TSK Memory Time S Time\n'
+           '--------- -------- ------ -------- ------ --- --- ------ ---- - ----\n'
+           '8812345.c sk2067   batch  mn_job   123    1   12  --     24:0 R 01:0\n')
+    out = d.parse_detail(raw)
+    assert out and out[0]['job_id'] == '8812345'
+    assert out[0]['state'] == 'RUNNING'
+    assert out[0]['name'] == 'mn_job'
+    assert out[0]['workdir'] == ''       # PBS 拿不到工作目录
+
+
+def test_query_queue_detail_sentinel_guard():
+    prof = _profile(scheduler='Slurm')
+    client = FakeClient(script=[('squeue', '101|R|j|/w\n')])   # 无哨兵 → 抛错
+    with pytest.raises(RuntimeError):
+        submitter.query_queue_detail(client, prof)
+
+
+# ── 改参续算 ─────────────────────────────────────────────────────────────────
+def _terminal_job(tmp_path, state='NEEDS_HUMAN', fclass='SCF_SLOSHING'):
+    d = _job_dir(tmp_path)
+    m = manifest.load_manifest(d)
+    m['cluster'] = '1w'
+    m['remote_dir'] = '/work/sk2067/jobs/zn_job'
+    m['scheduler_job_id'] = '900'
+    m.setdefault('results', {})['diagnosis'] = {
+        'failure_class': fclass, 'restartable': False, 'evidence': 'dE 不降'}
+    manifest.set_state(m, state)
+    manifest.save_manifest(d, m)
+    return d
+
+
+_CONTCAR = ('C atom\n1.0\n10 0 0\n0 10 0\n0 0 10\nC\n1\nDirect\n0 0 0\n')
+
+
+def test_tune_continue_appends_whitelist_and_resubmits(tmp_path):
+    d = _terminal_job(tmp_path)
+    client = FakeClient(script=[('cat', _CONTCAR), ('qsub', '901.cluster\n')])
+    sftp = FakeSFTP()
+    m = submitter.continue_with_incar_changes(
+        client, sftp, _profile(), d, {'ALGO': 'Normal', 'ISMEAR': '0'})
+    assert m['scheduler_job_id'] == '901'
+    assert m['state'] == 'SUBMITTED'
+    # INCAR 追加块(原文保留 + 白名单键)
+    text = open(os.path.join(d, 'INCAR'), encoding='utf-8').read()
+    assert 'ENCUT = 400' in text and 'ALGO = Normal' in text and 'ISMEAR = 0' in text
+    assert os.path.isfile(os.path.join(d, 'INCAR.bak1'))
+    # 新 INCAR 已上传
+    assert any(r.endswith('/INCAR') for r in sftp.uploaded)
+    # attempts 记录 changes
+    last = m['attempts'][-1]
+    assert last['action'] == 'incar_tuned_restart'
+    assert last['incar_changes'] == {'ALGO': 'Normal', 'ISMEAR': '0'}
+    # 诊断被消费 + 轮次 +1
+    assert 'diagnosis' not in (m['results'] or {})
+    assert m['results']['continue_rounds'] == 1
+
+
+def test_tune_continue_rejects_non_whitelist_key(tmp_path):
+    d = _terminal_job(tmp_path)
+    with pytest.raises(ValueError) as ei:
+        submitter.continue_with_incar_changes(
+            FakeClient(), FakeSFTP(), _profile(), d, {'ENCUT': '500'})
+    assert 'ENCUT' in str(ei.value)
+
+
+def test_tune_continue_refuses_live_job(tmp_path):
+    d = _terminal_job(tmp_path)
+    m = manifest.load_manifest(d)
+    manifest.set_state(m, 'RUNNING')
+    manifest.save_manifest(d, m)
+    with pytest.raises(ValueError):
+        submitter.continue_with_incar_changes(
+            FakeClient(), FakeSFTP(), _profile(), d, {'ALGO': 'Normal'})
+
+
+def test_tune_continue_respects_round_cap(tmp_path):
+    d = _terminal_job(tmp_path)
+    m = manifest.load_manifest(d)
+    m['results']['continue_rounds'] = submitter.CONTINUE_MAX_ROUNDS
+    manifest.save_manifest(d, m)
+    with pytest.raises(RuntimeError):
+        submitter.continue_with_incar_changes(
+            FakeClient(), FakeSFTP(), _profile(), d, {'ALGO': 'Normal'})
+
+
+def test_tune_continue_empty_changes_rejected(tmp_path):
+    d = _terminal_job(tmp_path)
+    with pytest.raises(ValueError):
+        submitter.continue_with_incar_changes(
+            FakeClient(), FakeSFTP(), _profile(), d, {})

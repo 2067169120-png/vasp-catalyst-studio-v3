@@ -78,7 +78,7 @@ def test_refresh_batch_closes_client_and_jump(monkeypatch):
 def test_fetch_batch_closes_client_and_jump(monkeypatch):
     client, jump = _patch_open(monkeypatch)
     monkeypatch.setattr(jobs_tab.submitter, 'fetch_results',
-                        lambda c, s, d: (['CONTCAR'], []))
+                        lambda c, s, d, files=None: (['CONTCAR'], []))
     payload = jobs_tab._fetch_batch(object(), None, ['d1'], False)
     assert payload['results'][0][1] is True
     assert client.closed and jump.closed
@@ -122,7 +122,7 @@ def test_fetch_batch_survives_ssh_exception(monkeypatch):
     from paramiko.ssh_exception import SSHException
     client, jump = _patch_open(monkeypatch)
 
-    def flaky(c, s, d):
+    def flaky(c, s, d, files=None):
         if d == 'bad':
             raise SSHException('boom')
         return (['CONTCAR'], [])
