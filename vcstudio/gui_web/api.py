@@ -20,7 +20,7 @@ class Api:
                  batch_ops_mod=None, ledger_mod=None, manifest_mod=None,
                  submitter_mod=None, config_mod=None, job_builder_mod=None,
                  logic_mod=None, adsorption_mod=None, report_full_mod=None,
-                 dialog_fn=None):
+                 conv_mod=None, dialog_fn=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -29,6 +29,7 @@ class Api:
         from vcstudio.generate import job_builder as _jb
         from vcstudio.gui import logic as _logic
         from vcstudio.project import adsorption as _ads
+        from vcstudio.cluster import convergence as _conv
         self._profiles = profiles_mod or _p
         self._secrets = secrets_mod or _s
         self._ledger = ledger_mod or _l
@@ -40,6 +41,8 @@ class Api:
         # 项目页:adsorption 纯模块(无 matplotlib)即时导入;report_full 牵扯 charts
         # (matplotlib 相邻)故延迟到用时 import(同 batch_ops),测试注入假件即免真依赖。
         self._adsorption = adsorption_mod or _ads
+        # 收敛解析:纯函数模块(零 IO),即时导入,测试注入假件。
+        self._conv = conv_mod or _conv
         self._dialog_fn = dialog_fn        # 测试注入假 dialog;None → 真走 webview
         self._ssh_test = ssh_test_mod      # 重依赖延迟到用时 import
         self._batch_ops = batch_ops_mod
@@ -349,6 +352,29 @@ class Api:
         except Exception as e:                            # noqa: BLE001
             return {'poscar': '', 'incar': '', 'out_dir': '', 'lib_root': '',
                     'error': str(e)}
+
+    def conv_series(self, job_dir):
+        """收敛过程序列(C1):读本地 job_dir/OSZICAR(+OUTCAR 若在)→ 逐离子步
+        E0/ΔE/|F|max。缺 OSZICAR → 结构化 error(提示先拉取);解析异常兜成 error。
+        纯读、不写、不联网;OUTCAR 缺失时降级由 convergence_series 用 notes 说明。
+        """
+        try:
+            d = (job_dir or '').strip()
+            osz_path = os.path.join(d, 'OSZICAR')
+            if not d or not os.path.isfile(osz_path):
+                return {'ok': False, 'series': None,
+                        'error': '该作业尚无本地 OSZICAR,请先拉取该作业结果'}
+            with open(osz_path, 'r', encoding='utf-8', errors='replace') as f:
+                osz_txt = f.read()
+            out_path = os.path.join(d, 'OUTCAR')
+            out_txt = None
+            if os.path.isfile(out_path):
+                with open(out_path, 'r', encoding='utf-8', errors='replace') as f:
+                    out_txt = f.read()
+            series = self._conv.convergence_series(osz_txt, out_txt)
+            return {'ok': True, 'series': series, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'series': None, 'error': str(e)}
 
     def gen_run(self, poscar_path, incar_path, out_dir, lib_root):
         """一键生成(镜像 generate_tab._on_run→build_job_dir→_write_manifest→ledger.register)。

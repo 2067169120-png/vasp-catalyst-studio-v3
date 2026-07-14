@@ -888,3 +888,83 @@ def test_query_workdir_delegates_to_batch_ops():
     out = api.query_workdir(205690, 'c1', None, False)
     assert calls['jid'] == '205690'
     assert out['workdir'] == '/home/u/dir with space'
+
+
+# ── conv_series (C1 收敛过程可视化) ──────────────────────────────────────────
+_OSZICAR_2 = (
+    "DAV:   1     0.11600000E+03   0.116E+03   0.116E+03   864   0.5\n"
+    "DAV:   2    -0.84943000E+02  -0.200E+03  -0.200E+03   912   0.1\n"
+    "   1 F= -.85018175E+02 E0= -.85018175E+02  d E =-.850182E+02\n"
+    "DAV:   1    -0.85000000E+02  -0.100E-01  -0.100E-01   700   0.01\n"
+    "   2 F= -.85120000E+02 E0= -.85120000E+02  d E =-.101825E+00\n"
+)
+_OUTCAR_2 = (
+    " POSITION                                       TOTAL-FORCE (eV/Angst)\n"
+    " -----------------------------------------------------------------------\n"
+    "      0.0      0.0      0.0         0.300000     0.400000     0.000000\n"
+    " -----------------------------------------------------------------------\n"
+    "    total drift:                   0.0 0.0 0.0\n"
+    " POSITION                                       TOTAL-FORCE (eV/Angst)\n"
+    " -----------------------------------------------------------------------\n"
+    "      0.0      0.0      0.0         0.000000     0.030000     0.040000\n"
+    " -----------------------------------------------------------------------\n"
+)
+
+
+def test_conv_series_reads_local_oszicar_and_outcar(tmp_path):
+    (tmp_path / 'OSZICAR').write_text(_OSZICAR_2, encoding='utf-8')
+    (tmp_path / 'OUTCAR').write_text(_OUTCAR_2, encoding='utf-8')
+    api = Api()  # 用真实 convergence 纯模块
+    out = api.conv_series(str(tmp_path))
+    assert out['ok'] is True
+    s = out['series']
+    assert s['steps'] == [1, 2]
+    assert s['E0'][0] == -85.018175
+    assert s['fmax'][0] == 0.5
+    assert s['have_forces'] is True
+
+
+def test_conv_series_missing_oszicar_gives_error(tmp_path):
+    api = Api()
+    out = api.conv_series(str(tmp_path))
+    assert out['ok'] is False
+    assert 'OSZICAR' in out['error']
+
+
+def test_conv_series_no_outcar_degrades(tmp_path):
+    (tmp_path / 'OSZICAR').write_text(_OSZICAR_2, encoding='utf-8')
+    api = Api()
+    out = api.conv_series(str(tmp_path))
+    assert out['ok'] is True
+    assert out['series']['have_forces'] is False
+    assert out['series']['fmax'] == [None, None]
+
+
+def test_conv_series_injects_conv_mod(tmp_path):
+    (tmp_path / 'OSZICAR').write_text('whatever', encoding='utf-8')
+    seen = {}
+
+    def _fake_series(osz, outc=None):
+        seen['osz'] = osz
+        seen['outc'] = outc
+        return {'steps': [1], 'E0': [-1.0], 'dE': [None], 'fmax': [None],
+                'scf_iters': [1], 'have_forces': False, 'notes': []}
+
+    fake = types.SimpleNamespace(convergence_series=_fake_series)
+    api = Api(conv_mod=fake)
+    out = api.conv_series(str(tmp_path))
+    assert out['ok'] is True
+    assert seen['osz'] == 'whatever'
+    assert seen['outc'] is None  # 无 OUTCAR → 传 None
+
+
+def test_conv_series_error_is_caught(tmp_path):
+    (tmp_path / 'OSZICAR').write_text('x', encoding='utf-8')
+
+    def _boom(osz, outc=None):
+        raise RuntimeError('parse boom')
+
+    api = Api(conv_mod=types.SimpleNamespace(convergence_series=_boom))
+    out = api.conv_series(str(tmp_path))
+    assert out['ok'] is False
+    assert 'parse boom' in out['error']
