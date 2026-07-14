@@ -1,2 +1,4 @@
 # 仓库内统一 LF;消除 Windows 下 CRLF 转换警告
 * text=auto eol=lf
+# 例外:cmd 按 GBK+CRLF 解析批处理,LF 会触发字节错位(交接总结 §2 实测坑)
+*.bat eol=crlf
