@@ -44,7 +44,37 @@
   </section>
 
   <section class="page" data-page="jobs" id="page-jobs">
-    <!-- Task 5 填充任务表 -->
+    <div class="pagebar">
+      <h1>任务</h1>
+      <span class="stats" id="jobs-stats">加载中…</span>
+      <span class="sp" style="flex:1"></span>
+      <label style="font-family:var(--mono);font-size:11.5px;color:var(--muted)">目标集群
+        <select id="jobs-profile" class="ipt" style="width:auto;display:inline-block;padding:4px 8px;margin-left:4px"></select>
+      </label>
+    </div>
+    <div class="actions">
+      <button class="btn primary" id="jb-submit">上传并提交</button>
+      <button class="btn" id="jb-status">查询状态</button>
+      <button class="btn" id="jb-fetch">拉回结果</button>
+      <button class="btn" id="jb-continue">续算</button>
+      <button class="btn" id="jb-queue">集群队列</button>
+      <button class="btn" id="jb-open">打开目录</button>
+      <span style="flex:1"></span>
+      <label style="display:flex;align-items:center;gap:5px;color:var(--muted);user-select:none">
+        <input type="checkbox" id="jb-auto"> 自动刷新
+        <select id="jb-interval" class="ipt" style="width:auto;display:inline-block;padding:3px 6px">
+          <option value="5">5 分钟</option>
+          <option value="15" selected>15 分钟</option>
+          <option value="30">30 分钟</option>
+        </select>
+      </label>
+      <button class="btn quiet" id="jb-report" disabled title="P1b 迁移:报告导出依赖项目页">导出报告</button>
+      <button class="btn quiet" id="jb-remove">移出台账</button>
+      <button class="btn quiet" id="jb-clean">清理失效条目</button>
+    </div>
+    <div class="card" id="jobs-card"></div>
+    <div class="sub" id="jobs-stale" style="margin-top:8px;color:var(--warn)"></div>
+    <div class="log" id="jobs-log" data-anchor><div class="head">操作日志</div></div>
   </section>
 
   <section class="page" data-page="cluster" id="page-cluster" hidden>
@@ -52,5 +82,6 @@
   </section>
 </main>
 <script src="app.js"></script>
+<script src="jobs.js"></script>
 </body>
 </html>

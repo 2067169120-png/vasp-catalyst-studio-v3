@@ -149,7 +149,11 @@ const VCS = {
   // 顶插日志到 .log 容器(带 HH:MM:SS 时间戳),保留 200 行。
   // 首次调用时若无容器则建一个挂到当前可见页尾。cls: '' | 'okc' | 'failc'
   log(line, cls = '') {
-    let box = document.querySelector('.log');
+    // 优先用当前可见页自带的日志锚点(如任务页的 #jobs-log / .log[data-anchor]),
+    // 否则退回文档首个 .log,再没有才自动新建 —— 向后兼容 Task 4 行为。
+    const visible = document.querySelector('main section[data-page]:not([hidden])');
+    let box = (visible && visible.querySelector('.log[data-anchor], .log')) ||
+              document.querySelector('.log');
     if (!box) {
       box = document.createElement('div');
       box.className = 'log';
