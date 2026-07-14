@@ -1,0 +1,113 @@
+/* app.css — 控制台感紧凑皮肤。:root/nav/header/pill/table/log 逐字取自
+   docs/superpowers/mockups/mockup_b_console.html,尾部追加 modal/toast/empty/disabled。
+   零 CDN,全本地。 */
+
+/* ── 离线字体(assets/fonts/,合计约 2.3MB woff2) ── */
+@font-face{font-family:'Noto Sans SC';font-style:normal;font-weight:400;font-display:swap;src:url('fonts/noto-sans-sc-400.woff2') format('woff2')}
+@font-face{font-family:'Noto Sans SC';font-style:normal;font-weight:700;font-display:swap;src:url('fonts/noto-sans-sc-700.woff2') format('woff2')}
+@font-face{font-family:'JetBrains Mono';font-style:normal;font-weight:400;font-display:swap;src:url('fonts/jetbrains-mono-400.woff2') format('woff2')}
+
+:root{
+  --bg:#EDF0F3; --surface:#FFFFFF; --ink:#16202B; --muted:#5C6B7C;
+  --accent:#4477AA; --accent-dark:#2E5580; --accent-soft:#E4EDF6;
+  --rule:#DCE2E9; --rule-strong:#B9C4CF;
+  --ok:#1F7A3D; --ok-bg:#E4F2E8; --run:#2F62A0; --run-bg:#E4EDF8;
+  --queue:#5F6B78; --queue-bg:#ECEFF2; --fail:#AD3A28; --fail-bg:#F8E9E5;
+  --warn:#92660F; --warn-bg:#F7EFDC;
+  --sans:"Noto Sans SC","Microsoft YaHei UI","Microsoft YaHei",sans-serif;
+  --mono:"JetBrains Mono","Cascadia Code","Consolas",monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font:13px/1.6 var(--sans);display:flex;min-height:100vh}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+/* ── 左导航:窄 icon+字,仪表台风 ── */
+nav{width:172px;background:#1E2935;color:#93A3B5;padding:20px 0;flex-shrink:0;display:flex;flex-direction:column}
+.brand{padding:0 18px 18px;border-bottom:1px solid #2C3947}
+.brand b{color:#F2F5F8;font-size:14px;display:block;letter-spacing:.02em}
+.brand span{font-family:var(--mono);font-size:10.5px;color:#5E7288}
+nav a{display:flex;align-items:center;gap:9px;padding:8px 18px;color:#93A3B5;text-decoration:none;font-size:13px;border-left:3px solid transparent}
+nav a:hover{color:#DFE7EF;background:#243140}
+nav a.on{color:#FFFFFF;background:#2A3A4C;border-left-color:var(--accent);font-weight:600}
+nav a svg{width:15px;height:15px;stroke:currentColor;stroke-width:1.8;fill:none;flex-shrink:0}
+nav .grp{font-family:var(--mono);font-size:10px;color:#54667A;padding:16px 18px 5px;letter-spacing:.16em}
+nav .foot{margin-top:auto;padding:14px 18px 0;border-top:1px solid #2C3947;font-family:var(--mono);font-size:10.5px;color:#5E7288;line-height:1.9}
+
+/* ── 顶部:连接态 + 队列占用读数条(签名元素) ── */
+main{flex:1;display:flex;flex-direction:column;min-width:0}
+header{display:flex;align-items:center;gap:20px;padding:9px 24px;background:var(--surface);border-bottom:1px solid var(--rule);font-size:12px}
+.dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:6px;vertical-align:1px}
+.dot.g{background:var(--ok);box-shadow:0 0 0 3px var(--ok-bg)}
+.qmeter{display:flex;align-items:center;gap:7px;font-family:var(--mono);font-size:11px;color:var(--muted)}
+.qmeter .bar{width:56px;height:6px;background:#E6EAEF;border-radius:3px;overflow:hidden}
+.qmeter .bar i{display:block;height:100%;background:var(--accent)}
+.qmeter .bar i.hot{background:#C4763B}
+header .sp{flex:1}
+header label{color:var(--muted);user-select:none}
+
+.page{padding:18px 24px 32px}
+.pagebar{display:flex;align-items:baseline;gap:14px;margin-bottom:12px}
+.pagebar h1{font-size:17px;font-weight:700}
+.pagebar .stats{font-family:var(--mono);font-size:11.5px;color:var(--muted)}
+.pagebar .stats b{color:var(--ink)}
+
+.actions{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap}
+.btn{font:600 12px/1 var(--sans);padding:7px 13px;border-radius:5px;border:1px solid var(--rule-strong);background:var(--surface);color:var(--ink);cursor:pointer}
+.btn:hover{border-color:var(--accent);color:var(--accent-dark)}
+.btn.primary{background:var(--accent);border-color:var(--accent-dark);color:#fff}
+.btn.primary:hover{background:var(--accent-dark)}
+.btn.quiet{border-color:transparent;color:var(--muted);background:transparent}
+.btn.quiet:hover{color:var(--accent-dark);background:var(--accent-soft)}
+
+/* ── 密表:32px 行高、行内 sparkline ── */
+.card{background:var(--surface);border:1px solid var(--rule);border-radius:6px;overflow:hidden}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+thead th{text-align:left;font-weight:600;color:var(--muted);font-size:11px;letter-spacing:.06em;padding:7px 10px;background:#F4F6F8;border-bottom:1px solid var(--rule-strong);position:sticky;top:0}
+tbody td{padding:6px 10px;border-bottom:1px solid var(--rule);height:32px}
+tbody tr:hover td{background:var(--accent-soft)}
+tbody tr.sel td{background:#DFEAF5;box-shadow:inset 3px 0 0 var(--accent)}
+td.mono,th.mono{font-family:var(--mono);font-size:11.5px}
+td.num,th.num{text-align:right;font-family:var(--mono);font-size:11.5px;font-variant-numeric:tabular-nums}
+.name{font-weight:600;font-size:12.5px}
+.sub{color:var(--muted);font-family:var(--mono);font-size:10.5px}
+
+.pill{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;padding:2px 8px;border-radius:4px;font-family:var(--mono)}
+.pill i{width:6px;height:6px;border-radius:50%}
+.pill.run{background:var(--run-bg);color:var(--run)} .pill.run i{background:var(--run)}
+.pill.q{background:var(--queue-bg);color:var(--queue)} .pill.q i{background:var(--queue)}
+.pill.ok{background:var(--ok-bg);color:var(--ok)} .pill.ok i{background:var(--ok)}
+.pill.fail{background:var(--fail-bg);color:var(--fail)} .pill.fail i{background:var(--fail)}
+.pill.warn{background:var(--warn-bg);color:var(--warn)} .pill.warn i{background:var(--warn)}
+.spark{vertical-align:middle}
+.spark polyline{fill:none;stroke:var(--accent);stroke-width:1.4}
+.spark.flat polyline{stroke:var(--rule-strong)}
+.re{color:var(--accent-dark);font-weight:600}
+.diag{font-size:11.5px;color:var(--muted)}
+
+/* 日志:终端读数 */
+.log{margin-top:14px;background:#1E2935;border-radius:6px;padding:12px 16px;font-family:var(--mono);font-size:11.5px;line-height:1.85;color:#A9B8C8}
+.log .t{color:#5E7288;margin-right:10px}
+.log .okc{color:#6FBF8B}
+.log .failc{color:#D98A7A}
+.log .head{color:#7E93A9;font-size:10px;letter-spacing:.14em;margin-bottom:4px}
+@media (prefers-reduced-motion: reduce){*{transition:none!important}}
+
+/* ── 追加组件(Task 4):modal / toast / empty / disabled / 输入框 ── */
+.ipt{width:100%;font:13px/1.4 var(--sans);padding:8px 11px;border:1px solid var(--rule-strong);border-radius:5px;background:var(--surface);color:var(--ink)}
+.ipt:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+
+.modal-mask{position:fixed;inset:0;background:rgba(22,32,43,.45);display:flex;align-items:center;justify-content:center;z-index:100}
+.modal{background:var(--surface);border:1px solid var(--rule-strong);border-radius:8px;box-shadow:0 12px 40px rgba(22,32,43,.28);width:min(440px,92vw);max-height:88vh;overflow:auto}
+.modal .m-title{font-size:14px;font-weight:700;padding:16px 20px 12px;border-bottom:1px solid var(--rule)}
+.modal .m-body{padding:16px 20px;font-size:13px;color:var(--ink);line-height:1.7}
+.modal .m-actions{display:flex;justify-content:flex-end;gap:8px;padding:12px 20px 16px;border-top:1px solid var(--rule)}
+
+.toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:#1E2935;color:#DFE7EF;font-size:12.5px;padding:10px 18px;border-radius:6px;box-shadow:0 8px 24px rgba(22,32,43,.32);z-index:120;max-width:80vw}
+.toast.ok{border-left:3px solid var(--ok)}
+.toast.fail{border-left:3px solid var(--fail)}
+
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;text-align:center;padding:64px 24px;color:var(--muted)}
+.empty p{font-size:13.5px;line-height:1.8;max-width:520px}
+.empty code{font-family:var(--mono);font-size:12px;background:var(--accent-soft);color:var(--accent-dark);padding:1px 6px;border-radius:4px}
+
+button:disabled{opacity:.5;cursor:not-allowed}

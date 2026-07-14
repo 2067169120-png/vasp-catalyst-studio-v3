@@ -1,1 +1,56 @@
-<!doctype html><title>vcstudio</title>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VASP Catalyst Studio</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<nav>
+  <div class="brand"><b>VASP Catalyst Studio</b><span>v2 · Li–S 催化剂</span></div>
+  <div class="grp">工作流</div>
+  <a href="#" data-page="dashboard"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>仪表盘</a>
+  <a href="#" data-page="generate"><svg viewBox="0 0 24 24"><path d="M12 3v18M3 12h18"/><circle cx="12" cy="12" r="9"/></svg>生成输入</a>
+  <a href="#" data-page="project"><svg viewBox="0 0 24 24"><path d="M3 7l9-4 9 4-9 4-9-4zM3 7v10l9 4 9-4V7"/></svg>吸附能项目</a>
+  <a href="#" data-page="jobs" class="on"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>任务</a>
+  <div class="grp">环境</div>
+  <a href="#" data-page="cluster"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="1"/><rect x="3" y="13" width="18" height="7" rx="1"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>集群</a>
+  <div class="foot">Maple123@1w<br>PBS · torque-6.1.2</div>
+</nav>
+<main>
+  <header>
+    <span id="conn"><span class="dot g"></span>桥就绪检测中…</span>
+    <span class="sp"></span>
+    <label><input type="checkbox" id="autorefresh"> 自动刷新 15m</label>
+  </header>
+
+  <section class="page" data-page="dashboard" hidden>
+    <div class="empty">
+      <p>仪表盘页本期在 P1b 迁移。请先用旧版:<br><code>python -m vcstudio.gui</code></p>
+    </div>
+  </section>
+
+  <section class="page" data-page="generate" hidden>
+    <div class="empty">
+      <p>生成输入页本期在 P1b 迁移。请先用旧版:<br><code>python -m vcstudio.gui</code></p>
+    </div>
+  </section>
+
+  <section class="page" data-page="project" hidden>
+    <div class="empty">
+      <p>吸附能项目页本期在 P1b 迁移。请先用旧版:<br><code>python -m vcstudio.gui</code></p>
+    </div>
+  </section>
+
+  <section class="page" data-page="jobs" id="page-jobs">
+    <!-- Task 5 填充任务表 -->
+  </section>
+
+  <section class="page" data-page="cluster" id="page-cluster" hidden>
+    <!-- Task 6 填充集群管理 -->
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
