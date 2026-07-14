@@ -78,10 +78,103 @@
   </section>
 
   <section class="page" data-page="cluster" id="page-cluster" hidden>
-    <!-- Task 6 填充集群管理 -->
+    <div class="pagebar">
+      <h1>集群</h1>
+      <span class="stats">连接配置 · 测试连接 · 提交脚本预览</span>
+      <span class="sp" style="flex:1"></span>
+      <label style="font-family:var(--mono);font-size:11.5px;color:var(--muted)">现有集群
+        <select id="cl-profile" class="ipt" style="width:auto;display:inline-block;padding:4px 8px;margin-left:4px"></select>
+      </label>
+      <button class="btn" id="cl-new">新建</button>
+      <button class="btn quiet" id="cl-delete">删除</button>
+    </div>
+
+    <div class="warn-banner" id="cl-warn" hidden></div>
+
+    <!-- 连接 -->
+    <div class="card" style="padding:16px;margin-bottom:14px">
+      <div class="cl-h">连接</div>
+      <div class="cl-grid">
+        <label class="fld">集群名称<input id="cl-name" class="ipt" autocomplete="off"></label>
+        <label class="fld">主机名<input id="cl-hostname" class="ipt" autocomplete="off" placeholder="127.0.0.1 或登录节点地址"></label>
+        <label class="fld">端口<input id="cl-port" class="ipt" inputmode="numeric" placeholder="22"></label>
+        <label class="fld">用户名<input id="cl-username" class="ipt" autocomplete="off"></label>
+      </div>
+      <div class="row span2" style="margin-top:14px">
+        <span style="font-size:11.5px;color:var(--muted)">认证方式</span>
+        <label class="rad"><input type="radio" name="cl-auth" value="key" checked> SSH 密钥</label>
+        <label class="rad"><input type="radio" name="cl-auth" value="password"> 密码</label>
+        <span class="sub" style="font-family:var(--mono)">密码不写入 yaml,仅在测试连接时经系统凭据库保存</span>
+      </div>
+      <label class="fld span2" id="cl-keyrow" style="margin-top:12px">密钥文件路径<input id="cl-keypath" class="ipt" autocomplete="off" placeholder="C:\\Users\\you\\.ssh\\id_rsa"></label>
+    </div>
+
+    <!-- 跳板机 -->
+    <div class="card" style="padding:16px;margin-bottom:14px">
+      <div class="cl-h">跳板机(可选)</div>
+      <label class="rad" style="margin-bottom:12px"><input type="checkbox" id="cl-usejump"> 经跳板机连接</label>
+      <div class="row">
+        <label class="fld" style="flex:2 1 220px">跳板主机<input id="cl-jumphost" class="ipt" autocomplete="off" placeholder="58.198.180.52"></label>
+        <label class="fld" style="flex:1 1 140px">跳板用户<input id="cl-jumpuser" class="ipt" autocomplete="off"></label>
+        <label class="fld" style="flex:0 0 100px">跳板端口<input id="cl-jumpport" class="ipt" inputmode="numeric" placeholder="22"></label>
+      </div>
+    </div>
+
+    <!-- 调度器 -->
+    <div class="card" style="padding:16px;margin-bottom:14px">
+      <div class="cl-h">调度器</div>
+      <div class="row">
+        <label class="fld" style="flex:0 0 140px">类型
+          <select id="cl-scheduler" class="ipt">
+            <option value="Slurm">Slurm</option>
+            <option value="PBS">PBS</option>
+            <option value="LSF">LSF</option>
+            <option value="Shell">Shell</option>
+          </select>
+        </label>
+        <label class="fld" style="flex:1 1 300px">命令目录 scheduler_bin<input id="cl-schedbin" class="ipt" autocomplete="off" placeholder="/opt/torque-6.1.2/bin"></label>
+      </div>
+      <div class="hint">调度器不在 PATH 时必填,如 1w 的 /opt/torque-6.1.2/bin</div>
+      <label class="fld" style="margin-top:14px">远程工作目录 remote_root<input id="cl-remoteroot" class="ipt" autocomplete="off" placeholder="/home/Maple123/done"></label>
+    </div>
+
+    <!-- 资源参数 -->
+    <div class="card" style="padding:16px;margin-bottom:14px">
+      <div class="cl-h">资源参数(自动生成脚本用)</div>
+      <div class="row">
+        <label class="fld" style="flex:1 1 160px">队列/分区<input id="cl-queue" class="ipt" autocomplete="off" placeholder="batch"></label>
+        <label class="fld" style="flex:0 0 90px">节点<input id="cl-nodes" class="ipt" inputmode="numeric" placeholder="1"></label>
+        <label class="fld" style="flex:0 0 110px">每节点核数<input id="cl-ppn" class="ipt" inputmode="numeric" placeholder="24"></label>
+        <label class="fld" style="flex:0 0 130px">墙钟<input id="cl-walltime" class="ipt" autocomplete="off" placeholder="24:00:00"></label>
+      </div>
+      <label class="fld span2" style="margin-top:14px">环境准备(每行一条 module load / source)
+        <textarea id="cl-env" class="ipt" rows="3" placeholder="source /home/.../mklvars.sh intel64"></textarea>
+      </label>
+      <label class="fld span2" style="margin-top:12px">VASP 命令<input id="cl-vaspcmd" class="ipt" autocomplete="off" placeholder="mpirun -np 24 -machinefile $PBS_NODEFILE .../vasp_std &gt; log 2&gt;&amp;1"></label>
+    </div>
+
+    <!-- 提交脚本 -->
+    <div class="card" style="padding:16px;margin-bottom:14px">
+      <div class="cl-h">提交脚本</div>
+      <div class="row" style="gap:20px;margin-bottom:12px">
+        <label class="rad"><input type="radio" name="cl-mode" value="auto" checked> 自动生成(用上面的资源参数)</label>
+        <label class="rad"><input type="radio" name="cl-mode" value="template"> 使用我的模板(逐字复用,只填占位符)</label>
+      </div>
+      <label class="fld span2">模板文件路径<input id="cl-template" class="ipt" autocomplete="off" placeholder="C:\\Users\\you\\my_submit.pbs"></label>
+      <div class="hint">占位符:{job_name} {queue} {nodes} {ppn} {walltime} {remote_dir}(兼容旧写法 {short} {cores} {dir})</div>
+    </div>
+
+    <div class="actions">
+      <button class="btn primary" id="cl-save">保存</button>
+      <button class="btn" id="cl-test">测试连接</button>
+      <button class="btn" id="cl-preview">预览 job 脚本</button>
+    </div>
+
+    <div class="log" id="cluster-log" data-anchor><div class="head">连接日志</div></div>
   </section>
 </main>
 <script src="app.js"></script>
 <script src="jobs.js"></script>
+<script src="cluster.js"></script>
 </body>
 </html>
