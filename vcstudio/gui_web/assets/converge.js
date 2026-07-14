@@ -18,6 +18,7 @@
     wrap.appendChild(chartEl);
 
     let chart = null;
+    let closed = false;
     const onResize = function () { if (chart) chart.resize(); };
 
     const m = VCS.modal({
@@ -29,12 +30,14 @@
     // 关闭/取消(遮罩/Esc 都走 handle.close)时释放图表与监听,防泄漏。
     const closeInner = m.close;
     m.close = function () {
+      closed = true;
       window.removeEventListener('resize', onResize);
       if (chart) { chart.dispose(); chart = null; }
       closeInner();
     };
 
     const out = await VCS.call('conv_series', jobDir);
+    if (closed) return;   // 加载期间模态已关闭:放弃渲染,避免图表建在游离节点/监听泄漏
     if (!out || out.error || !out.ok) {
       note.className = 'conv-note warn-banner';
       note.textContent = (out && out.error) || '读取收敛数据失败';

@@ -114,3 +114,18 @@ DAV:   1    -0.86000000E+02  -0.1E-01  -0.1E-01   700   0.01
 def test_parse_outcar_no_force_blocks():
     assert convergence.parse_outcar_fmax('header only, no forces\n') == []
     assert convergence.parse_outcar_fmax('') == []
+
+
+def test_parse_outcar_tolerates_field_overflow_row():
+    """Fortran F13 字段打满成 ****(6 列但非数)时,跳过该原子行而非终止整块。"""
+    text = (
+        " POSITION                          TOTAL-FORCE (eV/Angst)\n"
+        " -------------------------------------------------------\n"
+        "      0.0   0.0   0.0    ************ 0.030000  0.040000\n"  # 溢出行,跳过
+        "      1.0   1.0   1.0    0.300000     0.400000  0.000000\n"  # |F|=0.5
+        " -------------------------------------------------------\n"
+        "    total drift:         0.0 0.0 0.0\n"
+    )
+    fmax = convergence.parse_outcar_fmax(text)
+    assert len(fmax) == 1            # 块未被溢出行提前截断
+    assert fmax[0] == pytest.approx(0.5)

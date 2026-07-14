@@ -73,11 +73,14 @@ def parse_outcar_fmax(text: str) -> list[float]:
         while i < n:
             row = lines[i].split()
             if len(row) != 6:
-                break
+                break               # 结构终止(分隔虚线/total drift 行),块结束
             try:
                 fx, fy, fz = float(row[3]), float(row[4]), float(row[5])
             except ValueError:
-                break
+                # 6 列但非数值:Fortran F13 字段打满成 ****(力过大),跳过该
+                # 原子行(其真值不可恢复,|F|max 取余下原子)而非终止整块。
+                i += 1
+                continue
             mag = math.sqrt(fx * fx + fy * fy + fz * fz)
             if mag > cur_max:
                 cur_max = mag
