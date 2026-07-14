@@ -786,6 +786,88 @@ def test_proj_report_no_members_error():
     assert out['ok'] is False and out['file'] is None and '成员' in out['error']
 
 
+# ── adopt_root_get / adopt_root_set(认领本地根目录配置) ──────────────────────
+def test_adopt_root_get_default_when_unset():
+    api = Api(config_mod=_fake_config(ui={}))
+    out = api.adopt_root_get()
+    assert out['root'] == os.path.join(os.path.expanduser('~'), 'vcstudio_jobs')
+
+
+def test_adopt_root_get_returns_configured():
+    api = Api(config_mod=_fake_config(ui={'adopt_root': 'E:\\claimed'}))
+    out = api.adopt_root_get()
+    assert out['root'] == 'E:\\claimed'
+
+
+def test_adopt_root_get_error_falls_back_to_default():
+    boom = types.SimpleNamespace(
+        get_ui_state=lambda c=None: (_ for _ in ()).throw(RuntimeError('config坏了')))
+    api = Api(config_mod=boom)
+    out = api.adopt_root_get()
+    assert out['root'] == os.path.join(os.path.expanduser('~'), 'vcstudio_jobs')
+
+
+def test_adopt_root_set_persists_via_ui_state():
+    calls = {}
+    api = Api(config_mod=_fake_config(calls=calls))
+    out = api.adopt_root_set('E:\\myroot')
+    assert out['ok'] is True and out['error'] is None
+    assert calls['ui_state'] == {'adopt_root': 'E:\\myroot'}
+
+
+def test_adopt_root_set_rejects_blank():
+    api = Api(config_mod=_fake_config())
+    out = api.adopt_root_set('   ')
+    assert out['ok'] is False and out['error']
+
+
+def test_adopt_root_set_error_is_caught():
+    boom = types.SimpleNamespace(
+        set_ui_state=lambda **kv: (_ for _ in ()).throw(OSError('磁盘满')))
+    api = Api(config_mod=boom)
+    out = api.adopt_root_set('E:\\x')
+    assert out['ok'] is False and '磁盘满' in out['error']
+
+
+# ── adopt_all(委托 batch_ops.adopt_scan,known_ids 从台账,root 从配置) ────────
+def test_adopt_all_delegates_with_known_ids_and_root():
+    calls = {}
+    bo = types.SimpleNamespace(adopt_scan=lambda prof, pw, tn, known, root:
+        calls.update(known=known, root=root, tn=tn) or
+        {'needs_trust': False, 'results': [['200', True, '已认领 → X']]})
+    entries = [
+        ('/a', {'scheduler_job_id': '100'}),
+        ('/b', {'scheduler_job_id': '200'}),
+        ('/c', {'state': 'DONE'}),                       # 无作业号 → 不入 known
+        ('/gone', None),                                 # 失效条目 → 不入 known
+    ]
+    store = {'c1': ClusterProfile(name='c1', auth='key', key_path='/k')}
+    api = Api(profiles_mod=_fake_profiles(store), batch_ops_mod=bo,
+              ledger_mod=_fake_ledger(entries, []),
+              config_mod=_fake_config(ui={'adopt_root': 'E:\\root'}))
+    out = api.adopt_all('c1', None, True)
+    assert calls['known'] == {'100', '200'} and calls['tn'] is True
+    assert calls['root'] == 'E:\\root'
+    assert out['results'][0][1] is True
+
+
+def test_adopt_all_unknown_profile_error():
+    api = Api(profiles_mod=_fake_profiles({}), ledger_mod=_fake_ledger([], []),
+              config_mod=_fake_config())
+    out = api.adopt_all('nope', None, False)
+    assert out.get('error') and '集群' in out['error']
+
+
+def test_adopt_all_batch_ops_exception_caught():
+    bo = types.SimpleNamespace(
+        adopt_scan=lambda *a, **k: (_ for _ in ()).throw(RuntimeError('连不上')))
+    store = {'c1': ClusterProfile(name='c1', auth='key', key_path='/k')}
+    api = Api(profiles_mod=_fake_profiles(store), batch_ops_mod=bo,
+              ledger_mod=_fake_ledger([], []), config_mod=_fake_config())
+    out = api.adopt_all('c1', None, False)
+    assert '连不上' in out['error']
+
+
 def test_query_workdir_delegates_to_batch_ops():
     import types
     calls = {}

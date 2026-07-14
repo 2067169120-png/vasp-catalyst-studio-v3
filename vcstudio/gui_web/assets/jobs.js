@@ -330,13 +330,40 @@
     const res = await remote(name, (pw, trust) => VCS.call('queue_detail', name, pw, trust));
     if (!res) return;
     if (res.error) { VCS.log('队列查询异常:' + res.error, 'failc'); return; }
-    showQueueModal(name, res.jobs || []);
+    await showQueueModal(name, res.jobs || []);
   }
 
-  function showQueueModal(name, jobs) {
+  // 作业名/号 → 安全本地目录段(与后端 batch_ops._sanitize_seg 同口径)
+  function sanitizeSeg(s) {
+    const seg = String(s || '').replace(/[^A-Za-z0-9_.-]/g, '_');
+    return seg || '_';
+  }
+  // 本地根 + 作业名 → 预填本地目录(客户端以 '\\' 拼,可改)
+  function joinLocal(root, name) {
+    const r = String(root || '').replace(/[\\/]+$/, '');
+    const seg = sanitizeSeg(name);
+    return r ? r + '\\' + seg : seg;
+  }
+
+  async function showQueueModal(name, jobs) {
     const known = new Set(State.rows.filter(r => r.job_id).map(r => String(r.job_id)));
     if (!jobs.length) VCS.log(`「${name}」队列为空(该用户当前没有在队/在跑作业)`);
-    let h = '<div style="max-height:52vh;overflow:auto"><table><thead><tr>' +
+    // 认领本地根目录(未配置 → 后端给默认 %USERPROFILE%\vcstudio_jobs)
+    const rr = await VCS.call('adopt_root_get');
+    let root = (rr && rr.root) || '';
+    const unmanaged = jobs.filter(j => !known.has(String(j.job_id)));
+
+    // 顶部头行:一键认领全部未纳入(N,为 0 时隐藏)+ 当前认领根目录 + 修改链接
+    const header =
+      '<div style="display:flex;justify-content:space-between;align-items:center;' +
+      'gap:10px;margin-bottom:8px;flex-wrap:wrap">' +
+      '<div>' + (unmanaged.length
+        ? `<button class="btn primary" id="adopt-all-btn">一键认领全部未纳入(${unmanaged.length})</button>`
+        : '') + '</div>' +
+      '<div class="sub">本地根目录:<span id="adopt-root-val" class="mono">' +
+      `${VCS.esc(root)}</span> <a href="#" id="adopt-root-edit">修改</a></div></div>`;
+
+    let h = header + '<div style="max-height:52vh;overflow:auto"><table><thead><tr>' +
       '<th class="mono">作业号</th><th>状态</th><th>作业名</th><th>远程目录</th><th>纳管</th>' +
       '</tr></thead><tbody>';
     jobs.forEach((j, i) => {
@@ -352,38 +379,94 @@
     });
     h += '</tbody></table></div>' +
       '<p class="sub" style="margin-top:8px">「认领」= 把不是本软件提交的作业(如终端手动 qsub)' +
-      '纳入台账,之后可查状态/拉回/续算。</p>';
+      '纳入台账,之后可查状态/拉回/续算。「一键认领」自动补远程工作目录,本地目录建在根目录下。</p>';
     const m = VCS.modal({
       title: `集群队列 — ${name}`,
       bodyHTML: h,
       actions: [{ label: '关闭', onClick: mm => mm.close() }],
     });
+
+    // 修改认领根目录(prompt 式 modal → adopt_root_set)
+    const editLink = m.el.querySelector('#adopt-root-edit');
+    if (editLink) editLink.addEventListener('click', e => {
+      e.preventDefault();
+      editAdoptRoot(root, newRoot => {
+        root = newRoot;
+        const val = m.el.querySelector('#adopt-root-val');
+        if (val) val.textContent = newRoot;
+      });
+    });
+
+    // 一键认领全部未纳入
+    const allBtn = m.el.querySelector('#adopt-all-btn');
+    if (allBtn) allBtn.addEventListener('click', async () => {
+      const ok = await VCS.confirm(
+        `将认领 ${unmanaged.length} 个作业,本地目录建在 ${root} 下`);
+      if (!ok) return;
+      m.close();
+      VCS.log(`一键认领 ${unmanaged.length} 个未纳入作业(自动补远程目录)…`);
+      const res = await remote(name, (pw, trust) => VCS.call('adopt_all', name, pw, trust));
+      if (!res) return;
+      if (res.error) { VCS.log('一键认领异常:' + res.error, 'failc'); return; }
+      logResults(res.results, true);
+      await reload();
+    });
+
+    // 单个认领
     m.el.querySelectorAll('button[data-claim]').forEach(btn => {
       btn.addEventListener('click', () => {
         const j = jobs[+btn.dataset.claim];
-        askAdopt(name, j, () => { if (btn.parentNode) btn.parentNode.textContent = '已纳管'; });
+        askAdopt(name, j, root, () => {
+          if (btn.parentNode) btn.parentNode.textContent = '已纳管';
+        });
       });
     });
   }
 
-  function askAdopt(name, j, onDone) {
+  // 修改认领根目录:prompt 式 modal
+  function editAdoptRoot(current, onSaved) {
+    const body =
+      '<div class="sub" style="margin-bottom:4px">认领作业时,本地目录建在此根目录下</div>' +
+      `<input id="ar-input" class="ipt" value="${VCS.esc(current || '')}" placeholder="例如 E:\\runs">`;
+    VCS.modal({
+      title: '设置认领根目录',
+      bodyHTML: body,
+      actions: [
+        { label: '取消', quiet: true, onClick: mm => mm.close() },
+        { label: '保存', primary: true, onClick: async mm => {
+            const v = mm.el.querySelector('#ar-input').value.trim();
+            if (!v) { VCS.toast('根目录不能为空', 'fail'); return; }
+            const r = await VCS.call('adopt_root_set', v);
+            if (r && r.error) { VCS.log('保存根目录失败:' + r.error, 'failc'); return; }
+            mm.close();
+            VCS.log('认领根目录已更新:' + v, 'okc');
+            if (onSaved) onSaved(v);
+          } },
+      ],
+    });
+  }
+
+  function askAdopt(name, j, root, onDone) {
+    const localDefault = joinLocal(root, j.name || j.job_id);
+    const hasWd = !!(j.workdir && j.workdir.trim());
     const body =
       `<div style="margin-bottom:10px"><div class="sub" style="margin-bottom:4px">远程目录(绝对路径,以 / 开头)</div>` +
-      `<input id="ad-remote" class="ipt" value="${VCS.esc(j.workdir || '')}" placeholder="/home/Maple123/..."></div>` +
+      `<input id="ad-remote" class="ipt" value="${VCS.esc(j.workdir || '')}" ` +
+      `placeholder="${hasWd ? '/home/Maple123/...' : '查询中…'}"></div>` +
       `<div><div class="sub" style="margin-bottom:4px">本地目录(结果将拉回到这里;不存在会新建)</div>` +
-      `<input id="ad-local" class="ipt" placeholder="例如 E:\\runs\\claimed_${VCS.esc(j.job_id)}"></div>`;
-    VCS.modal({
+      `<input id="ad-local" class="ipt" value="${VCS.esc(localDefault)}" placeholder="例如 E:\\runs\\claimed_${VCS.esc(j.job_id)}"></div>`;
+    const m = VCS.modal({
       title: `认领作业 ${VCS.esc(j.job_id)}${j.name ? ' · ' + VCS.esc(j.name) : ''}`,
       bodyHTML: body,
       actions: [
         { label: '取消', quiet: true, onClick: mm => mm.close() },
         { label: '认领', primary: true, onClick: async mm => {
-            const remote = mm.el.querySelector('#ad-remote').value.trim();
+            const remoteDir = mm.el.querySelector('#ad-remote').value.trim();
             const local = mm.el.querySelector('#ad-local').value.trim();
             if (!local) { VCS.toast('请填写本地目录', 'fail'); return; }
-            if (!remote) { VCS.toast('请填写远程目录', 'fail'); return; }
+            if (!remoteDir) { VCS.toast('请填写远程目录', 'fail'); return; }
             mm.close();
-            const r = await VCS.call('adopt_job', local, name, String(j.job_id), remote, j.name || '');
+            const r = await VCS.call('adopt_job', local, name, String(j.job_id), remoteDir, j.name || '');
             if (r && r.error) { VCS.log('认领失败:' + r.error, 'failc'); return; }
             VCS.log(`已认领作业 ${j.job_id} → ${local}(下次「查询状态」即可追踪)`, 'okc');
             if (onDone) onDone();
@@ -391,6 +474,16 @@
           } },
       ],
     });
+    // 远程目录为空 → 自动查询工作目录预填(占位符「查询中…」直到返回)
+    if (!hasWd) {
+      const inp = m.el.querySelector('#ad-remote');
+      remote(name, (pw, trust) => VCS.call('query_workdir', String(j.job_id), name, pw, trust))
+        .then(res => {
+          if (!inp) return;
+          if (res && res.workdir && !inp.value.trim()) inp.value = res.workdir;
+          inp.placeholder = '/home/Maple123/...';
+        });
+    }
   }
 
   // ── 打开目录 / 移出台账 / 清理失效 ─────────────────────────────────────────

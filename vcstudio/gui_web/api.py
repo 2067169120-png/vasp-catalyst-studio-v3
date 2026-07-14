@@ -254,6 +254,42 @@ class Api:
                                   prof, pw, str(job_id), bool(trust_new)))
 
     # ── 任务:认领外部作业 ──
+    def _adopt_root_default(self):
+        return os.path.join(os.path.expanduser('~'), 'vcstudio_jobs')
+
+    def adopt_root_get(self):
+        """认领本地根目录(未配置 → %USERPROFILE%\\vcstudio_jobs)。"""
+        default = self._adopt_root_default()
+        try:
+            ui = self._config.get_ui_state()
+            return {'root': (ui.get('adopt_root') or default)}
+        except Exception:                                 # noqa: BLE001 读配置失败退默认
+            return {'root': default}
+
+    def adopt_root_set(self, path):
+        """持久化认领本地根目录(config ui_state)。"""
+        try:
+            p = (path or '').strip()
+            if not p:
+                return {'ok': False, 'error': '认领根目录不能为空'}
+            self._config.set_ui_state(adopt_root=p)
+            return {'ok': True, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def adopt_all(self, name, password, trust_new=False):
+        """一键认领全部未纳入作业:一次连接完成 明细→补目录→落认领(委托 adopt_scan)。
+
+        known_ids = 台账里所有带调度器作业号的作业(str);root 从 adopt_root_get。
+        """
+        def _scan(prof, pw):
+            known_ids = {str(m['scheduler_job_id'])
+                         for _d, m in self._ledger.load_all()
+                         if m and m.get('scheduler_job_id')}
+            root = self.adopt_root_get().get('root')
+            return self._bo().adopt_scan(prof, pw, bool(trust_new), known_ids, root)
+        return self._delegate(name, password, _scan)
+
     def adopt_job(self, local_dir, name, job_id, remote_dir, job_name=''):
         try:
             prof = self._profiles.load_profiles().get(name)

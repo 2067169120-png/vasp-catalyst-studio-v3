@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 from vcstudio.cluster import submitter
 from vcstudio.cluster.connection import open_client, close_quiet, ConnectError
@@ -146,6 +147,53 @@ def queue_detail(prof, pw, trust_new):
     finally:
         close_quiet(client, jump)
     return {'needs_trust': False, 'jobs': jobs}
+
+
+def _sanitize_seg(name: str) -> str:
+    """作业名 → 安全本地目录段:保留 [A-Za-z0-9_.-],其余替换 '_';空则 '_'。"""
+    s = re.sub(r'[^A-Za-z0-9_.-]', '_', str(name or ''))
+    return s or '_'
+
+
+def adopt_scan(prof, pw, trust_new, known_ids, local_root):
+    """一键认领:一次连接完成 队列明细 → 补工作目录 → 逐个落 adopt_external_job。
+
+    known_ids: 已纳管的调度器作业号集合(str);local_root: 本地目录根。
+    对每个 str(job_id) 不在 known_ids 的队列作业:
+      - workdir = job['workdir'] 或(空时)同连接内 submitter.query_workdir(不重连);
+      - 有 workdir → local_dir = local_root/<sanitize(作业名或job_id)>(makedirs)→ 认领;
+      - 查不到 workdir → 标记需手填(交前端走单个认领弹窗)。
+    已纳管作业跳过(不入 results)。返回 {'needs_trust', 'results': [[job_id, ok, msg]]}。
+    """
+    try:
+        client, jump = open_client(prof, pw, trust_new=trust_new)
+    except ConnectError as e:
+        if e.needs_trust:
+            return {'needs_trust': True, 'message': str(e), 'results': []}
+        raise RuntimeError(str(e))
+    known = {str(k) for k in (known_ids or [])}
+    results = []
+    try:
+        jobs = submitter.query_queue_detail(client, prof)
+        for j in jobs:
+            jid = str(j.get('job_id'))
+            if jid in known:
+                continue                                 # 已纳管:静默跳过
+            workdir = j.get('workdir') or submitter.query_workdir(client, prof, jid)
+            if not workdir:
+                results.append([jid, False, '查不到工作目录,请单个认领手填'])
+                continue
+            local_dir = os.path.join(local_root, _sanitize_seg(j.get('name') or jid))
+            try:
+                os.makedirs(local_dir, exist_ok=True)
+                submitter.adopt_external_job(local_dir, prof, jid, workdir,
+                                             name=j.get('name', ''))
+                results.append([jid, True, f'已认领 → {local_dir}'])
+            except _job_errors() as e:
+                results.append([jid, False, str(e)])
+    finally:
+        close_quiet(client, jump)
+    return {'needs_trust': False, 'results': results}
 
 
 def tune_batch(prof, pw, job_dir, changes, trust_new, from_contcar=True):
