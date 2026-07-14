@@ -225,6 +225,12 @@ class Api:
                               lambda prof, pw: self._bo().queue_detail(
                                   prof, pw, bool(trust_new)))
 
+    def query_workdir(self, job_id, name, password, trust_new=False):
+        """认领辅助:按作业号查远程工作目录(PBS qstat -f;查不到 workdir='')。"""
+        return self._delegate(name, password,
+                              lambda prof, pw: self._bo().workdir_lookup(
+                                  prof, pw, str(job_id), bool(trust_new)))
+
     # ── 任务:认领外部作业 ──
     def adopt_job(self, local_dir, name, job_id, remote_dir, job_name=''):
         try:

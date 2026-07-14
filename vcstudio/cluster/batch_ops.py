@@ -118,6 +118,21 @@ def continue_batch(prof, pw, dirs, trust_new):
     return {'needs_trust': False, 'results': results}
 
 
+def workdir_lookup(prof, pw, job_id, trust_new):
+    """单作业远程工作目录查询线程体(P1b 认领免手填;PBS qstat -f,Slurm 直接空)。"""
+    try:
+        client, jump = open_client(prof, pw, trust_new=trust_new)
+    except ConnectError as e:
+        if e.needs_trust:
+            return {'needs_trust': True, 'message': str(e), 'workdir': ''}
+        raise RuntimeError(str(e))
+    try:
+        wd = submitter.query_workdir(client, prof, str(job_id))
+    finally:
+        close_quiet(client, jump)
+    return {'needs_trust': False, 'workdir': wd}
+
+
 def queue_detail(prof, pw, trust_new):
     """集群队列全量明细线程体。"""
     try:

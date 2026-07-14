@@ -209,3 +209,33 @@ def test_tune_continue_empty_changes_rejected(tmp_path):
     with pytest.raises(ValueError):
         submitter.continue_with_incar_changes(
             FakeClient(), FakeSFTP(), _profile(), d, {})
+
+
+# ── P1b:query_workdir(认领免手填远程目录) ──────────────────────────────────
+def test_query_workdir_pbs_roundtrip():
+    from tests.test_submitter import FakeClient
+    from vcstudio.cluster import submitter
+
+    class _Prof:
+        scheduler = 'PBS'
+        scheduler_bin = '/opt/torque-6.1.2/bin'
+
+    raw = ('Job Id: 205690.cluster.hpc\n'
+           '    init_work_dir = /home/Maple123/new structure/Nb_S\n'
+           '\t8\n')
+    c = FakeClient(script=[('qstat', raw)])
+    assert submitter.query_workdir(c, _Prof(), '205690') == '/home/Maple123/new structure/Nb_S8'
+    assert any('-f' in cmd and '205690' in cmd for cmd in c.commands)
+
+
+def test_query_workdir_slurm_skips_remote_call():
+    from tests.test_submitter import FakeClient
+    from vcstudio.cluster import submitter
+
+    class _Prof:
+        scheduler = 'Slurm'
+        scheduler_bin = ''
+
+    c = FakeClient(script=[])
+    assert submitter.query_workdir(c, _Prof(), '42') == ''
+    assert c.commands == []                    # 方言不支持 → 不发一条远程命令

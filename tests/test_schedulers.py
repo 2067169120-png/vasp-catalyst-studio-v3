@@ -97,3 +97,49 @@ def test_get_dialect_dispatch_and_unsupported():
     assert get_dialect('Slurm').name == 'Slurm'
     with pytest.raises(ValueError, match='暂不支持'):
         get_dialect('LSF')
+
+
+# ── P1b:qstat -f 工作目录解析(认领免手填的前提) ──────────────────────────────
+_QSTAT_F = (
+    "Job Id: 205690.cluster.hpc\n"
+    "    Job_Name = Nb_S8\n"
+    "    Job_Owner = Maple123@cluster.hpc\n"
+    "    job_state = Q\n"
+    "    queue = batch\n"
+    "    init_work_dir = /home/Maple123/new structure/Nb_S\n"
+    "\t8\n"
+    "    Variable_List = PBS_O_QUEUE=batch,PBS_O_HOME=/home/Maple123,\n"
+    "\tPBS_O_WORKDIR=/home/Maple123/new structure/Nb_S8,PBS_O_LANG=en_US\n"
+)
+
+
+def test_pbs_workdir_cmd_uses_bin_path():
+    d = PBSDialect()
+    cmd = d.workdir_cmd('205690', bin_path='/opt/torque-6.1.2/bin')
+    assert '/opt/torque-6.1.2/bin/qstat' in cmd and '-f' in cmd and '205690' in cmd
+
+
+def test_pbs_parse_workdir_unwraps_tab_continuation_and_spaces():
+    # Torque 把长行折成「换行+制表符」续行;路径含空格(new structure)必须完整还原
+    d = PBSDialect()
+    assert d.parse_workdir(_QSTAT_F) == '/home/Maple123/new structure/Nb_S8'
+
+
+def test_pbs_parse_workdir_falls_back_to_variable_list():
+    raw = ("Job Id: 1.x\n"
+           "    Variable_List = PBS_O_HOME=/h,PBS_O_WORKDIR=/work/dir,PBS_O_SHELL=/bin/bash\n")
+    d = PBSDialect()
+    assert d.parse_workdir(raw) == '/work/dir'
+
+
+def test_pbs_parse_workdir_missing_returns_empty():
+    d = PBSDialect()
+    assert d.parse_workdir('qstat: Unknown Job Id\n') == ''
+    assert d.parse_workdir('') == ''
+
+
+def test_base_dialect_workdir_defaults_empty():
+    # Slurm 的 detail_cmd 已带 %Z 工作目录,无需二次查询 → 基类默认空实现
+    d = SlurmDialect()
+    assert d.workdir_cmd('42') == ''
+    assert d.parse_workdir('anything') == ''

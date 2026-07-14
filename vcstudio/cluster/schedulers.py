@@ -71,6 +71,14 @@ class SchedulerDialect:
     def detail_cmd(self, user: str, bin_path: str = '') -> str:
         return self.status_cmd(user, bin_path)
 
+    # ── 单作业工作目录二次查询(P1b 认领免手填)。detail 已带目录的方言(Slurm %Z)
+    #    无需实现 → 基类返回空串,调用方跳过 ──
+    def workdir_cmd(self, job_id: str, bin_path: str = '') -> str:
+        return ''
+
+    def parse_workdir(self, raw: str) -> str:
+        return ''
+
     def parse_detail(self, raw: str) -> list:
         """原始查询输出 → [{'job_id','state','name','workdir'}](仅在队/在跑)。"""
         return [{'job_id': k, 'state': v, 'name': '', 'workdir': ''}
@@ -138,6 +146,24 @@ class PBSDialect(SchedulerDialect):
 
     def cancel_cmd(self, job_id, bin_path=''):
         return f'{_bin(bin_path, "qdel")} {shlex.quote(str(job_id))} 2>&1'
+
+    def workdir_cmd(self, job_id, bin_path=''):
+        # qstat -u 拿不到目录;qstat -f 的 init_work_dir / PBS_O_WORKDIR 有(1w 实测)
+        return f'{_bin(bin_path, "qstat")} -f {shlex.quote(str(job_id))} 2>/dev/null'
+
+    def parse_workdir(self, raw):
+        """qstat -f 输出 → 工作目录(找不到 → '')。
+
+        Torque 把长属性行折成「换行+制表符」续行,先还原;路径可含空格
+        (如 /home/.../new structure/...),init_work_dir 取整行值,
+        退路 Variable_List 里的 PBS_O_WORKDIR 以逗号断值。
+        """
+        unwrapped = raw.replace('\n\t', '')
+        m = re.search(r'^\s*init_work_dir = (.+?)\s*$', unwrapped, re.MULTILINE)
+        if m:
+            return m.group(1)
+        m = re.search(r'PBS_O_WORKDIR=([^,\n]+)', unwrapped)
+        return m.group(1).strip() if m else ''
 
     def parse_detail(self, raw):
         """qstat -u 全量明细:作业名在第 4 列(≥10 列格式)。PBS 拿不到工作目录(留空,

@@ -212,6 +212,17 @@ def query_queue_detail(client, profile) -> list:
     return dialect.parse_detail(out.replace(_QOK, ''))
 
 
+def query_workdir(client, profile, job_id: str) -> str:
+    """认领辅助:按作业号查远程工作目录(PBS 走 qstat -f;Slurm 的 detail 已带 %Z
+    → 方言返回空命令,这里不发远程调用直接 '')。查不到 → ''(交前端让用户手填)。"""
+    dialect = get_dialect(profile.scheduler)
+    cmd = dialect.workdir_cmd(job_id, getattr(profile, 'scheduler_bin', ''))
+    if not cmd:
+        return ''
+    out, _ = run_cmd(client, cmd)
+    return dialect.parse_workdir(out)
+
+
 def adopt_external_job(local_dir: str, profile, job_id: str, remote_dir: str,
                        name: str = '', task_type: str = 'relax') -> dict:
     """认领一个非本软件提交的集群作业:落 job.yaml + 入台账,之后查状态/拉回/续算全走原生路径。

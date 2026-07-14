@@ -414,3 +414,25 @@ def test_open_dir_missing_path_error():
 # ── ping 保留(前端桥活性探测) ──────────────────────────────────────────────
 def test_ping_still_pong():
     assert Api().ping() == 'pong'
+
+
+def test_query_workdir_delegates_to_batch_ops():
+    import types
+    calls = {}
+    bo = types.SimpleNamespace(workdir_lookup=lambda prof, pw, jid, tn:
+        calls.update(jid=jid) or {'needs_trust': False, 'workdir': '/home/u/dir with space'})
+    from vcstudio.cluster.profiles import ClusterProfile
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key', key_path='/k')}
+
+    def _fake_profiles_mod():
+        m = types.SimpleNamespace()
+        m.load_profiles = lambda: dict(store)
+        m.save_profiles = lambda p: None
+        m.ClusterProfile = ClusterProfile
+        return m
+
+    from vcstudio.gui_web.api import Api
+    api = Api(profiles_mod=_fake_profiles_mod(), batch_ops_mod=bo)
+    out = api.query_workdir(205690, 'c1', None, False)
+    assert calls['jid'] == '205690'
+    assert out['workdir'] == '/home/u/dir with space'
