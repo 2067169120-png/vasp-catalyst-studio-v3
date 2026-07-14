@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B 版 · 控制台感紧凑 — VASP Catalyst Studio</title>
+<style>
+:root{
+  --bg:#EDF0F3; --surface:#FFFFFF; --ink:#16202B; --muted:#5C6B7C;
+  --accent:#4477AA; --accent-dark:#2E5580; --accent-soft:#E4EDF6;
+  --rule:#DCE2E9; --rule-strong:#B9C4CF;
+  --ok:#1F7A3D; --ok-bg:#E4F2E8; --run:#2F62A0; --run-bg:#E4EDF8;
+  --queue:#5F6B78; --queue-bg:#ECEFF2; --fail:#AD3A28; --fail-bg:#F8E9E5;
+  --warn:#92660F; --warn-bg:#F7EFDC;
+  --sans:"Microsoft YaHei UI","Microsoft YaHei","Noto Sans SC",sans-serif;
+  --mono:"JetBrains Mono","Cascadia Code","Consolas",monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font:13px/1.6 var(--sans);display:flex;min-height:100vh}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+/* ── 左导航:窄 icon+字,仪表台风 ── */
+nav{width:172px;background:#1E2935;color:#93A3B5;padding:20px 0;flex-shrink:0;display:flex;flex-direction:column}
+.brand{padding:0 18px 18px;border-bottom:1px solid #2C3947}
+.brand b{color:#F2F5F8;font-size:14px;display:block;letter-spacing:.02em}
+.brand span{font-family:var(--mono);font-size:10.5px;color:#5E7288}
+nav a{display:flex;align-items:center;gap:9px;padding:8px 18px;color:#93A3B5;text-decoration:none;font-size:13px;border-left:3px solid transparent}
+nav a:hover{color:#DFE7EF;background:#243140}
+nav a.on{color:#FFFFFF;background:#2A3A4C;border-left-color:var(--accent);font-weight:600}
+nav a svg{width:15px;height:15px;stroke:currentColor;stroke-width:1.8;fill:none;flex-shrink:0}
+nav .grp{font-family:var(--mono);font-size:10px;color:#54667A;padding:16px 18px 5px;letter-spacing:.16em}
+nav .foot{margin-top:auto;padding:14px 18px 0;border-top:1px solid #2C3947;font-family:var(--mono);font-size:10.5px;color:#5E7288;line-height:1.9}
+
+/* ── 顶部:连接态 + 队列占用读数条(签名元素) ── */
+main{flex:1;display:flex;flex-direction:column;min-width:0}
+header{display:flex;align-items:center;gap:20px;padding:9px 24px;background:var(--surface);border-bottom:1px solid var(--rule);font-size:12px}
+.dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:6px;vertical-align:1px}
+.dot.g{background:var(--ok);box-shadow:0 0 0 3px var(--ok-bg)}
+.qmeter{display:flex;align-items:center;gap:7px;font-family:var(--mono);font-size:11px;color:var(--muted)}
+.qmeter .bar{width:56px;height:6px;background:#E6EAEF;border-radius:3px;overflow:hidden}
+.qmeter .bar i{display:block;height:100%;background:var(--accent)}
+.qmeter .bar i.hot{background:#C4763B}
+header .sp{flex:1}
+header label{color:var(--muted);user-select:none}
+
+.page{padding:18px 24px 32px}
+.pagebar{display:flex;align-items:baseline;gap:14px;margin-bottom:12px}
+.pagebar h1{font-size:17px;font-weight:700}
+.pagebar .stats{font-family:var(--mono);font-size:11.5px;color:var(--muted)}
+.pagebar .stats b{color:var(--ink)}
+
+.actions{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap}
+.btn{font:600 12px/1 var(--sans);padding:7px 13px;border-radius:5px;border:1px solid var(--rule-strong);background:var(--surface);color:var(--ink);cursor:pointer}
+.btn:hover{border-color:var(--accent);color:var(--accent-dark)}
+.btn.primary{background:var(--accent);border-color:var(--accent-dark);color:#fff}
+.btn.primary:hover{background:var(--accent-dark)}
+.btn.quiet{border-color:transparent;color:var(--muted);background:transparent}
+.btn.quiet:hover{color:var(--accent-dark);background:var(--accent-soft)}
+
+/* ── 密表:32px 行高、行内 sparkline ── */
+.card{background:var(--surface);border:1px solid var(--rule);border-radius:6px;overflow:hidden}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+thead th{text-align:left;font-weight:600;color:var(--muted);font-size:11px;letter-spacing:.06em;padding:7px 10px;background:#F4F6F8;border-bottom:1px solid var(--rule-strong);position:sticky;top:0}
+tbody td{padding:6px 10px;border-bottom:1px solid var(--rule);height:32px}
+tbody tr:hover td{background:var(--accent-soft)}
+tbody tr.sel td{background:#DFEAF5;box-shadow:inset 3px 0 0 var(--accent)}
+td.mono,th.mono{font-family:var(--mono);font-size:11.5px}
+td.num,th.num{text-align:right;font-family:var(--mono);font-size:11.5px;font-variant-numeric:tabular-nums}
+.name{font-weight:600;font-size:12.5px}
+.sub{color:var(--muted);font-family:var(--mono);font-size:10.5px}
+
+.pill{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;padding:2px 8px;border-radius:4px;font-family:var(--mono)}
+.pill i{width:6px;height:6px;border-radius:50%}
+.pill.run{background:var(--run-bg);color:var(--run)} .pill.run i{background:var(--run)}
+.pill.q{background:var(--queue-bg);color:var(--queue)} .pill.q i{background:var(--queue)}
+.pill.ok{background:var(--ok-bg);color:var(--ok)} .pill.ok i{background:var(--ok)}
+.pill.fail{background:var(--fail-bg);color:var(--fail)} .pill.fail i{background:var(--fail)}
+.pill.warn{background:var(--warn-bg);color:var(--warn)} .pill.warn i{background:var(--warn)}
+.spark{vertical-align:middle}
+.spark polyline{fill:none;stroke:var(--accent);stroke-width:1.4}
+.spark.flat polyline{stroke:var(--rule-strong)}
+.re{color:var(--accent-dark);font-weight:600}
+.diag{font-size:11.5px;color:var(--muted)}
+
+/* 日志:终端读数 */
+.log{margin-top:14px;background:#1E2935;border-radius:6px;padding:12px 16px;font-family:var(--mono);font-size:11.5px;line-height:1.85;color:#A9B8C8}
+.log .t{color:#5E7288;margin-right:10px}
+.log .okc{color:#6FBF8B}
+.log .head{color:#7E93A9;font-size:10px;letter-spacing:.14em;margin-bottom:4px}
+@media (prefers-reduced-motion: reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<nav>
+  <div class="brand"><b>VASP Catalyst Studio</b><span>v2 · Li–S 催化剂</span></div>
+  <div class="grp">工作流</div>
+  <a href="#"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>仪表盘</a>
+  <a href="#"><svg viewBox="0 0 24 24"><path d="M12 3v18M3 12h18"/><circle cx="12" cy="12" r="9"/></svg>生成输入</a>
+  <a href="#"><svg viewBox="0 0 24 24"><path d="M3 7l9-4 9 4-9 4-9-4zM3 7v10l9 4 9-4V7"/></svg>吸附能项目</a>
+  <a href="#" class="on"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>任务</a>
+  <div class="grp">环境</div>
+  <a href="#"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="1"/><rect x="3" y="13" width="18" height="7" rx="1"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>集群</a>
+  <div class="foot">Maple123@1w<br>PBS · torque-6.1.2</div>
+</nav>
+<main>
+  <header>
+    <span><span class="dot g"></span>华师大集群 · 已连接</span>
+    <span class="qmeter">fat <span class="bar"><i style="width:100%" class="hot"></i></span> 6/6</span>
+    <span class="qmeter">fata <span class="bar"><i style="width:100%" class="hot"></i></span> 7/7</span>
+    <span class="qmeter">batch <span class="bar"><i style="width:67%"></i></span> 12/18</span>
+    <span class="sp"></span>
+    <label><input type="checkbox" checked> 自动刷新 15m</label>
+  </header>
+  <div class="page">
+    <div class="pagebar">
+      <h1>任务</h1>
+      <span class="stats">8 作业 · <b>2</b> RUN · <b>2</b> QUEUE · <b>3</b> DONE · <b>1</b> 需处理 · 上次查询 <b>14:32:05</b></span>
+    </div>
+    <div class="actions">
+      <button class="btn primary">上传并提交</button>
+      <button class="btn">查询状态</button>
+      <button class="btn">拉回结果</button>
+      <button class="btn">续算</button>
+      <button class="btn">集群队列</button>
+      <span style="flex:1"></span>
+      <button class="btn quiet">导出报告</button>
+      <button class="btn quiet">清理台账</button>
+    </div>
+    <div class="card">
+      <table>
+        <thead><tr>
+          <th>作业</th><th>状态</th><th class="mono">作业号</th>
+          <th class="num">步</th><th>收敛轨迹</th><th class="num">|F|max</th><th class="num">E0 (eV)</th>
+          <th>诊断</th><th class="mono">更新</th>
+        </tr></thead>
+        <tbody>
+          <tr class="sel">
+            <td><span class="name">Ta_Li2S6</span> <span class="sub">relax</span></td>
+            <td><span class="pill run"><i></i>RUN</span></td>
+            <td class="mono">205576</td><td class="num">187</td>
+            <td><svg class="spark" width="72" height="16" viewBox="0 0 72 16"><polyline points="0,2 9,9 18,6 27,11 36,10 45,13 54,12 63,13.5 72,14"/></svg></td>
+            <td class="num">0.043</td><td class="num">—</td>
+            <td class="diag">收敛趋势正常</td><td class="mono">14:32</td>
+          </tr>
+          <tr>
+            <td><span class="name">Co_Li2S4</span> <span class="sub">relax</span></td>
+            <td><span class="pill run"><i></i>RUN</span></td>
+            <td class="mono">205641</td><td class="num">12</td>
+            <td><svg class="spark" width="72" height="16" viewBox="0 0 72 16"><polyline points="0,3 12,12 24,5 36,11 48,4 60,10 72,7"/></svg></td>
+            <td class="num">1.872</td><td class="num">—</td>
+            <td class="diag">SCF 前期,观察中</td><td class="mono">14:32</td>
+          </tr>
+          <tr>
+            <td><span class="name">Nb_S8</span> <span class="sub">relax</span></td>
+            <td><span class="pill q"><i></i>QUEUE</span></td>
+            <td class="mono">205690</td><td class="num">—</td>
+            <td><svg class="spark flat" width="72" height="16" viewBox="0 0 72 16"><polyline points="0,8 72,8"/></svg></td>
+            <td class="num">—</td><td class="num">—</td>
+            <td class="diag">batch 第 3 位</td><td class="mono">14:32</td>
+          </tr>
+          <tr>
+            <td><span class="name">Zn_S8</span> <span class="sub">relax</span></td>
+            <td><span class="pill q"><i></i>QUEUE</span></td>
+            <td class="mono">205697</td><td class="num">—</td>
+            <td><svg class="spark flat" width="72" height="16" viewBox="0 0 72 16"><polyline points="0,8 72,8"/></svg></td>
+            <td class="num">—</td><td class="num">—</td>
+            <td class="diag"></td><td class="mono">14:32</td>
+          </tr>
+          <tr>
+            <td><span class="name">Zn_Li2S4</span> <span class="sub">relax</span></td>
+            <td><span class="pill ok"><i></i>DONE</span></td>
+            <td class="mono">205518</td><td class="num">243</td>
+            <td><svg class="spark" width="72" height="16" viewBox="0 0 72 16"><polyline points="0,2 9,8 18,10 27,11 36,12 45,13 54,13.6 63,14 72,14.2"/></svg></td>
+            <td class="num">0.019</td><td class="num">−401.3021</td>
+            <td class="diag">已拉回 · 结构图就绪</td><td class="mono">22:07</td>
+          </tr>
+          <tr>
+            <td><span class="name">V_Li2S6</span> <span class="sub">relax</span></td>
+            <td><span class="pill ok"><i></i>DONE</span></td>
+            <td class="mono">205504</td><td class="num">198</td>
+            <td><svg class="spark" width="72" height="16" viewBox="0 0 72 16"><polyline points="0,2 12,7 24,10 36,12 48,13 60,13.8 72,14"/></svg></td>
+            <td class="num">0.021</td><td class="num">−389.4470</td>
+            <td class="diag">已拉回 · 结构图就绪</td><td class="mono">20:51</td>
+          </tr>
+          <tr>
+            <td><span class="name">Ta_slab</span> <span class="sub">relax</span></td>
+            <td><span class="pill ok"><i></i>DONE</span></td>
+            <td class="mono">205579</td><td class="num">86</td>
+            <td><svg class="spark" width="72" height="16" viewBox="0 0 72 16"><polyline points="0,3 14,9 28,12 42,13 56,13.8 72,14"/></svg></td>
+            <td class="num">0.017</td><td class="num">−362.1188</td>
+            <td class="diag">已拉回 · 结构图就绪</td><td class="mono">07-07</td>
+          </tr>
+          <tr>
+            <td><span class="name">V_S8</span> <span class="sub">relax</span></td>
+            <td><span class="pill fail"><i></i>未收敛</span></td>
+            <td class="mono">205511</td><td class="num">500</td>
+            <td><svg class="spark" width="72" height="16" viewBox="0 0 72 16"><polyline points="0,4 9,10 18,7 27,11 36,9 45,12 54,10 63,12.5 72,11"/></svg></td>
+            <td class="num">0.088</td><td class="num">−455.0912</td>
+            <td class="diag">跑满 NSW=500 <span class="re">· 可续算(2/3 轮)</span></td>
+            <td class="mono">09:14</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="log">
+      <div class="head">操作日志</div>
+      <div><span class="t">14:32:05</span><span class="okc">查询完成</span> 8 作业 · 2 状态变化(Zn_Li2S4 → DONE,已自动拉回三件套并渲结构图)</div>
+      <div><span class="t">14:32:11</span>Ta_Li2S6 187 步 |F|max=0.043 收敛趋势正常</div>
+      <div><span class="t">14:17:03</span>自动刷新开启(15m)</div>
+    </div>
+  </div>
+</main>
+</body>
+</html>

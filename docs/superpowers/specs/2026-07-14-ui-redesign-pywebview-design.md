@@ -50,8 +50,11 @@ CustomTkinter/PySide6/PyWebView 对比;CatGo、VASPilot、vaspkit、atomate2 功
 
 ## D. 分期
 
-- **P1 UI 壳迁移**:先出 2 版静态 mockup(同布局、两种视觉浓度:文档感淡雅 vs
-  控制台感紧凑)供用户挑;定稿后迁移四页 parity + 空态。
+- **P1 UI 壳迁移**:2 版 mockup 已出,用户定稿 **B 版「控制台感紧凑」**
+  (2026-07-15):深色侧栏(#1E2935)+ 顶部队列占用读数条(fat/fata/batch,
+  签名元素)+ 32px 密行表格 + 行内收敛 sparkline + 终端风日志区;
+  色板/字体/pill 规格以 mockup_b_console.html 为准(浅色内容区,主色 #4477AA)。
+  按此迁移四页 parity + 空态。
 - **P2 行为修复**:B1 + B2。
 - **P3 新功能**:C1→C2→C3→C4。
 - 每期独立可发布;每期结束跑全量 pytest + 重打包 exe 验证。
