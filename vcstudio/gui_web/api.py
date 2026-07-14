@@ -363,20 +363,28 @@ class Api:
     def proj_list(self):
         """项目注册表 → [{path,name,n_members}](镜像 project_tab._reload_projects)。
 
-        n_members 用 report_full._member_dirs 作单一口径(清洁表面 + 气相参考 + 组态族);
-        畸形/已移动的 project.yaml(load_project→None)静默跳过,不整体失败。
+        n_members 内联算(清洁表面 + 气相参考 + 组态族,镜像 project_tab._member_dirs):
+        列表渲染绝不触碰 report_full(避免仅为计数拖入 matplotlib,matplotlib 坏时也不
+        整体失败)。畸形/已移动的 project.yaml(load_project→None)或坏成员静默跳过。
         """
         try:
             projects = []
             for pp in self._adsorption.list_projects():
-                proj = self._adsorption.load_project(pp)
-                if proj is None:
+                try:
+                    proj = self._adsorption.load_project(pp)
+                    if proj is None:
+                        continue
+                    mem = proj.get('members') or {}
+                    member_dirs = [d for d in ([mem.get('clean_slab'),
+                                                mem.get('gas_ref')]
+                                               + list(mem.get('configs') or [])) if d]
+                    projects.append({
+                        'path': pp,
+                        'name': proj.get('name', '') or '',
+                        'n_members': len(member_dirs),
+                    })
+                except Exception:                         # noqa: BLE001 单个坏项目不拖垮全表
                     continue
-                projects.append({
-                    'path': pp,
-                    'name': proj.get('name', '') or '',
-                    'n_members': len(self._rf()._member_dirs(proj)),
-                })
             return {'projects': projects, 'error': None}
         except Exception as e:                            # noqa: BLE001
             return {'projects': [], 'error': str(e)}

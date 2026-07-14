@@ -625,6 +625,23 @@ def test_proj_list_assembles_path_name_members():
                                 'n_members': 3}]
 
 
+def test_proj_list_counts_members_inline_without_report_full():
+    """成员计数内联,绝不触碰 report_full(避免为渲染列表而拖入 matplotlib):
+    注入一个 _member_dirs 必炸的 report_full 假件,proj_list 仍应内联算出 n_members=3。"""
+    proj = {'name': 'demo', 'members': {'clean_slab': '/s', 'gas_ref': None,
+                                        'configs': ['/c1', '/c2']}}
+    ads = _fake_adsorption(projects=['/p/project.yaml'],
+                           proj_map={'/p/project.yaml': proj})
+    boom_rf = types.SimpleNamespace(
+        _member_dirs=lambda proj: (_ for _ in ()).throw(
+            AssertionError('must not be called')))
+    api = Api(adsorption_mod=ads, report_full_mod=boom_rf)
+    out = api.proj_list()
+    assert out['error'] is None
+    assert out['projects'] == [{'path': '/p/project.yaml', 'name': 'demo',
+                                'n_members': 3}]
+
+
 def test_proj_list_skips_unloadable_and_catches_error():
     boom = types.SimpleNamespace(
         list_projects=lambda *a, **k: (_ for _ in ()).throw(RuntimeError('注册表坏了')))
