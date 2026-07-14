@@ -1,5 +1,5 @@
-"""jobs_tab 后台批量函数测试(不建 Tk 窗口,只测线程体):连接关闭责任与单作业失败隔离。"""
-from vcstudio.gui import jobs_tab
+"""batch_ops 后台批量函数测试(不建 Tk 窗口,只测线程体):连接关闭责任与单作业失败隔离。"""
+from vcstudio.cluster import batch_ops
 from vcstudio.shared import manifest as mm
 
 
@@ -25,7 +25,7 @@ def test_filter_continuable_partitions_selection(tmp_path):
     hardfail = _mk_job(tmp_path, 'seg', 'FAILED', restartable=False)     # 不可续算 → 跳过
     capped = _mk_job(tmp_path, 'cap', 'UNCONVERGED', restartable=True, rounds=3)  # 到顶 → 跳过
     nodiag = _mk_job(tmp_path, 'done', 'DONE')                           # 无诊断 → 跳过
-    eligible, skipped = jobs_tab._filter_continuable([ok, running, hardfail, capped, nodiag])
+    eligible, skipped = batch_ops.filter_continuable([ok, running, hardfail, capped, nodiag])
     assert eligible == [ok] and skipped == 4
 
 
@@ -51,35 +51,35 @@ class FakeConn:
 
 def _patch_open(monkeypatch):
     client, jump = FakeConn(), FakeConn()
-    monkeypatch.setattr(jobs_tab, 'open_client',
+    monkeypatch.setattr(batch_ops, 'open_client',
                         lambda prof, pw, trust_new: (client, jump))
     return client, jump
 
 
 def test_submit_batch_closes_client_and_jump(monkeypatch):
     client, jump = _patch_open(monkeypatch)
-    monkeypatch.setattr(jobs_tab.submitter, 'submit_job',
+    monkeypatch.setattr(batch_ops.submitter, 'submit_job',
                         lambda c, s, p, d: {'scheduler_job_id': '1'})
-    payload = jobs_tab._submit_batch(object(), None, ['d1'], False)
+    payload = batch_ops.submit_batch(object(), None, ['d1'], False)
     assert payload['results'] == [('d1', True, '已提交,作业号 1')]
     assert client.closed and jump.closed          # 跳板连接同样必须关
 
 
 def test_refresh_batch_closes_client_and_jump(monkeypatch):
     client, jump = _patch_open(monkeypatch)
-    monkeypatch.setattr(jobs_tab.submitter, 'query_scheduler', lambda c, p: ({}, {}))
-    monkeypatch.setattr(jobs_tab.submitter, 'refresh_job',
+    monkeypatch.setattr(batch_ops.submitter, 'query_scheduler', lambda c, p: ({}, {}))
+    monkeypatch.setattr(batch_ops.submitter, 'refresh_job',
                         lambda c, p, d, live_states, terminal_reasons=None: {'state': 'DONE', 'results': {}})
-    payload = jobs_tab._refresh_batch(object(), None, ['d1'], False)
+    payload = batch_ops.refresh_batch(object(), None, ['d1'], False)
     assert payload['results'] == [('d1', 'DONE')]
     assert client.closed and jump.closed
 
 
 def test_fetch_batch_closes_client_and_jump(monkeypatch):
     client, jump = _patch_open(monkeypatch)
-    monkeypatch.setattr(jobs_tab.submitter, 'fetch_results',
+    monkeypatch.setattr(batch_ops.submitter, 'fetch_results',
                         lambda c, s, d, files=None: (['CONTCAR'], []))
-    payload = jobs_tab._fetch_batch(object(), None, ['d1'], False)
+    payload = batch_ops.fetch_batch(object(), None, ['d1'], False)
     assert payload['results'][0][1] is True
     assert client.closed and jump.closed
 
@@ -94,8 +94,8 @@ def test_submit_batch_survives_ssh_exception(monkeypatch):
             raise SSHException('channel closed')
         return {'scheduler_job_id': '2'}
 
-    monkeypatch.setattr(jobs_tab.submitter, 'submit_job', flaky)
-    payload = jobs_tab._submit_batch(object(), None, ['bad', 'good'], False)
+    monkeypatch.setattr(batch_ops.submitter, 'submit_job', flaky)
+    payload = batch_ops.submit_batch(object(), None, ['bad', 'good'], False)
     assert [r[1] for r in payload['results']] == [False, True]   # bad 失败,good 照常
     assert 'channel closed' in payload['results'][0][2]
     assert client.closed and jump.closed
@@ -104,15 +104,15 @@ def test_submit_batch_survives_ssh_exception(monkeypatch):
 def test_refresh_batch_survives_ssh_exception(monkeypatch):
     from paramiko.ssh_exception import SSHException
     client, jump = _patch_open(monkeypatch)
-    monkeypatch.setattr(jobs_tab.submitter, 'query_scheduler', lambda c, p: ({}, {}))
+    monkeypatch.setattr(batch_ops.submitter, 'query_scheduler', lambda c, p: ({}, {}))
 
     def flaky(c, p, d, live_states, terminal_reasons=None):
         if d == 'bad':
             raise SSHException('boom')
         return {'state': 'DONE', 'results': {}}
 
-    monkeypatch.setattr(jobs_tab.submitter, 'refresh_job', flaky)
-    payload = jobs_tab._refresh_batch(object(), None, ['bad', 'good'], False)
+    monkeypatch.setattr(batch_ops.submitter, 'refresh_job', flaky)
+    payload = batch_ops.refresh_batch(object(), None, ['bad', 'good'], False)
     assert '查询失败' in payload['results'][0][1]
     assert payload['results'][1][1] == 'DONE'
     assert client.closed and jump.closed
@@ -127,8 +127,8 @@ def test_fetch_batch_survives_ssh_exception(monkeypatch):
             raise SSHException('boom')
         return (['CONTCAR'], [])
 
-    monkeypatch.setattr(jobs_tab.submitter, 'fetch_results', flaky)
-    payload = jobs_tab._fetch_batch(object(), None, ['bad', 'good'], False)
+    monkeypatch.setattr(batch_ops.submitter, 'fetch_results', flaky)
+    payload = batch_ops.fetch_batch(object(), None, ['bad', 'good'], False)
     assert [r[1] for r in payload['results']] == [False, True]
     assert client.closed and jump.closed
 
@@ -136,9 +136,9 @@ def test_fetch_batch_survives_ssh_exception(monkeypatch):
 # ── 续算批量:关闭责任 + 单作业失败隔离(不可续算的自失败不打断整批) ──
 def test_continue_batch_closes_client_and_jump(monkeypatch):
     client, jump = _patch_open(monkeypatch)
-    monkeypatch.setattr(jobs_tab.submitter, 'continue_from_contcar',
+    monkeypatch.setattr(batch_ops.submitter, 'continue_from_contcar',
                         lambda c, p, d: {'scheduler_job_id': '9'})
-    payload = jobs_tab._continue_batch(object(), None, ['d1'], False)
+    payload = batch_ops.continue_batch(object(), None, ['d1'], False)
     assert payload['results'] == [('d1', True, '已续算重投,新作业号 9')]
     assert client.closed and jump.closed
 
@@ -151,7 +151,7 @@ def test_continue_batch_survives_error(monkeypatch):
             raise RuntimeError('不可自动续算')
         return {'scheduler_job_id': '9'}
 
-    monkeypatch.setattr(jobs_tab.submitter, 'continue_from_contcar', flaky)
-    payload = jobs_tab._continue_batch(object(), None, ['bad', 'good'], False)
+    monkeypatch.setattr(batch_ops.submitter, 'continue_from_contcar', flaky)
+    payload = batch_ops.continue_batch(object(), None, ['bad', 'good'], False)
     assert [r[1] for r in payload['results']] == [False, True]
     assert client.closed and jump.closed
