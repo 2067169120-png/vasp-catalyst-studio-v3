@@ -104,6 +104,12 @@ def build_job_dir(poscar_path, incar, out_dir, *,
 
     incar_out = _render_incar(original_text, incar_dict, completions, system_name)
 
+    task_type = _infer_task_type(incar_dict)
+    # 方法学顾问(warn-only;项目页已有,单作业生成同样要抓 LDIPOL/ISMEAR/ISPIN 类
+    # "不崩但算错"的坑——多数人先逐个 slab 建模,这里正是最常见路径)
+    warnings += _single_job_advisories(incar_dict, calc_type, elements, counts,
+                                       read_cell_vectors(content))
+
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, 'INCAR'), 'w', encoding='utf-8') as f:
         f.write(incar_out)
@@ -117,5 +123,43 @@ def build_job_dir(poscar_path, incar, out_dir, *,
             'kpoints': kpts, 'elements': elements,
             # 附加回传(向后兼容的新增键):manifest/预览用
             'completions': dict(completions), 'calc_type': calc_type,
+            # 任务类型按 INCAR 推断(NSW=0→static 等):收敛判定按类型分流的前提
+            'task_type': task_type,
             # 赝势身份溯源(审查#2):variant/TITEL/ENMAX 供 manifest 落档
             'potcar': potcar_provenance(elements, lib_root)}
+
+
+def _infer_task_type(incar_dict) -> str:
+    """INCAR → task_type:NSW=0/缺省(VASP 默认 0)且非频率 → static;
+    IBRION=5/6 → freq;其余 → relax。修复静态单点被按 relax 判收敛的误报。"""
+    def _int(v, default):
+        try:
+            if isinstance(v, bool):
+                return default
+            return int(float(v))
+        except (TypeError, ValueError):
+            return default
+    up = {str(k).upper(): v for k, v in (incar_dict or {}).items()}
+    ibrion = _int(up.get('IBRION'), -1)
+    if ibrion in (5, 6, 7, 8):
+        return 'freq'
+    nsw = _int(up.get('NSW'), 0)
+    if nsw <= 0:
+        return 'static'
+    return 'relax'
+
+
+def _single_job_advisories(incar_dict, calc_type, elements, counts, cell) -> list:
+    """单作业防呆(warn-only):复用 project.advisor 规则于单目录生成路径。
+
+    calc_type='molecule' 按气相参考口径查(ISMEAR/开壳层/盒子);slab 查偶极修正。
+    advisor 失败静默(顾问绝不挡生成)。"""
+    try:
+        from vcstudio.project import advisor
+        gas = None
+        if calc_type == 'molecule':
+            gas = {'elements': elements, 'counts': counts, 'cell': cell}
+        tips = advisor.advise(incar_dict, has_configs=(calc_type == 'slab'), gas=gas)
+        return [f'[{p}] {msg}' for p, _name, msg in tips]
+    except Exception:                                    # noqa: BLE001
+        return []
