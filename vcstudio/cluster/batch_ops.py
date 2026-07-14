@@ -183,7 +183,14 @@ def adopt_scan(prof, pw, trust_new, known_ids, local_root):
             if not workdir:
                 results.append([jid, False, '查不到工作目录,请单个认领手填'])
                 continue
-            local_dir = os.path.join(local_root, _sanitize_seg(j.get('name') or jid))
+            seg = _sanitize_seg(j.get('name') or jid)
+            local_dir = os.path.join(local_root, seg)
+            # 同名撞车(qstat 常截断作业名):目标目录已属于另一作业则追加 _<jid> 避让,
+            # 否则第二个认领会落到第一个的目录并报第一个的作业号。已属本 jid 则复用(幂等)。
+            if os.path.isdir(local_dir):
+                existing = manifest_mod.load_manifest(local_dir)
+                if not (existing and str(existing.get('scheduler_job_id')) == jid):
+                    local_dir = os.path.join(local_root, f'{seg}_{jid}')
             try:
                 os.makedirs(local_dir, exist_ok=True)
                 submitter.adopt_external_job(local_dir, prof, jid, workdir,
