@@ -86,9 +86,10 @@
     State.rows.forEach(r => {
       const task = r.task && r.task !== '/' ? r.task : '';
       const sel = State.selected.has(r.dir) ? ' class="sel"' : '';
-      h += `<tr data-dir="${VCS.esc(r.dir)}"${sel}>` +
+      h += `<tr data-dir="${VCS.esc(r.dir)}" data-name="${VCS.esc(r.name)}"${sel}>` +
         `<td><span class="name">${VCS.esc(r.name)}</span>` +
-        (task ? ` <span class="sub">${VCS.esc(task)}</span>` : '') + '</td>' +
+        (task ? ` <span class="sub">${VCS.esc(task)}</span>` : '') +
+        ` <button class="lnk conv" title="查看收敛过程(E0/ΔE/|F|max vs 离子步)">收敛</button></td>` +
         `<td>${VCS.pill(r.state)}</td>` +
         `<td class="mono">${r.job_id ? VCS.esc(r.job_id) : '—'}</td>` +
         `<td class="num">${r.steps != null ? VCS.esc(r.steps) : '—'}</td>` +
@@ -129,6 +130,12 @@
     card.addEventListener('click', e => {
       const tr = e.target.closest('tr[data-dir]');
       if (!tr) return;
+      // 「收敛」按钮:打开收敛曲线,不参与行选中
+      if (e.target.closest('.conv')) {
+        e.stopPropagation();
+        VCS.showConvergence(tr.dataset.dir, tr.dataset.name || tr.dataset.dir);
+        return;
+      }
       const dir = tr.dataset.dir;
       if (e.ctrlKey || e.metaKey) {
         if (State.selected.has(dir)) State.selected.delete(dir);
