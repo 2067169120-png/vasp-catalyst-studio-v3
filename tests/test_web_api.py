@@ -3,6 +3,7 @@
 每个公开方法至少一个 happy + 一个错误路径;所有返回一律 JSON-safe dict,
 异常绝不穿透到 JS(错误落 'error' 字段)。中文注释允许,英文标识符。
 """
+import os
 import types
 
 from vcstudio.gui_web.api import Api
@@ -573,6 +574,199 @@ def test_pick_dir_cancel_returns_none():
     api = Api(dialog_fn=lambda kind: None)
     out = api.pick_dir()
     assert out['path'] is None
+
+
+# ── 项目页假件 ────────────────────────────────────────────────────────────────
+def _fake_adsorption(*, projects=None, proj_map=None, create_ret=None,
+                     delta_ret=None, csv_ret=None, calls=None):
+    """adsorption 假件:list/load/create/delta/export 全可注入;calls 收参数便于断言。"""
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.list_projects = lambda *a, **k: list(projects or [])
+    m.load_project = lambda p: (proj_map or {}).get(p)
+
+    def _create(root, name, **kw):
+        calls['create'] = {'root': root, 'name': name, **kw}
+        return dict(create_ret or {})
+    m.create_project = _create
+    m.delta_e_rows = lambda proj: dict(delta_ret or {})
+
+    def _export(proj, summary, out):
+        calls['export'] = {'out': out, 'summary': summary}
+        return csv_ret if csv_ret is not None else out
+    m.export_csv = _export
+    return m
+
+
+def _fake_report_full(*, member_dirs=None, report_ret='/out/报告.html', calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m._member_dirs = lambda proj: list(
+        member_dirs if member_dirs is not None else [])
+
+    def _gen(proj, out, *, config=None):
+        calls['report'] = {'out': out, 'config': config, 'proj': proj}
+        return report_ret
+    m.generate_project_report = _gen
+    return m
+
+
+# ── proj_list ────────────────────────────────────────────────────────────────
+def test_proj_list_assembles_path_name_members():
+    proj = {'name': 'demo', 'members': {'clean_slab': '/s', 'gas_ref': None,
+                                        'configs': ['/c1', '/c2']}}
+    ads = _fake_adsorption(projects=['/p/project.yaml'],
+                           proj_map={'/p/project.yaml': proj})
+    rf = _fake_report_full(member_dirs=['/s', '/c1', '/c2'])
+    api = Api(adsorption_mod=ads, report_full_mod=rf)
+    out = api.proj_list()
+    assert out['error'] is None
+    assert out['projects'] == [{'path': '/p/project.yaml', 'name': 'demo',
+                                'n_members': 3}]
+
+
+def test_proj_list_skips_unloadable_and_catches_error():
+    boom = types.SimpleNamespace(
+        list_projects=lambda *a, **k: (_ for _ in ()).throw(RuntimeError('注册表坏了')))
+    api = Api(adsorption_mod=boom, report_full_mod=_fake_report_full())
+    out = api.proj_list()
+    assert out['projects'] == [] and '注册表坏了' in out['error']
+
+
+# ── proj_create ──────────────────────────────────────────────────────────────
+def test_proj_create_mirrors_on_generate_params_and_transforms(tmp_path):
+    slab = tmp_path / 'POSCAR_slab'
+    slab.write_text('slab')
+    incar = tmp_path / 'INCAR'
+    incar.write_text('incar')
+    calls = {}
+    create_ret = {
+        'ok': True, 'project_path': str(tmp_path / 'demo' / 'project.yaml'),
+        'generated': [('demo_ads_x', '/o/x', ['偶极建议'])],
+        'errors': [('demo_ads_bad', 'POTCAR 缺 Ta')],       # 坏组态 → warnings,不整体失败
+        'advisories': [('P1', 'ENCUT', '建议统一 ENCUT=400')],
+    }
+    ads = _fake_adsorption(create_ret=create_ret, calls=calls)
+    api = Api(adsorption_mod=ads, report_full_mod=_fake_report_full(),
+              config_mod=_fake_config(cfg={'potcar_lib_root': '/lib'}))
+    out = api.proj_create('demo', str(slab), ['/c1', '/c2'], str(incar), '',
+                          str(tmp_path))
+    assert out['ok'] is True
+    assert out['project_path'] == str(tmp_path / 'demo' / 'project.yaml')
+    assert out['error'] is None
+    # 参数顺序/键忠实镜像 _on_generate → create_project
+    c = calls['create']
+    assert c['root'] == os.path.join(str(tmp_path), 'demo') and c['name'] == 'demo'
+    assert c['clean_poscar'] == str(slab)
+    assert c['config_poscars'] == ['/c1', '/c2']
+    assert c['incar_path'] == str(incar)
+    assert c['ref_poscar'] is None       # 空气相 → None(镜像可选气相参考)
+    assert c['lib_root'] == '/lib'
+    # advisories → "[级别] 文案" 字符串列表
+    assert out['advisories'] == ['[P1·ENCUT] 建议统一 ENCUT=400']
+    # 坏组态隔离:build 警告 + 组态错误都进 warnings(不整体失败)
+    assert 'demo_ads_x:偶极建议' in out['warnings']
+    assert 'demo_ads_bad:POTCAR 缺 Ta' in out['warnings']
+
+
+def test_proj_create_validation_error_short_circuits(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text('incar')
+    ads = _fake_adsorption(create_ret={'ok': True})
+    api = Api(adsorption_mod=ads, config_mod=_fake_config())
+    # 清洁表面缺失 → 校验拦截,不触碰 create_project
+    ads.create_project = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError('不应生成'))
+    out = api.proj_create('demo', '/no/such/slab', ['/c1'], str(incar), '',
+                          str(tmp_path))
+    assert out['ok'] is False and out['project_path'] is None
+    assert '清洁表面' in out['error']
+
+
+def test_proj_create_exception_is_caught(tmp_path):
+    slab = tmp_path / 'POSCAR'
+    slab.write_text('s')
+    incar = tmp_path / 'INCAR'
+    incar.write_text('i')
+    ads = _fake_adsorption()
+    ads.create_project = lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError('赝势缺失'))
+    api = Api(adsorption_mod=ads, config_mod=_fake_config())
+    out = api.proj_create('demo', str(slab), ['/c1'], str(incar), '', str(tmp_path))
+    assert out['ok'] is False and out['project_path'] is None
+    assert '赝势缺失' in out['error']
+
+
+# ── proj_delta ───────────────────────────────────────────────────────────────
+def test_proj_delta_passes_through_rows_and_gating():
+    proj = {'name': 'demo', 'members': {}}
+    delta_ret = {
+        'slab': ('DONE', -12.5), 'ref': ('无', None), 'has_ref': False,
+        'rows': [
+            {'name': 'demo_ads_a', 'state': 'DONE', 'e_config': -20.0,
+             'delta_e': -2.5, 'note': ''},
+            {'name': 'demo_ads_b', 'state': 'RUNNING', 'e_config': None,
+             'delta_e': None, 'note': '组态未完成'},
+        ],
+    }
+    ads = _fake_adsorption(proj_map={'/p': proj}, delta_ret=delta_ret)
+    api = Api(adsorption_mod=ads, report_full_mod=_fake_report_full())
+    out = api.proj_delta('/p')
+    assert out['ok'] is True and out['error'] is None
+    assert out['rows'][0]['delta_e'] == -2.5
+    assert out['rows'][1]['delta_e'] is None and '组态未完成' in out['rows'][1]['note']
+    assert '清洁表面' in out['note']
+
+
+def test_proj_delta_missing_project_error():
+    ads = _fake_adsorption(proj_map={})
+    api = Api(adsorption_mod=ads, report_full_mod=_fake_report_full())
+    out = api.proj_delta('/gone')
+    assert out['ok'] is False and out['rows'] == []
+    assert '项目' in out['error']
+
+
+# ── proj_export_csv ──────────────────────────────────────────────────────────
+def test_proj_export_csv_delegates():
+    proj = {'name': 'demo', 'members': {}}
+    calls = {}
+    ads = _fake_adsorption(proj_map={'/p': proj}, delta_ret={'rows': []},
+                           csv_ret='/save/demo.csv', calls=calls)
+    api = Api(adsorption_mod=ads, report_full_mod=_fake_report_full())
+    out = api.proj_export_csv('/p', '/save/demo.csv')
+    assert out['ok'] is True and out['file'] == '/save/demo.csv'
+    assert out['error'] is None and calls['export']['out'] == '/save/demo.csv'
+
+
+def test_proj_export_csv_missing_project_error():
+    ads = _fake_adsorption(proj_map={})
+    api = Api(adsorption_mod=ads, report_full_mod=_fake_report_full())
+    out = api.proj_export_csv('/gone', '/save/x.csv')
+    assert out['ok'] is False and out['file'] is None and '项目' in out['error']
+
+
+# ── proj_report ──────────────────────────────────────────────────────────────
+def test_proj_report_generates_via_report_full():
+    proj = {'name': 'demo', 'members': {}}
+    calls = {}
+    ads = _fake_adsorption(proj_map={'/p': proj})
+    rf = _fake_report_full(member_dirs=['/s', '/c1'],
+                           report_ret='/save/报告.html', calls=calls)
+    api = Api(adsorption_mod=ads, report_full_mod=rf,
+              config_mod=_fake_config(cfg={'k': 'v'}))
+    out = api.proj_report('/p', '/save/报告.html')
+    assert out['ok'] is True and out['file'] == '/save/报告.html'
+    assert calls['report']['out'] == '/save/报告.html'
+    assert calls['report']['config'] == {'k': 'v'} and calls['report']['proj'] is proj
+
+
+def test_proj_report_no_members_error():
+    proj = {'name': 'demo', 'members': {}}
+    ads = _fake_adsorption(proj_map={'/p': proj})
+    rf = _fake_report_full(member_dirs=[])       # 无成员作业
+    api = Api(adsorption_mod=ads, report_full_mod=rf, config_mod=_fake_config())
+    out = api.proj_report('/p', '/save/x.html')
+    assert out['ok'] is False and out['file'] is None and '成员' in out['error']
 
 
 def test_query_workdir_delegates_to_batch_ops():

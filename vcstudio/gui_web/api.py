@@ -19,7 +19,8 @@ class Api:
     def __init__(self, *, profiles_mod=None, secrets_mod=None, ssh_test_mod=None,
                  batch_ops_mod=None, ledger_mod=None, manifest_mod=None,
                  submitter_mod=None, config_mod=None, job_builder_mod=None,
-                 logic_mod=None, dialog_fn=None):
+                 logic_mod=None, adsorption_mod=None, report_full_mod=None,
+                 dialog_fn=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -27,6 +28,7 @@ class Api:
         from vcstudio.shared import config as _cfg
         from vcstudio.generate import job_builder as _jb
         from vcstudio.gui import logic as _logic
+        from vcstudio.project import adsorption as _ads
         self._profiles = profiles_mod or _p
         self._secrets = secrets_mod or _s
         self._ledger = ledger_mod or _l
@@ -35,10 +37,14 @@ class Api:
         self._config = config_mod or _cfg
         self._job_builder = job_builder_mod or _jb
         self._logic = logic_mod or _logic
+        # 项目页:adsorption 纯模块(无 matplotlib)即时导入;report_full 牵扯 charts
+        # (matplotlib 相邻)故延迟到用时 import(同 batch_ops),测试注入假件即免真依赖。
+        self._adsorption = adsorption_mod or _ads
         self._dialog_fn = dialog_fn        # 测试注入假 dialog;None → 真走 webview
         self._ssh_test = ssh_test_mod      # 重依赖延迟到用时 import
         self._batch_ops = batch_ops_mod
         self._submitter = submitter_mod
+        self._report_full = report_full_mod
 
     # ── 桥活性探测(前端用来确认 js_api 已就绪) ──
     def ping(self) -> str:
@@ -62,6 +68,13 @@ class Api:
             from vcstudio.cluster import ssh_test
             self._ssh_test = ssh_test
         return self._ssh_test
+
+    def _rf(self):
+        """report_full 延迟加载(牵扯 charts/matplotlib 相邻,重):测试注入假件即免真依赖。"""
+        if self._report_full is None:
+            from vcstudio.project import report_full
+            self._report_full = report_full
+        return self._report_full
 
     def _resolve(self, name, password):
         """名字 → (profile, 密码, err_dict|None)。
@@ -345,6 +358,155 @@ class Api:
                     'warnings': warnings, 'error': None}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'job_dir': None, 'warnings': [], 'error': str(e)}
+
+    # ── 吸附能项目页(镜像 gui/project_tab 调用面:列表/创建/ΔE/CSV/报告) ─────────
+    def proj_list(self):
+        """项目注册表 → [{path,name,n_members}](镜像 project_tab._reload_projects)。
+
+        n_members 用 report_full._member_dirs 作单一口径(清洁表面 + 气相参考 + 组态族);
+        畸形/已移动的 project.yaml(load_project→None)静默跳过,不整体失败。
+        """
+        try:
+            projects = []
+            for pp in self._adsorption.list_projects():
+                proj = self._adsorption.load_project(pp)
+                if proj is None:
+                    continue
+                projects.append({
+                    'path': pp,
+                    'name': proj.get('name', '') or '',
+                    'n_members': len(self._rf()._member_dirs(proj)),
+                })
+            return {'projects': projects, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'projects': [], 'error': str(e)}
+
+    def proj_create(self, name, slab_path, config_paths, incar_path, gas_path,
+                    out_root):
+        """批量生成 清洁表面 + 组态族 +(可选)气相参考(镜像 project_tab._on_generate)。
+
+        前置校验照抄 _on_generate;lib_root 从 config 读(失败静默)。坏组态隔离语义在
+        adsorption 层已就位(create_project 的 errors 只记不拖垮全组)→ 此处把 build 警告
+        与组态 errors 一并透传进 warnings,不整体失败;advisories 转成 "[级别] 文案" 列表
+        (project_tab 展示口径)。gas_path 空 → ref_poscar=None(镜像可选气相参考)。
+        """
+        try:
+            name = (name or '').strip()
+            slab = (slab_path or '').strip()
+            incar = (incar_path or '').strip()
+            gas = (gas_path or '').strip()
+            root = (out_root or '').strip()
+            configs = [str(p).strip() for p in (config_paths or []) if str(p).strip()]
+            errs = []
+            if not name:
+                errs.append('未填项目名')
+            if not root:
+                errs.append('未选输出根目录')
+            if not slab or not os.path.isfile(slab):
+                errs.append('清洁表面 POSCAR 不存在')
+            if not incar or not os.path.isfile(incar):
+                errs.append('共享 INCAR 不存在')
+            if not configs:
+                errs.append('至少添加一个吸附组态')
+            if gas and not os.path.isfile(gas):
+                errs.append('气相参考文件不存在')
+            if errs:
+                return {'ok': False, 'project_path': None, 'advisories': [],
+                        'warnings': [], 'error': ';'.join(errs)}
+            lib = ''
+            try:
+                lib = self._config.load_config().get('potcar_lib_root', '') or ''
+            except Exception:                             # noqa: BLE001
+                pass
+            res = self._adsorption.create_project(
+                os.path.join(root, name), name,
+                clean_poscar=slab, config_poscars=configs,
+                incar_path=incar, ref_poscar=(gas or None),
+                lib_root=(lib or None))
+            advisories = [f'[{pri}·{aname}] {msg}'
+                          for pri, aname, msg in (res.get('advisories') or [])]
+            warnings = []
+            for member, _d, wlist in (res.get('generated') or []):
+                for w in (wlist or []):
+                    warnings.append(f'{member}:{w}')
+            for member, msg in (res.get('errors') or []):
+                warnings.append(f'{member}:{msg}')
+            return {'ok': bool(res.get('ok')),
+                    'project_path': res.get('project_path'),
+                    'advisories': advisories, 'warnings': warnings, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'project_path': None, 'advisories': [],
+                    'warnings': [], 'error': str(e)}
+
+    def proj_delta(self, path):
+        """项目 ΔE 汇总(镜像 project_tab._on_delta)。
+
+        rows 忠实透传 delta_e_rows 的字段(name/state/e_config/delta_e/note);ΔE 门控语义
+        原样——任一成员未 DONE 时对应行 delta_e=None 且 note 明说缺谁。note 顶层汇总清洁
+        表面/气相参考状态(镜像 _on_delta 头部两行)。
+        """
+        try:
+            proj = self._adsorption.load_project((path or '').strip())
+            if proj is None:
+                return {'ok': False, 'rows': [], 'note': '',
+                        'error': '项目不存在或 project.yaml 已被移动'}
+            s = self._adsorption.delta_e_rows(proj)
+            slab_state, e_slab = s['slab']
+            ref_state, e_ref = s['ref']
+            rows = [{'name': r['name'], 'state': r['state'],
+                     'e_config': r['e_config'], 'delta_e': r['delta_e'],
+                     'note': r['note']} for r in (s.get('rows') or [])]
+            parts = [f'清洁表面:{slab_state}']
+            parts.append(f'气相参考:{ref_state}' if s.get('has_ref')
+                         else '未设气相参考')
+            return {'ok': True, 'rows': rows, 'note': ';'.join(parts),
+                    'slab': {'state': slab_state, 'energy': e_slab},
+                    'ref': {'state': ref_state, 'energy': e_ref,
+                            'has_ref': bool(s.get('has_ref'))},
+                    'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'rows': [], 'note': '', 'error': str(e)}
+
+    def proj_export_csv(self, path, save_to):
+        """ΔE 表导出 CSV(镜像 project_tab._on_export;utf-8-sig 语义在 adsorption 层)。"""
+        try:
+            proj = self._adsorption.load_project((path or '').strip())
+            if proj is None:
+                return {'ok': False, 'file': None,
+                        'error': '项目不存在或 project.yaml 已被移动'}
+            out = (save_to or '').strip()
+            if not out:
+                return {'ok': False, 'file': None, 'error': '未指定导出路径'}
+            s = self._adsorption.delta_e_rows(proj)
+            result = self._adsorption.export_csv(proj, s, out)
+            return {'ok': True, 'file': str(result), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'file': None, 'error': str(e)}
+
+    def proj_report(self, path, save_to):
+        """完整项目报告(镜像 project_tab._on_report);同步执行,耗时长在 JS 侧提示等待。
+
+        load_project → 无成员作业防呆(report_full._member_dirs)→ generate_project_report
+        (proj, save_to, config=load_config())。config 读失败降级为 {}(同 _on_report)。
+        """
+        try:
+            proj = self._adsorption.load_project((path or '').strip())
+            if proj is None:
+                return {'ok': False, 'file': None,
+                        'error': '项目不存在或 project.yaml 已被移动'}
+            out = (save_to or '').strip()
+            if not out:
+                return {'ok': False, 'file': None, 'error': '未指定报告路径'}
+            if not self._rf()._member_dirs(proj):
+                return {'ok': False, 'file': None, 'error': '项目无成员作业'}
+            try:
+                cfg = self._config.load_config()
+            except Exception:                             # noqa: BLE001
+                cfg = {}
+            result = self._rf().generate_project_report(proj, out, config=cfg)
+            return {'ok': True, 'file': str(result), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'file': None, 'error': str(e)}
 
     # ── 文件/目录选择(web 无原生 input;pywebview 延迟 import,测试注入 dialog_fn) ──
     def pick_file(self, kind='poscar'):
