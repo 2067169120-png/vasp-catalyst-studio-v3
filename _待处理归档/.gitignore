@@ -1,0 +1,6 @@
+# 本目录是"待定夺"暂存区:内容一律不入 git(与 .superpowers/sdd/.gitignore 同理)。
+# 仅保留清单 README.md 与本 .gitignore 入库,方便记录去向。
+# 已跟踪的文件(如 git mv 进来的 2026-07-05-夜间优化完成报告.md)不受影响,仍保留历史。
+*
+!README.md
+!.gitignore

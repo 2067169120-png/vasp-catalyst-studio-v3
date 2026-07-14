@@ -12,7 +12,9 @@
 | `packaging/` | 打包脚本 `build_exe.py`(无参=web 入口,`--legacy`=旧 tkinter) |
 | `tools/` | 独立辅助脚本(如 `generate_word_report.py` Word 报告导出) |
 | `results/` | 作业/项目输出根(内容 gitignore,仅留 `.gitkeep` 占位) |
-| `_待处理归档/` | 过程性文件暂存区,等用户定夺;README 有清单,不删除 |
+| `dist/` | 打包产物(gitignore):现役 `VASP Catalyst Studio.exe`(默认 Web)+ `…Legacy.exe`(旧 tkinter) |
+| `.superpowers/sdd/` | SDD 工作区(gitignore):`progress.md` 跨会话生命线;中间产物已迁 `_待处理归档/` |
+| `_待处理归档/` | 过程性文件暂存区,等用户定夺;README 有清单,内容不入 git,不删除 |
 
 ## 顶层文件
 

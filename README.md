@@ -1,5 +1,7 @@
 # VASP Catalyst Studio (vcstudio)
 
+> 📂 仓库目录结构速查见 **[STRUCTURE.md](STRUCTURE.md)**。
+
 > 轻量化 VASP 自动化桌面平台:**生成输入 → 多集群提交 → 失败诊断 → 有界恢复 → ΔE/自由能分析 → 出版级报告**。Windows 单文件 EXE,确定性核心零 token,LLM 只在分析层。
 
 📖 完整用法与代码分区块地图见 **[使用说明.md](使用说明.md)**。
