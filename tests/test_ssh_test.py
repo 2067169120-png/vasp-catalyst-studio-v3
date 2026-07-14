@@ -122,6 +122,30 @@ def test_jump_client_closed_after_check():
     assert target.closed and jump.closed
 
 
+def test_detect_scheduler_honors_scheduler_bin():
+    """1w 实情:torque 不在默认 PATH(command -v 探不到),但 profile 填了
+    scheduler_bin=/opt/torque-6.1.2/bin → 探测必须补查该目录,报 PBS 而非 Shell。
+    否则用户被"检测到 Shell"误导,查任务永远报调度器不支持(本次 exe 看不到任务的根源之一)。"""
+    # 探测是一条合并命令(command -v …; ls <bin>/…):只有探测命令里真的带上了
+    # scheduler_bin 的 ls,这个假件才会命中并回出 qsub 路径 → 判定 PBS
+    fake = FakeClient({'ls /opt/torque-6.1.2/bin': '/opt/torque-6.1.2/bin/qsub\n'})
+    prof = ClusterProfile(name='c', hostname='h', username='u', auth='password',
+                          scheduler_bin='/opt/torque-6.1.2/bin')
+    res = check_connection(prof, password='pw', client_factory=lambda: fake, trust_new=True)
+    assert res.ok is True
+    assert res.scheduler == 'PBS'
+
+
+def test_connect_kwargs_have_robust_timeouts():
+    fake = FakeClient({'whoami': 'u\n'})
+    prof = ClusterProfile(name='c', hostname='h', username='u', auth='password')
+    check_connection(prof, password='pw', client_factory=lambda: fake, trust_new=True)
+    kw = fake.connect_kwargs
+    assert kw['timeout'] >= 30
+    assert kw.get('banner_timeout', 0) >= 30
+    assert kw.get('auth_timeout', 0) >= 30
+
+
 def test_jump_client_closed_on_target_auth_failure():
     import paramiko
     target = FakeClient({}, raise_on_connect=paramiko.AuthenticationException())

@@ -31,9 +31,16 @@ def default_known_hosts_path() -> Path:
     return user_config_dir() / 'known_hosts'
 
 
-def _detect_scheduler(client) -> str:
-    """跑一条 command -v 探测,返回 Slurm/PBS/LSF/Shell。"""
+def _detect_scheduler(client, scheduler_bin: str = '') -> str:
+    """跑一条 command -v 探测,返回 Slurm/PBS/LSF/Shell。
+
+    profile 填了 scheduler_bin 时补查该目录(1w 实情:torque 在 /opt/torque-6.1.2/bin,
+    不在默认 PATH,只靠 command -v 会误报 Shell,把用户配置往错里带)。
+    """
     probe = 'command -v sbatch qsub bsub 2>/dev/null'
+    if scheduler_bin:
+        b = scheduler_bin.rstrip('/')
+        probe += f'; ls {b}/sbatch {b}/qsub {b}/bsub 2>/dev/null'
     _in, out, _err = client.exec_command(probe)
     found = out.read().decode(errors='replace')
     for name, exe in _SCHED_PROBES:
@@ -65,8 +72,10 @@ def check_connection(profile, password: str | None = None, *,
         client.set_missing_host_key_policy(
             paramiko.AutoAddPolicy() if trust_new else paramiko.RejectPolicy())
 
+        # 超时口径与 connection.open_client 一致(1w 跳板 sshd 慢,15s 不够)
         connect_kwargs = dict(hostname=profile.hostname, port=int(profile.port),
-                              username=profile.username, timeout=15,
+                              username=profile.username, timeout=30,
+                              banner_timeout=45, auth_timeout=30,
                               allow_agent=False, look_for_keys=False)
         if profile.auth == 'key':
             connect_kwargs['key_filename'] = profile.key_path
@@ -90,7 +99,7 @@ def check_connection(profile, password: str | None = None, *,
 
         _in, out, _err = client.exec_command('whoami')
         who = out.read().decode(errors='replace').strip()
-        sched = _detect_scheduler(client)
+        sched = _detect_scheduler(client, getattr(profile, 'scheduler_bin', ''))
 
         if trust_new:
             try:
@@ -133,7 +142,8 @@ def _open_jump_channel(profile, password, factory, *,
         jump.set_missing_host_key_policy(
             paramiko.AutoAddPolicy() if trust_new else paramiko.RejectPolicy())
         jkwargs = dict(hostname=profile.jump_host, port=int(profile.jump_port),
-                       username=profile.jump_user or profile.username, timeout=15,
+                       username=profile.jump_user or profile.username, timeout=30,
+                       banner_timeout=45, auth_timeout=30,
                        allow_agent=False, look_for_keys=False)
         if profile.auth == 'key':
             jkwargs['key_filename'] = profile.key_path

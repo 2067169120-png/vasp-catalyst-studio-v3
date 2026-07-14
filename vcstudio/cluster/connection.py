@@ -47,8 +47,11 @@ def open_client(profile, password: str | None = None, *,
     client.set_missing_host_key_policy(
         paramiko.AutoAddPolicy() if trust_new else paramiko.RejectPolicy())
 
+    # 超时口径借自 V2.0.0 layer1_hpc(1w 跳板 sshd 实测慢,banner 可拖过 15s):
+    # timeout=30 + banner/auth 显式给足,防"能 ping 通但握手超时"的假性连接失败
     kwargs = dict(hostname=profile.hostname, port=int(profile.port),
-                  username=profile.username, timeout=15,
+                  username=profile.username, timeout=30,
+                  banner_timeout=45, auth_timeout=30,
                   allow_agent=False, look_for_keys=False)
     if profile.auth == 'key':
         kwargs['key_filename'] = profile.key_path
@@ -71,6 +74,17 @@ def open_client(profile, password: str | None = None, *,
     except (OSError, EOFError) as e:
         close_quiet(client, jump)
         raise ConnectError(f'连接失败:{e}') from None
+
+    # keepalive 借自 V2.0.0(set_keepalive(30)):批量查询/慢集群下防 NAT 半路掐死空闲连接
+    for c in (client, jump):
+        if c is None:
+            continue
+        try:
+            t = c.get_transport()
+            if t is not None:
+                t.set_keepalive(30)
+        except Exception:
+            pass
 
     if trust_new:
         try:
