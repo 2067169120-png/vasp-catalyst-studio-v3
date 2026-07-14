@@ -416,6 +416,165 @@ def test_ping_still_pong():
     assert Api().ping() == 'pong'
 
 
+# ── 生成页假件 ────────────────────────────────────────────────────────────────
+def _fake_config(cfg=None, ui=None, calls=None):
+    """config 假件:load_config/get_ui_state 只读;set_* 落 calls 便于断言持久化。"""
+    cfg = dict(cfg or {})
+    ui = dict(ui or {})
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.load_config = lambda *a, **k: dict(cfg)
+    m.get_ui_state = lambda c=None: dict(ui)
+    m.set_ui_state = lambda **kv: calls.__setitem__('ui_state', dict(kv))
+    m.set_potcar_lib_root = lambda p, *a, **k: calls.__setitem__('lib', p)
+    return m
+
+
+def _fake_logic(pos='POS摘要', inc='INC预览', errs=None):
+    m = types.SimpleNamespace()
+    m.poscar_preview = lambda path, calc='slab': pos
+    m.incar_preview = lambda incar, poscar, lib, validate=True: inc
+    m.validate_generate_inputs = lambda p, i, o, l: list(errs or [])
+    return m
+
+
+def _fake_ledger_register(registered):
+    m = types.SimpleNamespace()
+    m.register = lambda d: registered.append(d) or True
+    return m
+
+
+def _fake_manifest(written):
+    m = types.SimpleNamespace()
+    m.create_from_build = lambda jd, payload, *, poscar_path, validate: written.update(
+        jd=jd, poscar=poscar_path, validate=validate)
+    return m
+
+
+# ── gen_preview ──────────────────────────────────────────────────────────────
+def test_gen_preview_returns_summary():
+    api = Api(config_mod=_fake_config(cfg={'potcar_lib_root': '/lib'}),
+              logic_mod=_fake_logic(pos='体系 A', inc='将补全 ENCUT'))
+    out = api.gen_preview('/p/POSCAR', '/p/INCAR')
+    assert out['ok'] is True and out['error'] is None
+    assert out['summary']['poscar'] == '体系 A'
+    assert out['summary']['incar'] == '将补全 ENCUT'
+
+
+def test_gen_preview_error_is_caught():
+    boom = _fake_logic()
+    boom.poscar_preview = lambda path, calc='slab': (_ for _ in ()).throw(RuntimeError('解析炸了'))
+    api = Api(config_mod=_fake_config(), logic_mod=boom)
+    out = api.gen_preview('/p/POSCAR', '/p/INCAR')
+    assert out['ok'] is False and '解析炸了' in out['error']
+
+
+# ── gen_state ────────────────────────────────────────────────────────────────
+def test_gen_state_backfills_from_config():
+    cfg = {'potcar_lib_root': '/lib'}
+    ui = {'last_poscar': '/last/POSCAR', 'last_incar': '/last/INCAR', 'last_out': '/last/out'}
+    api = Api(config_mod=_fake_config(cfg=cfg, ui=ui))
+    out = api.gen_state()
+    assert out == {'poscar': '/last/POSCAR', 'incar': '/last/INCAR',
+                   'out_dir': '/last/out', 'lib_root': '/lib'}
+
+
+def test_gen_state_error_is_caught():
+    boom = types.SimpleNamespace(
+        load_config=lambda *a, **k: (_ for _ in ()).throw(RuntimeError('config坏了')),
+        get_ui_state=lambda c=None: {})
+    api = Api(config_mod=boom)
+    out = api.gen_state()
+    assert out['poscar'] == '' and out['lib_root'] == '' and 'config坏了' in out.get('error', '')
+
+
+# ── gen_run(build→manifest→ledger 全链) ─────────────────────────────────────
+def test_gen_run_full_chain_writes_manifest_and_registers():
+    calls, written, registered = {}, {}, []
+    payload = {'ok': True, 'out_dir': '/out/job1', 'warnings': ['⚠ 建议偶极修正'],
+               'kpoints': [5, 5, 1], 'elements': ['Mo', 'S']}
+    jb = types.SimpleNamespace(
+        build_job_dir=lambda poscar, incar, out, **k: dict(payload))
+    api = Api(config_mod=_fake_config(calls=calls),
+              logic_mod=_fake_logic(errs=[]),
+              job_builder_mod=jb,
+              manifest_mod=_fake_manifest(written),
+              ledger_mod=_fake_ledger_register(registered))
+    out = api.gen_run('/p/POSCAR', '/p/INCAR', '/out/job1', '/lib')
+    assert out['ok'] is True and out['job_dir'] == '/out/job1'
+    assert out['warnings'] == ['⚠ 建议偶极修正'] and out['error'] is None
+    # 落档 + 台账登记 + 持久化 lib/ui_state
+    assert written == {'jd': '/out/job1', 'poscar': '/p/POSCAR', 'validate': True}
+    assert registered == ['/out/job1']
+    assert calls['lib'] == '/lib'
+    assert calls['ui_state'] == {'last_poscar': '/p/POSCAR',
+                                 'last_incar': '/p/INCAR', 'last_out': '/out/job1'}
+
+
+def test_gen_run_validation_error_short_circuits():
+    jb = types.SimpleNamespace(
+        build_job_dir=lambda *a, **k: (_ for _ in ()).throw(AssertionError('不应生成')))
+    api = Api(config_mod=_fake_config(),
+              logic_mod=_fake_logic(errs=['POSCAR 文件不存在或未选择']),
+              job_builder_mod=jb)
+    out = api.gen_run('', '/p/INCAR', '/out', '/lib')
+    assert out['ok'] is False and out['job_dir'] is None
+    assert 'POSCAR' in out['error']
+
+
+def test_gen_run_build_exception_is_caught():
+    jb = types.SimpleNamespace(
+        build_job_dir=lambda poscar, incar, out, **k:
+        (_ for _ in ()).throw(ValueError('POSCAR 缺元素符号行')))
+    api = Api(config_mod=_fake_config(), logic_mod=_fake_logic(errs=[]),
+              job_builder_mod=jb)
+    out = api.gen_run('/p/POSCAR', '/p/INCAR', '/out', '/lib')
+    assert out['ok'] is False and out['job_dir'] is None
+    assert '缺元素符号行' in out['error']
+
+
+def test_gen_run_manifest_failure_only_warns():
+    """job.yaml/台账写失败不撤销已生成的四件套,只追加警告。"""
+    registered = []
+    payload = {'ok': True, 'out_dir': '/out/j', 'warnings': []}
+    jb = types.SimpleNamespace(build_job_dir=lambda poscar, incar, out, **k: dict(payload))
+    manifest = types.SimpleNamespace(
+        create_from_build=lambda *a, **k: (_ for _ in ()).throw(OSError('磁盘满')))
+    api = Api(config_mod=_fake_config(), logic_mod=_fake_logic(errs=[]),
+              job_builder_mod=jb, manifest_mod=manifest,
+              ledger_mod=_fake_ledger_register(registered))
+    out = api.gen_run('/p/POSCAR', '/p/INCAR', '/out/j', '/lib')
+    assert out['ok'] is True and out['job_dir'] == '/out/j'
+    assert any('磁盘满' in w for w in out['warnings'])
+
+
+# ── pick_file / pick_dir(注入 dialog_fn,零 webview) ────────────────────────
+def test_pick_file_uses_injected_dialog():
+    seen = {}
+    api = Api(dialog_fn=lambda kind: seen.update(kind=kind) or '/chosen/POSCAR')
+    out = api.pick_file('poscar')
+    assert out['path'] == '/chosen/POSCAR' and seen['kind'] == 'poscar'
+
+
+def test_pick_file_cancel_returns_none():
+    api = Api(dialog_fn=lambda kind: None)
+    out = api.pick_file('incar')
+    assert out['path'] is None
+
+
+def test_pick_dir_uses_injected_dialog():
+    seen = {}
+    api = Api(dialog_fn=lambda kind: seen.update(kind=kind) or '/chosen/dir')
+    out = api.pick_dir()
+    assert out['path'] == '/chosen/dir' and seen['kind'] == 'dir'
+
+
+def test_pick_dir_cancel_returns_none():
+    api = Api(dialog_fn=lambda kind: None)
+    out = api.pick_dir()
+    assert out['path'] is None
+
+
 def test_query_workdir_delegates_to_batch_ops():
     import types
     calls = {}

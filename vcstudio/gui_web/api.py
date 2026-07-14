@@ -18,15 +18,24 @@ class Api:
 
     def __init__(self, *, profiles_mod=None, secrets_mod=None, ssh_test_mod=None,
                  batch_ops_mod=None, ledger_mod=None, manifest_mod=None,
-                 submitter_mod=None):
+                 submitter_mod=None, config_mod=None, job_builder_mod=None,
+                 logic_mod=None, dialog_fn=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
         from vcstudio.shared import manifest as _m
+        from vcstudio.shared import config as _cfg
+        from vcstudio.generate import job_builder as _jb
+        from vcstudio.gui import logic as _logic
         self._profiles = profiles_mod or _p
         self._secrets = secrets_mod or _s
         self._ledger = ledger_mod or _l
         self._manifest = manifest_mod or _m
+        # 生成页依赖(纯模块,无网络/keyring,故与 ledger/manifest 一样即时导入)
+        self._config = config_mod or _cfg
+        self._job_builder = job_builder_mod or _jb
+        self._logic = logic_mod or _logic
+        self._dialog_fn = dialog_fn        # 测试注入假 dialog;None → 真走 webview
         self._ssh_test = ssh_test_mod      # 重依赖延迟到用时 import
         self._batch_ops = batch_ops_mod
         self._submitter = submitter_mod
@@ -259,6 +268,108 @@ class Api:
             return {'ok': True, 'removed': len(stale)}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'error': str(e)}
+
+    # ── 生成页(镜像 gui/generate_tab 的调用面:预览/回填/一键生成/文件选择) ─────
+    def gen_preview(self, poscar_path, incar_path):
+        """即时解析预览(镜像 generate_tab._refresh_preview):纯读、不写任何文件。
+
+        summary = {'poscar','incar'} 两段中文摘要(logic.poscar_preview/incar_preview
+        自身已把解析问题降级为友好文案);calc_type/validate 取生成默认(slab/开)。
+        """
+        try:
+            poscar = (poscar_path or '').strip()
+            incar = (incar_path or '').strip()
+            cfg = self._config.load_config()
+            lib = cfg.get('potcar_lib_root', '') or ''
+            pos_txt = self._logic.poscar_preview(poscar, 'slab')
+            inc_txt = self._logic.incar_preview(incar, poscar, lib, True)
+            return {'ok': True, 'summary': {'poscar': pos_txt, 'incar': inc_txt},
+                    'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'summary': None, 'error': str(e)}
+
+    def gen_state(self):
+        """启动回填(镜像 generate_tab._load_state):最近 POSCAR/INCAR/输出目录 + 赝势库。"""
+        try:
+            cfg = self._config.load_config()
+            ui = self._config.get_ui_state(cfg)
+            return {'poscar': ui.get('last_poscar', '') or '',
+                    'incar': ui.get('last_incar', '') or '',
+                    'out_dir': ui.get('last_out', '') or '',
+                    'lib_root': cfg.get('potcar_lib_root', '') or ''}
+        except Exception as e:                            # noqa: BLE001
+            return {'poscar': '', 'incar': '', 'out_dir': '', 'lib_root': '',
+                    'error': str(e)}
+
+    def gen_run(self, poscar_path, incar_path, out_dir, lib_root):
+        """一键生成(镜像 generate_tab._on_run→build_job_dir→_write_manifest→ledger.register)。
+
+        web 无 KPOINTS/计算类型/校验开关字段 → 取生成默认(自动 K 网格 / slab / 开校验)。
+        job.yaml 与台账写入失败只追加警告,绝不撤销已生成的四件套(同 _write_manifest 口径)。
+        """
+        try:
+            poscar = (poscar_path or '').strip()
+            incar = (incar_path or '').strip()
+            out = (out_dir or '').strip()
+            lib = (lib_root or '').strip()
+            # 持久化赝势库(_persist_lib:失败只告警,不挡生成)
+            if lib:
+                try:
+                    self._config.set_potcar_lib_root(lib)
+                except Exception:                         # noqa: BLE001
+                    pass
+            errs = self._logic.validate_generate_inputs(poscar, incar, out, lib)
+            if errs:
+                return {'ok': False, 'job_dir': None, 'warnings': [],
+                        'error': ';'.join(errs)}
+            validate, calc_type, kpts = True, 'slab', None
+            # 路径记忆:下次启动自动回填(失败静默,同 _on_run)
+            try:
+                self._config.set_ui_state(last_poscar=poscar, last_incar=incar,
+                                          last_out=out)
+            except Exception:                             # noqa: BLE001
+                pass
+            payload = self._job_builder.build_job_dir(
+                poscar, incar, out, calc_type=calc_type, kpoints=kpts,
+                validate=validate, lib_root=lib)
+            warnings = list(payload.get('warnings') or [])
+            # 落 job.yaml + 登记台账(_write_manifest:失败只告警)
+            try:
+                self._manifest.create_from_build(
+                    payload['out_dir'], payload,
+                    poscar_path=poscar, validate=validate)
+                self._ledger.register(payload['out_dir'])
+            except Exception as e:                        # noqa: BLE001
+                warnings.append(f'job.yaml/台账写入失败(不影响四件套):{e}')
+            return {'ok': True, 'job_dir': payload['out_dir'],
+                    'warnings': warnings, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'job_dir': None, 'warnings': [], 'error': str(e)}
+
+    # ── 文件/目录选择(web 无原生 input;pywebview 延迟 import,测试注入 dialog_fn) ──
+    def pick_file(self, kind='poscar'):
+        try:
+            if self._dialog_fn is not None:
+                path = self._dialog_fn(kind)
+            else:
+                import webview                            # 延迟:测试永不 import
+                res = webview.windows[0].create_file_dialog(webview.OPEN_DIALOG)
+                path = res[0] if res else None
+            return {'path': path or None}
+        except Exception as e:                            # noqa: BLE001
+            return {'path': None, 'error': str(e)}
+
+    def pick_dir(self):
+        try:
+            if self._dialog_fn is not None:
+                path = self._dialog_fn('dir')
+            else:
+                import webview                            # 延迟:测试永不 import
+                res = webview.windows[0].create_file_dialog(webview.FOLDER_DIALOG)
+                path = res[0] if res else None
+            return {'path': path or None}
+        except Exception as e:                            # noqa: BLE001
+            return {'path': None, 'error': str(e)}
 
     # ── 打开本地目录(仅 win32:os.startfile) ──
     def open_dir(self, path):
