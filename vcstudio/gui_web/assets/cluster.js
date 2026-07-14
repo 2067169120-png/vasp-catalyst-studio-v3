@@ -154,6 +154,7 @@
 
   // ── 测试连接:先保存现值 → 取密码(仅 password 且 keyring 无)→ 测试 → 探测比对 ──
   async function testConnection() {
+    hideWarn();  // 清掉上次测试遗留的调度器不一致警告条,避免失败/取消后残留
     const data = readForm();
     if (!data.name) { VCS.log('集群名称不能为空,无法测试', 'failc'); return; }
     // save-first:test_connection 读的是已保存 profile,故先落盘
