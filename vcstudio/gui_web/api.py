@@ -173,40 +173,39 @@ class Api:
             return {'jobs': [], 'stale': [], 'error': str(e)}
 
     # ── 任务:远程动作(一律先 _resolve 再委托 batch_ops 同名函数) ─────────
-    def submit_jobs(self, dirs, name, password, trust_new=False):
-        prof, pw, err = self._resolve(name, password)
-        if err:
-            return err
+    def _delegate(self, name, password, fn):
+        """五个远程方法的公共壳:解析集群+密码 → 委托 batch_ops;任何异常兜成 error dict。
+
+        _resolve 内部会读 load_profiles()/keyring,配置损坏或后端报错也须在此兜住,
+        绝不穿透到 JS。
+        """
         try:
-            return self._bo().submit_batch(prof, pw, list(dirs), bool(trust_new))
-        except Exception as e:                            # noqa: BLE001
+            prof, pw, err = self._resolve(name, password)
+            if err:
+                return err
+            return fn(prof, pw)
+        except Exception as e:                            # noqa: BLE001 异常绝不穿透到 JS
             return {'error': str(e)}
 
+    def submit_jobs(self, dirs, name, password, trust_new=False):
+        return self._delegate(name, password,
+                              lambda prof, pw: self._bo().submit_batch(
+                                  prof, pw, list(dirs), bool(trust_new)))
+
     def fetch_jobs(self, dirs, name, password, trust_new=False, files=None):
-        prof, pw, err = self._resolve(name, password)
-        if err:
-            return err
-        try:
+        def _fetch(prof, pw):
             if files is None:
                 return self._bo().fetch_batch(prof, pw, list(dirs), bool(trust_new))
             return self._bo().fetch_batch(prof, pw, list(dirs), bool(trust_new), files)
-        except Exception as e:                            # noqa: BLE001
-            return {'error': str(e)}
+        return self._delegate(name, password, _fetch)
 
     def continue_jobs(self, dirs, name, password, trust_new=False):
-        prof, pw, err = self._resolve(name, password)
-        if err:
-            return err
-        try:
-            return self._bo().continue_batch(prof, pw, list(dirs), bool(trust_new))
-        except Exception as e:                            # noqa: BLE001
-            return {'error': str(e)}
+        return self._delegate(name, password,
+                              lambda prof, pw: self._bo().continue_batch(
+                                  prof, pw, list(dirs), bool(trust_new)))
 
     def refresh_status(self, name, password, trust_new=False):
-        prof, pw, err = self._resolve(name, password)
-        if err:
-            return err
-        try:
+        def _refresh(prof, pw):
             # 目标 dirs 逻辑照抄 jobs_tab._on_refresh_status:
             # 台账里该集群 + 有作业号 + 状态 SUBMITTED/QUEUED/RUNNING
             targets = [d for d, m in self._ledger.load_all()
@@ -215,17 +214,12 @@ class Api:
             if not targets:
                 return {'needs_trust': False, 'results': []}
             return self._bo().refresh_batch(prof, pw, targets, bool(trust_new))
-        except Exception as e:                            # noqa: BLE001
-            return {'error': str(e)}
+        return self._delegate(name, password, _refresh)
 
     def queue_detail(self, name, password, trust_new=False):
-        prof, pw, err = self._resolve(name, password)
-        if err:
-            return err
-        try:
-            return self._bo().queue_detail(prof, pw, bool(trust_new))
-        except Exception as e:                            # noqa: BLE001
-            return {'error': str(e)}
+        return self._delegate(name, password,
+                              lambda prof, pw: self._bo().queue_detail(
+                                  prof, pw, bool(trust_new)))
 
     # ── 任务:认领外部作业 ──
     def adopt_job(self, local_dir, name, job_id, remote_dir, job_name=''):

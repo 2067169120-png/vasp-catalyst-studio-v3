@@ -218,6 +218,15 @@ def test_submit_jobs_uses_saved_password():
     assert got['pw'] == 'kr-pw' and 'error' not in out
 
 
+def test_submit_jobs_resolve_load_error_caught():
+    """load_profiles 崩溃(配置损坏/keyring 后端报错)也须兜成 error dict,绝不穿透 JS。"""
+    boom = types.SimpleNamespace(
+        load_profiles=lambda: (_ for _ in ()).throw(RuntimeError('yaml corrupt')))
+    api = Api(profiles_mod=boom)
+    out = api.submit_jobs(['/a'], 'c1', None, False)
+    assert isinstance(out, dict) and 'yaml corrupt' in out.get('error', '')
+
+
 def test_submit_jobs_batch_ops_exception_caught():
     bo = types.SimpleNamespace(
         submit_batch=lambda prof, pw, dirs, tn: (_ for _ in ()).throw(RuntimeError('连不上')))
