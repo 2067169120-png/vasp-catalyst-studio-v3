@@ -5,6 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>VASP Catalyst Studio</title>
 <link rel="stylesheet" href="app.css">
+<style>
+/* 生成页(P1b Task 2):表单行与集群页观感一致;app.css 不改,样式随页内联 */
+#page-generate .gen-h{font-weight:700;font-size:13px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--rule)}
+#page-generate .gen-fld{display:flex;flex-direction:column;gap:4px;margin-bottom:12px}
+#page-generate .gen-lbl{font-size:11.5px;color:var(--muted)}
+#page-generate .gen-inrow{display:flex;gap:8px;align-items:center}
+#page-generate .gen-inrow .btn{flex:0 0 auto}
+</style>
 </head>
 <body>
 <nav>
@@ -30,10 +38,58 @@
     </div>
   </section>
 
-  <section class="page" data-page="generate" hidden>
-    <div class="empty">
-      <p>生成输入页本期在 P1b 迁移。请先用旧版:<br><code>python -m vcstudio.gui</code></p>
+  <section class="page" data-page="generate" id="page-generate" hidden>
+    <div class="pagebar">
+      <h1>生成输入</h1>
+      <span class="stats">POSCAR + INCAR → 自动补全四件套(POSCAR / INCAR / POTCAR / KPOINTS)</span>
     </div>
+
+    <div class="card" style="padding:16px;margin-bottom:14px">
+      <div class="gen-h">输入文件</div>
+
+      <div class="gen-fld">
+        <span class="gen-lbl">POSCAR 文件</span>
+        <div class="gen-inrow">
+          <input id="gen-poscar" class="ipt" autocomplete="off" placeholder="结构文件路径">
+          <button class="btn" id="gen-poscar-btn">浏览</button>
+        </div>
+      </div>
+
+      <div class="gen-fld">
+        <span class="gen-lbl">INCAR 文件</span>
+        <div class="gen-inrow">
+          <input id="gen-incar" class="ipt" autocomplete="off" placeholder="INCAR 参数文件路径">
+          <button class="btn" id="gen-incar-btn">浏览</button>
+        </div>
+      </div>
+
+      <div class="gen-fld">
+        <span class="gen-lbl">输出目录</span>
+        <div class="gen-inrow">
+          <input id="gen-out" class="ipt" autocomplete="off" placeholder="四件套写入目录">
+          <button class="btn" id="gen-out-btn">浏览</button>
+        </div>
+      </div>
+
+      <div class="gen-fld" style="margin-bottom:0">
+        <span class="gen-lbl">赝势库根目录</span>
+        <div class="gen-inrow">
+          <input id="gen-lib" class="ipt" autocomplete="off" placeholder="PAW_PBE 赝势库根目录(用于拼 POTCAR / 补 ENCUT)">
+          <button class="btn" id="gen-lib-btn">浏览</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="padding:16px;margin-bottom:14px">
+      <div class="gen-h">解析预览</div>
+      <pre class="mono" id="gen-preview" style="margin:0;max-height:40vh">(选择 POSCAR / INCAR 后自动解析预览)</pre>
+    </div>
+
+    <div class="actions">
+      <button class="btn primary" id="gen-run">生成四件套</button>
+    </div>
+
+    <div class="log" id="generate-log" data-anchor><div class="head">生成日志</div></div>
   </section>
 
   <section class="page" data-page="project" hidden>
@@ -175,5 +231,6 @@
 <script src="app.js"></script>
 <script src="jobs.js"></script>
 <script src="cluster.js"></script>
+<script src="generate.js"></script>
 </body>
 </html>
