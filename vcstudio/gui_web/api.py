@@ -392,15 +392,21 @@ class Api:
                 return {'ok': False, 'view': None, 'used': None,
                         'error': '未提供结构文件路径'}
             if filename == 'AUTO':
-                target, used = None, None
+                # 依次试 CONTCAR、POSCAR:非空但解析失败(如截断的 CONTCAR)也回退下一个
+                errs = []
                 for cand in ('CONTCAR', 'POSCAR'):
                     p = os.path.join(base, cand)
-                    if os.path.isfile(p) and os.path.getsize(p) > 0:
-                        target, used = p, cand
-                        break
-                if target is None:
-                    return {'ok': False, 'view': None, 'used': None,
-                            'error': '该作业目录下没有 CONTCAR/POSCAR,无法预览'}
+                    if not (os.path.isfile(p) and os.path.getsize(p) > 0):
+                        continue
+                    try:
+                        with open(p, 'r', encoding='utf-8', errors='replace') as f:
+                            content = f.read()
+                        view = self._sview.structure_view(content)
+                        return {'ok': True, 'view': view, 'used': cand, 'error': None}
+                    except Exception as e:                # noqa: BLE001
+                        errs.append(f'{cand}: {e}')
+                return {'ok': False, 'view': None, 'used': None,
+                        'error': ';'.join(errs) or '该作业目录下没有 CONTCAR/POSCAR,无法预览'}
             elif filename:
                 target, used = os.path.join(base, filename), filename
             else:

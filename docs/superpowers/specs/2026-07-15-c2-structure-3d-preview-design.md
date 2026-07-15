@@ -25,7 +25,8 @@
 - 复用 `parse_poscar_species`(物种/计数)与 `read_cell_vectors`(3×3 晶格,已乘缩放因子)。
 - 新增坐标解析:第 8/9 行起(Selective dynamics 行可选,大小写不敏感,S/D/C/K 首字母判定);
   `Direct/Fractional` → 分数坐标×晶格;`Cartesian` → ×缩放因子。
-  负缩放因子按 VASP 语义 = 目标体积,scale = (|v|/det)^(1/3)。
+  负缩放因子(=目标体积):M1 沿用 `read_cell_vectors` 既有决策**显式拒绝**
+  (NotImplementedError → api 兜成结构化 error),不做体积反解——绝不静默生成错误晶格。
   坐标行取前 3 列(selective 的 T/F 忽略);行数不足计数 → 结构化 error。
 - 输出 XYZ 文本喂 3Dmol(走它最成熟的 xyz 解析路径,避开其 vasp 解析器的坑),
   同一次解析同时产间隙分析——单源。

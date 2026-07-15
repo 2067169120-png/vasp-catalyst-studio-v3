@@ -1008,6 +1008,15 @@ def test_struct_view_missing_file_error(tmp_path):
     assert 'CONTCAR' in out['error'] or 'POSCAR' in out['error']
 
 
+def test_struct_view_auto_falls_back_on_unparseable_contcar(tmp_path):
+    # CONTCAR 非空但解析失败(只有换行)→ 回退用旁边合法的 POSCAR
+    (tmp_path / 'CONTCAR').write_text('\n', encoding='utf-8')
+    (tmp_path / 'POSCAR').write_text(_POSCAR_MIN, encoding='utf-8')
+    api = Api()
+    out = api.struct_view(str(tmp_path), 'AUTO')
+    assert out['ok'] is True and out['used'] == 'POSCAR'
+
+
 def test_struct_view_parse_error_is_caught(tmp_path):
     f = tmp_path / 'POSCAR'
     f.write_text('garbage\n', encoding='utf-8')

@@ -37,8 +37,8 @@ COVALENT_RADII = {
 }
 _R_DEFAULT = 1.2
 
-# 兜底全对扫描的规模上限(O(n²);超过则跳过并在 notes 说明)
-_FALLBACK_MAX_ATOMS = 1500
+# 重叠全对扫描的规模上限(O(9n²/2) 纯 Python;600 原子实测 ~1s,超过则跳过并 notes 说明)
+_FALLBACK_MAX_ATOMS = 600
 
 
 def parse_positions(content: str) -> dict:
@@ -106,19 +106,83 @@ def _rc(elem: str) -> float:
     return COVALENT_RADII.get(elem, _R_DEFAULT)
 
 
+def _unwrap_z(coords: list[list[float]], cell: list[list[float]]):
+    """跨 z 边界回卷检测与展开 → ``(coords2, wrapped:bool)``。
+
+    CONTCAR 常态:slab 底层原子弛豫越过 z=0 被 VASP 回卷到分数 z≈0.99x,
+    直接按 z 排序会误把它当"最高的原子"。处理:z 先 mod 归一到 [0,Lz)
+    (Lz=cell[2][2],slab 惯例 c 沿 z),在**圆周**上找最大相邻间隙作为切口,
+    切口以下的块整体 +Lz,使结构沿 z 连续。展开后周期 c 像不可能比胞内更近
+    (像间距 ≥ 切口间隙),后续分析无需再扩 c 像。Lz 无效或 n<2 时原样返回。
+    """
+    n = len(coords)
+    lz = cell[2][2] if len(cell) > 2 and len(cell[2]) > 2 else 0.0
+    if n < 2 or lz <= 0:
+        return coords, False
+    zs = [((c[2] % lz) + lz) % lz for c in coords]
+    order = sorted(range(n), key=lambda i: zs[i])
+    # 圆周相邻间隙:k=0..n-2 为排序相邻;k=n-1 为回卷间隙(最高 → 最低+Lz)
+    best_k = n - 1
+    best_gap = zs[order[0]] + lz - zs[order[-1]]
+    for k in range(n - 1):
+        g = zs[order[k + 1]] - zs[order[k]]
+        if g > best_gap:
+            best_gap, best_k = g, k
+    if best_k == n - 1:
+        # 最大间隙正好横跨边界 → 结构本就连续,只做 mod 归一(通常无变化)
+        coords2 = [[c[0], c[1], zs[i]] for i, c in enumerate(coords)]
+        return coords2, False
+    low = set(order[:best_k + 1])
+    coords2 = [[c[0], c[1], zs[i] + (lz if i in low else 0.0)]
+               for i, c in enumerate(coords)]
+    return coords2, True
+
+
+def _clash_scan(elements: list[str], coords: list[list[float]],
+                cell: list[list[float]]):
+    """共价半径重叠扫描(±1 面内像)→ ``(dist, i, j)`` 或 None(取最严重比值对)。"""
+    n = len(coords)
+    a_vec, b_vec = cell[0], cell[1]
+    worst = None   # (d, i, j, ratio)
+    for i in range(n):
+        for j in range(i + 1, n):
+            thresh = CLASH_FACTOR * (_rc(elements[i]) + _rc(elements[j]))
+            if thresh <= 0:
+                continue
+            for ia in (-1, 0, 1):
+                for ib in (-1, 0, 1):
+                    q = [coords[j][0] + ia * a_vec[0] + ib * b_vec[0],
+                         coords[j][1] + ia * a_vec[1] + ib * b_vec[1],
+                         coords[j][2] + ia * a_vec[2] + ib * b_vec[2]]
+                    d = _dist(coords[i], q)
+                    ratio = d / thresh
+                    if d < thresh and (worst is None or ratio < worst[3]):
+                        worst = (d, i, j, ratio)
+    return worst[:3] if worst else None
+
+
 def analyze_gap(elements: list[str], coords: list[list[float]],
                 cell: list[list[float]]) -> dict:
-    """分子-衬底间隙分析 → 见模块 docstring。绝不抛(输入已由 parse 校验)。"""
+    """分子-衬底间隙分析 → 见模块 docstring。绝不抛(输入已由 parse 校验)。
+
+    顺序:①z 回卷展开 ②z 最大间隙分离(成功报垂直间隙/最近对,warn/ok)
+    ③共价重叠扫描**无条件**执行(分子内部/骨架内部融合也必须拦),命中压成 crash。
+    """
     notes: list[str] = []
     out = {'separated': False, 'vertical_gap': None, 'min_dist': None,
            'pair': None, 'mol_formula': None, 'n_mol': 0, 'n_slab': 0,
-           'level': None, 'notes': notes}
+           'level': None, 'clash': None, 'notes': notes}
     n = len(coords)
     if n < 2:
         notes.append('原子数不足 2,无间隙可分析')
         return out
 
-    # ── z 最大相邻间隙 → 分离 ──
+    # ── ① 跨 z 边界回卷展开(CONTCAR 常态) ──
+    coords, wrapped = _unwrap_z(coords, cell)
+    if wrapped:
+        notes.append('检测到原子跨 z 边界回卷,已按周期展开后分析')
+
+    # ── ② z 最大相邻间隙 → 分离 ──
     order = sorted(range(n), key=lambda i: coords[i][2])
     gap_at, gap_max = -1, 0.0
     for k in range(n - 1):
@@ -155,48 +219,34 @@ def analyze_gap(elements: list[str], coords: list[list[float]],
         out['pair'] = {'i': best_pair[0], 'j': best_pair[1],
                        'elem_i': elements[best_pair[0]],
                        'elem_j': elements[best_pair[1]]}
-        if best < GAP_CRASH:
-            out['level'] = 'crash'
-            notes.append(f'分子-衬底最近距离 {best:.2f} Å < {GAP_CRASH} Å——撞车,'
-                         f'提交前必须修正(目标间隙 ~3.0 Å)')
-        elif best < GAP_WARN:
+        # 注:分离成立时 min_dist ≥ dz ≥ Z_SPLIT(1.8)> GAP_CRASH,故此处只有 warn/ok;
+        # 撞车级问题由 ③ 的重叠扫描统一兜住。
+        if best < GAP_WARN:
             out['level'] = 'warn'
             notes.append(f'分子-衬底最近距离 {best:.2f} Å 偏近(初始结构建议 ~3.0 Å;'
                          f'弛豫后成键属正常)')
         else:
             out['level'] = 'ok'
-        return out
+    else:
+        notes.append('未能按 z 分离分子/衬底(可能为纯分子、纯衬底或已粘连)')
 
-    # ── 分离失败:共价半径兜底扫原子重叠/过近 ──
-    notes.append('未能按 z 分离分子/衬底(可能为纯分子、纯衬底或已粘连)')
+    # ── ③ 共价重叠扫描:无条件(分子内部/骨架内部融合也要拦) ──
     if n > _FALLBACK_MAX_ATOMS:
-        notes.append(f'原子数 {n} 超过 {_FALLBACK_MAX_ATOMS},跳过全对重叠扫描')
+        notes.append(f'原子数 {n} 超过 {_FALLBACK_MAX_ATOMS},跳过原子重叠扫描')
         return out
-    a_vec, b_vec = cell[0], cell[1]
-    worst, worst_pair, worst_ratio = None, None, 1e9
-    for i in range(n):
-        for j in range(i + 1, n):
-            thresh = CLASH_FACTOR * (_rc(elements[i]) + _rc(elements[j]))
-            for ia in (-1, 0, 1):
-                for ib in (-1, 0, 1):
-                    q = [coords[j][0] + ia * a_vec[0] + ib * b_vec[0],
-                         coords[j][1] + ia * a_vec[1] + ib * b_vec[1],
-                         coords[j][2] + ia * a_vec[2] + ib * b_vec[2]]
-                    d = _dist(coords[i], q)
-                    if d < 1e-6 and ia == 0 and ib == 0 and i == j:
-                        continue
-                    ratio = d / thresh if thresh > 0 else 1e9
-                    if d < thresh and ratio < worst_ratio:
-                        worst, worst_pair, worst_ratio = d, (i, j), ratio
-    if worst is not None:
-        out['min_dist'] = round(worst, 4)
-        out['pair'] = {'i': worst_pair[0], 'j': worst_pair[1],
-                       'elem_i': elements[worst_pair[0]],
-                       'elem_j': elements[worst_pair[1]]}
+    hit = _clash_scan(elements, coords, cell)
+    if hit is not None:
+        d, i, j = hit
+        out['clash'] = {'dist': round(d, 4), 'i': i, 'j': j,
+                        'elem_i': elements[i], 'elem_j': elements[j]}
         out['level'] = 'crash'
-        notes.append(
-            f'{elements[worst_pair[0]]}-{elements[worst_pair[1]]} 距离 '
-            f'{worst:.2f} Å 低于共价判据——疑似原子重叠/过近,提交前必须修正')
+        notes.append(f'{elements[i]}-{elements[j]} 距离 {d:.2f} Å 低于共价判据'
+                     f'——疑似原子重叠/过近,提交前必须修正')
+        if not out['separated']:
+            # 分离失败时以重叠对充当"最近对"报告(既有语义)
+            out['min_dist'] = round(d, 4)
+            out['pair'] = {'i': i, 'j': j,
+                           'elem_i': elements[i], 'elem_j': elements[j]}
     return out
 
 

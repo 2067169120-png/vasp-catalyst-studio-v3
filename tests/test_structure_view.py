@@ -14,14 +14,15 @@ def _poscar(coords_block: str, *, elems='C S', counts='4 2', mode='Direct',
             f'{sel}{mode}\n{coords_block}')
 
 
-# 4 个 C @ z=10(面内 2×2),2 个 S @ z=13.0/13.5 → 垂直间隙 3.0,最近对 3.0(正上方)
+# 4 个 C @ z=10(面内 2×2),2 个 S @ z=13.0/14.9(S-S 1.9 Å 正常键长)
+# → 垂直间隙 3.0,最近对 3.0(正上方)
 _DIRECT_OK = _poscar(
     '0.05 0.05 0.333333333333 T T T\n'
     '0.55 0.05 0.333333333333 T T T\n'
     '0.05 0.55 0.333333333333 T T T\n'
     '0.55 0.55 0.333333333333 T T T\n'
     '0.05 0.05 0.433333333333 T T T\n'
-    '0.05 0.05 0.450000000000 T T T\n', selective=True)
+    '0.05 0.05 0.496666666667 T T T\n', selective=True)
 
 
 def test_parse_positions_direct_selective():
@@ -29,7 +30,7 @@ def test_parse_positions_direct_selective():
     assert p['elements'] == ['C', 'C', 'C', 'C', 'S', 'S']
     assert p['coords'][0] == pytest.approx([0.5, 0.5, 10.0])
     assert p['coords'][4] == pytest.approx([0.5, 0.5, 13.0])
-    assert p['coords'][5] == pytest.approx([0.5, 0.5, 13.5])
+    assert p['coords'][5] == pytest.approx([0.5, 0.5, 14.9])
     assert p['cell'][2] == pytest.approx([0.0, 0.0, 30.0])
 
 
@@ -125,6 +126,53 @@ def test_analyze_gap_bonded_h_not_false_alarm():
                    elems='C H', counts='1 1')
     g = _gap_of(text)
     assert g['level'] != 'crash'
+
+
+def test_analyze_gap_unwrap_wrapped_slab_atom():
+    """CONTCAR 常态:slab 底层原子弛豫越过 z=0 被回卷到 frac≈0.998 →
+    必须按周期展开后再分离,否则误把回卷原子当分子、假报 ok。"""
+    # slab C4:z=0.5/1.0/2.0 + 回卷原子 29.95(真实位置 -0.05);mol S2:z=5.0/6.9
+    text = _poscar(
+        '0.05 0.05 0.016666666667\n'
+        '0.55 0.05 0.033333333333\n'
+        '0.05 0.55 0.066666666667\n'
+        '0.55 0.55 0.998333333333\n'   # 回卷的 slab 底层原子
+        '0.05 0.05 0.166666666667\n'
+        '0.05 0.05 0.230000000000\n')
+    g = _gap_of(text)
+    assert g['separated'] is True
+    assert g['n_mol'] == 2 and g['n_slab'] == 4
+    assert g['mol_formula'] == 'S2'
+    assert g['vertical_gap'] == pytest.approx(3.0, abs=1e-4)  # 5.0 - 2.0
+    assert g['level'] == 'ok'
+    assert any('回卷' in n for n in g['notes'])
+
+
+def test_analyze_gap_crash_across_z_boundary():
+    """跨 z 边界撞车:slab S @ z=0.44,mol S 回卷前 @ z=29.2(真实 -0.8 侧),
+    真实距离 1.24 Å——展开后必须报 crash,不看周期会假报 28.76 Å 'ok'。"""
+    text = _poscar('0.05 0.05 0.014666666667\n0.05 0.05 0.973333333333\n',
+                   elems='S S', counts='1 1')
+    g = _gap_of(text)
+    assert g['separated'] is False
+    assert g['level'] == 'crash'
+    assert g['min_dist'] == pytest.approx(1.24, abs=1e-4)
+
+
+def test_analyze_gap_intra_molecule_fusion_still_crashes():
+    """分离成功但分子内部融合(S-S 1.24 Å):重叠扫描必须无条件跑,
+    否则模板坏在分子内部时安全门漏网。"""
+    text = _poscar(
+        '0.05 0.05 0.333333333333\n0.55 0.05 0.333333333333\n'
+        '0.05 0.55 0.333333333333\n0.55 0.55 0.333333333333\n'
+        '0.05 0.05 0.433333333333\n0.05 0.05 0.474666666667\n')  # S@13.0/14.24
+    g = _gap_of(text)
+    assert g['separated'] is True
+    assert g['min_dist'] == pytest.approx(3.0)   # 分子-衬底距离仍如实报告
+    assert g['level'] == 'crash'                  # 但内部融合压成 crash
+    assert g['clash'] is not None
+    assert g['clash']['dist'] == pytest.approx(1.24, abs=1e-4)
+    assert g['clash']['elem_i'] == 'S' and g['clash']['elem_j'] == 'S'
 
 
 # ── structure_view 门面 ─────────────────────────────────────────────────────

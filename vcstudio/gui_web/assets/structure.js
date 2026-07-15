@@ -90,15 +90,20 @@
       } else {
         viewer.setStyle({}, { sphere: { scale: 0.3 }, stick: { radius: 0.15 } });
       }
-      // 最近原子对:仅当胞内直线距离≈报告值时画虚线(跨周期像的近邻画进胞内会误导)
-      if (gap.pair && gap.min_dist != null) {
-        const p = atomXYZ(v.xyz, gap.pair.i), q = atomXYZ(v.xyz, gap.pair.j);
+      // 标注对:crash 时优先画真正的重叠对(gap.clash),否则画分子-衬底最近对。
+      // 仅当胞内直线距离≈报告值时画虚线(跨周期像的近邻画进胞内会误导)。
+      const mark = (gap.clash && gap.clash.dist != null)
+        ? { i: gap.clash.i, j: gap.clash.j, dist: gap.clash.dist }
+        : ((gap.pair && gap.min_dist != null)
+            ? { i: gap.pair.i, j: gap.pair.j, dist: gap.min_dist } : null);
+      if (mark) {
+        const p = atomXYZ(v.xyz, mark.i), q = atomXYZ(v.xyz, mark.j);
         const d = Math.sqrt((p.x - q.x) ** 2 + (p.y - q.y) ** 2 + (p.z - q.z) ** 2);
-        if (Math.abs(d - gap.min_dist) < 1e-3) {
+        if (Math.abs(d - mark.dist) < 1e-3) {
           const color = gap.level === 'crash' ? '#BB4444' : '#B8952E';
           viewer.addCylinder({ start: p, end: q, radius: 0.05, dashed: true,
                                color: color, fromCap: 1, toCap: 1 });
-          viewer.addLabel(`${gap.min_dist} Å`, {
+          viewer.addLabel(`${mark.dist} Å`, {
             position: { x: (p.x + q.x) / 2, y: (p.y + q.y) / 2, z: (p.z + q.z) / 2 },
             backgroundColor: color, backgroundOpacity: 0.85,
             fontColor: '#FFFFFF', fontSize: 12, borderRadius: 4,
