@@ -1025,6 +1025,54 @@ def test_struct_view_parse_error_is_caught(tmp_path):
     assert out['ok'] is False and out['error']
 
 
+# ── methods_text (C3 Methods 段生成) ─────────────────────────────────────────
+def test_methods_text_full_job_dir(tmp_path):
+    (tmp_path / 'INCAR').write_text(
+        'GGA = RP\nENCUT = 400\nISMEAR = 0\nSIGMA = 0.05\nIVDW = 11\n',
+        encoding='utf-8')
+    (tmp_path / 'KPOINTS').write_text(
+        'mesh\n0\nGamma\n3 3 1\n0 0 0\n', encoding='utf-8')
+    (tmp_path / 'POTCAR').write_text(
+        ' TITEL  = PAW_PBE C 08Apr2002\n TITEL  = PAW_PBE S 06Sep2000\n',
+        encoding='utf-8')
+    api = Api()
+    out = api.methods_text(str(tmp_path))
+    assert out['ok'] is True
+    assert 'RPBE' in out['zh'] and 'RPBE' in out['en']
+    assert 'Kresse' in out['bibtex']
+    assert out['warnings'] == []
+
+
+def test_methods_text_missing_incar_is_error(tmp_path):
+    api = Api()
+    out = api.methods_text(str(tmp_path))
+    assert out['ok'] is False and 'INCAR' in out['error']
+
+
+def test_methods_text_missing_optional_files_degrade(tmp_path):
+    (tmp_path / 'INCAR').write_text('ENCUT = 400\n', encoding='utf-8')
+    api = Api()
+    out = api.methods_text(str(tmp_path))
+    assert out['ok'] is True
+    assert any('KPOINTS' in w for w in out['warnings'])
+    assert any('POTCAR' in w for w in out['warnings'])
+
+
+def test_methods_text_injects_methods_mod(tmp_path):
+    (tmp_path / 'INCAR').write_text('x', encoding='utf-8')
+    seen = {}
+    fake = types.SimpleNamespace(
+        extract_facts=lambda i, k, p: (seen.update(i=i, k=k, p=p) or
+                                       {'facts': {'f': 1}, 'warnings': []}),
+        render_zh=lambda f: 'ZH',
+        render_en=lambda f: 'EN',
+        render_bibtex=lambda f: 'BIB')
+    api = Api(methods_mod=fake)
+    out = api.methods_text(str(tmp_path))
+    assert out['ok'] is True and out['zh'] == 'ZH' and out['bibtex'] == 'BIB'
+    assert seen['i'] == 'x' and seen['k'] is None and seen['p'] is None
+
+
 def test_struct_view_injects_sview_mod(tmp_path):
     f = tmp_path / 'POSCAR'
     f.write_text('whatever', encoding='utf-8')

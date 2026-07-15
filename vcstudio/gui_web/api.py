@@ -20,7 +20,7 @@ class Api:
                  batch_ops_mod=None, ledger_mod=None, manifest_mod=None,
                  submitter_mod=None, config_mod=None, job_builder_mod=None,
                  logic_mod=None, adsorption_mod=None, report_full_mod=None,
-                 conv_mod=None, sview_mod=None, dialog_fn=None):
+                 conv_mod=None, sview_mod=None, methods_mod=None, dialog_fn=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -31,6 +31,7 @@ class Api:
         from vcstudio.project import adsorption as _ads
         from vcstudio.cluster import convergence as _conv
         from vcstudio.generate import structure_view as _sview
+        from vcstudio.generate import methods_text as _methods
         self._profiles = profiles_mod or _p
         self._secrets = secrets_mod or _s
         self._ledger = ledger_mod or _l
@@ -45,6 +46,7 @@ class Api:
         # 收敛解析/结构预览:纯函数模块(零 IO),即时导入,测试注入假件。
         self._conv = conv_mod or _conv
         self._sview = sview_mod or _sview
+        self._methods = methods_mod or _methods
         self._dialog_fn = dialog_fn        # 测试注入假 dialog;None → 真走 webview
         self._ssh_test = ssh_test_mod      # 重依赖延迟到用时 import
         self._batch_ops = batch_ops_mod
@@ -420,6 +422,37 @@ class Api:
             return {'ok': True, 'view': view, 'used': used, 'error': None}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'view': None, 'used': None, 'error': str(e)}
+
+    def methods_text(self, job_dir):
+        """Methods 段生成(C3):读 job_dir 真实 INCAR/KPOINTS/POTCAR →
+        {'ok','zh','en','bibtex','warnings'|'error'}。INCAR 缺 → error;
+        KPOINTS/POTCAR 缺 → warnings 降级(extract_facts 内已明说)。纯读不写。
+        """
+        try:
+            d = (job_dir or '').strip()
+            inc_path = os.path.join(d, 'INCAR')
+            if not d or not os.path.isfile(inc_path):
+                return {'ok': False, 'zh': None, 'en': None, 'bibtex': None,
+                        'warnings': [], 'error': '该作业目录下没有 INCAR,无法生成方法段'}
+
+            def _read(name):
+                p = os.path.join(d, name)
+                if not os.path.isfile(p):
+                    return None
+                with open(p, 'r', encoding='utf-8', errors='replace') as f:
+                    return f.read()
+
+            r = self._methods.extract_facts(_read('INCAR'), _read('KPOINTS'),
+                                            _read('POTCAR'))
+            facts = r['facts']
+            return {'ok': True,
+                    'zh': self._methods.render_zh(facts),
+                    'en': self._methods.render_en(facts),
+                    'bibtex': self._methods.render_bibtex(facts),
+                    'warnings': r['warnings'], 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'zh': None, 'en': None, 'bibtex': None,
+                    'warnings': [], 'error': str(e)}
 
     def gen_run(self, poscar_path, incar_path, out_dir, lib_root):
         """一键生成(镜像 generate_tab._on_run→build_job_dir→_write_manifest→ledger.register)。
