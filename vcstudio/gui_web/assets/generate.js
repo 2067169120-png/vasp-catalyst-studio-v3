@@ -78,6 +78,11 @@
 
   async function init() {
     wire('gen-poscar-btn', () => pickFile('gen-poscar', 'poscar'));
+    wire('gen-poscar-3d', () => {
+      const p = val('gen-poscar');
+      if (!p) { VCS.log('请先选择 POSCAR 文件', 'failc'); return; }
+      VCS.showStructure(p, null, p.replace(/[\\/]+$/, '').split(/[\\/]/).pop());
+    });
     wire('gen-incar-btn', () => pickFile('gen-incar', 'incar'));
     wire('gen-out-btn', () => pickDir('gen-out'));
     wire('gen-lib-btn', () => pickDir('gen-lib'));
