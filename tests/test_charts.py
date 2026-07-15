@@ -130,3 +130,32 @@ def test_nice_ticks():
     assert t[0] <= -4.5 and t[-1] >= 0.5
     assert all(t[i] < t[i + 1] for i in range(len(t) - 1))
     assert charts._nice_ticks(1.0, 1.0)              # 退化区间不崩
+
+
+# ── DOS(C4) ────────────────────────────────────────────────────────────────
+def _dos(spin2=False):
+    return {'efermi': -2.0,
+            'energies': [-12.0, -7.0, -2.0, 2.0],
+            'spin_up': [0.0, 1.25, 3.75, 0.5],
+            'spin_down': [0.0, 1.10, 3.20, 0.4] if spin2 else None}
+
+
+def test_render_dos_svg_spin_polarized():
+    svg = charts.render_dos_svg(_dos(spin2=True), title='Ta_S8 DOS')
+    assert svg.startswith('<svg') and svg.endswith('</svg>')
+    assert svg.count('<path') == 2                    # 上/下自旋两条曲线
+    assert 'stroke-dasharray' in svg                  # E_F 竖虚线(+网格)
+    assert 'spin' in svg                              # 图例
+    assert 'DOS' in svg and 'Ta_S8 DOS' in svg
+
+
+def test_render_dos_svg_single_spin():
+    svg = charts.render_dos_svg(_dos())
+    assert svg.count('<path') == 1
+    assert 'spin' not in svg                          # 单自旋不画图例
+
+
+def test_render_dos_svg_empty_raises():
+    with pytest.raises(ValueError):
+        charts.render_dos_svg({'efermi': 0.0, 'energies': [],
+                               'spin_up': [], 'spin_down': None})

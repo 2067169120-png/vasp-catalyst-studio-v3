@@ -294,6 +294,74 @@ def render_convergence_svg(data: dict, *, title='', width=760, height=420) -> st
     return p.svg()
 
 
+# ── 5. 总 DOS(C4:E−E_F 横轴 + 自旋镜像 + 费米线) ─────────────────────────────
+def render_dos_svg(data: dict, *, title='', width=760, height=420,
+                   window=(-8.0, 6.0)) -> str:
+    """dosparse.parse_vasprun_dos 输出 → 出版风格总 DOS SVG。
+
+    x = E − E_F(默认窗口 −8…6 eV,与数据范围取交集);自旋向下取负镜像;
+    x=0 处 E_F 竖虚线。空数据 → ValueError。
+    """
+    energies = list(data.get('energies') or [])
+    up = list(data.get('spin_up') or [])
+    down = data.get('spin_down')
+    ef = data.get('efermi')
+    if not energies or not up or ef is None:
+        raise ValueError('DOS 数据为空,无可画内容')
+    xs = [e - ef for e in energies]
+    xlo = max(window[0], min(xs))
+    xhi = min(window[1], max(xs))
+    if xhi <= xlo:                       # 数据全在窗口外 → 用数据全范围
+        xlo, xhi = min(xs), max(xs)
+    vis = [i for i, x in enumerate(xs) if xlo - 1e-9 <= x <= xhi + 1e-9]
+    if not vis:
+        raise ValueError('窗口内无 DOS 数据点')
+    peak = max([up[i] for i in vis] +
+               ([abs(down[i]) for i in vis] if down else [0.0])) or 1.0
+    ylo = -peak * 1.1 if down else 0.0
+    yhi = peak * 1.1
+    p = _Plot(width, height, xlo, xhi, ylo, yhi)
+    p.title(title)
+    p.ylabel('DOS (states/eV)')
+    p.yaxis(_nice_ticks(ylo, yhi))
+    # x 轴刻度
+    for t in _nice_ticks(xlo, xhi):
+        if not (xlo - 1e-9 <= t <= xhi + 1e-9):
+            continue
+        p.add(f"<text x='{p.x(t):.1f}' y='{height - p.mb + 16}' text-anchor='middle' "
+              f"font-size='11' fill='#374151'>{t:g}</text>")
+    if down:                              # 自旋镜像基线
+        zy = p.y(0)
+        p.add(f"<line x1='{p.ml}' y1='{zy:.1f}' x2='{width - p.mr}' y2='{zy:.1f}' "
+              f"stroke='#9ca3af' stroke-width='0.8'/>")
+    # E_F 竖虚线 @ x=0
+    if xlo <= 0 <= xhi:
+        fx = p.x(0)
+        p.add(f"<line x1='{fx:.1f}' y1='{p.mt}' x2='{fx:.1f}' y2='{height - p.mb}' "
+              f"stroke='#374151' stroke-width='1' stroke-dasharray='5,4'/>")
+        p.add(f"<text x='{fx + 4:.1f}' y='{p.mt + 12}' font-size='10.5' "
+              f"fill='#374151'>E_F</text>")
+
+    def _path(vals, sign, color):
+        d = ' '.join(f"{'M' if k == 0 else 'L'}{p.x(xs[i]):.1f},{p.y(sign * vals[i]):.1f}"
+                     for k, i in enumerate(vis))
+        p.add(f"<path d='{d}' fill='none' stroke='{color}' stroke-width='1.6'/>")
+
+    _path(up, 1, PUB_COLORS[0])
+    if down:
+        _path(down, -1, PUB_COLORS[1])
+        # 图例(双自旋才画)
+        lx, ly = p.ml + 10, p.mt - 2
+        p.add(f"<rect x='{lx}' y='{ly - 9}' width='11' height='11' fill='{PUB_COLORS[0]}'/>")
+        p.add(f"<text x='{lx + 15}' y='{ly + 1}' font-size='11' fill='#374151'>spin up</text>")
+        p.add(f"<rect x='{lx + 90}' y='{ly - 9}' width='11' height='11' fill='{PUB_COLORS[1]}'/>")
+        p.add(f"<text x='{lx + 105}' y='{ly + 1}' font-size='11' fill='#374151'>spin down</text>")
+    p.add(f"<text x='{(p.ml + width - p.mr) / 2:.0f}' y='{height - 8}' text-anchor='middle' "
+          f"font-size='12' fill='#374151'>E − E_F (eV)</text>")
+    p.frame()
+    return p.svg()
+
+
 # ── 契约构建助手:从项目 ΔE 结果直接出图数据 ─────────────────────────────────────
 def bar_data_from_delta(project_name: str, delta_rows: list,
                         band=None, band_label='') -> dict:
