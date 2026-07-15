@@ -91,7 +91,8 @@
         (task ? ` <span class="sub">${VCS.esc(task)}</span>` : '') +
         ` <button class="lnk conv" title="查看收敛过程(E0/ΔE/|F|max vs 离子步)">收敛</button>` +
         `<button class="lnk struct" title="3D 结构预览(CONTCAR 优先,自动检查分子-衬底距离)">结构</button>` +
-        `<button class="lnk meth" title="生成中英双语 Methods 段 + BibTeX(读真实 INCAR/KPOINTS/POTCAR)">方法</button></td>` +
+        `<button class="lnk meth" title="生成中英双语 Methods 段 + BibTeX(读真实 INCAR/KPOINTS/POTCAR)">方法</button>` +
+        `<button class="lnk dos" title="总 DOS 出图(需本地 vasprun.xml)">DOS</button></td>` +
         `<td>${VCS.pill(r.state)}</td>` +
         `<td class="mono">${r.job_id ? VCS.esc(r.job_id) : '—'}</td>` +
         `<td class="num">${r.steps != null ? VCS.esc(r.steps) : '—'}</td>` +
@@ -146,6 +147,11 @@
       if (e.target.closest('.meth')) {
         e.stopPropagation();
         VCS.showMethods(tr.dataset.dir, tr.dataset.name || tr.dataset.dir);
+        return;
+      }
+      if (e.target.closest('.dos')) {
+        e.stopPropagation();
+        VCS.showDos(tr.dataset.dir, tr.dataset.name || tr.dataset.dir);
         return;
       }
       const dir = tr.dataset.dir;

@@ -145,3 +145,7 @@ tr.sel .lnk{color:#CBE0F2}
 .meth-h{display:flex;justify-content:space-between;align-items:center;margin:12px 0 6px;font-weight:700;font-size:12.5px}
 .meth-h:first-child{margin-top:0}
 pre.meth-pre{white-space:pre-wrap;word-break:break-word;max-height:200px}
+
+/* DOS 出图(C4) */
+.dos-box{width:100%;overflow:auto}
+.dos-box svg{max-width:100%;height:auto}

@@ -423,6 +423,37 @@ class Api:
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'view': None, 'used': None, 'error': str(e)}
 
+    def dos_view(self, job_dir):
+        """DOS 出图(C4):job_dir/vasprun.xml → 出版风格 SVG,同时落 job_dir/dos.svg。
+
+        缺 vasprun.xml → error(拉回清单暂无它,需手动放置);解析失败 → error;
+        dos.svg 写失败只 warnings 不挡显示。dosparse/charts 皆纯模块即时导入。
+        """
+        try:
+            d = (job_dir or '').strip()
+            xml_path = os.path.join(d, 'vasprun.xml')
+            if not d or not os.path.isfile(xml_path):
+                return {'ok': False, 'svg': None, 'saved': None, 'warnings': [],
+                        'error': '该作业目录下没有 vasprun.xml(拉回清单暂不含它,'
+                                 '请从集群手动下载后重试)'}
+            from vcstudio.project import dosparse, charts
+            with open(xml_path, 'r', encoding='utf-8', errors='replace') as f:
+                dos = dosparse.parse_vasprun_dos(f)
+            svg = charts.render_dos_svg(dos, title=os.path.basename(d) + ' DOS')
+            warnings, saved = [], None
+            try:
+                out_path = os.path.join(d, 'dos.svg')
+                with open(out_path, 'w', encoding='utf-8') as f:
+                    f.write(svg)
+                saved = out_path
+            except Exception as e:                    # noqa: BLE001
+                warnings.append(f'dos.svg 保存失败(仅影响落盘,不影响显示):{e}')
+            return {'ok': True, 'svg': svg, 'saved': saved,
+                    'warnings': warnings, 'error': None}
+        except Exception as e:                        # noqa: BLE001
+            return {'ok': False, 'svg': None, 'saved': None, 'warnings': [],
+                    'error': str(e)}
+
     def methods_text(self, job_dir):
         """Methods 段生成(C3):读 job_dir 真实 INCAR/KPOINTS/POTCAR →
         {'ok','zh','en','bibtex','warnings'|'error'}。INCAR 缺 → error;

@@ -1025,6 +1025,57 @@ def test_struct_view_parse_error_is_caught(tmp_path):
     assert out['ok'] is False and out['error']
 
 
+# ── dos_view (C4 DOS 出图) ───────────────────────────────────────────────────
+_VASPRUN_MIN = (
+    '<?xml version="1.0"?>\n<modeling><calculation><dos>'
+    '<i name="efermi"> -2.0 </i><total><array><set>'
+    '<set comment="spin 1"><r> -5.0 1.0 0.5 </r><r> 0.0 2.0 1.0 </r></set>'
+    '</set></array></total></dos></calculation></modeling>\n'
+)
+
+
+def test_dos_view_renders_and_saves(tmp_path):
+    (tmp_path / 'vasprun.xml').write_text(_VASPRUN_MIN, encoding='utf-8')
+    api = Api()
+    out = api.dos_view(str(tmp_path))
+    assert out['ok'] is True
+    assert out['svg'].startswith('<svg')
+    assert out['saved'] and out['saved'].endswith('dos.svg')
+    import os as _os
+    assert _os.path.isfile(out['saved'])
+
+
+def test_dos_view_missing_vasprun_error(tmp_path):
+    api = Api()
+    out = api.dos_view(str(tmp_path))
+    assert out['ok'] is False and 'vasprun' in out['error']
+
+
+def test_dos_view_bad_xml_error(tmp_path):
+    (tmp_path / 'vasprun.xml').write_text('<broken', encoding='utf-8')
+    api = Api()
+    out = api.dos_view(str(tmp_path))
+    assert out['ok'] is False and out['error']
+
+
+def test_dos_view_save_failure_only_warns(tmp_path, monkeypatch):
+    (tmp_path / 'vasprun.xml').write_text(_VASPRUN_MIN, encoding='utf-8')
+    api = Api()
+    import builtins
+    real_open = builtins.open
+
+    def deny_write(path, mode='r', *a, **kw):
+        if 'w' in mode and str(path).endswith('dos.svg'):
+            raise PermissionError('denied')
+        return real_open(path, mode, *a, **kw)
+
+    monkeypatch.setattr(builtins, 'open', deny_write)
+    out = api.dos_view(str(tmp_path))
+    assert out['ok'] is True and out['svg'].startswith('<svg')
+    assert out['saved'] is None
+    assert any('保存' in w or 'denied' in w for w in out['warnings'])
+
+
 # ── methods_text (C3 Methods 段生成) ─────────────────────────────────────────
 def test_methods_text_full_job_dir(tmp_path):
     (tmp_path / 'INCAR').write_text(
