@@ -140,3 +140,8 @@ tr.sel .lnk{color:#CBE0F2}
 .struct-note{font-size:12px;margin-bottom:10px}
 .struct-note.crash{font-weight:700;color:#A03333}
 .struct-canvas{width:100%;height:420px;position:relative;border:1px solid var(--rule);border-radius:5px;overflow:hidden}
+
+/* Methods 段生成(C3) */
+.meth-h{display:flex;justify-content:space-between;align-items:center;margin:12px 0 6px;font-weight:700;font-size:12.5px}
+.meth-h:first-child{margin-top:0}
+pre.meth-pre{white-space:pre-wrap;word-break:break-word;max-height:200px}
