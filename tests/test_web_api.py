@@ -968,3 +968,64 @@ def test_conv_series_error_is_caught(tmp_path):
     out = api.conv_series(str(tmp_path))
     assert out['ok'] is False
     assert 'parse boom' in out['error']
+
+
+# ── struct_view (C2 结构 3D 预览) ────────────────────────────────────────────
+_POSCAR_MIN = (
+    'test\n1.0\n10 0 0\n0 10 0\n0 0 30\nC S\n1 1\nDirect\n'
+    '0.05 0.05 0.333333333333\n0.05 0.05 0.433333333333\n'
+)
+
+
+def test_struct_view_reads_file_directly(tmp_path):
+    f = tmp_path / 'POSCAR'
+    f.write_text(_POSCAR_MIN, encoding='utf-8')
+    api = Api()  # 真 structure_view 纯模块
+    out = api.struct_view(str(f))
+    assert out['ok'] is True
+    assert out['view']['natoms'] == 2
+    assert out['view']['gap']['level'] == 'ok'
+    assert out['used'] == 'POSCAR'
+
+
+def test_struct_view_auto_prefers_contcar(tmp_path):
+    (tmp_path / 'POSCAR').write_text(_POSCAR_MIN, encoding='utf-8')
+    (tmp_path / 'CONTCAR').write_text(_POSCAR_MIN, encoding='utf-8')
+    api = Api()
+    out = api.struct_view(str(tmp_path), 'AUTO')
+    assert out['ok'] is True and out['used'] == 'CONTCAR'
+    # 只有 POSCAR 时回退
+    import os as _os
+    _os.remove(str(tmp_path / 'CONTCAR'))
+    out2 = api.struct_view(str(tmp_path), 'AUTO')
+    assert out2['ok'] is True and out2['used'] == 'POSCAR'
+
+
+def test_struct_view_missing_file_error(tmp_path):
+    api = Api()
+    out = api.struct_view(str(tmp_path), 'AUTO')
+    assert out['ok'] is False
+    assert 'CONTCAR' in out['error'] or 'POSCAR' in out['error']
+
+
+def test_struct_view_parse_error_is_caught(tmp_path):
+    f = tmp_path / 'POSCAR'
+    f.write_text('garbage\n', encoding='utf-8')
+    api = Api()
+    out = api.struct_view(str(f))
+    assert out['ok'] is False and out['error']
+
+
+def test_struct_view_injects_sview_mod(tmp_path):
+    f = tmp_path / 'POSCAR'
+    f.write_text('whatever', encoding='utf-8')
+    seen = {}
+
+    def _fake(content):
+        seen['content'] = content
+        return {'xyz': '0\nx\n', 'natoms': 0, 'formula': '', 'gap': {}, 'notes': []}
+
+    api = Api(sview_mod=types.SimpleNamespace(structure_view=_fake))
+    out = api.struct_view(str(f))
+    assert out['ok'] is True
+    assert seen['content'] == 'whatever'

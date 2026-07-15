@@ -20,7 +20,7 @@ class Api:
                  batch_ops_mod=None, ledger_mod=None, manifest_mod=None,
                  submitter_mod=None, config_mod=None, job_builder_mod=None,
                  logic_mod=None, adsorption_mod=None, report_full_mod=None,
-                 conv_mod=None, dialog_fn=None):
+                 conv_mod=None, sview_mod=None, dialog_fn=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -30,6 +30,7 @@ class Api:
         from vcstudio.gui import logic as _logic
         from vcstudio.project import adsorption as _ads
         from vcstudio.cluster import convergence as _conv
+        from vcstudio.generate import structure_view as _sview
         self._profiles = profiles_mod or _p
         self._secrets = secrets_mod or _s
         self._ledger = ledger_mod or _l
@@ -41,8 +42,9 @@ class Api:
         # 项目页:adsorption 纯模块(无 matplotlib)即时导入;report_full 牵扯 charts
         # (matplotlib 相邻)故延迟到用时 import(同 batch_ops),测试注入假件即免真依赖。
         self._adsorption = adsorption_mod or _ads
-        # 收敛解析:纯函数模块(零 IO),即时导入,测试注入假件。
+        # 收敛解析/结构预览:纯函数模块(零 IO),即时导入,测试注入假件。
         self._conv = conv_mod or _conv
+        self._sview = sview_mod or _sview
         self._dialog_fn = dialog_fn        # 测试注入假 dialog;None → 真走 webview
         self._ssh_test = ssh_test_mod      # 重依赖延迟到用时 import
         self._batch_ops = batch_ops_mod
@@ -375,6 +377,43 @@ class Api:
             return {'ok': True, 'series': series, 'error': None}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'series': None, 'error': str(e)}
+
+    def struct_view(self, path, filename=None):
+        """结构 3D 预览(C2):读本地 POSCAR/CONTCAR → XYZ + 间隙分析。
+
+        - filename=None:path 本身即结构文件(生成页传选中的 POSCAR 路径)。
+        - filename='AUTO':path 为 job_dir,依次试 CONTCAR、POSCAR(拉回后看弛豫结果)。
+        - 其他 filename:os.path.join(path, filename)——路径拼接留后端,JS 不碰 os.sep。
+        返回 {'ok','view'|None,'used','error'};缺文件/解析失败结构化 error,绝不抛。
+        """
+        try:
+            base = (path or '').strip()
+            if not base:
+                return {'ok': False, 'view': None, 'used': None,
+                        'error': '未提供结构文件路径'}
+            if filename == 'AUTO':
+                target, used = None, None
+                for cand in ('CONTCAR', 'POSCAR'):
+                    p = os.path.join(base, cand)
+                    if os.path.isfile(p) and os.path.getsize(p) > 0:
+                        target, used = p, cand
+                        break
+                if target is None:
+                    return {'ok': False, 'view': None, 'used': None,
+                            'error': '该作业目录下没有 CONTCAR/POSCAR,无法预览'}
+            elif filename:
+                target, used = os.path.join(base, filename), filename
+            else:
+                target, used = base, os.path.basename(base) or base
+            if not os.path.isfile(target):
+                return {'ok': False, 'view': None, 'used': None,
+                        'error': f'结构文件不存在:{target}'}
+            with open(target, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+            view = self._sview.structure_view(content)
+            return {'ok': True, 'view': view, 'used': used, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'view': None, 'used': None, 'error': str(e)}
 
     def gen_run(self, poscar_path, incar_path, out_dir, lib_root):
         """一键生成(镜像 generate_tab._on_run→build_job_dir→_write_manifest→ledger.register)。
