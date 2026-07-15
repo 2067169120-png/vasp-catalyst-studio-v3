@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "VASP Catalyst Studio"
+version: 0.1.0
+date-released: 2026-07-15
+license: MIT
+repository-code: "https://github.com/vasp-catalyst-studio/vcstudio"
+authors:
+  - name: "VASP Catalyst Studio Contributors"
+keywords:
+  - VASP
+  - density functional theory
+  - high-throughput screening
+  - catalysis
+  - workflow automation

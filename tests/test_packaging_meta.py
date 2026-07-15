@@ -23,3 +23,17 @@ def test_pyproject_declares_license_and_metadata():
     assert 'MIT' in text
     assert 'classifiers' in text
     assert 'License :: OSI Approved :: MIT License' in text
+
+
+def test_citation_cff_parses_with_required_keys():
+    import yaml
+    data = yaml.safe_load(_read('CITATION.cff'))
+    assert data['cff-version']
+    assert data['title'] == 'VASP Catalyst Studio'
+    assert data['authors'] and data['version'] and data['message']
+
+
+def test_contributing_covers_tests_and_issues():
+    text = _read('CONTRIBUTING.md')
+    assert 'pytest' in text
+    assert 'issue' in text.lower()
