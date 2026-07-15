@@ -159,3 +159,10 @@ def test_render_dos_svg_empty_raises():
     with pytest.raises(ValueError):
         charts.render_dos_svg({'efermi': 0.0, 'energies': [],
                                'spin_up': [], 'spin_down': None})
+
+
+def test_render_dos_svg_single_point_no_zerodiv():
+    # 退化区间(单能量点):两侧扩 1 eV,不得除零(C4 自验探针抓到的真 bug)
+    svg = charts.render_dos_svg({'efermi': 0.0, 'energies': [0.0],
+                                 'spin_up': [1.0], 'spin_down': None})
+    assert svg.startswith('<svg')

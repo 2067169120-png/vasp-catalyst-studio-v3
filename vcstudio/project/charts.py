@@ -313,6 +313,8 @@ def render_dos_svg(data: dict, *, title='', width=760, height=420,
     xhi = min(window[1], max(xs))
     if xhi <= xlo:                       # 数据全在窗口外 → 用数据全范围
         xlo, xhi = min(xs), max(xs)
+    if xhi - xlo < 1e-9:                 # 单点/退化区间 → 两侧各扩 1 eV,防除零
+        xlo, xhi = xlo - 1.0, xhi + 1.0
     vis = [i for i, x in enumerate(xs) if xlo - 1e-9 <= x <= xhi + 1e-9]
     if not vis:
         raise ValueError('窗口内无 DOS 数据点')
