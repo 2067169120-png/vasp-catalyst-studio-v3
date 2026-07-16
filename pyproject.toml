@@ -29,6 +29,8 @@ dependencies = [
 gui = ["pywebview>=4"]
 # 打包单文件 EXE
 packaging = ["pyinstaller>=6"]
+# 原生论文级出图引擎(external/native_charts.py;函数内延迟 import,core 零重依赖)
+charts = ["matplotlib>=3.6", "numpy>=1.23"]
 # 开发:测试 + 覆盖率 + lint
 dev = ["pytest>=7", "pytest-cov>=4", "ruff>=0.4"]
 
