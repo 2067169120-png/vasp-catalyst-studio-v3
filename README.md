@@ -9,7 +9,26 @@ your machine).
 
 > 📂 Repository map: **[STRUCTURE.md](STRUCTURE.md)** ·
 > 中文完整用法: **[使用说明.md](使用说明.md)** ·
-> English guide: **[docs/user-guide-en.md](docs/user-guide-en.md)**
+> English guide: **[docs/user-guide-en.md](docs/user-guide-en.md)** ·
+> 开发进度/待办: **[docs/planning/progress-2026-07-16.md](docs/planning/progress-2026-07-16.md)**
+
+## 软件流程图 · Workflow
+
+全流程 **生成 → 提交 → 监控/诊断 → 有界恢复 → 分析/报告**,每个区块标注了负责的代码包:
+
+![vcstudio 流程图](docs/vcstudio-flowchart.png)
+
+### 代码区块图(按流程分块,方便按需求查代码)
+
+| 流程区块 | 代码包 | 负责什么 | 关键文件 |
+|---|---|---|---|
+| ① 生成 Generate | `vcstudio/generate/` | POSCAR+用户INCAR → 校验补全四件套(缺项才补,不改用户键) | `job_builder.py` `incar_builder.py` `kpoints.py`(倒格矢) `potcar.py` `poscar.py` |
+| ② 提交 Submit | `vcstudio/cluster/` | PBS/Slurm 双方言、preflight、SSH 上传+提交 | `schedulers.py` `script_builder.py` `submitter.py` `connection.py` |
+| ③ 监控+诊断 Monitor | `vcstudio/cluster/` | 查队列判排队/运行/终态 → 取证 → 12+ 失败分类;**续算沉降护栏** | `submitter.refresh_job` `diagnose.py` `convergence.py` |
+| ④ 有界恢复 Recovery | `vcstudio/cluster/` | CONTCAR/改参续算(≤3轮,INCAR 冻结),否则交人工 | `submitter.continue_from_contcar` `batch_ops.py` |
+| ⑤ 分析+报告 Analyze | `vcstudio/project/` + `external/` | ΔE 门控、吸附能/ΔG台阶/d带中心/Bader、论文级出图、报告 | `adsorption.py` `freeenergy.py` `thermo.py` `dosparse.py` `bader.py` `charts.py` `external/native_charts.py` |
+| 跨层基础 Shared | `vcstudio/shared/` | 配置、清单(job.yaml状态机)、凭据(keyring) | `config.py` `manifest.py` `secrets.py` |
+| 界面 GUI | `vcstudio/gui_web/`(默认 Web)+ `gui/`(旧 tkinter) | pywebview 前端 + `api.py` 薄门面;五页:仪表盘/生成/项目/任务/集群 | `gui_web/api.py` `assets/*.js` |
 
 ## Statement of need
 
@@ -39,6 +58,27 @@ guaranteed consistent with the actual INCAR/KPOINTS/POTCAR. See the full
 Three invariants: ① methodology sovereignty (your INCAR/template is passed
 through verbatim) ② deterministic core is zero-token ③ explicit state, never
 silent (job.yaml state machine + audit history).
+
+## 2026-07-16 更新(本轮进展)
+
+- **修复续算状态误识别**:续算重投后新作业尚未进调度器队列时,不再拿上一轮旧
+  OUTCAR 误判为"已完成/需续算/SCF 震荡",而是保持 SUBMITTED 视作仍在排队
+  (续算沉降护栏,PBS/Slurm 均覆盖,含回归测试)。
+- **原生论文级出图引擎** `external/native_charts.py`:纯 matplotlib 达论文质量
+  (serif/矢量 PDF/多面板/色盲安全色板),不依赖 Origin/POV-Ray。吸附能分组柱状图、
+  数据矩阵表、ΔG 自由能台阶图、**多催化剂热图**、**火山图**(自动求 Sabatier 峰顶)、
+  标度关系图。*(注:引擎已就绪,接入 GUI/报告与打包收录为下一步,见 progress 文档)*
+- **结果分析增强**:PDOS 投影 + d 带中心、Bader 电荷解析、可选 ΔG 口径
+  (默认 ZPE−TS 对齐文献 / 可切 ASE 严格式含振动内能项)、PDS/U_L 图数一致性。
+- **输入正确性**:KPOINTS 改用倒格矢(修六方/hcp slab 欠采样)、项目内 ENCUT 强制
+  统一(保吸附能 ΔE 各成员基组一致)、计算类型下拉(修 web 硬编码 slab)。
+- **诊断扩展**:磁盘满/IO 错误、裸退出码 137 降级为疑墙钟(可续算,不再困死)、
+  ZBRENT 扩展签名。
+- **界面**:任务页按吸附能项目组归并折叠(整组进度)、dashboard 首页落地。
+- **工程化**:config 脱敏(移除内网 IP)、版本号单一事实来源、依赖分组声明、
+  CI 加 lint+覆盖率+打包冒烟。
+
+全套 476+ 测试通过。下一步待办见 **[docs/planning/progress-2026-07-16.md](docs/planning/progress-2026-07-16.md)**。
 
 ## Install & quickstart
 
