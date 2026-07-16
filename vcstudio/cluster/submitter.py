@@ -593,11 +593,22 @@ def fetch_results(client, sftp, job_dir: str, files=FETCH_FILES):
 
 # ── 有界恢复:CONTCAR 续算(对齐论文 bounded recovery;人工触发,冻结 INCAR) ──────
 CONTINUE_MAX_ROUNDS = 3
+# 续算前几何健全阈值(Å):周期最小原子间距低于此值判原子重叠(< 最短化学键 H-H 0.74)。
+MIN_INTERATOMIC_OK = 0.7
 
 
 def _read_remote_text(client, path: str) -> str:
     out, _ = run_cmd(client, f'cat {shlex.quote(path)} 2>/dev/null')
     return out
+
+
+def _contcar_min_distance(text: str):
+    """CONTCAR 文本 → 周期最小原子间距(Å);解析失败 → None(不因此拦续算,valid_poscar 已把关)。"""
+    try:
+        from vcstudio.generate.slab_builder import min_interatomic_distance
+        return min_interatomic_distance(text)
+    except Exception:                                    # noqa: BLE001
+        return None
 
 
 def continue_from_contcar(client, profile, job_dir: str,
@@ -635,6 +646,15 @@ def continue_from_contcar(client, profile, job_dir: str,
     contcar = _read_remote_text(client, posixpath.join(remote, 'CONTCAR'))
     if not diagnose.valid_poscar(contcar):
         raise RuntimeError('远端 CONTCAR 缺失或不完整,不能续算(防半个结构续出垃圾),请人工检查')
+
+    # 几何健全:CONTCAR 原子重叠(周期最小间距 < 阈值)→ 不续算,转人工。病态几何续算只会
+    # 反复崩(ZPOTRF/发散),盲目重投浪费机时;显式转 NEEDS_HUMAN 让人先修结构。
+    min_d = _contcar_min_distance(contcar)
+    if min_d is not None and min_d < MIN_INTERATOMIC_OK:
+        msg = f'CONTCAR 存在原子重叠(最小间距 {min_d:.2f} Å),疑似几何病态,请人工检查'
+        manifest_mod.set_state(m, 'NEEDS_HUMAN', note=msg)
+        manifest_mod.save_manifest(job_dir, m)
+        raise RuntimeError(msg)
 
     # 续算沉降基线:重投前记下上一轮 OUTCAR 的 mtime(此刻新作业尚未启动,仍是旧文件)
     _o0, _z0, _base_outcar_mtime = _stat_outcar_full(client, remote)

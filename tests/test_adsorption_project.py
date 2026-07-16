@@ -1,4 +1,6 @@
 """吸附能项目测试:批量生成 / project.yaml / ΔE 门控 / CSV 导出。"""
+import os
+
 import pytest
 
 from vcstudio.cluster import ledger
@@ -153,3 +155,59 @@ def test_export_csv_excel_friendly(env, tmp_path):
     text = raw.decode('utf-8-sig')
     assert '组态' in text and 'ΔE_ads / eV' in text
     assert '-14.500000' in text                        # -435.5 + 400 + 21
+
+
+def test_delta_e_most_stable_grouping(env):
+    """多构型取最稳:同 species 组内 ΔE 最低者 is_most_stable,dd_e 为相对最稳的 ΔΔE。"""
+    res = adsorption.create_project(
+        env['tmp'] / 'pms', 'ms', clean_poscar=env['poscar']('slab.vasp'),
+        config_poscars=[env['poscar']('Li2S4_top.vasp'),
+                        env['poscar']('Li2S4_hollow.vasp'),
+                        env['poscar']('Li2S6_top.vasp')],
+        incar_path=env['incar'], ref_poscar=env['poscar']('ref.vasp'),
+        lib_root=env['lib'])
+    proj = adsorption.load_project(res['project_path'])
+    _finish(proj['members']['clean_slab'], -400.0)
+    _finish(proj['members']['gas_ref'], -20.0)
+    energies = {'ms_ads_Li2S4_top': -450.0, 'ms_ads_Li2S4_hollow': -448.0,
+                'ms_ads_Li2S6_top': -455.0}
+    for d in proj['members']['configs']:
+        _finish(d, energies[os.path.basename(d)])
+
+    s = adsorption.delta_e_rows(proj)
+    by = {r['name']: r for r in s['rows']}
+    # species 从成员名剥 '{项目名}_ads_' 前缀识别为化学式 token
+    assert by['ms_ads_Li2S4_top']['species'] == 'Li2S4'
+    assert by['ms_ads_Li2S4_hollow']['species'] == 'Li2S4'
+    assert by['ms_ads_Li2S6_top']['species'] == 'Li2S6'
+    # Li2S4 组:top(ΔE=-30)最稳;hollow(ΔE=-28)落后 2.0 eV
+    assert by['ms_ads_Li2S4_top']['is_most_stable'] is True
+    assert by['ms_ads_Li2S4_top']['dd_e'] == pytest.approx(0.0)
+    assert by['ms_ads_Li2S4_hollow']['is_most_stable'] is False
+    assert by['ms_ads_Li2S4_hollow']['dd_e'] == pytest.approx(2.0)
+    # Li2S6 单构型 → 自成最稳
+    assert by['ms_ads_Li2S6_top']['is_most_stable'] is True
+    assert by['ms_ads_Li2S6_top']['dd_e'] == 0.0
+
+    # CSV 新增两列且标出最稳位
+    out = adsorption.export_csv(proj, s, env['tmp'] / 'ms.csv')
+    text = out.read_bytes().decode('utf-8-sig')
+    assert 'ΔΔE(eV)' in text and '最稳位?' in text
+    assert '2.000000' in text and '是' in text
+
+
+def test_delta_e_species_falls_back_to_short_name(env):
+    """识别不出化学式 token(如 h1/b2)→ species 用短名,各自成组。"""
+    res = adsorption.create_project(
+        env['tmp'] / 'pfb', 'fb', clean_poscar=env['poscar']('s.vasp'),
+        config_poscars=[env['poscar']('h1.vasp'), env['poscar']('b2.vasp')],
+        incar_path=env['incar'], lib_root=env['lib'])
+    proj = adsorption.load_project(res['project_path'])
+    _finish(proj['members']['clean_slab'], -400.0)
+    for d in proj['members']['configs']:
+        _finish(d, -420.0)
+    by = {r['name']: r for r in adsorption.delta_e_rows(proj)['rows']}
+    assert by['fb_ads_h1']['species'] == 'h1'
+    assert by['fb_ads_b2']['species'] == 'b2'
+    # 各自单独一组 → 都是各自组内最稳
+    assert by['fb_ads_h1']['is_most_stable'] and by['fb_ads_b2']['is_most_stable']

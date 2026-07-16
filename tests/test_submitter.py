@@ -348,6 +348,26 @@ def test_continue_refuses_invalid_contcar(tmp_path):
         submitter.continue_from_contcar(client, _profile(), d)
 
 
+# CONTCAR 通过 valid_poscar 但存在原子重叠(C-C 0.3 Å < 0.7 Å)
+_OVERLAP_CONTCAR = ('C slab\n1.0\n10 0 0\n0 10 0\n0 0 12\nC O\n2 1\nCartesian\n'
+                    '0 0 0\n0.3 0 0\n5 5 5\n')
+
+
+def test_continue_refuses_overlapping_contcar(tmp_path):
+    """几何健全:CONTCAR 原子重叠(最小间距 < 0.7 Å)→ 拒续算,manifest 转 NEEDS_HUMAN。"""
+    d = _restartable_job(tmp_path)
+    client = FakeClient(script=[('cat', _OVERLAP_CONTCAR), ('qsub', '201.c\n')])
+    with pytest.raises(RuntimeError, match='原子重叠'):
+        submitter.continue_from_contcar(client, _profile(), d)
+    m = manifest.load_manifest(d)
+    assert m['state'] == 'NEEDS_HUMAN'
+    assert '几何病态' in m['state_history'][-1].get('note', '')
+    # 未重投:没执行 cp/清历史/qsub(在几何检查处就拦下)
+    joined = ' '.join(client.commands)
+    assert 'cp CONTCAR POSCAR' not in joined and 'rm -f WAVECAR' not in joined
+    assert m['scheduler_job_id'] == '100'              # 仍是旧作业号,未推进
+
+
 def _continue_client(qsub_id='201.c\n', base_mtime='1000'):
     """续算用假 client:回放 CONTCAR + 基线 stat(旧 OUTCAR mtime)+ qsub 新号。"""
     return FakeClient(script=[

@@ -28,6 +28,27 @@ from vcstudio.shared.config import user_config_dir
 
 PROJECT_NAME = 'project.yaml'
 _STEM_RE = re.compile(r'[^A-Za-z0-9_.-]')
+# 化学式样 token:元素符号([A-Z][a-z]?)+ 可选计数,连缀成整式(Li2S4 / CO / OH / Fe2O3)。
+# 与 freeenergy._species_in_name 同一 token 观:大写起头、贴着数字算计数、遇分隔即断。
+_SPECIES_TOKEN_RE = re.compile(r'[A-Z][a-z]?\d*(?:[A-Z][a-z]?\d*)*')
+
+
+def _config_species(member_name: str, proj_name: str) -> str:
+    """组态成员名 → 吸附物种短名(多构型取最稳的分组键)。
+
+    剥 '{项目名}_ads_' 前缀(缺则退剥到 '_ads_' 之后)得短名,再取短名里**首个化学式样
+    token** 作物种(如 Li2S4_top→Li2S4、CO_fcc→CO);识别不出(如 h1/b2 无大写起头)用短名。
+    """
+    short = member_name
+    prefix = f'{proj_name}_ads_'
+    if proj_name and member_name.startswith(prefix):
+        short = member_name[len(prefix):]
+    else:
+        i = member_name.find('_ads_')
+        if i != -1:
+            short = member_name[i + len('_ads_'):]
+    m = _SPECIES_TOKEN_RE.search(short)
+    return m.group(0) if m else short
 
 
 def _stem(path: str) -> str:
@@ -249,10 +270,14 @@ def delta_e_rows(project: dict) -> dict:
 
     Returns:
         {'slab': (state, E), 'ref': (state, E|None), 'has_ref': bool,
-         'rows': [{'name','state','e_config','delta_e','note'}]}
+         'rows': [{'name','state','e_config','delta_e','note',
+                   'species','is_most_stable','dd_e'}]}
     规则:ΔE 只在 组态 DONE 且 slab DONE 且(有参考时)ref DONE 时给出;否则 note 说明缺谁。
+    多构型取最稳:同一 species(组态名剥前缀识别)内 delta_e 最低者 is_most_stable=True,
+    dd_e 为组内相对最稳的 ΔΔE(最稳 0.0);delta_e 为 None 的行 is_most_stable=False、dd_e=None。
     """
     members = project.get('members') or {}
+    proj_name = str(project.get('name') or '')
     slab_state, e_slab = _member_info(members.get('clean_slab'))
     has_ref = bool(members.get('gas_ref'))
     ref_state, e_ref = _member_info(members.get('gas_ref')) if has_ref else ('无', None)
@@ -289,7 +314,23 @@ def delta_e_rows(project: dict) -> dict:
         else:
             note = '；'.join(blockers)
         rows.append({'name': name, 'state': st, 'e_config': e_cfg,
-                     'delta_e': delta, 'note': note})
+                     'delta_e': delta, 'note': note,
+                     'species': _config_species(name, proj_name)})
+
+    # 多构型取最稳:按 species 分组求组内最低 ΔE,标注 is_most_stable 与相对 ΔΔE
+    group_min: dict = {}
+    for r in rows:
+        d = r['delta_e']
+        if d is not None and (r['species'] not in group_min or d < group_min[r['species']]):
+            group_min[r['species']] = d
+    for r in rows:
+        d, gm = r['delta_e'], group_min.get(r['species'])
+        if d is None or gm is None:
+            r['is_most_stable'], r['dd_e'] = False, None
+        else:
+            r['dd_e'] = round(d - gm, 6)
+            r['is_most_stable'] = (r['dd_e'] == 0.0)
+
     return {'slab': (slab_state, e_slab), 'ref': (ref_state, e_ref),
             'has_ref': has_ref, 'rows': rows}
 
@@ -307,10 +348,12 @@ def export_csv(project: dict, summary: dict, out_path: str | os.PathLike) -> Pat
                     f'E(ref)={_fmt(e_ref)} eV({ref_state})' if summary['has_ref']
                     else 'E(ref)=未设置'])
         w.writerow([])
-        w.writerow(['组态', '状态', 'E(slab+ads) / eV', 'ΔE_ads / eV', '备注'])
+        w.writerow(['组态', '状态', 'E(slab+ads) / eV', 'ΔE_ads / eV',
+                    'ΔΔE(eV)', '最稳位?', '备注'])
         for r in summary['rows']:
             w.writerow([r['name'], r['state'], _fmt(r['e_config']),
-                        _fmt(r['delta_e']), r['note']])
+                        _fmt(r['delta_e']), _fmt(r.get('dd_e')),
+                        '是' if r.get('is_most_stable') else '', r['note']])
     return out
 
 

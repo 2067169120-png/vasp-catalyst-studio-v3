@@ -29,20 +29,23 @@ def test_parse_no_frequencies_returns_empty():
 
 
 def test_harmonic_thermo_zpe_is_half_sum():
+    # 理由:harmonic_thermo 新增低频地板后多返回一个 meta(第4项);测试频率均 >50cm⁻¹
+    # (333/1618/3279 cm⁻¹)不触发地板,数值基线不变,仅解包多一项。
     real = [406.564208, 200.6, 41.36]
-    zpe, u_th, ts = thermo.harmonic_thermo(real, 298.15)
+    zpe, u_th, ts, meta = thermo.harmonic_thermo(real, 298.15)
     assert zpe == pytest.approx(sum(real) / 2000.0, rel=1e-9)   # Σ hν/2 (meV→eV)
     assert ts > 0 and u_th > 0
+    assert meta['n_floored'] == 0 and meta['floored_cm1'] == []  # 无低频 → 不抬频
     # 高频模在室温几乎不贡献熵/热占据;41 meV(x≈1.6)是主要贡献者
-    _, u_high_only, ts_high_only = thermo.harmonic_thermo([406.564208], 298.15)
+    _, u_high_only, ts_high_only, _m = thermo.harmonic_thermo([406.564208], 298.15)
     assert ts_high_only < 1e-6 and u_high_only < 1e-6
 
 
 def test_harmonic_thermo_entropy_formula_single_mode():
     """单模数值口径核对:x = hv/kT;U = hv/(e^x−1);S/kB = x/(e^x−1) − ln(1−e^−x)。"""
-    mev = 25.0
+    mev = 25.0                                           # ≈201.6 cm⁻¹,不触发 50cm⁻¹ 地板
     T = 300.0
-    zpe, u_th, ts = thermo.harmonic_thermo([mev], T)
+    zpe, u_th, ts, _meta = thermo.harmonic_thermo([mev], T)
     hv = mev / 1000.0
     x = hv / (thermo.KB_EV * T)
     s_kb = x / math.expm1(x) - math.log1p(-math.exp(-x))
@@ -51,10 +54,44 @@ def test_harmonic_thermo_entropy_formula_single_mode():
     assert zpe == pytest.approx(hv / 2)
 
 
+def test_harmonic_thermo_low_freq_floor():
+    """低频实模:熵/热能项按地板(50cm⁻¹)计,ZPE 用原频;meta 记被抬频。"""
+    low_cm1 = 20.0
+    low_mev = low_cm1 * thermo.CM1_TO_EV * 1000.0        # 20 cm⁻¹ 对应 meV
+    zpe0, u0, ts0, m0 = thermo.harmonic_thermo([low_mev], 298.15, freq_floor_cm1=0.0)
+    zpe1, u1, ts1, m1 = thermo.harmonic_thermo([low_mev], 298.15, freq_floor_cm1=50.0)
+    assert m0['n_floored'] == 0                          # 关地板 → 不抬
+    assert m1['n_floored'] == 1 and m1['floored_cm1'] == [pytest.approx(20.0, abs=0.05)]
+    assert zpe1 == pytest.approx(zpe0)                   # ZPE 用原频,地板不改
+    assert zpe1 == pytest.approx(low_mev / 2000.0)
+    assert ts1 < ts0 and u1 < u0                         # 抬频 → 熵/热占据更小
+    # 抬到 50cm⁻¹ 等价于直接用 50cm⁻¹ 算熵/热能
+    floor_mev = 50.0 * thermo.CM1_TO_EV * 1000.0
+    _z, u_ref, ts_ref, _m = thermo.harmonic_thermo([floor_mev], 298.15, freq_floor_cm1=0.0)
+    assert ts1 == pytest.approx(ts_ref) and u1 == pytest.approx(u_ref)
+
+
+def test_low_freq_floor_boundary_and_load_corrections(tmp_path):
+    """高于地板者不动;analyze_outcar/load_corrections 透传 n_floored/被抬频。"""
+    hi_mev = 100.0 * thermo.CM1_TO_EV * 1000.0           # 100 cm⁻¹ > 50 → 不抬
+    _z, _u, _t, meta = thermo.harmonic_thermo([hi_mev], 298.15, freq_floor_cm1=50.0)
+    assert meta['n_floored'] == 0
+    d = tmp_path / 'freq_low'
+    d.mkdir()
+    (d / 'OUTCAR').write_text(
+        ' Eigenvectors and eigenvalues of the dynamical matrix\n'
+        '   1 f  =   10.0 THz   62.8 2PI*THz  333.560000 cm-1   41.360000 meV\n'
+        '   2 f  =    0.5 THz    3.4 2PI*THz   18.079172 cm-1    2.241701 meV\n',
+        encoding='utf-8')
+    corr = thermo.load_corrections({'X': str(d)}, freq_floor_cm1=50.0)
+    assert corr['X']['n_floored'] == 1                   # 18 cm⁻¹ 被抬,333 cm⁻¹ 不抬
+    assert corr['X']['floored_cm1'] == [18.1]
+
+
 def test_g_corr_two_modes_same_frequencies():
     """同一组频率:'zpe_ts' 与 'ase' 给不同 g_corr;默认 = ZPE−TS(论文口径)。"""
     real = [406.564208, 200.6, 41.36]
-    zpe, u_th, ts = thermo.harmonic_thermo(real, 298.15)
+    zpe, u_th, ts, _meta = thermo.harmonic_thermo(real, 298.15)
     r = thermo.VibResult(real_mev=real, zpe_ev=zpe, u_thermal_ev=u_th, ts_ev=ts)
     assert r.g_corr('zpe_ts') == pytest.approx(zpe - ts)
     assert r.g_corr('ase') == pytest.approx(zpe + u_th - ts)

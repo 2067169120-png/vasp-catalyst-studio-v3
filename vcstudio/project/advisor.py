@@ -18,6 +18,9 @@ _OPEN_SHELL = {
 }
 
 
+VACUUM_MIN_A = 12.0     # Å:slab 真空层低于此值告警(周期镜像相互作用不可忽略)
+
+
 def _num(v, default=None):
     try:
         return float(v)
@@ -25,13 +28,30 @@ def _num(v, default=None):
         return default
 
 
+def _vacuum_thin(calc_type, poscar_text):
+    """slab 且能拿到 POSCAR 文本时算真空层厚度,< VACUUM_MIN_A 返回该厚度,否则 None。
+
+    真空计算/解析任何失败都吞成 None(顾问 warn-only,绝不因真空检查抛错吞掉其余告警)。
+    """
+    if calc_type != 'slab' or not poscar_text:
+        return None
+    try:
+        from vcstudio.generate.slab_builder import vacuum_thickness
+        vac = vacuum_thickness(poscar_text)
+    except Exception:                                    # noqa: BLE001 顾问不因此崩
+        return None
+    return vac if vac < VACUUM_MIN_A else None
+
+
 def advise(incar: dict, *, has_configs: bool = False,
-           gas: dict | None = None, unified_encut: int | None = None) -> list:
+           gas: dict | None = None, unified_encut: int | None = None,
+           calc_type: str | None = None, poscar_text: str | None = None) -> list:
     """共享 INCAR + 项目组成 → 告警清单 [(priority, name, message)],按优先级排序。
 
     incar: 大写键 dict(parse_incar 产物);gas: 气相参考信息
     {'elements','counts','cell'}(无参考传 None);unified_encut: 全员元素并集算出的
-    推荐 ENCUT(调用方可算不出时传 None)。
+    推荐 ENCUT(调用方可算不出时传 None)。calc_type/poscar_text:可选,给足时对 slab
+    做真空层厚度检查(向后兼容,老调用不传即跳过)。
     """
     out = []
     up = {str(k).upper(): v for k, v in (incar or {}).items()}
@@ -77,6 +97,9 @@ def advise(incar: dict, *, has_configs: bool = False,
                     '孤立分子 IDIPOL=4),否则修正无从施加。'))
 
     # ── P1 ──
+    if has_configs and nsw <= 0:
+        out.append(('P1', 'NSW_ZERO',
+                    '作业将为单点计算,吸附质不会弛豫;弛豫请设 NSW>0 与 IBRION=2。'))
     if has_configs and idipol == 0:
         out.append(('P1', 'ADS_SLAB_NO_DIPOLE',
                     '单面吸附 slab 必然有垂直净偶极,周期镜像赝电场对 E_ads 典型影响 '
@@ -85,8 +108,21 @@ def advise(incar: dict, *, has_configs: bool = False,
         out.append(('P1', 'TETRAHEDRON_RELAX',
                     '四面体法(ISMEAR=-5)对部分占据非变分,金属弛豫力可偏差数个百分点;'
                     '弛豫请用 ISMEAR=1、SIGMA≈0.2,收敛后再以 ISMEAR=-5 做静态单点。'))
+    _vac = _vacuum_thin(calc_type, poscar_text)
+    if _vac is not None:
+        out.append(('P1', 'VACUUM_TOO_THIN',
+                    f'slab 真空层仅 {_vac:.1f} Å(<{VACUUM_MIN_A:g} Å),周期镜像 slab 间'
+                    f'可能相互作用/偶极耦合,吸附能失真;建议真空 ≥12–15 Å。'))
 
     # ── P2 ──
+    if nsw > 0 and 'EDIFFG' not in up:
+        out.append(('P2', 'NO_EDIFFG',
+                    '未设 EDIFFG,VASP 将按能量判据收敛;吸附能建议力判据 '
+                    'EDIFFG=-0.02~-0.03 eV/Å。'))
+    if (has_configs or gas is not None) and 'IVDW' not in up and 'LUSE_VDW' not in up:
+        out.append(('P2', 'NO_DISPERSION',
+                    '未启用色散校正,分子/物理吸附能可能系统性偏弱(常用 IVDW=12 D3-BJ);'
+                    '金属化学吸附可酌情忽略。'))
     if ldipol and 'DIPOL' not in up:
         out.append(('P2', 'LDIPOL_WITHOUT_DIPOL',
                     '未设 DIPOL 时 VASP 自动猜偶极中心,可能很差且拖慢收敛;'

@@ -111,7 +111,7 @@ def build_job_dir(poscar_path, incar, out_dir, *,
     # 方法学顾问(warn-only;项目页已有,单作业生成同样要抓 LDIPOL/ISMEAR/ISPIN 类
     # "不崩但算错"的坑——多数人先逐个 slab 建模,这里正是最常见路径)
     warnings += _single_job_advisories(incar_dict, calc_type, elements, counts,
-                                       read_cell_vectors(content))
+                                       read_cell_vectors(content), content)
 
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, 'INCAR'), 'w', encoding='utf-8') as f:
@@ -152,17 +152,19 @@ def _infer_task_type(incar_dict) -> str:
     return 'relax'
 
 
-def _single_job_advisories(incar_dict, calc_type, elements, counts, cell) -> list:
+def _single_job_advisories(incar_dict, calc_type, elements, counts, cell,
+                           poscar_text=None) -> list:
     """单作业防呆(warn-only):复用 project.advisor 规则于单目录生成路径。
 
-    calc_type='molecule' 按气相参考口径查(ISMEAR/开壳层/盒子);slab 查偶极修正。
+    calc_type='molecule' 按气相参考口径查(ISMEAR/开壳层/盒子);slab 查偶极修正 + 真空层。
     advisor 失败静默(顾问绝不挡生成)。"""
     try:
         from vcstudio.project import advisor
         gas = None
         if calc_type == 'molecule':
             gas = {'elements': elements, 'counts': counts, 'cell': cell}
-        tips = advisor.advise(incar_dict, has_configs=(calc_type == 'slab'), gas=gas)
+        tips = advisor.advise(incar_dict, has_configs=(calc_type == 'slab'), gas=gas,
+                              calc_type=calc_type, poscar_text=poscar_text)
         return [f'[{p}] {msg}' for p, _name, msg in tips]
     except Exception:                                    # noqa: BLE001
         return []
