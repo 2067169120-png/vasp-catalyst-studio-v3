@@ -63,6 +63,45 @@ def test_bad_config_isolated_others_survive(env):
     assert len(proj['members']['configs']) == 1        # 坏组态不入组
 
 
+def test_project_unifies_encut_across_members(tmp_path, monkeypatch):
+    """修复:INCAR 未给 ENCUT 时,项目内各成员按**元素并集**统一补同一 ENCUT,
+    防 ΔE=E(slab+ads)−E(slab)−E(ref) 被不同截断能静默污染(缺口分析主打功能错误)。"""
+    lib = tmp_path / 'lib'
+    (lib / 'C').mkdir(parents=True)
+    (lib / 'O').mkdir(parents=True)
+    (lib / 'C' / 'POTCAR').write_text(
+        ' PAW_PBE C\n   ENMAX  =  273.214 eV\n', encoding='utf-8')
+    (lib / 'O' / 'POTCAR').write_text(
+        ' PAW_PBE O\n   ENMAX  =  400.000 eV\n', encoding='utf-8')
+    monkeypatch.setattr(ledger, 'default_ledger_path', lambda: tmp_path / 'jobs.json')
+    monkeypatch.setattr(adsorption, 'default_registry_path', lambda: tmp_path / 'projects.json')
+
+    incar = tmp_path / 'INCAR'          # 关键:不给 ENCUT
+    incar.write_text('ISMEAR = 0\n', encoding='utf-8')
+
+    def poscar(name, species, counts):
+        p = tmp_path / name
+        p.write_text(f'{name}\n1.0\n10 0 0\n0 10 0\n0 0 10\n{species}\n{counts}\n'
+                     'Cartesian\n0 0 0\n', encoding='utf-8')
+        return str(p)
+
+    res = adsorption.create_project(
+        tmp_path / 'proj', 'liS',
+        clean_poscar=poscar('slab.vasp', 'C', '1'),          # 仅 C
+        config_poscars=[poscar('c1.vasp', 'C O', '1 1')],    # C+O
+        incar_path=str(incar),
+        ref_poscar=poscar('ref.vasp', 'O', '1'),             # 仅 O
+        lib_root=str(lib))
+    assert res['ok'] and not res['errors']
+    proj = adsorption.load_project(res['project_path'])
+
+    # 并集 {C,O} → max ENMAX=400 → 统一 ENCUT=ceil(1.3*400/50)*50=550;全员一致
+    dirs = [proj['members']['clean_slab'], proj['members']['gas_ref'],
+            *proj['members']['configs']]
+    encuts = {manifest.load_manifest(d)['inputs']['completions']['ENCUT'] for d in dirs}
+    assert encuts == {550}, f'各成员 ENCUT 未统一: {encuts}'
+
+
 def test_delta_e_gating_and_value(env):
     res = adsorption.create_project(
         env['tmp'] / 'p3', 'd', clean_poscar=env['poscar']('s.vasp'),

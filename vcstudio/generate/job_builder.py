@@ -50,7 +50,8 @@ def _render_incar(original_text, incar_dict, completions, system_name):
 
 def build_job_dir(poscar_path, incar, out_dir, *,
                   calc_type: str = 'slab', kpoints=None, validate: bool = True,
-                  lib_root: str | None = None, system_name: str = '') -> dict:
+                  lib_root: str | None = None, system_name: str = '',
+                  force_encut: int | None = None) -> dict:
     """生成 VASP 输入四件套到 out_dir。
 
     Args:
@@ -61,6 +62,8 @@ def build_job_dir(poscar_path, incar, out_dir, *,
         kpoints: 显式 [kx,ky,kz];缺省则按 cell 自动推荐。
         validate: 是否校验补全用户 INCAR(缺 ENCUT/MAGMOM 等)。
         lib_root: POTCAR 库根(缺省从 config 读)。
+        force_encut: 项目级统一 ENCUT(吸附能项目各成员一致,保 ΔE 可比);
+            仅当用户 INCAR 未显式给 ENCUT 时生效。见 validate_and_complete_incar。
 
     Returns:
         {'ok','out_dir','warnings','kpoints','elements','completions','calc_type'}。
@@ -78,7 +81,7 @@ def build_job_dir(poscar_path, incar, out_dir, *,
     completions, warnings = OrderedDict(), []
     if validate:
         completions, warnings = validate_and_complete_incar(
-            incar_dict, elements, counts, lib_root)
+            incar_dict, elements, counts, lib_root, force_encut=force_encut)
 
     # ENCUT(仅供 POTCAR 的 ENMAX≤ENCUT 检查;从不写入 INCAR)。用成员判断避免把
     # 用户 ENCUT=0 等假值吞掉;三种来源互斥:用户显式 > 校验补全 > (无则)VASP 默认 max ENMAX。

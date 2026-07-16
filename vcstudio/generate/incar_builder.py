@@ -157,8 +157,15 @@ def _as_number(v):
 
 
 def validate_and_complete_incar(incar_dict, elements, counts,
-                                lib_root: str | None = None):
+                                lib_root: str | None = None,
+                                force_encut: int | None = None):
     """尊重用户 INCAR,只对【缺失键】产补全项;值不合理只 warn 不改。
+
+    force_encut:项目级统一 ENCUT。吸附能项目里各成员(clean_slab / slab+ads /
+    gas_ref)元素并集不同,若各自按自身元素补 ENCUT 会得到**不同**截断能,使
+    ΔE=E(slab+ads)−E(slab)−E(ref) 大数相减被不同基组静默污染(缺口分析指出的
+    主打功能静默错误)。调用方(create_project)按全项目元素并集算好统一值传入,
+    仅在用户 INCAR **未显式给** ENCUT 时生效(用户显式值永远尊重)。
 
     Returns:
         (completions: OrderedDict, warnings: list[str])。completions 仅含新增键
@@ -179,12 +186,24 @@ def validate_and_complete_incar(incar_dict, elements, counts,
 
     # D1 / D2:ENCUT
     if 'ENCUT' not in present:
-        mx = enmax_max()
-        enc = int(math.ceil(1.3 * mx / 50.0) * 50)      # 无 400 下限:不偷渡 RPBE 时代偏置
-        completions['ENCUT'] = enc
-        warnings.append(
-            f'INCAR 未指定 ENCUT,已按 1.3×max(ENMAX)={mx:.1f} 补为 {enc} eV;'
-            f'如需自定义请在 INCAR 显式给出。')
+        if force_encut is not None:
+            # 项目级统一:所有成员用同一 ENCUT,保 ΔE 可比性
+            mx = enmax_max()
+            if force_encut < mx:
+                warnings.append(
+                    f'项目统一 ENCUT={force_encut} 低于本成员元素最大 ENMAX={mx:.1f};'
+                    f'POTCAR 拼接阶段将报错,请提高项目 ENCUT 或在 INCAR 显式给出。')
+            completions['ENCUT'] = int(force_encut)
+            warnings.append(
+                f'INCAR 未指定 ENCUT,已按**全项目元素并集**统一补为 {int(force_encut)} eV'
+                f'(保吸附能 ΔE 各成员基组一致)。')
+        else:
+            mx = enmax_max()
+            enc = int(math.ceil(1.3 * mx / 50.0) * 50)  # 无 400 下限:不偷渡 RPBE 时代偏置
+            completions['ENCUT'] = enc
+            warnings.append(
+                f'INCAR 未指定 ENCUT,已按 1.3×max(ENMAX)={mx:.1f} 补为 {enc} eV;'
+                f'如需自定义请在 INCAR 显式给出。')
     else:
         user_encut = _as_number(upper.get('ENCUT'))
         if user_encut is not None:

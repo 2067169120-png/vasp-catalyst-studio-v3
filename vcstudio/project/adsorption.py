@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import re
 import time
@@ -18,7 +19,10 @@ from pathlib import Path
 import yaml
 
 from vcstudio.cluster import ledger
+from vcstudio.generate import potcar
+from vcstudio.generate.incar_builder import parse_incar
 from vcstudio.generate.job_builder import build_job_dir
+from vcstudio.generate.poscar import parse_poscar_species, read_poscar
 from vcstudio.shared import manifest as manifest_mod
 from vcstudio.shared.config import user_config_dir
 
@@ -38,6 +42,37 @@ def _now() -> str:
 
 
 # ── 项目创建(批量生成) ───────────────────────────────────────────────────────
+def _unified_encut(incar_path, poscars: list, lib_root) -> int | None:
+    """项目内各成员元素并集 → 统一 ENCUT(eV);算不出或用户已给 ENCUT → None。
+
+    保吸附能 ΔE=E(slab+ads)−E(slab)−E(ref) 三个作业基组一致(缺口分析:此前各成员
+    按自身元素补 ENCUT 会得不同截断能,静默污染 ΔE)。best-effort:任一步失败即回落
+    逐成员(旧行为),绝不因统一逻辑拖垮生成。
+    """
+    # 用户显式给了 ENCUT → 尊重,不统一(共享 INCAR 本就一致)
+    try:
+        with open(incar_path, 'r', encoding='utf-8', errors='replace') as f:
+            incar = parse_incar(f.read())
+        if 'ENCUT' in {str(k).upper() for k in incar}:
+            return None
+    except (OSError, ValueError):
+        return None
+    union: set = set()
+    for p in poscars:
+        try:
+            els, _ = parse_poscar_species(read_poscar(p))
+            union.update(els)
+        except (OSError, ValueError):
+            continue
+    if not union:
+        return None
+    try:
+        mx = potcar.max_enmax(sorted(union), lib_root)
+    except Exception:            # noqa: BLE001  库缺失/元素未登记 → 回落逐成员
+        return None
+    return int(math.ceil(1.3 * mx / 50.0) * 50)
+
+
 def create_project(root: str | os.PathLike, name: str, *,
                    clean_poscar: str, config_poscars: list,
                    incar_path: str, ref_poscar: str | None = None,
@@ -54,10 +89,16 @@ def create_project(root: str | os.PathLike, name: str, *,
     root.mkdir(parents=True, exist_ok=True)
     generated, errors = [], []
 
+    # 项目级统一 ENCUT:各成员元素并集算一个 ENCUT,防 ΔE 大数相减被不同基组污染。
+    # 仅当用户 INCAR 未显式给 ENCUT 时生效(用户值永远尊重);算不出则回落逐成员(旧行为)。
+    all_poscars = [clean_poscar, *config_poscars] + ([ref_poscar] if ref_poscar else [])
+    force_encut = _unified_encut(incar_path, all_poscars, lib_root) if validate else None
+
     def _gen(member: str, poscar: str, calc_type: str):
         out = root / member
         res = build_job_dir(poscar, incar_path, str(out), calc_type=calc_type,
-                            kpoints=kpoints, validate=validate, lib_root=lib_root)
+                            kpoints=kpoints, validate=validate, lib_root=lib_root,
+                            force_encut=force_encut)
         manifest_mod.create_from_build(str(out), res, poscar_path=poscar,
                                        validate=validate)
         ledger.register(str(out))

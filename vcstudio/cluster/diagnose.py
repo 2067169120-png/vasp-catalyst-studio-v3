@@ -28,6 +28,7 @@ SIGSEGV = 'SIGSEGV'               # 段错误——硬失败
 SILENT_EXIT = 'SILENT_EXIT'       # 退出 0 但无 OUTCAR——诡异,交人工
 NO_OUTPUT = 'NO_OUTPUT'           # 启动即死/缺 POTCAR,零输出——交人工
 BAD_ENERGY = 'BAD_ENERGY'         # 有收敛串但能量不合理——交人工(防收敛却是垃圾数)
+DISK_FULL = 'DISK_FULL'           # 磁盘满/IO 错误——交人工(盲目续算必再撞满,浪费机时)
 SCF_SLOSHING = 'SCF_SLOSHING'     # 电子步震荡(NELM 打满且 dE 不降)——盲目续算必复现,交人工
 USER_STOPPED = 'USER_STOPPED'     # STOPCAR 人工叫停——不是失败,人决定下一步
 UNKNOWN = 'UNKNOWN'               # 规则不覆盖——交人工
@@ -45,6 +46,7 @@ FAILURE_TO_STATE = {
     SILENT_EXIT: 'NEEDS_HUMAN',
     NO_OUTPUT: 'NEEDS_HUMAN',
     BAD_ENERGY: 'NEEDS_HUMAN',
+    DISK_FULL: 'NEEDS_HUMAN',
     SCF_SLOSHING: 'NEEDS_HUMAN',
     USER_STOPPED: 'NEEDS_HUMAN',
     UNKNOWN: 'NEEDS_HUMAN',
@@ -64,11 +66,21 @@ R_FAILED = 'FAILED'          # 泛化失败(Slurm F / PBS X):弱信号,交由取
 _ENERGY_ABSURD = 10000.0
 
 _OOM_EXIT = 137             # 128+9(SIGKILL),常见 OOM/超墙钟被杀
-_ZBRENT_RE = re.compile(r'ZBRENT:\s*fatal', re.IGNORECASE)
+# ZBRENT:除 "fatal error" 外,"bracketing interval incorrect" 与 "can not reach accuracy"
+# 同样常见(离子步线搜索失败),均可从 CONTCAR 续算(custodian 亦一并处理)
+_ZBRENT_RE = re.compile(
+    r'ZBRENT:\s*(?:fatal|bracketing interval incorrect|can\s*not reach accuracy)',
+    re.IGNORECASE)
 _SEGV_RE = re.compile(r'sigsegv|segmentation fault', re.IGNORECASE)
 # OOM 的日志直接证据:Slurm slurmstepd 的 oom-kill 行 / 内核 oom_kill / MPI 被 SIGKILL 收尸
 _OOM_LOG_RE = re.compile(r'oom-kill|oom_kill|out of memory'
                          r'|APPLICATION TERMINATED WITH THE EXIT STRING: Killed', re.IGNORECASE)
+# 磁盘满 / IO 错误(共享集群极常见):配额满、写盘失败、只读文件系统。
+# 盲目续算必再次撞满 → 不可续算,交人工清理后再说(区别于纯墙钟的可续算)
+_IO_ERROR_RE = re.compile(
+    r'No space left on device|Disk quota exceeded|quota exceeded'
+    r'|Input/output error|Read-only file system|Error writing file|write error',
+    re.IGNORECASE)
 
 # 已知 VASP 内部错误签名(字面串核对自 pymatgen Custodian VaspErrorHandler)。
 # 命中 → 具体命名 + 标准补救提示,状态 NEEDS_HUMAN:这些几乎都靠改 INCAR
@@ -254,6 +266,11 @@ def scan_vasp_error(log_tail: str):
     return None
 
 
+def scan_io_error(log_tail: str) -> bool:
+    """日志尾部是否含磁盘满/IO 错误签名(共享集群常见)。命中 → True。"""
+    return bool(log_tail) and bool(_IO_ERROR_RE.search(log_tail))
+
+
 def _empty(size) -> bool:
     """stat 大小视角:None(文件不存在/取不到)或 0 字节 → 空。"""
     return size is None or size == 0
@@ -286,6 +303,13 @@ def classify(*, scheduler_reason: str | None = None, exit_code: int | None = Non
     if stopped and not converged:
         return Diagnosis(USER_STOPPED, FAILURE_TO_STATE[USER_STOPPED], False,
                          'OUTCAR 见 soft stop(STOPCAR 人工叫停);非失败,由人决定续算/放弃')
+
+    # ⓪′ 磁盘满 / IO 错误:先于一切续算判定拦下——盲目续算必再次撞满,浪费机时。
+    # 未收敛时才拦(已收敛+能量合理说明计算其实已完成,末尾写盘报错另说)。
+    if scan_io_error(log_tail) and not converged:
+        return Diagnosis(DISK_FULL, FAILURE_TO_STATE[DISK_FULL], False,
+                         '日志命中磁盘满/IO 错误(No space / quota / I-O error)——'
+                         '不可续算,请先清理磁盘或换配额目录再重跑')
 
     # ① 收敛串在场:成功当且仅当 能量物理合理 且 末离子步电子真收敛
     if converged:
@@ -321,9 +345,14 @@ def classify(*, scheduler_reason: str | None = None, exit_code: int | None = Non
     if sig is not None:
         return Diagnosis(sig, FAILURE_TO_STATE[sig], sig in RESTARTABLE,
                          f'日志命中 {sig} 签名')
-    if exit_code == _OOM_EXIT:                      # 137 = OOM/被杀
-        return Diagnosis(OOM, FAILURE_TO_STATE[OOM], False,
-                         f'退出码 {exit_code}(128+9 SIGKILL)——疑 OOM/超墙钟被杀')
+    if exit_code == _OOM_EXIT:
+        # 137 = 128+9(SIGKILL)。此处已排除 OOM 日志证据(scan_log 会先命中真 OOM)与
+        # 调度器 OOM/TIMEOUT 原因。裸 137 既可能超墙钟被杀(可续算)也可能 OOM(硬失败),
+        # 但**有部分输出**时更常是墙钟。旧版一律判 OOM→FAILED 会困死可续算的墙钟作业
+        # (缺口分析 P0);改判为疑墙钟 → WALLTIME(可 CONTCAR 续算),把主动权交回恢复流程。
+        return Diagnosis(WALLTIME, FAILURE_TO_STATE[WALLTIME], True,
+                         f'退出码 {exit_code}(SIGKILL)但无 OOM 日志/调度器原因,且有部分输出——'
+                         f'疑超墙钟被杀,按可续算处理;若续算仍 137 再按 OOM 人工核查')
     ve = scan_vasp_error(log_tail)                  # 已知 VASP 内部错误(命名+建议,交人工)
     if ve is not None:
         label, hint = ve

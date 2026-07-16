@@ -159,10 +159,51 @@ def test_converged_ignores_benign_error_text_in_log():
     assert d.failure_class == dg.CONVERGED and d.state == 'DONE'
 
 
-# ── 有输出:退出码 137 = OOM ──
-def test_exit_137_is_oom():
+# ── 有输出:裸退出码 137(无 OOM 日志/调度器原因)→ 疑墙钟,可续算 ──
+def test_exit_137_bare_is_walltime_restartable():
+    """修复:裸 137 + 有部分输出但无 OOM 证据 → 判疑墙钟(可续算),
+    不再一律 OOM→FAILED 困死本可续算的墙钟作业(缺口分析 P0)。"""
     d = classify(outcar_size=90000, exit_code=137)
+    assert d.failure_class == dg.WALLTIME and d.state == 'UNCONVERGED' and d.restartable
+
+
+def test_exit_137_with_oom_log_is_still_oom():
+    """有 OOM 日志证据的 137 仍判 OOM→FAILED(scan_log 先命中,不被降级)。"""
+    d = classify(outcar_size=90000, exit_code=137,
+                 log_tail='slurmstepd: error: Detected 1 oom-kill event(s)\n')
     assert d.failure_class == dg.OOM and d.state == 'FAILED'
+
+
+def test_exit_137_with_scheduler_oom_reason_is_oom():
+    """调度器明确报 OOM 原因的 137 仍判 OOM→FAILED(原因优先)。"""
+    d = classify(outcar_size=90000, exit_code=137, scheduler_reason=dg.R_OOM)
+    assert d.failure_class == dg.OOM and d.state == 'FAILED'
+
+
+# ── 磁盘满 / IO 错误 → 不可续算,交人工 ──
+def test_disk_full_is_needs_human_not_restartable():
+    """磁盘满/配额满:盲目续算必再撞满 → DISK_FULL/NEEDS_HUMAN,不可续算。"""
+    for msg in ('OUTCAR write: No space left on device\n',
+                'Disk quota exceeded\n',
+                'Input/output error while writing WAVECAR\n'):
+        d = classify(outcar_size=90000, oszicar_size=3000, converged=False, log_tail=msg)
+        assert d.failure_class == dg.DISK_FULL and d.state == 'NEEDS_HUMAN' \
+            and not d.restartable, msg
+
+
+def test_disk_full_not_flagged_when_converged():
+    """已收敛+能量合理:计算其实已完成,末尾写盘噪声不改判(收敛短路在前)。"""
+    d = classify(converged=True, energy=-123.4, outcar_size=90000,
+                 log_tail='No space left on device\n')
+    assert d.failure_class == dg.CONVERGED and d.state == 'DONE'
+
+
+# ── ZBRENT 扩展签名(bracketing interval / can not reach accuracy)──
+def test_zbrent_extended_signatures_restartable():
+    for msg in ('ZBRENT: bracketing interval incorrect\n',
+                'ZBRENT: can not reach accuracy\n'):
+        d = classify(outcar_size=90000, log_tail=msg)
+        assert d.failure_class == dg.ZBRENT and d.restartable, msg
 
 
 # ── 有输出、无硬崩、无收敛串 → 未收敛(可续算) ──
