@@ -29,7 +29,8 @@ class Api:
                  batch_ops_mod=None, ledger_mod=None, manifest_mod=None,
                  submitter_mod=None, config_mod=None, job_builder_mod=None,
                  logic_mod=None, adsorption_mod=None, report_full_mod=None,
-                 conv_mod=None, sview_mod=None, methods_mod=None, dialog_fn=None):
+                 conv_mod=None, sview_mod=None, methods_mod=None, dialog_fn=None,
+                 native_charts_mod=None, freeenergy_mod=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -61,6 +62,9 @@ class Api:
         self._batch_ops = batch_ops_mod
         self._submitter = submitter_mod
         self._report_full = report_full_mod
+        # 原生出图引擎(matplotlib 可选依赖)与自由能:延迟导入,测试注入假件
+        self._native_charts = native_charts_mod
+        self._freeenergy = freeenergy_mod
 
     # ── 桥活性探测(前端用来确认 js_api 已就绪) ──
     def ping(self) -> str:
@@ -91,6 +95,19 @@ class Api:
             from vcstudio.project import report_full
             self._report_full = report_full
         return self._report_full
+
+    def _nc(self):
+        """原生出图引擎延迟加载(matplotlib/numpy 为可选依赖 charts)。"""
+        if self._native_charts is None:
+            from vcstudio.external import native_charts
+            self._native_charts = native_charts
+        return self._native_charts
+
+    def _fe(self):
+        if self._freeenergy is None:
+            from vcstudio.project import freeenergy
+            self._freeenergy = freeenergy
+        return self._freeenergy
 
     def _resolve(self, name, password):
         """名字 → (profile, 密码, err_dict|None)。
@@ -738,6 +755,222 @@ class Api:
             return {'ok': True, 'file': str(result), 'error': None}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'file': None, 'error': str(e)}
+
+    # ── 论文级出图(原生 matplotlib 引擎,不依赖 Origin/POV-Ray) ────────────────
+    @staticmethod
+    def _ads_short(member_name, proj_name) -> str:
+        """组态成员名 → 吸附质短名:剥掉 create_project 的 '{项目名}_ads_' 前缀。"""
+        prefix = f'{proj_name}_ads_'
+        n = str(member_name)
+        return n[len(prefix):] if n.startswith(prefix) else n
+
+    def _proj_delta_data(self, proj):
+        """项目 → (吸附质短名列表, ΔE 列表(None=未完成), delta 汇总 dict)。"""
+        s = self._adsorption.delta_e_rows(proj)
+        name = str(proj.get('name') or '')
+        rows = s.get('rows') or []
+        shorts = [self._ads_short(r['name'], name) for r in rows]
+        des = [r['delta_e'] for r in rows]
+        return shorts, des, s
+
+    def _proj_fed(self, proj, summary):
+        """项目 → Li-S 放电路径 fed;成功 (fed, None),失败 (None, 中文原因)。"""
+        try:
+            cfg = self._config.load_config()
+        except Exception:                                 # noqa: BLE001
+            cfg = {}
+        mol_dir = (cfg or {}).get('lis_molecules_dir') or ''
+        if not mol_dir or not os.path.isdir(str(mol_dir)):
+            return None, '未配置分子库目录 lis_molecules_dir(config),无法算 ΔG 台阶'
+        _state, e_slab = summary['slab']
+        if e_slab is None:
+            return None, '清洁表面未完成,无法算 ΔG 台阶'
+        try:
+            fed = self._fe().path_from_project_and_molecules(
+                summary['rows'], e_slab=e_slab, molecules_dir=str(mol_dir))
+            return fed, None
+        except ValueError as e:
+            return None, str(e)
+
+    def proj_figures(self, path, kinds=None, save_to=None):
+        """单项目论文级出图(原生引擎)。kinds ⊂ {'bar','table','ladder'},缺省全选。
+
+        bar/table 只用已完成的 ΔE 行;ladder 需 config.lis_molecules_dir 分子库。
+        某类图缺数据只记 skipped(kind+中文原因),不拖垮其他图。
+        返回 {'ok','files','skipped','out_dir','error'}。
+        """
+        try:
+            proj = self._adsorption.load_project((path or '').strip())
+            if proj is None:
+                return {'ok': False, 'files': [], 'skipped': [], 'out_dir': None,
+                        'error': '项目不存在或 project.yaml 已被移动'}
+            try:
+                nc = self._nc()
+            except ImportError:
+                return {'ok': False, 'files': [], 'skipped': [], 'out_dir': None,
+                        'error': '未安装 matplotlib/numpy(原生出图可选依赖):'
+                                 'pip install matplotlib numpy 后重试'}
+            kinds = [str(k) for k in (kinds or ['bar', 'table', 'ladder'])]
+            shorts, des, summary = self._proj_delta_data(proj)
+            pname = str(proj.get('name') or '') or '项目'
+            out_dir = (save_to or '').strip() or os.path.join(
+                str(proj.get('root') or os.path.dirname(str(path))), 'figures')
+            os.makedirs(out_dir, exist_ok=True)
+
+            files, skipped = [], []
+            done = [(s, d) for s, d in zip(shorts, des) if d is not None]
+            data = {'adsorbates': [s for s, _ in done],
+                    'substrates': {pname: [d for _, d in done]}}
+            for kind in kinds:
+                if kind in ('bar', 'table') and not done:
+                    skipped.append({'kind': kind,
+                                    'reason': '无已完成的 ΔE(需组态+清洁表面+参考全 DONE)'})
+                    continue
+                if kind == 'bar':
+                    files += nc.adsorption_bar(
+                        data, os.path.join(out_dir, 'adsorption_bar.png'),
+                        negative_up=True)
+                elif kind == 'table':
+                    files += nc.energy_matrix_table(
+                        data, os.path.join(out_dir, 'delta_e_table.png'))
+                elif kind == 'ladder':
+                    fed, reason = self._proj_fed(proj, summary)
+                    if fed is None:
+                        skipped.append({'kind': 'ladder', 'reason': reason})
+                        continue
+                    title = (f'Li-S discharge path ($U_L$ = {fed["u_l"]:.2f} V)'
+                             if fed.get('u_l') is not None else 'Li-S discharge path')
+                    files += nc.free_energy_ladder(
+                        [{'name': pname, 'G': [st['G'] for st in fed['steps']]}],
+                        os.path.join(out_dir, 'free_energy_ladder.png'),
+                        step_labels=[st['label'] for st in fed['steps']],
+                        pds_index=fed.get('pds_index'), title=title)
+                else:
+                    skipped.append({'kind': kind, 'reason': '未知图类型'})
+            return {'ok': True, 'files': files, 'skipped': skipped,
+                    'out_dir': out_dir, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'files': [], 'skipped': [], 'out_dir': None,
+                    'error': str(e)}
+
+    def proj_compare_figures(self, paths, kinds=None, save_to=None):
+        """多项目对比出图。kinds ⊂ {'heatmap','scaling','volcano'},缺省 heatmap。
+
+        heatmap:催化剂(项目)×吸附质 ΔE 矩阵;scaling:两个共同吸附质 ΔE 线性标度
+        (需 ≥3 个项目同时具备);volcano:x=共同吸附质 ΔE 描述符,y=各项目放电路径
+        U_L(需分子库,≥3 点)。缺数据记 skipped 不拖垮其他图。
+        """
+        try:
+            try:
+                nc = self._nc()
+            except ImportError:
+                return {'ok': False, 'files': [], 'skipped': [], 'out_dir': None,
+                        'error': '未安装 matplotlib/numpy(原生出图可选依赖):'
+                                 'pip install matplotlib numpy 后重试'}
+            kinds = [str(k) for k in (kinds or ['heatmap'])]
+            projs = []
+            for p in (paths or []):
+                proj = self._adsorption.load_project(str(p or '').strip())
+                if proj is None:
+                    continue
+                shorts, des, summary = self._proj_delta_data(proj)
+                projs.append({'name': str(proj.get('name') or '') or '项目',
+                              'proj': proj, 'summary': summary,
+                              'de': dict(zip(shorts, des))})
+            if len(projs) < 2:
+                return {'ok': False, 'files': [], 'skipped': [], 'out_dir': None,
+                        'error': '多项目对比至少需要选中 2 个有效项目'}
+            cols: list = []
+            for pr in projs:                     # 首见序并集
+                for s in pr['de']:
+                    if s not in cols:
+                        cols.append(s)
+            out_dir = (save_to or '').strip() or os.path.join(
+                str(projs[0]['proj'].get('root') or '.'), 'compare_figures')
+            os.makedirs(out_dir, exist_ok=True)
+
+            files, skipped = [], []
+            for kind in kinds:
+                if kind == 'heatmap':
+                    values = [[pr['de'].get(c) for c in cols] for pr in projs]
+                    if not any(v is not None for row in values for v in row):
+                        skipped.append({'kind': 'heatmap',
+                                        'reason': '所有项目均无已完成的 ΔE'})
+                        continue
+                    files += nc.heatmap_matrix(
+                        {'rows': [pr['name'] for pr in projs], 'cols': cols,
+                         'values': values},
+                        os.path.join(out_dir, 'delta_e_heatmap.png'))
+                elif kind == 'scaling':
+                    pair = self._best_scaling_pair(projs, cols)
+                    if pair is None:
+                        skipped.append({'kind': 'scaling',
+                                        'reason': '不足 3 个项目同时具备两个共同吸附质的 ΔE'})
+                        continue
+                    a, b, xs, ys, labels = pair
+                    files += nc.scaling_relation(
+                        xs, ys, os.path.join(out_dir, 'scaling_relation.png'),
+                        xlabel=f'$\\Delta E$({a}) (eV)',
+                        ylabel=f'$\\Delta E$({b}) (eV)', labels=labels)
+                elif kind == 'volcano':
+                    pts, reason = self._volcano_points(projs, cols)
+                    if pts is None:
+                        skipped.append({'kind': 'volcano', 'reason': reason})
+                        continue
+                    sp, points = pts
+                    files += nc.volcano_plot(
+                        points, os.path.join(out_dir, 'volcano.png'),
+                        descriptor_label=f'$\\Delta E$({sp}) (eV)',
+                        activity_label='$U_L$ (V)')
+                else:
+                    skipped.append({'kind': kind, 'reason': '未知图类型'})
+            return {'ok': True, 'files': files, 'skipped': skipped,
+                    'out_dir': out_dir, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'files': [], 'skipped': [], 'out_dir': None,
+                    'error': str(e)}
+
+    @staticmethod
+    def _best_scaling_pair(projs, cols):
+        """选覆盖最好的两个吸附质:≥3 个项目同时有 ΔE → (a,b,xs,ys,labels);否则 None。"""
+        best = None
+        for i in range(len(cols)):
+            for j in range(i + 1, len(cols)):
+                a, b = cols[i], cols[j]
+                pts = [(pr['de'].get(a), pr['de'].get(b), pr['name']) for pr in projs]
+                pts = [(x, y, n) for x, y, n in pts if x is not None and y is not None]
+                if len(pts) >= 3 and (best is None or len(pts) > len(best[2])):
+                    best = (a, b, pts)
+        if best is None:
+            return None
+        a, b, pts = best
+        return (a, b, [x for x, _, _ in pts], [y for _, y, _ in pts],
+                [n for _, _, n in pts])
+
+    def _volcano_points(self, projs, cols):
+        """火山图数据:描述符=覆盖最好的共同吸附质 ΔE,活性=各项目 U_L。
+
+        → ((species, points), None) 或 (None, 中文原因)。"""
+        uls, reasons = {}, []
+        for pr in projs:
+            fed, reason = self._proj_fed(pr['proj'], pr['summary'])
+            if fed is not None and fed.get('u_l') is not None:
+                uls[pr['name']] = fed['u_l']
+            elif reason:
+                reasons.append(f"{pr['name']}: {reason}")
+        if len(uls) < 3:
+            why = ';'.join(reasons[:3]) or '有 U_L 的项目不足'
+            return None, f'火山图需 ≥3 个项目具备放电路径 U_L(当前 {len(uls)} 个)。{why}'
+        best_sp, best_pts = None, []
+        for sp in cols:
+            pts = [{'name': pr['name'], 'x': pr['de'].get(sp),
+                    'y': uls.get(pr['name'])} for pr in projs]
+            pts = [p for p in pts if p['x'] is not None and p['y'] is not None]
+            if len(pts) > len(best_pts):
+                best_sp, best_pts = sp, pts
+        if len(best_pts) < 3:
+            return None, '不足 3 个项目同时具备描述符 ΔE 与 U_L'
+        return (best_sp, best_pts), None
 
     # ── 文件/目录选择(web 无原生 input;pywebview 延迟 import,测试注入 dialog_fn) ──
     def pick_file(self, kind='poscar'):

@@ -115,6 +115,86 @@
     const want = State.projects.some(p => p.path === prev) ? prev
       : State.projects[State.projects.length - 1].path;
     sel.value = want;
+    renderFigProjList();
+  }
+
+  // ── 论文级出图:多项目对比勾选列表(随项目列表刷新) ──────────────────────
+  function renderFigProjList() {
+    const box = $('fig-projlist');
+    if (!box) return;
+    box.innerHTML = '';
+    if (!State.projects.length) {
+      box.textContent = '(暂无项目)';
+      return;
+    }
+    State.projects.forEach(p => {
+      const lab = document.createElement('label');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.dataset.path = p.path;
+      lab.appendChild(cb);
+      lab.appendChild(document.createTextNode(p.name || '(未命名)'));
+      box.appendChild(lab);
+    });
+  }
+
+  function logFigResult(r, what) {
+    if (!r || r.ok === false || r.error) {
+      VCS.log(what + '失败:' + ((r && r.error) || '未知错误'), 'failc');
+      return;
+    }
+    (r.files || []).forEach(f => VCS.log('已生成:' + f, 'okc'));
+    (r.skipped || []).forEach(s => VCS.log('跳过 ' + s.kind + ':' + s.reason, 'warnc'));
+    if ((r.files || []).length) {
+      VCS.log('图已输出到:' + r.out_dir, 'okc');
+      VCS.call('open_dir', r.out_dir);          // 生成即可看
+      VCS.toast('已生成 ' + r.files.length + ' 个文件');
+    } else if ((r.skipped || []).length) {
+      VCS.toast('本次没有可生成的图(原因见日志)', 'fail');
+    }
+  }
+
+  // 当前项目出图:按勾选的图类型调 proj_figures
+  async function makeFigures() {
+    const proj = currentProject();
+    if (!proj) return;
+    const kinds = [];
+    if ($('fig-bar') && $('fig-bar').checked) kinds.push('bar');
+    if ($('fig-table') && $('fig-table').checked) kinds.push('table');
+    if ($('fig-ladder') && $('fig-ladder').checked) kinds.push('ladder');
+    if (!kinds.length) { VCS.log('请至少勾选一种图', 'failc'); return; }
+    const btn = $('pj-figs');
+    if (btn) btn.disabled = true;
+    VCS.log('出图中(' + kinds.join('/') + ')…');
+    try {
+      const r = await VCS.call('proj_figures', proj.path, kinds, null);
+      logFigResult(r, '出图');
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  // 多项目对比出图:勾选的项目 + 勾选的图类型调 proj_compare_figures
+  async function makeCompareFigures() {
+    const box = $('fig-projlist');
+    const paths = box
+      ? Array.from(box.querySelectorAll('input:checked')).map(cb => cb.dataset.path)
+      : [];
+    if (paths.length < 2) { VCS.log('多项目对比请勾选至少 2 个项目', 'failc'); return; }
+    const kinds = [];
+    if ($('fig-heatmap') && $('fig-heatmap').checked) kinds.push('heatmap');
+    if ($('fig-scaling') && $('fig-scaling').checked) kinds.push('scaling');
+    if ($('fig-volcano') && $('fig-volcano').checked) kinds.push('volcano');
+    if (!kinds.length) { VCS.log('请至少勾选一种对比图', 'failc'); return; }
+    const btn = $('pj-cmpfigs');
+    if (btn) btn.disabled = true;
+    VCS.log('对比出图中(' + paths.length + ' 个项目,' + kinds.join('/') + ')…');
+    try {
+      const r = await VCS.call('proj_compare_figures', paths, kinds, null);
+      logFigResult(r, '对比出图');
+    } finally {
+      if (btn) btn.disabled = false;
+    }
   }
 
   function currentProject() {
@@ -224,6 +304,8 @@
     wire('pj-delta', delta);
     wire('pj-csv', exportCsv);
     wire('pj-report', report);
+    wire('pj-figs', makeFigures);
+    wire('pj-cmpfigs', makeCompareFigures);
     renderConfigs();
     reloadProjects();
   }

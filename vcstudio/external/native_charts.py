@@ -378,6 +378,7 @@ def free_energy_ladder(paths, out_path, *, step_labels=None,
                        ylabel: str = r'$\Delta G$ (eV)',
                        xlabel: str = 'Reaction coordinate', title: str = '',
                        mark_pds: bool = True, show_ul: bool = False,
+                       pds_index=None,
                        half: float = 0.35, width: float | None = None,
                        palette: str = 'tol_bright', panel: str = '',
                        formats=('png', 'pdf'), style_kw: dict | None = None) -> list:
@@ -390,11 +391,18 @@ def free_energy_ladder(paths, out_path, *, step_labels=None,
         ]
         单体系可直接传一个 dict。各体系步数可不同(取最大者定横轴)。
         step_labels = ['S8', 'Li2S8', ...] 可选,标在横轴(自动化学式下标)。
+        每个体系 dict 可带 'pds_index'(该体系的权威决速步序号,优先级最高)。
 
     参数:
-        mark_pds: True 时每个体系的决速步(最大上坡 ΔG)连接线改红色实线并标注数值;
+        mark_pds: True 时每个体系的决速步连接线改红色实线并标注数值;
                   全下坡体系(无上坡)不标。
-        show_ul:  True 时图例追加极限电位 U_L = -ΔG_max/e(电催化惯例)。
+        pds_index: **权威决速步序号**(int,作用于所有未自带 pds_index 的体系)。
+                  各步转移电子数不等时(如 Li-S 末步 8 e⁻),决速步须按**逐电子**
+                  ΔG 判定(freeenergy.discharge_path 的 pds_index)——此时必须传入,
+                  否则本函数按原始 ΔG 自判会高亮错步(与 U_L 图数不一致)。
+                  None 时回落自判(仅逐 1 e⁻ 路径下正确)。
+        show_ul:  True 时图例追加极限电位 U_L = -ΔG_max/e(电催化惯例;
+                  仅逐 1 e⁻ 路径下与逐电子口径一致)。
         half:     平台半宽(反应坐标单位)。
         其余参数同 adsorption_bar。
 
@@ -407,27 +415,34 @@ def free_energy_ladder(paths, out_path, *, step_labels=None,
         name, gs = str(p.get('name', '')), [float(g) for g in (p.get('G') or [])]
         if len(gs) < 2:
             raise ValueError(f"体系 '{name}' 的 G 至少需 2 个台阶")
-        systems.append((name, gs))
+        systems.append((name, gs, p.get('pds_index', None)))
     if not systems:
         raise ValueError('paths 不能为空')
-    n = max(len(gs) for _, gs in systems)
+    n = max(len(gs) for _, gs, _ in systems)
     fig_w = width if width is not None else max(SINGLE_COL, 0.52 * n + 1.2)
 
     with apply_paper_style(palette=palette, **(style_kw or {})):
         fig, ax = _new_figure(width=fig_w, aspect=0.70)
         colors = PALETTES.get(palette, PALETTES['tol_bright'])
-        all_g = [g for _, gs in systems for g in gs]
+        all_g = [g for _, gs, _ in systems for g in gs]
         rng = (max(all_g) - min(all_g)) or 1.0
         if min(all_g) < 0 < max(all_g):
             ax.axhline(0.0, color=ZERO_LINE_COLOR, lw=0.7, ls=(0, (5, 3)), zorder=1)
 
-        for si, (name, gs) in enumerate(systems):
+        for si, (name, gs, path_pds) in enumerate(systems):
             c = colors[si % len(colors)]
-            # 决速步 = 最大上坡步(电化学 PDS 惯例);全下坡则无
             climbs = [gs[i + 1] - gs[i] for i in range(len(gs) - 1)]
-            pds = max(range(len(climbs)), key=lambda i: climbs[i]) if climbs else None
-            if pds is not None and climbs[pds] <= 0:
-                pds = None
+            # 决速步:体系自带 > 全局 pds_index > 按原始 ΔG 自判(仅逐 1e⁻ 路径正确)
+            authoritative = path_pds if path_pds is not None else pds_index
+            if authoritative is not None:
+                pds = int(authoritative)
+                if not (0 <= pds < len(climbs)):
+                    raise ValueError(
+                        f"pds_index={pds} 越界(体系 '{name}' 只有 {len(climbs)} 个连接步)")
+            else:
+                pds = max(range(len(climbs)), key=lambda i: climbs[i]) if climbs else None
+                if pds is not None and climbs[pds] <= 0:
+                    pds = None
             for i, g in enumerate(gs):          # 平台:实线
                 ax.plot([i - half, i + half], [g, g], color=c, lw=1.9,
                         solid_capstyle='butt', zorder=3)
@@ -436,7 +451,7 @@ def free_energy_ladder(paths, out_path, *, step_labels=None,
                 if mark_pds and i == pds:
                     ax.plot([x0, x1], [gs[i], gs[i + 1]], color=PDS_COLOR,
                             lw=1.6, zorder=4)
-                    ax.annotate(f'+{climbs[i]:.2f}',
+                    ax.annotate(f'{climbs[i]:+.2f}',
                                 ((x0 + x1) / 2, (gs[i] + gs[i + 1]) / 2),
                                 xytext=(3, -1), textcoords='offset points',
                                 ha='left', va='top', color=PDS_COLOR,

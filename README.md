@@ -67,7 +67,9 @@ silent (job.yaml state machine + audit history).
 - **原生论文级出图引擎** `external/native_charts.py`:纯 matplotlib 达论文质量
   (serif/矢量 PDF/多面板/色盲安全色板),不依赖 Origin/POV-Ray。吸附能分组柱状图、
   数据矩阵表、ΔG 自由能台阶图、**多催化剂热图**、**火山图**(自动求 Sabatier 峰顶)、
-  标度关系图。*(注:引擎已就绪,接入 GUI/报告与打包收录为下一步,见 progress 文档)*
+  标度关系图。**已接入 GUI**:项目页「论文级出图」卡片,勾选图类型一键生成
+  (单项目:柱状图/表/台阶图;多项目对比:热图/标度关系/火山图),生成后自动打开
+  图目录。打包默认收录 matplotlib(`--no-charts` 可关)。
 - **结果分析增强**:PDOS 投影 + d 带中心、Bader 电荷解析、可选 ΔG 口径
   (默认 ZPE−TS 对齐文献 / 可切 ASE 严格式含振动内能项)、PDS/U_L 图数一致性。
 - **输入正确性**:KPOINTS 改用倒格矢(修六方/hcp slab 欠采样)、项目内 ENCUT 强制

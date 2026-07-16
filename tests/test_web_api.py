@@ -1230,3 +1230,142 @@ def test_struct_view_injects_sview_mod(tmp_path):
     out = api.struct_view(str(f))
     assert out['ok'] is True
     assert seen['content'] == 'whatever'
+
+
+# ── proj_figures / proj_compare_figures(原生出图接线) ───────────────────────
+def _fake_ncharts(calls):
+    """native_charts 假件:记录每次调用与参数,返回假文件路径。"""
+    m = types.SimpleNamespace()
+
+    def _rec(kind):
+        def _f(data, out_path, **kw):
+            calls.setdefault(kind, []).append({'data': data, 'out': out_path, **kw})
+            return [str(out_path)]
+        return _f
+    m.adsorption_bar = _rec('bar')
+    m.energy_matrix_table = _rec('table')
+    m.free_energy_ladder = _rec('ladder')
+    m.heatmap_matrix = _rec('heatmap')
+    m.volcano_plot = _rec('volcano')
+    m.scaling_relation = lambda xs, ys, out_path, **kw: (
+        calls.setdefault('scaling', []).append(
+            {'xs': xs, 'ys': ys, 'out': out_path, **kw}) or [str(out_path)])
+    return m
+
+
+def _proj(name, root):
+    return {'name': name, 'root': root,
+            'members': {'clean_slab': '/s', 'gas_ref': None, 'configs': []}}
+
+
+def _delta(names_to_de, slab=('DONE', -100.0)):
+    rows = [{'name': n, 'state': 'DONE' if d is not None else 'RUNNING',
+             'e_config': None, 'delta_e': d, 'note': ''}
+            for n, d in names_to_de.items()]
+    return {'slab': slab, 'ref': ('无', None), 'has_ref': False, 'rows': rows}
+
+
+def test_proj_figures_bar_table_with_short_names(tmp_path):
+    calls = {}
+    proj = _proj('liS', str(tmp_path))
+    ads = _fake_adsorption(proj_map={'/p/project.yaml': proj},
+                           delta_ret=_delta({'liS_ads_Li2S4': -1.2,
+                                             'liS_ads_Li2S2': None}))
+    api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
+              config_mod=_fake_config())
+    out = api.proj_figures('/p/project.yaml', ['bar', 'table'])
+    assert out['ok'] is True and len(out['files']) == 2
+    # 短名剥前缀 + 只收已完成 ΔE
+    data = calls['bar'][0]['data']
+    assert data['adsorbates'] == ['Li2S4']
+    assert data['substrates'] == {'liS': [-1.2]}
+    assert calls['bar'][0]['negative_up'] is True
+    assert out['out_dir'] == str(tmp_path / 'figures')
+
+
+def test_proj_figures_no_done_rows_all_skipped(tmp_path):
+    calls = {}
+    ads = _fake_adsorption(proj_map={'/p': _proj('x', str(tmp_path))},
+                           delta_ret=_delta({'x_ads_a': None}))
+    api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
+              config_mod=_fake_config())
+    out = api.proj_figures('/p', ['bar', 'table'])
+    assert out['ok'] is True and out['files'] == []
+    assert {s['kind'] for s in out['skipped']} == {'bar', 'table'}
+    assert 'bar' not in calls
+
+
+def test_proj_figures_ladder_uses_fed_pds_index(tmp_path):
+    calls = {}
+    mol_dir = tmp_path / 'mols'
+    mol_dir.mkdir()
+    fed = {'steps': [{'label': 'S8*', 'G': 0.0}, {'label': 'Li2S*', 'G': -1.0}],
+           'pds_index': 0, 'u_l': 1.5, 'mu_li': -1.65, 'per_electron': [0.5],
+           'thermo_corrected': False}
+    fe = types.SimpleNamespace(
+        path_from_project_and_molecules=lambda rows, e_slab, molecules_dir: fed)
+    ads = _fake_adsorption(proj_map={'/p': _proj('liS', str(tmp_path))},
+                           delta_ret=_delta({'liS_ads_Li2S4': -1.2}))
+    api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
+              freeenergy_mod=fe,
+              config_mod=_fake_config(cfg={'lis_molecules_dir': str(mol_dir)}))
+    out = api.proj_figures('/p', ['ladder'])
+    assert out['ok'] is True and len(out['files']) == 1
+    lad = calls['ladder'][0]
+    assert lad['pds_index'] == 0                      # 逐电子权威口径透传
+    assert lad['step_labels'] == ['S8*', 'Li2S*']
+    assert lad['data'] == [{'name': 'liS', 'G': [0.0, -1.0]}]
+
+
+def test_proj_figures_ladder_skipped_without_molecules_dir(tmp_path):
+    calls = {}
+    ads = _fake_adsorption(proj_map={'/p': _proj('liS', str(tmp_path))},
+                           delta_ret=_delta({'liS_ads_a': -1.0}))
+    api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
+              config_mod=_fake_config())          # 无 lis_molecules_dir
+    out = api.proj_figures('/p', ['ladder'])
+    assert out['ok'] is True and out['files'] == []
+    assert out['skipped'][0]['kind'] == 'ladder'
+    assert 'lis_molecules_dir' in out['skipped'][0]['reason']
+
+
+def test_proj_compare_figures_heatmap_union_cols(tmp_path):
+    calls = {}
+    p1, p2 = _proj('A', str(tmp_path / 'a')), _proj('B', str(tmp_path / 'b'))
+    deltas = {'/a': _delta({'A_ads_S8': -0.5, 'A_ads_Li2S': -2.0}),
+              '/b': _delta({'B_ads_S8': -0.8})}
+    ads = _fake_adsorption(proj_map={'/a': p1, '/b': p2})
+    ads.delta_e_rows = lambda proj: deltas['/a' if proj['name'] == 'A' else '/b']
+    api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
+              config_mod=_fake_config())
+    out = api.proj_compare_figures(['/a', '/b'], ['heatmap'])
+    assert out['ok'] is True and len(out['files']) == 1
+    data = calls['heatmap'][0]['data']
+    assert data['rows'] == ['A', 'B']
+    assert data['cols'] == ['S8', 'Li2S']            # 首见序并集
+    assert data['values'] == [[-0.5, -2.0], [-0.8, None]]
+
+
+def test_proj_compare_figures_needs_two_projects():
+    api = Api(adsorption_mod=_fake_adsorption(proj_map={}),
+              native_charts_mod=_fake_ncharts({}), config_mod=_fake_config())
+    out = api.proj_compare_figures(['/only'], ['heatmap'])
+    assert out['ok'] is False and '2 个' in out['error']
+
+
+def test_proj_compare_scaling_pair_and_volcano_skip(tmp_path):
+    calls = {}
+    projs = {f'/p{i}': _proj(f'M{i}', str(tmp_path / f'p{i}')) for i in range(3)}
+    des = {'M0': {'M0_ads_a': -1.0, 'M0_ads_b': -2.0},
+           'M1': {'M1_ads_a': -1.5, 'M1_ads_b': -2.6},
+           'M2': {'M2_ads_a': -2.0, 'M2_ads_b': -3.1}}
+    ads = _fake_adsorption(proj_map=projs)
+    ads.delta_e_rows = lambda proj: _delta(des[proj['name']])
+    api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
+              config_mod=_fake_config())          # 无分子库 → volcano 应 skip
+    out = api.proj_compare_figures(list(projs), ['scaling', 'volcano'])
+    assert out['ok'] is True
+    sc = calls['scaling'][0]
+    assert sc['xs'] == [-1.0, -1.5, -2.0] and sc['ys'] == [-2.0, -2.6, -3.1]
+    assert [s['kind'] for s in out['skipped']] == ['volcano']
+    assert 'U_L' in out['skipped'][0]['reason']
