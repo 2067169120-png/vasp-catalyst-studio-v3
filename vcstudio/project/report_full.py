@@ -107,7 +107,10 @@ def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
     except ValueError as e:
         sections.append(f"<p class='dim'>ΔE 柱状图未生成:{_esc(e)}</p>")
     if fed:
-        ladder = charts.ladder_data(fed['steps'], u_l=fed['u_l'])
+        # pds_index 必须透传 freeenergy 的逐电子口径:Li-S 末步 8 e⁻,按原始 ΔG
+        # 重算会高亮错步(图上决速步 ≠ U_L 对应步)
+        ladder = charts.ladder_data(fed['steps'], u_l=fed['u_l'],
+                                    pds_index=fed['pds_index'])
         origin_specs.append({'kind': 'ladder', 'name': 'fed', 'data': ladder})
         corr_note = ('含 ZPE−TS 振动校正(298.15 K)' if fed.get('thermo_corrected')
                      else '电子能未含 ZPE/熵')

@@ -30,24 +30,40 @@ def test_parse_no_frequencies_returns_empty():
 
 def test_harmonic_thermo_zpe_is_half_sum():
     real = [406.564208, 200.6, 41.36]
-    zpe, ts = thermo.harmonic_thermo(real, 298.15)
+    zpe, u_th, ts = thermo.harmonic_thermo(real, 298.15)
     assert zpe == pytest.approx(sum(real) / 2000.0, rel=1e-9)   # Σ hν/2 (meV→eV)
-    assert ts > 0
-    # 高频模在室温几乎不贡献熵;41 meV(x≈1.6)是主要贡献者
-    _, ts_high_only = thermo.harmonic_thermo([406.564208], 298.15)
-    assert ts_high_only < 1e-6
+    assert ts > 0 and u_th > 0
+    # 高频模在室温几乎不贡献熵/热占据;41 meV(x≈1.6)是主要贡献者
+    _, u_high_only, ts_high_only = thermo.harmonic_thermo([406.564208], 298.15)
+    assert ts_high_only < 1e-6 and u_high_only < 1e-6
 
 
 def test_harmonic_thermo_entropy_formula_single_mode():
-    """单模数值口径核对:x = hv/kT;S/kB = x/(e^x−1) − ln(1−e^−x)。"""
+    """单模数值口径核对:x = hv/kT;U = hv/(e^x−1);S/kB = x/(e^x−1) − ln(1−e^−x)。"""
     mev = 25.0
     T = 300.0
-    zpe, ts = thermo.harmonic_thermo([mev], T)
+    zpe, u_th, ts = thermo.harmonic_thermo([mev], T)
     hv = mev / 1000.0
     x = hv / (thermo.KB_EV * T)
     s_kb = x / math.expm1(x) - math.log1p(-math.exp(-x))
     assert ts == pytest.approx(thermo.KB_EV * T * s_kb, rel=1e-9)
+    assert u_th == pytest.approx(hv / math.expm1(x), rel=1e-9)   # U_vib 热占据项
     assert zpe == pytest.approx(hv / 2)
+
+
+def test_g_corr_two_modes_same_frequencies():
+    """同一组频率:'zpe_ts' 与 'ase' 给不同 g_corr;默认 = ZPE−TS(论文口径)。"""
+    real = [406.564208, 200.6, 41.36]
+    zpe, u_th, ts = thermo.harmonic_thermo(real, 298.15)
+    r = thermo.VibResult(real_mev=real, zpe_ev=zpe, u_thermal_ev=u_th, ts_ev=ts)
+    assert r.g_corr('zpe_ts') == pytest.approx(zpe - ts)
+    assert r.g_corr('ase') == pytest.approx(zpe + u_th - ts)
+    assert r.g_corr('ase') - r.g_corr('zpe_ts') == pytest.approx(u_th)
+    assert u_th > 0                                   # 室温下两口径确实不同
+    assert r.g_corr() == r.g_corr('zpe_ts')           # 不带参默认论文口径
+    assert r.g_corr_ev == pytest.approx(zpe - ts)     # property = 默认口径,复现基准
+    with pytest.raises(ValueError, match='zpe_ts'):
+        r.g_corr('nonsense')
 
 
 def test_analyze_outcar_and_load_corrections(tmp_path):
@@ -63,6 +79,13 @@ def test_analyze_outcar_and_load_corrections(tmp_path):
     assert 'Li2S' in corr and 'missing' not in corr
     assert corr['Li2S']['n_imag'] == 1
     assert corr['Li2S']['imag_cm1'] == [18.1]
+    assert corr['Li2S']['g_corr'] == pytest.approx(
+        corr['Li2S']['zpe'] - corr['Li2S']['ts'], abs=2e-6)      # 默认 zpe_ts 口径
+    # mode='ase':同一批 OUTCAR,g_corr 多出 u_thermal 项
+    corr_ase = thermo.load_corrections({'Li2S': str(d)}, mode='ase')
+    assert corr_ase['Li2S']['g_corr'] == pytest.approx(
+        corr['Li2S']['g_corr'] + corr['Li2S']['u_thermal'], abs=2e-6)
+    assert corr_ase['Li2S']['u_thermal'] > 0
 
 
 def test_analyze_outcar_none_for_relax(tmp_path):

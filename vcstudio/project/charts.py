@@ -207,13 +207,25 @@ def render_heatmap_svg(data: dict, *, title='', width=760, height=None,
 
 
 # ── 3. 自由能阶梯图(RDS 高亮 + U_L 标注) ───────────────────────────────────────
-def ladder_data(steps: list, u_l: float | None = None) -> dict:
-    """steps=[{'label','G','sub_label'?}] → 契约(补 pds_index=最陡上坡步)。"""
+def ladder_data(steps: list, u_l: float | None = None,
+                pds_index: int | None = None) -> dict:
+    """steps=[{'label','G','sub_label'?}] → 阶梯图契约。
+
+    pds_index:决速步序号(第 i 步 = steps[i]→steps[i+1])。**各步电子数不等的
+    路径(如 Li-S 末步 8 e⁻)必须由调用方传入**——用 freeenergy.discharge_path
+    返回的逐电子口径 pds_index,保证图中高亮步与 U_L 同一口径(修复:此前本函数
+    按原始 ΔG 重算,高亮步可能 ≠ U_L 对应步)。
+    不传则兜底按"相邻步原始 ΔG 最大"重算——仅每步电子数相同(逐步 1 e⁻)时
+    该口径才与 U_L 一致。越界的 pds_index → ValueError(绝不静默画错图)。
+    """
     if len(steps) < 2:
         raise ValueError('阶梯图至少需要 2 个状态')
-    diffs = [steps[i + 1]['G'] - steps[i]['G'] for i in range(len(steps) - 1)]
-    pds = max(range(len(diffs)), key=lambda i: diffs[i]) if diffs else None
-    return {'steps': list(steps), 'pds_index': pds, 'u_l': u_l}
+    if pds_index is None:
+        diffs = [steps[i + 1]['G'] - steps[i]['G'] for i in range(len(steps) - 1)]
+        pds_index = max(range(len(diffs)), key=lambda i: diffs[i]) if diffs else None
+    elif not 0 <= int(pds_index) <= len(steps) - 2:
+        raise ValueError(f'pds_index={pds_index} 越界(有效范围 0..{len(steps) - 2})')
+    return {'steps': list(steps), 'pds_index': pds_index, 'u_l': u_l}
 
 
 def render_ladder_svg(data: dict, *, title='', ylabel='ΔG (eV)',

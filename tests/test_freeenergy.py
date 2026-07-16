@@ -36,6 +36,29 @@ def test_discharge_path_missing_species_named():
         fe.discharge_path({'S8': -1.0, 'Li2S8': -1.0}, _MOL, mu_li=-2.0)
 
 
+def test_pds_consistent_with_ladder_when_last_step_many_electrons():
+    """末步电子数大(8 e⁻)、原始 ΔG 最大但每电子 ΔG 小:PDS/U_L 与图必须同源。
+
+    构造:ΔG 阶梯 [0, −1, −0.5, −1, −1.2, −0.4],Δn = [2,2,2,2,8]
+    → 每电子 [−0.5, +0.25, −0.25, −0.1, +0.1]:PDS = 步 1(0.25),U_L = −0.25;
+    而原始 ΔG 最大是末步(+0.8)——旧 ladder_data 自行重算会高亮错那一步。
+    """
+    sys_e = {'S8': -100.0, 'Li2S8': -105.0, 'Li2S6': -96.5,
+             'Li2S4': -89.0, 'Li2S2': -81.2, 'Li2S': -76.4}
+    out = fe.discharge_path(sys_e, _MOL, mu_li=-2.0)
+    gs = [s['G'] for s in out['steps']]
+    assert gs == pytest.approx([0.0, -1.0, -0.5, -1.0, -1.2, -0.4])
+    assert out['per_electron'] == pytest.approx([-0.5, 0.25, -0.25, -0.1, 0.1])
+    assert out['pds_index'] == 1                       # 逐电子口径,不是末步(4)
+    assert out['u_l'] == pytest.approx(-0.25)          # U_L = −max(ΔG/Δn e)
+    # 接图:pds_index 透传后,图内高亮步 == U_L 对应步
+    from vcstudio.project import charts
+    lad = charts.ladder_data(out['steps'], u_l=out['u_l'], pds_index=out['pds_index'])
+    assert lad['pds_index'] == 1 and lad['u_l'] == pytest.approx(-0.25)
+    svg = charts.render_ladder_svg(lad)
+    assert 'ΔG = +0.50 eV' in svg and 'U_L = -0.25 V' in svg
+
+
 def test_read_e0_and_scan(tmp_path):
     d = tmp_path / 'mol_S8'
     d.mkdir()

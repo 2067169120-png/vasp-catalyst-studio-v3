@@ -82,6 +82,9 @@ def discharge_path(system_energies: dict, mol_energies: dict, *,
     不提供保持纯电子能口径(报告须明示)。返回带 'thermo_corrected' 标志。
     返回 {'steps':[{label,G,sub_label}], 'pds_index', 'u_l', 'mu_li',
           'per_electron':[...], 'thermo_corrected': bool}
+    注意:pds_index 是**逐电子** ΔG 口径(与 u_l 同源);画阶梯图时必须把它
+    传给 charts.ladder_data(steps, u_l, pds_index=…)——各步电子数不等
+    (末步 8 e⁻),让 charts 按原始 ΔG 重算会高亮错决速步。
     """
     preset = preset or LIS_PRESET
     g_corr = dict(g_corr or {})
