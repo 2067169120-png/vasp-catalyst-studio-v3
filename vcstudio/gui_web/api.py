@@ -174,9 +174,44 @@ class Api:
             return {'ok': False, 'error': str(e)}
 
     # ── 任务:台账列表(取数逻辑照抄 jobs_tab.reload) ──────────────────────
+    def _project_role_map(self):
+        """{规范化 job_dir → {'project': 项目名, 'role': 'clean'|'gas'|'config'}}。
+
+        供 list_jobs 给作业行注入所属吸附能项目组;任何异常(注册表坏/单个
+        project.yaml 畸形)兜成空映射或跳过该项目,绝不拖垮 list_jobs。
+        """
+        def norm(d):
+            return os.path.normcase(os.path.normpath(str(d)))
+
+        mapping = {}
+        try:
+            for pp in self._adsorption.list_projects():
+                try:
+                    proj = self._adsorption.load_project(pp)
+                    if proj is None:
+                        continue
+                    pname = proj.get('name', '') or os.path.basename(
+                        os.path.dirname(str(pp)))
+                    mem = proj.get('members') or {}
+                    if mem.get('clean_slab'):
+                        mapping[norm(mem['clean_slab'])] = {'project': pname,
+                                                            'role': 'clean'}
+                    if mem.get('gas_ref'):
+                        mapping[norm(mem['gas_ref'])] = {'project': pname,
+                                                         'role': 'gas'}
+                    for d in (mem.get('configs') or []):
+                        if d:
+                            mapping[norm(d)] = {'project': pname, 'role': 'config'}
+                except Exception:                         # noqa: BLE001 单个坏项目跳过
+                    continue
+        except Exception:                                 # noqa: BLE001 注册表坏 → 全部不分组
+            return {}
+        return mapping
+
     def list_jobs(self):
         try:
             jobs, stale = [], []
+            pmap = self._project_role_map()
             for job_dir, m in self._ledger.load_all():
                 if m is None:
                     stale.append(job_dir)
@@ -197,9 +232,12 @@ class Api:
                     elif live.get('ionic_steps') is not None:
                         diag = f"{live['ionic_steps']}步" + (
                             f" |F|max={live['fmax']}" if live.get('fmax') else '')
+                grp = pmap.get(os.path.normcase(os.path.normpath(job_dir)))
                 jobs.append({
                     'dir': job_dir,
                     'name': os.path.basename(os.path.normpath(job_dir)),
+                    'project': grp['project'] if grp else None,
+                    'role': grp['role'] if grp else None,
                     'state': state,
                     'task': f"{m.get('task_type', '')}/{m.get('calc_type', '')}",
                     'cluster': m.get('cluster') or '',

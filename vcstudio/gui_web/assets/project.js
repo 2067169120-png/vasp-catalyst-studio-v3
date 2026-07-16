@@ -228,6 +228,14 @@
     reloadProjects();
   }
 
+  // 任务页组头「算 ΔE」调用:刷新项目列表后按项目名选中(找不到则保持默认)
+  async function selectByName(name) {
+    await reloadProjects();
+    const hit = State.projects.find(p => p.name === name);
+    const sel = $('pj-select');
+    if (hit && sel) sel.value = hit.path;
+  }
+
   // 切回项目页时刷新项目下拉
   document.addEventListener('vcs:page', e => {
     if (e.detail && e.detail.page === 'project') reloadProjects();
@@ -236,5 +244,5 @@
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 
-  window.Project = { reload: reloadProjects };
+  window.Project = { reload: reloadProjects, selectByName };
 })();

@@ -11,6 +11,7 @@
     stale: [],           // 失效条目目录
     profiles: {},        // name -> profile dict
     selected: new Set(), // 选中的 dir
+    expanded: new Set(), // 展开的项目组 key(默认全部折叠;本会话内记忆)
     refreshing: false,   // 查询在飞(auto 跳过本轮的护栏)
     autoTimer: null,
   };
@@ -66,6 +67,72 @@
     renderStale();
   }
 
+  // 成员角色 → 中文标签(list_jobs 注入的 role 字段)
+  const ROLE_LABEL = { clean: '清洁表面', gas: '气相参考', config: '组态' };
+
+  // 单行作业 HTML。grpKey 非空 → 属于某折叠组(data-grp);hidden → 组当前折叠
+  function rowHtml(r, grpKey, hidden) {
+    const task = r.task && r.task !== '/' ? r.task : '';
+    const sel = State.selected.has(r.dir) ? ' class="sel"' : '';
+    const role = ROLE_LABEL[r.role] || '';
+    return `<tr data-dir="${VCS.esc(r.dir)}" data-name="${VCS.esc(r.name)}"` +
+      (grpKey ? ` data-grp="${VCS.esc(grpKey)}"` : '') +
+      (hidden ? ' hidden' : '') + `${sel}>` +
+      `<td><span class="name">${VCS.esc(r.name)}</span>` +
+      (role ? ` <span class="role-tag">${VCS.esc(role)}</span>` : '') +
+      (task ? ` <span class="sub">${VCS.esc(task)}</span>` : '') +
+      ` <button class="lnk conv" title="查看收敛过程(E0/ΔE/|F|max vs 离子步)">收敛</button>` +
+      `<button class="lnk struct" title="3D 结构预览(CONTCAR 优先,自动检查分子-衬底距离)">结构</button>` +
+      `<button class="lnk meth" title="生成中英双语 Methods 段 + BibTeX(读真实 INCAR/KPOINTS/POTCAR)">方法</button>` +
+      `<button class="lnk dos" title="总 DOS 出图(需本地 vasprun.xml)">DOS</button></td>` +
+      `<td>${VCS.pill(r.state)}</td>` +
+      `<td class="mono">${r.job_id ? VCS.esc(r.job_id) : '—'}</td>` +
+      `<td class="num">${r.steps != null ? VCS.esc(r.steps) : '—'}</td>` +
+      `<td class="num">${r.fmax != null ? VCS.esc(r.fmax) : '—'}</td>` +
+      `<td class="num">${r.energy !== '' && r.energy != null ? VCS.esc(r.energy) : '—'}</td>` +
+      `<td class="diag">${VCS.esc(r.diag || '')}</td>` +
+      `<td class="mono">${VCS.esc(r.updated || '')}</td></tr>`;
+  }
+
+  // 组内状态计数(与 renderStats 同口径)
+  function groupStats(rows) {
+    const c = s => rows.filter(r => r.state === s).length;
+    return {
+      total: rows.length,
+      done: c('DONE'),
+      run: c('RUNNING'),
+      queue: c('QUEUED') + c('SUBMITTED') + c('UPLOADED'),
+      need: c('FAILED') + c('UNCONVERGED') + c('NEEDS_HUMAN'),
+    };
+  }
+
+  // 组头行:项目名 + done/total 进度 + 细进度条 + 聚合状态;全 DONE 给「算 ΔE」
+  function groupHeadHtml(key, label, rows, isProject) {
+    const st = groupStats(rows);
+    const open = State.expanded.has(key);
+    const pct = st.total ? Math.round(st.done / st.total * 100) : 0;
+    let agg;
+    if (st.need) agg = `<span class="pill fail"><i></i>需处理 ${st.need}</span>`;
+    else if (st.run) agg = VCS.pill('RUNNING');
+    else if (st.queue) agg = VCS.pill('QUEUED');
+    else if (st.done === st.total) agg = VCS.pill('DONE');
+    else agg = `<span class="pill q"><i></i>待提交</span>`;
+    const allDone = st.total > 0 && st.done === st.total;
+    return `<tr class="grp-head" data-grp="${VCS.esc(key)}" ` +
+      `title="点击${open ? '折叠' : '展开'}组内 ${st.total} 个作业">` +
+      `<td colspan="8"><span class="caret">${open ? '▾' : '▸'}</span>` +
+      `<b class="grp-name">${VCS.esc(label)}</b>` +
+      (isProject ? '<span class="grp-tag">吸附能项目</span>' : '') +
+      `<span class="grp-prog">${st.done}/${st.total} 完成</span>` +
+      `<span class="grp-bar"><i style="width:${pct}%"></i></span>` +
+      agg +
+      (isProject && allDone
+        ? ` <button class="btn grp-de" data-proj="${VCS.esc(label)}" ` +
+          'title="切到吸附能项目页并选中该项目">算 ΔE</button>'
+        : '') +
+      `</td></tr>`;
+  }
+
   function renderTable() {
     const card = $('#jobs-card');
     if (!card) return;
@@ -79,30 +146,57 @@
     const present = new Set(State.rows.map(r => r.dir));
     State.selected.forEach(d => { if (!present.has(d)) State.selected.delete(d); });
 
+    // 按吸附能项目分桶(project=null → 单独作业桶);保持台账原有次序
+    const groups = new Map();
+    const single = [];
+    State.rows.forEach(r => {
+      if (r.project) {
+        if (!groups.has(r.project)) groups.set(r.project, []);
+        groups.get(r.project).push(r);
+      } else {
+        single.push(r);
+      }
+    });
+
     let h = '<table><thead><tr>' +
       '<th>作业</th><th>状态</th><th class="mono">作业号</th>' +
       '<th class="num">步</th><th class="num">|F|max</th><th class="num">E0 (eV)</th>' +
       '<th>诊断</th><th class="mono">更新</th></tr></thead><tbody>';
-    State.rows.forEach(r => {
-      const task = r.task && r.task !== '/' ? r.task : '';
-      const sel = State.selected.has(r.dir) ? ' class="sel"' : '';
-      h += `<tr data-dir="${VCS.esc(r.dir)}" data-name="${VCS.esc(r.name)}"${sel}>` +
-        `<td><span class="name">${VCS.esc(r.name)}</span>` +
-        (task ? ` <span class="sub">${VCS.esc(task)}</span>` : '') +
-        ` <button class="lnk conv" title="查看收敛过程(E0/ΔE/|F|max vs 离子步)">收敛</button>` +
-        `<button class="lnk struct" title="3D 结构预览(CONTCAR 优先,自动检查分子-衬底距离)">结构</button>` +
-        `<button class="lnk meth" title="生成中英双语 Methods 段 + BibTeX(读真实 INCAR/KPOINTS/POTCAR)">方法</button>` +
-        `<button class="lnk dos" title="总 DOS 出图(需本地 vasprun.xml)">DOS</button></td>` +
-        `<td>${VCS.pill(r.state)}</td>` +
-        `<td class="mono">${r.job_id ? VCS.esc(r.job_id) : '—'}</td>` +
-        `<td class="num">${r.steps != null ? VCS.esc(r.steps) : '—'}</td>` +
-        `<td class="num">${r.fmax != null ? VCS.esc(r.fmax) : '—'}</td>` +
-        `<td class="num">${r.energy !== '' && r.energy != null ? VCS.esc(r.energy) : '—'}</td>` +
-        `<td class="diag">${VCS.esc(r.diag || '')}</td>` +
-        `<td class="mono">${VCS.esc(r.updated || '')}</td></tr>`;
-    });
+    if (!groups.size) {
+      // 没有任何项目组 → 保持旧平铺观感,不加组头
+      State.rows.forEach(r => { h += rowHtml(r, null, false); });
+    } else {
+      groups.forEach((rows, pname) => {
+        const key = 'p:' + pname;
+        const open = State.expanded.has(key);
+        h += groupHeadHtml(key, pname, rows, true);
+        rows.forEach(r => { h += rowHtml(r, key, !open); });
+      });
+      if (single.length) {
+        const key = 's:_single';
+        const open = State.expanded.has(key);
+        h += groupHeadHtml(key, '单独作业', single, false);
+        single.forEach(r => { h += rowHtml(r, key, !open); });
+      }
+    }
     h += '</tbody></table>';
     card.innerHTML = h;
+  }
+
+  // 组头折叠开关:记忆到 State.expanded(重载/自动刷新后保持)
+  function toggleGroup(key) {
+    if (State.expanded.has(key)) State.expanded.delete(key);
+    else State.expanded.add(key);
+    renderTable();
+  }
+
+  // 「算 ΔE」:切到吸附能项目页并尽量选中该项目
+  function gotoProject(name) {
+    const a = document.querySelector('nav a[data-page=project]');
+    if (a) a.click();
+    if (window.Project && typeof window.Project.selectByName === 'function') {
+      window.Project.selectByName(name);
+    }
   }
 
   function renderStats() {
@@ -131,6 +225,14 @@
     const card = $('#jobs-card');
     if (!card) return;
     card.addEventListener('click', e => {
+      // 组头行:点「算 ΔE」跳项目页,其余区域折叠/展开组
+      const gh = e.target.closest('tr.grp-head');
+      if (gh) {
+        const de = e.target.closest('.grp-de');
+        if (de) { e.stopPropagation(); gotoProject(de.dataset.proj); return; }
+        toggleGroup(gh.dataset.grp);
+        return;
+      }
       const tr = e.target.closest('tr[data-dir]');
       if (!tr) return;
       // 「收敛」/「结构」按钮:打开对应视图,不参与行选中

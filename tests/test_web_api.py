@@ -202,6 +202,65 @@ def test_list_jobs_error_is_caught():
     assert out['jobs'] == [] and out['stale'] == [] and '台账坏了' in out.get('error', '')
 
 
+def test_list_jobs_injects_project_and_role():
+    """任务行注入所属吸附能项目组:clean/gas/config 各归位,独立作业 project=None。"""
+    def mk(st):
+        return {'state': st, 'task_type': 'relax', 'calc_type': 'slab',
+                'created_at': '2026-07-14T09:00:00', 'results': {}}
+    entries = [('/jobs/demo_slab_clean', mk('DONE')),
+               ('/jobs/demo_ads_S8', mk('RUNNING')),
+               ('/jobs/demo_ref', mk('DONE')),
+               ('/jobs/standalone', mk('DONE'))]
+    proj = {'name': 'demo', 'members': {
+        'clean_slab': '/jobs/demo_slab_clean',
+        'gas_ref': '/jobs/demo_ref',
+        'configs': ['/jobs/demo_ads_S8'],
+    }}
+    ads = _fake_adsorption(projects=['/p/project.yaml'],
+                           proj_map={'/p/project.yaml': proj})
+    api = Api(ledger_mod=_fake_ledger(entries, []), adsorption_mod=ads)
+    out = api.list_jobs()
+    rows = {r['dir']: r for r in out['jobs']}
+    assert rows['/jobs/demo_slab_clean']['project'] == 'demo'
+    assert rows['/jobs/demo_slab_clean']['role'] == 'clean'
+    assert rows['/jobs/demo_ads_S8']['project'] == 'demo'
+    assert rows['/jobs/demo_ads_S8']['role'] == 'config'
+    assert rows['/jobs/demo_ref']['project'] == 'demo'
+    assert rows['/jobs/demo_ref']['role'] == 'gas'
+    assert rows['/jobs/standalone']['project'] is None
+    assert rows['/jobs/standalone']['role'] is None
+
+
+def test_list_jobs_project_map_failure_does_not_break_listing():
+    """项目注册表崩坏(list_projects 抛)→ 全部作业不分组,list_jobs 契约不变。"""
+    entries = [('/jobs/a', {'state': 'DONE', 'created_at': 'x', 'results': {}})]
+    boom_ads = types.SimpleNamespace(
+        list_projects=lambda *a, **k: (_ for _ in ()).throw(RuntimeError('注册表坏了')),
+        load_project=lambda p: None)
+    api = Api(ledger_mod=_fake_ledger(entries, []), adsorption_mod=boom_ads)
+    out = api.list_jobs()
+    assert out.get('error') is None or 'error' not in out
+    assert out['jobs'][0]['project'] is None and out['jobs'][0]['role'] is None
+
+
+def test_list_jobs_single_bad_project_yaml_is_skipped():
+    """单个 project.yaml load 抛异常 → 只影响该项目,别的项目照常归组。"""
+    entries = [('/jobs/ok_slab', {'state': 'DONE', 'created_at': 'x', 'results': {}})]
+    good = {'name': 'ok', 'members': {'clean_slab': '/jobs/ok_slab',
+                                      'gas_ref': None, 'configs': []}}
+
+    def _load(p):
+        if p == '/bad/project.yaml':
+            raise RuntimeError('yaml 畸形')
+        return good
+    ads = types.SimpleNamespace(
+        list_projects=lambda *a, **k: ['/bad/project.yaml', '/good/project.yaml'],
+        load_project=_load)
+    api = Api(ledger_mod=_fake_ledger(entries, []), adsorption_mod=ads)
+    out = api.list_jobs()
+    assert out['jobs'][0]['project'] == 'ok' and out['jobs'][0]['role'] == 'clean'
+
+
 # ── submit_jobs / _resolve ───────────────────────────────────────────────────
 def test_submit_jobs_delegates_to_batch_ops():
     calls = {}

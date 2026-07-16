@@ -24,16 +24,52 @@
 #page-project .pj-cfgempty{font-size:11.5px;color:var(--muted);margin-top:6px}
 #page-project .pj-note{font-size:12px;color:var(--warn);margin-bottom:8px}
 #page-project .log .warnc{color:var(--warn)}
+/* 任务页:吸附能项目组折叠(组头行 + 细进度条 + 成员角色标签);样式随页内联 */
+#page-jobs tr.grp-head td{background:#F4F6F8;border-bottom:1px solid var(--rule-strong);cursor:pointer;padding:6px 10px;user-select:none}
+#page-jobs tr.grp-head:hover td{background:var(--accent-soft)}
+#page-jobs tr.grp-head .caret{display:inline-block;width:14px;color:var(--muted);font-size:10px}
+#page-jobs tr.grp-head .grp-name{font-size:12.5px}
+#page-jobs tr.grp-head .grp-tag{font-family:var(--mono);font-size:10px;color:var(--accent-dark);background:var(--accent-soft);padding:1px 6px;border-radius:4px;margin-left:8px}
+#page-jobs tr.grp-head .grp-prog{font-family:var(--mono);font-size:11px;color:var(--muted);margin-left:10px;font-variant-numeric:tabular-nums}
+#page-jobs tr.grp-head .grp-bar{display:inline-block;vertical-align:middle;width:90px;height:5px;background:#E6EAEF;border-radius:3px;overflow:hidden;margin:0 10px}
+#page-jobs tr.grp-head .grp-bar i{display:block;height:100%;background:var(--ok)}
+#page-jobs tr.grp-head .grp-de{padding:3px 9px;font-size:11px;margin-left:10px}
+#page-jobs .role-tag{font-family:var(--mono);font-size:10px;color:var(--muted);background:var(--queue-bg);padding:1px 6px;border-radius:4px;margin-left:4px;vertical-align:1px}
+/* 仪表盘首页:大数字卡 + 最近活动 + 快捷入口 + 待办;样式随页内联 */
+#page-dashboard .db-nums{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:14px}
+#page-dashboard .db-num{background:var(--surface);border:1px solid var(--rule);border-radius:6px;padding:14px 16px;cursor:pointer}
+#page-dashboard .db-num:hover{border-color:var(--accent)}
+#page-dashboard .db-num b{display:block;font-family:var(--mono);font-size:26px;line-height:1.25;font-variant-numeric:tabular-nums}
+#page-dashboard .db-num span{font-size:11.5px;color:var(--muted)}
+#page-dashboard .db-num.run b{color:var(--run)}
+#page-dashboard .db-num.q b{color:var(--queue)}
+#page-dashboard .db-num.ok b{color:var(--ok)}
+#page-dashboard .db-num.fail b{color:var(--fail)}
+#page-dashboard .db-grid{display:grid;grid-template-columns:3fr 2fr;gap:14px;align-items:start}
+#page-dashboard .db-h{font-weight:700;font-size:13px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--rule)}
+#page-dashboard .db-row{display:flex;align-items:center;gap:8px;padding:7px 4px;border-bottom:1px solid var(--rule);font-size:12.5px}
+#page-dashboard .db-row:last-child{border-bottom:none}
+#page-dashboard .db-row .sp{flex:1}
+#page-dashboard .db-row[data-goto]{cursor:pointer}
+#page-dashboard .db-row[data-goto]:hover{background:var(--accent-soft)}
+#page-dashboard .db-proj{font-family:var(--mono);font-size:10px;color:var(--accent-dark);background:var(--accent-soft);padding:1px 6px;border-radius:4px}
+#page-dashboard .db-time{font-family:var(--mono);font-size:10.5px;color:var(--muted)}
+#page-dashboard .db-todo-txt{line-height:1.5}
+#page-dashboard .db-empty{color:var(--muted);font-size:12.5px;padding:10px 4px}
+#page-dashboard .db-quick{display:flex;flex-direction:column;gap:8px}
+#page-dashboard .db-qbtn{display:flex;flex-direction:column;align-items:flex-start;gap:2px;padding:11px 14px;text-align:left}
+#page-dashboard .db-qbtn b{font-size:12.5px}
+#page-dashboard .db-qbtn span{font-family:var(--mono);font-size:10.5px;color:var(--muted);font-weight:400}
 </style>
 </head>
 <body>
 <nav>
   <div class="brand"><b>VASP Catalyst Studio</b><span>v2 · Li–S 催化剂</span></div>
   <div class="grp">工作流</div>
-  <a href="#" data-page="dashboard"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>仪表盘</a>
+  <a href="#" data-page="dashboard" class="on"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>仪表盘</a>
   <a href="#" data-page="generate"><svg viewBox="0 0 24 24"><path d="M12 3v18M3 12h18"/><circle cx="12" cy="12" r="9"/></svg>生成输入</a>
   <a href="#" data-page="project"><svg viewBox="0 0 24 24"><path d="M3 7l9-4 9 4-9 4-9-4zM3 7v10l9 4 9-4V7"/></svg>吸附能项目</a>
-  <a href="#" data-page="jobs" class="on"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>任务</a>
+  <a href="#" data-page="jobs"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>任务</a>
   <div class="grp">环境</div>
   <a href="#" data-page="cluster"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="1"/><rect x="3" y="13" width="18" height="7" rx="1"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>集群</a>
   <div class="foot">Maple123@1w<br>PBS · torque-6.1.2</div>
@@ -44,9 +80,39 @@
     <span class="sp"></span>
   </header>
 
-  <section class="page" data-page="dashboard" hidden>
-    <div class="empty">
-      <p>仪表盘页本期在 P1b 迁移。请先用旧版:<br><code>python -m vcstudio.gui</code></p>
+  <section class="page" data-page="dashboard" id="page-dashboard">
+    <div class="pagebar">
+      <h1>仪表盘</h1>
+      <span class="stats" id="db-stats">加载中…</span>
+    </div>
+
+    <!-- 卡片 1:作业状态汇总(大数字,点击跳任务页) -->
+    <div class="db-nums" id="db-nums"></div>
+
+    <div class="db-grid">
+      <!-- 卡片 2:最近活动 -->
+      <div class="card" style="padding:16px">
+        <div class="db-h">最近活动</div>
+        <div id="db-recent"><div class="db-empty">加载中…</div></div>
+      </div>
+
+      <div>
+        <!-- 卡片 3:快捷入口 -->
+        <div class="card" style="padding:16px;margin-bottom:14px">
+          <div class="db-h">快捷入口</div>
+          <div class="db-quick">
+            <button class="btn db-qbtn" id="db-go-generate"><b>生成四件套</b><span>POSCAR + INCAR 自动补全 POTCAR / KPOINTS</span></button>
+            <button class="btn db-qbtn" id="db-go-project"><b>新建吸附能项目</b><span>清洁表面 + 组态族 + 气相参考,一次生成整组</span></button>
+            <button class="btn db-qbtn" id="db-go-queue"><b>集群队列</b><span>查看在队作业,认领终端手动提交的作业</span></button>
+          </div>
+        </div>
+
+        <!-- 卡片 4:待办 -->
+        <div class="card" style="padding:16px">
+          <div class="db-h">待办</div>
+          <div id="db-todo"><div class="db-empty">加载中…</div></div>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -195,7 +261,7 @@
     <div class="log" id="project-log" data-anchor><div class="head">项目日志</div></div>
   </section>
 
-  <section class="page" data-page="jobs" id="page-jobs">
+  <section class="page" data-page="jobs" id="page-jobs" hidden>
     <div class="pagebar">
       <h1>任务</h1>
       <span class="stats" id="jobs-stats">加载中…</span>
@@ -336,5 +402,6 @@
 <script src="cluster.js"></script>
 <script src="generate.js"></script>
 <script src="project.js"></script>
+<script src="dashboard.js"></script>
 </body>
 </html>
