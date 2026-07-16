@@ -6,7 +6,6 @@ build-backend = "setuptools.build_meta"
 name = "vcstudio"
 dynamic = ["version"]
 description = "VASP Catalyst Studio — 轻量化 DFT 自动化:POSCAR+用户INCAR → 输入四件套 / 多集群提交 / 零token监控 / LLM分析"
-readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 classifiers = [
