@@ -1,6 +1,6 @@
 """失败分类器测试:用真实 VASP 日志/退出码签名做 fixture,离线验证分类学与状态映射。"""
 from vcstudio.cluster import diagnose as dg
-from vcstudio.cluster.diagnose import classify, Diagnosis
+from vcstudio.cluster.diagnose import classify
 
 
 # ── 收敛 + 物理合理性闸 ──

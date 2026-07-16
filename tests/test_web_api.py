@@ -435,7 +435,7 @@ def _fake_logic(pos='POS摘要', inc='INC预览', errs=None):
     m = types.SimpleNamespace()
     m.poscar_preview = lambda path, calc='slab': pos
     m.incar_preview = lambda incar, poscar, lib, validate=True: inc
-    m.validate_generate_inputs = lambda p, i, o, l: list(errs or [])
+    m.validate_generate_inputs = lambda p, i, o, lib: list(errs or [])
     return m
 
 

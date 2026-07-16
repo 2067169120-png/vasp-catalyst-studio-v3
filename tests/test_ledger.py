@@ -6,7 +6,8 @@ from vcstudio.shared import manifest
 def test_register_dedup_unregister_roundtrip(tmp_path):
     lp = tmp_path / 'jobs.json'
     d1, d2 = tmp_path / 'j1', tmp_path / 'j2'
-    d1.mkdir(); d2.mkdir()
+    d1.mkdir()
+    d2.mkdir()
 
     assert ledger.register(d1, path=lp) is True
     assert ledger.register(d1, path=lp) is False          # 去重

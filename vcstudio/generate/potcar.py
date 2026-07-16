@@ -68,7 +68,13 @@ class PotcarError(Exception):
 
 
 def _resolve_root(lib_root: str | None) -> str:
-    return lib_root if lib_root is not None else get_potcar_lib_root()
+    root = lib_root if lib_root is not None else get_potcar_lib_root()
+    if not root:
+        raise PotcarError(
+            '未配置 PAW_PBE 赝势库路径(potcar_lib_root 为空)。'
+            '请复制 config.example.yaml 为 config.yaml 填写,'
+            '或在「生成」页设置赝势库目录,或传入 --lib-root。')
+    return root
 
 
 def variant(element: str) -> str:

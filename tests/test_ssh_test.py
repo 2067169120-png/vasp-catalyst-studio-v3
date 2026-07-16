@@ -1,5 +1,5 @@
 from vcstudio.cluster.profiles import ClusterProfile
-from vcstudio.cluster.ssh_test import check_connection, ConnectionResult
+from vcstudio.cluster.ssh_test import check_connection
 
 
 class FakeChannelFile:

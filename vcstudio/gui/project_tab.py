@@ -9,7 +9,7 @@ import os
 import sys
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog
 
 from vcstudio.gui.widgets import FileRow, LogBox
 from vcstudio.gui import runner

@@ -12,11 +12,9 @@
 """
 from __future__ import annotations
 
-import math
 import os
 import shutil
 import subprocess
-import time
 
 # ── 元素表:共价半径 Å(Cordero 2008)+ jmol 配色 ────────────────────────────────
 ELEMENTS = {

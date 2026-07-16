@@ -31,7 +31,7 @@ def recommend_kpoints(cell_vectors: list, calc_type: str = 'slab') -> list:
     lengths = [math.sqrt(sum(c * c for c in v[:3])) for v in cell_vectors[:3]]
 
     target_spacing = 0.03  # Å⁻¹
-    kpts = [max(1, int(math.ceil(1.0 / (target_spacing * l)))) for l in lengths]
+    kpts = [max(1, int(math.ceil(1.0 / (target_spacing * length)))) for length in lengths]
 
     # 奇数化(Gamma-centered 惯例):偶数 +1
     kpts = [k if k % 2 == 1 else k + 1 for k in kpts]
@@ -43,7 +43,7 @@ def recommend_kpoints(cell_vectors: list, calc_type: str = 'slab') -> list:
         kpts[2] = 1  # 表面法向仅 1 个 k 点
 
     logger.info('recommend_kpoints: lengths=%s type=%s -> kpts=%s',
-                [round(float(l), 2) for l in lengths], calc_type, kpts)
+                [round(float(length), 2) for length in lengths], calc_type, kpts)
     return kpts
 
 

@@ -22,3 +22,11 @@ _internal/
 clusters.yaml
 known_hosts
 /config.local.yaml
+
+# 本地实配(含真实赝势库路径/内网 LLM 端点等,绝不入 git;复制 config.example.yaml 生成)
+config.yaml
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.ruff_cache/

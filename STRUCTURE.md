@@ -24,7 +24,7 @@
 | `使用说明.md` | 完整用法 + 代码分区块地图 |
 | `STRUCTURE.md` | 本文件,目录结构速查 |
 | `pyproject.toml` | 包元数据 + 依赖 + CLI 入口(`vcs` / `vcs-gui`) |
-| `config.yaml` | 示例/默认配置(用户敏感 `clusters.yaml` 另存,gitignore) |
+| `config.example.yaml` | 配置模板(复制为 `config.yaml` 填写;`config.yaml` 与 `clusters.yaml` 均 gitignore,不入库) |
 | `重新打包EXE.bat` | 一键重打包 EXE(Windows) |
 | `清理临时文件.bat` | 清理本地临时/缓存文件(Windows) |
 

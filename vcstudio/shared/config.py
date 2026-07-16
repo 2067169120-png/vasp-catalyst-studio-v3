@@ -12,10 +12,11 @@ from pathlib import Path
 
 import yaml
 
-# 内置默认:缺 config.yaml 时兜底。potcar_lib_root 指向 E: 现有 PAW_PBE 库(M1;M5 复制入包)。
+# 内置默认:缺 config.yaml 时兜底。potcar_lib_root 留空——真实赝势库路径因机而异
+# 且是受版权材料,绝不硬编码某台机器的绝对路径;首次使用请复制 config.example.yaml
+# 为 config.yaml 填写,或在 GUI「生成」页设置赝势库目录(会写入用户配置)。
 _DEFAULT = {
-    'potcar_lib_root':
-        'E:/V2.0.0/results/inputs/potpaw54/potpaw54/potpaw54/potpaw_PBE/paw_pbe',
+    'potcar_lib_root': '',
     'llm': {},
     'ssh': {},
 }

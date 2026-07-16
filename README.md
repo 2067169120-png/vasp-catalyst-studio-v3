@@ -99,6 +99,6 @@ via [CITATION.cff](CITATION.cff). Licensed under [MIT](LICENSE).
 ```
 vcstudio/       核心包(generate/cluster/project/external/gui/shared/cli)
 tests/          424 测试   docs/superpowers/specs/  设计文档
-config.yaml     本地配置(赝势库/分子库/理想窗口/llm 端点)
+config.example.yaml  配置模板(复制为 config.yaml 填写;config.yaml 已 gitignore)
 dist/           打包产物 EXE(gitignore)   results/  作业输出(不入 git)
 ```
