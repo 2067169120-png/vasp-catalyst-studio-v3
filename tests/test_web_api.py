@@ -512,6 +512,40 @@ def test_gen_run_full_chain_writes_manifest_and_registers():
                                  'last_incar': '/p/INCAR', 'last_out': '/out/job1'}
 
 
+def test_gen_run_passes_calc_type_through():
+    """修复:web 生成页 calc_type 不再硬编码 slab,前端选择直达 build_job_dir。"""
+    seen = {}
+    payload = {'ok': True, 'out_dir': '/out/j', 'warnings': [], 'kpoints': [4, 4, 4],
+               'elements': ['Si']}
+
+    def _build(poscar, incar, out, **k):
+        seen['calc_type'] = k.get('calc_type')
+        return dict(payload)
+
+    jb = types.SimpleNamespace(build_job_dir=_build)
+    api = Api(config_mod=_fake_config(), logic_mod=_fake_logic(errs=[]),
+              job_builder_mod=jb, manifest_mod=_fake_manifest({}),
+              ledger_mod=_fake_ledger_register([]))
+    api.gen_run('/p/POSCAR', '/p/INCAR', '/out/j', '/lib', 'bulk')
+    assert seen['calc_type'] == 'bulk'
+
+
+def test_gen_run_invalid_calc_type_falls_back_to_slab():
+    seen = {}
+
+    def _build(poscar, incar, out, **k):
+        seen['calc_type'] = k.get('calc_type')
+        return {'ok': True, 'out_dir': '/out/j', 'warnings': [], 'kpoints': [1, 1, 1],
+                'elements': ['Si']}
+
+    jb = types.SimpleNamespace(build_job_dir=_build)
+    api = Api(config_mod=_fake_config(), logic_mod=_fake_logic(errs=[]),
+              job_builder_mod=jb, manifest_mod=_fake_manifest({}),
+              ledger_mod=_fake_ledger_register([]))
+    api.gen_run('/p/POSCAR', '/p/INCAR', '/out/j', '/lib', 'nonsense')
+    assert seen['calc_type'] == 'slab'
+
+
 def test_gen_run_validation_error_short_circuits():
     jb = types.SimpleNamespace(
         build_job_dir=lambda *a, **k: (_ for _ in ()).throw(AssertionError('不应生成')))

@@ -261,6 +261,64 @@ def adopt_external_job(local_dir: str, profile, job_id: str, remote_dir: str,
     return m
 
 
+# 续算沉降护栏:续算后连续 SETTLE_MAX_CHECKS 次仍"调度器无此作业 + OUTCAR 未刷新",
+# 才放行终态取证(几乎必然是重投即被拒);正常情形新作业一两轮内就会现身/写出新 OUTCAR。
+SETTLE_MAX_CHECKS = 3
+
+
+def _mark_observed_alive(m: dict) -> None:
+    """标记当前(重投)轮已在调度器现身(QUEUED/RUNNING)。续算沉降护栏据此放行。"""
+    r = m.setdefault('results', {})
+    r['observed_alive'] = True
+    r.pop('settling', None)  # 现身即清沉降态
+
+
+def _set_continue_baseline(m: dict, old_outcar_mtime) -> None:
+    """续算重投时落基线:上一轮 OUTCAR 的 mtime + 复位本轮存活标记与沉降态。
+
+    refresh_job 的沉降护栏据此判断"新一轮是否真的重写过 OUTCAR",
+    避免新作业还没启动时误读旧 OUTCAR 而判终态(见 _in_continue_settling)。
+    """
+    r = m.setdefault('results', {})
+    r['continue_baseline'] = {'outcar_mtime': old_outcar_mtime, 'settle_checks': 0,
+                              'at': time.strftime('%Y-%m-%dT%H:%M:%S')}
+    r['observed_alive'] = False
+    r.pop('settling', None)
+
+
+def _in_continue_settling(m: dict, reason, outcar_mtime) -> bool:
+    """续算后作业仍未真正启动本轮 → 返回 True(保持 SUBMITTED,不判终态)。
+
+    仅对续算过(continue_rounds≥1)、当前 SUBMITTED、且无调度器终态原因的作业生效。
+    "已启动本轮"的证据:本轮在调度器现过身(observed_alive),或 OUTCAR 相对续算基线
+    被重写过(mtime 变化)。两者皆无 → 说明新作业还没被登记/还没写新 OUTCAR,手里那份是
+    上一轮旧 OUTCAR,绝不能拿去判终态。连续 SETTLE_MAX_CHECKS 次仍如此才兜底放行。
+    调用方已确保 u==GONE(非 QUEUED/RUNNING)。返回 True 时已就地更新 results,调用方需落盘。
+    """
+    r = m.get('results') or {}
+    rounds = int(r.get('continue_rounds', 0) or 0)
+    if rounds < 1 or m.get('state') != 'SUBMITTED' or reason:
+        return False
+    if r.get('observed_alive'):
+        return False
+    baseline = r.get('continue_baseline') or {}
+    base_mtime = baseline.get('outcar_mtime')
+    rewritten = outcar_mtime is not None and outcar_mtime != base_mtime
+    if rewritten:
+        return False  # 本轮确已重写 OUTCAR → 真终态,放行取证
+    # 仍是旧 OUTCAR(或暂无 OUTCAR):记一次沉降观测
+    checks = int(baseline.get('settle_checks', 0) or 0) + 1
+    baseline['settle_checks'] = checks
+    r['continue_baseline'] = baseline
+    r['settling'] = {
+        'checks': checks,
+        'reason': '续算后新作业尚未被调度器登记或尚未写出新 OUTCAR,暂不判终态(疑仍在排队)',
+        'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+    }
+    m['results'] = r
+    return checks < SETTLE_MAX_CHECKS
+
+
 def refresh_job(client, profile, job_dir: str, live_states: dict | None = None,
                 terminal_reasons: dict | None = None) -> dict:
     """按调度器现状更新一个作业的 manifest;终态时做取证 + 失败分类。
@@ -279,11 +337,14 @@ def refresh_job(client, profile, job_dir: str, live_states: dict | None = None,
     remote = m.get('remote_dir') or ''
 
     if u == QUEUED:
+        # 本轮已在调度器现身:记下"活过",续算沉降护栏据此放行(不再疑为旧 OUTCAR)
+        _mark_observed_alive(m)
         if m['state'] != 'QUEUED':
             manifest_mod.set_state(m, 'QUEUED')
-            manifest_mod.save_manifest(job_dir, m)
+        manifest_mod.save_manifest(job_dir, m)
         return m
     if u == RUNNING:
+        _mark_observed_alive(m)
         if m['state'] != 'RUNNING':
             manifest_mod.set_state(m, 'RUNNING')
         # 活体健康(原版 lis_sac_status 经验):运行中即查 SCF 震荡/首步假死+进度,
@@ -293,9 +354,21 @@ def refresh_job(client, profile, job_dir: str, live_states: dict | None = None,
         manifest_mod.save_manifest(job_dir, m)
         return m
 
-    # 终态(GONE / 调度器终态原因)→ 取证 + 分类(复活 FAILED/NEEDS_HUMAN)
+    # 终态候选(GONE / 调度器终态原因):先取 OUTCAR 现状(含 mtime)
     reason = (terminal_reasons or {}).get(jid)
-    outcar_size, oszicar_size = _stat_sizes(client, remote)
+    outcar_size, oszicar_size, outcar_mtime = _stat_outcar_full(client, remote)
+
+    # ── 续算沉降护栏(修复:续算后仍在排队却被误判终态)─────────────────────────
+    # 症状:续算重投 → 新作业号还没进 qstat(登记有延迟)→ 这里查为 GONE → 直接进终态分支
+    # → 抓到的却是**上一轮**留下的完整 OUTCAR(收敛/SCF 震荡串还在)→ 明明在排队,
+    # 却被标成 DONE / 需续算 / sloshing。只对**续算过**的作业设防(唯有它们才可能有旧 OUTCAR),
+    # 且要求"当前这一轮确有产出"才认终态:本轮在调度器现过身,或 OUTCAR 相对续算基线被重写过。
+    if _in_continue_settling(m, reason, outcar_mtime):
+        manifest_mod.save_manifest(job_dir, m)
+        return m
+    m.setdefault('results', {}).pop('settling', None)  # 放行终态 → 清沉降态
+    # ────────────────────────────────────────────────────────────────────────
+
     converged, clean_exit, stopped = _grep_marks(client, remote, m.get('task_type') or 'relax')
     exit_code, log_tail = _read_log(client, remote, jid)
     energy, oszicar_tail = _read_oszicar(client, remote)
@@ -373,16 +446,32 @@ def _stat_sizes(client, remote: str):
     与收敛 grep 分开:区分"缺输出/启动即死"(size None/0)与"跑了但没收敛",
     堵掉旧版 '|| echo 0' 把缺 OUTCAR 误当未收敛的假阴性(缺口分析 P0)。
     """
+    outcar, oszicar, _mtime = _stat_outcar_full(client, remote)
+    return outcar, oszicar
+
+
+def _stat_outcar_full(client, remote: str):
+    """一次 stat 取 OUTCAR/OSZICAR 的字节数与 OUTCAR mtime(远端 epoch 秒)。
+
+    → (outcar_size, oszicar_size, outcar_mtime);缺失/无 remote 对应 None。
+    mtime 用于续算沉降护栏:判断"当前这一轮是否真的重写过 OUTCAR",
+    避免续算后新作业尚未启动时误读上一轮旧 OUTCAR(见 refresh_job)。
+    mtime 与 baseline 同取自集群 stat,同一时钟,无 client/server 时钟偏差问题。
+    """
     if not remote:
-        return None, None
+        return None, None, None
     out, _ = run_cmd(client, f"cd {shlex.quote(remote)} && "
-                             f"stat -c '%n %s' OUTCAR OSZICAR 2>/dev/null")
-    sizes = {}
+                             f"stat -c '%n %s %Y' OUTCAR OSZICAR 2>/dev/null")
+    sizes: dict[str, int] = {}
+    mtimes: dict[str, int] = {}
     for line in out.splitlines():
         parts = line.split()
-        if len(parts) == 2 and parts[1].lstrip('-').isdigit():
+        # 兼容旧格式(仅 name size,2 列)与新格式(name size mtime,3 列)
+        if len(parts) >= 2 and parts[1].lstrip('-').isdigit():
             sizes[parts[0]] = int(parts[1])
-    return sizes.get('OUTCAR'), sizes.get('OSZICAR')
+        if len(parts) >= 3 and parts[2].lstrip('-').isdigit():
+            mtimes[parts[0]] = int(parts[2])
+    return sizes.get('OUTCAR'), sizes.get('OSZICAR'), mtimes.get('OUTCAR')
 
 
 # 收敛标志按任务类型分流(review-round2 收尾):'reached required accuracy' 是**离子弛豫**
@@ -547,6 +636,9 @@ def continue_from_contcar(client, profile, job_dir: str,
     if not diagnose.valid_poscar(contcar):
         raise RuntimeError('远端 CONTCAR 缺失或不完整,不能续算(防半个结构续出垃圾),请人工检查')
 
+    # 续算沉降基线:重投前记下上一轮 OUTCAR 的 mtime(此刻新作业尚未启动,仍是旧文件)
+    _o0, _z0, _base_outcar_mtime = _stat_outcar_full(client, remote)
+
     # 本地也留证:备份旧 POSCAR,用 CONTCAR 覆盖(保持本地目录与远端一致)
     local_poscar = os.path.join(job_dir, 'POSCAR')
     if os.path.isfile(local_poscar):
@@ -569,6 +661,7 @@ def continue_from_contcar(client, profile, job_dir: str,
     # 消费掉上一轮的终态诊断:新作业尚未诊断,restartable=True 不能被下一次误用
     m.setdefault('results', {}).pop('diagnosis', None)
     m.setdefault('results', {})['continue_rounds'] = rounds + 1
+    _set_continue_baseline(m, _base_outcar_mtime)  # 沉降护栏基线:防新作业未启动前误读旧 OUTCAR
     m.setdefault('attempts', []).append({
         'n': len(m.get('attempts') or []) + 1,
         'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
@@ -653,6 +746,9 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
                 f.write(contcar)
             run_cmd(client, f'cd {shlex.quote(remote)} && cp CONTCAR POSCAR', check=True)
 
+    # 续算沉降基线:重投前记下上一轮 OUTCAR 的 mtime(此刻新作业尚未启动,仍是旧文件)
+    _o0, _z0, _base_outcar_mtime = _stat_outcar_full(client, remote)
+
     # 3) 上传新 INCAR + 清混合历史,重投同一脚本
     sftp.put(local_incar, posixpath.join(remote, 'INCAR'))
     run_cmd(client, f'cd {shlex.quote(remote)} && rm -f WAVECAR CHGCAR', check=True)
@@ -667,6 +763,7 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
     m['scheduler_job_id'] = job_id
     m.setdefault('results', {}).pop('diagnosis', None)
     m.setdefault('results', {})['continue_rounds'] = rounds + 1
+    _set_continue_baseline(m, _base_outcar_mtime)  # 沉降护栏基线:防新作业未启动前误读旧 OUTCAR
     m.setdefault('attempts', []).append({
         'n': len(m.get('attempts') or []) + 1,
         'at': at,

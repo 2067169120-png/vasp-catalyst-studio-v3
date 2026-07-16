@@ -84,12 +84,21 @@
         </div>
       </div>
 
-      <div class="gen-fld" style="margin-bottom:0">
+      <div class="gen-fld">
         <span class="gen-lbl">赝势库根目录</span>
         <div class="gen-inrow">
           <input id="gen-lib" class="ipt" autocomplete="off" placeholder="PAW_PBE 赝势库根目录(用于拼 POTCAR / 补 ENCUT)">
           <button class="btn" id="gen-lib-btn">浏览</button>
         </div>
+      </div>
+
+      <div class="gen-fld" style="margin-bottom:0">
+        <span class="gen-lbl">计算类型(决定 KPOINTS 网格)</span>
+        <select id="gen-calc" class="ipt">
+          <option value="slab">slab — 表面/吸附(法向仅 1 个 k 点)</option>
+          <option value="bulk">bulk — 体相(三维 k 网格)</option>
+          <option value="molecule">molecule — 分子/团簇(Gamma 单点)</option>
+        </select>
       </div>
     </div>
 

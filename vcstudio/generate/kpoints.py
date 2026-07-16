@@ -13,10 +13,38 @@ import math
 logger = logging.getLogger(__name__)
 
 
-def recommend_kpoints(cell_vectors: list, calc_type: str = 'slab') -> list:
-    """据倒空间尺寸推荐 KPOINTS 网格。
+def _cross(a: list, b: list) -> list:
+    return [a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0]]
 
-    k_i = ceil(1 / (spacing · |a_i|)),spacing ≈ 0.03 Å⁻¹(适合过渡金属)。
+
+def _dot(a: list, b: list) -> float:
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _reciprocal_lengths(cell_vectors: list) -> list:
+    """晶格矢量 → 倒格矢长度 |b_i|(约定 b_i = (a_j×a_k)/V,不含 2π)。
+
+    修复:此前直接用实空间边长 1/|a_i| 定网格,对**非正交胞**(六方石墨烯 / hcp 金属
+    slab、三斜)会系统性欠/过采样——而这些正是催化最常见的表面。改用真正的倒格矢长度。
+    对正交胞 |b_i| ≡ 1/|a_i|,故立方/正交体系结果与旧版逐位一致(无回归)。
+    退化胞(体积≈0)回退 1/|a_i| 兜底,避免除零。
+    """
+    a1, a2, a3 = ([float(c) for c in v[:3]] for v in cell_vectors[:3])
+    vol = _dot(a1, _cross(a2, a3))
+    if abs(vol) < 1e-12:
+        lens = [math.sqrt(_dot(v, v)) for v in (a1, a2, a3)]
+        return [1.0 / L if L > 0 else 1.0 for L in lens]
+    b1, b2, b3 = (_cross(a2, a3), _cross(a3, a1), _cross(a1, a2))
+    return [math.sqrt(_dot(b, b)) / abs(vol) for b in (b1, b2, b3)]
+
+
+def recommend_kpoints(cell_vectors: list, calc_type: str = 'slab') -> list:
+    """据倒格矢尺寸推荐 KPOINTS 网格。
+
+    k_i = ceil(|b_i| / spacing),spacing ≈ 0.03 Å⁻¹(适合过渡金属);
+    b_i 为倒格矢(不含 2π),对正交胞 |b_i| = 1/|a_i|(与旧版数值一致)。
 
     Args:
         cell_vectors: 3 个晶格矢量,每个 [x,y,z]。
@@ -28,10 +56,10 @@ def recommend_kpoints(cell_vectors: list, calc_type: str = 'slab') -> list:
     if calc_type == 'molecule':
         return [1, 1, 1]
 
-    lengths = [math.sqrt(sum(c * c for c in v[:3])) for v in cell_vectors[:3]]
+    recip = _reciprocal_lengths(cell_vectors)
 
     target_spacing = 0.03  # Å⁻¹
-    kpts = [max(1, int(math.ceil(1.0 / (target_spacing * length)))) for length in lengths]
+    kpts = [max(1, int(math.ceil(b / target_spacing))) for b in recip]
 
     # 奇数化(Gamma-centered 惯例):偶数 +1
     kpts = [k if k % 2 == 1 else k + 1 for k in kpts]
@@ -42,8 +70,8 @@ def recommend_kpoints(cell_vectors: list, calc_type: str = 'slab') -> list:
     if calc_type == 'slab':
         kpts[2] = 1  # 表面法向仅 1 个 k 点
 
-    logger.info('recommend_kpoints: lengths=%s type=%s -> kpts=%s',
-                [round(float(length), 2) for length in lengths], calc_type, kpts)
+    logger.info('recommend_kpoints: |b|=%s type=%s -> kpts=%s',
+                [round(float(b), 3) for b in recip], calc_type, kpts)
     return kpts
 
 

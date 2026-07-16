@@ -348,6 +348,85 @@ def test_continue_refuses_invalid_contcar(tmp_path):
         submitter.continue_from_contcar(client, _profile(), d)
 
 
+def _continue_client(qsub_id='201.c\n', base_mtime='1000'):
+    """续算用假 client:回放 CONTCAR + 基线 stat(旧 OUTCAR mtime)+ qsub 新号。"""
+    return FakeClient(script=[
+        ('cat', _VALID_CONTCAR),
+        ('stat -c', f'OUTCAR 90000 {base_mtime}\nOSZICAR 3000 {base_mtime}\n'),
+        ('qsub', qsub_id),
+    ])
+
+
+def test_continue_then_still_queued_stays_submitted(tmp_path):
+    """修复回归:续算重投后新作业还没进 qstat(GONE)、OUTCAR 未刷新 →
+    保持 SUBMITTED(疑仍在排队),绝不拿上一轮旧 OUTCAR 误判终态。
+
+    这正是用户报告的 bug:续算后作业还在排队,却显示已完成/需续算/SCF sloshing,
+    因为旧 OUTCAR 的收敛/震荡串被当成了本轮结果。"""
+    d = _restartable_job(tmp_path)
+    submitter.continue_from_contcar(_continue_client(), _profile(), d)
+    # 新号 201 不在 qstat(GONE);OUTCAR mtime 仍是基线 1000(本轮尚未重写);
+    # 且旧 OUTCAR 还带收敛串 + E0 —— 正是会被误判 DONE 的陷阱
+    refresh_client = FakeClient(script=[
+        ('stat -c', 'OUTCAR 90000 1000\nOSZICAR 3000 1000\n'),
+        ('grep -c', '1\n'),
+        ('tail -n 150', '   5 F= -.5E+01 E0= -.5E+01  d E =-.1E-05\n'),
+    ])
+    m = submitter.refresh_job(refresh_client, _profile(), d, live_states={})
+    assert m['state'] == 'SUBMITTED'              # 仍视为在途,未误判终态
+    assert m['results'].get('settling')           # 记录了沉降原因(可供前端提示)
+    assert 'diagnosis' not in m['results']         # 没有落任何终态诊断
+
+
+def test_continue_then_new_run_rewrote_outcar_classifies(tmp_path):
+    """续算后新一轮确实跑过(OUTCAR mtime 相对基线变化)再消失 → 正常判终态。"""
+    d = _restartable_job(tmp_path)
+    submitter.continue_from_contcar(_continue_client(base_mtime='1000'), _profile(), d)
+    # 新一轮把 OUTCAR 重写到 mtime=2000,收敛,GONE → DONE
+    refresh_client = FakeClient(script=[
+        ('stat -c', 'OUTCAR 95000 2000\nOSZICAR 3200 2000\n'),
+        ('grep -c', '1\n'),
+        ('tail -n 150', '   5 F= -.5E+01 E0= -.5E+01  d E =-.1E-05\n'),
+    ])
+    m = submitter.refresh_job(refresh_client, _profile(), d, live_states={})
+    assert m['state'] == 'DONE'
+    assert 'settling' not in m['results']
+
+
+def test_continue_seen_in_scheduler_then_gone_classifies(tmp_path):
+    """续算后先在 qstat 现身(QUEUED)→ 状态离开 SUBMITTED;再消失即正常判终态,不沉降。"""
+    d = _restartable_job(tmp_path)
+    submitter.continue_from_contcar(_continue_client(), _profile(), d)
+    submitter.refresh_job(FakeClient(), _profile(), d, live_states={'201': 'QUEUED'})
+    # 再消失,OUTCAR 仍旧(mtime 未变)但已确认活过 → 落终态
+    refresh_client = FakeClient(script=[('stat -c', 'OUTCAR 90000 1000\nOSZICAR 3000 1000\n'),
+                                        ('grep -c', '0\n')])
+    m = submitter.refresh_job(refresh_client, _profile(), d, live_states={})
+    assert m['state'] != 'SUBMITTED'
+    assert 'settling' not in m['results']
+
+
+def test_continue_settling_cap_eventually_classifies(tmp_path):
+    """兜底:连续 SETTLE_MAX_CHECKS 次仍 GONE+旧 OUTCAR(疑重投即被拒)→ 放行落终态,
+    不永久卡 SUBMITTED。"""
+    d = _restartable_job(tmp_path)
+    submitter.continue_from_contcar(_continue_client(), _profile(), d)
+    stale = [('stat -c', 'OUTCAR 90000 1000\nOSZICAR 3000 1000\n'), ('grep -c', '0\n')]
+    last = None
+    for _ in range(submitter.SETTLE_MAX_CHECKS):
+        last = submitter.refresh_job(FakeClient(script=stale), _profile(), d, live_states={})
+    assert last['state'] != 'SUBMITTED'            # 到上限后兜底落终态
+
+
+def test_fresh_submit_gone_still_classifies_immediately(tmp_path):
+    """守恒:非续算的新提交作业(无旧 OUTCAR 隐患)行为不变——GONE 即刻取证分类。"""
+    d = _job_dir(tmp_path)
+    submitter.submit_job(FakeClient(script=[('qsub', '77.c\n')]), FakeSFTP(), _profile(), d)
+    client = FakeClient(script=[('grep -c', '0\n')])   # 零输出
+    m = submitter.refresh_job(client, _profile(), d, live_states={})
+    assert m['state'] == 'NEEDS_HUMAN'                  # 与修复前一致,未被沉降护栏拦住
+
+
 def test_grep_converged_static_uses_electronic_mark(tmp_path):
     """static/dos/band(NSW=0)永远不出'reached required accuracy'(离子标志),
     改查电子收敛标志,否则收敛的静态作业被误判未收敛(review-round2 收尾)。"""

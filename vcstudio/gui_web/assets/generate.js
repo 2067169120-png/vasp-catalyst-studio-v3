@@ -15,18 +15,19 @@
     const pre = $('gen-preview');
     if (!pre) return;
     const poscar = val('gen-poscar'), incar = val('gen-incar');
+    const calc = val('gen-calc') || 'slab';
     if (!poscar || !incar) {
       State.previewKey = null;
       pre.style.color = '';
       pre.textContent = '(选择 POSCAR / INCAR 后自动解析预览)';
       return;
     }
-    const key = poscar + '\n' + incar;
+    const key = poscar + '\n' + incar + '\n' + calc;
     if (key === State.previewKey) return;   // 相同输入不重复解析(镜像 _preview_memo)
     State.previewKey = key;
     pre.style.color = '';
     pre.textContent = '正在解析…';
-    const r = await VCS.call('gen_preview', poscar, incar);
+    const r = await VCS.call('gen_preview', poscar, incar, calc);
     if (State.previewKey !== key) return;   // 期间用户又改了路径 → 丢弃旧响应
     if (!r || r.ok === false || r.error) {
       pre.style.color = 'var(--fail)';
@@ -55,10 +56,11 @@
     const btn = $('gen-run');
     const poscar = val('gen-poscar'), incar = val('gen-incar');
     const out = val('gen-out'), lib = val('gen-lib');
+    const calc = val('gen-calc') || 'slab';
     if (btn) btn.disabled = true;
-    VCS.log('生成中…');
+    VCS.log('生成中(' + calc + ')…');
     try {
-      const r = await VCS.call('gen_run', poscar, incar, out, lib);
+      const r = await VCS.call('gen_run', poscar, incar, out, lib, calc);
       if (!r || r.ok === false || r.error) {
         VCS.log('生成失败:' + ((r && r.error) || '未知错误'), 'failc');
         return;
@@ -92,6 +94,8 @@
       const el = $(id);
       if (el) { el.addEventListener('change', refreshPreview); el.addEventListener('blur', refreshPreview); }
     });
+    // 切换计算类型即刷新预览(KPOINTS 随之变化)
+    { const el = $('gen-calc'); if (el) el.addEventListener('change', refreshPreview); }
 
     const st = await VCS.call('gen_state');
     if (st) {

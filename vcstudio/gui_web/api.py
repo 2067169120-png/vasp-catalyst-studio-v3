@@ -12,6 +12,15 @@ import os
 import sys
 from dataclasses import asdict, fields as dc_fields
 
+# 合法计算类型(决定 KPOINTS 网格);前端下拉与后端都以此为准
+_CALC_TYPES = ('slab', 'bulk', 'molecule')
+
+
+def _norm_calc_type(x) -> str:
+    """归一化前端传入的计算类型:非法/缺省一律回落 'slab'(保守且向后兼容)。"""
+    s = str(x or '').strip().lower()
+    return s if s in _CALC_TYPES else 'slab'
+
 
 class Api:
     """js_api 门面:参数/返回全 JSON-safe;真模块延迟导入,测试注入假件。"""
@@ -326,18 +335,20 @@ class Api:
             return {'ok': False, 'error': str(e)}
 
     # ── 生成页(镜像 gui/generate_tab 的调用面:预览/回填/一键生成/文件选择) ─────
-    def gen_preview(self, poscar_path, incar_path):
+    def gen_preview(self, poscar_path, incar_path, calc_type='slab'):
         """即时解析预览(镜像 generate_tab._refresh_preview):纯读、不写任何文件。
 
         summary = {'poscar','incar'} 两段中文摘要(logic.poscar_preview/incar_preview
-        自身已把解析问题降级为友好文案);calc_type/validate 取生成默认(slab/开)。
+        自身已把解析问题降级为友好文案);calc_type 由前端「计算类型」下拉传入
+        (slab/bulk/molecule,非法值归 slab),影响 KPOINTS 预览;validate 取生成默认(开)。
         """
         try:
             poscar = (poscar_path or '').strip()
             incar = (incar_path or '').strip()
+            calc = _norm_calc_type(calc_type)
             cfg = self._config.load_config()
             lib = cfg.get('potcar_lib_root', '') or ''
-            pos_txt = self._logic.poscar_preview(poscar, 'slab')
+            pos_txt = self._logic.poscar_preview(poscar, calc)
             inc_txt = self._logic.incar_preview(incar, poscar, lib, True)
             return {'ok': True, 'summary': {'poscar': pos_txt, 'incar': inc_txt},
                     'error': None}
@@ -485,10 +496,13 @@ class Api:
             return {'ok': False, 'zh': None, 'en': None, 'bibtex': None,
                     'warnings': [], 'error': str(e)}
 
-    def gen_run(self, poscar_path, incar_path, out_dir, lib_root):
+    def gen_run(self, poscar_path, incar_path, out_dir, lib_root, calc_type='slab'):
         """一键生成(镜像 generate_tab._on_run→build_job_dir→_write_manifest→ledger.register)。
 
-        web 无 KPOINTS/计算类型/校验开关字段 → 取生成默认(自动 K 网格 / slab / 开校验)。
+        calc_type 由前端「计算类型」下拉传入(slab/bulk/molecule,非法值归 slab):决定
+        KPOINTS 网格(slab 法向仅 1 个 k 点、molecule 为 Gamma 单点、bulk 三维网格)。
+        此前 web 硬编码 slab,生成 bulk/molecule 会拿到错误 KPOINTS(缺口分析已指出)。
+        校验开关取默认(开)、KPOINTS 仍自动推荐。
         job.yaml 与台账写入失败只追加警告,绝不撤销已生成的四件套(同 _write_manifest 口径)。
         """
         try:
@@ -506,7 +520,7 @@ class Api:
             if errs:
                 return {'ok': False, 'job_dir': None, 'warnings': [],
                         'error': ';'.join(errs)}
-            validate, calc_type, kpts = True, 'slab', None
+            validate, calc_type, kpts = True, _norm_calc_type(calc_type), None
             # 路径记忆:下次启动自动回填(失败静默,同 _on_run)
             try:
                 self._config.set_ui_state(last_poscar=poscar, last_incar=incar,
