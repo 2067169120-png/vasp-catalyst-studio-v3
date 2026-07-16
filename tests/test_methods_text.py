@@ -104,3 +104,68 @@ def test_render_handles_none_kpoints():
     zh = mt.render_zh(r['facts'])
     en = mt.render_en(r['facts'])
     assert zh and en  # 不崩、有产出;缺什么在 warnings 已说
+
+
+# ── 新增泛函/色散 BibTeX 条目按需接线 ──────────────────────────────────────────
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize('gga,func,cite,uncited', [
+    ('91', 'PW91', 'Perdew1992', 'Perdew1996'),      # PW91 独立引,不引 PBE
+    ('PS', 'PBEsol', 'Perdew2008', 'Hammer1999'),    # PBEsol 引 PBE+Perdew2008
+    ('RE', 'revPBE', 'Zhang1998', 'Hammer1999'),     # revPBE 引 PBE+Zhang1998
+    ('AM', 'AM05', 'Armiento2005', 'Perdew1996'),    # AM05 独立引
+])
+def test_functional_bibtex_wiring(gga, func, cite, uncited):
+    r = mt.extract_facts(f'GGA = {gga}\nENCUT = 400\n', _KPOINTS_GAMMA, _POTCAR_HEAD)
+    assert r['facts']['functional'] == func
+    bib = mt.render_bibtex(r['facts'])
+    assert cite in bib
+    assert uncited not in bib
+    # PBEsol/revPBE 作为 PBE 修订,惯例连引 PBE 原文
+    if func in ('PBEsol', 'revPBE'):
+        assert 'Perdew1996' in bib
+
+
+@pytest.mark.parametrize('ivdw,cite,uncited', [
+    ('1', 'Grimme2006', 'Grimme2010'),      # D2 → Grimme2006,不引 D3
+    ('2', 'Tkatchenko2009', 'Grimme'),      # TS → Tkatchenko-Scheffler,无 Grimme
+    ('21', 'Tkatchenko2009', 'Grimme'),     # TS+SCS 亦引 TS 原文
+])
+def test_dispersion_bibtex_wiring(ivdw, cite, uncited):
+    r = mt.extract_facts(f'GGA = PE\nENCUT = 400\nIVDW = {ivdw}\n',
+                         _KPOINTS_GAMMA, _POTCAR_HEAD)
+    bib = mt.render_bibtex(r['facts'])
+    assert cite in bib and uncited not in bib
+
+
+_INCAR_LDAU = """\
+GGA = PE
+ENCUT = 500
+ISMEAR = 0
+SIGMA = 0.05
+LDAU = .TRUE.
+LDAUL = -1 -1 2 -1
+LDAUU = 0 0 3.9 0
+LDAUJ = 0 0 0 0
+"""
+
+
+def test_ldau_sentence_carries_u_value_and_cites_dudarev():
+    r = mt.extract_facts(_INCAR_LDAU, _KPOINTS_GAMMA, _POTCAR_HEAD)
+    f = r['facts']
+    assert f['ldau'] is True and f['ldauu'] == '0 0 3.9 0'
+    zh, en = mt.render_zh(f), mt.render_en(f)
+    for text in (zh, en):
+        assert 'DFT+U' in text
+        assert '0 0 3.9 0' in text        # Methods 文本明示 U 值
+        assert 'Dudarev' in text
+    bib = mt.render_bibtex(f)
+    assert 'Dudarev1998' in bib and '1505' in bib
+
+
+def test_ldau_off_no_u_sentence_no_dudarev():
+    r = mt.extract_facts('GGA = PE\nENCUT = 500\n', _KPOINTS_GAMMA, _POTCAR_HEAD)
+    assert r['facts']['ldau'] is False and r['facts']['ldauu'] is None
+    assert 'Dudarev' not in mt.render_bibtex(r['facts'])
+    assert 'DFT+U' not in mt.render_zh(r['facts'])

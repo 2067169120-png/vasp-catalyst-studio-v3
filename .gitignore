@@ -10,6 +10,10 @@ venv/
 # 本地生成的作业目录
 job*/
 /scratch/
+# 离线演示自带的合成"已完成"作业集必须入库(上面的 job*/ 规则会误伤 jobs/)
+!examples/offline_analysis/jobs/
+# 离线演示产物(examples/offline_analysis/run_demo.py 默认输出)
+demo_out/
 
 # results/ 建议输出目录:忽略生成内容,保留目录占位
 /results/*

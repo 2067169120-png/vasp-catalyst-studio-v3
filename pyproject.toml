@@ -31,8 +31,8 @@ gui = ["pywebview>=4"]
 packaging = ["pyinstaller>=6"]
 # 原生论文级出图引擎(external/native_charts.py;函数内延迟 import,core 零重依赖)
 charts = ["matplotlib>=3.6", "numpy>=1.23"]
-# 开发:测试 + 覆盖率 + lint
-dev = ["pytest>=7", "pytest-cov>=4", "ruff>=0.4"]
+# 开发:测试 + 覆盖率 + lint + ASE(解析器交叉校验对拍,可选;缺失则相关测试 skip)
+dev = ["pytest>=7", "pytest-cov>=4", "ruff>=0.4", "ase>=3.22"]
 
 [project.urls]
 Repository = "https://github.com/2067169120-png/vasp-catalyst-studio-v3"

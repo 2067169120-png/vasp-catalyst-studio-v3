@@ -117,6 +117,8 @@ def extract_facts(incar_text: str, kpoints_text: str | None,
             relax = None
 
     encut = _num('ENCUT')
+    ldau = str(inc.get('LDAU', '')).strip().upper() in ('.TRUE.', 'T', 'TRUE')
+    ldauu = (str(inc.get('LDAUU', '')).strip() or None) if ldau else None
     facts = {
         'functional': functional,
         'potcar_flavor': flavor,
@@ -132,8 +134,8 @@ def extract_facts(incar_text: str, kpoints_text: str | None,
         'ispin': int(_num('ISPIN')) if _num('ISPIN') else None,
         'relax': relax,
         'nsw': int(nsw) if nsw else None,
-        'ldau': bool(str(inc.get('LDAU', '')).strip().upper()
-                     in ('.TRUE.', 'T', 'TRUE')),
+        'ldau': ldau,
+        'ldauu': ldauu,       # LDAUU 有效 U 值原串(如 '0 0 3.9 0');无则 None
     }
     return {'facts': facts, 'warnings': warnings}
 
@@ -182,7 +184,10 @@ def render_zh(f: dict) -> str:
     if f.get('ispin') == 2:
         parts.append('计算考虑自旋极化。')
     if f.get('ldau'):
-        parts.append('对局域 d/f 电子施加了 DFT+U 校正(参数见 INCAR)。')
+        s = '对局域 d/f 电子施加了 DFT+U 校正(Dudarev 方案'
+        s += (f',有效 U 值 LDAUU = {f["ldauu"]} eV' if f.get('ldauu')
+              else ',参数见 INCAR')
+        parts.append(s + ')。')
     return ''.join(parts)
 
 
@@ -233,8 +238,11 @@ def render_en(f: dict) -> str:
     if f.get('ispin') == 2:
         parts.append(' Spin polarization was included.')
     if f.get('ldau'):
-        parts.append(' A DFT+U correction was applied to localized d/f '
-                     'electrons (parameters as in the INCAR).')
+        s = (' A DFT+U correction (Dudarev scheme) was applied to localized '
+             'd/f electrons')
+        s += (f' with effective U values LDAUU = {f["ldauu"]} eV'
+              if f.get('ldauu') else ' (parameters as in the INCAR)')
+        parts.append(s + '.')
     return ''.join(parts)
 
 
@@ -304,11 +312,67 @@ _BIB = {
   pages   = {1456--1465},
   year    = {2011}
 }""",
+    'd2': """@article{Grimme2006,
+  author  = {Grimme, S.},
+  title   = {Semiempirical GGA-type density functional constructed with a long-range dispersion correction},
+  journal = {J. Comput. Chem.},
+  volume  = {27},
+  pages   = {1787--1799},
+  year    = {2006}
+}""",
+    'ts': """@article{Tkatchenko2009,
+  author  = {Tkatchenko, A. and Scheffler, M.},
+  title   = {Accurate molecular van der Waals interactions from ground-state electron density and free-atom reference data},
+  journal = {Phys. Rev. Lett.},
+  volume  = {102},
+  pages   = {073005},
+  year    = {2009}
+}""",
+    'pw91': """@article{Perdew1992,
+  author  = {Perdew, J. P. and Chevary, J. A. and Vosko, S. H. and Jackson, K. A. and Pederson, M. R. and Singh, D. J. and Fiolhais, C.},
+  title   = {Atoms, molecules, solids, and surfaces: Applications of the generalized gradient approximation for exchange and correlation},
+  journal = {Phys. Rev. B},
+  volume  = {46},
+  pages   = {6671--6687},
+  year    = {1992}
+}""",
+    'pbesol': """@article{Perdew2008,
+  author  = {Perdew, J. P. and Ruzsinszky, A. and Csonka, G. I. and Vydrov, O. A. and Scuseria, G. E. and Constantin, L. A. and Zhou, X. and Burke, K.},
+  title   = {Restoring the density-gradient expansion for exchange in solids and surfaces},
+  journal = {Phys. Rev. Lett.},
+  volume  = {100},
+  pages   = {136406},
+  year    = {2008}
+}""",
+    'revpbe': """@article{Zhang1998,
+  author  = {Zhang, Y. and Yang, W.},
+  title   = {Comment on ``Generalized Gradient Approximation Made Simple''},
+  journal = {Phys. Rev. Lett.},
+  volume  = {80},
+  pages   = {890},
+  year    = {1998}
+}""",
+    'am05': """@article{Armiento2005,
+  author  = {Armiento, R. and Mattsson, A. E.},
+  title   = {Functional designed to include surface effects in self-consistent density functional theory},
+  journal = {Phys. Rev. B},
+  volume  = {72},
+  pages   = {085108},
+  year    = {2005}
+}""",
+    'dftu': """@article{Dudarev1998,
+  author  = {Dudarev, S. L. and Botton, G. A. and Savrasov, S. Y. and Humphreys, C. J. and Sutton, A. P.},
+  title   = {Electron-energy-loss spectra and the structural stability of nickel oxide: An LSDA+U study},
+  journal = {Phys. Rev. B},
+  volume  = {57},
+  pages   = {1505--1509},
+  year    = {1998}
+}""",
 }
 
 
 def render_bibtex(f: dict) -> str:
-    """facts → BibTeX,只含真用到的条目(VASP 恒引;PAW 有赝势才引;泛函/色散按实)。"""
+    """facts → BibTeX,只含真用到的条目(VASP 恒引;PAW 有赝势才引;泛函/色散/+U 按实)。"""
     keys = ['vasp1', 'vasp2']
     if f.get('potcar_flavor'):
         keys += ['paw1', 'paw2']
@@ -316,10 +380,24 @@ def render_bibtex(f: dict) -> str:
     if func == 'PBE':
         keys.append('pbe')
     elif func == 'RPBE':
-        keys += ['pbe', 'rpbe']   # RPBE 是 PBE 的修订,惯例两篇都引
+        keys += ['pbe', 'rpbe']    # RPBE 是 PBE 的修订,惯例两篇都引
+    elif func == 'revPBE':
+        keys += ['pbe', 'revpbe']  # 同 RPBE:PBE 的修订,两篇都引
+    elif func == 'PBEsol':
+        keys += ['pbe', 'pbesol']  # PBEsol 为固体/表面复原梯度展开的 PBE 修订,两篇都引
+    elif func == 'PW91':
+        keys.append('pw91')        # PW91 先于 PBE,独立引
+    elif func == 'AM05':
+        keys.append('am05')        # AM05 独立构造,单引
     ivdw = f.get('ivdw') or ''
     if ivdw.startswith('DFT-D3'):
         keys.append('d3')
         if 'BJ' in ivdw:
             keys.append('d3bj')
+    elif ivdw == 'DFT-D2':
+        keys.append('d2')
+    elif ivdw.startswith('TS'):    # TS 与 TS+SCS 均引 Tkatchenko-Scheffler 原文
+        keys.append('ts')
+    if f.get('ldau'):
+        keys.append('dftu')        # Dudarev 方案 DFT+U
     return '\n\n'.join(_BIB[k] for k in keys)

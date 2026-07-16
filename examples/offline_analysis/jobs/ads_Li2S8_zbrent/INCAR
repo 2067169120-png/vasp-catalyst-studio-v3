@@ -1,0 +1,11 @@
+SYSTEM = Li-S SAC (offline demo, synthetic)
+GGA = RP
+ENCUT = 450
+EDIFF = 1E-5
+EDIFFG = -0.03
+ISMEAR = 0
+SIGMA = 0.05
+ISPIN = 2
+IBRION = 2
+NSW = 300
+IVDW = 11
