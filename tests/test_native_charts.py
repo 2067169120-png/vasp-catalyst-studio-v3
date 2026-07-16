@@ -171,6 +171,153 @@ def test_free_energy_ladder_bad_data():
         nc.free_energy_ladder({'name': 'p', 'G': [0.0]}, 'x')
 
 
+# ── 矩阵热图 ────────────────────────────────────────────────────────────────
+
+HEAT_DATA = {
+    'rows': ['CoO', 'Co9S8', 'Graphene'],
+    'cols': ['S8', 'Li2S8', 'Li2S4', 'Li2S'],
+    'values': [
+        [-0.86, -1.61, -2.06, -3.01],
+        [-0.90, -1.23, -1.18, -1.98],
+        [-0.79, -0.62, None, -0.36],           # 含缺值 → 空白格
+    ],
+}
+
+
+def test_heatmap_matrix_outputs(tmp_path):
+    out = nc.heatmap_matrix(HEAT_DATA, tmp_path / 'heat', panel='a',
+                            cbar_label=r'$E_\mathrm{ads}$ (eV)')
+    assert len(out) == 2
+    _assert_png(out[0])
+    _assert_pdf(out[1])
+
+
+def test_heatmap_matrix_no_annotate_custom_range(tmp_path):
+    out = nc.heatmap_matrix(HEAT_DATA, tmp_path / 'heat2.png', annotate=False,
+                            cmap='viridis', vmin=-3.5, vmax=0.0,
+                            title='LiPS anchoring')
+    _assert_png(out[0])
+    _assert_pdf(out[1])
+
+
+def test_heatmap_matrix_bad_data():
+    with pytest.raises(ValueError):                       # rows 空
+        nc.heatmap_matrix({'rows': [], 'cols': ['S8'], 'values': []}, 'x')
+    with pytest.raises(ValueError):                       # 行数不齐
+        nc.heatmap_matrix({'rows': ['CoO'], 'cols': ['S8'], 'values': []}, 'x')
+    with pytest.raises(ValueError):                       # 列数不齐
+        nc.heatmap_matrix({'rows': ['CoO'], 'cols': ['S8'],
+                           'values': [[1.0, 2.0]]}, 'x')
+    with pytest.raises(ValueError):                       # 全 None 无色标范围
+        nc.heatmap_matrix({'rows': ['CoO'], 'cols': ['S8'],
+                           'values': [[None]]}, 'x')
+
+
+# ── 火山图 ──────────────────────────────────────────────────────────────────
+
+VOLCANO_POINTS = [
+    {'name': 'V@N4',  'x': 0.95, 'y': 0.05},
+    {'name': 'Fe@N4', 'x': 1.62, 'y': 0.33},
+    {'name': 'Co@N4', 'x': 1.90, 'y': 0.35},
+    {'name': 'Ni@N4', 'x': 2.28, 'y': 0.16},
+]
+VOLCANO_LEGS = [
+    {'slope': 0.42,  'intercept': -0.33, 'label': 'Li2S2* formation'},
+    {'slope': -0.50, 'intercept': 1.32,  'label': 'Li2S2* reduction'},
+]
+
+
+def test_volcano_plot_with_legs(tmp_path):
+    out = nc.volcano_plot(
+        VOLCANO_POINTS, tmp_path / 'vol', legs=VOLCANO_LEGS, panel='b',
+        descriptor_label=r'$-\Delta G_\mathrm{ads}$(*LiS$_2$) (eV)',
+        activity_label=r'$U_\mathrm{L}$ (V)',
+        side_labels=('Weak adsorption', 'Strong adsorption'))
+    assert len(out) == 2
+    _assert_png(out[0])
+    _assert_pdf(out[1])
+
+
+def test_volcano_plot_scatter_quadratic_fit(tmp_path):
+    """无 legs:散点 + numpy 二次拟合引导线(开口向下 → 画星)。"""
+    out = nc.volcano_plot(VOLCANO_POINTS, tmp_path / 'vol2.png',
+                          descriptor_label='descriptor (eV)',
+                          activity_label='activity (V)')
+    _assert_png(out[0])
+    _assert_pdf(out[1])
+
+
+def test_volcano_plot_parallel_legs_no_apex(tmp_path):
+    legs = [{'slope': 0.5, 'intercept': 0.0, 'label': 'leg 1'},
+            {'slope': 0.5, 'intercept': 1.0, 'label': 'leg 2'}]
+    out = nc.volcano_plot(VOLCANO_POINTS, tmp_path / 'vol3', legs=legs,
+                          descriptor_label='d', activity_label='a')
+    _assert_png(out[0])
+    _assert_pdf(out[1])
+
+
+def test_volcano_plot_single_point_dict(tmp_path):
+    out = nc.volcano_plot({'name': 'Fe@N4', 'x': 1.0, 'y': 0.2},
+                          tmp_path / 'vol4',
+                          descriptor_label='d', activity_label='a')
+    _assert_png(out[0])
+    _assert_pdf(out[1])
+
+
+def test_volcano_plot_bad_data():
+    with pytest.raises(ValueError):                       # points 空
+        nc.volcano_plot([], 'x', descriptor_label='d', activity_label='a')
+    with pytest.raises(ValueError):                       # 缺 x/y
+        nc.volcano_plot([{'name': 'Fe'}], 'x',
+                        descriptor_label='d', activity_label='a')
+    with pytest.raises(ValueError):                       # 腿缺 intercept
+        nc.volcano_plot(VOLCANO_POINTS, 'x', descriptor_label='d',
+                        activity_label='a', legs=[{'slope': 1.0}])
+
+
+# ── 标度关系 ────────────────────────────────────────────────────────────────
+
+def test_scaling_relation_outputs(tmp_path):
+    xs = [-0.53, -1.07, -1.79, -1.11, -1.63]
+    ys = [-0.48, -1.01, -2.06, -1.18, -1.88]
+    out = nc.scaling_relation(
+        xs, ys, tmp_path / 'scal', panel='c',
+        xlabel=r'$E_\mathrm{ads}$(Li$_2$S$_6$) (eV)',
+        ylabel=r'$E_\mathrm{ads}$(Li$_2$S$_4$) (eV)',
+        labels=['Graphene', 'NG', 'CoO', 'Co9S8', 'Co3O4'])
+    assert len(out) == 2
+    _assert_png(out[0])
+    _assert_pdf(out[1])
+
+
+def test_scaling_relation_negative_slope(tmp_path):
+    """负斜率:拟合式标注走右上角分支。"""
+    out = nc.scaling_relation([0.0, 1.0, 2.0, 3.0], [2.0, 1.4, 0.9, 0.1],
+                              tmp_path / 'scal2', xlabel='x', ylabel='y')
+    _assert_png(out[0])
+    _assert_pdf(out[1])
+
+
+def test_scaling_relation_no_fit(tmp_path):
+    out = nc.scaling_relation([0.0, 1.0, 2.0], [0.1, 0.9, 2.2],
+                              tmp_path / 'scal3.png', xlabel='x', ylabel='y',
+                              fit=False)
+    _assert_png(out[0])
+    _assert_pdf(out[1])
+
+
+def test_scaling_relation_bad_data():
+    with pytest.raises(ValueError):                       # 点数 < 2
+        nc.scaling_relation([1.0], [1.0], 'x', xlabel='x', ylabel='y')
+    with pytest.raises(ValueError):                       # xs/ys 长度不齐
+        nc.scaling_relation([1.0, 2.0], [1.0], 'x', xlabel='x', ylabel='y')
+    with pytest.raises(ValueError):                       # labels 长度不齐
+        nc.scaling_relation([1.0, 2.0], [1.0, 2.0], 'x', xlabel='x',
+                            ylabel='y', labels=['a'])
+    with pytest.raises(ValueError):                       # xs 全同,无法线性拟合
+        nc.scaling_relation([1.0, 1.0], [1.0, 2.0], 'x', xlabel='x', ylabel='y')
+
+
 # ── 导出格式扩展 ────────────────────────────────────────────────────────────
 
 def test_svg_export(tmp_path):

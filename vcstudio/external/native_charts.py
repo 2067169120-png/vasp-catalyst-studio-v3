@@ -19,8 +19,11 @@ Figure+FigureCanvasAgg 纯离屏路径,不碰 pyplot 全局状态,CI 无显示�
 - adsorption_bar:     {'adsorbates': [...], 'substrates': {name: [eV, ...]}}
 - energy_matrix_table: 同上 + 可选 'dg': {name: [eV, ...]}
 - free_energy_ladder:  [{'name': str, 'G': [eV, ...]}, ...]
+- heatmap_matrix:      {'rows': [基底...], 'cols': [吸附质...], 'values': [[eV, ...], ...]}
+- volcano_plot:        [{'name': str, 'x': 描述符, 'y': 活性}, ...] + 可选 legs 两条腿
+- scaling_relation:    xs, ys 平行数组 + 可选 labels(点名)
 
-架构可扩展到全套 VASP 图(DOS/能带/收敛曲线/火山图):新图种 = apply_paper_style()
+架构可扩展到全套 VASP 图(DOS/能带/收敛曲线):新图种 = apply_paper_style()
 上下文 + _new_figure() + _save_dual(),规范层完全复用。中文注释允许,英文标识符。
 """
 from __future__ import annotations
@@ -178,6 +181,12 @@ def add_panel_label(ax, letter: str, *, dx: float = -0.16, dy: float = 1.02,
 
 def _as_float(v) -> float:
     return float('nan') if v is None else float(v)
+
+
+def _luminance(rgba) -> float:
+    """相对亮度(WCAG 系数简化版):决定热图格内文字用黑还是白。rgba 分量 ∈ [0,1]。"""
+    r, g, b = rgba[0], rgba[1], rgba[2]
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
 
 
 def _validate_matrix(data: dict) -> tuple:
@@ -459,6 +468,361 @@ def free_energy_ladder(paths, out_path, *, step_labels=None,
             ax.set_title(title)
         if len(systems) > 1 or show_ul:
             ax.legend(loc='best')
+        if panel:
+            add_panel_label(ax, panel)
+        return _save_dual(fig, out_path, formats)
+
+
+# ── 图 4:吸附能/ΔG 矩阵热图(多催化剂 × 多吸附质横向对比) ────────────────────
+
+def _validate_heatmap(data: dict) -> tuple:
+    """校验 {'rows', 'cols', 'values'} 契约,返回 (rows, cols, values)。"""
+    rows = list(data.get('rows') or [])
+    cols = list(data.get('cols') or [])
+    values = list(data.get('values') or [])
+    if not rows or not cols:
+        raise ValueError("data 需含非空 'rows'(基底)与 'cols'(吸附质)列表")
+    if len(values) != len(rows):
+        raise ValueError(f"'values' 行数 {len(values)} != rows 个数 {len(rows)}")
+    for name, rv in zip(rows, values):
+        if len(rv) != len(cols):
+            raise ValueError(f"行 '{name}' 的数值个数 {len(rv)} != cols 个数 {len(cols)}")
+    if not any(v is not None for rv in values for v in rv):
+        raise ValueError("'values' 至少需一个非 None 数值")
+    return rows, cols, values
+
+
+def heatmap_matrix(data: dict, out_path, *, cmap: str = 'RdYlGn_r',
+                   annotate: bool = True, fmt: str = '{:.2f}',
+                   cbar_label: str = r'$E_\mathrm{ads}$ (eV)',
+                   vmin: float | None = None, vmax: float | None = None,
+                   title: str = '', width: float | None = None,
+                   panel: str = '', formats=('png', 'pdf'),
+                   style_kw: dict | None = None) -> list:
+    """吸附能/ΔG 矩阵热图:纵轴=催化剂/基底,横轴=吸附质,格内标数值 + 色条。
+
+    数据契约:
+        data = {
+            'rows':   ['CoO', 'Co9S8', 'Graphene', ...],        # 基底(热图自上而下)
+            'cols':   ['S8', 'Li2S8', 'Li2S6', ...],            # 吸附质(自左向右)
+            'values': [[-0.82, -1.61, ...],                     # 每行一个基底,按 cols 序
+                       [-0.85, -1.20, ...], ...],               # 缺值用 None → 空白格
+        }
+        行列名走 chem_label 自动化学式下标;values 行数=len(rows)、列数=len(cols)。
+
+    参数:
+        out_path:   输出路径(扩展名可省;按 formats 导出多份,默认 PNG+PDF)。
+        cmap:       matplotlib 色图名。默认 'RdYlGn_r'(越负=吸附越强=绿);红绿色弱
+                    读者建议 'RdYlBu_r' 或 'viridis'——格内数值标注(annotate)保证
+                    任何色图下信息不丢失。
+        annotate:   True 时每格标数值(文字黑/白按底色亮度自动反转)。
+        fmt:        格内/示例数值格式。
+        cbar_label: 色条标签(mathtext 可用);'' 则不标。
+        vmin/vmax:  色标范围;None 按数据自适应(忽略 None 缺值)。
+        width:      图宽英寸;None 按行列数自适应(≥单栏 89 mm)。
+        panel:      非空则加多面板标号(如 'a')。
+        style_kw:   透传 apply_paper_style 的额外风格参数(font/base_size/box)。
+
+    返回:导出文件绝对路径列表(与 formats 同序)。
+    """
+    import numpy as np
+    from matplotlib import colormaps
+    rows, cols, values = _validate_heatmap(data)
+    nr, nc = len(rows), len(cols)
+    arr = np.array([[_as_float(v) for v in rv] for rv in values], dtype=float)
+    masked = np.ma.masked_invalid(arr)
+    cm = colormaps[cmap].with_extremes(bad='#FFFFFF')      # None → 空白格
+
+    max_row_chars = max(len(str(r)) for r in rows)
+    fig_w = width if width is not None else max(
+        SINGLE_COL, 0.56 * nc + 0.115 * max_row_chars + 1.15)
+    fig_h = 0.34 * nr + 0.62 + (0.28 if title else 0.0)
+
+    with apply_paper_style(**(style_kw or {})):
+        fig, ax = _new_figure(width=fig_w, aspect=fig_h / fig_w)
+        im = ax.imshow(masked, cmap=cm, vmin=vmin, vmax=vmax,
+                       aspect='auto', interpolation='nearest', zorder=2)
+        # 白色内部格线分隔单元格(只画内线,外缘由图像边界收齐;缺值格融为空白)
+        for i in range(1, nr):
+            ax.axhline(i - 0.5, color='white', lw=1.1, zorder=3)
+        for j in range(1, nc):
+            ax.axvline(j - 0.5, color='white', lw=1.1, zorder=3)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        if annotate:
+            for i in range(nr):
+                for j in range(nc):
+                    v = arr[i, j]
+                    if v != v:                              # NaN(缺值)不标
+                        continue
+                    lum = _luminance(im.cmap(im.norm(v)))
+                    ax.text(j, i, fmt.format(v), ha='center', va='center',
+                            fontsize=max(5.5, 7.8 - 0.10 * nc),
+                            color='white' if lum < 0.45 else 'black', zorder=4)
+
+        ax.set_xticks(range(nc))
+        ax.set_xticklabels([chem_label(c) for c in cols])
+        if max(len(str(c)) for c in cols) > 5:
+            for t in ax.get_xticklabels():
+                t.set_rotation(30)
+                t.set_ha('right')
+        ax.set_yticks(range(nr))
+        ax.set_yticklabels([chem_label(r) for r in rows])
+        ax.tick_params(length=0)                            # 类目轴不需要刻度线
+        if title:
+            ax.set_title(title)
+
+        cb = fig.colorbar(im, ax=ax, fraction=0.6 / fig_w, pad=0.03)
+        cb.outline.set_linewidth(0.9)
+        cb.ax.tick_params(width=0.9, length=2.6)
+        if cbar_label:
+            cb.set_label(cbar_label)
+        if panel:
+            add_panel_label(ax, panel, dx=-0.10 - 0.017 * max_row_chars)
+        return _save_dual(fig, out_path, formats)
+
+
+# ── 图 5:火山图(Sabatier 活性 vs 吸附描述符) ────────────────────────────────
+
+def volcano_plot(points, out_path, *, descriptor_label: str, activity_label: str,
+                 legs=None, mark_top: bool = True,
+                 top_label: str = 'Sabatier optimum',
+                 side_labels: tuple | None = None, annotate_points: bool = True,
+                 value_fmt: str = '{:.2f}', title: str = '',
+                 width: float | None = None, palette: str = 'tol_bright',
+                 panel: str = '', formats=('png', 'pdf'),
+                 style_kw: dict | None = None) -> list:
+    """火山图:活性(极限电位/负过电位)vs 吸附描述符,可画双腿并自动标峰顶。
+
+    数据契约:
+        points = [{'name': 'Fe@N4', 'x': -2.31, 'y': -0.55}, ...]
+            x = 描述符(如吸附能/ΔG),y = 活性(如 U_L;取"越大越好"的号规)。
+            'name' 可省(该点不标名);催化剂名走 chem_label 自动下标。
+        legs = [{'slope': k1, 'intercept': b1, 'label': '...'},   # 可选,恰好两条时
+                {'slope': k2, 'intercept': b2, 'label': '...'}]   # 取下包络画 Λ 形火山
+            两腿斜率不同则自动求交点 = Sabatier 峰顶(mark_top=True 时标星+顶标签)。
+            腿数 ≠2(或两腿平行)时各腿按全区间直线画、不求峰顶。
+
+    参数:
+        descriptor_label: 横轴标签(必填,如 r'$-\\Delta G_\\mathrm{ads}$(*LiS$_2$) (eV)')。
+        activity_label:   纵轴标签(必填,如 r'$U_\\mathrm{L}$ (V)')。
+        mark_top:   True 时标峰顶:有双腿→交点(金星+垂线+两行顶标签);无 legs 且
+                    ≥3 点→纯 numpy 二次拟合引导线(开口向下才画,虚线),顶点在视野
+                    内画星+垂线但不标字(避免与点名注释冲突)。
+        top_label:  峰顶注释文本('' 只画星不注字;仅双腿交点场景显示)。
+        side_labels: (左侧文本, 右侧文本) 标注弱/强吸附侧,如 ('Weak adsorption',
+                    'Strong adsorption');None 不标。方向取决于描述符号规,由调用者定。
+        annotate_points: True 时散点旁标催化剂名。
+        value_fmt:  峰顶注释里 x* 坐标的数值格式(top_label 后括注);'' 只标文本。
+        其余参数同 adsorption_bar。
+
+    返回:导出文件绝对路径列表(与 formats 同序)。
+    """
+    pts = [points] if isinstance(points, dict) else list(points)
+    if not pts:
+        raise ValueError('points 不能为空')
+    names, xs, ys = [], [], []
+    for p in pts:
+        if 'x' not in p or 'y' not in p:
+            raise ValueError(f"散点 {p.get('name', p)!r} 需含 'x' 与 'y'")
+        names.append(str(p.get('name', '') or ''))
+        xs.append(float(p['x']))
+        ys.append(float(p['y']))
+    legs = list(legs or [])
+    for leg in legs:
+        if 'slope' not in leg or 'intercept' not in leg:
+            raise ValueError("每条腿需含 'slope' 与 'intercept'")
+
+    # ── 几何计算(先算范围/交点,再进风格上下文作图) ──
+    xspan = (max(xs) - min(xs)) or 1.0
+    xlo, xhi = min(xs) - 0.12 * xspan, max(xs) + 0.12 * xspan
+    apex = None
+    if len(legs) == 2 and float(legs[0]['slope']) != float(legs[1]['slope']):
+        k1, b1 = float(legs[0]['slope']), float(legs[0]['intercept'])
+        k2, b2 = float(legs[1]['slope']), float(legs[1]['intercept'])
+        xa = (b2 - b1) / (k1 - k2)
+        apex = (xa, k1 * xa + b1)
+        xlo, xhi = min(xlo, xa - 0.10 * xspan), max(xhi, xa + 0.10 * xspan)
+
+    y_all = list(ys)
+    if apex is not None:
+        y_all.append(apex[1])
+    for leg in legs:
+        k, b = float(leg['slope']), float(leg['intercept'])
+        y_all += ([min(k * xlo + b, apex[1]), min(k * xhi + b, apex[1])]
+                  if apex is not None else [k * xlo + b, k * xhi + b])
+
+    fit_curve = None                     # 无腿时的可选二次拟合:(xx, yy, 顶点或 None)
+    if mark_top and not legs and len(xs) >= 3:
+        import numpy as np
+        a2, a1, a0 = np.polyfit(xs, ys, 2)
+        if a2 < 0:                       # 开口向下才有"峰"可言
+            xx = np.linspace(xlo, xhi, 200)
+            yy = a2 * xx * xx + a1 * xx + a0
+            xv = -a1 / (2 * a2)
+            vertex = (xv, a2 * xv * xv + a1 * xv + a0) if xlo <= xv <= xhi else None
+            fit_curve = (xx, yy, vertex)
+            y_all += [float(yy.min()), float(yy.max())]
+
+    yspan = (max(y_all) - min(y_all)) or 1.0
+    head = 0.26 if (mark_top and apex is not None and top_label) else 0.12
+    ylo, yhi = min(y_all) - 0.10 * yspan, max(y_all) + head * yspan
+    fig_w = width if width is not None else SINGLE_COL
+
+    with apply_paper_style(palette=palette, **(style_kw or {})):
+        fig, ax = _new_figure(width=fig_w, aspect=0.80)
+        colors = PALETTES.get(palette, PALETTES['tol_bright'])
+        ax.set_xlim(xlo, xhi)
+        ax.set_ylim(ylo, yhi)
+
+        if apex is not None:             # 恰两条腿:下包络 Λ 形(左腿=xlo 处更低的那条)
+            xa = apex[0]
+            left = 0 if (k1 * xlo + b1) <= (k2 * xlo + b2) else 1
+            for idx, (x0, x1) in ((left, (xlo, xa)), (1 - left, (xa, xhi))):
+                k = float(legs[idx]['slope'])
+                b = float(legs[idx]['intercept'])
+                lbl = legs[idx].get('label')
+                ax.plot([x0, x1], [k * x0 + b, k * x1 + b],
+                        color=colors[(idx + 1) % len(colors)], lw=1.6, zorder=2,
+                        solid_capstyle='round',
+                        label=chem_label(lbl) if lbl else None)
+        else:                            # 0/1/≥3 条或平行:各腿全区间直线
+            for idx, leg in enumerate(legs):
+                k, b = float(leg['slope']), float(leg['intercept'])
+                lbl = leg.get('label')
+                ax.plot([xlo, xhi], [k * xlo + b, k * xhi + b],
+                        color=colors[(idx + 1) % len(colors)], lw=1.6, zorder=2,
+                        label=chem_label(lbl) if lbl else None)
+
+        if fit_curve is not None:        # 无腿:二次拟合引导线(虚线,不进图例)
+            xx, yy, vertex = fit_curve
+            ax.plot(xx, yy, color='#888888', lw=1.1, ls=(0, (5, 3)), zorder=2)
+        else:
+            vertex = None
+
+        top = apex if (mark_top and apex is not None) else vertex
+        if top is not None:              # Sabatier 峰顶:金星 + 垂线 + 顶标签
+            ax.plot([top[0], top[0]], [ylo, top[1]], color=ZERO_LINE_COLOR,
+                    lw=0.7, ls=(0, (4, 3)), zorder=1)
+            ax.plot([top[0]], [top[1]], marker='*', ms=11, color='#DDAA33',
+                    mec='black', mew=0.6, ls='none', zorder=5)
+            # 只有双腿交点标文字(两行居中);拟合顶点只画星,避免与点名撞字
+            if top_label and apex is not None:
+                txt = (f'{top_label}\n({value_fmt.format(top[0])})'
+                       if value_fmt else str(top_label))
+                ax.annotate(txt, top, xytext=(0, 7), textcoords='offset points',
+                            ha='center', va='bottom', fontsize=7.5,
+                            linespacing=1.3, zorder=5)
+
+        ax.scatter(xs, ys, s=30, color=colors[0], edgecolors='black',
+                   linewidths=0.5, zorder=4)
+        if annotate_points:
+            for x, y, nm in zip(xs, ys, names):
+                if nm:
+                    ax.annotate(chem_label(nm), (x, y), xytext=(4, 3),
+                                textcoords='offset points', ha='left',
+                                va='bottom', fontsize=7.5, zorder=5)
+        if side_labels:
+            left_txt, right_txt = side_labels
+            ax.text(0.02, 0.03, str(left_txt), transform=ax.transAxes,
+                    ha='left', va='bottom', fontsize=7.5,
+                    fontstyle='italic', color='#555555')
+            ax.text(0.98, 0.03, str(right_txt), transform=ax.transAxes,
+                    ha='right', va='bottom', fontsize=7.5,
+                    fontstyle='italic', color='#555555')
+
+        ax.set_xlabel(descriptor_label)
+        ax.set_ylabel(activity_label)
+        if title:
+            ax.set_title(title)
+        if any(leg.get('label') for leg in legs):
+            # 峰顶注释占顶部中央 → legend 避让到离峰顶较远的一侧上角(腿低处上方必空)
+            if mark_top and apex is not None and top_label:
+                loc = ('upper right' if (apex[0] - xlo) <= (xhi - apex[0])
+                       else 'upper left')
+            else:
+                loc = 'best'
+            ax.legend(loc=loc, fontsize=7, handlelength=1.1,
+                      labelspacing=0.35, borderaxespad=0.25)
+        if panel:
+            add_panel_label(ax, panel)
+        return _save_dual(fig, out_path, formats)
+
+
+# ── 图 6:标度关系(scaling relation)散点 + 线性拟合 ─────────────────────────
+
+def scaling_relation(xs, ys, out_path, *, xlabel: str, ylabel: str,
+                     labels=None, fit: bool = True, fit_fmt: str = '{:.2f}',
+                     title: str = '', width: float | None = None,
+                     palette: str = 'tol_bright', panel: str = '',
+                     formats=('png', 'pdf'), style_kw: dict | None = None) -> list:
+    """标度关系图:两个吸附量的散点 + 最小二乘直线,标拟合式与 R²(纯 numpy)。
+
+    数据契约:
+        xs, ys: 等长数值序列(≥2 个点),如各基底的 E_ads(Li2S6) 与 E_ads(Li2S4)。
+        labels: 可选,与 xs 等长的点名列表(如基底名,走 chem_label 自动下标);
+                None 不标点名。
+
+    参数:
+        xlabel/ylabel: 轴标签(必填,mathtext 可用)。
+        fit:      True 画最小二乘直线并标 'y = kx + b' 与 R²(k>0 标注在左上,
+                  k<0 在右上,避开数据云);要求 xs 至少有 2 个不同值。
+        fit_fmt:  拟合式中 k/b 的数值格式(R² 固定 3 位小数)。
+        其余参数同 adsorption_bar。
+
+    返回:导出文件绝对路径列表(与 formats 同序)。
+    """
+    xs = [float(x) for x in xs]
+    ys = [float(y) for y in ys]
+    if len(xs) != len(ys):
+        raise ValueError(f'xs 与 ys 长度不一致: {len(xs)} != {len(ys)}')
+    if len(xs) < 2:
+        raise ValueError('标度关系至少需 2 个点')
+    if labels is not None and len(labels) != len(xs):
+        raise ValueError(f'labels 个数 {len(labels)} != 点数 {len(xs)}')
+    if fit and len(set(xs)) < 2:
+        raise ValueError('线性拟合要求 xs 至少含 2 个不同值')
+
+    fig_w = width if width is not None else SINGLE_COL
+    with apply_paper_style(palette=palette, **(style_kw or {})):
+        fig, ax = _new_figure(width=fig_w, aspect=0.80)
+        colors = PALETTES.get(palette, PALETTES['tol_bright'])
+        ax.scatter(xs, ys, s=30, color=colors[0], edgecolors='black',
+                   linewidths=0.5, zorder=3)
+        if labels:
+            for x, y, nm in zip(xs, ys, labels):
+                if nm:
+                    ax.annotate(chem_label(nm), (x, y), xytext=(4, 3),
+                                textcoords='offset points', ha='left',
+                                va='bottom', fontsize=7.5, zorder=4)
+        if fit:
+            import numpy as np
+            k, b = (float(c) for c in np.polyfit(xs, ys, 1))
+            yhat = [k * x + b for x in xs]
+            ybar = sum(ys) / len(ys)
+            ss_res = sum((y - h) ** 2 for y, h in zip(ys, yhat))
+            ss_tot = sum((y - ybar) ** 2 for y in ys)
+            r2 = (1.0 - ss_res / ss_tot) if ss_tot > 0 else (
+                1.0 if ss_res < 1e-12 else 0.0)
+            pad = 0.06 * ((max(xs) - min(xs)) or 1.0)
+            xx = (min(xs) - pad, max(xs) + pad)
+            ax.plot(xx, [k * x + b for x in xx], color=colors[1],
+                    lw=1.4, zorder=2)
+            sign = '+' if b >= 0 else '-'
+            eq = (rf'$y = {fit_fmt.format(k)}x \,{sign}\, {fit_fmt.format(abs(b))}$'
+                  '\n' rf'$R^2 = {r2:.3f}$')
+            if k >= 0:                   # 正相关点云在对角线上,拟合式放左上角
+                ax.text(0.05, 0.95, eq, transform=ax.transAxes,
+                        ha='left', va='top', linespacing=1.5)
+            else:
+                ax.text(0.95, 0.95, eq, transform=ax.transAxes,
+                        ha='right', va='top', linespacing=1.5)
+        ax.margins(x=0.10, y=0.12)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        if title:
+            ax.set_title(title)
         if panel:
             add_panel_label(ax, panel)
         return _save_dual(fig, out_path, formats)
