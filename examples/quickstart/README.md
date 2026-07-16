@@ -20,13 +20,11 @@ python examples/make_demo_potcar_lib.py demo_lib
 ## 2. Generate the input set / 生成四件套
 
 ```bash
-vcs gen --poscar examples/quickstart/POSCAR --incar examples/quickstart/INCAR ^
-        --calc-type slab --lib-root demo_lib -o results/demo01
+vcs gen --poscar examples/quickstart/POSCAR --incar examples/quickstart/INCAR --calc-type slab --lib-root demo_lib -o results/demo01
 ```
 
-(On Linux/macOS replace `^` with `\` for line continuation, or put the
-command on one line. If you installed without `pip install -e .`, use
-`python -m vcstudio.cli.main gen ...` equivalently.)
+(One line — no shell line-continuation needed. If you installed without
+`pip install -e .`, use `python -m vcstudio.cli.main gen ...` equivalently.)
 
 ## 3. Inspect the output / 检查产物
 

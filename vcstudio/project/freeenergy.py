@@ -4,7 +4,9 @@
 - ΔG(i) = [E(slab+Xᵢ) + Σ precip·E(mol) − n_li·μ_Li] − E(slab+S8),参照 S8*=0
 - μ_Li 估算:S8 + 16Li → 8Li2S 整反应,μ_Li = (E(Li2S) − E(S8)/8)/2(可显式覆盖)
 - 这里的 E 是 DFT 电子能(E0),未含 ZPE/熵——报告中明示,不冒充真自由能
-- U_L(CHE):U_L = −max(ΔG_step/Δn_e),PDS = 逐电子上坡最陡的步
+- U_L(CHE):U_L = −max(ΔG_step/Δn_e),PDS = 逐电子上坡最陡的步。
+  注:μ_Li 由 S8/Li2S 整反应定标,故 U_L 是**相对 S8/Li2S 整反应平衡电位**的极限
+  电位(整反应参照系),**非相对 Li/Li⁺ 金属电极**;报告方法学节同款措辞。
 
 能量来源:本地作业目录 OSZICAR 末行 E0(read_e0)/ 旧结果目录批量扫描
 (load_molecule_energies:mol_* 与 molecule_* 两种命名都认)。

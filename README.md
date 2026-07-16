@@ -24,7 +24,7 @@ your machine).
 |---|---|---|---|
 | ① 生成 Generate | `vcstudio/generate/` | POSCAR+用户INCAR → 校验补全四件套(缺项才补,不改用户键) | `job_builder.py` `incar_builder.py` `kpoints.py`(倒格矢) `potcar.py` `poscar.py` |
 | ② 提交 Submit | `vcstudio/cluster/` | PBS/Slurm 双方言、preflight、SSH 上传+提交 | `schedulers.py` `script_builder.py` `submitter.py` `connection.py` |
-| ③ 监控+诊断 Monitor | `vcstudio/cluster/` | 查队列判排队/运行/终态 → 取证 → 12+ 失败分类;**续算沉降护栏** | `submitter.refresh_job` `diagnose.py` `convergence.py` |
+| ③ 监控+诊断 Monitor | `vcstudio/cluster/` | 查队列判排队/运行/终态 → 取证 → 15 类作业分类 + 15 条 VASP 错误签名([失败分类表](docs/failure-taxonomy.md));**续算沉降护栏** | `submitter.refresh_job` `diagnose.py` `convergence.py` |
 | ④ 有界恢复 Recovery | `vcstudio/cluster/` | CONTCAR/改参续算(≤3轮,INCAR 冻结),否则交人工 | `submitter.continue_from_contcar` `batch_ops.py` |
 | ⑤ 分析+报告 Analyze | `vcstudio/project/` + `external/` | ΔE 门控、吸附能/ΔG台阶/d带中心/Bader、论文级出图、报告 | `adsorption.py` `freeenergy.py` `thermo.py` `dosparse.py` `bader.py` `charts.py` `external/native_charts.py` |
 | 跨层基础 Shared | `vcstudio/shared/` | 配置、清单(job.yaml状态机)、凭据(keyring) | `config.py` `manifest.py` `secrets.py` |
@@ -50,7 +50,7 @@ guaranteed consistent with the actual INCAR/KPOINTS/POTCAR. See the full
 |---|---|---|
 | Generate | `vcstudio/generate/` | POSCAR + your INCAR → validated 4-file input set; completes only missing keys, **never overwrites yours**; `job.yaml` records sha256 provenance |
 | Submit | `cluster/{schedulers,script_builder,submitter,connection}` | PBS/Slurm dialects (pure functions); preflight gates; dual-track scripts (auto / your template passed through verbatim) |
-| Monitor + diagnose | `submitter.refresh_job` + `cluster/diagnose.py` | scheduler exit reason + output integrity + log signatures + convergence + energy sanity → 12+11 failure classes → 4 terminal states |
+| Monitor + diagnose | `submitter.refresh_job` + `cluster/diagnose.py` | scheduler exit reason + output integrity + log signatures + convergence + energy sanity → 15 job-classification outcomes + 15 VASP internal-error signatures → 4 terminal states ([taxonomy](docs/failure-taxonomy.md)) |
 | Bounded recovery | `submitter.continue_from_contcar` | only for recoverable classes; CONTCAR validated; INCAR frozen; **max 3 rounds**; anything else → NEEDS_HUMAN |
 | Analyze + report | `project/` + `external/` | ΔE gating (all-DONE before numbers), Li–S discharge path (ΔG/PDS/U_L), Origin/SVG dual chart engines, POV-Ray structure figures, bilingual LLM analysis (real INCAR injected, no fabricated citations) |
 | Publication aids | `cluster/convergence.py`, `generate/structure_view.py`, `generate/methods_text.py`, `project/dosparse.py` | per-ionic-step convergence charts; 3D structure preview with molecule–slab clash interception; bilingual Methods + BibTeX from real inputs; total-DOS SVG from vasprun.xml |
@@ -80,7 +80,7 @@ silent (job.yaml state machine + audit history).
 - **工程化**:config 脱敏(移除内网 IP)、版本号单一事实来源、依赖分组声明、
   CI 加 lint+覆盖率+打包冒烟。
 
-全套 476+ 测试通过。下一步待办见 **[docs/planning/progress-2026-07-16.md](docs/planning/progress-2026-07-16.md)**。
+全套 525 测试通过(2 项在无 OriginLab/POV-Ray 时跳过)。下一步待办见 **[docs/planning/progress-2026-07-16.md](docs/planning/progress-2026-07-16.md)**。
 
 ## Install & quickstart
 
@@ -99,9 +99,15 @@ vcs gen --poscar POSCAR --incar my.incar --calc-type slab -o results/job1/
 POTCAR library generator (real pseudopotentials are licensed material and are
 never distributed with this repository).
 
-**Tests**: `python -m pytest` — 424 tests, 1 skipped (optional OriginLab
-smoke behind `VCS_ORIGIN_SMOKE=1`). CI runs the suite on
-ubuntu/windows × Python 3.10/3.12.
+**Verify the analysis chain offline** (diagnose → gated ΔE → chart → HTML
+report, no VASP or cluster): [examples/offline_analysis](examples/offline_analysis/README.md)
+— `python examples/offline_analysis/run_demo.py` drives a synthetic completed
+job set end-to-end so a reviewer can confirm the analysis half of the pipeline.
+
+**Tests**: `python -m pytest` — 525 tests, 2 skipped (optional OriginLab smoke
+behind `VCS_ORIGIN_SMOKE=1`, and a POV-Ray real-render smoke). Parser
+cross-checks against ASE run when `ase` is installed (in the `dev` extra).
+CI runs the suite on ubuntu/windows × Python 3.10/3.12.
 
 ## Scientific conventions
 
@@ -128,19 +134,22 @@ via [CITATION.cff](CITATION.cff). Licensed under [MIT](LICENSE).
 ΔE/自由能分析 → 出版级报告。Windows 单文件 EXE,确定性核心零 token,
 全离线运行。
 
-- **快速开始**:双击 `dist\VASP Catalyst Studio.exe`(四页:生成/吸附能项目/
-  任务/集群);改完代码双击 `重新打包EXE.bat` 重打包
+- **快速开始**:双击 `dist\VASP Catalyst Studio.exe`(默认 Web,五页:仪表盘/生成/
+  吸附能项目/任务/集群;命令行 `vcs gui`,`--legacy` 用旧 tkinter);
+  改完代码双击 `重新打包EXE.bat` 重打包
 - **离线体验**:[examples/quickstart](examples/quickstart/README.md)
-  (石墨烯示例+假赝势库,五分钟跑通全链)
+  (石墨烯示例+假赝势库,五分钟跑通全链);
+  [examples/offline_analysis](examples/offline_analysis/README.md)
+  (合成的已完成作业 → 诊断/ΔE/出图/报告,审稿人无 VASP/集群即可验证分析链路)
 - **完整用法**:[使用说明.md](使用说明.md);目录结构:[STRUCTURE.md](STRUCTURE.md)
-- **测试**:`python -m pytest`(424 用例)
+- **测试**:`python -m pytest`(525 用例,2 项在无 OriginLab/POV-Ray 时跳过)
 - **科学约定/发刊工具链**:同上英文节;竞品对比见
   [docs/comparison.md](docs/comparison.md),验证协议见
   [docs/validation.md](docs/validation.md)
 
 ```
 vcstudio/       核心包(generate/cluster/project/external/gui/shared/cli)
-tests/          424 测试   docs/superpowers/specs/  设计文档
+tests/          525 测试   docs/superpowers/specs/  设计文档
 config.example.yaml  配置模板(复制为 config.yaml 填写;config.yaml 已 gitignore)
 dist/           打包产物 EXE(gitignore)   results/  作业输出(不入 git)
 ```

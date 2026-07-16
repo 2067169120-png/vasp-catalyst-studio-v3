@@ -92,6 +92,69 @@ def test_generate_report_falls_back_to_svg_and_degrades_ai(tmp_path):
     assert h.count('proj1') >= 1
 
 
+def _proj_repro(tmp_path):
+    """带 KPOINTS/POTCAR 溯源 + 续算历史的项目(item 6 发刊级可复现字段)。"""
+    dirs = []
+    for i, cname in enumerate(['ads_A', 'ads_B']):
+        d = tmp_path / cname
+        d.mkdir()
+        m = mm.new_manifest(
+            job_id=cname, system='s', task_type='relax', calc_type='slab',
+            inputs={'kpoints': [3, 3, 1],
+                    'potcar_provenance': [
+                        {'element': 'C', 'variant': 'C',
+                         'titel': 'PAW_PBE C 08Apr2002', 'enmax': 400.0},
+                        {'element': 'S', 'variant': 'S',
+                         'titel': 'PAW_PBE S 06Sep2000', 'enmax': 280.0}]})
+        m['kpoints'] = [3, 3, 1]
+        mm.set_state(m, 'DONE')
+        m['results'] = {'energy_e0_eV': -100.0 - i}
+        if cname == 'ads_B':                        # 一次续算历史 → 报告注"续算×1"
+            m['attempts'] = [{'n': 1, 'result': 'submitted'},
+                             {'n': 2, 'result': 'continued'}]
+        mm.save_manifest(d, m)
+        (d / 'INCAR').write_text('ENCUT = 450\nEDIFF = 1E-5\n', encoding='utf-8')
+        dirs.append(str(d))
+    slab = tmp_path / 'slab'
+    slab.mkdir()
+    ms = mm.new_manifest(job_id='slab', system='s', task_type='relax',
+                         calc_type='slab', inputs={'kpoints': [3, 3, 1]})
+    ms['kpoints'] = [3, 3, 1]
+    mm.set_state(ms, 'DONE')
+    ms['results'] = {'energy_e0_eV': -90.0}
+    mm.save_manifest(slab, ms)
+    return {'name': 'reproj', 'root': str(tmp_path),
+            'members': {'clean_slab': str(slab), 'gas_ref': None, 'configs': dirs}}
+
+
+def _gen_repro(tmp_path):
+    p = _proj_repro(tmp_path)
+    return report_full.generate_project_report(
+        p, tmp_path / 'r.html',
+        origin_render=lambda *a, **k: {'ok': False, 'images': {}, 'error': ''},
+        ai_analyze=lambda payload: {'ok': False, 'error': 'skip'}).read_text(encoding='utf-8')
+
+
+def test_report_shows_kpoints_and_potcar_provenance(tmp_path):
+    h = _gen_repro(tmp_path)
+    assert 'KPOINTS' in h and '3 × 3 × 1' in h            # K 点网格入计算参数表
+    assert 'POTCAR provenance' in h                       # 赝势身份小表
+    assert 'PAW_PBE C 08Apr2002' in h and '400' in h      # TITEL + ENMAX
+    assert 'PAW_PBE S 06Sep2000' in h and '280' in h
+
+
+def test_report_annotates_continuation_rounds(tmp_path):
+    h = _gen_repro(tmp_path)
+    assert '续算×1' in h                                  # ads_B 有一次 continued
+
+
+def test_report_methodology_fixed_sentences(tmp_path):
+    h = _gen_repro(tmp_path)
+    assert 'BSSE' in h                                    # 平面波基组无 BSSE
+    assert 'ENCUT' in h and '基组一致' in h                # 项目内 ENCUT 一致
+    assert '真空盒尺寸' in h                               # 气相参考盒尺寸见输入文件
+
+
 def test_structure_gallery_embeds_existing_renders(tmp_path):
     p = _proj(tmp_path)
     figs = os.path.join(p['members']['configs'][0], 'figs')

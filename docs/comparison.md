@@ -11,7 +11,7 @@ capability exists but with material caveats noted inline.
 | Zero-install distribution | Yes (one EXE) | No (install) | No | No | No | No (DB + daemon) | No | No | No |
 | Input generation (INCAR/KPOINTS/POTCAR) | Yes; user INCAR keys never overwritten | Yes | Yes | Yes | Yes (recipe sets) | Yes (plugins) | Yes (generic params) | Yes (LLM-drafted) | Yes (LLM-drafted) |
 | Cluster submission | PBS + Slurm, double-hop SSH jump host | No (bash scripts) | No | Yes | Via FireWorks/jobflow-remote | Yes (daemon) | Yes (queue option) | Slurm | Yes |
-| Job monitoring + failure classification | Yes: 12+11 failure classes → 4 terminal states | No | No | Partial | custodian error handlers | Yes (process states) | Job status in DB | LLM parses errors | LLM dual-path monitor |
+| Job monitoring + failure classification | Yes: 15 job-classification outcomes + 15 VASP error signatures → 4 terminal states | No | No | Partial | custodian error handlers | Yes (process states) | Job status in DB | LLM parses errors | LLM dual-path monitor |
 | Self-healing | Rule-based, **bounded (max 3 rounds), INCAR frozen**, else NEEDS_HUMAN | No | No | No | custodian rule-based | Plugin-dependent | No | LLM-driven retry | LLM recovery agent |
 | Works fully offline (no external services) | Yes (deterministic core is zero-token; LLM layer optional) | Yes | Yes | Yes | Yes | Yes | Yes | No (LLM inference required) | No (LLM required) |
 | Pre-submission structure clash detection | Yes (molecule–slab gap analysis, covalent-radius clash scan) | No | No | No | No | No | No | No | No |

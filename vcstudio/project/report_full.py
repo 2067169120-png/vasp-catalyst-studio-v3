@@ -64,6 +64,7 @@ def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
     name = proj.get('name', 'project')
 
     delta = adsorption.delta_e_rows(proj)
+    _annotate_continuations(delta, proj)   # ΔE 行按续算历史注"续算×N"(发刊级可复现)
     dirs = _member_dirs(proj)
     rows = report.collect_jobs(dirs)
     summary = report.summarize(rows)
@@ -80,19 +81,38 @@ def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
             f'(ΔE = {min(des):.4f} eV);最弱 ΔE = {max(des):.4f} eV;'
             f'平均 ΔE = {sum(des) / len(des):.4f} eV。</p>')
 
-    # ── 0b. 计算参数表(原版 INCAR parameters 表移植;读共享 INCAR 真实键) ──
+    # ── 0b. 计算参数表(INCAR 关键键 + KPOINTS 网格;发刊级可复现) ──
     inc0 = {}
     for d in dirs:
         inc0 = incar_summary_from_dir(d)
         if inc0:
             break
-    if inc0:
+    kpts_repro, potcar_prov = _repro_fields_from_dirs(dirs)
+    if inc0 or kpts_repro:
         prow = ''.join(f'<tr><td><code>{_esc(k)}</code></td><td class="num">{_esc(v)}</td></tr>'
                        for k, v in inc0.items())
+        if kpts_repro:
+            grid = ' × '.join(str(x) for x in kpts_repro)
+            prow += (f'<tr><td><code>KPOINTS</code></td>'
+                     f'<td class="num">{_esc(grid)}(倒格矢自动网格)</td></tr>')
+        tail = ('' if potcar_prov else
+                "<p class='dim'>完整赝势身份(variant/TITEL/ENMAX)见各作业 job.yaml 的 inputs 小节。</p>")
         sections.append(
-            '<h2>计算参数(成员共享 INCAR 关键键)</h2>'
+            '<h2>计算参数(成员共享 INCAR 关键键 + K 点网格)</h2>'
             f'<table><thead><tr><th>键</th><th>值</th></tr></thead><tbody>{prow}</tbody></table>'
-            "<p class='dim'>完整输入与赝势身份(variant/TITEL/ENMAX)见各作业 job.yaml 的 inputs 小节。</p>")
+            + tail)
+    # ── 0c. POTCAR 身份小表(赝势溯源:结果永远可答"哪套赝势算的") ──
+    if potcar_prov:
+        prows = ''.join(
+            f'<tr><td>{_esc(p.get("element"))}</td><td>{_esc(p.get("variant"))}</td>'
+            f'<td><code>{_esc(p.get("titel"))}</code></td>'
+            f'<td class="num">{_esc(p.get("enmax"))}</td></tr>'
+            for p in potcar_prov)
+        sections.append(
+            '<h2>赝势身份(POTCAR provenance)</h2>'
+            '<table><thead><tr><th>元素</th><th>variant</th><th>TITEL</th>'
+            f'<th>ENMAX / eV</th></tr></thead><tbody>{prows}</tbody></table>'
+            "<p class='dim'>赝势本体为版权材料,不随仓库分发;此表仅记身份供溯源与复算对齐。</p>")
 
     # ── 1. ΔE 图表(Origin 优先,SVG 兜底) ──
     band = config.get('ideal_window')            # 可配理想窗口 (lo, hi);默认不画
@@ -183,10 +203,15 @@ def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
     conv = ['E<sub>ads</sub> = E(slab+ads) − E(slab) − E(ref),负值 = 有利吸附;'
             'ΔE 着色:&lt; −3 eV 强吸附(绿)、&gt; 0(红)。',
             corr_line,
-            '成员全部 DONE 才给 ΔE;能量经物理合理性闸(E≥0/|E|&gt;10⁴ 拒收)。']
+            '成员全部 DONE 才给 ΔE;能量经物理合理性闸(E≥0/|E|&gt;10⁴ 拒收)。',
+            '平面波基组不存在基组重叠误差(BSSE),无需 counterpoise 校正;'
+            '项目内各作业 ENCUT 统一(生成时按元素并集取一致截断能,保 ΔE 各成员基组一致);'
+            '气相参考的真空盒尺寸见各作业输入文件(POSCAR/CONTCAR)。']
     if fed:
         conv.insert(1, f'μ<sub>Li</sub> = (E(Li₂S) − E(S₈)/8) / 2 = {fed["mu_li"]:.4f} eV'
-                       '(由分子库估算);ΔG 参照 S8* = 0,U<sub>L</sub> = −max(ΔG/Δn·e)(CHE)。')
+                       '(由分子库估算);ΔG 参照 S8* = 0,U<sub>L</sub> = −max(ΔG/Δn·e)(CHE);'
+                       'U<sub>L</sub> 是相对 S8/Li₂S 整反应平衡电位的极限电位(整反应参照系),'
+                       '非相对 Li/Li⁺ 电极。')
     sections.append('<h2>方法学约定</h2><ul>'
                     + ''.join(f'<li>{c}</li>' for c in conv) + '</ul>')
 
@@ -229,6 +254,47 @@ def _try_fed(delta, config, log):
     except ValueError as e:
         log(f'自由能路径未生成:{e}')
         return None
+
+
+def _repro_fields_from_dirs(dirs):
+    """从首个可读成员 manifest 取(KPOINTS 网格, POTCAR 身份表)——发刊级可复现字段。
+
+    KPOINTS 优先 manifest 顶层 ``kpoints``,退 ``inputs.kpoints``;POTCAR 身份取
+    ``inputs.potcar_provenance``(逐元素 {element/variant/titel/enmax})。任一成员给全即用。
+    缺失一律返回 (None, []),调用方按"不展示该表"降级。
+    """
+    from vcstudio.shared import manifest as _mm
+    kpts, prov = None, []
+    for d in dirs:
+        m = _mm.load_manifest(d)
+        if not m:
+            continue
+        inputs = m.get('inputs') or {}
+        if kpts is None:
+            kpts = m.get('kpoints') or inputs.get('kpoints')
+        # 取元素最全的一份赝势身份(组态含吸附质,元素多于清洁表面)
+        cand = inputs.get('potcar_provenance') or []
+        if len(cand) > len(prov):
+            prov = cand
+    return (list(kpts) if kpts else None), list(prov)
+
+
+def _annotate_continuations(delta, proj):
+    """ΔE 表行按各组态 manifest 的续算历史追加"续算×N"备注(attempts 里 result=continued)。"""
+    from vcstudio.shared import manifest as _mm
+    configs = ((proj.get('members') or {}).get('configs')) or []
+    by_name = {os.path.basename(os.path.normpath(str(d))): d for d in configs if d}
+    for r in (delta.get('rows') or []):
+        d = by_name.get(r.get('name'))
+        if not d:
+            continue
+        m = _mm.load_manifest(d)
+        if not m:
+            continue
+        n = sum(1 for a in (m.get('attempts') or []) if a.get('result') == 'continued')
+        if n:
+            tag = f'续算×{n}'
+            r['note'] = (str(r['note']) + '；' + tag) if r.get('note') else tag
 
 
 def _default_origin(specs, out_dir, opju_path=None):

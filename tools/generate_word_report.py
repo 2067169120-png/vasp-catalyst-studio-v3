@@ -158,7 +158,8 @@ def _compose(png_in, png_out, symbols, pal, label=None):
     H = h + top + bot
     fig, ax = plt.subplots(figsize=(w / 220, H / 220), dpi=220)
     ax.imshow(img, extent=[0, w, bot, bot + h])
-    ax.set_xlim(0, w); ax.set_ylim(0, H)
+    ax.set_xlim(0, w)
+    ax.set_ylim(0, H)
     ax.axis('off')
     if label:
         ax.text(w / 2, bot + h + top * 0.5, label, ha='center', va='center',
@@ -262,8 +263,8 @@ def plot_ads_bar_gradient(group, cols, vals, out_png):
     cmap = matplotlib.colormaps['Blues_r']   # 最负 → 深蓝
     colors = [cmap(norm(v)) for v in vals]
     x = np.arange(len(cols))
-    bars = ax.bar(x, vals, width=0.62, color=colors, edgecolor='#1a1a1a',
-                  linewidth=1.4, zorder=3)
+    ax.bar(x, vals, width=0.62, color=colors, edgecolor='#1a1a1a',
+           linewidth=1.4, zorder=3)
     for xi, v in zip(x, vals):
         ax.text(xi, v - 0.06, f'{v:.2f}', ha='center', va='top',
                 fontsize=13.5, fontweight='bold', color='#1a1a1a', zorder=4)
@@ -630,7 +631,8 @@ class WordReport:
         self.doc.add_paragraph('')
         pairs = [(chem_text(c), v) for c, v in zip(cols, vals) if v is not None]
         if pairs:
-            s = min(pairs, key=lambda x: x[1]); w = max(pairs, key=lambda x: x[1])
+            s = min(pairs, key=lambda x: x[1])
+            w = max(pairs, key=lambda x: x[1])
             self._add_body_paragraph(
                 f'其中 {s[0]} 吸附最强（{s[1]:.2f} eV），{w[0]} 最弱（{w[1]:.2f} eV）。')
 
