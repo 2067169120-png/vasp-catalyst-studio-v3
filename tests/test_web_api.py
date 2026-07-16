@@ -4,6 +4,7 @@
 异常绝不穿透到 JS(错误落 'error' 字段)。中文注释允许,英文标识符。
 """
 import os
+import sys
 import types
 
 from vcstudio.gui_web.api import Api
@@ -1369,3 +1370,291 @@ def test_proj_compare_scaling_pair_and_volcano_skip(tmp_path):
     assert sc['xs'] == [-1.0, -1.5, -2.0] and sc['ys'] == [-2.0, -2.6, -3.1]
     assert [s['kind'] for s in out['skipped']] == ['volcano']
     assert 'U_L' in out['skipped'][0]['reason']
+
+
+# ── 设置页 / 自动驾驶 假件 ────────────────────────────────────────────────────
+def _fake_config_rw(backing):
+    """可读写 config 假件:load_config/save_config/get_ui_state/set_ui_state 共享 backing。"""
+    m = types.SimpleNamespace()
+    m.load_config = lambda *a, **k: dict(backing)
+    m.save_config = lambda cfg, *a, **k: (backing.clear() or backing.update(cfg))
+
+    def _get_ui(c=None):
+        src = c if c is not None else backing
+        return dict(src.get('ui') or {})
+    m.get_ui_state = _get_ui
+
+    def _set_ui(**kv):
+        ui = dict(backing.get('ui') or {})
+        ui.update({k: v for k, v in kv.items() if v is not None})
+        backing['ui'] = ui
+    m.set_ui_state = _set_ui
+    m.set_potcar_lib_root = lambda p, *a, **k: backing.__setitem__('potcar_lib_root', p)
+    return m
+
+
+def _fake_ai(calls=None, key_saved=False):
+    """ai_analysis 假件:save/load key + probe(用注入 transport)+ 默认预设常量。"""
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.DEFAULT_PROMPT_PRESET = 'DEFAULT_PRESET_TEXT'
+    m.save_api_key = lambda k: calls.__setitem__('saved_key', k)
+    m.load_api_key = lambda: 'stored-key' if key_saved else None
+
+    def _probe(*, api_key=None, base_url='', model='', transport=None, timeout=20):
+        calls['probe'] = {'base_url': base_url, 'model': model}
+        if transport is not None:
+            st, _raw = transport(base_url or 'u', b'{}', {}, timeout)
+            return {'ok': st == 200, 'error': None if st == 200 else f'HTTP {st}'}
+        return {'ok': True, 'error': None}
+    m.probe = _probe
+    return m
+
+
+def _fake_manifest_mod(states):
+    """manifest 假件:load_manifest 按目录返回注入的 manifest dict。"""
+    m = types.SimpleNamespace()
+    m.load_manifest = lambda d: states.get(d)
+    m.create_from_build = lambda *a, **k: None
+    return m
+
+
+# ── settings_get / llm_save / key 状态掩码 ───────────────────────────────────
+def test_settings_get_aggregates_and_masks_key():
+    backing = {'potcar_lib_root': '/lib', 'lis_molecules_dir': '/mols',
+               'ideal_window': [-1.0, 0.5],
+               'llm': {'base_url': 'u', 'model': 'm', 'allow_external': True},
+               'ui': {'theme': 'paper', 'poll_interval': 5, 'autopilot_fetch': False}}
+    api = Api(config_mod=_fake_config_rw(backing), ai_analysis_mod=_fake_ai(key_saved=True))
+    out = api.settings_get()
+    assert out['ok'] is True
+    assert out['llm'] == {'base_url': 'u', 'model': 'm', 'allow_external': True,
+                          'key_saved': True}
+    assert 'api_key' not in out['llm'] and 'stored-key' not in str(out)   # 绝不回显密钥
+    assert out['paths']['lis_molecules_dir'] == '/mols'
+    assert out['paths']['ideal_window'] == [-1.0, 0.5]
+    assert out['ui']['theme'] == 'paper' and out['ui']['poll_interval'] == 5
+    assert out['ui']['autopilot_fetch'] is False and out['ui']['autopilot'] is True
+    assert out['prompt']['is_default'] is True and 'DEFAULT_PRESET_TEXT' in out['prompt']['text']
+
+
+def test_settings_get_defaults_when_unset():
+    api = Api(config_mod=_fake_config_rw({}), ai_analysis_mod=_fake_ai(key_saved=False))
+    out = api.settings_get()
+    assert out['ui'] == {'theme': 'classic', 'autopilot': True, 'poll_interval': 10,
+                         'autopilot_continue': True, 'autopilot_fetch': True,
+                         'autopilot_report': True}
+    assert out['llm']['key_saved'] is False and out['llm']['base_url'] == ''
+
+
+def test_llm_save_roundtrip():
+    backing = {}
+    api = Api(config_mod=_fake_config_rw(backing))
+    out = api.llm_save('https://api.openai.com/v1/chat/completions', 'gpt-4o', True)
+    assert out['ok'] is True
+    assert backing['llm'] == {'base_url': 'https://api.openai.com/v1/chat/completions',
+                              'model': 'gpt-4o', 'allow_external': True}
+
+
+def test_llm_key_save_and_status():
+    calls = {}
+    api = Api(ai_analysis_mod=_fake_ai(calls=calls, key_saved=False))
+    out = api.llm_key_save('sk-123')
+    assert out['ok'] is True and calls['saved_key'] == 'sk-123'
+    assert api.llm_key_status() == {'saved': False}
+    api2 = Api(ai_analysis_mod=_fake_ai(key_saved=True))
+    assert api2.llm_key_status() == {'saved': True}
+
+
+def test_llm_key_save_rejects_blank():
+    api = Api(ai_analysis_mod=_fake_ai())
+    out = api.llm_key_save('   ')
+    assert out['ok'] is False and out['error']
+
+
+# ── llm_test(注入假 transport) ──────────────────────────────────────────────
+def test_llm_test_ok_with_injected_transport():
+    calls = {}
+    api = Api(ai_analysis_mod=_fake_ai(calls=calls))
+    out = api.llm_test('http://api', 'gpt', transport=lambda u, b, h, t: (200, b'{}'))
+    assert out['ok'] is True and calls['probe']['base_url'] == 'http://api'
+
+
+def test_llm_test_http_error():
+    api = Api(ai_analysis_mod=_fake_ai())
+    out = api.llm_test('http://api', 'gpt', transport=lambda u, b, h, t: (401, b'no'))
+    assert out['ok'] is False and '401' in out['error']
+
+
+# ── prompt_get / prompt_save / prompt_reset ──────────────────────────────────
+def test_prompt_save_get_reset_roundtrip():
+    backing = {}
+    api = Api(config_mod=_fake_config_rw(backing), ai_analysis_mod=_fake_ai())
+    g0 = api.prompt_get()
+    assert g0['is_default'] is True and g0['text'] == 'DEFAULT_PRESET_TEXT'
+    assert api.prompt_save('MY CUSTOM PROMPT')['ok'] is True
+    assert backing['llm']['prompt_preset'] == 'MY CUSTOM PROMPT'
+    g1 = api.prompt_get()
+    assert g1['is_default'] is False and g1['text'] == 'MY CUSTOM PROMPT'
+    r = api.prompt_reset()
+    assert r['ok'] is True and 'prompt_preset' not in backing.get('llm', {})
+    assert api.prompt_get()['is_default'] is True
+
+
+def test_prompt_save_rejects_blank():
+    api = Api(config_mod=_fake_config_rw({}), ai_analysis_mod=_fake_ai())
+    assert api.prompt_save('   ')['ok'] is False
+
+
+# ── paths_save / theme_set / autopilot_save ──────────────────────────────────
+def test_paths_save_roundtrip_and_ideal_window():
+    backing = {}
+    api = Api(config_mod=_fake_config_rw(backing))
+    out = api.paths_save('/lib2', '/mols2', '-1.5', '0.5')
+    assert out['ok'] is True
+    assert backing['potcar_lib_root'] == '/lib2'
+    assert backing['lis_molecules_dir'] == '/mols2'
+    assert backing['ideal_window'] == [-1.5, 0.5]
+    # 两个都留空 → 移除 ideal_window
+    api.paths_save('/lib2', '/mols2', '', '')
+    assert 'ideal_window' not in backing
+
+
+def test_paths_save_partial_ideal_window_error():
+    api = Api(config_mod=_fake_config_rw({}))
+    out = api.paths_save('/lib', '/mols', '1.0', '')
+    assert out['ok'] is False and 'ideal_window' in out['error']
+
+
+def test_theme_set_persists_and_validates():
+    backing = {}
+    api = Api(config_mod=_fake_config_rw(backing))
+    assert api.theme_set('deep')['theme'] == 'deep' and backing['ui']['theme'] == 'deep'
+    assert api.theme_set('bogus')['theme'] == 'classic'   # 非法 → classic
+
+
+def test_autopilot_save_persists_subswitches():
+    backing = {}
+    api = Api(config_mod=_fake_config_rw(backing))
+    api.autopilot_save(True, 15, True, False, True)
+    ui = backing['ui']
+    assert ui['autopilot'] is True and ui['poll_interval'] == 15
+    assert ui['autopilot_continue'] is True and ui['autopilot_fetch'] is False
+    assert ui['autopilot_report'] is True
+    # 非法间隔回落 10
+    api.autopilot_save(poll_interval=999)
+    assert backing['ui']['poll_interval'] == 10
+
+
+# ── pipeline_tick(幂等:首拍 report_done + 写标记,次拍无重复) ──────────────────
+def test_pipeline_tick_report_done_idempotent(tmp_path):
+    calls, saved = {}, []
+    proj = {'name': 'liS', 'root': str(tmp_path),
+            'members': {'clean_slab': '/s', 'gas_ref': None, 'configs': ['/c1']}}
+    ads = _fake_adsorption(projects=['/p/project.yaml'],
+                           proj_map={'/p/project.yaml': proj},
+                           delta_ret=_delta({'liS_ads_Li2S4': -1.2}))
+    ads.save_project = lambda root, p: saved.append(root)
+    manifest = _fake_manifest_mod({'/s': {'state': 'DONE', 'results': {}},
+                                   '/c1': {'state': 'DONE', 'results': {}}})
+    rf = _fake_report_full(member_dirs=['/s', '/c1'],
+                           report_ret=str(tmp_path / 'report' / 'liS_report.html'))
+    api = Api(profiles_mod=_fake_profiles({}), adsorption_mod=ads, manifest_mod=manifest,
+              native_charts_mod=_fake_ncharts(calls), report_full_mod=rf,
+              config_mod=_fake_config())
+    out1 = api.pipeline_tick()
+    assert out1['ok'] is True and out1['last_sync']
+    rd = [e for e in out1['events'] if e['kind'] == 'report_done']
+    assert len(rd) == 1 and rd[0]['project'] == 'liS'
+    assert rd[0]['report'].endswith('liS_report.html')
+    assert proj.get('autopilot_report_done') and saved == [str(tmp_path)]   # 标记已写
+    # 次拍:标记已在 → 不再重复出报告
+    out2 = api.pipeline_tick()
+    assert [e for e in out2['events'] if e['kind'] == 'report_done'] == []
+
+
+def test_pipeline_tick_no_profiles_no_errors():
+    api = Api(profiles_mod=_fake_profiles({}),
+              adsorption_mod=_fake_adsorption(projects=[]),
+              config_mod=_fake_config())
+    out = api.pipeline_tick()
+    assert out['ok'] is True and out['events'] == [] and out['errors'] == []
+    assert out['synced'] == 0
+
+
+def test_pipeline_tick_skips_profile_without_credentials():
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='password')}
+    secrets = types.SimpleNamespace(get_password=lambda n: None, set_password=lambda n, pw: None)
+    api = Api(profiles_mod=_fake_profiles(store), secrets_mod=secrets,
+              adsorption_mod=_fake_adsorption(projects=[]),
+              ledger_mod=_fake_ledger([], []), config_mod=_fake_config())
+    out = api.pipeline_tick()
+    assert any(e['kind'] == 'skip' and 'c1' in e['text'] for e in out['events'])
+    assert out['synced'] == 0
+
+
+# ── pipeline_status(阶段判定) ───────────────────────────────────────────────
+def test_pipeline_status_stage_detection():
+    projA = {'name': 'A', 'members': {'clean_slab': '/a/s', 'gas_ref': None,
+                                      'configs': ['/a/c1', '/a/c2']}}
+    projB = {'name': 'B', 'members': {'clean_slab': '/b/s', 'gas_ref': None,
+                                      'configs': ['/b/c1']},
+             'autopilot_report_done': '2026-07-16T00:00:00'}
+    ads = _fake_adsorption(projects=['/a/project.yaml', '/b/project.yaml'],
+                           proj_map={'/a/project.yaml': projA, '/b/project.yaml': projB})
+    states = {
+        '/a/s': {'state': 'DONE', 'results': {}},
+        '/a/c1': {'state': 'CREATED', 'results': {}},     # 未提交 → 提交阶段
+        '/a/c2': {'state': 'DONE', 'results': {}},
+        '/b/s': {'state': 'DONE', 'results': {}},
+        '/b/c1': {'state': 'DONE', 'results': {}},         # 全 DONE + 标记 → 报告完成
+    }
+    api = Api(adsorption_mod=ads, manifest_mod=_fake_manifest_mod(states))
+    out = api.pipeline_status()
+    by = {p['name']: p for p in out['projects']}
+    assert by['A']['stage'] == 'submit' and by['A']['needs_human'] is False
+    assert by['B']['stage'] == 'report_done'
+    assert by['B']['done'] == 2 and by['B']['total'] == 2
+    assert by['B']['stage_index'] == 5 and by['B']['stages'][5] == 'report_done'
+
+
+def test_pipeline_status_monitor_recover_and_needs_human():
+    projM = {'name': 'M', 'members': {'clean_slab': '/m/s', 'gas_ref': None,
+                                      'configs': ['/m/c1']}}
+    projR = {'name': 'R', 'members': {'clean_slab': '/r/s', 'gas_ref': None,
+                                      'configs': ['/r/c1', '/r/c2']}}
+    ads = _fake_adsorption(projects=['/m/p', '/r/p'],
+                           proj_map={'/m/p': projM, '/r/p': projR})
+    states = {
+        '/m/s': {'state': 'DONE', 'results': {}},
+        '/m/c1': {'state': 'RUNNING', 'results': {}},      # 在跑 → 监控
+        '/r/s': {'state': 'DONE', 'results': {}},
+        '/r/c1': {'state': 'UNCONVERGED',
+                  'results': {'diagnosis': {'restartable': True}, 'continue_rounds': 2}},
+        '/r/c2': {'state': 'NEEDS_HUMAN', 'results': {}},  # 红旗
+    }
+    api = Api(adsorption_mod=ads, manifest_mod=_fake_manifest_mod(states))
+    out = api.pipeline_status()
+    by = {p['name']: p for p in out['projects']}
+    assert by['M']['stage'] == 'monitor'
+    assert by['R']['stage'] == 'recover' and by['R']['recover_round'] == 2
+    assert by['R']['needs_human'] is True
+
+
+# ── open_dir 文件路径 → 打开所在目录 ─────────────────────────────────────────
+def test_open_dir_file_opens_parent(tmp_path, monkeypatch):
+    import subprocess
+    f = tmp_path / 'report.html'
+    f.write_text('x', encoding='utf-8')
+    opened = {}
+    monkeypatch.setattr(subprocess, 'Popen', lambda args, *a, **k: opened.update(args=args))
+    monkeypatch.setattr(sys, 'platform', 'linux')
+    api = Api()
+    out = api.open_dir(str(f))
+    assert out['ok'] is True and opened['args'] == ['xdg-open', str(tmp_path)]
+
+
+def test_open_dir_missing_still_errors():
+    api = Api()
+    out = api.open_dir('/definitely/not/a/real/path/xyz')
+    assert out['ok'] is False

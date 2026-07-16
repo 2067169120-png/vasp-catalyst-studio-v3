@@ -265,6 +265,8 @@
       return;
     }
     VCS.log('已导出 CSV:' + (r.file || save), 'okc');
+    VCS.call('open_dir', r.file || save);       // 输出反馈统一:打开所在目录
+    VCS.toast('已导出 CSV');
   }
 
   // ── 生成完整报告:pick_dir + 默认文件名 → proj_report(耗时长,按钮禁用) ──
@@ -285,6 +287,8 @@
         return;
       }
       VCS.log('完整报告已生成:' + (r.file || save), 'okc');
+      VCS.call('open_dir', r.file || save);     // 输出反馈统一:打开所在目录
+      VCS.toast('报告已生成');
     } finally {
       if (btn) btn.disabled = false;
     }

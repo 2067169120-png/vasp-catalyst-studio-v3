@@ -10,10 +10,18 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from dataclasses import asdict, fields as dc_fields
 
 # 合法计算类型(决定 KPOINTS 网格);前端下拉与后端都以此为准
 _CALC_TYPES = ('slab', 'bulk', 'molecule')
+
+# 主题白名单(设置页三选);自动驾驶管线阶段序(pipeline_status 的 stage_index 取此序)
+_THEMES = ('classic', 'paper', 'deep')
+_STAGES = ('generate', 'submit', 'monitor', 'recover', 'analysis', 'report_done')
+# 活跃(在队/在跑)状态与可续算终态:pipeline_tick/status 复用
+_ACTIVE_STATES = ('UPLOADED', 'SUBMITTED', 'QUEUED', 'RUNNING')
+_TERMINAL_FAIL = ('FAILED', 'UNCONVERGED')
 
 
 def _norm_calc_type(x) -> str:
@@ -30,7 +38,7 @@ class Api:
                  submitter_mod=None, config_mod=None, job_builder_mod=None,
                  logic_mod=None, adsorption_mod=None, report_full_mod=None,
                  conv_mod=None, sview_mod=None, methods_mod=None, dialog_fn=None,
-                 native_charts_mod=None, freeenergy_mod=None):
+                 native_charts_mod=None, freeenergy_mod=None, ai_analysis_mod=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -65,6 +73,8 @@ class Api:
         # 原生出图引擎(matplotlib 可选依赖)与自由能:延迟导入,测试注入假件
         self._native_charts = native_charts_mod
         self._freeenergy = freeenergy_mod
+        # LLM 分析层(设置页/自动报告用):纯 stdlib 模块,延迟导入,测试注入假件
+        self._ai_analysis = ai_analysis_mod
 
     # ── 桥活性探测(前端用来确认 js_api 已就绪) ──
     def ping(self) -> str:
@@ -108,6 +118,13 @@ class Api:
             from vcstudio.project import freeenergy
             self._freeenergy = freeenergy
         return self._freeenergy
+
+    def _ai(self):
+        """LLM 分析层延迟加载(keyring/urllib 在其内部再延迟);测试注入假件即免真依赖。"""
+        if self._ai_analysis is None:
+            from vcstudio.project import ai_analysis
+            self._ai_analysis = ai_analysis
+        return self._ai_analysis
 
     def _resolve(self, name, password):
         """名字 → (profile, 密码, err_dict|None)。
@@ -997,16 +1014,402 @@ class Api:
         except Exception as e:                            # noqa: BLE001
             return {'path': None, 'error': str(e)}
 
-    # ── 打开本地目录(仅 win32:os.startfile) ──
+    # ── 打开本地目录(传文件路径 → 打开其所在目录) ──
     def open_dir(self, path):
         try:
-            if not os.path.isdir(path):
+            p = path
+            # 传入文件路径(如报告 html / CSV)→ 打开其所在目录(输出反馈统一口径)
+            if p and os.path.isfile(p):
+                p = os.path.dirname(p)
+            if not p or not os.path.isdir(p):
                 return {'ok': False, 'error': '目录不存在'}
             if sys.platform == 'win32':
-                os.startfile(path)  # noqa: S606
+                os.startfile(p)  # noqa: S606
             else:
                 import subprocess
-                subprocess.Popen(['xdg-open', path])
+                subprocess.Popen(['xdg-open', p])
             return {'ok': True}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'error': str(e)}
+
+    # ── 设置页(config 读写 + keyring 状态;全走注入的 config/ai_analysis,可测) ─────────
+    @staticmethod
+    def _parse_ideal_window(lo, hi):
+        """两个数(可留空)→ [lo, hi] 或 None。都空 → None;非法数字 → ValueError。"""
+        def _num(x):
+            s = str(x if x is not None else '').strip()
+            return None if s == '' else float(s)
+        a, b = _num(lo), _num(hi)
+        if a is None and b is None:
+            return None
+        if a is None or b is None:
+            raise ValueError('ideal_window 需同时给两个数字,或都留空')
+        return [a, b]
+
+    def _ui_defaults(self, ui):
+        """ui 小节 → 外观/自动化设置(带默认值)。"""
+        return {
+            'theme': ui.get('theme') if ui.get('theme') in _THEMES else 'classic',
+            'autopilot': bool(ui.get('autopilot', True)),
+            'poll_interval': int(ui.get('poll_interval', 10) or 10),
+            'autopilot_continue': bool(ui.get('autopilot_continue', True)),
+            'autopilot_fetch': bool(ui.get('autopilot_fetch', True)),
+            'autopilot_report': bool(ui.get('autopilot_report', True)),
+        }
+
+    def settings_get(self):
+        """设置页汇总读:LLM(不含密钥明文,仅 key_saved)/提示词/数据路径/外观自动化。"""
+        try:
+            cfg = self._config.load_config()
+            llm = dict(cfg.get('llm') or {})
+            ui = self._config.get_ui_state(cfg)
+            iw = cfg.get('ideal_window')
+            key_saved = False
+            try:
+                key_saved = self._ai().load_api_key() is not None
+            except Exception:                             # noqa: BLE001 keyring 不可用 → 视作未设置
+                key_saved = False
+            preset = llm.get('prompt_preset')
+            is_default = not (isinstance(preset, str) and preset.strip())
+            return {
+                'ok': True, 'error': None,
+                'llm': {'base_url': llm.get('base_url', '') or '',
+                        'model': llm.get('model', '') or '',
+                        'allow_external': bool(llm.get('allow_external', False)),
+                        'key_saved': bool(key_saved)},   # 绝不回显密钥,仅掩码状态
+                'prompt': {'text': preset if not is_default else self._ai().DEFAULT_PROMPT_PRESET,
+                           'is_default': is_default},
+                'paths': {'potcar_lib_root': cfg.get('potcar_lib_root', '') or '',
+                          'lis_molecules_dir': cfg.get('lis_molecules_dir', '') or '',
+                          'ideal_window': list(iw) if isinstance(iw, (list, tuple)) else []},
+                'ui': self._ui_defaults(ui),
+            }
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def llm_save(self, base_url, model, allow_external=None):
+        """保存 LLM 端点/模型(可选联网开关)到 config.llm(密钥不走这里)。"""
+        try:
+            cfg = self._config.load_config()
+            llm = dict(cfg.get('llm') or {})
+            llm['base_url'] = (base_url or '').strip()
+            llm['model'] = (model or '').strip()
+            if allow_external is not None:
+                llm['allow_external'] = bool(allow_external)
+            cfg['llm'] = llm
+            self._config.save_config(cfg)
+            return {'ok': True, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def llm_key_save(self, key):
+        """密钥进 keyring(经 ai_analysis.save_api_key),绝不落 config/yaml。"""
+        try:
+            k = (key or '').strip()
+            if not k:
+                return {'ok': False, 'error': 'API 密钥不能为空'}
+            self._ai().save_api_key(k)
+            return {'ok': True, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def llm_key_status(self):
+        """密钥是否已存(仅掩码状态,绝不回显)。"""
+        try:
+            return {'saved': self._ai().load_api_key() is not None}
+        except Exception:                                 # noqa: BLE001
+            return {'saved': False}
+
+    def llm_test(self, base_url='', model='', transport=None):
+        """测试连接:用当前(未保存的表单)端点/模型 + keyring 密钥发一个极小请求。"""
+        try:
+            res = self._ai().probe(base_url=(base_url or '').strip(),
+                                   model=(model or '').strip(), transport=transport)
+            return {'ok': bool(res.get('ok')), 'error': res.get('error')}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def prompt_get(self):
+        """取生效中的分析提示词预设(config llm.prompt_preset,缺 → 内置默认)。"""
+        try:
+            llm = dict(self._config.load_config().get('llm') or {})
+            preset = llm.get('prompt_preset')
+            is_default = not (isinstance(preset, str) and preset.strip())
+            return {'ok': True, 'error': None, 'is_default': is_default,
+                    'text': preset if not is_default else self._ai().DEFAULT_PROMPT_PRESET}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'text': '', 'error': str(e)}
+
+    def prompt_save(self, text):
+        """保存自定义分析提示词到 config.llm.prompt_preset。"""
+        try:
+            if not (text or '').strip():
+                return {'ok': False, 'error': '提示词不能为空'}
+            cfg = self._config.load_config()
+            llm = dict(cfg.get('llm') or {})
+            llm['prompt_preset'] = text
+            cfg['llm'] = llm
+            self._config.save_config(cfg)
+            return {'ok': True, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def prompt_reset(self):
+        """恢复默认:删除 config.llm.prompt_preset,返回内置默认文本。"""
+        try:
+            cfg = self._config.load_config()
+            llm = dict(cfg.get('llm') or {})
+            llm.pop('prompt_preset', None)
+            cfg['llm'] = llm
+            self._config.save_config(cfg)
+            return {'ok': True, 'error': None, 'text': self._ai().DEFAULT_PROMPT_PRESET}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def paths_save(self, potcar_lib_root='', lis_molecules_dir='',
+                   ideal_window_lo=None, ideal_window_hi=None):
+        """保存数据路径(赝势库 / Li-S 分子库 / 理想窗口)到 config 对应键。"""
+        try:
+            iw = self._parse_ideal_window(ideal_window_lo, ideal_window_hi)
+            cfg = self._config.load_config()
+            cfg['potcar_lib_root'] = (potcar_lib_root or '').strip()
+            cfg['lis_molecules_dir'] = (lis_molecules_dir or '').strip()
+            if iw is None:
+                cfg.pop('ideal_window', None)
+            else:
+                cfg['ideal_window'] = iw
+            self._config.save_config(cfg)
+            return {'ok': True, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def theme_set(self, name):
+        """三选主题即时生效(写 config ui.theme;非法值回落 classic)。"""
+        try:
+            n = str(name or '').strip().lower()
+            if n not in _THEMES:
+                n = 'classic'
+            self._config.set_ui_state(theme=n)
+            return {'ok': True, 'theme': n, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def autopilot_save(self, autopilot=None, poll_interval=None,
+                       autopilot_continue=None, autopilot_fetch=None,
+                       autopilot_report=None):
+        """保存自动驾驶开关/间隔/子开关到 config ui.*(None 的字段不改)。"""
+        try:
+            kv = {}
+            if autopilot is not None:
+                kv['autopilot'] = bool(autopilot)
+            if poll_interval is not None:
+                pi = int(poll_interval)
+                kv['poll_interval'] = pi if pi in (5, 10, 15) else 10
+            if autopilot_continue is not None:
+                kv['autopilot_continue'] = bool(autopilot_continue)
+            if autopilot_fetch is not None:
+                kv['autopilot_fetch'] = bool(autopilot_fetch)
+            if autopilot_report is not None:
+                kv['autopilot_report'] = bool(autopilot_report)
+            self._config.set_ui_state(**kv)
+            return {'ok': True, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    # ── 自动驾驶管线 ─────────────────────────────────────────────────────────────
+    def _autopilot_cfg(self):
+        try:
+            ui = self._config.get_ui_state()
+        except Exception:                                 # noqa: BLE001
+            ui = {}
+        d = self._ui_defaults(ui if isinstance(ui, dict) else {})
+        return {'enabled': d['autopilot'], 'interval': d['poll_interval'],
+                'cont': d['autopilot_continue'], 'fetch': d['autopilot_fetch'],
+                'report': d['autopilot_report']}
+
+    def _member_states(self, proj):
+        """项目成员目录 → [{'dir','state','restartable','rounds'}](经注入的 manifest 读)。"""
+        members = proj.get('members') or {}
+        dirs = []
+        if members.get('clean_slab'):
+            dirs.append(members['clean_slab'])
+        if members.get('gas_ref'):
+            dirs.append(members['gas_ref'])
+        dirs += [d for d in (members.get('configs') or []) if d]
+        out = []
+        for d in dirs:
+            m = self._manifest.load_manifest(d)
+            if m is None:
+                out.append({'dir': d, 'state': None, 'restartable': False, 'rounds': 0})
+                continue
+            res = m.get('results') or {}
+            dgn = res.get('diagnosis') or {}
+            out.append({'dir': d, 'state': m.get('state'),
+                        'restartable': bool(dgn.get('restartable')),
+                        'rounds': int(res.get('continue_rounds', 0) or 0)})
+        return out
+
+    def _project_stage(self, states, has_marker):
+        """成员状态 + 报告标记 → (stage, needs_human, recover_round)。规则见 pipeline_status。"""
+        all_states = [s['state'] for s in states]
+        needs_human = (any(s == 'NEEDS_HUMAN' for s in all_states)
+                       or any(s['state'] in _TERMINAL_FAIL and not s['restartable']
+                              for s in states))
+        recover_round = max([s['rounds'] for s in states
+                             if s['restartable'] and s['state'] in _TERMINAL_FAIL] or [0])
+        if not states:
+            stage = 'generate'
+        elif any(s == 'CREATED' for s in all_states):
+            stage = 'submit'
+        elif any(s in _ACTIVE_STATES for s in all_states):
+            stage = 'monitor'
+        elif any(s['restartable'] and s['state'] in _TERMINAL_FAIL for s in states):
+            stage = 'recover'
+        elif all_states and all(s == 'DONE' for s in all_states):
+            stage = 'report_done' if has_marker else 'analysis'
+        elif any(s in _TERMINAL_FAIL for s in all_states):
+            stage = 'recover'                             # 有终态失败但不可续算 → 卡恢复待人工
+        else:
+            stage = 'generate'
+        return stage, needs_human, recover_round
+
+    def pipeline_status(self):
+        """每项目管线阶段:生成→提交→监控→恢复(n/3)→分析→报告完成;NEEDS_HUMAN 红旗。"""
+        try:
+            projs = []
+            for pp in self._adsorption.list_projects():
+                try:
+                    proj = self._adsorption.load_project(pp)
+                    if proj is None:
+                        continue
+                    states = self._member_states(proj)
+                    has_marker = bool(proj.get('autopilot_report_done'))
+                    stage, needs_human, rr = self._project_stage(states, has_marker)
+                    projs.append({
+                        'path': pp, 'name': proj.get('name', '') or '',
+                        'stage': stage, 'stage_index': _STAGES.index(stage),
+                        'stages': list(_STAGES), 'needs_human': needs_human,
+                        'recover_round': rr,
+                        'done': sum(1 for s in states if s['state'] == 'DONE'),
+                        'total': len(states),
+                    })
+                except Exception:                         # noqa: BLE001 单个坏项目跳过
+                    continue
+            return {'ok': True, 'projects': projs, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'projects': [], 'error': str(e)}
+
+    @staticmethod
+    def _base(d):
+        return os.path.basename(os.path.normpath(str(d)))
+
+    def _tick_cluster(self, name, prof, pw, ap, events, errors):
+        """单集群一轮:刷新在队作业(+ 可选续算 restartable / 拉回新 DONE)。成功返回 True。"""
+        entries = list(self._ledger.load_all())
+        before_done = {d for d, m in entries
+                       if m and m.get('cluster') == name and m.get('state') == 'DONE'}
+        targets = [d for d, m in entries
+                   if m and m.get('scheduler_job_id') and m.get('cluster') == name
+                   and m.get('state') in ('SUBMITTED', 'QUEUED', 'RUNNING')]
+        if targets:
+            res = self._bo().refresh_batch(prof, pw, targets, False)
+            if res.get('needs_trust'):
+                events.append({'kind': 'skip',
+                               'text': f'集群「{name}」主机指纹未信任,跳过本轮'})
+                return False
+            for d, note in (res.get('results') or []):
+                events.append({'kind': 'refresh', 'text': f'{self._base(d)}:{note}'})
+        entries2 = list(self._ledger.load_all())
+        # 续算:刷新后 restartable 终态且 attempts<3 → 自动续算(复用 filter_continuable)
+        if ap['cont']:
+            try:
+                cdirs = [d for d, m in entries2 if m and m.get('cluster') == name]
+                eligible, _sk = self._bo().filter_continuable(cdirs)
+                if eligible:
+                    cres = self._bo().continue_batch(prof, pw, eligible, False)
+                    for d, ok, msg in (cres.get('results') or []):
+                        events.append({'kind': 'continue', 'text': f'{self._base(d)}:{msg}'})
+            except Exception as e:                        # noqa: BLE001 续算失败仅记 event 不中断
+                events.append({'kind': 'continue', 'text': f'集群「{name}」续算跳过:{e}'})
+        # 拉回:本轮新变 DONE 的作业(after − before)→ 轻量拉回
+        if ap['fetch']:
+            try:
+                after_done = {d for d, m in entries2
+                              if m and m.get('cluster') == name and m.get('state') == 'DONE'}
+                newly = list(after_done - before_done)
+                if newly:
+                    fres = self._bo().fetch_batch(prof, pw, newly, False)
+                    for d, ok, msg in (fres.get('results') or []):
+                        events.append({'kind': 'fetch', 'text': f'{self._base(d)}:{msg}'})
+            except Exception as e:                        # noqa: BLE001 拉回失败仅记 event 不中断
+                events.append({'kind': 'fetch', 'text': f'集群「{name}」拉回跳过:{e}'})
+        return True
+
+    def _project_all_done(self, states):
+        return bool(states) and all(s['state'] == 'DONE' for s in states)
+
+    def _tick_reports(self, events, errors):
+        """遍历项目:全员 DONE 且无报告标记 → 自动出图 + 报告 → 写标记 → report_done 事件。"""
+        for pp in self._adsorption.list_projects():
+            try:
+                proj = self._adsorption.load_project(pp)
+                if proj is None or proj.get('autopilot_report_done'):
+                    continue
+                states = self._member_states(proj)
+                if not self._project_all_done(states):
+                    continue
+                name = proj.get('name', '') or self._base(os.path.dirname(str(pp)))
+                root = proj.get('root') or os.path.dirname(str(pp))
+                report_dir = os.path.join(root, 'report')
+                os.makedirs(report_dir, exist_ok=True)
+                fig = self.proj_figures(pp, ['bar', 'table', 'ladder'], report_dir)
+                rep = self.proj_report(pp, os.path.join(report_dir, f'{name}_report.html'))
+                if not rep.get('ok'):
+                    errors.append(f'项目「{name}」自动报告失败:{rep.get("error")}')
+                    continue
+                # 安全的 yaml 读改写:原地打标记 + 落盘(落盘失败仅记 error,下拍再试)
+                proj['autopilot_report_done'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+                try:
+                    self._adsorption.save_project(root, proj)
+                except Exception as e:                    # noqa: BLE001
+                    errors.append(f'项目「{name}」报告标记落盘失败:{e}')
+                events.append({'kind': 'report_done', 'project': name,
+                               'report': rep.get('file'), 'figures_dir': fig.get('out_dir'),
+                               'text': f'项目「{name}」报告已自动生成'})
+            except Exception as e:                        # noqa: BLE001 单项目失败不拖垮其他
+                errors.append(f'项目报告自动化异常:{e}')
+
+    def pipeline_tick(self):
+        """服务端一拍编排(幂等,全部复用现有方法):逐集群刷新/续算/拉回 + 自动报告。
+
+        返回 {'ok','events':[{kind,text,...}],'errors':[...],'last_sync','synced'}。
+        无凭据的 profile 记 skip event;各阶段失败只记 event/error,绝不抛到 JS。
+        """
+        events, errors, synced = [], [], 0
+        ap = self._autopilot_cfg()
+        try:
+            profiles = self._profiles.load_profiles()
+        except Exception as e:                            # noqa: BLE001
+            profiles = {}
+            errors.append(f'读取集群配置失败:{e}')
+        for name, prof in profiles.items():
+            try:
+                if getattr(prof, 'auth', 'key') == 'password':
+                    pw = self._secrets.get_password(name)
+                    if not pw:
+                        events.append({'kind': 'skip',
+                                       'text': f'集群「{name}」无保存凭据,跳过本轮同步'})
+                        continue
+                else:
+                    pw = None
+                if self._tick_cluster(name, prof, pw, ap, events, errors):
+                    synced += 1
+            except Exception as e:                        # noqa: BLE001 单集群失败不拖垮其他
+                errors.append(f'集群「{name}」同步失败:{e}')
+        if ap['report']:
+            try:
+                self._tick_reports(events, errors)
+            except Exception as e:                        # noqa: BLE001
+                errors.append(f'报告自动化失败:{e}')
+        return {'ok': True, 'events': events, 'errors': errors, 'synced': synced,
+                'last_sync': time.strftime('%Y-%m-%d %H:%M:%S')}

@@ -68,6 +68,8 @@
       VCS.log('已生成:' + r.job_dir, 'okc');
       (r.warnings || []).forEach(w => VCS.log(w));
       VCS.log('作业已入台账,去任务页提交', 'okc');
+      VCS.call('open_dir', r.job_dir);          // 输出反馈统一:打开四件套所在目录
+      VCS.toast('已生成四件套');
       // 同步任务页台账(若已加载)
       if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
     } finally {

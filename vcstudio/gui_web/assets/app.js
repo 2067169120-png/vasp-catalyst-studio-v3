@@ -195,15 +195,211 @@ document.addEventListener('click', e => {
   document.dispatchEvent(new CustomEvent('vcs:page', { detail: { page: a.dataset.page } }));
 });
 
-// ── 桥就绪后确认 ping,更新连接态读数 ──
+// ── 主题:三选可切换(经典深邃 / 学术浅色 / 深空监控) ──
+// 启动时 <head> 内联脚本已按 localStorage 先粉刷防闪烁;此处提供切换 + 校准入口。
+const THEMES = ['classic', 'paper', 'deep'];
+VCS.themeApply = function (name) {
+  const t = THEMES.indexOf(name) >= 0 ? name : 'classic';
+  document.documentElement.dataset.theme = t;
+  try { localStorage.setItem('vcs.theme', t); } catch (_) { /* 隐私模式忽略 */ }
+  return t;
+};
+
+// ── 侧栏底部:动态显示当前默认集群(取 profiles 首个;无则"未配置集群") ──
+VCS.refreshNavFoot = async function () {
+  const foot = document.getElementById('nav-foot');
+  if (!foot) return;
+  try {
+    const r = await VCS.call('list_profiles');
+    const profs = (r && r.profiles) || [];
+    if (!profs.length) { foot.textContent = '未配置集群'; return; }
+    const p = profs[0];
+    const sched = p.scheduler ? ' · ' + p.scheduler : '';
+    foot.innerHTML = `${VCS.esc((p.username ? p.username + '@' : '') + (p.name || ''))}` +
+      `<br>${VCS.esc((p.hostname || '') + sched)}`;
+  } catch (_) { foot.textContent = '未配置集群'; }
+};
+
+// ── 化学元素徽章:从体系名提取首个金属符号 → CPK 风格色块 + 白字(色盲安全靠文字) ──
+const EL_CPK = {
+  Co: '#D45A7C', Fe: '#C85A22', Ni: '#2E7C39', Mo: '#2E8C8C', W: '#2A6BA6',
+  Ti: '#6A7480', V: '#586A88', Mn: '#8C5AB4', Cu: '#B06A2C', Zn: '#5E7396',
+  Pt: '#6E7B99', Pd: '#3B7C86', Ru: '#2E8F7E', Ir: '#4A6FA5', Ag: '#6E7C8C', Au: '#9C7A1E',
+};
+VCS.elementBadge = function (systemName) {
+  const s = String(systemName || '');
+  const re = /[A-Z][a-z]?/g;
+  let m;
+  while ((m = re.exec(s))) {
+    const sym = m[0];
+    if (EL_CPK[sym]) {
+      return `<span class="elbadge" style="--el:${EL_CPK[sym]}" title="金属位:${sym}">${sym}</span>`;
+    }
+  }
+  return '';   // 识别不出不加(不猜)
+};
+
+// ── 全局自动驾驶编排器:按间隔调 pipeline_tick,渲染事件 + 健康读数 + 断线横幅 ──
+VCS.pipeline = {
+  timer: null, running: false, failStreak: 0, lastSuccess: null,
+  events: [],   // 最近 20 条(新在前),前端到达时间戳
+};
+
+function hhmm(ts) {
+  const s = String(ts || '');
+  const m = s.match(/(\d{2}):(\d{2})/);
+  if (m) return m[1] + ':' + m[2];
+  const d = new Date();
+  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+}
+
+function renderHealth() {
+  const el = document.getElementById('conn');
+  if (!el) return;
+  const p = VCS.pipeline;
+  if (p.failStreak >= 1) {
+    el.className = 'warn';
+    el.innerHTML = `<span class="dot g"></span>同步失败×${p.failStreak}` +
+      `<span class="bridge">界面桥 ✓</span>`;
+  } else if (p.lastSuccess) {
+    el.className = '';
+    el.innerHTML = `<span class="dot g"></span>同步 ${hhmm(p.lastSuccess)} ✓` +
+      `<span class="bridge">界面桥 ✓</span>`;
+  } else {
+    el.className = '';
+    el.innerHTML = `<span class="dot g"></span><span class="bridge">界面桥 ✓</span>`;
+  }
+}
+
+function renderConnBanner() {
+  const b = document.getElementById('conn-banner');
+  if (!b) return;
+  const p = VCS.pipeline;
+  if (p.failStreak >= 2) {
+    b.classList.add('show');
+    b.innerHTML = `⚠ 集群连接可能已断:最近 <b>${p.failStreak}</b> 次同步失败` +
+      `(上次成功 ${p.lastSuccess ? hhmm(p.lastSuccess) : '—'}),数据可能过期`;
+  } else {
+    b.classList.remove('show');
+  }
+  // 任务表数据过期视觉(降饱和 + 角标);表重渲后由下一拍再置
+  document.querySelectorAll('#jobs-card tr[data-dir]').forEach(
+    tr => tr.classList.toggle('stale', p.failStreak >= 2));
+}
+
+function renderFeed() {
+  const box = document.getElementById('db-feed');
+  if (!box) return;
+  const evs = VCS.pipeline.events;
+  if (!evs.length) {
+    box.innerHTML = '<div class="db-empty">自动驾驶开启后,这里显示每轮同步/续算/拉回/报告事件</div>';
+    return;
+  }
+  const KL = { refresh: '同步', continue: '续算', fetch: '拉回', report_done: '报告',
+    skip: '跳过', error: '错误' };
+  box.innerHTML = evs.map(e => {
+    const kcls = e.kind === 'report_done' ? 'report'
+      : (e.kind === 'error' ? 'err' : (e.kind === 'skip' ? 'skip' : ''));
+    const label = KL[e.kind] || e.kind;
+    const btn = (e.kind === 'report_done' && (e.report || e.figures_dir))
+      ? `<button class="btn quiet fbtn" data-open="${VCS.esc(e.report || e.figures_dir)}">打开</button>` : '';
+    return `<div class="feed-row"><span class="fk ${kcls}">${VCS.esc(label)}</span>` +
+      `<span class="ftxt" title="${VCS.esc(e.text || '')}">${VCS.esc(e.text || '')}</span>` +
+      `<span class="ft">${VCS.esc(e.time || '')}</span>${btn}</div>`;
+  }).join('');
+}
+
+function reportToast(ev) {
+  const t = document.createElement('div');
+  t.className = 'toast ok';
+  t.textContent = '报告已自动生成:' + (ev.project || '');
+  const b = document.createElement('button');
+  b.className = 'btn quiet';
+  b.style.marginLeft = '12px';
+  b.textContent = '打开';
+  b.addEventListener('click', () => {
+    VCS.call('open_dir', ev.report || ev.figures_dir);
+    if (t.parentNode) t.parentNode.removeChild(t);
+  });
+  t.appendChild(b);
+  document.body.appendChild(t);
+  setTimeout(() => { if (t.parentNode) t.parentNode.removeChild(t); }, 8000);
+}
+
+function onPipelineOutcome(out) {
+  const p = VCS.pipeline;
+  const now = hhmm(out.last_sync);
+  const clusterFail = (out.errors || []).some(e => String(e).includes('同步失败'));
+  if ((out.synced || 0) > 0) { p.failStreak = 0; p.lastSuccess = out.last_sync; }
+  else if (clusterFail) { p.failStreak++; }
+  // 事件累积(新在前,最多 20 条);report_done 醒目 toast,其余汇总 toast(避免刷屏)
+  let other = 0;
+  (out.events || []).forEach(e => {
+    p.events.unshift(Object.assign({ time: now }, e));
+    if (e.kind === 'report_done') reportToast(Object.assign({ time: now }, e));
+    else if (e.kind !== 'skip') other++;
+  });
+  // 错误也进 feed(不用 VCS.log:避免给无日志区的页面凭空插入日志框)
+  (out.errors || []).forEach(err => p.events.unshift({ kind: 'error', text: err, time: now }));
+  p.events = p.events.slice(0, 20);
+  if (other) VCS.toast('自动驾驶:本轮 ' + other + ' 条动态', '');
+  if ((out.errors || []).length) VCS.toast('自动驾驶遇到 ' + out.errors.length + ' 个问题(见管线动态)', 'fail');
+  renderHealth();
+  renderConnBanner();
+  renderFeed();
+}
+
+async function pipelineTick() {
+  const p = VCS.pipeline;
+  if (p.running) return;
+  p.running = true;
+  try {
+    const out = await VCS.call('pipeline_tick');
+    if (!out || out.error) {
+      p.failStreak++;
+      renderHealth(); renderConnBanner();
+      return;
+    }
+    onPipelineOutcome(out);
+  } finally {
+    p.running = false;
+  }
+}
+VCS.pipeline.tick = pipelineTick;
+VCS.pipeline.renderFeed = renderFeed;
+
+// 从 config 校准主题 + 按开关/间隔(重新)装载定时器;设置页保存后可再调本函数
+VCS.pipeline.reconfigure = async function () {
+  const s = await VCS.call('settings_get');
+  const ui = (s && s.ui) || {};
+  if (ui.theme) VCS.themeApply(ui.theme);
+  const enabled = ui.autopilot !== false;             // 默认开
+  const interval = (Number(ui.poll_interval) || 10) * 60000;
+  if (VCS.pipeline.timer) { clearInterval(VCS.pipeline.timer); VCS.pipeline.timer = null; }
+  if (enabled) {
+    VCS.pipeline.timer = setInterval(pipelineTick, interval);
+    setTimeout(pipelineTick, 3500);                   // 启动后先跑一拍,让用户见到动态
+  }
+};
+
+// feed 内「打开」按钮委托 + 切回仪表盘时重渲 feed
+document.addEventListener('click', e => {
+  const b = e.target.closest && e.target.closest('#db-feed [data-open]');
+  if (b) { e.preventDefault(); VCS.call('open_dir', b.dataset.open); }
+});
+document.addEventListener('vcs:page', e => {
+  if (e.detail && e.detail.page === 'dashboard') renderFeed();
+});
+
+// ── 桥就绪:界面桥读数(小字,避免误读为集群已连)+ 启动自动驾驶编排器 ──
 VCS.ready.then(async () => {
   try {
-    const pong = await window.pywebview.api.ping();
+    await window.pywebview.api.ping();     // 确认桥活性(失败则走 catch)
+    renderHealth();                        // 初始:仅"界面桥 ✓"
+    VCS.refreshNavFoot();
+    VCS.pipeline.reconfigure();
+  } catch (_) {
     const el = document.getElementById('conn');
-    if (el) {
-      el.innerHTML = pong === 'pong'
-        ? '<span class="dot g"></span>本地桥就绪'
-        : '<span class="dot g"></span>桥响应异常';
-    }
-  } catch (_) { /* 桥探测失败不阻塞 UI */ }
+    if (el) el.innerHTML = '<span class="dot g"></span><span class="bridge">界面桥 响应异常</span>';
+  }
 });

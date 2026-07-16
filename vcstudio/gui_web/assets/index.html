@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>VASP Catalyst Studio</title>
 <link rel="stylesheet" href="app.css">
+<script>/* 主题先粉刷防闪烁:CSS 生效前按上次选择置 data-theme,app.js 再从 config 校准 */
+try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.dataset.theme=_t;}catch(e){}</script>
 <style>
 /* 生成页(P1b Task 2):表单行与集群页观感一致;app.css 不改,样式随页内联 */
 #page-generate .gen-h{font-weight:700;font-size:13px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--rule)}
@@ -31,7 +33,7 @@
   border:1px solid var(--rule);border-radius:6px;padding:8px 10px;background:var(--surface)}
 #page-project .pj-figprojs label{display:flex;gap:5px;align-items:center;cursor:pointer;user-select:none;color:var(--ink)}
 /* 任务页:吸附能项目组折叠(组头行 + 细进度条 + 成员角色标签);样式随页内联 */
-#page-jobs tr.grp-head td{background:#F4F6F8;border-bottom:1px solid var(--rule-strong);cursor:pointer;padding:6px 10px;user-select:none}
+#page-jobs tr.grp-head td{background:var(--th-bg);border-bottom:1px solid var(--rule-strong);cursor:pointer;padding:6px 10px;user-select:none}
 #page-jobs tr.grp-head:hover td{background:var(--accent-soft)}
 #page-jobs tr.grp-head .caret{display:inline-block;width:14px;color:var(--muted);font-size:10px}
 #page-jobs tr.grp-head .grp-name{font-size:12.5px}
@@ -70,7 +72,19 @@
 </head>
 <body>
 <nav>
-  <div class="brand"><b>VASP Catalyst Studio</b><span>v2 · Li–S 催化剂</span></div>
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+      <polygon points="16,4 26.4,10 26.4,22 16,28 5.6,22 5.6,10" stroke="currentColor" stroke-width="1.4" opacity=".85"/>
+      <line x1="16" y1="16" x2="16" y2="4" stroke="currentColor" stroke-width="1.1" opacity=".7"/>
+      <line x1="16" y1="16" x2="26.4" y2="22" stroke="currentColor" stroke-width="1.1" opacity=".7"/>
+      <line x1="16" y1="16" x2="5.6" y2="22" stroke="currentColor" stroke-width="1.1" opacity=".7"/>
+      <circle cx="16" cy="4" r="1.8" fill="currentColor" opacity=".6"/>
+      <circle cx="26.4" cy="22" r="1.8" fill="currentColor" opacity=".6"/>
+      <circle cx="5.6" cy="22" r="1.8" fill="currentColor" opacity=".6"/>
+      <circle cx="16" cy="16" r="3.2" fill="currentColor"/>
+    </svg>
+    <div class="brandtxt"><b>VASP Catalyst Studio</b><span>v2 · Li–S 催化剂</span></div>
+  </div>
   <div class="grp">工作流</div>
   <a href="#" data-page="dashboard" class="on"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>仪表盘</a>
   <a href="#" data-page="generate"><svg viewBox="0 0 24 24"><path d="M12 3v18M3 12h18"/><circle cx="12" cy="12" r="9"/></svg>生成输入</a>
@@ -78,22 +92,34 @@
   <a href="#" data-page="jobs"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>任务</a>
   <div class="grp">环境</div>
   <a href="#" data-page="cluster"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="1"/><rect x="3" y="13" width="18" height="7" rx="1"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>集群</a>
-  <div class="foot">Maple123@1w<br>PBS · torque-6.1.2</div>
+  <a href="#" data-page="settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M18.4 5.6L17 7M7 17l-1.4 1.4"/></svg>设置</a>
+  <div class="foot" id="nav-foot">未配置集群</div>
 </nav>
 <main>
   <header>
     <span id="conn"><span class="dot g"></span>桥就绪检测中…</span>
     <span class="sp"></span>
   </header>
+  <div class="conn-banner" id="conn-banner"></div>
 
   <section class="page" data-page="dashboard" id="page-dashboard">
     <div class="pagebar">
+      <div class="lattice-wm"></div>
       <h1>仪表盘</h1>
       <span class="stats" id="db-stats">加载中…</span>
     </div>
 
+    <!-- 取数失败错误条(不再假装 0 作业) -->
+    <div class="errbar" id="db-error" hidden></div>
+
     <!-- 卡片 1:作业状态汇总(大数字,点击跳任务页) -->
     <div class="db-nums" id="db-nums"></div>
+
+    <!-- 卡片:项目管线(每项目一行站点进度) -->
+    <div class="card" id="db-pipeline-card" style="padding:16px;margin-bottom:14px">
+      <div class="db-h">项目管线 <span class="sub" style="font-weight:400">生成 → 提交 → 监控 → 恢复 → 分析 → 报告</span></div>
+      <div id="db-pipeline"><div class="pl-empty">加载中…</div></div>
+    </div>
 
     <div class="db-grid">
       <!-- 卡片 2:最近活动 -->
@@ -119,6 +145,12 @@
           <div id="db-todo"><div class="db-empty">加载中…</div></div>
         </div>
       </div>
+    </div>
+
+    <!-- 卡片:管线动态 feed(自动驾驶事件,最近 20 条) -->
+    <div class="card" style="padding:16px;margin-top:14px">
+      <div class="db-h">管线动态 <span class="sub" style="font-weight:400">自动驾驶最近事件</span></div>
+      <div id="db-feed" class="feed"><div class="db-empty">自动驾驶开启后,这里显示每轮同步/续算/拉回/报告事件</div></div>
     </div>
   </section>
 
@@ -310,11 +342,11 @@
         <input type="checkbox" id="jb-auto"> 自动刷新
         <select id="jb-interval" class="ipt" style="width:auto;display:inline-block;padding:3px 6px">
           <option value="5">5 分钟</option>
-          <option value="15" selected>15 分钟</option>
-          <option value="30">30 分钟</option>
+          <option value="10" selected>10 分钟</option>
+          <option value="15">15 分钟</option>
         </select>
       </label>
-      <button class="btn quiet" id="jb-report" disabled title="P1b 迁移:报告导出依赖项目页">导出报告</button>
+      <button class="btn quiet" id="jb-report" title="报告在项目页生成(点此跳转并选中该项目)">导出报告</button>
       <button class="btn quiet" id="jb-remove">移出台账</button>
       <button class="btn quiet" id="jb-clean">清理失效条目</button>
     </div>
@@ -360,7 +392,7 @@
       <div class="cl-h">跳板机(可选)</div>
       <label class="rad" style="margin-bottom:12px"><input type="checkbox" id="cl-usejump"> 经跳板机连接</label>
       <div class="row">
-        <label class="fld" style="flex:2 1 220px">跳板主机<input id="cl-jumphost" class="ipt" autocomplete="off" placeholder="58.198.180.52"></label>
+        <label class="fld" style="flex:2 1 220px">跳板主机<input id="cl-jumphost" class="ipt" autocomplete="off" placeholder="jump.example.edu"></label>
         <label class="fld" style="flex:1 1 140px">跳板用户<input id="cl-jumpuser" class="ipt" autocomplete="off"></label>
         <label class="fld" style="flex:0 0 100px">跳板端口<input id="cl-jumpport" class="ipt" inputmode="numeric" placeholder="22"></label>
       </div>
@@ -418,6 +450,135 @@
 
     <div class="log" id="cluster-log" data-anchor><div class="head">连接日志</div></div>
   </section>
+
+  <section class="page" data-page="settings" id="page-settings" hidden>
+    <div class="pagebar">
+      <h1>设置</h1>
+      <span class="stats">LLM 智能分析 · 报告提示词 · 数据路径 · 外观与自动化</span>
+    </div>
+
+    <!-- 卡片 1:LLM 智能分析 -->
+    <div class="card" style="padding:16px;margin-bottom:14px">
+      <div class="set-h">LLM 智能分析</div>
+      <div class="set-sub">用于报告的 AI 解读。密钥只存入系统凭据库,绝不写入配置文件;项目数据默认不外发,需显式勾选下方开关。</div>
+
+      <div class="set-fld">
+        <span class="set-lbl">提供商预设(选中自动填端点与模型,可再改)</span>
+        <select id="set-llm-provider" class="ipt">
+          <option value="openai">OpenAI</option>
+          <option value="deepseek">DeepSeek</option>
+          <option value="glm">智谱 GLM</option>
+          <option value="kimi">Kimi(Moonshot)</option>
+          <option value="custom">自定义</option>
+        </select>
+      </div>
+      <div class="set-fld">
+        <span class="set-lbl">API 端点 base_url</span>
+        <input id="set-llm-baseurl" class="ipt" autocomplete="off" placeholder="https://api.deepseek.com/v1/chat/completions">
+      </div>
+      <div class="set-fld">
+        <span class="set-lbl">模型 model</span>
+        <input id="set-llm-model" class="ipt" autocomplete="off" placeholder="deepseek-chat">
+      </div>
+      <div class="set-fld">
+        <span class="set-lbl">API 密钥(仅存系统凭据库,绝不回显已存密钥)</span>
+        <div class="set-inrow">
+          <input id="set-llm-key" class="ipt" type="password" autocomplete="off" placeholder="粘贴密钥后点「保存密钥」">
+          <span class="keystate unset" id="set-llm-keystate">未设置</span>
+        </div>
+      </div>
+      <label class="set-check"><input type="checkbox" id="set-llm-external"> 允许将项目数据发送到外部 LLM(默认关闭)</label>
+      <div class="actions" style="margin-top:14px">
+        <button class="btn primary" id="set-llm-save">保存</button>
+        <button class="btn" id="set-llm-keysave">保存密钥</button>
+        <button class="btn" id="set-llm-test">测试连接</button>
+      </div>
+    </div>
+
+    <!-- 卡片 2:报告分析提示词 -->
+    <div class="card" style="padding:16px;margin-bottom:14px">
+      <div class="set-h">报告分析提示词</div>
+      <div class="set-sub">发刊级默认已内置(①数据可靠性核查 ②关键发现(锚定数值) ③机理讨论(仅基于给定数据,禁止编造) ④局限与下一步 + 双语小结)。可自定义"分析要求"段;数据注入与 JSON 输出契约、反编造规则固定不受影响。</div>
+      <textarea id="set-prompt" class="ipt" rows="12" spellcheck="false" placeholder="加载中…"></textarea>
+      <div class="actions" style="margin-top:12px">
+        <button class="btn primary" id="set-prompt-save">保存</button>
+        <button class="btn" id="set-prompt-reset">恢复默认</button>
+      </div>
+    </div>
+
+    <!-- 卡片 3:数据路径 -->
+    <div class="card" style="padding:16px;margin-bottom:14px">
+      <div class="set-h">数据路径</div>
+      <div class="set-sub">赝势库用于拼 POTCAR / 补 ENCUT;Li-S 分子库用于台阶图 / 火山图的 ΔG 计算(此前无处配置)。</div>
+      <div class="set-fld">
+        <span class="set-lbl">赝势库根目录 potcar_lib_root</span>
+        <div class="set-inrow">
+          <input id="set-potcar" class="ipt" autocomplete="off" placeholder="PAW_PBE 赝势库根目录">
+          <button class="btn" id="set-potcar-btn">浏览</button>
+        </div>
+      </div>
+      <div class="set-fld">
+        <span class="set-lbl">Li-S 分子库目录 lis_molecules_dir</span>
+        <div class="set-inrow">
+          <input id="set-molecules" class="ipt" autocomplete="off" placeholder="含 Li2S / Li2S2 … 分子能量的目录">
+          <button class="btn" id="set-molecules-btn">浏览</button>
+        </div>
+      </div>
+      <div class="set-fld">
+        <span class="set-lbl">理想窗口 ideal_window(下限 / 上限,eV,可留空)</span>
+        <div class="set-inrow">
+          <input id="set-idw-lo" class="ipt" inputmode="decimal" autocomplete="off" placeholder="下限,如 -1.5">
+          <input id="set-idw-hi" class="ipt" inputmode="decimal" autocomplete="off" placeholder="上限,如 0.5">
+        </div>
+      </div>
+      <div class="actions" style="margin-top:12px">
+        <button class="btn primary" id="set-paths-save">保存</button>
+      </div>
+    </div>
+
+    <!-- 卡片 4:外观与自动化 -->
+    <div class="card" style="padding:16px;margin-bottom:14px">
+      <div class="set-h">外观与自动化</div>
+      <div class="set-sub">主题即时生效并记忆;自动驾驶按间隔自动同步作业状态、续算、拉回结果、出图出报告。</div>
+
+      <div class="set-lbl" style="margin-bottom:8px">主题(三选,即时生效)</div>
+      <div class="theme-row" id="set-theme-row">
+        <div class="theme-opt" data-theme="classic">
+          <div class="swatch"><i style="background:#1E2935"></i><i style="background:#4477AA"></i><i style="background:#EDF0F3"></i></div>
+          <div><b>经典深邃</b><br><span>默认深色仪表台</span></div>
+        </div>
+        <div class="theme-opt" data-theme="paper">
+          <div class="swatch"><i style="background:#F4F7F9"></i><i style="background:#0E7C74"></i><i style="background:#FFFFFF"></i></div>
+          <div><b>学术浅色</b><br><span>白底 · 孔雀蓝绿</span></div>
+        </div>
+        <div class="theme-opt" data-theme="deep">
+          <div class="swatch"><i style="background:#0A0F17"></i><i style="background:#37D7F2"></i><i style="background:#111B28"></i></div>
+          <div><b>深空监控</b><br><span>深底 · 等离子青</span></div>
+        </div>
+      </div>
+
+      <label class="set-check"><input type="checkbox" id="set-ap-on"> 启用自动驾驶(默认开)</label>
+      <div class="ap-row" style="margin-top:10px">
+        <label class="set-lbl" style="display:flex;align-items:center">轮询间隔
+          <select id="set-ap-interval" class="ipt" style="width:auto;display:inline-block;margin-left:6px">
+            <option value="5">5 分钟</option>
+            <option value="10" selected>10 分钟</option>
+            <option value="15">15 分钟</option>
+          </select>
+        </label>
+      </div>
+      <div class="ap-sub">
+        <label class="set-check"><input type="checkbox" id="set-ap-continue"> 自动续算(默认开)</label>
+        <label class="set-check"><input type="checkbox" id="set-ap-fetch"> 全 DONE 自动拉回(默认开)</label>
+        <label class="set-check"><input type="checkbox" id="set-ap-report"> 自动出图出报告(默认开)</label>
+      </div>
+      <div class="actions" style="margin-top:14px">
+        <button class="btn primary" id="set-ap-save">保存自动化设置</button>
+      </div>
+    </div>
+
+    <div class="log" id="settings-log" data-anchor><div class="head">设置日志</div></div>
+  </section>
 </main>
 <script src="vendor/echarts.min.js"></script>
 <script src="vendor/3Dmol-min.js"></script>
@@ -431,5 +592,6 @@
 <script src="generate.js"></script>
 <script src="project.js"></script>
 <script src="dashboard.js"></script>
+<script src="settings.js"></script>
 </body>
 </html>

@@ -63,10 +63,12 @@ def fetch_batch(prof, pw, dirs, trust_new, files=submitter.FETCH_FILES):
                     msg += f'(远端缺 {"、".join(missing)})'
                 if 'CONTCAR' in fetched:                 # 全自动渲结构图(缓存,失败跳过)
                     from vcstudio.external import povray_render
+                    figs_dir = os.path.join(d, 'figs')
                     rr = povray_render.render_poscar_views(
-                        os.path.join(d, 'CONTCAR'), os.path.join(d, 'figs'),
+                        os.path.join(d, 'CONTCAR'), figs_dir,
                         os.path.basename(os.path.normpath(d)))
-                    msg += ',结构图 ✓' if rr['ok'] else f",结构图跳过({rr['error'][:60]})"
+                    msg += (f',结构图 ✓ → {figs_dir}' if rr['ok']
+                            else f",结构图跳过({rr['error'][:60]})")
                 results.append((d, bool(fetched), msg))
             except _job_errors() as e:
                 results.append((d, False, str(e)))

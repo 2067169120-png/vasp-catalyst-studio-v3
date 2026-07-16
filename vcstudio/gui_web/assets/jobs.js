@@ -4,6 +4,8 @@
 'use strict';
 (function () {
   const PROFILE_KEY = 'vcs.jobs.profile';
+  const AUTO_KEY = 'vcs.jobs.auto';         // 自动刷新开关(持久化;默认开)
+  const INT_KEY = 'vcs.jobs.interval';      // 自动刷新间隔(分钟,持久化)
   const $ = sel => document.querySelector(sel);
 
   const State = {
@@ -78,7 +80,7 @@
     return `<tr data-dir="${VCS.esc(r.dir)}" data-name="${VCS.esc(r.name)}"` +
       (grpKey ? ` data-grp="${VCS.esc(grpKey)}"` : '') +
       (hidden ? ' hidden' : '') + `${sel}>` +
-      `<td><span class="name">${VCS.esc(r.name)}</span>` +
+      `<td>${VCS.elementBadge(r.name)}<span class="name">${VCS.esc(r.name)}</span>` +
       (role ? ` <span class="role-tag">${VCS.esc(role)}</span>` : '') +
       (task ? ` <span class="sub">${VCS.esc(task)}</span>` : '') +
       ` <button class="lnk conv" title="查看收敛过程(E0/ΔE/|F|max vs 离子步)">收敛</button>` +
@@ -197,6 +199,19 @@
     if (window.Project && typeof window.Project.selectByName === 'function') {
       window.Project.selectByName(name);
     }
+  }
+
+  // 「导出报告」:报告在项目页生成 —— 跳项目页 + toast + 选中选中作业所属项目
+  function doReport() {
+    const dirs = selectedDirs();
+    let projName = '';
+    if (dirs.length) {
+      const row = State.rows.find(r => r.dir === dirs[0]);
+      if (row && row.project) projName = row.project;
+    }
+    gotoProject(projName);
+    VCS.toast('报告在项目页生成');
+    VCS.log('报告在「吸附能项目」页生成' + (projName ? '(已为你选中项目「' + projName + '」)' : ''));
   }
 
   function renderStats() {
@@ -364,7 +379,12 @@
       if (!auto) VCS.log('查询作业状态…');
       const res = await remote(name, (pw, trust) => VCS.call('refresh_status', name, pw, trust));
       if (!res) return;
-      if (res.error) { VCS.log((auto ? '自动刷新' : '查询') + '异常:' + res.error, 'failc'); return; }
+      if (res.error) {
+        VCS.log((auto ? '自动刷新' : '查询') + '异常:' + res.error, 'failc');
+        // 自动刷新失败在别页也要可见(此前只写日志,用户看不到)
+        if (auto) VCS.toast('自动刷新失败:' + res.error, 'fail');
+        return;
+      }
       const results = res.results || [];
       if (!results.length) {
         if (!auto) VCS.log(`「${name}」没有待查询的作业(SUBMITTED/QUEUED/RUNNING)`);
@@ -579,7 +599,7 @@
     const body =
       `<div style="margin-bottom:10px"><div class="sub" style="margin-bottom:4px">远程目录(绝对路径,以 / 开头)</div>` +
       `<input id="ad-remote" class="ipt" value="${VCS.esc(j.workdir || '')}" ` +
-      `placeholder="${hasWd ? '/home/Maple123/...' : '查询中…'}"></div>` +
+      `placeholder="${hasWd ? '/home/<用户名>/runs' : '查询中…'}"></div>` +
       `<div><div class="sub" style="margin-bottom:4px">本地目录(结果将拉回到这里;不存在会新建)</div>` +
       `<input id="ad-local" class="ipt" value="${VCS.esc(localDefault)}" placeholder="例如 E:\\runs\\claimed_${VCS.esc(j.job_id)}"></div>`;
     const m = VCS.modal({
@@ -608,7 +628,7 @@
         .then(res => {
           if (!inp) return;
           if (res && res.workdir && !inp.value.trim()) inp.value = res.workdir;
-          inp.placeholder = '/home/Maple123/...';
+          inp.placeholder = '/home/<用户名>/runs';
         });
     }
   }
@@ -647,15 +667,17 @@
   // ── 自动刷新 ───────────────────────────────────────────────────────────────
   function autoTick() { runStatus(true); }
 
-  function applyAuto() {
+  // silent=true(启动装载时):只起停定时器,不写日志——启动时可见页是仪表盘,
+  // 此刻 VCS.log 会给无日志区的仪表盘凭空插一个日志框,故静默。
+  function applyAuto(silent) {
     const cb = $('#jb-auto');
     const sel = $('#jb-interval');
     if (State.autoTimer) { clearInterval(State.autoTimer); State.autoTimer = null; }
     if (cb && cb.checked) {
-      const mins = parseInt(sel.value, 10) || 15;
+      const mins = parseInt(sel.value, 10) || 10;
       State.autoTimer = setInterval(autoTick, mins * 60000);
-      VCS.log(`自动刷新开启(每 ${mins} 分钟)`);
-    } else {
+      if (!silent) VCS.log(`自动刷新开启(每 ${mins} 分钟)`);
+    } else if (!silent) {
       VCS.log('自动刷新已关闭');
     }
   }
@@ -670,12 +692,29 @@
     wire('jb-continue', doContinue);
     wire('jb-queue', doQueue);
     wire('jb-open', doOpen);
+    wire('jb-report', doReport);
     wire('jb-remove', doRemove);
     wire('jb-clean', doClean);
     const cb = $('#jb-auto');
     const iv = $('#jb-interval');
-    if (cb) cb.addEventListener('change', applyAuto);
-    if (iv) iv.addEventListener('change', () => { if (cb && cb.checked) applyAuto(); });
+    // 自动刷新默认开 + 状态持久化(localStorage);启动即按持久化状态装载定时器
+    if (iv) {
+      const savedInt = localStorage.getItem(INT_KEY);
+      if (savedInt) iv.value = savedInt;
+      iv.addEventListener('change', () => {
+        localStorage.setItem(INT_KEY, iv.value);
+        if (cb && cb.checked) applyAuto();
+      });
+    }
+    if (cb) {
+      const savedAuto = localStorage.getItem(AUTO_KEY);
+      cb.checked = savedAuto === null ? true : savedAuto === '1';   // 默认开
+      cb.addEventListener('change', () => {
+        localStorage.setItem(AUTO_KEY, cb.checked ? '1' : '0');
+        applyAuto();
+      });
+      applyAuto(true);                               // 启动静默装载定时器(不写日志)
+    }
     const psel = $('#jobs-profile');
     if (psel) psel.addEventListener('change', () =>
       localStorage.setItem(PROFILE_KEY, currentProfile()));

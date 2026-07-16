@@ -31,6 +31,25 @@ SYSTEM_PROMPT = (
     '"paragraph_en" (one polished manuscript-ready paragraph in English, 120-180 words), '
     '"caveats" (array of strings, honest limitations), "confidence" (high/medium/low).')
 
+# 发刊级默认"分析要求"段(可在设置页覆盖;设置页保存的预设经 config llm.prompt_preset
+# 生效)。只承载"分析要求",不含 payload 注入与 JSON 输出契约(那两段在 build_prompt 固定)。
+# 刻意不写死 d 带/轨道机理诱导语——是否放行由 build_prompt 按 payload 是否含电子结构数据门控。
+DEFAULT_PROMPT_PRESET = (
+    'Analysis requirements — organize the reasoning into FOUR explicit parts:\n'
+    '(1) Data-reliability check: before interpreting, flag any positive or anomalous E_ads, '
+    'incomplete/missing configurations, and inconsistencies in the reported computational '
+    'parameters; state whether the dataset is sufficient for the conclusions drawn.\n'
+    '(2) Key findings (anchor to numbers): describe the adsorption-strength trend across '
+    'configurations while CITING the specific ΔE values; name the strongest- and weakest-binding '
+    'sites, and — if a discharge_path is present — the potential-determining step and limiting '
+    'potential U_L.\n'
+    '(3) Mechanism discussion: explain the observed trend using ONLY the provided data; '
+    'do NOT fabricate literature values, citations, or parameters absent from the payload.\n'
+    '(4) Limitations & next steps: state honestly what the data cannot support (these are DFT '
+    'electronic energies without ZPE/entropy unless ΔG is given) and propose concrete, '
+    'prioritized follow-up calculations.\n'
+    'Deliver a concise bilingual summary: 中文 in "analysis_zh", polished English in "paragraph_en".')
+
 
 # 催化剂类型机理语境(移植原版 _CATALYST_CONTEXT 的类型化框架;只给机理概念,
 # 不带原版那些无来源的文献数值——守禁编造原则)。按 slab 元素组成启发式判型。
@@ -65,8 +84,14 @@ def catalyst_context(elements: list) -> str:
 
 def build_payload(*, project_name: str, delta_rows: list, incar_summary: dict,
                   kpoints=None, path_result: dict | None = None,
-                  slab_elements: list | None = None) -> dict:
-    """项目结果 → 喂给 LLM 的结构化数据(数值为数字;真实计算参数;含失败统计)。"""
+                  slab_elements: list | None = None,
+                  dos: dict | None = None, bader: dict | None = None) -> dict:
+    """项目结果 → 喂给 LLM 的结构化数据(数值为数字;真实计算参数;含失败统计)。
+
+    电子结构数据(dos/bader)仅在显式提供时注入;且**只有**含电子结构数据时才注入
+    catalyst_context(d 带/轨道机理语境)——否则 build_prompt 会明示"仅基于能量数据,
+    不要推断电子结构机理",防止无 DOS/Bader 依据的机理编造。
+    """
     ok_rows = [r for r in delta_rows if r.get('delta_e') is not None]
     payload = {
         'project': project_name,
@@ -79,8 +104,13 @@ def build_payload(*, project_name: str, delta_rows: list, incar_summary: dict,
     }
     if kpoints:
         payload['kpoints'] = list(kpoints)
+    if dos:
+        payload['dos'] = dict(dos)
+    if bader:
+        payload['bader'] = dict(bader)
+    # catalyst_context 门控:仅当 payload 含电子结构数据(dos/bader)才注入 d 带/轨道语境
     ctx = catalyst_context(slab_elements or [])
-    if ctx:
+    if ctx and (dos or bader):
         payload['catalyst_context'] = ctx
     if path_result:
         payload['discharge_path'] = {
@@ -93,22 +123,38 @@ def build_payload(*, project_name: str, delta_rows: list, incar_summary: dict,
     return payload
 
 
-def build_prompt(payload: dict) -> str:
+def active_prompt_preset() -> str:
+    """生效中的"分析要求"段:config llm.prompt_preset(非空)> 内置发刊级默认。"""
+    preset = _config_llm().get('prompt_preset')
+    return preset if isinstance(preset, str) and preset.strip() else DEFAULT_PROMPT_PRESET
+
+
+def build_prompt(payload: dict, preset: str | None = None) -> str:
+    """拼装 user 提示词:固定 payload 注入段 + 可替换的"分析要求"段(preset)+ 电子结构
+    机理门控 + 固定 JSON 输出契约。
+
+    门控:payload 含电子结构数据(catalyst_context/dos/bader)才放行 d 带/轨道机理讨论;
+    否则明示"仅基于能量数据,不要推断电子结构机理"——避免无 DOS/Bader 依据的机理编造。
+    """
+    preset = preset if (isinstance(preset, str) and preset.strip()) else active_prompt_preset()
+    has_electronic = any(k in payload for k in ('catalyst_context', 'dos', 'bader'))
+    if has_electronic:
+        gate = (' Electronic-structure data (catalyst_context / DOS / Bader) is provided: you MAY '
+                'discuss d-band-center, orbital-hybridization and charge-transfer mechanisms, '
+                'strictly grounded in that data.')
+    else:
+        gate = (' The dataset contains ONLY energies (no DOS/Bader electronic-structure data); '
+                'base the discussion strictly on energy/geometry trends and do NOT infer '
+                'd-band-center, orbital-hybridization or charge-transfer mechanisms.')
     return (
         'Analyze these VASP adsorption results. Data (JSON):\n'
         + json.dumps(payload, ensure_ascii=False, indent=1)
-        + '\n\nTasks: 1) interpret the adsorption-strength trend across configurations, '
-          'and WHY (electronic structure: orbital hybridization, charge transfer, '
-          'd-band arguments where applicable — use catalyst_context if provided); '
-          '2) if the series spans related species (e.g. chain lengths), explain HOW '
-          'binding evolves along the series and what that implies for the application; '
-          '3) if discharge_path present, interpret the potential-determining step; '
-          '4) note anything anomalous (positive E_ads, missing configs). '
-          'Remember: no invented references or parameters. '
-          # 键名约束放末尾(recency):Claude 系模型会无视只写在 system 里的 schema 自创结构
-          'Output MUST be a single JSON object with EXACTLY these four keys and no others: '
-          '"analysis_zh" (string, 中文), "paragraph_en" (string), '
-          '"caveats" (array of strings), "confidence" ("high"|"medium"|"low").')
+        + '\n\n' + preset + gate
+        + ' Remember: no invented references or parameters. '
+        # 键名约束放末尾(recency):Claude 系模型会无视只写在 system 里的 schema 自创结构
+        'Output MUST be a single JSON object with EXACTLY these four keys and no others: '
+        '"analysis_zh" (string, 中文), "paragraph_en" (string), '
+        '"caveats" (array of strings), "confidence" ("high"|"medium"|"low").')
 
 
 def render_export_md(payload: dict) -> str:
@@ -161,22 +207,64 @@ def _config_llm() -> dict:
         return {}
 
 
+def probe(*, api_key: str | None = None, base_url: str = '', model: str = '',
+          transport=None, timeout: int = 20) -> dict:
+    """连通性探测:发一个极小请求(max_tokens≤8),不外发项目数据。返回 {'ok','error'}。
+
+    专供设置页"测试连接":只验端点/密钥/模型可达,不做分析,故不受联网门控约束。
+    400 且疑似拒 max_tokens → 剥掉重试一次(部分网关不认该参数)。
+    """
+    base_url = base_url or _config_llm().get('base_url') or DEFAULT_BASE_URL
+    model = model or _config_llm().get('model') or DEFAULT_MODEL
+    transport = transport or _default_transport
+    key = api_key or load_api_key()
+    if not key:
+        return {'ok': False, 'error': '未设置 API 密钥(请先在设置页保存密钥再测试)'}
+    req = {'model': model, 'max_tokens': 8,
+           'messages': [{'role': 'user', 'content': 'ping'}]}
+    headers = {'Content-Type': 'application/json; charset=utf-8',
+               'Authorization': f'Bearer {key}'}
+    for attempt in range(2):
+        body = json.dumps(req, ensure_ascii=False).encode('utf-8')
+        try:
+            status, raw = transport(base_url, body, headers, timeout)
+        except Exception as e:                            # noqa: BLE001 网络异常统一降级
+            return {'ok': False, 'error': f'请求失败:{e}'}
+        if status == 200:
+            return {'ok': True, 'error': None}
+        text = raw[:200].decode('utf-8', errors='replace') if isinstance(raw, (bytes, bytearray)) else str(raw)
+        if status == 400 and 'max_tokens' in req and attempt == 0:
+            req.pop('max_tokens')
+            continue
+        return {'ok': False, 'error': f'HTTP {status}:{text}'}
+    return {'ok': False, 'error': '未知错误'}
+
+
 def analyze(payload: dict, *, api_key: str | None = None,
             base_url: str = '', model: str = '',
-            transport=None, timeout: int = 60) -> dict:
+            transport=None, timeout: int = 60,
+            allow_external: bool | None = None) -> dict:
     """调 LLM 分析。返回 {'ok', 'analysis_zh','paragraph_en','caveats','confidence','error'}。
 
+    联网门控(默认关闭):allow_external=None 时读 config llm.allow_external(缺省 False);
+    未开启则不外发项目数据,返回 skipped 结果并给离线指引(报告层据此降级为提示词包路线)。
     端点/模型解析优先级:显式入参 > config.yaml llm 小节 > 内置默认(DeepSeek)。
-    (用户在 config 里换端点/模型即全局生效,报告层不必传参。)
     失败不抛(报告章节降级为提示词包指引);温度 0.2(事实性文本);一次重试。
     """
+    if allow_external is None:
+        allow_external = bool(_config_llm().get('allow_external', False))
+    if not allow_external:
+        return {'ok': False, 'skipped': True,
+                'error': ('未开启联网分析:请在设置页开启"允许将项目数据发送到外部 LLM"'
+                          ',或在项目页"导出提示词包"离线使用'),
+                'reason': 'llm.allow_external 关闭(默认)'}
     cfg = _config_llm() if not (base_url and model) else {}
     base_url = base_url or cfg.get('base_url') or DEFAULT_BASE_URL
     model = model or cfg.get('model') or DEFAULT_MODEL
     transport = transport or _default_transport
     key = api_key or load_api_key()
     if not key:
-        return {'ok': False, 'error': '未配置 API key(集群页 LLM 区保存,或用"导出提示词包"离线路线)'}
+        return {'ok': False, 'error': '未配置 API key(设置页 LLM 区保存,或用"导出提示词包"离线路线)'}
     req = {
         'model': model,
         'temperature': 0.2,

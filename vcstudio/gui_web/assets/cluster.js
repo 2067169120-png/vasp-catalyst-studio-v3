@@ -132,8 +132,9 @@
     if (!(r && r.ok)) { VCS.log('保存失败:' + ((r && r.error) || '未知错误'), 'failc'); return false; }
     await loadProfiles(data.name);
     VCS.log(`已保存集群「${data.name}」(密码不写入 yaml)`, 'okc');
-    // 同步任务页集群下拉(若已加载)
+    // 同步任务页集群下拉 + 侧栏底部默认集群(若已加载)
     if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
+    if (typeof VCS.refreshNavFoot === 'function') VCS.refreshNavFoot();
     return true;
   }
 
@@ -150,6 +151,7 @@
     if (profs.length) fillForm(State.profiles[currentName()]);
     else newProfile();
     if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
+    if (typeof VCS.refreshNavFoot === 'function') VCS.refreshNavFoot();
   }
 
   // ── 测试连接:先保存现值 → 取密码(仅 password 且 keyring 无)→ 测试 → 探测比对 ──

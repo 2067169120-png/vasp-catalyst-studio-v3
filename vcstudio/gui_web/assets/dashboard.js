@@ -33,7 +33,7 @@
       `<b>${n}</b><span>${VCS.esc(label)}</span></div>`).join('');
   }
 
-  // ── 卡片 2:最近活动(按更新时间倒序取前 6 个作业) ────────────────────────
+  // ── 卡片 2:最近活动(按更新时间倒序取前 6 个作业;体系名加元素徽章) ─────────
   function renderRecent(jobs) {
     const box = $('db-recent');
     if (!box) return;
@@ -46,10 +46,43 @@
     }
     box.innerHTML = rows.map(r =>
       '<div class="db-row" data-goto="jobs" title="点击查看任务页">' +
+      VCS.elementBadge(r.name) +
       `<span class="name">${VCS.esc(r.name)}</span>` +
       (r.project ? `<span class="db-proj">${VCS.esc(r.project)}</span>` : '') +
       '<span class="sp"></span>' + VCS.pill(r.state) +
       `<span class="db-time">${VCS.esc(r.updated || '')}</span></div>`).join('');
+  }
+
+  // ── 卡片:项目管线(每项目一行站点进度;当前站高亮,NEEDS_HUMAN 红点) ─────────
+  const STAGE_LABEL = { generate: '生成', submit: '提交', monitor: '监控',
+    recover: '恢复', analysis: '分析', report_done: '报告' };
+
+  function renderPipeline(projects, err) {
+    const box = $('db-pipeline');
+    if (!box) return;
+    if (err) { box.innerHTML = `<div class="pl-empty">读取项目管线失败:${VCS.esc(err)}</div>`; return; }
+    if (!projects.length) {
+      box.innerHTML = '<div class="pl-empty">暂无吸附能项目 — 去「吸附能项目」新建一组</div>';
+      return;
+    }
+    box.innerHTML = projects.map(p => {
+      const stages = p.stages || ['generate', 'submit', 'monitor', 'recover', 'analysis', 'report_done'];
+      const steps = stages.map((st, i) => {
+        let cls = '';
+        if (i < p.stage_index) cls = 'done';
+        else if (i === p.stage_index) cls = 'cur';
+        let lbl = STAGE_LABEL[st] || st;
+        if (st === 'recover' && p.recover_round) lbl += ` ${p.recover_round}/3`;
+        return `<div class="pl-step ${cls}"><span class="dot"></span><span class="lbl">${VCS.esc(lbl)}</span></div>`;
+      }).join('');
+      return '<div class="pl-proj">' +
+        '<div class="pl-head">' +
+        (p.needs_human ? '<span class="redflag" title="需人工介入"></span>' : '') +
+        VCS.elementBadge(p.name) +
+        `<span class="nm">${VCS.esc(p.name || '(未命名)')}</span>` +
+        `<span class="plcount">${p.done}/${p.total} DONE</span></div>` +
+        `<div class="pl-steps">${steps}</div></div>`;
+    }).join('');
   }
 
   // ── 卡片 4:待办(失效条目 / 需处理作业 / 未配置集群,各给一键跳转) ────────
@@ -79,17 +112,37 @@
       '</div>').join('');
   }
 
+  // 取数出错 → 页顶错误条(不再吞 error 假装 0 作业)
+  function renderError(msgs) {
+    const bar = $('db-error');
+    if (!bar) return;
+    if (!msgs.length) { bar.hidden = true; bar.textContent = ''; return; }
+    bar.hidden = false;
+    bar.textContent = '部分数据读取失败(下列读数可能不完整):' + msgs.join(';');
+  }
+
   // ── 取数 + 全量渲染(进页 / 启动时) ───────────────────────────────────────
   async function refresh() {
-    const [jr, pr, cr] = await Promise.all([
-      VCS.call('list_jobs'), VCS.call('proj_list'), VCS.call('list_profiles')]);
+    const [jr, pr, cr, sr] = await Promise.all([
+      VCS.call('list_jobs'), VCS.call('proj_list'),
+      VCS.call('list_profiles'), VCS.call('pipeline_status')]);
     const jobs = (jr && jr.jobs) || [];
     const stale = (jr && jr.stale) || [];
     const projects = (pr && pr.projects) || [];
     const profiles = (cr && cr.profiles) || [];
+    // 任一取数带 error → 错误条如实呈现,绝不静默当 0
+    const errs = [];
+    if (jr && jr.error) errs.push('作业台账:' + jr.error);
+    if (pr && pr.error) errs.push('项目列表:' + pr.error);
+    if (cr && cr.error) errs.push('集群配置:' + cr.error);
+    if (sr && sr.error) errs.push('项目管线:' + sr.error);
+    renderError(errs);
     renderNums(jobs);
     renderRecent(jobs);
     renderTodo(jobs, stale, profiles);
+    renderPipeline((sr && sr.projects) || [], sr && sr.error);
+    if (VCS.pipeline && typeof VCS.pipeline.renderFeed === 'function') VCS.pipeline.renderFeed();
+    if (typeof VCS.refreshNavFoot === 'function') VCS.refreshNavFoot();
     const el = $('db-stats');
     if (el) {
       el.innerHTML = `<b>${jobs.length}</b> 作业 · <b>${projects.length}</b> 吸附能项目 · ` +
