@@ -18,13 +18,13 @@ from typing import Optional
 from vcstudio.generate import potcar
 
 # ── 磁性元素 → 每原子初猜磁矩(μB) ──────────────────────────────────────────────
-# 元素比矩初猜(**初猜非终值**:仅给 VASP 起步磁态,自洽后应核对 OUTCAR 末尾 mag 并按需
+# 元素经验磁矩初猜(**初猜非终值**:仅给 VASP 起步磁态,自洽后应核对 OUTCAR 末尾 mag 并按需
 # 覆盖)。数值取常见高自旋近似:3d 过渡金属按未配对 d 电子数量级,4d/5d 偏小,Ce/Gd 按 4f。
 MAGNETIC_ELEMENTS = {
     'V': 3, 'Cr': 5, 'Mn': 5, 'Fe': 4, 'Co': 3, 'Ni': 2, 'Cu': 1,
     'Mo': 3, 'W': 2, 'Ce': 1, 'Gd': 7,
 }
-DEFAULT_MAGMOM = 5  # μB,磁性原子磁矩兜底(元素未登记比矩时用)
+DEFAULT_MAGMOM = 5  # μB,磁性原子磁矩兜底(元素未登记经验磁矩时用)
 
 
 def has_magnetic(elements) -> bool:
@@ -36,7 +36,7 @@ def build_magmom(elements, counts,
                  magmom_overrides: Optional[dict] = None) -> Optional[str]:
     """生成 MAGMOM 串 ``'n1*m1 n2*m2 ...'``(按 elements 顺序)。
 
-    磁性原子取 MAGNETIC_ELEMENTS 的元素比矩(magmom_overrides 优先,登记缺失兜底
+    磁性原子取 MAGNETIC_ELEMENTS 的元素经验磁矩(magmom_overrides 优先,登记缺失兜底
     DEFAULT_MAGMOM),非磁性原子 0。counts 缺失或与 elements 不等长 → None(调用方降级)。
     """
     if not counts or len(counts) != len(elements):
@@ -239,7 +239,7 @@ def validate_and_complete_incar(incar_dict, elements, counts,
                     completions['ISPIN'] = 2
                 warnings.append(
                     f"体系含磁性元素 {mags} 但 INCAR 无 MAGMOM,已补 MAGMOM='{magmom}'"
-                    f'(按元素比矩初猜,非终值)并设 ISPIN=2;顺序须与 POSCAR '
+                    f'(按元素经验磁矩初猜,非终值)并设 ISPIN=2;顺序须与 POSCAR '
                     f'物种一致,自洽后请核对 mag 并按需覆盖。')
             else:
                 # D3':含磁但 counts 缺失/畸形 → 无法生成 MAGMOM,但仍补 ISPIN=2 保自旋极化

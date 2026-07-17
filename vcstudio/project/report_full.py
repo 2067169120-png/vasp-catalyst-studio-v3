@@ -77,7 +77,7 @@ def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
                         if isinstance(r.get('delta_e'), (int, float)) else 1e9)
         sections.append(
             '<h2>ΔE 汇总统计</h2><p>'
-            f'有效组态 {len(des)} 个;最强吸附 <b>{_esc(strongest["name"])}</b>'
+            f'有效构型 {len(des)} 个;最强吸附 <b>{_esc(strongest["name"])}</b>'
             f'(ΔE = {min(des):.4f} eV);最弱 ΔE = {max(des):.4f} eV;'
             f'平均 ΔE = {sum(des) / len(des):.4f} eV。</p>')
 
@@ -272,7 +272,7 @@ def _repro_fields_from_dirs(dirs):
         inputs = m.get('inputs') or {}
         if kpts is None:
             kpts = m.get('kpoints') or inputs.get('kpoints')
-        # 取元素最全的一份赝势身份(组态含吸附质,元素多于清洁表面)
+        # 取元素最全的一份赝势身份(构型含吸附质,元素多于清洁表面)
         cand = inputs.get('potcar_provenance') or []
         if len(cand) > len(prov):
             prov = cand
@@ -280,7 +280,7 @@ def _repro_fields_from_dirs(dirs):
 
 
 def _annotate_continuations(delta, proj):
-    """ΔE 表行按各组态 manifest 的续算历史追加"续算×N"备注(attempts 里 result=continued)。"""
+    """ΔE 表行按各构型 manifest 的续算历史追加"续算×N"备注(attempts 里 result=continued)。"""
     from vcstudio.shared import manifest as _mm
     configs = ((proj.get('members') or {}).get('configs')) or []
     by_name = {os.path.basename(os.path.normpath(str(d))): d for d in configs if d}

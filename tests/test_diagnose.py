@@ -32,7 +32,7 @@ def test_energy_implausible_bounds():
     assert not dg.energy_implausible(-435.6)   # 正常
 
 
-# ── 零输出:启动即死 / 沉默退出 / 调度器杀于产出前 ──
+# ── 零输出:启动即死 / 静默退出 / 调度器杀于产出前 ──
 def test_no_output_startup_death():
     d = classify(outcar_size=0, oszicar_size=0, exit_code=None)
     assert d.failure_class == dg.NO_OUTPUT and d.state == 'NEEDS_HUMAN'

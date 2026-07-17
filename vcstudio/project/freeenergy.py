@@ -128,8 +128,8 @@ def path_from_project_and_molecules(delta_rows: list, e_slab: float,
                                     g_corr: dict | None = None) -> dict:
     """便捷入口:项目 ΔE 行(带 e_config)+ 旧分子目录 → 放电路径。
 
-    组态名需含物种名(如 ads_Li2S4_on_slab / Li2S6_top):按物种子串匹配唯一组态;
-    多个匹配取 E 最低(最稳组态,常规口径)。
+    构型名需含物种名(如 ads_Li2S4_on_slab / Li2S6_top):按物种子串匹配唯一构型;
+    多个匹配取 E 最低(最稳构型,常规口径)。
     g_corr 透传 discharge_path(逐物种 ZPE−TS 校正,见 project.thermo)。
     """
     mol_e = load_molecule_energies(molecules_dir)

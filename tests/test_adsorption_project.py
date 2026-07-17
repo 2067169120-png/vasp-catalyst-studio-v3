@@ -62,7 +62,7 @@ def test_bad_config_isolated_others_survive(env):
         incar_path=env['incar'], lib_root=env['lib'])
     assert len(res['errors']) == 1 and 'Xx' in res['errors'][0][1]
     proj = adsorption.load_project(res['project_path'])
-    assert len(proj['members']['configs']) == 1        # 坏组态不入组
+    assert len(proj['members']['configs']) == 1        # 坏构型不入组
 
 
 def test_project_unifies_encut_across_members(tmp_path, monkeypatch):
@@ -153,7 +153,7 @@ def test_export_csv_excel_friendly(env, tmp_path):
     raw = out.read_bytes()
     assert raw.startswith(b'\xef\xbb\xbf')             # utf-8-sig BOM(Excel 中文不乱码)
     text = raw.decode('utf-8-sig')
-    assert '组态' in text and 'ΔE_ads / eV' in text
+    assert '构型' in text and 'ΔE_ads / eV' in text
     assert '-14.500000' in text                        # -435.5 + 400 + 21
 
 
@@ -192,7 +192,7 @@ def test_delta_e_most_stable_grouping(env):
     # CSV 新增两列且标出最稳位
     out = adsorption.export_csv(proj, s, env['tmp'] / 'ms.csv')
     text = out.read_bytes().decode('utf-8-sig')
-    assert 'ΔΔE(eV)' in text and '最稳位?' in text
+    assert 'ΔΔE(eV)' in text and '是否最稳' in text
     assert '2.000000' in text and '是' in text
 
 

@@ -1,4 +1,4 @@
-"""吸附能项目:清洁表面 + N 个吸附组态 + 气相参考 → 批量生成、ΔE 汇总、CSV 导出。
+"""吸附能项目:清洁表面 + N 个吸附构型 + 气相参考 → 批量生成、ΔE 汇总、CSV 导出。
 
 一个吸附能数据点天然是一组作业:ΔE_ads = E(slab+ads) − E(slab) − E(ref)。
 本模块把"组"落成 project.yaml(成员目录 + 元信息),能量一律从各成员 job.yaml 的
@@ -34,7 +34,7 @@ _SPECIES_TOKEN_RE = re.compile(r'[A-Z][a-z]?\d*(?:[A-Z][a-z]?\d*)*')
 
 
 def _config_species(member_name: str, proj_name: str) -> str:
-    """组态成员名 → 吸附物种短名(多构型取最稳的分组键)。
+    """构型成员名 → 吸附物种短名(多构型取最稳的分组键)。
 
     剥 '{项目名}_ads_' 前缀(缺则退剥到 '_ads_' 之后)得短名,再取短名里**首个化学式样
     token** 作物种(如 Li2S4_top→Li2S4、CO_fcc→CO);识别不出(如 h1/b2 无大写起头)用短名。
@@ -99,12 +99,12 @@ def create_project(root: str | os.PathLike, name: str, *,
                    incar_path: str, ref_poscar: str | None = None,
                    lib_root: str | None = None, validate: bool = True,
                    kpoints=None) -> dict:
-    """批量生成 清洁表面 + 组态族 + (可选)气相参考,写 project.yaml 并登记台账。
+    """批量生成 清洁表面 + 构型族 + (可选)气相参考,写 project.yaml 并登记台账。
 
     Returns:
         {'ok', 'project_path', 'project', 'generated': [(member, dir, warnings)],
          'errors': [(member, msg)]}。清洁表面生成失败 → 整体失败(其能量是公式必需项);
-        个别组态失败只记入 errors,不拖垮全组。
+        个别构型失败只记入 errors,不拖垮全组。
     """
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
@@ -130,7 +130,7 @@ def create_project(root: str | os.PathLike, name: str, *,
     slab_member = f'{name}_slab_clean'
     slab_dir = _gen(slab_member, clean_poscar, 'slab')
 
-    # 2) 组态族(个别失败不拖垮全组)
+    # 2) 构型族(个别失败不拖垮全组)
     config_dirs = []
     for p in config_poscars:
         member = f'{name}_ads_{_stem(p)}'
@@ -272,8 +272,8 @@ def delta_e_rows(project: dict) -> dict:
         {'slab': (state, E), 'ref': (state, E|None), 'has_ref': bool,
          'rows': [{'name','state','e_config','delta_e','note',
                    'species','is_most_stable','dd_e'}]}
-    规则:ΔE 只在 组态 DONE 且 slab DONE 且(有参考时)ref DONE 时给出;否则 note 说明缺谁。
-    多构型取最稳:同一 species(组态名剥前缀识别)内 delta_e 最低者 is_most_stable=True,
+    规则:ΔE 只在 构型 DONE 且 slab DONE 且(有参考时)ref DONE 时给出;否则 note 说明缺谁。
+    多构型取最稳:同一 species(构型名剥前缀识别)内 delta_e 最低者 is_most_stable=True,
     dd_e 为组内相对最稳的 ΔΔE(最稳 0.0);delta_e 为 None 的行 is_most_stable=False、dd_e=None。
     """
     members = project.get('members') or {}
@@ -282,7 +282,7 @@ def delta_e_rows(project: dict) -> dict:
     has_ref = bool(members.get('gas_ref'))
     ref_state, e_ref = _member_info(members.get('gas_ref')) if has_ref else ('无', None)
     # 逐物种气相参考(原版 lis_sac_analysis 口径):project['species_refs']=
-    # {物种: E_mol};组态名以 '_<物种>' 结尾即匹配。与单一 gas_ref 互斥,优先。
+    # {物种: E_mol};构型名以 '_<物种>' 结尾即匹配。与单一 gas_ref 互斥,优先。
     species_refs = dict(project.get('species_refs') or {})
 
     rows = []
@@ -297,7 +297,7 @@ def delta_e_rows(project: dict) -> dict:
             sp_ref = species_refs.get(sp)
         blockers = []
         if st != 'DONE' or e_cfg is None:
-            blockers.append('组态未完成')
+            blockers.append('构型未完成')
         if slab_state != 'DONE' or e_slab is None:
             blockers.append('清洁表面未完成')
         if species_refs and sp_ref is None:
@@ -348,8 +348,8 @@ def export_csv(project: dict, summary: dict, out_path: str | os.PathLike) -> Pat
                     f'E(ref)={_fmt(e_ref)} eV({ref_state})' if summary['has_ref']
                     else 'E(ref)=未设置'])
         w.writerow([])
-        w.writerow(['组态', '状态', 'E(slab+ads) / eV', 'ΔE_ads / eV',
-                    'ΔΔE(eV)', '最稳位?', '备注'])
+        w.writerow(['构型', '状态', 'E(slab+ads) / eV', 'ΔE_ads / eV',
+                    'ΔΔE(eV)', '是否最稳', '备注'])
         for r in summary['rows']:
             w.writerow([r['name'], r['state'], _fmt(r['e_config']),
                         _fmt(r['delta_e']), _fmt(r.get('dd_e')),

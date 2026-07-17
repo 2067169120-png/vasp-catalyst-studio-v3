@@ -620,7 +620,7 @@ class Api:
     def proj_list(self):
         """项目注册表 → [{path,name,n_members}](镜像 project_tab._reload_projects)。
 
-        n_members 内联算(清洁表面 + 气相参考 + 组态族,镜像 project_tab._member_dirs):
+        n_members 内联算(清洁表面 + 气相参考 + 构型族,镜像 project_tab._member_dirs):
         列表渲染绝不触碰 report_full(避免仅为计数拖入 matplotlib,matplotlib 坏时也不
         整体失败)。畸形/已移动的 project.yaml(load_project→None)或坏成员静默跳过。
         """
@@ -648,11 +648,11 @@ class Api:
 
     def proj_create(self, name, slab_path, config_paths, incar_path, gas_path,
                     out_root):
-        """批量生成 清洁表面 + 组态族 +(可选)气相参考(镜像 project_tab._on_generate)。
+        """批量生成 清洁表面 + 构型族 +(可选)气相参考(镜像 project_tab._on_generate)。
 
-        前置校验照抄 _on_generate;lib_root 从 config 读(失败静默)。坏组态隔离语义在
+        前置校验照抄 _on_generate;lib_root 从 config 读(失败静默)。坏构型隔离语义在
         adsorption 层已就位(create_project 的 errors 只记不拖垮全组)→ 此处把 build 警告
-        与组态 errors 一并透传进 warnings,不整体失败;advisories 转成 "[级别] 文案" 列表
+        与构型 errors 一并透传进 warnings,不整体失败;advisories 转成 "[级别] 文案" 列表
         (project_tab 展示口径)。gas_path 空 → ref_poscar=None(镜像可选气相参考)。
         """
         try:
@@ -672,7 +672,7 @@ class Api:
             if not incar or not os.path.isfile(incar):
                 errs.append('共享 INCAR 不存在')
             if not configs:
-                errs.append('至少添加一个吸附组态')
+                errs.append('至少添加一个吸附构型')
             if gas and not os.path.isfile(gas):
                 errs.append('气相参考文件不存在')
             if errs:
@@ -776,7 +776,7 @@ class Api:
     # ── 论文级出图(原生 matplotlib 引擎,不依赖 Origin/POV-Ray) ────────────────
     @staticmethod
     def _ads_short(member_name, proj_name) -> str:
-        """组态成员名 → 吸附质短名:剥掉 create_project 的 '{项目名}_ads_' 前缀。"""
+        """构型成员名 → 吸附质短名:剥掉 create_project 的 '{项目名}_ads_' 前缀。"""
         prefix = f'{proj_name}_ads_'
         n = str(member_name)
         return n[len(prefix):] if n.startswith(prefix) else n
@@ -841,7 +841,7 @@ class Api:
             for kind in kinds:
                 if kind in ('bar', 'table') and not done:
                     skipped.append({'kind': kind,
-                                    'reason': '无已完成的 ΔE(需组态+清洁表面+参考全 DONE)'})
+                                    'reason': '无已完成的 ΔE(需构型+清洁表面+参考全 DONE)'})
                     continue
                 if kind == 'bar':
                     files += nc.adsorption_bar(
@@ -1268,7 +1268,7 @@ class Api:
         elif all_states and all(s == 'DONE' for s in all_states):
             stage = 'report_done' if has_marker else 'analysis'
         elif any(s in _TERMINAL_FAIL for s in all_states):
-            stage = 'recover'                             # 有终态失败但不可续算 → 卡恢复待人工
+            stage = 'recover'                             # 有终态失败但不可续算 → 卡恢复需人工
         else:
             stage = 'generate'
         return stage, needs_human, recover_round

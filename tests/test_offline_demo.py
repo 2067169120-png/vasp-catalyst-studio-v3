@@ -26,7 +26,7 @@ def test_demo_runs_offline_and_emits_artifacts(tmp_path):
     n_done = sum(1 for d in diags.values() if d.state == 'DONE')
     assert n_done == 4
 
-    # 2) ΔE 门控:两个 DONE 组态给数;未完成组态 ΔE 留空
+    # 2) ΔE 门控:两个 DONE 构型给数;未完成构型 ΔE 留空
     rows = {r['name']: r for r in res['summary']['rows']}
     assert rows['ads_Li2S4']['delta_e'] == pytest.approx(-2.5, abs=1e-6)
     assert rows['ads_Li2S6']['delta_e'] == pytest.approx(-1.7, abs=1e-6)

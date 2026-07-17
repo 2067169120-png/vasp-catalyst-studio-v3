@@ -294,7 +294,7 @@ def classify(*, scheduler_reason: str | None = None, exit_code: int | None = Non
     """单一决策点:所有取证证据 → Diagnosis。
 
     优先级:①收敛串在场 → 判能量合理性(CONVERGED / BAD_ENERGY);②零输出 →
-    区分调度器杀 / 沉默退出 / 启动即死;③有输出未收敛 → 调度器具体原因 > 日志硬崩
+    区分调度器杀 / 静默退出 / 启动即死;③有输出未收敛 → 调度器具体原因 > 日志硬崩
     签名 > 退出码 137(OOM) > 未收敛(可续算);④都不覆盖 → UNKNOWN 交人工。
     """
     rcls = _reason_to_class(scheduler_reason)
@@ -333,7 +333,7 @@ def classify(*, scheduler_reason: str | None = None, exit_code: int | None = Non
                              f'调度器报 {scheduler_reason} 且无任何输出(杀于产出前,无 CONTCAR 可续)')
         if exit_code == 0:
             return Diagnosis(SILENT_EXIT, FAILURE_TO_STATE[SILENT_EXIT], False,
-                             '退出码 0 但 OUTCAR 为空——沉默退出,疑输入/环境问题,需人工')
+                             '退出码 0 但 OUTCAR 为空——静默退出,疑输入/环境问题,需人工')
         return Diagnosis(NO_OUTPUT, FAILURE_TO_STATE[NO_OUTPUT], False,
                          '零输出(OUTCAR/OSZICAR 均缺失或空)——启动即死,疑缺 POTCAR/输入错,需人工')
 

@@ -754,7 +754,7 @@ def test_proj_create_mirrors_on_generate_params_and_transforms(tmp_path):
     create_ret = {
         'ok': True, 'project_path': str(tmp_path / 'demo' / 'project.yaml'),
         'generated': [('demo_ads_x', '/o/x', ['偶极建议'])],
-        'errors': [('demo_ads_bad', 'POTCAR 缺 Ta')],       # 坏组态 → warnings,不整体失败
+        'errors': [('demo_ads_bad', 'POTCAR 缺 Ta')],       # 坏构型 → warnings,不整体失败
         'advisories': [('P1', 'ENCUT', '建议统一 ENCUT=400')],
     }
     ads = _fake_adsorption(create_ret=create_ret, calls=calls)
@@ -775,7 +775,7 @@ def test_proj_create_mirrors_on_generate_params_and_transforms(tmp_path):
     assert c['lib_root'] == '/lib'
     # advisories → "[级别] 文案" 字符串列表
     assert out['advisories'] == ['[P1·ENCUT] 建议统一 ENCUT=400']
-    # 坏组态隔离:build 警告 + 组态错误都进 warnings(不整体失败)
+    # 坏构型隔离:build 警告 + 构型错误都进 warnings(不整体失败)
     assert 'demo_ads_x:偶极建议' in out['warnings']
     assert 'demo_ads_bad:POTCAR 缺 Ta' in out['warnings']
 
@@ -817,7 +817,7 @@ def test_proj_delta_passes_through_rows_and_gating():
             {'name': 'demo_ads_a', 'state': 'DONE', 'e_config': -20.0,
              'delta_e': -2.5, 'note': ''},
             {'name': 'demo_ads_b', 'state': 'RUNNING', 'e_config': None,
-             'delta_e': None, 'note': '组态未完成'},
+             'delta_e': None, 'note': '构型未完成'},
         ],
     }
     ads = _fake_adsorption(proj_map={'/p': proj}, delta_ret=delta_ret)
@@ -825,7 +825,7 @@ def test_proj_delta_passes_through_rows_and_gating():
     out = api.proj_delta('/p')
     assert out['ok'] is True and out['error'] is None
     assert out['rows'][0]['delta_e'] == -2.5
-    assert out['rows'][1]['delta_e'] is None and '组态未完成' in out['rows'][1]['note']
+    assert out['rows'][1]['delta_e'] is None and '构型未完成' in out['rows'][1]['note']
     assert '清洁表面' in out['note']
 
 

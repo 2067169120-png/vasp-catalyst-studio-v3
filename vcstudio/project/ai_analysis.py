@@ -255,8 +255,8 @@ def analyze(payload: dict, *, api_key: str | None = None,
         allow_external = bool(_config_llm().get('allow_external', False))
     if not allow_external:
         return {'ok': False, 'skipped': True,
-                'error': ('未开启联网分析:请在设置页开启"允许将项目数据发送到外部 LLM"'
-                          ',或在项目页"导出提示词包"离线使用'),
+                'error': ('未开启联网分析:请在设置页开启「允许将项目数据发送到外部 LLM」'
+                          ',或在项目页「导出提示词包」离线使用'),
                 'reason': 'llm.allow_external 关闭(默认)'}
     cfg = _config_llm() if not (base_url and model) else {}
     base_url = base_url or cfg.get('base_url') or DEFAULT_BASE_URL
@@ -264,7 +264,7 @@ def analyze(payload: dict, *, api_key: str | None = None,
     transport = transport or _default_transport
     key = api_key or load_api_key()
     if not key:
-        return {'ok': False, 'error': '未配置 API key(设置页 LLM 区保存,或用"导出提示词包"离线路线)'}
+        return {'ok': False, 'error': '未配置 API key(设置页 LLM 区保存,或用「导出提示词包」离线路线)'}
     req = {
         'model': model,
         'temperature': 0.2,

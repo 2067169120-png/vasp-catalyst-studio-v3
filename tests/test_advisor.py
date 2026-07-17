@@ -47,7 +47,7 @@ def test_dipole_rules():
     assert 'LDIPOL_WITHOUT_DIPOL' in _names(w)             # P2:无 DIPOL
     ok = advisor.advise({'ENCUT': 500, 'LDIPOL': True, 'IDIPOL': 3, 'DIPOL': '0.5 0.5 0.45'})
     assert 'LDIPOL_WITHOUT_IDIPOL' not in _names(ok)
-    # 有吸附组态但完全没配偶极 → P1 提示
+    # 有吸附构型但完全没配偶极 → P1 提示
     w2 = advisor.advise({'ENCUT': 500}, has_configs=True)
     assert 'ADS_SLAB_NO_DIPOLE' in _names(w2)
     assert 'ADS_SLAB_NO_DIPOLE' not in _names(

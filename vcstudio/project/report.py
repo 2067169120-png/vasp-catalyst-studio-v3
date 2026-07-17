@@ -3,7 +3,7 @@
 设计(缺口分析 P1「报告那一半」+ 交接 §6 M4):
 - **零依赖**:纯 Python + stdlib(html/内联 CSS),不引 matplotlib/openpyxl/docx,守 EXE 零增重。
 - **单一真相源**:只从各作业 job.yaml 聚合(不引 SQLite/并行状态存);拿不到就如实标注。
-- **对齐论文最终摘要**:失败按 diagnose 的分类学分桶,失败/待人工作业带诊断证据;
+- **对齐论文最终摘要**:失败按 diagnose 的分类学分桶,失败/需人工作业带诊断证据;
   可选嵌入吸附能 ΔE 表(与 adsorption.export_csv 互补,一份可读的总览)。
 纯函数(collect/summarize/render)可离线测;write_report 才落盘。中文注释允许,英文标识符。
 """
@@ -22,7 +22,7 @@ _STATE_META = {
     'SUBMITTED': ('已提交', '#7e22ce'), 'QUEUED': ('排队', '#7e22ce'),
     'RUNNING': ('运行中', '#1d4ed8'), 'DONE': ('完成', '#15803d'),
     'FAILED': ('失败', '#b91c1c'), 'UNCONVERGED': ('未收敛', '#a16207'),
-    'NEEDS_HUMAN': ('待人工', '#a16207'),
+    'NEEDS_HUMAN': ('需人工', '#a16207'),
 }
 _PROBLEM_STATES = ('FAILED', 'NEEDS_HUMAN', 'UNCONVERGED')
 
@@ -136,7 +136,7 @@ def render_html(rows: list, summary: dict, *, title: str = 'VASP 批量运行报
         f'<h2>问题作业（{summary["n_problem"]}）</h2>'
         f'<table><thead><tr><th>作业</th><th>状态</th><th>失败分类</th>'
         f'<th>可续算</th><th>证据</th></tr></thead><tbody>{prob_rows}</tbody></table>'
-        if summary['problems'] else '<h2>问题作业</h2><p class="ok">无 — 全部作业均无失败/待人工。</p>')
+        if summary['problems'] else '<h2>问题作业</h2><p class="ok">无 — 全部作业均无失败/需人工。</p>')
 
     all_rows = ''.join(
         f'<tr><td>{esc(r["name"])}</td><td>{esc(r["system"])}</td>'
@@ -166,7 +166,7 @@ def render_html(rows: list, summary: dict, *, title: str = 'VASP 批量运行报
             f'<td class="dim">{esc(r.get("note",""))}</td></tr>'
             for r in delta_e['rows'])
         de_section = (
-            f'<h2>吸附能 ΔE</h2><table><thead><tr><th>组态</th><th>状态</th>'
+            f'<h2>吸附能 ΔE</h2><table><thead><tr><th>构型</th><th>状态</th>'
             f'<th>E(slab+ads)/eV</th><th>ΔE/eV</th><th>备注</th></tr></thead>'
             f'<tbody>{de_rows}</tbody></table>')
 

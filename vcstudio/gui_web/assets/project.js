@@ -1,4 +1,4 @@
-// project.js — 吸附能项目页:新建项目(清洁表面 + 组态族 + 气相参考 → 批量生成)
+// project.js — 吸附能项目页:新建项目(清洁表面 + 构型族 + 气相参考 → 批量生成)
 // + 已有项目 ΔE 汇总 / 导出 CSV / 生成完整报告。行为对齐 vcstudio/gui/project_tab.py。
 // 只依赖 app.js 暴露的 VCS.* 与 api 桥方法(proj_*/pick_file/pick_dir)。
 // 全部插值走 VCS.esc;零 emoji;中文文案。数字列用 td.num 右对齐等宽。
@@ -9,7 +9,7 @@
   const setVal = (id, v) => { const el = $(id); if (el) el.value = v || ''; };
 
   const State = {
-    configs: [],      // 组态 POSCAR 路径列表(逐个添加)
+    configs: [],      // 构型 POSCAR 路径列表(逐个添加)
     projects: [],     // proj_list 返回:[{path,name,n_members}]
   };
 
@@ -32,12 +32,12 @@
     if (r && r.path) setVal(id, r.path);
   }
 
-  // ── 组态列表:逐个添加 + 可移除 ────────────────────────────────────────────
+  // ── 构型列表:逐个添加 + 可移除 ────────────────────────────────────────────
   function renderConfigs() {
     const box = $('pj-cfg-list');
     if (!box) return;
     if (!State.configs.length) {
-      box.innerHTML = '<div class="pj-cfgempty">尚未添加任何吸附组态</div>';
+      box.innerHTML = '<div class="pj-cfgempty">尚未添加任何吸附构型</div>';
       return;
     }
     box.innerHTML = State.configs.map((p, i) =>
@@ -53,10 +53,10 @@
 
   async function addConfig() {
     const r = await VCS.call('pick_file', 'poscar');
-    if (r && r.error) { VCS.log('选择组态失败:' + r.error, 'failc'); return; }
+    if (r && r.error) { VCS.log('选择构型失败:' + r.error, 'failc'); return; }
     if (r && r.path) {
       if (State.configs.indexOf(r.path) >= 0) {
-        VCS.log('该组态已在列表中,已跳过:' + r.path);
+        VCS.log('该构型已在列表中,已跳过:' + r.path);
         return;
       }
       State.configs.push(r.path);
@@ -71,7 +71,7 @@
     const gas = val('pj-gas'), root = val('pj-root');
     const configs = State.configs.slice();
     if (btn) btn.disabled = true;
-    VCS.log('批量生成:清洁表面 + ' + configs.length + ' 组态' + (gas ? ' + 气相参考' : '') + '…');
+    VCS.log('批量生成:清洁表面 + ' + configs.length + ' 构型' + (gas ? ' + 气相参考' : '') + '…');
     try {
       const r = await VCS.call('proj_create', name, slab, configs, incar, gas, root);
       if (!r || r.ok === false || r.error) {
@@ -82,7 +82,7 @@
       (r.advisories || []).forEach(a => VCS.log('方法学提示:' + a, 'warnc'));
       (r.warnings || []).forEach(w => VCS.log(w, 'warnc'));
       VCS.log('已生成项目:' + (r.project_path || ''), 'okc');
-      VCS.log('作业已入台账,去任务页上传提交;全部 DONE 后回本页算 ΔE', 'okc');
+      VCS.log('作业已入台账,去作业页上传提交;全部 DONE 后回本页算 ΔE', 'okc');
       // 生成的成员作业进了台账 → 刷新任务页
       if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
       await reloadProjects();
@@ -230,12 +230,12 @@
     const note = r.note || '';
     let h = note ? `<div class="pj-note">${VCS.esc(note)}</div>` : '';
     if (!rows.length) {
-      h += '<div class="empty"><p>该项目暂无吸附组态成员</p></div>';
+      h += '<div class="empty"><p>该项目暂无吸附构型成员</p></div>';
       box.innerHTML = h;
       return;
     }
     h += '<table><thead><tr>' +
-      '<th>组态</th><th>状态</th><th class="num">E_config (eV)</th>' +
+      '<th>构型</th><th>状态</th><th class="num">E_config (eV)</th>' +
       '<th class="num">ΔE (eV)</th><th>备注</th>' +
       '</tr></thead><tbody>';
     rows.forEach(row => {

@@ -379,17 +379,17 @@ def render_dos_svg(data: dict, *, title='', width=760, height=420,
 # ── 契约构建助手:从项目 ΔE 结果直接出图数据 ─────────────────────────────────────
 def bar_data_from_delta(project_name: str, delta_rows: list,
                         band=None, band_label='') -> dict:
-    """adsorption.delta_e_rows 的 rows → 单体系柱状图契约(只取有 ΔE 的组态)。"""
+    """adsorption.delta_e_rows 的 rows → 单体系柱状图契约(只取有 ΔE 的构型)。"""
     cols = [r['name'] for r in delta_rows if r.get('delta_e') is not None]
     vals = [r['delta_e'] for r in delta_rows if r.get('delta_e') is not None]
     if not cols:
-        raise ValueError('没有任何组态有 ΔE(需成员全部 DONE)')
+        raise ValueError('没有任何构型有 ΔE(需成员全部 DONE)')
     return {'rows': [project_name], 'cols': cols, 'matrix': [vals],
             'band': band, 'band_label': band_label}
 
 
 def heatmap_data_from_projects(projects: list) -> dict:
-    """多项目 → 热图契约:rows=项目名,cols=组态名并集(保序),缺格 None。"""
+    """多项目 → 热图契约:rows=项目名,cols=构型名并集(保序),缺格 None。"""
     cols: list = []
     for _, rows in projects:
         for r in rows:

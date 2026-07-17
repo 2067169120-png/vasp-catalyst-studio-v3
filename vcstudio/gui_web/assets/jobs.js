@@ -1,4 +1,4 @@
-// jobs.js — 任务页:台账表 + 全部批量动作 + 密码/信任流 + 自动刷新 + 集群队列/认领。
+// jobs.js — 作业页:台账表 + 全部批量动作 + 密码/信任流 + 自动刷新 + 集群队列/认领。
 // 只依赖 app.js 暴露的 VCS.* 与 api 桥方法。行为逐条对齐 vcstudio/gui/jobs_tab.py。
 // 全部数据插值走 VCS.esc(注入防御);零 emoji;中文文案。
 'use strict';
@@ -70,7 +70,7 @@
   }
 
   // 成员角色 → 中文标签(list_jobs 注入的 role 字段)
-  const ROLE_LABEL = { clean: '清洁表面', gas: '气相参考', config: '组态' };
+  const ROLE_LABEL = { clean: '清洁表面', gas: '气相参考', config: '构型' };
 
   // 单行作业 HTML。grpKey 非空 → 属于某折叠组(data-grp);hidden → 组当前折叠
   function rowHtml(r, grpKey, hidden) {
@@ -722,7 +722,7 @@
     reload();
   }
 
-  // 切回任务页时刷新台账
+  // 切回作业页时刷新台账
   document.addEventListener('vcs:page', e => { if (e.detail && e.detail.page === 'jobs') reload(); });
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);

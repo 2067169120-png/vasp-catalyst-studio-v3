@@ -18,7 +18,7 @@
     if (a) a.click();
   }
 
-  // ── 卡片 1:状态汇总大数字(点击跳任务页) ─────────────────────────────────
+  // ── 卡片 1:状态汇总大数字(点击跳作业页) ─────────────────────────────────
   function renderNums(jobs) {
     const box = $('db-nums');
     if (!box) return;
@@ -29,7 +29,7 @@
       ['fail', '需处理', count(jobs, NEED_STATES)],
     ];
     box.innerHTML = items.map(([cls, label, n]) =>
-      `<div class="db-num ${cls}" data-goto="jobs" title="点击查看任务页">` +
+      `<div class="db-num ${cls}" data-goto="jobs" title="点击查看作业页">` +
       `<b>${n}</b><span>${VCS.esc(label)}</span></div>`).join('');
   }
 
@@ -45,7 +45,7 @@
       return;
     }
     box.innerHTML = rows.map(r =>
-      '<div class="db-row" data-goto="jobs" title="点击查看任务页">' +
+      '<div class="db-row" data-goto="jobs" title="点击查看作业页">' +
       VCS.elementBadge(r.name) +
       `<span class="name">${VCS.esc(r.name)}</span>` +
       (r.project ? `<span class="db-proj">${VCS.esc(r.project)}</span>` : '') +
@@ -92,7 +92,7 @@
     const items = [];
     const need = count(jobs, NEED_STATES);
     if (need) {
-      items.push([`${need} 个作业需处理(失败 / 未收敛 / 需人工)`, 'jobs', '去任务页']);
+      items.push([`${need} 个作业需处理(失败 / 未收敛 / 需人工)`, 'jobs', '去作业页']);
     }
     if (stale.length) {
       items.push([`${stale.length} 个失效台账条目待清理(目录或 job.yaml 已不存在)`,
