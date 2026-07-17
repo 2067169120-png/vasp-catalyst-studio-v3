@@ -150,3 +150,94 @@ def test_discharge_path_g_corr_shifts_steps():
     shifted2 = discharge_path(_SYS_E, _MOL_E, g_corr=corr2)
     assert shifted2['steps'][-1]['G'] == pytest.approx(base['steps'][-1]['G'] + 0.2)
     assert shifted2['steps'][0]['G'] == pytest.approx(0.0)
+
+
+# ── 虚频质量闸 classify_imaginary(F15)四象限 ────────────────────────────────────
+def test_classify_minimum_clean_no_imag():
+    r = thermo.classify_imaginary([], context='minimum')
+    assert r['verdict'] == 'clean' and r['n_imag'] == 0
+    assert r['usable_for_thermo'] is True and r['max_imag_cm1'] == 0.0
+
+
+def test_classify_minimum_noise_small_imag_usable():
+    r = thermo.classify_imaginary([18.0, 30.0], context='minimum')   # 全 <50 → 噪声
+    assert r['verdict'] == 'noise' and r['n_imag'] == 2 and r['n_imag_large'] == 0
+    assert r['usable_for_thermo'] is True
+    assert '按实模地板计入熵' in r['advice']
+
+
+def test_classify_minimum_bad_large_imag_not_usable():
+    r = thermo.classify_imaginary([120.0, 20.0], context='minimum')  # 一个大虚频
+    assert r['verdict'] == 'bad_minimum' and r['n_imag_large'] == 1
+    assert r['usable_for_thermo'] is False
+    assert r['max_imag_cm1'] == pytest.approx(120.0)
+    assert '重弛豫' in r['advice']
+
+
+def test_classify_ts_exactly_one_large_is_valid():
+    r = thermo.classify_imaginary([350.0, 15.0], context='ts')       # 恰一个大虚频
+    assert r['verdict'] == 'valid_ts' and r['usable_for_thermo'] is True
+
+
+def test_classify_ts_zero_large_invalid():
+    r = thermo.classify_imaginary([12.0], context='ts')              # 无大虚频
+    assert r['verdict'] == 'invalid_ts' and r['usable_for_thermo'] is False
+
+
+def test_classify_ts_multiple_large_invalid():
+    r = thermo.classify_imaginary([300.0, 250.0], context='ts')      # 二阶鞍点
+    assert r['verdict'] == 'invalid_ts' and r['n_imag_large'] == 2
+    assert '高阶鞍点' in r['advice']
+
+
+def test_classify_custom_noise_threshold():
+    # 阈值降到 10 → 18 cm⁻¹ 变"大虚频",极小点判 bad
+    r = thermo.classify_imaginary([18.0], noise_threshold=10.0, context='minimum')
+    assert r['verdict'] == 'bad_minimum' and r['usable_for_thermo'] is False
+
+
+def test_classify_unknown_context_raises():
+    with pytest.raises(ValueError, match='context'):
+        thermo.classify_imaginary([10.0], context='saddle')
+
+
+def test_load_corrections_attaches_classify_noise(tmp_path):
+    # _OUTCAR_FREQ 含 18 cm⁻¹ 单虚频(<50)→ noise,usable,不排除
+    d = tmp_path / 'freq_Li2S'
+    d.mkdir()
+    (d / 'OUTCAR').write_text(_OUTCAR_FREQ, encoding='utf-8')
+    corr = thermo.load_corrections({'Li2S': str(d)})
+    assert corr['Li2S']['classify']['verdict'] == 'noise'
+    assert corr['Li2S']['usable_for_thermo'] is True
+    assert 'excluded' not in corr['Li2S']
+
+
+def test_load_corrections_marks_bad_minimum_excluded(tmp_path):
+    # 构造含 200 cm⁻¹ 大虚频的 OUTCAR → bad_minimum,标 excluded(不静默入 ΔG)
+    d = tmp_path / 'freq_bad'
+    d.mkdir()
+    (d / 'OUTCAR').write_text(
+        ' Eigenvectors and eigenvalues of the dynamical matrix\n'
+        '   1 f  =   10.0 THz   62.8 2PI*THz  333.560000 cm-1   41.360000 meV\n'
+        '   2 f/i=    5.0 THz   30.0 2PI*THz  200.000000 cm-1   24.800000 meV\n',
+        encoding='utf-8')
+    corr = thermo.load_corrections({'X': str(d)})
+    assert corr['X']['classify']['verdict'] == 'bad_minimum'
+    assert corr['X']['usable_for_thermo'] is False
+    assert corr['X']['excluded'] is True
+    assert corr['X']['exclude_reason']
+
+
+def test_load_corrections_ts_context_per_species(tmp_path):
+    # contexts 指定某物种按过渡态口径:单大虚频 → valid_ts,usable
+    d = tmp_path / 'freq_ts'
+    d.mkdir()
+    (d / 'OUTCAR').write_text(
+        ' Eigenvectors and eigenvalues of the dynamical matrix\n'
+        '   1 f  =   10.0 THz   62.8 2PI*THz  333.560000 cm-1   41.360000 meV\n'
+        '   2 f/i=    5.0 THz   30.0 2PI*THz  200.000000 cm-1   24.800000 meV\n',
+        encoding='utf-8')
+    corr = thermo.load_corrections({'TS': str(d)}, contexts={'TS': 'ts'})
+    assert corr['TS']['classify']['verdict'] == 'valid_ts'
+    assert corr['TS']['usable_for_thermo'] is True
+    assert 'excluded' not in corr['TS']

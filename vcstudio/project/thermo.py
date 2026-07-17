@@ -44,6 +44,12 @@ _FREQ_RE = re.compile(
 
 G_CORR_MODES = ('zpe_ts', 'ase')     # ΔG 校正口径(见模块 docstring)
 
+# 虚频质量闸(F15):|ν| < 噪声阈视作弛豫残留小虚频(可忽略/抬频),≥阈为"大虚频"。
+DEFAULT_IMAG_NOISE_CM1 = 50.0
+IMAG_CONTEXTS = ('minimum', 'ts')
+# 四象限判定 verdict:极小点 clean/noise/bad_minimum;过渡态 valid_ts/invalid_ts。
+IMAG_VERDICTS = ('clean', 'noise', 'bad_minimum', 'valid_ts', 'invalid_ts')
+
 
 @dataclass
 class VibResult:
@@ -163,26 +169,93 @@ def analyze_outcar(path: str | os.PathLike, temperature: float = DEFAULT_T,
                      n_floored=meta['n_floored'], floored_cm1=meta['floored_cm1'])
 
 
+def classify_imaginary(freqs_cm1: list, *, noise_threshold: float = DEFAULT_IMAG_NOISE_CM1,
+                       context: str = 'minimum') -> dict:
+    """虚频质量闸(F15):按虚频构成给出四象限判定 + 中文建议。
+
+    freqs_cm1:虚频**幅值**列表(cm⁻¹,即 VibResult.imag_cm1;取绝对值参与判定)。
+    noise_threshold:|ν| 低于此视作弛豫残留小虚频(噪声),≥此为"大虚频"。
+    context:
+    - ``'minimum'``(极小点):无虚频→clean;有虚频但全 <阈→noise(可接受,按实模地板
+      计入熵,建议报告注明);出现大虚频→bad_minimum(沿虚频模式扰动重弛豫,勿直接用于 ΔG)。
+    - ``'ts'``(过渡态):恰一个大虚频→valid_ts;0 个或 ≥2 个大虚频→invalid_ts。
+
+    Returns ``{'verdict','n_imag','n_imag_large','max_imag_cm1','advice','usable_for_thermo',
+    'noise_threshold_cm1','context'}``。usable_for_thermo=False 的结果不应静默进 ΔG。
+    """
+    if context not in IMAG_CONTEXTS:
+        raise ValueError(f'未知 context {context!r}(可选:{IMAG_CONTEXTS})')
+    mags = [abs(float(c)) for c in (freqs_cm1 or [])]
+    n_imag = len(mags)
+    large = [c for c in mags if c >= noise_threshold]
+    n_large = len(large)
+    max_imag = round(max(mags), 1) if mags else 0.0
+
+    if context == 'ts':
+        if n_large == 1:
+            verdict, usable = 'valid_ts', True
+            advice = f'恰一个大虚频({max_imag:g} cm⁻¹),合格一阶鞍点;热校正用其余实模。'
+        elif n_large == 0:
+            verdict, usable = 'invalid_ts', False
+            advice = ('过渡态应恰有一个大虚频,却未检出;可能已滑落到极小点,'
+                      '需重新搜索过渡态,勿用于能垒/ΔG。')
+        else:
+            verdict, usable = 'invalid_ts', False
+            advice = (f'过渡态出现 {n_large} 个大虚频(高阶鞍点),'
+                      f'需沿多余虚频模式优化到一阶鞍点。')
+    else:  # minimum
+        if n_imag == 0:
+            verdict, usable = 'clean', True
+            advice = '无虚频,合格极小点。'
+        elif n_large == 0:
+            verdict, usable = 'noise', True
+            advice = (f'仅残留小虚频(全部 <{noise_threshold:g} cm⁻¹,最大 {max_imag:g}),'
+                      f'可接受;建议报告注明并按实模地板计入熵。')
+        else:
+            verdict, usable = 'bad_minimum', False
+            advice = (f'存在大虚频(最大 {max_imag:g} cm⁻¹),沿该虚频模式扰动后重弛豫,'
+                      f'勿直接用于 ΔG。')
+
+    return {'verdict': verdict, 'n_imag': n_imag, 'n_imag_large': n_large,
+            'max_imag_cm1': max_imag, 'advice': advice, 'usable_for_thermo': usable,
+            'noise_threshold_cm1': float(noise_threshold), 'context': context}
+
+
 def load_corrections(freq_dirs: dict, temperature: float = DEFAULT_T,
                      mode: str = 'zpe_ts',
-                     freq_floor_cm1: float = DEFAULT_FREQ_FLOOR_CM1) -> dict:
+                     freq_floor_cm1: float = DEFAULT_FREQ_FLOOR_CM1,
+                     imag_noise_cm1: float = DEFAULT_IMAG_NOISE_CM1,
+                     contexts: dict | None = None) -> dict:
     """{物种: 频率作业目录} → {物种: {'g_corr','zpe','u_thermal','ts','n_imag','imag_cm1',
-    'n_floored','floored_cm1'}}。
+    'n_floored','floored_cm1','classify','usable_for_thermo'[,'excluded','exclude_reason']}}。
 
     mode 选 g_corr 口径(见 VibResult.g_corr):默认 'zpe_ts' = ZPE−TS(论文
     复现基准);'ase' = ZPE+U_vib−TS(严格谐振子)。zpe/u_thermal/ts 三项原样
     给出,调用方可自行复核任一口径。freq_floor_cm1 透传 harmonic_thermo(低频熵/热能地板)。
     不读 config,模式/地板由调用方显式传入。
     目录缺 OUTCAR/无频率 → 该物种跳过(不进结果;调用方按"无校正"处理并明示)。
-    虚频只报告(imag_cm1),处理决策(忽略/抬频/重优化)交人工。
+
+    虚频质量闸(F15):每物种附 classify_imaginary 结果('classify')与 'usable_for_thermo'。
+    imag_noise_cm1 为小虚频噪声阈;contexts={物种:'minimum'|'ts'} 可给个别物种指定
+    过渡态口径(默认全按 'minimum')。usable_for_thermo=False 的物种**不静默入 ΔG**:
+    额外标 'excluded'=True 与 'exclude_reason'(中文),由调用方决定是否拦截。
     """
     out = {}
+    contexts = dict(contexts or {})
     for sp, d in (freq_dirs or {}).items():
         r = analyze_outcar(os.path.join(str(d), 'OUTCAR'), temperature, freq_floor_cm1)
         if r is None:
             continue
-        out[sp] = {'g_corr': round(r.g_corr(mode), 6), 'zpe': r.zpe_ev,
-                   'u_thermal': r.u_thermal_ev, 'ts': r.ts_ev, 'n_imag': r.n_imag,
-                   'imag_cm1': [round(c, 1) for c in r.imag_cm1],
-                   'n_floored': r.n_floored, 'floored_cm1': list(r.floored_cm1)}
+        cls = classify_imaginary(r.imag_cm1, noise_threshold=imag_noise_cm1,
+                                 context=contexts.get(sp, 'minimum'))
+        row = {'g_corr': round(r.g_corr(mode), 6), 'zpe': r.zpe_ev,
+               'u_thermal': r.u_thermal_ev, 'ts': r.ts_ev, 'n_imag': r.n_imag,
+               'imag_cm1': [round(c, 1) for c in r.imag_cm1],
+               'n_floored': r.n_floored, 'floored_cm1': list(r.floored_cm1),
+               'classify': cls, 'usable_for_thermo': cls['usable_for_thermo']}
+        if not cls['usable_for_thermo']:
+            # 质量闸不放行 → 显式标记,绝不让坏虚频物种静默进 ΔG(调用方决定拦截)
+            row['excluded'] = True
+            row['exclude_reason'] = cls['advice']
+        out[sp] = row
     return out
