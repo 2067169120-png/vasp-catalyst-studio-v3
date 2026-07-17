@@ -1,0 +1,42 @@
+name: Release
+
+# 打 v* 标签自动出 Windows EXE 挂到 GitHub Release(在 windows-latest 云机器构建)。
+# EXE 含 web GUI + matplotlib 出图引擎;--legacy tkinter 版不随发行(需要者自行打包)。
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install (gui + charts + PyInstaller)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[gui,charts]
+          pip install pyinstaller
+      - name: Test (fast gate)
+        run: python -m pytest -q
+      - name: Build EXE
+        run: python packaging/build_exe.py
+      - name: Rename artifact with version
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}"
+          Copy-Item "dist/VASP Catalyst Studio.exe" "dist/VASP-Catalyst-Studio-$v-windows.exe"
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/VASP-Catalyst-Studio-*.exe
+          generate_release_notes: true
+          body: |
+            VASP Catalyst Studio ${{ github.ref_name }} — Windows 单文件 EXE(双击即用,无需安装 Python)。
+            更新内容见 CHANGELOG.md。首次启动若报 WebView2 缺失,请安装微软 Edge WebView2 运行时。

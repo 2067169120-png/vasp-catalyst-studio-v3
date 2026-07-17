@@ -32,7 +32,7 @@ your machine).
 | ⑧ 通用 CHE 引擎 (v3.1) | `vcstudio/project/` | 反应网络预设(Li-S 16e/缔合解离/ORR/HER/OER/CO2RR),U_eq/U_L/η,多电位台阶 | `reactions.py` `freeenergy.free_energy_path` |
 | ⑨ campaign 控制面 (v3.1) | `vcstudio/campaign/` | 文件式任务 DAG:三态(completed/validated/accepted)、三门禁(提交/验收/报告)、方法指纹、决策账本、机时预算闸 | `schema.py` `states.py` `gates.py` `fingerprint.py` `ledger.py` `budget.py` `derive.py` |
 | 跨层基础 Shared | `vcstudio/shared/` | 配置、清单(job.yaml状态机)、凭据(keyring) | `config.py` `manifest.py` `secrets.py` |
-| 界面 GUI | `vcstudio/gui_web/`(默认 Web)+ `gui/`(旧 tkinter) | pywebview 前端 + `api.py` 薄门面;六页:仪表盘/生成/项目/作业/集群/设置 | `gui_web/api.py` `assets/*.js` |
+| 界面 GUI | `vcstudio/gui_web/`(默认 Web)+ `gui/`(旧 tkinter) | pywebview 前端 + `api.py` 薄门面;工作流式九页:概览/①结构建模/②生成输入/③提交计算/④结果分析/⑤论文出图/⑥AI助手/集群/设置 | `gui_web/api.py` `assets/*.js` |
 
 ## Statement of need
 
@@ -118,7 +118,19 @@ silent (job.yaml state machine + audit history).
 - **术语统一**(中文文案审查落地):组态→构型(58 处)、任务→作业、需人工统一、
   限制电位步口径说明等,为 i18n 中英双语铺路
 
-933 测试通过(2 跳过)。GUI 接线(campaign 视图/频率与电子结构按钮/候选矩阵页)为 Phase A 收尾项,见总体方案 Phase A/B/C 路线。
+933 测试通过(2 跳过)。
+
+## v3.1.0 正式发布(2026-07-17)· Phase B+C 全部落地
+
+**下载**:[Releases 页](https://github.com/2067169120-png/vasp-catalyst-studio-v3/releases) 提供 Windows 单文件 EXE(标签推送后由 CI 自动构建)。
+
+**界面重构(starpivot 式工作流)**:编号步进侧栏 概览 → ①结构建模 → ②生成输入 → ③提交计算 → ④结果分析 → ⑤论文出图 → ⑥AI 助手;研究场景系统按方向裁剪界面;三主题;中英双语基础;结构查看/编辑器(3Dmol 交互:选中/移动/删除/改元素/固定底层/真空检查/导出 POSCAR);图表预设画廊(12 图型点选出图);AI 助手页(论文→规格表→计划→实例化,全自动开关受机时闸/单点先行/三态门禁约束)。
+
+**Phase B**:GUI 派生按钮(频率/PDOS/Bader/差分电荷)、SAC 候选矩阵页(chips 选金属×模板×吸附质,预估机时,自动建项目+campaign)、多自旋并跑与对比、通用反应预设下拉;**CI-NEB 全流程**(插值→多 image 作业→逐 image 监控→能垒+MEP 图);**COHP/LOBSTER 链**(lobsterin 生成/解析/spilling 质量闸);筛选引擎(描述符汇总+火山图双支自动拟合)。
+
+**Phase C**:收尾流水线(Methods 成段/SI 装订/三线表/口径稽核,只组织真实数据);AI 论文入口(逐格出处的规格表,LLM 不进数值链路);**多引擎适配层**(CalcSpec IR + CP2K/Gaussian/CASTEP 文件级后端 + 跨引擎不等价清单 + 参考态一致性先行闸;引擎软件用户自备);场景系统与 i18n。
+
+**1401 测试通过(3 跳过)**。完整清单见 [CHANGELOG.md](CHANGELOG.md);路线图与验证计划见 [v3.1 总体方案](docs/planning/v3.1-总体方案.md)(端到端复现文献 MAE 表为下一步验证项)。
 
 ## Install & quickstart
 
@@ -142,7 +154,7 @@ report, no VASP or cluster): [examples/offline_analysis](examples/offline_analys
 — `python examples/offline_analysis/run_demo.py` drives a synthetic completed
 job set end-to-end so a reviewer can confirm the analysis half of the pipeline.
 
-**Tests**: `python -m pytest` — 933 tests, 2 skipped (optional OriginLab smoke
+**Tests**: `python -m pytest` — 1401 tests, 3 skipped (optional OriginLab smoke
 behind `VCS_ORIGIN_SMOKE=1`, and a POV-Ray real-render smoke). Parser
 cross-checks against ASE run when `ase` is installed (in the `dev` extra).
 CI runs the suite on ubuntu/windows × Python 3.10/3.12.
@@ -180,14 +192,14 @@ via [CITATION.cff](CITATION.cff). Licensed under [MIT](LICENSE).
   [examples/offline_analysis](examples/offline_analysis/README.md)
   (合成的已完成作业 → 诊断/ΔE/出图/报告,审稿人无 VASP/集群即可验证分析链路)
 - **完整用法**:[使用说明.md](使用说明.md);目录结构:[STRUCTURE.md](STRUCTURE.md)
-- **测试**:`python -m pytest`(933 用例,2 项在无 OriginLab/POV-Ray 时跳过)
+- **测试**:`python -m pytest`(1401 用例,3 项在无 OriginLab/POV-Ray/真机时跳过)
 - **科学约定/发刊工具链**:同上英文节;竞品对比见
   [docs/comparison.md](docs/comparison.md),验证协议见
   [docs/validation.md](docs/validation.md)
 
 ```
 vcstudio/       核心包(generate/cluster/project/external/gui/shared/cli)
-tests/          933 测试   docs/superpowers/specs/  设计文档
+tests/          1401 测试   docs/superpowers/specs/  设计文档
 config.example.yaml  配置模板(复制为 config.yaml 填写;config.yaml 已 gitignore)
 dist/           打包产物 EXE(gitignore)   results/  作业输出(不入 git)
 ```
