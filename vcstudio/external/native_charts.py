@@ -841,3 +841,139 @@ def scaling_relation(xs, ys, out_path, *, xlabel: str, ylabel: str,
         if panel:
             add_panel_label(ax, panel)
         return _save_dual(fig, out_path, formats)
+
+
+# ── 图 7:投影 DOS(PDOS,F19;自旋镜像 + 费米零点 + d 带中心竖线)────────────────
+
+def pdos_plot(series, out_path, *, efermi: float = 0.0, band_centers=None,
+              mirror_spin: bool = True, xlim=(-8, 4), title: str = '',
+              ylabel: str | None = None, width: float | None = None,
+              palette: str = 'tol_bright', panel: str = '',
+              formats=('png', 'pdf'), style_kw: dict | None = None) -> list:
+    """投影态密度图:多条投影曲线叠加,自旋向下镜像至 y<0,标费米零点与 d 带中心。
+
+    数据契约:
+        series = [
+            {'label': 'Co 3d', 'energies': [...], 'dos_up': [...],
+             'dos_down': [...],   # 可选;无则该曲线单自旋
+             'color': '#EE6677'}, # 可选;缺省走 palette 色循环
+            {'label': 'O 2p', 'energies': [...], 'dos_up': [...]},
+        ]
+        energies 为**绝对**能量(eV);本函数按 efermi 平移到 E − E_F(费米落在 x=0)。
+
+    参数:
+        efermi:    费米能级(eV),用于把横轴平移到相对费米能级。
+        band_centers: {'label': ε_d} → 在 x=ε_d(**已相对 E_F**,取自 band_center 的
+                   center_eV)画红色竖线并标注;None 不标。
+        mirror_spin: True 时 dos_down 取负画在 y=0 下方(PDOS 自旋镜像惯例)。
+        xlim:      横轴范围(相对 E_F,eV)。其余参数同 adsorption_bar。
+
+    返回:导出文件绝对路径列表(与 formats 同序)。series 空/字段缺失/长度不一致 → ValueError。
+    """
+    if not series:
+        raise ValueError('series 不能为空')
+    norm = []
+    for s in series:
+        if 'energies' not in s or 'dos_up' not in s:
+            raise ValueError("每条 series 需含 'energies' 与 'dos_up'")
+        e = [float(x) for x in s['energies']]
+        up = [float(x) for x in s['dos_up']]
+        if len(e) != len(up):
+            raise ValueError(f"series {s.get('label', '?')!r} 的 energies 与 dos_up 长度不一致")
+        dn = s.get('dos_down')
+        if dn is not None:
+            dn = [float(x) for x in dn]
+            if len(dn) != len(e):
+                raise ValueError(f"series {s.get('label', '?')!r} 的 dos_down 长度不一致")
+        norm.append((s.get('label', ''), e, up, dn, s.get('color')))
+
+    fig_w = width if width is not None else SINGLE_COL
+    has_down = any(t[3] is not None for t in norm)
+    with apply_paper_style(palette=palette, **(style_kw or {})):
+        fig, ax = _new_figure(width=fig_w, aspect=0.80)
+        colors = PALETTES.get(palette, PALETTES['tol_bright'])
+        for i, (label, e, up, dn, color) in enumerate(norm):
+            c = color or colors[i % len(colors)]
+            x = [ee - efermi for ee in e]
+            ax.plot(x, up, color=c, lw=1.3, zorder=3,
+                    label=chem_label(label) if label else None)
+            if dn is not None:
+                ydn = [-v for v in dn] if mirror_spin else dn
+                ax.plot(x, ydn, color=c, lw=1.3, zorder=3)
+        if mirror_spin and has_down:
+            ax.axhline(0.0, color=ZERO_LINE_COLOR, lw=0.7, zorder=1)
+        # 费米零点(横轴已平移,E_F 落在 x=0)
+        ax.axvline(0.0, color=ZERO_LINE_COLOR, lw=0.9, ls=(0, (5, 3)), zorder=2)
+        ax.annotate(r'$E_\mathrm{F}$', (0.0, 1.0), xycoords=('data', 'axes fraction'),
+                    xytext=(2, -2), textcoords='offset points', ha='left', va='top',
+                    fontsize=7.5, color=ZERO_LINE_COLOR)
+        if band_centers:
+            for lbl, eps in band_centers.items():
+                if eps is None:
+                    continue
+                ax.axvline(float(eps), color=PDS_COLOR, lw=1.0, ls=(0, (2, 2)), zorder=4)
+                ax.annotate(rf'{chem_label(lbl)} $\varepsilon_d$={float(eps):.2f}',
+                            (float(eps), 1.0), xycoords=('data', 'axes fraction'),
+                            xytext=(2, -11), textcoords='offset points',
+                            ha='left', va='top', fontsize=7, color=PDS_COLOR)
+        ax.set_xlim(*xlim)
+        ax.set_xlabel(r'$E - E_\mathrm{F}$ (eV)')
+        ax.set_ylabel(ylabel if ylabel is not None else 'PDOS (states/eV)')
+        if title:
+            ax.set_title(title)
+        if any(t[0] for t in norm):
+            ax.legend(loc='best')
+        if panel:
+            add_panel_label(ax, panel)
+        return _save_dual(fig, out_path, formats)
+
+
+# ── 图 8:面平均差分电荷 Δρ(z) 曲线(F21 的定量补充)────────────────────────────
+
+def charge_profile_plot(z, rho, out_path, *, regions=None, title: str = '',
+                        xlabel: str | None = None, ylabel: str | None = None,
+                        width: float | None = None, palette: str = 'tol_bright',
+                        panel: str = '', formats=('png', 'pdf'),
+                        style_kw: dict | None = None) -> list:
+    """面平均差分电荷 Δρ̄(z) 曲线:聚集(>0)/耗散(<0)分色填充,可标区间底色。
+
+    数据契约:
+        z, rho: 等长数值序列(≥2 点),取自 chgdiff.plane_averaged 的 'z'/'rho'。
+        regions = [{'z0': 3.0, 'z1': 8.0, 'label': 'slab', 'color': '#EEE'}, ...]
+            可选:标出表面/吸附质区间底色(axvspan);label 进图例,color 缺省浅灰。
+
+    返回:导出文件绝对路径列表。长度不一致/点数<2 → ValueError。
+    """
+    z = [float(v) for v in z]
+    rho = [float(v) for v in rho]
+    if len(z) != len(rho):
+        raise ValueError(f'z 与 rho 长度不一致:{len(z)} != {len(rho)}')
+    if len(z) < 2:
+        raise ValueError('面平均曲线至少需 2 个点')
+
+    fig_w = width if width is not None else SINGLE_COL
+    with apply_paper_style(palette=palette, **(style_kw or {})):
+        fig, ax = _new_figure(width=fig_w, aspect=0.62)
+        colors = PALETTES.get(palette, PALETTES['tol_bright'])
+        if regions:
+            for reg in regions:
+                ax.axvspan(float(reg['z0']), float(reg['z1']),
+                           color=reg.get('color', '#E9E9E9'), alpha=0.6, zorder=0,
+                           label=chem_label(reg['label']) if reg.get('label') else None)
+        ax.axhline(0.0, color=ZERO_LINE_COLOR, lw=0.8, zorder=1)
+        pos = [r if r > 0 else 0.0 for r in rho]
+        neg = [r if r < 0 else 0.0 for r in rho]
+        ax.fill_between(z, pos, 0.0, color='#EE6677', alpha=0.35, linewidth=0, zorder=2)
+        ax.fill_between(z, neg, 0.0, color='#4477AA', alpha=0.35, linewidth=0, zorder=2)
+        ax.plot(z, rho, color=colors[0], lw=1.4, zorder=3)
+        ax.set_xlim(min(z), max(z))
+        ax.set_xlabel(xlabel if xlabel is not None else r'$z$ (Å)')
+        ax.set_ylabel(ylabel if ylabel is not None
+                      else r'$\Delta\bar\rho$ (e/Å$^{3}$)')
+        if title:
+            ax.set_title(title)
+        if regions and any(r.get('label') for r in regions):
+            ax.legend(loc='best', fontsize=7)
+        if panel:
+            add_panel_label(ax, panel)
+        return _save_dual(fig, out_path, formats)
