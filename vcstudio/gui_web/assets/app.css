@@ -58,6 +58,9 @@
   --lattice-ink:rgba(55,215,242,.05);
 }
 *{margin:0;padding:0;box-sizing:border-box}
+/* [hidden] 兜底:作者规则(如 nav a / .ed-edit 的 display:flex)会盖过 UA 的 [hidden]{display:none};
+   统一用此规则保证 hidden 属性恒生效(场景显隐 nav、编辑器面板初始隐藏、侧滑抽屉等都依赖它) */
+[hidden]{display:none!important}
 body{background:var(--bg);color:var(--ink);font:13px/1.6 var(--sans);display:flex;min-height:100vh}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
@@ -276,3 +279,110 @@ pre.meth-pre{white-space:pre-wrap;word-break:break-word;max-height:200px}
 #page-settings .ap-sub{padding-left:2px;display:flex;flex-direction:column;gap:8px}
 #page-settings .set-2col{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}
 @media (max-width:720px){#page-settings .set-2col{grid-template-columns:1fr}}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   v3.1 GUI 总集成:starpivot 式工作流步进 + 结构编辑器 + 出图画廊 + AI 助手
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── 侧栏工作流步骤编号徽章(CSS circle,当前页高亮) ── */
+nav a .stepno{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;
+  flex-shrink:0;border-radius:50%;border:1.5px solid var(--nav-grp);color:var(--nav-fg);
+  font:700 10px/1 var(--mono);font-style:normal}
+nav a:hover .stepno{border-color:var(--nav-fg-hover);color:var(--nav-fg-hover)}
+nav a.on .stepno{background:var(--accent);border-color:var(--accent);color:#fff}
+
+/* ── 实验性徽标(引擎选择器等) ── */
+.exp-badge{display:inline-block;font-family:var(--mono);font-size:9.5px;font-weight:700;letter-spacing:.04em;
+  padding:1px 6px;border-radius:4px;background:var(--warn-bg);color:var(--warn);vertical-align:1px;margin-left:2px}
+
+/* ── 结构建模页:复用生成页表单原语(gen-*/chips/sac-prev) ── */
+#page-structure .gen-h{font-weight:700;font-size:13px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--rule)}
+#page-structure .gen-fld{display:flex;flex-direction:column;gap:4px;margin-bottom:12px}
+#page-structure .gen-lbl{font-size:11.5px;color:var(--muted)}
+#page-structure .gen-inrow{display:flex;gap:8px;align-items:center}
+#page-structure .gen-inrow .btn{flex:0 0 auto}
+#page-structure .chips{display:flex;gap:6px;flex-wrap:wrap}
+#page-structure .chip{font-size:11.5px;padding:3px 10px;border:1px solid var(--rule);border-radius:12px;background:var(--surface);cursor:pointer;user-select:none;color:var(--ink)}
+#page-structure .chip.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent-dark)}
+#page-structure .sac-prev{font-size:12px;color:var(--muted);line-height:1.5;margin:8px 0 0;padding:8px 10px;border:1px solid var(--rule);border-radius:6px;background:var(--surface);min-height:18px}
+#page-structure .sac-prev b{color:var(--ink);font-variant-numeric:tabular-nums}
+
+/* ── 结构查看/编辑器 ── */
+.ed-toolbar{display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap}
+.ed-vac{font-family:var(--mono);font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+.ed-main{display:grid;grid-template-columns:1fr 260px;gap:14px;align-items:start}
+@media (max-width:820px){.ed-main{grid-template-columns:1fr}}
+.ed-main .struct-canvas{height:380px}
+.ed-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;
+  padding:24px;color:var(--muted);font-size:12.5px;line-height:1.7}
+.ed-side{display:flex;flex-direction:column;gap:12px}
+.ed-selinfo{font-family:var(--mono);font-size:11.5px;color:var(--ink);background:var(--code-bg);
+  border:1px solid var(--rule);border-radius:6px;padding:8px 10px;line-height:1.6;word-break:break-all}
+.ed-edit,.ed-fix{display:flex;flex-direction:column;gap:8px;border:1px solid var(--rule);border-radius:6px;padding:10px}
+.ed-row{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--ink);flex-wrap:wrap}
+.ed-move{display:grid;grid-template-columns:repeat(2,1fr);gap:6px}
+.ed-move .btn{padding:6px 0;font-family:var(--mono)}
+.ed-fixstate{color:var(--ok)}
+
+/* ── 分子库网格 ── */
+.mol-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px}
+.mol-card{border:1px solid var(--rule);border-radius:6px;padding:10px 12px;background:var(--surface)}
+.mol-card b{font-size:12.5px;display:block}
+.mol-card span{font-family:var(--mono);font-size:10.5px;color:var(--muted)}
+.mol-card .spin-hint{color:var(--warn)}
+
+/* ── 论文出图页:预设画廊 + 侧滑详情 ── */
+.fig-srcrow{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.fig-cat{margin-bottom:16px}
+.fig-cat-h{font-weight:700;font-size:12.5px;color:var(--muted);letter-spacing:.06em;margin:4px 0 10px;
+  padding-bottom:6px;border-bottom:1px solid var(--rule)}
+.fig-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px}
+.fig-card{border:1px solid var(--rule);border-radius:8px;background:var(--surface);padding:12px;cursor:pointer;
+  display:flex;flex-direction:column;gap:8px;transition:border-color .12s,box-shadow .12s}
+.fig-card:hover{border-color:var(--accent);box-shadow:0 4px 14px rgba(22,32,43,.10)}
+.fig-thumb{height:70px;display:flex;align-items:center;justify-content:center;background:var(--code-bg);
+  border:1px solid var(--rule);border-radius:6px}
+.fig-thumb svg{width:80px;height:60px}
+.fig-card b{font-size:12.5px}
+.fig-card .fig-desc{font-size:11px;color:var(--muted);line-height:1.5}
+.fig-drawer{position:fixed;inset:0;z-index:110}
+.fig-drawer[hidden]{display:none}
+.fig-drawer-mask{position:absolute;inset:0;background:rgba(22,32,43,.42)}
+.fig-drawer-panel{position:absolute;top:0;right:0;height:100%;width:min(460px,94vw);background:var(--surface);
+  border-left:1px solid var(--rule-strong);box-shadow:-8px 0 30px rgba(22,32,43,.22);display:flex;flex-direction:column}
+.fig-drawer-head{display:flex;align-items:center;gap:10px;padding:16px 20px;border-bottom:1px solid var(--rule)}
+.fig-drawer-title{font-weight:700;font-size:14px;flex:1}
+.fig-drawer-body{flex:1;overflow:auto;padding:16px 20px;font-size:12.5px;line-height:1.7}
+.fig-drawer-body .fig-need{color:var(--muted);background:var(--code-bg);border:1px solid var(--rule);
+  border-radius:6px;padding:8px 10px;margin-bottom:14px;font-size:12px;line-height:1.6}
+.fig-drawer-foot{padding:12px 20px;border-top:1px solid var(--rule);display:flex;justify-content:flex-end}
+.fig-param{display:flex;flex-direction:column;gap:4px;margin-bottom:12px}
+.fig-param label{font-size:11.5px;color:var(--muted)}
+
+/* ── AI 助手页 ── */
+.ai-guide{background:var(--warn-bg);color:var(--warn);border:1px solid #E4CE93;border-radius:6px;
+  padding:10px 13px;font-size:12.5px;line-height:1.6;margin-bottom:14px}
+.ai-autowarn{background:var(--fail-bg);color:var(--fail);border:1px solid var(--fail);border-radius:6px;
+  padding:9px 12px;font-size:12px;line-height:1.6;margin-bottom:10px}
+#page-ai .gen-h{font-weight:700;font-size:13px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--rule)}
+#page-ai .gen-inrow{display:flex;gap:8px;align-items:center}
+#page-ai textarea.ipt{resize:vertical;font-family:var(--mono);font-size:11.5px;line-height:1.55}
+.ai-spec-group{margin-bottom:14px}
+.ai-spec-group-h{font-weight:700;font-size:12px;color:var(--muted);letter-spacing:.05em;margin-bottom:8px}
+.ai-cell{display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap}
+.ai-cell-k{font-family:var(--mono);font-size:11px;color:var(--muted);flex:0 0 130px}
+.ai-cell .ipt{flex:1;min-width:120px}
+.ai-lowconf{display:inline-block;font-family:var(--mono);font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px;
+  background:var(--warn-bg);color:var(--warn)}
+.ai-origin{font-family:var(--mono);font-size:10px;color:var(--muted);cursor:help}
+.ai-plan-stat{display:flex;gap:20px;flex-wrap:wrap;margin-bottom:10px;font-size:12.5px}
+.ai-plan-stat b{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--accent-dark)}
+
+/* ── 首启研究场景选择模态(简洁卡片式) ── */
+.scene-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:4px}
+@media (max-width:520px){.scene-grid{grid-template-columns:1fr}}
+.scene-card{border:1px solid var(--rule-strong);border-radius:8px;padding:12px 14px;cursor:pointer;
+  display:flex;flex-direction:column;gap:5px;transition:border-color .12s,box-shadow .12s}
+.scene-card:hover{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)}
+.scene-card b{font-size:13px}
+.scene-card span{font-size:11px;color:var(--muted);line-height:1.55}

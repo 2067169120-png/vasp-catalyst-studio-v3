@@ -391,6 +391,91 @@ document.addEventListener('vcs:page', e => {
   if (e.detail && e.detail.page === 'dashboard') renderFeed();
 });
 
+// ── i18n:按 data-i18n 属性替换文本(缺键保留原中文,en 缺失回落 zh 已在后端处理) ──
+VCS.i18n = { dict: {}, lang: 'zh' };
+VCS.applyI18n = function (dict) {
+  if (dict) VCS.i18n.dict = dict;
+  const d = VCS.i18n.dict || {};
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const k = el.getAttribute('data-i18n');
+    if (k && Object.prototype.hasOwnProperty.call(d, k)) el.textContent = d[k];
+  });
+  document.querySelectorAll('[data-i18n-ph]').forEach(el => {
+    const k = el.getAttribute('data-i18n-ph');
+    if (k && Object.prototype.hasOwnProperty.call(d, k)) el.setAttribute('placeholder', d[k]);
+  });
+};
+VCS.loadLang = async function (lang) {
+  let lg = lang;
+  if (!lg) { const g = await VCS.call('lang_get'); lg = (g && g.lang) || 'zh'; }
+  VCS.i18n.lang = lg;
+  const r = await VCS.call('i18n_dict', lg);
+  if (r && r.dict) VCS.applyI18n(r.dict);
+  try { document.documentElement.lang = (lg === 'en' ? 'en' : 'zh-CN'); } catch (_) { /* 忽略 */ }
+  return lg;
+};
+
+// ── 研究场景:按 data-scene 点分路径显隐 nav 项与卡片(镜像 scenarios.is_visible 口径) ──
+VCS.scenario = null;
+function sceneVisible(sc, path) {
+  if (!sc || !path) return true;
+  const parts = path.split('.'); const head = parts[0]; const rest = parts.slice(1);
+  if (head === 'pages') return rest.length > 0 && (sc.pages || []).indexOf(rest[0]) >= 0;
+  if (head === 'engines') return rest.length > 0 && (sc.engines || []).indexOf(rest[0]) >= 0;
+  if (head === 'reactions') return rest.length > 0 && (sc.reaction_presets || []).indexOf(rest[0]) >= 0;
+  if (head === 'figures') return rest.length > 0 && (sc.figure_preset_order || []).indexOf(rest[0]) >= 0;
+  if (head === 'cards') {
+    let node = sc.cards || {};
+    for (let i = 0; i < rest.length; i++) {
+      const k = rest[i];
+      if (typeof node !== 'object' || node === null || !(k in node)) return true;  // 未覆盖 → 默认可见
+      node = node[k];
+    }
+    return (typeof node === 'boolean') ? node : true;
+  }
+  return true;                             // 未知路径族保守可见(fail-open)
+}
+VCS.sceneVisible = sceneVisible;
+VCS.applyScenario = function (sc) {
+  if (sc) VCS.scenario = sc;
+  const s = VCS.scenario;
+  if (!s) return;
+  document.querySelectorAll('[data-scene]').forEach(el => {
+    el.hidden = !sceneVisible(s, el.getAttribute('data-scene'));
+  });
+  // 当前页被场景隐藏 → 退回概览,避免停在空白隐藏页
+  const cur = document.querySelector('nav a.on');
+  if (cur && cur.hidden) {
+    const dash = document.querySelector('nav a[data-page="dashboard"]');
+    if (dash) dash.click();
+  }
+  document.dispatchEvent(new CustomEvent('vcs:scenario', { detail: { scenario: s } }));
+};
+
+// ── 首启研究场景选择模态(config 无 ui.scenario 时;简洁卡片式,含"全功能") ──
+async function firstLaunchScenario() {
+  const r = await VCS.call('scenario_list');
+  const list = (r && r.scenarios) || [];
+  if (!list.length) return;
+  const box = document.createElement('div');
+  box.innerHTML = '<div class="scene-grid">' + list.map(s =>
+    `<div class="scene-card" data-key="${VCS.esc(s.key)}"><b>${VCS.esc(s.name)}</b>` +
+    `<span>${VCS.esc(s.description)}</span></div>`).join('') + '</div>';
+  const m = VCS.modal({ title: '选择研究场景(界面据此裁剪;可随时在设置页更改)',
+    body: box, actions: [] });
+  m.el.classList.add('modal-wide');
+  box.querySelectorAll('.scene-card').forEach(c => c.addEventListener('click', async () => {
+    const key = c.dataset.key;
+    m.close();
+    const res = await VCS.call('scenario_set', key);
+    if (res && res.scenario) {
+      VCS.applyScenario(res.scenario);
+      VCS.toast('已选择研究场景:' + (res.scenario.name || key));
+    }
+  }));
+}
+VCS.firstLaunchScenario = firstLaunchScenario;
+
 // ── 桥就绪:界面桥读数(小字,避免误读为集群已连)+ 启动自动驾驶编排器 ──
 VCS.ready.then(async () => {
   try {
@@ -398,6 +483,14 @@ VCS.ready.then(async () => {
     renderHealth();                        // 初始:仅"界面桥 ✓"
     VCS.refreshNavFoot();
     VCS.pipeline.reconfigure();
+    try { await VCS.loadLang(); } catch (_) { /* 语言失败不挡界面 */ }
+    try {
+      const sc = await VCS.call('scenario_get');
+      if (sc && sc.scenario) {
+        VCS.applyScenario(sc.scenario);
+        if (!sc.configured) firstLaunchScenario();   // 首启弹场景选择模态
+      }
+    } catch (_) { /* 场景失败不挡界面 */ }
   } catch (_) {
     const el = document.getElementById('conn');
     if (el) el.innerHTML = '<span class="dot g"></span><span class="bridge">界面桥 响应异常</span>';

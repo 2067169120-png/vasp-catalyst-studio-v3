@@ -28,6 +28,22 @@ _TERMINAL_FAIL = ('FAILED', 'UNCONVERGED')
 # SAC 矩阵机时粗估系数(核时·原子⁻¹·作业⁻¹,数量级参考,可解释:Σ原子数 × 系数)
 _SAC_EST_COEF = 0.8
 
+# 图表预设 → 数据装配路线(render_figure_preset 据此从项目数据组装或降级 skipped):
+#   _FIG_FROM_DELTA  能量学:柱状图/矩阵表/热图,取 delta_e_rows 的已完成 ΔE
+#   _FIG_LADDER      电池/电化学:自由能台阶,取 freeenergy/reactions 路径
+#   _FIG_MULTI       标度/火山:单项目无法出(需多催化剂对比),降级 skipped
+#   _FIG_NEEDS_PARSE 电子结构/NEB/差分电荷/收敛测试:需对应解析产物,项目层无从组装 → skipped
+_FIG_FROM_DELTA = ('adsorption_bar', 'energy_matrix_table', 'delta_e_heatmap')
+_FIG_LADDER = ('free_energy_ladder', 'free_energy_ladder_multi')
+_FIG_MULTI = ('scaling_relation', 'volcano')
+_FIG_NEEDS_PARSE = {
+    'pdos': 'PDOS 需电子结构静态计算的投影态密度解析产物;请在④页对 DONE 作业派生 PDOS 后单独出图。',
+    'cohp': 'COHP 键强图需 LOBSTER 的 COHPCAR 解析产物;项目层暂无从组装。',
+    'neb_profile': 'NEB 剖面需 CI-NEB 各像能量(过渡态搜索产物);项目层暂无从组装。',
+    'charge_profile': '差分电荷面平均需 CHGDIFF 的面平均序列;请先派生差分电荷计算。',
+    'convergence_curve': '收敛测试曲线需真实的截断能/K 点收敛历史值,该图型将在后续版本提供。',
+}
+
 
 def _norm_calc_type(x) -> str:
     """归一化前端传入的计算类型:非法/缺省一律回落 'slab'(保守且向后兼容)。"""
@@ -45,7 +61,10 @@ class Api:
                  conv_mod=None, sview_mod=None, methods_mod=None, dialog_fn=None,
                  native_charts_mod=None, freeenergy_mod=None, ai_analysis_mod=None,
                  freq_builder_mod=None, estatic_mod=None, sac_mods=None,
-                 spin_mod=None, reactions_mod=None, campaign_mods=None):
+                 spin_mod=None, reactions_mod=None, campaign_mods=None,
+                 scenarios_mod=None, i18n_mod=None, figure_presets_mod=None,
+                 draftpack_mod=None, ai_paper_mod=None, engines_mod=None,
+                 slab_builder_mod=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -57,6 +76,10 @@ class Api:
         from vcstudio.cluster import convergence as _conv
         from vcstudio.generate import structure_view as _sview
         from vcstudio.generate import methods_text as _methods
+        from vcstudio.shared import scenarios as _scen
+        from vcstudio.shared import i18n as _i18n_m
+        from vcstudio.project import figure_presets as _figp
+        from vcstudio.generate import slab_builder as _slabb
         self._profiles = profiles_mod or _p
         self._secrets = secrets_mod or _s
         self._ledger = ledger_mod or _l
@@ -90,6 +113,15 @@ class Api:
         self._spin = spin_mod
         self._reactions = reactions_mod
         self._campaign = campaign_mods
+        # v3.1 GUI 总集成:研究场景 / i18n / 图表预设 / slab_builder 为纯或轻模块,即时导入
+        # (测试注入假件);draftpack/ai_paper/engines 牵扯较重依赖,延迟到用时 import。
+        self._scenarios = scenarios_mod or _scen
+        self._i18n = i18n_mod or _i18n_m
+        self._figpresets = figure_presets_mod or _figp
+        self._slab_builder = slab_builder_mod or _slabb
+        self._draftpack = draftpack_mod
+        self._ai_paper = ai_paper_mod
+        self._engines = engines_mod
 
     # ── 桥活性探测(前端用来确认 js_api 已就绪) ──
     def ping(self) -> str:
@@ -183,6 +215,27 @@ class Api:
             import vcstudio.campaign as campaign
             self._campaign = campaign
         return self._campaign
+
+    def _dp(self):
+        """收尾流水线 Draft-Ready 延迟加载(牵扯 adsorption/methods_text/incar_builder)。"""
+        if self._draftpack is None:
+            from vcstudio.project import draftpack
+            self._draftpack = draftpack
+        return self._draftpack
+
+    def _aip(self):
+        """AI 论文智能体延迟加载(牵扯 campaign 全套 + ai_analysis)。"""
+        if self._ai_paper is None:
+            from vcstudio.project import ai_paper
+            self._ai_paper = ai_paper
+        return self._ai_paper
+
+    def _eng(self):
+        """多引擎适配层延迟加载(4 个 Backend + poscar/structure_view)。"""
+        if self._engines is None:
+            import vcstudio.engines as engines
+            self._engines = engines
+        return self._engines
 
     def _resolve(self, name, password):
         """名字 → (profile, 密码, err_dict|None)。
@@ -2060,3 +2113,512 @@ class Api:
                     'error': None}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'available': False, 'campaigns': [], 'error': str(e)}
+
+    # ── 研究场景(界面裁剪:显隐页面/卡片/图型/引擎/反应预设) ────────────────────
+    @staticmethod
+    def _scenario_view(sc):
+        """场景 dict → 前端消费视图(JSON-safe;含显隐判定所需全部键)。"""
+        return {
+            'key': sc.get('key'), 'name': sc.get('name'),
+            'description': sc.get('description'),
+            'pages': list(sc.get('pages') or []),
+            'cards': sc.get('cards') or {},
+            'figure_preset_order': list(sc.get('figure_preset_order') or []),
+            'reaction_presets': list(sc.get('reaction_presets') or []),
+            'engines': list(sc.get('engines') or []),
+            'defaults': sc.get('defaults') or {},
+            'ai_context': sc.get('ai_context') or '',
+        }
+
+    def scenario_list(self):
+        """全部内置研究场景(展示序)→ {'ok','scenarios':[view...],'error'}(首启场景选择模态用)。"""
+        try:
+            out = [self._scenario_view(s) for s in self._scenarios.list_scenarios()]
+            return {'ok': True, 'scenarios': out, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'scenarios': [], 'error': str(e)}
+
+    def scenario_get(self):
+        """当前生效场景 + 是否已显式配置(config 无 ui.scenario → configured=False,首启弹模态)。"""
+        try:
+            try:
+                cfg = self._config.load_config()
+            except Exception:                             # noqa: BLE001
+                cfg = {}
+            ui = self._config.get_ui_state(cfg)
+            configured = bool(isinstance(ui, dict) and ui.get('scenario'))
+            sc = self._scenarios.active_scenario(cfg)
+            return {'ok': True, 'configured': configured,
+                    'scenario': self._scenario_view(sc), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'configured': False, 'scenario': None, 'error': str(e)}
+
+    def scenario_set(self, key):
+        """切换研究场景(写 config ui.scenario)→ 返回新场景视图供前端即时 applyScenario。"""
+        try:
+            k = (key or '').strip()
+            self._scenarios.set_scenario(k)
+            sc = self._scenarios.get_scenario(k)
+            return {'ok': True, 'key': sc.get('key'),
+                    'scenario': self._scenario_view(sc), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'scenario': None, 'error': str(e)}
+
+    # ── 界面语言(i18n:zh 基准 + en 回落) ──────────────────────────────────────
+    def lang_get(self):
+        """当前界面语言 + 可选语言列表 → {'ok','lang','available','error'}。"""
+        try:
+            try:
+                cfg = self._config.load_config()
+            except Exception:                             # noqa: BLE001
+                cfg = {}
+            return {'ok': True, 'lang': self._i18n.current_lang(cfg),
+                    'available': self._i18n.available_langs(), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'lang': 'zh', 'available': [], 'error': str(e)}
+
+    def lang_set(self, lang):
+        """切换界面语言(写 config ui.lang);前端据返回值重拉 i18n_dict 换文案。"""
+        try:
+            lg = (lang or '').strip() or 'zh'
+            self._i18n.set_lang(lg)
+            return {'ok': True, 'lang': lg, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def i18n_dict(self, lang):
+        """某语言的完整词典(回落补齐后)→ {'ok','lang','dict','error'};供前端一次性注入替换。"""
+        try:
+            lg = (lang or '').strip() or 'zh'
+            return {'ok': True, 'lang': lg,
+                    'dict': self._i18n.export_for_js(lg), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'lang': lang, 'dict': {}, 'error': str(e)}
+
+    # ── 论文出图:图表预设画廊 + 一键出图(数据后端装配) ───────────────────────
+    def figure_presets(self):
+        """图表预设清单(含缩略 SVG + 参数 schema)→ 论文出图页画廊按分类渲染。"""
+        try:
+            fp = self._figpresets
+            presets = []
+            for p in fp.list_presets():
+                key = p.get('key')
+                try:
+                    thumb = fp.get_preset(key).get('thumbnail_svg', '')
+                except Exception:                         # noqa: BLE001 缩略缺失不致命
+                    thumb = ''
+                presets.append({
+                    'key': key, 'name': p.get('name'), 'category': p.get('category'),
+                    'description': p.get('description', ''),
+                    'required_data': p.get('required_data', ''),
+                    'thumbnail_svg': thumb,
+                    'params_schema': p.get('params_schema') or {},
+                })
+            return {'ok': True, 'presets': presets,
+                    'categories': fp.categories(), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'presets': [], 'categories': [], 'error': str(e)}
+
+    def render_figure_preset(self, key, project_path, params=None):
+        """按图表预设 + 当前项目出图:后端从项目数据装配 → figure_presets.render_preset 出图。
+
+        能量学类(柱/表/热图)取 delta_e_rows 的已完成 ΔE;台阶图取 freeenergy/reactions 路径
+        (params.reaction_preset 为空 → Li-S 放电,向后兼容);标度/火山需多催化剂对比、电子结构/
+        NEB/差分电荷需专门解析产物 → 项目层无从组装,返回中文 skipped 原因(绝不假装出图)。
+        返回 {'ok','files','skipped':[{kind,reason}],'out_dir','provenance','error'}。
+        """
+        empty = {'ok': True, 'files': [], 'skipped': [], 'out_dir': None,
+                 'provenance': None, 'error': None}
+        try:
+            k = str(key or '').strip()
+            params = dict(params or {})
+            fp = self._figpresets
+            try:
+                fp.get_preset(k)                          # 校验预设 key 存在(未知即抛)
+            except Exception:                             # noqa: BLE001 未知预设
+                return {**empty, 'ok': False, 'error': f'未知图表预设:{k}'}
+            # 需专门解析产物的图型(电子结构/NEB/差分电荷/收敛):项目层无从组装 → skipped
+            if k in _FIG_NEEDS_PARSE:
+                return {**empty, 'skipped': [{'kind': k, 'reason': _FIG_NEEDS_PARSE[k]}]}
+            # 标度/火山:单项目无法出(需多催化剂横比)→ skipped 明说去④页多项目对比
+            if k in _FIG_MULTI:
+                return {**empty, 'skipped': [{'kind': k,
+                        'reason': '标度关系/火山图需多催化剂横向对比(≥3 组);'
+                                  '请在④结果分析页用「多项目对比」出图。'}]}
+            proj = self._adsorption.load_project((project_path or '').strip())
+            if proj is None:
+                return {**empty, 'ok': False,
+                        'error': '项目不存在或 project.yaml 已被移动'}
+            reaction_preset = params.pop('reaction_preset', None) or None
+            save_to = (params.pop('save_to', None) or '').strip()
+            shorts, des, summary = self._proj_delta_data(proj)
+            pname = str(proj.get('name') or '') or '项目'
+            out_dir = save_to or os.path.join(
+                str(proj.get('root') or os.path.dirname(str(project_path))), 'figures')
+
+            data, skipped = None, None
+            if k in _FIG_FROM_DELTA:
+                done = [(s, d) for s, d in zip(shorts, des) if d is not None]
+                if not done:
+                    skipped = '无已完成的 ΔE(需构型 + 清洁表面 + 参考全 DONE)'
+                elif k == 'delta_e_heatmap':
+                    data = {'rows': [pname], 'cols': [s for s, _ in done],
+                            'values': [[d for _, d in done]]}
+                else:
+                    data = {'adsorbates': [s for s, _ in done],
+                            'substrates': {pname: [d for _, d in done]}}
+            elif k in _FIG_LADDER:
+                if reaction_preset:
+                    fed, reason, ptitle = self._proj_fed_preset(
+                        proj, summary, reaction_preset)
+                else:
+                    fed, reason = self._proj_fed(proj, summary)
+                    ptitle = 'Li-S discharge path'
+                if fed is None:
+                    skipped = reason
+                else:
+                    data = {'paths': [{'name': pname,
+                                       'G': [st['G'] for st in fed['steps']]}],
+                            'step_labels': [st['label'] for st in fed['steps']],
+                            'pds_index': fed.get('pds_index')}
+                    params.setdefault('title', ptitle)
+            else:
+                skipped = '该预设暂不支持从项目数据一键出图'
+
+            if skipped is not None:
+                return {**empty, 'skipped': [{'kind': k, 'reason': skipped}]}
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, k + '.png')
+            files = fp.render_preset(k, data, out_path, **params)
+            prov = None
+            try:
+                prov = fp.preset_provenance(
+                    k, {'project': pname, 'source': 'delta_e_rows'}, params=params)
+            except Exception:                             # noqa: BLE001 溯源失败不挡出图
+                prov = None
+            return {'ok': True, 'files': list(files), 'skipped': [],
+                    'out_dir': out_dir, 'provenance': prov, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {**empty, 'ok': False, 'error': str(e)}
+
+    # ── 一键成稿包(Draft-Ready 收尾流水线) ────────────────────────────────────
+    def draft_ready(self, path, out):
+        """一键成稿包:SI zip + 三线表 + 口径稽核 + Methods → {'ok','summary','issues','products'}。
+
+        稽核不过/SI 缺关键输入仍产全套工件但 ok=False(DRAFT_READY.md 首行醒目);products 汇
+        总全部落盘文件供前端列出 + open_dir。
+        """
+        try:
+            proj = self._adsorption.load_project((path or '').strip())
+            if proj is None:
+                return {'ok': False, 'summary': None, 'issues': [], 'products': [],
+                        'issues_total': 0, 'summary_path': None, 'out_dir': None,
+                        'error': '项目不存在或 project.yaml 已被移动'}
+            o = (out or '').strip()
+            if not o:
+                return {'ok': False, 'summary': None, 'issues': [], 'products': [],
+                        'issues_total': 0, 'summary_path': None, 'out_dir': None,
+                        'error': '未指定成稿包输出目录'}
+            res = self._dp().draft_ready(proj, o)
+            report = res.get('report') or {}
+            products = []
+            si = report.get('si_package') or {}
+            if si.get('zip_path'):
+                products.append(si['zip_path'])
+            products += list((report.get('tables') or {}).get('files') or [])
+            products += list((report.get('methods') or {}).get('files') or [])
+            if res.get('summary_path'):
+                products.append(res['summary_path'])
+            return {'ok': bool(res.get('ok')), 'summary': res.get('summary'),
+                    'issues': list(res.get('issues') or []),
+                    'issues_total': int(res.get('issues_total', 0) or 0),
+                    'products': products, 'summary_path': res.get('summary_path'),
+                    'out_dir': o, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'summary': None, 'issues': [], 'products': [],
+                    'issues_total': 0, 'summary_path': None, 'out_dir': None,
+                    'error': str(e)}
+
+    # ── AI 助手:论文 → 规格表 → 计划 → 实例化(转发 ai_paper) ─────────────────
+    def ai_extract(self, source, transport=None):
+        """论文/文本 → 可编辑规格表(LLM 只抽文本 + 每格带出处;allow_external 门在引擎内)。
+
+        返回 {'ok','spec','issues','error'};transport 沿用 ai_analysis(测试注入假件离线可测)。
+        """
+        try:
+            res = self._aip().extract_spec(source, transport=transport)
+            return {'ok': bool(res.get('ok')), 'spec': res.get('spec'),
+                    'issues': list(res.get('issues') or []),
+                    'error': res.get('error')}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'spec': None, 'issues': [], 'error': str(e)}
+
+    def ai_plan(self, spec):
+        """规格表 → 实例化计划(纯计划对象,不落盘)→ {'ok','plan','jobs_estimate','est_core_hours'}。
+
+        est_core_hours 经 dry-run instantiate 取机时预算闸估值(不写盘);warnings 透传计划告警。
+        """
+        try:
+            res = self._aip().plan_campaign(spec)
+            plan = res.get('plan') or {}
+            est = None
+            try:
+                dry = self._aip().instantiate(plan, '(dry-run)', dry_run=True)
+                est = ((dry.get('gates') or {}).get('budget') or {}).get(
+                    'estimated_core_hours')
+            except Exception:                             # noqa: BLE001 估值失败不挡计划
+                est = None
+            return {'ok': bool(res.get('ok')), 'plan': plan,
+                    'jobs_estimate': plan.get('jobs_estimate'),
+                    'est_core_hours': est,
+                    'warnings': list(plan.get('warnings') or []), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'plan': None, 'jobs_estimate': 0,
+                    'est_core_hours': None, 'warnings': [], 'error': str(e)}
+
+    def ai_instantiate(self, plan, out_root, opts=None):
+        """计划 → campaign(门禁序列:机时闸 + 单点先行 + 写盘 + 账本;全自动与交互共用)。
+
+        opts 透传 instantiate 的 confirm_token/budget_cap_hours/dry_run 等;成功且非 dry_run 则把
+        campaign 目录记入仪表盘发现表。返回 {'ok','created','campaign_dir','gates','pilot','awaiting'}。
+        """
+        try:
+            root = (out_root or '').strip()
+            if not root:
+                return {'ok': False, 'created': [], 'campaign_dir': None,
+                        'gates': {}, 'error': '未指定输出根目录'}
+            res = self._aip().instantiate(plan, root, **dict(opts or {}))
+            if res.get('campaign_dir') and not res.get('dry_run'):
+                self._register_campaign_dir(res['campaign_dir'])
+            return {'ok': bool(res.get('ok')), 'created': list(res.get('created') or []),
+                    'campaign_dir': res.get('campaign_dir'),
+                    'gates': res.get('gates') or {}, 'pilot': res.get('pilot'),
+                    'awaiting': res.get('awaiting'), 'error': res.get('error')}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'created': [], 'campaign_dir': None,
+                    'gates': {}, 'error': str(e)}
+
+    # ── 多引擎适配(生成页引擎选择器) ──────────────────────────────────────────
+    _ENGINE_DISPLAY = {'vasp': 'VASP', 'cp2k': 'CP2K', 'gaussian': 'Gaussian',
+                       'castep': 'CASTEP'}
+
+    def engine_list(self, scenario_key=None):
+        """已注册引擎清单(按场景标可见)→ {'ok','engines':[{key,name,visible,experimental}],'default'}。
+
+        VASP 为主引擎(默认、非实验性、恒可见);CP2K/Gaussian/CASTEP 为文件级适配(实验性)。
+        给 scenario_key 时按场景 engines 白名单标 visible(vasp 恒可见),否则全部 visible。
+        """
+        try:
+            names = self._eng().available_engines()
+            vis = None
+            if scenario_key is not None:
+                sc = self._scenarios.get_scenario(scenario_key)
+                vis = set(sc.get('engines') or []) | {'vasp'}
+            engines = [{'key': n, 'name': self._ENGINE_DISPLAY.get(n, n.upper()),
+                        'experimental': n != 'vasp',
+                        'visible': True if vis is None else (n in vis)}
+                       for n in names]
+            return {'ok': True, 'engines': engines, 'default': 'vasp', 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'engines': [], 'default': 'vasp', 'error': str(e)}
+
+    def engine_generate(self, engine, params, out_dir):
+        """非 VASP 引擎输入生成(文件级适配):简化参数表单 → CalcSpec → backend.generate_inputs。
+
+        params:{poscar(结构文件路径),task,functional,cutoff_ev,kpoints([a,b,c]|None),spin,charge,
+        periodic,dispersion,multiplicity}。validate 的自洽问题并入 issues(不静默),生成失败兜 error。
+        返回 {'ok','files','warnings','issues','out_dir','error'}。
+        """
+        try:
+            params = dict(params or {})
+            eng = (engine or '').strip()
+            out = (out_dir or '').strip()
+            if not eng:
+                return {'ok': False, 'files': [], 'warnings': [], 'issues': [],
+                        'out_dir': None, 'error': '未指定引擎'}
+            if not out:
+                return {'ok': False, 'files': [], 'warnings': [], 'issues': [],
+                        'out_dir': None, 'error': '未选输出目录'}
+            poscar = (params.get('poscar') or '').strip()
+            if not poscar or not os.path.isfile(poscar):
+                return {'ok': False, 'files': [], 'warnings': [], 'issues': [],
+                        'out_dir': None, 'error': '结构文件(POSCAR)不存在'}
+            with open(poscar, 'r', encoding='utf-8', errors='replace') as f:
+                structure = f.read()
+            mods = self._eng()
+            kpts = params.get('kpoints')
+            if isinstance(kpts, (list, tuple)) and len(kpts) >= 3:
+                try:
+                    kpts = tuple(int(x) for x in kpts[:3])
+                except (TypeError, ValueError):
+                    kpts = None
+            else:
+                kpts = None
+            cutoff = params.get('cutoff_ev')
+            spec = mods.CalcSpec(
+                structure=structure, task=(params.get('task') or 'relax'),
+                functional=(params.get('functional') or 'PBE'),
+                periodic=bool(params.get('periodic', True)),
+                dispersion=(params.get('dispersion') or None),
+                cutoff_ev=(float(cutoff) if cutoff not in (None, '') else None),
+                kpoints=kpts, spin=bool(params.get('spin', False)),
+                charge=int(params.get('charge') or 0),
+                multiplicity=int(params.get('multiplicity') or 1))
+            issues = list(mods.validate(spec))
+            backend = mods.get_backend(eng)
+            os.makedirs(out, exist_ok=True)
+            res = backend.generate_inputs(spec, out)
+            return {'ok': True, 'files': list(res.get('files') or []),
+                    'warnings': list(res.get('warnings') or []),
+                    'issues': issues, 'out_dir': out, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'files': [], 'warnings': [], 'issues': [],
+                    'out_dir': None, 'error': str(e)}
+
+    def engine_nonequiv(self, src, dst):
+        """跨引擎方法不等价清单(不静默翻译)→ {'ok','report':[中文逐条],'error'}(生成页告警条)。"""
+        try:
+            report = self._eng().nonequivalence_report(src, dst)
+            return {'ok': True, 'report': list(report), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'report': [], 'error': str(e)}
+
+    # ── 结构查看/编辑器(结构建模页;api 只做 解析/写出/固定层 纯转换,注入可测) ─────
+    def _state_to_poscar(self, state, *, sd=None):
+        """编辑器 JS 状态 {elements,coords,lattice} → (POSCAR 文本, perm)。
+
+        按物种(首见序)分块以满足 VASP 计数契约;perm 为 state 原子序 → 写出序的映射,供固定层
+        标志回填。sd 给定(每 state 原子 bool,True=冻结)且有真值时写 Selective dynamics。
+        """
+        elements = list((state or {}).get('elements') or [])
+        coords = [list(c) for c in ((state or {}).get('coords') or [])]
+        lattice = [list(r) for r in ((state or {}).get('lattice') or [])]
+        if not elements or len(elements) != len(coords):
+            raise ValueError('结构状态无效(元素数与坐标数不一致)')
+        if len(lattice) != 3 or any(len(r) < 3 for r in lattice):
+            raise ValueError('晶格矢量须为 3×3')
+        uniq = []
+        for e in elements:
+            if e not in uniq:
+                uniq.append(e)
+        perm = [i for sp in uniq for i, e in enumerate(elements) if e == sp]
+        counts = [sum(1 for e in elements if e == sp) for sp in uniq]
+        use_sd = isinstance(sd, list) and any(bool(x) for x in sd)
+        lines = ['vcstudio structure editor', '1.0']
+        for r in lattice:
+            lines.append('  ' + ' '.join(f'{float(x):.10f}' for x in r[:3]))
+        lines.append('  ' + ' '.join(str(s) for s in uniq))
+        lines.append('  ' + ' '.join(str(c) for c in counts))
+        if use_sd:
+            lines.append('Selective dynamics')
+        lines.append('Cartesian')
+        for idx in perm:
+            x, y, z = coords[idx][:3]
+            row = f'  {float(x):.10f} {float(y):.10f} {float(z):.10f}'
+            if use_sd:
+                fixed = idx < len(sd) and bool(sd[idx])
+                row += '  ' + ('F F F' if fixed else 'T T T')
+            lines.append(row)
+        return '\n'.join(lines) + '\n', perm
+
+    @staticmethod
+    def _parse_sd_fixed(poscar_text):
+        """带 Selective dynamics 的 POSCAR → 每原子是否冻结(首标志 F)的 bool 列表(写出序)。"""
+        lines = poscar_text.splitlines()
+        if not (len(lines) > 7 and lines[7].strip()[:1].lower() == 's'):
+            return []
+        try:
+            natoms = sum(int(x) for x in lines[6].split())
+        except (ValueError, IndexError):
+            natoms = 0
+        out = []
+        for k in range(natoms):
+            idx = 9 + k
+            parts = lines[idx].split() if idx < len(lines) else []
+            out.append(len(parts) >= 6 and parts[3].strip().upper() == 'F')
+        return out
+
+    def struct_load(self, path):
+        """加载 POSCAR/CONTCAR → {'ok','struct':{elements,coords,lattice,natoms,formula},'vacuum'}。
+
+        纯解析(复用 structure_view.parse_positions);真空厚度经 slab_builder。缺文件/畸形 → error。
+        """
+        try:
+            p = (path or '').strip()
+            if not p or not os.path.isfile(p):
+                return {'ok': False, 'struct': None, 'vacuum': None,
+                        'error': '结构文件不存在'}
+            with open(p, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+            parsed = self._sview.parse_positions(content)
+            elements = parsed['elements']
+            uniq = []
+            for e in elements:
+                if e not in uniq:
+                    uniq.append(e)
+            formula = ' '.join(f'{s}{sum(1 for e in elements if e == s)}' for s in uniq)
+            vac = None
+            try:
+                vac = round(self._slab_builder.vacuum_thickness(content), 3)
+            except Exception:                             # noqa: BLE001 真空计算失败不挡加载
+                vac = None
+            return {'ok': True, 'vacuum': vac,
+                    'struct': {'elements': elements, 'coords': parsed['coords'],
+                               'lattice': parsed['cell'], 'natoms': len(elements),
+                               'formula': formula},
+                    'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'struct': None, 'vacuum': None, 'error': str(e)}
+
+    def struct_save(self, state, path):
+        """编辑器状态 → POSCAR 落盘(Cartesian;state.fixed 有真值则写 Selective dynamics)。"""
+        try:
+            p = (path or '').strip()
+            if not p:
+                return {'ok': False, 'path': None, 'error': '未指定保存路径'}
+            sd = (state or {}).get('fixed')
+            text, _ = self._state_to_poscar(
+                state, sd=sd if isinstance(sd, list) else None)
+            os.makedirs(os.path.dirname(os.path.abspath(p)) or '.', exist_ok=True)
+            with open(p, 'w', encoding='utf-8') as f:
+                f.write(text)
+            return {'ok': True, 'path': p, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'path': None, 'error': str(e)}
+
+    def struct_fix_layers(self, state, n_layers):
+        """冻结最底 n 层(调 slab_builder.fix_bottom_layers)→ 每原子冻结 bool(state 序)+ 真空厚度。
+
+        n_layers ≤0 或 ≥ 总层数 → slab_builder 抛 ValueError,此处兜成 error。返回
+        {'ok','fixed':[bool...],'fixed_count','vacuum','error'}。
+        """
+        try:
+            n = int(n_layers)
+            text, perm = self._state_to_poscar(state)
+            new_text = self._slab_builder.fix_bottom_layers(text, n)
+            built = self._parse_sd_fixed(new_text)
+            fixed = [False] * len(perm)
+            for built_i, state_i in enumerate(perm):
+                if built_i < len(built):
+                    fixed[state_i] = built[built_i]
+            vac = None
+            try:
+                vac = round(self._slab_builder.vacuum_thickness(new_text), 3)
+            except Exception:                             # noqa: BLE001
+                vac = None
+            return {'ok': True, 'fixed': fixed,
+                    'fixed_count': sum(1 for x in fixed if x),
+                    'vacuum': vac, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'fixed': None, 'fixed_count': 0,
+                    'vacuum': None, 'error': str(e)}
+
+    def struct_vacuum(self, state):
+        """当前编辑器状态的 c 向真空层厚度(Å)→ {'ok','vacuum','error'}(编辑后实时刷新)。"""
+        try:
+            text, _ = self._state_to_poscar(state)
+            return {'ok': True,
+                    'vacuum': round(self._slab_builder.vacuum_thickness(text), 3),
+                    'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'vacuum': None, 'error': str(e)}

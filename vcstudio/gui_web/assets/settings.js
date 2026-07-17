@@ -7,6 +7,7 @@
   const val = id => { const el = $(id); return el ? el.value.trim() : ''; };
   const setVal = (id, v) => { const el = $(id); if (el) el.value = (v == null ? '' : v); };
   const setSel = (id, v) => { const el = $(id); if (el) el.value = String(v); };
+  const State = { scenarios: [] };
 
   // 提供商预设 → [base_url, model](自定义为空,不覆盖用户已填)
   const PROVIDERS = {
@@ -48,6 +49,8 @@
     if ($('set-ap-continue')) $('set-ap-continue').checked = ui.autopilot_continue !== false;
     if ($('set-ap-fetch')) $('set-ap-fetch').checked = ui.autopilot_fetch !== false;
     if ($('set-ap-report')) $('set-ap-report').checked = ui.autopilot_report !== false;
+
+    loadWorkspace();          // 界面语言 + 研究场景下拉
   }
 
   function renderKeyState(saved) {
@@ -170,6 +173,53 @@
     if (VCS.pipeline && typeof VCS.pipeline.reconfigure === 'function') VCS.pipeline.reconfigure();
   }
 
+  // ── 界面语言 + 研究场景 ──────────────────────────────────────────────────────
+  const LANG_NAMES = { zh: '中文(简体)', en: 'English' };
+  async function loadWorkspace() {
+    // 语言下拉
+    const langSel = $('set-lang');
+    if (langSel) {
+      const g = await VCS.call('lang_get');
+      const avail = (g && g.available) || ['zh', 'en'];
+      langSel.innerHTML = avail.map(l =>
+        `<option value="${l}">${LANG_NAMES[l] || l}</option>`).join('');
+      langSel.value = (g && g.lang) || 'zh';
+    }
+    // 场景下拉
+    const scSel = $('set-scenario');
+    if (scSel) {
+      const [list, cur] = await Promise.all([
+        VCS.call('scenario_list'), VCS.call('scenario_get')]);
+      State.scenarios = (list && list.scenarios) || [];
+      scSel.innerHTML = State.scenarios.map(s =>
+        `<option value="${s.key}">${VCS.esc(s.name)}</option>`).join('');
+      const curKey = (cur && cur.scenario && cur.scenario.key) || 'full';
+      scSel.value = curKey;
+      renderScenarioDesc(curKey);
+    }
+  }
+  function renderScenarioDesc(key) {
+    const d = $('set-scenario-desc');
+    const s = (State.scenarios || []).find(x => x.key === key);
+    if (d) d.textContent = s ? s.description : '';
+  }
+  async function onLangChange() {
+    const lg = $('set-lang') ? $('set-lang').value : 'zh';
+    const r = await VCS.call('lang_set', lg);
+    if (!(r && r.ok)) { VCS.log('切换语言失败:' + ((r && r.error) || '未知'), 'failc'); return; }
+    if (VCS.loadLang) await VCS.loadLang(lg);        // 重拉词典并替换 data-i18n 文本
+    VCS.log('界面语言已切换:' + lg, 'okc');
+  }
+  async function onScenarioChange() {
+    const key = $('set-scenario') ? $('set-scenario').value : 'full';
+    const r = await VCS.call('scenario_set', key);
+    if (!(r && r.ok)) { VCS.log('切换场景失败:' + ((r && r.error) || '未知'), 'failc'); return; }
+    renderScenarioDesc(key);
+    if (VCS.applyScenario && r.scenario) VCS.applyScenario(r.scenario);
+    VCS.log('研究场景已切换:' + ((r.scenario && r.scenario.name) || key), 'okc');
+    VCS.toast('已切换研究场景');
+  }
+
   // ── 初始化 ──────────────────────────────────────────────────────────────────
   function wire(id, ev, fn) { const el = $(id); if (el) el.addEventListener(ev, fn); }
 
@@ -184,6 +234,8 @@
     wire('set-molecules-btn', 'click', () => pickDirInto('set-molecules'));
     wire('set-paths-save', 'click', savePaths);
     wire('set-ap-save', 'click', saveAutopilot);
+    wire('set-lang', 'change', onLangChange);
+    wire('set-scenario', 'change', onScenarioChange);
     const row = $('set-theme-row');
     if (row) row.addEventListener('click', e => {
       const o = e.target.closest('.theme-opt');

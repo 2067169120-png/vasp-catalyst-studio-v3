@@ -201,6 +201,76 @@
     }
   }
 
+  // ── 引擎选择器:VASP(用上方四件套)/ CP2K / Gaussian / CASTEP(文件级适配,简化表单) ──
+  const State2 = { engine: 'vasp' };
+  async function loadEngines() {
+    const box = $('engine-chips');
+    if (!box) return;
+    const sceneKey = (window.VCS && VCS.scenario && VCS.scenario.key) || null;
+    const r = await VCS.call('engine_list', sceneKey);
+    const engines = (r && r.engines) || [];
+    box.innerHTML = '';
+    engines.forEach(e => {
+      const c = document.createElement('span');
+      c.className = 'chip' + (e.key === State2.engine ? ' on' : '');
+      c.dataset.val = e.key;
+      c.textContent = e.name + (e.experimental ? ' (实验性)' : '');
+      c.addEventListener('click', () => selectEngine(e.key));
+      box.appendChild(c);
+    });
+  }
+  async function selectEngine(key) {
+    State2.engine = key;
+    document.querySelectorAll('#engine-chips .chip').forEach(
+      c => c.classList.toggle('on', c.dataset.val === key));
+    const form = $('engine-form');
+    if (form) form.hidden = (key === 'vasp');
+    const banner = $('engine-nonequiv');
+    if (banner) {
+      if (key === 'vasp') { banner.hidden = true; }
+      else {
+        const nr = await VCS.call('engine_nonequiv', 'vasp', key);
+        const rep = (nr && nr.report) || [];
+        banner.hidden = !rep.length;
+        banner.innerHTML = '<b>跨引擎不等价(需逐项人工确认):</b><br>' +
+          rep.map(x => VCS.esc(x)).join('<br>');
+      }
+    }
+  }
+  async function engineGenerate() {
+    const eng = State2.engine;
+    const out = val('eng-out');
+    if (!val('eng-poscar')) { VCS.log('引擎:请选择结构 POSCAR', 'failc'); return; }
+    if (!out) { VCS.log('引擎:请选择输出目录', 'failc'); return; }
+    const kpts = val('eng-kpts').split(/[\s,]+/).map(s => parseInt(s, 10)).filter(n => !isNaN(n));
+    const params = {
+      poscar: val('eng-poscar'), functional: val('eng-func') || 'PBE',
+      dispersion: val('eng-disp') || null,
+      cutoff_ev: val('eng-cutoff') || null,
+      kpoints: kpts.length >= 3 ? kpts.slice(0, 3) : null,
+      periodic: (val('eng-periodic') || '1') === '1',
+      spin: $('eng-spin') ? $('eng-spin').checked : false,
+      charge: parseInt(val('eng-charge') || '0', 10) || 0,
+    };
+    const btn = $('engine-gen-btn');
+    if (btn) btn.disabled = true;
+    VCS.log('生成 ' + eng + ' 引擎输入(文件级适配)…');
+    try {
+      const r = await VCS.call('engine_generate', eng, params, out);
+      if (!r || r.ok === false || r.error) {
+        VCS.log('引擎生成失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+      }
+      (r.files || []).forEach(f => VCS.log('已生成:' + f, 'okc'));
+      (r.issues || []).forEach(i => VCS.log('自洽校验:' + i, 'warnc'));
+      (r.warnings || []).forEach(w => VCS.log(w, 'warnc'));
+      VCS.log(eng + ' 引擎输入已生成(软件本体用户自备)', 'okc');
+      VCS.call('open_dir', out);
+      VCS.toast('已生成 ' + eng + ' 输入');
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
   // ── 初始化:回填上次路径 + 首帧预览,绑定浏览/生成/输入监听 ──
   function wire(id, fn) { const el = $(id); if (el) el.addEventListener('click', fn); }
 
@@ -236,6 +306,12 @@
     wire('spin-incar-btn', () => pickFile('spin-incar', 'incar'));
     wire('spin-out-btn', () => pickDir('spin-out'));
     wire('spin-gen-btn', spinGenerate);
+
+    // 引擎选择器(生成页):载入引擎 chips + 浏览/生成
+    loadEngines();
+    wire('eng-poscar-btn', () => pickFile('eng-poscar', 'poscar'));
+    wire('eng-out-btn', () => pickDir('eng-out'));
+    wire('engine-gen-btn', engineGenerate);
 
     const st = await VCS.call('gen_state');
     if (st) {

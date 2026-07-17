@@ -2277,3 +2277,541 @@ def test_campaign_list_bad_campaign_does_not_break():
     api = Api(campaign_mods=fc, config_mod=_fake_config(ui={'campaign_dirs': [cdir]}))
     out = api.campaign_list()
     assert out['ok'] is True and out['campaigns'] == []   # 坏批次跳过,绝不拖垮仪表盘
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v3.1 GUI 总集成:研究场景 / i18n / 图表预设 / 成稿包 / AI 助手 / 多引擎 / 结构编辑器
+# ═══════════════════════════════════════════════════════════════════════════════
+def _fake_scenarios(calls=None, reg=None, active=None):
+    """scenarios 假件:list/get/active/set 全可注入;set 落 calls 便于断言持久化。"""
+    calls = calls if calls is not None else {}
+    full = {'key': 'full', 'name': '通用', 'description': '兜底',
+            'pages': ['dashboard', 'generate', 'project', 'jobs', 'cluster', 'settings'],
+            'cards': {}, 'figure_preset_order': ['bar', 'ladder'],
+            'reaction_presets': [], 'engines': ['vasp'],
+            'defaults': {'calc_type': 'slab'}, 'ai_context': 'x'}
+    lis = {'key': 'lis', 'name': '锂硫', 'description': 'Li-S',
+           'pages': ['dashboard', 'generate', 'project', 'jobs', 'cluster', 'settings'],
+           'cards': {}, 'figure_preset_order': ['ladder', 'volcano'],
+           'reaction_presets': ['LIS_16E'], 'engines': ['vasp'],
+           'defaults': {'calc_type': 'slab'}, 'ai_context': 'y'}
+    reg = reg if reg is not None else {'full': full, 'lis': lis}
+    m = types.SimpleNamespace()
+    m.list_scenarios = lambda: [dict(v) for v in reg.values()]
+    m.get_scenario = lambda k: dict(reg.get(k, full))
+    m.active_scenario = lambda cfg=None: dict(active if active is not None else full)
+    m.set_scenario = lambda k, *a, **kw: calls.__setitem__('set', k)
+    return m
+
+
+def _fake_i18n(calls=None, lang='zh', avail=None, dict_ret=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.current_lang = lambda cfg=None: lang
+    m.available_langs = lambda: list(avail if avail is not None else ['zh', 'en'])
+    m.set_lang = lambda lg, *a, **kw: calls.__setitem__('lang', lg)
+    m.export_for_js = lambda lg: dict(dict_ret if dict_ret is not None else (
+        {'nav.dashboard': '仪表盘'} if lg == 'zh' else {'nav.dashboard': 'Dashboard'}))
+    return m
+
+
+def _fake_figpresets(calls=None, reg=None):
+    calls = calls if calls is not None else {}
+    reg = reg if reg is not None else {
+        'adsorption_bar': {'key': 'adsorption_bar', 'name': '吸附能柱状图',
+                           'category': '能量学', 'description': '柱状',
+                           'required_data': 'adsorbates+substrates',
+                           'thumbnail_svg': '<svg id="bar"/>',
+                           'params_schema': {'negative_up': False, 'title': ''}},
+        'delta_e_heatmap': {'key': 'delta_e_heatmap', 'name': 'ΔE 热图',
+                            'category': '能量学', 'description': '热图',
+                            'required_data': 'rows+cols+values',
+                            'thumbnail_svg': '<svg id="hm"/>',
+                            'params_schema': {'annotate': True}},
+        'free_energy_ladder': {'key': 'free_energy_ladder', 'name': 'ΔG 台阶图',
+                               'category': '电池', 'description': '台阶',
+                               'required_data': 'paths',
+                               'thumbnail_svg': '<svg id="ld"/>',
+                               'params_schema': {'mark_pds': True, 'title': ''}},
+        'pdos': {'key': 'pdos', 'name': 'PDOS', 'category': '电子结构',
+                 'description': 'pdos', 'required_data': 'series',
+                 'thumbnail_svg': '<svg id="pd"/>', 'params_schema': {}},
+        'volcano': {'key': 'volcano', 'name': '火山图', 'category': '能量学',
+                    'description': '火山', 'required_data': 'points',
+                    'thumbnail_svg': '<svg id="vo"/>', 'params_schema': {}},
+    }
+    m = types.SimpleNamespace()
+    m.list_presets = lambda category=None: [
+        {k: v for k, v in p.items() if k != 'thumbnail_svg'}
+        for p in reg.values() if category is None or p['category'] == category]
+    m.get_preset = lambda k: dict(reg[k])   # 未知 key → KeyError
+    m.categories = lambda: list(dict.fromkeys(p['category'] for p in reg.values()))
+
+    def _render(k, data, out_path, **params):
+        calls.setdefault('render', []).append(
+            {'key': k, 'data': data, 'out': out_path, 'params': params})
+        return [str(out_path)]
+    m.render_preset = _render
+    m.preset_provenance = lambda k, ds, params=None: {
+        'preset': k, 'data_source': ds, 'params': dict(params or {})}
+    return m
+
+
+def _fake_draftpack(ret=None, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _dr(proj, out, **kw):
+        calls['draft'] = {'out': out, 'proj': proj, 'kw': kw}
+        if ret is not None:
+            return dict(ret)
+        return {'ok': True, 'summary': '✅ Draft-Ready 通过', 'issues': [],
+                'issues_total': 0, 'summary_path': out + '/DRAFT_READY.md',
+                'report': {
+                    'si_package': {'zip_path': out + '/x_SI.zip', 'ok': True,
+                                   'contents': ['members/a']},
+                    'tables': {'files': [out + '/t.csv', out + '/t.html'], 'issues': []},
+                    'methods': {'files': [out + '/methods_zh.md'], 'issues': []}}}
+    m.draft_ready = _dr
+    return m
+
+
+def _fake_ai_paper(*, extract_ret=None, plan_ret=None, inst_ret=None, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _extract(source, transport=None, config=None):
+        calls['extract'] = {'source': source, 'transport': transport}
+        return extract_ret if extract_ret is not None else {
+            'ok': True, 'spec': {'systems': [], 'adsorbates': []},
+            'issues': ['未知泛函「XPB」'], 'error': None}
+    m.extract_spec = _extract
+    m.plan_campaign = lambda spec, **kw: (plan_ret if plan_ret is not None else {
+        'ok': True, 'plan': {'jobs_estimate': 3, 'warnings': ['需用户提供 INCAR'],
+                             'tasks': [{'id': 'a'}], 'nk': 9}})
+
+    def _inst(plan, out_root, **kw):
+        calls['inst'] = {'out_root': out_root, 'kw': dict(kw)}
+        if kw.get('dry_run'):
+            return {'ok': True, 'created': ['a'], 'campaign_dir': '(dry)',
+                    'gates': {'budget': {'estimated_core_hours': 12.5}},
+                    'dry_run': True}
+        return inst_ret if inst_ret is not None else {
+            'ok': True, 'created': ['a', 'b'],
+            'campaign_dir': out_root + '/.camp/ai-paper',
+            'gates': {'pilot': {'status': 'awaiting'}},
+            'pilot': {'id': 'a'}, 'awaiting': 'pilot_validation'}
+    m.instantiate = _inst
+    return m
+
+
+def _fake_engines(calls=None, gen_ret=None, validate_issues=None, nonequiv=None):
+    calls = calls if calls is not None else {}
+
+    class _Spec:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+            calls['spec'] = dict(kw)
+
+    class _Backend:
+        def generate_inputs(self, spec, out):
+            calls['gen'] = {'out': out, 'spec': spec}
+            return gen_ret if gen_ret is not None else {
+                'files': [out + '/cp2k.inp'], 'warnings': ['CP2K 需自备 GTH 赝势库']}
+
+    m = types.SimpleNamespace()
+    m.CalcSpec = _Spec
+    m.validate = lambda spec: list(validate_issues or [])
+    m.available_engines = lambda: ['vasp', 'cp2k', 'gaussian', 'castep']
+    m.get_backend = lambda name: (calls.__setitem__('engine', name) or _Backend())
+    m.nonequivalence_report = lambda s, d: list(
+        nonequiv if nonequiv is not None else [f'[cutoff] {s}→{d} 截断能不可换算'])
+    return m
+
+
+# 供结构编辑器往返测试的最小 slab POSCAR:2 层(底层两 Fe,顶层一 O),c 向 20 Å 真空 18 Å
+_EDITOR_POSCAR = (
+    'slab test\n1.0\n3.0 0.0 0.0\n0.0 3.0 0.0\n0.0 0.0 20.0\n'
+    'Fe O\n2 1\nCartesian\n'
+    '0.0 0.0 5.0\n1.5 1.5 5.0\n0.75 0.75 7.0\n')
+
+
+# ── scenario_* ───────────────────────────────────────────────────────────────
+def test_scenario_list_shape():
+    api = Api(scenarios_mod=_fake_scenarios())
+    out = api.scenario_list()
+    assert out['ok'] is True
+    assert {s['key'] for s in out['scenarios']} == {'full', 'lis'}
+    lis = next(s for s in out['scenarios'] if s['key'] == 'lis')
+    assert 'project' in lis['pages'] and lis['reaction_presets'] == ['LIS_16E']
+
+
+def test_scenario_get_configured_true_reads_active():
+    calls = {}
+    api = Api(scenarios_mod=_fake_scenarios(active={'key': 'lis', 'name': '锂硫',
+              'pages': ['dashboard'], 'cards': {}, 'figure_preset_order': [],
+              'reaction_presets': [], 'engines': ['vasp'], 'defaults': {},
+              'ai_context': ''}, calls=calls),
+              config_mod=_fake_config(ui={'scenario': 'lis'}))
+    out = api.scenario_get()
+    assert out['ok'] is True and out['configured'] is True
+    assert out['scenario']['key'] == 'lis'
+
+
+def test_scenario_get_unconfigured_first_launch():
+    # config 无 ui.scenario → configured=False(前端据此弹首启场景选择模态)
+    api = Api(scenarios_mod=_fake_scenarios(), config_mod=_fake_config(ui={}))
+    out = api.scenario_get()
+    assert out['ok'] is True and out['configured'] is False
+
+
+def test_scenario_set_persists_and_returns_view():
+    calls = {}
+    api = Api(scenarios_mod=_fake_scenarios(calls=calls))
+    out = api.scenario_set('lis')
+    assert out['ok'] is True and out['key'] == 'lis' and calls['set'] == 'lis'
+    assert out['scenario']['reaction_presets'] == ['LIS_16E']
+
+
+def test_scenario_get_error_caught():
+    boom = _fake_scenarios()
+    boom.active_scenario = lambda cfg=None: (_ for _ in ()).throw(RuntimeError('场景坏'))
+    api = Api(scenarios_mod=boom, config_mod=_fake_config())
+    out = api.scenario_get()
+    assert out['ok'] is False and '场景坏' in out['error']
+
+
+# ── lang_* / i18n_dict ───────────────────────────────────────────────────────
+def test_lang_get_returns_lang_and_available():
+    api = Api(i18n_mod=_fake_i18n(lang='en', avail=['zh', 'en']),
+              config_mod=_fake_config(ui={'lang': 'en'}))
+    out = api.lang_get()
+    assert out['ok'] is True and out['lang'] == 'en'
+    assert out['available'] == ['zh', 'en']
+
+
+def test_lang_set_persists_active_language():
+    calls = {}
+    api = Api(i18n_mod=_fake_i18n(calls=calls))
+    out = api.lang_set('en')
+    assert out['ok'] is True and out['lang'] == 'en' and calls['lang'] == 'en'
+
+
+def test_i18n_dict_returns_full_table():
+    api = Api(i18n_mod=_fake_i18n())
+    out = api.i18n_dict('en')
+    assert out['ok'] is True and out['lang'] == 'en'
+    assert out['dict']['nav.dashboard'] == 'Dashboard'
+
+
+def test_lang_get_error_caught():
+    boom = _fake_i18n()
+    boom.current_lang = lambda cfg=None: (_ for _ in ()).throw(RuntimeError('语言坏'))
+    api = Api(i18n_mod=boom, config_mod=_fake_config())
+    out = api.lang_get()
+    assert out['ok'] is False and '语言坏' in out['error']
+
+
+# ── figure_presets / render_figure_preset ────────────────────────────────────
+def test_figure_presets_gallery_with_thumbnails():
+    api = Api(figure_presets_mod=_fake_figpresets())
+    out = api.figure_presets()
+    assert out['ok'] is True and len(out['presets']) == 5
+    bar = next(p for p in out['presets'] if p['key'] == 'adsorption_bar')
+    assert bar['thumbnail_svg'] == '<svg id="bar"/>'
+    assert bar['params_schema'] == {'negative_up': False, 'title': ''}
+    assert '能量学' in out['categories']
+
+
+def test_render_figure_preset_bar_assembles_from_delta(tmp_path):
+    calls = {}
+    ads = _fake_adsorption(proj_map={'/p': _proj('demo', str(tmp_path))},
+                           delta_ret=_delta({'O': -1.0, 'OH': -2.0}))
+    api = Api(figure_presets_mod=_fake_figpresets(calls=calls), adsorption_mod=ads)
+    out = api.render_figure_preset('adsorption_bar', '/p', {'save_to': str(tmp_path)})
+    assert out['ok'] is True and len(out['files']) == 1 and out['skipped'] == []
+    data = calls['render'][0]['data']
+    assert data['adsorbates'] == ['O', 'OH']
+    assert data['substrates']['demo'] == [-1.0, -2.0]
+    assert out['provenance']['preset'] == 'adsorption_bar'
+
+
+def test_render_figure_preset_heatmap_rows_cols_values(tmp_path):
+    calls = {}
+    ads = _fake_adsorption(proj_map={'/p': _proj('demo', str(tmp_path))},
+                           delta_ret=_delta({'O': -1.0, 'OH': -2.0}))
+    api = Api(figure_presets_mod=_fake_figpresets(calls=calls), adsorption_mod=ads)
+    out = api.render_figure_preset('delta_e_heatmap', '/p', {'save_to': str(tmp_path)})
+    assert out['ok'] is True
+    data = calls['render'][0]['data']
+    assert data['rows'] == ['demo'] and data['cols'] == ['O', 'OH']
+    assert data['values'] == [[-1.0, -2.0]]
+
+
+def test_render_figure_preset_ladder_lis_default(tmp_path):
+    calls = {}
+    mol = tmp_path / 'mols'
+    mol.mkdir()
+    fed = {'steps': [{'label': 'S8*', 'G': 0.0}, {'label': 'Li2S*', 'G': -1.0}],
+           'pds_index': 0, 'u_l': 1.5}
+    fe = types.SimpleNamespace(
+        path_from_project_and_molecules=lambda rows, e_slab, molecules_dir: fed)
+    ads = _fake_adsorption(proj_map={'/p': _proj('liS', str(tmp_path))},
+                           delta_ret=_delta({'liS_ads_Li2S4': -1.2}))
+    api = Api(figure_presets_mod=_fake_figpresets(calls=calls), adsorption_mod=ads,
+              freeenergy_mod=fe,
+              config_mod=_fake_config(cfg={'lis_molecules_dir': str(mol)}))
+    out = api.render_figure_preset('free_energy_ladder', '/p', {'save_to': str(tmp_path)})
+    assert out['ok'] is True and len(out['files']) == 1
+    data = calls['render'][0]['data']
+    assert data['paths'][0]['G'] == [0.0, -1.0] and data['pds_index'] == 0
+    assert calls['render'][0]['params']['title'] == 'Li-S discharge path'
+
+
+def test_render_figure_preset_pdos_skipped_needs_parse(tmp_path):
+    api = Api(figure_presets_mod=_fake_figpresets(), adsorption_mod=_fake_adsorption())
+    out = api.render_figure_preset('pdos', '/p', {})
+    assert out['ok'] is True and out['files'] == []
+    assert out['skipped'][0]['kind'] == 'pdos' and 'PDOS' in out['skipped'][0]['reason']
+
+
+def test_render_figure_preset_volcano_skipped_multi(tmp_path):
+    api = Api(figure_presets_mod=_fake_figpresets(), adsorption_mod=_fake_adsorption())
+    out = api.render_figure_preset('volcano', '/p', {})
+    assert out['ok'] is True and out['files'] == []
+    assert '多催化剂' in out['skipped'][0]['reason']
+
+
+def test_render_figure_preset_no_done_skipped(tmp_path):
+    ads = _fake_adsorption(proj_map={'/p': _proj('demo', str(tmp_path))},
+                           delta_ret={'slab': ('RUNNING', None), 'ref': ('无', None),
+                                      'has_ref': False,
+                                      'rows': [{'name': 'O', 'state': 'RUNNING',
+                                                'e_config': None, 'delta_e': None,
+                                                'note': ''}]})
+    api = Api(figure_presets_mod=_fake_figpresets(), adsorption_mod=ads)
+    out = api.render_figure_preset('adsorption_bar', '/p', {})
+    assert out['ok'] is True and out['files'] == []
+    assert 'ΔE' in out['skipped'][0]['reason']
+
+
+def test_render_figure_preset_unknown_key_error():
+    api = Api(figure_presets_mod=_fake_figpresets(), adsorption_mod=_fake_adsorption())
+    out = api.render_figure_preset('nope', '/p', {})
+    assert out['ok'] is False and '未知图表预设' in out['error']
+
+
+# ── draft_ready ──────────────────────────────────────────────────────────────
+def test_draft_ready_aggregates_products(tmp_path):
+    calls = {}
+    ads = _fake_adsorption(proj_map={'/p': _proj('demo', str(tmp_path))})
+    api = Api(adsorption_mod=ads, draftpack_mod=_fake_draftpack(calls=calls))
+    out = api.draft_ready('/p', str(tmp_path))
+    assert out['ok'] is True and out['error'] is None
+    assert out['out_dir'] == str(tmp_path)
+    # products 汇总 SI + 表格 + 方法学 + 总结
+    assert any(p.endswith('_SI.zip') for p in out['products'])
+    assert any(p.endswith('methods_zh.md') for p in out['products'])
+    assert any(p.endswith('DRAFT_READY.md') for p in out['products'])
+    assert calls['draft']['out'] == str(tmp_path)
+
+
+def test_draft_ready_not_ok_passthrough(tmp_path):
+    ret = {'ok': False, 'summary': '⚠️ 口径稽核未通过', 'issues': ['[待确认:X 无 ΔE]'],
+           'issues_total': 1, 'summary_path': '/o/DRAFT_READY.md',
+           'report': {'si_package': {'zip_path': '/o/x.zip', 'ok': False},
+                      'tables': {'files': []}, 'methods': {'files': []}}}
+    ads = _fake_adsorption(proj_map={'/p': _proj('demo', str(tmp_path))})
+    api = Api(adsorption_mod=ads, draftpack_mod=_fake_draftpack(ret=ret))
+    out = api.draft_ready('/p', str(tmp_path))
+    assert out['ok'] is False and out['issues_total'] == 1
+    assert out['issues'] == ['[待确认:X 无 ΔE]']
+
+
+def test_draft_ready_missing_project_error():
+    api = Api(adsorption_mod=_fake_adsorption(), draftpack_mod=_fake_draftpack())
+    out = api.draft_ready('/nope', '/out')
+    assert out['ok'] is False and '项目不存在' in out['error']
+
+
+# ── ai_extract / ai_plan / ai_instantiate ────────────────────────────────────
+def test_ai_extract_forwards_and_returns_spec():
+    calls = {}
+    api = Api(ai_paper_mod=_fake_ai_paper(calls=calls))
+    out = api.ai_extract('论文文本 ... VASP ENCUT 500 eV', transport='T')
+    assert out['ok'] is True and out['spec']['systems'] == []
+    assert '未知泛函「XPB」' in out['issues']
+    assert calls['extract']['transport'] == 'T'
+
+
+def test_ai_extract_external_off_passthrough():
+    ret = {'ok': False, 'spec': None, 'issues': [],
+           'error': '未开启联网抽取:请在设置页开启「允许将文本发送到外部 LLM」'}
+    api = Api(ai_paper_mod=_fake_ai_paper(extract_ret=ret))
+    out = api.ai_extract('text')
+    assert out['ok'] is False and '未开启联网抽取' in out['error']
+
+
+def test_ai_plan_returns_plan_and_estimate():
+    api = Api(ai_paper_mod=_fake_ai_paper())
+    out = api.ai_plan({'systems': [], 'adsorbates': []})
+    assert out['ok'] is True and out['jobs_estimate'] == 3
+    assert out['est_core_hours'] == 12.5           # 经 dry-run 机时预算闸估值
+    assert '需用户提供 INCAR' in out['warnings']
+
+
+def test_ai_instantiate_registers_campaign_and_returns_gates(tmp_path):
+    cc = {}
+    api = Api(ai_paper_mod=_fake_ai_paper(),
+              config_mod=_fake_config(ui={}, calls=cc))
+    out = api.ai_instantiate({'tasks': [{'id': 'a'}]}, str(tmp_path), {})
+    assert out['ok'] is True and out['created'] == ['a', 'b']
+    assert out['awaiting'] == 'pilot_validation'
+    assert out['gates']['pilot']['status'] == 'awaiting'
+    # campaign 目录记入仪表盘发现表(config ui.campaign_dirs)
+    assert out['campaign_dir'] in cc['ui_state']['campaign_dirs']
+
+
+def test_ai_instantiate_missing_out_root_error():
+    api = Api(ai_paper_mod=_fake_ai_paper())
+    out = api.ai_instantiate({'tasks': []}, '', {})
+    assert out['ok'] is False and '输出根目录' in out['error']
+
+
+# ── engine_list / engine_generate / engine_nonequiv ──────────────────────────
+def test_engine_list_all_and_scenario_visibility():
+    api = Api(engines_mod=_fake_engines())      # 用真实 scenarios 判可见
+    out = api.engine_list()
+    assert out['ok'] is True and out['default'] == 'vasp'
+    assert {e['key'] for e in out['engines']} == {'vasp', 'cp2k', 'gaussian', 'castep'}
+    vasp = next(e for e in out['engines'] if e['key'] == 'vasp')
+    assert vasp['experimental'] is False and vasp['visible'] is True
+    # 分子化学场景:Gaussian 可见,CP2K/CASTEP 不在场景引擎白名单
+    out2 = api.engine_list('molecular')
+    vis = {e['key']: e['visible'] for e in out2['engines']}
+    assert vis['vasp'] is True and vis['gaussian'] is True
+    assert vis['cp2k'] is False and vis['castep'] is False
+
+
+def test_engine_generate_builds_calcspec_and_writes(tmp_path):
+    calls = {}
+    poscar = tmp_path / 'POSCAR'
+    poscar.write_text(_EDITOR_POSCAR, encoding='utf-8')
+    api = Api(engines_mod=_fake_engines(calls=calls))
+    out = api.engine_generate('cp2k', {
+        'poscar': str(poscar), 'task': 'relax', 'functional': 'PBE',
+        'cutoff_ev': 500, 'kpoints': [3, 3, 1], 'spin': True, 'charge': 0,
+        'periodic': True}, str(tmp_path / 'cp2k_out'))
+    assert out['ok'] is True and out['files'] == [str(tmp_path / 'cp2k_out') + '/cp2k.inp']
+    assert calls['engine'] == 'cp2k'
+    assert calls['spec']['cutoff_ev'] == 500.0 and calls['spec']['kpoints'] == (3, 3, 1)
+    assert calls['spec']['spin'] is True
+
+
+def test_engine_generate_surfaces_validate_issues(tmp_path):
+    poscar = tmp_path / 'POSCAR'
+    poscar.write_text(_EDITOR_POSCAR, encoding='utf-8')
+    api = Api(engines_mod=_fake_engines(
+        validate_issues=['周期性计算必须指定 cutoff_ev(平面波截断能,eV);缺失或非正值。']))
+    out = api.engine_generate('cp2k', {'poscar': str(poscar), 'periodic': True},
+                              str(tmp_path / 'o'))
+    assert out['ok'] is True and out['issues'] and 'cutoff_ev' in out['issues'][0]
+
+
+def test_engine_generate_missing_poscar_error(tmp_path):
+    api = Api(engines_mod=_fake_engines())
+    out = api.engine_generate('cp2k', {'poscar': '/nope/POSCAR'}, str(tmp_path))
+    assert out['ok'] is False and '结构文件' in out['error']
+
+
+def test_engine_nonequiv_report():
+    api = Api(engines_mod=_fake_engines(
+        nonequiv=['[cutoff] ENCUT 与 CUTOFF 不可换算', '[basis] 平面波 vs 高斯基组']))
+    out = api.engine_nonequiv('vasp', 'cp2k')
+    assert out['ok'] is True and len(out['report']) == 2
+    assert 'cutoff' in out['report'][0]
+
+
+# ── struct_load / struct_save / struct_fix_layers / struct_vacuum(真实往返) ───
+def test_struct_load_parses_elements_coords_lattice(tmp_path):
+    p = tmp_path / 'POSCAR'
+    p.write_text(_EDITOR_POSCAR, encoding='utf-8')
+    api = Api()
+    out = api.struct_load(str(p))
+    assert out['ok'] is True
+    st = out['struct']
+    assert st['elements'] == ['Fe', 'Fe', 'O'] and st['natoms'] == 3
+    assert st['lattice'][2] == [0.0, 0.0, 20.0]
+    assert st['formula'] == 'Fe2 O1'
+    assert out['vacuum'] == 18.0                       # |c| 20 − z 跨度 2
+
+
+def test_struct_load_missing_file_error():
+    api = Api()
+    out = api.struct_load('/nope/POSCAR')
+    assert out['ok'] is False and '不存在' in out['error']
+
+
+def test_struct_save_roundtrip(tmp_path):
+    api = Api()
+    state = {'elements': ['Fe', 'Fe', 'O'],
+             'coords': [[0.0, 0.0, 5.0], [1.5, 1.5, 5.0], [0.75, 0.75, 7.0]],
+             'lattice': [[3.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 20.0]]}
+    dest = tmp_path / 'out' / 'POSCAR'
+    out = api.struct_save(state, str(dest))
+    assert out['ok'] is True and os.path.isfile(str(dest))
+    # 写出的 POSCAR 应可被 struct_load 再解析回同样的元素/原子数(往返)
+    back = api.struct_load(str(dest))
+    assert back['ok'] is True and back['struct']['elements'] == ['Fe', 'Fe', 'O']
+    assert back['struct']['natoms'] == 3
+
+
+def test_struct_fix_layers_maps_flags_back_to_state_order():
+    # 状态原子序为 O(顶) 在前、Fe(底) 在后 —— 写出按物种分块会重排,须正确映射回状态序
+    api = Api()
+    state = {'elements': ['O', 'Fe', 'Fe'],
+             'coords': [[0.75, 0.75, 7.0], [0.0, 0.0, 5.0], [1.5, 1.5, 5.0]],
+             'lattice': [[3.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 20.0]]}
+    out = api.struct_fix_layers(state, 1)
+    assert out['ok'] is True
+    # 底层是两个 Fe(状态 idx 1、2)→ 冻结;O(状态 idx 0,顶层)→ 不冻结
+    assert out['fixed'] == [False, True, True] and out['fixed_count'] == 2
+    assert out['vacuum'] == 18.0
+
+
+def test_struct_fix_layers_too_many_layers_error():
+    api = Api()
+    state = {'elements': ['Fe', 'Fe', 'O'],
+             'coords': [[0.0, 0.0, 5.0], [1.5, 1.5, 5.0], [0.75, 0.75, 7.0]],
+             'lattice': [[3.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 20.0]]}
+    out = api.struct_fix_layers(state, 5)          # 5 ≥ 总层数 2
+    assert out['ok'] is False and out['fixed'] is None
+
+
+def test_struct_save_with_fixed_emits_selective_dynamics(tmp_path):
+    api = Api()
+    state = {'elements': ['Fe', 'Fe', 'O'],
+             'coords': [[0.0, 0.0, 5.0], [1.5, 1.5, 5.0], [0.75, 0.75, 7.0]],
+             'lattice': [[3.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 20.0]],
+             'fixed': [True, True, False]}
+    dest = tmp_path / 'POSCAR'
+    out = api.struct_save(state, str(dest))
+    assert out['ok'] is True
+    text = dest.read_text(encoding='utf-8')
+    assert 'Selective dynamics' in text
+    assert text.count('F F F') == 2 and text.count('T T T') == 1
+
+
+def test_struct_vacuum_from_state():
+    api = Api()
+    state = {'elements': ['Fe', 'O'],
+             'coords': [[0.0, 0.0, 5.0], [0.75, 0.75, 7.0]],
+             'lattice': [[3.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 20.0]]}
+    out = api.struct_vacuum(state)
+    assert out['ok'] is True and out['vacuum'] == 18.0
+
+
+def test_struct_vacuum_invalid_state_error():
+    api = Api()
+    out = api.struct_vacuum({'elements': ['Fe'], 'coords': [], 'lattice': []})
+    assert out['ok'] is False and out['vacuum'] is None

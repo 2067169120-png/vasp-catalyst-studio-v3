@@ -310,6 +310,50 @@
     }
   }
 
+  // ── 一键成稿包:pick_dir → draft_ready → 列产物 + issues + open_dir ──────────
+  async function draftReady() {
+    const proj = currentProject();
+    if (!proj) return;
+    const dr = await VCS.call('pick_dir');
+    if (dr && dr.error) { VCS.log('选择目录失败:' + dr.error, 'failc'); return; }
+    if (!dr || !dr.path) return;
+    const btn = $('pj-draft');
+    const box = $('pj-draft-out');
+    if (btn) btn.disabled = true;
+    if (box) box.innerHTML = '';
+    VCS.log('生成成稿包(SI + 三线表 + 口径稽核 + 方法学),生成中…');
+    try {
+      const r = await VCS.call('draft_ready', proj.path, dr.path);
+      if (!r || r.ok === false && r.error) {
+        // ok=False 但有产物(稽核不过仍出全套)时 error 为 null;仅真错误(error 非空)才失败
+        if (r && r.error) { VCS.log('成稿包生成失败:' + r.error, 'failc'); return; }
+      }
+      if (!r) { VCS.log('成稿包生成失败:未知错误', 'failc'); return; }
+      VCS.log((r.ok ? '✓ 稽核通过:' : '⚠ 稽核未通过(仍产全套工件):') + (r.summary || ''),
+        r.ok ? 'okc' : 'warnc');
+      (r.products || []).forEach(p => VCS.log('产物:' + p, 'okc'));
+      (r.issues || []).forEach(i => VCS.log(i, 'warnc'));
+      renderDraft(r);
+      if (r.out_dir) VCS.call('open_dir', r.out_dir);
+      VCS.toast(r.ok ? '成稿包已生成' : '成稿包已生成(有待确认项)', r.ok ? '' : 'fail');
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  function renderDraft(r) {
+    const box = $('pj-draft-out');
+    if (!box) return;
+    let h = `<div class="pj-note" style="color:var(--${r.ok ? 'ok' : 'warn'})">` +
+      VCS.esc(r.summary || '') + `(待确认 ${r.issues_total || 0} 项)</div>`;
+    h += '<div class="pj-cfglist">';
+    (r.products || []).forEach(p => {
+      h += `<div class="pj-cfgrow"><span class="path" title="${VCS.esc(p)}">${VCS.esc(p)}</span></div>`;
+    });
+    h += '</div>';
+    box.innerHTML = h;
+  }
+
   // ── 初始化 ─────────────────────────────────────────────────────────────────
   function wire(id, fn) { const el = $(id); if (el) el.addEventListener('click', fn); }
 
@@ -326,6 +370,7 @@
     wire('pj-report', report);
     wire('pj-figs', makeFigures);
     wire('pj-cmpfigs', makeCompareFigures);
+    wire('pj-draft', draftReady);
     renderConfigs();
     loadPresets();
     reloadProjects();
