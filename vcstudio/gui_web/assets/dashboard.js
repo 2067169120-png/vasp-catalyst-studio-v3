@@ -85,6 +85,33 @@
     }).join('');
   }
 
+  // ── 项目管线卡片下:批次(campaign)三态小条形 + 机时 ──────────────────────
+  // campaign 模块不可用 / 无批次 → 区块隐藏;任何异常都降级不拖垮仪表盘。
+  function renderCampaigns(res) {
+    const wrap = document.getElementById('db-campaigns');
+    const box = document.getElementById('db-campaign-list');
+    if (!wrap || !box) return;
+    const camps = (res && res.available && res.campaigns) || [];
+    if (!camps.length) { wrap.hidden = true; box.innerHTML = ''; return; }
+    wrap.hidden = false;
+    box.innerHTML = camps.map(c => {
+      const t = Math.max(c.n_tasks || 0, 1);
+      const s = c.states || {};
+      const pct = n => Math.round((n || 0) / t * 100);
+      const bud = c.budget || {};
+      const cap = (bud.cap == null) ? '不限' : bud.cap;
+      const mh = '机时 ' + (bud.estimated == null ? '—' : bud.estimated) + ' / ' + cap;
+      return '<div class="cmp-row">' +
+        `<span class="cmp-name" title="${VCS.esc(c.name || '')}">${VCS.esc(c.name || '(未命名)')}</span>` +
+        `<span class="cmp-bar" title="共 ${c.n_tasks} 任务:完成 ${s.completed || 0} / 验证 ${s.validated || 0} / 采纳 ${s.accepted || 0}">` +
+        `<i class="b-completed" style="width:${pct(s.completed)}%"></i>` +
+        `<i class="b-validated" style="width:${pct(s.validated)}%"></i>` +
+        `<i class="b-accepted" style="width:${pct(s.accepted)}%"></i></span>` +
+        `<span class="cmp-meta">${s.completed || 0}/${s.validated || 0}/${s.accepted || 0}` +
+        ` · ${c.n_tasks} 任务 · ${VCS.esc(mh)}</span></div>`;
+    }).join('');
+  }
+
   // ── 卡片 4:待办(失效条目 / 需处理作业 / 未配置集群,各给一键跳转) ────────
   function renderTodo(jobs, stale, profiles) {
     const box = $('db-todo');
@@ -123,9 +150,10 @@
 
   // ── 取数 + 全量渲染(进页 / 启动时) ───────────────────────────────────────
   async function refresh() {
-    const [jr, pr, cr, sr] = await Promise.all([
+    const [jr, pr, cr, sr, campr] = await Promise.all([
       VCS.call('list_jobs'), VCS.call('proj_list'),
-      VCS.call('list_profiles'), VCS.call('pipeline_status')]);
+      VCS.call('list_profiles'), VCS.call('pipeline_status'),
+      VCS.call('campaign_list')]);
     const jobs = (jr && jr.jobs) || [];
     const stale = (jr && jr.stale) || [];
     const projects = (pr && pr.projects) || [];
@@ -141,6 +169,7 @@
     renderRecent(jobs);
     renderTodo(jobs, stale, profiles);
     renderPipeline((sr && sr.projects) || [], sr && sr.error);
+    renderCampaigns(campr);
     if (VCS.pipeline && typeof VCS.pipeline.renderFeed === 'function') VCS.pipeline.renderFeed();
     if (typeof VCS.refreshNavFoot === 'function') VCS.refreshNavFoot();
     const el = $('db-stats');

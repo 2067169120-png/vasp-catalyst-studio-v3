@@ -77,6 +77,130 @@
     }
   }
 
+  // ── SAC 批量建模:chips 多选 + 预览矩阵 + 生成矩阵(生成前弹确认显示预估) ──
+  const SAC_METALS = ['Ti', 'V', 'Cr', 'Mn', 'Fe', 'Co', 'Ni', 'Cu', 'Mo', 'W'];
+  const SAC_TEMPLATES = ['MN4', 'MN3', 'MP1N3', 'MS1N3', 'MB1N3', 'MN4+B'];
+
+  function renderChips(id, items, preselect) {
+    const box = $(id);
+    if (!box) return;
+    box.innerHTML = '';
+    items.forEach(it => {
+      const c = document.createElement('span');
+      c.className = 'chip' + (preselect && preselect.indexOf(it) >= 0 ? ' on' : '');
+      c.textContent = it;
+      c.dataset.val = it;
+      c.addEventListener('click', () => c.classList.toggle('on'));
+      box.appendChild(c);
+    });
+  }
+  function chipVals(id) {
+    const box = $(id);
+    return box ? Array.from(box.querySelectorAll('.chip.on')).map(c => c.dataset.val) : [];
+  }
+  function sacMetals() {
+    const base = chipVals('sac-metals');
+    const extra = (val('sac-metal-more') || '').split(',').map(s => s.trim()).filter(Boolean);
+    return Array.from(new Set(base.concat(extra)));
+  }
+  function sacParams() {
+    return {
+      metals: sacMetals(), templates: chipVals('sac-templates'), ads: chipVals('sac-ads'),
+      sites: val('sac-sites') || 'metal_top', rot: parseInt(val('sac-rot') || '1', 10) || 1,
+    };
+  }
+
+  async function loadSacAdsorbates() {
+    const r = await VCS.call('molecule_list');
+    const mols = (r && r.molecules) || [];
+    renderChips('sac-ads', mols.map(m => m.name), []);
+  }
+
+  async function sacPreview() {
+    const p = sacParams();
+    const box = $('sac-preview');
+    if (!p.metals.length || !p.templates.length) {
+      if (box) box.textContent = '请至少选择一个金属与一个模板';
+      return null;
+    }
+    if (box) box.textContent = '估算中…';
+    const r = await VCS.call('sac_matrix_preview', p.metals, p.templates, p.ads, p.sites, p.rot);
+    if (!r || r.ok === false || r.error) {
+      if (box) box.textContent = '预览失败:' + ((r && r.error) || '未知错误');
+      return null;
+    }
+    if (box) {
+      const eg = (r.names || []).slice(0, 6).join('、');
+      box.innerHTML = `矩阵规模:<b>${r.n_slabs}</b> 清洁面 + <b>${r.n_configs}</b> 吸附构型 = ` +
+        `<b>${r.n_total_jobs}</b> 个作业<br>${VCS.esc(r.estimate_note)}` +
+        (eg ? `<br>示例:${VCS.esc(eg)} …` : '');
+    }
+    return r;
+  }
+
+  async function sacGenerate() {
+    const p = sacParams();
+    const incar = val('sac-incar'), out = val('sac-out');
+    if (!p.metals.length || !p.templates.length) {
+      VCS.log('SAC:请至少选择一个金属与一个模板', 'failc'); return;
+    }
+    if (!incar) { VCS.log('SAC:请选择共享 INCAR', 'failc'); return; }
+    if (!out) { VCS.log('SAC:请选择输出根目录', 'failc'); return; }
+    const pv = await sacPreview();     // 生成前弹确认显示预估(规模 + 粗估机时)
+    const msg = pv
+      ? `将生成约 ${pv.n_total_jobs} 个作业(${pv.n_slabs} 清洁面 + ${pv.n_configs} 构型)。\n` +
+        `${pv.estimate_note}\n\n继续?`
+      : `将生成 SAC 候选矩阵(${p.metals.length} 金属 × ${p.templates.length} 模板)。继续?`;
+    if (!await VCS.confirm(msg)) return;
+    const btn = $('sac-gen-btn');
+    if (btn) btn.disabled = true;
+    VCS.log('SAC 批量建模生成中…');
+    try {
+      const r = await VCS.call('sac_matrix_generate', p.metals, p.templates, p.ads,
+        p.sites, p.rot, incar, out);
+      if (!r || r.ok === false || r.error) {
+        VCS.log('SAC 生成失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+      }
+      VCS.log('SAC 已生成 ' + r.created + ' 个作业,入台账', 'okc');
+      (r.project_paths || []).forEach(pp => VCS.log('已建吸附能项目:' + pp, 'okc'));
+      (r.skipped || []).forEach(s => VCS.log('跳过 ' + (s.name || '') + ':' + s.reason, 'warnc'));
+      if (r.campaign) VCS.log('已注册批次(campaign):' + r.campaign, 'okc');
+      VCS.toast('SAC 已生成 ' + r.created + ' 个作业');
+      VCS.call('open_dir', out);
+      if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  // ── 多自旋并跑:生成 NM/LS/HS 家族 ────────────────────────────────────────
+  async function spinGenerate() {
+    const pos = val('spin-poscar'), incar = val('spin-incar'), out = val('spin-out');
+    if (!pos) { VCS.log('自旋:请选择结构 POSCAR', 'failc'); return; }
+    if (!incar) { VCS.log('自旋:请选择 INCAR', 'failc'); return; }
+    if (!out) { VCS.log('自旋:请选择输出根目录', 'failc'); return; }
+    const btn = $('spin-gen-btn');
+    if (btn) btn.disabled = true;
+    VCS.log('多自旋家族生成中…');
+    try {
+      const r = await VCS.call('spin_family_generate', pos, incar, out);
+      if (!r || r.ok === false || r.error) {
+        VCS.log('自旋家族生成失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+      }
+      (r.variants || []).forEach(v => {
+        VCS.log('已生成自旋变体 ' + v.name + ':' + v.job_dir +
+          (v.magmom ? '(MAGMOM ' + v.magmom + ')' : ''), 'okc');
+        (v.warnings || []).forEach(w => VCS.log('  ⚠ ' + w, 'warnc'));
+      });
+      VCS.log('自旋家族已入台账;全部 DONE 后在作业页对该家族「自旋对比」判基态', 'okc');
+      VCS.toast('已生成 ' + (r.variants || []).length + ' 个自旋变体');
+      VCS.call('open_dir', out);
+      if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
   // ── 初始化:回填上次路径 + 首帧预览,绑定浏览/生成/输入监听 ──
   function wire(id, fn) { const el = $(id); if (el) el.addEventListener('click', fn); }
 
@@ -98,6 +222,20 @@
     });
     // 切换计算类型即刷新预览(KPOINTS 随之变化)
     { const el = $('gen-calc'); if (el) el.addEventListener('change', refreshPreview); }
+
+    // SAC 批量建模:chips 预置 + 吸附质从分子库载入 + 浏览/预览/生成
+    renderChips('sac-metals', SAC_METALS, ['Fe']);
+    renderChips('sac-templates', SAC_TEMPLATES, ['MN4']);
+    loadSacAdsorbates();
+    wire('sac-incar-btn', () => pickFile('sac-incar', 'incar'));
+    wire('sac-out-btn', () => pickDir('sac-out'));
+    wire('sac-preview-btn', sacPreview);
+    wire('sac-gen-btn', sacGenerate);
+    // 多自旋并跑:浏览/生成
+    wire('spin-poscar-btn', () => pickFile('spin-poscar', 'poscar'));
+    wire('spin-incar-btn', () => pickFile('spin-incar', 'incar'));
+    wire('spin-out-btn', () => pickDir('spin-out'));
+    wire('spin-gen-btn', spinGenerate);
 
     const st = await VCS.call('gen_state');
     if (st) {

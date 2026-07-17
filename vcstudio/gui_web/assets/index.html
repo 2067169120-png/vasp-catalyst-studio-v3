@@ -68,6 +68,27 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 #page-dashboard .db-qbtn{display:flex;flex-direction:column;align-items:flex-start;gap:2px;padding:11px 14px;text-align:left}
 #page-dashboard .db-qbtn b{font-size:12.5px}
 #page-dashboard .db-qbtn span{font-family:var(--mono);font-size:10.5px;color:var(--muted);font-weight:400}
+/* 生成页 SAC 批量建模 / 多自旋:chips 多选 + 预览文案 */
+#page-generate .chips{display:flex;gap:6px;flex-wrap:wrap}
+#page-generate .chip{font-size:11.5px;padding:3px 10px;border:1px solid var(--rule);border-radius:12px;background:var(--surface);cursor:pointer;user-select:none;color:var(--ink)}
+#page-generate .chip.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent-dark)}
+#page-generate .sac-prev{font-size:12px;color:var(--muted);line-height:1.5;margin:8px 0 0;padding:8px 10px;border:1px solid var(--rule);border-radius:6px;background:var(--surface);min-height:18px}
+#page-generate .sac-prev b{color:var(--ink);font-variant-numeric:tabular-nums}
+/* 作业页派生展开区(DONE 作业):频率 / 电子结构静态多选 */
+#page-jobs tr.derive-row td{background:var(--accent-soft);padding:8px 12px}
+#page-jobs .derive-box{display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:12px}
+#page-jobs .derive-box label{display:flex;gap:4px;align-items:center;cursor:pointer;user-select:none}
+#page-jobs .derive-box .derive-lbl,#page-jobs .derive-box .derive-sep{color:var(--muted);font-weight:600}
+/* 仪表盘 campaign 批次三态小条形 + 机时 */
+#page-dashboard .cmp-row{display:flex;align-items:center;gap:10px;padding:7px 4px;border-bottom:1px solid var(--rule);font-size:12.5px}
+#page-dashboard .cmp-row:last-child{border-bottom:none}
+#page-dashboard .cmp-name{flex:0 0 auto;font-weight:600;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#page-dashboard .cmp-bar{flex:1;height:9px;background:var(--queue-bg);border-radius:5px;overflow:hidden;position:relative;min-width:80px}
+#page-dashboard .cmp-bar i{position:absolute;left:0;top:0;height:100%;border-radius:5px}
+#page-dashboard .cmp-bar .b-completed{background:#B7C3D0}
+#page-dashboard .cmp-bar .b-validated{background:#4C86C6}
+#page-dashboard .cmp-bar .b-accepted{background:var(--ok)}
+#page-dashboard .cmp-meta{flex:0 0 auto;font-family:var(--mono);font-size:10.5px;color:var(--muted);font-variant-numeric:tabular-nums}
 </style>
 </head>
 <body>
@@ -119,6 +140,12 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     <div class="card" id="db-pipeline-card" style="padding:16px;margin-bottom:14px">
       <div class="db-h">项目管线 <span class="sub" style="font-weight:400">生成 → 提交 → 监控 → 恢复 → 分析 → 报告</span></div>
       <div id="db-pipeline"><div class="pl-empty">加载中…</div></div>
+      <!-- 批次(campaign)区块:引擎可用且有批次才显示,否则隐藏 -->
+      <div id="db-campaigns" hidden style="margin-top:14px;border-top:1px solid var(--rule);padding-top:12px">
+        <div class="db-h" style="border:none;padding:0;margin-bottom:8px">批次(campaign)
+          <span class="sub" style="font-weight:400">已完成 / 已验证 / 已采纳 · 机时(预估 / 上限)</span></div>
+        <div id="db-campaign-list"></div>
+      </div>
     </div>
 
     <div class="db-grid">
@@ -215,6 +242,88 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <button class="btn primary" id="gen-run">生成四件套</button>
     </div>
 
+    <!-- SAC 批量建模:金属 × 模板 × 吸附质 × 位点 × 取向 候选矩阵 -->
+    <div class="card" id="sac-card" style="padding:16px;margin:14px 0">
+      <div class="gen-h">SAC 批量建模(周期表换金属 × 配位模板 × 吸附质候选矩阵)</div>
+      <div class="gen-fld">
+        <span class="gen-lbl">金属(多选,可在下方补充自定义符号)</span>
+        <div class="chips" id="sac-metals"></div>
+        <div class="gen-inrow" style="margin-top:6px">
+          <input id="sac-metal-more" class="ipt" autocomplete="off" placeholder="补充金属符号,逗号分隔,如 Ru, Pt">
+        </div>
+      </div>
+      <div class="gen-fld">
+        <span class="gen-lbl">配位模板(多选)</span>
+        <div class="chips" id="sac-templates"></div>
+      </div>
+      <div class="gen-fld">
+        <span class="gen-lbl">吸附质(多选;不选任何吸附质 = 仅清洁表面)</span>
+        <div class="chips" id="sac-ads"></div>
+      </div>
+      <div class="gen-fld">
+        <span class="gen-lbl">位点策略 / 每位点取向数</span>
+        <div class="gen-inrow">
+          <select id="sac-sites" class="ipt" style="flex:1">
+            <option value="metal_top">仅金属顶位</option>
+            <option value="all">全位点(顶位 / 桥位 / 空位中心)</option>
+          </select>
+          <select id="sac-rot" class="ipt" style="flex:0 0 130px">
+            <option value="1">1 取向</option>
+            <option value="2">2 取向</option>
+            <option value="4">4 取向</option>
+          </select>
+        </div>
+      </div>
+      <div class="gen-fld">
+        <span class="gen-lbl">共享 INCAR(全矩阵共用,决定精度)</span>
+        <div class="gen-inrow">
+          <input id="sac-incar" class="ipt" autocomplete="off" placeholder="INCAR 参数文件路径">
+          <button class="btn" id="sac-incar-btn">浏览</button>
+        </div>
+      </div>
+      <div class="gen-fld" style="margin-bottom:0">
+        <span class="gen-lbl">输出根目录</span>
+        <div class="gen-inrow">
+          <input id="sac-out" class="ipt" autocomplete="off" placeholder="矩阵各体系生成在此根下(每 slab 一个吸附能项目)">
+          <button class="btn" id="sac-out-btn">浏览</button>
+        </div>
+      </div>
+      <div class="sac-prev" id="sac-preview">选好维度后点「预览矩阵」估算规模与机时</div>
+      <div class="actions" style="margin-top:10px">
+        <button class="btn" id="sac-preview-btn">预览矩阵</button>
+        <button class="btn primary" id="sac-gen-btn">生成矩阵</button>
+      </div>
+    </div>
+
+    <!-- 多自旋并跑:NM/LS/HS 家族(防自旋态选错的静默错数) -->
+    <div class="card" id="spin-card" style="padding:16px;margin-bottom:14px">
+      <div class="gen-h">多自旋并跑(NM / LS / HS 家族,防自旋态选错的 0.1–0.5 eV 静默错数)</div>
+      <div class="gen-fld">
+        <span class="gen-lbl">结构 POSCAR</span>
+        <div class="gen-inrow">
+          <input id="spin-poscar" class="ipt" autocomplete="off" placeholder="结构文件路径">
+          <button class="btn" id="spin-poscar-btn">浏览</button>
+        </div>
+      </div>
+      <div class="gen-fld">
+        <span class="gen-lbl">INCAR</span>
+        <div class="gen-inrow">
+          <input id="spin-incar" class="ipt" autocomplete="off" placeholder="INCAR 参数文件路径">
+          <button class="btn" id="spin-incar-btn">浏览</button>
+        </div>
+      </div>
+      <div class="gen-fld" style="margin-bottom:0">
+        <span class="gen-lbl">输出根目录</span>
+        <div class="gen-inrow">
+          <input id="spin-out" class="ipt" autocomplete="off" placeholder="家族作业组(_spin_nm/_ls/_hs)生成在此根下">
+          <button class="btn" id="spin-out-btn">浏览</button>
+        </div>
+      </div>
+      <div class="actions" style="margin-top:10px">
+        <button class="btn primary" id="spin-gen-btn">生成自旋家族</button>
+      </div>
+    </div>
+
     <div class="log" id="generate-log" data-anchor><div class="head">生成日志</div></div>
   </section>
 
@@ -305,6 +414,11 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
         <label><input type="checkbox" id="fig-bar" checked> 吸附能柱状图</label>
         <label><input type="checkbox" id="fig-table" checked> ΔE 数据表(PNG+PDF+CSV)</label>
         <label><input type="checkbox" id="fig-ladder" checked> ΔG 台阶图(需分子库)</label>
+        <label style="display:flex;gap:5px;align-items:center">反应
+          <select id="pj-preset" class="ipt" style="width:auto;display:inline-block;padding:3px 6px">
+            <option value="">Li-S 放电(默认)</option>
+          </select>
+        </label>
         <button class="btn primary" id="pj-figs">生成所选图</button>
       </div>
 
@@ -335,6 +449,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <button class="btn" id="jb-status">查询状态</button>
       <button class="btn" id="jb-fetch">拉回结果</button>
       <button class="btn" id="jb-continue">续算</button>
+      <button class="btn" id="jb-spin" title="对选中的自旋家族(_spin_nm/_ls/_hs)判基态 + 磁矩审计">自旋对比</button>
       <button class="btn" id="jb-queue">集群队列</button>
       <button class="btn" id="jb-open">打开目录</button>
       <span style="flex:1"></span>

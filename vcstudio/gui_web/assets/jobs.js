@@ -86,7 +86,10 @@
       ` <button class="lnk conv" title="查看收敛过程(E0/ΔE/|F|max vs 离子步)">收敛</button>` +
       `<button class="lnk struct" title="3D 结构预览(CONTCAR 优先,自动检查分子-衬底距离)">结构</button>` +
       `<button class="lnk meth" title="生成中英双语 Methods 段 + BibTeX(读真实 INCAR/KPOINTS/POTCAR)">方法</button>` +
-      `<button class="lnk dos" title="总 DOS 出图(需本地 vasprun.xml)">DOS</button></td>` +
+      `<button class="lnk dos" title="总 DOS 出图(需本地 vasprun.xml)">DOS</button>` +
+      (r.state === 'DONE'
+        ? `<button class="lnk derive" title="派生频率(ZPE)/电子结构静态作业">派生</button>` : '') +
+      `</td>` +
       `<td>${VCS.pill(r.state)}</td>` +
       `<td class="mono">${r.job_id ? VCS.esc(r.job_id) : '—'}</td>` +
       `<td class="num">${r.steps != null ? VCS.esc(r.steps) : '—'}</td>` +
@@ -271,6 +274,11 @@
         VCS.showDos(tr.dataset.dir, tr.dataset.name || tr.dataset.dir);
         return;
       }
+      if (e.target.closest('.derive')) {
+        e.stopPropagation();
+        toggleDeriveRow(tr);
+        return;
+      }
       const dir = tr.dataset.dir;
       if (e.ctrlKey || e.metaKey) {
         if (State.selected.has(dir)) State.selected.delete(dir);
@@ -334,6 +342,96 @@
         const [dir, msg] = row;
         VCS.log(base(dir) + ':' + msg);
       }
+    });
+  }
+
+  // ── 派生计算展开区(DONE 作业):频率(ZPE)/ 电子结构静态多选 ────────────────
+  function fmtChange(c) {
+    if (typeof c === 'string') return c;             // estatic 改动为字符串
+    const key = c.key, act = c.action;
+    if (act === 'add') return '新增 ' + key + ' = ' + c.new + (c.reason ? '(' + c.reason + ')' : '');
+    if (act === 'strip') return '剥离 ' + key + '(原 ' + c.old + ')' + (c.reason ? ':' + c.reason : '');
+    return key + ':' + c.old + ' → ' + c.new + (c.reason ? '(' + c.reason + ')' : '');
+  }
+
+  function toggleDeriveRow(tr) {
+    const dir = tr.dataset.dir, name = tr.dataset.name || dir;
+    const next = tr.nextElementSibling;
+    if (next && next.classList.contains('derive-row') && next.dataset.for === dir) {
+      next.remove(); return;                         // 再点收起
+    }
+    const row = document.createElement('tr');
+    row.className = 'derive-row';
+    row.dataset.for = dir;
+    row.innerHTML = '<td colspan="8"><div class="derive-box">' +
+      '<span class="derive-lbl">派生计算:</span>' +
+      '<button class="btn quiet" data-dfreq>频率 (ZPE)</button>' +
+      '<span class="derive-sep">电子结构静态:</span>' +
+      '<label><input type="checkbox" data-k="pdos" checked> PDOS</label>' +
+      '<label><input type="checkbox" data-k="bader"> Bader</label>' +
+      '<label><input type="checkbox" data-k="chgdiff"> 差分电荷</label>' +
+      '<button class="btn quiet" data-dstatic>派生静态</button></div></td>';
+    tr.parentNode.insertBefore(row, tr.nextSibling);
+    row.querySelector('[data-dfreq]').addEventListener('click', () => doDeriveFreq(dir, name));
+    row.querySelector('[data-dstatic]').addEventListener('click', () => {
+      const kinds = Array.from(row.querySelectorAll('input[data-k]:checked')).map(c => c.dataset.k);
+      doDeriveEstatic(dir, name, kinds);
+    });
+  }
+
+  async function doDeriveFreq(dir, name) {
+    VCS.log('派生频率作业(ZPE):' + name + ' …');
+    const r = await VCS.call('derive_freq', dir);
+    if (!r || r.ok === false || r.error) {
+      VCS.log('派生频率失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+    }
+    VCS.log('已派生频率作业:' + r.job_dir, 'okc');
+    (r.changes || []).forEach(c => VCS.log('  · ' + fmtChange(c)));
+    (r.warnings || []).forEach(w => VCS.log('  ⚠ ' + w, 'warnc'));
+    VCS.log('频率作业已入台账,去列表提交', 'okc');
+    await reload();
+  }
+
+  async function doDeriveEstatic(dir, name, kinds) {
+    if (!kinds.length) { VCS.toast('请至少勾选一种静态类型', 'fail'); return; }
+    VCS.log('派生静态作业(' + kinds.join('、') + '):' + name + ' …');
+    const r = await VCS.call('derive_estatic', dir, kinds);
+    if (!r || r.ok === false || r.error) {
+      VCS.log('派生静态失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+    }
+    (r.jobs || []).forEach(j => {
+      VCS.log('已派生 ' + j.kind + ' 静态作业:' + j.job_dir, 'okc');
+      (j.changes || []).forEach(c => VCS.log('  · ' + fmtChange(c)));
+      (j.warnings || []).forEach(w => VCS.log('  ⚠ ' + w, 'warnc'));
+    });
+    (r.skipped || []).forEach(s => VCS.log('跳过 ' + s.kind + ':' + s.reason, 'warnc'));
+    VCS.log('静态作业已入台账,去列表提交', 'okc');
+    await reload();
+  }
+
+  // ── 自旋对比:对选中的自旋家族判基态 + 磁矩审计 ────────────────────────────
+  async function doSpinCompare() {
+    const dirs = selectedDirs();
+    if (dirs.length < 2) {
+      VCS.log('自旋对比:请选中同一家族的多个自旋变体(_spin_nm/_ls/_hs)', 'failc'); return;
+    }
+    VCS.log('自旋对比(' + dirs.length + ' 个变体)…');
+    const r = await VCS.call('spin_family_compare', dirs);
+    if (!r || r.ok === false || r.error) {
+      VCS.log('自旋对比失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+    }
+    const g = r.ground || {};
+    if (g.pending && g.pending.length) {
+      VCS.log('尚未全部 DONE,待完成:' + g.pending.join('、'), 'warnc');
+    } else if (g.winner) {
+      VCS.log('自旋基态:' + g.winner + '(相对能量 ' +
+        Object.entries(g.de_meV || {}).map(kv => kv[0] + '=' + kv[1] + ' meV').join(', ') + ')', 'okc');
+      if (g.warning) VCS.log('⚠ ' + g.warning, 'warnc');
+    }
+    (r.audits || []).forEach(a => {
+      if (!a.audited) VCS.log('磁矩审计 ' + a.name + ':' + (a.warning || '无法审计'), 'warnc');
+      else if (a.warning) VCS.log('磁矩审计 ' + a.name + ':⚠ ' + a.warning, 'warnc');
+      else VCS.log('磁矩审计 ' + a.name + ':末态 ' + a.final_magnetization + ' μB,正常', 'okc');
     });
   }
 
@@ -690,6 +788,7 @@
     wire('jb-status', () => runStatus(false));
     wire('jb-fetch', doFetch);
     wire('jb-continue', doContinue);
+    wire('jb-spin', doSpinCompare);
     wire('jb-queue', doQueue);
     wire('jb-open', doOpen);
     wire('jb-report', doReport);

@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import time
+import types
 from dataclasses import asdict, fields as dc_fields
 
 # 合法计算类型(决定 KPOINTS 网格);前端下拉与后端都以此为准
@@ -22,6 +24,9 @@ _STAGES = ('generate', 'submit', 'monitor', 'recover', 'analysis', 'report_done'
 # 活跃(在队/在跑)状态与可续算终态:pipeline_tick/status 复用
 _ACTIVE_STATES = ('UPLOADED', 'SUBMITTED', 'QUEUED', 'RUNNING')
 _TERMINAL_FAIL = ('FAILED', 'UNCONVERGED')
+
+# SAC 矩阵机时粗估系数(核时·原子⁻¹·作业⁻¹,数量级参考,可解释:Σ原子数 × 系数)
+_SAC_EST_COEF = 0.8
 
 
 def _norm_calc_type(x) -> str:
@@ -38,7 +43,9 @@ class Api:
                  submitter_mod=None, config_mod=None, job_builder_mod=None,
                  logic_mod=None, adsorption_mod=None, report_full_mod=None,
                  conv_mod=None, sview_mod=None, methods_mod=None, dialog_fn=None,
-                 native_charts_mod=None, freeenergy_mod=None, ai_analysis_mod=None):
+                 native_charts_mod=None, freeenergy_mod=None, ai_analysis_mod=None,
+                 freq_builder_mod=None, estatic_mod=None, sac_mods=None,
+                 spin_mod=None, reactions_mod=None, campaign_mods=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -75,6 +82,14 @@ class Api:
         self._freeenergy = freeenergy_mod
         # LLM 分析层(设置页/自动报告用):纯 stdlib 模块,延迟导入,测试注入假件
         self._ai_analysis = ai_analysis_mod
+        # Phase A 新引擎(派生计算/SAC 矩阵/多自旋/通用反应/campaign):一律延迟导入,
+        # 测试注入假件即全离线可测。sac_mods/campaign_mods 为"模块束"(SimpleNamespace/包)。
+        self._freq_builder = freq_builder_mod
+        self._estatic = estatic_mod
+        self._sac_mods = sac_mods
+        self._spin = spin_mod
+        self._reactions = reactions_mod
+        self._campaign = campaign_mods
 
     # ── 桥活性探测(前端用来确认 js_api 已就绪) ──
     def ping(self) -> str:
@@ -125,6 +140,49 @@ class Api:
             from vcstudio.project import ai_analysis
             self._ai_analysis = ai_analysis
         return self._ai_analysis
+
+    def _fb(self):
+        """频率作业生成端(F14)延迟加载。"""
+        if self._freq_builder is None:
+            from vcstudio.generate import freq_builder
+            self._freq_builder = freq_builder
+        return self._freq_builder
+
+    def _es(self):
+        """电子结构静态派生延迟加载。"""
+        if self._estatic is None:
+            from vcstudio.generate import estatic
+            self._estatic = estatic
+        return self._estatic
+
+    def _sac(self):
+        """SAC 建模束(sac_builder + molecules + sites)延迟加载(numpy 相邻,重)。"""
+        if self._sac_mods is None:
+            from vcstudio.generate import molecules, sac_builder, sites
+            self._sac_mods = types.SimpleNamespace(
+                sac_builder=sac_builder, molecules=molecules, sites=sites)
+        return self._sac_mods
+
+    def _sp(self):
+        """多自旋并跑引擎(F3/F10)延迟加载。"""
+        if self._spin is None:
+            from vcstudio.project import spin_scan
+            self._spin = spin_scan
+        return self._spin
+
+    def _rx(self):
+        """通用反应预设库延迟加载。"""
+        if self._reactions is None:
+            from vcstudio.project import reactions
+            self._reactions = reactions
+        return self._reactions
+
+    def _cmp(self):
+        """campaign 文件式控制面延迟加载(不可用/未安装 → ImportError,调用方降级)。"""
+        if self._campaign is None:
+            import vcstudio.campaign as campaign
+            self._campaign = campaign
+        return self._campaign
 
     def _resolve(self, name, password):
         """名字 → (profile, 密码, err_dict|None)。
@@ -809,10 +867,102 @@ class Api:
         except ValueError as e:
             return None, str(e)
 
-    def proj_figures(self, path, kinds=None, save_to=None):
+    @staticmethod
+    def _match_species_energy(species_bare, short_energies):
+        """物种裸名 → 项目构型能量:短名精确匹配(或短名以物种名+分隔符起头)。
+
+        取最稳(能量最低)的匹配。'OH' 不会误配 'OOH'(下一字符为字母);'O_top' 配 'O'。
+        无匹配 → None。
+        """
+        low = str(species_bare).lower()
+        if not low:
+            return None
+        best = None
+        for short, e in short_energies.items():
+            s = str(short).lower()
+            hit = s == low or (s.startswith(low)
+                               and (len(s) == len(low) or not s[len(low)].isalnum()))
+            if hit and (best is None or e < best):
+                best = e
+        return best
+
+    def _proj_fed_preset(self, proj, summary, preset_key):
+        """通用反应预设台阶(F16):项目构型/分子能量 → free_energy_path。
+
+        → (fed, None, 标题) 或 (None, 中文原因, 标题)。构型名映射为物种能量,
+        缺失物种/分子能量集中报"缺 {物种} 的能量"。
+        """
+        try:
+            spec = self._rx().get_preset(preset_key)
+        except Exception as e:                            # noqa: BLE001 未知预设
+            return None, f'未知反应预设「{preset_key}」:{e}', str(preset_key)
+        ptitle = spec.get('description') or spec.get('name') or str(preset_key)
+        # 分子/参考态能量:复用 Li-S 分子库扫描(mol_*/molecule_* 子目录 OSZICAR)
+        try:
+            cfg = self._config.load_config()
+        except Exception:                                 # noqa: BLE001
+            cfg = {}
+        mol_dir = (cfg or {}).get('lis_molecules_dir') or ''
+        mol_e = {}
+        if mol_dir and os.path.isdir(str(mol_dir)):
+            try:
+                mol_e = self._fe().load_molecule_energies(str(mol_dir))
+            except Exception:                             # noqa: BLE001 分子库坏 → 视作空
+                mol_e = {}
+        _state, e_slab = summary['slab']
+        # 项目构型短名 → 最稳能量(仅 DONE)
+        pname = str(proj.get('name') or '')
+        short_e = {}
+        for r in (summary.get('rows') or []):
+            if r.get('e_config') is None or r.get('state') != 'DONE':
+                continue
+            short = self._ads_short(r['name'], pname)
+            e = r['e_config']
+            if short not in short_e or e < short_e[short]:
+                short_e[short] = e
+        energies, missing = {}, []
+
+        def _need(key, energy):
+            if energy is None:
+                if key not in missing:
+                    missing.append(key)
+            else:
+                energies[key] = energy
+
+        for st in spec.get('steps') or []:
+            sp = st.get('species', '')
+            if sp in energies or sp in missing:
+                continue
+            bare = str(sp).rstrip('*')
+            if bare == '':                    # 干净基底 '*' → 清洁表面能量
+                _need(sp, e_slab)
+            else:
+                _need(sp, self._match_species_energy(bare, short_e))
+        for st in spec.get('steps') or []:
+            for g in (st.get('coadsorbates_or_gas') or []):
+                nm = g.get('name')
+                if nm and nm not in energies and nm not in missing:
+                    _need(nm, mol_e.get(nm))
+        # 参比电对定标所需分子(Li/Li+ 需 Li2S/S8;RHE 需 H2)
+        for nm in (('Li2S', 'S8') if spec.get('electrode') == 'Li/Li+'
+                   else ('H2',) if spec.get('electrode') == 'RHE' else ()):
+            if nm not in energies and nm not in missing:
+                _need(nm, mol_e.get(nm))
+        if missing:
+            return None, '缺 ' + '、'.join(missing) + ' 的能量(对应构型/分子需 DONE)', ptitle
+        try:
+            fed = self._fe().free_energy_path(spec, energies)
+            return fed, None, ptitle
+        except ValueError as e:
+            return None, str(e), ptitle
+
+    def proj_figures(self, path, kinds=None, save_to=None, preset_key=None):
         """单项目论文级出图(原生引擎)。kinds ⊂ {'bar','table','ladder'},缺省全选。
 
         bar/table 只用已完成的 ΔE 行;ladder 需 config.lis_molecules_dir 分子库。
+        preset_key 为空(默认)→ ladder 走既有 Li-S 放电路径(向后兼容,行为完全不变);
+        给非空反应预设 key(见 reaction_presets)→ ladder 改走通用 free_energy_path 引擎,
+        项目构型名映射为物种能量,映射不上的物种记 skipped 原因"缺 {物种} 的能量"。
         某类图缺数据只记 skipped(kind+中文原因),不拖垮其他图。
         返回 {'ok','files','skipped','out_dir','error'}。
         """
@@ -851,12 +1001,17 @@ class Api:
                     files += nc.energy_matrix_table(
                         data, os.path.join(out_dir, 'delta_e_table.png'))
                 elif kind == 'ladder':
-                    fed, reason = self._proj_fed(proj, summary)
+                    if preset_key:
+                        fed, reason, ptitle = self._proj_fed_preset(
+                            proj, summary, preset_key)
+                    else:
+                        fed, reason = self._proj_fed(proj, summary)
+                        ptitle = 'Li-S discharge path'
                     if fed is None:
                         skipped.append({'kind': 'ladder', 'reason': reason})
                         continue
-                    title = (f'Li-S discharge path ($U_L$ = {fed["u_l"]:.2f} V)'
-                             if fed.get('u_l') is not None else 'Li-S discharge path')
+                    title = (f'{ptitle} ($U_L$ = {fed["u_l"]:.2f} V)'
+                             if fed.get('u_l') is not None else ptitle)
                     files += nc.free_energy_ladder(
                         [{'name': pname, 'G': [st['G'] for st in fed['steps']]}],
                         os.path.join(out_dir, 'free_energy_ladder.png'),
@@ -1413,3 +1568,495 @@ class Api:
                 errors.append(f'报告自动化失败:{e}')
         return {'ok': True, 'events': events, 'errors': errors, 'synced': synced,
                 'last_sync': time.strftime('%Y-%m-%d %H:%M:%S')}
+
+    # ── Phase A 引擎:公共小工具 ────────────────────────────────────────────────
+    @staticmethod
+    def _rotations_tuple(n):
+        """取向数 → 绕 z 采样角度(度)。1→(0,);2→(0,180);4→(0,90,180,270);其余均分。"""
+        try:
+            n = int(n or 1)
+        except (TypeError, ValueError):
+            n = 1
+        n = max(1, n)
+        if n == 1:
+            return (0,)
+        if n == 2:
+            return (0, 180)
+        if n == 4:
+            return (0, 90, 180, 270)
+        step = 360.0 / n
+        return tuple(int(round(step * i)) for i in range(n))
+
+    @staticmethod
+    def _filter_sites(sites, sites_mode):
+        """位点策略:'metal_top' 仅金属顶位;其余(全位点)返回全部。"""
+        if str(sites_mode) == 'metal_top':
+            return [s for s in sites if s.get('kind') == 'top_metal']
+        return list(sites)
+
+    @staticmethod
+    def _poscar_natoms(text):
+        """POSCAR 文本 → 原子数(取首个全整数行即计数行之和;解析不出 → 0)。"""
+        for ln in (text or '').splitlines()[5:9]:
+            parts = ln.split()
+            if parts and all(p.isdigit() for p in parts):
+                return sum(int(p) for p in parts)
+        return 0
+
+    def _job_from_text(self, poscar_text, incar_path, out_dir, lib):
+        """把 POSCAR 文本经既有四件套链落 out_dir + 写 job.yaml + 入台账 →(job_dir, warnings)。
+
+        build 失败向上抛(调用方记 skipped);job.yaml/台账写失败只并入 warnings,
+        绝不撤销已生成的四件套(同 gen_run 口径)。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            ppath = os.path.join(td, 'POSCAR')
+            with open(ppath, 'w', encoding='utf-8') as f:
+                f.write(poscar_text)
+            payload = self._job_builder.build_job_dir(
+                ppath, incar_path, out_dir, calc_type='slab', lib_root=(lib or None))
+        job_dir = payload['out_dir']
+        warnings = list(payload.get('warnings') or [])
+        try:
+            self._manifest.create_from_build(
+                job_dir, payload, poscar_path=os.path.join(job_dir, 'POSCAR'),
+                validate=True)
+            self._ledger.register(job_dir)
+        except Exception as e:                            # noqa: BLE001
+            warnings.append(f'job.yaml/台账写入失败(不影响四件套):{e}')
+        return job_dir, warnings
+
+    # ── 派生计算(作业页):频率(ZPE)/ 电子结构静态 ─────────────────────────────
+    def derive_freq(self, job_dir, out_root=None):
+        """派生频率作业(F14,ZPE):调 freq_builder 从 CONTCAR+INCAR 派生 → 入台账。
+
+        out_root 缺省 → 与原作业同级;命名 {原名}_freq。
+        返回 {'ok','job_dir','changes'(逐条改动 dict),'warnings','error'}。
+        """
+        try:
+            d = (job_dir or '').strip()
+            if not d or not os.path.isdir(d):
+                return {'ok': False, 'job_dir': None, 'changes': [],
+                        'warnings': [], 'error': '作业目录不存在'}
+            base = os.path.basename(os.path.normpath(d))
+            parent = (out_root or '').strip() or os.path.dirname(os.path.normpath(d))
+            out_dir = os.path.join(parent, f'{base}_freq')
+            res = self._fb().build_freq_job(d, out_dir)
+            warnings = list(res.get('warnings') or [])
+            try:
+                self._ledger.register(res['out_dir'])
+            except Exception as e:                        # noqa: BLE001
+                warnings.append(f'台账登记失败(不影响已派生目录):{e}')
+            return {'ok': True, 'job_dir': res['out_dir'],
+                    'changes': list(res.get('changes') or []),
+                    'warnings': warnings, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'job_dir': None, 'changes': [],
+                    'warnings': [], 'error': str(e)}
+
+    def derive_estatic(self, job_dir, kinds, out_root=None):
+        """派生电子结构静态作业:kinds ⊂ {'pdos','bader','chgdiff'},每类一份 → 入台账。
+
+        命名 {原名}_st_{kind}('_st' 为静态标记)。单类失败只记 skipped,不拖垮其他类。
+        返回 {'ok','jobs':[{'kind','job_dir','changes','warnings'}],'skipped':[...],'error'}。
+        """
+        try:
+            d = (job_dir or '').strip()
+            if not d or not os.path.isdir(d):
+                return {'ok': False, 'jobs': [], 'skipped': [],
+                        'error': '作业目录不存在'}
+            valid = ('pdos', 'bader', 'chgdiff')
+            req = [str(k).strip().lower() for k in (kinds or []) if str(k).strip()]
+            picks = [k for k in valid if k in req]        # 保序去重、只留合法
+            skipped = [{'kind': k, 'reason': '不支持的静态类型(仅 pdos/bader/chgdiff)'}
+                       for k in req if k not in valid]
+            if not picks:
+                return {'ok': False, 'jobs': [], 'skipped': skipped,
+                        'error': '未选择有效的静态类型(pdos/bader/差分电荷)'}
+            base = os.path.basename(os.path.normpath(d))
+            parent = (out_root or '').strip() or os.path.dirname(os.path.normpath(d))
+            es = self._es()
+            jobs = []
+            for kind in picks:
+                out_dir = os.path.join(parent, f'{base}_st_{kind}')
+                try:
+                    res = es.build_static_job(d, out_dir, purpose=kind)
+                except Exception as e:                    # noqa: BLE001 单类失败隔离
+                    skipped.append({'kind': kind, 'reason': str(e)})
+                    continue
+                warnings = list(res.get('warnings') or [])
+                try:
+                    self._ledger.register(res['out_dir'])
+                except Exception as e:                    # noqa: BLE001
+                    warnings.append(f'台账登记失败:{e}')
+                jobs.append({'kind': kind, 'job_dir': res['out_dir'],
+                             'changes': list(res.get('changes') or []),
+                             'warnings': warnings})
+            return {'ok': bool(jobs), 'jobs': jobs, 'skipped': skipped, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'jobs': [], 'skipped': [], 'error': str(e)}
+
+    # ── SAC 批量建模(生成页) ───────────────────────────────────────────────────
+    def molecule_list(self):
+        """内置分子库清单(SAC 吸附质 chips 取此)→
+        {'ok','molecules':[{name,formula,spin_hint}],'error'}。"""
+        try:
+            mols = self._sac().molecules
+            out = []
+            for n in mols.list_molecules():
+                try:
+                    info = mols.molecule_info(n)
+                except Exception:                         # noqa: BLE001
+                    info = {}
+                out.append({'name': n, 'formula': info.get('formula') or n,
+                            'spin_hint': info.get('spin_hint')})
+            return {'ok': True, 'molecules': out, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'molecules': [], 'error': str(e)}
+
+    def sac_matrix_preview(self, metals, templates, adsorbates,
+                           sites_mode='all', rotations=1):
+        """SAC 候选矩阵预览 →
+        {'ok','n_slabs','n_configs','n_total_jobs','estimate_note','names','error'}。
+
+        金属 × 模板 × 吸附质 × 位点 × 取向。位点数按模板配位(与金属无关),故每模板建一
+        样本 SAC 数位点。机时为粗估(Σ原子数 × 系数),文案注明"粗估"。
+        """
+        empty = {'ok': False, 'n_slabs': 0, 'n_configs': 0, 'n_total_jobs': 0,
+                 'estimate_note': '', 'names': []}
+        try:
+            metals = [str(m).strip() for m in (metals or []) if str(m).strip()]
+            templates = [str(t).strip() for t in (templates or []) if str(t).strip()]
+            adsorbates = [str(a).strip() for a in (adsorbates or []) if str(a).strip()]
+            if not metals or not templates:
+                return {**empty, 'error': '请至少选择一个金属与一个模板'}
+            sac = self._sac()
+            rots = self._rotations_tuple(rotations)
+            n_rot = len(rots)
+            n_sites_by_t, natoms_by_t = {}, {}
+            for t in templates:
+                built = sac.sac_builder.build_sac(t, metals[0])
+                sites = sac.sites.enumerate_sac_sites(
+                    built['poscar'], built['site_indices'])
+                n_sites_by_t[t] = len(self._filter_sites(sites, sites_mode))
+                natoms_by_t[t] = self._poscar_natoms(built['poscar'])
+            n_slabs = len(metals) * len(templates)
+            n_ads = len(adsorbates)
+            n_configs = sum(len(metals) * n_sites_by_t[t] * n_ads * n_rot
+                            for t in templates)
+            n_total = n_slabs + n_configs
+            names = [f'{metal}@{t}_clean' for metal in metals for t in templates]
+            names += [f'{metal}@{t}_ads_{ads}'
+                      for metal in metals for t in templates for ads in adsorbates]
+            names = names[:20]
+            total_atoms = sum(
+                len(metals) * natoms_by_t[t] * (1 + n_sites_by_t[t] * n_ads * n_rot)
+                for t in templates)
+            est = round(total_atoms * _SAC_EST_COEF)
+            estimate_note = (
+                f'粗估机时 ≈ {est} 核时(按 Σ原子数({total_atoms})× {_SAC_EST_COEF} '
+                f'核时·原子⁻¹ 粗估:{n_slabs} 清洁面 + {n_configs} 吸附构型作业);'
+                f'仅数量级参考,实际随体系/收敛差异大。')
+            return {'ok': True, 'n_slabs': n_slabs, 'n_configs': n_configs,
+                    'n_total_jobs': n_total, 'estimate_note': estimate_note,
+                    'names': names, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {**empty, 'error': str(e)}
+
+    def sac_matrix_generate(self, metals, templates, adsorbates, sites_mode='all',
+                            rotations=1, incar_path='', out_root=''):
+        """SAC 候选矩阵生成:逐个 build_sac → 清洁 slab 作业 + 每个吸附构型作业(用
+        job_builder 四件套链,INCAR 用用户提供的)→ 入台账;按 slab 建吸附能项目(清洁面
+        + 构型族);引擎可用则同步注册 campaign(记预估机时)。
+
+        返回 {'ok','created','project_paths','skipped','campaign','error'}。
+        """
+        try:
+            metals = [str(m).strip() for m in (metals or []) if str(m).strip()]
+            templates = [str(t).strip() for t in (templates or []) if str(t).strip()]
+            adsorbates = [str(a).strip() for a in (adsorbates or []) if str(a).strip()]
+            incar = (incar_path or '').strip()
+            root = (out_root or '').strip()
+            errs = []
+            if not metals or not templates:
+                errs.append('请至少选择一个金属与一个模板')
+            if not incar or not os.path.isfile(incar):
+                errs.append('共享 INCAR 不存在')
+            if not root:
+                errs.append('未选输出根目录')
+            if errs:
+                return {'ok': False, 'created': 0, 'project_paths': [],
+                        'skipped': [], 'campaign': None, 'error': ';'.join(errs)}
+            lib = ''
+            try:
+                lib = self._config.load_config().get('potcar_lib_root', '') or ''
+            except Exception:                             # noqa: BLE001
+                pass
+            sac = self._sac()
+            rots = self._rotations_tuple(rotations)
+            created, project_paths, skipped, tasks = 0, [], [], []
+            for metal in metals:
+                for template in templates:
+                    label = f'{metal}@{template}'
+                    try:
+                        built = sac.sac_builder.build_sac(template, metal)
+                    except Exception as e:                # noqa: BLE001 单体系建模失败隔离
+                        skipped.append({'name': label, 'reason': f'建模失败:{e}'})
+                        continue
+                    base = f'{metal}_{template}'.replace('+', 'p')
+                    proj_root = os.path.join(root, base)
+                    try:
+                        cdir, _cw = self._job_from_text(
+                            built['poscar'], incar,
+                            os.path.join(proj_root, f'{base}_clean'), lib)
+                    except Exception as e:                # noqa: BLE001
+                        skipped.append({'name': f'{label} 清洁面', 'reason': str(e)})
+                        continue
+                    created += 1
+                    tasks.append({'id': os.path.basename(cdir), 'dir': cdir,
+                                  'natoms': self._poscar_natoms(built['poscar'])})
+                    try:
+                        sites = self._filter_sites(sac.sites.enumerate_sac_sites(
+                            built['poscar'], built['site_indices']), sites_mode)
+                    except Exception as e:                # noqa: BLE001
+                        skipped.append({'name': f'{label} 位点', 'reason': str(e)})
+                        sites = []
+                    config_dirs = []
+                    for ads in adsorbates:
+                        for site in sites:
+                            try:
+                                texts = sac.sites.place_adsorbate(
+                                    built['poscar'], ads, site, rotations=rots)
+                            except Exception as e:        # noqa: BLE001 拒绝/失败隔离
+                                skipped.append(
+                                    {'name': f'{ads}@{site.get("name")}',
+                                     'reason': str(e)})
+                                continue
+                            for i, text in enumerate(texts):
+                                deg = rots[i] if i < len(rots) else i
+                                cfg_dir = os.path.join(
+                                    proj_root,
+                                    f'{base}_ads_{ads}_{site.get("name")}_r{deg}')
+                                try:
+                                    jd, _w = self._job_from_text(text, incar,
+                                                                 cfg_dir, lib)
+                                except Exception as e:    # noqa: BLE001
+                                    skipped.append(
+                                        {'name': os.path.basename(cfg_dir),
+                                         'reason': str(e)})
+                                    continue
+                                config_dirs.append(jd)
+                                tasks.append({'id': os.path.basename(jd), 'dir': jd,
+                                              'natoms': self._poscar_natoms(text)})
+                                created += 1
+                    if config_dirs:
+                        pp = self._save_sac_project(base, proj_root, cdir, config_dirs)
+                        if pp:
+                            project_paths.append(pp)
+            campaign = self._register_sac_campaign(root, tasks)
+            return {'ok': True, 'created': created, 'project_paths': project_paths,
+                    'skipped': skipped, 'campaign': campaign, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'created': 0, 'project_paths': [],
+                    'skipped': [], 'campaign': None, 'error': str(e)}
+
+    def _save_sac_project(self, name, proj_root, clean_dir, config_dirs):
+        """按 slab 建吸附能项目(清洁面 + 构型族)并登记注册表 → project.yaml 路径|None。"""
+        try:
+            proj = {'name': name, 'root': proj_root,
+                    'members': {'clean_slab': clean_dir, 'gas_ref': None,
+                                'configs': list(config_dirs)}}
+            self._adsorption.save_project(proj_root, proj)
+            pp = os.path.join(proj_root, 'project.yaml')
+            try:
+                self._adsorption.register_project(pp)
+            except Exception:                             # noqa: BLE001 注册失败不致命
+                pass
+            return pp
+        except Exception:                                 # noqa: BLE001 建项目失败不拖垮生成
+            return None
+
+    def _register_sac_campaign(self, root, tasks):
+        """引擎可用则为本批生成注册 campaign(每作业一任务节点 + 记预估机时)→ 目录|None。
+
+        campaign 不可用/失败一律降级为 None,绝不拖垮生成。
+        """
+        if not tasks:
+            return None
+        try:
+            cmp = self._cmp()
+        except ImportError:
+            return None
+        try:
+            cid = 'sac-' + time.strftime('%Y%m%d-%H%M%S')
+            nodes = [cmp.new_task(t['id'], 'relax', job_dir=t['dir']) for t in tasks]
+            camp = cmp.init_campaign(
+                root, cid, tasks=nodes, title=f'SAC 批量建模 {len(tasks)} 作业',
+                hypothesis='SAC 候选矩阵筛选')
+            cdir = camp['dir']
+            for t in tasks:
+                try:
+                    est = cmp.estimate_job(t.get('natoms', 1), 1, 'relax', 32)
+                    cmp.record_estimate(cdir, t['id'], est)
+                except Exception:                         # noqa: BLE001 单条预估失败跳过
+                    continue
+            self._register_campaign_dir(cdir)
+            return cdir
+        except Exception:                                 # noqa: BLE001 注册失败降级
+            return None
+
+    def _register_campaign_dir(self, cdir):
+        """把 campaign 目录记入 config ui.campaign_dirs(供仪表盘 campaign_list 发现)。"""
+        try:
+            ui = self._config.get_ui_state()
+            dirs = list((ui or {}).get('campaign_dirs') or [])
+            if cdir not in dirs:
+                dirs.append(cdir)
+                self._config.set_ui_state(campaign_dirs=dirs)
+        except Exception:                                 # noqa: BLE001 记不进注册表不致命
+            pass
+
+    # ── 多自旋并跑(生成页 / 作业页) ────────────────────────────────────────────
+    def spin_family_generate(self, poscar, incar, out_root):
+        """多自旋并跑(F3):结构+INCAR → NM/LS/HS 家族作业组(spin_scan)→ 入台账。
+
+        返回 {'ok','variants':[{name,job_dir,magmom,changes,warnings}],'error'}。
+        """
+        try:
+            pos = (poscar or '').strip()
+            inc = (incar or '').strip()
+            root = (out_root or '').strip()
+            errs = []
+            if not pos or not os.path.isfile(pos):
+                errs.append('POSCAR 文件不存在')
+            if not inc or not os.path.isfile(inc):
+                errs.append('INCAR 文件不存在')
+            if not root:
+                errs.append('未选输出根目录')
+            if errs:
+                return {'ok': False, 'variants': [], 'error': ';'.join(errs)}
+            lib = ''
+            try:
+                lib = self._config.load_config().get('potcar_lib_root', '') or ''
+            except Exception:                             # noqa: BLE001
+                pass
+            base_name = os.path.splitext(os.path.basename(pos))[0] or 'spin'
+            with tempfile.TemporaryDirectory() as td:
+                base_dir = os.path.join(td, base_name)
+                payload = self._job_builder.build_job_dir(
+                    pos, inc, base_dir, calc_type='slab', lib_root=(lib or None))
+                try:
+                    self._manifest.create_from_build(
+                        payload['out_dir'], payload, poscar_path=pos, validate=True)
+                except Exception:                         # noqa: BLE001 基座 manifest 失败不致命
+                    pass
+                variants = self._sp().build_spin_variants(base_dir, root)
+            out = []
+            for v in variants:
+                warnings = list(v.get('warnings') or [])
+                try:
+                    self._ledger.register(v['out_dir'])
+                except Exception as e:                    # noqa: BLE001
+                    warnings.append(f'台账登记失败:{e}')
+                out.append({'name': v.get('name'), 'job_dir': v.get('out_dir'),
+                            'magmom': v.get('magmom'),
+                            'changes': list(v.get('changes') or []),
+                            'warnings': warnings})
+            return {'ok': True, 'variants': out, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'variants': [], 'error': str(e)}
+
+    def spin_family_compare(self, dirs):
+        """同家族(_nm/_ls/_hs)全 DONE 后判自旋基态 + 磁矩审计(spin_scan)。
+
+        返回 {'ok','ground'(pick_ground_state 结果),'audits':[{dir,name,...}],'error'}。
+        """
+        try:
+            dirs = [str(d).strip() for d in (dirs or []) if str(d).strip()]
+            if not dirs:
+                return {'ok': False, 'ground': None, 'audits': [],
+                        'error': '未提供作业目录'}
+            sp = self._sp()
+            ground = sp.pick_ground_state(dirs)
+            audits = []
+            for d in dirs:
+                name = os.path.basename(os.path.normpath(d))
+                outcar_path = os.path.join(d, 'OUTCAR')
+                if not os.path.isfile(outcar_path):
+                    audits.append({'dir': d, 'name': name, 'audited': False,
+                                   'warning': '缺 OUTCAR,无法审计磁矩'})
+                    continue
+                with open(outcar_path, 'r', encoding='utf-8', errors='replace') as f:
+                    outcar = f.read()
+                m = self._manifest.load_manifest(d) or {}
+                init = (m.get('inputs') or {}).get('spin_magmom')
+                a = self._sp().audit_magmom(outcar, init)
+                audits.append({'dir': d, 'name': name, **a})
+            return {'ok': True, 'ground': ground, 'audits': audits, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'ground': None, 'audits': [], 'error': str(e)}
+
+    # ── 通用反应预设(项目页 ΔG 台阶) ──────────────────────────────────────────
+    def reaction_presets(self):
+        """通用反应预设 → {'ok','presets':[{key,name,description}],'error'}(供 ΔG 台阶下拉)。"""
+        try:
+            presets = self._rx().list_presets()
+            out = [{'key': key, 'name': spec.get('name') or key,
+                    'description': spec.get('description') or ''}
+                   for key, spec in presets.items()]
+            return {'ok': True, 'presets': out, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'presets': [], 'error': str(e)}
+
+    # ── campaign 最小接线(仪表盘) ─────────────────────────────────────────────
+    def campaign_list(self):
+        """仪表盘批次(campaign)统计 → {'ok','available','campaigns':[...],'error'}。
+
+        每个 campaign {name,dir,n_tasks,states:{completed,validated,accepted}(累计口径,
+        completed⊇validated⊇accepted),budget:{estimated,cap}}。campaign 模块不可用/无批次
+        → available=False 或空列表(前端据此隐藏区块)。全程 try/except 降级,绝不拖垮仪表盘。
+        """
+        try:
+            try:
+                cmp = self._cmp()
+            except ImportError:
+                return {'ok': True, 'available': False, 'campaigns': [], 'error': None}
+            try:
+                ui = self._config.get_ui_state()
+            except Exception:                             # noqa: BLE001
+                ui = {}
+            dirs = list((ui or {}).get('campaign_dirs') or [])
+            campaigns = []
+            for cdir in dirs:
+                try:
+                    camp = cmp.load_campaign(cdir)
+                    if camp is None:
+                        continue
+                    summary = cmp.progress_summary(camp)
+                    acc = int(summary.get('accepted', 0) or 0)
+                    val = int(summary.get('validated', 0) or 0) + acc
+                    comp = int(summary.get('completed', 0) or 0) + val
+                    meta = camp.get('meta') or {}
+                    try:
+                        bud = cmp.load_budget(cdir)
+                        estimated = round(float(sum(
+                            float(v or 0.0)
+                            for v in (bud.get('estimates') or {}).values())), 2)
+                    except Exception:                     # noqa: BLE001 预算读失败给 0
+                        estimated = 0.0
+                    campaigns.append({
+                        'name': meta.get('title') or meta.get('id')
+                        or os.path.basename(str(cdir)),
+                        'dir': cdir,
+                        'n_tasks': int(summary.get('total', 0) or 0),
+                        'states': {'completed': comp, 'validated': val,
+                                   'accepted': acc},
+                        'budget': {'estimated': estimated,
+                                   'cap': meta.get('budget_core_hours')},
+                    })
+                except Exception:                         # noqa: BLE001 单个坏 campaign 跳过
+                    continue
+            return {'ok': True, 'available': True, 'campaigns': campaigns,
+                    'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'available': False, 'campaigns': [], 'error': str(e)}

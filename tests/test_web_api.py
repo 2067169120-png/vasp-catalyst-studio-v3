@@ -1658,3 +1658,622 @@ def test_open_dir_missing_still_errors():
     api = Api()
     out = api.open_dir('/definitely/not/a/real/path/xyz')
     assert out['ok'] is False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase A 新引擎接线(派生计算 / SAC 矩阵 / 多自旋 / 通用反应 / campaign)
+# 全部走构造注入的假件,零真实 matplotlib/ssh/campaign 磁盘依赖。
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── 假件工厂 ────────────────────────────────────────────────────────────────
+def _fake_freq(*, changes=None, warnings=None, calls=None, boom=None):
+    """freq_builder 假件:build_freq_job 回显 out_dir + 逐条改动 dict。"""
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _build(relax_dir, out_dir, **kw):
+        calls['build'] = {'relax_dir': relax_dir, 'out_dir': out_dir, **kw}
+        if boom:
+            raise boom
+        return {'out_dir': out_dir, 'free_atoms': [0, 1],
+                'changes': list(changes if changes is not None else
+                                [{'key': 'IBRION', 'action': 'replace', 'old': '2',
+                                  'new': '5', 'reason': '有限差分频率'}]),
+                'warnings': list(warnings or [])}
+    m.build_freq_job = _build
+    return m
+
+
+def _fake_estatic(*, calls=None, boom_kinds=None):
+    """estatic 假件:build_static_job 回显 out_dir + 字符串 changes。"""
+    calls = calls if calls is not None else {}
+    boom_kinds = boom_kinds or {}
+    m = types.SimpleNamespace()
+
+    def _build(relax_dir, out_dir, *, purpose='pdos', **kw):
+        calls.setdefault('purposes', []).append(purpose)
+        if purpose in boom_kinds:
+            raise boom_kinds[purpose]
+        return {'out_dir': out_dir, 'changes': [f'{purpose} 改动 A', f'{purpose} 改动 B'],
+                'warnings': []}
+    m.build_static_job = _build
+    return m
+
+
+_SAC_POSCAR = ('demo\n1.0\n8 0 0\n0 8 0\n0 0 20\nFe N C\n1 4 26\nCartesian\n'
+               + '0 0 0\n' * 31)
+
+
+def _fake_sac(*, sites_list=None, ads_texts=None, place_boom=None, build_boom=None,
+              calls=None):
+    """sac 束假件:sac_builder.build_sac / sites.enumerate+place / molecules。"""
+    calls = calls if calls is not None else {}
+    sb = types.SimpleNamespace()
+
+    def _build_sac(template, metal, **kw):
+        calls.setdefault('built', []).append((metal, template))
+        if build_boom and template in build_boom:
+            raise build_boom[template]
+        return {'poscar': _SAC_POSCAR, 'description': f'{metal}@{template}',
+                'site_indices': {'metal': 0, 'coord': [1, 2, 3, 4],
+                                 'metal_element': metal}}
+    sb.build_sac = _build_sac
+
+    _sites = sites_list if sites_list is not None else [
+        {'name': 'top_metal', 'position': [0.5, 0.5, 0.4], 'kind': 'top_metal'},
+        {'name': 'hollow', 'position': [0.5, 0.5, 0.4], 'kind': 'hollow'}]
+    st = types.SimpleNamespace()
+    st.enumerate_sac_sites = lambda pos, si: [dict(s) for s in _sites]
+
+    def _place(pos, mol, site, *, rotations=(0,), **kw):
+        calls.setdefault('placed', []).append((mol, site['name'], tuple(rotations)))
+        if place_boom:
+            raise place_boom
+        return list(ads_texts if ads_texts is not None
+                    else [f'{mol}@{site["name"]}_r{d}\nPOSCAR\n' for d in rotations])
+    st.place_adsorbate = _place
+
+    mo = types.SimpleNamespace()
+    mo.list_molecules = lambda: ['S8', 'Li2S4', 'O2']
+    mo.molecule_info = lambda n: {'formula': n, 'spin_hint': None, 'source_note': 'x'}
+    return types.SimpleNamespace(sac_builder=sb, sites=st, molecules=mo)
+
+
+def _fake_jb_text(built=None):
+    """job_builder 假件:build_job_dir 回显 out_dir(供 _job_from_text 链)。"""
+    built = built if built is not None else []
+    m = types.SimpleNamespace()
+
+    def _build(poscar_path, incar, out, **kw):
+        built.append(out)
+        return {'ok': True, 'out_dir': out, 'warnings': [], 'kpoints': [3, 3, 1],
+                'elements': ['Fe', 'N', 'C']}
+    m.build_job_dir = _build
+    return m
+
+
+def _fake_ads_projects(saved=None):
+    """adsorption 假件:save_project/register_project 收参(不碰真实注册表)。"""
+    saved = saved if saved is not None else []
+    m = types.SimpleNamespace()
+    m.save_project = lambda root, proj: saved.append((root, proj))
+    m.register_project = lambda pp: True
+    m.list_projects = lambda *a, **k: []
+    return m
+
+
+def _fake_spin(*, variants=None, ground=None, audit=None, calls=None, build_boom=None):
+    """spin_scan 假件:build_spin_variants / pick_ground_state / audit_magmom。"""
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _bsv(job_dir, out_root, **kw):
+        calls['bsv'] = {'job_dir': job_dir, 'out_root': out_root}
+        if build_boom:
+            raise build_boom
+        return list(variants if variants is not None else [
+            {'name': 'nm', 'out_dir': out_root + '/j_spin_nm', 'magmom': None,
+             'changes': [{'key': 'ISPIN', 'old': None, 'new': 2}], 'warnings': []},
+            {'name': 'hs', 'out_dir': out_root + '/j_spin_hs', 'magmom': '4 0',
+             'changes': [{'key': 'MAGMOM', 'old': None, 'new': '4 0'}], 'warnings': []}])
+    m.build_spin_variants = _bsv
+    m.pick_ground_state = lambda dirs: (ground if ground is not None
+                                        else {'winner': 'hs', 'energies': {},
+                                              'de_meV': {}, 'warning': None})
+
+    def _audit(outcar, init):
+        calls.setdefault('audits', []).append({'outcar': outcar, 'init': init})
+        return audit if audit is not None else {
+            'final_magnetization': 3.9, 'initial_magmom': init, 'collapsed': False,
+            'flipped': False, 'audited': True, 'warning': None}
+    m.audit_magmom = _audit
+    return m
+
+
+def _fake_reactions(presets=None):
+    p = presets if presets is not None else {
+        'ORR_4E': {'name': 'ORR_4E', 'description': '4 电子氧还原 ORR',
+                   'electrode': 'RHE', 'direction': 'reduction', 'steps': []},
+        'HER': {'name': 'HER', 'description': '析氢 HER', 'electrode': 'RHE',
+                'direction': 'reduction', 'steps': []}}
+    m = types.SimpleNamespace()
+    m.list_presets = lambda: dict(p)
+    m.get_preset = lambda k: dict(p)[k]
+    return m
+
+
+def _reactions_orr_spec():
+    return {'name': 'ORR_4E', 'description': '4 电子氧还原 ORR', 'electrode': 'RHE',
+            'direction': 'reduction', 'steps': [
+                {'label': 'O2', 'species': '*', 'n_electrons_cumulative': 0,
+                 'coadsorbates_or_gas': [{'name': 'O2', 'coef': 1}]},
+                {'label': '*OOH', 'species': 'OOH*', 'n_electrons_cumulative': 1,
+                 'coadsorbates_or_gas': []},
+                {'label': '*OH', 'species': 'OH*', 'n_electrons_cumulative': 2,
+                 'coadsorbates_or_gas': [{'name': 'H2O', 'coef': 1}]}]}
+
+
+def _fake_reactions_orr():
+    spec = _reactions_orr_spec()
+    m = types.SimpleNamespace()
+    m.list_presets = lambda: {'ORR_4E': spec}
+    m.get_preset = lambda k: {'ORR_4E': spec}[k]
+    return m
+
+
+def _fake_fe_preset(*, mol_e=None, fed=None, path_calls=None):
+    """freeenergy 假件(通用预设路径):load_molecule_energies + free_energy_path。"""
+    path_calls = path_calls if path_calls is not None else {}
+    m = types.SimpleNamespace()
+    m.load_molecule_energies = lambda d: dict(mol_e or {})
+
+    def _fep(spec, energies, **kw):
+        path_calls['energies'] = dict(energies)
+        path_calls['spec'] = spec
+        return fed if fed is not None else {
+            'steps': [{'label': s['label'], 'G': 0.0} for s in spec['steps']],
+            'pds_index': 0, 'u_l': 0.7, 'u_eq': 1.23, 'eta': 0.5,
+            'per_electron': [], 'warnings': []}
+    m.free_energy_path = _fep
+    return m
+
+
+def _fake_campaign(*, campaigns=None, calls=None):
+    """campaign 束假件:new_task/init_campaign/estimate/record + load/summary/budget。"""
+    calls = calls if calls is not None else {}
+    campaigns = campaigns or {}
+    m = types.SimpleNamespace()
+    m.new_task = lambda tid, kind, *, job_dir=None, **kw: {
+        'id': tid, 'kind': kind, 'job_dir': job_dir}
+
+    def _init(base, cid, *, tasks=None, title='', **kw):
+        cdir = os.path.join(str(base), '.camp', str(cid))
+        calls['init'] = {'base': str(base), 'cid': cid, 'title': title,
+                         'tasks': list(tasks or [])}
+        return {'dir': cdir, 'meta': {'id': cid, 'title': title,
+                                      'budget_core_hours': None},
+                'tasks': list(tasks or [])}
+    m.init_campaign = _init
+    m.estimate_job = lambda natoms, nkpts, kind, cores, **kw: round((natoms or 1) * 0.01, 3)
+    m.record_estimate = lambda cdir, tid, ch: calls.setdefault(
+        'estimates', {}).__setitem__(tid, ch)
+    m.load_campaign = lambda cdir: campaigns.get(cdir)
+    m.progress_summary = lambda camp: camp.get('_summary', {}) if isinstance(camp, dict) else {}
+    m.load_budget = lambda cdir: (campaigns.get(cdir) or {}).get(
+        '_budget', {'estimates': {}, 'actuals': {}})
+    return m
+
+
+# ── derive_freq ──────────────────────────────────────────────────────────────
+def test_derive_freq_derives_and_registers(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    registered, calls = [], {}
+    api = Api(freq_builder_mod=_fake_freq(calls=calls),
+              ledger_mod=_fake_ledger_register(registered))
+    out = api.derive_freq(str(tmp_path))
+    assert out['ok'] is True and out['error'] is None
+    assert out['job_dir'].endswith(os.path.basename(str(tmp_path)) + '_freq')
+    assert out['changes'][0]['key'] == 'IBRION'          # 逐条派生改动
+    assert registered == [out['job_dir']]                # 入台账
+    assert calls['build']['out_dir'] == out['job_dir']   # 命名 {原名}_freq
+
+
+def test_derive_freq_missing_dir_error():
+    api = Api(freq_builder_mod=_fake_freq())
+    out = api.derive_freq('/no/such/dir/xyz')
+    assert out['ok'] is False and out['job_dir'] is None and '目录' in out['error']
+
+
+def test_derive_freq_engine_exception_caught(tmp_path):
+    api = Api(freq_builder_mod=_fake_freq(boom=ValueError('缺 CONTCAR')),
+              ledger_mod=_fake_ledger_register([]))
+    out = api.derive_freq(str(tmp_path))
+    assert out['ok'] is False and '缺 CONTCAR' in out['error']
+
+
+# ── derive_estatic ───────────────────────────────────────────────────────────
+def test_derive_estatic_multi_kind_registers(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    registered, calls = [], {}
+    api = Api(estatic_mod=_fake_estatic(calls=calls),
+              ledger_mod=_fake_ledger_register(registered))
+    out = api.derive_estatic(str(tmp_path), ['pdos', 'bader', 'chgdiff'])
+    assert out['ok'] is True and len(out['jobs']) == 3
+    assert calls['purposes'] == ['pdos', 'bader', 'chgdiff']
+    assert [j['kind'] for j in out['jobs']] == ['pdos', 'bader', 'chgdiff']
+    assert out['jobs'][0]['job_dir'].endswith('_st_pdos')   # 命名 {原名}_st_{kind}
+    assert len(registered) == 3
+    assert out['jobs'][0]['changes'] == ['pdos 改动 A', 'pdos 改动 B']
+
+
+def test_derive_estatic_skips_invalid_kind(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    api = Api(estatic_mod=_fake_estatic(), ledger_mod=_fake_ledger_register([]))
+    out = api.derive_estatic(str(tmp_path), ['pdos', 'bogus'])
+    assert out['ok'] is True and len(out['jobs']) == 1
+    assert out['skipped'] == [{'kind': 'bogus',
+                               'reason': '不支持的静态类型(仅 pdos/bader/chgdiff)'}]
+
+
+def test_derive_estatic_no_valid_kinds_error(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    api = Api(estatic_mod=_fake_estatic())
+    out = api.derive_estatic(str(tmp_path), ['nope'])
+    assert out['ok'] is False and out['jobs'] == [] and '静态类型' in out['error']
+
+
+def test_derive_estatic_engine_failure_isolated(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    est = _fake_estatic(boom_kinds={'bader': RuntimeError('母 KPOINTS 缺')})
+    api = Api(estatic_mod=est, ledger_mod=_fake_ledger_register([]))
+    out = api.derive_estatic(str(tmp_path), ['pdos', 'bader'])
+    assert out['ok'] is True and len(out['jobs']) == 1
+    assert out['jobs'][0]['kind'] == 'pdos'
+    assert any(s['kind'] == 'bader' and '母 KPOINTS' in s['reason'] for s in out['skipped'])
+
+
+# ── molecule_list ────────────────────────────────────────────────────────────
+def test_molecule_list_from_engine():
+    api = Api(sac_mods=_fake_sac())
+    out = api.molecule_list()
+    assert out['ok'] is True
+    assert [m['name'] for m in out['molecules']] == ['S8', 'Li2S4', 'O2']
+    assert out['molecules'][0]['formula'] == 'S8'
+
+
+def test_molecule_list_error_caught():
+    boom = types.SimpleNamespace(molecules=types.SimpleNamespace(
+        list_molecules=lambda: (_ for _ in ()).throw(RuntimeError('库坏'))))
+    api = Api(sac_mods=boom)
+    out = api.molecule_list()
+    assert out['ok'] is False and '库坏' in out['error']
+
+
+# ── sac_matrix_preview ───────────────────────────────────────────────────────
+def test_sac_matrix_preview_counts_and_estimate():
+    api = Api(sac_mods=_fake_sac())
+    out = api.sac_matrix_preview(['Fe', 'Co'], ['MN4'], ['S8', 'O2'], 'metal_top', 2)
+    assert out['ok'] is True
+    assert out['n_slabs'] == 2                        # 2 金属 × 1 模板
+    assert out['n_configs'] == 8                      # 每 slab 1 顶位 × 2 吸附质 × 2 取向 ×2 slab
+    assert out['n_total_jobs'] == 10
+    assert '粗估' in out['estimate_note']
+    assert out['names'][0] == 'Fe@MN4_clean'
+
+
+def test_sac_matrix_preview_all_sites_uses_all_kinds():
+    api = Api(sac_mods=_fake_sac())                   # 默认 2 位点(top_metal + hollow)
+    out = api.sac_matrix_preview(['Fe'], ['MN4'], ['S8'], 'all', 1)
+    assert out['n_configs'] == 2                      # 2 位点 × 1 吸附质 × 1 取向
+
+
+def test_sac_matrix_preview_requires_metal_and_template():
+    api = Api(sac_mods=_fake_sac())
+    out = api.sac_matrix_preview([], ['MN4'], ['S8'], 'all', 1)
+    assert out['ok'] is False and '金属' in out['error']
+
+
+# ── sac_matrix_generate ──────────────────────────────────────────────────────
+def test_sac_matrix_generate_creates_jobs_project_and_campaign(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text('ENCUT=500\n', encoding='utf-8')
+    registered, saved, cc = [], [], {}
+    api = Api(sac_mods=_fake_sac(), job_builder_mod=_fake_jb_text(),
+              manifest_mod=_fake_manifest({}),
+              ledger_mod=_fake_ledger_register(registered),
+              adsorption_mod=_fake_ads_projects(saved),
+              campaign_mods=_fake_campaign(calls=cc),
+              config_mod=_fake_config(cfg={'potcar_lib_root': '/lib'}))
+    out = api.sac_matrix_generate(['Fe'], ['MN4'], ['S8'], 'metal_top', 1,
+                                  str(incar), str(tmp_path))
+    assert out['ok'] is True and out['error'] is None
+    assert out['created'] == 2                        # 1 清洁面 + 1 构型
+    assert len(registered) == 2                       # 全部入台账
+    # 每 slab 一个吸附能项目(清洁面 + 构型族)
+    assert len(out['project_paths']) == 1 and len(saved) == 1
+    assert saved[0][1]['members']['clean_slab'].endswith('_clean')
+    assert len(saved[0][1]['members']['configs']) == 1
+    # 同步注册 campaign(2 任务节点 + 逐任务记预估机时)
+    assert out['campaign'].endswith(cc['init']['cid'])
+    assert len(cc['init']['tasks']) == 2 and len(cc['estimates']) == 2
+
+
+def test_sac_matrix_generate_place_rejection_skipped(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text('E\n', encoding='utf-8')
+    sac = _fake_sac(place_boom=ValueError('分子-表面最近距离过近,全部拒绝'))
+    api = Api(sac_mods=sac, job_builder_mod=_fake_jb_text(),
+              manifest_mod=_fake_manifest({}), ledger_mod=_fake_ledger_register([]),
+              adsorption_mod=_fake_ads_projects(), campaign_mods=_fake_campaign(),
+              config_mod=_fake_config())
+    out = api.sac_matrix_generate(['Fe'], ['MN4'], ['S8'], 'metal_top', 1,
+                                  str(incar), str(tmp_path))
+    assert out['ok'] is True and out['created'] == 1          # 仅清洁面
+    assert any('拒绝' in s['reason'] for s in out['skipped'])
+    assert out['project_paths'] == []                         # 无构型 → 不建项目
+
+
+def test_sac_matrix_generate_clean_only_no_project(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text('E\n', encoding='utf-8')
+    saved = []
+    api = Api(sac_mods=_fake_sac(), job_builder_mod=_fake_jb_text(),
+              manifest_mod=_fake_manifest({}), ledger_mod=_fake_ledger_register([]),
+              adsorption_mod=_fake_ads_projects(saved), campaign_mods=_fake_campaign(),
+              config_mod=_fake_config())
+    out = api.sac_matrix_generate(['Fe'], ['MN4'], [], 'all', 1,
+                                  str(incar), str(tmp_path))
+    assert out['ok'] is True and out['created'] == 1
+    assert out['project_paths'] == [] and saved == []
+
+
+def test_sac_matrix_generate_missing_incar_error(tmp_path):
+    api = Api(sac_mods=_fake_sac(), config_mod=_fake_config())
+    out = api.sac_matrix_generate(['Fe'], ['MN4'], ['S8'], 'all', 1,
+                                  '/no/incar', str(tmp_path))
+    assert out['ok'] is False and 'INCAR' in out['error']
+
+
+def test_sac_matrix_generate_build_failure_isolated(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text('E\n', encoding='utf-8')
+    sac = _fake_sac(build_boom={'MN4': ValueError('未知模板')})
+    api = Api(sac_mods=sac, job_builder_mod=_fake_jb_text(),
+              manifest_mod=_fake_manifest({}), ledger_mod=_fake_ledger_register([]),
+              adsorption_mod=_fake_ads_projects(), campaign_mods=_fake_campaign(),
+              config_mod=_fake_config())
+    out = api.sac_matrix_generate(['Fe'], ['MN4', 'MN3'], ['S8'], 'metal_top', 1,
+                                  str(incar), str(tmp_path))
+    assert out['ok'] is True
+    assert any('MN4' in s['name'] and '建模失败' in s['reason'] for s in out['skipped'])
+    assert out['created'] >= 1                        # MN3 正常生成
+
+
+# ── spin_family_generate ─────────────────────────────────────────────────────
+def test_spin_family_generate_creates_family(tmp_path):
+    pos = tmp_path / 'POSCAR'
+    pos.write_text('p', encoding='utf-8')
+    incar = tmp_path / 'INCAR'
+    incar.write_text('i', encoding='utf-8')
+    registered = []
+    api = Api(spin_mod=_fake_spin(), job_builder_mod=_fake_jb_text(),
+              manifest_mod=_fake_manifest({}),
+              ledger_mod=_fake_ledger_register(registered), config_mod=_fake_config())
+    out = api.spin_family_generate(str(pos), str(incar), str(tmp_path))
+    assert out['ok'] is True and len(out['variants']) == 2
+    assert [v['name'] for v in out['variants']] == ['nm', 'hs']
+    assert len(registered) == 2                       # 家族全部入台账
+    assert out['variants'][1]['magmom'] == '4 0'
+
+
+def test_spin_family_generate_missing_files_error(tmp_path):
+    api = Api(spin_mod=_fake_spin(), config_mod=_fake_config())
+    out = api.spin_family_generate('/no/POSCAR', '/no/INCAR', str(tmp_path))
+    assert out['ok'] is False and 'POSCAR' in out['error']
+
+
+def test_spin_family_generate_engine_exception_caught(tmp_path):
+    pos = tmp_path / 'POSCAR'
+    pos.write_text('p', encoding='utf-8')
+    incar = tmp_path / 'INCAR'
+    incar.write_text('i', encoding='utf-8')
+    spin = _fake_spin(build_boom=ValueError('作业目录缺 POSCAR'))
+    api = Api(spin_mod=spin, job_builder_mod=_fake_jb_text(),
+              manifest_mod=_fake_manifest({}), ledger_mod=_fake_ledger_register([]),
+              config_mod=_fake_config())
+    out = api.spin_family_generate(str(pos), str(incar), str(tmp_path))
+    assert out['ok'] is False and '缺 POSCAR' in out['error']
+
+
+# ── spin_family_compare ──────────────────────────────────────────────────────
+def test_spin_family_compare_ground_and_audit(tmp_path):
+    d1 = tmp_path / 'j_nm'
+    d1.mkdir()
+    (d1 / 'OUTCAR').write_text('magnetization 0.0', encoding='utf-8')
+    d2 = tmp_path / 'j_hs'
+    d2.mkdir()
+    (d2 / 'OUTCAR').write_text('magnetization 3.9', encoding='utf-8')
+    calls = {}
+    manifest = _fake_manifest_mod({str(d1): {'inputs': {'spin_magmom': '0'}},
+                                   str(d2): {'inputs': {'spin_magmom': '4 0'}}})
+    api = Api(spin_mod=_fake_spin(calls=calls), manifest_mod=manifest)
+    out = api.spin_family_compare([str(d1), str(d2)])
+    assert out['ok'] is True and out['ground']['winner'] == 'hs'
+    assert len(out['audits']) == 2 and all(a['audited'] for a in out['audits'])
+    # audit_magmom 收到 OUTCAR 文本 + 各自初猜磁矩(从 manifest 溯源)
+    assert any(a['init'] == '4 0' for a in calls['audits'])
+    assert any('3.9' in a['outcar'] for a in calls['audits'])
+
+
+def test_spin_family_compare_pending_passthrough_and_missing_outcar(tmp_path):
+    d1 = tmp_path / 'j_nm'
+    d1.mkdir()                                        # 无 OUTCAR
+    spin = _fake_spin(ground={'pending': ['nm']})
+    api = Api(spin_mod=spin, manifest_mod=_fake_manifest_mod({}))
+    out = api.spin_family_compare([str(d1)])
+    assert out['ok'] is True and out['ground'] == {'pending': ['nm']}
+    assert out['audits'][0]['audited'] is False
+    assert 'OUTCAR' in out['audits'][0]['warning']
+
+
+def test_spin_family_compare_empty_dirs_error():
+    api = Api(spin_mod=_fake_spin())
+    out = api.spin_family_compare([])
+    assert out['ok'] is False and '作业目录' in out['error']
+
+
+def test_spin_family_compare_error_caught(tmp_path):
+    spin = _fake_spin()
+    spin.pick_ground_state = lambda dirs: (_ for _ in ()).throw(RuntimeError('读能量失败'))
+    api = Api(spin_mod=spin, manifest_mod=_fake_manifest_mod({}))
+    out = api.spin_family_compare([str(tmp_path)])
+    assert out['ok'] is False and '读能量失败' in out['error']
+
+
+# ── reaction_presets ─────────────────────────────────────────────────────────
+def test_reaction_presets_shape():
+    api = Api(reactions_mod=_fake_reactions())
+    out = api.reaction_presets()
+    assert out['ok'] is True
+    assert {p['key'] for p in out['presets']} == {'ORR_4E', 'HER'}
+    orr = next(p for p in out['presets'] if p['key'] == 'ORR_4E')
+    assert orr['name'] == 'ORR_4E' and '氧还原' in orr['description']
+
+
+def test_reaction_presets_error_caught():
+    boom = types.SimpleNamespace(
+        list_presets=lambda: (_ for _ in ()).throw(RuntimeError('预设坏')))
+    api = Api(reactions_mod=boom)
+    out = api.reaction_presets()
+    assert out['ok'] is False and '预设坏' in out['error']
+
+
+# ── proj_figures(通用反应预设 ladder;默认 Li-S 向后兼容) ─────────────────────
+def test_proj_figures_preset_ladder_maps_species(tmp_path):
+    calls, path_calls = {}, {}
+    proj = _proj('PtN4', str(tmp_path))
+    delta_ret = {'slab': ('DONE', -100.0), 'ref': ('无', None), 'has_ref': False,
+                 'rows': [
+                     {'name': 'PtN4_ads_OOH', 'state': 'DONE', 'e_config': -110.0,
+                      'delta_e': -1.0, 'note': ''},
+                     {'name': 'PtN4_ads_OH', 'state': 'DONE', 'e_config': -104.5,
+                      'delta_e': -1.0, 'note': ''}]}
+    ads = _fake_adsorption(proj_map={'/p': proj}, delta_ret=delta_ret)
+    mol = tmp_path / 'mols'
+    mol.mkdir()
+    api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
+              reactions_mod=_fake_reactions_orr(),
+              freeenergy_mod=_fake_fe_preset(
+                  mol_e={'O2': -9.8, 'H2O': -14.2, 'H2': -6.8}, path_calls=path_calls),
+              config_mod=_fake_config(cfg={'lis_molecules_dir': str(mol)}))
+    out = api.proj_figures('/p', ['ladder'], str(tmp_path), 'ORR_4E')
+    assert out['ok'] is True and len(out['files']) == 1
+    e = path_calls['energies']
+    assert e['*'] == -100.0                            # 干净基底 '*' → 清洁表面能量
+    assert e['OOH*'] == -110.0 and e['OH*'] == -104.5  # 构型名 → 物种能量
+    assert e['O2'] == -9.8 and e['H2O'] == -14.2 and e['H2'] == -6.8  # 分子库 + RHE 定标
+    assert '氧还原' in calls['ladder'][0]['title']      # 标题随预设
+
+
+def test_proj_figures_preset_ladder_missing_species_skipped(tmp_path):
+    proj = _proj('PtN4', str(tmp_path))
+    delta_ret = {'slab': ('DONE', -100.0), 'ref': ('无', None), 'has_ref': False,
+                 'rows': [{'name': 'PtN4_ads_OH', 'state': 'DONE', 'e_config': -104.5,
+                           'delta_e': -1.0, 'note': ''}]}    # 缺 OOH
+    ads = _fake_adsorption(proj_map={'/p': proj}, delta_ret=delta_ret)
+    mol = tmp_path / 'mols'
+    mol.mkdir()
+    api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts({}),
+              reactions_mod=_fake_reactions_orr(),
+              freeenergy_mod=_fake_fe_preset(mol_e={'O2': -9.8, 'H2O': -14.2, 'H2': -6.8}),
+              config_mod=_fake_config(cfg={'lis_molecules_dir': str(mol)}))
+    out = api.proj_figures('/p', ['ladder'], str(tmp_path), 'ORR_4E')
+    assert out['ok'] is True and out['files'] == []
+    assert out['skipped'][0]['kind'] == 'ladder'
+    assert 'OOH*' in out['skipped'][0]['reason'] and '缺' in out['skipped'][0]['reason']
+
+
+def test_proj_figures_default_ladder_unchanged_when_no_preset(tmp_path):
+    # 不传 preset_key → 走既有 Li-S path_from_project_and_molecules,行为完全不变
+    calls = {}
+    mol_dir = tmp_path / 'mols'
+    mol_dir.mkdir()
+    fed = {'steps': [{'label': 'S8*', 'G': 0.0}, {'label': 'Li2S*', 'G': -1.0}],
+           'pds_index': 0, 'u_l': 1.5}
+    seen = {}
+
+    def _path(rows, e_slab, molecules_dir):
+        seen['called'] = True
+        return fed
+    fe = types.SimpleNamespace(path_from_project_and_molecules=_path)
+    ads = _fake_adsorption(proj_map={'/p': _proj('liS', str(tmp_path))},
+                           delta_ret=_delta({'liS_ads_Li2S4': -1.2}))
+    api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
+              freeenergy_mod=fe,
+              config_mod=_fake_config(cfg={'lis_molecules_dir': str(mol_dir)}))
+    out = api.proj_figures('/p', ['ladder'])          # 无 preset_key
+    assert out['ok'] is True and len(out['files']) == 1
+    assert seen.get('called') is True                 # 仍走 Li-S 便捷入口
+    assert 'Li-S discharge path' in calls['ladder'][0]['title']
+
+
+# ── campaign_list ────────────────────────────────────────────────────────────
+def test_campaign_list_aggregates_states_and_budget():
+    cdir = '/base/.camp/sac-1'
+    campaigns = {cdir: {
+        'meta': {'id': 'sac-1', 'title': 'SAC 批 3 作业', 'budget_core_hours': 50.0},
+        'tasks': [],
+        '_summary': {'total': 3, 'pending': 0, 'running': 0, 'failed': 0,
+                     'completed': 1, 'validated': 1, 'accepted': 1},
+        '_budget': {'estimates': {'a': 0.3, 'b': 0.5}, 'actuals': {}}}}
+    api = Api(campaign_mods=_fake_campaign(campaigns=campaigns),
+              config_mod=_fake_config(ui={'campaign_dirs': [cdir]}))
+    out = api.campaign_list()
+    assert out['ok'] is True and out['available'] is True and len(out['campaigns']) == 1
+    c = out['campaigns'][0]
+    assert c['name'] == 'SAC 批 3 作业' and c['n_tasks'] == 3
+    # 累计口径:completed ⊇ validated ⊇ accepted(三态嵌套小条形)
+    assert c['states'] == {'completed': 3, 'validated': 2, 'accepted': 1}
+    assert c['budget'] == {'estimated': 0.8, 'cap': 50.0}
+
+
+def test_campaign_list_no_campaigns_hidden():
+    api = Api(campaign_mods=_fake_campaign(), config_mod=_fake_config(ui={}))
+    out = api.campaign_list()
+    assert out['ok'] is True and out['available'] is True and out['campaigns'] == []
+
+
+def test_campaign_list_module_unavailable(monkeypatch):
+    # campaign 模块不可用(ImportError)→ available=False,前端据此隐藏区块
+    api = Api(config_mod=_fake_config(ui={'campaign_dirs': ['/x']}))
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *a, **k):
+        if name == 'vcstudio.campaign':
+            raise ImportError('campaign 不可用')
+        return real_import(name, *a, **k)
+    monkeypatch.setattr(builtins, '__import__', fake_import)
+    out = api.campaign_list()
+    assert out['ok'] is True and out['available'] is False and out['campaigns'] == []
+
+
+def test_campaign_list_skips_unloadable_campaign():
+    good = '/base/.camp/good'
+    campaigns = {good: {
+        'meta': {'id': 'good'}, 'tasks': [],
+        '_summary': {'total': 1, 'completed': 1, 'validated': 0, 'accepted': 0},
+        '_budget': {'estimates': {}, 'actuals': {}}}}
+    api = Api(campaign_mods=_fake_campaign(campaigns=campaigns),
+              config_mod=_fake_config(ui={'campaign_dirs': ['/base/.camp/bad', good]}))
+    out = api.campaign_list()
+    assert len(out['campaigns']) == 1 and out['campaigns'][0]['name'] == 'good'
+
+
+def test_campaign_list_bad_campaign_does_not_break():
+    cdir = '/b/c'
+    fc = _fake_campaign(campaigns={cdir: {'meta': {'id': 'c'}, 'tasks': []}})
+    fc.progress_summary = lambda camp: (_ for _ in ()).throw(RuntimeError('summary 坏'))
+    api = Api(campaign_mods=fc, config_mod=_fake_config(ui={'campaign_dirs': [cdir]}))
+    out = api.campaign_list()
+    assert out['ok'] is True and out['campaigns'] == []   # 坏批次跳过,绝不拖垮仪表盘

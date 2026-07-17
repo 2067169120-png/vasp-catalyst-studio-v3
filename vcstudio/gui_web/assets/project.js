@@ -163,11 +163,13 @@
     if ($('fig-table') && $('fig-table').checked) kinds.push('table');
     if ($('fig-ladder') && $('fig-ladder').checked) kinds.push('ladder');
     if (!kinds.length) { VCS.log('请至少勾选一种图', 'failc'); return; }
+    const preset = $('pj-preset') ? $('pj-preset').value : '';
     const btn = $('pj-figs');
     if (btn) btn.disabled = true;
-    VCS.log('出图中(' + kinds.join('/') + ')…');
+    VCS.log('出图中(' + kinds.join('/') + (preset ? ',反应 ' + preset : '') + ')…');
     try {
-      const r = await VCS.call('proj_figures', proj.path, kinds, null);
+      // preset 为空 → Li-S 默认(向后兼容);非空 → ladder 走通用反应引擎
+      const r = await VCS.call('proj_figures', proj.path, kinds, null, preset || null);
       logFigResult(r, '出图');
     } finally {
       if (btn) btn.disabled = false;
@@ -195,6 +197,20 @@
     } finally {
       if (btn) btn.disabled = false;
     }
+  }
+
+  // ── 反应预设下拉:充填 ΔG 台阶图可选的反应族(默认 Li-S 放电保留在首项) ──────
+  async function loadPresets() {
+    const sel = $('pj-preset');
+    if (!sel) return;
+    const r = await VCS.call('reaction_presets');
+    (r && r.presets || []).forEach(p => {
+      const o = document.createElement('option');
+      o.value = p.key;
+      o.textContent = p.description || p.name || p.key;
+      o.title = p.description || '';
+      sel.appendChild(o);
+    });
   }
 
   function currentProject() {
@@ -311,6 +327,7 @@
     wire('pj-figs', makeFigures);
     wire('pj-cmpfigs', makeCompareFigures);
     renderConfigs();
+    loadPresets();
     reloadProjects();
   }
 
