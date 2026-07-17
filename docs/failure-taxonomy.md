@@ -12,9 +12,9 @@ VASP 作业失败分类器(`vcstudio/cluster/diagnose.py`)把"作业没成功"�
 `diagnose.RESTARTABLE` / `diagnose._VASP_ERROR_TABLE`,与实现零漂移(`tests/`
 有同步守卫,代码改了不重新生成即测试失败)。
 
-- **作业分类**:15 类分类结果(含 `CONVERGED` 成功态),映射到
+- **作业分类**:18 类分类结果(含 `CONVERGED` 成功态),映射到
   **4 个目标状态**(`DONE / FAILED / NEEDS_HUMAN / UNCONVERGED`);其中 **3 类可 CONTCAR 续算**。
-- **VASP 内部错误签名**:15 条(字面串核对自 pymatgen Custodian
+- **VASP 内部错误签名**:16 条(字面串核对自 pymatgen Custodian
   VaspErrorHandler);命中即具体命名 + 标准补救提示,状态 `NEEDS_HUMAN`——本平台守
   方法学主权,**绝不自动改用户 INCAR**,只精确诊断并交人工。
 
@@ -37,6 +37,9 @@ VASP 作业失败分类器(`vcstudio/cluster/diagnose.py`)把"作业没成功"�
 | `DISK_FULL` | 磁盘满 / IO 错误(No space left / quota exceeded / I-O error / read-only fs) | `NEEDS_HUMAN` | — |
 | `SCF_SLOSHING` | 电子步震荡(某 SCF 块打满 NELM 且末步 \|dE\|>1e-2 eV);或收敛串为 NELM 耗尽假阳性 | `NEEDS_HUMAN` | — |
 | `USER_STOPPED` | STOPCAR 人工叫停(OUTCAR 见 soft stop);非失败,由人决定续算/放弃 | `NEEDS_HUMAN` | — |
+| `NEB_IMAGES_MISMATCH` | NEB 的 INCAR IMAGES 与实际 image 子目录数不符(输入配置错误) | `NEEDS_HUMAN` | — |
+| `NEB_IMAGE_MISSING` | NEB 某 image 子目录无有效输出(OSZICAR/OUTCAR 缺失或空,启动即死) | `NEEDS_HUMAN` | — |
+| `NEB_IMAGE_SCF` | NEB 某 image SCF 崩/震荡(点名 image 编号;同 INCAR 续算必复现) | `NEEDS_HUMAN` | — |
 | `UNKNOWN` | 规则不覆盖(调度器泛化失败且无具体原因/日志签名) | `NEEDS_HUMAN` | — |
 
 ## VASP 内部错误签名 / VASP internal-error signatures
@@ -45,6 +48,7 @@ VASP 作业失败分类器(`vcstudio/cluster/diagnose.py`)把"作业没成功"�
 
 | 分类 | 触发证据(日志签名) | 补救提示 | 目标状态 |
 |---|---|---|---|
+| `NEB_NPAR_DIVIDE` | `M_divide.*can not / can not subdivide / number of images.*not` | NEB 并行划分失败:总 MPI 进程数须能被 IMAGES 整除(检查 IMAGES 与 -np/NCORE/KPAR) | `NEEDS_HUMAN` |
 | `TOO_FEW_BANDS` | `TOO FEW BANDS` | 能带不足:增大 NBANDS | `NEEDS_HUMAN` |
 | `TETRAHEDRON` | `Tetrahedron method fails / Routine TETIRR needs special values` | 四面体积分失败(金属/slab 常见):ISMEAR 改 0 或 1、SIGMA≈0.05,或加密 k 点 | `NEEDS_HUMAN` |
 | `ZPOTRF` | `LAPACK: Routine ZPOTRF failed / Routine ZPOTRF ZTRTRI` | ZPOTRF 分解失败(常因原子过近/晶胞塌缩):检查结构是否重叠 | `NEEDS_HUMAN` |

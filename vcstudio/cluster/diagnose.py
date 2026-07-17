@@ -31,6 +31,10 @@ BAD_ENERGY = 'BAD_ENERGY'         # 有收敛串但能量不合理——交人�
 DISK_FULL = 'DISK_FULL'           # 磁盘满/IO 错误——交人工(盲目续算必再撞满,浪费机时)
 SCF_SLOSHING = 'SCF_SLOSHING'     # 电子步震荡(NELM 打满且 dE 不降)——盲目续算必复现,交人工
 USER_STOPPED = 'USER_STOPPED'     # STOPCAR 人工叫停——不是失败,人决定下一步
+# ── NEB 专属分类(多 image 作业;结构性输入错误,盲目续算无益 → 交人工) ──
+NEB_IMAGES_MISMATCH = 'NEB_IMAGES_MISMATCH'  # INCAR 的 IMAGES 与实际 image 子目录数不符
+NEB_IMAGE_MISSING = 'NEB_IMAGE_MISSING'      # 某 image 子目录无有效输出(缺失/启动即死)
+NEB_IMAGE_SCF = 'NEB_IMAGE_SCF'              # 某 image SCF 崩/震荡(点名 image 编号)
 UNKNOWN = 'UNKNOWN'               # 规则不覆盖——交人工
 
 # 分类 → job.yaml 状态(复活死态 FAILED/NEEDS_HUMAN)
@@ -49,6 +53,9 @@ FAILURE_TO_STATE = {
     DISK_FULL: 'NEEDS_HUMAN',
     SCF_SLOSHING: 'NEEDS_HUMAN',
     USER_STOPPED: 'NEEDS_HUMAN',
+    NEB_IMAGES_MISMATCH: 'NEEDS_HUMAN',
+    NEB_IMAGE_MISSING: 'NEEDS_HUMAN',
+    NEB_IMAGE_SCF: 'NEEDS_HUMAN',
     UNKNOWN: 'NEEDS_HUMAN',
 }
 
@@ -89,6 +96,9 @@ _IO_ERROR_RE = re.compile(
 # 顺序 = 优先级(具体在前,泛化兜底在后);只收清晰致命项,避开可自恢复的告警(如单次
 # Sub-Space-Matrix not hermitian),防误报。
 _VASP_ERROR_TABLE = [
+    # NEB 并行划分:总核数须能被 IMAGES 整除,否则 VASP 报 M_divide/子群划分失败(NEB 专属签名)
+    (re.compile(r'M_divide.*can not|can not subdivide|number of images.*not'), 'NEB_NPAR_DIVIDE',
+     'NEB 并行划分失败:总 MPI 进程数须能被 IMAGES 整除(检查 IMAGES 与 -np/NCORE/KPAR)'),
     (re.compile(r'TOO FEW BANDS'), 'TOO_FEW_BANDS', '能带不足:增大 NBANDS'),
     (re.compile(r'Tetrahedron method fails|Routine TETIRR needs special values'), 'TETRAHEDRON',
      '四面体积分失败(金属/slab 常见):ISMEAR 改 0 或 1、SIGMA≈0.05,或加密 k 点'),
@@ -374,6 +384,76 @@ def classify(*, scheduler_reason: str | None = None, exit_code: int | None = Non
         detail = 'SCF/几何未收敛'
     return Diagnosis(NONCONVERGED, 'UNCONVERGED', True,
                      f'有输出但未见收敛标志——{detail},可从 CONTCAR 续算')
+
+
+def classify_neb(*, images_expected=None, images_found=None, image_status=None,
+                 converged: bool = False, scheduler_reason: str | None = None,
+                 exit_code: int | None = None, log_tail: str = '') -> Diagnosis:
+    """NEB 作业专用分类:结构性检查优先,再沿用单作业签名裁定收敛/续算。
+
+    NEB 主输出在各 image 子目录(根无 OUTCAR),收敛标志在 stdout 的 'reached required
+    accuracy'(IBRION=1 路径:各 image 力收敛)。优先级:
+      ① IMAGES 与实际 image 子目录数不符 → 输入错误(NEB_IMAGES_MISMATCH,交人工);
+      ② 某 image 无有效输出 → NEB_IMAGE_MISSING(点名 image,交人工);
+      ③ 某 image SCF 崩/震荡 → NEB_IMAGE_SCF(点名 image,交人工);
+      ④ 收敛串在场 → CONVERGED;
+      ⑤ 调度器具体原因(WALLTIME 等)> stdout 硬崩签名 > VASP 已知错误 > 未收敛(可续算)。
+
+    Args:
+        images_expected: INCAR 的 IMAGES(中间 image 数);None 表示未知(跳过①)。
+        images_found:    实际中间 image 子目录数;None 表示未探测到(跳过①)。
+        image_status:    [{'index':int,'empty':bool,'scf_fail':bool,'energy':float|None}, ...]。
+        converged:       stdout 是否出现收敛标志(各 image 力收敛)。
+    """
+    status = list(image_status or [])
+
+    # ① IMAGES 配置错误(结构性,盲目续算无益)
+    if (images_expected is not None and images_found is not None
+            and int(images_expected) != int(images_found)):
+        return Diagnosis(
+            NEB_IMAGES_MISMATCH, FAILURE_TO_STATE[NEB_IMAGES_MISMATCH], False,
+            f'INCAR 的 IMAGES={images_expected} 与实际 image 子目录数 {images_found} 不符,'
+            f'输入配置错误——请核对 IMAGES 与 01..N 目录数量后重建')
+
+    # ② 某 image 无有效输出(缺失/启动即死)
+    missing = [s['index'] for s in status if s.get('empty')]
+    if missing and not converged:
+        names = ', '.join(f'{int(i):02d}' for i in missing)
+        return Diagnosis(
+            NEB_IMAGE_MISSING, FAILURE_TO_STATE[NEB_IMAGE_MISSING], False,
+            f'image {names} 无有效输出(OSZICAR/OUTCAR 缺失或空)——疑启动即死/缺输入,需人工')
+
+    # ③ 某 image SCF 崩/震荡(点名 image)
+    crashed = [s['index'] for s in status if s.get('scf_fail')]
+    if crashed and not converged:
+        names = ', '.join(f'{int(i):02d}' for i in crashed)
+        return Diagnosis(
+            NEB_IMAGE_SCF, FAILURE_TO_STATE[NEB_IMAGE_SCF], False,
+            f'image {names} SCF 崩/震荡——同 INCAR 续算必复现,建议人工调 ALGO/AMIX 或查该 image 结构')
+
+    # ④ 收敛(各 image 力收敛)
+    if converged:
+        return Diagnosis(CONVERGED, 'DONE', False,
+                         'NEB 各 image 力收敛(stdout 出现 reached required accuracy)')
+
+    # ⑤ 未收敛:调度器原因 > stdout 硬崩签名 > VASP 已知错误 > 未收敛(可续算)
+    rcls = _reason_to_class(scheduler_reason)
+    if rcls is not None:
+        return Diagnosis(rcls, FAILURE_TO_STATE[rcls], rcls in RESTARTABLE,
+                         f'调度器报 {scheduler_reason};NEB 有部分输出但未收敛')
+    sig = scan_log(log_tail)
+    if sig is not None:
+        return Diagnosis(sig, FAILURE_TO_STATE[sig], sig in RESTARTABLE,
+                         f'NEB stdout 命中 {sig} 签名')
+    if exit_code == _OOM_EXIT:
+        return Diagnosis(WALLTIME, FAILURE_TO_STATE[WALLTIME], True,
+                         f'退出码 {exit_code}(SIGKILL)但无 OOM 证据,且有部分输出——疑超墙钟,按可续算处理')
+    ve = scan_vasp_error(log_tail)
+    if ve is not None:
+        label, hint = ve
+        return Diagnosis(label, 'NEEDS_HUMAN', False, f'NEB 命中 VASP 已知错误 {label}:{hint}')
+    return Diagnosis(NONCONVERGED, 'UNCONVERGED', True,
+                     'NEB 未见收敛标志(reached required accuracy)——力未收敛/墙钟,可从各 image CONTCAR 续算')
 
 
 # ── CONTCAR 续算前校验(valid_poscar 移植) ─────────────────────────────────────

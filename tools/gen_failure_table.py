@@ -40,6 +40,9 @@ _EVIDENCE = {
     dg.DISK_FULL: '磁盘满 / IO 错误(No space left / quota exceeded / I-O error / read-only fs)',
     dg.SCF_SLOSHING: '电子步震荡(某 SCF 块打满 NELM 且末步 |dE|>1e-2 eV);或收敛串为 NELM 耗尽假阳性',
     dg.USER_STOPPED: 'STOPCAR 人工叫停(OUTCAR 见 soft stop);非失败,由人决定续算/放弃',
+    dg.NEB_IMAGES_MISMATCH: 'NEB 的 INCAR IMAGES 与实际 image 子目录数不符(输入配置错误)',
+    dg.NEB_IMAGE_MISSING: 'NEB 某 image 子目录无有效输出(OSZICAR/OUTCAR 缺失或空,启动即死)',
+    dg.NEB_IMAGE_SCF: 'NEB 某 image SCF 崩/震荡(点名 image 编号;同 INCAR 续算必复现)',
     dg.UNKNOWN: '规则不覆盖(调度器泛化失败且无具体原因/日志签名)',
 }
 
