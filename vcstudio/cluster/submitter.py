@@ -23,7 +23,91 @@ from vcstudio.shared import manifest as manifest_mod
 
 SCRIPT_NAME = 'vcs_job.sh'
 _INPUT_FILES = ('INCAR', 'POTCAR', 'KPOINTS', 'POSCAR')
+# NEB 根目录共享文件(POSCAR 在各 image 子目录,不在根)
+_NEB_ROOT_FILES = ('INCAR', 'POTCAR', 'KPOINTS')
 _E0_RE = re.compile(r'E0=\s*([-+.\dEe]+)')
+_NEB_FRAME_RE = re.compile(r'^\d+$')
+# NEB 收敛标志(各 image 力收敛后 VASP 向 stdout 打印,与离子弛豫同串)
+_NEB_CONVERGED_MARK = 'reached required accuracy'
+
+
+# ── NEB 多 image 作业辅助(一目录多 image 子目录,根共享 INCAR/POTCAR/KPOINTS) ──────
+def _is_neb(m: dict | None) -> bool:
+    """manifest task_type=='neb' → 走 NEB 专用上传/刷新/取证路径。"""
+    return bool(m) and str(m.get('task_type') or '') == 'neb'
+
+
+def _neb_n_images(m: dict | None) -> int | None:
+    """中间 image 数:优先 manifest inputs.n_images。"""
+    if not m:
+        return None
+    n = (m.get('inputs') or {}).get('n_images')
+    try:
+        return int(n)
+    except (TypeError, ValueError):
+        return None
+
+
+def _neb_local_frames(job_dir: str) -> list:
+    """本地 image 子目录名(纯数字升序):00,01,...,N+1。"""
+    try:
+        names = [d for d in os.listdir(job_dir)
+                 if os.path.isdir(os.path.join(job_dir, d)) and _NEB_FRAME_RE.match(d)]
+    except OSError:
+        return []
+    return sorted(names, key=lambda s: int(s))
+
+
+def _read_incar_images(job_dir: str) -> int | None:
+    """本地根 INCAR 的 IMAGES 值(缺/读不到 → None)。"""
+    try:
+        from vcstudio.generate.incar_builder import parse_incar
+        with open(os.path.join(job_dir, 'INCAR'), 'r', encoding='utf-8', errors='replace') as f:
+            v = parse_incar(f.read()).get('IMAGES')
+        return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _neb_input_check(job_dir: str, m: dict) -> list:
+    """NEB 提交前输入检查:根共享文件 + 各 image 子目录 POSCAR + IMAGES 与目录数一致性。"""
+    errs = []
+    for f in _NEB_ROOT_FILES:
+        if not os.path.isfile(os.path.join(job_dir, f)):
+            errs.append(f'NEB 作业根目录缺 {f}(先在生成页产出 NEB 目录树)')
+    frames = _neb_local_frames(job_dir)
+    if len(frames) < 3:
+        errs.append(f'NEB 作业 image 子目录不足(找到 {len(frames)} 个,至少需 00/01/02)')
+    for fr in frames:
+        if not os.path.isfile(os.path.join(job_dir, fr, 'POSCAR')):
+            errs.append(f'NEB image 子目录 {fr} 缺 POSCAR')
+    n = _neb_n_images(m)
+    if frames and n is not None and (len(frames) - 2) != n:
+        errs.append(
+            f'NEB image 子目录数 {len(frames)}(含端点 → {len(frames) - 2} 中间 image)'
+            f'与 manifest n_images={n} 不符')
+    return errs
+
+
+def _upload_neb_tree(client, sftp, job_dir: str, remote_dir: str) -> int:
+    """整棵 NEB 目录树上传(根共享文件 + 各 image 子目录 POSCAR)。返回上传文件数。
+
+    递归 os.walk:逐子目录远端 mkdir -p,逐文件 sftp.put;跳过 job.yaml/脚本/*.bak/figs。
+    """
+    skip_names = {manifest_mod.MANIFEST_NAME, SCRIPT_NAME}
+    count = 0
+    for root, dirs, files in os.walk(job_dir):
+        dirs[:] = [d for d in dirs if d != 'figs']       # 结构图缓存不上传
+        rel = os.path.relpath(root, job_dir)
+        rdir = remote_dir if rel == '.' else posixpath.join(remote_dir, rel.replace(os.sep, '/'))
+        if rel != '.':
+            run_cmd(client, f'mkdir -p {shlex.quote(rdir)}', check=True)
+        for fn in sorted(files):
+            if fn in skip_names or '.bak' in fn:
+                continue
+            sftp.put(os.path.join(root, fn), posixpath.join(rdir, fn))
+            count += 1
+    return count
 
 
 def run_cmd(client, cmd: str, timeout: int = 30, check: bool = False):
@@ -45,10 +129,14 @@ def run_cmd(client, cmd: str, timeout: int = 30, check: bool = False):
 def preflight(profile, job_dir: str) -> list:
     """提交前检查,返回错误文案列表(空=可以出手)。"""
     errs = []
-    for f in _INPUT_FILES:
-        if not os.path.isfile(os.path.join(job_dir, f)):
-            errs.append(f'作业目录缺 {f}(先在生成页产出四件套)')
     m0 = manifest_mod.load_manifest(job_dir)
+    if _is_neb(m0):
+        # NEB 多 image:POSCAR 在各 image 子目录,根只放共享 INCAR/POTCAR/KPOINTS
+        errs += _neb_input_check(job_dir, m0)
+    else:
+        for f in _INPUT_FILES:
+            if not os.path.isfile(os.path.join(job_dir, f)):
+                errs.append(f'作业目录缺 {f}(先在生成页产出四件套)')
     if m0 is None:
         errs.append('作业目录缺 job.yaml(旧目录可重新生成一次以补台账)')
     else:
@@ -140,13 +228,19 @@ def submit_job(client, sftp, profile, job_dir: str) -> dict:
 
     # 远程目录 + 上传(脚本统一 LF,防 Windows CRLF 毒害 shell)
     run_cmd(client, f'mkdir -p {shlex.quote(spec.remote_dir)}', check=True)
-    for fname in _INPUT_FILES:
-        sftp.put(os.path.join(job_dir, fname), posixpath.join(spec.remote_dir, fname))
+    if _is_neb(m):
+        # NEB:整棵目录树(根共享 INCAR/POTCAR/KPOINTS + 各 image 子目录 POSCAR)
+        n_up = _upload_neb_tree(client, sftp, job_dir, spec.remote_dir)
+        upload_note = f'NEB 目录树 {n_up} 文件 + {SCRIPT_NAME}'
+    else:
+        for fname in _INPUT_FILES:
+            sftp.put(os.path.join(job_dir, fname), posixpath.join(spec.remote_dir, fname))
+        upload_note = f'{len(_INPUT_FILES)} 输入 + {SCRIPT_NAME}'
     with sftp.file(posixpath.join(spec.remote_dir, SCRIPT_NAME), 'w') as f:
         f.write(script_text.replace('\r\n', '\n'))
     m['cluster'] = profile.name
     m['remote_dir'] = spec.remote_dir
-    manifest_mod.set_state(m, 'UPLOADED', note=f'{len(_INPUT_FILES)} 输入 + {SCRIPT_NAME}')
+    manifest_mod.set_state(m, 'UPLOADED', note=upload_note)
 
     out, err = run_cmd(client, dialect.submit_cmd(
         posixpath.join(spec.remote_dir, SCRIPT_NAME),
@@ -336,6 +430,11 @@ def refresh_job(client, profile, job_dir: str, live_states: dict | None = None,
     u = states.get(jid, GONE)
     remote = m.get('remote_dir') or ''
 
+    # NEB 多 image 走专用路径:主输出在各 image 子目录,根无 OUTCAR,收敛判定在 stdout
+    if _is_neb(m):
+        return _refresh_neb_job(client, profile, job_dir, m, u,
+                                (terminal_reasons or {}).get(jid))
+
     if u == QUEUED:
         # 本轮已在调度器现身:记下"活过",续算沉降护栏据此放行(不再疑为旧 OUTCAR)
         _mark_observed_alive(m)
@@ -392,6 +491,126 @@ def refresh_job(client, profile, job_dir: str, live_states: dict | None = None,
         'scheduler_reason': reason,
         'exit_code': exit_code,
         'outcar_bytes': outcar_size,
+        'classified_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+    }
+    if d.failure_class != diagnose.CONVERGED:
+        m.setdefault('attempts', []).append({
+            'n': len(m.get('attempts') or []) + 1,
+            'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'result': 'failed',
+            'failure_class': d.failure_class,
+            'to_state': d.state,
+        })
+    manifest_mod.set_state(m, d.state, note=f'{d.failure_class}: {d.evidence}')
+    manifest_mod.save_manifest(job_dir, m)
+    return m
+
+
+def _neb_remote_intermediate_count(client, remote: str):
+    """远端 image 子目录探测 → 中间 image 数(总帧数−2);列不到 → None(不据此误判)。"""
+    if not remote:
+        return None
+    out, _ = run_cmd(client, f'cd {shlex.quote(remote)} && ls -1d [0-9][0-9] 2>/dev/null')
+    dirs = [ln.strip() for ln in out.splitlines() if _NEB_FRAME_RE.match(ln.strip())]
+    if not dirs:
+        return None
+    return max(len(dirs) - 2, 0)
+
+
+def _neb_image_energies(client, remote: str, n_images):
+    """各中间 image(01..N)末 E0 列表(缺 → None);运行中进度 + 终态取证共用。"""
+    energies = []
+    n = int(n_images or 0)
+    for i in range(1, n + 1):
+        e0, _tail = _read_oszicar(client, posixpath.join(remote, f'{i:02d}'))
+        energies.append(e0)
+    return energies
+
+
+def _neb_forensics(client, remote: str, n_images):
+    """终态取证:逐 image(01..N)读 OSZICAR → (energies, image_status, images_found)。
+
+    image_status 每项 {'index','energy','empty','scf_fail'}:empty=OSZICAR 无内容(启动即死),
+    scf_fail=末离子步 SCF 震荡(diagnose 判据)。images_found 为远端探测的中间 image 数。
+    """
+    energies, status = [], []
+    n = int(n_images or 0)
+    for i in range(1, n + 1):
+        e0, tail = _read_oszicar(client, posixpath.join(remote, f'{i:02d}'))
+        empty = not (tail or '').strip()
+        scf_fail = diagnose.scan_oszicar_sloshing(tail) is not None
+        energies.append(e0)
+        status.append({'index': i, 'energy': e0, 'empty': empty, 'scf_fail': scf_fail})
+    images_found = _neb_remote_intermediate_count(client, remote)
+    return energies, status, images_found
+
+
+def _grep_neb_converged(client, remote: str, job_id: str = '') -> bool:
+    """NEB 收敛判定:stdout 出现 'reached required accuracy'(各 image 力收敛)→ True。
+
+    NEB 根目录无 OUTCAR,收敛标志打到作业 stdout(*.o<num>/slurm-<num>.out/vasp.out/log)。
+    按本作业号精确定位(同 _read_log,避免续算读到旧轮)。
+    """
+    if not remote:
+        return False
+    num = str(job_id).split('.')[0].strip()
+    if num:
+        targets = f'*.o{num} slurm-{num}.out vasp.out log stdout'
+    else:
+        targets = '*.o* slurm-*.out vasp.out log stdout'
+    out, _ = run_cmd(
+        client,
+        f'cd {shlex.quote(remote)} && grep -h "{_NEB_CONVERGED_MARK}" {targets} 2>/dev/null | head -1')
+    return _NEB_CONVERGED_MARK in out
+
+
+def _refresh_neb_job(client, profile, job_dir: str, m: dict, u: str, reason):
+    """NEB 作业状态刷新:QUEUED/RUNNING 沿用状态机(活体取各 image 进度),终态走 NEB 取证。
+
+    终态取证:stdout 收敛标志 + 逐 image OSZICAR(能量/崩溃)+ 远端 image 数,
+    交 diagnose.classify_neb 裁定(IMAGES 不符/image 缺输出/image SCF 崩/收敛/未收敛)。
+    """
+    remote = m.get('remote_dir') or ''
+    n = _neb_n_images(m)
+
+    if u == QUEUED:
+        _mark_observed_alive(m)
+        if m['state'] != 'QUEUED':
+            manifest_mod.set_state(m, 'QUEUED')
+        manifest_mod.save_manifest(job_dir, m)
+        return m
+    if u == RUNNING:
+        _mark_observed_alive(m)
+        if m['state'] != 'RUNNING':
+            manifest_mod.set_state(m, 'RUNNING')
+        # 活体进度:各 image 当前 E0(NEB 根无 OUTCAR,不查根收敛/SCF)
+        m.setdefault('results', {})['neb_energies'] = _neb_image_energies(client, remote, n)
+        manifest_mod.save_manifest(job_dir, m)
+        return m
+
+    # 终态取证
+    jid = str(m.get('scheduler_job_id') or '')
+    converged = _grep_neb_converged(client, remote, jid)
+    exit_code, log_tail = _read_log(client, remote, jid)
+    energies, status, images_found = _neb_forensics(client, remote, n)
+    images_expected = _read_incar_images(job_dir)
+    if images_expected is None:
+        images_expected = n
+
+    d = diagnose.classify_neb(
+        images_expected=images_expected, images_found=images_found,
+        image_status=status, converged=converged, scheduler_reason=reason,
+        exit_code=exit_code, log_tail=log_tail)
+
+    r = m.setdefault('results', {})
+    r['neb_energies'] = energies
+    r['diagnosis'] = {
+        'failure_class': d.failure_class,
+        'restartable': d.restartable,
+        'evidence': d.evidence,
+        'scheduler_reason': reason,
+        'exit_code': exit_code,
+        'images_found': images_found,
         'classified_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
     }
     if d.failure_class != diagnose.CONVERGED:
@@ -577,17 +796,40 @@ def fetch_results(client, sftp, job_dir: str, files=FETCH_FILES):
     remote = m.get('remote_dir')
     if not remote:
         raise ValueError('该作业尚未提交过(manifest 无 remote_dir)')
-    fetched, missing = [], []
-    for fname in files:
-        try:
-            sftp.get(posixpath.join(remote, fname), os.path.join(job_dir, fname))
-            fetched.append(fname)
-        except (IOError, OSError):
-            missing.append(fname)
+    if _is_neb(m):
+        fetched, missing = _fetch_neb_results(client, sftp, job_dir, remote, files)
+    else:
+        fetched, missing = [], []
+        for fname in files:
+            try:
+                sftp.get(posixpath.join(remote, fname), os.path.join(job_dir, fname))
+                fetched.append(fname)
+            except (IOError, OSError):
+                missing.append(fname)
     res = m.setdefault('results', {})
     res['fetched'] = fetched
     res['fetched_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
     manifest_mod.save_manifest(job_dir, m)
+    return fetched, missing
+
+
+def _fetch_neb_results(client, sftp, job_dir: str, remote: str, files):
+    """NEB 结果回收:逐 image 子目录(00..N+1)下载 files 到本地同名子目录。
+
+    → (fetched, missing),名字带 image 前缀(如 '01/OSZICAR')。端点(00/N+1)常只有
+    OUTCAR(读取初/末态能量),缺项记 missing 不中断其余。
+    """
+    fetched, missing = [], []
+    for fr in _neb_local_frames(job_dir):
+        local_sub = os.path.join(job_dir, fr)
+        os.makedirs(local_sub, exist_ok=True)
+        for fname in files:
+            tag = f'{fr}/{fname}'
+            try:
+                sftp.get(posixpath.join(remote, fr, fname), os.path.join(local_sub, fname))
+                fetched.append(tag)
+            except (IOError, OSError):
+                missing.append(tag)
     return fetched, missing
 
 
