@@ -252,3 +252,90 @@ def validate_and_complete_incar(incar_dict, elements, counts,
                     f'(可能非最优),建议提供 counts 以写入正确 MAGMOM。')
         # else:用户已带 MAGMOM → 完全不动(不重复补)
     return completions, warnings
+
+
+# ── 偶极校正建议(F6)与色散一致性审计(F13):两个独立新函数,只建议不强塞 ──────
+def _mat_inv3(m):
+    """3×3 矩阵求逆(纯 Python,避免给 incar_builder 引入 numpy 硬依赖)。奇异 → ValueError。"""
+    (a, b, c), (d, e, f), (g, h, i) = m[0], m[1], m[2]
+    ca, cb, cc = e * i - f * h, f * g - d * i, d * h - e * g
+    det = a * ca + b * cb + c * cc
+    if abs(det) < 1e-12:
+        raise ValueError('晶格矢量退化(行列式≈0),无法求分数坐标')
+    inv = 1.0 / det
+    return [[ca * inv, (c * h - b * i) * inv, (b * f - c * e) * inv],
+            [cb * inv, (a * i - c * g) * inv, (c * d - a * f) * inv],
+            [cc * inv, (b * g - a * h) * inv, (a * e - b * d) * inv]]
+
+
+def _cart_to_frac(cart, cell):
+    """笛卡尔 → 分数(frac_j = Σ_k cart_k·inv[k][j],与 slab_builder 同口径)。"""
+    inv = _mat_inv3(cell)
+    return [cart[0] * inv[0][j] + cart[1] * inv[1][j] + cart[2] * inv[2][j] for j in range(3)]
+
+
+def dipole_correction_keys(poscar_text, calc_type) -> dict:
+    """slab 且结构 z 不对称 → 建议偶极校正键;否则空 dict。**只建议不强塞**(调用方合并)。
+
+    判据:仅对 calc_type='slab' 生效;z 质心偏离盒中心(|c|/2)> 1 Å 视为上下表面不对称
+    (吸附/掺杂造成),返回 {'LDIPOL':'.TRUE.','IDIPOL':'3','DIPOL':'质心分数坐标'};
+    z 近似对称或非 slab → {}。POSCAR 解析失败静默返回 {}(顾问绝不挡主流程)。
+    """
+    if str(calc_type).lower() != 'slab':
+        return {}
+    try:
+        from vcstudio.generate.structure_view import parse_positions
+        parsed = parse_positions(poscar_text)
+    except Exception:                                    # noqa: BLE001 解析失败 → 不建议
+        return {}
+    coords, cell = parsed['coords'], parsed['cell']
+    if not coords:
+        return {}
+    n = len(coords)
+    lz = cell[2][2]
+    if lz <= 0:
+        return {}
+    cz = sum(pt[2] for pt in coords) / n
+    if abs(cz - lz / 2.0) <= 1.0:
+        return {}                                        # z 近似对称,无需偶极校正
+    cx = sum(pt[0] for pt in coords) / n
+    cy = sum(pt[1] for pt in coords) / n
+    try:
+        frac = _cart_to_frac([cx, cy, cz], cell)
+    except ValueError:
+        return {}
+    return {'LDIPOL': '.TRUE.', 'IDIPOL': '3',
+            'DIPOL': f'{frac[0]:.4f} {frac[1]:.4f} {frac[2]:.4f}'}
+
+
+def dispersion_audit(incar_texts: list) -> dict:
+    """项目内多份 INCAR 的 IVDW(色散)一致性审计 → {'ok','ivdw','detail'}。
+
+    - 全部未设 IVDW(无色散)→ ok(口径一致)。
+    - 全部有且同值 → ok。
+    - 部分缺 / 混用不同值 → ok=False,detail 中文点名哪几份缺、哪几份何值(能量不可比)。
+    """
+    vals = []
+    for text in incar_texts:
+        vals.append(parse_incar(text).get('IVDW'))
+    present = [v for v in vals if v is not None]
+    total = len(vals)
+    if not present:
+        return {'ok': True, 'ivdw': None,
+                'detail': f'{total} 份 INCAR 均未设 IVDW(无色散校正),口径一致。'}
+    if len(present) == total and len(set(present)) == 1:
+        return {'ok': True, 'ivdw': present[0],
+                'detail': f'{total} 份 INCAR 均设 IVDW={present[0]},口径一致。'}
+    parts = []
+    missing = [i + 1 for i, v in enumerate(vals) if v is None]
+    if missing:
+        parts.append(f'第 {", ".join(map(str, missing))} 份缺 IVDW')
+    by_val: dict = {}
+    for i, v in enumerate(vals):
+        if v is not None:
+            by_val.setdefault(v, []).append(i + 1)
+    if len(by_val) > 1:
+        parts.append('; '.join(
+            f'IVDW={k} 见第 {", ".join(map(str, idxs))} 份' for k, idxs in by_val.items()))
+    return {'ok': False, 'ivdw': None,
+            'detail': '色散设置不一致,能量不可比:' + ';'.join(parts) + '。'}
