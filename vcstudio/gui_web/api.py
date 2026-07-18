@@ -66,7 +66,13 @@ class Api:
                  draftpack_mod=None, ai_paper_mod=None, engines_mod=None,
                  slab_builder_mod=None, molbuild_mods=None, gaussian_mod=None,
                  quick_submit_mod=None, local_runner_mod=None, connection_mod=None,
-                 multiwfn_mod=None, vmd_mod=None, aimd_mod=None):
+                 multiwfn_mod=None, vmd_mod=None, aimd_mod=None,
+                 task_catalog_mod=None, u_library_mod=None, conv_scan_mod=None,
+                 bands_mod=None, cell_opt_mod=None, eos_mod=None,
+                 workfunction_mod=None, surface_energy_mod=None, dimer_mod=None,
+                 auto_figures_mod=None, campaign_templates_mod=None,
+                 solvation_mod=None, paper_data_mod=None, variant_advisor_mod=None,
+                 manuscript_draft_mod=None, bands_parse_mod=None, deps_runner=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -135,6 +141,26 @@ class Api:
         self._multiwfn = multiwfn_mod
         self._vmd = vmd_mod
         self._aimd = aimd_mod
+        # v3.1 GUI 总装(全 DFT 任务目录 / 一键出图管线 / AI 三能力 / starpivot 对齐):
+        # 全部只读引擎,一律延迟导入,测试注入假件即全离线可测(不碰 numpy/matplotlib/网络)。
+        self._task_catalog = task_catalog_mod       # generate.task_catalog(计算类型目录)
+        self._u_library = u_library_mod             # project.u_library(DFT+U 建议表)
+        self._conv_scan = conv_scan_mod             # generate.conv_scan(收敛扫描系列)
+        self._bands = bands_mod                     # generate.bands_builder(能带派生)
+        self._cell_opt = cell_opt_mod               # generate.cell_opt(变胞弛豫派生)
+        self._eos = eos_mod                         # project.eos(EOS 系列 + BM 拟合)
+        self._workfunction = workfunction_mod       # project.workfunction(功函数派生/解析)
+        self._surface_energy = surface_energy_mod   # project.surface_energy(表面能计算器)
+        self._dimer = dimer_mod                     # generate.dimer_builder(Dimer 派生)
+        self._auto_figures = auto_figures_mod       # project.auto_figures(场景感知一键出图)
+        self._campaign_tpl = campaign_templates_mod  # project.campaign_templates(活动模板)
+        self._solvation = solvation_mod             # generate.solvation(溶剂化复合物)
+        self._paper_data = paper_data_mod           # project.paper_data(数据表提取/文献对照)
+        self._variant_advisor = variant_advisor_mod  # project.variant_advisor(材料变体)
+        self._manuscript = manuscript_draft_mod     # project.manuscript_draft(论文骨架)
+        self._bands_parse = bands_parse_mod         # project.bands(EIGENVAL/带隙解析)
+        self._deps_runner = deps_runner             # 依赖安装后台执行器(subprocess 注入)
+        self._deps_job = None                       # deps_install 后台任务句柄(轮询用)
 
     # ── 桥活性探测(前端用来确认 js_api 已就绪) ──
     def ping(self) -> str:
@@ -307,6 +333,118 @@ class Api:
             from vcstudio.generate import aimd_builder
             self._aimd = aimd_builder
         return self._aimd
+
+    def _tc(self):
+        """计算类型目录(task_catalog)延迟加载。"""
+        if self._task_catalog is None:
+            from vcstudio.generate import task_catalog
+            self._task_catalog = task_catalog
+        return self._task_catalog
+
+    def _ul(self):
+        """DFT+U 建议库延迟加载。"""
+        if self._u_library is None:
+            from vcstudio.project import u_library
+            self._u_library = u_library
+        return self._u_library
+
+    def _cs(self):
+        """收敛扫描系列引擎延迟加载。"""
+        if self._conv_scan is None:
+            from vcstudio.generate import conv_scan
+            self._conv_scan = conv_scan
+        return self._conv_scan
+
+    def _bd(self):
+        """能带派生端延迟加载。"""
+        if self._bands is None:
+            from vcstudio.generate import bands_builder
+            self._bands = bands_builder
+        return self._bands
+
+    def _co(self):
+        """变胞弛豫派生端延迟加载。"""
+        if self._cell_opt is None:
+            from vcstudio.generate import cell_opt
+            self._cell_opt = cell_opt
+        return self._cell_opt
+
+    def _eos_(self):
+        """EOS 系列 + BM 拟合引擎延迟加载(numpy 相邻,重)。"""
+        if self._eos is None:
+            from vcstudio.project import eos
+            self._eos = eos
+        return self._eos
+
+    def _wf(self):
+        """功函数派生/解析引擎延迟加载。"""
+        if self._workfunction is None:
+            from vcstudio.project import workfunction
+            self._workfunction = workfunction
+        return self._workfunction
+
+    def _se(self):
+        """表面能计算器延迟加载(纯函数)。"""
+        if self._surface_energy is None:
+            from vcstudio.project import surface_energy
+            self._surface_energy = surface_energy
+        return self._surface_energy
+
+    def _dm(self):
+        """Dimer 过渡态派生端延迟加载。"""
+        if self._dimer is None:
+            from vcstudio.generate import dimer_builder
+            self._dimer = dimer_builder
+        return self._dimer
+
+    def _af(self):
+        """场景感知一键出图引擎延迟加载(matplotlib 相邻,重)。"""
+        if self._auto_figures is None:
+            from vcstudio.project import auto_figures
+            self._auto_figures = auto_figures
+        return self._auto_figures
+
+    def _ct(self):
+        """计算活动模板引擎延迟加载。"""
+        if self._campaign_tpl is None:
+            from vcstudio.project import campaign_templates
+            self._campaign_tpl = campaign_templates
+        return self._campaign_tpl
+
+    def _sv(self):
+        """溶剂化复合物建模引擎延迟加载(numpy 相邻,重)。"""
+        if self._solvation is None:
+            from vcstudio.generate import solvation
+            self._solvation = solvation
+        return self._solvation
+
+    def _pd(self):
+        """文献数据表提取 / 对照引擎延迟加载。"""
+        if self._paper_data is None:
+            from vcstudio.project import paper_data
+            self._paper_data = paper_data
+        return self._paper_data
+
+    def _va(self):
+        """材料变体推荐引擎延迟加载。"""
+        if self._variant_advisor is None:
+            from vcstudio.project import variant_advisor
+            self._variant_advisor = variant_advisor
+        return self._variant_advisor
+
+    def _md(self):
+        """论文骨架生成引擎延迟加载(python-docx 可选)。"""
+        if self._manuscript is None:
+            from vcstudio.project import manuscript_draft
+            self._manuscript = manuscript_draft
+        return self._manuscript
+
+    def _bp(self):
+        """能带/带隙解析引擎延迟加载。"""
+        if self._bands_parse is None:
+            from vcstudio.project import bands as bands_parse
+            self._bands_parse = bands_parse
+        return self._bands_parse
 
     def _resolve(self, name, password):
         """名字 → (profile, 密码, err_dict|None)。
@@ -750,13 +888,15 @@ class Api:
             return {'ok': False, 'zh': None, 'en': None, 'bibtex': None,
                     'warnings': [], 'error': str(e)}
 
-    def gen_run(self, poscar_path, incar_path, out_dir, lib_root, calc_type='slab'):
+    def gen_run(self, poscar_path, incar_path, out_dir, lib_root, calc_type='slab',
+                extra_keywords=None):
         """一键生成(镜像 generate_tab._on_run→build_job_dir→_write_manifest→ledger.register)。
 
         calc_type 由前端「计算类型」下拉传入(slab/bulk/molecule,非法值归 slab):决定
         KPOINTS 网格(slab 法向仅 1 个 k 点、molecule 为 Gamma 单点、bulk 三维网格)。
         此前 web 硬编码 slab,生成 bulk/molecule 会拿到错误 KPOINTS(缺口分析已指出)。
-        校验开关取默认(开)、KPOINTS 仍自动推荐。
+        校验开关取默认(开)、KPOINTS 仍自动推荐。extra_keywords(每行一条 ``KEY = VALUE``)
+        生成后追加到 INCAR 末(自定义关键词,如 LREAL/NCORE);解析不出的行原样保留。
         job.yaml 与台账写入失败只追加警告,绝不撤销已生成的四件套(同 _write_manifest 口径)。
         """
         try:
@@ -785,6 +925,18 @@ class Api:
                 poscar, incar, out, calc_type=calc_type, kpoints=kpts,
                 validate=validate, lib_root=lib)
             warnings = list(payload.get('warnings') or [])
+            # 自定义关键词:追加到生成的 INCAR 末(失败只告警,不撤销四件套)
+            extra_lines = [ln.strip() for ln in str(extra_keywords or '').splitlines()
+                           if ln.strip()]
+            if extra_lines:
+                try:
+                    incar_out = os.path.join(payload['out_dir'], 'INCAR')
+                    with open(incar_out, 'a', encoding='utf-8') as f:
+                        f.write('\n# === vcstudio 自定义关键词 ===\n')
+                        f.write('\n'.join(extra_lines) + '\n')
+                    warnings.append(f'已追加 {len(extra_lines)} 条自定义关键词到 INCAR')
+                except Exception as e:                    # noqa: BLE001
+                    warnings.append(f'自定义关键词追加失败(不影响四件套):{e}')
             # 落 job.yaml + 登记台账(_write_manifest:失败只告警)
             try:
                 self._manifest.create_from_build(
@@ -1311,6 +1463,18 @@ class Api:
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'error': str(e)}
 
+    def save_text(self, path, text):
+        """把文本写到指定路径(②预览区「保存预览到文件」等用)→ {'ok','path','error'}。"""
+        try:
+            p = (path or '').strip()
+            if not p:
+                return {'ok': False, 'path': None, 'error': '未指定保存路径'}
+            with open(p, 'w', encoding='utf-8') as f:
+                f.write(str(text if text is not None else ''))
+            return {'ok': True, 'path': p, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'path': None, 'error': str(e)}
+
     # ── 设置页(config 读写 + keyring 状态;全走注入的 config/ai_analysis,可测) ─────────
     @staticmethod
     def _parse_ideal_window(lo, hi):
@@ -1362,6 +1526,12 @@ class Api:
                           'lis_molecules_dir': cfg.get('lis_molecules_dir', '') or '',
                           'ideal_window': list(iw) if isinstance(iw, (list, tuple)) else []},
                 'ui': self._ui_defaults(ui),
+                'figures': {  # 出图偏好(期刊风格 / 自动出图 / 多面板)
+                    'journal_style': (str(ui.get('journal_style') or 'nature').lower()
+                                      if str(ui.get('journal_style') or 'nature').lower()
+                                      in self._JOURNAL_STYLES else 'nature'),
+                    'auto_figures': bool(ui.get('auto_figures', True)),
+                    'multi_panel': bool(ui.get('multi_panel', True))},
             }
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'error': str(e)}
@@ -1641,7 +1811,7 @@ class Api:
                 root = proj.get('root') or os.path.dirname(str(pp))
                 report_dir = os.path.join(root, 'report')
                 os.makedirs(report_dir, exist_ok=True)
-                fig = self.proj_figures(pp, ['bar', 'table', 'ladder'], report_dir)
+                fig = self._auto_figures_for_project(proj, pp, report_dir)
                 rep = self.proj_report(pp, os.path.join(report_dir, f'{name}_report.html'))
                 if not rep.get('ok'):
                     errors.append(f'项目「{name}」自动报告失败:{rep.get("error")}')
@@ -1652,11 +1822,98 @@ class Api:
                     self._adsorption.save_project(root, proj)
                 except Exception as e:                    # noqa: BLE001
                     errors.append(f'项目「{name}」报告标记落盘失败:{e}')
+                nfig = len(fig.get('files') or [])
+                extra = f'(一键出图 {nfig} 张)' if fig.get('engine') == 'auto_figures' else ''
                 events.append({'kind': 'report_done', 'project': name,
                                'report': rep.get('file'), 'figures_dir': fig.get('out_dir'),
-                               'text': f'项目「{name}」报告已自动生成'})
+                               'engine': fig.get('engine'), 'n_figures': nfig,
+                               'text': f'项目「{name}」报告已自动生成{extra}'})
             except Exception as e:                        # noqa: BLE001 单项目失败不拖垮其他
                 errors.append(f'项目报告自动化异常:{e}')
+
+    # ── 一键出图接线:全 DONE 项目自动出图升级(auto_figures 场景感知 + 期刊风格) ──
+    def _af_scenario(self, proj):
+        """项目 → auto_figures 场景(lis/general)。研究场景为 lis(锂硫)→ lis,否则 general。"""
+        try:
+            cfg = self._config.load_config()
+            sc = self._scenarios.active_scenario(cfg)
+            if str((sc or {}).get('key')) == 'lis':
+                return 'lis'
+        except Exception:                                 # noqa: BLE001
+            pass
+        return 'general'
+
+    def _af_molecules_dir(self):
+        try:
+            return (self._config.load_config().get('lis_molecules_dir') or '').strip() or None
+        except Exception:                                 # noqa: BLE001
+            return None
+
+    def _auto_figures_for_project(self, proj, pp, out_dir):
+        """全 DONE 项目一键出图:优先 auto_figures.run_auto_figures(场景感知 + 期刊风格 + 多面板),
+        引擎不可用(缺 matplotlib)/偏好关闭 → 回退 proj_figures(bar/table/ladder)。"""
+        prefs = self.figure_prefs_get()
+        if prefs.get('auto_figures', True):
+            try:
+                r = self._af().run_auto_figures(
+                    proj, self._af_scenario(proj), out_dir,
+                    journal=prefs.get('journal_style', 'nature'),
+                    adsorption_mod=self._adsorption, molecules_dir=self._af_molecules_dir(),
+                    compose_panel=bool(prefs.get('multi_panel', True)))
+                if r.get('ok'):
+                    return {'out_dir': r.get('out_dir'), 'files': list(r.get('files') or []),
+                            'panel': r.get('panel'), 'manifest': list(r.get('manifest') or []),
+                            'engine': 'auto_figures'}
+            except Exception:                             # noqa: BLE001 引擎不可用 → 回退
+                pass
+        fig = self.proj_figures(pp, ['bar', 'table', 'ladder'], out_dir)
+        return {'out_dir': fig.get('out_dir'), 'files': [], 'panel': None,
+                'manifest': [], 'engine': 'proj_figures'}
+
+    # ── campaign 全链推进接线:消费 next_derivations 自动派生下一阶段作业(自动驾驶时) ──
+    def _tick_campaigns(self, events, errors):
+        """扫已登记 campaign,消费 next_derivations 自动派生下一阶段作业并 mark_derived(幂等)。
+
+        依赖 campaign_templates(不可用则整体跳过);每目录/每项失败只记 event/error,绝不抛出。
+        """
+        try:
+            ct = self._ct()
+        except Exception:                                 # noqa: BLE001 模块不可用 → 跳过
+            return
+        try:
+            ui = self._config.get_ui_state()
+        except Exception:                                 # noqa: BLE001
+            ui = {}
+        for cdir in list((ui or {}).get('campaign_dirs') or []):
+            try:
+                pending = ct.next_derivations(cdir)
+            except Exception as e:                        # noqa: BLE001
+                errors.append(f'批次「{self._base(cdir)}」推进扫描失败:{e}')
+                continue
+            for item in pending:
+                src = item.get('src_dir')
+                derive = item.get('derive')
+                if not src or not os.path.isdir(str(src)):
+                    continue
+                try:
+                    if derive == 'estatic':
+                        r = self.derive_estatic(src, item.get('kinds') or ['pdos'])
+                        ok = bool(r.get('ok'))
+                    elif derive == 'freq':
+                        r = self.derive_freq(src)
+                        ok = bool(r.get('ok'))
+                    else:
+                        continue
+                    if ok:
+                        try:
+                            ct.mark_derived(cdir, item.get('src_id'), derive)
+                        except Exception as e:            # noqa: BLE001 记事件失败下拍再试
+                            errors.append(f'批次派生标记失败:{e}')
+                        events.append({'kind': 'derive',
+                                       'text': f'{self._base(src)}:自动派生 {derive} '
+                                               f'({self._base(cdir)})'})
+                except Exception as e:                    # noqa: BLE001 单项失败不拖垮其他
+                    errors.append(f'批次自动派生失败({self._base(src)}/{derive}):{e}')
 
     def pipeline_tick(self):
         """服务端一拍编排(幂等,全部复用现有方法):逐集群刷新/续算/拉回 + 自动报告。
@@ -1685,6 +1942,12 @@ class Api:
                     synced += 1
             except Exception as e:                        # noqa: BLE001 单集群失败不拖垮其他
                 errors.append(f'集群「{name}」同步失败:{e}')
+        # campaign 全链推进:自动派生下一阶段作业(自动驾驶续算或拉回任一子开关开启时)
+        if ap['cont'] or ap['fetch']:
+            try:
+                self._tick_campaigns(events, errors)
+            except Exception as e:                        # noqa: BLE001
+                errors.append(f'批次全链推进失败:{e}')
         if ap['report']:
             try:
                 self._tick_reports(events, errors)
@@ -3380,3 +3643,1188 @@ class Api:
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'job_dir': None, 'changes': [],
                     'warnings': [], 'error': str(e)}
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 一、全 DFT 任务目录(②生成输入页):计算类型目录 + U 建议 + 派生分发 + 任务解析
+    # ══════════════════════════════════════════════════════════════════════════
+    # 计算类型 key → estatic build_static_job 的 purpose(电子结构静态派生一族)
+    _DERIVE_ELECTRONIC = {'static': 'esp', 'dos_pdos': 'pdos', 'bader': 'bader',
+                          'chgdiff': 'chgdiff', 'elf': 'elf'}
+
+    def task_catalog(self):
+        """计算类型目录(五分类 23 项)→ {'ok','categories','tasks':[{key,name_zh,category,
+        description,requires,outputs,figure}],'error'}。前端据此渲染卡片网格与参数表单。"""
+        try:
+            tc = self._tc()
+            tasks = [{'key': t['key'], 'name_zh': t.get('name_zh', t['key']),
+                      'category': t.get('category', ''),
+                      'description': t.get('description', ''),
+                      'requires': t.get('requires', ''),
+                      'outputs': t.get('outputs', ''), 'figure': t.get('figure')}
+                     for t in tc.list_catalog()]
+            return {'ok': True, 'categories': list(tc.CATEGORIES),
+                    'tasks': tasks, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'categories': [], 'tasks': [], 'error': str(e)}
+
+    def u_suggest(self, elements):
+        """DFT+U 建议表:按元素查 U 库 → {'ok','suggestions':[{element,u,l,orbital,source,note}],
+        'missing':[库内无经验 U 的元素],'incar_keys':LDAU 系列键(按输入序),'error'}。
+
+        库内未登记的元素**不编造 U**(计入 missing);incar_keys 供「应用到 INCAR」直接写入。
+        """
+        try:
+            els = [str(e).strip() for e in (elements or []) if str(e).strip()]
+            ul = self._ul()
+            sugg = list(ul.suggest_u(els))
+            have = {s['element'] for s in sugg}
+            keys = {}
+            try:
+                keys = ul.ldau_keys(sugg, els)
+            except Exception:                             # noqa: BLE001 键组装失败不挡建议表
+                keys = {}
+            return {'ok': True, 'suggestions': sugg,
+                    'missing': [e for e in els if e not in have],
+                    'incar_keys': keys, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'suggestions': [], 'missing': [],
+                    'incar_keys': {}, 'error': str(e)}
+
+    def _derive_ret(self, key, dirs, changes, warnings, *, series=None, extra=None):
+        """派生统一返回:逐目录入台账(失败并入 warnings,不撤销已生成目录)。"""
+        warns = list(warnings or [])
+        for d in dirs:
+            try:
+                self._ledger.register(d)
+            except Exception as e:                        # noqa: BLE001
+                warns.append(f'台账登记失败({os.path.basename(str(d))}):{e}')
+        out = {'ok': True, 'key': key, 'job_dirs': [str(d) for d in dirs],
+               'series': series, 'changes': list(changes or []),
+               'warnings': warns, 'error': None}
+        if extra:
+            out.update(extra)
+        return out
+
+    @staticmethod
+    def _series_dirs(res):
+        """系列 build 返回 → (dirs 列表, series 视图)。"""
+        series = list(res.get('series') or [])
+        dirs = [s.get('dir') for s in series if s.get('dir')]
+        return dirs, series
+
+    def derive_task(self, key, src_dir, params=None):
+        """按计算类型 key 从源作业目录派生下一步作业(分发到对应 builder)→ 入台账。
+
+        支持:cellopt / static / dos_pdos / bader / chgdiff / elf / bands / eos /
+        workfunction / dimer / freq / aimd / conv_encut / conv_kmesh / conv_vacuum /
+        conv_thickness。返回 {'ok','key','job_dirs':[...],'series':[...]|None,'changes',
+        'warnings','error'}。不可派生的 key(如吸附能项目/表面能计算器)→ ok=False + 中文说明。
+        """
+        try:
+            k = str(key or '').strip()
+            d = (src_dir or '').strip()
+            if not d or not os.path.isdir(d):
+                return {'ok': False, 'key': k, 'job_dirs': [], 'series': None,
+                        'changes': [], 'warnings': [], 'error': '源作业目录不存在'}
+            p = dict(params or {})
+            base = os.path.basename(os.path.normpath(d))
+            parent = (p.get('out_root') or '').strip() or os.path.dirname(
+                os.path.normpath(d))
+
+            if k == 'cellopt':
+                out_dir = os.path.join(parent, f'{base}_cellopt')
+                res = self._co().build_cellopt_job(
+                    d, out_dir, bump_encut=bool(p.get('bump_encut', True)))
+                return self._derive_ret(k, [res['out_dir']], res.get('changes'),
+                                        res.get('warnings'))
+            if k in self._DERIVE_ELECTRONIC:
+                out_dir = os.path.join(parent, f'{base}_{k}')
+                res = self._es().build_static_job(
+                    d, out_dir, purpose=self._DERIVE_ELECTRONIC[k])
+                return self._derive_ret(k, [res['out_dir']], res.get('changes'),
+                                        res.get('warnings'))
+            if k == 'bands':
+                out_dir = os.path.join(parent, f'{base}_bands')
+                res = self._bd().build_bands_job(
+                    d, out_dir, lattice=(p.get('lattice') or None),
+                    npoints=int(p.get('npoints', 40) or 40))
+                return self._derive_ret(k, [res['out_dir']], res.get('changes'),
+                                        res.get('warnings'),
+                                        extra={'lattice': res.get('lattice')})
+            if k == 'workfunction':
+                out_dir = os.path.join(parent, f'{base}_wf')
+                res = self._wf().build_workfunction_job(
+                    d, out_dir, add_dipole=str(p.get('add_dipole', 'auto')))
+                return self._derive_ret(k, [res['out_dir']], res.get('changes'),
+                                        res.get('warnings'),
+                                        extra={'dipole': res.get('dipole')})
+            if k == 'dimer':
+                out_dir = os.path.join(parent, f'{base}_dimer')
+                kw = {}
+                if p.get('amplitude') not in (None, ''):
+                    kw['amplitude'] = float(p['amplitude'])
+                if p.get('displaced_poscar'):
+                    kw['displaced_poscar'] = str(p['displaced_poscar'])
+                res = self._dm().build_dimer_job(d, out_dir, **kw)
+                return self._derive_ret(k, [res['out_dir']], res.get('changes'),
+                                        res.get('warnings'),
+                                        extra={'modecar_method': res.get('modecar_method')})
+            if k == 'eos':
+                out_root = os.path.join(parent, f'{base}_eos')
+                kw = {}
+                if p.get('scales'):
+                    kw['scales'] = [float(x) for x in p['scales']]
+                res = self._eos_().build_eos_series(d, out_root, **kw)
+                dirs, series = self._series_dirs(res)
+                return self._derive_ret(k, dirs, [], res.get('warnings'), series=series)
+            if k in ('conv_encut', 'conv_kmesh', 'conv_vacuum', 'conv_thickness'):
+                return self._derive_conv(k, d, parent, base, p)
+            if k == 'freq':
+                r = self.derive_freq(d, out_root=parent)
+                return {'ok': r['ok'], 'key': k,
+                        'job_dirs': [r['job_dir']] if r.get('job_dir') else [],
+                        'series': None, 'changes': r.get('changes') or [],
+                        'warnings': r.get('warnings') or [], 'error': r.get('error')}
+            if k == 'aimd':
+                r = self.derive_aimd(
+                    d, ensemble=str(p.get('ensemble', 'nvt')),
+                    temp_k=float(p.get('temp_k', 300.0) or 300.0),
+                    temp_end_k=p.get('temp_end_k'), steps=int(p.get('steps', 10000) or 10000),
+                    potim_fs=float(p.get('potim_fs', 1.0) or 1.0),
+                    encut=p.get('encut'), out_root=parent)
+                return {'ok': r['ok'], 'key': k,
+                        'job_dirs': [r['job_dir']] if r.get('job_dir') else [],
+                        'series': None, 'changes': r.get('changes') or [],
+                        'warnings': r.get('warnings') or [], 'error': r.get('error')}
+            return {'ok': False, 'key': k, 'job_dirs': [], 'series': None,
+                    'changes': [], 'warnings': [],
+                    'error': f'任务类型 {k!r} 不支持一键派生(如吸附能项目/表面能计算器请走专用流程)'}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'key': str(key), 'job_dirs': [], 'series': None,
+                    'changes': [], 'warnings': [], 'error': str(e)}
+
+    def _derive_conv(self, k, d, parent, base, p):
+        """收敛扫描系列派生(encut/kmesh/vacuum/thickness):默认值兜底,系列各作业入台账。"""
+        cs = self._cs()
+        out_root = os.path.join(parent, f'{base}_{k}')
+        if k == 'conv_encut':
+            vals = [int(x) for x in (p.get('values') or [])] or None
+            res = (cs.build_encut_series(d, out_root, values=vals) if vals
+                   else cs.build_encut_series(d, out_root))
+        elif k == 'conv_kmesh':
+            meshes = p.get('meshes') or [[3, 3, 1], [5, 5, 1], [7, 7, 1]]
+            res = cs.build_kmesh_series(d, out_root, meshes)
+        elif k == 'conv_vacuum':
+            vacs = [float(x) for x in (p.get('vacuums') or [10, 12, 15, 18])]
+            res = cs.build_vacuum_series(d, out_root, vacs)
+        else:  # conv_thickness
+            layers = [int(x) for x in (p.get('layers') or [3, 4, 5])]
+            res = cs.build_slab_thickness_series(d, out_root, layers)
+        dirs, series = self._series_dirs(res)
+        return self._derive_ret(k, dirs, [], res.get('warnings'), series=series)
+
+    # ── ④结果分析页·任务解析(按 task_type 自动解析 + 出图) ──────────────────────
+    @staticmethod
+    def _osz_energy(job_dir):
+        """OSZICAR 末态自洽能 E0 → float|None(未跑完/缺文件 → None)。"""
+        try:
+            p = os.path.join(job_dir, 'OSZICAR')
+            if not os.path.isfile(p):
+                return None
+            e = None
+            with open(p, encoding='utf-8', errors='replace') as f:
+                for ln in f:
+                    if 'E0=' in ln:
+                        try:
+                            e = float(ln.split('E0=')[1].split()[0])
+                        except (IndexError, ValueError):
+                            pass
+            return e
+        except Exception:                                 # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _poscar_volume(job_dir):
+        """CONTCAR/POSCAR 晶胞体积(Å³)→ float|None(scale>0 时乘 scale³)。"""
+        try:
+            for name in ('CONTCAR', 'POSCAR'):
+                p = os.path.join(job_dir, name)
+                if not os.path.isfile(p):
+                    continue
+                lines = open(p, encoding='utf-8', errors='replace').read().splitlines()
+                if len(lines) < 5:
+                    continue
+                scale = float(lines[1].split()[0])
+                a = [[float(x) for x in lines[2].split()[:3]],
+                     [float(x) for x in lines[3].split()[:3]],
+                     [float(x) for x in lines[4].split()[:3]]]
+                det = (a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
+                       - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
+                       + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]))
+                return abs(det) * (scale ** 3 if scale > 0 else 1.0)
+            return None
+        except Exception:                                 # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _outcar_efermi(job_dir):
+        """OUTCAR 费米能 E-fermi → float|None。"""
+        try:
+            import re as _re
+            p = os.path.join(job_dir, 'OUTCAR')
+            if not os.path.isfile(p):
+                return None
+            ef = None
+            with open(p, encoding='utf-8', errors='replace') as f:
+                for ln in f:
+                    if 'E-fermi' in ln:
+                        m = _re.search(r'E-fermi\s*:\s*([-\d.]+)', ln)
+                        if m:
+                            ef = float(m.group(1))
+            return ef
+        except Exception:                                 # noqa: BLE001
+            return None
+
+    def _infer_task_kind(self, d):
+        """从 manifest task_type 或目录内容推断解析类型(conv/eos/bands/workfunction)。"""
+        try:
+            m = self._manifest.load_manifest(d)
+            tt = str((m or {}).get('task_type') or '').lower()
+            if 'eos' in tt:
+                return 'eos'
+            if 'band' in tt:
+                return 'bands'
+            if 'work' in tt or tt == 'workfunction':
+                return 'workfunction'
+            if tt in ('encut', 'kmesh', 'vacuum', 'thickness') or 'conv' in tt:
+                return 'conv'
+        except Exception:                                 # noqa: BLE001
+            pass
+        try:
+            subs = [x for x in os.listdir(d) if os.path.isdir(os.path.join(d, x))]
+        except OSError:
+            subs = []
+        if any(x.startswith('eos_') for x in subs):
+            return 'eos'
+        if any(x.split('_')[0] in ('encut', 'kmesh', 'vac', 'thick', 'slab') for x in subs):
+            return 'conv'
+        if os.path.isfile(os.path.join(d, 'LOCPOT')):
+            return 'workfunction'
+        if os.path.isfile(os.path.join(d, 'EIGENVAL')):
+            return 'bands'
+        return ''
+
+    def analyze_task(self, job_dir, kind=None):
+        """任务解析:按 task_type(或推断)自动调解析器 + 出图 → {'ok','kind','result',
+        'figure','summary','files','error'}。支持 conv 曲线 / EOS 拟合 / 能带带隙 / 功函数。"""
+        try:
+            d = (job_dir or '').strip()
+            if not d or not os.path.isdir(d):
+                return {'ok': False, 'kind': None, 'result': None, 'figure': None,
+                        'summary': '', 'files': [], 'error': '作业目录不存在'}
+            k = (kind or '').strip().lower() or self._infer_task_kind(d)
+            if k.startswith('conv') or k in ('encut', 'kmesh', 'vacuum', 'thickness'):
+                return self._analyze_conv(d)
+            if k == 'eos':
+                return self._analyze_eos(d)
+            if k in ('bands', 'band'):
+                return self._analyze_bands(d)
+            if k in ('workfunction', 'work_function', 'wf'):
+                return self._analyze_workfunction(d)
+            return {'ok': False, 'kind': k or None, 'result': None, 'figure': None,
+                    'summary': '', 'files': [],
+                    'error': '无法识别任务类型(支持 conv/eos/bands/workfunction;可显式传 kind)'}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'kind': None, 'result': None, 'figure': None,
+                    'summary': '', 'files': [], 'error': str(e)}
+
+    def _analyze_conv(self, d):
+        subs = sorted(os.path.join(d, x) for x in os.listdir(d)
+                      if os.path.isdir(os.path.join(d, x))
+                      and x.split('_')[0] in ('encut', 'kmesh', 'vac', 'thick', 'slab'))
+        dirs = subs or [d]
+        cs = self._cs()
+        res = cs.analyze_series(dirs)
+        fig = None
+        try:
+            pts = [p for p in (res.get('points') or []) if p.get('energy') is not None]
+            if pts:
+                out_png = os.path.join(d, 'convergence.png')
+                cs.conv_plot(pts, out_png, converged_at=res.get('converged_at'))
+                fig = out_png
+        except Exception:                                 # noqa: BLE001 出图失败不挡解析
+            fig = None
+        return {'ok': True, 'kind': 'conv', 'result': res, 'figure': fig,
+                'summary': res.get('note', ''),
+                'files': [fig] if fig else [], 'error': None}
+
+    def _analyze_eos(self, d):
+        subs = sorted(os.path.join(d, x) for x in os.listdir(d)
+                      if os.path.isdir(os.path.join(d, x)) and x.startswith('eos_'))
+        dirs = subs or [d]
+        vols, ens = [], []
+        for jd in dirs:
+            v, e = self._poscar_volume(jd), self._osz_energy(jd)
+            if v is not None and e is not None:
+                vols.append(v)
+                ens.append(e)
+        if len(vols) < 3:
+            return {'ok': False, 'kind': 'eos', 'result': None, 'figure': None,
+                    'summary': '', 'files': [],
+                    'error': f'EOS 拟合需 ≥3 个含体积/能量的作业(现有 {len(vols)} 个,尚未跑完?)'}
+        eos = self._eos_()
+        fit = eos.fit_birch_murnaghan(vols, ens)
+        fig = None
+        try:
+            out_png = os.path.join(d, 'eos.png')
+            eos.eos_plot([{'volume': v, 'energy': e} for v, e in zip(vols, ens)],
+                         fit, out_png)
+            fig = out_png
+        except Exception:                                 # noqa: BLE001
+            fig = None
+        summary = (f"V0 = {fit.get('v0'):.3f} Å³,E0 = {fit.get('e0'):.4f} eV,"
+                   f"B0 = {fit.get('b0_gpa'):.1f} GPa,B0' = {fit.get('b0_prime'):.2f},"
+                   f"R² = {fit.get('r2'):.4f}") if fit else ''
+        return {'ok': True, 'kind': 'eos', 'result': fit, 'figure': fig,
+                'summary': summary, 'files': [fig] if fig else [], 'error': None}
+
+    def _analyze_bands(self, d):
+        src = None
+        for name in ('EIGENVAL', 'vasprun.xml'):
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                src = open(p, encoding='utf-8', errors='replace').read()
+                break
+        if src is None:
+            return {'ok': False, 'kind': 'bands', 'result': None, 'figure': None,
+                    'summary': '', 'files': [], 'error': '未找到 EIGENVAL / vasprun.xml'}
+        bp = self._bp()
+        ef = self._outcar_efermi(d)
+        data = bp.parse_bands(src, efermi=ef)
+        gap = data.get('gap') or {}
+        fig = None
+        try:
+            out_png = os.path.join(d, 'band.png')
+            bp.band_plot(data, out_png, efermi=ef)
+            fig = out_png
+        except Exception:                                 # noqa: BLE001
+            fig = None
+        if gap.get('metal'):
+            summary = '金属性(无带隙)。'
+        elif gap.get('value') is not None:
+            summary = (f"带隙 = {gap['value']:.3f} eV"
+                       f"({'直接' if gap.get('direct') else '间接'}带隙)。")
+        else:
+            summary = gap.get('note', '未能判定带隙。')
+        return {'ok': True, 'kind': 'bands', 'result': {'gap': gap}, 'figure': fig,
+                'summary': summary, 'files': [fig] if fig else [], 'error': None}
+
+    def _analyze_workfunction(self, d):
+        locpot = os.path.join(d, 'LOCPOT')
+        if not os.path.isfile(locpot):
+            return {'ok': False, 'kind': 'workfunction', 'result': None, 'figure': None,
+                    'summary': '', 'files': [], 'error': '未找到 LOCPOT'}
+        wf = self._wf()
+        ef = self._outcar_efermi(d)
+        if ef is None:
+            return {'ok': False, 'kind': 'workfunction', 'result': None, 'figure': None,
+                    'summary': '', 'files': [], 'error': '未能从 OUTCAR 读到费米能 E-fermi'}
+        planar = wf.parse_locpot_planar(locpot)
+        res = wf.work_function(planar['v_planar'], planar['z'], ef)
+        fig = None
+        try:
+            out_png = os.path.join(d, 'work_function.png')
+            wf.wf_plot(planar['v_planar'], planar['z'], ef, out_png,
+                       vacuum_level=res.get('vacuum_level'), phi=res.get('phi'))
+            fig = out_png
+        except Exception:                                 # noqa: BLE001
+            fig = None
+        phi = res.get('phi')
+        summary = (f"功函数 φ = {phi:.3f} eV(真空能级 {res.get('vacuum_level'):.3f} eV,"
+                   f"E_F = {ef:.3f} eV)。") if phi is not None else res.get('note', '')
+        return {'ok': True, 'kind': 'workfunction', 'result': res, 'figure': fig,
+                'summary': summary, 'files': [fig] if fig else [], 'error': None}
+
+    def surface_energy_calc(self, slab_dir, bulk_dir, e_bulk_per_atom=None, area=None):
+        """表面能计算器:选 slab + bulk 作业 → γ (J/m²)。面积从 slab POSCAR 自动算。
+
+        e_bulk_per_atom 缺省时由 bulk 作业的 OSZICAR 能与原子数现算;area 缺省时由 slab POSCAR
+        的 a×b 叉积面积算。返回 {'ok','gamma_jm2','area_a2','e_slab','n_slab','e_bulk_per_atom',
+        'note','error'}。
+        """
+        try:
+            sd = (slab_dir or '').strip()
+            if not sd or not os.path.isdir(sd):
+                return {'ok': False, 'gamma_jm2': None, 'error': 'slab 作业目录不存在'}
+            e_slab = self._osz_energy(sd)
+            if e_slab is None:
+                return {'ok': False, 'gamma_jm2': None, 'error': 'slab 作业无可解析能量(未跑完?)'}
+            n_slab = self._poscar_natoms(self._read_poscar_text(sd))
+            if not n_slab:
+                return {'ok': False, 'gamma_jm2': None, 'error': '无法从 slab POSCAR 读原子数'}
+            se = self._se()
+            if area in (None, ''):
+                area = se.area_from_poscar(self._read_poscar_text(sd))
+            e_bpa = e_bulk_per_atom
+            if e_bpa in (None, ''):
+                bd = (bulk_dir or '').strip()
+                if not bd or not os.path.isdir(bd):
+                    return {'ok': False, 'gamma_jm2': None,
+                            'error': 'bulk 作业目录不存在(或直接填体相每原子能)'}
+                e_bulk = self._osz_energy(bd)
+                n_bulk = self._poscar_natoms(self._read_poscar_text(bd))
+                if e_bulk is None or not n_bulk:
+                    return {'ok': False, 'gamma_jm2': None,
+                            'error': 'bulk 作业无可解析能量/原子数'}
+                e_bpa = e_bulk / n_bulk
+            gamma = se.surface_energy(float(e_slab), int(n_slab), float(e_bpa), float(area))
+            return {'ok': True, 'gamma_jm2': float(gamma), 'area_a2': float(area),
+                    'e_slab': float(e_slab), 'n_slab': int(n_slab),
+                    'e_bulk_per_atom': float(e_bpa),
+                    'note': f'γ = (E_slab − N·E_bulk)/2A = {gamma:.4f} J/m²', 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'gamma_jm2': None, 'error': str(e)}
+
+    @staticmethod
+    def _read_poscar_text(job_dir):
+        for name in ('CONTCAR', 'POSCAR'):
+            p = os.path.join(job_dir, name)
+            if os.path.isfile(p):
+                return open(p, encoding='utf-8', errors='replace').read()
+        return ''
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 二、一键出图管线接线:活动模板 + 溶剂化复合物 + 出图偏好
+    # ══════════════════════════════════════════════════════════════════════════
+    def campaign_templates(self):
+        """计算活动模板清单 → {'ok','templates':[{key,name_zh,description,figures_scenario,
+        n_stages,analyses}],'error'}(①结构建模 SAC 矩阵卡下拉)。"""
+        try:
+            tpl = self._ct().list_templates()
+            out = [{'key': k, 'name_zh': v.get('name_zh', k),
+                    'description': v.get('description', ''),
+                    'figures_scenario': v.get('figures_scenario'),
+                    'n_stages': v.get('n_stages', 0),
+                    'analyses': list(v.get('analyses') or [])}
+                   for k, v in tpl.items()]
+            return {'ok': True, 'templates': out, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'templates': [], 'error': str(e)}
+
+    def campaign_instantiate(self, template_key, matrix_spec, out_root, title=None):
+        """据模板 + 体系矩阵生成全链 DAG(落 campaign)→ 入仪表盘发现表。
+
+        返回 {'ok','campaign_dir','stages','n_jobs','estimate','figures_scenario','error'}。
+        """
+        try:
+            root = (out_root or '').strip()
+            if not root:
+                return {'ok': False, 'campaign_dir': None, 'error': '未指定输出根目录'}
+            spec = dict(matrix_spec or {})
+            if not (spec.get('systems') or []):
+                return {'ok': False, 'campaign_dir': None,
+                        'error': '体系矩阵至少需要一个 system(体系/催化剂)'}
+            res = self._ct().instantiate(str(template_key or ''), spec, root,
+                                         title=(title or None))
+            cdir = res.get('campaign_dir')
+            if cdir:
+                self._register_campaign_dir(cdir)
+            return {'ok': True, 'campaign_dir': cdir, 'stages': res.get('stages') or {},
+                    'n_jobs': res.get('n_jobs', 0), 'estimate': res.get('estimate') or {},
+                    'figures_scenario': res.get('figures_scenario'), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'campaign_dir': None, 'error': str(e)}
+
+    def solvent_presets(self):
+        """溶剂配比预设清单 → {'ok','presets':[{key,recipe,label}],'error'}(溶剂化小卡下拉)。"""
+        try:
+            sv = self._sv()
+            presets = [{'key': k, 'recipe': [[nm, n] for nm, n in v],
+                        'label': '、'.join(f'{n}×{nm}' for nm, n in v)}
+                       for k, v in sv.SOLVENT_PRESETS.items()]
+            return {'ok': True, 'presets': presets, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'presets': [], 'error': str(e)}
+
+    def build_solvated(self, core='Li2S3', solvents='lis_electrolyte', box=18.0,
+                       min_sep=2.5, seed=42, save_to=None):
+        """组装显式溶剂化复合物(核 + 溶剂 → 立方盒 POSCAR)→ {'ok','poscar','n_atoms','note',
+        'saved_to','error'}。solvents 可为预设 key 或 [[名,个数],...];save_to 给了则落盘。"""
+        try:
+            sv = self._sv()
+            if isinstance(solvents, (list, tuple)) and not isinstance(solvents, str):
+                recipe = [(str(nm), int(cnt)) for nm, cnt in solvents]
+            else:
+                recipe = str(solvents)
+            res = sv.build_solvated_complex(
+                core=str(core or 'Li2S3'), solvents=recipe,
+                box=float(box), min_sep=float(min_sep), seed=int(seed))
+            saved = None
+            dest = (save_to or '').strip()
+            if dest:
+                with open(dest, 'w', encoding='utf-8') as f:
+                    f.write(res['poscar'])
+                saved = dest
+            # 另写一份到临时 POSCAR,供前端「载入编辑器」经 struct_load 读取
+            temp_path = None
+            try:
+                fd, temp_path = tempfile.mkstemp(prefix='vcs_solv_', suffix='_POSCAR')
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    f.write(res['poscar'])
+            except Exception:                             # noqa: BLE001 临时文件失败不致命
+                temp_path = None
+            return {'ok': True, 'poscar': res['poscar'], 'n_atoms': res.get('n_atoms'),
+                    'note': res.get('note', ''), 'saved_to': saved,
+                    'temp_path': temp_path, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'poscar': None, 'n_atoms': 0, 'note': '',
+                    'saved_to': None, 'error': str(e)}
+
+    _JOURNAL_STYLES = ('nature', 'acs', 'prb')
+
+    def figure_prefs_get(self):
+        """出图偏好读:期刊风格 / 自动出图开关 / 多面板开关(config ui.*,带默认)。"""
+        try:
+            ui = self._config.get_ui_state()
+        except Exception:                                 # noqa: BLE001
+            ui = {}
+        js = str((ui or {}).get('journal_style') or 'nature').lower()
+        return {'ok': True,
+                'journal_style': js if js in self._JOURNAL_STYLES else 'nature',
+                'auto_figures': bool((ui or {}).get('auto_figures', True)),
+                'multi_panel': bool((ui or {}).get('multi_panel', True)),
+                'error': None}
+
+    def figure_prefs_save(self, journal_style=None, auto_figures=None, multi_panel=None):
+        """保存出图偏好到 config ui.*(None 字段不改;非法期刊回落 nature)。"""
+        try:
+            kv = {}
+            if journal_style is not None:
+                js = str(journal_style).lower()
+                kv['journal_style'] = js if js in self._JOURNAL_STYLES else 'nature'
+            if auto_figures is not None:
+                kv['auto_figures'] = bool(auto_figures)
+            if multi_panel is not None:
+                kv['multi_panel'] = bool(multi_panel)
+            self._config.set_ui_state(**kv)
+            return {'ok': True, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 三、AI 助手三能力:数据对照 / 材料变体 / 论文草稿
+    # ══════════════════════════════════════════════════════════════════════════
+    def ai_extract_tables(self, source, transport=None):
+        """论文正文 → 结构化文献数据表(LLM 只誊抄 + 确定性校验)→ {'ok','tables':[{label,kind,
+        columns,rows:[{system,species,value_ev,page_hint}]}],'error'}。仅供对照,绝不回流计算。"""
+        try:
+            text = (source or '')
+            if not str(text).strip():
+                return {'ok': False, 'tables': [], 'error': '未提供论文文本'}
+            res = self._pd().extract_data_tables(str(text), transport=transport)
+            return {'ok': bool(res.get('ok')), 'tables': list(res.get('tables') or []),
+                    'error': res.get('error')}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'tables': [], 'error': str(e)}
+
+    def _project_computed(self, proj):
+        """项目 → 计算侧对照集 [{system,species,quantity:'E_ads',value}](取各物种最稳 ΔE)。"""
+        rows = (self._adsorption.delta_e_rows(proj) or {}).get('rows') or []
+        name = str(proj.get('name') or '')
+        out = []
+        for r in rows:
+            if r.get('is_most_stable') and r.get('delta_e') is not None:
+                out.append({'system': name, 'species': r.get('species') or r.get('name'),
+                            'quantity': 'E_ads', 'value': float(r['delta_e'])})
+        return out
+
+    def ai_compare(self, project_path, reference):
+        """项目计算值 × 文献参考(体系×物种×量对齐)→ MAE/RMSE/最差3项/对照表(纯确定性)。
+
+        reference 为 ai_extract_tables 的 tables(或已归一参考集)。返回 {'ok','n','mae','rmse',
+        'worst','pairs','unmatched','summary','error'};无对齐项 ok=True 但 n=0 + 说明。
+        """
+        try:
+            proj = self._adsorption.load_project((project_path or '').strip())
+            if proj is None:
+                return {'ok': False, 'n': 0, 'error': '项目不存在或 project.yaml 已移动'}
+            pd = self._pd()
+            ref = reference
+            if isinstance(reference, list):
+                ref = pd.build_reference_dataset(reference)
+            elif isinstance(reference, dict) and 'entries' not in reference:
+                ref = pd.build_reference_dataset(reference.get('tables') or [])
+            computed = self._project_computed(proj)
+            cmp = pd.compare_with_computed(ref, computed)
+            return {'ok': True, 'n': cmp.get('n', 0), 'mae': cmp.get('mae'),
+                    'rmse': cmp.get('rmse'), 'worst': list(cmp.get('worst') or []),
+                    'pairs': list(cmp.get('pairs') or []),
+                    'unmatched': list(cmp.get('unmatched') or []),
+                    'summary': cmp.get('summary_zh', ''), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'n': 0, 'error': str(e)}
+
+    def ai_write_validation(self, project_path, reference, out=None):
+        """把文献对照写成 validation.md(项目 report/ 下或指定路径)→ {'ok','path','n','error'}。"""
+        try:
+            proj = self._adsorption.load_project((project_path or '').strip())
+            if proj is None:
+                return {'ok': False, 'path': None, 'error': '项目不存在或 project.yaml 已移动'}
+            pd = self._pd()
+            ref = reference
+            if isinstance(reference, list):
+                ref = pd.build_reference_dataset(reference)
+            elif isinstance(reference, dict) and 'entries' not in reference:
+                ref = pd.build_reference_dataset(reference.get('tables') or [])
+            cmp = pd.compare_with_computed(ref, self._project_computed(proj))
+            md = pd.mae_report_md(cmp)
+            dest = (out or '').strip()
+            if not dest:
+                root = proj.get('root') or os.path.dirname((project_path or '').strip())
+                rdir = os.path.join(root, 'report')
+                os.makedirs(rdir, exist_ok=True)
+                dest = os.path.join(rdir, 'validation.md')
+            with open(dest, 'w', encoding='utf-8') as f:
+                f.write(md)
+            return {'ok': True, 'path': dest, 'n': cmp.get('n', 0), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'path': None, 'error': str(e)}
+
+    def ai_variants(self, spec, budget_cap_hours=None):
+        """材料变体推荐:母版规格表 → 变体列表 + 分批预算 + 可喂 sac_matrix 的矩阵谱。
+
+        返回 {'ok','variants':[{kind,from,to,metal,template,parent,priority,rationale_zh}],
+        'matrix_spec':{metals,templates},'plan':{n_jobs,estimate_hours,batches,note},'error'}。
+        """
+        try:
+            va = self._va()
+            sugg = va.suggest_variants(spec or {})
+            variants = list(sugg.get('variants') or [])
+            cap = None if budget_cap_hours in (None, '') else float(budget_cap_hours)
+            plan = va.variant_campaign_plan(variants, budget_cap_hours=cap)
+            return {'ok': True, 'variants': variants,
+                    'matrix_spec': sugg.get('matrix_spec') or {'metals': [], 'templates': []},
+                    'plan': plan, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'variants': [], 'matrix_spec': {},
+                    'plan': {}, 'error': str(e)}
+
+    def ai_manuscript(self, project_path, fmt='markdown', reference=None):
+        """生成论文骨架:Methods 全自动 + Results 逐图数据句 + 占位待补 → 诚实展示自动/占位比。
+
+        返回 {'ok','path','md_path','docx_path','docx_available','sections','stats':{auto,
+        placeholder,total,auto_ratio},'note','error'}。fmt='docx' 时缺 python-docx 降级只出 .md。
+        """
+        try:
+            proj = self._adsorption.load_project((project_path or '').strip())
+            if proj is None:
+                return {'ok': False, 'path': None, 'error': '项目不存在或 project.yaml 已移动'}
+            comparison = None
+            if reference is not None:
+                cr = self.ai_compare(project_path, reference)
+                if cr.get('ok') and cr.get('n'):
+                    comparison = {'pairs': cr.get('pairs'), 'mae': cr.get('mae'),
+                                  'rmse': cr.get('rmse'), 'n': cr.get('n'),
+                                  'worst': cr.get('worst'), 'unmatched': cr.get('unmatched'),
+                                  'summary_zh': cr.get('summary')}
+            md = self._md()
+            res = md.build_manuscript(proj, comparison=comparison,
+                                      fmt=str(fmt or 'markdown'))
+            stats = {}
+            try:
+                stats = md.draft_stats(res.get('md_path') or res.get('path'))
+            except Exception:                             # noqa: BLE001 统计失败不挡产物
+                stats = {}
+            return {'ok': bool(res.get('ok')), 'path': res.get('path'),
+                    'md_path': res.get('md_path'), 'docx_path': res.get('docx_path'),
+                    'docx_available': bool(res.get('docx_available')),
+                    'sections': list(res.get('sections') or []),
+                    'placeholders_count': res.get('placeholders_count'),
+                    'stats': stats, 'note': res.get('note'), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'path': None, 'error': str(e)}
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 四、starpivot 细节对齐:依赖状态/安装 + 概览核时 + 波函数分组/散点/远程渲染
+    # ══════════════════════════════════════════════════════════════════════════
+    # 可后台 pip 安装的组件白名单(避免任意包注入;pip 为真实包名序列)
+    _DEPS_INSTALLABLE = {
+        'rdkit': {'pip': ('rdkit',), 'note': '分子建模(SMILES↔3D、2D 键线式)'},
+        'decimer': {'pip': ('decimer',),
+                    'note': '图片识别 OCSR(含 TensorFlow 模型,约数百 MB)'},
+        'matplotlib': {'pip': ('matplotlib', 'numpy'), 'note': '论文级出图引擎'},
+        'python-docx': {'pip': ('python-docx',), 'note': '论文骨架导出 .docx'},
+        'pypdf': {'pip': ('pypdf',), 'note': 'PDF 论文文本提取'},
+    }
+
+    @staticmethod
+    def _pkg_present(name):
+        try:
+            import importlib.util
+            return importlib.util.find_spec(name) is not None
+        except Exception:                                 # noqa: BLE001
+            return False
+
+    def deps_status(self):
+        """依赖状态汇总(侧栏依赖状态区)→ {'ok','deps':[{key,name,available,detail,installable,
+        note}],'error'}。RDKit/DECIMER/matplotlib 按 import 探测;Multiwfn/VMD 走各自 probe。"""
+        try:
+            deps = []
+            py = [('rdkit', 'RDKit', 'rdkit'), ('decimer', 'DECIMER', 'decimer'),
+                  ('matplotlib', 'matplotlib', 'matplotlib')]
+            for key, name, mod in py:
+                ok = self._pkg_present(mod)
+                deps.append({'key': key, 'name': name, 'available': ok,
+                             'detail': '已安装' if ok else '未安装',
+                             'installable': key in self._DEPS_INSTALLABLE,
+                             'note': self._DEPS_INSTALLABLE.get(key, {}).get('note', '')})
+            paths = self._tool_paths()
+            for key, name, probe in (('multiwfn', 'Multiwfn', self._mw),
+                                     ('vmd', 'VMD', self._vmd_)):
+                try:
+                    pr = probe().probe((paths.get(key) or '').strip() or None)
+                except Exception as e:                    # noqa: BLE001
+                    pr = {'available': False, 'detail': str(e)}
+                deps.append({'key': key, 'name': name,
+                             'available': bool(pr.get('available')),
+                             'detail': pr.get('detail', ''), 'installable': False,
+                             'note': '外部程序,请在波函数页填路径或加入 PATH'})
+            return {'ok': True, 'deps': deps, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'deps': [], 'error': str(e)}
+
+    @staticmethod
+    def _default_deps_runner(pip_names, log_path):
+        """默认后台 pip 安装器:Popen 输出重定向到日志文件。"""
+        import subprocess
+        logf = open(log_path, 'w', encoding='utf-8')
+        return subprocess.Popen([sys.executable, '-m', 'pip', 'install', *pip_names],
+                                stdout=logf, stderr=subprocess.STDOUT)
+
+    def deps_install(self, pkgs):
+        """后台安装依赖组件(白名单内)→ 启动 pip 子进程,进度经 deps_install_status 轮询。
+
+        返回 {'ok','started','pkgs','pip','rejected','log_path','error'}。非白名单组件计入 rejected。
+        """
+        try:
+            allow = self._DEPS_INSTALLABLE
+            req = [str(p).strip() for p in (pkgs or []) if str(p).strip()]
+            picks = [p for p in req if p in allow]
+            rejected = [p for p in req if p not in allow]
+            if not picks:
+                return {'ok': False, 'started': False, 'pkgs': [], 'pip': [],
+                        'rejected': rejected, 'log_path': None,
+                        'error': '未选择可安装的组件(可选:' + '、'.join(sorted(allow)) + ')'}
+            if self._deps_job is not None:
+                proc = self._deps_job.get('proc')
+                if proc is not None and proc.poll() is None:
+                    return {'ok': False, 'started': False, 'pkgs': [], 'pip': [],
+                            'rejected': rejected, 'log_path': self._deps_job.get('log_path'),
+                            'error': '已有安装任务进行中,请等待完成或稍后再试'}
+            pip_names = []
+            for p in picks:
+                pip_names += list(allow[p]['pip'])
+            log_path = os.path.join(tempfile.gettempdir(),
+                                    f'vcstudio_deps_{int(time.time())}.log')
+            runner = self._deps_runner or self._default_deps_runner
+            proc = runner(pip_names, log_path)
+            self._deps_job = {'proc': proc, 'log_path': log_path, 'pkgs': picks,
+                              'pip': pip_names, 'started_at': time.time()}
+            return {'ok': True, 'started': True, 'pkgs': picks, 'pip': pip_names,
+                    'rejected': rejected, 'log_path': log_path, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'started': False, 'pkgs': [], 'pip': [],
+                    'rejected': [], 'log_path': None, 'error': str(e)}
+
+    def deps_install_status(self):
+        """轮询后台安装进度 → {'ok','active','running','done','returncode','log_tail','pkgs','error'}。
+
+        无任务 → active=False;done 且 returncode==0 视为成功(前端据此刷新 deps_status)。
+        """
+        try:
+            job = self._deps_job
+            if not job:
+                return {'ok': True, 'active': False, 'running': False, 'done': False,
+                        'returncode': None, 'log_tail': '', 'pkgs': [], 'error': None}
+            proc = job.get('proc')
+            rc = proc.poll() if proc is not None else None
+            running = rc is None
+            tail = ''
+            try:
+                if os.path.isfile(job['log_path']):
+                    txt = open(job['log_path'], encoding='utf-8', errors='replace').read()
+                    tail = '\n'.join(txt.splitlines()[-40:])
+            except Exception:                             # noqa: BLE001
+                tail = ''
+            return {'ok': True, 'active': True, 'running': running, 'done': not running,
+                    'returncode': rc, 'log_tail': tail, 'pkgs': list(job.get('pkgs') or []),
+                    'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'active': False, 'running': False, 'error': str(e)}
+
+    def overview_stats(self):
+        """概览页核时四卡:近30天作业数 / 近30天核时(估算)/ 剩余核时 / 实时监控状态。
+
+        作业数与 30 天窗口取台账 created_at;核时/剩余取 campaign 预算(cap − 估算已花)。
+        返回 {'ok','jobs_30d','jobs_total','core_hours_30d','remaining_core_hours',
+        'budget_cap','monitor':{running,queued,active,status},'error'}。全程 try/except 降级。
+        """
+        try:
+            import datetime
+            entries = list(self._ledger.load_all())
+            now = time.time()
+            cutoff = now - 30 * 86400
+            jobs_total = len(entries)
+            jobs_30d, running, queued = 0, 0, 0
+            for _d, m in entries:
+                if not m:
+                    continue
+                st = m.get('state')
+                if st == 'RUNNING':
+                    running += 1
+                elif st in ('QUEUED', 'SUBMITTED', 'UPLOADED'):
+                    queued += 1
+                ca = m.get('created_at')
+                if ca:
+                    try:
+                        ts = datetime.datetime.fromisoformat(str(ca)).timestamp()
+                        if ts >= cutoff:
+                            jobs_30d += 1
+                    except (ValueError, TypeError):
+                        pass
+            if jobs_30d == 0 and not any((m or {}).get('created_at') for _d, m in entries):
+                jobs_30d = jobs_total          # 无时间戳则回退用总数(不误报 0)
+            cap_total, spent = 0.0, 0.0
+            try:
+                camps = self.campaign_list()
+                for c in (camps.get('campaigns') or []):
+                    bud = c.get('budget') or {}
+                    cap = bud.get('cap')
+                    est = float(bud.get('estimated') or 0.0)
+                    states = c.get('states') or {}
+                    n_tasks = int(c.get('n_tasks') or 0)
+                    done = int(states.get('completed') or 0)
+                    frac = (done / n_tasks) if n_tasks else 0.0
+                    spent += est * frac
+                    if cap not in (None, ''):
+                        cap_total += float(cap)
+            except Exception:                             # noqa: BLE001
+                pass
+            remaining = round(cap_total - spent, 2) if cap_total else None
+            active = running + queued
+            status = ('运行中' if running else ('排队中' if queued else '空闲'))
+            return {'ok': True, 'jobs_30d': jobs_30d, 'jobs_total': jobs_total,
+                    'core_hours_30d': round(spent, 2),
+                    'remaining_core_hours': remaining,
+                    'budget_cap': round(cap_total, 2) if cap_total else None,
+                    'monitor': {'running': running, 'queued': queued, 'active': active,
+                                'status': status}, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'jobs_30d': 0, 'jobs_total': 0, 'core_hours_30d': 0.0,
+                    'remaining_core_hours': None, 'budget_cap': None,
+                    'monitor': {}, 'error': str(e)}
+
+    # ── 波函数页:分析项分组菜单(引擎 ANALYSES + api 层 _EXTRA_ANALYSES 补四种) ──
+    @staticmethod
+    def _script_elf_lol_section(params=None):
+        """ELF/LOL 平面截面图(主功能4→9/10 平面数据 → PNG/PDF)。切面:自动/坐标/三原子。"""
+        p = dict(params or {})
+        func = '9' if str(p.get('func', 'elf')).lower() == 'elf' else '10'
+        plane = str(p.get('plane', 'auto')).lower()
+        lines = ['4', func]
+        if plane == 'atoms' and p.get('atoms'):
+            a = [str(int(x)) for x in p['atoms'][:3]]
+            lines += ['1', ' '.join(a)]              # 由三原子定义平面
+        elif plane == 'xy':
+            lines += ['2', '0']
+        else:
+            lines += ['2', '0']                      # 自动/默认:XY 面 z=0
+        lines += ['0']                               # 后处理:导出图形
+        return '\n'.join(lines) + '\n'
+
+    @staticmethod
+    def _script_adch_charge(params=None):
+        """ADCH 原子电荷(主功能7→11):Hirshfeld-I 基础上的偶极校正原子电荷。"""
+        return '7\n11\n1\ny\n0\nq\n'
+
+    @staticmethod
+    def _script_property_summary(params=None):
+        """性质汇总(主功能100→2 等):单点能 / 偶极矩 / 基本热力学量打印在 stdout。"""
+        return '100\n2\n0\nq\n'
+
+    @staticmethod
+    def _script_fukui_cdft(params=None):
+        """Fukui / CDFT(主功能22):f+/f-/f0 与双描述符 DD 四 cube(需 N-1/N/N+1 波函数)。"""
+        return '22\n1\n\n0\nq\n'
+
+    def _extra_analyses(self):
+        """api 层补充分析注册表(引擎 multiwfn_driver.ANALYSES 暂缺的四种;同 stdin 脚本模式)。
+
+        引擎侧扩展后此表可移除(菜单流已标注版本差异);键不与引擎重复。
+        """
+        return {
+            'elf_lol_section': {
+                'name': 'ELF / LOL 截面图', 'stdin_script': self._script_elf_lol_section,
+                'outputs': ('plane.png', 'plane.pdf'),
+                'note': ('平面截面(切面:自动/坐标/三原子)导出 PNG/PDF。⚠ api 层补充项——'
+                         'multiwfn_driver.ANALYSES 暂无此项,菜单号按 Multiwfn 3.8,版本差异请核对。')},
+            'adch_charge': {
+                'name': 'ADCH 原子电荷', 'stdin_script': self._script_adch_charge,
+                'outputs': (),
+                'note': ('主功能7→11:ADCH(原子偶极校正 Hirshfeld)电荷,结果在 stdout。'
+                         '⚠ api 层补充项,引擎待扩展;版本差异请核对。')},
+            'property_summary': {
+                'name': '性质汇总(单点能/偶极矩/热力学)',
+                'stdin_script': self._script_property_summary, 'outputs': (),
+                'note': ('单点能 / 偶极矩 / 基本热力学量汇总打印。⚠ api 层补充项,引擎待扩展。')},
+            'fukui_cdft': {
+                'name': 'Fukui / CDFT 四 cube', 'stdin_script': self._script_fukui_cdft,
+                'outputs': ('f_plus.cub', 'f_minus.cub', 'f_zero.cub', 'CDD.cub'),
+                'note': ('主功能22:CDFT 概念密度泛函,f+/f−/f0 与双描述符;需 N-1/N/N+1 波函数。'
+                         '⚠ api 层补充项,引擎待扩展;版本差异请核对。')},
+        }
+
+    # 分析项分组(对齐 starpivot:常用 / 实空间与截面 / 弱相互作用 / 其它)
+    _WAVEFN_GROUPS = (
+        ('常用', ('esp_extrema', 'density_cube', 'esp_cube', 'homo_lumo_cube')),
+        ('实空间与截面', ('elf_lol_section', 'alie', 'alie_extrema', 'adch_charge')),
+        ('弱相互作用', ('nci_rdg', 'igmh', 'iri')),
+        ('其它', ('aim_cp', 'property_summary', 'fukui_cdft')),
+    )
+
+    def wavefn_analyses(self):
+        """波函数分析项分组菜单(引擎 ANALYSES + api 层补充)→ {'ok','groups':[{group,items:[{key,
+        name,note,source,outputs}]}],'error'}。source∈{engine,api};其它组收未分组项。"""
+        try:
+            eng = dict(self._mw().ANALYSES)
+            extra = self._extra_analyses()
+            merged = {}
+            for k, v in eng.items():
+                merged[k] = {'key': k, 'name': v.get('name', k), 'note': v.get('note', ''),
+                             'outputs': list(v.get('outputs') or ()), 'source': 'engine'}
+            for k, v in extra.items():
+                if k in merged:
+                    continue                              # 引擎已有则不覆盖
+                merged[k] = {'key': k, 'name': v.get('name', k), 'note': v.get('note', ''),
+                             'outputs': list(v.get('outputs') or ()), 'source': 'api'}
+            placed, groups = set(), []
+            for gname, keys in self._WAVEFN_GROUPS:
+                items = [merged[k] for k in keys if k in merged]
+                for it in items:
+                    placed.add(it['key'])
+                if items:
+                    groups.append({'group': gname, 'items': items})
+            leftover = [merged[k] for k in merged if k not in placed]
+            if leftover:
+                other = next((g for g in groups if g['group'] == '其它'), None)
+                if other:
+                    other['items'].extend(leftover)
+                else:
+                    groups.append({'group': '其它', 'items': leftover})
+            return {'ok': True, 'groups': groups, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'groups': [], 'error': str(e)}
+
+    def wavefn_run_extra(self, wavefn_file, analyses, params=None, exe=None, workdir=None):
+        """跑 api 层补充分析项(elf_lol_section/adch_charge/property_summary/fukui_cdft)。
+
+        用 _EXTRA_ANALYSES 的 stdin 脚本经 multiwfn_driver.run_script(或降级回传脚本)。返回同
+        wavefn_run 形状 {'ok','results':[{analysis,ok,outputs,stdout_tail,script,error}],'error'}。
+        引擎缺失(无 run_script)→ 各项回传可复制 stdin 脚本 + '引擎待扩展' 说明。
+        """
+        try:
+            wf = (wavefn_file or '').strip()
+            keys = [str(a).strip() for a in (analyses or []) if str(a).strip()]
+            if not wf:
+                return {'ok': False, 'results': [], 'error': '未选择波函数文件'}
+            if not keys:
+                return {'ok': False, 'results': [], 'error': '未选择分析项'}
+            extra = self._extra_analyses()
+            mw = self._mw()
+            mw_exe = (exe or self._tool_paths().get('multiwfn') or '').strip() or None
+            wd = (workdir or '').strip() or None
+            p = dict(params or {})
+            results = []
+            for k in keys:
+                spec = extra.get(k)
+                if spec is None:
+                    results.append({'analysis': k, 'ok': False, 'outputs': [],
+                                    'stdout_tail': '', 'script': '',
+                                    'error': f'未知补充分析项 {k!r}'})
+                    continue
+                try:
+                    script = spec['stdin_script'](p)
+                except Exception as e:                    # noqa: BLE001
+                    script = ''
+                    results.append({'analysis': k, 'ok': False, 'outputs': [],
+                                    'stdout_tail': '', 'script': '', 'error': str(e)})
+                    continue
+                runner = getattr(mw, 'run_script', None)
+                if callable(runner):
+                    try:
+                        r = runner(wf, script, exe=mw_exe, workdir=wd,
+                                   outputs=list(spec.get('outputs') or ()))
+                        results.append({'analysis': k, 'ok': bool(r.get('ok')),
+                                        'outputs': list(r.get('outputs') or []),
+                                        'stdout_tail': r.get('stdout_tail', ''),
+                                        'script': r.get('script', script),
+                                        'error': r.get('error') or None})
+                    except Exception as e:                # noqa: BLE001
+                        results.append({'analysis': k, 'ok': False, 'outputs': [],
+                                        'stdout_tail': '', 'script': script, 'error': str(e)})
+                else:
+                    results.append({'analysis': k, 'ok': False, 'outputs': [],
+                                    'stdout_tail': '', 'script': script,
+                                    'error': '引擎待扩展:multiwfn_driver 暂无 run_script,'
+                                             '可复制上方 stdin 脚本手动运行'})
+            return {'ok': any(r['ok'] for r in results), 'results': results, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'results': [], 'error': str(e)}
+
+    @staticmethod
+    def _parse_cube_values(path):
+        """.cub/.cube → (n_atoms, (nx,ny,nz), 扁平体数据 float 列表)。解析失败 → (0,(0,0,0),[])。"""
+        try:
+            with open(path, encoding='utf-8', errors='replace') as f:
+                lines = f.read().splitlines()
+            if len(lines) < 6:
+                return 0, (0, 0, 0), []
+            natoms = int(float(lines[2].split()[0]))
+            nx = int(float(lines[3].split()[0]))
+            ny = int(float(lines[4].split()[0]))
+            nz = int(float(lines[5].split()[0]))
+            data_start = 6 + abs(natoms)
+            vals = []
+            for ln in lines[data_start:]:
+                for tok in ln.split():
+                    try:
+                        vals.append(float(tok))
+                    except ValueError:
+                        pass
+            return abs(natoms), (nx, ny, nz), vals
+        except Exception:                                 # noqa: BLE001
+            return 0, (0, 0, 0), []
+
+    def wavefn_scatter(self, func1_cube, func2_cube, kind='nci', max_points=3000, out_png=None):
+        """NCI/IRI 散点(RDG-sign(λ2)ρ):读两 cube 配对采样 → {'ok','kind','points':[{x,y}],
+        'n','png','error'}。func1=sign(λ2)ρ(x)、func2=RDG(y);前端可 echarts 渲染,给 out_png 则
+        经 native_charts 另出 PNG(缺 matplotlib 则跳过,points 仍返回)。"""
+        try:
+            f1 = (func1_cube or '').strip()
+            f2 = (func2_cube or '').strip()
+            if not f1 or not os.path.isfile(f1):
+                return {'ok': False, 'kind': kind, 'points': [], 'n': 0, 'png': None,
+                        'error': 'sign(λ2)ρ cube(func1)不存在'}
+            if not f2 or not os.path.isfile(f2):
+                return {'ok': False, 'kind': kind, 'points': [], 'n': 0, 'png': None,
+                        'error': 'RDG cube(func2)不存在'}
+            _n1, _d1, xs = self._parse_cube_values(f1)
+            _n2, _d2, ys = self._parse_cube_values(f2)
+            n = min(len(xs), len(ys))
+            if n == 0:
+                return {'ok': False, 'kind': kind, 'points': [], 'n': 0, 'png': None,
+                        'error': '两 cube 无可解析体数据'}
+            step = max(1, n // int(max_points or 3000))
+            points = []
+            for i in range(0, n, step):
+                x, y = xs[i], ys[i]
+                if abs(x) <= 0.05 and 0.0 <= y <= 2.0:   # NCI 典型窗口
+                    points.append({'x': round(x, 5), 'y': round(y, 5)})
+            png = None
+            dest = (out_png or '').strip()
+            if dest and points:
+                try:
+                    nc = self._nc()
+                    xs2 = [p['x'] for p in points]
+                    ys2 = [p['y'] for p in points]
+                    got = nc.scaling_relation(
+                        xs2, ys2, dest, xlabel=r'sign($\lambda_2$)$\rho$ (a.u.)',
+                        ylabel='RDG', fit=False)
+                    png = got[0] if isinstance(got, (list, tuple)) and got else dest
+                except Exception:                         # noqa: BLE001 出图失败不挡数据
+                    png = None
+            return {'ok': True, 'kind': kind, 'points': points, 'n': len(points),
+                    'png': png, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'kind': kind, 'points': [], 'n': 0, 'png': None,
+                    'error': str(e)}
+
+    def wavefn_render_remote(self, scene, files, name, password, remote_dir,
+                             remote_exe='vmd', trust_new=False, params=None):
+        """(实验性)远程集群渲染波函数场景:上传 cube/结构 → 远端 VMD Tachyon → 下载 PNG。
+
+        返回 {'ok','png'(本地),'tcl','experimental':True,'needs_trust','error'}。任一步失败给
+        中文说明;大文件/复杂路径后续完善。VMD 缺 tcl 时回传脚本供手动渲染。
+        """
+        try:
+            import shlex
+            sc = (scene or '').strip()
+            rdir = (remote_dir or '').strip()
+            fmap = dict(files or {})
+            if not sc:
+                return {'ok': False, 'png': None, 'tcl': '', 'experimental': True,
+                        'needs_trust': False, 'error': '未选择渲染场景'}
+            if not rdir:
+                return {'ok': False, 'png': None, 'tcl': '', 'experimental': True,
+                        'needs_trust': False, 'error': '未指定远端工作目录'}
+            vmd = self._vmd_()
+            spec = vmd.SCENES.get(sc)
+            if spec is None:
+                return {'ok': False, 'png': None, 'tcl': '', 'experimental': True,
+                        'needs_trust': False, 'error': f'未知场景 {sc!r}'}
+            for role in (spec.get('files') or ()):
+                lp = (fmap.get(role) or '').strip()
+                if not lp or not os.path.isfile(lp):
+                    return {'ok': False, 'png': None, 'tcl': '', 'experimental': True,
+                            'needs_trust': False, 'error': f'渲染文件「{role}」不存在'}
+            prof, pw, err = self._resolve(name, password)
+            if err:
+                return err
+            conn = self._conn()
+            rexe = (remote_exe or 'vmd').strip() or 'vmd'
+            remote_files = {}
+            for role, lp in fmap.items():
+                remote_files[role] = rdir.rstrip('/') + '/' + os.path.basename(lp)
+            remote_out = rdir.rstrip('/') + '/' + sc + '.png'
+            try:
+                tcl = spec['build'](remote_files, remote_out, dict(params or {}))
+            except Exception as e:                        # noqa: BLE001
+                return {'ok': False, 'png': None, 'tcl': '', 'experimental': True,
+                        'needs_trust': False, 'error': f'场景脚本生成失败:{e}'}
+            try:
+                client, jump = conn.open_client(prof, pw, trust_new=bool(trust_new))
+            except conn.ConnectError as e:
+                return {'ok': False, 'png': None, 'tcl': tcl, 'experimental': True,
+                        'needs_trust': bool(getattr(e, 'needs_trust', False)), 'error': str(e)}
+            local_png = None
+            try:
+                sftp = client.open_sftp()
+                for role, lp in fmap.items():
+                    sftp.put(lp, remote_files[role])
+                tcl_remote = rdir.rstrip('/') + '/_vcs_scene.tcl'
+                with sftp.open(tcl_remote, 'w') as f:
+                    f.write(tcl)
+                cmd = (f'cd {shlex.quote(rdir)} && {rexe} -dispdev text -eofexit '
+                       f'-e _vcs_scene.tcl')
+                _in, out, _err = client.exec_command(cmd, timeout=1800)
+                code = out.channel.recv_exit_status()
+                tail = '\n'.join(out.read().decode('utf-8', errors='replace')
+                                 .splitlines()[-40:])
+                if code == 0:
+                    first = next(iter(fmap.values()))
+                    local_png = os.path.join(os.path.dirname(first), sc + '_remote.png')
+                    try:
+                        sftp.get(remote_out, local_png)
+                    except Exception:                     # noqa: BLE001 下载失败仅记
+                        local_png = None
+                sftp.close()
+            finally:
+                conn.close_quiet(client, jump)
+            ok = local_png is not None and os.path.isfile(local_png)
+            return {'ok': ok, 'png': local_png, 'tcl': tcl, 'experimental': True,
+                    'needs_trust': False,
+                    'error': None if ok else ('远端渲染完成但未取回 PNG(退出码/网络问题):' + tail
+                                              if code == 0 else f'远端 VMD 退出码 {code};{tail}')}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'png': None, 'tcl': '', 'experimental': True,
+                    'needs_trust': False, 'error': str(e)}

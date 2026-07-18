@@ -16,27 +16,43 @@
     if (!pre) return;
     const poscar = val('gen-poscar'), incar = val('gen-incar');
     const calc = val('gen-calc') || 'slab';
+    // 预览区改为可编辑 textarea(用 .value);setTxt 兼容 <pre>/<textarea>
+    const setTxt = t => { if ('value' in pre) pre.value = t; else pre.textContent = t; };
     if (!poscar || !incar) {
       State.previewKey = null;
       pre.style.color = '';
-      pre.textContent = '(选择 POSCAR / INCAR 后自动解析预览)';
+      setTxt('(选择 POSCAR / INCAR 后自动解析预览)');
       return;
     }
     const key = poscar + '\n' + incar + '\n' + calc;
     if (key === State.previewKey) return;   // 相同输入不重复解析(镜像 _preview_memo)
     State.previewKey = key;
     pre.style.color = '';
-    pre.textContent = '正在解析…';
+    setTxt('正在解析…');
     const r = await VCS.call('gen_preview', poscar, incar, calc);
     if (State.previewKey !== key) return;   // 期间用户又改了路径 → 丢弃旧响应
     if (!r || r.ok === false || r.error) {
       pre.style.color = 'var(--fail)';
-      pre.textContent = '预览失败:' + ((r && r.error) || '未知错误');
+      setTxt('预览失败:' + ((r && r.error) || '未知错误'));
       return;
     }
     const s = r.summary || {};
     pre.style.color = '';
-    pre.textContent = [s.poscar, s.incar].filter(Boolean).join('\n\n') || '(无预览内容)';
+    setTxt([s.poscar, s.incar].filter(Boolean).join('\n\n') || '(无预览内容)');
+  }
+
+  // 保存预览到文件(可编辑预览区内容 → save_text)
+  async function savePreview() {
+    const pre = $('gen-preview');
+    const txt = pre ? ('value' in pre ? pre.value : pre.textContent) : '';
+    if (!txt || !txt.trim()) { VCS.log('预览为空,无内容可保存', 'failc'); return; }
+    const d = await VCS.call('pick_dir');
+    if (!d || !d.path) return;
+    const sep = d.path.indexOf('\\') >= 0 ? '\\' : '/';
+    const dest = d.path + sep + 'preview.txt';
+    const r = await VCS.call('save_text', dest, txt);
+    if (r && r.ok) { VCS.log('预览已保存:' + r.path, 'okc'); VCS.toast('已保存预览'); }
+    else VCS.log('保存失败:' + ((r && r.error) || '未知'), 'failc');
   }
 
   // ── 浏览:pick_file(文件)/ pick_dir(目录)→ 回填输入;取消(path=null)不改值、不崩 ──
@@ -57,10 +73,11 @@
     const poscar = val('gen-poscar'), incar = val('gen-incar');
     const out = val('gen-out'), lib = val('gen-lib');
     const calc = val('gen-calc') || 'slab';
+    const extraKw = val('gen-extra-kw');
     if (btn) btn.disabled = true;
     VCS.log('生成中(' + calc + ')…');
     try {
-      const r = await VCS.call('gen_run', poscar, incar, out, lib, calc);
+      const r = await VCS.call('gen_run', poscar, incar, out, lib, calc, extraKw);
       if (!r || r.ok === false || r.error) {
         VCS.log('生成失败:' + ((r && r.error) || '未知错误'), 'failc');
         return;
@@ -276,6 +293,47 @@
     }
   }
 
+  // ── 计算活动模板(SAC 卡):选模板 → instantiate 全链 DAG ──
+  const CampState = { templates: [] };
+  async function loadCampaignTemplates() {
+    const sel = $('camp-tpl-sel');
+    if (!sel) return;
+    const r = await VCS.call('campaign_templates');
+    CampState.templates = (r && r.templates) || [];
+    sel.innerHTML = '<option value="">不使用模板(仅建吸附能项目矩阵)</option>' +
+      CampState.templates.map(t => `<option value="${VCS.esc(t.key)}">${VCS.esc(t.name_zh)}</option>`).join('');
+  }
+  function onCampTplChange() {
+    const sel = $('camp-tpl-sel');
+    const desc = $('camp-tpl-desc');
+    if (!sel || !desc) return;
+    const t = CampState.templates.find(x => x.key === sel.value);
+    if (!t) { desc.hidden = true; return; }
+    desc.hidden = false;
+    desc.innerHTML = `<b>${VCS.esc(t.name_zh)}</b>:${VCS.esc(t.description)}<br>` +
+      `阶段数 ${t.n_stages} · 汇总 ${(t.analyses || []).join('、')} · 图场景 ${VCS.esc(t.figures_scenario || '—')}`;
+  }
+  async function instantiateCampaign() {
+    const sel = $('camp-tpl-sel');
+    const key = sel ? sel.value : '';
+    if (!key) { VCS.log('请先选计算活动模板', 'failc'); return; }
+    const p = sacParams();
+    const out = val('sac-out');
+    if (!p.metals.length || !p.templates.length) { VCS.log('请先在下方选金属与配位模板', 'failc'); return; }
+    if (!out) { VCS.log('请选输出根目录', 'failc'); return; }
+    const systems = [];
+    p.metals.forEach(m => p.templates.forEach(t => systems.push(m + '@' + t)));
+    const spec = { systems: systems, adsorbates: p.ads, clean: true };
+    if (!await VCS.confirm('将按模板「' + sel.options[sel.selectedIndex].text + '」生成 ' +
+      systems.length + ' 体系的全链任务 DAG(relax→静态→频率→汇总)。继续?')) return;
+    VCS.log('按模板实例化全链 DAG…');
+    const r = await VCS.call('campaign_instantiate', key, spec, out, null);
+    if (!r || r.ok === false || r.error) { VCS.log('实例化失败:' + ((r && r.error) || '未知'), 'failc'); return; }
+    const est = (r.estimate && r.estimate.total) || 0;
+    VCS.log('已生成全链 DAG:' + r.n_jobs + ' 个作业,约 ' + est + ' 核时 → ' + r.campaign_dir, 'okc');
+    VCS.toast('已按模板生成全链批次');
+  }
+
   // ── 初始化:回填上次路径 + 首帧预览,绑定浏览/生成/输入监听 ──
   function wire(id, fn) { const el = $(id); if (el) el.addEventListener('click', fn); }
 
@@ -306,6 +364,11 @@
     wire('sac-out-btn', () => pickDir('sac-out'));
     wire('sac-preview-btn', sacPreview);
     wire('sac-gen-btn', sacGenerate);
+    // 计算活动模板 + 预览保存
+    loadCampaignTemplates();
+    { const el = $('camp-tpl-sel'); if (el) el.addEventListener('change', onCampTplChange); }
+    wire('camp-tpl-inst', instantiateCampaign);
+    wire('gen-preview-save', savePreview);
     // 多自旋并跑:浏览/生成
     wire('spin-poscar-btn', () => pickFile('spin-poscar', 'poscar'));
     wire('spin-incar-btn', () => pickFile('spin-incar', 'incar'));

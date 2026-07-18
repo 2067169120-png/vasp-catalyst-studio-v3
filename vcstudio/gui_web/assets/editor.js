@@ -106,6 +106,7 @@
       // 测量选点高亮(青)
       State.measure.picks.forEach(i => viewer.setStyle({ serial: i },
         { sphere: { scale: 0.45, color: '#28C7E0' }, stick: { radius: 0.16 } }));
+      if (State.hideH) viewer.setStyle({ elem: 'H' }, {});   // 切换氢:隐藏 H(不改索引)
       if (State.labels) {
         for (let i = 0; i < State.struct.elements.length; i++) {
           const c = State.struct.coords[i];
@@ -306,9 +307,11 @@
     return [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
   }
   function norm(v) { return Math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); }
+  function cross(a, b) { return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]; }
+  function dot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
   function measureClick(i) {
     let p = State.measure.picks;
-    if (p.length >= 3) p = [];
+    if (p.length >= 4) p = [];       // 测量扩到 4 原子二面角
     p.push(i);
     State.measure.picks = p;
     const bar = $('ed-measbar');
@@ -317,9 +320,15 @@
       if (bar) bar.textContent = `键长 #${p[0]}–#${p[1]} = ${d.toFixed(3)} Å(再点 1 个原子测键角)`;
     } else if (p.length === 3) {
       const v1 = vec(p[1], p[0]), v2 = vec(p[1], p[2]);
-      const cos = (v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2]) / (norm(v1) * norm(v2) || 1);
+      const cos = dot(v1, v2) / (norm(v1) * norm(v2) || 1);
       const ang = Math.acos(Math.max(-1, Math.min(1, cos))) * 180 / Math.PI;
-      if (bar) bar.textContent = `键角 #${p[0]}–#${p[1]}–#${p[2]} = ${ang.toFixed(2)}°(顶点=中间原子;点原子重新测量)`;
+      if (bar) bar.textContent = `键角 #${p[0]}–#${p[1]}–#${p[2]} = ${ang.toFixed(2)}°(再点 1 个原子测二面角)`;
+    } else if (p.length === 4) {
+      const b1 = vec(p[0], p[1]), b2 = vec(p[1], p[2]), b3 = vec(p[2], p[3]);
+      const n1 = cross(b1, b2), n2 = cross(b2, b3);
+      const m1 = cross(n1, [b2[0] / (norm(b2) || 1), b2[1] / (norm(b2) || 1), b2[2] / (norm(b2) || 1)]);
+      const dih = Math.atan2(dot(m1, n2), dot(n1, n2)) * 180 / Math.PI;
+      if (bar) bar.textContent = `二面角 #${p[0]}–#${p[1]}–#${p[2]}–#${p[3]} = ${dih.toFixed(2)}°(点原子重新测量)`;
     } else if (bar) {
       bar.textContent = `已选 #${i};再点 1 个原子测键长`;
     }
@@ -417,6 +426,55 @@
     VCS.toast('已送去 ② 生成输入');
   }
 
+  // ── 切换氢显示 ──
+  function toggleHydrogens() {
+    State.hideH = !State.hideH;
+    const btn = $('ed-hydrogens');
+    if (btn) btn.classList.toggle('on', State.hideH);
+    render3D();
+  }
+
+  // ── 输入原子坐标(粘贴 xyz 文本 → 载入编辑器)──
+  function pasteXyz() {
+    const box = document.createElement('div');
+    box.innerHTML = '<div class="sub" style="margin-bottom:6px">每行一个原子:元素 x y z(单位 Å);' +
+      '可含/不含 XYZ 头两行。</div>' +
+      '<textarea id="ed-xyz-ta" class="ipt" rows="10" spellcheck="false" ' +
+      'placeholder="O   0.000   0.000   0.000&#10;H   0.757   0.586   0.000&#10;H  -0.757   0.586   0.000"></textarea>';
+    const m = VCS.modal({
+      title: '输入原子坐标(xyz)', body: box,
+      actions: [
+        { label: '取消', quiet: true, onClick: h => h.close() },
+        { label: '载入', primary: true, onClick: h => { if (applyXyz(box)) h.close(); } },
+      ],
+    });
+    const ta = box.querySelector('#ed-xyz-ta');
+    if (ta) ta.focus();
+  }
+  function applyXyz(box) {
+    const txt = (box.querySelector('#ed-xyz-ta') || {}).value || '';
+    const elements = [], coords = [];
+    txt.split('\n').forEach(line => {
+      const p = line.trim().split(/[\s,]+/);
+      if (p.length >= 4 && /^[A-Za-z]{1,2}$/.test(p[0])) {
+        const x = parseFloat(p[1]), y = parseFloat(p[2]), z = parseFloat(p[3]);
+        if (isFinite(x) && isFinite(y) && isFinite(z)) {
+          elements.push(p[0][0].toUpperCase() + (p[0][1] || '').toLowerCase());
+          coords.push([x, y, z]);
+        }
+      }
+    });
+    if (!elements.length) { VCS.log('未解析到有效原子行(元素 x y z)', 'failc'); return false; }
+    const counts = {};
+    elements.forEach(e => { counts[e] = (counts[e] || 0) + 1; });
+    const formula = Object.keys(counts).map(e => e + (counts[e] > 1 ? counts[e] : '')).join('');
+    setStruct({ elements: elements, coords: coords, fixed: elements.map(() => false), formula: formula },
+      null, null);
+    VCS.log('已载入粘贴坐标:' + elements.length + ' 原子(' + formula + ')', 'okc');
+    VCS.toast('已载入 ' + elements.length + ' 原子');
+    return true;
+  }
+
   // ── 分子库浏览 ──
   async function loadMolecules() {
     const box = $('mol-grid');
@@ -447,6 +505,8 @@
     wire('ed-reset', resetView);
     wire('ed-bg', toggleBg);
     wire('ed-labels', toggleLabels);
+    wire('ed-hydrogens', toggleHydrogens);
+    wire('ed-paste-xyz', pasteXyz);
     wire('ed-measure', toggleMeasure);
     wire('ed-img', saveImage);
     wire('ed-selall', selectAll);

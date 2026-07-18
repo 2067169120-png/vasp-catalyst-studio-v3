@@ -3698,3 +3698,969 @@ def test_derive_aimd_engine_failure_caught(tmp_path):
               ledger_mod=_fake_ledger_register([]))
     out = api.derive_aimd(str(tmp_path))
     assert out['ok'] is False and 'INCAR' in out['error']
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v3.1 GUI 总装:全 DFT 任务目录 / 一键出图管线 / AI 三能力 / starpivot 对齐
+# ══════════════════════════════════════════════════════════════════════════════
+def _fake_task_catalog():
+    m = types.SimpleNamespace()
+    m.CATEGORIES = ('基础', '电子结构', '热力学与动力学', '性质', '收敛与校验')
+    m.list_catalog = lambda category=None: [
+        {'key': 'relax', 'name_zh': '结构优化', 'category': '基础',
+         'description': '弛豫', 'requires': 'POSCAR', 'outputs': 'CONTCAR', 'figure': None},
+        {'key': 'eos', 'name_zh': '状态方程', 'category': '性质',
+         'description': 'BM3', 'requires': '平衡结构', 'outputs': 'E-V', 'figure': 'eos'},
+    ]
+    return m
+
+
+def _fake_u_library():
+    m = types.SimpleNamespace()
+    m.suggest_u = lambda els: [{'element': e, 'u': 4.0, 'l': 2, 'orbital': 'd',
+                                'source': 'MP', 'note': '敏感性测试'} for e in els if e in ('Fe', 'Co')]
+    m.ldau_keys = lambda sugg, order: {'LDAU': True, 'LDAUTYPE': 2,
+                                       'LDAUL': ' '.join('2' if e in {s['element'] for s in sugg} else '-1' for e in order)}
+    return m
+
+
+def _fake_conv_scan(*, calls=None, series=None, analyze_ret=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _series_ret(out_root):
+        s = series if series is not None else [
+            {'value': 400, 'label': '400 eV', 'dir': os.path.join(out_root, 'encut_400')},
+            {'value': 500, 'label': '500 eV', 'dir': os.path.join(out_root, 'encut_500')}]
+        return {'out_root': out_root, 'dirs': {}, 'series': s, 'results': {}, 'warnings': []}
+    m.build_encut_series = lambda src, out_root, values=None: (
+        calls.__setitem__('encut', {'src': src, 'values': values}) or _series_ret(out_root))
+    m.build_kmesh_series = lambda src, out_root, meshes: (
+        calls.__setitem__('kmesh', {'meshes': meshes}) or _series_ret(out_root))
+    m.build_vacuum_series = lambda src, out_root, vacuums: (
+        calls.__setitem__('vacuum', {'vacuums': vacuums}) or _series_ret(out_root))
+    m.build_slab_thickness_series = lambda src, out_root, layers, **kw: (
+        calls.__setitem__('thick', {'layers': layers}) or _series_ret(out_root))
+    m.analyze_series = lambda dirs, **kw: (analyze_ret if analyze_ret is not None else {
+        'points': [{'x': 400, 'energy': -10.0, 'converged': False},
+                   {'x': 500, 'energy': -10.001, 'converged': True}],
+        'converged_at': 500, 'threshold_mev': 1.0, 'natoms': 4, 'note': '收敛点 x=500'})
+    m.conv_plot = lambda pts, out, **kw: (calls.__setitem__('conv_plot', out) or [out])
+    return m
+
+
+def _fake_bands_builder(*, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _build(src, out_root, *, lattice=None, npoints=40):
+        calls['bands'] = {'src': src, 'out': out_root, 'lattice': lattice, 'npoints': npoints}
+        return {'out_dir': out_root, 'lattice': lattice or 'fcc',
+                'changes': [{'key': 'ICHARG', 'new': '11'}], 'warnings': []}
+    m.build_bands_job = _build
+    return m
+
+
+def _fake_cell_opt(*, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _build(src, out_dir, *, bump_encut=False, **kw):
+        calls['cellopt'] = {'src': src, 'out': out_dir, 'bump_encut': bump_encut}
+        return {'out_dir': out_dir, 'changes': [{'key': 'ISIF', 'new': '3'}], 'warnings': []}
+    m.build_cellopt_job = _build
+    return m
+
+
+def _fake_eos_mod(*, calls=None, fit=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.DEFAULT_SCALES = (0.96, 0.98, 1.0, 1.02, 1.04)
+
+    def _build(src, out_root, scales=None):
+        s = scales if scales is not None else list(m.DEFAULT_SCALES)
+        calls['eos'] = {'src': src, 'scales': s}
+        return {'out_root': out_root, 'dirs': {}, 'warnings': [],
+                'series': [{'scale': sc, 'volume': 100 * sc,
+                            'dir': os.path.join(out_root, f'eos_{sc}')} for sc in s]}
+    m.build_eos_series = _build
+    m.fit_birch_murnaghan = lambda vols, ens: (fit if fit is not None else {
+        'v0': 100.0, 'e0': -10.5, 'b0_gpa': 200.0, 'b0_prime': 4.0, 'r2': 0.999,
+        'b0_evA3': 1.25})
+    m.eos_plot = lambda pts, fit, out, **kw: (calls.__setitem__('eos_plot', out) or [out])
+    return m
+
+
+def _fake_workfunction(*, calls=None, wf_ret=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _build(src, out_root, *, add_dipole='auto'):
+        calls['wf'] = {'src': src, 'out': out_root, 'add_dipole': add_dipole}
+        return {'out_dir': out_root, 'changes': [{'key': 'LVTOT', 'new': 'T'}],
+                'warnings': [], 'dipole': True}
+    m.build_workfunction_job = _build
+    m.parse_locpot_planar = lambda locpot, axis='z': {'z': [0, 1, 2], 'v_planar': [1, 5, 1], 'axis': axis}
+    m.work_function = lambda v, z, ef, **kw: (wf_ret if wf_ret is not None else {
+        'phi': 4.5, 'vacuum_level': 0.0, 'phi_values': [4.5], 'note': '', 'warnings': []})
+    m.wf_plot = lambda v, z, ef, out, **kw: (calls.__setitem__('wf_plot', out) or [out])
+    return m
+
+
+def _fake_surface_energy(*, area=100.0, gamma=1.23, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.area_from_poscar = lambda text: area
+    m.surface_energy = lambda e_slab, n_slab, e_bpa, a, **kw: (
+        calls.__setitem__('se', {'e_slab': e_slab, 'n_slab': n_slab, 'e_bpa': e_bpa, 'a': a}) or gamma)
+    return m
+
+
+def _fake_dimer(*, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _build(src, out_root, *, amplitude=None, displaced_poscar=None, **kw):
+        calls['dimer'] = {'src': src, 'amplitude': amplitude, 'displaced': displaced_poscar}
+        return {'out_dir': out_root, 'changes': [{'key': 'ICHAIN', 'new': '2'}],
+                'warnings': [], 'modecar_method': 'random'}
+    m.build_dimer_job = _build
+    return m
+
+
+def _fake_bands_parse(*, gap=None, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.parse_bands = lambda src, efermi=None: {'bands': [], 'kpath': [],
+                                              'gap': gap if gap is not None else
+                                              {'value': 1.2, 'direct': True, 'metal': False, 'note': ''}}
+    m.band_plot = lambda data, out, **kw: (calls.__setitem__('band_plot', out) or [out])
+    return m
+
+
+def _fake_auto_figures(*, ret=None, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _run(proj, scenario, out_dir, *, journal='nature', **kw):
+        calls['run'] = {'scenario': scenario, 'journal': journal,
+                        'compose_panel': kw.get('compose_panel')}
+        return ret if ret is not None else {
+            'ok': True, 'out_dir': os.path.join(out_dir, 'figures'),
+            'files': [os.path.join(out_dir, 'figures', 'adsorption_bar.png')],
+            'panel': {'files': ['panel.png'], 'n': 1}, 'manifest': [{'key': 'adsorption_bar'}],
+            'error': None}
+    m.run_auto_figures = _run
+    return m
+
+
+def _fake_campaign_tpl(*, templates=None, inst_ret=None, next_ret=None, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.list_templates = lambda: (templates if templates is not None else {
+        'sac_lis_screening': {'name_zh': 'SAC 锂硫筛选', 'description': '全链',
+                              'figures_scenario': 'lis', 'n_stages': 3, 'analyses': ['delta_e']}})
+
+    def _inst(key, spec, out_root, *, title=None, **kw):
+        calls['inst'] = {'key': key, 'spec': dict(spec), 'out_root': out_root, 'title': title}
+        return inst_ret if inst_ret is not None else {
+            'campaign_dir': os.path.join(out_root, '.camp', key),
+            'stages': {'relax': 2}, 'n_jobs': 2, 'estimate': {'total': 96.0},
+            'figures_scenario': 'lis'}
+    m.instantiate = _inst
+    m.next_derivations = lambda cdir: list(next_ret or [])
+    m.mark_derived = lambda cdir, src, derive: calls.setdefault(
+        'marked', []).append((src, derive)) or {'ok': True}
+    return m
+
+
+def _fake_solvation(*, calls=None, build_ret=None, boom=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.SOLVENT_PRESETS = {'lis_electrolyte': [('DOL', 2), ('DME', 1)],
+                         'dol_only': [('DOL', 3)]}
+
+    def _build(core='Li2S3', solvents=(('DOL', 2),), *, box=18.0, min_sep=2.5, seed=42):
+        calls['build'] = {'core': core, 'solvents': solvents, 'box': box, 'seed': seed}
+        if boom:
+            raise boom
+        return build_ret if build_ret is not None else {
+            'poscar': 'solvated\n1.0\n...\n', 'n_atoms': 42, 'note': '核 Li2S3 + 2×DOL + 1×DME'}
+    m.build_solvated_complex = _build
+    return m
+
+
+def _fake_paper_data(*, extract_ret=None, cmp_ret=None, md_ret='## 文献对照\n', calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _extract(text, *, transport=None, **kw):
+        calls['extract'] = {'text': text, 'transport': transport}
+        return extract_ret if extract_ret is not None else {
+            'ok': True, 'tables': [{'label': 'T1', 'kind': 'E_ads', 'columns': [],
+                                    'rows': [{'system': 'Fe@N4', 'species': 'Li2S4',
+                                              'value_ev': -1.5, 'page_hint': 3}]}], 'error': None}
+    m.extract_data_tables = _extract
+    m.build_reference_dataset = lambda tables: (
+        calls.__setitem__('refset', tables) or {'entries': [
+            {'system': 'Fe@N4', 'species': 'Li2S4', 'quantity': 'E_ads', 'ref_value': -1.5}]})
+
+    def _compare(ref, computed):
+        calls['compare'] = {'ref': ref, 'computed': list(computed)}
+        return cmp_ret if cmp_ret is not None else {
+            'pairs': [{'system': 'Fe@N4', 'species': 'Li2S4', 'ref': -1.5, 'ours': -1.4,
+                       'delta': 0.1, 'abs_delta': 0.1}],
+            'mae': 0.1, 'rmse': 0.1, 'n': 1, 'worst': [], 'unmatched': [],
+            'summary_zh': '共比对 1 项:MAE = 0.100 eV'}
+    m.compare_with_computed = _compare
+    m.mae_report_md = lambda cmp: md_ret
+    return m
+
+
+def _fake_variant_advisor(*, suggest_ret=None, plan_ret=None, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _suggest(spec):
+        calls['suggest'] = spec
+        return suggest_ret if suggest_ret is not None else {
+            'variants': [{'kind': 'metal_swap', 'from': 'Fe', 'to': 'Co', 'metal': 'Co',
+                          'template': 'N4', 'parent': 'Fe@N4', 'priority': 0,
+                          'rationale_zh': '同族替换'}],
+            'matrix_spec': {'metals': ['Co'], 'templates': ['N4']}}
+    m.suggest_variants = _suggest
+    m.variant_campaign_plan = lambda variants, *, budget_cap_hours=None: (
+        plan_ret if plan_ret is not None else {
+            'n_jobs': len(variants), 'estimate_hours': 48.0,
+            'batches': [{'batch': 1, 'priority': 0, 'jobs': ['Co@N4'], 'n_jobs': 1,
+                         'estimate_hours': 48.0, 'reason': '锚定近邻'}],
+            'note': f'共 {len(variants)} 个变体'})
+    return m
+
+
+def _fake_manuscript(*, build_ret=None, stats_ret=None, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _build(proj, comparison=None, figures_manifest=None, *, lang='zh', fmt='markdown'):
+        calls['build'] = {'fmt': fmt, 'has_comparison': comparison is not None}
+        return build_ret if build_ret is not None else {
+            'ok': True, 'path': '/out/manuscript_zh.md', 'md_path': '/out/manuscript_zh.md',
+            'sections': ['摘要', '引言'], 'placeholders_count': 5, 'docx_path': None,
+            'docx_available': False}
+    m.build_manuscript = _build
+    m.draft_stats = lambda path: (stats_ret if stats_ret is not None else {
+        'auto': 10, 'placeholder': 5, 'total': 15, 'auto_ratio': 0.667})
+    return m
+
+
+# ── task_catalog / u_suggest ──────────────────────────────────────────────────
+def test_task_catalog_shape():
+    api = Api(task_catalog_mod=_fake_task_catalog())
+    out = api.task_catalog()
+    assert out['ok'] is True and '性质' in out['categories']
+    keys = {t['key'] for t in out['tasks']}
+    assert 'relax' in keys and 'eos' in keys
+    assert out['tasks'][0]['name_zh'] == '结构优化'
+
+
+def test_task_catalog_error_caught():
+    boom = types.SimpleNamespace(
+        CATEGORIES=(), list_catalog=lambda *a, **k: (_ for _ in ()).throw(RuntimeError('坏表')))
+    api = Api(task_catalog_mod=boom)
+    out = api.task_catalog()
+    assert out['ok'] is False and '坏表' in out['error']
+
+
+def test_u_suggest_returns_values_missing_and_incar_keys():
+    api = Api(u_library_mod=_fake_u_library())
+    out = api.u_suggest(['Fe', 'Co', 'Xx'])
+    assert out['ok'] is True and len(out['suggestions']) == 2
+    assert out['missing'] == ['Xx']              # 库内无经验 U,不编造
+    assert out['incar_keys']['LDAU'] is True
+    assert out['suggestions'][0]['source'] == 'MP'
+
+
+def test_u_suggest_error_caught():
+    boom = types.SimpleNamespace(
+        suggest_u=lambda els: (_ for _ in ()).throw(RuntimeError('U 库坏')))
+    api = Api(u_library_mod=boom)
+    out = api.u_suggest(['Fe'])
+    assert out['ok'] is False and 'U 库坏' in out['error']
+
+
+# ── derive_task 分发 ──────────────────────────────────────────────────────────
+def test_derive_task_cellopt_registers(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    registered, calls = [], {}
+    api = Api(cell_opt_mod=_fake_cell_opt(calls=calls),
+              ledger_mod=_fake_ledger_register(registered))
+    out = api.derive_task('cellopt', str(tmp_path))
+    assert out['ok'] is True and out['job_dirs'][0].endswith('_cellopt')
+    assert registered == out['job_dirs']
+    assert calls['cellopt']['bump_encut'] is True
+
+
+def test_derive_task_electronic_elf(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    calls = {}
+    api = Api(estatic_mod=_fake_estatic(calls=calls), ledger_mod=_fake_ledger_register([]))
+    out = api.derive_task('elf', str(tmp_path))
+    assert out['ok'] is True and out['job_dirs'][0].endswith('_elf')
+    assert calls['purposes'] == ['elf']
+
+
+def test_derive_task_bands_passes_params(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    calls = {}
+    api = Api(bands_mod=_fake_bands_builder(calls=calls), ledger_mod=_fake_ledger_register([]))
+    out = api.derive_task('bands', str(tmp_path), {'lattice': 'bcc', 'npoints': 60})
+    assert out['ok'] is True and out['lattice'] == 'bcc'
+    assert calls['bands']['npoints'] == 60
+
+
+def test_derive_task_eos_series_registers_all(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    registered, calls = [], {}
+    api = Api(eos_mod=_fake_eos_mod(calls=calls), ledger_mod=_fake_ledger_register(registered))
+    out = api.derive_task('eos', str(tmp_path), {'scales': [0.98, 1.0, 1.02]})
+    assert out['ok'] is True and len(out['job_dirs']) == 3
+    assert len(registered) == 3 and out['series'][0]['scale'] == 0.98
+    assert calls['eos']['scales'] == [0.98, 1.0, 1.02]
+
+
+def test_derive_task_workfunction(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    api = Api(workfunction_mod=_fake_workfunction(), ledger_mod=_fake_ledger_register([]))
+    out = api.derive_task('workfunction', str(tmp_path))
+    assert out['ok'] is True and out['job_dirs'][0].endswith('_wf') and out['dipole'] is True
+
+
+def test_derive_task_dimer_amplitude(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    calls = {}
+    api = Api(dimer_mod=_fake_dimer(calls=calls), ledger_mod=_fake_ledger_register([]))
+    out = api.derive_task('dimer', str(tmp_path), {'amplitude': 0.02})
+    assert out['ok'] is True and calls['dimer']['amplitude'] == 0.02
+
+
+def test_derive_task_conv_encut_series(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    registered, calls = [], {}
+    api = Api(conv_scan_mod=_fake_conv_scan(calls=calls),
+              ledger_mod=_fake_ledger_register(registered))
+    out = api.derive_task('conv_encut', str(tmp_path), {'values': [400, 500]})
+    assert out['ok'] is True and len(out['job_dirs']) == 2 and len(registered) == 2
+    assert calls['encut']['values'] == [400, 500]
+
+
+def test_derive_task_conv_kmesh_defaults(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    calls = {}
+    api = Api(conv_scan_mod=_fake_conv_scan(calls=calls), ledger_mod=_fake_ledger_register([]))
+    out = api.derive_task('conv_kmesh', str(tmp_path))
+    assert out['ok'] is True and calls['kmesh']['meshes'][0] == [3, 3, 1]
+
+
+def test_derive_task_freq_delegates(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    api = Api(freq_builder_mod=_fake_freq(), ledger_mod=_fake_ledger_register([]))
+    out = api.derive_task('freq', str(tmp_path))
+    assert out['ok'] is True and out['job_dirs'][0].endswith('_freq')
+
+
+def test_derive_task_aimd_delegates(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    calls = {}
+    api = Api(aimd_mod=_fake_aimd(calls=calls), ledger_mod=_fake_ledger_register([]))
+    out = api.derive_task('aimd', str(tmp_path), {'temp_k': 500, 'steps': 5000})
+    assert out['ok'] is True and out['job_dirs'][0].endswith('_aimd')
+    assert calls['build']['temp_k'] == 500.0
+
+
+def test_derive_task_unsupported_key(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    api = Api()
+    out = api.derive_task('adsorption_project', str(tmp_path))
+    assert out['ok'] is False and '不支持' in out['error']
+
+
+def test_derive_task_missing_dir():
+    api = Api()
+    out = api.derive_task('cellopt', '/no/such/dir')
+    assert out['ok'] is False and '不存在' in out['error']
+
+
+# ── analyze_task ──────────────────────────────────────────────────────────────
+def _write_poscar(d, cell=10.0, natoms=2):
+    (d / 'POSCAR').write_text(
+        f'demo\n1.0\n{cell} 0 0\n0 {cell} 0\n0 0 {cell}\nSi\n{natoms}\nCartesian\n'
+        + '0 0 0\n' * natoms, encoding='utf-8')
+
+
+def test_analyze_task_conv(tmp_path):
+    for x in ('encut_400', 'encut_500'):
+        (tmp_path / x).mkdir()
+    calls = {}
+    api = Api(conv_scan_mod=_fake_conv_scan(calls=calls))
+    out = api.analyze_task(str(tmp_path), kind='conv')
+    assert out['ok'] is True and out['kind'] == 'conv'
+    assert out['result']['converged_at'] == 500
+    assert out['figure'] and out['figure'].endswith('convergence.png')
+
+
+def test_analyze_task_eos_fits(tmp_path):
+    for i, sc in enumerate((0.98, 1.0, 1.02)):
+        sub = tmp_path / f'eos_{sc}'
+        sub.mkdir()
+        _write_poscar(sub, cell=10.0 + i)
+        (sub / 'OSZICAR').write_text(f'1 F= x E0= -{10 + i * 0.1:.6f}E+00 dE=0\n', encoding='utf-8')
+    api = Api(eos_mod=_fake_eos_mod())
+    out = api.analyze_task(str(tmp_path), kind='eos')
+    assert out['ok'] is True and out['result']['b0_gpa'] == 200.0
+    assert 'V0' in out['summary'] and out['figure'].endswith('eos.png')
+
+
+def test_analyze_task_eos_insufficient(tmp_path):
+    sub = tmp_path / 'eos_1.0'
+    sub.mkdir()
+    _write_poscar(sub)          # 缺 OSZICAR → 能量 None
+    api = Api(eos_mod=_fake_eos_mod())
+    out = api.analyze_task(str(tmp_path), kind='eos')
+    assert out['ok'] is False and '≥3' in out['error']
+
+
+def test_analyze_task_bands_gap(tmp_path):
+    (tmp_path / 'EIGENVAL').write_text('eigen', encoding='utf-8')
+    (tmp_path / 'OUTCAR').write_text(' E-fermi :   3.1234  XC\n', encoding='utf-8')
+    api = Api(bands_parse_mod=_fake_bands_parse())
+    out = api.analyze_task(str(tmp_path), kind='bands')
+    assert out['ok'] is True and out['result']['gap']['value'] == 1.2
+    assert '带隙 = 1.200 eV' in out['summary'] and '直接' in out['summary']
+
+
+def test_analyze_task_workfunction(tmp_path):
+    (tmp_path / 'LOCPOT').write_text('locpot', encoding='utf-8')
+    (tmp_path / 'OUTCAR').write_text(' E-fermi :   1.5  XC\n', encoding='utf-8')
+    api = Api(workfunction_mod=_fake_workfunction())
+    out = api.analyze_task(str(tmp_path), kind='workfunction')
+    assert out['ok'] is True and out['result']['phi'] == 4.5
+    assert 'φ = 4.500 eV' in out['summary']
+
+
+def test_analyze_task_workfunction_needs_efermi(tmp_path):
+    (tmp_path / 'LOCPOT').write_text('locpot', encoding='utf-8')
+    api = Api(workfunction_mod=_fake_workfunction())
+    out = api.analyze_task(str(tmp_path), kind='workfunction')
+    assert out['ok'] is False and 'E-fermi' in out['error']
+
+
+def test_analyze_task_unknown_kind(tmp_path):
+    api = Api()
+    out = api.analyze_task(str(tmp_path), kind='nope')
+    assert out['ok'] is False and '无法识别' in out['error']
+
+
+def test_analyze_task_missing_dir():
+    api = Api()
+    out = api.analyze_task('/no/such/dir')
+    assert out['ok'] is False and '不存在' in out['error']
+
+
+# ── surface_energy_calc ───────────────────────────────────────────────────────
+def test_surface_energy_calc_auto_area_and_bulk(tmp_path):
+    slab = tmp_path / 'slab'
+    slab.mkdir()
+    _write_poscar(slab, natoms=6)
+    (slab / 'OSZICAR').write_text('1 F= x E0= -60.0E+00 dE=0\n', encoding='utf-8')
+    bulk = tmp_path / 'bulk'
+    bulk.mkdir()
+    _write_poscar(bulk, natoms=2)
+    (bulk / 'OSZICAR').write_text('1 F= x E0= -20.0E+00 dE=0\n', encoding='utf-8')
+    calls = {}
+    api = Api(surface_energy_mod=_fake_surface_energy(calls=calls))
+    out = api.surface_energy_calc(str(slab), str(bulk))
+    assert out['ok'] is True and out['gamma_jm2'] == 1.23
+    assert out['area_a2'] == 100.0 and out['n_slab'] == 6
+    assert calls['se']['e_bpa'] == -10.0    # -20/2
+
+
+def test_surface_energy_calc_missing_slab():
+    api = Api(surface_energy_mod=_fake_surface_energy())
+    out = api.surface_energy_calc('/no/such', '/no/bulk')
+    assert out['ok'] is False and 'slab' in out['error']
+
+
+# ── campaign_templates / instantiate ──────────────────────────────────────────
+def test_campaign_templates_shape():
+    api = Api(campaign_templates_mod=_fake_campaign_tpl())
+    out = api.campaign_templates()
+    assert out['ok'] is True and out['templates'][0]['key'] == 'sac_lis_screening'
+    assert out['templates'][0]['n_stages'] == 3
+
+
+def test_campaign_instantiate_registers(tmp_path):
+    calls = {}
+    backing = {'ui': {}}
+    api = Api(campaign_templates_mod=_fake_campaign_tpl(calls=calls),
+              config_mod=_fake_config_rw(backing))
+    out = api.campaign_instantiate('sac_lis_screening',
+                                   {'systems': ['Fe@N4', 'Co@N4']}, str(tmp_path))
+    assert out['ok'] is True and out['n_jobs'] == 2
+    assert out['campaign_dir'] in (backing['ui'].get('campaign_dirs') or [])
+    assert calls['inst']['spec']['systems'] == ['Fe@N4', 'Co@N4']
+
+
+def test_campaign_instantiate_needs_systems(tmp_path):
+    api = Api(campaign_templates_mod=_fake_campaign_tpl())
+    out = api.campaign_instantiate('sac_lis_screening', {'systems': []}, str(tmp_path))
+    assert out['ok'] is False and 'system' in out['error']
+
+
+def test_campaign_instantiate_missing_outroot():
+    api = Api(campaign_templates_mod=_fake_campaign_tpl())
+    out = api.campaign_instantiate('sac_lis_screening', {'systems': ['Fe@N4']}, '')
+    assert out['ok'] is False and '输出根目录' in out['error']
+
+
+# ── solvent_presets / build_solvated ──────────────────────────────────────────
+def test_solvent_presets_shape():
+    api = Api(solvation_mod=_fake_solvation())
+    out = api.solvent_presets()
+    assert out['ok'] is True
+    keys = {p['key'] for p in out['presets']}
+    assert 'lis_electrolyte' in keys
+
+
+def test_build_solvated_preset(tmp_path):
+    calls = {}
+    api = Api(solvation_mod=_fake_solvation(calls=calls))
+    out = api.build_solvated(core='Li2S3', solvents='lis_electrolyte')
+    assert out['ok'] is True and out['n_atoms'] == 42
+    assert calls['build']['solvents'] == 'lis_electrolyte'
+
+
+def test_build_solvated_custom_recipe_and_save(tmp_path):
+    calls = {}
+    dest = tmp_path / 'solv.vasp'
+    api = Api(solvation_mod=_fake_solvation(calls=calls))
+    out = api.build_solvated(core='S8', solvents=[['DOL', 2], ['DME', 1]], save_to=str(dest))
+    assert out['ok'] is True and out['saved_to'] == str(dest)
+    assert dest.read_text(encoding='utf-8').startswith('solvated')
+    assert calls['build']['solvents'] == [('DOL', 2), ('DME', 1)]
+
+
+def test_build_solvated_error_caught():
+    api = Api(solvation_mod=_fake_solvation(boom=ValueError('盒太小')))
+    out = api.build_solvated()
+    assert out['ok'] is False and '盒太小' in out['error']
+
+
+# ── figure_prefs ──────────────────────────────────────────────────────────────
+def test_figure_prefs_get_defaults():
+    api = Api(config_mod=_fake_config(ui={}))
+    out = api.figure_prefs_get()
+    assert out['journal_style'] == 'nature' and out['auto_figures'] is True
+    assert out['multi_panel'] is True
+
+
+def test_figure_prefs_save_persists():
+    backing = {'ui': {}}
+    api = Api(config_mod=_fake_config_rw(backing))
+    out = api.figure_prefs_save(journal_style='acs', auto_figures=False, multi_panel=False)
+    assert out['ok'] is True
+    assert backing['ui']['journal_style'] == 'acs'
+    assert backing['ui']['auto_figures'] is False
+
+
+def test_figure_prefs_save_bad_journal_falls_back():
+    backing = {'ui': {}}
+    api = Api(config_mod=_fake_config_rw(backing))
+    api.figure_prefs_save(journal_style='comic')
+    assert backing['ui']['journal_style'] == 'nature'
+
+
+# ── AI 三能力:数据对照 ────────────────────────────────────────────────────────
+def test_ai_extract_tables_forwards(tmp_path):
+    calls = {}
+    api = Api(paper_data_mod=_fake_paper_data(calls=calls))
+    out = api.ai_extract_tables('论文正文...E_ads')
+    assert out['ok'] is True and out['tables'][0]['rows'][0]['system'] == 'Fe@N4'
+    assert calls['extract']['text'].startswith('论文')
+
+
+def test_ai_extract_tables_empty():
+    api = Api(paper_data_mod=_fake_paper_data())
+    out = api.ai_extract_tables('   ')
+    assert out['ok'] is False and '论文文本' in out['error']
+
+
+def test_ai_compare_project_vs_reference(tmp_path):
+    proj = {'name': 'Fe@N4', 'root': str(tmp_path)}
+    rows = {'rows': [{'species': 'Li2S4', 'delta_e': -1.4, 'is_most_stable': True, 'name': 'c1'}]}
+    ads = _fake_adsorption(proj_map={str(tmp_path): proj}, delta_ret=rows)
+    api = Api(adsorption_mod=ads, paper_data_mod=_fake_paper_data())
+    tables = [{'label': 'T1', 'kind': 'E_ads',
+               'rows': [{'system': 'Fe@N4', 'species': 'Li2S4', 'value_ev': -1.5}]}]
+    out = api.ai_compare(str(tmp_path), tables)
+    assert out['ok'] is True and out['n'] == 1 and out['mae'] == 0.1
+    assert 'MAE' in out['summary']
+
+
+def test_ai_compare_missing_project():
+    api = Api(adsorption_mod=_fake_adsorption(proj_map={}), paper_data_mod=_fake_paper_data())
+    out = api.ai_compare('/no/proj', [])
+    assert out['ok'] is False and '项目' in out['error']
+
+
+def test_ai_write_validation_writes_md(tmp_path):
+    proj = {'name': 'Fe@N4', 'root': str(tmp_path)}
+    ads = _fake_adsorption(proj_map={str(tmp_path): proj},
+                           delta_ret={'rows': [{'species': 'Li2S4', 'delta_e': -1.4,
+                                                 'is_most_stable': True, 'name': 'c1'}]})
+    api = Api(adsorption_mod=ads, paper_data_mod=_fake_paper_data(md_ret='## 文献对照\n表格\n'))
+    out = api.ai_write_validation(str(tmp_path), [{'kind': 'E_ads', 'rows': []}])
+    assert out['ok'] is True and out['path'].endswith('validation.md')
+    assert os.path.isfile(out['path'])
+    assert '文献对照' in open(out['path'], encoding='utf-8').read()
+
+
+def test_ai_write_validation_missing_project():
+    api = Api(adsorption_mod=_fake_adsorption(proj_map={}), paper_data_mod=_fake_paper_data())
+    out = api.ai_write_validation('/no/proj', [])
+    assert out['ok'] is False and '项目' in out['error']
+
+
+# ── AI 三能力:材料变体 ────────────────────────────────────────────────────────
+def test_ai_variants_returns_list_and_plan():
+    calls = {}
+    api = Api(variant_advisor_mod=_fake_variant_advisor(calls=calls))
+    out = api.ai_variants({'systems': [{'metals': [{'value': 'Fe'}]}]}, budget_cap_hours=100)
+    assert out['ok'] is True and out['variants'][0]['metal'] == 'Co'
+    assert out['matrix_spec']['metals'] == ['Co']
+    assert out['plan']['n_jobs'] == 1
+
+
+def test_ai_variants_error_caught():
+    boom = types.SimpleNamespace(
+        suggest_variants=lambda spec: (_ for _ in ()).throw(RuntimeError('母版坏')))
+    api = Api(variant_advisor_mod=boom)
+    out = api.ai_variants({})
+    assert out['ok'] is False and '母版坏' in out['error']
+
+
+# ── AI 三能力:论文草稿 ────────────────────────────────────────────────────────
+def test_ai_manuscript_returns_stats(tmp_path):
+    proj = {'name': 'Fe@N4', 'root': str(tmp_path)}
+    ads = _fake_adsorption(proj_map={str(tmp_path): proj})
+    calls = {}
+    api = Api(adsorption_mod=ads, manuscript_draft_mod=_fake_manuscript(calls=calls))
+    out = api.ai_manuscript(str(tmp_path), fmt='markdown')
+    assert out['ok'] is True and out['stats']['auto'] == 10
+    assert out['placeholders_count'] == 5 and out['docx_available'] is False
+    assert calls['build']['fmt'] == 'markdown'
+
+
+def test_ai_manuscript_missing_project():
+    api = Api(adsorption_mod=_fake_adsorption(proj_map={}),
+              manuscript_draft_mod=_fake_manuscript())
+    out = api.ai_manuscript('/no/proj')
+    assert out['ok'] is False and '项目' in out['error']
+
+
+# ── starpivot:依赖状态 / 安装 ─────────────────────────────────────────────────
+def test_deps_status_external_tools_reflect_probe():
+    api = Api(multiwfn_mod=_fake_multiwfn(probe_avail=True),
+              vmd_mod=_fake_vmd(probe_avail=False), config_mod=_fake_config(cfg={}))
+    out = api.deps_status()
+    assert out['ok'] is True
+    by = {d['key']: d for d in out['deps']}
+    assert by['multiwfn']['available'] is True and by['vmd']['available'] is False
+    assert set(by) >= {'rdkit', 'decimer', 'matplotlib', 'multiwfn', 'vmd'}
+
+
+def _fake_deps_runner(*, returncode=0, calls=None, write_log=True):
+    calls = calls if calls is not None else {}
+
+    class _Proc:
+        def poll(self):
+            return returncode
+
+    def _run(pip_names, log_path):
+        calls['pip'] = list(pip_names)
+        calls['log'] = log_path
+        if write_log:
+            with open(log_path, 'w', encoding='utf-8') as f:
+                f.write('Collecting ' + ' '.join(pip_names) + '\nSuccessfully installed\n')
+        return _Proc()
+    return _run
+
+
+def test_deps_install_starts_via_runner():
+    calls = {}
+    api = Api(deps_runner=_fake_deps_runner(returncode=None, calls=calls))
+    out = api.deps_install(['rdkit', 'matplotlib'])
+    assert out['ok'] is True and out['started'] is True
+    assert 'rdkit' in out['pip'] and 'matplotlib' in out['pip']
+    assert calls['pip']
+
+
+def test_deps_install_rejects_non_whitelist():
+    api = Api(deps_runner=_fake_deps_runner())
+    out = api.deps_install(['evil-pkg'])
+    assert out['ok'] is False and out['rejected'] == ['evil-pkg']
+
+
+def test_deps_install_busy_guard():
+    api = Api(deps_runner=_fake_deps_runner(returncode=None))
+    api.deps_install(['rdkit'])
+    out = api.deps_install(['decimer'])
+    assert out['ok'] is False and '进行中' in out['error']
+
+
+def test_deps_install_status_none_then_done():
+    api = Api()
+    assert api.deps_install_status()['active'] is False
+    api2 = Api(deps_runner=_fake_deps_runner(returncode=0))
+    api2.deps_install(['rdkit'])
+    st = api2.deps_install_status()
+    assert st['active'] is True and st['done'] is True and st['returncode'] == 0
+    assert 'Successfully' in st['log_tail']
+
+
+def test_deps_install_status_running():
+    api = Api(deps_runner=_fake_deps_runner(returncode=None))
+    api.deps_install(['decimer'])
+    st = api.deps_install_status()
+    assert st['running'] is True and st['done'] is False
+
+
+# ── starpivot:概览核时四卡 ────────────────────────────────────────────────────
+def test_overview_stats_aggregates():
+    import datetime
+    now = datetime.datetime.now().isoformat()
+    entries = [('/a', {'state': 'RUNNING', 'created_at': now}),
+               ('/b', {'state': 'QUEUED', 'created_at': now}),
+               ('/c', {'state': 'DONE', 'created_at': now})]
+    cdir = '/camp/x'
+    camp = {cdir: {'_summary': {'total': 4, 'completed': 2},
+                   '_budget': {'estimates': {'t1': 50.0, 't2': 50.0}}, 'meta': {}}}
+    camp[cdir]['meta'] = {'title': 'X', 'budget_core_hours': 200.0}
+    api = Api(ledger_mod=_fake_ledger(entries, []),
+              campaign_mods=_fake_campaign(campaigns=camp),
+              config_mod=_fake_config(ui={'campaign_dirs': [cdir]}))
+    out = api.overview_stats()
+    assert out['ok'] is True and out['jobs_30d'] == 3
+    assert out['monitor']['running'] == 1 and out['monitor']['queued'] == 1
+    assert out['monitor']['status'] == '运行中'
+    assert out['budget_cap'] == 200.0 and out['remaining_core_hours'] is not None
+
+
+def test_overview_stats_error_caught():
+    boom = types.SimpleNamespace(load_all=lambda: (_ for _ in ()).throw(RuntimeError('台账坏')))
+    api = Api(ledger_mod=boom)
+    out = api.overview_stats()
+    assert out['ok'] is False and '台账坏' in out['error']
+
+
+# ── starpivot:波函数分组菜单 + 补充分析 ───────────────────────────────────────
+def _fake_multiwfn_full():
+    """波函数分组菜单测试用:ANALYSES 覆盖引擎全七件套 + 弱相互作用族(纯注册表)。"""
+    m = _fake_multiwfn()
+    m.ANALYSES = dict(m.ANALYSES)
+    for k, name in (('density_cube', '电子密度 cube'), ('esp_cube', '静电势 cube'),
+                    ('nci_rdg', 'NCI/RDG'), ('igmh', 'IGMH'), ('iri', 'IRI'),
+                    ('aim_cp', 'AIM 临界点'), ('alie', 'ALIE cube'),
+                    ('alie_extrema', 'ALIE 极值')):
+        m.ANALYSES[k] = {'name': name, 'stdin_script': lambda p: '', 'outputs': (), 'note': ''}
+    return m
+
+
+def test_wavefn_analyses_grouped_with_extra():
+    api = Api(multiwfn_mod=_fake_multiwfn_full())
+    out = api.wavefn_analyses()
+    assert out['ok'] is True
+    gnames = {g['group'] for g in out['groups']}
+    assert '常用' in gnames and '弱相互作用' in gnames
+    allkeys = {it['key']: it for g in out['groups'] for it in g['items']}
+    assert 'esp_extrema' in allkeys and allkeys['esp_extrema']['source'] == 'engine'
+    # api 层补充四种存在且标注 source=api
+    assert 'elf_lol_section' in allkeys and allkeys['elf_lol_section']['source'] == 'api'
+    assert 'fukui_cdft' in allkeys and 'adch_charge' in allkeys
+
+
+def test_wavefn_analyses_error_caught():
+    # multiwfn 假件无 ANALYSES 属性 → AttributeError 被 try/except 兜住
+    api = Api(multiwfn_mod=types.SimpleNamespace())
+    out = api.wavefn_analyses()
+    assert out['ok'] is False and out['error']
+
+
+def test_wavefn_run_extra_script_fallback_without_run_script(tmp_path):
+    wf = tmp_path / 'mol.fchk'
+    wf.write_text('x', encoding='utf-8')
+    api = Api(multiwfn_mod=_fake_multiwfn(), config_mod=_fake_config(cfg={}))
+    out = api.wavefn_run_extra(str(wf), ['fukui_cdft', 'adch_charge'])
+    assert out['ok'] is False and len(out['results']) == 2
+    assert all(r['script'] for r in out['results'])       # 回传 stdin 脚本
+    assert '引擎待扩展' in out['results'][0]['error']
+
+
+def test_wavefn_run_extra_uses_run_script_when_present(tmp_path):
+    wf = tmp_path / 'mol.fchk'
+    wf.write_text('x', encoding='utf-8')
+    mw = _fake_multiwfn()
+    calls = {}
+    mw.run_script = lambda w, script, exe=None, workdir=None, outputs=None: (
+        calls.__setitem__('ran', {'script': script, 'outputs': outputs})
+        or {'ok': True, 'outputs': list(outputs or []), 'stdout_tail': 'done', 'script': script})
+    api = Api(multiwfn_mod=mw, config_mod=_fake_config(cfg={}))
+    out = api.wavefn_run_extra(str(wf), ['fukui_cdft'])
+    assert out['ok'] is True and out['results'][0]['ok'] is True
+    assert 'f_plus.cub' in out['results'][0]['outputs']
+
+
+def test_wavefn_run_extra_missing_file():
+    api = Api(multiwfn_mod=_fake_multiwfn(), config_mod=_fake_config(cfg={}))
+    out = api.wavefn_run_extra('', ['fukui_cdft'])
+    assert out['ok'] is False and '波函数文件' in out['error']
+
+
+# ── starpivot:NCI/IRI 散点 ────────────────────────────────────────────────────
+def _write_cube(path, values):
+    """最小 cube:2 原子头 + 体数据。"""
+    n = len(values)
+    lines = ['comment', 'comment', '2 0 0 0', f'{n} 0.1 0 0', '1 0 0.1 0', '1 0 0 0.1',
+             '1 0 0 0 0', '6 0 0.5 0.5 0.5']
+    lines += [' '.join(f'{v:.5f}' for v in values[i:i + 6]) for i in range(0, n, 6)]
+    path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+
+def test_wavefn_scatter_parses_and_filters(tmp_path):
+    f1 = tmp_path / 'func1.cub'   # sign(λ2)ρ
+    f2 = tmp_path / 'func2.cub'   # RDG
+    _write_cube(f1, [0.01, -0.02, 0.5, 0.03])       # 0.5 超窗口(|x|>0.05)被滤
+    _write_cube(f2, [0.5, 0.8, 0.3, 1.5])
+    api = Api()
+    out = api.wavefn_scatter(str(f1), str(f2), kind='nci')
+    assert out['ok'] is True and out['kind'] == 'nci'
+    assert out['n'] == 3          # 第三点 x=0.5 被滤
+    assert {'x', 'y'} <= set(out['points'][0])
+
+
+def test_wavefn_scatter_missing_file(tmp_path):
+    f1 = tmp_path / 'func1.cub'
+    _write_cube(f1, [0.01])
+    api = Api()
+    out = api.wavefn_scatter(str(f1), '/no/func2.cub')
+    assert out['ok'] is False and 'func2' in out['error']
+
+
+def test_wavefn_scatter_png_via_native_charts(tmp_path):
+    f1 = tmp_path / 'func1.cub'
+    f2 = tmp_path / 'func2.cub'
+    _write_cube(f1, [0.01, -0.02])
+    _write_cube(f2, [0.5, 0.8])
+    calls = {}
+    nc = types.SimpleNamespace(
+        scaling_relation=lambda xs, ys, out, **kw: (calls.__setitem__('scatter', out) or [out]))
+    dest = tmp_path / 'nci.png'
+    api = Api(native_charts_mod=nc)
+    out = api.wavefn_scatter(str(f1), str(f2), out_png=str(dest))
+    assert out['ok'] is True and out['png'] == str(dest)
+    assert calls['scatter'] == str(dest)
+
+
+# ── starpivot:远程渲染(离线错误路径) ─────────────────────────────────────────
+def test_wavefn_render_remote_missing_remote_dir(tmp_path):
+    api = Api(vmd_mod=_fake_vmd())
+    out = api.wavefn_render_remote('orbital', {'cube': str(tmp_path / 'x.cub')},
+                                   'c1', None, '')
+    assert out['ok'] is False and out['experimental'] is True and '远端工作目录' in out['error']
+
+
+def test_wavefn_render_remote_unknown_scene(tmp_path):
+    api = Api(vmd_mod=_fake_vmd())
+    out = api.wavefn_render_remote('nope', {}, 'c1', None, '/remote/run')
+    assert out['ok'] is False and '未知场景' in out['error']
+
+
+# ── 一键出图管线接线:auto_figures + campaign 推进 ─────────────────────────────
+def test_auto_figures_for_project_uses_auto_engine(tmp_path):
+    calls = {}
+    api = Api(config_mod=_fake_config(ui={'auto_figures': True, 'journal_style': 'acs',
+                                          'multi_panel': True}),
+              auto_figures_mod=_fake_auto_figures(calls=calls),
+              adsorption_mod=_fake_adsorption())
+    out = api._auto_figures_for_project({'name': 'p', 'root': str(tmp_path)},
+                                        str(tmp_path / 'project.yaml'), str(tmp_path))
+    assert out['engine'] == 'auto_figures' and len(out['files']) == 1
+    assert calls['run']['journal'] == 'acs' and calls['run']['scenario'] == 'general'
+
+
+def test_auto_figures_for_project_falls_back_when_disabled(tmp_path):
+    calls = {}
+    af = _fake_auto_figures(calls=calls)
+    api = Api(config_mod=_fake_config(ui={'auto_figures': False}),
+              auto_figures_mod=af, adsorption_mod=_fake_adsorption(proj_map={}),
+              native_charts_mod=_fake_ncharts({}))
+    out = api._auto_figures_for_project({'name': 'p', 'root': str(tmp_path)},
+                                        str(tmp_path / 'project.yaml'), str(tmp_path))
+    assert out['engine'] == 'proj_figures' and 'run' not in calls   # 未调 auto_figures
+
+
+def test_tick_campaigns_derives_and_marks(tmp_path):
+    src = tmp_path / 'Fe__clean__relax'
+    src.mkdir()
+    (src / 'CONTCAR').write_text('x', encoding='utf-8')
+    cdir = str(tmp_path / '.camp' / 'c1')
+    ct = _fake_campaign_tpl(next_ret=[{'src_id': 'Fe__clean__relax', 'src_dir': str(src),
+                                       'derive': 'estatic', 'kinds': ['pdos', 'bader'],
+                                       'task_id': 'Fe__clean__estatic'}])
+    calls = {}
+    ct.mark_derived = lambda cd, s, d: calls.setdefault('marked', []).append((s, d))
+    api = Api(campaign_templates_mod=ct, estatic_mod=_fake_estatic(),
+              ledger_mod=_fake_ledger_register([]),
+              config_mod=_fake_config(ui={'campaign_dirs': [cdir]}))
+    events, errors = [], []
+    api._tick_campaigns(events, errors)
+    assert any(e['kind'] == 'derive' for e in events)
+    assert calls['marked'] == [('Fe__clean__relax', 'estatic')]
+
+
+# ── save_text / gen_run 自定义关键词 / build_solvated 临时文件 ─────────────────
+def test_save_text_writes(tmp_path):
+    dest = tmp_path / 'preview.txt'
+    api = Api()
+    out = api.save_text(str(dest), 'INCAR\nENCUT = 500\n')
+    assert out['ok'] is True and out['path'] == str(dest)
+    assert dest.read_text(encoding='utf-8').startswith('INCAR')
+
+
+def test_save_text_missing_path():
+    api = Api()
+    out = api.save_text('', 'x')
+    assert out['ok'] is False and '保存路径' in out['error']
+
+
+def test_gen_run_appends_extra_keywords(tmp_path):
+    (tmp_path / 'INCAR').write_text('ENCUT = 500\n', encoding='utf-8')
+    payload = {'ok': True, 'out_dir': str(tmp_path), 'warnings': [], 'kpoints': [3, 3, 1],
+               'elements': ['Fe']}
+    jb = types.SimpleNamespace(build_job_dir=lambda p, i, o, **k: dict(payload))
+    api = Api(config_mod=_fake_config(), logic_mod=_fake_logic(errs=[]),
+              job_builder_mod=jb, manifest_mod=_fake_manifest({}),
+              ledger_mod=_fake_ledger_register([]))
+    out = api.gen_run('/p/POSCAR', '/p/INCAR', str(tmp_path), '/lib', 'slab',
+                      'LREAL = Auto\nNCORE = 4')
+    assert out['ok'] is True
+    incar = (tmp_path / 'INCAR').read_text(encoding='utf-8')
+    assert 'LREAL = Auto' in incar and 'NCORE = 4' in incar
+    assert any('自定义关键词' in w for w in out['warnings'])
+
+
+def test_build_solvated_returns_temp_path(tmp_path):
+    api = Api(solvation_mod=_fake_solvation())
+    out = api.build_solvated(core='Li2S3', solvents='lis_electrolyte')
+    assert out['ok'] is True and out['temp_path'] and os.path.isfile(out['temp_path'])
+    assert out['poscar'] in open(out['temp_path'], encoding='utf-8').read()

@@ -95,8 +95,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 @media (max-width:760px){.gen-2col{grid-template-columns:1fr}}
 
 /* ①分子建模分区(三卡) */
-.molzone-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:14px}
-@media (max-width:1000px){.molzone-grid{grid-template-columns:1fr}}
+.molzone-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;margin-bottom:14px}
+@media (max-width:600px){.molzone-grid{grid-template-columns:1fr}}
 .molzone-card{display:flex;flex-direction:column}
 .mol-svgbox{border:1px solid var(--rule);border-radius:6px;background:var(--surface);min-height:150px;
   display:flex;align-items:center;justify-content:center;padding:8px;overflow:auto}
@@ -205,6 +205,74 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 .wf-scene-files{margin-top:6px}
 .wf-scene-files .wf-role{flex:0 0 110px;font-family:var(--mono);font-size:11px;color:var(--muted)}
 .wf-exp{color:var(--warn)}
+
+/* ── v3.1 总装:侧栏依赖状态 / 任务目录 / 任务解析 / 出图偏好 / AI 三能力 / 波函数分组 ── */
+/* 侧栏依赖状态区 */
+.deps-panel{margin:8px 12px 4px;padding:10px 10px 8px;border:1px solid var(--rule);border-radius:8px;background:var(--surface)}
+.deps-head{font-size:10.5px;font-weight:700;color:var(--muted);letter-spacing:.04em;text-transform:uppercase;margin-bottom:6px}
+.deps-list{display:flex;flex-direction:column;gap:3px;margin-bottom:8px}
+.deps-empty{font-size:11px;color:var(--muted)}
+.deps-item{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--ink)}
+.deps-item .dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto;background:#B7C3D0}
+.deps-item.ok .dot{background:var(--ok)}
+.deps-item.bad .dot{background:#B7C3D0}
+.deps-item .dnm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.deps-item .dst{font-family:var(--mono);font-size:9.5px;color:var(--muted)}
+.deps-fix{width:100%;font-size:11px;padding:5px 8px}
+/* 依赖安装弹窗 */
+.deps-modal .deps-opt{display:flex;align-items:flex-start;gap:8px;padding:7px 8px;border:1px solid var(--rule);border-radius:6px;margin-bottom:6px;cursor:pointer}
+.deps-modal .deps-opt:hover{border-color:var(--accent)}
+.deps-modal .deps-opt b{font-size:12px}
+.deps-modal .deps-opt span{font-size:11px;color:var(--muted);display:block;margin-top:2px}
+.deps-modal .deps-log{width:100%;font-family:var(--mono);font-size:10.5px;margin-top:8px;white-space:pre-wrap;max-height:180px}
+/* 概览核时四卡沿用 db-num;新增 monitor 色 */
+#page-dashboard .db-num.mon b{color:var(--accent)}
+/* 计算类型目录(②生成输入) */
+#page-generate .tc-cats{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+#page-generate .tc-cat{font-size:11.5px;padding:4px 12px;border:1px solid var(--rule);border-radius:14px;background:var(--surface);cursor:pointer;user-select:none;color:var(--ink)}
+#page-generate .tc-cat.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent-dark)}
+#page-generate .tc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}
+#page-generate .tc-card{border:1px solid var(--rule);border-radius:8px;padding:11px 12px;background:var(--surface);cursor:pointer}
+#page-generate .tc-card:hover{border-color:var(--accent)}
+#page-generate .tc-card.on{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)}
+#page-generate .tc-card b{font-size:12.5px;display:block;margin-bottom:3px}
+#page-generate .tc-card .tc-desc{font-size:11px;color:var(--muted);line-height:1.45}
+#page-generate .tc-badges{display:flex;gap:5px;flex-wrap:wrap;margin-top:6px}
+#page-generate .tc-badge{font-family:var(--mono);font-size:9.5px;padding:1px 6px;border-radius:4px;background:var(--queue-bg);color:var(--muted)}
+#page-generate .tc-badge.fig{background:var(--accent-soft);color:var(--accent-dark)}
+#page-generate .tc-form{margin-top:12px;border-top:1px dashed var(--rule);padding-top:12px}
+#page-generate .tc-form[hidden]{display:none}
+.urow{display:flex;gap:10px;font-size:11.5px;padding:3px 0;font-family:var(--mono)}
+.urow b{color:var(--accent-dark)}
+/* 任务解析(④结果分析) */
+#page-project .ta-out{margin-top:10px}
+#page-project .ta-summary{font-size:12.5px;line-height:1.6;padding:8px 10px;border:1px solid var(--rule);border-radius:6px;background:var(--surface);margin-bottom:8px}
+#page-project .ta-summary b{color:var(--accent-dark)}
+#page-project .ta-img{max-width:100%;border:1px solid var(--rule);border-radius:6px}
+/* AI 三能力区 */
+#page-ai .ai-cap-h{font-weight:700;font-size:13px;margin:16px 0 10px;padding-bottom:6px;border-bottom:1px solid var(--rule)}
+#page-ai .ai-tbl{width:100%;border-collapse:collapse;font-size:11.5px;margin-top:8px}
+#page-ai .ai-tbl th{background:var(--th-bg);color:var(--muted);text-align:left;padding:5px 8px;position:sticky;top:0}
+#page-ai .ai-tbl td{padding:4px 8px;border-top:1px solid var(--rule)}
+#page-ai .ai-tbl td.num{text-align:right;font-variant-numeric:tabular-nums}
+#page-ai .ai-metrics{display:flex;gap:16px;flex-wrap:wrap;font-size:12.5px;margin:8px 0}
+#page-ai .ai-metrics b{font-family:var(--mono);color:var(--accent-dark);font-size:15px}
+#page-ai .ai-worst{color:var(--warn)}
+#page-ai .ai-var-row{display:flex;align-items:center;gap:8px;font-size:11.5px;padding:4px 6px;border-bottom:1px solid var(--rule)}
+#page-ai .ai-var-row .vk{font-family:var(--mono);font-size:10px;padding:1px 6px;border-radius:4px;background:var(--queue-bg);color:var(--muted)}
+#page-ai .ai-var-row .vd{flex:1;color:var(--muted)}
+#page-ai .ai-var-row.computed{opacity:.5}
+#page-ai .ai-stat-pill{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;padding:3px 10px;border-radius:12px;background:var(--surface);border:1px solid var(--rule);margin-right:6px}
+#page-ai .ai-stat-pill b{font-family:var(--mono);color:var(--accent-dark)}
+/* 波函数分组菜单 */
+#page-wavefunction .wf-agroup{margin-bottom:8px}
+#page-wavefunction .wf-agroup-h{font-size:10.5px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px}
+#page-wavefunction .chip.api-extra{border-style:dashed}
+#page-wavefunction .wf-gridprec{display:flex;align-items:center;gap:6px}
+#page-wavefunction .wf-scatter-box{margin-top:10px}
+/* SAC 活动模板 / 溶剂化小卡 */
+#page-structure .camp-tpl-desc{font-size:11.5px;color:var(--muted);line-height:1.5;margin-top:6px;padding:8px 10px;border:1px solid var(--rule);border-radius:6px;background:var(--surface)}
+#page-structure .solv-card .gen-inrow{flex-wrap:wrap}
 </style>
 </head>
 <body>
@@ -234,6 +302,12 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
   <div class="grp" data-i18n="nav.group.environment">环境</div>
   <a href="#" data-page="cluster" data-scene="pages.cluster"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="1"/><rect x="3" y="13" width="18" height="7" rx="1"/><path d="M7 7.5h.01M7 16.5h.01"/></svg><span data-i18n="nav.cluster">集群</span></a>
   <a href="#" data-page="settings" data-scene="pages.settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M18.4 5.6L17 7M7 17l-1.4 1.4"/></svg><span data-i18n="nav.settings">设置</span></a>
+  <!-- 侧栏依赖状态区(对齐 starpivot 左下角):各组件状态点 + 下载/修复依赖 -->
+  <div class="deps-panel" id="deps-panel">
+    <div class="deps-head" data-i18n="deps.title">依赖状态</div>
+    <div class="deps-list" id="deps-list"><span class="deps-empty" data-i18n="deps.loading">检测中…</span></div>
+    <button class="btn quiet deps-fix" id="deps-fix-btn" data-i18n="deps.fix">下载 / 修复依赖</button>
+  </div>
   <div class="foot" id="nav-foot" data-i18n="nav.foot.no_cluster">未配置集群</div>
 </nav>
 <main>
@@ -252,6 +326,14 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 
     <!-- 取数失败错误条(不再假装 0 作业) -->
     <div class="errbar" id="db-error" hidden></div>
+
+    <!-- 卡片 0:核时四卡(近30天作业数 / 近30天核时 / 剩余核时 / 实时监控状态) -->
+    <div class="db-nums" id="db-overview">
+      <div class="db-num"><b id="ov-jobs30">—</b><span data-i18n="overview.jobs30">近 30 天作业数</span></div>
+      <div class="db-num"><b id="ov-ch30">—</b><span data-i18n="overview.ch30">近 30 天核时(估算)</span></div>
+      <div class="db-num ok"><b id="ov-remain">—</b><span data-i18n="overview.remain">剩余核时(预算 − 已花)</span></div>
+      <div class="db-num mon"><b id="ov-monitor">—</b><span data-i18n="overview.monitor">实时监控</span></div>
+    </div>
 
     <!-- 卡片 1:作业状态汇总(大数字,点击跳作业页) -->
     <div class="db-nums" id="db-nums"></div>
@@ -377,6 +459,30 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
         <div class="mol-props" id="mol-props"><span class="sub" data-i18n="mol.build3d.props_empty">生成或载入结构后显示:原子数 / 分子式 / 电子数 / 建议多重度</span></div>
       </div>
 
+      <!-- 卡4:溶剂化复合物(核分子 + 溶剂配比 → 显式溶剂盒) -->
+      <div class="card molzone-card solv-card" style="padding:16px">
+        <div class="gen-h" data-i18n="mol.solv.title">溶剂化复合物(核 + 显式溶剂盒)</div>
+        <div class="gen-fld">
+          <span class="gen-lbl" data-i18n="mol.solv.core">核分子(多硫化锂 / S8 等)</span>
+          <select id="solv-core" class="ipt">
+            <option>Li2S</option><option>Li2S2</option><option>Li2S3</option>
+            <option>Li2S4</option><option>Li2S6</option><option>Li2S8</option><option>S8</option>
+          </select>
+        </div>
+        <div class="gen-fld">
+          <span class="gen-lbl" data-i18n="mol.solv.recipe">溶剂配比</span>
+          <div class="gen-inrow">
+            <select id="solv-preset" class="ipt" style="flex:1"></select>
+            <input id="solv-box" class="ipt" inputmode="decimal" value="18" title="盒边长 Å" style="flex:0 0 90px">
+          </div>
+        </div>
+        <div class="actions" style="margin:2px 0 8px">
+          <button class="btn primary" id="solv-build" data-i18n="mol.solv.build">组装并载入编辑器</button>
+          <button class="btn" id="solv-save" data-i18n="mol.solv.save">保存 POSCAR</button>
+        </div>
+        <div class="mol-props" id="solv-out"><span class="sub" data-i18n="mol.solv.empty">选核分子与溶剂配比后组装显式溶剂化盒</span></div>
+      </div>
+
       <!-- 卡3:外部编辑器往返 -->
       <div class="card molzone-card" style="padding:16px">
         <div class="gen-h" data-i18n="mol.ext.title">外部编辑器(GaussView / Avogadro)</div>
@@ -435,7 +541,9 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
         <button class="btn" id="ed-reset" data-i18n="editor.view.reset">重置视图</button>
         <button class="btn" id="ed-bg" data-i18n="editor.bg">切换底色</button>
         <button class="btn" id="ed-labels" data-i18n="editor.labels">切换标签</button>
-        <button class="btn" id="ed-measure" data-i18n="editor.measure">测量模式</button>
+        <button class="btn" id="ed-hydrogens" data-i18n="editor.hydrogens">切换氢</button>
+        <button class="btn" id="ed-paste-xyz" data-i18n="editor.pastexyz">输入原子坐标</button>
+        <button class="btn" id="ed-measure" title="测量:2 原子距离 / 3 原子角度 / 4 原子二面角" data-i18n="editor.measure">测量模式</button>
         <button class="btn" id="ed-img" data-i18n="editor.saveimg">保存图片</button>
         <span class="sp" style="flex:1"></span>
         <button class="btn quiet" id="ed-selall" data-i18n="editor.selectall">全选</button>
@@ -483,6 +591,15 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     <!-- SAC 批量建模:金属 × 模板 × 吸附质 × 位点 × 取向 候选矩阵 -->
     <div class="card" id="sac-card" data-scene="cards.generate.sac_matrix" style="padding:16px;margin:14px 0">
       <div class="gen-h">SAC 批量建模(周期表换金属 × 配位模板 × 吸附质候选矩阵)</div>
+      <!-- 计算活动模板:选模板 → instantiate 全链 DAG -->
+      <div class="gen-fld">
+        <span class="gen-lbl" data-i18n="camp.tpl">计算活动模板(选模板生成全链任务 DAG:relax→静态→频率→汇总)</span>
+        <div class="gen-inrow">
+          <select id="camp-tpl-sel" class="ipt" style="flex:1"><option value="" data-i18n="camp.tpl.none">不使用模板(仅建吸附能项目矩阵)</option></select>
+          <button class="btn" id="camp-tpl-inst" data-i18n="camp.tpl.gen">按模板生成全链</button>
+        </div>
+        <div class="camp-tpl-desc" id="camp-tpl-desc" hidden></div>
+      </div>
       <div class="gen-fld">
         <span class="gen-lbl">金属(多选,可在下方补充自定义符号)</span>
         <div class="chips" id="sac-metals"></div>
@@ -571,6 +688,40 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <span class="stats">POSCAR + INCAR → 自动补全四件套(POSCAR / INCAR / POTCAR / KPOINTS)</span>
     </div>
 
+    <!-- 计算类型目录:五分类 23 项卡片网格 → 参数表单 → 派生作业 -->
+    <div class="card" id="taskcat-card" style="padding:16px;margin-bottom:14px">
+      <div class="gen-h" data-i18n="taskcat.title">计算类型目录 <span class="sub" style="font-weight:400" data-i18n="taskcat.sub">选类型 → 填参数 → 从已完成作业派生下一步作业</span></div>
+      <div class="tc-cats" id="tc-cats"></div>
+      <div class="tc-grid" id="tc-grid"><span class="sub" data-i18n="taskcat.loading">加载计算类型目录…</span></div>
+      <div class="tc-form" id="tc-form" hidden>
+        <div class="gen-fld">
+          <span class="gen-lbl"><b id="tc-sel-name"></b> — <span id="tc-sel-desc" class="sub"></span></span>
+          <div class="tc-badges" id="tc-sel-badges"></div>
+        </div>
+        <div class="gen-fld">
+          <span class="gen-lbl" data-i18n="taskcat.src">源作业目录(已完成的前置作业)</span>
+          <div class="gen-inrow">
+            <input id="tc-src" class="ipt" autocomplete="off" placeholder="如已弛豫的作业目录">
+            <button class="btn" id="tc-src-btn" data-i18n="common.browse">浏览</button>
+          </div>
+        </div>
+        <div id="tc-params"></div>
+        <!-- DFT+U 建议表(含金属元素的任务显示) -->
+        <div class="gen-fld" id="tc-u-box" hidden>
+          <span class="gen-lbl" data-i18n="taskcat.u">DFT+U 建议(元素逗号分隔;库内无经验 U 的不编造)</span>
+          <div class="gen-inrow">
+            <input id="tc-u-els" class="ipt" autocomplete="off" placeholder="如 Fe, Co, Ni">
+            <button class="btn" id="tc-u-btn" data-i18n="taskcat.u.query">查 U 值</button>
+            <button class="btn" id="tc-u-apply" data-i18n="taskcat.u.apply" hidden>应用到 INCAR</button>
+          </div>
+          <div id="tc-u-out"></div>
+        </div>
+        <div class="actions" style="margin-top:10px">
+          <button class="btn primary" id="tc-derive-btn" data-i18n="taskcat.derive">派生作业</button>
+        </div>
+      </div>
+    </div>
+
     <div class="card" style="padding:16px;margin-bottom:14px">
       <div class="gen-h">输入文件</div>
 
@@ -618,8 +769,15 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <div class="card" style="padding:16px;margin-bottom:14px">
-      <div class="gen-h">解析预览</div>
-      <pre class="mono" id="gen-preview" style="margin:0;max-height:40vh">(选择 POSCAR / INCAR 后自动解析预览)</pre>
+      <div class="gen-h">解析预览 <span class="sub" style="font-weight:400" data-i18n="generate.preview.editable">可直接编辑;可保存到文件</span></div>
+      <div class="gen-fld">
+        <span class="gen-lbl" data-i18n="generate.extra_kw">自定义 INCAR 关键词(每行一条,如 LREAL = Auto;生成时追加到 INCAR)</span>
+        <textarea id="gen-extra-kw" class="ipt" rows="2" spellcheck="false" placeholder="LREAL = Auto&#10;NCORE = 4"></textarea>
+      </div>
+      <textarea class="mono ipt" id="gen-preview" style="margin:0;min-height:200px;max-height:40vh;white-space:pre" spellcheck="false">(选择 POSCAR / INCAR 后自动解析预览)</textarea>
+      <div class="actions" style="margin-top:8px">
+        <button class="btn" id="gen-preview-save" data-i18n="generate.preview.save">保存预览到文件</button>
+      </div>
     </div>
 
     <div class="actions">
@@ -880,6 +1038,41 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <div id="pj-table"></div>
     </div>
 
+    <!-- 任务解析:选作业 → 按 task_type 自动解析 + 出图 -->
+    <div class="card" id="taskana-card" style="padding:16px;margin-bottom:14px">
+      <div class="pj-h" data-i18n="taskana.title">任务解析(收敛曲线 / EOS 拟合 / 能带带隙 / 功函数)</div>
+      <div class="pj-fld">
+        <span class="pj-lbl" data-i18n="taskana.dir">作业目录(或收敛/EOS 系列根目录)</span>
+        <div class="pj-inrow">
+          <input id="ta-dir" class="ipt" autocomplete="off" placeholder="选作业目录,类型自动识别">
+          <button class="btn" id="ta-dir-btn" data-i18n="common.browse">浏览</button>
+          <select id="ta-kind" class="ipt" style="flex:0 0 150px" title="解析类型(自动识别可留自动)">
+            <option value="" data-i18n="taskana.auto">自动识别</option>
+            <option value="conv" data-i18n="taskana.conv">收敛曲线</option>
+            <option value="eos">EOS</option>
+            <option value="bands" data-i18n="taskana.bands">能带带隙</option>
+            <option value="workfunction" data-i18n="taskana.wf">功函数</option>
+          </select>
+          <button class="btn primary" id="ta-run" data-i18n="taskana.run">解析并出图</button>
+        </div>
+      </div>
+      <!-- 表面能计算器:选 slab + bulk 作业,面积自动 -->
+      <div class="pj-fld" style="margin-top:6px">
+        <span class="pj-lbl" data-i18n="taskana.se">表面能计算器 γ(选 slab + bulk 作业,面积自动)</span>
+        <div class="pj-inrow">
+          <input id="ta-se-slab" class="ipt" autocomplete="off" placeholder="slab 作业目录">
+          <button class="btn" id="ta-se-slab-btn" data-i18n="common.browse">浏览</button>
+        </div>
+        <div class="pj-inrow" style="margin-top:6px">
+          <input id="ta-se-bulk" class="ipt" autocomplete="off" placeholder="bulk 作业目录(或直接填体相每原子能)">
+          <button class="btn" id="ta-se-bulk-btn" data-i18n="common.browse">浏览</button>
+          <input id="ta-se-ebulk" class="ipt" inputmode="decimal" placeholder="体相每原子能 eV(可空)" style="flex:0 0 180px">
+          <button class="btn primary" id="ta-se-run" data-i18n="taskana.se.run">算 γ</button>
+        </div>
+      </div>
+      <div class="ta-out" id="ta-out"></div>
+    </div>
+
     <!-- 论文级出图(原生 matplotlib 引擎) -->
     <div class="card" style="padding:16px;margin-bottom:14px">
       <div class="pj-h">论文级出图(原生引擎,无需 Origin / POV-Ray)</div>
@@ -981,14 +1174,27 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
           </div>
         </div>
         <div class="gen-fld">
-          <span class="gen-lbl" data-i18n="wavefn.analyze.chips">分析项(七件套;可多选)</span>
-          <div class="chips" id="wf-analysis-chips"></div>
+          <span class="gen-lbl" data-i18n="wavefn.analyze.chips">分析项(分组菜单:常用 / 实空间与截面 / 弱相互作用 / 其它;可多选)</span>
+          <div id="wf-analysis-chips"></div>
         </div>
         <div class="gen-fld" id="wf-analysis-params">
           <div class="wf-inline"><label data-i18n="wavefn.analyze.orbital">HOMO/LUMO 轨道号</label>
             <input id="wf-orbital" class="ipt" placeholder="HOMO(默认;或整数/LUMO/HOMO-1)" style="width:200px"></div>
           <div class="wf-inline"><label data-i18n="wavefn.analyze.fragments">IGMH 片段(逗号分隔)</label>
             <input id="wf-fragments" class="ipt" placeholder="如 1-12, 13-20" style="width:200px"></div>
+          <div class="wf-inline wf-gridprec"><label data-i18n="wavefn.analyze.grid">格点精度</label>
+            <select id="wf-grid" class="ipt" style="width:auto">
+              <option value="1" data-i18n="wavefn.grid.low">1 低(快)</option>
+              <option value="2" selected data-i18n="wavefn.grid.med">2 中</option>
+              <option value="3" data-i18n="wavefn.grid.high">3 高(精)</option>
+            </select></div>
+          <div class="wf-inline" id="wf-plane-row" hidden><label data-i18n="wavefn.analyze.plane">ELF/LOL 切面</label>
+            <select id="wf-plane" class="ipt" style="width:auto">
+              <option value="auto" data-i18n="wavefn.plane.auto">自动</option>
+              <option value="xy" data-i18n="wavefn.plane.xy">坐标面 XY</option>
+              <option value="atoms" data-i18n="wavefn.plane.atoms">三原子定义</option>
+            </select>
+            <input id="wf-plane-atoms" class="ipt" placeholder="三原子序号,如 1 2 3" style="width:150px"></div>
         </div>
         <div class="gen-fld">
           <span class="gen-lbl" data-i18n="wavefn.analyze.location">计算位置</span>
@@ -1032,12 +1238,77 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
             <label><input type="checkbox" id="wf-extval" checked> <span data-i18n="wavefn.visual.showext">显示极值点数值</span></label>
           </div>
         </div>
+        <div class="gen-fld">
+          <span class="gen-lbl" data-i18n="wavefn.visual.loc">渲染位置(服务器为实验性:上传场景 → 远程 Tachyon → 下载)</span>
+          <div class="wf-radio">
+            <label><input type="radio" name="wf-render-loc" value="local" checked> <span data-i18n="wavefn.visual.loc.local">本机</span></label>
+            <label><input type="radio" name="wf-render-loc" value="server"> <span data-i18n="wavefn.visual.loc.server">服务器(实验性)</span></label>
+            <select id="wf-render-cluster" class="ipt" style="width:auto;display:inline-block" hidden></select>
+            <input id="wf-render-dir" class="ipt" placeholder="远端工作目录" style="width:200px" hidden>
+          </div>
+        </div>
         <div class="actions" style="margin-top:6px;flex-wrap:wrap">
           <button class="btn primary" id="wf-render" data-i18n="wavefn.visual.render">渲染(Tachyon 高清)</button>
           <button class="btn" id="wf-extrema" data-i18n="wavefn.visual.extrema">查询极值</button>
         </div>
         <div class="wf-render-out" id="wf-render-out"></div>
         <div class="wf-extrema-out" id="wf-extrema-out"></div>
+      </div>
+
+      <!-- Fukui / CDFT 四描述符 + ELF-LOL 联动 -->
+      <div class="card" style="padding:16px;margin-top:12px">
+        <div class="gen-h" data-i18n="wavefn.fukui.title">Fukui / CDFT 概念密度泛函(f+ / f− / f0 / 双描述符 DD)</div>
+        <div class="actions" style="flex-wrap:wrap">
+          <button class="btn wf-fukui" data-f="f_plus">f+(亲核)</button>
+          <button class="btn wf-fukui" data-f="f_minus">f−(亲电)</button>
+          <button class="btn wf-fukui" data-f="f_zero">f0(自由基)</button>
+          <button class="btn wf-fukui" data-f="dd">双描述符 DD</button>
+          <span class="sp" style="flex:1"></span>
+          <button class="btn" id="wf-elflol-link" data-i18n="wavefn.fukui.elflink">→ 去分析页跑 ELF/LOL 截面</button>
+        </div>
+        <div id="wf-fukui-out" class="sub" style="margin-top:8px"></div>
+      </div>
+
+      <!-- 散点图(NCI / IRI:RDG-sign(λ2)ρ) + output 可视化 -->
+      <div class="card" style="padding:16px;margin-top:12px">
+        <div class="gen-h" data-i18n="wavefn.scatter.title">弱相互作用散点(RDG vs sign(λ₂)ρ) / output 可视化</div>
+        <div class="gen-2col">
+          <div class="gen-fld">
+            <span class="gen-lbl" data-i18n="wavefn.scatter.func1">func1 = sign(λ₂)ρ cube</span>
+            <div class="gen-inrow"><input id="wf-sc-f1" class="ipt" placeholder="func1.cub"><button class="btn wf-sc-browse" data-t="f1" data-i18n="common.browse">浏览</button></div>
+          </div>
+          <div class="gen-fld">
+            <span class="gen-lbl" data-i18n="wavefn.scatter.func2">func2 = RDG cube</span>
+            <div class="gen-inrow"><input id="wf-sc-f2" class="ipt" placeholder="func2.cub"><button class="btn wf-sc-browse" data-t="f2" data-i18n="common.browse">浏览</button></div>
+          </div>
+        </div>
+        <div class="actions" style="flex-wrap:wrap">
+          <select id="wf-sc-kind" class="ipt" style="flex:0 0 120px"><option value="nci">NCI</option><option value="iri">IRI</option></select>
+          <button class="btn primary" id="wf-scatter-btn" data-i18n="wavefn.scatter.run">出散点图</button>
+          <span class="sp" style="flex:1"></span>
+          <input id="wf-out-dir" class="ipt" placeholder="output 文件夹(ESP 面积分布柱状图)" style="flex:1">
+          <button class="btn" id="wf-out-btn" data-i18n="wavefn.scatter.espbar">ESP 面积分布</button>
+        </div>
+        <div class="wf-scatter-box" id="wf-scatter-out"></div>
+      </div>
+
+      <!-- HOMO-LUMO 能级 / AIM BCP 查询(可复制) -->
+      <div class="card" style="padding:16px;margin-top:12px">
+        <div class="gen-h" data-i18n="wavefn.query.title">能级 / 键临界点查询</div>
+        <div class="gen-2col">
+          <div class="gen-fld">
+            <span class="gen-lbl" data-i18n="wavefn.query.homolumo">HOMO-LUMO 能级与能隙</span>
+            <div class="gen-inrow"><button class="btn" id="wf-homolumo-btn" data-i18n="wavefn.query.homolumo.run">查询能级</button>
+              <span id="wf-homolumo-val" class="sub"></span>
+              <button class="btn quiet" id="wf-homolumo-copy" hidden data-i18n="common.copy">复制</button></div>
+          </div>
+          <div class="gen-fld">
+            <span class="gen-lbl" data-i18n="wavefn.query.bcp">AIM 键临界点 ρ / 键能</span>
+            <div class="gen-inrow"><button class="btn" id="wf-bcp-btn" data-i18n="wavefn.query.bcp.run">查询 BCP</button>
+              <span id="wf-bcp-val" class="sub"></span>
+              <button class="btn quiet" id="wf-bcp-copy" hidden data-i18n="common.copy">复制</button></div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -1127,6 +1398,55 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <div class="actions">
         <button class="btn primary" id="ai-inst-btn">实例化(单点先行)</button>
       </div>
+    </div>
+
+    <!-- 能力一:数据对照(文献数据表提取 + 与项目计算值对照) -->
+    <div class="card" style="padding:16px;margin-bottom:14px">
+      <div class="ai-cap-h" data-i18n="ai.cap.data">数据对照(文献值 × 计算值)</div>
+      <div class="sub" style="color:var(--muted);margin-bottom:8px;line-height:1.5" data-i18n="ai.cap.data.sub">
+        从上方论文提取文献数据表(体系×物种×文献值,带页码);项目算完后与计算值对照给 MAE/RMSE。抽出的是文献参考值,仅供对照,绝不回流计算。</div>
+      <div class="actions" style="margin-bottom:8px">
+        <button class="btn" id="ai-tables-btn" data-i18n="ai.cap.data.extract">提取数据表</button>
+      </div>
+      <div id="ai-tables"></div>
+      <div class="pj-inrow" style="margin:10px 0 8px">
+        <label class="gen-lbl" style="display:flex;align-items:center;gap:8px" data-i18n="ai.cap.data.project">对照项目
+          <select id="ai-cmp-project" class="ipt" style="width:auto;min-width:200px"></select>
+        </label>
+        <button class="btn" id="ai-cmp-refresh" data-i18n="common.refresh">刷新</button>
+        <button class="btn primary" id="ai-compare-btn" data-i18n="ai.cap.data.compare">与文献对照</button>
+      </div>
+      <div id="ai-compare-out"></div>
+    </div>
+
+    <!-- 能力二:材料变体(推荐变体 + 分批预算 + 生成变体矩阵) -->
+    <div class="card" style="padding:16px;margin-bottom:14px">
+      <div class="ai-cap-h" data-i18n="ai.cap.variants">材料变体(母版 → 邻域筛选)</div>
+      <div class="sub" style="color:var(--muted);margin-bottom:8px;line-height:1.5" data-i18n="ai.cap.variants.sub">
+        据规格表母版体系推荐变体(金属替换 / 配位调控 / 掺杂),排除论文已算过的组合;按优先级 + 机时预算分批。</div>
+      <div class="actions" style="margin-bottom:8px">
+        <button class="btn" id="ai-variants-btn" data-i18n="ai.cap.variants.suggest">推荐变体</button>
+        <button class="btn primary" id="ai-variants-gen" data-i18n="ai.cap.variants.gen" hidden>生成变体矩阵</button>
+      </div>
+      <div id="ai-variants-out"></div>
+    </div>
+
+    <!-- 能力三:论文草稿(生成论文骨架 + 诚实展示自动/占位比) -->
+    <div class="card" style="padding:16px;margin-bottom:14px">
+      <div class="ai-cap-h" data-i18n="ai.cap.manuscript">论文草稿(骨架 + Methods 全自动)</div>
+      <div class="sub" style="color:var(--muted);margin-bottom:8px;line-height:1.5" data-i18n="ai.cap.manuscript.sub">
+        Methods 用真实 INCAR 全自动;Results 逐图数据句 + 占位待补。诚实展示 AI 组织了多少、留给你多少。</div>
+      <div class="pj-inrow" style="margin-bottom:8px">
+        <label class="gen-lbl" style="display:flex;align-items:center;gap:8px" data-i18n="ai.cap.manuscript.project">项目
+          <select id="ai-ms-project" class="ipt" style="width:auto;min-width:200px"></select>
+        </label>
+        <select id="ai-ms-fmt" class="ipt" style="flex:0 0 130px">
+          <option value="markdown">Markdown</option>
+          <option value="docx">Word (.docx)</option>
+        </select>
+        <button class="btn primary" id="ai-ms-btn" data-i18n="ai.cap.manuscript.gen">生成论文骨架</button>
+      </div>
+      <div id="ai-ms-out"></div>
     </div>
 
     <div class="log" id="ai-log" data-anchor><div class="head" data-i18n="ai.log">AI 助手日志</div></div>
@@ -1459,6 +1779,29 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       </div>
     </div>
 
+    <!-- 卡片 4b:出图偏好(期刊风格 / 自动出图 / 多面板) -->
+    <div class="card" style="padding:16px;margin-bottom:14px">
+      <div class="set-h" data-i18n="settings.figures.title">出图偏好</div>
+      <div class="set-sub" data-i18n="settings.figures.sub">一键出图管线用此期刊风格出全套图;自动出图开启后,项目全部 DONE 即自动出图 + 拼多面板。</div>
+      <div class="set-2col">
+        <div class="set-fld">
+          <span class="set-lbl" data-i18n="settings.figures.journal">期刊风格</span>
+          <select id="set-fig-journal" class="ipt">
+            <option value="nature">Nature</option>
+            <option value="acs">ACS</option>
+            <option value="prb">PRB(APS)</option>
+          </select>
+        </div>
+        <div class="set-fld" style="justify-content:flex-end">
+          <label class="set-check"><input type="checkbox" id="set-fig-auto" checked> <span data-i18n="settings.figures.auto">项目全 DONE 自动出图</span></label>
+          <label class="set-check"><input type="checkbox" id="set-fig-panel" checked> <span data-i18n="settings.figures.panel">出多面板拼版</span></label>
+        </div>
+      </div>
+      <div class="actions" style="margin-top:12px">
+        <button class="btn primary" id="set-fig-save" data-i18n="settings.figures.save">保存出图偏好</button>
+      </div>
+    </div>
+
     <!-- 卡片 5:界面语言 + 研究场景 -->
     <div class="card" style="padding:16px;margin-bottom:14px">
       <div class="set-h" data-i18n="settings.workspace.title">界面语言与研究场景</div>
@@ -1498,5 +1841,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 <script src="wavefn.js"></script>
 <script src="figures.js"></script>
 <script src="ai.js"></script>
+<script src="taskcat.js"></script>
+<script src="deps.js"></script>
 </body>
 </html>

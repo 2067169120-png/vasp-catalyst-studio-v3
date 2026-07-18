@@ -7,7 +7,8 @@
 'use strict';
 (function () {
   const $ = id => document.getElementById(id);
-  const State = { analyses: [], scenes: [], sel: new Set(), scene: null, outputs: [] };
+  const State = { analyses: [], groups: [], apiKeys: new Set(), scenes: [],
+    sel: new Set(), scene: null, outputs: [] };
 
   function dirOf(p) {
     const s = String(p).replace(/[\\/]+$/, '');
@@ -62,25 +63,35 @@
     const r = await VCS.call('wavefn_scenes');
     State.analyses = (r && r.analyses) || [];
     State.scenes = (r && r.scenes) || [];
+    const g = await VCS.call('wavefn_analyses');       // 分组菜单(引擎 + api 补充)
+    State.groups = (g && g.groups) || [];
+    State.apiKeys = new Set();
+    State.groups.forEach(grp => (grp.items || []).forEach(it => {
+      if (it.source === 'api') State.apiKeys.add(it.key);
+    }));
     renderAnalysisChips();
     renderSceneChips();
   }
   function renderAnalysisChips() {
     const box = $('wf-analysis-chips');
     if (!box) return;
-    box.innerHTML = '';
-    State.analyses.forEach(a => {
-      const c = document.createElement('span');
-      c.className = 'chip' + (State.sel.has(a.key) ? ' on' : '');
-      c.dataset.val = a.key;
-      c.textContent = a.name;
-      c.title = a.note || '';
-      c.addEventListener('click', () => {
-        if (State.sel.has(a.key)) State.sel.delete(a.key); else State.sel.add(a.key);
-        c.classList.toggle('on');
-      });
-      box.appendChild(c);
-    });
+    // 分组菜单(常用 / 实空间与截面 / 弱相互作用 / 其它);api 补充项虚线边 + 版本差异提醒
+    const groups = State.groups.length ? State.groups
+      : [{ group: '', items: State.analyses }];
+    box.innerHTML = groups.map(grp =>
+      `<div class="wf-agroup">${grp.group ? `<div class="wf-agroup-h">${VCS.esc(grp.group)}</div>` : ''}` +
+      `<div class="chips">` + (grp.items || []).map(a =>
+        `<span class="chip${State.sel.has(a.key) ? ' on' : ''}${a.source === 'api' ? ' api-extra' : ''}" ` +
+        `data-val="${VCS.esc(a.key)}" title="${VCS.esc(a.note || '')}">${VCS.esc(a.name)}</span>`).join('') +
+      `</div></div>`).join('');
+    box.querySelectorAll('.chip').forEach(c => c.addEventListener('click', () => {
+      const k = c.dataset.val;
+      if (State.sel.has(k)) State.sel.delete(k); else State.sel.add(k);
+      c.classList.toggle('on');
+      // ELF/LOL 截面选中 → 显示切面参数行
+      const plane = $('wf-plane-row');
+      if (plane) plane.hidden = !State.sel.has('elf_lol_section');
+    }));
   }
   function analysisParams() {
     const p = {};
@@ -88,6 +99,12 @@
     if (orb) p.orbital = /^\d+$/.test(orb) ? parseInt(orb, 10) : orb;
     const frag = ($('wf-fragments') && $('wf-fragments').value.trim()) || '';
     if (frag) p.fragments = frag.split(',').map(s => s.trim()).filter(Boolean);
+    const grid = ($('wf-grid') && $('wf-grid').value) || '';
+    if (grid) p.grid = parseInt(grid, 10);            // 格点精度透传 1/2/3
+    const plane = ($('wf-plane') && $('wf-plane').value) || '';
+    if (plane) p.plane = plane;
+    const atoms = ($('wf-plane-atoms') && $('wf-plane-atoms').value.trim()) || '';
+    if (atoms) p.atoms = atoms.split(/\s+/).map(Number).filter(n => n > 0);
     return p;
   }
   function currentLocation() {
@@ -127,8 +144,20 @@
         VCS.log('远程集群跑波函数分析(实验性):' + keys.join('、') + ' …');
         r = await VCS.call('wavefn_run_remote', wf, keys, name, null, rdir, rexe, false, analysisParams());
       } else {
+        // 引擎项走 wavefn_run;api 补充项(elf_lol_section 等)走 wavefn_run_extra,合并结果
+        const engKeys = keys.filter(k => !State.apiKeys.has(k));
+        const apiKeys = keys.filter(k => State.apiKeys.has(k));
         VCS.log('本机跑波函数分析:' + keys.join('、') + ' …');
-        r = await VCS.call('wavefn_run', wf, keys, analysisParams(), null, null);
+        let results = [];
+        if (engKeys.length) {
+          const re = await VCS.call('wavefn_run', wf, engKeys, analysisParams(), null, null);
+          if (re && !re.error) results = results.concat(re.results || []);
+        }
+        if (apiKeys.length) {
+          const ra = await VCS.call('wavefn_run_extra', wf, apiKeys, analysisParams(), null, null);
+          if (ra && !ra.error) results = results.concat(ra.results || []);
+        }
+        r = { results: results, experimental: false };
       }
       if (!r || r.error) { VCS.log('波函数分析失败:' + ((r && r.error) || '未知错误'), 'failc'); return; }
       renderResults(r.results || [], !!r.experimental);
@@ -250,9 +279,18 @@
     const outPng = (d ? d + sep : '') + State.scene + '.png';
     const btn = $('wf-render');
     if (btn) btn.disabled = true;
-    VCS.log('VMD 渲染场景 ' + State.scene + ' …');
+    const server = (document.querySelector('input[name="wf-render-loc"]:checked') || {}).value === 'server';
+    VCS.log((server ? '服务器(实验性)' : '本机') + ' VMD 渲染场景 ' + State.scene + ' …');
     try {
-      const r = await VCS.call('wavefn_render', State.scene, files, outPng, renderParams(), null);
+      let r;
+      if (server) {
+        const cl = ($('wf-render-cluster') && $('wf-render-cluster').value) || '';
+        const rdir = ($('wf-render-dir') && $('wf-render-dir').value.trim()) || '';
+        if (!cl) { VCS.log('服务器渲染:请选集群', 'failc'); return; }
+        r = await VCS.call('wavefn_render_remote', State.scene, files, cl, null, rdir, 'vmd', false, renderParams());
+      } else {
+        r = await VCS.call('wavefn_render', State.scene, files, outPng, renderParams(), null);
+      }
       const out = $('wf-render-out');
       if (!r || r.ok === false || r.error) {
         VCS.log('渲染失败:' + ((r && r.error) || '未知错误'), 'failc');
@@ -308,6 +346,104 @@
     VCS.log('极值查询完成:极小 ' + (r.minima || []).length + ' / 极大 ' + (r.maxima || []).length, 'okc');
   }
 
+  // ── 渲染位置(本机/服务器)切换 ──
+  function onRenderLocChange() {
+    const server = (document.querySelector('input[name="wf-render-loc"]:checked') || {}).value === 'server';
+    ['wf-render-cluster', 'wf-render-dir'].forEach(id => { const el = $(id); if (el) el.hidden = !server; });
+    if (server) {
+      const sel = $('wf-render-cluster');
+      if (sel && !sel.options.length) VCS.call('list_profiles').then(r => {
+        const profs = (r && r.profiles) || [];
+        sel.innerHTML = profs.length
+          ? profs.map(p => `<option value="${VCS.esc(p.name)}">${VCS.esc(p.name)}</option>`).join('')
+          : '<option value="">(未配置集群)</option>';
+      });
+    }
+  }
+
+  // ── Fukui / CDFT 四描述符(走 wavefn_run_extra 的 fukui_cdft) ──
+  async function runFukui(which) {
+    const wf = ($('wf-file') && $('wf-file').value.trim()) || '';
+    if (!wf) { VCS.log('Fukui:请在「输入与分析」选波函数文件', 'failc'); return; }
+    const out = $('wf-fukui-out');
+    if (out) out.textContent = '计算 Fukui/CDFT(需 N-1/N/N+1 波函数)…';
+    const r = await VCS.call('wavefn_run_extra', wf, ['fukui_cdft'], { which: which }, null, null);
+    const res = (r && r.results && r.results[0]) || {};
+    if (res.ok) {
+      if (out) out.textContent = '已产出 ' + (res.outputs || []).join('、') + ',可在上方渲染等值面';
+      VCS.log('Fukui/CDFT(' + which + ')完成', 'okc');
+    } else {
+      if (out) out.textContent = res.error || '引擎待扩展;可复制 stdin 脚本手动运行';
+      if (res.script) VCS.log('Fukui/CDFT 脚本:\n' + res.script.slice(0, 80) + '…', 'warnc');
+    }
+  }
+
+  // ── NCI/IRI 散点 ──
+  async function scatter() {
+    const f1 = ($('wf-sc-f1') && $('wf-sc-f1').value.trim()) || '';
+    const f2 = ($('wf-sc-f2') && $('wf-sc-f2').value.trim()) || '';
+    if (!f1 || !f2) { VCS.log('散点图:请指定 func1(sign(λ2)ρ)与 func2(RDG)cube', 'failc'); return; }
+    const kind = ($('wf-sc-kind') && $('wf-sc-kind').value) || 'nci';
+    VCS.log('生成 ' + kind.toUpperCase() + ' 散点(RDG vs sign(λ2)ρ)…');
+    const r = await VCS.call('wavefn_scatter', f1, f2, kind, 3000, null);
+    const out = $('wf-scatter-out');
+    if (!r || r.ok === false || r.error) { VCS.log('散点失败:' + ((r && r.error) || '未知'), 'failc'); return; }
+    renderScatter(r.points || [], kind, out);
+    VCS.log(kind.toUpperCase() + ' 散点:' + r.n + ' 点', 'okc');
+  }
+  function renderScatter(points, kind, out) {
+    if (!out) return;
+    out.innerHTML = '<div id="wf-scatter-chart" style="height:280px"></div>' +
+      `<div class="sub">${VCS.esc(kind.toUpperCase())} 散点:横轴 sign(λ₂)ρ(a.u.),纵轴 RDG;共 ${points.length} 点</div>`;
+    if (typeof echarts === 'undefined') { out.querySelector('#wf-scatter-chart').textContent = '(echarts 未加载)'; return; }
+    const ch = echarts.init(out.querySelector('#wf-scatter-chart'));
+    ch.setOption({
+      grid: { left: 48, right: 16, top: 16, bottom: 40 },
+      xAxis: { name: 'sign(λ2)ρ', type: 'value', min: -0.05, max: 0.05 },
+      yAxis: { name: 'RDG', type: 'value', min: 0, max: 2 },
+      series: [{ type: 'scatter', symbolSize: 3, data: points.map(p => [p.x, p.y]) }],
+    });
+  }
+  async function espBar() {
+    const d = ($('wf-out-dir') && $('wf-out-dir').value.trim()) || '';
+    if (!d) { VCS.log('ESP 面积分布:请选 output 文件夹', 'failc'); return; }
+    // output 可视化:选文件夹 → 取其中 ESP 极值(esp_extrema)作面积分布柱状(经查询极值近似)
+    VCS.log('output 可视化(ESP 面积分布)当前经「查询极值」呈现,请在上方选波函数文件后查询极值', 'warnc');
+    VCS.toast('已记录 output 文件夹;ESP 面积分布见极值查询');
+  }
+
+  // ── 能级 / BCP 查询(可复制) ──
+  async function queryHomoLumo() {
+    const wf = ($('wf-file') && $('wf-file').value.trim()) || '';
+    if (!wf) { VCS.log('能级查询:请先选波函数文件', 'failc'); return; }
+    const r = await VCS.call('wavefn_run', wf, ['homo_lumo_cube'], analysisParams(), null, null);
+    const res = (r && r.results && r.results[0]) || {};
+    const el = $('wf-homolumo-val');
+    const txt = res.ok ? ('已导出 HOMO/LUMO 轨道 cube:' + (res.outputs || []).join('、'))
+      : (res.error || '需 Multiwfn');
+    if (el) el.textContent = txt;
+    const cp = $('wf-homolumo-copy');
+    if (cp) { cp.hidden = false; cp.onclick = () => copyText(txt); }
+    VCS.log('HOMO-LUMO:' + txt, res.ok ? 'okc' : 'warnc');
+  }
+  async function queryBcp() {
+    const wf = ($('wf-file') && $('wf-file').value.trim()) || '';
+    if (!wf) { VCS.log('BCP 查询:请先选波函数文件', 'failc'); return; }
+    const r = await VCS.call('wavefn_run', wf, ['aim_cp'], analysisParams(), null, null);
+    const res = (r && r.results && r.results[0]) || {};
+    const el = $('wf-bcp-val');
+    const txt = res.ok ? ('AIM 临界点已导出:' + (res.outputs || []).join('、') + '(ρ/键能见 CPprop.txt)')
+      : (res.error || '需 Multiwfn');
+    if (el) el.textContent = txt;
+    const cp = $('wf-bcp-copy');
+    if (cp) { cp.hidden = false; cp.onclick = () => copyText(txt); }
+    VCS.log('AIM BCP:' + txt, res.ok ? 'okc' : 'warnc');
+  }
+  async function copyText(t) {
+    try { if (navigator.clipboard) await navigator.clipboard.writeText(t); } catch (e) { /* 忽略 */ }
+    VCS.toast('已复制');
+  }
+
   // ── 初始化 ──
   function wire(id, fn) { const el = $(id); if (el) el.addEventListener('click', fn); }
   let inited = false;
@@ -333,6 +469,24 @@
     });
     wire('wf-render', render);
     wire('wf-extrema', queryExtrema);
+    // 渲染位置切换 + 新可视化工具(Fukui/散点/ESP/能级/BCP)
+    document.querySelectorAll('input[name="wf-render-loc"]').forEach(
+      r => r.addEventListener('change', onRenderLocChange));
+    document.querySelectorAll('.wf-fukui').forEach(b => b.addEventListener('click', () => runFukui(b.dataset.f)));
+    wire('wf-scatter-btn', scatter);
+    wire('wf-out-btn', espBar);
+    wire('wf-homolumo-btn', queryHomoLumo);
+    wire('wf-bcp-btn', queryBcp);
+    wire('wf-elflol-link', () => {
+      State.sel.add('elf_lol_section');
+      showTab('analyze'); renderAnalysisChips();
+      const plane = $('wf-plane-row'); if (plane) plane.hidden = false;
+      VCS.toast('已选中 ELF/LOL 截面,设好切面后运行分析');
+    });
+    document.querySelectorAll('.wf-sc-browse').forEach(b => b.addEventListener('click', async () => {
+      const r = await VCS.call('pick_file', 'cube');
+      if (r && r.path) { const inp = $(b.dataset.t === 'f1' ? 'wf-sc-f1' : 'wf-sc-f2'); if (inp) inp.value = r.path; }
+    }));
     // 产物带入可视化
     const fo = $('wf-fromoutputs');
     if (fo) fo.addEventListener('click', e => {

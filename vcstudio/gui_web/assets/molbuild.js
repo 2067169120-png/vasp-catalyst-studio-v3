@@ -291,11 +291,61 @@
   }
   function stopPoll() { if (State.poll) { clearInterval(State.poll); State.poll = null; } }
 
+  // ── 溶剂化复合物(核 + 显式溶剂盒)──
+  async function loadSolventPresets() {
+    const sel = $('solv-preset');
+    if (!sel) return;
+    const r = await VCS.call('solvent_presets');
+    const presets = (r && r.presets) || [];
+    sel.innerHTML = presets.map(p => `<option value="${VCS.esc(p.key)}">${VCS.esc(p.label)}(${VCS.esc(p.key)})</option>`).join('');
+  }
+  function solvArgs() {
+    return {
+      core: ($('solv-core') && $('solv-core').value) || 'Li2S3',
+      preset: ($('solv-preset') && $('solv-preset').value) || 'lis_electrolyte',
+      box: parseFloat(($('solv-box') && $('solv-box').value) || '18') || 18,
+    };
+  }
+  async function buildSolvated(save) {
+    const a = solvArgs();
+    let saveTo = null;
+    if (save) {
+      const d = await VCS.call('pick_dir');
+      if (!d || !d.path) return;
+      const sep = d.path.indexOf('\\') >= 0 ? '\\' : '/';
+      saveTo = d.path + sep + a.core + '_solvated.vasp';
+    }
+    VCS.log('组装溶剂化复合物(' + a.core + ' + ' + a.preset + ')…');
+    const r = await VCS.call('build_solvated', a.core, a.preset, a.box, 2.5, 42, saveTo);
+    const out = $('solv-out');
+    if (!r || r.ok === false || r.error) {
+      VCS.log('溶剂化组装失败:' + ((r && r.error) || '未知'), 'failc');
+      if (out) out.innerHTML = `<span class="sub" style="color:var(--fail)">${VCS.esc((r && r.error) || '失败')}</span>`;
+      return;
+    }
+    if (out) out.innerHTML = `<b>${r.n_atoms}</b> 原子 · ${VCS.esc(r.note || '')}`;
+    if (saveTo) { VCS.log('已保存:' + r.saved_to, 'okc'); VCS.toast('已保存溶剂化 POSCAR'); return; }
+    // 载入编辑器(经临时 POSCAR → struct_load)
+    if (r.temp_path) {
+      const sr = await VCS.call('struct_load', r.temp_path);
+      if (sr && sr.ok && sr.struct && window.Editor && window.Editor.loadStruct) {
+        window.Editor.loadStruct(sr.struct, null, null);
+        VCS.log('溶剂化复合物已载入编辑器:' + r.n_atoms + ' 原子', 'okc');
+        VCS.toast('已载入编辑器');
+      } else {
+        VCS.log('已组装 ' + r.n_atoms + ' 原子(载入编辑器失败,可点保存 POSCAR)', 'warnc');
+      }
+    }
+  }
+
   // ── 初始化 ──
   function wire(id, fn) { const el = $(id); if (el) el.addEventListener('click', fn); }
   let inited = false;
   function init() {
     if (inited) return; inited = true;
+    wire('solv-build', () => buildSolvated(false));
+    wire('solv-save', () => buildSolvated(true));
+    loadSolventPresets();
     wire('mol-img-btn', pickImage);
     wire('mol-ocsr-run', runOcsr);
     wire('mol-svg-refresh', refreshSvg);

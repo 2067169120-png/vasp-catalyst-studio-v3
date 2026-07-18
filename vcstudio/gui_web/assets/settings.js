@@ -50,7 +50,21 @@
     if ($('set-ap-fetch')) $('set-ap-fetch').checked = ui.autopilot_fetch !== false;
     if ($('set-ap-report')) $('set-ap-report').checked = ui.autopilot_report !== false;
 
+    const fig = s.figures || {};
+    setSel('set-fig-journal', fig.journal_style || 'nature');
+    if ($('set-fig-auto')) $('set-fig-auto').checked = fig.auto_figures !== false;
+    if ($('set-fig-panel')) $('set-fig-panel').checked = fig.multi_panel !== false;
+
     loadWorkspace();          // 界面语言 + 研究场景下拉
+  }
+
+  async function saveFigPrefs() {
+    const r = await VCS.call('figure_prefs_save',
+      ($('set-fig-journal') && $('set-fig-journal').value) || 'nature',
+      $('set-fig-auto') ? $('set-fig-auto').checked : true,
+      $('set-fig-panel') ? $('set-fig-panel').checked : true);
+    if (r && r.ok) { VCS.log('已保存出图偏好', 'okc'); VCS.toast('已保存出图偏好'); }
+    else VCS.log('保存出图偏好失败:' + ((r && r.error) || '未知'), 'failc');
   }
 
   function renderKeyState(saved) {
@@ -234,6 +248,7 @@
     wire('set-molecules-btn', 'click', () => pickDirInto('set-molecules'));
     wire('set-paths-save', 'click', savePaths);
     wire('set-ap-save', 'click', saveAutopilot);
+    wire('set-fig-save', 'click', saveFigPrefs);
     wire('set-lang', 'change', onLangChange);
     wire('set-scenario', 'change', onScenarioChange);
     const row = $('set-theme-row');
