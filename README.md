@@ -1,11 +1,16 @@
 # VASP Catalyst Studio (vcstudio)
 
-Lightweight desktop automation platform for VASP catalysis workflows:
-**input generation → multi-cluster submission → failure diagnosis → bounded
-recovery → ΔE / free-energy analysis → publication-ready reports** — packaged
-as a single Windows EXE, with a deterministic zero-token core (LLM only in the
-optional analysis layer) and fully offline operation (your data never leaves
-your machine).
+Desktop **full-DFT computing platform** with an autopilot pipeline — from
+structure to paper in one place. Two workflow lines: a **periodic catalysis
+main line** (SAC batch modeling → 23-type task catalog → multi-cluster
+submission → failure diagnosis → bounded self-healing → ΔE/ΔG/electronic
+structure/NEB analysis → one-click publication figure sets → reports & draft
+manuscripts) and a **molecular line** (image→SMILES→3D→Gaussian→Multiwfn 16
+analyses→VMD rendering), both running on a file-based campaign control plane
+(task DAG, completed/validated/accepted three-state gates, method-fingerprint
+consistency, compute-budget caps). Packaged as a single Windows EXE with a
+deterministic zero-token core (LLM only in the optional assistant layer, never
+in the numeric chain) and fully offline operation.
 
 > 📂 Repository map: **[STRUCTURE.md](STRUCTURE.md)** ·
 > 中文完整用法: **[使用说明.md](使用说明.md)** ·
@@ -14,7 +19,10 @@ your machine).
 
 ## 软件流程图 · Workflow
 
-全流程 **生成 → 提交 → 监控/诊断 → 有界恢复 → 分析/报告**,每个区块标注了负责的代码包:
+双线工作流:**周期性催化主线**(①结构建模 → ②生成输入(23 种任务目录)→ ③提交计算 →
+自动驾驶环(监控→诊断→自愈≤3轮)→ ④结果分析 → ⑥论文出图 → 产出)与
+**分子计算线**(图片识别 → 3D 建模 → Gaussian → ⑤波函数分析 → VMD 渲染),
+共同跑在 **campaign 控制面**(任务 DAG/三态/三门禁)上,⑦AI 助手横贯全程但绝不进数值链路:
 
 ![vcstudio 流程图](docs/vcstudio-flowchart.png)
 
@@ -32,6 +40,10 @@ your machine).
 | ⑧ 通用 CHE 引擎 (v3.1) | `vcstudio/project/` | 反应网络预设(Li-S 16e/缔合解离/ORR/HER/OER/CO2RR),U_eq/U_L/η,多电位台阶 | `reactions.py` `freeenergy.free_energy_path` |
 | ⑨ campaign 控制面 (v3.1) | `vcstudio/campaign/` | 文件式任务 DAG:三态(completed/validated/accepted)、三门禁(提交/验收/报告)、方法指纹、决策账本、机时预算闸 | `schema.py` `states.py` `gates.py` `fingerprint.py` `ledger.py` `budget.py` `derive.py` |
 | 跨层基础 Shared | `vcstudio/shared/` | 配置、清单(job.yaml状态机)、凭据(keyring) | `config.py` `manifest.py` `secrets.py` |
+| ⑩ 分子线 Molecular (v3.1.1) | `vcstudio/molbuild/` + `external/` | 图片识别(DECIMER)/SMILES→3D(RDKit)/外部编辑器联动;Multiwfn 16 种分析/VMD Tachyon 渲染/本机运行器 | `ocsr.py` `smiles3d.py` `multiwfn_driver.py` `vmd_driver.py` `cluster/local_runner.py` |
+| ⑪ 全 DFT 目录 TaskCatalog (v3.2) | `vcstudio/generate/` + `project/` | 23 种计算类型五分类:收敛扫描/能带/EOS/功函数/表面能/Dimer/VASPsol/DFT+U 值库 | `task_catalog.py` `conv_scan.py` `bands_builder.py` `eos.py` `workfunction.py` `u_library.py` |
+| ⑫ 一键出图与 AI Pipeline (v3.2) | `vcstudio/project/` | 场景感知整套图+多面板拼版+图表溯源;计算活动模板全链推进;论文数据抽取→MAE 对照→变体推荐→论文草稿骨架 | `auto_figures.py` `panel_composer.py` `campaign_templates.py` `paper_data.py` `variant_advisor.py` `manuscript_draft.py` |
+| 多引擎 Engines (v3.1.1) | `vcstudio/engines/` | CalcSpec IR + VASP/CP2K/Gaussian/CASTEP 文件级后端;跨引擎不等价清单+参考态一致性闸 | `calcspec.py` `gaussian.py` `cp2k.py` `castep.py` `equivalence.py` |
 | 界面 GUI | `vcstudio/gui_web/`(默认 Web)+ `gui/`(旧 tkinter) | pywebview 前端 + `api.py` 薄门面;工作流式九页:概览/①结构建模/②生成输入/③提交计算/④结果分析/⑤论文出图/⑥AI助手/集群/设置 | `gui_web/api.py` `assets/*.js` |
 
 ## Statement of need
@@ -188,26 +200,29 @@ via [CITATION.cff](CITATION.cff). Licensed under [MIT](LICENSE).
 
 ## 中文速览
 
-轻量化 VASP 自动化桌面平台:生成输入 → 多集群提交 → 失败诊断 → 有界恢复 →
-ΔE/自由能分析 → 出版级报告。Windows 单文件 EXE,确定性核心零 token,
-全离线运行。
+全 DFT 计算桌面自动驾驶平台:从结构到论文一站式。周期性催化主线(SAC 批量建模 →
+23 种计算类型 → 多集群提交 → 诊断自愈 → ΔE/ΔG/电子结构/NEB → 一键整套论文图 →
+报告与论文骨架)+ 分子线(图片识别 → 3D 建模 → Gaussian → Multiwfn 波函数 16 种 →
+VMD 渲染),跑在 campaign 控制面上(任务 DAG/三态门禁/方法指纹/机时闸)。
+Windows 单文件 EXE,确定性核心零 token,AI 只做助手绝不进数值链路,全离线运行。
 
-- **快速开始**:双击 `dist\VASP Catalyst Studio.exe`(默认 Web,五页:仪表盘/生成/
-  吸附能项目/任务/集群;命令行 `vcs gui`,`--legacy` 用旧 tkinter);
+- **快速开始**:从 [Releases](https://github.com/2067169120-png/vasp-catalyst-studio-v3/releases)
+  下载 EXE 双击即用(工作流九页:概览/①结构建模/②生成输入/③提交计算/④结果分析/
+  ⑤波函数分析/⑥论文出图/⑦AI助手/集群/设置;命令行 `vcs gui`,`--legacy` 旧 tkinter);
   改完代码双击 `重新打包EXE.bat` 重打包
 - **离线体验**:[examples/quickstart](examples/quickstart/README.md)
   (石墨烯示例+假赝势库,五分钟跑通全链);
   [examples/offline_analysis](examples/offline_analysis/README.md)
   (合成的已完成作业 → 诊断/ΔE/出图/报告,审稿人无 VASP/集群即可验证分析链路)
 - **完整用法**:[使用说明.md](使用说明.md);目录结构:[STRUCTURE.md](STRUCTURE.md)
-- **测试**:`python -m pytest`(1401 用例,3 项在无 OriginLab/POV-Ray/真机时跳过)
+- **测试**:`python -m pytest`(2009 用例,6 项在无 OriginLab/POV-Ray/rdkit 时跳过)
 - **科学约定/发刊工具链**:同上英文节;竞品对比见
   [docs/comparison.md](docs/comparison.md),验证协议见
   [docs/validation.md](docs/validation.md)
 
 ```
-vcstudio/       核心包(generate/cluster/project/external/gui/shared/cli)
-tests/          1401 测试   docs/superpowers/specs/  设计文档
+vcstudio/       核心包(generate/cluster/project/external/engines/molbuild/campaign/gui_web/shared/cli)
+tests/          2009 测试   docs/superpowers/specs/  设计文档
 config.example.yaml  配置模板(复制为 config.yaml 填写;config.yaml 已 gitignore)
 dist/           打包产物 EXE(gitignore)   results/  作业输出(不入 git)
 ```
