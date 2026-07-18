@@ -20,7 +20,7 @@ from vcstudio.generate.incar_builder import incar_dict_to_str, parse_incar
 from vcstudio.generate.kpoints import kpoints_str, recommend_kpoints
 from vcstudio.generate.poscar import read_cell_vectors
 
-_PURPOSES = ('pdos', 'bader', 'chgdiff', 'esp')
+_PURPOSES = ('pdos', 'bader', 'chgdiff', 'esp', 'elf')
 
 # purpose → 追加的输出标志(值为 True 序列化成 .TRUE.)
 _PURPOSE_KEYS = {
@@ -28,6 +28,8 @@ _PURPOSE_KEYS = {
     'bader': OrderedDict([('LAECHG', True), ('LCHARG', True)]),
     'chgdiff': OrderedDict([('LCHARG', True)]),
     'esp': OrderedDict([('LVTOT', True)]),
+    # elf:电子局域函数,LELF=.TRUE. → 产出 ELFCAR(VESTA 可视化共价/孤对/金属键)
+    'elf': OrderedDict([('LELF', True)]),
 }
 
 
@@ -167,6 +169,13 @@ def build_static_job(relax_dir, out_dir, *, purpose: str = 'pdos',
 
     for k, v in _PURPOSE_KEYS[purpose].items():
         _set(k, v, f'purpose={purpose} 需要')
+
+    if purpose == 'elf':
+        # ELF(LELF=.TRUE.)与并行 NPAR 兼容性:部分 VASP 版本 NPAR>1 时 ELFCAR 分区不正确,
+        # 且 LELF 与 NCORE(NCORE·NPAR=总核)互斥语义。绝不静默,显式提醒核对。
+        warnings.append(
+            'ELF 计算(LELF=.TRUE.)产出 ELFCAR;注意 ELF 与并行 NPAR 兼容性——部分 VASP '
+            '版本 NPAR>1 时 ELFCAR 可能不正确,建议设 NPAR=1(或改用 NCORE=1)并核对版本。')
 
     if drop_incar:
         for k in drop_incar:

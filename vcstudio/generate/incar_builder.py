@@ -308,6 +308,34 @@ def dipole_correction_keys(poscar_text, calc_type) -> dict:
             'DIPOL': f'{frac[0]:.4f} {frac[1]:.4f} {frac[2]:.4f}'}
 
 
+# VASPsol 隐式溶剂化顾问文本(需补丁编译;标准 VASP 会静默忽略 → 真空结果):
+VASPSOL_ADVISORY = (
+    'VASPsol 隐式溶剂化需 VASP 打 VASPsol 补丁并重新编译:标准 VASP 无 LSOL/EB_K 支持,'
+    '直接提交会**静默忽略**这些键、给出真空(gas-phase)结果而不报错——提交前务必确认集群 '
+    'VASP 版本已含 VASPsol。相对介电常数 EB_K 默认 78.4(300 K 水);其他溶剂查文献'
+    '(如乙腈 37.5、乙醇 24.9)。溶剂化能须与真空同几何单点相减,口径请在方法学写明。')
+
+
+def vaspsol_keys(enabled: bool = True, *, eb_k: float = 78.4) -> dict:
+    """VASPsol 隐式溶剂化 INCAR 键(独立顾问函数,**只给键不强塞**;调用方自行合并)。
+
+    与 dipole_correction_keys 同口径:返回纯 INCAR 键 dict,不 mutate 任何输入,不生成
+    文件。advisor 式提醒见模块常量 ``VASPSOL_ADVISORY``(补丁编译要求 + 标准 VASP 静默
+    真空陷阱),调用方应把该文本作为 warning 暴露给用户。
+
+    Args:
+        enabled: True → ``{'LSOL': True, 'EB_K': eb_k}`` 开溶剂化;
+            False → ``{'LSOL': False}``(显式关,占位便于真空/溶剂对照口径)。
+        eb_k: 相对介电常数(默认 78.4 = 300 K 水)。仅 enabled=True 时写入。
+
+    Returns:
+        dict(LSOL[/EB_K])。EB_K 为浮点。
+    """
+    if not enabled:
+        return {'LSOL': False}
+    return {'LSOL': True, 'EB_K': float(eb_k)}
+
+
 def dispersion_audit(incar_texts: list) -> dict:
     """项目内多份 INCAR 的 IVDW(色散)一致性审计 → {'ok','ivdw','detail'}。
 
