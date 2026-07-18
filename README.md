@@ -132,6 +132,10 @@ silent (job.yaml state machine + audit history).
 
 **1401 测试通过(3 跳过)**。完整清单见 [CHANGELOG.md](CHANGELOG.md);路线图与验证计划见 [v3.1 总体方案](docs/planning/v3.1-总体方案.md)(端到端复现文献 MAE 表为下一步验证项)。
 
+### v3.1.1(2026-07-18):分子计算全流程
+
+对齐 starpivot-DFT 全部功能与选项并超越:图片识别(DECIMER)→SMILES→RDKit 3D 建模→Gaussian 输入(九种任务/溶剂模型/周期表混合基组 Gen-GenECP/资源行)→批量提交(任意输入文件/筛选排序/勾选批量取消/**本机运行**)→**波函数分析八件套**(ESP/ALIE/HOMO-LUMO/IGMH/NCI-RDG/IRI/AIM,Multiwfn 本机/远程)→**VMD 一键可视化**(Tachyon 渲染/极值点标注);编辑器样式视角测量原子表;AIMD 派生;远端文件管理。工作流侧栏更新为 ①结构建模→②生成输入→③提交计算→④结果分析→⑤波函数分析→⑥论文出图→⑦AI助手。**1704 测试通过(6 跳过)**。
+
 ## Install & quickstart
 
 **GUI (Windows)**: double-click `dist\VASP Catalyst Studio.exe`

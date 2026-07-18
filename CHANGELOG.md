@@ -1,5 +1,38 @@
 # 更新日志 / Changelog
 
+## v3.1.1 — 2026-07-18 · 分子计算全流程(对齐并超越 starpivot-DFT)
+
+新增分子这条腿,与周期性催化主线并列。1704 项测试。
+
+### 分子建模链(①结构建模·分子建模分区)
+- 图片识别:DECIMER 图→SMILES(可编辑)+RDKit 2D 键线式渲染+复制(可选依赖,未装给指引)
+- SMILES→3D:RDKit ETKDGv3+MMFF94/UFF(力场可选,seed 可复现)→直接载入 3D 编辑器
+- 编辑器增强:球棍/仅键/线框/空间填充样式、±X/±Y/±Z/等距视角、保存图片、键长键角测量、原子列表表格、分子式/电子数属性、全选/删除选中
+- 外部编辑器联动:GaussView/Avogadro 导出打开→改完检测导入(mtime 轮询)
+- 保存 xyz/mol/pdb
+
+### Gaussian 输入完整化(②生成输入)
+- 任务九种:Opt/Freq/Opt+Freq/单点/TD 激发态/IRC/柔性扫描(ModRedundant)/NMR/过渡态优化(TS+Freq 验证)
+- 泛函/基组常用下拉+自定义;色散 D3/D3BJ;溶剂 SMD/PCM/CPCM+常用溶剂+Generic 自定义 eps/epsinf
+- %nprocshared/%mem/%chk;混合基组 Gen/GenECP:**元素周期表点选配基组**(1-86,ECP 勾选)
+- 预览/复制剪贴板/导出/提交联动;附加段顺序守恒(坐标→ModRedundant→基组→ECP→SCRF)
+
+### 提交与运行(③)
+- 任意 .gjf/.com/.inp/.cell 多文件快速批量提交(自动识别引擎入台账)
+- 作业列表:集群/状态筛选+排序+勾选批量取消(qdel/scancel 回写)
+- **本机运行**:分子/快速作业本地软件直跑(跨平台运行器,日志尾随,可停止)
+- 文件管理:远端目录浏览+文件下载
+
+### 波函数分析与可视化(⑤新页,对齐 starpivot 七件套并超越)
+- Multiwfn 驱动:ESP 极值/ESP 面/**ALIE**/HOMO-LUMO/NCI-RDG/IGMH/**IRI**/AIM 八种分析,本机或远程(实验性);缺 Multiwfn 给可复制命令流
+- VMD 批渲染:ESP 着色表面(极值点标注球)/ALIE 表面/轨道/NCI/IRI/结构 CPK,Tachyon 高清,缺 VMD 给 tcl
+- 外部工具路径统一设置+探测
+
+### 周期性侧补全
+- AIMD 输入派生(NVT Nose-Hoover/NVE,温度/步长/步数,继承源 INCAR 留痕)+OSZICAR MD 能量-温度解析
+- 结果分析页 DONE 作业一键派生 AIMD
+
+
 ## v3.1.0 — 2026-07-17 · DFT 全通量管线
 
 从"吸附能工具"升级为"催化计算桌面自动驾驶平台"。1401 项测试。
