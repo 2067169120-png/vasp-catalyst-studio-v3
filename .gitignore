@@ -4,6 +4,9 @@ __pycache__/
 .eggs/
 build/
 dist/
+# 发布产物构建目录(wheel/sdist/绿色便携包,由会话内构建、上传 Release,不进版本库)
+dist_release/
+portable_build/
 .pytest_cache/
 .venv/
 venv/
