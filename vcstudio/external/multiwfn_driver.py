@@ -403,6 +403,56 @@ def extrema_parse(text: str) -> dict:
     return {'minima': minima, 'maxima': maxima}
 
 
+# ── CPprop.txt 解析(纯函数;AIM 拓扑分析产物) ─────────────────────────────────
+BOHR_TO_ANGST = 0.52917721067   # 1 Bohr → Å(CODATA)
+_KCAL_PER_AU = 627.509474       # 1 Hartree → kcal/mol
+
+_CP_HEAD_RE = re.compile(r'CP\s+(\d+),\s*Type\s*\(\s*(\d)\s*,\s*([+-]?\d)\s*\)')
+_FLOAT = r'(-?\d+(?:\.\d+)?(?:[EeDd][+-]?\d+)?)'
+_CP_POS_RE = re.compile(r'Position\s*\(Bohr\)\s*:\s*' + _FLOAT + r'\s+' + _FLOAT + r'\s+' + _FLOAT)
+_CP_RHO_RE = re.compile(r'Density of all electrons\s*:\s*' + _FLOAT)
+_CP_V_RE = re.compile(r'Potential energy density\s*V\(r\)\s*:\s*' + _FLOAT)
+
+
+def _cp_float(tok: str) -> float:
+    return float(tok.replace('D', 'E').replace('d', 'e'))   # Fortran D 记号容忍
+
+
+def cpprop_parse(text: str) -> list:
+    """解析 AIM 拓扑分析(主功能 2)导出的 CPprop.txt → 逐临界点列表。
+
+    返回 ``[{'index','type','xyz_bohr','xyz_angst','rho','v','bond_energy_kcal'}, ...]``:
+    - type 形如 '(3,-3)' 核 NCP / '(3,-1)' 键 BCP / '(3,+1)' 环 RCP / '(3,+3)' 笼 CCP;
+    - rho=该点电子密度(a.u.),v=势能密度 V(r)(a.u.;文件缺此字段 → None);
+    - bond_energy_kcal 仅对 (3,-1) 且有 V(r) 时给 **Espinosa 经验估算** E≈V(r)/2
+      (换算 kcal/mol)。该式面向氢键等弱相互作用 BCP,共价键不适用——是估算不是精确
+      口径,展示端须注明。其余 CP → None,绝不编数。
+    字段缺失/版本导出差异一律容忍(对应键给 None),坐标同时给 Bohr 原值与 Å 换算。
+    """
+    cps: list = []
+    heads = list(_CP_HEAD_RE.finditer(text or ''))
+    for i, h in enumerate(heads):
+        block = text[h.end(): heads[i + 1].start() if i + 1 < len(heads) else len(text)]
+        cp_type = f'({h.group(2)},{int(h.group(3)):+d})'
+        pos = _CP_POS_RE.search(block)
+        rho = _CP_RHO_RE.search(block)
+        v = _CP_V_RE.search(block)
+        xyz_bohr = [_cp_float(g) for g in pos.groups()] if pos else None
+        v_au = _cp_float(v.group(1)) if v else None
+        bond_e = None
+        if cp_type == '(3,-1)' and v_au is not None:
+            bond_e = round(v_au / 2.0 * _KCAL_PER_AU, 3)   # Espinosa: E ≈ V(r)/2
+        cps.append({
+            'index': int(h.group(1)), 'type': cp_type,
+            'xyz_bohr': xyz_bohr,
+            'xyz_angst': ([round(c * BOHR_TO_ANGST, 6) for c in xyz_bohr]
+                          if xyz_bohr else None),
+            'rho': _cp_float(rho.group(1)) if rho else None,
+            'v': v_au, 'bond_energy_kcal': bond_e,
+        })
+    return cps
+
+
 # ── 运行 ─────────────────────────────────────────────────────────────────────
 def _tail(text: str, n: int = 60) -> str:
     """取文本末 n 行(stdout 尾部;ESP 极值等结果一般落在输出末段)。"""

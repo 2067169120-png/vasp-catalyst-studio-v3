@@ -89,6 +89,8 @@
       (role ? ` <span class="role-tag">${VCS.esc(role)}</span>` : '') +
       (task ? ` <span class="sub">${VCS.esc(task)}</span>` : '') +
       ` <button class="lnk conv" title="查看收敛过程(E0/ΔE/|F|max vs 离子步)">收敛</button>` +
+      (['RUNNING', 'QUEUED', 'SUBMITTED', 'UPLOADED'].indexOf(r.state) >= 0
+        ? `<button class="lnk live" title="实时能量曲线:本地无 OSZICAR 时经 SSH 读远端,可轮询">实时</button>` : '') +
       `<button class="lnk struct" title="3D 结构预览(CONTCAR 优先,自动检查分子-衬底距离)">结构</button>` +
       `<button class="lnk meth" title="生成中英双语 Methods 段 + BibTeX(读真实 INCAR/KPOINTS/POTCAR)">方法</button>` +
       `<button class="lnk dos" title="总 DOS 出图(需本地 vasprun.xml)">DOS</button>` +
@@ -293,6 +295,13 @@
       }
       const tr = e.target.closest('tr[data-dir]');
       if (!tr) return;
+      // 「实时」按钮:打开实时能量曲线面板(v3.3.0,不参与行选中)
+      if (e.target.closest('.live')) {
+        e.stopPropagation();
+        const row = State.rows.find(x => x.dir === tr.dataset.dir) || {};
+        liveOpen(tr.dataset.dir, tr.dataset.name || tr.dataset.dir, row.cluster || '');
+        return;
+      }
       // 「收敛」/「结构」按钮:打开对应视图,不参与行选中
       if (e.target.closest('.conv')) {
         e.stopPropagation();
@@ -1041,6 +1050,78 @@
   }
 
   // ── 初始化 ─────────────────────────────────────────────────────────────────
+  // ── v3.3.0 实时能量曲线:本地 OSZICAR 优先,远端 SSH 轮询(对齐 starpivot 任务监控) ──
+  const Live = { dir: null, name: '', cluster: '', pw: null, timer: null, chart: null, busy: false };
+  function liveStop(hide) {
+    if (Live.timer) { clearInterval(Live.timer); Live.timer = null; }
+    if (hide) { const p = $('#jobs-live'); if (p) p.hidden = true; Live.dir = null; }
+  }
+  function liveSchedule() {
+    if (Live.timer) { clearInterval(Live.timer); Live.timer = null; }
+    const sec = parseInt(($('#jl-interval') && $('#jl-interval').value) || '30', 10);
+    if (sec > 0 && Live.dir) Live.timer = setInterval(() => livePoll(), sec * 1000);
+  }
+  async function liveOpen(dir, jobName, cluster) {
+    liveStop(false);
+    Live.dir = dir; Live.name = jobName || base(dir); Live.cluster = cluster || ''; Live.pw = null;
+    const p = $('#jobs-live'); if (p) p.hidden = false;
+    const t = $('#jl-title');
+    if (t) t.textContent = Live.name + (cluster ? '(' + cluster + ')' : '');
+    const note = $('#jl-note'); if (note) note.textContent = '读取中…';
+    let res;
+    if (cluster && State.profiles[cluster]) {
+      // 首次经 remote 壳走密码/信任流;捕获实际使用的密码供后续静默轮询
+      res = await remote(cluster, (pw, trust) => {
+        Live.pw = pw;
+        return VCS.call('job_live_energy', dir, cluster, pw, trust);
+      });
+      if (res === null) { liveStop(true); return; }
+    } else {
+      res = await VCS.call('job_live_energy', dir, null, null, false);
+    }
+    liveRender(res);
+    liveSchedule();
+  }
+  async function livePoll() {
+    if (!Live.dir || Live.busy) return;                  // 上一轮未返回则跳过本轮
+    Live.busy = true;
+    try {
+      const res = await VCS.call('job_live_energy', Live.dir, Live.cluster || null, Live.pw, false);
+      liveRender(res);
+    } finally { Live.busy = false; }
+  }
+  function liveRender(res) {
+    const note = $('#jl-note');
+    if (!res || res.ok === false || res.error) {
+      if (note) note.textContent = '⚠ ' + ((res && res.error) || '读取失败');
+      return;
+    }
+    const steps = res.steps || [];
+    if (!steps.length) {
+      if (note) note.textContent = '尚无离子步(SCF 进行中或刚启动),轮询将自动更新';
+      return;
+    }
+    const last = steps[steps.length - 1];
+    if (note) {
+      note.textContent = (res.source === 'remote' ? '远端 OSZICAR' : '本地 OSZICAR') +
+        ' · ' + steps.length + ' 离子步 · 末步 E0=' + last.e0 + ' eV' +
+        (last.de != null ? ' · |ΔE|=' + last.de + ' eV' : '') +
+        (res.state ? ' · 状态 ' + res.state : '') +
+        (Live.timer ? '' : '(手动刷新模式)');
+    }
+    const box = document.getElementById('jl-chart');
+    if (!box) return;
+    if (typeof echarts === 'undefined') { box.textContent = '(echarts 未加载,无法画曲线)'; return; }
+    if (!Live.chart) Live.chart = echarts.init(box);
+    Live.chart.setOption({
+      grid: { left: 74, right: 20, top: 24, bottom: 40 },
+      xAxis: { type: 'category', name: '离子步', data: steps.map(s => s.n) },
+      yAxis: { type: 'value', name: 'E0 (eV)', scale: true },
+      tooltip: { trigger: 'axis' },
+      series: [{ type: 'line', symbolSize: 5, data: steps.map(s => s.e0) }],
+    }, true);
+  }
+
   function wire(id, fn) { const el = $('#' + id); if (el) el.addEventListener('click', fn); }
 
   function init() {
@@ -1056,6 +1137,10 @@
     wire('jb-clean', doClean);
     wire('jb-checkall', checkAll);
     wire('jb-cancelchecked', batchCancel);
+    // 实时能量曲线面板(v3.3.0)
+    wire('jl-refresh', () => livePoll());
+    wire('jl-close', () => liveStop(true));
+    { const el = $('#jl-interval'); if (el) el.addEventListener('change', liveSchedule); }
     // 筛选行:变更即重渲
     ['jf-cluster', 'jf-status', 'jf-sort'].forEach(id => {
       const el = $('#' + id);

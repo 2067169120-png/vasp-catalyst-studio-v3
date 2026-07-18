@@ -335,6 +335,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     <div class="db-nums" id="db-overview">
       <div class="db-num"><b id="ov-jobs30">—</b><span data-i18n="overview.jobs30">近 30 天作业数</span></div>
       <div class="db-num"><b id="ov-ch30">—</b><span data-i18n="overview.ch30">近 30 天核时(估算)</span></div>
+      <div class="db-num"><b id="ov-used30">—</b><span data-i18n="overview.used30">近 30 天实耗核时</span></div>
       <div class="db-num ok"><b id="ov-remain">—</b><span data-i18n="overview.remain">剩余核时(预算 − 已花)</span></div>
       <div class="db-num mon"><b id="ov-monitor">—</b><span data-i18n="overview.monitor">实时监控</span></div>
     </div>
@@ -414,8 +415,9 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
         <div class="gen-fld">
           <span class="gen-lbl" data-i18n="mol.ocsr.image">分子结构图片(文献插图 / 手绘 / 截图)</span>
           <div class="gen-inrow">
-            <input id="mol-img-path" class="ipt" autocomplete="off" placeholder="图片文件路径(png / jpg …)">
+            <input id="mol-img-path" class="ipt" autocomplete="off" placeholder="图片文件路径(png / jpg …);或直接 Ctrl+V 粘贴截图">
             <button class="btn" id="mol-img-btn" data-i18n="common.browse">浏览</button>
+            <button class="btn" id="mol-paste-btn" title="读取剪贴板里的分子结构截图并识别(也可在本页直接 Ctrl+V)">粘贴图片</button>
             <button class="btn primary" id="mol-ocsr-run" data-i18n="mol.ocsr.run">开始识别</button>
           </div>
         </div>
@@ -1414,8 +1416,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
         <div class="gen-fld">
           <span class="gen-lbl" data-i18n="wavefn.visual.params">参数</span>
           <div class="wf-params">
-            <label data-i18n="wavefn.visual.iso">密度等值面 <input id="wf-iso" class="ipt" value="0.001" style="width:80px"></label>
-            <label data-i18n="wavefn.visual.orbiso">轨道 iso ± <input id="wf-orbiso" class="ipt" value="0.05" style="width:70px"></label>
+            <label data-i18n="wavefn.visual.iso">等值面 iso <input id="wf-iso" class="ipt" value="" placeholder="留空=场景默认" style="width:96px" title="留空即用各场景默认:ESP/ALIE 0.001 · NCI 0.5 · IRI 1.0 · IGMH 0.01"></label>
+            <label data-i18n="wavefn.visual.orbiso">轨道 iso ± <input id="wf-orbiso" class="ipt" value="" placeholder="默认 0.05" style="width:80px"></label>
             <label data-i18n="wavefn.visual.extsize">极值球大小 <input id="wf-extsize" class="ipt" value="0.1" style="width:70px"></label>
             <label><input type="checkbox" id="wf-extval" checked> <span data-i18n="wavefn.visual.showext">显示极值点数值</span></label>
           </div>
@@ -1481,6 +1483,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
           <div class="gen-fld">
             <span class="gen-lbl" data-i18n="wavefn.query.homolumo">HOMO-LUMO 能级与能隙</span>
             <div class="gen-inrow"><button class="btn" id="wf-homolumo-btn" data-i18n="wavefn.query.homolumo.run">查询能级</button>
+              <button class="btn" id="wf-hl-toggle" title="在 HOMO 与 LUMO 之间一键切换并重新导出轨道 cube(对齐 starpivot 切换轨道)">切换 HOMO⇄LUMO</button>
               <span id="wf-homolumo-val" class="sub"></span>
               <button class="btn quiet" id="wf-homolumo-copy" hidden data-i18n="common.copy">复制</button></div>
           </div>
@@ -1489,6 +1492,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
             <div class="gen-inrow"><button class="btn" id="wf-bcp-btn" data-i18n="wavefn.query.bcp.run">查询 BCP</button>
               <span id="wf-bcp-val" class="sub"></span>
               <button class="btn quiet" id="wf-bcp-copy" hidden data-i18n="common.copy">复制</button></div>
+            <div id="wf-bcp-table"></div>
           </div>
         </div>
       </div>
@@ -1712,6 +1716,26 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <button class="btn quiet" id="jb-cancelchecked" data-i18n="jobs.filter.cancelchecked">批量取消勾选作业</button>
     </div>
 
+    <!-- v3.3.0 实时能量曲线:行内「实时」按钮打开;本地 OSZICAR 优先,远端 SSH 轮询 -->
+    <div class="card" id="jobs-live" hidden style="padding:12px;margin-bottom:10px">
+      <div class="gen-h" style="display:flex;align-items:center;gap:8px;margin-bottom:0">
+        <span>实时能量曲线</span>
+        <span class="sub" id="jl-title"></span>
+        <span style="flex:1"></span>
+        <label class="sub" style="user-select:none">轮询
+          <select id="jl-interval" class="ipt" style="width:auto;display:inline-block;padding:3px 6px;margin-left:4px">
+            <option value="10">10 秒</option>
+            <option value="30" selected>30 秒</option>
+            <option value="60">60 秒</option>
+            <option value="0">手动</option>
+          </select>
+        </label>
+        <button class="btn" id="jl-refresh">刷新</button>
+        <button class="btn" id="jl-close">关闭</button>
+      </div>
+      <div id="jl-chart" style="height:260px;margin-top:8px"></div>
+      <div class="sub" id="jl-note"></div>
+    </div>
     <div class="card" id="jobs-card"></div>
     <div class="sub" id="jobs-stale" style="margin-top:8px;color:var(--warn)"></div>
 

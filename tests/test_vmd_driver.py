@@ -28,7 +28,9 @@ def test_probe_found_on_path(monkeypatch):
 # ── 场景注册表 ───────────────────────────────────────────────────────────────
 def test_scenes_registry_shape():
     assert set(vd.SCENES) == {'esp_surface', 'orbital', 'nci', 'structure',
-                              'alie_surface', 'iri'}
+                              'alie_surface', 'iri',
+                              # v3.3.0 对齐 starpivot 可视化 tab 的三场景
+                              'igmh', 'fukui', 'aim'}
     for scene in vd.SCENES.values():
         assert callable(scene['build']) and scene['name']
         assert isinstance(scene['files'], tuple) and scene['files']
@@ -195,3 +197,66 @@ def test_render_no_png_reports_error(tmp_path, monkeypatch):
     monkeypatch.setattr(vd.subprocess, 'run', fake_run)
     res = vd.render('structure', {'structure': str(tmp_path / 'm.xyz')}, str(tmp_path / 's.png'))
     assert not res['ok'] and '未产出 PNG' in res['error']
+
+
+# ── v3.3.0 新场景:IGMH / Fukui / AIM ─────────────────────────────────────────
+import pytest  # noqa: E402
+
+
+def test_tcl_igmh_defaults_and_overrides():
+    tcl = vd.igmh('dg.cub', 'sl2.cub', 'out.png', {})
+    assert 'mol new {dg.cub} type cube' in tcl            # δg 定几何
+    assert 'mol addfile {sl2.cub} type cube' in tcl       # sign(λ2)ρ 定色
+    assert 'Isosurface 0.01' in tcl                       # IGMH 默认 iso
+    assert 'mol scaleminmax top 0 -0.05 0.05' in tcl      # 惯用 ±0.05 a.u. 色范围
+    assert 'color scale method BGR' in tcl
+    tcl2 = vd.igmh('a.cub', 'b.cub', 'o.png', {'iso': 0.02, 'color_range': (-0.1, 0.1)})
+    assert 'Isosurface 0.02' in tcl2 and 'mol scaleminmax top 0 -0.1 0.1' in tcl2
+
+
+def test_scene_fukui_dual_phase_iso():
+    tcl = vd.SCENES['fukui']['build']({'cube': 'fukui_cdft_f_plus.cub'}, 'o.png', {'iso': 0.05})
+    assert 'mol new {fukui_cdft_f_plus.cub} type cube' in tcl
+    assert 'Isosurface 0.05' in tcl and 'Isosurface -0.05' in tcl   # ± 双相等值面
+
+
+_CPPROP_SAMPLE = ''' ----------------   CP     1,     Type (3,-3)   ----------------
+ Corresponding nucleus:     1(C )
+ Position (Bohr):        0.000000000000    0.000000000000    1.253667059614
+ Density of all electrons:  0.1210424825E+03
+
+ ----------------   CP     2,     Type (3,-1)   ----------------
+ Position (Bohr):        0.500000000000    0.000000000000    0.000000000000
+ Density of all electrons:  0.6280000000E-01
+ Lagrangian kinetic energy G(r):  0.1000000000E-01
+ Potential energy density V(r):  -0.2400000000E-01
+'''
+
+
+def test_tcl_aim_labels_colors_and_ncp_hidden(tmp_path):
+    cpp = tmp_path / 'aim_cp_CPprop.txt'
+    cpp.write_text(_CPPROP_SAMPLE, encoding='utf-8')
+    tcl = vd.aim('mol.xyz', str(cpp), 'o.png', {})
+    assert 'mol new {mol.xyz} type xyz' in tcl
+    assert 'graphics top color orange' in tcl             # BCP 橙球
+    assert 'sphere' in tcl and 'text' in tcl
+    assert '"2:0.063"' in tcl                             # 标签 = 编号:ρ(.3f)
+    assert 'gray' not in tcl                              # NCP 默认不画(与原子重合)
+    tcl2 = vd.aim('mol.pdb', str(cpp), 'o.png', {'show_ncp': True, 'labels': 'index'})
+    assert 'type pdb' in tcl2 and 'gray' in tcl2 and '"2"' in tcl2
+
+
+def test_tcl_aim_missing_or_empty_cpprop_raises(tmp_path):
+    with pytest.raises(ValueError, match='CPprop'):
+        vd.aim('mol.xyz', str(tmp_path / 'nope.txt'), 'o.png', {})
+    empty = tmp_path / 'empty.txt'
+    empty.write_text('nothing here\n', encoding='utf-8')
+    with pytest.raises(ValueError, match='临界点'):
+        vd.aim('mol.xyz', str(empty), 'o.png', {})
+
+
+def test_render_aim_build_failure_structured(tmp_path):
+    # 构建期 ValueError → render 结构化 error(不抛、不出假图)
+    res = vd.render('aim', {'structure': 'mol.xyz', 'cpprop': str(tmp_path / 'nope.txt')},
+                    str(tmp_path / 'o.png'))
+    assert res['ok'] is False and '构建失败' in res['error']

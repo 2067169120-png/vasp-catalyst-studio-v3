@@ -255,10 +255,15 @@
       box.appendChild(c);
     });
   }
+  // 各场景 iso 默认值(等值面语义不同,数量级差很大;输入框留空即用场景默认)
+  const SCENE_ISO = { esp_surface: 0.001, alie_surface: 0.001, nci: 0.5, iri: 1.0,
+    igmh: 0.01, orbital: 0.05, fukui: 0.05 };
   function selectScene(key) {
     State.scene = key;
     document.querySelectorAll('#wf-scene-chips .chip').forEach(
       c => c.classList.toggle('on', c.dataset.val === key));
+    const iso = $('wf-iso');
+    if (iso && SCENE_ISO[key] != null) iso.placeholder = '默认 ' + SCENE_ISO[key];
     renderSceneFiles();
   }
   function sceneRoles() {
@@ -293,11 +298,16 @@
     return files;
   }
   function renderParams() {
-    const iso = parseFloat(($('wf-iso') && $('wf-iso').value) || '0.001') || 0.001;
-    const orbiso = parseFloat(($('wf-orbiso') && $('wf-orbiso').value) || '0.05') || 0.05;
+    const isoRaw = ($('wf-iso') && $('wf-iso').value.trim()) || '';
+    const orbRaw = ($('wf-orbiso') && $('wf-orbiso').value.trim()) || '';
     const size = parseFloat(($('wf-extsize') && $('wf-extsize').value) || '0.1') || 0.1;
-    const p = { iso: iso, extrema_size: size };
-    if (State.scene === 'orbital') p.iso = orbiso;   // 轨道用 orbiso
+    const p = { extrema_size: size };
+    // iso 留空 → 不传参,交由各场景引擎默认值(esp 0.001 / nci 0.5 / iri 1.0 / igmh 0.01…)
+    if (State.scene === 'orbital' || State.scene === 'fukui') {
+      if (orbRaw) p.iso = parseFloat(orbRaw) || 0.05;   // 轨道族用 orbiso 输入
+    } else if (isoRaw) {
+      p.iso = parseFloat(isoRaw) || SCENE_ISO[State.scene] || 0.001;
+    }
     return p;
   }
   async function render() {
@@ -458,18 +468,59 @@
     if (cp) { cp.hidden = false; cp.onclick = () => copyText(txt); }
     VCS.log('HOMO-LUMO:' + txt, res.ok ? 'okc' : 'warnc');
   }
+  // v3.3.0:切换 HOMO⇄LUMO(重导轨道 cube;对齐 starpivot「切换轨道」)
+  function toggleHomoLumo() {
+    const inp = $('wf-orbital');
+    const cur = ((inp && inp.value.trim()) || 'HOMO').toUpperCase();
+    const next = cur === 'LUMO' ? 'HOMO' : 'LUMO';
+    if (inp) inp.value = next;
+    VCS.log('轨道切换为 ' + next + ',重新导出 cube…');
+    queryHomoLumo();
+  }
+  // v3.3.0:BCP 查询升级为结构化表(wavefn_bcp:ρ / V(r) / Espinosa 键能估算)
   async function queryBcp() {
     const wf = ($('wf-file') && $('wf-file').value.trim()) || '';
     if (!wf) { VCS.log('BCP 查询:请先选波函数文件', 'failc'); return; }
-    const r = await VCS.call('wavefn_run', wf, ['aim_cp'], analysisParams(), null, null);
-    const res = (r && r.results && r.results[0]) || {};
     const el = $('wf-bcp-val');
-    const txt = res.ok ? ('AIM 临界点已导出:' + (res.outputs || []).join('、') + '(ρ/键能见 CPprop.txt)')
-      : (res.error || '需 Multiwfn');
-    if (el) el.textContent = txt;
+    if (el) el.textContent = 'AIM 拓扑分析中…';
+    const r = await VCS.call('wavefn_bcp', wf, null, null);
+    const tbl = $('wf-bcp-table');
+    if (!r || r.ok === false || r.error) {
+      const txt = (r && r.error) || '需 Multiwfn';
+      if (el) el.textContent = txt;
+      if (tbl) tbl.innerHTML = '';
+      if (r && r.script) VCS.log('AIM stdin 脚本(可手跑):\n' + r.script.slice(0, 80) + '…', 'warnc');
+      VCS.log('AIM BCP:' + txt, 'warnc');
+      return;
+    }
+    const cps = r.cps || [];
+    const bcps = cps.filter(c => c.type === '(3,-1)');
+    const head = 'CP 共 ' + cps.length + ' 个(键 BCP ' + bcps.length + ' 个);' + (r.note || '');
+    if (el) el.textContent = head;
+    if (tbl) {
+      tbl.innerHTML = '<table style="margin-top:6px"><thead><tr><th>#</th><th>类型</th>' +
+        '<th class="num">ρ (a.u.)</th><th class="num">V(r) (a.u.)</th>' +
+        '<th class="num">键能估算 (kcal/mol)</th><th class="mono">坐标 (Å)</th></tr></thead><tbody>' +
+        cps.map(c => '<tr><td>' + c.index + '</td><td>' + VCS.esc(c.type) + '</td>' +
+          '<td class="num">' + (c.rho != null ? (+c.rho).toFixed(4) : '—') + '</td>' +
+          '<td class="num">' + (c.v != null ? (+c.v).toFixed(4) : '—') + '</td>' +
+          '<td class="num">' + (c.bond_energy_kcal != null ? c.bond_energy_kcal : '—') + '</td>' +
+          '<td class="mono">' + (c.xyz_angst ? c.xyz_angst.map(v => (+v).toFixed(2)).join(', ') : '—') +
+          '</td></tr>').join('') + '</tbody></table>';
+    }
+    // CPprop 路径喂给可视化 aim 场景(选中场景后 cpprop 角色自动回填)
+    if (r.cpprop_path && State.outputs.indexOf(r.cpprop_path) < 0) {
+      State.outputs.push(r.cpprop_path);
+      renderFromOutputs();
+    }
     const cp = $('wf-bcp-copy');
-    if (cp) { cp.hidden = false; cp.onclick = () => copyText(txt); }
-    VCS.log('AIM BCP:' + txt, res.ok ? 'okc' : 'warnc');
+    if (cp) {
+      cp.hidden = false;
+      const plain = cps.map(c => c.index + ' ' + c.type + ' rho=' + c.rho +
+        ' V=' + c.v + ' E≈' + c.bond_energy_kcal + ' kcal/mol').join('\n');
+      cp.onclick = () => copyText(plain + '\n' + (r.note || ''));
+    }
+    VCS.log('AIM BCP:' + head, 'okc');
   }
   async function copyText(t) {
     try { if (navigator.clipboard) await navigator.clipboard.writeText(t); } catch (e) { /* 忽略 */ }
@@ -508,6 +559,7 @@
     wire('wf-scatter-btn', scatter);
     wire('wf-out-btn', espBar);
     wire('wf-homolumo-btn', queryHomoLumo);
+    wire('wf-hl-toggle', toggleHomoLumo);
     wire('wf-bcp-btn', queryBcp);
     wire('wf-elflol-link', () => {
       State.sel.add('elf_lol_section');

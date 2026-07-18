@@ -76,6 +76,13 @@
     const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
     set('ov-jobs30', r.jobs_30d != null ? r.jobs_30d : '—');
     set('ov-ch30', r.core_hours_30d != null ? Math.round(r.core_hours_30d) : '—');
+    // v3.3.0 实耗核时:时间戳×提交核数(与预算估算并列的独立口径;缺数据作业单列不编数)
+    set('ov-used30', r.used_core_hours_30d != null ? Math.round(r.used_core_hours_30d) : '—');
+    const usedEl = $('ov-used30');
+    if (usedEl) {
+      usedEl.title = '实耗 =(RUNNING→终态)时长 × 提交核数;在跑作业实时累计'
+        + (r.usage_unknown_n ? ';另有 ' + r.usage_unknown_n + ' 个作业缺核数/时间戳未计入' : '');
+    }
     set('ov-remain', r.remaining_core_hours != null ? Math.round(r.remaining_core_hours) : '∞');
     const mon = r.monitor || {};
     set('ov-monitor', mon.status || '—');

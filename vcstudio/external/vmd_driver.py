@@ -226,6 +226,93 @@ def structure(struct_file: str, out_png: str, params: dict | None = None) -> str
     return '\n'.join(lines) + '\n'
 
 
+def igmh(dg_cube: str, sign_lambda2_cube: str, out_png: str,
+         params: dict | None = None) -> str:
+    """IGMH 片段相互作用:δg 等值面(iso,默认 0.01)按 sign(λ2)ρ 着色(默认 ±0.05 a.u.)。
+
+    对应 Multiwfn igmh 产物:dg_cube=func1.cub(δg),sign_lambda2_cube=func2.cub
+    (sign(λ2)ρ)。着色蓝=吸引、绿=vdW、红=排斥;「片段间/片段内」由所选 δg cube 决定
+    (Multiwfn 侧导出哪个就渲染哪个,本场景不替用户猜)。
+    """
+    p = params or {}
+    iso = float(p.get('iso', 0.01))
+    lo, hi = p.get('color_range', (-0.05, 0.05))
+    lines = [
+        f'# IGMH:δg={iso} 等值面按 sign(λ2)ρ 着色(蓝=吸引,绿=vdW,红=排斥)',
+        f'mol new {{{dg_cube}}} type cube waitfor all',                # vol 0:δg(定几何)
+        f'mol addfile {{{sign_lambda2_cube}}} type cube waitfor all',  # vol 1:sign(λ2)ρ(定色)
+        'mol delrep 0 top',
+        f'mol representation Isosurface {iso} 0 0 0 1 1',
+        'mol color Volume 1',                                          # 按 vol 1 着色
+        'mol selection {all}',
+        'mol material Opaque',
+        'mol addrep top',
+        f'mol scaleminmax top 0 {float(lo)} {float(hi)}',              # IGMH 惯用 ±0.05 a.u.
+        'color scale method BGR',                                      # 蓝绿红(IGM 族通行色标)
+    ]
+    lines += _tcl_footer(out_png)
+    return '\n'.join(lines) + '\n'
+
+
+# AIM 临界点类型 → 标注色(BCP 键橙 / RCP 环绿 / CCP 笼紫 / NCP 核灰,默认不画 NCP)
+_CP_COLORS = {'(3,-1)': 'orange', '(3,+1)': 'green', '(3,+3)': 'purple', '(3,-3)': 'gray'}
+
+
+def aim(struct_file: str, cpprop_file: str, out_png: str,
+        params: dict | None = None) -> str:
+    """AIM 临界点标注:结构细棍 CPK + CPprop.txt 各临界点画球并标「编号:ρ」。
+
+    - cpprop_file:Multiwfn 拓扑分析导出(本软件 aim_cp 分析收集为 aim_cp_CPprop.txt);
+      经 multiwfn_driver.cpprop_parse 解析,坐标 Bohr→Å 后落在结构坐标系上。
+    - params:cp_size(标注球半径,默认 0.12)、labels('both' 编号+ρ / 'index' / 'rho' /
+      'none')、show_ncp(默认 False:核临界点与原子重合,不画)。
+    - 文件读不到 / 一个 CP 都解析不出 → ValueError 中文报错(render 转结构化 error),
+      绝不渲染一张"看着成功"的空标注图。
+    """
+    from vcstudio.external.multiwfn_driver import cpprop_parse
+    p = params or {}
+    size = float(p.get('cp_size', 0.12))
+    labels = str(p.get('labels', 'both')).lower()
+    show_ncp = bool(p.get('show_ncp', False))
+    try:
+        with open(cpprop_file, 'r', encoding='utf-8', errors='replace') as f:
+            cps = cpprop_parse(f.read())
+    except OSError as e:
+        raise ValueError(f'CPprop 文件无法读取:{e}') from None
+    drawn = [c for c in cps if c.get('xyz_angst')
+             and (show_ncp or c.get('type') != '(3,-3)')]
+    if not drawn:
+        raise ValueError('CPprop.txt 未解析出可标注的临界点(文件为空、版本格式差异,'
+                         '或仅含核临界点;可在参数开 show_ncp 核对)')
+    ext = os.path.splitext(str(struct_file))[1].lower()
+    ftype = 'pdb' if ext == '.pdb' else 'xyz'
+    lines = [
+        f'# AIM 临界点标注:结构 CPK + {len(drawn)} 个 CP(BCP 橙/RCP 绿/CCP 紫)',
+        f'mol new {{{struct_file}}} type {ftype} waitfor all',
+        'mol delrep 0 top',
+        'mol representation CPK 0.6 0.2 12 12',   # 细棍:让位给 CP 标注
+        'mol color Name',
+        'mol selection {all}',
+        'mol material Opaque',
+        'mol addrep top',
+    ]
+    for cp in drawn:
+        x, y, z = cp['xyz_angst']
+        color = _CP_COLORS.get(cp.get('type'), 'orange')
+        lines.append(f'graphics top color {color}')
+        lines.append(f'graphics top sphere {{{x} {y} {z}}} radius {size} resolution 20')
+        if labels != 'none':
+            rho = cp.get('rho')
+            tag = {'index': str(cp['index']),
+                   'rho': (f'{rho:.3f}' if rho is not None else '?')}.get(
+                labels, f'{cp["index"]}:' + (f'{rho:.3f}' if rho is not None else '?'))
+            lines.append('graphics top color black')
+            lines.append(
+                f'graphics top text {{{x} {y + size * 1.6} {z}}} "{tag}" size 0.9 thickness 2')
+    lines += _tcl_footer(out_png)
+    return '\n'.join(lines) + '\n'
+
+
 # ── 场景注册表 ───────────────────────────────────────────────────────────────
 # key → {name(中文), files(render 需要的文件角色键), build(files,out,params)->tcl, note}
 SCENES = {
@@ -265,6 +352,28 @@ SCENES = {
         'build': lambda files, out, p: structure(files['structure'], out, p),
         'note': 'xyz/pdb 结构的 CPK 球棍渲染。',
     },
+    # ── v3.3.0 对齐 starpivot 可视化 tab:IGMH / Fukui / AIM 三场景 ──
+    'igmh': {
+        'name': 'IGMH 片段相互作用',
+        'files': ('dg', 'sign_lambda2'),
+        'build': lambda files, out, p: igmh(files['dg'], files['sign_lambda2'], out, p),
+        'note': ('IGMH δg 等值面(默认 iso=0.01)按 sign(λ2)ρ 着色(惯用 ±0.05 a.u.);'
+                 'dg=func1.cub、sign_lambda2=func2.cub;片段间/片段内取决于所选 δg cube。'),
+    },
+    'fukui': {
+        'name': 'Fukui / CDFT 等值面',
+        'files': ('cube',),
+        'build': lambda files, out, p: orbital(files['cube'], out, p),
+        'note': ('f+ / f− / f0 / 双描述符任一 cube 的 ±iso 双色等值面(默认 0.05);'
+                 'cube 来自波函数页 Fukui/CDFT 分析产物(fukui_cdft_*.cub)。'),
+    },
+    'aim': {
+        'name': 'AIM 临界点标注',
+        'files': ('structure', 'cpprop'),
+        'build': lambda files, out, p: aim(files['structure'], files['cpprop'], out, p),
+        'note': ('结构 CPK + CPprop.txt 临界点标注(BCP 橙 / RCP 绿 / CCP 紫,标签=编号:ρ);'
+                 'cpprop 用 AIM 分析产物 aim_cp_CPprop.txt,structure 给 xyz/pdb。'),
+    },
 }
 
 
@@ -292,6 +401,9 @@ def render(scene_key: str, files: dict, out_png: str, *, exe: str | None = None,
     except KeyError as e:
         return {'ok': False, 'png': None, 'tcl': '', 'stdout_tail': '',
                 'error': f'场景 {scene_key} 缺少输入文件角色 {e};需要 {scene["files"]}'}
+    except (ValueError, OSError) as e:                    # 场景构建期输入问题(如 CPprop 解析)
+        return {'ok': False, 'png': None, 'tcl': '', 'stdout_tail': '',
+                'error': f'场景 {scene_key} 构建失败:{e}'}
     info = probe(exe)
     if not info['available']:
         return {'ok': False, 'png': None, 'tcl': tcl, 'stdout_tail': '',

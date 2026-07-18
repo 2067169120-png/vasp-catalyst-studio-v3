@@ -259,6 +259,8 @@ def submit_job(client, sftp, profile, job_dir: str) -> dict:
         'cluster': profile.name,
         'queue': spec.queue or None,
         'script_mode': getattr(profile, 'script_mode', 'auto'),
+        # v3.3.0 实际核时统计:提交时点核数(nodes×ppn;ppn 未配 → None,usage 端不编数)
+        'cores': (spec.nodes * spec.ppn) if spec.ppn else None,
     })
     manifest_mod.set_state(m, 'SUBMITTED', note=f'{dialect.name} {job_id}')
     manifest_mod.save_manifest(job_dir, m)

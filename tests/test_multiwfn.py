@@ -448,3 +448,44 @@ def test_run_script_subprocess_error_caught(tmp_path, monkeypatch):
     monkeypatch.setattr(md.subprocess, 'run', fake_run)
     out = md.run_script(str(wf), '5\n1\n', ('density.cub',), workdir=str(tmp_path))
     assert not out['ok'] and '运行失败' in out['error'] and out['script'] == '5\n1\n'
+
+
+# ── CPprop.txt 解析(v3.3.0:AIM 标注场景 + BCP 表的数据源) ────────────────────
+_CPPROP_SAMPLE = ''' ----------------   CP     1,     Type (3,-3)   ----------------
+ Corresponding nucleus:     1(C )
+ Position (Bohr):        0.000000000000    0.000000000000    1.253667059614
+ Density of all electrons:  0.1210424825E+03
+
+ ----------------   CP     2,     Type (3,-1)   ----------------
+ Position (Bohr):        0.500000000000    0.000000000000    0.000000000000
+ Density of all electrons:  0.6280000000E-01
+ Lagrangian kinetic energy G(r):  0.1000000000E-01
+ Potential energy density V(r):  -0.2400000000E-01
+'''
+
+
+def test_cpprop_parse_types_rho_espinosa_and_units():
+    cps = md.cpprop_parse(_CPPROP_SAMPLE)
+    assert [c['index'] for c in cps] == [1, 2]
+    ncp, bcp = cps
+    assert ncp['type'] == '(3,-3)' and ncp['bond_energy_kcal'] is None   # 核 CP 不给键能
+    assert bcp['type'] == '(3,-1)'
+    assert abs(bcp['rho'] - 0.0628) < 1e-12
+    assert abs(bcp['v'] + 0.024) < 1e-12
+    # Espinosa E≈V/2 → kcal/mol,手算对拍
+    assert abs(bcp['bond_energy_kcal'] - round(-0.024 / 2 * 627.509474, 3)) < 1e-9
+    # Bohr → Å 换算
+    assert abs(ncp['xyz_angst'][2] - 1.253667059614 * 0.52917721067) < 1e-6
+    assert abs(bcp['xyz_angst'][0] - 0.5 * 0.52917721067) < 1e-6   # 6 位小数落盘精度
+
+
+def test_cpprop_parse_tolerates_missing_fields_and_fortran_d():
+    assert md.cpprop_parse('') == []
+    cps = md.cpprop_parse('---- CP  3,  Type (3,+1) ----\n nothing else here\n')
+    assert cps[0]['type'] == '(3,+1)'
+    assert cps[0]['rho'] is None and cps[0]['xyz_angst'] is None
+    assert cps[0]['bond_energy_kcal'] is None            # 缺 V(r) 绝不编数
+    # Fortran D 指数记号容忍
+    d = md.cpprop_parse('CP 1, Type (3,-1)\n Density of all electrons:  0.5000D-01\n'
+                        ' Potential energy density V(r):  -0.1000D-01\n')
+    assert abs(d[0]['rho'] - 0.05) < 1e-12 and d[0]['bond_energy_kcal'] is not None

@@ -154,6 +154,7 @@ def test_submit_job_happy_path_pbs(tmp_path):
     assert m['cluster'] == '1w' and m['remote_dir'] == remote
     assert [h['state'] for h in m['state_history']] == ['CREATED', 'UPLOADED', 'SUBMITTED']
     assert m['attempts'][0]['job_id'] == '8812345'
+    assert m['attempts'][0]['cores'] == 12                     # v3.3.0 记核数(nodes×ppn)供实耗核时
     assert manifest.load_manifest(d)['state'] == 'SUBMITTED'   # 已落盘
 
 

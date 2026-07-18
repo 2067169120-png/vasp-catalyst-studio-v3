@@ -5300,3 +5300,191 @@ def test_task_badge_classifier():
     assert Api._task_badge('vcstudio.project.surface_energy:surface_energy') == '结果计算器'
     assert Api._task_badge('vcstudio.generate.job_builder:build_job_dir') == '作业生成'
     assert Api._task_badge('') == '作业生成'
+
+
+# ═══ v3.3.0:实时能量曲线 / 剪贴板贴图 / 实耗核时 / BCP 表 ═══════════════════════
+_OSZ_TEXT = (
+    '       N       E                     dE\n'
+    'DAV:   1    -0.850181750000E+02   -0.85018E+02   -0.11945E+03  6280   0.259E+02\n'
+    '   1 F= -.85018175E+02 E0= -.85018175E+02  d E =-.850182E+02\n'
+    'DAV:   1    -0.851200000000E+02   -0.10182E+00   -0.63021E-02  1544   0.554E+00\n'
+    '   2 F= -.85120000E+02 E0= -.85120000E+02  d E =-.101825E+00\n')
+
+_MINI_POSCAR = 'sys\n1.0\n 3 0 0\n 0 3 0\n 0 0 3\n C O\n 1 1\nCartesian\n 0 0 0\n 1 1 1\n'
+
+
+def _fake_conn_read(content=b'', *, connect_boom=False, missing=False):
+    """connection 假件(实时曲线用):open_client → sftp.file 读远端 OSZICAR。"""
+    m = types.SimpleNamespace()
+
+    class _CE(Exception):
+        def __init__(self, msg, needs_trust=False):
+            super().__init__(msg)
+            self.needs_trust = needs_trust
+    m.ConnectError = _CE
+
+    class _F:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return content
+
+    class _SFTP:
+        def file(self, path, mode):
+            if missing:
+                raise FileNotFoundError(path)
+            return _F()
+
+        def close(self):
+            pass
+
+    class _Client:
+        def open_sftp(self):
+            return _SFTP()
+
+    def _open(prof, pw, trust_new=False):
+        if connect_boom:
+            raise _CE('无法确认主机指纹', needs_trust=True)
+        return _Client(), None
+    m.open_client = _open
+    m.close_quiet = lambda c, j: None
+    return m
+
+
+def test_job_live_energy_local_oszicar(tmp_path):
+    (tmp_path / 'OSZICAR').write_text(_OSZ_TEXT, encoding='utf-8')
+    (tmp_path / 'POSCAR').write_text(_MINI_POSCAR, encoding='utf-8')
+    api = Api()
+    out = api.job_live_energy(str(tmp_path))
+    assert out['ok'] is True and out['source'] == 'local'
+    assert [p['n'] for p in out['steps']] == [1, 2]
+    assert abs(out['steps'][0]['e0'] + 85.018175) < 1e-6
+    assert abs(out['steps'][1]['de'] - 0.101825) < 1e-6   # 相邻步 |ΔE0|
+    assert out['natoms'] == 2
+
+
+def test_job_live_energy_remote_via_manifest(tmp_path):
+    from vcstudio.shared import manifest as real_manifest
+    m = real_manifest.new_manifest(job_id='j', system='s', task_type='relax',
+                                   calc_type='slab', inputs={})
+    m['remote_dir'] = '/work/j'
+    m['cluster'] = 'hpc'
+    real_manifest.save_manifest(str(tmp_path), m)
+    api = Api(profiles_mod=_fake_profiles({'hpc': types.SimpleNamespace(auth='key')}),
+              connection_mod=_fake_conn_read(_OSZ_TEXT.encode('utf-8')))
+    out = api.job_live_energy(str(tmp_path))
+    assert out['ok'] is True and out['source'] == 'remote' and len(out['steps']) == 2
+
+
+def test_job_live_energy_remote_not_started_yet(tmp_path):
+    from vcstudio.shared import manifest as real_manifest
+    m = real_manifest.new_manifest(job_id='j', system='s', task_type='relax',
+                                   calc_type='slab', inputs={})
+    m['remote_dir'] = '/work/j'
+    m['cluster'] = 'hpc'
+    real_manifest.save_manifest(str(tmp_path), m)
+    api = Api(profiles_mod=_fake_profiles({'hpc': types.SimpleNamespace(auth='key')}),
+              connection_mod=_fake_conn_read(missing=True))
+    out = api.job_live_energy(str(tmp_path))
+    assert out['ok'] is False and '远端尚无 OSZICAR' in out['error']
+
+
+def test_job_live_energy_unsubmitted_honest(tmp_path):
+    (tmp_path / 'job.yaml').write_text('state: CREATED\n', encoding='utf-8')
+    out = Api().job_live_energy(str(tmp_path))
+    assert out['ok'] is False and '尚未提交' in out['error']
+
+
+def test_job_live_energy_needs_trust_passthrough(tmp_path):
+    from vcstudio.shared import manifest as real_manifest
+    m = real_manifest.new_manifest(job_id='j', system='s', task_type='relax',
+                                   calc_type='slab', inputs={})
+    m['remote_dir'] = '/work/j'
+    m['cluster'] = 'hpc'
+    real_manifest.save_manifest(str(tmp_path), m)
+    api = Api(profiles_mod=_fake_profiles({'hpc': types.SimpleNamespace(auth='key')}),
+              connection_mod=_fake_conn_read(connect_boom=True))
+    out = api.job_live_energy(str(tmp_path))
+    assert out['ok'] is False and out['needs_trust'] is True
+
+
+def test_mol_image_b64_to_smiles_roundtrip():
+    import base64 as _b64
+    calls = {}
+    api = Api(molbuild_mods=_fake_molbuild(calls=calls))
+    payload = _b64.b64encode(b'\x89PNG fake image bytes' * 8).decode('ascii')
+    out = api.mol_image_b64_to_smiles('data:image/png;base64,' + payload)
+    assert out['ok'] is True and out['smiles']
+    assert calls['img'].endswith('.png') and os.path.isfile(calls['img'])
+    assert out['image_path'] == calls['img']              # 临时图片落盘供复查
+
+
+def test_mol_image_b64_to_smiles_rejects_bad_data():
+    api = Api(molbuild_mods=_fake_molbuild())
+    assert '没有图片' in api.mol_image_b64_to_smiles('')['error']
+    assert '不是合法 base64' in api.mol_image_b64_to_smiles('!!!not-b64!!!')['error']
+    import base64 as _b64
+    tiny = _b64.b64encode(b'xx').decode('ascii')
+    assert '过小' in api.mol_image_b64_to_smiles(tiny)['error']
+
+
+def test_usage_stats_api_totals():
+    now_iso = __import__('datetime').datetime.now()
+    t0 = (now_iso - __import__('datetime').timedelta(hours=2)).isoformat(timespec='seconds')
+    t1 = (now_iso - __import__('datetime').timedelta(hours=1)).isoformat(timespec='seconds')
+    entries = [('/j/a', {'state': 'DONE', 'cluster': 'hpc',
+                         'state_history': [{'state': 'RUNNING', 'at': t0},
+                                           {'state': 'DONE', 'at': t1}],
+                         'attempts': [{'cores': 64}]}),
+               ('/j/nc', {'state': 'DONE', 'cluster': 'nope',
+                          'state_history': [{'state': 'RUNNING', 'at': t0},
+                                            {'state': 'DONE', 'at': t1}],
+                          'attempts': []})]
+    api = Api(ledger_mod=_fake_ledger(entries, []),
+              profiles_mod=_fake_profiles({'hpc': types.SimpleNamespace(auth='key',
+                                                                        nodes=1, ppn=32)}))
+    out = api.usage_stats(30)
+    assert out['ok'] is True and out['jobs_counted'] == 1
+    assert abs(out['core_hours'] - 64.0) < 0.5            # 1h × 64 核(时间戳秒级误差容忍)
+    assert len(out['unknown']) == 1                       # 无核数作业单列,不编数
+
+
+def test_overview_stats_includes_actual_usage_fields():
+    import datetime
+    now = datetime.datetime.now().isoformat()
+    entries = [('/a', {'state': 'DONE', 'created_at': now})]
+    api = Api(ledger_mod=_fake_ledger(entries, []),
+              campaign_mods=_fake_campaign(campaigns={}),
+              config_mod=_fake_config(ui={'campaign_dirs': []}))
+    out = api.overview_stats()
+    assert out['ok'] is True
+    assert out['used_core_hours_30d'] == 0.0              # 无 state_history → 实耗 0,不编数
+    assert out['usage_unknown_n'] == 0
+
+
+def test_wavefn_bcp_parses_cpprop(tmp_path):
+    from vcstudio.external import multiwfn_driver as real_md
+    cpp = tmp_path / 'aim_cp_CPprop.txt'
+    cpp.write_text(' ----------------   CP     1,     Type (3,-1)   ----------------\n'
+                   ' Position (Bohr):   0.5 0.0 0.0\n'
+                   ' Density of all electrons:  0.6280000000E-01\n'
+                   ' Potential energy density V(r):  -0.2400000000E-01\n', encoding='utf-8')
+    mw = _fake_multiwfn(run_ret={'ok': True, 'outputs': [str(cpp)],
+                                 'stdout_tail': 'done', 'elapsed_s': 1.0, 'error': ''})
+    mw.cpprop_parse = real_md.cpprop_parse
+    api = Api(multiwfn_mod=mw, config_mod=_fake_config(cfg={}))
+    out = api.wavefn_bcp(str(tmp_path / 'mol.fchk'))
+    assert out['ok'] is True and len(out['cps']) == 1
+    assert out['cps'][0]['type'] == '(3,-1)'
+    assert out['cps'][0]['bond_energy_kcal'] is not None
+    assert 'Espinosa' in out['note']                      # 键能口径显式注明
+
+
+def test_wavefn_bcp_old_engine_honest(tmp_path):
+    api = Api(multiwfn_mod=_fake_multiwfn(), config_mod=_fake_config(cfg={}))
+    out = api.wavefn_bcp(str(tmp_path / 'mol.fchk'))
+    assert out['ok'] is False and '引擎待扩展' in out['error']

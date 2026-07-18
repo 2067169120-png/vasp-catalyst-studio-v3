@@ -31,7 +31,7 @@
   }
   async function runOcsr() {
     const p = val('mol-img-path');
-    if (!p) { VCS.log('请先选择分子结构图片', 'failc'); return; }
+    if (!p) { VCS.log('请先选择分子结构图片(或直接 Ctrl+V 粘贴截图)', 'failc'); return; }
     const btn = $('mol-ocsr-run');
     if (btn) btn.disabled = true;
     VCS.log('图片识别(DECIMER)中…');
@@ -46,6 +46,63 @@
     } finally {
       if (btn) btn.disabled = false;
     }
+  }
+
+  // ── v3.3.0 剪贴板贴图识别:Ctrl+V / 「粘贴图片」按钮 → base64 直传后端 OCSR ──
+  async function ocsrFromB64(dataUrl) {
+    const btn = $('mol-ocsr-run');
+    if (btn) btn.disabled = true;
+    VCS.log('剪贴板图片识别(DECIMER)中…');
+    try {
+      const r = await VCS.call('mol_image_b64_to_smiles', dataUrl, '.png');
+      if (!r || r.ok === false || r.error) {
+        VCS.log('剪贴板识别失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+      }
+      if (r.image_path) setVal('mol-img-path', r.image_path);   // 落盘临时图回填,便于复查
+      setVal('mol-img-smiles', r.smiles);
+      VCS.log('识别出 SMILES:' + r.smiles + '(耗时 ' + r.elapsed_ms + ' ms)', 'okc');
+      refreshSvg();
+      VCS.toast('剪贴板图片已识别');
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+  function blobToB64(blob) {
+    return new Promise((res, rej) => {
+      const fr = new FileReader();
+      fr.onload = () => res(String(fr.result));
+      fr.onerror = () => rej(new Error('读取剪贴板图片失败'));
+      fr.readAsDataURL(blob);
+    });
+  }
+  async function onPaste(e) {
+    // 只在分子建模页可见时接管粘贴;输入框里的文本粘贴不拦截
+    const page = document.getElementById('page-structure');
+    if (!page || page.hidden) return;
+    const items = (e.clipboardData && e.clipboardData.items) || [];
+    for (const it of items) {
+      if (it.type && it.type.indexOf('image/') === 0) {
+        e.preventDefault();
+        const blob = it.getAsFile();
+        if (blob) ocsrFromB64(await blobToB64(blob));
+        return;
+      }
+    }
+  }
+  async function pasteFromClipboard() {
+    // 按钮路径:优先异步剪贴板 API;不可用/被拒 → 提示用 Ctrl+V(paste 事件路径)
+    try {
+      if (navigator.clipboard && navigator.clipboard.read) {
+        const items = await navigator.clipboard.read();
+        for (const it of items) {
+          const t = (it.types || []).find(x => x.indexOf('image/') === 0);
+          if (t) { ocsrFromB64(await blobToB64(await it.getType(t))); return; }
+        }
+        VCS.log('剪贴板里没有图片:请先对分子结构截图(如 QQ/微信截图),再点本按钮', 'warnc');
+        return;
+      }
+    } catch (err) { /* 权限被拒/API 不可用 → 走提示 */ }
+    VCS.log('无法直接读剪贴板:请点击页面空白处后按 Ctrl+V 粘贴截图', 'warnc');
   }
   async function refreshSvg() {
     const s = val('mol-img-smiles');
@@ -348,6 +405,8 @@
     loadSolventPresets();
     wire('mol-img-btn', pickImage);
     wire('mol-ocsr-run', runOcsr);
+    wire('mol-paste-btn', pasteFromClipboard);
+    document.addEventListener('paste', onPaste);   // Ctrl+V 贴图识别(仅结构建模页可见时)
     wire('mol-svg-refresh', refreshSvg);
     wire('mol-img-copy', copySmiles);
     wire('mol-img-next', nextToBuild);

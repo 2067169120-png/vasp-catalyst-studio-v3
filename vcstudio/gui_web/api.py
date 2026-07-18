@@ -8,6 +8,8 @@ submitter)延迟导入,测试注入假件即可全离线跑,不碰网络/keyring
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import os
 import sys
 import tempfile
@@ -74,7 +76,7 @@ class Api:
                  solvation_mod=None, paper_data_mod=None, variant_advisor_mod=None,
                  manuscript_draft_mod=None, bands_parse_mod=None, deps_runner=None,
                  neb_builder_mod=None, references_mod=None, chgdiff_mod=None,
-                 incar_builder_mod=None, metal_slab_mod=None):
+                 incar_builder_mod=None, metal_slab_mod=None, usage_mod=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -169,6 +171,7 @@ class Api:
         self._chgdiff = chgdiff_mod                 # project.chgdiff(差分电荷三静态 + Δρ 合成)
         self._incar_builder = incar_builder_mod     # generate.incar_builder(VASPsol 键)
         self._metal_slab = metal_slab_mod           # generate.metal_slab(金属 slab + 层厚配方)
+        self._usage_mod = usage_mod                 # cluster.usage(实际核时统计,纯函数)
 
     # ── 桥活性探测(前端用来确认 js_api 已就绪) ──
     def ping(self) -> str:
@@ -369,6 +372,26 @@ class Api:
             from vcstudio.generate import metal_slab
             self._metal_slab = metal_slab
         return self._metal_slab
+
+    def _usage(self):
+        """实际核时统计引擎(纯函数)延迟加载。"""
+        if self._usage_mod is None:
+            from vcstudio.cluster import usage
+            self._usage_mod = usage
+        return self._usage_mod
+
+    def _profile_cores(self):
+        """集群名 → 当前配置核数(nodes×ppn;ppn 未配则不入表)——usage 的回退口径。"""
+        out = {}
+        try:
+            for nm, prof in (self._profiles.load_profiles() or {}).items():
+                ppn = int(getattr(prof, 'ppn', 0) or 0)
+                nodes = int(getattr(prof, 'nodes', 1) or 1)
+                if ppn:
+                    out[nm] = nodes * ppn
+        except Exception:                                 # noqa: BLE001 配置坏不挡统计
+            pass
+        return out
 
     def _bd(self):
         """能带派生端延迟加载。"""
@@ -697,6 +720,75 @@ class Api:
         return self._delegate(name, password,
                               lambda prof, pw: self._bo().queue_detail(
                                   prof, pw, bool(trust_new)))
+
+    def job_live_energy(self, job_dir, name=None, password=None, trust_new=False,
+                        max_points=400):
+        """运行中作业实时能量曲线:本地 OSZICAR 优先,无则经 SSH 读远端(manifest.remote_dir)。
+
+        返回 {'ok','source'('local'|'remote'),'steps':[{'n','e0','de','scf'}],'natoms',
+        'state','needs_trust','error'}。远端尚无 OSZICAR(排队中)/未提交 → 中文说明;
+        需要密码 → error='NEED_PASSWORD'(前端弹框口径同其余集群操作)。绝不抛。
+        """
+        empty = {'ok': False, 'source': None, 'steps': [], 'natoms': None,
+                 'state': None, 'needs_trust': False}
+        try:
+            d = (job_dir or '').strip()
+            if not d or not os.path.isdir(d):
+                return {**empty, 'error': '作业目录不存在'}
+            m = self._manifest.load_manifest(d) or {}
+            state = m.get('state')
+            text, source = None, None
+            local = os.path.join(d, 'OSZICAR')
+            if os.path.isfile(local):
+                with open(local, encoding='utf-8', errors='replace') as f:
+                    text = f.read()
+                source = 'local'
+            else:
+                rdir = (m.get('remote_dir') or '').strip()
+                cl = (str(name).strip() if name else '') or (m.get('cluster') or '').strip()
+                if not rdir or not cl:
+                    return {**empty, 'state': state,
+                            'error': ('本地无 OSZICAR,且该作业没有远端目录/集群记录'
+                                      '(尚未提交?);提交后才有实时能量可看。')}
+                prof, pw, err = self._resolve(cl, password)
+                if err:
+                    return {**empty, 'state': state, 'error': err.get('error') or str(err)}
+                conn = self._conn()
+                try:
+                    client, jump = conn.open_client(prof, pw, trust_new=bool(trust_new))
+                except conn.ConnectError as e:
+                    return {**empty, 'state': state,
+                            'needs_trust': bool(getattr(e, 'needs_trust', False)),
+                            'error': str(e)}
+                try:
+                    sftp = client.open_sftp()
+                    try:
+                        with sftp.file(rdir.rstrip('/') + '/OSZICAR', 'r') as f:
+                            raw = f.read()
+                    finally:
+                        sftp.close()
+                    text = (raw.decode('utf-8', errors='replace')
+                            if isinstance(raw, bytes) else str(raw))
+                    source = 'remote'
+                except FileNotFoundError:
+                    return {**empty, 'state': state,
+                            'error': '远端尚无 OSZICAR(排队中或刚启动),稍后再试。'}
+                except Exception as e:                    # noqa: BLE001
+                    return {**empty, 'state': state, 'error': f'读取远端 OSZICAR 失败:{e}'}
+                finally:
+                    conn.close_quiet(client, jump)
+            steps = self._conv.parse_oszicar(text or '')
+            pts = [{'n': i + 1, 'e0': s.get('E0'), 'de': s.get('dE'),
+                    'scf': s.get('scf_iters')}
+                   for i, s in enumerate(steps)][-int(max_points or 400):]
+            natoms = None
+            ptxt = self._read_named_text(d, 'POSCAR')
+            if ptxt:
+                natoms = self._poscar_natoms(ptxt) or None
+            return {'ok': True, 'source': source, 'steps': pts, 'natoms': natoms,
+                    'state': state, 'needs_trust': False, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {**empty, 'error': str(e)}
 
     def query_workdir(self, job_id, name, password, trust_new=False):
         """认领辅助:按作业号查远程工作目录(PBS qstat -f;查不到 workdir='')。"""
@@ -3248,6 +3340,44 @@ class Api:
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'smiles': '', 'elapsed_ms': 0.0, 'error': str(e)}
 
+    def mol_image_b64_to_smiles(self, image_b64, suffix='.png'):
+        """剪贴板图片(base64,可带 data:image/...;base64, 前缀)→ 临时 PNG → DECIMER OCSR。
+
+        对齐 starpivot「粘贴图片」:前端 Ctrl+V 取剪贴板位图转 base64 直传,无需先存文件。
+        返回 {'ok','smiles','elapsed_ms','image_path','error'};image_path 为落盘的临时
+        图片(供复查/复用),识别失败原样透传引擎中文说明。
+        """
+        try:
+            s = (image_b64 or '').strip()
+            if not s:
+                return {'ok': False, 'smiles': '', 'elapsed_ms': 0.0,
+                        'image_path': None, 'error': '剪贴板里没有图片数据'}
+            if s.lower().startswith('data:') and ',' in s:
+                s = s.split(',', 1)[1]                    # 剥 dataURL 前缀
+            try:
+                blob = base64.b64decode(s, validate=True)
+            except (binascii.Error, ValueError):
+                return {'ok': False, 'smiles': '', 'elapsed_ms': 0.0, 'image_path': None,
+                        'error': '图片数据不是合法 base64(请直接对分子结构截图后 Ctrl+V)'}
+            if len(blob) < 64:
+                return {'ok': False, 'smiles': '', 'elapsed_ms': 0.0, 'image_path': None,
+                        'error': '图片数据过小,疑非图片(请粘贴分子结构截图)'}
+            ext = str(suffix or '.png').lower()
+            if ext not in ('.png', '.jpg', '.jpeg'):
+                ext = '.png'
+            tmpdir = os.path.join(tempfile.gettempdir(), 'vcstudio_paste')
+            os.makedirs(tmpdir, exist_ok=True)
+            path = os.path.join(tmpdir, f'paste_{int(time.time() * 1000)}{ext}')
+            with open(path, 'wb') as f:
+                f.write(blob)
+            r = self._mb().ocsr.image_to_smiles(path)
+            return {'ok': bool(r.get('ok')), 'smiles': r.get('smiles', ''),
+                    'elapsed_ms': r.get('elapsed_ms', 0.0), 'image_path': path,
+                    'error': r.get('error') or None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'smiles': '', 'elapsed_ms': 0.0,
+                    'image_path': None, 'error': str(e)}
+
     def mol_smiles_svg(self, smiles, width=420, height=300):
         """SMILES → 2D 键线式 SVG(RDKit)→ {'ok','svg','error'}(结构图预览)。"""
         try:
@@ -3761,6 +3891,51 @@ class Api:
                     'error': r.get('error') or None}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'minima': [], 'maxima': [], 'script': '', 'error': str(e)}
+
+    def wavefn_bcp(self, wavefn_file, exe=None, workdir=None):
+        """AIM 临界点表:跑 aim_cp 并解析 CPprop.txt → 结构化 BCP 列表(编号/类型/ρ/键能)。
+
+        返回 {'ok','cps':[{index,type,xyz_angst,rho,v,bond_energy_kcal}],'cpprop_path',
+        'script','note','error'}。键能仅对 (3,-1) 给 **Espinosa 经验估算** E≈V(r)/2
+        (kcal/mol,面向氢键等弱相互作用;共价键不适用,note 注明口径,绝不假精确)。
+        Multiwfn 缺失 → 回传 stdin 脚本;产物缺失/解析为空 → 诚实报错。
+        """
+        try:
+            wf = (wavefn_file or '').strip()
+            if not wf:
+                return {'ok': False, 'cps': [], 'cpprop_path': None, 'script': '',
+                        'note': None, 'error': '未选择波函数文件'}
+            mw = self._mw()
+            parser = getattr(mw, 'cpprop_parse', None)
+            if not callable(parser):
+                return {'ok': False, 'cps': [], 'cpprop_path': None, 'script': '',
+                        'note': None,
+                        'error': '引擎待扩展:multiwfn_driver 无 cpprop_parse(请更新 vcstudio)'}
+            mw_exe = (exe or self._tool_paths().get('multiwfn') or '').strip() or None
+            r = mw.run(wf, 'aim_cp', exe=mw_exe, workdir=((workdir or '').strip() or None))
+            if not r.get('ok'):
+                return {'ok': False, 'cps': [], 'cpprop_path': None,
+                        'script': r.get('script', ''), 'note': None,
+                        'error': r.get('error') or 'AIM 拓扑分析失败'}
+            cpp = next((p for p in (r.get('outputs') or [])
+                        if str(p).lower().endswith('cpprop.txt')), None)
+            if not cpp or not os.path.isfile(cpp):
+                return {'ok': False, 'cps': [], 'cpprop_path': None, 'script': '',
+                        'note': None,
+                        'error': 'AIM 完成但未找到 CPprop.txt 产物(版本导出名差异?请查工作目录)'}
+            with open(cpp, encoding='utf-8', errors='replace') as f:
+                cps = parser(f.read())
+            if not cps:
+                return {'ok': False, 'cps': [], 'cpprop_path': cpp, 'script': '',
+                        'note': None,
+                        'error': 'CPprop.txt 未解析出临界点(版本格式差异,请把样例反馈给我们)'}
+            return {'ok': True, 'cps': cps, 'cpprop_path': cpp, 'script': '',
+                    'note': ('键能为 Espinosa 经验估算 E≈V(r)/2(换算 kcal/mol),面向氢键等'
+                             '弱相互作用 BCP;共价键不适用,发表引用请注明口径。'),
+                    'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'cps': [], 'cpprop_path': None, 'script': '',
+                    'note': None, 'error': str(e)}
 
     # ── 外部工具路径(设置页 / 波函数页 / 外部编辑器卡 共用记忆) ──────────────────
     def tool_paths_get(self):
@@ -5027,10 +5202,21 @@ class Api:
             except Exception:                             # noqa: BLE001
                 pass
             remaining = round(cap_total - spent, 2) if cap_total else None
+            # v3.3.0 实耗核时(与上面的"预算估算已花"并列,口径独立:时间戳×提交核数)
+            used_30d, usage_unknown_n = None, 0
+            try:
+                u = self._usage().usage_stats(entries, days=30,
+                                              profile_cores_by_name=self._profile_cores())
+                used_30d = u.get('core_hours')
+                usage_unknown_n = len(u.get('unknown') or [])
+            except Exception:                             # noqa: BLE001 统计失败不挡概览
+                pass
             active = running + queued
             status = ('运行中' if running else ('排队中' if queued else '空闲'))
             return {'ok': True, 'jobs_30d': jobs_30d, 'jobs_total': jobs_total,
                     'core_hours_30d': round(spent, 2),
+                    'used_core_hours_30d': used_30d,
+                    'usage_unknown_n': usage_unknown_n,
                     'remaining_core_hours': remaining,
                     'budget_cap': round(cap_total, 2) if cap_total else None,
                     'monitor': {'running': running, 'queued': queued, 'active': active,
@@ -5039,6 +5225,23 @@ class Api:
             return {'ok': False, 'jobs_30d': 0, 'jobs_total': 0, 'core_hours_30d': 0.0,
                     'remaining_core_hours': None, 'budget_cap': None,
                     'monitor': {}, 'error': str(e)}
+
+    def usage_stats(self, days=30):
+        """近 N 天实耗核时明细(诚实口径:RUNNING→终态时间戳 × 提交核数)。
+
+        返回 {'ok','days','core_hours','jobs':[逐作业含 core_hours/basis/running],
+        'jobs_counted','running_jobs','unknown':[缺数据作业+原因],'note','error'}。
+        缺核数/缺时间戳的作业不计入总数、单列原因,绝不编数。
+        """
+        try:
+            r = self._usage().usage_stats(
+                list(self._ledger.load_all()), days=int(days or 30),
+                profile_cores_by_name=self._profile_cores())
+            return {'ok': True, **r, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'days': int(days or 30), 'core_hours': 0.0, 'jobs': [],
+                    'jobs_counted': 0, 'running_jobs': 0, 'unknown': [], 'note': '',
+                    'error': str(e)}
 
     # ── 波函数页:分析项分组菜单(单一事实源 = 引擎 multiwfn_driver.ANALYSES) ──
     # v3.2.2:ELF-LOL/ADCH/性质汇总/Fukui-CDFT 四项已自 api 层 _EXTRA_ANALYSES 迁入引擎
