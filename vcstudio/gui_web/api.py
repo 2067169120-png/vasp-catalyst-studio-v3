@@ -4911,65 +4911,10 @@ class Api:
                     'remaining_core_hours': None, 'budget_cap': None,
                     'monitor': {}, 'error': str(e)}
 
-    # ── 波函数页:分析项分组菜单(引擎 ANALYSES + api 层 _EXTRA_ANALYSES 补四种) ──
-    @staticmethod
-    def _script_elf_lol_section(params=None):
-        """ELF/LOL 平面截面图(主功能4→9/10 平面数据 → PNG/PDF)。切面:自动/坐标/三原子。"""
-        p = dict(params or {})
-        func = '9' if str(p.get('func', 'elf')).lower() == 'elf' else '10'
-        plane = str(p.get('plane', 'auto')).lower()
-        lines = ['4', func]
-        if plane == 'atoms' and p.get('atoms'):
-            a = [str(int(x)) for x in p['atoms'][:3]]
-            lines += ['1', ' '.join(a)]              # 由三原子定义平面
-        elif plane == 'xy':
-            lines += ['2', '0']
-        else:
-            lines += ['2', '0']                      # 自动/默认:XY 面 z=0
-        lines += ['0']                               # 后处理:导出图形
-        return '\n'.join(lines) + '\n'
-
-    @staticmethod
-    def _script_adch_charge(params=None):
-        """ADCH 原子电荷(主功能7→11):Hirshfeld-I 基础上的偶极校正原子电荷。"""
-        return '7\n11\n1\ny\n0\nq\n'
-
-    @staticmethod
-    def _script_property_summary(params=None):
-        """性质汇总(主功能100→2 等):单点能 / 偶极矩 / 基本热力学量打印在 stdout。"""
-        return '100\n2\n0\nq\n'
-
-    @staticmethod
-    def _script_fukui_cdft(params=None):
-        """Fukui / CDFT(主功能22):f+/f-/f0 与双描述符 DD 四 cube(需 N-1/N/N+1 波函数)。"""
-        return '22\n1\n\n0\nq\n'
-
-    def _extra_analyses(self):
-        """api 层补充分析注册表(引擎 multiwfn_driver.ANALYSES 暂缺的四种;同 stdin 脚本模式)。
-
-        引擎侧扩展后此表可移除(菜单流已标注版本差异);键不与引擎重复。
-        """
-        return {
-            'elf_lol_section': {
-                'name': 'ELF / LOL 截面图', 'stdin_script': self._script_elf_lol_section,
-                'outputs': ('plane.png', 'plane.pdf'),
-                'note': ('平面截面(切面:自动/坐标/三原子)导出 PNG/PDF。⚠ api 层补充项——'
-                         'multiwfn_driver.ANALYSES 暂无此项,菜单号按 Multiwfn 3.8,版本差异请核对。')},
-            'adch_charge': {
-                'name': 'ADCH 原子电荷', 'stdin_script': self._script_adch_charge,
-                'outputs': (),
-                'note': ('主功能7→11:ADCH(原子偶极校正 Hirshfeld)电荷,结果在 stdout。'
-                         '⚠ api 层补充项,引擎待扩展;版本差异请核对。')},
-            'property_summary': {
-                'name': '性质汇总(单点能/偶极矩/热力学)',
-                'stdin_script': self._script_property_summary, 'outputs': (),
-                'note': ('单点能 / 偶极矩 / 基本热力学量汇总打印。⚠ api 层补充项,引擎待扩展。')},
-            'fukui_cdft': {
-                'name': 'Fukui / CDFT 四 cube', 'stdin_script': self._script_fukui_cdft,
-                'outputs': ('f_plus.cub', 'f_minus.cub', 'f_zero.cub', 'CDD.cub'),
-                'note': ('主功能22:CDFT 概念密度泛函,f+/f−/f0 与双描述符;需 N-1/N/N+1 波函数。'
-                         '⚠ api 层补充项,引擎待扩展;版本差异请核对。')},
-        }
+    # ── 波函数页:分析项分组菜单(单一事实源 = 引擎 multiwfn_driver.ANALYSES) ──
+    # v3.2.2:ELF-LOL/ADCH/性质汇总/Fukui-CDFT 四项已自 api 层 _EXTRA_ANALYSES 迁入引擎
+    # 注册表(菜单流字节不变);api 不再自带 stdin 脚本,菜单与执行均以引擎为准——
+    # 远程分析(wavefn_run_remote 走 ANALYSES)也因此自动获得这四项。
 
     # 分析项分组(对齐 starpivot:常用 / 实空间与截面 / 弱相互作用 / 其它)
     _WAVEFN_GROUPS = (
@@ -4980,20 +4925,15 @@ class Api:
     )
 
     def wavefn_analyses(self):
-        """波函数分析项分组菜单(引擎 ANALYSES + api 层补充)→ {'ok','groups':[{group,items:[{key,
-        name,note,source,outputs}]}],'error'}。source∈{engine,api};其它组收未分组项。"""
+        """波函数分析项分组菜单(单一事实源:引擎 ANALYSES)→ {'ok','groups':[{group,items:[{key,
+        name,note,source,outputs}]}],'error'}。source 恒为 engine(四补充项 v3.2.2 已迁入引擎);
+        引擎缺某项 → 菜单诚实少该项(不虚列点不动的卡)。其它组收未分组项。"""
         try:
             eng = dict(self._mw().ANALYSES)
-            extra = self._extra_analyses()
             merged = {}
             for k, v in eng.items():
                 merged[k] = {'key': k, 'name': v.get('name', k), 'note': v.get('note', ''),
                              'outputs': list(v.get('outputs') or ()), 'source': 'engine'}
-            for k, v in extra.items():
-                if k in merged:
-                    continue                              # 引擎已有则不覆盖
-                merged[k] = {'key': k, 'name': v.get('name', k), 'note': v.get('note', ''),
-                             'outputs': list(v.get('outputs') or ()), 'source': 'api'}
             placed, groups = set(), []
             for gname, keys in self._WAVEFN_GROUPS:
                 items = [merged[k] for k in keys if k in merged]
@@ -5013,11 +4953,12 @@ class Api:
             return {'ok': False, 'groups': [], 'error': str(e)}
 
     def wavefn_run_extra(self, wavefn_file, analyses, params=None, exe=None, workdir=None):
-        """跑 api 层补充分析项(elf_lol_section/adch_charge/property_summary/fukui_cdft)。
+        """跑补充分析四项(elf_lol_section/adch_charge/property_summary/fukui_cdft)——兼容入口。
 
-        用 _EXTRA_ANALYSES 的 stdin 脚本经 multiwfn_driver.run_script(或降级回传脚本)。返回同
-        wavefn_run 形状 {'ok','results':[{analysis,ok,outputs,stdout_tail,script,error}],'error'}。
-        引擎缺失(无 run_script)→ 各项回传可复制 stdin 脚本 + '引擎待扩展' 说明。
+        v3.2.2 起四项在引擎 multiwfn_driver.ANALYSES 注册表,本方法直接按引擎 run() 执行
+        (语义等价 wavefn_run;保留本方法兼容旧前端路由与 Fukui 面板直连)。注入的引擎若无
+        该项(旧版引擎),按项返回「引擎待扩展」中文说明,绝不假成功。返回
+        {'ok','results':[{analysis,ok,outputs,stdout_tail,elapsed_s,script,error}],'error'}。
         """
         try:
             wf = (wavefn_file or '').strip()
@@ -5026,44 +4967,31 @@ class Api:
                 return {'ok': False, 'results': [], 'error': '未选择波函数文件'}
             if not keys:
                 return {'ok': False, 'results': [], 'error': '未选择分析项'}
-            extra = self._extra_analyses()
             mw = self._mw()
+            registry = dict(getattr(mw, 'ANALYSES', None) or {})
             mw_exe = (exe or self._tool_paths().get('multiwfn') or '').strip() or None
             wd = (workdir or '').strip() or None
             p = dict(params or {})
             results = []
             for k in keys:
-                spec = extra.get(k)
-                if spec is None:
+                if k not in registry:
                     results.append({'analysis': k, 'ok': False, 'outputs': [],
-                                    'stdout_tail': '', 'script': '',
-                                    'error': f'未知补充分析项 {k!r}'})
+                                    'stdout_tail': '', 'script': '', 'elapsed_s': 0.0,
+                                    'error': (f'引擎待扩展:multiwfn_driver.ANALYSES 无分析项 '
+                                              f'{k!r}(引擎版本过旧,请更新 vcstudio)')})
                     continue
                 try:
-                    script = spec['stdin_script'](p)
+                    r = mw.run(wf, k, exe=mw_exe, workdir=wd, params=p)
+                    results.append({'analysis': k, 'ok': bool(r.get('ok')),
+                                    'outputs': list(r.get('outputs') or []),
+                                    'stdout_tail': r.get('stdout_tail', ''),
+                                    'elapsed_s': r.get('elapsed_s', 0.0),
+                                    'script': r.get('script', ''),
+                                    'error': r.get('error') or None})
                 except Exception as e:                    # noqa: BLE001
-                    script = ''
                     results.append({'analysis': k, 'ok': False, 'outputs': [],
-                                    'stdout_tail': '', 'script': '', 'error': str(e)})
-                    continue
-                runner = getattr(mw, 'run_script', None)
-                if callable(runner):
-                    try:
-                        r = runner(wf, script, exe=mw_exe, workdir=wd,
-                                   outputs=list(spec.get('outputs') or ()))
-                        results.append({'analysis': k, 'ok': bool(r.get('ok')),
-                                        'outputs': list(r.get('outputs') or []),
-                                        'stdout_tail': r.get('stdout_tail', ''),
-                                        'script': r.get('script', script),
-                                        'error': r.get('error') or None})
-                    except Exception as e:                # noqa: BLE001
-                        results.append({'analysis': k, 'ok': False, 'outputs': [],
-                                        'stdout_tail': '', 'script': script, 'error': str(e)})
-                else:
-                    results.append({'analysis': k, 'ok': False, 'outputs': [],
-                                    'stdout_tail': '', 'script': script,
-                                    'error': '引擎待扩展:multiwfn_driver 暂无 run_script,'
-                                             '可复制上方 stdin 脚本手动运行'})
+                                    'stdout_tail': '', 'script': '', 'elapsed_s': 0.0,
+                                    'error': str(e)})
             return {'ok': any(r['ok'] for r in results), 'results': results, 'error': None}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'results': [], 'error': str(e)}

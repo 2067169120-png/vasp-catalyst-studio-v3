@@ -4463,20 +4463,22 @@ def test_overview_stats_error_caught():
     assert out['ok'] is False and '台账坏' in out['error']
 
 
-# ── starpivot:波函数分组菜单 + 补充分析 ───────────────────────────────────────
+# ── starpivot:波函数分组菜单 + 补充分析(v3.2.2 单一事实源=引擎注册表) ─────────
 def _fake_multiwfn_full():
-    """波函数分组菜单测试用:ANALYSES 覆盖引擎全七件套 + 弱相互作用族(纯注册表)。"""
+    """波函数分组菜单测试用:ANALYSES 覆盖引擎全量注册表(含 v3.2.2 迁入的四补充项)。"""
     m = _fake_multiwfn()
     m.ANALYSES = dict(m.ANALYSES)
     for k, name in (('density_cube', '电子密度 cube'), ('esp_cube', '静电势 cube'),
                     ('nci_rdg', 'NCI/RDG'), ('igmh', 'IGMH'), ('iri', 'IRI'),
                     ('aim_cp', 'AIM 临界点'), ('alie', 'ALIE cube'),
-                    ('alie_extrema', 'ALIE 极值')):
+                    ('alie_extrema', 'ALIE 极值'),
+                    ('elf_lol_section', 'ELF/LOL 截面'), ('adch_charge', 'ADCH 电荷'),
+                    ('property_summary', '性质汇总'), ('fukui_cdft', 'Fukui/CDFT')):
         m.ANALYSES[k] = {'name': name, 'stdin_script': lambda p: '', 'outputs': (), 'note': ''}
     return m
 
 
-def test_wavefn_analyses_grouped_with_extra():
+def test_wavefn_analyses_grouped_all_engine():
     api = Api(multiwfn_mod=_fake_multiwfn_full())
     out = api.wavefn_analyses()
     assert out['ok'] is True
@@ -4484,9 +4486,20 @@ def test_wavefn_analyses_grouped_with_extra():
     assert '常用' in gnames and '弱相互作用' in gnames
     allkeys = {it['key']: it for g in out['groups'] for it in g['items']}
     assert 'esp_extrema' in allkeys and allkeys['esp_extrema']['source'] == 'engine'
-    # api 层补充四种存在且标注 source=api
-    assert 'elf_lol_section' in allkeys and allkeys['elf_lol_section']['source'] == 'api'
+    # v3.2.2:四补充项由引擎注册表提供,source 统一为 engine(api 不再自带脚本)
+    assert 'elf_lol_section' in allkeys and allkeys['elf_lol_section']['source'] == 'engine'
     assert 'fukui_cdft' in allkeys and 'adch_charge' in allkeys
+    assert all(it['source'] == 'engine' for it in allkeys.values())
+
+
+def test_wavefn_analyses_old_engine_omits_missing_items():
+    # 旧引擎(注册表无四补充项)→ 菜单诚实少这四项,不虚列点不动的卡
+    api = Api(multiwfn_mod=_fake_multiwfn())
+    out = api.wavefn_analyses()
+    assert out['ok'] is True
+    allkeys = {it['key'] for g in out['groups'] for it in g['items']}
+    assert 'esp_extrema' in allkeys
+    assert 'elf_lol_section' not in allkeys and 'fukui_cdft' not in allkeys
 
 
 def test_wavefn_analyses_error_caught():
@@ -4496,28 +4509,32 @@ def test_wavefn_analyses_error_caught():
     assert out['ok'] is False and out['error']
 
 
-def test_wavefn_run_extra_script_fallback_without_run_script(tmp_path):
+def test_wavefn_run_extra_old_engine_honest_error(tmp_path):
+    # 旧引擎注册表无四项 → 按项「引擎待扩展」中文说明(前端 engineMissing 归因依赖此措辞)
     wf = tmp_path / 'mol.fchk'
     wf.write_text('x', encoding='utf-8')
     api = Api(multiwfn_mod=_fake_multiwfn(), config_mod=_fake_config(cfg={}))
     out = api.wavefn_run_extra(str(wf), ['fukui_cdft', 'adch_charge'])
     assert out['ok'] is False and len(out['results']) == 2
-    assert all(r['script'] for r in out['results'])       # 回传 stdin 脚本
-    assert '引擎待扩展' in out['results'][0]['error']
+    assert all('引擎待扩展' in r['error'] for r in out['results'])
 
 
-def test_wavefn_run_extra_uses_run_script_when_present(tmp_path):
+def test_wavefn_run_extra_runs_via_engine_registry(tmp_path):
+    # v3.2.2:四项在引擎注册表 → wavefn_run_extra 直接走引擎 run()(与 wavefn_run 同路径)
     wf = tmp_path / 'mol.fchk'
     wf.write_text('x', encoding='utf-8')
-    mw = _fake_multiwfn()
     calls = {}
-    mw.run_script = lambda w, script, exe=None, workdir=None, outputs=None: (
-        calls.__setitem__('ran', {'script': script, 'outputs': outputs})
-        or {'ok': True, 'outputs': list(outputs or []), 'stdout_tail': 'done', 'script': script})
+    mw = _fake_multiwfn(calls=calls,
+                        run_ret={'ok': True, 'outputs': ['fukui_cdft_f_plus.cub'],
+                                 'stdout_tail': 'done', 'elapsed_s': 2.0, 'error': ''})
+    mw.ANALYSES = dict(mw.ANALYSES)
+    mw.ANALYSES['fukui_cdft'] = {'name': 'Fukui/CDFT', 'stdin_script': lambda p: '22\n',
+                                 'outputs': ('f_plus.cub',), 'note': ''}
     api = Api(multiwfn_mod=mw, config_mod=_fake_config(cfg={}))
-    out = api.wavefn_run_extra(str(wf), ['fukui_cdft'])
+    out = api.wavefn_run_extra(str(wf), ['fukui_cdft'], {'which': 'f+'})
     assert out['ok'] is True and out['results'][0]['ok'] is True
-    assert 'f_plus.cub' in out['results'][0]['outputs']
+    assert 'fukui_cdft_f_plus.cub' in out['results'][0]['outputs']
+    assert calls['runs'][0]['key'] == 'fukui_cdft'        # 确实经引擎 run() 执行
 
 
 def test_wavefn_run_extra_missing_file():

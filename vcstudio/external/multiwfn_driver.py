@@ -204,6 +204,65 @@ def _script_iri(params: dict | None = None) -> str:
     return '\n'.join(lines) + '\n'
 
 
+def _script_elf_lol_section(params: dict | None = None) -> str:
+    """ELF/LOL 平面截面图(主功能 4 → 实空间函数 9/10)。
+
+    params:``func``('elf' 默认 / 'lol');``plane``('auto' 默认=XY z=0 / 'xy' /
+    'atoms' 三原子定义平面,此时需 ``atoms`` 给 3 个 1 起原子序号)。
+    (v3.2.2 自 api 层 _EXTRA_ANALYSES 迁入引擎注册表,菜单流字节不变。)
+    """
+    p = dict(params or {})
+    func = '9' if str(p.get('func', 'elf')).lower() == 'elf' else '10'
+    plane = str(p.get('plane', 'auto')).lower()
+    lines = [
+        '4',     # 主功能 4:绘制平面图(实空间函数的二维截面)
+        func,    # 实空间函数:9=ELF 电子局域化函数 / 10=LOL 局域轨道定位函数
+    ]
+    if plane == 'atoms' and p.get('atoms'):
+        a = [str(int(x)) for x in p['atoms'][:3]]
+        lines += ['1', ' '.join(a)]              # 平面定义方式 1:由三原子确定平面
+    else:
+        lines += ['2', '0']                      # 自动/默认:XY 平面,z=0
+    lines += ['0']                               # 后处理:导出图形(plane.png/plane.pdf)
+    return '\n'.join(lines) + '\n'
+
+
+def _script_adch_charge(params: dict | None = None) -> str:
+    """ADCH 原子电荷(主功能 7 → 11):Hirshfeld 基础上偶极校正的原子电荷,结果在 stdout。"""
+    lines = [
+        '7',     # 主功能 7:布居分析与原子电荷计算
+        '11',    # 子功能 11:ADCH(原子偶极矩校正 Hirshfeld)电荷
+        '1',     # 参考态:内置球对称自由原子密度
+        'y',     # 确认输出电荷结果
+        '0',     # 返回上级菜单
+        'q',     # 退出程序
+    ]
+    return '\n'.join(lines) + '\n'
+
+
+def _script_property_summary(params: dict | None = None) -> str:
+    """性质汇总(主功能 100 → 2):单点能 / 偶极矩 / 基本分子性质打印在 stdout。"""
+    lines = [
+        '100',   # 主功能 100:其它功能(Part 1)
+        '2',     # 子功能 2:输出分子基本性质(能量/偶极矩等)
+        '0',     # 返回
+        'q',     # 退出程序
+    ]
+    return '\n'.join(lines) + '\n'
+
+
+def _script_fukui_cdft(params: dict | None = None) -> str:
+    """Fukui / CDFT(主功能 22):f+/f−/f0 与双描述符四 cube(需 N−1/N/N+1 波函数)。"""
+    lines = [
+        '22',    # 主功能 22:概念密度泛函(CDFT)分析
+        '1',     # 子功能 1:Fukui 函数与双描述符
+        '',      # 回车:按默认文件名约定取 N±1 电子态波函数
+        '0',     # 返回
+        'q',     # 退出程序
+    ]
+    return '\n'.join(lines) + '\n'
+
+
 # ── 分析项注册表 ─────────────────────────────────────────────────────────────
 # key → {name(中文), stdin_script(fn(params)->str), outputs(期望产物默认文件名), note}
 # outputs 用 Multiwfn 各功能的默认导出文件名;不同版本命名可能略有差异,run() 按名收集,
@@ -278,6 +337,37 @@ ANALYSES = {
         'note': ('主功能20→IRI:相互作用区域指示函数,输出 func1.cub(IRI)与 func2.cub'
                  '(sign(λ2)ρ),既显化学键又显弱相互作用(比 NCI 更完整的相互作用视图);'
                  '供 VMD iri 场景。IRI 子功能号按 Multiwfn 3.8,版本差异见源码常量注释。'),
+    },
+    # ── 以下四项 v3.2.2 自 api 层 _EXTRA_ANALYSES 迁入(菜单流字节不变,单一事实源) ──
+    'elf_lol_section': {
+        'name': 'ELF / LOL 截面图',
+        'stdin_script': _script_elf_lol_section,
+        'outputs': ('plane.png', 'plane.pdf'),
+        'note': ("主功能4→9/10:ELF/LOL 平面截面导出 PNG/PDF。切面:自动(XY,z=0)或"
+                 "params['plane']='atoms' + params['atoms'] 三原子定义;"
+                 "params['func']∈{elf,lol}。菜单号按 Multiwfn 3.8,版本差异请核对。"),
+    },
+    'adch_charge': {
+        'name': 'ADCH 原子电荷',
+        'stdin_script': _script_adch_charge,
+        'outputs': (),   # 无文件产物:电荷表打印在 stdout
+        'note': ('主功能7→11:ADCH(原子偶极校正 Hirshfeld)电荷,结果在 stdout。'
+                 '菜单号按 Multiwfn 3.8,版本差异请核对。'),
+    },
+    'property_summary': {
+        'name': '性质汇总(单点能/偶极矩/热力学)',
+        'stdin_script': _script_property_summary,
+        'outputs': (),   # 无文件产物:汇总打印在 stdout
+        'note': ('主功能100→2:单点能 / 偶极矩 / 基本分子性质汇总打印在 stdout。'
+                 '菜单号按 Multiwfn 3.8,版本差异请核对。'),
+    },
+    'fukui_cdft': {
+        'name': 'Fukui / CDFT 四 cube',
+        'stdin_script': _script_fukui_cdft,
+        'outputs': ('f_plus.cub', 'f_minus.cub', 'f_zero.cub', 'CDD.cub'),
+        'note': ('主功能22:CDFT 概念密度泛函,f+/f−/f0 与双描述符四 cube;'
+                 '需按 Multiwfn 约定备好 N−1/N/N+1 波函数。菜单号按 Multiwfn 3.8,'
+                 '版本差异请核对。'),
     },
 }
 
@@ -411,8 +501,9 @@ def run_script(wavefn_file: str, stdin_script: str, outputs=(), *,
                timeout: int = 1800) -> dict:
     """跑一段**现成 stdin 脚本**(逻辑同 run,但吃调用方给的菜单文本 + outputs 列表)。
 
-    面向 api 层补充分析(_EXTRA_ANALYSES:ELF-LOL/ADCH/性质汇总/Fukui-CDFT)——这些的
-    stdin 脚本在 api 侧生成,引擎只需照喂并按 outputs 收产物。返回同 run():
+    通用自定义脚本入口:注册表(ANALYSES)之外的分析、用户手写/微调过的菜单流走这里。
+    (历史:v3.2.1 前 api 层 _EXTRA_ANALYSES 四项经此运行;v3.2.2 起四项已迁入 ANALYSES
+    注册表走 run(),本函数保留作自定义脚本与旧调用方兼容。)返回同 run():
     ``{'ok','outputs','stdout_tail','elapsed_s','script'?,'error'}``。
 
     - wavefn_file:.fchk/.wfn/.wfx/.molden 等;stdin_script:已构建好的 Multiwfn 交互输入文本;

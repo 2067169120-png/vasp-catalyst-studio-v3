@@ -59,7 +59,10 @@ def test_probe_explicit_missing(monkeypatch):
 def test_analyses_registry_shape():
     assert set(md.ANALYSES) == {'esp_extrema', 'homo_lumo_cube', 'density_cube',
                                 'esp_cube', 'nci_rdg', 'igmh', 'aim_cp',
-                                'alie', 'alie_extrema', 'iri'}
+                                'alie', 'alie_extrema', 'iri',
+                                # v3.2.2 自 api 层 _EXTRA_ANALYSES 迁入的四项
+                                'elf_lol_section', 'adch_charge',
+                                'property_summary', 'fukui_cdft'}
     for spec in md.ANALYSES.values():
         assert callable(spec['stdin_script'])
         assert isinstance(spec['name'], str) and spec['name']
@@ -136,6 +139,55 @@ def test_script_iri_grid_override():
 def test_script_grid_param_override():
     # 格点质量参数注入:params['grid'] 落到密度 cube 脚本第 3 行
     assert md.ANALYSES['density_cube']['stdin_script']({'grid': 3}).splitlines()[2] == '3'
+
+
+# ── v3.2.2:api 层 _EXTRA_ANALYSES 四项迁入引擎注册表(菜单流须与迁移前字节一致) ──
+def test_script_elf_lol_section_default_and_atoms_plane():
+    # 默认:ELF(9)+ XY 面 z=0;与迁移前 api 层脚本逐字节一致
+    assert md.ANALYSES['elf_lol_section']['stdin_script']({}) == '4\n9\n2\n0\n0\n'
+    # LOL 切换实空间函数 10
+    assert md.ANALYSES['elf_lol_section']['stdin_script']({'func': 'lol'}) == '4\n10\n2\n0\n0\n'
+    # 三原子定义平面:方式 1 + 空格分隔原子序号
+    lines = md.ANALYSES['elf_lol_section']['stdin_script'](
+        {'plane': 'atoms', 'atoms': [1, 2, 3]}).splitlines()
+    assert lines[:2] == ['4', '9'] and lines[2] == '1' and lines[3] == '1 2 3'
+    assert md.ANALYSES['elf_lol_section']['outputs'] == ('plane.png', 'plane.pdf')
+
+
+def test_script_adch_property_fukui_bytes_stable():
+    # 三段固定菜单流与迁移前 api 层字符串逐字节一致(行为零漂移)
+    assert md.ANALYSES['adch_charge']['stdin_script']({}) == '7\n11\n1\ny\n0\nq\n'
+    assert md.ANALYSES['property_summary']['stdin_script']({}) == '100\n2\n0\nq\n'
+    assert md.ANALYSES['fukui_cdft']['stdin_script']({}) == '22\n1\n\n0\nq\n'
+    assert md.ANALYSES['adch_charge']['outputs'] == ()
+    assert md.ANALYSES['property_summary']['outputs'] == ()
+    assert md.ANALYSES['fukui_cdft']['outputs'] == (
+        'f_plus.cub', 'f_minus.cub', 'f_zero.cub', 'CDD.cub')
+
+
+def test_extra_four_run_through_engine(tmp_path, monkeypatch):
+    # 迁入后四项走 run() 主路径:产物带 analysis 前缀重命名(如 fukui_cdft_f_plus.cub)
+    wf = tmp_path / 'mol.fchk'
+    wf.write_text('fake wavefn', encoding='utf-8')
+    monkeypatch.setattr(md, 'probe',
+                        lambda exe=None: {'available': True, 'path': 'Multiwfn', 'detail': ''})
+
+    def fake_run(cmd, **kw):
+        for name in ('f_plus.cub', 'f_minus.cub', 'f_zero.cub', 'CDD.cub'):
+            with open(os.path.join(kw['cwd'], name), 'wb') as f:
+                f.write(b'CUBE')
+
+        class P:
+            returncode = 0
+            stdout = b'CDFT done\n'
+        return P()
+
+    monkeypatch.setattr(md.subprocess, 'run', fake_run)
+    out = md.run(str(wf), 'fukui_cdft', workdir=str(tmp_path))
+    assert out['ok']
+    names = sorted(os.path.basename(p) for p in out['outputs'])
+    assert names == ['fukui_cdft_CDD.cub', 'fukui_cdft_f_minus.cub',
+                     'fukui_cdft_f_plus.cub', 'fukui_cdft_f_zero.cub']
 
 
 # ── run 编排(假 subprocess) ──────────────────────────────────────────────────

@@ -63,7 +63,7 @@
     const r = await VCS.call('wavefn_scenes');
     State.analyses = (r && r.analyses) || [];
     State.scenes = (r && r.scenes) || [];
-    const g = await VCS.call('wavefn_analyses');       // 分组菜单(引擎 + api 补充)
+    const g = await VCS.call('wavefn_analyses');       // 分组菜单(单一事实源=引擎注册表;source=api 仅旧后端出现)
     State.groups = (g && g.groups) || [];
     State.apiKeys = new Set();
     State.groups.forEach(grp => (grp.items || []).forEach(it => {
@@ -165,7 +165,8 @@
         VCS.log('远程集群跑波函数分析(实验性):' + keys.join('、') + ' …');
         r = await VCS.call('wavefn_run_remote', wf, keys, name, null, rdir, rexe, false, analysisParams());
       } else {
-        // 引擎项走 wavefn_run;api 补充项(elf_lol_section 等)走 wavefn_run_extra,合并结果
+        // v3.2.2 起四补充项已入引擎注册表(source=engine)统一走 wavefn_run;
+        // apiKeys 路由仅为旧后端(source=api)保留,新后端该集合为空。
         const engKeys = keys.filter(k => !State.apiKeys.has(k));
         const apiKeys = keys.filter(k => State.apiKeys.has(k));
         VCS.log('本机跑波函数分析:' + keys.join('、') + ' …');
