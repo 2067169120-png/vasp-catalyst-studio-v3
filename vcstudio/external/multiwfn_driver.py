@@ -28,6 +28,14 @@ _EXE_CANDIDATES = ('Multiwfn', 'Multiwfn.exe', 'Multiwfn_noGUI', 'multiwfn')
 # Multiwfn 支持的波函数/波函数信息文件后缀(本驱动接受的输入格式)
 _WAVEFN_EXTS = ('.fchk', '.fch', '.wfn', '.wfx', '.molden', '.mwfn')
 
+# ── Multiwfn 菜单编号常量 ─────────────────────────────────────────────────────
+# 交互式菜单编号按 Multiwfn 3.8 手册整理;不同版本菜单顺序可能微调。若版本差异导致
+# 脚本喂错子菜单,请对照本机 Multiwfn 手册调整下列常量即可(脚本生成为纯函数,可改)。
+_FUNC_ALIE = '18'           # 主功能5"实空间函数选择"里 ALIE(平均局域离子化能)的编号
+_SUB_IRI = '4'              # 主功能20"弱相互作用可视化"里 IRI(相互作用区域指示函数)子功能号
+_SURF_SELECT_MAPPED = '2'   # 主功能12"定量分子表面分析"里"选择映射函数"的子菜单项
+_SURF_MAPPED_ALIE = '2'     # 上述"选择映射函数"子菜单里选 ALIE 的编号
+
 
 # ── 探测 ─────────────────────────────────────────────────────────────────────
 def probe(exe: str | None = None) -> dict:
@@ -156,6 +164,46 @@ def _script_aim_cp(params: dict | None = None) -> str:
     return '\n'.join(lines) + '\n'
 
 
+def _script_alie_cube(params: dict | None = None) -> str:
+    """ALIE 平均局域离子化能 cube(主功能 5 → 实空间函数 ALIE)。"""
+    grid = str((params or {}).get('grid', 2))
+    lines = [
+        '5',            # 主功能 5:计算并输出空间格点数据(cube)
+        _FUNC_ALIE,     # 实空间函数:ALIE 平均局域离子化能(编号见文件顶部常量注释)
+        grid,           # 格点质量:1 低 / 2 中 / 3 高
+        '2',            # 后处理选项 2:导出 Gaussian 格式 cube(ALIE.cub)
+        '0',            # 返回主菜单(随后 EOF 退出程序)
+    ]
+    return '\n'.join(lines) + '\n'
+
+
+def _script_alie_extrema(params: dict | None = None) -> str:
+    """ALIE 分子表面极值点(主功能 12,映射函数切为 ALIE → 0 开始)。
+
+    ALIE 表面极小点 = 电子最易被移走处 = 亲电试剂进攻的敏感位点(亲电位点);
+    与 ESP 极值同走"定量分子表面分析",只把映射函数从静电势换成 ALIE。
+    """
+    lines = [
+        '12',                   # 主功能 12:定量分子表面分析(默认在 ρ=0.001 等值面上分析)
+        _SURF_SELECT_MAPPED,    # 子菜单:选择映射函数(编号见文件顶部常量注释)
+        _SURF_MAPPED_ALIE,      # 把映射函数选为 ALIE
+        '0',                    # 立即开始分析;极小/极大点打印到 stdout,交 extrema_parse 解析
+    ]
+    return '\n'.join(lines) + '\n'
+
+
+def _script_iri(params: dict | None = None) -> str:
+    """IRI 相互作用区域指示函数(主功能 20 → IRI 子功能)。"""
+    grid = str((params or {}).get('grid', 2))
+    lines = [
+        '20',        # 主功能 20:弱相互作用可视化研究
+        _SUB_IRI,    # 子功能:IRI 相互作用区域指示函数分析(编号见文件顶部常量注释)
+        grid,        # 格点质量;算完在当前目录写 func1.cub(IRI)、func2.cub(sign(λ2)ρ)
+        '-10',       # 返回主菜单
+    ]
+    return '\n'.join(lines) + '\n'
+
+
 # ── 分析项注册表 ─────────────────────────────────────────────────────────────
 # key → {name(中文), stdin_script(fn(params)->str), outputs(期望产物默认文件名), note}
 # outputs 用 Multiwfn 各功能的默认导出文件名;不同版本命名可能略有差异,run() 按名收集,
@@ -206,6 +254,30 @@ ANALYSES = {
         'stdin_script': _script_aim_cp,
         'outputs': ('CPprop.txt',),
         'note': '主功能2:QTAIM 拓扑分析,搜核吸引子/键临界点,导出 CPprop.txt(键强/密度性质)。',
+    },
+    'alie': {
+        'name': 'ALIE 平均局域离子化能 cube',
+        'stdin_script': _script_alie_cube,
+        'outputs': ('ALIE.cub',),
+        'note': ('主功能5→实空间函数 ALIE:导出平均局域离子化能 cube。ALIE 低值区=电子'
+                 '束缚弱=对亲电进攻敏感的位点;供 VMD alie_surface 着色分子表面。'
+                 'ALIE 菜单号按 Multiwfn 3.8,版本差异见源码常量注释。'),
+    },
+    'alie_extrema': {
+        'name': 'ALIE 表面极值点',
+        'stdin_script': _script_alie_extrema,
+        'outputs': (),   # 无文件产物:极值列表打印在 stdout,复用 extrema_parse 解析
+        'note': ('定量分子表面分析(主功能12,映射函数切 ALIE→0):求 ALIE 表面极小/极大点。'
+                 'ALIE 极小点=电子最易失去处=亲电位点;结果在 stdout,交 extrema_parse 解析'
+                 '(数值单位为 eV,非 kcal/mol)。'),
+    },
+    'iri': {
+        'name': 'IRI 相互作用区域指示函数',
+        'stdin_script': _script_iri,
+        'outputs': ('func1.cub', 'func2.cub'),
+        'note': ('主功能20→IRI:相互作用区域指示函数,输出 func1.cub(IRI)与 func2.cub'
+                 '(sign(λ2)ρ),既显化学键又显弱相互作用(比 NCI 更完整的相互作用视图);'
+                 '供 VMD iri 场景。IRI 子功能号按 Multiwfn 3.8,版本差异见源码常量注释。'),
     },
 }
 

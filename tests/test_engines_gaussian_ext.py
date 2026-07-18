@@ -31,7 +31,11 @@ def _spec(structure=MOL, **kw):
 
 
 def _route(spec):
-    for ln in build_gjf(spec)[0].splitlines():
+    return _route_of(build_gjf(spec)[0])
+
+
+def _route_of(text):
+    for ln in text.splitlines():
         if ln.lstrip().startswith('#'):
             return ln
     return ''
@@ -239,6 +243,132 @@ def test_preview_periodic_still_raises():
                        [[0, 0, 5.0]])
     with pytest.raises(ValueError, match='仅支持分子'):
         preview(_spec(structure=slab, periodic=True, cutoff_ev=400))
+
+
+# ── Gaussian 任务种类全家桶(extras['gaussian_task']) ──────────────────────────
+def test_gaussian_tasks_registry_shape():
+    assert set(gaussian.GAUSSIAN_TASKS) == {
+        'opt', 'freq', 'opt_freq', 'sp', 'td', 'irc', 'scan', 'nmr', 'opt_ts'}
+    for spec in gaussian.GAUSSIAN_TASKS.values():
+        assert callable(spec['route_fn'])
+        assert isinstance(spec['name_zh'], str) and spec['name_zh']
+        assert isinstance(spec['note'], str) and spec['note']
+
+
+def test_task_opt_route():
+    assert _route(_spec(extras={'gaussian_task': 'opt'})).split()[-1] == 'opt'
+
+
+def test_task_freq_route():
+    assert _route(_spec(extras={'gaussian_task': 'freq'})).split()[-1] == 'freq'
+
+
+def test_task_sp_route():
+    assert _route(_spec(extras={'gaussian_task': 'sp'})).split()[-1] == 'sp'
+
+
+def test_task_opt_freq_route():
+    route = _route(_spec(extras={'gaussian_task': 'opt_freq'}))
+    assert 'Opt Freq' in route
+
+
+def test_task_td_default_nstates():
+    assert 'TD=(NStates=6)' in _route(_spec(extras={'gaussian_task': 'td'}))
+
+
+def test_task_td_custom_nstates():
+    assert 'TD=(NStates=12)' in _route(
+        _spec(extras={'gaussian_task': 'td', 'td_nstates': 12}))
+
+
+def test_task_td_bad_nstates_raises():
+    with pytest.raises(ValueError, match='td_nstates'):
+        build_gjf(_spec(extras={'gaussian_task': 'td', 'td_nstates': 0}))
+
+
+def test_task_irc_default_maxpoints():
+    assert 'IRC=(CalcFC,MaxPoints=20)' in _route(_spec(extras={'gaussian_task': 'irc'}))
+
+
+def test_task_irc_custom_maxpoints():
+    assert 'IRC=(CalcFC,MaxPoints=40)' in _route(
+        _spec(extras={'gaussian_task': 'irc', 'irc_maxpoints': 40}))
+
+
+def test_task_irc_bad_maxpoints_raises():
+    with pytest.raises(ValueError, match='irc_maxpoints'):
+        build_gjf(_spec(extras={'gaussian_task': 'irc', 'irc_maxpoints': -1}))
+
+
+def test_task_nmr_route():
+    assert 'NMR=GIAO' in _route(_spec(extras={'gaussian_task': 'nmr'}))
+
+
+def test_task_opt_ts_route_with_freq():
+    route = _route(_spec(extras={'gaussian_task': 'opt_ts'}))
+    assert 'Opt=(TS,CalcFC,NoEigenTest)' in route and 'Freq' in route
+
+
+def test_task_scan_route_and_modredundant_section():
+    text = build_gjf(_spec(extras={
+        'gaussian_task': 'scan',
+        'modredundant': ['B 1 2 S 10 0.1', 'A 1 2 3 S 5 2.0']}))[0]
+    assert 'Opt=ModRedundant' in _route_of(text)
+    # ModRedundant 段紧跟坐标块、排在其它附加段之前;两行内容齐全
+    blocks = _blocks(text)
+    coords = next(i for i, b in enumerate(blocks) if b[0].startswith('0 1'))
+    modred = blocks.index(['B 1 2 S 10 0.1', 'A 1 2 3 S 5 2.0'])
+    assert modred == coords + 1                       # 坐标块之后紧接 ModRedundant 段
+
+
+def test_task_scan_modredundant_full_order_before_basis_ecp_scrf():
+    # ModRedundant 段必须排在 基组/ECP/SCRF 之前(全序断言)
+    text = build_gjf(_spec(structure=GOLD, extras={
+        'gaussian_task': 'scan',
+        'modredundant': ['B 1 4 S 10 0.1'],
+        'solvent': {'model': 'pcm', 'eps': 78.39},
+        'mixed_basis': {'default': '6-31G(d)', 'per_element': {'Au': 'LANL2DZ'},
+                        'ecp_elements': ['Au']}}))[0]
+    blocks = _blocks(text)
+    coords = next(i for i, b in enumerate(blocks) if b[0].startswith('0 1'))
+    modred = blocks.index(['B 1 4 S 10 0.1'])
+    basis = blocks.index(['C H O 0', '6-31G(d)', '****', 'Au 0', 'LANL2DZ', '****'])
+    ecp = blocks.index(['Au 0', 'LANL2DZ'])
+    scrf = blocks.index(['eps=78.39'])
+    assert coords < modred < basis < ecp < scrf
+
+
+def test_task_scan_missing_modredundant_raises():
+    with pytest.raises(ValueError, match='modredundant'):
+        build_gjf(_spec(extras={'gaussian_task': 'scan'}))
+
+
+def test_task_scan_modredundant_accepts_single_str():
+    text = build_gjf(_spec(extras={
+        'gaussian_task': 'scan', 'modredundant': 'B 1 2 S 10 0.1'}))[0]
+    assert ['B 1 2 S 10 0.1'] in _blocks(text)
+
+
+def test_task_unknown_raises():
+    with pytest.raises(ValueError, match='gaussian_task'):
+        build_gjf(_spec(extras={'gaussian_task': 'bogus'}))
+
+
+def test_task_overrides_calcspec_task():
+    # gaussian_task 覆盖 CalcSpec.task:task=relax 但 gaussian_task=sp → 路线为 sp
+    assert _route(_spec(task='relax', extras={'gaussian_task': 'sp'})).split()[-1] == 'sp'
+
+
+@pytest.mark.parametrize('task,kw', [
+    ('relax', 'opt'), ('static', 'sp'), ('freq', 'freq')])
+def test_no_gaussian_task_preserves_old_behavior(task, kw):
+    # 未给 gaussian_task → 路线行与旧映射逐字符一致,且不泄漏任何全家桶新段/关键字
+    text = build_gjf(CalcSpec(structure=MOL, task=task, functional='PBE',
+                              periodic=False, charge=0, multiplicity=1))[0]
+    assert _route_of(text) == f'#P PBEPBE def2-SVP {kw}'
+    for leak in ('ModRedundant', 'TD=', 'IRC=', 'NMR=', 'TS,CalcFC'):
+        assert leak not in text
+    assert text.endswith('\n\n')                       # 末尾必空行(旧不变式)
 
 
 # ── PERIODIC_TABLE_GROUPS 周期表建议 ──────────────────────────────────────────

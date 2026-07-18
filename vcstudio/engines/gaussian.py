@@ -196,12 +196,97 @@ def _mixed_basis_sections(mixed: dict, unique_elements: list,
     return ('GenECP' if has_ecp else 'Gen'), basis_lines, ecp_lines, has_ecp
 
 
+# ── Gaussian 任务种类全家桶(extras['gaussian_task'] 覆盖 CalcSpec.task 映射) ──────
+def _positive_int(extras: dict, key: str, default, label: str) -> int:
+    """extras[key] → 正整数(缺省用 default);非正整数 → 中文 ValueError。"""
+    v = extras.get(key, default)
+    try:
+        iv = int(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"extras[{key!r}] 需为正整数({label}),收到 {v!r}。")
+    if iv <= 0:
+        raise ValueError(f"extras[{key!r}] 需为正整数({label}),收到 {v!r}。")
+    return iv
+
+
+def _modredundant_section(extras: dict) -> list:
+    """extras['modredundant'] → ModRedundant 段行列表(如 ['B 1 2 S 10 0.1'])。缺失 → 中文 ValueError。"""
+    mr = extras.get('modredundant')
+    if not mr:
+        raise ValueError(
+            "gaussian_task='scan' 需在 extras['modredundant'] 提供 ModRedundant 扫描定义"
+            "(list[str],如 ['B 1 2 S 10 0.1']:键长 1-2,扫 10 步,每步 +0.1 Å)。")
+    if isinstance(mr, str):
+        mr = [mr]
+    return [str(x) for x in mr]
+
+
+# 任务 key → {route_fn(extras)->路线关键字, name_zh(GUI 下拉标签), note}。
+# route_fn 只产路线关键字;scan 的 ModRedundant 附加段在 _render 里单独按顺序输出。
+GAUSSIAN_TASKS = {
+    'opt': {
+        'route_fn': lambda e: 'opt',
+        'name_zh': '结构优化', 'note': 'Opt:标准几何优化(等价 CalcSpec.task=relax)。',
+    },
+    'freq': {
+        'route_fn': lambda e: 'freq',
+        'name_zh': '频率分析', 'note': 'Freq:简谐频率/热化学(须在优化后的构型上做)。',
+    },
+    'opt_freq': {
+        'route_fn': lambda e: 'Opt Freq',
+        'name_zh': '优化+频率', 'note': 'Opt Freq:优化后连跑频率(一步拿到极小点+热校正)。',
+    },
+    'sp': {
+        'route_fn': lambda e: 'sp',
+        'name_zh': '单点能', 'note': 'SP:单点能(等价 CalcSpec.task=static)。',
+    },
+    'td': {
+        'route_fn': lambda e: f'TD=(NStates={_positive_int(e, "td_nstates", 6, "TD 激发态数")})',
+        'name_zh': '激发态 TD-DFT',
+        'note': "TD=(NStates=N):含时 DFT 激发态,N 取 extras['td_nstates'](默认 6)。",
+    },
+    'irc': {
+        'route_fn': lambda e: f'IRC=(CalcFC,MaxPoints={_positive_int(e, "irc_maxpoints", 20, "IRC 最大路径点数")})',
+        'name_zh': '内禀反应坐标 IRC',
+        'note': "IRC=(CalcFC,MaxPoints=N):从过渡态沿 IRC 下山,N 取 extras['irc_maxpoints'](默认 20)。",
+    },
+    'scan': {
+        'route_fn': lambda e: 'Opt=ModRedundant',
+        'name_zh': '刚性/柔性扫描',
+        'note': "Opt=ModRedundant:冗余内坐标扫描,须给 extras['modredundant'](坐标块后附加段)。",
+    },
+    'nmr': {
+        'route_fn': lambda e: 'NMR=GIAO',
+        'name_zh': 'NMR 屏蔽', 'note': 'NMR=GIAO:GIAO 法磁屏蔽张量(化学位移)。',
+    },
+    'opt_ts': {
+        'route_fn': lambda e: 'Opt=(TS,CalcFC,NoEigenTest) Freq',
+        'name_zh': '过渡态优化',
+        'note': ('Opt=(TS,CalcFC,NoEigenTest) Freq:过渡态优化并连跑 Freq 验证——'
+                 'TS 须恰有 1 个虚频(反应坐标方向),Freq 用于确认单虚频。'),
+    },
+}
+
+
+def _gaussian_task_route(gtask: str, extras: dict) -> tuple[str, list]:
+    """gaussian_task → (路线关键字, ModRedundant 附加段行)。未知任务/参数非法 → 中文 ValueError。"""
+    key = str(gtask).lower()
+    if key not in GAUSSIAN_TASKS:
+        raise ValueError(
+            f'未知 gaussian_task {gtask!r};可选:{", ".join(GAUSSIAN_TASKS)}。')
+    route = GAUSSIAN_TASKS[key]['route_fn'](extras)   # td/irc 参数非法在此抛
+    modred = _modredundant_section(extras) if key == 'scan' else []
+    return route, modred
+
+
 def _render(spec: CalcSpec) -> tuple[str, list]:
     """CalcSpec(分子)→ (gjf 全文, warnings)。build_gjf/generate_inputs/preview 唯一渲染源。
 
     **附加输入区顺序(Gaussian 铁律,本函数的接线决定)**:分子坐标块之后必空一行,
-    随后各附加段依次为 Gen/GenECP 基组段 → ECP(Pseudo=Read)段 → SCRF=Read 自定义
-    介电段,段与段之间恒以单空行分隔,文件以空行收尾。周期性 CalcSpec → ValueError。
+    随后各附加段依次为 ModRedundant 扫描段(仅 scan 任务) → Gen/GenECP 基组段 →
+    ECP(Pseudo=Read)段 → SCRF=Read 自定义介电段,段与段之间恒以单空行分隔,文件以
+    空行收尾。任务路线由 extras['gaussian_task'] 决定(见 GAUSSIAN_TASKS),未给时退回
+    CalcSpec.task 的 relax/static/freq 旧映射。周期性 CalcSpec → ValueError。
     """
     if spec.periodic:
         raise ValueError(
@@ -220,7 +305,14 @@ def _render(spec: CalcSpec) -> tuple[str, list]:
             f'未登记 Gaussian 泛函关键字 {spec.functional!r},已按原名写入路线行,请核对。')
 
     basis = spec.extras.get('basis', _DEF_BASIS)
-    job = _JOB_KW.get(spec.task, 'sp')
+    # 任务路线:extras['gaussian_task'] 显式给定 → 走全家桶(可含多关键字/扫描附加段);
+    # 未给 → 保持旧行为(CalcSpec.task 经 _JOB_KW 映射 relax/static/freq,逐字节不变)。
+    gtask = spec.extras.get('gaussian_task')
+    if gtask is None:
+        job = _JOB_KW.get(spec.task, 'sp')
+        modredundant_lines: list = []
+    else:
+        job, modredundant_lines = _gaussian_task_route(gtask, spec.extras)
 
     # 色散:按裁决口径写作功能后缀 '-D3'(路线行)。不同 Gaussian 版本可能需
     # EmpiricalDispersion=GD3/GD3BJ 关键字,提示用户据版本调整。
@@ -262,8 +354,9 @@ def _render(spec: CalcSpec) -> tuple[str, list]:
     for el, xyz in zip(elements, cart):
         lines.append(f'{el:<2s} {xyz[0]:16.8f} {xyz[1]:16.8f} {xyz[2]:16.8f}')
 
-    # 附加输入区(顺序:基组段 → ECP 段 → SCRF 段;段间单空行,坐标块后必空行)
-    for section in (basis_lines, ecp_lines, scrf_lines):
+    # 附加输入区(顺序:ModRedundant 段 → 基组段 → ECP 段 → SCRF 段;段间单空行,坐标块后必空行)。
+    # ModRedundant(仅 scan 任务)必须紧跟坐标块、排在基组/ECP/SCRF 之前(Gaussian 铁律)。
+    for section in (modredundant_lines, basis_lines, ecp_lines, scrf_lines):
         if section:
             lines.append('')
             lines.extend(section)

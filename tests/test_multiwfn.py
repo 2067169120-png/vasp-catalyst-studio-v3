@@ -58,7 +58,8 @@ def test_probe_explicit_missing(monkeypatch):
 # ── 分析项注册表 ─────────────────────────────────────────────────────────────
 def test_analyses_registry_shape():
     assert set(md.ANALYSES) == {'esp_extrema', 'homo_lumo_cube', 'density_cube',
-                                'esp_cube', 'nci_rdg', 'igmh', 'aim_cp'}
+                                'esp_cube', 'nci_rdg', 'igmh', 'aim_cp',
+                                'alie', 'alie_extrema', 'iri'}
     for spec in md.ANALYSES.values():
         assert callable(spec['stdin_script'])
         assert isinstance(spec['name'], str) and spec['name']
@@ -100,6 +101,38 @@ def test_script_aim_cp():
     assert lines[0] == '2' and '7' in lines
 
 
+# ── ALIE / IRI 补全种类(对齐 starpivot 七件套外的两种) ─────────────────────────────
+def test_script_alie_cube():
+    # 主功能5 → 实空间函数 ALIE(常量)→ 导出 cube
+    lines = md.ANALYSES['alie']['stdin_script']({}).splitlines()
+    assert lines[0] == '5' and lines[1] == md._FUNC_ALIE
+    assert lines[3] == '2'                                       # 导出 cube
+    assert md.ANALYSES['alie']['outputs'] == ('ALIE.cub',)
+
+
+def test_script_alie_cube_grid_override():
+    assert md.ANALYSES['alie']['stdin_script']({'grid': 3}).splitlines()[2] == '3'
+
+
+def test_script_alie_extrema():
+    # 主功能12 → 选映射函数(常量)→ ALIE(常量)→ 0 开始
+    lines = md.ANALYSES['alie_extrema']['stdin_script']({}).splitlines()
+    assert lines[0] == '12' and lines[1] == md._SURF_SELECT_MAPPED
+    assert lines[2] == md._SURF_MAPPED_ALIE and lines[3] == '0'
+    assert md.ANALYSES['alie_extrema']['outputs'] == ()          # 极值走 stdout,无文件产物
+
+
+def test_script_iri():
+    # 主功能20 → IRI 子功能(常量);产物 func1.cub(IRI)+func2.cub(sign(λ2)ρ)
+    lines = md.ANALYSES['iri']['stdin_script']({}).splitlines()
+    assert lines[0] == '20' and lines[1] == md._SUB_IRI
+    assert md.ANALYSES['iri']['outputs'] == ('func1.cub', 'func2.cub')
+
+
+def test_script_iri_grid_override():
+    assert md.ANALYSES['iri']['stdin_script']({'grid': 3}).splitlines()[2] == '3'
+
+
 def test_script_grid_param_override():
     # 格点质量参数注入:params['grid'] 落到密度 cube 脚本第 3 行
     assert md.ANALYSES['density_cube']['stdin_script']({'grid': 3}).splitlines()[2] == '3'
@@ -134,6 +167,47 @@ def test_run_assembles_cmd_and_collects_renamed_cubes(tmp_path, monkeypatch):
     assert captured['cmd'][0] == 'Multiwfn' and captured['cmd'][1].endswith('mol.fchk')
     assert captured['input'].decode('utf-8').startswith('20')        # NCI 从主功能20 起
     assert out['elapsed_s'] >= 0.0
+
+
+def test_run_iri_collects_prefixed_cubes(tmp_path, monkeypatch):
+    wf = tmp_path / 'mol.fchk'
+    wf.write_text('fake wavefn', encoding='utf-8')
+    monkeypatch.setattr(md, 'probe',
+                        lambda exe=None: {'available': True, 'path': 'Multiwfn', 'detail': ''})
+
+    def fake_run(cmd, **kw):
+        for name in ('func1.cub', 'func2.cub'):        # 模拟 IRI 产出两 cube
+            with open(os.path.join(kw['cwd'], name), 'wb') as f:
+                f.write(b'CUBE')
+
+        class P:
+            returncode = 0
+            stdout = b'IRI analysis done\n'
+        return P()
+
+    monkeypatch.setattr(md.subprocess, 'run', fake_run)
+    out = md.run(str(wf), 'iri', workdir=str(tmp_path))
+    assert out['ok']
+    names = sorted(os.path.basename(p) for p in out['outputs'])
+    assert names == ['iri_func1.cub', 'iri_func2.cub']          # 带 iri_ 前缀重命名
+
+
+def test_run_alie_extrema_ok_via_stdout(tmp_path, monkeypatch):
+    wf = tmp_path / 'mol.wfx'
+    wf.write_text('x', encoding='utf-8')
+    monkeypatch.setattr(md, 'probe',
+                        lambda exe=None: {'available': True, 'path': 'Multiwfn', 'detail': ''})
+
+    def fake_run(cmd, **kw):
+        assert kw['input'].decode('utf-8').startswith('12')     # 定量分子表面分析
+        class P:
+            returncode = 0
+            stdout = b'Surface local minima (eV)\n 12.3 eV\n'
+        return P()
+
+    monkeypatch.setattr(md.subprocess, 'run', fake_run)
+    out = md.run(str(wf), 'alie_extrema', workdir=str(tmp_path))
+    assert out['ok'] and out['outputs'] == []
 
 
 def test_run_esp_extrema_ok_via_stdout(tmp_path, monkeypatch):

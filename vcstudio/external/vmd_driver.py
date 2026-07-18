@@ -141,6 +141,73 @@ def nci(rdg_cube: str, sign_lambda2_cube: str, out_png: str,
     return '\n'.join(lines) + '\n'
 
 
+def alie_surface(density_cube: str, alie_cube: str, out_png: str,
+                 params: dict | None = None) -> str:
+    """ALIE 着色分子表面:电子密度等值面(iso,默认 0.001)按 ALIE(平均局域离子化能)着色。
+
+    与 esp_surface 同构,只把着色 cube 换成 ALIE:色标低值(蓝)=电子束缚弱=亲电敏感位点,
+    高值(红)=电子束缚强。params:iso(密度等值面值)、color_range=(min,max)(ALIE 着色范围,
+    单位 eV,可选)、extrema(可选,extrema_parse 输出,标注极小蓝/极大红球)、extrema_size。
+    """
+    p = params or {}
+    iso = float(p.get('iso', 0.001))
+    color_range = p.get('color_range')
+    size = float(p.get('extrema_size', 0.1))
+    extrema = p.get('extrema')
+    lines = [
+        f'# ALIE 着色分子表面:密度 {iso} 等值面按 ALIE(平均局域离子化能)着色',
+        f'mol new {{{density_cube}}} type cube waitfor all',      # vol 0:电子密度(定几何)
+        f'mol addfile {{{alie_cube}}} type cube waitfor all',     # vol 1:ALIE(定颜色)
+        'mol delrep 0 top',
+        f'mol representation Isosurface {iso} 0 0 0 1 1',         # 密度等值面(实体面)
+        'mol color Volume 1',                                     # 按 vol 1(ALIE)着色
+        'mol selection {all}',
+        'mol material Opaque',
+        'mol addrep top',
+        'color scale method BWR',                                 # 蓝白红:低 ALIE(亲电敏感)→高 ALIE
+    ]
+    if color_range:
+        lines.append(f'mol scaleminmax top 0 {float(color_range[0])} {float(color_range[1])}')
+    if extrema:                                                   # 极值标注球:极小蓝、极大红
+        for pt in extrema.get('minima', []):
+            x, y, z = pt['xyz']
+            lines.append('graphics top color blue')
+            lines.append(f'graphics top sphere {{{x} {y} {z}}} radius {size} resolution 20')
+        for pt in extrema.get('maxima', []):
+            x, y, z = pt['xyz']
+            lines.append('graphics top color red')
+            lines.append(f'graphics top sphere {{{x} {y} {z}}} radius {size} resolution 20')
+    lines += _tcl_footer(out_png)
+    return '\n'.join(lines) + '\n'
+
+
+def iri(iri_cube: str, sign_lambda2_cube: str, out_png: str,
+        params: dict | None = None) -> str:
+    """IRI 相互作用区域:IRI 等值面(iso,默认 1.0)按 sign(λ2)ρ 着色(默认范围 -0.035~0.02 a.u.)。
+
+    对应 Multiwfn iri 产物:iri_cube=func1.cub(IRI),sign_lambda2_cube=func2.cub(sign(λ2)ρ)。
+    着色与 NCI 同族:蓝=吸引(氢键/成键)、绿=vdW、红=位阻排斥;IRI 比 NCI 多显化学键区。
+    """
+    p = params or {}
+    iso = float(p.get('iso', 1.0))
+    lo, hi = p.get('color_range', (-0.035, 0.02))
+    lines = [
+        f'# IRI:IRI={iso} 等值面按 sign(λ2)ρ 着色(蓝=吸引/成键,绿=vdW,红=位阻)',
+        f'mol new {{{iri_cube}}} type cube waitfor all',               # vol 0:IRI(定几何)
+        f'mol addfile {{{sign_lambda2_cube}}} type cube waitfor all',  # vol 1:sign(λ2)ρ(定色)
+        'mol delrep 0 top',
+        f'mol representation Isosurface {iso} 0 0 0 1 1',
+        'mol color Volume 1',                                          # 按 vol 1 着色
+        'mol selection {all}',
+        'mol material Opaque',
+        'mol addrep top',
+        f'mol scaleminmax top 0 {float(lo)} {float(hi)}',              # 着色范围 -0.035~0.02 a.u.
+        'color scale method BGR',                                      # 蓝绿红(NCI/IRI 通行色标)
+    ]
+    lines += _tcl_footer(out_png)
+    return '\n'.join(lines) + '\n'
+
+
 def structure(struct_file: str, out_png: str, params: dict | None = None) -> str:
     """分子结构:CPK 球棍模型;按扩展名判 xyz/pdb。"""
     ext = os.path.splitext(str(struct_file))[1].lower()
@@ -179,6 +246,18 @@ SCENES = {
         'files': ('rdg', 'sign_lambda2'),
         'build': lambda files, out, p: nci(files['rdg'], files['sign_lambda2'], out, p),
         'note': 'RDG 等值面按 sign(λ2)ρ 着色;rdg=func2.cub、sign_lambda2=func1.cub。',
+    },
+    'alie_surface': {
+        'name': 'ALIE 着色分子表面',
+        'files': ('density', 'alie'),
+        'build': lambda files, out, p: alie_surface(files['density'], files['alie'], out, p),
+        'note': '密度等值面按 ALIE 着色(BWR);需 density + alie 两个 cube;低 ALIE=亲电敏感位点。',
+    },
+    'iri': {
+        'name': 'IRI 相互作用区域',
+        'files': ('iri', 'sign_lambda2'),
+        'build': lambda files, out, p: iri(files['iri'], files['sign_lambda2'], out, p),
+        'note': 'IRI 等值面(默认 iso=1.0)按 sign(λ2)ρ 着色;iri=func1.cub、sign_lambda2=func2.cub。',
     },
     'structure': {
         'name': '分子结构 CPK',

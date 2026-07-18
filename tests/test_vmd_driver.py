@@ -27,7 +27,8 @@ def test_probe_found_on_path(monkeypatch):
 
 # ── 场景注册表 ───────────────────────────────────────────────────────────────
 def test_scenes_registry_shape():
-    assert set(vd.SCENES) == {'esp_surface', 'orbital', 'nci', 'structure'}
+    assert set(vd.SCENES) == {'esp_surface', 'orbital', 'nci', 'structure',
+                              'alie_surface', 'iri'}
     for scene in vd.SCENES.values():
         assert callable(scene['build']) and scene['name']
         assert isinstance(scene['files'], tuple) and scene['files']
@@ -77,6 +78,37 @@ def test_tcl_nci():
     assert 'mol color Volume 1' in tcl
 
 
+def test_tcl_alie_surface():
+    tcl = vd.alie_surface('dens.cub', 'alie.cub', 'out.png', {'iso': 0.002})
+    assert 'mol new {dens.cub} type cube' in tcl        # 密度定几何
+    assert 'mol addfile {alie.cub} type cube' in tcl    # ALIE 定颜色
+    assert 'Isosurface 0.002' in tcl                    # 参数注入
+    assert 'mol color Volume 1' in tcl
+    assert 'ALIE' in tcl                                # 色标说明换成 ALIE
+    assert 'render TachyonInternal {out.png}' in tcl
+
+
+def test_tcl_alie_surface_extrema_and_range():
+    extrema = {'minima': [{'value_kcal': -1, 'xyz': [0.0, 0.0, 0.0]}], 'maxima': []}
+    tcl = vd.alie_surface('d.cub', 'a.cub', 'o.png',
+                          {'extrema': extrema, 'color_range': (10.0, 20.0)})
+    assert 'graphics top sphere {0.0 0.0 0.0} radius 0.1' in tcl
+    assert 'mol scaleminmax top 0 10.0 20.0' in tcl
+
+
+def test_tcl_iri_default_iso_one():
+    tcl = vd.iri('func1.cub', 'func2.cub', 'iri.png')
+    assert 'mol new {func1.cub} type cube' in tcl          # IRI 定几何(func1)
+    assert 'mol addfile {func2.cub} type cube' in tcl      # sign(λ2)ρ 定色(func2)
+    assert 'Isosurface 1.0' in tcl                         # IRI 默认 iso=1.0
+    assert 'mol scaleminmax top 0 -0.035 0.02' in tcl      # 与 NCI 同族着色范围
+    assert 'color scale method BGR' in tcl
+
+
+def test_tcl_iri_iso_override():
+    assert 'Isosurface 2.0' in vd.iri('a.cub', 'b.cub', 'o.png', {'iso': 2.0})
+
+
 def test_tcl_structure_xyz_and_pdb():
     tcl = vd.structure('mol.xyz', 'struct.png')
     assert 'mol new {mol.xyz} type xyz' in tcl
@@ -107,6 +139,26 @@ def test_render_with_fake_vmd(tmp_path, monkeypatch):
     assert calls['cmd'][0] == 'vmd' and calls['cmd'][1:4] == ['-dispdev', 'text', '-e']
     assert os.path.isfile(calls['cmd'][4])                # tcl 脚本落盘
     assert 'Isosurface' in res['tcl']
+
+
+def test_render_iri_scene_wires_file_roles(tmp_path, monkeypatch):
+    monkeypatch.setattr(vd, 'probe',
+                        lambda exe=None: {'available': True, 'path': 'vmd', 'detail': ''})
+    out_png = str(tmp_path / 'iri.png')
+
+    def fake_run(cmd, **kw):
+        with open(out_png, 'wb') as f:
+            f.write(b'PNGDATA')
+
+        class P:
+            returncode = 0
+            stdout = b'rendered\n'
+        return P()
+
+    monkeypatch.setattr(vd.subprocess, 'run', fake_run)
+    res = vd.render('iri', {'iri': 'f1.cub', 'sign_lambda2': 'f2.cub'}, out_png)
+    assert res['ok']
+    assert 'mol new {f1.cub}' in res['tcl'] and 'mol addfile {f2.cub}' in res['tcl']
 
 
 def test_render_degrades_without_vmd(tmp_path, monkeypatch):

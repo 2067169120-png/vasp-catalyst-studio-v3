@@ -57,7 +57,12 @@ class CalcSpec:
                       'name':'water'} 或自定义介电 {'model':...,'eps':...,'epsinf':...}
                       →SCRF(后者走 Solvent=Generic,Read + 尾段);mixed_basis=
                       {'default','per_element':{El:basis},'ecp_elements':[El]}→Gen/GenECP
-                      (元素分组基组段 + ECP 段,附加输入区顺序:坐标→基组→ECP→SCRF-Read)。
+                      (元素分组基组段 + ECP 段,附加输入区顺序:坐标→ModRedundant→基组→
+                      ECP→SCRF-Read)。gaussian_task(覆盖 task 映射,见 gaussian.GAUSSIAN_TASKS:
+                      opt/freq/opt_freq/sp/td/irc/scan/nmr/opt_ts;未给时退回 task 的
+                      relax/static/freq 旧行为);td_nstates(td 激发态数,默认 6)、
+                      irc_maxpoints(irc 路径点数,默认 20)、modredundant(scan 冗余内坐标
+                      扫描定义 list[str],如 ['B 1 2 S 10 0.1'])。
     """
 
     structure: str
