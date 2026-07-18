@@ -977,3 +977,144 @@ def charge_profile_plot(z, rho, out_path, *, regions=None, title: str = '',
         if panel:
             add_panel_label(ax, panel)
         return _save_dual(fig, out_path, formats)
+
+
+# ── 图 9:收敛测试曲线(ENCUT/K 点/离子步收敛 + 阈值带 + 收敛点标注)──────────────
+
+def convergence_plot(points, out_path, *, threshold_mev: float = 1.0,
+                     xlabel: str = 'ENCUT (eV)',
+                     ylabel: str | None = None, ref: str = 'last',
+                     per_atom: bool = False, title: str = '',
+                     width: float | None = None, palette: str = 'tol_bright',
+                     panel: str = '', formats=('png', 'pdf'),
+                     style_kw: dict | None = None) -> list:
+    """收敛测试曲线:能量(或力)对参数收敛,±threshold 阈值带 + 首个收敛点标注。
+
+    数据契约:
+        points = [(x, E), ...] 或 {'xs': [...], 'ys': [...]}
+            x = 被扫参数(ENCUT / k 点密度 / 离子步…);E = 对应能量(eV,真实历史值)。
+            至少 2 个点;按 x 升序内部重排(容忍乱序输入)。
+
+    参数:
+        threshold_mev: 收敛判据阈值(meV;曲线相对参照值落入 ±阈值即视作收敛)。
+        ref:      参照能量取法——'last'(最密点,默认)或 'min'(最低点)。
+        per_atom: True 时纵轴按 meV/atom 语义标注(数值不变,仅标签;调用方须已折算)。
+        其余参数同 adsorption_bar。
+
+    收敛点 = 从密到疏方向**最后一个**仍落在阈值带内、其后不再离带的最疏 x
+    (即"再降精度就出带"的临界点);无点收敛则不标。返回导出路径列表。
+    """
+    if isinstance(points, dict):
+        xs = [float(x) for x in (points.get('xs') or [])]
+        ys = [float(y) for y in (points.get('ys') or [])]
+    else:
+        xs = [float(p[0]) for p in points]
+        ys = [float(p[1]) for p in points]
+    if len(xs) != len(ys):
+        raise ValueError(f'xs 与 ys 长度不一致:{len(xs)} != {len(ys)}')
+    if len(xs) < 2:
+        raise ValueError('收敛曲线至少需 2 个测试点')
+    order = sorted(range(len(xs)), key=lambda i: xs[i])
+    xs = [xs[i] for i in order]
+    ys = [ys[i] for i in order]
+    e_ref = ys[-1] if ref == 'last' else min(ys)
+    thr = float(threshold_mev) / 1000.0                 # meV → eV
+
+    # 收敛点:自最密(右)向疏(左)扫,找"仍在带内"的最疏 x(其后一路在带内)
+    conv_i = None
+    for i in range(len(xs) - 1, -1, -1):
+        if abs(ys[i] - e_ref) <= thr:
+            conv_i = i
+        else:
+            break
+
+    fig_w = width if width is not None else SINGLE_COL
+    with apply_paper_style(palette=palette, **(style_kw or {})):
+        fig, ax = _new_figure(width=fig_w, aspect=0.72)
+        colors = PALETTES.get(palette, PALETTES['tol_bright'])
+        ax.axhspan(e_ref - thr, e_ref + thr, color=colors[2], alpha=0.16, zorder=0,
+                   label=rf'$\pm${threshold_mev:g} meV')
+        ax.axhline(e_ref, color=ZERO_LINE_COLOR, lw=0.8, ls=(0, (5, 3)), zorder=1)
+        ax.plot(xs, ys, color=colors[0], lw=1.4, marker='o', ms=4.5,
+                mec='black', mew=0.5, zorder=3)
+        if conv_i is not None:
+            ax.plot([xs[conv_i]], [ys[conv_i]], marker='*', ms=12, color='#DDAA33',
+                    mec='black', mew=0.6, ls='none', zorder=5)
+            ax.annotate(f'converged\n{xs[conv_i]:g}', (xs[conv_i], ys[conv_i]),
+                        xytext=(5, 8), textcoords='offset points', ha='left',
+                        va='bottom', fontsize=7.5, linespacing=1.3, zorder=5)
+        ax.set_xlabel(xlabel)
+        yl = ylabel if ylabel is not None else (
+            'Energy (meV/atom)' if per_atom else 'Total energy (eV)')
+        ax.set_ylabel(yl)
+        ax.margins(x=0.08, y=0.14)
+        if title:
+            ax.set_title(title)
+        ax.legend(loc='best', fontsize=7)
+        if panel:
+            add_panel_label(ax, panel)
+        return _save_dual(fig, out_path, formats)
+
+
+# ── 图 10:AIMD 能量-温度双轴时间线 ───────────────────────────────────────────
+
+def energy_time_plot(steps, out_path, *, dt_fs: float | None = None,
+                     energy_key: str = 'energy', temp_key: str = 'temperature',
+                     title: str = '', width: float | None = None,
+                     palette: str = 'tol_bright', panel: str = '',
+                     formats=('png', 'pdf'), style_kw: dict | None = None) -> list:
+    """AIMD 能量-温度双轴时间线:左轴能量(eV)、右轴温度(K),共享步/时间横轴。
+
+    数据契约:
+        steps = [{'energy': E, 'temperature': T}, ...]     # 逐 MD 步(至少 2 步)
+            或 {'energy': [...], 'temperature': [...]}(可选 'step'/'time')。
+        含 'step'/'time' 则用作横轴;否则用 0..N-1 步序。dt_fs 给定则步序 ×dt 换算成
+        飞秒时间轴(横轴标 Time (fs));温度序列可缺省(只画能量单轴)。
+
+    返回导出路径列表。长度不一致 / 步数<2 → ValueError。
+    """
+    if isinstance(steps, dict):
+        energies = [float(v) for v in (steps.get(energy_key) or [])]
+        temps_raw = steps.get(temp_key)
+        temps = [float(v) for v in temps_raw] if temps_raw else []
+        tx = steps.get('time') or steps.get('step')
+        xs = [float(v) for v in tx] if tx else list(range(len(energies)))
+    else:
+        energies, temps, xs = [], [], []
+        for i, s in enumerate(steps):
+            energies.append(float(s[energy_key]))
+            if s.get(temp_key) is not None:
+                temps.append(float(s[temp_key]))
+            xs.append(float(s.get('time', s.get('step', i))))
+    if len(energies) < 2:
+        raise ValueError('能量-时间线至少需 2 个 MD 步')
+    if temps and len(temps) != len(energies):
+        raise ValueError(f'温度序列长度 {len(temps)} != 能量序列 {len(energies)}')
+    xlabel = 'Time (fs)'
+    if dt_fs is not None:
+        xs = [x * float(dt_fs) for x in xs]
+    elif not (isinstance(steps, dict) and ('time' in steps or 'step' in steps)):
+        xlabel = 'MD step'
+
+    fig_w = width if width is not None else max(SINGLE_COL, DOUBLE_COL * 0.62)
+    with apply_paper_style(palette=palette, **(style_kw or {})):
+        fig, ax = _new_figure(width=fig_w, aspect=0.55)
+        colors = PALETTES.get(palette, PALETTES['tol_bright'])
+        c_e, c_t = colors[0], colors[1]
+        ax.plot(xs, energies, color=c_e, lw=1.3, zorder=3)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel('Total energy (eV)', color=c_e)
+        ax.tick_params(axis='y', colors=c_e)
+        ax.set_xlim(min(xs), max(xs))
+        if temps:
+            ax2 = ax.twinx()
+            ax2.spines['right'].set_visible(True)          # 双轴须保留右框
+            ax2.plot(xs, temps, color=c_t, lw=1.0, alpha=0.85, zorder=2)
+            ax2.set_ylabel('Temperature (K)', color=c_t)
+            ax2.tick_params(axis='y', colors=c_t)
+            ax2.tick_params(axis='y', direction='in')
+        if title:
+            ax.set_title(title)
+        if panel:
+            add_panel_label(ax, panel)
+        return _save_dual(fig, out_path, formats)
