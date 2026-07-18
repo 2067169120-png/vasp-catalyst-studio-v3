@@ -136,6 +136,10 @@ silent (job.yaml state machine + audit history).
 
 对齐 starpivot-DFT 全部功能与选项并超越:图片识别(DECIMER)→SMILES→RDKit 3D 建模→Gaussian 输入(九种任务/溶剂模型/周期表混合基组 Gen-GenECP/资源行)→批量提交(任意输入文件/筛选排序/勾选批量取消/**本机运行**)→**波函数分析八件套**(ESP/ALIE/HOMO-LUMO/IGMH/NCI-RDG/IRI/AIM,Multiwfn 本机/远程)→**VMD 一键可视化**(Tachyon 渲染/极值点标注);编辑器样式视角测量原子表;AIMD 派生;远端文件管理。工作流侧栏更新为 ①结构建模→②生成输入→③提交计算→④结果分析→⑤波函数分析→⑥论文出图→⑦AI助手。**1704 测试通过(6 跳过)**。
 
+### v3.2.0(2026-07-18):全 DFT 计算平台
+
+**23 种计算类型目录**(收敛扫描/能带/EOS/功函数/表面能/Dimer/VASPsol/DFT+U 值库等全补齐,选类型→派生→解析→出图闭环);**一键出图管线**(自动驾驶终点场景感知整套图+多面板拼版+图表溯源,计算活动模板全链自动推进);**AI 数据闭环**(论文数据表抽取→复现 MAE 自动对照→变体矩阵推荐→论文草稿骨架);starpivot 细节对齐(一键依赖安装/核时四卡/波函数 16 种/Fukui·ELF-LOL·散点图)。**2009 测试通过(6 跳过)**。
+
 ## Install & quickstart
 
 **GUI (Windows)**: double-click `dist\VASP Catalyst Studio.exe`
@@ -158,7 +162,7 @@ report, no VASP or cluster): [examples/offline_analysis](examples/offline_analys
 — `python examples/offline_analysis/run_demo.py` drives a synthetic completed
 job set end-to-end so a reviewer can confirm the analysis half of the pipeline.
 
-**Tests**: `python -m pytest` — 1401 tests, 3 skipped (optional OriginLab smoke
+**Tests**: `python -m pytest` — 2009 tests, 6 skipped (optional OriginLab smoke
 behind `VCS_ORIGIN_SMOKE=1`, and a POV-Ray real-render smoke). Parser
 cross-checks against ASE run when `ase` is installed (in the `dev` extra).
 CI runs the suite on ubuntu/windows × Python 3.10/3.12.

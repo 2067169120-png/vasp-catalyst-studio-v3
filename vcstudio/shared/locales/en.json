@@ -15,7 +15,7 @@
   "ai.log": "AI Assistant log",
   "ai.subtitle": "Paper → spec → plan → instantiate (pilot-first · budget gate · three-state gates)",
   "ai.title": "AI Assistant",
-  "app.subtitle": "v3.1 · Catalysis Computing Platform",
+  "app.subtitle": "v3.2 · Catalysis Computing Platform",
   "app.title": "VASP Catalyst Studio",
   "camp.tpl": "Campaign template (build full-chain DAG: relax→static→freq→summary)",
   "camp.tpl.gen": "Instantiate full chain",
