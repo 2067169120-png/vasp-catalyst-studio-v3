@@ -126,6 +126,7 @@ __all__ = [
     'CONTRADICT_TOL', 'extract_text', 'ingest_source', 'locate_method_sections',
     'extract_spec', 'validate_spec', 'plan_campaign', 'instantiate', 'autopilot_step',
     'build_extract_prompt', 'EXTRACT_SYSTEM_PROMPT',
+    'attach_data_tables', 'full_reproduce_plan',
 ]
 
 
@@ -633,6 +634,12 @@ def validate_spec(spec):
     if spec.get('expected'):
         out['expected'] = _norm_expected(spec['expected'], issues)
 
+    # 数据表区(paper_data 抽取并已过其确定性校验)原样透传;向后兼容:无此键则不加。
+    if spec.get('data_tables') is not None:
+        out['data_tables'] = spec['data_tables']
+    if spec.get('reference') is not None:
+        out['reference'] = spec['reference']
+
     return {'ok': not issues, 'issues': issues, 'normalized': out}
 
 
@@ -976,3 +983,64 @@ def autopilot_step(campaign_dir, *, runners, contradict_tol=None):
                             'detail': verdict['blocking_issues']})
 
     return {'actions': actions, 'halted': False, 'reason': None}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5. 论文数据表复现 + 全复现计划(接 paper_data / variant_advisor,向后兼容)
+# ═══════════════════════════════════════════════════════════════════════════════
+def attach_data_tables(spec, paper_text, *, transport=None, config=None):
+    """抽取论文数据表挂到 spec['data_tables'] 并归一出 spec['reference']。
+
+    联网门控与 extract_spec 同口径(默认关→引导);抽取走 paper_data(LLM 只誊抄 + 确定性校验层,
+    抽出的是文献参考值,**绝不回流计算链路**)。返回 {'ok','spec','tables','reference','error'};
+    spec 为**新字典**(补 data_tables/reference,不改动既有键,向后兼容)。
+    """
+    if not _allow_external(config):
+        return {'ok': False, 'spec': spec, 'tables': [], 'reference': None,
+                'error': ('未开启联网抽取:请在设置页开启「允许将文本发送到外部 LLM」,'
+                          '或直接手填数据表(离线)')}
+    from vcstudio.project import paper_data
+    cfg = dict(config or {})
+    res = paper_data.extract_data_tables(
+        paper_text, transport=transport, base_url=cfg.get('base_url'),
+        model=cfg.get('model'), api_key=cfg.get('api_key'))
+    if not res['ok']:
+        return {'ok': False, 'spec': spec, 'tables': [], 'reference': None, 'error': res['error']}
+    tables = res['tables']
+    reference = paper_data.build_reference_dataset(tables)
+    spec = dict(spec or {})
+    spec['data_tables'] = tables
+    spec['reference'] = reference
+    return {'ok': True, 'spec': spec, 'tables': tables, 'reference': reference, 'error': None}
+
+
+def full_reproduce_plan(spec, *, include_variants=False, incar_defaults=None,
+                        budget_cap_hours=None):
+    """复现计划(= plan_campaign)+ 可选变体批次(接 variant_advisor)。
+
+    向后兼容:**不改动** plan_campaign;新增能力经额外只读键返回。返回
+    {'ok','plan','reference','variants','variant_plan'}。reference 取 spec['reference'] 或由
+    spec['data_tables'] 现归一;include_variants=True 时从参考集(优先)或归一 systems 生成变体
+    与按优先级/预算分批的计划。
+    """
+    base = plan_campaign(spec, incar_defaults=incar_defaults)
+    out = {'ok': base['ok'], 'plan': base['plan'],
+           'reference': None, 'variants': None, 'variant_plan': None}
+
+    reference = (spec or {}).get('reference')
+    dt = (spec or {}).get('data_tables')
+    if reference is None and dt:
+        from vcstudio.project import paper_data
+        reference = paper_data.build_reference_dataset(dt)
+    out['reference'] = reference
+
+    if include_variants:
+        from vcstudio.project import variant_advisor
+        norm = validate_spec(spec)['normalized']
+        src = (reference if (reference and reference.get('entries'))
+               else {'systems': norm.get('systems') or []})
+        vres = variant_advisor.suggest_variants(src)
+        out['variants'] = vres
+        out['variant_plan'] = variant_advisor.variant_campaign_plan(
+            vres['variants'], budget_cap_hours=budget_cap_hours)
+    return out
