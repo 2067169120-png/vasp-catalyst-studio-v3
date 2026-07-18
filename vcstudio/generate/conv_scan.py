@@ -331,8 +331,9 @@ def build_slab_thickness_series(src_dir, out_root, layers, *, slab_builder_fn=No
             'out_root': str(out_root), 'dirs': OrderedDict(), 'series': [],
             'results': OrderedDict(), 'warnings': [],
             'note': ('层厚系列需重建不同层数的 slab,而裸 CONTCAR/POSCAR 不含体相晶胞与米勒面/'
-                     '终止面信息,无法从已有 slab 再生。请提供 slab_builder_fn(n_layers)->POSCAR'
-                     '(来自建 slab 时的 sac/slab 模板)后重试;本次未生成任何作业(不编造结构)。')}
+                     '终止面信息,无法从已有 slab 再生。请用「结构建模页 → 金属 slab 建模」生成'
+                     '基线作业(job.yaml 自带可再生配方,层厚收敛即可从该作业一键派生),或显式'
+                     '提供 slab_builder_fn(n_layers)->POSCAR;本次未生成任何作业(不编造结构)。')}
     _src, _poscar, incar_text = _require_inputs(src_dir)
     dirs, series, results = OrderedDict(), [], OrderedDict()
     for n in layers:

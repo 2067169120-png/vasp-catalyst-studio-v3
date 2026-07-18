@@ -5123,6 +5123,165 @@ def test_derive_task_conv_vacuum_no_spurious_note(tmp_path):
     assert out['ok'] is True and len(out['job_dirs']) == 2 and out.get('note') is None
 
 
+# ── Backlog #2:金属 slab 建模 + 层厚收敛可再生入口 ────────────────────────────
+def _fake_metal_slab(*, calls=None, boom=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.supported_surfaces = lambda: [{'structure': 'fcc', 'miller': '111'}]
+    m.LATTICE_GUESS = {'fcc': {'Pt': 3.924}}
+
+    def _build(element, structure='fcc', miller='111', layers=4, **kw):
+        if boom is not None:
+            raise ValueError(boom)
+        calls['build'] = {'element': element, 'structure': structure,
+                          'miller': miller, 'layers': layers, **kw}
+        recipe = {'kind': 'metal_slab', 'element': element, 'structure': structure,
+                  'miller': miller, 'layers': int(layers), 'nx': kw.get('nx', 3),
+                  'ny': kw.get('ny', 3), 'vacuum': kw.get('vacuum', 15.0),
+                  'a': 3.924, 'fix_bottom': kw.get('fix_bottom', 0)}
+        return {'poscar': f'{element} slab\n1.0\n', 'recipe': recipe,
+                'description': f'{element} {structure}({miller}) {layers} 层',
+                'warnings': ['晶格常数 a=3.924 Å 取自实验值初猜表'], 'natoms': 4 * int(layers)}
+    m.build_metal_slab = _build
+
+    def _from_recipe(recipe):
+        calls['recipe'] = dict(recipe)
+
+        def _fn(n):
+            calls.setdefault('regen', []).append(int(n))
+            return f'regen {n} layers\n1.0\n'
+        return _fn
+    m.slab_builder_from_recipe = _from_recipe
+    return m
+
+
+def _fake_manifest_recipe(store):
+    """manifest 假件(带 load/save):支持 _annotate_recipe 往 job.yaml 合入配方。"""
+    m = types.SimpleNamespace()
+    m.create_from_build = lambda jd, payload, *, poscar_path, validate: store.__setitem__(
+        str(jd), {'job_id': os.path.basename(str(jd)), 'inputs': {}})
+    m.new_manifest = lambda **kw: {'job_id': kw.get('job_id'),
+                                   'inputs': dict(kw.get('inputs') or {}),
+                                   'warnings': list(kw.get('warnings') or [])}
+    m.load_manifest = lambda jd: store.get(str(jd))
+    m.save_manifest = lambda jd, man: store.__setitem__(str(jd), man)
+    return m
+
+
+def test_metal_slab_catalog_shape():
+    api = Api(metal_slab_mod=_fake_metal_slab())
+    out = api.metal_slab_catalog()
+    assert out['ok'] is True
+    assert out['surfaces'] == [{'structure': 'fcc', 'miller': '111'}]
+    assert out['guess']['fcc']['Pt'] == 3.924
+
+
+def test_metal_slab_build_requires_out_dir_and_valid_incar(tmp_path):
+    api = Api(metal_slab_mod=_fake_metal_slab())
+    out = api.metal_slab_build('Pt', 'fcc', '111', 4)
+    assert out['ok'] is False and '输出目录' in out['error']
+    out2 = api.metal_slab_build('Pt', 'fcc', '111', 4, None, None, 3, 3, 15.0, 0,
+                                str(tmp_path / 'no_incar'), str(tmp_path / 'j'))
+    assert out2['ok'] is False and 'INCAR 不存在' in out2['error']
+
+
+def test_metal_slab_build_poscar_only_writes_recipe(tmp_path):
+    store = {}
+    d = tmp_path / 'Pt111'
+    api = Api(metal_slab_mod=_fake_metal_slab(),
+              manifest_mod=_fake_manifest_recipe(store))
+    out = api.metal_slab_build('Pt', 'fcc', '111', 4, None, None, 2, 2, 15.0, 0,
+                               None, str(d))
+    assert out['ok'] is True and out['job_dir'] == str(d)
+    assert (d / 'POSCAR').read_text(encoding='utf-8').startswith('Pt slab')
+    assert store[str(d)]['inputs']['recipe']['kind'] == 'metal_slab'   # 配方入 job.yaml
+    assert any('补全' in w for w in out['warnings'])                    # 提示去②生成输入
+    assert any('初猜' in w for w in out['warnings'])                    # 晶格常数口径提醒透传
+
+
+def test_metal_slab_build_with_incar_full_chain(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text('ENCUT=500\n', encoding='utf-8')
+    store, registered, built = {}, [], []
+    d = tmp_path / 'Pt111'
+    api = Api(metal_slab_mod=_fake_metal_slab(), job_builder_mod=_fake_jb_text(built),
+              manifest_mod=_fake_manifest_recipe(store),
+              ledger_mod=_fake_ledger_register(registered),
+              config_mod=_fake_config(cfg={'potcar_lib_root': '/lib'}))
+    out = api.metal_slab_build('Pt', 'fcc', '111', 4, None, None, 3, 3, 15.0, 2,
+                               str(incar), str(d))
+    assert out['ok'] is True and built == [str(d)]      # 走四件套链
+    assert registered == [str(d)]                        # 入台账
+    assert store[str(d)]['inputs']['recipe']['fix_bottom'] == 2
+
+
+def test_metal_slab_build_engine_error_caught():
+    api = Api(metal_slab_mod=_fake_metal_slab(boom='不支持的结构/晶面组合'))
+    out = api.metal_slab_build('Pt', 'fcc', '211', 4, None, None, 3, 3, 15.0, 0,
+                               None, '/tmp/x')
+    assert out['ok'] is False and '不支持' in out['error']
+
+
+def test_derive_conv_thickness_regenerates_from_recipe(tmp_path):
+    """核心接通:job.yaml 带 metal_slab 配方 → 层厚系列真生成(不再诚实报错)。"""
+    from vcstudio.shared import manifest as real_manifest
+    src = tmp_path / 'base'
+    src.mkdir()
+    (src / 'CONTCAR').write_text('x\n', encoding='utf-8')
+    (src / 'INCAR').write_text('ENCUT = 500\n', encoding='utf-8')
+    man = real_manifest.new_manifest(
+        job_id='base', system='Pt slab', task_type='relax', calc_type='slab',
+        inputs={'recipe': {'kind': 'metal_slab', 'element': 'Pt', 'structure': 'fcc',
+                           'miller': '111', 'layers': 4, 'nx': 1, 'ny': 1,
+                           'vacuum': 15.0, 'a': 3.924, 'fix_bottom': 0}})
+    real_manifest.save_manifest(str(src), man)
+    calls = {}
+    api = Api(metal_slab_mod=_fake_metal_slab(calls=calls),
+              ledger_mod=_fake_ledger_register([]))     # conv_scan 用真引擎
+    out = api.derive_task('conv_thickness', str(src), {'layers': [3, 4]})
+    assert out['ok'] is True and out.get('note') is None
+    assert len(out['job_dirs']) == 2                     # 系列真生成
+    assert calls['regen'] == [3, 4]                      # 配方再生器逐层调用
+    for jd, n in zip(out['job_dirs'], (3, 4)):
+        with open(os.path.join(jd, 'POSCAR'), encoding='utf-8') as f:
+            assert f.read().startswith(f'regen {n}')     # 各作业 POSCAR 为对应层数再生
+        assert os.path.isfile(os.path.join(jd, 'INCAR'))  # INCAR 同源复制
+
+
+def test_derive_conv_thickness_sac_recipe_targeted_note(tmp_path):
+    """SAC 石墨烯作业派层厚 → 0 作业 + 「单层无层厚概念」针对性说明(不套通用报错)。"""
+    from vcstudio.shared import manifest as real_manifest
+    src = tmp_path / 'fe_mn4_clean'
+    src.mkdir()
+    (src / 'CONTCAR').write_text('x\n', encoding='utf-8')
+    (src / 'INCAR').write_text('ENCUT = 500\n', encoding='utf-8')
+    man = real_manifest.new_manifest(
+        job_id='fe', system='Fe@MN4', task_type='relax', calc_type='slab',
+        inputs={'recipe': {'kind': 'sac', 'template': 'MN4', 'metal': 'Fe'}})
+    real_manifest.save_manifest(str(src), man)
+    api = Api(ledger_mod=_fake_ledger_register([]))
+    out = api.derive_task('conv_thickness', str(src), {'layers': [3, 4]})
+    assert out['ok'] is True and out['job_dirs'] == []
+    assert '层厚' in (out.get('note') or '') and 'SAC' in out['note']
+    assert any('SAC' in w for w in out['warnings'])
+
+
+def test_sac_matrix_generate_annotates_sac_recipe(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text('E\n', encoding='utf-8')
+    store = {}
+    api = Api(sac_mods=_fake_sac(), job_builder_mod=_fake_jb_text(),
+              manifest_mod=_fake_manifest_recipe(store),
+              ledger_mod=_fake_ledger_register([]),
+              adsorption_mod=_fake_ads_projects(), campaign_mods=_fake_campaign(),
+              config_mod=_fake_config())
+    out = api.sac_matrix_generate(['Fe'], ['MN4'], ['S8'], 'metal_top', 1,
+                                  str(incar), str(tmp_path))
+    assert out['ok'] is True and out['created'] == 2
+    kinds = {v['inputs'].get('recipe', {}).get('kind') for v in store.values()}
+    assert kinds == {'sac'}                              # 清洁面与构型作业均注记 SAC 来源
+
+
 # ── P2 任务性质徽标 ────────────────────────────────────────────────────────────
 def test_task_catalog_kind_badges():
     api = Api()                                             # 真 task_catalog

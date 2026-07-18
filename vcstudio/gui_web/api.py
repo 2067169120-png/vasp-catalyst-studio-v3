@@ -74,7 +74,7 @@ class Api:
                  solvation_mod=None, paper_data_mod=None, variant_advisor_mod=None,
                  manuscript_draft_mod=None, bands_parse_mod=None, deps_runner=None,
                  neb_builder_mod=None, references_mod=None, chgdiff_mod=None,
-                 incar_builder_mod=None):
+                 incar_builder_mod=None, metal_slab_mod=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -168,6 +168,7 @@ class Api:
         self._references = references_mod            # project.references(结合能/形成能/σ)
         self._chgdiff = chgdiff_mod                 # project.chgdiff(差分电荷三静态 + Δρ 合成)
         self._incar_builder = incar_builder_mod     # generate.incar_builder(VASPsol 键)
+        self._metal_slab = metal_slab_mod           # generate.metal_slab(金属 slab + 层厚配方)
 
     # ── 桥活性探测(前端用来确认 js_api 已就绪) ──
     def ping(self) -> str:
@@ -361,6 +362,13 @@ class Api:
             from vcstudio.generate import conv_scan
             self._conv_scan = conv_scan
         return self._conv_scan
+
+    def _msl(self):
+        """金属 slab 建模引擎(numpy 相邻,重)延迟加载。"""
+        if self._metal_slab is None:
+            from vcstudio.generate import metal_slab
+            self._metal_slab = metal_slab
+        return self._metal_slab
 
     def _bd(self):
         """能带派生端延迟加载。"""
@@ -2256,6 +2264,9 @@ class Api:
                         skipped.append({'name': f'{label} 清洁面', 'reason': str(e)})
                         continue
                     created += 1
+                    # 配方注记:标记 SAC 石墨烯来源(层厚收敛据此给「单层无层厚」针对性说明)
+                    self._annotate_recipe(cdir, {'kind': 'sac', 'template': template,
+                                                 'metal': metal})
                     tasks.append({'id': os.path.basename(cdir), 'dir': cdir,
                                   'natoms': self._poscar_natoms(built['poscar'])})
                     try:
@@ -2288,6 +2299,9 @@ class Api:
                                         {'name': os.path.basename(cfg_dir),
                                          'reason': str(e)})
                                     continue
+                                self._annotate_recipe(
+                                    jd, {'kind': 'sac', 'template': template,
+                                         'metal': metal, 'adsorbate': ads})
                                 config_dirs.append(jd)
                                 tasks.append({'id': os.path.basename(jd), 'dir': jd,
                                               'natoms': self._poscar_natoms(text)})
@@ -2358,6 +2372,116 @@ class Api:
                 self._config.set_ui_state(campaign_dirs=dirs)
         except Exception:                                 # noqa: BLE001 记不进注册表不致命
             pass
+
+    # ── 金属 slab 建模(结构建模页;层厚收敛的可再生入口,Backlog #2) ────────────────
+    def metal_slab_catalog(self):
+        """支持的(结构,晶面)组合 + 晶格常数初猜表 → {'ok','surfaces','guess','error'}。
+
+        guess 为**实验值初猜**表(发表口径须同泛函 EOS/晶胞优化),前端用于自动回填。
+        """
+        try:
+            ms = self._msl()
+            return {'ok': True, 'surfaces': ms.supported_surfaces(),
+                    'guess': ms.LATTICE_GUESS, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'surfaces': [], 'guess': {}, 'error': str(e)}
+
+    def _annotate_recipe(self, job_dir, recipe):
+        """把可再生配方并入 job.yaml 的 inputs.recipe → 是否成功(失败不抛,由调用方记 warning)。"""
+        try:
+            m = self._manifest.load_manifest(job_dir)
+            if not m:
+                return False
+            inputs = dict(m.get('inputs') or {})
+            inputs['recipe'] = dict(recipe or {})
+            m['inputs'] = inputs
+            self._manifest.save_manifest(job_dir, m)
+            return True
+        except Exception:                                 # noqa: BLE001
+            return False
+
+    def metal_slab_build(self, element, structure, miller, layers, a=None, c=None,
+                         nx=3, ny=3, vacuum=15.0, fix_bottom=0, incar_path=None,
+                         out_dir=None):
+        """建金属 slab 作业(fcc/bcc/hcp 低指数面)——层厚收敛的**可再生入口**。
+
+        - 给 INCAR → 四件套链 + job.yaml + 入台账(同 SAC 矩阵口径);不给 → 仅写
+          POSCAR + job.yaml,提示到②生成输入页补全(不假装是完整作业)。
+        - job.yaml inputs.recipe 记全部构造参数:之后从该作业派生 conv_thickness 时
+          可由配方再生不同层数 slab(不再诚实报错,见 _thickness_builder_from_job)。
+        返回 {'ok','job_dir','poscar','description','natoms','warnings','error'}。
+        """
+        try:
+            d = (out_dir or '').strip()
+            if not d:
+                return {'ok': False, 'job_dir': None, 'poscar': '', 'description': '',
+                        'natoms': 0, 'warnings': [], 'error': '未指定输出目录'}
+            inc = (incar_path or '').strip()
+            if inc and not os.path.isfile(inc):
+                return {'ok': False, 'job_dir': None, 'poscar': '', 'description': '',
+                        'natoms': 0, 'warnings': [], 'error': f'INCAR 不存在:{inc}'}
+            ms = self._msl()
+            built = ms.build_metal_slab(
+                element, structure, miller, int(layers or 4),
+                a=(float(a) if a not in (None, '') else None),
+                c=(float(c) if c not in (None, '') else None),
+                nx=int(nx or 3), ny=int(ny or 3), vacuum=float(vacuum or 15.0),
+                fix_bottom=int(fix_bottom or 0))
+            warnings = list(built['warnings'])
+            if inc:
+                lib = ''
+                try:
+                    lib = self._config.load_config().get('potcar_lib_root', '') or ''
+                except Exception:                         # noqa: BLE001
+                    pass
+                job_dir, w2 = self._job_from_text(built['poscar'], inc, d, lib)
+                warnings += list(w2 or [])
+            else:
+                os.makedirs(d, exist_ok=True)
+                with open(os.path.join(d, 'POSCAR'), 'w', encoding='utf-8') as f:
+                    f.write(built['poscar'])
+                m = self._manifest.new_manifest(
+                    job_id=os.path.basename(os.path.normpath(d)),
+                    system=built['poscar'].splitlines()[0].strip(),
+                    task_type='relax', calc_type='slab',
+                    inputs={'natoms': built['natoms']}, warnings=warnings)
+                self._manifest.save_manifest(d, m)
+                job_dir = d
+                warnings.append('未给 INCAR:仅写出 POSCAR 与 job.yaml(含可再生配方);'
+                                '请到「②生成输入」页补全 INCAR/KPOINTS/POTCAR。')
+            if not self._annotate_recipe(job_dir, built['recipe']):
+                warnings.append('配方写入 job.yaml 失败:层厚收敛派生将退回诚实报错路径。')
+            return {'ok': True, 'job_dir': job_dir, 'poscar': built['poscar'],
+                    'description': built['description'], 'natoms': built['natoms'],
+                    'warnings': warnings, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'job_dir': None, 'poscar': '', 'description': '',
+                    'natoms': 0, 'warnings': [], 'error': str(e)}
+
+    def _thickness_builder_from_job(self, job_dir):
+        """作业 job.yaml 的 inputs.recipe → (slab_builder_fn|None, 针对性中文说明|None)。
+
+        metal_slab 配方 → 层数再生器(层厚收敛真跑);sac 配方 → 单层无层厚概念的针对性
+        说明;无配方 → (None, None)(走 conv_scan 默认诚实 note);配方损坏 → 错误说明。
+        """
+        try:
+            m = self._manifest.load_manifest(job_dir)
+        except Exception:                                 # noqa: BLE001
+            m = None
+        inputs = (m or {}).get('inputs')
+        recipe = inputs.get('recipe') if isinstance(inputs, dict) else None
+        if not isinstance(recipe, dict) or not recipe:
+            return None, None
+        kind = recipe.get('kind')
+        if kind == 'sac':
+            return None, ('该作业来自石墨烯 SAC 建模:单层二维基底没有「层厚」概念,'
+                          '层厚收敛不适用;可改做超胞尺寸(nx×ny)或真空层收敛。')
+        if kind != 'metal_slab':
+            return None, f'job.yaml 配方 kind={kind!r} 未知,无法再生不同层数 slab。'
+        try:
+            return self._msl().slab_builder_from_recipe(recipe), None
+        except Exception as e:                            # noqa: BLE001
+            return None, f'配方无法再生 slab:{e}'
 
     # ── 多自旋并跑(生成页 / 作业页) ────────────────────────────────────────────
     def spin_family_generate(self, poscar, incar, out_root):
@@ -3903,10 +4027,10 @@ class Api:
     def _derive_conv(self, k, d, parent, base, p):
         """收敛扫描系列派生(encut/kmesh/vacuum/thickness):默认值兜底,系列各作业入台账。
 
-        conv_thickness 诚实化:build_slab_thickness_series 无 slab_builder_fn 时返回空作业 + note
-        (裸 CONTCAR 无米勒面/终止面信息,无法再生不同层数 slab);此前 note 被吞掉、前端误报
-        成功。现把 note 并入 warnings,并在 extra 透传 note 供前端按「0 作业 + note」显示 warn 级
-        说明(而非成功 toast)——绝不假成功。
+        conv_thickness(v3.2.2 接通,Backlog #2):源作业 job.yaml 若带金属 slab 建模配方
+        (inputs.recipe,来自 metal_slab_build),据其构造 slab_builder_fn 再生不同层数 →
+        系列真生成;SAC 配方 → 「单层无层厚」针对性说明;无配方 → conv_scan 默认诚实
+        note(裸 CONTCAR 无米勒面信息)。note 并入 warnings + extra 透传,0 作业绝不假成功。
         """
         cs = self._cs()
         out_root = os.path.join(parent, f'{base}_{k}')
@@ -3920,9 +4044,14 @@ class Api:
         elif k == 'conv_vacuum':
             vacs = [float(x) for x in (p.get('vacuums') or [10, 12, 15, 18])]
             res = cs.build_vacuum_series(d, out_root, vacs)
-        else:  # conv_thickness
+        else:  # conv_thickness:job.yaml 有 metal_slab 配方 → 真再生;无/不适用 → 诚实说明
             layers = [int(x) for x in (p.get('layers') or [3, 4, 5])]
-            res = cs.build_slab_thickness_series(d, out_root, layers)
+            builder_fn, why = self._thickness_builder_from_job(d)
+            res = cs.build_slab_thickness_series(d, out_root, layers,
+                                                 slab_builder_fn=builder_fn)
+            if builder_fn is None and why:
+                res = dict(res)
+                res['note'] = why                         # 针对性说明盖过通用 note
         dirs, series = self._series_dirs(res)
         warns = list(res.get('warnings') or [])
         note = res.get('note')

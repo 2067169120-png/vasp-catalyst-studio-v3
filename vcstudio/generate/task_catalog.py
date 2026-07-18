@@ -123,9 +123,11 @@ CATALOG = [
      'builder_ref': 'vcstudio.generate.conv_scan:build_vacuum_series',
      'requires': 'slab 结构 + INCAR', 'outputs': 'E vs 真空', 'figure': 'convergence'},
     {'key': 'conv_thickness', 'name_zh': '收敛扫描:slab 层厚', 'category': '收敛与校验',
-     'description': '重建不同层数 slab 的一串单点,判层厚收敛(需 slab 模板可再生)。',
+     'description': ('重建不同层数 slab 的一串单点,判层厚收敛;源作业须带可再生配方'
+                     '(来自「金属 slab 建模」,job.yaml inputs.recipe)。'),
      'builder_ref': 'vcstudio.generate.conv_scan:build_slab_thickness_series',
-     'requires': 'slab 模板(可再生)', 'outputs': 'E vs 层数', 'figure': 'convergence'},
+     'requires': '金属 slab 建模作业(配方可再生)', 'outputs': 'E vs 层数',
+     'figure': 'convergence'},
 ]
 
 

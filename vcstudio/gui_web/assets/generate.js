@@ -221,6 +221,76 @@
     }
   }
 
+  // ── 金属 slab 建模:fcc/bcc/hcp 低指数面(层厚收敛的可再生入口,Backlog #2) ──
+  const MSlab = { surfaces: [], guess: {} };
+  async function loadMetalSlabCatalog() {
+    const sel = $('mslab-surface');
+    if (!sel) return;
+    const r = await VCS.call('metal_slab_catalog');
+    if (!r || r.ok === false) {
+      sel.innerHTML = '<option value="">(晶面目录加载失败)</option>';
+      return;
+    }
+    MSlab.surfaces = r.surfaces || [];
+    MSlab.guess = r.guess || {};
+    sel.innerHTML = MSlab.surfaces.map(s =>
+      `<option value="${VCS.esc(s.structure + ':' + s.miller)}">` +
+      `${VCS.esc(s.structure + '(' + s.miller + ')')}</option>`).join('');
+    onMslabChange();
+  }
+  function mslabSel() {
+    const v = (val('mslab-surface') || 'fcc:111').split(':');
+    return { structure: v[0] || 'fcc', miller: v[1] || '111' };
+  }
+  // 元素/晶面联动:hcp 显示 c 输入;提示晶格常数初猜(实验值,发表口径须 EOS/晶胞优化)
+  function onMslabChange() {
+    const s = mslabSel().structure;
+    const cIpt = $('mslab-c');
+    if (cIpt) cIpt.hidden = s !== 'hcp';
+    const tip = $('mslab-guess');
+    if (!tip) return;
+    const el = val('mslab-el');
+    if (!el) { tip.textContent = ''; return; }
+    const g = (MSlab.guess[s] || {})[el];
+    if (g === undefined) {
+      tip.textContent = el + ' 不在 ' + s + ' 初猜表:请显式填晶格常数(建议来自同泛函 EOS/晶胞优化)。';
+    } else if (typeof g === 'object') {
+      tip.textContent = '初猜:a=' + g.a + ' Å、c=' + g.c + ' Å(实验值;发表口径须晶胞优化定终值)。';
+    } else {
+      tip.textContent = '初猜:a=' + g + ' Å(实验值;发表口径须 EOS/晶胞优化定终值)。';
+    }
+  }
+  async function mslabGenerate() {
+    const el = val('mslab-el'), out = val('mslab-out');
+    if (!el) { VCS.log('金属 slab:请填元素符号', 'failc'); return; }
+    if (!out) { VCS.log('金属 slab:请选择输出作业目录', 'failc'); return; }
+    const s = mslabSel();
+    const btn = $('mslab-gen-btn');
+    if (btn) btn.disabled = true;
+    VCS.log('金属 slab 建模:' + el + ' ' + s.structure + '(' + s.miller + ')…');
+    try {
+      const r = await VCS.call('metal_slab_build', el, s.structure, s.miller,
+        parseInt(val('mslab-layers') || '4', 10) || 4,
+        val('mslab-a') || null, val('mslab-c') || null,
+        parseInt(val('mslab-nx') || '3', 10) || 3,
+        parseInt(val('mslab-ny') || '3', 10) || 3,
+        parseFloat(val('mslab-vac') || '15') || 15,
+        parseInt(val('mslab-fix') || '0', 10) || 0,
+        val('mslab-incar') || null, out);
+      if (!r || r.ok === false || r.error) {
+        VCS.log('金属 slab 生成失败:' + ((r && r.error) || '未知错误'), 'failc');
+        return;
+      }
+      VCS.log('已生成:' + r.description, 'okc');
+      (r.warnings || []).forEach(w => VCS.log('⚠ ' + w, 'warnc'));
+      VCS.log('作业目录:' + r.job_dir + '(job.yaml 带可再生配方;层厚收敛可从此作业一键派生)', 'okc');
+      VCS.toast('金属 slab 已生成');
+      if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
   // ── 多自旋并跑:生成 NM/LS/HS 家族 ────────────────────────────────────────
   async function spinGenerate() {
     const pos = val('spin-poscar'), incar = val('spin-incar'), out = val('spin-out');
@@ -408,6 +478,14 @@
     { const el = $('camp-tpl-sel'); if (el) el.addEventListener('change', onCampTplChange); }
     wire('camp-tpl-inst', instantiateCampaign);
     wire('gen-preview-save', savePreview);
+    // 金属 slab 建模:晶面目录 + 元素/晶面联动 + 浏览/生成
+    loadMetalSlabCatalog();
+    { const el = $('mslab-surface'); if (el) el.addEventListener('change', onMslabChange); }
+    { const el = $('mslab-el');
+      if (el) { el.addEventListener('input', onMslabChange); el.addEventListener('change', onMslabChange); } }
+    wire('mslab-incar-btn', () => pickFile('mslab-incar', 'incar'));
+    wire('mslab-out-btn', () => pickDir('mslab-out'));
+    wire('mslab-gen-btn', mslabGenerate);
     // 多自旋并跑:浏览/生成
     wire('spin-poscar-btn', () => pickFile('spin-poscar', 'poscar'));
     wire('spin-incar-btn', () => pickFile('spin-incar', 'incar'));

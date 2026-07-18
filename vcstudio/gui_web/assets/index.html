@@ -602,6 +602,54 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <div class="mol-grid" id="mol-grid"><span class="sub">加载中…</span></div>
     </div>
 
+    <!-- 金属 slab 建模:fcc/bcc/hcp 低指数面 N 层 slab(层厚收敛的可再生入口) -->
+    <div class="card acc" data-acc="structure:mslab" data-sum="fcc / bcc / hcp 低指数面 slab" data-acc-default="0" data-src="periodic" id="mslab-card" style="padding:12px;margin:10px 0">
+      <div class="gen-h acc-h">金属 slab 建模(fcc / bcc / hcp 低指数面;job.yaml 带可再生配方,层厚收敛可用)</div>
+      <div class="gen-fld">
+        <span class="gen-lbl">元素 / 结构与晶面</span>
+        <div class="gen-inrow">
+          <input id="mslab-el" class="ipt" autocomplete="off" placeholder="元素符号,如 Pt" style="flex:0 0 110px">
+          <select id="mslab-surface" class="ipt" style="flex:1"></select>
+        </div>
+        <div class="sub" id="mslab-guess"></div>
+      </div>
+      <div class="gen-fld">
+        <span class="gen-lbl">层数 / 超胞 nx / ny / 真空(Å)/ 冻结底部层数(0=不冻结)</span>
+        <div class="gen-inrow">
+          <input id="mslab-layers" class="ipt" type="number" min="1" step="1" value="4" title="原子层数">
+          <input id="mslab-nx" class="ipt" type="number" min="1" step="1" value="3" title="面内超胞 nx">
+          <input id="mslab-ny" class="ipt" type="number" min="1" step="1" value="3" title="面内超胞 ny">
+          <input id="mslab-vac" class="ipt" type="number" min="5" step="0.5" value="15" title="真空层厚度(Å)">
+          <input id="mslab-fix" class="ipt" type="number" min="0" step="1" value="0" title="冻结最底 n 层(Selective dynamics)">
+        </div>
+      </div>
+      <div class="gen-fld">
+        <span class="gen-lbl">晶格常数 a / c(Å;留空自动取实验初猜——发表口径须同泛函 EOS/晶胞优化)</span>
+        <div class="gen-inrow">
+          <input id="mslab-a" class="ipt" autocomplete="off" placeholder="a(留空=初猜)">
+          <input id="mslab-c" class="ipt" autocomplete="off" placeholder="c(仅 hcp;留空=初猜)" hidden>
+        </div>
+      </div>
+      <div class="gen-fld">
+        <span class="gen-lbl">INCAR(可选:给了即建全四件套并入台账;不给只写 POSCAR + 配方 job.yaml)</span>
+        <div class="gen-inrow">
+          <input id="mslab-incar" class="ipt" autocomplete="off" placeholder="INCAR 参数文件路径(可留空)">
+          <button class="btn" id="mslab-incar-btn">浏览</button>
+        </div>
+      </div>
+      <div class="gen-fld" style="margin-bottom:0">
+        <span class="gen-lbl">输出作业目录</span>
+        <div class="gen-inrow">
+          <input id="mslab-out" class="ipt" autocomplete="off" placeholder="slab 作业目录(如 D:\calc\Pt111_slab)">
+          <button class="btn" id="mslab-out-btn">浏览</button>
+        </div>
+      </div>
+      <div class="sub" style="margin-top:6px">生成后到「计算活动 → 从作业派生」选 conv_thickness:配方可再生不同层数,层厚收敛系列真生成(不再报"无米勒面信息")。</div>
+      <div class="actions" style="margin-top:10px">
+        <button class="btn primary" id="mslab-gen-btn">生成 slab 作业</button>
+      </div>
+    </div>
+
     <!-- SAC 批量建模:金属 × 模板 × 吸附质 × 位点 × 取向 候选矩阵 -->
     <div class="card acc" data-acc="structure:sac" data-sum="金属 × 模板 × 吸附质候选矩阵" data-acc-default="0" data-src="periodic" id="sac-card" data-scene="cards.generate.sac_matrix" style="padding:12px;margin:10px 0">
       <div class="gen-h acc-h">SAC 批量建模(周期表换金属 × 配位模板 × 吸附质候选矩阵)</div>
