@@ -68,16 +68,37 @@
   }
 
   // ── 一键生成:gen_run → 成功落台账 + 逐条 warnings + 提示去任务页;失败 log 错误 ──
+  // 隐式溶剂化(VASPsol)勾选状态 → gen_run 的 solvation 参数(默认关)
+  function solvationParam() {
+    const on = $('gen-solvation') && $('gen-solvation').checked;
+    if (!on) return null;
+    const ebk = parseFloat(val('gen-solvation-ebk') || '78.4');
+    return { enabled: true, eb_k: isNaN(ebk) ? 78.4 : ebk };
+  }
+  // 勾选/改介电常数时预览将写入的键 + 补丁编译 warning(诚实提醒真空陷阱)
+  async function refreshSolvationNote() {
+    const note = $('gen-solvation-note');
+    if (!note) return;
+    const on = $('gen-solvation') && $('gen-solvation').checked;
+    if (!on) { note.hidden = true; note.textContent = ''; return; }
+    const ebk = parseFloat(val('gen-solvation-ebk') || '78.4');
+    const r = await VCS.call('vaspsol_preview', isNaN(ebk) ? 78.4 : ebk, true);
+    if (!r || r.ok === false) { note.hidden = true; return; }
+    note.hidden = false;
+    note.textContent = '将追加:' + (r.incar_lines || []).join(' · ') + '。' + (r.warning || '');
+  }
+
   async function run() {
     const btn = $('gen-run');
     const poscar = val('gen-poscar'), incar = val('gen-incar');
     const out = val('gen-out'), lib = val('gen-lib');
     const calc = val('gen-calc') || 'slab';
     const extraKw = val('gen-extra-kw');
+    const solvation = solvationParam();
     if (btn) btn.disabled = true;
-    VCS.log('生成中(' + calc + ')…');
+    VCS.log('生成中(' + calc + (solvation ? ',VASPsol' : '') + ')…');
     try {
-      const r = await VCS.call('gen_run', poscar, incar, out, lib, calc, extraKw);
+      const r = await VCS.call('gen_run', poscar, incar, out, lib, calc, extraKw, solvation);
       if (!r || r.ok === false || r.error) {
         VCS.log('生成失败:' + ((r && r.error) || '未知错误'), 'failc');
         return;
@@ -370,6 +391,9 @@
     });
     // 切换计算类型即刷新预览(KPOINTS 随之变化)
     { const el = $('gen-calc'); if (el) el.addEventListener('change', refreshPreview); }
+    // 隐式溶剂化(VASPsol):勾选/改介电常数即预览将写入的键 + 补丁编译 warning
+    { const el = $('gen-solvation'); if (el) el.addEventListener('change', refreshSolvationNote); }
+    { const el = $('gen-solvation-ebk'); if (el) el.addEventListener('input', refreshSolvationNote); }
 
     // SAC 批量建模:chips 预置 + 吸附质从分子库载入 + 浏览/预览/生成
     renderChips('sac-metals', SAC_METALS, ['Fe']);

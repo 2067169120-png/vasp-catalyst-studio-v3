@@ -4664,3 +4664,463 @@ def test_build_solvated_returns_temp_path(tmp_path):
     out = api.build_solvated(core='Li2S3', solvents='lis_electrolyte')
     assert out['ok'] is True and out['temp_path'] and os.path.isfile(out['temp_path'])
     assert out['poscar'] in open(out['temp_path'], encoding='utf-8').read()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# QA 接线修复:NEB / 形成能·结合能 / 差分电荷 / VASPsol / conv_thickness 诚实化 / 徽标
+# ══════════════════════════════════════════════════════════════════════════════
+def _osz(e0):
+    return f'   1 F= -.1E+02 E0= {e0:.6f}  d E =0.0\n'
+
+
+def _vasp5_poscar(species, counts):
+    head = f'demo\n1.0\n12 0 0\n0 12 0\n0 0 15\n{" ".join(species)}\n{" ".join(str(c) for c in counts)}\nDirect\n'
+    return head + '0.0 0.0 0.0\n' * sum(counts)
+
+
+def _fake_neb_builder(*, calls=None, boom=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.DEFAULT_N_IMAGES = 5
+
+    def _build(out_dir, ini, fin, incar, *, n_images=5, potcar_fn=None, **kw):
+        calls['build'] = {'out': out_dir, 'n_images': n_images, 'potcar_fn': potcar_fn,
+                          'ini': ini, 'fin': fin, 'incar': incar}
+        if boom:
+            raise boom
+        return {'job_dir': out_dir, 'n_images': n_images, 'warnings': ['端点须已弛豫']}
+    m.build_neb_dir = _build
+    return m
+
+
+def _fake_references(*, calls=None, cohesive=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.binding_energy = lambda e_sac, e_sub, e_atom: (
+        calls.__setitem__('be', (e_sac, e_sub, e_atom)) or (e_sac - e_sub - e_atom))
+
+    def _form(e_sac, e_ref, chem_pots, counts):
+        calls['form_counts'] = dict(counts)
+        total = e_sac - e_ref
+        for sp, n in counts.items():
+            if sp not in chem_pots:
+                raise ValueError(f'缺物种 {sp!r} 的化学势 μ,无法算形成能')
+            total -= n * chem_pots[sp]
+        return total
+    m.formation_energy = _form
+
+    def _coh(metal):
+        if cohesive is not None and metal in cohesive:
+            return cohesive[metal]
+        raise ValueError(f'内置内聚能表无 {metal!r}')
+    m.cohesive_energy = _coh
+    m.stability_verdict = lambda eb, ecoh: {
+        'sigma': round(-eb / ecoh, 4), 'stable': (-eb / ecoh) > 1.0, 'note': f'σ={-eb/ecoh:.2f} 判定'}
+    return m
+
+
+def _fake_chgdiff(*, calls=None, compute_ret=None, profile=None, compute_boom=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _build(relax_dir, out_root, ads_idx):
+        calls['build'] = {'relax': relax_dir, 'ads': list(ads_idx)}
+        dirs = {'_AB': os.path.join(out_root, '_AB'), '_A': os.path.join(out_root, '_A'),
+                '_B': os.path.join(out_root, '_B')}
+        results = {tag: {'out_dir': d, 'changes': [], 'warnings': [f'{tag} 警告']}
+                   for tag, d in dirs.items()}
+        return {'out_root': out_root, 'dirs': dirs, 'results': results}
+    m.build_chgdiff_jobs = _build
+
+    def _compute(ab, a, b, out_path):
+        calls['compute'] = {'ab': ab, 'a': a, 'b': b, 'out': str(out_path)}
+        if compute_boom:
+            raise compute_boom
+        return compute_ret if compute_ret is not None else {
+            'out': str(out_path), 'max': 8.0, 'min': -3.0, 'n_grid': 8}
+    m.compute_chgdiff = _compute
+
+    def _plane(path, axis='z'):
+        if profile == 'boom':
+            raise ValueError('面平均失败')
+        return profile if profile is not None else {'z': [0.0, 1.0], 'rho': [0.1, -0.2], 'axis': axis}
+    m.plane_averaged = _plane
+    return m
+
+
+def _fake_incar_builder():
+    m = types.SimpleNamespace()
+    m.VASPSOL_ADVISORY = 'VASPsol 需补丁编译;标准 VASP 静默给真空结果。'
+    m.vaspsol_keys = lambda enabled=True, *, eb_k=78.4: (
+        {'LSOL': True, 'EB_K': float(eb_k)} if enabled else {'LSOL': False})
+    return m
+
+
+# ── P0-1 derive_neb ───────────────────────────────────────────────────────────
+def _mk_neb_dirs(tmp_path, *, with_incar=True, with_potcar=False):
+    s = tmp_path / 'start'
+    e = tmp_path / 'end'
+    s.mkdir()
+    e.mkdir()
+    (s / 'CONTCAR').write_text(_vasp5_poscar(['H'], [2]), encoding='utf-8')
+    (e / 'CONTCAR').write_text(_vasp5_poscar(['H'], [2]), encoding='utf-8')
+    if with_incar:
+        (s / 'INCAR').write_text('ENCUT = 400\n', encoding='utf-8')
+    if with_potcar:
+        (s / 'POTCAR').write_text('H POTCAR\n', encoding='utf-8')
+    return str(s), str(e)
+
+
+def test_derive_neb_happy_registers(tmp_path):
+    s, e = _mk_neb_dirs(tmp_path, with_potcar=True)
+    registered, calls = [], {}
+    api = Api(neb_builder_mod=_fake_neb_builder(calls=calls),
+              ledger_mod=_fake_ledger_register(registered))
+    out = api.derive_neb(s, e, 3)
+    assert out['ok'] is True and out['n_images'] == 3
+    assert out['job_dir'].endswith('_neb') and registered == [out['job_dir']]
+    assert calls['build']['n_images'] == 3
+    assert calls['build']['potcar_fn'] == os.path.join(s, 'POTCAR')   # 有 POTCAR 则透传路径
+    assert 'ENCUT = 400' in calls['build']['incar']                   # 始态 INCAR 透传
+
+
+def test_derive_neb_missing_start_dir():
+    api = Api(neb_builder_mod=_fake_neb_builder())
+    out = api.derive_neb('/no/such', '/also/no')
+    assert out['ok'] is False and '始态' in out['error']
+
+
+def test_derive_neb_missing_end_dir(tmp_path):
+    s = tmp_path / 'start'
+    s.mkdir()
+    (s / 'CONTCAR').write_text(_vasp5_poscar(['H'], [2]), encoding='utf-8')
+    api = Api(neb_builder_mod=_fake_neb_builder())
+    out = api.derive_neb(str(s), '/no/end')
+    assert out['ok'] is False and '末态' in out['error']
+
+
+def test_derive_neb_missing_struct(tmp_path):
+    s = tmp_path / 'start'
+    e = tmp_path / 'end'
+    s.mkdir()
+    e.mkdir()
+    (e / 'CONTCAR').write_text(_vasp5_poscar(['H'], [2]), encoding='utf-8')
+    api = Api(neb_builder_mod=_fake_neb_builder())
+    out = api.derive_neb(str(s), str(e))
+    assert out['ok'] is False and 'CONTCAR/POSCAR' in out['error']
+
+
+def test_derive_neb_missing_incar_honest_error(tmp_path):
+    s, e = _mk_neb_dirs(tmp_path, with_incar=False)
+    api = Api(neb_builder_mod=_fake_neb_builder())
+    out = api.derive_neb(s, e, 5)
+    assert out['ok'] is False and 'INCAR' in out['error']       # 诚实报错,绝不假成功
+
+
+def test_derive_neb_engine_valueerror_caught(tmp_path):
+    s, e = _mk_neb_dirs(tmp_path)
+    api = Api(neb_builder_mod=_fake_neb_builder(boom=ValueError('初末态原子组成不一致')),
+              ledger_mod=_fake_ledger_register([]))
+    out = api.derive_neb(s, e, 4)
+    assert out['ok'] is False and '组成不一致' in out['error']
+
+
+def test_derive_neb_real_engine_builds_tree(tmp_path):
+    # 真引擎端到端:确证 build_neb_dir 真落 00/01../N+1 目录树(不是假成功)
+    ini = ('H2\n1.0\n10 0 0\n0 10 0\n0 0 10\nH\n2\nDirect\n0.10 0.5 0.5\n0.30 0.5 0.5\n')
+    fin = ('H2\n1.0\n10 0 0\n0 10 0\n0 0 10\nH\n2\nDirect\n0.10 0.5 0.5\n0.55 0.5 0.5\n')
+    s = tmp_path / 's'
+    e = tmp_path / 'e'
+    s.mkdir()
+    e.mkdir()
+    (s / 'CONTCAR').write_text(ini, encoding='utf-8')
+    (e / 'CONTCAR').write_text(fin, encoding='utf-8')
+    (s / 'INCAR').write_text('ENCUT = 400\nISMEAR = 0\n', encoding='utf-8')
+    api = Api(ledger_mod=_fake_ledger_register([]))          # 真 neb_builder
+    out = api.derive_neb(str(s), str(e), nimages=3)          # 前端经桥传字符串路径
+    assert out['ok'] is True and out['n_images'] == 3
+    imgs = sorted(d for d in os.listdir(out['job_dir']) if d.isdigit())
+    assert imgs == ['00', '01', '02', '03', '04']            # 00 初 + 3 中间 + 末
+    assert 'IMAGES = 3' in (tmp_path / 's_neb' / 'INCAR').read_text(encoding='utf-8')
+
+
+# ── P0-2 formation_binding_calc ───────────────────────────────────────────────
+def _mk_fb_dirs(tmp_path, *, e_sac=-300.0, e_sub=-295.0, with_sub=True):
+    sac = tmp_path / 'sac'
+    sac.mkdir()
+    (sac / 'CONTCAR').write_text(_vasp5_poscar(['Fe', 'N', 'C'], [1, 4, 22]), encoding='utf-8')
+    (sac / 'OSZICAR').write_text(_osz(e_sac), encoding='utf-8')
+    sub = None
+    if with_sub:
+        sub = tmp_path / 'sub'
+        sub.mkdir()
+        (sub / 'CONTCAR').write_text(_vasp5_poscar(['N', 'C'], [4, 22]), encoding='utf-8')
+        (sub / 'OSZICAR').write_text(_osz(e_sub), encoding='utf-8')
+    return str(sac), (str(sub) if sub else None)
+
+
+def test_formation_binding_eb_and_sigma(tmp_path):
+    sac, sub = _mk_fb_dirs(tmp_path)
+    calls = {}
+    api = Api(references_mod=_fake_references(calls=calls, cohesive={'Fe': 4.28}))
+    out = api.formation_binding_calc(sac, sub, {'Fe': -3.0})
+    assert out['ok'] is True and out['metal'] == 'Fe'
+    assert out['binding_energy'] == -2.0                     # -300 -(-295) -(-3)
+    assert out['sigma'] == round(2.0 / 4.28, 4) and out['stable'] is False
+    assert calls['be'] == (-300.0, -295.0, -3.0)             # 真调 references.binding_energy
+
+
+def test_formation_binding_ef_with_chem_pots(tmp_path):
+    sac, sub = _mk_fb_dirs(tmp_path)
+    api = Api(references_mod=_fake_references(cohesive={'Fe': 4.28}))
+    out = api.formation_binding_calc(sac, sub, {'Fe': -3.0}, {'Fe': -4.0})
+    assert out['formation_energy'] == -1.0                   # -300 -(-295) -(1*-4.0)
+    assert out['counts'] == {'Fe': 1}
+
+
+def test_formation_binding_missing_substrate_hints(tmp_path):
+    sac, _ = _mk_fb_dirs(tmp_path, with_sub=False)
+    api = Api(references_mod=_fake_references())
+    out = api.formation_binding_calc(sac, None, {'Fe': -3.0})
+    assert out['ok'] is False and out['binding_energy'] is None
+    assert any('基底' in h for h in out['hints'])
+
+
+def test_formation_binding_missing_atom_energies_hint(tmp_path):
+    sac, sub = _mk_fb_dirs(tmp_path)
+    api = Api(references_mod=_fake_references())
+    out = api.formation_binding_calc(sac, sub, None)
+    assert out['binding_energy'] is None
+    assert any('金属原子能量' in h for h in out['hints'])
+
+
+def test_formation_binding_metal_not_in_cohesive_table(tmp_path):
+    sac, sub = _mk_fb_dirs(tmp_path)
+    api = Api(references_mod=_fake_references(cohesive={}))    # 内聚能表空 → σ 缺
+    out = api.formation_binding_calc(sac, sub, {'Fe': -3.0})
+    assert out['binding_energy'] == -2.0 and out['sigma'] is None
+    assert any('内聚能' in h for h in out['hints'])
+
+
+def test_formation_binding_ef_missing_mu_caught(tmp_path):
+    sac, sub = _mk_fb_dirs(tmp_path)
+    api = Api(references_mod=_fake_references(cohesive={'Fe': 4.28}))
+    out = api.formation_binding_calc(sac, sub, {'Fe': -3.0}, {'Ni': -4.0})  # 缺 Fe 的 μ
+    assert out['formation_energy'] is None
+    assert any('形成能' in h for h in out['hints'])
+
+
+def test_formation_binding_missing_sac_energy(tmp_path):
+    sac = tmp_path / 'sac'
+    sac.mkdir()
+    (sac / 'CONTCAR').write_text(_vasp5_poscar(['Fe'], [1]), encoding='utf-8')  # 无 OSZICAR
+    api = Api(references_mod=_fake_references())
+    out = api.formation_binding_calc(str(sac))
+    assert out['ok'] is False and 'E_sac' in out['error']
+
+
+def test_formation_binding_missing_dir():
+    api = Api(references_mod=_fake_references())
+    out = api.formation_binding_calc('/no/sac')
+    assert out['ok'] is False and '不存在' in out['error']
+
+
+def test_formation_binding_real_references(tmp_path):
+    # 真引擎:内置 Fe 内聚能 4.28,验证 σ 真算
+    sac, sub = _mk_fb_dirs(tmp_path, e_sac=-300.0, e_sub=-295.0)
+    api = Api()                                              # 真 references
+    out = api.formation_binding_calc(sac, sub, {'Fe': -3.0})
+    assert out['binding_energy'] == -2.0
+    assert out['sigma'] == round(2.0 / 4.28, 4) and out['stable'] is False
+
+
+# ── P0-4 差分电荷:derive_task 分派 + compute_chgdiff ─────────────────────────────
+def test_derive_task_chgdiff_dispatches_three_statics(tmp_path):
+    (tmp_path / 'CONTCAR').write_text(_vasp5_poscar(['Cu', 'O'], [4, 1]), encoding='utf-8')
+    registered, calls, est_calls = [], {}, {}
+    api = Api(chgdiff_mod=_fake_chgdiff(calls=calls),
+              estatic_mod=_fake_estatic(calls=est_calls),
+              ledger_mod=_fake_ledger_register(registered))
+    out = api.derive_task('chgdiff', str(tmp_path), {'adsorbate_indices': [5]})
+    assert out['ok'] is True and len(out['job_dirs']) == 3   # AB/A/B 三作业
+    assert len(registered) == 3
+    assert calls['build']['ads'] == [5]
+    assert 'purposes' not in est_calls                       # 不再误接单静态 build_static_job
+
+
+def test_derive_task_chgdiff_requires_indices(tmp_path):
+    (tmp_path / 'CONTCAR').write_text(_vasp5_poscar(['Cu', 'O'], [4, 1]), encoding='utf-8')
+    api = Api(chgdiff_mod=_fake_chgdiff())
+    out = api.derive_task('chgdiff', str(tmp_path), {})
+    assert out['ok'] is False and '序号' in out['error'] and out['job_dirs'] == []
+
+
+def test_chgdiff_not_in_electronic_map():
+    # 回归守卫:chgdiff 不再在电子学单静态表(名副其实,不误接 build_static_job)
+    assert 'chgdiff' not in Api._DERIVE_ELECTRONIC
+
+
+def test_compute_chgdiff_happy_with_profile(tmp_path):
+    dirs = {}
+    for tag in ('AB', 'A', 'B'):
+        d = tmp_path / tag
+        d.mkdir()
+        (d / 'CHGCAR').write_text('grid', encoding='utf-8')
+        dirs[tag] = str(d)
+    calls = {}
+    api = Api(chgdiff_mod=_fake_chgdiff(calls=calls))
+    out = api.compute_chgdiff(dirs['AB'], dirs['A'], dirs['B'], str(tmp_path / 'o'))
+    assert out['ok'] is True and out['max'] == 8.0 and out['n_grid'] == 8
+    assert out['out'].endswith('CHGDIFF.vasp')
+    assert out['profile']['z'] == [0.0, 1.0]                 # 面平均 charge_profile
+    assert os.path.basename(calls['compute']['ab']) == 'CHGCAR'
+
+
+def test_compute_chgdiff_missing_chgcar(tmp_path):
+    ab = tmp_path / 'AB'
+    ab.mkdir()                              # 无 CHGCAR
+    a = tmp_path / 'A'
+    a.mkdir()
+    (a / 'CHGCAR').write_text('x', encoding='utf-8')
+    b = tmp_path / 'B'
+    b.mkdir()
+    (b / 'CHGCAR').write_text('x', encoding='utf-8')
+    api = Api(chgdiff_mod=_fake_chgdiff())
+    out = api.compute_chgdiff(str(ab), str(a), str(b))
+    assert out['ok'] is False and 'CHGCAR' in out['error']
+
+
+def test_compute_chgdiff_missing_dir(tmp_path):
+    api = Api(chgdiff_mod=_fake_chgdiff())
+    out = api.compute_chgdiff('/no/ab', '/no/a', '/no/b')
+    assert out['ok'] is False and '不存在' in out['error']
+
+
+def test_compute_chgdiff_engine_error_caught(tmp_path):
+    dirs = {}
+    for tag in ('AB', 'A', 'B'):
+        d = tmp_path / tag
+        d.mkdir()
+        (d / 'CHGCAR').write_text('x', encoding='utf-8')
+        dirs[tag] = str(d)
+    api = Api(chgdiff_mod=_fake_chgdiff(compute_boom=ValueError('AB 与 A 网格不一致')))
+    out = api.compute_chgdiff(dirs['AB'], dirs['A'], dirs['B'])
+    assert out['ok'] is False and '网格不一致' in out['error']
+
+
+def test_compute_chgdiff_profile_failure_does_not_block(tmp_path):
+    dirs = {}
+    for tag in ('AB', 'A', 'B'):
+        d = tmp_path / tag
+        d.mkdir()
+        (d / 'CHGCAR').write_text('x', encoding='utf-8')
+        dirs[tag] = str(d)
+    api = Api(chgdiff_mod=_fake_chgdiff(profile='boom'))
+    out = api.compute_chgdiff(dirs['AB'], dirs['A'], dirs['B'])
+    assert out['ok'] is True and out['profile'] == {}        # 面平均失败不挡主产物
+
+
+# ── P0-3 VASPsol ───────────────────────────────────────────────────────────────
+def test_vaspsol_preview_water_default():
+    api = Api(incar_builder_mod=_fake_incar_builder())
+    out = api.vaspsol_preview(78.4)
+    assert out['ok'] is True and out['keys'] == {'LSOL': True, 'EB_K': 78.4}
+    assert out['incar_lines'] == ['LSOL = .TRUE.', 'EB_K = 78.4']
+    assert 'VASPsol' in out['warning']
+
+
+def test_vaspsol_preview_custom_dielectric():
+    api = Api(incar_builder_mod=_fake_incar_builder())
+    out = api.vaspsol_preview(37.5)
+    assert out['incar_lines'] == ['LSOL = .TRUE.', 'EB_K = 37.5']
+
+
+def test_vaspsol_preview_disabled():
+    api = Api(incar_builder_mod=_fake_incar_builder())
+    out = api.vaspsol_preview(78.4, False)
+    assert out['keys'] == {'LSOL': False} and out['incar_lines'] == ['LSOL = .FALSE.']
+
+
+def test_vaspsol_preview_real_engine():
+    api = Api()                                             # 真 incar_builder
+    out = api.vaspsol_preview(78.4)
+    assert out['ok'] is True and out['keys']['LSOL'] is True
+    assert 'LSOL = .TRUE.' in out['incar_lines'] and '补丁' in out['warning']
+
+
+def test_gen_run_solvation_appends_keys_and_advisory(tmp_path):
+    (tmp_path / 'INCAR').write_text('ENCUT = 500\n', encoding='utf-8')
+    payload = {'ok': True, 'out_dir': str(tmp_path), 'warnings': [], 'kpoints': [3, 3, 1],
+               'elements': ['Fe']}
+    jb = types.SimpleNamespace(build_job_dir=lambda p, i, o, **k: dict(payload))
+    api = Api(config_mod=_fake_config(), logic_mod=_fake_logic(errs=[]),
+              job_builder_mod=jb, manifest_mod=_fake_manifest({}),
+              ledger_mod=_fake_ledger_register([]),
+              incar_builder_mod=_fake_incar_builder())
+    out = api.gen_run('/p/POSCAR', '/p/INCAR', str(tmp_path), '/lib', 'slab', None,
+                      {'enabled': True, 'eb_k': 37.5})
+    assert out['ok'] is True
+    incar = (tmp_path / 'INCAR').read_text(encoding='utf-8')
+    assert 'LSOL = .TRUE.' in incar and 'EB_K = 37.5' in incar
+    assert any('VASPsol' in w for w in out['warnings'])
+    assert any('静默' in w for w in out['warnings'])         # 补丁编译 advisory 一并显示
+
+
+def test_gen_run_solvation_off_is_backward_compatible(tmp_path):
+    (tmp_path / 'INCAR').write_text('ENCUT = 500\n', encoding='utf-8')
+    payload = {'ok': True, 'out_dir': str(tmp_path), 'warnings': [], 'kpoints': [3, 3, 1],
+               'elements': ['Fe']}
+    jb = types.SimpleNamespace(build_job_dir=lambda p, i, o, **k: dict(payload))
+    api = Api(config_mod=_fake_config(), logic_mod=_fake_logic(errs=[]),
+              job_builder_mod=jb, manifest_mod=_fake_manifest({}),
+              ledger_mod=_fake_ledger_register([]),
+              incar_builder_mod=_fake_incar_builder())
+    out = api.gen_run('/p/POSCAR', '/p/INCAR', str(tmp_path), '/lib')  # 无 solvation 参数
+    assert out['ok'] is True
+    assert 'LSOL' not in (tmp_path / 'INCAR').read_text(encoding='utf-8')
+
+
+# ── P1-1 conv_thickness 诚实化 ─────────────────────────────────────────────────
+def _fake_conv_scan_thickness_note():
+    m = _fake_conv_scan()
+    m.build_slab_thickness_series = lambda src, out_root, layers, **kw: {
+        'out_root': out_root, 'dirs': {}, 'series': [], 'results': {}, 'warnings': [],
+        'note': '层厚收敛需从建 slab 流程发起(裸 CONTCAR 无米勒面信息)'}
+    return m
+
+
+def test_derive_task_conv_thickness_honest_note(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    api = Api(conv_scan_mod=_fake_conv_scan_thickness_note(),
+              ledger_mod=_fake_ledger_register([]))
+    out = api.derive_task('conv_thickness', str(tmp_path), {'layers': [3, 4, 5]})
+    assert out['ok'] is True and out['job_dirs'] == []       # 0 作业但不假成功
+    assert out['note'] and '层厚' in out['note']
+    assert any('层厚' in w for w in out['warnings'])          # note 并入 warnings,不再被吞
+
+
+def test_derive_task_conv_vacuum_no_spurious_note(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    api = Api(conv_scan_mod=_fake_conv_scan(), ledger_mod=_fake_ledger_register([]))
+    out = api.derive_task('conv_vacuum', str(tmp_path), {'vacuums': [10, 12]})
+    assert out['ok'] is True and len(out['job_dirs']) == 2 and out.get('note') is None
+
+
+# ── P2 任务性质徽标 ────────────────────────────────────────────────────────────
+def test_task_catalog_kind_badges():
+    api = Api()                                             # 真 task_catalog
+    out = api.task_catalog()
+    badges = {t['key']: t['kind_badge'] for t in out['tasks']}
+    assert badges['vaspsol'] == 'INCAR 顾问'
+    assert badges['formation_binding'] == '结果计算器'
+    assert badges['surface_energy'] == '结果计算器'
+    assert badges['relax'] == '作业生成' and badges['chgdiff'] == '作业生成'
+    assert badges['neb'] == '作业生成'
+
+
+def test_task_badge_classifier():
+    assert Api._task_badge('vcstudio.generate.incar_builder:vaspsol_keys') == 'INCAR 顾问'
+    assert Api._task_badge('vcstudio.project.references:binding_energy') == '结果计算器'
+    assert Api._task_badge('vcstudio.project.surface_energy:surface_energy') == '结果计算器'
+    assert Api._task_badge('vcstudio.generate.job_builder:build_job_dir') == '作业生成'
+    assert Api._task_badge('') == '作业生成'

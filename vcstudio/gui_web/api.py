@@ -72,7 +72,9 @@ class Api:
                  workfunction_mod=None, surface_energy_mod=None, dimer_mod=None,
                  auto_figures_mod=None, campaign_templates_mod=None,
                  solvation_mod=None, paper_data_mod=None, variant_advisor_mod=None,
-                 manuscript_draft_mod=None, bands_parse_mod=None, deps_runner=None):
+                 manuscript_draft_mod=None, bands_parse_mod=None, deps_runner=None,
+                 neb_builder_mod=None, references_mod=None, chgdiff_mod=None,
+                 incar_builder_mod=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -161,6 +163,11 @@ class Api:
         self._bands_parse = bands_parse_mod         # project.bands(EIGENVAL/带隙解析)
         self._deps_runner = deps_runner             # 依赖安装后台执行器(subprocess 注入)
         self._deps_job = None                       # deps_install 后台任务句柄(轮询用)
+        # QA 接线修复(NEB/形成能·结合能/差分电荷/VASPsol):全只读引擎,延迟导入,注入式可测。
+        self._neb_builder = neb_builder_mod         # generate.neb_builder(NEB 目录树)
+        self._references = references_mod            # project.references(结合能/形成能/σ)
+        self._chgdiff = chgdiff_mod                 # project.chgdiff(差分电荷三静态 + Δρ 合成)
+        self._incar_builder = incar_builder_mod     # generate.incar_builder(VASPsol 键)
 
     # ── 桥活性探测(前端用来确认 js_api 已就绪) ──
     def ping(self) -> str:
@@ -445,6 +452,34 @@ class Api:
             from vcstudio.project import bands as bands_parse
             self._bands_parse = bands_parse
         return self._bands_parse
+
+    def _neb(self):
+        """NEB 过渡态目录生成端延迟加载(纯 python)。"""
+        if self._neb_builder is None:
+            from vcstudio.generate import neb_builder
+            self._neb_builder = neb_builder
+        return self._neb_builder
+
+    def _refs(self):
+        """参考态/稳定性判据引擎(结合能/形成能/σ)延迟加载。"""
+        if self._references is None:
+            from vcstudio.project import references
+            self._references = references
+        return self._references
+
+    def _chg(self):
+        """差分电荷工作流引擎(三静态派生 + Δρ 网格代数)延迟加载。"""
+        if self._chgdiff is None:
+            from vcstudio.project import chgdiff
+            self._chgdiff = chgdiff
+        return self._chgdiff
+
+    def _ib(self):
+        """INCAR 顾问引擎(VASPsol 键等)延迟加载(纯 python)。"""
+        if self._incar_builder is None:
+            from vcstudio.generate import incar_builder
+            self._incar_builder = incar_builder
+        return self._incar_builder
 
     def _resolve(self, name, password):
         """名字 → (profile, 密码, err_dict|None)。
@@ -889,7 +924,7 @@ class Api:
                     'warnings': [], 'error': str(e)}
 
     def gen_run(self, poscar_path, incar_path, out_dir, lib_root, calc_type='slab',
-                extra_keywords=None):
+                extra_keywords=None, solvation=None):
         """一键生成(镜像 generate_tab._on_run→build_job_dir→_write_manifest→ledger.register)。
 
         calc_type 由前端「计算类型」下拉传入(slab/bulk/molecule,非法值归 slab):决定
@@ -897,6 +932,9 @@ class Api:
         此前 web 硬编码 slab,生成 bulk/molecule 会拿到错误 KPOINTS(缺口分析已指出)。
         校验开关取默认(开)、KPOINTS 仍自动推荐。extra_keywords(每行一条 ``KEY = VALUE``)
         生成后追加到 INCAR 末(自定义关键词,如 LREAL/NCORE);解析不出的行原样保留。
+        solvation(可选,默认关,向后兼容):真值/{'enabled':True,'eb_k':78.4}→ 调
+        incar_builder.vaspsol_keys 把 LSOL/EB_K 追加进 INCAR,并把「需 VASPsol 补丁编译、
+        否则标准 VASP 静默给真空结果」的 advisory 一并进 warnings(绝不假装已溶剂化)。
         job.yaml 与台账写入失败只追加警告,绝不撤销已生成的四件套(同 _write_manifest 口径)。
         """
         try:
@@ -937,6 +975,24 @@ class Api:
                     warnings.append(f'已追加 {len(extra_lines)} 条自定义关键词到 INCAR')
                 except Exception as e:                    # noqa: BLE001
                     warnings.append(f'自定义关键词追加失败(不影响四件套):{e}')
+            # VASPsol 隐式溶剂化(默认关):勾选则把 LSOL/EB_K 追加进 INCAR + advisory 进 warnings
+            sol = solvation if isinstance(solvation, dict) else (
+                {'enabled': True} if solvation else {})
+            if sol.get('enabled'):
+                try:
+                    ib = self._ib()
+                    eb_k = float(sol.get('eb_k', 78.4) or 78.4)
+                    keys = ib.vaspsol_keys(True, eb_k=eb_k)
+                    incar_out = os.path.join(payload['out_dir'], 'INCAR')
+                    with open(incar_out, 'a', encoding='utf-8') as f:
+                        f.write('\n# === VASPsol 隐式溶剂化(需 VASPsol 补丁编译的 VASP)===\n')
+                        f.write('\n'.join(self._incar_lines_from(keys)) + '\n')
+                    warnings.append(f'已启用 VASPsol 隐式溶剂化(EB_K={eb_k:g}),追加 LSOL/EB_K 到 INCAR')
+                    adv = getattr(ib, 'VASPSOL_ADVISORY', '')
+                    if adv:
+                        warnings.append(adv)
+                except Exception as e:                    # noqa: BLE001
+                    warnings.append(f'VASPsol 键追加失败(不影响四件套):{e}')
             # 落 job.yaml + 登记台账(_write_manifest:失败只告警)
             try:
                 self._manifest.create_from_build(
@@ -3647,20 +3703,41 @@ class Api:
     # ══════════════════════════════════════════════════════════════════════════
     # 一、全 DFT 任务目录(②生成输入页):计算类型目录 + U 建议 + 派生分发 + 任务解析
     # ══════════════════════════════════════════════════════════════════════════
-    # 计算类型 key → estatic build_static_job 的 purpose(电子结构静态派生一族)
+    # 计算类型 key → estatic build_static_job 的 purpose(电子结构静态派生一族)。
+    # 注意:'chgdiff' 不在此表——差分电荷不是单个静态,而是 AB/A/B 三冻结几何静态,
+    # 单独走 chgdiff.build_chgdiff_jobs(见 derive_task 的 chgdiff 分支),名副其实。
     _DERIVE_ELECTRONIC = {'static': 'esp', 'dos_pdos': 'pdos', 'bader': 'bader',
-                          'chgdiff': 'chgdiff', 'elf': 'elf'}
+                          'elf': 'elf'}
+
+    @staticmethod
+    def _task_badge(builder_ref):
+        """按 builder_ref 分类任务性质徽标:作业生成 / 结果计算器 / INCAR 顾问(P2 卡片区分)。
+
+        - INCAR 顾问:incar_builder 系(如 vaspsol_keys 只给键、不建作业);
+        - 结果计算器:从已完成作业算标量的纯函数(surface_energy / binding_energy / formation_energy);
+        - 作业生成:其余(建作业目录/系列的 builder,create_project 等)。
+        """
+        ref = str(builder_ref or '')
+        mod, _, func = ref.partition(':')
+        if 'incar_builder' in mod:
+            return 'INCAR 顾问'
+        if func in ('surface_energy', 'binding_energy', 'formation_energy'):
+            return '结果计算器'
+        return '作业生成'
 
     def task_catalog(self):
         """计算类型目录(五分类 23 项)→ {'ok','categories','tasks':[{key,name_zh,category,
-        description,requires,outputs,figure}],'error'}。前端据此渲染卡片网格与参数表单。"""
+        description,requires,outputs,figure,builder_ref,kind_badge}],'error'}。前端据此渲染卡片
+        网格与参数表单;kind_badge 按 builder_ref 分「作业生成/结果计算器/INCAR 顾问」区分。"""
         try:
             tc = self._tc()
             tasks = [{'key': t['key'], 'name_zh': t.get('name_zh', t['key']),
                       'category': t.get('category', ''),
                       'description': t.get('description', ''),
                       'requires': t.get('requires', ''),
-                      'outputs': t.get('outputs', ''), 'figure': t.get('figure')}
+                      'outputs': t.get('outputs', ''), 'figure': t.get('figure'),
+                      'builder_ref': t.get('builder_ref', ''),
+                      'kind_badge': self._task_badge(t.get('builder_ref', ''))}
                      for t in tc.list_catalog()]
             return {'ok': True, 'categories': list(tc.CATEGORIES),
                     'tasks': tasks, 'error': None}
@@ -3743,6 +3820,26 @@ class Api:
                     d, out_dir, purpose=self._DERIVE_ELECTRONIC[k])
                 return self._derive_ret(k, [res['out_dir']], res.get('changes'),
                                         res.get('warnings'))
+            if k == 'chgdiff':
+                # 差分电荷:名副其实拆 AB/A/B 三冻结几何静态(此前误接单静态,拿不到 Δρ)。
+                idx = p.get('adsorbate_indices') or p.get('indices')
+                ads = [int(i) for i in idx] if idx else []
+                if not ads:
+                    return {'ok': False, 'key': k, 'job_dirs': [], 'series': None,
+                            'changes': [], 'warnings': [],
+                            'error': ('差分电荷需指定吸附质原子序号(1 起,对齐 POSCAR),'
+                                      '据此拆 AB/仅表面 A/仅吸附质 B 三冻结几何静态;'
+                                      '请在参数里填「吸附质原子序号」。')}
+                out_root = os.path.join(parent, f'{base}_chgdiff')
+                res = self._chg().build_chgdiff_jobs(d, out_root, ads)
+                dirs = [str(v) for v in (res.get('dirs') or {}).values()]
+                changes = [f'差分电荷三静态已拆:{", ".join(os.path.basename(x) for x in dirs)}'
+                           f'(AB 全原子 / A 仅表面 / B 仅吸附质,同冻结几何)']
+                warns = []
+                for r in (res.get('results') or {}).values():
+                    warns += list((r or {}).get('warnings') or [])
+                return self._derive_ret(k, dirs, changes, warns,
+                                        extra={'chgdiff_dirs': res.get('dirs')})
             if k == 'bands':
                 out_dir = os.path.join(parent, f'{base}_bands')
                 res = self._bd().build_bands_job(
@@ -3804,7 +3901,13 @@ class Api:
                     'changes': [], 'warnings': [], 'error': str(e)}
 
     def _derive_conv(self, k, d, parent, base, p):
-        """收敛扫描系列派生(encut/kmesh/vacuum/thickness):默认值兜底,系列各作业入台账。"""
+        """收敛扫描系列派生(encut/kmesh/vacuum/thickness):默认值兜底,系列各作业入台账。
+
+        conv_thickness 诚实化:build_slab_thickness_series 无 slab_builder_fn 时返回空作业 + note
+        (裸 CONTCAR 无米勒面/终止面信息,无法再生不同层数 slab);此前 note 被吞掉、前端误报
+        成功。现把 note 并入 warnings,并在 extra 透传 note 供前端按「0 作业 + note」显示 warn 级
+        说明(而非成功 toast)——绝不假成功。
+        """
         cs = self._cs()
         out_root = os.path.join(parent, f'{base}_{k}')
         if k == 'conv_encut':
@@ -3821,7 +3924,291 @@ class Api:
             layers = [int(x) for x in (p.get('layers') or [3, 4, 5])]
             res = cs.build_slab_thickness_series(d, out_root, layers)
         dirs, series = self._series_dirs(res)
-        return self._derive_ret(k, dirs, [], res.get('warnings'), series=series)
+        warns = list(res.get('warnings') or [])
+        note = res.get('note')
+        # note(层厚需从建 slab 流程发起)不吞掉:并入 warnings,并单列 extra 供前端判 warn。
+        if note and note not in warns:
+            warns.append(note)
+        return self._derive_ret(k, dirs, [], warns, series=series,
+                                extra={'note': note})
+
+    # ── 输入读取小工具(NEB / 计算器共用;优先 CONTCAR) ─────────────────────────
+    @staticmethod
+    def _read_struct_text(job_dir):
+        """作业目录结构文本:优先 CONTCAR(已弛豫),回落 POSCAR;都无 → None。"""
+        for name in ('CONTCAR', 'POSCAR'):
+            p = os.path.join(job_dir, name)
+            if os.path.isfile(p):
+                try:
+                    with open(p, encoding='utf-8', errors='replace') as f:
+                        return f.read()
+                except OSError:
+                    return None
+        return None
+
+    @staticmethod
+    def _read_named_text(job_dir, name):
+        """读作业目录下指定文件文本;缺文件/读失败 → None。"""
+        p = os.path.join(job_dir, name)
+        if os.path.isfile(p):
+            try:
+                with open(p, encoding='utf-8', errors='replace') as f:
+                    return f.read()
+            except OSError:
+                return None
+        return None
+
+    @staticmethod
+    def _fmt_incar_value(v):
+        """INCAR 值格式化:bool→.TRUE./.FALSE.,float→紧凑,其余原样。"""
+        if isinstance(v, bool):
+            return '.TRUE.' if v else '.FALSE.'
+        if isinstance(v, float):
+            return f'{v:g}'
+        return str(v)
+
+    @classmethod
+    def _incar_lines_from(cls, keys):
+        """INCAR 键 dict → ['KEY = VALUE', ...](供预览/追加)。"""
+        return [f'{k} = {cls._fmt_incar_value(v)}' for k, v in (keys or {}).items()]
+
+    @staticmethod
+    def _species_counts(text):
+        """POSCAR/CONTCAR 文本 → {元素: 计数} dict;解析失败 → {}。"""
+        try:
+            from vcstudio.generate.poscar import parse_poscar_species
+            syms, counts = parse_poscar_species(text)
+            out = {}
+            for s, c in zip(syms or [], counts or []):
+                out[s] = out.get(s, 0) + int(c)
+            return out
+        except Exception:                                 # noqa: BLE001
+            return {}
+
+    # ── P0-1 NEB 过渡态接通(始/末态目录 → 标准 NEB 目录树) ──────────────────────
+    # 注:nimages/out_root 为位置或关键字参(非 keyword-only)——前端经 pywebview 桥按位置
+    # 传参,keyword-only 会断桥;与 gen_run/wavefn_run 等 JS 面向方法同口径。
+    def derive_neb(self, start_dir, end_dir, nimages=5, out_root=None):
+        """NEB 过渡态接通:始/末态目录 → neb_builder.build_neb_dir(插值 + 多 image 目录树)→ 入台账。
+
+        - start_dir/end_dir:已弛豫的初/末态作业目录(读 CONTCAR 优先、否则 POSCAR)。
+        - INCAR 取自 start_dir(否则 end_dir);两者皆缺 → 中文错误(NEB 须用户电子学设置)。
+        - POTCAR:start_dir 有则透传其路径,否则 build 侧告警、提交前补齐。
+        返回 {'ok','job_dir','n_images','changes','warnings','error'}。端点不一致/插值重叠等 →
+        error(引擎 ValueError 冒泡),绝不假成功。
+        """
+        try:
+            s = (start_dir or '').strip()
+            e = (end_dir or '').strip()
+            if not s or not os.path.isdir(s):
+                return {'ok': False, 'job_dir': None, 'n_images': 0, 'changes': [],
+                        'warnings': [], 'error': '始态作业目录不存在'}
+            if not e or not os.path.isdir(e):
+                return {'ok': False, 'job_dir': None, 'n_images': 0, 'changes': [],
+                        'warnings': [], 'error': '末态作业目录不存在'}
+            ini = self._read_struct_text(s)
+            fin = self._read_struct_text(e)
+            if not ini:
+                return {'ok': False, 'job_dir': None, 'n_images': 0, 'changes': [],
+                        'warnings': [], 'error': '始态目录缺 CONTCAR/POSCAR,无法作 NEB 初态'}
+            if not fin:
+                return {'ok': False, 'job_dir': None, 'n_images': 0, 'changes': [],
+                        'warnings': [], 'error': '末态目录缺 CONTCAR/POSCAR,无法作 NEB 末态'}
+            incar = self._read_named_text(s, 'INCAR') or self._read_named_text(e, 'INCAR')
+            if not incar:
+                return {'ok': False, 'job_dir': None, 'n_images': 0, 'changes': [],
+                        'warnings': [],
+                        'error': 'NEB 须用户 INCAR(始/末态目录均无 INCAR);请先在始态目录放置 INCAR'}
+            try:
+                n = int(nimages)
+            except (TypeError, ValueError):
+                n = 5
+            base = os.path.basename(os.path.normpath(s))
+            parent = (out_root or '').strip() or os.path.dirname(os.path.normpath(s))
+            out_dir = os.path.join(parent, f'{base}_neb')
+            potcar_path = os.path.join(s, 'POTCAR')
+            potcar_fn = potcar_path if os.path.isfile(potcar_path) else None
+            res = self._neb().build_neb_dir(
+                out_dir, ini, fin, incar, n_images=n, potcar_fn=potcar_fn)
+            warns = list(res.get('warnings') or [])
+            try:
+                self._ledger.register(res['job_dir'])
+            except Exception as ex:                       # noqa: BLE001
+                warns.append(f'台账登记失败(不影响已生成 NEB 目录):{ex}')
+            changes = [f'已生成标准 NEB 目录树:00 初态 + {res["n_images"]} 个中间 image + 末态,'
+                       f'根目录共享 INCAR/POTCAR/KPOINTS(INCAR 只补不改补齐 IMAGES/SPRING 等)']
+            return {'ok': True, 'job_dir': res['job_dir'], 'n_images': res['n_images'],
+                    'changes': changes, 'warnings': warns, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'job_dir': None, 'n_images': 0, 'changes': [],
+                    'warnings': [], 'error': str(e)}
+
+    # ── P0-2 形成能/结合能计算器 ───────────────────────────────────────────────
+    # 位置或关键字参(非 keyword-only):前端经 pywebview 桥按位置传参,keyword-only 会断桥。
+    def formation_binding_calc(self, sac_dir, substrate_dir=None,
+                               atom_energies=None, chem_pots=None):
+        """形成能/结合能计算器:读各作业能量 → references.binding_energy/formation_energy + σ 稳定性。
+
+        - sac_dir:单原子催化剂(SAC)作业目录(读 OSZICAR 末 E0 作 E_sac,读 CONTCAR/POSCAR 组成)。
+        - substrate_dir:含空位、未嵌金属的基底作业目录(E_substrate);Eb 与 Ef 都相对它。
+        - atom_energies:{元素: 孤立原子能量 eV}(结合能用金属原子能;缺 → 无法算 Eb 的中文提示)。
+        - chem_pots:{元素: 化学势 μ eV/atom}(形成能用;counts 取 SAC−基底 组成差)。
+        返回 {'ok','e_sac','e_substrate','metal','counts','binding_energy','formation_energy',
+        'sigma','stable','stability_note','hints','warnings','error'}。缺量只提示、绝不编造。
+        """
+        try:
+            sd = (sac_dir or '').strip()
+            if not sd or not os.path.isdir(sd):
+                return {'ok': False, 'e_sac': None, 'e_substrate': None, 'metal': None,
+                        'counts': {}, 'binding_energy': None, 'formation_energy': None,
+                        'sigma': None, 'stable': None, 'stability_note': None,
+                        'hints': [], 'warnings': [], 'error': 'SAC 作业目录不存在'}
+            e_sac = self._osz_energy(sd)
+            if e_sac is None:
+                return {'ok': False, 'e_sac': None, 'e_substrate': None, 'metal': None,
+                        'counts': {}, 'binding_energy': None, 'formation_energy': None,
+                        'sigma': None, 'stable': None, 'stability_note': None,
+                        'hints': [], 'warnings': [],
+                        'error': 'SAC 作业无 OSZICAR / 未跑完,取不到 E_sac 能量'}
+            refs = self._refs()
+            hints, warnings = [], []
+            sac_counts = self._species_counts(self._read_struct_text(sd) or '')
+
+            # 基底能量 + 组成
+            e_sub, sub_counts = None, {}
+            sub = (substrate_dir or '').strip()
+            if sub and os.path.isdir(sub):
+                e_sub = self._osz_energy(sub)
+                sub_counts = self._species_counts(self._read_struct_text(sub) or '')
+                if e_sub is None:
+                    hints.append('基底作业无 OSZICAR / 未跑完,取不到 E_substrate;结合能/形成能暂缺。')
+
+            # 组成差 counts(SAC − 基底);金属 = 差值为正且在 atom_energies 中的元素
+            delta = {}
+            if sac_counts and sub_counts:
+                for el in set(sac_counts) | set(sub_counts):
+                    d = sac_counts.get(el, 0) - sub_counts.get(el, 0)
+                    if d != 0:
+                        delta[el] = d
+            ae = {}
+            for k, v in (atom_energies or {}).items():
+                try:
+                    ae[str(k)] = float(v)
+                except (TypeError, ValueError):
+                    continue
+            added = [el for el, d in delta.items() if d > 0 and el in ae]
+            metal = None
+            if len(added) == 1:
+                metal = added[0]
+            elif added:
+                metal = added[0]
+            elif len(ae) == 1:
+                metal = next(iter(ae))
+
+            # 结合能 Eb + σ 稳定性
+            eb, sigma, stable, stab_note = None, None, None, None
+            if e_sub is None and sub:
+                pass                                       # 已在上面提示
+            elif not sub:
+                hints.append('结合能需基底作业(含空位、未嵌金属)的能量;请选「基底作业目录」。')
+            elif not ae:
+                hints.append('结合能需金属孤立原子能量;请填「金属原子能量」(元素→eV)。')
+            elif metal is None:
+                hints.append('无法判定嵌入的金属元素(SAC 与基底组成差不明确);'
+                             '请确认所选作业,或让金属原子能量只含目标金属。')
+            else:
+                eb = refs.binding_energy(e_sac, e_sub, ae[metal])
+                try:
+                    ecoh = refs.cohesive_energy(metal)
+                    verdict = refs.stability_verdict(eb, ecoh)
+                    sigma, stable, stab_note = verdict['sigma'], verdict['stable'], verdict['note']
+                except ValueError as ve:
+                    hints.append(f'稳定性 σ 需金属内聚能:{ve}')
+
+            # 形成能 Ef(以基底为参考,counts 取组成差,μ 取 chem_pots)
+            ef = None
+            cp = {}
+            for k, v in (chem_pots or {}).items():
+                try:
+                    cp[str(k)] = float(v)
+                except (TypeError, ValueError):
+                    continue
+            if e_sub is None:
+                if not sub:
+                    hints.append('形成能需参考态(基底)作业能量;请选基底作业目录。')
+            elif not delta:
+                hints.append('形成能需 SAC 与基底的组成差(判掺入/移除的物种);'
+                             '请确认两作业结构可解析组成。')
+            elif not cp:
+                hints.append('形成能需各变动物种的化学势 μ(eV/atom);请填「化学势」。')
+            else:
+                try:
+                    ef = refs.formation_energy(e_sac, e_sub, cp, delta)
+                except ValueError as ve:
+                    hints.append(f'形成能:{ve}')
+
+            return {'ok': (eb is not None) or (ef is not None),
+                    'e_sac': e_sac, 'e_substrate': e_sub, 'metal': metal,
+                    'counts': delta, 'binding_energy': eb, 'formation_energy': ef,
+                    'sigma': sigma, 'stable': stable, 'stability_note': stab_note,
+                    'hints': hints, 'warnings': warnings, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'e_sac': None, 'e_substrate': None, 'metal': None,
+                    'counts': {}, 'binding_energy': None, 'formation_energy': None,
+                    'sigma': None, 'stable': None, 'stability_note': None,
+                    'hints': [], 'warnings': [], 'error': str(e)}
+
+    # ── P0-4 差分电荷合成(三作业 CHGCAR → CHGDIFF.vasp + 面平均) ──────────────────
+    def compute_chgdiff(self, ab_dir, a_dir, b_dir, out_dir=None):
+        """差分电荷合成:三作业 CHGCAR → chgdiff.compute_chgdiff 出 CHGDIFF.vasp + 面平均 Δρ̄(z)。
+
+        返回 {'ok','out','max','min','n_grid','profile':{'z','rho','axis'},'error'}。
+        任一 CHGCAR 缺失/网格或晶格不一致/原子数不守恒 → 中文 error(引擎硬校验冒泡),不静默错算。
+        """
+        try:
+            paths = {}
+            for tag, dd in (('AB', ab_dir), ('A', a_dir), ('B', b_dir)):
+                d = (dd or '').strip()
+                if not d or not os.path.isdir(d):
+                    return {'ok': False, 'out': None, 'max': None, 'min': None,
+                            'n_grid': 0, 'profile': {}, 'error': f'{tag} 作业目录不存在'}
+                cp = os.path.join(d, 'CHGCAR')
+                if not os.path.isfile(cp):
+                    return {'ok': False, 'out': None, 'max': None, 'min': None,
+                            'n_grid': 0, 'profile': {},
+                            'error': f'{tag} 作业目录缺 CHGCAR;差分电荷需三体系各自自洽 CHGCAR,'
+                                     '请先跑完三个静态作业。'}
+                paths[tag] = cp
+            out = (out_dir or '').strip() or os.path.dirname(paths['AB'])
+            os.makedirs(out, exist_ok=True)
+            out_path = os.path.join(out, 'CHGDIFF.vasp')
+            chg = self._chg()
+            res = chg.compute_chgdiff(paths['AB'], paths['A'], paths['B'], out_path)
+            profile = {}
+            try:
+                profile = chg.plane_averaged(out_path, 'z')
+            except Exception:                             # noqa: BLE001 面平均失败不挡主产物
+                profile = {}
+            return {'ok': True, 'out': res['out'], 'max': res['max'], 'min': res['min'],
+                    'n_grid': res['n_grid'], 'profile': profile, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'out': None, 'max': None, 'min': None, 'n_grid': 0,
+                    'profile': {}, 'error': str(e)}
+
+    # ── P0-3 VASPsol 隐式溶剂化预览(将写入的键 + 补丁编译 warning) ─────────────────
+    def vaspsol_preview(self, eb_k=78.4, enabled=True):
+        """VASPsol 隐式溶剂化预览:incar_builder.vaspsol_keys → 将写入的 INCAR 键 + 补丁编译 warning。
+
+        返回 {'ok','keys','incar_lines','warning','error'}。供②生成页「高级」区在勾选前后展示
+        (标准 VASP 无 VASPsol 会**静默**给真空结果的陷阱一并提醒,绝不假装已溶剂化)。
+        """
+        try:
+            ib = self._ib()
+            keys = ib.vaspsol_keys(bool(enabled), eb_k=float(eb_k))
+            return {'ok': True, 'keys': keys, 'incar_lines': self._incar_lines_from(keys),
+                    'warning': getattr(ib, 'VASPSOL_ADVISORY', ''), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'keys': {}, 'incar_lines': [], 'warning': '', 'error': str(e)}
 
     # ── ④结果分析页·任务解析(按 task_type 自动解析 + 出图) ──────────────────────
     @staticmethod

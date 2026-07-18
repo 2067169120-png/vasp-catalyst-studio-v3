@@ -291,3 +291,108 @@ def test_extrema_parse():
 def test_extrema_parse_empty():
     res = md.extrema_parse('no extrema here\n')
     assert res == {'minima': [], 'maxima': []}
+
+
+# ── run_script:吃现成 stdin 脚本 + outputs(P1-2 波函数四项补充分析接通) ────────────
+def test_run_script_collects_prefixed_products(tmp_path, monkeypatch):
+    wf = tmp_path / 'mol.fchk'
+    wf.write_text('fake wavefn', encoding='utf-8')
+    monkeypatch.setattr(md, 'probe',
+                        lambda exe=None: {'available': True, 'path': 'Multiwfn', 'detail': ''})
+    captured = {}
+
+    def fake_run(cmd, **kw):
+        captured['cmd'] = cmd
+        captured['input'] = kw.get('input')
+        for name in ('f_plus.cub', 'f_minus.cub'):
+            with open(os.path.join(kw['cwd'], name), 'wb') as f:
+                f.write(b'CUBE')
+
+        class P:
+            returncode = 0
+            stdout = b'Fukui done\n'
+        return P()
+
+    monkeypatch.setattr(md.subprocess, 'run', fake_run)
+    out = md.run_script(str(wf), '22\n1\n\n0\nq\n', ('f_plus.cub', 'f_minus.cub'),
+                        workdir=str(tmp_path))
+    assert out['ok']
+    names = sorted(os.path.basename(p) for p in out['outputs'])
+    assert names == ['extra_f_minus.cub', 'extra_f_plus.cub']    # 带 extra_ 前缀防同名覆盖
+    assert captured['cmd'][0] == 'Multiwfn'
+    assert captured['input'].decode('utf-8').startswith('22')     # 现成脚本原样喂入
+
+
+def test_run_script_no_outputs_ok_via_exit_code(tmp_path, monkeypatch):
+    wf = tmp_path / 'mol.wfn'
+    wf.write_text('x', encoding='utf-8')
+    monkeypatch.setattr(md, 'probe',
+                        lambda exe=None: {'available': True, 'path': 'Multiwfn', 'detail': ''})
+
+    def fake_run(cmd, **kw):
+        class P:
+            returncode = 0
+            stdout = b'ADCH charges printed\n'
+        return P()
+
+    monkeypatch.setattr(md.subprocess, 'run', fake_run)
+    out = md.run_script(str(wf), '7\n11\n1\ny\n0\nq\n', (), workdir=str(tmp_path))
+    assert out['ok'] and out['outputs'] == [] and 'ADCH' in out['stdout_tail']
+
+
+def test_run_script_degrades_without_multiwfn_returns_script(tmp_path, monkeypatch):
+    wf = tmp_path / 'mol.wfn'
+    wf.write_text('x', encoding='utf-8')
+    monkeypatch.setattr(md, 'probe',
+                        lambda exe=None: {'available': False, 'path': None, 'detail': '未找到 Multiwfn'})
+    out = md.run_script(str(wf), '5\n1\n', ('density.cub',), workdir=str(tmp_path))
+    assert not out['ok'] and out.get('script') == '5\n1\n'         # 缺 Multiwfn 回传脚本
+    assert '未找到 Multiwfn' in out['error']
+
+
+def test_run_script_rejects_bad_ext(tmp_path):
+    out = md.run_script(str(tmp_path / 'mol.txt'), '5\n1\n', ('density.cub',))
+    assert not out['ok'] and '不支持' in out['error'] and 'script' in out
+
+
+def test_run_script_empty_script_error(tmp_path):
+    out = md.run_script(str(tmp_path / 'mol.fchk'), '   \n', ())
+    assert not out['ok'] and '空' in out['error']
+
+
+def test_run_script_missing_file_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(md, 'probe',
+                        lambda exe=None: {'available': True, 'path': 'Multiwfn', 'detail': ''})
+    out = md.run_script(str(tmp_path / 'nope.fchk'), '5\n1\n', ('density.cub',))
+    assert not out['ok'] and '不存在' in out['error'] and out.get('script') == '5\n1\n'
+
+
+def test_run_script_reports_missing_products(tmp_path, monkeypatch):
+    wf = tmp_path / 'mol.molden'
+    wf.write_text('x', encoding='utf-8')
+    monkeypatch.setattr(md, 'probe',
+                        lambda exe=None: {'available': True, 'path': 'Multiwfn', 'detail': ''})
+
+    def fake_run(cmd, **kw):
+        class P:                                    # 什么都不产出
+            returncode = 0
+            stdout = b''
+        return P()
+
+    monkeypatch.setattr(md.subprocess, 'run', fake_run)
+    out = md.run_script(str(wf), '5\n1\n', ('density.cub',), workdir=str(tmp_path))
+    assert not out['ok'] and '未找到预期产物' in out['error']
+
+
+def test_run_script_subprocess_error_caught(tmp_path, monkeypatch):
+    wf = tmp_path / 'mol.wfx'
+    wf.write_text('x', encoding='utf-8')
+    monkeypatch.setattr(md, 'probe',
+                        lambda exe=None: {'available': True, 'path': 'Multiwfn', 'detail': ''})
+
+    def fake_run(cmd, **kw):
+        raise OSError('exec 失败')
+
+    monkeypatch.setattr(md.subprocess, 'run', fake_run)
+    out = md.run_script(str(wf), '5\n1\n', ('density.cub',), workdir=str(tmp_path))
+    assert not out['ok'] and '运行失败' in out['error'] and out['script'] == '5\n1\n'

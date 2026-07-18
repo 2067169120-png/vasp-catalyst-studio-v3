@@ -186,6 +186,14 @@
       if (btn) btn.disabled = false;
     }
   }
+  // 降级归因(P1-2):区分「引擎缺 run_script 方法」(现已修复)与「Multiwfn 未安装」(probe 失败)。
+  // 手动运行 stdin 脚本的提示只在真缺 Multiwfn 时显示;引擎缺方法只提示更新程序,不误导为未装 Multiwfn。
+  function engineMissing(res) {
+    return !!(res && res.error && /引擎待扩展|run_script/.test(res.error));
+  }
+  function showManualScript(res) {
+    return !!(res && res.script) && !engineMissing(res);
+  }
   function renderResults(results, experimental) {
     const box = $('wf-results');
     State.outputs = [];
@@ -205,18 +213,20 @@
         const mn = (res.extrema.minima || []).length, mx = (res.extrema.maxima || []).length;
         h += `<div class="sub">表面极值:极小 ${mn} 个 / 极大 ${mx} 个(见「可视化」查询极值)</div>`;
       }
-      if (res.script) {
-        h += '<div class="sub">Multiwfn 未就绪 — 可复制以下 stdin 脚本手动运行:</div>' +
+      if (showManualScript(res)) {
+        h += '<div class="sub">Multiwfn 未安装/未就绪(probe 失败)— 可复制以下 stdin 脚本手动运行:</div>' +
           `<textarea class="ipt wf-script" readonly rows="4"></textarea>`;
+      } else if (engineMissing(res)) {
+        h += '<div class="sub" style="color:var(--warn)">波函数引擎缺 run_script 方法(此版本应已接通;若仍出现请更新程序)</div>';
       }
       if (res.stdout_tail) h += `<pre class="mono wf-stdout"></pre>`;
       h += '</div>';
     });
     box.innerHTML = h;
-    // textContent 注入脚本/stdout(避免把脚本内容当 HTML)
+    // textContent 注入脚本/stdout(避免把脚本内容当 HTML);脚本仅在真缺 Multiwfn 时注入
     let si = 0, oi = 0;
     results.forEach(res => {
-      if (res.script) { const t = box.querySelectorAll('.wf-script')[si++]; if (t) t.value = res.script; }
+      if (showManualScript(res)) { const t = box.querySelectorAll('.wf-script')[si++]; if (t) t.value = res.script; }
       if (res.stdout_tail) { const p = box.querySelectorAll('.wf-stdout')[oi++]; if (p) p.textContent = res.stdout_tail; }
     });
     renderFromOutputs();

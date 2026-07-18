@@ -240,6 +240,10 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 #page-generate .tc-badges{display:flex;gap:5px;flex-wrap:wrap;margin-top:6px}
 #page-generate .tc-badge{font-family:var(--mono);font-size:9.5px;padding:1px 6px;border-radius:4px;background:var(--queue-bg);color:var(--muted)}
 #page-generate .tc-badge.fig{background:var(--accent-soft);color:var(--accent-dark)}
+/* P2 任务性质徽标:作业生成 / 结果计算器 / INCAR 顾问 */
+#page-generate .tc-badge-gen{background:var(--accent-soft);color:var(--accent-dark)}
+#page-generate .tc-badge-calc{background:var(--ok-bg,var(--queue-bg));color:var(--ok,var(--muted))}
+#page-generate .tc-badge-advisor{background:var(--queue-bg);color:var(--warn)}
 #page-generate .tc-form{margin-top:12px;border-top:1px dashed var(--rule);padding-top:12px}
 #page-generate .tc-form[hidden]{display:none}
 .urow{display:flex;gap:10px;font-size:11.5px;padding:3px 0;font-family:var(--mono)}
@@ -739,6 +743,35 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       </div>
     </div>
 
+    <!-- NEB 过渡态面板:始态/末态目录 + image 数 → 生成标准 NEB 目录树(P0-1 接通) -->
+    <div class="card acc" data-acc="generate:neb" data-sum="始态 + 末态 → CI-NEB 目录树" data-acc-default="0" id="neb-card" style="padding:12px;margin-bottom:10px">
+      <div class="gen-h acc-h">NEB 过渡态(始末态已知)
+        <span class="sub" style="font-weight:400">选已弛豫的初/末态作业目录 + 中间 image 数 → 线性插值 + 标准 VASP NEB 目录树(00/01../N+1),根 INCAR 只补不改补齐 IMAGES/SPRING</span>
+      </div>
+      <div class="gen-fld">
+        <span class="gen-lbl">始态作业目录(已弛豫初态;读 CONTCAR + INCAR)</span>
+        <div class="gen-inrow">
+          <input id="neb-start" class="ipt" autocomplete="off" placeholder="初态已弛豫作业目录">
+          <button class="btn" id="neb-start-btn" data-i18n="common.browse">浏览</button>
+        </div>
+      </div>
+      <div class="gen-fld">
+        <span class="gen-lbl">末态作业目录(已弛豫末态;读 CONTCAR)</span>
+        <div class="gen-inrow">
+          <input id="neb-end" class="ipt" autocomplete="off" placeholder="末态已弛豫作业目录">
+          <button class="btn" id="neb-end-btn" data-i18n="common.browse">浏览</button>
+        </div>
+      </div>
+      <div class="gen-fld" style="margin-bottom:0">
+        <span class="gen-lbl">中间 image 数(不含两端)</span>
+        <div class="gen-inrow">
+          <input id="neb-nimages" class="ipt" inputmode="numeric" value="5" style="flex:0 0 120px">
+          <button class="btn primary" id="neb-gen-btn">生成 NEB</button>
+        </div>
+      </div>
+      <div class="ta-out" id="neb-out" style="margin-top:8px"></div>
+    </div>
+
     <div class="card acc" data-acc="generate:input" data-sum="POSCAR / INCAR / 输出 / 赝势库" data-acc-default="0" style="padding:12px;margin-bottom:10px">
       <div class="gen-h acc-h">输入文件</div>
 
@@ -775,13 +808,24 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
         </div>
       </div>
 
-      <div class="gen-fld" style="margin-bottom:0">
+      <div class="gen-fld">
         <span class="gen-lbl">计算类型(决定 KPOINTS 网格)</span>
         <select id="gen-calc" class="ipt">
           <option value="slab">slab — 表面/吸附(法向仅 1 个 k 点)</option>
           <option value="bulk">bulk — 体相(三维 k 网格)</option>
           <option value="molecule">molecule — 分子/团簇(Gamma 单点)</option>
         </select>
+      </div>
+
+      <!-- 高级:隐式溶剂化(VASPsol)。默认关;勾选后 gen_run 追加 LSOL/EB_K 并显示补丁编译 warning -->
+      <div class="gen-fld" style="margin-bottom:0">
+        <span class="gen-lbl">高级</span>
+        <label class="gen-lbl" style="display:flex;gap:6px;align-items:center;font-weight:400">
+          <input type="checkbox" id="gen-solvation"> 隐式溶剂化(VASPsol,LSOL/EB_K)
+          <span class="sub" style="margin-left:6px">介电常数 EB_K</span>
+          <input id="gen-solvation-ebk" class="ipt" inputmode="decimal" value="78.4" title="相对介电常数(默认 78.4 = 300 K 水;乙腈 37.5、乙醇 24.9)" style="flex:0 0 110px">
+        </label>
+        <div class="sub" id="gen-solvation-note" style="margin-top:4px;color:var(--muted)" hidden></div>
       </div>
     </div>
 
@@ -1098,6 +1142,69 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
         </div>
       </div>
       <div class="ta-out" id="ta-out"></div>
+    </div>
+
+    <!-- 形成能 / 结合能计算器(P0-2):选 SAC + 基底 + 金属原子能量 → Eb/Ef + 稳定性 σ -->
+    <div class="card" data-ana="taskana" id="fb-card" style="padding:12px;margin-bottom:10px">
+      <div class="pj-h">形成能 / 结合能计算器(Eb / Ef + 稳定性 σ)</div>
+      <div class="sub" style="color:var(--muted);margin-bottom:8px;line-height:1.6">
+        Eb=E(SAC)−E(基底)−E(金属原子);σ=−Eb/E_cohesive(&gt;1 判抗团聚稳定)。缺输入只提示、绝不编造。</div>
+      <div class="pj-fld">
+        <span class="pj-lbl">SAC 作业目录(读 OSZICAR 能量 + 组成)</span>
+        <div class="pj-inrow">
+          <input id="fb-sac" class="ipt" autocomplete="off" placeholder="单原子催化剂作业目录">
+          <button class="btn" id="fb-sac-btn" data-i18n="common.browse">浏览</button>
+        </div>
+      </div>
+      <div class="pj-fld">
+        <span class="pj-lbl">基底作业目录(含空位、未嵌金属;Eb/Ef 相对它)</span>
+        <div class="pj-inrow">
+          <input id="fb-sub" class="ipt" autocomplete="off" placeholder="基底(缺陷)作业目录">
+          <button class="btn" id="fb-sub-btn" data-i18n="common.browse">浏览</button>
+        </div>
+      </div>
+      <div class="pj-fld">
+        <span class="pj-lbl">金属原子能量(结合能用;格式 Fe=-3.2,逗号分隔多元素)</span>
+        <input id="fb-atom" class="ipt" autocomplete="off" placeholder="如 Fe=-3.20">
+      </div>
+      <div class="pj-fld">
+        <span class="pj-lbl">化学势 μ(形成能用,可空;格式 Fe=-4.0, N=-8.3)</span>
+        <div class="pj-inrow">
+          <input id="fb-mu" class="ipt" autocomplete="off" placeholder="如 Fe=-4.0, C=-9.2">
+          <button class="btn primary" id="fb-run">算 Eb / Ef / σ</button>
+        </div>
+      </div>
+      <div class="ta-out" id="fb-out"></div>
+    </div>
+
+    <!-- 差分电荷合成(P0-4):选 AB/A/B 三静态作业 → Δρ=ρ(AB)−ρ(A)−ρ(B) + 面平均 charge_profile -->
+    <div class="card" data-ana="taskana" id="cd-card" style="padding:12px;margin-bottom:10px">
+      <div class="pj-h">差分电荷合成 Δρ(选 AB / A / B 三静态作业 → CHGDIFF.vasp + 面平均)</div>
+      <div class="sub" style="color:var(--muted);margin-bottom:8px;line-height:1.6">
+        三体系须同晶胞、同网格(NGXF/NGYF/NGZF)、原子数守恒;不一致引擎拒算并说明,绝不静默错位相减。</div>
+      <div class="pj-fld">
+        <span class="pj-lbl">AB 作业目录(复合体系,全原子)</span>
+        <div class="pj-inrow">
+          <input id="cd-ab" class="ipt" autocomplete="off" placeholder="AB 静态作业目录(含 CHGCAR)">
+          <button class="btn" id="cd-ab-btn" data-i18n="common.browse">浏览</button>
+        </div>
+      </div>
+      <div class="pj-fld">
+        <span class="pj-lbl">A 作业目录(仅表面,冻结几何)</span>
+        <div class="pj-inrow">
+          <input id="cd-a" class="ipt" autocomplete="off" placeholder="A 静态作业目录(含 CHGCAR)">
+          <button class="btn" id="cd-a-btn" data-i18n="common.browse">浏览</button>
+        </div>
+      </div>
+      <div class="pj-fld">
+        <span class="pj-lbl">B 作业目录(仅吸附质,冻结几何)</span>
+        <div class="pj-inrow">
+          <input id="cd-b" class="ipt" autocomplete="off" placeholder="B 静态作业目录(含 CHGCAR)">
+          <button class="btn" id="cd-b-btn" data-i18n="common.browse">浏览</button>
+          <button class="btn primary" id="cd-run">合成 Δρ</button>
+        </div>
+      </div>
+      <div class="ta-out" id="cd-out"></div>
     </div>
 
     <!-- 论文级出图(原生 matplotlib 引擎) -->

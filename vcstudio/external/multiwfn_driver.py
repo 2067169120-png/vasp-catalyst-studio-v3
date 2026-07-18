@@ -404,3 +404,88 @@ def run(wavefn_file: str, analysis_key: str, *, exe: str | None = None,
         err = '' if ok else f'Multiwfn 退出码 {code},未见分析结果'
     return {'ok': ok, 'outputs': collected, 'stdout_tail': tail,
             'elapsed_s': elapsed, 'error': err}
+
+
+def run_script(wavefn_file: str, stdin_script: str, outputs=(), *,
+               exe: str | None = None, workdir: str | None = None,
+               timeout: int = 1800) -> dict:
+    """跑一段**现成 stdin 脚本**(逻辑同 run,但吃调用方给的菜单文本 + outputs 列表)。
+
+    面向 api 层补充分析(_EXTRA_ANALYSES:ELF-LOL/ADCH/性质汇总/Fukui-CDFT)——这些的
+    stdin 脚本在 api 侧生成,引擎只需照喂并按 outputs 收产物。返回同 run():
+    ``{'ok','outputs','stdout_tail','elapsed_s','script'?,'error'}``。
+
+    - wavefn_file:.fchk/.wfn/.wfx/.molden 等;stdin_script:已构建好的 Multiwfn 交互输入文本;
+      outputs:期望产物默认文件名序列(空 → 看退出码/stdout 判成功,同无文件产物分析)。
+    - Multiwfn 缺失 / 格式不支持 / 文件不存在 → ok=False 且把 'script' 回传(用户可手动
+      ``Multiwfn xxx.wfn < script.txt``);全程超时保护,绝不抛。
+    - 收产物时带 'extra_' 前缀重命名(避免 func1.cub 等默认名在同目录被不同分析互相覆盖)。
+    """
+    script = str(stdin_script or '')
+    outs = tuple(outputs or ())
+    if not script.strip():
+        return {'ok': False, 'outputs': [], 'stdout_tail': '', 'elapsed_s': 0.0,
+                'error': 'stdin 脚本为空,无可执行的 Multiwfn 菜单流'}
+    # 1) 波函数格式校验(脚本已现成,先校验输入格式)
+    ext = os.path.splitext(str(wavefn_file))[1].lower()
+    if ext not in _WAVEFN_EXTS:
+        return {'ok': False, 'outputs': [], 'stdout_tail': '', 'elapsed_s': 0.0,
+                'script': script,
+                'error': f'不支持的波函数格式 {ext!r};支持:{", ".join(_WAVEFN_EXTS)}'}
+    # 2) 探测 Multiwfn;缺失 → 降级并回传脚本文本(供用户手动运行)
+    info = probe(exe)
+    if not info['available']:
+        return {'ok': False, 'outputs': [], 'stdout_tail': '', 'elapsed_s': 0.0,
+                'script': script,
+                'error': (info['detail'] + ' 下面 script 字段是本分析的 Multiwfn 交互输入,'
+                          f'可手动执行:Multiwfn {os.path.basename(str(wavefn_file))} < script.txt')}
+    # 3) 输入文件存在性检查(Multiwfn 就绪后才检查,以便前面能优先回传脚本)
+    if not os.path.isfile(wavefn_file):
+        return {'ok': False, 'outputs': [], 'stdout_tail': '', 'elapsed_s': 0.0,
+                'script': script, 'error': f'波函数文件不存在:{wavefn_file}'}
+    workdir = os.path.abspath(workdir) if workdir else os.path.dirname(os.path.abspath(str(wavefn_file)))
+    os.makedirs(workdir, exist_ok=True)
+    # 清理上一轮带前缀的历史产物(防收集到陈旧 cube 误判成功;不动原始默认名文件)
+    for fname in outs:
+        stale = os.path.join(workdir, f'extra_{fname}')
+        if os.path.isfile(stale):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
+    wavefn_abs = os.path.abspath(str(wavefn_file))
+    t0 = time.time()
+    try:
+        proc = subprocess.run([info['path'], wavefn_abs],
+                              input=script.encode('utf-8'),
+                              cwd=workdir, timeout=timeout,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        code = getattr(proc, 'returncode', 1)
+        raw = getattr(proc, 'stdout', b'') or b''
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {'ok': False, 'outputs': [], 'stdout_tail': '', 'script': script,
+                'elapsed_s': round(time.time() - t0, 2),
+                'error': f'Multiwfn 运行失败:{e}'}
+    elapsed = round(time.time() - t0, 2)
+    stdout_text = raw.decode('utf-8', errors='replace')
+    tail = _tail(stdout_text)
+    # 收集产物:期望文件 → 带 extra_ 前缀重命名
+    collected: list = []
+    for fname in outs:
+        src = os.path.join(workdir, fname)
+        if os.path.isfile(src):
+            dst = os.path.join(workdir, f'extra_{fname}')
+            try:
+                os.replace(src, dst)
+                collected.append(dst)
+            except OSError:
+                collected.append(src)
+    # 成功判定:有文件产物的看产物;无文件产物的(如 ADCH/性质汇总)看退出码
+    if outs:
+        ok = bool(collected)
+        err = '' if ok else 'Multiwfn 结束但未找到预期产物(版本导出名可能不同,请查 workdir)'
+    else:
+        ok = code == 0
+        err = '' if ok else f'Multiwfn 退出码 {code},未见分析结果'
+    return {'ok': ok, 'outputs': collected, 'stdout_tail': tail,
+            'elapsed_s': elapsed, 'error': err}
