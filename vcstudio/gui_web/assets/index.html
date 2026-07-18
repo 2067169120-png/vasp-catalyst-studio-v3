@@ -44,7 +44,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 #page-jobs tr.grp-head .grp-de{padding:3px 9px;font-size:11px;margin-left:10px}
 #page-jobs .role-tag{font-family:var(--mono);font-size:10px;color:var(--muted);background:var(--queue-bg);padding:1px 6px;border-radius:4px;margin-left:4px;vertical-align:1px}
 /* 仪表盘首页:大数字卡 + 最近活动 + 快捷入口 + 待办;样式随页内联 */
-#page-dashboard .db-nums{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:14px}
+#page-dashboard .db-nums{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:10px}
 #page-dashboard .db-num{background:var(--surface);border:1px solid var(--rule);border-radius:6px;padding:14px 16px;cursor:pointer}
 #page-dashboard .db-num:hover{border-color:var(--accent)}
 #page-dashboard .db-num b{display:block;font-family:var(--mono);font-size:26px;line-height:1.25;font-variant-numeric:tabular-nums}
@@ -95,7 +95,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 @media (max-width:760px){.gen-2col{grid-template-columns:1fr}}
 
 /* ①分子建模分区(三卡) */
-.molzone-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;margin-bottom:14px}
+.molzone-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;margin-bottom:10px}
 @media (max-width:600px){.molzone-grid{grid-template-columns:1fr}}
 .molzone-card{display:flex;flex-direction:column}
 .mol-svgbox{border:1px solid var(--rule);border-radius:6px;background:var(--surface);min-height:150px;
@@ -339,11 +339,11 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     <div class="db-nums" id="db-nums"></div>
 
     <!-- 卡片:项目管线(每项目一行站点进度) -->
-    <div class="card" id="db-pipeline-card" style="padding:16px;margin-bottom:14px">
-      <div class="db-h">项目管线 <span class="sub" style="font-weight:400">生成 → 提交 → 监控 → 恢复 → 分析 → 报告</span></div>
+    <div class="card acc" data-acc="dashboard:pipeline" data-sum="生成 → 提交 → 分析 → 报告" id="db-pipeline-card" style="padding:12px;margin-bottom:10px">
+      <div class="db-h acc-h">项目管线 <span class="sub" style="font-weight:400">生成 → 提交 → 监控 → 恢复 → 分析 → 报告</span></div>
       <div id="db-pipeline"><div class="pl-empty">加载中…</div></div>
       <!-- 批次(campaign)区块:引擎可用且有批次才显示,否则隐藏 -->
-      <div id="db-campaigns" hidden style="margin-top:14px;border-top:1px solid var(--rule);padding-top:12px">
+      <div id="db-campaigns" hidden style="margin-top:10px;border-top:1px solid var(--rule);padding-top:12px">
         <div class="db-h" style="border:none;padding:0;margin-bottom:8px">批次(campaign)
           <span class="sub" style="font-weight:400">已完成 / 已验证 / 已采纳 · 机时(预估 / 上限)</span></div>
         <div id="db-campaign-list"></div>
@@ -352,24 +352,24 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 
     <div class="db-grid">
       <!-- 卡片 2:最近活动 -->
-      <div class="card" style="padding:16px">
+      <div class="card" style="padding:12px">
         <div class="db-h">最近活动</div>
         <div id="db-recent"><div class="db-empty">加载中…</div></div>
       </div>
 
       <div>
         <!-- 卡片 3:快捷入口 -->
-        <div class="card" style="padding:16px;margin-bottom:14px">
+        <div class="card" style="padding:12px;margin-bottom:10px">
           <div class="db-h">快捷入口</div>
           <div class="db-quick">
             <button class="btn db-qbtn" id="db-go-generate"><b>生成四件套</b><span>POSCAR + INCAR 自动补全 POTCAR / KPOINTS</span></button>
-            <button class="btn db-qbtn" id="db-go-project"><b>新建吸附能项目</b><span>清洁表面 + 构型族 + 气相参考,一次生成整组</span></button>
+            <button class="btn db-qbtn" id="db-go-project"><b>结果分析 / 批量项目</b><span>任务解析 · 吸附能 ΔE 批量 · 出图成稿</span></button>
             <button class="btn db-qbtn" id="db-go-queue"><b>集群队列</b><span>查看在队作业,认领终端手动提交的作业</span></button>
           </div>
         </div>
 
         <!-- 卡片 4:待办 -->
-        <div class="card" style="padding:16px">
+        <div class="card" style="padding:12px">
           <div class="db-h">待办</div>
           <div id="db-todo"><div class="db-empty">加载中…</div></div>
         </div>
@@ -377,8 +377,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 卡片:管线动态 feed(自动驾驶事件,最近 20 条) -->
-    <div class="card" style="padding:16px;margin-top:14px">
-      <div class="db-h">管线动态 <span class="sub" style="font-weight:400">自动驾驶最近事件</span></div>
+    <div class="card acc" data-acc="dashboard:feed" data-sum="自动驾驶最近事件" data-acc-default="0" style="padding:12px;margin-top:10px">
+      <div class="db-h acc-h">管线动态 <span class="sub" style="font-weight:400">自动驾驶最近事件</span></div>
       <div id="db-feed" class="feed"><div class="db-empty">自动驾驶开启后,这里显示每轮同步/续算/拉回/报告事件</div></div>
     </div>
   </section>
@@ -389,12 +389,22 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <span class="stats" data-i18n="structure.subtitle">加载 / 编辑结构 · 固定底层 · 真空检查 · SAC 批量建模 · 多自旋家族</span>
     </div>
 
+    <!-- 结构来源:分段控件三选一(周期性建模 | 分子建模 | 打开文件),编辑器为共享画布常显 -->
+    <div class="seg-bar">
+      <span class="seg-lbl" data-i18n="structure.source.label">结构来源</span>
+      <div class="seg" data-seg="data-src" data-seg-store="structure.src">
+        <button type="button" data-seg-val="periodic" data-i18n="structure.source.periodic">周期性建模</button>
+        <button type="button" data-seg-val="molecular" data-i18n="structure.source.molecular">分子建模</button>
+        <button type="button" data-seg-val="file" data-i18n="structure.source.file">打开文件</button>
+      </div>
+    </div>
+
     <!-- 分子建模分区(图片识别 → SMILES → 3D 建模 → 外部编辑器往返;分子化学 / 全功能场景显示) -->
-    <div data-mol-scene>
+    <div data-mol-scene data-src="molecular">
     <div class="molzone-grid">
 
       <!-- 卡1:图片识别 OCSR -->
-      <div class="card molzone-card" style="padding:16px">
+      <div class="card molzone-card" style="padding:12px">
         <div class="gen-h" data-i18n="mol.ocsr.title">图片识别(OCSR → SMILES)</div>
         <div class="warn-banner" id="mol-ocsr-banner" hidden></div>
         <div class="gen-fld">
@@ -425,7 +435,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       </div>
 
       <!-- 卡2:分子 3D 建模 -->
-      <div class="card molzone-card" style="padding:16px">
+      <div class="card molzone-card" style="padding:12px">
         <div class="gen-h" data-i18n="mol.build3d.title">分子 3D 建模(SMILES → 3D)</div>
         <div class="gen-fld">
           <span class="gen-lbl" data-i18n="mol.build3d.smiles">SMILES</span>
@@ -460,7 +470,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       </div>
 
       <!-- 卡4:溶剂化复合物(核分子 + 溶剂配比 → 显式溶剂盒) -->
-      <div class="card molzone-card solv-card" style="padding:16px">
+      <div class="card molzone-card solv-card" style="padding:12px">
         <div class="gen-h" data-i18n="mol.solv.title">溶剂化复合物(核 + 显式溶剂盒)</div>
         <div class="gen-fld">
           <span class="gen-lbl" data-i18n="mol.solv.core">核分子(多硫化锂 / S8 等)</span>
@@ -484,7 +494,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       </div>
 
       <!-- 卡3:外部编辑器往返 -->
-      <div class="card molzone-card" style="padding:16px">
+      <div class="card molzone-card" style="padding:12px">
         <div class="gen-h" data-i18n="mol.ext.title">外部编辑器(GaussView / Avogadro)</div>
         <div class="gen-fld">
           <span class="gen-lbl" data-i18n="mol.ext.editor">编辑器</span>
@@ -516,8 +526,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 结构查看 / 编辑器 -->
-    <div class="card" style="padding:16px;margin-bottom:14px">
-      <div class="gen-h" data-i18n="structure.editor.title">结构查看 / 编辑器</div>
+    <div class="card acc" data-acc="structure:editor" data-sum="加载 / 编辑结构 · 固定底层 · 真空检查" style="padding:12px;margin-bottom:10px">
+      <div class="gen-h acc-h" data-i18n="structure.editor.title">结构查看 / 编辑器</div>
       <div class="ed-toolbar">
         <button class="btn" id="ed-load" data-i18n="structure.editor.load">加载 POSCAR / CIF</button>
         <button class="btn" id="ed-send" title="把当前结构路径填到 ② 生成输入" data-i18n="structure.editor.send">送去生成输入</button>
@@ -583,14 +593,14 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 分子库浏览 -->
-    <div class="card" style="padding:16px;margin-bottom:14px">
-      <div class="gen-h" data-i18n="structure.molecules.title">分子库(内置吸附质 / 参考分子)</div>
+    <div class="card acc" data-acc="structure:mollib" data-sum="内置吸附质 / 参考分子" data-acc-default="0" style="padding:12px;margin-bottom:10px">
+      <div class="gen-h acc-h" data-i18n="structure.molecules.title">分子库(内置吸附质 / 参考分子)</div>
       <div class="mol-grid" id="mol-grid"><span class="sub">加载中…</span></div>
     </div>
 
     <!-- SAC 批量建模:金属 × 模板 × 吸附质 × 位点 × 取向 候选矩阵 -->
-    <div class="card" id="sac-card" data-scene="cards.generate.sac_matrix" style="padding:16px;margin:14px 0">
-      <div class="gen-h">SAC 批量建模(周期表换金属 × 配位模板 × 吸附质候选矩阵)</div>
+    <div class="card acc" data-acc="structure:sac" data-sum="金属 × 模板 × 吸附质候选矩阵" data-acc-default="0" data-src="periodic" id="sac-card" data-scene="cards.generate.sac_matrix" style="padding:12px;margin:10px 0">
+      <div class="gen-h acc-h">SAC 批量建模(周期表换金属 × 配位模板 × 吸附质候选矩阵)</div>
       <!-- 计算活动模板:选模板 → instantiate 全链 DAG -->
       <div class="gen-fld">
         <span class="gen-lbl" data-i18n="camp.tpl">计算活动模板(选模板生成全链任务 DAG:relax→静态→频率→汇总)</span>
@@ -651,8 +661,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 多自旋并跑:NM/LS/HS 家族(防自旋态选错的静默错数) -->
-    <div class="card" id="spin-card" style="padding:16px;margin-bottom:14px">
-      <div class="gen-h">多自旋并跑(NM / LS / HS 家族,防自旋态选错的 0.1–0.5 eV 静默错数)</div>
+    <div class="card acc" data-acc="structure:spin" data-sum="NM / LS / HS 家族并跑" data-acc-default="0" data-src="periodic" id="spin-card" style="padding:12px;margin-bottom:10px">
+      <div class="gen-h acc-h">多自旋并跑(NM / LS / HS 家族,防自旋态选错的 0.1–0.5 eV 静默错数)</div>
       <div class="gen-fld">
         <span class="gen-lbl">结构 POSCAR</span>
         <div class="gen-inrow">
@@ -688,9 +698,16 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <span class="stats">POSCAR + INCAR → 自动补全四件套(POSCAR / INCAR / POTCAR / KPOINTS)</span>
     </div>
 
-    <!-- 计算类型目录:五分类 23 项卡片网格 → 参数表单 → 派生作业 -->
-    <div class="card" id="taskcat-card" style="padding:16px;margin-bottom:14px">
-      <div class="gen-h" data-i18n="taskcat.title">计算类型目录 <span class="sub" style="font-weight:400" data-i18n="taskcat.sub">选类型 → 填参数 → 从已完成作业派生下一步作业</span></div>
+    <!-- 引擎(VASP 优先):置顶醒目;默认 VASP,其余引擎标实验性 -->
+    <div class="ana-bar engine-top">
+      <span class="ana-lbl" data-i18n="generate.engine.label">计算引擎</span>
+      <select id="engine-select" class="ipt"></select>
+      <span class="engine-note" id="engine-note" data-i18n="generate.engine.note">VASP:用下方计算类型目录与四件套;其余引擎走文件级适配(实验性)</span>
+    </div>
+
+    <!-- 计算类型目录:VASP 23 类分类 optgroup 下拉 → 参数表单 → 派生作业 -->
+    <div class="card acc" data-acc="generate:taskcat" data-sum="VASP 23 类计算 → 参数 → 派生" id="taskcat-card" style="padding:12px;margin-bottom:10px">
+      <div class="gen-h acc-h" data-i18n="taskcat.title">计算类型目录 <span class="sub" style="font-weight:400" data-i18n="taskcat.sub">选类型 → 填参数 → 从已完成作业派生下一步作业</span></div>
       <div class="tc-cats" id="tc-cats"></div>
       <div class="tc-grid" id="tc-grid"><span class="sub" data-i18n="taskcat.loading">加载计算类型目录…</span></div>
       <div class="tc-form" id="tc-form" hidden>
@@ -722,8 +739,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       </div>
     </div>
 
-    <div class="card" style="padding:16px;margin-bottom:14px">
-      <div class="gen-h">输入文件</div>
+    <div class="card acc" data-acc="generate:input" data-sum="POSCAR / INCAR / 输出 / 赝势库" data-acc-default="0" style="padding:12px;margin-bottom:10px">
+      <div class="gen-h acc-h">输入文件</div>
 
       <div class="gen-fld">
         <span class="gen-lbl">POSCAR 文件</span>
@@ -768,8 +785,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       </div>
     </div>
 
-    <div class="card" style="padding:16px;margin-bottom:14px">
-      <div class="gen-h">解析预览 <span class="sub" style="font-weight:400" data-i18n="generate.preview.editable">可直接编辑;可保存到文件</span></div>
+    <div class="card acc" data-acc="generate:preview" data-sum="四件套解析预览,可编辑保存" data-acc-default="0" style="padding:12px;margin-bottom:10px">
+      <div class="gen-h acc-h">解析预览 <span class="sub" style="font-weight:400" data-i18n="generate.preview.editable">可直接编辑;可保存到文件</span></div>
       <div class="gen-fld">
         <span class="gen-lbl" data-i18n="generate.extra_kw">自定义 INCAR 关键词(每行一条,如 LREAL = Auto;生成时追加到 INCAR)</span>
         <textarea id="gen-extra-kw" class="ipt" rows="2" spellcheck="false" placeholder="LREAL = Auto&#10;NCORE = 4"></textarea>
@@ -785,13 +802,10 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 计算引擎选择器(VASP 主 + CP2K/Gaussian/CASTEP 文件级适配,实验性) -->
-    <div class="card" id="engine-card" style="padding:16px;margin:14px 0">
-      <div class="gen-h">计算引擎 <span class="exp-badge">实验性</span>
-        <span class="sub" style="font-weight:400">VASP 为主引擎;其余为文件级适配(生成输入 + 解析输出),软件本体用户自备</span></div>
-      <div class="gen-fld">
-        <span class="gen-lbl">引擎(选 VASP 用上方四件套;选其它走简化参数表单)</span>
-        <div class="chips" id="engine-chips"></div>
-      </div>
+    <div class="card acc" data-acc="generate:engine" data-sum="VASP 主引擎;其余引擎实验性" data-acc-default="0" id="engine-card" style="padding:12px;margin:10px 0">
+      <div class="gen-h acc-h">引擎参数 <span class="exp-badge">非 VASP · 实验性</span>
+        <span class="sub" style="font-weight:400">引擎在页面顶部「计算引擎」下拉选择;VASP 走四件套,CP2K / Gaussian / CASTEP 在此填简化参数(生成输入 + 解析输出,软件本体用户自备)</span></div>
+      <div class="chips" id="engine-chips" hidden></div>
       <div class="warn-banner" id="engine-nonequiv" hidden></div>
       <div id="engine-form" hidden>
         <div class="gen-fld">
@@ -962,12 +976,25 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 
   <section class="page" data-page="project" id="page-project" hidden>
     <div class="pagebar">
-      <h1 data-i18n="project.title">吸附能项目</h1>
-      <span class="stats">清洁表面 + 构型族 +(可选)气相参考 → 批量生成;成员全部 DONE 后算 ΔE</span>
+      <h1 data-i18n="project.title">结果分析</h1>
+      <span class="stats" data-i18n="project.subtitle">任意 DFT 计算的结果解析与出图 · 吸附能只是诸多计算类型之一</span>
+    </div>
+
+    <!-- 分析类型:选中只显示对应分区(去"吸附能中心主义") -->
+    <div class="ana-bar">
+      <span class="ana-lbl" data-i18n="project.ana.label">分析类型</span>
+      <select id="analysis-type" data-switch="data-ana" data-switch-store="project.ana">
+        <option value="taskana" data-i18n="project.ana.taskana">任务解析(能带 / EOS / 功函数 / 收敛…)</option>
+        <option value="adsorption" data-i18n="project.ana.adsorption">吸附能项目</option>
+        <option value="spin" data-i18n="project.ana.spin">自旋态对比</option>
+        <option value="figures" data-i18n="project.ana.figures">结果出图 / 多项目对照</option>
+        <option value="draft" data-i18n="project.ana.draft">一键成稿包</option>
+      </select>
+      <span class="ana-note" data-i18n="project.ana.note">切换分析类型即切换下方分区</span>
     </div>
 
     <!-- 新建项目 -->
-    <div class="card" style="padding:16px;margin-bottom:14px">
+    <div class="card" data-ana="adsorption" style="padding:12px;margin-bottom:10px">
       <div class="pj-h">新建吸附能项目(一次生成整组作业并登记台账)</div>
 
       <div class="pj-fld">
@@ -1018,13 +1045,13 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
         </div>
       </div>
 
-      <div class="actions" style="margin-top:14px">
+      <div class="actions" style="margin-top:10px">
         <button class="btn primary" id="pj-create" data-i18n="project.create">批量生成</button>
       </div>
     </div>
 
     <!-- 已有项目 -->
-    <div class="card" style="padding:16px;margin-bottom:14px">
+    <div class="card" data-ana="adsorption" style="padding:12px;margin-bottom:10px">
       <div class="pj-h">已有项目 ΔE 汇总(成员全部 DONE 才给数)</div>
       <div class="pj-inrow" style="margin-bottom:12px">
         <select id="pj-select" class="ipt" style="flex:1"></select>
@@ -1039,7 +1066,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 任务解析:选作业 → 按 task_type 自动解析 + 出图 -->
-    <div class="card" id="taskana-card" style="padding:16px;margin-bottom:14px">
+    <div class="card" data-ana="taskana spin" id="taskana-card" style="padding:12px;margin-bottom:10px">
       <div class="pj-h" data-i18n="taskana.title">任务解析(收敛曲线 / EOS 拟合 / 能带带隙 / 功函数)</div>
       <div class="pj-fld">
         <span class="pj-lbl" data-i18n="taskana.dir">作业目录(或收敛/EOS 系列根目录)</span>
@@ -1074,7 +1101,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 论文级出图(原生 matplotlib 引擎) -->
-    <div class="card" style="padding:16px;margin-bottom:14px">
+    <div class="card" data-ana="figures" style="padding:12px;margin-bottom:10px">
       <div class="pj-h">论文级出图(原生引擎,无需 Origin / POV-Ray)</div>
 
       <div class="pj-lbl" style="margin-bottom:6px">当前项目(上方下拉所选):</div>
@@ -1090,7 +1117,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
         <button class="btn primary" id="pj-figs">生成所选图</button>
       </div>
 
-      <div class="pj-lbl" style="margin:14px 0 6px">多项目对比(勾选 ≥2 个项目;火山图需 ≥3 组 + 分子库):</div>
+      <div class="pj-lbl" style="margin:10px 0 6px">多项目对比(勾选 ≥2 个项目;火山图需 ≥3 组 + 分子库):</div>
       <div id="fig-projlist" class="pj-figprojs">(先点上方「刷新」载入项目)</div>
       <div class="pj-figrow" style="margin-top:8px">
         <label><input type="checkbox" id="fig-heatmap" checked> 吸附能热图</label>
@@ -1101,7 +1128,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 一键成稿包(Draft-Ready 收尾流水线) -->
-    <div class="card" style="padding:16px;margin-bottom:14px">
+    <div class="card" data-ana="draft" style="padding:12px;margin-bottom:10px">
       <div class="pj-h" data-i18n="project.draft.title">一键成稿包(SI 数据包 + 三线表 + 口径稽核 + 双语方法学)</div>
       <div class="sub" style="color:var(--muted);margin-bottom:10px;line-height:1.6">
         只组织磁盘上真实数据,绝不生成数值;缺项以「待确认」标注。稽核不过仍产全套工件,但会醒目提示进稿前须核对。</div>
@@ -1129,7 +1156,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 
     <!-- tab1:外部工具路径 + 检测 -->
     <div class="wf-pane" data-wfpane="tools">
-      <div class="card" style="padding:16px">
+      <div class="card" style="padding:12px">
         <div class="gen-h" data-i18n="wavefn.tools.title">外部工具路径(检测后记忆到配置)</div>
         <div class="wf-tool-row" data-tool="multiwfn">
           <span class="wf-tool-name">Multiwfn</span>
@@ -1164,7 +1191,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 
     <!-- tab2:输入与分析项 -->
     <div class="wf-pane" data-wfpane="analyze" hidden>
-      <div class="card" style="padding:16px">
+      <div class="card" style="padding:12px">
         <div class="gen-h" data-i18n="wavefn.analyze.title">波函数文件与分析项</div>
         <div class="gen-fld">
           <span class="gen-lbl" data-i18n="wavefn.analyze.file">波函数文件(.fchk / .wfn / .wfx / .molden)</span>
@@ -1215,7 +1242,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 
     <!-- tab3:可视化 -->
     <div class="wf-pane" data-wfpane="visual" hidden>
-      <div class="card" style="padding:16px">
+      <div class="card" style="padding:12px">
         <div class="gen-h" data-i18n="wavefn.visual.title">可视化渲染(VMD Tachyon 高清)</div>
         <div class="gen-fld">
           <span class="gen-lbl" data-i18n="wavefn.visual.file">数据文件(.cub / .cube / .xyz / .pdb;可从分析产物带入)</span>
@@ -1256,7 +1283,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       </div>
 
       <!-- Fukui / CDFT 四描述符 + ELF-LOL 联动 -->
-      <div class="card" style="padding:16px;margin-top:12px">
+      <div class="card" style="padding:12px;margin-top:12px">
         <div class="gen-h" data-i18n="wavefn.fukui.title">Fukui / CDFT 概念密度泛函(f+ / f− / f0 / 双描述符 DD)</div>
         <div class="actions" style="flex-wrap:wrap">
           <button class="btn wf-fukui" data-f="f_plus">f+(亲核)</button>
@@ -1270,7 +1297,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       </div>
 
       <!-- 散点图(NCI / IRI:RDG-sign(λ2)ρ) + output 可视化 -->
-      <div class="card" style="padding:16px;margin-top:12px">
+      <div class="card" style="padding:12px;margin-top:12px">
         <div class="gen-h" data-i18n="wavefn.scatter.title">弱相互作用散点(RDG vs sign(λ₂)ρ) / output 可视化</div>
         <div class="gen-2col">
           <div class="gen-fld">
@@ -1293,7 +1320,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       </div>
 
       <!-- HOMO-LUMO 能级 / AIM BCP 查询(可复制) -->
-      <div class="card" style="padding:16px;margin-top:12px">
+      <div class="card" style="padding:12px;margin-top:12px">
         <div class="gen-h" data-i18n="wavefn.query.title">能级 / 键临界点查询</div>
         <div class="gen-2col">
           <div class="gen-fld">
@@ -1320,8 +1347,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <h1 data-i18n="figures.title">论文出图</h1>
       <span class="stats" data-i18n="figures.subtitle">图表预设画廊 · 选数据来源 + 参数 · 一键出图(原生引擎)</span>
     </div>
-    <div class="card" style="padding:16px;margin-bottom:14px">
-      <div class="gen-h">数据来源
+    <div class="card acc" data-acc="figures:source" data-sum="选项目 / 参数,一键出图" style="padding:12px;margin-bottom:10px">
+      <div class="gen-h acc-h">数据来源
         <span class="sub" style="font-weight:400">能量学 / 台阶图从当前项目装配;电子结构 / NEB 类需专门解析产物</span></div>
       <div class="fig-srcrow">
         <label class="gen-lbl" style="display:flex;align-items:center;gap:8px">当前项目
@@ -1359,8 +1386,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 步骤 1:输入 -->
-    <div class="card" style="padding:16px;margin-bottom:14px">
-      <div class="gen-h">① 论文来源</div>
+    <div class="card acc" data-acc="ai:source" data-sum="论文 / PDF → 结构化规格" style="padding:12px;margin-bottom:10px">
+      <div class="gen-h acc-h">① 论文来源</div>
       <div class="gen-inrow" style="margin-bottom:8px">
         <input id="ai-pdf" class="ipt" autocomplete="off" placeholder="PDF 文件路径(或在下方粘贴方法学文本)">
         <button class="btn" id="ai-pdf-btn" data-i18n="common.browse">浏览</button>
@@ -1372,7 +1399,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 步骤 2:可编辑规格表 -->
-    <div class="card" id="ai-spec-card" style="padding:16px;margin-bottom:14px" hidden>
+    <div class="card" id="ai-spec-card" style="padding:12px;margin-bottom:10px" hidden>
       <div class="gen-h">② 规格表(可编辑;每格显示值 + 出处 + 低置信度黄标)</div>
       <div id="ai-spec"></div>
       <div class="actions" style="margin-top:12px">
@@ -1381,7 +1408,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 步骤 3:计划 + 实例化 -->
-    <div class="card" id="ai-plan-card" style="padding:16px;margin-bottom:14px" hidden>
+    <div class="card" id="ai-plan-card" style="padding:12px;margin-bottom:10px" hidden>
       <div class="gen-h">③ 实例化计划</div>
       <div id="ai-plan"></div>
       <div class="gen-inrow" style="margin:10px 0">
@@ -1401,8 +1428,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 能力一:数据对照(文献数据表提取 + 与项目计算值对照) -->
-    <div class="card" style="padding:16px;margin-bottom:14px">
-      <div class="ai-cap-h" data-i18n="ai.cap.data">数据对照(文献值 × 计算值)</div>
+    <div class="card acc" data-acc="ai:data" data-sum="文献值 × 计算值核对" data-acc-default="0" style="padding:12px;margin-bottom:10px">
+      <div class="ai-cap-h acc-h" data-i18n="ai.cap.data">数据对照(文献值 × 计算值)</div>
       <div class="sub" style="color:var(--muted);margin-bottom:8px;line-height:1.5" data-i18n="ai.cap.data.sub">
         从上方论文提取文献数据表(体系×物种×文献值,带页码);项目算完后与计算值对照给 MAE/RMSE。抽出的是文献参考值,仅供对照,绝不回流计算。</div>
       <div class="actions" style="margin-bottom:8px">
@@ -1420,8 +1447,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 能力二:材料变体(推荐变体 + 分批预算 + 生成变体矩阵) -->
-    <div class="card" style="padding:16px;margin-bottom:14px">
-      <div class="ai-cap-h" data-i18n="ai.cap.variants">材料变体(母版 → 邻域筛选)</div>
+    <div class="card acc" data-acc="ai:variants" data-sum="母版 → 邻域筛选变体" data-acc-default="0" style="padding:12px;margin-bottom:10px">
+      <div class="ai-cap-h acc-h" data-i18n="ai.cap.variants">材料变体(母版 → 邻域筛选)</div>
       <div class="sub" style="color:var(--muted);margin-bottom:8px;line-height:1.5" data-i18n="ai.cap.variants.sub">
         据规格表母版体系推荐变体(金属替换 / 配位调控 / 掺杂),排除论文已算过的组合;按优先级 + 机时预算分批。</div>
       <div class="actions" style="margin-bottom:8px">
@@ -1432,8 +1459,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 能力三:论文草稿(生成论文骨架 + 诚实展示自动/占位比) -->
-    <div class="card" style="padding:16px;margin-bottom:14px">
-      <div class="ai-cap-h" data-i18n="ai.cap.manuscript">论文草稿(骨架 + Methods 全自动)</div>
+    <div class="card acc" data-acc="ai:manuscript" data-sum="骨架 + Methods 全自动" data-acc-default="0" style="padding:12px;margin-bottom:10px">
+      <div class="ai-cap-h acc-h" data-i18n="ai.cap.manuscript">论文草稿(骨架 + Methods 全自动)</div>
       <div class="sub" style="color:var(--muted);margin-bottom:8px;line-height:1.5" data-i18n="ai.cap.manuscript.sub">
         Methods 用真实 INCAR 全自动;Results 逐图数据句 + 占位待补。诚实展示 AI 组织了多少、留给你多少。</div>
       <div class="pj-inrow" style="margin-bottom:8px">
@@ -1485,8 +1512,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 快速批量提交:任意 .gjf/.com/.inp/.cell 逐个建轻量作业 + 入台账 -->
-    <div class="card" id="quick-submit-card" style="padding:16px;margin-bottom:12px">
-      <div class="gen-h" data-i18n="jobs.quick.title">快速批量提交(任意输入文件建作业)</div>
+    <div class="card acc" data-acc="jobs:quick" data-sum="任意输入文件建轻量作业" data-acc-default="0" id="quick-submit-card" style="padding:12px;margin-bottom:12px">
+      <div class="gen-h acc-h" data-i18n="jobs.quick.title">快速批量提交(任意输入文件建作业)</div>
       <div class="gen-fld">
         <span class="gen-lbl" data-i18n="jobs.quick.files">输入文件(.gjf / .com / .inp / .cell;逐个添加,可删)</span>
         <div class="gen-inrow">
@@ -1534,8 +1561,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     <div class="sub" id="jobs-stale" style="margin-top:8px;color:var(--warn)"></div>
 
     <!-- 文件管理:列远端目录 + 下载选中 -->
-    <div class="card" id="file-manage-card" style="padding:16px;margin-top:12px">
-      <div class="gen-h" data-i18n="jobs.files.title">文件管理(远端目录浏览 / 下载)</div>
+    <div class="card acc" data-acc="jobs:files" data-sum="远端目录浏览 / 下载" data-acc-default="0" id="file-manage-card" style="padding:12px;margin-top:12px">
+      <div class="gen-h acc-h" data-i18n="jobs.files.title">文件管理(远端目录浏览 / 下载)</div>
       <div class="gen-fld">
         <span class="gen-lbl" data-i18n="jobs.files.remote">集群 / 远端路径</span>
         <div class="gen-inrow">
@@ -1572,15 +1599,15 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     <div class="warn-banner" id="cl-warn" hidden></div>
 
     <!-- 连接 -->
-    <div class="card" style="padding:16px;margin-bottom:14px">
-      <div class="cl-h">连接</div>
+    <div class="card acc" data-acc="cluster:conn" data-sum="SSH 主机 / 用户 / 认证" style="padding:12px;margin-bottom:10px">
+      <div class="cl-h acc-h">连接</div>
       <div class="cl-grid">
         <label class="fld">集群名称<input id="cl-name" class="ipt" autocomplete="off"></label>
         <label class="fld">主机名<input id="cl-hostname" class="ipt" autocomplete="off" placeholder="127.0.0.1 或登录节点地址"></label>
         <label class="fld">端口<input id="cl-port" class="ipt" inputmode="numeric" placeholder="22"></label>
         <label class="fld">用户名<input id="cl-username" class="ipt" autocomplete="off"></label>
       </div>
-      <div class="row span2" style="margin-top:14px">
+      <div class="row span2" style="margin-top:10px">
         <span style="font-size:11.5px;color:var(--muted)">认证方式</span>
         <label class="rad"><input type="radio" name="cl-auth" value="key" checked> SSH 密钥</label>
         <label class="rad"><input type="radio" name="cl-auth" value="password"> 密码</label>
@@ -1590,8 +1617,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 跳板机 -->
-    <div class="card" style="padding:16px;margin-bottom:14px">
-      <div class="cl-h">跳板机(可选)</div>
+    <div class="card acc" data-acc="cluster:jump" data-sum="ProxyJump 跳板配置" data-acc-default="0" style="padding:12px;margin-bottom:10px">
+      <div class="cl-h acc-h">跳板机(可选)</div>
       <label class="rad" style="margin-bottom:12px"><input type="checkbox" id="cl-usejump"> 经跳板机连接</label>
       <div class="row">
         <label class="fld" style="flex:2 1 220px">跳板主机<input id="cl-jumphost" class="ipt" autocomplete="off" placeholder="jump.example.edu"></label>
@@ -1601,8 +1628,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 调度器 -->
-    <div class="card" style="padding:16px;margin-bottom:14px">
-      <div class="cl-h">调度器</div>
+    <div class="card acc" data-acc="cluster:sched" data-sum="Slurm / PBS / LSF / Shell" data-acc-default="0" style="padding:12px;margin-bottom:10px">
+      <div class="cl-h acc-h">调度器</div>
       <div class="row">
         <label class="fld" style="flex:0 0 140px">类型
           <select id="cl-scheduler" class="ipt">
@@ -1615,27 +1642,27 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
         <label class="fld" style="flex:1 1 300px">命令目录 scheduler_bin<input id="cl-schedbin" class="ipt" autocomplete="off" placeholder="/opt/torque-6.1.2/bin"></label>
       </div>
       <div class="hint">调度器不在 PATH 时必填,如 1w 的 /opt/torque-6.1.2/bin</div>
-      <label class="fld" style="margin-top:14px">远程工作目录 remote_root<input id="cl-remoteroot" class="ipt" autocomplete="off" placeholder="/home/Maple123/done"></label>
+      <label class="fld" style="margin-top:10px">远程工作目录 remote_root<input id="cl-remoteroot" class="ipt" autocomplete="off" placeholder="/home/Maple123/done"></label>
     </div>
 
     <!-- 资源参数 -->
-    <div class="card" style="padding:16px;margin-bottom:14px">
-      <div class="cl-h">资源参数(自动生成脚本用)</div>
+    <div class="card acc" data-acc="cluster:res" data-sum="队列 / 核数 / 墙钟 / VASP 命令" data-acc-default="0" style="padding:12px;margin-bottom:10px">
+      <div class="cl-h acc-h">资源参数(自动生成脚本用)</div>
       <div class="row">
         <label class="fld" style="flex:1 1 160px">队列/分区<input id="cl-queue" class="ipt" autocomplete="off" placeholder="batch"></label>
         <label class="fld" style="flex:0 0 90px">节点<input id="cl-nodes" class="ipt" inputmode="numeric" placeholder="1"></label>
         <label class="fld" style="flex:0 0 110px">每节点核数<input id="cl-ppn" class="ipt" inputmode="numeric" placeholder="24"></label>
         <label class="fld" style="flex:0 0 130px">墙钟<input id="cl-walltime" class="ipt" autocomplete="off" placeholder="24:00:00"></label>
       </div>
-      <label class="fld span2" style="margin-top:14px">环境准备(每行一条 module load / source)
+      <label class="fld span2" style="margin-top:10px">环境准备(每行一条 module load / source)
         <textarea id="cl-env" class="ipt" rows="3" placeholder="source /home/.../mklvars.sh intel64"></textarea>
       </label>
       <label class="fld span2" style="margin-top:12px">VASP 命令<input id="cl-vaspcmd" class="ipt" autocomplete="off" placeholder="mpirun -np 24 -machinefile $PBS_NODEFILE .../vasp_std &gt; log 2&gt;&amp;1"></label>
     </div>
 
     <!-- 提交脚本 -->
-    <div class="card" style="padding:16px;margin-bottom:14px">
-      <div class="cl-h">提交脚本</div>
+    <div class="card acc" data-acc="cluster:script" data-sum="自动生成脚本 / 我的模板" data-acc-default="0" style="padding:12px;margin-bottom:10px">
+      <div class="cl-h acc-h">提交脚本</div>
       <div class="row" style="gap:20px;margin-bottom:12px">
         <label class="rad"><input type="radio" name="cl-mode" value="auto" checked> 自动生成(用上面的资源参数)</label>
         <label class="rad"><input type="radio" name="cl-mode" value="template"> 使用我的模板(逐字复用,只填占位符)</label>
@@ -1660,8 +1687,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 卡片 1:LLM 智能分析 -->
-    <div class="card" style="padding:16px;margin-bottom:14px">
-      <div class="set-h">LLM 智能分析</div>
+    <div class="card acc" data-acc="settings:llm" data-sum="外部大模型接入(可选)" style="padding:12px;margin-bottom:10px">
+      <div class="set-h acc-h">LLM 智能分析</div>
       <div class="set-sub">用于报告的 AI 解读。密钥只存入系统凭据库,绝不写入配置文件;项目数据默认不外发,需显式勾选下方开关。</div>
 
       <div class="set-fld">
@@ -1690,7 +1717,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
         </div>
       </div>
       <label class="set-check"><input type="checkbox" id="set-llm-external"> 允许将项目数据发送到外部 LLM(默认关闭)</label>
-      <div class="actions" style="margin-top:14px">
+      <div class="actions" style="margin-top:10px">
         <button class="btn primary" id="set-llm-save" data-i18n="settings.llm.save">保存</button>
         <button class="btn" id="set-llm-keysave">保存密钥</button>
         <button class="btn" id="set-llm-test">测试连接</button>
@@ -1698,8 +1725,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 卡片 2:报告分析提示词 -->
-    <div class="card" style="padding:16px;margin-bottom:14px">
-      <div class="set-h">报告分析提示词</div>
+    <div class="card acc" data-acc="settings:prompt" data-sum="自定义报告分析提示词" data-acc-default="0" style="padding:12px;margin-bottom:10px">
+      <div class="set-h acc-h">报告分析提示词</div>
       <div class="set-sub">发刊级默认已内置(①数据可靠性核查 ②关键发现(锚定数值) ③机理讨论(仅基于给定数据,禁止编造) ④局限与下一步 + 双语小结)。可自定义"分析要求"段;数据注入与 JSON 输出契约、反编造规则固定不受影响。</div>
       <textarea id="set-prompt" class="ipt" rows="12" spellcheck="false" placeholder="加载中…"></textarea>
       <div class="actions" style="margin-top:12px">
@@ -1709,8 +1736,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 卡片 3:数据路径 -->
-    <div class="card" style="padding:16px;margin-bottom:14px">
-      <div class="set-h">数据路径</div>
+    <div class="card acc" data-acc="settings:paths" data-sum="赝势库 / 分子库 / 输出根" data-acc-default="0" style="padding:12px;margin-bottom:10px">
+      <div class="set-h acc-h">数据路径</div>
       <div class="set-sub">赝势库用于拼 POTCAR / 补 ENCUT;Li-S 分子库用于台阶图 / 火山图的 ΔG 计算(此前无处配置)。</div>
       <div class="set-fld">
         <span class="set-lbl">赝势库根目录 potcar_lib_root</span>
@@ -1739,8 +1766,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 卡片 4:外观与自动化 -->
-    <div class="card" style="padding:16px;margin-bottom:14px">
-      <div class="set-h">外观与自动化</div>
+    <div class="card acc" data-acc="settings:appearance" data-sum="主题 / 自动驾驶" data-acc-default="0" style="padding:12px;margin-bottom:10px">
+      <div class="set-h acc-h">外观与自动化</div>
       <div class="set-sub">主题即时生效并记忆;自动驾驶按间隔自动同步作业状态、续算、拉回结果、出图出报告。</div>
 
       <div class="set-lbl" style="margin-bottom:8px">主题(三选,即时生效)</div>
@@ -1774,14 +1801,14 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
         <label class="set-check"><input type="checkbox" id="set-ap-fetch"> 全 DONE 自动拉回(默认开)</label>
         <label class="set-check"><input type="checkbox" id="set-ap-report"> 自动出图出报告(默认开)</label>
       </div>
-      <div class="actions" style="margin-top:14px">
+      <div class="actions" style="margin-top:10px">
         <button class="btn primary" id="set-ap-save" data-i18n="settings.auto.save">保存自动化设置</button>
       </div>
     </div>
 
     <!-- 卡片 4b:出图偏好(期刊风格 / 自动出图 / 多面板) -->
-    <div class="card" style="padding:16px;margin-bottom:14px">
-      <div class="set-h" data-i18n="settings.figures.title">出图偏好</div>
+    <div class="card acc" data-acc="settings:figures" data-sum="期刊模板 / 自动出图" data-acc-default="0" style="padding:12px;margin-bottom:10px">
+      <div class="set-h acc-h" data-i18n="settings.figures.title">出图偏好</div>
       <div class="set-sub" data-i18n="settings.figures.sub">一键出图管线用此期刊风格出全套图;自动出图开启后,项目全部 DONE 即自动出图 + 拼多面板。</div>
       <div class="set-2col">
         <div class="set-fld">
@@ -1803,8 +1830,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 卡片 5:界面语言 + 研究场景 -->
-    <div class="card" style="padding:16px;margin-bottom:14px">
-      <div class="set-h" data-i18n="settings.workspace.title">界面语言与研究场景</div>
+    <div class="card acc" data-acc="settings:workspace" data-sum="语言 / 研究场景裁剪" data-acc-default="0" style="padding:12px;margin-bottom:10px">
+      <div class="set-h acc-h" data-i18n="settings.workspace.title">界面语言与研究场景</div>
       <div class="set-sub" data-i18n="settings.workspace.sub">语言即时切换(zh 基准 / en 回落);研究场景把界面裁剪到某研究方向(显隐页面 / 卡片 / 图型 / 引擎)。</div>
       <div class="set-2col">
         <div class="set-fld">
@@ -1843,5 +1870,6 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 <script src="ai.js"></script>
 <script src="taskcat.js"></script>
 <script src="deps.js"></script>
+<script src="ui.js"></script>
 </body>
 </html>

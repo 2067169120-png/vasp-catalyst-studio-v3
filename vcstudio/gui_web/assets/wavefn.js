@@ -72,26 +72,47 @@
     renderAnalysisChips();
     renderSceneChips();
   }
+  // 分析项 chips 墙 → 分组多选下拉(常用 / 实空间与截面 / 弱相互作用 / 其它)。
+  // 保留 wf-analysis-chips 容器 id;State.sel 仍为选中项真源(被 wavefn_run 消费)。
+  function applyPlaneRow() {
+    const plane = $('wf-plane-row');
+    if (plane) plane.hidden = !State.sel.has('elf_lol_section');
+  }
   function renderAnalysisChips() {
     const box = $('wf-analysis-chips');
     if (!box) return;
-    // 分组菜单(常用 / 实空间与截面 / 弱相互作用 / 其它);api 补充项虚线边 + 版本差异提醒
-    const groups = State.groups.length ? State.groups
-      : [{ group: '', items: State.analyses }];
-    box.innerHTML = groups.map(grp =>
-      `<div class="wf-agroup">${grp.group ? `<div class="wf-agroup-h">${VCS.esc(grp.group)}</div>` : ''}` +
-      `<div class="chips">` + (grp.items || []).map(a =>
-        `<span class="chip${State.sel.has(a.key) ? ' on' : ''}${a.source === 'api' ? ' api-extra' : ''}" ` +
-        `data-val="${VCS.esc(a.key)}" title="${VCS.esc(a.note || '')}">${VCS.esc(a.name)}</span>`).join('') +
-      `</div></div>`).join('');
-    box.querySelectorAll('.chip').forEach(c => c.addEventListener('click', () => {
-      const k = c.dataset.val;
-      if (State.sel.has(k)) State.sel.delete(k); else State.sel.add(k);
-      c.classList.toggle('on');
-      // ELF/LOL 截面选中 → 显示切面参数行
-      const plane = $('wf-plane-row');
-      if (plane) plane.hidden = !State.sel.has('elf_lol_section');
+    const src = State.groups.length ? State.groups : [{ group: '', items: State.analyses }];
+    const groups = src.map(grp => ({
+      group: grp.group || '',
+      items: (grp.items || []).map(a => ({
+        val: a.key, label: a.name, note: a.note || '', exp: a.source === 'api',
+      })),
     }));
+    if (window.VCS && VCS.ui && VCS.ui.multiselect) {
+      if (box._ms) {
+        box._ms.setGroups(groups, true);
+        box._ms.setSelected(Array.from(State.sel));
+      } else {
+        VCS.ui.multiselect(box, {
+          groups: groups, selected: Array.from(State.sel), placeholder: '选择分析项(可多选)',
+          onChange: arr => { State.sel = new Set(arr); applyPlaneRow(); },
+        });
+      }
+      applyPlaneRow();
+    } else {                                   // 兜底:原分组 chips
+      box.innerHTML = src.map(grp =>
+        `<div class="wf-agroup">${grp.group ? `<div class="wf-agroup-h">${VCS.esc(grp.group)}</div>` : ''}` +
+        `<div class="chips">` + (grp.items || []).map(a =>
+          `<span class="chip${State.sel.has(a.key) ? ' on' : ''}${a.source === 'api' ? ' api-extra' : ''}" ` +
+          `data-val="${VCS.esc(a.key)}" title="${VCS.esc(a.note || '')}">${VCS.esc(a.name)}</span>`).join('') +
+        `</div></div>`).join('');
+      box.querySelectorAll('.chip').forEach(c => c.addEventListener('click', () => {
+        const k = c.dataset.val;
+        if (State.sel.has(k)) State.sel.delete(k); else State.sel.add(k);
+        c.classList.toggle('on');
+        applyPlaneRow();
+      }));
+    }
   }
   function analysisParams() {
     const p = {};

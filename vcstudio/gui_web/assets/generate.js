@@ -98,22 +98,32 @@
   const SAC_METALS = ['Ti', 'V', 'Cr', 'Mn', 'Fe', 'Co', 'Ni', 'Cu', 'Mo', 'W'];
   const SAC_TEMPLATES = ['MN4', 'MN3', 'MP1N3', 'MS1N3', 'MB1N3', 'MN4+B'];
 
+  // chips 墙 → 多选下拉(保留原容器 id,只改内部渲染;被 api 消费的选中值数组契约不变)
   function renderChips(id, items, preselect) {
     const box = $(id);
     if (!box) return;
-    box.innerHTML = '';
-    items.forEach(it => {
-      const c = document.createElement('span');
-      c.className = 'chip' + (preselect && preselect.indexOf(it) >= 0 ? ' on' : '');
-      c.textContent = it;
-      c.dataset.val = it;
-      c.addEventListener('click', () => c.classList.toggle('on'));
-      box.appendChild(c);
-    });
+    if (window.VCS && VCS.ui && VCS.ui.multiselect) {
+      VCS.ui.multiselect(box, {
+        items: items.map(v => ({ val: v, label: v })),
+        selected: (preselect || []).filter(v => items.indexOf(v) >= 0),
+        placeholder: '点此选择(可多选)',
+      });
+    } else {                                   // 兜底:ui.js 缺失时退回 chips
+      box.innerHTML = '';
+      items.forEach(it => {
+        const c = document.createElement('span');
+        c.className = 'chip' + (preselect && preselect.indexOf(it) >= 0 ? ' on' : '');
+        c.textContent = it; c.dataset.val = it;
+        c.addEventListener('click', () => c.classList.toggle('on'));
+        box.appendChild(c);
+      });
+    }
   }
   function chipVals(id) {
     const box = $(id);
-    return box ? Array.from(box.querySelectorAll('.chip.on')).map(c => c.dataset.val) : [];
+    if (!box) return [];
+    if (box._ms) return box._ms.getSelected();
+    return Array.from(box.querySelectorAll('.chip.on')).map(c => c.dataset.val);
   }
   function sacMetals() {
     const base = chipVals('sac-metals');
@@ -220,27 +230,32 @@
 
   // ── 引擎选择器:VASP(用上方四件套)/ CP2K / Gaussian / CASTEP(文件级适配,简化表单) ──
   const State2 = { engine: 'vasp' };
+  // 引擎选择器:VASP 置顶(主引擎)的下拉,替代原 chips 墙。默认 VASP。
   async function loadEngines() {
-    const box = $('engine-chips');
-    if (!box) return;
+    const sel = $('engine-select');
+    if (!sel) return;
     const sceneKey = (window.VCS && VCS.scenario && VCS.scenario.key) || null;
     const r = await VCS.call('engine_list', sceneKey);
-    const engines = (r && r.engines) || [];
-    box.innerHTML = '';
-    engines.forEach(e => {
-      const c = document.createElement('span');
-      c.className = 'chip' + (e.key === State2.engine ? ' on' : '');
-      c.dataset.val = e.key;
-      c.textContent = e.name + (e.experimental ? ' (实验性)' : '');
-      c.addEventListener('click', () => selectEngine(e.key));
-      box.appendChild(c);
-    });
+    let engines = (r && r.engines) || [];
+    if (!engines.length) engines = [{ key: 'vasp', name: 'VASP', experimental: false }];
+    // VASP 恒置顶醒目;其余引擎(实验性)靠后
+    engines = engines.slice().sort((a, b) => (a.key === 'vasp' ? -1 : b.key === 'vasp' ? 1 : 0));
+    sel.innerHTML = engines.map(e =>
+      '<option value="' + VCS.esc(e.key) + '">' + VCS.esc(e.name) +
+      (e.key === 'vasp' ? '(主引擎)' : e.experimental ? '(实验性)' : '') + '</option>').join('');
+    const has = engines.some(e => e.key === State2.engine);
+    if (!has) State2.engine = engines[0].key;
+    sel.value = State2.engine;
+    selectEngine(sel.value);
   }
   async function selectEngine(key) {
     State2.engine = key;
-    document.querySelectorAll('#engine-chips .chip').forEach(
-      c => c.classList.toggle('on', c.dataset.val === key));
+    const sel = $('engine-select');
+    if (sel && sel.value !== key) sel.value = key;
     const isGauss = (key === 'gaussian');
+    // 非 VASP:展开「引擎参数」折叠分区,让简化表单可见
+    const card = $('engine-card');
+    if (card && key !== 'vasp') card.setAttribute('data-open', '1');
     // 通用简化表单:cp2k/castep 用;vasp 走上方四件套;gaussian 走专属分子面板
     const form = $('engine-form');
     if (form) form.hidden = (key === 'vasp' || isGauss);
@@ -375,7 +390,8 @@
     wire('spin-out-btn', () => pickDir('spin-out'));
     wire('spin-gen-btn', spinGenerate);
 
-    // 引擎选择器(生成页):载入引擎 chips + 浏览/生成
+    // 引擎选择器(生成页):载入引擎下拉(VASP 优先)+ 浏览/生成
+    { const esel = $('engine-select'); if (esel) esel.addEventListener('change', () => selectEngine(esel.value)); }
     loadEngines();
     wire('eng-poscar-btn', () => pickFile('eng-poscar', 'poscar'));
     wire('eng-out-btn', () => pickDir('eng-out'));

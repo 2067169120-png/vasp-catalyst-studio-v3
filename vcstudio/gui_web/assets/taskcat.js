@@ -35,25 +35,40 @@
     renderCats();
     renderGrid();
   }
+  // 分类 optgroup 下拉替代"分类 chips + 卡片网格墙"(VASP 23 类计算目录)。
+  // 保留 tc-cats(承载下拉)与 tc-grid(隐藏,id 保持)容器。
+  function buildOptions(sel) {
+    const cats = State.cats.length ? State.cats
+      : Array.from(new Set(State.tasks.map(t => t.category)));
+    let html = '<option value="">选择计算类型…</option>';
+    cats.forEach(c => {
+      const items = State.tasks.filter(t => t.category === c);
+      if (!items.length) return;
+      html += `<optgroup label="${VCS.esc(c)}">` + items.map(t =>
+        `<option value="${VCS.esc(t.key)}"${State.sel === t.key ? ' selected' : ''}>` +
+        `${VCS.esc(t.name_zh)}${DERIVABLE.has(t.key) ? '' : '(专用流程)'}</option>`).join('') + '</optgroup>';
+    });
+    sel.innerHTML = html;
+  }
   function renderCats() {
     const box = $('tc-cats');
     if (!box) return;
-    box.innerHTML = State.cats.map(c =>
-      `<span class="tc-cat${c === State.cat ? ' on' : ''}" data-cat="${VCS.esc(c)}">${VCS.esc(c)}</span>`).join('');
+    let sel = document.getElementById('tc-select');
+    if (!sel) {
+      sel = document.createElement('select');
+      sel.id = 'tc-select';
+      sel.className = 'ipt';
+      box.innerHTML = '';
+      box.appendChild(sel);
+      sel.addEventListener('change', () => { if (sel.value) selectTask(sel.value); });
+    }
+    buildOptions(sel);
   }
   function renderGrid() {
     const box = $('tc-grid');
-    if (!box) return;
-    const items = State.tasks.filter(t => !State.cat || t.category === State.cat);
-    box.innerHTML = items.map(t => {
-      const badges = [];
-      if (t.requires) badges.push(`<span class="tc-badge" title="前置条件">前置:${VCS.esc(t.requires)}</span>`);
-      if (t.figure) badges.push(`<span class="tc-badge fig" title="关联图型">图:${VCS.esc(t.figure)}</span>`);
-      const dv = DERIVABLE.has(t.key) ? '' : '<span class="tc-badge">专用流程</span>';
-      return `<div class="tc-card${State.sel === t.key ? ' on' : ''}" data-key="${VCS.esc(t.key)}">` +
-        `<b>${VCS.esc(t.name_zh)}</b><div class="tc-desc">${VCS.esc(t.description)}</div>` +
-        `<div class="tc-badges">${badges.join('')}${dv}</div></div>`;
-    }).join('') || '<span class="sub">此分类暂无任务</span>';
+    if (box) { box.hidden = true; box.innerHTML = ''; }   // 网格墙隐藏,改由上方 optgroup 下拉选择
+    const sel = document.getElementById('tc-select');
+    if (sel) buildOptions(sel);
   }
   function selectTask(key) {
     State.sel = key;

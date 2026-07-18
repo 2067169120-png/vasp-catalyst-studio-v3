@@ -386,3 +386,77 @@ nav a.on .stepno{background:var(--accent);border-color:var(--accent);color:#fff}
 .scene-card:hover{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)}
 .scene-card b{font-size:13px}
 .scene-card span{font-size:11px;color:var(--muted);line-height:1.55}
+
+/* ══════════════════════════════════════════════════════════════════
+   v3.2 紧凑重设计(参照 starpivot DFT 排版):手风琴 / 多选下拉 / 分段 /
+   4 列参数网格 / 密度压缩 / 引擎与分析类型醒目条。仅新增,不改历史规则。
+   ══════════════════════════════════════════════════════════════════ */
+
+/* ── 分区手风琴:分区根 [data-acc],头部 .acc-h(直接子),折叠态只留头部 ── */
+.acc > .acc-h{display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;
+  font-weight:700;font-size:13px;color:var(--ink);margin:0;padding:0;border:none}
+.acc[data-open="1"] > .acc-h{margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid var(--rule)}
+.acc > .acc-h:hover{color:var(--accent-dark)}
+.acc > .acc-h .acc-caret{flex:0 0 auto;width:8px;height:8px;border-right:2px solid var(--muted);
+  border-bottom:2px solid var(--muted);transform:rotate(-45deg);transition:transform .15s;margin:0 3px 2px 0}
+.acc[data-open="1"] > .acc-h .acc-caret{transform:rotate(45deg);margin-bottom:0;margin-top:-3px}
+.acc > .acc-h .acc-sum{margin-left:auto;font-weight:400;font-size:11px;color:var(--muted);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:54%}
+.acc[data-open="0"] > :not(.acc-h){display:none!important}
+.acc[data-open="0"]{padding-top:12px!important;padding-bottom:12px!important}
+
+/* ── 多选下拉:已选 N 项按钮 + 浮层复选(≤260px 滚动)+ pill 摘要(可点×删) ── */
+.ms{position:relative;display:inline-block}
+.ms-btn{display:inline-flex;align-items:center;gap:6px;font:600 12px/1 var(--sans);padding:7px 12px;
+  border:1px solid var(--rule-strong);border-radius:5px;background:var(--surface);color:var(--muted);cursor:pointer}
+.ms-btn::after{content:"\25BE";font-size:10px;margin-left:2px}
+.ms-btn:hover{border-color:var(--accent);color:var(--accent-dark)}
+.ms-btn.has{color:var(--accent-dark);border-color:var(--accent)}
+.ms-pop{position:absolute;z-index:40;top:calc(100% + 4px);left:0;min-width:220px;max-width:340px;
+  max-height:260px;overflow:auto;background:var(--surface);border:1px solid var(--rule-strong);
+  border-radius:6px;box-shadow:0 10px 30px rgba(22,32,43,.18);padding:6px}
+.ms-grp{font-size:10px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);padding:7px 8px 3px}
+.ms-opt{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:5px;font-size:12px;cursor:pointer;color:var(--ink)}
+.ms-opt:hover{background:var(--accent-soft)}
+.ms-opt input{flex:0 0 auto}
+.ms-opt.exp i{font-style:normal;font-size:9px;color:var(--warn);background:var(--warn-bg);padding:0 4px;border-radius:3px;margin-left:4px}
+.ms-empty{font-size:11.5px;color:var(--muted);padding:8px}
+.ms-pills{display:flex;flex-wrap:wrap;gap:5px;margin-top:7px}
+.ms-pills:empty{display:none}
+.ms-pill{display:inline-flex;align-items:center;gap:3px;font-size:11px;padding:2px 5px 2px 9px;
+  border:1px solid var(--accent);border-radius:12px;background:var(--accent-soft);color:var(--accent-dark)}
+.ms-pill b{cursor:pointer;color:var(--fail);font-weight:700;padding:0 2px;font-size:12px}
+
+/* ── 分段控件(结构来源 / 通用三选一) ── */
+.seg{display:inline-flex;border:1px solid var(--rule-strong);border-radius:6px;overflow:hidden;background:var(--surface)}
+.seg button{border:none;background:none;padding:7px 14px;font:600 12px/1 var(--sans);color:var(--muted);
+  cursor:pointer;border-right:1px solid var(--rule)}
+.seg button:last-child{border-right:none}
+.seg button:hover{background:var(--accent-soft);color:var(--accent-dark)}
+.seg button.on{background:var(--accent);color:#fff}
+.seg-bar{display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap}
+.seg-bar .seg-lbl{font-size:11px;color:var(--muted);font-weight:600}
+
+/* ── 4 列参数网格:label 在上 input 在下,窄屏降 2 / 1 列 ── */
+.p4grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px 12px}
+.p4grid > .gen-fld,.p4grid > .pj-fld{margin-bottom:0}
+@media (max-width:900px){.p4grid{grid-template-columns:repeat(2,1fr)}}
+@media (max-width:560px){.p4grid{grid-template-columns:1fr}}
+
+/* ── 引擎(VASP 优先)与分析类型醒目条 ── */
+.exp-badge{font-style:normal;font-size:9.5px;font-weight:600;color:var(--warn);background:var(--warn-bg);
+  padding:1px 6px;border-radius:4px;margin-left:4px;vertical-align:1px}
+.engine-top{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.engine-top .engine-note{font-size:11px;color:var(--muted)}
+#engine-select,.ana-bar select,.src-seg + *{font-weight:700}
+#engine-select{min-width:240px;font-weight:700}
+.ana-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px;
+  padding:10px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--surface)}
+.ana-bar .ana-lbl{font-size:11px;color:var(--muted);font-weight:600}
+.ana-bar select{flex:0 0 auto;min-width:230px}
+.ana-bar .ana-note{font-size:11px;color:var(--muted)}
+
+/* ── 密度压缩:正文与说明行收紧(不改历史专属规则的更高优先级) ── */
+.page{padding:14px 22px 26px}
+.card .gen-lbl,.card .pj-lbl{line-height:1.4}
+.acc .actions{margin-bottom:0}
