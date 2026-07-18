@@ -12,6 +12,7 @@ import re
 
 from vcstudio.cluster import submitter
 from vcstudio.cluster.connection import open_client, close_quiet, ConnectError
+from vcstudio.cluster.schedulers import get_dialect
 from vcstudio.shared import manifest as manifest_mod
 
 
@@ -264,3 +265,55 @@ def refresh_batch(prof, pw, dirs, trust_new):
     finally:
         close_quiet(client, jump)
     return {'needs_trust': False, 'results': results}
+
+
+def cancel_batch(profile, jobs, *, password=None, trust_new=False):
+    """批量取消作业线程体:逐作业 qdel/scancel + 回写 manifest 状态。
+
+    jobs:作业目录列表(每目录 job.yaml 的 scheduler_job_id 提供调度器作业号)。复用
+    submit/refresh 同一 open_client 连接模式;单作业失败(缺作业号/取消命令报错)只失败
+    该条,不打断整批。取消命令走 run_cmd(check=True),调度器退出码非零(如作业已不存在/
+    无权限)记为该条 failed 并透传调度器文案。
+
+    状态回写:manifest.VALID_STATES 无 'CANCELLED',按裁决改写 FAILED + note '用户取消'
+    (绝不发明 manifest 不认的状态)。
+
+    返回 {'ok', 'cancelled':[job_id], 'failed':[{'job_id','reason'}], 'error', 'needs_trust'}。
+    调度器不支持/连接失败 → ok=False + error;needs_trust 供前端可信任重试。
+    """
+    out = {'ok': False, 'cancelled': [], 'failed': [], 'error': None,
+           'needs_trust': False}
+    try:
+        dialect = get_dialect(profile.scheduler)      # 不支持的调度器早失败(绝不静默)
+    except ValueError as e:
+        out['error'] = str(e)
+        return out
+    try:
+        client, jump = open_client(profile, password, trust_new=trust_new)
+    except ConnectError as e:
+        out['error'] = str(e)
+        out['needs_trust'] = e.needs_trust
+        return out
+
+    bin_path = getattr(profile, 'scheduler_bin', '')
+    try:
+        for d in jobs:
+            m = manifest_mod.load_manifest(d)
+            jid = str((m or {}).get('scheduler_job_id') or '')
+            if not m or not jid:
+                out['failed'].append(
+                    {'job_id': jid or str(d),
+                     'reason': '无 job.yaml 或缺 scheduler_job_id,无法取消'})
+                continue
+            try:
+                submitter.run_cmd(client, dialect.cancel_cmd(jid, bin_path), check=True)
+                # CANCELLED 非 manifest 合法态 → FAILED + note '用户取消'(裁决口径)
+                manifest_mod.set_state(m, 'FAILED', note='用户取消')
+                manifest_mod.save_manifest(d, m)
+                out['cancelled'].append(jid)
+            except _job_errors() as e:
+                out['failed'].append({'job_id': jid, 'reason': str(e)})
+    finally:
+        close_quiet(client, jump)
+    out['ok'] = True
+    return out

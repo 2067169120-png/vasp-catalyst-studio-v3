@@ -50,8 +50,14 @@ class CalcSpec:
         charge:       体系净电荷(分子参考态/带电缺陷)。
         multiplicity: 自旋多重度 2S+1(分子;周期体系一般用 spin/NUPDOWN,此值忽略)。
         convergence:  {'energy_ev','force_ev_a'} 收敛判据(能量/力阈值)。
-        extras:       引擎私有透传(如 CP2K 的 cutoff_ry/basis、Gaussian 的 basis、
-                      CASTEP 的 seedname、VASP 的 incar 覆盖)。绝不跨引擎自动搬运。
+        extras:       引擎私有透传(如 CP2K 的 cutoff_ry/basis、CASTEP 的 seedname、
+                      VASP 的 incar 覆盖)。绝不跨引擎自动搬运。Gaussian 侧支持:
+                      basis(单一基组名);nproc→%nprocshared、mem_gb→%mem=NGB、
+                      chk(bool/名)→%chk 资源行;solvent={'model':'smd'|'pcm'|'cpcm',
+                      'name':'water'} 或自定义介电 {'model':...,'eps':...,'epsinf':...}
+                      →SCRF(后者走 Solvent=Generic,Read + 尾段);mixed_basis=
+                      {'default','per_element':{El:basis},'ecp_elements':[El]}→Gen/GenECP
+                      (元素分组基组段 + ECP 段,附加输入区顺序:坐标→基组→ECP→SCRF-Read)。
     """
 
     structure: str
