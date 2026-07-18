@@ -436,6 +436,11 @@ function sceneVisible(sc, path) {
   return true;                             // 未知路径族保守可见(fail-open)
 }
 VCS.sceneVisible = sceneVisible;
+// 分子专属区(⑤波函数分析页 + ①结构建模页分子建模区):仅"分子化学 / 全功能"场景显示,其余
+// 方向(锂硫 / 电催化 / 热催化 / 体相)隐藏。scenarios 为只读引擎且无 wavefunction 页位,故这一
+// 族用独立 data-mol-scene 属性 + 场景 key 判定(molecular/full),不占用标准 data-scene 通道。
+const MOL_SCENE_KEYS = ['molecular', 'full'];
+VCS.molSceneVisible = function (sc) { return !!sc && MOL_SCENE_KEYS.indexOf(sc.key) >= 0; };
 VCS.applyScenario = function (sc) {
   if (sc) VCS.scenario = sc;
   const s = VCS.scenario;
@@ -443,6 +448,8 @@ VCS.applyScenario = function (sc) {
   document.querySelectorAll('[data-scene]').forEach(el => {
     el.hidden = !sceneVisible(s, el.getAttribute('data-scene'));
   });
+  const molOn = VCS.molSceneVisible(s);
+  document.querySelectorAll('[data-mol-scene]').forEach(el => { el.hidden = !molOn; });
   // 当前页被场景隐藏 → 退回概览,避免停在空白隐藏页
   const cur = document.querySelector('nav a.on');
   if (cur && cur.hidden) {

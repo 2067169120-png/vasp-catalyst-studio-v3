@@ -89,6 +89,122 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 #page-dashboard .cmp-bar .b-validated{background:#4C86C6}
 #page-dashboard .cmp-bar .b-accepted{background:var(--ok)}
 #page-dashboard .cmp-meta{flex:0 0 auto;font-family:var(--mono);font-size:10.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+
+/* ── 分子计算全流程总装(分子建模区 / 编辑器增强 / Gaussian 面板 / ③增强 / ⑤波函数) ── */
+.gen-2col{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media (max-width:760px){.gen-2col{grid-template-columns:1fr}}
+
+/* ①分子建模分区(三卡) */
+.molzone-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:14px}
+@media (max-width:1000px){.molzone-grid{grid-template-columns:1fr}}
+.molzone-card{display:flex;flex-direction:column}
+.mol-svgbox{border:1px solid var(--rule);border-radius:6px;background:var(--surface);min-height:150px;
+  display:flex;align-items:center;justify-content:center;padding:8px;overflow:auto}
+.mol-svgbox svg{max-width:100%;height:auto}
+.mol-props{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted);
+  border:1px solid var(--rule);border-radius:6px;padding:8px 10px;background:var(--surface);margin-top:6px}
+.mol-props b{color:var(--ink);font-variant-numeric:tabular-nums}
+.mol-reimport-hint{margin-top:6px}
+.mol-reimport-hint.hot{color:var(--ok);font-weight:600}
+#page-structure #mol-editor-import.ready,#page-generate .btn.ready{box-shadow:0 0 0 2px var(--ok-bg);border-color:var(--ok);color:var(--ok)}
+
+/* 编辑器增强:第二工具行 + 测量条 + 原子列表 */
+.ed-toolbar2{margin-top:-4px}
+.ed-toolbar2 .ed-viewgrp{display:inline-flex;gap:2px}
+.ed-toolbar2 .ed-viewgrp .btn{padding:3px 7px;font-size:11px}
+#page-structure .btn.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent-dark)}
+.ed-measbar{background:var(--accent-soft);border:1px solid var(--accent);border-radius:5px;
+  padding:6px 10px;font-size:12px;color:var(--accent-dark);margin-bottom:10px}
+.ed-measbar[hidden]{display:none}
+.ed-atomlist{border:1px solid var(--rule);border-radius:6px;margin-top:8px;background:var(--surface);max-height:260px;overflow:auto}
+.ed-atomlist[hidden]{display:none}
+.ed-atomlist-head{font-size:11.5px;font-weight:600;color:var(--muted);padding:6px 8px;border-bottom:1px solid var(--rule);position:sticky;top:0;background:var(--surface)}
+.ed-atable{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:10.5px}
+.ed-atable th{color:var(--muted);text-align:right;padding:3px 6px;font-weight:600}
+.ed-atable td{text-align:right;padding:2px 6px;border-top:1px solid var(--rule)}
+.ed-atable tr{cursor:pointer}
+.ed-atable tr:hover td{background:var(--accent-soft)}
+.ed-atable tr.sel td{background:var(--accent-soft);color:var(--accent-dark)}
+
+/* ②Gaussian 分子面板 */
+#gauss-panel{border-top:1px dashed var(--rule);margin-top:12px;padding-top:12px}
+#page-generate .gauss-structinfo{font-size:11.5px;color:var(--accent-dark);flex:0 0 auto;max-width:260px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#page-generate .gauss-mixed-summary{font-size:11.5px;color:var(--muted)}
+#page-generate .gauss-mixed-summary.on{color:var(--accent-dark);font-weight:600}
+#page-generate .gauss-prevhead{font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:8px}
+/* 混合基组周期表弹窗 */
+.pt-modal{min-width:640px}
+.pt-note{margin-bottom:8px}
+.pt-grid{display:grid;grid-template-columns:repeat(18,minmax(0,1fr));gap:2px;margin-bottom:10px}
+.pt-cell{font-family:var(--mono);font-size:10px;text-align:center;padding:4px 0;border:1px solid var(--rule);
+  border-radius:3px;cursor:pointer;user-select:none;background:var(--surface);color:var(--ink)}
+.pt-cell:hover{border-color:var(--accent)}
+.pt-cell.cat-transition_metal{background:var(--run-bg)}
+.pt-cell.cat-lanthanide{background:var(--warn-bg)}
+.pt-cell.sel{outline:2px solid var(--accent);outline-offset:-1px;font-weight:700}
+.pt-cell.added{border-color:var(--ok);box-shadow:inset 0 0 0 1px var(--ok)}
+.pt-ctrl{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+.pt-selhint{margin-bottom:6px}
+.pt-list{display:flex;gap:6px;flex-wrap:wrap;min-height:22px}
+.pt-chip{font-family:var(--mono);font-size:11px;padding:2px 8px;border:1px solid var(--accent);border-radius:12px;
+  background:var(--accent-soft);color:var(--accent-dark)}
+.pt-chip b{cursor:pointer;color:var(--fail);margin-left:4px}
+.pt-ecp-tag{font-style:normal;font-size:9px;background:var(--warn-bg);color:var(--warn);padding:0 4px;border-radius:3px}
+
+/* ③提交页:快速批量提交 / 筛选行 / 勾选列 / 本机运行 / 文件管理 */
+#page-jobs td.chk,#page-jobs th.chk{width:26px;text-align:center;padding:0}
+#page-jobs .qs-filelist{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+#page-jobs .qs-file{font-family:var(--mono);font-size:11px;padding:2px 8px;border:1px solid var(--rule);border-radius:12px;background:var(--surface)}
+#page-jobs .qs-file b{cursor:pointer;color:var(--fail);margin-left:4px}
+.jobs-filterbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:0 0 10px;font-size:12px;color:var(--muted)}
+.jobs-filterbar .jf-lbl{display:flex;align-items:center;gap:5px}
+.jobs-filterbar .ipt{width:auto;display:inline-block;padding:4px 8px}
+#page-jobs tr.localrun-row td{background:var(--run-bg);padding:8px 12px}
+#page-jobs .lr-state{font-family:var(--mono)}
+#page-jobs .lr-log{background:var(--surface);border:1px solid var(--rule);border-radius:5px;padding:6px 8px;width:100%;white-space:pre-wrap}
+#page-jobs .gen-h,#page-jobs .gen-lbl{font-size:11.5px;color:var(--muted)}
+#page-jobs .gen-h{font-weight:700;font-size:13px;padding-bottom:8px;border-bottom:1px solid var(--rule);color:var(--ink)}
+#page-jobs .gen-fld{display:flex;flex-direction:column;gap:4px;margin-bottom:12px}
+#page-jobs .gen-inrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+#page-jobs .fm-table{margin-top:10px;max-height:36vh;overflow:auto;border:1px solid var(--rule);border-radius:6px}
+#page-jobs .fm-tbl{width:100%;border-collapse:collapse;font-size:11.5px}
+#page-jobs .fm-tbl th{position:sticky;top:0;background:var(--th-bg);color:var(--muted);text-align:left;padding:5px 8px}
+#page-jobs .fm-tbl td{padding:4px 8px;border-top:1px solid var(--rule)}
+#page-jobs .fm-tbl td.num{text-align:right;font-variant-numeric:tabular-nums}
+
+/* ⑤波函数分析页 */
+#page-wavefunction .gen-h{font-weight:700;font-size:13px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--rule)}
+#page-wavefunction .gen-fld{display:flex;flex-direction:column;gap:4px;margin-bottom:12px}
+#page-wavefunction .gen-lbl{font-size:11.5px;color:var(--muted)}
+#page-wavefunction .gen-inrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+#page-wavefunction .chips{display:flex;gap:6px;flex-wrap:wrap}
+#page-wavefunction .chip{font-size:11.5px;padding:3px 10px;border:1px solid var(--rule);border-radius:12px;background:var(--surface);cursor:pointer;user-select:none;color:var(--ink)}
+#page-wavefunction .chip.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent-dark)}
+#page-wavefunction .chip.out{border-style:dashed}
+.wf-tabs{display:flex;gap:4px;margin-bottom:12px;border-bottom:1px solid var(--rule)}
+.wf-tab{background:none;border:none;border-bottom:2px solid transparent;padding:8px 14px;cursor:pointer;
+  font-size:12.5px;color:var(--muted)}
+.wf-tab.on{color:var(--accent-dark);border-bottom-color:var(--accent);font-weight:600}
+.wf-pane[hidden]{display:none}
+.wf-tool-row{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.wf-tool-name{flex:0 0 130px;font-weight:600;font-size:12px}
+.wf-tool-path{flex:1}
+.wf-tool-state{flex:0 0 auto;font-family:var(--mono);font-size:11px;color:var(--muted);max-width:280px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wf-tool-state.ok{color:var(--ok)}
+.wf-tool-state.bad{color:var(--fail)}
+.wf-inline,.wf-radio,.wf-params{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:12px}
+.wf-inline label,.wf-radio label,.wf-params label{color:var(--muted);display:flex;align-items:center;gap:5px}
+.wf-results,.wf-render-out,.wf-extrema-out,.wf-fromoutputs{margin-top:10px}
+.wf-res{border:1px solid var(--rule);border-radius:6px;padding:8px 10px;margin-bottom:8px;background:var(--surface)}
+.wf-res-h{font-weight:600;font-size:12.5px}
+.wf-res-h.okc{color:var(--ok)}.wf-res-h.failc{color:var(--fail)}
+.wf-script,.wf-stdout{width:100%;font-family:var(--mono);font-size:11px;margin-top:6px;white-space:pre-wrap}
+.wf-png{max-width:100%;border:1px solid var(--rule);border-radius:6px}
+.wf-scene-files{margin-top:6px}
+.wf-scene-files .wf-role{flex:0 0 110px;font-family:var(--mono);font-size:11px;color:var(--muted)}
+.wf-exp{color:var(--warn)}
 </style>
 </head>
 <body>
@@ -112,8 +228,9 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
   <a href="#" data-page="generate" data-scene="pages.generate"><i class="stepno">2</i><span data-i18n="nav.generate">生成输入</span></a>
   <a href="#" data-page="jobs" data-scene="pages.jobs"><i class="stepno">3</i><span data-i18n="nav.jobs">提交计算</span></a>
   <a href="#" data-page="project" data-scene="pages.project"><i class="stepno">4</i><span data-i18n="nav.project">结果分析</span></a>
-  <a href="#" data-page="figures"><i class="stepno">5</i><span data-i18n="nav.figures">论文出图</span></a>
-  <a href="#" data-page="ai"><i class="stepno">6</i><span data-i18n="nav.ai">AI 助手</span></a>
+  <a href="#" data-page="wavefunction" data-mol-scene><i class="stepno">5</i><span data-i18n="nav.wavefunction">波函数分析</span></a>
+  <a href="#" data-page="figures"><i class="stepno">6</i><span data-i18n="nav.figures">论文出图</span></a>
+  <a href="#" data-page="ai"><i class="stepno">7</i><span data-i18n="nav.ai">AI 助手</span></a>
   <div class="grp" data-i18n="nav.group.environment">环境</div>
   <a href="#" data-page="cluster" data-scene="pages.cluster"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="1"/><rect x="3" y="13" width="18" height="7" rx="1"/><path d="M7 7.5h.01M7 16.5h.01"/></svg><span data-i18n="nav.cluster">集群</span></a>
   <a href="#" data-page="settings" data-scene="pages.settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M18.4 5.6L17 7M7 17l-1.4 1.4"/></svg><span data-i18n="nav.settings">设置</span></a>
@@ -190,6 +307,108 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <span class="stats" data-i18n="structure.subtitle">加载 / 编辑结构 · 固定底层 · 真空检查 · SAC 批量建模 · 多自旋家族</span>
     </div>
 
+    <!-- 分子建模分区(图片识别 → SMILES → 3D 建模 → 外部编辑器往返;分子化学 / 全功能场景显示) -->
+    <div data-mol-scene>
+    <div class="molzone-grid">
+
+      <!-- 卡1:图片识别 OCSR -->
+      <div class="card molzone-card" style="padding:16px">
+        <div class="gen-h" data-i18n="mol.ocsr.title">图片识别(OCSR → SMILES)</div>
+        <div class="warn-banner" id="mol-ocsr-banner" hidden></div>
+        <div class="gen-fld">
+          <span class="gen-lbl" data-i18n="mol.ocsr.image">分子结构图片(文献插图 / 手绘 / 截图)</span>
+          <div class="gen-inrow">
+            <input id="mol-img-path" class="ipt" autocomplete="off" placeholder="图片文件路径(png / jpg …)">
+            <button class="btn" id="mol-img-btn" data-i18n="common.browse">浏览</button>
+            <button class="btn primary" id="mol-ocsr-run" data-i18n="mol.ocsr.run">开始识别</button>
+          </div>
+        </div>
+        <div class="gen-fld">
+          <span class="gen-lbl" data-i18n="mol.ocsr.smiles">识别出的 SMILES(可编辑)</span>
+          <div class="gen-inrow">
+            <input id="mol-img-smiles" class="ipt" autocomplete="off" placeholder="SMILES(识别后自动填入,可手动修正)">
+            <button class="btn" id="mol-img-copy" data-i18n="mol.ocsr.copy">复制 SMILES</button>
+          </div>
+        </div>
+        <div class="gen-fld" style="margin-bottom:8px">
+          <div class="gen-inrow" style="justify-content:space-between">
+            <span class="gen-lbl" style="margin:0" data-i18n="mol.ocsr.preview2d">2D 键线式结构图</span>
+            <span>
+              <button class="btn" id="mol-svg-refresh" data-i18n="mol.ocsr.refresh">刷新结构图</button>
+              <button class="btn primary" id="mol-img-next" data-i18n="mol.ocsr.next">下一步:3D 建模</button>
+            </span>
+          </div>
+        </div>
+        <div class="mol-svgbox" id="mol-svg"><span class="sub" data-i18n="mol.ocsr.svg_empty">识别 SMILES 或点「刷新结构图」后显示 2D 结构</span></div>
+      </div>
+
+      <!-- 卡2:分子 3D 建模 -->
+      <div class="card molzone-card" style="padding:16px">
+        <div class="gen-h" data-i18n="mol.build3d.title">分子 3D 建模(SMILES → 3D)</div>
+        <div class="gen-fld">
+          <span class="gen-lbl" data-i18n="mol.build3d.smiles">SMILES</span>
+          <div class="gen-inrow">
+            <input id="mol-smiles" class="ipt" autocomplete="off" placeholder="如 c1ccccc1(苯);由卡1「下一步」自动带入">
+            <select id="mol-ff" class="ipt" style="flex:0 0 130px" title="力场优化">
+              <option value="auto" data-i18n="mol.build3d.ff_auto">力场:自动</option>
+              <option value="mmff">MMFF94</option>
+              <option value="uff">UFF</option>
+            </select>
+          </div>
+        </div>
+        <div class="actions" style="margin:2px 0 10px">
+          <button class="btn primary" id="mol-3d-run" data-i18n="mol.build3d.run">生成 3D 结构</button>
+          <button class="btn" id="mol-open-file" data-i18n="mol.build3d.open">打开结构文件</button>
+          <button class="btn quiet" id="mol-3d-undo" data-i18n="mol.build3d.undo">撤回</button>
+          <button class="btn quiet" id="mol-3d-clear" data-i18n="mol.build3d.clear">清空</button>
+        </div>
+        <div class="gen-fld">
+          <span class="gen-lbl" data-i18n="mol.build3d.saveas">保存为</span>
+          <div class="gen-inrow">
+            <select id="mol-save-fmt" class="ipt" style="flex:0 0 130px">
+              <option value="xyz">XYZ</option>
+              <option value="mol">MOL</option>
+              <option value="pdb">PDB</option>
+            </select>
+            <button class="btn" id="mol-save-btn" data-i18n="mol.build3d.save">保存结构</button>
+            <button class="btn primary" id="mol-to-generate" data-i18n="mol.build3d.next">下一步:生成输入文件</button>
+          </div>
+        </div>
+        <div class="mol-props" id="mol-props"><span class="sub" data-i18n="mol.build3d.props_empty">生成或载入结构后显示:原子数 / 分子式 / 电子数 / 建议多重度</span></div>
+      </div>
+
+      <!-- 卡3:外部编辑器往返 -->
+      <div class="card molzone-card" style="padding:16px">
+        <div class="gen-h" data-i18n="mol.ext.title">外部编辑器(GaussView / Avogadro)</div>
+        <div class="gen-fld">
+          <span class="gen-lbl" data-i18n="mol.ext.editor">编辑器</span>
+          <div class="gen-inrow">
+            <select id="mol-editor-sel" class="ipt" style="flex:0 0 150px">
+              <option value="gaussview">GaussView</option>
+              <option value="avogadro">Avogadro</option>
+              <option value="custom" data-i18n="mol.ext.custom">自定义</option>
+            </select>
+            <input id="mol-editor-path" class="ipt" autocomplete="off" placeholder="可执行文件路径(设置页记忆,可空=平台默认打开)">
+            <button class="btn" id="mol-editor-path-btn" data-i18n="common.browse">浏览</button>
+          </div>
+        </div>
+        <div class="gen-fld">
+          <span class="gen-lbl" data-i18n="mol.ext.fmt">导出格式</span>
+          <div class="gen-inrow">
+            <select id="mol-editor-fmt" class="ipt" style="flex:0 0 130px">
+              <option value="xyz">XYZ</option>
+              <option value="mol">MOL</option>
+            </select>
+            <button class="btn primary" id="mol-editor-export" data-i18n="mol.ext.export">导出并打开</button>
+            <button class="btn" id="mol-editor-import" data-i18n="mol.ext.import">导入编辑结果</button>
+          </div>
+        </div>
+        <div class="mol-reimport-hint sub" id="mol-reimport-hint" data-i18n="mol.ext.hint">导出后自动检测外部改动;检测到变化即高亮「导入编辑结果」。</div>
+      </div>
+
+    </div>
+    </div>
+
     <!-- 结构查看 / 编辑器 -->
     <div class="card" style="padding:16px;margin-bottom:14px">
       <div class="gen-h" data-i18n="structure.editor.title">结构查看 / 编辑器</div>
@@ -200,6 +419,31 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
         <span class="sp" style="flex:1"></span>
         <span class="ed-vac" id="ed-vacuum">真空:—</span>
       </div>
+      <div class="ed-toolbar ed-toolbar2">
+        <select id="ed-style" class="ipt" style="flex:0 0 130px" title="显示样式">
+          <option value="ballstick" data-i18n="editor.style.ballstick">球棍</option>
+          <option value="stick" data-i18n="editor.style.stick">仅键</option>
+          <option value="line" data-i18n="editor.style.line">线框</option>
+          <option value="sphere" data-i18n="editor.style.sphere">空间填充</option>
+        </select>
+        <span class="ed-viewgrp" title="标准视角">
+          <button class="btn" data-view="x+">+X</button><button class="btn" data-view="x-">−X</button>
+          <button class="btn" data-view="y+">+Y</button><button class="btn" data-view="y-">−Y</button>
+          <button class="btn" data-view="z+">+Z</button><button class="btn" data-view="z-">−Z</button>
+          <button class="btn" data-view="iso" data-i18n="editor.view.iso">等距</button>
+        </span>
+        <button class="btn" id="ed-reset" data-i18n="editor.view.reset">重置视图</button>
+        <button class="btn" id="ed-bg" data-i18n="editor.bg">切换底色</button>
+        <button class="btn" id="ed-labels" data-i18n="editor.labels">切换标签</button>
+        <button class="btn" id="ed-measure" data-i18n="editor.measure">测量模式</button>
+        <button class="btn" id="ed-img" data-i18n="editor.saveimg">保存图片</button>
+        <span class="sp" style="flex:1"></span>
+        <button class="btn quiet" id="ed-selall" data-i18n="editor.selectall">全选</button>
+        <button class="btn quiet" id="ed-selclear" data-i18n="editor.clearsel">清除选择</button>
+        <button class="btn quiet" id="ed-seldel" data-i18n="editor.deletesel">删除选中</button>
+        <button class="btn quiet" id="ed-atomlist-toggle" data-i18n="editor.atomlist">原子列表</button>
+      </div>
+      <div class="ed-measbar" id="ed-measbar" hidden></div>
       <div class="ed-main">
         <div class="struct-canvas" id="ed-canvas"><div class="ed-empty" id="ed-empty">加载 POSCAR / CIF 或从 SAC 结果载入结构后,可点击原子选中并编辑</div></div>
         <div class="ed-side">
@@ -220,6 +464,10 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
             <div class="ed-row">固定底 <input id="ed-fixn" class="ipt" value="1" style="width:52px"> 层
               <button class="btn" id="ed-fixbtn" data-i18n="structure.editor.fix">固定</button></div>
             <div class="ed-fixstate sub" id="ed-fixstate"></div>
+          </div>
+          <div class="ed-atomlist" id="ed-atomlist" hidden>
+            <div class="ed-atomlist-head" data-i18n="editor.atomlist">原子列表</div>
+            <div class="ed-atomlist-body" id="ed-atomlist-body"></div>
           </div>
           <div class="actions" style="margin:0"><button class="btn primary" id="ed-save" data-i18n="structure.editor.save">保存 POSCAR</button></div>
         </div>
@@ -426,6 +674,129 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
           <button class="btn primary" id="engine-gen-btn">生成引擎输入</button>
         </div>
       </div>
+
+      <!-- Gaussian 分子面板(选 Gaussian 引擎时展开;任务/泛函/基组/色散/溶剂/混合基组/资源) -->
+      <div id="gauss-panel" hidden>
+        <div class="gen-fld">
+          <span class="gen-lbl" data-i18n="gauss.struct">结构来源(分子)</span>
+          <div class="gen-inrow">
+            <span class="gauss-structinfo" id="gauss-structinfo" data-i18n="gauss.struct.none">未选结构(从①分子建模「下一步」带入,或选结构文件)</span>
+            <input id="gauss-poscar" class="ipt" autocomplete="off" placeholder="或选 POSCAR/xyz 结构文件路径" style="flex:1">
+            <button class="btn" id="gauss-poscar-btn" data-i18n="common.browse">浏览</button>
+          </div>
+        </div>
+        <div class="gen-2col">
+          <div class="gen-fld">
+            <span class="gen-lbl" data-i18n="gauss.task">任务类型</span>
+            <select id="gauss-task" class="ipt"></select>
+          </div>
+          <div class="gen-fld" id="gauss-task-extra" hidden>
+            <span class="gen-lbl" id="gauss-task-extra-lbl">任务参数</span>
+            <input id="gauss-td-nstates" class="ipt" inputmode="numeric" placeholder="激发态数 NStates(默认 6)" hidden>
+            <input id="gauss-irc-maxpoints" class="ipt" inputmode="numeric" placeholder="IRC 最大路径点数(默认 20)" hidden>
+            <textarea id="gauss-modredundant" class="ipt" rows="2" placeholder="扫描定义(每行一条),如 B 1 2 S 10 0.1" hidden></textarea>
+          </div>
+        </div>
+        <div class="gen-2col">
+          <div class="gen-fld">
+            <span class="gen-lbl" data-i18n="gauss.func">泛函</span>
+            <select id="gauss-func" class="ipt">
+              <option>B3LYP</option><option>PBE0</option><option>M06-2X</option>
+              <option>wB97X-D</option><option>CAM-B3LYP</option><option>PBE</option>
+              <option>TPSS</option><option>HSE06</option>
+              <option value="__custom__" data-i18n="common.custom">自定义…</option>
+            </select>
+            <input id="gauss-func-custom" class="ipt" placeholder="自定义泛函关键字" hidden style="margin-top:6px">
+          </div>
+          <div class="gen-fld">
+            <span class="gen-lbl" data-i18n="gauss.basis">基组</span>
+            <select id="gauss-basis" class="ipt">
+              <option>STO-3G</option><option>3-21G</option><option>6-31G(d)</option>
+              <option>6-31G(d,p)</option><option>6-311+G(d,p)</option>
+              <option selected>def2-SVP</option><option>def2-TZVP</option>
+              <option>cc-pVDZ</option><option>cc-pVTZ</option><option>LANL2DZ</option>
+              <option>SDD</option>
+              <option value="__custom__" data-i18n="common.custom">自定义…</option>
+            </select>
+            <input id="gauss-basis-custom" class="ipt" placeholder="自定义基组关键字" hidden style="margin-top:6px">
+          </div>
+        </div>
+        <div class="gen-2col">
+          <div class="gen-fld">
+            <span class="gen-lbl" data-i18n="gauss.disp">色散校正</span>
+            <select id="gauss-disp" class="ipt">
+              <option value="" data-i18n="gauss.disp.none">无</option>
+              <option value="D3">D3</option><option value="D3BJ">D3BJ</option>
+            </select>
+          </div>
+          <div class="gen-fld">
+            <span class="gen-lbl" data-i18n="gauss.solv.model">溶剂模型</span>
+            <select id="gauss-solv-model" class="ipt">
+              <option value="" data-i18n="gauss.solv.none">无(气相)</option>
+              <option value="SMD">SMD</option><option value="PCM">PCM</option>
+              <option value="CPCM">CPCM</option>
+            </select>
+          </div>
+        </div>
+        <div class="gen-2col" id="gauss-solv-row" hidden>
+          <div class="gen-fld">
+            <span class="gen-lbl" data-i18n="gauss.solv.name">溶剂</span>
+            <select id="gauss-solv-name" class="ipt">
+              <option value="water">water</option><option value="methanol">methanol</option>
+              <option value="ethanol">ethanol</option><option value="acetonitrile">acetonitrile</option>
+              <option value="dmso">dmso</option><option value="thf">thf</option>
+              <option value="dichloromethane">dichloromethane</option>
+              <option value="chloroform">chloroform</option><option value="toluene">toluene</option>
+              <option value="benzene">benzene</option>
+              <option value="__generic__" data-i18n="gauss.solv.generic">Generic(自定义介电)</option>
+            </select>
+          </div>
+          <div class="gen-fld" id="gauss-solv-eps-row" hidden>
+            <span class="gen-lbl" data-i18n="gauss.solv.eps">介电常数 eps / epsinf</span>
+            <div class="gen-inrow">
+              <input id="gauss-solv-eps" class="ipt" inputmode="decimal" placeholder="eps,如 78.36">
+              <input id="gauss-solv-epsinf" class="ipt" inputmode="decimal" placeholder="epsinf,如 1.78(可空)">
+            </div>
+          </div>
+        </div>
+        <div class="gen-fld">
+          <span class="gen-lbl" data-i18n="gauss.mixed">混合基组(重元素赝势 / 分区基组)</span>
+          <div class="gen-inrow">
+            <button class="btn" id="gauss-mixed-btn" data-i18n="gauss.mixed.open">元素周期表选基组</button>
+            <span class="gauss-mixed-summary sub" id="gauss-mixed-summary" data-i18n="gauss.mixed.none">未启用混合基组(用上方单一基组)</span>
+          </div>
+        </div>
+        <div class="gen-2col">
+          <div class="gen-fld">
+            <span class="gen-lbl" data-i18n="gauss.charge">电荷 / 自旋多重度</span>
+            <div class="gen-inrow">
+              <input id="gauss-charge" class="ipt" inputmode="numeric" value="0" style="flex:1">
+              <input id="gauss-mult" class="ipt" inputmode="numeric" value="1" style="flex:1">
+            </div>
+          </div>
+          <div class="gen-fld">
+            <span class="gen-lbl" data-i18n="gauss.res">核数 / 内存GB / chk</span>
+            <div class="gen-inrow">
+              <input id="gauss-nproc" class="ipt" inputmode="numeric" placeholder="核数" style="flex:1">
+              <input id="gauss-mem" class="ipt" inputmode="numeric" placeholder="GB" style="flex:1">
+              <input id="gauss-chk" class="ipt" placeholder="chk 名(可空)" style="flex:1.4">
+            </div>
+          </div>
+        </div>
+        <div class="gen-fld">
+          <span class="gen-lbl" data-i18n="gauss.fname">输出文件名(.gjf)</span>
+          <input id="gauss-fname" class="ipt" placeholder="留空则按结构注释自动命名">
+        </div>
+        <div class="actions" style="margin-top:10px;flex-wrap:wrap">
+          <button class="btn" id="gauss-preview-btn" data-i18n="gauss.preview">预览</button>
+          <button class="btn primary" id="gauss-gen-btn" data-i18n="gauss.generate">生成输入文件</button>
+          <button class="btn" id="gauss-copy-btn" data-i18n="gauss.copy">复制到剪贴板</button>
+          <button class="btn" id="gauss-export-btn" data-i18n="gauss.export">导出到文件</button>
+          <button class="btn" id="gauss-submit-btn" data-i18n="gauss.submit">提交到服务器</button>
+        </div>
+        <div class="gauss-prevhead sub" id="gauss-prevhead"></div>
+        <pre class="mono" id="gauss-preview" style="margin:6px 0 0;max-height:34vh" data-i18n="gauss.preview.empty">点「预览」查看 Gaussian 输入(.gjf)全文</pre>
+      </div>
     </div>
 
     <div class="log" id="generate-log" data-anchor><div class="head">生成日志</div></div>
@@ -550,6 +921,129 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     <div class="log" id="project-log" data-anchor><div class="head">项目日志</div></div>
   </section>
 
+  <!-- ⑤ 波函数分析(分子化学 / 全功能场景显示) -->
+  <section class="page" data-page="wavefunction" id="page-wavefunction" hidden>
+    <div class="pagebar">
+      <h1 data-i18n="wavefn.title">波函数分析</h1>
+      <span class="stats" data-i18n="wavefn.subtitle">外部工具(Multiwfn / VMD)· 实空间分析(ESP / 轨道 / NCI / AIM)· 可视化渲染</span>
+    </div>
+
+    <div class="wf-tabs" id="wf-tabs">
+      <button class="wf-tab on" data-wftab="tools" data-i18n="wavefn.tab.tools">外部工具</button>
+      <button class="wf-tab" data-wftab="analyze" data-i18n="wavefn.tab.analyze">输入与分析</button>
+      <button class="wf-tab" data-wftab="visual" data-i18n="wavefn.tab.visual">可视化</button>
+    </div>
+
+    <!-- tab1:外部工具路径 + 检测 -->
+    <div class="wf-pane" data-wfpane="tools">
+      <div class="card" style="padding:16px">
+        <div class="gen-h" data-i18n="wavefn.tools.title">外部工具路径(检测后记忆到配置)</div>
+        <div class="wf-tool-row" data-tool="multiwfn">
+          <span class="wf-tool-name">Multiwfn</span>
+          <input class="ipt wf-tool-path" data-tk="multiwfn" placeholder="Multiwfn 可执行文件路径(空=PATH 查找)">
+          <button class="btn wf-tool-browse" data-tk="multiwfn" data-i18n="common.browse">浏览</button>
+          <span class="wf-tool-state" data-ts="multiwfn">—</span>
+        </div>
+        <div class="wf-tool-row" data-tool="vmd">
+          <span class="wf-tool-name">VMD</span>
+          <input class="ipt wf-tool-path" data-tk="vmd" placeholder="VMD 可执行文件路径(空=PATH 查找)">
+          <button class="btn wf-tool-browse" data-tk="vmd" data-i18n="common.browse">浏览</button>
+          <span class="wf-tool-state" data-ts="vmd">—</span>
+        </div>
+        <div class="wf-tool-row" data-tool="gaussview">
+          <span class="wf-tool-name">GaussView</span>
+          <input class="ipt wf-tool-path" data-tk="gaussview" placeholder="GaussView(gview)可执行文件路径">
+          <button class="btn wf-tool-browse" data-tk="gaussview" data-i18n="common.browse">浏览</button>
+          <span class="wf-tool-state" data-ts="gaussview">—</span>
+        </div>
+        <div class="wf-tool-row" data-tool="gaussian">
+          <span class="wf-tool-name" data-i18n="wavefn.tools.gaussian">本地 Gaussian</span>
+          <input class="ipt wf-tool-path" data-tk="gaussian" placeholder="g16 / g09 命令或路径">
+          <button class="btn wf-tool-browse" data-tk="gaussian" data-i18n="common.browse">浏览</button>
+          <span class="wf-tool-state" data-ts="gaussian">—</span>
+        </div>
+        <div class="actions" style="margin-top:12px">
+          <button class="btn primary" id="wf-probe" data-i18n="wavefn.tools.probe">检测</button>
+          <button class="btn" id="wf-tools-save" data-i18n="wavefn.tools.save">保存路径</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- tab2:输入与分析项 -->
+    <div class="wf-pane" data-wfpane="analyze" hidden>
+      <div class="card" style="padding:16px">
+        <div class="gen-h" data-i18n="wavefn.analyze.title">波函数文件与分析项</div>
+        <div class="gen-fld">
+          <span class="gen-lbl" data-i18n="wavefn.analyze.file">波函数文件(.fchk / .wfn / .wfx / .molden)</span>
+          <div class="gen-inrow">
+            <input id="wf-file" class="ipt" autocomplete="off" placeholder="波函数文件路径">
+            <button class="btn" id="wf-file-btn" data-i18n="common.browse">浏览</button>
+          </div>
+        </div>
+        <div class="gen-fld">
+          <span class="gen-lbl" data-i18n="wavefn.analyze.chips">分析项(七件套;可多选)</span>
+          <div class="chips" id="wf-analysis-chips"></div>
+        </div>
+        <div class="gen-fld" id="wf-analysis-params">
+          <div class="wf-inline"><label data-i18n="wavefn.analyze.orbital">HOMO/LUMO 轨道号</label>
+            <input id="wf-orbital" class="ipt" placeholder="HOMO(默认;或整数/LUMO/HOMO-1)" style="width:200px"></div>
+          <div class="wf-inline"><label data-i18n="wavefn.analyze.fragments">IGMH 片段(逗号分隔)</label>
+            <input id="wf-fragments" class="ipt" placeholder="如 1-12, 13-20" style="width:200px"></div>
+        </div>
+        <div class="gen-fld">
+          <span class="gen-lbl" data-i18n="wavefn.analyze.location">计算位置</span>
+          <div class="wf-radio">
+            <label><input type="radio" name="wf-loc" value="local" checked> <span data-i18n="wavefn.analyze.local">本机</span></label>
+            <label><input type="radio" name="wf-loc" value="remote"> <span data-i18n="wavefn.analyze.remote">远程集群(实验性)</span></label>
+            <select id="wf-remote-cluster" class="ipt" style="width:auto;display:inline-block" hidden></select>
+            <input id="wf-remote-dir" class="ipt" placeholder="远端工作目录" style="width:200px" hidden>
+            <input id="wf-remote-exe" class="ipt" placeholder="远端 Multiwfn 路径(默认 Multiwfn)" style="width:220px" hidden>
+          </div>
+        </div>
+        <div class="actions" style="margin-top:6px">
+          <button class="btn primary" id="wf-run" data-i18n="wavefn.analyze.run">运行分析</button>
+        </div>
+        <div class="wf-results" id="wf-results"></div>
+      </div>
+    </div>
+
+    <!-- tab3:可视化 -->
+    <div class="wf-pane" data-wfpane="visual" hidden>
+      <div class="card" style="padding:16px">
+        <div class="gen-h" data-i18n="wavefn.visual.title">可视化渲染(VMD Tachyon 高清)</div>
+        <div class="gen-fld">
+          <span class="gen-lbl" data-i18n="wavefn.visual.file">数据文件(.cub / .cube / .xyz / .pdb;可从分析产物带入)</span>
+          <div class="gen-inrow">
+            <input id="wf-vis-file" class="ipt" autocomplete="off" placeholder="cube / 结构文件路径">
+            <button class="btn" id="wf-vis-btn" data-i18n="common.browse">浏览</button>
+          </div>
+          <div class="wf-fromoutputs" id="wf-fromoutputs"></div>
+        </div>
+        <div class="gen-fld">
+          <span class="gen-lbl" data-i18n="wavefn.visual.scenes">渲染场景</span>
+          <div class="chips" id="wf-scene-chips"></div>
+        </div>
+        <div class="gen-fld">
+          <span class="gen-lbl" data-i18n="wavefn.visual.params">参数</span>
+          <div class="wf-params">
+            <label data-i18n="wavefn.visual.iso">密度等值面 <input id="wf-iso" class="ipt" value="0.001" style="width:80px"></label>
+            <label data-i18n="wavefn.visual.orbiso">轨道 iso ± <input id="wf-orbiso" class="ipt" value="0.05" style="width:70px"></label>
+            <label data-i18n="wavefn.visual.extsize">极值球大小 <input id="wf-extsize" class="ipt" value="0.1" style="width:70px"></label>
+            <label><input type="checkbox" id="wf-extval" checked> <span data-i18n="wavefn.visual.showext">显示极值点数值</span></label>
+          </div>
+        </div>
+        <div class="actions" style="margin-top:6px;flex-wrap:wrap">
+          <button class="btn primary" id="wf-render" data-i18n="wavefn.visual.render">渲染(Tachyon 高清)</button>
+          <button class="btn" id="wf-extrema" data-i18n="wavefn.visual.extrema">查询极值</button>
+        </div>
+        <div class="wf-render-out" id="wf-render-out"></div>
+        <div class="wf-extrema-out" id="wf-extrema-out"></div>
+      </div>
+    </div>
+
+    <div class="log" id="wavefn-log" data-anchor><div class="head">波函数分析日志</div></div>
+  </section>
+
   <section class="page" data-page="figures" id="page-figures" hidden>
     <div class="pagebar">
       <h1 data-i18n="figures.title">论文出图</h1>
@@ -669,8 +1163,77 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <button class="btn quiet" id="jb-remove">移出台账</button>
       <button class="btn quiet" id="jb-clean">清理失效条目</button>
     </div>
+
+    <!-- 快速批量提交:任意 .gjf/.com/.inp/.cell 逐个建轻量作业 + 入台账 -->
+    <div class="card" id="quick-submit-card" style="padding:16px;margin-bottom:12px">
+      <div class="gen-h" data-i18n="jobs.quick.title">快速批量提交(任意输入文件建作业)</div>
+      <div class="gen-fld">
+        <span class="gen-lbl" data-i18n="jobs.quick.files">输入文件(.gjf / .com / .inp / .cell;逐个添加,可删)</span>
+        <div class="gen-inrow">
+          <button class="btn" id="qs-add" data-i18n="jobs.quick.add">添加文件</button>
+          <button class="btn quiet" id="qs-clearfiles" data-i18n="jobs.quick.clearfiles">清空列表</button>
+          <span class="sub" id="qs-count">0 个文件</span>
+        </div>
+        <div class="qs-filelist" id="qs-filelist"></div>
+      </div>
+      <div class="gen-fld" style="margin-bottom:0">
+        <span class="gen-lbl" data-i18n="jobs.quick.outroot">输出根目录</span>
+        <div class="gen-inrow">
+          <input id="qs-out" class="ipt" autocomplete="off" placeholder="各作业目录生成在此根下">
+          <button class="btn" id="qs-out-btn" data-i18n="common.browse">浏览</button>
+          <button class="btn primary" id="qs-build" data-i18n="jobs.quick.build">建作业并入台账</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 台账筛选 + 批量勾选取消 -->
+    <div class="jobs-filterbar" id="jobs-filterbar">
+      <label class="jf-lbl">集群
+        <select id="jf-cluster" class="ipt"><option value="" data-i18n="jobs.filter.all_cluster">全部集群</option></select></label>
+      <label class="jf-lbl" data-i18n="jobs.filter.status">状态
+        <select id="jf-status" class="ipt">
+          <option value="" data-i18n="jobs.filter.all">全部</option>
+          <option value="run" data-i18n="jobs.filter.run">运行</option>
+          <option value="queue" data-i18n="jobs.filter.queue">排队</option>
+          <option value="done" data-i18n="jobs.filter.done">完成</option>
+          <option value="fail" data-i18n="jobs.filter.fail">失败</option>
+          <option value="need" data-i18n="jobs.filter.need">需人工</option>
+        </select></label>
+      <label class="jf-lbl" data-i18n="jobs.filter.sort">排序
+        <select id="jf-sort" class="ipt">
+          <option value="time" data-i18n="jobs.filter.sort_time">时间↓</option>
+          <option value="name" data-i18n="jobs.filter.sort_name">名称</option>
+          <option value="state" data-i18n="jobs.filter.sort_state">状态</option>
+        </select></label>
+      <span class="sp" style="flex:1"></span>
+      <button class="btn quiet" id="jb-checkall" data-i18n="jobs.filter.checkall">全选/反选</button>
+      <button class="btn quiet" id="jb-cancelchecked" data-i18n="jobs.filter.cancelchecked">批量取消勾选作业</button>
+    </div>
+
     <div class="card" id="jobs-card"></div>
     <div class="sub" id="jobs-stale" style="margin-top:8px;color:var(--warn)"></div>
+
+    <!-- 文件管理:列远端目录 + 下载选中 -->
+    <div class="card" id="file-manage-card" style="padding:16px;margin-top:12px">
+      <div class="gen-h" data-i18n="jobs.files.title">文件管理(远端目录浏览 / 下载)</div>
+      <div class="gen-fld">
+        <span class="gen-lbl" data-i18n="jobs.files.remote">集群 / 远端路径</span>
+        <div class="gen-inrow">
+          <select id="fm-cluster" class="ipt" style="flex:0 0 160px"></select>
+          <input id="fm-path" class="ipt" autocomplete="off" placeholder="远端目录路径,如 /home/me/run" style="flex:1">
+          <button class="btn" id="fm-ls" data-i18n="jobs.files.ls">列目录</button>
+        </div>
+      </div>
+      <div class="gen-fld" style="margin-bottom:0">
+        <div class="gen-inrow">
+          <input id="fm-localdir" class="ipt" autocomplete="off" placeholder="下载到本地目录">
+          <button class="btn" id="fm-localbtn" data-i18n="common.browse">浏览</button>
+          <button class="btn primary" id="fm-fetch" data-i18n="jobs.files.fetch">下载选中</button>
+        </div>
+      </div>
+      <div class="fm-table" id="fm-table"><span class="sub" data-i18n="jobs.files.empty">选集群 + 填远端路径后点「列目录」</span></div>
+    </div>
+
     <div class="log" id="jobs-log" data-anchor><div class="head">操作日志</div></div>
   </section>
 
@@ -930,6 +1493,9 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 <script src="dashboard.js"></script>
 <script src="settings.js"></script>
 <script src="editor.js"></script>
+<script src="molbuild.js"></script>
+<script src="gaussmol.js"></script>
+<script src="wavefn.js"></script>
 <script src="figures.js"></script>
 <script src="ai.js"></script>
 </body>

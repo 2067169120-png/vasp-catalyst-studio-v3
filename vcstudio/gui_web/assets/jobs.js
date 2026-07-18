@@ -64,6 +64,8 @@
     State.rows = (r && r.jobs) || [];
     State.stale = (r && r.stale) || [];
     if (r && r.error) VCS.log('读取台账失败:' + r.error, 'failc');
+    refreshClusterFilter();
+    if (typeof fmClusters === 'function') fmClusters();
     renderTable();
     renderStats();
     renderStale();
@@ -75,11 +77,14 @@
   // 单行作业 HTML。grpKey 非空 → 属于某折叠组(data-grp);hidden → 组当前折叠
   function rowHtml(r, grpKey, hidden) {
     const task = r.task && r.task !== '/' ? r.task : '';
-    const sel = State.selected.has(r.dir) ? ' class="sel"' : '';
+    const checked = State.selected.has(r.dir);
+    const sel = checked ? ' class="sel"' : '';
     const role = ROLE_LABEL[r.role] || '';
+    const isQuick = String(r.task || '').startsWith('quick');
     return `<tr data-dir="${VCS.esc(r.dir)}" data-name="${VCS.esc(r.name)}"` +
       (grpKey ? ` data-grp="${VCS.esc(grpKey)}"` : '') +
       (hidden ? ' hidden' : '') + `${sel}>` +
+      `<td class="chk"><input type="checkbox" class="jrow-chk"${checked ? ' checked' : ''}></td>` +
       `<td>${VCS.elementBadge(r.name)}<span class="name">${VCS.esc(r.name)}</span>` +
       (role ? ` <span class="role-tag">${VCS.esc(role)}</span>` : '') +
       (task ? ` <span class="sub">${VCS.esc(task)}</span>` : '') +
@@ -87,8 +92,10 @@
       `<button class="lnk struct" title="3D 结构预览(CONTCAR 优先,自动检查分子-衬底距离)">结构</button>` +
       `<button class="lnk meth" title="生成中英双语 Methods 段 + BibTeX(读真实 INCAR/KPOINTS/POTCAR)">方法</button>` +
       `<button class="lnk dos" title="总 DOS 出图(需本地 vasprun.xml)">DOS</button>` +
+      (isQuick
+        ? `<button class="lnk localrun" title="在本机跑该作业(需设置页配置本地软件命令)">本机运行</button>` : '') +
       (r.state === 'DONE'
-        ? `<button class="lnk derive" title="派生频率(ZPE)/电子结构静态作业">派生</button>` : '') +
+        ? `<button class="lnk derive" title="派生频率(ZPE)/电子结构静态/AIMD 作业">派生</button>` : '') +
       `</td>` +
       `<td>${VCS.pill(r.state)}</td>` +
       `<td class="mono">${r.job_id ? VCS.esc(r.job_id) : '—'}</td>` +
@@ -125,7 +132,7 @@
     const allDone = st.total > 0 && st.done === st.total;
     return `<tr class="grp-head" data-grp="${VCS.esc(key)}" ` +
       `title="点击${open ? '折叠' : '展开'}组内 ${st.total} 个作业">` +
-      `<td colspan="8"><span class="caret">${open ? '▾' : '▸'}</span>` +
+      `<td colspan="9"><span class="caret">${open ? '▾' : '▸'}</span>` +
       `<b class="grp-name">${VCS.esc(label)}</b>` +
       (isProject ? '<span class="grp-tag">吸附能项目</span>' : '') +
       `<span class="grp-prog">${st.done}/${st.total} 完成</span>` +
@@ -151,10 +158,16 @@
     const present = new Set(State.rows.map(r => r.dir));
     State.selected.forEach(d => { if (!present.has(d)) State.selected.delete(d); });
 
-    // 按吸附能项目分桶(project=null → 单独作业桶);保持台账原有次序
+    const rows0 = visibleRows();
+    if (!rows0.length) {
+      card.innerHTML = '<div class="empty"><p>当前筛选无匹配作业 — 调整上方筛选条件</p></div>';
+      return;
+    }
+
+    // 按吸附能项目分桶(project=null → 单独作业桶);保持筛选后次序
     const groups = new Map();
     const single = [];
-    State.rows.forEach(r => {
+    rows0.forEach(r => {
       if (r.project) {
         if (!groups.has(r.project)) groups.set(r.project, []);
         groups.get(r.project).push(r);
@@ -164,12 +177,12 @@
     });
 
     let h = '<table><thead><tr>' +
-      '<th>作业</th><th>状态</th><th class="mono">作业号</th>' +
+      '<th class="chk"></th><th>作业</th><th>状态</th><th class="mono">作业号</th>' +
       '<th class="num">步</th><th class="num">|F|max</th><th class="num">E0 (eV)</th>' +
       '<th>诊断</th><th class="mono">更新</th></tr></thead><tbody>';
     if (!groups.size) {
       // 没有任何项目组 → 保持旧平铺观感,不加组头
-      State.rows.forEach(r => { h += rowHtml(r, null, false); });
+      rows0.forEach(r => { h += rowHtml(r, null, false); });
     } else {
       groups.forEach((rows, pname) => {
         const key = 'p:' + pname;
@@ -186,6 +199,33 @@
     }
     h += '</tbody></table>';
     card.innerHTML = h;
+  }
+
+  // ── 筛选(集群 / 状态)+ 排序(时间↓/名称/状态) ──
+  const STATUS_GROUP = {
+    run: ['RUNNING'], queue: ['QUEUED', 'SUBMITTED', 'UPLOADED'], done: ['DONE'],
+    fail: ['FAILED', 'UNCONVERGED'], need: ['NEEDS_HUMAN'],
+  };
+  function visibleRows() {
+    const fc = ($('#jf-cluster') && $('#jf-cluster').value) || '';
+    const fs = ($('#jf-status') && $('#jf-status').value) || '';
+    const so = ($('#jf-sort') && $('#jf-sort').value) || 'time';
+    let rows = State.rows.slice();
+    if (fc) rows = rows.filter(r => (r.cluster || '') === fc);
+    if (fs && STATUS_GROUP[fs]) rows = rows.filter(r => STATUS_GROUP[fs].indexOf(r.state) >= 0);
+    if (so === 'name') rows.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    else if (so === 'state') rows.sort((a, b) => String(a.state).localeCompare(String(b.state)));
+    else rows.sort((a, b) => String(b.updated || '').localeCompare(String(a.updated || '')));
+    return rows;
+  }
+  function refreshClusterFilter() {
+    const sel = $('#jf-cluster');
+    if (!sel) return;
+    const cur = sel.value;
+    const clusters = Array.from(new Set(State.rows.map(r => r.cluster).filter(Boolean)));
+    sel.innerHTML = '<option value="">全部集群</option>' +
+      clusters.map(c => `<option value="${VCS.esc(c)}">${VCS.esc(c)}</option>`).join('');
+    if (clusters.indexOf(cur) >= 0) sel.value = cur;
   }
 
   // 组头折叠开关:记忆到 State.expanded(重载/自动刷新后保持)
@@ -279,7 +319,19 @@
         toggleDeriveRow(tr);
         return;
       }
+      if (e.target.closest('.localrun')) {
+        e.stopPropagation();
+        toggleLocalRow(tr);
+        return;
+      }
       const dir = tr.dataset.dir;
+      // 勾选框:切换选中(不清空其他选中)
+      if (e.target.closest('.jrow-chk')) {
+        if (State.selected.has(dir)) State.selected.delete(dir);
+        else State.selected.add(dir);
+        tr.classList.toggle('sel', State.selected.has(dir));
+        return;
+      }
       if (e.ctrlKey || e.metaKey) {
         if (State.selected.has(dir)) State.selected.delete(dir);
         else State.selected.add(dir);
@@ -287,8 +339,11 @@
         State.selected.clear();
         State.selected.add(dir);
       }
-      card.querySelectorAll('tr[data-dir]').forEach(t =>
-        t.classList.toggle('sel', State.selected.has(t.dataset.dir)));
+      card.querySelectorAll('tr[data-dir]').forEach(t => {
+        t.classList.toggle('sel', State.selected.has(t.dataset.dir));
+        const cb = t.querySelector('.jrow-chk');
+        if (cb) cb.checked = State.selected.has(t.dataset.dir);
+      });
     });
     card.addEventListener('dblclick', async e => {
       const tr = e.target.closest('tr[data-dir]');
@@ -363,20 +418,103 @@
     const row = document.createElement('tr');
     row.className = 'derive-row';
     row.dataset.for = dir;
-    row.innerHTML = '<td colspan="8"><div class="derive-box">' +
+    row.innerHTML = '<td colspan="9"><div class="derive-box">' +
       '<span class="derive-lbl">派生计算:</span>' +
       '<button class="btn quiet" data-dfreq>频率 (ZPE)</button>' +
       '<span class="derive-sep">电子结构静态:</span>' +
       '<label><input type="checkbox" data-k="pdos" checked> PDOS</label>' +
       '<label><input type="checkbox" data-k="bader"> Bader</label>' +
       '<label><input type="checkbox" data-k="chgdiff"> 差分电荷</label>' +
-      '<button class="btn quiet" data-dstatic>派生静态</button></div></td>';
+      '<button class="btn quiet" data-dstatic>派生静态</button>' +
+      '<span class="derive-sep">AIMD 热稳定性:</span>' +
+      '<label>系综 <select class="ipt" data-aimd-ens style="width:auto;display:inline-block">' +
+      '<option value="nvt">NVT</option><option value="nve">NVE</option></select></label>' +
+      '<label>温度 <input class="ipt" data-aimd-temp value="300" style="width:56px"> K</label>' +
+      '<label>步数 <input class="ipt" data-aimd-steps value="10000" style="width:72px"></label>' +
+      '<button class="btn quiet" data-daimd>派生 AIMD</button></div></td>';
     tr.parentNode.insertBefore(row, tr.nextSibling);
     row.querySelector('[data-dfreq]').addEventListener('click', () => doDeriveFreq(dir, name));
     row.querySelector('[data-dstatic]').addEventListener('click', () => {
       const kinds = Array.from(row.querySelectorAll('input[data-k]:checked')).map(c => c.dataset.k);
       doDeriveEstatic(dir, name, kinds);
     });
+    row.querySelector('[data-daimd]').addEventListener('click', () => {
+      const ens = row.querySelector('[data-aimd-ens]').value;
+      const temp = parseFloat(row.querySelector('[data-aimd-temp]').value) || 300;
+      const steps = parseInt(row.querySelector('[data-aimd-steps]').value, 10) || 10000;
+      doDeriveAimd(dir, name, ens, temp, steps);
+    });
+  }
+
+  async function doDeriveAimd(dir, name, ens, temp, steps) {
+    VCS.log('派生 AIMD 作业(' + ens.toUpperCase() + ' ' + temp + 'K ' + steps + '步):' + name + ' …');
+    const r = await VCS.call('derive_aimd', dir, ens, temp, null, steps, 1.0, null);
+    if (!r || r.ok === false || r.error) {
+      VCS.log('派生 AIMD 失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+    }
+    VCS.log('已派生 AIMD 作业:' + r.job_dir, 'okc');
+    (r.changes || []).forEach(c => VCS.log('  · ' + fmtChange(c)));
+    (r.warnings || []).forEach(w => VCS.log('  ⚠ ' + w, 'warnc'));
+    VCS.log('AIMD 作业已入台账,去列表提交', 'okc');
+    await reload();
+  }
+
+  // ── 本机运行展开区(quick/gaussian 作业):启动 / 轮询状态 / 停止 ──
+  const LocalRun = { timers: {} };
+  function toggleLocalRow(tr) {
+    const dir = tr.dataset.dir, name = tr.dataset.name || dir;
+    const next = tr.nextElementSibling;
+    if (next && next.classList.contains('localrun-row') && next.dataset.for === dir) {
+      stopLocalPoll(dir); next.remove(); return;
+    }
+    const row = document.createElement('tr');
+    row.className = 'localrun-row';
+    row.dataset.for = dir;
+    row.innerHTML = '<td colspan="9"><div class="derive-box">' +
+      '<span class="derive-lbl">本机运行:</span>' +
+      '<label>命令模板 <input class="ipt" data-lr-cmd placeholder="如 g16 或 g16 {input} {output}" style="width:280px"></label>' +
+      '<button class="btn quiet" data-lr-start>启动</button>' +
+      '<button class="btn quiet" data-lr-stop>停止</button>' +
+      '<span class="lr-state sub" data-lr-state>未运行</span>' +
+      '<pre class="mono lr-log" data-lr-log style="margin:6px 0 0;max-height:16vh"></pre></div></td>';
+    tr.parentNode.insertBefore(row, tr.nextSibling);
+    row.querySelector('[data-lr-start]').addEventListener('click', () => localStart(dir, name, row));
+    row.querySelector('[data-lr-stop]').addEventListener('click', () => localStop(dir, row));
+    localPoll(dir, row);   // 立即拉一次状态
+  }
+  async function localStart(dir, name, row) {
+    const tmpl = (row.querySelector('[data-lr-cmd]').value || '').trim();
+    if (!tmpl) { VCS.toast('请填入本机命令模板(如 g16)', 'fail'); return; }
+    VCS.log('本机运行启动:' + name + '(' + tmpl + ')…');
+    const r = await VCS.call('local_run_start', dir, tmpl);
+    if (!r || r.ok === false || r.error) {
+      VCS.log('本机运行启动失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+    }
+    VCS.log('本机运行已启动:pid ' + r.pid + '(' + (r.cmd || []).join(' ') + ')', 'okc');
+    startLocalPoll(dir, row);
+  }
+  async function localStop(dir, row) {
+    const r = await VCS.call('local_run_cancel', dir);
+    if (r && r.ok) { VCS.log('已停止本机作业:' + base(dir), 'okc'); localPoll(dir, row); }
+    else VCS.log('停止失败:' + ((r && r.error) || '未知'), 'failc');
+  }
+  async function localPoll(dir, row) {
+    const r = await VCS.call('local_run_status', dir);
+    if (!r || !r.ok) return;
+    const st = row.querySelector('[data-lr-state]');
+    if (st) st.textContent = '状态:' + (r.state || '?') +
+      (r.exit_code != null ? '(退出码 ' + r.exit_code + ')' : '');
+    const log = row.querySelector('[data-lr-log]');
+    if (log) log.textContent = r.log_tail || '';
+    if (r.state === 'DONE' || r.state === 'FAILED') stopLocalPoll(dir);
+  }
+  function startLocalPoll(dir, row) {
+    stopLocalPoll(dir);
+    LocalRun.timers[dir] = setInterval(() => localPoll(dir, row), 4000);
+    localPoll(dir, row);
+  }
+  function stopLocalPoll(dir) {
+    if (LocalRun.timers[dir]) { clearInterval(LocalRun.timers[dir]); delete LocalRun.timers[dir]; }
   }
 
   async function doDeriveFreq(dir, name) {
@@ -780,6 +918,128 @@
     }
   }
 
+  // ── 全选/反选 + 批量取消勾选作业 ──
+  function checkAll() {
+    const rows = visibleRows();
+    const allSel = rows.length && rows.every(r => State.selected.has(r.dir));
+    if (allSel) rows.forEach(r => State.selected.delete(r.dir));
+    else rows.forEach(r => State.selected.add(r.dir));
+    renderTable();
+  }
+  async function batchCancel() {
+    const dirs = selectedDirs();
+    if (!dirs.length) { VCS.log('批量取消:请先勾选要取消的作业', 'failc'); return; }
+    const name = requireProfile();
+    if (!name) return;
+    if (!await VCS.confirm('确认取消勾选的 ' + dirs.length + ' 个作业?(qdel/scancel + 台账标记 FAILED/用户取消)')) return;
+    const res = await remote(name, (pw, trust) => VCS.call('jobs_cancel_batch', dirs, name, pw, trust));
+    if (!res) return;
+    if (res.error) { VCS.log('批量取消失败:' + res.error, 'failc'); return; }
+    (res.cancelled || []).forEach(j => VCS.log('已取消作业号 ' + j, 'okc'));
+    (res.failed || []).forEach(f => VCS.log('取消失败 ' + f.job_id + ':' + f.reason, 'failc'));
+    await reload();
+  }
+
+  // ── 快速批量提交(任意输入文件建作业) ──
+  const QS = { files: [] };
+  function renderQsFiles() {
+    const box = $('#qs-filelist');
+    const cnt = $('#qs-count');
+    if (cnt) cnt.textContent = QS.files.length + ' 个文件';
+    if (!box) return;
+    box.innerHTML = QS.files.map((f, i) =>
+      `<span class="qs-file" data-i="${i}">${VCS.esc(f)} <b data-rm="${i}">×</b></span>`).join('') ||
+      '<span class="sub">尚未添加文件</span>';
+  }
+  async function qsAdd() {
+    const r = await VCS.call('pick_file', 'input');
+    if (r && r.error) { VCS.log('选择文件失败:' + r.error, 'failc'); return; }
+    if (r && r.path && QS.files.indexOf(r.path) < 0) { QS.files.push(r.path); renderQsFiles(); }
+  }
+  async function qsBuild() {
+    if (!QS.files.length) { VCS.log('快速提交:请先添加输入文件', 'failc'); return; }
+    const out = ($('#qs-out') && $('#qs-out').value.trim()) || '';
+    if (!out) { VCS.log('快速提交:请选择输出根目录', 'failc'); return; }
+    VCS.log('快速批量提交建作业(' + QS.files.length + ' 个文件)…');
+    const r = await VCS.call('quick_submit_build', QS.files, out, '');
+    if (!r || r.ok === false || r.error) {
+      VCS.log('快速提交失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+    }
+    (r.jobs || []).forEach(j => {
+      VCS.log('已建作业:' + j.name + '(' + j.engine + ')→ ' + j.dir, 'okc');
+      if (j.hint) VCS.log('  提交命令模板:' + j.hint);
+    });
+    (r.skipped || []).forEach(s => VCS.log('跳过 ' + s.file + ':' + s.reason, 'warnc'));
+    VCS.log('已建 ' + (r.jobs || []).length + ' 个作业并入台账,勾选后可上传提交', 'okc');
+    VCS.toast('已建 ' + (r.jobs || []).length + ' 个作业');
+    await reload();
+  }
+
+  // ── 文件管理:列远端目录 + 下载选中 ──
+  const FM = { entries: [], checked: new Set() };
+  function fmClusters() {
+    const sel = $('#fm-cluster');
+    if (!sel) return;
+    const names = Object.keys(State.profiles);
+    sel.innerHTML = names.length
+      ? names.map(n => `<option value="${VCS.esc(n)}">${VCS.esc(n)}</option>`).join('')
+      : '<option value="">(未配置集群)</option>';
+  }
+  async function fmList() {
+    const name = $('#fm-cluster') ? $('#fm-cluster').value : '';
+    if (!name || !State.profiles[name]) { VCS.log('文件管理:请先选集群', 'failc'); return; }
+    const path = ($('#fm-path') && $('#fm-path').value.trim()) || '.';
+    VCS.log('列远端目录:' + name + ':' + path + ' …');
+    const res = await remote(name, (pw, trust) => VCS.call('remote_ls', name, pw, path, trust));
+    if (!res) return;
+    if (res.error) { VCS.log('列目录失败:' + res.error, 'failc'); return; }
+    FM.entries = res.entries || [];
+    FM.checked = new Set();
+    renderFmTable(res.path || path);
+    VCS.log('已列出 ' + FM.entries.length + ' 项', 'okc');
+  }
+  function renderFmTable(path) {
+    const box = $('#fm-table');
+    if (!box) return;
+    if (!FM.entries.length) { box.innerHTML = '<span class="sub">目录为空:' + VCS.esc(path) + '</span>'; return; }
+    let h = '<table class="fm-tbl"><thead><tr><th></th><th>名称</th><th class="num">大小</th>' +
+      '<th>修改时间</th></tr></thead><tbody>';
+    FM.entries.forEach((e, i) => {
+      const dt = e.mtime ? new Date(e.mtime * 1000).toLocaleString() : '';
+      const icon = e.is_dir ? '📁 ' : '';
+      h += `<tr data-fi="${i}"><td>${e.is_dir ? '' : `<input type="checkbox" class="fm-chk" data-i="${i}">`}</td>` +
+        `<td>${icon}${VCS.esc(e.name)}</td><td class="num">${e.is_dir ? '—' : fmSize(e.size)}</td>` +
+        `<td class="mono">${VCS.esc(dt)}</td></tr>`;
+    });
+    box.innerHTML = h + '</tbody></table>';
+  }
+  function fmSize(n) {
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1048576).toFixed(1) + ' MB';
+  }
+  async function fmFetch() {
+    const name = $('#fm-cluster') ? $('#fm-cluster').value : '';
+    if (!name) { VCS.log('文件管理:请先选集群', 'failc'); return; }
+    const localDir = ($('#fm-localdir') && $('#fm-localdir').value.trim()) || '';
+    if (!localDir) { VCS.log('文件管理:请选择本地保存目录', 'failc'); return; }
+    const picks = Array.from(FM.checked);
+    if (!picks.length) { VCS.log('文件管理:请勾选要下载的文件', 'failc'); return; }
+    const base0 = ($('#fm-path') && $('#fm-path').value.trim()) || '.';
+    for (const i of picks) {
+      const e = FM.entries[i];
+      if (!e) continue;
+      const rpath = base0.replace(/\/+$/, '') + '/' + e.name;
+      const res = await remote(name, (pw, trust) =>
+        VCS.call('remote_fetch_file', name, pw, rpath, localDir, trust));
+      if (!res) return;
+      if (res.error) VCS.log('下载失败 ' + e.name + ':' + res.error, 'failc');
+      else VCS.log('已下载:' + res.local_path, 'okc');
+    }
+    VCS.toast('下载完成');
+    VCS.call('open_dir', localDir);
+  }
+
   // ── 初始化 ─────────────────────────────────────────────────────────────────
   function wire(id, fn) { const el = $('#' + id); if (el) el.addEventListener('click', fn); }
 
@@ -794,6 +1054,41 @@
     wire('jb-report', doReport);
     wire('jb-remove', doRemove);
     wire('jb-clean', doClean);
+    wire('jb-checkall', checkAll);
+    wire('jb-cancelchecked', batchCancel);
+    // 筛选行:变更即重渲
+    ['jf-cluster', 'jf-status', 'jf-sort'].forEach(id => {
+      const el = $('#' + id);
+      if (el) el.addEventListener('change', renderTable);
+    });
+    // 快速批量提交
+    wire('qs-add', qsAdd);
+    wire('qs-clearfiles', () => { QS.files = []; renderQsFiles(); });
+    wire('qs-out-btn', async () => {
+      const r = await VCS.call('pick_dir');
+      if (r && r.path && $('#qs-out')) $('#qs-out').value = r.path;
+    });
+    wire('qs-build', qsBuild);
+    const qsl = $('#qs-filelist');
+    if (qsl) qsl.addEventListener('click', e => {
+      const rm = e.target.closest('[data-rm]');
+      if (rm) { QS.files.splice(parseInt(rm.dataset.rm, 10), 1); renderQsFiles(); }
+    });
+    renderQsFiles();
+    // 文件管理
+    wire('fm-ls', fmList);
+    wire('fm-fetch', fmFetch);
+    wire('fm-localbtn', async () => {
+      const r = await VCS.call('pick_dir');
+      if (r && r.path && $('#fm-localdir')) $('#fm-localdir').value = r.path;
+    });
+    const fmt = $('#fm-table');
+    if (fmt) fmt.addEventListener('change', e => {
+      const cb = e.target.closest('.fm-chk');
+      if (!cb) return;
+      const i = parseInt(cb.dataset.i, 10);
+      if (cb.checked) FM.checked.add(i); else FM.checked.delete(i);
+    });
     const cb = $('#jb-auto');
     const iv = $('#jb-interval');
     // 自动刷新默认开 + 状态持久化(localStorage);启动即按持久化状态装载定时器

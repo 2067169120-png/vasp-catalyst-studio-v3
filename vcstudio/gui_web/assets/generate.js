@@ -223,8 +223,13 @@
     State2.engine = key;
     document.querySelectorAll('#engine-chips .chip').forEach(
       c => c.classList.toggle('on', c.dataset.val === key));
+    const isGauss = (key === 'gaussian');
+    // 通用简化表单:cp2k/castep 用;vasp 走上方四件套;gaussian 走专属分子面板
     const form = $('engine-form');
-    if (form) form.hidden = (key === 'vasp');
+    if (form) form.hidden = (key === 'vasp' || isGauss);
+    const gp = $('gauss-panel');
+    if (gp) gp.hidden = !isGauss;
+    if (isGauss && window.GaussMol && window.GaussMol.onShow) window.GaussMol.onShow();
     const banner = $('engine-nonequiv');
     if (banner) {
       if (key === 'vasp') { banner.hidden = true; }
@@ -327,5 +332,14 @@
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 
-  window.Generate = { reload: () => refreshPreview() };
+  // 供 molbuild.js(①分子建模「下一步」)携分子进 Gaussian 面板:选 Gaussian 引擎 + 载分子
+  async function useMolecule(struct) {
+    await loadEngines();
+    selectEngine('gaussian');
+    if (window.GaussMol && typeof window.GaussMol.useMolecule === 'function') {
+      window.GaussMol.useMolecule(struct);
+    }
+  }
+
+  window.Generate = { reload: () => refreshPreview(), useMolecule };
 })();

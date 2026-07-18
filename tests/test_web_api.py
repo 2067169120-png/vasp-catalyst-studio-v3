@@ -2815,3 +2815,886 @@ def test_struct_vacuum_invalid_state_error():
     api = Api()
     out = api.struct_vacuum({'elements': ['Fe'], 'coords': [], 'lattice': []})
     assert out['ok'] is False and out['vacuum'] is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 分子计算全流程总装(结构建模分子区 / ②Gaussian 面板 / ③本机运行·文件管理 /
+# ⑤波函数分析 / ④AIMD 派生)—— 全部注入假件,零 rdkit/paramiko/Multiwfn/VMD。
+# ═══════════════════════════════════════════════════════════════════════════════
+def _fake_molbuild(*, ocsr_ret=None, svg_ret=None, s3d_ret=None, info_ret=None,
+                   export_ret=None, open_ret=None, check_ret=None, reimport_ret=None,
+                   probe_avail=True, calls=None):
+    """molbuild 束假件:ocsr/smiles3d/molinfo/external_editor 四子模块。"""
+    calls = calls if calls is not None else {}
+    ocsr = types.SimpleNamespace()
+    ocsr.probe = lambda: {'available': probe_avail,
+                          'detail': 'DECIMER 可用' if probe_avail else '未安装 DECIMER'}
+    ocsr.image_to_smiles = lambda p: (calls.__setitem__('img', p) or (
+        ocsr_ret if ocsr_ret is not None else
+        {'ok': True, 'smiles': 'c1ccccc1', 'elapsed_ms': 12.3, 'error': ''}))
+    ocsr.smiles_svg = lambda s, width=400, height=300: (
+        calls.__setitem__('svg', {'s': s, 'w': width, 'h': height}) or (
+            svg_ret if svg_ret is not None else
+            {'ok': True, 'svg': '<svg>ok</svg>', 'error': ''}))
+    smiles3d = types.SimpleNamespace()
+    smiles3d.smiles_to_3d = lambda s, forcefield='auto', **k: (
+        calls.__setitem__('s3d', {'s': s, 'ff': forcefield}) or (
+            s3d_ret if s3d_ret is not None else
+            {'ok': True, 'elements': ['C', 'O'], 'coords': [[0, 0, 0], [1.2, 0, 0]],
+             'formula': 'CO', 'n_atoms': 2, 'charge': 0, 'multiplicity_hint': 1,
+             'warnings': ['实际所用力场:MMFF'], 'error': ''}))
+    molinfo = types.SimpleNamespace()
+    molinfo.mol_summary = lambda els, coords=None, charge=0: (
+        info_ret if info_ret is not None else
+        {'formula': 'CO', 'n_atoms': len(els), 'n_electrons': 14, 'mass_amu': 28.01,
+         'charge': charge, 'suggested_multiplicity': 1, 'multiplicity_note': '按奇偶初猜'})
+    molinfo.formula = lambda els: '+'.join(sorted(set(els))) or 'X'
+    ee = types.SimpleNamespace()
+    ee.export_for_editor = lambda els, cds, fmt='xyz', workdir=None: (
+        calls.__setitem__('export', {'fmt': fmt, 'workdir': workdir}) or (
+            export_ret if export_ret is not None else
+            {'ok': True, 'path': '/tmp/vcstudio_external_edit.' + fmt,
+             'mtime': 111.0, 'error': ''}))
+    ee.open_with = lambda p, editor_exe=None: (
+        calls.__setitem__('open', {'p': p, 'exe': editor_exe}) or (
+            open_ret if open_ret is not None else {'ok': True, 'error': ''}))
+    ee.check_reimport = lambda p, last: (
+        check_ret if check_ret is not None else {'changed': True, 'mtime': 222.0})
+    ee.reimport = lambda p: (
+        reimport_ret if reimport_ret is not None else
+        {'ok': True, 'elements': ['C', 'O'], 'coords': [[0, 0, 0], [1.2, 0, 0]], 'error': ''})
+    return types.SimpleNamespace(ocsr=ocsr, smiles3d=smiles3d, molinfo=molinfo,
+                                 external_editor=ee)
+
+
+def _fake_gaussian(*, preview_text='#P B3LYP def2-SVP opt\n\n0 1\nC 0 0 0\n', calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.GAUSSIAN_TASKS = {
+        'opt': {'name_zh': '结构优化', 'note': 'Opt'},
+        'freq': {'name_zh': '频率分析', 'note': 'Freq'},
+        'td': {'name_zh': '激发态 TD-DFT', 'note': 'TD'},
+    }
+    m.PERIODIC_TABLE_GROUPS = {
+        'note': '基组建议仅供起点',
+        'categories': [{'key': 'transition_metal', 'label': '过渡金属',
+                        'basis_suggestion': ['LANL2DZ', 'SDD'], 'needs_ecp': True}],
+        'elements': [{'z': 1, 'symbol': 'H', 'category': 'main_group',
+                      'basis_suggestion': ['6-31G(d)']},
+                     {'z': 26, 'symbol': 'Fe', 'category': 'transition_metal',
+                      'basis_suggestion': ['LANL2DZ', 'SDD']}],
+    }
+    m.preview = lambda spec: (calls.__setitem__('spec', spec) or preview_text)
+    return m
+
+
+# ── mol_ocsr_probe ───────────────────────────────────────────────────────────
+def test_mol_ocsr_probe_available():
+    api = Api(molbuild_mods=_fake_molbuild(probe_avail=True))
+    out = api.mol_ocsr_probe()
+    assert out['ok'] is True and out['available'] is True and 'DECIMER' in out['detail']
+
+
+def test_mol_ocsr_probe_missing_reports_unavailable():
+    api = Api(molbuild_mods=_fake_molbuild(probe_avail=False))
+    out = api.mol_ocsr_probe()
+    assert out['ok'] is True and out['available'] is False
+
+
+def test_mol_ocsr_probe_exception_caught():
+    boom = types.SimpleNamespace(ocsr=types.SimpleNamespace(
+        probe=lambda: (_ for _ in ()).throw(RuntimeError('炸'))))
+    out = Api(molbuild_mods=boom).mol_ocsr_probe()
+    assert out['ok'] is False and '炸' in out['error']
+
+
+# ── mol_image_to_smiles ──────────────────────────────────────────────────────
+def test_mol_image_to_smiles_ok():
+    calls = {}
+    api = Api(molbuild_mods=_fake_molbuild(calls=calls))
+    out = api.mol_image_to_smiles('/tmp/mol.png')
+    assert out['ok'] is True and out['smiles'] == 'c1ccccc1' and out['elapsed_ms'] == 12.3
+    assert calls['img'] == '/tmp/mol.png'
+
+
+def test_mol_image_to_smiles_empty_path_error():
+    api = Api(molbuild_mods=_fake_molbuild())
+    out = api.mol_image_to_smiles('   ')
+    assert out['ok'] is False and '图片' in out['error']
+
+
+def test_mol_image_to_smiles_driver_missing_passthrough():
+    api = Api(molbuild_mods=_fake_molbuild(
+        ocsr_ret={'ok': False, 'smiles': '', 'elapsed_ms': 0.0, 'error': '未安装 DECIMER'}))
+    out = api.mol_image_to_smiles('/tmp/x.png')
+    assert out['ok'] is False and 'DECIMER' in out['error']
+
+
+# ── mol_smiles_svg ───────────────────────────────────────────────────────────
+def test_mol_smiles_svg_ok():
+    calls = {}
+    api = Api(molbuild_mods=_fake_molbuild(calls=calls))
+    out = api.mol_smiles_svg('CCO', width=500, height=350)
+    assert out['ok'] is True and '<svg>' in out['svg']
+    assert calls['svg'] == {'s': 'CCO', 'w': 500, 'h': 350}
+
+
+def test_mol_smiles_svg_empty_error():
+    api = Api(molbuild_mods=_fake_molbuild())
+    out = api.mol_smiles_svg('')
+    assert out['ok'] is False and 'SMILES' in out['error']
+
+
+# ── mol_smiles_to_3d ─────────────────────────────────────────────────────────
+def test_mol_smiles_to_3d_builds_struct():
+    api = Api(molbuild_mods=_fake_molbuild())
+    out = api.mol_smiles_to_3d('CO', 'mmff')
+    assert out['ok'] is True
+    st = out['struct']
+    assert st['elements'] == ['C', 'O'] and st['natoms'] == 2 and st['formula'] == 'CO'
+    assert st['lattice'][0][0] == 15.0                 # 立方盒边长
+    assert out['charge'] == 0 and out['multiplicity_hint'] == 1
+    assert any('MMFF' in w for w in out['warnings'])
+
+
+def test_mol_smiles_to_3d_empty_error():
+    api = Api(molbuild_mods=_fake_molbuild())
+    out = api.mol_smiles_to_3d('')
+    assert out['ok'] is False and out['struct'] is None
+
+
+def test_mol_smiles_to_3d_rdkit_missing():
+    api = Api(molbuild_mods=_fake_molbuild(
+        s3d_ret={'ok': False, 'elements': [], 'coords': [], 'formula': '', 'n_atoms': 0,
+                 'charge': 0, 'multiplicity_hint': None, 'warnings': [],
+                 'error': '未安装 rdkit'}))
+    out = api.mol_smiles_to_3d('CCO')
+    assert out['ok'] is False and 'rdkit' in out['error'] and out['struct'] is None
+
+
+# ── mol_info ─────────────────────────────────────────────────────────────────
+def test_mol_info_ok():
+    api = Api(molbuild_mods=_fake_molbuild())
+    out = api.mol_info(['C', 'O'], [[0, 0, 0], [1.2, 0, 0]], 0)
+    assert out['ok'] is True and out['n_electrons'] == 14
+    assert out['suggested_multiplicity'] == 1 and out['formula'] == 'CO'
+
+
+def test_mol_info_empty_elements_error():
+    api = Api(molbuild_mods=_fake_molbuild())
+    out = api.mol_info([])
+    assert out['ok'] is False and '原子' in out['error']
+
+
+def test_mol_info_unregistered_element_caught():
+    boom = types.SimpleNamespace(molinfo=types.SimpleNamespace(
+        mol_summary=lambda els, coords=None, charge=0:
+        (_ for _ in ()).throw(ValueError('未登记元素'))))
+    out = Api(molbuild_mods=boom).mol_info(['Xx'])
+    assert out['ok'] is False and '未登记' in out['error']
+
+
+# ── mol_export_editor / mol_open_with ────────────────────────────────────────
+def test_mol_export_editor_ok():
+    calls = {}
+    api = Api(molbuild_mods=_fake_molbuild(calls=calls))
+    out = api.mol_export_editor(['C', 'O'], [[0, 0, 0], [1.2, 0, 0]], 'mol', '/wd')
+    assert out['ok'] is True and out['path'].endswith('.mol') and out['mtime'] == 111.0
+    assert calls['export'] == {'fmt': 'mol', 'workdir': '/wd'}
+
+
+def test_mol_export_editor_bad_fmt_passthrough():
+    api = Api(molbuild_mods=_fake_molbuild(
+        export_ret={'ok': False, 'path': None, 'mtime': None, 'error': '未知导出格式'}))
+    out = api.mol_export_editor(['C'], [[0, 0, 0]], 'pdb')
+    assert out['ok'] is False and '格式' in out['error']
+
+
+def test_mol_open_with_ok():
+    calls = {}
+    api = Api(molbuild_mods=_fake_molbuild(calls=calls))
+    out = api.mol_open_with('/tmp/x.xyz', '/usr/bin/avogadro')
+    assert out['ok'] is True and calls['open']['exe'] == '/usr/bin/avogadro'
+
+
+def test_mol_open_with_empty_path_error():
+    api = Api(molbuild_mods=_fake_molbuild())
+    out = api.mol_open_with('')
+    assert out['ok'] is False and '路径' in out['error']
+
+
+# ── mol_check_reimport / mol_reimport ────────────────────────────────────────
+def test_mol_check_reimport_changed():
+    api = Api(molbuild_mods=_fake_molbuild())
+    out = api.mol_check_reimport('/tmp/edit.xyz', 100.0)
+    assert out['ok'] is True and out['changed'] is True and out['mtime'] == 222.0
+
+
+def test_mol_check_reimport_empty_error():
+    api = Api(molbuild_mods=_fake_molbuild())
+    out = api.mol_check_reimport('')
+    assert out['ok'] is False and out['changed'] is False
+
+
+def test_mol_reimport_builds_struct(tmp_path):
+    f = tmp_path / 'edit.xyz'
+    f.write_text('2\n\nC 0 0 0\nO 1.2 0 0\n', encoding='utf-8')
+    api = Api(molbuild_mods=_fake_molbuild())
+    out = api.mol_reimport(str(f))
+    assert out['ok'] is True and out['struct']['elements'] == ['C', 'O']
+    assert out['struct']['natoms'] == 2
+
+
+def test_mol_reimport_missing_file_error():
+    api = Api(molbuild_mods=_fake_molbuild())
+    out = api.mol_reimport('/nope/edit.xyz')
+    assert out['ok'] is False and '不存在' in out['error']
+
+
+# ── gauss_tasks / gauss_periodic_table ───────────────────────────────────────
+def test_gauss_tasks_shape():
+    api = Api(gaussian_mod=_fake_gaussian())
+    out = api.gauss_tasks()
+    assert out['ok'] is True
+    keys = {t['key'] for t in out['tasks']}
+    assert 'td' in keys
+    td = next(t for t in out['tasks'] if t['key'] == 'td')
+    assert td['name'] == '激发态 TD-DFT'
+
+
+def test_gauss_periodic_table_shape():
+    api = Api(gaussian_mod=_fake_gaussian())
+    out = api.gauss_periodic_table()
+    assert out['ok'] is True
+    syms = {e['symbol'] for e in out['table']['elements']}
+    assert 'Fe' in syms
+    fe = next(e for e in out['table']['elements'] if e['symbol'] == 'Fe')
+    assert 'LANL2DZ' in fe['basis_suggestion']
+
+
+def test_gauss_tasks_exception_caught():
+    class _Boom:
+        @property
+        def GAUSSIAN_TASKS(self):
+            raise RuntimeError('炸')
+    out = Api(gaussian_mod=_Boom()).gauss_tasks()
+    assert out['ok'] is False and '炸' in out['error']
+
+
+# ── engine_preview ───────────────────────────────────────────────────────────
+def test_engine_preview_gaussian_text_and_chars(tmp_path):
+    calls = {}
+    poscar = tmp_path / 'POSCAR'
+    poscar.write_text(_EDITOR_POSCAR, encoding='utf-8')
+    api = Api(engines_mod=_fake_engines(), gaussian_mod=_fake_gaussian(calls=calls))
+    out = api.engine_preview('gaussian', {
+        'poscar': str(poscar), 'periodic': False, 'functional': 'B3LYP',
+        'extras': {'gaussian_task': 'opt', 'basis': 'def2-SVP'}})
+    assert out['ok'] is True and out['chars'] == len(out['text'])
+    assert 'B3LYP' in out['text']
+    assert calls['spec'].extras['gaussian_task'] == 'opt'   # extras 透传进 CalcSpec
+
+
+def test_engine_preview_generic_roundtrip(tmp_path):
+    poscar = tmp_path / 'POSCAR'
+    poscar.write_text(_EDITOR_POSCAR, encoding='utf-8')
+
+    def _writer(spec, out):
+        p = os.path.join(out, 'cp2k.inp')
+        with open(p, 'w', encoding='utf-8') as f:
+            f.write('&GLOBAL\n  RUN_TYPE GEO_OPT\n&END\n')
+        return {'files': [p], 'warnings': ['需自备 GTH 赝势']}
+    eng = _fake_engines()
+    eng.get_backend = lambda name: types.SimpleNamespace(generate_inputs=_writer)
+    api = Api(engines_mod=eng)
+    out = api.engine_preview('cp2k', {'poscar': str(poscar), 'periodic': True,
+                                      'cutoff_ev': 500})
+    assert out['ok'] is True and 'RUN_TYPE' in out['text'] and out['chars'] > 0
+    assert '需自备 GTH 赝势' in out['warnings']
+
+
+def test_engine_preview_missing_structure_error():
+    api = Api(engines_mod=_fake_engines(), gaussian_mod=_fake_gaussian())
+    out = api.engine_preview('gaussian', {'poscar': '/nope/POSCAR'})
+    assert out['ok'] is False and '结构文件' in out['error']
+
+
+def test_engine_generate_passes_extras(tmp_path):
+    calls = {}
+    poscar = tmp_path / 'POSCAR'
+    poscar.write_text(_EDITOR_POSCAR, encoding='utf-8')
+    api = Api(engines_mod=_fake_engines(calls=calls))
+    out = api.engine_generate('gaussian', {
+        'poscar': str(poscar), 'periodic': False,
+        'extras': {'gaussian_task': 'freq', 'nproc': 8}}, str(tmp_path / 'g_out'))
+    assert out['ok'] is True
+    assert calls['spec']['extras'] == {'gaussian_task': 'freq', 'nproc': 8}
+
+
+# ── quick_submit_build ───────────────────────────────────────────────────────
+def _fake_quick_submit(*, jobs=None, skipped=None, ok=True, error=None, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _build(files, out_root, job_prefix=''):
+        calls['build'] = {'files': list(files), 'out_root': out_root, 'prefix': job_prefix}
+        return {'ok': ok, 'jobs': list(jobs if jobs is not None else
+                [{'dir': out_root + '/benzene', 'name': 'benzene', 'engine': 'gaussian',
+                  'files': ['benzene.gjf']}]),
+                'skipped': list(skipped or []), 'error': error}
+    m.build_quick_jobs = _build
+    m.submit_hint = lambda engine: f'{engine}-cmd-hint'
+    return m
+
+
+def test_quick_submit_build_registers_and_hints(tmp_path):
+    registered = []
+    api = Api(quick_submit_mod=_fake_quick_submit(),
+              ledger_mod=_fake_ledger_register(registered))
+    out = api.quick_submit_build(['/x/benzene.gjf'], str(tmp_path))
+    assert out['ok'] is True and len(out['jobs']) == 1
+    j = out['jobs'][0]
+    assert j['engine'] == 'gaussian' and j['hint'] == 'gaussian-cmd-hint'
+    assert j['registered'] is True and registered == [j['dir']]
+
+
+def test_quick_submit_build_reports_skipped(tmp_path):
+    api = Api(quick_submit_mod=_fake_quick_submit(
+        jobs=[], skipped=[{'file': '/x/foo.txt', 'reason': '无法识别引擎'}]),
+        ledger_mod=_fake_ledger_register([]))
+    out = api.quick_submit_build(['/x/foo.txt'], str(tmp_path))
+    assert out['ok'] is True and out['jobs'] == []
+    assert out['skipped'][0]['reason'] == '无法识别引擎'
+
+
+def test_quick_submit_build_no_files_error():
+    api = Api(quick_submit_mod=_fake_quick_submit())
+    out = api.quick_submit_build([], '/root')
+    assert out['ok'] is False and '输入文件' in out['error']
+
+
+def test_quick_submit_build_no_root_error():
+    api = Api(quick_submit_mod=_fake_quick_submit())
+    out = api.quick_submit_build(['/x/a.gjf'], '')
+    assert out['ok'] is False and '输出根目录' in out['error']
+
+
+# ── jobs_cancel_batch ────────────────────────────────────────────────────────
+def _fake_batch_cancel(*, ok=True, cancelled=None, failed=None, error=None,
+                       needs_trust=False, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _cancel(profile, jobs, *, password=None, trust_new=False):
+        calls['cancel'] = {'jobs': list(jobs), 'password': password, 'trust_new': trust_new}
+        return {'ok': ok, 'cancelled': list(cancelled or ['12345']),
+                'failed': list(failed or []), 'error': error, 'needs_trust': needs_trust}
+    m.cancel_batch = _cancel
+    return m
+
+
+def test_jobs_cancel_batch_ok():
+    calls = {}
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              batch_ops_mod=_fake_batch_cancel(calls=calls))
+    out = api.jobs_cancel_batch(['/j/a', '/j/b'], 'c1', None, False)
+    assert out['ok'] is True and out['cancelled'] == ['12345']
+    assert calls['cancel']['jobs'] == ['/j/a', '/j/b']
+
+
+def test_jobs_cancel_batch_no_dirs_error():
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store), batch_ops_mod=_fake_batch_cancel())
+    out = api.jobs_cancel_batch([], 'c1', None)
+    assert out['ok'] is False and '取消' in out['error']
+
+
+def test_jobs_cancel_batch_needs_password():
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='password')}
+    secrets = types.SimpleNamespace(get_password=lambda n: None, set_password=lambda n, p: None)
+    api = Api(profiles_mod=_fake_profiles(store), secrets_mod=secrets,
+              batch_ops_mod=_fake_batch_cancel())
+    out = api.jobs_cancel_batch(['/j/a'], 'c1', None)
+    assert out['error'] == 'NEED_PASSWORD'
+
+
+# ── local_run_start / status / cancel ────────────────────────────────────────
+def _fake_local_runner(*, start_ret=None, status_ret=None, cancel_ret=None, calls=None):
+    calls = calls if calls is not None else {}
+
+    class _LocalJob:
+        def __init__(self, cmd, cwd, log_file, env=None):
+            self.cmd, self.cwd, self.log_file, self.env = cmd, cwd, log_file, env
+            calls['job'] = {'cmd': cmd, 'cwd': cwd, 'log_file': log_file}
+    m = types.SimpleNamespace()
+    m.LocalJob = _LocalJob
+    m.start = lambda job: (start_ret if start_ret is not None else
+                           {'ok': True, 'pid': 4242, 'error': ''})
+    m.status = lambda d: (status_ret if status_ret is not None else
+                          {'state': 'RUNNING', 'pid': 4242, 'exit_code': None,
+                           'log_tail': '... running ...'})
+    m.cancel = lambda d: (cancel_ret if cancel_ret is not None else {'ok': True, 'error': ''})
+    return m
+
+
+def test_local_run_start_builds_cmd_from_input(tmp_path):
+    (tmp_path / 'benzene.gjf').write_text('#opt', encoding='utf-8')
+    calls = {}
+    api = Api(local_runner_mod=_fake_local_runner(calls=calls))
+    out = api.local_run_start(str(tmp_path), 'g16')
+    assert out['ok'] is True and out['pid'] == 4242
+    assert out['cmd'] == ['g16', 'benzene.gjf']          # 末尾追加识别到的输入文件
+    assert calls['job']['cwd'] == str(tmp_path)
+
+
+def test_local_run_start_placeholder_template(tmp_path):
+    (tmp_path / 'mol.com').write_text('#sp', encoding='utf-8')
+    api = Api(local_runner_mod=_fake_local_runner())
+    out = api.local_run_start(str(tmp_path), 'g09 {input} {output}')
+    assert out['ok'] is True and out['cmd'] == ['g09', 'mol.com', 'mol.log']
+
+
+def test_local_run_start_missing_dir_error():
+    api = Api(local_runner_mod=_fake_local_runner())
+    out = api.local_run_start('/no/such/dir', 'g16')
+    assert out['ok'] is False and '目录' in out['error']
+
+
+def test_local_run_start_missing_template_error(tmp_path):
+    api = Api(local_runner_mod=_fake_local_runner())
+    out = api.local_run_start(str(tmp_path), '  ')
+    assert out['ok'] is False and '命令模板' in out['error']
+
+
+def test_local_run_status_ok(tmp_path):
+    api = Api(local_runner_mod=_fake_local_runner())
+    out = api.local_run_status(str(tmp_path))
+    assert out['ok'] is True and out['state'] == 'RUNNING' and out['pid'] == 4242
+
+
+def test_local_run_status_missing_dir_error():
+    api = Api(local_runner_mod=_fake_local_runner())
+    out = api.local_run_status('')
+    assert out['ok'] is False and out['state'] == 'NOT_STARTED'
+
+
+def test_local_run_cancel_ok(tmp_path):
+    api = Api(local_runner_mod=_fake_local_runner())
+    out = api.local_run_cancel(str(tmp_path))
+    assert out['ok'] is True
+
+
+def test_local_run_cancel_missing_dir_error():
+    api = Api(local_runner_mod=_fake_local_runner())
+    out = api.local_run_cancel('')
+    assert out['ok'] is False
+
+
+# ── remote_ls / remote_fetch_file ────────────────────────────────────────────
+class _FakeConnectError(Exception):
+    def __init__(self, message, needs_trust=False):
+        super().__init__(message)
+        self.needs_trust = needs_trust
+
+
+def _fake_connection(*, entries=None, connect_boom=None, calls=None, exec_ret=None):
+    """connection 假件:open_client → (client, jump);client.open_sftp/exec_command。"""
+    calls = calls if calls is not None else {}
+
+    class _SFTP:
+        def listdir_attr(self, path):
+            calls['ls_path'] = path
+            attrs = []
+            for e in (entries if entries is not None else
+                      [('run.log', 2048, 1700000000, 0o100644),
+                       ('OUTCAR', 4096, 1700000100, 0o100644),
+                       ('scratch', 0, 1700000200, 0o040755)]):
+                attrs.append(types.SimpleNamespace(
+                    filename=e[0], st_size=e[1], st_mtime=e[2], st_mode=e[3]))
+            return attrs
+
+        def get(self, remote, local):
+            calls['get'] = {'remote': remote, 'local': local}
+            with open(local, 'w', encoding='utf-8') as f:
+                f.write('fetched')
+
+        def put(self, local, remote):
+            calls.setdefault('put', []).append({'local': local, 'remote': remote})
+
+        def open(self, path, mode):
+            calls.setdefault('scripts', []).append(path)
+            return _SFTPFile()
+
+        def close(self):
+            calls['sftp_closed'] = True
+
+    class _SFTPFile:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def write(self, data):
+            calls.setdefault('script_text', []).append(data)
+
+    class _Chan:
+        def recv_exit_status(self):
+            return (exec_ret or {}).get('code', 0)
+
+    class _Out:
+        channel = _Chan()
+
+        def read(self):
+            return (exec_ret or {}).get('stdout', b' minima found\n')
+
+    class _Client:
+        def open_sftp(self):
+            return _SFTP()
+
+        def exec_command(self, cmd, timeout=None):
+            calls.setdefault('exec', []).append(cmd)
+            return None, _Out(), None
+
+    m = types.SimpleNamespace()
+    m.ConnectError = _FakeConnectError
+
+    def _open(prof, pw, trust_new=False):
+        calls['open'] = {'prof': prof.name, 'trust_new': trust_new}
+        if connect_boom:
+            raise connect_boom
+        return _Client(), None
+    m.open_client = _open
+    m.close_quiet = lambda *cs: calls.__setitem__('closed', True)
+    return m
+
+
+def test_remote_ls_lists_entries(tmp_path):
+    calls = {}
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              connection_mod=_fake_connection(calls=calls))
+    out = api.remote_ls('c1', None, '/home/me/run')
+    assert out['ok'] is True and calls['ls_path'] == '/home/me/run'
+    names = [e['name'] for e in out['entries']]
+    assert 'scratch' in names and 'OUTCAR' in names
+    scratch = next(e for e in out['entries'] if e['name'] == 'scratch')
+    assert scratch['is_dir'] is True and out['entries'][0]['is_dir'] is True  # 目录排前
+
+
+def test_remote_ls_connect_error_needs_trust():
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              connection_mod=_fake_connection(
+                  connect_boom=_FakeConnectError('未知指纹', needs_trust=True)))
+    out = api.remote_ls('c1', None, '.')
+    assert out['ok'] is False and out['needs_trust'] is True and '指纹' in out['error']
+
+
+def test_remote_ls_needs_password():
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='password')}
+    secrets = types.SimpleNamespace(get_password=lambda n: None, set_password=lambda n, p: None)
+    api = Api(profiles_mod=_fake_profiles(store), secrets_mod=secrets,
+              connection_mod=_fake_connection())
+    out = api.remote_ls('c1', None, '.')
+    assert out['error'] == 'NEED_PASSWORD'
+
+
+def test_remote_fetch_file_downloads(tmp_path):
+    calls = {}
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              connection_mod=_fake_connection(calls=calls))
+    out = api.remote_fetch_file('c1', None, '/home/me/run/OUTCAR', str(tmp_path))
+    assert out['ok'] is True
+    assert out['local_path'] == os.path.join(str(tmp_path), 'OUTCAR')
+    assert os.path.isfile(out['local_path'])
+    assert calls['get']['remote'] == '/home/me/run/OUTCAR'
+
+
+def test_remote_fetch_file_missing_remote_error():
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store), connection_mod=_fake_connection())
+    out = api.remote_fetch_file('c1', None, '', '/tmp')
+    assert out['ok'] is False and '远端文件' in out['error']
+
+
+def test_remote_fetch_file_missing_local_error():
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store), connection_mod=_fake_connection())
+    out = api.remote_fetch_file('c1', None, '/r/OUTCAR', '')
+    assert out['ok'] is False and '本地' in out['error']
+
+
+# ── 波函数分析:probe / scenes / run / render / extrema / run_remote ───────────
+def _fake_multiwfn(*, run_ret=None, probe_avail=True, extrema=None, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.ANALYSES = {
+        'esp_extrema': {'name': 'ESP 表面极值点', 'stdin_script': lambda p: '12\n0\n',
+                        'outputs': (), 'note': 'ESP 极值'},
+        'homo_lumo_cube': {'name': 'HOMO/LUMO 轨道 cube',
+                           'stdin_script': lambda p: '5\n4\nHOMO\n', 'outputs': ('orbital.cub',),
+                           'note': '轨道 cube'},
+    }
+    m.probe = lambda exe=None: {'available': probe_avail, 'path': '/opt/Multiwfn' if probe_avail
+                                else None, 'detail': 'ok' if probe_avail else '未找到 Multiwfn'}
+
+    def _run(wf, key, exe=None, workdir=None, params=None):
+        calls.setdefault('runs', []).append({'wf': wf, 'key': key, 'exe': exe})
+        if run_ret is not None:
+            return dict(run_ret)
+        return {'ok': True, 'outputs': [f'{key}_orbital.cub'] if 'cube' in key else [],
+                'stdout_tail': ' Minima\n 1  0.0 0.0 0.0  -12.3\n', 'elapsed_s': 1.2,
+                'error': ''}
+    m.run = _run
+    m.extrema_parse = lambda text: (extrema if extrema is not None else
+                                    {'minima': [{'value_kcal': -12.3, 'xyz': [0.0, 0.0, 0.0]}],
+                                     'maxima': []})
+    return m
+
+
+def _fake_vmd(*, render_ret=None, probe_avail=True, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.SCENES = {
+        'esp_surface': {'name': 'ESP 着色分子表面', 'files': ('density', 'esp'),
+                        'note': 'ESP 表面'},
+        'orbital': {'name': '分子轨道等值面', 'files': ('cube',), 'note': '轨道'},
+    }
+    m.probe = lambda exe=None: {'available': probe_avail, 'path': '/opt/vmd' if probe_avail
+                                else None, 'detail': 'ok' if probe_avail else '未找到 VMD'}
+
+    def _render(scene, files, out_png, exe=None, params=None, timeout=600):
+        calls['render'] = {'scene': scene, 'files': files, 'out': out_png, 'exe': exe}
+        if render_ret is not None:
+            return dict(render_ret)
+        return {'ok': True, 'png': out_png, 'tcl': 'mol new ...', 'stdout_tail': 'done',
+                'error': ''}
+    m.render = _render
+    return m
+
+
+def test_wavefn_probe_all_tools():
+    api = Api(multiwfn_mod=_fake_multiwfn(probe_avail=True),
+              vmd_mod=_fake_vmd(probe_avail=False),
+              config_mod=_fake_config(cfg={}))
+    out = api.wavefn_probe(['multiwfn', 'vmd', 'gaussview'])
+    assert out['ok'] is True
+    assert out['tools']['multiwfn']['available'] is True
+    assert out['tools']['vmd']['available'] is False
+    assert out['tools']['gaussview']['available'] is False   # PATH 无 gview,确定性未找到
+
+
+def test_wavefn_probe_uses_configured_path():
+    calls = {}
+    mw = _fake_multiwfn(calls=calls)
+    api = Api(multiwfn_mod=mw, vmd_mod=_fake_vmd(),
+              config_mod=_fake_config(cfg={'tool_paths': {'multiwfn': '/custom/Multiwfn'}}))
+    api.wavefn_probe(['multiwfn'])
+    # probe 被调用(available 依赖 fake),配置路径读取无异常
+    out = api.wavefn_probe(['multiwfn'])
+    assert out['ok'] is True
+
+
+def test_wavefn_scenes_catalog():
+    api = Api(multiwfn_mod=_fake_multiwfn(), vmd_mod=_fake_vmd())
+    out = api.wavefn_scenes()
+    assert out['ok'] is True
+    akeys = {a['key'] for a in out['analyses']}
+    skeys = {s['key'] for s in out['scenes']}
+    assert 'esp_extrema' in akeys and 'esp_surface' in skeys
+    esp = next(s for s in out['scenes'] if s['key'] == 'esp_surface')
+    assert esp['files'] == ['density', 'esp']
+
+
+def test_wavefn_run_multiple_analyses(tmp_path):
+    calls = {}
+    wf = tmp_path / 'mol.fchk'
+    wf.write_text('x', encoding='utf-8')
+    api = Api(multiwfn_mod=_fake_multiwfn(calls=calls), config_mod=_fake_config(cfg={}))
+    out = api.wavefn_run(str(wf), ['esp_extrema', 'homo_lumo_cube'])
+    assert out['ok'] is True and len(out['results']) == 2
+    esp = out['results'][0]
+    assert esp['analysis'] == 'esp_extrema' and 'extrema' in esp
+    assert esp['extrema']['minima'][0]['value_kcal'] == -12.3
+    assert [r['key'] for r in calls['runs']] == ['esp_extrema', 'homo_lumo_cube']
+
+
+def test_wavefn_run_missing_file_error():
+    api = Api(multiwfn_mod=_fake_multiwfn(), config_mod=_fake_config(cfg={}))
+    out = api.wavefn_run('', ['esp_extrema'])
+    assert out['ok'] is False and '波函数文件' in out['error']
+
+
+def test_wavefn_run_no_analyses_error(tmp_path):
+    wf = tmp_path / 'mol.wfn'
+    wf.write_text('x', encoding='utf-8')
+    api = Api(multiwfn_mod=_fake_multiwfn(), config_mod=_fake_config(cfg={}))
+    out = api.wavefn_run(str(wf), [])
+    assert out['ok'] is False and '分析项' in out['error']
+
+
+def test_wavefn_run_missing_multiwfn_returns_script(tmp_path):
+    wf = tmp_path / 'mol.fchk'
+    wf.write_text('x', encoding='utf-8')
+    mw = _fake_multiwfn(run_ret={'ok': False, 'outputs': [], 'stdout_tail': '',
+                                 'elapsed_s': 0.0, 'script': '12\n0\n',
+                                 'error': '未找到 Multiwfn'})
+    api = Api(multiwfn_mod=mw, config_mod=_fake_config(cfg={}))
+    out = api.wavefn_run(str(wf), ['esp_extrema'])
+    assert out['ok'] is False and out['results'][0]['script'] == '12\n0\n'
+    assert 'Multiwfn' in out['results'][0]['error']
+
+
+def test_wavefn_render_ok(tmp_path):
+    calls = {}
+    api = Api(vmd_mod=_fake_vmd(calls=calls), config_mod=_fake_config(cfg={}))
+    out = api.wavefn_render('esp_surface', {'density': '/d.cub', 'esp': '/e.cub'},
+                            str(tmp_path / 'esp.png'))
+    assert out['ok'] is True and out['png'].endswith('esp.png')
+    assert calls['render']['scene'] == 'esp_surface'
+
+
+def test_wavefn_render_missing_scene_error():
+    api = Api(vmd_mod=_fake_vmd(), config_mod=_fake_config(cfg={}))
+    out = api.wavefn_render('', {}, '/tmp/x.png')
+    assert out['ok'] is False and '场景' in out['error']
+
+
+def test_wavefn_render_vmd_missing_returns_tcl(tmp_path):
+    vmd = _fake_vmd(render_ret={'ok': False, 'png': None, 'tcl': 'mol new xxx',
+                                'stdout_tail': '', 'error': '未找到 VMD'})
+    api = Api(vmd_mod=vmd, config_mod=_fake_config(cfg={}))
+    out = api.wavefn_render('orbital', {'cube': '/o.cub'}, str(tmp_path / 'o.png'))
+    assert out['ok'] is False and out['tcl'] == 'mol new xxx'
+
+
+def test_wavefn_extrema_parses(tmp_path):
+    wf = tmp_path / 'mol.fchk'
+    wf.write_text('x', encoding='utf-8')
+    api = Api(multiwfn_mod=_fake_multiwfn(), config_mod=_fake_config(cfg={}))
+    out = api.wavefn_extrema(str(wf), 'esp_extrema')
+    assert out['ok'] is True and out['minima'][0]['value_kcal'] == -12.3
+    assert out['maxima'] == []
+
+
+def test_wavefn_extrema_bad_kind_error(tmp_path):
+    wf = tmp_path / 'mol.fchk'
+    wf.write_text('x', encoding='utf-8')
+    api = Api(multiwfn_mod=_fake_multiwfn(), config_mod=_fake_config(cfg={}))
+    out = api.wavefn_extrema(str(wf), 'nci_rdg')
+    assert out['ok'] is False and '极值类型' in out['error']
+
+
+def test_wavefn_run_remote_experimental_happy(tmp_path):
+    calls = {}
+    wf = tmp_path / 'mol.fchk'
+    wf.write_text('x', encoding='utf-8')
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              connection_mod=_fake_connection(calls=calls, exec_ret={'code': 0}),
+              multiwfn_mod=_fake_multiwfn())
+    out = api.wavefn_run_remote(str(wf), ['esp_extrema'], 'c1', None, '/scratch/wfn')
+    assert out['ok'] is True and out['experimental'] is True
+    assert out['results'][0]['ok'] is True
+    assert calls['put'][0]['remote'].endswith('mol.fchk')       # 上传波函数
+    assert any('Multiwfn' in c for c in calls['exec'])          # 远端执行
+
+
+def test_wavefn_run_remote_missing_file_error():
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store), connection_mod=_fake_connection(),
+              multiwfn_mod=_fake_multiwfn())
+    out = api.wavefn_run_remote('/nope.fchk', ['esp_extrema'], 'c1', None, '/scratch')
+    assert out['ok'] is False and out['experimental'] is True and '不存在' in out['error']
+
+
+def test_wavefn_run_remote_missing_remote_dir_error(tmp_path):
+    wf = tmp_path / 'mol.fchk'
+    wf.write_text('x', encoding='utf-8')
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store), connection_mod=_fake_connection(),
+              multiwfn_mod=_fake_multiwfn())
+    out = api.wavefn_run_remote(str(wf), ['esp_extrema'], 'c1', None, '')
+    assert out['ok'] is False and '远端工作目录' in out['error']
+
+
+# ── tool_paths_get / tool_paths_set ──────────────────────────────────────────
+def test_tool_paths_roundtrip():
+    backing = {}
+    api = Api(config_mod=_fake_config_rw(backing))
+    out = api.tool_paths_set({'multiwfn': '/opt/Multiwfn', 'vmd': '  /opt/vmd  ',
+                              'blank': ''})
+    assert out['ok'] is True and out['paths']['vmd'] == '/opt/vmd'
+    got = api.tool_paths_get()
+    assert got['ok'] is True and got['paths']['multiwfn'] == '/opt/Multiwfn'
+
+
+def test_tool_paths_set_merges_existing():
+    backing = {'tool_paths': {'multiwfn': '/old/Multiwfn'}}
+    api = Api(config_mod=_fake_config_rw(backing))
+    api.tool_paths_set({'vmd': '/opt/vmd'})
+    got = api.tool_paths_get()
+    assert got['paths']['multiwfn'] == '/old/Multiwfn' and got['paths']['vmd'] == '/opt/vmd'
+
+
+def test_tool_paths_get_empty_default():
+    api = Api(config_mod=_fake_config(cfg={}))
+    out = api.tool_paths_get()
+    assert out['ok'] is True and out['paths'] == {}
+
+
+# ── derive_aimd ──────────────────────────────────────────────────────────────
+def _fake_aimd(*, changes=None, warnings=None, calls=None, boom=None, ok=True, error=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _build(src_dir, out_dir, **kw):
+        calls['build'] = {'src_dir': src_dir, 'out_dir': out_dir, **kw}
+        if boom:
+            raise boom
+        return {'ok': ok, 'job_dir': out_dir,
+                'changes': list(changes if changes is not None else
+                                [{'key': 'IBRION', 'action': 'replace', 'old': '2',
+                                  'new': '0', 'reason': 'MD'}]),
+                'warnings': list(warnings or ['Γ 点单点']), 'error': error}
+    m.build_aimd_job = _build
+    return m
+
+
+def test_derive_aimd_derives_and_registers(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    registered, calls = [], {}
+    api = Api(aimd_mod=_fake_aimd(calls=calls), ledger_mod=_fake_ledger_register(registered))
+    out = api.derive_aimd(str(tmp_path), ensemble='nvt', temp_k=300, steps=10000,
+                          potim_fs=1.0, temp_end_k=350, encut=350)
+    assert out['ok'] is True and out['job_dir'].endswith(
+        os.path.basename(str(tmp_path)) + '_aimd')
+    assert out['changes'][0]['key'] == 'IBRION'
+    assert registered == [out['job_dir']]
+    assert calls['build']['ensemble'] == 'nvt' and calls['build']['temp_end_k'] == 350.0
+    assert calls['build']['encut'] == 350.0
+
+
+def test_derive_aimd_omits_optional_when_blank(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    calls = {}
+    api = Api(aimd_mod=_fake_aimd(calls=calls), ledger_mod=_fake_ledger_register([]))
+    api.derive_aimd(str(tmp_path), ensemble='nve', temp_k=300)
+    assert 'temp_end_k' not in calls['build'] and 'encut' not in calls['build']
+
+
+def test_derive_aimd_missing_dir_error():
+    api = Api(aimd_mod=_fake_aimd())
+    out = api.derive_aimd('/no/such/dir')
+    assert out['ok'] is False and out['job_dir'] is None and '目录' in out['error']
+
+
+def test_derive_aimd_engine_failure_caught(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    api = Api(aimd_mod=_fake_aimd(ok=False, error='源目录缺 INCAR'),
+              ledger_mod=_fake_ledger_register([]))
+    out = api.derive_aimd(str(tmp_path))
+    assert out['ok'] is False and 'INCAR' in out['error']

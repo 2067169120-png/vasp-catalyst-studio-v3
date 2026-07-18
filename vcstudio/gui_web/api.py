@@ -64,7 +64,9 @@ class Api:
                  spin_mod=None, reactions_mod=None, campaign_mods=None,
                  scenarios_mod=None, i18n_mod=None, figure_presets_mod=None,
                  draftpack_mod=None, ai_paper_mod=None, engines_mod=None,
-                 slab_builder_mod=None):
+                 slab_builder_mod=None, molbuild_mods=None, gaussian_mod=None,
+                 quick_submit_mod=None, local_runner_mod=None, connection_mod=None,
+                 multiwfn_mod=None, vmd_mod=None, aimd_mod=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -122,6 +124,17 @@ class Api:
         self._draftpack = draftpack_mod
         self._ai_paper = ai_paper_mod
         self._engines = engines_mod
+        # 分子计算全流程总装(结构建模页分子建模区 / ②Gaussian 分子面板 / ③本机运行·文件管理 /
+        # ⑤波函数分析 / ④AIMD 派生):全部重/可选依赖(rdkit/decimer/paramiko/Multiwfn/VMD)延迟
+        # 导入,测试注入假件即全离线可测。
+        self._molbuild = molbuild_mods            # {ocsr,smiles3d,molinfo,external_editor} 束
+        self._gaussian = gaussian_mod             # engines.gaussian(任务表/周期表/preview)
+        self._quick_submit = quick_submit_mod
+        self._local_runner = local_runner_mod
+        self._connection = connection_mod
+        self._multiwfn = multiwfn_mod
+        self._vmd = vmd_mod
+        self._aimd = aimd_mod
 
     # ── 桥活性探测(前端用来确认 js_api 已就绪) ──
     def ping(self) -> str:
@@ -236,6 +249,64 @@ class Api:
             import vcstudio.engines as engines
             self._engines = engines
         return self._engines
+
+    def _mb(self):
+        """分子建模引擎束(ocsr/smiles3d/molinfo/external_editor)延迟加载(rdkit/decimer 可选)。"""
+        if self._molbuild is None:
+            from vcstudio.molbuild import external_editor, molinfo, ocsr, smiles3d
+            self._molbuild = types.SimpleNamespace(
+                ocsr=ocsr, smiles3d=smiles3d, molinfo=molinfo,
+                external_editor=external_editor)
+        return self._molbuild
+
+    def _gauss(self):
+        """engines.gaussian 子模块延迟加载(GAUSSIAN_TASKS/PERIODIC_TABLE_GROUPS/preview)。"""
+        if self._gaussian is None:
+            from vcstudio.engines import gaussian
+            self._gaussian = gaussian
+        return self._gaussian
+
+    def _qs(self):
+        """任意输入批量提交建作业延迟加载。"""
+        if self._quick_submit is None:
+            from vcstudio.cluster import quick_submit
+            self._quick_submit = quick_submit
+        return self._quick_submit
+
+    def _lr(self):
+        """本机作业运行器延迟加载。"""
+        if self._local_runner is None:
+            from vcstudio.cluster import local_runner
+            self._local_runner = local_runner
+        return self._local_runner
+
+    def _conn(self):
+        """可复用 SSH 连接延迟加载(paramiko 在其内部再延迟;文件管理/远程波函数用)。"""
+        if self._connection is None:
+            from vcstudio.cluster import connection
+            self._connection = connection
+        return self._connection
+
+    def _mw(self):
+        """Multiwfn 波函数分析驱动延迟加载。"""
+        if self._multiwfn is None:
+            from vcstudio.external import multiwfn_driver
+            self._multiwfn = multiwfn_driver
+        return self._multiwfn
+
+    def _vmd_(self):
+        """VMD 批渲染驱动延迟加载。"""
+        if self._vmd is None:
+            from vcstudio.external import vmd_driver
+            self._vmd = vmd_driver
+        return self._vmd
+
+    def _aimd_(self):
+        """AIMD 作业派生端延迟加载。"""
+        if self._aimd is None:
+            from vcstudio.generate import aimd_builder
+            self._aimd = aimd_builder
+        return self._aimd
 
     def _resolve(self, name, password):
         """名字 → (profile, 密码, err_dict|None)。
@@ -2422,11 +2493,48 @@ class Api:
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'engines': [], 'default': 'vasp', 'error': str(e)}
 
+    def _spec_from_params(self, mods, params):
+        """params → (CalcSpec, err|None)。结构取 params['structure'](内联文本)或 poscar 路径;
+
+        extras(Gaussian 分子面板透传:nproc/mem_gb/chk/basis/solvent/mixed_basis/gaussian_task/
+        td_nstates/irc_maxpoints/modredundant …)原样并入 spec.extras(见 CalcSpec.extras 契约)。
+        engine_generate/engine_preview 共用同一装配源。
+        """
+        params = dict(params or {})
+        structure = params.get('structure')
+        if not (isinstance(structure, str) and structure.strip()):
+            poscar = (params.get('poscar') or '').strip()
+            if not poscar or not os.path.isfile(poscar):
+                return None, '结构文件(POSCAR)不存在'
+            with open(poscar, 'r', encoding='utf-8', errors='replace') as f:
+                structure = f.read()
+        kpts = params.get('kpoints')
+        if isinstance(kpts, (list, tuple)) and len(kpts) >= 3:
+            try:
+                kpts = tuple(int(x) for x in kpts[:3])
+            except (TypeError, ValueError):
+                kpts = None
+        else:
+            kpts = None
+        cutoff = params.get('cutoff_ev')
+        spec = mods.CalcSpec(
+            structure=structure, task=(params.get('task') or 'relax'),
+            functional=(params.get('functional') or 'PBE'),
+            periodic=bool(params.get('periodic', True)),
+            dispersion=(params.get('dispersion') or None),
+            cutoff_ev=(float(cutoff) if cutoff not in (None, '') else None),
+            kpoints=kpts, spin=bool(params.get('spin', False)),
+            charge=int(params.get('charge') or 0),
+            multiplicity=int(params.get('multiplicity') or 1),
+            extras=dict(params.get('extras') or {}))
+        return spec, None
+
     def engine_generate(self, engine, params, out_dir):
         """非 VASP 引擎输入生成(文件级适配):简化参数表单 → CalcSpec → backend.generate_inputs。
 
-        params:{poscar(结构文件路径),task,functional,cutoff_ev,kpoints([a,b,c]|None),spin,charge,
-        periodic,dispersion,multiplicity}。validate 的自洽问题并入 issues(不静默),生成失败兜 error。
+        params:{poscar(结构文件路径)|structure(内联文本),task,functional,cutoff_ev,
+        kpoints([a,b,c]|None),spin,charge,periodic,dispersion,multiplicity,extras(引擎私有透传,
+        Gaussian 分子面板参数走此)}。validate 的自洽问题并入 issues(不静默),生成失败兜 error。
         返回 {'ok','files','warnings','issues','out_dir','error'}。
         """
         try:
@@ -2439,31 +2547,11 @@ class Api:
             if not out:
                 return {'ok': False, 'files': [], 'warnings': [], 'issues': [],
                         'out_dir': None, 'error': '未选输出目录'}
-            poscar = (params.get('poscar') or '').strip()
-            if not poscar or not os.path.isfile(poscar):
-                return {'ok': False, 'files': [], 'warnings': [], 'issues': [],
-                        'out_dir': None, 'error': '结构文件(POSCAR)不存在'}
-            with open(poscar, 'r', encoding='utf-8', errors='replace') as f:
-                structure = f.read()
             mods = self._eng()
-            kpts = params.get('kpoints')
-            if isinstance(kpts, (list, tuple)) and len(kpts) >= 3:
-                try:
-                    kpts = tuple(int(x) for x in kpts[:3])
-                except (TypeError, ValueError):
-                    kpts = None
-            else:
-                kpts = None
-            cutoff = params.get('cutoff_ev')
-            spec = mods.CalcSpec(
-                structure=structure, task=(params.get('task') or 'relax'),
-                functional=(params.get('functional') or 'PBE'),
-                periodic=bool(params.get('periodic', True)),
-                dispersion=(params.get('dispersion') or None),
-                cutoff_ev=(float(cutoff) if cutoff not in (None, '') else None),
-                kpoints=kpts, spin=bool(params.get('spin', False)),
-                charge=int(params.get('charge') or 0),
-                multiplicity=int(params.get('multiplicity') or 1))
+            spec, serr = self._spec_from_params(mods, params)
+            if serr:
+                return {'ok': False, 'files': [], 'warnings': [], 'issues': [],
+                        'out_dir': None, 'error': serr}
             issues = list(mods.validate(spec))
             backend = mods.get_backend(eng)
             os.makedirs(out, exist_ok=True)
@@ -2474,6 +2562,68 @@ class Api:
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'files': [], 'warnings': [], 'issues': [],
                     'out_dir': None, 'error': str(e)}
+
+    def engine_preview(self, engine, params):
+        """引擎输入实时预览(不落用户盘):CalcSpec → 输入全文文本 + 字符数(②预览区用)。
+
+        Gaussian 走 gaussian.preview(spec)(分子面板主用);其余引擎经临时目录 generate_inputs
+        回读首个产物文本。validate 自洽问题并入 issues。返回
+        {'ok','text','chars','warnings','issues','error'}。
+        """
+        try:
+            eng = (engine or '').strip().lower()
+            if not eng:
+                return {'ok': False, 'text': '', 'chars': 0, 'warnings': [],
+                        'issues': [], 'error': '未指定引擎'}
+            mods = self._eng()
+            spec, serr = self._spec_from_params(mods, params)
+            if serr:
+                return {'ok': False, 'text': '', 'chars': 0, 'warnings': [],
+                        'issues': [], 'error': serr}
+            issues = list(mods.validate(spec))
+            eng_norm = {'g16': 'gaussian', 'g09': 'gaussian'}.get(eng, eng)
+            warnings: list = []
+            if eng_norm == 'gaussian':
+                text = self._gauss().preview(spec)
+            else:
+                tmp = tempfile.mkdtemp(prefix='vcs_engine_preview_')
+                try:
+                    res = mods.get_backend(eng).generate_inputs(spec, tmp)
+                    warnings = list(res.get('warnings') or [])
+                    files = list(res.get('files') or [])
+                    text = ''
+                    if files and os.path.isfile(files[0]):
+                        with open(files[0], 'r', encoding='utf-8', errors='replace') as f:
+                            text = f.read()
+                finally:
+                    import shutil
+                    shutil.rmtree(tmp, ignore_errors=True)
+            return {'ok': True, 'text': text, 'chars': len(text),
+                    'warnings': warnings, 'issues': issues, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'text': '', 'chars': 0, 'warnings': [],
+                    'issues': [], 'error': str(e)}
+
+    def gauss_tasks(self):
+        """Gaussian 任务种类全家桶(9 种)→ {'ok','tasks':[{key,name,note}],'error'}(②任务下拉)。"""
+        try:
+            tasks = self._gauss().GAUSSIAN_TASKS
+            out = [{'key': k, 'name': v.get('name_zh', k), 'note': v.get('note', '')}
+                   for k, v in tasks.items()]
+            return {'ok': True, 'tasks': out, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'tasks': [], 'error': str(e)}
+
+    def gauss_periodic_table(self):
+        """Gaussian 混合基组周期表数据源(1-86 号 + 类别 + 每元素基组建议)→ {'ok','table','error'}。"""
+        try:
+            pt = self._gauss().PERIODIC_TABLE_GROUPS
+            return {'ok': True, 'error': None, 'table': {
+                'note': pt.get('note', ''),
+                'categories': list(pt.get('categories') or []),
+                'elements': list(pt.get('elements') or [])}}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'table': None, 'error': str(e)}
 
     def engine_nonequiv(self, src, dst):
         """跨引擎方法不等价清单(不静默翻译)→ {'ok','report':[中文逐条],'error'}(生成页告警条)。"""
@@ -2622,3 +2772,611 @@ class Api:
                     'error': None}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'vacuum': None, 'error': str(e)}
+
+    # ── ①结构建模页·分子建模区(图片识别 → SMILES → 3D 建模 → 外部编辑器往返) ─────
+    _MOL_BOX = 15.0                                       # 分子装盒边长(Å;编辑器晶格 + 保存 POSCAR)
+
+    @staticmethod
+    def _mol_struct(elements, coords, formula):
+        """elements/coords + 分子式 → 编辑器 struct dict(立方盒晶格,便于 3D 渲染/POSCAR 导出)。"""
+        box = Api._MOL_BOX
+        return {'elements': list(elements), 'coords': [list(c) for c in coords],
+                'lattice': [[box, 0.0, 0.0], [0.0, box, 0.0], [0.0, 0.0, box]],
+                'natoms': len(list(elements)), 'formula': formula}
+
+    def mol_ocsr_probe(self):
+        """探测 DECIMER(图片 OCSR)可用性 → {'ok','available','detail','error'}(卡顶提示条)。"""
+        try:
+            r = self._mb().ocsr.probe()
+            return {'ok': True, 'available': bool(r.get('available')),
+                    'detail': r.get('detail', ''), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'available': False, 'detail': '', 'error': str(e)}
+
+    def mol_image_to_smiles(self, image_path):
+        """分子结构图片 → SMILES(DECIMER)→ {'ok','smiles','elapsed_ms','error'}。"""
+        try:
+            p = (image_path or '').strip()
+            if not p:
+                return {'ok': False, 'smiles': '', 'elapsed_ms': 0.0, 'error': '未选择图片文件'}
+            r = self._mb().ocsr.image_to_smiles(p)
+            return {'ok': bool(r.get('ok')), 'smiles': r.get('smiles', ''),
+                    'elapsed_ms': r.get('elapsed_ms', 0.0), 'error': r.get('error') or None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'smiles': '', 'elapsed_ms': 0.0, 'error': str(e)}
+
+    def mol_smiles_svg(self, smiles, width=420, height=300):
+        """SMILES → 2D 键线式 SVG(RDKit)→ {'ok','svg','error'}(结构图预览)。"""
+        try:
+            s = (smiles or '').strip()
+            if not s:
+                return {'ok': False, 'svg': '', 'error': 'SMILES 为空'}
+            r = self._mb().ocsr.smiles_svg(s, width=int(width or 420), height=int(height or 300))
+            return {'ok': bool(r.get('ok')), 'svg': r.get('svg', ''),
+                    'error': r.get('error') or None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'svg': '', 'error': str(e)}
+
+    def mol_smiles_to_3d(self, smiles, forcefield='auto'):
+        """SMILES → 3D 结构(RDKit ETKDG + MMFF/UFF)→ 编辑器 struct + 电荷/多重度提示。
+
+        返回 {'ok','struct','charge','multiplicity_hint','warnings','error'}。struct 载入现有编辑器。
+        """
+        try:
+            s = (smiles or '').strip()
+            if not s:
+                return {'ok': False, 'struct': None, 'charge': 0,
+                        'multiplicity_hint': None, 'warnings': [], 'error': 'SMILES 为空'}
+            r = self._mb().smiles3d.smiles_to_3d(s, forcefield=(forcefield or 'auto'))
+            if not r.get('ok'):
+                return {'ok': False, 'struct': None, 'charge': 0, 'multiplicity_hint': None,
+                        'warnings': list(r.get('warnings') or []), 'error': r.get('error')}
+            return {'ok': True, 'error': None,
+                    'struct': self._mol_struct(r['elements'], r['coords'], r['formula']),
+                    'charge': r.get('charge', 0),
+                    'multiplicity_hint': r.get('multiplicity_hint'),
+                    'warnings': list(r.get('warnings') or [])}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'struct': None, 'charge': 0, 'multiplicity_hint': None,
+                    'warnings': [], 'error': str(e)}
+
+    def mol_info(self, elements, coords=None, charge=0):
+        """分子属性(化学式/原子数/电子数/分子量/建议多重度)→ {'ok', …, 'error'}(属性面板)。"""
+        try:
+            els = list(elements or [])
+            if not els:
+                return {'ok': False, 'error': '无原子(先建模或载入结构)'}
+            r = self._mb().molinfo.mol_summary(els, coords, int(charge or 0))
+            out = {'ok': True, 'error': None}
+            out.update(r)
+            return out
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def mol_export_editor(self, elements, coords, fmt='xyz', workdir=None):
+        """把当前结构写成外部编辑器临时文件(固定名)→ {'ok','path','mtime','error'}(GaussView/Avogadro)。"""
+        try:
+            els = list(elements or [])
+            cds = [list(c) for c in (coords or [])]
+            r = self._mb().external_editor.export_for_editor(
+                els, cds, fmt=(fmt or 'xyz'), workdir=((workdir or '').strip() or None))
+            return {'ok': bool(r.get('ok')), 'path': r.get('path'),
+                    'mtime': r.get('mtime'), 'error': r.get('error') or None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'path': None, 'mtime': None, 'error': str(e)}
+
+    def mol_open_with(self, path, editor_exe=None):
+        """用外部编辑器(或平台默认)打开文件 → {'ok','error'}。editor_exe 空则走 xdg-open/startfile。"""
+        try:
+            p = (path or '').strip()
+            if not p:
+                return {'ok': False, 'error': '未指定文件路径'}
+            exe = (editor_exe or '').strip() or None
+            r = self._mb().external_editor.open_with(p, editor_exe=exe)
+            return {'ok': bool(r.get('ok')), 'error': r.get('error') or None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def mol_check_reimport(self, path, last_mtime=None):
+        """比对外部编辑文件 mtime 判是否改动过 → {'ok','changed','mtime','error'}(自动检测轮询)。"""
+        try:
+            p = (path or '').strip()
+            if not p:
+                return {'ok': False, 'changed': False, 'mtime': None, 'error': '未指定文件路径'}
+            r = self._mb().external_editor.check_reimport(p, last_mtime)
+            return {'ok': True, 'changed': bool(r.get('changed')),
+                    'mtime': r.get('mtime'), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'changed': False, 'mtime': None, 'error': str(e)}
+
+    def mol_reimport(self, path):
+        """回读外部编辑结果(xyz/mol 纯手写解析)→ {'ok','struct','error'}(载入编辑器)。"""
+        try:
+            p = (path or '').strip()
+            if not p or not os.path.isfile(p):
+                return {'ok': False, 'struct': None, 'error': '编辑文件不存在'}
+            r = self._mb().external_editor.reimport(p)
+            if not r.get('ok'):
+                return {'ok': False, 'struct': None, 'error': r.get('error')}
+            els, cds = r['elements'], r['coords']
+            formula = self._mb().molinfo.formula(els)
+            return {'ok': True, 'error': None, 'struct': self._mol_struct(els, cds, formula)}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'struct': None, 'error': str(e)}
+
+    # ── ③提交页·快速批量提交 / 本机运行 / 文件管理 ─────────────────────────────────
+    def quick_submit_build(self, files, out_root, job_prefix=''):
+        """任意输入文件(.gjf/.com/.inp/.cell/VASP 目录)→ 逐个建轻量作业目录 + 入台账。
+
+        返回 {'ok','jobs':[{dir,name,engine,files,hint,registered}],'skipped':[{file,reason}],'error'}。
+        hint 为该引擎的集群运行命令模板提示(quick_submit.submit_hint)。
+        """
+        try:
+            fs = [str(f) for f in (files or []) if str(f).strip()]
+            root = (out_root or '').strip()
+            if not fs:
+                return {'ok': False, 'jobs': [], 'skipped': [], 'error': '未选择任何输入文件'}
+            if not root:
+                return {'ok': False, 'jobs': [], 'skipped': [], 'error': '未选输出根目录'}
+            qs = self._qs()
+            res = qs.build_quick_jobs(fs, root, job_prefix=(job_prefix or ''))
+            if not res.get('ok'):
+                return {'ok': False, 'jobs': [], 'skipped': list(res.get('skipped') or []),
+                        'error': res.get('error') or '建作业失败'}
+            jobs = []
+            for j in (res.get('jobs') or []):
+                registered = True
+                try:
+                    self._ledger.register(j['dir'])
+                except Exception:                         # noqa: BLE001 登记失败不挡已建目录
+                    registered = False
+                jobs.append({'dir': j['dir'], 'name': j['name'], 'engine': j['engine'],
+                             'files': list(j.get('files') or []),
+                             'hint': qs.submit_hint(j.get('engine', '')),
+                             'registered': registered})
+            return {'ok': True, 'jobs': jobs, 'skipped': list(res.get('skipped') or []),
+                    'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'jobs': [], 'skipped': [], 'error': str(e)}
+
+    def jobs_cancel_batch(self, dirs, name, password, trust_new=False):
+        """批量取消集群作业(逐作业 qdel/scancel + 回写 manifest FAILED/用户取消)。
+
+        返回 {'ok','cancelled':[job_id],'failed':[{job_id,reason}],'needs_trust','error'}。
+        """
+        try:
+            ds = [str(d) for d in (dirs or []) if str(d).strip()]
+            if not ds:
+                return {'ok': False, 'cancelled': [], 'failed': [],
+                        'needs_trust': False, 'error': '未选择要取消的作业'}
+            prof, pw, err = self._resolve(name, password)
+            if err:
+                return err
+            res = self._bo().cancel_batch(prof, ds, password=pw, trust_new=bool(trust_new))
+            return {'ok': bool(res.get('ok')), 'cancelled': list(res.get('cancelled') or []),
+                    'failed': list(res.get('failed') or []),
+                    'needs_trust': bool(res.get('needs_trust')), 'error': res.get('error')}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'cancelled': [], 'failed': [],
+                    'needs_trust': False, 'error': str(e)}
+
+    _LOCAL_INPUT_EXTS = ('.gjf', '.com', '.inp', '.gau')
+
+    def _find_local_input(self, job_dir):
+        """作业目录内首个本机引擎输入文件(.gjf/.com/.inp/.gau);无 → None。"""
+        import glob
+        for ext in self._LOCAL_INPUT_EXTS:
+            cands = sorted(glob.glob(os.path.join(job_dir, '*' + ext)))
+            if cands:
+                return cands[0]
+        return None
+
+    def _build_local_cmd(self, job_dir, tmpl):
+        """命令模板 + 作业目录输入 → argv 列表。占位符 {input}/{output} 替换,否则末尾追加输入名。
+
+        缺 {input} 占位符也无可识别输入文件 → 直接按模板拆分(用户模板可自含输入)。
+        """
+        import shlex
+        inp = self._find_local_input(job_dir)
+        inp_base = os.path.basename(inp) if inp else ''
+        out_base = (os.path.splitext(inp_base)[0] + '.log') if inp_base else 'output.log'
+        if '{input}' in tmpl or '{output}' in tmpl:
+            filled = tmpl.replace('{input}', inp_base).replace('{output}', out_base)
+            return shlex.split(filled)
+        parts = shlex.split(tmpl)
+        if inp_base:
+            parts.append(inp_base)
+        return parts
+
+    def local_run_start(self, job_dir, cmd_template):
+        """本机启动作业(quick/gaussian):按命令模板 + 目录输入文件 → local_runner.start。
+
+        返回 {'ok','pid','cmd','error'}。cmd_template 为设置页存的本地软件命令(如 g16 或
+        'g16 {input} {output}')。
+        """
+        try:
+            d = (job_dir or '').strip()
+            if not d or not os.path.isdir(d):
+                return {'ok': False, 'pid': None, 'cmd': [], 'error': '作业目录不存在'}
+            tmpl = (cmd_template or '').strip()
+            if not tmpl:
+                return {'ok': False, 'pid': None, 'cmd': [],
+                        'error': '未配置本机运行命令模板(请在设置页填写,如 g16)'}
+            cmd = self._build_local_cmd(d, tmpl)
+            if not cmd:
+                return {'ok': False, 'pid': None, 'cmd': [], 'error': '命令模板为空'}
+            lr = self._lr()
+            job = lr.LocalJob(cmd=cmd, cwd=d, log_file=os.path.join(d, 'local_run.log'))
+            res = lr.start(job)
+            return {'ok': bool(res.get('ok')), 'pid': res.get('pid'),
+                    'cmd': cmd, 'error': res.get('error') or None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'pid': None, 'cmd': [], 'error': str(e)}
+
+    def local_run_status(self, job_dir):
+        """查询本机作业状态 → {'ok','state','pid','exit_code','log_tail','error'}(轮询)。"""
+        try:
+            d = (job_dir or '').strip()
+            if not d:
+                return {'ok': False, 'state': 'NOT_STARTED', 'pid': None,
+                        'exit_code': None, 'log_tail': '', 'error': '未指定作业目录'}
+            r = self._lr().status(d)
+            return {'ok': True, 'state': r.get('state'), 'pid': r.get('pid'),
+                    'exit_code': r.get('exit_code'), 'log_tail': r.get('log_tail', ''),
+                    'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'state': 'NOT_STARTED', 'pid': None,
+                    'exit_code': None, 'log_tail': '', 'error': str(e)}
+
+    def local_run_cancel(self, job_dir):
+        """停止本机作业(杀进程树/进程组)→ {'ok','error'}。"""
+        try:
+            d = (job_dir or '').strip()
+            if not d:
+                return {'ok': False, 'error': '未指定作业目录'}
+            r = self._lr().cancel(d)
+            return {'ok': bool(r.get('ok')), 'error': r.get('error') or None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    @staticmethod
+    def _sftp_is_dir(mode):
+        """SFTP st_mode → 是否目录(缺/异常 → False)。"""
+        import stat as _stat
+        try:
+            return bool(_stat.S_ISDIR(int(mode or 0)))
+        except (TypeError, ValueError):
+            return False
+
+    def remote_ls(self, name, password, remote_path='.', trust_new=False):
+        """列远端目录(SFTP listdir_attr)→ {'ok','path','entries':[{name,size,mtime,is_dir}],
+        'needs_trust','error'}(文件管理子卡)。"""
+        try:
+            prof, pw, err = self._resolve(name, password)
+            if err:
+                return err
+            rpath = (remote_path or '.').strip() or '.'
+            conn = self._conn()
+            try:
+                client, jump = conn.open_client(prof, pw, trust_new=bool(trust_new))
+            except conn.ConnectError as e:
+                return {'ok': False, 'path': rpath, 'entries': [],
+                        'needs_trust': bool(getattr(e, 'needs_trust', False)), 'error': str(e)}
+            try:
+                sftp = client.open_sftp()
+                attrs = sftp.listdir_attr(rpath)
+                entries = []
+                for a in attrs:
+                    entries.append({
+                        'name': getattr(a, 'filename', ''),
+                        'size': int(getattr(a, 'st_size', 0) or 0),
+                        'mtime': int(getattr(a, 'st_mtime', 0) or 0),
+                        'is_dir': self._sftp_is_dir(getattr(a, 'st_mode', 0))})
+                sftp.close()
+            finally:
+                conn.close_quiet(client, jump)
+            entries.sort(key=lambda e: (not e['is_dir'], e['name'].lower()))
+            return {'ok': True, 'path': rpath, 'entries': entries,
+                    'needs_trust': False, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'path': remote_path, 'entries': [],
+                    'needs_trust': False, 'error': str(e)}
+
+    def remote_fetch_file(self, name, password, remote_path, local_dir, trust_new=False):
+        """下载远端单个文件到本地目录(SFTP get)→ {'ok','local_path','needs_trust','error'}。"""
+        try:
+            rpath = (remote_path or '').strip()
+            ldir = (local_dir or '').strip()
+            if not rpath:
+                return {'ok': False, 'local_path': None, 'needs_trust': False,
+                        'error': '未指定远端文件'}
+            if not ldir:
+                return {'ok': False, 'local_path': None, 'needs_trust': False,
+                        'error': '未指定本地保存目录'}
+            prof, pw, err = self._resolve(name, password)
+            if err:
+                return err
+            os.makedirs(ldir, exist_ok=True)
+            local_path = os.path.join(ldir, os.path.basename(rpath.rstrip('/')))
+            conn = self._conn()
+            try:
+                client, jump = conn.open_client(prof, pw, trust_new=bool(trust_new))
+            except conn.ConnectError as e:
+                return {'ok': False, 'local_path': None,
+                        'needs_trust': bool(getattr(e, 'needs_trust', False)), 'error': str(e)}
+            try:
+                sftp = client.open_sftp()
+                sftp.get(rpath, local_path)
+                sftp.close()
+            finally:
+                conn.close_quiet(client, jump)
+            return {'ok': True, 'local_path': local_path, 'needs_trust': False, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'local_path': None, 'needs_trust': False, 'error': str(e)}
+
+    # ── ⑤波函数分析页(外部工具探测 / 分析 / 渲染 / 极值) ──────────────────────────
+    _WAVEFN_TOOL_KEYS = ('multiwfn', 'vmd', 'gaussview', 'gaussian')
+    _TOOL_WHICH = {'gaussview': ('gview', 'gview.exe', 'GaussView'),
+                   'gaussian': ('g16', 'g09', 'g16.exe', 'g09.exe')}
+
+    def _tool_paths(self):
+        """config.tool_paths(外部工具路径记忆)→ dict(缺 → {})。"""
+        try:
+            tp = self._config.load_config().get('tool_paths')
+            return dict(tp) if isinstance(tp, dict) else {}
+        except Exception:                                 # noqa: BLE001
+            return {}
+
+    def _probe_which(self, key, exe):
+        """gaussview/gaussian 简易探测(给定路径 isfile 直用,否则候选名 PATH 查)→ probe dict。"""
+        import shutil
+        if exe and os.path.isfile(exe):
+            return {'available': True, 'path': exe, 'detail': f'使用指定路径:{exe}'}
+        for cand in ((exe,) if exe else ()) + self._TOOL_WHICH.get(key, ()):
+            found = shutil.which(cand)
+            if found:
+                return {'available': True, 'path': found, 'detail': f'在 PATH 找到:{found}'}
+        label = 'GaussView' if key == 'gaussview' else '本地 Gaussian(g16/g09)'
+        return {'available': False, 'path': None,
+                'detail': f'未找到 {label}:请在上方填写可执行文件路径,或将其加入 PATH。'}
+
+    def wavefn_probe(self, tools=None):
+        """探测波函数分析外部工具(Multiwfn/VMD/GaussView/本地 Gaussian)→
+        {'ok','tools':{key:{available,path,detail}},'error'}。"""
+        try:
+            paths = self._tool_paths()
+            want = [str(t).lower() for t in tools] if tools else list(self._WAVEFN_TOOL_KEYS)
+            out = {}
+            for key in want:
+                exe = (paths.get(key) or '').strip() or None
+                if key == 'multiwfn':
+                    out[key] = self._mw().probe(exe)
+                elif key == 'vmd':
+                    out[key] = self._vmd_().probe(exe)
+                elif key in ('gaussview', 'gaussian'):
+                    out[key] = self._probe_which(key, exe)
+                else:
+                    out[key] = {'available': False, 'path': None,
+                                'detail': f'未知工具 {key!r}'}
+            return {'ok': True, 'tools': out, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'tools': {}, 'error': str(e)}
+
+    def wavefn_scenes(self):
+        """波函数分析项(Multiwfn)+ 可视化场景(VMD)目录 → {'ok','analyses','scenes','error'}(chips)。"""
+        try:
+            analyses = [{'key': k, 'name': v.get('name', k), 'note': v.get('note', '')}
+                        for k, v in self._mw().ANALYSES.items()]
+            scenes = [{'key': k, 'name': v.get('name', k),
+                       'files': list(v.get('files') or ()), 'note': v.get('note', '')}
+                      for k, v in self._vmd_().SCENES.items()]
+            return {'ok': True, 'analyses': analyses, 'scenes': scenes, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'analyses': [], 'scenes': [], 'error': str(e)}
+
+    def wavefn_run(self, wavefn_file, analyses, params=None, exe=None, workdir=None):
+        """本机逐项跑 Multiwfn 分析 → {'ok','results':[{analysis,ok,outputs,stdout_tail,elapsed_s,
+        script,extrema?,error}],'error'}。Multiwfn 缺失 → 各项 error + 可复制 stdin 脚本(script)。"""
+        try:
+            wf = (wavefn_file or '').strip()
+            keys = [str(a).strip() for a in (analyses or []) if str(a).strip()]
+            if not wf:
+                return {'ok': False, 'results': [], 'error': '未选择波函数文件'}
+            if not keys:
+                return {'ok': False, 'results': [], 'error': '未选择分析项'}
+            paths = self._tool_paths()
+            mw_exe = (exe or paths.get('multiwfn') or '').strip() or None
+            wd = (workdir or '').strip() or None
+            mw = self._mw()
+            p = dict(params or {})
+            results = []
+            for k in keys:
+                r = mw.run(wf, k, exe=mw_exe, workdir=wd, params=p)
+                entry = {'analysis': k, 'ok': bool(r.get('ok')),
+                         'outputs': list(r.get('outputs') or []),
+                         'stdout_tail': r.get('stdout_tail', ''),
+                         'elapsed_s': r.get('elapsed_s', 0.0),
+                         'script': r.get('script', ''), 'error': r.get('error') or None}
+                if k in ('esp_extrema', 'alie_extrema') and r.get('stdout_tail'):
+                    try:
+                        entry['extrema'] = mw.extrema_parse(r['stdout_tail'])
+                    except Exception:                     # noqa: BLE001 解析失败不挡该项返回
+                        pass
+                results.append(entry)
+            return {'ok': any(e['ok'] for e in results), 'results': results, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'results': [], 'error': str(e)}
+
+    def wavefn_run_remote(self, wavefn_file, analyses, name, password, remote_dir,
+                          remote_exe='Multiwfn', trust_new=False, params=None):
+        """(实验性)远程集群跑 Multiwfn:上传波函数 → 远端逐项执行 → 取回 stdout。
+
+        返回 {'ok','results':[{analysis,ok,stdout_tail,error}],'experimental':True,'needs_trust','error'}。
+        任一步失败给中文说明。复杂路径(产物取回/大文件)后续版本完善。
+        """
+        try:
+            import shlex
+            wf = (wavefn_file or '').strip()
+            keys = [str(a).strip() for a in (analyses or []) if str(a).strip()]
+            rdir = (remote_dir or '').strip()
+            if not wf or not os.path.isfile(wf):
+                return {'ok': False, 'results': [], 'experimental': True,
+                        'needs_trust': False, 'error': '波函数文件不存在'}
+            if not keys:
+                return {'ok': False, 'results': [], 'experimental': True,
+                        'needs_trust': False, 'error': '未选择分析项'}
+            if not rdir:
+                return {'ok': False, 'results': [], 'experimental': True,
+                        'needs_trust': False, 'error': '未指定远端工作目录'}
+            prof, pw, err = self._resolve(name, password)
+            if err:
+                return err
+            conn = self._conn()
+            mw = self._mw()
+            rexe = (remote_exe or 'Multiwfn').strip() or 'Multiwfn'
+            try:
+                client, jump = conn.open_client(prof, pw, trust_new=bool(trust_new))
+            except conn.ConnectError as e:
+                return {'ok': False, 'results': [], 'experimental': True,
+                        'needs_trust': bool(getattr(e, 'needs_trust', False)), 'error': str(e)}
+            results = []
+            try:
+                sftp = client.open_sftp()
+                base = os.path.basename(wf)
+                remote_wf = rdir.rstrip('/') + '/' + base
+                sftp.put(wf, remote_wf)
+                for k in keys:
+                    spec = mw.ANALYSES.get(k)
+                    if spec is None:
+                        results.append({'analysis': k, 'ok': False, 'stdout_tail': '',
+                                        'error': f'未知分析项 {k!r}'})
+                        continue
+                    try:
+                        script = spec['stdin_script'](dict(params or {}))
+                    except ValueError as e:
+                        results.append({'analysis': k, 'ok': False, 'stdout_tail': '',
+                                        'error': str(e)})
+                        continue
+                    script_name = f'_wfn_{k}.txt'
+                    with sftp.open(rdir.rstrip('/') + '/' + script_name, 'w') as f:
+                        f.write(script)
+                    cmd = (f'cd {shlex.quote(rdir)} && {rexe} '
+                           f'{shlex.quote(base)} < {script_name}')
+                    _in, out, _err = client.exec_command(cmd, timeout=1800)
+                    text = out.read().decode('utf-8', errors='replace')
+                    code = out.channel.recv_exit_status()
+                    tail = '\n'.join(text.splitlines()[-40:])
+                    results.append({'analysis': k, 'ok': code == 0, 'stdout_tail': tail,
+                                    'error': None if code == 0 else f'远端退出码 {code}'})
+                sftp.close()
+            finally:
+                conn.close_quiet(client, jump)
+            return {'ok': any(r.get('ok') for r in results), 'results': results,
+                    'experimental': True, 'needs_trust': False, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'results': [], 'experimental': True,
+                    'needs_trust': False, 'error': str(e)}
+
+    def wavefn_render(self, scene, files, out_png, params=None, exe=None):
+        """VMD 批渲染一个可视化场景 → {'ok','png','tcl','stdout_tail','error'}。VMD 缺失 → 回传 tcl。"""
+        try:
+            sc = (scene or '').strip()
+            if not sc:
+                return {'ok': False, 'png': None, 'tcl': '', 'error': '未选择渲染场景'}
+            outp = (out_png or '').strip()
+            if not outp:
+                return {'ok': False, 'png': None, 'tcl': '', 'error': '未指定输出 PNG 路径'}
+            vmd_exe = (exe or self._tool_paths().get('vmd') or '').strip() or None
+            r = self._vmd_().render(sc, dict(files or {}), outp,
+                                    exe=vmd_exe, params=dict(params or {}))
+            return {'ok': bool(r.get('ok')), 'png': r.get('png'), 'tcl': r.get('tcl', ''),
+                    'stdout_tail': r.get('stdout_tail', ''), 'error': r.get('error') or None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'png': None, 'tcl': '', 'error': str(e)}
+
+    def wavefn_extrema(self, wavefn_file, kind='esp_extrema', exe=None, workdir=None):
+        """查询分子表面极值点(ESP/ALIE)→ {'ok','minima','maxima','script','error'}。
+
+        跑 Multiwfn 定量分子表面分析并解析极小/极大点(反应位点);Multiwfn 缺失 → 回传 stdin 脚本。
+        """
+        try:
+            wf = (wavefn_file or '').strip()
+            if not wf:
+                return {'ok': False, 'minima': [], 'maxima': [], 'script': '',
+                        'error': '未选择波函数文件'}
+            k = (kind or 'esp_extrema').strip()
+            if k not in ('esp_extrema', 'alie_extrema'):
+                return {'ok': False, 'minima': [], 'maxima': [], 'script': '',
+                        'error': f'不支持的极值类型 {k!r}(仅 esp_extrema/alie_extrema)'}
+            mw_exe = (exe or self._tool_paths().get('multiwfn') or '').strip() or None
+            mw = self._mw()
+            r = mw.run(wf, k, exe=mw_exe, workdir=((workdir or '').strip() or None))
+            ex = mw.extrema_parse(r.get('stdout_tail', '')) if r.get('stdout_tail') \
+                else {'minima': [], 'maxima': []}
+            return {'ok': bool(r.get('ok')), 'minima': list(ex.get('minima') or []),
+                    'maxima': list(ex.get('maxima') or []), 'script': r.get('script', ''),
+                    'error': r.get('error') or None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'minima': [], 'maxima': [], 'script': '', 'error': str(e)}
+
+    # ── 外部工具路径(设置页 / 波函数页 / 外部编辑器卡 共用记忆) ──────────────────
+    def tool_paths_get(self):
+        """读外部工具路径记忆 → {'ok','paths':{key:path},'error'}。"""
+        try:
+            return {'ok': True, 'paths': self._tool_paths(), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'paths': {}, 'error': str(e)}
+
+    def tool_paths_set(self, paths):
+        """合并更新外部工具路径记忆到 config.tool_paths → {'ok','paths','error'}(空串=清除该键值)。"""
+        try:
+            incoming = dict(paths or {})
+            cfg = self._config.load_config()
+            tp = dict(cfg.get('tool_paths') or {})
+            for k, v in incoming.items():
+                key = str(k).strip()
+                if not key:
+                    continue
+                tp[key] = (str(v).strip() if v is not None else '')
+            cfg['tool_paths'] = tp
+            self._config.save_config(cfg)
+            return {'ok': True, 'paths': tp, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'paths': {}, 'error': str(e)}
+
+    # ── ④结果分析页·AIMD 派生(从完成弛豫作业一键派生 AIMD 作业) ────────────────────
+    def derive_aimd(self, job_dir, ensemble='nvt', temp_k=300.0, temp_end_k=None,
+                    steps=10000, potim_fs=1.0, encut=None, out_root=None):
+        """从完成弛豫的作业目录派生 AIMD 作业(NVT/NVE)→ 入台账。命名 {原名}_aimd。
+
+        返回 {'ok','job_dir','changes','warnings','error'}。系综非法/缺 INCAR → ok=False + 中文 error。
+        """
+        try:
+            d = (job_dir or '').strip()
+            if not d or not os.path.isdir(d):
+                return {'ok': False, 'job_dir': None, 'changes': [],
+                        'warnings': [], 'error': '作业目录不存在'}
+            base = os.path.basename(os.path.normpath(d))
+            parent = (out_root or '').strip() or os.path.dirname(os.path.normpath(d))
+            out_dir = os.path.join(parent, f'{base}_aimd')
+            kw = dict(ensemble=(ensemble or 'nvt'), temp_k=float(temp_k),
+                      steps=int(steps), potim_fs=float(potim_fs))
+            if temp_end_k not in (None, ''):
+                kw['temp_end_k'] = float(temp_end_k)
+            if encut not in (None, ''):
+                kw['encut'] = float(encut)
+            res = self._aimd_().build_aimd_job(d, out_dir, **kw)
+            if not res.get('ok'):
+                return {'ok': False, 'job_dir': None, 'changes': [],
+                        'warnings': list(res.get('warnings') or []), 'error': res.get('error')}
+            warnings = list(res.get('warnings') or [])
+            try:
+                self._ledger.register(res['job_dir'])
+            except Exception as e:                        # noqa: BLE001
+                warnings.append(f'台账登记失败(不影响已派生目录):{e}')
+            return {'ok': True, 'job_dir': res['job_dir'],
+                    'changes': list(res.get('changes') or []),
+                    'warnings': warnings, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'job_dir': None, 'changes': [],
+                    'warnings': [], 'error': str(e)}
