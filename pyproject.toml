@@ -48,6 +48,15 @@ vcs-gui = "vcstudio.gui.app:main"
 [tool.setuptools.packages.find]
 include = ["vcstudio*"]
 
+# wheel/sdist 必须携带界面资源与语言包(缺了 pip 安装版 GUI 白屏)
+[tool.setuptools.package-data]
+vcstudio = [
+    "gui_web/assets/*",
+    "gui_web/assets/fonts/*",
+    "gui_web/assets/vendor/*",
+    "shared/locales/*.json",
+]
+
 [tool.setuptools.dynamic]
 version = {attr = "vcstudio.__version__"}
 
