@@ -7,6 +7,7 @@ client/sftp 由调用方注入(GUI 经 connection.open_client;测试注入假件
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import posixpath
 import re
@@ -126,23 +127,13 @@ def run_cmd(client, cmd: str, timeout: int = 30, check: bool = False):
 
 
 # ── preflight(全部本地检查,不联网) ─────────────────────────────────────────
-def preflight(profile, job_dir: str) -> list:
-    """提交前检查,返回错误文案列表(空=可以出手)。"""
+def profile_preflight(profile) -> list:
+    """只检查连接目标与脚本配置，供导入向导在写入前调用。"""
     errs = []
-    m0 = manifest_mod.load_manifest(job_dir)
-    if _is_neb(m0):
-        # NEB 多 image:POSCAR 在各 image 子目录,根只放共享 INCAR/POTCAR/KPOINTS
-        errs += _neb_input_check(job_dir, m0)
-    else:
-        for f in _INPUT_FILES:
-            if not os.path.isfile(os.path.join(job_dir, f)):
-                errs.append(f'作业目录缺 {f}(先在生成页产出四件套)')
-    if m0 is None:
-        errs.append('作业目录缺 job.yaml(旧目录可重新生成一次以补台账)')
-    else:
-        # POTCAR TITEL 闸(原版提交前防线):截断/拼错的 POTCAR 会给出"收敛但静默错"
-        # 的能量——TITEL 段数必须等于 POSCAR 物种数,不等拒绝提交
-        errs += _potcar_gate(job_dir, m0)
+    if not str(getattr(profile, 'hostname', '') or '').strip():
+        errs.append('集群配置未填主机地址 hostname')
+    if not str(getattr(profile, 'username', '') or '').strip():
+        errs.append('集群配置未填用户名 username')
     if not profile.remote_root:
         errs.append('集群配置未填远程工作目录 remote_root')
     elif not str(profile.remote_root).startswith('/'):
@@ -168,6 +159,31 @@ def preflight(profile, job_dir: str) -> list:
     return errs
 
 
+def preflight(profile, job_dir: str) -> list:
+    """提交前检查,返回错误文案列表(空=可以出手)。"""
+    errs = []
+    m0 = manifest_mod.load_manifest(job_dir)
+    if _is_neb(m0):
+        # NEB 多 image:POSCAR 在各 image 子目录,根只放共享 INCAR/POTCAR/KPOINTS
+        errs += _neb_input_check(job_dir, m0)
+    else:
+        for f in _INPUT_FILES:
+            if not os.path.isfile(os.path.join(job_dir, f)):
+                errs.append(f'作业目录缺 {f}(先在生成页产出四件套)')
+    if m0 is None:
+        errs.append('作业目录缺 job.yaml(旧目录可重新生成一次以补台账)')
+    else:
+        import_issues = list((m0.get('inputs') or {}).get('import_input_issues') or [])
+        if import_issues:
+            errs.append('导入四件套未通过输入门控:' + '；'.join(str(x) for x in import_issues)
+                        + '；请修正文件后重新导入')
+        # POTCAR TITEL 闸(原版提交前防线):截断/拼错的 POTCAR 会给出"收敛但静默错"
+        # 的能量——TITEL 段数必须等于 POSCAR 物种数,不等拒绝提交
+        errs += _potcar_gate(job_dir, m0)
+    errs += profile_preflight(profile)
+    return errs
+
+
 def _potcar_gate(job_dir: str, m: dict) -> list:
     """本地 POTCAR 的 TITEL 段数 == manifest 物种数,否则拒提交(读不到不硬拦)。"""
     elements = (m.get('inputs') or {}).get('elements') or []
@@ -185,9 +201,38 @@ def _potcar_gate(job_dir: str, m: dict) -> list:
     return []
 
 
-def _spec_for(profile, job_dir: str) -> JobScriptSpec:
+def _remote_dir_for(profile, job_dir: str, manifest: dict | None = None) -> str:
+    """返回稳定且不碰撞的远端目录，历史 ``remote_dir`` 原样沿用。
+
+    旧实现只取本地 basename；两个项目都含 ``clean``/``zn_job`` 时会上传到
+    同一个 ``remote_root/clean`` 并互相覆盖。新目录保留可读 basename，再附
+    一个由作业身份和本地规范路径计算的短摘要。摘要不会把绝对路径明文带到
+    集群；首次提交成功或上传完成后 ``remote_dir`` 会写入 manifest，同一集群
+    profile 的重提、续算、拉取和刷新均继续使用该值，即使本地目录移动或
+    profile 根目录变化。切换到另一 profile 时重新按新目标生成，绝不沿用旧路径。
+    """
+    item = manifest if manifest is not None else manifest_mod.load_manifest(job_dir)
+    existing = str((item or {}).get('remote_dir') or '').strip()
+    existing_cluster = str((item or {}).get('cluster') or '').strip()
+    if existing and existing_cluster == str(profile.name):
+        return existing
     dir_name = os.path.basename(os.path.normpath(job_dir))
-    remote_dir = posixpath.join(profile.remote_root, dir_name)
+    readable = script_builder.sanitize_job_name(dir_name, max_len=48)
+    canonical = os.path.normcase(os.path.realpath(os.path.abspath(job_dir)))
+    identity = '\0'.join((
+        'vcstudio-remote-v1',
+        str(profile.name),
+        str((item or {}).get('job_id') or ''),
+        str((item or {}).get('created_at') or ''),
+        canonical,
+    ))
+    suffix = hashlib.sha256(identity.encode('utf-8', errors='surrogatepass')).hexdigest()[:16]
+    return posixpath.join(profile.remote_root, f'{readable}--{suffix}')
+
+
+def _spec_for(profile, job_dir: str, manifest: dict | None = None) -> JobScriptSpec:
+    dir_name = os.path.basename(os.path.normpath(job_dir))
+    remote_dir = _remote_dir_for(profile, job_dir, manifest)
     return JobScriptSpec(
         job_name=script_builder.sanitize_job_name(dir_name),
         remote_dir=remote_dir,
@@ -200,9 +245,9 @@ def _spec_for(profile, job_dir: str) -> JobScriptSpec:
     )
 
 
-def build_script_text(profile, job_dir: str) -> str:
+def build_script_text(profile, job_dir: str, manifest: dict | None = None) -> str:
     """按 profile 双轨生成最终 job 脚本文本(预览按钮与真提交共用,所见即所交)。"""
-    spec = _spec_for(profile, job_dir)
+    spec = _spec_for(profile, job_dir, manifest)
     dialect = get_dialect(profile.scheduler)
     template_text = None
     if getattr(profile, 'script_mode', 'auto') == 'template':
@@ -222,9 +267,9 @@ def submit_job(client, sftp, profile, job_dir: str) -> dict:
     if errs:
         raise ValueError('；'.join(errs))
     m = manifest_mod.load_manifest(job_dir)
-    spec = _spec_for(profile, job_dir)
+    spec = _spec_for(profile, job_dir, m)
     dialect = get_dialect(profile.scheduler)
-    script_text = build_script_text(profile, job_dir)
+    script_text = build_script_text(profile, job_dir, m)
 
     # 远程目录 + 上传(脚本统一 LF,防 Windows CRLF 毒害 shell)
     run_cmd(client, f'mkdir -p {shlex.quote(spec.remote_dir)}', check=True)

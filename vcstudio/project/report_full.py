@@ -3,8 +3,8 @@
 编排逻辑(spec 2026-07-06 用户 7 决策落地):
 - 图表:先试 Origin(出版级 PNG 落 report_figs/),失败/缺席逐图降级为内嵌 SVG
 - 热图:显式 SVG(Origin2024b 真机验证不支持,数据仍在 opju)
-- 自由能:config['lis_molecules_dir'] 指向旧分子库(如 E:/V2.0.0/results/done/lis_results)
-  时自动算 Li-S 放电路径;算不出(缺物种)记备注不阻塞
+- 自由能:优先用 project['molecules_dir'](导入项目自带分子库),不存在再回退
+  config['lis_molecules_dir'];算不出(缺物种)记备注不阻塞
 - AI:有 keyring key → 调用并持久化进报告;无 → 报告里放提示词包指引
 - 结构图:嵌各作业目录 figs/ 里已渲染的 PNG(拉回结果时全自动渲,此处不现渲)
 所有外部依赖注入可测;单段失败降级为文字说明,报告永远出得来。
@@ -38,9 +38,55 @@ def incar_summary_from_dir(job_dir) -> dict:
 
 
 def _member_dirs(proj) -> list:
+    """全部受管成员，包含导入的分子参考作业并稳定去重。"""
     mem = proj.get('members') or {}
-    return [d for d in ([mem.get('clean_slab'), mem.get('gas_ref')]
-                        + list(mem.get('configs') or [])) if d]
+    dirs = [mem.get('clean_slab'), mem.get('gas_ref')]
+    dirs.extend(mem.get('configs') or [])
+    for refs in (mem.get('molecules'), proj.get('species_ref_jobs')):
+        if isinstance(refs, dict):
+            dirs.extend(refs.values())
+        elif isinstance(refs, (list, tuple)):
+            dirs.extend(refs)
+    out, seen = [], set()
+    for directory in dirs:
+        if not directory:
+            continue
+        key = os.path.normcase(os.path.normpath(str(directory)))
+        if key not in seen:
+            seen.add(key)
+            out.append(directory)
+    return out
+
+
+def _encut_methodology_text(dirs) -> str:
+    """按每个成员真实 INCAR 给出 ENCUT 核验结论，不把首个成员冒充全项目。"""
+    dirs = list(dirs)
+    values = []
+    missing = 0
+    for directory in dirs:
+        encut = incar_summary_from_dir(directory).get('ENCUT')
+        if isinstance(encut, (int, float)) and not isinstance(encut, bool):
+            values.append(float(encut))
+        else:
+            missing += 1
+    distinct = sorted(set(values))
+
+    def fmt(value):
+        return f'{value:g}'
+
+    if len(distinct) > 1:
+        suffix = f'；另有 {missing} 个成员未读到 ENCUT' if missing else ''
+        joined = '、'.join(fmt(value) for value in distinct)
+        return (f'检测到成员 INCAR 的 ENCUT 不一致({joined} eV){suffix};'
+                '不同平面波截断能的 ΔE/ΔG 不应直接比较。')
+    if missing:
+        read_note = (f'已读到 ENCUT = {fmt(distinct[0])} eV；' if distinct else '')
+        return (f'ENCUT 核验不完整:{missing}/{len(dirs)} 个成员缺失/不可读 '
+                f'INCAR 或 ENCUT；{read_note}报告不宣称基组一致。')
+    if distinct:
+        return (f'已核验 {len(values)} 个成员 INCAR:ENCUT = {fmt(distinct[0])} eV 一致，'
+                '支持同一平面波截断能下比较 ΔE/ΔG。')
+    return '未能从成员 INCAR 核验 ENCUT；报告不宣称基组一致。'
 
 
 def _fig_html(png_path, report_dir, caption='') -> str:
@@ -117,7 +163,7 @@ def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
     # ── 1. ΔE 图表(Origin 优先,SVG 兜底) ──
     band = config.get('ideal_window')            # 可配理想窗口 (lo, hi);默认不画
     band_label = config.get('ideal_window_label', '理想窗口')
-    fed = _try_fed(delta, config, log)
+    fed = _try_fed(delta, config, log, proj=proj)
     origin_specs, svg_parts = [], {}
     try:
         bar = charts.bar_data_from_delta(name, delta['rows'],
@@ -204,8 +250,8 @@ def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
             'ΔE 着色:&lt; −3 eV 强吸附(绿)、&gt; 0(红)。',
             corr_line,
             '成员全部 DONE 才给 ΔE;能量经物理合理性闸(E≥0/|E|&gt;10⁴ 拒收)。',
-            '平面波基组不存在基组重叠误差(BSSE),无需 counterpoise 校正;'
-            '项目内各作业 ENCUT 统一(生成时按元素并集取一致截断能,保 ΔE 各成员基组一致);'
+            '平面波基组不存在基组重叠误差(BSSE),无需 counterpoise 校正。',
+            _encut_methodology_text(dirs),
             '气相参考的真空盒尺寸见各作业输入文件(POSCAR/CONTCAR)。']
     if fed:
         conv.insert(1, f'μ<sub>Li</sub> = (E(Li₂S) − E(S₈)/8) / 2 = {fed["mu_li"]:.4f} eV'
@@ -223,15 +269,26 @@ def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
     return out_path
 
 
-def _try_fed(delta, config, log):
-    """分子库目录已配置时算放电路径;缺物种/失败 → None + 日志,不阻塞报告。
+def _try_fed(delta, config, log, proj=None):
+    """有可用分子库时算放电路径;缺物种/失败 → None + 日志,不阻塞报告。
+
+    目录优先级:``proj['molecules_dir']``(导入项目自带) →
+    ``config['lis_molecules_dir']``(全局兼容配置)。项目中的路径已失效时也会
+    回退全局目录，避免移动项目后整段自由能静默丢失。
 
     热校正(投稿级):config['freq_dirs'] = {物种: 频率作业目录} 时,自动解析各
     OUTCAR 频率(IBRION=5/6)做 ZPE−TS 校正并叠进 ΔG;有虚频的物种记日志提醒。
     未配置保持电子能口径(报告方法学节明示)。
     """
-    mol_dir = (config or {}).get('lis_molecules_dir') or ''
-    if not mol_dir or not os.path.isdir(mol_dir):
+    project_dir = str((proj or {}).get('molecules_dir') or '').strip()
+    config_dir = str((config or {}).get('lis_molecules_dir') or '').strip()
+    if project_dir and os.path.isdir(project_dir):
+        mol_dir = project_dir
+    elif config_dir and os.path.isdir(config_dir):
+        mol_dir = config_dir
+        if project_dir:
+            log(f'项目分子库目录不存在,已回退全局配置:{project_dir}')
+    else:
         return None
     g_corr, corr_meta = None, {}
     freq_dirs = (config or {}).get('freq_dirs') or {}
@@ -247,8 +304,14 @@ def _try_fed(delta, config, log):
     try:
         slab_state, e_slab = delta['slab']
         fed = freeenergy.path_from_project_and_molecules(
-            delta['rows'], e_slab=e_slab, molecules_dir=mol_dir, g_corr=g_corr)
-        if corr_meta:
+            delta['rows'], e_slab=e_slab, molecules_dir=mol_dir, g_corr=g_corr,
+            managed_dirs=list(dict((proj or {}).get('species_ref_jobs') or {}).values()),
+            project=proj)
+        if isinstance(fed, dict):
+            for warning in fed.get('warnings') or []:
+                if '方法' in warning or '核验' in warning or '非受管' in warning:
+                    log(f'⚠ 自由能方法学提示:{warning}')
+        if corr_meta and isinstance(fed, dict):
             fed['thermo_meta'] = corr_meta
         return fed
     except ValueError as e:

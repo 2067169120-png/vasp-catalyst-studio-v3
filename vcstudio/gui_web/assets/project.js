@@ -86,6 +86,15 @@
       // 生成的成员作业进了台账 → 刷新任务页
       if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
       await reloadProjects();
+      if (typeof VCS.nextStep === 'function') {
+        VCS.nextStep({
+          title: '吸附能项目已生成',
+          message: `清洁面、${configs.length} 个吸附构型${gas ? '和气相参考' : ''}已加入任务列表。`,
+          detail: '下一步：在任务页选择服务器并批量提交；全部 DONE 后回到吸附能工作台计算 ΔE 和生成报告。',
+          primaryLabel: '去任务页批量提交',
+          page: 'jobs',
+        });
+      }
     } finally {
       if (btn) btn.disabled = false;
     }
@@ -145,6 +154,7 @@
     }
     (r.files || []).forEach(f => VCS.log('已生成:' + f, 'okc'));
     (r.skipped || []).forEach(s => VCS.log('跳过 ' + s.kind + ':' + s.reason, 'warnc'));
+    (r.warnings || []).forEach(w => VCS.log('方法学提示:' + w, 'warnc'));
     if ((r.files || []).length) {
       VCS.log('图已输出到:' + r.out_dir, 'okc');
       VCS.call('open_dir', r.out_dir);          // 生成即可看
@@ -376,7 +386,17 @@
     reloadProjects();
   }
 
-  // 任务页组头「算 ΔE」调用:刷新项目列表后按项目名选中(找不到则保持默认)
+  // 导入向导/任务页优先用 project.yaml 绝对路径精确选中，
+  // 避免两个同名项目被选错。按名选中仅保留给旧数据兼容。
+  async function selectByPath(path) {
+    await reloadProjects();
+    const wanted = String(path || '');
+    const hit = State.projects.find(p => String(p.path || '') === wanted);
+    const sel = $('pj-select');
+    if (hit && sel) sel.value = hit.path;
+    return !!hit;
+  }
+
   async function selectByName(name) {
     await reloadProjects();
     const hit = State.projects.find(p => p.name === name);
@@ -392,5 +412,5 @@
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 
-  window.Project = { reload: reloadProjects, selectByName };
+  window.Project = { reload: reloadProjects, selectByPath, selectByName };
 })();

@@ -18,6 +18,24 @@
     if (a) a.click();
   }
 
+  function openImport(mode) {
+    if (window.Project && typeof window.Project.openImport === 'function') {
+      window.Project.openImport(mode);
+      return;
+    }
+    navTo('project');
+    VCS.toast('请在“吸附能项目”中选择“导入整个文件夹”');
+  }
+
+  function openNewAdsorption() {
+    if (window.AdsorptionWorkbench &&
+        typeof window.AdsorptionWorkbench.openNewProject === 'function') {
+      window.AdsorptionWorkbench.openNewProject();
+      return;
+    }
+    navTo('project');
+  }
+
   // ── 卡片 1:状态汇总大数字(点击跳作业页) ─────────────────────────────────
   function renderNums(jobs) {
     const box = $('db-nums');
@@ -75,12 +93,15 @@
         if (st === 'recover' && p.recover_round) lbl += ` ${p.recover_round}/3`;
         return `<div class="pl-step ${cls}"><span class="dot"></span><span class="lbl">${VCS.esc(lbl)}</span></div>`;
       }).join('');
+      const nextPage = p.stage_index <= 0 ? 'generate'
+        : (p.stage_index <= 3 ? 'jobs' : 'project');
       return '<div class="pl-proj">' +
         '<div class="pl-head">' +
         (p.needs_human ? '<span class="redflag" title="需人工介入"></span>' : '') +
         VCS.elementBadge(p.name) +
         `<span class="nm">${VCS.esc(p.name || '(未命名)')}</span>` +
-        `<span class="plcount">${p.done}/${p.total} DONE</span></div>` +
+        `<span class="plcount">${p.done}/${p.total} DONE</span>` +
+        `<button class="btn quiet" data-goto="${nextPage}">继续下一步</button></div>` +
         `<div class="pl-steps">${steps}</div></div>`;
     }).join('');
   }
@@ -185,6 +206,11 @@
     if (!page) return;
     // 快捷入口三个大按钮
     const wire = (id, fn) => { const el = $(id); if (el) el.addEventListener('click', fn); };
+    wire('db-start-new', openNewAdsorption);
+    wire('db-start-inputs', () => openImport('inputs'));
+    wire('db-start-results', () => openImport('results'));
+    wire('db-start-molecules', () => openImport('molecules'));
+    wire('db-start-existing', () => navTo('jobs'));
     wire('db-go-generate', () => navTo('generate'));
     wire('db-go-project', () => navTo('project'));
     wire('db-go-queue', () => {

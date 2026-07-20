@@ -75,6 +75,22 @@ Three invariants: ① methodology sovereignty (your INCAR/template is passed
 through verbatim) ② deterministic core is zero-token ③ explicit state, never
 silent (job.yaml state machine + audit history).
 
+## 2026-07-20 更新：吸附能工作台
+
+- **整文件夹导入**：在项目页先选择“已有吸附能结果”“四件套并提交”或
+  “锂硫/分子参考库”，软件会递归扫描子目录，再由用户确认 clean、config、
+  gas ref、molecule 角色；原目录始终只读，确认预检后才复制到受管目录。
+- **已有结果也能出报告**：不要求结果来自本软件的集群任务。只有通过收敛标记、
+  E0 合理性和 DONE 状态门控的能量才进入 ΔE/ΔG、图表与报告；待核验结果仍可导入，
+  但不会被悄悄当作可信数据。
+- **一页完成提交**：四件套通过语法与元素顺序检查后，可在导入向导内选择服务器、
+  队列、节点、核数和墙钟并直接提交；也可先导入，稍后在任务页批量提交。
+- **科学一致性预检**：clean/config 会核验泛函（含 HSE、SCAN/r2SCAN）、ENCUT、
+  KPOINTS、晶胞、POTCAR、DFT+U、色散、自旋与展宽设置，发现不可比较的数据会说明
+  原因并阻止生成误导性的吸附能。
+- **依赖安装修复**：冻结的单文件 EXE 不再调用自身执行 `-m pip`（该行为会重新打开
+  软件）。标准完整版在打包时内置 RDKit 与 matplotlib；源码运行仍可使用依赖安装器。
+
 ## 2026-07-16 更新(本轮进展)
 
 - **修复续算状态误识别**:续算重投后新作业尚未进调度器队列时,不再拿上一轮旧
@@ -85,7 +101,8 @@ silent (job.yaml state machine + audit history).
   数据矩阵表、ΔG 自由能台阶图、**多催化剂热图**、**火山图**(自动求 Sabatier 峰顶)、
   标度关系图。**已接入 GUI**:项目页「论文级出图」卡片,勾选图类型一键生成
   (单项目:柱状图/表/台阶图;多项目对比:热图/标度关系/火山图),生成后自动打开
-  图目录。打包默认收录 matplotlib(`--no-charts` 可关)。
+  图目录。打包默认的完整版收录 matplotlib 与 RDKit（`--lite` 可构建明确精简版）；
+  DECIMER 为构建时实验性选项，不进默认 EXE。
 - **结果分析增强**:PDOS 投影 + d 带中心、Bader 电荷解析、可选 ΔG 口径
   (默认 ZPE−TS 对齐文献 / 可切 ASE 严格式含振动内能项)、PDS/U_L 图数一致性。
 - **输入正确性**:KPOINTS 改用倒格矢(修六方/hcp slab 欠采样)、项目内 ENCUT 强制

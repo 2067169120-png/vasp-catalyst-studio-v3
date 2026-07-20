@@ -138,6 +138,36 @@ def test_delta_e_without_ref_notes_formula(env):
     assert 'E(slab+ads)−E(slab)' in s['rows'][0]['note']
 
 
+def test_imported_species_reference_job_updates_delta_after_done(tmp_path):
+    clean = tmp_path / 'demo_slab_clean'
+    config = tmp_path / 'demo_ads_top_Li2S4'
+    molecule = tmp_path / 'molecules' / 'mol_Li2S4'
+    for directory, system in ((clean, 'clean'), (config, 'config'),
+                              (molecule, 'Li2S4 molecule')):
+        directory.mkdir(parents=True)
+        item = manifest.new_manifest(
+            job_id=directory.name, system=system, task_type='static',
+            calc_type='molecule' if directory == molecule else 'slab', inputs={})
+        manifest.save_manifest(directory, item)
+    _finish(clean, -100.0)
+    _finish(config, -120.0)
+    project = {
+        'name': 'demo',
+        'members': {'clean_slab': str(clean), 'gas_ref': None,
+                    'configs': [str(config)]},
+        'species_refs': {'Li2S4': None},
+        'species_ref_jobs': {'Li2S4': str(molecule)},
+    }
+
+    pending = adsorption.delta_e_rows(project)
+    assert pending['rows'][0]['delta_e'] is None
+    assert '参考能量' in pending['rows'][0]['note']
+
+    _finish(molecule, -10.0)
+    completed = adsorption.delta_e_rows(project)
+    assert completed['rows'][0]['delta_e'] == pytest.approx(-10.0)
+
+
 def test_export_csv_excel_friendly(env, tmp_path):
     res = adsorption.create_project(
         env['tmp'] / 'p5', 'csv', clean_poscar=env['poscar']('s.vasp'),

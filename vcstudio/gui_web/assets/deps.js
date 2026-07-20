@@ -4,7 +4,7 @@
 'use strict';
 (function () {
   const $ = id => document.getElementById(id);
-  const State = { deps: [], pollTimer: null };
+  const State = { deps: [], pollTimer: null, runtimeInstallSupported: true, installNote: '' };
 
   // ── 侧栏依赖状态 ──
   async function loadDeps() {
@@ -13,6 +13,8 @@
     if (!box) return;
     if (!r || r.ok === false) { box.innerHTML = '<span class="deps-empty">检测失败</span>'; return; }
     State.deps = r.deps || [];
+    State.runtimeInstallSupported = r.runtime_install_supported !== false;
+    State.installNote = r.runtime_install_note || '';
     box.innerHTML = State.deps.map(d =>
       `<div class="deps-item ${d.available ? 'ok' : 'bad'}" title="${VCS.esc(d.detail || '')}">` +
       `<span class="dot"></span><span class="dnm">${VCS.esc(d.name)}</span>` +
@@ -21,6 +23,16 @@
 
   // ── 下载/修复依赖弹窗 ──
   function openInstallModal() {
+    if (!State.runtimeInstallSupported) {
+      const box = document.createElement('div');
+      box.className = 'deps-modal';
+      const note = document.createElement('p');
+      note.className = 'sub';
+      note.textContent = State.installNote || '单文件 EXE 的 Python 依赖需在打包时内置。';
+      box.appendChild(note);
+      VCS.modal({ title: '依赖安装说明', body: box });
+      return;
+    }
     const installable = State.deps.filter(d => d.installable);
     if (!installable.length) { VCS.toast('无可自动安装的组件'); return; }
     const box = document.createElement('div');

@@ -40,6 +40,7 @@ class FakeSFTP:
     def __init__(self, available=('CONTCAR', 'OSZICAR', 'OUTCAR')):
         self.available = set(available)
         self.puts = {}
+        self.gets = []
 
     def put(self, local, remote):
         self.puts[remote] = local
@@ -57,6 +58,7 @@ class FakeSFTP:
         return _W()
 
     def get(self, remote, local):
+        self.gets.append(remote)
         name = remote.rsplit('/', 1)[-1]
         if name not in self.available:
             raise IOError(f'no such file: {remote}')
@@ -108,3 +110,19 @@ def test_fetch_before_submit_raises(tmp_path):
     d = _job(tmp_path)
     with pytest.raises(ValueError, match='尚未提交'):
         submitter.fetch_results(FakeClient(), FakeSFTP(), d)
+
+
+def test_fetch_preserves_legacy_manifest_remote_dir(tmp_path):
+    d = _job(tmp_path)
+    legacy = '/legacy/work/jobs/j'
+    item = manifest.load_manifest(d)
+    item['cluster'] = 'old-hpc'
+    item['remote_dir'] = legacy
+    item['scheduler_job_id'] = '42'
+    manifest.save_manifest(d, item)
+    sftp = FakeSFTP()
+
+    fetched, missing = submitter.fetch_results(FakeClient(), sftp, d)
+
+    assert fetched == ['CONTCAR', 'OSZICAR', 'OUTCAR'] and missing == []
+    assert sftp.gets == [f'{legacy}/{name}' for name in fetched]

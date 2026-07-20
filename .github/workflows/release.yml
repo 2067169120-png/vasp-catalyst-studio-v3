@@ -1,7 +1,8 @@
 name: Release
 
 # 打 v* 标签自动出 Windows EXE 挂到 GitHub Release(在 windows-latest 云机器构建)。
-# EXE 含 web GUI + matplotlib 出图引擎;--legacy tkinter 版不随发行(需要者自行打包)。
+# EXE 含 web GUI + matplotlib 出图引擎 + RDKit 分子建模;
+# DECIMER 因模型体积不默认打包；--legacy tkinter 版不随发行。
 on:
   push:
     tags: ["v*"]
@@ -17,11 +18,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install (dev + gui + charts + PyInstaller)
+      - name: Install full EXE dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e .[dev,gui,charts]
-          pip install pyinstaller
+          pip install -e ".[dev,gui,charts,mol,packaging]"
       - name: Test (fast gate)
         run: python -m pytest -q
       - name: Build EXE

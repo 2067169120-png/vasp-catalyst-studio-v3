@@ -16,10 +16,20 @@ from __future__ import annotations
 
 import os
 import re
+from pathlib import Path
 
+import yaml
+
+from vcstudio.generate import methods_text
+from vcstudio.generate.incar_builder import parse_incar
+from vcstudio.generate.poscar import parse_poscar_species
 from vcstudio.project import reactions
 
 _E0_RE = re.compile(r'E0=\s*([-+.\dEe]+)')
+_XC_KEYS = (
+    'metagga', 'lhfcalc', 'aexx', 'hfscreen', 'aggax', 'aggac', 'aldac',
+    'lasph', 'luse_vdw',
+)
 
 # Li-S 16 电子放电路径 preset:(吸附物种, 累计 n_li, 沉淀 [(分子, 个数)])
 # 硫/锂守恒:每态 吸附态+沉淀 合计 8 个 S;n_li = 吸附态 Li + 沉淀 Li。
@@ -48,9 +58,301 @@ def read_e0(job_dir) -> float | None:
         return None
 
 
-def load_molecule_energies(folder) -> dict:
-    """扫描目录下 mol_<X>/molecule_<X> 子目录 → {X: E0}(旧版 results/done 兼容)。"""
+def method_fingerprint_from_facts(facts: dict | None) -> dict:
+    """方法学 facts → 可持久化、可审计的能量比较指纹。"""
+    facts = dict(facts or {})
+    potcars = {
+        str(item.get('element')): {
+            'variant': item.get('variant'), 'titel': item.get('titel'),
+        }
+        for item in (facts.get('potcars') or []) if item.get('element')
+    }
+    xc_source = dict(facts.get('xc_fingerprint') or {})
+    xc = {key: xc_source.get(key, facts.get(key)) for key in _XC_KEYS}
+    missing = []
+    functional = facts.get('functional')
+    if not functional or facts.get('functional_known') is False:
+        missing.append('可识别的交换关联泛函')
+    if facts.get('encut') is None:
+        missing.append('ENCUT')
+    if facts.get('ivdw_setting') is None:
+        missing.append('IVDW/LUSE_VDW')
+    if 'ldau' not in facts:
+        missing.append('DFT+U 开关')
+    if not potcars:
+        missing.append('POTCAR 身份')
+    ldau_parameters = dict(facts.get('ldau_parameters') or {})
+    if facts.get('ldau') and not ldau_parameters:
+        missing.append('逐元素 DFT+U 参数')
+    return {
+        'schema': 1,
+        'complete': not missing,
+        'missing': missing,
+        'functional': functional,
+        'xc': xc,
+        'encut': facts.get('encut'),
+        'ivdw_setting': facts.get('ivdw_setting'),
+        'ldau': facts.get('ldau') if 'ldau' in facts else None,
+        'potcars': potcars,
+        'ldau_parameters': ldau_parameters,
+    }
+
+
+def _method_fingerprint_from_job(job_dir) -> dict:
+    """优先从真实输入重建指纹；文件缺失时回退 manifest 的审计快照。"""
+    root = Path(job_dir)
+
+    def text(name):
+        try:
+            return (root / name).read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            return None
+
+    incar, kpoints, potcar, poscar = (
+        text('INCAR'), text('KPOINTS'), text('POTCAR'), text('POSCAR'))
+    if incar and kpoints and potcar:
+        extracted = methods_text.extract_facts(incar, kpoints, potcar)
+        facts = dict(extracted.get('facts') or {})
+        try:
+            parsed = parse_incar(incar)
+            elements, _counts = parse_poscar_species(poscar or '')
+            parameters = {}
+            for key in ('LDAUL', 'LDAUU', 'LDAUJ'):
+                values = str(parsed.get(key, '')).split()
+                if values and len(values) == len(elements):
+                    for element, value in zip(elements, values):
+                        parameters.setdefault(element, {})[key] = value
+            facts['ldau_parameters'] = parameters
+        except (TypeError, ValueError, IndexError):
+            facts['ldau_parameters'] = {}
+        return method_fingerprint_from_facts(facts)
+
+    from vcstudio.shared import manifest as manifest_mod
+    item = manifest_mod.load_manifest(root) or {}
+    facts = dict((item.get('inputs') or {}).get('method_facts') or {})
+    return method_fingerprint_from_facts(facts)
+
+
+def _normal_path(path) -> str:
+    return os.path.normcase(os.path.abspath(os.path.normpath(str(path))))
+
+
+def _library_project_context(folder) -> tuple[dict | None, str | None, bool]:
+    """返回 (project, error, managed_marker_seen)。"""
+    root = Path(folder)
+    project_file = root.parent / 'project.yaml'
+    if not project_file.is_file():
+        return None, None, False
+    try:
+        with project_file.open('r', encoding='utf-8') as handle:
+            project = yaml.safe_load(handle)
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        return None, f'分子参考库 project.yaml 损坏，无法核验方法一致性:{exc}', True
+    if not isinstance(project, dict):
+        return None, '分子参考库 project.yaml 不是合法项目对象，无法核验方法一致性', True
+    configured = str(project.get('molecules_dir') or '').strip()
+    if configured and _normal_path(configured) == _normal_path(root):
+        return project, None, True
+    if project.get('kind') == 'molecule_library':
+        return None, '分子参考库 project.yaml 的 molecules_dir 与当前目录不一致', True
+    return None, None, False
+
+
+def _project_method_entries(project: dict, roles: tuple[str, ...]) -> list[tuple[str, dict]]:
+    """读取项目元数据指纹；旧项目则从受管作业的真实输入重建。"""
+    metadata = dict((project or {}).get('method_fingerprints') or {})
+    saved = metadata.get('members') if isinstance(metadata, dict) else None
+    saved_by_path = {}
+    if isinstance(saved, list):
+        for item in saved:
+            if isinstance(item, dict) and item.get('path') and item.get('fingerprint'):
+                saved_by_path[_normal_path(item['path'])] = item
+
+    members = dict((project or {}).get('members') or {})
+    records: list[tuple[str, str]] = []
+    if 'clean' in roles and members.get('clean_slab'):
+        records.append(('clean', str(members['clean_slab'])))
+    if 'config' in roles:
+        records.extend(('config', str(path)) for path in (members.get('configs') or []) if path)
+    if 'molecule' in roles:
+        paths = []
+        for mapping in (members.get('molecules'), (project or {}).get('species_ref_jobs')):
+            if isinstance(mapping, dict):
+                paths.extend(mapping.values())
+            elif isinstance(mapping, (list, tuple)):
+                paths.extend(mapping)
+        records.extend(('molecule', str(path)) for path in dict.fromkeys(paths) if path)
+
+    entries = []
+    for role, path in records:
+        saved_item = saved_by_path.get(_normal_path(path))
+        quartet_exists = all((Path(path) / name).is_file()
+                             for name in ('INCAR', 'POTCAR', 'KPOINTS', 'POSCAR'))
+        if quartet_exists:
+            fingerprint = _method_fingerprint_from_job(path)
+            if (saved_item and saved_item.get('role') == role
+                    and fingerprint != dict(saved_item['fingerprint'])):
+                fingerprint['complete'] = False
+                fingerprint.setdefault('missing', []).append(
+                    '保存方法指纹后真实四件套已改变')
+        elif saved_item and saved_item.get('role') == role:
+            fingerprint = dict(saved_item['fingerprint'])
+        else:
+            fingerprint = _method_fingerprint_from_job(path)
+        entries.append((f'{role}:{Path(path).name}', fingerprint))
+    return entries
+
+
+def _method_profile(entries: list[tuple[str, dict]], label: str) -> tuple[dict, list[str]]:
+    errors = []
+    if not entries:
+        return {}, [f'{label}没有可核验的方法学成员']
+    baseline_name, baseline = entries[0]
+    for name, fingerprint in entries:
+        if not fingerprint.get('complete'):
+            missing = '、'.join(fingerprint.get('missing') or ['未知关键字段'])
+            errors.append(f'{label}成员 {name} 缺少方法证据:{missing}')
+    core_keys = (
+        ('functional', '交换关联泛函'), ('encut', 'ENCUT'),
+        ('ivdw_setting', '色散校正'), ('ldau', 'DFT+U 开关'),
+    )
+    for name, fingerprint in entries[1:]:
+        for key, title in core_keys:
+            if baseline.get(key) != fingerprint.get(key):
+                errors.append(
+                    f'{label}内部方法不一致:{baseline_name} 与 {name} 的 {title} '
+                    f'分别为 {baseline.get(key)!r}/{fingerprint.get(key)!r}')
+        if baseline.get('xc') != fingerprint.get('xc'):
+            errors.append(f'{label}内部方法不一致:{baseline_name} 与 {name} 的 hybrid/meta 参数不同')
+
+    potcars, u_parameters = {}, {}
+    for name, fingerprint in entries:
+        for element, identity in dict(fingerprint.get('potcars') or {}).items():
+            if element in potcars and potcars[element][0] != identity:
+                errors.append(f'{label}内部 {element} POTCAR 不一致:{potcars[element][1]}/{name}')
+            else:
+                potcars[element] = (identity, name)
+        for element, parameters in dict(fingerprint.get('ldau_parameters') or {}).items():
+            if element in u_parameters and u_parameters[element][0] != parameters:
+                errors.append(f'{label}内部 {element} DFT+U 参数不一致')
+            else:
+                u_parameters[element] = (parameters, name)
+    profile = {
+        'functional': baseline.get('functional'), 'xc': baseline.get('xc'),
+        'encut': baseline.get('encut'), 'ivdw_setting': baseline.get('ivdw_setting'),
+        'ldau': baseline.get('ldau'),
+        'potcars': {key: value[0] for key, value in potcars.items()},
+        'ldau_parameters': {key: value[0] for key, value in u_parameters.items()},
+    }
+    return profile, list(dict.fromkeys(errors))
+
+
+def audit_molecule_method_compatibility(project: dict | None, molecules_dir,
+                                        *, managed_dirs=None) -> dict:
+    """审计吸附项目与分子参考库能否安全混用于 ΔG。"""
+    library_project, context_error, marker_seen = _library_project_context(molecules_dir)
+    explicit_dirs = [str(path) for path in (managed_dirs or []) if path]
+    managed = bool(marker_seen or explicit_dirs)
+    if context_error:
+        return {'ok': False, 'verified': False, 'managed': True,
+                'errors': [context_error], 'warnings': []}
+    if not managed:
+        warning = ('旧式非受管分子目录没有 project.yaml/方法指纹；无法核验其泛函、'
+                   'ENCUT、色散、DFT+U 与 POTCAR，仅为兼容旧数据继续计算，请勿直接用于投稿')
+        return {'ok': True, 'verified': False, 'managed': False,
+                'errors': [], 'warnings': [warning]}
+    if not isinstance(project, dict):
+        return {'ok': False, 'verified': False, 'managed': True,
+                'errors': ['受管分子参考库必须与当前吸附项目核验方法一致性，缺少吸附项目上下文'],
+                'warnings': []}
+
+    ads_entries = _project_method_entries(project, ('clean', 'config'))
+    if library_project is not None:
+        library_entries = _project_method_entries(library_project, ('molecule',))
+    else:
+        library_entries = [
+            (f'molecule:{Path(path).name}', _method_fingerprint_from_job(path))
+            for path in explicit_dirs
+        ]
+    ads_profile, errors = _method_profile(ads_entries, '吸附项目')
+    library_profile, library_errors = _method_profile(library_entries, '分子参考库')
+    errors.extend(library_errors)
+    if not errors:
+        for key, title in (
+            ('functional', '交换关联泛函'), ('encut', 'ENCUT'),
+            ('ivdw_setting', '色散校正'), ('ldau', 'DFT+U 开关'),
+        ):
+            if ads_profile.get(key) != library_profile.get(key):
+                errors.append(
+                    f'跨项目方法不一致:{title}，吸附项目={ads_profile.get(key)!r}，'
+                    f'分子参考库={library_profile.get(key)!r}')
+        if ads_profile.get('xc') != library_profile.get('xc'):
+            errors.append('跨项目方法不一致:hybrid/meta-GGA 关键参数不同')
+        shared = sorted(set(ads_profile.get('potcars') or {})
+                        & set(library_profile.get('potcars') or {}))
+        for element in shared:
+            if ads_profile['potcars'][element] != library_profile['potcars'][element]:
+                errors.append(f'跨项目方法不一致:共享元素 {element} 的 POTCAR 身份不同')
+        for element in shared:
+            ads_u = (ads_profile.get('ldau_parameters') or {}).get(element)
+            library_u = (library_profile.get('ldau_parameters') or {}).get(element)
+            if ads_profile.get('ldau') and ads_u != library_u:
+                errors.append(f'跨项目方法不一致:共享元素 {element} 的 DFT+U 参数不同')
+    return {
+        'ok': not errors, 'verified': not errors, 'managed': True,
+        'errors': list(dict.fromkeys(errors)), 'warnings': [],
+        'adsorption_profile': ads_profile,
+        'library_profile': library_profile,
+    }
+def _library_managed_dirs(folder) -> set[str]:
+    """从 ``<library>/../project.yaml`` 识别独立导入的受管分子作业。
+
+    molecule_library 会被全局 ``lis_molecules_dir`` 复用，此时调用方往往没有
+    当前吸附项目的 ``species_ref_jobs``。若不从参考库自己的 project.yaml
+    恢复受管成员，损坏/丢失 job.yaml 会被误当 legacy OSZICAR 直接采信。
+    """
+    root = Path(folder)
+    project_file = root.parent / 'project.yaml'
+    if not project_file.is_file():
+        return set()
+    try:
+        with open(project_file, 'r', encoding='utf-8') as handle:
+            project = yaml.safe_load(handle)
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return set()
+    if not isinstance(project, dict) or project.get('kind') != 'molecule_library':
+        return set()
+    configured_root = str(project.get('molecules_dir') or '').strip()
+    if configured_root:
+        expected = os.path.normcase(os.path.abspath(os.path.normpath(configured_root)))
+        actual = os.path.normcase(os.path.abspath(os.path.normpath(str(root))))
+        if expected != actual:
+            return set()
+    refs = []
+    members = project.get('members') or {}
+    for mapping in (members.get('molecules'), project.get('species_ref_jobs')):
+        if isinstance(mapping, dict):
+            refs.extend(mapping.values())
+        elif isinstance(mapping, (list, tuple)):
+            refs.extend(mapping)
+    return {
+        os.path.normcase(os.path.abspath(os.path.normpath(str(path))))
+        for path in refs if path
+    }
+
+
+def load_molecule_energies(folder, *, managed_dirs=None) -> dict:
+    """扫描 mol_<X>/molecule_<X> → {X: E0}，受管作业必须为 DONE。
+
+    无 job.yaml 的旧分子库继续直接读 OSZICAR；整文件夹导入的受管分子有
+    job.yaml，只有 DONE 才能进入 ΔG，避免未收敛 OSZICAR 被静默采用。
+    """
     out = {}
+    managed = _library_managed_dirs(folder)
+    managed.update({
+        os.path.normcase(os.path.abspath(os.path.normpath(str(path))))
+        for path in (managed_dirs or []) if path
+    })
     try:
         entries = sorted(os.listdir(folder))
     except OSError:
@@ -59,7 +361,22 @@ def load_molecule_energies(folder) -> dict:
         low = name.lower()
         for prefix in ('mol_', 'molecule_'):
             if low.startswith(prefix):
-                e = read_e0(os.path.join(str(folder), name))
+                job_dir = os.path.join(str(folder), name)
+                from vcstudio.shared import manifest as manifest_mod
+                item = manifest_mod.load_manifest(job_dir)
+                known_managed = os.path.normcase(os.path.abspath(
+                    os.path.normpath(job_dir))) in managed
+                # Explicit project membership is fail-closed: a deleted or
+                # corrupt job.yaml must never make a partially run E0 look like
+                # a trusted legacy molecule.  Unmanaged legacy libraries retain
+                # their historical OSZICAR-only compatibility.
+                if known_managed and (item is None or item.get('state') != 'DONE'):
+                    break
+                if item is not None and item.get('state') != 'DONE':
+                    break
+                result_energy = ((item or {}).get('results') or {}).get('energy_e0_eV')
+                e = (float(result_energy)
+                     if isinstance(result_energy, (int, float)) else read_e0(job_dir))
                 if e is not None:
                     out[name[len(prefix):]] = e
                 break
@@ -127,14 +444,20 @@ def discharge_path(system_energies: dict, mol_energies: dict, *,
 
 def path_from_project_and_molecules(delta_rows: list, e_slab: float,
                                     molecules_dir, *, mu_li=None,
-                                    g_corr: dict | None = None) -> dict:
+                                    g_corr: dict | None = None,
+                                    managed_dirs=None,
+                                    project: dict | None = None) -> dict:
     """便捷入口:项目 ΔE 行(带 e_config)+ 旧分子目录 → 放电路径。
 
     构型名需含物种名(如 ads_Li2S4_on_slab / Li2S6_top):按物种子串匹配唯一构型;
     多个匹配取 E 最低(最稳构型,常规口径)。
     g_corr 透传 discharge_path(逐物种 ZPE−TS 校正,见 project.thermo)。
     """
-    mol_e = load_molecule_energies(molecules_dir)
+    audit = audit_molecule_method_compatibility(
+        project, molecules_dir, managed_dirs=managed_dirs)
+    if not audit['ok']:
+        raise ValueError('ΔG 方法一致性门控未通过:' + '；'.join(audit['errors']))
+    mol_e = load_molecule_energies(molecules_dir, managed_dirs=managed_dirs)
     system_e = {}
     for sp, _, _ in LIS_PRESET:
         # 只取 DONE 成员(审查#3):NEEDS_HUMAN/BAD_ENERGY 的能量不得漏进 ΔG/U_L
@@ -143,7 +466,10 @@ def path_from_project_and_molecules(delta_rows: list, e_slab: float,
                  and _species_in_name(sp, r.get('name', ''))]
         if cands:
             system_e[sp] = min(cands)
-    return discharge_path(system_e, mol_e, mu_li=mu_li, g_corr=g_corr)
+    result = discharge_path(system_e, mol_e, mu_li=mu_li, g_corr=g_corr)
+    result['method_consistency'] = audit
+    result.setdefault('warnings', []).extend(audit.get('warnings') or [])
+    return result
 
 
 def _species_in_name(species: str, name: str) -> bool:

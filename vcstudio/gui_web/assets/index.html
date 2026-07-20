@@ -328,6 +328,37 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <span class="stats" id="db-stats">加载中…</span>
     </div>
 
+    <!-- 默认任务入口:先问用户手里有什么,再进入对应向导。高级页面仍可从左侧直达。 -->
+    <div class="card start-here" id="db-start-here">
+      <div class="start-copy">
+        <span class="start-kicker">从这里开始</span>
+        <h2>你现在手里有什么？</h2>
+        <p>选择最符合当前情况的一项。软件会检查文件、只展示下一步，不要求你先理解全部页面。</p>
+      </div>
+      <div class="start-flow" aria-label="推荐流程">
+        <span><b>1</b>选择数据</span><i></i><span><b>2</b>软件预检</span><i></i>
+        <span><b>3</b>提交或导入</span><i></i><span><b>4</b>生成报告</span>
+      </div>
+      <div class="start-actions">
+        <button class="start-action" id="db-start-new">
+          <b>从结构新建吸附能项目</b><span>清洁面 + 多构型 + 参考态 → 批量提交</span>
+        </button>
+        <button class="start-action primary" id="db-start-inputs">
+          <b>我已有 VASP 四件套</b><span>选择整个文件夹，检查后直接加入待提交作业</span>
+        </button>
+        <button class="start-action primary" id="db-start-results">
+          <b>我已有算好的结果</b><span>整文件夹导入；自动识别吸附体系与锂硫参考态并生成报告</span>
+        </button>
+        <button class="start-action" id="db-start-molecules">
+          <b>导入锂硫 / 分子参考库</b><span>整文件夹导入 Li₂Sₓ 等参考态，无需清洁面或吸附构型</span>
+        </button>
+        <button class="start-action quiet" id="db-start-existing">
+          <b>继续已有任务</b><span>查看提交、运行、失败恢复与拉回结果</span>
+        </button>
+      </div>
+      <div class="start-note">推荐直接选择包含多个计算子目录的根文件夹；识别不确定时，软件只会请你确认角色，不会替你猜科学含义。</div>
+    </div>
+
     <!-- 取数失败错误条(不再假装 0 作业) -->
     <div class="errbar" id="db-error" hidden></div>
 
@@ -365,7 +396,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <div>
         <!-- 卡片 3:快捷入口 -->
         <div class="card" style="padding:12px;margin-bottom:10px">
-          <div class="db-h">快捷入口</div>
+          <div class="db-h">专业入口</div>
           <div class="db-quick">
             <button class="btn db-qbtn" id="db-go-generate"><b>生成四件套</b><span>POSCAR + INCAR 自动补全 POTCAR / KPOINTS</span></button>
             <button class="btn db-qbtn" id="db-go-project"><b>结果分析 / 批量项目</b><span>任务解析 · 吸附能 ΔE 批量 · 出图成稿</span></button>
@@ -1070,26 +1101,58 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 
   <section class="page" data-page="project" id="page-project" hidden>
     <div class="pagebar">
-      <h1 data-i18n="project.title">结果分析</h1>
-      <span class="stats" data-i18n="project.subtitle">任意 DFT 计算的结果解析与出图 · 吸附能只是诸多计算类型之一</span>
+      <h1>吸附能工作台</h1>
+      <span class="stats">从已有四件套或已算结果开始，也可以从结构新建；导入、提交、分析和报告在一条流程里完成</span>
     </div>
 
-    <!-- 分析类型:选中只显示对应分区(去"吸附能中心主义") -->
+    <!-- 默认主流程:吸附能优先；通用分析仍保留在下方高级入口。 -->
+    <div class="card ads-workbench" id="ads-workbench">
+      <div class="ads-wb-copy">
+        <span class="start-kicker">推荐流程</span>
+        <h2>选择你现在已有的数据</h2>
+        <p>软件递归检查整个文件夹，先让你确认清洁面、吸附构型和参考态，再复制到受管目录。原始计算文件不会被修改。</p>
+      </div>
+      <div class="ads-steps" aria-label="吸附能推荐流程">
+        <span><b>1</b>选择整文件夹</span><i></i><span><b>2</b>确认体系角色</span><i></i>
+        <span><b>3</b>直接提交或采用结果</span><i></i><span><b>4</b>ΔE / ΔG / 报告</span>
+      </div>
+      <div class="ads-entry-grid">
+        <button class="ads-entry primary" id="ads-import-results">
+          <b>导入已经算好的结果</b>
+          <span>自动读取 E0 与收敛证据；支持锂硫化合物和分子参考态</span>
+        </button>
+        <button class="ads-entry" id="ads-import-inputs">
+          <b>导入 VASP 四件套并提交</b>
+          <span>整文件夹检查 INCAR / POSCAR / KPOINTS / POTCAR，然后选服务器直接提交</span>
+        </button>
+        <button class="ads-entry" id="ads-import-molecules">
+          <b>导入锂硫 / 分子参考库</b>
+          <span>可只导入 Li₂Sₓ、S₈ 等物种参考态，用于后续 ΔG 分析</span>
+        </button>
+        <button class="ads-entry quiet" id="ads-new-from-structure">
+          <b>从结构新建吸附能项目</b>
+          <span>清洁面 + 多个吸附构型 + 可选气相参考</span>
+        </button>
+      </div>
+      <div class="ads-safety">软件会自动识别，但不会擅自猜科学角色：不明确的目录会标成“需确认”；没有正确收敛证据的能量不会写入正式结果。</div>
+    </div>
+
+    <!-- 高级分析类型:选中只显示对应分区。新用户默认吸附能。 -->
     <div class="ana-bar">
-      <span class="ana-lbl" data-i18n="project.ana.label">分析类型</span>
+      <span class="ana-lbl">高级功能</span>
       <select id="analysis-type" data-switch="data-ana" data-switch-store="project.ana">
-        <option value="taskana" data-i18n="project.ana.taskana">任务解析(能带 / EOS / 功函数 / 收敛…)</option>
         <option value="adsorption" data-i18n="project.ana.adsorption">吸附能项目</option>
+        <option value="taskana" data-i18n="project.ana.taskana">任务解析(能带 / EOS / 功函数 / 收敛…)</option>
         <option value="spin" data-i18n="project.ana.spin">自旋态对比</option>
         <option value="figures" data-i18n="project.ana.figures">结果出图 / 多项目对照</option>
         <option value="draft" data-i18n="project.ana.draft">一键成稿包</option>
       </select>
-      <span class="ana-note" data-i18n="project.ana.note">切换分析类型即切换下方分区</span>
+      <span class="ana-note">需要能带、EOS、功函数等通用分析时再切换；当前先聚焦吸附能。</span>
     </div>
 
     <!-- 新建项目 -->
-    <div class="card" data-ana="adsorption" style="padding:12px;margin-bottom:10px">
-      <div class="pj-h">新建吸附能项目(一次生成整组作业并登记台账)</div>
+    <div class="card" id="pj-create-card" data-ana="adsorption" style="padding:12px;margin-bottom:10px">
+      <div class="pj-h">方式 B：从结构新建（一组生成并登记清洁面、构型与参考态）</div>
 
       <div class="pj-fld">
         <span class="pj-lbl">项目名</span>
@@ -1145,8 +1208,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 已有项目 -->
-    <div class="card" data-ana="adsorption" style="padding:12px;margin-bottom:10px">
-      <div class="pj-h">已有项目 ΔE 汇总(成员全部 DONE 才给数)</div>
+    <div class="card" id="pj-results-card" data-ana="adsorption" style="padding:12px;margin-bottom:10px">
+      <div class="pj-h">项目结果：ΔE 汇总、锂硫 ΔG、图表与完整报告（只有通过 DONE 门控才给正式数值）</div>
       <div class="pj-inrow" style="margin-bottom:12px">
         <select id="pj-select" class="ipt" style="flex:1"></select>
         <button class="btn" id="pj-refresh">刷新</button>
@@ -1258,7 +1321,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 论文级出图(原生 matplotlib 引擎) -->
-    <div class="card" data-ana="figures" style="padding:12px;margin-bottom:10px">
+    <div class="card" data-ana="figures adsorption" style="padding:12px;margin-bottom:10px">
       <div class="pj-h">论文级出图(原生引擎,无需 Origin / POV-Ray)</div>
 
       <div class="pj-lbl" style="margin-bottom:6px">当前项目(上方下拉所选):</div>
@@ -1670,15 +1733,16 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <button class="btn quiet" id="jb-clean">清理失效条目</button>
     </div>
 
-    <!-- 快速批量提交:任意 .gjf/.com/.inp/.cell 逐个建轻量作业 + 入台账 -->
-    <div class="card acc" data-acc="jobs:quick" data-sum="任意输入文件建轻量作业" data-acc-default="0" id="quick-submit-card" style="padding:12px;margin-bottom:12px">
-      <div class="gen-h acc-h" data-i18n="jobs.quick.title">快速批量提交(任意输入文件建作业)</div>
+    <!-- 快速批量提交:整套 VASP 目录或其它引擎输入建轻量作业 + 入台账 -->
+    <div class="card acc" data-acc="jobs:quick" data-sum="整套 VASP 目录 / 其它输入文件" data-acc-default="0" id="quick-submit-card" style="padding:12px;margin-bottom:12px">
+      <div class="gen-h acc-h" data-i18n="jobs.quick.title">导入已有输入并提交</div>
       <div class="gen-fld">
-        <span class="gen-lbl" data-i18n="jobs.quick.files">输入文件(.gjf / .com / .inp / .cell;逐个添加,可删)</span>
+        <span class="gen-lbl" data-i18n="jobs.quick.files">已有输入(推荐直接选择一整个 VASP 四件套目录)</span>
         <div class="gen-inrow">
           <button class="btn" id="qs-add" data-i18n="jobs.quick.add">添加文件</button>
+          <button class="btn primary" id="qs-add-dir" data-i18n="jobs.quick.add_vasp_dir">添加 VASP 四件套目录</button>
           <button class="btn quiet" id="qs-clearfiles" data-i18n="jobs.quick.clearfiles">清空列表</button>
-          <span class="sub" id="qs-count">0 个文件</span>
+          <span class="sub" id="qs-count">0 项</span>
         </div>
         <div class="qs-filelist" id="qs-filelist"></div>
       </div>
@@ -2039,6 +2103,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 <script src="cluster.js"></script>
 <script src="generate.js"></script>
 <script src="project.js"></script>
+<script src="adsorption-workbench.js"></script>
 <script src="dashboard.js"></script>
 <script src="settings.js"></script>
 <script src="editor.js"></script>

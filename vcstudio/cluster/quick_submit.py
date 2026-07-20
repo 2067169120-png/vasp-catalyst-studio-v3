@@ -16,6 +16,9 @@ import os
 import shutil
 import time
 
+from vcstudio.generate.incar_builder import parse_incar
+from vcstudio.generate.job_builder import _infer_task_type
+from vcstudio.generate.poscar import parse_poscar_species
 from vcstudio.shared import manifest as manifest_mod
 
 # 引擎识别:扩展名(小写)→ 引擎名。VASP 无独有扩展名,靠特征文件名/目录判定。
@@ -26,7 +29,7 @@ _EXT_ENGINE = {
 }
 # VASP 特征文件名(单文件命中即判 vasp;目录内含其一亦然)。
 _VASP_MARKERS = ('INCAR', 'POSCAR', 'CONTCAR')
-# VASP 目录拷贝的标准输入集(存在才拷)。
+# VASP 目录拷贝的标准输入四件套(缺一不可提交)。
 _VASP_INPUTS = ('INCAR', 'POSCAR', 'KPOINTS', 'POTCAR')
 
 # 每引擎的集群运行命令模板提示(仅文案:真正 vasp_cmd 由用户模板/集群 profile 决定)。
@@ -119,12 +122,40 @@ def _copy_inputs(path: str, job_dir: str) -> list:
     return copied
 
 
+def _missing_vasp_inputs(path: str) -> list[str]:
+    """VASP 作业目录缺失的输入四件套。非目录不在此处限制。"""
+    if not os.path.isdir(path):
+        return []
+    return [fn for fn in _VASP_INPUTS if not os.path.isfile(os.path.join(path, fn))]
+
+
+def _manifest_task_type(engine: str, job_dir: str) -> str:
+    """输入引擎/已拷贝作业目录 → manifest task_type。
+
+    VASP 的完成判定依赖此字段:static 查电子收敛标志,relax/freq 查离子
+    收敛标志。其它引擎继续使用原有 quick 类型,保持兼容。
+    """
+    if engine != 'vasp':
+        return 'quick'
+    incar_path = os.path.join(job_dir, 'INCAR')
+    try:
+        with open(incar_path, 'r', encoding='utf-8', errors='replace') as fh:
+            incar = parse_incar(fh.read())
+    except OSError:
+        # 单文件旧入口可能只选 POSCAR/CONTCAR;无 INCAR 时按 VASP 默认
+        # NSW=0 处理。完整目录在到达此处前已强制校验四件套。
+        incar = {}
+    return _infer_task_type(incar)
+
+
 def build_quick_jobs(files: list, out_root: str, *, job_prefix: str = '') -> dict:
     """任意输入文件列表 → 逐个建轻量作业目录 + 落 job.yaml(state=CREATED)。
 
     每个可识别文件:建 out_root/<sanitize(作业名)> 目录(同名自动 _2/_3 后缀避让),
-    拷入输入,写 manifest(task_type='quick'、inputs.engine、各文件 sha256 溯源、
-    submit_hint 入 warnings)。认不出引擎/文件不存在 → 记 skipped(不打断整批)。
+    拷入输入,写 manifest(VASP 从 INCAR 推断 task_type,其它引擎为 'quick'、
+    inputs.engine、各文件 sha256 溯源、submit_hint 入 warnings)。认不出引擎/
+    文件不存在 → 记 skipped(不打断整批)。VASP 目录必须同时包含
+    INCAR/POSCAR/KPOINTS/POTCAR,否则跳过且列出缺失项。
 
     返回 {'ok', 'jobs':[{'dir','name','engine','files'}], 'skipped':[{'file','reason'}], 'error'}。
     """
@@ -144,6 +175,25 @@ def build_quick_jobs(files: list, out_root: str, *, job_prefix: str = '') -> dic
         if not (os.path.isfile(f) or os.path.isdir(f)):
             result['skipped'].append({'file': str(f), 'reason': '输入不存在'})
             continue
+        if engine == 'vasp' and os.path.isdir(f):
+            missing = _missing_vasp_inputs(f)
+            if missing:
+                result['skipped'].append({
+                    'file': str(f),
+                    'reason': f'VASP 输入四件套不完整，缺少: {", ".join(missing)}',
+                })
+                continue
+            # Existence alone cannot catch an empty POTCAR, a malformed mesh,
+            # or POSCAR/POTCAR element-order mismatches.  Share the same
+            # side-effect-free gate as the adsorption folder importer.
+            from vcstudio.project.result_import import validate_vasp_quartet
+            issues = validate_vasp_quartet(f)
+            if issues:
+                result['skipped'].append({
+                    'file': str(f),
+                    'reason': 'VASP 输入门控未通过: ' + '；'.join(issues),
+                })
+                continue
 
         name = _unique_dir_name(
             _sanitize(f'{job_prefix}{_job_name_for(f, engine)}'), out_root, used)
@@ -157,13 +207,24 @@ def build_quick_jobs(files: list, out_root: str, *, job_prefix: str = '') -> dic
             continue
 
         sha = {fn: manifest_mod.sha256_file(os.path.join(job_dir, fn)) for fn in copied}
+        task_type = _manifest_task_type(engine, job_dir)
+        inputs = {'engine': engine, 'files': copied,
+                  'source': os.path.abspath(f), 'sha256': sha}
+        if engine == 'vasp':
+            try:
+                with open(os.path.join(job_dir, 'POSCAR'), 'r', encoding='utf-8',
+                          errors='replace') as handle:
+                    elements, counts = parse_poscar_species(handle.read())
+            except (OSError, ValueError, IndexError, TypeError):
+                elements, counts = [], []
+            inputs.update({'elements': elements, 'counts': counts,
+                           'import_input_issues': []})
         m = manifest_mod.new_manifest(
             job_id=f'{name}-{time.strftime("%Y%m%d-%H%M%S")}',
             system=_job_name_for(f, engine),
-            task_type='quick',
+            task_type=task_type,
             calc_type='',
-            inputs={'engine': engine, 'files': copied,
-                    'source': os.path.abspath(f), 'sha256': sha},
+            inputs=inputs,
             warnings=[f'快速提交作业(引擎 {engine});集群运行命令模板:{submit_hint(engine)}'],
         )
         manifest_mod.save_manifest(job_dir, m)

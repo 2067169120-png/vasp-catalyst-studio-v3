@@ -184,16 +184,129 @@ const VCS = {
 
 window.VCS = VCS;
 
-// ── 路由:nav a[data-page] 点击 → section 显隐 + .on 高亮 ──
+// ── 统一页面导航:手动点侧栏与程序化“下一步”共用同一路由 ──
+function activatePage(page, sourceLink, detail) {
+  const name = String(page || '');
+  const section = Array.from(document.querySelectorAll('main section[data-page]'))
+    .find(s => s.dataset.page === name);
+  const link = sourceLink || Array.from(document.querySelectorAll('nav a[data-page]'))
+    .find(a => a.dataset.page === name);
+  if (!name || !section || !link) return false;
+  document.querySelectorAll('nav a').forEach(x => x.classList.toggle('on', x === link));
+  document.querySelectorAll('main section[data-page]').forEach(
+    s => { s.hidden = s.dataset.page !== name; });
+  document.dispatchEvent(new CustomEvent('vcs:page', {
+    detail: Object.assign({}, detail || {}, { page: name }),
+  }));
+  return true;
+}
+
 document.addEventListener('click', e => {
   const a = e.target.closest('a[data-page]');
   if (!a) return;
   e.preventDefault();
-  document.querySelectorAll('nav a').forEach(x => x.classList.toggle('on', x === a));
-  document.querySelectorAll('main section[data-page]').forEach(
-    s => { s.hidden = s.dataset.page !== a.dataset.page; });
-  document.dispatchEvent(new CustomEvent('vcs:page', { detail: { page: a.dataset.page } }));
+  activatePage(a.dataset.page, a);
 });
+
+function findJobRow(jobDir) {
+  const comparablePath = value => {
+    let out = String(value || '').replace(/\\/g, '/').replace(/\/+$/, '');
+    if (/^[A-Za-z]:\//.test(out)) out = out.toLowerCase();
+    return out;
+  };
+  const wanted = comparablePath(jobDir);
+  return Array.from(document.querySelectorAll('#jobs-card tr[data-dir]'))
+    .find(row => comparablePath(row.dataset.dir) === wanted) || null;
+}
+
+// 跳作业页后清除会遮住新作业的筛选,展开所在组,选中并滚动到该行。
+// 不依赖 jobs.js 内部 State,只通过它已有的 DOM 事件契约交互。
+async function focusPendingJob(jobDir) {
+  if (!jobDir) return false;
+  if (window.Jobs && typeof window.Jobs.reload === 'function') {
+    await window.Jobs.reload();
+  }
+  ['jf-cluster', 'jf-status'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el && el.value) {
+      el.value = '';
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  });
+  let row = findJobRow(jobDir);
+  if (row && row.hidden && row.dataset.grp) {
+    const group = Array.from(document.querySelectorAll('#jobs-card tr.grp-head'))
+      .find(head => head.dataset.grp === row.dataset.grp);
+    if (group) group.click();
+    row = findJobRow(jobDir);                 // 展开会重绘 table,需重取节点
+  }
+  if (!row || row.hidden) return false;
+  if (!row.classList.contains('sel')) row.click();
+  if (typeof row.scrollIntoView === 'function') {
+    row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+  const focusTarget = row.querySelector('.jrow-chk') || row;
+  if (focusTarget === row) row.tabIndex = -1;
+  if (typeof focusTarget.focus === 'function') {
+    try { focusTarget.focus({ preventScroll: true }); } catch (_) { focusTarget.focus(); }
+  }
+  return true;
+}
+
+// 程序化导航公开入口。options.focusJobDir 专用于“生成 → 提交”的待提交作业聚焦。
+VCS.navigate = async function (page, options = {}) {
+  const ok = activatePage(page, null, { source: options.source || 'programmatic' });
+  if (!ok) return { ok: false, focused: false };
+  let focused = true;
+  if (options.focusJobDir) focused = await focusPendingJob(options.focusJobDir);
+  else if (options.focusSelector) {
+    const el = document.querySelector(options.focusSelector);
+    focused = !!el;
+    if (el) {
+      if (typeof el.scrollIntoView === 'function') el.scrollIntoView({ block: 'center' });
+      if (typeof el.focus === 'function') el.focus();
+    }
+  }
+  return { ok: true, focused };
+};
+
+// 统一“下一步”弹窗:文案均以 textContent 写入;主按钮可跳页并携带聚焦上下文。
+VCS.nextStep = function ({ title = '操作已完成', message = '', detail = '',
+  primaryLabel = '前往下一步', stayLabel = '留在本页', page = '', focusJobDir = '',
+  focusSelector = '', onPrimary = null } = {}) {
+  const body = document.createElement('div');
+  const msg = document.createElement('p');
+  msg.textContent = String(message || '');
+  body.appendChild(msg);
+  if (detail) {
+    const more = document.createElement('div');
+    more.className = 'sub';
+    more.textContent = String(detail);
+    body.appendChild(more);
+  }
+  return VCS.modal({
+    title,
+    body,
+    actions: [
+      { label: stayLabel, quiet: true, onClick: modal => modal.close() },
+      { label: primaryLabel, primary: true, onClick: async modal => {
+          modal.close();
+          try {
+            if (typeof onPrimary === 'function') await onPrimary();
+            else if (page) {
+              const out = await VCS.navigate(page, { focusJobDir, focusSelector,
+                source: 'next-step' });
+              if (out.ok && focusJobDir && !out.focused) {
+                VCS.toast('已进入任务页，请在列表中选择新作业');
+              }
+            }
+          } catch (err) {
+            VCS.toast('无法打开下一步:' + (err && err.message ? err.message : err), 'fail');
+          }
+        } },
+    ],
+  });
+};
 
 // ── 主题:三选可切换(经典深邃 / 学术浅色 / 深空监控) ──
 // 启动时 <head> 内联脚本已按 localStorage 先粉刷防闪烁;此处提供切换 + 校准入口。

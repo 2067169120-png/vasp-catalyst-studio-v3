@@ -110,6 +110,18 @@
       VCS.toast('已生成四件套');
       // 同步任务页台账(若已加载)
       if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
+      // 生成是流程中点,不让新手只在日志里猜后续步骤。主按钮走 app.js
+      // 统一导航,进任务页后自动选中刚生成的 CREATED 作业。
+      if (typeof VCS.nextStep === 'function') {
+        VCS.nextStep({
+          title: '四件套已生成',
+          message: '作业已加入任务列表。',
+          detail: '下一步：前往任务页，确认目标集群，然后点击“上传并提交”。',
+          primaryLabel: '前往任务页并提交',
+          page: 'jobs',
+          focusJobDir: r.job_dir,
+        });
+      }
     } finally {
       if (btn) btn.disabled = false;
     }

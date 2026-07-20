@@ -153,7 +153,8 @@ def test_neb_submit_uploads_tree(tmp_path):
     sftp = FakeSFTP()
     m = submitter.submit_job(client, sftp, _profile(), jd)
 
-    remote = '/work/sk2067/jobs/neb'
+    remote = m['remote_dir']
+    assert remote.startswith('/work/sk2067/jobs/neb--')
     for fr in ('00', '01', '02', '03', '04'):
         assert posixpath.join(remote, fr, 'POSCAR') in sftp.uploaded
         assert any(f'mkdir -p {posixpath.join(remote, fr)}' in c for c in client.commands)

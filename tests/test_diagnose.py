@@ -214,10 +214,14 @@ def test_has_output_not_converged_is_nonconverged_restartable():
 
 # ── SCF 震荡(原版 healer/lis_sac_status 生产口径移植) ──
 def _oszicar_block(n_iters, last_de):
-    lines = ['   1 F= -.38712683E+03 E0= -.38712683E+03  d E =-.387127E+03']
+    # Real OSZICAR order: electronic DAV/RMM iterations first, then the ionic
+    # ``F= ... E0= ...`` summary.  Keeping the fixture realistic protects the
+    # VASP5 NELM false-positive guard from silently parsing an empty block.
+    lines = []
     for i in range(1, n_iters + 1):
         de = last_de if i == n_iters else '-0.5E+00'
         lines.append(f'DAV:  {i}    -0.385031793E+03   {de}   -0.129E+02  4696   0.1E+00')
+    lines.append('   1 F= -.38712683E+03 E0= -.38712683E+03  d E =-.387127E+03')
     return '\n'.join(lines) + '\n'
 
 
@@ -242,9 +246,10 @@ def test_sloshing_scans_all_blocks_worst_wins():
     """原版标定经验:扫尾部全部块取最坏块——历史块震荡、末块刚起步也要报
     (只看末块会在新离子步起步时漏判)。"""
     bad = _oszicar_block(85, '0.8E-01')
-    new_step_started = bad + '   2 F= -.38800000E+03 E0= -.38800000E+03  d E =-.87E+00\n' \
+    new_step_started = bad \
         + 'DAV:   1    -0.388E+03   -0.5E+00   -0.1E+02  4696   0.1E+00\n' \
-        + 'DAV:   2    -0.388E+03   -0.1E-03   -0.1E+02  4696   0.1E-02\n'
+        + 'DAV:   2    -0.388E+03   -0.1E-03   -0.1E+02  4696   0.1E-02\n' \
+        + '   2 F= -.38800000E+03 E0= -.38800000E+03  d E =-.87E+00\n'
     assert dg.scan_oszicar_sloshing(new_step_started) is not None
     # 原版 EDDAV 等算法前缀同样被识别
     eddav = '\n'.join(f'EDDAV:  {i}   -0.38E+03   0.5E-01   x  x  x' for i in range(1, 86))
@@ -269,6 +274,21 @@ def test_vasp5_nelm_trap_converged_flag_is_false_positive():
     ok = classify(converged=True, energy=-100.0, oszicar_tail=_oszicar_block(12, '0.1E-04'),
                   nelm=60, outcar_size=90000)
     assert ok.failure_class == dg.CONVERGED
+
+
+def test_last_block_scf_iters_uses_latest_real_ionic_block():
+    """多离子步只看最后一个 DAV…F 块，不能被上一步 NELM 打满污染。"""
+    first = _oszicar_block(60, '0.5E-01')
+    second_lines = [
+        f'RMM:  {i}    -0.390000000E+03   -0.1E-04   -0.1E+02  4696   0.1E-03'
+        for i in range(1, 13)
+    ]
+    second_lines.append(
+        '   2 F= -.39000000E+03 E0= -.39000000E+03  d E =-.20E+00')
+    tail = first + '\n'.join(second_lines) + '\n'
+
+    assert dg.last_block_scf_iters(tail) == 12
+    assert not dg.nelm_saturated(tail, nelm=60)
 
 
 def test_clean_exit_refines_nonconverged_evidence():

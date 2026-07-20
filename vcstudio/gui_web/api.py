@@ -15,7 +15,7 @@ import sys
 import tempfile
 import time
 import types
-from dataclasses import asdict, fields as dc_fields
+from dataclasses import asdict, fields as dc_fields, replace as dc_replace
 
 # 合法计算类型(决定 KPOINTS 网格);前端下拉与后端都以此为准
 _CALC_TYPES = ('slab', 'bulk', 'molecule')
@@ -60,6 +60,7 @@ class Api:
                  batch_ops_mod=None, ledger_mod=None, manifest_mod=None,
                  submitter_mod=None, config_mod=None, job_builder_mod=None,
                  logic_mod=None, adsorption_mod=None, report_full_mod=None,
+                 result_import_mod=None,
                  conv_mod=None, sview_mod=None, methods_mod=None, dialog_fn=None,
                  native_charts_mod=None, freeenergy_mod=None, ai_analysis_mod=None,
                  freq_builder_mod=None, estatic_mod=None, sac_mods=None,
@@ -112,6 +113,7 @@ class Api:
         self._batch_ops = batch_ops_mod
         self._submitter = submitter_mod
         self._report_full = report_full_mod
+        self._result_import = result_import_mod
         # 原生出图引擎(matplotlib 可选依赖)与自由能:延迟导入,测试注入假件
         self._native_charts = native_charts_mod
         self._freeenergy = freeenergy_mod
@@ -202,6 +204,13 @@ class Api:
             from vcstudio.project import report_full
             self._report_full = report_full
         return self._report_full
+
+    def _ri(self):
+        """本地 VASP 整文件夹导入器延迟加载。"""
+        if self._result_import is None:
+            from vcstudio.project import result_import
+            self._result_import = result_import
+        return self._result_import
 
     def _nc(self):
         """原生出图引擎延迟加载(matplotlib/numpy 为可选依赖 charts)。"""
@@ -594,8 +603,29 @@ class Api:
             return {'ok': False, 'error': str(e)}
 
     # ── 任务:台账列表(取数逻辑照抄 jobs_tab.reload) ──────────────────────
+    @staticmethod
+    def _project_member_dirs(proj):
+        """返回项目全部受管作业，包含导入的物种参考态并稳定去重。"""
+        members = proj.get('members') or {}
+        dirs = [members.get('clean_slab'), members.get('gas_ref')]
+        dirs.extend(members.get('configs') or [])
+        for refs in (members.get('molecules'), proj.get('species_ref_jobs')):
+            if isinstance(refs, dict):
+                dirs.extend(refs.values())
+            elif isinstance(refs, (list, tuple)):
+                dirs.extend(refs)
+        out, seen = [], set()
+        for directory in dirs:
+            if not directory:
+                continue
+            key = os.path.normcase(os.path.normpath(str(directory)))
+            if key not in seen:
+                seen.add(key)
+                out.append(directory)
+        return out
+
     def _project_role_map(self):
-        """{规范化 job_dir → {'project': 项目名, 'role': 'clean'|'gas'|'config'}}。
+        """{规范化 job_dir → {'project': 项目名, 'role': clean/gas/config/molecule}}。
 
         供 list_jobs 给作业行注入所属吸附能项目组;任何异常(注册表坏/单个
         project.yaml 畸形)兜成空映射或跳过该项目,绝不拖垮 list_jobs。
@@ -612,16 +642,24 @@ class Api:
                         continue
                     pname = proj.get('name', '') or os.path.basename(
                         os.path.dirname(str(pp)))
+                    group = {'project': pname, 'project_path': str(pp)}
                     mem = proj.get('members') or {}
                     if mem.get('clean_slab'):
-                        mapping[norm(mem['clean_slab'])] = {'project': pname,
-                                                            'role': 'clean'}
+                        mapping[norm(mem['clean_slab'])] = {**group, 'role': 'clean'}
                     if mem.get('gas_ref'):
-                        mapping[norm(mem['gas_ref'])] = {'project': pname,
-                                                         'role': 'gas'}
+                        mapping[norm(mem['gas_ref'])] = {**group, 'role': 'gas'}
                     for d in (mem.get('configs') or []):
                         if d:
-                            mapping[norm(d)] = {'project': pname, 'role': 'config'}
+                            mapping[norm(d)] = {**group, 'role': 'config'}
+                    molecule_dirs = []
+                    for refs in (mem.get('molecules'), proj.get('species_ref_jobs')):
+                        if isinstance(refs, dict):
+                            molecule_dirs.extend(refs.values())
+                        elif isinstance(refs, (list, tuple)):
+                            molecule_dirs.extend(refs)
+                    for d in molecule_dirs:
+                        if d:
+                            mapping.setdefault(norm(d), {**group, 'role': 'molecule'})
                 except Exception:                         # noqa: BLE001 单个坏项目跳过
                     continue
         except Exception:                                 # noqa: BLE001 注册表坏 → 全部不分组
@@ -657,6 +695,7 @@ class Api:
                     'dir': job_dir,
                     'name': os.path.basename(os.path.normpath(job_dir)),
                     'project': grp['project'] if grp else None,
+                    'project_path': grp['project_path'] if grp else None,
                     'role': grp['role'] if grp else None,
                     'state': state,
                     'task': f"{m.get('task_type', '')}/{m.get('calc_type', '')}",
@@ -687,10 +726,57 @@ class Api:
         except Exception as e:                            # noqa: BLE001 异常绝不穿透到 JS
             return {'error': str(e)}
 
-    def submit_jobs(self, dirs, name, password, trust_new=False):
-        return self._delegate(name, password,
-                              lambda prof, pw: self._bo().submit_batch(
-                                  prof, pw, list(dirs), bool(trust_new)))
+    @staticmethod
+    def _submission_profile(prof, resources=None):
+        """给一次提交叠加临时资源参数，不改用户保存的集群配置。
+
+        吸附能工作台需要像常见计算提交页一样，在同一处确认队列、节点、核数和
+        墙钟。这里仅允许覆盖调度资源字段；主机、认证、远程根目录和执行命令仍
+        来自已验证的集群 profile，避免一个便捷表单悄悄改变连接安全边界。
+        """
+        raw = resources if isinstance(resources, dict) else {}
+        if not raw:
+            return prof
+        changes = {}
+        if 'queue' in raw:
+            changes['queue'] = str(raw.get('queue') or '').strip()
+        if 'walltime' in raw:
+            walltime = str(raw.get('walltime') or '').strip()
+            if not walltime:
+                raise ValueError('墙钟时间不能为空')
+            changes['walltime'] = walltime
+        for key, label in (('nodes', '节点数'), ('ppn', '每节点核数')):
+            if key not in raw:
+                continue
+            try:
+                value = int(raw[key])
+            except (TypeError, ValueError) as e:
+                raise ValueError(f'{label}必须是正整数') from e
+            if value <= 0:
+                raise ValueError(f'{label}必须是正整数')
+            changes[key] = value
+        return dc_replace(prof, **changes)
+
+    def submit_jobs(self, dirs, name, password, trust_new=False, resources=None):
+        def _submit(prof, pw):
+            effective = self._submission_profile(prof, resources)
+            return self._bo().submit_batch(
+                effective, pw, list(dirs), bool(trust_new))
+        return self._delegate(name, password, _submit)
+
+    def submission_profile_check(self, name, resources=None):
+        """在导入落盘前验证一次性提交资源与服务器脚本配置。"""
+        try:
+            prof = self._profiles.load_profiles().get(name)
+            if prof is None:
+                return {'ok': False, 'errors': [f'集群「{name}」不存在'],
+                        'error': f'集群「{name}」不存在'}
+            effective = self._submission_profile(prof, resources)
+            errors = list(self._sub().profile_preflight(effective))
+            return {'ok': not errors, 'errors': errors,
+                    'error': '；'.join(errors) if errors else None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'errors': [str(e)], 'error': str(e)}
 
     def fetch_jobs(self, dirs, name, password, trust_new=False, files=None):
         def _fetch(prof, pw):
@@ -1106,11 +1192,66 @@ class Api:
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'job_dir': None, 'warnings': [], 'error': str(e)}
 
+    # ── 吸附能整文件夹导入(只读扫描 → 预检 → 原子复制提交) ──────────────────
+    def proj_import_scan(self, root):
+        """递归扫描用户选择的 VASP 根目录；本方法保证不写源目录或台账。"""
+        try:
+            return self._ri().scan_root(root)
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'root': str(root or ''), 'preview': [],
+                    'candidates': [], 'role_suggestions': {}, 'warnings': [],
+                    'error': str(e)}
+
+    def proj_import_preview(self, root, name, output_root, assignments=None,
+                            include_large_outputs=False, manual_confirm=False,
+                            project_kind='adsorption'):
+        """生成零写入导入计划，供向导展示科学门控与最终文件清单。"""
+        try:
+            return self._ri().preview_project(
+                root, name, output_root, assignments,
+                include_large_outputs=include_large_outputs,
+                manual_confirm=manual_confirm, project_kind=project_kind)
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'source_root': str(root or ''),
+                    'name': str(name or ''), 'destination': None,
+                    'members': [], 'unassigned': [], 'errors': [str(e)],
+                    'warnings': [], 'counts': {
+                        'created': 0, 'done': 0, 'needs_human': 0},
+                    'error': str(e)}
+
+    def proj_import_commit(self, root, name, output_root, assignments=None,
+                           include_large_outputs=False, manual_confirm=False,
+                           project_kind='adsorption', expected_fingerprints=None):
+        """把已映射数据复制为受管项目并登记任务；原始目录始终只读。"""
+        try:
+            result = self._ri().import_project(
+                root, name, output_root, assignments,
+                include_large_outputs=include_large_outputs,
+                manual_confirm=manual_confirm, project_kind=project_kind,
+                expected_fingerprints=expected_fingerprints)
+            if (result.get('ok') and project_kind == 'molecule_library'
+                    and result.get('project', {}).get('molecules_dir')):
+                try:
+                    cfg = self._config.load_config()
+                    cfg['lis_molecules_dir'] = result['project']['molecules_dir']
+                    self._config.save_config(cfg)
+                    result['configured_global_molecules'] = True
+                except Exception as e:                    # noqa: BLE001 导入成功不回滚
+                    result.setdefault('warnings', []).append(
+                        f'参考库已导入，但默认分子库路径保存失败:{e}')
+                    result['configured_global_molecules'] = False
+            return result
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'source_root': str(root or ''),
+                    'name': str(name or ''), 'destination': None,
+                    'members': [], 'registered_jobs': [], 'errors': [str(e)],
+                    'warnings': [], 'error': str(e)}
+
     # ── 吸附能项目页(镜像 gui/project_tab 调用面:列表/创建/ΔE/CSV/报告) ─────────
     def proj_list(self):
         """项目注册表 → [{path,name,n_members}](镜像 project_tab._reload_projects)。
 
-        n_members 内联算(清洁表面 + 气相参考 + 构型族,镜像 project_tab._member_dirs):
+        n_members 内联算(清洁表面 + 气相参考 + 构型族 + 物种参考态):
         列表渲染绝不触碰 report_full(避免仅为计数拖入 matplotlib,matplotlib 坏时也不
         整体失败)。畸形/已移动的 project.yaml(load_project→None)或坏成员静默跳过。
         """
@@ -1121,10 +1262,9 @@ class Api:
                     proj = self._adsorption.load_project(pp)
                     if proj is None:
                         continue
-                    mem = proj.get('members') or {}
-                    member_dirs = [d for d in ([mem.get('clean_slab'),
-                                                mem.get('gas_ref')]
-                                               + list(mem.get('configs') or [])) if d]
+                    if proj.get('kind') == 'molecule_library':
+                        continue
+                    member_dirs = self._project_member_dirs(proj)
                     projects.append({
                         'path': pp,
                         'name': proj.get('name', '') or '',
@@ -1280,21 +1420,37 @@ class Api:
         des = [r['delta_e'] for r in rows]
         return shorts, des, s
 
-    def _proj_fed(self, proj, summary):
-        """项目 → Li-S 放电路径 fed;成功 (fed, None),失败 (None, 中文原因)。"""
+    def _project_molecules_dir(self, proj) -> str:
+        """项目自带分子库优先，失效时回退全局配置。
+
+        整文件夹导入会把锂硫参考态复制到项目的 ``molecules_dir``。这里与
+        report_full 使用同一优先级，确保“项目页出图”和“完整报告”读到同一批
+        参考能量；老项目仍继续使用 config.lis_molecules_dir。
+        """
+        local = str((proj or {}).get('molecules_dir') or '').strip()
+        if local and os.path.isdir(local):
+            return local
         try:
             cfg = self._config.load_config()
         except Exception:                                 # noqa: BLE001
             cfg = {}
-        mol_dir = (cfg or {}).get('lis_molecules_dir') or ''
-        if not mol_dir or not os.path.isdir(str(mol_dir)):
-            return None, '未配置分子库目录 lis_molecules_dir(config),无法算 ΔG 台阶'
+        configured = str((cfg or {}).get('lis_molecules_dir') or '').strip()
+        return configured if configured and os.path.isdir(configured) else ''
+
+    def _proj_fed(self, proj, summary):
+        """项目 → Li-S 放电路径 fed;成功 (fed, None),失败 (None, 中文原因)。"""
+        mol_dir = self._project_molecules_dir(proj)
+        if not mol_dir:
+            return None, ('项目未导入有效分子参考态，且未配置分子库目录 '
+                          'lis_molecules_dir(config)，无法算 ΔG 台阶')
         _state, e_slab = summary['slab']
         if e_slab is None:
             return None, '清洁表面未完成,无法算 ΔG 台阶'
         try:
             fed = self._fe().path_from_project_and_molecules(
-                summary['rows'], e_slab=e_slab, molecules_dir=str(mol_dir))
+                summary['rows'], e_slab=e_slab, molecules_dir=mol_dir,
+                managed_dirs=list(dict(proj.get('species_ref_jobs') or {}).values()),
+                project=proj)
             return fed, None
         except ValueError as e:
             return None, str(e)
@@ -1330,17 +1486,23 @@ class Api:
             return None, f'未知反应预设「{preset_key}」:{e}', str(preset_key)
         ptitle = spec.get('description') or spec.get('name') or str(preset_key)
         # 分子/参考态能量:复用 Li-S 分子库扫描(mol_*/molecule_* 子目录 OSZICAR)
-        try:
-            cfg = self._config.load_config()
-        except Exception:                                 # noqa: BLE001
-            cfg = {}
-        mol_dir = (cfg or {}).get('lis_molecules_dir') or ''
+        mol_dir = self._project_molecules_dir(proj)
         mol_e = {}
-        if mol_dir and os.path.isdir(str(mol_dir)):
+        method_audit = None
+        if mol_dir:
+            managed_dirs = list(dict(proj.get('species_ref_jobs') or {}).values())
             try:
-                mol_e = self._fe().load_molecule_energies(str(mol_dir))
-            except Exception:                             # noqa: BLE001 分子库坏 → 视作空
-                mol_e = {}
+                audit_fn = getattr(self._fe(), 'audit_molecule_method_compatibility', None)
+                if audit_fn is not None:
+                    method_audit = audit_fn(
+                        proj, mol_dir, managed_dirs=managed_dirs)
+                    if not method_audit.get('ok'):
+                        return (None, 'ΔG 方法一致性门控未通过:'
+                                + '；'.join(method_audit.get('errors') or []), ptitle)
+                mol_e = self._fe().load_molecule_energies(
+                    mol_dir, managed_dirs=managed_dirs)
+            except Exception as e:                        # noqa: BLE001 清晰返回分子库错误
+                return None, f'分子参考库读取失败:{e}', ptitle
         _state, e_slab = summary['slab']
         # 项目构型短名 → 最稳能量(仅 DONE)
         pname = str(proj.get('name') or '')
@@ -1384,6 +1546,10 @@ class Api:
             return None, '缺 ' + '、'.join(missing) + ' 的能量(对应构型/分子需 DONE)', ptitle
         try:
             fed = self._fe().free_energy_path(spec, energies)
+            if method_audit is not None:
+                fed['method_consistency'] = method_audit
+                fed.setdefault('warnings', []).extend(
+                    method_audit.get('warnings') or [])
             return fed, None, ptitle
         except ValueError as e:
             return None, str(e), ptitle
@@ -1416,7 +1582,7 @@ class Api:
                 str(proj.get('root') or os.path.dirname(str(path))), 'figures')
             os.makedirs(out_dir, exist_ok=True)
 
-            files, skipped = [], []
+            files, skipped, warnings = [], [], []
             done = [(s, d) for s, d in zip(shorts, des) if d is not None]
             data = {'adsorbates': [s for s, _ in done],
                     'substrates': {pname: [d for _, d in done]}}
@@ -1442,6 +1608,7 @@ class Api:
                     if fed is None:
                         skipped.append({'kind': 'ladder', 'reason': reason})
                         continue
+                    warnings.extend(str(item) for item in (fed.get('warnings') or []))
                     title = (f'{ptitle} ($U_L$ = {fed["u_l"]:.2f} V)'
                              if fed.get('u_l') is not None else ptitle)
                     files += nc.free_energy_ladder(
@@ -1452,6 +1619,7 @@ class Api:
                 else:
                     skipped.append({'kind': kind, 'reason': '未知图类型'})
             return {'ok': True, 'files': files, 'skipped': skipped,
+                    'warnings': list(dict.fromkeys(warnings)),
                     'out_dir': out_dir, 'error': None}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'files': [], 'skipped': [], 'out_dir': None,
@@ -1834,15 +2002,8 @@ class Api:
 
     def _member_states(self, proj):
         """项目成员目录 → [{'dir','state','restartable','rounds'}](经注入的 manifest 读)。"""
-        members = proj.get('members') or {}
-        dirs = []
-        if members.get('clean_slab'):
-            dirs.append(members['clean_slab'])
-        if members.get('gas_ref'):
-            dirs.append(members['gas_ref'])
-        dirs += [d for d in (members.get('configs') or []) if d]
         out = []
-        for d in dirs:
+        for d in self._project_member_dirs(proj):
             m = self._manifest.load_manifest(d)
             if m is None:
                 out.append({'dir': d, 'state': None, 'restartable': False, 'rounds': 0})
@@ -5047,6 +5208,22 @@ class Api:
         'python-docx': {'pip': ('python-docx',), 'note': '论文骨架导出 .docx'},
         'pypdf': {'pip': ('pypdf',), 'note': 'PDF 论文文本提取'},
     }
+    _FROZEN_DEPS_INSTALL_ERROR = (
+        '当前运行的是单文件 EXE，不能在运行时安装 Python 依赖。'
+        '单文件 EXE 中 sys.executable 指向软件本身，用它执行 pip 会重新打开本软件；'
+        '即使改用外部 Python 安装，新包也不会可靠地进入已冻结的 EXE。'
+        '请使用已内置所需组件的 EXE（标准完整版含 RDKit/matplotlib；'
+        'DECIMER 需构建时额外选择），或在源码 Python 环境安装依赖后重新打包。'
+    )
+
+    @staticmethod
+    def _runtime_deps_install_supported():
+        """运行时 pip 只对源码 Python 环境开放。
+
+        PyInstaller/Nuitka 冻结态的 ``sys.executable`` 是应用程序而不是
+        Python 解释器；且单文件包的 import 集合在构建时已确定。
+        """
+        return not bool(getattr(sys, 'frozen', False))
 
     @staticmethod
     def _pkg_present(name):
@@ -5058,17 +5235,23 @@ class Api:
 
     def deps_status(self):
         """依赖状态汇总(侧栏依赖状态区)→ {'ok','deps':[{key,name,available,detail,installable,
-        note}],'error'}。RDKit/DECIMER/matplotlib 按 import 探测;Multiwfn/VMD 走各自 probe。"""
+        note}],'runtime_install_supported','runtime_install_note','error'}。RDKit/DECIMER/matplotlib
+        按 import 探测;Multiwfn/VMD 走各自 probe。"""
         try:
             deps = []
+            install_supported = self._runtime_deps_install_supported()
             py = [('rdkit', 'RDKit', 'rdkit'), ('decimer', 'DECIMER', 'decimer'),
                   ('matplotlib', 'matplotlib', 'matplotlib')]
             for key, name, mod in py:
                 ok = self._pkg_present(mod)
+                note = self._DEPS_INSTALLABLE.get(key, {}).get('note', '')
+                if not install_supported and not ok:
+                    note += '；单文件 EXE 需在打包时内置此组件'
                 deps.append({'key': key, 'name': name, 'available': ok,
                              'detail': '已安装' if ok else '未安装',
-                             'installable': key in self._DEPS_INSTALLABLE,
-                             'note': self._DEPS_INSTALLABLE.get(key, {}).get('note', '')})
+                             'installable': (install_supported and
+                                             key in self._DEPS_INSTALLABLE),
+                             'note': note})
             paths = self._tool_paths()
             for key, name, probe in (('multiwfn', 'Multiwfn', self._mw),
                                      ('vmd', 'VMD', self._vmd_)):
@@ -5080,17 +5263,31 @@ class Api:
                              'available': bool(pr.get('available')),
                              'detail': pr.get('detail', ''), 'installable': False,
                              'note': '外部程序,请在波函数页填路径或加入 PATH'})
-            return {'ok': True, 'deps': deps, 'error': None}
+            return {'ok': True, 'deps': deps,
+                    'runtime_install_supported': install_supported,
+                    'runtime_install_note': (None if install_supported
+                                             else self._FROZEN_DEPS_INSTALL_ERROR),
+                    'error': None}
         except Exception as e:                            # noqa: BLE001
-            return {'ok': False, 'deps': [], 'error': str(e)}
+            return {'ok': False, 'deps': [], 'runtime_install_supported': False,
+                    'runtime_install_note': None, 'error': str(e)}
 
     @staticmethod
     def _default_deps_runner(pip_names, log_path):
         """默认后台 pip 安装器:Popen 输出重定向到日志文件。"""
+        if getattr(sys, 'frozen', False):
+            # 双重防线:即使调用方绕过 deps_install，也绝不能把当前
+            # EXE 当成 python.exe 再启动。
+            raise RuntimeError(Api._FROZEN_DEPS_INSTALL_ERROR)
         import subprocess
         logf = open(log_path, 'w', encoding='utf-8')
-        return subprocess.Popen([sys.executable, '-m', 'pip', 'install', *pip_names],
-                                stdout=logf, stderr=subprocess.STDOUT)
+        try:
+            return subprocess.Popen([sys.executable, '-m', 'pip', 'install', *pip_names],
+                                    stdout=logf, stderr=subprocess.STDOUT)
+        finally:
+            # Popen 已把文件句柄交给子进程；父进程不应在整个下载
+            # 期间额外占用日志文件(也避免 Popen 启动失败时泄漏)。
+            logf.close()
 
     def deps_install(self, pkgs):
         """后台安装依赖组件(白名单内)→ 启动 pip 子进程,进度经 deps_install_status 轮询。
@@ -5106,6 +5303,10 @@ class Api:
                 return {'ok': False, 'started': False, 'pkgs': [], 'pip': [],
                         'rejected': rejected, 'log_path': None,
                         'error': '未选择可安装的组件(可选:' + '、'.join(sorted(allow)) + ')'}
+            if not self._runtime_deps_install_supported():
+                return {'ok': False, 'started': False, 'pkgs': [], 'pip': [],
+                        'rejected': rejected, 'log_path': None,
+                        'error': self._FROZEN_DEPS_INSTALL_ERROR}
             if self._deps_job is not None:
                 proc = self._deps_job.get('proc')
                 if proc is not None and proc.poll() is None:

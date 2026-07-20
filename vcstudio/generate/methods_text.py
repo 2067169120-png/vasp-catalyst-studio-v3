@@ -18,8 +18,10 @@ GGA_MAP = {'PE': 'PBE', 'RP': 'RPBE', 'PS': 'PBEsol', '91': 'PW91',
            'RE': 'revPBE', 'AM': 'AM05'}
 FLAVOR_MAP = {'PAW_PBE': 'PBE', 'PAW_GGA': 'PW91', 'PAW_LDA': 'LDA', 'PAW': 'LDA'}
 IVDW_MAP = {1: 'DFT-D2', 10: 'DFT-D2', 11: 'DFT-D3(zero)', 12: 'DFT-D3(BJ)',
-            2: 'TS', 20: 'TS', 21: 'TS+SCS', 4: 'dDsC'}
+            2: 'TS', 20: 'TS', 21: 'TS+SCS', 4: 'dDsC',
+            202: 'MBD@rsSCS', 263: 'rVV10'}
 IBRION_MAP = {2: 'CG', 1: 'quasi-Newton', 3: 'damped MD', 0: 'MD'}
+KNOWN_METAGGA = frozenset(('SCAN', 'R2SCAN', 'RSCAN', 'TPSS', 'RTPSS', 'M06L', 'MBJ'))
 
 
 def parse_potcar_titels(text: str) -> list[dict]:
@@ -50,9 +52,18 @@ def parse_kpoints_scheme(text: str) -> dict | None:
             grid = [int(t) for t in lines[3].split()[:3]]
         except ValueError:
             return {'scheme': 'explicit', 'grid': None, 'raw': text.strip()[:120]}
+        try:
+            shift = [float(t) for t in lines[4].split()[:3]] if len(lines) > 4 else []
+        except ValueError:
+            shift = []
+        if len(shift) != 3:
+            shift = [0.0, 0.0, 0.0]
         return {'scheme': 'Gamma' if mode == 'G' else 'Monkhorst-Pack',
-                'grid': grid}
-    return {'scheme': 'explicit', 'grid': None, 'raw': text.strip()[:120]}
+                'grid': grid, 'shift': shift}
+    # The first line is a free-form comment and has no effect on the calculation.
+    # Excluding it prevents comment-only differences from failing consistency.
+    return {'scheme': 'explicit', 'grid': None,
+            'raw': '\n'.join(lines[1:]).strip()[:120]}
 
 
 def extract_facts(incar_text: str, kpoints_text: str | None,
@@ -68,19 +79,97 @@ def extract_facts(incar_text: str, kpoints_text: str | None,
         except (TypeError, ValueError):
             return None
 
+    def _bool(key, default=False):
+        value = inc.get(key)
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        normalised = str(value).strip().strip('.').upper()
+        if normalised in ('T', 'TRUE'):
+            return True
+        if normalised in ('F', 'FALSE'):
+            return False
+        warnings.append(f'{key}={value!r} 不是可识别的布尔值')
+        return None
+
     potcars = parse_potcar_titels(potcar_text) if potcar_text else []
     if not potcar_text:
         warnings.append('缺 POTCAR:赝势条目与泛函回退不可用')
     flavor = potcars[0]['flavor'] if potcars else None
 
-    gga = str(inc.get('GGA', '')).strip().upper() or None
+    gga = str(inc.get('GGA', '')).strip().strip('"\'').upper() or None
     if gga:
-        functional = GGA_MAP.get(gga, f'GGA={gga}')
+        base_functional = GGA_MAP.get(gga, f'GGA={gga}')
     elif flavor:
-        functional = FLAVOR_MAP.get(flavor, flavor)
+        base_functional = FLAVOR_MAP.get(flavor, flavor)
     else:
-        functional = None
+        base_functional = None
         warnings.append('无 GGA 键且无 POTCAR,泛函未知')
+
+    metagga = str(inc.get('METAGGA', '')).strip().strip('"\'').upper() or None
+    if metagga in ('NONE', 'FALSE', 'F'):
+        metagga = None
+    lhfcalc = _bool('LHFCALC', False)
+    aexx_explicit = _num('AEXX')
+    hfscreen_explicit = _num('HFSCREEN')
+    xc_numeric_keys = ('AEXX', 'HFSCREEN', 'AGGAX', 'AGGAC', 'ALDAC')
+    invalid_xc_numeric = [
+        key for key in xc_numeric_keys if key in inc and _num(key) is None
+    ]
+    for key in invalid_xc_numeric:
+        warnings.append(f'{key}={inc.get(key)!r} 不是可识别的数值')
+    # VASP's documented hybrid defaults are part of the effective method even
+    # when not written explicitly.  Recording the effective values avoids a
+    # false mismatch between an omitted default and the same explicit value.
+    aexx = (0.25 if lhfcalc is True and 'AEXX' not in inc else aexx_explicit)
+    hfscreen = (0.0 if lhfcalc is True and 'HFSCREEN' not in inc
+                else hfscreen_explicit)
+    lasph = _bool('LASPH', False)
+    luse_vdw = _bool('LUSE_VDW', False)
+
+    if metagga:
+        meta_label = {'R2SCAN': 'r2SCAN'}.get(metagga, metagga)
+        functional = meta_label
+        functional_class = 'meta-GGA'
+    else:
+        functional = base_functional
+        functional_class = 'GGA' if functional else None
+    if lhfcalc is True:
+        if metagga:
+            functional = f'hybrid {functional}'
+            functional_class = 'hybrid meta-GGA'
+        elif (base_functional == 'PBE' and aexx is not None
+              and abs(aexx - 0.25) < 1e-12 and hfscreen is not None
+              and abs(hfscreen - 0.2) < 1e-12):
+            functional, functional_class = 'HSE06', 'screened hybrid'
+        elif (base_functional == 'PBE' and aexx is not None
+              and abs(aexx - 0.25) < 1e-12 and hfscreen is not None
+              and abs(hfscreen - 0.3) < 1e-12):
+            functional, functional_class = 'HSE03', 'screened hybrid'
+        elif (base_functional == 'PBE' and aexx is not None
+              and abs(aexx - 0.25) < 1e-12 and hfscreen == 0.0):
+            functional, functional_class = 'PBE0', 'hybrid'
+        else:
+            functional = f'hybrid {base_functional or "unknown semilocal base"}'
+            functional_class = 'hybrid'
+    elif lhfcalc is None:
+        functional_class = None
+
+    known_base = bool(
+        (gga and gga in GGA_MAP) or (not gga and flavor in FLAVOR_MAP))
+    orphan_hybrid_parameters = bool(
+        lhfcalc is not True and any(key in inc for key in ('AEXX', 'HFSCREEN')))
+    functional_known = bool(
+        lhfcalc is not None and (not metagga or metagga in KNOWN_METAGGA)
+        and (known_base or bool(metagga)) and not invalid_xc_numeric
+        and not orphan_hybrid_parameters)
+
+    if metagga and lasph is not True:
+        warnings.append(
+            f'METAGGA={metagga} 但 LASPH 未明确开启；请核对 meta-GGA 的 PAW 球内项')
+    if orphan_hybrid_parameters:
+        warnings.append('设置了 AEXX/HFSCREEN 但 LHFCALC 未开启；混合泛函设置不完整')
 
     kpts = parse_kpoints_scheme(kpoints_text) if kpoints_text else None
     if not kpoints_text:
@@ -107,6 +196,13 @@ def extract_facts(incar_text: str, kpoints_text: str | None,
         ivdw_name = IVDW_MAP.get(int(ivdw)) if ivdw is not None else None
     except (TypeError, ValueError):
         ivdw_name = None
+    try:
+        ivdw_setting = int(ivdw) if ivdw is not None else 0
+    except (TypeError, ValueError):
+        ivdw_setting = str(ivdw).strip() if ivdw is not None else 0
+        warnings.append(f'IVDW={ivdw!r} 无法识别，色散设置需人工核对')
+    if ivdw_name is None and luse_vdw is True:
+        ivdw_name = 'nonlocal vdW-DF (LUSE_VDW)'
     ibrion = inc.get('IBRION')
     nsw = _num('NSW')
     relax = None
@@ -121,6 +217,19 @@ def extract_facts(incar_text: str, kpoints_text: str | None,
     ldauu = (str(inc.get('LDAUU', '')).strip() or None) if ldau else None
     facts = {
         'functional': functional,
+        'functional_class': functional_class,
+        'functional_known': functional_known,
+        'base_functional': base_functional,
+        'gga': gga,
+        'metagga': metagga,
+        'lhfcalc': lhfcalc,
+        'aexx': aexx,
+        'hfscreen': hfscreen,
+        'aggax': _num('AGGAX'),
+        'aggac': _num('AGGAC'),
+        'aldac': _num('ALDAC'),
+        'lasph': lasph,
+        'luse_vdw': luse_vdw,
         'potcar_flavor': flavor,
         'potcars': potcars,
         'encut': int(encut) if encut else None,
@@ -131,6 +240,7 @@ def extract_facts(incar_text: str, kpoints_text: str | None,
         'ediffg_force': abs(ediffg) if ediffg is not None and ediffg < 0 else None,
         'ediffg_energy': ediffg if ediffg is not None and ediffg > 0 else None,
         'ivdw': ivdw_name,
+        'ivdw_setting': ivdw_setting,
         'ispin': int(_num('ISPIN')) if _num('ISPIN') else None,
         'relax': relax,
         'nsw': int(nsw) if nsw else None,
@@ -158,7 +268,18 @@ def render_zh(f: dict) -> str:
         lead += ')'
     parts.append(lead + '。')
     if f.get('functional'):
-        s = f'交换关联作用采用广义梯度近似(GGA)下的 {f["functional"]} 泛函处理'
+        family = f.get('functional_class')
+        if family == 'meta-GGA':
+            s = f'交换关联作用采用 meta-GGA {f["functional"]} 泛函处理'
+        elif family in ('hybrid', 'screened hybrid', 'hybrid meta-GGA'):
+            s = f'交换关联作用采用{family} {f["functional"]} 泛函处理'
+            if f.get('aexx') is not None:
+                s += f'(AEXX = {f["aexx"]:g}'
+                if f.get('hfscreen') is not None:
+                    s += f', HFSCREEN = {f["hfscreen"]:g}'
+                s += ')'
+        else:
+            s = f'交换关联作用采用广义梯度近似(GGA)下的 {f["functional"]} 泛函处理'
         if f.get('functional') == 'RPBE' and f.get('potcar_flavor') == 'PAW_PBE':
             s += '(PAW 数据集由 PBE 生成)'
         parts.append(s + '。')
@@ -204,9 +325,22 @@ def render_en(f: dict) -> str:
         lead += ')'
     parts.append(lead + '.')
     if f.get('functional'):
-        s = (f' Exchange-correlation effects were treated within the '
-             f'generalized gradient approximation using the {f["functional"]} '
-             f'functional')
+        family = f.get('functional_class')
+        if family == 'meta-GGA':
+            s = (f' Exchange-correlation effects were treated with the '
+                 f'meta-GGA {f["functional"]} functional')
+        elif family in ('hybrid', 'screened hybrid', 'hybrid meta-GGA'):
+            s = (f' Exchange-correlation effects were treated with the '
+                 f'{family} {f["functional"]} functional')
+            if f.get('aexx') is not None:
+                s += f' (AEXX = {f["aexx"]:g}'
+                if f.get('hfscreen') is not None:
+                    s += f', HFSCREEN = {f["hfscreen"]:g}'
+                s += ')'
+        else:
+            s = (f' Exchange-correlation effects were treated within the '
+                 f'generalized gradient approximation using the {f["functional"]} '
+                 f'functional')
         if f.get('functional') == 'RPBE' and f.get('potcar_flavor') == 'PAW_PBE':
             s += ' (with PBE-generated PAW datasets)'
         parts.append(s + '.')
@@ -287,6 +421,38 @@ _BIB = {
   volume  = {77},
   pages   = {3865--3868},
   year    = {1996}
+}""",
+    'hse': """@article{Heyd2003,
+  author  = {Heyd, J. and Scuseria, G. E. and Ernzerhof, M.},
+  title   = {Hybrid functionals based on a screened Coulomb potential},
+  journal = {J. Chem. Phys.},
+  volume  = {118},
+  pages   = {8207--8215},
+  year    = {2003}
+}""",
+    'pbe0': """@article{Adamo1999,
+  author  = {Adamo, C. and Barone, V.},
+  title   = {Toward reliable density functional methods without adjustable parameters: The PBE0 model},
+  journal = {J. Chem. Phys.},
+  volume  = {110},
+  pages   = {6158--6170},
+  year    = {1999}
+}""",
+    'scan': """@article{Sun2015,
+  author  = {Sun, J. and Ruzsinszky, A. and Perdew, J. P.},
+  title   = {Strongly constrained and appropriately normed semilocal density functional},
+  journal = {Phys. Rev. Lett.},
+  volume  = {115},
+  pages   = {036402},
+  year    = {2015}
+}""",
+    'r2scan': """@article{Furness2020,
+  author  = {Furness, J. W. and Kaplan, A. D. and Ning, J. and Perdew, J. P. and Sun, J.},
+  title   = {Accurate and numerically efficient r2SCAN meta-generalized gradient approximation},
+  journal = {J. Phys. Chem. Lett.},
+  volume  = {11},
+  pages   = {8208--8215},
+  year    = {2020}
 }""",
     'rpbe': """@article{Hammer1999,
   author  = {Hammer, B. and Hansen, L. B. and N\\o{}rskov, J. K.},
@@ -379,6 +545,14 @@ def render_bibtex(f: dict) -> str:
     func = f.get('functional')
     if func == 'PBE':
         keys.append('pbe')
+    elif func in ('HSE03', 'HSE06'):
+        keys += ['pbe', 'hse']
+    elif func == 'PBE0':
+        keys += ['pbe', 'pbe0']
+    elif func == 'SCAN':
+        keys.append('scan')
+    elif func == 'r2SCAN':
+        keys += ['scan', 'r2scan']
     elif func == 'RPBE':
         keys += ['pbe', 'rpbe']    # RPBE 是 PBE 的修订,惯例两篇都引
     elif func == 'revPBE':

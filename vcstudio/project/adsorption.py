@@ -265,6 +265,21 @@ def _member_info(job_dir: str | None):
     return m.get('state', '?'), (float(e) if isinstance(e, (int, float)) else None)
 
 
+def _resolved_species_refs(project: dict) -> dict:
+    """物种参考能量：导入作业的当前 manifest 优先于导入时快照。
+
+    整文件夹导入允许一个 Li-S 分子参考当时只有四件套（CREATED），随后从
+    工作台直接提交。若一直读取 project.yaml 里的 ``None`` 快照，即使该分子
+    后来 DONE，ΔE 也永远无法计算。``species_ref_jobs`` 保存了物种到受管作业
+    的映射，因此每次分析都从 job.yaml 现读；老项目没有该字段时行为不变。
+    """
+    refs = dict(project.get('species_refs') or {})
+    for species, job_dir in dict(project.get('species_ref_jobs') or {}).items():
+        state, energy = _member_info(job_dir)
+        refs[str(species)] = energy if state == 'DONE' and energy is not None else None
+    return refs
+
+
 def delta_e_rows(project: dict) -> dict:
     """按当前各成员 job.yaml 计算 ΔE 表。
 
@@ -283,7 +298,8 @@ def delta_e_rows(project: dict) -> dict:
     ref_state, e_ref = _member_info(members.get('gas_ref')) if has_ref else ('无', None)
     # 逐物种气相参考(原版 lis_sac_analysis 口径):project['species_refs']=
     # {物种: E_mol};构型名以 '_<物种>' 结尾即匹配。与单一 gas_ref 互斥,优先。
-    species_refs = dict(project.get('species_refs') or {})
+    species_refs = _resolved_species_refs(project)
+    explicit_species = dict(project.get('config_species') or {})
 
     rows = []
     for cdir in (members.get('configs') or []):
@@ -291,9 +307,12 @@ def delta_e_rows(project: dict) -> dict:
         st, e_cfg = _member_info(cdir)
         delta, note = None, ''
         sp_ref = None
+        row_species = (explicit_species.get(cdir) or explicit_species.get(name)
+                       or _config_species(name, proj_name))
         if species_refs:
-            sp = next((s for s in sorted(species_refs, key=len, reverse=True)
-                       if name.endswith('_' + s)), None)
+            sp = (row_species if row_species in species_refs else
+                  next((s for s in sorted(species_refs, key=len, reverse=True)
+                        if name.endswith('_' + s)), None))
             sp_ref = species_refs.get(sp)
         blockers = []
         if st != 'DONE' or e_cfg is None:
@@ -315,7 +334,7 @@ def delta_e_rows(project: dict) -> dict:
             note = '；'.join(blockers)
         rows.append({'name': name, 'state': st, 'e_config': e_cfg,
                      'delta_e': delta, 'note': note,
-                     'species': _config_species(name, proj_name)})
+                     'species': row_species})
 
     # 多构型取最稳:按 species 分组求组内最低 ΔE,标注 is_most_stable 与相对 ΔΔE
     group_min: dict = {}

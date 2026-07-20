@@ -3,12 +3,19 @@ submit_hint 文案。全部本地文件级,离线可测。
 """
 import os
 
+import pytest
+
 from vcstudio.cluster import quick_submit
 from vcstudio.shared import manifest as manifest_mod
 
 GJF_WITH_CHK = ('%chk=water_opt.chk\n#P PBE def2-SVP sp\n\n'
                 'a title line\n\n0 1\nO 0.0 0.0 0.0\n\n')
 GJF_TITLE_ONLY = ('#P PBE def2-SVP opt\n\nWater Optimization\n\n0 1\nO 0.0 0.0 0.0\n\n')
+VASP_POSCAR = ('Fe slab\n1.0\n10 0 0\n0 10 0\n0 0 15\nFe\n1\nDirect\n'
+                '0.0 0.0 0.5\n')
+VASP_KPOINTS = 'Gamma mesh\n0\nGamma\n3 3 1\n0 0 0\n'
+VASP_POTCAR = ('TITEL  = PAW_PBE Fe 06Sep2000\n'
+                'ENMAX  =  400.000; ENMIN = 300.000 eV\n')
 
 
 def _write(path, text=''):
@@ -16,6 +23,14 @@ def _write(path, text=''):
     with open(path, 'w', encoding='utf-8') as f:
         f.write(text)
     return path
+
+
+def _write_vasp_quartet(directory, incar='ENCUT=400\nNSW=0\n'):
+    """写一套能通过共享导入门控的最小、真实格式 VASP 输入。"""
+    _write(str(directory / 'INCAR'), incar)
+    _write(str(directory / 'POSCAR'), VASP_POSCAR)
+    _write(str(directory / 'KPOINTS'), VASP_KPOINTS)
+    _write(str(directory / 'POTCAR'), VASP_POTCAR)
 
 
 # ── detect_engine ─────────────────────────────────────────────────────────────
@@ -136,15 +151,66 @@ def test_build_skips_missing_file(tmp_path):
 
 def test_build_vasp_directory_copies_input_set(tmp_path):
     d = tmp_path / 'vaspjob'
-    _write(str(d / 'INCAR'), 'ENCUT=400\n')
-    _write(str(d / 'POSCAR'), 'Fe slab\n')
-    _write(str(d / 'KPOINTS'), 'auto\n')
+    _write_vasp_quartet(d)
     out = quick_submit.build_quick_jobs([str(d)], str(tmp_path / 'out'))
     job = out['jobs'][0]
     assert job['engine'] == 'vasp' and job['name'] == 'vaspjob'
-    assert set(job['files']) == {'INCAR', 'POSCAR', 'KPOINTS'}
-    for fn in ('INCAR', 'POSCAR', 'KPOINTS'):
+    assert set(job['files']) == {'INCAR', 'POSCAR', 'KPOINTS', 'POTCAR'}
+    for fn in ('INCAR', 'POSCAR', 'KPOINTS', 'POTCAR'):
         assert os.path.isfile(os.path.join(job['dir'], fn))
+    saved = manifest_mod.load_manifest(job['dir'])
+    assert saved['task_type'] == 'static'
+    assert saved['inputs']['elements'] == ['Fe']
+    assert saved['inputs']['counts'] == [1]
+    assert saved['inputs']['import_input_issues'] == []
+
+
+def test_build_vasp_directory_skips_when_quartet_is_incomplete(tmp_path):
+    d = tmp_path / 'vaspjob'
+    _write(str(d / 'INCAR'), 'ENCUT=400\nNSW=0\n')
+    _write(str(d / 'POSCAR'), VASP_POSCAR)
+    _write(str(d / 'KPOINTS'), VASP_KPOINTS)
+
+    out = quick_submit.build_quick_jobs([str(d)], str(tmp_path / 'out'))
+
+    assert out['ok'] is True
+    assert out['jobs'] == []
+    assert len(out['skipped']) == 1
+    assert 'POTCAR' in out['skipped'][0]['reason']
+    assert not (tmp_path / 'out' / 'vaspjob').exists()
+
+
+def test_build_vasp_directory_skips_malformed_complete_quartet(tmp_path):
+    """四个文件都在也不够：坏 KPOINTS/空文件等必须在建作业前拒绝。"""
+    d = tmp_path / 'bad-vasp'
+    _write_vasp_quartet(d)
+    _write(str(d / 'KPOINTS'), 'bad mesh\n0\nGamma\n3 0 1\n')
+
+    out = quick_submit.build_quick_jobs([str(d)], str(tmp_path / 'out'))
+
+    assert out['ok'] is True and out['jobs'] == []
+    assert len(out['skipped']) == 1
+    assert '输入门控未通过' in out['skipped'][0]['reason']
+    assert '正整数' in out['skipped'][0]['reason']
+    assert not (tmp_path / 'out' / 'bad-vasp').exists()
+
+
+@pytest.mark.parametrize(
+    ('incar_text', 'expected'),
+    [
+        ('ENCUT = 500\nNSW = 0\n', 'static'),
+        ('ENCUT = 500\nNSW = 200\nIBRION = 2\n', 'relax'),
+        ('ENCUT = 500\nNSW = 1\nIBRION = 5\n', 'freq'),
+    ],
+)
+def test_build_vasp_directory_infers_task_type_from_incar(tmp_path, incar_text, expected):
+    d = tmp_path / expected
+    _write_vasp_quartet(d, incar=incar_text)
+
+    out = quick_submit.build_quick_jobs([str(d)], str(tmp_path / 'out'))
+
+    assert out['ok'] is True and len(out['jobs']) == 1
+    assert manifest_mod.load_manifest(out['jobs'][0]['dir'])['task_type'] == expected
 
 
 def test_build_job_prefix_applied(tmp_path):

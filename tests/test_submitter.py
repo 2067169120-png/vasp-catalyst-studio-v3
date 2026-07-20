@@ -121,6 +121,21 @@ def test_preflight_catches_problems(tmp_path):
     assert any('缺 INCAR' in e for e in submitter.preflight(_profile(), str(empty)))
 
 
+def test_profile_preflight_is_job_independent_and_checks_connection_identity(tmp_path):
+    assert submitter.profile_preflight(_profile()) == []
+    assert any('hostname' in e for e in submitter.profile_preflight(
+        _profile(hostname='')))
+    assert any('username' in e for e in submitter.profile_preflight(
+        _profile(username='')))
+    assert any('绝对路径' in e for e in submitter.profile_preflight(
+        _profile(remote_root='relative/jobs')))
+
+    template = tmp_path / 'submit.sh'
+    template.write_text('#!/bin/bash\n{{VASP_CMD}}\n', encoding='utf-8')
+    assert submitter.profile_preflight(
+        _profile(script_mode='template', template_path=str(template))) == []
+
+
 def test_preflight_potcar_titel_gate(tmp_path):
     """原版防线移植:POTCAR TITEL 段数 ≠ 物种数(截断/手改)→ 拒绝提交。"""
     d = _job_dir(tmp_path)
@@ -132,13 +147,28 @@ def test_preflight_potcar_titel_gate(tmp_path):
     assert any('TITEL' in e and '截断/手改' in e for e in errs)
 
 
+def test_preflight_blocks_imported_input_gate_issues(tmp_path):
+    d = _job_dir(tmp_path)
+    current = manifest.load_manifest(d)
+    current['inputs']['import_input_issues'] = [
+        'POTCAR 元素顺序与 POSCAR 不一致', 'KPOINTS 网格须为正整数']
+    manifest.save_manifest(d, current)
+
+    errors = submitter.preflight(_profile(), d)
+
+    assert any('导入四件套未通过输入门控' in error for error in errors)
+    assert any('重新导入' in error for error in errors)
+
+
 def test_submit_job_happy_path_pbs(tmp_path):
     d = _job_dir(tmp_path)
     client = FakeClient(script=[('qsub', '8812345.cluster.hpc\n')])
     sftp = FakeSFTP()
     m = submitter.submit_job(client, sftp, _profile(), d)
 
-    remote = '/work/sk2067/jobs/zn_job'
+    remote = m['remote_dir']
+    assert remote.startswith('/work/sk2067/jobs/zn_job--')
+    assert len(posixpath.basename(remote).rsplit('--', 1)[-1]) == 16
     # 上传:四件套 put + 脚本 write
     for f in ('INCAR', 'POTCAR', 'KPOINTS', 'POSCAR'):
         assert posixpath.join(remote, f) in sftp.uploaded
@@ -156,6 +186,85 @@ def test_submit_job_happy_path_pbs(tmp_path):
     assert m['attempts'][0]['job_id'] == '8812345'
     assert m['attempts'][0]['cores'] == 12                     # v3.3.0 记核数(nodes×ppn)供实耗核时
     assert manifest.load_manifest(d)['state'] == 'SUBMITTED'   # 已落盘
+
+
+def test_remote_dir_avoids_same_basename_collisions_and_is_deterministic(tmp_path):
+    """不同项目的同名作业不能再覆盖同一个 remote_root/basename。"""
+    first = _job_dir(tmp_path / 'project-a')
+    second = _job_dir(tmp_path / 'project-b')
+    profile = _profile()
+
+    spec_a1 = submitter._spec_for(profile, first)
+    spec_a2 = submitter._spec_for(profile, first)
+    spec_b = submitter._spec_for(profile, second)
+
+    assert spec_a1.remote_dir == spec_a2.remote_dir
+    assert spec_a1.remote_dir != spec_b.remote_dir
+    assert posixpath.basename(spec_a1.remote_dir).startswith('zn_job--')
+    assert str(tmp_path) not in spec_a1.remote_dir       # 不泄露本地绝对路径
+
+    saved_a = submitter.submit_job(
+        FakeClient(script=[('qsub', '701.c\n')]), FakeSFTP(), profile, first)
+    saved_b = submitter.submit_job(
+        FakeClient(script=[('qsub', '702.c\n')]), FakeSFTP(), profile, second)
+    assert saved_a['remote_dir'] != saved_b['remote_dir']
+
+
+def test_remote_dir_reuses_same_profile_but_not_another_profile(tmp_path):
+    d = _job_dir(tmp_path)
+    original = _profile()
+    submitted = submitter.submit_job(
+        FakeClient(script=[('qsub', '710.c\n')]), FakeSFTP(), original, d)
+    remote = submitted['remote_dir']
+
+    # 同一 profile 即使之后调整 remote_root，也沿用已提交目录，保证重提/续算稳定。
+    same_profile = _profile(remote_root='/new/root/that/must/not/replace')
+    assert submitter._spec_for(same_profile, d).remote_dir == remote
+    resubmitted = submitter.submit_job(
+        FakeClient(script=[('qsub', '711.c\n')]), FakeSFTP(), same_profile, d)
+    assert resubmitted['remote_dir'] == remote
+
+    # 另一集群不能把旧集群绝对路径带过去；新目标有自己稳定的唯一目录。
+    other = _profile(name='second-hpc', hostname='h2', username='other',
+                     remote_root='/scratch/other/jobs')
+    other_remote = submitter._spec_for(other, d).remote_dir
+    assert other_remote.startswith('/scratch/other/jobs/zn_job--')
+    assert other_remote != remote
+    assert submitter._spec_for(other, d).remote_dir == other_remote
+
+
+def test_legacy_remote_dir_is_preserved_for_submit_refresh_and_continue(tmp_path):
+    """旧 manifest 已记录的同集群 remote_dir 是兼容边界，不迁移也不改名。"""
+    d = _job_dir(tmp_path)
+    legacy = '/work/sk2067/jobs/zn_job'
+    item = manifest.load_manifest(d)
+    item['cluster'] = '1w'
+    item['remote_dir'] = legacy
+    manifest.save_manifest(d, item)
+
+    submit_client = FakeClient(script=[('qsub', '720.c\n')])
+    submitted = submitter.submit_job(submit_client, FakeSFTP(), _profile(), d)
+    assert submitted['remote_dir'] == legacy
+    assert any(legacy in command for command in submit_client.commands)
+
+    # 旧路径仍由刷新链直接读取。
+    refresh_client = FakeClient(script=[('___VCSLIVE___',
+        '1\n___VCSLIVE___\n\n___VCSLIVE___\n\n')])
+    submitter.refresh_job(
+        refresh_client, _profile(), d, live_states={'720': 'RUNNING'})
+    assert any(legacy in command for command in refresh_client.commands)
+
+    # 终态后续算仍在同一旧目录重投，不创建带摘要的新目录。
+    item = manifest.load_manifest(d)
+    manifest.set_state(item, 'UNCONVERGED')
+    item.setdefault('results', {})['diagnosis'] = {
+        'failure_class': 'NONCONVERGED', 'restartable': True}
+    manifest.save_manifest(d, item)
+    continue_client = _continue_client(qsub_id='721.c\n')
+    continued = submitter.continue_from_contcar(
+        continue_client, _profile(), d)
+    assert continued['remote_dir'] == legacy
+    assert any(legacy in command for command in continue_client.commands)
 
 
 def test_submit_job_failure_keeps_uploaded(tmp_path):
@@ -222,7 +331,8 @@ def test_submit_and_refresh_quote_spaced_remote_dir(tmp_path):
     sftp = FakeSFTP()
     m = submitter.submit_job(client, sftp, prof, d)
 
-    remote = '/work/my jobs/zn_job'
+    remote = m['remote_dir']
+    assert remote.startswith('/work/my jobs/zn_job--')
     assert m['remote_dir'] == remote
     assert f"mkdir -p '{remote}'" in client.commands
     assert any(f"'{remote}/vcs_job.sh'" in c for c in client.commands)
@@ -514,7 +624,8 @@ def test_build_script_text_template_mode(tmp_path):
                    encoding='utf-8')
     prof = _profile(script_mode='template', template_path=str(tpl))
     text = submitter.build_script_text(prof, d)
-    assert '#PBS -N zn_job' in text and 'cd X/zn_job' in text and '-np 12' in text
+    leaf = posixpath.basename(submitter._spec_for(prof, d).remote_dir)
+    assert '#PBS -N zn_job' in text and f'cd X/{leaf}' in text and '-np 12' in text
 
 
 def test_refresh_job_running_live_health(tmp_path):

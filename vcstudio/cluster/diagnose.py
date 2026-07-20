@@ -188,7 +188,18 @@ def last_block_scf_iters(oszicar_tail: str) -> int:
     """OSZICAR 尾部最后一个离子步块的电子步数(解析不出 → 0)。"""
     if not oszicar_tail:
         return 0
-    last_block = oszicar_tail.rsplit('F=', 1)[-1] if 'F=' in oszicar_tail else oszicar_tail
+    # Real VASP ordering is DAV/RMM electronic lines followed by the ionic
+    # ``F= ... E0= ...`` summary.  Therefore the final electronic block lies
+    # *before* the last F= line and after the previous summary.  The old rsplit
+    # selected text after F= and returned zero for the real NELM trap.
+    lines = oszicar_tail.splitlines()
+    summaries = [index for index, line in enumerate(lines) if 'F=' in line]
+    if summaries:
+        end = summaries[-1]
+        start = summaries[-2] + 1 if len(summaries) > 1 else 0
+        last_block = '\n'.join(lines[start:end])
+    else:
+        last_block = oszicar_tail
     matches = _SCF_LINE_RE.findall(last_block)
     return int(matches[-1][0]) if matches else 0
 

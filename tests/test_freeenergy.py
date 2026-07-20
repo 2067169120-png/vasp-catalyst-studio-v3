@@ -1,14 +1,89 @@
 """freeenergy 测试:μ_Li/ΔG/PDS/U_L 公式 + OSZICAR 解析 + 旧目录扫描 + 物种匹配
 + 通用 CHE/ΔG 台阶引擎(free_energy_path/ladder_at_potentials/u_eq_check)。"""
 import copy
+from pathlib import Path
 
 import pytest
 
+from vcstudio.project import adsorption
 from vcstudio.project import freeenergy as fe
 from vcstudio.project import reactions as R
+from vcstudio.shared import manifest as mm
 
 # 构造能量:让公式可手算。E(S8)=-32, E(Li2S)=-8 → μ_Li = (-8 - (-32/8))/2 = -2
 _MOL = {'S8': -32.0, 'Li2S': -8.0, 'Li2S2': -12.0}
+
+
+def _method_job(path, energy, *, encut=400, xc='pbe', ivdw=0,
+                potcar_variant='S', u=0.0):
+    path.mkdir(parents=True, exist_ok=True)
+    incar = [f'ENCUT = {encut}', 'NSW = 0', 'ISMEAR = 0']
+    if xc == 'hse':
+        incar += ['GGA = PE', 'LHFCALC = .TRUE.', 'AEXX = 0.25',
+                  'HFSCREEN = 0.2', 'LASPH = .TRUE.']
+    elif xc == 'r2scan':
+        incar += ['METAGGA = R2SCAN', 'LASPH = .TRUE.']
+    else:
+        incar += ['GGA = PE']
+    if ivdw:
+        incar.append(f'IVDW = {ivdw}')
+    if u:
+        incar += ['LDAU = .TRUE.', 'LDAUL = 2', f'LDAUU = {u}', 'LDAUJ = 0']
+    (path / 'INCAR').write_text('\n'.join(incar) + '\n', encoding='utf-8')
+    (path / 'KPOINTS').write_text(
+        'mesh\n0\nGamma\n1 1 1\n0 0 0\n', encoding='utf-8')
+    (path / 'POSCAR').write_text(
+        'S system\n1\n10 0 0\n0 10 0\n0 0 15\nS\n1\nDirect\n0 0 0\n',
+        encoding='utf-8')
+    (path / 'POTCAR').write_text(
+        f'TITEL = PAW_PBE {potcar_variant} 06Sep2000\nENMAX = 260 eV\n',
+        encoding='utf-8')
+    (path / 'OSZICAR').write_text(
+        f' 1 F= {energy} E0= {energy:.8E}\n', encoding='utf-8')
+    item = mm.new_manifest(job_id=path.name, system=path.name,
+                           task_type='static', calc_type='molecule', inputs={})
+    mm.set_state(item, 'DONE')
+    item['results'] = {'energy_e0_eV': energy}
+    mm.save_manifest(path, item)
+    return str(path)
+
+
+def _managed_method_pair(tmp_path, *, library_kwargs=None, one_override=None):
+    adsorption_root = tmp_path / 'adsorption'
+    clean = _method_job(adsorption_root / 'clean', -90.0)
+    config = _method_job(adsorption_root / 'config', -100.0)
+    adsorption_project = {
+        'name': 'ads', 'root': str(adsorption_root),
+        'members': {'clean_slab': clean, 'gas_ref': None, 'configs': [config]},
+    }
+    library_root = tmp_path / 'reference-library'
+    molecules = library_root / 'molecules'
+    kwargs = dict(library_kwargs or {})
+    refs = {}
+    for species, energy in _MOL.items():
+        member_kwargs = dict(kwargs)
+        if one_override and species == one_override[0]:
+            member_kwargs.update(one_override[1])
+        refs[species] = _method_job(
+            molecules / f'mol_{species}', energy, **member_kwargs)
+    library_project = {
+        'kind': 'molecule_library', 'name': 'refs', 'root': str(library_root),
+        'molecules_dir': str(molecules),
+        'members': {'clean_slab': None, 'gas_ref': None, 'configs': [],
+                    'molecules': refs},
+        'species_ref_jobs': refs,
+    }
+    adsorption.save_project(library_root, library_project)
+    return adsorption_project, molecules
+
+
+def _lis_rows():
+    return [
+        {'name': f'ads_{species}_top', 'e_config': energy, 'state': 'DONE'}
+        for species, energy in (
+            ('S8', -100.0), ('Li2S8', -105.0), ('Li2S6', -95.0),
+            ('Li2S4', -100.0), ('Li2S2', -103.0), ('Li2S', -104.0))
+    ]
 
 
 def test_mu_li_formula():
@@ -79,6 +154,121 @@ def test_read_e0_and_scan(tmp_path):
     assert scanned == {'S8': pytest.approx(-32.0), 'Li2S': pytest.approx(-8.0)}
 
 
+def test_managed_molecule_missing_or_corrupt_manifest_fails_closed(tmp_path):
+    """项目明确管理的目录不能因 job.yaml 丢失而退化成“可信旧库”。"""
+    d = tmp_path / 'mol_S8'
+    d.mkdir()
+    (d / 'OSZICAR').write_text(
+        ' 1 F= -32.0 E0= -3.200000E+01\n', encoding='utf-8')
+
+    # 未声明受管时保留历史 OSZICAR-only 分子库兼容。
+    assert fe.load_molecule_energies(tmp_path) == {'S8': pytest.approx(-32.0)}
+    # 一旦项目 species_ref_jobs 指向该目录，缺 manifest 必须拒绝。
+    assert fe.load_molecule_energies(tmp_path, managed_dirs=[d]) == {}
+
+    (d / 'job.yaml').write_text(': : malformed\t[', encoding='utf-8')
+    assert fe.load_molecule_energies(tmp_path, managed_dirs=[str(d)]) == {}
+
+
+def test_standalone_molecule_library_auto_restores_managed_gate(tmp_path):
+    """全局引用独立参考库时，不依赖调用方另传 species_ref_jobs。"""
+    molecules = tmp_path / 'molecules'
+    d = molecules / 'mol_S8'
+    d.mkdir(parents=True)
+    (d / 'OSZICAR').write_text(
+        ' 1 F= -32.0 E0= -3.200000E+01\n', encoding='utf-8')
+    project = {
+        'kind': 'molecule_library', 'name': 'refs', 'root': str(tmp_path),
+        'molecules_dir': str(molecules),
+        'members': {'clean_slab': None, 'gas_ref': None, 'configs': [],
+                    'molecules': {'S8': str(d)}},
+        'species_ref_jobs': {'S8': str(d)},
+    }
+    adsorption.save_project(tmp_path, project)
+
+    # 未显式传 managed_dirs，也能从参考库自己的 project.yaml 判定受管并拒绝。
+    assert fe.load_molecule_energies(molecules) == {}
+    (d / 'job.yaml').write_text('state:\t[broken', encoding='utf-8')
+    assert fe.load_molecule_energies(molecules) == {}
+
+    item = mm.new_manifest(job_id='s8', system='S8', task_type='static',
+                           calc_type='molecule', inputs={})
+    mm.set_state(item, 'DONE')
+    item['results'] = {'energy_e0_eV': -32.5}
+    mm.save_manifest(d, item)
+    assert fe.load_molecule_energies(molecules) == {'S8': pytest.approx(-32.5)}
+
+
+def test_managed_cross_project_method_match_is_verified(tmp_path):
+    project, molecules = _managed_method_pair(tmp_path)
+    audit = fe.audit_molecule_method_compatibility(project, molecules)
+    assert audit['ok'] is True and audit['verified'] is True and audit['managed'] is True
+
+    out = fe.path_from_project_and_molecules(
+        _lis_rows(), e_slab=-90.0, molecules_dir=molecules, project=project)
+    assert out['method_consistency']['verified'] is True
+    assert not out['method_consistency']['warnings']
+
+
+@pytest.mark.parametrize(
+    ('kwargs', 'expected'),
+    [
+        ({'encut': 500}, 'ENCUT'),
+        ({'xc': 'hse'}, '交换关联泛函'),
+        ({'xc': 'r2scan'}, '交换关联泛函'),
+        ({'ivdw': 11}, '色散校正'),
+        ({'potcar_variant': 'S_sv'}, 'POTCAR'),
+        ({'u': 3.9}, 'DFT+U'),
+    ],
+    ids=('encut', 'hse', 'r2scan', 'dispersion', 'potcar', 'hubbard-u'),
+)
+def test_managed_cross_project_method_mismatch_blocks_delta_g(tmp_path, kwargs, expected):
+    project, molecules = _managed_method_pair(tmp_path, library_kwargs=kwargs)
+    audit = fe.audit_molecule_method_compatibility(project, molecules)
+    assert audit['ok'] is False
+    assert any(expected in error for error in audit['errors']), audit['errors']
+    with pytest.raises(ValueError, match='方法一致性门控未通过'):
+        fe.path_from_project_and_molecules(
+            _lis_rows(), e_slab=-90.0, molecules_dir=molecules, project=project)
+
+
+def test_managed_library_internal_method_mix_or_missing_evidence_blocks(tmp_path):
+    project, molecules = _managed_method_pair(
+        tmp_path, one_override=('Li2S2', {'encut': 500}))
+    audit = fe.audit_molecule_method_compatibility(project, molecules)
+    assert not audit['ok']
+    assert any('分子参考库内部方法不一致' in error for error in audit['errors'])
+
+    # A managed library cannot silently fall back to energy-only legacy mode.
+    (molecules / 'mol_Li2S2' / 'POTCAR').unlink()
+    audit = fe.audit_molecule_method_compatibility(project, molecules)
+    assert not audit['ok']
+    assert any('缺少方法证据' in error for error in audit['errors'])
+
+
+def test_saved_method_fingerprint_cannot_hide_later_input_change(tmp_path):
+    project, molecules = _managed_method_pair(tmp_path)
+    library_root = molecules.parent
+    library_project = adsorption.load_project(library_root)
+    records = []
+    for path in library_project['species_ref_jobs'].values():
+        records.append({
+            'path': path, 'role': 'molecule',
+            'fingerprint': fe._method_fingerprint_from_job(path),
+        })
+    library_project['method_fingerprints'] = {'schema': 1, 'members': records}
+    adsorption.save_project(library_root, library_project)
+    assert fe.audit_molecule_method_compatibility(project, molecules)['ok'] is True
+
+    changed = Path(library_project['species_ref_jobs']['S8']) / 'INCAR'
+    changed.write_text(
+        changed.read_text(encoding='utf-8').replace('ENCUT = 400', 'ENCUT = 500'),
+        encoding='utf-8')
+    audit = fe.audit_molecule_method_compatibility(project, molecules)
+    assert audit['ok'] is False
+    assert any('保存方法指纹后真实四件套已改变' in error for error in audit['errors'])
+
+
 def test_species_matching_no_prefix_collision():
     assert fe._species_in_name('Li2S', 'ads_Li2S_on_slab')
     assert not fe._species_in_name('Li2S', 'ads_Li2S8_on_slab')   # Li2S 不误配 Li2S8(前缀)
@@ -102,6 +292,8 @@ def test_path_from_project_picks_lowest_energy(tmp_path):
     out = fe.path_from_project_and_molecules(rows, e_slab=-90.0,
                                              molecules_dir=tmp_path)
     assert out['steps'][1]['G'] == pytest.approx(-1.0)            # 取了 -105(DONE 里最稳)
+    assert out['method_consistency']['verified'] is False
+    assert any('旧式非受管' in warning for warning in out['warnings'])
 
 
 # ═════════════════════════════════════════════════════════════════════════════

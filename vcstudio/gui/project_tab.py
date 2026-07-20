@@ -206,10 +206,8 @@ class ProjectTab(ttk.Frame):
             self.log.write(f'❌ 导出失败:{e}')
 
     def _member_dirs(self, proj):
-        """项目全部成员作业目录(清洁表面 + 气相参考 + 构型族)。"""
-        mem = proj.get('members') or {}
-        return [d for d in ([mem.get('clean_slab'), mem.get('gas_ref')]
-                            + list(mem.get('configs') or [])) if d]
+        """项目全部成员作业目录（含导入的物种参考态）。"""
+        return report_full._member_dirs(proj)
 
     def _on_report(self):
         proj = self._current_project()

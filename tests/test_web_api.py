@@ -167,6 +167,49 @@ def test_preview_script_build_failure_caught():
     assert out['ok'] is False and '无模板' in out['error']
 
 
+def test_submission_profile_check_applies_one_shot_resources():
+    seen = {}
+
+    def _check(profile):
+        seen['profile'] = profile
+        return []
+
+    profile = ClusterProfile(
+        name='hpc', hostname='login.example', username='alice',
+        remote_root='/work/alice/jobs', scheduler='PBS', queue='batch',
+        nodes=1, ppn=16, walltime='24:00:00', vasp_cmd='vasp_std')
+    api = Api(profiles_mod=_fake_profiles({'hpc': profile}),
+              submitter_mod=types.SimpleNamespace(profile_preflight=_check))
+
+    out = api.submission_profile_check(
+        'hpc', {'queue': 'gpu', 'nodes': 2, 'ppn': 32, 'walltime': '12:00:00'})
+
+    assert out == {'ok': True, 'errors': [], 'error': None}
+    effective = seen['profile']
+    assert (effective.queue, effective.nodes, effective.ppn, effective.walltime) == (
+        'gpu', 2, 32, '12:00:00')
+    # 一次性资源不写回保存的 profile。
+    assert profile.queue == 'batch' and profile.nodes == 1
+
+
+def test_submission_profile_check_reports_missing_profile_and_preflight_errors():
+    missing = Api(profiles_mod=_fake_profiles({})).submission_profile_check('gone')
+    assert missing['ok'] is False and '不存在' in missing['error']
+
+    profile = ClusterProfile(name='bad', hostname='', username='')
+    sub = types.SimpleNamespace(
+        profile_preflight=lambda prof: ['集群配置未填主机地址 hostname'])
+    blocked = Api(profiles_mod=_fake_profiles({'bad': profile}),
+                  submitter_mod=sub).submission_profile_check('bad')
+    assert blocked['ok'] is False
+    assert blocked['errors'] == ['集群配置未填主机地址 hostname']
+
+    bad_resource = Api(
+        profiles_mod=_fake_profiles({'bad': profile}),
+        submitter_mod=sub).submission_profile_check('bad', {'nodes': 0})
+    assert bad_resource['ok'] is False and '正整数' in bad_resource['error']
+
+
 # ── list_jobs ────────────────────────────────────────────────────────────────
 def test_list_jobs_row_assembly_and_stale():
     m_done = {
@@ -204,19 +247,21 @@ def test_list_jobs_error_is_caught():
 
 
 def test_list_jobs_injects_project_and_role():
-    """任务行注入所属吸附能项目组:clean/gas/config 各归位,独立作业 project=None。"""
+    """任务行注入所属吸附能项目组，包含导入的物种参考态。"""
     def mk(st):
         return {'state': st, 'task_type': 'relax', 'calc_type': 'slab',
                 'created_at': '2026-07-14T09:00:00', 'results': {}}
     entries = [('/jobs/demo_slab_clean', mk('DONE')),
                ('/jobs/demo_ads_S8', mk('RUNNING')),
                ('/jobs/demo_ref', mk('DONE')),
+               ('/jobs/mol_S8', mk('CREATED')),
                ('/jobs/standalone', mk('DONE'))]
     proj = {'name': 'demo', 'members': {
         'clean_slab': '/jobs/demo_slab_clean',
         'gas_ref': '/jobs/demo_ref',
         'configs': ['/jobs/demo_ads_S8'],
-    }}
+        'molecules': {'S8': '/jobs/mol_S8'},
+    }, 'species_ref_jobs': {'S8': '/jobs/mol_S8'}}
     ads = _fake_adsorption(projects=['/p/project.yaml'],
                            proj_map={'/p/project.yaml': proj})
     api = Api(ledger_mod=_fake_ledger(entries, []), adsorption_mod=ads)
@@ -228,6 +273,8 @@ def test_list_jobs_injects_project_and_role():
     assert rows['/jobs/demo_ads_S8']['role'] == 'config'
     assert rows['/jobs/demo_ref']['project'] == 'demo'
     assert rows['/jobs/demo_ref']['role'] == 'gas'
+    assert rows['/jobs/mol_S8']['project'] == 'demo'
+    assert rows['/jobs/mol_S8']['role'] == 'molecule'
     assert rows['/jobs/standalone']['project'] is None
     assert rows['/jobs/standalone']['role'] is None
 
@@ -272,6 +319,39 @@ def test_submit_jobs_delegates_to_batch_ops():
     api = Api(profiles_mod=_fake_profiles(store), batch_ops_mod=bo)
     out = api.submit_jobs(['/a', '/b'], 'c1', None, False)
     assert calls['dirs'] == ['/a', '/b'] and out['results'][0][1] is True
+
+
+def test_submit_jobs_applies_one_time_resource_overrides_without_saving():
+    seen = {}
+
+    def _submit(prof, pw, dirs, trust):
+        seen.update(queue=prof.queue, nodes=prof.nodes, ppn=prof.ppn,
+                    walltime=prof.walltime, hostname=prof.hostname)
+        return {'needs_trust': False, 'results': []}
+
+    original = ClusterProfile(name='c1', hostname='cluster', queue='old',
+                              nodes=1, ppn=24, walltime='24:00:00')
+    store = {'c1': original}
+    api = Api(profiles_mod=_fake_profiles(store),
+              batch_ops_mod=types.SimpleNamespace(submit_batch=_submit))
+
+    out = api.submit_jobs(['/a'], 'c1', None, False,
+                          {'queue': 'compute', 'nodes': 2, 'ppn': 32,
+                           'walltime': '48:00:00'})
+
+    assert 'error' not in out
+    assert seen == {'queue': 'compute', 'nodes': 2, 'ppn': 32,
+                    'walltime': '48:00:00', 'hostname': 'cluster'}
+    assert store['c1'] is original and original.queue == 'old' and original.ppn == 24
+
+
+def test_submit_jobs_rejects_invalid_resource_override():
+    store = {'c1': ClusterProfile(name='c1', auth='key', key_path='/k')}
+    api = Api(profiles_mod=_fake_profiles(store))
+
+    out = api.submit_jobs(['/a'], 'c1', None, False, {'ppn': 0})
+
+    assert '每节点核数' in out['error']
 
 
 def test_unknown_profile_is_error_not_crash():
@@ -705,6 +785,91 @@ def _fake_report_full(*, member_dirs=None, report_ret='/out/报告.html', calls=
     return m
 
 
+def _fake_result_import(calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.scan_root = lambda root: {
+        'ok': True, 'root': root, 'preview': [{'relative_path': 'clean'}],
+        'candidates': [{'relative_path': 'clean'}], 'warnings': []}
+
+    def _preview(root, name, output, assignments, **kwargs):
+        calls['preview'] = (root, name, output, assignments, kwargs)
+        return {'ok': True, 'members': [], 'counts': {
+            'created': 0, 'done': 0, 'needs_human': 0}}
+
+    def _commit(root, name, output, assignments, **kwargs):
+        calls['commit'] = (root, name, output, assignments, kwargs)
+        return {'ok': True, 'project_path': '/managed/project.yaml',
+                'registered_jobs': ['/managed/clean']}
+
+    m.preview_project = _preview
+    m.import_project = _commit
+    return m
+
+
+def test_proj_import_bridge_scan_preview_and_commit():
+    calls = {}
+    api = Api(result_import_mod=_fake_result_import(calls))
+
+    scan = api.proj_import_scan('/source')
+    preview = api.proj_import_preview(
+        '/source', 'LiS', '/managed', [{'path': 'clean', 'role': 'clean'}],
+        True, {'ads': True}, 'adsorption')
+    commit = api.proj_import_commit(
+        '/source', 'LiS', '/managed', [{'path': 'clean', 'role': 'clean'}],
+        False, False, 'adsorption', {'clean': 'preview-fingerprint'})
+
+    assert scan['ok'] is True and scan['preview'][0]['relative_path'] == 'clean'
+    assert preview['ok'] is True
+    assert calls['preview'][-1] == {
+        'include_large_outputs': True, 'manual_confirm': {'ads': True},
+        'project_kind': 'adsorption'}
+    assert commit['registered_jobs'] == ['/managed/clean']
+    assert calls['commit'][-1] == {
+        'include_large_outputs': False, 'manual_confirm': False,
+        'project_kind': 'adsorption',
+        'expected_fingerprints': {'clean': 'preview-fingerprint'}}
+
+
+def test_proj_import_molecule_library_saves_default_path_and_forwards_snapshot():
+    calls = {}
+    importer = _fake_result_import(calls)
+
+    def _commit(root, name, output, assignments, **kwargs):
+        calls['commit'] = (root, name, output, assignments, kwargs)
+        return {'ok': True, 'project_path': '/managed/refs/project.yaml',
+                'project': {'molecules_dir': '/managed/refs/molecules'},
+                'registered_jobs': ['/managed/refs/molecules/mol_S8'],
+                'warnings': []}
+
+    importer.import_project = _commit
+    backing = {'theme': 'light'}
+    config = types.SimpleNamespace(
+        load_config=lambda: dict(backing),
+        save_config=lambda cfg: (backing.clear() or backing.update(cfg)))
+    api = Api(result_import_mod=importer, config_mod=config)
+
+    out = api.proj_import_commit(
+        '/source', 'Li-S refs', '/managed',
+        [{'path': 'mol_S8', 'role': 'molecule', 'species': 'S8'}],
+        project_kind='molecule_library',
+        expected_fingerprints={'mol_S8': 'approved-snapshot'})
+
+    assert out['ok'] is True and out['configured_global_molecules'] is True
+    assert backing['lis_molecules_dir'] == '/managed/refs/molecules'
+    assert calls['commit'][-1] == {
+        'include_large_outputs': False, 'manual_confirm': False,
+        'project_kind': 'molecule_library',
+        'expected_fingerprints': {'mol_S8': 'approved-snapshot'}}
+
+
+def test_proj_import_bridge_catches_importer_exception():
+    boom = types.SimpleNamespace(
+        scan_root=lambda root: (_ for _ in ()).throw(RuntimeError('扫描失败')))
+    out = Api(result_import_mod=boom).proj_import_scan('/source')
+    assert out['ok'] is False and out['preview'] == [] and '扫描失败' in out['error']
+
+
 # ── proj_list ────────────────────────────────────────────────────────────────
 def test_proj_list_assembles_path_name_members():
     proj = {'name': 'demo', 'members': {'clean_slab': '/s', 'gas_ref': None,
@@ -734,6 +899,17 @@ def test_proj_list_counts_members_inline_without_report_full():
     assert out['error'] is None
     assert out['projects'] == [{'path': '/p/project.yaml', 'name': 'demo',
                                 'n_members': 3}]
+
+
+def test_proj_list_counts_species_reference_jobs_once():
+    proj = {'name': 'lis', 'members': {
+        'clean_slab': '/s', 'gas_ref': None, 'configs': ['/c'],
+        'molecules': {'S8': '/m/S8'},
+    }, 'species_ref_jobs': {'S8': '/m/S8', 'Li2S': '/m/Li2S'}}
+    ads = _fake_adsorption(projects=['/p/project.yaml'],
+                           proj_map={'/p/project.yaml': proj})
+    out = Api(adsorption_mod=ads).proj_list()
+    assert out['projects'][0]['n_members'] == 4
 
 
 def test_proj_list_skips_unloadable_and_catches_error():
@@ -1302,9 +1478,11 @@ def test_proj_figures_ladder_uses_fed_pds_index(tmp_path):
     mol_dir.mkdir()
     fed = {'steps': [{'label': 'S8*', 'G': 0.0}, {'label': 'Li2S*', 'G': -1.0}],
            'pds_index': 0, 'u_l': 1.5, 'mu_li': -1.65, 'per_electron': [0.5],
-           'thermo_corrected': False}
+           'thermo_corrected': False,
+           'warnings': ['旧式非受管分子目录无法核验方法']}
     fe = types.SimpleNamespace(
-        path_from_project_and_molecules=lambda rows, e_slab, molecules_dir: fed)
+        path_from_project_and_molecules=lambda rows, e_slab, molecules_dir,
+        managed_dirs=None, project=None: fed)
     ads = _fake_adsorption(proj_map={'/p': _proj('liS', str(tmp_path))},
                            delta_ret=_delta({'liS_ads_Li2S4': -1.2}))
     api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
@@ -1316,6 +1494,37 @@ def test_proj_figures_ladder_uses_fed_pds_index(tmp_path):
     assert lad['pds_index'] == 0                      # 逐电子权威口径透传
     assert lad['step_labels'] == ['S8*', 'Li2S*']
     assert lad['data'] == [{'name': 'liS', 'G': [0.0, -1.0]}]
+    assert out['warnings'] == ['旧式非受管分子目录无法核验方法']
+
+
+def test_proj_figures_prefers_imported_project_molecules(tmp_path):
+    calls, seen = {}, {}
+    project_mols = tmp_path / 'imported-molecules'
+    configured_mols = tmp_path / 'configured-molecules'
+    project_mols.mkdir()
+    configured_mols.mkdir()
+    proj = _proj('liS', str(tmp_path))
+    proj['molecules_dir'] = str(project_mols)
+    fed = {'steps': [{'label': 'S8*', 'G': 0.0}, {'label': 'Li2S*', 'G': -1.0}],
+           'pds_index': 0, 'u_l': 1.5}
+
+    def _path(rows, e_slab, molecules_dir, managed_dirs=None, project=None):
+        seen['molecules_dir'] = molecules_dir
+        seen['managed_dirs'] = list(managed_dirs or [])
+        seen['project'] = project
+        return fed
+
+    ads = _fake_adsorption(proj_map={'/p': proj},
+                           delta_ret=_delta({'liS_ads_Li2S4': -1.2}))
+    api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
+              freeenergy_mod=types.SimpleNamespace(path_from_project_and_molecules=_path),
+              config_mod=_fake_config(cfg={'lis_molecules_dir': str(configured_mols)}))
+
+    out = api.proj_figures('/p', ['ladder'])
+
+    assert out['ok'] is True and len(out['files']) == 1
+    assert seen['molecules_dir'] == str(project_mols)
+    assert seen['project'] is proj
 
 
 def test_proj_figures_ladder_skipped_without_molecules_dir(tmp_path):
@@ -1641,6 +1850,24 @@ def test_pipeline_status_monitor_recover_and_needs_human():
     assert by['R']['needs_human'] is True
 
 
+def test_pipeline_status_waits_for_created_species_reference():
+    proj = {'name': 'LiS', 'members': {
+        'clean_slab': '/s', 'gas_ref': None, 'configs': ['/c'],
+        'molecules': {'S8': '/m/S8'},
+    }, 'species_ref_jobs': {'S8': '/m/S8'}}
+    ads = _fake_adsorption(projects=['/p'], proj_map={'/p': proj})
+    states = {
+        '/s': {'state': 'DONE', 'results': {}},
+        '/c': {'state': 'DONE', 'results': {}},
+        '/m/S8': {'state': 'CREATED', 'results': {}},
+    }
+    out = Api(adsorption_mod=ads,
+              manifest_mod=_fake_manifest_mod(states)).pipeline_status()
+    assert out['projects'][0]['stage'] == 'submit'
+    assert out['projects'][0]['done'] == 2
+    assert out['projects'][0]['total'] == 3
+
+
 # ── open_dir 文件路径 → 打开所在目录 ─────────────────────────────────────────
 def test_open_dir_file_opens_parent(tmp_path, monkeypatch):
     import subprocess
@@ -1825,7 +2052,7 @@ def _fake_fe_preset(*, mol_e=None, fed=None, path_calls=None):
     """freeenergy 假件(通用预设路径):load_molecule_energies + free_energy_path。"""
     path_calls = path_calls if path_calls is not None else {}
     m = types.SimpleNamespace()
-    m.load_molecule_energies = lambda d: dict(mol_e or {})
+    m.load_molecule_energies = lambda d, managed_dirs=None: dict(mol_e or {})
 
     def _fep(spec, energies, **kw):
         path_calls['energies'] = dict(energies)
@@ -2202,7 +2429,7 @@ def test_proj_figures_default_ladder_unchanged_when_no_preset(tmp_path):
            'pds_index': 0, 'u_l': 1.5}
     seen = {}
 
-    def _path(rows, e_slab, molecules_dir):
+    def _path(rows, e_slab, molecules_dir, managed_dirs=None, project=None):
         seen['called'] = True
         return fed
     fe = types.SimpleNamespace(path_from_project_and_molecules=_path)
@@ -2555,7 +2782,8 @@ def test_render_figure_preset_ladder_lis_default(tmp_path):
     fed = {'steps': [{'label': 'S8*', 'G': 0.0}, {'label': 'Li2S*', 'G': -1.0}],
            'pds_index': 0, 'u_l': 1.5}
     fe = types.SimpleNamespace(
-        path_from_project_and_molecules=lambda rows, e_slab, molecules_dir: fed)
+        path_from_project_and_molecules=lambda rows, e_slab, molecules_dir,
+        managed_dirs=None, project=None: fed)
     ads = _fake_adsorption(proj_map={'/p': _proj('liS', str(tmp_path))},
                            delta_ret=_delta({'liS_ads_Li2S4': -1.2}))
     api = Api(figure_presets_mod=_fake_figpresets(calls=calls), adsorption_mod=ads,

@@ -204,7 +204,9 @@ def _ladder_from_project(project, summary, scenario, molecules_dir):
     try:
         from vcstudio.project import freeenergy
         fed = freeenergy.path_from_project_and_molecules(
-            summary.get('rows') or [], e_slab=e_slab, molecules_dir=molecules_dir)
+            summary.get('rows') or [], e_slab=e_slab, molecules_dir=molecules_dir,
+            managed_dirs=list(dict(project.get('species_ref_jobs') or {}).values()),
+            project=project)
     except Exception as e:                 # noqa: BLE001 缺中间体/分子能量
         return None, str(e)
     name = str(project.get('name') or '') or '项目'
@@ -213,6 +215,7 @@ def _ladder_from_project(project, summary, scenario, molecules_dir):
         'step_labels': [st['label'] for st in fed['steps']],
         'pds_index': fed.get('pds_index'),
         '_u_l': fed.get('u_l'),
+        '_warnings': list(fed.get('warnings') or []),
     }
     return data, ''
 
@@ -236,7 +239,8 @@ def analyze_project(project, scenario, *, adsorption_mod=None,
     avail: dict = {'name': name, 'scenario': str(scenario), 'n_delta': 0,
                    'n_systems': 0, 'has_bar': False, 'has_table': False,
                    'has_ladder': False, 'has_volcano': False, 'has_pdos': False,
-                   'has_chgdiff': False, 'has_freq': False, 'member_dirs': []}
+                   'has_chgdiff': False, 'has_freq': False, 'member_dirs': [],
+                   'warnings': []}
 
     members = (project or {}).get('members') or {}
     mdirs = [members.get('clean_slab'), members.get('gas_ref')]
@@ -278,6 +282,7 @@ def analyze_project(project, scenario, *, adsorption_mod=None,
         if lad is not None:
             data['free_energy_ladder'] = lad
             avail['has_ladder'] = True
+            avail['warnings'].extend(lad.get('_warnings') or [])
         else:
             avail['ladder_reason'] = reason
 
@@ -395,6 +400,7 @@ def run_auto_figures(project, scenario, out_dir, *, journal: str = 'nature',
     全部成品落 ``<out_dir>/figures/``。返回::
 
         {'ok', 'files': [...绝对路径...], 'skipped': [{'key','reason'}],
+         'warnings': [...方法学提示...],
          'panel': {'files':[png,pdf],'n':k}|None, 'manifest': [每图溯源条目],
          'out_dir': figures 目录, 'error': None|中文}
 
@@ -455,8 +461,9 @@ def run_auto_figures(project, scenario, out_dir, *, journal: str = 'nature',
             except Exception as e:         # noqa: BLE001 拼版失败不拖垮单图产物
                 skipped.append({'key': 'panel_combined', 'reason': f'拼版失败:{e}'})
 
-        return {'ok': True, 'files': files, 'skipped': skipped, 'panel': panel,
+        return {'ok': True, 'files': files, 'skipped': skipped,
+                'warnings': list(avail.get('warnings') or []), 'panel': panel,
                 'manifest': manifest, 'out_dir': figures_dir, 'error': None}
     except Exception as e:                 # noqa: BLE001 全流程兜底
-        return {'ok': False, 'files': [], 'skipped': [], 'panel': None,
+        return {'ok': False, 'files': [], 'skipped': [], 'warnings': [], 'panel': None,
                 'manifest': [], 'out_dir': None, 'error': str(e)}

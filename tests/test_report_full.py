@@ -35,6 +35,27 @@ def test_incar_summary_reads_real_keys(tmp_path):
     assert report_full.incar_summary_from_dir(tmp_path / 'nope') == {}
 
 
+def test_encut_methodology_reports_consistent_mismatch_and_missing(tmp_path):
+    a, b, missing = tmp_path / 'a', tmp_path / 'b', tmp_path / 'missing'
+    for directory in (a, b, missing):
+        directory.mkdir()
+    (a / 'INCAR').write_text('ENCUT = 450\n', encoding='utf-8')
+    (b / 'INCAR').write_text('ENCUT = 450\n', encoding='utf-8')
+
+    consistent = report_full._encut_methodology_text([a, b])
+    assert 'ENCUT = 450 eV 一致' in consistent
+    assert '已核验 2 个成员' in consistent
+
+    (b / 'INCAR').write_text('ENCUT = 520\n', encoding='utf-8')
+    mismatch = report_full._encut_methodology_text([a, b])
+    assert 'ENCUT 不一致(450、520 eV)' in mismatch
+    assert '不应直接比较' in mismatch
+
+    incomplete = report_full._encut_methodology_text([a, missing])
+    assert 'ENCUT 核验不完整:1/2' in incomplete
+    assert '不宣称基组一致' in incomplete
+
+
 def test_generate_report_origin_ok_and_ai_ok(tmp_path):
     p = _proj(tmp_path)
 
@@ -123,6 +144,7 @@ def _proj_repro(tmp_path):
     mm.set_state(ms, 'DONE')
     ms['results'] = {'energy_e0_eV': -90.0}
     mm.save_manifest(slab, ms)
+    (slab / 'INCAR').write_text('ENCUT = 450\nEDIFF = 1E-5\n', encoding='utf-8')
     return {'name': 'reproj', 'root': str(tmp_path),
             'members': {'clean_slab': str(slab), 'gas_ref': None, 'configs': dirs}}
 
@@ -151,7 +173,7 @@ def test_report_annotates_continuation_rounds(tmp_path):
 def test_report_methodology_fixed_sentences(tmp_path):
     h = _gen_repro(tmp_path)
     assert 'BSSE' in h                                    # 平面波基组无 BSSE
-    assert 'ENCUT' in h and '基组一致' in h                # 项目内 ENCUT 一致
+    assert 'ENCUT = 450 eV 一致' in h                      # 逐成员真实 INCAR 核验
     assert '真空盒尺寸' in h                               # 气相参考盒尺寸见输入文件
 
 
@@ -166,3 +188,77 @@ def test_structure_gallery_embeds_existing_renders(tmp_path):
         ai_analyze=lambda payload: {'ok': False, 'error': 'skip'})
     h = out.read_text(encoding='utf-8')
     assert '结构图(POV-Ray)' in h and 'x_top.png' in h
+
+
+def _generate_with_molecule_source(monkeypatch, tmp_path, project_dir, config_dir):
+    """生成报告并捕获 freeenergy 真正收到的分子库目录。"""
+    p = _proj(tmp_path)
+    if project_dir is not None:
+        p['molecules_dir'] = str(project_dir)
+    called = {}
+
+    def fake_path(rows, e_slab, molecules_dir, *, g_corr=None, mu_li=None,
+                  managed_dirs=None, project=None):
+        called['molecules_dir'] = molecules_dir
+        called['managed_dirs'] = list(managed_dirs or [])
+        called['project'] = project
+        return None
+
+    monkeypatch.setattr(report_full.freeenergy, 'path_from_project_and_molecules', fake_path)
+    logs = []
+    report_full.generate_project_report(
+        p, tmp_path / 'molecule-source.html',
+        config={'lis_molecules_dir': str(config_dir) if config_dir is not None else ''},
+        origin_render=lambda *a, **k: {'ok': False, 'images': {}, 'error': ''},
+        ai_analyze=lambda payload: {'ok': False, 'error': 'skip'}, log=logs.append)
+    assert called.get('project') is p
+    return called.get('molecules_dir'), logs
+
+
+def test_report_prefers_imported_project_molecules_dir(monkeypatch, tmp_path):
+    project_dir = tmp_path / 'imported-molecules'
+    config_dir = tmp_path / 'configured-molecules'
+    project_dir.mkdir()
+    config_dir.mkdir()
+
+    used, logs = _generate_with_molecule_source(
+        monkeypatch, tmp_path, project_dir, config_dir)
+
+    assert used == str(project_dir)
+    assert not any('回退全局配置' in line for line in logs)
+
+
+def test_report_falls_back_when_project_molecules_dir_missing(monkeypatch, tmp_path):
+    missing_project_dir = tmp_path / 'moved-imported-molecules'
+    config_dir = tmp_path / 'configured-molecules'
+    config_dir.mkdir()
+
+    used, logs = _generate_with_molecule_source(
+        monkeypatch, tmp_path, missing_project_dir, config_dir)
+
+    assert used == str(config_dir)
+    assert any('回退全局配置' in line for line in logs)
+
+
+def test_report_logs_unverified_legacy_molecule_method_warning(monkeypatch, tmp_path):
+    molecules = tmp_path / 'legacy-molecules'
+    molecules.mkdir()
+    warning = '旧式非受管分子目录没有方法指纹，无法核验'
+    monkeypatch.setattr(
+        report_full.freeenergy, 'path_from_project_and_molecules',
+        lambda *args, **kwargs: {'warnings': [warning]})
+    logs = []
+    fed = report_full._try_fed(
+        {'slab': ('DONE', -10.0), 'rows': []},
+        {'lis_molecules_dir': str(molecules)}, logs.append, proj={'members': {}})
+    assert fed is not None
+    assert any(warning in line for line in logs)
+
+
+def test_member_dirs_include_species_reference_jobs_once():
+    project = {'members': {
+        'clean_slab': '/s', 'gas_ref': None, 'configs': ['/c'],
+        'molecules': {'S8': '/m/S8'},
+    }, 'species_ref_jobs': {'S8': '/m/S8', 'Li2S': '/m/Li2S'}}
+
+    assert report_full._member_dirs(project) == ['/s', '/c', '/m/S8', '/m/Li2S']

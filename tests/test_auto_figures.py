@@ -180,6 +180,34 @@ def test_analyze_no_data_marks_unavailable():
     assert not avail['has_ladder']
 
 
+def test_analyze_lis_forwards_managed_molecule_dirs(monkeypatch, tmp_path):
+    """自动出图也必须让受管参考态走 job.yaml DONE 门控。"""
+    from vcstudio.project import freeenergy
+
+    seen = {}
+
+    def _path(rows, e_slab, molecules_dir, *, managed_dirs=None, **kwargs):
+        seen['managed_dirs'] = list(managed_dirs or [])
+        seen['project'] = kwargs.get('project')
+        return {'steps': [{'label': 'S8*', 'G': 0.0},
+                          {'label': 'Li2S8*', 'G': -0.5}],
+                'pds_index': 0, 'u_l': 0.25,
+                'warnings': ['旧式非受管分子目录无法核验方法']}
+
+    monkeypatch.setattr(freeenergy, 'path_from_project_and_molecules', _path)
+    reference = str(tmp_path / 'mol_S8')
+    project = {'name': 'CoO', 'members': {},
+               'species_ref_jobs': {'S8': reference}}
+
+    avail = af.analyze_project(
+        project, 'lis', adsorption_mod=_FakeAds, molecules_dir=str(tmp_path))
+
+    assert avail['has_ladder'] is True
+    assert seen['managed_dirs'] == [reference]
+    assert seen['project'] is project
+    assert any('无法核验方法' in warning for warning in avail['warnings'])
+
+
 # ── run_auto_figures 全链 ─────────────────────────────────────────────────────
 
 def test_run_auto_figures_full_pipeline(tmp_path):

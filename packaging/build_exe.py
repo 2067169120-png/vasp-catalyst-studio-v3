@@ -1,22 +1,26 @@
-"""一键打包:PyInstaller 出单文件、无控制台窗口的 EXE 到 <repo>/dist/。
+"""Build a self-contained Windows executable with PyInstaller.
 
-用法:
-  python packaging/build_exe.py            # 新 pywebview 入口 → 'VASP Catalyst Studio'(默认)
-  python packaging/build_exe.py --web      # 同上,无参默认的别名(保留肌肉记忆)
-  python packaging/build_exe.py --legacy   # 旧 tkinter 入口 → 'VASP Catalyst Studio Legacy'
-  python packaging/build_exe.py --no-charts  # 不打包 matplotlib/numpy(EXE 更小,原生出图不可用)
+The executable cannot install Python packages into itself after it is frozen.  Optional
+features therefore have to be selected *when the executable is built*:
 
-不手写 .spec(PyInstaller 6.x 的 spec 语法版本脆弱,EXE(onefile=True) 并非合法参数),
-改用稳定的 CLI flags:--onefile --windowed。产物落仓库根 dist/,工作目录 build/,
-与 .gitignore 的 build/ dist/ 对齐。keyring 后端是动态加载,用 --collect-submodules 收全。
-默认(web)分支额外带入 gui_web/assets(目录名须与 resources.asset_dir 的 frozen 分支
-'vcstudio_assets' 严格一致)并 --collect-all webview 收全 pywebview 的 clr-loader/bottle/js 资源。
+``python packaging/build_exe.py``
+    Build the normal, full Web executable.  Charts (matplotlib/numpy) and molecular
+    editing (RDKit) are required and explicitly collected.  A missing prerequisite is
+    a build error; the script never silently emits a feature-incomplete executable.
 
-出图引擎(2026-07-16):默认把 matplotlib/numpy 打进 EXE(原生论文级出图,项目页
-「论文级出图」卡片依赖);--collect-data matplotlib 收 mpl-data(字体/色图/rc,缺了
-import 即崩)。嫌大用 --no-charts 恢复旧瘦身行为(出图按钮会提示未安装可选依赖)。
-pythonnet(clr)/paramiko 链按环境条件收集:装了才加 flag,防在未装机器上打包报错。
-中文注释允许,英文标识符。
+``python packaging/build_exe.py --lite``
+    Build a deliberately small executable without charts, numpy or RDKit.  The former
+    ``--no-charts`` spelling remains an alias for this profile.
+
+``python packaging/build_exe.py --with-decimer``
+    Experimental opt-in for DECIMER/TensorFlow code.  DECIMER model weights may still
+    be downloaded by that dependency on first use, so this profile is not advertised as
+    a fully offline OCSR bundle.  It is excluded by default because it can make a
+    one-file executable extremely large.
+
+``--web`` remains a no-op alias for the default Web entry and ``--legacy`` selects the
+old tkinter entry.  CLI flags are used instead of a hand-written spec so the recipe
+stays compatible with PyInstaller 6.x.
 """
 from __future__ import annotations
 
@@ -24,6 +28,8 @@ import importlib.util
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
+from typing import Sequence
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -32,60 +38,208 @@ WEB_ENTRY = os.path.join(ROOT, 'vcstudio', 'gui_web', '__main__.py')
 WEB_ASSETS = os.path.join(ROOT, 'vcstudio', 'gui_web', 'assets')
 CONFIG_EXAMPLE = os.path.join(ROOT, 'config.example.yaml')
 
-# 无关重包始终排除;matplotlib/numpy 由 --no-charts 决定(见 main)
-EXCLUDES_ALWAYS = ['sklearn', 'scipy', 'PIL', 'pandas', 'pytest']
+# These packages are not used by the shipped application.  Keeping the exclusions
+# profile-independent also prevents an unrelated package in the build environment from
+# unexpectedly inflating the executable.
+EXCLUDES_ALWAYS = ('sklearn', 'scipy', 'pandas', 'pytest')
+EXCLUDES_LITE = ('numpy', 'matplotlib', 'rdkit', 'PIL')
+EXCLUDES_DECIMER = ('DECIMER', 'decimer', 'tensorflow', 'keras')
+
+# (import name, human-facing package name).  Core dependencies are required even for
+# the lite build: otherwise the executable starts but cluster/config/keyring features
+# fail later, which is exactly the partial-build failure this preflight prevents.
+CORE_REQUIREMENTS = (
+    ('PyInstaller', 'pyinstaller'),
+    ('yaml', 'PyYAML'),
+    ('paramiko', 'paramiko'),
+    ('keyring', 'keyring'),
+)
+WEB_REQUIREMENTS = (('webview', 'pywebview'),)
+FULL_REQUIREMENTS = (
+    ('matplotlib', 'matplotlib'),
+    ('numpy', 'numpy'),
+    ('rdkit', 'rdkit'),
+)
+DECIMER_REQUIREMENTS = (
+    ('DECIMER', 'decimer'),
+    ('tensorflow', 'tensorflow'),
+)
+
+
+class BuildConfigurationError(RuntimeError):
+    """The requested build cannot safely be produced in this environment."""
+
+
+@dataclass(frozen=True)
+class BuildOptions:
+    legacy: bool = False
+    lite: bool = False
+    with_decimer: bool = False
 
 
 def _has(mod: str) -> bool:
-    """本机装了该包才加对应 collect flag(PyInstaller 对未安装包直接报错)。"""
-    return importlib.util.find_spec(mod) is not None
+    """Return whether *mod* can be discovered without importing a heavy package."""
+    try:
+        return importlib.util.find_spec(mod) is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        return False
 
 
-def main() -> int:
-    # 无参 = web(默认);--web 保留为默认别名不破坏肌肉记忆;--legacy = 旧 tkinter 兜底
-    args = sys.argv[1:]
-    legacy = '--legacy' in args
-    no_charts = '--no-charts' in args
-    name = 'VASP Catalyst Studio Legacy' if legacy else 'VASP Catalyst Studio'
-    cmd = [sys.executable, '-m', 'PyInstaller',
-           '--onefile', '--windowed', '--clean', '--noconfirm',
-           '--name', name,
-           '--collect-submodules', 'keyring.backends',
-           '--paths', ROOT,
-           '--distpath', os.path.join(ROOT, 'dist'),
-           '--workpath', os.path.join(ROOT, 'build'),
-           '--specpath', os.path.join(ROOT, 'build')]
+def _parse_args(args: Sequence[str]) -> BuildOptions:
+    known = {'--web', '--legacy', '--full', '--lite', '--no-charts', '--with-decimer'}
+    unknown = [arg for arg in args if arg not in known]
+    if unknown:
+        raise BuildConfigurationError(f"未知参数: {' '.join(unknown)}")
+    if '--web' in args and '--legacy' in args:
+        raise BuildConfigurationError('--web 与 --legacy 不能同时使用')
+
+    lite = '--lite' in args or '--no-charts' in args
+    if '--full' in args and lite:
+        raise BuildConfigurationError('--full 与 --lite/--no-charts 不能同时使用')
+    if lite and '--with-decimer' in args:
+        raise BuildConfigurationError('--with-decimer 只支持完整版构建，不能与 --lite 同时使用')
+    return BuildOptions(
+        legacy='--legacy' in args,
+        lite=lite,
+        with_decimer='--with-decimer' in args,
+    )
+
+
+def _requirements(options: BuildOptions) -> tuple[tuple[str, str], ...]:
+    required = list(CORE_REQUIREMENTS)
+    if not options.legacy:
+        required.extend(WEB_REQUIREMENTS)
+    if not options.lite:
+        required.extend(FULL_REQUIREMENTS)
+    if options.with_decimer:
+        required.extend(DECIMER_REQUIREMENTS)
+    return tuple(required)
+
+
+def _install_hint(options: BuildOptions) -> str:
+    extras = ['packaging']
+    if not options.legacy:
+        extras.append('gui')
+    if not options.lite:
+        extras.extend(('charts', 'mol'))
+    if options.with_decimer:
+        extras.append('ocsr')
+    joined = ','.join(extras)
+    return f'{sys.executable} -m pip install -e ".[{joined}]"'
+
+
+def _preflight(options: BuildOptions) -> None:
+    missing = [label for mod, label in _requirements(options) if not _has(mod)]
+    if missing:
+        profile = '轻量版' if options.lite else '完整版'
+        detail = '、'.join(missing)
+        hint = _install_hint(options)
+        lite_hint = '' if options.lite else (
+            '\n若确实不需要论文出图和分子编辑，可显式构建轻量版:'
+            '\n  python packaging/build_exe.py --lite'
+        )
+        raise BuildConfigurationError(
+            f'{profile} EXE 缺少关键构建依赖: {detail}\n'
+            f'请先在当前构建 Python 中安装完整依赖:\n  {hint}'
+            f'{lite_hint}\n'
+            '冻结 EXE 运行后不能再通过 pip 为自身补装这些模块。'
+        )
+
+    required_paths = [ENTRY if options.legacy else WEB_ENTRY]
+    if not options.legacy:
+        required_paths.append(WEB_ASSETS)
+    missing_paths = [path for path in required_paths if not os.path.exists(path)]
+    if missing_paths:
+        raise BuildConfigurationError(
+            '构建输入缺失，请从完整仓库运行脚本: ' + '、'.join(missing_paths)
+        )
+
+
+def build_command(args: Sequence[str] = ()) -> tuple[list[str], BuildOptions]:
+    """Validate *args* and return the deterministic PyInstaller command.
+
+    Keeping command construction separate from :func:`main` makes the packaging policy
+    testable without launching a costly PyInstaller build.
+    """
+    options = _parse_args(args)
+    _preflight(options)
+
+    name = 'VASP Catalyst Studio Legacy' if options.legacy else 'VASP Catalyst Studio'
+    cmd = [
+        sys.executable, '-m', 'PyInstaller',
+        '--onefile', '--windowed', '--clean', '--noconfirm',
+        '--name', name,
+        '--collect-submodules', 'keyring.backends',
+        '--paths', ROOT,
+        '--distpath', os.path.join(ROOT, 'dist'),
+        '--workpath', os.path.join(ROOT, 'build'),
+        '--specpath', os.path.join(ROOT, 'build'),
+    ]
 
     excludes = list(EXCLUDES_ALWAYS)
-    if no_charts or not _has('matplotlib'):
-        # 未装/显式关闭 → 维持旧瘦身行为;GUI 出图按钮会提示"未安装可选依赖"
-        excludes += ['numpy', 'matplotlib']
-        if not no_charts:
-            print('提示:本机未安装 matplotlib,EXE 将不含原生出图引擎'
-                  '(pip install matplotlib numpy 后重打包即可启用)')
+    if options.lite:
+        excludes.extend(EXCLUDES_LITE)
     else:
-        # 原生出图进包:mpl-data(字体/色图/matplotlibrc)必须显式收,缺了 import 即崩
-        cmd += ['--collect-data', 'matplotlib']
-    for m in excludes:
-        cmd += ['--exclude-module', m]
+        # Matplotlib's fonts/style data and RDKit's shared libraries/data files are both
+        # dynamically discovered.  PyInstaller's static import scan alone is insufficient.
+        cmd += ['--collect-all', 'matplotlib']
+        cmd += ['--collect-binaries', 'numpy']
+        cmd += ['--collect-all', 'rdkit']
 
-    # SSH 链(paramiko→cryptography/bcrypt/nacl 有编译后端,自动分析偶有缺口):
-    # 干净 Windows 上"连集群即 ImportError"的主凶,装了就显式收全
-    if _has('paramiko'):
-        cmd += ['--collect-submodules', 'paramiko']
+    if options.with_decimer:
+        cmd += ['--collect-all', 'DECIMER']
+        cmd += ['--collect-all', 'tensorflow']
+    else:
+        excludes.extend(EXCLUDES_DECIMER)
+
+    for mod in excludes:
+        cmd += ['--exclude-module', mod]
+
+    # Paramiko and pynacl load cryptographic backends dynamically.  Paramiko is a core
+    # prerequisite; pynacl remains conditional because Paramiko can use other backends.
+    cmd += ['--collect-submodules', 'paramiko']
     if _has('nacl'):
         cmd += ['--collect-all', 'nacl']
 
-    if not legacy:
+    if not options.legacy:
         cmd += ['--add-data', WEB_ASSETS + os.pathsep + 'vcstudio_assets']
-        if os.path.isfile(CONFIG_EXAMPLE):   # 配置模板随包,首启可自取
+        if os.path.isfile(CONFIG_EXAMPLE):
             cmd += ['--add-data', CONFIG_EXAMPLE + os.pathsep + '.']
         cmd += ['--collect-all', 'webview']
-        # pywebview 的 EdgeChromium 后端跑在 pythonnet(clr)上;不收全则窗口起不来
+        # The EdgeChromium backend uses pythonnet on Windows.  It is a platform-specific
+        # pywebview dependency, so collect it when the selected build environment has it.
         if _has('pythonnet') or _has('clr'):
             cmd += ['--collect-all', 'pythonnet']
-    cmd.append(ENTRY if legacy else WEB_ENTRY)
-    print('运行:', ' '.join(cmd))
+
+    cmd.append(ENTRY if options.legacy else WEB_ENTRY)
+    return cmd, options
+
+
+def _usage() -> str:
+    return (
+        '用法: python packaging/build_exe.py '
+        '[--web|--legacy] [--full|--lite|--no-charts] [--with-decimer]\n'
+        '默认构建完整版 Web EXE（charts + RDKit，不含 DECIMER）。\n'
+        '--lite / --no-charts 构建明确缺少出图和分子编辑能力的轻量版。\n'
+        '--with-decimer 为实验性选项，模型权重仍可能在首次使用时下载。'
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if '--help' in args or '-h' in args:
+        print(_usage())
+        return 0
+    try:
+        cmd, options = build_command(args)
+    except BuildConfigurationError as exc:
+        print(f'构建前检查失败:\n{exc}', file=sys.stderr)
+        return 2
+
+    profile = '轻量版' if options.lite else '完整版'
+    decimer = '，含 DECIMER' if options.with_decimer else '，不含 DECIMER'
+    print(f'构建配置: {profile}{decimer}')
+    print('运行:', subprocess.list2cmdline(cmd))
     return subprocess.call(cmd, cwd=ROOT)
 
 
