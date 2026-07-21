@@ -1271,8 +1271,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <div class="pj-h acc-h">开始新的 Li-S 吸附计算（生成、提交、续算、下载、报告一站完成）</div>
 
       <div class="lis-intro">
-        <b>你只需准备：</b>已经导入的 Li-S 化合物能量，以及每个 clean/adsorption 文件夹各自的 POSCAR 和 INCAR。
-        选好服务器、核数和墙时后，软件接管后续流程。
+        <b>你只需准备：</b>已经导入的 Li-S 化合物能量，以及每个 clean/adsorption 文件夹自己的输入。
+        完整 POSCAR/INCAR/KPOINTS/POTCAR 会原样绑定；不完整目录按本目录 POSCAR+INCAR 生成受管四件套，源目录不改。
       </div>
 
       <div class="lis-step" data-lis-step="1">
@@ -1292,10 +1292,10 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <div class="lis-step" data-lis-step="2">
         <div class="lis-step-no">2</div>
         <div class="lis-step-body">
-          <button class="lis-step-title" type="button" data-lis-open-step="2">放入这次计算的输入 <span>每个作业读取自己目录里的 INCAR</span></button>
+          <button class="lis-step-title" type="button" data-lis-open-step="2">放入这次计算的输入 <span>逐成员识别并绑定各自四件套</span></button>
           <div class="lis-bundle-import">
             <button class="btn primary" type="button" id="lis-input-dir">导入本次计算文件夹（推荐）</button>
-            <span>一次识别 clean slab、全部 adsorption 结构及各自同目录 INCAR；缺失或冲突会精确指出成员。</span>
+            <span>一次识别 clean slab、全部 adsorption 结构及各自四件套；完整组原样使用，不完整组按本目录 POSCAR+INCAR 生成受管四件套。</span>
           </div>
           <div class="lis-scan-status" id="lis-bundle-status" hidden aria-live="polite"></div>
           <div class="lis-input-grid">
@@ -1375,13 +1375,12 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       </div>
       <div class="lis-method-check" id="lis-method-check" hidden aria-live="polite">
         <div class="lis-method-title" id="lis-method-title"></div>
-        <ul id="lis-method-reasons"></ul>
-        <label class="lis-method-confirm"><input type="checkbox" id="lis-method-confirm">
-          我已核对上述方法差异或证据缺项；若涉及 ISPIN，已确认各体系采用了正确的基态自旋设置；这些能量可用于本次吸附能比较</label>
-        <label class="lis-method-reason-label">确认理由（必填）
-          <textarea class="ipt" id="lis-method-reason" rows="2"
-            placeholder="例如：Li2S8 已经 ISPIN=2 多初态对照验证为非磁闭壳层，参考能用 ISPIN=1；磁性基底、clean slab 与吸附构型统一用 ISPIN=2"></textarea>
-        </label>
+        <div class="lis-method-outcome" id="lis-method-outcome"></div>
+        <div class="lis-method-section" id="lis-method-issues" hidden></div>
+        <div class="lis-method-section" id="lis-method-notes" hidden></div>
+        <div class="lis-method-section" id="lis-method-warnings" hidden></div>
+        <div class="lis-method-section" id="lis-method-repairs" hidden></div>
+        <div class="lis-repair-actions" id="lis-repair-actions" hidden></div>
       </div>
       <div class="lis-readiness" id="lis-readiness" aria-live="polite">按 1–4 步补齐信息后即可整组提交。</div>
       <div class="actions lis-actions">
@@ -1391,7 +1390,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 
       <details class="lis-legacy">
         <summary>专家：按当前逐目录输入只生成作业，不提交</summary>
-        <p class="sub">复用上方参考能、物种映射和逐成员 INCAR 检查；不会调用旧的共享 INCAR 生成入口。</p>
+        <p class="sub">复用上方参考能、物种映射和逐成员四件套检查；完整组原样绑定，不完整组按本目录 POSCAR+INCAR 生成受管四件套。</p>
         <button class="btn" type="button" id="pj-create">只生成当前逐目录作业，不提交</button>
       </details>
     </div>

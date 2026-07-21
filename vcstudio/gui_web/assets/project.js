@@ -12,8 +12,11 @@
   const State = {
     configs: [],      // 构型 POSCAR 路径列表(逐个添加)
     configSpecies: Object.create(null), // path -> Li-S 物种
-    configSpeciesMeta: Object.create(null), // path -> 物种来源/置信度/逐目录 INCAR/是否已确认
-    cleanIncar: { path: '', sha256: '', status: 'missing', source: '', issues: [] },
+    configSpeciesMeta: Object.create(null), // path -> 物种来源/置信度/逐目录四件套/是否已确认
+    cleanIncar: {
+      path: '', sha256: '', status: 'missing', source: '', issues: [],
+      quartet: null, inputMode: '', quartetStatus: '',
+    },
     projects: [],     // proj_list 返回:[{path,name,n_members}]
     profiles: [],     // list_profiles 返回；一站式提交资源选择
     importRows: [],   // 本地结果扫描候选(前端只持有修正值;commit 时后端会重新验证)
@@ -22,7 +25,9 @@
     preparedConflictHint: null,
     methodCheck: null,
     methodCheckFingerprint: '',
-    needsMethodConfirmation: false,
+    repairPlan: null,
+    repairDecision: null, // {plan_id,mode:'keep'|'apply'}；仅作用于受管项目副本
+    repairResume: 'submit',
     workflowPendingSubmit: false,
     workflowSubmitted: false,
     workflowAnalysisReady: false,
@@ -40,7 +45,7 @@
     'pj-slab', 'pj-slab-btn', 'pj-cfg-add', 'pj-cfg-dir',
     'lis-bulk-species', 'lis-apply-species', 'lis-only-unmatched',
     'pj-name', 'pj-root', 'pj-root-btn', 'lis-profile', 'lis-cores',
-    'lis-walltime', 'lis-method-confirm', 'lis-method-reason', 'pj-create',
+    'lis-walltime', 'pj-create',
   ];
 
   function lisInputsLocked() {
@@ -947,6 +952,9 @@
         incar_sha256: String(meta.incarSha256 || ''),
         incar_status: String(meta.incarStatus || (meta.incarPath ? 'ready' : 'missing')),
         incar_issues: textList(meta.incarIssues),
+        quartet: meta.quartet && typeof meta.quartet === 'object' ? meta.quartet : null,
+        input_mode: String(meta.inputMode || ''),
+        quartet_status: String(meta.quartetStatus || ''),
       };
     });
   }
@@ -964,63 +972,143 @@
       ? State.preparedLis : null;
   }
 
-  function methodConfirmationPayload() {
-    return {
-      confirmed: !!($('lis-method-confirm') && $('lis-method-confirm').checked),
-      reason: val('lis-method-reason'),
-    };
-  }
-
-  function methodCheckStatus(check) {
-    const value = String(check && (check.status || check.state || check.result) || '').toLowerCase();
-    if (['incompatible', 'blocked', 'fail', 'failed'].includes(value)) return 'incompatible';
+  function methodComparabilityStatus(check) {
+    const value = String(check && (check.comparability_status || check.status ||
+      check.state || check.result) || '').toLowerCase();
+    if (['incompatible', 'analysis_blocked', 'not_comparable'].includes(value)) return 'incompatible';
     if (['unverified', 'unknown', 'needs_confirmation', 'review'].includes(value)) return 'unverified';
-    if (['compatible', 'verified', 'pass', 'passed', 'ok'].includes(value)) return 'compatible';
-    return '';
+    if (['compatible', 'verified', 'pass', 'passed', 'ok', 'advisory',
+      'compatible_with_advisory'].includes(value)) return 'verified';
+    return check ? 'unverified' : '';
   }
 
-  function renderMethodCheck(check, needsConfirmation, confirmedAccepted) {
+  function methodExecutionStatus(check) {
+    const value = String(check && check.execution_status || '').toLowerCase();
+    return value === 'blocked' ? 'blocked' : 'ready';
+  }
+
+  function renderMethodSection(id, title, values, formatter) {
+    const section = $(id);
+    if (!section) return;
+    const rows = (values || []).map(value => formatter ? formatter(value) : String(value || ''))
+      .filter(Boolean);
+    section.hidden = rows.length === 0;
+    section.innerHTML = rows.length
+      ? `<b>${VCS.esc(title)}</b><ul>${rows.map(value => `<li>${VCS.esc(value)}</li>`).join('')}</ul>`
+      : '';
+  }
+
+  function methodRepairText(value) {
+    if (!value || typeof value !== 'object') return String(value || '');
+    const target = [value.member, value.key].filter(Boolean).join(' / ');
+    const change = value.old != null || value.new != null
+      ? `${value.old == null ? '缺失' : value.old} → ${value.new == null ? '已补齐' : value.new}` : '';
+    const reason = textList(value.reason || value.message || value.description).join('；');
+    return [target, change, reason].filter(Boolean).join('：');
+  }
+
+  function renderMethodCheck(check, legacyNeedsReview) {
     const box = $('lis-method-check');
     if (!box) return;
-    if (!check && needsConfirmation) {
-      check = { status: 'unverified', reasons: ['后端要求人工确认，但未提供完整的方法比较明细'] };
+    if (!check && legacyNeedsReview) {
+      check = {
+        execution_status: 'ready', comparability_status: 'unverified',
+        warnings: ['方法可比性证据尚未完整；作业可提交，自动 ΔE 与最终报告暂停'],
+      };
     }
     const fingerprint = lisContentFingerprint();
-    const isNewCheck = !!check && State.methodCheckFingerprint !== fingerprint;
     State.methodCheck = check || null;
     State.methodCheckFingerprint = check ? fingerprint : '';
-    if (isNewCheck && !confirmedAccepted) {
-      const confirm = $('lis-method-confirm');
-      const reason = $('lis-method-reason');
-      if (confirm) confirm.checked = false;
-      if (reason) reason.value = '';
-    }
-    State.needsMethodConfirmation = !!needsConfirmation ||
-      (methodCheckStatus(check) === 'unverified' && !confirmedAccepted);
-    const status = methodCheckStatus(check);
-    if (!check || status === 'compatible') {
+    State.repairPlan = check && check.repair_plan || null;
+    const executionStatus = methodExecutionStatus(check);
+    const comparabilityStatus = methodComparabilityStatus(check);
+    const issues = [...new Set(textList(check && check.issues))];
+    const notes = [...new Set(textList(check && [check.notes, check.advisories]))];
+    const warnings = [...new Set(textList(check && check.warnings))];
+    const repairs = check && Array.isArray(check.repairs) ? check.repairs : [];
+    const hasDetails = issues.length || notes.length || warnings.length || repairs.length ||
+      !!(check && check.repair_plan);
+    if (!check || (comparabilityStatus === 'verified' && executionStatus === 'ready' && !hasDetails)) {
       box.hidden = true;
       box.className = 'lis-method-check';
+      renderRepairPlan(null);
       updateLisReadiness();
       return;
     }
-    const reasons = [
-      ...textList(check.issues), ...textList(check.reasons), ...textList(check.warnings),
-      ...textList(check.details), ...textList(check.summary),
-    ];
     box.hidden = false;
-    box.className = 'lis-method-check ' + (status === 'incompatible' ? 'bad' : 'warn');
+    box.className = 'lis-method-check ' + (executionStatus === 'blocked' ? 'bad' :
+      comparabilityStatus === 'verified' ? 'ok' : 'analysis');
     const title = $('lis-method-title');
-    if (title) title.textContent = status === 'incompatible'
-      ? '计算方法不兼容，已阻止提交'
-      : '参考能与新任务存在需要人工核对的方法差异或证据缺项';
-    const list = $('lis-method-reasons');
-    if (list) list.innerHTML = (reasons.length ? reasons : ['缺少足够的方法元数据，不能自动证明能量可直接比较'])
-      .map(item => `<li>${VCS.esc(item)}</li>`).join('');
-    box.querySelectorAll('.lis-method-confirm,.lis-method-reason-label').forEach(el => {
-      el.hidden = status === 'incompatible';
-    });
+    if (title) title.textContent = executionStatus === 'blocked'
+      ? '输入执行检查未通过'
+      : comparabilityStatus === 'incompatible'
+        ? '作业可提交；方法不一致会暂停自动 ΔE 与最终报告'
+        : comparabilityStatus === 'unverified'
+          ? '作业可提交；方法证据待核验'
+          : '作业可提交；方法可比性已核验';
+    const outcome = $('lis-method-outcome');
+    if (outcome) {
+      const submitText = executionStatus === 'blocked'
+        ? '作业生成 / 提交：已阻止'
+        : '作业生成 / 提交：可继续';
+      const analysisText = executionStatus === 'blocked'
+        ? '自动 ΔE / 最终报告：尚未运行，请先修正本目录输入'
+        : comparabilityStatus === 'verified'
+          ? '自动 ΔE / 最终报告：可继续'
+          : comparabilityStatus === 'incompatible'
+            ? '自动 ΔE / 最终报告：已暂停，需重算或修正方法差异'
+            : '自动 ΔE / 最终报告：待补齐证据后继续';
+      outcome.innerHTML = `<span>${VCS.esc(submitText)}</span><span>${VCS.esc(analysisText)}</span>`;
+    }
+    renderMethodSection('lis-method-issues', '影响 ΔE / 报告的问题（不阻止作业提交）', issues);
+    renderMethodSection('lis-method-notes', '体系说明（包括 ISPIN）', notes);
+    renderMethodSection('lis-method-warnings', '需留意', warnings);
+    renderMethodSection('lis-method-repairs', '已在受管副本安全修复（源文件未改）', repairs,
+      methodRepairText);
+    renderRepairPlan(check && check.repair_plan);
     updateLisReadiness();
+  }
+
+  function renderRepairPlan(plan) {
+    const box = $('lis-repair-actions');
+    if (!box) return;
+    const actions = plan && Array.isArray(plan.actions) ? plan.actions : [];
+    const suggestions = plan && Array.isArray(plan.suggestions) ? plan.suggestions : [];
+    const rows = [...actions, ...suggestions];
+    if (!rows.length) { box.hidden = true; box.innerHTML = ''; return; }
+    const safeActions = actions.filter(action => String(action && action.risk || '').toLowerCase() === 'low');
+    const reviewActions = [
+      ...actions.filter(action => String(action && action.risk || '').toLowerCase() !== 'low'),
+      ...suggestions,
+    ];
+    const current = State.repairDecision && State.repairDecision.plan_id === plan.plan_id
+      ? State.repairDecision.mode : '';
+    box.hidden = false;
+    box.innerHTML = '<div class="lis-repair-title"><b>智能修复预览</b>' +
+      '<span>只有低风险项可自动写入受管副本；源目录四件套保持原字节不变。' +
+      (reviewActions.length ? ' MAGMOM、ISPIN 等科学选择只给建议，不自动改。' : '') + '</span></div>' +
+      '<table><thead><tr><th>成员</th><th>参数</th><th>原值</th><th>建议值</th><th>处理</th><th>原因</th></tr></thead><tbody>' +
+      rows.map(action => `<tr><td>${VCS.esc(action.member || '')}</td>` +
+        `<td>${VCS.esc(action.key || '')}</td><td>${VCS.esc(action.old == null ? '缺失' : action.old)}</td>` +
+        `<td>${VCS.esc(action.new)}</td><td>${String(action.risk || '').toLowerCase() === 'low'
+          ? '低风险，可修复副本' : '仅建议，不自动'}</td>` +
+        `<td>${VCS.esc(action.reason || '')}</td></tr>`).join('') +
+      '</tbody></table><div class="actions">' +
+      (safeActions.length
+        ? `<button class="btn primary" type="button" data-lis-repair="apply"${current === 'apply' ? ' disabled' : ''}>仅修复 ${safeActions.length} 个低风险副本项并继续</button>` +
+          `<button class="btn" type="button" data-lis-repair="keep"${current === 'keep' ? ' disabled' : ''}>保持各目录原样继续</button>`
+        : '<span class="sub">这些是科学设置建议，不会自动修改，也不阻止提交。</span>') +
+      '</div>';
+    box.querySelectorAll('[data-lis-repair]').forEach(button => {
+      button.addEventListener('click', () => {
+        State.repairDecision = { plan_id: plan.plan_id, mode: button.dataset.lisRepair };
+        VCS.log(button.dataset.lisRepair === 'apply'
+          ? '已确认：仅低风险项修复到受管项目副本；MAGMOM/ISPIN 只建议，源目录不改'
+          : '已确认：保持每个目录的原始四件套提交；最终 ΔE 仍受方法门禁约束', 'warnc');
+        const resume = $(State.repairResume === 'create' ? 'pj-create' : 'pj-submit-all');
+        if (resume && !resume.disabled) resume.click();
+      });
+    });
   }
 
   function invalidatePreparedLis() {
@@ -1029,13 +1117,10 @@
     if (State.methodCheck && State.methodCheckFingerprint !== fingerprint) {
       State.methodCheck = null;
       State.methodCheckFingerprint = '';
-      State.needsMethodConfirmation = false;
+      State.repairPlan = null;
+      State.repairDecision = null;
       const methodBox = $('lis-method-check');
       if (methodBox) methodBox.hidden = true;
-      const confirm = $('lis-method-confirm');
-      const reason = $('lis-method-reason');
-      if (confirm) confirm.checked = false;
-      if (reason) reason.value = '';
     }
     if (!prepared || prepared.fingerprint === fingerprint) return;
     State.preparedLis = null;
@@ -1043,7 +1128,8 @@
     State.preparedConflictHint = { oldName: prepared.name, path: prepared.path };
     State.methodCheck = null;
     State.methodCheckFingerprint = '';
-    State.needsMethodConfirmation = false;
+    State.repairPlan = null;
+    State.repairDecision = null;
     const methodBox = $('lis-method-check');
     if (methodBox) methodBox.hidden = true;
     showLisFailure('输入已改变，不能复用刚才生成的项目',
@@ -1071,20 +1157,93 @@
     const box = $('lis-clean-incar-status');
     if (!box) return;
     const local = State.cleanIncar || {};
-    if (local.status === 'ready' && local.path) {
+    const quartet = quartetPresentation(local, val('pj-incar'));
+    if (quartet.hasEvidence) {
+      box.className = `sub lis-quartet ${quartet.blocked ? 'blocked' : quartet.mode === 'copy' ? 'copy' : 'generate'}`;
+      box.innerHTML = quartetHtml(quartet);
+    } else if (local.status === 'ready' && local.path) {
+      box.className = 'sub';
       box.textContent = `将使用同目录 INCAR：${local.path}`;
     } else if (local.status && local.status !== 'missing') {
+      box.className = 'sub';
       box.textContent = `clean slab INCAR 不可用：${textList(local.issues).join('；') || local.status}`;
     } else if (val('pj-incar')) {
+      box.className = 'sub';
       box.textContent = `同目录无 INCAR，将使用你显式选择的备用文件：${val('pj-incar')}`;
     } else {
+      box.className = 'sub';
       box.textContent = 'clean slab 同目录尚未找到 INCAR。';
     }
   }
 
+  const QUARTET_FILES = ['POSCAR', 'INCAR', 'KPOINTS', 'POTCAR'];
+
+  function normaliseQuartet(raw) {
+    const source = raw && typeof raw === 'object' ? raw : {};
+    const quartet = source.quartet && typeof source.quartet === 'object' ? source.quartet : {};
+    const files = quartet.files && typeof quartet.files === 'object' ? quartet.files
+      : source.files && typeof source.files === 'object' ? source.files : {};
+    const mode = String(source.inputMode || source.input_mode || quartet.input_mode ||
+      quartet.mode || source.mode || '').toLowerCase();
+    const status = String(source.quartetStatus || source.quartet_status ||
+      quartet.quartet_status || quartet.status || '').toLowerCase();
+    const missing = textList(quartet.missing || source.missing).map(name => String(name).toUpperCase());
+    const issues = textList(quartet.issues || source.quartet_issues);
+    const hasEvidence = !!(source.quartet || source.inputMode || source.input_mode ||
+      source.quartetStatus || source.quartet_status || Object.keys(files).length || missing.length);
+    return { files, mode, status, missing, issues, hasEvidence };
+  }
+
+  function quartetBlocked(raw) {
+    const quartet = normaliseQuartet(raw);
+    return quartet.mode === 'blocked' || ['blocked', 'invalid'].includes(quartet.status);
+  }
+
+  function quartetPresentation(raw, fallbackIncar) {
+    const quartet = normaliseQuartet(raw);
+    const fileRows = QUARTET_FILES.flatMap(name => {
+      const record = quartet.files[name] || quartet.files[name.toLowerCase()];
+      const path = typeof record === 'string' ? record : record && record.path;
+      return path ? [`${name}：${path}`] : [];
+    });
+    const present = QUARTET_FILES.filter(name => {
+      const record = quartet.files[name] || quartet.files[name.toLowerCase()];
+      return !!(typeof record === 'string' ? record : record && record.path);
+    });
+    const missing = quartet.missing.length ? quartet.missing
+      : QUARTET_FILES.filter(name => !present.includes(name));
+    const copyMode = ['copy', 'copied_quartet', 'verbatim', 'verbatim_quartet'].includes(quartet.mode);
+    const generateMode = ['generate', 'generated', 'smart_generate', 'partial'].includes(quartet.mode) ||
+      (!copyMode && quartet.status === 'partial');
+    const blocked = quartetBlocked(raw);
+    let summary = '';
+    if (blocked) {
+      summary = `四件套不可提交：${quartet.issues.join('；') || '输入文件无效或冲突'}`;
+    } else if (copyMode) {
+      summary = '完整四件套原样绑定（源文件不改）';
+    } else if (generateMode || quartet.hasEvidence) {
+      const generated = missing.length ? missing.join('、') : '无';
+      summary = `不完整输入（缺 ${generated}）：将以本目录 POSCAR+INCAR 生成受管四件套；源目录不改`;
+    }
+    if (!present.includes('INCAR') && fallbackIncar && !blocked) {
+      fileRows.push(`INCAR 备用：${fallbackIncar}`);
+    }
+    return { ...quartet, blocked, mode: copyMode ? 'copy' : blocked ? 'blocked' : 'generate',
+      summary, details: fileRows };
+  }
+
+  function quartetHtml(quartet) {
+    return `<span class="lis-quartet-summary">${VCS.esc(quartet.summary)}</span>` +
+      quartet.details.map(line => `<span title="${VCS.esc(line)}">${VCS.esc(line)}</span>`).join('');
+  }
+
+  function normaliseLocalPath(value) {
+    const normalised = String(value || '').trim().replace(/\\/g, '/').replace(/\/+$/, '');
+    return /^[A-Za-z]:(?:\/|$)/.test(normalised) ? normalised.toLowerCase() : normalised;
+  }
+
   function sameLocalPath(left, right) {
-    return String(left || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase() ===
-      String(right || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+    return normaliseLocalPath(left) === normaliseLocalPath(right);
   }
 
   function removeConfigPath(path) {
@@ -1101,7 +1260,7 @@
   function appendConfig(path, species, evidence) {
     const clean = String(path || '').trim();
     if (!clean) return false;
-    if (State.configs.includes(clean)) return false;
+    if (State.configs.some(item => sameLocalPath(item, clean))) return false;
     const raw = evidence && typeof evidence === 'object' ? evidence : {};
     const assignment = raw.assignment && typeof raw.assignment === 'object' ? raw.assignment : {};
     const guessed = guessSpeciesEvidence(clean, species);
@@ -1111,6 +1270,11 @@
     const incarPath = String(raw.incar_path || raw.incar || '').trim();
     const incarSha256 = String(raw.incar_sha256 || '').trim();
     const incarStatus = String(raw.incar_status || (incarPath ? 'ready' : 'missing'));
+    const quartet = raw.quartet && typeof raw.quartet === 'object' ? raw.quartet : null;
+    const inputMode = String(raw.input_mode || (quartet && quartet.input_mode) ||
+      (quartet && quartet.mode) || raw.mode || '');
+    const quartetStatus = String(raw.quartet_status || (quartet && quartet.quartet_status) ||
+      (quartet && quartet.status) || '');
     State.configs.push(clean);
     State.configSpecies[clean] = guessed.value;
     State.configSpeciesMeta[clean] = {
@@ -1121,6 +1285,7 @@
       incarPath, incarSha256, incarStatus,
       incarSource: String(raw.incar_source || ''),
       incarIssues: textList(raw.incar_issues),
+      quartet, inputMode, quartetStatus,
     };
     invalidatePreparedLis();
     return true;
@@ -1134,7 +1299,7 @@
     const picked = await VCS.call('pick_dir');
     if (picked && picked.error) {
       VCS.log('选择本次计算文件夹失败:' + picked.error, 'failc');
-      showBundleStatus('bad', '没有选中文件夹。请选择同时包含固定 INCAR、clean slab 和 adsorption 结构的上层目录。');
+      showBundleStatus('bad', '没有选中文件夹。请选择包含 clean slab 与 adsorption 各成员输入的上层目录。');
       return;
     }
     if (!picked || !picked.path) return;
@@ -1145,7 +1310,10 @@
     State.configs = [];
     State.configSpecies = Object.create(null);
     State.configSpeciesMeta = Object.create(null);
-    State.cleanIncar = { path: '', sha256: '', status: 'missing', source: '', issues: [] };
+    State.cleanIncar = {
+      path: '', sha256: '', status: 'missing', source: '', issues: [],
+      quartet: null, inputMode: '', quartetStatus: '',
+    };
     setVal('pj-slab', '');
     setVal('pj-incar', '');
     invalidatePreparedLis();
@@ -1156,7 +1324,7 @@
     updateLisReadiness();
     const button = $('lis-input-dir');
     if (button) { button.disabled = true; button.textContent = '正在识别整套输入…'; }
-    showBundleStatus('', '正在只读扫描各目录 INCAR、clean slab 和 adsorption 结构…');
+    showBundleStatus('', '正在只读扫描 clean slab、adsorption 结构及各自 POSCAR/INCAR/KPOINTS/POTCAR…');
     try {
       const result = await VCS.call(
         'proj_scan_lis_inputs', picked.path, selectedReferenceSpecies());
@@ -1175,12 +1343,23 @@
       setVal('pj-slab', String(result.clean_slab || ''));
       if (result.clean_slab) {
         removeConfigPath(result.clean_slab);
+        const cleanItem = [...(result.structures || []), ...(result.clean_candidates || [])]
+          .find(item => item && sameLocalPath(item.path, result.clean_slab)) || {};
+        const cleanQuartet = result.clean_quartet && typeof result.clean_quartet === 'object'
+          ? result.clean_quartet : cleanItem.quartet || null;
         State.cleanIncar = {
           path: String(result.clean_incar || ''),
           sha256: String(result.clean_incar_sha256 || ''),
           status: String(result.clean_incar_status || (result.clean_incar ? 'ready' : 'missing')),
           source: String(result.clean_incar_source || ''),
           issues: textList(result.clean_incar_issues),
+          quartet: cleanQuartet,
+          inputMode: String(result.clean_input_mode || cleanItem.input_mode ||
+            (cleanQuartet && cleanQuartet.input_mode) ||
+            (cleanQuartet && cleanQuartet.mode) || cleanItem.mode || ''),
+          quartetStatus: String(result.clean_quartet_status || cleanItem.quartet_status ||
+            (cleanQuartet && cleanQuartet.quartet_status) ||
+            (cleanQuartet && cleanQuartet.status) || ''),
         };
       }
       if (!val('pj-name')) setVal('pj-name', pathBase(picked.path) + '_adsorption');
@@ -1197,8 +1376,16 @@
       const warnings = textList(result.warnings);
       const readyIncars = (result.configs || []).filter(item => item &&
         String(item.incar_status || (item.incar_path ? 'ready' : '')) === 'ready').length;
+      const quartetMembers = [State.cleanIncar, ...State.configs.map(path =>
+        State.configSpeciesMeta[path] || {})].filter(item => normaliseQuartet(item).hasEvidence);
+      const copiedQuartets = quartetMembers.filter(item =>
+        quartetPresentation(item, rootFallback).mode === 'copy').length;
+      const generatedQuartets = quartetMembers.filter(item =>
+        quartetPresentation(item, rootFallback).mode === 'generate').length;
       const summary = `已识别 ${result.clean_slab ? 'clean slab，' : ''}新增 ${added} 个 adsorption 结构，` +
         `${readyIncars + (State.cleanIncar.status === 'ready' ? 1 : 0)} 个成员已绑定本目录 INCAR。` +
+        (quartetMembers.length
+          ? ` 完整四件套原样绑定 ${copiedQuartets} 组，受管副本智能补齐 ${generatedQuartets} 组。` : '') +
         (rootFallback ? ` 根目录 INCAR 已作为显式备用：${rootFallback}。` : '');
       showBundleStatus(warnings.length ? 'warn' : 'ok', summary +
         (warnings.length ? ' 还需确认：' + warnings.join('；') : ' 请检查物种映射后继续。'));
@@ -1229,22 +1416,22 @@
       Number(walltime.split(':')[1]) < 60 && Number(walltime.split(':')[2]) < 60;
     const nameConflict = State.preparedConflictHint &&
       val('pj-name') === String(State.preparedConflictHint.oldName || '');
-    const methodStatus = methodCheckStatus(State.methodCheck);
-    const methodConfirmation = methodConfirmationPayload();
-    const methodBlocked = methodStatus === 'incompatible';
-    const methodNeedsConfirmation = State.needsMethodConfirmation || methodStatus === 'unverified';
-    const methodReady = !methodBlocked && (!methodNeedsConfirmation ||
-      (methodConfirmation.confirmed && !!methodConfirmation.reason));
+    const methodStatus = methodComparabilityStatus(State.methodCheck);
+    const executionStatus = methodExecutionStatus(State.methodCheck);
+    const methodBlocked = executionStatus === 'blocked';
     const fallbackIncar = val('pj-incar');
     const cleanIncarReady = State.cleanIncar.status === 'ready' ||
       (State.cleanIncar.status === 'missing' && !!fallbackIncar);
+    const cleanQuartetBlocked = quartetBlocked(State.cleanIncar);
     const invalidIncars = items.filter(item =>
       !['ready', 'missing'].includes(item.incar_status));
     const missingIncars = items.filter(item => item.incar_status === 'missing' && !fallbackIncar);
+    const blockedQuartets = items.filter(quartetBlocked);
     const step = {
       1: !!ref && refs.length > 0,
-      2: !State.inputScanBusy && !!val('pj-slab') && cleanIncarReady && items.length > 0 &&
-        invalidIncars.length === 0 && missingIncars.length === 0 &&
+      2: !State.inputScanBusy && !!val('pj-slab') && cleanIncarReady && !cleanQuartetBlocked &&
+        items.length > 0 && invalidIncars.length === 0 && missingIncars.length === 0 &&
+        blockedQuartets.length === 0 &&
         invalidSpecies.length === 0 && unconfirmedSpecies.length === 0,
       3: !!val('pj-name') && !!val('pj-root') && !nameConflict,
       4: !!val('lis-profile') && Number.isInteger(cores) && cores > 0 && validWalltime,
@@ -1254,6 +1441,7 @@
     else if (!ref) issue = '第 1 步：请选择已经导入的 Li-S 参考能项目';
     else if (!refs.length) issue = '第 1 步：所选项目没有可用的 Li-S 物种参考能';
     else if (!val('pj-slab')) issue = '第 2 步：请选择 clean slab POSCAR';
+    else if (cleanQuartetBlocked) issue = '第 2 步：clean slab 的四件套无效或冲突，请按成员明细修正';
     else if (!cleanIncarReady) issue = State.cleanIncar.status === 'missing'
       ? '第 2 步：clean slab 同目录缺少 INCAR；补齐文件或显式选择备用 INCAR'
       : `第 2 步：clean slab 的 INCAR 不可用（${textList(State.cleanIncar.issues).join('；') || State.cleanIncar.status}）`;
@@ -1262,6 +1450,8 @@
       `第 2 步：有 ${invalidIncars.length} 个构型的同目录 INCAR 冲突或无效`;
     else if (missingIncars.length) issue =
       `第 2 步：有 ${missingIncars.length} 个构型缺少同目录 INCAR；补齐文件或显式选择备用 INCAR`;
+    else if (blockedQuartets.length) issue =
+      `第 2 步：有 ${blockedQuartets.length} 个构型的四件套无效或冲突`;
     else if (invalidSpecies.length) issue = `第 2 步：有 ${invalidSpecies.length} 个构型的物种不在参考能集合中`;
     else if (unconfirmedSpecies.length) issue =
       `第 2 步：请确认 ${unconfirmedSpecies.length} 个构型的智能物种分组`;
@@ -1271,16 +1461,22 @@
     else if (!val('lis-profile')) issue = '第 4 步：选择用于提交的服务器';
     else if (!Number.isInteger(cores) || cores < 1) issue = '第 4 步：核数必须是正整数';
     else if (!validWalltime) issue = '第 4 步：墙时请填写为 HH:MM:SS（例如 24:00:00）';
-    else if (methodBlocked) issue = '方法检查不兼容：按红色提示统一 INCAR / 赝势 / 泛函后重新建立项目';
-    else if (methodNeedsConfirmation && !methodConfirmation.confirmed) issue = '提交前：请阅读方法检查并勾选人工确认';
-    else if (methodNeedsConfirmation && !methodConfirmation.reason) issue = '提交前：请填写可审计的方法一致性确认理由';
+    else if (methodBlocked) issue = '输入执行检查已阻止生成 / 提交；请按方法面板中的输入错误修正';
     const memberIncars = {
-      clean_slab: { path: State.cleanIncar.path || '', sha256: State.cleanIncar.sha256 || '' },
+      clean_slab: {
+        path: State.cleanIncar.path || '', sha256: State.cleanIncar.sha256 || '',
+        quartet: State.cleanIncar.quartet || null,
+        input_mode: State.cleanIncar.inputMode || '',
+        quartet_status: State.cleanIncar.quartetStatus || '',
+      },
       configs: items.map(item => ({ path: item.path, incar_path: item.incar_path,
-        incar_sha256: item.incar_sha256 })),
+        incar_sha256: item.incar_sha256, quartet: item.quartet,
+        input_mode: item.input_mode, quartet_status: item.quartet_status })),
     };
-    return { ok: Object.values(step).every(Boolean) && methodReady, issue, step, ref, refs, items,
-      cores, walltime, methodConfirmation, methodBlocked, methodNeedsConfirmation, memberIncars };
+    return { ok: Object.values(step).every(Boolean) && !methodBlocked, issue, step, ref, refs, items,
+      cores, walltime, methodConfirmation: null, methodBlocked, methodStatus, executionStatus,
+      memberIncars,
+      repairRequest: State.repairDecision || null };
   }
 
   function updateLisReadiness(requestedStep) {
@@ -1298,10 +1494,13 @@
     if (note) {
       note.classList.toggle('ready', gate.ok);
       const prepared = reusablePreparedLis();
+      const analysisPaused = ['unverified', 'incompatible'].includes(gate.methodStatus);
       note.textContent = prepared && !prepared.submitted
         ? `本地项目已经生成。直接重试提交即可，不会重复生成或覆盖：${prepared.path}`
         : gate.ok
-          ? `已就绪：将生成 clean slab + ${gate.items.length} 个 adsorption 作业，并在 ${val('lis-profile')} 提交。`
+          ? analysisPaused
+            ? `作业已就绪，可在 ${val('lis-profile')} 提交；自动 ΔE / 最终报告将暂停，等方法证据修正或补齐后继续。`
+            : `已就绪：将生成 clean slab + ${gate.items.length} 个 adsorption 作业，并在 ${val('lis-profile')} 提交。`
           : gate.issue;
     }
     const button = $('pj-submit-all');
@@ -1313,7 +1512,9 @@
         button.textContent = prepared && prepared.submitted
           ? '整组已提交，自动托管运行中'
           : prepared ? '重试未提交成员（不会重复生成）'
-            : '生成并提交整组，开启自动续算/下载/报告';
+            : ['unverified', 'incompatible'].includes(gate.methodStatus)
+              ? '生成并提交整组（ΔE / 报告待核验）'
+              : '生成并提交整组，开启自动续算/下载/报告';
       }
     }
     const status = $('lis-reference-status');
@@ -1404,8 +1605,14 @@
         ((meta.incarStatus || 'missing') === 'missing' && !!val('pj-incar'));
     };
     const incars = State.configs.filter(incarReady).length;
+    const quartetRows = State.configs.map(path => quartetPresentation(
+      State.configSpeciesMeta[path] || {}, val('pj-incar')));
+    const copiedQuartets = quartetRows.filter(item => item.hasEvidence && item.mode === 'copy').length;
+    const generatedQuartets = quartetRows.filter(item => item.hasEvidence && item.mode === 'generate').length;
     if (count) count.textContent = State.configs.length
-      ? `物种已确认 ${matched}/${State.configs.length}，INCAR 已绑定 ${incars}/${State.configs.length}`
+      ? `物种已确认 ${matched}/${State.configs.length}，INCAR 已绑定 ${incars}/${State.configs.length}` +
+        (copiedQuartets || generatedQuartets
+          ? `；四件套原样 ${copiedQuartets}，受管副本补齐 ${generatedQuartets}` : '')
       : '尚未添加构型';
     updateBulkSpeciesOptions(refs);
     if (!box) return;
@@ -1416,7 +1623,8 @@
     }
     const onlyUnmatched = !!($('lis-only-unmatched') && $('lis-only-unmatched').checked);
     const rows = State.configs.map((path, index) => ({ path, index }))
-      .filter(item => !onlyUnmatched || !confirmedSpecies(item.path) || !incarReady(item.path));
+      .filter(item => !onlyUnmatched || !confirmedSpecies(item.path) ||
+        !incarReady(item.path) || quartetBlocked(State.configSpeciesMeta[item.path]));
     if (!rows.length) {
       box.innerHTML = '<div class="pj-cfgempty">所有构型的物种映射都已确认。</div>';
       updateLisReadiness();
@@ -1445,12 +1653,16 @@
         const meta = State.configSpeciesMeta[p] || {};
         const confirmedRow = valid && meta.confirmed === true;
         const memberIncarReady = incarReady(p);
+        const quartet = quartetPresentation(meta, val('pj-incar'));
         const incarStatus = String(meta.incarStatus || 'missing');
         const incarText = incarStatus === 'ready' && meta.incarPath
           ? `INCAR：${meta.incarPath}`
           : incarStatus === 'missing' && val('pj-incar')
             ? `本目录无 INCAR；将使用显式备用：${val('pj-incar')}`
             : `INCAR 不可用：${textList(meta.incarIssues).join('；') || '同目录缺失'}`;
+        const inputEvidence = quartet.hasEvidence
+          ? `<div class="lis-quartet ${quartet.blocked ? 'blocked' : quartet.mode}">${quartetHtml(quartet)}</div>`
+          : `<span class="sub" title="${VCS.esc(incarText)}">${VCS.esc(incarText)}</span>`;
         const sourceLabel = meta.source === 'poscar_minus_clean_slab' ||
           String(meta.source || '').startsWith('poscar_minus_clean_slab+')
           ? 'POSCAR−clean slab 组成差'
@@ -1461,10 +1673,11 @@
         const speciesOptions = '<option value="">请选择对应物种</option>' +
           (!valid && species ? `<option value="${VCS.esc(species)}" selected>${VCS.esc(species)}（未匹配）</option>` : '') +
           refs.map(value => `<option value="${VCS.esc(value)}"${value.toLowerCase() === species.trim().toLowerCase() ? ' selected' : ''}>${VCS.esc(value)}</option>`).join('');
-        return `<div class="pj-cfgrow lis-cfgrow${confirmedRow && memberIncarReady ? '' : valid && memberIncarReady ? ' pending' : ' invalid'}">` +
+        return `<div class="pj-cfgrow lis-cfgrow${quartet.blocked ? ' invalid' :
+          confirmedRow && memberIncarReady ? '' : valid && memberIncarReady ? ' pending' : ' invalid'}">` +
           `<div class="lis-cfgpath"><span class="path" title="${VCS.esc(p)}">${VCS.esc(pathBase(p))}</span>` +
           `<span class="sub" title="${VCS.esc(p)}">${VCS.esc(p)}</span>` +
-          `<span class="sub" title="${VCS.esc(incarText)}">${VCS.esc(incarText)}</span></div>` +
+          `${inputEvidence}</div>` +
           `<label>对应物种<select class="ipt lis-species" data-species-index="${i}">${speciesOptions}</select></label>` +
           `<span class="lis-species-check">${VCS.esc(speciesCheck)}</span>` +
           `<button class="btn quiet" type="button" data-rm="${i}">移除</button></div>`;
@@ -1772,8 +1985,8 @@
   function lisRepairHint(message, stage) {
     const text = String(message || '');
     if (/已存在|不会覆盖/.test(text)) return '目标项目已经存在。请回到第 3 步换一个项目名，旧项目不会被覆盖。';
+    if (/方法|核验|不能直接相减|可比性/.test(text)) return '作业输入可继续生成和提交；这些差异只会暂停自动 ΔE 与最终报告。请查看方法面板，按具体能量项补齐证据或重算；ISPIN 体系说明无需勾选确认。';
     if (/INCAR|POSCAR|结构文件|文件不存在|无法读取/.test(text)) return '文件路径已经失效或不可读。回到第 2 步重新选择对应文件。';
-    if (/方法|核验|确认理由|不能直接相减/.test(text)) return '阅读页面内的方法检查。明确不兼容时统一泛函、赝势、ENCUT 等设置；证据不完整时须人工核对并填写理由。';
     if (/物种|species|参考/.test(text)) return '回到第 1、2 步：确认参考能项目，并把每个红色构型改为参考集合中的物种。';
     if (/POTCAR|赝势/.test(text)) return '到“设置”中配置可用的 POTCAR 库，再返回重试；不要手工拼接不一致的赝势。';
     if (/凭据.*保存|keyring|无人值守|自动(?:托管|驾驶).*保存/i.test(text)) {
@@ -1789,7 +2002,7 @@
 
   function lisRepairAction(message, stage) {
     const text = String(message || '');
-    if (/方法|核验|确认理由|不能直接相减/.test(text)) return ['method', '查看方法检查'];
+    if (/方法|核验|不能直接相减|可比性/.test(text)) return ['method', '查看 ΔE / 报告门禁'];
     if (/已存在|不会覆盖/.test(text)) return ['step3', '返回修改项目名'];
     if (/参考项目|参考能/.test(text)) return ['step1', '返回选择参考能'];
     if (/INCAR|POSCAR|结构文件|物种|species/.test(text)) return ['step2', '返回检查输入'];
@@ -1883,6 +2096,7 @@
     const button = $('pj-submit-all');
     const resultBox = $('lis-submit-result');
     const operationFingerprint = lisContentFingerprint();
+    State.repairResume = 'submit';
     State.lisBusy = true;
     syncLisInputLocks();
     if (button) { button.disabled = true; button.textContent = reusable ? '正在重试未提交成员…' : '正在生成整组输入…'; }
@@ -1897,27 +2111,36 @@
       } else {
         prepared = await VCS.call('proj_prepare_lis', val('pj-name'), val('pj-slab'), gate.items,
           val('pj-incar'), val('pj-root'), gate.ref.path, gate.methodConfirmation,
-          gate.memberIncars);
+          gate.memberIncars, gate.repairRequest);
         const methodCheck = prepared && prepared.method_check;
         const needsMethod = !!(prepared && prepared.needs_method_confirmation);
-        const acceptedMethod = gate.methodConfirmation.confirmed && !!gate.methodConfirmation.reason && !needsMethod;
-        if (methodCheck || needsMethod) renderMethodCheck(methodCheck, needsMethod, acceptedMethod);
-        if (methodCheckStatus(methodCheck) === 'incompatible') {
-          const error = (prepared && prepared.error) || '参考能与新任务的方法不兼容';
-          VCS.log('方法检查阻止提交:' + error, 'failc');
-          showLisFailure('方法不兼容，未生成项目', error, 'prepare');
+        const needsRepair = !!(prepared && prepared.needs_repair_decision);
+        if (methodCheck || needsMethod) renderMethodCheck(methodCheck, needsMethod);
+        if (methodExecutionStatus(methodCheck) === 'blocked') {
+          const error = (prepared && prepared.error) || '本地输入无法安全生成或提交';
+          VCS.log('输入执行检查阻止提交:' + error, 'failc');
+          showLisFailure('输入执行检查未通过', error, 'prepare');
+          return;
+        }
+        if (needsRepair) {
+          VCS.log('已生成智能修复预览；请选择“修复副本”或“保持原样”后继续', 'warnc');
+          VCS.toast('请在方法检查中选择智能修复或保持原样');
+          const method = $('lis-method-check');
+          if (method && typeof method.scrollIntoView === 'function') {
+            method.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }
           return;
         }
         if (needsMethod) {
-          VCS.log('方法信息需要人工确认；请阅读页面内检查结果并填写确认理由', 'warnc');
-          showLisFailure('需要确认计算方法后才能继续',
-            '请阅读上方方法检查，勾选确认并填写理由，然后再次点击主按钮。', 'prepare');
-          return;
+          VCS.log('旧版后端标记了方法待核对；不要求 ISPIN 确认，作业继续，自动 ΔE / 报告暂停', 'warnc');
         }
         if (!prepared || prepared.ok === false || prepared.error) {
           const error = (prepared && prepared.error) || '未知错误';
           if (!methodCheck && /方法.*(?:不一致|不兼容)|不能直接相减/.test(error)) {
-            renderMethodCheck({ status: 'incompatible', issues: [error] }, false, false);
+            renderMethodCheck({
+              execution_status: 'ready', comparability_status: 'incompatible',
+              status: 'incompatible', issues: [error],
+            });
           }
           VCS.log('Li-S 项目生成失败:' + error, 'failc');
           textList(prepared && prepared.warnings).forEach(x => VCS.log(x, 'warnc'));
@@ -1927,6 +2150,10 @@
       }
       textList(prepared.advisories).forEach(x => VCS.log('方法学提示:' + x, 'warnc'));
       textList(prepared.warnings).forEach(x => VCS.log(x, 'warnc'));
+      if (['unverified', 'incompatible'].includes(methodComparabilityStatus(
+        prepared && prepared.method_check))) {
+        VCS.log('作业继续提交；自动 ΔE 与最终报告将等方法证据通过后再继续', 'warnc');
+      }
       const projectPath = projectPathFrom(prepared);
       if (!projectPath) {
         VCS.log('Li-S 项目生成失败:后端没有返回项目路径', 'failc');
@@ -2022,36 +2249,36 @@
     updateLisReadiness();
     let issue = '';
     if (!gate.step[1] || !gate.step[2] || !gate.step[3]) issue = gate.issue;
-    else if (gate.methodBlocked) issue = '方法检查不兼容；请按红色提示统一设置后再生成';
-    else if (gate.methodNeedsConfirmation && !gate.methodConfirmation.confirmed) {
-      issue = '请先阅读方法检查并勾选人工确认';
-    } else if (gate.methodNeedsConfirmation && !gate.methodConfirmation.reason) {
-      issue = '请填写可审计的方法一致性确认理由';
-    }
+    else if (gate.methodBlocked) issue = '输入执行检查已阻止生成；请修正本目录输入错误';
     if (issue) { VCS.toast(issue, 'fail'); return; }
     const operationFingerprint = lisContentFingerprint();
+    State.repairResume = 'create';
     State.lisBusy = true;
     syncLisInputLocks();
     if (btn) { btn.disabled = true; btn.textContent = '正在生成逐目录作业…'; }
-    VCS.log(`仅生成：正在准备 clean slab + ${gate.items.length} 个逐目录 INCAR 作业…`);
+    VCS.log(`仅生成：正在准备 clean slab + ${gate.items.length} 个逐成员四件套作业…`);
     try {
       const prepared = await VCS.call(
         'proj_prepare_lis', val('pj-name'), val('pj-slab'), gate.items,
         val('pj-incar'), val('pj-root'), gate.ref.path, gate.methodConfirmation,
-        gate.memberIncars);
+        gate.memberIncars, gate.repairRequest);
       const methodCheck = prepared && prepared.method_check;
       const needsMethod = !!(prepared && prepared.needs_method_confirmation);
-      const acceptedMethod = gate.methodConfirmation.confirmed &&
-        !!gate.methodConfirmation.reason && !needsMethod;
-      if (methodCheck || needsMethod) renderMethodCheck(methodCheck, needsMethod, acceptedMethod);
-      if (methodCheckStatus(methodCheck) === 'incompatible' || needsMethod) {
-        const error = (prepared && prepared.error) ||
-          (needsMethod ? '需要确认计算方法后才能生成' : '参考能与新任务的方法不兼容');
-        VCS.log('仅生成已停止：' + error, needsMethod ? 'warnc' : 'failc');
-        showLisFailure(needsMethod ? '需要确认计算方法后才能继续' : '方法不兼容，未生成项目',
-          error, 'prepare');
+      const needsRepair = !!(prepared && prepared.needs_repair_decision);
+      if (methodCheck || needsMethod) renderMethodCheck(methodCheck, needsMethod);
+      if (methodExecutionStatus(methodCheck) === 'blocked') {
+        const error = (prepared && prepared.error) || '本地输入无法安全生成';
+        VCS.log('仅生成已停止：' + error, 'failc');
+        showLisFailure('输入执行检查未通过', error, 'prepare');
         return;
       }
+      if (needsRepair) {
+        VCS.log('已生成智能修复预览；选择如何处理后再次执行“只生成”', 'warnc');
+        VCS.toast('请先选择智能修复或保持原样');
+        return;
+      }
+      if (needsMethod) VCS.log(
+        '方法证据待核对；作业继续生成，自动 ΔE / 报告暂停', 'warnc');
       if (!prepared || prepared.ok === false || prepared.error) {
         const error = (prepared && prepared.error) || '未知错误';
         VCS.log('逐目录作业生成失败:' + error, 'failc');
@@ -2075,7 +2302,7 @@
         resultBox.hidden = false;
         resultBox.innerHTML = '<div class="lis-result-head ok"><b>逐目录作业已生成，尚未提交</b>' +
           `<span>${VCS.esc(projectPath)}</span></div>` +
-          '<div class="lis-result-next"><b>输入已冻结</b><span>每个成员使用自己绑定的 INCAR。' +
+          '<div class="lis-result-next"><b>输入已冻结</b><span>完整成员使用同目录原始四件套；不完整成员按本目录 POSCAR+INCAR 生成受管四件套。' +
           '可回到主按钮选择服务器并提交；不会重复生成项目。</span></div>';
       }
       VCS.log('逐目录作业已生成，尚未提交：' + projectPath, 'okc');
@@ -2084,7 +2311,7 @@
       if (typeof VCS.nextStep === 'function') {
         VCS.nextStep({
           title: '逐目录吸附作业已生成',
-          message: `clean slab 和 ${gate.items.length} 个吸附构型已按各自 INCAR 加入任务列表。`,
+          message: `clean slab 和 ${gate.items.length} 个吸附构型已按各自四件套证据加入任务列表。`,
           detail: '下一步可在当前页面选择服务器后点击主按钮提交；生成阶段不会覆盖任何成员的本地 INCAR。',
           primaryLabel: '留在当前页选择服务器',
         });
@@ -2397,7 +2624,7 @@
     if (row && row.delta_e != null) return '';
     const methodCheck = row && row.method_check || {};
     if (methodCheck.status === 'incompatible' || /方法不一致/.test(note)) {
-      return '下一步：按方法检查列出的硬冲突逐项修正后重算；clean slab 与吸附构型的 ISPIN 必须一致。当前 ΔE 已阻断，不能用于比较或报告。';
+      return '下一步：按方法检查列出的泛函、ENCUT、色散、共享元素 POTCAR/DFT+U 等硬冲突逐项修正后重算。合法的 ISPIN 差异本身不会触发此阻断。';
     }
     if (methodCheck.status === 'unverified') {
       return '下一步：按方法检查逐项核对；分子参考与周期体系 ISPIN 不同，可在确认各自采用正确基态自旋后保留。';
@@ -2424,9 +2651,10 @@
     const methodStatus = String(method.status || '').toLowerCase();
     const methodIssues = (method.issues || []).map(String);
     const methodWarnings = (method.warnings || []).map(String);
+    const methodAdvisories = (method.advisories || []).map(String);
     if (methodStatus === 'incompatible') {
       h += '<div class="pj-method-gate incompatible"><b>方法不一致：ΔE 已阻断</b>' +
-        '<span>请按下列硬冲突逐项修正后重新计算；clean slab 与吸附构型的 ISPIN 必须一致。当前数值不能用于构型比较、出图或报告。</span>' +
+        '<span>请按下列泛函、ENCUT、色散、共享元素 POTCAR/DFT+U 等硬冲突逐项修正后重新计算。合法的 ISPIN 差异不属于硬冲突。</span>' +
         (methodIssues.length ? `<ul>${methodIssues.map(x => `<li>${VCS.esc(x)}</li>`).join('')}</ul>` : '') +
         '</div>';
     } else if (methodStatus === 'unverified') {
@@ -2437,6 +2665,11 @@
     } else if (methodStatus === 'verified') {
       h += '<div class="pj-method-gate verified"><b>方法一致性已核验</b>' +
         '<span>本项目能量相减项已通过记录层面的一致性检查。</span></div>';
+    }
+    if (methodAdvisories.length) {
+      h += '<div class="pj-method-gate advisory"><b>体系自旋提示（不阻断 ΔE）</b>' +
+        '<span>分子、clean slab 与吸附体系可分别采用各自经验证的基态自旋；以下内容仅用于审计与复核。</span>' +
+        `<ul>${methodAdvisories.map(x => `<li>${VCS.esc(x)}</li>`).join('')}</ul></div>`;
     }
     if (!rows.length) {
       h += '<div class="empty"><p>该项目暂无吸附构型成员</p></div>';
@@ -2614,6 +2847,7 @@
             path: resolved.incar_path, sha256: resolved.incar_sha256,
             status: resolved.incar_status, source: resolved.incar_source,
             issues: resolved.incar_issues,
+            quartet: null, inputMode: '', quartetStatus: '',
           };
         }
         invalidatePreparedLis(); updateLisReadiness();
@@ -2651,10 +2885,6 @@
     document.querySelectorAll('#pj-create-card [data-lis-open-step]').forEach(button => {
       button.addEventListener('click', () => openLisStep(Number(button.dataset.lisOpenStep)));
     });
-    const methodConfirm = $('lis-method-confirm');
-    if (methodConfirm) methodConfirm.addEventListener('change', updateLisReadiness);
-    const methodReason = $('lis-method-reason');
-    if (methodReason) methodReason.addEventListener('input', updateLisReadiness);
     const profile = $('lis-profile');
     if (profile) profile.addEventListener('change', () => {
       try { localStorage.setItem('vcs.jobs.profile', profile.value); } catch (e) { /* 不阻塞 */ }
@@ -2663,7 +2893,10 @@
     ['pj-name', 'pj-slab', 'pj-incar', 'pj-root'].forEach(id => {
       const el = $(id); if (el) el.addEventListener('input', () => {
         if (id === 'pj-slab') {
-          State.cleanIncar = { path: '', sha256: '', status: 'missing', source: '', issues: [] };
+          State.cleanIncar = {
+            path: '', sha256: '', status: 'missing', source: '', issues: [],
+            quartet: null, inputMode: '', quartetStatus: '',
+          };
         }
         invalidatePreparedLis(); updateLisReadiness();
         if (id === 'pj-incar') renderConfigs();

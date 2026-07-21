@@ -42,6 +42,9 @@ def test_lis_builder_uses_backend_contract_and_strict_species_mapping():
     assert "species: String(State.configSpecies[path] || '').trim()" in js
     assert "incar_path: String(meta.incarPath || '')" in js
     assert 'gate.memberIncars' in js
+    assert 'quartet: meta.quartet' in js
+    assert 'input_mode: String(meta.inputMode' in js
+    assert 'quartet_status: String(meta.quartetStatus' in js
     # 专家“只生成”也必须复用同一逐成员契约，不能退回共享 INCAR API。
     create_block = js[js.index('async function create()'):js.index('// ── 已有项目')]
     assert "'proj_prepare_lis', val('pj-name'), val('pj-slab'), gate.items" in create_block
@@ -53,7 +56,7 @@ def test_one_folder_input_import_only_autofills_unambiguous_members():
     html = _source('index.html')
     js = _source('project.js')
     assert '导入本次计算文件夹（推荐）' in html
-    assert '各自同目录 INCAR；缺失或冲突会精确指出成员' in html
+    assert '完整组原样使用，不完整组按本目录 POSCAR+INCAR 生成受管四件套' in html
     assert '本目录文件始终优先' in html
     assert "const rootFallback = String(result.incar || '').trim()" in js
     assert "setVal('pj-incar', rootFallback)" in js
@@ -170,20 +173,70 @@ def test_prepared_project_is_reused_for_cancelled_or_partial_submit():
     assert '请把项目名改成新名称' in js
 
 
-def test_method_check_requires_explicit_auditable_confirmation():
+def test_method_check_separates_execution_from_energy_comparability():
     html = _source('index.html')
     js = _source('project.js')
-    for control in ('lis-method-check', 'lis-method-confirm', 'lis-method-reason'):
+    for control in (
+        'lis-method-check', 'lis-method-outcome', 'lis-method-issues',
+        'lis-method-notes', 'lis-method-warnings', 'lis-method-repairs',
+    ):
         assert f'id="{control}"' in html
-    assert 'checked' not in html[html.index('id="lis-method-confirm"') - 80:
-                                 html.index('id="lis-method-confirm"') + 80]
+    assert 'id="lis-method-confirm"' not in html
+    assert 'id="lis-method-reason"' not in html
     assert 'gate.ref.path, gate.methodConfirmation' in js
     assert 'prepared.needs_method_confirmation' in js
-    assert "methodStatus === 'incompatible'" in js
-    assert '请填写可审计的方法一致性确认理由' in js
-    assert '存在需要人工核对的方法差异或证据缺项' in js
-    assert '各体系采用了正确的基态自旋设置' in html
-    assert 'Li2S8 已经 ISPIN=2 多初态对照验证为非磁闭壳层' in html
+    assert 'check.execution_status' in js
+    assert 'check.comparability_status || check.status' in js
+    gate = js[js.index('function lisGate()'):js.index('function updateLisReadiness(')]
+    assert "const methodBlocked = executionStatus === 'blocked'" in gate
+    assert 'methodNeedsConfirmation' not in gate
+    assert 'methodConfirmation: null' in gate
+    assert '作业生成 / 提交：可继续' in js
+    assert '自动 ΔE / 最终报告：已暂停' in js
+    assert '输入执行检查已阻止生成 / 提交' in js
+
+
+def test_ispin_notes_and_managed_copy_repairs_are_informational():
+    js = _source('project.js')
+    method = js[js.index('function renderMethodCheck('):
+                js.index('function renderRepairPlan(')]
+    assert 'check.notes' in method
+    assert "'lis-method-notes', '体系说明（包括 ISPIN）'" in method
+    assert "'lis-method-repairs', '已在受管副本安全修复（源文件未改）'" in method
+    assert 'checkbox' not in method
+    repair = js[js.index('function renderRepairPlan('):
+                js.index('function invalidatePreparedLis(')]
+    assert "action.risk || '').toLowerCase() === 'low'" in repair
+    assert 'MAGMOM、ISPIN 等科学选择只给建议，不自动改' in repair
+    assert '仅建议，不自动' in repair
+    assert 'VCS.call(' not in repair
+
+
+def test_each_member_shows_copied_or_generated_quartet_evidence():
+    html = _source('index.html')
+    js = _source('project.js')
+    css = _source('app.css')
+    assert 'POSCAR/INCAR/KPOINTS/POTCAR 会原样绑定' in html
+    for field in ('raw.quartet', 'raw.input_mode', 'raw.quartet_status'):
+        assert field in js
+    assert 'function quartetPresentation(raw, fallbackIncar)' in js
+    assert '完整四件套原样绑定（源文件不改）' in js
+    assert '将以本目录 POSCAR+INCAR 生成受管四件套；源目录不改' in js
+    assert '四件套不可提交' in js
+    assert 'quartetBlocked(State.cleanIncar)' in js
+    assert 'items.filter(quartetBlocked)' in js
+    assert '.lis-quartet.generate' in css
+    assert '.lis-quartet.blocked' in css
+
+
+def test_same_local_path_preserves_posix_case_and_folds_windows_drive_paths():
+    js = _source('project.js')
+    helper = js[js.index('function normaliseLocalPath('):
+                js.index('function removeConfigPath(')]
+    assert "replace(/\\\\/g, '/').replace(/\\/+$/, '')" in helper
+    assert "return /^[A-Za-z]:(?:\\/|$)/.test(normalised) ? normalised.toLowerCase() : normalised;" in helper
+    assert 'return normaliseLocalPath(left) === normaliseLocalPath(right);' in helper
+    assert ".replace(/\\/+$/, '').toLowerCase()" not in helper
 
 
 def test_host_trust_never_blindly_accepts_missing_fingerprint():
@@ -244,7 +297,8 @@ def test_delta_view_blocks_method_mismatch_and_guides_unverified_results():
     assert '方法不一致：ΔE 已阻断' in js
     assert "methodStatus === 'unverified'" in js
     assert '方法一致性尚未完全核验' in js
-    assert 'clean slab 与吸附构型的 ISPIN 必须一致' in js
+    assert '合法的 ISPIN 差异不属于硬冲突' in js
+    assert '体系自旋提示（不阻断 ΔE）' in js
     assert '分子参考与周期体系 ISPIN 不同' in js
     assert '.pj-method-gate.incompatible' in css
     assert '.pj-method-gate.unverified' in css
@@ -300,7 +354,7 @@ def test_errors_offer_a_direct_repair_action_instead_of_log_only():
     assert 'data-lis-fix=' in js
     assert "return ['cluster', '前往集群配置']" in js
     assert "return ['step3', '返回修改项目名']" in js
-    assert "return ['method', '查看方法检查']" in js
+    assert "return ['method', '查看 ΔE / 报告门禁']" in js
 
 
 def test_project_progress_is_restored_after_reopening_the_app():

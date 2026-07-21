@@ -738,6 +738,55 @@ def test_validate_vasp_quartet_accepts_legal_negative_poscar_scale(tmp_path):
     assert ri.validate_vasp_quartet(quartet) == []
 
 
+def test_validate_vasp_quartet_uses_vasp_ldau_defaults_without_overblocking(tmp_path):
+    quartet = _make_quartet(
+        tmp_path / 'ldau-defaults',
+        incar='ENCUT=500\nLDAU=T\nISPIN=1\nMAGMOM=1\n')
+
+    # Omitted LDAUL/U/J use VASP defaults; ISPIN=1 makes the leftover MAGMOM
+    # irrelevant to execution.  Neither is a cross-directory comparison here.
+    assert ri.validate_vasp_quartet(quartet) == []
+
+    (quartet / 'INCAR').write_text(
+        'ENCUT=500\nLDAU=T\nLDAUL=2\n', encoding='utf-8')
+    assert any('LDAUL 长度' in issue for issue in ri.validate_vasp_quartet(quartet))
+
+    (quartet / 'INCAR').write_text(
+        'ENCUT=500\nLDAU=T\nLDAUTYPE=2.5\n', encoding='utf-8')
+    assert any('LDAUTYPE' in issue and '整数' in issue
+               for issue in ri.validate_vasp_quartet(quartet))
+
+
+def test_validate_vasp_quartet_checks_magmom_only_in_magnetic_mode(tmp_path):
+    quartet = _make_quartet(
+        tmp_path / 'magmom', incar='ENCUT=500\nISPIN=2\nMAGMOM=1\n')
+
+    assert any('MAGMOM 长度' in issue for issue in ri.validate_vasp_quartet(quartet))
+
+    (quartet / 'INCAR').write_text(
+        'ENCUT=500\nISPIN=2\nLSORBIT=T\nMAGMOM=30*0\n', encoding='utf-8')
+    assert ri.validate_vasp_quartet(quartet) == []
+
+
+def test_validate_vasp_quartet_does_not_treat_low_positive_encut_as_syntax_error(
+        tmp_path):
+    quartet = _make_quartet(tmp_path / 'low-encut', incar='ENCUT=200\n')
+    (quartet / 'POTCAR').write_text(
+        'TITEL = PAW_PBE Li\nENMAX = 300\n'
+        'TITEL = PAW_PBE S\nENMAX = 400\n', encoding='utf-8')
+
+    assert ri.validate_vasp_quartet(quartet) == []
+
+
+def test_validate_vasp_quartet_rejects_invalid_hybrid_numeric_value(tmp_path):
+    quartet = _make_quartet(
+        tmp_path / 'bad-hybrid',
+        incar='ENCUT=500\nLHFCALC=T\nAEXX=not-a-number\n')
+
+    assert any('AEXX' in issue and '有限数值' in issue
+               for issue in ri.validate_vasp_quartet(quartet))
+
+
 def test_input_only_quartet_imports_as_created_without_fake_result_energy(tmp_path):
     source = tmp_path / 'source'
     folder = _make_quartet(

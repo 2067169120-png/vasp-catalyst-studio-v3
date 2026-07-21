@@ -22,7 +22,7 @@ from pathlib import Path
 import yaml
 
 from vcstudio.cluster import diagnose, ledger
-from vcstudio.generate import potcar
+from vcstudio.generate import methods_text, potcar
 from vcstudio.generate.incar_builder import parse_incar
 from vcstudio.generate.job_builder import build_job_dir
 from vcstudio.generate.poscar import parse_poscar_species, read_poscar
@@ -37,6 +37,7 @@ _STEM_RE = re.compile(r'[^A-Za-z0-9_.-]')
 _SPECIES_TOKEN_RE = re.compile(r'[A-Z][a-z]?\d*(?:[A-Z][a-z]?\d*)*')
 _STRUCTURE_NAMES = {'poscar', 'contcar'}
 _STRUCTURE_SUFFIXES = {'.vasp', '.poscar'}
+_VASP_INPUT_NAMES = ('POSCAR', 'INCAR', 'KPOINTS', 'POTCAR')
 # project.yaml 的 species_refs 只是便于展示/迁移的缓存，不是计算真相源。缓存与
 # reference job.yaml 的差异超过 1 μeV 时 fail-closed，避免旧缓存静默污染 ΔE。
 SPECIES_REF_CACHE_TOLERANCE_EV = 1e-6
@@ -206,6 +207,14 @@ def scan_structure_files(root: str | os.PathLike) -> list[dict]:
                 'species': _structure_species_hint(path),
             }
             item['structure'] = structure_identity.poscar_facts(path)
+            quartet = _structure_input_bundle(path)
+            item['quartet'] = quartet
+            # Flat aliases keep the scanner convenient for existing GUI/API
+            # consumers while ``quartet`` remains the authoritative record.
+            item['mode'] = quartet['mode']
+            item['status'] = quartet['status']
+            item['issues'] = list(quartet['issues'])
+            item['files'] = quartet['files']
             item['species_source'] = 'path_name' if item['species'] else 'unresolved'
             item['species_confidence'] = 'hint' if item['species'] else 'unknown'
             item['species_confirmed'] = False
@@ -288,6 +297,116 @@ def _inspect_incar_file(path, *, source: str) -> dict:
         'source': source,
         'issues': issues, 'incar_issues': list(issues),
     }
+
+
+def resolve_structure_quartet(structure_path) -> dict:
+    """Resolve one structure's same-directory VASP quartet without writes.
+
+    A complete, unique, ordinary-file ``POSCAR/INCAR/KPOINTS/POTCAR`` quartet is
+    validated without writes and marked ``copy``.  Partial folders remain
+    ``generate`` so the established ``build_job_dir`` path can fill the missing
+    inputs.  A complete-but-invalid or ambiguous quartet is ``blocked`` rather
+    than silently discarded and regenerated.
+    """
+    raw_structure = str(structure_path or '').strip()
+    if not raw_structure:
+        return {
+            'status': 'invalid', 'mode': 'blocked', 'files': {},
+            'paths': {}, 'sha256': {}, 'missing': list(_VASP_INPUT_NAMES),
+            'issues': ['结构文件路径为空'],
+        }
+    structure = Path(raw_structure).expanduser().absolute()
+    if structure.is_symlink():
+        return {
+            'status': 'invalid', 'mode': 'blocked', 'files': {},
+            'paths': {}, 'sha256': {}, 'missing': list(_VASP_INPUT_NAMES),
+            'issues': [f'结构文件不能是符号链接：{structure}'],
+        }
+    if not structure.is_file():
+        return {
+            'status': 'invalid', 'mode': 'blocked', 'files': {},
+            'paths': {}, 'sha256': {}, 'missing': list(_VASP_INPUT_NAMES),
+            'issues': [f'结构文件不存在或不是普通文件：{structure}'],
+        }
+    structure = structure.resolve()
+    folder = structure.parent
+    candidates: dict[str, list[Path]] = {name: [] for name in _VASP_INPUT_NAMES}
+    issues: list[str] = []
+    try:
+        entries = sorted(folder.iterdir(), key=lambda item: item.name.casefold())
+    except OSError as exc:
+        return {
+            'status': 'invalid', 'mode': 'blocked', 'files': {},
+            'missing': list(_VASP_INPUT_NAMES),
+            'issues': [f'无法读取四件套目录 {folder}：{exc}'],
+        }
+    canonical = {name.casefold(): name for name in _VASP_INPUT_NAMES}
+    for entry in entries:
+        name = canonical.get(entry.name.casefold())
+        if name is None:
+            continue
+        if entry.is_symlink():
+            issues.append(f'{name} 不能是符号链接：{entry}')
+            continue
+        if not entry.is_file():
+            issues.append(f'{name} 不是普通文件：{entry}')
+            continue
+        candidates[name].append(entry)
+
+    files: dict[str, dict] = {}
+    for name in _VASP_INPUT_NAMES:
+        matches = candidates[name]
+        if len(matches) > 1:
+            issues.append(
+                f'同目录存在多个大小写不同的 {name}：'
+                + '、'.join(item.name for item in matches))
+            continue
+        if not matches:
+            continue
+        selected = matches[0].resolve()
+        try:
+            digest = manifest_mod.sha256_file(selected)
+        except OSError as exc:
+            issues.append(f'{name} 无法读取：{exc}')
+            continue
+        files[name] = {'path': str(selected), 'sha256': digest}
+
+    missing = [name for name in _VASP_INPUT_NAMES if name not in files]
+    selected_poscar = files.get('POSCAR', {}).get('path')
+    structure_is_quartet_poscar = bool(
+        selected_poscar and os.path.normcase(os.path.realpath(selected_poscar))
+        == os.path.normcase(os.path.realpath(structure)))
+
+    complete = not missing
+    validation = []
+    if complete:
+        from vcstudio.project.result_import import validate_vasp_quartet
+        validation = validate_vasp_quartet(folder)
+        issues.extend(validation)
+
+    if issues:
+        mode, status = 'blocked', 'invalid'
+    elif complete and structure_is_quartet_poscar:
+        mode, status = 'copy', 'ready'
+    else:
+        # A partial folder (or a .vasp file beside another POSCAR) stays on the
+        # established generation path.  INCAR availability is resolved later,
+        # where an explicit per-member mapping or the legacy fallback can be
+        # considered.  Treating a missing local INCAR as a quartet error here
+        # would incorrectly block those supported sources before that step.
+        mode, status = 'generate', 'generatable'
+    paths = {name: record['path'] for name, record in files.items()}
+    hashes = {name: record['sha256'] for name, record in files.items()}
+    return {
+        'status': status, 'mode': mode, 'files': files,
+        'paths': paths, 'sha256': hashes,
+        'missing': missing, 'issues': list(dict.fromkeys(issues)),
+    }
+
+
+def _structure_input_bundle(structure_path) -> dict:
+    """Backward-compatible private alias for :func:`resolve_structure_quartet`."""
+    return resolve_structure_quartet(structure_path)
 
 
 def resolve_structure_incar(structure_path, fallback='') -> dict:
@@ -459,12 +578,19 @@ def scan_lis_input_bundle(root: str | os.PathLike, reference_species=None) -> di
         if item.get('incar_status') != 'ready':
             label = Path(item['path']).parent.name or Path(item['path']).name
             warnings.extend(f'{label}: {message}' for message in item.get('incar_issues') or [])
+        quartet = item.get('quartet') or {}
+        if quartet.get('status') == 'invalid' or quartet.get('mode') == 'blocked':
+            label = Path(item['path']).parent.name or Path(item['path']).name
+            warnings.extend(
+                f'{label}: 四件套不可用：{message}'
+                for message in quartet.get('issues') or [])
     clean_item = next((item for item in structures if item['path'] == clean_slab), None)
     clean_incar = (clean_item or {}).get('incar_path', '')
     clean_incar_sha256 = (clean_item or {}).get('incar_sha256', '')
     clean_incar_status = (clean_item or {}).get('incar_status', 'missing')
     clean_incar_issues = list((clean_item or {}).get('incar_issues') or [])
     clean_incar_source = (clean_item or {}).get('incar_source', '')
+    clean_quartet = dict((clean_item or {}).get('quartet') or {})
     return {
         'root': str(base),
         # Legacy shared-INCAR field now means only a unique root-level, explicit
@@ -477,6 +603,10 @@ def scan_lis_input_bundle(root: str | os.PathLike, reference_species=None) -> di
         'clean_incar_status': clean_incar_status,
         'clean_incar_issues': clean_incar_issues,
         'clean_incar_source': clean_incar_source,
+        'clean_quartet': clean_quartet,
+        'clean_mode': clean_quartet.get('mode', ''),
+        'clean_status': clean_quartet.get('status', 'missing'),
+        'clean_issues': list(clean_quartet.get('issues') or []),
         'clean_candidates': clean_candidates,
         'clean_inference': clean_inference,
         'configs': configs,
@@ -521,15 +651,23 @@ def identify_config_species(clean_slab, structures, reference_species=None) -> d
 
 
 # ── 项目创建(批量生成) ───────────────────────────────────────────────────────
-def _unified_encut(incar_paths, poscars: list, lib_root) -> int | None:
+def _unified_encut(incar_paths, poscars: list, lib_root,
+                   incar_overrides: dict | None = None) -> int | None:
     """Resolve a safe group ENCUT from the actual per-member INCAR files.
 
     All members lacking ENCUT get one value from the union of their elements.
     If some members explicitly use one common ENCUT, missing members inherit it.
-    Different explicit values are never overwritten or silently mixed.
+    Different explicit values are preserved per member.  They make the later
+    total-energy comparison non-final, but do not make either VASP job itself
+    invalid and therefore must not block project generation.
     """
     paths = [incar_paths] if isinstance(incar_paths, (str, os.PathLike)) \
         else list(incar_paths or [])
+    overrides = {
+        os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(path)))):
+        {str(key).upper(): value for key, value in dict(values or {}).items()}
+        for path, values in dict(incar_overrides or {}).items()
+    }
     explicit: list[tuple[str, float]] = []
     missing = 0
     for path in paths:
@@ -538,6 +676,8 @@ def _unified_encut(incar_paths, poscars: list, lib_root) -> int | None:
                 incar = parse_incar(handle.read())
         except OSError as exc:
             raise ValueError(f'无法读取成员 INCAR {path}：{exc}') from exc
+        incar.update(overrides.get(
+            os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(path)))), {}))
         if 'ENCUT' not in incar:
             missing += 1
             continue
@@ -556,14 +696,11 @@ def _unified_encut(incar_paths, poscars: list, lib_root) -> int | None:
         conflicts = [(path, value) for path, value in explicit
                      if abs(value - baseline) > 1e-9]
         if conflicts:
-            details = '；'.join(f'{path}={value:g}' for path, value in explicit)
-            raise ValueError(f'各成员 INCAR 的 ENCUT 不一致，不能安全生成吸附能组：{details}')
+            return None
         if not missing:
             return None
         if baseline != int(baseline):
-            raise ValueError(
-                f'部分成员缺 ENCUT，但其余成员使用非整数 ENCUT={baseline:g}；'
-                '请在每个成员 INCAR 中显式写入同一值')
+            return None
         return int(baseline)
     union: set = set()
     for p in poscars:
@@ -594,7 +731,10 @@ def create_project(root: str | os.PathLike, name: str, *,
                    preparation: dict | None = None,
                    fail_if_exists: bool = False,
                    member_incars: dict | None = None,
-                   member_source_evidence: dict | None = None) -> dict:
+                   member_source_evidence: dict | None = None,
+                   member_incar_patches: dict | None = None,
+                   member_quartets: dict | None = None,
+                   member_input_bundles: dict | None = None) -> dict:
     """批量生成 清洁表面 + 构型族 + (可选)气相参考,写 project.yaml 并登记台账。
 
     Returns:
@@ -626,22 +766,133 @@ def create_project(root: str | os.PathLike, name: str, *,
             raise ValueError(f'成员 {source} 的源文件哈希证据格式无效')
         mapped_source_evidence[_source_key(source)] = dict(evidence)
 
+    mapped_incar_patches = {}
+    for source, raw_patches in dict(member_incar_patches or {}).items():
+        if not isinstance(raw_patches, dict):
+            raise ValueError(f'成员 {source} 的 INCAR 智能修复格式无效')
+        patches = {}
+        for raw_key, value in raw_patches.items():
+            key = str(raw_key or '').strip().upper()
+            # The repair planner currently marks only an upward ENCUT alignment
+            # as mechanically safe.  Magnetic initialisation and other physics
+            # choices must remain explicit user decisions.
+            if key != 'ENCUT':
+                raise ValueError(
+                    f'成员 {source} 的 {key or "INCAR"} 不是可自动应用的低风险修复')
+            if isinstance(value, bool):
+                raise ValueError(f'成员 {source} 的 ENCUT 修复值无效：{value!r}')
+            try:
+                number = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f'成员 {source} 的 ENCUT 修复值无效：{value!r}') from exc
+            if not math.isfinite(number) or number <= 0:
+                raise ValueError(f'成员 {source} 的 ENCUT 修复值必须为正数')
+            patches[key] = int(number) if number == int(number) else number
+        if patches:
+            mapped_incar_patches[_source_key(source)] = patches
+    if mapped_incar_patches and not fail_if_exists:
+        raise ValueError(
+            'INCAR 智能修复只允许原子 staging 发布；请启用 fail_if_exists，'
+            '避免修复失败后留下半成品项目')
+
+    supplied_bundles = dict(member_input_bundles or {})
+    for source, quartet in dict(member_quartets or {}).items():
+        if source in supplied_bundles and supplied_bundles[source] != quartet:
+            raise ValueError(f'成员 {source} 的四件套绑定重复且不一致')
+        supplied_bundles[source] = quartet
+    mapped_input_bundles = {}
+    for source, raw_bundle in supplied_bundles.items():
+        if not isinstance(raw_bundle, dict):
+            raise ValueError(f'成员 {source} 的四件套绑定格式无效')
+        bundle = raw_bundle.get('quartet') \
+            if isinstance(raw_bundle.get('quartet'), dict) else raw_bundle
+        mapped_input_bundles[_source_key(source)] = dict(bundle)
+
     def _source_evidence_part(evidence, kind):
         nested = evidence.get(kind)
+        if not isinstance(nested, dict):
+            nested = evidence.get(str(kind).upper())
         if isinstance(nested, dict):
             return (str(nested.get('path') or '').strip(),
                     str(nested.get('sha256') or '').strip().lower())
         return (str(evidence.get(f'{kind}_path') or '').strip(),
                 str(evidence.get(f'{kind}_sha256') or '').strip().lower())
 
-    def _verify_member_sources(label, poscar, source_incar, phase):
-        """Bind method evidence to unchanged source bytes across job generation."""
+    def _normalise_member_bundle(label, poscar):
+        """Re-scan a bundle and reject stale browser/scan evidence."""
+        current = _structure_input_bundle(poscar)
+        supplied = mapped_input_bundles.get(_source_key(poscar))
+        if supplied is None:
+            # ``create_project`` predates same-directory quartet binding and is
+            # also used by the desktop/manual workflow, where ``incar_path`` is
+            # an explicit user choice.  Only an explicit bundle opts a member
+            # into byte-for-byte quartet copying; otherwise preserve the
+            # established POSCAR + selected-INCAR generation contract instead
+            # of silently letting a neighbouring INCAR override that choice.
+            return {
+                'mode': 'generate', 'input_mode': 'generate',
+                'status': 'generatable', 'quartet_status': 'generatable',
+                'files': {}, 'paths': {}, 'sha256': {},
+                'missing': [], 'issues': [],
+            }
+        supplied_mode = str(supplied.get('mode') or '').strip().lower()
+        if supplied_mode and supplied_mode != current['mode']:
+            raise ValueError(
+                f'{label} 的四件套模式在扫描后已变化'
+                f'（{supplied_mode} → {current["mode"]}）；请重新扫描')
+        supplied_files = supplied.get('files') or {}
+        if not isinstance(supplied_files, dict):
+            raise ValueError(f'{label} 的四件套文件证据格式无效')
+        if current['mode'] == 'copy' and set(supplied_files) != set(_VASP_INPUT_NAMES):
+            raise ValueError(f'{label} 的完整四件套缺少文件哈希证据；请重新扫描')
+        for name, record in supplied_files.items():
+            canonical = str(name).upper()
+            if canonical not in _VASP_INPUT_NAMES or not isinstance(record, dict):
+                raise ValueError(f'{label} 的四件套包含无效文件记录：{name}')
+            actual = current['files'].get(canonical) or {}
+            expected_path = str(record.get('path') or '').strip()
+            expected_hash = str(record.get('sha256') or '').strip().lower()
+            if expected_path and _source_key(expected_path) != _source_key(actual.get('path', '')):
+                raise ValueError(f'{label} 的源 {canonical} 路径在扫描后已变化；请重新扫描')
+            if not re.fullmatch(r'[0-9a-f]{64}', expected_hash):
+                raise ValueError(f'{label} 的源 {canonical} 缺少有效 SHA256 证据；请重新扫描')
+            if expected_hash != str(actual.get('sha256') or '').lower():
+                raise ValueError(
+                    f'{label} 的源 {canonical} 在扫描后内容已变化；请重新扫描')
+        return current
+
+    def _verify_member_sources(label, poscar, source_incar, phase, bundle=None):
+        """Bind all relevant source bytes to the scan across generation/copying."""
         evidence = mapped_source_evidence.get(_source_key(poscar))
-        if evidence is None:
+        copy_files = {}
+        if (bundle or {}).get('mode') == 'copy':
+            copy_files = (bundle or {}).get('files') or {}
+        actual_files = {'poscar': poscar, 'incar': source_incar}
+        for canonical in ('KPOINTS', 'POTCAR'):
+            record = copy_files.get(canonical) or {}
+            if record.get('path'):
+                actual_files[canonical.lower()] = record['path']
+        if evidence is None and not copy_files:
             return
-        for kind, display, actual_path in (
-                ('poscar', 'POSCAR', poscar), ('incar', 'INCAR', source_incar)):
-            expected_path, expected_hash = _source_evidence_part(evidence, kind)
+        for kind, actual_path in actual_files.items():
+            display = kind.upper()
+            expected_path, expected_hash = ('', '')
+            if evidence is not None:
+                expected_path, expected_hash = _source_evidence_part(evidence, kind)
+            bundle_record = copy_files.get(display) or {}
+            bundle_path = str(bundle_record.get('path') or '').strip()
+            bundle_hash = str(bundle_record.get('sha256') or '').strip().lower()
+            if not expected_path:
+                expected_path = bundle_path
+            elif bundle_path and _source_key(expected_path) != _source_key(bundle_path):
+                raise ValueError(
+                    f'{label} 的源 {display} 路径证据互相冲突；请重新扫描')
+            if not expected_hash:
+                expected_hash = bundle_hash
+            elif bundle_hash and expected_hash != bundle_hash:
+                raise ValueError(
+                    f'{label} 的源 {display} 哈希证据互相冲突；请重新扫描')
             if not re.fullmatch(r'[0-9a-f]{64}', expected_hash):
                 raise ValueError(
                     f'{label} 的源 {display} 缺少有效 SHA256 证据；'
@@ -666,15 +917,67 @@ def create_project(root: str | os.PathLike, name: str, *,
                    for path in config_poscars)
     if ref_poscar:
         planned.append(('气相参考', ref_poscar))
+    planned_keys = {_source_key(poscar) for _label, poscar in planned}
+    mapped_sources = (
+        ('INCAR 映射', mapped_incars),
+        ('源文件证据', mapped_source_evidence),
+        ('四件套绑定', mapped_input_bundles),
+        ('INCAR 智能修复', mapped_incar_patches),
+    )
+    for display, mapping in mapped_sources:
+        if set(mapping) - planned_keys:
+            raise ValueError(f'{display}包含不属于本项目的成员')
+    member_bundles = {}
+    for label, poscar in planned:
+        bundle = _normalise_member_bundle(label, poscar)
+        member_bundles[_source_key(poscar)] = bundle
+        if bundle.get('status') == 'invalid' or bundle.get('mode') == 'blocked':
+            details = '；'.join(bundle.get('issues') or ['完整四件套未通过输入校验'])
+            raise ValueError(f'{label} 的同目录四件套不可用：{details}')
     member_resolutions = {}
     for label, poscar in planned:
         key = _source_key(poscar)
         selected = mapped_incars.get(key, '')
-        if selected:
+        bundle = member_bundles[key]
+        if bundle.get('mode') == 'copy':
+            quartet_incar = str(
+                ((bundle.get('files') or {}).get('INCAR') or {}).get('path') or '')
+            if selected and _source_key(selected) != _source_key(quartet_incar):
+                raise ValueError(
+                    f'{label} 已绑定同目录完整四件套，不能改用其他 INCAR')
+            resolution = _inspect_incar_file(
+                quartet_incar, source='same_directory_quartet')
+        elif selected:
             resolution = _inspect_incar_file(selected, source='member_mapping')
         else:
             resolution = resolve_structure_incar(poscar, fallback=incar_path)
         member_resolutions[key] = resolution
+
+    # Legacy/internal callers may not have a browser-side scan record.  Take a
+    # local baseline before method completion or any output is created so the
+    # generate path has the same before/after source-race protection as an
+    # explicitly scanned complete quartet.  If the caller did supply evidence,
+    # keep it fail-closed: missing or malformed fields must still be rejected by
+    # _verify_member_sources instead of being silently filled here.
+    for _label, poscar in planned:
+        key = _source_key(poscar)
+        resolution = member_resolutions[key]
+        if key in mapped_source_evidence or resolution.get('status') != 'ready':
+            continue
+        try:
+            mapped_source_evidence[key] = {
+                'poscar': {
+                    'path': str(Path(poscar).expanduser().resolve()),
+                    'sha256': manifest_mod.sha256_file(poscar).lower(),
+                },
+                'incar': {
+                    'path': str(Path(resolution['path']).expanduser().resolve()),
+                    'sha256': manifest_mod.sha256_file(resolution['path']).lower(),
+                },
+            }
+        except OSError as exc:
+            raise ValueError(
+                f'{_label} 的 POSCAR/INCAR 无法建立生成前哈希基线：{exc}') from exc
     clean_resolution = member_resolutions[_source_key(clean_poscar)]
     if clean_resolution.get('status') != 'ready':
         details = '；'.join(clean_resolution.get('issues') or ['没有可用的 INCAR'])
@@ -695,7 +998,8 @@ def create_project(root: str | os.PathLike, name: str, *,
         resolution = member_resolutions[_source_key(poscar)]
         if resolution.get('status') == 'ready':
             _verify_member_sources(
-                label, poscar, resolution['path'], '生成前')
+                label, poscar, resolution['path'], '生成前',
+                member_bundles[_source_key(poscar)])
 
     # Resolve the group ENCUT before creating either the final target or its
     # atomic staging directory.  A method conflict must leave no filesystem
@@ -704,10 +1008,16 @@ def create_project(root: str | os.PathLike, name: str, *,
         (poscar, member_resolutions[_source_key(poscar)]['path'])
         for _label, poscar in planned
         if member_resolutions[_source_key(poscar)].get('status') == 'ready'
+        and member_bundles[_source_key(poscar)].get('mode') == 'generate'
     ]
     force_encut = _unified_encut(
         [incar for _poscar, incar in valid_planned],
         [poscar for poscar, _incar in valid_planned], lib_root,
+        incar_overrides={
+            member_resolutions[_source_key(poscar)]['path']:
+            mapped_incar_patches.get(_source_key(poscar), {})
+            for poscar, _incar in valid_planned
+        },
     ) if validate else None
 
     final_root = Path(root).expanduser().resolve()
@@ -724,8 +1034,173 @@ def create_project(root: str | os.PathLike, name: str, *,
         root.mkdir(parents=True, exist_ok=True)
     generated, errors = [], []
 
+    def _apply_incar_patches(poscar, source_incar, managed_incar):
+        """Apply allow-listed fixes only to the managed INCAR copy."""
+        patches = mapped_incar_patches.get(_source_key(poscar)) or {}
+        if not patches:
+            return None
+        source_path = Path(source_incar)
+        managed_path = Path(managed_incar)
+        source_text = source_path.read_text(encoding='utf-8', errors='replace')
+        managed_text = managed_path.read_text(encoding='utf-8', errors='replace')
+        source_hash_before = manifest_mod.sha256_file(source_path)
+        managed_hash_before = manifest_mod.sha256_file(managed_path)
+        backup_path = managed_path.with_name('INCAR.source.bak')
+        source_values = parse_incar(source_text)
+        managed_values = parse_incar(managed_text)
+        changes = []
+        for key, new_value in patches.items():
+            old_value = source_values.get(key)
+            try:
+                old_number = None if old_value is None else float(old_value)
+                managed_number = (None if managed_values.get(key) is None
+                                  else float(managed_values[key]))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f'{Path(poscar).name} 的 {key} 现值无法安全自动修复') from exc
+            new_number = float(new_value)
+            if old_number is not None and new_number + 1e-10 < old_number:
+                raise ValueError(f'{key} 低风险修复只能保持或提高原值，不能降低')
+            if managed_number is not None and new_number + 1e-10 < managed_number:
+                raise ValueError(f'{key} 低风险修复不能降低已生成的安全值')
+            if old_number is not None and abs(old_number - new_number) <= 1e-10:
+                continue
+            rendered = str(new_value)
+            pattern = re.compile(
+                rf'(?im)(^|;)([ \t]*{re.escape(key)}[ \t]*=[ \t]*)'
+                r'([^;#!\r\n]*?)(?=[ \t]*(?:;|[#!]|\r?$))')
+            managed_text, replacements = pattern.subn(
+                lambda match: match.group(1) + match.group(2) + rendered,
+                managed_text)
+            if not replacements:
+                managed_text = managed_text.rstrip('\r\n') + f'\n{key} = {rendered}\n'
+            changes.append({
+                'key': key, 'old': old_value, 'new': new_value,
+                'risk': 'low',
+            })
+        if not changes:
+            return None
+        # Back up the exact managed file that is about to be changed.  In the
+        # generated-input path this may already contain deterministic
+        # completions and is not necessarily byte-identical to the user source.
+        shutil.copy2(managed_path, backup_path)
+        if manifest_mod.sha256_file(backup_path) != managed_hash_before:
+            raise ValueError('INCAR 智能修复备份哈希不一致，已停止发布项目')
+        managed_path.write_text(managed_text, encoding='utf-8')
+        final_values = parse_incar(managed_text)
+        for change in changes:
+            try:
+                actual = float(final_values.get(change['key']))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f'{change["key"]} 智能修复写入后无法复核') from exc
+            if abs(actual - float(change['new'])) > 1e-10:
+                raise ValueError(f'{change["key"]} 智能修复写入后数值不一致')
+        if manifest_mod.sha256_file(source_path) != source_hash_before:
+            raise ValueError('源 INCAR 在智能修复期间发生变化；请重新扫描')
+        return {
+            'schema': 1, 'risk': 'low', 'source_unchanged': True,
+            'source_incar': {
+                'path': str(source_path.resolve()),
+                'sha256': source_hash_before,
+            },
+            'backup': {
+                # Relative paths survive the atomic staging-directory rename.
+                'path': backup_path.name,
+                'sha256': managed_hash_before,
+            },
+            'managed_before_sha256': managed_hash_before,
+            'final_incar': {
+                # Relative to the managed job directory: in atomic mode the
+                # staging root is renamed after this evidence is recorded.
+                'path': 'INCAR',
+                'sha256': manifest_mod.sha256_file(managed_path),
+            },
+            'changes': changes,
+        }
+
     # 项目级统一 ENCUT:各成员元素并集算一个 ENCUT,防 ΔE 大数相减被不同基组污染。
     # 仅当用户 INCAR 未显式给 ENCUT 时生效(用户值永远尊重);算不出则回落逐成员(旧行为)。
+    def _copied_task_type(incar):
+        def _integer(value, default):
+            try:
+                if isinstance(value, bool):
+                    return default
+                return int(float(value))
+            except (TypeError, ValueError):
+                return default
+        if _integer(incar.get('IBRION'), -1) in (5, 6, 7, 8):
+            return 'freq'
+        return 'static' if _integer(incar.get('NSW'), 0) <= 0 else 'relax'
+
+    def _copy_quartet(member, poscar, calc_type, source_incar, bundle, out):
+        """Copy a validated quartet byte-for-byte and create an audited manifest."""
+        files = bundle.get('files') or {}
+        if set(files) != set(_VASP_INPUT_NAMES):
+            raise ValueError(f'{member} 的 copy 四件套证据不完整')
+        out.mkdir(parents=True, exist_ok=True)
+        for filename in _VASP_INPUT_NAMES:
+            source = files[filename]['path']
+            destination = out / filename
+            shutil.copy2(source, destination)
+            copied_hash = manifest_mod.sha256_file(destination).lower()
+            if copied_hash != str(files[filename]['sha256']).lower():
+                raise ValueError(
+                    f'{member} 的 {filename} 复制结果与扫描哈希不一致；'
+                    '源文件可能在复制期间变化')
+
+        repairs = _apply_incar_patches(poscar, source_incar, out / 'INCAR')
+        from vcstudio.project.result_import import validate_vasp_quartet
+        copied_issues = validate_vasp_quartet(out)
+        if copied_issues:
+            raise ValueError(
+                f'{member} 的复制后四件套未通过校验：'
+                + '；'.join(copied_issues))
+
+        poscar_text = read_poscar(out / 'POSCAR')
+        elements, _counts = parse_poscar_species(poscar_text)
+        with open(out / 'INCAR', 'r', encoding='utf-8', errors='replace') as handle:
+            incar = parse_incar(handle.read())
+        with open(out / 'KPOINTS', 'r', encoding='utf-8', errors='replace') as handle:
+            kpoints_info = methods_text.parse_kpoints_scheme(handle.read()) or {}
+        with open(out / 'POTCAR', 'r', encoding='utf-8', errors='replace') as handle:
+            potcar_rows = methods_text.parse_potcar_titels(handle.read())
+        build_result = {
+            'ok': True, 'out_dir': str(out), 'warnings': [],
+            'kpoints': list(kpoints_info.get('grid') or []),
+            'elements': list(elements), 'completions': {},
+            'calc_type': calc_type, 'task_type': _copied_task_type(incar),
+            'potcar': potcar_rows,
+        }
+        job_manifest = manifest_mod.create_from_build(
+            str(out), build_result, poscar_path=poscar,
+            incar_path=source_incar, validate=validate)
+        job_manifest.setdefault('inputs', {})['input_mode'] = 'copy'
+        job_manifest['inputs']['source_quartet'] = {
+            filename: {
+                'path': str(files[filename]['path']),
+                'sha256': str(files[filename]['sha256']).lower(),
+            }
+            for filename in _VASP_INPUT_NAMES
+        }
+        if repairs:
+            job_manifest['inputs']['incar_repairs'] = repairs
+        # create_from_build already hashes the final managed inputs.  Assert the
+        # invariant here before publishing the manifest/staging directory.
+        final_hashes = job_manifest['inputs'].get('sha256') or {}
+        if set(final_hashes) != set(_VASP_INPUT_NAMES):
+            raise ValueError(f'{member} 的最终四件套哈希记录不完整')
+        for filename in _VASP_INPUT_NAMES:
+            if filename == 'INCAR' and repairs:
+                if final_hashes[filename].lower() != \
+                        repairs['final_incar']['sha256'].lower():
+                    raise ValueError(f'{member} 的修复后 INCAR 哈希记录不一致')
+                continue
+            if final_hashes[filename].lower() != files[filename]['sha256'].lower():
+                raise ValueError(f'{member} 的最终 {filename} 不是源文件的字节级副本')
+        manifest_mod.save_manifest(out, job_manifest)
+        return build_result
+
     def _gen(member: str, poscar: str, calc_type: str):
         resolution = member_resolutions[_source_key(poscar)]
         if resolution.get('status') != 'ready':
@@ -733,13 +1208,47 @@ def create_project(root: str | os.PathLike, name: str, *,
             raise ValueError(f'{poscar} 的 INCAR 不可用：{details}')
         source_incar = resolution['path']
         out = root / member
-        _verify_member_sources(member, poscar, source_incar, '复制前')
-        res = build_job_dir(poscar, source_incar, str(out), calc_type=calc_type,
-                            kpoints=kpoints, validate=validate, lib_root=lib_root,
-                            force_encut=force_encut)
-        _verify_member_sources(member, poscar, source_incar, '复制后')
-        manifest_mod.create_from_build(str(out), res, poscar_path=poscar,
-                                       incar_path=source_incar, validate=validate)
+        bundle = member_bundles[_source_key(poscar)]
+        _verify_member_sources(member, poscar, source_incar, '复制前', bundle)
+        if bundle.get('mode') == 'copy':
+            res = _copy_quartet(
+                member, poscar, calc_type, source_incar, bundle, out)
+        else:
+            res = build_job_dir(poscar, source_incar, str(out), calc_type=calc_type,
+                                kpoints=kpoints, validate=validate, lib_root=lib_root,
+                                force_encut=force_encut)
+            repairs = _apply_incar_patches(poscar, source_incar, out / 'INCAR')
+            # This is a directory-local execution check only: POSCAR atom
+            # counts/order must match this member's MAGMOM, Hubbard vectors and
+            # generated POTCAR.  It deliberately does not demand cross-member
+            # ISPIN/MAGMOM equality or treat a positive low ENCUT as invalid.
+            from vcstudio.project.result_import import validate_vasp_quartet
+            generated_issues = validate_vasp_quartet(out)
+            if generated_issues:
+                phase = '修复后' if repairs else '生成后'
+                raise ValueError(
+                    f'{member} 的{phase}四件套未通过校验：'
+                    + '；'.join(generated_issues))
+            job_manifest = manifest_mod.create_from_build(
+                str(out), res, poscar_path=poscar,
+                incar_path=source_incar, validate=validate)
+            job_manifest.setdefault('inputs', {})['input_mode'] = 'generate'
+            if repairs:
+                job_manifest['inputs']['incar_repairs'] = repairs
+            final_hashes = job_manifest['inputs'].get('sha256') or {}
+            if set(final_hashes) != set(_VASP_INPUT_NAMES):
+                raise ValueError(f'{member} 的最终四件套哈希记录不完整')
+            for filename in _VASP_INPUT_NAMES:
+                try:
+                    actual_hash = manifest_mod.sha256_file(out / filename).lower()
+                except OSError as exc:
+                    raise ValueError(
+                        f'{member} 的最终 {filename} 无法读取：{exc}') from exc
+                if actual_hash != str(final_hashes[filename]).lower():
+                    raise ValueError(
+                        f'{member} 的最终 {filename} 与清单哈希不一致')
+            manifest_mod.save_manifest(out, job_manifest)
+        _verify_member_sources(member, poscar, source_incar, '复制后', bundle)
         if stage_root is None:
             ledger.register(str(out))
         generated.append((member, str(out), res['warnings']))
@@ -857,12 +1366,27 @@ def create_project(root: str | os.PathLike, name: str, *,
         advisories = _project_advisories(clean_resolution['path'],
                                          [str(root / Path(d).name) for d in config_dirs],
                                          ref_poscar, generated, lib_root)
-        if stage_root is not None:
-            os.replace(stage_root, final_root)
         ppath = final_root / PROJECT_NAME
-        for _member, job_dir, _warnings in generated:
-            ledger.register(_published(job_dir))
-        register_project(ppath)
+        registered_jobs = []
+        project_registered = False
+        published_atomically = False
+        try:
+            if stage_root is not None:
+                os.replace(stage_root, final_root)
+                published_atomically = True
+            for _member, job_dir, _warnings in generated:
+                published_job = _published(job_dir)
+                if ledger.register(published_job):
+                    registered_jobs.append(published_job)
+            project_registered = register_project(ppath)
+        except Exception:
+            if project_registered:
+                unregister_project(ppath)
+            for job_dir in reversed(registered_jobs):
+                ledger.unregister(job_dir)
+            if published_atomically and final_root.exists():
+                shutil.rmtree(final_root, ignore_errors=True)
+            raise
         generated = [(member, _published(path), warnings)
                      for member, path, warnings in generated]
         return {'ok': True, 'project_path': str(ppath), 'project': project,
@@ -1128,21 +1652,53 @@ def _energy_pair_method_check(left_dir, left_label, right_dir, right_label,
     ]
     check = energy_gate.compare_methods(
         records, require_same_kpoints=require_same_kpoints)
-    if not require_same_kpoints and check.get('issues'):
-        # A gas molecule may legitimately use a different spin setting, and a
-        # catalyst-only Hubbard U vector naturally differs from the molecule.
-        # Keep both visible for audit, but only shared method invariants/POTCAR
-        # identities are hard cross-cell blockers.
-        soft_prefixes = ('ISPIN 不一致', 'DFT+U 不一致')
-        soft = [issue for issue in check['issues'] if issue.startswith(soft_prefixes)]
+    if not require_same_kpoints:
+        # A molecular reference necessarily uses a different cell and normally
+        # Γ-only sampling.  K-point equality is therefore neither required nor
+        # meaningful for this cross-cell subtraction; retain it as audit context
+        # without downgrading otherwise complete method evidence.
+        kpoint_notes = [
+            warning for warning in (check.get('warnings') or [])
+            if warning.startswith('K 点')]
+        if kpoint_notes:
+            check['warnings'] = [
+                warning for warning in check['warnings']
+                if warning not in kpoint_notes]
+            check['advisories'] = list(dict.fromkeys([
+                *(check.get('advisories') or []),
+                *(warning + '；分子参考与周期体系晶胞不同，此差异不阻断'
+                  for warning in kpoint_notes),
+            ]))
+    if check.get('issues'):
+        # ISPIN/MAGMOM describe each system's own magnetic ground-state search.
+        # clean=1 and adsorption=2 can be a legitimate adsorption-induced
+        # magnetic solution, so spin is never a cross-directory hard blocker.
+        # Gas-vs-periodic DFT+U remains soft here for backward compatibility;
+        # common-element U identities are audited separately when provenance is
+        # available instead of comparing raw vectors with different species order.
+        legal_spin_difference = all(
+            row.get('known', {}).get('spin')
+            and (row.get('fingerprint') or {}).get('spin') in {1, 2}
+            for row in records)
+        spin_soft = ([issue for issue in check['issues']
+                      if issue.startswith('ISPIN 不一致')]
+                     if legal_spin_difference else [])
+        u_soft = ([issue for issue in check['issues']
+                   if issue.startswith('DFT+U 不一致')]
+                  if not require_same_kpoints else [])
+        soft = spin_soft + u_soft
         if soft:
             check['issues'] = [issue for issue in check['issues'] if issue not in soft]
+            check['advisories'] = list(dict.fromkeys([
+                *(check.get('advisories') or []),
+                *(issue + '；不同体系可采用各自基态自旋设置' for issue in spin_soft),
+            ]))
             check['warnings'] = list(dict.fromkeys([
                 *(check.get('warnings') or []),
-                *(issue + '；气相/周期体系差异需人工核对' for issue in soft),
+                *(issue + '；气相/周期体系差异需人工核对' for issue in u_soft),
             ]))
-            check['status'] = ('incompatible' if check['issues']
-                               else ('verified' if not check['warnings'] else 'unverified'))
+    check['status'] = ('incompatible' if check.get('issues')
+                       else ('verified' if not check.get('warnings') else 'unverified'))
     return check
 
 
@@ -1160,9 +1716,11 @@ def _row_method_check(slab_dir, config_dir, reference_dir=None) -> dict:
         issue for check in checks for issue in (check.get('issues') or [])))
     warnings = list(dict.fromkeys(
         warning for check in checks for warning in (check.get('warnings') or [])))
+    advisories = list(dict.fromkeys(
+        item for check in checks for item in (check.get('advisories') or [])))
     status = 'incompatible' if issues else ('verified' if not warnings else 'unverified')
     return {'status': status, 'issues': issues, 'warnings': warnings,
-            'checks': checks}
+            'advisories': advisories, 'checks': checks}
 
 
 def delta_e_rows(project: dict) -> dict:
@@ -1271,6 +1829,10 @@ def delta_e_rows(project: dict) -> dict:
                 blockers.append(ref_error or '气相参考能量缺失或不合理')
         if method_check['status'] == 'incompatible':
             blockers.append('能量项方法不一致：' + '；'.join(method_check['issues']))
+        elif method_check['status'] == 'unverified':
+            blockers.append(
+                '能量项方法证据不完整：' + '；'.join(method_check['warnings'])
+                + '；自动 ΔE 与最终报告已暂停')
         if not blockers:
             if sp_ref is not None:
                 delta = e_cfg - e_slab - sp_ref
@@ -1290,7 +1852,8 @@ def delta_e_rows(project: dict) -> dict:
                      'reference_valid': reference_valid,
                      'reference_note': reference_note,
                      'method_check': method_check,
-                     'method_warnings': method_check['warnings']})
+                     'method_warnings': method_check['warnings'],
+                     'method_advisories': method_check.get('advisories') or []})
 
     # 多构型取最稳:按 species 分组求组内最低 ΔE,标注 is_most_stable 与相对 ΔΔE
     group_min: dict = {}
@@ -1315,6 +1878,8 @@ def delta_e_rows(project: dict) -> dict:
         issue for check in method_checks for issue in (check.get('issues') or [])))
     method_warnings = list(dict.fromkeys(
         warning for check in method_checks for warning in (check.get('warnings') or [])))
+    method_advisories = list(dict.fromkeys(
+        item for check in method_checks for item in (check.get('advisories') or [])))
     method_status = ('incompatible' if method_issues
                      else ('verified' if not method_warnings else 'unverified'))
     dataset_groups = list(project.get('dataset_groups') or [])
@@ -1331,8 +1896,9 @@ def delta_e_rows(project: dict) -> dict:
             'species_refs': resolved_refs, 'species_ref_cache': species_refs,
             'species_reference_evidence': list(reference_index.values()),
             'dataset_groups': dataset_groups,
-            'method_consistency': {'status': method_status, 'issues': method_issues,
-                                   'warnings': method_warnings},
+        'method_consistency': {'status': method_status, 'issues': method_issues,
+                               'warnings': method_warnings,
+                               'advisories': method_advisories},
             'rows': rows}
 
 

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from vcstudio.cluster import ledger
+from vcstudio.generate.incar_builder import parse_incar
 from vcstudio.project import adsorption
 from vcstudio.shared import manifest
 
@@ -15,7 +16,8 @@ def env(tmp_path, monkeypatch):
     lib = tmp_path / 'lib'
     (lib / 'C').mkdir(parents=True)
     (lib / 'C' / 'POTCAR').write_text(
-        ' fake PAW_PBE C\n   ENMAX  =  273.214; ENMIN = 200.000 eV\n', encoding='utf-8')
+        ' TITEL = PAW_PBE C 08Apr2002\n'
+        '   ENMAX  =  273.214; ENMIN = 200.000 eV\n', encoding='utf-8')
 
     def poscar(name, element='C'):
         p = tmp_path / name
@@ -49,7 +51,13 @@ def _make_species_ref_job(job_dir, *, energy=-38.072771, state='DONE',
     ref = manifest.new_manifest(job_id='ref', system='Li2S8', task_type='relax',
                                 calc_type='molecule', inputs={})
     manifest.set_state(ref, state)
-    ref['results'].update(energy_e0_eV=energy, energy_source=source)
+    ref['results'].update(
+        energy_e0_eV=energy, energy_source=source,
+        reference_method_signature={
+            'functional': 'PBE', 'ivdw': 0, 'encut': 400.0, 'ispin': 1,
+            'ldau': 'F', 'potcar_titel': ['PAW_PBE C 08Apr2002'],
+            'potcar_elements': ['C'],
+        })
     manifest.save_manifest(job_dir, ref)
     (job_dir / 'OSZICAR').write_text(
         f' 1 F= {energy:.12f} E0= {energy:.12f} d E =0\n', encoding='utf-8')
@@ -58,13 +66,33 @@ def _make_species_ref_job(job_dir, *, energy=-38.072771, state='DONE',
     return job_dir
 
 
-def _set_actual_method(job_dir, functional, *, ispin=1):
+def _set_actual_method(job_dir, functional, *, ispin=1, **overrides):
     item = manifest.load_manifest(job_dir)
-    item.setdefault('results', {})['reference_method_signature'] = {
+    signature = {
         'functional': functional, 'ivdw': 0, 'encut': 400.0, 'ispin': ispin,
         'ldau': 'F', 'potcar_titel': ['PAW_PBE C'], 'potcar_elements': ['C'],
     }
+    signature.update(overrides)
+    item.setdefault('results', {})['reference_method_signature'] = signature
     manifest.save_manifest(job_dir, item)
+
+
+def _write_valid_quartet(folder: Path, *, nsw=0, encut=400, marker='') -> Path:
+    """Write a minimal scientifically valid quartet with distinguishable bytes."""
+    folder.mkdir(parents=True, exist_ok=True)
+    files = {
+        'POSCAR': (
+            f'C {marker}\n1.0\n10 0 0\n0 10 0\n0 0 10\nC\n1\n'
+            'Cartesian\n0 0 0\n'),
+        'INCAR': f'ENCUT = {encut}\nNSW = {nsw}\nISMEAR = 0\n# {marker}\n',
+        'KPOINTS': f'{marker}\n0\nGamma\n2 2 1\n0 0 0\n',
+        'POTCAR': (
+            'TITEL = PAW_PBE C 08Apr2002\n'
+            f'   ENMAX = 300.000; marker={marker}\n'),
+    }
+    for name, text in files.items():
+        (folder / name).write_bytes(text.encode('utf-8'))
+    return folder / 'POSCAR'
 
 
 def test_create_project_generates_members_and_registers(env):
@@ -106,9 +134,11 @@ def test_project_unifies_encut_across_members(tmp_path, monkeypatch):
     (lib / 'C').mkdir(parents=True)
     (lib / 'O').mkdir(parents=True)
     (lib / 'C' / 'POTCAR').write_text(
-        ' PAW_PBE C\n   ENMAX  =  273.214 eV\n', encoding='utf-8')
+        ' TITEL = PAW_PBE C 08Apr2002\n'
+        '   ENMAX  =  273.214 eV\n', encoding='utf-8')
     (lib / 'O' / 'POTCAR').write_text(
-        ' PAW_PBE O\n   ENMAX  =  400.000 eV\n', encoding='utf-8')
+        ' TITEL = PAW_PBE O 08Apr2002\n'
+        '   ENMAX  =  400.000 eV\n', encoding='utf-8')
     monkeypatch.setattr(ledger, 'default_ledger_path', lambda: tmp_path / 'jobs.json')
     monkeypatch.setattr(adsorption, 'default_registry_path', lambda: tmp_path / 'projects.json')
 
@@ -117,8 +147,9 @@ def test_project_unifies_encut_across_members(tmp_path, monkeypatch):
 
     def poscar(name, species, counts):
         p = tmp_path / name
+        coordinates = '0 0 0\n' * sum(int(value) for value in counts.split())
         p.write_text(f'{name}\n1.0\n10 0 0\n0 10 0\n0 0 10\n{species}\n{counts}\n'
-                     'Cartesian\n0 0 0\n', encoding='utf-8')
+                     f'Cartesian\n{coordinates}', encoding='utf-8')
         return str(p)
 
     res = adsorption.create_project(
@@ -219,6 +250,8 @@ def test_delta_e_blocks_known_pbe_rpbe_method_mismatch(env):
     _finish(config, -110.0)
     _set_actual_method(clean, 'PBE')
     _set_actual_method(config, 'RPBE')
+    project['preparation'] = {'method_check': {'confirmation': {
+        'confirmed': True, 'reason': '确认不能覆盖已知方法冲突'}}}
 
     summary = adsorption.delta_e_rows(project)
     row = summary['rows'][0]
@@ -251,14 +284,14 @@ def test_delta_e_allows_molecular_ispin_difference_with_audit_warning(env):
     row = summary['rows'][0]
 
     assert row['delta_e'] == pytest.approx(-5.0)
-    assert row['method_check']['status'] == 'unverified'
+    assert row['method_check']['status'] == 'verified'
     assert not row['method_check']['issues']
-    assert any('ISPIN 不一致' in warning and '人工核对' in warning
-               for warning in row['method_check']['warnings'])
-    assert summary['method_consistency']['status'] == 'unverified'
+    assert any('ISPIN 不一致' in advisory and '各自基态自旋' in advisory
+               for advisory in row['method_check']['advisories'])
+    assert summary['method_consistency']['status'] == 'verified'
 
 
-def test_delta_e_still_blocks_clean_slab_and_adsorption_ispin_difference(env):
+def test_delta_e_allows_clean_slab_and_adsorption_ispin_difference_with_advisory(env):
     result = adsorption.create_project(
         env['tmp'] / 'spin-periodic-mismatch', 'spin-periodic-mismatch',
         clean_poscar=env['poscar']('strict-spin-slab.vasp'),
@@ -275,10 +308,131 @@ def test_delta_e_still_blocks_clean_slab_and_adsorption_ispin_difference(env):
     summary = adsorption.delta_e_rows(project)
     row = summary['rows'][0]
 
+    assert row['delta_e'] == pytest.approx(-15.0)
+    assert row['method_check']['status'] == 'verified'
+    assert not row['method_check']['issues']
+    assert any('ISPIN 不一致' in advisory and '各自基态自旋' in advisory
+               for advisory in row['method_check']['advisories'])
+    assert summary['method_consistency']['status'] == 'verified'
+
+
+def test_delta_e_does_not_soften_illegal_ispin_value(env):
+    result = adsorption.create_project(
+        env['tmp'] / 'invalid-result-spin', 'invalid-result-spin',
+        clean_poscar=env['poscar']('invalid-spin-slab.vasp'),
+        config_poscars=[env['poscar']('invalid-spin-config.vasp')],
+        incar_path=env['incar'], lib_root=env['lib'])
+    project = adsorption.load_project(result['project_path'])
+    clean = project['members']['clean_slab']
+    config = project['members']['configs'][0]
+    _finish(clean, -100.0)
+    _finish(config, -115.0)
+    _set_actual_method(clean, 'PBE', ispin=1)
+    _set_actual_method(config, 'PBE', ispin=3)
+
+    summary = adsorption.delta_e_rows(project)
+    row = summary['rows'][0]
+
     assert row['delta_e'] is None
     assert row['method_check']['status'] == 'incompatible'
-    assert any('ISPIN 不一致' in issue for issue in row['method_check']['issues'])
+    assert any('ISPIN 非法' in issue for issue in row['method_check']['issues'])
+    assert not any('ISPIN 不一致' in advisory
+                   for advisory in row['method_check']['advisories'])
+
+
+def test_delta_e_blocks_shared_element_dft_u_difference(env):
+    result = adsorption.create_project(
+        env['tmp'] / 'shared-u-mismatch', 'shared-u-mismatch',
+        clean_poscar=env['poscar']('u-slab.vasp'),
+        config_poscars=[env['poscar']('u-config.vasp')],
+        incar_path=env['incar'], lib_root=env['lib'])
+    project = adsorption.load_project(result['project_path'])
+    clean = project['members']['clean_slab']
+    config = project['members']['configs'][0]
+    _finish(clean, -100.0)
+    _finish(config, -115.0)
+    common = {
+        'ldau': 'T', 'ldautype': 2, 'ldaul': [2], 'ldauj': [0.0],
+    }
+    _set_actual_method(clean, 'PBE', ldauu=[3.0], **common)
+    _set_actual_method(config, 'PBE', ldauu=[4.0], **common)
+
+    summary = adsorption.delta_e_rows(project)
+    row = summary['rows'][0]
+
+    assert row['delta_e'] is None
+    assert row['method_check']['status'] == 'incompatible'
+    assert any('C 的 DFT+U 参数不一致' in issue
+               for issue in row['method_check']['issues'])
     assert summary['method_consistency']['status'] == 'incompatible'
+
+
+def test_delta_e_blocks_encut_difference_after_jobs_finish(env):
+    result = adsorption.create_project(
+        env['tmp'] / 'encut-result-mismatch', 'encut-result-mismatch',
+        clean_poscar=env['poscar']('encut-result-slab.vasp'),
+        config_poscars=[env['poscar']('encut-result-config.vasp')],
+        incar_path=env['incar'], lib_root=env['lib'])
+    project = adsorption.load_project(result['project_path'])
+    clean = project['members']['clean_slab']
+    config = project['members']['configs'][0]
+    _finish(clean, -100.0)
+    _finish(config, -115.0)
+    _set_actual_method(clean, 'PBE', encut=400.0)
+    _set_actual_method(config, 'PBE', encut=500.0)
+
+    summary = adsorption.delta_e_rows(project)
+    row = summary['rows'][0]
+
+    assert row['delta_e'] is None
+    assert row['method_check']['status'] == 'incompatible'
+    assert any('ENCUT 不一致' in issue for issue in row['method_check']['issues'])
+    assert summary['method_consistency']['status'] == 'incompatible'
+
+
+def test_delta_e_blocks_shared_potcar_identity_difference(env):
+    result = adsorption.create_project(
+        env['tmp'] / 'potcar-result-mismatch', 'potcar-result-mismatch',
+        clean_poscar=env['poscar']('potcar-result-slab.vasp'),
+        config_poscars=[env['poscar']('potcar-result-config.vasp')],
+        incar_path=env['incar'], lib_root=env['lib'])
+    project = adsorption.load_project(result['project_path'])
+    clean = project['members']['clean_slab']
+    config = project['members']['configs'][0]
+    _finish(clean, -100.0)
+    _finish(config, -115.0)
+    _set_actual_method(clean, 'PBE', potcar_titel=['PAW_PBE C'])
+    _set_actual_method(config, 'PBE', potcar_titel=['PAW_PBE C_h'])
+
+    summary = adsorption.delta_e_rows(project)
+    row = summary['rows'][0]
+
+    assert row['delta_e'] is None
+    assert row['method_check']['status'] == 'incompatible'
+    assert any('C 的 POTCAR TITEL 不一致' in issue
+               for issue in row['method_check']['issues'])
+
+
+def test_delta_e_blocks_when_critical_method_evidence_is_missing(env):
+    result = adsorption.create_project(
+        env['tmp'] / 'missing-method-evidence', 'missing-method-evidence',
+        clean_poscar=env['poscar']('missing-method-slab.vasp'),
+        config_poscars=[env['poscar']('missing-method-config.vasp')],
+        incar_path=env['incar'], lib_root=env['lib'])
+    project = adsorption.load_project(result['project_path'])
+    clean = project['members']['clean_slab']
+    config = project['members']['configs'][0]
+    _finish(clean, -100.0)
+    _finish(config, -115.0)
+    os.unlink(os.path.join(config, 'INCAR'))
+
+    summary = adsorption.delta_e_rows(project)
+    row = summary['rows'][0]
+
+    assert row['delta_e'] is None
+    assert row['method_check']['status'] == 'unverified'
+    assert '方法证据不完整' in row['note']
+    assert '自动 ΔE 与最终报告已暂停' in row['note']
 
 
 def test_delta_e_without_ref_notes_formula(env):
@@ -483,6 +637,251 @@ def test_resolve_structure_incar_never_uses_fallback_over_local_symlink(tmp_path
     assert any('符号链接' in issue for issue in result['issues'])
 
 
+def test_complete_quartets_copy_byte_identically_without_potcar_library(tmp_path,
+                                                                       monkeypatch):
+    monkeypatch.setattr(ledger, 'default_ledger_path', lambda: tmp_path / 'jobs.json')
+    monkeypatch.setattr(adsorption, 'default_registry_path',
+                        lambda: tmp_path / 'projects.json')
+    clean = _write_valid_quartet(tmp_path / 'clean', nsw=0, marker='clean bytes')
+    config = _write_valid_quartet(tmp_path / 'Li2S8_top', nsw=24,
+                                  marker='config bytes')
+    clean_quartet = adsorption.resolve_structure_quartet(clean)
+    config_quartet = adsorption.resolve_structure_quartet(config)
+
+    assert clean_quartet['mode'] == 'copy' and clean_quartet['status'] == 'ready'
+    assert set(clean_quartet['files']) == {'POSCAR', 'INCAR', 'KPOINTS', 'POTCAR'}
+    result = adsorption.create_project(
+        tmp_path / 'copied-project', 'copied', clean_poscar=str(clean),
+        config_poscars=[str(config)], lib_root=str(tmp_path / 'missing-potcar-lib'),
+        member_quartets={str(clean): clean_quartet, str(config): config_quartet},
+        fail_if_exists=True)
+
+    project = adsorption.load_project(result['project_path'])
+    for source_dir, job_dir in (
+            (clean.parent, project['members']['clean_slab']),
+            (config.parent, project['members']['configs'][0])):
+        for name in ('POSCAR', 'INCAR', 'KPOINTS', 'POTCAR'):
+            assert (Path(job_dir) / name).read_bytes() == (source_dir / name).read_bytes()
+        job = manifest.load_manifest(job_dir)
+        assert job['inputs']['input_mode'] == 'copy'
+        assert job['inputs']['sha256'] == {
+            name: manifest.sha256_file(source_dir / name)
+            for name in ('INCAR', 'POSCAR', 'KPOINTS', 'POTCAR')
+        }
+        assert job['inputs']['source_quartet']['POTCAR']['path'] == \
+            str((source_dir / 'POTCAR').resolve())
+
+
+def test_quartet_hash_change_after_scan_blocks_atomic_project(tmp_path, monkeypatch):
+    monkeypatch.setattr(ledger, 'default_ledger_path', lambda: tmp_path / 'jobs.json')
+    monkeypatch.setattr(adsorption, 'default_registry_path',
+                        lambda: tmp_path / 'projects.json')
+    clean = _write_valid_quartet(tmp_path / 'clean', marker='clean')
+    config = _write_valid_quartet(tmp_path / 'config', marker='before')
+    quartets = {
+        str(clean): adsorption.resolve_structure_quartet(clean),
+        str(config): adsorption.resolve_structure_quartet(config),
+    }
+    (config.parent / 'KPOINTS').write_text(
+        'changed after scan\n0\nGamma\n3 3 1\n0 0 0\n', encoding='utf-8')
+    target = tmp_path / 'race-project'
+
+    with pytest.raises(ValueError, match='KPOINTS.*内容已变化.*重新扫描'):
+        adsorption.create_project(
+            target, 'race', clean_poscar=str(clean), config_poscars=[str(config)],
+            member_quartets=quartets, fail_if_exists=True)
+
+    assert not target.exists()
+
+
+def test_invalid_complete_quartet_never_falls_back_to_generation(env, monkeypatch):
+    clean = _write_valid_quartet(env['tmp'] / 'bad-quartet', marker='bad-potcar')
+    config = _write_valid_quartet(env['tmp'] / 'valid-quartet', marker='valid')
+    (clean.parent / 'POTCAR').write_text(
+        'TITEL = PAW_PBE O 08Apr2002\nENMAX = 400\n', encoding='utf-8')
+    resolution = adsorption.resolve_structure_quartet(clean)
+    target = env['tmp'] / 'must-not-generate'
+    called = False
+
+    def forbidden_build(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError('invalid complete quartet must not be regenerated')
+
+    monkeypatch.setattr(adsorption, 'build_job_dir', forbidden_build)
+    assert resolution['status'] == 'invalid' and resolution['mode'] == 'blocked'
+    with pytest.raises(ValueError, match='四件套不可用.*POTCAR 元素顺序'):
+        adsorption.create_project(
+            target, 'blocked', clean_poscar=str(clean),
+            config_poscars=[str(config)], lib_root=env['lib'],
+            member_quartets={str(clean): resolution}, fail_if_exists=True)
+    assert called is False and not target.exists()
+
+
+def test_incomplete_local_quartets_keep_generation_path(env):
+    def member(name, nsw):
+        folder = env['tmp'] / name
+        folder.mkdir()
+        poscar = folder / 'POSCAR'
+        poscar.write_text(
+            f'{name}\n1.0\n10 0 0\n0 10 0\n0 0 10\nC\n1\n'
+            'Cartesian\n0 0 0\n', encoding='utf-8')
+        (folder / 'INCAR').write_text(
+            f'ENCUT = 400\nNSW = {nsw}\nISMEAR = 0\n', encoding='utf-8')
+        return poscar
+
+    clean = member('partial-clean', 0)
+    config = member('partial-config', 20)
+    quartets = {
+        str(clean): adsorption.resolve_structure_quartet(clean),
+        str(config): adsorption.resolve_structure_quartet(config),
+    }
+    assert all(item['mode'] == 'generate' and item['status'] == 'generatable'
+               for item in quartets.values())
+
+    result = adsorption.create_project(
+        env['tmp'] / 'generated-project', 'generated', clean_poscar=str(clean),
+        config_poscars=[str(config)], member_quartets=quartets,
+        lib_root=env['lib'], fail_if_exists=True)
+    project = adsorption.load_project(result['project_path'])
+    for job_dir in (project['members']['clean_slab'],
+                    project['members']['configs'][0]):
+        job = manifest.load_manifest(job_dir)
+        assert job['inputs']['input_mode'] == 'generate'
+        assert set(job['inputs']['sha256']) == {'POSCAR', 'INCAR', 'KPOINTS', 'POTCAR'}
+
+
+def test_generated_partial_quartet_validates_incar_against_its_poscar(env):
+    def member(name, magmom):
+        folder = env['tmp'] / name
+        folder.mkdir()
+        poscar = folder / 'POSCAR'
+        poscar.write_text(
+            f'{name}\n1.0\n10 0 0\n0 10 0\n0 0 10\nC\n1\n'
+            'Cartesian\n0 0 0\n', encoding='utf-8')
+        (folder / 'INCAR').write_text(
+            f'ENCUT=400\nISPIN=2\nMAGMOM={magmom}\nNSW=0\n',
+            encoding='utf-8')
+        return poscar
+
+    clean = member('partial-vector-clean', '1*0')
+    config = member('partial-vector-config', '2*1')
+    target = env['tmp'] / 'partial-vector-project'
+
+    with pytest.raises(ValueError, match='MAGMOM 长度'):
+        adsorption.create_project(
+            target, 'partial-vector', clean_poscar=str(clean),
+            config_poscars=[str(config)],
+            member_quartets={
+                str(clean): adsorption.resolve_structure_quartet(clean),
+                str(config): adsorption.resolve_structure_quartet(config),
+            }, lib_root=env['lib'], fail_if_exists=True)
+
+    assert not target.exists()
+
+
+def test_low_risk_incar_patch_changes_only_managed_copy_and_records_hashes(tmp_path,
+                                                                          monkeypatch):
+    monkeypatch.setattr(ledger, 'default_ledger_path', lambda: tmp_path / 'jobs.json')
+    monkeypatch.setattr(adsorption, 'default_registry_path',
+                        lambda: tmp_path / 'projects.json')
+    clean = _write_valid_quartet(tmp_path / 'repair-clean', encut=400, marker='clean')
+    config = _write_valid_quartet(tmp_path / 'repair-config', encut=450, marker='config')
+    source_before = (clean.parent / 'INCAR').read_bytes()
+    result = adsorption.create_project(
+        tmp_path / 'repair-project', 'repair', clean_poscar=str(clean),
+        config_poscars=[str(config)], lib_root=str(tmp_path / 'missing-lib'),
+        member_quartets={
+            str(clean): adsorption.resolve_structure_quartet(clean),
+            str(config): adsorption.resolve_structure_quartet(config),
+        }, member_incar_patches={str(clean): {'ENCUT': 450}},
+        fail_if_exists=True)
+
+    project = adsorption.load_project(result['project_path'])
+    job_dir = Path(project['members']['clean_slab'])
+    job = manifest.load_manifest(job_dir)
+    repairs = job['inputs']['incar_repairs']
+    assert (clean.parent / 'INCAR').read_bytes() == source_before
+    assert parse_incar((job_dir / 'INCAR').read_text(encoding='utf-8'))['ENCUT'] == 450
+    assert repairs['changes'] == [
+        {'key': 'ENCUT', 'old': 400, 'new': 450, 'risk': 'low'}]
+    assert repairs['source_incar']['sha256'] == manifest.sha256_file(clean.parent / 'INCAR')
+    assert repairs['final_incar']['sha256'] == manifest.sha256_file(job_dir / 'INCAR')
+    backup = job_dir / repairs['backup']['path']
+    assert repairs['backup']['path'] == 'INCAR.source.bak'
+    assert backup.is_file()
+    assert repairs['backup']['sha256'] == manifest.sha256_file(backup)
+    assert job['inputs']['source_quartet']['INCAR']['sha256'] != \
+        job['inputs']['sha256']['INCAR']
+
+
+def test_low_risk_incar_patch_also_applies_on_generated_member(env):
+    (Path(env['lib']) / 'C' / 'POTCAR').write_text(
+        'TITEL = PAW_PBE C 08Apr2002\nENMAX = 300.0; ENMIN = 200.0\n',
+        encoding='utf-8')
+
+    def member(name, encut):
+        folder = env['tmp'] / name
+        folder.mkdir()
+        poscar = folder / 'POSCAR'
+        poscar.write_text(
+            f'{name}\n1.0\n10 0 0\n0 10 0\n0 0 10\nC\n1\n'
+            'Cartesian\n0 0 0\n', encoding='utf-8')
+        (folder / 'INCAR').write_text(
+            f'ENCUT = {encut}\nNSW = 20\nISMEAR = 0\n', encoding='utf-8')
+        return poscar
+
+    clean = member('generated-repair-clean', 400)
+    config = member('generated-repair-config', 450)
+    source_before = (clean.parent / 'INCAR').read_bytes()
+    result = adsorption.create_project(
+        env['tmp'] / 'generated-repair-project', 'generated-repair',
+        clean_poscar=str(clean), config_poscars=[str(config)],
+        member_incar_patches={str(clean): {'ENCUT': 450}},
+        lib_root=env['lib'], fail_if_exists=True)
+
+    project = adsorption.load_project(result['project_path'])
+    clean_job = Path(project['members']['clean_slab'])
+    item = manifest.load_manifest(clean_job)
+    assert item['inputs']['input_mode'] == 'generate'
+    assert parse_incar((clean_job / 'INCAR').read_text(encoding='utf-8'))['ENCUT'] == 450
+    assert item['inputs']['incar_repairs']['changes'][0]['old'] == 400
+    assert (clean.parent / 'INCAR').read_bytes() == source_before
+    repairs = item['inputs']['incar_repairs']
+    backup = clean_job / repairs['backup']['path']
+    assert backup.is_file()
+    assert manifest.sha256_file(backup) == repairs['managed_before_sha256']
+
+
+def test_low_risk_repair_requires_atomic_staging(env):
+    clean = _write_valid_quartet(env['tmp'] / 'non-atomic-repair-clean')
+    config = _write_valid_quartet(env['tmp'] / 'non-atomic-repair-config')
+    target = env['tmp'] / 'non-atomic-repair-target'
+
+    with pytest.raises(ValueError, match='只允许原子 staging 发布'):
+        adsorption.create_project(
+            target, 'non-atomic-repair', clean_poscar=str(clean),
+            config_poscars=[str(config)],
+            member_incar_patches={str(clean): {'ENCUT': 450}},
+            fail_if_exists=False)
+
+    assert not target.exists()
+
+
+def test_non_low_risk_incar_patch_is_rejected_without_writes(env):
+    clean = _write_valid_quartet(env['tmp'] / 'review-clean', marker='clean')
+    config = _write_valid_quartet(env['tmp'] / 'review-config', marker='config')
+    target = env['tmp'] / 'review-patch-project'
+
+    with pytest.raises(ValueError, match='MAGMOM.*不是可自动应用的低风险修复'):
+        adsorption.create_project(
+            target, 'review-patch', clean_poscar=str(clean),
+            config_poscars=[str(config)],
+            member_incar_patches={str(clean): {'MAGMOM': '1*5'}},
+            fail_if_exists=True)
+    assert not target.exists()
+
+
 def test_create_project_uses_each_members_own_incar_and_records_provenance(env):
     def member(folder_name, nsw):
         folder = env['tmp'] / folder_name
@@ -595,6 +994,88 @@ def test_create_project_detects_source_incar_race_during_copy(env, monkeypatch):
     assert not target.exists()
 
 
+def test_generated_member_has_internal_source_race_guard_without_client_evidence(
+        env, monkeypatch):
+    """Legacy callers still receive the same source immutability guarantee."""
+    def member(folder_name):
+        folder = env['tmp'] / folder_name
+        folder.mkdir()
+        poscar = folder / 'POSCAR'
+        poscar.write_text(
+            f'{folder_name}\n1.0\n10 0 0\n0 10 0\n0 0 10\nC\n1\n'
+            'Cartesian\n0 0 0\n', encoding='utf-8')
+        incar = folder / 'INCAR'
+        incar.write_text('ENCUT = 400\nISMEAR = 0\n', encoding='utf-8')
+        return poscar, incar
+
+    clean, _clean_incar = member('internal-race-clean')
+    config, config_incar = member('internal-race-config')
+    real_build = adsorption.build_job_dir
+
+    def racing_build(poscar, incar, out_dir, **kwargs):
+        result = real_build(poscar, incar, out_dir, **kwargs)
+        if Path(poscar).resolve() == config.resolve():
+            config_incar.write_text(
+                'ENCUT = 400\nISMEAR = 0\nNSW = 999\n', encoding='utf-8')
+        return result
+
+    monkeypatch.setattr(adsorption, 'build_job_dir', racing_build)
+    target = env['tmp'] / 'internal-source-race'
+
+    with pytest.raises(ValueError, match='源 INCAR.*复制后哈希不一致'):
+        adsorption.create_project(
+            target, 'internal-source-race', clean_poscar=str(clean),
+            config_poscars=[str(config)], lib_root=env['lib'],
+            fail_if_exists=True)
+
+    assert not target.exists()
+
+
+def test_generated_member_requires_complete_final_quartet_hashes(env, monkeypatch):
+    clean = Path(env['poscar']('final-hash-clean.vasp'))
+    config = Path(env['poscar']('final-hash-config.vasp'))
+    real_build = adsorption.build_job_dir
+
+    def incomplete_build(poscar, incar, out_dir, **kwargs):
+        result = real_build(poscar, incar, out_dir, **kwargs)
+        if Path(poscar).resolve() == config.resolve():
+            (Path(out_dir) / 'KPOINTS').unlink()
+        return result
+
+    monkeypatch.setattr(adsorption, 'build_job_dir', incomplete_build)
+    from vcstudio.project import result_import
+    monkeypatch.setattr(result_import, 'validate_vasp_quartet', lambda _path: [])
+    target = env['tmp'] / 'incomplete-final-quartet'
+
+    with pytest.raises(ValueError, match='最终四件套哈希记录不完整'):
+        adsorption.create_project(
+            target, 'incomplete-final', clean_poscar=str(clean),
+            config_poscars=[str(config)], incar_path=env['incar'],
+            lib_root=env['lib'], fail_if_exists=True)
+
+    assert not target.exists()
+
+
+def test_atomic_publish_rolls_back_jobs_if_project_registration_fails(env, monkeypatch):
+    clean = Path(env['poscar']('registry-clean.vasp'))
+    config = Path(env['poscar']('registry-config.vasp'))
+    target = env['tmp'] / 'registry-failure-project'
+
+    def fail_registration(_path):
+        raise OSError('registry unavailable')
+
+    monkeypatch.setattr(adsorption, 'register_project', fail_registration)
+
+    with pytest.raises(OSError, match='registry unavailable'):
+        adsorption.create_project(
+            target, 'registry-failure', clean_poscar=str(clean),
+            config_poscars=[str(config)], incar_path=env['incar'],
+            lib_root=env['lib'], fail_if_exists=True)
+
+    assert not target.exists()
+    assert ledger.list_dirs() == []
+
+
 def test_atomic_project_rejects_member_missing_incar_without_writing_target(env):
     clean_dir = env['tmp'] / 'atomic-clean'
     config_dir = env['tmp'] / 'atomic-config'
@@ -617,7 +1098,7 @@ def test_atomic_project_rejects_member_missing_incar_without_writing_target(env)
     assert not target.exists()
 
 
-def test_member_incars_propagate_one_explicit_encut_and_reject_conflicts(env):
+def test_member_incars_propagate_one_explicit_encut_and_preserve_conflicts(env):
     def member(folder_name, incar_text):
         folder = env['tmp'] / folder_name
         folder.mkdir()
@@ -639,11 +1120,15 @@ def test_member_incars_propagate_one_explicit_encut_and_reject_conflicts(env):
 
     conflict = member('encut-conflict', 'ENCUT = 600\nISMEAR = 0\n')
     conflict_target = env['tmp'] / 'encut-conflict-project'
-    with pytest.raises(ValueError, match='各成员 INCAR 的 ENCUT 不一致'):
-        adsorption.create_project(
-            conflict_target, 'encut-conflict', clean_poscar=str(clean),
-            config_poscars=[str(conflict)], lib_root=env['lib'], fail_if_exists=True)
-    assert not conflict_target.exists()
+    conflict_result = adsorption.create_project(
+        conflict_target, 'encut-conflict', clean_poscar=str(clean),
+        config_poscars=[str(conflict)], lib_root=env['lib'], fail_if_exists=True)
+    conflict_project = adsorption.load_project(conflict_result['project_path'])
+    clean_incar = parse_incar((Path(conflict_project['members']['clean_slab']) / 'INCAR')
+                              .read_text(encoding='utf-8'))
+    config_incar = parse_incar((Path(conflict_project['members']['configs'][0]) / 'INCAR')
+                               .read_text(encoding='utf-8'))
+    assert clean_incar['ENCUT'] == 500 and config_incar['ENCUT'] == 600
 
 
 def test_scan_lis_bundle_infers_generic_clean_and_groups_from_poscar_difference(tmp_path):

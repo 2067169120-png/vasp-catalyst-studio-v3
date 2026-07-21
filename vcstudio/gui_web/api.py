@@ -175,6 +175,19 @@ def _method_vector_map(value, element_orders, *, integer=False):
             candidates.append(mapped)
     return candidates[0] if len(candidates) == 1 else None
 
+
+def _method_u_by_element(plan):
+    """Return effective Hubbard settings keyed by element when unambiguous.
+
+    ``LDAU`` is a global switch, but its physical effect is element-local:
+    ``LDAUL=-1`` disables the correction for one species.  Comparing only the
+    global switch would therefore reject a perfectly valid molecule/slab pair
+    when the catalyst alone uses +U.  Unknown vector order remains fail-closed
+    for the later energy-comparability gate.
+    """
+    from vcstudio.project.method_policy import effective_u_by_element
+    return effective_u_by_element(plan)
+
 # 图表预设 → 数据装配路线(render_figure_preset 据此从项目数据组装或降级 skipped):
 #   _FIG_FROM_DELTA  能量学:柱状图/矩阵表/热图,取 delta_e_rows 的已完成 ΔE
 #   _FIG_LADDER      电池/电化学:自由能台阶,取 freeenergy/reactions 路径
@@ -1565,6 +1578,14 @@ class Api:
                     if encut is None or encut <= 0:
                         status = 'invalid'
                         issues.append(f'ENCUT={parsed.get("ENCUT")!r} 不是正数')
+                for key in ('AEXX', 'HFSCREEN'):
+                    if parsed and key in parsed and _method_number(parsed.get(key)) is None:
+                        status = 'invalid'
+                        issues.append(f'{key}={parsed.get(key)!r} 必须是有限数值')
+                if (parsed and 'LDAUTYPE' in parsed
+                        and _method_integer(parsed.get('LDAUTYPE')) is None):
+                    status = 'invalid'
+                    issues.append(f'LDAUTYPE={parsed.get("LDAUTYPE")!r} 必须是整数')
                 for key in ('NSW', 'IBRION', 'NELM', 'ISIF'):
                     if parsed and key in parsed and _method_integer(parsed.get(key)) is None:
                         status = 'invalid'
@@ -1593,8 +1614,13 @@ class Api:
         return (isinstance(value, (int, float)) and not isinstance(value, bool)
                 and math.isfinite(float(value)) and -10000.0 <= float(value) < 0.0)
 
-    def _validated_reference_project(self, reference_project_path):
-        """加载并逐 job.yaml 验证参考项目，返回受审计的能量与目录。"""
+    def _validated_reference_project(self, reference_project_path, required_species=None):
+        """加载并验证本批实际使用的参考物种，返回受审计的能量与目录。
+
+        参考项目可以包含尚未完成的其它 Li-S 物种；那些作业与本批没有直接
+        能量关系，不能阻止当前构型提交。调用方传入 ``required_species`` 后只
+        对这些标签执行 DONE/能量/方法签名硬门，同时仍明确拒绝缺失标签。
+        """
         raw_path = str(reference_project_path or '').strip()
         if not raw_path:
             raise ValueError('请选择已导入并收敛的 Li-S 参考结果项目')
@@ -1604,10 +1630,20 @@ class Api:
         jobs = dict(project.get('species_ref_jobs') or {})
         if not jobs:
             raise ValueError('参考项目没有 species_ref_jobs；请先把 Li-S 结果导入为分子参考')
+        filter_requested = required_species is not None
+        requested = {
+            str(species or '').strip() for species in (required_species or [])
+            if str(species or '').strip()
+        }
+        missing = sorted(requested - set(jobs))
+        if missing:
+            raise ValueError('参考项目缺少本批物种：' + '、'.join(missing))
+        selected_jobs = ({species: jobs[species] for species in sorted(requested)}
+                         if filter_requested else jobs)
         energies, resolved_jobs, signatures = {}, {}, {}
         composition_labels = {}
         reference_root = str(project.get('root') or os.path.dirname(raw_path))
-        for raw_species, raw_job_dir in sorted(jobs.items()):
+        for raw_species, raw_job_dir in sorted(selected_jobs.items()):
             species = str(raw_species or '').strip()
             if not species:
                 raise ValueError('参考项目包含空物种名')
@@ -1645,9 +1681,11 @@ class Api:
     @staticmethod
     def _reference_method_check(signatures, incar_path, planned_potcar=None,
                                 effective_encut=None, encut_source=None,
-                                planned_element_orders=None):
+                                planned_element_orders=None, effective_ispin=None,
+                                planned_kpoints=None):
         """Compare hard method invariants that are knowable before generation."""
         from vcstudio.generate.incar_builder import parse_incar
+        from vcstudio.campaign import fingerprint as fingerprint_mod
 
         with open(incar_path, 'r', encoding='utf-8', errors='replace') as handle:
             incar = {str(key).upper(): value for key, value in parse_incar(handle.read()).items()}
@@ -1666,10 +1704,37 @@ class Api:
         explicit_encut = _method_number(incar.get('ENCUT'))
         planned_encut = explicit_encut if has_explicit_encut else _method_number(effective_encut)
         planned_ldau = _method_bool(incar.get('LDAU', False))
+        explicit_ispin = _method_integer(incar.get('ISPIN')) \
+            if 'ISPIN' in incar else None
+        local_method_issues = []
+        planned_hybrid_value = (_method_bool(incar.get('LHFCALC'))
+                                if 'LHFCALC' in incar else False)
+        if 'LHFCALC' in incar and planned_hybrid_value is None:
+            local_method_issues.append(
+                f'新任务 LHFCALC={incar.get("LHFCALC")!r} 不是合法布尔值')
+        planned_hybrid = planned_hybrid_value is True
+        planned_aexx = (0.25 if planned_hybrid and 'AEXX' not in incar
+                        else _method_number(incar.get('AEXX')))
+        planned_hfscreen = (0.0 if planned_hybrid and 'HFSCREEN' not in incar
+                            else _method_number(incar.get('HFSCREEN')))
+        for key, value in (('AEXX', planned_aexx), ('HFSCREEN', planned_hfscreen)):
+            if key in incar and value is None:
+                local_method_issues.append(
+                    f'新任务 {key}={incar.get(key)!r} 不是有限数值')
+        effective_functional = (
+            None if local_method_issues else fingerprint_mod.canonical_functional(
+                base=functional, metagga=incar.get('METAGGA'),
+                lhfcalc=planned_hybrid, aexx=planned_aexx,
+                hfscreen=planned_hfscreen))
         planned = {
-            'functional': functional,
+            'functional': effective_functional,
+            'base_functional': functional,
             'ivdw': _method_integer(incar.get('IVDW', 0)),
-            'ispin': _method_integer(incar.get('ISPIN', 1)),
+            'ispin': (explicit_ispin if 'ISPIN' in incar
+                      else (_method_integer(effective_ispin) or 1)),
+            'ispin_source': ('member_incar' if 'ISPIN' in incar
+                             else ('generated_completion' if effective_ispin is not None
+                                   else 'vasp_default')),
             'ldau': planned_ldau,
             'ldautype': _method_integer(incar.get('LDAUTYPE')),
             'ldaul': _method_vector(incar.get('LDAUL'), integer=True),
@@ -1679,21 +1744,48 @@ class Api:
             'encut_source': encut_source or (
                 'shared_incar' if explicit_encut is not None else 'unavailable'),
             'metagga': _method_choice(incar.get('METAGGA')),
-            'lhfcalc': str(incar.get('LHFCALC', 'F')).strip().upper()
-                        in {'T', '.TRUE.', 'TRUE'},
-            'aexx': _method_number(incar.get('AEXX')),
-            'hfscreen': _method_number(incar.get('HFSCREEN')),
+            'lhfcalc': planned_hybrid,
+            'aexx': planned_aexx,
+            'hfscreen': planned_hfscreen,
             'potcar_titel': list(planned_potcar or []),
             'element_orders': [list(order) for order in (planned_element_orders or [])],
+            'kpoints_scheme': planned_kpoints,
         }
-        issues, warnings = [], []
+        issues, warnings, advisories = list(local_method_issues), [], []
         checked = 0
         for species, signature in sorted((signatures or {}).items()):
             if not signature:
                 warnings.append(f'{species}: 导入结果缺方法签名')
                 continue
+            reference_base = (signature.get('base_functional')
+                              or signature.get('gga') or signature.get('functional'))
+            legacy_hybrid_label = str(reference_base or '').strip().upper() in {
+                'HSE03', 'HSE06', 'PBE0'}
+            reference_hybrid_value = (
+                _method_bool(signature.get('lhfcalc'))
+                if 'lhfcalc' in signature else
+                (None if legacy_hybrid_label else False))
+            reference_hybrid = reference_hybrid_value is True
+            reference_aexx = (
+                0.25 if reference_hybrid and 'aexx' not in signature
+                else _method_number(signature.get('aexx')))
+            reference_hfscreen = (
+                0.0 if reference_hybrid and 'hfscreen' not in signature
+                else _method_number(signature.get('hfscreen')))
+            reference_method_invalid = (
+                ('lhfcalc' in signature and reference_hybrid_value is None)
+                or ('aexx' in signature and reference_aexx is None)
+                or ('hfscreen' in signature and reference_hfscreen is None))
             reference = {
-                'functional': signature.get('functional'),
+                'functional': (
+                    None if reference_method_invalid
+                    else fingerprint_mod.canonical_functional(
+                        base=reference_base, metagga=signature.get('metagga'),
+                        lhfcalc=(reference_hybrid
+                                 if 'lhfcalc' in signature else None),
+                        aexx=reference_aexx,
+                        hfscreen=reference_hfscreen)),
+                'base_functional': reference_base,
                 'ivdw': _method_integer(signature.get('ivdw')),
                 'ispin': _method_integer(signature.get('ispin')),
                 'ldau': _method_bool(signature.get('ldau')),
@@ -1703,12 +1795,19 @@ class Api:
                 'ldauj': signature.get('ldauj'),
                 'encut': _method_number(signature.get('encut')),
                 'metagga': _method_choice(signature.get('metagga')),
-                'lhfcalc': str(signature.get('lhfcalc', 'F')).strip().upper()
-                            in {'T', '.TRUE.', 'TRUE'},
-                'aexx': _method_number(signature.get('aexx')),
-                'hfscreen': _method_number(signature.get('hfscreen')),
+                'lhfcalc': (None if reference_hybrid_value is None
+                            else reference_hybrid),
+                'aexx': reference_aexx,
+                'hfscreen': reference_hfscreen,
             }
-            for key in ('functional', 'ivdw', 'ldau', 'metagga', 'lhfcalc'):
+            reference_elements = list(signature.get('potcar_elements') or [])
+            if not reference_elements:
+                reference_elements = [
+                    _titel_element(titel) for titel in signature.get('potcar_titel') or []]
+            reference['element_orders'] = (
+                [reference_elements]
+                if reference_elements and all(reference_elements) else [])
+            for key in ('functional', 'ivdw', 'metagga', 'lhfcalc'):
                 if reference.get(key) is None or planned.get(key) is None:
                     warnings.append(f'{species}: 无法核对 {key}')
                 elif reference[key] != planned[key]:
@@ -1727,61 +1826,32 @@ class Api:
             elif reference_spin == planned_spin:
                 checked += 1
             elif reference_spin == 1 and planned_spin == 2:
-                warnings.append(
+                advisories.append(
                     f'{species}: 参考分子 ISPIN=1，新建 clean slab/adsorption 作业 '
                     'ISPIN=2；不同体系可按各自基态磁性设置，这不是自动不兼容。'
-                    '请确认参考分子是经自旋极化/多初态对照验证的非磁闭壳层基态'
-                    '（不能只凭总磁矩为零判断），并确认 clean slab 与所有 adsorption '
-                    '构型统一使用当前自旋设置')
+                    '参考分子的自旋设置不参与周期体系 INCAR 绑定；建议保留其基态验证记录')
             else:
-                warnings.append(
+                advisories.append(
                     f'{species}: 参考分子 ISPIN={reference_spin}，新建 clean slab/adsorption '
                     f'作业 ISPIN={planned_spin}；不同体系可按各自基态磁性设置，这不是自动'
-                    '不兼容。新任务将强制非自旋极化，请确认 clean slab 与吸附体系确实非磁；'
-                    '否则改用 ISPIN=2 并设置合理的 MAGMOM')
-            if reference['ldau'] is True and planned['ldau'] is True:
-                if reference['ldautype'] is None or planned['ldautype'] is None:
-                    warnings.append(f'{species}: LDAUTYPE 证据不完整')
-                elif reference['ldautype'] != planned['ldautype']:
-                    issues.append(
-                        f'{species}: LDAUTYPE 参考={reference["ldautype"]!r}，'
-                        f'新任务={planned["ldautype"]!r}')
-                else:
-                    checked += 1
-
-                reference_elements = list(signature.get('potcar_elements') or [])
-                if not reference_elements:
-                    reference_elements = [
-                        _titel_element(titel) for titel in signature.get('potcar_titel') or []]
-                if not reference_elements or any(not element for element in reference_elements):
-                    reference_orders = []
-                else:
-                    reference_orders = [reference_elements]
-                for key, integer in (('ldaul', True), ('ldauu', False), ('ldauj', False)):
-                    reference_map = _method_vector_map(
-                        reference[key], reference_orders, integer=integer)
-                    planned_map = _method_vector_map(
-                        planned[key], planned_element_orders, integer=integer)
-                    if reference_map is None or planned_map is None:
-                        warnings.append(
-                            f'{species}: 无法按 POTCAR/POSCAR 元素顺序可靠核对 {key.upper()}')
-                        continue
-                    missing_elements = sorted(set(reference_map) - set(planned_map))
-                    if missing_elements:
-                        warnings.append(
-                            f'{species}: 新任务 {key.upper()} 缺参考元素 '
-                            f'{", ".join(missing_elements)} 的可靠映射')
-                        continue
-                    for element, reference_value in reference_map.items():
-                        planned_value = planned_map[element]
-                        differs = (reference_value != planned_value if integer else
-                                   abs(float(reference_value) - float(planned_value)) > 1e-10)
-                        if differs:
-                            issues.append(
-                                f'{species}: {element} {key.upper()} '
-                                f'参考={reference_value!r}，新任务={planned_value!r}')
-                        else:
-                            checked += 1
+                    '不兼容。新任务将使用自己的局部自旋设置')
+            reference_u = _method_u_by_element(reference)
+            planned_u = _method_u_by_element(planned)
+            if reference_u is None or planned_u is None:
+                warnings.append(f'{species}: 无法按 POTCAR/POSCAR 元素顺序可靠核对 DFT+U')
+            else:
+                missing_elements = sorted(set(reference_u) - set(planned_u))
+                if missing_elements:
+                    warnings.append(
+                        f'{species}: 新任务缺参考元素 '
+                        f'{", ".join(missing_elements)} 的可靠 DFT+U 映射')
+                for element in sorted(set(reference_u) & set(planned_u)):
+                    if reference_u[element] != planned_u[element]:
+                        issues.append(
+                            f'{species}: {element} DFT+U 参考={reference_u[element]!r}，'
+                            f'新任务={planned_u[element]!r}')
+                    else:
+                        checked += 1
             if reference.get('encut') is None or planned.get('encut') is None:
                 warnings.append(f'{species}: ENCUT 证据不完整')
             elif abs(float(reference['encut']) - planned['encut']) > 1e-8:
@@ -1821,97 +1891,148 @@ class Api:
                     checked += 1
         status = 'incompatible' if issues else ('verified' if not warnings else 'unverified')
         return {'status': status, 'issues': issues, 'warnings': warnings,
+                'advisories': advisories,
                 'checked_fields': checked, 'planned': planned,
                 'reference_signatures': signatures}
 
     @staticmethod
     def _periodic_method_check(clean_plan, member_plans):
         """核对 clean slab 与各 adsorption 的能量可比方法；运行控制键允许不同。"""
-        issues, warnings = [], []
-        checked = 0
+        from vcstudio.project.method_policy import compare_plans
 
-        def _same(left, right):
-            if isinstance(left, (int, float)) and isinstance(right, (int, float)):
-                return abs(float(left) - float(right)) <= 1e-10
-            return left == right
-
-        def _title_map(plan):
-            orders = list(plan.get('element_orders') or [])
-            order = list(orders[0]) if len(orders) == 1 else []
-            titles = list(plan.get('potcar_titel') or [])
-            if not order or len(order) != len(titles) or len(set(order)) != len(order):
-                return None
-            return dict(zip(order, titles))
-
-        clean_name = 'clean slab'
-        if clean_plan.get('ispin') not in {1, 2}:
-            issues.append(f'{clean_name}: ISPIN={clean_plan.get("ispin")!r} 无效（仅允许 1 或 2）')
+        issues, warnings, advisories, checked = [], [], [], 0
         for member_name, plan in member_plans.items():
-            label = f'{clean_name} ↔ {member_name}'
-            if plan.get('ispin') not in {1, 2}:
-                issues.append(f'{member_name}: ISPIN={plan.get("ispin")!r} 无效（仅允许 1 或 2）')
-            for key in ('functional', 'ivdw', 'ispin', 'ldau', 'metagga', 'lhfcalc', 'encut'):
-                left, right = clean_plan.get(key), plan.get(key)
-                if left is None or right is None:
-                    warnings.append(f'{label}: 无法核对 {key.upper()}')
-                elif not _same(left, right):
-                    issues.append(f'{label}: {key.upper()} 不一致（{left!r} vs {right!r}）')
-                else:
-                    checked += 1
-            if clean_plan.get('ldau') is True and plan.get('ldau') is True:
-                left_type, right_type = clean_plan.get('ldautype'), plan.get('ldautype')
-                if left_type is None or right_type is None:
-                    warnings.append(f'{label}: 无法核对 LDAUTYPE')
-                elif left_type != right_type:
-                    issues.append(
-                        f'{label}: LDAUTYPE 不一致（{left_type!r} vs {right_type!r}）')
-                else:
-                    checked += 1
-                for key, integer in (('ldaul', True), ('ldauu', False), ('ldauj', False)):
-                    clean_map = _method_vector_map(
-                        clean_plan.get(key), clean_plan.get('element_orders'), integer=integer)
-                    member_map = _method_vector_map(
-                        plan.get(key), plan.get('element_orders'), integer=integer)
-                    if clean_map is None or member_map is None:
-                        warnings.append(f'{label}: 无法按元素顺序核对 {key.upper()}')
-                        continue
-                    for element in sorted(set(clean_map) & set(member_map)):
-                        if not _same(clean_map[element], member_map[element]):
-                            issues.append(
-                                f'{label}: {element} {key.upper()} 不一致 '
-                                f'（{clean_map[element]!r} vs {member_map[element]!r}）')
-                        else:
-                            checked += 1
-            if clean_plan.get('lhfcalc') is True and plan.get('lhfcalc') is True:
-                for key in ('aexx', 'hfscreen'):
-                    left, right = clean_plan.get(key), plan.get(key)
-                    if left is None or right is None:
-                        warnings.append(f'{label}: 无法核对 {key.upper()}')
-                    elif not _same(left, right):
-                        issues.append(
-                            f'{label}: {key.upper()} 不一致（{left!r} vs {right!r}）')
-                    else:
-                        checked += 1
-            clean_titles, member_titles = _title_map(clean_plan), _title_map(plan)
-            if clean_titles is None or member_titles is None:
-                warnings.append(f'{label}: POTCAR 元素/TITEL 证据不完整')
-            else:
-                for element in sorted(set(clean_titles) & set(member_titles)):
-                    if clean_titles[element] != member_titles[element]:
-                        issues.append(
-                            f'{label}: {element} POTCAR TITEL 不一致 '
-                            f'（{clean_titles[element]!r} vs {member_titles[element]!r}）')
-                    else:
-                        checked += 1
-        return {'issues': issues, 'warnings': warnings, 'checked_fields': checked}
+            result = compare_plans(
+                clean_plan, plan, left_label='clean slab',
+                right_label=member_name, relation='periodic_delta')
+            issues.extend(result['issues'])
+            warnings.extend(result['warnings'])
+            advisories.extend(result['notes'])
+            checked += int(result.get('checked_fields') or 0)
+        return {'issues': issues, 'warnings': warnings, 'advisories': advisories,
+                'checked_fields': checked}
+
+    @staticmethod
+    def _lis_repair_plan(structure_paths, plans, parsed_incars,
+                         structure_compositions, incar_records,
+                         member_source_evidence=None):
+        """Build a read-only, hash-bound repair preview for managed copies.
+
+        Only mechanically safe fixes are proposed here: aligning periodic
+        ``ENCUT`` upward to the largest effective value, and supplying a local
+        MAGMOM candidate when a collinear ``ISPIN=2`` member has none (or the
+        vector length cannot match its own POSCAR).  Functional, dispersion,
+        POTCAR, DFT+U and the magnetic state itself are scientific choices and
+        are deliberately never auto-selected.
+        """
+        actions, suggestions = [], []
+
+        def _label(path):
+            name = os.path.basename(path)
+            if name.casefold() in {'poscar', 'contcar'}:
+                name = os.path.basename(os.path.dirname(path))
+            return name or path
+
+        effective = {
+            path: _method_number((plans.get(path) or {}).get('encut'))
+            for path in structure_paths
+        }
+        finite = [value for value in effective.values() if value is not None and value > 0]
+        if finite and len({round(value, 10) for value in finite}) > 1:
+            target = max(finite)
+            target = int(target) if target == int(target) else target
+            for path in structure_paths:
+                parsed = parsed_incars.get(path) or {}
+                old = _method_number(parsed.get('ENCUT')) if 'ENCUT' in parsed else None
+                if old is not None and abs(old - float(target)) <= 1e-10:
+                    continue
+                record = incar_records.get(path) or {}
+                actions.append({
+                    'member': _label(path), 'structure_path': path,
+                    'incar_path': record.get('path') or '',
+                    'before_sha256': record.get('sha256') or '',
+                    'key': 'ENCUT', 'old': old, 'new': target,
+                    'reason': ('将周期成员 ENCUT 统一提高到当前组的安全最大值；'
+                               '只修改受管项目副本，不改源目录'),
+                    'risk': 'low',
+                })
+
+        try:
+            from vcstudio.generate.incar_builder import build_magmom, has_magnetic
+        except Exception:                                # noqa: BLE001
+            build_magmom = has_magnetic = None
+        if build_magmom and has_magnetic:
+            for path in structure_paths:
+                parsed = parsed_incars.get(path) or {}
+                plan = plans.get(path) or {}
+                composition = structure_compositions.get(path) or {}
+                elements, counts = list(composition), list(composition.values())
+                if plan.get('ispin_source') == 'generated_completion':
+                    # build_job_dir will add its audited MAGMOM/ISPIN
+                    # completion to this managed member; no manual suggestion.
+                    continue
+                if plan.get('ispin') != 2 or not elements or not has_magnetic(elements):
+                    continue
+                noncollinear = _method_bool(parsed.get('LNONCOLLINEAR')) is True
+                if noncollinear:
+                    continue
+                raw = parsed.get('MAGMOM')
+                vector = _method_vector(raw)
+                if vector is not None and len(vector) == sum(counts):
+                    continue
+                candidate = build_magmom(elements, counts)
+                if not candidate:
+                    continue
+                record = incar_records.get(path) or {}
+                suggestions.append({
+                    'member': _label(path), 'structure_path': path,
+                    'incar_path': record.get('path') or '',
+                    'before_sha256': record.get('sha256') or '',
+                    'key': 'MAGMOM', 'old': raw, 'new': candidate,
+                    'reason': ('ISPIN=2 的 MAGMOM 应按本目录 POSCAR 的 NIONS 顺序给出；'
+                               '磁矩初态属于科学选择，只给候选，不自动写入'),
+                    'risk': 'scientific_choice',
+                })
+
+        if not actions and not suggestions:
+            return None
+        evidence = {}
+        for path in structure_paths:
+            supplied = dict((member_source_evidence or {}).get(path) or {})
+            files = {}
+            for raw_name, record in supplied.items():
+                if not isinstance(record, dict):
+                    continue
+                name = str(raw_name or '').upper()
+                file_path = str(record.get('path') or '').strip()
+                digest = str(record.get('sha256') or '').strip().lower()
+                if file_path or digest:
+                    files[name] = {'path': file_path, 'sha256': digest}
+            if 'INCAR' not in files:
+                record = incar_records.get(path) or {}
+                files['INCAR'] = {
+                    'path': record.get('path') or '',
+                    'sha256': record.get('sha256') or '',
+                }
+            evidence[path] = {'files': files}
+        payload = {
+            'schema': 1, 'actions': actions, 'suggestions': suggestions,
+            'evidence': evidence,
+        }
+        plan_id = hashlib.sha256(json.dumps(
+            payload, ensure_ascii=False, sort_keys=True,
+            separators=(',', ':')).encode('utf-8')).hexdigest()
+        return {**payload, 'plan_id': plan_id,
+                'source_unchanged': True, 'target': 'managed_project_copy'}
 
     def proj_prepare_lis(self, name, slab_path, config_items, incar_path,
                          out_root, reference_project_path, method_confirmation=None,
-                         member_incars=None):
+                         member_incars=None, repair_request=None):
         """用既有参考能与每个结构同目录的 INCAR 建立可直接提交的 Li-S 项目。"""
         empty = {'ok': False, 'project_path': None, 'job_dirs': [],
                  'reference_species': [], 'advisories': [], 'warnings': [],
-                 'method_check': None, 'needs_method_confirmation': False}
+                 'method_check': None, 'needs_method_confirmation': False,
+                 'repair_plan': None, 'needs_repair_decision': False}
         try:
             project_name = str(name or '').strip()
             slab = os.path.abspath(os.path.expanduser(str(slab_path or '').strip()))
@@ -1929,8 +2050,13 @@ class Api:
                 raise ValueError('请选择项目输出根目录')
             target = os.path.join(output, project_name)
 
+            requested_species = {
+                str(item.get('species') or '').strip()
+                for item in (config_items or []) if isinstance(item, dict)
+                and str(item.get('species') or '').strip()
+            }
             reference, refs, ref_jobs, ref_signatures = self._validated_reference_project(
-                reference_project_path)
+                reference_project_path, required_species=requested_species)
             configs, source_species, source_species_evidence = [], {}, {}
             source_incar_evidence = {}
             seen_paths, seen_members = set(), set()
@@ -1968,11 +2094,99 @@ class Api:
             if not configs:
                 raise ValueError('至少选择一个 adsorption 构型结构')
 
+            # Resolve the actual same-directory quartet at prepare time.  A
+            # complete valid quartet is an atomic member input and will later
+            # be copied byte-for-byte; a partial folder may still use the
+            # established generator/fallback path.  Re-resolution in
+            # create_project binds these hashes across the staging copy.
+            member_input_bundles = {}
+            quartet_resolver = getattr(
+                self._adsorption, 'resolve_structure_quartet', None)
+            if callable(quartet_resolver):
+                for structure_path in [slab, *configs]:
+                    bundle = dict(quartet_resolver(structure_path) or {})
+                    if (bundle.get('status') == 'invalid'
+                            or bundle.get('mode') == 'blocked'):
+                        label = (os.path.basename(os.path.dirname(structure_path))
+                                 if os.path.basename(structure_path).casefold()
+                                 in {'poscar', 'contcar'}
+                                 else os.path.basename(structure_path))
+                        raise ValueError(
+                            f'{label} 的同目录四件套不可用：'
+                            + '；'.join(bundle.get('issues') or ['输入校验失败']))
+                    member_input_bundles[structure_path] = bundle
+
             supplied_incars = dict(member_incars or {}) \
                 if isinstance(member_incars, dict) else {}
             clean_expected = supplied_incars.get('clean_slab') or {}
             if isinstance(clean_expected, str):
                 clean_expected = {'path': clean_expected}
+
+            config_expected_map = supplied_incars.get('configs') or {}
+            if isinstance(config_expected_map, list):
+                config_expected_map = {
+                    os.path.normcase(os.path.abspath(str(item.get('path') or ''))): item
+                    for item in config_expected_map
+                    if isinstance(item, dict) and item.get('path')
+                }
+            elif isinstance(config_expected_map, dict):
+                config_expected_map = {
+                    os.path.normcase(os.path.abspath(str(key))): value
+                    for key, value in config_expected_map.items()
+                }
+            else:
+                config_expected_map = {}
+
+            def _assert_scanned_quartet_unchanged(structure_path, expected):
+                """Bind prepare-time inputs to the quartet the user reviewed."""
+                if not isinstance(expected, dict):
+                    return
+                scanned = expected.get('quartet')
+                if not isinstance(scanned, dict) or not scanned:
+                    return
+                current = member_input_bundles.get(structure_path) or {}
+                scanned_mode = str(
+                    scanned.get('mode') or expected.get('input_mode') or '').lower()
+                current_mode = str(current.get('mode') or '').lower()
+                if scanned_mode and scanned_mode != current_mode:
+                    raise ValueError(
+                        f'{structure_path} 的四件套模式在扫描后已变化'
+                        f'（{scanned_mode} → {current_mode or "unknown"}）；请重新扫描')
+                scanned_files = scanned.get('files') or {}
+                current_files = current.get('files') or {}
+                if not isinstance(scanned_files, dict):
+                    raise ValueError(f'{structure_path} 的扫描四件套证据格式无效')
+                scanned_names = {str(name).upper() for name in scanned_files}
+                current_names = {str(name).upper() for name in current_files}
+                if scanned_names != current_names:
+                    raise ValueError(
+                        f'{structure_path} 的四件套文件集在扫描后已变化；请重新扫描')
+                for raw_name, record in scanned_files.items():
+                    name = str(raw_name).upper()
+                    if not isinstance(record, dict):
+                        raise ValueError(
+                            f'{structure_path} 的 {name} 扫描证据格式无效')
+                    actual = current_files.get(name) or current_files.get(raw_name) or {}
+                    expected_path = str(record.get('path') or '').strip()
+                    actual_path = str(actual.get('path') or '').strip()
+                    if (expected_path and actual_path
+                            and os.path.normcase(os.path.realpath(expected_path))
+                            != os.path.normcase(os.path.realpath(actual_path))):
+                        raise ValueError(
+                            f'{structure_path} 的 {name} 路径在扫描后已变化；请重新扫描')
+                    expected_hash = str(record.get('sha256') or '').strip().lower()
+                    actual_hash = str(actual.get('sha256') or '').strip().lower()
+                    if (not re.fullmatch(r'[0-9a-f]{64}', expected_hash)
+                            or expected_hash != actual_hash):
+                        raise ValueError(
+                            f'{structure_path} 的 {name} 内容在扫描后已变化；请重新扫描')
+
+            _assert_scanned_quartet_unchanged(slab, clean_expected)
+            for config_path in configs:
+                _assert_scanned_quartet_unchanged(
+                    config_path,
+                    config_expected_map.get(os.path.normcase(config_path)) or {})
+
             clean_incar_result = self._resolve_lis_member_incar(
                 slab, fallback_incar=fallback_incar,
                 expected_path=str(clean_expected.get('path') or clean_expected.get('incar_path') or ''),
@@ -1984,19 +2198,6 @@ class Api:
                     + '；'.join(clean_incar_result['issues'] or ['同目录缺少 INCAR']))
             member_incar_paths = {slab: clean_incar_result['path']}
             member_incar_records = {slab: clean_incar_result}
-            config_expected_map = supplied_incars.get('configs') or {}
-            if isinstance(config_expected_map, list):
-                config_expected_map = {
-                    os.path.normcase(os.path.abspath(str(item.get('path') or ''))): item
-                    for item in config_expected_map if isinstance(item, dict) and item.get('path')
-                }
-            elif isinstance(config_expected_map, dict):
-                config_expected_map = {
-                    os.path.normcase(os.path.abspath(str(key))): value
-                    for key, value in config_expected_map.items()
-                }
-            else:
-                config_expected_map = {}
             for config_path in configs:
                 expected = source_incar_evidence.get(config_path) or {}
                 supplied = config_expected_map.get(os.path.normcase(config_path)) or {}
@@ -2017,6 +2218,18 @@ class Api:
                 member_incar_paths[config_path] = resolved['path']
                 member_incar_records[config_path] = resolved
 
+            for structure_path, bundle in member_input_bundles.items():
+                if bundle.get('mode') != 'copy':
+                    continue
+                quartet_incar = str(
+                    ((bundle.get('files') or {}).get('INCAR') or {}).get('path') or '')
+                if (not quartet_incar
+                        or os.path.normcase(os.path.realpath(quartet_incar))
+                        != os.path.normcase(os.path.realpath(
+                            member_incar_paths[structure_path]))):
+                    raise ValueError(
+                        f'{structure_path} 的 INCAR 与同目录四件套绑定不一致；请重新扫描')
+
             # Capture the source structures before parsing/method planning.  These
             # digests, together with the INCAR digests captured by the resolver,
             # are passed into create_project and checked around every copy.
@@ -2031,6 +2244,14 @@ class Api:
                 }
                 for path in [slab, *configs]
             }
+            for path, bundle in member_input_bundles.items():
+                if bundle.get('mode') != 'copy':
+                    continue
+                for filename, record in (bundle.get('files') or {}).items():
+                    member_source_evidence[path][filename.lower()] = {
+                        'path': str(record.get('path') or ''),
+                        'sha256': str(record.get('sha256') or ''),
+                    }
 
             slab_composition, slab_cell = _poscar_composition_cell(slab)
             structure_compositions = {slab: slab_composition}
@@ -2108,12 +2329,51 @@ class Api:
                     auto_encut = None
 
             plans = {}
-            reference_issues, reference_warnings = list(encut_issues), []
+            # 跨目录差异属于“最终能量可比性”证据，不属于“作业能否运行”硬门。
+            # 本目录 INCAR/POSCAR/KPOINTS/POTCAR 的合法性在前面的成员输入门处理。
+            reference_issues, reference_warnings, method_advisories = [], [], []
+            reference_warnings.extend(encut_issues)
             checked_fields = 0
             for structure_path in [slab, *configs]:
                 elements = list(structure_compositions[structure_path])
                 planned_titels = []
-                if lib_root:
+                bundle = member_input_bundles.get(structure_path) or {}
+                local_potcar = ((bundle.get('files') or {}).get('POTCAR') or {}).get('path')
+                local_kpoints = ((bundle.get('files') or {}).get('KPOINTS') or {}).get('path')
+                local_default_encut = None
+                try:
+                    from vcstudio.generate.kpoints import recommend_kpoints
+                    planned_kpoints = {
+                        'scheme': 'Gamma',
+                        'grid': recommend_kpoints(slab_cell, 'slab'),
+                        'shift': [0.0, 0.0, 0.0],
+                    }
+                except Exception:                         # noqa: BLE001 仅降级方法证据
+                    planned_kpoints = None
+                if bundle.get('mode') == 'copy' and local_potcar:
+                    try:
+                        from vcstudio.generate import methods_text as _methods_text
+                        with open(local_potcar, 'r', encoding='utf-8',
+                                  errors='replace') as handle:
+                            potcar_text = handle.read()
+                            planned_titels = [
+                                row.get('titel') or ''
+                                for row in _methods_text.parse_potcar_titels(potcar_text)]
+                        enmax_values = [float(value) for value in re.findall(
+                            r'\bENMAX\s*=\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)',
+                            potcar_text, re.I)]
+                        if enmax_values and all(math.isfinite(value)
+                                                for value in enmax_values):
+                            # VASP's effective default when ENCUT is omitted.
+                            local_default_encut = max(enmax_values)
+                        if local_kpoints:
+                            with open(local_kpoints, 'r', encoding='utf-8',
+                                      errors='replace') as handle:
+                                planned_kpoints = _methods_text.parse_kpoints_scheme(
+                                    handle.read())
+                    except Exception:                     # noqa: BLE001 四件套硬门已给精确错误
+                        planned_titels, local_default_encut, planned_kpoints = [], None, None
+                elif lib_root:
                     try:
                         from vcstudio.generate import potcar as _potcar
                         planned_titels = [row.get('titel') or '' for row in
@@ -2123,6 +2383,9 @@ class Api:
                 if structure_path in explicit_encuts:
                     effective_encut = explicit_encuts[structure_path]
                     encut_source = 'member_incar'
+                elif bundle.get('mode') == 'copy':
+                    effective_encut = local_default_encut
+                    encut_source = 'source_quartet_vasp_default_max_enmax'
                 elif group_encut is not None:
                     effective_encut = group_encut
                     encut_source = 'project_member_incar'
@@ -2133,12 +2396,26 @@ class Api:
                     effective_encut = None
                     encut_source = ('unavailable:no_potcar_lib_root' if not lib_root
                                     else 'unavailable:potcar_enmax')
-                signatures = ref_signatures if structure_path in configs else {}
+                signatures = ({source_species[structure_path]:
+                               ref_signatures[source_species[structure_path]]}
+                              if structure_path in configs else {})
+                effective_ispin = None
+                if (bundle.get('mode') != 'copy'
+                        and 'ISPIN' not in parsed_incars[structure_path]
+                        and 'MAGMOM' not in parsed_incars[structure_path]):
+                    try:
+                        from vcstudio.generate.incar_builder import has_magnetic
+                        if has_magnetic(elements):
+                            effective_ispin = 2
+                    except Exception:                     # noqa: BLE001 仅影响预览证据
+                        effective_ispin = None
                 check = self._reference_method_check(
                     signatures, member_incar_paths[structure_path],
                     planned_potcar=planned_titels,
                     effective_encut=effective_encut, encut_source=encut_source,
-                    planned_element_orders=[elements])
+                    planned_element_orders=[elements],
+                    effective_ispin=effective_ispin,
+                    planned_kpoints=planned_kpoints)
                 check['planned']['element_orders'] = [elements]
                 plans[structure_path] = check['planned']
                 if structure_path in configs:
@@ -2147,6 +2424,8 @@ class Api:
                         else os.path.basename(structure_path)
                     reference_issues.extend(f'{label}: {item}' for item in check['issues'])
                     reference_warnings.extend(f'{label}: {item}' for item in check['warnings'])
+                    method_advisories.extend(
+                        f'{label}: {item}' for item in check.get('advisories') or [])
                     checked_fields += int(check.get('checked_fields') or 0)
 
             periodic = self._periodic_method_check(
@@ -2158,6 +2437,7 @@ class Api:
                 })
             reference_issues.extend(periodic['issues'])
             reference_warnings.extend(periodic['warnings'])
+            method_advisories.extend(periodic.get('advisories') or [])
             checked_fields += periodic['checked_fields']
             planned_members = {
                 ('clean_slab' if path == slab else
@@ -2167,31 +2447,129 @@ class Api:
                 for path, plan in plans.items()
             }
             method_check = {
-                'status': ('incompatible' if reference_issues else
-                           ('unverified' if reference_warnings else 'verified')),
+                # analysis_blocked 只表示这些能量当前不能直接进入最终 ΔE/报告；
+                # 作业本身仍可按各目录四件套生成并提交。
+                'status': ('analysis_blocked' if reference_issues else
+                           ('review' if reference_warnings else
+                            ('advisory' if method_advisories else 'verified'))),
+                'execution_status': 'ready',
+                'comparability_status': (
+                    'incompatible' if reference_issues else
+                    ('unverified' if reference_warnings else 'verified')),
                 'issues': reference_issues, 'warnings': reference_warnings,
+                'advisories': list(dict.fromkeys(method_advisories)),
+                'notes': list(dict.fromkeys(method_advisories)),
+                'submission_allowed': True,
+                'analysis_ready': not reference_issues and not reference_warnings,
                 'checked_fields': checked_fields,
                 # 兼容旧消费者：代表性 planned 取首个 adsorption；完整矩阵另存。
                 'planned': plans[configs[0]], 'planned_members': planned_members,
                 'reference_signatures': ref_signatures,
             }
-            if method_check['status'] == 'incompatible':
-                return {**empty, 'reference_species': sorted(refs),
-                        'method_check': method_check,
-                        'error': '参考能与新任务方法明确不一致，不能直接相减：'
-                                 + '；'.join(method_check['issues'])}
+            repair_plan = self._lis_repair_plan(
+                [slab, *configs], plans, parsed_incars,
+                structure_compositions, member_incar_records,
+                member_source_evidence)
+            if repair_plan:
+                repair_plan['manual_review'] = list(dict.fromkeys([
+                    *reference_issues, *reference_warnings,
+                ]))
+                method_check['repair_plan'] = repair_plan
+                repair_notes = [
+                    f'{action["member"]}: {action["key"]} 可在受管副本中智能修复；'
+                    '源目录不会修改'
+                    for action in repair_plan['actions']
+                ]
+                repair_notes.extend(
+                    f'{item["member"]}: {item["key"]} 仅提供候选建议；不会自动修改'
+                    for item in repair_plan.get('suggestions') or [])
+                method_check['advisories'] = list(dict.fromkeys([
+                    *method_check.get('advisories', []), *repair_notes,
+                ]))
+                method_check['notes'] = list(method_check['advisories'])
+                if method_check['status'] == 'verified':
+                    method_check['status'] = 'advisory'
+            decision = dict(repair_request or {}) \
+                if isinstance(repair_request, dict) else {}
+            member_incar_patches = {}
+            if repair_plan and repair_plan.get('actions'):
+                mode = str(decision.get('mode') or '').strip().lower()
+                supplied_plan = str(decision.get('plan_id') or '').strip().lower()
+                if mode and supplied_plan != repair_plan['plan_id']:
+                    return {**empty, 'reference_species': sorted(refs),
+                            'method_check': method_check, 'repair_plan': repair_plan,
+                            'error': '智能修复预览已过期；输入文件可能变化，请重新预览'}
+                if mode not in {'keep', 'apply'}:
+                    return {**empty, 'reference_species': sorted(refs),
+                            'method_check': method_check, 'repair_plan': repair_plan,
+                            'needs_repair_decision': True, 'error': None}
+                if mode == 'apply':
+                    for action in repair_plan['actions']:
+                        member_incar_patches.setdefault(
+                            action['structure_path'], {})[action['key']] = action['new']
+                        if action['key'] == 'ENCUT':
+                            plans[action['structure_path']]['encut'] = float(action['new'])
+                            plans[action['structure_path']]['encut_source'] = \
+                                'managed_copy_low_risk_repair'
+
+                    # ENCUT is the only auto-repairable field.  Re-evaluate its
+                    # comparability after the previewed patches so the stored
+                    # plan and UI describe the bytes that will actually run.
+                    reference_issues[:] = [
+                        item for item in reference_issues if 'ENCUT' not in item]
+                    reference_warnings[:] = [
+                        item for item in reference_warnings if 'ENCUT' not in item]
+                    for path in configs:
+                        species = source_species[path]
+                        label = (os.path.basename(os.path.dirname(path))
+                                 if os.path.basename(path).casefold()
+                                 in ('poscar', 'contcar') else os.path.basename(path))
+                        reference_encut = _method_number(
+                            (ref_signatures.get(species) or {}).get('encut'))
+                        planned_encut = _method_number(plans[path].get('encut'))
+                        if reference_encut is None or planned_encut is None:
+                            reference_warnings.append(
+                                f'{label}: {species}: ENCUT 证据不完整')
+                        elif abs(reference_encut - planned_encut) > 1e-8:
+                            reference_issues.append(
+                                f'{label}: {species}: ENCUT 参考={reference_encut} eV，'
+                                f'新任务={planned_encut} eV')
+                    clean_encut = _method_number(plans[slab].get('encut'))
+                    for path in configs:
+                        member_encut = _method_number(plans[path].get('encut'))
+                        label = (os.path.basename(os.path.dirname(path))
+                                 if os.path.basename(path).casefold()
+                                 in ('poscar', 'contcar') else os.path.basename(path))
+                        if clean_encut is None or member_encut is None:
+                            reference_warnings.append(
+                                f'clean slab ↔ {label}: ENCUT 证据不完整')
+                        elif abs(clean_encut - member_encut) > 1e-8:
+                            reference_issues.append(
+                                f'clean slab ↔ {label}: ENCUT 不一致'
+                                f'（{clean_encut!r} vs {member_encut!r}）')
+                    method_check['issues'] = list(dict.fromkeys(reference_issues))
+                    method_check['warnings'] = list(dict.fromkeys(reference_warnings))
+                    method_check['comparability_status'] = (
+                        'incompatible' if method_check['issues'] else
+                        ('unverified' if method_check['warnings'] else 'verified'))
+                    method_check['analysis_ready'] = (
+                        not method_check['issues'] and not method_check['warnings'])
+                    method_check['status'] = (
+                        'analysis_blocked' if method_check['issues'] else
+                        ('review' if method_check['warnings'] else 'advisory'))
+                    method_check['repairs'] = [
+                        {**action, 'applied': True, 'source_unchanged': True}
+                        for action in repair_plan['actions']]
+                method_check['repair_decision'] = {
+                    'mode': mode, 'plan_id': repair_plan['plan_id'],
+                    'source_unchanged': True,
+                }
             confirmation = dict(method_confirmation or {}) \
                 if isinstance(method_confirmation, dict) else {}
-            if method_check['status'] == 'unverified':
-                reason = str(confirmation.get('reason') or '').strip()
-                if not confirmation.get('confirmed') or not reason:
-                    return {**empty, 'reference_species': sorted(refs),
-                            'method_check': method_check,
-                            'needs_method_confirmation': True,
-                            'error': '参考能与新任务存在需人工核对的方法差异或证据缺项；'
-                                     '请阅读提示后填写确认理由'}
+            if confirmation.get('confirmed') and str(confirmation.get('reason') or '').strip():
                 method_check['confirmation'] = {
-                    'confirmed': True, 'reason': reason,
+                    'confirmed': True,
+                    'reason': str(confirmation.get('reason') or '').strip(),
                     'confirmed_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
                 }
 
@@ -2212,6 +2590,7 @@ class Api:
                 'incar': {'path': member_incar_paths[slab],
                           'sha256': member_incar_records[slab]['sha256'],
                           'source': member_incar_records[slab]['source']},
+                'input_bundle': member_input_bundles.get(slab),
             }]
             member_inputs.extend({
                 'role': 'config', 'species': source_species[path],
@@ -2219,6 +2598,7 @@ class Api:
                 'incar': {'path': member_incar_paths[path],
                           'sha256': member_incar_records[path]['sha256'],
                           'source': member_incar_records[path]['source']},
+                'input_bundle': member_input_bundles.get(path),
                 'species_evidence': source_species_evidence[path],
             } for path in configs)
             request_inputs = {
@@ -2231,6 +2611,7 @@ class Api:
                     {'path': path, 'sha256': member_poscar_hashes[path],
                      'incar_path': member_incar_paths[path],
                      'incar_sha256': member_incar_records[path]['sha256'],
+                     'input_bundle': member_input_bundles.get(path),
                      'species': source_species[path],
                      'species_evidence': source_species_evidence[path]}
                     for path in configs
@@ -2241,6 +2622,7 @@ class Api:
                 'species_ref_jobs': ref_jobs,
                 'planned_method': method_check['planned'],
                 'planned_methods': method_check['planned_members'],
+                'repair_decision': method_check.get('repair_decision'),
             }
             request_sha256 = hashlib.sha256(json.dumps(
                 request_inputs, ensure_ascii=False, sort_keys=True,
@@ -2275,12 +2657,14 @@ class Api:
                 incar_path=(fallback_incar or member_incar_paths[slab]),
                 member_incars=member_incar_paths,
                 member_source_evidence=member_source_evidence,
+                member_input_bundles=member_input_bundles,
                 lib_root=(lib_root or None),
                 config_species=source_species, species_refs=refs,
                 config_species_evidence=source_species_evidence,
                 species_ref_jobs=ref_jobs, molecules_dir=molecules_dir,
                 reference_project=reference_path, preparation=preparation,
-                fail_if_exists=True)
+                fail_if_exists=True,
+                member_incar_patches=member_incar_patches)
             warnings = []
             for member, _job_dir, item_warnings in (result.get('generated') or []):
                 warnings.extend(f'{member}:{warning}' for warning in (item_warnings or []))
@@ -2298,6 +2682,7 @@ class Api:
                     'job_dirs': job_dirs, 'reference_species': sorted(refs),
                     'reused': False, 'preparation': preparation,
                     'method_check': method_check,
+                    'repair_plan': repair_plan,
                     'needs_method_confirmation': False,
                     'advisories': advisories, 'warnings': warnings, 'error': error}
         except Exception as e:                            # noqa: BLE001

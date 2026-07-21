@@ -140,7 +140,7 @@ def _number(value, default=None):
 
 def _integer(value, default=None):
     n = _number(value)
-    return int(n) if n is not None else default
+    return int(n) if n is not None and n == int(n) else default
 
 
 def _numeric_vector(value, *, integer: bool = False):
@@ -293,6 +293,7 @@ def validate_vasp_quartet(source: str | os.PathLike) -> list[str]:
     if issues:
         return list(dict.fromkeys(issues))
 
+    incar = {}
     try:
         incar = parse_incar(texts['INCAR'])
         if not incar:
@@ -327,6 +328,59 @@ def validate_vasp_quartet(source: str | os.PathLike) -> list[str]:
         issues.append(
             'POTCAR 元素顺序与 POSCAR 不一致：'
             f'{" ".join(str(item) for item in potcar_elements)} != {" ".join(species)}')
+
+    # Directory-local INCAR vectors are meaningful only against this POSCAR
+    # and POTCAR order.  These are execution-safety checks, not cross-system
+    # comparability rules.
+    if incar:
+        spin = _number(incar.get('ISPIN', 1))
+        if 'ISPIN' in incar:
+            if spin not in (1.0, 2.0):
+                issues.append(
+                    f'INCAR 的 ISPIN={incar.get("ISPIN")!r} 无效（仅允许 1 或 2）')
+        nions = sum(counts) if counts and all(count > 0 for count in counts) else None
+        noncollinear = str(incar.get('LNONCOLLINEAR', 'F')).strip().strip('.').upper() \
+            in {'T', 'TRUE'}
+        spin_orbit = str(incar.get('LSORBIT', 'F')).strip().strip('.').upper() \
+            in {'T', 'TRUE'}
+        magnetic_mode = spin == 2.0 or noncollinear or spin_orbit
+        if 'MAGMOM' in incar and nions is not None and magnetic_mode:
+            magmom = _numeric_vector(incar.get('MAGMOM'))
+            expected = 3 * nions if noncollinear or spin_orbit else nions
+            if magmom is None or len(magmom) != expected:
+                issues.append(
+                    f'INCAR 的 MAGMOM 长度应与本目录 POSCAR 对应'
+                    f'（应为 {expected}，实际 {0 if magmom is None else len(magmom)}）')
+
+        ldau_enabled = str(incar.get('LDAU', 'F')).strip().strip('.').upper() \
+            in {'T', 'TRUE'}
+        u_keys = ('LDAUL', 'LDAUU', 'LDAUJ')
+        if ldau_enabled:
+            if ('LDAUTYPE' in incar
+                    and _integer(incar.get('LDAUTYPE')) is None):
+                issues.append(
+                    f'INCAR 的 LDAUTYPE={incar.get("LDAUTYPE")!r} 必须为整数')
+            for key in u_keys:
+                # VASP provides defaults for omitted Hubbard vectors.  Only an
+                # explicitly supplied vector can be malformed locally; cross-
+                # job comparability still treats missing provenance as
+                # unverified at the final-energy gate.
+                if key not in incar:
+                    continue
+                vector = _numeric_vector(incar.get(key), integer=(key == 'LDAUL'))
+                if vector is None or len(vector) != len(species):
+                    issues.append(
+                        f'INCAR 的 {key} 长度须与本目录 POTCAR/POSCAR 物种数 '
+                        f'{len(species)} 一致')
+
+        if 'ENCUT' in incar:
+            encut = _number(incar.get('ENCUT'))
+            if encut is None or encut <= 0:
+                issues.append(f'INCAR 的 ENCUT={incar.get("ENCUT")!r} 不是正数')
+        for key in ('AEXX', 'HFSCREEN'):
+            if key in incar and _number(incar.get(key)) is None:
+                issues.append(
+                    f'INCAR 的 {key}={incar.get(key)!r} 必须是有限数值')
     return list(dict.fromkeys(issues))
 
 
@@ -344,6 +398,7 @@ def _input_method_signature(files: dict[str, Path]) -> dict:
     potcars = list(facts.get('potcars') or [])
     signature = {
         'functional': facts.get('functional'),
+        'base_functional': facts.get('base_functional'),
         'gga': facts.get('gga'),
         'metagga': facts.get('metagga') or 'F',
         'ivdw': facts.get('ivdw_setting'),

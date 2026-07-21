@@ -10,6 +10,9 @@ from __future__ import annotations
 import re
 
 from vcstudio.generate.incar_builder import parse_incar
+from vcstudio.shared.vasp_identity import (
+    canonical_kpoints_effective_text, canonical_kpoints_sha256,
+)
 
 _TITEL_RE = re.compile(r'TITEL\s*=\s*(.+)')
 
@@ -44,14 +47,25 @@ def parse_kpoints_scheme(text: str) -> dict | None:
     if not text or not text.strip():
         return None
     lines = [ln.strip() for ln in text.splitlines()]
+    def explicit_record():
+        # The first line is a free-form comment.  Hash every effective line
+        # after whitespace normalisation so equal-length explicit meshes cannot
+        # be mistaken for one another merely because their point counts match.
+        effective = canonical_kpoints_effective_text(text)
+        return {
+            'scheme': 'explicit', 'grid': None,
+            'raw': effective[:120],
+            'raw_sha256': canonical_kpoints_sha256(text),
+        }
+
     if len(lines) < 4:
-        return {'scheme': 'explicit', 'grid': None, 'raw': text.strip()[:120]}
+        return explicit_record()
     mode = lines[2][:1].upper()
     if lines[1].split()[:1] == ['0'] and mode in ('G', 'M'):
         try:
             grid = [int(t) for t in lines[3].split()[:3]]
         except ValueError:
-            return {'scheme': 'explicit', 'grid': None, 'raw': text.strip()[:120]}
+            return explicit_record()
         try:
             shift = [float(t) for t in lines[4].split()[:3]] if len(lines) > 4 else []
         except ValueError:
@@ -60,10 +74,7 @@ def parse_kpoints_scheme(text: str) -> dict | None:
             shift = [0.0, 0.0, 0.0]
         return {'scheme': 'Gamma' if mode == 'G' else 'Monkhorst-Pack',
                 'grid': grid, 'shift': shift}
-    # The first line is a free-form comment and has no effect on the calculation.
-    # Excluding it prevents comment-only differences from failing consistency.
-    return {'scheme': 'explicit', 'grid': None,
-            'raw': '\n'.join(lines[1:]).strip()[:120]}
+    return explicit_record()
 
 
 def extract_facts(incar_text: str, kpoints_text: str | None,
@@ -241,7 +252,9 @@ def extract_facts(incar_text: str, kpoints_text: str | None,
         'ediffg_energy': ediffg if ediffg is not None and ediffg > 0 else None,
         'ivdw': ivdw_name,
         'ivdw_setting': ivdw_setting,
-        'ispin': int(_num('ISPIN')) if _num('ISPIN') else None,
+        # Preserve an explicit non-integral value for downstream validity
+        # gates; only a genuinely omitted ISPIN receives the VASP default.
+        'ispin': (1 if 'ISPIN' not in inc else _num('ISPIN')),
         'relax': relax,
         'nsw': int(nsw) if nsw else None,
         'ldau': ldau,

@@ -12,6 +12,21 @@ def _write_done_files(job_dir, energy):
         'General timing and accounting information for this job\n', encoding='utf-8')
 
 
+def _write_method_files(job_dir):
+    """Write a complete, mutually comparable single-element VASP input set."""
+    (job_dir / 'POSCAR').write_text(
+        'C\n1.0\n10 0 0\n0 10 0\n0 0 10\nC\n1\nCartesian\n0 0 0\n',
+        encoding='utf-8')
+    (job_dir / 'INCAR').write_text(
+        'ENCUT = 500\nEDIFF = 1E-5\nISPIN = 1\nLDAU = F\n',
+        encoding='utf-8')
+    (job_dir / 'KPOINTS').write_text(
+        'mesh\n0\nGamma\n3 3 1\n0 0 0\n', encoding='utf-8')
+    (job_dir / 'POTCAR').write_text(
+        'TITEL = PAW_PBE C 08Apr2002\nENMAX = 400.0; ENMIN = 300.0\n',
+        encoding='utf-8')
+
+
 def _proj(tmp_path, n_done=2):
     dirs = []
     for i in range(n_done):
@@ -23,7 +38,7 @@ def _proj(tmp_path, n_done=2):
         m['results'] = {'energy_e0_eV': -100.0 - i}
         mm.save_manifest(d, m)
         _write_done_files(d, -100.0 - i)
-        (d / 'INCAR').write_text('ENCUT = 500\nEDIFF = 1E-5\n', encoding='utf-8')
+        _write_method_files(d)
         dirs.append(str(d))
     slab = tmp_path / 'slab'
     slab.mkdir()
@@ -33,6 +48,7 @@ def _proj(tmp_path, n_done=2):
     ms['results'] = {'energy_e0_eV': -90.0}
     mm.save_manifest(slab, ms)
     _write_done_files(slab, -90.0)
+    _write_method_files(slab)
     return {'name': 'proj1', 'root': str(tmp_path),
             'members': {'clean_slab': str(slab), 'gas_ref': None, 'configs': dirs}}
 
@@ -40,7 +56,7 @@ def _proj(tmp_path, n_done=2):
 def test_incar_summary_reads_real_keys(tmp_path):
     p = _proj(tmp_path)
     s = report_full.incar_summary_from_dir(p['members']['configs'][0])
-    assert s == {'ENCUT': 500, 'EDIFF': 1e-05}
+    assert s == {'ENCUT': 500, 'EDIFF': 1e-05, 'ISPIN': 1}
     assert report_full.incar_summary_from_dir(tmp_path / 'nope') == {}
 
 
@@ -54,7 +70,8 @@ def test_generate_report_origin_ok_and_ai_ok(tmp_path):
         return {'ok': True, 'images': {'ads_bar': png}, 'error': ''}
 
     def fake_ai(payload):
-        assert payload['computational_parameters'] == {'ENCUT': 500, 'EDIFF': 1e-05}
+        assert payload['computational_parameters'] == {
+            'ENCUT': 500, 'EDIFF': 1e-05, 'ISPIN': 1}
         return {'ok': True, 'analysis_zh': '中文解读OK', 'paragraph_en': 'English para.',
                 'caveats': ['no ZPE'], 'confidence': 'high', 'error': ''}
 
@@ -270,7 +287,12 @@ def test_species_reference_report_contains_energy_source_provenance_and_formula(
     mm.set_state(ref, 'DONE')
     ref['results'].update(
         energy_e0_eV=-38.072771, energy_source='OSZICAR:E0',
-        import_confirmation={'manual': False})
+        import_confirmation={'manual': False},
+        reference_method_signature={
+            'functional': 'PBE', 'ivdw': 0, 'encut': 500.0, 'ispin': 1,
+            'ldau': 'F', 'potcar_titel': ['PAW_PBE C 08Apr2002'],
+            'potcar_elements': ['C'],
+        })
     mm.save_manifest(ref_job, ref)
     _write_done_files(ref_job, -38.072771)
     project['config_species'] = {config: 'Li2S8'}

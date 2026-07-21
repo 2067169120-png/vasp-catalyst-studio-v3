@@ -195,21 +195,30 @@ silent (job.yaml state machine + audit history).
 
 - 新计算扫描会把每个结构绑定到同目录唯一的 `INCAR`，不同目录多份 INCAR 不再视为歧义；
   本地文件优先，显式备用只补真正缺失的目录，不会掩盖空文件、大小写冲突或非法参数。
-  生成、manifest 和 SSH 上传均逐成员保留源路径与 SHA256；上传前会再次核对最终四件套，
-  准备后被修改的成员必须重新准备。物种分组仍只由结构组成决定。
+  同目录完整 `POSCAR/INCAR/KPOINTS/POTCAR` 会字节级复制；不完整目录只用本目录
+  `POSCAR+INCAR` 生成受管四件套，不改源文件。生成、manifest 和 SSH 上传均逐成员保留
+  源路径与 SHA256；上传前会再次核对最终四件套，准备后被修改的成员必须重新准备。
+  物种分组仍只由结构组成决定。
 - 新计算目录优先读取 `POSCAR`，已算结果优先读取 `CONTCAR`；以
   `composition(config) − composition(clean slab)` 识别吸附物化学计量，按组成稳定分组。
   文件夹名只作提示；同组成多参考、无法唯一识别或人工改映射时必须确认并留审计记录。
-- 分子参考 `ISPIN=1`、周期 clean/adsorption 体系 `ISPIN=2` 不再被笼统判为硬不兼容；
-  clean slab 与 adsorption 仍须严格同自旋设置，跨体系差异必须填写基态磁性核对理由。
+- 检查拆成两层：提交门只检查每个目录自身能否运行（四件套、POSCAR/POTCAR 顺序、合法
+  `ISPIN`、本目录 `MAGMOM`/DFT+U 向量等）；跨目录方法差异只影响自动 ΔE/报告。
+  `NSW/IBRION/MAGMOM` 不要求跨作业相同；分子参考、clean slab、adsorption 可按各自基态
+  使用 `ISPIN=1/2`，包括吸附诱导磁性的 clean=1、adsorption=2，只作核对提示而不阻止提交。
+- 智能修复先展示哈希绑定的预览并等待选择；当前只会把受管副本的 `ENCUT` 安全上调到组内
+  最大值，保留修复前备份和前后 SHA256。`MAGMOM` 等磁性选择只给候选建议，绝不自动改写；
+  源目录始终只读，预览后任一实际使用的输入发生变化都必须重新确认。
 - 自动托管只操作项目提交成功后保存的目录白名单。多服务器并行隔离；服务器端点指纹、
   per-job 互斥和下载代次 CAS 防止同名服务器接管、双重续算或旧清单覆盖新作业号。
 - 续算前把上一轮输出移入远端历史目录；重投失败会恢复输出、INCAR/POSCAR。最终下载只接受
   DONE，证据绑定 job id、remote dir、attempt token、文件大小与 SHA256，运行中预览不能冒充最终结果。
 - ΔE 的 slab/config/reference 每个操作数都要通过 DONE、完整结束页脚和当前 `OSZICAR:E0`
-  复核。无参考态、参考无效或未确认的方法差异只能生成诊断，不能标记为最终吸附能报告。
+  复核。已知的泛函、ENCUT、共享元素 POTCAR/DFT+U 冲突会暂停相减；关键方法证据缺失时
+  标为 unverified。无参考态、参考无效或未确认的方法差异只能生成诊断，不能标记为最终
+  吸附能报告。
   报告绑定成员代次、能量、下载哈希与方法证据；结果变化或报告文件删除后会自动失效重建。
-- 当前回归基线：**2624 测试通过，6 项按本机可选软件/依赖环境跳过**。
+- 当前回归基线：**2695 测试通过，6 项按本机可选软件/依赖环境跳过**。
 
 ## Install & quickstart
 
@@ -233,7 +242,7 @@ report, no VASP or cluster): [examples/offline_analysis](examples/offline_analys
 — `python examples/offline_analysis/run_demo.py` drives a synthetic completed
 job set end-to-end so a reviewer can confirm the analysis half of the pipeline.
 
-**Tests**: `python -m pytest` — 2624 tests, 6 skipped (optional OriginLab smoke
+**Tests**: `python -m pytest` — 2695 tests, 6 skipped (optional OriginLab smoke
 behind `VCS_ORIGIN_SMOKE=1`, and a POV-Ray real-render smoke). Parser
 cross-checks against ASE run when `ase` is installed (in the `dev` extra).
 CI runs the suite on ubuntu/windows × Python 3.10/3.12.

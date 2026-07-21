@@ -152,6 +152,159 @@ def test_method_record_prefers_actual_output_signature_over_edited_incar(tmp_pat
     assert record['known']['functional'] is True
 
 
+def test_legacy_hse_label_never_collapses_to_plain_pbe(tmp_path):
+    legacy = _write_method_job(
+        tmp_path / 'legacy-hse06', functional='HSE06', input_functional='PBE')
+    pbe = _write_method_job(
+        tmp_path / 'plain-pbe', functional='PBE', input_functional='PBE')
+    legacy_record = energy_gate.method_record(
+        legacy, manifest_mod.load_manifest(legacy), 'legacy HSE06')
+    pbe_record = energy_gate.method_record(
+        pbe, manifest_mod.load_manifest(pbe), 'PBE')
+    result = energy_gate.compare_methods(
+        [legacy_record, pbe_record], require_same_kpoints=True)
+
+    assert legacy_record['fingerprint']['functional'] == \
+        'hybrid:base=PBE;metagga=F;AEXX=0.25;HFSCREEN=0.2'
+    assert any('泛函 不一致' in issue for issue in result['issues'])
+
+
+def test_contradictory_hse_label_and_disabled_lhfcalc_is_unverified(tmp_path):
+    job = _write_method_job(tmp_path / 'contradictory-hse', functional='HSE06')
+    item = manifest_mod.load_manifest(job)
+    item['results']['reference_method_signature']['lhfcalc'] = 'F'
+    manifest_mod.save_manifest(job, item)
+
+    record = energy_gate.method_record(job, item, 'contradictory HSE')
+
+    assert record['known']['functional'] is False
+
+
+def test_malformed_hybrid_parameters_are_unverified_not_plain_pbe(tmp_path):
+    job = _write_method_job(tmp_path / 'bad-hybrid')
+    (job / 'INCAR').write_text(
+        'GGA=PE\nLHFCALC=T\nAEXX=bad\nENCUT=500\nISPIN=1\nLDAU=F\n',
+        encoding='utf-8')
+    item = manifest_mod.load_manifest(job)
+    item['results'].pop('reference_method_signature', None)
+    manifest_mod.save_manifest(job, item)
+
+    record = energy_gate.method_record(job, item, 'bad hybrid')
+
+    assert record['known']['functional'] is False
+    assert record['fingerprint']['functional'] is None
+
+
+def test_partial_potcar_identity_is_missing_evidence_not_a_conflict(tmp_path):
+    job = tmp_path / 'partial-potcar'
+    job.mkdir()
+    (job / 'INCAR').write_text('GGA=PE\nENCUT=500\nISPIN=1\nLDAU=F\n', encoding='utf-8')
+    (job / 'KPOINTS').write_text(
+        'Automatic\n0\nGamma\n1 1 1\n0 0 0\n', encoding='utf-8')
+    (job / 'POSCAR').write_text(
+        'C\n1\n8 0 0\n0 8 0\n0 0 8\nC\n1\nDirect\n0 0 0\n',
+        encoding='utf-8')
+    partial = energy_gate.method_record(
+        job, {'inputs': {'potcar_provenance': [{'element': 'C', 'titel': None}]}},
+        'partial')
+    known = copy.deepcopy(partial)
+    known['label'] = 'known'
+    known['fingerprint']['potcar_ids'] = {'C': 'known-id'}
+    known['known']['potcar_ids'] = True
+
+    result = energy_gate.compare_methods([partial, known], require_same_kpoints=True)
+
+    assert partial['known']['potcar_ids'] is False
+    assert not any('POTCAR' in issue for issue in result['issues'])
+    assert any('POTCAR 身份证据不完整' in warning
+               for warning in result['warnings'])
+
+
+def _write_unsigned_method_job(path, *, incar, enmax=400.0):
+    path.mkdir(parents=True)
+    (path / 'INCAR').write_text(incar, encoding='utf-8')
+    (path / 'KPOINTS').write_text(
+        'Automatic\n0\nGamma\n1 1 1\n0 0 0\n', encoding='utf-8')
+    (path / 'POSCAR').write_text(
+        'C\n1\n8 0 0\n0 8 0\n0 0 8\nC\n1\nDirect\n0 0 0\n',
+        encoding='utf-8')
+    (path / 'POTCAR').write_text(
+        f'TITEL = PAW_PBE C\nENMAX = {enmax}\n', encoding='utf-8')
+    return path
+
+
+def test_result_method_gate_uses_effective_encut_default_from_potcar(tmp_path):
+    common = 'GGA=PE\nISPIN=1\nIVDW=0\nLDAU=F\n'
+    left_dir = _write_unsigned_method_job(tmp_path / 'left-default', incar=common)
+    right_dir = _write_unsigned_method_job(tmp_path / 'right-default', incar=common)
+    changed_dir = _write_unsigned_method_job(
+        tmp_path / 'changed-default', incar=common, enmax=450.0)
+    left = energy_gate.method_record(left_dir, {}, 'left')
+    right = energy_gate.method_record(right_dir, {}, 'right')
+    changed = energy_gate.method_record(changed_dir, {}, 'changed')
+
+    same = energy_gate.compare_methods([left, right], require_same_kpoints=True)
+    different = energy_gate.compare_methods([left, changed], require_same_kpoints=True)
+
+    assert same['status'] == 'verified'
+    assert left['fingerprint']['encut'] == 400.0
+    assert any('ENCUT 不一致' in issue for issue in different['issues'])
+
+
+def test_result_method_gate_normalises_metagga_false_and_hybrid_base(tmp_path):
+    omitted = _write_unsigned_method_job(
+        tmp_path / 'meta-omitted',
+        incar='GGA=PE\nENCUT=500\nISPIN=1\nIVDW=0\nLDAU=F\n')
+    disabled = _write_unsigned_method_job(
+        tmp_path / 'meta-disabled',
+        incar='GGA=PE\nMETAGGA=F\nENCUT=500\nISPIN=1\nIVDW=0\nLDAU=F\n')
+    pbe_hybrid = _write_unsigned_method_job(
+        tmp_path / 'pbe-hybrid',
+        incar=('GGA=PE\nLHFCALC=T\nAEXX=0.25\nHFSCREEN=0.2\n'
+               'ENCUT=500\nISPIN=1\nIVDW=0\nLDAU=F\n'))
+    implicit_pbe_hybrid = _write_unsigned_method_job(
+        tmp_path / 'implicit-pbe-hybrid',
+        incar=('LHFCALC=T\nAEXX=0.25\nHFSCREEN=0.2\n'
+               'ENCUT=500\nISPIN=1\nIVDW=0\nLDAU=F\n'))
+    rpbe_hybrid = _write_unsigned_method_job(
+        tmp_path / 'rpbe-hybrid',
+        incar=('GGA=RP\nLHFCALC=T\nAEXX=0.25\nHFSCREEN=0.2\n'
+               'ENCUT=500\nISPIN=1\nIVDW=0\nLDAU=F\n'))
+
+    meta = energy_gate.compare_methods([
+        energy_gate.method_record(omitted, {}, 'omitted'),
+        energy_gate.method_record(disabled, {}, 'disabled'),
+    ], require_same_kpoints=True)
+    hybrid = energy_gate.compare_methods([
+        energy_gate.method_record(pbe_hybrid, {}, 'PBE hybrid'),
+        energy_gate.method_record(rpbe_hybrid, {}, 'RPBE hybrid'),
+    ], require_same_kpoints=True)
+    implicit_base = energy_gate.compare_methods([
+        energy_gate.method_record(pbe_hybrid, {}, 'explicit PBE hybrid'),
+        energy_gate.method_record(implicit_pbe_hybrid, {}, 'PAW_PBE default hybrid'),
+    ], require_same_kpoints=True)
+
+    assert meta['status'] == 'verified'
+    assert any('泛函' in issue for issue in hybrid['issues'])
+    assert implicit_base['status'] == 'verified'
+
+
+def test_result_method_gate_detects_managed_input_hash_drift(tmp_path):
+    job = _write_unsigned_method_job(
+        tmp_path / 'drifted',
+        incar='GGA=PE\nENCUT=500\nISPIN=1\nIVDW=0\nLDAU=F\n')
+    frozen = {name: manifest_mod.sha256_file(job / name)
+              for name in ('INCAR', 'KPOINTS', 'POTCAR')}
+    (job / 'INCAR').write_text(
+        'GGA=RP\nENCUT=500\nISPIN=1\nIVDW=0\nLDAU=F\n', encoding='utf-8')
+
+    record = energy_gate.method_record(job, {'inputs': {'sha256': frozen}}, 'drifted')
+
+    assert record['known']['functional'] is False
+    assert any('INCAR' in warning and '哈希不一致' in warning
+               for warning in record['evidence_warnings'])
+
+
 def test_managed_lis_method_audit_blocks_pbe_rpbe_mix(tmp_path):
     clean = _write_method_job(tmp_path / 'ads' / 'clean', elements=('S',), functional='PBE')
     config = _write_method_job(tmp_path / 'ads' / 'config', elements=('S',), functional='PBE')

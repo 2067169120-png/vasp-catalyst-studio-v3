@@ -6508,7 +6508,8 @@ def _write_lis_potcar_library(root):
             encoding='utf-8')
 
 
-def test_proj_prepare_lis_reuses_only_done_reference_jobs_and_persists_mapping(tmp_path):
+def test_proj_prepare_lis_reuses_only_required_done_reference_jobs_and_persists_mapping(
+        tmp_path):
     slab = tmp_path / 'slab.vasp'
     config = tmp_path / 'Li2S8_top.vasp'
     incar = tmp_path / 'INCAR'
@@ -6524,11 +6525,12 @@ def test_proj_prepare_lis_reuses_only_done_reference_jobs_and_persists_mapping(t
         str(incar), str(tmp_path / 'out'), reference_path,
         {'confirmed': True, 'reason': '单测假赝势库无法核对 TITEL'})
 
-    assert out['ok'] is True and out['reference_species'] == ['Li2S8', 'S8']
+    assert out['ok'] is True and out['reference_species'] == ['Li2S8']
     assert len(out['job_dirs']) == 2
     assert calls['root'] == str(tmp_path / 'out' / 'lis')
     assert calls['config_species'] == {str(config.resolve()): 'Li2S8'}
-    assert calls['species_refs'] == {'Li2S8': -30.0, 'S8': -31.0}
+    assert calls['species_refs'] == {'Li2S8': -30.0}
+    assert set(calls['species_ref_jobs']) == {'Li2S8'}
     assert calls['species_ref_jobs']['Li2S8'].endswith('mol_Li2S8')
     assert calls['reference_project'] == reference_path
     assert calls['lib_root'] == '/potentials'
@@ -6594,7 +6596,62 @@ def test_proj_prepare_lis_binds_each_member_incar_and_keeps_runtime_controls_ind
     assert not out['method_check']['issues']
 
 
-def test_proj_prepare_lis_blocks_clean_config_ispin_mismatch_before_generation(tmp_path):
+def test_proj_prepare_lis_rejects_quartet_changed_after_browser_scan(tmp_path):
+    from vcstudio.project import adsorption as real_adsorption
+
+    clean_dir = tmp_path / 'inputs' / 'clean'
+    config_dir = tmp_path / 'inputs' / 'Li2S8_top'
+    clean_dir.mkdir(parents=True)
+    config_dir.mkdir(parents=True)
+    slab, config = clean_dir / 'POSCAR', config_dir / 'POSCAR'
+    header = '1.0\n10 0 0\n0 10 0\n0 0 20\n'
+    slab.write_text('slab\n' + header + 'C\n1\nDirect\n0 0 0\n', encoding='utf-8')
+    config.write_text(
+        'ads\n' + header + 'C Li S\n1 2 8\nDirect\n' + '0 0 0\n' * 11,
+        encoding='utf-8')
+    common = 'ENCUT=400\nGGA=RP\nISPIN=1\nIVDW=0\nLDAU=F\n'
+    for folder, elements in ((clean_dir, ('C',)), (config_dir, ('C', 'Li', 'S'))):
+        (folder / 'INCAR').write_text(common, encoding='utf-8')
+        (folder / 'KPOINTS').write_text(
+            'reviewed mesh\n0\nGamma\n3 3 1\n0 0 0\n', encoding='utf-8')
+        (folder / 'POTCAR').write_text(''.join(
+            f'TITEL = PAW_PBE {element}\nENMAX = 400\n' for element in elements),
+            encoding='utf-8')
+    scanned_clean = real_adsorption.resolve_structure_quartet(slab)
+    scanned_config = real_adsorption.resolve_structure_quartet(config)
+    (clean_dir / 'KPOINTS').write_text(
+        'changed after review\n0\nGamma\n5 5 1\n0 0 0\n', encoding='utf-8')
+
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    adsorption.resolve_structure_quartet = real_adsorption.resolve_structure_quartet
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config())
+    evidence = {
+        'clean_slab': {
+            'path': str(clean_dir / 'INCAR'),
+            'sha256': _sha256_file(clean_dir / 'INCAR'),
+            'quartet': scanned_clean,
+        },
+        'configs': [{
+            'path': str(config), 'incar_path': str(config_dir / 'INCAR'),
+            'incar_sha256': _sha256_file(config_dir / 'INCAR'),
+            'quartet': scanned_config,
+        }],
+    }
+
+    out = api.proj_prepare_lis(
+        'changed-after-scan', str(slab),
+        [{'path': str(config), 'species': 'Li2S8'}], '',
+        str(tmp_path / 'out'), reference_path, member_incars=evidence)
+
+    assert out['ok'] is False
+    assert 'KPOINTS' in out['error'] and '扫描后已变化' in out['error']
+    assert not calls
+
+
+def test_proj_prepare_lis_allows_clean_config_ispin_difference_as_advisory(tmp_path):
     clean_dir = tmp_path / 'clean'
     config_dir = tmp_path / 'Li2S8_top'
     clean_dir.mkdir()
@@ -6612,22 +6669,120 @@ def test_proj_prepare_lis_blocks_clean_config_ispin_mismatch_before_generation(t
     calls = {}
     reference_path, adsorption, manifests = _lis_reference_fake(
         tmp_path, {'Li2S8': 'DONE'}, calls)
+    potcars = tmp_path / 'potcars'
+    _write_lis_potcar_library(potcars)
     api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
-              config_mod=_fake_config())
+              config_mod=_fake_config(cfg={'potcar_lib_root': str(potcars)}))
 
     out = api.proj_prepare_lis(
         'spin-mismatch', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
-        '', str(tmp_path / 'out'), reference_path,
-        {'confirmed': True, 'reason': '不应覆盖周期体系自旋硬冲突'})
+        '', str(tmp_path / 'out'), reference_path)
 
-    assert out['ok'] is False
-    assert out['method_check']['status'] == 'incompatible'
-    assert any('clean slab' in issue and 'ISPIN' in issue
-               for issue in out['method_check']['issues'])
+    assert out['ok'] is True and calls
+    assert out['method_check']['status'] == 'advisory'
+    assert out['method_check']['submission_allowed'] is True
+    assert out['method_check']['analysis_ready'] is True
+    assert not out['method_check']['issues']
+    assert any('clean slab' in advisory and 'ISPIN' in advisory
+               and '吸附诱导磁性' in advisory
+               for advisory in out['method_check']['advisories'])
+
+
+def test_proj_prepare_lis_previews_and_applies_only_managed_copy_encut_repair(
+        tmp_path):
+    clean_dir = tmp_path / 'clean'
+    config_dir = tmp_path / 'Li2S8_top'
+    clean_dir.mkdir()
+    config_dir.mkdir()
+    slab, config = clean_dir / 'POSCAR', config_dir / 'POSCAR'
+    clean_incar, config_incar = clean_dir / 'INCAR', config_dir / 'INCAR'
+    header = '1.0\n10 0 0\n0 10 0\n0 0 20\n'
+    slab.write_text('slab\n' + header + 'C\n1\nDirect\n0 0 0\n', encoding='utf-8')
+    config.write_text(
+        'ads\n' + header + 'C Li S\n1 2 8\nDirect\n' + '0 0 0\n' * 11,
+        encoding='utf-8')
+    common = 'GGA=RP\nISPIN=1\nIVDW=0\nLDAU=F\nMETAGGA=F\nLHFCALC=F\n'
+    clean_incar.write_text('ENCUT=400\n' + common, encoding='utf-8')
+    config_incar.write_text('ENCUT=450\n' + common, encoding='utf-8')
+    before = {clean_incar: clean_incar.read_bytes(), config_incar: config_incar.read_bytes()}
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    ref_job = str(tmp_path / 'reference' / 'molecules' / 'mol_Li2S8')
+    ref_manifest = manifests.load_manifest(ref_job)
+    ref_manifest['results']['reference_method_signature']['encut'] = 450.0
+    potcars = tmp_path / 'potcars'
+    _write_lis_potcar_library(potcars)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config(cfg={'potcar_lib_root': str(potcars)}))
+
+    preview = api.proj_prepare_lis(
+        'repair-preview', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        '', str(tmp_path / 'out'), reference_path)
+
+    assert preview['ok'] is False and preview['needs_repair_decision'] is True
     assert not calls
+    actions = preview['repair_plan']['actions']
+    assert [(item['key'], item['old'], item['new'], item['risk']) for item in actions] == [
+        ('ENCUT', 400.0, 450, 'low')]
+
+    applied = api.proj_prepare_lis(
+        'repair-preview', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        '', str(tmp_path / 'out'), reference_path,
+        repair_request={'plan_id': preview['repair_plan']['plan_id'], 'mode': 'apply'})
+
+    assert applied['ok'] is True and calls
+    assert calls['member_incar_patches'] == {str(slab.resolve()): {'ENCUT': 450}}
+    assert applied['method_check']['analysis_ready'] is True
+    assert applied['method_check']['comparability_status'] == 'verified'
+    assert not applied['method_check']['issues']
+    assert calls['preparation']['inputs']['planned_methods']['clean_slab']['encut'] == 450.0
+    assert before == {clean_incar: clean_incar.read_bytes(),
+                      config_incar: config_incar.read_bytes()}
 
 
-def test_proj_prepare_lis_blocks_reference_encut_different_from_auto_effective(tmp_path):
+def test_lis_repair_plan_id_binds_the_entire_member_input_evidence():
+    clean = '/inputs/clean/POSCAR'
+    config = '/inputs/Li2S8_top/POSCAR'
+    paths = [clean, config]
+    plans = {clean: {'encut': 400.0}, config: {'encut': 450.0}}
+    parsed = {clean: {'ENCUT': 400}, config: {'ENCUT': 450}}
+    compositions = {clean: {'C': 1}, config: {'C': 1, 'Li': 2, 'S': 8}}
+    incars = {
+        clean: {'path': '/inputs/clean/INCAR', 'sha256': '1' * 64},
+        config: {'path': '/inputs/Li2S8_top/INCAR', 'sha256': '2' * 64},
+    }
+
+    def evidence(kpoints_hash):
+        return {
+            clean: {
+                'poscar': {'path': clean, 'sha256': '3' * 64},
+                'incar': incars[clean],
+                'kpoints': {'path': '/inputs/clean/KPOINTS',
+                            'sha256': kpoints_hash},
+                'potcar': {'path': '/inputs/clean/POTCAR', 'sha256': '5' * 64},
+            },
+            config: {
+                'poscar': {'path': config, 'sha256': '6' * 64},
+                'incar': incars[config],
+                'kpoints': {'path': '/inputs/Li2S8_top/KPOINTS',
+                            'sha256': '7' * 64},
+                'potcar': {'path': '/inputs/Li2S8_top/POTCAR',
+                           'sha256': '8' * 64},
+            },
+        }
+
+    first = Api._lis_repair_plan(
+        paths, plans, parsed, compositions, incars, evidence('4' * 64))
+    second = Api._lis_repair_plan(
+        paths, plans, parsed, compositions, incars, evidence('9' * 64))
+
+    assert first['plan_id'] != second['plan_id']
+    assert set(first['evidence'][clean]['files']) == {
+        'POSCAR', 'INCAR', 'KPOINTS', 'POTCAR'}
+
+
+def test_proj_prepare_lis_generates_with_reference_encut_analysis_blocked(tmp_path):
     slab, config, incar = (tmp_path / name for name in
                            ('slab.vasp', 'Li2S8_top.vasp', 'INCAR'))
     _write_lis_prepare_inputs(slab, config, incar)
@@ -6644,14 +6799,16 @@ def test_proj_prepare_lis_blocks_reference_encut_different_from_auto_effective(t
 
     out = api.proj_prepare_lis(
         'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
-        str(incar), str(tmp_path / 'out'), reference_path,
-        {'confirmed': True, 'reason': '人工确认也不能覆盖明确 ENCUT 冲突'})
+        str(incar), str(tmp_path / 'out'), reference_path)
 
-    assert out['ok'] is False and out['method_check']['status'] == 'incompatible'
+    assert out['ok'] is True and out['method_check']['status'] == 'analysis_blocked'
+    assert out['method_check']['submission_allowed'] is True
+    assert out['method_check']['analysis_ready'] is False
     assert out['method_check']['planned']['encut'] == 550
     assert out['method_check']['planned']['encut_source'] == (
         'potcar_enmax_1.3_round_up_50')
-    assert 'ENCUT' in out['error'] and not calls
+    assert any('ENCUT' in issue for issue in out['method_check']['issues'])
+    assert calls
 
 
 def test_proj_prepare_lis_auto_effective_encut_can_be_fully_verified(tmp_path):
@@ -6684,7 +6841,8 @@ def test_proj_prepare_lis_auto_effective_encut_can_be_fully_verified(tmp_path):
     assert calls['preparation']['inputs']['planned_method']['encut'] == 550
 
 
-def test_proj_prepare_lis_accepts_confirmed_molecular_ispin_difference(tmp_path):
+def test_proj_prepare_lis_molecular_ispin_difference_is_advisory_without_confirmation(
+        tmp_path):
     slab, config, incar = (tmp_path / name for name in
                            ('slab.vasp', 'Li2S8_top.vasp', 'INCAR'))
     _write_lis_prepare_inputs(slab, config, incar)
@@ -6703,28 +6861,24 @@ def test_proj_prepare_lis_accepts_confirmed_molecular_ispin_difference(tmp_path)
     api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
               config_mod=_fake_config(cfg={'potcar_lib_root': str(potcars)}))
 
-    first = api.proj_prepare_lis(
+    out = api.proj_prepare_lis(
         'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
         str(incar), str(tmp_path / 'out'), reference_path)
 
-    assert first['ok'] is False and first['needs_method_confirmation'] is True
-    assert first['method_check']['status'] == 'unverified'
-    assert not first['method_check']['issues'] and not calls
-    assert any('参考分子 ISPIN=1' in warning
-               for warning in first['method_check']['warnings'])
-
-    second = api.proj_prepare_lis(
-        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
-        str(incar), str(tmp_path / 'out'), reference_path,
-        {'confirmed': True,
-         'reason': 'Li2S8 为已验证非磁闭壳层；磁性基底和吸附体系统一用 ISPIN=2'})
-
-    assert second['ok'] is True and calls
-    confirmation = calls['preparation']['method_check']['confirmation']
-    assert confirmation['confirmed'] is True and 'ISPIN=2' in confirmation['reason']
+    assert out['ok'] is True and calls
+    assert out['needs_method_confirmation'] is False
+    assert out['method_check']['status'] == 'advisory'
+    assert out['method_check']['submission_allowed'] is True
+    assert out['method_check']['analysis_ready'] is True
+    assert not out['method_check']['issues']
+    assert not out['method_check']['warnings']
+    assert any('参考分子 ISPIN=1' in advisory and '不是自动不兼容' in advisory
+               for advisory in out['method_check']['advisories'])
+    assert 'confirmation' not in calls['preparation']['method_check']
 
 
-def test_proj_prepare_lis_dft_u_value_mismatch_is_not_confirmable(tmp_path):
+def test_proj_prepare_lis_shared_element_dft_u_mismatch_allows_generation_but_blocks_analysis(
+        tmp_path):
     slab, config, incar = (tmp_path / name for name in
                            ('slab.vasp', 'Li2S8_top.vasp', 'INCAR'))
     _write_lis_prepare_inputs(slab, config, incar)
@@ -6748,16 +6902,17 @@ def test_proj_prepare_lis_dft_u_value_mismatch_is_not_confirmable(tmp_path):
 
     out = api.proj_prepare_lis(
         'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
-        str(incar), str(tmp_path / 'out'), reference_path,
-        {'confirmed': True, 'reason': '不应覆盖明确的 U 值冲突'})
+        str(incar), str(tmp_path / 'out'), reference_path)
 
-    assert out['ok'] is False and out['method_check']['status'] == 'incompatible'
-    assert any('Li LDAUU' in issue and '3.0' in issue and '5.0' in issue
+    assert out['ok'] is True and out['method_check']['status'] == 'analysis_blocked'
+    assert out['method_check']['submission_allowed'] is True
+    assert out['method_check']['analysis_ready'] is False
+    assert any('Li DFT+U' in issue and '3.0' in issue and '5.0' in issue
                for issue in out['method_check']['issues'])
-    assert not calls
+    assert calls
 
 
-def test_reference_method_check_dft_u_missing_vectors_stays_unverified(tmp_path):
+def test_reference_method_check_uses_vasp_defaults_for_omitted_dft_u_vectors(tmp_path):
     incar = tmp_path / 'INCAR'
     incar.write_text(
         'ENCUT = 400\nGGA = RP\nISPIN = 1\nIVDW = 0\nLDAU = T\n'
@@ -6774,8 +6929,9 @@ def test_reference_method_check_dft_u_missing_vectors_stays_unverified(tmp_path)
         signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'],
         planned_element_orders=[['Li', 'S']])
 
-    assert check['status'] == 'unverified' and not check['issues']
-    assert any('LDAUU' in warning for warning in check['warnings'])
+    assert check['status'] == 'incompatible'
+    assert any('Li DFT+U' in issue for issue in check['issues'])
+    assert not any('DFT+U' in warning for warning in check['warnings'])
 
 
 def test_reference_method_check_allows_molecular_ispin_1_with_magnetic_adsorption(tmp_path):
@@ -6787,14 +6943,38 @@ def test_reference_method_check_allows_molecular_ispin_1_with_magnetic_adsorptio
         'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
         'metagga': 'F', 'lhfcalc': 'F', 'encut': 400.0,
         'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+        'potcar_elements': ['Li', 'S'],
     }}
 
     check = Api._reference_method_check(
-        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'])
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'],
+        planned_element_orders=[['Li', 'S']])
 
-    assert check['status'] == 'unverified' and not check['issues']
-    assert any('参考分子 ISPIN=1' in warning and '不是自动不兼容' in warning
-               for warning in check['warnings'])
+    assert check['status'] == 'verified' and not check['issues'] and not check['warnings']
+    assert any('参考分子 ISPIN=1' in advisory and '不是自动不兼容' in advisory
+               for advisory in check['advisories'])
+
+
+def test_reference_method_check_records_generated_magnetic_spin_completion(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=RP\nIVDW=0\nLDAU=F\n', encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'encut': 400.0, 'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+        'potcar_elements': ['Li', 'S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'],
+        planned_element_orders=[['Li', 'S']], effective_ispin=2)
+
+    assert check['planned']['ispin'] == 2
+    assert check['planned']['ispin_source'] == 'generated_completion'
+    assert check['status'] == 'verified'
+    assert not check['issues'] and not check['warnings']
+    assert any('ISPIN=1' in item and 'ISPIN=2' in item
+               for item in check['advisories'])
 
 
 def test_reference_method_check_keeps_hard_conflicts_with_soft_ispin_warning(tmp_path):
@@ -6813,7 +6993,7 @@ def test_reference_method_check_keeps_hard_conflicts_with_soft_ispin_warning(tmp
 
     assert check['status'] == 'incompatible'
     assert any('functional' in issue for issue in check['issues'])
-    assert any('ISPIN=1' in warning for warning in check['warnings'])
+    assert any('ISPIN=1' in advisory for advisory in check['advisories'])
 
 
 def test_reference_method_check_rejects_invalid_ispin_value(tmp_path):
@@ -6854,7 +7034,7 @@ def test_reference_method_check_hse_aexx_difference_is_incompatible(tmp_path):
                for issue in check['issues'])
 
 
-def test_reference_method_check_hse_missing_aexx_stays_unverified(tmp_path):
+def test_reference_method_check_hybrid_omitted_aexx_uses_vasp_default(tmp_path):
     incar = tmp_path / 'INCAR'
     incar.write_text(
         'ENCUT=400\nGGA=RP\nISPIN=1\nIVDW=0\nLDAU=F\nMETAGGA=F\n'
@@ -6863,16 +7043,125 @@ def test_reference_method_check_hse_missing_aexx_stays_unverified(tmp_path):
         'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
         'metagga': 'F', 'lhfcalc': 'T', 'hfscreen': 0.2,
         'encut': 400.0, 'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+        'potcar_elements': ['Li', 'S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'],
+        planned_element_orders=[['Li', 'S']])
+
+    assert check['status'] == 'verified' and not check['issues']
+    assert not any('AEXX' in warning for warning in check['warnings'])
+
+
+def test_reference_method_check_rejects_malformed_planned_hybrid_number(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=PE\nISPIN=1\nLDAU=F\n'
+        'LHFCALC=T\nAEXX=bad\n', encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'PBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'encut': 400.0, 'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
     }}
 
     check = Api._reference_method_check(
         signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'])
 
-    assert check['status'] == 'unverified' and not check['issues']
-    assert any('AEXX' in warning for warning in check['warnings'])
+    assert check['status'] == 'incompatible'
+    assert any('AEXX' in issue and '有限数值' in issue for issue in check['issues'])
 
 
-def test_proj_prepare_lis_fails_closed_if_any_reference_job_not_done(tmp_path):
+def test_reference_method_check_legacy_hse_label_is_not_plain_pbe(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=PE\nISPIN=1\nIVDW=0\nLDAU=F\n',
+        encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'HSE06', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'encut': 400.0, 'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'])
+
+    assert check['status'] == 'incompatible'
+    assert any('functional' in issue and 'hybrid:base=PBE' in issue
+               for issue in check['issues'])
+
+
+def test_reference_method_check_planned_hybrid_defaults_equal_explicit_signature(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=RP\nISPIN=1\nIVDW=0\nLDAU=F\nLHFCALC=T\n',
+        encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'metagga': 'F', 'lhfcalc': 'T', 'aexx': 0.25, 'hfscreen': 0.0,
+        'encut': 400.0, 'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+        'potcar_elements': ['Li', 'S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'],
+        planned_element_orders=[['Li', 'S']])
+
+    assert check['status'] == 'verified'
+    assert check['planned']['aexx'] == 0.25
+    assert check['planned']['hfscreen'] == 0.0
+
+
+def test_reference_method_check_accepts_real_imported_hse_signature(tmp_path):
+    from vcstudio.project import result_import
+
+    incar = tmp_path / 'INCAR'
+    kpoints = tmp_path / 'KPOINTS'
+    potcar = tmp_path / 'POTCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=PE\nISPIN=1\nIVDW=0\nLDAU=F\nMETAGGA=F\n'
+        'LHFCALC=T\nHFSCREEN=0.2\n', encoding='utf-8')
+    kpoints.write_text('Gamma\n0\nGamma\n1 1 1\n0 0 0\n', encoding='utf-8')
+    potcar.write_text(
+        'TITEL = PAW_PBE Li\nENMAX=250\nTITEL = PAW_PBE S\nENMAX=400\n',
+        encoding='utf-8')
+    signature = result_import._input_method_signature({
+        'INCAR': incar, 'KPOINTS': kpoints, 'POTCAR': potcar})
+
+    check = Api._reference_method_check(
+        {'Li2S8': signature}, str(incar),
+        planned_potcar=['PAW_PBE Li', 'PAW_PBE S'],
+        planned_element_orders=[['Li', 'S']])
+
+    assert signature['functional'] == 'HSE06'
+    assert signature['base_functional'] == 'PBE'
+    assert check['status'] == 'verified'
+
+
+def test_reference_method_check_accepts_real_imported_metagga_signature(tmp_path):
+    from vcstudio.project import result_import
+
+    incar = tmp_path / 'INCAR'
+    kpoints = tmp_path / 'KPOINTS'
+    potcar = tmp_path / 'POTCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=PE\nISPIN=1\nIVDW=0\nLDAU=F\n'
+        'METAGGA=R2SCAN\nLASPH=T\nLHFCALC=F\n', encoding='utf-8')
+    kpoints.write_text('Gamma\n0\nGamma\n1 1 1\n0 0 0\n', encoding='utf-8')
+    potcar.write_text(
+        'TITEL = PAW_PBE Li\nENMAX=250\nTITEL = PAW_PBE S\nENMAX=400\n',
+        encoding='utf-8')
+    signature = result_import._input_method_signature({
+        'INCAR': incar, 'KPOINTS': kpoints, 'POTCAR': potcar})
+
+    check = Api._reference_method_check(
+        {'Li2S8': signature}, str(incar),
+        planned_potcar=['PAW_PBE Li', 'PAW_PBE S'],
+        planned_element_orders=[['Li', 'S']])
+
+    assert signature['functional'] == 'r2SCAN'
+    assert check['status'] == 'verified'
+
+
+def test_proj_prepare_lis_ignores_unfinished_reference_species_not_used_by_batch(tmp_path):
     slab, config, incar = (tmp_path / name for name in ('slab.vasp', 'Li2S8.vasp', 'INCAR'))
     _write_lis_prepare_inputs(slab, config, incar)
     calls = {}
@@ -6885,8 +7174,9 @@ def test_proj_prepare_lis_fails_closed_if_any_reference_job_not_done(tmp_path):
         'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
         str(incar), str(tmp_path / 'out'), reference_path)
 
-    assert out['ok'] is False and 'S8' in out['error'] and 'DONE' in out['error']
-    assert not calls
+    assert out['ok'] is True and out['reference_species'] == ['Li2S8']
+    assert calls['species_refs'] == {'Li2S8': -30.0}
+    assert set(calls['species_ref_jobs']) == {'Li2S8'}
 
 
 def test_proj_prepare_lis_rejects_missing_species_and_existing_target(tmp_path):
@@ -7294,7 +7584,7 @@ def test_exhausted_restartable_project_moves_to_human_analysis():
     assert stage == 'analysis' and needs_human is True and rounds == 3
 
 
-def test_unverified_reference_method_requires_reasoned_confirmation(tmp_path):
+def test_missing_reference_method_evidence_allows_generation_in_review_state(tmp_path):
     slab, config, incar = (tmp_path / name for name in
                            ('slab.vasp', 'Li2S8_top.vasp', 'INCAR'))
     _write_lis_prepare_inputs(slab, config, incar)
@@ -7306,18 +7596,16 @@ def test_unverified_reference_method_requires_reasoned_confirmation(tmp_path):
     ref_manifest['results']['reference_method_signature'] = {}
     api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
               config_mod=_fake_config())
-    first = api.proj_prepare_lis(
+    out = api.proj_prepare_lis(
         'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
         str(incar), str(tmp_path / 'out'), reference_path)
-    assert first['needs_method_confirmation'] is True
-    assert first['method_check']['status'] == 'unverified' and not calls
-    second = api.proj_prepare_lis(
-        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
-        str(incar), str(tmp_path / 'out'), reference_path,
-        {'confirmed': True, 'reason': '已核对原始 OUTCAR 与共享 INCAR'})
-    assert second['ok'] and calls
-    confirmation = calls['preparation']['method_check']['confirmation']
-    assert confirmation['confirmed'] and '核对' in confirmation['reason']
+    assert out['ok'] is True and calls
+    assert out['needs_method_confirmation'] is False
+    assert out['method_check']['status'] == 'review'
+    assert out['method_check']['submission_allowed'] is True
+    assert out['method_check']['analysis_ready'] is False
+    assert not out['method_check']['issues']
+    assert any('缺方法签名' in warning for warning in out['method_check']['warnings'])
 
 
 def test_pipeline_done_jobs_backfill_missing_local_results_after_restart(tmp_path):

@@ -45,6 +45,28 @@ def test_parse_kpoints_scheme():
     assert k['grid'] == [3, 3, 1]
 
 
+def test_explicit_kpoints_identity_covers_all_effective_lines_but_not_comment():
+    first = mt.parse_kpoints_scheme(
+        'comment one\n2\nReciprocal\n0 0 0 1\n0.5 0 0 1\n')
+    same = mt.parse_kpoints_scheme(
+        'different comment\n2\nReciprocal\n0 0 0 1\n0.5 0 0 1\n')
+    changed = mt.parse_kpoints_scheme(
+        'comment one\n2\nReciprocal\n0 0 0 1\n0.25 0 0 1\n')
+
+    assert first['raw_sha256'] == same['raw_sha256']
+    assert first['raw_sha256'] != changed['raw_sha256']
+
+
+def test_explicit_kpoints_identity_normalises_case_numbers_and_signed_zero():
+    first = mt.parse_kpoints_scheme(
+        'comment\n2\nReciprocal\n0 0 0 1\n0.5 -0 0 1\n')
+    same = mt.parse_kpoints_scheme(
+        'other\n2\nreciprocal\n0.0 0.000 0 1.0\n0.500000 0 0.0 1\n')
+
+    assert first['raw'] == same['raw']
+    assert first['raw_sha256'] == same['raw_sha256']
+
+
 def test_extract_facts_rpbe_overrides_potcar_flavor():
     r = mt.extract_facts(_INCAR_RPBE, _KPOINTS_GAMMA, _POTCAR_HEAD)
     f = r['facts']
