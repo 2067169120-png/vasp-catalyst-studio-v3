@@ -789,8 +789,30 @@ class Api:
             return {'ok': False, 'error': str(e)}
 
     # ── 任务:台账列表(取数逻辑照抄 jobs_tab.reload) ──────────────────────
+    @staticmethod
+    def _project_member_dirs(project):
+        """Return every managed project member once, including molecule refs."""
+        members = (project or {}).get('members') or {}
+        dirs = [members.get('clean_slab'), members.get('gas_ref')]
+        dirs.extend(members.get('configs') or [])
+        for refs in (members.get('molecules'),
+                     (project or {}).get('species_ref_jobs')):
+            if isinstance(refs, dict):
+                dirs.extend(refs.values())
+            elif isinstance(refs, (list, tuple)):
+                dirs.extend(refs)
+        result, seen = [], set()
+        for directory in dirs:
+            if not directory:
+                continue
+            key = os.path.normcase(os.path.normpath(str(directory)))
+            if key not in seen:
+                seen.add(key)
+                result.append(directory)
+        return result
+
     def _project_role_map(self):
-        """{规范化 job_dir → {'project': 项目名, 'role': 'clean'|'gas'|'config'}}。
+        """Map managed directories to a path-stable project and scientific role.
 
         供 list_jobs 给作业行注入所属吸附能项目组;任何异常(注册表坏/单个
         project.yaml 畸形)兜成空映射或跳过该项目,绝不拖垮 list_jobs。
@@ -807,16 +829,24 @@ class Api:
                         continue
                     pname = proj.get('name', '') or os.path.basename(
                         os.path.dirname(str(pp)))
+                    group = {'project': pname, 'project_path': str(pp)}
                     mem = proj.get('members') or {}
                     if mem.get('clean_slab'):
-                        mapping[norm(mem['clean_slab'])] = {'project': pname,
-                                                            'role': 'clean'}
+                        mapping[norm(mem['clean_slab'])] = {**group, 'role': 'clean'}
                     if mem.get('gas_ref'):
-                        mapping[norm(mem['gas_ref'])] = {'project': pname,
-                                                         'role': 'gas'}
+                        mapping[norm(mem['gas_ref'])] = {**group, 'role': 'gas'}
                     for d in (mem.get('configs') or []):
                         if d:
-                            mapping[norm(d)] = {'project': pname, 'role': 'config'}
+                            mapping[norm(d)] = {**group, 'role': 'config'}
+                    molecule_dirs = []
+                    for refs in (mem.get('molecules'), proj.get('species_ref_jobs')):
+                        if isinstance(refs, dict):
+                            molecule_dirs.extend(refs.values())
+                        elif isinstance(refs, (list, tuple)):
+                            molecule_dirs.extend(refs)
+                    for d in molecule_dirs:
+                        if d:
+                            mapping.setdefault(norm(d), {**group, 'role': 'molecule'})
                 except Exception:                         # noqa: BLE001 单个坏项目跳过
                     continue
         except Exception:                                 # noqa: BLE001 注册表坏 → 全部不分组
@@ -852,6 +882,7 @@ class Api:
                     'dir': job_dir,
                     'name': os.path.basename(os.path.normpath(job_dir)),
                     'project': grp['project'] if grp else None,
+                    'project_path': grp['project_path'] if grp else None,
                     'role': grp['role'] if grp else None,
                     'state': state,
                     'task': f"{m.get('task_type', '')}/{m.get('calc_type', '')}",
@@ -1014,7 +1045,18 @@ class Api:
                 source = 'local'
             else:
                 rdir = (m.get('remote_dir') or '').strip()
-                cl = (str(name).strip() if name else '') or (m.get('cluster') or '').strip()
+                requested = str(name or '').strip()
+                bound = str(m.get('cluster') or '').strip()
+                if rdir and not bound:
+                    return {**empty, 'state': state,
+                            'error': ('该旧作业虽有远端目录，但未记录所属服务器。为防止从'
+                                      '错误服务器读取同名路径，请先通过“认领外部作业”'
+                                      '明确绑定服务器后再查看实时能量。')}
+                if requested and bound and requested != bound:
+                    return {**empty, 'state': state,
+                            'error': (f'实时能量拒绝跨服务器读取：作业属于「{bound}」，'
+                                      f'当前选择「{requested}」')}
+                cl = bound
                 if not rdir or not cl:
                     return {**empty, 'state': state,
                             'error': ('本地无 OSZICAR,且该作业没有远端目录/集群记录'
@@ -1098,7 +1140,8 @@ class Api:
         def _scan(prof, pw):
             known_ids = {str(m['scheduler_job_id'])
                          for _d, m in self._ledger.load_all()
-                         if m and m.get('scheduler_job_id')}
+                         if (m and m.get('scheduler_job_id')
+                             and str(m.get('cluster') or '') == str(prof.name))}
             root = self.adopt_root_get().get('root')
             return self._bo().adopt_scan(prof, pw, trust_new, known_ids, root)
         return self._delegate(name, password, _scan)
@@ -1466,6 +1509,14 @@ class Api:
         gga = str(incar.get('GGA') or '').strip().upper()
         functional = {'RP': 'RPBE', 'PE': 'PBE', 'PS': 'PBEsol', '91': 'PW91'}.get(
             gga, gga or None)
+        if functional is None and planned_potcar:
+            flavors = {str(titel).split()[0].upper()
+                       for titel in planned_potcar if str(titel).split()}
+            # In normal VASP workflows a PAW_PBE POTCAR with no explicit GGA
+            # uses the PBE semilocal base.  Treating this as "unknown" would let
+            # an explicit RPBE reference slip through a human override.
+            if flavors == {'PAW_PBE'}:
+                functional = 'PBE'
         has_explicit_encut = incar.get('ENCUT') is not None
         explicit_encut = _method_number(incar.get('ENCUT'))
         planned_encut = explicit_encut if has_explicit_encut else _method_number(effective_encut)
@@ -1925,42 +1976,97 @@ class Api:
             else:
                 raise ValueError(f'未知提交脚本模式：{mode!r}')
 
-            members = project.get('members') or {}
-            job_dirs = [members.get('clean_slab'), members.get('gas_ref'),
-                        *(members.get('configs') or [])]
-            eligible, skipped = [], []
-            for job_dir in (str(d) for d in job_dirs if d):
+            # 与状态监控/报告共用同一成员枚举：除 clean/gas/config 外，导入项目的
+            # species_ref_jobs/molecules 中若仍是 CREATED，也必须能在这一站提交。
+            # 已完成的分子参考会在下面按 DONE 安全跳过。
+            job_dirs = list(dict.fromkeys(
+                str(d) for d in self._project_member_dirs(project) if d))
+            previous_launch = dict(project.get('launch') or {})
+            previous_resources = dict(previous_launch.get('resources') or {})
+            previous_profile = str(previous_resources.get('profile') or '').strip()
+            previous_submitted = list(previous_launch.get('submitted_job_dirs') or [])
+            if previous_submitted and previous_profile and previous_profile != prof.name:
+                raise ValueError(
+                    f'该项目已有 {len(previous_submitted)} 个作业由服务器'
+                    f'「{previous_profile}」自动托管，不能改用「{prof.name}」覆盖项目'
+                    '级服务器绑定。请继续使用原服务器，或新建项目。')
+
+            eligible, skipped, reconciled = [], [], []
+            for job_dir in job_dirs:
                 manifest = self._manifest.load_manifest(job_dir)
                 state = (manifest or {}).get('state')
                 job_id = (manifest or {}).get('scheduler_job_id')
                 if manifest is None:
                     skipped.append({'dir': job_dir, 'reason': '缺少可读 job.yaml'})
                 elif job_id:
+                    bound_profile = str(manifest.get('cluster') or '').strip()
+                    if bound_profile and bound_profile != prof.name:
+                        raise ValueError(
+                            f'项目成员 {self._base(job_dir)} 已绑定服务器'
+                            f'「{bound_profile}」(作业号 {job_id})，不能改投'
+                            f'「{prof.name}」。同一项目当前只允许一台服务器'
+                            '自动托管。')
+                    if bound_profile == prof.name:
+                        reconciled.append(job_dir)
                     skipped.append({'dir': job_dir, 'reason': f'已有作业号 {job_id}'})
                 elif state == 'DONE' or state in _ACTIVE_STATES:
                     skipped.append({'dir': job_dir, 'reason': f'当前状态 {state} 不重复提交'})
                 else:
                     eligible.append(job_dir)
+
+            managed_before = list(previous_submitted)
+            managed_before.extend(d for d in reconciled if d not in managed_before)
+            repair_needed = bool(
+                managed_before
+                and (not project.get('autopilot_managed')
+                     or previous_profile != prof.name
+                     or any(d not in previous_submitted for d in reconciled)))
+
+            def _persist_management(new_submitted):
+                """Persist or repair the explicit project automation allow-list."""
+                persistence_errors = []
+                all_submitted = list(managed_before)
+                all_submitted.extend(d for d in new_submitted if d not in all_submitted)
+                project['launch'] = {
+                    **previous_launch,
+                    'resources': resources,
+                    'submitted_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                    'submitted_job_dirs': all_submitted,
+                }
+                project['autopilot_managed'] = True
+                try:
+                    root = project.get('root') or os.path.dirname(str(project_path))
+                    self._adsorption.save_project(root, project)
+                except Exception as e:                    # noqa: BLE001 远程提交不能回滚
+                    persistence_errors.append(f'提交成功但 launch 资源写回失败：{e}')
+                try:
+                    self._config.set_ui_state(
+                        autopilot=True, autopilot_continue=True,
+                        autopilot_fetch=True, autopilot_report=True)
+                except Exception as e:                    # noqa: BLE001 自动化开关可重试
+                    persistence_errors.append(f'任务已提交，但自动托管设置保存失败：{e}')
+                if getattr(prof, 'auth', 'key') == 'password' and pw:
+                    try:
+                        self._save_password_verified(prof.name, pw)
+                    except Exception as e:                # noqa: BLE001 无人值守凭据失败
+                        persistence_errors.append(
+                            f'提交成功但密码未能保存到系统凭据库：{e}')
+                return persistence_errors
+
             if not eligible:
                 unsafe = [row for row in skipped
                           if not ('已有作业号' in row['reason']
                                   or '当前状态 DONE' in row['reason']
                                   or any(f'当前状态 {state}' in row['reason']
                                          for state in _ACTIVE_STATES))]
-                return {**base, 'ok': not unsafe, 'skipped': skipped,
-                        'resources': resources,
-                        'error': ('没有可提交作业；' + '；'.join(
-                            f'{self._base(row["dir"])}:{row["reason"]}' for row in unsafe)
-                                  if unsafe else None)}
-
-            by_basename = {}
-            for job_dir in eligible:
-                by_basename.setdefault(self._base(job_dir), []).append(job_dir)
-            duplicates = {name: paths for name, paths in by_basename.items() if len(paths) > 1}
-            if duplicates:
-                raise ValueError('项目内不同本地目录会映射到同一远程目录：'
-                                 + '；'.join(f'{name}({len(paths)} 个)' for name, paths in duplicates.items())
-                                 + '；请先重命名，不会覆盖远程结果')
+                persistence_errors = (_persist_management([])
+                                      if repair_needed and not unsafe else [])
+                return {**base, 'ok': not unsafe and not persistence_errors,
+                        'skipped': skipped, 'resources': resources,
+                        'error': ('；'.join(persistence_errors) if persistence_errors else
+                                  ('没有可提交作业；' + '；'.join(
+                                      f'{self._base(row["dir"])}:{row["reason"]}'
+                                      for row in unsafe) if unsafe else None))}
 
             response = self._bo().submit_batch(
                 launch_profile, pw, eligible, trust_new)
@@ -1977,34 +2083,8 @@ class Api:
                 if success:
                     submitted.append(job_dir)
             persistence_errors = []
-            if submitted:
-                previous_launch = dict(project.get('launch') or {})
-                all_submitted = list(previous_launch.get('submitted_job_dirs') or [])
-                all_submitted.extend(d for d in submitted if d not in all_submitted)
-                project['launch'] = {
-                    'resources': resources,
-                    'submitted_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
-                    'submitted_job_dirs': all_submitted,
-                }
-                project['autopilot_managed'] = True
-                try:
-                    root = project.get('root') or os.path.dirname(str(project_path))
-                    self._adsorption.save_project(root, project)
-                except Exception as e:                    # noqa: BLE001 已提交，不能回滚远端
-                    persistence_errors.append(f'提交成功但 launch 资源写回失败：{e}')
-                try:
-                    self._config.set_ui_state(
-                        autopilot=True, autopilot_continue=True,
-                        autopilot_fetch=True, autopilot_report=True)
-                except Exception as e:                    # noqa: BLE001 已提交，自动化开关可重试
-                    persistence_errors.append(f'任务已提交，但自动托管设置保存失败：{e}')
-                if getattr(prof, 'auth', 'key') == 'password' and pw:
-                    try:
-                        # pipeline_tick 后续在后台运行，不能再次弹密码框；首次成功提交
-                        # 即写入系统 keyring（绝不落 project/config 明文）。
-                        self._save_password_verified(prof.name, pw)
-                    except Exception as e:                # noqa: BLE001 已提交，明确告知无人值守受阻
-                        persistence_errors.append(f'提交成功但密码未能保存到系统凭据库：{e}')
+            if submitted or repair_needed:
+                persistence_errors = _persist_management(submitted)
             failed = [row for row in results if not row['ok']]
             if persistence_errors:
                 error = '；'.join(persistence_errors)
@@ -2092,9 +2172,7 @@ class Api:
                     if proj is None:
                         continue
                     mem = proj.get('members') or {}
-                    member_dirs = [d for d in ([mem.get('clean_slab'),
-                                                mem.get('gas_ref')]
-                                               + list(mem.get('configs') or [])) if d]
+                    member_dirs = self._project_member_dirs(proj)
                     reference_species = sorted(
                         str(species) for species in (proj.get('species_ref_jobs') or {})
                         if str(species).strip())
@@ -2203,6 +2281,8 @@ class Api:
                      'reference_state': r.get('reference_state'),
                      'reference_valid': r.get('reference_valid'),
                      'reference_note': r.get('reference_note'),
+                     'method_check': r.get('method_check'),
+                     'method_warnings': r.get('method_warnings') or [],
                      'dd_e': r.get('dd_e'),
                      'is_most_stable': bool(r.get('is_most_stable'))}
                     for r in (s.get('rows') or [])]
@@ -2215,6 +2295,7 @@ class Api:
             return {'ok': True, 'rows': rows, 'note': ';'.join(parts),
                     'reference_mode': s.get('reference_mode', 'none'),
                     'species_refs': s.get('species_refs') or {},
+                    'method_consistency': s.get('method_consistency') or {},
                     'slab': {'state': slab_state, 'energy': e_slab},
                     'ref': {'state': ref_state, 'energy': e_ref,
                             'has_ref': bool(s.get('has_ref'))},
@@ -2308,7 +2389,9 @@ class Api:
             return None, '清洁表面未完成,无法算 ΔG 台阶'
         try:
             fed = self._fe().path_from_project_and_molecules(
-                summary['rows'], e_slab=e_slab, molecules_dir=mol_dir)
+                summary['rows'], e_slab=e_slab, molecules_dir=mol_dir,
+                managed_dirs=(proj.get('species_ref_jobs') or {}).values(),
+                project=proj)
             return fed, None
         except ValueError as e:
             return None, str(e)
@@ -2850,15 +2933,8 @@ class Api:
 
     def _member_states(self, proj):
         """项目成员状态、续算轮次与远端结果是否已完整回到本地。"""
-        members = proj.get('members') or {}
-        dirs = []
-        if members.get('clean_slab'):
-            dirs.append(members['clean_slab'])
-        if members.get('gas_ref'):
-            dirs.append(members['gas_ref'])
-        dirs += [d for d in (members.get('configs') or []) if d]
         out = []
-        for d in dirs:
+        for d in self._project_member_dirs(proj):
             m = self._manifest.load_manifest(d)
             if m is None:
                 out.append({'dir': d, 'state': None, 'restartable': False, 'rounds': 0})
@@ -2967,10 +3043,9 @@ class Api:
                 resources = launch.get('resources') or {}
                 if not (project or {}).get('autopilot_managed') or resources.get('profile') != name:
                     continue
-                members = (project or {}).get('members') or {}
-                member_dirs = {_key(path) for path in (
-                    [members.get('clean_slab'), members.get('gas_ref')]
-                    + list(members.get('configs') or [])) if path}
+                member_dirs = {
+                    _key(path) for path in self._project_member_dirs(project)
+                }
                 submitted_dirs = launch.get('submitted_job_dirs') or []
                 # 必须同时是该项目成员、且确由一站式提交成功后写入 launch 的目录。
                 managed_dirs.update(_key(path) for path in submitted_dirs
@@ -2981,6 +3056,17 @@ class Api:
         def _in_scope(job_dir):
             # 空白名单必须 fail closed，绝不能退化成“台账里的所有旧任务”。
             return _key(job_dir) in managed_dirs
+
+        sync_ok = True
+        did_remote_action = False
+
+        def _record_remote_failure(stage, detail):
+            nonlocal sync_ok
+            sync_ok = False
+            label = {'continue': '续算', 'fetch': '下载'}.get(stage, stage)
+            text = f'集群「{name}」{label}跳过:{detail}'
+            events.append({'kind': stage, 'cluster': name, 'text': text})
+            errors.append(f'集群「{name}」同步失败({label}):{detail}')
 
         entries = list(self._ledger.load_all())
         targets = [d for d, m in entries
@@ -2993,7 +3079,9 @@ class Api:
                 events.append({'kind': 'skip',
                                'cluster': name,
                                'text': f'集群「{name}」主机指纹未信任,跳过本轮'})
+                errors.append(f'集群「{name}」同步失败:主机指纹未信任')
                 return False
+            did_remote_action = True
             for d, note in (res.get('results') or []):
                 events.append({'kind': 'refresh', 'cluster': name,
                                'text': f'{self._base(d)}:{note}'})
@@ -3006,12 +3094,15 @@ class Api:
                 eligible, _sk = self._bo().filter_continuable(cdirs)
                 if eligible:
                     cres = self._bo().continue_batch(prof, pw, eligible, False)
+                    if cres.get('needs_trust'):
+                        _record_remote_failure('continue', '主机指纹未信任')
+                        return False
+                    did_remote_action = True
                     for d, ok, msg in (cres.get('results') or []):
                         events.append({'kind': 'continue', 'cluster': name,
                                        'text': f'{self._base(d)}:{msg}'})
-            except Exception as e:                        # noqa: BLE001 续算失败仅记 event 不中断
-                events.append({'kind': 'continue', 'cluster': name,
-                               'text': f'集群「{name}」续算跳过:{e}'})
+            except Exception as e:                        # noqa: BLE001 单集群失败不拖垮其它集群
+                _record_remote_failure('continue', str(e))
         # 拉回：不能只看“本轮新变 DONE”。应用可能在任务结束后才重启，此时本地
         # 没有 fetched_at/关键输出；每拍重新检查缺口，fetch_results 成功写 fetched_at，
         # 因而完整结果天然幂等，未完整的结果会在下拍继续补拉。
@@ -3027,13 +3118,16 @@ class Api:
                         needs_fetch.append(job_dir)
                 if needs_fetch:
                     fres = self._bo().fetch_batch(prof, pw, needs_fetch, False)
+                    if fres.get('needs_trust'):
+                        _record_remote_failure('fetch', '主机指纹未信任')
+                        return False
+                    did_remote_action = True
                     for d, ok, msg in (fres.get('results') or []):
                         events.append({'kind': 'fetch', 'cluster': name,
                                        'text': f'{self._base(d)}:{msg}'})
-            except Exception as e:                        # noqa: BLE001 拉回失败仅记 event 不中断
-                events.append({'kind': 'fetch', 'cluster': name,
-                               'text': f'集群「{name}」下载跳过:{e}'})
-        return True
+            except Exception as e:                        # noqa: BLE001 单集群失败不拖垮其它集群
+                _record_remote_failure('fetch', str(e))
+        return sync_ok and did_remote_action
 
     def _project_all_done(self, states):
         return bool(states) and all(s['state'] == 'DONE' for s in states)
@@ -3183,20 +3277,49 @@ class Api:
         except Exception as e:                            # noqa: BLE001
             profiles = {}
             errors.append(f'读取集群配置失败:{e}')
+        runnable = []
         for name, prof in profiles.items():
             try:
                 if getattr(prof, 'auth', 'key') == 'password':
                     pw = self._secrets.get_password(name)
                     if not pw:
-                        events.append({'kind': 'skip',
+                        events.append({'kind': 'skip', 'cluster': name,
                                        'text': f'集群「{name}」无保存凭据,跳过本轮同步'})
                         continue
                 else:
                     pw = None
-                if self._tick_cluster(name, prof, pw, ap, events, errors):
-                    synced += 1
-            except Exception as e:                        # noqa: BLE001 单集群失败不拖垮其他
-                errors.append(f'集群「{name}」同步失败:{e}')
+                runnable.append((name, prof, pw))
+            except Exception as e:                        # noqa: BLE001 单集群凭据失败隔离
+                errors.append(f'集群「{name}」读取凭据失败:{e}')
+
+        def _run_cluster(name, profile, password):
+            cluster_events, cluster_errors = [], []
+            try:
+                did_sync = bool(self._tick_cluster(
+                    name, profile, password, ap, cluster_events, cluster_errors))
+            except Exception as exc:                     # noqa: BLE001 单集群失败不拖垮其他
+                did_sync = False
+                cluster_errors.append(f'集群「{name}」同步失败:{exc}')
+            return did_sync, cluster_events, cluster_errors
+
+        completed = {}
+        if runnable:
+            with ThreadPoolExecutor(
+                    max_workers=min(8, len(runnable)),
+                    thread_name_prefix='vcs-pipeline') as pool:
+                futures = {
+                    pool.submit(_run_cluster, name, prof, pw): name
+                    for name, prof, pw in runnable
+                }
+                for future in as_completed(futures):
+                    completed[futures[future]] = future.result()
+        # Preserve profile order in the user-visible event log even though the
+        # network work above runs concurrently.
+        for name, _prof, _pw in runnable:
+            did_sync, cluster_events, cluster_errors = completed[name]
+            synced += int(did_sync)
+            events.extend(cluster_events)
+            errors.extend(cluster_errors)
         # campaign 派生是独立能力；一站式吸附能启用续算/拉回不能顺带推进别的批次。
         if ap['campaigns']:
             try:

@@ -96,7 +96,10 @@
   }
 
   // 成员角色 → 中文标签(list_jobs 注入的 role 字段)
-  const ROLE_LABEL = { clean: '清洁表面', gas: '气相参考', config: '构型' };
+  const ROLE_LABEL = {
+    clean: '清洁表面', gas: '气相参考', config: '吸附构型',
+    molecule: '物种参考态',
+  };
 
   // 单行作业 HTML。grpKey 非空 → 属于某折叠组(data-grp);hidden → 组当前折叠
   function rowHtml(r, grpKey, hidden) {
@@ -145,8 +148,16 @@
     };
   }
 
+  function projectKindForGroup(group) {
+    const allRows = State.rows.filter(row => group.path
+      ? row.project_path === group.path
+      : (!row.project_path && row.project === group.label));
+    return allRows.length && allRows.every(row => row.role === 'molecule')
+      ? 'molecule_library' : 'adsorption';
+  }
+
   // 组头行:项目名 + done/total 进度 + 细进度条 + 聚合状态;全 DONE 给「算 ΔE」
-  function groupHeadHtml(key, label, rows, isProject) {
+  function groupHeadHtml(key, label, rows, isProject, projectPath, projectKind) {
     const st = groupStats(rows);
     const open = State.expanded.has(key);
     const pct = st.total ? Math.round(st.done / st.total * 100) : 0;
@@ -161,12 +172,14 @@
       `title="点击${open ? '折叠' : '展开'}组内 ${st.total} 个作业">` +
       `<td colspan="9"><span class="caret">${open ? '▾' : '▸'}</span>` +
       `<b class="grp-name">${VCS.esc(label)}</b>` +
-      (isProject ? '<span class="grp-tag">吸附能项目</span>' : '') +
+      (isProject ? `<span class="grp-tag">${projectKind === 'molecule_library'
+        ? '分子参考库' : '吸附能项目'}</span>` : '') +
       `<span class="grp-prog">${st.done}/${st.total} 完成</span>` +
       `<span class="grp-bar"><i style="width:${pct}%"></i></span>` +
       agg +
-      (isProject && allDone
+      (isProject && projectKind !== 'molecule_library' && allDone
         ? ` <button class="btn grp-de" data-proj="${VCS.esc(label)}" ` +
+          `data-proj-path="${VCS.esc(projectPath || '')}" ` +
           'title="切到吸附能项目页并选中该项目">算 ΔE</button>'
         : '') +
       `</td></tr>`;
@@ -196,8 +209,11 @@
     const single = [];
     rows0.forEach(r => {
       if (r.project) {
-        if (!groups.has(r.project)) groups.set(r.project, []);
-        groups.get(r.project).push(r);
+        const groupKey = r.project_path ? 'path:' + r.project_path : 'name:' + r.project;
+        if (!groups.has(groupKey)) {
+          groups.set(groupKey, { label: r.project, path: r.project_path || '', rows: [] });
+        }
+        groups.get(groupKey).rows.push(r);
       } else {
         single.push(r);
       }
@@ -211,16 +227,18 @@
       // 没有任何项目组 → 保持旧平铺观感,不加组头
       rows0.forEach(r => { h += rowHtml(r, null, false); });
     } else {
-      groups.forEach((rows, pname) => {
-        const key = 'p:' + pname;
+      groups.forEach((group, groupKey) => {
+        const rows = group.rows;
+        const key = 'p:' + groupKey;
         const open = State.expanded.has(key);
-        h += groupHeadHtml(key, pname, rows, true);
+        const projectKind = projectKindForGroup(group);
+        h += groupHeadHtml(key, group.label, rows, true, group.path, projectKind);
         rows.forEach(r => { h += rowHtml(r, key, !open); });
       });
       if (single.length) {
         const key = 's:_single';
         const open = State.expanded.has(key);
-        h += groupHeadHtml(key, '单独作业', single, false);
+        h += groupHeadHtml(key, '单独作业', single, false, '', '');
         single.forEach(r => { h += rowHtml(r, key, !open); });
       }
     }
@@ -263,10 +281,12 @@
   }
 
   // 「算 ΔE」:切到吸附能项目页并尽量选中该项目
-  function gotoProject(name) {
+  function gotoProject(name, path) {
     const a = document.querySelector('nav a[data-page=project]');
     if (a) a.click();
-    if (window.Project && typeof window.Project.selectByName === 'function') {
+    if (path && window.Project && typeof window.Project.selectByPath === 'function') {
+      window.Project.selectByPath(path);
+    } else if (window.Project && typeof window.Project.selectByName === 'function') {
       window.Project.selectByName(name);
     }
   }
@@ -275,11 +295,15 @@
   function doReport() {
     const dirs = selectedDirs();
     let projName = '';
+    let projPath = '';
     if (dirs.length) {
       const row = State.rows.find(r => r.dir === dirs[0]);
-      if (row && row.project) projName = row.project;
+      if (row && row.project) {
+        projName = row.project;
+        projPath = row.project_path || '';
+      }
     }
-    gotoProject(projName);
+    gotoProject(projName, projPath);
     VCS.toast('报告在项目页生成');
     VCS.log('报告在「吸附能项目」页生成' + (projName ? '(已为你选中项目「' + projName + '」)' : ''));
   }
@@ -314,7 +338,11 @@
       const gh = e.target.closest('tr.grp-head');
       if (gh) {
         const de = e.target.closest('.grp-de');
-        if (de) { e.stopPropagation(); gotoProject(de.dataset.proj); return; }
+        if (de) {
+          e.stopPropagation();
+          gotoProject(de.dataset.proj, de.dataset.projPath || '');
+          return;
+        }
         toggleGroup(gh.dataset.grp);
         return;
       }
@@ -1452,6 +1480,24 @@
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 
-  // 供集群页(Task 6)保存后调用,刷新下拉/台账
-  window.Jobs = { reload };
+  // 结果导入可能带来只有完整四件套、尚未运行的 CREATED 成员。
+  // 进入任务页时按 project_path 精确展开并勾选，用户仍需亲自确认服务器与远程目录。
+  async function selectCreatedProject(projectPath) {
+    await reload();
+    const wanted = String(projectPath || '');
+    const rows = State.rows.filter(row => row.state === 'CREATED' && !row.cluster &&
+      (!wanted || String(row.project_path || '') === wanted));
+    rows.forEach(row => State.selected.add(row.dir));
+    if (wanted) State.expanded.add('path:' + wanted);
+    ['jf-cluster', 'jf-status'].forEach(id => {
+      const filter = $('#' + id);
+      if (filter && filter.value) filter.value = '';
+    });
+    renderTable();
+    if (rows.length) VCS.toast(`已勾选 ${rows.length} 个待提交作业；请选择服务器后提交`);
+    return rows.length;
+  }
+
+  // 供集群页保存与项目导入流程调用。
+  window.Jobs = { reload, selectCreatedProject };
 })();

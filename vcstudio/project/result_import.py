@@ -14,6 +14,7 @@ tests can use the same scientific gate.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import re
@@ -24,9 +25,14 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from vcstudio.cluster import diagnose
+from vcstudio.generate import methods_text
+from vcstudio.generate.incar_builder import parse_incar
+from vcstudio.generate.poscar import parse_poscar_species
 
 
 _RESULT_NAMES = ('OUTCAR', 'OSZICAR', 'vasprun.xml', 'CONTCAR')
+_OUTPUT_EVIDENCE_NAMES = ('OUTCAR', 'OSZICAR', 'vasprun.xml')
+_INPUT_NAMES = ('INCAR', 'POSCAR', 'KPOINTS', 'POTCAR')
 _COPY_NAMES = (
     'INCAR', 'POSCAR', 'KPOINTS', 'POTCAR',
     'CONTCAR', 'OSZICAR', 'OUTCAR', 'vasprun.xml',
@@ -169,6 +175,215 @@ def _reasonable_energy(value) -> bool:
     return value is not None and not diagnose.energy_implausible(value)
 
 
+def _validate_kpoints(text: str) -> str | None:
+    """Validate automatic, explicit, and line-mode KPOINTS without guessing."""
+    lines = [line.strip() for line in str(text or '').splitlines()]
+    if len(lines) < 4:
+        return 'KPOINTS 行数不足'
+    try:
+        count = int(lines[1].split()[0])
+    except (IndexError, ValueError):
+        return 'KPOINTS 第 2 行不是合法点数'
+    def _values(line: str, expected: int, label: str) -> list[float] | str:
+        raw = line.split('!', 1)[0].split('#', 1)[0].split()
+        if len(raw) < expected:
+            return f'{label}须至少包含 {expected} 个数值'
+        try:
+            values = [float(value) for value in raw[:expected]]
+        except ValueError:
+            return f'{label}含非数值字段'
+        if any(not math.isfinite(value) for value in values):
+            return f'{label}须使用有限数值'
+        return values
+
+    mode = lines[2].lower()
+    if mode.startswith('l'):
+        if count <= 0 or len(lines) < 6:
+            return 'Line-mode KPOINTS 缺分段数、坐标系或端点'
+        coordinate_mode = lines[3].lower()
+        if not coordinate_mode.startswith(('r', 'k', 'c')):
+            return 'Line-mode KPOINTS 第 4 行须为 Reciprocal 或 Cartesian'
+        points = [line for line in lines[4:] if line]
+        if len(points) < 2:
+            return 'Line-mode KPOINTS 至少需要两个端点'
+        for index, line in enumerate(points, start=1):
+            parsed = _values(line, 3, f'Line-mode 第 {index} 个端点')
+            if isinstance(parsed, str):
+                return parsed
+    elif count == 0:
+        if not (mode.startswith('g') or mode.startswith('m')):
+            return '自动 KPOINTS 第 3 行须为 Gamma 或 Monkhorst-Pack'
+        try:
+            grid = [int(value) for value in lines[3].split()[:3]]
+        except ValueError:
+            return '自动 KPOINTS 网格不是整数'
+        if len(grid) != 3 or any(value <= 0 for value in grid):
+            return '自动 KPOINTS 网格须为 3 个正整数'
+        if len(lines) > 4 and lines[4]:
+            shift = _values(lines[4], 3, '自动 KPOINTS 位移')
+            if isinstance(shift, str):
+                return shift
+    elif count > 0:
+        if not mode.startswith(('r', 'k', 'c')):
+            return '显式 KPOINTS 第 3 行须为 Reciprocal 或 Cartesian'
+        points = [line for line in lines[3:] if line]
+        if len(points) < count:
+            return f'显式 KPOINTS 声明 {count} 个点但坐标行不足'
+        for index, line in enumerate(points[:count], start=1):
+            parsed = _values(line, 4, f'显式 KPOINTS 第 {index} 个点（含权重）')
+            if isinstance(parsed, str):
+                return parsed
+    elif count < 0:
+        return 'KPOINTS 点数不能为负数'
+    return None
+
+
+def _validate_poscar_coordinates(text: str, counts: list[int]) -> str | None:
+    lines = str(text or '').splitlines()
+    if len(lines) < 5:
+        return 'POSCAR 行数不足以解析晶格矢量'
+    try:
+        scale = float(lines[1].split()[0])
+        vectors = [[float(value) for value in lines[index].split()[:3]]
+                   for index in (2, 3, 4)]
+    except (ValueError, IndexError, TypeError) as exc:
+        return f'POSCAR 晶格解析失败：{exc}'
+    if not math.isfinite(scale) or scale == 0:
+        return 'POSCAR 缩放因子须为非零有限数值'
+    if any(len(vector) != 3 or any(not math.isfinite(value) for value in vector)
+           for vector in vectors):
+        return 'POSCAR 晶格矢量须为 3 个有限数值'
+    determinant = (
+        vectors[0][0] * (vectors[1][1] * vectors[2][2] - vectors[1][2] * vectors[2][1])
+        - vectors[0][1] * (vectors[1][0] * vectors[2][2] - vectors[1][2] * vectors[2][0])
+        + vectors[0][2] * (vectors[1][0] * vectors[2][1] - vectors[1][1] * vectors[2][0])
+    )
+    if abs(determinant) <= 1e-14:
+        return 'POSCAR 三个晶格矢量线性相关，晶胞体积为 0'
+    # A negative scalar is valid VASP syntax: abs(scale) is the requested cell
+    # volume.  Copy-mode validation only needs to prove the input is legal; it
+    # must not reject a quartet merely because older builders cannot rescale it.
+    index = 7
+    if len(lines) <= index:
+        return 'POSCAR 缺坐标模式与原子坐标'
+    if lines[index].strip().lower().startswith('s'):
+        index += 1
+    if len(lines) <= index or not lines[index].strip().lower().startswith(('d', 'c', 'k')):
+        return 'POSCAR 坐标模式须为 Direct 或 Cartesian'
+    index += 1
+    expected = sum(counts)
+    coordinates = lines[index:index + expected]
+    if len(coordinates) != expected:
+        return f'POSCAR 坐标数不足：应有 {expected} 行，实际 {len(coordinates)} 行'
+    for offset, line in enumerate(coordinates, start=1):
+        try:
+            values = [float(value) for value in line.split()[:3]]
+        except ValueError:
+            return f'POSCAR 第 {offset} 个原子坐标不是数值'
+        if len(values) != 3 or any(not math.isfinite(value) for value in values):
+            return f'POSCAR 第 {offset} 个原子坐标须为 3 个有限数值'
+    return None
+
+
+def validate_vasp_quartet(source: str | os.PathLike) -> list[str]:
+    """Side-effect-free scientific gate for a user-supplied VASP quartet."""
+    folder = Path(source).expanduser()
+    if not folder.is_dir():
+        return [f'四件套目录不存在或不可读：{folder}']
+    files = _files_by_canonical(folder)
+    required = ('INCAR', 'POSCAR', 'KPOINTS', 'POTCAR')
+    issues = [f'缺 {name}' for name in required if name not in files]
+    if issues:
+        return issues
+    texts = {}
+    for name in required:
+        try:
+            texts[name] = files[name].read_text(encoding='utf-8', errors='replace')
+        except OSError as exc:
+            issues.append(f'{name} 不可读：{exc}')
+            texts[name] = ''
+        if not texts[name].strip():
+            issues.append(f'{name} 为空或不可读')
+    if issues:
+        return list(dict.fromkeys(issues))
+
+    try:
+        incar = parse_incar(texts['INCAR'])
+        if not incar:
+            issues.append('INCAR 未解析到任何 KEY=VALUE 参数')
+    except (TypeError, ValueError) as exc:
+        issues.append(f'INCAR 解析失败：{exc}')
+
+    try:
+        species, counts = parse_poscar_species(texts['POSCAR'])
+    except (TypeError, ValueError, IndexError, NotImplementedError) as exc:
+        species, counts = [], []
+        issues.append(f'POSCAR 物种/计数解析失败：{exc}')
+    if not species or not counts or len(species) != len(counts):
+        issues.append('POSCAR 缺合法物种/计数行')
+    elif any(count <= 0 for count in counts):
+        issues.append('POSCAR 原子计数须为正整数')
+    else:
+        coordinate_issue = _validate_poscar_coordinates(texts['POSCAR'], counts)
+        if coordinate_issue:
+            issues.append(coordinate_issue)
+
+    kpoints_issue = _validate_kpoints(texts['KPOINTS'])
+    if kpoints_issue:
+        issues.append(kpoints_issue)
+
+    potcars = methods_text.parse_potcar_titels(texts['POTCAR'])
+    potcar_elements = [item.get('element') for item in potcars]
+    if len(potcars) != len(species):
+        issues.append(
+            f'POTCAR TITEL 段数 {len(potcars)} 与 POSCAR 物种数 {len(species)} 不一致')
+    elif potcar_elements != species:
+        issues.append(
+            'POTCAR 元素顺序与 POSCAR 不一致：'
+            f'{" ".join(str(item) for item in potcar_elements)} != {" ".join(species)}')
+    return list(dict.fromkeys(issues))
+
+
+def _input_method_signature(files: dict[str, Path]) -> dict:
+    """Build a comparable method signature from a validated input quartet."""
+    try:
+        incar_text = files['INCAR'].read_text(encoding='utf-8', errors='replace')
+        kpoints_text = files['KPOINTS'].read_text(encoding='utf-8', errors='replace')
+        potcar_text = files['POTCAR'].read_text(encoding='utf-8', errors='replace')
+    except (KeyError, OSError):
+        return {}
+    payload = methods_text.extract_facts(incar_text, kpoints_text, potcar_text)
+    facts = payload.get('facts') or {}
+    incar = parse_incar(incar_text)
+    potcars = list(facts.get('potcars') or [])
+    signature = {
+        'functional': facts.get('functional'),
+        'gga': facts.get('gga'),
+        'metagga': facts.get('metagga') or 'F',
+        'ivdw': facts.get('ivdw_setting'),
+        'ispin': facts.get('ispin') or 1,
+        'encut': facts.get('encut'),
+        'ldau': 'T' if facts.get('ldau') else 'F',
+        'lhfcalc': 'T' if facts.get('lhfcalc') else 'F',
+        'aexx': facts.get('aexx'),
+        'hfscreen': facts.get('hfscreen'),
+        'potcar_titel': [row.get('titel') for row in potcars if row.get('titel')],
+        'potcar_elements': [row.get('element') for row in potcars if row.get('element')],
+    }
+    for key, integer in (('LDAUTYPE', True), ('LDAUL', True),
+                         ('LDAUU', False), ('LDAUJ', False)):
+        if key not in incar:
+            continue
+        if key == 'LDAUTYPE':
+            parsed = _integer(incar[key])
+        else:
+            parsed = _numeric_vector(incar[key], integer=integer)
+        if parsed is not None:
+            signature[key.lower()] = parsed
+    return {key: value for key, value in signature.items()
+            if value not in (None, '', [])}
+
+
 def _now_iso() -> str:
     return time.strftime('%Y-%m-%dT%H:%M:%S')
 
@@ -234,7 +449,8 @@ def _parse_outcar(path: Path | None) -> dict:
         'ionic_converged_marker': False, 'electronic_converged_marker': False,
         'normal_footer': False, 'soft_stopped': False, 'fatal_error': None,
         'final_force_max_eV_A': None, 'energy_e0_eV': None,
-        'energy_source': None, 'parameters': {}, 'method_signature': {},
+        'energy_source': None, 'observed_energy_eV': None,
+        'observed_energy_source': None, 'parameters': {}, 'method_signature': {},
     }
     if not facts['present']:
         return facts
@@ -268,7 +484,11 @@ def _parse_outcar(path: Path | None) -> dict:
         toten = [_number(v) for v in _TOTEN_RE.findall(terminal)]
         energy = next((v for v in reversed(toten) if _reasonable_energy(v)), None)
         if energy is not None:
-            facts['energy_e0_eV'], facts['energy_source'] = energy, 'OUTCAR:TOTEN'
+            # TOTEN is the finite-temperature free energy, not the sigma->0 E0
+            # used by this project's adsorption-energy convention.  Keep it as
+            # visible evidence, but never relabel it as energy_e0_eV.
+            facts['observed_energy_eV'] = energy
+            facts['observed_energy_source'] = 'OUTCAR:TOTEN'
     for key, regex in _OUTCAR_PARAM_RE.items():
         m = regex.search(terminal) or regex.search(text)
         if m:
@@ -358,6 +578,7 @@ def _parse_vasprun(path: Path | None) -> dict:
         'present': bool(path and path.is_file()), 'checked': False, 'complete': False,
         'parse_error': None, 'calculations': 0, 'final_scf_steps': None,
         'energy_e0_eV': None, 'energy_source': None,
+        'observed_energy_eV': None, 'observed_energy_source': None,
         'raw_final_energies': {}, 'final_force_max_eV_A': None, 'parameters': {},
         'method_signature': {}, 'e0_anomaly': False,
     }
@@ -468,11 +689,14 @@ def _parse_vasprun(path: Path | None) -> dict:
             facts['energy_e0_eV'] = derived
             facts['energy_source'] = 'vasprun.xml:derived_sigma0'
         else:
+            # A lone e_wo_entrp or e_fr_energy is not E0.  Preserve the value
+            # for diagnostics, but force the adsorption-energy gate to wait for
+            # a real e_0_energy or the documented paired sigma->0 derivation.
             for name in ('e_wo_entrp', 'e_fr_energy'):
                 value = energies.get(name)
                 if _reasonable_energy(value):
-                    facts['energy_e0_eV'] = value
-                    facts['energy_source'] = f'vasprun.xml:{name}'
+                    facts['observed_energy_eV'] = value
+                    facts['observed_energy_source'] = f'vasprun.xml:{name}'
                     break
     return facts
 
@@ -610,8 +834,6 @@ def _state_preview(folder: Path, files: dict[str, Path], task_type_override=None
         energy, energy_source = out['energy_e0_eV'], out['energy_source']
     if energy is None and _reasonable_energy(xml['energy_e0_eV']):
         energy, energy_source = xml['energy_e0_eV'], xml['energy_source']
-    if energy is None and _reasonable_energy(out['energy_e0_eV']):
-        energy, energy_source = out['energy_e0_eV'], out['energy_source']
 
     comparable_energies = []
     if _reasonable_energy(osz['energy_e0_eV']):
@@ -656,6 +878,14 @@ def _state_preview(folder: Path, files: dict[str, Path], task_type_override=None
     if energy is None:
         blockers.append('未找到物理合理的最终总能量')
         suggestions.append('请提供含末个 E0 的 OSZICAR，或完整且能量可解析的 vasprun.xml')
+        observed = out.get('observed_energy_eV')
+        observed_source = out.get('observed_energy_source')
+        if observed is None:
+            observed = xml.get('observed_energy_eV')
+            observed_source = xml.get('observed_energy_source')
+        if observed is not None:
+            warnings.append(
+                f'检测到 {observed_source}={observed:.10g} eV，但它不是 E0，未用于吸附能')
     if not energy_consistent:
         detail = '；'.join(f'{source}={value:.10g} eV'
                           for source, value in comparable_energies)
@@ -734,7 +964,15 @@ def _state_preview(folder: Path, files: dict[str, Path], task_type_override=None
     method_signature = dict(xml.get('method_signature') or {})
     method_signature.update(out.get('method_signature') or {})
     evidence = {
-        'energy': {'value_eV': energy, 'source': energy_source, 'reasonable': _reasonable_energy(energy)},
+        'energy': {
+            'value_eV': energy, 'source': energy_source,
+            'reasonable': _reasonable_energy(energy),
+            'observed_non_e0_eV': (out.get('observed_energy_eV')
+                                   if out.get('observed_energy_eV') is not None
+                                   else xml.get('observed_energy_eV')),
+            'observed_non_e0_source': (out.get('observed_energy_source')
+                                       or xml.get('observed_energy_source')),
+        },
         'cross_file_energy': {
             'values_eV': {source: value for source, value in comparable_energies},
             'spread_eV': energy_spread, 'tolerance_eV': _ENERGY_CONSISTENCY_TOL_EV,
@@ -765,8 +1003,78 @@ def _state_preview(folder: Path, files: dict[str, Path], task_type_override=None
     }
 
 
+def _has_output_evidence(files: dict[str, Path]) -> bool:
+    return any(name in files for name in _OUTPUT_EVIDENCE_NAMES)
+
+
+def _created_preview(folder: Path, files: dict[str, Path], task_type_override=None) -> dict:
+    """Describe a validated input-only quartet without inventing result truth."""
+    parameters = _parse_incar(files.get('INCAR'))
+    inferred_task_type = _infer_task_type(parameters)
+    task_type = inferred_task_type
+    if task_type_override is not None:
+        requested = str(task_type_override).strip().lower()
+        if requested not in _IMPORT_TASK_TYPES:
+            raise ValueError(
+                f'任务类型 {requested!r} 不受结果导入支持；'
+                f'可选：{", ".join(sorted(_IMPORT_TASK_TYPES))}')
+        # Static, DOS and band inputs share a no-ionic-motion signature.  A
+        # relax/frequency INCAR is distinguishable and must never be relabelled
+        # to weaken the completion rule used after the calculation returns.
+        if inferred_task_type == 'relax' and requested != 'relax':
+            raise ValueError(
+                f'INCAR 明确表明任务为 relax，不能改为 {requested}')
+        if inferred_task_type == 'freq' and requested != 'freq':
+            raise ValueError('INCAR 明确表明任务为频率任务，不能改为其他类型')
+        task_type = requested
+
+    issues = validate_vasp_quartet(folder)
+    method_signature = _input_method_signature(files) if not issues else {}
+    ready = not issues
+    state = 'CREATED' if ready else 'NEEDS_HUMAN'
+    diagnosis = {
+        'code': 'input_ready' if ready else 'input_gate_failed',
+        'summary': ('四件套已通过检查，可直接提交'
+                    if ready else '四件套未通过输入检查'),
+        'blockers': list(issues),
+        'reasons': ['INCAR、POSCAR、KPOINTS 和 POTCAR 已齐全且可解析']
+        if ready else [],
+        'suggestions': [] if ready else ['按提示修复四件套后重新扫描'],
+    }
+    evidence = {
+        'energy': {
+            'value_eV': None, 'source': None, 'reasonable': False,
+            'observed_non_e0_eV': None, 'observed_non_e0_source': None,
+        },
+        'input_quartet': {
+            'complete': all(name in files for name in _INPUT_NAMES),
+            'valid': ready, 'issues': list(issues),
+        },
+        'method_signature': method_signature,
+    }
+    return {
+        'task_type': task_type, 'state_suggestion': state,
+        'energy_e0_eV': None, 'energy_source': None,
+        'diagnosis': diagnosis, 'warnings': [],
+        'convergence_evidence': evidence,
+        'reference_method_signature': method_signature,
+        'confirmation_eligible': False,
+        'recommended_action': 'submit_created' if ready else 'repair_inputs',
+    }
+
+
+def _preview(folder: Path, files: dict[str, Path], task_type_override=None) -> dict:
+    if _has_output_evidence(files):
+        return _state_preview(folder, files, task_type_override=task_type_override)
+    return _created_preview(folder, files, task_type_override=task_type_override)
+
+
 def _candidate(folder: Path, source_root: Path, files: dict[str, Path]) -> dict:
-    preview = _state_preview(folder, files)
+    has_output = _has_output_evidence(files)
+    input_issues = validate_vasp_quartet(folder)
+    input_complete = all(name in files for name in _INPUT_NAMES) and not input_issues
+    preview = _preview(folder, files)
+    fingerprint, source_hashes, snapshot_stable = _source_snapshot(folder, files)
     species = _species_from(folder, files)
     role = _suggested_role(folder, species)
     rel = '.' if folder == source_root else folder.relative_to(source_root).as_posix()
@@ -781,7 +1089,47 @@ def _candidate(folder: Path, source_root: Path, files: dict[str, Path]) -> dict:
         'confirmation_eligible': preview['confirmation_eligible'],
         'recommended_action': preview['recommended_action'],
         'suggested_role': role, 'role_options': list(_ROLE_OPTIONS), 'species': species,
+        'source_has_output': has_output, 'has_output': has_output,
+        'input_complete': input_complete, 'input_issues': input_issues,
+        'importable': (preview['state_suggestion'] in {'DONE', 'CREATED'}
+                       and snapshot_stable),
+        'source_fingerprint': fingerprint, 'source_sha256': source_hashes,
+        'source_snapshot_stable': snapshot_stable,
     }
+
+
+def _source_snapshot(folder: Path, files: dict[str, Path]) -> tuple[str, dict[str, str], bool]:
+    """Bind a reviewed scan to full content, including large result evidence."""
+    record = {'source': str(folder.resolve()), 'files': {}}
+    hashes: dict[str, str] = {}
+    stable = True
+    for name in sorted(files):
+        path = files[name]
+        try:
+            before = path.stat()
+            digest = _sha256(path)
+            after = path.stat()
+        except OSError:
+            record['files'][name] = {'missing': True}
+            stable = False
+            continue
+        unchanged = ((before.st_size, before.st_mtime_ns)
+                     == (after.st_size, after.st_mtime_ns))
+        stable = stable and unchanged
+        hashes[name] = digest
+        item = {
+            'size': after.st_size, 'mtime_ns': after.st_mtime_ns,
+            'sha256': digest, 'stable_during_scan': unchanged,
+        }
+        record['files'][name] = item
+    encoded = json.dumps(
+        record, sort_keys=True, ensure_ascii=False,
+        separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest(), hashes, stable
+
+
+def _source_fingerprint(folder: Path, files: dict[str, Path]) -> str:
+    return _source_snapshot(folder, files)[0]
 
 
 def scan_folder(source_root) -> dict:
@@ -803,14 +1151,16 @@ def scan_folder(source_root) -> dict:
                 safe_dirs.append(dirname)
         dirnames[:] = safe_dirs
         files = _files_by_canonical(base)
-        if any(name in files for name in _RESULT_NAMES):
+        if (any(name in files for name in _RESULT_NAMES)
+                or all(name in files for name in _INPUT_NAMES)):
             candidates.append(_candidate(base, root, files))
     candidates.sort(key=lambda c: c['relative_path'].casefold())
     counts = {state: sum(c['state_suggestion'] == state for c in candidates)
-              for state in ('DONE', 'NEEDS_HUMAN')}
+              for state in ('CREATED', 'DONE', 'NEEDS_HUMAN')}
     return {
         'ok': True, 'source_root': str(root), 'candidates': candidates,
-        'summary': {'total': len(candidates), 'done': counts['DONE'],
+        'summary': {'total': len(candidates), 'created': counts['CREATED'],
+                    'done': counts['DONE'],
                     'needs_human': counts['NEEDS_HUMAN'],
                     'confirmation_eligible': sum(c['confirmation_eligible'] for c in candidates),
                     'skipped_symlink_dirs': skipped_symlink_dirs},
@@ -927,7 +1277,7 @@ def commit_import(source_root, out_root, project_name, selections, *,
     imported = []
     final_members = {'clean_slab': None, 'gas_ref': None, 'configs': []}
     molecule_jobs: dict[str, str] = {}
-    molecule_energies: dict[str, float] = {}
+    molecule_energies: dict[str, float | None] = {}
     config_species: dict[str, str] = {}
     standalone: list[str] = []
     seen_sources: set[str] = set()
@@ -944,6 +1294,16 @@ def commit_import(source_root, out_root, project_name, selections, *,
             candidate = by_path.get(path)
             if candidate is None:
                 raise ValueError(f'选择不在本次扫描候选中：{raw_path}')
+            expected_fingerprint = str(item.get('source_fingerprint') or '').strip()
+            if (expected_fingerprint
+                    and expected_fingerprint != candidate.get('source_fingerprint')):
+                raise ValueError(
+                    f'{candidate["name"]} 在扫描确认后发生变化；为避免混用不同轮结果，'
+                    '请重新检查文件夹后再导入')
+            if not candidate.get('source_snapshot_stable', False):
+                raise ValueError(
+                    f'{candidate["name"]} 在扫描期间仍在变化；'
+                    '请等文件写入完成后重新扫描')
             if path in seen_sources:
                 raise ValueError(f'同一结果目录不能重复导入为多个角色：{raw_path}')
             seen_sources.add(path)
@@ -968,39 +1328,11 @@ def commit_import(source_root, out_root, project_name, selections, *,
                 # a DONE decision made under the original inferred task type.
                 candidate = {
                     **candidate,
-                    **_state_preview(
+                    **_preview(
                         Path(path), _files_by_canonical(Path(path)),
                         task_type_override=task_type),
                 }
-            if role == 'molecule_ref' and candidate['state_suggestion'] != 'DONE':
-                raise ValueError(
-                    f'{candidate["name"]} 尚未被自动判定为 DONE，不能写入分子参考库；'
-                    '请先补齐收敛证据，或改选 standalone 保留待核数据')
-
-            manual = bool(item.get('manual_confirm')) and candidate['state_suggestion'] != 'DONE'
-            if manual and not candidate['confirmation_eligible']:
-                raise ValueError(
-                    f'{candidate["name"]} 含不可绕过的质量问题，不能人工确认为 DONE：'
-                    + '；'.join(candidate['diagnosis']['blockers']))
-            confirmation_reason = str(item.get('confirmation_reason') or '').strip()
-            if manual and not confirmation_reason:
-                raise ValueError(f'{candidate["name"]} 人工确认时必须填写核对理由')
-            state = 'DONE' if (candidate['state_suggestion'] == 'DONE' or manual) else 'NEEDS_HUMAN'
             species = str(item.get('species') or candidate.get('species') or '').strip() or None
-            if role == 'molecule_ref':
-                actual = _structure_composition(_files_by_canonical(Path(path)))
-                declared = _formula_composition(species or '')
-                if actual is None:
-                    raise ValueError(
-                        f'{candidate["name"]} 缺少可解析的 CONTCAR/POSCAR 元素计数，'
-                        '不能安全作为分子参考')
-                if declared is None or declared != actual:
-                    actual_formula = ''.join(
-                        element + (str(count) if count != 1 else '')
-                        for element, count in actual.items())
-                    raise ValueError(
-                        f'参考物种 {species or "(空)"} 与结构组成 {actual_formula} '
-                        '不一致；文件夹名或人工标签不能覆盖真实原子计数')
             if role == 'clean_slab':
                 rel_dst = Path('clean_slab')
             elif role == 'gas_ref':
@@ -1017,32 +1349,107 @@ def commit_import(source_root, out_root, project_name, selections, *,
 
             stage_dst = stage / rel_dst
             copied, hashes = _copy_candidate(Path(path), stage_dst)
+            expected_hashes = candidate.get('source_sha256') or {}
+            staged_hashes = {name: _sha256(stage_dst / name) for name in copied}
+            if (set(copied) != set(expected_hashes)
+                    or hashes != staged_hashes
+                    or any(staged_hashes.get(name) != expected_hashes.get(name)
+                           for name in copied)):
+                raise ValueError(
+                    f'{candidate["name"]} 在导入期间源文件内容发生变化；'
+                    '为避免混用不同轮计算，请重新扫描后再导入')
+
+            # The staged copy is the delivered truth.  Re-run all scientific
+            # gates there so a scan→copy race cannot leave a manifest describing
+            # evidence that was not actually imported.
+            staged_files = _files_by_canonical(stage_dst)
+            candidate = {
+                **candidate,
+                **_preview(stage_dst, staged_files, task_type_override=task_type),
+            }
+            input_issues = validate_vasp_quartet(stage_dst)
+            input_complete = (all(name in staged_files for name in _INPUT_NAMES)
+                              and not input_issues)
+            candidate.update({
+                'source_has_output': _has_output_evidence(staged_files),
+                'has_output': _has_output_evidence(staged_files),
+                'input_complete': input_complete,
+                'input_issues': input_issues,
+            })
+
+            if (role == 'molecule_ref'
+                    and candidate['state_suggestion'] not in {'DONE', 'CREATED'}):
+                raise ValueError(
+                    f'{candidate["name"]} 尚未被自动判定为 DONE，不能写入分子参考库；'
+                    '请先补齐收敛证据，或改选 standalone 保留待核数据')
+
+            manual = (bool(item.get('manual_confirm'))
+                      and candidate['state_suggestion'] != 'DONE')
+            if manual and not candidate['confirmation_eligible']:
+                raise ValueError(
+                    f'{candidate["name"]} 含不可绕过的质量问题，不能人工确认为 DONE：'
+                    + '；'.join(candidate['diagnosis']['blockers']))
+            confirmation_reason = str(item.get('confirmation_reason') or '').strip()
+            if manual and not confirmation_reason:
+                raise ValueError(f'{candidate["name"]} 人工确认时必须填写核对理由')
+            if candidate['state_suggestion'] == 'CREATED':
+                state = 'CREATED'
+            elif candidate['state_suggestion'] == 'DONE' or manual:
+                state = 'DONE'
+            else:
+                state = 'NEEDS_HUMAN'
+
+            if role == 'molecule_ref':
+                actual = _structure_composition(staged_files)
+                declared = _formula_composition(species or '')
+                if actual is None:
+                    raise ValueError(
+                        f'{candidate["name"]} 缺少可解析的 CONTCAR/POSCAR 元素计数，'
+                        '不能安全作为分子参考')
+                if declared is None or declared != actual:
+                    actual_formula = ''.join(
+                        element + (str(count) if count != 1 else '')
+                        for element, count in actual.items())
+                    raise ValueError(
+                        f'参考物种 {species or "(空)"} 与结构组成 {actual_formula} '
+                        '不一致；文件夹名或人工标签不能覆盖真实原子计数')
+
             final_dst = final_root / rel_dst
             m = manifest_mod.new_manifest(
                 job_id=f'import-{project_stem}-{_safe_stem(candidate["name"])}-{int(time.time())}',
                 system=candidate['name'], task_type=task_type,
                 calc_type='molecule' if role in {'gas_ref', 'molecule_ref'} else 'slab',
                 inputs={'imported_from': path, 'imported_files': copied,
-                        'source_sha256': hashes, 'import_role': role, 'species': species},
+                        'source_sha256': staged_hashes,
+                        'source_fingerprint': candidate.get('source_fingerprint'),
+                        'import_role': role, 'species': species,
+                        'input_complete': input_complete,
+                        'input_issues': input_issues},
                 warnings=candidate['warnings'],
             )
-            note = ('本地结果多证据自动判定收敛' if not manual
-                    else '用户人工确认：自动证据不足，但已通过不可绕过的质量门槛')
-            manifest_mod.set_state(m, state, note=note)
+            if state != 'CREATED':
+                if manual:
+                    note = '用户人工确认：自动证据不足，但已通过不可绕过的质量门槛'
+                elif state == 'DONE':
+                    note = '本地结果多证据自动判定收敛'
+                else:
+                    note = '本地结果证据不足，保留为待人工处理'
+                manifest_mod.set_state(m, state, note=note)
             m['inputs']['reference_method_signature'] = (
                 candidate.get('reference_method_signature') or {})
-            m.setdefault('results', {}).update({
-                'energy_e0_eV': candidate['energy_e0_eV'],
-                'energy_source': candidate['energy_source'],
-                'diagnosis': candidate['diagnosis'],
-                'convergence_evidence': candidate['convergence_evidence'],
-                'reference_method_signature': candidate.get('reference_method_signature') or {},
-                'import_confirmation': {
-                    'manual': manual, 'eligible': candidate['confirmation_eligible'],
-                    'confirmed_at': _now_iso() if manual else None,
-                    'reason': confirmation_reason or None,
-                },
-            })
+            if state != 'CREATED':
+                m.setdefault('results', {}).update({
+                    'energy_e0_eV': candidate['energy_e0_eV'],
+                    'energy_source': candidate['energy_source'],
+                    'diagnosis': candidate['diagnosis'],
+                    'convergence_evidence': candidate['convergence_evidence'],
+                    'reference_method_signature': candidate.get('reference_method_signature') or {},
+                    'import_confirmation': {
+                        'manual': manual, 'eligible': candidate['confirmation_eligible'],
+                        'confirmed_at': _now_iso() if manual else None,
+                        'reason': confirmation_reason or None,
+                    },
+                })
             manifest_mod.save_manifest(stage_dst, m)
 
             final_str = str(final_dst)
@@ -1060,6 +1467,8 @@ def commit_import(source_root, out_root, project_name, selections, *,
                 molecule_jobs[species] = final_str
                 if state == 'DONE':
                     molecule_energies[species] = float(candidate['energy_e0_eV'])
+                else:
+                    molecule_energies[species] = None
             else:
                 standalone.append(final_str)
             imported.append({'source': path, 'path': final_str, 'role': role,
@@ -1095,7 +1504,8 @@ def commit_import(source_root, out_root, project_name, selections, *,
                 'project_name': project['name'], 'project': project,
                 'warnings': project_warnings, 'imported': imported, 'summary': {
                     'total': len(imported), 'done': sum(r['state'] == 'DONE' for r in imported),
-                    'needs_human': sum(r['state'] != 'DONE' for r in imported),
+                    'created': sum(r['state'] == 'CREATED' for r in imported),
+                    'needs_human': sum(r['state'] == 'NEEDS_HUMAN' for r in imported),
                     'manual_confirmed': sum(r['manual_confirmed'] for r in imported),
                 }}
     except Exception as exc:
@@ -1131,4 +1541,4 @@ def commit_import(source_root, out_root, project_name, selections, *,
         raise
 
 
-__all__ = ['scan_folder', 'commit_import']
+__all__ = ['scan_folder', 'commit_import', 'validate_vasp_quartet']

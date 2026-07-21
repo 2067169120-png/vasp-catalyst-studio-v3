@@ -49,6 +49,15 @@ def _make_species_ref_job(job_dir, *, energy=-38.072771, state='DONE',
     return job_dir
 
 
+def _set_actual_method(job_dir, functional):
+    item = manifest.load_manifest(job_dir)
+    item.setdefault('results', {})['reference_method_signature'] = {
+        'functional': functional, 'ivdw': 0, 'encut': 400.0, 'ispin': 1,
+        'ldau': 'F', 'potcar_titel': ['PAW_PBE C'], 'potcar_elements': ['C'],
+    }
+    manifest.save_manifest(job_dir, item)
+
+
 def test_create_project_generates_members_and_registers(env):
     res = adsorption.create_project(
         env['tmp'] / 'proj', 'liS', clean_poscar=env['poscar']('slab.vasp'),
@@ -139,6 +148,29 @@ def test_delta_e_gating_and_value(env):
     _finish(proj['members']['gas_ref'], -21.0)
     s = adsorption.delta_e_rows(proj)
     assert s['rows'][0]['delta_e'] == pytest.approx(-435.5 - (-400.0) - (-21.0))
+
+
+def test_delta_e_blocks_known_pbe_rpbe_method_mismatch(env):
+    result = adsorption.create_project(
+        env['tmp'] / 'method-mismatch', 'mix',
+        clean_poscar=env['poscar']('method-slab.vasp'),
+        config_poscars=[env['poscar']('method-config.vasp')],
+        incar_path=env['incar'], lib_root=env['lib'])
+    project = adsorption.load_project(result['project_path'])
+    clean = project['members']['clean_slab']
+    config = project['members']['configs'][0]
+    _finish(clean, -100.0)
+    _finish(config, -110.0)
+    _set_actual_method(clean, 'PBE')
+    _set_actual_method(config, 'RPBE')
+
+    summary = adsorption.delta_e_rows(project)
+    row = summary['rows'][0]
+
+    assert row['delta_e'] is None
+    assert row['method_check']['status'] == 'incompatible'
+    assert '方法不一致' in row['note'] and '泛函' in row['note']
+    assert summary['method_consistency']['status'] == 'incompatible'
 
 
 def test_delta_e_without_ref_notes_formula(env):
@@ -460,6 +492,23 @@ def test_species_reference_cache_drift_blocks_and_exposes_manifest_truth(env):
     assert '缓存与 job.yaml 不一致' in row['note'] and '容差 1e-06 eV' in row['note']
     assert summary['species_refs'] == {'Li2S8': None}
     assert summary['species_ref_cache'] == {'Li2S8': -38.0}
+
+
+def test_created_species_reference_becomes_usable_after_job_finishes(env):
+    project = _prepared_species_reference_project(env, cached=None)
+
+    summary = adsorption.delta_e_rows(project)
+    row = summary['rows'][0]
+
+    assert row['reference_state'] == 'DONE'
+    assert row['reference_valid'] is True
+    assert row['e_ref'] == pytest.approx(-38.072771)
+    assert row['delta_e'] == pytest.approx(-139.5 - (-100.0) - (-38.072771))
+    evidence = summary['species_reference_evidence'][0]
+    assert evidence['cache_refresh_needed'] is True
+    assert '采用 DONE job.yaml 真值' in evidence['note']
+    assert summary['species_refs'] == {'Li2S8': -38.072771}
+    assert summary['species_ref_cache'] == {'Li2S8': None}
 
 
 def test_legacy_species_reference_without_job_mapping_fails_closed(env):

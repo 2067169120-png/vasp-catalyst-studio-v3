@@ -81,7 +81,10 @@ def test_import_completion_can_start_lis_with_preselected_references():
     js = _source('project.js')
     assert '用这些参考能开始吸附计算' in js
     assert 'startLiS(' in js
-    assert 'window.Project = { reload: reloadProjects, selectByName, openImport, startLiS }' in js
+    assert 'window.Project = {' in js
+    for member in ('reload: reloadProjects', 'selectByPath', 'selectByName',
+                   'openImport', 'startLiS'):
+        assert member in js
     assert "sel.value = hit.path; onReferenceChanged()" in js
 
 
@@ -89,7 +92,7 @@ def test_reference_only_import_is_not_mislabelled_as_missing_delta_e():
     js = _source('project.js')
     assert 'const referenceOnly = gate.molecules > 0 && !isAdsorption' in js
     assert 'Li-S 参考能库已建立，可以开始新的吸附计算' in js
-    assert "primaryLabel: referenceOnly ? '用这些参考能开始吸附计算'" in js
+    assert "? '用这些参考能开始吸附计算'" in js
     assert "referenceOnly ? 'Li-S 参考能库已就绪。'" in js
 
 
@@ -216,6 +219,19 @@ def test_user_facing_copy_calls_it_managed_workflow_not_autopilot():
     assert '自动驾驶' not in visible
     assert '自动托管' in visible
     assert '监控、续算、下载和报告' in visible
+
+
+def test_delta_view_blocks_method_mismatch_and_guides_unverified_results():
+    js = _source('project.js')
+    css = _source('app.css')
+    assert 'r.method_consistency || {}' in js
+    assert "methodStatus === 'incompatible'" in js
+    assert '方法不一致：ΔE 已阻断' in js
+    assert "methodStatus === 'unverified'" in js
+    assert '方法一致性尚未完全核验' in js
+    assert '统一所有相减项的泛函、ENCUT、色散和 POTCAR 后重算' in js
+    assert '.pj-method-gate.incompatible' in css
+    assert '.pj-method-gate.unverified' in css
 
 
 def test_folder_scan_prefers_valid_final_contcar_and_explains_override():

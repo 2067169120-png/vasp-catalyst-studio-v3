@@ -37,8 +37,11 @@ def test_result_import_calls_scan_then_commit_with_full_review_payload():
     assert 'confirmationEligible' in js
     assert 'row.manualConfirm && row.confirmationEligible' in js
     assert 'const deltaResult = await delta()' in js
-    assert "primaryLabel: referenceOnly ? '用这些参考能开始吸附计算'" in js
-    assert "window.Project = { reload: reloadProjects, selectByName, openImport, startLiS }" in js
+    assert "? '用这些参考能开始吸附计算'" in js
+    assert 'window.Project = {' in js
+    for member in ('reload: reloadProjects', 'selectByPath', 'selectByName',
+                   'openImport', 'startLiS'):
+        assert member in js
 
 
 def test_molecule_reference_only_import_is_not_misreported_as_report_ready():
@@ -100,3 +103,23 @@ def test_dashboard_routes_inputs_and_results_to_distinct_guided_flows():
     assert "const first = $('qs-add-dir')" in js
     assert "openImport('inputs')" not in js
     assert "openImport('results')" not in js
+
+
+def test_input_only_quartets_are_visible_and_continue_to_real_submission():
+    project = _source('project.js')
+    jobs = _source('jobs.js')
+    html = _source('index.html')
+    app = _source('app.js')
+    assert "=== 'CREATED'" in project
+    assert '四件套完整，待提交' in project
+    assert 'input_complete !== false' in project
+    assert "!== 'DONE' && !isCreatedInput(row)" in project
+    assert "status === 'ready' && !isCreatedInput(row)" in project
+    assert '分子参考仅接收 DONE 结果或已验证的完整四件套待提交' in project
+    assert 'id="pj-import-filter"' in html and 'value="created"' in html
+    assert 'createdCount' in project
+    assert 'openImportedCreatedJobs' in project
+    assert 'window.Jobs.selectCreatedProject' in project
+    assert 'async function selectCreatedProject(projectPath)' in jobs
+    assert "row.state === 'CREATED'" in jobs
+    assert "CREATED: ['q', '待提交']" in app

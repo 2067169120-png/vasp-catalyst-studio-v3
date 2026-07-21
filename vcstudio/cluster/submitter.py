@@ -7,6 +7,7 @@ client/sftp 由调用方注入(GUI 经 connection.open_client;测试注入假件
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import posixpath
 import re
@@ -443,22 +444,49 @@ def _potcar_gate(job_dir: str, m: dict) -> list:
     return []
 
 
-def _spec_for(profile, job_dir: str) -> JobScriptSpec:
+def _remote_dir_for(profile, job_dir: str, manifest: dict | None = None) -> str:
+    """Build a stable, collision-resistant remote directory for one profile.
+
+    Reusing only the local basename lets two projects called ``clean_slab``
+    overwrite each other across separate submissions.  The readable prefix is
+    therefore followed by a deterministic digest.  An already persisted path
+    for the same profile is a compatibility boundary and is never migrated.
+    """
+    item = manifest if manifest is not None else manifest_mod.load_manifest(job_dir)
+    existing = str((item or {}).get('remote_dir') or '').strip()
+    existing_cluster = str((item or {}).get('cluster') or '').strip()
+    if existing and existing_cluster == str(profile.name):
+        return existing
+
     dir_name = os.path.basename(os.path.normpath(job_dir))
-    manifest = manifest_mod.load_manifest(job_dir) or {}
-    engine = _job_engine(manifest)
-    names, _input_errs = _declared_input_files(job_dir, manifest)
-    inputs = manifest.get('inputs') or {}
+    inputs = (item or {}).get('inputs') or {}
     if not isinstance(inputs, dict):
         inputs = {}
     namespace = str(inputs.get('remote_namespace') or '')
     if namespace and not _REMOTE_NAMESPACE_RE.fullmatch(namespace):
         raise ValueError('远程命名空间非法，拒绝生成远程路径')
-    remote_dir = (posixpath.join(profile.remote_root, namespace, dir_name)
-                  if namespace else posixpath.join(profile.remote_root, dir_name))
+    canonical = os.path.normcase(os.path.realpath(os.path.abspath(job_dir)))
+    identity = '\0'.join((
+        'vcstudio-remote-v1', str(profile.name),
+        str((item or {}).get('job_id') or ''),
+        str((item or {}).get('created_at') or ''), canonical,
+    ))
+    suffix = hashlib.sha256(
+        identity.encode('utf-8', errors='surrogatepass')).hexdigest()[:16]
+    readable = script_builder.sanitize_job_name(dir_name, max_len=48)
+    root = (posixpath.join(profile.remote_root, namespace)
+            if namespace else profile.remote_root)
+    return posixpath.join(root, f'{readable}--{suffix}')
+
+
+def _spec_for(profile, job_dir: str, manifest: dict | None = None) -> JobScriptSpec:
+    dir_name = os.path.basename(os.path.normpath(job_dir))
+    manifest = manifest if manifest is not None else (manifest_mod.load_manifest(job_dir) or {})
+    engine = _job_engine(manifest)
+    names, _input_errs = _declared_input_files(job_dir, manifest)
     return JobScriptSpec(
         job_name=script_builder.sanitize_job_name(dir_name),
-        remote_dir=remote_dir,
+        remote_dir=_remote_dir_for(profile, job_dir, manifest),
         queue=getattr(profile, 'queue', ''),
         nodes=int(getattr(profile, 'nodes', 1) or 1),
         ppn=int(getattr(profile, 'ppn', 0) or 0),
@@ -482,7 +510,7 @@ def build_script_text(profile, job_dir: str) -> str:
     engine = _job_engine(manifest)
     if engine not in _SUPPORTED_ENGINES:
         raise ValueError(f'不支持的计算引擎:{engine!r}')
-    spec = _spec_for(profile, job_dir)
+    spec = _spec_for(profile, job_dir, manifest)
     dialect = get_dialect(profile.scheduler)
     template_text = None
     mode = getattr(profile, 'script_mode', 'auto')
@@ -516,7 +544,7 @@ def submit_job(client, sftp, profile, job_dir: str) -> dict:
     if errs:
         raise ValueError('；'.join(errs))
     m = manifest_mod.load_manifest(job_dir)
-    spec = _spec_for(profile, job_dir)
+    spec = _spec_for(profile, job_dir, m)
     dialect = get_dialect(profile.scheduler)
     script_text = build_script_text(profile, job_dir)
 
@@ -628,9 +656,6 @@ def adopt_external_job(local_dir: str, profile, job_id: str, remote_dir: str,
     if not str(remote_dir).startswith('/'):
         raise ValueError('远程目录需为绝对路径(以 / 开头)')
     existing = manifest_mod.load_manifest(local_dir)
-    if existing and existing.get('scheduler_job_id'):
-        raise ValueError(f'该本地目录已关联作业号 {existing["scheduler_job_id"]},'
-                         f'请换一个目录或先移出台账')
     requested_task = (str(task_type).strip() if task_type is not None else '')
     requested_task = (manifest_mod.normalize_task_type(requested_task)
                       if requested_task else None)
@@ -649,6 +674,23 @@ def adopt_external_job(local_dir: str, profile, job_id: str, remote_dir: str,
     else:
         # 旧 API 调用没有 task_type 时仅对「全新目录」兼容为 relax。
         effective_task = requested_task or 'relax'
+    if existing and existing.get('scheduler_job_id'):
+        existing_job_id = str(existing.get('scheduler_job_id') or '')
+        exact_binding = (
+            existing_job_id == str(job_id)
+            and str(existing.get('cluster') or '') == str(profile.name)
+            and posixpath.normpath(str(existing.get('remote_dir') or ''))
+            == posixpath.normpath(str(remote_dir)))
+        if exact_binding:
+            # 认领响应可能在前端收到前中断；同一 job/profile/remote 的重试只修复
+            # 台账登记，不重复追加 attempts，也不改状态。
+            from vcstudio.cluster import ledger
+            ledger.register(local_dir)
+            return existing
+        raise ValueError(
+            f'该本地目录已关联服务器「{existing.get("cluster") or "?"}」的作业号 '
+            f'{existing_job_id}，与本次「{profile.name}」/{job_id} 不同；'
+            '请换一个目录或先移出台账')
     # 所有参数/任务类型验证通过后才创建目录，失败调用不留空文件夹。
     os.makedirs(local_dir, exist_ok=True)
     dir_name = os.path.basename(os.path.normpath(local_dir))

@@ -5,6 +5,7 @@ import copy
 import pytest
 
 from vcstudio.project import freeenergy as fe
+from vcstudio.project import energy_gate
 from vcstudio.project import reactions as R
 from vcstudio.shared import manifest as manifest_mod
 
@@ -107,6 +108,83 @@ def test_molecule_scan_does_not_treat_corrupt_managed_manifest_as_legacy(tmp_pat
     (d / 'job.yaml').write_text('state: [DONE\n', encoding='utf-8')
 
     assert fe.load_molecule_energies(tmp_path) == {}
+
+
+def _write_method_job(path, *, elements=('S',), functional='PBE',
+                      input_functional='PBE', energy=-10.0):
+    path.mkdir(parents=True)
+    gga = 'RP' if input_functional == 'RPBE' else 'PE'
+    (path / 'INCAR').write_text(
+        f'GGA={gga}\nENCUT=500\nIVDW=11\nISPIN=2\nLDAU=F\n', encoding='utf-8')
+    counts = ' '.join('1' for _ in elements)
+    coords = '\n'.join(f'0 0 {index / 10:.1f}' for index, _ in enumerate(elements))
+    (path / 'POSCAR').write_text(
+        'method test\n1\n8 0 0\n0 8 0\n0 0 12\n'
+        + ' '.join(elements) + '\n' + counts + '\nDirect\n' + coords + '\n',
+        encoding='utf-8')
+    (path / 'KPOINTS').write_text(
+        'Automatic\n0\nGamma\n1 1 1\n0 0 0\n', encoding='utf-8')
+    titels = [f'PAW_PBE {element}' for element in elements]
+    (path / 'POTCAR').write_text(
+        ''.join(f'TITEL = {titel}\n' for titel in titels), encoding='utf-8')
+    (path / 'OSZICAR').write_text(f'1 F= {energy} E0= {energy}\n', encoding='utf-8')
+    item = manifest_mod.new_manifest(
+        job_id=path.name, system=path.name, task_type='relax',
+        calc_type='molecule', inputs={})
+    manifest_mod.set_state(item, 'DONE')
+    signature = {
+        'functional': functional, 'ivdw': 11, 'encut': 500.0, 'ispin': 2,
+        'ldau': 'F', 'potcar_titel': titels, 'potcar_elements': list(elements),
+    }
+    item['results'] = {'energy_e0_eV': energy,
+                       'reference_method_signature': signature}
+    manifest_mod.save_manifest(path, item)
+    return path
+
+
+def test_method_record_prefers_actual_output_signature_over_edited_incar(tmp_path):
+    job = _write_method_job(
+        tmp_path / 'edited-after-run', functional='RPBE', input_functional='PBE')
+    record = energy_gate.method_record(
+        job, manifest_mod.load_manifest(job), 'edited')
+
+    assert record['fingerprint']['functional'] == 'RPBE'
+    assert record['known']['functional'] is True
+
+
+def test_managed_lis_method_audit_blocks_pbe_rpbe_mix(tmp_path):
+    clean = _write_method_job(tmp_path / 'ads' / 'clean', elements=('S',), functional='PBE')
+    config = _write_method_job(tmp_path / 'ads' / 'config', elements=('S',), functional='PBE')
+    molecules = tmp_path / 'molecules'
+    refs = [
+        _write_method_job(molecules / 'mol_S8', elements=('S',), functional='RPBE'),
+        _write_method_job(molecules / 'mol_Li2S', elements=('Li', 'S'), functional='RPBE'),
+        _write_method_job(molecules / 'mol_Li2S2', elements=('Li', 'S'), functional='RPBE'),
+    ]
+    project = {'members': {'clean_slab': str(clean), 'configs': [str(config)]}}
+
+    audit = fe.audit_molecule_method_compatibility(
+        project, molecules, managed_dirs=[str(path) for path in refs])
+
+    assert audit['ok'] is False and audit['status'] == 'incompatible'
+    assert any('跨项目泛函不一致' in issue for issue in audit['errors'])
+
+
+def test_explicit_managed_molecule_missing_manifest_fails_closed(tmp_path):
+    molecule = tmp_path / 'molecules' / 'mol_S8'
+    molecule.mkdir(parents=True)
+    (molecule / 'OSZICAR').write_text('1 F= -32 E0= -32\n', encoding='utf-8')
+    clean = _write_method_job(tmp_path / 'ads' / 'clean')
+    config = _write_method_job(tmp_path / 'ads' / 'config')
+    project = {'members': {'clean_slab': str(clean), 'configs': [str(config)]}}
+
+    audit = fe.audit_molecule_method_compatibility(
+        project, molecule.parent, managed_dirs=[str(molecule)])
+
+    assert audit['ok'] is False
+    assert any('job.yaml' in issue for issue in audit['errors'])
+    assert fe.load_molecule_energies(
+        molecule.parent, managed_dirs=[str(molecule)]) == {}
 
 
 def test_species_matching_no_prefix_collision():

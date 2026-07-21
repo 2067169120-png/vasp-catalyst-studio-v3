@@ -145,7 +145,13 @@ def _scan_vasp_item(path: str, shared_incar: str | None) -> dict:
                if os.path.isfile(os.path.join(path, name))]
     missing = [name for name in _VASP_INPUTS if name not in present]
     if not missing:
-        status, mode, message = 'ready', 'copy', '四件套完整，可直接建作业'
+        from vcstudio.project.result_import import validate_vasp_quartet
+        issues = validate_vasp_quartet(path)
+        if issues:
+            status, mode = 'invalid', 'blocked'
+            message = '四件套未通过输入检查：' + '；'.join(issues)
+        else:
+            status, mode, message = 'ready', 'copy', '四件套完整且已通过检查，可直接建作业'
     elif structure and shared_incar:
         status, mode = 'generatable', 'generate'
         src = os.path.basename(structure)
@@ -545,6 +551,11 @@ def build_quick_jobs(files: list, out_root: str, *, job_prefix: str = '',
             else:
                 structure = ''
                 copied = _copy_inputs(source, stage)
+                if engine == 'vasp':
+                    from vcstudio.project.result_import import validate_vasp_quartet
+                    issues = validate_vasp_quartet(stage)
+                    if issues:
+                        raise ValueError('四件套复核失败：' + '；'.join(issues))
             _write_quick_manifest(
                 stage, name=name, source=source, engine=engine, copied=copied,
                 mode=mode, build_result=build_result, structure=structure,

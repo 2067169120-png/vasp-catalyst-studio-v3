@@ -66,6 +66,45 @@ def test_extract_facts_no_gga_falls_back_to_flavor():
     assert r['facts']['functional'] == 'PBE'  # PAW_PBE 味缺 GGA → PBE
 
 
+def test_extract_facts_hse06_is_not_mislabelled_as_pbe():
+    incar = (
+        'GGA = PE\nENCUT = 500\nLHFCALC = .TRUE.\n'
+        'AEXX = 0.25\nHFSCREEN = 0.2\nLASPH = .TRUE.\n'
+    )
+    result = mt.extract_facts(incar, _KPOINTS_GAMMA, _POTCAR_HEAD)
+    facts = result['facts']
+    assert facts['functional'] == 'HSE06'
+    assert facts['functional_class'] == 'screened hybrid'
+    assert facts['base_functional'] == 'PBE'
+    assert facts['lhfcalc'] is True
+    assert facts['aexx'] == 0.25 and facts['hfscreen'] == 0.2
+    assert 'HSE06' in mt.render_zh(facts)
+    assert 'HSE06' in mt.render_en(facts)
+    assert 'Heyd2003' in mt.render_bibtex(facts)
+
+
+def test_extract_facts_r2scan_is_not_mislabelled_as_pbe():
+    incar = 'METAGGA = R2SCAN\nLASPH = .TRUE.\nENCUT = 500\n'
+    result = mt.extract_facts(incar, _KPOINTS_GAMMA, _POTCAR_HEAD)
+    facts = result['facts']
+    assert facts['functional'] == 'r2SCAN'
+    assert facts['functional_class'] == 'meta-GGA'
+    assert facts['metagga'] == 'R2SCAN'
+    assert facts['functional_known'] is True
+    assert 'meta-GGA r2SCAN' in mt.render_zh(facts)
+    assert 'meta-GGA r2SCAN' in mt.render_en(facts)
+    assert 'Furness2020' in mt.render_bibtex(facts)
+
+
+def test_malformed_hybrid_settings_are_not_reported_as_verified_pbe():
+    result = mt.extract_facts(
+        'GGA = PE\nLHFCALC = .TRUE.\nAEXX = not-a-number\nHFSCREEN = 0.2\n',
+        _KPOINTS_GAMMA, _POTCAR_HEAD)
+    assert result['facts']['functional_known'] is False
+    assert result['facts']['lhfcalc'] is True
+    assert any('AEXX' in warning for warning in result['warnings'])
+
+
 def test_extract_facts_missing_pieces_degrade():
     r = mt.extract_facts('ENCUT = 400\n', None, None)
     assert r['facts']['kpoints'] is None

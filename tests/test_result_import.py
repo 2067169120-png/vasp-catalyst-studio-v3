@@ -1,6 +1,7 @@
 """Local VASP-result import: multi-evidence convergence and read-only commit."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -112,6 +113,18 @@ def _make_result(folder: Path, *, marker=True, footer=True, electronic=True,
     return folder
 
 
+def _make_quartet(folder: Path, *, incar='ENCUT=500\nNSW=0\nIBRION=-1\n',
+                  poscar=_CONTCAR,
+                  kpoints='Automatic\n0\nGamma\n1 1 1\n0 0 0\n'):
+    folder.mkdir(parents=True)
+    (folder / 'INCAR').write_text(incar, encoding='utf-8')
+    (folder / 'POSCAR').write_text(poscar, encoding='utf-8')
+    (folder / 'KPOINTS').write_text(kpoints, encoding='utf-8')
+    (folder / 'POTCAR').write_text(
+        'TITEL = PAW_PBE Li\nTITEL = PAW_PBE S\n', encoding='utf-8')
+    return folder
+
+
 def _candidate(root: Path):
     result = ri.scan_folder(root)
     assert result['summary']['total'] == 1
@@ -184,6 +197,53 @@ def test_outcar_energy_is_fallback_when_oszicar_missing(tmp_path):
     assert c['state_suggestion'] == 'DONE'
     assert c['energy_source'] == 'OUTCAR:energy(sigma->0)'
     assert c['energy_e0_eV'] == pytest.approx(-38.07277089)
+
+
+def test_outcar_toten_only_is_visible_but_never_relabelled_as_e0(tmp_path):
+    d = tmp_path / 'toten_only'
+    d.mkdir()
+    (d / 'CONTCAR').write_text(_CONTCAR, encoding='utf-8')
+    sigma_line = (
+        'energy without entropy = -38.07277089 '
+        'energy(sigma->0) = -38.07277089')
+    (d / 'OUTCAR').write_text(
+        _outcar().replace(sigma_line, 'free energy TOTEN = -38.07277089 eV'),
+        encoding='utf-8')
+
+    c = _candidate(tmp_path)
+
+    assert c['state_suggestion'] == 'NEEDS_HUMAN'
+    assert c['energy_e0_eV'] is None and c['energy_source'] is None
+    energy = c['convergence_evidence']['energy']
+    assert energy['observed_non_e0_eV'] == pytest.approx(-38.07277089)
+    assert energy['observed_non_e0_source'] == 'OUTCAR:TOTEN'
+    assert any('不是 E0' in warning for warning in c['warnings'])
+
+
+@pytest.mark.parametrize(
+    ('removed', 'observed_source'),
+    [
+        ('e_fr_energy', 'vasprun.xml:e_wo_entrp'),
+        ('e_wo_entrp', 'vasprun.xml:e_fr_energy'),
+    ],
+)
+def test_lone_vasprun_free_energy_field_never_becomes_e0(
+        tmp_path, removed, observed_source):
+    d = tmp_path / f'lone_{removed}'
+    d.mkdir()
+    (d / 'CONTCAR').write_text(_CONTCAR, encoding='utf-8')
+    xml = _vasprun(e0=-0.0, ewo=-12.345)
+    xml = xml.replace('<i name="e_0_energy">-0.0</i>', '')
+    xml = xml.replace(f'<i name="{removed}">-12.345</i>', '')
+    (d / 'vasprun.xml').write_text(xml, encoding='utf-8')
+
+    c = _candidate(tmp_path)
+
+    assert c['state_suggestion'] == 'NEEDS_HUMAN'
+    assert c['energy_e0_eV'] is None and not c['confirmation_eligible']
+    energy = c['convergence_evidence']['energy']
+    assert energy['observed_non_e0_source'] == observed_source
+    assert energy['observed_non_e0_eV'] == pytest.approx(-12.345)
 
 
 def test_truncated_vasprun_is_not_normal_completion(tmp_path):
@@ -483,6 +543,145 @@ def test_commit_molecule_library_copies_full_provenance_without_clean(tmp_path):
     assert jobs == [str(imported)]
     loaded = yaml.safe_load(Path(result['project_path']).read_text(encoding='utf-8'))
     assert loaded['molecules_dir'] == str(imported.parent)
+
+
+def test_validate_vasp_quartet_reports_bad_poscar_kpoints_and_potcar_order(tmp_path):
+    quartet = tmp_path / 'quartet'
+    quartet.mkdir()
+    (quartet / 'INCAR').write_text('ENCUT=500\nNSW=0\n', encoding='utf-8')
+    (quartet / 'POSCAR').write_text(_CONTCAR, encoding='utf-8')
+    (quartet / 'KPOINTS').write_text('Automatic\n0\nGamma\n0 1 1\n', encoding='utf-8')
+    (quartet / 'POTCAR').write_text(
+        'TITEL = PAW_PBE S\nTITEL = PAW_PBE Li\n', encoding='utf-8')
+
+    issues = ri.validate_vasp_quartet(quartet)
+
+    assert any('正整数' in issue for issue in issues)
+    assert any('元素顺序' in issue for issue in issues)
+    (quartet / 'POSCAR').write_text('not a POSCAR\n', encoding='utf-8')
+    issues = ri.validate_vasp_quartet(quartet)
+    assert any('POSCAR' in issue and ('解析失败' in issue or '缺合法' in issue)
+               for issue in issues)
+
+
+@pytest.mark.parametrize(
+    ('kpoints', 'message'),
+    [
+        ('Band path\n20\nLine-mode\nReciprocal\n0 0 nan\n0.5 0 0\n', '有限数值'),
+        ('Explicit\n2\nReciprocal\n0 0 0 1\n0.5 nope 0 1\n', '非数值'),
+    ],
+)
+def test_validate_vasp_quartet_rejects_nonfinite_or_garbage_explicit_kpoints(
+        tmp_path, kpoints, message):
+    quartet = _make_quartet(tmp_path / 'quartet', kpoints=kpoints)
+
+    issues = ri.validate_vasp_quartet(quartet)
+
+    assert any(message in issue for issue in issues)
+
+
+def test_validate_vasp_quartet_accepts_legal_negative_poscar_scale(tmp_path):
+    negative_scale = _CONTCAR.replace('\n1.0\n', '\n-1200.0\n', 1)
+    quartet = _make_quartet(tmp_path / 'negative-scale', poscar=negative_scale)
+
+    assert ri.validate_vasp_quartet(quartet) == []
+
+
+def test_input_only_quartet_imports_as_created_without_fake_result_energy(tmp_path):
+    source = tmp_path / 'source'
+    folder = _make_quartet(
+        source / 'mol_Li2S8',
+        incar='ENCUT=500\nNSW=200\nIBRION=2\nGGA=PE\n')
+    candidate = _candidate(source)
+    assert candidate['state_suggestion'] == 'CREATED'
+    assert candidate['input_complete'] and not candidate['source_has_output']
+    assert candidate['importable'] and candidate['energy_e0_eV'] is None
+    assert ri.scan_folder(source)['summary']['created'] == 1
+
+    ads, ledger, jobs, _projects = _fake_services()
+    result = ri.commit_import(
+        source, tmp_path / 'managed', 'created-quartet',
+        [{'path': candidate['path'], 'role': 'molecule_ref', 'species': 'Li2S8',
+          'source_fingerprint': candidate['source_fingerprint']}],
+        adsorption_mod=ads, ledger_mod=ledger, manifest_mod=manifest)
+
+    imported = Path(result['project']['species_ref_jobs']['Li2S8'])
+    saved = manifest.load_manifest(imported)
+    assert saved['state'] == 'CREATED' and saved['results'] == {}
+    assert saved['task_type'] == 'relax'
+    assert len(saved['state_history']) == 1
+    assert saved['inputs']['input_complete'] is True
+    assert set(saved['inputs']['source_sha256']) == {'INCAR', 'POSCAR', 'KPOINTS', 'POTCAR'}
+    assert result['project']['species_refs']['Li2S8'] is None
+    assert result['summary']['created'] == 1 and result['summary']['needs_human'] == 0
+    assert jobs == [str(imported)] and folder.is_dir()
+
+
+def test_commit_rejects_source_changed_after_reviewed_scan(tmp_path):
+    source = tmp_path / 'source'
+    folder = _make_result(source / 'mol_Li2S8')
+    candidate = _candidate(source)
+    ads, ledger, *_ = _fake_services()
+    with open(folder / 'OSZICAR', 'a', encoding='utf-8') as handle:
+        handle.write('DAV: 1 -1.0 -1.0 0 1 1e-1\n')
+
+    with pytest.raises(ValueError, match='扫描确认后发生变化'):
+        ri.commit_import(
+            source, tmp_path / 'managed', 'changed-source',
+            [{'path': candidate['path'], 'role': 'molecule_ref', 'species': 'Li2S8',
+              'source_fingerprint': candidate['source_fingerprint']}],
+            adsorption_mod=ads, ledger_mod=ledger, manifest_mod=manifest)
+    assert not (tmp_path / 'managed' / 'changed-source').exists()
+
+
+def test_fingerprint_detects_same_size_same_mtime_outcar_change(tmp_path):
+    source = tmp_path / 'source'
+    folder = _make_result(source / 'mol_Li2S8')
+    candidate = _candidate(source)
+    outcar = folder / 'OUTCAR'
+    stat = outcar.stat()
+    original = outcar.read_text(encoding='utf-8')
+    changed = original.replace('244.647', '244.648')
+    assert len(changed) == len(original) and changed != original
+    outcar.write_text(changed, encoding='utf-8')
+    os.utime(outcar, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+    rescanned = _candidate(source)
+    assert rescanned['source_fingerprint'] != candidate['source_fingerprint']
+    ads, ledger, *_ = _fake_services()
+    with pytest.raises(ValueError, match='扫描确认后发生变化'):
+        ri.commit_import(
+            source, tmp_path / 'managed', 'same-metadata-change',
+            [{'path': candidate['path'], 'role': 'molecule_ref', 'species': 'Li2S8',
+              'source_fingerprint': candidate['source_fingerprint']}],
+            adsorption_mod=ads, ledger_mod=ledger, manifest_mod=manifest)
+
+
+def test_commit_rejects_scan_to_copy_content_race(tmp_path, monkeypatch):
+    source = tmp_path / 'source'
+    _make_result(source / 'mol_Li2S8')
+    candidate = _candidate(source)
+    original_copy = ri._copy_candidate
+
+    def mutate_then_copy(src, dst):
+        outcar = src / 'OUTCAR'
+        stat = outcar.stat()
+        original = outcar.read_text(encoding='utf-8')
+        changed = original.replace('244.647', '244.648')
+        assert len(changed) == len(original) and changed != original
+        outcar.write_text(changed, encoding='utf-8')
+        os.utime(outcar, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        return original_copy(src, dst)
+
+    monkeypatch.setattr(ri, '_copy_candidate', mutate_then_copy)
+    ads, ledger, *_ = _fake_services()
+    with pytest.raises(ValueError, match='导入期间源文件内容发生变化'):
+        ri.commit_import(
+            source, tmp_path / 'managed', 'copy-race',
+            [{'path': candidate['path'], 'role': 'molecule_ref', 'species': 'Li2S8',
+              'source_fingerprint': candidate['source_fingerprint']}],
+            adsorption_mod=ads, ledger_mod=ledger, manifest_mod=manifest)
+    assert not (tmp_path / 'managed' / 'copy-race').exists()
 
 
 def test_unconfirmed_molecule_cannot_enter_reference_library(tmp_path):

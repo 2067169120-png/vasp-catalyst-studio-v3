@@ -660,9 +660,14 @@ def _species_reference_info(species: str, cached_energy, job_dir) -> dict:
     if manifest_energy is None:
         blockers.append(
             f'物种 {species} 的参考 job.yaml 能量缺失或不合理，请重新解析/导入结果')
-    if cached is None:
-        blockers.append(
-            f'物种 {species} 的 project.yaml 参考能缓存缺失或不合理，请重新准备项目')
+    # A molecule may be imported as CREATED and finish later.  In that valid
+    # lifecycle the project cache is intentionally empty; the DONE job.yaml is
+    # the truth source and must become usable without re-importing the project.
+    if cached is None and state == 'DONE' and manifest_energy is not None:
+        info['cache_refresh_needed'] = True
+        info['note'] = 'project.yaml 参考能缓存尚未刷新；本次采用 DONE job.yaml 真值'
+    else:
+        info['cache_refresh_needed'] = False
     if manifest_energy is not None and cached is not None:
         drift = abs(manifest_energy - cached)
         if drift > SPECIES_REF_CACHE_TOLERANCE_EV:
@@ -671,7 +676,8 @@ def _species_reference_info(species: str, cached_energy, job_dir) -> dict:
                 f'（差 {drift:.9g} eV，容差 {SPECIES_REF_CACHE_TOLERANCE_EV:g} eV）；'
                 '请刷新参考项目后重新准备')
     info['valid'] = not blockers
-    info['note'] = '；'.join(blockers)
+    if blockers:
+        info['note'] = '；'.join(blockers)
     return info
 
 
@@ -683,6 +689,59 @@ def _species_reference_index(project: dict) -> dict[str, dict]:
         species: _species_reference_info(species, cached.get(species), jobs.get(species))
         for species in sorted(set(cached) | set(jobs))
     }
+
+
+def _energy_pair_method_check(left_dir, left_label, right_dir, right_label,
+                              *, require_same_kpoints):
+    """Compare one subtraction pair using actual-output method signatures."""
+    from vcstudio.project import energy_gate
+
+    if not left_dir or not right_dir:
+        return {'status': 'unverified', 'issues': [],
+                'warnings': ['方法核验缺少作业路径'], 'labels': []}
+    left_manifest = manifest_mod.load_manifest(left_dir)
+    right_manifest = manifest_mod.load_manifest(right_dir)
+    records = [
+        energy_gate.method_record(left_dir, left_manifest, left_label),
+        energy_gate.method_record(right_dir, right_manifest, right_label),
+    ]
+    check = energy_gate.compare_methods(
+        records, require_same_kpoints=require_same_kpoints)
+    if not require_same_kpoints and check.get('issues'):
+        # A gas molecule may legitimately use a different spin setting, and a
+        # catalyst-only Hubbard U vector naturally differs from the molecule.
+        # Keep both visible for audit, but only shared method invariants/POTCAR
+        # identities are hard cross-cell blockers.
+        soft_prefixes = ('ISPIN 不一致', 'DFT+U 不一致')
+        soft = [issue for issue in check['issues'] if issue.startswith(soft_prefixes)]
+        if soft:
+            check['issues'] = [issue for issue in check['issues'] if issue not in soft]
+            check['warnings'] = list(dict.fromkeys([
+                *(check.get('warnings') or []),
+                *(issue + '；气相/周期体系差异需人工核对' for issue in soft),
+            ]))
+            check['status'] = ('incompatible' if check['issues']
+                               else ('verified' if not check['warnings'] else 'unverified'))
+    return check
+
+
+def _row_method_check(slab_dir, config_dir, reference_dir=None) -> dict:
+    """Audit every direct energy subtraction used by one adsorption row."""
+    checks = [_energy_pair_method_check(
+        slab_dir, '清洁表面', config_dir, '吸附构型', require_same_kpoints=True)]
+    if reference_dir:
+        # Gas/molecular references live in a different cell; their k-point
+        # schemes may differ, but functional/ENCUT/POTCAR conflicts still block.
+        checks.append(_energy_pair_method_check(
+            config_dir, '吸附构型', reference_dir, '参考态',
+            require_same_kpoints=False))
+    issues = list(dict.fromkeys(
+        issue for check in checks for issue in (check.get('issues') or [])))
+    warnings = list(dict.fromkeys(
+        warning for check in checks for warning in (check.get('warnings') or [])))
+    status = 'incompatible' if issues else ('verified' if not warnings else 'unverified')
+    return {'status': status, 'issues': issues, 'warnings': warnings,
+            'checks': checks}
 
 
 def delta_e_rows(project: dict) -> dict:
@@ -762,6 +821,9 @@ def delta_e_rows(project: dict) -> dict:
                     (((gas_manifest or {}).get('results') or {}).get('energy_source') or '')
                 ) or None
                 reference_valid = ref_state == 'DONE' and e_ref is not None
+        method_check = _row_method_check(
+            members.get('clean_slab'), cdir,
+            reference_job if reference_mode != 'none' else None)
         blockers = []
         if st != 'DONE':
             blockers.append('构型未完成')
@@ -782,6 +844,8 @@ def delta_e_rows(project: dict) -> dict:
                 blockers.append('气相参考未完成')
             elif e_ref is None:
                 blockers.append('气相参考能量缺失或不合理')
+        if method_check['status'] == 'incompatible':
+            blockers.append('能量项方法不一致：' + '；'.join(method_check['issues']))
         if not blockers:
             if sp_ref is not None:
                 delta = e_cfg - e_slab - sp_ref
@@ -799,7 +863,9 @@ def delta_e_rows(project: dict) -> dict:
                      'reference_job': reference_job,
                      'reference_source': reference_source,
                      'reference_valid': reference_valid,
-                     'reference_note': reference_note})
+                     'reference_note': reference_note,
+                     'method_check': method_check,
+                     'method_warnings': method_check['warnings']})
 
     # 多构型取最稳:按 species 分组求组内最低 ΔE,标注 is_most_stable 与相对 ΔΔE
     group_min: dict = {}
@@ -819,10 +885,20 @@ def delta_e_rows(project: dict) -> dict:
         species: (info['energy'] if info['valid'] else None)
         for species, info in reference_index.items()
     }
+    method_checks = [row['method_check'] for row in rows]
+    method_issues = list(dict.fromkeys(
+        issue for check in method_checks for issue in (check.get('issues') or [])))
+    method_warnings = list(dict.fromkeys(
+        warning for check in method_checks for warning in (check.get('warnings') or [])))
+    method_status = ('incompatible' if method_issues
+                     else ('verified' if not method_warnings else 'unverified'))
     return {'slab': (slab_state, e_slab), 'ref': (ref_state, e_ref),
             'has_ref': has_ref, 'reference_mode': reference_mode,
             'species_refs': resolved_refs, 'species_ref_cache': species_refs,
-            'species_reference_evidence': list(reference_index.values()), 'rows': rows}
+            'species_reference_evidence': list(reference_index.values()),
+            'method_consistency': {'status': method_status, 'issues': method_issues,
+                                   'warnings': method_warnings},
+            'rows': rows}
 
 
 def export_csv(project: dict, summary: dict, out_path: str | os.PathLike) -> Path:

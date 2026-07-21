@@ -208,7 +208,7 @@ def _generate_with_molecule_source(monkeypatch, tmp_path, project_dir, config_di
         p['molecules_dir'] = str(project_dir)
     called = {}
 
-    def fake_path(rows, e_slab, molecules_dir, *, g_corr=None, mu_li=None):
+    def fake_path(rows, e_slab, molecules_dir, *, g_corr=None, mu_li=None, **_context):
         called['molecules_dir'] = molecules_dir
         return None
 

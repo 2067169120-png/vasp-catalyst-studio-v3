@@ -14,6 +14,8 @@ GJF_WITH_CHK = ('%chk=water_opt.chk\n#P PBE def2-SVP sp\n\n'
 GJF_TITLE_ONLY = ('#P PBE def2-SVP opt\n\nWater Optimization\n\n0 1\nO 0.0 0.0 0.0\n\n')
 POSCAR_FE = ('Fe slab\n1.0\n8 0 0\n0 8 0\n0 0 15\nFe\n1\nDirect\n0 0 0\n')
 POSCAR_O = ('O box\n1.0\n12 0 0\n0 12 0\n0 0 12\nO\n1\nDirect\n0 0 0\n')
+KPOINTS_GAMMA = 'Automatic\n0\nGamma\n1 1 1\n0 0 0\n'
+POTCAR_FE = 'TITEL = PAW_PBE Fe\n'
 
 
 def _write(path, text=''):
@@ -152,9 +154,9 @@ def test_build_skips_missing_file(tmp_path):
 def test_build_vasp_directory_copies_input_set(tmp_path):
     d = tmp_path / 'vaspjob'
     _write(str(d / 'INCAR'), 'ENCUT=400\nNSW=0\n')
-    _write(str(d / 'POSCAR'), 'Fe slab\n')
-    _write(str(d / 'KPOINTS'), 'auto\n')
-    _write(str(d / 'POTCAR'), 'TITEL = PAW_PBE Fe\n')
+    _write(str(d / 'POSCAR'), POSCAR_FE)
+    _write(str(d / 'KPOINTS'), KPOINTS_GAMMA)
+    _write(str(d / 'POTCAR'), POTCAR_FE)
     out = quick_submit.build_quick_jobs([str(d)], str(tmp_path / 'out'))
     job = out['jobs'][0]
     assert job['engine'] == 'vasp' and job['name'] == 'vaspjob'
@@ -180,6 +182,61 @@ def test_build_vasp_directory_skips_when_quartet_is_incomplete(tmp_path):
     assert not (tmp_path / 'out' / 'vaspjob').exists()
 
 
+def test_build_vasp_directory_blocks_invalid_complete_quartet(tmp_path):
+    d = tmp_path / 'bad-quartet'
+    _write(str(d / 'INCAR'), 'ENCUT=400\nNSW=0\n')
+    _write(str(d / 'POSCAR'), POSCAR_FE)
+    _write(str(d / 'KPOINTS'), 'Automatic\n0\nGamma\n0 1 1\n')
+    _write(str(d / 'POTCAR'), POTCAR_FE)
+
+    scanned = quick_submit.scan_inputs([str(d)])
+    built = quick_submit.build_quick_jobs([str(d)], str(tmp_path / 'out'))
+
+    assert scanned['items'][0]['status'] == 'invalid'
+    assert scanned['items'][0]['can_build'] is False
+    assert '正整数' in scanned['items'][0]['message']
+    assert built['ok'] is False and built['jobs'] == []
+    assert not (tmp_path / 'out' / 'bad-quartet').exists()
+
+
+@pytest.mark.parametrize(
+    'kpoints',
+    [
+        'Band path\n20\nLine-mode\nReciprocal\n0 0 nan\n0.5 0 0\n',
+        'Explicit\n2\nReciprocal\n0 0 0 1\n0.5 garbage 0 1\n',
+    ],
+)
+def test_scan_vasp_directory_blocks_bad_line_or_explicit_kpoints(tmp_path, kpoints):
+    d = tmp_path / 'bad-kpoints'
+    _write(str(d / 'INCAR'), 'ENCUT=400\nNSW=0\n')
+    _write(str(d / 'POSCAR'), POSCAR_FE)
+    _write(str(d / 'KPOINTS'), kpoints)
+    _write(str(d / 'POTCAR'), POTCAR_FE)
+
+    scanned = quick_submit.scan_inputs([str(d)])
+
+    assert scanned['items'][0]['status'] == 'invalid'
+    assert scanned['items'][0]['can_build'] is False
+    assert ('有限数值' in scanned['items'][0]['message']
+            or '非数值' in scanned['items'][0]['message'])
+
+
+def test_build_vasp_directory_accepts_negative_poscar_volume_scale(tmp_path):
+    d = tmp_path / 'negative-scale'
+    negative = POSCAR_FE.replace('\n1.0\n', '\n-960.0\n', 1)
+    _write(str(d / 'INCAR'), 'ENCUT=400\nNSW=0\n')
+    _write(str(d / 'POSCAR'), negative)
+    _write(str(d / 'KPOINTS'), KPOINTS_GAMMA)
+    _write(str(d / 'POTCAR'), POTCAR_FE)
+
+    scanned = quick_submit.scan_inputs([str(d)])
+    built = quick_submit.build_quick_jobs([str(d)], str(tmp_path / 'out'))
+
+    assert scanned['items'][0]['status'] == 'ready'
+    assert built['ok'] is True and len(built['jobs']) == 1
+    assert Path(built['jobs'][0]['dir'], 'POSCAR').read_text(encoding='utf-8') == negative
+
+
 @pytest.mark.parametrize(
     ('incar_text', 'expected'),
     [
@@ -191,9 +248,9 @@ def test_build_vasp_directory_skips_when_quartet_is_incomplete(tmp_path):
 def test_build_vasp_directory_infers_task_type_from_incar(tmp_path, incar_text, expected):
     d = tmp_path / expected
     _write(str(d / 'INCAR'), incar_text)
-    _write(str(d / 'POSCAR'), 'Fe slab\n')
-    _write(str(d / 'KPOINTS'), 'auto\n')
-    _write(str(d / 'POTCAR'), 'TITEL = PAW_PBE Fe\n')
+    _write(str(d / 'POSCAR'), POSCAR_FE)
+    _write(str(d / 'KPOINTS'), KPOINTS_GAMMA)
+    _write(str(d / 'POTCAR'), POTCAR_FE)
 
     out = quick_submit.build_quick_jobs([str(d)], str(tmp_path / 'out'))
 

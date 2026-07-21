@@ -159,7 +159,7 @@ const VCS = {
     const M = {
       RUNNING: ['run', 'RUN'], QUEUED: ['q', 'QUEUE'], SUBMITTED: ['q', 'SUBMIT'],
       UPLOADED: ['q', 'UPLOAD'], DONE: ['ok', 'DONE'], FAILED: ['fail', 'FAIL'],
-      UNCONVERGED: ['fail', '未收敛'], NEEDS_HUMAN: ['warn', '需人工'], CREATED: ['q', '草稿'],
+      UNCONVERGED: ['fail', '未收敛'], NEEDS_HUMAN: ['warn', '需人工'], CREATED: ['q', '待提交'],
     };
     const [cls, txt] = M[state] || ['q', state];
     return `<span class="pill ${cls}"><i></i>${VCS.esc(txt)}</span>`;
@@ -560,6 +560,33 @@ VCS.loadLang = async function (lang) {
 // ── 工作模式:按 data-scene 点分路径显隐 nav 项与卡片(镜像 scenarios.is_visible 口径) ──
 VCS.scenario = null;
 VCS.activeCalculation = '';
+
+// “本次计算类型”不仅裁剪卡片，也必须给出一个真实可到达的首要入口。
+// 大多数 VASP 任务从生成页派生；三个结果型流程直接去项目页，自旋扫描去结构页。
+// 这份前端路由不替代后端 task_keys 白名单，只负责把已获准的类型送到正确页面。
+const CALCULATION_ROUTES = {
+  adsorption_project: { page: 'project', focusSelector: '#ads-journey', analysis: 'adsorption' },
+  spin_scan: { page: 'structure', focusSelector: '#spin-card' },
+  formation_binding: { page: 'project', focusSelector: '#fb-card', analysis: 'taskana' },
+  surface_energy: { page: 'project', focusSelector: '#ta-se-slab', analysis: 'taskana' },
+};
+
+VCS.calculationRoute = function (key, scenario) {
+  const task = String(key || VCS.activeCalculation || '');
+  const sc = scenario || VCS.scenario;
+  if (!task) return null;
+  // 场景白名单仍是访问闸；不能靠前端路由打开不适用的计算。
+  if (sc && Array.isArray(sc.task_keys) && sc.task_keys.indexOf(task) < 0) return null;
+  if (CALCULATION_ROUTES[task]) return Object.assign({}, CALCULATION_ROUTES[task]);
+  if (sc && sc.key === 'molecular') {
+    return { page: 'generate', focusSelector: '#gauss-panel' };
+  }
+  return {
+    page: 'generate',
+    focusSelector: task === 'neb' ? '#neb-card' : '#taskcat-card',
+  };
+};
+
 function sceneVisible(sc, path) {
   if (!sc || !path) return true;
   const parts = path.split('.'); const head = parts[0]; const rest = parts.slice(1);
@@ -579,23 +606,41 @@ function sceneVisible(sc, path) {
   return true;                             // 未知路径族保守可见(fail-open)
 }
 VCS.sceneVisible = sceneVisible;
+
+function applySceneElements(sc) {
+  if (!sc) return;
+  document.querySelectorAll('[data-scene]').forEach(el => {
+    el.toggleAttribute('data-scene-hidden', !sceneVisible(sc, el.getAttribute('data-scene')));
+  });
+  // 某些专用模式（例如 Li-S）默认精简掉“生成输入”。当用户在设置里明确
+  // 改选 NEB / DOS / 收敛扫描等类型时，只放行该类型真正需要的目标页。
+  const route = VCS.calculationRoute(VCS.activeCalculation, sc);
+  if (route) {
+    const link = document.querySelector(`nav a[data-page="${route.page}"]`);
+    if (link) link.removeAttribute('data-scene-hidden');
+  }
+}
+
+function keepCurrentPageReachable(sc, source) {
+  const cur = document.querySelector('nav a.on');
+  if (!cur || !cur.hasAttribute('data-scene-hidden')) return;
+  const route = VCS.calculationRoute(VCS.activeCalculation, sc);
+  const landing = (route && route.page) ||
+    (sc.defaults && sc.defaults.landing_page) || 'dashboard';
+  if (!activatePage(landing, null, { source })) {
+    activatePage('dashboard', null, { source: source + '-fallback' });
+  }
+}
+
 VCS.applyScenario = function (sc) {
   if (sc) VCS.scenario = sc;
   const s = VCS.scenario;
   if (!s) return;
-  document.querySelectorAll('[data-scene]').forEach(el => {
-    el.toggleAttribute('data-scene-hidden', !sceneVisible(s, el.getAttribute('data-scene')));
-  });
+  applySceneElements(s);
   const chip = document.getElementById('mode-chip');
   if (chip) chip.textContent = '工作模式：' + (s.name || s.key || '未选择');
-  // 当前页被模式隐藏 → 去该模式的默认入口；再失败才退回概览。
-  const cur = document.querySelector('nav a.on');
-  if (cur && cur.hasAttribute('data-scene-hidden')) {
-    const landing = (s.defaults && s.defaults.landing_page) || 'dashboard';
-    if (!activatePage(landing, null, { source: 'work-mode' })) {
-      activatePage('dashboard', null, { source: 'work-mode-fallback' });
-    }
-  }
+  // 当前页被模式隐藏 → 优先去所选计算的真实入口；再按模式默认页回退。
+  keepCurrentPageReachable(s, 'work-mode');
   document.dispatchEvent(new CustomEvent('vcs:scenario', { detail: { scenario: s } }));
 };
 
@@ -606,9 +651,50 @@ VCS.applyCalculation = function (key) {
     el.toggleAttribute('data-task-hidden', !!VCS.activeCalculation &&
       tokens.indexOf(VCS.activeCalculation) < 0 && tokens.indexOf('all') < 0);
   });
+  // 重新按场景计算页面显隐，既能放行新类型需要的页，也会在切回吸附能时
+  // 收起此前临时放行的生成页。
+  if (VCS.scenario) {
+    applySceneElements(VCS.scenario);
+    keepCurrentPageReachable(VCS.scenario, 'calculation-type');
+  }
   document.dispatchEvent(new CustomEvent('vcs:calculation', {
     detail: { activeCalculation: VCS.activeCalculation },
   }));
+};
+
+// 设置页与仪表盘共用：进入所选计算的唯一主入口，并展开/聚焦目标卡片。
+VCS.openCalculation = async function (key, options = {}) {
+  const task = String(key || VCS.activeCalculation || '');
+  const route = VCS.calculationRoute(task, VCS.scenario);
+  if (!route) {
+    VCS.toast('当前工作模式不支持这个计算类型，请回到设置重新选择', 'fail');
+    return { ok: false, focused: false };
+  }
+  const out = await VCS.navigate(route.page, { source: options.source || 'calculation-entry' });
+  if (!out.ok) return out;
+  if (route.analysis) {
+    const analysis = document.getElementById('analysis-type');
+    if (analysis && analysis.value !== route.analysis) {
+      analysis.value = route.analysis;
+      analysis.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  }
+  if (task === 'adsorption_project' && options.startFresh && window.Project &&
+      typeof window.Project.startLiS === 'function') {
+    await window.Project.startLiS();
+    return { ok: true, focused: true };
+  }
+  const target = route.focusSelector && document.querySelector(route.focusSelector);
+  if (target) {
+    const card = target.classList && target.classList.contains('acc')
+      ? target : target.closest && target.closest('.acc');
+    if (card) card.setAttribute('data-open', '1');
+    if (typeof target.scrollIntoView === 'function') {
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+    if (typeof target.focus === 'function') target.focus();
+  }
+  return { ok: true, focused: !!target };
 };
 
 VCS.loadCalculation = async function () {

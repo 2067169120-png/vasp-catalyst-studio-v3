@@ -229,12 +229,52 @@ def adopt_scan(prof, pw, trust_new, known_ids, local_root):
                 continue
             seg = _sanitize_seg(j.get('name') or jid)
             local_dir = os.path.join(local_root, seg)
+            remote_key = posixpath.normpath(str(workdir))
             # 同名撞车(qstat 常截断作业名):目标目录已属于另一作业则追加 _<jid> 避让,
             # 否则第二个认领会落到第一个的目录并报第一个的作业号。已属本 jid 则复用(幂等)。
             if os.path.isdir(local_dir):
                 existing = manifest_mod.load_manifest(local_dir)
-                if not (existing and str(existing.get('scheduler_job_id')) == jid):
-                    local_dir = os.path.join(local_root, f'{seg}_{jid}')
+                same_binding = bool(
+                    existing
+                    and str(existing.get('scheduler_job_id') or '') == jid
+                    and str(existing.get('cluster') or '') == str(prof.name)
+                    and posixpath.normpath(str(existing.get('remote_dir') or ''))
+                    == remote_key)
+                if same_binding:
+                    # 台账丢失但本地绑定仍完整时，认领应幂等恢复登记，不能因为
+                    # adopt_external_job 拒绝覆盖已有作业号而制造一个假失败。
+                    try:
+                        from vcstudio.cluster import ledger
+                        ledger.register(local_dir)
+                        results.append([jid, True, f'已纳管（原绑定）→ {local_dir}'])
+                    except _job_errors() as e:
+                        results.append([jid, False, str(e)])
+                    continue
+                # 不同服务器可出现同名、同作业号；后缀必须含 profile，且目标若仍
+                # 被占用就继续编号，绝不能复用另一台服务器的本地目录。
+                profile_seg = _sanitize_seg(getattr(prof, 'name', '') or 'cluster')
+                base = os.path.join(local_root, f'{seg}_{profile_seg}_{jid}')
+                local_dir = base
+                serial = 2
+                while os.path.isdir(local_dir):
+                    bound = manifest_mod.load_manifest(local_dir)
+                    if (bound
+                            and str(bound.get('scheduler_job_id') or '') == jid
+                            and str(bound.get('cluster') or '') == str(prof.name)
+                            and posixpath.normpath(str(bound.get('remote_dir') or ''))
+                            == remote_key):
+                        try:
+                            from vcstudio.cluster import ledger
+                            ledger.register(local_dir)
+                            results.append([jid, True, f'已纳管（原绑定）→ {local_dir}'])
+                        except _job_errors() as e:
+                            results.append([jid, False, str(e)])
+                        local_dir = ''
+                        break
+                    local_dir = f'{base}_{serial}'
+                    serial += 1
+                if not local_dir:
+                    continue
             try:
                 os.makedirs(local_dir, exist_ok=True)
                 submitter.adopt_external_job(local_dir, prof, jid, workdir,
@@ -280,23 +320,25 @@ def refresh_batch(prof, pw, dirs, trust_new):
         raise RuntimeError(str(e))
     results = []
     try:
-        live, reasons = submitter.query_scheduler(client, prof)
+        scheduler_states, reasons = submitter.query_scheduler(client, prof)
         for d in dirs:
             try:
-                m = submitter.refresh_job(client, prof, d, live_states=live,
+                submitter.assert_profile_binding(prof, d, '刷新状态')
+                m = submitter.refresh_job(client, prof, d, live_states=scheduler_states,
                                           terminal_reasons=reasons)
                 note = m['state']
                 res = m.get('results') or {}
                 dgn = res.get('diagnosis') or {}
                 if dgn.get('failure_class') and m['state'] in ('FAILED', 'UNCONVERGED', 'NEEDS_HUMAN'):
                     note += f" [{dgn['failure_class']}{'·可续算' if dgn.get('restartable') else ''}] {dgn.get('evidence', '')}"
-                live = res.get('live') or {}
+                live_result = res.get('live') or {}
                 if m['state'] == 'RUNNING':
-                    if live.get('warning'):
-                        note += f" ⚠{live['warning']}"
-                    elif live.get('ionic_steps') is not None:
-                        note += f"({live['ionic_steps']} 离子步" + (
-                            f",|F|max={live['fmax']}" if live.get('fmax') else '') + ')'
+                    if live_result.get('warning'):
+                        note += f" ⚠{live_result['warning']}"
+                    elif live_result.get('ionic_steps') is not None:
+                        note += f"({live_result['ionic_steps']} 离子步" + (
+                            f",|F|max={live_result['fmax']}"
+                            if live_result.get('fmax') else '') + ')'
                 e0 = res.get('energy_e0_eV')
                 if e0 is not None:
                     note += f'(E0={e0:.4f} eV)'

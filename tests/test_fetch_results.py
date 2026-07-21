@@ -40,6 +40,7 @@ class FakeSFTP:
     def __init__(self, available=('CONTCAR', 'OSZICAR', 'OUTCAR')):
         self.available = set(available)
         self.puts = {}
+        self.gets = []
 
     def put(self, local, remote):
         self.puts[remote] = local
@@ -57,6 +58,7 @@ class FakeSFTP:
         return _W()
 
     def get(self, remote, local):
+        self.gets.append(remote)
         name = remote.rsplit('/', 1)[-1]
         if name not in self.available:
             raise IOError(f'no such file: {remote}')

@@ -3,6 +3,7 @@
 每个公开方法至少一个 happy + 一个错误路径;所有返回一律 JSON-safe dict,
 异常绝不穿透到 JS(错误落 'error' 字段)。中文注释允许,英文标识符。
 """
+import copy
 import os
 import sys
 import types
@@ -1199,9 +1200,10 @@ def test_adopt_all_delegates_with_known_ids_and_root():
         calls.update(known=known, root=root, tn=tn) or
         {'needs_trust': False, 'results': [['200', True, '已认领 → X']]})
     entries = [
-        ('/a', {'scheduler_job_id': '100'}),
-        ('/b', {'scheduler_job_id': '200'}),
-        ('/c', {'state': 'DONE'}),                       # 无作业号 → 不入 known
+        ('/a', {'scheduler_job_id': '100', 'cluster': 'c1'}),
+        ('/b', {'scheduler_job_id': '200', 'cluster': 'c1'}),
+        ('/other-server', {'scheduler_job_id': '200', 'cluster': 'c2'}),
+        ('/c', {'state': 'DONE', 'cluster': 'c1'}),      # 无作业号 → 不入 known
         ('/gone', None),                                 # 失效条目 → 不入 known
     ]
     store = {'c1': ClusterProfile(name='c1', auth='key', key_path='/k')}
@@ -1573,7 +1575,7 @@ def test_proj_figures_ladder_uses_fed_pds_index(tmp_path):
            'pds_index': 0, 'u_l': 1.5, 'mu_li': -1.65, 'per_electron': [0.5],
            'thermo_corrected': False}
     fe = types.SimpleNamespace(
-        path_from_project_and_molecules=lambda rows, e_slab, molecules_dir: fed)
+        path_from_project_and_molecules=lambda rows, e_slab, molecules_dir, **kw: fed)
     ads = _fake_adsorption(proj_map={'/p': _proj('liS', str(tmp_path))},
                            delta_ret=_delta({'liS_ads_Li2S4': -1.2}))
     api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
@@ -1598,7 +1600,7 @@ def test_proj_figures_prefers_imported_project_molecules(tmp_path):
     fed = {'steps': [{'label': 'S8*', 'G': 0.0}, {'label': 'Li2S*', 'G': -1.0}],
            'pds_index': 0, 'u_l': 1.5}
 
-    def _path(rows, e_slab, molecules_dir):
+    def _path(rows, e_slab, molecules_dir, **_context):
         seen['molecules_dir'] = molecules_dir
         return fed
 
@@ -1878,6 +1880,22 @@ def test_pipeline_tick_no_profiles_no_errors():
               config_mod=_fake_config())
     out = api.pipeline_tick()
     assert out['ok'] is True and out['events'] == [] and out['errors'] == []
+    assert out['synced'] == 0
+
+
+def test_pipeline_tick_configured_but_idle_profile_is_not_counted_as_synced():
+    api = Api(
+        profiles_mod=_fake_profiles({'idle': ClusterProfile(name='idle', auth='key')}),
+        adsorption_mod=_fake_adsorption(projects=[]),
+        ledger_mod=_fake_ledger([], []),
+        config_mod=_fake_config(ui={
+            'autopilot': True, 'autopilot_report': False,
+            'autopilot_campaigns': False,
+        }))
+
+    out = api.pipeline_tick()
+
+    assert out['ok'] is True
     assert out['synced'] == 0
 
 
@@ -2566,7 +2584,7 @@ def test_proj_figures_default_ladder_unchanged_when_no_preset(tmp_path):
            'pds_index': 0, 'u_l': 1.5}
     seen = {}
 
-    def _path(rows, e_slab, molecules_dir):
+    def _path(rows, e_slab, molecules_dir, **_context):
         seen['called'] = True
         return fed
     fe = types.SimpleNamespace(path_from_project_and_molecules=_path)
@@ -2939,7 +2957,7 @@ def test_render_figure_preset_ladder_lis_default(tmp_path):
     fed = {'steps': [{'label': 'S8*', 'G': 0.0}, {'label': 'Li2S*', 'G': -1.0}],
            'pds_index': 0, 'u_l': 1.5}
     fe = types.SimpleNamespace(
-        path_from_project_and_molecules=lambda rows, e_slab, molecules_dir: fed)
+        path_from_project_and_molecules=lambda rows, e_slab, molecules_dir, **kw: fed)
     ads = _fake_adsorption(proj_map={'/p': _proj('liS', str(tmp_path))},
                            delta_ret=_delta({'liS_ads_Li2S4': -1.2}))
     api = Api(figure_presets_mod=_fake_figpresets(calls=calls), adsorption_mod=ads,
@@ -5976,6 +5994,25 @@ def test_job_live_energy_unsubmitted_honest(tmp_path):
     assert out['ok'] is False and '尚未提交' in out['error']
 
 
+def test_job_live_energy_legacy_remote_dir_requires_explicit_cluster_binding(tmp_path):
+    from vcstudio.shared import manifest as real_manifest
+
+    m = real_manifest.new_manifest(job_id='legacy', system='s', task_type='relax',
+                                   calc_type='slab', inputs={})
+    m['remote_dir'] = '/work/legacy'
+    real_manifest.save_manifest(str(tmp_path), m)
+    connection = types.SimpleNamespace(
+        open_client=lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError('未绑定时不得联网')))
+    api = Api(profiles_mod=_fake_profiles({'hpc': ClusterProfile(name='hpc')}),
+              connection_mod=connection)
+
+    out = api.job_live_energy(str(tmp_path), name='hpc')
+
+    assert out['ok'] is False
+    assert '未记录所属服务器' in out['error']
+
+
 def test_job_live_energy_needs_trust_passthrough(tmp_path):
     from vcstudio.shared import manifest as real_manifest
     m = real_manifest.new_manifest(job_id='j', system='s', task_type='relax',
@@ -6428,6 +6465,139 @@ def test_submit_project_resources_are_ephemeral_retry_safe_and_enable_autopilot(
     assert project['launch']['submitted_job_dirs'] == [dirs['clean'], dirs['retry']]
 
 
+def test_submit_project_same_basename_members_are_not_rejected(tmp_path):
+    first = str(tmp_path / 'left' / 'calc')
+    second = str(tmp_path / 'right' / 'calc')
+    project = {'root': str(tmp_path), 'members': {
+        'clean_slab': first, 'gas_ref': None, 'configs': [second]}}
+    states = {path: {'state': 'CREATED', 'scheduler_job_id': None}
+              for path in (first, second)}
+    submitted = []
+    adsorption = types.SimpleNamespace(
+        load_project=lambda _path: project,
+        save_project=lambda _root, _project: None)
+    batch = types.SimpleNamespace(submit_batch=lambda _profile, _pw, dirs, _trust:
+        submitted.extend(dirs) or {'needs_trust': False,
+                                   'results': [(d, True, 'ok') for d in dirs]})
+    api = Api(profiles_mod=_fake_profiles({'hpc': ClusterProfile(
+                  name='hpc', remote_root='/work', queue='q', ppn=16,
+                  vasp_cmd='mpirun -np {cores} vasp_std')}),
+              adsorption_mod=adsorption,
+              manifest_mod=types.SimpleNamespace(load_manifest=lambda path: states[path]),
+              batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+
+    out = api.submit_project_with_resources('/p/project.yaml', 'hpc', 16, '10:00:00')
+
+    assert out['ok'] is True
+    assert submitted == [first, second]
+
+
+def test_submit_project_includes_created_species_refs_and_skips_done_refs(tmp_path):
+    clean = str(tmp_path / 'clean')
+    config = str(tmp_path / 'config')
+    created_ref = str(tmp_path / 'Li2S4')
+    done_ref = str(tmp_path / 'S8')
+    project = {'root': str(tmp_path),
+               'members': {'clean_slab': clean, 'gas_ref': None, 'configs': [config]},
+               'species_ref_jobs': {'Li2S4': created_ref, 'S8': done_ref}}
+    states = {
+        clean: {'state': 'CREATED', 'scheduler_job_id': None},
+        config: {'state': 'CREATED', 'scheduler_job_id': None},
+        created_ref: {'state': 'CREATED', 'scheduler_job_id': None},
+        done_ref: {'state': 'DONE', 'scheduler_job_id': None},
+    }
+    submitted = []
+    adsorption = types.SimpleNamespace(
+        load_project=lambda _path: project,
+        save_project=lambda _root, _project: None)
+    batch = types.SimpleNamespace(submit_batch=lambda _profile, _pw, dirs, _trust:
+        submitted.extend(dirs) or {'needs_trust': False,
+                                   'results': [(d, True, 'ok') for d in dirs]})
+    api = Api(profiles_mod=_fake_profiles({'hpc': ClusterProfile(
+                  name='hpc', remote_root='/work', queue='q', ppn=16,
+                  vasp_cmd='mpirun -np {cores} vasp_std')}),
+              adsorption_mod=adsorption,
+              manifest_mod=types.SimpleNamespace(load_manifest=lambda path: states[path]),
+              batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+
+    out = api.submit_project_with_resources('/p/project.yaml', 'hpc', 16, '10:00:00')
+
+    assert out['ok'] is True
+    assert submitted == [clean, config, created_ref]
+    assert any(row['dir'] == done_ref and 'DONE' in row['reason'] for row in out['skipped'])
+
+
+def test_submit_project_rejects_switching_managed_project_to_other_profile(tmp_path):
+    job = str(tmp_path / 'clean')
+    project = {
+        'root': str(tmp_path), 'autopilot_managed': True,
+        'members': {'clean_slab': job, 'gas_ref': None, 'configs': []},
+        'launch': {'resources': {'profile': 'server-a'},
+                   'submitted_job_dirs': [job]},
+    }
+    manifest = {'state': 'SUBMITTED', 'scheduler_job_id': '42',
+                'cluster': 'server-a'}
+    batch = types.SimpleNamespace(submit_batch=lambda *_a, **_k:
+        (_ for _ in ()).throw(AssertionError('跨服务器护栏必须在联网前生效')))
+    api = Api(
+        profiles_mod=_fake_profiles({'server-b': ClusterProfile(
+            name='server-b', remote_root='/work', queue='q', ppn=16,
+            vasp_cmd='mpirun -np {cores} vasp_std')}),
+        adsorption_mod=types.SimpleNamespace(load_project=lambda _path: project),
+        manifest_mod=types.SimpleNamespace(load_manifest=lambda _path: manifest),
+        batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+
+    out = api.submit_project_with_resources(
+        '/p/project.yaml', 'server-b', 16, '10:00:00')
+
+    assert out['ok'] is False
+    assert 'server-a' in out['error'] and 'server-b' in out['error']
+
+
+def test_submit_project_retry_repairs_launch_after_persistence_failure(tmp_path):
+    job = str(tmp_path / 'clean')
+    disk = {'project': {'root': str(tmp_path), 'members': {
+        'clean_slab': job, 'gas_ref': None, 'configs': []}}}
+    manifest = {'state': 'CREATED', 'scheduler_job_id': None,
+                'cluster': None, 'remote_dir': None}
+    saves = {'count': 0}
+
+    def _load(_path):
+        return copy.deepcopy(disk['project'])
+
+    def _save(_root, project):
+        saves['count'] += 1
+        if saves['count'] == 1:
+            raise OSError('disk temporarily unavailable')
+        disk['project'] = copy.deepcopy(project)
+
+    def _submit(profile, _pw, dirs, _trust):
+        assert dirs == [job]
+        manifest.update({'state': 'SUBMITTED', 'scheduler_job_id': '900',
+                         'cluster': profile.name, 'remote_dir': '/work/clean'})
+        return {'needs_trust': False, 'results': [(job, True, 'ok')]}
+
+    submissions = []
+    batch = types.SimpleNamespace(submit_batch=lambda *args:
+        submissions.append(args[2]) or _submit(*args))
+    api = Api(
+        profiles_mod=_fake_profiles({'hpc': ClusterProfile(
+            name='hpc', remote_root='/work', queue='q', ppn=16,
+            vasp_cmd='mpirun -np {cores} vasp_std')}),
+        adsorption_mod=types.SimpleNamespace(load_project=_load, save_project=_save),
+        manifest_mod=types.SimpleNamespace(load_manifest=lambda _path: manifest),
+        batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+
+    first = api.submit_project_with_resources('/p/project.yaml', 'hpc', 16, '10:00:00')
+    second = api.submit_project_with_resources('/p/project.yaml', 'hpc', 16, '10:00:00')
+
+    assert first['ok'] is False and 'launch' in first['error']
+    assert second['ok'] is True and second['submitted'] == []
+    assert submissions == [[job]]
+    assert disk['project']['autopilot_managed'] is True
+    assert disk['project']['launch']['submitted_job_dirs'] == [job]
+
+
 def test_submit_project_round_trips_host_key_evidence_and_exact_pin(tmp_path):
     job = str(tmp_path / 'clean')
     project = {'root': str(tmp_path), 'members': {
@@ -6685,6 +6855,97 @@ def test_pipeline_done_jobs_backfill_missing_local_results_after_restart(tmp_pat
     assert ok is True and errors == []
     assert fetched == [str(missing_timestamp), str(missing_file)]
     assert len([event for event in events if event['kind'] == 'fetch']) == 2
+
+
+def test_pipeline_continue_needs_trust_marks_cluster_unsynced(tmp_path):
+    job = str(tmp_path / 'restartable')
+    manifest = {
+        'cluster': 'hpc', 'state': 'UNCONVERGED', 'remote_dir': '/r/restartable',
+        'scheduler_job_id': '101',
+        'results': {'diagnosis': {'restartable': True}, 'continue_rounds': 0},
+    }
+    project = {
+        'autopilot_managed': True,
+        'launch': {'resources': {'profile': 'hpc'}, 'submitted_job_dirs': [job]},
+        'members': {'clean_slab': job, 'gas_ref': None, 'configs': []},
+    }
+    batch = types.SimpleNamespace(
+        filter_continuable=lambda dirs: (list(dirs), 0),
+        continue_batch=lambda *_a: {'needs_trust': True, 'results': [],
+                                    'fingerprint': 'SHA256:abc'},
+    )
+    api = Api(
+        ledger_mod=_fake_ledger([(job, manifest)], []), batch_ops_mod=batch,
+        adsorption_mod=_fake_adsorption(
+            projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project}))
+    events, errors = [], []
+
+    synced = api._tick_cluster(
+        'hpc', ClusterProfile(name='hpc'), None,
+        {'cont': True, 'fetch': False}, events, errors)
+
+    assert synced is False
+    assert any('主机指纹未信任' in error for error in errors)
+    assert any(event['kind'] == 'continue' for event in events)
+
+
+def test_pipeline_fetch_exception_marks_cluster_unsynced(tmp_path):
+    job_dir = tmp_path / 'done'
+    job_dir.mkdir()
+    job = str(job_dir)
+    manifest = {
+        'cluster': 'hpc', 'state': 'DONE', 'remote_dir': '/r/done',
+        'scheduler_job_id': '102', 'task_type': 'relax', 'results': {},
+    }
+    project = {
+        'autopilot_managed': True,
+        'launch': {'resources': {'profile': 'hpc'}, 'submitted_job_dirs': [job]},
+        'members': {'clean_slab': job, 'gas_ref': None, 'configs': []},
+    }
+    batch = types.SimpleNamespace(fetch_batch=lambda *_a:
+        (_ for _ in ()).throw(RuntimeError('network down')))
+    api = Api(
+        ledger_mod=_fake_ledger([(job, manifest)], []), batch_ops_mod=batch,
+        adsorption_mod=_fake_adsorption(
+            projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project}))
+    events, errors = [], []
+
+    synced = api._tick_cluster(
+        'hpc', ClusterProfile(name='hpc'), None,
+        {'cont': False, 'fetch': True}, events, errors)
+
+    assert synced is False
+    assert any('network down' in error for error in errors)
+    assert any(event['kind'] == 'fetch' for event in events)
+
+
+def test_pipeline_fetch_needs_trust_marks_cluster_unsynced(tmp_path):
+    job_dir = tmp_path / 'done_trust'
+    job_dir.mkdir()
+    job = str(job_dir)
+    manifest = {
+        'cluster': 'hpc', 'state': 'DONE', 'remote_dir': '/r/done-trust',
+        'scheduler_job_id': '103', 'task_type': 'relax', 'results': {},
+    }
+    project = {
+        'autopilot_managed': True,
+        'launch': {'resources': {'profile': 'hpc'}, 'submitted_job_dirs': [job]},
+        'members': {'clean_slab': job, 'gas_ref': None, 'configs': []},
+    }
+    batch = types.SimpleNamespace(fetch_batch=lambda *_a: {
+        'needs_trust': True, 'results': [], 'fingerprint': 'SHA256:def'})
+    api = Api(
+        ledger_mod=_fake_ledger([(job, manifest)], []), batch_ops_mod=batch,
+        adsorption_mod=_fake_adsorption(
+            projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project}))
+    errors = []
+
+    synced = api._tick_cluster(
+        'hpc', ClusterProfile(name='hpc'), None,
+        {'cont': False, 'fetch': True}, [], errors)
+
+    assert synced is False
+    assert any('主机指纹未信任' in error for error in errors)
 
 
 def test_pipeline_cluster_empty_or_nonmember_allowlist_fails_closed(tmp_path):

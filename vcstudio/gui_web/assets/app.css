@@ -291,7 +291,13 @@ pre.meth-pre{white-space:pre-wrap;word-break:break-word;max-height:200px}
 #page-settings .ap-row{display:flex;gap:18px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
 #page-settings .ap-sub{padding-left:2px;display:flex;flex-direction:column;gap:8px}
 #page-settings .set-2col{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}
+#page-settings .set-calculation-guide{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 12px;align-items:center;margin:2px 0 12px;padding:10px 12px;border:1px solid var(--rule);border-radius:8px;background:var(--surface)}
+#page-settings .set-calculation-guide[hidden]{display:none}
+#page-settings .set-calculation-guide b{font-size:12.5px}
+#page-settings .set-calculation-guide span{grid-column:1;color:var(--muted);font-size:11.5px;line-height:1.5}
+#page-settings .set-calculation-guide .btn{grid-column:2;grid-row:1 / span 4;white-space:nowrap}
 @media (max-width:720px){#page-settings .set-2col{grid-template-columns:1fr}}
+@media (max-width:720px){#page-settings .set-calculation-guide{grid-template-columns:1fr}#page-settings .set-calculation-guide .btn{grid-column:1;grid-row:auto;margin-top:4px}}
 
 /* ══════════════════════════════════════════════════════════════════════════
    v3.1 GUI 总集成:starpivot 式工作流步进 + 结构编辑器 + 出图画廊 + AI 助手
@@ -518,7 +524,7 @@ nav a.on .stepno{background:var(--accent);border-color:var(--accent);color:#fff}
 .pj-import-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;padding:12px 18px 7px}
 .pj-import-stat{padding:9px 11px;border:1px solid var(--rule);border-radius:6px;background:var(--surface)}
 .pj-import-stat b{display:block;font:700 19px/1.25 var(--mono)}.pj-import-stat span{display:block;color:var(--muted);font-size:10.5px}
-.pj-import-stat.ready b{color:var(--ok)}.pj-import-stat.review b{color:var(--warn)}.pj-import-stat.blocked b{color:var(--fail)}
+.pj-import-stat.ready b{color:var(--ok)}.pj-import-stat.created b{color:var(--run)}.pj-import-stat.review b{color:var(--warn)}.pj-import-stat.blocked b{color:var(--fail)}
 .pj-import-attention{margin:2px 18px 9px;padding:8px 10px;border-radius:6px;background:var(--accent-soft);color:var(--accent-dark);font-size:11.5px;line-height:1.55}
 .pj-import-attention.warn{background:var(--warn-bg);color:var(--warn)}
 .pj-import-tools,.pj-import-batch{display:flex;align-items:center;gap:7px;flex-wrap:wrap;padding:8px 18px}
@@ -598,6 +604,7 @@ nav a.on .stepno{background:var(--accent);border-color:var(--accent);color:#fff}
 .pj-project-summary{margin:-3px 0 10px;padding:9px 10px;border:1px solid var(--rule);border-radius:7px;background:var(--th-bg);font-size:11.5px;line-height:1.5}.pj-project-summary > b,.pj-project-summary > span{display:block}.pj-project-summary > b{margin-top:5px;color:var(--accent-dark)}
 .pj-summary-chips{display:flex;gap:6px;flex-wrap:wrap}.pj-summary-chips span{padding:2px 7px;border:1px solid var(--rule);border-radius:10px;background:var(--surface);color:var(--muted);font:10.5px/1.4 var(--mono)}
 #pj-table{overflow-x:auto}#pj-table table{min-width:1080px}.pj-delta-formula{color:var(--accent-dark);font-family:var(--mono)}.pj-delta-fix{display:block;margin-top:3px;color:var(--warn);font-family:var(--sans)}.pj-stable{display:inline-block;padding:2px 7px;border-radius:9px;background:var(--ok-bg);color:var(--ok);font-size:10.5px;font-weight:700;white-space:nowrap}
+.pj-method-gate{display:flex;flex-direction:column;gap:4px;margin:0 0 9px;padding:9px 11px;border:1px solid var(--rule);border-radius:7px;font-size:11.5px;line-height:1.5}.pj-method-gate ul{margin:2px 0 0;padding-left:18px}.pj-method-gate.incompatible{border-color:var(--fail);background:var(--fail-bg);color:var(--fail)}.pj-method-gate.unverified{border-color:var(--warn);background:var(--warn-bg);color:var(--warn)}.pj-method-gate.verified{border-color:var(--ok);background:var(--ok-bg);color:var(--ok)}
 
 /* ── 作业页:父目录预检 → 四件套自动补齐 → 自动勾选提交 ── */
 #page-jobs .qs-card{border-color:color-mix(in srgb,var(--accent) 35%,var(--rule))}

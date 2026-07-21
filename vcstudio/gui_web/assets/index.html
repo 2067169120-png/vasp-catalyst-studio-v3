@@ -1132,10 +1132,12 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
         <span data-flow-step="6"><b>6</b>ΔE / 报告</span>
       </div>
       <div class="ads-route-actions">
-        <button class="btn primary" type="button" id="ads-route-import">先导入已算好的 Li-S 结果</button>
-        <button class="btn" type="button" id="ads-route-new">已有参考能，开始新的吸附计算</button>
-        <button class="btn quiet" type="button" id="ads-route-results">查看项目、ΔE 与报告</button>
+        <button class="btn primary" type="button" id="ads-route-import">导入已算结果 / Li-S 参考能</button>
+        <button class="btn" type="button" id="ads-route-new">Li-S 一站式：新建并自动托管</button>
+        <button class="btn" type="button" id="ads-route-quartets">通用快速提交：已有完整四件套</button>
+        <button class="btn quiet" type="button" id="ads-route-results">查看 ΔE、图表与报告</button>
       </div>
+      <div class="start-note">推荐 Li-S 新任务走“一站式”，软件会建立吸附项目并接管监控、续算、下载和报告；“通用快速提交”只批量提交已有输入，不会自动建立吸附能项目。</div>
     </div>
 
     <!-- 本地结果导入:整目录扫描 → 人工确认少数歧义 → 建项目 → 立即分析 -->
@@ -1179,6 +1181,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
             <option value="attention">只看需处理</option>
             <option value="all">全部结果</option>
             <option value="ready">可直接导入</option>
+            <option value="created">四件套完整，待提交</option>
             <option value="review">需确认</option>
             <option value="blocked">暂不可导入</option>
           </select>
@@ -1917,7 +1920,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 
     <!-- 快速批量提交:父目录递归发现；完整四件套导入；结构 + 共享 INCAR 自动补齐 -->
     <div class="card acc qs-card" data-acc="jobs:quick" data-sum="父目录扫描 / POSCAR 自动补齐 / 批量提交" data-acc-default="1" id="quick-submit-card" style="padding:12px;margin-bottom:12px">
-      <div class="gen-h acc-h">批量准备并提交 VASP 作业</div>
+      <div class="gen-h acc-h">通用快速提交（已有四件套或结构 + 共享 INCAR）</div>
+      <div class="sub" style="margin-bottom:8px">适用于独立 VASP 作业批量提交；Li-S 吸附项目请优先在“结果分析 → 吸附能全流程”使用一站式入口。</div>
       <div class="qs-guide">
         <span><b>1</b>选父目录</span><i></i><span><b>2</b>检查缺项</span><i></i>
         <span><b>3</b>自动补齐</span><i></i><span><b>4</b>勾选提交</span>
@@ -2165,6 +2169,13 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
         </div>
       </div>
       <div class="set-sub" id="set-scenario-desc" style="margin:2px 0 8px"></div>
+      <div class="set-calculation-guide" id="set-calculation-guide" hidden>
+        <b id="set-calculation-name"></b>
+        <span id="set-calculation-desc"></span>
+        <span id="set-calculation-io"></span>
+        <span id="set-calculation-next"></span>
+        <button class="btn primary" type="button" id="set-calculation-start">进入这类计算</button>
+      </div>
       <div class="set-fld" style="margin-bottom:0">
         <span class="set-lbl" data-i18n="settings.lang.label">界面语言</span>
         <select id="set-lang" class="ipt"></select>

@@ -46,11 +46,11 @@
 
   const ACTIONS = {
     import_adsorption_results: ['导入已算好的 Li-S 结果', '整文件夹识别参考态、slab 与吸附构型', openResultsImport],
-    lis_new: ['开始新的吸附能计算', '固定 INCAR + slab / adsorption POSCAR → 整组提交', async () => {
+    lis_new: ['Li-S 一站式：开始新的吸附计算', '参考能 + 固定 INCAR + slab / adsorption POSCAR → 自动托管整组任务', async () => {
       const out = await VCS.navigate('project', { source: 'dashboard-lis-new' });
       if (out.ok && window.Project && Project.startLiS) Project.startLiS();
     }],
-    submit_inputs: ['提交已有输入文件', '选择整个文件夹，预检后批量提交', openInputsSubmit],
+    submit_inputs: ['通用快速提交：已有四件套', '整文件夹预检并批量提交；不会自动建立 Li-S 吸附能项目', openInputsSubmit],
     continue_jobs: ['继续已有任务', '监控、续算、下载与失败恢复', () => navTo('jobs')],
     new_structure: ['从结构开始', '建模或打开结构文件', () => navTo('structure')],
     choose_vasp_task: ['选择本次 DFT 计算', '按设置中的类型只显示对应参数与下一步', () =>
@@ -73,10 +73,34 @@
     wavefunction: ['波函数分析', 'Multiwfn / VMD 分析与可视化', () => navTo('wavefunction')],
   };
 
-  function renderStartActions(sc) {
+  let startRenderVersion = 0;
+
+  async function renderStartActions(sc) {
     const box = $('db-start-actions');
     if (!box || !sc) return;
-    const keys = (sc.home_actions || []).filter(k => ACTIONS[k]);
+    const version = ++startRenderVersion;
+    let keys = (sc.home_actions || []).filter(k => ACTIONS[k]);
+    const active = VCS.activeCalculation || '';
+    // Li-S 默认吸附项目保留“导入 / 一站式 / 四件套 / 继续”四入口；用户一旦
+    // 明确改选其它 DFT 类型，首页第一项就变成该类型的真实入口，不再误导回吸附表单。
+    if (active && sc.key !== 'molecular' && !(sc.key === 'lis' && active === 'adsorption_project')) {
+      const r = await VCS.call('task_catalog', sc.key || null, active);
+      if (version !== startRenderVersion) return;
+      const task = r && r.ok !== false && (r.tasks || [])[0];
+      if (task) {
+        const route = VCS.calculationRoute && VCS.calculationRoute(active, sc);
+        const verb = route && route.page === 'project' ? '打开结果工具' : '开始准备';
+        ACTIONS.selected_calculation = [
+          `${verb}：${task.name_zh}`,
+          `${task.requires || '按提示准备输入'} → ${task.outputs || '计算结果'}`,
+          () => VCS.openCalculation
+            ? VCS.openCalculation(active, { source: 'dashboard-selected-calculation' })
+            : navTo((route && route.page) || 'generate'),
+        ];
+        keys = ['selected_calculation', 'submit_inputs', 'continue_jobs', 'analyze_vasp_result']
+          .filter(k => ACTIONS[k]);
+      }
+    }
     box.innerHTML = keys.map((key, i) => {
       const a = ACTIONS[key];
       return `<button class="start-action${i < 2 ? ' primary' : i > 2 ? ' quiet' : ''}" data-action="${VCS.esc(key)}">` +
@@ -84,9 +108,10 @@
     }).join('');
     const title = document.querySelector('#db-start-here .start-copy h2');
     const sub = document.querySelector('#db-start-here .start-copy p');
-    if (title) title.textContent = sc.key === 'lis' ? '这次要导入结果，还是开始新的吸附计算？' :
+    if (title) title.textContent = sc.key === 'lis' && active === 'adsorption_project'
+      ? '这次要导入结果，还是开始新的吸附计算？' :
       sc.key === 'molecular' ? '这次从分子结构、Gaussian 输入还是已有任务开始？' :
-        '这次从哪一步开始？';
+        active ? '按本次计算类型继续' : '这次从哪一步开始？';
     if (sub) sub.textContent = '当前工作模式：' + (sc.name || sc.key) +
       '。这里只保留本次需要的入口，可随时在设置中切换。';
   }
@@ -289,6 +314,7 @@
     if (e.detail && e.detail.page === 'dashboard') refresh();
   });
   document.addEventListener('vcs:scenario', e => renderStartActions(e.detail && e.detail.scenario));
+  document.addEventListener('vcs:calculation', () => renderStartActions(VCS.scenario));
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();

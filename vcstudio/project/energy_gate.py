@@ -131,6 +131,18 @@ def method_record(job_dir, manifest, label):
                      or inputs.get('reference_method_signature') or {})
     provenance = list(inputs.get('potcar_provenance') or inputs.get('potcar') or [])
 
+    # OUTCAR/vasprun describe what was actually run.  Prefer that recorded
+    # identity over a quartet that may have been edited after the calculation.
+    signature_titels = list(signature.get('potcar_titel') or [])
+    if signature_titels:
+        signature_elements = list(signature.get('potcar_elements') or [])
+        provenance = [
+            {'element': (signature_elements[index]
+                         if index < len(signature_elements) else f'#{index + 1}'),
+             'titel': titel}
+            for index, titel in enumerate(signature_titels)
+        ]
+
     if not provenance:
         potcar_text = _read_named(job_dir, 'POTCAR')
         titels = [match.group(1).strip() for match in re.finditer(
@@ -166,36 +178,47 @@ def method_record(job_dir, manifest, label):
         fp['functional'] = fp.get('functional') or 'PBE'
         fp['dispersion'] = fp.get('dispersion') or 'none'
         fp['u_values'] = fp.get('u_values') or {'LDAU': False}
-    else:
-        if signature.get('functional') is not None:
-            fp['functional'] = signature.get('functional')
-            known['functional'] = True
-        if 'ivdw' in signature:
-            probe = fingerprint_mod.extract_from_inputs(
-                f'IVDW={signature.get("ivdw")}', '', [])
-            fp['dispersion'] = probe.get('dispersion') or 'none'
-            known['dispersion'] = True
-        if signature.get('encut') is not None:
-            try:
-                fp['encut'] = float(signature['encut'])
-                known['encut'] = True
-            except (TypeError, ValueError):
-                pass
-        if signature.get('ispin') is not None:
-            try:
-                fp['spin'] = int(signature['ispin'])
-                known['spin'] = True
-            except (TypeError, ValueError):
-                pass
-        if 'ldau' in signature:
-            enabled = str(signature.get('ldau')).strip().strip('.').upper() in {
-                'T', 'TRUE', '1'}
-            fp['u_values'] = ({'LDAU': False} if not enabled else {
-                'LDAU': True, **{
-                    key.upper(): signature[key]
-                    for key in ('ldautype', 'ldaul', 'ldauu', 'ldauj')
-                    if key in signature}})
-            known['u_values'] = True
+    # Apply every trustworthy output signature field even when input files are
+    # present: current INCAR is only a fallback and must not rewrite history.
+    signature_hybrid = str(signature.get('lhfcalc') or '').strip().strip('.').upper() \
+        in {'T', 'TRUE', '1'}
+    signature_metagga = str(signature.get('metagga') or '').strip().strip('"').strip("'")
+    if signature_hybrid:
+        fp['functional'] = (
+            f'hybrid:AEXX={signature.get("aexx")!r},HFSCREEN={signature.get("hfscreen")!r}')
+        known['functional'] = True
+    elif signature_metagga and signature_metagga.upper() not in {'F', 'FALSE', 'NONE'}:
+        fp['functional'] = 'metagga:' + signature_metagga.upper()
+        known['functional'] = True
+    elif signature.get('functional') is not None:
+        fp['functional'] = signature.get('functional')
+        known['functional'] = True
+    if 'ivdw' in signature:
+        probe = fingerprint_mod.extract_from_inputs(
+            f'IVDW={signature.get("ivdw")}', '', [])
+        fp['dispersion'] = probe.get('dispersion') or 'none'
+        known['dispersion'] = True
+    if signature.get('encut') is not None:
+        try:
+            fp['encut'] = float(signature['encut'])
+            known['encut'] = True
+        except (TypeError, ValueError):
+            pass
+    if signature.get('ispin') is not None:
+        try:
+            fp['spin'] = int(signature['ispin'])
+            known['spin'] = True
+        except (TypeError, ValueError):
+            pass
+    if 'ldau' in signature:
+        enabled = str(signature.get('ldau')).strip().strip('.').upper() in {
+            'T', 'TRUE', '1'}
+        fp['u_values'] = ({'LDAU': False} if not enabled else {
+            'LDAU': True, **{
+                key.upper(): signature[key]
+                for key in ('ldautype', 'ldaul', 'ldauu', 'ldauj')
+                if key in signature}})
+        known['u_values'] = True
     if not known['kpoints_scheme'] and inputs.get('kpoints'):
         fp['kpoints_scheme'] = 'mesh ' + 'x'.join(str(value) for value in inputs['kpoints'])
         known['kpoints_scheme'] = True

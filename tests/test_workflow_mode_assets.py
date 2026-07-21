@@ -70,6 +70,52 @@ def test_dashboard_actions_are_driven_by_selected_mode():
     assert 'const ACTIONS = {' in js
     assert 'sc.home_actions' in js
     assert "addEventListener('vcs:scenario'" in js
+    assert "addEventListener('vcs:calculation'" in js
+    assert "VCS.call('task_catalog', sc.key || null, active)" in js
+    assert 'selected_calculation' in js
+    assert 'VCS.openCalculation(active' in js
+
+
+def test_exact_calculation_can_reveal_its_required_page_without_bypassing_whitelist():
+    app = _read('app.js')
+    lis = scenarios.get_scenario('lis')
+    assert 'generate' not in lis['pages']       # Li-S 默认仍保持低认知负担
+    assert 'CALCULATION_ROUTES' in app
+    assert 'sc.task_keys.indexOf(task) < 0' in app
+    assert "page: 'generate'" in app
+    assert "link.removeAttribute('data-scene-hidden')" in app
+    assert 'applySceneElements(VCS.scenario)' in app
+    assert 'VCS.openCalculation = async function' in app
+
+
+def test_settings_explains_selected_task_and_has_one_direct_next_step():
+    html = _read('index.html')
+    js = _read('settings.js')
+    for control in ('set-calculation-guide', 'set-calculation-name',
+                    'set-calculation-desc', 'set-calculation-io',
+                    'set-calculation-next', 'set-calculation-start'):
+        assert f'id="{control}"' in html
+    assert 'task.requires' in js and 'task.outputs' in js and 'task.next_action' in js
+    assert 'VCS.openCalculation(key' in js
+
+
+def test_adsorption_entry_distinguishes_one_stop_from_generic_quartet_submit():
+    html = _read('index.html')
+    project = _read('project.js')
+    dashboard = _read('dashboard.js')
+    assert 'Li-S 一站式：新建并自动托管' in html
+    assert '通用快速提交：已有完整四件套' in html
+    assert '不会自动建立吸附能项目' in html
+    assert '通用快速提交：已有四件套' in dashboard
+    assert "card.getAttribute('data-open') !== '1'" in project
+    assert "head.click()" in project
+
+
+def test_user_facing_assets_never_call_managed_workflow_automatic_driving():
+    visible = '\n'.join(_read(name) for name in (
+        'index.html', 'app.js', 'dashboard.js', 'project.js', 'settings.js'))
+    assert '自动驾驶' not in visible
+    assert '自动托管' in visible
 
 
 def test_specialized_panels_follow_exact_calculation_and_routes_are_callable():

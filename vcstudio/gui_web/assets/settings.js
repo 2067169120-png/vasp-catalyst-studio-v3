@@ -242,6 +242,33 @@
       await VCS.call('calculation_set', sel.value);
     }
     if (VCS.applyCalculation) VCS.applyCalculation(sel.value || '');
+    renderCalculationGuide(sel.value || '');
+  }
+
+  function renderCalculationGuide(key) {
+    const guide = $('set-calculation-guide');
+    const task = State.tasks.find(t => t.key === key);
+    if (!guide) return;
+    guide.hidden = !task;
+    if (!task) return;
+    if ($('set-calculation-name')) $('set-calculation-name').textContent = task.name_zh || task.key;
+    if ($('set-calculation-desc')) $('set-calculation-desc').textContent = task.description || '';
+    if ($('set-calculation-io')) $('set-calculation-io').textContent =
+      `需要：${task.requires || '按页面提示准备'}　产出：${task.outputs || '按任务生成'}`;
+    if ($('set-calculation-next')) $('set-calculation-next').textContent =
+      `完成后：${task.next_action || '在任务页监控、下载并生成报告。'}`;
+    const start = $('set-calculation-start');
+    const route = VCS.calculationRoute && VCS.calculationRoute(key, VCS.scenario);
+    if (start) start.textContent = route && route.page === 'project'
+      ? '打开对应结果工具' : route && route.page === 'structure'
+        ? '打开对应建模工具' : '进入输入准备';
+  }
+
+  async function startCalculation() {
+    const key = $('set-calculation') ? $('set-calculation').value : '';
+    if (!key || !VCS.openCalculation) return;
+    const out = await VCS.openCalculation(key, { source: 'settings-calculation' });
+    if (!out.ok) VCS.log('无法进入所选计算，请检查当前工作模式', 'failc');
   }
   function renderScenarioDesc(key) {
     const d = $('set-scenario-desc');
@@ -274,8 +301,9 @@
     }
     if (VCS.applyCalculation) VCS.applyCalculation(key);
     const task = State.tasks.find(t => t.key === key);
+    renderCalculationGuide(key);
     VCS.log('本次计算类型已切换:' + ((task && task.name_zh) || key), 'okc');
-    VCS.toast('已切换本次计算类型');
+    VCS.toast('已切换本次计算类型；可直接进入对应步骤');
   }
 
   // ── 初始化 ──────────────────────────────────────────────────────────────────
@@ -296,6 +324,7 @@
     wire('set-lang', 'change', onLangChange);
     wire('set-scenario', 'change', onScenarioChange);
     wire('set-calculation', 'change', onCalculationChange);
+    wire('set-calculation-start', 'click', startCalculation);
     const row = $('set-theme-row');
     if (row) row.addEventListener('click', e => {
       const o = e.target.closest('.theme-opt');

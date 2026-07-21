@@ -100,8 +100,8 @@ def test_adopt_scan_skips_known_adopts_and_flags_missing(tmp_path, monkeypatch):
     assert os.path.isdir(expected)
 
 
-def test_adopt_scan_name_collision_appends_jid(tmp_path, monkeypatch):
-    """两个未纳管作业同名 'Nb_S8'(qstat 截断易撞名):第二个本地目录撞名 → 追加 _<jid2>,
+def test_adopt_scan_name_collision_appends_profile_and_jid(tmp_path, monkeypatch):
+    """两个未纳管作业同名 'Nb_S8':第二个目录追加 profile + jid 避让，
     两个都认领成功且落到不同目录(不再第二个失败还引用第一个的作业号)。"""
     monkeypatch.setattr(batch_ops, 'open_client',
                         lambda prof, pw, trust_new=False: ('C', 'J'))
@@ -130,8 +130,64 @@ def test_adopt_scan_name_collision_appends_jid(tmp_path, monkeypatch):
     assert rows['501'][1] is True and rows['502'][1] is True   # 两个都认领成功
     assert len(adopted) == 2 and adopted[0] != adopted[1]      # 落到不同目录
     assert adopted[0] == os.path.join(str(tmp_path), 'Nb_S8')
-    assert adopted[1] == os.path.join(str(tmp_path), 'Nb_S8_502')
+    assert adopted[1] == os.path.join(str(tmp_path), 'Nb_S8_c1_502')
     assert os.path.isdir(adopted[1])
+
+
+def test_adopt_scan_same_job_id_on_other_cluster_never_reuses_local_dir(tmp_path, monkeypatch):
+    local = tmp_path / 'same_name'
+    local.mkdir()
+    existing = manifest_mod.new_manifest(
+        job_id='old', system='old', task_type='relax', calc_type='slab', inputs={})
+    existing.update({'cluster': 'server-a', 'remote_dir': '/work/a',
+                     'scheduler_job_id': '777'})
+    manifest_mod.set_state(existing, 'SUBMITTED')
+    manifest_mod.save_manifest(local, existing)
+    monkeypatch.setattr(batch_ops, 'open_client', lambda *a, **k: ('C', 'J'))
+    monkeypatch.setattr(batch_ops, 'close_quiet', lambda *a: None)
+    monkeypatch.setattr(batch_ops.submitter, 'query_queue_detail', lambda *_a: [
+        {'job_id': '777', 'name': 'same_name', 'workdir': '/work/b'}])
+    adopted = []
+    monkeypatch.setattr(
+        batch_ops.submitter, 'adopt_external_job',
+        lambda local_dir, *_a, **_k: adopted.append(local_dir) or {'state': 'SUBMITTED'})
+
+    out = batch_ops.adopt_scan(
+        types.SimpleNamespace(name='server-b'), None, False, set(), str(tmp_path))
+
+    target = os.path.join(str(tmp_path), 'same_name_server-b_777')
+    assert out['results'][0][1] is True
+    assert adopted == [target]
+    assert target != str(local)
+
+
+def test_adopt_scan_exact_existing_binding_is_idempotent(tmp_path, monkeypatch):
+    from vcstudio.cluster import ledger
+
+    local = tmp_path / 'same_name'
+    local.mkdir()
+    existing = manifest_mod.new_manifest(
+        job_id='old', system='old', task_type='relax', calc_type='slab', inputs={})
+    existing.update({'cluster': 'server-b', 'remote_dir': '/work/b',
+                     'scheduler_job_id': '777'})
+    manifest_mod.set_state(existing, 'SUBMITTED')
+    manifest_mod.save_manifest(local, existing)
+    monkeypatch.setattr(batch_ops, 'open_client', lambda *a, **k: ('C', 'J'))
+    monkeypatch.setattr(batch_ops, 'close_quiet', lambda *a: None)
+    monkeypatch.setattr(batch_ops.submitter, 'query_queue_detail', lambda *_a: [
+        {'job_id': '777', 'name': 'same_name', 'workdir': '/work/b'}])
+    registered = []
+    monkeypatch.setattr(ledger, 'register', lambda path: registered.append(path) or True)
+    monkeypatch.setattr(
+        batch_ops.submitter, 'adopt_external_job',
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError('原绑定不得重复认领')))
+
+    out = batch_ops.adopt_scan(
+        types.SimpleNamespace(name='server-b'), None, False, set(), str(tmp_path))
+
+    assert out['results'][0][1] is True
+    assert '原绑定' in out['results'][0][2]
+    assert registered == [str(local)]
 
 
 def test_adopt_scan_needs_trust_branch(monkeypatch):

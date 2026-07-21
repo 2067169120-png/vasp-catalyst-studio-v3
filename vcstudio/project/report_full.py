@@ -61,9 +61,24 @@ def _energy_source_line(dirs) -> str:
 
 
 def _member_dirs(proj) -> list:
+    """Return all managed members, including imported molecule references."""
     mem = proj.get('members') or {}
-    return [d for d in ([mem.get('clean_slab'), mem.get('gas_ref')]
-                        + list(mem.get('configs') or [])) if d]
+    dirs = [mem.get('clean_slab'), mem.get('gas_ref')]
+    dirs.extend(mem.get('configs') or [])
+    for refs in (mem.get('molecules'), proj.get('species_ref_jobs')):
+        if isinstance(refs, dict):
+            dirs.extend(refs.values())
+        elif isinstance(refs, (list, tuple)):
+            dirs.extend(refs)
+    result, seen = [], set()
+    for directory in dirs:
+        if not directory:
+            continue
+        key = os.path.normcase(os.path.normpath(str(directory)))
+        if key not in seen:
+            seen.add(key)
+            result.append(directory)
+    return result
 
 
 def _species_reference_evidence(delta: dict) -> list[dict]:
@@ -296,9 +311,19 @@ def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
         '请以上方参数与赝势表为准，对缺失的复现信息做人工稽核。'
         if proj.get('import_source') else
         '项目内各作业 ENCUT 统一(生成时按元素并集取一致截断能，保 ΔE 各成员基组一致)。')
+    method_check = delta.get('method_consistency') or {}
+    if method_check.get('status') == 'verified':
+        method_audit_line = '本次 ΔE 各直接能量项的方法指纹已通过一致性核验。'
+    elif method_check.get('status') == 'incompatible':
+        method_audit_line = ('方法一致性门控未通过：'
+                             + '；'.join(method_check.get('issues') or []))
+    else:
+        method_audit_line = ('方法一致性证据尚不完整：'
+                             + '；'.join(method_check.get('warnings') or ['请核对原始输入/输出']))
     conv = ['E<sub>ads</sub> = E(slab+ads) − E(slab) − E(ref),负值 = 有利吸附;'
             'ΔE 着色:&lt; −3 eV 强吸附(绿)、&gt; 0(红)。',
             _energy_source_line(dirs + [row['job'] for row in ref_evidence if row.get('job')]),
+            method_audit_line,
             corr_line,
             '成员全部 DONE 才给 ΔE;能量经物理合理性闸(E≥0/|E|&gt;10⁴ 拒收)。',
             '平面波基组不存在基组重叠误差(BSSE),无需 counterpoise 校正;'
@@ -355,7 +380,11 @@ def _try_fed(delta, config, log, proj=None):
     try:
         slab_state, e_slab = delta['slab']
         fed = freeenergy.path_from_project_and_molecules(
-            delta['rows'], e_slab=e_slab, molecules_dir=mol_dir, g_corr=g_corr)
+            delta['rows'], e_slab=e_slab, molecules_dir=mol_dir, g_corr=g_corr,
+            managed_dirs=((proj or {}).get('species_ref_jobs') or {}).values(),
+            project=proj)
+        for warning in (fed or {}).get('warnings') or []:
+            log(f'自由能方法核验提示:{warning}')
         if corr_meta:
             fed['thermo_meta'] = corr_meta
         return fed

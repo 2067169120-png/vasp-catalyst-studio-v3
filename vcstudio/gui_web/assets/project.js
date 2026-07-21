@@ -221,7 +221,14 @@
       manual_confirm: '核对原始输出确已正常结束后，可勾选人工确认',
       repair_or_recalculate: '按硬性问题补齐输出或续算，然后重新检查',
       inspect_output: '打开原始输出核对结束状态，补齐文件后重新检查',
+      submit_created: '四件套已就绪；导入后前往任务页选择服务器提交',
+      submit: '四件套已就绪；导入后前往任务页选择服务器提交',
     })[action] || action;
+  }
+
+  function isCreatedInput(row) {
+    return String(row && row.state || '').toUpperCase() === 'CREATED' &&
+      (!row.raw || row.raw.input_complete !== false);
   }
 
   function importStatus(row) {
@@ -291,8 +298,11 @@
   }
 
   function importCounts() {
-    const out = { total: State.importRows.length, ready: 0, review: 0, blocked: 0 };
-    State.importRows.forEach(row => { out[importStatus(row)] += 1; });
+    const out = { total: State.importRows.length, ready: 0, created: 0, review: 0, blocked: 0 };
+    State.importRows.forEach(row => {
+      out[importStatus(row)] += 1;
+      if (isCreatedInput(row)) out.created += 1;
+    });
     return out;
   }
 
@@ -310,7 +320,7 @@
     const missingConfigSpecies = usesSpeciesRefs
       ? selected.filter(row => row.role === 'config' && !row.species.trim()) : [];
     const unsafeMolecules = selected.filter(row => row.role === 'molecule_ref' &&
-      String(row.state).toUpperCase() !== 'DONE');
+      String(row.state).toUpperCase() !== 'DONE' && !isCreatedInput(row));
     const invalidTasks = selected.filter(row => !['relax', 'static', 'freq', 'dos', 'band'].includes(row.taskType));
     const missingConfirmationReasons = selected.filter(row => row.manualConfirm &&
       row.confirmationEligible && !row.confirmationReason.trim());
@@ -324,7 +334,8 @@
     else if (missingSpecies.length) issue = `有 ${missingSpecies.length} 个分子参考未填写物种名称（如 Li2S4、S8）`;
     else if (missingConfigSpecies.length) issue =
       `已选择逐物种分子参考：请为 ${missingConfigSpecies.length} 个吸附构型填写对应物种（如 Li2S8）`;
-    else if (unsafeMolecules.length) issue = '分子能量库只接收自动判定 DONE 的结果；待核项请改为“独立计算结果”';
+    else if (unsafeMolecules.length) issue =
+      '分子参考仅接收 DONE 结果或已验证的完整四件套待提交；待核项请改为“独立计算结果”';
     else if (invalidTasks.length) issue = `有 ${invalidTasks.length} 个结果尚未选择受支持的任务类型`;
     else if (configs && clean !== 1) issue = '已选择吸附构型，请再指定 1 个清洁表面';
     else if (clean && !configs) issue = '已选择清洁表面，请至少再选择 1 个吸附构型';
@@ -341,6 +352,7 @@
     box.innerHTML = [
       ['total', n.total, '扫描到的计算目录'],
       ['ready', n.ready, '可直接导入'],
+      ['created', n.created, '四件套待提交'],
       ['review', n.review, '需你确认'],
       ['blocked', n.blocked, '暂不可导入'],
     ].map(x => `<div class="pj-import-stat ${x[0]}"><b>${x[1]}</b><span>${x[2]}</span></div>`).join('');
@@ -348,7 +360,11 @@
     const pending = n.review + n.blocked;
     attention.classList.toggle('warn', pending > 0 || !gate.ok);
     if (pending) {
-      attention.textContent = `软件已先选中 ${n.ready} 个可靠结果。请处理黄色/红色条目；点击每行“查看证据”可看到无法导入的具体原因。`;
+      attention.textContent = `软件已先选中 ${n.ready - n.created} 个可靠结果` +
+        (n.created ? `和 ${n.created} 个待提交四件套` : '') +
+        '。请处理黄色/红色条目；点击每行“查看证据”可看到无法导入的具体原因。';
+    } else if (n.created) {
+      attention.textContent = `其中 ${n.created} 个目录只有完整四件套、尚未计算；会以“待提交”导入，随后前往任务页选择服务器提交，不会冒充已收敛结果。`;
     } else {
       attention.textContent = '所有结果均已通过检查。确认清洁表面和吸附构型角色后即可建立项目。';
     }
@@ -358,8 +374,9 @@
     const filter = val('pj-import-filter') || 'attention';
     const query = val('pj-import-search').toLowerCase();
     const status = importStatus(row);
-    if (filter === 'attention' && status === 'ready') return false;
-    if (filter !== 'all' && filter !== 'attention' && filter !== status) return false;
+    const visibleStatus = isCreatedInput(row) ? 'created' : status;
+    if (filter === 'attention' && status === 'ready' && !isCreatedInput(row)) return false;
+    if (filter !== 'all' && filter !== 'attention' && filter !== visibleStatus) return false;
     if (!query) return true;
     const haystack = [row.name, row.path, row.role, row.taskType, row.state, row.action,
       ...row.diagnosis, ...row.blocking, ...row.warnings, ...row.evidence].join(' ').toLowerCase();
@@ -379,11 +396,15 @@
     const visible = State.importRows.filter(rowMatches);
     body.innerHTML = visible.map(row => {
       const status = importStatus(row);
-      const statusLabel = { ready: '可导入', review: '需确认', blocked: '暂不可导入' }[status];
-      const statusClass = { ready: 'ok', review: 'warn', blocked: 'fail' }[status];
+      const created = isCreatedInput(row);
+      const statusLabel = created ? '四件套完整，待提交'
+        : { ready: '可导入', review: '需确认', blocked: '暂不可导入' }[status];
+      const statusClass = created ? 'run'
+        : { ready: 'ok', review: 'warn', blocked: 'fail' }[status];
       const reasons = [...row.blocking, ...row.diagnosis, ...row.warnings, ...row.evidence];
       const mainReason = row.blocking[0] || row.diagnosis[0] || row.warnings[0] ||
-        (status === 'ready' ? '能量与收敛证据已通过检查' : '尚缺少足够的完成证据');
+        (created ? '输入文件已通过检查；尚无输出，导入后需要提交计算'
+          : status === 'ready' ? '能量与收敛证据已通过检查' : '尚缺少足够的完成证据');
       const detail = reasons.length ? '<details><summary>查看证据与完整原因</summary><ul class="pj-import-evidence">' +
         reasons.map(item => `<li>${VCS.esc(item)}</li>`).join('') + '</ul></details>' : '';
       const roleOptions = ['clean_slab', 'config', 'gas_ref', 'molecule_ref', 'standalone', 'ignore'];
@@ -397,9 +418,11 @@
         ? `<textarea class="ipt pj-import-confirm-reason" data-act="confirm-reason" rows="2" ` +
           `placeholder="请填写你核对了哪些输出证据">${VCS.esc(row.confirmationReason)}</textarea>`
         : '';
-      const manualLabel = status === 'ready' ? '自动检查已通过，无需人工确认'
+      const manualLabel = created ? '输入检查已通过，不是收敛结果'
+        : status === 'ready' ? '自动检查已通过，无需人工确认'
         : row.confirmationEligible ? '我已核对并确认收敛' : '存在硬性问题，不能人工跳过';
-      const manualHint = status === 'ready' ? '可直接导入；提交时仍会复核源文件是否变化'
+      const manualHint = created ? '导入后在任务页选择服务器、核数和墙时再提交'
+        : status === 'ready' ? '可直接导入；提交时仍会复核源文件是否变化'
         : row.confirmationEligible ? '请保留可审计的核对依据；提交时仍会复核硬性门禁'
           : '请按左侧原因补齐结果';
       return `<tr data-import-index="${row.index}" class="pj-import-${status}">` +
@@ -556,6 +579,7 @@
       manual_confirm: !!row.manualConfirm && row.confirmationEligible,
       confirmation_reason: row.manualConfirm ? row.confirmationReason.trim() : null,
       species: row.species || null,
+      source_fingerprint: row.raw && row.raw.source_fingerprint || null,
     }));
   }
 
@@ -589,34 +613,47 @@
       // 明确触发，避免自动产出一个科学数据尚不完整的文件。
       const deltaResult = await delta();
       const deltaRows = (deltaResult && deltaResult.rows) || [];
+      const deltaMethodBlocked = String(deltaResult && deltaResult.method_consistency &&
+        deltaResult.method_consistency.status || '').toLowerCase() === 'incompatible';
       const isAdsorption = gate.clean > 0 && gate.configs > 0;
       const hasIncompleteDelta = isAdsorption &&
         (!deltaRows.length || deltaRows.some(row => row.delta_e == null));
       const hasNeedsHuman = Number(r.summary && r.summary.needs_human || 0) > 0;
+      const createdCount = Number(r.summary && r.summary.created || 0);
       // A molecule-reference-only import is a reusable reference library, not an
       // adsorption project with a reportable data point.  Keep the report action
       // locked until both clean slab and at least one config are present.
-      const reportReady = isAdsorption && !hasNeedsHuman && !hasIncompleteDelta;
+      const reportReady = isAdsorption && !hasNeedsHuman && !hasIncompleteDelta && !deltaMethodBlocked;
       const referenceOnly = gate.molecules > 0 && !isAdsorption;
       const startWithReferences = () => startLiS(
         r.project_path || r.path || r.project_name || name);
-      showImportDone(r, gate.selected.length, reportReady, gate.molecules > 0, referenceOnly);
+      const openCreatedJobs = () => openImportedCreatedJobs(
+        r.project_path || r.path || '');
+      showImportDone(r, gate.selected.length, reportReady,
+        gate.molecules > 0 && createdCount === 0,
+        referenceOnly, createdCount, openCreatedJobs);
       setImportStep(4);
-      VCS.toast(referenceOnly ? 'Li-S 参考能库已建立，可以开始新的吸附计算'
+      VCS.toast(createdCount ? `已导入；${createdCount} 个四件套作业等待提交`
+        : referenceOnly ? 'Li-S 参考能库已建立，可以开始新的吸附计算'
         : reportReady ? '结果与 ΔE 已载入，可以生成报告' : '结果已导入；请先处理表格中的缺项');
       if (typeof VCS.nextStep === 'function') {
         VCS.nextStep({
           title: '结果导入完成',
-          message: `已导入 ${gate.selected.length} 个结果并建立项目「${r.project_name || name}」。`,
-          detail: referenceOnly
+          message: `已导入 ${gate.selected.length} 个条目并建立项目「${r.project_name || name}」。`,
+          detail: createdCount
+            ? `其中 ${createdCount} 个只有完整四件套、尚未运行。下一步到任务页选择服务器、核数和墙时后提交。`
+            : referenceOnly
             ? '这些已收敛的 Li-S 能量已加入参考库。下一步只需选择固定 INCAR、clean slab 和 adsorption 结构。'
             : reportReady
             ? 'ΔE 已自动计算并显示在本页。请核对表格后生成完整报告。'
             : 'ΔE 表已自动刷新，但仍有缺角色、缺能量或待确认结果；处理完再生成报告。',
-          primaryLabel: referenceOnly ? '用这些参考能开始吸附计算'
+          primaryLabel: createdCount ? `提交 ${createdCount} 个待运行作业`
+            : referenceOnly ? '用这些参考能开始吸附计算'
             : reportReady ? '生成完整报告' : '查看 ΔE 缺项',
-          stayLabel: referenceOnly ? '先检查参考能清单' : '先检查导入清单',
-          onPrimary: referenceOnly ? startWithReferences : reportReady ? report : () => {
+          stayLabel: createdCount ? '先检查待提交成员'
+            : referenceOnly ? '先检查参考能清单' : '先检查导入清单',
+          onPrimary: createdCount ? openCreatedJobs
+            : referenceOnly ? startWithReferences : reportReady ? report : () => {
             const table = $('pj-table');
             if (table && typeof table.scrollIntoView === 'function') {
               table.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -629,21 +666,34 @@
     }
   }
 
-  function showImportDone(result, count, reportReady, hasSpeciesReferences, referenceOnly) {
+  async function openImportedCreatedJobs(projectPath) {
+    const out = await VCS.navigate('jobs', { source: 'import-created-inputs' });
+    if (!out.ok) return;
+    if (window.Jobs && typeof window.Jobs.selectCreatedProject === 'function') {
+      const selected = await window.Jobs.selectCreatedProject(projectPath);
+      if (!selected) VCS.toast('未找到待提交成员，请在任务页清除筛选后检查', 'fail');
+    }
+  }
+
+  function showImportDone(result, count, reportReady, hasSpeciesReferences, referenceOnly,
+                          createdCount, openCreatedJobs) {
     const box = $('pj-import-done');
     if (!box) return;
     box.hidden = false;
     box.innerHTML = `<b>导入完成：</b>${VCS.esc(result.project_name || val('pj-import-name'))}，` +
-      `共 ${count} 个结果。${referenceOnly ? 'Li-S 参考能库已就绪。' : reportReady
+      `共 ${count} 个条目。${createdCount ? `${createdCount} 个四件套作业等待提交。` : referenceOnly ? 'Li-S 参考能库已就绪。' : reportReady
         ? 'ΔE 已显示在下方，可以生成报告。' : '请先处理下方 ΔE 表中的缺项。'}` +
       '<div class="actions">' + (referenceOnly ? ''
         : '<button class="btn" type="button" data-next="delta">重新计算 ΔE</button>') +
+      (createdCount ? `<button class="btn primary" type="button" data-next="submit-created">提交 ${createdCount} 个待运行作业</button>` : '') +
       (hasSpeciesReferences
         ? '<button class="btn primary" type="button" data-next="lis">用这些参考能开始吸附计算</button>' : '') +
       (referenceOnly ? '' : `<button class="btn primary" type="button" data-next="report"${reportReady ? '' : ' disabled ' +
         'title="ΔE 或收敛状态仍有缺项，暂不生成报告"'}>生成完整报告</button>`) + '</div>';
     const deltaButton = box.querySelector('[data-next="delta"]');
     if (deltaButton) deltaButton.addEventListener('click', delta);
+    const submitCreated = box.querySelector('[data-next="submit-created"]');
+    if (submitCreated && openCreatedJobs) submitCreated.addEventListener('click', openCreatedJobs);
     const lis = box.querySelector('[data-next="lis"]');
     if (lis) lis.addEventListener('click', () => startLiS(
       result.project_path || result.path || result.project_name || val('pj-import-name')));
@@ -1583,6 +1633,25 @@
     await startLiS();
   }
 
+  async function routeQuartetSubmit() {
+    if (typeof VCS.navigate === 'function') {
+      await VCS.navigate('jobs', {
+        source: 'adsorption-quartets', focusSelector: '#quick-submit-card',
+      });
+    }
+    const card = $('quick-submit-card');
+    if (card) {
+      if (card.getAttribute('data-open') !== '1') {
+        const head = card.querySelector(':scope > .acc-h');
+        if (head) head.click();
+        else card.setAttribute('data-open', '1');
+      }
+      card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+    const button = $('qs-add-dir');
+    if (button) button.focus();
+  }
+
   // ── 批量生成:proj_create → advisories/warnings 逐条 warn 级 log → 成功刷台账 ──
   async function create() {
     const btn = $('pj-create');
@@ -1605,6 +1674,15 @@
       // 生成的成员作业进了台账 → 刷新任务页
       if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
       await reloadProjects();
+      if (typeof VCS.nextStep === 'function') {
+        VCS.nextStep({
+          title: '吸附能项目已生成',
+          message: `清洁面、${configs.length} 个吸附构型${gas ? '和气相参考' : ''}已加入任务列表。`,
+          detail: '下一步：在任务页选择服务器并批量提交；全部 DONE 后回到吸附能工作台计算 ΔE 和生成报告。',
+          primaryLabel: '去任务页批量提交',
+          page: 'jobs',
+        });
+      }
     } finally {
       if (btn) btn.disabled = false;
     }
@@ -1693,6 +1771,7 @@
     }
     (r.files || []).forEach(f => VCS.log('已生成:' + f, 'okc'));
     (r.skipped || []).forEach(s => VCS.log('跳过 ' + s.kind + ':' + s.reason, 'warnc'));
+    (r.warnings || []).forEach(w => VCS.log('方法学提示:' + w, 'warnc'));
     if ((r.files || []).length) {
       VCS.log('图已输出到:' + r.out_dir, 'okc');
       VCS.call('open_dir', r.out_dir);          // 生成即可看
@@ -1821,12 +1900,17 @@
       : ['species', 'species_refs'].includes(referenceMode) ? '逐物种参考（具体物种见 ΔE 表）'
         : ['single', 'gas_ref'].includes(referenceMode) ? '统一气相参考' : '参考模式待 ΔE 检查确认';
     const rows = deltaResult && (deltaResult.rows || []);
-    const complete = !!(rows && rows.length && rows.every(row => row.delta_e != null));
+    const methodBlocked = String(deltaResult && deltaResult.method_consistency &&
+      deltaResult.method_consistency.status || '').toLowerCase() === 'incompatible';
+    const complete = !!(rows && rows.length && rows.every(row => row.delta_e != null) && !methodBlocked);
     const missing = rows ? rows.filter(row => row.delta_e == null).length : null;
     const pipelineStage = String(project.pipeline_stage || project.autopilot_stage || '').trim();
     let stage;
     let next;
-    if (complete) {
+    if (methodBlocked) {
+      stage = '方法不一致，ΔE 已阻断';
+      next = '下一步：统一泛函、ENCUT、色散和 POTCAR 后重算。';
+    } else if (complete) {
       stage = 'ΔE 已完整'; next = '下一步：核对下表后生成完整 HTML 报告。';
     } else if (missing != null && missing > 0) {
       stage = `${missing} 个构型尚缺可靠 ΔE`;
@@ -1872,7 +1956,10 @@
     }
     renderDelta(r);
     const rows = r.rows || [];
-    State.workflowResultReady = !!(rows.length && rows.every(row => row.delta_e != null));
+    const methodBlocked = String(r.method_consistency && r.method_consistency.status || '')
+      .toLowerCase() === 'incompatible';
+    State.workflowResultReady = !!(!methodBlocked && rows.length &&
+      rows.every(row => row.delta_e != null));
     updateProjectSummary(r);
     updateJourney();
     if (State.workflowResultReady) VCS.toast('ΔE 已完整；下一步生成完整报告');
@@ -1886,6 +1973,13 @@
   function deltaRepair(row) {
     const note = String(row && row.note || '');
     if (row && row.delta_e != null) return '';
+    const methodCheck = row && row.method_check || {};
+    if (methodCheck.status === 'incompatible' || /方法不一致/.test(note)) {
+      return '下一步：统一所有相减项的泛函、ENCUT、色散和 POTCAR 后重算；当前 ΔE 已阻断，不能直接用于比较或报告。';
+    }
+    if (methodCheck.status === 'unverified') {
+      return '下一步：先核对泛函、ENCUT、色散和 POTCAR 是否一致，再决定能否使用该 ΔE。';
+    }
     if (/构型未完成|清洁表面未完成|未完成/.test(note)) {
       return '下一步：保持软件运行等待自动续算/下载；任务 DONE 后重新计算 ΔE。';
     }
@@ -1904,6 +1998,24 @@
     const rows = r.rows || [];
     const note = r.note || '';
     let h = note ? `<div class="pj-note">${VCS.esc(note)}</div>` : '';
+    const method = r.method_consistency || {};
+    const methodStatus = String(method.status || '').toLowerCase();
+    const methodIssues = (method.issues || []).map(String);
+    const methodWarnings = (method.warnings || []).map(String);
+    if (methodStatus === 'incompatible') {
+      h += '<div class="pj-method-gate incompatible"><b>方法不一致：ΔE 已阻断</b>' +
+        '<span>请统一所有相减项的泛函、ENCUT、色散和 POTCAR 后重新计算；当前数值不能用于构型比较、出图或报告。</span>' +
+        (methodIssues.length ? `<ul>${methodIssues.map(x => `<li>${VCS.esc(x)}</li>`).join('')}</ul>` : '') +
+        '</div>';
+    } else if (methodStatus === 'unverified') {
+      h += '<div class="pj-method-gate unverified"><b>方法一致性尚未完全核验</b>' +
+        '<span>ΔE 展示不等于方法已可比；请核对泛函、ENCUT、色散和 POTCAR。</span>' +
+        (methodWarnings.length ? `<ul>${methodWarnings.map(x => `<li>${VCS.esc(x)}</li>`).join('')}</ul>` : '') +
+        '</div>';
+    } else if (methodStatus === 'verified') {
+      h += '<div class="pj-method-gate verified"><b>方法一致性已核验</b>' +
+        '<span>本项目能量相减项已通过记录层面的一致性检查。</span></div>';
+    }
     if (!rows.length) {
       h += '<div class="empty"><p>该项目暂无吸附构型成员</p></div>';
       box.innerHTML = h;
@@ -2083,6 +2195,7 @@
     wire('pj-create', create);
     wire('ads-route-import', () => openImport());
     wire('ads-route-new', routeNewCalculation);
+    wire('ads-route-quartets', routeQuartetSubmit);
     wire('ads-route-results', () => openProjectResults());
     wire('lis-open-import', () => openImport());
     wire('lis-open-cluster', () => {
@@ -2141,7 +2254,21 @@
     loadLisProfiles();
   }
 
-  // 任务页组头「算 ΔE」调用:刷新项目列表后按项目名选中(找不到则保持默认)
+  // 导入向导/任务页优先用 project.yaml 绝对路径精确选中，
+  // 避免两个同名项目被选错。按名选中仅保留给旧数据兼容。
+  async function selectByPath(path) {
+    await reloadProjects();
+    const wanted = String(path || '');
+    const hit = State.projects.find(p => String(p.path || '') === wanted);
+    const sel = $('pj-select');
+    if (hit && sel) {
+      sel.value = hit.path;
+      updateProjectSummary();
+      updateJourney();
+    }
+    return !!hit;
+  }
+
   async function selectByName(name) {
     await reloadProjects();
     const hit = State.projects.find(p => p.name === name);
@@ -2159,5 +2286,5 @@
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 
-  window.Project = { reload: reloadProjects, selectByName, openImport, startLiS };
+  window.Project = { reload: reloadProjects, selectByPath, selectByName, openImport, startLiS };
 })();

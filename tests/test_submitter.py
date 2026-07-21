@@ -158,7 +158,9 @@ def test_submit_job_happy_path_pbs(tmp_path):
     sftp = FakeSFTP()
     m = submitter.submit_job(client, sftp, _profile(), d)
 
-    remote = '/work/sk2067/jobs/zn_job'
+    remote = m['remote_dir']
+    assert remote.startswith('/work/sk2067/jobs/zn_job--')
+    assert len(posixpath.basename(remote).rsplit('--', 1)[-1]) == 16
     # 上传:四件套 put + 脚本 write
     for f in ('INCAR', 'POTCAR', 'KPOINTS', 'POSCAR'):
         assert posixpath.join(remote, f) in sftp.uploaded
@@ -222,7 +224,7 @@ def test_non_vasp_command_selected_rendered_and_only_declared_inputs_uploaded(tm
     sftp = FakeSFTP()
     m = submitter.submit_job(client, sftp, profile, d)
 
-    remote = '/work/sk2067/jobs/cp2k_job'
+    remote = m['remote_dir']
     script = sftp.written[posixpath.join(remote, 'vcs_job.sh')]
     assert 'srun -n 16 cp2k.psmp -i water.inp -o water.out' in script
     assert 'vasp_std' not in script
@@ -250,8 +252,8 @@ def test_vasp_task_specific_inputs_are_required_and_uploaded(
     assert submitter.preflight(_profile(), d) == []
     client = FakeClient(script=[('qsub', '711.cluster\n')])
     sftp = FakeSFTP()
-    submitter.submit_job(client, sftp, _profile(), d)
-    assert posixpath.join('/work/sk2067/jobs/zn_job', extra) in sftp.uploaded
+    submitted = submitter.submit_job(client, sftp, _profile(), d)
+    assert posixpath.join(submitted['remote_dir'], extra) in sftp.uploaded
 
 
 @pytest.mark.parametrize('task_type,expected', [
@@ -327,6 +329,32 @@ def test_submit_job_failure_keeps_uploaded(tmp_path):
     assert manifest.load_manifest(d)['state'] == 'UPLOADED'    # 留痕但不冒充已提交
 
 
+def test_adopt_external_job_exact_binding_is_idempotent_and_profile_scoped(
+        tmp_path, monkeypatch):
+    from vcstudio.cluster import ledger
+
+    d = tmp_path / 'adopted'
+    d.mkdir()
+    data = manifest.new_manifest(
+        job_id='external', system='s', task_type='relax', calc_type='slab', inputs={})
+    data.update({'cluster': '1w', 'remote_dir': '/work/adopted',
+                 'scheduler_job_id': '777'})
+    manifest.set_state(data, 'SUBMITTED')
+    manifest.save_manifest(d, data)
+    registered = []
+    monkeypatch.setattr(ledger, 'register', lambda path: registered.append(path) or True)
+
+    same = submitter.adopt_external_job(
+        str(d), _profile(), '777', '/work/adopted')
+
+    assert same['scheduler_job_id'] == '777'
+    assert registered == [str(d)]
+    assert same.get('attempts') == data.get('attempts')
+    with pytest.raises(ValueError, match='与本次.*不同'):
+        submitter.adopt_external_job(
+            str(d), _profile(name='other'), '777', '/work/adopted')
+
+
 def test_refresh_job_states(tmp_path):
     d = _job_dir(tmp_path)
     client = FakeClient(script=[('qsub', '8812345.cluster.hpc\n')])
@@ -383,7 +411,8 @@ def test_submit_and_refresh_quote_spaced_remote_dir(tmp_path):
     sftp = FakeSFTP()
     m = submitter.submit_job(client, sftp, prof, d)
 
-    remote = '/work/my jobs/zn_job'
+    remote = m['remote_dir']
+    assert remote.startswith('/work/my jobs/zn_job--')
     assert m['remote_dir'] == remote
     assert f"mkdir -p '{remote}'" in client.commands
     assert any(f"'{remote}/vcs_job.sh'" in c for c in client.commands)
@@ -897,7 +926,8 @@ def test_build_script_text_template_mode(tmp_path):
                    encoding='utf-8')
     prof = _profile(script_mode='template', template_path=str(tpl))
     text = submitter.build_script_text(prof, d)
-    assert '#PBS -N zn_job' in text and 'cd X/zn_job' in text and '-np 12' in text
+    leaf = posixpath.basename(submitter._spec_for(prof, d).remote_dir)
+    assert '#PBS -N zn_job' in text and f'cd X/{leaf}' in text and '-np 12' in text
 
 
 def test_legacy_vasp_template_remains_valid_without_command_placeholder(tmp_path):
@@ -940,14 +970,40 @@ def test_refresh_job_running_live_health(tmp_path):
 def test_remote_namespace_isolated_but_legacy_path_stays_compatible(tmp_path):
     job = _job_dir(tmp_path)
     profile = _profile()
-    assert submitter._spec_for(profile, job).remote_dir.endswith('/jobs/zn_job')
+    default_remote = submitter._spec_for(profile, job).remote_dir
+    assert default_remote.startswith('/work/sk2067/jobs/zn_job--')
     data = manifest.load_manifest(job)
     data['inputs']['remote_namespace'] = 'lis-a1b2c3d4e5f6'
     manifest.save_manifest(job, data)
-    assert submitter._spec_for(profile, job).remote_dir.endswith(
-        '/jobs/lis-a1b2c3d4e5f6/zn_job')
+    namespaced = submitter._spec_for(profile, job).remote_dir
+    assert namespaced.startswith('/work/sk2067/jobs/lis-a1b2c3d4e5f6/zn_job--')
     data['inputs']['remote_namespace'] = '../escape'
     manifest.save_manifest(job, data)
     assert any('命名空间非法' in issue for issue in submitter.preflight(profile, job))
     with pytest.raises(ValueError, match='命名空间非法'):
         submitter._spec_for(profile, job)
+
+
+def test_remote_dir_avoids_same_basename_collisions_and_is_stable(tmp_path):
+    first = _job_dir(tmp_path / 'project-a')
+    second = _job_dir(tmp_path / 'project-b')
+    profile = _profile()
+
+    first_remote = submitter._spec_for(profile, first).remote_dir
+    assert first_remote == submitter._spec_for(profile, first).remote_dir
+    assert first_remote != submitter._spec_for(profile, second).remote_dir
+    assert posixpath.basename(first_remote).startswith('zn_job--')
+    assert str(tmp_path) not in first_remote
+
+
+def test_remote_dir_preserves_legacy_path_for_same_profile(tmp_path):
+    job = _job_dir(tmp_path)
+    data = manifest.load_manifest(job)
+    data['cluster'] = '1w'
+    data['remote_dir'] = '/work/sk2067/jobs/legacy-job'
+    manifest.save_manifest(job, data)
+
+    assert submitter._spec_for(_profile(), job).remote_dir == data['remote_dir']
+    other = _profile(name='other', remote_root='/scratch/other')
+    assert submitter._spec_for(other, job).remote_dir.startswith(
+        '/scratch/other/zn_job--')

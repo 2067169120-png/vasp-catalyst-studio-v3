@@ -75,29 +75,70 @@ def test_submit_batch_closes_client_and_jump(monkeypatch):
     assert client.closed and jump.closed          # 跳板连接同样必须关
 
 
-def test_submit_batch_remote_collision_fails_whole_batch_before_network(tmp_path, monkeypatch):
-    a = tmp_path / 'left' / 'calc'
-    b = tmp_path / 'right' / 'calc'
-    a.mkdir(parents=True)
-    b.mkdir(parents=True)
+def test_submit_batch_duplicate_selection_fails_whole_batch_before_network(tmp_path, monkeypatch):
+    a = tmp_path / 'calc'
+    a.mkdir()
     monkeypatch.setattr(
         batch_ops, 'open_client',
         lambda *_a, **_k: (_ for _ in ()).throw(AssertionError('冲突批次不得联网')))
     profile = types.SimpleNamespace(name='c1', remote_root='/remote/jobs')
 
-    out = batch_ops.submit_batch(profile, None, [str(a), str(b)], False)
+    out = batch_ops.submit_batch(profile, None, [str(a), str(a)], False)
 
     assert [row[1] for row in out['results']] == [False, False]
     assert all('同一远程目录' in row[2] for row in out['results'])
 
 
+def test_submit_batch_same_basename_uses_hashed_remote_dirs(tmp_path, monkeypatch):
+    a = tmp_path / 'left' / 'calc'
+    b = tmp_path / 'right' / 'calc'
+    a.mkdir(parents=True)
+    b.mkdir(parents=True)
+    client, jump = _patch_open(monkeypatch)
+    seen = []
+    monkeypatch.setattr(
+        batch_ops.submitter, 'submit_job',
+        lambda _c, _s, _p, d: seen.append(d) or {'scheduler_job_id': str(len(seen))})
+
+    out = batch_ops.submit_batch(
+        types.SimpleNamespace(name='c1', remote_root='/remote/jobs'),
+        None, [str(a), str(b)], False)
+
+    assert [row[1] for row in out['results']] == [True, True]
+    assert seen == [str(a), str(b)]
+    assert client.closed and jump.closed
+
+
 def test_refresh_batch_closes_client_and_jump(monkeypatch):
     client, jump = _patch_open(monkeypatch)
     monkeypatch.setattr(batch_ops.submitter, 'query_scheduler', lambda c, p: ({}, {}))
+    monkeypatch.setattr(batch_ops.submitter, 'assert_profile_binding', lambda *a, **k: {})
     monkeypatch.setattr(batch_ops.submitter, 'refresh_job',
                         lambda c, p, d, live_states, terminal_reasons=None: {'state': 'DONE', 'results': {}})
     payload = batch_ops.refresh_batch(object(), None, ['d1'], False)
     assert payload['results'] == [('d1', 'DONE')]
+    assert client.closed and jump.closed
+
+
+def test_refresh_batch_preserves_scheduler_map_for_every_job(monkeypatch):
+    client, jump = _patch_open(monkeypatch)
+    scheduler_states = {'101': 'RUNNING', '102': 'QUEUED'}
+    seen = []
+    monkeypatch.setattr(
+        batch_ops.submitter, 'query_scheduler', lambda _c, _p: (scheduler_states, {}))
+    monkeypatch.setattr(batch_ops.submitter, 'assert_profile_binding', lambda *a, **k: {})
+
+    def _refresh(_client, _profile, job_dir, live_states, terminal_reasons=None):
+        seen.append((job_dir, live_states))
+        return {'state': 'RUNNING',
+                'results': {'live': {'ionic_steps': 1, 'warning': ''}}}
+
+    monkeypatch.setattr(batch_ops.submitter, 'refresh_job', _refresh)
+
+    payload = batch_ops.refresh_batch(object(), None, ['first', 'second'], False)
+
+    assert [row[0] for row in payload['results']] == ['first', 'second']
+    assert seen == [('first', scheduler_states), ('second', scheduler_states)]
     assert client.closed and jump.closed
 
 
@@ -154,6 +195,7 @@ def test_refresh_batch_survives_ssh_exception(monkeypatch):
     from paramiko.ssh_exception import SSHException
     client, jump = _patch_open(monkeypatch)
     monkeypatch.setattr(batch_ops.submitter, 'query_scheduler', lambda c, p: ({}, {}))
+    monkeypatch.setattr(batch_ops.submitter, 'assert_profile_binding', lambda *a, **k: {})
 
     def flaky(c, p, d, live_states, terminal_reasons=None):
         if d == 'bad':
