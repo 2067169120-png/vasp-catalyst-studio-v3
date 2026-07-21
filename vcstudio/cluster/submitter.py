@@ -7,7 +7,10 @@ client/sftp 由调用方注入(GUI 经 connection.open_client;测试注入假件
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+import functools
 import hashlib
+import json
 import math
 import os
 import posixpath
@@ -15,6 +18,7 @@ import re
 import shlex
 import shutil
 import tempfile
+import threading
 import time
 
 from vcstudio.cluster import script_builder
@@ -53,6 +57,44 @@ _NEB_FRAME_RE = re.compile(r'^\d+$')
 _NEB_CONVERGED_MARK = 'reached required accuracy'
 _REMOTE_NAMESPACE_RE = re.compile(r'^[A-Za-z0-9_.-]{1,120}$')
 
+_JOB_LOCKS: dict[str, threading.RLock] = {}
+_JOB_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def job_operation(job_dir, action='远程操作'):
+    """Serialize manifest/remote mutations for one job inside the GUI process.
+
+    pywebview dispatches API calls on independent threads.  Without this lock,
+    a manual fetch and an automatic continuation can both load the old
+    manifest and the later save may orphan a newly submitted scheduler job.
+    The fetch-generation CAS remains the second line of defence.
+    """
+    key = os.path.normcase(os.path.abspath(os.path.normpath(str(job_dir))))
+    with _JOB_LOCKS_GUARD:
+        lock = _JOB_LOCKS.setdefault(key, threading.RLock())
+    if not lock.acquire(blocking=False):
+        raise RuntimeError(f'{action}已跳过：该作业正在执行另一项提交/刷新/下载/续算操作')
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def _serialized_job_argument(position: int, action: str):
+    def decorate(function):
+        @functools.wraps(function)
+        def wrapped(*args, **kwargs):
+            job_dir = kwargs.get('job_dir')
+            if job_dir is None and len(args) > position:
+                job_dir = args[position]
+            if job_dir is None:
+                raise TypeError('缺少 job_dir')
+            with job_operation(job_dir, action):
+                return function(*args, **kwargs)
+        return wrapped
+    return decorate
+
 
 def _job_engine(m: dict | None) -> str:
     """Return the manifest engine; old manifests remain VASP-compatible.
@@ -65,6 +107,50 @@ def _job_engine(m: dict | None) -> str:
     if not isinstance(inputs, dict):
         return 'vasp'
     return str(inputs.get('engine') or 'vasp').strip().lower() or 'vasp'
+
+
+_PROFILE_BINDING_FIELDS = (
+    'name', 'hostname', 'port', 'username', 'scheduler', 'scheduler_bin',
+    'remote_root', 'use_jump', 'jump_host', 'jump_port', 'jump_user',
+)
+
+
+def _normalise_binding_value(field: str, value):
+    if field in {'port', 'jump_port'}:
+        try:
+            return int(value or 22)
+        except (TypeError, ValueError):
+            return 22
+    if field == 'use_jump':
+        return bool(value)
+    text = str(value or '').strip()
+    if field in {'hostname', 'jump_host', 'scheduler'}:
+        return text.lower()
+    if field == 'remote_root' and text:
+        return posixpath.normpath(text)
+    return text
+
+
+def profile_binding(profile) -> dict:
+    """Return the immutable remote endpoint identity stored with every job.
+
+    A display name alone is not an endpoint identity: users may edit a saved
+    profile in-place and keep the same name.  The digest deliberately excludes
+    resource choices (queue/nodes/walltime) but includes every field that can
+    redirect a remote action to a different account, scheduler, jump host or
+    directory namespace.
+    """
+    endpoint = {
+        field: _normalise_binding_value(field, getattr(profile, field, None))
+        for field in _PROFILE_BINDING_FIELDS
+    }
+    encoded = json.dumps(endpoint, ensure_ascii=False, sort_keys=True,
+                         separators=(',', ':')).encode('utf-8')
+    return {
+        'schema': 1,
+        'fingerprint': hashlib.sha256(encoded).hexdigest(),
+        'endpoint': endpoint,
+    }
 
 
 def assert_profile_binding(profile, job_dir: str, action: str,
@@ -87,7 +173,53 @@ def assert_profile_binding(profile, job_dir: str, action: str,
         raise ValueError(
             f'{action}失败：作业属于服务器「{actual}」，当前选择的是「{expected}」；'
             '为防止操作错误服务器，已阻止本次操作')
+    stored = m.get('cluster_binding')
+    if stored is not None:
+        stored_fingerprint = (str(stored.get('fingerprint') or '').strip()
+                              if isinstance(stored, dict) else '')
+        current = profile_binding(profile)
+        if (not stored_fingerprint
+                or stored_fingerprint != current['fingerprint']):
+            raise ValueError(
+                f'{action}失败：服务器「{expected}」的连接端点已与作业提交时不同'
+                '（主机/端口/用户/调度器/跳板机/远程根目录之一已改变）；'
+                '为防止误操作同名的另一台服务器，已阻止本次操作')
+    # Legacy manifests have no cluster_binding.  Keep their historical
+    # name-only behaviour so an upgrade does not strand existing calculations.
     return m
+
+
+def current_attempt_token(m: dict | None) -> str:
+    """Return a stable token for the manifest's current scheduler attempt.
+
+    New attempts persist the token.  Legacy and continuation attempts derive
+    the same value deterministically, allowing final fetch evidence to bind to
+    one scheduler job without rewriting old audit history.
+    """
+    m = m or {}
+    job_id = str(m.get('scheduler_job_id') or '')
+    attempts = list(m.get('attempts') or [])
+    attempt = next((item for item in reversed(attempts)
+                    if isinstance(item, dict)
+                    and str(item.get('job_id') or '') == job_id), {})
+    persisted = str((attempt or {}).get('attempt_token') or '').strip()
+    if persisted:
+        return persisted
+    binding = m.get('cluster_binding') or {}
+    payload = {
+        'job_id': job_id,
+        'remote_dir': str(m.get('remote_dir') or ''),
+        'cluster': str(m.get('cluster') or ''),
+        'cluster_fingerprint': (str(binding.get('fingerprint') or '')
+                                if isinstance(binding, dict) else ''),
+        'attempt_n': (attempt or {}).get('n'),
+        'attempt_at': str((attempt or {}).get('at') or ''),
+        'attempt_action': str((attempt or {}).get('action') or
+                              (attempt or {}).get('result') or ''),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                         separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _engine_command_template(profile, engine: str) -> str:
@@ -585,6 +717,7 @@ def build_script_text(profile, job_dir: str) -> str:
 
 
 # ── 提交 ───────────────────────────────────────────────────────────────────
+@_serialized_job_argument(3, '提交')
 def submit_job(client, sftp, profile, job_dir: str) -> dict:
     """上传 + 提交一个作业;成功回写 manifest(UPLOADED→SUBMITTED)并返回之。
 
@@ -614,6 +747,7 @@ def submit_job(client, sftp, profile, job_dir: str) -> dict:
     with sftp.file(posixpath.join(spec.remote_dir, SCRIPT_NAME), 'w') as f:
         f.write(script_text.replace('\r\n', '\n'))
     m['cluster'] = profile.name
+    m['cluster_binding'] = profile_binding(profile)
     m['remote_dir'] = spec.remote_dir
     manifest_mod.set_state(m, 'UPLOADED', note=upload_note)
 
@@ -627,7 +761,7 @@ def submit_job(client, sftp, profile, job_dir: str) -> dict:
 
     m['scheduler_job_id'] = job_id
     m['attempts'] = list(m.get('attempts') or [])
-    m['attempts'].append({
+    attempt = {
         'n': len(m['attempts']) + 1,
         'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'job_id': job_id,
@@ -637,7 +771,13 @@ def submit_job(client, sftp, profile, job_dir: str) -> dict:
         'engine': _job_engine(m),
         # v3.3.0 实际核时统计:提交时点核数(nodes×ppn;ppn 未配 → None,usage 端不编数)
         'cores': (spec.nodes * spec.ppn) if spec.ppn else None,
-    })
+    }
+    # The token is part of the immutable attempt audit record and later binds
+    # downloaded files to this exact scheduler generation.
+    token_manifest = {**m, 'scheduler_job_id': job_id,
+                      'attempts': [*m['attempts'], attempt]}
+    attempt['attempt_token'] = current_attempt_token(token_manifest)
+    m['attempts'].append(attempt)
     manifest_mod.set_state(m, 'SUBMITTED', note=f'{dialect.name} {job_id}')
     manifest_mod.save_manifest(job_dir, m)
     return m
@@ -695,6 +835,7 @@ def query_workdir(client, profile, job_id: str) -> str:
     return dialect.parse_workdir(out)
 
 
+@_serialized_job_argument(0, '认领')
 def adopt_external_job(local_dir: str, profile, job_id: str, remote_dir: str,
                        name: str = '', task_type: str | None = None) -> dict:
     """认领一个非本软件提交的集群作业:落 job.yaml + 入台账,之后查状态/拉回/续算全走原生路径。
@@ -732,6 +873,8 @@ def adopt_external_job(local_dir: str, profile, job_id: str, remote_dir: str,
             and posixpath.normpath(str(existing.get('remote_dir') or ''))
             == posixpath.normpath(str(remote_dir)))
         if exact_binding:
+            assert_profile_binding(
+                profile, local_dir, '认领外部作业', manifest=existing)
             # 认领响应可能在前端收到前中断；同一 job/profile/remote 的重试只修复
             # 台账登记，不重复追加 attempts，也不改状态。
             from vcstudio.cluster import ledger
@@ -749,16 +892,20 @@ def adopt_external_job(local_dir: str, profile, job_id: str, remote_dir: str,
         system=name or dir_name, task_type=effective_task, calc_type='slab',
         inputs={'adopted': True, 'adopted_from': f'{profile.name}:{job_id}'})
     m['cluster'] = profile.name
+    m['cluster_binding'] = profile_binding(profile)
     m['remote_dir'] = remote_dir
     m['scheduler_job_id'] = str(job_id)
     m['task_type'] = effective_task
-    m.setdefault('attempts', []).append({
+    attempt = {
         'n': len(m.get('attempts') or []) + 1,
         'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'result': 'adopted',
         'job_id': str(job_id),
         'cluster': profile.name,
-    })
+    }
+    token_manifest = {**m, 'attempts': [*(m.get('attempts') or []), attempt]}
+    attempt['attempt_token'] = current_attempt_token(token_manifest)
+    m.setdefault('attempts', []).append(attempt)
     manifest_mod.set_state(m, 'SUBMITTED', note=f'认领外部作业 {job_id}(remote: {remote_dir})')
     manifest_mod.save_manifest(local_dir, m)
     from vcstudio.cluster import ledger
@@ -766,19 +913,23 @@ def adopt_external_job(local_dir: str, profile, job_id: str, remote_dir: str,
     return m
 
 
-# 续算沉降护栏:续算后连续 SETTLE_MAX_CHECKS 次仍"调度器无此作业 + OUTCAR 未刷新",
-# 才放行终态取证(几乎必然是重投即被拒);正常情形新作业一两轮内就会现身/写出新 OUTCAR。
+# 续算沉降护栏:续算后连续 SETTLE_MAX_CHECKS 次仍"未见 RUNNING +
+# OUTCAR 未刷新"，就转 NEEDS_HUMAN。绝不放行解析上一轮遗留输出。
 SETTLE_MAX_CHECKS = 3
 
 
-def _mark_observed_alive(m: dict) -> None:
-    """标记当前(重投)轮已在调度器现身(QUEUED/RUNNING)。续算沉降护栏据此放行。"""
+def _mark_observed_alive(m: dict, *, running=False) -> None:
+    """记录本轮调度状态；只有 RUNNING 才证明新作业真正执行过。"""
     r = m.setdefault('results', {})
-    r['observed_alive'] = True
-    r.pop('settling', None)  # 现身即清沉降态
+    if running:
+        r['observed_running'] = True
+        r['observed_alive'] = True  # 兼容旧项目/旧界面只读字段
+        r.pop('settling', None)
+    else:
+        r['observed_queued'] = True
 
 
-def _set_continue_baseline(m: dict, old_outcar_mtime) -> None:
+def _set_continue_baseline(m: dict, old_outcar_mtime, *, outputs_archived=False) -> None:
     """续算重投时落基线:上一轮 OUTCAR 的 mtime + 复位本轮存活标记与沉降态。
 
     refresh_job 的沉降护栏据此判断"新一轮是否真的重写过 OUTCAR",
@@ -786,42 +937,69 @@ def _set_continue_baseline(m: dict, old_outcar_mtime) -> None:
     """
     r = m.setdefault('results', {})
     r['continue_baseline'] = {'outcar_mtime': old_outcar_mtime, 'settle_checks': 0,
+                              'outputs_archived': bool(outputs_archived),
                               'at': time.strftime('%Y-%m-%dT%H:%M:%S')}
     r['observed_alive'] = False
+    r['observed_running'] = False
+    r['observed_queued'] = False
     r.pop('settling', None)
 
 
-def _in_continue_settling(m: dict, reason, outcar_mtime) -> bool:
+def _in_continue_settling(m: dict, reason, outcar_mtime, outcar_size=None) -> bool:
     """续算后作业仍未真正启动本轮 → 返回 True(保持 SUBMITTED,不判终态)。
 
-    仅对续算过(continue_rounds≥1)、当前 SUBMITTED、且无调度器终态原因的作业生效。
-    "已启动本轮"的证据:本轮在调度器现过身(observed_alive),或 OUTCAR 相对续算基线
-    被重写过(mtime 变化)。两者皆无 → 说明新作业还没被登记/还没写新 OUTCAR,手里那份是
-    上一轮旧 OUTCAR,绝不能拿去判终态。连续 SETTLE_MAX_CHECKS 次仍如此才兜底放行。
+    仅对续算过(continue_rounds≥1)且仍在活动态的作业生效。"已启动本轮"的证据只能是
+    本轮真正进入 RUNNING，或 OUTCAR 相对续算基线被重写(mtime 变化)。只见 QUEUED
+    不代表运行过。两者皆无时，手里的 OUTCAR 就可能属于上一轮，绝不能用于终态。
+    达到上限后失败即停地转 NEEDS_HUMAN，不解析旧文件。
     调用方已确保 u==GONE(非 QUEUED/RUNNING)。返回 True 时已就地更新 results,调用方需落盘。
     """
     r = m.get('results') or {}
     rounds = int(r.get('continue_rounds', 0) or 0)
-    if rounds < 1 or m.get('state') != 'SUBMITTED' or reason:
-        return False
-    if r.get('observed_alive'):
+    if rounds < 1 or m.get('state') not in {'SUBMITTED', 'QUEUED', 'RUNNING'}:
         return False
     baseline = r.get('continue_baseline') or {}
     base_mtime = baseline.get('outcar_mtime')
-    rewritten = outcar_mtime is not None and outcar_mtime != base_mtime
+    if baseline.get('outputs_archived'):
+        # 上轮输出已原子移入审计目录，工作目录中重新出现的 OUTCAR
+        # 天然属于本轮；不再受远程文件系统秒级 mtime 精度影响。
+        rewritten = isinstance(outcar_size, int) and outcar_size > 0
+    else:
+        # 旧清单兼容路径：没有归档证据时必须看到 mtime 变化。
+        rewritten = outcar_mtime is not None and outcar_mtime != base_mtime
     if rewritten:
         return False  # 本轮确已重写 OUTCAR → 真终态,放行取证
-    # 仍是旧 OUTCAR(或暂无 OUTCAR):记一次沉降观测
-    checks = int(baseline.get('settle_checks', 0) or 0) + 1
+    # 仍是旧 OUTCAR(或暂无 OUTCAR):记一次沉降观测。调度器已给终态原因
+    # 时无需继续等待，但仍不能去解析旧 OUTCAR。
+    checks = (SETTLE_MAX_CHECKS if reason else
+              int(baseline.get('settle_checks', 0) or 0) + 1)
     baseline['settle_checks'] = checks
     r['continue_baseline'] = baseline
     r['settling'] = {
         'checks': checks,
-        'reason': '续算后新作业尚未被调度器登记或尚未写出新 OUTCAR,暂不判终态(疑仍在排队)',
+        'reason': ('续算后新作业尚未进入 RUNNING，且未写出新 OUTCAR；'
+                   '暂不判终态，旧轮输出不会被复用'),
         'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
     }
     m['results'] = r
-    return checks < SETTLE_MAX_CHECKS
+    if checks >= SETTLE_MAX_CHECKS:
+        evidence = ('续算重投后未观测到本轮 RUNNING 或 OUTCAR 更新'
+                    + (f'；调度器原因：{reason}' if reason else ''))
+        r['diagnosis'] = {
+            'failure_class': 'CONTINUE_RUN_NOT_OBSERVED',
+            'restartable': False,
+            'evidence': evidence,
+            'scheduler_reason': reason,
+            'classified_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        }
+        m.setdefault('attempts', []).append({
+            'n': len(m.get('attempts') or []) + 1,
+            'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'result': 'failed', 'failure_class': 'CONTINUE_RUN_NOT_OBSERVED',
+            'to_state': 'NEEDS_HUMAN',
+        })
+        manifest_mod.set_state(m, 'NEEDS_HUMAN', note=evidence)
+    return True
 
 
 def _engine_output_evidence(client, remote: str, m: dict, job_dir: str | None = None):
@@ -952,6 +1130,7 @@ def _refresh_non_vasp_terminal(client, job_dir: str, m: dict, reason):
     return m
 
 
+@_serialized_job_argument(2, '刷新状态')
 def refresh_job(client, profile, job_dir: str, live_states: dict | None = None,
                 terminal_reasons: dict | None = None) -> dict:
     """按调度器现状更新一个作业的 manifest;终态时做取证 + 失败分类。
@@ -964,6 +1143,7 @@ def refresh_job(client, profile, job_dir: str, live_states: dict | None = None,
     m = manifest_mod.load_manifest(job_dir)
     if m is None or not m.get('scheduler_job_id'):
         return m
+    assert_profile_binding(profile, job_dir, '刷新状态', manifest=m)
     states = live_states if live_states is not None else query_states(client, profile)
     jid = str(m['scheduler_job_id'])
     u = states.get(jid, GONE)
@@ -982,7 +1162,7 @@ def refresh_job(client, profile, job_dir: str, live_states: dict | None = None,
         manifest_mod.save_manifest(job_dir, m)
         return m
     if u == RUNNING:
-        _mark_observed_alive(m)
+        _mark_observed_alive(m, running=True)
         if m['state'] != 'RUNNING':
             manifest_mod.set_state(m, 'RUNNING')
         engine = _job_engine(m)
@@ -1016,7 +1196,7 @@ def refresh_job(client, profile, job_dir: str, live_states: dict | None = None,
     # → 抓到的却是**上一轮**留下的完整 OUTCAR(收敛/SCF 震荡串还在)→ 明明在排队,
     # 却被标成 DONE / 需续算 / sloshing。只对**续算过**的作业设防(唯有它们才可能有旧 OUTCAR),
     # 且要求"当前这一轮确有产出"才认终态:本轮在调度器现过身,或 OUTCAR 相对续算基线被重写过。
-    if _in_continue_settling(m, reason, outcar_mtime):
+    if _in_continue_settling(m, reason, outcar_mtime, outcar_size):
         manifest_mod.save_manifest(job_dir, m)
         return m
     m.setdefault('results', {}).pop('settling', None)  # 放行终态 → 清沉降态
@@ -1139,7 +1319,7 @@ def _refresh_neb_job(client, profile, job_dir: str, m: dict, u: str, reason):
         manifest_mod.save_manifest(job_dir, m)
         return m
     if u == RUNNING:
-        _mark_observed_alive(m)
+        _mark_observed_alive(m, running=True)
         if m['state'] != 'RUNNING':
             manifest_mod.set_state(m, 'RUNNING')
         # 活体进度:各 image 当前 E0(NEB 根无 OUTCAR,不查根收敛/SCF)
@@ -1417,7 +1597,9 @@ _VASP_FETCH_BY_TASK = {
 }
 _FETCH_EVIDENCE_KEYS = (
     'fetched', 'fetched_missing', 'missing', 'fetched_at', 'fetched_job_id',
-    'fetched_remote_dir', 'fetch_requested',
+    'fetched_remote_dir', 'fetch_requested', 'fetched_state',
+    'fetched_attempt_token', 'fetched_sha256', 'fetched_sizes',
+    'fetched_files', 'fetch_contract',
 )
 
 
@@ -1542,12 +1724,42 @@ def _atomic_sftp_get(sftp, remote_path: str, local_path: str) -> None:
         raise
 
 
-def fetch_results(client, sftp, job_dir: str, files=None, *, profile=None):
+def _file_sha256_size(path: str) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    with open(path, 'rb') as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(block)
+            size += len(block)
+    return digest.hexdigest(), size
+
+
+def _same_fetch_generation(before: dict, after: dict | None) -> bool:
+    """CAS predicate used after network I/O and immediately before evidence save."""
+    if not after:
+        return False
+    return (
+        str(after.get('state') or '') == str(before.get('state') or '')
+        and str(after.get('scheduler_job_id') or '')
+        == str(before.get('scheduler_job_id') or '')
+        and str(after.get('remote_dir') or '') == str(before.get('remote_dir') or '')
+        and current_attempt_token(after) == current_attempt_token(before)
+        and (after.get('cluster_binding') or None)
+        == (before.get('cluster_binding') or None)
+    )
+
+
+@_serialized_job_argument(2, '拉回结果')
+def fetch_results(client, sftp, job_dir: str, files=None, *, profile=None,
+                  preview: bool = False):
     """下载远程输出文件到本地作业目录。返回 (fetched, missing) 两个文件名列表。
 
     - 不覆盖输入语义:CONTCAR/OSZICAR/OUTCAR 与四件套不重名,直接落在 job_dir。
     - 单个文件缺失(如未跑出 CONTCAR)记入 missing,不中断其余下载。
-    - 下载记录绑定当前 scheduler_job_id；同目录续算时旧本地文件不能冒充本轮结果。
+    - 默认为最终回收，仅 DONE 可执行；``preview=True`` 是显式实时预览，
+      允许下载但绝不写 fetched_at/哈希等最终证据。
+    - 最终下载记录绑定 state/job/remote/attempt token，且在网络 I/O
+      后重读 job.yaml 做 CAS；同目录并发续算时绝不覆盖新作业清单。
     """
     m = manifest_mod.load_manifest(job_dir)
     if m is None:
@@ -1557,6 +1769,10 @@ def fetch_results(client, sftp, job_dir: str, files=None, *, profile=None):
     remote = m.get('remote_dir')
     if not remote:
         raise ValueError('该作业尚未提交过(manifest 无 remote_dir)')
+    if not preview and str(m.get('state') or '') != 'DONE':
+        raise ValueError(
+            f'最终结果只能在作业 DONE 后拉回；当前状态为 '
+            f'{m.get("state") or "未知"}。运行中查看请使用显式预览模式')
     if files is None:
         requested = list(fetch_files_for_manifest(m, job_dir=job_dir))
     else:
@@ -1577,6 +1793,36 @@ def fetch_results(client, sftp, job_dir: str, files=None, *, profile=None):
                 fetched.append(fname)
             except (IOError, OSError):
                 missing.append(fname)
+    if preview:
+        return fetched, missing
+
+    # The manifest may have been continued/re-submitted while SFTP was busy.
+    # Always update a freshly loaded copy and only when the exact generation is
+    # unchanged; the downloaded files then remain untrusted local artefacts and
+    # cannot unlock analysis because no final evidence is written.
+    latest = manifest_mod.load_manifest(job_dir)
+    if not _same_fetch_generation(m, latest):
+        raise RuntimeError(
+            '结果下载期间作业状态或提交代次已变化；已放弃写入最终下载证据，'
+            '请刷新状态后重新拉取')
+    file_evidence = {}
+    for name in fetched:
+        local_path = os.path.join(job_dir, *str(name).split('/'))
+        try:
+            digest, size = _file_sha256_size(local_path)
+        except OSError as exc:
+            raise RuntimeError(f'下载后无法校验文件 {name}:{exc}') from exc
+        file_evidence[str(name)] = {'sha256': digest, 'size': size}
+    # Hashing a very large vasprun/CHGCAR can take long enough for a restart to
+    # happen, so repeat the generation CAS immediately before the manifest
+    # update and use that newest copy instead of the pre-download snapshot.
+    newest = manifest_mod.load_manifest(job_dir)
+    if not _same_fetch_generation(m, newest):
+        raise RuntimeError(
+            '结果校验期间作业状态或提交代次已变化；已放弃写入最终下载证据，'
+            '请刷新状态后重新拉取')
+    m = newest
+    attempt_token = current_attempt_token(m)
     res = m.setdefault('results', {})
     # ``missing`` 是旧版本曾用过的别名；本轮统一写 ``fetched_missing``，并清掉旧值，
     # 避免界面把上一轮缺失列表与当前下载结果混在一起。
@@ -1587,6 +1833,24 @@ def fetch_results(client, sftp, job_dir: str, files=None, *, profile=None):
     res['fetched_job_id'] = str(m.get('scheduler_job_id') or '')
     res['fetched_remote_dir'] = str(remote)
     res['fetch_requested'] = requested
+    res['fetched_state'] = 'DONE'
+    res['fetched_attempt_token'] = attempt_token
+    res['fetched_files'] = file_evidence
+    res['fetched_sha256'] = {
+        name: evidence['sha256'] for name, evidence in file_evidence.items()
+    }
+    res['fetched_sizes'] = {
+        name: evidence['size'] for name, evidence in file_evidence.items()
+    }
+    res['fetch_contract'] = {
+        'schema': 1,
+        'mode': 'final',
+        'state': 'DONE',
+        'scheduler_job_id': str(m.get('scheduler_job_id') or ''),
+        'remote_dir': str(remote),
+        'attempt_token': attempt_token,
+        'requested': requested,
+    }
     manifest_mod.save_manifest(job_dir, m)
     return fetched, missing
 
@@ -1645,6 +1909,67 @@ def _restart_cleanup_command(m: dict, job_dir: str | None = None) -> str:
             else 'rm -f WAVECAR CHGCAR')
 
 
+def _restart_archive_command(round_number: int, *,
+                             backup_inputs: tuple[str, ...] = (),
+                             promote_contcar: bool = False) -> tuple[str, str]:
+    """Atomically remove prior-round outputs from the live remote directory.
+
+    The files remain available under ``.vcstudio_history`` for audit, but can
+    no longer masquerade as evidence from the newly submitted scheduler job.
+    """
+    archive = f'.vcstudio_history/round_{int(round_number):02d}'
+    names = ('OUTCAR', 'OSZICAR', 'vasprun.xml', 'CONTCAR', 'XDATCAR')
+    moves = ' '.join(shlex.quote(name) for name in names)
+    quoted_archive = shlex.quote(archive)
+    commands = [f'mkdir -p {quoted_archive}']
+    for name in backup_inputs:
+        quoted_name = shlex.quote(name)
+        previous = shlex.quote(posixpath.join(archive, f'.vcstudio_previous_{name}'))
+        missing = shlex.quote(posixpath.join(archive, f'.vcstudio_missing_{name}'))
+        commands.append(
+            f'if [ -e {quoted_name} ]; then cp -p {quoted_name} {previous}; '
+            f'else : > {missing}; fi')
+    if promote_contcar:
+        # Must happen before CONTCAR is moved into the round archive.
+        commands.append('cp CONTCAR POSCAR')
+    commands.append(
+        f'for f in {moves}; do '
+        f'if [ -e "$f" ]; then mv "$f" {quoted_archive}/; fi; done')
+    command = ' && '.join(commands)
+    return command, archive
+
+
+def _restart_restore_command(archive: str, *,
+                             restore_inputs: tuple[str, ...] = ()) -> str:
+    """Restore archived outputs and input snapshots after submission failure."""
+    quoted = shlex.quote(archive)
+    names = ('OUTCAR', 'OSZICAR', 'vasprun.xml', 'CONTCAR', 'XDATCAR')
+    commands = [f'if [ -d {quoted} ]; then']
+    for name in names:
+        archived = shlex.quote(posixpath.join(archive, name))
+        commands.append(f'if [ -e {archived} ]; then mv -f {archived} .; fi;')
+    for name in restore_inputs:
+        quoted_name = shlex.quote(name)
+        previous = shlex.quote(posixpath.join(archive, f'.vcstudio_previous_{name}'))
+        missing = shlex.quote(posixpath.join(archive, f'.vcstudio_missing_{name}'))
+        commands.append(
+            f'if [ -e {previous} ]; then mv -f {previous} {quoted_name}; '
+            f'elif [ -e {missing} ]; then rm -f {quoted_name} {missing}; fi;')
+    commands.append(f'rmdir {quoted} 2>/dev/null || true; fi')
+    return ' '.join(commands)
+
+
+def _restore_local_restart_file(path: str, round_number: int,
+                                existed_before: bool) -> None:
+    """Restore a locally mutated restart input while retaining its audit backup."""
+    backup = f'{path}.bak{round_number}'
+    if existed_before and os.path.isfile(backup):
+        shutil.copyfile(backup, path)
+    elif not existed_before and os.path.exists(path):
+        os.remove(path)
+
+
+@_serialized_job_argument(2, '续算')
 def continue_from_contcar(client, profile, job_dir: str,
                           max_rounds: int = CONTINUE_MAX_ROUNDS) -> dict:
     """把一个可续算作业从 CONTCAR 接着跑(cp CONTCAR POSCAR + 冻结 INCAR 重投同一脚本)。
@@ -1706,21 +2031,38 @@ def continue_from_contcar(client, profile, job_dir: str,
 
     # 本地也留证:备份旧 POSCAR,用 CONTCAR 覆盖(保持本地目录与远端一致)
     local_poscar = os.path.join(job_dir, 'POSCAR')
-    if os.path.isfile(local_poscar):
+    local_poscar_existed = os.path.isfile(local_poscar)
+    if local_poscar_existed:
         shutil.copyfile(local_poscar, f'{local_poscar}.bak{rounds + 1}')
     with open(local_poscar, 'w', encoding='utf-8', newline='') as f:
         f.write(contcar)
 
     # 远端:CONTCAR→POSCAR + 清混合历史,再重投同一脚本(INCAR 不动)
     cleanup = _restart_cleanup_command(m, job_dir)
-    run_cmd(client, f'cd {shlex.quote(remote)} && cp CONTCAR POSCAR && {cleanup}',
-            check=True)
+    archive_command, archive_dir = _restart_archive_command(
+        rounds + 1, backup_inputs=('POSCAR',), promote_contcar=True)
+    run_cmd(
+        client,
+        f'cd {shlex.quote(remote)} && {archive_command} && {cleanup}',
+        check=True)
     dialect = get_dialect(profile.scheduler)
     out, err = run_cmd(client, dialect.submit_cmd(
         posixpath.join(remote, SCRIPT_NAME), getattr(profile, 'scheduler_bin', '')))
     job_id = dialect.parse_job_id(out)
     if not job_id:
-        raise RuntimeError(f'续算重投失败,{dialect.name} 返回:{(out or err).strip()[:300]}')
+        rollback_error = ''
+        try:
+            run_cmd(
+                client,
+                f'cd {shlex.quote(remote)} && '
+                f'{_restart_restore_command(archive_dir, restore_inputs=("POSCAR",))}',
+                check=True)
+        except Exception as exc:                         # noqa: BLE001 保留原始提交错误
+            rollback_error = f'；且旧输出归档回滚失败:{exc}'
+        _restore_local_restart_file(local_poscar, rounds + 1, local_poscar_existed)
+        raise RuntimeError(
+            f'续算重投失败,{dialect.name} 返回:{(out or err).strip()[:300]}'
+            f'{rollback_error}')
 
     prev = m.get('scheduler_job_id')
     m['scheduler_job_id'] = job_id
@@ -1728,7 +2070,13 @@ def continue_from_contcar(client, profile, job_dir: str,
     # 消费掉上一轮的终态诊断:新作业尚未诊断,restartable=True 不能被下一次误用
     m.setdefault('results', {}).pop('diagnosis', None)
     m.setdefault('results', {})['continue_rounds'] = rounds + 1
-    _set_continue_baseline(m, _base_outcar_mtime)  # 沉降护栏基线:防新作业未启动前误读旧 OUTCAR
+    _set_continue_baseline(
+        m, _base_outcar_mtime, outputs_archived=True)
+    m.setdefault('results', {})['continue_archive'] = {
+        'remote_dir': posixpath.join(remote, archive_dir),
+        'round': rounds + 1,
+        'files': ['OUTCAR', 'OSZICAR', 'vasprun.xml', 'CONTCAR', 'XDATCAR'],
+    }
     m.setdefault('attempts', []).append({
         'n': len(m.get('attempts') or []) + 1,
         'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
@@ -1755,6 +2103,7 @@ INCAR_TUNE_WHITELIST = frozenset({
 _TUNE_BANNER = '# --- vcstudio 改参续算 第{round}轮 {at} ---'
 
 
+@_serialized_job_argument(3, '改参续算')
 def continue_with_incar_changes(client, sftp, profile, job_dir: str,
                                 changes: dict,
                                 max_rounds: int = CONTINUE_MAX_ROUNDS,
@@ -1799,7 +2148,8 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
 
     # 1) 本地 INCAR:备份 + 追加覆盖块(原文保留)
     local_incar = os.path.join(job_dir, 'INCAR')
-    if not os.path.isfile(local_incar):
+    local_incar_existed = os.path.isfile(local_incar)
+    if not local_incar_existed:
         raise ValueError('本地作业目录缺 INCAR')
     with open(local_incar, 'r', encoding='utf-8', errors='replace') as f:
         incar_text = f.read()
@@ -1812,36 +2162,63 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
         f.write(new_text)
 
     # 2) 可选 CONTCAR 续结构(结构没跑几步/硬崩时也允许保持原 POSCAR 重跑)
+    local_poscar = os.path.join(job_dir, 'POSCAR')
+    local_poscar_existed = os.path.isfile(local_poscar)
+    promoted_contcar = False
     if restart_from_contcar:
         contcar = _read_remote_text(client, posixpath.join(remote, 'CONTCAR'))
         if diagnose.valid_poscar(contcar):
-            local_poscar = os.path.join(job_dir, 'POSCAR')
-            if os.path.isfile(local_poscar):
+            promoted_contcar = True
+            if local_poscar_existed:
                 shutil.copyfile(local_poscar, f'{local_poscar}.bak{rounds + 1}')
             with open(local_poscar, 'w', encoding='utf-8', newline='') as f:
                 f.write(contcar)
-            run_cmd(client, f'cd {shlex.quote(remote)} && cp CONTCAR POSCAR', check=True)
 
     # 续算沉降基线:重投前记下上一轮 OUTCAR 的 mtime(此刻新作业尚未启动,仍是旧文件)
     _o0, _z0, _base_outcar_mtime = _stat_outcar_full(client, remote)
 
-    # 3) 上传新 INCAR + 清混合历史,重投同一脚本
+    # 3) 上传新 INCAR，归档旧轮终态输出 + 清混合历史，重投同一脚本
+    archive_command, archive_dir = _restart_archive_command(
+        rounds + 1, backup_inputs=('INCAR', 'POSCAR'),
+        promote_contcar=promoted_contcar)
+    run_cmd(
+        client,
+        f'cd {shlex.quote(remote)} && {archive_command} && '
+        f'{_restart_cleanup_command(m, job_dir)}',
+        check=True)
     sftp.put(local_incar, posixpath.join(remote, 'INCAR'))
-    run_cmd(client, f'cd {shlex.quote(remote)} && {_restart_cleanup_command(m, job_dir)}',
-            check=True)
     dialect = get_dialect(profile.scheduler)
     out, err = run_cmd(client, dialect.submit_cmd(
         posixpath.join(remote, SCRIPT_NAME), getattr(profile, 'scheduler_bin', '')))
     job_id = dialect.parse_job_id(out)
     if not job_id:
-        raise RuntimeError(f'改参重投失败,{dialect.name} 返回:{(out or err).strip()[:300]}')
+        rollback_error = ''
+        try:
+            run_cmd(
+                client,
+                f'cd {shlex.quote(remote)} && '
+                f'{_restart_restore_command(archive_dir, restore_inputs=("INCAR", "POSCAR"))}',
+                check=True)
+        except Exception as exc:                         # noqa: BLE001 保留原始提交错误
+            rollback_error = f'；且远端输入/输出回滚失败:{exc}'
+        _restore_local_restart_file(local_incar, rounds + 1, local_incar_existed)
+        _restore_local_restart_file(local_poscar, rounds + 1, local_poscar_existed)
+        raise RuntimeError(
+            f'改参重投失败,{dialect.name} 返回:{(out or err).strip()[:300]}'
+            f'{rollback_error}')
 
     prev = m.get('scheduler_job_id')
     m['scheduler_job_id'] = job_id
     _clear_fetch_evidence(m)
     m.setdefault('results', {}).pop('diagnosis', None)
     m.setdefault('results', {})['continue_rounds'] = rounds + 1
-    _set_continue_baseline(m, _base_outcar_mtime)  # 沉降护栏基线:防新作业未启动前误读旧 OUTCAR
+    _set_continue_baseline(
+        m, _base_outcar_mtime, outputs_archived=True)
+    m.setdefault('results', {})['continue_archive'] = {
+        'remote_dir': posixpath.join(remote, archive_dir),
+        'round': rounds + 1,
+        'files': ['OUTCAR', 'OSZICAR', 'vasprun.xml', 'CONTCAR', 'XDATCAR'],
+    }
     m.setdefault('attempts', []).append({
         'n': len(m.get('attempts') or []) + 1,
         'at': at,

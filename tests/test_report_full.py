@@ -5,6 +5,13 @@ from vcstudio.project import report_full
 from vcstudio.shared import manifest as mm
 
 
+def _write_done_files(job_dir, energy):
+    (job_dir / 'OSZICAR').write_text(
+        f' 1 F= {energy:.12f} E0= {energy:.12f} d E =0\n', encoding='utf-8')
+    (job_dir / 'OUTCAR').write_text(
+        'General timing and accounting information for this job\n', encoding='utf-8')
+
+
 def _proj(tmp_path, n_done=2):
     dirs = []
     for i in range(n_done):
@@ -15,6 +22,7 @@ def _proj(tmp_path, n_done=2):
         mm.set_state(m, 'DONE')
         m['results'] = {'energy_e0_eV': -100.0 - i}
         mm.save_manifest(d, m)
+        _write_done_files(d, -100.0 - i)
         (d / 'INCAR').write_text('ENCUT = 500\nEDIFF = 1E-5\n', encoding='utf-8')
         dirs.append(str(d))
     slab = tmp_path / 'slab'
@@ -24,6 +32,7 @@ def _proj(tmp_path, n_done=2):
     mm.set_state(ms, 'DONE')
     ms['results'] = {'energy_e0_eV': -90.0}
     mm.save_manifest(slab, ms)
+    _write_done_files(slab, -90.0)
     return {'name': 'proj1', 'root': str(tmp_path),
             'members': {'clean_slab': str(slab), 'gas_ref': None, 'configs': dirs}}
 
@@ -113,6 +122,7 @@ def _proj_repro(tmp_path):
             m['attempts'] = [{'n': 1, 'result': 'submitted'},
                              {'n': 2, 'result': 'continued'}]
         mm.save_manifest(d, m)
+        _write_done_files(d, -100.0 - i)
         (d / 'INCAR').write_text('ENCUT = 450\nEDIFF = 1E-5\n', encoding='utf-8')
         dirs.append(str(d))
     slab = tmp_path / 'slab'
@@ -123,6 +133,7 @@ def _proj_repro(tmp_path):
     mm.set_state(ms, 'DONE')
     ms['results'] = {'energy_e0_eV': -90.0}
     mm.save_manifest(slab, ms)
+    _write_done_files(slab, -90.0)
     return {'name': 'reproj', 'root': str(tmp_path),
             'members': {'clean_slab': str(slab), 'gas_ref': None, 'configs': dirs}}
 
@@ -261,6 +272,7 @@ def test_species_reference_report_contains_energy_source_provenance_and_formula(
         energy_e0_eV=-38.072771, energy_source='OSZICAR:E0',
         import_confirmation={'manual': False})
     mm.save_manifest(ref_job, ref)
+    _write_done_files(ref_job, -38.072771)
     project['config_species'] = {config: 'Li2S8'}
     project['species_refs'] = {'Li2S8': -38.072771}
     project['species_ref_jobs'] = {'Li2S8': str(ref_job)}
@@ -290,6 +302,7 @@ def test_species_reference_report_uses_manifest_truth_and_blocks_cache_drift(tmp
     mm.set_state(ref, 'DONE')
     ref['results'].update(energy_e0_eV=-38.072771, energy_source='OSZICAR:E0')
     mm.save_manifest(ref_job, ref)
+    _write_done_files(ref_job, -38.072771)
     project['config_species'] = {config: 'Li2S8'}
     project['species_refs'] = {'Li2S8': -38.0}  # stale project.yaml cache
     project['species_ref_jobs'] = {'Li2S8': str(ref_job)}

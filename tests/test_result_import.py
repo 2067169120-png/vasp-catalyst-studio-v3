@@ -125,6 +125,15 @@ def _make_quartet(folder: Path, *, incar='ENCUT=500\nNSW=0\nIBRION=-1\n',
     return folder
 
 
+def _adsorption_poscar(elements, counts):
+    return (
+        'adsorption structure\n1.0\n10 0 0\n0 10 0\n0 0 20\n'
+        + ' '.join(elements) + '\n'
+        + ' '.join(str(value) for value in counts) + '\nDirect\n'
+        + '0 0 0\n' * sum(counts)
+    )
+
+
 def _candidate(root: Path):
     result = ri.scan_folder(root)
     assert result['summary']['total'] == 1
@@ -160,6 +169,125 @@ def test_real_style_relax_is_done_with_structured_evidence(tmp_path):
     assert ev['cross_file_energy']['consistent']
     assert ev['cross_file_energy']['spread_eV'] < 1e-6
     assert c['diagnosis']['code'] == 'converged_multi_evidence'
+
+
+def test_scan_groups_generic_adsorption_results_by_poscar_difference(tmp_path):
+    source = tmp_path / 'generic-results'
+    clean = _make_result(source / '000')
+    top = _make_result(source / '001')
+    bridge = _make_result(source / '002')
+    (clean / 'CONTCAR').write_text(
+        _adsorption_poscar(['C'], [24]), encoding='utf-8')
+    for folder in (top, bridge):
+        (folder / 'CONTCAR').write_text(
+            _adsorption_poscar(['C', 'Li', 'S'], [24, 2, 8]), encoding='utf-8')
+
+    result = ri.scan_folder(source)
+    by_name = {row['name']: row for row in result['candidates']}
+
+    assert by_name['000']['suggested_role'] == 'clean_slab'
+    assert by_name['000']['role_confidence'] == 'exact'
+    for name in ('001', '002'):
+        assert by_name[name]['suggested_role'] == 'config'
+        assert by_name[name]['species'] == 'Li2S8'
+        assert by_name[name]['species_source'] == 'poscar_minus_clean_slab'
+        assert by_name[name]['mapping_requires_confirmation'] is False
+    group = next(group for group in result['species_groups'] if group['role'] == 'config')
+    assert group['species'] == 'Li2S8' and group['count'] == 2
+
+
+def test_two_generic_results_do_not_invent_a_clean_slab(tmp_path):
+    source = tmp_path / 'two-results'
+    subset = _make_result(source / '000')
+    superset = _make_result(source / '001')
+    (subset / 'CONTCAR').write_text(
+        _adsorption_poscar(['C'], [24]), encoding='utf-8')
+    (superset / 'CONTCAR').write_text(
+        _adsorption_poscar(['C', 'Li', 'S'], [24, 2, 8]), encoding='utf-8')
+
+    result = ri.scan_folder(source)
+
+    assert result['clean_inference']['path'] == ''
+    assert result['clean_inference']['confidence'] == 'insufficient'
+    assert not any(row['suggested_role'] == 'clean_slab'
+                   for row in result['candidates'])
+
+
+def test_commit_rechecks_config_species_and_persists_dataset_groups(tmp_path):
+    source = tmp_path / 'source'
+    clean = _make_result(source / '000')
+    config = _make_result(source / '001')
+    (clean / 'CONTCAR').write_text(
+        _adsorption_poscar(['C'], [24]), encoding='utf-8')
+    (config / 'CONTCAR').write_text(
+        _adsorption_poscar(['C', 'Li', 'S'], [24, 2, 8]), encoding='utf-8')
+    scan = ri.scan_folder(source)
+    by_name = {row['name']: row for row in scan['candidates']}
+    ads, ledger, *_ = _fake_services()
+
+    result = ri.commit_import(
+        source, tmp_path / 'managed', 'grouped',
+        [
+            {'path': by_name['001']['path'], 'role': 'config',
+             'mapping_confirmed': True},
+            {'path': by_name['000']['path'], 'role': 'clean_slab',
+             'mapping_confirmed': True},
+        ], adsorption_mod=ads, ledger_mod=ledger, manifest_mod=manifest)
+
+    project = result['project']
+    config_path = project['members']['configs'][0]
+    assert project['config_species'][config_path] == 'Li2S8'
+    assert project['config_species_evidence'][config_path]['status'] == 'exact'
+    assert project['dataset_groups'] == [{
+        'group_id': 'composition:Li:2|S:8', 'species': 'Li2S8',
+        'configs': [config_path], 'n_configs': 1, 'reference_job': None,
+    }]
+
+
+def test_commit_rejects_folder_or_user_species_against_poscar_difference(tmp_path):
+    source = tmp_path / 'source'
+    clean = _make_result(source / 'clean')
+    config = _make_result(source / 'wrong_Li2S6_config')
+    (clean / 'CONTCAR').write_text(
+        _adsorption_poscar(['C'], [24]), encoding='utf-8')
+    (config / 'CONTCAR').write_text(
+        _adsorption_poscar(['C', 'Li', 'S'], [24, 2, 8]), encoding='utf-8')
+    scan = ri.scan_folder(source)
+    by_name = {row['name']: row for row in scan['candidates']}
+    ads, ledger, *_ = _fake_services()
+
+    with pytest.raises(ValueError, match='实际组成为 Li2S8'):
+        ri.commit_import(
+            source, tmp_path / 'managed', 'bad-group',
+            [
+                {'path': by_name['clean']['path'], 'role': 'clean_slab'},
+                {'path': by_name['wrong_Li2S6_config']['path'],
+                 'role': 'config', 'species': 'Li2S6',
+                 'mapping_confirmed': True},
+            ], adsorption_mod=ads, ledger_mod=ledger, manifest_mod=manifest)
+
+
+def test_changed_or_uncertain_mapping_requires_explicit_confirmation(tmp_path):
+    source = tmp_path / 'source'
+    _make_result(source / 'mystery')
+    candidate = _candidate(source)
+    ads, ledger, *_ = _fake_services()
+
+    with pytest.raises(ValueError, match='映射需要明确确认'):
+        ri.commit_import(
+            source, tmp_path / 'managed', 'unconfirmed-mapping',
+            [{'path': candidate['path'], 'role': 'config', 'species': 'Li2S8'}],
+            adsorption_mod=ads, ledger_mod=ledger, manifest_mod=manifest)
+
+    committed = ri.commit_import(
+        source, tmp_path / 'managed', 'confirmed-mapping',
+        [{'path': candidate['path'], 'role': 'config', 'species': 'Li2S8',
+          'mapping_confirmed': True}],
+        adsorption_mod=ads, ledger_mod=ledger, manifest_mod=manifest)
+    imported = manifest.load_manifest(committed['imported'][0]['path'])
+    confirmation = imported['inputs']['mapping_confirmation']
+    assert confirmation['required'] is True and confirmation['confirmed'] is True
+    assert confirmation['reasons']
 
 
 def test_vasprun_zero_e0_does_not_hide_valid_energy(tmp_path):
@@ -348,7 +476,8 @@ def test_ambiguous_energy_can_be_manually_confirmed_with_audit(tmp_path):
     result = ri.commit_import(
         source, tmp_path / 'managed', '人工核对项目',
         [{'path': c['path'], 'role': 'config', 'manual_confirm': True,
-          'confirmation_reason': '已对照原始作业日志和末结构', 'task_type': 'relax'}],
+          'confirmation_reason': '已对照原始作业日志和末结构', 'task_type': 'relax',
+          'mapping_confirmed': True}],
         adsorption_mod=ads, ledger_mod=ledger, manifest_mod=manifest)
     assert result['summary']['manual_confirmed'] == 1
     imported = Path(result['imported'][0]['path'])
@@ -369,7 +498,8 @@ def test_manual_confirmation_cannot_override_nelm(tmp_path):
     with pytest.raises(ValueError, match='不能人工确认为 DONE'):
         ri.commit_import(
             source, tmp_path / 'managed', 'bad-project',
-            [{'path': c['path'], 'role': 'config', 'manual_confirm': True}],
+            [{'path': c['path'], 'role': 'config', 'manual_confirm': True,
+              'mapping_confirmed': True}],
             adsorption_mod=ads, ledger_mod=ledger, manifest_mod=manifest)
     assert not (tmp_path / 'managed' / 'bad-project').exists()
 
@@ -384,7 +514,7 @@ def test_manual_confirmation_requires_an_audit_reason(tmp_path):
         ri.commit_import(
             source, tmp_path / 'managed', 'missing-reason',
             [{'path': c['path'], 'role': 'config', 'manual_confirm': True,
-              'task_type': 'relax'}],
+              'task_type': 'relax', 'mapping_confirmed': True}],
             adsorption_mod=ads, ledger_mod=ledger, manifest_mod=manifest)
 
 
@@ -431,7 +561,8 @@ def test_relax_task_override_cannot_bypass_ionic_convergence(tmp_path):
         ri.commit_import(
             source, tmp_path / 'managed', 'no-bypass',
             [{'path': candidate['path'], 'role': 'molecule_ref',
-              'species': 'Li2S8', 'task_type': 'static'}],
+              'species': 'Li2S8', 'task_type': 'static',
+              'mapping_confirmed': True}],
             adsorption_mod=ads, ledger_mod=ledger, manifest_mod=manifest)
 
 
@@ -514,7 +645,27 @@ def test_molecule_reference_species_must_match_structure_composition(tmp_path):
     with pytest.raises(ValueError, match='结构组成 Li2S8 不一致'):
         ri.commit_import(
             source, tmp_path / 'managed', 'bad-label',
-            [{'path': candidate['path'], 'role': 'molecule_ref', 'species': 'Li2S6'}],
+            [{'path': candidate['path'], 'role': 'molecule_ref', 'species': 'Li2S6',
+              'mapping_confirmed': True}],
+            adsorption_mod=ads, ledger_mod=ledger, manifest_mod=manifest)
+
+
+def test_backend_rejects_reference_aliases_with_the_same_composition(tmp_path):
+    source = tmp_path / 'source'
+    _make_result(source / 'mol_Li2S8')
+    _make_result(source / 'mol_S8Li2')
+    candidates = {row['name']: row for row in ri.scan_folder(source)['candidates']}
+    ads, ledger, *_ = _fake_services()
+
+    with pytest.raises(ValueError, match='相同原子组成'):
+        ri.commit_import(
+            source, tmp_path / 'managed', 'duplicate-composition',
+            [
+                {'path': candidates['mol_Li2S8']['path'],
+                 'role': 'molecule_ref', 'species': 'Li2S8'},
+                {'path': candidates['mol_S8Li2']['path'],
+                 'role': 'molecule_ref', 'species': 'S8Li2'},
+            ],
             adsorption_mod=ads, ledger_mod=ledger, manifest_mod=manifest)
 
 
@@ -615,6 +766,27 @@ def test_input_only_quartet_imports_as_created_without_fake_result_energy(tmp_pa
     assert result['project']['species_refs']['Li2S8'] is None
     assert result['summary']['created'] == 1 and result['summary']['needs_human'] == 0
     assert jobs == [str(imported)] and folder.is_dir()
+
+
+def test_input_only_quartet_prefers_poscar_over_stale_contcar(tmp_path):
+    source = tmp_path / 'source'
+    folder = _make_quartet(source / 'mol_Li2S8')
+    (folder / 'CONTCAR').write_text(
+        _CONTCAR.replace('\n2 8\n', '\n2 6\n', 1), encoding='utf-8')
+
+    candidate = _candidate(source)
+
+    assert candidate['source_has_output'] is False
+    assert candidate['structure']['source_file'] == 'POSCAR'
+    assert candidate['structure']['composition'] == {'Li': 2, 'S': 8}
+    assert candidate['species'] == 'Li2S8'
+
+    ads, ledger, *_ = _fake_services()
+    committed = ri.commit_import(
+        source, tmp_path / 'managed', 'fresh-input-wins',
+        [{'path': candidate['path'], 'role': 'molecule_ref', 'species': 'Li2S8'}],
+        adsorption_mod=ads, ledger_mod=ledger, manifest_mod=manifest)
+    assert committed['project']['species_ref_jobs']['Li2S8']
 
 
 def test_commit_rejects_source_changed_after_reviewed_scan(tmp_path):

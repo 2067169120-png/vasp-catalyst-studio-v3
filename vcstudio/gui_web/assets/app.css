@@ -575,19 +575,22 @@ nav a.on .stepno{background:var(--accent);border-color:var(--accent);color:#fff}
 .lis-config-actions{flex-wrap:wrap}.lis-config-actions .sub{margin-left:auto}
 .lis-config-batch{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0}.lis-config-batch .ipt{width:auto;min-width:190px}.lis-config-batch label{font-size:11px;color:var(--muted)}
 .lis-config-field .pj-cfglist{max-height:min(55vh,560px);overflow:auto;padding-right:3px}
+.lis-species-group{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:9px 0 5px;padding:7px 9px;border:1px solid var(--rule);border-radius:7px;background:var(--panel-2);font:11px/1.35 var(--sans)}
 .lis-scan-status{margin-top:7px;padding:7px 9px;border-radius:6px;background:var(--th-bg);color:var(--muted);font-size:11px;line-height:1.5}.lis-scan-status.ok{background:var(--ok-bg);color:var(--ok)}.lis-scan-status.bad{background:var(--fail-bg);color:var(--fail)}
 .lis-cfgrow{display:grid!important;grid-template-columns:minmax(190px,1fr) minmax(135px,.45fr) auto auto!important;gap:10px!important;padding:8px 9px!important}
+.lis-cfgrow.pending{border-color:color-mix(in srgb,var(--warn) 55%,var(--rule));background:var(--warn-bg)!important}
 .lis-cfgrow.invalid{border-color:color-mix(in srgb,var(--fail) 55%,var(--rule));background:var(--fail-bg)!important}
 .lis-cfgpath{min-width:0}.lis-cfgpath .path,.lis-cfgpath .sub{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .lis-cfgpath .sub{margin-top:2px}.lis-cfgrow label{font:10.5px/1.3 var(--sans);color:var(--muted)}
 .lis-cfgrow .lis-species{margin-top:3px;padding:5px 7px;font:11.5px/1.3 var(--mono)}
-.lis-species-check{align-self:center;font:10.5px/1.35 var(--sans);color:var(--ok);white-space:nowrap}.lis-cfgrow.invalid .lis-species-check{color:var(--fail)}
+.lis-species-check{align-self:center;font:10.5px/1.35 var(--sans);color:var(--ok);white-space:nowrap}.lis-cfgrow.pending .lis-species-check{color:var(--warn)}.lis-cfgrow.invalid .lis-species-check{color:var(--fail)}
 .lis-cfgrow > .btn{align-self:center}.lis-resource-grid{display:grid;grid-template-columns:minmax(190px,1fr) 115px 150px auto;gap:9px;align-items:end}
 .lis-resource-grid label{display:flex;flex-direction:column;gap:4px;color:var(--muted);font-size:11px}
 .lis-resource-summary{margin-top:7px;color:var(--muted);font-size:11px;line-height:1.5}
 .lis-resource-grid .btn{margin-bottom:1px}.lis-automation-note{margin:11px 10px 0;padding:9px 11px;border:1px solid color-mix(in srgb,var(--warn) 35%,var(--rule));border-radius:7px;background:var(--warn-bg);color:var(--warn);font-size:11.5px;line-height:1.55}
 .lis-method-check{margin:9px 10px 0;padding:10px 11px;border:1px solid color-mix(in srgb,var(--warn) 45%,var(--rule));border-radius:7px;background:var(--warn-bg);color:var(--warn);font-size:11.5px}.lis-method-check.bad{border-color:color-mix(in srgb,var(--fail) 50%,var(--rule));background:var(--fail-bg);color:var(--fail)}
 .lis-method-title{font-weight:700;margin-bottom:4px}.lis-method-check ul{margin:3px 0 7px 18px;line-height:1.55}.lis-method-confirm{display:flex;gap:7px;align-items:flex-start;font-weight:600;cursor:pointer}.lis-method-reason-label{display:flex;flex-direction:column;gap:4px;margin-top:8px}.lis-method-reason-label textarea{resize:vertical;background:var(--surface)}
+.pj-import-group-row td{padding:8px 10px!important;background:var(--panel-2);border-top:1px solid var(--rule);border-bottom:1px solid var(--rule)}.pj-import-group-row td{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:11px}.pj-import-mapping{display:block;margin-top:5px;font:10px/1.35 var(--sans);color:var(--ok)}.pj-import-mapping.pending{color:var(--warn)}
 .lis-readiness{margin:9px 10px 0;padding:8px 10px;border-radius:6px;background:var(--th-bg);color:var(--muted);font-size:11.5px}.lis-readiness.ready{background:var(--ok-bg);color:var(--ok);font-weight:700}
 .lis-actions{align-items:center;margin:10px 10px 4px!important}.lis-actions #pj-submit-all{font-size:12.5px;padding:9px 15px}
 .lis-submit-result{margin:11px 10px 4px;border:1px solid var(--rule);border-radius:7px;overflow:hidden}.lis-result-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 12px;background:var(--fail-bg);color:var(--fail)}

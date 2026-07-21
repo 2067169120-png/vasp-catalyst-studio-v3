@@ -28,6 +28,7 @@ from vcstudio.cluster import diagnose
 from vcstudio.generate import methods_text
 from vcstudio.generate.incar_builder import parse_incar
 from vcstudio.generate.poscar import parse_poscar_species, read_cell_vectors
+from vcstudio.project import structure_identity
 
 
 _RESULT_NAMES = ('OUTCAR', 'OSZICAR', 'vasprun.xml', 'CONTCAR')
@@ -80,12 +81,7 @@ _FATAL_RE = re.compile(
 )
 _VASP_START_RE = re.compile(r'^\s*vasp\.\d', re.I | re.M)
 _FORMULA_RE = re.compile(r'(?:[A-Z][a-z]?\d*){1,12}')
-_ELEMENTS = frozenset(
-    'H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn '
-    'Ga Ge As Se Br Kr Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba La '
-    'Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi Po '
-    'At Rn Fr Ra Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm Md No Lr Rf Db Sg Bh Hs Mt Ds Rg '
-    'Cn Nh Fl Mc Lv Ts Og'.split())
+_ELEMENTS = structure_identity.ELEMENTS
 _MAX_OUTCAR_HEAD = 4 * 1024 * 1024
 _MAX_OUTCAR_TAIL = 16 * 1024 * 1024
 _MAX_OSZICAR_TAIL = 8 * 1024 * 1024
@@ -701,16 +697,25 @@ def _infer_task_type(parameters: dict) -> str:
     return 'relax'
 
 
-def _species_from(folder: Path, files: dict[str, Path]) -> str | None:
-    names = [folder.name]
-    for key in ('CONTCAR', 'POSCAR'):
+def _structure_file_order(*, prefer_final: bool) -> tuple[str, str]:
+    """Use final geometry for results and requested geometry for new inputs."""
+    return ('CONTCAR', 'POSCAR') if prefer_final else ('POSCAR', 'CONTCAR')
+
+
+def _species_evidence_from(folder: Path, files: dict[str, Path], *,
+                           prefer_final=True) -> dict:
+    names = [('folder_name', folder.name)]
+    for key in _structure_file_order(prefer_final=prefer_final):
         p = files.get(key)
         if p:
             try:
-                names.append(p.read_text(encoding='utf-8', errors='replace').splitlines()[0])
+                names.append((
+                    'structure_title',
+                    p.read_text(encoding='utf-8', errors='replace').splitlines()[0],
+                ))
             except (OSError, IndexError):
                 pass
-    for name in names:
+    for source, name in names:
         valid = []
         for hit in _FORMULA_RE.findall(name):
             parts = re.findall(r'([A-Z][a-z]?)(\d*)', hit)
@@ -718,10 +723,11 @@ def _species_from(folder: Path, files: dict[str, Path]) -> str | None:
                     and all(el in _ELEMENTS for el, _count in parts):
                 valid.append(hit)
         if valid:
-            return max(valid, key=len)
+            return {'species': max(valid, key=len), 'source': source,
+                    'confidence': 'hint'}
     # Molecule folders often have a generic title.  As a last resort, build a
     # formula from a VASP5 species/count header (useful for Li2Sx libraries).
-    for key in ('CONTCAR', 'POSCAR'):
+    for key in _structure_file_order(prefer_final=prefer_final):
         p = files.get(key)
         if not p:
             continue
@@ -732,9 +738,17 @@ def _species_from(folder: Path, files: dict[str, Path]) -> str | None:
         except (OSError, IndexError, ValueError):
             continue
         if elements and len(elements) == len(counts) and all(el in _ELEMENTS for el in elements):
-            return ''.join(el + (str(n) if n != 1 else '')
-                           for el, n in zip(elements, counts))
-    return None
+            return {
+                'species': ''.join(el + (str(n) if n != 1 else '')
+                                   for el, n in zip(elements, counts)),
+                'source': 'structure_composition', 'confidence': 'structure_total',
+            }
+    return {'species': None, 'source': 'unresolved', 'confidence': 'unknown'}
+
+
+def _species_from(folder: Path, files: dict[str, Path]) -> str | None:
+    """Backward-compatible scalar wrapper around structured species evidence."""
+    return _species_evidence_from(folder, files)['species']
 
 
 def _formula_composition(formula: str) -> dict[str, int] | None:
@@ -749,9 +763,9 @@ def _formula_composition(formula: str) -> dict[str, int] | None:
     return composition
 
 
-def _structure_composition(files: dict[str, Path]) -> dict[str, int] | None:
-    """Read a VASP5 CONTCAR/POSCAR header, preferring the final CONTCAR."""
-    for key in ('CONTCAR', 'POSCAR'):
+def _structure_composition(files: dict[str, Path], *, prefer_final=True) -> dict[str, int] | None:
+    """Read the authoritative result/input VASP5 structure header."""
+    for key in _structure_file_order(prefer_final=prefer_final):
         path = files.get(key)
         if not path:
             continue
@@ -768,19 +782,48 @@ def _structure_composition(files: dict[str, Path]) -> dict[str, int] | None:
     return None
 
 
-def _suggested_role(folder: Path, species: str | None) -> str:
+def _structure_facts(files: dict[str, Path], *, prefer_final=True) -> dict:
+    for key in _structure_file_order(prefer_final=prefer_final):
+        if files.get(key):
+            facts = structure_identity.poscar_facts(files[key])
+            facts['source_file'] = key
+            return facts
+    return {'ok': False, 'path': '', 'elements': [], 'counts': [],
+            'composition': {}, 'formula': '', 'natoms': 0, 'cell': [],
+            'source_file': None, 'error': '缺少 CONTCAR/POSCAR'}
+
+
+def _suggested_role_evidence(folder: Path, species: str | None) -> dict:
     low = folder.name.casefold()
-    if any(token in low for token in ('clean', 'bare', 'pristine')) or low.endswith('_slab'):
-        return 'clean_slab'
-    if any(token in low for token in ('gas_ref', 'gas-ref', 'reference', '_ref')):
-        return 'gas_ref'
-    if low.startswith(('mol_', 'molecule_')):
-        return 'molecule_ref'
+    lis_species = bool(species and (
+        species == 'S8' or re.fullmatch(r'Li\d*S\d*', species)))
+    if any(token in low for token in ('gas_ref', 'gas-ref', 'gasreference')):
+        return {'role': 'gas_ref', 'reason': '目录名明确包含 gas_ref', 'confidence': 'high'}
+    if low.startswith(('mol_', 'molecule_')) or 'molecule' in low:
+        return {'role': 'molecule_ref', 'reason': '目录名明确标记 molecule',
+                'confidence': 'high'}
     if any(token in low for token in ('ads', 'config', 'site', 'top', 'bridge', 'hollow')):
-        return 'config'
-    if species and (species == 'S8' or re.fullmatch(r'Li\d*S\d*', species)):
-        return 'molecule_ref'
-    return 'standalone'
+        return {'role': 'config', 'reason': '目录名包含吸附构型/位点关键词',
+                'confidence': 'hint'}
+    if lis_species and (low == 'slab' or low.endswith('_slab')):
+        return {'role': 'config', 'reason': '目录名同时含 Li-S 物种与 slab，不能当作 clean slab',
+                'confidence': 'hint'}
+    if any(token in low for token in ('clean', 'bare', 'pristine')) or low == 'slab' \
+            or low.endswith('_slab'):
+        return {'role': 'clean_slab', 'reason': '目录名明确标记 clean/bare/slab',
+                'confidence': 'high'}
+    if any(token in low for token in ('reference', '_ref')):
+        return {'role': 'molecule_ref' if lis_species else 'gas_ref',
+                'reason': '目录名包含 reference/ref', 'confidence': 'hint'}
+    if lis_species:
+        return {'role': 'molecule_ref', 'reason': '识别到独立 Li-S 分子组成',
+                'confidence': 'hint'}
+    return {'role': 'standalone', 'reason': '未找到可靠的吸附项目角色证据',
+            'confidence': 'unknown'}
+
+
+def _suggested_role(folder: Path, species: str | None) -> str:
+    return _suggested_role_evidence(folder, species)['role']
 
 
 def _state_preview(folder: Path, files: dict[str, Path], task_type_override=None) -> dict:
@@ -1065,20 +1108,52 @@ def _candidate(folder: Path, source_root: Path, files: dict[str, Path]) -> dict:
     input_complete = all(name in files for name in _INPUT_NAMES) and not input_issues
     preview = _preview(folder, files)
     fingerprint, source_hashes, snapshot_stable = _source_snapshot(folder, files)
-    species = _species_from(folder, files)
-    role = _suggested_role(folder, species)
+    species_evidence = _species_evidence_from(
+        folder, files, prefer_final=has_output)
+    species = species_evidence['species']
+    role_evidence = _suggested_role_evidence(folder, species)
+    role = role_evidence['role']
+    structure = _structure_facts(files, prefer_final=has_output)
+    mapping_warnings = []
+    # The full composition of slab+ads is not an adsorbate identity.  Keep it
+    # as structure evidence until a clean slab allows an auditable subtraction.
+    if role == 'config' and species_evidence['source'] == 'structure_composition':
+        species = None
+        species_evidence = {'species': None, 'source': 'unresolved',
+                            'confidence': 'unknown'}
+    if role == 'molecule_ref' and species_evidence['source'] == 'structure_composition':
+        species_evidence['confidence'] = 'exact'
+    elif role == 'molecule_ref' and structure.get('ok') and species:
+        named_composition = structure_identity.formula_composition(species)
+        if named_composition == structure.get('composition'):
+            species_evidence['source'] += '+structure_composition'
+            species_evidence['confidence'] = 'exact'
+        else:
+            mapping_warnings.append(
+                f'目录/标题提示物种 {species}，但结构实际为 {structure.get("formula") or "未知"}')
     rel = '.' if folder == source_root else folder.relative_to(source_root).as_posix()
     return {
         'path': str(folder.resolve()), 'relative_path': rel, 'name': folder.name,
         'files': sorted(files), 'task_type': preview['task_type'],
         'state_suggestion': preview['state_suggestion'],
         'energy_e0_eV': preview['energy_e0_eV'], 'energy_source': preview['energy_source'],
-        'diagnosis': preview['diagnosis'], 'warnings': preview['warnings'],
+        'diagnosis': preview['diagnosis'],
+        'warnings': list(dict.fromkeys([*preview['warnings'], *mapping_warnings])),
         'convergence_evidence': preview['convergence_evidence'],
         'reference_method_signature': preview.get('reference_method_signature') or {},
         'confirmation_eligible': preview['confirmation_eligible'],
         'recommended_action': preview['recommended_action'],
         'suggested_role': role, 'role_options': list(_ROLE_OPTIONS), 'species': species,
+        'species_source': species_evidence['source'],
+        'species_confidence': species_evidence['confidence'],
+        'role_reason': role_evidence['reason'],
+        'role_confidence': role_evidence['confidence'],
+        'mapping_requires_confirmation': (
+            role in {'clean_slab', 'config', 'gas_ref', 'molecule_ref'}
+            and (role_evidence['confidence'] not in {'high', 'exact'}
+                 or (role in {'config', 'molecule_ref'}
+                     and species_evidence['confidence'] != 'exact'))),
+        'structure': structure,
         'source_has_output': has_output, 'has_output': has_output,
         'input_complete': input_complete, 'input_issues': input_issues,
         'importable': (preview['state_suggestion'] in {'DONE', 'CREATED'}
@@ -1086,6 +1161,77 @@ def _candidate(folder: Path, source_root: Path, files: dict[str, Path]) -> dict:
         'source_fingerprint': fingerprint, 'source_sha256': source_hashes,
         'source_snapshot_stable': snapshot_stable,
     }
+
+
+def _organize_candidates(candidates) -> dict:
+    """Apply one clean-slab composition model and return stable species groups."""
+    rows = [dict(candidate) for candidate in candidates or []]
+    clean_rows = [row for row in rows if row.get('suggested_role') == 'clean_slab']
+    config_rows = [row for row in rows if row.get('suggested_role') == 'config']
+    molecule_rows = [row for row in rows if row.get('suggested_role') in {
+        'molecule_ref', 'gas_ref'}]
+    reference_species = [
+        row.get('species') for row in rows
+        if row.get('suggested_role') == 'molecule_ref' and row.get('species')
+    ]
+    clean_path = clean_rows[0]['path'] if len(clean_rows) == 1 else ''
+    clean_inference = {'path': clean_path, 'confidence': 'name' if clean_path else 'unknown'}
+    if not clean_path and (config_rows or (len(rows) >= 2 and not molecule_rows)):
+        structural = structure_identity.infer_clean_candidate(rows)
+        # Preserve an ambiguity/insufficient-evidence diagnosis even though it
+        # intentionally has no chosen path; the UI must explain why it did not
+        # auto-fill clean_slab instead of looking as if inference never ran.
+        clean_inference = structural
+        named = {row['path'] for row in clean_rows}
+        if structural.get('path') and (not named or structural['path'] in named):
+            clean_path = structural['path']
+            for row in rows:
+                if row['path'] == clean_path:
+                    row.update({
+                        'suggested_role': 'clean_slab',
+                        'role_reason': structural['reason'],
+                        'role_confidence': 'exact',
+                        'mapping_requires_confirmation': False,
+                    })
+                    break
+    if clean_path:
+        for row in rows:
+            if row['path'] == clean_path or row.get('suggested_role') in {
+                    'gas_ref', 'molecule_ref'}:
+                continue
+            assignment = structure_identity.classify_against_clean(
+                clean_path, row['path'], name_hint=row.get('species') or '',
+                reference_species=reference_species)
+            row['assignment'] = assignment
+            row['warnings'] = list(dict.fromkeys([
+                *(row.get('warnings') or []), *(assignment.get('warnings') or []),
+            ]))
+            if assignment['confidence'] != 'exact':
+                if row.get('suggested_role') == 'config':
+                    row['mapping_requires_confirmation'] = True
+                continue
+            row.update({
+                'suggested_role': 'config', 'role_confidence': 'exact',
+                'role_reason': '与 clean slab 同晶胞，POSCAR 组成差为非空吸附物',
+                'species': assignment['species'],
+                'species_source': assignment['source'],
+                'species_confidence': 'exact',
+                'mapping_requires_confirmation': False,
+                'adsorbate_composition': assignment['composition'],
+            })
+    grouped = []
+    for role in ('molecule_ref', 'config'):
+        role_rows = [row for row in rows if row.get('suggested_role') == role]
+        for group in structure_identity.species_groups(role_rows):
+            grouped.append({**group, 'role': role,
+                            'group_id': f'{role}:{group.get("key") or "unresolved"}'})
+    unresolved = [
+        {'path': row['path'], 'role': row.get('suggested_role'),
+         'reason': '缺少可确认的物种映射'}
+        for row in rows if row.get('suggested_role') == 'config' and not row.get('species')
+    ]
+    return {'candidates': rows, 'clean_inference': clean_inference,
+            'species_groups': grouped, 'unresolved': unresolved}
 
 
 def _source_snapshot(folder: Path, files: dict[str, Path]) -> tuple[str, dict[str, str], bool]:
@@ -1145,10 +1291,16 @@ def scan_folder(source_root) -> dict:
                 or all(name in files for name in _INPUT_NAMES)):
             candidates.append(_candidate(base, root, files))
     candidates.sort(key=lambda c: c['relative_path'].casefold())
+    organized = _organize_candidates(candidates)
+    candidates = organized['candidates']
     counts = {state: sum(c['state_suggestion'] == state for c in candidates)
               for state in ('CREATED', 'DONE', 'NEEDS_HUMAN')}
     return {
         'ok': True, 'source_root': str(root), 'candidates': candidates,
+        'classification_schema': 1,
+        'clean_inference': organized['clean_inference'],
+        'species_groups': organized['species_groups'],
+        'unresolved': organized['unresolved'],
         'summary': {'total': len(candidates), 'created': counts['CREATED'],
                     'done': counts['DONE'],
                     'needs_human': counts['NEEDS_HUMAN'],
@@ -1165,6 +1317,29 @@ def scan_folder(source_root) -> dict:
 def _safe_stem(value: str, fallback='result') -> str:
     value = re.sub(r'[^\w.-]+', '_', str(value or '').strip(), flags=re.UNICODE).strip('._')
     return (value[:100] or fallback)
+
+
+def _mapping_confirmation_reasons(candidate: dict, role: str,
+                                  species: str | None) -> list[str]:
+    """Explain why a user-edited scientific mapping needs explicit consent."""
+    if role not in {'clean_slab', 'config', 'gas_ref', 'molecule_ref'}:
+        # ``standalone`` intentionally opts out of adsorption/reference
+        # semantics, so it cannot poison a grouped ΔE dataset.
+        return []
+    reasons = []
+    suggested_role = str(candidate.get('suggested_role') or '')
+    if candidate.get('mapping_requires_confirmation'):
+        reasons.append('自动识别证据不足或同时匹配多个参考标签')
+    if suggested_role and role != suggested_role:
+        reasons.append(f'角色由 {suggested_role} 改为 {role}')
+    if role in {'config', 'molecule_ref'}:
+        suggested_species = str(candidate.get('species') or '').strip()
+        selected_species = str(species or '').strip()
+        if selected_species != suggested_species:
+            reasons.append(
+                f'物种由 {suggested_species or "未识别"} '
+                f'改为 {selected_species or "未识别"}')
+    return list(dict.fromkeys(reasons))
 
 
 def _normalise_selections(selections) -> list[dict]:
@@ -1268,7 +1443,10 @@ def commit_import(source_root, out_root, project_name, selections, *,
     final_members = {'clean_slab': None, 'gas_ref': None, 'configs': []}
     molecule_jobs: dict[str, str] = {}
     molecule_energies: dict[str, float | None] = {}
+    molecule_compositions: dict[str, str] = {}
     config_species: dict[str, str] = {}
+    config_species_evidence: dict[str, dict] = {}
+    staged_by_final: dict[str, str] = {}
     standalone: list[str] = []
     seen_sources: set[str] = set()
     renamed = False
@@ -1307,6 +1485,24 @@ def commit_import(source_root, out_root, project_name, selections, *,
                 if seen_roles[role] > 1:
                     raise ValueError(f'一个项目只能有一个 {role}')
 
+            selected_species = item.get('species') or candidate.get('species') or ''
+            if (role == 'config'
+                    and candidate.get('suggested_role') == 'standalone'
+                    and candidate.get('species_source') == 'structure_composition'):
+                # A standalone candidate's total POSCAR formula includes the
+                # whole slab.  When the user reclassifies it as a config, that
+                # value is not an adsorbate label; leave it unresolved until
+                # the selected clean slab is subtracted later in this commit.
+                selected_species = ''
+            species = str(selected_species).strip() or None
+            mapping_reasons = _mapping_confirmation_reasons(candidate, role, species)
+            mapping_confirmed = item.get('mapping_confirmed') is True
+            if mapping_reasons and not mapping_confirmed:
+                raise ValueError(
+                    f'{candidate["name"]} 的角色/物种映射需要明确确认：'
+                    + '；'.join(mapping_reasons)
+                    + '；请在导入界面核对后勾选“确认本组”')
+
             task_type = str(item.get('task_type') or candidate['task_type']).strip().lower()
             if task_type not in _IMPORT_TASK_TYPES:
                 raise ValueError(
@@ -1322,7 +1518,6 @@ def commit_import(source_root, out_root, project_name, selections, *,
                         Path(path), _files_by_canonical(Path(path)),
                         task_type_override=task_type),
                 }
-            species = str(item.get('species') or candidate.get('species') or '').strip() or None
             if role == 'clean_slab':
                 rel_dst = Path('clean_slab')
             elif role == 'gas_ref':
@@ -1390,7 +1585,8 @@ def commit_import(source_root, out_root, project_name, selections, *,
                 state = 'NEEDS_HUMAN'
 
             if role == 'molecule_ref':
-                actual = _structure_composition(staged_files)
+                actual = _structure_composition(
+                    staged_files, prefer_final=bool(candidate.get('source_has_output')))
                 declared = _formula_composition(species or '')
                 if actual is None:
                     raise ValueError(
@@ -1403,6 +1599,14 @@ def commit_import(source_root, out_root, project_name, selections, *,
                     raise ValueError(
                         f'参考物种 {species or "(空)"} 与结构组成 {actual_formula} '
                         '不一致；文件夹名或人工标签不能覆盖真实原子计数')
+                actual_key = structure_identity.composition_key(actual)
+                previous_label = molecule_compositions.get(actual_key)
+                if previous_label and previous_label != species:
+                    raise ValueError(
+                        f'分子参考 {previous_label} 与 {species} 的 POSCAR '
+                        '具有相同原子组成；后端不能仅凭化学计量选择参考，'
+                        '请先合并重复标签')
+                molecule_compositions[actual_key] = str(species)
 
             final_dst = final_root / rel_dst
             m = manifest_mod.new_manifest(
@@ -1413,6 +1617,12 @@ def commit_import(source_root, out_root, project_name, selections, *,
                         'source_sha256': staged_hashes,
                         'source_fingerprint': candidate.get('source_fingerprint'),
                         'import_role': role, 'species': species,
+                        'mapping_confirmation': {
+                            'required': bool(mapping_reasons),
+                            'confirmed': mapping_confirmed if mapping_reasons else True,
+                            'reasons': mapping_reasons,
+                            'confirmed_at': _now_iso() if mapping_reasons else None,
+                        },
                         'input_complete': input_complete,
                         'input_issues': input_issues},
                 warnings=candidate['warnings'],
@@ -1443,6 +1653,7 @@ def commit_import(source_root, out_root, project_name, selections, *,
             manifest_mod.save_manifest(stage_dst, m)
 
             final_str = str(final_dst)
+            staged_by_final[final_str] = str(stage_dst)
             if role == 'clean_slab':
                 final_members['clean_slab'] = final_str
             elif role == 'gas_ref':
@@ -1463,10 +1674,82 @@ def commit_import(source_root, out_root, project_name, selections, *,
                 standalone.append(final_str)
             imported.append({'source': path, 'path': final_str, 'role': role,
                              'species': species, 'state': state,
-                             'manual_confirmed': manual})
+                             'manual_confirmed': manual,
+                             'mapping_confirmed': (
+                                 mapping_confirmed if mapping_reasons else True),
+                             'mapping_confirmation_reasons': mapping_reasons})
 
         if not imported:
             raise ValueError('所有候选都被忽略，没有可导入内容')
+        clean_member = final_members['clean_slab']
+        config_members = list(final_members['configs'])
+        if clean_member and config_members:
+            clean_stage = staged_by_final[clean_member]
+            for config_member in config_members:
+                config_stage = staged_by_final[config_member]
+                assignment = structure_identity.classify_against_clean(
+                    clean_stage, config_stage,
+                    name_hint=config_species.get(config_member) or '')
+                if assignment['confidence'] != 'exact':
+                    detail = '；'.join(assignment.get('warnings') or ['无法得到唯一组成差'])
+                    raise ValueError(
+                        f'吸附构型 {Path(config_member).name} 无法与 clean slab 自动配对：'
+                        f'{detail}')
+                actual_species = assignment['species']
+                declared_species = str(config_species.get(config_member) or '').strip()
+                if declared_species:
+                    declared = structure_identity.formula_composition(declared_species)
+                    if declared != assignment['composition']:
+                        raise ValueError(
+                            f'吸附构型 {Path(config_member).name} 标记为 {declared_species}，'
+                            f'但 POSCAR−clean slab 实际组成为 {actual_species}；'
+                            '文件夹名或手工标签不能覆盖真实原子计数')
+                    actual_species = declared_species
+                if molecule_jobs:
+                    reference_matches = [
+                        species for species in molecule_jobs
+                        if structure_identity.formula_composition(species)
+                        == assignment['composition']
+                    ]
+                    if len(reference_matches) == 1:
+                        actual_species = reference_matches[0]
+                    elif len(reference_matches) > 1:
+                        raise ValueError(
+                            f'吸附构型 {Path(config_member).name} 的组成同时匹配多个参考标签：'
+                            + '、'.join(reference_matches))
+                config_species[config_member] = actual_species
+                config_species_evidence[config_member] = {
+                    'status': 'exact', 'source': 'poscar_minus_clean_slab',
+                    'species': actual_species,
+                    'adsorbate_composition': assignment['composition'],
+                    'clean_member': clean_member,
+                    'warnings': assignment.get('warnings') or [],
+                }
+                job_manifest = manifest_mod.load_manifest(config_stage)
+                if job_manifest is None:
+                    raise ValueError(f'导入构型 {config_member} 缺少可读 job.yaml')
+                job_manifest.setdefault('inputs', {})['species'] = actual_species
+                job_manifest['inputs']['species_evidence'] = config_species_evidence[config_member]
+                manifest_mod.save_manifest(config_stage, job_manifest)
+                for row in imported:
+                    if row['path'] == config_member:
+                        row['species'] = actual_species
+                        break
+        if molecule_jobs:
+            missing_species = sorted({
+                str(config_species.get(path) or '').strip()
+                for path in config_members
+                if not str(config_species.get(path) or '').strip()
+            })
+            if missing_species:
+                raise ValueError('逐物种参考项目中的每个吸附构型都必须有可验证物种')
+            unmatched = sorted({
+                species for species in config_species.values()
+                if species and species not in molecule_jobs
+            })
+            if unmatched:
+                raise ValueError(
+                    '吸附构型物种没有对应的分子参考：' + '、'.join(unmatched))
         project_warnings = []
         if not final_members['clean_slab']:
             project_warnings.append(
@@ -1479,7 +1762,10 @@ def commit_import(source_root, out_root, project_name, selections, *,
             'created_at': _now_iso(), 'root': str(final_root),
             'import_source': str(source), 'members': final_members,
             'config_species': config_species,
+            'config_species_evidence': config_species_evidence,
             'species_refs': molecule_energies, 'species_ref_jobs': molecule_jobs,
+            'dataset_groups': structure_identity.build_dataset_groups(
+                config_members, config_species, molecule_jobs),
             'molecules_dir': str(final_root / 'molecules') if molecule_jobs else None,
             'standalone': standalone, 'warnings': project_warnings,
         }

@@ -35,6 +35,10 @@ def _finish(job_dir, energy):
     manifest.set_state(m, 'DONE')
     m.setdefault('results', {})['energy_e0_eV'] = energy
     manifest.save_manifest(job_dir, m)
+    with open(os.path.join(job_dir, 'OSZICAR'), 'w', encoding='utf-8') as handle:
+        handle.write(f' 1 F= {energy:.12f} E0= {energy:.12f} d E =0\n')
+    with open(os.path.join(job_dir, 'OUTCAR'), 'w', encoding='utf-8') as handle:
+        handle.write('General timing and accounting information for this job\n')
 
 
 def _make_species_ref_job(job_dir, *, energy=-38.072771, state='DONE',
@@ -46,13 +50,17 @@ def _make_species_ref_job(job_dir, *, energy=-38.072771, state='DONE',
     manifest.set_state(ref, state)
     ref['results'].update(energy_e0_eV=energy, energy_source=source)
     manifest.save_manifest(job_dir, ref)
+    (job_dir / 'OSZICAR').write_text(
+        f' 1 F= {energy:.12f} E0= {energy:.12f} d E =0\n', encoding='utf-8')
+    (job_dir / 'OUTCAR').write_text(
+        'General timing and accounting information for this job\n', encoding='utf-8')
     return job_dir
 
 
-def _set_actual_method(job_dir, functional):
+def _set_actual_method(job_dir, functional, *, ispin=1):
     item = manifest.load_manifest(job_dir)
     item.setdefault('results', {})['reference_method_signature'] = {
-        'functional': functional, 'ivdw': 0, 'encut': 400.0, 'ispin': 1,
+        'functional': functional, 'ivdw': 0, 'encut': 400.0, 'ispin': ispin,
         'ldau': 'F', 'potcar_titel': ['PAW_PBE C'], 'potcar_elements': ['C'],
     }
     manifest.save_manifest(job_dir, item)
@@ -150,6 +158,53 @@ def test_delta_e_gating_and_value(env):
     assert s['rows'][0]['delta_e'] == pytest.approx(-435.5 - (-400.0) - (-21.0))
 
 
+def test_delta_e_blocks_done_operand_when_oszicar_is_missing(env):
+    """DONE/job.yaml 的缓存能量不能代替当前轮 OSZICAR 证据。"""
+    result = adsorption.create_project(
+        env['tmp'] / 'missing-oszicar', 'missing-oszicar',
+        clean_poscar=env['poscar']('missing-oszicar-slab.vasp'),
+        config_poscars=[env['poscar']('missing-oszicar-config.vasp')],
+        incar_path=env['incar'], ref_poscar=env['poscar']('missing-oszicar-ref.vasp'),
+        lib_root=env['lib'])
+    project = adsorption.load_project(result['project_path'])
+    clean = project['members']['clean_slab']
+    config = project['members']['configs'][0]
+    reference = project['members']['gas_ref']
+    _finish(clean, -100.0)
+    _finish(config, -115.0)
+    _finish(reference, -10.0)
+    os.unlink(os.path.join(clean, 'OSZICAR'))
+
+    row = adsorption.delta_e_rows(project)['rows'][0]
+
+    assert row['delta_e'] is None
+    assert '清洁表面缺少可解析的当前轮 OSZICAR:E0' in row['note']
+
+
+def test_delta_e_blocks_done_operand_when_oszicar_energy_was_replaced(env):
+    """后续被覆盖的 OSZICAR 不得与旧 job.yaml 能量混用。"""
+    result = adsorption.create_project(
+        env['tmp'] / 'mutated-oszicar', 'mutated-oszicar',
+        clean_poscar=env['poscar']('mutated-oszicar-slab.vasp'),
+        config_poscars=[env['poscar']('mutated-oszicar-config.vasp')],
+        incar_path=env['incar'], ref_poscar=env['poscar']('mutated-oszicar-ref.vasp'),
+        lib_root=env['lib'])
+    project = adsorption.load_project(result['project_path'])
+    clean = project['members']['clean_slab']
+    config = project['members']['configs'][0]
+    reference = project['members']['gas_ref']
+    _finish(clean, -100.0)
+    _finish(config, -115.0)
+    _finish(reference, -10.0)
+    with open(os.path.join(config, 'OSZICAR'), 'w', encoding='utf-8') as handle:
+        handle.write(' 1 F= -999.0 E0= -999.0 d E =0\n')
+
+    row = adsorption.delta_e_rows(project)['rows'][0]
+
+    assert row['delta_e'] is None
+    assert 'job.yaml 能量 -115.00000000 eV 与 OSZICAR -999.00000000 eV 不一致' in row['note']
+
+
 def test_delta_e_blocks_known_pbe_rpbe_method_mismatch(env):
     result = adsorption.create_project(
         env['tmp'] / 'method-mismatch', 'mix',
@@ -170,6 +225,58 @@ def test_delta_e_blocks_known_pbe_rpbe_method_mismatch(env):
     assert row['delta_e'] is None
     assert row['method_check']['status'] == 'incompatible'
     assert '方法不一致' in row['note'] and '泛函' in row['note']
+    assert summary['method_consistency']['status'] == 'incompatible'
+
+
+def test_delta_e_allows_molecular_ispin_difference_with_audit_warning(env):
+    result = adsorption.create_project(
+        env['tmp'] / 'spin-reference', 'spin-reference',
+        clean_poscar=env['poscar']('spin-slab.vasp'),
+        config_poscars=[env['poscar']('spin-config.vasp')],
+        incar_path=env['incar'], ref_poscar=env['poscar']('spin-molecule.vasp'),
+        lib_root=env['lib'])
+    project = adsorption.load_project(result['project_path'])
+    clean = project['members']['clean_slab']
+    config = project['members']['configs'][0]
+    reference = project['members']['gas_ref']
+    _finish(clean, -100.0)
+    _finish(config, -115.0)
+    _finish(reference, -10.0)
+    _set_actual_method(clean, 'PBE', ispin=2)
+    _set_actual_method(config, 'PBE', ispin=2)
+    _set_actual_method(reference, 'PBE', ispin=1)
+
+    summary = adsorption.delta_e_rows(project)
+    row = summary['rows'][0]
+
+    assert row['delta_e'] == pytest.approx(-5.0)
+    assert row['method_check']['status'] == 'unverified'
+    assert not row['method_check']['issues']
+    assert any('ISPIN 不一致' in warning and '人工核对' in warning
+               for warning in row['method_check']['warnings'])
+    assert summary['method_consistency']['status'] == 'unverified'
+
+
+def test_delta_e_still_blocks_clean_slab_and_adsorption_ispin_difference(env):
+    result = adsorption.create_project(
+        env['tmp'] / 'spin-periodic-mismatch', 'spin-periodic-mismatch',
+        clean_poscar=env['poscar']('strict-spin-slab.vasp'),
+        config_poscars=[env['poscar']('strict-spin-config.vasp')],
+        incar_path=env['incar'], lib_root=env['lib'])
+    project = adsorption.load_project(result['project_path'])
+    clean = project['members']['clean_slab']
+    config = project['members']['configs'][0]
+    _finish(clean, -100.0)
+    _finish(config, -115.0)
+    _set_actual_method(clean, 'PBE', ispin=1)
+    _set_actual_method(config, 'PBE', ispin=2)
+
+    summary = adsorption.delta_e_rows(project)
+    row = summary['rows'][0]
+
+    assert row['delta_e'] is None
+    assert row['method_check']['status'] == 'incompatible'
+    assert any('ISPIN 不一致' in issue for issue in row['method_check']['issues'])
     assert summary['method_consistency']['status'] == 'incompatible'
 
 
@@ -214,14 +321,43 @@ def test_scan_structure_files_recursive_read_only_deduplicates_and_ignores_symli
     assert before == after
 
 
+def test_new_input_scan_prefers_poscar_over_stale_contcar(tmp_path):
+    folder = tmp_path / 'inputs' / 'Li2S8_top'
+    folder.mkdir(parents=True)
+    poscar = folder / 'POSCAR'
+    contcar = folder / 'CONTCAR'
+    poscar.write_text(
+        'new input\n1\n10 0 0\n0 10 0\n0 0 20\nC Li S\n24 2 8\nDirect\n'
+        + '0 0 0\n' * 34, encoding='utf-8')
+    contcar.write_text(
+        'old final\n1\n10 0 0\n0 10 0\n0 0 20\nC Li S\n24 2 6\nDirect\n'
+        + '0 0 0\n' * 32, encoding='utf-8')
+
+    rows = adsorption.scan_structure_files(tmp_path / 'inputs')
+
+    assert len(rows) == 1
+    assert rows[0]['path'] == str(poscar.resolve())
+    assert rows[0]['structure']['composition'] == {'C': 24, 'Li': 2, 'S': 8}
+    assert '优先选 POSCAR' in rows[0]['selection_note']
+
+
 def test_scan_lis_input_bundle_fills_unique_incar_clean_and_configs_read_only(tmp_path):
     root = tmp_path / 'MoS2_LiS_inputs'
     clean = root / 'clean_slab' / 'POSCAR'
     lis = root / 'adsorption' / 'Li2S8_top' / 'POSCAR'
     s8 = root / 'adsorption' / 'S8_bridge.vasp'
-    for path in (clean, lis, s8):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text('structure', encoding='utf-8')
+    clean.parent.mkdir(parents=True, exist_ok=True)
+    clean.write_text(
+        'clean\n1.0\n10 0 0\n0 10 0\n0 0 20\nC\n2\nDirect\n0 0 0\n.5 .5 .5\n',
+        encoding='utf-8')
+    lis.parent.mkdir(parents=True, exist_ok=True)
+    lis.write_text(
+        'Li2S8 top\n1.0\n10 0 0\n0 10 0\n0 0 20\nC Li S\n2 2 8\nDirect\n'
+        + '0 0 0\n' * 12, encoding='utf-8')
+    s8.parent.mkdir(parents=True, exist_ok=True)
+    s8.write_text(
+        'S8 bridge\n1.0\n10 0 0\n0 10 0\n0 0 20\nC S\n2 8\nDirect\n'
+        + '0 0 0\n' * 10, encoding='utf-8')
     incar = root / 'INCAR'
     incar.write_text('ENCUT = 500\n', encoding='utf-8')
     before = {str(path.relative_to(root)): path.stat().st_mtime_ns
@@ -235,6 +371,8 @@ def test_scan_lis_input_bundle_fills_unique_incar_clean_and_configs_read_only(tm
     assert result['clean_slab'] == str(clean.resolve())
     assert {item['path'] for item in result['configs']} == {
         str(lis.resolve()), str(s8.resolve())}
+    assert {item['species'] for item in result['configs']} == {'Li2S8', 'S8'}
+    assert all(item['species_confidence'] == 'exact' for item in result['configs'])
     assert result['warnings'] == [] and result['source_read_only'] is True
     assert before == after
 
@@ -254,6 +392,35 @@ def test_scan_lis_input_bundle_never_guesses_ambiguous_incar_or_clean(tmp_path):
     assert result['clean_slab'] == '' and len(result['clean_candidates']) == 2
     assert {item['species'] for item in result['configs']} == {'Li2S8'}
     assert any('手动选择' in warning for warning in result['warnings'])
+
+
+def test_scan_lis_bundle_infers_generic_clean_and_groups_from_poscar_difference(tmp_path):
+    root = tmp_path / 'generic-bundle'
+
+    def write(path, elements, counts):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            'structure\n1.0\n10 0 0\n0 10 0\n0 0 20\n'
+            + ' '.join(elements) + '\n'
+            + ' '.join(str(value) for value in counts) + '\nDirect\n'
+            + '0 0 0\n' * sum(counts), encoding='utf-8')
+
+    clean = root / '000' / 'POSCAR'
+    top = root / '001' / 'POSCAR'
+    bridge = root / '002' / 'POSCAR'
+    write(clean, ['C'], [24])
+    write(top, ['C', 'Li', 'S'], [24, 2, 8])
+    write(bridge, ['C', 'Li', 'S'], [24, 2, 8])
+    (root / 'INCAR').write_text('ENCUT=500\n', encoding='utf-8')
+
+    result = adsorption.scan_lis_input_bundle(root)
+
+    assert result['clean_slab'] == str(clean.resolve())
+    assert result['clean_inference']['confidence'] == 'exact'
+    assert {item['species'] for item in result['configs']} == {'Li2S8'}
+    assert all(item['species_confirmed'] is True for item in result['configs'])
+    assert result['species_groups'][0]['species'] == 'Li2S8'
+    assert result['species_groups'][0]['count'] == 2
 
 
 def test_create_project_persists_lis_reference_metadata_and_poscar_folder_labels(env):
@@ -283,6 +450,23 @@ def test_create_project_persists_lis_reference_metadata_and_poscar_folder_labels
     assert project['species_ref_jobs'] == {'Li2S8': str(ref_job)}
     assert project['molecules_dir'] == str(ref_job.parent.resolve())
     assert project['reference_project'] == str(reference_project.resolve())
+
+
+def test_create_project_rejects_duplicate_reference_compositions_before_writing(env):
+    target = env['tmp'] / 'duplicate-reference-project'
+
+    with pytest.raises(ValueError, match='具有相同原子组成'):
+        adsorption.create_project(
+            target, 'duplicate-refs',
+            clean_poscar=env['poscar']('duplicate-ref-slab.vasp'),
+            config_poscars=[env['poscar']('duplicate-ref-config.vasp')],
+            incar_path=env['incar'], lib_root=env['lib'],
+            config_species={},
+            species_refs={'Li2S8': -38.0, 'S8Li2': -38.0},
+            species_ref_jobs={'Li2S8': '/refs/first', 'S8Li2': '/refs/second'},
+        )
+
+    assert not target.exists()
 
 
 def test_export_csv_excel_friendly(env, tmp_path):
@@ -412,12 +596,7 @@ def test_species_reference_summary_csv_and_row_are_auditable(env):
     ref_job = env['tmp'] / 'mol_Li2S8'
     _finish(proj['members']['clean_slab'], -100.0)
     _finish(config, -139.5)
-    ref_job.mkdir()
-    ref = manifest.new_manifest(job_id='ref', system='Li2S8', task_type='relax',
-                                calc_type='molecule', inputs={})
-    manifest.set_state(ref, 'DONE')
-    ref['results'].update(energy_e0_eV=-38.072771, energy_source='OSZICAR:E0')
-    manifest.save_manifest(ref_job, ref)
+    _make_species_ref_job(ref_job, energy=-38.072771, source='OSZICAR:E0')
     proj['config_species'] = {config: 'Li2S8'}
     # 缓存与 manifest 相差 0.5 μeV（容差内）；公式仍须使用 manifest 真值。
     proj['species_refs'] = {'Li2S8': -38.0727705}

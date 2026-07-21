@@ -189,7 +189,23 @@ silent (job.yaml state machine + audit history).
 - CP2K 补齐 Ry 截断、k 点、Selective Dynamics、RPBE/PBEsol XC 和频率/末结构；Gaussian 补齐
   GD3/GD3BJ、任务级完成、MP2/CC/热校正与末结构；CASTEP 补齐 D3/D3-BJ、0 K 能量口径、
   `.phonon/.geom` 和同 seed 输入门。所有非 VASP 失败/未收敛能量只记为 raw，不进入可信结果。
-- 当前回归基线：**2543 测试通过，8 项按本机可选软件/依赖环境跳过**。
+- 上一轮回归基线：**2543 测试通过，8 项按本机可选软件/依赖环境跳过**。
+
+### 2026-07-21：批量吸附能智能分组与可信自动托管
+
+- 新计算目录优先读取 `POSCAR`，已算结果优先读取 `CONTCAR`；以
+  `composition(config) − composition(clean slab)` 识别吸附物化学计量，按组成稳定分组。
+  文件夹名只作提示；同组成多参考、无法唯一识别或人工改映射时必须确认并留审计记录。
+- 分子参考 `ISPIN=1`、周期 clean/adsorption 体系 `ISPIN=2` 不再被笼统判为硬不兼容；
+  clean slab 与 adsorption 仍须严格同自旋设置，跨体系差异必须填写基态磁性核对理由。
+- 自动托管只操作项目提交成功后保存的目录白名单。多服务器并行隔离；服务器端点指纹、
+  per-job 互斥和下载代次 CAS 防止同名服务器接管、双重续算或旧清单覆盖新作业号。
+- 续算前把上一轮输出移入远端历史目录；重投失败会恢复输出、INCAR/POSCAR。最终下载只接受
+  DONE，证据绑定 job id、remote dir、attempt token、文件大小与 SHA256，运行中预览不能冒充最终结果。
+- ΔE 的 slab/config/reference 每个操作数都要通过 DONE、完整结束页脚和当前 `OSZICAR:E0`
+  复核。无参考态、参考无效或未确认的方法差异只能生成诊断，不能标记为最终吸附能报告。
+  报告绑定成员代次、能量、下载哈希与方法证据；结果变化或报告文件删除后会自动失效重建。
+- 当前回归基线：**2586 测试通过，8 项按本机可选软件/依赖环境跳过**。
 
 ## Install & quickstart
 
@@ -213,7 +229,7 @@ report, no VASP or cluster): [examples/offline_analysis](examples/offline_analys
 — `python examples/offline_analysis/run_demo.py` drives a synthetic completed
 job set end-to-end so a reviewer can confirm the analysis half of the pipeline.
 
-**Tests**: `python -m pytest` — 2051 tests, 6 skipped (optional OriginLab smoke
+**Tests**: `python -m pytest` — 2586 tests, 8 skipped (optional OriginLab smoke
 behind `VCS_ORIGIN_SMOKE=1`, and a POV-Ray real-render smoke). Parser
 cross-checks against ASE run when `ase` is installed (in the `dev` extra).
 CI runs the suite on ubuntu/windows × Python 3.10/3.12.

@@ -148,11 +148,14 @@ def test_fetch_batch_closes_client_and_jump(monkeypatch):
     monkeypatch.setattr(batch_ops.submitter, 'assert_profile_binding',
                         lambda *args, **kwargs: {})
     monkeypatch.setattr(batch_ops.submitter, 'fetch_results',
-                        lambda c, s, d, files=None: seen.append((d, files)) or
+                        lambda c, s, d, files=None, profile=None:
+                        seen.append((d, files, profile)) or
                         (['CONTCAR'], []))
-    payload = batch_ops.fetch_batch(object(), None, ['d1', 'd2'], False)
+    profile = object()
+    payload = batch_ops.fetch_batch(profile, None, ['d1', 'd2'], False)
     assert payload['results'][0][1] is True
-    assert seen == [('d1', None), ('d2', None)]       # 每个 manifest 自己决定默认结果包
+    assert seen == [('d1', None, profile), ('d2', None, profile)]
+    # 每个 manifest 自己决定默认结果包，并将已校验 profile 透传到下载层复核。
     assert client.closed and jump.closed
 
 
@@ -215,7 +218,7 @@ def test_fetch_batch_survives_ssh_exception(monkeypatch):
     monkeypatch.setattr(batch_ops.submitter, 'assert_profile_binding',
                         lambda *args, **kwargs: {})
 
-    def flaky(c, s, d, files=None):
+    def flaky(c, s, d, files=None, profile=None):
         if d == 'bad':
             raise SSHException('boom')
         return (['CONTCAR'], [])

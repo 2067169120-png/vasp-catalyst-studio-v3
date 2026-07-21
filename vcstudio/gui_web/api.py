@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import types
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -321,6 +322,9 @@ class Api:
         self._result_import = result_import_mod
         # 23 类任务共用的能力矩阵/证据报告；未接解析器的任务必须显式标记。
         self._task_analysis = task_analysis_mod
+        # pywebview 可并发调用同一个 js_api；后端锁才是自动托管的正确性边界。
+        # 前端的 running 标志只负责交互，不能阻止两条线程同时续算/出报告。
+        self._pipeline_lock = threading.Lock()
 
     # ── 桥活性探测(前端用来确认 js_api 已就绪) ──
     def ping(self) -> str:
@@ -1064,6 +1068,11 @@ class Api:
                 prof, pw, err = self._resolve(cl, password)
                 if err:
                     return {**empty, 'state': state, 'error': err.get('error') or str(err)}
+                try:
+                    self._sub().assert_profile_binding(
+                        prof, d, '读取实时能量', manifest=m)
+                except Exception as e:                    # noqa: BLE001 连网前失败即停
+                    return {**empty, 'state': state, 'error': str(e)}
                 conn = self._conn()
                 try:
                     client, jump = conn.open_client(prof, pw, trust_new=trust_new)
@@ -1424,32 +1433,48 @@ class Api:
             return {'ok': False, 'job_dir': None, 'warnings': [], 'error': str(e)}
 
     # ── 吸附能项目页(镜像 gui/project_tab 调用面:列表/创建/ΔE/CSV/报告) ─────────
-    def proj_scan_structures(self, root):
+    def proj_scan_structures(self, root, clean_slab=None, reference_species=None):
         """递归发现可用于 slab/adsorption 的普通结构文件（严格只读）。"""
         try:
             source = str(root or '').strip()
             if not source:
                 raise ValueError('请先选择结构根目录')
             items = self._adsorption.scan_structure_files(source)
+            grouped = {'items': items, 'species_groups': [], 'warnings': []}
+            clean = str(clean_slab or '').strip()
+            if clean:
+                if reference_species:
+                    grouped = self._adsorption.identify_config_species(
+                        clean, items, reference_species=reference_species)
+                else:
+                    grouped = self._adsorption.identify_config_species(clean, items)
             return {'ok': True, 'root': os.path.abspath(source),
-                    'items': items, 'error': None}
+                    'items': grouped.get('items') or [],
+                    'species_groups': grouped.get('species_groups') or [],
+                    'warnings': grouped.get('warnings') or [], 'error': None}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'root': str(root or ''), 'items': [],
-                    'error': str(e)}
+                    'species_groups': [], 'warnings': [], 'error': str(e)}
 
-    def proj_scan_lis_inputs(self, root):
+    def proj_scan_lis_inputs(self, root, reference_species=None):
         """一次只读识别固定 INCAR、clean slab 与 adsorption 结构族。"""
         empty = {
             'ok': False, 'root': str(root or ''), 'incar': '',
             'incar_candidates': [], 'clean_slab': '', 'clean_candidates': [],
             'configs': [], 'structures': [], 'warnings': [],
+            'species_groups': [], 'unresolved_species': 0,
             'source_read_only': True,
         }
         try:
             source = str(root or '').strip()
             if not source:
                 raise ValueError('请先选择本次计算文件夹')
-            result = dict(self._adsorption.scan_lis_input_bundle(source) or {})
+            if reference_species:
+                scanned = self._adsorption.scan_lis_input_bundle(
+                    source, reference_species=reference_species)
+            else:
+                scanned = self._adsorption.scan_lis_input_bundle(source)
+            result = dict(scanned or {})
             return {**empty, **result, 'ok': True, 'error': None}
         except Exception as e:                            # noqa: BLE001
             return {**empty, 'error': str(e)}
@@ -1472,11 +1497,21 @@ class Api:
         if not jobs:
             raise ValueError('参考项目没有 species_ref_jobs；请先把 Li-S 结果导入为分子参考')
         energies, resolved_jobs, signatures = {}, {}, {}
+        composition_labels = {}
         reference_root = str(project.get('root') or os.path.dirname(raw_path))
         for raw_species, raw_job_dir in sorted(jobs.items()):
             species = str(raw_species or '').strip()
             if not species:
                 raise ValueError('参考项目包含空物种名')
+            composition = _formula_composition(species)
+            if composition:
+                composition_key = tuple(sorted(composition.items()))
+                previous = composition_labels.get(composition_key)
+                if previous and previous != species:
+                    raise ValueError(
+                        f'参考标签 {previous} 与 {species} 具有相同原子组成；'
+                        'POSCAR 无法区分别名/异构体/电荷或自旋态，请先保留唯一明确参考')
+                composition_labels[composition_key] = species
             job_dir = os.path.expanduser(str(raw_job_dir or '').strip())
             if not os.path.isabs(job_dir):
                 job_dir = os.path.join(reference_root, job_dir)
@@ -1487,7 +1522,9 @@ class Api:
             if manifest.get('state') != 'DONE':
                 raise ValueError(
                     f'参考物种 {species} 尚未通过 DONE 门（当前 {manifest.get("state") or "未知"}）')
-            energy = (manifest.get('results') or {}).get('energy_e0_eV')
+            from vcstudio.project import energy_gate
+            energy, manifest, _completion = energy_gate.validate_done_energy(
+                job_dir, f'参考物种 {species}', self._manifest, require_oszicar=True)
             if not self._reasonable_reference_energy(energy):
                 raise ValueError(f'参考物种 {species} 的 DONE 能量缺失或不合理')
             energies[species] = float(energy)
@@ -1563,7 +1600,7 @@ class Api:
                 'aexx': _method_number(signature.get('aexx')),
                 'hfscreen': _method_number(signature.get('hfscreen')),
             }
-            for key in ('functional', 'ivdw', 'ispin', 'ldau', 'metagga', 'lhfcalc'):
+            for key in ('functional', 'ivdw', 'ldau', 'metagga', 'lhfcalc'):
                 if reference.get(key) is None or planned.get(key) is None:
                     warnings.append(f'{species}: 无法核对 {key}')
                 elif reference[key] != planned[key]:
@@ -1571,6 +1608,29 @@ class Api:
                         f'{species}: {key} 参考={reference[key]!r}，新任务={planned[key]!r}')
                 else:
                     checked += 1
+            reference_spin = reference.get('ispin')
+            planned_spin = planned.get('ispin')
+            if reference_spin is None or planned_spin is None:
+                warnings.append(f'{species}: 无法核对 ISPIN')
+            elif reference_spin not in {1, 2}:
+                issues.append(f'{species}: 参考分子 ISPIN={reference_spin!r} 无效（仅允许 1 或 2）')
+            elif planned_spin not in {1, 2}:
+                issues.append(f'{species}: 新任务 ISPIN={planned_spin!r} 无效（仅允许 1 或 2）')
+            elif reference_spin == planned_spin:
+                checked += 1
+            elif reference_spin == 1 and planned_spin == 2:
+                warnings.append(
+                    f'{species}: 参考分子 ISPIN=1，新建 clean slab/adsorption 作业 '
+                    'ISPIN=2；不同体系可按各自基态磁性设置，这不是自动不兼容。'
+                    '请确认参考分子是经自旋极化/多初态对照验证的非磁闭壳层基态'
+                    '（不能只凭总磁矩为零判断），并确认 clean slab 与所有 adsorption '
+                    '构型统一使用当前自旋设置')
+            else:
+                warnings.append(
+                    f'{species}: 参考分子 ISPIN={reference_spin}，新建 clean slab/adsorption '
+                    f'作业 ISPIN={planned_spin}；不同体系可按各自基态磁性设置，这不是自动'
+                    '不兼容。新任务将强制非自旋极化，请确认 clean slab 与吸附体系确实非磁；'
+                    '否则改用 ISPIN=2 并设置合理的 MAGMOM')
             if reference['ldau'] is True and planned['ldau'] is True:
                 if reference['ldautype'] is None or planned['ldautype'] is None:
                     warnings.append(f'{species}: LDAUTYPE 证据不完整')
@@ -1680,7 +1740,8 @@ class Api:
 
             reference, refs, ref_jobs, ref_signatures = self._validated_reference_project(
                 reference_project_path)
-            configs, source_species, seen_paths, seen_members = [], {}, set(), set()
+            configs, source_species, source_species_evidence = [], {}, {}
+            seen_paths, seen_members = set(), set()
             for raw_item in (config_items or []):
                 if not isinstance(raw_item, dict):
                     raise ValueError('吸附构型列表格式无效')
@@ -1738,6 +1799,12 @@ class Api:
                         f'构型 {os.path.basename(config_path)} 选择了 '
                         f'{source_species[config_path]}，但 config−slab 实际组成为 {actual}；'
                         '请更正物种或结构')
+                source_species_evidence[config_path] = {
+                    'status': 'exact', 'source': 'poscar_minus_clean_slab',
+                    'species': source_species[config_path],
+                    'adsorbate_composition': delta_composition,
+                    'clean_source': slab,
+                }
 
             lib_root = ''
             try:
@@ -1798,7 +1865,8 @@ class Api:
                     return {**empty, 'reference_species': sorted(refs),
                             'method_check': method_check,
                             'needs_method_confirmation': True,
-                            'error': '参考能与新任务的方法证据不完整；请阅读差异后填写确认理由'}
+                            'error': '参考能与新任务存在需人工核对的方法差异或证据缺项；'
+                                     '请阅读提示后填写确认理由'}
                 method_check['confirmation'] = {
                     'confirmed': True, 'reason': reason,
                     'confirmed_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
@@ -1821,7 +1889,8 @@ class Api:
                 'incar': {'path': incar, 'sha256': _sha256_file(incar)},
                 'configs': [
                     {'path': path, 'sha256': _sha256_file(path),
-                     'species': source_species[path]}
+                     'species': source_species[path],
+                     'species_evidence': source_species_evidence[path]}
                     for path in configs
                 ],
                 'reference_project': reference_path,
@@ -1860,6 +1929,7 @@ class Api:
                 target, project_name, clean_poscar=slab,
                 config_poscars=configs, incar_path=incar, lib_root=(lib_root or None),
                 config_species=source_species, species_refs=refs,
+                config_species_evidence=source_species_evidence,
                 species_ref_jobs=ref_jobs, molecules_dir=molecules_dir,
                 reference_project=reference_path, preparation=preparation,
                 fail_if_exists=True)
@@ -1917,6 +1987,8 @@ class Api:
             launch_profile.walltime = wall
             resources = {'profile': prof.name, 'nodes': 1, 'cores': ncores,
                          'ppn': ncores, 'walltime': wall}
+            if hasattr(self._sub(), 'profile_binding'):
+                resources['profile_binding'] = self._sub().profile_binding(prof)
             mode = str(getattr(prof, 'script_mode', 'auto') or 'auto')
             raw_commands = getattr(prof, 'engine_commands', {}) or {}
             commands = ({str(key).strip().lower(): str(value or '').strip()
@@ -1984,12 +2056,20 @@ class Api:
             previous_launch = dict(project.get('launch') or {})
             previous_resources = dict(previous_launch.get('resources') or {})
             previous_profile = str(previous_resources.get('profile') or '').strip()
+            previous_binding = previous_resources.get('profile_binding') or {}
+            current_binding = resources.get('profile_binding') or {}
             previous_submitted = list(previous_launch.get('submitted_job_dirs') or [])
             if previous_submitted and previous_profile and previous_profile != prof.name:
                 raise ValueError(
                     f'该项目已有 {len(previous_submitted)} 个作业由服务器'
                     f'「{previous_profile}」自动托管，不能改用「{prof.name}」覆盖项目'
                     '级服务器绑定。请继续使用原服务器，或新建项目。')
+            if (previous_submitted and previous_binding
+                    and previous_binding.get('fingerprint')
+                    != current_binding.get('fingerprint')):
+                raise ValueError(
+                    f'服务器「{prof.name}」的连接端点已与项目首次提交时不同；'
+                    '为防止同名配置接管旧任务，已阻止本次提交。请恢复原配置或新建项目。')
 
             eligible, skipped, reconciled = [], [], []
             for job_dir in job_dirs:
@@ -1998,6 +2078,10 @@ class Api:
                 job_id = (manifest or {}).get('scheduler_job_id')
                 if manifest is None:
                     skipped.append({'dir': job_dir, 'reason': '缺少可读 job.yaml'})
+                elif state == 'DONE':
+                    # 已收敛分子参考是只读依赖，可跨服务器复用；它既不应进入本项目
+                    # 的提交白名单，也不应因保留了原服务器 job_id 而被误判为串服。
+                    skipped.append({'dir': job_dir, 'reason': '当前状态 DONE 不重复提交'})
                 elif job_id:
                     bound_profile = str(manifest.get('cluster') or '').strip()
                     if bound_profile and bound_profile != prof.name:
@@ -2007,9 +2091,12 @@ class Api:
                             f'「{prof.name}」。同一项目当前只允许一台服务器'
                             '自动托管。')
                     if bound_profile == prof.name:
+                        if hasattr(self._sub(), 'assert_profile_binding'):
+                            self._sub().assert_profile_binding(
+                                prof, job_dir, '项目继续托管', manifest=manifest)
                         reconciled.append(job_dir)
                     skipped.append({'dir': job_dir, 'reason': f'已有作业号 {job_id}'})
-                elif state == 'DONE' or state in _ACTIVE_STATES:
+                elif state in _ACTIVE_STATES:
                     skipped.append({'dir': job_dir, 'reason': f'当前状态 {state} 不重复提交'})
                 else:
                     eligible.append(job_dir)
@@ -2292,13 +2379,17 @@ class Api:
             else:
                 parts.append(f'气相参考:{ref_state}' if s.get('has_ref')
                              else '未设气相参考')
+            final_eligible, final_reason = self._final_report_gate(proj, s)
             return {'ok': True, 'rows': rows, 'note': ';'.join(parts),
                     'reference_mode': s.get('reference_mode', 'none'),
                     'species_refs': s.get('species_refs') or {},
+                    'dataset_groups': s.get('dataset_groups') or [],
                     'method_consistency': s.get('method_consistency') or {},
                     'slab': {'state': slab_state, 'energy': e_slab},
                     'ref': {'state': ref_state, 'energy': e_ref,
                             'has_ref': bool(s.get('has_ref'))},
+                    'final_report_eligible': final_eligible,
+                    'final_report_reason': final_reason,
                     'error': None}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'rows': [], 'note': '', 'error': str(e)}
@@ -2319,7 +2410,7 @@ class Api:
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'file': None, 'error': str(e)}
 
-    def proj_report(self, path, save_to):
+    def proj_report(self, path, save_to, final=False):
         """完整项目报告(镜像 project_tab._on_report);同步执行,耗时长在 JS 侧提示等待。
 
         load_project → 无成员作业防呆(report_full._member_dirs)→ generate_project_report
@@ -2335,6 +2426,12 @@ class Api:
                 return {'ok': False, 'file': None, 'error': '未指定报告路径'}
             if not self._rf()._member_dirs(proj):
                 return {'ok': False, 'file': None, 'error': '项目无成员作业'}
+            if final:
+                summary = self._adsorption.delta_e_rows(proj)
+                eligible, reason = self._final_report_gate(proj, summary)
+                if not eligible:
+                    return {'ok': False, 'file': None,
+                            'error': f'最终吸附能报告门禁未通过：{reason}'}
             try:
                 cfg = self._config.load_config()
             except Exception:                             # noqa: BLE001
@@ -2959,18 +3056,46 @@ class Api:
             return True
         job_id = str(manifest.get('scheduler_job_id') or '')
         results = manifest.get('results') or {}
-        if (not job_id or not results.get('fetched_at')
+        if (str(manifest.get('state') or '') != 'DONE'
+                or not job_id or not results.get('fetched_at')
+                or str(results.get('fetched_state') or '') != 'DONE'
                 or str(results.get('fetched_job_id') or '') != job_id
                 or str(results.get('fetched_remote_dir') or '') != remote_dir):
             return False
-        if str(manifest.get('task_type') or '') == 'neb':
-            return True
-        required = {'CONTCAR', 'OSZICAR', 'OUTCAR'}
+        try:
+            from vcstudio.cluster.submitter import current_attempt_token
+            if (str(results.get('fetched_attempt_token') or '')
+                    != current_attempt_token(manifest)):
+                return False
+        except (ImportError, TypeError, ValueError):
+            return False
+        contract = results.get('fetch_contract') or {}
+        if (not isinstance(contract, dict)
+                or str(contract.get('state') or '') != 'DONE'
+                or str(contract.get('scheduler_job_id') or '') != job_id
+                or str(contract.get('remote_dir') or '') != remote_dir
+                or str(contract.get('attempt_token') or '')
+                != str(results.get('fetched_attempt_token') or '')):
+            return False
+        hashes = results.get('fetched_sha256') or {}
+        sizes = results.get('fetched_sizes') or {}
         fetched = {str(name) for name in (results.get('fetched') or [])}
+        for filename in fetched:
+            path = os.path.join(job_dir, *filename.split('/'))
+            try:
+                if (not os.path.isfile(path)
+                        or int(sizes.get(filename, -1)) != os.path.getsize(path)
+                        or str(hashes.get(filename) or '') != _sha256_file(path)):
+                    return False
+            except (OSError, TypeError, ValueError):
+                return False
+        if str(manifest.get('task_type') or '') == 'neb':
+            return bool(fetched)
+        required = {'CONTCAR', 'OSZICAR', 'OUTCAR'}
         missing = {str(name) for name in (results.get('fetched_missing') or [])}
         return (required.issubset(fetched) and required.isdisjoint(missing)
-                and all(os.path.isfile(os.path.join(job_dir, filename))
-                        for filename in required))
+                and required.issubset(set(hashes))
+                and required.issubset(set(sizes)))
 
     def _project_stage(self, states, has_marker):
         """成员状态 + 报告标记 → (stage, needs_human, recover_round)。规则见 pipeline_status。"""
@@ -2992,7 +3117,10 @@ class Api:
                  for s in states):
             stage = 'recover'
         elif all_states and all(s == 'DONE' for s in all_states):
-            stage = 'report_done' if has_marker else 'analysis'
+            if not all(s.get('local_results_ready', True) for s in states):
+                stage = 'monitor'  # 已结束但结果尚未完整回收，不能提前进入分析
+            else:
+                stage = 'report_done' if has_marker else 'analysis'
         elif any(s in _TERMINAL_FAIL for s in all_states):
             stage = 'analysis'                            # 达上限/不可续算：转人工，不再伪装恢复中
         else:
@@ -3009,7 +3137,7 @@ class Api:
                     if proj is None:
                         continue
                     states = self._member_states(proj)
-                    has_marker = bool(proj.get('autopilot_report_done'))
+                    has_marker = self._report_marker_current(proj)
                     stage, needs_human, rr = self._project_stage(states, has_marker)
                     projs.append({
                         'path': pp, 'name': proj.get('name', '') or '',
@@ -3036,9 +3164,9 @@ class Api:
         def _key(path):
             return os.path.normcase(os.path.abspath(os.path.normpath(str(path))))
 
-        managed_dirs = set()
-        try:
-            for project_path in self._adsorption.list_projects():
+        managed_dirs = {}
+        for project_path in self._adsorption.list_projects():
+            try:
                 project = self._adsorption.load_project(project_path)
                 launch = (project or {}).get('launch') or {}
                 resources = launch.get('resources') or {}
@@ -3049,10 +3177,11 @@ class Api:
                 }
                 submitted_dirs = launch.get('submitted_job_dirs') or []
                 # 必须同时是该项目成员、且确由一站式提交成功后写入 launch 的目录。
-                managed_dirs.update(_key(path) for path in submitted_dirs
-                                    if path and _key(path) in member_dirs)
-        except Exception:                                 # noqa: BLE001 注册表坏不扩大自动化范围
-            managed_dirs = set()
+                for path in submitted_dirs:
+                    if path and _key(path) in member_dirs:
+                        managed_dirs[_key(path)] = str(path)
+            except Exception as exc:                     # noqa: BLE001 单个坏项目不拖停同服务器
+                errors.append(f'集群「{name}」项目托管清单读取失败({project_path}):{exc}')
 
         def _in_scope(job_dir):
             # 空白名单必须 fail closed，绝不能退化成“台账里的所有旧任务”。
@@ -3064,12 +3193,15 @@ class Api:
         def _record_remote_failure(stage, detail):
             nonlocal sync_ok
             sync_ok = False
-            label = {'continue': '续算', 'fetch': '下载'}.get(stage, stage)
+            label = {'refresh': '刷新', 'continue': '续算', 'fetch': '下载'}.get(stage, stage)
             text = f'集群「{name}」{label}跳过:{detail}'
             events.append({'kind': stage, 'cluster': name, 'text': text})
             errors.append(f'集群「{name}」同步失败({label}):{detail}')
 
-        entries = list(self._ledger.load_all())
+        # project.launch.submitted_job_dirs 是远程写操作的授权真源；台账只是 UI 索引，
+        # 丢条目后仍须继续监控明确托管的项目，不能静默停管。
+        entries = [(path, self._manifest.load_manifest(path))
+                   for path in managed_dirs.values()]
         targets = [d for d, m in entries
                    if m and m.get('scheduler_job_id') and m.get('cluster') == name
                    and m.get('state') in ('SUBMITTED', 'QUEUED', 'RUNNING')
@@ -3086,7 +3218,10 @@ class Api:
             for d, note in (res.get('results') or []):
                 events.append({'kind': 'refresh', 'cluster': name,
                                'text': f'{self._base(d)}:{note}'})
-        entries2 = list(self._ledger.load_all())
+                if str(note).startswith('查询失败:'):
+                    _record_remote_failure('refresh', f'{self._base(d)}:{note}')
+        entries2 = [(path, self._manifest.load_manifest(path))
+                    for path in managed_dirs.values()]
         # 续算:刷新后 restartable 终态且 attempts<3 → 自动续算(复用 filter_continuable)
         if ap['cont']:
             try:
@@ -3102,6 +3237,8 @@ class Api:
                     for d, ok, msg in (cres.get('results') or []):
                         events.append({'kind': 'continue', 'cluster': name,
                                        'text': f'{self._base(d)}:{msg}'})
+                        if not ok:
+                            _record_remote_failure('continue', f'{self._base(d)}:{msg}')
             except Exception as e:                        # noqa: BLE001 单集群失败不拖垮其它集群
                 _record_remote_failure('continue', str(e))
         # 拉回：不能只看“本轮新变 DONE”。应用可能在任务结束后才重启，此时本地
@@ -3126,6 +3263,8 @@ class Api:
                     for d, ok, msg in (fres.get('results') or []):
                         events.append({'kind': 'fetch', 'cluster': name,
                                        'text': f'{self._base(d)}:{msg}'})
+                        if not ok:
+                            _record_remote_failure('fetch', f'{self._base(d)}:{msg}')
             except Exception as e:                        # noqa: BLE001 单集群失败不拖垮其它集群
                 _record_remote_failure('fetch', str(e))
         return sync_ok and did_remote_action
@@ -3133,13 +3272,96 @@ class Api:
     def _project_all_done(self, states):
         return bool(states) and all(s['state'] == 'DONE' for s in states)
 
+    @staticmethod
+    def _method_confirmation(project) -> dict:
+        check = ((project or {}).get('preparation') or {}).get('method_check') or {}
+        confirmation = check.get('confirmation') or {}
+        return confirmation if isinstance(confirmation, dict) else {}
+
+    def _final_report_gate(self, project, summary):
+        """Return whether ``summary`` is a deliverable adsorption-energy result."""
+        rows = list((summary or {}).get('rows') or [])
+        if not (summary or {}).get('has_ref'):
+            return False, '未设置有效气相/逐物种参考态；当前差值不是完整吸附能'
+        if not rows:
+            return False, '没有吸附构型结果'
+        invalid_refs = [row.get('name') for row in rows if not row.get('reference_valid')]
+        if invalid_refs:
+            return False, '以下构型的参考态未通过完整性校验：' + '、'.join(
+                str(name or '?') for name in invalid_refs)
+        incomplete = [row.get('name') for row in rows
+                      if _method_number(row.get('delta_e')) is None]
+        if incomplete:
+            return False, '以下构型尚无有效 ΔE：' + '、'.join(
+                str(name or '?') for name in incomplete)
+        method = (summary or {}).get('method_consistency') or {}
+        status = str(method.get('status') or 'unverified')
+        if status == 'incompatible':
+            return False, '能量项方法不兼容：' + '；'.join(method.get('issues') or [])
+        if status != 'verified':
+            confirmation = self._method_confirmation(project)
+            if not (confirmation.get('confirmed')
+                    and str(confirmation.get('reason') or '').strip()):
+                return False, '方法证据仍为 unverified，且没有保存带理由的人工确认'
+        return True, ''
+
+    def _report_input_fingerprint(self, project, summary) -> str:
+        """Bind a final report to member attempts, downloaded files and ΔE rows."""
+        members = []
+        for job_dir in self._project_member_dirs(project):
+            manifest = self._manifest.load_manifest(job_dir) or {}
+            results = manifest.get('results') or {}
+            attempts = manifest.get('attempts') or []
+            members.append({
+                'dir': os.path.abspath(os.path.normpath(str(job_dir))),
+                'state': manifest.get('state'),
+                'job_id': manifest.get('scheduler_job_id'),
+                'attempt': attempts[-1] if attempts else None,
+                'energy_e0_eV': results.get('energy_e0_eV'),
+                'fetched_job_id': results.get('fetched_job_id'),
+                'fetched_remote_dir': results.get('fetched_remote_dir'),
+                'fetched_sha256': results.get('fetched_sha256') or {},
+            })
+        payload = {
+            'project': project.get('project_uuid') or project.get('name'),
+            'members': members,
+            'reference_mode': summary.get('reference_mode'),
+            'species_reference_evidence': summary.get('species_reference_evidence') or [],
+            'method_consistency': summary.get('method_consistency') or {},
+            'method_confirmation': self._method_confirmation(project),
+            'rows': [{
+                'name': row.get('name'), 'species': row.get('species'),
+                'delta_e': row.get('delta_e'), 'dd_e': row.get('dd_e'),
+                'reference_job': row.get('reference_job'),
+                'reference_valid': row.get('reference_valid'),
+            } for row in (summary.get('rows') or [])],
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                             separators=(',', ':'), default=str).encode('utf-8')
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _report_marker_current(self, project, summary=None) -> bool:
+        marker = (project or {}).get('autopilot_report')
+        if not isinstance(marker, dict):
+            return False
+        report_path = str(marker.get('file') or '')
+        if not report_path or not os.path.isfile(report_path):
+            return False
+        try:
+            current = summary or self._adsorption.delta_e_rows(project)
+            if marker.get('input_fingerprint') != self._report_input_fingerprint(project, current):
+                return False
+            expected_hash = str(marker.get('report_sha256') or '')
+            return bool(expected_hash and _sha256_file(report_path) == expected_hash)
+        except Exception:                                # noqa: BLE001 失效即重建，绝不误报完成
+            return False
+
     def _tick_reports(self, events, errors):
         """只为一站式托管且每个构型都有有效 ΔE 的项目生成最终报告。"""
         for pp in self._adsorption.list_projects():
             try:
                 proj = self._adsorption.load_project(pp)
-                if (proj is None or not proj.get('autopilot_managed')
-                        or proj.get('autopilot_report_done')):
+                if proj is None or not proj.get('autopilot_managed'):
                     continue
                 states = self._member_states(proj)
                 if not self._project_all_done(states):
@@ -3148,28 +3370,48 @@ class Api:
                     # 远端 DONE 但轻量结果仍未完整回到本地时，不抢跑报告；_tick_cluster
                     # 会在本拍先补拉，成功后这里重新读 manifest 即可同拍继续。
                     continue
-                delta_rows = (self._adsorption.delta_e_rows(proj).get('rows') or [])
-                if (not delta_rows
-                        or any(_method_number(row.get('delta_e')) is None
-                               for row in delta_rows)):
-                    # proj_report 可生成诊断页，但诊断页不是可交付的吸附能报告，不能打
-                    # report_done 标记，否则补齐参考态后也不会再次自动生成。
+                summary = self._adsorption.delta_e_rows(proj)
+                if self._report_marker_current(proj, summary):
+                    continue
+                eligible, _gate_reason = self._final_report_gate(proj, summary)
+                if not eligible:
+                    # 诊断/相对能页面不是可交付吸附能报告，不能打 final marker。
                     continue
                 name = proj.get('name', '') or self._base(os.path.dirname(str(pp)))
                 root = proj.get('root') or os.path.dirname(str(pp))
                 report_dir = os.path.join(root, 'report')
                 os.makedirs(report_dir, exist_ok=True)
                 fig = self._auto_figures_for_project(proj, pp, report_dir)
-                rep = self.proj_report(pp, os.path.join(report_dir, f'{name}_report.html'))
+                rep = self.proj_report(
+                    pp, os.path.join(report_dir, f'{name}_report.html'), final=True)
                 if not rep.get('ok'):
                     errors.append(f'项目「{name}」自动报告失败:{rep.get("error")}')
                     continue
-                # 安全的 yaml 读改写:原地打标记 + 落盘(落盘失败仅记 error,下拍再试)
-                proj['autopilot_report_done'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+                report_file = str(rep.get('file') or '')
+                if not report_file or not os.path.isfile(report_file):
+                    errors.append(f'项目「{name}」报告生成器未产出可读文件')
+                    continue
+                generated_at = time.strftime('%Y-%m-%dT%H:%M:%S')
+                marker = {
+                    'generated_at': generated_at,
+                    'input_fingerprint': self._report_input_fingerprint(proj, summary),
+                    'file': report_file,
+                    'report_sha256': _sha256_file(report_file),
+                    'figures_dir': fig.get('out_dir'),
+                }
+                # 先用独立副本落盘，成功后才更新当前内存对象。
+                # 否则一次保存失败会在进程内留下“伪 marker”，
+                # 下一拍可能错误认为报告已持久化而不再重试。
+                persisted = dict(proj)
+                persisted['autopilot_report'] = marker
+                persisted['autopilot_report_done'] = generated_at  # 旧界面只读兼容
                 try:
-                    self._adsorption.save_project(root, proj)
+                    self._adsorption.save_project(root, persisted)
                 except Exception as e:                    # noqa: BLE001
                     errors.append(f'项目「{name}」报告标记落盘失败:{e}')
+                    continue
+                proj['autopilot_report'] = marker
+                proj['autopilot_report_done'] = generated_at
                 nfig = len(fig.get('files') or [])
                 extra = f'(一键出图 {nfig} 张)' if fig.get('engine') == 'auto_figures' else ''
                 events.append({'kind': 'report_done', 'project': name,
@@ -3262,6 +3504,21 @@ class Api:
                     errors.append(f'批次自动派生失败({self._base(src)}/{derive}):{e}')
 
     def pipeline_tick(self):
+        """Run at most one automation tick in this backend process."""
+        if not self._pipeline_lock.acquire(blocking=False):
+            return {
+                'ok': True,
+                'events': [{'kind': 'skip', 'text': '上一轮自动托管仍在执行，本轮已跳过'}],
+                'errors': [], 'synced': 0,
+                'last_sync': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'busy': True,
+            }
+        try:
+            return self._pipeline_tick_once()
+        finally:
+            self._pipeline_lock.release()
+
+    def _pipeline_tick_once(self):
         """服务端一拍编排(幂等,全部复用现有方法):逐集群刷新/续算/拉回 + 自动报告。
 
         返回 {'ok','events':[{kind,text,...}],'errors':[...],'last_sync','synced'}。
@@ -3278,6 +3535,24 @@ class Api:
         except Exception as e:                            # noqa: BLE001
             profiles = {}
             errors.append(f'读取集群配置失败:{e}')
+        # 项目仍声明托管、但配置已删除时必须明确报警；静默忽略会让用户误以为
+        # 任务仍在监控。逐项目隔离，坏项目不能掩盖其它服务器。
+        try:
+            for project_path in self._adsorption.list_projects():
+                try:
+                    project = self._adsorption.load_project(project_path)
+                    if not (project or {}).get('autopilot_managed'):
+                        continue
+                    profile_name = str(((((project or {}).get('launch') or {})
+                                        .get('resources') or {}).get('profile') or '')).strip()
+                    if profile_name and profile_name not in profiles:
+                        errors.append(
+                            f'托管项目「{(project or {}).get("name") or project_path}」引用的'
+                            f'服务器「{profile_name}」已不存在；请恢复该配置或停止托管')
+                except Exception as exc:                 # noqa: BLE001
+                    errors.append(f'托管项目读取失败({project_path}):{exc}')
+        except Exception as exc:                         # noqa: BLE001
+            errors.append(f'托管项目注册表读取失败:{exc}')
         runnable = []
         for name, prof in profiles.items():
             try:

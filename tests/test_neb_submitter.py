@@ -270,8 +270,15 @@ def test_neb_refresh_image_scf_crash_named(tmp_path):
 
 
 # ── 逐 image 回收 ──
+def _mark_done(job_dir):
+    data = manifest.load_manifest(job_dir)
+    manifest.set_state(data, 'DONE', note='test remote completion')
+    manifest.save_manifest(job_dir, data)
+
+
 def test_neb_fetch_per_image(tmp_path):
     jd = _submit(tmp_path)
+    _mark_done(jd)
     sftp = FakeSFTP()
     fetched, missing = submitter.fetch_results(FakeClient(), sftp, jd)
     assert '01/OSZICAR' in fetched and '00/OUTCAR' in fetched and '04/OUTCAR' in fetched
@@ -281,6 +288,7 @@ def test_neb_fetch_per_image(tmp_path):
 
 def test_neb_fetch_missing_recorded(tmp_path):
     jd = _submit(tmp_path)
+    _mark_done(jd)
     sftp = FakeSFTP(fail_on=('CONTCAR',))              # 远端各 image 无 CONTCAR
     fetched, missing = submitter.fetch_results(FakeClient(), sftp, jd)
     assert any('CONTCAR' in t for t in missing)
@@ -289,6 +297,7 @@ def test_neb_fetch_missing_recorded(tmp_path):
 
 def test_neb_interrupted_image_fetch_preserves_previous_result(tmp_path):
     jd = _submit(tmp_path)
+    _mark_done(jd)
     target = os.path.join(jd, '01', 'OUTCAR')
     with open(target, 'w', encoding='utf-8') as handle:
         handle.write('previous complete image OUTCAR\n')

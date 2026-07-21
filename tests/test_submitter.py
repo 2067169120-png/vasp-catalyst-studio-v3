@@ -1,6 +1,7 @@
 """提交编排测试:注入假 client/sftp,验证 preflight/上传/提交/状态刷新与 manifest 回写。"""
 import os
 import posixpath
+import threading
 
 import pytest
 
@@ -563,6 +564,33 @@ def test_continue_from_contcar_happy(tmp_path):
     assert os.path.isfile(os.path.join(d, 'OUTCAR'))             # 旧文件保留作审计，不算新轮证据
 
 
+def test_continue_from_contcar_qsub_without_job_id_rolls_back(tmp_path):
+    """qsub 未返回作业号时恢复本地 POSCAR 及远端本轮归档，清单不得推进。"""
+    d = _restartable_job(tmp_path)
+    local_poscar = os.path.join(d, 'POSCAR')
+    before_poscar = open(local_poscar, encoding='utf-8').read()
+    before_manifest = manifest.load_manifest(d)
+    client = FakeClient(script=[
+        ('cat', _VALID_CONTCAR),
+        ('stat -c', 'OUTCAR 90000 1000\nOSZICAR 3000 1000\n'),
+        ('qsub', 'qsub: submission rejected\n'),
+    ])
+
+    with pytest.raises(RuntimeError, match='submission rejected'):
+        submitter.continue_from_contcar(client, _profile(), d)
+
+    assert open(local_poscar, encoding='utf-8').read() == before_poscar
+    assert os.path.isfile(f'{local_poscar}.bak1')
+    assert manifest.load_manifest(d) == before_manifest
+    assert any('cp CONTCAR POSCAR' in command and
+               '.vcstudio_previous_POSCAR' in command
+               for command in client.commands)
+    rollback = client.commands[-1]
+    assert '.vcstudio_history/round_01/OUTCAR' in rollback
+    assert '.vcstudio_history/round_01/CONTCAR' in rollback
+    assert '.vcstudio_previous_POSCAR' in rollback
+
+
 def test_continue_refuses_wrong_cluster_before_remote_mutation(tmp_path):
     d = _restartable_job(tmp_path)
     client = FakeClient()
@@ -630,6 +658,42 @@ def test_continue_with_incar_changes_clears_fetch_evidence(tmp_path):
         assert key not in m['results']
 
 
+def test_tuned_continue_qsub_without_job_id_restores_inputs_and_archive(tmp_path):
+    """改参重投未取得作业号时，本地和远端 INCAR/POSCAR/旧输出全部回滚。"""
+    d = _restartable_job(tmp_path)
+    local_incar = os.path.join(d, 'INCAR')
+    local_poscar = os.path.join(d, 'POSCAR')
+    before_incar = open(local_incar, encoding='utf-8').read()
+    before_poscar = open(local_poscar, encoding='utf-8').read()
+    before_manifest = manifest.load_manifest(d)
+    client = FakeClient(script=[
+        ('cat', _VALID_CONTCAR),
+        ('stat -c', 'OUTCAR 90000 1000\nOSZICAR 3000 1000\n'),
+        ('qsub', 'qsub: submission rejected\n'),
+    ])
+    sftp = FakeSFTP()
+
+    with pytest.raises(RuntimeError, match='submission rejected'):
+        submitter.continue_with_incar_changes(
+            client, sftp, _profile(), d, {'ALGO': 'Normal'})
+
+    assert open(local_incar, encoding='utf-8').read() == before_incar
+    assert open(local_poscar, encoding='utf-8').read() == before_poscar
+    assert os.path.isfile(f'{local_incar}.bak1')
+    assert os.path.isfile(f'{local_poscar}.bak1')
+    assert manifest.load_manifest(d) == before_manifest
+    assert any(remote.endswith('/INCAR') for remote in sftp.uploaded)
+    archive = next(command for command in client.commands
+                   if '.vcstudio_previous_INCAR' in command and 'for f in' in command)
+    assert '.vcstudio_previous_POSCAR' in archive
+    assert 'cp CONTCAR POSCAR' in archive
+    rollback = client.commands[-1]
+    for name in ('OUTCAR', 'OSZICAR', 'vasprun.xml', 'CONTCAR', 'XDATCAR'):
+        assert f'.vcstudio_history/round_01/{name}' in rollback
+    assert '.vcstudio_previous_INCAR' in rollback
+    assert '.vcstudio_previous_POSCAR' in rollback
+
+
 def test_bands_tuned_restart_also_preserves_chgcar(tmp_path):
     d = _restartable_job(tmp_path)
     data = manifest.load_manifest(d)
@@ -653,6 +717,7 @@ def test_fetch_results_records_current_job_and_missing(tmp_path):
         FakeClient(script=[('qsub', '301.cluster\n')]), FakeSFTP(), _profile(), d)
     before = manifest.load_manifest(d)
     before.setdefault('results', {})['missing'] = ['stale-old-round']
+    manifest.set_state(before, 'DONE', note='test remote completion')
     manifest.save_manifest(d, before)
 
     fetched, missing = submitter.fetch_results(
@@ -667,6 +732,8 @@ def test_fetch_results_records_current_job_and_missing(tmp_path):
     assert results['fetched_at']
     assert results['fetched_job_id'] == '301'
     assert results['fetched_remote_dir'] == updated['remote_dir']
+    assert results['fetched_state'] == 'DONE'
+    assert results['fetched_attempt_token'] == submitter.current_attempt_token(updated)
     assert 'missing' not in results
 
 
@@ -746,13 +813,8 @@ def test_continue_then_still_queued_stays_submitted(tmp_path):
     因为旧 OUTCAR 的收敛/震荡串被当成了本轮结果。"""
     d = _restartable_job(tmp_path)
     submitter.continue_from_contcar(_continue_client(), _profile(), d)
-    # 新号 201 不在 qstat(GONE);OUTCAR mtime 仍是基线 1000(本轮尚未重写);
-    # 且旧 OUTCAR 还带收敛串 + E0 —— 正是会被误判 DONE 的陷阱
-    refresh_client = FakeClient(script=[
-        ('stat -c', 'OUTCAR 90000 1000\nOSZICAR 3000 1000\n'),
-        ('grep -c', '1\n1\n0\n'),
-        ('tail -n 150', '   5 F= -.5E+01 E0= -.5E+01  d E =-.1E-05\n'),
-    ])
+    # 新号 201 不在 qstat(GONE)，旧轮输出已归档且本轮尚无 OUTCAR。
+    refresh_client = FakeClient(script=[('stat -c', '')])
     m = submitter.refresh_job(refresh_client, _profile(), d, live_states={})
     assert m['state'] == 'SUBMITTED'              # 仍视为在途,未误判终态
     assert m['results'].get('settling')           # 记录了沉降原因(可供前端提示)
@@ -774,12 +836,12 @@ def test_continue_then_new_run_rewrote_outcar_classifies(tmp_path):
     assert 'settling' not in m['results']
 
 
-def test_continue_seen_in_scheduler_then_gone_classifies(tmp_path):
-    """续算后先在 qstat 现身(QUEUED)→ 状态离开 SUBMITTED;再消失即正常判终态,不沉降。"""
+def test_continue_seen_running_then_gone_classifies(tmp_path):
+    """续算后真正进入 RUNNING，再消失时才可放行终态取证。"""
     d = _restartable_job(tmp_path)
     submitter.continue_from_contcar(_continue_client(), _profile(), d)
-    submitter.refresh_job(FakeClient(), _profile(), d, live_states={'201': 'QUEUED'})
-    # 再消失,OUTCAR 仍旧(mtime 未变)但已确认活过 → 落终态
+    submitter.refresh_job(FakeClient(), _profile(), d, live_states={'201': 'RUNNING'})
+    # 再消失,OUTCAR mtime 未变，但已有本轮 RUNNING 证据 → 允许取证。
     refresh_client = FakeClient(script=[('stat -c', 'OUTCAR 90000 1000\nOSZICAR 3000 1000\n'),
                                         ('grep -c', '0\n')])
     m = submitter.refresh_job(refresh_client, _profile(), d, live_states={})
@@ -787,16 +849,30 @@ def test_continue_seen_in_scheduler_then_gone_classifies(tmp_path):
     assert 'settling' not in m['results']
 
 
-def test_continue_settling_cap_eventually_classifies(tmp_path):
-    """兜底:连续 SETTLE_MAX_CHECKS 次仍 GONE+旧 OUTCAR(疑重投即被拒)→ 放行落终态,
-    不永久卡 SUBMITTED。"""
+def test_continue_seen_only_queued_never_reuses_old_outcar(tmp_path):
+    """QUEUED 只证明进过队列；未见 RUNNING/新输出时不得复用旧 OUTCAR。"""
     d = _restartable_job(tmp_path)
     submitter.continue_from_contcar(_continue_client(), _profile(), d)
-    stale = [('stat -c', 'OUTCAR 90000 1000\nOSZICAR 3000 1000\n'), ('grep -c', '0\n')]
+    submitter.refresh_job(FakeClient(), _profile(), d, live_states={'201': 'QUEUED'})
+    # 旧轮输出已归档；工作目录尚无本轮 OUTCAR。
+    stale = [('stat -c', '')]
+    m = submitter.refresh_job(FakeClient(script=stale), _profile(), d, live_states={})
+    assert m['state'] == 'QUEUED'
+    assert m['results']['settling']['checks'] == 1
+    assert 'diagnosis' not in m['results']
+
+
+def test_continue_settling_cap_stops_for_human_without_old_output(tmp_path):
+    """连续达上限仍 GONE+无本轮 OUTCAR 时转人工，不得放行旧轮终态取证。"""
+    d = _restartable_job(tmp_path)
+    submitter.continue_from_contcar(_continue_client(), _profile(), d)
+    stale = [('stat -c', '')]
     last = None
     for _ in range(submitter.SETTLE_MAX_CHECKS):
         last = submitter.refresh_job(FakeClient(script=stale), _profile(), d, live_states={})
-    assert last['state'] != 'SUBMITTED'            # 到上限后兜底落终态
+    assert last['state'] == 'NEEDS_HUMAN'
+    assert last['results']['diagnosis']['failure_class'] == 'CONTINUE_RUN_NOT_OBSERVED'
+    assert last['results'].get('energy_e0_eV') is None
 
 
 def test_fresh_submit_gone_still_classifies_immediately(tmp_path):
@@ -1122,3 +1198,25 @@ def test_remote_dir_preserves_legacy_path_for_same_profile(tmp_path):
     other = _profile(name='other', remote_root='/scratch/other')
     assert submitter._spec_for(other, job).remote_dir.startswith(
         '/scratch/other/zn_job--')
+
+
+def test_job_operation_rejects_overlapping_cross_thread_mutation(tmp_path):
+    job = _job_dir(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hold_lock():
+        with submitter.job_operation(job, '测试占用'):
+            entered.set()
+            release.wait(timeout=5)
+
+    thread = threading.Thread(target=hold_lock)
+    thread.start()
+    assert entered.wait(timeout=2)
+    try:
+        with pytest.raises(RuntimeError, match='正在执行另一项'):
+            submitter.submit_job(FakeClient(), FakeSFTP(), _profile(), job)
+    finally:
+        release.set()
+        thread.join(timeout=2)
+    assert not thread.is_alive()

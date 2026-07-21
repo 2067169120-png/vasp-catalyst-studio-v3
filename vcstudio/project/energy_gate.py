@@ -71,8 +71,15 @@ def clean_completion_from_files(job_dir):
     return False, ''
 
 
-def validate_done_energy(job_dir, label, manifest_mod):
-    """Return ``(energy, manifest, evidence_messages)`` after hard validation."""
+def validate_done_energy(job_dir, label, manifest_mod, *, require_oszicar=False):
+    """Return ``(energy, manifest, evidence_messages)`` after hard validation.
+
+    ``require_oszicar`` is used by final total-energy subtraction workflows.
+    A manifest value alone is then insufficient: the downloaded/current
+    OSZICAR must contain the same final ``E0``.  Other callers retain the
+    legacy compatibility path because some imported calculations only carry a
+    complete vasprun.xml plus an audited manifest energy.
+    """
     manifest = manifest_mod.load_manifest(job_dir)
     if manifest is None:
         raise ValueError(
@@ -112,11 +119,17 @@ def validate_done_energy(job_dir, label, manifest_mod):
     if not math.isfinite(energy):
         raise ValueError(f'{label}的 energy_e0_eV 非有限数')
     parsed = parse_oszicar_energy(job_dir)
+    if require_oszicar and parsed is None:
+        raise ValueError(
+            f'{label}缺少可解析的当前轮 OSZICAR:E0；拒绝仅凭 job.yaml 缓存能量计算')
     if parsed is not None and abs(parsed - energy) > 1e-3:
         raise ValueError(
             f'{label}的 job.yaml 能量 {energy:.8f} eV 与 OSZICAR '
             f'{parsed:.8f} eV 不一致，疑混入不同轮结果')
-    return energy, manifest, [f'{label}完成证据：{clean_source}']
+    evidence = [f'{label}完成证据：{clean_source}']
+    if parsed is not None:
+        evidence.append(f'{label}能量证据：OSZICAR:E0={parsed:.8f} eV')
+    return energy, manifest, evidence
 
 
 def method_record(job_dir, manifest, label):

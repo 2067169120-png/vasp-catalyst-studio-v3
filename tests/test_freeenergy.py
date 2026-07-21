@@ -212,6 +212,25 @@ def test_path_from_project_picks_lowest_energy(tmp_path):
     assert out['steps'][1]['G'] == pytest.approx(-1.0)            # 取了 -105(DONE 里最稳)
 
 
+def test_path_from_project_prefers_explicit_species_for_generic_folder_names(tmp_path):
+    for name, e0 in (('mol_S8', -32.0), ('mol_Li2S', -8.0), ('mol_Li2S2', -12.0)):
+        folder = tmp_path / name
+        folder.mkdir()
+        (folder / 'OSZICAR').write_text(
+            f' 1 F= {e0} E0= {e0:.5E}\n', encoding='utf-8')
+    values = (('S8', -100.0), ('Li2S8', -105.0), ('Li2S6', -95.0),
+              ('Li2S4', -100.0), ('Li2S2', -103.0), ('Li2S', -104.0))
+    rows = [{'name': f'{index:03d}', 'species': species,
+             'e_config': energy, 'state': 'DONE'}
+            for index, (species, energy) in enumerate(values, 1)]
+
+    out = fe.path_from_project_and_molecules(
+        rows, e_slab=-90.0, molecules_dir=tmp_path)
+
+    assert [step['label'] for step in out['steps']] == [
+        'S8*', 'Li2S8*', 'Li2S6*', 'Li2S4*', 'Li2S2*', 'Li2S*']
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # 通用 CHE/ΔG 台阶引擎(F16)
 # ═════════════════════════════════════════════════════════════════════════════

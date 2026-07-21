@@ -26,6 +26,7 @@ from vcstudio.generate import potcar
 from vcstudio.generate.incar_builder import parse_incar
 from vcstudio.generate.job_builder import build_job_dir
 from vcstudio.generate.poscar import parse_poscar_species, read_poscar
+from vcstudio.project import structure_identity
 from vcstudio.shared import manifest as manifest_mod
 from vcstudio.shared.config import user_config_dir
 
@@ -160,7 +161,11 @@ def scan_structure_files(root: str | os.PathLike) -> list[dict]:
         if len(exact_structures) == 1:
             selected_exact = next(iter(exact_structures.values()))
         else:
-            for wanted in ('contcar', 'poscar'):
+            # This scanner supplies *new calculation inputs*.  A CONTCAR left
+            # beside POSCAR may belong to an earlier relaxation, so POSCAR is
+            # authoritative here.  Result import has a separate scanner that
+            # deliberately keeps the opposite (CONTCAR-first) policy.
+            for wanted in ('poscar', 'contcar'):
                 candidate = exact_structures.get(wanted)
                 if not candidate or candidate.is_symlink():
                     continue
@@ -169,10 +174,12 @@ def scan_structure_files(root: str | os.PathLike) -> list[dict]:
                 except (OSError, ValueError):
                     continue
                 selected_exact = candidate
-                if wanted == 'contcar' and 'poscar' in exact_structures:
-                    selection_note = '同目录同时有 POSCAR/CONTCAR，已优先选可解析的最终 CONTCAR'
-                elif wanted == 'poscar' and 'contcar' in exact_structures:
-                    selection_note = 'CONTCAR 不可解析，已回退到 POSCAR'
+                if wanted == 'poscar' and 'contcar' in exact_structures:
+                    selection_note = (
+                        '同目录同时有 POSCAR/CONTCAR；这是本次计算输入，'
+                        '已优先选 POSCAR，避免误用旧 CONTCAR')
+                elif wanted == 'contcar' and 'poscar' in exact_structures:
+                    selection_note = 'POSCAR 不可解析，已回退到 CONTCAR'
                 break
         for filename in sorted(filenames, key=str.casefold):
             path = current_path / filename
@@ -198,6 +205,10 @@ def scan_structure_files(root: str | os.PathLike) -> list[dict]:
                 'name': filename,
                 'species': _structure_species_hint(path),
             }
+            item['structure'] = structure_identity.poscar_facts(path)
+            item['species_source'] = 'path_name' if item['species'] else 'unresolved'
+            item['species_confidence'] = 'hint' if item['species'] else 'unknown'
+            item['species_confirmed'] = False
             if selection_note:
                 item['selection_note'] = selection_note
             found.append(item)
@@ -205,7 +216,7 @@ def scan_structure_files(root: str | os.PathLike) -> list[dict]:
     return found
 
 
-def scan_lis_input_bundle(root: str | os.PathLike) -> dict:
+def scan_lis_input_bundle(root: str | os.PathLike, reference_species=None) -> dict:
     """只读扫描一整套 Li-S 吸附输入，自动分出共享 INCAR/slab/config。
 
     只有唯一且命名明确的候选才自动填入；多个 INCAR 或多个 clean/slab 候选
@@ -252,10 +263,32 @@ def scan_lis_input_bundle(root: str | os.PathLike) -> dict:
     clean_candidates.sort(
         key=lambda item: (-_clean_score(item), os.path.relpath(item['path'], base).casefold()))
     clean_slab = clean_candidates[0]['path'] if len(clean_candidates) == 1 else ''
+    clean_inference = {'path': clean_slab, 'confidence': 'name' if clean_slab else 'unknown'}
+    if not clean_slab:
+        structural_clean = structure_identity.infer_clean_candidate(structures)
+        named_paths = {item['path'] for item in clean_candidates}
+        if (structural_clean.get('path') and (
+                not named_paths or structural_clean['path'] in named_paths)):
+            clean_slab = structural_clean['path']
+            clean_inference = structural_clean
+            clean_candidates = [
+                item for item in structures if item['path'] == clean_slab
+            ]
     excluded = {item['path'] for item in clean_candidates}
     if clean_slab:
         excluded = {clean_slab}
-    configs = [item for item in structures if item['path'] not in excluded]
+    configs = [dict(item) for item in structures if item['path'] not in excluded]
+    if clean_slab:
+        for item in configs:
+            assignment = structure_identity.classify_against_clean(
+                clean_slab, item['path'], name_hint=item.get('species') or '',
+                reference_species=reference_species)
+            item['assignment'] = assignment
+            item['species'] = assignment['species']
+            item['species_source'] = assignment['source']
+            item['species_confidence'] = assignment['confidence']
+            item['species_confirmed'] = bool(assignment['confirmed'])
+            item['adsorbate_composition'] = assignment['composition']
 
     warnings = []
     if not incar_candidates:
@@ -269,17 +302,60 @@ def scan_lis_input_bundle(root: str | os.PathLike) -> dict:
     elif len(clean_candidates) > 1:
         warnings.append(
             f'找到 {len(clean_candidates)} 个 clean/slab 候选；请手动选择正确的清洁表面')
+    if clean_slab and clean_inference.get('confidence') == 'exact':
+        warnings.append(
+            f'已通过 POSCAR 晶格与组成关系识别 clean slab，并据此整理 '
+            f'{sum(item.get("species_confidence") == "exact" for item in configs)} 个构型物种')
+    for item in configs:
+        warnings.extend(
+            f'{Path(item["path"]).parent.name or Path(item["path"]).name}: {message}'
+            for message in ((item.get('assignment') or {}).get('warnings') or []))
     return {
         'root': str(base),
         'incar': incar_candidates[0] if len(incar_candidates) == 1 else '',
         'incar_candidates': incar_candidates,
         'clean_slab': clean_slab,
         'clean_candidates': clean_candidates,
+        'clean_inference': clean_inference,
         'configs': configs,
         'structures': structures,
+        'species_groups': structure_identity.species_groups(configs),
+        'unresolved_species': sum(not item.get('species') for item in configs),
         'warnings': warnings,
         'source_read_only': True,
     }
+
+
+def identify_config_species(clean_slab, structures, reference_species=None) -> dict:
+    """Enrich scanned structures using auditable config-clean composition differences."""
+    clean = str(clean_slab or '').strip()
+    items = [dict(item) if isinstance(item, dict) else {'path': str(item)}
+             for item in (structures or [])]
+    warnings = []
+    if not clean:
+        return {'items': items, 'species_groups': structure_identity.species_groups(items),
+                'warnings': ['尚未指定 clean slab；物种仅按文件夹/文件名建议，需人工确认']}
+    enriched = []
+    for item in items:
+        if os.path.normcase(os.path.abspath(str(item.get('path') or ''))) == \
+                os.path.normcase(os.path.abspath(clean)):
+            continue
+        assignment = structure_identity.classify_against_clean(
+            clean, item.get('path'), name_hint=item.get('species') or '',
+            reference_species=reference_species)
+        item.update({
+            'assignment': assignment, 'species': assignment['species'],
+            'species_source': assignment['source'],
+            'species_confidence': assignment['confidence'],
+            'species_confirmed': bool(assignment['confirmed']),
+            'adsorbate_composition': assignment['composition'],
+        })
+        enriched.append(item)
+        warnings.extend(
+            f'{Path(str(item.get("path") or "")).parent.name}: {message}'
+            for message in assignment.get('warnings') or [])
+    return {'items': enriched, 'species_groups': structure_identity.species_groups(enriched),
+            'warnings': warnings}
 
 
 # ── 项目创建(批量生成) ───────────────────────────────────────────────────────
@@ -319,6 +395,7 @@ def create_project(root: str | os.PathLike, name: str, *,
                    incar_path: str, ref_poscar: str | None = None,
                    lib_root: str | None = None, validate: bool = True,
                    kpoints=None, config_species: dict | None = None,
+                   config_species_evidence: dict | None = None,
                    species_refs: dict | None = None,
                    species_ref_jobs: dict | None = None,
                    molecules_dir: str | None = None,
@@ -332,6 +409,14 @@ def create_project(root: str | os.PathLike, name: str, *,
          'errors': [(member, msg)]}。清洁表面生成失败 → 整体失败(其能量是公式必需项);
         个别构型失败只记入 errors,不拖垮全组。
     """
+    # Reject composition aliases before creating any job directories.  VASP
+    # composition can prove stoichiometry but cannot choose between two
+    # same-composition references (isomer, charge/spin state, or mere alias).
+    reference_labels = dict(species_ref_jobs or {})
+    for label in dict(species_refs or {}):
+        reference_labels.setdefault(label, None)
+    structure_identity.build_dataset_groups([], {}, reference_labels)
+
     final_root = Path(root).expanduser().resolve()
     stage_root = None
     if fail_if_exists:
@@ -371,13 +456,19 @@ def create_project(root: str | os.PathLike, name: str, *,
         # 2) 构型族(个别失败不拖垮兼容旧流程；原子发布模式则整组失败)
         config_dirs = []
         config_species_out = {}
+        config_evidence_out = {}
         source_species = {}
+        source_evidence = {}
         for source, species in dict(config_species or {}).items():
             value = str(species or '').strip()
             if not value:
                 continue
             source = os.path.expanduser(os.fspath(source))
             source_species[os.path.normcase(os.path.abspath(os.path.normpath(source)))] = value
+        for source, evidence in dict(config_species_evidence or {}).items():
+            source = os.path.expanduser(os.fspath(source))
+            source_evidence[os.path.normcase(os.path.abspath(os.path.normpath(source)))] = \
+                dict(evidence or {})
         for p in config_poscars:
             member = f'{name}_ads_{_stem(p)}'
             try:
@@ -386,6 +477,8 @@ def create_project(root: str | os.PathLike, name: str, *,
                 source_key = os.path.normcase(os.path.abspath(os.path.normpath(p)))
                 if source_key in source_species:
                     config_species_out[str(Path(config_dir).resolve())] = source_species[source_key]
+                if source_key in source_evidence:
+                    config_evidence_out[str(Path(config_dir).resolve())] = source_evidence[source_key]
             except Exception as e:   # PotcarError 亦在此兜住
                 errors.append((member, str(e)))
 
@@ -414,6 +507,9 @@ def create_project(root: str | os.PathLike, name: str, *,
             config_species_out = {
                 _published(path): species for path, species in config_species_out.items()
             }
+            config_evidence_out = {
+                _published(path): evidence for path, evidence in config_evidence_out.items()
+            }
 
         project = {
             'schema': 1,
@@ -428,6 +524,9 @@ def create_project(root: str | os.PathLike, name: str, *,
         }
         if config_species is not None:
             project['config_species'] = config_species_out
+            project['config_species_evidence'] = config_evidence_out
+            project['dataset_groups'] = structure_identity.build_dataset_groups(
+                config_dirs, config_species_out, species_ref_jobs)
         if species_refs is not None:
             project['species_refs'] = dict(species_refs)
         if species_ref_jobs is not None:
@@ -584,18 +683,30 @@ def list_projects(path: str | os.PathLike | None = None) -> list:
 
 
 # ── ΔE 汇总 ─────────────────────────────────────────────────────────────────
-def _member_info(job_dir: str | None):
-    """成员目录 → (state, energy|None)。无目录/无 manifest → ('缺失', None)。"""
+def _member_info(job_dir: str | None, label='成员'):
+    """成员目录 → ``(state, energy|None, validation_error)``。
+
+    DONE 只是生命周期状态，不足以授权能量相减。最终吸附能的每个操作数还
+    必须有完整结束证据，并由当前目录 OSZICAR 的末 ``E0`` 复核。
+    """
     if not job_dir:
-        return '未设置', None
+        return '未设置', None, ''
     m = manifest_mod.load_manifest(job_dir)
     if m is None:
-        return '缺 job.yaml', None
+        return '缺 job.yaml', None, f'{label}缺少可读 job.yaml'
     e = m.get('results', {}).get('energy_e0_eV')
     if (not isinstance(e, (int, float)) or isinstance(e, bool)
             or not math.isfinite(float(e)) or diagnose.energy_implausible(e)):
-        return m.get('state', '?'), None
-    return m.get('state', '?'), float(e)
+        return m.get('state', '?'), None, f'{label}能量缺失或不合理'
+    if m.get('state') != 'DONE':
+        return m.get('state', '?'), float(e), ''
+    from vcstudio.project import energy_gate
+    try:
+        checked, _manifest, _evidence = energy_gate.validate_done_energy(
+            job_dir, label, manifest_mod, require_oszicar=True)
+    except ValueError as exc:
+        return m.get('state', '?'), None, str(exc)
+    return m.get('state', '?'), float(checked), ''
 
 
 def _reasonable_energy(value) -> float | None:
@@ -660,6 +771,18 @@ def _species_reference_info(species: str, cached_energy, job_dir) -> dict:
     if manifest_energy is None:
         blockers.append(
             f'物种 {species} 的参考 job.yaml 能量缺失或不合理，请重新解析/导入结果')
+    if state == 'DONE' and manifest_energy is not None:
+        from vcstudio.project import energy_gate
+        try:
+            checked, _checked_manifest, evidence = energy_gate.validate_done_energy(
+                job_dir, f'物种 {species} 参考', manifest_mod, require_oszicar=True)
+            manifest_energy = float(checked)
+            info['energy'] = manifest_energy
+            info['energy_validation'] = evidence
+        except ValueError as exc:
+            info['energy'] = None
+            info['energy_validation'] = []
+            blockers.append(str(exc))
     # A molecule may be imported as CREATED and finish later.  In that valid
     # lifecycle the project cache is intentionally empty; the DONE job.yaml is
     # the truth source and must become usable without re-importing the project.
@@ -757,9 +880,13 @@ def delta_e_rows(project: dict) -> dict:
     """
     members = project.get('members') or {}
     proj_name = str(project.get('name') or '')
-    slab_state, e_slab = _member_info(members.get('clean_slab'))
+    slab_state, e_slab, slab_error = _member_info(
+        members.get('clean_slab'), '清洁表面')
     has_gas_ref = bool(members.get('gas_ref'))
-    ref_state, e_ref = _member_info(members.get('gas_ref')) if has_gas_ref else ('无', None)
+    if has_gas_ref:
+        ref_state, e_ref, ref_error = _member_info(members.get('gas_ref'), '气相参考')
+    else:
+        ref_state, e_ref, ref_error = '无', None, ''
     # 逐物种气相参考(原版 lis_sac_analysis 口径):project['species_refs']=
     # {物种: E_mol};构型名以 '_<物种>' 结尾即匹配。与单一 gas_ref 互斥,优先。
     species_refs = dict(project.get('species_refs') or {})
@@ -773,7 +900,7 @@ def delta_e_rows(project: dict) -> dict:
     rows = []
     for cdir in (members.get('configs') or []):
         name = os.path.basename(os.path.normpath(cdir))
-        st, e_cfg = _member_info(cdir)
+        st, e_cfg, config_error = _member_info(cdir, f'吸附构型 {name}')
         delta, note = None, ''
         sp_ref = None
         sp = None
@@ -828,11 +955,11 @@ def delta_e_rows(project: dict) -> dict:
         if st != 'DONE':
             blockers.append('构型未完成')
         elif e_cfg is None:
-            blockers.append('构型能量缺失或不合理')
+            blockers.append(config_error or '构型能量缺失或不合理')
         if slab_state != 'DONE':
             blockers.append('清洁表面未完成')
         elif e_slab is None:
-            blockers.append('清洁表面能量缺失或不合理')
+            blockers.append(slab_error or '清洁表面能量缺失或不合理')
         if reference_mode == 'species':
             if sp is None:
                 blockers.append(
@@ -843,7 +970,7 @@ def delta_e_rows(project: dict) -> dict:
             if ref_state != 'DONE':
                 blockers.append('气相参考未完成')
             elif e_ref is None:
-                blockers.append('气相参考能量缺失或不合理')
+                blockers.append(ref_error or '气相参考能量缺失或不合理')
         if method_check['status'] == 'incompatible':
             blockers.append('能量项方法不一致：' + '；'.join(method_check['issues']))
         if not blockers:
@@ -892,10 +1019,20 @@ def delta_e_rows(project: dict) -> dict:
         warning for check in method_checks for warning in (check.get('warnings') or [])))
     method_status = ('incompatible' if method_issues
                      else ('verified' if not method_warnings else 'unverified'))
+    dataset_groups = list(project.get('dataset_groups') or [])
+    if not dataset_groups:
+        explicit_mapping = {
+            path: next((explicit_species[key] for key in _path_keys(path, project.get('root'))
+                        if key in explicit_species), '')
+            for path in (members.get('configs') or [])
+        }
+        dataset_groups = structure_identity.build_dataset_groups(
+            members.get('configs') or [], explicit_mapping, species_ref_jobs)
     return {'slab': (slab_state, e_slab), 'ref': (ref_state, e_ref),
             'has_ref': has_ref, 'reference_mode': reference_mode,
             'species_refs': resolved_refs, 'species_ref_cache': species_refs,
             'species_reference_evidence': list(reference_index.values()),
+            'dataset_groups': dataset_groups,
             'method_consistency': {'status': method_status, 'issues': method_issues,
                                    'warnings': method_warnings},
             'rows': rows}

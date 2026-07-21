@@ -434,8 +434,8 @@ def path_from_project_and_molecules(delta_rows: list, e_slab: float,
                                     project: dict | None = None) -> dict:
     """便捷入口:项目 ΔE 行(带 e_config)+ 旧分子目录 → 放电路径。
 
-    构型名需含物种名(如 ads_Li2S4_on_slab / Li2S6_top):按物种子串匹配唯一构型;
-    多个匹配取 E 最低(最稳构型,常规口径)。
+    新项目优先使用每行显式 ``species``（由 POSCAR 组成差与用户确认得到）；
+    旧项目才回退到构型名子串。多个匹配取 E 最低(最稳构型,常规口径)。
     g_corr 透传 discharge_path(逐物种 ZPE−TS 校正,见 project.thermo)。
     """
     audit = audit_molecule_method_compatibility(
@@ -448,7 +448,9 @@ def path_from_project_and_molecules(delta_rows: list, e_slab: float,
         # 只取 DONE 成员(审查#3):NEEDS_HUMAN/BAD_ENERGY 的能量不得漏进 ΔG/U_L
         cands = [r['e_config'] for r in delta_rows
                  if r.get('e_config') is not None and r.get('state') == 'DONE'
-                 and _species_in_name(sp, r.get('name', ''))]
+                 and (str(r.get('species') or '').strip() == sp
+                      or (not str(r.get('species') or '').strip()
+                          and _species_in_name(sp, r.get('name', ''))))]
         if cands:
             system_e[sp] = min(cands)
     result = discharge_path(system_e, mol_e, mu_li=mu_li, g_corr=g_corr)

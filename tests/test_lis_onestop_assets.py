@@ -29,8 +29,8 @@ def test_lis_builder_guides_reference_inputs_output_and_resources():
 
 def test_lis_builder_uses_backend_contract_and_strict_species_mapping():
     js = _source('project.js')
-    assert "VCS.call('proj_scan_lis_inputs', picked.path)" in js
-    assert "VCS.call('proj_scan_structures', picked.path)" in js
+    assert "'proj_scan_lis_inputs', picked.path, selectedReferenceSpecies()" in js
+    assert "'proj_scan_structures', picked.path, val('pj-slab'), selectedReferenceSpecies()" in js
     assert "VCS.call('proj_prepare_lis', val('pj-name'), val('pj-slab'), gate.items," in js
     assert "VCS.call('submit_project_with_resources', projectPath," in js
     assert 'State.configSpecies' in js
@@ -58,9 +58,10 @@ def test_large_config_folders_have_safe_bulk_species_tools():
     js = _source('project.js')
     css = _source('app.css')
     assert 'function applyBulkSpecies()' in js
-    assert '应用到全部未匹配项' in _source('index.html')
-    assert '只看未匹配' in _source('index.html')
-    assert '已匹配 ${matched}/${State.configs.length} 个构型' in js
+    assert '应用并确认全部未确认项' in _source('index.html')
+    assert '只看未确认' in _source('index.html')
+    assert '已确认 ${matched}/${State.configs.length} 个构型' in js
+    assert '确认本组映射' in js
     assert '<select class="ipt lis-species"' in js
     assert '.lis-config-field .pj-cfglist' in css and 'max-height:' in css
 
@@ -169,6 +170,9 @@ def test_method_check_requires_explicit_auditable_confirmation():
     assert 'prepared.needs_method_confirmation' in js
     assert "methodStatus === 'incompatible'" in js
     assert '请填写可审计的方法一致性确认理由' in js
+    assert '存在需要人工核对的方法差异或证据缺项' in js
+    assert '各体系采用了正确的基态自旋设置' in html
+    assert 'Li2S8 已经 ISPIN=2 多初态对照验证为非磁闭壳层' in html
 
 
 def test_host_trust_never_blindly_accepts_missing_fingerprint():
@@ -229,25 +233,31 @@ def test_delta_view_blocks_method_mismatch_and_guides_unverified_results():
     assert '方法不一致：ΔE 已阻断' in js
     assert "methodStatus === 'unverified'" in js
     assert '方法一致性尚未完全核验' in js
-    assert '统一所有相减项的泛函、ENCUT、色散和 POTCAR 后重算' in js
+    assert 'clean slab 与吸附构型的 ISPIN 必须一致' in js
+    assert '分子参考与周期体系 ISPIN 不同' in js
     assert '.pj-method-gate.incompatible' in css
     assert '.pj-method-gate.unverified' in css
 
 
-def test_folder_scan_prefers_valid_final_contcar_and_explains_override():
+def test_new_input_folder_scan_prefers_poscar_and_explains_contcar_fallback():
     js = _source('project.js')
     assert 'function preferredScannedStructures(raw)' in js
     assert "item.valid === false || item.parseable === false" in js
-    assert "if (base === 'contcar') return 20" in js
-    assert "if (base === 'poscar') return 10" in js
+    assert "if (base === 'poscar') return 20" in js
+    assert "if (base === 'contcar') return 10" in js
     assert 'item.preferred === true' in js
-    assert '已自动选择可用的最终 CONTCAR' in js
-    assert '如需原始 POSCAR 请使用“逐个添加”' in js
+    assert '已优先选择本次输入 POSCAR' in js
+    assert '请确认不是旧结果残留' in js
 
 
 def test_submit_button_stays_locked_while_async_method_check_or_submit_runs():
     js = _source('project.js')
     assert 'lisBusy: false' in js
+
+
+def test_project_report_requests_backend_final_adsorption_gate():
+    js = _source('project.js')
+    assert "VCS.call('proj_report', proj.path, save, true)" in js
     assert 'button.disabled = State.lisBusy || !gate.ok' in js
     assert 'State.lisBusy = true' in js
     assert 'State.lisBusy = false' in js

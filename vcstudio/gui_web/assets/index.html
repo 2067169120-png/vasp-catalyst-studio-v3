@@ -1323,8 +1323,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
             </div>
             <div class="lis-config-batch" id="lis-config-batch">
               <select id="lis-bulk-species" class="ipt" aria-label="批量设置吸附物种"><option value="">选择物种后批量应用…</option></select>
-              <button class="btn" type="button" id="lis-apply-species">应用到全部未匹配项</button>
-              <label><input type="checkbox" id="lis-only-unmatched"> 只看未匹配</label>
+              <button class="btn" type="button" id="lis-apply-species">应用并确认全部未确认项</button>
+              <label><input type="checkbox" id="lis-only-unmatched"> 只看未确认</label>
             </div>
             <div class="lis-scan-status" id="lis-config-scan-status" hidden aria-live="polite"></div>
             <datalist id="lis-species-options"></datalist>
@@ -1375,10 +1375,10 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
         <div class="lis-method-title" id="lis-method-title"></div>
         <ul id="lis-method-reasons"></ul>
         <label class="lis-method-confirm"><input type="checkbox" id="lis-method-confirm">
-          我已核对参考能与新任务的计算方法，确认这些差异可用于本次吸附能比较</label>
+          我已核对上述方法差异或证据缺项；若涉及 ISPIN，已确认各体系采用了正确的基态自旋设置；这些能量可用于本次吸附能比较</label>
         <label class="lis-method-reason-label">确认理由（必填）
           <textarea class="ipt" id="lis-method-reason" rows="2"
-            placeholder="例如：参考能与新任务使用同一泛函、赝势、ENCUT 和色散修正；仅目录来源不同"></textarea>
+            placeholder="例如：Li2S8 已经 ISPIN=2 多初态对照验证为非磁闭壳层，参考能用 ISPIN=1；磁性基底、clean slab 与吸附构型统一用 ISPIN=2"></textarea>
         </label>
       </div>
       <div class="lis-readiness" id="lis-readiness" aria-live="polite">按 1–4 步补齐信息后即可整组提交。</div>

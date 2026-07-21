@@ -322,6 +322,15 @@ def classify(*, scheduler_reason: str | None = None, exit_code: int | None = Non
     """
     rcls = _reason_to_class(scheduler_reason)
 
+    # 调度器明确报 CANCELLED/OOM/TIMEOUT/NODE_FAIL 时，失败证据必须压过
+    # OUTCAR 中可能来自旧轮、或在后处理前留下的收敛串。若两者冲突，
+    # 停在人工取证；不自动 DONE，也不盲目续算一份看似收敛的结构。
+    if converged and (rcls is not None or scheduler_reason == R_FAILED):
+        return Diagnosis(
+            rcls or UNKNOWN, 'NEEDS_HUMAN', False,
+            f'收敛证据与调度器终态 {scheduler_reason} 冲突；'
+            '需核对当前作业号的 EXIT=0 与本轮输出世代，禁止自动判 DONE')
+
     # ⓪ STOPCAR 人工叫停:不是失败,人决定下一步(防被误判 NONCONVERGED 而盲目续算)
     if stopped and not converged:
         return Diagnosis(USER_STOPPED, FAILURE_TO_STATE[USER_STOPPED], False,

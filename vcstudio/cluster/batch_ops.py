@@ -98,7 +98,10 @@ def fetch_batch(prof, pw, dirs, trust_new, files=None):
         for d in dirs:
             try:
                 submitter.assert_profile_binding(prof, d, '拉回结果')
-                fetched, missing = submitter.fetch_results(client, sftp, d, files=files)
+                # fetch_results 内再用同一 profile 对读到的 manifest 做硬校验，
+                # 避免外层检查与真正 SFTP 下载之间 job.yaml 被换代的 TOCTOU。
+                fetched, missing = submitter.fetch_results(
+                    client, sftp, d, files=files, profile=prof)
                 msg = '已拉回 ' + ('、'.join(fetched) if fetched else '(无)')
                 if missing:
                     msg += f'(远端缺 {"、".join(missing)})'
@@ -395,12 +398,20 @@ def cancel_batch(profile, jobs, *, password=None, trust_new=False):
                      'reason': '无 job.yaml 或缺 scheduler_job_id,无法取消'})
                 continue
             try:
-                submitter.assert_profile_binding(profile, d, '取消作业', manifest=m)
-                submitter.run_cmd(client, dialect.cancel_cmd(jid, bin_path), check=True)
-                # CANCELLED 非 manifest 合法态 → FAILED + note '用户取消'(裁决口径)
-                manifest_mod.set_state(m, 'FAILED', note='用户取消')
-                manifest_mod.save_manifest(d, m)
-                out['cancelled'].append(jid)
+                with submitter.job_operation(d, '取消作业'):
+                    # 入锁后重读，防止等待期间作业已被续算为另一 job id。
+                    m = manifest_mod.load_manifest(d)
+                    current_jid = str((m or {}).get('scheduler_job_id') or '')
+                    if not m or current_jid != jid:
+                        raise RuntimeError('取消前作业代次已变化，请刷新后重试')
+                    submitter.assert_profile_binding(
+                        profile, d, '取消作业', manifest=m)
+                    submitter.run_cmd(
+                        client, dialect.cancel_cmd(jid, bin_path), check=True)
+                    # CANCELLED 非 manifest 合法态 → FAILED + note '用户取消'(裁决口径)
+                    manifest_mod.set_state(m, 'FAILED', note='用户取消')
+                    manifest_mod.save_manifest(d, m)
+                    out['cancelled'].append(jid)
             except _job_errors() as e:
                 out['failed'].append({'job_id': jid, 'reason': str(e)})
     finally:

@@ -581,27 +581,54 @@ def _audit_kmesh(recs: list) -> dict:
             'detail': '全部成员 K 网格已记录:' + '; '.join(got) + '。'}
 
 
-def _audit_ispin(incars: dict) -> dict:
+def _audit_ispin(incars: dict, roles: dict | None = None) -> dict:
+    roles = dict(roles or {})
     pairs: list = []
     for n, t in incars.items():
         if t is None:
-            pairs.append((n, None))
+            pairs.append((n, None, roles.get(n)))
             continue
         v = parse_incar(t).get('ISPIN')
-        pairs.append((n, int(v) if isinstance(v, (int, float)) else 1))  # 缺 ISPIN → VASP 默认 1
-    present = [(n, v) for n, v in pairs if v is not None]
+        # 缺 ISPIN → VASP 默认 1
+        pairs.append((n, int(v) if isinstance(v, (int, float)) else 1, roles.get(n)))
+    present = [(n, v, role) for n, v, role in pairs if v is not None]
     if not present:
         return {'name': 'ISPIN 一致性', 'ok': False, 'detail': '无成员 INCAR 可读。'}
-    missing = [n for n, v in pairs if v is None]
+    missing = [n for n, v, _role in pairs if v is None]
     if missing:
         return {'name': 'ISPIN 一致性', 'ok': False,
                 'detail': f'成员 {"、".join(missing)} 无 INCAR,自旋设置无法核对。'}
-    vals = {v for _, v in present}
+    invalid = [(n, v) for n, v, _role in present if v not in {1, 2}]
+    if invalid:
+        return {'name': 'ISPIN 一致性', 'ok': False,
+                'detail': '存在非法 ISPIN：' + '、'.join(f'{n}={v}' for n, v in invalid) + '。'}
+
+    periodic = [(n, v) for n, v, role in present if role in {'clean_slab', 'config'}]
+    references = [(n, v) for n, v, role in present if role == 'gas_ref']
+    if periodic:
+        periodic_vals = {v for _, v in periodic}
+        if len(periodic_vals) != 1:
+            grp = _group_by_val(periodic)
+            detail = ';'.join(f'ISPIN={k}(成员:{"、".join(v)})'
+                              for k, v in grp.items())
+            return {'name': 'ISPIN 一致性', 'ok': False,
+                    'detail': f'clean slab 与吸附构型自旋口径不一致:{detail}。'}
+        value = next(iter(periodic_vals))
+        detail = f'周期能量项统一使用 ISPIN={value}'
+        if references:
+            refs = '、'.join(f'{name}=ISPIN {spin}' for name, spin in references)
+            detail += (f'；分子/气相参考 {refs}。不同体系可按各自基态采用'
+                       '不同 ISPIN，需保留自旋极化与多初态核对证据。')
+        else:
+            detail += '，clean slab 与全部吸附构型一致。'
+        return {'name': 'ISPIN 一致性', 'ok': True, 'detail': detail}
+
+    vals = {v for _, v, _role in present}
     if len(vals) == 1:
         v = next(iter(vals))
         return {'name': 'ISPIN 一致性', 'ok': True,
                 'detail': f'全部成员 ISPIN={v}({"自旋极化" if v == 2 else "非自旋极化"}),一致。'}
-    grp = _group_by_val(present)
+    grp = _group_by_val([(n, v) for n, v, _role in present])
     detail = ';'.join(f'ISPIN={k}(成员:{"、".join(v)})' for k, v in grp.items())
     return {'name': 'ISPIN 一致性', 'ok': False,
             'detail': f'ISPIN 混用(自旋口径不一致,能量不可比):{detail}。'}
@@ -615,13 +642,14 @@ def consistency_audit(project: dict, *, config: dict | None = None) -> dict:
     """
     recs = _member_records(project)
     incars = {r['name']: _read_file(r['dir'], 'INCAR') for r in recs}
+    roles = {r['name']: r['role'] for r in recs}
     checks = [
         _audit_encut(incars),
         _audit_functional(incars),
         _audit_dispersion(incars),
         _audit_reference(project),
         _audit_kmesh(recs),
-        _audit_ispin(incars),
+        _audit_ispin(incars, roles),
     ]
     ok = all(c['ok'] for c in checks)
     if ok:

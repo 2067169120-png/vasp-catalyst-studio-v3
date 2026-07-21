@@ -8,8 +8,9 @@ import os
 import sys
 import types
 
-from vcstudio.gui_web.api import Api
+from vcstudio.gui_web.api import Api, _sha256_file
 from vcstudio.cluster.profiles import ClusterProfile
+from vcstudio.cluster import submitter as cluster_submitter
 
 
 # ── 假件工厂 ────────────────────────────────────────────────────────────────
@@ -27,6 +28,36 @@ def _fake_ledger(entries, removed):
     m.load_all = lambda: list(entries)
     m.unregister = lambda d: removed.append(d) or True
     return m
+
+
+def _attach_final_fetch_evidence(job_dir, data, names=None):
+    """Populate the same generation/hash contract written by final SFTP fetch."""
+    names = list(names or ('CONTCAR', 'OSZICAR', 'OUTCAR'))
+    token = cluster_submitter.current_attempt_token(data)
+    hashes, sizes = {}, {}
+    for name in names:
+        path = os.path.join(job_dir, *name.split('/'))
+        hashes[name] = _sha256_file(path)
+        sizes[name] = os.path.getsize(path)
+    data.setdefault('results', {}).update({
+        'fetched_at': 'now',
+        'fetched_state': 'DONE',
+        'fetched_job_id': str(data.get('scheduler_job_id') or ''),
+        'fetched_remote_dir': str(data.get('remote_dir') or ''),
+        'fetched_attempt_token': token,
+        'fetched': names,
+        'fetched_missing': [],
+        'fetch_requested': names,
+        'fetched_sha256': hashes,
+        'fetched_sizes': sizes,
+        'fetch_contract': {
+            'schema': 1, 'mode': 'final', 'state': 'DONE',
+            'scheduler_job_id': str(data.get('scheduler_job_id') or ''),
+            'remote_dir': str(data.get('remote_dir') or ''),
+            'attempt_token': token, 'requested': names,
+        },
+    })
+    return data
 
 
 # ── list_profiles ────────────────────────────────────────────────────────────
@@ -1847,19 +1878,100 @@ def test_autopilot_save_persists_subswitches():
 
 
 # ── pipeline_tick(幂等:首拍 report_done + 写标记,次拍无重复) ──────────────────
+def _report_gate_fixture(tmp_path, *, has_ref=True, method_status='verified',
+                         save_project=None):
+    """构造一个无远程依赖的最终报告门禁项目。"""
+    clean = str(tmp_path / 'clean')
+    config = str(tmp_path / 'config')
+    reference = str(tmp_path / 'reference') if has_ref else None
+    members = {'clean_slab': clean, 'gas_ref': reference, 'configs': [config]}
+    project = {
+        'name': 'report-gate', 'root': str(tmp_path),
+        'autopilot_managed': True, 'members': members,
+    }
+    manifests = {
+        clean: {'state': 'DONE', 'scheduler_job_id': 'clean-1', 'attempts': [],
+                'results': {'energy_e0_eV': -100.0}},
+        config: {'state': 'DONE', 'scheduler_job_id': 'config-1', 'attempts': [],
+                 'results': {'energy_e0_eV': -115.0}},
+    }
+    if reference:
+        manifests[reference] = {
+            'state': 'DONE', 'scheduler_job_id': 'reference-1', 'attempts': [],
+            'results': {'energy_e0_eV': -10.0},
+        }
+    summary = {
+        'slab': ('DONE', -100.0),
+        'ref': ('DONE', -10.0) if has_ref else ('无', None),
+        'has_ref': has_ref,
+        'reference_mode': 'single' if has_ref else 'none',
+        'method_consistency': {
+            'status': method_status, 'issues': [],
+            'warnings': ([] if method_status == 'verified'
+                         else ['ISPIN 不一致：分子参考、吸附构型']),
+        },
+        'rows': [{
+            'name': 'report-gate_ads_Li2S8', 'species': 'Li2S8',
+            'state': 'DONE', 'e_config': -115.0, 'delta_e': -5.0,
+            'dd_e': 0.0, 'reference_valid': has_ref,
+            'reference_job': reference, 'note': '',
+        }],
+    }
+    calls = {'reports': 0, 'saved': 0}
+    adsorption = _fake_adsorption(
+        projects=['/managed/project.yaml'],
+        proj_map={'/managed/project.yaml': project}, delta_ret=summary)
+
+    def _save(root, saved_project):
+        calls['saved'] += 1
+        if save_project is not None:
+            return save_project(root, saved_project)
+        return None
+
+    adsorption.save_project = _save
+    report_full = _fake_report_full(
+        member_dirs=[path for path in (clean, config, reference) if path])
+
+    def _generate(_project, out, config=None):
+        calls['reports'] += 1
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, 'w', encoding='utf-8') as handle:
+            handle.write(f'<html>generation {calls["reports"]}</html>')
+        return out
+
+    report_full.generate_project_report = _generate
+    manifest_mod = _fake_manifest_mod(manifests)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifest_mod,
+              report_full_mod=report_full, config_mod=_fake_config())
+    api._auto_figures_for_project = lambda _p, _pp, out_dir: {
+        'engine': 'none', 'out_dir': out_dir, 'files': [], 'panel': None,
+    }
+    return api, project, manifests, summary, calls
+
+
 def test_pipeline_tick_report_done_idempotent(tmp_path):
     calls, saved = {}, []
     proj = {'name': 'liS', 'root': str(tmp_path),
             'autopilot_managed': True,
             'members': {'clean_slab': '/s', 'gas_ref': None, 'configs': ['/c1']}}
+    delta = _delta({'liS_ads_Li2S4': -1.2})
+    delta.update({'has_ref': True, 'reference_mode': 'single',
+                  'ref': ('DONE', -10.0),
+                  'method_consistency': {'status': 'verified', 'issues': [], 'warnings': []}})
+    delta['rows'][0]['reference_valid'] = True
     ads = _fake_adsorption(projects=['/p/project.yaml'],
-                           proj_map={'/p/project.yaml': proj},
-                           delta_ret=_delta({'liS_ads_Li2S4': -1.2}))
+                           proj_map={'/p/project.yaml': proj}, delta_ret=delta)
     ads.save_project = lambda root, p: saved.append(root)
     manifest = _fake_manifest_mod({'/s': {'state': 'DONE', 'results': {}},
                                    '/c1': {'state': 'DONE', 'results': {}}})
     rf = _fake_report_full(member_dirs=['/s', '/c1'],
                            report_ret=str(tmp_path / 'report' / 'liS_report.html'))
+    def _write_report(_project, out, config=None):
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, 'w', encoding='utf-8') as handle:
+            handle.write('<html>validated adsorption report</html>')
+        return out
+    rf.generate_project_report = _write_report
     api = Api(profiles_mod=_fake_profiles({}), adsorption_mod=ads, manifest_mod=manifest,
               native_charts_mod=_fake_ncharts(calls), report_full_mod=rf,
               config_mod=_fake_config(ui={'autopilot': True}))
@@ -1874,6 +1986,89 @@ def test_pipeline_tick_report_done_idempotent(tmp_path):
     assert [e for e in out2['events'] if e['kind'] == 'report_done'] == []
 
 
+def test_final_report_rejects_numeric_difference_without_reference_state(tmp_path):
+    """E(config)-E(slab) 可供诊断，但不能冒充最终吸附能报告。"""
+    api, project, _manifests, _summary, calls = _report_gate_fixture(
+        tmp_path, has_ref=False)
+    events, errors = [], []
+
+    api._tick_reports(events, errors)
+
+    assert events == [] and errors == []
+    assert calls['reports'] == 0 and calls['saved'] == 0
+    assert 'autopilot_report' not in project
+    final = api.proj_report('/managed/project.yaml', str(tmp_path / 'manual.html'), final=True)
+    assert final['ok'] is False and '未设置有效气相/逐物种参考态' in final['error']
+
+
+def test_unverified_method_requires_persisted_reason_before_final_report(tmp_path):
+    api, project, _manifests, _summary, calls = _report_gate_fixture(
+        tmp_path, method_status='unverified')
+    events, errors = [], []
+
+    api._tick_reports(events, errors)
+
+    assert events == [] and errors == [] and calls['reports'] == 0
+    project['preparation'] = {'method_check': {'confirmation': {
+        'confirmed': True,
+        'reason': '已核对 Li2S8 非磁基态 ISPIN=1，周期吸附体系 ISPIN=2',
+    }}}
+
+    api._tick_reports(events, errors)
+
+    assert errors == [] and calls['reports'] == 1 and calls['saved'] == 1
+    assert [event['kind'] for event in events] == ['report_done']
+    assert project['autopilot_report']['input_fingerprint']
+
+
+def test_report_marker_invalidates_on_file_and_member_generation_changes(tmp_path):
+    api, project, manifests, _summary, calls = _report_gate_fixture(tmp_path)
+
+    def _tick_once():
+        events, errors = [], []
+        api._tick_reports(events, errors)
+        assert errors == []
+        assert [event['kind'] for event in events] == ['report_done']
+
+    _tick_once()
+    report_path = project['autopilot_report']['file']
+    assert calls['reports'] == 1
+    os.unlink(report_path)
+    _tick_once()  # 报告文件被删，marker 不得继续有效
+    assert calls['reports'] == 2
+
+    config = project['members']['configs'][0]
+    manifests[config]['results']['energy_e0_eV'] = -115.2
+    _tick_once()
+    assert calls['reports'] == 3
+
+    manifests[config]['scheduler_job_id'] = 'config-2'
+    _tick_once()
+    assert calls['reports'] == 4
+
+    manifests[config]['attempts'].append({'round': 2, 'reason': 'continued'})
+    _tick_once()
+    assert calls['reports'] == 5
+
+
+def test_report_marker_save_failure_never_emits_report_done(tmp_path):
+    def _fail_save(_root, _project):
+        raise OSError('disk full')
+
+    api, project, _manifests, _summary, calls = _report_gate_fixture(
+        tmp_path, save_project=_fail_save)
+    events, errors = [], []
+
+    api._tick_reports(events, errors)
+
+    assert events == []
+    assert calls['reports'] == 1 and calls['saved'] == 1
+    assert any('报告标记落盘失败' in error and 'disk full' in error
+               for error in errors)
+    assert 'autopilot_report' not in project
+    assert 'autopilot_report_done' not in project
+
+
 def test_pipeline_tick_no_profiles_no_errors():
     api = Api(profiles_mod=_fake_profiles({}),
               adsorption_mod=_fake_adsorption(projects=[]),
@@ -1881,6 +2076,38 @@ def test_pipeline_tick_no_profiles_no_errors():
     out = api.pipeline_tick()
     assert out['ok'] is True and out['events'] == [] and out['errors'] == []
     assert out['synced'] == 0
+
+
+def test_pipeline_tick_backend_lock_skips_overlapping_tick():
+    api = Api(profiles_mod=_fake_profiles({}),
+              adsorption_mod=_fake_adsorption(projects=[]),
+              config_mod=_fake_config(ui={'autopilot': True}))
+    assert api._pipeline_lock.acquire(blocking=False)
+    try:
+        out = api.pipeline_tick()
+    finally:
+        api._pipeline_lock.release()
+    assert out['ok'] is True and out['busy'] is True and out['synced'] == 0
+    assert '仍在执行' in out['events'][0]['text']
+
+
+def test_pipeline_tick_reports_deleted_managed_profile():
+    project = {
+        'name': 'lost-cluster', 'autopilot_managed': True,
+        'launch': {'resources': {'profile': 'deleted-server'},
+                   'submitted_job_dirs': ['/job']},
+        'members': {'clean_slab': '/job', 'gas_ref': None, 'configs': []},
+    }
+    api = Api(
+        profiles_mod=_fake_profiles({}),
+        adsorption_mod=_fake_adsorption(
+            projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project}),
+        config_mod=_fake_config(ui={'autopilot': True}))
+
+    out = api.pipeline_tick()
+
+    assert any('deleted-server' in error and '已不存在' in error
+               for error in out['errors'])
 
 
 def test_pipeline_tick_configured_but_idle_profile_is_not_counted_as_synced():
@@ -1994,9 +2221,10 @@ def test_pipeline_status_stage_detection():
     by = {p['name']: p for p in out['projects']}
     assert by['A']['stage'] == 'submit' and by['A']['needs_human'] is False
     assert by['A']['profile'] == 'gpu-a'
-    assert by['B']['stage'] == 'report_done'
+    # 旧时间字符串不绑定成员/能量/报告文件，必须失效并等待重建。
+    assert by['B']['stage'] == 'analysis'
     assert by['B']['done'] == 2 and by['B']['total'] == 2
-    assert by['B']['stage_index'] == 5 and by['B']['stages'][5] == 'report_done'
+    assert by['B']['stage_index'] == 4 and by['B']['stages'][5] == 'report_done'
 
 
 def test_pipeline_status_monitor_recover_and_needs_human():
@@ -6038,7 +6266,7 @@ def test_job_live_energy_remote_via_manifest(tmp_path):
     m['remote_dir'] = '/work/j'
     m['cluster'] = 'hpc'
     real_manifest.save_manifest(str(tmp_path), m)
-    api = Api(profiles_mod=_fake_profiles({'hpc': types.SimpleNamespace(auth='key')}),
+    api = Api(profiles_mod=_fake_profiles({'hpc': ClusterProfile(name='hpc', auth='key')}),
               connection_mod=_fake_conn_read(_OSZ_TEXT.encode('utf-8')))
     out = api.job_live_energy(str(tmp_path))
     assert out['ok'] is True and out['source'] == 'remote' and len(out['steps']) == 2
@@ -6051,7 +6279,7 @@ def test_job_live_energy_remote_not_started_yet(tmp_path):
     m['remote_dir'] = '/work/j'
     m['cluster'] = 'hpc'
     real_manifest.save_manifest(str(tmp_path), m)
-    api = Api(profiles_mod=_fake_profiles({'hpc': types.SimpleNamespace(auth='key')}),
+    api = Api(profiles_mod=_fake_profiles({'hpc': ClusterProfile(name='hpc', auth='key')}),
               connection_mod=_fake_conn_read(missing=True))
     out = api.job_live_energy(str(tmp_path))
     assert out['ok'] is False and '远端尚无 OSZICAR' in out['error']
@@ -6104,7 +6332,7 @@ def test_job_live_energy_needs_trust_passthrough(tmp_path):
     m['remote_dir'] = '/work/j'
     m['cluster'] = 'hpc'
     real_manifest.save_manifest(str(tmp_path), m)
-    api = Api(profiles_mod=_fake_profiles({'hpc': types.SimpleNamespace(auth='key')}),
+    api = Api(profiles_mod=_fake_profiles({'hpc': ClusterProfile(name='hpc', auth='key')}),
               connection_mod=_fake_conn_read(connect_boom=True))
     out = api.job_live_energy(str(tmp_path))
     assert out['ok'] is False and out['needs_trust'] is True
@@ -6198,8 +6426,10 @@ def test_proj_scan_structures_api_uses_recursive_read_only_scanner(tmp_path):
     out = Api().proj_scan_structures(str(tmp_path))
 
     assert out['ok'] is True and out['error'] is None
-    assert out['items'] == [{'path': str(structure.resolve()), 'name': 'POSCAR',
-                             'species': 'Li2S8'}]
+    assert len(out['items']) == 1
+    assert {key: out['items'][0][key] for key in ('path', 'name', 'species')} == {
+        'path': str(structure.resolve()), 'name': 'POSCAR', 'species': 'Li2S8'}
+    assert out['items'][0]['species_source'] == 'path_name'
 
 
 def test_proj_scan_lis_inputs_api_returns_one_folder_bundle(tmp_path):
@@ -6249,6 +6479,13 @@ def _lis_reference_fake(tmp_path, states, create_calls):
                                 }}}
         for index, (species, state) in enumerate(states.items())
     }
+    for job_dir, item in manifest_states.items():
+        os.makedirs(job_dir, exist_ok=True)
+        energy = item['results']['energy_e0_eV']
+        with open(os.path.join(job_dir, 'OSZICAR'), 'w', encoding='utf-8') as handle:
+            handle.write(f' 1 F= {energy:.12f} E0= {energy:.12f} d E =0\n')
+        with open(os.path.join(job_dir, 'OUTCAR'), 'w', encoding='utf-8') as handle:
+            handle.write('General timing and accounting information for this job\n')
     manifests = types.SimpleNamespace(load_manifest=lambda path: manifest_states.get(path))
     return project_path, adsorption, manifests
 
@@ -6354,6 +6591,46 @@ def test_proj_prepare_lis_auto_effective_encut_can_be_fully_verified(tmp_path):
     assert calls['preparation']['inputs']['planned_method']['encut'] == 550
 
 
+def test_proj_prepare_lis_accepts_confirmed_molecular_ispin_difference(tmp_path):
+    slab, config, incar = (tmp_path / name for name in
+                           ('slab.vasp', 'Li2S8_top.vasp', 'INCAR'))
+    _write_lis_prepare_inputs(slab, config, incar)
+    incar.write_text(
+        'ENCUT=400\nGGA=RP\nISPIN=2\nIVDW=0\nLDAU=F\nMETAGGA=F\nLHFCALC=F\n',
+        encoding='utf-8')
+    potcars = tmp_path / 'potcars'
+    _write_lis_potcar_library(potcars)
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    reference = adsorption.load_project(reference_path)
+    signature = manifests.load_manifest(
+        reference['species_ref_jobs']['Li2S8'])['results']['reference_method_signature']
+    signature.update({'metagga': 'F', 'lhfcalc': 'F'})
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config(cfg={'potcar_lib_root': str(potcars)}))
+
+    first = api.proj_prepare_lis(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path)
+
+    assert first['ok'] is False and first['needs_method_confirmation'] is True
+    assert first['method_check']['status'] == 'unverified'
+    assert not first['method_check']['issues'] and not calls
+    assert any('参考分子 ISPIN=1' in warning
+               for warning in first['method_check']['warnings'])
+
+    second = api.proj_prepare_lis(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path,
+        {'confirmed': True,
+         'reason': 'Li2S8 为已验证非磁闭壳层；磁性基底和吸附体系统一用 ISPIN=2'})
+
+    assert second['ok'] is True and calls
+    confirmation = calls['preparation']['method_check']['confirmation']
+    assert confirmation['confirmed'] is True and 'ISPIN=2' in confirmation['reason']
+
+
 def test_proj_prepare_lis_dft_u_value_mismatch_is_not_confirmable(tmp_path):
     slab, config, incar = (tmp_path / name for name in
                            ('slab.vasp', 'Li2S8_top.vasp', 'INCAR'))
@@ -6406,6 +6683,63 @@ def test_reference_method_check_dft_u_missing_vectors_stays_unverified(tmp_path)
 
     assert check['status'] == 'unverified' and not check['issues']
     assert any('LDAUU' in warning for warning in check['warnings'])
+
+
+def test_reference_method_check_allows_molecular_ispin_1_with_magnetic_adsorption(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=RP\nISPIN=2\nIVDW=0\nLDAU=F\nMETAGGA=F\nLHFCALC=F\n',
+        encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'metagga': 'F', 'lhfcalc': 'F', 'encut': 400.0,
+        'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'])
+
+    assert check['status'] == 'unverified' and not check['issues']
+    assert any('参考分子 ISPIN=1' in warning and '不是自动不兼容' in warning
+               for warning in check['warnings'])
+
+
+def test_reference_method_check_keeps_hard_conflicts_with_soft_ispin_warning(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=PE\nISPIN=2\nIVDW=0\nLDAU=F\nMETAGGA=F\nLHFCALC=F\n',
+        encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'metagga': 'F', 'lhfcalc': 'F', 'encut': 400.0,
+        'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'])
+
+    assert check['status'] == 'incompatible'
+    assert any('functional' in issue for issue in check['issues'])
+    assert any('ISPIN=1' in warning for warning in check['warnings'])
+
+
+def test_reference_method_check_rejects_invalid_ispin_value(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=RP\nISPIN=3\nIVDW=0\nLDAU=F\nMETAGGA=F\nLHFCALC=F\n',
+        encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'metagga': 'F', 'lhfcalc': 'F', 'encut': 400.0,
+        'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'])
+
+    assert check['status'] == 'incompatible'
+    assert any('新任务 ISPIN=3' in issue and '无效' in issue
+               for issue in check['issues'])
 
 
 def test_reference_method_check_hse_aexx_difference_is_incompatible(tmp_path):
@@ -6588,7 +6922,9 @@ def test_submit_project_includes_created_species_refs_and_skips_done_refs(tmp_pa
         clean: {'state': 'CREATED', 'scheduler_job_id': None},
         config: {'state': 'CREATED', 'scheduler_job_id': None},
         created_ref: {'state': 'CREATED', 'scheduler_job_id': None},
-        done_ref: {'state': 'DONE', 'scheduler_job_id': None},
+        # 已完成只读参考可来自另一服务器；不能把其旧 job_id 当成本项目串服。
+        done_ref: {'state': 'DONE', 'scheduler_job_id': '778',
+                   'cluster': 'reference-server'},
     }
     submitted = []
     adsorption = types.SimpleNamespace(
@@ -6917,6 +7253,7 @@ def test_pipeline_done_jobs_backfill_missing_local_results_after_restart(tmp_pat
                                          'fetched': ['CONTCAR', 'OSZICAR', 'OUTCAR'],
                                          'fetched_missing': []}}),
     ]
+    _attach_final_fetch_evidence(str(complete), entries[0][1])
     fetched = []
     batch = types.SimpleNamespace(fetch_batch=lambda _p, _pw, dirs, _trust:
         fetched.extend(dirs) or {'needs_trust': False,
@@ -6930,7 +7267,8 @@ def test_pipeline_done_jobs_backfill_missing_local_results_after_restart(tmp_pat
     adsorption = _fake_adsorption(
         projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project})
     api = Api(ledger_mod=_fake_ledger(entries, []), batch_ops_mod=batch,
-              adsorption_mod=adsorption)
+              adsorption_mod=adsorption,
+              manifest_mod=_fake_manifest_mod(dict(entries)))
 
     events, errors = [], []
     ok = api._tick_cluster('hpc', ClusterProfile(name='hpc'), None,
@@ -6939,6 +7277,36 @@ def test_pipeline_done_jobs_backfill_missing_local_results_after_restart(tmp_pat
     assert ok is True and errors == []
     assert fetched == [str(missing_timestamp), str(missing_file)]
     assert len([event for event in events if event['kind'] == 'fetch']) == 2
+
+
+def test_pipeline_monitors_project_allowlist_even_when_ledger_entry_is_missing(tmp_path):
+    job = str(tmp_path / 'active')
+    manifest = {
+        'cluster': 'hpc', 'state': 'RUNNING', 'remote_dir': '/r/active',
+        'scheduler_job_id': '501', 'results': {},
+    }
+    project = {
+        'autopilot_managed': True,
+        'launch': {'resources': {'profile': 'hpc'}, 'submitted_job_dirs': [job]},
+        'members': {'clean_slab': job, 'gas_ref': None, 'configs': []},
+    }
+    refreshed = []
+    batch = types.SimpleNamespace(
+        refresh_batch=lambda _p, _pw, dirs, _trust:
+            refreshed.extend(dirs) or {'needs_trust': False,
+                                        'results': [(d, 'RUNNING') for d in dirs]})
+    api = Api(
+        ledger_mod=_fake_ledger([], []),
+        manifest_mod=_fake_manifest_mod({job: manifest}),
+        batch_ops_mod=batch,
+        adsorption_mod=_fake_adsorption(
+            projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project}))
+
+    synced = api._tick_cluster(
+        'hpc', ClusterProfile(name='hpc'), None,
+        {'cont': False, 'fetch': False}, [], [])
+
+    assert synced is True and refreshed == [job]
 
 
 def test_pipeline_continue_needs_trust_marks_cluster_unsynced(tmp_path):
@@ -6960,6 +7328,7 @@ def test_pipeline_continue_needs_trust_marks_cluster_unsynced(tmp_path):
     )
     api = Api(
         ledger_mod=_fake_ledger([(job, manifest)], []), batch_ops_mod=batch,
+        manifest_mod=_fake_manifest_mod({job: manifest}),
         adsorption_mod=_fake_adsorption(
             projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project}))
     events, errors = [], []
@@ -6990,6 +7359,7 @@ def test_pipeline_fetch_exception_marks_cluster_unsynced(tmp_path):
         (_ for _ in ()).throw(RuntimeError('network down')))
     api = Api(
         ledger_mod=_fake_ledger([(job, manifest)], []), batch_ops_mod=batch,
+        manifest_mod=_fake_manifest_mod({job: manifest}),
         adsorption_mod=_fake_adsorption(
             projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project}))
     events, errors = [], []
@@ -7020,6 +7390,7 @@ def test_pipeline_fetch_needs_trust_marks_cluster_unsynced(tmp_path):
         'needs_trust': True, 'results': [], 'fingerprint': 'SHA256:def'})
     api = Api(
         ledger_mod=_fake_ledger([(job, manifest)], []), batch_ops_mod=batch,
+        manifest_mod=_fake_manifest_mod({job: manifest}),
         adsorption_mod=_fake_adsorption(
             projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project}))
     errors = []
@@ -7068,13 +7439,10 @@ def test_local_results_ready_requires_current_job_remote_and_complete_file_evide
     for filename in ('CONTCAR', 'OSZICAR', 'OUTCAR'):
         (tmp_path / filename).write_text('result', encoding='utf-8')
     manifest = {
-        'scheduler_job_id': '42', 'remote_dir': '/remote/job', 'task_type': 'relax',
-        'results': {
-            'fetched_at': 'now', 'fetched_job_id': '42',
-            'fetched_remote_dir': '/remote/job',
-            'fetched': ['CONTCAR', 'OSZICAR', 'OUTCAR'], 'fetched_missing': [],
-        },
+        'state': 'DONE', 'scheduler_job_id': '42',
+        'remote_dir': '/remote/job', 'task_type': 'relax', 'results': {},
     }
+    _attach_final_fetch_evidence(str(tmp_path), manifest)
     assert Api._local_results_ready(str(tmp_path), manifest) is True
 
     for key, bad_value in (('fetched_job_id', 'old-job'),
@@ -7086,6 +7454,8 @@ def test_local_results_ready_requires_current_job_remote_and_complete_file_evide
     assert Api._local_results_ready(str(tmp_path), missing) is False
     no_timestamp = {**manifest, 'results': {**manifest['results'], 'fetched_at': ''}}
     assert Api._local_results_ready(str(tmp_path), no_timestamp) is False
+    (tmp_path / 'OUTCAR').write_text('mutated after fetch', encoding='utf-8')
+    assert Api._local_results_ready(str(tmp_path), manifest) is False
 
 
 def test_pipeline_reports_skip_unmanaged_or_incomplete_delta_projects(tmp_path):
@@ -7145,13 +7515,7 @@ def test_pipeline_reports_only_after_done_outputs_are_fetched_in_same_tick(tmp_p
                 for filename in ('CONTCAR', 'OSZICAR', 'OUTCAR'):
                     (tmp_path / os.path.basename(job_dir) / filename).write_text(
                         'result', encoding='utf-8')
-                manifests[job_dir]['results'].update({
-                    'fetched_at': 'now',
-                    'fetched_job_id': manifests[job_dir]['scheduler_job_id'],
-                    'fetched_remote_dir': manifests[job_dir]['remote_dir'],
-                    'fetched': ['CONTCAR', 'OSZICAR', 'OUTCAR'],
-                    'fetched_missing': [],
-                })
+                _attach_final_fetch_evidence(job_dir, manifests[job_dir])
             results.append((job_dir, mode['fetch_ok'], 'ok' if mode['fetch_ok'] else 'offline'))
         return {'needs_trust': False, 'results': results}
 
@@ -7164,14 +7528,22 @@ def test_pipeline_reports_only_after_done_outputs_are_fetched_in_same_tick(tmp_p
         load_project=lambda path: project if path == project_path else None,
         save_project=lambda _root, _project: order.append('save-project'),
         delta_e_rows=lambda _project: {
-            'slab': ('DONE', -10.0), 'ref': ('无', None), 'has_ref': False,
+            'slab': ('DONE', -10.0), 'ref': ('DONE', -5.0), 'has_ref': True,
+            'reference_mode': 'single',
+            'method_consistency': {'status': 'verified', 'issues': [], 'warnings': []},
             'rows': [{'name': 'ads', 'state': 'DONE', 'delta_e': -1.0,
-                      'e_config': -11.0, 'note': ''}]})
+                      'e_config': -16.0, 'reference_valid': True, 'note': ''}]})
     manifest_mod = types.SimpleNamespace(load_manifest=lambda path: manifests.get(path))
+    def generate_report(_project, out, config=None):
+        order.append('report')
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, 'w', encoding='utf-8') as handle:
+            handle.write('<html>final adsorption report</html>')
+        return out
+
     report_full = types.SimpleNamespace(
         _member_dirs=lambda _project: list(job_dirs),
-        generate_project_report=lambda _project, out, config=None:
-            order.append('report') or out)
+        generate_project_report=generate_report)
 
     def auto_figures(_project, _scenario, out_dir, **_kwargs):
         order.append('figures')

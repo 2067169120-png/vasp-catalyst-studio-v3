@@ -12,6 +12,7 @@
   const State = {
     configs: [],      // 构型 POSCAR 路径列表(逐个添加)
     configSpecies: Object.create(null), // path -> Li-S 物种；旧 proj_create 仍只读取 configs 字符串数组
+    configSpeciesMeta: Object.create(null), // path -> 物种来源/置信度/是否已确认
     projects: [],     // proj_list 返回:[{path,name,n_members}]
     profiles: [],     // list_profiles 返回；一站式提交资源选择
     importRows: [],   // 本地结果扫描候选(前端只持有修正值;commit 时后端会重新验证)
@@ -231,7 +232,7 @@
       (!row.raw || row.raw.input_complete !== false);
   }
 
-  function importStatus(row) {
+  function convergenceImportStatus(row) {
     if (row.manualConfirm && row.confirmationEligible &&
       String(row.confirmationReason || '').trim()) return 'ready';
     const state = String(row.state || '').toUpperCase();
@@ -242,6 +243,12 @@
       return row.confirmationEligible ? 'review' : 'blocked';
     }
     return row.importable === true ? 'ready' : row.confirmationEligible ? 'review' : 'blocked';
+  }
+
+  function importStatus(row) {
+    const convergence = convergenceImportStatus(row);
+    if (convergence === 'ready' && row.mappingRequired && !row.mappingConfirmed) return 'review';
+    return convergence;
   }
 
   function normalizeImportCandidate(candidate, index) {
@@ -266,6 +273,12 @@
       name: String(c.name || pathBase(path) || `结果 ${index + 1}`),
       role,
       species: String(c.species || ''),
+      speciesSource: String(c.species_source || ''),
+      speciesConfidence: String(c.species_confidence || ''),
+      roleReason: String(c.role_reason || ''),
+      roleConfidence: String(c.role_confidence || ''),
+      mappingRequired: c.mapping_requires_confirmation === true,
+      mappingConfirmed: c.mapping_confirmed === true || c.mapping_requires_confirmation !== true,
       taskType: String(c.task_type || c.detected_task_type || 'unknown').toLowerCase(),
       state: String(state),
       importable: c.importable,
@@ -308,7 +321,7 @@
 
   function importMethodGate() {
     const selected = selectedImportRows();
-    const unresolved = selected.filter(row => importStatus(row) !== 'ready');
+    const unresolved = selected.filter(row => convergenceImportStatus(row) !== 'ready');
     const clean = selected.filter(row => row.role === 'clean_slab').length;
     const configs = selected.filter(row => row.role === 'config').length;
     const gas = selected.filter(row => row.role === 'gas_ref').length;
@@ -321,6 +334,15 @@
       ? selected.filter(row => row.role === 'config' && !row.species.trim()) : [];
     const unsafeMolecules = selected.filter(row => row.role === 'molecule_ref' &&
       String(row.state).toUpperCase() !== 'DONE' && !isCreatedInput(row));
+    const pendingMappings = selected.filter(row => row.mappingRequired && !row.mappingConfirmed);
+    const selectedMoleculeSpecies = selected.filter(row => row.role === 'molecule_ref')
+      .map(row => row.species.trim()).filter(Boolean);
+    const duplicateMoleculeSpecies = selectedMoleculeSpecies.filter((value, index, values) =>
+      values.findIndex(other => other.toLowerCase() === value.toLowerCase()) !== index);
+    const referenceSet = selectedMoleculeSpecies.map(value => value.toLowerCase());
+    const unmatchedConfigSpecies = referenceSet.length
+      ? selected.filter(row => row.role === 'config' && row.species.trim() &&
+        !referenceSet.includes(row.species.trim().toLowerCase())) : [];
     const invalidTasks = selected.filter(row => !['relax', 'static', 'freq', 'dos', 'band'].includes(row.taskType));
     const missingConfirmationReasons = selected.filter(row => row.manualConfirm &&
       row.confirmationEligible && !row.confirmationReason.trim());
@@ -329,11 +351,16 @@
     else if (missingConfirmationReasons.length) issue =
       `有 ${missingConfirmationReasons.length} 个人工确认结果尚未填写核对依据`;
     else if (unresolved.length) issue = `仍有 ${unresolved.length} 个已选结果需要处理`;
+    else if (pendingMappings.length) issue = `请确认 ${pendingMappings.length} 个已选结果的智能角色/物种分组`;
     else if (clean > 1) issue = '一个吸附能项目只能选择 1 个清洁表面';
     else if (gas > 1) issue = '一个吸附能项目只能选择 1 个吸附质气相参考';
     else if (missingSpecies.length) issue = `有 ${missingSpecies.length} 个分子参考未填写物种名称（如 Li2S4、S8）`;
     else if (missingConfigSpecies.length) issue =
       `已选择逐物种分子参考：请为 ${missingConfigSpecies.length} 个吸附构型填写对应物种（如 Li2S8）`;
+    else if (duplicateMoleculeSpecies.length) issue =
+      `分子参考物种重复：${Array.from(new Set(duplicateMoleculeSpecies)).join('、')}`;
+    else if (unmatchedConfigSpecies.length) issue =
+      `有 ${unmatchedConfigSpecies.length} 个吸附构型没有同名分子参考`;
     else if (unsafeMolecules.length) issue =
       '分子参考仅接收 DONE 结果或已验证的完整四件套待提交；待核项请改为“独立计算结果”';
     else if (invalidTasks.length) issue = `有 ${invalidTasks.length} 个结果尚未选择受支持的任务类型`;
@@ -378,7 +405,8 @@
     if (filter === 'attention' && status === 'ready' && !isCreatedInput(row)) return false;
     if (filter !== 'all' && filter !== 'attention' && filter !== visibleStatus) return false;
     if (!query) return true;
-    const haystack = [row.name, row.path, row.role, row.taskType, row.state, row.action,
+    const haystack = [row.name, row.path, row.role, row.species, row.speciesSource,
+      row.roleReason, row.taskType, row.state, row.action,
       ...row.diagnosis, ...row.blocking, ...row.warnings, ...row.evidence].join(' ').toLowerCase();
     return haystack.includes(query);
   }
@@ -394,15 +422,33 @@
     const empty = $('pj-import-empty');
     if (!body || !empty) return;
     const visible = State.importRows.filter(rowMatches);
-    body.innerHTML = visible.map(row => {
+    const groups = [];
+    visible.forEach(row => {
+      const key = `${row.role}:${row.species || '未识别'}`;
+      let group = groups.find(item => item.key === key);
+      if (!group) { group = { key, role: row.role, species: row.species || '未识别', rows: [] }; groups.push(group); }
+      group.rows.push(row);
+    });
+    groups.sort((left, right) => left.key.localeCompare(right.key));
+    body.innerHTML = groups.map((group, groupIndex) => {
+      const pending = group.rows.filter(row => row.mappingRequired && !row.mappingConfirmed);
+      const groupHeader = '<tr class="pj-import-group-row"><td colspan="6"><span><b>' +
+        `${VCS.esc(ROLE_LABELS[group.role] || group.role)}</b> / ${VCS.esc(group.species)} · ` +
+        `${group.rows.length} 项</span>` + (pending.length
+          ? `<button class="btn quiet" type="button" data-confirm-import-group="${groupIndex}">确认本组并选中</button>` : '') +
+        '</td></tr>';
+      const groupRows = group.rows.map(row => {
       const status = importStatus(row);
+      const convergenceStatus = convergenceImportStatus(row);
       const created = isCreatedInput(row);
       const statusLabel = created ? '四件套完整，待提交'
         : { ready: '可导入', review: '需确认', blocked: '暂不可导入' }[status];
       const statusClass = created ? 'run'
         : { ready: 'ok', review: 'warn', blocked: 'fail' }[status];
       const reasons = [...row.blocking, ...row.diagnosis, ...row.warnings, ...row.evidence];
-      const mainReason = row.blocking[0] || row.diagnosis[0] || row.warnings[0] ||
+      const mappingPending = row.mappingRequired && !row.mappingConfirmed;
+      const mainReason = (mappingPending ? `智能分组待确认：${row.roleReason || '请核对角色与物种'}` : '') ||
+        row.blocking[0] || row.diagnosis[0] || row.warnings[0] ||
         (created ? '输入文件已通过检查；尚无输出，导入后需要提交计算'
           : status === 'ready' ? '能量与收敛证据已通过检查' : '尚缺少足够的完成证据');
       const detail = reasons.length ? '<details><summary>查看证据与完整原因</summary><ul class="pj-import-evidence">' +
@@ -414,22 +460,24 @@
         ? `<input class="ipt pj-import-species" data-act="species" value="${VCS.esc(row.species)}" ` +
           `placeholder="${row.role === 'molecule_ref' ? '物种，如 Li2S4' : '吸附物种，如 Li2S8（使用分子参考时必填）'}">`
         : '';
+      const mappingHint = `<span class="pj-import-mapping ${mappingPending ? 'pending' : 'confirmed'}">` +
+        `${mappingPending ? '待确认' : '已确认'} · ${VCS.esc(row.speciesSource || row.roleReason || '人工设置')}</span>`;
       const confirmationInput = row.confirmationEligible
         ? `<textarea class="ipt pj-import-confirm-reason" data-act="confirm-reason" rows="2" ` +
           `placeholder="请填写你核对了哪些输出证据">${VCS.esc(row.confirmationReason)}</textarea>`
         : '';
       const manualLabel = created ? '输入检查已通过，不是收敛结果'
-        : status === 'ready' ? '自动检查已通过，无需人工确认'
+        : convergenceStatus === 'ready' ? '自动检查已通过，无需人工确认'
         : row.confirmationEligible ? '我已核对并确认收敛' : '存在硬性问题，不能人工跳过';
       const manualHint = created ? '导入后在任务页选择服务器、核数和墙时再提交'
-        : status === 'ready' ? '可直接导入；提交时仍会复核源文件是否变化'
+        : convergenceStatus === 'ready' ? '可直接导入；提交时仍会复核源文件是否变化'
         : row.confirmationEligible ? '请保留可审计的核对依据；提交时仍会复核硬性门禁'
           : '请按左侧原因补齐结果';
       return `<tr data-import-index="${row.index}" class="pj-import-${status}">` +
         `<td class="pj-import-check"><input type="checkbox" data-act="select"${row.selected ? ' checked' : ''}${disabled}></td>` +
         `<td class="pj-import-dir"><span class="name" title="${VCS.esc(row.path)}">${VCS.esc(row.name)}</span>` +
         `<span class="sub" title="${VCS.esc(row.path)}">${VCS.esc(row.path)}</span></td>` +
-        `<td><select class="ipt" data-act="role">${optionHtml(roleOptions, row.role, ROLE_LABELS)}</select>${speciesInput}</td>` +
+        `<td><select class="ipt" data-act="role">${optionHtml(roleOptions, row.role, ROLE_LABELS)}</select>${speciesInput}${mappingHint}</td>` +
         `<td><select class="ipt" data-act="task">${optionHtml(taskOptions, row.taskType, TASK_LABELS)}</select></td>` +
         `<td class="pj-import-reason"><span class="pill ${statusClass}"><i></i>${statusLabel}</span> ` +
         `<span class="pj-import-mainreason">${VCS.esc(mainReason)}</span>` +
@@ -438,8 +486,21 @@
         `${row.manualConfirm ? ' checked' : ''}${row.confirmationEligible ? '' : ' disabled'}>` +
         `${manualLabel}</label><span class="sub">${manualHint}</span>` +
         `${confirmationInput}</td></tr>`;
+      }).join('');
+      return groupHeader + groupRows;
     }).join('');
     empty.hidden = visible.length > 0;
+    body.querySelectorAll('[data-confirm-import-group]').forEach(button => {
+      button.addEventListener('click', () => {
+        const group = groups[Number(button.dataset.confirmImportGroup)];
+        if (!group) return;
+        group.rows.forEach(row => {
+          row.mappingConfirmed = true;
+          if (convergenceImportStatus(row) === 'ready' && row.role !== 'ignore') row.selected = true;
+        });
+        renderImport();
+      });
+    });
     body.querySelectorAll('tr[data-import-index]').forEach(tr => {
       const row = State.importRows[Number(tr.dataset.importIndex)];
       tr.querySelector('[data-act="select"]').addEventListener('change', e => {
@@ -448,6 +509,7 @@
       });
       tr.querySelector('[data-act="role"]').addEventListener('change', e => {
         row.role = e.target.value;
+        row.mappingConfirmed = true;
         if (row.role === 'ignore') row.selected = false;
         renderImport();
       });
@@ -459,6 +521,7 @@
       const species = tr.querySelector('[data-act="species"]');
       if (species) species.addEventListener('input', e => {
         row.species = e.target.value;
+        row.mappingConfirmed = true;
         updateImportCommit();
       });
       const confirmationReason = tr.querySelector('[data-act="confirm-reason"]');
@@ -579,6 +642,8 @@
       manual_confirm: !!row.manualConfirm && row.confirmationEligible,
       confirmation_reason: row.manualConfirm ? row.confirmationReason.trim() : null,
       species: row.species || null,
+      mapping_confirmed: row.mappingConfirmed === true,
+      species_source: row.speciesSource || null,
       source_fingerprint: row.raw && row.raw.source_fingerprint || null,
     }));
   }
@@ -801,17 +866,46 @@
     return selectedReferenceSpecies().find(x => x.toLowerCase() === wanted) || '';
   }
 
-  function guessSpecies(path, suggested) {
+  function guessSpeciesEvidence(path, suggested) {
     const refs = selectedReferenceSpecies();
     const exact = refs.find(x => x.toLowerCase() === String(suggested || '').trim().toLowerCase());
-    if (exact) return exact;
-    const name = pathBase(path).toLowerCase().replace(/[^a-z0-9]/g, '');
-    return refs.slice().sort((a, b) => b.length - a.length)
-      .find(x => name.includes(x.toLowerCase().replace(/[^a-z0-9]/g, ''))) || String(suggested || '').trim();
+    if (exact) return { value: exact, source: 'backend_suggestion', ambiguous: false, warnings: [] };
+    const base = pathBase(path);
+    const parent = pathBase(pathParent(path));
+    const names = [base, parent].filter(Boolean).map(value => value.toLowerCase());
+    const matches = refs.filter(ref => {
+      const token = ref.toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (!token) return false;
+      const boundary = new RegExp(`(^|[^a-z0-9])${token}(?=$|[^a-z0-9])`, 'i');
+      if (names.some(name => boundary.test(name))) return true;
+      return names.some(name => name.replace(/[^a-z0-9]/g, '').includes(token));
+    });
+    if (matches.length === 1) {
+      return { value: matches[0], source: 'path_name', ambiguous: false, warnings: [] };
+    }
+    const fallback = String(suggested || '').trim();
+    return {
+      value: fallback, source: fallback ? 'backend_suggestion' : 'unresolved',
+      ambiguous: matches.length > 1,
+      warnings: matches.length > 1
+        ? [`文件夹名同时匹配 ${matches.join('、')}，没有自动选择`] : [],
+    };
+  }
+
+  function guessSpecies(path, suggested) {
+    return guessSpeciesEvidence(path, suggested).value;
   }
 
   function lisConfigItems() {
-    return State.configs.map(path => ({ path, species: String(State.configSpecies[path] || '').trim() }));
+    return State.configs.map(path => {
+      const meta = State.configSpeciesMeta[path] || {};
+      return {
+        path, species: String(State.configSpecies[path] || '').trim(),
+        species_source: String(meta.source || ''),
+        species_confidence: String(meta.confidence || ''),
+        species_confirmed: meta.confirmed === true,
+      };
+    });
   }
 
   function lisContentFingerprint() {
@@ -875,7 +969,7 @@
     const title = $('lis-method-title');
     if (title) title.textContent = status === 'incompatible'
       ? '计算方法不兼容，已阻止提交'
-      : '参考能与新任务的方法信息无法自动完全核验';
+      : '参考能与新任务存在需要人工核对的方法差异或证据缺项';
     const list = $('lis-method-reasons');
     if (list) list.innerHTML = (reasons.length ? reasons : ['缺少足够的方法元数据，不能自动证明能量可直接比较'])
       .map(item => `<li>${VCS.esc(item)}</li>`).join('');
@@ -938,16 +1032,31 @@
     const removed = State.configs.filter(item => sameLocalPath(item, path));
     if (!removed.length) return false;
     State.configs = State.configs.filter(item => !sameLocalPath(item, path));
-    removed.forEach(item => { delete State.configSpecies[item]; });
+    removed.forEach(item => {
+      delete State.configSpecies[item];
+      delete State.configSpeciesMeta[item];
+    });
     return true;
   }
 
-  function appendConfig(path, species) {
+  function appendConfig(path, species, evidence) {
     const clean = String(path || '').trim();
     if (!clean) return false;
     if (State.configs.includes(clean)) return false;
+    const raw = evidence && typeof evidence === 'object' ? evidence : {};
+    const assignment = raw.assignment && typeof raw.assignment === 'object' ? raw.assignment : {};
+    const guessed = guessSpeciesEvidence(clean, species);
+    const confidence = String(raw.species_confidence || assignment.confidence ||
+      (guessed.value ? 'hint' : 'unknown'));
+    const source = String(raw.species_source || assignment.source || guessed.source);
     State.configs.push(clean);
-    State.configSpecies[clean] = guessSpecies(clean, species);
+    State.configSpecies[clean] = guessed.value;
+    State.configSpeciesMeta[clean] = {
+      source, confidence,
+      confirmed: (raw.species_confirmed === true || assignment.confirmed === true) && confidence === 'exact',
+      ambiguous: guessed.ambiguous,
+      warnings: [...textList(raw.warnings || assignment.warnings), ...guessed.warnings],
+    };
     invalidatePreparedLis();
     return true;
   }
@@ -964,7 +1073,8 @@
     if (button) { button.disabled = true; button.textContent = '正在识别整套输入…'; }
     showBundleStatus('', '正在只读扫描固定 INCAR、clean slab 和 adsorption 结构…');
     try {
-      const result = await VCS.call('proj_scan_lis_inputs', picked.path);
+      const result = await VCS.call(
+        'proj_scan_lis_inputs', picked.path, selectedReferenceSpecies());
       if (!result || result.ok === false || result.error) {
         const message = (result && result.error) || '未知错误';
         VCS.log('识别本次计算文件夹失败:' + message, 'failc');
@@ -983,7 +1093,7 @@
         const path = typeof item === 'string' ? item : item && item.path;
         const species = typeof item === 'object' && item
           ? (item.species || item.suggested_species || '') : '';
-        if (path && !sameLocalPath(path, result.clean_slab) && appendConfig(path, species)) added++;
+        if (path && !sameLocalPath(path, result.clean_slab) && appendConfig(path, species, item)) added++;
       });
       invalidatePreparedLis();
       renderConfigs();
@@ -1005,6 +1115,7 @@
     const refs = selectedReferenceSpecies();
     const items = lisConfigItems();
     const invalidSpecies = items.filter(item => !refs.some(x => x.toLowerCase() === item.species.toLowerCase()));
+    const unconfirmedSpecies = items.filter(item => item.species_confirmed !== true);
     const cores = Number(val('lis-cores'));
     const walltime = val('lis-walltime');
     const validWalltime = /^\d{1,3}:\d{2}:\d{2}$/.test(walltime) &&
@@ -1019,7 +1130,8 @@
       (methodConfirmation.confirmed && !!methodConfirmation.reason));
     const step = {
       1: !!ref && refs.length > 0,
-      2: !!val('pj-incar') && !!val('pj-slab') && items.length > 0 && invalidSpecies.length === 0,
+      2: !!val('pj-incar') && !!val('pj-slab') && items.length > 0 &&
+        invalidSpecies.length === 0 && unconfirmedSpecies.length === 0,
       3: !!val('pj-name') && !!val('pj-root') && !nameConflict,
       4: !!val('lis-profile') && Number.isInteger(cores) && cores > 0 && validWalltime,
     };
@@ -1030,6 +1142,8 @@
     else if (!val('pj-slab')) issue = '第 2 步：请选择 clean slab POSCAR';
     else if (!items.length) issue = '第 2 步：至少添加一个 adsorption POSCAR';
     else if (invalidSpecies.length) issue = `第 2 步：有 ${invalidSpecies.length} 个构型的物种不在参考能集合中`;
+    else if (unconfirmedSpecies.length) issue =
+      `第 2 步：请确认 ${unconfirmedSpecies.length} 个构型的智能物种分组`;
     else if (!val('pj-name')) issue = '第 3 步：填写项目名';
     else if (!val('pj-root')) issue = '第 3 步：选择输出根目录';
     else if (nameConflict) issue = `第 3 步：旧项目“${State.preparedConflictHint.oldName}”已存在；请改用新项目名`;
@@ -1119,7 +1233,14 @@
   function onReferenceChanged() {
     invalidatePreparedLis();
     State.configs.forEach(path => {
-      if (!State.configSpecies[path]) State.configSpecies[path] = guessSpecies(path, '');
+      if (!State.configSpecies[path]) {
+        const guessed = guessSpeciesEvidence(path, '');
+        State.configSpecies[path] = guessed.value;
+        State.configSpeciesMeta[path] = {
+          source: guessed.source, confidence: guessed.value ? 'hint' : 'unknown',
+          confirmed: false, ambiguous: guessed.ambiguous, warnings: guessed.warnings,
+        };
+      }
     });
     const options = $('lis-species-options');
     if (options) options.innerHTML = selectedReferenceSpecies()
@@ -1137,16 +1258,18 @@
     if (values.includes(previous)) select.value = previous;
   }
 
-  // 构型列表兼容旧的 string[]，额外维护 path -> species 映射供 proj_prepare_lis。
+  // 构型列表按物种成组；POSCAR 组成差可自动确认，文件名建议必须由用户确认。
   function renderConfigs() {
     const box = $('pj-cfg-list');
     const count = $('lis-config-count');
     const refs = selectedReferenceSpecies();
     const validSpecies = path => refs.some(value => value.toLowerCase() ===
       String(State.configSpecies[path] || '').trim().toLowerCase());
-    const matched = State.configs.filter(validSpecies).length;
+    const confirmedSpecies = path => validSpecies(path) &&
+      !!(State.configSpeciesMeta[path] && State.configSpeciesMeta[path].confirmed);
+    const matched = State.configs.filter(confirmedSpecies).length;
     if (count) count.textContent = State.configs.length
-      ? `已匹配 ${matched}/${State.configs.length} 个构型` : '尚未添加构型';
+      ? `已确认 ${matched}/${State.configs.length} 个构型，按物种自动分组` : '尚未添加构型';
     updateBulkSpeciesOptions(refs);
     if (!box) return;
     if (!State.configs.length) {
@@ -1156,31 +1279,78 @@
     }
     const onlyUnmatched = !!($('lis-only-unmatched') && $('lis-only-unmatched').checked);
     const rows = State.configs.map((path, index) => ({ path, index }))
-      .filter(item => !onlyUnmatched || !validSpecies(item.path));
+      .filter(item => !onlyUnmatched || !confirmedSpecies(item.path));
     if (!rows.length) {
-      box.innerHTML = '<div class="pj-cfgempty">所有构型都已匹配参考物种。</div>';
+      box.innerHTML = '<div class="pj-cfgempty">所有构型的物种映射都已确认。</div>';
       updateLisReadiness();
       return;
     }
-    box.innerHTML = rows.map(({ path: p, index: i }) => {
-      const species = String(State.configSpecies[p] || '');
-      const valid = validSpecies(p);
-      const speciesCheck = valid ? '已匹配参考能' : `请选择：${refs.join('、') || '先选参考项目'}`;
-      const speciesOptions = '<option value="">请选择对应物种</option>' +
-        (!valid && species ? `<option value="${VCS.esc(species)}" selected>${VCS.esc(species)}（未匹配）</option>` : '') +
-        refs.map(value => `<option value="${VCS.esc(value)}"${value.toLowerCase() === species.trim().toLowerCase() ? ' selected' : ''}>${VCS.esc(value)}</option>`).join('');
-      return `<div class="pj-cfgrow lis-cfgrow${valid ? '' : ' invalid'}">` +
-        `<div class="lis-cfgpath"><span class="path" title="${VCS.esc(p)}">${VCS.esc(pathBase(p))}</span>` +
-        `<span class="sub" title="${VCS.esc(p)}">${VCS.esc(p)}</span></div>` +
-        `<label>对应物种<select class="ipt lis-species" data-species-index="${i}">${speciesOptions}</select></label>` +
-        `<span class="lis-species-check">${VCS.esc(speciesCheck)}</span>` +
-        `<button class="btn quiet" type="button" data-rm="${i}">移除</button></div>`;
+    const groups = [];
+    rows.forEach(row => {
+      const species = String(State.configSpecies[row.path] || '').trim();
+      const key = species || '未识别';
+      let group = groups.find(item => item.key.toLowerCase() === key.toLowerCase());
+      if (!group) { group = { key, rows: [] }; groups.push(group); }
+      group.rows.push(row);
+    });
+    groups.sort((left, right) => (left.key === '未识别') - (right.key === '未识别') ||
+      left.key.localeCompare(right.key));
+    box.innerHTML = groups.map((group, groupIndex) => {
+      const canConfirm = group.rows.some(row => validSpecies(row.path) && !confirmedSpecies(row.path));
+      const confirmed = group.rows.filter(row => confirmedSpecies(row.path)).length;
+      const header = `<div class="lis-species-group"><span><b>${VCS.esc(group.key)}</b> · ` +
+        `${group.rows.length} 个构型 · ${confirmed} 个已确认</span>` +
+        (canConfirm ? `<button class="btn quiet" type="button" data-confirm-group="${groupIndex}">确认本组映射</button>` : '') +
+        '</div>';
+      const body = group.rows.map(({ path: p, index: i }) => {
+        const species = String(State.configSpecies[p] || '');
+        const valid = validSpecies(p);
+        const meta = State.configSpeciesMeta[p] || {};
+        const confirmedRow = valid && meta.confirmed === true;
+        const sourceLabel = meta.source === 'poscar_minus_clean_slab' ||
+          String(meta.source || '').startsWith('poscar_minus_clean_slab+')
+          ? 'POSCAR−clean slab 组成差'
+          : meta.source === 'user' ? '人工选择' : meta.source === 'path_name' ? '文件夹/文件名建议' : '未识别';
+        const speciesCheck = confirmedRow ? `已确认：${sourceLabel}`
+          : valid ? `自动建议 ${species}，待确认（${sourceLabel}）`
+            : `未匹配参考能；请选择：${refs.join('、') || '先选参考项目'}`;
+        const speciesOptions = '<option value="">请选择对应物种</option>' +
+          (!valid && species ? `<option value="${VCS.esc(species)}" selected>${VCS.esc(species)}（未匹配）</option>` : '') +
+          refs.map(value => `<option value="${VCS.esc(value)}"${value.toLowerCase() === species.trim().toLowerCase() ? ' selected' : ''}>${VCS.esc(value)}</option>`).join('');
+        return `<div class="pj-cfgrow lis-cfgrow${confirmedRow ? '' : valid ? ' pending' : ' invalid'}">` +
+          `<div class="lis-cfgpath"><span class="path" title="${VCS.esc(p)}">${VCS.esc(pathBase(p))}</span>` +
+          `<span class="sub" title="${VCS.esc(p)}">${VCS.esc(p)}</span></div>` +
+          `<label>对应物种<select class="ipt lis-species" data-species-index="${i}">${speciesOptions}</select></label>` +
+          `<span class="lis-species-check">${VCS.esc(speciesCheck)}</span>` +
+          `<button class="btn quiet" type="button" data-rm="${i}">移除</button></div>`;
+      }).join('');
+      return header + body;
     }).join('');
+    box.querySelectorAll('button[data-confirm-group]').forEach(button => {
+      button.addEventListener('click', () => {
+        const group = groups[Number(button.dataset.confirmGroup)];
+        if (!group) return;
+        let changed = 0;
+        group.rows.forEach(row => {
+          if (!validSpecies(row.path)) return;
+          const meta = State.configSpeciesMeta[row.path] || {};
+          if (!meta.confirmed) changed++;
+          State.configSpeciesMeta[row.path] = { ...meta, confirmed: true };
+        });
+        invalidatePreparedLis();
+        renderConfigs();
+        VCS.toast(`已确认 ${changed} 个 ${group.key} 构型的物种映射`);
+      });
+    });
     box.querySelectorAll('select[data-species-index]').forEach(input => {
       input.addEventListener('change', () => {
         const path = State.configs[Number(input.dataset.speciesIndex)];
         if (!path) return;
         State.configSpecies[path] = exactReferenceSpecies(input.value) || input.value.trim();
+        State.configSpeciesMeta[path] = {
+          source: 'user', confidence: 'confirmed', confirmed: !!State.configSpecies[path],
+          warnings: [],
+        };
         invalidatePreparedLis();
         renderConfigs();
       });
@@ -1189,7 +1359,10 @@
       btn.addEventListener('click', () => {
         const path = State.configs[Number(btn.dataset.rm)];
         State.configs.splice(Number(btn.dataset.rm), 1);
-        if (path) delete State.configSpecies[path];
+        if (path) {
+          delete State.configSpecies[path];
+          delete State.configSpeciesMeta[path];
+        }
         invalidatePreparedLis();
         renderConfigs();
       });
@@ -1203,18 +1376,19 @@
       VCS.toast('请先从参考物种中选择一个值', 'fail');
       return;
     }
-    const refs = selectedReferenceSpecies().map(value => value.toLowerCase());
     let changed = 0;
     State.configs.forEach(path => {
-      const current = String(State.configSpecies[path] || '').trim().toLowerCase();
-      if (!refs.includes(current)) {
-        State.configSpecies[path] = species;
-        changed++;
-      }
+      const meta = State.configSpeciesMeta[path] || {};
+      if (meta.confirmed === true) return;
+      State.configSpecies[path] = species;
+      State.configSpeciesMeta[path] = {
+        source: 'user', confidence: 'confirmed', confirmed: true, warnings: [],
+      };
+      changed++;
     });
     invalidatePreparedLis();
     renderConfigs();
-    VCS.toast(changed ? `已为 ${changed} 个未匹配构型设置 ${species}` : '所有构型已经匹配，无需修改');
+    VCS.toast(changed ? `已为 ${changed} 个未确认构型绑定并确认 ${species}` : '所有构型已经确认，无需修改');
   }
 
   async function addConfig() {
@@ -1237,8 +1411,8 @@
       const base = pathBase(path).toLowerCase();
       if (item.preferred === true) return 100;
       if (item.valid === false || item.parseable === false) return -10;
-      if (base === 'contcar') return 20;
-      if (base === 'poscar') return 10;
+      if (base === 'poscar') return 20;
+      if (base === 'contcar') return 10;
       return 0;
     }
     (raw || []).forEach(item => {
@@ -1250,7 +1424,8 @@
       const standard = base === 'poscar' || base === 'contcar';
       const key = standard ? 'folder:' + pathParent(path).toLowerCase() : 'file:' + String(path).toLowerCase();
       const previous = chosen.get(key);
-      // 同目录优先后端显式 preferred；否则采用可解析的最终 CONTCAR，缺失/无效才回退 POSCAR。
+      // 这是新计算输入：同目录优先后端显式 preferred；否则优先原始 POSCAR，
+      // 避免把上一轮残留 CONTCAR 当成用户本次准备提交的结构。
       if (!previous || score(candidate) > score(previous)) {
         if (previous) suppressed++;
         chosen.set(key, candidate);
@@ -1278,7 +1453,8 @@
     showConfigScanStatus('', '正在递归寻找 POSCAR / CONTCAR / .vasp 结构文件…');
     VCS.log('正在递归扫描 adsorption POSCAR:' + picked.path + '…');
     try {
-      const r = await VCS.call('proj_scan_structures', picked.path);
+      const r = await VCS.call(
+        'proj_scan_structures', picked.path, val('pj-slab'), selectedReferenceSpecies());
       if (!r || r.ok === false || r.error) {
         VCS.log('扫描结构文件夹失败:' + ((r && r.error) || '未知错误'), 'failc');
         showConfigScanStatus('bad', '扫描失败：' + ((r && r.error) || '未知错误') +
@@ -1293,7 +1469,7 @@
           : item && (item.path || item.poscar_path || item.file || item.source_path);
         const species = typeof item === 'object' && item
           ? (item.species || item.suggested_species || item.species_suggestion || '') : '';
-        if (appendConfig(path, species)) added++;
+        if (appendConfig(path, species, item)) added++;
       });
       textList(r.warnings).forEach(x => VCS.log(x, 'warnc'));
       renderConfigs();
@@ -1303,9 +1479,9 @@
         VCS.toast('没有找到 POSCAR / CONTCAR 结构文件', 'fail');
       } else {
         const choice = preferred.suppressed
-          ? `；同目录冲突时已自动选择可用的最终 CONTCAR（跳过 ${preferred.suppressed} 个重复文件）` : '';
+          ? `；同目录冲突时已优先选择本次输入 POSCAR（跳过 ${preferred.suppressed} 个重复文件）` : '';
         const finalNote = preferred.finalStructures
-          ? `；已选 ${preferred.finalStructures} 个最终 CONTCAR，如需原始 POSCAR 请使用“逐个添加”` : '';
+          ? `；${preferred.finalStructures} 个目录仅能回退使用 CONTCAR，请确认不是旧结果残留` : '';
         showConfigScanStatus('ok', `已新增 ${added} 个结构${choice}${finalNote}。请逐行确认“对应物种”，红色项必须修正后才能提交。`);
       }
     } finally {
@@ -1902,7 +2078,9 @@
     const rows = deltaResult && (deltaResult.rows || []);
     const methodBlocked = String(deltaResult && deltaResult.method_consistency &&
       deltaResult.method_consistency.status || '').toLowerCase() === 'incompatible';
-    const complete = !!(rows && rows.length && rows.every(row => row.delta_e != null) && !methodBlocked);
+    const backendFinal = deltaResult && deltaResult.final_report_eligible;
+    const complete = !!(rows && rows.length && rows.every(row => row.delta_e != null) &&
+      !methodBlocked && backendFinal === true);
     const missing = rows ? rows.filter(row => row.delta_e == null).length : null;
     const pipelineStage = String(project.pipeline_stage || project.autopilot_stage || '').trim();
     let stage;
@@ -1912,6 +2090,9 @@
       next = '下一步：统一泛函、ENCUT、色散和 POTCAR 后重算。';
     } else if (complete) {
       stage = 'ΔE 已完整'; next = '下一步：核对下表后生成完整 HTML 报告。';
+    } else if (rows && rows.length && rows.every(row => row.delta_e != null) && backendFinal === false) {
+      stage = 'ΔE 可预览，最终报告仍被门禁阻止';
+      next = `下一步：${deltaResult.final_report_reason || '补齐参考态与方法确认。'}`;
     } else if (missing != null && missing > 0) {
       stage = `${missing} 个构型尚缺可靠 ΔE`;
       next = '下一步：保持软件运行等待自动下载/续算，完成后点“刷新并计算 ΔE”。';
@@ -1959,7 +2140,7 @@
     const methodBlocked = String(r.method_consistency && r.method_consistency.status || '')
       .toLowerCase() === 'incompatible';
     State.workflowResultReady = !!(!methodBlocked && rows.length &&
-      rows.every(row => row.delta_e != null));
+      rows.every(row => row.delta_e != null) && r.final_report_eligible === true);
     updateProjectSummary(r);
     updateJourney();
     if (State.workflowResultReady) VCS.toast('ΔE 已完整；下一步生成完整报告');
@@ -1975,10 +2156,10 @@
     if (row && row.delta_e != null) return '';
     const methodCheck = row && row.method_check || {};
     if (methodCheck.status === 'incompatible' || /方法不一致/.test(note)) {
-      return '下一步：统一所有相减项的泛函、ENCUT、色散和 POTCAR 后重算；当前 ΔE 已阻断，不能直接用于比较或报告。';
+      return '下一步：按方法检查列出的硬冲突逐项修正后重算；clean slab 与吸附构型的 ISPIN 必须一致。当前 ΔE 已阻断，不能用于比较或报告。';
     }
     if (methodCheck.status === 'unverified') {
-      return '下一步：先核对泛函、ENCUT、色散和 POTCAR 是否一致，再决定能否使用该 ΔE。';
+      return '下一步：按方法检查逐项核对；分子参考与周期体系 ISPIN 不同，可在确认各自采用正确基态自旋后保留。';
     }
     if (/构型未完成|清洁表面未完成|未完成/.test(note)) {
       return '下一步：保持软件运行等待自动续算/下载；任务 DONE 后重新计算 ΔE。';
@@ -2004,12 +2185,12 @@
     const methodWarnings = (method.warnings || []).map(String);
     if (methodStatus === 'incompatible') {
       h += '<div class="pj-method-gate incompatible"><b>方法不一致：ΔE 已阻断</b>' +
-        '<span>请统一所有相减项的泛函、ENCUT、色散和 POTCAR 后重新计算；当前数值不能用于构型比较、出图或报告。</span>' +
+        '<span>请按下列硬冲突逐项修正后重新计算；clean slab 与吸附构型的 ISPIN 必须一致。当前数值不能用于构型比较、出图或报告。</span>' +
         (methodIssues.length ? `<ul>${methodIssues.map(x => `<li>${VCS.esc(x)}</li>`).join('')}</ul>` : '') +
         '</div>';
     } else if (methodStatus === 'unverified') {
       h += '<div class="pj-method-gate unverified"><b>方法一致性尚未完全核验</b>' +
-        '<span>ΔE 展示不等于方法已可比；请核对泛函、ENCUT、色散和 POTCAR。</span>' +
+        '<span>请按下列具体项目逐项核对；分子参考与周期体系 ISPIN 不同，可在确认各自采用正确基态自旋后保留。</span>' +
         (methodWarnings.length ? `<ul>${methodWarnings.map(x => `<li>${VCS.esc(x)}</li>`).join('')}</ul>` : '') +
         '</div>';
     } else if (methodStatus === 'verified') {
@@ -2091,7 +2272,9 @@
     if (btn) btn.disabled = true;
     VCS.log('生成完整报告(Origin 图表 + 结构图 + AI 分析),生成中,可能需要几分钟…');
     try {
-      const r = await VCS.call('proj_report', proj.path, save);
+      // 项目页的“完整报告”是最终吸附能交付物：后端必须再次核对参考态、
+      // DONE 能量和方法确认，不能只依赖按钮当前是否可点。
+      const r = await VCS.call('proj_report', proj.path, save, true);
       if (!r || r.ok === false || r.error) {
         VCS.log('生成完整报告失败:' + ((r && r.error) || '未知错误'), 'failc');
         return;
