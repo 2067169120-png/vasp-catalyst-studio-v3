@@ -276,5 +276,6 @@ def get_dialect(scheduler: str) -> SchedulerDialect:
     if cls is None:
         raise ValueError(
             f'调度器 {scheduler!r} 暂不支持自动提交(当前支持: {", ".join(_DIALECTS)});'
-            f'LSF/Shell 请改用"我的模板"模式并自定提交命令(后续版本支持)。')
+            '模板只控制作业脚本文本，不能替代缺失的提交/查询/取消方言；'
+            '请使用 Slurm/PBS，或等待相应调度器支持。')
     return cls()

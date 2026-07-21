@@ -28,8 +28,44 @@ VALID_STATES = (
     'DONE', 'FAILED', 'UNCONVERGED', 'NEEDS_HUMAN',
 )
 
-# 任务类型:M1 阶段吸附能研究以 relax 为主;后续类型链(static/dos/band/freq/neb)按此扩展。
-KNOWN_TASK_TYPES = ('relax', 'static', 'dos', 'band', 'freq', 'neb', 'aimd')
+# GUI 「计算类型」目录中的全部任务 key。这里不反向导入
+# generate.task_catalog，避免 shared 层依赖生成器；同步关系由测试强制校验。
+CATALOG_TASK_TYPES = (
+    'relax', 'cellopt', 'static', 'adsorption_project', 'spin_scan',
+    'dos_pdos', 'bands', 'bader', 'chgdiff', 'elf',
+    'freq', 'aimd', 'neb', 'dimer', 'eos', 'surface_energy',
+    'workfunction', 'formation_binding', 'vaspsol',
+    'conv_encut', 'conv_kmesh', 'conv_vacuum', 'conv_thickness',
+)
+
+# 存量文件使用的聚合/运行类型：conv_scan 的具体维度记在
+# inputs.series；quick 是多引擎「直接提交输入」作业。它们不是 GUI 目录项，
+# 但仍是合法 manifest 类型，不能被当成未知值。
+OPERATIONAL_TASK_TYPES = ('conv_scan', 'quick')
+
+# 只在写入时规范化；旧 job.yaml 的原文仍可读，不会被暗中改写。
+TASK_TYPE_ALIASES = {
+    'band': 'bands',
+    'dos': 'dos_pdos',
+    'pdos': 'dos_pdos',
+}
+
+KNOWN_TASK_TYPES = CATALOG_TASK_TYPES + OPERATIONAL_TASK_TYPES
+
+
+def normalize_task_type(task_type: str) -> str:
+    """任务类型规范化为 manifest 的唯一 key；未知值显式拒绝。
+
+    旧别名 ``band/dos/pdos`` 仅为读入兼容，新写入统一落为
+    ``bands/dos_pdos``。过去 create_from_build 会把任何拼错静默变成
+    relax，可能让静态/动力学作业用错误的完成判据，因此现在必须报错。
+    """
+    raw = str(task_type or '').strip().lower()
+    canonical = TASK_TYPE_ALIASES.get(raw, raw)
+    if canonical not in KNOWN_TASK_TYPES:
+        raise ValueError(
+            f'未知任务类型: {task_type!r};合法值: {", ".join(KNOWN_TASK_TYPES)}')
+    return canonical
 
 
 def _now_iso() -> str:
@@ -55,6 +91,7 @@ def incar_source_label(validate: bool, completions: dict | None) -> str:
 def new_manifest(*, job_id: str, system: str, task_type: str, calc_type: str,
                  inputs: dict, warnings: list | None = None) -> dict:
     """构造一份新 manifest dict(state=CREATED)。"""
+    task_type = normalize_task_type(task_type)
     now = _now_iso()
     return {
         'schema': SCHEMA_VERSION,
@@ -149,6 +186,7 @@ def create_from_build(job_dir: str | os.PathLike, build_result: dict, *,
     """
     if task_type is None:
         task_type = str(build_result.get('task_type') or 'relax')
+    task_type = normalize_task_type(task_type)
     completions = dict(build_result.get('completions') or {})
     job_dir = Path(job_dir)
     inputs = {
@@ -167,7 +205,7 @@ def create_from_build(job_dir: str | os.PathLike, build_result: dict, *,
     m = new_manifest(
         job_id=f'{job_dir.resolve().name}-{time.strftime("%Y%m%d-%H%M%S")}',
         system=system or _poscar_system_name(poscar_path),
-        task_type=task_type if task_type in KNOWN_TASK_TYPES else 'relax',
+        task_type=task_type,
         calc_type=str(build_result.get('calc_type') or ''),
         inputs=inputs,
         warnings=build_result.get('warnings'),

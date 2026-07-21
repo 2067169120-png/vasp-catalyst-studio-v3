@@ -57,6 +57,49 @@ def test_save_profile_roundtrip_only_known_fields():
     assert not hasattr(store['c9'], 'bogus')
 
 
+def test_save_profile_roundtrips_engine_commands_and_normalizes_keys():
+    store = {}
+    api = Api(profiles_mod=_fake_profiles(store))
+
+    out = api.save_profile({
+        'name': 'multi',
+        'engine_commands': {
+            ' CP2K ': '  cp2k.psmp -i {input} -o {stem}.out  ',
+            'Gaussian': 'g16 < {input} > {stem}.log',
+        },
+    })
+
+    assert out['ok'] is True
+    assert store['multi'].engine_commands == {
+        'cp2k': 'cp2k.psmp -i {input} -o {stem}.out',
+        'gaussian': 'g16 < {input} > {stem}.log',
+    }
+    listed = api.list_profiles()['profiles'][0]
+    assert listed['engine_commands'] == store['multi'].engine_commands
+
+
+def test_save_profile_rejects_malformed_engine_commands():
+    store = {}
+    api = Api(profiles_mod=_fake_profiles(store))
+
+    out = api.save_profile({'name': 'bad', 'engine_commands': ['srun cp2k']})
+
+    assert out['ok'] is False and 'engine_commands' in out['error']
+    assert store == {}
+
+
+def test_legacy_profile_form_does_not_erase_engine_commands():
+    store = {'multi': ClusterProfile(
+        name='multi', hostname='old',
+        engine_commands={'cp2k': 'cp2k.psmp -i {input}'})}
+    api = Api(profiles_mod=_fake_profiles(store))
+
+    out = api.save_profile({'name': 'multi', 'hostname': 'new'})
+
+    assert out['ok'] is True and store['multi'].hostname == 'new'
+    assert store['multi'].engine_commands == {'cp2k': 'cp2k.psmp -i {input}'}
+
+
 def test_save_profile_rejects_blank_name():
     api = Api(profiles_mod=_fake_profiles({}))
     out = api.save_profile({'name': '  '})
@@ -77,11 +120,21 @@ def test_delete_profile_missing_is_ok_false():
     assert out['ok'] is False
 
 
+def test_save_profile_rejects_scheduler_without_execution_dialect():
+    store = {}
+    api = Api(profiles_mod=_fake_profiles(store))
+
+    out = api.save_profile({'name': 'lsf', 'scheduler': 'LSF'})
+
+    assert out['ok'] is False and 'Slurm / PBS' in out['error']
+    assert store == {}
+
+
 # ── test_connection ──────────────────────────────────────────────────────────
 def test_test_connection_saves_password_on_success():
     saved = {}
     secrets = types.SimpleNamespace(
-        get_password=lambda n: None,
+        get_password=lambda n: saved.get(n),
         set_password=lambda n, pw: saved.update({n: pw}))
     ssh = types.SimpleNamespace(check_connection=lambda prof, password, trust_new=False:
         types.SimpleNamespace(ok=True, message='ok', scheduler='PBS', needs_trust=False))
@@ -90,6 +143,20 @@ def test_test_connection_saves_password_on_success():
     out = api.test_connection('c1', 'pw123', False)
     assert out['ok'] is True and saved == {'c1': 'pw123'}
     assert out['scheduler'] == 'PBS' and out['needs_trust'] is False
+
+
+def test_test_connection_rejects_keyring_write_without_matching_readback():
+    secrets = types.SimpleNamespace(
+        get_password=lambda _n: None,
+        set_password=lambda _n, _pw: None)
+    ssh = types.SimpleNamespace(check_connection=lambda prof, password, trust_new=False:
+        types.SimpleNamespace(ok=True, message='ok', scheduler='PBS', needs_trust=False))
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='password')}
+    api = Api(profiles_mod=_fake_profiles(store), secrets_mod=secrets, ssh_test_mod=ssh)
+
+    out = api.test_connection('c1', 'pw123', False)
+
+    assert out['ok'] is False and '回读不一致' in out['message']
 
 
 def test_test_connection_failure_does_not_save():
@@ -130,6 +197,28 @@ def test_test_connection_unknown_profile_error():
     api = Api(profiles_mod=_fake_profiles({}))
     out = api.test_connection('nope', 'pw', False)
     assert out['ok'] is False and '集群' in out['message']
+
+
+def test_test_connection_round_trips_exact_sha256_host_pin():
+    seen = {}
+    pin = {'host': 'bastion', 'fingerprint': 'SHA256:abc',
+           'algorithm': 'ssh-ed25519'}
+
+    def _check(_prof, _password, trust_new=False):
+        seen['trust_new'] = trust_new
+        return types.SimpleNamespace(
+            ok=False, message='请核对', scheduler='', needs_trust=True,
+            host='target', fingerprint='SHA256:def', algorithm='ssh-rsa')
+
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              ssh_test_mod=types.SimpleNamespace(check_connection=_check))
+    out = api.test_connection('c1', None, pin)
+
+    assert seen['trust_new'] is pin
+    assert out['needs_trust'] is True
+    assert (out['host'], out['fingerprint'], out['algorithm']) == (
+        'target', 'SHA256:def', 'ssh-rsa')
 
 
 # ── has_saved_password ───────────────────────────────────────────────────────
@@ -274,6 +363,19 @@ def test_submit_jobs_delegates_to_batch_ops():
     assert calls['dirs'] == ['/a', '/b'] and out['results'][0][1] is True
 
 
+def test_submit_jobs_passes_exact_host_pin_without_boolean_coercion():
+    seen = {}
+    pin = {'host': 'h', 'fingerprint': 'SHA256:abc', 'algorithm': 'ssh-ed25519'}
+    bo = types.SimpleNamespace(submit_batch=lambda _prof, _pw, _dirs, trust:
+        seen.update(trust=trust) or {'needs_trust': False, 'results': []})
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store), batch_ops_mod=bo)
+
+    api.submit_jobs(['/a'], 'c1', None, pin)
+
+    assert seen['trust'] is pin
+
+
 def test_unknown_profile_is_error_not_crash():
     api = Api(profiles_mod=_fake_profiles({}))
     out = api.submit_jobs(['/a'], 'nope', None, False)
@@ -413,6 +515,65 @@ def test_refresh_status_unknown_profile_error():
     assert out.get('error') and '集群' in out['error']
 
 
+def test_refresh_all_status_monitors_all_active_servers_and_isolates_failure():
+    entries = [
+        ('/a', {'scheduler_job_id': '1', 'cluster': 'c1', 'state': 'RUNNING'}),
+        ('/b', {'scheduler_job_id': '2', 'cluster': 'c2', 'state': 'QUEUED'}),
+        ('/done', {'scheduler_job_id': '3', 'cluster': 'c3', 'state': 'DONE'}),
+    ]
+
+    def _refresh(prof, _pw, dirs, _trust):
+        if prof.name == 'c2':
+            raise RuntimeError('c2 暂时断线')
+        return {'needs_trust': False, 'results': [(dirs[0], 'RUNNING')]}
+
+    store = {name: ClusterProfile(name=name, auth='key', key_path='/k')
+             for name in ('c1', 'c2', 'c3')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              batch_ops_mod=types.SimpleNamespace(refresh_batch=_refresh),
+              ledger_mod=_fake_ledger(entries, []))
+
+    out = api.refresh_all_status()
+
+    assert [row['name'] for row in out['profiles']] == ['c1', 'c2']
+    assert out['profiles'][0]['results'] == [('/a', 'RUNNING')]
+    assert '断线' in out['profiles'][1]['error']
+    assert out['results'] == [{'cluster': 'c1', 'result': ('/a', 'RUNNING')}]
+    assert out['ok'] is False and len(out['errors']) == 1
+
+
+def test_refresh_all_status_exposes_host_key_confirmation_instead_of_silence():
+    entries = [('/a', {'scheduler_job_id': '1', 'cluster': 'c1', 'state': 'RUNNING'})]
+    bo = types.SimpleNamespace(refresh_batch=lambda *a, **k: {
+        'needs_trust': True, 'results': [], 'fingerprint': 'SHA256:abc',
+        'algorithm': 'ssh-ed25519', 'host': 'h:22',
+    })
+    store = {'c1': ClusterProfile(name='c1', auth='key', key_path='/k')}
+    api = Api(profiles_mod=_fake_profiles(store), batch_ops_mod=bo,
+              ledger_mod=_fake_ledger(entries, []))
+
+    out = api.refresh_all_status()
+
+    row = out['profiles'][0]
+    assert row['ok'] is False and row['needs_trust'] is True
+    assert row['error'] == 'HOST_KEY_CONFIRMATION_REQUIRED'
+    assert row['fingerprint'] == 'SHA256:abc'
+    assert out['ok'] is False and out['errors']
+
+
+def test_refresh_all_status_reports_active_job_whose_profile_was_deleted():
+    entries = [('/lost', {
+        'scheduler_job_id': '7', 'cluster': 'old-server', 'state': 'QUEUED'})]
+    api = Api(profiles_mod=_fake_profiles({}),
+              ledger_mod=_fake_ledger(entries, []))
+
+    out = api.refresh_all_status()
+
+    assert out['ok'] is False
+    assert out['profiles'][0]['name'] == 'old-server'
+    assert '删除或改名' in out['profiles'][0]['error']
+
+
 # ── adopt_job ────────────────────────────────────────────────────────────────
 def test_adopt_job_delegates():
     calls = {}
@@ -423,6 +584,17 @@ def test_adopt_job_delegates():
     out = api.adopt_job('/local', 'c1', '777', '/remote/dir', 'myjob')
     assert out['ok'] is True
     assert calls == {'local': '/local', 'jid': '777', 'remote': '/remote/dir', 'name': 'myjob'}
+
+
+def test_adopt_job_passes_explicit_task_type():
+    calls = {}
+    sub = types.SimpleNamespace(adopt_external_job=lambda *args, **kwargs:
+                                calls.update(kwargs) or {'state': 'SUBMITTED'})
+    api = Api(profiles_mod=_fake_profiles({'c1': ClusterProfile(name='c1')}),
+              submitter_mod=sub)
+    out = api.adopt_job('/local', 'c1', '778', '/remote/dir', 'dosjob', 'dos')
+    assert out['ok'] is True
+    assert calls['name'] == 'dosjob' and calls['task_type'] == 'dos'
 
 
 def test_adopt_job_unknown_profile_error():
@@ -705,6 +877,83 @@ def _fake_report_full(*, member_dirs=None, report_ret='/out/报告.html', calls=
     return m
 
 
+def _fake_result_import(*, scan_ret=None, commit_ret=None, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _scan(root):
+        calls['scan'] = root
+        return dict(scan_ret or {'ok': True, 'source_root': root, 'candidates': [],
+                                 'summary': {'total': 0}, 'suggested_name': 'demo'})
+
+    def _commit(source, target, name, selections, **kwargs):
+        calls['commit'] = {'source': source, 'target': target, 'name': name,
+                           'selections': selections, **kwargs}
+        return dict(commit_ret or {'ok': True, 'project_path': '/managed/project.yaml',
+                                   'imported': [], 'summary': {'total': 0}})
+
+    m.scan_folder = _scan
+    m.commit_import = _commit
+    return m
+
+
+# ── 本地已算结果导入（扫描只读 / 提交重新校验）────────────────
+def test_proj_import_scan_forwards_structured_preview():
+    calls = {}
+    candidate = {'path': '/raw/Li2S8', 'state_suggestion': 'DONE'}
+    ri = _fake_result_import(
+        scan_ret={'ok': True, 'source_root': '/raw', 'candidates': [candidate],
+                  'summary': {'total': 1, 'done': 1}, 'suggested_name': 'LiS'}, calls=calls)
+    api = Api(result_import_mod=ri)
+
+    out = api.proj_import_scan(' /raw ')
+
+    assert out['ok'] is True and out['candidates'] == [candidate]
+    assert out['summary']['done'] == 1 and out['error'] is None
+    assert calls['scan'] == '/raw'
+
+
+def test_proj_import_scan_validation_and_exception_are_json_safe():
+    api = Api(result_import_mod=_fake_result_import())
+    assert api.proj_import_scan('')['ok'] is False
+    boom = types.SimpleNamespace(
+        scan_folder=lambda _root: (_ for _ in ()).throw(RuntimeError('输出损坏')))
+    out = Api(result_import_mod=boom).proj_import_scan('/raw')
+    assert out['ok'] is False and '输出损坏' in out['error']
+
+
+def test_proj_import_commit_passes_full_selection_and_injected_modules():
+    calls = {}
+    selections = [
+        {'path': '/raw/slab', 'selected': True, 'role': 'clean_slab',
+         'task_type': 'relax', 'manual_confirm': False},
+        {'path': '/raw/skip', 'selected': False, 'role': 'config',
+         'task_type': 'static', 'manual_confirm': False},
+    ]
+    ri = _fake_result_import(calls=calls)
+    ads = _fake_adsorption()
+    ledger = _fake_ledger([], [])
+    manifest = types.SimpleNamespace()
+    api = Api(result_import_mod=ri, adsorption_mod=ads,
+              ledger_mod=ledger, manifest_mod=manifest)
+
+    out = api.proj_import_commit('/raw', '/managed', 'demo', selections)
+
+    assert out['ok'] is True and out['error'] is None
+    got = calls['commit']
+    assert got['selections'] == selections
+    assert got['adsorption_mod'] is ads and got['ledger_mod'] is ledger
+    assert got['manifest_mod'] is manifest
+
+
+def test_proj_import_commit_requires_selected_nonignored_item():
+    api = Api(result_import_mod=_fake_result_import())
+    out = api.proj_import_commit('/raw', '/managed', 'demo', [
+        {'path': '/raw/x', 'selected': False, 'role': 'config'},
+    ])
+    assert out['ok'] is False and '至少选择' in out['error']
+
+
 # ── proj_list ────────────────────────────────────────────────────────────────
 def test_proj_list_assembles_path_name_members():
     proj = {'name': 'demo', 'members': {'clean_slab': '/s', 'gas_ref': None,
@@ -716,7 +965,9 @@ def test_proj_list_assembles_path_name_members():
     out = api.proj_list()
     assert out['error'] is None
     assert out['projects'] == [{'path': '/p/project.yaml', 'name': 'demo',
-                                'n_members': 3}]
+                                'n_members': 3, 'n_done': 0, 'reference_mode': 'none',
+                                'reference_species': [],
+                                'n_species_refs': 0}]
 
 
 def test_proj_list_counts_members_inline_without_report_full():
@@ -733,7 +984,21 @@ def test_proj_list_counts_members_inline_without_report_full():
     out = api.proj_list()
     assert out['error'] is None
     assert out['projects'] == [{'path': '/p/project.yaml', 'name': 'demo',
-                                'n_members': 3}]
+                                'n_members': 3, 'n_done': 0, 'reference_mode': 'none',
+                                'reference_species': [],
+                                'n_species_refs': 0}]
+
+
+def test_proj_list_exposes_reference_species_for_lis_builder():
+    proj = {'name': 'refs', 'members': {'clean_slab': None, 'configs': []},
+            'species_ref_jobs': {'S8': '/m/S8', 'Li2S8': '/m/Li2S8'}}
+    api = Api(adsorption_mod=_fake_adsorption(
+        projects=['/refs/project.yaml'], proj_map={'/refs/project.yaml': proj}))
+
+    row = api.proj_list()['projects'][0]
+
+    assert row['reference_species'] == ['Li2S8', 'S8']
+    assert row['n_species_refs'] == 2
 
 
 def test_proj_list_skips_unloadable_and_catches_error():
@@ -815,7 +1080,8 @@ def test_proj_delta_passes_through_rows_and_gating():
         'slab': ('DONE', -12.5), 'ref': ('无', None), 'has_ref': False,
         'rows': [
             {'name': 'demo_ads_a', 'state': 'DONE', 'e_config': -20.0,
-             'delta_e': -2.5, 'note': ''},
+             'delta_e': -2.5, 'note': '', 'reference_state': 'DONE',
+             'reference_valid': True, 'reference_note': '清单与作业能量一致'},
             {'name': 'demo_ads_b', 'state': 'RUNNING', 'e_config': None,
              'delta_e': None, 'note': '构型未完成'},
         ],
@@ -825,6 +1091,9 @@ def test_proj_delta_passes_through_rows_and_gating():
     out = api.proj_delta('/p')
     assert out['ok'] is True and out['error'] is None
     assert out['rows'][0]['delta_e'] == -2.5
+    assert out['rows'][0]['reference_state'] == 'DONE'
+    assert out['rows'][0]['reference_valid'] is True
+    assert '一致' in out['rows'][0]['reference_note']
     assert out['rows'][1]['delta_e'] is None and '构型未完成' in out['rows'][1]['note']
     assert '清洁表面' in out['note']
 
@@ -1318,6 +1587,33 @@ def test_proj_figures_ladder_uses_fed_pds_index(tmp_path):
     assert lad['data'] == [{'name': 'liS', 'G': [0.0, -1.0]}]
 
 
+def test_proj_figures_prefers_imported_project_molecules(tmp_path):
+    calls, seen = {}, {}
+    project_mols = tmp_path / 'imported-molecules'
+    configured_mols = tmp_path / 'configured-molecules'
+    project_mols.mkdir()
+    configured_mols.mkdir()
+    proj = _proj('liS', str(tmp_path))
+    proj['molecules_dir'] = str(project_mols)
+    fed = {'steps': [{'label': 'S8*', 'G': 0.0}, {'label': 'Li2S*', 'G': -1.0}],
+           'pds_index': 0, 'u_l': 1.5}
+
+    def _path(rows, e_slab, molecules_dir):
+        seen['molecules_dir'] = molecules_dir
+        return fed
+
+    ads = _fake_adsorption(proj_map={'/p': proj},
+                           delta_ret=_delta({'liS_ads_Li2S4': -1.2}))
+    api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
+              freeenergy_mod=types.SimpleNamespace(path_from_project_and_molecules=_path),
+              config_mod=_fake_config(cfg={'lis_molecules_dir': str(configured_mols)}))
+
+    out = api.proj_figures('/p', ['ladder'])
+
+    assert out['ok'] is True and len(out['files']) == 1
+    assert seen['molecules_dir'] == str(project_mols)
+
+
 def test_proj_figures_ladder_skipped_without_molecules_dir(tmp_path):
     calls = {}
     ads = _fake_adsorption(proj_map={'/p': _proj('liS', str(tmp_path))},
@@ -1434,16 +1730,17 @@ def test_settings_get_aggregates_and_masks_key():
     assert out['paths']['lis_molecules_dir'] == '/mols'
     assert out['paths']['ideal_window'] == [-1.0, 0.5]
     assert out['ui']['theme'] == 'paper' and out['ui']['poll_interval'] == 5
-    assert out['ui']['autopilot_fetch'] is False and out['ui']['autopilot'] is True
+    assert out['ui']['autopilot_fetch'] is False and out['ui']['autopilot'] is False
     assert out['prompt']['is_default'] is True and 'DEFAULT_PRESET_TEXT' in out['prompt']['text']
 
 
 def test_settings_get_defaults_when_unset():
     api = Api(config_mod=_fake_config_rw({}), ai_analysis_mod=_fake_ai(key_saved=False))
     out = api.settings_get()
-    assert out['ui'] == {'theme': 'classic', 'autopilot': True, 'poll_interval': 10,
+    assert out['ui'] == {'theme': 'classic', 'autopilot': False, 'poll_interval': 10,
                          'autopilot_continue': True, 'autopilot_fetch': True,
-                         'autopilot_report': True}
+                         'autopilot_report': True, 'autopilot_campaigns': False,
+                         'scenario': '', 'active_calculation': ''}
     assert out['llm']['key_saved'] is False and out['llm']['base_url'] == ''
 
 
@@ -1536,11 +1833,12 @@ def test_theme_set_persists_and_validates():
 def test_autopilot_save_persists_subswitches():
     backing = {}
     api = Api(config_mod=_fake_config_rw(backing))
-    api.autopilot_save(True, 15, True, False, True)
+    api.autopilot_save(True, 15, True, False, True, True)
     ui = backing['ui']
     assert ui['autopilot'] is True and ui['poll_interval'] == 15
     assert ui['autopilot_continue'] is True and ui['autopilot_fetch'] is False
     assert ui['autopilot_report'] is True
+    assert ui['autopilot_campaigns'] is True
     # 非法间隔回落 10
     api.autopilot_save(poll_interval=999)
     assert backing['ui']['poll_interval'] == 10
@@ -1550,6 +1848,7 @@ def test_autopilot_save_persists_subswitches():
 def test_pipeline_tick_report_done_idempotent(tmp_path):
     calls, saved = {}, []
     proj = {'name': 'liS', 'root': str(tmp_path),
+            'autopilot_managed': True,
             'members': {'clean_slab': '/s', 'gas_ref': None, 'configs': ['/c1']}}
     ads = _fake_adsorption(projects=['/p/project.yaml'],
                            proj_map={'/p/project.yaml': proj},
@@ -1561,7 +1860,7 @@ def test_pipeline_tick_report_done_idempotent(tmp_path):
                            report_ret=str(tmp_path / 'report' / 'liS_report.html'))
     api = Api(profiles_mod=_fake_profiles({}), adsorption_mod=ads, manifest_mod=manifest,
               native_charts_mod=_fake_ncharts(calls), report_full_mod=rf,
-              config_mod=_fake_config())
+              config_mod=_fake_config(ui={'autopilot': True}))
     out1 = api.pipeline_tick()
     assert out1['ok'] is True and out1['last_sync']
     rd = [e for e in out1['events'] if e['kind'] == 'report_done']
@@ -1582,12 +1881,74 @@ def test_pipeline_tick_no_profiles_no_errors():
     assert out['synced'] == 0
 
 
+def test_pipeline_tick_monitors_multiple_servers_and_isolates_one_failure():
+    profiles = {
+        'server-a': ClusterProfile(name='server-a', auth='key'),
+        'server-b': ClusterProfile(name='server-b', auth='key'),
+    }
+    api = Api(
+        profiles_mod=_fake_profiles(profiles),
+        config_mod=_fake_config(ui={
+            'autopilot': True, 'autopilot_report': False,
+            'autopilot_campaigns': False,
+        }))
+    seen = []
+
+    def _tick(name, *_args):
+        seen.append(name)
+        if name == 'server-a':
+            raise RuntimeError('network down')
+        return True
+
+    api._tick_cluster = _tick
+    out = api.pipeline_tick()
+
+    assert seen == ['server-a', 'server-b']
+    assert out['synced'] == 1
+    assert any('server-a' in error for error in out['errors'])
+
+
+def test_pipeline_tick_disabled_has_no_cluster_campaign_or_report_side_effects():
+    calls = []
+    profiles = types.SimpleNamespace(load_profiles=lambda: calls.append('profiles') or {})
+    adsorption = types.SimpleNamespace(
+        list_projects=lambda: calls.append('projects') or [], load_project=lambda _p: None)
+    secrets = types.SimpleNamespace(
+        get_password=lambda _n: calls.append('password'), set_password=lambda *_a: None)
+    api = Api(profiles_mod=profiles, adsorption_mod=adsorption, secrets_mod=secrets,
+              config_mod=_fake_config(ui={'autopilot': False,
+                                          'autopilot_campaigns': True}))
+    api._tick_campaigns = lambda *_a: calls.append('campaigns')
+
+    out = api.pipeline_tick()
+
+    assert out['ok'] is True and out['events'] == [] and out['synced'] == 0
+    assert calls == []
+
+
+def test_pipeline_campaigns_require_independent_explicit_switch():
+    calls = []
+    api = Api(profiles_mod=_fake_profiles({}),
+              config_mod=_fake_config(ui={'autopilot': True,
+                                          'autopilot_continue': True,
+                                          'autopilot_fetch': True}))
+    api._tick_campaigns = lambda *_a: calls.append('campaign')
+    api.pipeline_tick()
+    assert calls == []
+
+    api._config = _fake_config(ui={'autopilot': True,
+                                   'autopilot_campaigns': True})
+    api.pipeline_tick()
+    assert calls == ['campaign']
+
+
 def test_pipeline_tick_skips_profile_without_credentials():
     store = {'c1': ClusterProfile(name='c1', hostname='h', auth='password')}
     secrets = types.SimpleNamespace(get_password=lambda n: None, set_password=lambda n, pw: None)
     api = Api(profiles_mod=_fake_profiles(store), secrets_mod=secrets,
               adsorption_mod=_fake_adsorption(projects=[]),
-              ledger_mod=_fake_ledger([], []), config_mod=_fake_config())
+              ledger_mod=_fake_ledger([], []),
+              config_mod=_fake_config(ui={'autopilot': True}))
     out = api.pipeline_tick()
     assert any(e['kind'] == 'skip' and 'c1' in e['text'] for e in out['events'])
     assert out['synced'] == 0
@@ -1596,7 +1957,8 @@ def test_pipeline_tick_skips_profile_without_credentials():
 # ── pipeline_status(阶段判定) ───────────────────────────────────────────────
 def test_pipeline_status_stage_detection():
     projA = {'name': 'A', 'members': {'clean_slab': '/a/s', 'gas_ref': None,
-                                      'configs': ['/a/c1', '/a/c2']}}
+                                      'configs': ['/a/c1', '/a/c2']},
+             'launch': {'resources': {'profile': 'gpu-a'}}}
     projB = {'name': 'B', 'members': {'clean_slab': '/b/s', 'gas_ref': None,
                                       'configs': ['/b/c1']},
              'autopilot_report_done': '2026-07-16T00:00:00'}
@@ -1613,6 +1975,7 @@ def test_pipeline_status_stage_detection():
     out = api.pipeline_status()
     by = {p['name']: p for p in out['projects']}
     assert by['A']['stage'] == 'submit' and by['A']['needs_human'] is False
+    assert by['A']['profile'] == 'gpu-a'
     assert by['B']['stage'] == 'report_done'
     assert by['B']['done'] == 2 and by['B']['total'] == 2
     assert by['B']['stage_index'] == 5 and by['B']['stages'][5] == 'report_done'
@@ -2103,6 +2466,7 @@ def test_spin_family_compare_ground_and_audit(tmp_path):
     # audit_magmom 收到 OUTCAR 文本 + 各自初猜磁矩(从 manifest 溯源)
     assert any(a['init'] == '4 0' for a in calls['audits'])
     assert any('3.9' in a['outcar'] for a in calls['audits'])
+    assert out['report_file'] and os.path.isfile(out['report_file'])
 
 
 def test_spin_family_compare_pending_passthrough_and_missing_outcar(tmp_path):
@@ -2473,6 +2837,26 @@ def test_scenario_set_persists_and_returns_view():
     assert out['scenario']['reaction_presets'] == ['LIS_16E']
 
 
+def test_scenario_set_rejects_unknown_before_persisting():
+    calls = {}
+    api = Api(scenarios_mod=_fake_scenarios(calls=calls))
+    out = api.scenario_set('typo-mode')
+    assert out['ok'] is False and '未知工作模式' in out['error']
+    assert 'set' not in calls
+
+
+def test_calculation_get_falls_back_to_mode_default_and_set_validates():
+    backing = {'ui': {'scenario': 'vasp', 'active_calculation': 'not-a-task'}}
+    api = Api(config_mod=_fake_config_rw(backing))
+    got = api.calculation_get()
+    assert got['ok'] is True and got['configured'] is False
+    assert got['active_calculation'] == 'relax'
+    bad = api.calculation_set('gaussian_fake')
+    assert bad['ok'] is False
+    good = api.calculation_set('bands')
+    assert good['ok'] is True and backing['ui']['active_calculation'] == 'bands'
+
+
 def test_scenario_get_error_caught():
     boom = _fake_scenarios()
     boom.active_scenario = lambda cfg=None: (_ for _ in ()).throw(RuntimeError('场景坏'))
@@ -2691,6 +3075,7 @@ def test_engine_list_all_and_scenario_visibility():
     vis = {e['key']: e['visible'] for e in out2['engines']}
     assert vis['vasp'] is True and vis['gaussian'] is True
     assert vis['cp2k'] is False and vis['castep'] is False
+    assert out2['default'] == 'gaussian'
 
 
 def test_engine_generate_builds_calcspec_and_writes(tmp_path):
@@ -3132,19 +3517,42 @@ def test_engine_generate_passes_extras(tmp_path):
 
 
 # ── quick_submit_build ───────────────────────────────────────────────────────
-def _fake_quick_submit(*, jobs=None, skipped=None, ok=True, error=None, calls=None):
+def _fake_quick_submit(*, jobs=None, skipped=None, ok=True, error=None, calls=None,
+                       scan_items=None):
     calls = calls if calls is not None else {}
     m = types.SimpleNamespace()
 
-    def _build(files, out_root, job_prefix=''):
-        calls['build'] = {'files': list(files), 'out_root': out_root, 'prefix': job_prefix}
+    def _scan(paths, *, shared_incar=''):
+        calls['scan'] = {'paths': list(paths), 'shared_incar': shared_incar}
+        items = list(scan_items or [])
+        return {'ok': True, 'items': items,
+                'summary': {'total': len(items),
+                            'ready': sum(bool(x.get('can_build')) for x in items)},
+                'error': None}
+
+    def _build(files, out_root, job_prefix='', **kwargs):
+        calls['build'] = {'files': list(files), 'out_root': out_root,
+                          'prefix': job_prefix, **kwargs}
         return {'ok': ok, 'jobs': list(jobs if jobs is not None else
                 [{'dir': out_root + '/benzene', 'name': 'benzene', 'engine': 'gaussian',
                   'files': ['benzene.gjf']}]),
-                'skipped': list(skipped or []), 'error': error}
+                'skipped': list(skipped or []), 'preflight': {'summary': {'total': 1}},
+                'error': error}
+    m.scan_inputs = _scan
     m.build_quick_jobs = _build
     m.submit_hint = lambda engine: f'{engine}-cmd-hint'
     return m
+
+
+def test_quick_submit_scan_forwards_shared_incar():
+    calls = {}
+    item = {'path': '/batch/a', 'can_build': True}
+    api = Api(quick_submit_mod=_fake_quick_submit(scan_items=[item], calls=calls))
+
+    out = api.quick_submit_scan(['/batch'], '/common/INCAR')
+
+    assert out['ok'] is True and out['items'] == [item]
+    assert calls['scan'] == {'paths': ['/batch'], 'shared_incar': '/common/INCAR'}
 
 
 def test_quick_submit_build_registers_and_hints(tmp_path):
@@ -3156,6 +3564,22 @@ def test_quick_submit_build_registers_and_hints(tmp_path):
     j = out['jobs'][0]
     assert j['engine'] == 'gaussian' and j['hint'] == 'gaussian-cmd-hint'
     assert j['registered'] is True and registered == [j['dir']]
+
+
+def test_quick_submit_build_forwards_shared_generation_options(tmp_path):
+    calls = {}
+    api = Api(quick_submit_mod=_fake_quick_submit(calls=calls),
+              ledger_mod=_fake_ledger_register([]),
+              config_mod=_fake_config(cfg={'potcar_lib_root': '/configured/paw'}))
+
+    out = api.quick_submit_build(
+        ['/batch'], str(tmp_path), 'p_', '/common/INCAR', '', 'molecule')
+
+    assert out['ok'] is True and out['preflight']['summary']['total'] == 1
+    built = calls['build']
+    assert built['shared_incar'] == '/common/INCAR'
+    assert built['lib_root'] == '/configured/paw'
+    assert built['calc_type'] == 'molecule' and built['prefix'] == 'p_'
 
 
 def test_quick_submit_build_reports_skipped(tmp_path):
@@ -3293,9 +3717,12 @@ def test_local_run_cancel_missing_dir_error():
 
 # ── remote_ls / remote_fetch_file ────────────────────────────────────────────
 class _FakeConnectError(Exception):
-    def __init__(self, message, needs_trust=False):
+    def __init__(self, message, needs_trust=False, *, fingerprint='', algorithm='', host=''):
         super().__init__(message)
         self.needs_trust = needs_trust
+        self.fingerprint = fingerprint
+        self.algorithm = algorithm
+        self.host = host
 
 
 def _fake_connection(*, entries=None, connect_boom=None, calls=None, exec_ret=None):
@@ -3387,9 +3814,13 @@ def test_remote_ls_connect_error_needs_trust():
     store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
     api = Api(profiles_mod=_fake_profiles(store),
               connection_mod=_fake_connection(
-                  connect_boom=_FakeConnectError('未知指纹', needs_trust=True)))
+                  connect_boom=_FakeConnectError(
+                      '未知指纹', needs_trust=True, fingerprint='SHA256:abc',
+                      algorithm='ssh-ed25519', host='h')))
     out = api.remote_ls('c1', None, '.')
     assert out['ok'] is False and out['needs_trust'] is True and '指纹' in out['error']
+    assert (out['host'], out['fingerprint'], out['algorithm']) == (
+        'h', 'SHA256:abc', 'ssh-ed25519')
 
 
 def test_remote_ls_needs_password():
@@ -3812,7 +4243,9 @@ def _fake_surface_energy(*, area=100.0, gamma=1.23, calls=None):
     m = types.SimpleNamespace()
     m.area_from_poscar = lambda text: area
     m.surface_energy = lambda e_slab, n_slab, e_bpa, a, **kw: (
-        calls.__setitem__('se', {'e_slab': e_slab, 'n_slab': n_slab, 'e_bpa': e_bpa, 'a': a}) or gamma)
+        calls.__setitem__('se', {'e_slab': e_slab, 'n_slab': n_slab, 'e_bpa': e_bpa, 'a': a}) or
+        {'gamma_jm2': gamma, 'gamma_evA2': gamma / 16.02176634,
+         'note': '真实字典返回', 'warnings': []})
     return m
 
 
@@ -3844,7 +4277,8 @@ def _fake_auto_figures(*, ret=None, calls=None):
 
     def _run(proj, scenario, out_dir, *, journal='nature', **kw):
         calls['run'] = {'scenario': scenario, 'journal': journal,
-                        'compose_panel': kw.get('compose_panel')}
+                        'compose_panel': kw.get('compose_panel'),
+                        'molecules_dir': kw.get('molecules_dir')}
         return ret if ret is not None else {
             'ok': True, 'out_dir': os.path.join(out_dir, 'figures'),
             'files': [os.path.join(out_dir, 'figures', 'adsorption_bar.png')],
@@ -3962,6 +4396,16 @@ def test_task_catalog_shape():
     keys = {t['key'] for t in out['tasks']}
     assert 'relax' in keys and 'eos' in keys
     assert out['tasks'][0]['name_zh'] == '结构优化'
+
+
+def test_task_catalog_filters_by_work_mode_and_active_calculation():
+    api = Api()
+    battery = api.task_catalog('battery_bulk')
+    keys = {t['key'] for t in battery['tasks']}
+    assert 'cellopt' in keys and 'bands' in keys
+    assert 'adsorption_project' not in keys and 'neb' not in keys
+    one = api.task_catalog('vasp', 'workfunction')
+    assert [t['key'] for t in one['tasks']] == ['workfunction']
 
 
 def test_task_catalog_error_caught():
@@ -4173,16 +4617,58 @@ def test_surface_energy_calc_auto_area_and_bulk(tmp_path):
     slab.mkdir()
     _write_poscar(slab, natoms=6)
     (slab / 'OSZICAR').write_text('1 F= x E0= -60.0E+00 dE=0\n', encoding='utf-8')
+    _mark_done_energy_job(slab, -60.0, ['Si'])
     bulk = tmp_path / 'bulk'
     bulk.mkdir()
     _write_poscar(bulk, natoms=2)
     (bulk / 'OSZICAR').write_text('1 F= x E0= -20.0E+00 dE=0\n', encoding='utf-8')
+    _mark_done_energy_job(bulk, -20.0, ['Si'])
     calls = {}
     api = Api(surface_energy_mod=_fake_surface_energy(calls=calls))
     out = api.surface_energy_calc(str(slab), str(bulk))
     assert out['ok'] is True and out['gamma_jm2'] == 1.23
     assert out['area_a2'] == 100.0 and out['n_slab'] == 6
     assert calls['se']['e_bpa'] == -10.0    # -20/2
+    assert out['method_check']['status'] == 'verified'
+    assert out['report_file'] and os.path.isfile(out['report_file'])
+
+
+def test_surface_energy_rejects_unfinished_and_known_method_conflict(tmp_path):
+    slab = tmp_path / 'slab'
+    slab.mkdir()
+    _write_poscar(slab, natoms=6)
+    (slab / 'OSZICAR').write_text(_osz(-60.0), encoding='utf-8')
+    _mark_done_energy_job(slab, -60.0, ['Si'])
+    bulk = tmp_path / 'bulk'
+    bulk.mkdir()
+    _write_poscar(bulk, natoms=2)
+    (bulk / 'OSZICAR').write_text(_osz(-20.0), encoding='utf-8')
+    _mark_done_energy_job(bulk, -20.0, ['Si'], titel_suffix='different')
+    api = Api(surface_energy_mod=_fake_surface_energy())
+    mismatch = api.surface_energy_calc(str(slab), str(bulk))
+    assert mismatch['ok'] is False
+    assert mismatch['method_check']['status'] == 'incompatible'
+    assert 'POTCAR' in mismatch['error']
+
+    os.remove(slab / 'OUTCAR')
+    from vcstudio.shared import manifest as real_manifest
+    manifest_value = real_manifest.load_manifest(slab)
+    manifest_value['results']['diagnosis']['clean_exit'] = False
+    real_manifest.save_manifest(slab, manifest_value)
+    unfinished = api.surface_energy_calc(str(slab), str(bulk))
+    assert unfinished['ok'] is False and 'timing 页脚' in unfinished['error']
+
+
+def test_surface_energy_manual_bulk_energy_is_explicitly_unverified(tmp_path):
+    slab = tmp_path / 'slab'
+    slab.mkdir()
+    _write_poscar(slab, natoms=6)
+    (slab / 'OSZICAR').write_text(_osz(-60.0), encoding='utf-8')
+    _mark_done_energy_job(slab, -60.0, ['Si'])
+    api = Api(surface_energy_mod=_fake_surface_energy())
+    out = api.surface_energy_calc(str(slab), '', -10.0)
+    assert out['ok'] is True and out['method_check']['status'] == 'unverified'
+    assert any('手工输入' in warning for warning in out['warnings'])
 
 
 def test_surface_energy_calc_missing_slab():
@@ -4695,6 +5181,36 @@ def _vasp5_poscar(species, counts):
     return head + '0.0 0.0 0.0\n' * sum(counts)
 
 
+def _mark_done_energy_job(folder, energy, species, *, encut=500, kmesh=(3, 3, 1),
+                          exit_code=0, clean=True, titel_suffix='standard'):
+    """为能量计算器测试构造可追溯 DONE 作业，不依赖集群。"""
+    from vcstudio.shared import manifest as real_manifest
+
+    (folder / 'INCAR').write_text(
+        f'GGA=PE\nENCUT={encut}\nISPIN=2\nIVDW=12\nLDAU=F\n', encoding='utf-8')
+    (folder / 'KPOINTS').write_text(
+        f'Gamma\n0\nGamma\n{kmesh[0]} {kmesh[1]} {kmesh[2]}\n0 0 0\n',
+        encoding='utf-8')
+    (folder / 'POTCAR').write_text(''.join(
+        f'TITEL = PAW_PBE {element} {titel_suffix}\n' for element in species),
+        encoding='utf-8')
+    if clean:
+        (folder / 'OUTCAR').write_text(
+            'General timing and accounting informations for this job:\n', encoding='utf-8')
+    m = real_manifest.new_manifest(
+        job_id=folder.name, system=folder.name, task_type='static', calc_type='slab',
+        inputs={'potcar': [
+            {'element': element, 'titel': f'PAW_PBE {element} {titel_suffix}'}
+            for element in species]})
+    real_manifest.set_state(m, 'DONE')
+    m['results'] = {
+        'energy_e0_eV': float(energy),
+        'diagnosis': {'failure_class': 'CONVERGED', 'clean_exit': bool(clean),
+                      'exit_code': exit_code},
+    }
+    real_manifest.save_manifest(folder, m)
+
+
 def _fake_neb_builder(*, calls=None, boom=None):
     calls = calls if calls is not None else {}
     m = types.SimpleNamespace()
@@ -4867,12 +5383,14 @@ def _mk_fb_dirs(tmp_path, *, e_sac=-300.0, e_sub=-295.0, with_sub=True):
     sac.mkdir()
     (sac / 'CONTCAR').write_text(_vasp5_poscar(['Fe', 'N', 'C'], [1, 4, 22]), encoding='utf-8')
     (sac / 'OSZICAR').write_text(_osz(e_sac), encoding='utf-8')
+    _mark_done_energy_job(sac, e_sac, ['Fe', 'N', 'C'])
     sub = None
     if with_sub:
         sub = tmp_path / 'sub'
         sub.mkdir()
         (sub / 'CONTCAR').write_text(_vasp5_poscar(['N', 'C'], [4, 22]), encoding='utf-8')
         (sub / 'OSZICAR').write_text(_osz(e_sub), encoding='utf-8')
+        _mark_done_energy_job(sub, e_sub, ['N', 'C'])
     return str(sac), (str(sub) if sub else None)
 
 
@@ -4885,6 +5403,9 @@ def test_formation_binding_eb_and_sigma(tmp_path):
     assert out['binding_energy'] == -2.0                     # -300 -(-295) -(-3)
     assert out['sigma'] == round(2.0 / 4.28, 4) and out['stable'] is False
     assert calls['be'] == (-300.0, -295.0, -3.0)             # 真调 references.binding_energy
+    assert out['method_check']['status'] == 'verified'
+    assert any('孤立原子能量' in warning for warning in out['warnings'])
+    assert out['report_file'] and os.path.isfile(out['report_file'])
 
 
 def test_formation_binding_ef_with_chem_pots(tmp_path):
@@ -4928,12 +5449,39 @@ def test_formation_binding_ef_missing_mu_caught(tmp_path):
 
 
 def test_formation_binding_missing_sac_energy(tmp_path):
+    from vcstudio.shared import manifest as real_manifest
+
     sac = tmp_path / 'sac'
     sac.mkdir()
-    (sac / 'CONTCAR').write_text(_vasp5_poscar(['Fe'], [1]), encoding='utf-8')  # 无 OSZICAR
+    (sac / 'CONTCAR').write_text(_vasp5_poscar(['Fe'], [1]), encoding='utf-8')
+    _mark_done_energy_job(sac, -1.0, ['Fe'])
+    m = real_manifest.load_manifest(sac)
+    m['results'].pop('energy_e0_eV')
+    real_manifest.save_manifest(sac, m)
     api = Api(references_mod=_fake_references())
     out = api.formation_binding_calc(str(sac))
-    assert out['ok'] is False and 'E_sac' in out['error']
+    assert out['ok'] is False and 'energy_e0_eV' in out['error']
+
+
+def test_formation_binding_rejects_non_done_or_method_mismatch(tmp_path):
+    from vcstudio.shared import manifest as real_manifest
+
+    sac, sub = _mk_fb_dirs(tmp_path)
+    m = real_manifest.load_manifest(sac)
+    m['state'] = 'RUNNING'
+    real_manifest.save_manifest(sac, m)
+    api = Api(references_mod=_fake_references())
+    blocked = api.formation_binding_calc(sac, sub, {'Fe': -3.0})
+    assert blocked['ok'] is False and 'DONE' in blocked['error']
+
+    m['state'] = 'DONE'
+    real_manifest.save_manifest(sac, m)
+    with open(os.path.join(sub, 'INCAR'), 'a', encoding='utf-8') as handle:
+        handle.write('ENCUT=400\n')
+    mismatch = api.formation_binding_calc(sac, sub, {'Fe': -3.0})
+    assert mismatch['ok'] is False
+    assert mismatch['method_check']['status'] == 'incompatible'
+    assert 'ENCUT' in mismatch['error']
 
 
 def test_formation_binding_missing_dir():
@@ -4983,6 +5531,9 @@ def test_compute_chgdiff_happy_with_profile(tmp_path):
         d = tmp_path / tag
         d.mkdir()
         (d / 'CHGCAR').write_text('grid', encoding='utf-8')
+        (d / 'CONTCAR').write_text(_vasp5_poscar(['Si'], [1]), encoding='utf-8')
+        (d / 'OSZICAR').write_text(_osz(-10.0), encoding='utf-8')
+        _mark_done_energy_job(d, -10.0, ['Si'])
         dirs[tag] = str(d)
     calls = {}
     api = Api(chgdiff_mod=_fake_chgdiff(calls=calls))
@@ -4991,6 +5542,26 @@ def test_compute_chgdiff_happy_with_profile(tmp_path):
     assert out['out'].endswith('CHGDIFF.vasp')
     assert out['profile']['z'] == [0.0, 1.0]                 # 面平均 charge_profile
     assert os.path.basename(calls['compute']['ab']) == 'CHGCAR'
+    assert out['report_file'] and os.path.isfile(out['report_file'])
+
+
+def test_compute_chgdiff_rejects_method_mismatch_before_grid_subtraction(tmp_path):
+    dirs = {}
+    for tag in ('AB', 'A', 'B'):
+        d = tmp_path / tag
+        d.mkdir()
+        (d / 'CHGCAR').write_text('grid', encoding='utf-8')
+        (d / 'CONTCAR').write_text(_vasp5_poscar(['Si'], [1]), encoding='utf-8')
+        (d / 'OSZICAR').write_text(_osz(-10.0), encoding='utf-8')
+        _mark_done_energy_job(d, -10.0, ['Si'], encut=600 if tag == 'B' else 500)
+        dirs[tag] = str(d)
+    calls = {}
+    api = Api(chgdiff_mod=_fake_chgdiff(calls=calls))
+
+    out = api.compute_chgdiff(dirs['AB'], dirs['A'], dirs['B'])
+
+    assert out['ok'] is False and out['method_check']['status'] == 'incompatible'
+    assert 'ENCUT' in out['error'] and 'compute' not in calls
 
 
 def test_compute_chgdiff_missing_chgcar(tmp_path):
@@ -5019,6 +5590,9 @@ def test_compute_chgdiff_engine_error_caught(tmp_path):
         d = tmp_path / tag
         d.mkdir()
         (d / 'CHGCAR').write_text('x', encoding='utf-8')
+        (d / 'CONTCAR').write_text(_vasp5_poscar(['Si'], [1]), encoding='utf-8')
+        (d / 'OSZICAR').write_text(_osz(-10.0), encoding='utf-8')
+        _mark_done_energy_job(d, -10.0, ['Si'])
         dirs[tag] = str(d)
     api = Api(chgdiff_mod=_fake_chgdiff(compute_boom=ValueError('AB 与 A 网格不一致')))
     out = api.compute_chgdiff(dirs['AB'], dirs['A'], dirs['B'])
@@ -5031,6 +5605,9 @@ def test_compute_chgdiff_profile_failure_does_not_block(tmp_path):
         d = tmp_path / tag
         d.mkdir()
         (d / 'CHGCAR').write_text('x', encoding='utf-8')
+        (d / 'CONTCAR').write_text(_vasp5_poscar(['Si'], [1]), encoding='utf-8')
+        (d / 'OSZICAR').write_text(_osz(-10.0), encoding='utf-8')
+        _mark_done_energy_job(d, -10.0, ['Si'])
         dirs[tag] = str(d)
     api = Api(chgdiff_mod=_fake_chgdiff(profile='boom'))
     out = api.compute_chgdiff(dirs['AB'], dirs['A'], dirs['B'])
@@ -5287,7 +5864,7 @@ def test_task_catalog_kind_badges():
     api = Api()                                             # 真 task_catalog
     out = api.task_catalog()
     badges = {t['key']: t['kind_badge'] for t in out['tasks']}
-    assert badges['vaspsol'] == 'INCAR 顾问'
+    assert badges['vaspsol'] == '作业生成'
     assert badges['formation_binding'] == '结果计算器'
     assert badges['surface_energy'] == '结果计算器'
     assert badges['relax'] == '作业生成' and badges['chgdiff'] == '作业生成'
@@ -5488,3 +6065,810 @@ def test_wavefn_bcp_old_engine_honest(tmp_path):
     api = Api(multiwfn_mod=_fake_multiwfn(), config_mod=_fake_config(cfg={}))
     out = api.wavefn_bcp(str(tmp_path / 'mol.fchk'))
     assert out['ok'] is False and '引擎待扩展' in out['error']
+
+
+# ── Li-S 一站式项目后端 ─────────────────────────────────────────────────────
+def test_proj_scan_structures_api_uses_recursive_read_only_scanner(tmp_path):
+    folder = tmp_path / 'Li2S8_top'
+    folder.mkdir()
+    structure = folder / 'POSCAR'
+    structure.write_text('x', encoding='utf-8')
+
+    out = Api().proj_scan_structures(str(tmp_path))
+
+    assert out['ok'] is True and out['error'] is None
+    assert out['items'] == [{'path': str(structure.resolve()), 'name': 'POSCAR',
+                             'species': 'Li2S8'}]
+
+
+def test_proj_scan_lis_inputs_api_returns_one_folder_bundle(tmp_path):
+    payload = {
+        'root': str(tmp_path), 'incar': str(tmp_path / 'INCAR'),
+        'incar_candidates': [str(tmp_path / 'INCAR')],
+        'clean_slab': str(tmp_path / 'clean' / 'POSCAR'),
+        'clean_candidates': [], 'configs': [{'path': '/ads/POSCAR'}],
+        'structures': [], 'warnings': [], 'source_read_only': True,
+    }
+    adsorption = types.SimpleNamespace(scan_lis_input_bundle=lambda root: {
+        **payload, 'root': str(root)})
+
+    out = Api(adsorption_mod=adsorption).proj_scan_lis_inputs(str(tmp_path))
+
+    assert out['ok'] is True and out['incar'] == str(tmp_path / 'INCAR')
+    assert out['clean_slab'].endswith(os.path.join('clean', 'POSCAR'))
+    assert out['configs'] == [{'path': '/ads/POSCAR'}]
+
+
+def _lis_reference_fake(tmp_path, states, create_calls):
+    project_path = str(tmp_path / 'reference' / 'project.yaml')
+    ref_jobs = {species: str(tmp_path / 'reference' / 'molecules' / f'mol_{species}')
+                for species in states}
+    reference = {'root': str(tmp_path / 'reference'),
+                 'molecules_dir': str(tmp_path / 'reference' / 'molecules'),
+                 'species_ref_jobs': ref_jobs, 'members': {'configs': []}}
+    adsorption = types.SimpleNamespace()
+    adsorption.load_project = lambda path: reference if path == project_path else None
+
+    def create(root, name, **kwargs):
+        create_calls.update(root=root, name=name, **kwargs)
+        generated = [('lis_slab_clean', os.path.join(root, 'lis_slab_clean'), []),
+                     ('lis_ads_Li2S8_top', os.path.join(root, 'lis_ads_Li2S8_top'), [])]
+        return {'ok': True, 'project_path': os.path.join(root, 'project.yaml'),
+                'generated': generated, 'errors': [], 'advisories': []}
+
+    adsorption.create_project = create
+    manifest_states = {
+        ref_jobs[species]: {'state': state,
+                            'results': {
+                                'energy_e0_eV': -30.0 - index,
+                                'reference_method_signature': {
+                                    'functional': 'RPBE', 'ivdw': 0, 'ispin': 1,
+                                    'ldau': 'F', 'encut': 400.0,
+                                    'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+                                }}}
+        for index, (species, state) in enumerate(states.items())
+    }
+    manifests = types.SimpleNamespace(load_manifest=lambda path: manifest_states.get(path))
+    return project_path, adsorption, manifests
+
+
+def _write_lis_prepare_inputs(slab, config, incar):
+    header = '1.0\n10 0 0\n0 10 0\n0 0 20\n'
+    slab.write_text('slab\n' + header + 'C\n1\nDirect\n0 0 0\n', encoding='utf-8')
+    config.write_text(
+        'ads\n' + header + 'C Li S\n1 2 8\nDirect\n' + '0 0 0\n' * 11,
+        encoding='utf-8')
+    incar.write_text('ENCUT = 400\nGGA = RP\nISPIN = 1\nIVDW = 0\n', encoding='utf-8')
+
+
+def _write_lis_potcar_library(root):
+    for element, enmax in {'C': 300.0, 'Li': 250.0, 'S': 400.0}.items():
+        folder = root / element
+        folder.mkdir(parents=True)
+        (folder / 'POTCAR').write_text(
+            f'TITEL = PAW_PBE {element}\nENMAX = {enmax}; ENMIN = 100\n',
+            encoding='utf-8')
+
+
+def test_proj_prepare_lis_reuses_only_done_reference_jobs_and_persists_mapping(tmp_path):
+    slab = tmp_path / 'slab.vasp'
+    config = tmp_path / 'Li2S8_top.vasp'
+    incar = tmp_path / 'INCAR'
+    _write_lis_prepare_inputs(slab, config, incar)
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE', 'S8': 'DONE'}, calls)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config(cfg={'potcar_lib_root': '/potentials'}))
+
+    out = api.proj_prepare_lis(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path,
+        {'confirmed': True, 'reason': '单测假赝势库无法核对 TITEL'})
+
+    assert out['ok'] is True and out['reference_species'] == ['Li2S8', 'S8']
+    assert len(out['job_dirs']) == 2
+    assert calls['root'] == str(tmp_path / 'out' / 'lis')
+    assert calls['config_species'] == {str(config.resolve()): 'Li2S8'}
+    assert calls['species_refs'] == {'Li2S8': -30.0, 'S8': -31.0}
+    assert calls['species_ref_jobs']['Li2S8'].endswith('mol_Li2S8')
+    assert calls['reference_project'] == reference_path
+    assert calls['lib_root'] == '/potentials'
+
+
+def test_proj_prepare_lis_blocks_reference_encut_different_from_auto_effective(tmp_path):
+    slab, config, incar = (tmp_path / name for name in
+                           ('slab.vasp', 'Li2S8_top.vasp', 'INCAR'))
+    _write_lis_prepare_inputs(slab, config, incar)
+    incar.write_text(
+        'GGA = RP\nISPIN = 1\nIVDW = 0\nLDAU = F\nMETAGGA = F\nLHFCALC = F\n',
+        encoding='utf-8')
+    potcars = tmp_path / 'potcars'
+    _write_lis_potcar_library(potcars)
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config(cfg={'potcar_lib_root': str(potcars)}))
+
+    out = api.proj_prepare_lis(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path,
+        {'confirmed': True, 'reason': '人工确认也不能覆盖明确 ENCUT 冲突'})
+
+    assert out['ok'] is False and out['method_check']['status'] == 'incompatible'
+    assert out['method_check']['planned']['encut'] == 550
+    assert out['method_check']['planned']['encut_source'] == (
+        'potcar_enmax_1.3_round_up_50')
+    assert 'ENCUT' in out['error'] and not calls
+
+
+def test_proj_prepare_lis_auto_effective_encut_can_be_fully_verified(tmp_path):
+    slab, config, incar = (tmp_path / name for name in
+                           ('slab.vasp', 'Li2S8_top.vasp', 'INCAR'))
+    _write_lis_prepare_inputs(slab, config, incar)
+    incar.write_text(
+        'GGA = RP\nISPIN = 1\nIVDW = 0\nLDAU = F\nMETAGGA = F\nLHFCALC = F\n',
+        encoding='utf-8')
+    potcars = tmp_path / 'potcars'
+    _write_lis_potcar_library(potcars)
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    reference = adsorption.load_project(reference_path)
+    signature = manifests.load_manifest(
+        reference['species_ref_jobs']['Li2S8'])['results']['reference_method_signature']
+    signature.update({'encut': 550.0, 'metagga': 'F', 'lhfcalc': 'F'})
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config(cfg={'potcar_lib_root': str(potcars)}))
+
+    out = api.proj_prepare_lis(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path)
+
+    assert out['ok'] is True and out['method_check']['status'] == 'verified'
+    planned = calls['preparation']['method_check']['planned']
+    assert planned['encut'] == 550
+    assert planned['encut_source'] == 'potcar_enmax_1.3_round_up_50'
+    assert calls['preparation']['inputs']['planned_method']['encut'] == 550
+
+
+def test_proj_prepare_lis_dft_u_value_mismatch_is_not_confirmable(tmp_path):
+    slab, config, incar = (tmp_path / name for name in
+                           ('slab.vasp', 'Li2S8_top.vasp', 'INCAR'))
+    _write_lis_prepare_inputs(slab, config, incar)
+    incar.write_text(
+        'ENCUT = 400\nGGA = RP\nISPIN = 1\nIVDW = 0\nLDAU = T\n'
+        'LDAUTYPE = 2\nLDAUL = -1 0 -1\nLDAUU = 0 5 0\nLDAUJ = 0 0 0\n',
+        encoding='utf-8')
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    reference = adsorption.load_project(reference_path)
+    signature = manifests.load_manifest(
+        reference['species_ref_jobs']['Li2S8'])['results']['reference_method_signature']
+    signature.update({
+        'ldau': 'T', 'ldautype': 2, 'ldaul': [0, -1],
+        'ldauu': [3.0, 0.0], 'ldauj': [0.0, 0.0],
+        'potcar_elements': ['Li', 'S'],
+    })
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config())
+
+    out = api.proj_prepare_lis(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path,
+        {'confirmed': True, 'reason': '不应覆盖明确的 U 值冲突'})
+
+    assert out['ok'] is False and out['method_check']['status'] == 'incompatible'
+    assert any('Li LDAUU' in issue and '3.0' in issue and '5.0' in issue
+               for issue in out['method_check']['issues'])
+    assert not calls
+
+
+def test_reference_method_check_dft_u_missing_vectors_stays_unverified(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT = 400\nGGA = RP\nISPIN = 1\nIVDW = 0\nLDAU = T\n'
+        'LDAUTYPE = 2\nLDAUL = 0 -1\nLDAUU = 5 0\nLDAUJ = 0 0\n',
+        encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'T',
+        'ldautype': 2, 'encut': 400.0,
+        'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+        'potcar_elements': ['Li', 'S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'],
+        planned_element_orders=[['Li', 'S']])
+
+    assert check['status'] == 'unverified' and not check['issues']
+    assert any('LDAUU' in warning for warning in check['warnings'])
+
+
+def test_reference_method_check_hse_aexx_difference_is_incompatible(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=RP\nISPIN=1\nIVDW=0\nLDAU=F\nMETAGGA=F\n'
+        'LHFCALC=T\nAEXX=0.30\nHFSCREEN=0.2\n', encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'metagga': 'F', 'lhfcalc': 'T', 'aexx': 0.25, 'hfscreen': 0.2,
+        'encut': 400.0, 'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'])
+
+    assert check['status'] == 'incompatible'
+    assert any('AEXX' in issue and '0.25' in issue and '0.3' in issue
+               for issue in check['issues'])
+
+
+def test_reference_method_check_hse_missing_aexx_stays_unverified(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=RP\nISPIN=1\nIVDW=0\nLDAU=F\nMETAGGA=F\n'
+        'LHFCALC=T\nAEXX=0.25\nHFSCREEN=0.2\n', encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'metagga': 'F', 'lhfcalc': 'T', 'hfscreen': 0.2,
+        'encut': 400.0, 'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'])
+
+    assert check['status'] == 'unverified' and not check['issues']
+    assert any('AEXX' in warning for warning in check['warnings'])
+
+
+def test_proj_prepare_lis_fails_closed_if_any_reference_job_not_done(tmp_path):
+    slab, config, incar = (tmp_path / name for name in ('slab.vasp', 'Li2S8.vasp', 'INCAR'))
+    _write_lis_prepare_inputs(slab, config, incar)
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE', 'S8': 'NEEDS_HUMAN'}, calls)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config())
+
+    out = api.proj_prepare_lis(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path)
+
+    assert out['ok'] is False and 'S8' in out['error'] and 'DONE' in out['error']
+    assert not calls
+
+
+def test_proj_prepare_lis_rejects_missing_species_and_existing_target(tmp_path):
+    slab, config, incar = (tmp_path / name for name in ('slab.vasp', 'Li2S6.vasp', 'INCAR'))
+    _write_lis_prepare_inputs(slab, config, incar)
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config())
+    missing = api.proj_prepare_lis(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S6'}],
+        str(incar), str(tmp_path / 'out'), reference_path)
+    assert missing['ok'] is False and 'Li2S6' in missing['error']
+
+    target = tmp_path / 'out' / 'lis'
+    target.mkdir(parents=True)
+    existing = api.proj_prepare_lis(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path,
+        {'confirmed': True, 'reason': '单测假赝势库无法核对 TITEL'})
+    assert existing['ok'] is False and '不会覆盖' in existing['error']
+
+
+def test_submit_project_resources_are_ephemeral_retry_safe_and_enable_autopilot(tmp_path):
+    dirs = {name: str(tmp_path / name)
+            for name in ('clean', 'running', 'done', 'owned', 'retry')}
+    states = {
+        dirs['clean']: {'state': 'CREATED', 'scheduler_job_id': None},
+        dirs['running']: {'state': 'RUNNING', 'scheduler_job_id': None},
+        dirs['done']: {'state': 'DONE', 'scheduler_job_id': None},
+        dirs['owned']: {'state': 'FAILED', 'scheduler_job_id': '99'},
+        dirs['retry']: {'state': 'CREATED', 'scheduler_job_id': None},
+    }
+    project = {'name': 'lis', 'root': str(tmp_path), 'members': {
+        'clean_slab': dirs['clean'], 'gas_ref': None,
+        'configs': [dirs['running'], dirs['done'], dirs['owned'], dirs['retry']]}}
+    saved = []
+    adsorption = types.SimpleNamespace(
+        load_project=lambda path: project if path == '/p/project.yaml' else None,
+        save_project=lambda root, data: saved.append((root, dict(data))))
+    manifests = types.SimpleNamespace(load_manifest=lambda path: states.get(path))
+    captured = []
+
+    def submit_batch(profile, _password, eligible, _trust):
+        captured.append((profile, list(eligible)))
+        results = []
+        for job_dir in eligible:
+            success = job_dir == dirs['clean'] or len(captured) > 1
+            if success:
+                states[job_dir]['scheduler_job_id'] = str(100 + len(captured))
+                states[job_dir]['state'] = 'SUBMITTED'
+            results.append((job_dir, success, 'ok' if success else 'network blip'))
+        return {'needs_trust': False, 'results': results}
+
+    original = ClusterProfile(name='hpc', auth='password', nodes=2, ppn=96,
+                              walltime='72:00:00')
+    config_backing = {}
+    passwords = {}
+    secrets = types.SimpleNamespace(
+        get_password=lambda name: passwords.get(name),
+        set_password=lambda name, value: passwords.__setitem__(name, value))
+    api = Api(profiles_mod=_fake_profiles({'hpc': original}), adsorption_mod=adsorption,
+              manifest_mod=manifests,
+              batch_ops_mod=types.SimpleNamespace(submit_batch=submit_batch),
+              config_mod=_fake_config_rw(config_backing), secrets_mod=secrets)
+
+    first = api.submit_project_with_resources(
+        '/p/project.yaml', 'hpc', 32, '48:00:00', password='cluster-secret')
+    assert first['ok'] is False
+    assert first['submitted'] == [dirs['clean']]
+    assert captured[0][1] == [dirs['clean'], dirs['retry']]
+    assert (captured[0][0].nodes, captured[0][0].ppn,
+            captured[0][0].walltime) == (1, 32, '48:00:00')
+    assert (original.nodes, original.ppn, original.walltime) == (2, 96, '72:00:00')
+    assert {row['dir'] for row in first['skipped']} == {
+        dirs['running'], dirs['done'], dirs['owned']}
+    assert project['launch']['resources']['cores'] == 32 and saved
+    ui = config_backing['ui']
+    assert all(ui[key] for key in ('autopilot', 'autopilot_continue',
+                                   'autopilot_fetch', 'autopilot_report'))
+    assert passwords == {'hpc': 'cluster-secret'}
+
+    second = api.submit_project_with_resources('/p/project.yaml', 'hpc', 32, '48:00:00')
+    assert second['ok'] is True and second['submitted'] == [dirs['retry']]
+    assert captured[1][1] == [dirs['retry']]
+    assert project['launch']['submitted_job_dirs'] == [dirs['clean'], dirs['retry']]
+
+
+def test_submit_project_round_trips_host_key_evidence_and_exact_pin(tmp_path):
+    job = str(tmp_path / 'clean')
+    project = {'root': str(tmp_path), 'members': {
+        'clean_slab': job, 'gas_ref': None, 'configs': []}}
+    seen = {}
+    evidence = {'host': 'target', 'fingerprint': 'SHA256:def',
+                'algorithm': 'ssh-ed25519'}
+
+    def _submit(_profile, _password, _dirs, trust):
+        seen['trust'] = trust
+        return {'needs_trust': True, 'message': '请核对', 'results': [], **evidence}
+
+    pin = {'host': 'bastion', 'fingerprint': 'SHA256:abc',
+           'algorithm': 'ssh-rsa'}
+    profile = ClusterProfile(
+        name='hpc', auth='key', remote_root='/work', queue='q', ppn=32,
+        vasp_cmd='mpirun -np {cores} vasp_std')
+    api = Api(
+        profiles_mod=_fake_profiles({'hpc': profile}),
+        adsorption_mod=types.SimpleNamespace(load_project=lambda _path: project),
+        manifest_mod=types.SimpleNamespace(load_manifest=lambda _path: {
+            'state': 'CREATED', 'scheduler_job_id': None}),
+        batch_ops_mod=types.SimpleNamespace(submit_batch=_submit),
+        config_mod=_fake_config_rw({}))
+
+    out = api.submit_project_with_resources(
+        '/p/project.yaml', 'hpc', 32, '24:00:00', trust_new=pin)
+
+    assert seen['trust'] is pin
+    assert out['needs_trust'] is True
+    assert {key: out[key] for key in evidence} == evidence
+
+
+def test_submit_blocks_literal_mpi_count_and_renders_cores_placeholder(tmp_path):
+    job = str(tmp_path / 'job')
+    project = {'root': str(tmp_path), 'members': {
+        'clean_slab': job, 'gas_ref': None, 'configs': []}}
+    state = {'state': 'CREATED', 'scheduler_job_id': None}
+    adsorption = types.SimpleNamespace(
+        load_project=lambda _path: project,
+        save_project=lambda _root, _project: None)
+    manifests = types.SimpleNamespace(load_manifest=lambda _path: state)
+    for command in ('mpirun -np96 vasp_std', 'mpirun -np=96 vasp_std',
+                    'srun -n96 vasp_std', 'srun --ntasks=96 vasp_std',
+                    'srun --ntasks 96 vasp_std'):
+        hardcoded = ClusterProfile(name='hpc', remote_root='/work', queue='q', ppn=16,
+                                   vasp_cmd=command)
+        api = Api(profiles_mod=_fake_profiles({'hpc': hardcoded}),
+                  adsorption_mod=adsorption, manifest_mod=manifests,
+                  config_mod=_fake_config_rw({}))
+        blocked = api.submit_project_with_resources(
+            '/p/project.yaml', 'hpc', 32, '24:00:00')
+        assert blocked['ok'] is False and '不一致' in blocked['error']
+
+    captured = []
+    template = ClusterProfile(name='hpc', remote_root='/work', queue='q', ppn=16,
+                              vasp_cmd='mpirun -np {cores} vasp_std')
+    batch = types.SimpleNamespace(submit_batch=lambda profile, _pw, dirs, _trust:
+        captured.append((profile.vasp_cmd, dirs)) or
+        {'needs_trust': False, 'results': [(job, True, 'ok')]})
+    api = Api(profiles_mod=_fake_profiles({'hpc': template}), adsorption_mod=adsorption,
+              manifest_mod=manifests, batch_ops_mod=batch,
+              config_mod=_fake_config_rw({}))
+    submitted = api.submit_project_with_resources('/p/project.yaml', 'hpc', 32, '24:00:00')
+    assert submitted['ok'] and captured[0][0] == 'mpirun -np 32 vasp_std'
+
+
+def test_submit_project_renders_mapped_vasp_command_without_mutating_profile(tmp_path):
+    job = str(tmp_path / 'job')
+    project = {'root': str(tmp_path), 'members': {
+        'clean_slab': job, 'gas_ref': None, 'configs': []}}
+    adsorption = types.SimpleNamespace(
+        load_project=lambda _path: project,
+        save_project=lambda _root, _project: None)
+    manifests = types.SimpleNamespace(load_manifest=lambda _path: {
+        'state': 'CREATED', 'scheduler_job_id': None})
+    original = ClusterProfile(
+        name='hpc', remote_root='/work', queue='q', ppn=16,
+        vasp_cmd='legacy vasp_std',
+        engine_commands={'vasp': 'srun -n {cores} vasp_std'})
+    captured = []
+    batch = types.SimpleNamespace(submit_batch=lambda profile, _pw, dirs, _trust:
+        captured.append((profile, dirs)) or
+        {'needs_trust': False, 'results': [(job, True, 'ok')]})
+    api = Api(profiles_mod=_fake_profiles({'hpc': original}),
+              adsorption_mod=adsorption, manifest_mod=manifests,
+              batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+
+    out = api.submit_project_with_resources('/p/project.yaml', 'hpc', 24, '12:00:00')
+
+    assert out['ok'] is True
+    assert captured[0][0].engine_commands['vasp'] == 'srun -n 24 vasp_std'
+    assert original.engine_commands['vasp'] == 'srun -n {cores} vasp_std'
+
+
+def test_submit_template_requires_effective_resource_placeholders_and_no_conflicts(tmp_path):
+    job = str(tmp_path / 'job')
+    project = {'root': str(tmp_path), 'members': {
+        'clean_slab': job, 'gas_ref': None, 'configs': []}}
+    state = {'state': 'CREATED', 'scheduler_job_id': None}
+    adsorption = types.SimpleNamespace(
+        load_project=lambda _path: project,
+        save_project=lambda _root, _project: None)
+    manifests = types.SimpleNamespace(load_manifest=lambda _path: state)
+    submitted = []
+    batch = types.SimpleNamespace(submit_batch=lambda profile, _pw, dirs, _trust:
+        submitted.append((profile, list(dirs))) or
+        {'needs_trust': False, 'results': [(job, True, 'ok')]})
+
+    def _run(text):
+        template_path = tmp_path / 'submit.sh'
+        template_path.write_text(text, encoding='utf-8')
+        profile = ClusterProfile(
+            name='hpc', remote_root='/work', scheduler='Slurm',
+            script_mode='template', template_path=str(template_path))
+        api = Api(profiles_mod=_fake_profiles({'hpc': profile}),
+                  adsorption_mod=adsorption, manifest_mod=manifests,
+                  batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+        return api.submit_project_with_resources(
+            '/p/project.yaml', 'hpc', 32, '24:00:00')
+
+    valid = _run(
+        '#!/bin/bash\n#SBATCH --nodes=1\n#SBATCH --ntasks={cores}\n'
+        '#SBATCH --time={walltime}\nsrun --ntasks={cores} vasp_std\n')
+    assert valid['ok'] is True and submitted
+
+    missing_wall_placeholder = _run(
+        '#!/bin/bash\n#SBATCH --ntasks={cores}\n#SBATCH --time=24:00:00\n')
+    assert missing_wall_placeholder['ok'] is False
+    assert '{walltime}' in missing_wall_placeholder['error']
+
+    ineffective = _run(
+        '# selected {cores} / {walltime}\n#SBATCH --ntasks=32\n'
+        '#SBATCH --time=24:00:00\n')
+    assert ineffective['ok'] is False and '有效' in ineffective['error']
+
+    conflicting = _run(
+        '#!/bin/bash\n#SBATCH --ntasks={cores}\n#SBATCH --time={walltime}\n'
+        'mpirun -np=16 vasp_std\n')
+    assert conflicting['ok'] is False and '冲突' in conflicting['error']
+
+    conflicting_wall = _run(
+        '#!/bin/bash\n#SBATCH --ntasks={cores}\n#SBATCH --time={walltime}\n'
+        '#SBATCH -t 01:00:00\n')
+    assert conflicting_wall['ok'] is False and '墙时' in conflicting_wall['error']
+
+
+def test_submit_reports_keyring_setter_success_without_readback_as_failure(tmp_path):
+    job = str(tmp_path / 'job')
+    project = {'root': str(tmp_path), 'members': {
+        'clean_slab': job, 'gas_ref': None, 'configs': []}}
+    adsorption = types.SimpleNamespace(
+        load_project=lambda _path: project,
+        save_project=lambda _root, _project: None)
+    manifests = types.SimpleNamespace(load_manifest=lambda _path: {
+        'state': 'CREATED', 'scheduler_job_id': None})
+    batch = types.SimpleNamespace(submit_batch=lambda *_a:
+        {'needs_trust': False, 'results': [(job, True, 'ok')]})
+    secrets = types.SimpleNamespace(
+        set_password=lambda _name, _password: None,
+        get_password=lambda _name: None)
+    profile = ClusterProfile(
+        name='hpc', auth='password', remote_root='/work', queue='q', ppn=32,
+        vasp_cmd='mpirun -np {cores} vasp_std')
+    api = Api(profiles_mod=_fake_profiles({'hpc': profile}),
+              adsorption_mod=adsorption, manifest_mod=manifests,
+              batch_ops_mod=batch, secrets_mod=secrets,
+              config_mod=_fake_config_rw({}))
+
+    out = api.submit_project_with_resources(
+        '/p/project.yaml', 'hpc', 32, '24:00:00', password='secret')
+
+    assert out['submitted'] == [job] and out['ok'] is False
+    assert '回读不一致' in out['error']
+
+
+def test_exhausted_restartable_project_moves_to_human_analysis():
+    api = Api()
+    stage, needs_human, rounds = api._project_stage([
+        {'state': 'UNCONVERGED', 'restartable': True, 'rounds': 3}], False)
+    assert stage == 'analysis' and needs_human is True and rounds == 3
+
+
+def test_unverified_reference_method_requires_reasoned_confirmation(tmp_path):
+    slab, config, incar = (tmp_path / name for name in
+                           ('slab.vasp', 'Li2S8_top.vasp', 'INCAR'))
+    _write_lis_prepare_inputs(slab, config, incar)
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    reference = adsorption.load_project(reference_path)
+    ref_manifest = manifests.load_manifest(reference['species_ref_jobs']['Li2S8'])
+    ref_manifest['results']['reference_method_signature'] = {}
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config())
+    first = api.proj_prepare_lis(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path)
+    assert first['needs_method_confirmation'] is True
+    assert first['method_check']['status'] == 'unverified' and not calls
+    second = api.proj_prepare_lis(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path,
+        {'confirmed': True, 'reason': '已核对原始 OUTCAR 与共享 INCAR'})
+    assert second['ok'] and calls
+    confirmation = calls['preparation']['method_check']['confirmation']
+    assert confirmation['confirmed'] and '核对' in confirmation['reason']
+
+
+def test_pipeline_done_jobs_backfill_missing_local_results_after_restart(tmp_path):
+    complete = tmp_path / 'complete'
+    missing_timestamp = tmp_path / 'missing_timestamp'
+    missing_file = tmp_path / 'missing_file'
+    for folder in (complete, missing_timestamp, missing_file):
+        folder.mkdir()
+        for filename in ('CONTCAR', 'OSZICAR', 'OUTCAR'):
+            (folder / filename).write_text('x', encoding='utf-8')
+    (missing_file / 'OUTCAR').unlink()
+    entries = [
+        (str(complete), {'cluster': 'hpc', 'state': 'DONE', 'remote_dir': '/r/a',
+                         'scheduler_job_id': '101', 'task_type': 'relax',
+                         'results': {'fetched_at': 'now', 'fetched_job_id': '101',
+                                     'fetched_remote_dir': '/r/a',
+                                     'fetched': ['CONTCAR', 'OSZICAR', 'OUTCAR'],
+                                     'fetched_missing': []}}),
+        (str(missing_timestamp), {'cluster': 'hpc', 'state': 'DONE',
+                                  'remote_dir': '/r/b', 'scheduler_job_id': '102',
+                                  'task_type': 'relax', 'results': {}}),
+        (str(missing_file), {'cluster': 'hpc', 'state': 'DONE', 'remote_dir': '/r/c',
+                             'scheduler_job_id': '103', 'task_type': 'relax',
+                             'results': {'fetched_at': 'old', 'fetched_job_id': '103',
+                                         'fetched_remote_dir': '/r/c',
+                                         'fetched': ['CONTCAR', 'OSZICAR', 'OUTCAR'],
+                                         'fetched_missing': []}}),
+    ]
+    fetched = []
+    batch = types.SimpleNamespace(fetch_batch=lambda _p, _pw, dirs, _trust:
+        fetched.extend(dirs) or {'needs_trust': False,
+                                 'results': [(d, True, 'fetched') for d in dirs]})
+    managed = [str(complete), str(missing_timestamp), str(missing_file)]
+    project = {'autopilot_managed': True,
+               'launch': {'resources': {'profile': 'hpc'},
+                          'submitted_job_dirs': managed},
+               'members': {'clean_slab': managed[0], 'gas_ref': None,
+                           'configs': managed[1:]}}
+    adsorption = _fake_adsorption(
+        projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project})
+    api = Api(ledger_mod=_fake_ledger(entries, []), batch_ops_mod=batch,
+              adsorption_mod=adsorption)
+
+    events, errors = [], []
+    ok = api._tick_cluster('hpc', ClusterProfile(name='hpc'), None,
+                           {'cont': False, 'fetch': True}, events, errors)
+
+    assert ok is True and errors == []
+    assert fetched == [str(missing_timestamp), str(missing_file)]
+    assert len([event for event in events if event['kind'] == 'fetch']) == 2
+
+
+def test_pipeline_cluster_empty_or_nonmember_allowlist_fails_closed(tmp_path):
+    active = str(tmp_path / 'active')
+    done = str(tmp_path / 'done')
+    outsider = str(tmp_path / 'outsider')
+    entries = [
+        (active, {'cluster': 'hpc', 'state': 'RUNNING',
+                  'scheduler_job_id': '1', 'remote_dir': '/r/active'}),
+        (done, {'cluster': 'hpc', 'state': 'DONE', 'scheduler_job_id': '2',
+                'remote_dir': '/r/done', 'results': {}}),
+    ]
+    calls = []
+    batch = types.SimpleNamespace(
+        refresh_batch=lambda *_a: calls.append('refresh') or {'results': []},
+        filter_continuable=lambda dirs: (list(dirs), []),
+        continue_batch=lambda *_a: calls.append('continue') or {'results': []},
+        fetch_batch=lambda *_a: calls.append('fetch') or {'results': []})
+    project = {'autopilot_managed': True,
+               'launch': {'resources': {'profile': 'hpc'},
+                          # outsider 被写入也不是该项目成员，不能扩大自动托管范围。
+                          'submitted_job_dirs': [outsider]},
+               'members': {'clean_slab': active, 'gas_ref': None, 'configs': [done]}}
+    ads = _fake_adsorption(
+        projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project})
+    api = Api(ledger_mod=_fake_ledger(entries, []), batch_ops_mod=batch,
+              adsorption_mod=ads)
+
+    api._tick_cluster('hpc', ClusterProfile(name='hpc'), None,
+                      {'cont': True, 'fetch': True}, [], [])
+
+    assert calls == []
+
+
+def test_local_results_ready_requires_current_job_remote_and_complete_file_evidence(tmp_path):
+    for filename in ('CONTCAR', 'OSZICAR', 'OUTCAR'):
+        (tmp_path / filename).write_text('result', encoding='utf-8')
+    manifest = {
+        'scheduler_job_id': '42', 'remote_dir': '/remote/job', 'task_type': 'relax',
+        'results': {
+            'fetched_at': 'now', 'fetched_job_id': '42',
+            'fetched_remote_dir': '/remote/job',
+            'fetched': ['CONTCAR', 'OSZICAR', 'OUTCAR'], 'fetched_missing': [],
+        },
+    }
+    assert Api._local_results_ready(str(tmp_path), manifest) is True
+
+    for key, bad_value in (('fetched_job_id', 'old-job'),
+                           ('fetched_remote_dir', '/remote/old')):
+        changed = {**manifest, 'results': {**manifest['results'], key: bad_value}}
+        assert Api._local_results_ready(str(tmp_path), changed) is False
+    missing = {**manifest, 'results': {**manifest['results'],
+                                      'fetched_missing': ['OUTCAR']}}
+    assert Api._local_results_ready(str(tmp_path), missing) is False
+    no_timestamp = {**manifest, 'results': {**manifest['results'], 'fetched_at': ''}}
+    assert Api._local_results_ready(str(tmp_path), no_timestamp) is False
+
+
+def test_pipeline_reports_skip_unmanaged_or_incomplete_delta_projects(tmp_path):
+    projects = {
+        '/unmanaged/project.yaml': {
+            'name': 'unmanaged', 'root': str(tmp_path / 'unmanaged'),
+            'members': {'clean_slab': '/u/s', 'gas_ref': None, 'configs': ['/u/c']}},
+        '/invalid/project.yaml': {
+            'name': 'invalid', 'root': str(tmp_path / 'invalid'),
+            'autopilot_managed': True,
+            'members': {'clean_slab': '/i/s', 'gas_ref': None, 'configs': ['/i/c']}},
+    }
+    manifests = {path: {'state': 'DONE', 'results': {}}
+                 for path in ('/u/s', '/u/c', '/i/s', '/i/c')}
+    adsorption = _fake_adsorption(
+        projects=list(projects), proj_map=projects,
+        delta_ret={'slab': ('DONE', -10.0), 'ref': ('无', None), 'has_ref': False,
+                   'rows': [{'name': 'invalid_ads', 'state': 'DONE',
+                             'delta_e': None, 'note': '参考态无效'}]})
+    report = _fake_report_full()
+    report.generate_project_report = lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError('诊断报告不能标记为最终报告'))
+    api = Api(adsorption_mod=adsorption,
+              manifest_mod=_fake_manifest_mod(manifests), report_full_mod=report)
+    events, errors = [], []
+
+    api._tick_reports(events, errors)
+
+    assert events == [] and errors == []
+    assert not any(project.get('autopilot_report_done') for project in projects.values())
+
+
+def test_pipeline_reports_only_after_done_outputs_are_fetched_in_same_tick(tmp_path):
+    job_dirs = [str(tmp_path / 'clean'), str(tmp_path / 'config')]
+    for job_dir in job_dirs:
+        os.makedirs(job_dir)
+    manifests = {
+        job_dir: {'cluster': 'hpc', 'state': 'DONE', 'remote_dir': f'/remote/{index}',
+                  'scheduler_job_id': str(200 + index),
+                  'task_type': 'relax', 'results': {}}
+        for index, job_dir in enumerate(job_dirs)
+    }
+    project_path = str(tmp_path / 'project.yaml')
+    project = {'name': 'lis', 'root': str(tmp_path), 'autopilot_managed': True,
+               'launch': {'resources': {'profile': 'hpc'},
+                          'submitted_job_dirs': list(job_dirs)},
+               'members': {
+                   'clean_slab': job_dirs[0], 'gas_ref': None,
+                   'configs': [job_dirs[1]]}}
+    order, mode = [], {'fetch_ok': False}
+
+    def fetch_batch(_profile, _password, dirs, _trust):
+        order.append('fetch')
+        results = []
+        for job_dir in dirs:
+            if mode['fetch_ok']:
+                for filename in ('CONTCAR', 'OSZICAR', 'OUTCAR'):
+                    (tmp_path / os.path.basename(job_dir) / filename).write_text(
+                        'result', encoding='utf-8')
+                manifests[job_dir]['results'].update({
+                    'fetched_at': 'now',
+                    'fetched_job_id': manifests[job_dir]['scheduler_job_id'],
+                    'fetched_remote_dir': manifests[job_dir]['remote_dir'],
+                    'fetched': ['CONTCAR', 'OSZICAR', 'OUTCAR'],
+                    'fetched_missing': [],
+                })
+            results.append((job_dir, mode['fetch_ok'], 'ok' if mode['fetch_ok'] else 'offline'))
+        return {'needs_trust': False, 'results': results}
+
+    batch = types.SimpleNamespace(
+        fetch_batch=fetch_batch,
+        filter_continuable=lambda dirs: ([], len(dirs)),
+        continue_batch=lambda *_args: {'needs_trust': False, 'results': []})
+    adsorption = types.SimpleNamespace(
+        list_projects=lambda: [project_path],
+        load_project=lambda path: project if path == project_path else None,
+        save_project=lambda _root, _project: order.append('save-project'),
+        delta_e_rows=lambda _project: {
+            'slab': ('DONE', -10.0), 'ref': ('无', None), 'has_ref': False,
+            'rows': [{'name': 'ads', 'state': 'DONE', 'delta_e': -1.0,
+                      'e_config': -11.0, 'note': ''}]})
+    manifest_mod = types.SimpleNamespace(load_manifest=lambda path: manifests.get(path))
+    report_full = types.SimpleNamespace(
+        _member_dirs=lambda _project: list(job_dirs),
+        generate_project_report=lambda _project, out, config=None:
+            order.append('report') or out)
+
+    def auto_figures(_project, _scenario, out_dir, **_kwargs):
+        order.append('figures')
+        return {'ok': True, 'out_dir': out_dir, 'files': [], 'panel': None,
+                'manifest': []}
+
+    api = Api(
+        profiles_mod=_fake_profiles({'hpc': ClusterProfile(name='hpc', auth='key')}),
+        ledger_mod=_fake_ledger([(job_dir, manifests[job_dir]) for job_dir in job_dirs], []),
+        batch_ops_mod=batch, adsorption_mod=adsorption, manifest_mod=manifest_mod,
+        report_full_mod=report_full,
+        auto_figures_mod=types.SimpleNamespace(run_auto_figures=auto_figures),
+        config_mod=_fake_config(ui={'autopilot': True,
+                                    'autopilot_continue': False,
+                                    'autopilot_fetch': True,
+                                    'autopilot_report': True}))
+
+    first = api.pipeline_tick()
+    assert not any(event['kind'] == 'report_done' for event in first['events'])
+    assert 'report' not in order and 'figures' not in order
+
+    mode['fetch_ok'] = True
+    order.clear()
+    second = api.pipeline_tick()
+    assert any(event['kind'] == 'report_done' for event in second['events'])
+    assert order.index('fetch') < order.index('figures') < order.index('report')
+
+
+def test_auto_figures_prefers_project_molecules_dir_over_global(tmp_path):
+    project_molecules = tmp_path / 'project-molecules'
+    global_molecules = tmp_path / 'global-molecules'
+    project_molecules.mkdir()
+    global_molecules.mkdir()
+    calls = {}
+    api = Api(config_mod=_fake_config(
+                  cfg={'lis_molecules_dir': str(global_molecules)},
+                  ui={'auto_figures': True}),
+              auto_figures_mod=_fake_auto_figures(calls=calls),
+              adsorption_mod=_fake_adsorption())
+    project = {'name': 'lis', 'root': str(tmp_path),
+               'molecules_dir': str(project_molecules)}
+
+    api._auto_figures_for_project(project, '/p/project.yaml', str(tmp_path / 'figs'))
+
+    assert calls['run']['molecules_dir'] == str(project_molecules)

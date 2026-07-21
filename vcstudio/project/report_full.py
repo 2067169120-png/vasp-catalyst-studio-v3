@@ -3,8 +3,8 @@
 编排逻辑(spec 2026-07-06 用户 7 决策落地):
 - 图表:先试 Origin(出版级 PNG 落 report_figs/),失败/缺席逐图降级为内嵌 SVG
 - 热图:显式 SVG(Origin2024b 真机验证不支持,数据仍在 opju)
-- 自由能:config['lis_molecules_dir'] 指向旧分子库(如 E:/V2.0.0/results/done/lis_results)
-  时自动算 Li-S 放电路径;算不出(缺物种)记备注不阻塞
+- 自由能:优先用 project['molecules_dir'](导入项目自带分子库),不存在再回退
+  config['lis_molecules_dir'];算不出(缺物种)记备注不阻塞
 - AI:有 keyring key → 调用并持久化进报告;无 → 报告里放提示词包指引
 - 结构图:嵌各作业目录 figs/ 里已渲染的 PNG(拉回结果时全自动渲,此处不现渲)
 所有外部依赖注入可测;单段失败降级为文字说明,报告永远出得来。
@@ -37,10 +37,43 @@ def incar_summary_from_dir(job_dir) -> dict:
     return {k: d[k] for k in _INCAR_KEYS if k in d}
 
 
+def _energy_source_line(dirs) -> str:
+    """Describe recorded per-member energy provenance without inventing one."""
+    from vcstudio.shared import manifest as _mm
+
+    sources: list[str] = []
+    missing = 0
+    for d in dirs:
+        m = _mm.load_manifest(d)
+        source = str(((m or {}).get('results') or {}).get('energy_source') or '').strip()
+        if source:
+            if source not in sources:
+                sources.append(source)
+        else:
+            missing += 1
+    if sources:
+        suffix = f'；另有 {missing} 个成员未记录 energy_source' if missing else ''
+        return ('电子总能来源按各成员 job.yaml 记录为：'
+                + '、'.join(f'<code>{_esc(source)}</code>' for source in sources)
+                + suffix + '。')
+    return ('各成员 job.yaml 未完整记录 energy_source；请以成员原始输出复核，'
+            '本报告不假定能量全部来自 OSZICAR E0。')
+
+
 def _member_dirs(proj) -> list:
     mem = proj.get('members') or {}
     return [d for d in ([mem.get('clean_slab'), mem.get('gas_ref')]
                         + list(mem.get('configs') or [])) if d]
+
+
+def _species_reference_evidence(delta: dict) -> list[dict]:
+    """Use the exact manifest-backed evidence already resolved for ΔE.
+
+    Re-reading ``project['species_refs']`` here would create a second truth
+    source and could make the evidence table disagree with the formula.
+    """
+    rows = delta.get('species_reference_evidence') or []
+    return [dict(item) for item in rows if isinstance(item, dict)]
 
 
 def _fig_html(png_path, report_dir, caption='') -> str:
@@ -70,6 +103,53 @@ def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
     summary = report.summarize(rows)
     sections: list = []
 
+    # 逐物种参考是 Li-S 公式的实际第三项，必须与ΔE同页可审计。
+    ref_evidence = _species_reference_evidence(delta)
+    if ref_evidence:
+        ref_rows = []
+        for item in ref_evidence:
+            hashes = item['hashes'] if isinstance(item['hashes'], dict) else {}
+            hash_text = '；'.join(f'{key}:{str(value)[:12]}…'
+                                 for key, value in sorted(hashes.items())) or '—'
+            conf = item['confirmation'] if isinstance(item['confirmation'], dict) else {}
+            conf_text = ('人工确认：' + str(conf.get('reason') or '未填理由')
+                         if conf.get('manual') else
+                         ('多证据自动门控' if item.get('valid') else '未记录'))
+            validation_text = ('可用于 ΔE' if item.get('valid') else
+                               (item.get('note') or '参考未通过完整性校验'))
+            ref_rows.append(
+                f'<tr><td><b>{_esc(item["species"])}</b></td>'
+                f'<td>{_esc(item["state"])}</td><td class="num">{_esc(item["energy"])}</td>'
+                f'<td><code>{_esc(item["source"] or "未记录")}</code></td>'
+                f'<td><code>{_esc(item["job"])}</code></td>'
+                f'<td>{_esc(item["imported_from"] or "—")}</td>'
+                f'<td><code>{_esc(hash_text)}</code></td><td>{_esc(conf_text)}</td>'
+                f'<td>{_esc(validation_text)}</td></tr>')
+        sections.append(
+            '<h2>逐物种参考能与溯源</h2><table><thead><tr>'
+            '<th>物种</th><th>状态</th><th>E(ref) / eV</th><th>能量来源</th>'
+            '<th>参考作业</th><th>导入源</th><th>SHA256(前12位)</th><th>确认方式</th>'
+            '<th>ΔE 门控</th>'
+            '</tr></thead><tbody>' + ''.join(ref_rows) + '</tbody></table>')
+
+    formula_rows = []
+    for row in delta.get('rows') or []:
+        if row.get('delta_e') is None or row.get('e_ref') is None:
+            continue
+        formula_rows.append(
+            f'<tr><td>{_esc(row.get("name"))}</td><td>{_esc(row.get("reference_species") or row.get("species"))}</td>'
+            f'<td>{_esc(row.get("reference_state") or "—")}</td>'
+            f'<td class="num">{row.get("e_config"):.10f}</td>'
+            f'<td class="num">{delta["slab"][1]:.10f}</td>'
+            f'<td class="num">{row.get("e_ref"):.10f}</td>'
+            f'<td class="num"><b>{row.get("delta_e"):.10f}</b></td></tr>')
+    if formula_rows:
+        sections.append(
+            '<h2>吸附能逐项核算</h2><p><code>ΔE = E(slab+ads) − E(slab) − E(ref)</code></p>'
+            '<table><thead><tr><th>构型</th><th>参考物种</th><th>参考状态</th><th>E(slab+ads)</th>'
+            '<th>E(slab)</th><th>E(ref)</th><th>ΔE / eV</th></tr></thead><tbody>'
+            + ''.join(formula_rows) + '</tbody></table>')
+
     # ── 0a. ΔE 汇总统计(原版 summary-stats 移植,零依赖) ──
     des = [r['delta_e'] for r in delta['rows'] if isinstance(r.get('delta_e'), (int, float))]
     if des:
@@ -95,10 +175,13 @@ def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
             grid = ' × '.join(str(x) for x in kpts_repro)
             prow += (f'<tr><td><code>KPOINTS</code></td>'
                      f'<td class="num">{_esc(grid)}(倒格矢自动网格)</td></tr>')
-        tail = ('' if potcar_prov else
-                "<p class='dim'>完整赝势身份(variant/TITEL/ENMAX)见各作业 job.yaml 的 inputs 小节。</p>")
+        tail = (
+            "<p class='dim'>本表展示首个可读成员的 INCAR 关键键与首份可用 K 点记录；"
+            "不据此推断所有成员参数相同，逐成员值请查看各自输入文件与 job.yaml。</p>"
+            + ('' if potcar_prov else
+               "<p class='dim'>完整赝势身份(variant/TITEL/ENMAX)见各作业 job.yaml 的 inputs 小节。</p>"))
         sections.append(
-            '<h2>计算参数(成员共享 INCAR 关键键 + K 点网格)</h2>'
+            '<h2>计算参数(首个可读成员的 INCAR 关键键 + 可用 K 点网格)</h2>'
             f'<table><thead><tr><th>键</th><th>值</th></tr></thead><tbody>{prow}</tbody></table>'
             + tail)
     # ── 0c. POTCAR 身份小表(赝势溯源:结果永远可答"哪套赝势算的") ──
@@ -117,8 +200,12 @@ def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
     # ── 1. ΔE 图表(Origin 优先,SVG 兜底) ──
     band = config.get('ideal_window')            # 可配理想窗口 (lo, hi);默认不画
     band_label = config.get('ideal_window_label', '理想窗口')
-    fed = _try_fed(delta, config, log)
+    fed = _try_fed(delta, config, log, proj=proj)
     origin_specs, svg_parts = [], {}
+    if not any(r.get('delta_e') is not None for r in (delta.get('rows') or [])):
+        sections.append(
+            "<p class='dim'>当前报告为诊断版：尚无可用 ΔE。请在软件中处理"
+            "缺失的清洁表面/吸附构型，或确认 NEEDS_HUMAN 成员后重新生成。</p>")
     try:
         bar = charts.bar_data_from_delta(name, delta['rows'],
                                          band=band, band_label=band_label)
@@ -136,6 +223,10 @@ def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
                      else '电子能未含 ZPE/熵')
         svg_parts['fed'] = charts.render_ladder_svg(
             ladder, title=f'Li-S 放电路径(μ_Li={fed["mu_li"]:.3f} eV,{corr_note})')
+    elif (proj.get('molecules_dir') or (config or {}).get('lis_molecules_dir')):
+        sections.append(
+            "<p class='dim'>Li-S 自由能台阶未生成：分子参考态或吸附态不齐，"
+            "或其中存在未确认收敛的结果。NEEDS_HUMAN 分子能量不会进入 μLi/ΔG。</p>")
     origin_images = {}
     if origin_specs:
         r = origin_render(origin_specs, str(figs_dir),
@@ -199,14 +290,20 @@ def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
                      '物种:' + '、'.join(
                          f'{sp} {v["g_corr"]:+.3f} eV' for sp, v in meta.items()) + ')。')
     else:
-        corr_line = '全部能量为 DFT 电子能(OSZICAR E0),未含 ZPE/熵修正。'
+        corr_line = '吸附能与 Li-S 路径按 DFT 电子能口径计算，未含 ZPE/熵修正。'
+    method_scope = (
+        '本项目由外部已算结果导入，软件不默认其 INCAR/ENCUT/K 点一致；'
+        '请以上方参数与赝势表为准，对缺失的复现信息做人工稽核。'
+        if proj.get('import_source') else
+        '项目内各作业 ENCUT 统一(生成时按元素并集取一致截断能，保 ΔE 各成员基组一致)。')
     conv = ['E<sub>ads</sub> = E(slab+ads) − E(slab) − E(ref),负值 = 有利吸附;'
             'ΔE 着色:&lt; −3 eV 强吸附(绿)、&gt; 0(红)。',
+            _energy_source_line(dirs + [row['job'] for row in ref_evidence if row.get('job')]),
             corr_line,
             '成员全部 DONE 才给 ΔE;能量经物理合理性闸(E≥0/|E|&gt;10⁴ 拒收)。',
             '平面波基组不存在基组重叠误差(BSSE),无需 counterpoise 校正;'
-            '项目内各作业 ENCUT 统一(生成时按元素并集取一致截断能,保 ΔE 各成员基组一致);'
-            '气相参考的真空盒尺寸见各作业输入文件(POSCAR/CONTCAR)。']
+            '气相参考的真空盒尺寸见各作业输入文件(POSCAR/CONTCAR)。',
+            method_scope]
     if fed:
         conv.insert(1, f'μ<sub>Li</sub> = (E(Li₂S) − E(S₈)/8) / 2 = {fed["mu_li"]:.4f} eV'
                        '(由分子库估算);ΔG 参照 S8* = 0,U<sub>L</sub> = −max(ΔG/Δn·e)(CHE);'
@@ -223,15 +320,26 @@ def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
     return out_path
 
 
-def _try_fed(delta, config, log):
-    """分子库目录已配置时算放电路径;缺物种/失败 → None + 日志,不阻塞报告。
+def _try_fed(delta, config, log, proj=None):
+    """有可用分子库时算放电路径;缺物种/失败 → None + 日志,不阻塞报告。
+
+    目录优先级:``proj['molecules_dir']``(导入项目自带) →
+    ``config['lis_molecules_dir']``(全局兼容配置)。项目中的路径已失效时也会
+    回退全局目录，避免移动项目后整段自由能静默丢失。
 
     热校正(投稿级):config['freq_dirs'] = {物种: 频率作业目录} 时,自动解析各
     OUTCAR 频率(IBRION=5/6)做 ZPE−TS 校正并叠进 ΔG;有虚频的物种记日志提醒。
     未配置保持电子能口径(报告方法学节明示)。
     """
-    mol_dir = (config or {}).get('lis_molecules_dir') or ''
-    if not mol_dir or not os.path.isdir(mol_dir):
+    project_dir = str((proj or {}).get('molecules_dir') or '').strip()
+    config_dir = str((config or {}).get('lis_molecules_dir') or '').strip()
+    if project_dir and os.path.isdir(project_dir):
+        mol_dir = project_dir
+    elif config_dir and os.path.isdir(config_dir):
+        mol_dir = config_dir
+        if project_dir:
+            log(f'项目分子库目录不存在,已回退全局配置:{project_dir}')
+    else:
         return None
     g_corr, corr_meta = None, {}
     freq_dirs = (config or {}).get('freq_dirs') or {}

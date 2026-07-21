@@ -11,8 +11,9 @@ from vcstudio.project import advisor as advisor_mod
 from vcstudio.project import reactions as reactions_mod
 from vcstudio.shared import scenarios as S
 
-# 官方要求的 5 个方向 + full 兜底
-_EXPECTED_KEYS = {'lis', 'electrocat', 'thermocat', 'battery_bulk', 'molecular', 'full'}
+# 四个主模式 + 三个专业预设
+_EXPECTED_KEYS = {'lis', 'vasp', 'electrocat', 'thermocat',
+                  'battery_bulk', 'molecular', 'full'}
 
 
 def _real_advisor_rules() -> set:
@@ -23,7 +24,7 @@ def _real_advisor_rules() -> set:
 
 # ── 注册表与 schema 完备性 ────────────────────────────────────────────────────
 
-def test_builtin_has_five_directions_plus_full():
+def test_builtin_has_primary_modes_and_professional_presets():
     keys = {s['key'] for s in S.list_scenarios()}
     assert keys == _EXPECTED_KEYS
     assert set(S.BUILTIN_KEYS) == _EXPECTED_KEYS
@@ -45,6 +46,24 @@ def test_pages_are_subset_of_valid_pages():
     for sc in S.list_scenarios():
         assert sc['pages'], sc['key']
         assert set(sc['pages']) <= set(S.PAGES), sc['key']
+
+
+def test_page_registry_matches_real_html_pages():
+    html = (Path(__file__).parents[1] / 'vcstudio/gui_web/assets/index.html').read_text(
+        encoding='utf-8')
+    assert set(re.findall(r'<section[^>]+data-page="([^"]+)"', html)) == set(S.PAGES)
+    nav = set(re.findall(r'<a[^>]+data-page="([^"]+)"[^>]+data-scene="pages\.([^"]+)"', html))
+    assert {a for a, b in nav if a == b} == set(S.PAGES)
+
+
+def test_four_primary_modes_have_safe_defaults():
+    primary = {s['key']: s for s in S.list_scenarios() if s['primary']}
+    assert set(primary) == {'lis', 'vasp', 'molecular', 'full'}
+    assert primary['lis']['defaults']['landing_page'] == 'project'
+    assert primary['vasp']['defaults']['landing_page'] == 'generate'
+    assert primary['molecular']['defaults']['engine'] == 'gaussian'
+    assert set(primary['full']['pages']) == set(S.PAGES)
+    assert set(primary['full']['engines']) == set(S.ENGINES)
 
 
 def test_molecular_drops_project_page():
@@ -108,7 +127,7 @@ def test_get_scenario_returns_independent_copy():
     a['cards']['generate'] = {'sac_matrix': False}
     b = S.get_scenario('lis')
     assert 'HACKED' not in b['pages']
-    assert b['cards'] == {}
+    assert 'generate' not in b['cards']
 
 
 # ── is_visible 各层级 ─────────────────────────────────────────────────────────
@@ -128,7 +147,7 @@ def test_is_visible_cards_default_true_when_unspecified():
 
 def test_is_visible_cards_override_false():
     mol = S.get_scenario('molecular')
-    assert S.is_visible(mol, 'cards.generate.sac_matrix') is False
+    assert S.is_visible(mol, 'cards.structure.sac_matrix') is False
     # 未被覆盖的卡片仍默认可见
     assert S.is_visible(mol, 'cards.generate.spin_family') is True
 
@@ -147,7 +166,16 @@ def test_is_visible_engines_reactions_figures():
     thermo = S.get_scenario('thermocat')
     assert S.is_visible(thermo, 'reactions.ORR_4E') is False     # 热催化无电化学预设
     assert S.is_visible(S.get_scenario('molecular'), 'engines.gaussian') is True
-    assert S.is_visible(S.get_scenario('full'), 'engines.gaussian') is False
+    assert S.is_visible(S.get_scenario('full'), 'engines.gaussian') is True
+
+
+def test_task_keys_are_in_sync_with_catalog_and_defaults_are_allowed():
+    from vcstudio.generate import task_catalog
+    assert set(S.TASK_KEYS) == {t['key'] for t in task_catalog.CATALOG}
+    for sc in S.list_scenarios():
+        assert set(sc['task_keys']) <= set(S.TASK_KEYS)
+        assert sc['defaults']['active_calculation'] in sc['task_keys']
+        assert set(sc['home_actions']) <= set(S.HOME_ACTIONS)
 
 
 def test_is_visible_unknown_path_fails_open():

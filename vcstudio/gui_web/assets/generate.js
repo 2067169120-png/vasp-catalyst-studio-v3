@@ -110,6 +110,18 @@
       VCS.toast('已生成四件套');
       // 同步任务页台账(若已加载)
       if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
+      // 生成是流程中点,不让新手只在日志里猜后续步骤。主按钮走 app.js
+      // 统一导航,进任务页后自动选中刚生成的 CREATED 作业。
+      if (typeof VCS.nextStep === 'function') {
+        VCS.nextStep({
+          title: '四件套已生成',
+          message: '作业已加入任务列表。',
+          detail: '下一步：前往任务页，确认目标集群，然后点击“上传并提交”。',
+          primaryLabel: '前往任务页并提交',
+          page: 'jobs',
+          focusJobDir: r.job_dir,
+        });
+      }
     } finally {
       if (btn) btn.disabled = false;
     }
@@ -320,22 +332,27 @@
   }
 
   // ── 引擎选择器:VASP(用上方四件套)/ CP2K / Gaussian / CASTEP(文件级适配,简化表单) ──
-  const State2 = { engine: 'vasp' };
+  const State2 = { engine: 'vasp', sceneKey: null };
   // 引擎选择器:VASP 置顶(主引擎)的下拉,替代原 chips 墙。默认 VASP。
   async function loadEngines() {
     const sel = $('engine-select');
     if (!sel) return;
     const sceneKey = (window.VCS && VCS.scenario && VCS.scenario.key) || null;
     const r = await VCS.call('engine_list', sceneKey);
-    let engines = (r && r.engines) || [];
+    let engines = ((r && r.engines) || []).filter(e => e.visible !== false);
     if (!engines.length) engines = [{ key: 'vasp', name: 'VASP', experimental: false }];
     // VASP 恒置顶醒目;其余引擎(实验性)靠后
     engines = engines.slice().sort((a, b) => (a.key === 'vasp' ? -1 : b.key === 'vasp' ? 1 : 0));
     sel.innerHTML = engines.map(e =>
       '<option value="' + VCS.esc(e.key) + '">' + VCS.esc(e.name) +
       (e.key === 'vasp' ? '(主引擎)' : e.experimental ? '(实验性)' : '') + '</option>').join('');
+    const modeChanged = State2.sceneKey !== sceneKey;
+    State2.sceneKey = sceneKey;
+    const preferred = (r && r.default) || engines[0].key;
     const has = engines.some(e => e.key === State2.engine);
-    if (!has) State2.engine = engines[0].key;
+    if (!has || modeChanged) {
+      State2.engine = engines.some(e => e.key === preferred) ? preferred : engines[0].key;
+    }
     sel.value = State2.engine;
     selectEngine(sel.value);
   }
@@ -391,9 +408,20 @@
       (r.files || []).forEach(f => VCS.log('已生成:' + f, 'okc'));
       (r.issues || []).forEach(i => VCS.log('自洽校验:' + i, 'warnc'));
       (r.warnings || []).forEach(w => VCS.log(w, 'warnc'));
-      VCS.log(eng + ' 引擎输入已生成(软件本体用户自备)', 'okc');
-      VCS.call('open_dir', out);
-      VCS.toast('已生成 ' + eng + ' 输入');
+      if (!r.registered) {
+        VCS.log(eng + ' 输入文件已生成，但 job.yaml/台账登记失败；已打开目录，请先处理日志中的登记问题，不能直接提交', 'failc');
+        VCS.call('open_dir', out);
+        VCS.toast('输入已生成，但尚未纳管', 'fail');
+        return;
+      }
+      VCS.log(eng + ' 引擎输入已生成并加入任务列表', 'okc');
+      VCS.toast('已生成并纳管 ' + eng + ' 作业');
+      if (VCS.nextStep) VCS.nextStep({
+        title: eng.toUpperCase() + ' 作业已就绪',
+        message: '输入文件、job.yaml 和输出下载契约已生成。',
+        detail: '下一步：前往任务页选择服务器并提交；完成后可按该引擎解析能量和生成报告。',
+        primaryLabel: '前往任务页提交', page: 'jobs', focusJobDir: out,
+      });
     } finally {
       if (btn) btn.disabled = false;
     }
@@ -513,6 +541,18 @@
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 
+  // 工作模式晚于页面脚本加载：切换后重拉严格白名单，并应用该模式默认体系类型。
+  document.addEventListener('vcs:scenario', e => {
+    const sc = e.detail && e.detail.scenario;
+    const defaults = (sc && sc.defaults) || {};
+    const calc = $('gen-calc');
+    if (calc && defaults.calc_type && Array.from(calc.options).some(o => o.value === defaults.calc_type)) {
+      calc.value = defaults.calc_type;
+      refreshPreview();
+    }
+    loadEngines();
+  });
+
   // 供 molbuild.js(①分子建模「下一步」)携分子进 Gaussian 面板:选 Gaussian 引擎 + 载分子
   async function useMolecule(struct) {
     await loadEngines();
@@ -522,5 +562,6 @@
     }
   }
 
-  window.Generate = { reload: () => refreshPreview(), useMolecule };
+  window.Generate = { reload: () => refreshPreview(), useMolecule,
+    selectEngine: async key => { await loadEngines(); return selectEngine(key); } };
 })();

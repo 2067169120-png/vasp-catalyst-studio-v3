@@ -6,6 +6,7 @@ import pytest
 
 from vcstudio.project import freeenergy as fe
 from vcstudio.project import reactions as R
+from vcstudio.shared import manifest as manifest_mod
 
 # 构造能量:让公式可手算。E(S8)=-32, E(Li2S)=-8 → μ_Li = (-8 - (-32/8))/2 = -2
 _MOL = {'S8': -32.0, 'Li2S': -8.0, 'Li2S2': -12.0}
@@ -77,6 +78,35 @@ def test_read_e0_and_scan(tmp_path):
     assert fe.read_e0(tmp_path / 'not_a_mol') is None   # 无 OSZICAR
     scanned = fe.load_molecule_energies(tmp_path)
     assert scanned == {'S8': pytest.approx(-32.0), 'Li2S': pytest.approx(-8.0)}
+
+
+def test_molecule_scan_rejects_managed_not_done_or_implausible_energy(tmp_path):
+    for species, state, energy in (
+            ('S8', 'DONE', -32.0),
+            ('Li2S', 'NEEDS_HUMAN', -8.0),
+            ('Li2S2', 'DONE', 4.0)):
+        d = tmp_path / f'mol_{species}'
+        d.mkdir()
+        (d / 'OSZICAR').write_text(f' 1 F= {energy} E0= {energy}\n', encoding='utf-8')
+        m = manifest_mod.new_manifest(
+            job_id=species, system=species, task_type='relax', calc_type='molecule', inputs={})
+        manifest_mod.set_state(m, state)
+        m['results'] = {'energy_e0_eV': energy}
+        manifest_mod.save_manifest(d, m)
+
+    assert fe.load_molecule_energies(tmp_path) == {'S8': pytest.approx(-32.0)}
+
+
+def test_molecule_scan_does_not_treat_corrupt_managed_manifest_as_legacy(tmp_path):
+    d = tmp_path / 'mol_Li2S'
+    d.mkdir()
+    (d / 'OSZICAR').write_text(
+        ' 1 F= -8.0 E0= -8.000000E+00\n', encoding='utf-8')
+    # Existing but malformed job.yaml identifies a managed result whose state
+    # cannot be audited.  Its otherwise valid E0 must not enter μLi/ΔG.
+    (d / 'job.yaml').write_text('state: [DONE\n', encoding='utf-8')
+
+    assert fe.load_molecule_energies(tmp_path) == {}
 
 
 def test_species_matching_no_prefix_collision():

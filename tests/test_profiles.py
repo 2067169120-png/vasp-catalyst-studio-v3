@@ -24,6 +24,22 @@ def test_save_load_roundtrip(tmp_path):
     assert back['lab'].auth == 'password' and back['lab'].scheduler == 'PBS'
 
 
+def test_engine_commands_roundtrip_without_breaking_legacy_vasp(tmp_path):
+    path = tmp_path / 'clusters.yaml'
+    profile = ClusterProfile(
+        name='multi', vasp_cmd='srun vasp_std',
+        engine_commands={
+            'gaussian': 'g16 < {input} > {stem}.log',
+            'cp2k': 'srun cp2k.psmp -i {input} -o {stem}.out',
+        })
+    save_profiles({'multi': profile}, path)
+
+    loaded = load_profiles(path)['multi']
+
+    assert loaded.vasp_cmd == 'srun vasp_std'
+    assert loaded.engine_commands == profile.engine_commands
+
+
 def test_yaml_never_contains_password(tmp_path):
     path = tmp_path / 'clusters.yaml'
     save_profiles({'c': ClusterProfile(name='c', username='u')}, path)

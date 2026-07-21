@@ -31,8 +31,12 @@ gui = ["pywebview>=4"]
 packaging = ["pyinstaller>=6"]
 # 原生论文级出图引擎(external/native_charts.py;函数内延迟 import,core 零重依赖)
 charts = ["matplotlib>=3.6", "numpy>=1.23"]
+# 不含 matplotlib 的数值生成能力，供 --no-charts 打包配置使用
+numeric = ["numpy>=1.23"]
 # 分子建模引擎链(molbuild/smiles3d:SMILES→3D、2D SVG 预览;函数内延迟 import,core 零重依赖)
 mol = ["rdkit"]
+# 论文/PDF 文档能力；默认完整版 EXE 会显式收录，冻结后无需也无法再补装
+docs = ["python-docx", "pypdf"]
 # 图片识别 OCSR(molbuild/ocsr:图片→SMILES);体积大,含 TensorFlow 模型,不进默认依赖
 ocsr = ["decimer"]
 # 开发:测试 + 覆盖率 + lint + ASE(解析器交叉校验对拍,可选;缺失则相关测试 skip)

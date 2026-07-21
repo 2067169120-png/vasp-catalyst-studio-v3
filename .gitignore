@@ -37,3 +37,9 @@ config.yaml
 coverage.xml
 htmlcov/
 .ruff_cache/
+
+# GUI/测试运行时临时产物（不得进入功能分支）
+pytest-of-root/
+vcstudio_paste/
+vcs_solv_*_POSCAR
+vcstudio_deps_*.log

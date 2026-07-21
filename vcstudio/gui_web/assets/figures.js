@@ -80,7 +80,7 @@
       });
       h += '</div></div>';
     });
-    box.innerHTML = h || '<div class="db-empty">当前研究场景未启用任何图型</div>';
+    box.innerHTML = h || '<div class="db-empty">当前工作模式未启用任何图型</div>';
     box.querySelectorAll('.fig-card').forEach(c =>
       c.addEventListener('click', () => openDrawer(c.dataset.key)));
   }

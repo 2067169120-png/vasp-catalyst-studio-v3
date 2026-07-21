@@ -3,7 +3,10 @@ import os
 import sys
 import types
 
+import pytest
+
 from vcstudio.cluster import batch_ops
+from vcstudio.cluster.connection import ConnectError
 from vcstudio.shared import manifest as manifest_mod
 
 
@@ -23,6 +26,32 @@ def test_public_surface():
     for name in ('submit_batch', 'fetch_batch', 'continue_batch',
                  'refresh_batch', 'queue_detail', 'tune_batch', 'adopt_scan'):
         assert callable(getattr(batch_ops, name))
+
+
+@pytest.mark.parametrize('invoke,empty_key', [
+    (lambda p: batch_ops.submit_batch(p, 'pw', [], False), 'results'),
+    (lambda p: batch_ops.fetch_batch(p, 'pw', [], False), 'results'),
+    (lambda p: batch_ops.continue_batch(p, 'pw', [], False), 'results'),
+    (lambda p: batch_ops.refresh_batch(p, 'pw', [], False), 'results'),
+    (lambda p: batch_ops.tune_batch(p, 'pw', '/job', {}, False), 'results'),
+    (lambda p: batch_ops.adopt_scan(p, 'pw', False, set(), '/tmp'), 'results'),
+    (lambda p: batch_ops.queue_detail(p, 'pw', False), 'jobs'),
+    (lambda p: batch_ops.workdir_lookup(p, 'pw', '1', False), 'workdir'),
+])
+def test_needs_trust_passthrough_has_real_key_evidence(
+        monkeypatch, invoke, empty_key):
+    def _unknown(*_args, **_kwargs):
+        raise ConnectError(
+            '请核对指纹', needs_trust=True,
+            fingerprint='SHA256:abc', algorithm='ssh-ed25519', host='bastion')
+
+    monkeypatch.setattr(batch_ops, 'open_client', _unknown)
+    out = invoke(types.SimpleNamespace(name='c'))
+    assert out['needs_trust'] is True
+    assert out['fingerprint'] == 'SHA256:abc'
+    assert out['algorithm'] == 'ssh-ed25519'
+    assert out['host'] == 'bastion'
+    assert empty_key in out
 
 
 # ── adopt_scan:一次连接完成 明细 → 补目录 → 落认领 ────────────────────────────
@@ -148,6 +177,7 @@ def _make_job(tmp_path, name, job_id, state='RUNNING'):
     m = manifest_mod.new_manifest(job_id=f'{name}-x', system=name,
                                   task_type='relax', calc_type='', inputs={})
     m['scheduler_job_id'] = job_id
+    m['cluster'] = 'c1'
     manifest_mod.set_state(m, state)
     manifest_mod.save_manifest(str(d), m)
     return str(d)
@@ -230,6 +260,26 @@ def test_cancel_batch_pbs_uses_qdel(tmp_path, monkeypatch):
     assert any('qdel' in c and '888' in c for c in calls)
 
 
+def test_cancel_batch_wrong_cluster_never_calls_scheduler(tmp_path, monkeypatch):
+    _fake_conn(monkeypatch)
+    d = _make_job(tmp_path, 'foreign', '777')
+    data = manifest_mod.load_manifest(d)
+    data['cluster'] = 'server-a'
+    manifest_mod.save_manifest(d, data)
+    monkeypatch.setattr(
+        batch_ops.submitter, 'run_cmd',
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError('不得取消错误服务器作业')))
+
+    out = batch_ops.cancel_batch(
+        types.SimpleNamespace(name='server-b', scheduler='Slurm', scheduler_bin=''),
+        [d], password='pw')
+
+    assert out['cancelled'] == []
+    assert out['failed'][0]['job_id'] == '777'
+    assert '属于服务器「server-a」' in out['failed'][0]['reason']
+    assert manifest_mod.load_manifest(d)['state'] == 'RUNNING'
+
+
 def test_cancel_batch_needs_trust(monkeypatch):
     """首次未知主机指纹:open_client 抛 ConnectError(needs_trust)→ ok=False + needs_trust。"""
     from vcstudio.cluster.connection import ConnectError
@@ -240,6 +290,20 @@ def test_cancel_batch_needs_trust(monkeypatch):
     monkeypatch.setattr(batch_ops, 'open_client', _boom)
     out = batch_ops.cancel_batch(_prof('Slurm'), ['/x'], password='pw')
     assert out['ok'] is False and out['needs_trust'] is True and out['cancelled'] == []
+
+
+def test_cancel_batch_needs_trust_passthrough_has_key_evidence(monkeypatch):
+    def _boom(*_args, **_kwargs):
+        raise ConnectError(
+            '未知主机', needs_trust=True, fingerprint='SHA256:def',
+            algorithm='ssh-rsa', host='target')
+
+    monkeypatch.setattr(batch_ops, 'open_client', _boom)
+    out = batch_ops.cancel_batch(_prof('Slurm'), ['/x'], password='pw')
+    assert out['needs_trust'] is True
+    assert out['fingerprint'] == 'SHA256:def'
+    assert out['algorithm'] == 'ssh-rsa'
+    assert out['host'] == 'target'
 
 
 def test_cancel_batch_unsupported_scheduler_errors():

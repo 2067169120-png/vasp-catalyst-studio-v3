@@ -18,6 +18,79 @@
     if (a) a.click();
   }
 
+  async function openResultsImport() {
+    const out = await VCS.navigate('project', { source: 'dashboard-import-results' });
+    if (!out.ok) return;
+    if (window.Project && typeof window.Project.openImport === 'function') {
+      await window.Project.openImport();
+      return;
+    }
+    VCS.toast('请在“吸附能项目”中选择“导入整个文件夹”');
+  }
+
+  function openInputsSubmit() {
+    navTo('jobs');
+    // 导航与手风琴初始化都是同步完成；下一帧聚焦到快速提交首步。
+    window.setTimeout(() => {
+      const card = $('quick-submit-card');
+      if (!card) return;
+      if (card.getAttribute('data-open') !== '1') {
+        const head = card.querySelector(':scope > .acc-h');
+        if (head) head.click();
+      }
+      card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      const first = $('qs-add-dir');
+      if (first) first.focus();
+    }, 0);
+  }
+
+  const ACTIONS = {
+    import_adsorption_results: ['导入已算好的 Li-S 结果', '整文件夹识别参考态、slab 与吸附构型', openResultsImport],
+    lis_new: ['开始新的吸附能计算', '固定 INCAR + slab / adsorption POSCAR → 整组提交', async () => {
+      const out = await VCS.navigate('project', { source: 'dashboard-lis-new' });
+      if (out.ok && window.Project && Project.startLiS) Project.startLiS();
+    }],
+    submit_inputs: ['提交已有输入文件', '选择整个文件夹，预检后批量提交', openInputsSubmit],
+    continue_jobs: ['继续已有任务', '监控、续算、下载与失败恢复', () => navTo('jobs')],
+    new_structure: ['从结构开始', '建模或打开结构文件', () => navTo('structure')],
+    choose_vasp_task: ['选择本次 DFT 计算', '按设置中的类型只显示对应参数与下一步', () =>
+      VCS.navigate('generate', { source: 'dashboard-task', focusSelector: '#taskcat-card' })],
+    analyze_vasp_result: ['解析已有计算结果', '能带、EOS、功函数、收敛与性质计算', async () => {
+      const out = await VCS.navigate('project', { source: 'dashboard-analysis', focusSelector: '#taskana-card' });
+      const sel = $('analysis-type');
+      if (out.ok && sel) { sel.value = 'taskana'; sel.dispatchEvent(new Event('change', { bubbles: true })); }
+    }],
+    build_molecule: ['建立或导入分子', '图片 / SMILES / 文件 → 3D 分子结构', async () => {
+      const out = await VCS.navigate('structure', { source: 'dashboard-molecule' });
+      if (!out.ok) return;
+      const b = document.querySelector('[data-seg="data-src"] [data-seg-val="molecular"]');
+      if (b) b.click();
+    }],
+    gaussian_input: ['生成 Gaussian 输入', '分子结构 → 方法、基组与服务器资源', async () => {
+      const out = await VCS.navigate('generate', { source: 'dashboard-gaussian' });
+      if (out.ok && window.Generate && Generate.selectEngine) Generate.selectEngine('gaussian');
+    }],
+    wavefunction: ['波函数分析', 'Multiwfn / VMD 分析与可视化', () => navTo('wavefunction')],
+  };
+
+  function renderStartActions(sc) {
+    const box = $('db-start-actions');
+    if (!box || !sc) return;
+    const keys = (sc.home_actions || []).filter(k => ACTIONS[k]);
+    box.innerHTML = keys.map((key, i) => {
+      const a = ACTIONS[key];
+      return `<button class="start-action${i < 2 ? ' primary' : i > 2 ? ' quiet' : ''}" data-action="${VCS.esc(key)}">` +
+        `<b>${VCS.esc(a[0])}</b><span>${VCS.esc(a[1])}</span></button>`;
+    }).join('');
+    const title = document.querySelector('#db-start-here .start-copy h2');
+    const sub = document.querySelector('#db-start-here .start-copy p');
+    if (title) title.textContent = sc.key === 'lis' ? '这次要导入结果，还是开始新的吸附计算？' :
+      sc.key === 'molecular' ? '这次从分子结构、Gaussian 输入还是已有任务开始？' :
+        '这次从哪一步开始？';
+    if (sub) sub.textContent = '当前工作模式：' + (sc.name || sc.key) +
+      '。这里只保留本次需要的入口，可随时在设置中切换。';
+  }
+
   // ── 卡片 1:状态汇总大数字(点击跳作业页) ─────────────────────────────────
   function renderNums(jobs) {
     const box = $('db-nums');
@@ -75,12 +148,16 @@
         if (st === 'recover' && p.recover_round) lbl += ` ${p.recover_round}/3`;
         return `<div class="pl-step ${cls}"><span class="dot"></span><span class="lbl">${VCS.esc(lbl)}</span></div>`;
       }).join('');
+      const nextPage = p.stage_index <= 0 ? 'generate'
+        : (p.stage_index <= 3 ? 'jobs' : 'project');
       return '<div class="pl-proj">' +
         '<div class="pl-head">' +
         (p.needs_human ? '<span class="redflag" title="需人工介入"></span>' : '') +
         VCS.elementBadge(p.name) +
         `<span class="nm">${VCS.esc(p.name || '(未命名)')}</span>` +
-        `<span class="plcount">${p.done}/${p.total} DONE</span></div>` +
+        (p.profile ? `<span class="pl-cluster">${VCS.esc(p.profile)}</span>` : '') +
+        `<span class="plcount">${p.done}/${p.total} DONE</span>` +
+        `<button class="btn quiet" data-goto="${nextPage}">继续下一步</button></div>` +
         `<div class="pl-steps">${steps}</div></div>`;
     }).join('');
   }
@@ -185,6 +262,13 @@
     if (!page) return;
     // 快捷入口三个大按钮
     const wire = (id, fn) => { const el = $(id); if (el) el.addEventListener('click', fn); };
+    renderStartActions(VCS.scenario);
+    const actions = $('db-start-actions');
+    if (actions) actions.addEventListener('click', e => {
+      const b = e.target.closest('[data-action]');
+      const a = b && ACTIONS[b.dataset.action];
+      if (a) a[2]();
+    });
     wire('db-go-generate', () => navTo('generate'));
     wire('db-go-project', () => navTo('project'));
     wire('db-go-queue', () => {
@@ -204,6 +288,7 @@
   document.addEventListener('vcs:page', e => {
     if (e.detail && e.detail.page === 'dashboard') refresh();
   });
+  document.addEventListener('vcs:scenario', e => renderStartActions(e.detail && e.detail.scenario));
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();

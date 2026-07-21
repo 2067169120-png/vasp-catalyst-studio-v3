@@ -23,6 +23,30 @@
   function currentProfile() { const s = $('#jobs-profile'); return s ? s.value : ''; }
   function selectedDirs() { return Array.from(State.selected); }
 
+  // 所有破坏性/远程动作都必须与 job.yaml 绑定的服务器一致。后端还会做同样的
+  // 硬校验；这里先给用户可理解的提示，避免输完密码后才发现选错服务器。
+  function actionDirs(name, action, mode) {
+    const rows = selectedDirs().map(d => State.rows.find(r => r.dir === d)).filter(Boolean);
+    if (!rows.length) return [];
+    let invalid;
+    if (mode === 'new') {
+      invalid = rows.filter(r => r.cluster || r.state !== 'CREATED');
+      if (invalid.length) {
+        VCS.log(`${action}仅适用于尚未提交的 CREATED 作业；已绑定/已提交的作业请走续算流程：` +
+          invalid.map(r => r.name).join('、'), 'failc');
+        return null;
+      }
+    } else {
+      invalid = rows.filter(r => r.cluster !== name);
+      if (invalid.length) {
+        VCS.log(`${action}已阻止：所选作业不属于当前服务器「${name}」：` +
+          invalid.map(r => `${r.name}(${r.cluster || '尚未提交'})`).join('、'), 'failc');
+        return null;
+      }
+    }
+    return rows.map(r => r.dir);
+  }
+
   function requireProfile() {
     const name = currentProfile();
     if (!name || !State.profiles[name]) {
@@ -87,6 +111,7 @@
       `<td class="chk"><input type="checkbox" class="jrow-chk"${checked ? ' checked' : ''}></td>` +
       `<td>${VCS.elementBadge(r.name)}<span class="name">${VCS.esc(r.name)}</span>` +
       (role ? ` <span class="role-tag">${VCS.esc(role)}</span>` : '') +
+      (r.cluster ? ` <span class="role-tag" title="该作业绑定的服务器">${VCS.esc(r.cluster)}</span>` : '') +
       (task ? ` <span class="sub">${VCS.esc(task)}</span>` : '') +
       ` <button class="lnk conv" title="查看收敛过程(E0/ΔE/|F|max vs 离子步)">收敛</button>` +
       (['RUNNING', 'QUEUED', 'SUBMITTED', 'UPLOADED'].indexOf(r.state) >= 0
@@ -385,10 +410,9 @@
       if (res.cancelled) return null;
       if (res.needPassword) { password = res.password; res = await invoke(password, trust); continue; }
       if (res.needs_trust) {
-        const ok = await VCS.confirm('未知主机指纹:' + (res.message || '') +
-          '\n\n信任该主机并重试?');
-        if (!ok) { VCS.log('已取消(未信任主机)', 'failc'); return null; }
-        trust = true;
+        const pin = await VCS.confirmHostKey(res);
+        if (!pin) { VCS.log('已取消或阻止未知主机连接', 'failc'); return null; }
+        trust = pin;
         res = await invoke(password, trust);
         continue;
       }
@@ -580,13 +604,16 @@
       else if (a.warning) VCS.log('磁矩审计 ' + a.name + ':⚠ ' + a.warning, 'warnc');
       else VCS.log('磁矩审计 ' + a.name + ':末态 ' + a.final_magnetization + ' μB,正常', 'okc');
     });
+    if (r.report_file) VCS.log('多自旋态可追溯报告:' + r.report_file, 'okc');
+    if (r.report_error) VCS.log('多自旋报告生成失败:' + r.report_error, 'warnc');
   }
 
   // ── 上传并提交 ─────────────────────────────────────────────────────────────
   async function doSubmit() {
     const name = requireProfile();
     if (!name) return;
-    const dirs = selectedDirs();
+    const dirs = actionDirs(name, '提交', 'new');
+    if (dirs === null) return;
     if (!dirs.length) { VCS.log('请先在列表中选中要提交的作业(可多选)', 'failc'); return; }
     const prof = State.profiles[name];
     const ok = await VCS.confirm(
@@ -642,19 +669,59 @@
     }
   }
 
-  // ── 拉回结果:预设弹窗(轻量 / DOS·Bader 全家桶 / 自定义) ─────────────────
+  async function runAllStatus(auto) {
+    if (State.refreshing) {
+      if (!auto) VCS.log('上一轮查询仍在进行,请稍候');
+      return;
+    }
+    State.refreshing = true;
+    try {
+      if (!auto) VCS.log('并行查询所有服务器上的活跃作业…');
+      const res = await VCS.call('refresh_all_status');
+      if (!res || res.error) {
+        VCS.log('全部服务器查询失败:' + ((res && res.error) || '未知错误'), 'failc');
+        return;
+      }
+      let count = 0;
+      (res.profiles || []).forEach(server => {
+        if (server.error) {
+          const next = server.error === 'NEED_PASSWORD'
+            ? '请在目标集群下手动查询一次并保存密码'
+            : server.needs_trust ? '请先选择该集群手动查询并核对 SHA256 指纹' : server.error;
+          VCS.log(`[${server.name}] 查询失败:${next}`, 'failc');
+          return;
+        }
+        (server.results || []).forEach(row => {
+          count++;
+          VCS.log(`[${server.name}] ${row[0]}: ${row[1]}`);
+        });
+      });
+      if (!count && !auto && !(res.errors || []).length) {
+        VCS.log('所有服务器都没有待查询的活跃作业');
+      }
+      if ((res.errors || []).length && auto) {
+        VCS.toast(`多服务器监控：${res.errors.length} 台需要处理，其它服务器已正常刷新`, 'fail');
+      }
+      await reload();
+    } finally {
+      State.refreshing = false;
+    }
+  }
+
+  // ── 拉回结果:默认按每个 job.yaml 的任务类型选择关键产物 ─────────────────
   function askFetchFiles(n) {
     return new Promise(resolve => {
       const presets = [
-        ['轻量(默认):CONTCAR + OSZICAR + OUTCAR', ['CONTCAR', 'OSZICAR', 'OUTCAR']],
-        ['DOS/Bader 全家桶:轻量 + vasprun.xml + DOSCAR + CHGCAR + AECCAR0/2(大文件,较慢)',
-          ['CONTCAR', 'OSZICAR', 'OUTCAR', 'vasprun.xml', 'DOSCAR', 'CHGCAR', 'AECCAR0', 'AECCAR2']],
+        ['按任务自动（推荐）：能带 / DOS / Bader / ELF / 功函数 / AIMD 各取自己的关键文件', null],
+        ['仅轻量：CONTCAR + OSZICAR + OUTCAR', ['CONTCAR', 'OSZICAR', 'OUTCAR']],
+        ['电子结构全家桶：轻量 + vasprun.xml + DOSCAR + EIGENVAL + CHGCAR + AECCAR0/2 + ELFCAR + LOCPOT',
+          ['CONTCAR', 'OSZICAR', 'OUTCAR', 'vasprun.xml', 'DOSCAR', 'EIGENVAL',
+            'CHGCAR', 'AECCAR0', 'AECCAR2', 'ACF.dat', 'ELFCAR', 'LOCPOT', 'XDATCAR']],
       ];
       let done = false;
       const finish = v => { if (!done) { done = true; resolve(v); } };
       const body =
-        `<label style="display:block;margin-bottom:8px"><input type="radio" name="fp" value="0" checked> ${VCS.esc(presets[0][0])}</label>` +
-        `<label style="display:block;margin-bottom:8px"><input type="radio" name="fp" value="1"> ${VCS.esc(presets[1][0])}</label>` +
+        presets.map((p, i) => `<label style="display:block;margin-bottom:8px"><input type="radio" name="fp" value="${i}"${i === 0 ? ' checked' : ''}> ${VCS.esc(p[0])}</label>`).join('') +
         `<label style="display:block;margin-bottom:6px"><input type="radio" name="fp" value="99"> 自定义(逗号分隔文件名):</label>` +
         `<input id="fp-custom" class="ipt" value="CONTCAR, OUTCAR, vasprun.xml">`;
       const m = VCS.modal({
@@ -672,7 +739,7 @@
               } else {
                 files = presets[+c][1];
               }
-              mm.close(); finish(files);
+              mm.close(); finish({ files, label: c === '99' ? '自定义结果包' : presets[+c][0] });
             } },
         ],
       });
@@ -683,11 +750,13 @@
   async function doFetch() {
     const name = requireProfile();
     if (!name) return;
-    const dirs = selectedDirs();
+    const dirs = actionDirs(name, '拉回结果', 'bound');
+    if (dirs === null) return;
     if (!dirs.length) { VCS.log('请先选中要拉回结果的作业(通常是 DONE/未收敛 的)', 'failc'); return; }
-    const files = await askFetchFiles(dirs.length);
-    if (!files) return;
-    VCS.log(`拉回 ${dirs.length} 个作业的 ${files.join('、')}…`);
+    const choice = await askFetchFiles(dirs.length);
+    if (!choice) return;
+    const files = choice.files;
+    VCS.log(`拉回 ${dirs.length} 个作业：${files ? files.join('、') : choice.label}…`);
     const res = await remote(name, (pw, trust) =>
       VCS.call('fetch_jobs', dirs, name, pw, trust, files));
     if (!res) return;
@@ -700,7 +769,8 @@
   async function doContinue() {
     const name = requireProfile();
     if (!name) return;
-    const dirs = selectedDirs();
+    const dirs = actionDirs(name, '续算', 'bound');
+    if (dirs === null) return;
     if (!dirs.length) { VCS.log('请先选中要续算的作业(仅未收敛/墙钟/ZBRENT 等可续算)', 'failc'); return; }
     const ok = await VCS.confirm(
       `将对选中的 ${dirs.length} 个作业从 CONTCAR 续算并重投到「${name}」\n` +
@@ -910,7 +980,7 @@
   }
 
   // ── 自动刷新 ───────────────────────────────────────────────────────────────
-  function autoTick() { runStatus(true); }
+  function autoTick() { runAllStatus(true); }
 
   // silent=true(启动装载时):只起停定时器,不写日志——启动时可见页是仪表盘,
   // 此刻 VCS.log 会给无日志区的仪表盘凭空插一个日志框,故静默。
@@ -929,17 +999,20 @@
 
   // ── 全选/反选 + 批量取消勾选作业 ──
   function checkAll() {
-    const rows = visibleRows();
+    const name = currentProfile();
+    // 全选不会跨服务器；未提交作业仍可勾选后提交到当前服务器。
+    const rows = visibleRows().filter(r => !r.cluster || r.cluster === name);
     const allSel = rows.length && rows.every(r => State.selected.has(r.dir));
     if (allSel) rows.forEach(r => State.selected.delete(r.dir));
     else rows.forEach(r => State.selected.add(r.dir));
     renderTable();
   }
   async function batchCancel() {
-    const dirs = selectedDirs();
-    if (!dirs.length) { VCS.log('批量取消:请先勾选要取消的作业', 'failc'); return; }
     const name = requireProfile();
     if (!name) return;
+    const dirs = actionDirs(name, '批量取消', 'bound');
+    if (dirs === null) return;
+    if (!dirs.length) { VCS.log('批量取消:请先勾选要取消的作业', 'failc'); return; }
     if (!await VCS.confirm('确认取消勾选的 ' + dirs.length + ' 个作业?(qdel/scancel + 台账标记 FAILED/用户取消)')) return;
     const res = await remote(name, (pw, trust) => VCS.call('jobs_cancel_batch', dirs, name, pw, trust));
     if (!res) return;
@@ -949,28 +1022,146 @@
     await reload();
   }
 
-  // ── 快速批量提交(任意输入文件建作业) ──
-  const QS = { files: [] };
+  // ── 快速批量提交:父目录扫描 → 四件套补齐 → 建作业 → 自动勾选 ──
+  const QS = { files: [], scan: null, scanSeq: 0, scanning: false };
+  function qsSharedIncar() { return ($('#qs-incar') && $('#qs-incar').value.trim()) || ''; }
+  function qsBuildable() {
+    return (((QS.scan || {}).items) || []).filter(i => i && i.can_build).length;
+  }
+  function qsUpdateBuildButton() {
+    const btn = $('#qs-build');
+    if (!btn) return;
+    const n = qsBuildable();
+    btn.disabled = QS.scanning || n === 0;
+    btn.textContent = QS.scanning ? '正在扫描…' :
+      (n ? `生成 / 导入 ${n} 个作业` : '请先选择并预检');
+  }
   function renderQsFiles() {
     const box = $('#qs-filelist');
     const cnt = $('#qs-count');
-    if (cnt) cnt.textContent = QS.files.length + ' 个文件';
+    if (cnt) cnt.textContent = QS.files.length + ' 个入口';
     if (!box) return;
     box.innerHTML = QS.files.map((f, i) =>
       `<span class="qs-file" data-i="${i}">${VCS.esc(f)} <b data-rm="${i}">×</b></span>`).join('') ||
-      '<span class="sub">尚未添加文件</span>';
+      '<span class="sub">尚未选择。优先选择包含多个计算目录的父文件夹</span>';
+  }
+  function qsStatus(item) {
+    if (item.status === 'ready') return ['ready', '四件套完整'];
+    if (item.status === 'generatable') return ['generatable', '可自动补齐'];
+    return ['blocked', '需要处理'];
+  }
+  function renderQsPreview(r) {
+    const box = $('#qs-preview');
+    if (!box) return;
+    if (!QS.files.length) { box.hidden = true; box.innerHTML = ''; qsUpdateBuildButton(); return; }
+    box.hidden = false;
+    if (!r || r.error || r.ok === false) {
+      box.innerHTML = `<div class="qs-preview-head"><strong>预检失败</strong>` +
+        `<span class="qs-stat bad">${VCS.esc((r && r.error) || '无法读取输入')}</span></div>`;
+      qsUpdateBuildButton();
+      return;
+    }
+    const s = r.summary || {};
+    const items = r.items || [];
+    let h = '<div class="qs-preview-head"><strong>预检结果：发现 ' +
+      VCS.esc(s.total || 0) + ' 个候选作业</strong>' +
+      `<span class="qs-stat ok">完整 ${VCS.esc(s.ready || 0)}</span>` +
+      `<span class="qs-stat gen">可生成 ${VCS.esc(s.generatable || 0)}</span>` +
+      `<span class="qs-stat bad">需处理 ${VCS.esc(s.blocked || 0)}</span>` +
+      ((s.duplicates || 0) ? `<span class="qs-stat">已去重 ${VCS.esc(s.duplicates)}</span>` : '') +
+      '</div><div class="qs-preview-list">';
+    if (!items.length) {
+      h += '<div class="empty"><p>没有发现可用输入。请选择包含 POSCAR、CONTCAR 或四件套的目录。</p></div>';
+    } else {
+      items.forEach(item => {
+        const st = qsStatus(item);
+        const missing = item.missing || [];
+        h += '<div class="qs-preview-row">' +
+          `<div class="qs-preview-name"><b>${VCS.esc(item.name || '未命名')}</b>` +
+          `<span title="${VCS.esc(item.path || '')}">${VCS.esc(item.path || '')}</span></div>` +
+          `<div><span class="qs-status ${st[0]}">${st[1]}</span>` +
+          (missing.length
+            ? `<span class="qs-missing${item.can_build ? '' : ' bad'}">缺：${VCS.esc(missing.join('、'))}</span>`
+            : '<span class="qs-missing">文件完整</span>') + '</div>' +
+          `<div class="qs-preview-msg">${VCS.esc(item.message || '')}</div></div>`;
+      });
+    }
+    h += '</div>';
+    box.innerHTML = h;
+    qsUpdateBuildButton();
+  }
+  async function qsScan() {
+    const seq = ++QS.scanSeq;
+    if (!QS.files.length) {
+      QS.scan = null; QS.scanning = false; renderQsPreview(null); return null;
+    }
+    QS.scanning = true;
+    const box = $('#qs-preview');
+    if (box) {
+      box.hidden = false;
+      box.innerHTML = '<div class="qs-preview-head"><strong>正在递归扫描目录并检查四件套…</strong></div>';
+    }
+    qsUpdateBuildButton();
+    let r;
+    try {
+      r = await VCS.call('quick_submit_scan', QS.files, qsSharedIncar());
+    } catch (e) {
+      r = { ok: false, error: String(e), items: [], summary: {} };
+    }
+    if (seq !== QS.scanSeq) return null;
+    QS.scanning = false;
+    QS.scan = r;
+    renderQsPreview(r);
+    return r;
+  }
+  function qsSuggestOut(path, isDir) {
+    const out = $('#qs-out');
+    if (!out || out.value.trim() || !path) return;
+    const clean = String(path).replace(/[\\/]+$/, '');
+    if (isDir) out.value = clean + '_vcstudio_jobs';
+    else {
+      const m = clean.match(/^(.*)[\\/][^\\/]+$/);
+      out.value = (m ? m[1] + clean.slice(m[1].length, m[1].length + 1) : '') + 'vcstudio_jobs';
+    }
   }
   async function qsAdd() {
     const r = await VCS.call('pick_file', 'input');
     if (r && r.error) { VCS.log('选择文件失败:' + r.error, 'failc'); return; }
-    if (r && r.path && QS.files.indexOf(r.path) < 0) { QS.files.push(r.path); renderQsFiles(); }
+    if (r && r.path && QS.files.indexOf(r.path) < 0) {
+      QS.files.push(r.path); renderQsFiles(); qsSuggestOut(r.path, false); await qsScan();
+    }
+  }
+  async function qsAddVaspDir() {
+    const r = await VCS.call('pick_dir');
+    if (r && r.error) { VCS.log('选择目录失败:' + r.error, 'failc'); return; }
+    if (r && r.path && QS.files.indexOf(r.path) < 0) {
+      QS.files.push(r.path);
+      renderQsFiles();
+      qsSuggestOut(r.path, true);
+      VCS.log('正在扫描父目录:' + r.path);
+      const scan = await qsScan();
+      if (scan && scan.ok) {
+        const s = scan.summary || {};
+        VCS.log(`已发现 ${s.total || 0} 个候选作业：完整 ${s.ready || 0}，` +
+          `可自动补齐 ${s.generatable || 0}，需处理 ${s.blocked || 0}`, 'okc');
+      }
+    }
   }
   async function qsBuild() {
-    if (!QS.files.length) { VCS.log('快速提交:请先添加输入文件', 'failc'); return; }
+    if (!QS.files.length) { VCS.log('快速提交:请先添加 VASP 目录或输入文件', 'failc'); return; }
+    if (!QS.scan || QS.scanning) await qsScan();
+    if (!qsBuildable()) {
+      VCS.log('没有可建作业。若只有 POSCAR/CONTCAR，请先选择共享 INCAR；并检查预检中的缺项。', 'failc');
+      return;
+    }
     const out = ($('#qs-out') && $('#qs-out').value.trim()) || '';
     if (!out) { VCS.log('快速提交:请选择输出根目录', 'failc'); return; }
-    VCS.log('快速批量提交建作业(' + QS.files.length + ' 个文件)…');
-    const r = await VCS.call('quick_submit_build', QS.files, out, '');
+    const shared = qsSharedIncar();
+    const lib = ($('#qs-lib') && $('#qs-lib').value.trim()) || '';
+    const calcType = ($('#qs-calc-type') && $('#qs-calc-type').value) || 'slab';
+    VCS.log('正在生成 / 导入 ' + qsBuildable() + ' 个作业；源文件保持不变…');
+    const r = await VCS.call(
+      'quick_submit_build', QS.files, out, '', shared, lib, calcType);
     if (!r || r.ok === false || r.error) {
       VCS.log('快速提交失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
     }
@@ -979,9 +1170,25 @@
       if (j.hint) VCS.log('  提交命令模板:' + j.hint);
     });
     (r.skipped || []).forEach(s => VCS.log('跳过 ' + s.file + ':' + s.reason, 'warnc'));
-    VCS.log('已建 ' + (r.jobs || []).length + ' 个作业并入台账,勾选后可上传提交', 'okc');
-    VCS.toast('已建 ' + (r.jobs || []).length + ' 个作业');
+    const made = r.jobs || [];
+    VCS.log('已建 ' + made.length + ' 个作业并入台账', 'okc');
+    VCS.toast('已准备 ' + made.length + ' 个作业');
     await reload();
+    // 新作业自动勾选；用户仍能在真正远程提交的确认框前增删选择。
+    const present = new Set(State.rows.map(row => row.dir));
+    let selected = 0;
+    made.forEach(job => {
+      if (present.has(job.dir)) { State.selected.add(job.dir); selected += 1; }
+    });
+    renderTable();
+    const next = $('#qs-next');
+    if (next && made.length) {
+      next.hidden = false;
+      if ($('#qs-next-title')) $('#qs-next-title').textContent = `已准备 ${made.length} 个作业`;
+      if ($('#qs-next-note')) $('#qs-next-note').textContent =
+        `其中 ${selected} 个已在下方自动勾选；提交前仍会显示集群与远程目录确认。`;
+      next.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
   }
 
   // ── 文件管理:列远端目录 + 下载选中 ──
@@ -1127,6 +1334,7 @@
   function init() {
     wire('jb-submit', doSubmit);
     wire('jb-status', () => runStatus(false));
+    wire('jb-status-all', () => runAllStatus(false));
     wire('jb-fetch', doFetch);
     wire('jb-continue', doContinue);
     wire('jb-spin', doSpinCompare);
@@ -1148,18 +1356,44 @@
     });
     // 快速批量提交
     wire('qs-add', qsAdd);
-    wire('qs-clearfiles', () => { QS.files = []; renderQsFiles(); });
+    wire('qs-add-dir', qsAddVaspDir);
+    wire('qs-clearfiles', () => {
+      QS.files = []; QS.scan = null; QS.scanSeq += 1; QS.scanning = false;
+      renderQsFiles(); renderQsPreview(null);
+      const next = $('#qs-next'); if (next) next.hidden = true;
+    });
+    wire('qs-incar-btn', async () => {
+      const r = await VCS.call('pick_file', 'incar');
+      if (r && r.error) { VCS.log('选择 INCAR 失败:' + r.error, 'failc'); return; }
+      if (r && r.path && $('#qs-incar')) {
+        $('#qs-incar').value = r.path;
+        VCS.log('已选择共享 INCAR，重新检查可自动补齐的结构…');
+        await qsScan();
+      }
+    });
+    wire('qs-lib-btn', async () => {
+      const r = await VCS.call('pick_dir');
+      if (r && r.error) { VCS.log('选择赝势库失败:' + r.error, 'failc'); return; }
+      if (r && r.path && $('#qs-lib')) $('#qs-lib').value = r.path;
+    });
     wire('qs-out-btn', async () => {
       const r = await VCS.call('pick_dir');
       if (r && r.path && $('#qs-out')) $('#qs-out').value = r.path;
     });
     wire('qs-build', qsBuild);
+    wire('qs-go-submit', doSubmit);
+    const qsi = $('#qs-incar');
+    if (qsi) qsi.addEventListener('change', qsScan);
     const qsl = $('#qs-filelist');
     if (qsl) qsl.addEventListener('click', e => {
       const rm = e.target.closest('[data-rm]');
-      if (rm) { QS.files.splice(parseInt(rm.dataset.rm, 10), 1); renderQsFiles(); }
+      if (rm) {
+        QS.files.splice(parseInt(rm.dataset.rm, 10), 1);
+        renderQsFiles(); qsScan();
+      }
     });
     renderQsFiles();
+    qsUpdateBuildButton();
     // 文件管理
     wire('fm-ls', fmList);
     wire('fm-fetch', fmFetch);
@@ -1195,8 +1429,19 @@
       applyAuto(true);                               // 启动静默装载定时器(不写日志)
     }
     const psel = $('#jobs-profile');
-    if (psel) psel.addEventListener('change', () =>
-      localStorage.setItem(PROFILE_KEY, currentProfile()));
+    if (psel) psel.addEventListener('change', () => {
+      const name = currentProfile();
+      localStorage.setItem(PROFILE_KEY, name);
+      let removed = 0;
+      State.selected.forEach(d => {
+        const row = State.rows.find(r => r.dir === d);
+        if (row && row.cluster && row.cluster !== name) {
+          State.selected.delete(d); removed++;
+        }
+      });
+      if (removed) VCS.log(`切换服务器后已取消 ${removed} 个其它服务器作业的勾选`, 'warnc');
+      renderTable();
+    });
     bindTable();
     reload();
   }

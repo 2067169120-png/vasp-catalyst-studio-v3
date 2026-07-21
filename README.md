@@ -1,6 +1,6 @@
 # VASP Catalyst Studio (vcstudio)
 
-Desktop **full-DFT computing platform** with an autopilot pipeline — from
+Desktop **full-DFT computing platform** with a managed pipeline — from
 structure to paper in one place. Two workflow lines: a **periodic catalysis
 main line** (SAC batch modeling → 23-type task catalog → multi-cluster
 submission → failure diagnosis → bounded self-healing → ΔE/ΔG/electronic
@@ -20,7 +20,7 @@ in the numeric chain) and fully offline operation.
 ## 软件流程图 · Workflow
 
 双线工作流:**周期性催化主线**(①结构建模 → ②生成输入(23 种任务目录)→ ③提交计算 →
-自动驾驶环(监控→诊断→自愈≤3轮)→ ④结果分析 → ⑥论文出图 → 产出)与
+自动托管环(监控→诊断→续算≤3轮)→ ④结果分析 → ⑥论文出图 → 产出)与
 **分子计算线**(图片识别 → 3D 建模 → Gaussian → ⑤波函数分析 → VMD 渲染),
 共同跑在 **campaign 控制面**(任务 DAG/三态/三门禁)上,⑦AI 助手横贯全程但绝不进数值链路:
 
@@ -150,7 +150,35 @@ silent (job.yaml state machine + audit history).
 
 ### v3.2.0(2026-07-18):全 DFT 计算平台
 
-**23 种计算类型目录**(收敛扫描/能带/EOS/功函数/表面能/Dimer/VASPsol/DFT+U 值库等全补齐,选类型→派生→解析→出图闭环);**一键出图管线**(自动驾驶终点场景感知整套图+多面板拼版+图表溯源,计算活动模板全链自动推进);**AI 数据闭环**(论文数据表抽取→复现 MAE 自动对照→变体矩阵推荐→论文草稿骨架);starpivot 细节对齐(一键依赖安装/核时四卡/波函数 16 种/Fukui·ELF-LOL·散点图)。**2051 测试通过(6 跳过)**。
+**23 种计算类型目录**(收敛扫描/能带/EOS/功函数/表面能/Dimer/VASPsol/DFT+U 值库等全补齐,选类型→派生→解析→出图闭环);**一键出图管线**(自动托管终点场景感知整套图+多面板拼版+图表溯源,计算活动模板全链自动推进);**AI 数据闭环**(论文数据表抽取→复现 MAE 自动对照→变体矩阵推荐→论文草稿骨架);starpivot 细节对齐(精确依赖检测与可复制安装命令/核时四卡/波函数 16 种/Fukui·ELF-LOL·散点图)。**2051 测试通过(6 跳过)**。
+
+### 2026-07-20：本地结果导入与 Li-S 一站式流程
+
+- 结果分析页可递归导入一个完整文件夹；仅有 `CONTCAR/OSZICAR/OUTCAR/vasprun.xml`
+  的已算结果也能按多证据收敛门槛识别，不要求它原先属于集群台账。
+- Li-S 向导复用已导入的分子参考能：固定 `INCAR` + clean slab POSCAR + 多个
+  adsorption POSCAR 自动补齐四件套；用户选择服务器、核数和墙时后可整组提交。
+- 自动托管在软件保持运行时监控、最多续算 3 轮、下载关键结果，并在整组完成后
+  自动计算吸附能和生成报告。
+- 依赖入口改为“检测 → 推荐勾选 → 复制可直接执行的 PowerShell/终端命令 → 重新检测”。
+  冻结 EXE 不再把自身误当 Python 启动；完整版 EXE 的图表与 RDKit 能力在打包时内置。
+- 设置页顶部新增“工作模式 + 本次计算类型”：常用模式为 Li-S 吸附能、通用 VASP、
+  分子计算和专家模式。选择后导航、计算引擎、任务目录和专用表单会同步裁剪，只保留
+  本次需要的入口；23 种 DFT 类型都具备可到达的生成器、计算器或专用流程。
+- 通用 DFT 派生作业统一写标准 `job.yaml`，不再把未知任务静默当作弛豫；提交、状态判定
+  和默认结果下载按任务类型选择输入/产物，能带、Bader、ELF、功函数、AIMD 等不会再漏文件。
+- 任务页可一次刷新所有已配置服务器上的活动作业。每台服务器独立使用自己的凭据、队列
+  方言、远端目录和引擎命令；单台连接失败不会阻塞其它服务器的监控结果。
+- 远程操作新增服务器归属硬闸：下载、续算、取消不能跨服务器；已提交/DONE 作业不能重复
+  提交；同批远端目录冲突在联网前整批阻止。结果下载采用临时文件完成后原子替换，中断时
+  不会截断本地已有结果。
+- Gaussian、CP2K、CASTEP 输入生成后直接写标准清单并入台账，可走提交、监控、任务类型下载、
+  引擎原生能量解析和带文件指纹报告；不会再误读 VASP 的 `OSZICAR`。
+- VASPsol 改为一次派生同几何真空/溶剂双作业；只有两者均 DONE、方法/几何一致且溶剂
+  `OUTCAR` 能证明 VASPsol 补丁生效时，才计算 `E_sol−E_vac` 并生成报告。
+- NEB 会把真实端点能量文件及 SHA256 带入 `00`/末态，Bader 在没有 `ACF.dat` 时只显示
+  产物证据和下一步，不再假称已完成自动解析。表面能、形成/结合能、差分电荷和多自旋比较
+  都会生成专用可追溯报告；大数相减前强制 DONE/完整页脚/方法一致性门槛。
 
 ## Install & quickstart
 
@@ -200,7 +228,7 @@ via [CITATION.cff](CITATION.cff). Licensed under [MIT](LICENSE).
 
 ## 中文速览
 
-全 DFT 计算桌面自动驾驶平台:从结构到论文一站式。周期性催化主线(SAC 批量建模 →
+全 DFT 计算桌面自动托管平台:从结构到论文一站式。周期性催化主线(SAC 批量建模 →
 23 种计算类型 → 多集群提交 → 诊断自愈 → ΔE/ΔG/电子结构/NEB → 一键整套论文图 →
 报告与论文骨架)+ 分子线(图片识别 → 3D 建模 → Gaussian → Multiwfn 波函数 16 种 →
 VMD 渲染),跑在 campaign 控制面上(任务 DAG/三态门禁/方法指纹/机时闸)。

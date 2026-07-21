@@ -105,9 +105,9 @@ CATALOG = [
      'builder_ref': 'vcstudio.project.references:binding_energy',
      'requires': '体系能 + 参考态能', 'outputs': 'E_form / E_bind (eV)', 'figure': None},
     {'key': 'vaspsol', 'name_zh': 'VASPsol 隐式溶剂化', 'category': '性质',
-     'description': 'LSOL/EB_K 隐式溶剂化(需 VASPsol 补丁编译);真空/溶剂同几何相减得溶剂化能。',
-     'builder_ref': 'vcstudio.generate.incar_builder:vaspsol_keys',
-     'requires': '完成真空弛豫 + VASPsol 版 VASP', 'outputs': '溶剂化单点能', 'figure': None},
+     'description': '一次派生同几何真空/溶剂静态配对；完成后严格核对方法并计算 E_sol−E_vac。',
+     'builder_ref': 'vcstudio.generate.vaspsol_pair:build_pair',
+     'requires': '已完成结构 + VASPsol 版 VASP', 'outputs': '真空/溶剂配对 + ΔE_solv 报告', 'figure': None},
 
     # ── 收敛与校验 ──────────────────────────────────────────────────────────────
     {'key': 'conv_encut', 'name_zh': '收敛扫描:ENCUT', 'category': '收敛与校验',

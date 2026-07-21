@@ -85,6 +85,9 @@ def test_build_wf_job_sets_lvtot(tmp_path):
     assert res['dipole'] is False                        # 对称 slab 不加偶极
     m = manifest_mod.load_manifest(tmp_path / 'wf')
     assert m['task_type'] == 'workfunction'
+    assert set(m['inputs']['files']) == {'INCAR', 'POSCAR', 'KPOINTS', 'POTCAR'}
+    assert set(m['inputs']['sha256']) == {'INCAR', 'POSCAR', 'KPOINTS', 'POTCAR'}
+    assert m['inputs']['purpose'] == 'esp'
 
 
 def test_build_wf_job_asymmetric_adds_dipole(tmp_path):

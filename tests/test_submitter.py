@@ -67,15 +67,23 @@ class _FakeRemoteFile:
 
 
 class FakeSFTP:
-    def __init__(self):
+    def __init__(self, missing=()):
         self.uploaded = {}     # remote → local
         self.written = {}      # remote → text
+        self.missing = set(missing)
 
     def put(self, local, remote):
         self.uploaded[remote] = local
 
     def file(self, path, mode='w'):
         return _FakeRemoteFile(self.written, path)
+
+    def get(self, remote, local):
+        name = posixpath.basename(remote)
+        if name in self.missing:
+            raise IOError(f'no such file: {remote}')
+        with open(local, 'w', encoding='utf-8') as f:
+            f.write(f'fresh {name}\n')
 
 
 def _profile(**kw):
@@ -102,6 +110,18 @@ def _job_dir(tmp_path):
     res = build_job_dir(str(poscar), 'ENCUT = 400\n', str(out),
                         calc_type='slab', lib_root=str(lib))
     manifest.create_from_build(str(out), res, poscar_path=str(poscar), validate=True)
+    return str(out)
+
+
+def _quick_job_dir(tmp_path, engine='cp2k', filename='calc.inp'):
+    out = tmp_path / f'{engine}_job'
+    out.mkdir(parents=True)
+    (out / filename).write_text('&GLOBAL\n  RUN_TYPE ENERGY\n&END GLOBAL\n',
+                                encoding='utf-8')
+    m = manifest.new_manifest(
+        job_id=f'{engine}-1', system=out.name, task_type='quick', calc_type='',
+        inputs={'engine': engine, 'files': [filename]})
+    manifest.save_manifest(out, m)
     return str(out)
 
 
@@ -158,6 +178,147 @@ def test_submit_job_happy_path_pbs(tmp_path):
     assert manifest.load_manifest(d)['state'] == 'SUBMITTED'   # 已落盘
 
 
+def test_submit_refuses_any_existing_remote_identity_or_non_created_state(tmp_path):
+    """通用提交不可复用已有远端身份，尤其不能把 RUNNING 作业双提交到同一目录。"""
+    d = _job_dir(tmp_path)
+    submitter.submit_job(
+        FakeClient(script=[('qsub', '8812345.cluster\n')]), FakeSFTP(), _profile(), d)
+    client, sftp = FakeClient(), FakeSFTP()
+    with pytest.raises(ValueError, match='仅全新的 CREATED|拒绝重复提交'):
+        submitter.submit_job(client, sftp, _profile(), d)
+    assert client.commands == [] and sftp.uploaded == {}
+
+    fresh = _job_dir(tmp_path / 'fresh')
+    data = manifest.load_manifest(fresh)
+    data['cluster'] = 'old-server'                 # 即便 state 仍 CREATED，也不是全新清单
+    manifest.save_manifest(fresh, data)
+    assert any('远端身份' in issue for issue in submitter.preflight(_profile(), fresh))
+
+
+def test_non_vasp_missing_own_command_hard_blocks_before_network(tmp_path):
+    d = _quick_job_dir(tmp_path, 'cp2k')
+    profile = _profile()  # 只有 vasp_cmd，不得被 CP2K 借用
+    errs = submitter.preflight(profile, d)
+    assert not any('四件套' in issue for issue in errs)
+    assert any('engine_commands.cp2k' in issue and '不会用 VASP' in issue
+               for issue in errs)
+
+    client, sftp = FakeClient(), FakeSFTP()
+    with pytest.raises(ValueError, match=r'engine_commands\.cp2k'):
+        submitter.submit_job(client, sftp, profile, d)
+    assert client.commands == [] and sftp.uploaded == {} and sftp.written == {}
+
+
+def test_non_vasp_command_selected_rendered_and_only_declared_inputs_uploaded(tmp_path):
+    d = _quick_job_dir(tmp_path, 'cp2k', 'water.inp')
+    profile = _profile(
+        nodes=2, ppn=8,
+        engine_commands={
+            'cp2k': 'srun -n {cores} cp2k.psmp -i {input} -o {stem}.out',
+        })
+    assert submitter.preflight(profile, d) == []
+
+    client = FakeClient(script=[('qsub', '42.cluster\n')])
+    sftp = FakeSFTP()
+    m = submitter.submit_job(client, sftp, profile, d)
+
+    remote = '/work/sk2067/jobs/cp2k_job'
+    script = sftp.written[posixpath.join(remote, 'vcs_job.sh')]
+    assert 'srun -n 16 cp2k.psmp -i water.inp -o water.out' in script
+    assert 'vasp_std' not in script
+    assert set(sftp.uploaded) == {posixpath.join(remote, 'water.inp')}
+    assert m['attempts'][0]['engine'] == 'cp2k'
+
+
+@pytest.mark.parametrize('task_type,extra,reason', [
+    ('bands', 'CHGCAR', 'ICHARG=11'),
+    ('dimer', 'MODECAR', 'Dimer'),
+])
+def test_vasp_task_specific_inputs_are_required_and_uploaded(
+        tmp_path, task_type, extra, reason):
+    """派生任务的硬输入必须随四件套上传；缺失时联网前给出可行动错误。"""
+    d = _job_dir(tmp_path)
+    data = manifest.load_manifest(d)
+    data['task_type'] = task_type
+    manifest.save_manifest(d, data)
+
+    errs = submitter.preflight(_profile(), d)
+    assert any(extra in issue and reason in issue for issue in errs)
+
+    with open(os.path.join(d, extra), 'w', encoding='utf-8') as handle:
+        handle.write('required task input\n')
+    assert submitter.preflight(_profile(), d) == []
+    client = FakeClient(script=[('qsub', '711.cluster\n')])
+    sftp = FakeSFTP()
+    submitter.submit_job(client, sftp, _profile(), d)
+    assert posixpath.join('/work/sk2067/jobs/zn_job', extra) in sftp.uploaded
+
+
+@pytest.mark.parametrize('task_type,expected', [
+    ('static', ('vasprun.xml', 'CHGCAR')),
+    ('dos_pdos', ('DOSCAR', 'vasprun.xml')),
+    ('bands', ('EIGENVAL', 'vasprun.xml')),
+    ('bader', ('CHGCAR', 'AECCAR0', 'AECCAR2', 'ACF.dat')),
+    ('chgdiff', ('CHGCAR',)),
+    ('elf', ('ELFCAR',)),
+    ('workfunction', ('LOCPOT',)),
+    ('aimd', ('XDATCAR',)),
+])
+def test_fetch_bundle_is_task_aware(task_type, expected):
+    m = {'task_type': task_type, 'inputs': {'engine': 'vasp'}}
+    files = submitter.fetch_files_for_manifest(m)
+    assert files[:3] == submitter.FETCH_FILES
+    assert files[3:] == expected
+
+
+def test_fetch_bundle_understands_legacy_estatic_purpose_and_other_engines():
+    m = {'task_type': 'static', 'inputs': {'purpose': 'bader'}}
+    assert submitter.fetch_files_for_manifest(m)[3:] == (
+        'CHGCAR', 'AECCAR0', 'AECCAR2', 'ACF.dat')
+    cp2k = {'task_type': 'quick',
+            'inputs': {'engine': 'cp2k', 'files': ['water.inp']}}
+    assert submitter.fetch_files_for_manifest(cp2k) == ('water.out',)
+    cp2k['inputs']['output_files'] = ['custom.out', '../escape']
+    # 非法项不参与远程路径；合法显式输出仍可用。
+    assert submitter.fetch_files_for_manifest(cp2k) == ('custom.out',)
+
+
+def test_unknown_engine_and_manifest_path_traversal_are_hard_blocked(tmp_path):
+    unknown = _quick_job_dir(tmp_path / 'unknown', 'orca', 'calc.inp')
+    assert any('不支持的计算引擎' in issue
+               for issue in submitter.preflight(_profile(), unknown))
+
+    unsafe = _quick_job_dir(tmp_path / 'unsafe', 'cp2k', 'safe.inp')
+    data = manifest.load_manifest(unsafe)
+    data['inputs']['files'] = ['../secret.inp']
+    manifest.save_manifest(unsafe, data)
+    (tmp_path / 'unsafe' / 'secret.inp').write_text('secret', encoding='utf-8')
+    assert any('文件名非法' in issue
+               for issue in submitter.preflight(
+                   _profile(engine_commands={'cp2k': 'cp2k -i {input}'}), unsafe))
+
+
+def test_non_vasp_template_requires_command_placeholder(tmp_path):
+    d = _quick_job_dir(tmp_path, 'gaussian', 'water.gjf')
+    command = {'gaussian': 'g16 < {input} > {stem}.log'}
+    bad = tmp_path / 'bad.sh'
+    bad.write_text('#!/bin/bash\nvasp_std\n', encoding='utf-8')
+    bad_profile = _profile(
+        script_mode='template', template_path=str(bad), engine_commands=command)
+    assert any('{command}' in issue and '防止误跑 VASP' in issue
+               for issue in submitter.preflight(bad_profile, d))
+    with pytest.raises(ValueError, match=r'\{command\}'):
+        submitter.build_script_text(bad_profile, d)
+
+    good = tmp_path / 'good.sh'
+    good.write_text('#!/bin/bash\ncd {remote_dir}\n{command}\n', encoding='utf-8')
+    good_profile = _profile(
+        script_mode='template', template_path=str(good), engine_commands=command)
+    assert submitter.preflight(good_profile, d) == []
+    script = submitter.build_script_text(good_profile, d)
+    assert 'g16 < water.gjf > water.log' in script and 'vasp_std' not in script
+
+
 def test_submit_job_failure_keeps_uploaded(tmp_path):
     d = _job_dir(tmp_path)
     client = FakeClient(script=[('qsub', 'qsub: Unauthorized Request\n')])
@@ -179,7 +340,7 @@ def test_refresh_job_states(tmp_path):
     assert m['state'] == 'RUNNING'
     # 调度器消失 + 收敛 + OSZICAR E0 → DONE + 能量
     done_client = FakeClient(script=[
-        ('grep -c', '1\n'),
+        ('grep -c', '1\n1\n0\n'),
         ('tail -n 150', '   5 F= -.43561190E+03 E0= -.43561154E+03  d E =-.10E-05\n'),
     ])
     m = submitter.refresh_job(done_client, _profile(), d, live_states={})
@@ -231,7 +392,7 @@ def test_submit_and_refresh_quote_spaced_remote_dir(tmp_path):
     assert f"cd '{remote}'" in sftp.written[posixpath.join(remote, 'vcs_job.sh')]
 
     done_client = FakeClient(script=[
-        ('grep -c', '1\n'),
+        ('grep -c', '1\n1\n0\n'),
         ('tail -n 150', '   5 F= -.5E+01 E0= -.5E+01  d E =-.1E-05\n'),
     ])
     m = submitter.refresh_job(done_client, prof, d, live_states={})
@@ -270,7 +431,7 @@ def test_refresh_job_converged_but_positive_energy_needs_human(tmp_path):
     d = _job_dir(tmp_path)
     submitter.submit_job(FakeClient(script=[('qsub', '57.c\n')]), FakeSFTP(), _profile(), d)
     client = FakeClient(script=[
-        ('grep -c', '1\n'),
+        ('grep -c', '1\n1\n0\n'),
         ('tail -n 150', '   5 F= 0.5E+01 E0= 0.5E+01  d E =0.1E-05\n'),
         ('stat -c', 'OUTCAR 90000\nOSZICAR 3000\n'),
     ])
@@ -298,6 +459,19 @@ def _restartable_job(tmp_path, rounds=0, restartable=True, fclass='NONCONVERGED'
 
 def test_continue_from_contcar_happy(tmp_path):
     d = _restartable_job(tmp_path)
+    old = manifest.load_manifest(d)
+    old['results'].update({
+        'fetched': ['CONTCAR', 'OSZICAR', 'OUTCAR'],
+        'fetched_missing': [],
+        'missing': ['legacy-name'],
+        'fetched_at': '2026-01-01T00:00:00',
+        'fetched_job_id': '100',
+        'fetched_remote_dir': old['remote_dir'],
+    })
+    manifest.save_manifest(d, old)
+    for name in ('CONTCAR', 'OSZICAR', 'OUTCAR'):
+        with open(os.path.join(d, name), 'w', encoding='utf-8') as f:
+            f.write('old local result\n')
     client = FakeClient(script=[('cat', _VALID_CONTCAR), ('qsub', '201.c\n')])
     m = submitter.continue_from_contcar(client, _profile(), d)
     assert m['state'] == 'SUBMITTED' and m['scheduler_job_id'] == '201'
@@ -308,6 +482,106 @@ def test_continue_from_contcar_happy(tmp_path):
     assert 'cp CONTCAR POSCAR' in ' '.join(client.commands)     # 远端提升 + 冻结 INCAR
     assert any('rm -f WAVECAR CHGCAR' in c for c in client.commands)  # 清混合历史
     assert 'diagnosis' not in m['results']                      # 上一轮诊断已消费,防再次误用
+    for key in ('fetched', 'fetched_missing', 'missing', 'fetched_at',
+                'fetched_job_id', 'fetched_remote_dir'):
+        assert key not in m['results']                           # 新轮尚未下载，旧证据清零
+    assert os.path.isfile(os.path.join(d, 'OUTCAR'))             # 旧文件保留作审计，不算新轮证据
+
+
+def test_continue_refuses_wrong_cluster_before_remote_mutation(tmp_path):
+    d = _restartable_job(tmp_path)
+    client = FakeClient()
+    with pytest.raises(ValueError, match='属于服务器「1w」'):
+        submitter.continue_from_contcar(client, _profile(name='other'), d)
+    assert client.commands == []
+
+
+def test_bands_continue_preserves_required_chgcar(tmp_path):
+    d = _restartable_job(tmp_path)
+    data = manifest.load_manifest(d)
+    data['task_type'] = 'bands'
+    manifest.save_manifest(d, data)
+    client = FakeClient(script=[('cat', _VALID_CONTCAR), ('qsub', '203.c\n')])
+    submitter.continue_from_contcar(client, _profile(), d)
+    commands = ' '.join(client.commands)
+    assert 'rm -f WAVECAR' in commands
+    assert 'rm -f WAVECAR CHGCAR' not in commands
+
+
+def test_generic_neb_continue_is_blocked_without_remote_commands(tmp_path):
+    d = _restartable_job(tmp_path)
+    data = manifest.load_manifest(d)
+    data['task_type'] = 'neb'
+    manifest.save_manifest(d, data)
+    client = FakeClient()
+    with pytest.raises(ValueError, match='NEB 不能使用通用 CONTCAR 续算'):
+        submitter.continue_from_contcar(client, _profile(), d)
+    assert client.commands == []
+
+
+def test_continue_with_incar_changes_clears_fetch_evidence(tmp_path):
+    d = _restartable_job(tmp_path)
+    old = manifest.load_manifest(d)
+    old['results'].update({
+        'fetched': ['OUTCAR'], 'fetched_missing': ['CONTCAR'],
+        'fetched_at': '2026-01-01T00:00:00', 'fetched_job_id': '100',
+        'fetched_remote_dir': old['remote_dir'],
+    })
+    manifest.save_manifest(d, old)
+
+    client = FakeClient(script=[
+        ('cat', _VALID_CONTCAR),
+        ('stat -c', 'OUTCAR 90000 1000\nOSZICAR 3000 1000\n'),
+        ('qsub', '202.c\n'),
+    ])
+    m = submitter.continue_with_incar_changes(
+        client, FakeSFTP(), _profile(), d, {'ALGO': 'Normal'})
+
+    assert m['scheduler_job_id'] == '202'
+    assert m['results']['continue_rounds'] == 1
+    for key in ('fetched', 'fetched_missing', 'missing', 'fetched_at',
+                'fetched_job_id', 'fetched_remote_dir'):
+        assert key not in m['results']
+
+
+def test_bands_tuned_restart_also_preserves_chgcar(tmp_path):
+    d = _restartable_job(tmp_path)
+    data = manifest.load_manifest(d)
+    data['task_type'] = 'bands'
+    manifest.save_manifest(d, data)
+    client = FakeClient(script=[
+        ('cat', _VALID_CONTCAR),
+        ('stat -c', 'OUTCAR 90000 1000\nOSZICAR 3000 1000\n'),
+        ('qsub', '204.c\n'),
+    ])
+    submitter.continue_with_incar_changes(
+        client, FakeSFTP(), _profile(), d, {'ALGO': 'Normal'})
+    commands = ' '.join(client.commands)
+    assert 'rm -f WAVECAR' in commands
+    assert 'rm -f WAVECAR CHGCAR' not in commands
+
+
+def test_fetch_results_records_current_job_and_missing(tmp_path):
+    d = _job_dir(tmp_path)
+    submitter.submit_job(
+        FakeClient(script=[('qsub', '301.cluster\n')]), FakeSFTP(), _profile(), d)
+    before = manifest.load_manifest(d)
+    before.setdefault('results', {})['missing'] = ['stale-old-round']
+    manifest.save_manifest(d, before)
+
+    fetched, missing = submitter.fetch_results(
+        FakeClient(), FakeSFTP(missing=('OUTCAR',)), d)
+
+    assert fetched == ['CONTCAR', 'OSZICAR', 'vasprun.xml', 'CHGCAR']
+    assert missing == ['OUTCAR']
+    updated = manifest.load_manifest(d)
+    results = updated['results']
+    assert results['fetched'] == fetched
+    assert results['fetched_missing'] == missing
+    assert results['fetched_at']
+    assert results['fetched_job_id'] == '301'
+    assert results['fetched_remote_dir'] == updated['remote_dir']
+    assert 'missing' not in results
 
 
 def test_continue_refuses_live_job(tmp_path):
@@ -390,7 +664,7 @@ def test_continue_then_still_queued_stays_submitted(tmp_path):
     # 且旧 OUTCAR 还带收敛串 + E0 —— 正是会被误判 DONE 的陷阱
     refresh_client = FakeClient(script=[
         ('stat -c', 'OUTCAR 90000 1000\nOSZICAR 3000 1000\n'),
-        ('grep -c', '1\n'),
+        ('grep -c', '1\n1\n0\n'),
         ('tail -n 150', '   5 F= -.5E+01 E0= -.5E+01  d E =-.1E-05\n'),
     ])
     m = submitter.refresh_job(refresh_client, _profile(), d, live_states={})
@@ -406,7 +680,7 @@ def test_continue_then_new_run_rewrote_outcar_classifies(tmp_path):
     # 新一轮把 OUTCAR 重写到 mtime=2000,收敛,GONE → DONE
     refresh_client = FakeClient(script=[
         ('stat -c', 'OUTCAR 95000 2000\nOSZICAR 3200 2000\n'),
-        ('grep -c', '1\n'),
+        ('grep -c', '1\n1\n0\n'),
         ('tail -n 150', '   5 F= -.5E+01 E0= -.5E+01  d E =-.1E-05\n'),
     ])
     m = submitter.refresh_job(refresh_client, _profile(), d, live_states={})
@@ -451,12 +725,121 @@ def test_fresh_submit_gone_still_classifies_immediately(tmp_path):
 def test_grep_converged_static_uses_electronic_mark(tmp_path):
     """static/dos/band(NSW=0)永远不出'reached required accuracy'(离子标志),
     改查电子收敛标志,否则收敛的静态作业被误判未收敛(review-round2 收尾)。"""
-    client = FakeClient(script=[('grep -c', '1\n')])
+    client = FakeClient(script=[('grep -c', '1\n1\n0\n')])
     submitter._grep_converged(client, '/w/j', 'static')
     assert 'aborting loop because EDIFF is reached' in client.commands[-1]
-    client2 = FakeClient(script=[('grep -c', '1\n')])
+    client2 = FakeClient(script=[('grep -c', '1\n1\n0\n')])
     submitter._grep_converged(client2, '/w/j', 'relax')
     assert 'reached required accuracy' in client2.commands[-1]
+
+
+@pytest.mark.parametrize('task_type', [
+    'static', 'dos_pdos', 'bands', 'bader', 'chgdiff', 'elf', 'eos',
+    'workfunction', 'vaspsol', 'conv_scan',
+])
+def test_all_electronic_tasks_use_ediff_completion(task_type):
+    client = FakeClient(script=[('grep -c', '1\n1\n0\n')])
+    converged, _clean, _stopped = submitter._grep_marks(client, '/w/j', task_type)
+    assert converged is True
+    assert 'aborting loop because EDIFF is reached' in client.commands[-1]
+
+
+def test_static_marker_without_clean_footer_is_not_done(tmp_path):
+    """旧收敛串 + 截断 OUTCAR 必须交人工，不得 DONE/自动续算。"""
+    d = _job_dir(tmp_path)
+    submitter.submit_job(FakeClient(script=[('qsub', '63.c\n')]), FakeSFTP(), _profile(), d)
+    client = FakeClient(script=[
+        ('grep -c', '1\n0\n0\n'),
+        ('stat -c', 'OUTCAR 90000\nOSZICAR 3000\n'),
+        ('tail -n 150', '1 F= -10 E0= -10 d E=0\n'),
+    ])
+    m = submitter.refresh_job(client, _profile(), d, live_states={})
+    assert m['state'] == 'NEEDS_HUMAN'
+    assert m['results']['diagnosis']['failure_class'] == 'UNKNOWN'
+    assert m['results']['diagnosis']['clean_exit'] is False
+    assert m['results']['diagnosis']['restartable'] is False
+
+
+def test_clean_footer_with_nonzero_wrapper_exit_is_not_done(tmp_path):
+    d = _job_dir(tmp_path)
+    submitter.submit_job(FakeClient(script=[('qsub', '64.c\n')]), FakeSFTP(), _profile(), d)
+    client = FakeClient(script=[
+        ('grep -c', '1\n1\n0\n'),
+        ('stat -c', 'OUTCAR 90000\nOSZICAR 3000\n'),
+        ('___VCSLOG___', 'EXIT: 1\n___VCSLOG___\n'),
+        ('tail -n 150', '1 F= -10 E0= -10 d E=0\n'),
+    ])
+    m = submitter.refresh_job(client, _profile(), d, live_states={})
+    assert m['state'] == 'NEEDS_HUMAN'
+    assert m['results']['diagnosis']['failure_class'] == 'UNKNOWN'
+    assert m['results']['diagnosis']['exit_code'] == 1
+
+
+def test_frequency_requires_modes_and_clean_footer():
+    complete = FakeClient(script=[('grep -c', '6\n1\n0\n')])
+    assert submitter._grep_marks(complete, '/w/freq', 'freq') == (True, True, False)
+    assert 'THz' in complete.commands[-1]
+
+    partial = FakeClient(script=[('grep -c', '6\n0\n0\n')])
+    assert submitter._grep_marks(partial, '/w/freq', 'freq')[0] is False
+
+
+def test_aimd_requires_requested_step_count_and_clean_footer():
+    short = FakeClient(script=[('grep -c', '99\n1\n0\n')])
+    assert submitter._grep_marks(
+        short, '/w/md', 'aimd', expected_steps=100)[0] is False
+    assert '/OSZICAR' in short.commands[-1] and 'F=' in short.commands[-1]
+
+    complete = FakeClient(script=[('grep -c', '100\n1\n0\n')])
+    assert submitter._grep_marks(
+        complete, '/w/md', 'aimd', expected_steps=100) == (True, True, False)
+
+
+def test_static_running_does_not_emit_false_zero_ionic_step_warning(tmp_path):
+    d = _job_dir(tmp_path)  # helper 的 INCAR 无 NSW，规范推断为 static
+    submitter.submit_job(FakeClient(script=[('qsub', '62.c\n')]), FakeSFTP(), _profile(), d)
+    client = FakeClient()
+    m = submitter.refresh_job(client, _profile(), d, live_states={'62': 'RUNNING'})
+    assert m['state'] == 'RUNNING'
+    assert m['results']['live']['progress_kind'] == 'static'
+    assert m['results']['live']['warning'] == ''
+    assert not any('___VCSLIVE___' in cmd for cmd in client.commands)
+
+
+def test_non_vasp_terminal_uses_own_normal_footer_and_energy(tmp_path):
+    d = _quick_job_dir(tmp_path, 'cp2k', 'water.inp')
+    profile = _profile(engine_commands={
+        'cp2k': 'cp2k.psmp -i {input} -o {stem}.out',
+    })
+    submitter.submit_job(
+        FakeClient(script=[('qsub', '901.cluster\n')]), FakeSFTP(), profile, d)
+    output = ('2400\n___VCSENGINE___\n'
+              ' ENERGY| Total FORCE_EVAL ( QS ) energy [a.u.]: -10.000000\n'
+              ' PROGRAM ENDED AT 2026-07-20 12:00:00\n')
+    client = FakeClient(script=[
+        ('___VCSENGINE___', output),
+        ('___VCSLOG___', 'EXIT: 0\n___VCSLOG___\n'),
+    ])
+    m = submitter.refresh_job(client, profile, d, live_states={})
+    assert m['state'] == 'DONE'
+    assert m['results']['diagnosis']['engine'] == 'cp2k'
+    assert m['results']['diagnosis']['failure_class'] == 'CONVERGED'
+    assert m['results']['energy_e0_eV'] == pytest.approx(-272.11386245988)
+    assert not any('/OUTCAR' in cmd or '/OSZICAR' in cmd for cmd in client.commands)
+
+
+def test_non_vasp_output_without_normal_footer_needs_human(tmp_path):
+    d = _quick_job_dir(tmp_path, 'gaussian', 'mol.gjf')
+    profile = _profile(engine_commands={'gaussian': 'g16 < {input} > {stem}.log'})
+    submitter.submit_job(
+        FakeClient(script=[('qsub', '902.cluster\n')]), FakeSFTP(), profile, d)
+    client = FakeClient(script=[
+        ('___VCSENGINE___', '500\n___VCSENGINE___\nSCF Done: E(RHF) = -2.0\n'),
+        ('___VCSLOG___', 'EXIT: 0\n___VCSLOG___\n'),
+    ])
+    m = submitter.refresh_job(client, profile, d, live_states={})
+    assert m['state'] == 'NEEDS_HUMAN'
+    assert m['results']['diagnosis']['failure_class'] == 'NORMAL_TERMINATION_NOT_FOUND'
 
 
 def test_read_log_targets_job_number(tmp_path):
@@ -517,9 +900,25 @@ def test_build_script_text_template_mode(tmp_path):
     assert '#PBS -N zn_job' in text and 'cd X/zn_job' in text and '-np 12' in text
 
 
+def test_legacy_vasp_template_remains_valid_without_command_placeholder(tmp_path):
+    d = _job_dir(tmp_path)
+    tpl = tmp_path / 'legacy_vasp.sh'
+    tpl.write_text('#!/bin/bash\n#PBS -q batch\nmpirun -np 24 vasp_std\n',
+                   encoding='utf-8')
+    prof = _profile(
+        ppn=0, vasp_cmd='mpirun -np {cores} vasp_std',
+        script_mode='template', template_path=str(tpl))
+
+    assert submitter.preflight(prof, d) == []
+    assert 'mpirun -np 24 vasp_std' in submitter.build_script_text(prof, d)
+
+
 def test_refresh_job_running_live_health(tmp_path):
     """RUNNING 分支活体取数:离子步/|F|max 进度入 manifest;跨轮计数器持久化。"""
     d = _job_dir(tmp_path)
+    current = manifest.load_manifest(d)
+    current['task_type'] = 'relax'
+    manifest.save_manifest(d, current)
     submitter.submit_job(FakeClient(script=[('qsub', '61.c\n')]), FakeSFTP(), _profile(), d)
     live_out = ('4\n___VCSLIVE___\n  FORCES: max atom, RMS   0.031456   0.0122\n'
                 '___VCSLIVE___\nDAV:  12  -0.38E+03  -0.1E-04  x  x  x\n')
@@ -536,3 +935,19 @@ def test_refresh_job_running_live_health(tmp_path):
                                   _profile(), d, live_states={'61': 'RUNNING'})
         assert m['results']['live']['zero_step_polls'] == expect
     assert '首步假死' in m['results']['live']['warning']
+
+
+def test_remote_namespace_isolated_but_legacy_path_stays_compatible(tmp_path):
+    job = _job_dir(tmp_path)
+    profile = _profile()
+    assert submitter._spec_for(profile, job).remote_dir.endswith('/jobs/zn_job')
+    data = manifest.load_manifest(job)
+    data['inputs']['remote_namespace'] = 'lis-a1b2c3d4e5f6'
+    manifest.save_manifest(job, data)
+    assert submitter._spec_for(profile, job).remote_dir.endswith(
+        '/jobs/lis-a1b2c3d4e5f6/zn_job')
+    data['inputs']['remote_namespace'] = '../escape'
+    manifest.save_manifest(job, data)
+    assert any('命名空间非法' in issue for issue in submitter.preflight(profile, job))
+    with pytest.raises(ValueError, match='命名空间非法'):
+        submitter._spec_for(profile, job)

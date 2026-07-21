@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 
@@ -150,7 +151,7 @@ def energy_implausible(e) -> bool:
         v = float(e)
     except (TypeError, ValueError):
         return True
-    return v >= 0 or abs(v) > _ENERGY_ABSURD
+    return not math.isfinite(v) or v >= 0 or abs(v) > _ENERGY_ABSURD
 
 
 def scan_log(log_tail: str) -> str | None:
@@ -303,7 +304,8 @@ def classify(*, scheduler_reason: str | None = None, exit_code: int | None = Non
              stopped: bool = False) -> Diagnosis:
     """单一决策点:所有取证证据 → Diagnosis。
 
-    优先级:①收敛串在场 → 判能量合理性(CONVERGED / BAD_ENERGY);②零输出 →
+    优先级:①收敛串 + 干净页脚 + 无非零退出证据 → 判能量合理性
+    (CONVERGED / BAD_ENERGY);②零输出 →
     区分调度器杀 / 静默退出 / 启动即死;③有输出未收敛 → 调度器具体原因 > 日志硬崩
     签名 > 退出码 137(OOM) > 未收敛(可续算);④都不覆盖 → UNKNOWN 交人工。
     """
@@ -321,8 +323,15 @@ def classify(*, scheduler_reason: str | None = None, exit_code: int | None = Non
                          '日志命中磁盘满/IO 错误(No space / quota / I-O error)——'
                          '不可续算,请先清理磁盘或换配额目录再重跑')
 
-    # ① 收敛串在场:成功当且仅当 能量物理合理 且 末离子步电子真收敛
+    # ① 收敛串在场仍不等于完成：OUTCAR 可能是旧轮残留或在收尾时截断。
+    # DONE 必须同时有 timing 页脚，且作业包装无非零退出证据。None 表示未取到
+    # 退出码，不当作失败；显式非零则一定不能 DONE。
     if converged:
+        if clean_exit is not True:
+            return Diagnosis(
+                UNKNOWN, FAILURE_TO_STATE[UNKNOWN], False,
+                '收敛串在场但无 timing 页脚——可能是旧 OUTCAR 残留或中途截断；'
+                '不能判 DONE，也不能自动续算，需人工核对当轮作业日志')
         if nelm_saturated(oszicar_tail, nelm):
             # VASP5 陷阱:NELM 耗尽同样打印 EDIFF-reached 串——收敛标志是假阳性
             return Diagnosis(SCF_SLOSHING, FAILURE_TO_STATE[SCF_SLOSHING], False,
@@ -331,9 +340,9 @@ def classify(*, scheduler_reason: str | None = None, exit_code: int | None = Non
         if energy_implausible(energy):
             return Diagnosis(BAD_ENERGY, FAILURE_TO_STATE[BAD_ENERGY], False,
                              f'OUTCAR 报收敛但能量不合理(E={energy});疑结构重叠/SCF 发散,需人工核对')
-        tail_note = '' if clean_exit in (True, None) else '(注:未见 timing 页脚,收尾非干净退出)'
-        return Diagnosis(CONVERGED, 'DONE', False,
-                         f'OUTCAR 达到要求精度,E0={energy} eV{tail_note}')
+        if clean_exit is True and exit_code in (None, 0):
+            return Diagnosis(CONVERGED, 'DONE', False,
+                             f'OUTCAR 达到要求精度且见干净页脚,E0={energy} eV')
 
     # ② 零输出:OUTCAR 与 OSZICAR 都空/缺
     if _empty(outcar_size) and _empty(oszicar_size):
@@ -370,6 +379,11 @@ def classify(*, scheduler_reason: str | None = None, exit_code: int | None = Non
     if scheduler_reason == R_FAILED:               # 泛化失败无更具体信号 → 交人工
         return Diagnosis(UNKNOWN, FAILURE_TO_STATE[UNKNOWN], False,
                          '调度器报失败但无具体原因/日志签名,需人工')
+    if exit_code not in (None, 0):
+        return Diagnosis(
+            UNKNOWN, FAILURE_TO_STATE[UNKNOWN], False,
+            f'退出码 {exit_code} 为非零；即使 OUTCAR 留有收敛串也不能证明作业完整完成，'
+            '需核对作业日志和输出完整性')
     slosh = scan_oszicar_sloshing(oszicar_tail)     # 电子震荡:盲目续算必复现 → 交人工
     if slosh is not None:
         return Diagnosis(SCF_SLOSHING, FAILURE_TO_STATE[SCF_SLOSHING], False, slosh)

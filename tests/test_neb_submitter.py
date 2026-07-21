@@ -256,6 +256,28 @@ def test_neb_fetch_missing_recorded(tmp_path):
     assert any('OSZICAR' in t for t in fetched)
 
 
+def test_neb_interrupted_image_fetch_preserves_previous_result(tmp_path):
+    jd = _submit(tmp_path)
+    target = os.path.join(jd, '01', 'OUTCAR')
+    with open(target, 'w', encoding='utf-8') as handle:
+        handle.write('previous complete image OUTCAR\n')
+
+    class PartialFailure(FakeSFTP):
+        def get(self, remote, local):
+            if remote.endswith('/01/OUTCAR'):
+                with open(local, 'w', encoding='utf-8') as handle:
+                    handle.write('partial')
+                raise IOError('connection dropped')
+            return super().get(remote, local)
+
+    _fetched, missing = submitter.fetch_results(FakeClient(), PartialFailure(), jd)
+    assert '01/OUTCAR' in missing
+    with open(target, encoding='utf-8') as handle:
+        assert handle.read() == 'previous complete image OUTCAR\n'
+    assert not [name for name in os.listdir(os.path.dirname(target))
+                if name.startswith('.OUTCAR.vcstudio-') and name.endswith('.part')]
+
+
 # ── diagnose.classify_neb 纯函数分支 ──
 def test_classify_neb_walltime_restartable():
     d = diagnose.classify_neb(images_expected=3, images_found=3,

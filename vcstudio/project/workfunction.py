@@ -67,16 +67,25 @@ def build_workfunction_job(src_dir, out_root, *, add_dipole: str = 'auto') -> di
     warnings.append('LVTOT=.TRUE. 产出 LOCPOT;φ = 真空能级 − E_F,真空能级取 LOCPOT 沿 z 面平均'
                     '在真空平台处的值(见 parse_locpot_planar / work_function)。')
 
-    # 重写 job.yaml 为规范 manifest(task_type='workfunction')
+    # estatic 已落标准 manifest；在原清单上改任务语义，保留四件套文件表、
+    # SHA256、状态历史和父任务溯源。重新 new_manifest 会丢掉这些提交前证据。
     system = poscar_text.splitlines()[0].strip() if poscar_text.strip() else Path(out_root).name
     parent = str(Path(src_dir).resolve())
-    m = manifest_mod.new_manifest(
+    m = manifest_mod.load_manifest(out_root) or manifest_mod.new_manifest(
         job_id=f'{Path(out_root).name}-workfunction', system=system,
-        task_type='workfunction', calc_type='slab',
-        inputs={'parent_job': parent, 'derived_from': source_name, 'purpose': 'esp',
-                'dipole': bool(dipole), 'incar_changes': res['changes']},
-        warnings=warnings)
+        task_type='workfunction', calc_type='slab', inputs={}, warnings=warnings)
+    m['task_type'] = 'workfunction'
+    m['calc_type'] = 'slab'
+    m['warnings'] = warnings
+    m.setdefault('inputs', {}).update({
+        'parent_job': parent, 'derived_from': source_name, 'purpose': 'esp',
+        'dipole': bool(dipole), 'incar_changes': res['changes'],
+    })
     m['parent_job'] = parent
+    m.setdefault('derivation', {}).update({
+        'purpose': 'workfunction', 'derived_from': source_name,
+        'dipole': bool(dipole), 'changes': list(res['changes']),
+    })
     manifest_mod.save_manifest(out_root, m)
     return {'out_dir': str(out_root), 'changes': res['changes'], 'warnings': warnings,
             'dipole': bool(dipole)}

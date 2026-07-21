@@ -37,6 +37,18 @@ def _finish(job_dir, energy):
     manifest.save_manifest(job_dir, m)
 
 
+def _make_species_ref_job(job_dir, *, energy=-38.072771, state='DONE',
+                          source='OSZICAR:E0'):
+    """Create a molecular reference manifest for species-reference tests."""
+    job_dir.mkdir(parents=True, exist_ok=True)
+    ref = manifest.new_manifest(job_id='ref', system='Li2S8', task_type='relax',
+                                calc_type='molecule', inputs={})
+    manifest.set_state(ref, state)
+    ref['results'].update(energy_e0_eV=energy, energy_source=source)
+    manifest.save_manifest(job_dir, ref)
+    return job_dir
+
+
 def test_create_project_generates_members_and_registers(env):
     res = adsorption.create_project(
         env['tmp'] / 'proj', 'liS', clean_poscar=env['poscar']('slab.vasp'),
@@ -53,6 +65,10 @@ def test_create_project_generates_members_and_registers(env):
     # 全部登记进台账 + 项目注册表
     assert len(ledger.list_dirs()) == 4
     assert adsorption.list_projects() == [res['project_path']]
+    assert adsorption.unregister_project(res['project_path']) is True
+    assert adsorption.list_projects() == []
+    assert adsorption.unregister_project(res['project_path']) is False
+    assert adsorption.register_project(res['project_path']) is True
 
 
 def test_bad_config_isolated_others_survive(env):
@@ -138,6 +154,105 @@ def test_delta_e_without_ref_notes_formula(env):
     assert 'E(slab+ads)−E(slab)' in s['rows'][0]['note']
 
 
+def test_scan_structure_files_recursive_read_only_deduplicates_and_ignores_symlinks(
+        tmp_path):
+    source = tmp_path / 'structures'
+    nested = source / 'Li2S8_top'
+    nested.mkdir(parents=True)
+    poscar = nested / 'POSCAR'
+    poscar.write_text('structure', encoding='utf-8')
+    (source / 'S8_bridge.vasp').write_text('structure', encoding='utf-8')
+    (source / 'notes.txt').write_text('ignore', encoding='utf-8')
+    os.link(poscar, nested / 'zz_duplicate.poscar')
+    try:
+        (source / 'linked.vasp').symlink_to(poscar)
+        (source / 'linked_dir').symlink_to(nested, target_is_directory=True)
+    except OSError:
+        pass
+
+    before = {str(path.relative_to(source)): path.stat().st_mtime_ns
+              for path in source.rglob('*') if path.is_file() and not path.is_symlink()}
+    items = adsorption.scan_structure_files(source)
+    after = {str(path.relative_to(source)): path.stat().st_mtime_ns
+             for path in source.rglob('*') if path.is_file() and not path.is_symlink()}
+
+    assert len(items) == 2
+    assert {item['species'] for item in items} == {'Li2S8', 'S8'}
+    assert all(os.path.isabs(item['path']) for item in items)
+    assert before == after
+
+
+def test_scan_lis_input_bundle_fills_unique_incar_clean_and_configs_read_only(tmp_path):
+    root = tmp_path / 'MoS2_LiS_inputs'
+    clean = root / 'clean_slab' / 'POSCAR'
+    lis = root / 'adsorption' / 'Li2S8_top' / 'POSCAR'
+    s8 = root / 'adsorption' / 'S8_bridge.vasp'
+    for path in (clean, lis, s8):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('structure', encoding='utf-8')
+    incar = root / 'INCAR'
+    incar.write_text('ENCUT = 500\n', encoding='utf-8')
+    before = {str(path.relative_to(root)): path.stat().st_mtime_ns
+              for path in root.rglob('*') if path.is_file()}
+
+    result = adsorption.scan_lis_input_bundle(root)
+
+    after = {str(path.relative_to(root)): path.stat().st_mtime_ns
+             for path in root.rglob('*') if path.is_file()}
+    assert result['incar'] == str(incar.resolve())
+    assert result['clean_slab'] == str(clean.resolve())
+    assert {item['path'] for item in result['configs']} == {
+        str(lis.resolve()), str(s8.resolve())}
+    assert result['warnings'] == [] and result['source_read_only'] is True
+    assert before == after
+
+
+def test_scan_lis_input_bundle_never_guesses_ambiguous_incar_or_clean(tmp_path):
+    root = tmp_path / 'bundle'
+    paths = [root / 'a' / 'INCAR', root / 'b' / 'INCAR',
+             root / 'clean' / 'POSCAR', root / 'bare' / 'POSCAR',
+             root / 'Li2S8_slab' / 'POSCAR']
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('x', encoding='utf-8')
+
+    result = adsorption.scan_lis_input_bundle(root)
+
+    assert result['incar'] == '' and len(result['incar_candidates']) == 2
+    assert result['clean_slab'] == '' and len(result['clean_candidates']) == 2
+    assert {item['species'] for item in result['configs']} == {'Li2S8'}
+    assert any('手动选择' in warning for warning in result['warnings'])
+
+
+def test_create_project_persists_lis_reference_metadata_and_poscar_folder_labels(env):
+    folder = env['tmp'] / 'Li2S8_top'
+    folder.mkdir()
+    config = folder / 'POSCAR'
+    config.write_text(
+        'ads\n1.0\n10 0 0\n0 10 0\n0 0 10\nC\n1\nCartesian\n0 0 0\n',
+        encoding='utf-8')
+    ref_job = env['tmp'] / 'refs' / 'mol_Li2S8'
+    ref_job.mkdir(parents=True)
+    reference_project = env['tmp'] / 'refs' / 'project.yaml'
+
+    result = adsorption.create_project(
+        env['tmp'] / 'lis-project', 'lis',
+        clean_poscar=env['poscar']('slab.vasp'), config_poscars=[str(config)],
+        incar_path=env['incar'], lib_root=env['lib'],
+        config_species={str(config): 'Li2S8'}, species_refs={'Li2S8': -38.0},
+        species_ref_jobs={'Li2S8': str(ref_job)}, molecules_dir=str(ref_job.parent),
+        reference_project=str(reference_project))
+
+    project = adsorption.load_project(result['project_path'])
+    config_dir = project['members']['configs'][0]
+    assert config_dir.endswith('lis_ads_Li2S8_top')
+    assert project['config_species'] == {str(os.path.abspath(config_dir)): 'Li2S8'}
+    assert project['species_refs'] == {'Li2S8': -38.0}
+    assert project['species_ref_jobs'] == {'Li2S8': str(ref_job)}
+    assert project['molecules_dir'] == str(ref_job.parent.resolve())
+    assert project['reference_project'] == str(reference_project.resolve())
+
+
 def test_export_csv_excel_friendly(env, tmp_path):
     res = adsorption.create_project(
         env['tmp'] / 'p5', 'csv', clean_poscar=env['poscar']('s.vasp'),
@@ -211,3 +326,205 @@ def test_delta_e_species_falls_back_to_short_name(env):
     assert by['fb_ads_b2']['species'] == 'b2'
     # 各自单独一组 → 都是各自组内最稳
     assert by['fb_ads_h1']['is_most_stable'] and by['fb_ads_b2']['is_most_stable']
+
+
+def test_delta_e_prefers_normalised_explicit_config_species_mapping(env):
+    """导入目录可直接叫 Li2S6；显式物种映射优先于旧的文件名后缀猜测。"""
+    res = adsorption.create_project(
+        env['tmp'] / 'mapped', 'mapped', clean_poscar=env['poscar']('s.vasp'),
+        config_poscars=[env['poscar']('Li2S6.vasp')], incar_path=env['incar'],
+        lib_root=env['lib'])
+    proj = adsorption.load_project(res['project_path'])
+    cdir = proj['members']['configs'][0]
+    _finish(proj['members']['clean_slab'], -100.0)
+    _finish(cdir, -115.0)
+
+    # deliberately use a relative, non-normalised key and map away from the
+    # basename-inferred Li2S6 to prove explicit metadata wins.
+    rel = os.path.relpath(cdir, proj['root'])
+    proj['config_species'] = {os.path.join('unused', '..', rel): 'Li2S8'}
+    proj['species_refs'] = {'Li2S6': -20.0, 'Li2S8': -10.0}
+    ref_job = _make_species_ref_job(env['tmp'] / 'mapped-ref', energy=-10.0)
+    proj['species_ref_jobs'] = {'Li2S8': str(ref_job)}
+
+    row = adsorption.delta_e_rows(proj)['rows'][0]
+    assert row['species'] == 'Li2S8'
+    assert row['delta_e'] == pytest.approx(-115.0 - (-100.0) - (-10.0))
+
+
+def test_delta_e_species_reference_keeps_legacy_suffix_fallback(env):
+    """没有 config_species 的旧项目仍按 ``_<species>`` 后缀匹配。"""
+    res = adsorption.create_project(
+        env['tmp'] / 'legacy-ref', 'legacy', clean_poscar=env['poscar']('s.vasp'),
+        config_poscars=[env['poscar']('Li2S4.vasp')], incar_path=env['incar'],
+        lib_root=env['lib'])
+    proj = adsorption.load_project(res['project_path'])
+    _finish(proj['members']['clean_slab'], -100.0)
+    _finish(proj['members']['configs'][0], -115.0)
+    proj['species_refs'] = {'Li2S4': -12.0}
+    ref_job = _make_species_ref_job(env['tmp'] / 'legacy-ref-job', energy=-12.0)
+    proj['species_ref_jobs'] = {'Li2S4': str(ref_job)}
+
+    row = adsorption.delta_e_rows(proj)['rows'][0]
+    assert row['species'] == 'Li2S4'
+    assert row['delta_e'] == pytest.approx(-3.0)
+
+
+def test_species_reference_summary_csv_and_row_are_auditable(env):
+    res = adsorption.create_project(
+        env['tmp'] / 'species-ref', 'lis', clean_poscar=env['poscar']('slab.vasp'),
+        config_poscars=[env['poscar']('Li2S8.vasp')], incar_path=env['incar'],
+        lib_root=env['lib'])
+    proj = adsorption.load_project(res['project_path'])
+    config = proj['members']['configs'][0]
+    ref_job = env['tmp'] / 'mol_Li2S8'
+    _finish(proj['members']['clean_slab'], -100.0)
+    _finish(config, -139.5)
+    ref_job.mkdir()
+    ref = manifest.new_manifest(job_id='ref', system='Li2S8', task_type='relax',
+                                calc_type='molecule', inputs={})
+    manifest.set_state(ref, 'DONE')
+    ref['results'].update(energy_e0_eV=-38.072771, energy_source='OSZICAR:E0')
+    manifest.save_manifest(ref_job, ref)
+    proj['config_species'] = {config: 'Li2S8'}
+    # 缓存与 manifest 相差 0.5 μeV（容差内）；公式仍须使用 manifest 真值。
+    proj['species_refs'] = {'Li2S8': -38.0727705}
+    proj['species_ref_jobs'] = {'Li2S8': str(ref_job)}
+
+    summary = adsorption.delta_e_rows(proj)
+    row = summary['rows'][0]
+    assert summary['has_ref'] and summary['reference_mode'] == 'species'
+    assert row['reference_species'] == 'Li2S8'
+    assert row['e_ref'] == pytest.approx(-38.072771)
+    assert row['reference_state'] == 'DONE'
+    assert row['reference_source'] == 'OSZICAR:E0'
+    assert row['delta_e'] == pytest.approx(-139.5 - (-100.0) - (-38.072771))
+    text = adsorption.export_csv(proj, summary, env['tmp'] / 'species.csv').read_text(
+        encoding='utf-8-sig')
+    assert '逐物种参考' in text and 'Li2S8=-38.072771' in text
+    assert 'E(ref)=未设置' not in text
+
+
+def _prepared_species_reference_project(env, *, cached=-38.072771,
+                                        manifest_energy=-38.072771,
+                                        state='DONE', write_manifest=True):
+    result = adsorption.create_project(
+        env['tmp'] / 'reference-gate-project', 'lis',
+        clean_poscar=env['poscar']('gate-slab.vasp'),
+        config_poscars=[env['poscar']('Li2S8-gate.vasp')],
+        incar_path=env['incar'], lib_root=env['lib'])
+    project = adsorption.load_project(result['project_path'])
+    config = project['members']['configs'][0]
+    _finish(project['members']['clean_slab'], -100.0)
+    _finish(config, -139.5)
+    ref_job = env['tmp'] / 'reference-gate-Li2S8'
+    ref_job.mkdir()
+    if write_manifest:
+        _make_species_ref_job(ref_job, energy=manifest_energy, state=state)
+    project['config_species'] = {config: 'Li2S8'}
+    project['species_refs'] = {'Li2S8': cached}
+    project['species_ref_jobs'] = {'Li2S8': str(ref_job)}
+    return project
+
+
+def test_species_reference_needs_human_blocks_delta(env):
+    project = _prepared_species_reference_project(env, state='NEEDS_HUMAN')
+
+    row = adsorption.delta_e_rows(project)['rows'][0]
+
+    assert row['delta_e'] is None
+    assert row['reference_state'] == 'NEEDS_HUMAN'
+    assert row['e_ref'] == pytest.approx(-38.072771)  # 展示 manifest 实值但不参与公式
+    assert '状态为 NEEDS_HUMAN' in row['note'] and '人工确认' in row['note']
+
+
+def test_species_reference_missing_manifest_blocks_delta(env):
+    project = _prepared_species_reference_project(env, write_manifest=False)
+
+    row = adsorption.delta_e_rows(project)['rows'][0]
+
+    assert row['delta_e'] is None and row['e_ref'] is None
+    assert row['reference_state'] == '缺 job.yaml'
+    assert '重新导入' in row['note'] and 'job.yaml' in row['note']
+
+
+def test_species_reference_cache_drift_blocks_and_exposes_manifest_truth(env):
+    project = _prepared_species_reference_project(env, cached=-38.0)
+
+    summary = adsorption.delta_e_rows(project)
+    row = summary['rows'][0]
+
+    assert row['delta_e'] is None
+    assert row['e_ref'] == pytest.approx(-38.072771)  # 不回退到 project.yaml 的 -38.0
+    assert row['reference_state'] == 'DONE'
+    assert '缓存与 job.yaml 不一致' in row['note'] and '容差 1e-06 eV' in row['note']
+    assert summary['species_refs'] == {'Li2S8': None}
+    assert summary['species_ref_cache'] == {'Li2S8': -38.0}
+
+
+def test_legacy_species_reference_without_job_mapping_fails_closed(env):
+    project = _prepared_species_reference_project(env)
+    project.pop('species_ref_jobs')
+
+    row = adsorption.delta_e_rows(project)['rows'][0]
+
+    assert row['delta_e'] is None and row['reference_state'] == '未登记'
+    assert '缺少 species_ref_jobs' in row['note'] and '重新选择参考项目' in row['note']
+
+
+@pytest.mark.parametrize('bad_energy', [float('nan'), float('inf'), 1.0, -20000.0])
+def test_delta_rejects_nonphysical_done_member_energy(env, bad_energy):
+    res = adsorption.create_project(
+        env['tmp'] / ('bad-' + str(len(list(env['tmp'].iterdir())))), 'bad',
+        clean_poscar=env['poscar']('slab-bad.vasp'),
+        config_poscars=[env['poscar']('cfg-bad.vasp')], incar_path=env['incar'],
+        lib_root=env['lib'])
+    proj = adsorption.load_project(res['project_path'])
+    _finish(proj['members']['clean_slab'], -100.0)
+    _finish(proj['members']['configs'][0], bad_energy)
+    row = adsorption.delta_e_rows(proj)['rows'][0]
+    assert row['delta_e'] is None and '能量缺失或不合理' in row['note']
+
+
+def test_atomic_project_failure_leaves_no_target_and_same_name_can_retry(env):
+    target = env['tmp'] / 'atomic-project'
+    bad = env['tmp'] / 'bad.vasp'
+    bad.write_text('not a POSCAR\n', encoding='utf-8')
+    with pytest.raises(ValueError):
+        adsorption.create_project(
+            target, 'atomic', clean_poscar=str(bad),
+            config_poscars=[env['poscar']('atomic-cfg.vasp')],
+            incar_path=env['incar'], lib_root=env['lib'], fail_if_exists=True)
+    assert not target.exists()
+    result = adsorption.create_project(
+        target, 'atomic', clean_poscar=env['poscar']('atomic-slab.vasp'),
+        config_poscars=[env['poscar']('atomic-cfg2.vasp')],
+        incar_path=env['incar'], lib_root=env['lib'], fail_if_exists=True)
+    assert result['ok'] and target.is_dir()
+    assert all(str(target) in path for _name, path, _warnings in result['generated'])
+
+
+def test_prepared_projects_use_random_persistent_remote_instance_ids(env):
+    slab = env['poscar']('uuid-slab.vasp')
+    config = env['poscar']('uuid-config.vasp')
+    preparation = {'request_sha256': 'a' * 64, 'inputs': {'same': True}}
+
+    first = adsorption.create_project(
+        env['tmp'] / 'uuid-project-a', 'same-name', clean_poscar=slab,
+        config_poscars=[config], incar_path=env['incar'], lib_root=env['lib'],
+        preparation=preparation, fail_if_exists=True)
+    second = adsorption.create_project(
+        env['tmp'] / 'uuid-project-b', 'same-name', clean_poscar=slab,
+        config_poscars=[config], incar_path=env['incar'], lib_root=env['lib'],
+        preparation=preparation, fail_if_exists=True)
+
+    first_project = adsorption.load_project(first['project_path'])
+    second_project = adsorption.load_project(second['project_path'])
+    assert first_project['project_uuid'] != second_project['project_uuid']
+    assert first_project['remote_namespace'] != second_project['remote_namespace']
+    assert len(first_project['remote_namespace']) <= 120
+    assert first_project['preparation']['project_uuid'] == first_project['project_uuid']
+    for job_dir in [first_project['members']['clean_slab'],
+                    *first_project['members']['configs']]:
+        job = manifest.load_manifest(job_dir)
+        assert job['inputs']['remote_namespace'] == first_project['remote_namespace']

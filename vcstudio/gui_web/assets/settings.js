@@ -7,7 +7,7 @@
   const val = id => { const el = $(id); return el ? el.value.trim() : ''; };
   const setVal = (id, v) => { const el = $(id); if (el) el.value = (v == null ? '' : v); };
   const setSel = (id, v) => { const el = $(id); if (el) el.value = String(v); };
-  const State = { scenarios: [] };
+  const State = { scenarios: [], tasks: [] };
 
   // 提供商预设 → [base_url, model](自定义为空,不覆盖用户已填)
   const PROVIDERS = {
@@ -44,7 +44,8 @@
 
     const ui = s.ui || {};
     selectTheme(ui.theme || 'classic', false);
-    if ($('set-ap-on')) $('set-ap-on').checked = ui.autopilot !== false;
+    // 自动托管必须显式开启；旧配置缺少该键时保持关闭，避免误操作台账中的其它任务。
+    if ($('set-ap-on')) $('set-ap-on').checked = ui.autopilot === true;
     setSel('set-ap-interval', ui.poll_interval || 10);
     if ($('set-ap-continue')) $('set-ap-continue').checked = ui.autopilot_continue !== false;
     if ($('set-ap-fetch')) $('set-ap-fetch').checked = ui.autopilot_fetch !== false;
@@ -55,7 +56,7 @@
     if ($('set-fig-auto')) $('set-fig-auto').checked = fig.auto_figures !== false;
     if ($('set-fig-panel')) $('set-fig-panel').checked = fig.multi_panel !== false;
 
-    loadWorkspace();          // 界面语言 + 研究场景下拉
+    loadWorkspace();          // 界面语言 + 工作模式 + 本次计算类型
   }
 
   async function saveFigPrefs() {
@@ -182,12 +183,12 @@
       $('set-ap-fetch') ? $('set-ap-fetch').checked : true,
       $('set-ap-report') ? $('set-ap-report').checked : true);
     if (!(r && r.ok)) { VCS.log('保存自动化设置失败:' + ((r && r.error) || '未知'), 'failc'); return; }
-    VCS.log('已保存自动驾驶设置', 'okc');
+    VCS.log('已保存自动托管设置', 'okc');
     VCS.toast('已保存');
     if (VCS.pipeline && typeof VCS.pipeline.reconfigure === 'function') VCS.pipeline.reconfigure();
   }
 
-  // ── 界面语言 + 研究场景 ──────────────────────────────────────────────────────
+  // ── 界面语言 + 工作模式 + 本次计算类型 ──────────────────────────────────────
   const LANG_NAMES = { zh: '中文(简体)', en: 'English' };
   async function loadWorkspace() {
     // 语言下拉
@@ -205,12 +206,42 @@
       const [list, cur] = await Promise.all([
         VCS.call('scenario_list'), VCS.call('scenario_get')]);
       State.scenarios = (list && list.scenarios) || [];
-      scSel.innerHTML = State.scenarios.map(s =>
+      const primary = State.scenarios.filter(s => s.primary);
+      const advanced = State.scenarios.filter(s => !s.primary);
+      const opts = rows => rows.map(s =>
         `<option value="${s.key}">${VCS.esc(s.name)}</option>`).join('');
+      scSel.innerHTML = '<optgroup label="常用模式">' + opts(primary) + '</optgroup>' +
+        (advanced.length ? '<optgroup label="更多专业预设">' + opts(advanced) + '</optgroup>' : '');
       const curKey = (cur && cur.scenario && cur.scenario.key) || 'full';
       scSel.value = curKey;
       renderScenarioDesc(curKey);
+      await loadCalculations(curKey);
     }
+  }
+
+  async function loadCalculations(scenarioKey) {
+    const sel = $('set-calculation');
+    if (!sel) return;
+    const [catalog, current] = await Promise.all([
+      VCS.call('task_catalog', scenarioKey || null), VCS.call('calculation_get')]);
+    State.tasks = (catalog && catalog.tasks) || [];
+    const cats = (catalog && catalog.categories) || [];
+    let html = '';
+    cats.forEach(cat => {
+      const rows = State.tasks.filter(t => t.category === cat);
+      if (!rows.length) return;
+      html += `<optgroup label="${VCS.esc(cat)}">` + rows.map(t =>
+        `<option value="${VCS.esc(t.key)}">${VCS.esc(t.name_zh)}</option>`).join('') + '</optgroup>';
+    });
+    sel.innerHTML = html || '<option value="">当前模式没有可选任务</option>';
+    const active = (current && current.active_calculation) ||
+      ((VCS.scenario && VCS.scenario.defaults) || {}).active_calculation || '';
+    if (State.tasks.some(t => t.key === active)) sel.value = active;
+    else if (State.tasks.length) sel.value = State.tasks[0].key;
+    if (sel.value && (!current || !current.configured)) {
+      await VCS.call('calculation_set', sel.value);
+    }
+    if (VCS.applyCalculation) VCS.applyCalculation(sel.value || '');
   }
   function renderScenarioDesc(key) {
     const d = $('set-scenario-desc');
@@ -227,11 +258,24 @@
   async function onScenarioChange() {
     const key = $('set-scenario') ? $('set-scenario').value : 'full';
     const r = await VCS.call('scenario_set', key);
-    if (!(r && r.ok)) { VCS.log('切换场景失败:' + ((r && r.error) || '未知'), 'failc'); return; }
+    if (!(r && r.ok)) { VCS.log('切换工作模式失败:' + ((r && r.error) || '未知'), 'failc'); return; }
     renderScenarioDesc(key);
     if (VCS.applyScenario && r.scenario) VCS.applyScenario(r.scenario);
-    VCS.log('研究场景已切换:' + ((r.scenario && r.scenario.name) || key), 'okc');
-    VCS.toast('已切换研究场景');
+    await loadCalculations(key);
+    VCS.log('工作模式已切换:' + ((r.scenario && r.scenario.name) || key), 'okc');
+    VCS.toast('已切换工作模式');
+  }
+  async function onCalculationChange() {
+    const key = $('set-calculation') ? $('set-calculation').value : '';
+    if (!key) return;
+    const r = await VCS.call('calculation_set', key);
+    if (!(r && r.ok)) {
+      VCS.log('切换计算类型失败:' + ((r && r.error) || '未知'), 'failc'); return;
+    }
+    if (VCS.applyCalculation) VCS.applyCalculation(key);
+    const task = State.tasks.find(t => t.key === key);
+    VCS.log('本次计算类型已切换:' + ((task && task.name_zh) || key), 'okc');
+    VCS.toast('已切换本次计算类型');
   }
 
   // ── 初始化 ──────────────────────────────────────────────────────────────────
@@ -251,6 +295,7 @@
     wire('set-fig-save', 'click', saveFigPrefs);
     wire('set-lang', 'change', onLangChange);
     wire('set-scenario', 'change', onScenarioChange);
+    wire('set-calculation', 'change', onCalculationChange);
     const row = $('set-theme-row');
     if (row) row.addEventListener('click', e => {
       const o = e.target.closest('.theme-opt');

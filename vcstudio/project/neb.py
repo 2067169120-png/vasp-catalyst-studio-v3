@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 from pathlib import Path
@@ -46,22 +47,63 @@ def _frame_dirs(job_dir) -> list:
     return sorted(names, key=lambda s: int(s))
 
 
-def _frame_energy(frame_dir) -> float | None:
-    """单 image 能量(eV):OSZICAR 末行 E0 优先,退 OUTCAR 末个 energy(sigma->0)。缺 → None。"""
+def _frame_energy_evidence(frame_dir) -> tuple[float | None, str | None]:
+    """单 image 能量与实际证据文件；不从 POSCAR/目录名推断。"""
     osz = _read_text(os.path.join(frame_dir, 'OSZICAR'))
     if osz:
         steps = convergence.parse_oszicar(osz)
         if steps and steps[-1].get('E0') is not None:
-            return float(steps[-1]['E0'])
+            return float(steps[-1]['E0']), 'OSZICAR:E0'
     out = _read_text(os.path.join(frame_dir, 'OUTCAR'))
     if out:
         hits = _SIGMA0_RE.findall(out)
         if hits:
             try:
-                return float(hits[-1])
+                return float(hits[-1]), 'OUTCAR:energy(sigma->0)'
             except ValueError:
-                return None
-    return None
+                return None, None
+    return None, None
+
+
+def _frame_energy(frame_dir) -> float | None:
+    """向后兼容的单值入口。"""
+    return _frame_energy_evidence(frame_dir)[0]
+
+
+def _manifest_endpoint_energy(job_dir, frame: str, role: str):
+    """仅接受 derive_neb 写入且带来源证据的端点能量。"""
+    try:
+        from vcstudio.shared import manifest as manifest_mod
+        value = manifest_mod.load_manifest(job_dir) or {}
+    except Exception:
+        return None, None
+    inputs = value.get('inputs') or {}
+    endpoints = inputs.get('neb_endpoints') or {}
+    if not isinstance(endpoints, dict):
+        return None, None
+    record = endpoints.get(role) or {}
+    if not isinstance(record, dict) or record.get('target_frame') != frame \
+            or record.get('trusted') is not True:
+        return None, None
+    energy = record.get('energy_e0_eV')
+    if (isinstance(energy, bool) or not isinstance(energy, (int, float))
+            or not math.isfinite(float(energy))):
+        return None, None
+    source = str(record.get('energy_source') or '').strip()
+    if source.startswith('copied:'):
+        evidence_file = source[len('copied:'):].split(':', 1)[0]
+        files = record.get('files') or []
+        has_hash = any(isinstance(item, dict)
+                       and item.get('name') == evidence_file and item.get('sha256')
+                       for item in files)
+        if not has_hash:
+            return None, None
+    elif source.startswith('source_manifest:'):
+        if record.get('source_state') != 'DONE' or not record.get('source_job_id'):
+            return None, None
+    else:
+        return None, None
+    return float(energy), source
 
 
 def _frame_fmax(frame_dir) -> float | None:
@@ -98,8 +140,23 @@ def parse_neb_energies(job_dir) -> dict:
             f'请确认目录为标准 NEB 布局:{job_dir}')
 
     root = Path(job_dir)
-    energies = [_frame_energy(root / fr) for fr in frames]
+    pairs = [_frame_energy_evidence(root / fr) for fr in frames]
+    energies = [item[0] for item in pairs]
+    energy_sources = [item[1] for item in pairs]
     forces = [_frame_fmax(root / fr) for fr in frames]
+
+    # VASP NEB 只计算中间 image。端点能量来自生成时带入的已算证据；
+    # 当回收时远端没有端点 OSZICAR/OUTCAR，才使用经哈希/源清单认证的值。
+    fallback_notes = []
+    for idx, role in ((0, 'start'), (len(frames) - 1, 'end')):
+        if energies[idx] is not None:
+            continue
+        value, source = _manifest_endpoint_energy(root, frames[idx], role)
+        if value is not None:
+            energies[idx] = value
+            energy_sources[idx] = source
+            fallback_notes.append(
+                f'{frames[idx]} 端点使用 job.yaml 中的可追溯能量({source})。')
 
     if energies[0] is None:
         raise ValueError(
@@ -120,7 +177,7 @@ def parse_neb_energies(job_dir) -> dict:
     climbing_converged = bool(inter_forces) and all(
         f is not None and f < FORCE_TOL for f in inter_forces)
 
-    warnings: list = []
+    warnings: list = list(fallback_notes)
     n_frames = len(frames)
     if ts_index == 0 or ts_index == n_frames - 1:
         warnings.append(
@@ -135,6 +192,7 @@ def parse_neb_energies(job_dir) -> dict:
         'barrier_f': barrier_f, 'barrier_r': barrier_r,
         'ts_index': ts_index, 'climbing_converged': climbing_converged,
         'per_image_forces': forces, 'n_frames': n_frames, 'warnings': warnings,
+        'energy_sources': energy_sources,
     }
 
 

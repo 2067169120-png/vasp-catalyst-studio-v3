@@ -8,6 +8,7 @@
   const val = id => { const el = $(id); return el ? el.value.trim() : ''; };
 
   const State = { molStruct: null, mixed: null, previewText: '' };
+  const CALCULATION_TASK = { relax: 'opt', static: 'sp', freq: 'freq' };
 
   // 结构 → POSCAR 文本(分子装 15Å 盒;species 分块,供后端 parse_structure 读取笛卡尔坐标)
   function poscarText(st, comment) {
@@ -41,6 +42,15 @@
     const tasks = (r && r.tasks) || [];
     sel.innerHTML = tasks.map(t =>
       `<option value="${VCS.esc(t.key)}" title="${VCS.esc(t.note)}">${VCS.esc(t.name)}</option>`).join('');
+    syncCalculationTask();
+    onTaskChange();
+  }
+  function syncCalculationTask() {
+    if (!VCS.scenario || VCS.scenario.key !== 'molecular') return;
+    const sel = $('gauss-task');
+    const target = CALCULATION_TASK[VCS.activeCalculation || ''];
+    if (!sel || !target || !Array.from(sel.options).some(o => o.value === target)) return;
+    sel.value = target;
     onTaskChange();
   }
   function onTaskChange() {
@@ -169,9 +179,19 @@
       (r.files || []).forEach(f => VCS.log('已生成:' + f, 'okc'));
       (r.issues || []).forEach(i => VCS.log('自洽校验:' + i, 'warnc'));
       (r.warnings || []).forEach(w => VCS.log(w, 'warnc'));
-      VCS.log('Gaussian 输入已生成(软件本体用户自备)', 'okc');
-      VCS.call('open_dir', outDir);
-      VCS.toast('已生成 Gaussian 输入');
+      if (!r.registered) {
+        VCS.log('Gaussian 输入已生成，但 job.yaml/台账登记失败；已打开目录，不能直接提交', 'failc');
+        VCS.call('open_dir', outDir);
+        VCS.toast('输入已生成，但尚未纳管', 'fail');
+        return;
+      }
+      VCS.log('Gaussian 输入已生成并加入任务列表', 'okc');
+      VCS.toast('已生成并纳管 Gaussian 作业');
+      if (VCS.nextStep) VCS.nextStep({
+        title: 'Gaussian 作业已就绪', message: '输入文件与 job.yaml 已生成。',
+        detail: '下一步：前往任务页选择服务器并提交；完成后可解析能量和生成报告。',
+        primaryLabel: '前往任务页提交', page: 'jobs', focusJobDir: outDir,
+      });
     } finally {
       if (btn) btn.disabled = false;
     }
@@ -375,6 +395,7 @@
   document.addEventListener('vcs:page', e => {
     if (e.detail && e.detail.page === 'generate') init();
   });
+  document.addEventListener('vcs:calculation', syncCalculationTask);
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 

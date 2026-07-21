@@ -126,6 +126,25 @@ const VCS = {
     });
   },
 
+  // 未知 SSH 主机确认：只把后端实际捕获的 host + SHA256 指纹回传为精确 pin。
+  // 缺少任何关键证据时不提供“信任”路径；跳板机和目标机可依次调用本流程。
+  async confirmHostKey(result) {
+    const host = String(result && result.host || '').trim();
+    const fingerprint = String(result && result.fingerprint || '').trim();
+    const algorithm = String(result && result.algorithm || '').trim();
+    if (!host || !fingerprint || !fingerprint.startsWith('SHA256:')) {
+      VCS.log('服务器没有返回可核对的主机名和 SHA256 指纹，已阻止连接。请先在“集群”页测试连接。', 'failc');
+      return null;
+    }
+    const ok = await VCS.confirm(
+      '首次连接服务器，请与管理员提供的信息逐字核对：\n\n' +
+      '主机：' + host + '\n' +
+      '算法：' + (algorithm || '未提供') + '\n' +
+      'SHA256 指纹：' + fingerprint + '\n\n' +
+      '只有完全一致时才选择“确定”。');
+    return ok ? { host, fingerprint, algorithm } : null;
+  },
+
   // 短提示条,2.6s 自动消失。kind: '' | 'ok' | 'fail'
   toast(msg, kind = '') {
     const t = document.createElement('div');
@@ -184,16 +203,134 @@ const VCS = {
 
 window.VCS = VCS;
 
-// ── 路由:nav a[data-page] 点击 → section 显隐 + .on 高亮 ──
+// ── 统一页面导航:手动点侧栏与程序化“下一步”共用同一路由 ──
+function activatePage(page, sourceLink, detail) {
+  const name = String(page || '');
+  const section = Array.from(document.querySelectorAll('main section[data-page]'))
+    .find(s => s.dataset.page === name);
+  const link = sourceLink || Array.from(document.querySelectorAll('nav a[data-page]'))
+    .find(a => a.dataset.page === name);
+  if (!name || !section || !link) return false;
+  // 工作模式是访问闸，不只是视觉隐藏。程序化导航也不能绕过侧栏裁剪。
+  if (link.hasAttribute('data-scene-hidden') || link.hidden) {
+    VCS.toast('当前工作模式不需要此页面；可在“设置 → 本次计算”切换模式', 'fail');
+    return false;
+  }
+  document.querySelectorAll('nav a').forEach(x => x.classList.toggle('on', x === link));
+  document.querySelectorAll('main section[data-page]').forEach(
+    s => { s.hidden = s.dataset.page !== name; });
+  document.dispatchEvent(new CustomEvent('vcs:page', {
+    detail: Object.assign({}, detail || {}, { page: name }),
+  }));
+  return true;
+}
+
 document.addEventListener('click', e => {
   const a = e.target.closest('a[data-page]');
   if (!a) return;
   e.preventDefault();
-  document.querySelectorAll('nav a').forEach(x => x.classList.toggle('on', x === a));
-  document.querySelectorAll('main section[data-page]').forEach(
-    s => { s.hidden = s.dataset.page !== a.dataset.page; });
-  document.dispatchEvent(new CustomEvent('vcs:page', { detail: { page: a.dataset.page } }));
+  activatePage(a.dataset.page, a);
 });
+
+function findJobRow(jobDir) {
+  const comparablePath = value => {
+    let out = String(value || '').replace(/\\/g, '/').replace(/\/+$/, '');
+    if (/^[A-Za-z]:\//.test(out)) out = out.toLowerCase();
+    return out;
+  };
+  const wanted = comparablePath(jobDir);
+  return Array.from(document.querySelectorAll('#jobs-card tr[data-dir]'))
+    .find(row => comparablePath(row.dataset.dir) === wanted) || null;
+}
+
+// 跳作业页后清除会遮住新作业的筛选,展开所在组,选中并滚动到该行。
+// 不依赖 jobs.js 内部 State,只通过它已有的 DOM 事件契约交互。
+async function focusPendingJob(jobDir) {
+  if (!jobDir) return false;
+  if (window.Jobs && typeof window.Jobs.reload === 'function') {
+    await window.Jobs.reload();
+  }
+  ['jf-cluster', 'jf-status'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el && el.value) {
+      el.value = '';
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  });
+  let row = findJobRow(jobDir);
+  if (row && row.hidden && row.dataset.grp) {
+    const group = Array.from(document.querySelectorAll('#jobs-card tr.grp-head'))
+      .find(head => head.dataset.grp === row.dataset.grp);
+    if (group) group.click();
+    row = findJobRow(jobDir);                 // 展开会重绘 table,需重取节点
+  }
+  if (!row || row.hidden) return false;
+  if (!row.classList.contains('sel')) row.click();
+  if (typeof row.scrollIntoView === 'function') {
+    row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+  const focusTarget = row.querySelector('.jrow-chk') || row;
+  if (focusTarget === row) row.tabIndex = -1;
+  if (typeof focusTarget.focus === 'function') {
+    try { focusTarget.focus({ preventScroll: true }); } catch (_) { focusTarget.focus(); }
+  }
+  return true;
+}
+
+// 程序化导航公开入口。options.focusJobDir 专用于“生成 → 提交”的待提交作业聚焦。
+VCS.navigate = async function (page, options = {}) {
+  const ok = activatePage(page, null, { source: options.source || 'programmatic' });
+  if (!ok) return { ok: false, focused: false };
+  let focused = true;
+  if (options.focusJobDir) focused = await focusPendingJob(options.focusJobDir);
+  else if (options.focusSelector) {
+    const el = document.querySelector(options.focusSelector);
+    focused = !!el;
+    if (el) {
+      if (typeof el.scrollIntoView === 'function') el.scrollIntoView({ block: 'center' });
+      if (typeof el.focus === 'function') el.focus();
+    }
+  }
+  return { ok: true, focused };
+};
+
+// 统一“下一步”弹窗:文案均以 textContent 写入;主按钮可跳页并携带聚焦上下文。
+VCS.nextStep = function ({ title = '操作已完成', message = '', detail = '',
+  primaryLabel = '前往下一步', stayLabel = '留在本页', page = '', focusJobDir = '',
+  focusSelector = '', onPrimary = null } = {}) {
+  const body = document.createElement('div');
+  const msg = document.createElement('p');
+  msg.textContent = String(message || '');
+  body.appendChild(msg);
+  if (detail) {
+    const more = document.createElement('div');
+    more.className = 'sub';
+    more.textContent = String(detail);
+    body.appendChild(more);
+  }
+  return VCS.modal({
+    title,
+    body,
+    actions: [
+      { label: stayLabel, quiet: true, onClick: modal => modal.close() },
+      { label: primaryLabel, primary: true, onClick: async modal => {
+          modal.close();
+          try {
+            if (typeof onPrimary === 'function') await onPrimary();
+            else if (page) {
+              const out = await VCS.navigate(page, { focusJobDir, focusSelector,
+                source: 'next-step' });
+              if (out.ok && focusJobDir && !out.focused) {
+                VCS.toast('已进入任务页，请在列表中选择新作业');
+              }
+            }
+          } catch (err) {
+            VCS.toast('无法打开下一步:' + (err && err.message ? err.message : err), 'fail');
+          }
+        } },
+    ],
+  });
+};
 
 // ── 主题:三选可切换(经典深邃 / 学术浅色 / 深空监控) ──
 // 启动时 <head> 内联脚本已按 localStorage 先粉刷防闪烁;此处提供切换 + 校准入口。
@@ -239,7 +376,7 @@ VCS.elementBadge = function (systemName) {
   return '';   // 识别不出不加(不猜)
 };
 
-// ── 全局自动驾驶编排器:按间隔调 pipeline_tick,渲染事件 + 健康读数 + 断线横幅 ──
+// ── 全局自动托管编排器:按间隔调 pipeline_tick,渲染事件 + 健康读数 + 断线横幅 ──
 VCS.pipeline = {
   timer: null, running: false, failStreak: 0, lastSuccess: null,
   events: [],   // 最近 20 条(新在前),前端到达时间戳
@@ -292,18 +429,20 @@ function renderFeed() {
   if (!box) return;
   const evs = VCS.pipeline.events;
   if (!evs.length) {
-    box.innerHTML = '<div class="db-empty">自动驾驶开启后,这里显示每轮同步/续算/拉回/报告事件</div>';
+    box.innerHTML = '<div class="db-empty">自动托管开启后，这里显示每轮监控、续算、下载和报告事件</div>';
     return;
   }
-  const KL = { refresh: '同步', continue: '续算', fetch: '拉回', report_done: '报告',
+  const KL = { refresh: '同步', continue: '续算', fetch: '下载', report_done: '报告',
     skip: '跳过', error: '错误' };
   box.innerHTML = evs.map(e => {
     const kcls = e.kind === 'report_done' ? 'report'
       : (e.kind === 'error' ? 'err' : (e.kind === 'skip' ? 'skip' : ''));
     const label = KL[e.kind] || e.kind;
+    const cluster = e.cluster
+      ? `<span class="fcluster" title="服务器">${VCS.esc(e.cluster)}</span>` : '';
     const btn = (e.kind === 'report_done' && (e.report || e.figures_dir))
       ? `<button class="btn quiet fbtn" data-open="${VCS.esc(e.report || e.figures_dir)}">打开</button>` : '';
-    return `<div class="feed-row"><span class="fk ${kcls}">${VCS.esc(label)}</span>` +
+    return `<div class="feed-row"><span class="fk ${kcls}">${VCS.esc(label)}</span>${cluster}` +
       `<span class="ftxt" title="${VCS.esc(e.text || '')}">${VCS.esc(e.text || '')}</span>` +
       `<span class="ft">${VCS.esc(e.time || '')}</span>${btn}</div>`;
   }).join('');
@@ -342,8 +481,8 @@ function onPipelineOutcome(out) {
   // 错误也进 feed(不用 VCS.log:避免给无日志区的页面凭空插入日志框)
   (out.errors || []).forEach(err => p.events.unshift({ kind: 'error', text: err, time: now }));
   p.events = p.events.slice(0, 20);
-  if (other) VCS.toast('自动驾驶:本轮 ' + other + ' 条动态', '');
-  if ((out.errors || []).length) VCS.toast('自动驾驶遇到 ' + out.errors.length + ' 个问题(见管线动态)', 'fail');
+  if (other) VCS.toast('自动托管：本轮 ' + other + ' 条动态', '');
+  if ((out.errors || []).length) VCS.toast('自动托管遇到 ' + out.errors.length + ' 个问题（见任务动态）', 'fail');
   renderHealth();
   renderConnBanner();
   renderFeed();
@@ -373,7 +512,10 @@ VCS.pipeline.reconfigure = async function () {
   const s = await VCS.call('settings_get');
   const ui = (s && s.ui) || {};
   if (ui.theme) VCS.themeApply(ui.theme);
-  const enabled = ui.autopilot !== false;             // 默认开
+  // Fail closed when settings cannot be read.  The Li-S submit flow explicitly
+  // enables automation for its managed project after a successful submission;
+  // a fresh install must never start mutating an old ledger on its own.
+  const enabled = ui.autopilot === true;
   const interval = (Number(ui.poll_interval) || 10) * 60000;
   if (VCS.pipeline.timer) { clearInterval(VCS.pipeline.timer); VCS.pipeline.timer = null; }
   if (enabled) {
@@ -415,8 +557,9 @@ VCS.loadLang = async function (lang) {
   return lg;
 };
 
-// ── 研究场景:按 data-scene 点分路径显隐 nav 项与卡片(镜像 scenarios.is_visible 口径) ──
+// ── 工作模式:按 data-scene 点分路径显隐 nav 项与卡片(镜像 scenarios.is_visible 口径) ──
 VCS.scenario = null;
+VCS.activeCalculation = '';
 function sceneVisible(sc, path) {
   if (!sc || !path) return true;
   const parts = path.split('.'); const head = parts[0]; const rest = parts.slice(1);
@@ -436,39 +579,54 @@ function sceneVisible(sc, path) {
   return true;                             // 未知路径族保守可见(fail-open)
 }
 VCS.sceneVisible = sceneVisible;
-// 分子专属区(⑤波函数分析页 + ①结构建模页分子建模区):仅"分子化学 / 全功能"场景显示,其余
-// 方向(锂硫 / 电催化 / 热催化 / 体相)隐藏。scenarios 为只读引擎且无 wavefunction 页位,故这一
-// 族用独立 data-mol-scene 属性 + 场景 key 判定(molecular/full),不占用标准 data-scene 通道。
-const MOL_SCENE_KEYS = ['molecular', 'full'];
-VCS.molSceneVisible = function (sc) { return !!sc && MOL_SCENE_KEYS.indexOf(sc.key) >= 0; };
 VCS.applyScenario = function (sc) {
   if (sc) VCS.scenario = sc;
   const s = VCS.scenario;
   if (!s) return;
   document.querySelectorAll('[data-scene]').forEach(el => {
-    el.hidden = !sceneVisible(s, el.getAttribute('data-scene'));
+    el.toggleAttribute('data-scene-hidden', !sceneVisible(s, el.getAttribute('data-scene')));
   });
-  const molOn = VCS.molSceneVisible(s);
-  document.querySelectorAll('[data-mol-scene]').forEach(el => { el.hidden = !molOn; });
-  // 当前页被场景隐藏 → 退回概览,避免停在空白隐藏页
+  const chip = document.getElementById('mode-chip');
+  if (chip) chip.textContent = '工作模式：' + (s.name || s.key || '未选择');
+  // 当前页被模式隐藏 → 去该模式的默认入口；再失败才退回概览。
   const cur = document.querySelector('nav a.on');
-  if (cur && cur.hidden) {
-    const dash = document.querySelector('nav a[data-page="dashboard"]');
-    if (dash) dash.click();
+  if (cur && cur.hasAttribute('data-scene-hidden')) {
+    const landing = (s.defaults && s.defaults.landing_page) || 'dashboard';
+    if (!activatePage(landing, null, { source: 'work-mode' })) {
+      activatePage('dashboard', null, { source: 'work-mode-fallback' });
+    }
   }
   document.dispatchEvent(new CustomEvent('vcs:scenario', { detail: { scenario: s } }));
 };
 
-// ── 首启研究场景选择模态(config 无 ui.scenario 时;简洁卡片式,含"全功能") ──
+VCS.applyCalculation = function (key) {
+  VCS.activeCalculation = String(key || '');
+  document.querySelectorAll('[data-task]').forEach(el => {
+    const tokens = String(el.getAttribute('data-task') || '').split(/\s+/).filter(Boolean);
+    el.toggleAttribute('data-task-hidden', !!VCS.activeCalculation &&
+      tokens.indexOf(VCS.activeCalculation) < 0 && tokens.indexOf('all') < 0);
+  });
+  document.dispatchEvent(new CustomEvent('vcs:calculation', {
+    detail: { activeCalculation: VCS.activeCalculation },
+  }));
+};
+
+VCS.loadCalculation = async function () {
+  const r = await VCS.call('calculation_get');
+  if (r && r.ok) VCS.applyCalculation(r.active_calculation || '');
+  return VCS.activeCalculation;
+};
+
+// ── 首启工作模式选择模态(config 无 ui.scenario 时;只给四个常用模式) ──
 async function firstLaunchScenario() {
   const r = await VCS.call('scenario_list');
-  const list = (r && r.scenarios) || [];
+  const list = ((r && r.scenarios) || []).filter(s => s.primary);
   if (!list.length) return;
   const box = document.createElement('div');
   box.innerHTML = '<div class="scene-grid">' + list.map(s =>
     `<div class="scene-card" data-key="${VCS.esc(s.key)}"><b>${VCS.esc(s.name)}</b>` +
     `<span>${VCS.esc(s.description)}</span></div>`).join('') + '</div>';
-  const m = VCS.modal({ title: '选择研究场景(界面据此裁剪;可随时在设置页更改)',
+  const m = VCS.modal({ title: '这次要做哪类计算？（之后可在设置中切换）',
     body: box, actions: [] });
   m.el.classList.add('modal-wide');
   box.querySelectorAll('.scene-card').forEach(c => c.addEventListener('click', async () => {
@@ -477,13 +635,19 @@ async function firstLaunchScenario() {
     const res = await VCS.call('scenario_set', key);
     if (res && res.scenario) {
       VCS.applyScenario(res.scenario);
-      VCS.toast('已选择研究场景:' + (res.scenario.name || key));
+      await VCS.loadCalculation();
+      VCS.toast('已选择工作模式：' + (res.scenario.name || key));
     }
   }));
 }
 VCS.firstLaunchScenario = firstLaunchScenario;
 
-// ── 桥就绪:界面桥读数(小字,避免误读为集群已连)+ 启动自动驾驶编排器 ──
+document.addEventListener('click', e => {
+  const chip = e.target.closest && e.target.closest('#mode-chip');
+  if (chip) { e.preventDefault(); VCS.navigate('settings', { source: 'mode-chip' }); }
+});
+
+// ── 桥就绪:界面桥读数(小字,避免误读为集群已连)+ 启动自动托管编排器 ──
 VCS.ready.then(async () => {
   try {
     await window.pywebview.api.ping();     // 确认桥活性(失败则走 catch)
@@ -495,6 +659,7 @@ VCS.ready.then(async () => {
       const sc = await VCS.call('scenario_get');
       if (sc && sc.scenario) {
         VCS.applyScenario(sc.scenario);
+        await VCS.loadCalculation();
         if (!sc.configured) firstLaunchScenario();   // 首启弹场景选择模态
       }
     } catch (_) { /* 场景失败不挡界面 */ }

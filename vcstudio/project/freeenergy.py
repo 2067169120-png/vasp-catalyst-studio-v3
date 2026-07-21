@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import os
 import re
+import math
 
 from vcstudio.project import reactions
+from vcstudio.shared import manifest as manifest_mod
 
 _E0_RE = re.compile(r'E0=\s*([-+.\dEe]+)')
 
@@ -49,7 +51,12 @@ def read_e0(job_dir) -> float | None:
 
 
 def load_molecule_energies(folder) -> dict:
-    """扫描目录下 mol_<X>/molecule_<X> 子目录 → {X: E0}(旧版 results/done 兼容)。"""
+    """扫描 ``mol_<X>``/``molecule_<X>`` 子目录 → ``{X: E0}``。
+
+    受管导入目录若存在 ``job.yaml``，只接受 ``DONE`` 且能量合理的
+    参考态；``NEEDS_HUMAN``/未收敛分子不得静默进入 μLi/ΔG。没有 manifest
+    的旧版 ``results/done`` 目录仍按 OSZICAR 兼容读取。
+    """
     out = {}
     try:
         entries = sorted(os.listdir(folder))
@@ -59,8 +66,25 @@ def load_molecule_energies(folder) -> dict:
         low = name.lower()
         for prefix in ('mol_', 'molecule_'):
             if low.startswith(prefix):
-                e = read_e0(os.path.join(str(folder), name))
-                if e is not None:
+                job_dir = os.path.join(str(folder), name)
+                manifest_file = manifest_mod.manifest_path(job_dir)
+                manifest = manifest_mod.load_manifest(job_dir)
+                # ``None`` means either legacy/no manifest or an unreadable
+                # manifest.  Those cases must not be conflated: once job.yaml
+                # exists this is a managed result, and corruption must fail
+                # closed instead of silently bypassing the DONE gate via OSZICAR.
+                if manifest_file.is_file() and manifest is None:
+                    break
+                if manifest is not None and manifest.get('state') != 'DONE':
+                    break
+                e = ((manifest or {}).get('results') or {}).get('energy_e0_eV')
+                if not isinstance(e, (int, float)):
+                    e = read_e0(job_dir)
+                try:
+                    e = float(e)
+                except (TypeError, ValueError):
+                    e = None
+                if e is not None and math.isfinite(e) and e < 0 and abs(e) <= 10000.0:
                     out[name[len(prefix):]] = e
                 break
     return out

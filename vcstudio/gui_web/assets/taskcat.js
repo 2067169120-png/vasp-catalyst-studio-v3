@@ -9,12 +9,16 @@
 
   // 可一键派生的任务(其余走各自专用流程)+ 每任务参数表单 schema
   const DERIVABLE = new Set(['cellopt', 'static', 'dos_pdos', 'bader', 'chgdiff', 'elf',
-    'bands', 'eos', 'workfunction', 'dimer', 'freq', 'aimd',
+    'bands', 'eos', 'workfunction', 'dimer', 'freq', 'aimd', 'vaspsol',
     'conv_encut', 'conv_kmesh', 'conv_vacuum', 'conv_thickness']);
   // 有专用面板/计算器的任务:点「派生」不是死按钮,而是跳转/展开对应面板(P0-1 / P0-2)。
   const ROUTED = {
+    relax: { label: '前往四件套输入', run: gotoRelax },
+    adsorption_project: { label: '前往吸附能全流程', run: gotoAdsorption },
+    spin_scan: { label: '前往多自旋扫描', run: gotoSpin },
     neb: { label: '前往 NEB 面板', run: expandNeb },
     formation_binding: { label: '前往形成能/结合能计算器', run: gotoCalc },
+    surface_energy: { label: '前往表面能计算器', run: gotoSurfaceEnergy },
   };
   const PARAMS = {
     eos: [{ k: 'scales', label: '缩放因子(逗号分隔,留空=默认7点)', ph: '0.96, 0.98, 1.0, 1.02, 1.04', list: 'float' }],
@@ -29,19 +33,30 @@
       { k: 'steps', label: '步数', ph: '10000', num: true }, { k: 'potim_fs', label: '步长 fs', ph: '1.0', num: true }],
     dimer: [{ k: 'amplitude', label: '初始位移幅度 Å', ph: '0.01', num: true }],
     cellopt: [{ k: 'bump_encut', label: 'ENCUT×1.3(缓 Pulay 应力)', check: true }],
+    vaspsol: [{ k: 'eb_k', label: '溶剂相对介电常数 EB_K', ph: '78.4', num: true }],
   };
   // 任务性质徽标底色(P2:作业生成 / 结果计算器 / INCAR 顾问)
   const BADGE_CLS = { '作业生成': 'gen', '结果计算器': 'calc', 'INCAR 顾问': 'advisor' };
+  const ANALYSIS_LABEL = {
+    integrated: '自动解析 + 报告', evidence_only: '产物核对 + 报告',
+    dedicated: '专用流程 + 报告', unsupported: '暂不支持分析',
+  };
 
   // ── ② 计算类型目录 ──
   async function loadCatalog() {
-    const r = await VCS.call('task_catalog');
+    const sceneKey = (VCS.scenario && VCS.scenario.key) || null;
+    const active = VCS.activeCalculation || null;
+    const r = await VCS.call('task_catalog', sceneKey, active);
     if (!r || r.ok === false) { VCS.log('加载计算类型目录失败:' + ((r && r.error) || '未知'), 'failc'); return; }
     State.cats = r.categories || [];
     State.tasks = r.tasks || [];
     State.cat = State.cats[0] || null;
+    State.sel = null;
+    const form = $('tc-form'); if (form) form.hidden = true;
     renderCats();
     renderGrid();
+    if (State.tasks.length === 1) selectTask(State.tasks[0].key);
+    syncAnalysisKind();
   }
   // 分类 optgroup 下拉替代"分类 chips + 卡片网格墙"(VASP 23 类计算目录)。
   // 保留 tc-cats(承载下拉)与 tc-grid(隐藏,id 保持)容器。
@@ -92,6 +107,7 @@
     const routed = !!ROUTED[key];
     if ($('tc-sel-badges')) $('tc-sel-badges').innerHTML =
       `<span class="tc-badge tc-badge-${BADGE_CLS[kind] || 'gen'}">${VCS.esc(kind)}</span>` +
+      `<span class="tc-badge">${VCS.esc(ANALYSIS_LABEL[t.analysis_status] || '分析能力待确认')}</span>` +
       `<span class="tc-badge">产物:${VCS.esc(t.outputs || '—')}</span>` +
       (DERIVABLE.has(key) || routed ? '' : '<span class="tc-badge">此类型经专用流程建作业(非一键派生)</span>');
     renderParams(key);
@@ -114,6 +130,20 @@
     }
     VCS.toast('已展开 NEB 面板:填始态/末态目录后「生成 NEB」');
   }
+  function focusAfterNavigate(page, selector, message) {
+    VCS.navigate(page, { source: 'task-catalog', focusSelector: selector }).then(out => {
+      if (out.ok && message) VCS.toast(message);
+    });
+  }
+  function gotoRelax() {
+    focusAfterNavigate('generate', '#gen-poscar', '选择 POSCAR、INCAR 和输出目录后生成四件套');
+  }
+  function gotoAdsorption() {
+    focusAfterNavigate('project', '#ads-journey', '已进入吸附能全流程');
+  }
+  function gotoSpin() {
+    focusAfterNavigate('structure', '#spin-card', '已定位多自旋态扫描');
+  }
   function gotoCalc() {
     const nav = document.querySelector('nav a[data-page="project"]');
     if (nav) nav.click();
@@ -122,6 +152,11 @@
       if (c) c.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }, 120);
     VCS.toast('已跳转到结果分析页的形成能/结合能计算器');
+  }
+  function gotoSurfaceEnergy() {
+    const ana = $('analysis-type');
+    if (ana) { ana.value = 'taskana'; ana.dispatchEvent(new Event('change', { bubbles: true })); }
+    focusAfterNavigate('project', '#ta-se-slab', '选择 slab 与同口径 bulk 作业后计算表面能');
   }
   function renderParams(key) {
     const box = $('tc-params');
@@ -202,6 +237,11 @@
       VCS.log('已派生 ' + n + ' 个作业并入台账:' + (r.job_dirs || []).map(d => d.split(/[\\/]/).pop()).join('、'), 'okc');
       (r.warnings || []).forEach(w => VCS.log('提示:' + w, 'warnc'));
       VCS.toast('已派生 ' + n + ' 个作业');
+      if (n && VCS.nextStep) VCS.nextStep({
+        title: '派生作业已生成', message: `已创建 ${n} 个作业并加入任务列表。`,
+        detail: '下一步：选择服务器、核数与墙时，然后上传并提交。',
+        primaryLabel: '前往任务页提交', page: 'jobs', focusJobDir: (r.job_dirs || [])[0] || '',
+      });
     } finally { if (btn) btn.disabled = false; }
   }
 
@@ -231,6 +271,11 @@
         `<div class="actions" style="margin-top:6px"><button class="btn" data-open="${VCS.esc(r.job_dir)}">打开目录</button></div></div>`;
       VCS.toast('已生成 NEB 目录树');
       if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
+      if (VCS.nextStep) VCS.nextStep({
+        title: 'NEB 作业已生成', message: 'NEB 目录树已加入任务列表。',
+        detail: '下一步：选择服务器并上传提交；任务页会按 NEB 目录结构处理。',
+        primaryLabel: '前往任务页提交', page: 'jobs', focusJobDir: r.job_dir,
+      });
     } finally { if (btn) btn.disabled = false; }
   }
 
@@ -257,8 +302,12 @@
     const r = await VCS.call('formation_binding_calc', sac, sub || null,
       Object.keys(atom).length ? atom : null, Object.keys(mu).length ? mu : null);
     const out = $('fb-out');
-    if (!r || r.error) { VCS.log('计算失败:' + ((r && r.error) || '未知'), 'failc');
-      if (out) out.innerHTML = `<div class="ta-summary" style="color:var(--fail)">${VCS.esc((r && r.error) || '计算失败')}</div>`;
+    if (!r || r.error) {
+      (r && r.warnings || []).forEach(warning => VCS.log('形成能/结合能:' + warning, 'warnc'));
+      VCS.log('计算失败:' + ((r && r.error) || '未知'), 'failc');
+      const warningHtml = (r && r.warnings || []).map(warning =>
+        `<div class="sub" style="color:var(--warn);margin-top:4px">⚠ ${VCS.esc(warning)}</div>`).join('');
+      if (out) out.innerHTML = `<div class="ta-summary" style="color:var(--fail)">${VCS.esc((r && r.error) || '计算失败')}${warningHtml}</div>`;
       return; }
     let h = '<div class="ta-summary">';
     if (r.e_sac != null) h += `E(SAC)=${(+r.e_sac).toFixed(4)} eV`;
@@ -269,6 +318,11 @@
     if (r.formation_energy != null) h += `<br>形成能 <b>Ef = ${(+r.formation_energy).toFixed(4)} eV</b>`;
     if (r.stability_note) h += `<div class="sub" style="margin-top:4px">${VCS.esc(r.stability_note)}</div>`;
     (r.hints || []).forEach(hint => { h += `<div class="sub" style="color:var(--warn);margin-top:4px">${VCS.esc(hint)}</div>`; });
+    (r.warnings || []).forEach(warning => {
+      h += `<div class="sub" style="color:var(--warn);margin-top:4px">⚠ ${VCS.esc(warning)}</div>`;
+      VCS.log('形成能/结合能:' + warning, 'warnc');
+    });
+    if (r.report_file) h += `<div class="actions" style="margin-top:6px"><button class="btn" data-open="${VCS.esc(r.report_file)}">打开可追溯报告</button></div>`;
     h += '</div>';
     if (out) out.innerHTML = h;
     if (r.binding_energy != null || r.formation_energy != null)
@@ -295,12 +349,15 @@
       }
       let h = `<div class="ta-summary">已合成 <b>${VCS.esc(r.out)}</b>(VESTA 可读)` +
         ` · Δ(ρ×V) 极大 ${(+r.max).toExponential(3)} / 极小 ${(+r.min).toExponential(3)} · 网格 ${r.n_grid}` +
-        `<div class="actions" style="margin-top:6px"><button class="btn" data-open="${VCS.esc(r.out)}">打开目录</button></div></div>`;
+        `<div class="actions" style="margin-top:6px"><button class="btn" data-open="${VCS.esc(r.out)}">打开目录</button>` +
+        (r.report_file ? `<button class="btn" data-open="${VCS.esc(r.report_file)}">打开可追溯报告</button>` : '') +
+        `</div>` + (r.warnings || []).map(w => `<div class="sub" style="color:var(--warn)">⚠ ${VCS.esc(w)}</div>`).join('') + `</div>`;
       if (out) {
         out.innerHTML = h + '<div id="cd-chart" style="height:220px;margin-top:8px"></div>';
         renderChargeProfile(r.profile || {});
       }
       VCS.log('差分电荷合成完成:' + r.out, 'okc');
+      (r.warnings || []).forEach(w => VCS.log('差分电荷:' + w, 'warnc'));
       VCS.toast('已合成差分电荷 Δρ');
     } finally { if (btn) btn.disabled = false; }
   }
@@ -319,10 +376,30 @@
   }
 
   // ── ④ 任务解析 ──
+  function selectedAnalysisKind() {
+    return (($('ta-kind') && $('ta-kind').value) || '').trim();
+  }
+
+  function syncAnalysisKind() {
+    const sel = $('ta-kind');
+    if (!sel) return;
+    const old = sel.querySelector('[data-active-calculation]');
+    if (old) old.remove();
+    const active = VCS.activeCalculation || '';
+    if (!active) return;
+    const task = State.tasks.find(row => row.key === active);
+    const option = document.createElement('option');
+    option.value = active;
+    option.dataset.activeCalculation = '1';
+    option.textContent = '按设置：' + ((task && task.name_zh) || active);
+    sel.insertBefore(option, sel.children[1] || null);
+    sel.value = active;
+  }
+
   async function analyze() {
     const d = (($('ta-dir') && $('ta-dir').value) || '').trim();
     if (!d) { VCS.log('请选择作业目录', 'failc'); return; }
-    const kind = ($('ta-kind') && $('ta-kind').value) || '';
+    const kind = selectedAnalysisKind();
     const btn = $('ta-run');
     if (btn) btn.disabled = true;
     VCS.log('任务解析…');
@@ -331,14 +408,35 @@
       const out = $('ta-out');
       if (!r || r.ok === false || r.error) {
         VCS.log('解析失败:' + ((r && r.error) || '未知'), 'failc');
-        if (out) out.innerHTML = `<div class="ta-summary" style="color:var(--fail)">${VCS.esc((r && r.error) || '解析失败')}</div>`;
+        if (out) out.innerHTML = `<div class="ta-summary" style="color:var(--fail)">${VCS.esc((r && r.error) || '解析失败')}` +
+          `${r && r.next_action ? `<div class="sub" style="margin-top:6px">下一步：${VCS.esc(r.next_action)}</div>` : ''}</div>`;
         return;
       }
-      let h = `<div class="ta-summary"><b>${VCS.esc(r.kind)}</b> — ${VCS.esc(r.summary || '')}</div>`;
+      let h = `<div class="ta-summary"><b>${VCS.esc(r.kind)}</b> — ${VCS.esc(r.summary || '')}` +
+        `${r.next_action ? `<div class="sub" style="margin-top:6px">建议：${VCS.esc(r.next_action)}</div>` : ''}</div>`;
       if (r.figure) h += `<img class="ta-img" src="file://${VCS.esc(r.figure)}" alt="figure">` +
         `<div class="actions" style="margin-top:6px"><button class="btn" data-open="${VCS.esc(r.figure)}">打开目录</button></div>`;
       if (out) out.innerHTML = h;
       VCS.log('解析完成:' + (r.summary || r.kind), 'okc');
+    } finally { if (btn) btn.disabled = false; }
+  }
+
+  async function makeTaskReport() {
+    const d = (($('ta-dir') && $('ta-dir').value) || '').trim();
+    if (!d) { VCS.log('生成报告前请先选择作业目录', 'failc'); return; }
+    const sep = d.includes('\\') ? '\\' : '/';
+    const path = d.replace(/[\\/]$/, '') + sep + 'vcstudio-task-report.html';
+    const btn = $('ta-report'); if (btn) btn.disabled = true;
+    try {
+      const r = await VCS.call('task_report', d, path, selectedAnalysisKind() || null);
+      if (!r || r.ok === false || r.error) {
+        VCS.log('报告生成失败:' + ((r && r.error) || '未知'), 'failc'); return;
+      }
+      VCS.log('可追溯报告已生成:' + r.file, r.analysis_ok ? 'okc' : 'warnc');
+      VCS.nextStep({ title: '任务报告已生成',
+        message: r.analysis_ok ? '解析结果和文件指纹已写入报告。' : '报告已记录缺失项和下一步，没有伪造分析结论。',
+        detail: r.file, primaryLabel: '打开报告所在目录',
+        onPrimary: () => VCS.call('open_dir', r.file) });
     } finally { if (btn) btn.disabled = false; }
   }
   async function surfEnergy() {
@@ -349,10 +447,41 @@
     VCS.log('表面能计算…');
     const r = await VCS.call('surface_energy_calc', slab, bulk, eb ? parseFloat(eb) : null, null);
     const out = $('ta-out');
-    if (!r || r.ok === false || r.error) { VCS.log('表面能计算失败:' + ((r && r.error) || '未知'), 'failc'); return; }
+    if (!r || r.ok === false || r.error) {
+      (r && r.warnings || []).forEach(warning => VCS.log('表面能:' + warning, 'warnc'));
+      VCS.log('表面能计算失败:' + ((r && r.error) || '未知'), 'failc'); return;
+    }
+    const warnings = (r.warnings || []).map(warning =>
+      `<div class="sub" style="color:var(--warn);margin-top:4px">⚠ ${VCS.esc(warning)}</div>`).join('');
+    const report = r.report_file
+      ? `<div class="actions"><button class="btn" data-open="${VCS.esc(r.report_file)}">打开可追溯报告</button></div>` : '';
     if (out) out.innerHTML = `<div class="ta-summary">表面能 <b>γ = ${r.gamma_jm2.toFixed(4)} J/m²</b>` +
-      ` · 面积 ${r.area_a2.toFixed(2)} Å² · N=${r.n_slab} · E_bulk/atom=${r.e_bulk_per_atom.toFixed(4)} eV</div>`;
+      ` · 面积 ${r.area_a2.toFixed(2)} Å² · N=${r.n_slab} · E_bulk/atom=${r.e_bulk_per_atom.toFixed(4)} eV${warnings}${report}</div>`;
+    (r.warnings || []).forEach(warning => VCS.log('表面能:' + warning, 'warnc'));
     VCS.log('γ = ' + r.gamma_jm2.toFixed(4) + ' J/m²', 'okc');
+  }
+
+  async function vaspsolPair() {
+    const vacuum = (($('vs-vacuum') && $('vs-vacuum').value) || '').trim();
+    const solvent = (($('vs-solvent') && $('vs-solvent').value) || '').trim();
+    if (!vacuum || !solvent) {
+      VCS.log('VASPsol 配对：请选择真空与溶剂两个作业目录', 'failc'); return;
+    }
+    const btn = $('vs-run'); if (btn) btn.disabled = true;
+    try {
+      const r = await VCS.call('vaspsol_pair_calc', vacuum, solvent, null);
+      const out = $('vs-out');
+      if (!r || r.ok === false || r.error) {
+        VCS.log('VASPsol 配对计算失败:' + ((r && r.error) || '未知'), 'failc');
+        if (out) out.innerHTML = `<div class="ta-summary" style="color:var(--fail)">${VCS.esc((r && r.error) || '计算失败')}</div>`;
+        return;
+      }
+      if (out) out.innerHTML = `<div class="ta-summary">溶剂化能 <b>ΔE<sub>solv</sub> = ${(+r.solvation_energy_eV).toFixed(8)} eV</b>` +
+        ` · E<sub>vac</sub>=${(+r.e_vacuum_eV).toFixed(8)} eV · E<sub>sol</sub>=${(+r.e_solvent_eV).toFixed(8)} eV` +
+        `<div class="sub">已验证配对、方法一致性与 VASPsol OUTCAR 证据；报告：${VCS.esc(r.report_file)}</div>` +
+        `<div class="actions"><button class="btn" data-open="${VCS.esc(r.report_file)}">打开报告所在目录</button></div></div>`;
+      VCS.log('VASPsol 配对报告已生成:' + r.report_file, 'okc');
+    } finally { if (btn) btn.disabled = false; }
   }
 
   // ── 初始化 ──
@@ -382,7 +511,12 @@
     wire('ta-se-slab-btn', () => browseInto('ta-se-slab', 'dir'));
     wire('ta-se-bulk-btn', () => browseInto('ta-se-bulk', 'dir'));
     wire('ta-run', analyze);
+    wire('ta-report', makeTaskReport);
+    wire('ta-spin-jobs', () => VCS.navigate('jobs', { source: 'spin-analysis' }));
     wire('ta-se-run', surfEnergy);
+    wire('vs-vacuum-btn', () => browseInto('vs-vacuum', 'dir'));
+    wire('vs-solvent-btn', () => browseInto('vs-solvent', 'dir'));
+    wire('vs-run', vaspsolPair);
     // NEB 面板(②生成页):始/末态浏览 + 生成
     wire('neb-start-btn', () => browseInto('neb-start', 'dir'));
     wire('neb-end-btn', () => browseInto('neb-end', 'dir'));
@@ -396,7 +530,7 @@
     wire('cd-b-btn', () => browseInto('cd-b', 'dir'));
     wire('cd-run', chgdiffSynth);
     // 结果卡片「打开目录」委托(ta-out / neb-out / fb-out / cd-out 共用 data-open)
-    ['ta-out', 'neb-out', 'fb-out', 'cd-out'].forEach(oid => {
+    ['ta-out', 'neb-out', 'fb-out', 'cd-out', 'vs-out'].forEach(oid => {
       const box = $(oid);
       if (box) box.addEventListener('click', e => {
         const b = e.target.closest('[data-open]'); if (b) VCS.call('open_dir', b.dataset.open);
@@ -411,5 +545,8 @@
   });
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
+  document.addEventListener('vcs:scenario', loadCatalog);
+  document.addEventListener('vcs:calculation', loadCatalog);
+  document.addEventListener('vcs:calculation', syncAnalysisKind);
   window.TaskCat = { reload: loadCatalog };
 })();

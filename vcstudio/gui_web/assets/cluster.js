@@ -23,7 +23,7 @@
 
   // 表单现值 → save_profile 所需 dict(数字化 + env 按行去空)
   function readForm() {
-    return {
+    const data = {
       name: trimval('cl-name'),
       hostname: trimval('cl-hostname'),
       port: num('cl-port', 22),
@@ -47,6 +47,15 @@
       script_mode: radio('cl-mode') || 'auto',
       template_path: trimval('cl-template'),
     };
+    const commands = {};
+    [['cp2k', 'cl-cp2kcmd'], ['gaussian', 'cl-gaussiancmd'],
+      ['castep', 'cl-castepcmd']].forEach(([engine, id]) => {
+      const command = trimval(id);
+      if (command) commands[engine] = command;
+    });
+    // 仅当界面确有这些控件时发送映射；老页面保存其它字段不会擦除后端已有配置。
+    if ($('cl-cp2kcmd')) data.engine_commands = commands;
+    return data;
   }
 
   // profile dict → 回填全部字段
@@ -72,6 +81,10 @@
     set('cl-walltime', p.walltime || '24:00:00');
     set('cl-env', (p.env_lines || []).join('\n'));
     set('cl-vaspcmd', p.vasp_cmd || '');
+    const commands = p.engine_commands || {};
+    set('cl-cp2kcmd', commands.cp2k || '');
+    set('cl-gaussiancmd', commands.gaussian || '');
+    set('cl-castepcmd', commands.castep || '');
     setRadio('cl-mode', p.script_mode || 'auto');
     set('cl-template', p.template_path || '');
     toggleKeyRow();
@@ -178,16 +191,19 @@
       const res = await VCS.call('test_connection', data.name, password, trust);
       if (!res) { VCS.log('测试连接无返回', 'failc'); return; }
       if (res.needs_trust) {
-        const ok = await VCS.confirm((res.message || '未知主机指纹') + '\n\n是否信任该主机并重试?');
-        if (!ok) { VCS.log('已取消(未信任主机)', 'failc'); return; }
-        trust = true;
+        const pin = await VCS.confirmHostKey(res);
+        if (!pin) { VCS.log('已取消或阻止未知主机连接', 'failc'); return; }
+        trust = pin;
         continue;
       }
       if (res.ok) {
         VCS.log(res.message || '连接成功', 'okc');
         // 探测调度器 vs 表单选择:不一致 → 黄色警告条 + 自动切下拉(用户可改回再保存)
         const chosen = data.scheduler;
-        if (res.scheduler && res.scheduler !== chosen) {
+        if (res.scheduler && ['Slurm', 'PBS'].indexOf(res.scheduler) < 0) {
+          showWarn(`远端探测到 ${res.scheduler}，当前版本只支持 Slurm / PBS 自动提交；连接可用，但不会允许保存为可提交配置。`);
+          VCS.log(`探测到尚未支持的调度器 ${res.scheduler}；请勿按 Slurm/PBS 误提交`, 'failc');
+        } else if (res.scheduler && res.scheduler !== chosen) {
           showWarn(`远端探测到 ${res.scheduler},与当前选择的 ${chosen} 不一致,已为你选中(可改回再保存)`);
           if ($('cl-scheduler')) $('cl-scheduler').value = res.scheduler;
           VCS.log(`探测到调度器 ${res.scheduler}(原选择 ${chosen}),已自动切换下拉;如需保留请改回后重新保存`, 'okc');

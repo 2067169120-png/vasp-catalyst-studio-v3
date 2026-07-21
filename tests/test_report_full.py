@@ -155,6 +155,39 @@ def test_report_methodology_fixed_sentences(tmp_path):
     assert '真空盒尺寸' in h                               # 气相参考盒尺寸见输入文件
 
 
+def test_imported_report_does_not_claim_parameters_were_unified(tmp_path):
+    p = _proj(tmp_path)
+    p['import_source'] = '/user/already-computed'
+    sources = ('OUTCAR:TOTEN', 'vasprun.xml:derived_sigma0')
+    for d, source in zip(p['members']['configs'], sources):
+        m = mm.load_manifest(d)
+        m['results']['energy_source'] = source
+        mm.save_manifest(d, m)
+    out = report_full.generate_project_report(
+        p, tmp_path / 'imported.html',
+        origin_render=lambda *a, **k: {'ok': False, 'images': {}, 'error': ''},
+        ai_analyze=lambda payload: {'ok': False, 'error': 'skip'})
+
+    h = out.read_text(encoding='utf-8')
+    assert '不默认其 INCAR/ENCUT/K 点一致' in h
+    assert '项目内各作业 ENCUT 统一' not in h
+    assert '成员共享 INCAR' not in h
+    assert '首个可读成员的 INCAR 关键键' in h
+    assert 'OUTCAR:TOTEN' in h and 'vasprun.xml:derived_sigma0' in h
+    assert '全部能量为 DFT 电子能(OSZICAR E0)' not in h
+
+
+def test_report_without_delta_is_explicitly_diagnostic(tmp_path):
+    p = _proj(tmp_path, n_done=0)
+    out = report_full.generate_project_report(
+        p, tmp_path / 'diagnostic.html',
+        origin_render=lambda *a, **k: {'ok': False, 'images': {}, 'error': ''},
+        ai_analyze=lambda payload: {'ok': False, 'error': 'skip'})
+
+    h = out.read_text(encoding='utf-8')
+    assert '当前报告为诊断版' in h and '尚无可用 ΔE' in h
+
+
 def test_structure_gallery_embeds_existing_renders(tmp_path):
     p = _proj(tmp_path)
     figs = os.path.join(p['members']['configs'][0], 'figs')
@@ -166,3 +199,109 @@ def test_structure_gallery_embeds_existing_renders(tmp_path):
         ai_analyze=lambda payload: {'ok': False, 'error': 'skip'})
     h = out.read_text(encoding='utf-8')
     assert '结构图(POV-Ray)' in h and 'x_top.png' in h
+
+
+def _generate_with_molecule_source(monkeypatch, tmp_path, project_dir, config_dir):
+    """生成报告并捕获 freeenergy 真正收到的分子库目录。"""
+    p = _proj(tmp_path)
+    if project_dir is not None:
+        p['molecules_dir'] = str(project_dir)
+    called = {}
+
+    def fake_path(rows, e_slab, molecules_dir, *, g_corr=None, mu_li=None):
+        called['molecules_dir'] = molecules_dir
+        return None
+
+    monkeypatch.setattr(report_full.freeenergy, 'path_from_project_and_molecules', fake_path)
+    logs = []
+    report_full.generate_project_report(
+        p, tmp_path / 'molecule-source.html',
+        config={'lis_molecules_dir': str(config_dir) if config_dir is not None else ''},
+        origin_render=lambda *a, **k: {'ok': False, 'images': {}, 'error': ''},
+        ai_analyze=lambda payload: {'ok': False, 'error': 'skip'}, log=logs.append)
+    return called.get('molecules_dir'), logs
+
+
+def test_report_prefers_imported_project_molecules_dir(monkeypatch, tmp_path):
+    project_dir = tmp_path / 'imported-molecules'
+    config_dir = tmp_path / 'configured-molecules'
+    project_dir.mkdir()
+    config_dir.mkdir()
+
+    used, logs = _generate_with_molecule_source(
+        monkeypatch, tmp_path, project_dir, config_dir)
+
+    assert used == str(project_dir)
+    assert not any('回退全局配置' in line for line in logs)
+
+
+def test_report_falls_back_when_project_molecules_dir_missing(monkeypatch, tmp_path):
+    missing_project_dir = tmp_path / 'moved-imported-molecules'
+    config_dir = tmp_path / 'configured-molecules'
+    config_dir.mkdir()
+
+    used, logs = _generate_with_molecule_source(
+        monkeypatch, tmp_path, missing_project_dir, config_dir)
+
+    assert used == str(config_dir)
+    assert any('回退全局配置' in line for line in logs)
+
+
+def test_species_reference_report_contains_energy_source_provenance_and_formula(tmp_path):
+    project = _proj(tmp_path, n_done=1)
+    config = project['members']['configs'][0]
+    ref_job = tmp_path / 'molecules' / 'mol_Li2S8'
+    ref_job.mkdir(parents=True)
+    ref = mm.new_manifest(
+        job_id='ref', system='Li2S8', task_type='relax', calc_type='molecule',
+        inputs={'imported_from': '/original/Li2S8',
+                'source_sha256': {'OUTCAR': 'a' * 64, 'OSZICAR': 'b' * 64}})
+    mm.set_state(ref, 'DONE')
+    ref['results'].update(
+        energy_e0_eV=-38.072771, energy_source='OSZICAR:E0',
+        import_confirmation={'manual': False})
+    mm.save_manifest(ref_job, ref)
+    project['config_species'] = {config: 'Li2S8'}
+    project['species_refs'] = {'Li2S8': -38.072771}
+    project['species_ref_jobs'] = {'Li2S8': str(ref_job)}
+
+    out = report_full.generate_project_report(
+        project, tmp_path / 'species-report.html',
+        origin_render=lambda *args, **kwargs: {'ok': False, 'images': {}, 'error': ''},
+        ai_analyze=lambda payload: {'ok': False, 'error': 'skip'})
+    html = out.read_text(encoding='utf-8')
+    assert '逐物种参考能与溯源' in html
+    assert 'Li2S8' in html and '-38.072771' in html and 'OSZICAR:E0' in html
+    assert '/original/Li2S8' in html and 'aaaaaaaaaaaa…' in html
+    assert '吸附能逐项核算' in html
+    assert '参考状态' in html and 'DONE' in html
+    assert html.count('-38.072771') >= 2 and '-38.0727710000' in html
+    assert 'E(slab+ads) − E(slab) − E(ref)' in html
+
+
+def test_species_reference_report_uses_manifest_truth_and_blocks_cache_drift(tmp_path):
+    project = _proj(tmp_path, n_done=1)
+    config = project['members']['configs'][0]
+    ref_job = tmp_path / 'molecules' / 'mol_Li2S8-drift'
+    ref_job.mkdir(parents=True)
+    ref = mm.new_manifest(
+        job_id='ref-drift', system='Li2S8', task_type='relax',
+        calc_type='molecule', inputs={})
+    mm.set_state(ref, 'DONE')
+    ref['results'].update(energy_e0_eV=-38.072771, energy_source='OSZICAR:E0')
+    mm.save_manifest(ref_job, ref)
+    project['config_species'] = {config: 'Li2S8'}
+    project['species_refs'] = {'Li2S8': -38.0}  # stale project.yaml cache
+    project['species_ref_jobs'] = {'Li2S8': str(ref_job)}
+
+    out = report_full.generate_project_report(
+        project, tmp_path / 'species-drift-report.html',
+        origin_render=lambda *args, **kwargs: {'ok': False, 'images': {}, 'error': ''},
+        ai_analyze=lambda payload: {'ok': False, 'error': 'skip'})
+    html = out.read_text(encoding='utf-8')
+
+    assert '逐物种参考能与溯源' in html
+    assert '-38.072771' in html and 'OSZICAR:E0' in html and 'DONE' in html
+    assert '参考能缓存与 job.yaml 不一致' in html and '容差 1e-06 eV' in html
+    assert '吸附能逐项核算' not in html
+    assert '当前报告为诊断版' in html

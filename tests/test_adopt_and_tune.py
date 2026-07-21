@@ -104,6 +104,49 @@ def test_adopt_rejects_relative_remote_and_double_adopt(tmp_path):
         ledger_mod.default_ledger_path = orig
 
 
+def test_adopt_preserves_existing_manifest_task_type(tmp_path):
+    local = tmp_path / 'existing_static'
+    local.mkdir()
+    original = manifest.new_manifest(
+        job_id='existing', system='surface', task_type='static', calc_type='slab', inputs={})
+    manifest.save_manifest(local, original)
+    import vcstudio.cluster.ledger as ledger_mod
+    orig = ledger_mod.default_ledger_path
+    ledger_mod.default_ledger_path = lambda: tmp_path / 'jobs.json'
+    try:
+        adopted = submitter.adopt_external_job(
+            str(local), _profile(), '55', '/work/static')
+    finally:
+        ledger_mod.default_ledger_path = orig
+    assert adopted['task_type'] == 'static'
+    assert manifest.load_manifest(local)['task_type'] == 'static'
+
+
+def test_adopt_explicit_task_is_strictly_normalized_and_conflicts_rejected(tmp_path):
+    import vcstudio.cluster.ledger as ledger_mod
+    orig = ledger_mod.default_ledger_path
+    ledger_mod.default_ledger_path = lambda: tmp_path / 'jobs.json'
+    try:
+        fresh = submitter.adopt_external_job(
+            str(tmp_path / 'band'), _profile(), '56', '/work/band', task_type='band')
+        assert fresh['task_type'] == 'bands'
+        with pytest.raises(ValueError, match='未知任务类型'):
+            submitter.adopt_external_job(
+                str(tmp_path / 'bad'), _profile(), '57', '/work/bad', task_type='statci')
+        assert not (tmp_path / 'bad').exists()
+
+        existing = tmp_path / 'existing_dos'
+        existing.mkdir()
+        manifest.save_manifest(existing, manifest.new_manifest(
+            job_id='dos', system='s', task_type='dos_pdos', calc_type='slab', inputs={}))
+        with pytest.raises(ValueError, match='冲突'):
+            submitter.adopt_external_job(
+                str(existing), _profile(), '58', '/work/dos', task_type='relax')
+        assert manifest.load_manifest(existing)['task_type'] == 'dos_pdos'
+    finally:
+        ledger_mod.default_ledger_path = orig
+
+
 # ── 队列全量明细解析 ─────────────────────────────────────────────────────────
 def test_slurm_parse_detail_with_workdir():
     d = SlurmDialect()

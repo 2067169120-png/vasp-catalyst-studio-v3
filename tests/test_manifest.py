@@ -2,6 +2,7 @@
 import pytest
 
 from vcstudio.generate.job_builder import build_job_dir
+from vcstudio.generate import task_catalog
 from vcstudio.shared import manifest
 
 
@@ -63,6 +64,33 @@ def test_incar_source_labels():
     assert manifest.incar_source_label(False, {}) == 'user_no_validate'
     assert manifest.incar_source_label(True, {}) == 'user_verbatim'
     assert manifest.incar_source_label(True, {'ENCUT': 400}) == 'user+completion'
+
+
+def test_manifest_task_types_cover_full_catalog_and_normalize_legacy_aliases():
+    catalog_keys = tuple(item['key'] for item in task_catalog.CATALOG)
+    assert len(catalog_keys) == 23
+    assert catalog_keys == manifest.CATALOG_TASK_TYPES
+    assert set(catalog_keys).issubset(manifest.KNOWN_TASK_TYPES)
+    assert manifest.normalize_task_type('band') == 'bands'
+    assert manifest.normalize_task_type('DOS') == 'dos_pdos'
+    m = manifest.new_manifest(
+        job_id='legacy-band', system='s', task_type='band', calc_type='bulk', inputs={})
+    assert m['task_type'] == 'bands'
+
+
+def test_unknown_task_type_is_rejected_instead_of_silently_becoming_relax(tmp_path):
+    with pytest.raises(ValueError, match='未知任务类型'):
+        manifest.new_manifest(
+            job_id='bad', system='s', task_type='statci', calc_type='bulk', inputs={})
+
+    poscar, lib = _make_fixture(tmp_path)
+    out = tmp_path / 'bad-build'
+    res = build_job_dir(poscar, 'ENCUT = 400\n', str(out),
+                        calc_type='molecule', lib_root=lib)
+    res['task_type'] = 'statci'
+    with pytest.raises(ValueError, match='未知任务类型'):
+        manifest.create_from_build(str(out), res, poscar_path=poscar)
+    assert not (out / 'job.yaml').exists()
 
 
 def test_set_state_appends_history_and_rejects_bogus(tmp_path):

@@ -3,17 +3,31 @@
 从 gui/jobs_tab.py 搬出,Tk 与 gui_web 两个 GUI 共用。
 本模块绝不 import Tk/webview 等 GUI 框架;paramiko 延迟导入。
 返回统一 {'needs_trust': bool, 'message': str, 'results'|'jobs': list}。
+needs_trust=True 时透传 fingerprint/algorithm/host,供界面展示并精确 pin。
 中文注释允许,英文标识符。
 """
 from __future__ import annotations
 
 import os
+import posixpath
 import re
 
 from vcstudio.cluster import submitter
 from vcstudio.cluster.connection import open_client, close_quiet, ConnectError
 from vcstudio.cluster.schedulers import get_dialect
 from vcstudio.shared import manifest as manifest_mod
+
+
+def _trust_payload(error: ConnectError, **empty) -> dict:
+    """把连接层 missing_host_key 捕获的真实 key 证据原样透传。"""
+    empty.update({
+        'needs_trust': True,
+        'message': str(error),
+        'fingerprint': getattr(error, 'fingerprint', ''),
+        'algorithm': getattr(error, 'algorithm', ''),
+        'host': getattr(error, 'host', ''),
+    })
+    return empty
 
 
 # ── 后台线程体(不碰 Tk) ─────────────────────────────────────────────────────
@@ -25,11 +39,29 @@ def _job_errors():
 
 
 def submit_batch(prof, pw, dirs, trust_new):
+    dirs = list(dirs)
+    # 整批联网前解析远程目标。不同本地目录（或同一路径被重复选中）若映射到同一个
+    # remote_dir，后上传者会覆盖先上传者并产生两个同目录作业，必须整批 fail closed。
+    planned = {}
+    for d in dirs:
+        try:
+            remote = posixpath.normpath(submitter.planned_remote_dir(prof, d))
+        except (ValueError, TypeError, OSError, AttributeError):
+            continue                     # 单作业的详细输入错误仍由 submit_job/preflight 返回
+        planned.setdefault(remote, []).append(str(d))
+    conflicts = {remote: paths for remote, paths in planned.items() if len(paths) > 1}
+    if conflicts:
+        detail = '；'.join(
+            f'{remote} ← {", ".join(paths)}' for remote, paths in conflicts.items())
+        message = ('整批未提交：多个本地作业映射到同一远程目录，可能互相覆盖。'
+                   f'请重命名作业目录或设置不同 remote_namespace：{detail}')
+        return {'needs_trust': False,
+                'results': [(d, False, message) for d in dirs]}
     try:
         client, jump = open_client(prof, pw, trust_new=trust_new)
     except ConnectError as e:
         if e.needs_trust:
-            return {'needs_trust': True, 'message': str(e), 'results': []}
+            return _trust_payload(e, results=[])
         raise RuntimeError(str(e))
     results = []
     try:
@@ -46,18 +78,26 @@ def submit_batch(prof, pw, dirs, trust_new):
     return {'needs_trust': False, 'results': results}
 
 
-def fetch_batch(prof, pw, dirs, trust_new, files=submitter.FETCH_FILES):
+def fetch_batch(prof, pw, dirs, trust_new, files=None):
+    """Fetch selected jobs in one SSH session.
+
+    ``files=None`` deliberately stays ``None`` for every job so submitter can
+    inspect that directory's manifest and choose DOS/能带/Bader/ELF/功函数/AIMD
+    outputs independently.  An explicit list remains the user's manual
+    override and is applied to every selected job.
+    """
     try:
         client, jump = open_client(prof, pw, trust_new=trust_new)
     except ConnectError as e:
         if e.needs_trust:
-            return {'needs_trust': True, 'message': str(e), 'results': []}
+            return _trust_payload(e, results=[])
         raise RuntimeError(str(e))
     results = []
     try:
         sftp = client.open_sftp()
         for d in dirs:
             try:
+                submitter.assert_profile_binding(prof, d, '拉回结果')
                 fetched, missing = submitter.fetch_results(client, sftp, d, files=files)
                 msg = '已拉回 ' + ('、'.join(fetched) if fetched else '(无)')
                 if missing:
@@ -93,6 +133,7 @@ def filter_continuable(dirs):
         rounds = int(res.get('continue_rounds', 0))
         if (m is not None
                 and m.get('state') not in ('UPLOADED', 'SUBMITTED', 'QUEUED', 'RUNNING')
+                and str(m.get('task_type') or '') != 'neb'
                 and dgn.get('restartable')
                 and rounds < submitter.CONTINUE_MAX_ROUNDS):
             eligible.append(d)
@@ -107,7 +148,7 @@ def continue_batch(prof, pw, dirs, trust_new):
         client, jump = open_client(prof, pw, trust_new=trust_new)
     except ConnectError as e:
         if e.needs_trust:
-            return {'needs_trust': True, 'message': str(e), 'results': []}
+            return _trust_payload(e, results=[])
         raise RuntimeError(str(e))
     results = []
     try:
@@ -128,7 +169,7 @@ def workdir_lookup(prof, pw, job_id, trust_new):
         client, jump = open_client(prof, pw, trust_new=trust_new)
     except ConnectError as e:
         if e.needs_trust:
-            return {'needs_trust': True, 'message': str(e), 'workdir': ''}
+            return _trust_payload(e, workdir='')
         raise RuntimeError(str(e))
     try:
         wd = submitter.query_workdir(client, prof, str(job_id))
@@ -143,7 +184,7 @@ def queue_detail(prof, pw, trust_new):
         client, jump = open_client(prof, pw, trust_new=trust_new)
     except ConnectError as e:
         if e.needs_trust:
-            return {'needs_trust': True, 'message': str(e), 'jobs': []}
+            return _trust_payload(e, jobs=[])
         raise RuntimeError(str(e))
     try:
         jobs = submitter.query_queue_detail(client, prof)
@@ -172,7 +213,7 @@ def adopt_scan(prof, pw, trust_new, known_ids, local_root):
         client, jump = open_client(prof, pw, trust_new=trust_new)
     except ConnectError as e:
         if e.needs_trust:
-            return {'needs_trust': True, 'message': str(e), 'results': []}
+            return _trust_payload(e, results=[])
         raise RuntimeError(str(e))
     known = {str(k) for k in (known_ids or [])}
     results = []
@@ -212,7 +253,7 @@ def tune_batch(prof, pw, job_dir, changes, trust_new, from_contcar=True):
         client, jump = open_client(prof, pw, trust_new=trust_new)
     except ConnectError as e:
         if e.needs_trust:
-            return {'needs_trust': True, 'message': str(e), 'results': []}
+            return _trust_payload(e, results=[])
         raise RuntimeError(str(e))
     results = []
     try:
@@ -235,7 +276,7 @@ def refresh_batch(prof, pw, dirs, trust_new):
         client, jump = open_client(prof, pw, trust_new=trust_new)
     except ConnectError as e:
         if e.needs_trust:
-            return {'needs_trust': True, 'message': str(e), 'results': []}
+            return _trust_payload(e, results=[])
         raise RuntimeError(str(e))
     results = []
     try:
@@ -293,6 +334,12 @@ def cancel_batch(profile, jobs, *, password=None, trust_new=False):
     except ConnectError as e:
         out['error'] = str(e)
         out['needs_trust'] = e.needs_trust
+        if e.needs_trust:
+            out.update({
+                'fingerprint': getattr(e, 'fingerprint', ''),
+                'algorithm': getattr(e, 'algorithm', ''),
+                'host': getattr(e, 'host', ''),
+            })
         return out
 
     bin_path = getattr(profile, 'scheduler_bin', '')
@@ -306,6 +353,7 @@ def cancel_batch(profile, jobs, *, password=None, trust_new=False):
                      'reason': '无 job.yaml 或缺 scheduler_job_id,无法取消'})
                 continue
             try:
+                submitter.assert_profile_binding(profile, d, '取消作业', manifest=m)
                 submitter.run_cmd(client, dialect.cancel_cmd(jid, bin_path), check=True)
                 # CANCELLED 非 manifest 合法态 → FAILED + note '用户取消'(裁决口径)
                 manifest_mod.set_state(m, 'FAILED', note='用户取消')

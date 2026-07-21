@@ -2,6 +2,9 @@
 submit_hint 文案。全部本地文件级,离线可测。
 """
 import os
+from pathlib import Path
+
+import pytest
 
 from vcstudio.cluster import quick_submit
 from vcstudio.shared import manifest as manifest_mod
@@ -9,6 +12,8 @@ from vcstudio.shared import manifest as manifest_mod
 GJF_WITH_CHK = ('%chk=water_opt.chk\n#P PBE def2-SVP sp\n\n'
                 'a title line\n\n0 1\nO 0.0 0.0 0.0\n\n')
 GJF_TITLE_ONLY = ('#P PBE def2-SVP opt\n\nWater Optimization\n\n0 1\nO 0.0 0.0 0.0\n\n')
+POSCAR_FE = ('Fe slab\n1.0\n8 0 0\n0 8 0\n0 0 15\nFe\n1\nDirect\n0 0 0\n')
+POSCAR_O = ('O box\n1.0\n12 0 0\n0 12 0\n0 0 12\nO\n1\nDirect\n0 0 0\n')
 
 
 def _write(path, text=''):
@@ -16,6 +21,13 @@ def _write(path, text=''):
     with open(path, 'w', encoding='utf-8') as f:
         f.write(text)
     return path
+
+
+def _potlib(root, entries=(('Fe', 300), ('O', 400))):
+    for variant, enmax in entries:
+        _write(str(root / variant / 'POTCAR'),
+               f'TITEL = PAW_PBE {variant}\nENMAX = {enmax}; ENMIN = 200\n')
+    return str(root)
 
 
 # ── detect_engine ─────────────────────────────────────────────────────────────
@@ -125,26 +137,68 @@ def test_build_name_collision_gets_suffix(tmp_path):
 def test_build_skips_unknown_engine(tmp_path):
     src = _write(str(tmp_path / 'notes.txt'), 'hello')
     out = quick_submit.build_quick_jobs([src], str(tmp_path / 'out'))
+    assert out['ok'] is False
     assert out['jobs'] == [] and len(out['skipped']) == 1
     assert '无法识别' in out['skipped'][0]['reason']
+    assert '未生成任何作业' in out['error']
 
 
 def test_build_skips_missing_file(tmp_path):
     out = quick_submit.build_quick_jobs([str(tmp_path / 'ghost.gjf')], str(tmp_path / 'out'))
+    assert out['ok'] is False
     assert out['jobs'] == [] and '不存在' in out['skipped'][0]['reason']
 
 
 def test_build_vasp_directory_copies_input_set(tmp_path):
     d = tmp_path / 'vaspjob'
-    _write(str(d / 'INCAR'), 'ENCUT=400\n')
+    _write(str(d / 'INCAR'), 'ENCUT=400\nNSW=0\n')
     _write(str(d / 'POSCAR'), 'Fe slab\n')
     _write(str(d / 'KPOINTS'), 'auto\n')
+    _write(str(d / 'POTCAR'), 'TITEL = PAW_PBE Fe\n')
     out = quick_submit.build_quick_jobs([str(d)], str(tmp_path / 'out'))
     job = out['jobs'][0]
     assert job['engine'] == 'vasp' and job['name'] == 'vaspjob'
-    assert set(job['files']) == {'INCAR', 'POSCAR', 'KPOINTS'}
-    for fn in ('INCAR', 'POSCAR', 'KPOINTS'):
+    assert set(job['files']) == {'INCAR', 'POSCAR', 'KPOINTS', 'POTCAR'}
+    for fn in ('INCAR', 'POSCAR', 'KPOINTS', 'POTCAR'):
         assert os.path.isfile(os.path.join(job['dir'], fn))
+    assert manifest_mod.load_manifest(job['dir'])['task_type'] == 'static'
+
+
+def test_build_vasp_directory_skips_when_quartet_is_incomplete(tmp_path):
+    d = tmp_path / 'vaspjob'
+    _write(str(d / 'INCAR'), 'ENCUT=400\nNSW=0\n')
+    _write(str(d / 'POSCAR'), 'Fe slab\n')
+    _write(str(d / 'KPOINTS'), 'auto\n')
+
+    out = quick_submit.build_quick_jobs([str(d)], str(tmp_path / 'out'))
+
+    assert out['ok'] is False
+    assert out['jobs'] == []
+    assert len(out['skipped']) == 1
+    assert 'POTCAR' in out['skipped'][0]['reason']
+    assert 'POTCAR' in out['error']
+    assert not (tmp_path / 'out' / 'vaspjob').exists()
+
+
+@pytest.mark.parametrize(
+    ('incar_text', 'expected'),
+    [
+        ('ENCUT = 500\nNSW = 0\n', 'static'),
+        ('ENCUT = 500\nNSW = 200\nIBRION = 2\n', 'relax'),
+        ('ENCUT = 500\nNSW = 1\nIBRION = 5\n', 'freq'),
+    ],
+)
+def test_build_vasp_directory_infers_task_type_from_incar(tmp_path, incar_text, expected):
+    d = tmp_path / expected
+    _write(str(d / 'INCAR'), incar_text)
+    _write(str(d / 'POSCAR'), 'Fe slab\n')
+    _write(str(d / 'KPOINTS'), 'auto\n')
+    _write(str(d / 'POTCAR'), 'TITEL = PAW_PBE Fe\n')
+
+    out = quick_submit.build_quick_jobs([str(d)], str(tmp_path / 'out'))
+
+    assert out['ok'] is True and len(out['jobs']) == 1
+    assert manifest_mod.load_manifest(out['jobs'][0]['dir'])['task_type'] == expected
 
 
 def test_build_job_prefix_applied(tmp_path):
@@ -166,3 +220,207 @@ def test_build_manifest_has_submit_hint_warning(tmp_path):
     out = quick_submit.build_quick_jobs([src], str(tmp_path / 'out'))
     m = manifest_mod.load_manifest(out['jobs'][0]['dir'])
     assert any('g16' in w for w in m['warnings'])
+
+
+# ── 父目录预检 + POSCAR/CONTCAR 自动补齐四件套 ───────────────────────────────
+def test_scan_parent_recursively_finds_jobs_and_reports_missing(tmp_path):
+    ready = tmp_path / 'batch' / 'ready'
+    for name, text in (
+        ('INCAR', 'ENCUT=500\n'), ('POSCAR', POSCAR_FE),
+        ('KPOINTS', 'Automatic\n0\nGamma\n1 1 1\n0 0 0\n'),
+        ('POTCAR', 'TITEL = PAW_PBE Fe\n'),
+    ):
+        _write(str(ready / name), text)
+    structure = tmp_path / 'batch' / 'only_structure'
+    _write(str(structure / 'CONTCAR'), POSCAR_O)
+    shared = _write(str(tmp_path / 'shared' / 'INCAR'), 'EDIFF=1E-5\nNSW=0\n')
+
+    out = quick_submit.scan_inputs([str(tmp_path / 'batch')], shared_incar=shared)
+
+    assert out['ok'] is True
+    assert out['summary'] == {
+        'total': 2, 'ready': 1, 'generatable': 1, 'blocked': 0,
+        'duplicates': 0, 'shared_incar_valid': True,
+    }
+    by_name = {item['name']: item for item in out['items']}
+    assert by_name['ready']['mode'] == 'copy'
+    assert by_name['only_structure']['mode'] == 'generate'
+    assert set(by_name['only_structure']['missing']) == set(quick_submit._VASP_INPUTS)
+
+
+def test_scan_parent_and_child_deduplicate_and_do_not_follow_symlink(tmp_path):
+    job = tmp_path / 'root' / 'job'
+    _write(str(job / 'POSCAR'), POSCAR_FE)
+    link = tmp_path / 'root' / 'loop'
+    try:
+        os.symlink(tmp_path / 'root', link, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip('当前文件系统不支持目录符号链接')
+
+    out = quick_submit.scan_inputs([str(job), str(tmp_path / 'root'), str(job)])
+
+    assert len(out['items']) == 1
+    assert out['items'][0]['path'] == str(job)
+    assert out['summary']['duplicates'] >= 2
+
+
+def test_scan_structure_without_shared_incar_is_actionable_blocked(tmp_path):
+    source = tmp_path / 'structure'
+    _write(str(source / 'POSCAR'), POSCAR_FE)
+
+    out = quick_submit.scan_inputs([str(source)])
+
+    item = out['items'][0]
+    assert item['status'] == 'incomplete' and item['can_build'] is False
+    assert '共享 INCAR' in item['message']
+    assert item['missing'] == ['INCAR', 'KPOINTS', 'POTCAR']
+
+
+def test_scan_does_not_count_shared_incar_parent_as_a_job(tmp_path):
+    root = tmp_path / 'batch'
+    shared = _write(str(root / 'INCAR'), 'ENCUT=500\n')
+    _write(str(root / 'a' / 'POSCAR'), POSCAR_FE)
+    _write(str(root / 'b' / 'POSCAR'), POSCAR_O)
+
+    out = quick_submit.scan_inputs([str(root)], shared_incar=shared)
+
+    assert out['summary']['total'] == 2
+    assert {item['name'] for item in out['items']} == {'a', 'b'}
+    assert all(item['status'] == 'generatable' for item in out['items'])
+
+
+def test_build_structure_with_shared_incar_generates_quartet_without_touching_source(tmp_path):
+    source = tmp_path / 'source' / 'fe'
+    poscar = _write(str(source / 'POSCAR'), POSCAR_FE)
+    shared = _write(str(tmp_path / 'shared' / 'INCAR'), 'EDIFF=1E-6\nNSW=0\n')
+    lib = _potlib(tmp_path / 'potpaw')
+    before = open(poscar, 'rb').read()
+
+    out = quick_submit.build_quick_jobs(
+        [str(source)], str(tmp_path / 'jobs'), shared_incar=shared, lib_root=lib)
+
+    assert out['ok'] is True and len(out['jobs']) == 1
+    job = out['jobs'][0]
+    assert job['mode'] == 'generate'
+    assert set(job['files']) == set(quick_submit._VASP_INPUTS)
+    assert open(poscar, 'rb').read() == before
+    assert sorted(p.name for p in source.iterdir()) == ['POSCAR']
+    incar_out = open(os.path.join(job['dir'], 'INCAR'), encoding='utf-8').read()
+    assert 'ENCUT = 400' in incar_out
+    manifest = manifest_mod.load_manifest(job['dir'])
+    assert manifest['task_type'] == 'static'
+    assert manifest['inputs']['quick_submit_mode'] == 'generate'
+    assert manifest['inputs']['source_structure'] == poscar
+
+
+def test_generated_batch_uses_one_group_encut(tmp_path):
+    fe = tmp_path / 'source' / 'fe'
+    oxygen = tmp_path / 'source' / 'oxygen'
+    _write(str(fe / 'POSCAR'), POSCAR_FE)
+    _write(str(oxygen / 'POSCAR'), POSCAR_O)
+    shared = _write(str(tmp_path / 'shared' / 'INCAR'), 'EDIFF=1E-5\n')
+    lib = _potlib(tmp_path / 'potpaw')
+
+    out = quick_submit.build_quick_jobs(
+        [str(tmp_path / 'source')], str(tmp_path / 'jobs'),
+        shared_incar=shared, lib_root=lib)
+
+    assert len(out['jobs']) == 2 and not out['skipped']
+    incars = [open(os.path.join(job['dir'], 'INCAR'), encoding='utf-8').read()
+              for job in out['jobs']]
+    # 1.3 × max(Fe=300,O=400) 向上取整到 50 eV -> 全组均为 550 eV。
+    assert all('ENCUT = 550' in text for text in incars)
+
+
+def test_generation_failure_is_isolated_from_valid_sibling(tmp_path):
+    good = tmp_path / 'source' / 'good'
+    bad = tmp_path / 'source' / 'bad'
+    _write(str(good / 'POSCAR'), POSCAR_FE)
+    _write(str(bad / 'POSCAR'), 'not a POSCAR\n')
+    shared = _write(str(tmp_path / 'shared' / 'INCAR'), 'NSW=0\n')
+    lib = _potlib(tmp_path / 'potpaw')
+
+    out = quick_submit.build_quick_jobs(
+        [str(tmp_path / 'source')], str(tmp_path / 'jobs'),
+        shared_incar=shared, lib_root=lib)
+
+    assert len(out['jobs']) == 1 and out['jobs'][0]['name'] == 'good'
+    assert len(out['skipped']) == 1 and out['skipped'][0]['file'] == str(bad)
+    assert out['skipped'][0]['status'] == 'generation_failed'
+    assert not list((tmp_path / 'jobs').glob('.*.building-*'))
+
+
+def test_complete_quartet_still_imports_when_shared_incar_path_is_invalid(tmp_path):
+    source = tmp_path / 'ready'
+    for name, text in (
+        ('INCAR', 'ENCUT=500\nNSW=0\n'), ('POSCAR', POSCAR_FE),
+        ('KPOINTS', 'Automatic\n0\nGamma\n1 1 1\n0 0 0\n'),
+        ('POTCAR', 'TITEL = PAW_PBE Fe\n'),
+    ):
+        _write(str(source / name), text)
+
+    out = quick_submit.build_quick_jobs(
+        [str(source)], str(tmp_path / 'jobs'), shared_incar='/missing/INCAR')
+
+    assert len(out['jobs']) == 1 and out['jobs'][0]['mode'] == 'copy'
+    assert out['skipped'] == []
+
+
+def test_build_refuses_output_inside_source_calculation_directory(tmp_path):
+    source = tmp_path / 'source'
+    for name, text in (
+        ('INCAR', 'ENCUT=500\n'), ('POSCAR', POSCAR_FE),
+        ('KPOINTS', 'Automatic\n0\nGamma\n1 1 1\n0 0 0\n'),
+        ('POTCAR', 'TITEL = PAW_PBE Fe\n'),
+    ):
+        _write(str(source / name), text)
+
+    out = quick_submit.build_quick_jobs([str(source)], str(source / 'generated'))
+
+    assert out['ok'] is False
+    assert '所选源目录内部' in out['error']
+    assert out['jobs'] == []
+    assert out['skipped'][0]['status'] == 'unsafe_output_root'
+    assert sorted(p.name for p in source.iterdir()) == ['INCAR', 'KPOINTS', 'POSCAR', 'POTCAR']
+
+
+def test_build_refuses_output_inside_selected_parent_not_only_candidate(tmp_path):
+    parent = tmp_path / 'batch'
+    source = parent / 'job_a'
+    for name, text in (
+        ('INCAR', 'ENCUT=500\n'), ('POSCAR', POSCAR_FE),
+        ('KPOINTS', 'Automatic\n0\nGamma\n1 1 1\n0 0 0\n'),
+        ('POTCAR', 'TITEL = PAW_PBE Fe\n'),
+    ):
+        _write(str(source / name), text)
+
+    out = quick_submit.build_quick_jobs([str(parent)], str(parent / 'generated'))
+
+    assert out['ok'] is False
+    assert out['jobs'] == []
+    assert out['skipped'][0]['file'] == str(parent)
+    assert out['skipped'][0]['status'] == 'unsafe_output_root'
+    assert not (parent / 'generated').exists()
+
+
+def test_quick_submit_ui_exposes_guided_scan_and_generation_controls():
+    root = Path(__file__).resolve().parents[1] / 'vcstudio' / 'gui_web' / 'assets'
+    html = (root / 'index.html').read_text(encoding='utf-8')
+    for control_id in (
+        'qs-add-dir', 'qs-incar', 'qs-incar-btn', 'qs-lib', 'qs-calc-type',
+        'qs-preview', 'qs-build', 'qs-next', 'qs-go-submit',
+    ):
+        assert f'id="{control_id}"' in html
+    assert '选择父目录并扫描' in html
+    assert '源目录不会被修改或覆盖' in html
+
+
+def test_quick_submit_ui_scans_automatically_and_selects_new_jobs():
+    jobs_js = (Path(__file__).resolve().parents[1] / 'vcstudio' / 'gui_web' /
+               'assets' / 'jobs.js').read_text(encoding='utf-8')
+    assert "VCS.call('quick_submit_scan', QS.files, qsSharedIncar())" in jobs_js
+    assert "'quick_submit_build', QS.files, out, '', shared, lib, calcType" in jobs_js
+    assert 'State.selected.add(job.dir)' in jobs_js
+    assert "wire('qs-go-submit', doSubmit)" in jobs_js
+    assert "next.scrollIntoView({ behavior: 'smooth', block: 'center' })" in jobs_js
+    assert "card.scrollIntoView({ behavior: 'smooth', block: 'start' })" not in jobs_js
