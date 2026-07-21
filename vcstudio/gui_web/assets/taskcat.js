@@ -46,7 +46,7 @@
   async function loadCatalog() {
     const sceneKey = (VCS.scenario && VCS.scenario.key) || null;
     const active = VCS.activeCalculation || null;
-    const r = await VCS.call('task_catalog', sceneKey, active);
+    const r = await VCS.call('task_catalog', sceneKey, active, VCS.activeEngine || 'vasp');
     if (!r || r.ok === false) { VCS.log('加载计算类型目录失败:' + ((r && r.error) || '未知'), 'failc'); return; }
     State.cats = r.categories || [];
     State.tasks = r.tasks || [];
@@ -546,6 +546,7 @@
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
   document.addEventListener('vcs:scenario', loadCatalog);
+  document.addEventListener('vcs:engine', loadCatalog);
   document.addEventListener('vcs:calculation', loadCatalog);
   document.addEventListener('vcs:calculation', syncAnalysisKind);
   window.TaskCat = { reload: loadCatalog };

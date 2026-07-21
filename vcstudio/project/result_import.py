@@ -27,7 +27,7 @@ from pathlib import Path
 from vcstudio.cluster import diagnose
 from vcstudio.generate import methods_text
 from vcstudio.generate.incar_builder import parse_incar
-from vcstudio.generate.poscar import parse_poscar_species
+from vcstudio.generate.poscar import parse_poscar_species, read_cell_vectors
 
 
 _RESULT_NAMES = ('OUTCAR', 'OSZICAR', 'vasprun.xml', 'CONTCAR')
@@ -243,16 +243,9 @@ def _validate_poscar_coordinates(text: str, counts: list[int]) -> str | None:
     if len(lines) < 5:
         return 'POSCAR 行数不足以解析晶格矢量'
     try:
-        scale = float(lines[1].split()[0])
-        vectors = [[float(value) for value in lines[index].split()[:3]]
-                   for index in (2, 3, 4)]
+        vectors = read_cell_vectors(str(text or ''))
     except (ValueError, IndexError, TypeError) as exc:
         return f'POSCAR 晶格解析失败：{exc}'
-    if not math.isfinite(scale) or scale == 0:
-        return 'POSCAR 缩放因子须为非零有限数值'
-    if any(len(vector) != 3 or any(not math.isfinite(value) for value in vector)
-           for vector in vectors):
-        return 'POSCAR 晶格矢量须为 3 个有限数值'
     determinant = (
         vectors[0][0] * (vectors[1][1] * vectors[2][2] - vectors[1][2] * vectors[2][1])
         - vectors[0][1] * (vectors[1][0] * vectors[2][2] - vectors[1][2] * vectors[2][0])
@@ -260,9 +253,6 @@ def _validate_poscar_coordinates(text: str, counts: list[int]) -> str | None:
     )
     if abs(determinant) <= 1e-14:
         return 'POSCAR 三个晶格矢量线性相关，晶胞体积为 0'
-    # A negative scalar is valid VASP syntax: abs(scale) is the requested cell
-    # volume.  Copy-mode validation only needs to prove the input is legal; it
-    # must not reject a quartet merely because older builders cannot rescale it.
     index = 7
     if len(lines) <= index:
         return 'POSCAR 缺坐标模式与原子坐标'

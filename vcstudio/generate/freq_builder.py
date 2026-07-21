@@ -251,11 +251,14 @@ def build_freq_poscar(poscar_text: str, free_indices) -> str:
 
 # ── 频率 INCAR 派生 ─────────────────────────────────────────────────────────────
 _FREQ_SET = OrderedDict([                 # 必须替换的离子学关键键 → 频率取值
+    ('ISTART', '0'), ('ICHARG', '2'),
     ('IBRION', '5'), ('NFREE', '2'), ('POTIM', '0.015'), ('NSW', '1'), ('ISYM', '0'),
 ])
 _FREQ_STRIP = ('ISIF', 'EDIFFG')          # 频率无意义,剥离
 _EDIFF_TARGET = '1E-07'                   # EDIFF 收紧至发文级(≤1e-7)
 _FREQ_REASON = {
+    'ISTART': '派生目录不复制 WAVECAR，从头初始化波函数',
+    'ICHARG': '频率力常数必须自洽，且派生目录不复制 CHGCAR',
     'IBRION': '有限差分频率(Hessian)', 'NFREE': '两点有限差分', 'POTIM': '有限差分位移步长(Å)',
     'NSW': '单步(频率不做离子弛豫)', 'ISYM': '频率计算关对称,避免简并模式误分类',
     'EDIFF': '收紧电子收敛至发文级(≤1e-7)',
@@ -364,8 +367,9 @@ def _freq_incar_banner(changes: list) -> str:
 def build_freq_incar(base_incar_text: str) -> str:
     """弛豫 INCAR 文本 → 频率 INCAR 文本(含改动注释块)。结构化 changes 见 build_freq_job。
 
-    派生规则:替换 IBRION=5 / NFREE=2 / POTIM=0.015 / NSW=1 / ISYM=0;EDIFF 收紧至
-    ≤1e-7;剥离 ISIF / EDIFFG;其余电子学参数逐字保留。
+    派生规则:显式从头自洽(ISTART=0/ICHARG=2)，替换 IBRION=5 / NFREE=2 /
+    POTIM=0.015 / NSW=1 / ISYM=0;EDIFF 收紧至 ≤1e-7;剥离 ISIF / EDIFFG;
+    其余电子学参数逐字保留。
     """
     return _derive_freq_incar(base_incar_text)[0]
 

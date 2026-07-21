@@ -470,6 +470,23 @@ def analyze_engine_outputs(job_dir, engine: str | None = None,
                             os.link(source, target)
                         except OSError:
                             shutil.copy2(source, target)
+                    # Task-specific completion (opt vs SP vs phonon) is encoded
+                    # in each engine's input.  Include only manifest-declared
+                    # local inputs in the sandbox so the backend can infer that
+                    # task without seeing undeclared stale outputs.
+                    raw_inputs = inputs.get('files') or [] if isinstance(inputs, dict) else []
+                    for raw in raw_inputs if isinstance(raw_inputs, (list, tuple)) else []:
+                        safe = _safe_relative_name(raw)
+                        source = root / safe if safe and '/' not in safe else None
+                        if source is None or not source.is_file():
+                            continue
+                        target = Path(tmp) / source.name
+                        if target.exists():
+                            continue
+                        try:
+                            os.link(source, target)
+                        except OSError:
+                            shutil.copy2(source, target)
                     parsed = dict(backend.parse_energy(tmp) or {})
         else:
             parsed = dict(backend.parse_energy(str(root)) or {})

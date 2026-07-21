@@ -45,14 +45,20 @@ def test_gaussian_unknown_functional_warns():
     assert any('未登记 Gaussian 泛函' in w for w in warns)
 
 
-def test_gaussian_dispersion_suffix():
+def test_gaussian_dispersion_keyword():
     route = _route(_spec(dispersion='D3'))
-    assert 'PBEPBE-D3' in route
+    assert 'PBEPBE-D3' not in route
+    assert 'EmpiricalDispersion=GD3' in route
 
 
 def test_gaussian_dispersion_warns_version():
     _, warns = build_gjf(_spec(dispersion='D3'))
     assert any('EmpiricalDispersion' in w for w in warns)
+
+
+def test_gaussian_unknown_dispersion_is_rejected():
+    with pytest.raises(ValueError, match='拒绝猜测'):
+        build_gjf(_spec(dispersion='mystery'))
 
 
 @pytest.mark.parametrize('task,kw', [('relax', 'opt'), ('static', 'sp'), ('freq', 'freq')])
@@ -137,6 +143,50 @@ def test_gaussian_parse_error_termination(tmp_path):
              ' SCF Done:  E(RPBE) =  -76.0  A.U.\n'
              ' Error termination via Lnk1e\n')
     assert r['converged'] is False and 'Error termination' in r['error']
+
+
+def test_gaussian_opt_needs_stationary_point_not_just_normal_footer(tmp_path):
+    (tmp_path / 'job.gjf').write_text(
+        '#P PBEPBE/def2-SVP opt\n\njob\n\n0 1\nH 0 0 0\n\n', encoding='utf-8')
+    r = _log(tmp_path,
+             ' SCF Done: E(RHF) = -1.0 A.U.\n'
+             ' Normal termination of Gaussian 16\n')
+    assert r['converged'] is False and r['task'] == 'opt'
+    assert '任务级完成证据' in r['error']
+
+
+def test_gaussian_mp2_d_exponent_and_frequency_list(tmp_path):
+    r = _log(tmp_path,
+             ' SCF Done: E(RHF) = -2.0 A.U.\n'
+             ' EUMP2 = -0.250000000D+01\n'
+             ' Frequencies -- -120.0 500.0 1000.0\n'
+             ' Normal termination of Gaussian 16\n')
+    assert r['energy_ev'] == pytest.approx(-2.5 * HARTREE_TO_EV)
+    assert r['energy_source'] == 'MP2'
+    assert r['frequencies_cm1'] == [-120.0, 500.0, 1000.0]
+
+
+def test_gaussian_last_orientation_is_extracted(tmp_path):
+    r = _log(tmp_path,
+             ' SCF Done: E(RHF) = -1.0 A.U.\n'
+             ' Standard orientation:\n'
+             ' ---------------------------------------------------------------------\n'
+             ' Center     Atomic      Atomic             Coordinates (Angstroms)\n'
+             ' Number     Number       Type             X           Y           Z\n'
+             ' ---------------------------------------------------------------------\n'
+             '      1          8           0        1.000000    2.000000    3.000000\n'
+             ' ---------------------------------------------------------------------\n'
+             ' Normal termination of Gaussian 16\n')
+    assert r['final_structure']['atoms'][0]['element'] == 'O'
+    assert r['final_structure']['atoms'][0]['xyz_angstrom'] == [1.0, 2.0, 3.0]
+
+
+def test_gaussian_generate_reports_custom_checkpoint(tmp_path):
+    result = get_backend('gaussian').generate_inputs(
+        _spec(extras={'chk': 'wavefunction'}), str(tmp_path))
+    assert 'water.log' in result['output_files']
+    assert 'wavefunction.chk' in result['output_files']
+    assert result['restart']['supported'] is False
 
 
 def test_gaussian_parse_missing(tmp_path):

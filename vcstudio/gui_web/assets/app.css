@@ -27,7 +27,7 @@
 }
 
 /* 工作模式显隐使用独立属性，避免被 data-src / data-ana 分区切换重新取消隐藏。 */
-[data-scene-hidden],[data-task-hidden]{display:none!important}
+[data-scene-hidden],[data-task-hidden],[data-engine-hidden]{display:none!important}
 .mode-chip{display:block;width:calc(100% - 20px);margin:0 10px 10px;padding:7px 9px;
   border:1px solid var(--rule);border-radius:6px;background:var(--surface);color:var(--ink);
   font-size:10.5px;line-height:1.35;text-align:left;cursor:pointer;white-space:normal}
@@ -291,11 +291,13 @@ pre.meth-pre{white-space:pre-wrap;word-break:break-word;max-height:200px}
 #page-settings .ap-row{display:flex;gap:18px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
 #page-settings .ap-sub{padding-left:2px;display:flex;flex-direction:column;gap:8px}
 #page-settings .set-2col{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}
+#page-settings .set-workspace-grid{display:grid;grid-template-columns:1fr 1fr 1.2fr;gap:0 14px}
 #page-settings .set-calculation-guide{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 12px;align-items:center;margin:2px 0 12px;padding:10px 12px;border:1px solid var(--rule);border-radius:8px;background:var(--surface)}
 #page-settings .set-calculation-guide[hidden]{display:none}
 #page-settings .set-calculation-guide b{font-size:12.5px}
 #page-settings .set-calculation-guide span{grid-column:1;color:var(--muted);font-size:11.5px;line-height:1.5}
 #page-settings .set-calculation-guide .btn{grid-column:2;grid-row:1 / span 4;white-space:nowrap}
+@media (max-width:900px){#page-settings .set-workspace-grid{grid-template-columns:1fr}}
 @media (max-width:720px){#page-settings .set-2col{grid-template-columns:1fr}}
 @media (max-width:720px){#page-settings .set-calculation-guide{grid-template-columns:1fr}#page-settings .set-calculation-guide .btn{grid-column:1;grid-row:auto;margin-top:4px}}
 

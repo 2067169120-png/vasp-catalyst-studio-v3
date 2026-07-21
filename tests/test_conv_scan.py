@@ -60,13 +60,16 @@ def _write_oszicar(job_dir, e0):
 
 
 # ── ENCUT 系列 ──────────────────────────────────────────────────────────────────
-def test_encut_series_only_changes_encut(tmp_path):
+def test_encut_series_uses_fixed_geometry_static_baseline(tmp_path):
     src = _make_src(tmp_path)
     res = cs.build_encut_series(str(src), str(tmp_path / 'enc'), values=[400, 500, 600])
     assert set(res['dirs']) == {400, 500, 600}
     inc = parse_incar((tmp_path / 'enc' / 'encut_400' / 'INCAR').read_text())
     assert inc['ENCUT'] == 400
-    assert inc['GGA'] == 'PE' and inc['IBRION'] == 2         # 其余键原样
+    assert inc['GGA'] == 'PE'
+    assert inc['IBRION'] == -1 and inc['NSW'] == 0
+    assert inc['ISTART'] == 0 and inc['ICHARG'] == 2
+    assert 'ISIF' not in inc and 'EDIFFG' not in inc
     # KPOINTS/POTCAR 逐字复制
     assert (tmp_path / 'enc' / 'encut_400' / 'KPOINTS').read_text() == _KP
 
@@ -82,14 +85,14 @@ def test_encut_series_manifest_and_changes(tmp_path):
 
 
 # ── k 网格系列 ──────────────────────────────────────────────────────────────────
-def test_kmesh_series_changes_kpoints_only(tmp_path):
+def test_kmesh_series_changes_kpoints_on_fixed_static_baseline(tmp_path):
     src = _make_src(tmp_path)
     res = cs.build_kmesh_series(str(src), str(tmp_path / 'km'), meshes=[[3, 3, 1], [7, 7, 1]])
     assert set(res['dirs']) == {9, 49}                       # series_value = k 点积
     kp = (tmp_path / 'km' / 'kmesh_7x7x1' / 'KPOINTS').read_text()
     assert '7 7 1' in kp and 'Gamma' in kp
-    # INCAR 未动
-    assert (tmp_path / 'km' / 'kmesh_7x7x1' / 'INCAR').read_text() == _INCAR
+    inc = parse_incar((tmp_path / 'km' / 'kmesh_7x7x1' / 'INCAR').read_text())
+    assert inc['IBRION'] == -1 and inc['NSW'] == 0 and inc['ICHARG'] == 2
 
 
 def test_kmesh_series_manifest(tmp_path):
@@ -108,8 +111,9 @@ def test_vacuum_series_rebuilds_poscar(tmp_path):
     # slab z 跨度 = 2 Å(8→10),真空 12 → |c| = 14
     c_line = txt.splitlines()[4].split()
     assert float(c_line[2]) == pytest.approx(14.0)
-    # INCAR/KPOINTS 复制
-    assert (tmp_path / 'vac' / 'vac_12' / 'INCAR').read_text() == _INCAR
+    # 所有点共享固定几何静态 INCAR；KPOINTS 复制
+    inc = parse_incar((tmp_path / 'vac' / 'vac_12' / 'INCAR').read_text())
+    assert inc['IBRION'] == -1 and inc['NSW'] == 0 and inc['ICHARG'] == 2
 
 
 def test_set_vacuum_centers_and_sets_c(tmp_path):
@@ -146,6 +150,8 @@ def test_slab_thickness_with_builder_fn(tmp_path):
                                          layers=[3, 4], slab_builder_fn=_fake_slab)
     assert set(res['dirs']) == {3, 4}
     assert '3 layers' in (tmp_path / 'th' / 'nlayers_3' / 'POSCAR').read_text()
+    inc = parse_incar((tmp_path / 'th' / 'nlayers_3' / 'INCAR').read_text())
+    assert inc['IBRION'] == -1 and inc['NSW'] == 0 and inc['ICHARG'] == 2
     m = manifest_mod.load_manifest(tmp_path / 'th' / 'nlayers_4')
     assert m['inputs']['series'] == 'slab_thickness' and m['inputs']['series_value'] == 4
 
@@ -208,11 +214,23 @@ def test_analyze_series_missing_oszicar_energy_none(tmp_path):
     assert '无任一' in res['note']
 
 
+def test_analyze_series_ignores_partial_energy_from_created_job(tmp_path):
+    src = _make_src(tmp_path)
+    built = cs.build_encut_series(str(src), str(tmp_path / 'enc'), values=[400])
+    job = __import__('pathlib').Path(built['dirs'][400])
+    _write_oszicar(job, -10.0)
+    res = cs.analyze_series(built['dirs'], natoms=2)
+    assert res['points'][0]['energy'] is None
+
+
 def test_analyze_series_from_dir_list_reads_manifest(tmp_path):
     src = _make_src(tmp_path)
     r = cs.build_encut_series(str(src), str(tmp_path / 'enc'), values=[400, 500])
     for x, d in r['dirs'].items():
         _write_oszicar(__import__('pathlib').Path(d), -10.0 - 0.0001 * x)
+        m = manifest_mod.load_manifest(d)
+        manifest_mod.set_state(m, 'DONE')
+        manifest_mod.save_manifest(d, m)
     res = cs.analyze_series(list(r['dirs'].values()))        # 列表 → 从 manifest 取 x
     assert [p['x'] for p in res['points']] == [400, 500]
 

@@ -108,6 +108,18 @@ def test_build_aimd_incar_nve_uses_andersen_prob_zero():
     assert 'SMASS' not in d and 'TEEND' not in d        # NVE 无 Nose 热浴/终温
 
 
+def test_build_aimd_incar_removes_stale_thermostat_keys():
+    old_nvt = (_RELAX_INCAR + 'SMASS = 5\nTEEND = 900\n'
+               'LANGEVIN_GAMMA = 10 10\nLANGEVIN_GAMMA_L = 1\nPMASS = 1000\n')
+    nve = parse_incar(ab.build_aimd_incar(old_nvt, ensemble='nve'))
+    for key in ('SMASS', 'TEEND', 'LANGEVIN_GAMMA', 'LANGEVIN_GAMMA_L', 'PMASS'):
+        assert key not in nve
+
+    old_andersen = _RELAX_INCAR + 'ANDERSEN_PROB = 0.25\n'
+    nvt = parse_incar(ab.build_aimd_incar(old_andersen, ensemble='nvt'))
+    assert 'ANDERSEN_PROB' not in nvt
+
+
 def test_build_aimd_incar_adds_missing_ionic_keys():
     base = 'ENCUT = 400\nGGA = PE\n'                    # 纯电子学,无离子学键
     d = parse_incar(ab.build_aimd_incar(base))
@@ -128,6 +140,15 @@ def test_derive_aimd_incar_changes_actions():
 def test_build_aimd_incar_unknown_ensemble_raises():
     with pytest.raises(ValueError, match='系综'):
         ab.build_aimd_incar(_RELAX_INCAR, ensemble='npt')
+
+
+@pytest.mark.parametrize('kwargs', [
+    {'steps': 0}, {'steps': 1.5}, {'potim_fs': 0}, {'potim_fs': float('nan')},
+    {'temp_k': -1}, {'temp_end_k': float('inf')}, {'encut': -400},
+])
+def test_build_aimd_incar_rejects_invalid_physical_parameters(kwargs):
+    with pytest.raises(ValueError):
+        ab.build_aimd_incar(_RELAX_INCAR, **kwargs)
 
 
 # ── 一键派生 AIMD 作业目录 ─────────────────────────────────────────────────────

@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import math
 from collections import OrderedDict
 from pathlib import Path
 
@@ -35,7 +36,7 @@ ENSEMBLES = ('nvt', 'nve')
 #   EDIFFG 是离子弛豫力/能收敛判据,MD 跑满 NSW 步与它无关,留着误导;
 #   ISIF(应力/晶胞优化)对固定胞的 NVT/NVE AIMD 无意义(IBRION=0 下 VASP 忽略),
 #   留 ISIF=3 会让人误以为在变胞。与 freq_builder 剥离集同口径。
-_AIMD_STRIP = ('ISIF', 'EDIFFG')
+_AIMD_STRIP = ('ISIF', 'EDIFFG', 'LANGEVIN_GAMMA', 'LANGEVIN_GAMMA_L', 'PMASS')
 
 _AIMD_REASON = {
     'IBRION': 'IBRION=0 开启分子动力学',
@@ -50,6 +51,9 @@ _AIMD_REASON = {
     'NELMIN': '每 MD 步最少电子自洽步数,保证力平滑/能量守恒',
     'EDIFFG': 'MD 无离子弛豫收敛判据,剥离',
     'ISIF': '固定胞 NVT/NVE 无需应力/晶胞优化,剥离',
+    'LANGEVIN_GAMMA': '当前派生的是 Nose-Hoover/Andersen，不保留旧 Langevin 摩擦参数',
+    'LANGEVIN_GAMMA_L': '固定胞作业不保留旧 Langevin 晶格摩擦参数',
+    'PMASS': '固定胞 NVT/NVE 不使用旧 Parrinello-Rahman 晶格质量',
     'ENCUT': 'AIMD 截断能(显式传 encut 时才改)',
 }
 
@@ -99,22 +103,51 @@ def _aimd_targets(ensemble, temp_k, temp_end_k, steps, potim_fs, encut):
     ens = str(ensemble).lower()
     if ens not in ENSEMBLES:
         raise ValueError(f"未知系综 ensemble={ensemble!r};可选:{' / '.join(ENSEMBLES)}。")
+
+    def _finite(name, value, *, positive=False):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f'{name} 必须是有限数值,收到 {value!r}') from None
+        if not math.isfinite(number):
+            raise ValueError(f'{name} 必须是有限数值,收到 {value!r}')
+        if positive and number <= 0:
+            raise ValueError(f'{name} 必须大于 0,收到 {value!r}')
+        return number
+
+    try:
+        steps_float = float(steps)
+        steps_int = int(steps_float)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'steps 必须是正整数,收到 {steps!r}') from None
+    if (isinstance(steps, bool) or not math.isfinite(steps_float)
+            or steps_int <= 0 or steps_float != steps_int):
+        raise ValueError(f'steps 必须是正整数,收到 {steps!r}')
+    temp = _finite('temp_k', temp_k)
+    if temp < 0:
+        raise ValueError(f'temp_k 不能为负,收到 {temp_k!r}')
+    temp_end = temp if temp_end_k is None else _finite('temp_end_k', temp_end_k)
+    if temp_end < 0:
+        raise ValueError(f'temp_end_k 不能为负,收到 {temp_end_k!r}')
+    potim = _finite('potim_fs', potim_fs, positive=True)
+    cutoff = None if encut is None else _finite('encut', encut, positive=True)
+
     t: OrderedDict = OrderedDict()
     t['IBRION'] = '0'
-    t['NSW'] = str(int(steps))
-    t['POTIM'] = _fmt(potim_fs)
+    t['NSW'] = str(steps_int)
+    t['POTIM'] = _fmt(potim)
     t['ISYM'] = '0'
     t['NELMIN'] = '4'
-    t['TEBEG'] = _fmt(temp_k)
+    t['TEBEG'] = _fmt(temp)
     if ens == 'nvt':
         t['MDALGO'] = '2'
         t['SMASS'] = '0'
-        t['TEEND'] = _fmt(temp_end_k if temp_end_k is not None else temp_k)
+        t['TEEND'] = _fmt(temp_end)
     else:  # nve:Andersen 碰撞概率0 → 微正则
         t['MDALGO'] = '1'
         t['ANDERSEN_PROB'] = '0.0'
-    if encut is not None:
-        t['ENCUT'] = str(int(encut))
+    if cutoff is not None:
+        t['ENCUT'] = str(int(cutoff))
     return t, ens
 
 
@@ -141,6 +174,13 @@ def _derive_aimd_incar(base_incar_text: str, target: OrderedDict):
     子句级处理 ';' 多赋值,保留行内注释(与 _derive_freq_incar 同口径)。
     """
     parsed = parse_incar(base_incar_text)
+    # target 之外的旧恒温器键不能残留。否则例如 NVT→NVE 派生仍带 SMASS/TEEND，
+    # 或 Andersen→Nose 仍带 ANDERSEN_PROB，INCAR 表面显示新系综却混入旧控制参数。
+    strip_keys = set(_AIMD_STRIP)
+    if str(target.get('MDALGO')) == '1':
+        strip_keys.update(('SMASS', 'TEEND'))
+    else:
+        strip_keys.add('ANDERSEN_PROB')
     changes: list = []
     handled: set = set()
     new_lines: list = []
@@ -157,7 +197,7 @@ def _derive_aimd_incar(base_incar_text: str, target: OrderedDict):
                     kept.append(clause.strip())
                 continue
             key = clause.split('=', 1)[0].strip().upper()
-            if key in _AIMD_STRIP:
+            if key in strip_keys:
                 changes.append({'key': key, 'action': 'strip', 'old': parsed.get(key),
                                 'new': None, 'reason': _AIMD_REASON.get(key, '')})
                 continue                    # 丢弃该子句

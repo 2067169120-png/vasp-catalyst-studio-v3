@@ -160,8 +160,19 @@ def build_static_job(relax_dir, out_dir, *, purpose: str = 'pdos',
         derived[key] = val
         changes.append(f'{key}: {old} → {val}({note})')
 
+    # 派生目录只复制四件套，不复制母作业的 WAVECAR/CHGCAR。若把弛豫续算留下的
+    # ISTART=1 / ICHARG=11 原样带过来，远端会在启动时缺文件，或更隐蔽地把本应自洽的
+    # PDOS/Bader/功函数算成固定电荷非自洽结果。派生性质作业统一从原子叠加电荷自洽启动。
+    _set('ISTART', 0, '派生目录不依赖母作业 WAVECAR')
+    _set('ICHARG', 2, '性质静态作业必须自洽，且派生目录不依赖母作业 CHGCAR')
     _set('NSW', 0, '静态单点')
     _set('IBRION', -1, '不做离子步')
+    for key, note in (
+            ('ISIF', '静态性质作业不做应力/变胞'),
+            ('EDIFFG', '静态性质作业无离子收敛判据')):
+        if key in derived:
+            old = derived.pop(key)
+            changes.append(f'{key}: {old} → 移除({note})')
     nk_prod = new_grid[0] * new_grid[1] * new_grid[2]
     if nk_prod >= 4:
         _set('ISMEAR', -5, '四面体+Blöchl 校正,DOS/能量精度最佳')

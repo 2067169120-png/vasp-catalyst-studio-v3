@@ -1742,7 +1742,7 @@ def test_settings_get_defaults_when_unset():
     assert out['ui'] == {'theme': 'classic', 'autopilot': False, 'poll_interval': 10,
                          'autopilot_continue': True, 'autopilot_fetch': True,
                          'autopilot_report': True, 'autopilot_campaigns': False,
-                         'scenario': '', 'active_calculation': ''}
+                         'scenario': '', 'active_engine': '', 'active_calculation': ''}
     assert out['llm']['key_saved'] is False and out['llm']['base_url'] == ''
 
 
@@ -2875,6 +2875,30 @@ def test_calculation_get_falls_back_to_mode_default_and_set_validates():
     assert good['ok'] is True and backing['ui']['active_calculation'] == 'bands'
 
 
+def test_engine_selection_is_persistent_and_filters_calculation_contract():
+    backing = {'ui': {'scenario': 'full', 'active_calculation': 'bands'}}
+    api = Api(config_mod=_fake_config_rw(backing), engines_mod=_fake_engines())
+
+    changed = api.engine_set('cp2k')
+    assert changed['ok'] is True and changed['engine'] == 'cp2k'
+    assert changed['active_calculation'] == 'relax'
+    assert backing['ui']['active_engine'] == 'cp2k'
+    assert backing['ui']['active_calculation'] == 'relax'
+
+    current = api.engine_get()
+    assert current['engine'] == 'cp2k' and current['configured'] is True
+    assert current['capability']['task_keys'] == ['relax', 'static', 'freq']
+    assert api.calculation_set('bands')['ok'] is False
+    assert api.calculation_set('freq')['ok'] is True
+
+
+def test_engine_selection_rejects_mode_incompatible_engine():
+    backing = {'ui': {'scenario': 'molecular'}}
+    api = Api(config_mod=_fake_config_rw(backing), engines_mod=_fake_engines())
+    out = api.engine_set('castep')
+    assert out['ok'] is False and '分子化学' in out['error']
+
+
 def test_scenario_get_error_caught():
     boom = _fake_scenarios()
     boom.active_scenario = lambda cfg=None: (_ for _ in ()).throw(RuntimeError('场景坏'))
@@ -3088,6 +3112,12 @@ def test_engine_list_all_and_scenario_visibility():
     assert {e['key'] for e in out['engines']} == {'vasp', 'cp2k', 'gaussian', 'castep'}
     vasp = next(e for e in out['engines'] if e['key'] == 'vasp')
     assert vasp['experimental'] is False and vasp['visible'] is True
+    assert vasp['support_level'] == 'full' and 'bands' in vasp['task_keys']
+    cp2k = next(e for e in out['engines'] if e['key'] == 'cp2k')
+    assert cp2k['task_keys'] == ['relax', 'static', 'freq']
+    assert 'cutoff_ry' in cp2k['fields'] and 'cutoff_ev' not in cp2k['fields']
+    castep = next(e for e in out['engines'] if e['key'] == 'castep')
+    assert castep['boundaries'] == ['periodic']
     # 分子化学场景:Gaussian 可见,CP2K/CASTEP 不在场景引擎白名单
     out2 = api.engine_list('molecular')
     vis = {e['key']: e['visible'] for e in out2['engines']}
@@ -3103,11 +3133,13 @@ def test_engine_generate_builds_calcspec_and_writes(tmp_path):
     api = Api(engines_mod=_fake_engines(calls=calls))
     out = api.engine_generate('cp2k', {
         'poscar': str(poscar), 'task': 'relax', 'functional': 'PBE',
-        'cutoff_ev': 500, 'kpoints': [3, 3, 1], 'spin': True, 'charge': 0,
+        'cutoff_ry': 500, 'rel_cutoff_ry': 70, 'spin': True, 'charge': 0,
         'periodic': True}, str(tmp_path / 'cp2k_out'))
     assert out['ok'] is True and out['files'] == [str(tmp_path / 'cp2k_out') + '/cp2k.inp']
     assert calls['engine'] == 'cp2k'
-    assert calls['spec']['cutoff_ev'] == 500.0 and calls['spec']['kpoints'] == (3, 3, 1)
+    assert calls['spec']['cutoff_ev'] is None and calls['spec']['kpoints'] is None
+    assert calls['spec']['extras']['cutoff_ry'] == 500
+    assert calls['spec']['extras']['rel_cutoff_ry'] == 70
     assert calls['spec']['spin'] is True
 
 
@@ -3118,13 +3150,41 @@ def test_engine_generate_surfaces_validate_issues(tmp_path):
         validate_issues=['周期性计算必须指定 cutoff_ev(平面波截断能,eV);缺失或非正值。']))
     out = api.engine_generate('cp2k', {'poscar': str(poscar), 'periodic': True},
                               str(tmp_path / 'o'))
-    assert out['ok'] is True and out['issues'] and 'cutoff_ev' in out['issues'][0]
+    assert out['ok'] is True and out['issues']
+    assert 'CUTOFF（Ry）' in out['issues'][0] and 'cutoff_ev' not in str(out['issues'])
 
 
 def test_engine_generate_missing_poscar_error(tmp_path):
     api = Api(engines_mod=_fake_engines())
     out = api.engine_generate('cp2k', {'poscar': '/nope/POSCAR'}, str(tmp_path))
     assert out['ok'] is False and '结构文件' in out['error']
+
+
+def test_engine_generate_rejects_unadvertised_task_and_castep_molecule(tmp_path):
+    poscar = tmp_path / 'POSCAR'
+    poscar.write_text(_EDITOR_POSCAR, encoding='utf-8')
+    api = Api(engines_mod=_fake_engines())
+    unsupported = api.engine_generate(
+        'cp2k', {'poscar': str(poscar), 'task': 'bands', 'periodic': True},
+        str(tmp_path / 'cp2k'))
+    assert unsupported['ok'] is False and '不支持任务' in unsupported['error']
+    molecule = api.engine_generate(
+        'castep', {'poscar': str(poscar), 'task': 'static', 'periodic': False},
+        str(tmp_path / 'castep'))
+    assert molecule['ok'] is False and '孤立分子' in molecule['error']
+
+
+def test_engine_generate_rejects_duplicate_vasp_adapter_path(tmp_path):
+    poscar = tmp_path / 'POSCAR'
+    poscar.write_text(_EDITOR_POSCAR, encoding='utf-8')
+    api = Api(engines_mod=_fake_engines())
+    generated = api.engine_generate(
+        'vasp', {'poscar': str(poscar), 'task': 'relax', 'cutoff_ev': 500},
+        str(tmp_path / 'out'))
+    preview = api.engine_preview(
+        'vasp', {'poscar': str(poscar), 'task': 'relax', 'cutoff_ev': 500})
+    assert generated['ok'] is False and '主工作流' in generated['error']
+    assert preview['ok'] is False and '四件套预览' in preview['error']
 
 
 def test_engine_nonequiv_report():
@@ -4424,6 +4484,15 @@ def test_task_catalog_filters_by_work_mode_and_active_calculation():
     assert 'adsorption_project' not in keys and 'neb' not in keys
     one = api.task_catalog('vasp', 'workfunction')
     assert [t['key'] for t in one['tasks']] == ['workfunction']
+
+
+def test_task_catalog_filters_non_vasp_to_closed_loop_tasks():
+    api = Api()
+    out = api.task_catalog('full', None, 'cp2k')
+    assert out['ok'] is True and out['engine'] == 'cp2k'
+    assert [row['key'] for row in out['tasks']] == ['relax', 'static', 'freq']
+    assert all(row['kind_badge'] == '引擎输入生成' for row in out['tasks'])
+    assert all('CP2K' in row['next_action'] for row in out['tasks'])
 
 
 def test_task_catalog_error_caught():
@@ -6011,6 +6080,21 @@ def test_job_live_energy_legacy_remote_dir_requires_explicit_cluster_binding(tmp
 
     assert out['ok'] is False
     assert '未记录所属服务器' in out['error']
+
+
+def test_api_poscar_volume_honors_negative_and_three_component_scaling(tmp_path):
+    negative = tmp_path / 'negative'
+    negative.mkdir()
+    (negative / 'POSCAR').write_text(
+        'target volume\n-125\n1 0 0\n0 1 0\n0 0 1\nH\n1\nDirect\n0 0 0\n',
+        encoding='utf-8')
+    anisotropic = tmp_path / 'anisotropic'
+    anisotropic.mkdir()
+    (anisotropic / 'POSCAR').write_text(
+        'three scales\n2 3 4\n1 0 0\n0 1 0\n0 0 1\nH\n1\nDirect\n0 0 0\n',
+        encoding='utf-8')
+    assert abs(Api._poscar_volume(str(negative)) - 125.0) < 1e-9
+    assert abs(Api._poscar_volume(str(anisotropic)) - 24.0) < 1e-9
 
 
 def test_job_live_energy_needs_trust_passthrough(tmp_path):

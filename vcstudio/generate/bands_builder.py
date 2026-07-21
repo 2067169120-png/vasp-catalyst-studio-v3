@@ -155,6 +155,7 @@ def kpoints_line_mode(lattice: str, npoints: int = 40) -> str:
 
 
 _REASONS = {
+    'ISTART': '非自洽能带只硬读 CHGCAR；派生目录不复制 WAVECAR，禁止继承 ISTART=1',
     'ICHARG': '非自洽能带:读固定自洽 CHGCAR(须先有自洽静态产出的 CHGCAR)',
     'LORBIT': '投影能带(轨道/原子权重),供 fatband/贡献分析',
     'NSW': '能带不做离子步',
@@ -208,11 +209,12 @@ def build_bands_job(src_dir, out_root, *, lattice=None, npoints: int = 40) -> di
         raise ValueError(f'未知晶格类型 {lattice!r};可选:{LATTICES}')
 
     warnings: list[str] = []
-    set_keys = OrderedDict([('ICHARG', 11), ('LORBIT', 11), ('NSW', 0),
+    set_keys = OrderedDict([('ISTART', 0), ('ICHARG', 11), ('LORBIT', 11), ('NSW', 0),
                             ('IBRION', -1), ('ISMEAR', 0), ('SIGMA', 0.05)])
     banner = ('# === vcstudio 能带作业(非自洽 ICHARG=11;两步法第二步) ===\n'
               f'# k 路径:{HIGH_SYMMETRY[lattice]["note"]}\n'
-              '# 前置:须先自洽静态产出收敛 CHGCAR 并置于本目录(ICHARG=11 读它)。')
+              '# 前置:须先自洽静态产出收敛 CHGCAR 并置于本目录(ICHARG=11 读它；'
+              'ISTART=0 不依赖 WAVECAR)。')
     new_incar, changes = derive_incar(base_incar, set_keys=set_keys,
                                       strip_keys=('ISIF', 'EDIFFG'), reasons=_REASONS,
                                       banner=banner)

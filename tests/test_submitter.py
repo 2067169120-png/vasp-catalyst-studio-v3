@@ -116,8 +116,16 @@ def _job_dir(tmp_path):
 def _quick_job_dir(tmp_path, engine='cp2k', filename='calc.inp'):
     out = tmp_path / f'{engine}_job'
     out.mkdir(parents=True)
-    (out / filename).write_text('&GLOBAL\n  RUN_TYPE ENERGY\n&END GLOBAL\n',
-                                encoding='utf-8')
+    text = {
+        'cp2k': (
+            '&GLOBAL\n  RUN_TYPE ENERGY\n&END GLOBAL\n'
+            '&FORCE_EVAL\n &DFT\n  &MGRID\n   CUTOFF 400\n  &END MGRID\n &END DFT\n'
+            ' &SUBSYS\n  &CELL\n   ABC 10 10 10\n  &END CELL\n'
+            '  &COORD\n   H 0 0 0\n  &END COORD\n'
+            '  &KIND H\n  &END KIND\n &END SUBSYS\n&END FORCE_EVAL\n'),
+        'gaussian': '#P HF/STO-3G SP\n\njob\n\n0 1\nH 0 0 0\n\n',
+    }.get(engine, 'input\n')
+    (out / filename).write_text(text, encoding='utf-8')
     m = manifest.new_manifest(
         job_id=f'{engine}-1', system=out.name, task_type='quick', calc_type='',
         inputs={'engine': engine, 'files': [filename]})
@@ -256,10 +264,26 @@ def test_vasp_task_specific_inputs_are_required_and_uploaded(
     assert posixpath.join(submitted['remote_dir'], extra) in sftp.uploaded
 
 
+def test_vasp_icharg_hard_input_is_required_independent_of_task_name(tmp_path):
+    d = _job_dir(tmp_path)
+    with open(os.path.join(d, 'INCAR'), 'a', encoding='utf-8') as handle:
+        handle.write('ICHARG = 11\n')
+    errs = submitter.preflight(_profile(), d)
+    assert any('CHGCAR' in issue and 'ICHARG=11' in issue for issue in errs)
+
+    with open(os.path.join(d, 'CHGCAR'), 'w', encoding='utf-8') as handle:
+        handle.write('required fixed charge density\n')
+    assert submitter.preflight(_profile(), d) == []
+    sftp = FakeSFTP()
+    m = submitter.submit_job(
+        FakeClient(script=[('qsub', '712.cluster\n')]), sftp, _profile(), d)
+    assert posixpath.join(m['remote_dir'], 'CHGCAR') in sftp.uploaded
+
+
 @pytest.mark.parametrize('task_type,expected', [
     ('static', ('vasprun.xml', 'CHGCAR')),
     ('dos_pdos', ('DOSCAR', 'vasprun.xml')),
-    ('bands', ('EIGENVAL', 'vasprun.xml')),
+    ('bands', ('EIGENVAL', 'PROCAR', 'vasprun.xml')),
     ('bader', ('CHGCAR', 'AECCAR0', 'AECCAR2', 'ACF.dat')),
     ('chgdiff', ('CHGCAR',)),
     ('elf', ('ELFCAR',)),
@@ -283,6 +307,28 @@ def test_fetch_bundle_understands_legacy_estatic_purpose_and_other_engines():
     cp2k['inputs']['output_files'] = ['custom.out', '../escape']
     # 非法项不参与远程路径；合法显式输出仍可用。
     assert submitter.fetch_files_for_manifest(cp2k) == ('custom.out',)
+
+
+def test_generated_castep_fetch_bundle_includes_task_specific_and_restart_evidence(tmp_path):
+    m = {'task_type': 'freq', 'inputs': {
+        'engine': 'castep', 'task': 'freq', 'generator': 'engine_generate',
+        'files': ['seed.cell', 'seed.param'],
+        'output_files': ['seed.castep', 'seed.geom'],
+    }}
+    assert submitter.fetch_files_for_manifest(m, job_dir=str(tmp_path)) == (
+        'seed.castep', 'seed.geom', 'seed.check', 'seed.phonon')
+
+
+def test_generated_gaussian_fetch_uses_real_percent_chk(tmp_path):
+    (tmp_path / 'mol.gjf').write_text(
+        '%chk=wavefunction.chk\n#P HF/STO-3G SP\n\njob\n\n0 1\nH 0 0 0\n\n',
+        encoding='utf-8')
+    m = {'task_type': 'static', 'inputs': {
+        'engine': 'gaussian', 'task': 'static', 'generator': 'engine_generate',
+        'files': ['mol.gjf'], 'output_files': ['mol.log', 'mol.chk'],
+    }}
+    assert submitter.fetch_files_for_manifest(m, job_dir=str(tmp_path)) == (
+        'mol.log', 'wavefunction.chk')
 
 
 def test_unknown_engine_and_manifest_path_traversal_are_hard_blocked(tmp_path):
@@ -531,6 +577,17 @@ def test_bands_continue_preserves_required_chgcar(tmp_path):
     data['task_type'] = 'bands'
     manifest.save_manifest(d, data)
     client = FakeClient(script=[('cat', _VALID_CONTCAR), ('qsub', '203.c\n')])
+    submitter.continue_from_contcar(client, _profile(), d)
+    commands = ' '.join(client.commands)
+    assert 'rm -f WAVECAR' in commands
+    assert 'rm -f WAVECAR CHGCAR' not in commands
+
+
+def test_generic_icharg_restart_preserves_required_chgcar(tmp_path):
+    d = _restartable_job(tmp_path)
+    with open(os.path.join(d, 'INCAR'), 'a', encoding='utf-8') as handle:
+        handle.write('ICHARG = 1\n')
+    client = FakeClient(script=[('cat', _VALID_CONTCAR), ('qsub', '205.c\n')])
     submitter.continue_from_contcar(client, _profile(), d)
     commands = ' '.join(client.commands)
     assert 'rm -f WAVECAR' in commands
@@ -869,6 +926,64 @@ def test_non_vasp_output_without_normal_footer_needs_human(tmp_path):
     m = submitter.refresh_job(client, profile, d, live_states={})
     assert m['state'] == 'NEEDS_HUMAN'
     assert m['results']['diagnosis']['failure_class'] == 'NORMAL_TERMINATION_NOT_FOUND'
+
+
+def test_non_vasp_normal_footer_does_not_fake_relax_convergence(tmp_path):
+    d = _quick_job_dir(tmp_path, 'cp2k', 'water.inp')
+    data = manifest.load_manifest(d)
+    data['inputs']['task'] = 'relax'
+    manifest.save_manifest(d, data)
+    profile = _profile(engine_commands={
+        'cp2k': 'cp2k.psmp -i {input} -o {stem}.out',
+    })
+    submitter.submit_job(
+        FakeClient(script=[('qsub', '903.cluster\n')]), FakeSFTP(), profile, d)
+    output = ('2400\n___VCSENGINE___\n'
+              ' ENERGY| Total FORCE_EVAL ( QS ) energy [a.u.]: -10.0\n'
+              ' PROGRAM ENDED AT 2026-07-20\n')
+    client = FakeClient(script=[
+        ('___VCSENGINE___', output),
+        ('___VCSLOG___', 'EXIT: 0\n___VCSLOG___\n'),
+    ])
+    result = submitter.refresh_job(client, profile, d, live_states={})
+    assert result['state'] == 'UNCONVERGED'
+    assert result['results']['diagnosis']['failure_class'] == 'TASK_NOT_CONVERGED'
+    assert 'energy_e0_eV' not in result['results']
+    assert result['results']['raw_energy_e0_eV'] == pytest.approx(-272.11386)
+
+
+def test_non_vasp_output_failure_marker_beats_footer_and_energy(tmp_path):
+    d = _quick_job_dir(tmp_path, 'cp2k', 'water.inp')
+    profile = _profile(engine_commands={
+        'cp2k': 'cp2k.psmp -i {input} -o {stem}.out',
+    })
+    submitter.submit_job(
+        FakeClient(script=[('qsub', '904.cluster\n')]), FakeSFTP(), profile, d)
+    output = ('2400\n___VCSENGINE___\n'
+              ' ENERGY| Total FORCE_EVAL ( QS ) energy [a.u.]: -10.0\n'
+              ' *** SCF run NOT converged ***\n PROGRAM ENDED AT 2026-07-20\n')
+    client = FakeClient(script=[
+        ('___VCSENGINE___', output),
+        ('___VCSLOG___', 'EXIT: 0\n___VCSLOG___\n'),
+    ])
+    result = submitter.refresh_job(client, profile, d, live_states={})
+    assert result['state'] == 'FAILED'
+    assert result['results']['diagnosis']['failure_class'] == 'ENGINE_OUTPUT_ERROR'
+    assert 'energy_e0_eV' not in result['results']
+
+
+def test_non_vasp_cannot_enter_vasp_contcar_restart_even_if_manifest_is_tampered(tmp_path):
+    d = _quick_job_dir(tmp_path, 'cp2k', 'water.inp')
+    data = manifest.load_manifest(d)
+    data.update({'cluster': '1w', 'remote_dir': '/work/cp2k',
+                 'scheduler_job_id': '1', 'state': 'UNCONVERGED'})
+    data.setdefault('results', {})['diagnosis'] = {
+        'failure_class': 'WALLTIME', 'restartable': True}
+    manifest.save_manifest(d, data)
+    client = FakeClient()
+    with pytest.raises(ValueError, match='不能走 VASP CONTCAR'):
+        submitter.continue_from_contcar(client, _profile(), d)
+    assert client.commands == []
 
 
 def test_read_log_targets_job_number(tmp_path):

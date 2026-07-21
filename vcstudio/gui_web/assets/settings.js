@@ -7,7 +7,7 @@
   const val = id => { const el = $(id); return el ? el.value.trim() : ''; };
   const setVal = (id, v) => { const el = $(id); if (el) el.value = (v == null ? '' : v); };
   const setSel = (id, v) => { const el = $(id); if (el) el.value = String(v); };
-  const State = { scenarios: [], tasks: [] };
+  const State = { scenarios: [], engines: [], tasks: [] };
 
   // 提供商预设 → [base_url, model](自定义为空,不覆盖用户已填)
   const PROVIDERS = {
@@ -215,15 +215,37 @@
       const curKey = (cur && cur.scenario && cur.scenario.key) || 'full';
       scSel.value = curKey;
       renderScenarioDesc(curKey);
-      await loadCalculations(curKey);
+      await loadEngines(curKey);
     }
   }
 
-  async function loadCalculations(scenarioKey) {
+  async function loadEngines(scenarioKey) {
+    const sel = $('set-engine');
+    if (!sel) { await loadCalculations(scenarioKey, 'vasp'); return; }
+    const [listed, current] = await Promise.all([
+      VCS.call('engine_list', scenarioKey || null), VCS.call('engine_get')]);
+    State.engines = ((listed && listed.engines) || []).filter(row => row.visible !== false);
+    State.engines.sort((a, b) => (a.key === 'vasp' ? -1 : b.key === 'vasp' ? 1 : 0));
+    sel.innerHTML = State.engines.map(row =>
+      `<option value="${VCS.esc(row.key)}">${VCS.esc(row.name)}` +
+      `${row.key === 'vasp' ? '（推荐）' : '（文件级适配）'}</option>`).join('') ||
+      '<option value="vasp">VASP（推荐）</option>';
+    const active = (current && current.engine) || (listed && listed.default) || 'vasp';
+    sel.value = State.engines.some(row => row.key === active) ? active : sel.options[0].value;
+    sel.disabled = sel.options.length < 2;
+    const capability = (current && current.engine === sel.value && current.capability) ||
+      ((State.engines.find(row => row.key === sel.value) || {}));
+    if (VCS.applyEngine) VCS.applyEngine(sel.value, capability);
+    renderEngineDesc(sel.value);
+    await loadCalculations(scenarioKey, sel.value);
+  }
+
+  async function loadCalculations(scenarioKey, engineKey) {
     const sel = $('set-calculation');
     if (!sel) return;
     const [catalog, current] = await Promise.all([
-      VCS.call('task_catalog', scenarioKey || null), VCS.call('calculation_get')]);
+      VCS.call('task_catalog', scenarioKey || null, null, engineKey || 'vasp'),
+      VCS.call('calculation_get')]);
     State.tasks = (catalog && catalog.tasks) || [];
     const cats = (catalog && catalog.categories) || [];
     let html = '';
@@ -245,6 +267,15 @@
     renderCalculationGuide(sel.value || '');
   }
 
+  function renderEngineDesc(key) {
+    const out = $('set-engine-desc');
+    if (!out) return;
+    const row = State.engines.find(item => item.key === key) || {};
+    const limits = (row.limitations || []).join('；');
+    out.textContent = `${row.support_label || ''}${row.summary ? '：' + row.summary : ''}` +
+      (limits ? ` 注意：${limits}` : '');
+  }
+
   function renderCalculationGuide(key) {
     const guide = $('set-calculation-guide');
     const task = State.tasks.find(t => t.key === key);
@@ -261,7 +292,7 @@
     const route = VCS.calculationRoute && VCS.calculationRoute(key, VCS.scenario);
     if (start) start.textContent = route && route.page === 'project'
       ? '打开对应结果工具' : route && route.page === 'structure'
-        ? '打开对应建模工具' : '进入输入准备';
+        ? '打开对应建模工具' : `进入 ${String(VCS.activeEngine || 'vasp').toUpperCase()} 输入准备`;
   }
 
   async function startCalculation() {
@@ -288,9 +319,26 @@
     if (!(r && r.ok)) { VCS.log('切换工作模式失败:' + ((r && r.error) || '未知'), 'failc'); return; }
     renderScenarioDesc(key);
     if (VCS.applyScenario && r.scenario) VCS.applyScenario(r.scenario);
-    await loadCalculations(key);
+    const preferredEngine = r.scenario && r.scenario.defaults && r.scenario.defaults.engine;
+    if (preferredEngine) await VCS.call('engine_set', preferredEngine);
+    await loadEngines(key);
     VCS.log('工作模式已切换:' + ((r.scenario && r.scenario.name) || key), 'okc');
     VCS.toast('已切换工作模式');
+  }
+  async function onEngineChange() {
+    const key = $('set-engine') ? $('set-engine').value : 'vasp';
+    const r = await VCS.call('engine_set', key);
+    if (!(r && r.ok)) {
+      VCS.log('切换计算引擎失败:' + ((r && r.error) || '未知'), 'failc');
+      await loadEngines(($('set-scenario') && $('set-scenario').value) || null);
+      return;
+    }
+    const row = State.engines.find(item => item.key === key) || r.capability || {};
+    if (VCS.applyEngine) VCS.applyEngine(key, Object.assign({}, row, r.capability || {}));
+    renderEngineDesc(key);
+    await loadCalculations(($('set-scenario') && $('set-scenario').value) || null, key);
+    VCS.log('本次计算引擎已切换:' + (row.name || key.toUpperCase()), 'okc');
+    VCS.toast('已按引擎收起不支持的任务和字段');
   }
   async function onCalculationChange() {
     const key = $('set-calculation') ? $('set-calculation').value : '';
@@ -323,6 +371,7 @@
     wire('set-fig-save', 'click', saveFigPrefs);
     wire('set-lang', 'change', onLangChange);
     wire('set-scenario', 'change', onScenarioChange);
+    wire('set-engine', 'change', onEngineChange);
     wire('set-calculation', 'change', onCalculationChange);
     wire('set-calculation-start', 'click', startCalculation);
     const row = $('set-theme-row');

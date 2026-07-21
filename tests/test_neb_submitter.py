@@ -196,13 +196,43 @@ def test_neb_refresh_converged_is_done(tmp_path):
     assert m['results']['neb_energies'] == [pytest.approx(v) for v in (-9.6, -9.3, -9.7)]
 
 
-def test_neb_refresh_nonconverged_restartable(tmp_path):
+def test_neb_refresh_nonconverged_does_not_claim_unimplemented_restart(tmp_path):
     jd = _submit(tmp_path)
     client = FakeClient(script=[('OSZICAR', _osz(-9.5))])   # 有输出、无收敛串、无 ls
     m = submitter.refresh_job(client, _profile(), jd, live_states={})
     assert m['state'] == 'UNCONVERGED'
     assert m['results']['diagnosis']['failure_class'] == 'NONCONVERGED'
-    assert m['results']['diagnosis']['restartable'] is True
+    assert m['results']['diagnosis']['restartable'] is False
+
+
+def test_neb_convergence_marker_cannot_override_nonzero_exit(tmp_path):
+    jd = _submit(tmp_path)
+    client = FakeClient(script=[
+        ('reached required accuracy', 'reached required accuracy - stopping\n'),
+        ('___VCSLOG___', 'EXIT: 1\n___VCSLOG___\n'),
+        ('01/OSZICAR', _osz(-9.6)),
+        ('02/OSZICAR', _osz(-9.3)),
+        ('03/OSZICAR', _osz(-9.7)),
+        ('ls -1d', '00\n01\n02\n03\n04\n'),
+    ])
+    m = submitter.refresh_job(client, _profile(), jd, live_states={})
+    assert m['state'] != 'DONE'
+    assert m['results']['diagnosis']['failure_class'] == 'UNKNOWN'
+
+
+def test_neb_convergence_marker_cannot_override_missing_image_output(tmp_path):
+    jd = _submit(tmp_path)
+    client = FakeClient(script=[
+        ('reached required accuracy', 'reached required accuracy - stopping\n'),
+        ('___VCSLOG___', 'EXIT: 0\n___VCSLOG___\n'),
+        ('01/OSZICAR', _osz(-9.6)),
+        ('02/OSZICAR', ''),
+        ('03/OSZICAR', _osz(-9.7)),
+        ('ls -1d', '00\n01\n02\n03\n04\n'),
+    ])
+    m = submitter.refresh_job(client, _profile(), jd, live_states={})
+    assert m['state'] == 'NEEDS_HUMAN'
+    assert m['results']['diagnosis']['failure_class'] == 'NEB_IMAGE_MISSING'
 
 
 def test_neb_refresh_image_missing_is_needs_human(tmp_path):
@@ -280,11 +310,12 @@ def test_neb_interrupted_image_fetch_preserves_previous_result(tmp_path):
 
 
 # ── diagnose.classify_neb 纯函数分支 ──
-def test_classify_neb_walltime_restartable():
+def test_classify_neb_walltime_does_not_claim_unimplemented_restart():
     d = diagnose.classify_neb(images_expected=3, images_found=3,
                               image_status=[{'index': 1, 'empty': False, 'scf_fail': False}],
                               converged=False, scheduler_reason=diagnose.R_TIMEOUT)
-    assert d.failure_class == diagnose.WALLTIME and d.restartable
+    assert d.failure_class == diagnose.WALLTIME and not d.restartable
+    assert 'image 级自动续算尚未实现' in d.evidence
 
 
 def test_classify_neb_npar_divide_signature():

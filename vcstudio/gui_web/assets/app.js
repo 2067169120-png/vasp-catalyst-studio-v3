@@ -559,6 +559,8 @@ VCS.loadLang = async function (lang) {
 
 // ── 工作模式:按 data-scene 点分路径显隐 nav 项与卡片(镜像 scenarios.is_visible 口径) ──
 VCS.scenario = null;
+VCS.activeEngine = 'vasp';
+VCS.engineCapability = {};
 VCS.activeCalculation = '';
 
 // “本次计算类型”不仅裁剪卡片，也必须给出一个真实可到达的首要入口。
@@ -578,8 +580,11 @@ VCS.calculationRoute = function (key, scenario) {
   // 场景白名单仍是访问闸；不能靠前端路由打开不适用的计算。
   if (sc && Array.isArray(sc.task_keys) && sc.task_keys.indexOf(task) < 0) return null;
   if (CALCULATION_ROUTES[task]) return Object.assign({}, CALCULATION_ROUTES[task]);
-  if (sc && sc.key === 'molecular') {
+  if (VCS.activeEngine === 'gaussian') {
     return { page: 'generate', focusSelector: '#gauss-panel' };
+  }
+  if (VCS.activeEngine && VCS.activeEngine !== 'vasp') {
+    return { page: 'generate', focusSelector: '#engine-card' };
   }
   return {
     page: 'generate',
@@ -612,6 +617,14 @@ function applySceneElements(sc) {
   document.querySelectorAll('[data-scene]').forEach(el => {
     el.toggleAttribute('data-scene-hidden', !sceneVisible(sc, el.getAttribute('data-scene')));
   });
+  // 允许的引擎必须至少有一个真实输入入口。比如“分子化学”默认收起 VASP
+  // 四件套，但用户显式改选 VASP 后应恢复 VASP 输入，而不是只剩一个空页面。
+  if ((sc.engines || []).indexOf(VCS.activeEngine) >= 0) {
+    document.querySelectorAll('[data-engine][data-scene^="cards.generate."]').forEach(el => {
+      const engines = String(el.getAttribute('data-engine') || '').split(/\s+/);
+      if (engines.indexOf(VCS.activeEngine) >= 0) el.removeAttribute('data-scene-hidden');
+    });
+  }
   // 某些专用模式（例如 Li-S）默认精简掉“生成输入”。当用户在设置里明确
   // 改选 NEB / DOS / 收敛扫描等类型时，只放行该类型真正需要的目标页。
   const route = VCS.calculationRoute(VCS.activeCalculation, sc);
@@ -619,6 +632,23 @@ function applySceneElements(sc) {
     const link = document.querySelector(`nav a[data-page="${route.page}"]`);
     if (link) link.removeAttribute('data-scene-hidden');
   }
+}
+
+function applyEngineElements(engine) {
+  const active = String(engine || 'vasp');
+  document.querySelectorAll('[data-engine]').forEach(el => {
+    const tokens = String(el.getAttribute('data-engine') || '').split(/\s+/).filter(Boolean);
+    el.toggleAttribute('data-engine-hidden', tokens.indexOf(active) < 0 && tokens.indexOf('all') < 0);
+  });
+}
+
+function refreshModeChip() {
+  const chip = document.getElementById('mode-chip');
+  if (!chip) return;
+  const sc = VCS.scenario || {};
+  const engine = String(VCS.activeEngine || 'vasp').toUpperCase();
+  chip.textContent = (sc.name || sc.key || '工作模式') + ' · ' + engine;
+  chip.title = '切换工作模式、计算引擎或本次计算类型';
 }
 
 function keepCurrentPageReachable(sc, source) {
@@ -637,11 +667,22 @@ VCS.applyScenario = function (sc) {
   const s = VCS.scenario;
   if (!s) return;
   applySceneElements(s);
-  const chip = document.getElementById('mode-chip');
-  if (chip) chip.textContent = '工作模式：' + (s.name || s.key || '未选择');
+  applyEngineElements(VCS.activeEngine);
+  refreshModeChip();
   // 当前页被模式隐藏 → 优先去所选计算的真实入口；再按模式默认页回退。
   keepCurrentPageReachable(s, 'work-mode');
   document.dispatchEvent(new CustomEvent('vcs:scenario', { detail: { scenario: s } }));
+};
+
+VCS.applyEngine = function (engine, capability) {
+  VCS.activeEngine = String(engine || 'vasp').toLowerCase();
+  VCS.engineCapability = capability || {};
+  if (VCS.scenario) applySceneElements(VCS.scenario);
+  applyEngineElements(VCS.activeEngine);
+  refreshModeChip();
+  document.dispatchEvent(new CustomEvent('vcs:engine', {
+    detail: { engine: VCS.activeEngine, capability: VCS.engineCapability },
+  }));
 };
 
 VCS.applyCalculation = function (key) {
@@ -703,14 +744,22 @@ VCS.loadCalculation = async function () {
   return VCS.activeCalculation;
 };
 
+VCS.loadEngine = async function () {
+  const r = await VCS.call('engine_get');
+  if (r && r.ok) VCS.applyEngine(r.engine || 'vasp', r.capability || {});
+  else VCS.applyEngine('vasp', {});
+  return VCS.activeEngine;
+};
+
 // ── 首启工作模式选择模态(config 无 ui.scenario 时;只给四个常用模式) ──
 async function firstLaunchScenario() {
   const r = await VCS.call('scenario_list');
-  const list = ((r && r.scenarios) || []).filter(s => s.primary);
+  const list = ((r && r.scenarios) || []).filter(s => s.primary)
+    .sort((a, b) => (a.key === 'vasp' ? -1 : b.key === 'vasp' ? 1 : 0));
   if (!list.length) return;
   const box = document.createElement('div');
   box.innerHTML = '<div class="scene-grid">' + list.map(s =>
-    `<div class="scene-card" data-key="${VCS.esc(s.key)}"><b>${VCS.esc(s.name)}</b>` +
+    `<div class="scene-card" data-key="${VCS.esc(s.key)}"><b>${VCS.esc(s.name)}${s.key === 'vasp' ? '（推荐）' : ''}</b>` +
     `<span>${VCS.esc(s.description)}</span></div>`).join('') + '</div>';
   const m = VCS.modal({ title: '这次要做哪类计算？（之后可在设置中切换）',
     body: box, actions: [] });
@@ -721,6 +770,7 @@ async function firstLaunchScenario() {
     const res = await VCS.call('scenario_set', key);
     if (res && res.scenario) {
       VCS.applyScenario(res.scenario);
+      await VCS.loadEngine();
       await VCS.loadCalculation();
       VCS.toast('已选择工作模式：' + (res.scenario.name || key));
     }
@@ -745,6 +795,7 @@ VCS.ready.then(async () => {
       const sc = await VCS.call('scenario_get');
       if (sc && sc.scenario) {
         VCS.applyScenario(sc.scenario);
+        await VCS.loadEngine();
         await VCS.loadCalculation();
         if (!sc.configured) firstLaunchScenario();   // 首启弹场景选择模态
       }

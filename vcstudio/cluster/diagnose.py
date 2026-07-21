@@ -421,8 +421,9 @@ def classify_neb(*, images_expected=None, images_found=None, image_status=None,
       ① IMAGES 与实际 image 子目录数不符 → 输入错误(NEB_IMAGES_MISMATCH,交人工);
       ② 某 image 无有效输出 → NEB_IMAGE_MISSING(点名 image,交人工);
       ③ 某 image SCF 崩/震荡 → NEB_IMAGE_SCF(点名 image,交人工);
-      ④ 收敛串在场 → CONVERGED;
-      ⑤ 调度器具体原因(WALLTIME 等)> stdout 硬崩签名 > VASP 已知错误 > 未收敛(可续算)。
+      ④ 调度器/退出码/stdout 显式失败证据;
+      ⑤ 收敛串在场 → CONVERGED;
+      ⑥ 未收敛。当前没有安全的 image 级自动续算实现，因此不冒充 restartable。
 
     Args:
         images_expected: INCAR 的 IMAGES(中间 image 数);None 表示未知(跳过①)。
@@ -442,7 +443,7 @@ def classify_neb(*, images_expected=None, images_found=None, image_status=None,
 
     # ② 某 image 无有效输出(缺失/启动即死)
     missing = [s['index'] for s in status if s.get('empty')]
-    if missing and not converged:
+    if missing:
         names = ', '.join(f'{int(i):02d}' for i in missing)
         return Diagnosis(
             NEB_IMAGE_MISSING, FAILURE_TO_STATE[NEB_IMAGE_MISSING], False,
@@ -450,35 +451,41 @@ def classify_neb(*, images_expected=None, images_found=None, image_status=None,
 
     # ③ 某 image SCF 崩/震荡(点名 image)
     crashed = [s['index'] for s in status if s.get('scf_fail')]
-    if crashed and not converged:
+    if crashed:
         names = ', '.join(f'{int(i):02d}' for i in crashed)
         return Diagnosis(
             NEB_IMAGE_SCF, FAILURE_TO_STATE[NEB_IMAGE_SCF], False,
             f'image {names} SCF 崩/震荡——同 INCAR 续算必复现,建议人工调 ALGO/AMIX 或查该 image 结构')
 
-    # ④ 收敛(各 image 力收敛)
-    if converged:
-        return Diagnosis(CONVERGED, 'DONE', False,
-                         'NEB 各 image 力收敛(stdout 出现 reached required accuracy)')
-
-    # ⑤ 未收敛:调度器原因 > stdout 硬崩签名 > VASP 已知错误 > 未收敛(可续算)
+    # ④ 显式失败证据必须压过 stdout 中可能来自旧轮次的收敛串。
     rcls = _reason_to_class(scheduler_reason)
     if rcls is not None:
-        return Diagnosis(rcls, FAILURE_TO_STATE[rcls], rcls in RESTARTABLE,
-                         f'调度器报 {scheduler_reason};NEB 有部分输出但未收敛')
+        return Diagnosis(rcls, FAILURE_TO_STATE[rcls], False,
+                         f'调度器报 {scheduler_reason};NEB image 级自动续算尚未实现,需人工重提')
     sig = scan_log(log_tail)
     if sig is not None:
-        return Diagnosis(sig, FAILURE_TO_STATE[sig], sig in RESTARTABLE,
+        return Diagnosis(sig, FAILURE_TO_STATE[sig], False,
                          f'NEB stdout 命中 {sig} 签名')
     if exit_code == _OOM_EXIT:
-        return Diagnosis(WALLTIME, FAILURE_TO_STATE[WALLTIME], True,
-                         f'退出码 {exit_code}(SIGKILL)但无 OOM 证据,且有部分输出——疑超墙钟,按可续算处理')
+        return Diagnosis(WALLTIME, FAILURE_TO_STATE[WALLTIME], False,
+                         f'退出码 {exit_code}(SIGKILL)但无 OOM 证据;NEB image 级自动续算尚未实现')
     ve = scan_vasp_error(log_tail)
     if ve is not None:
         label, hint = ve
         return Diagnosis(label, 'NEEDS_HUMAN', False, f'NEB 命中 VASP 已知错误 {label}:{hint}')
-    return Diagnosis(NONCONVERGED, 'UNCONVERGED', True,
-                     'NEB 未见收敛标志(reached required accuracy)——力未收敛/墙钟,可从各 image CONTCAR 续算')
+    if exit_code not in (None, 0):
+        return Diagnosis(
+            UNKNOWN, FAILURE_TO_STATE[UNKNOWN], False,
+            f'NEB 包装脚本退出码 {exit_code} 为非零;即使 stdout 留有收敛串也不能判 DONE')
+
+    # ⑤ 收敛(各 image 输出完整、无硬失败且力收敛)
+    if converged:
+        return Diagnosis(CONVERGED, 'DONE', False,
+                         'NEB 各 image 输出完整且力收敛(stdout 出现 reached required accuracy)')
+
+    return Diagnosis(
+        NONCONVERGED, 'UNCONVERGED', False,
+        'NEB 未见收敛标志；当前尚无安全的 image 级自动续算实现，请保留各 image 后人工重提')
 
 
 # ── CONTCAR 续算前校验(valid_poscar 移植) ─────────────────────────────────────

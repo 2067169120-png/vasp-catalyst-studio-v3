@@ -778,18 +778,18 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
   <section class="page" data-page="generate" id="page-generate" hidden>
     <div class="pagebar">
       <h1 data-i18n="generate.title">生成输入</h1>
-      <span class="stats">POSCAR + INCAR → 自动补全四件套(POSCAR / INCAR / POTCAR / KPOINTS)</span>
+      <span class="stats" id="generate-engine-summary">VASP · POSCAR + INCAR → 自动补全四件套</span>
     </div>
 
     <!-- 引擎(VASP 优先):置顶醒目;默认 VASP,其余引擎标实验性 -->
     <div class="ana-bar engine-top">
       <span class="ana-lbl" data-i18n="generate.engine.label">计算引擎</span>
       <select id="engine-select" class="ipt"></select>
-      <span class="engine-note" id="engine-note" data-i18n="generate.engine.note">VASP:用下方计算类型目录与四件套;其余引擎走文件级适配(实验性)</span>
+      <span class="engine-note" id="engine-note">VASP 为默认完整工作流；其它引擎只显示已接通的任务与专属字段</span>
     </div>
 
     <!-- 计算类型目录:VASP 23 类分类 optgroup 下拉 → 参数表单 → 派生作业 -->
-    <div class="card acc" data-acc="generate:taskcat" data-sum="VASP 23 类计算 → 参数 → 派生" id="taskcat-card" data-scene="cards.generate.task_catalog" style="padding:12px;margin-bottom:10px">
+    <div class="card acc" data-acc="generate:taskcat" data-sum="VASP 23 类计算 → 参数 → 派生" id="taskcat-card" data-scene="cards.generate.task_catalog" data-engine="vasp" style="padding:12px;margin-bottom:10px">
       <div class="gen-h acc-h" data-i18n="taskcat.title">计算类型目录 <span class="sub" style="font-weight:400" data-i18n="taskcat.sub">选类型 → 填参数 → 从已完成作业派生下一步作业</span></div>
       <div class="tc-cats" id="tc-cats"></div>
       <div class="tc-grid" id="tc-grid"><span class="sub" data-i18n="taskcat.loading">加载计算类型目录…</span></div>
@@ -823,7 +823,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- NEB 过渡态面板:始态/末态目录 + image 数 → 生成标准 NEB 目录树(P0-1 接通) -->
-    <div class="card acc" data-acc="generate:neb" data-sum="始态 + 末态 → CI-NEB 目录树" data-acc-default="0" id="neb-card" data-scene="cards.generate.neb" data-task="neb" style="padding:12px;margin-bottom:10px">
+    <div class="card acc" data-acc="generate:neb" data-sum="始态 + 末态 → CI-NEB 目录树" data-acc-default="0" id="neb-card" data-scene="cards.generate.neb" data-task="neb" data-engine="vasp" style="padding:12px;margin-bottom:10px">
       <div class="gen-h acc-h">NEB 过渡态(始末态已知)
         <span class="sub" style="font-weight:400">选已弛豫的初/末态作业目录 + 中间 image 数 → 线性插值 + 标准 VASP NEB 目录树(00/01../N+1),根 INCAR 只补不改补齐 IMAGES/SPRING</span>
       </div>
@@ -851,7 +851,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <div class="ta-out" id="neb-out" style="margin-top:8px"></div>
     </div>
 
-    <div class="card acc" data-acc="generate:input" data-sum="POSCAR / INCAR / 输出 / 赝势库" data-acc-default="0" data-scene="cards.generate.vasp_inputs" data-task="relax vaspsol" style="padding:12px;margin-bottom:10px">
+    <div class="card acc" data-acc="generate:input" data-sum="POSCAR / INCAR / 输出 / 赝势库" data-acc-default="0" data-scene="cards.generate.vasp_inputs" data-task="relax vaspsol" data-engine="vasp" style="padding:12px;margin-bottom:10px">
       <div class="gen-h acc-h">输入文件</div>
 
       <div class="gen-fld">
@@ -908,7 +908,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       </div>
     </div>
 
-    <div class="card acc" data-acc="generate:preview" data-sum="四件套解析预览,可编辑保存" data-acc-default="0" data-scene="cards.generate.preview" data-task="relax vaspsol" style="padding:12px;margin-bottom:10px">
+    <div class="card acc" data-acc="generate:preview" data-sum="四件套解析预览,可编辑保存" data-acc-default="0" data-scene="cards.generate.preview" data-task="relax vaspsol" data-engine="vasp" style="padding:12px;margin-bottom:10px">
       <div class="gen-h acc-h">解析预览 <span class="sub" style="font-weight:400" data-i18n="generate.preview.editable">可直接编辑;可保存到文件</span></div>
       <div class="gen-fld">
         <span class="gen-lbl" data-i18n="generate.extra_kw">自定义 INCAR 关键词(每行一条,如 LREAL = Auto;生成时追加到 INCAR)</span>
@@ -920,15 +920,16 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       </div>
     </div>
 
-    <div class="actions" data-task="relax vaspsol">
+    <div class="actions" data-task="relax vaspsol" data-engine="vasp">
       <button class="btn primary" id="gen-run" data-i18n="generate.run">生成四件套</button>
     </div>
 
     <!-- 计算引擎选择器(VASP 主 + CP2K/Gaussian/CASTEP 文件级适配,实验性) -->
-    <div class="card acc" data-acc="generate:engine" data-sum="VASP 主引擎;其余引擎实验性" data-acc-default="0" id="engine-card" data-scene="cards.generate.engine_adapter" style="padding:12px;margin:10px 0">
-      <div class="gen-h acc-h">引擎参数 <span class="exp-badge">非 VASP · 实验性</span>
-        <span class="sub" style="font-weight:400">引擎在页面顶部「计算引擎」下拉选择;VASP 走四件套,CP2K / Gaussian / CASTEP 在此填简化参数(生成输入 + 解析输出,软件本体用户自备)</span></div>
+    <div class="card acc" data-acc="generate:engine" data-sum="非 VASP 专属输入与工作流" data-acc-default="0" id="engine-card" data-scene="cards.generate.engine_adapter" data-engine="cp2k gaussian castep" style="padding:12px;margin:10px 0">
+      <div class="gen-h acc-h"><span id="engine-card-title">非 VASP 引擎输入</span> <span class="exp-badge">文件级适配</span>
+        <span class="sub" id="engine-card-sub" style="font-weight:400">只显示当前引擎真正需要的字段；生成后会写 job.yaml 并进入同一任务页</span></div>
       <div class="chips" id="engine-chips" hidden></div>
+      <div class="warn-banner" id="engine-capability-note"></div>
       <div class="warn-banner" id="engine-nonequiv" hidden></div>
       <div id="engine-form" hidden>
         <div class="gen-fld">
@@ -939,21 +940,46 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
           </div>
         </div>
         <div class="gen-fld">
+          <span class="gen-lbl">任务类型（仅列出当前适配已接通的任务）</span>
+          <select id="eng-task" class="ipt"></select>
+        </div>
+        <div class="gen-fld">
           <span class="gen-lbl">泛函 / 色散</span>
           <div class="gen-inrow">
             <input id="eng-func" class="ipt" autocomplete="off" placeholder="PBE" style="flex:1">
             <input id="eng-disp" class="ipt" autocomplete="off" placeholder="色散(如 D3,可空)" style="flex:1">
           </div>
         </div>
-        <div class="gen-fld">
-          <span class="gen-lbl">截断能 ENCUT (eV) / k 点网格(如 3 3 1,分子留空)</span>
+        <div class="gen-fld" data-engine-field="castep">
+          <span class="gen-lbl">CASTEP 截断能 cut_off_energy (eV) / k 点网格</span>
           <div class="gen-inrow">
-            <input id="eng-cutoff" class="ipt" inputmode="decimal" placeholder="500" style="flex:0 0 120px">
-            <input id="eng-kpts" class="ipt" autocomplete="off" placeholder="3 3 1" style="flex:1">
+            <input id="eng-cutoff" class="ipt" inputmode="decimal" value="500" placeholder="500" style="flex:0 0 120px">
+            <input id="eng-kpts" class="ipt" autocomplete="off" value="3 3 1" placeholder="3 3 1" style="flex:1">
+          </div>
+          <span class="sub">与 VASP ENCUT 虽同为 eV，仍必须按 CASTEP 赝势独立收敛。</span>
+        </div>
+        <div class="gen-fld" data-engine-field="cp2k">
+          <span class="gen-lbl">CP2K 密度网格 CUTOFF / REL_CUTOFF（Ry）</span>
+          <div class="gen-inrow">
+            <input id="eng-cutoff-ry" class="ipt" inputmode="decimal" value="400" placeholder="CUTOFF 400 Ry" style="flex:1">
+            <input id="eng-rel-cutoff-ry" class="ipt" inputmode="decimal" value="60" placeholder="REL_CUTOFF 60 Ry" style="flex:1">
+          </div>
+          <span class="sub">这是 GTH 密度网格截断，不能从 VASP ENCUT(eV)换算。</span>
+        </div>
+        <div class="gen-fld" data-engine-field="cp2k">
+          <span class="gen-lbl">CP2K BASIS / POTENTIAL 数据文件名（可保留默认）</span>
+          <div class="gen-inrow">
+            <input id="eng-basis-file" class="ipt" autocomplete="off" value="BASIS_MOLOPT" placeholder="BASIS_MOLOPT" style="flex:1">
+            <input id="eng-potential-file" class="ipt" autocomplete="off" value="GTH_POTENTIALS" placeholder="GTH_POTENTIALS" style="flex:1">
           </div>
         </div>
-        <div class="gen-fld" style="margin-bottom:0">
-          <span class="gen-lbl">体系 / 自旋 / 电荷</span>
+        <div class="gen-fld" data-engine-field="cp2k">
+          <span class="gen-lbl">CP2K 周期体系 k 点网格</span>
+          <input id="eng-cp2k-kpts" class="ipt" autocomplete="off" value="3 3 1" placeholder="3 3 1">
+          <span class="sub">周期 slab/bulk 必须独立收敛；孤立分子模式不使用此项。</span>
+        </div>
+        <div class="gen-fld">
+          <span class="gen-lbl">体系边界 / 自旋 / 电荷 / 多重度</span>
           <div class="gen-inrow" style="flex-wrap:wrap">
             <select id="eng-periodic" class="ipt" style="flex:0 0 150px">
               <option value="1">周期(slab/bulk)</option>
@@ -961,6 +987,12 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
             </select>
             <label class="rad" style="display:flex;align-items:center;gap:5px"><input type="checkbox" id="eng-spin"> 自旋极化</label>
             <input id="eng-charge" class="ipt" inputmode="numeric" placeholder="电荷 0" style="flex:0 0 110px">
+            <input id="eng-multiplicity" class="ipt" inputmode="numeric" value="1" placeholder="多重度 1" style="flex:0 0 110px">
+          </div>
+        </div>
+        <div class="gen-fld" style="margin-bottom:0">
+          <span class="gen-lbl">输出目录</span>
+          <div class="gen-inrow">
             <input id="eng-out" class="ipt" autocomplete="off" placeholder="输出目录" style="flex:1">
             <button class="btn" id="eng-out-btn">浏览</button>
           </div>
@@ -2155,13 +2187,17 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
 
     <!-- 最先决定本次做什么；切换只影响界面显隐，不删除、移动或提交已有任务。 -->
-    <div class="card acc" data-acc="settings:workspace" data-sum="工作模式 / 本次计算类型" data-acc-default="1" style="padding:12px;margin-bottom:10px">
+    <div class="card acc" data-acc="settings:workspace" data-sum="工作模式 / 计算引擎 / 本次计算类型" data-acc-default="1" style="padding:12px;margin-bottom:10px">
       <div class="set-h acc-h" data-i18n="settings.workspace.title">本次计算</div>
-      <div class="set-sub" data-i18n="settings.workspace.sub">先选择工作模式和本次计算类型；软件只显示需要的步骤，不会删除或修改已有任务。</div>
-      <div class="set-2col">
+      <div class="set-sub" data-i18n="settings.workspace.sub">依次选择工作模式、计算引擎和本次任务；VASP 默认且功能最完整，切换其它引擎后只保留已接通的任务和字段。</div>
+      <div class="set-workspace-grid">
         <div class="set-fld">
           <span class="set-lbl" data-i18n="settings.scenario.label">工作模式</span>
           <select id="set-scenario" class="ipt"></select>
+        </div>
+        <div class="set-fld">
+          <span class="set-lbl">计算引擎</span>
+          <select id="set-engine" class="ipt"></select>
         </div>
         <div class="set-fld">
           <span class="set-lbl">本次计算类型</span>
@@ -2169,6 +2205,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
         </div>
       </div>
       <div class="set-sub" id="set-scenario-desc" style="margin:2px 0 8px"></div>
+      <div class="set-sub" id="set-engine-desc" style="margin:2px 0 8px"></div>
       <div class="set-calculation-guide" id="set-calculation-guide" hidden>
         <b id="set-calculation-name"></b>
         <span id="set-calculation-desc"></span>

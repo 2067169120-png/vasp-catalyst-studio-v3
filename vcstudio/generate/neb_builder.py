@@ -91,7 +91,7 @@ def _read_sd_flags(lines: list, natoms: int):
 def _endpoint(text: str) -> dict:
     """解析一个端点 POSCAR → 物种/计数/晶格/分数坐标/SD 标志/头部行。
 
-    复用 parse_positions(笛卡尔坐标 + 晶格,已处理 Direct/Cartesian/负缩放拒绝),
+    复用 parse_positions(笛卡尔坐标 + 晶格，已处理 Direct/Cartesian/完整缩放语义),
     再转分数坐标。VASP4/畸形 → ValueError(冒泡)。
     """
     syms, counts = parse_poscar_species(text)

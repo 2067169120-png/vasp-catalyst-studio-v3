@@ -18,7 +18,7 @@ import math
 import os
 from collections import OrderedDict
 
-from vcstudio.generate.poscar import parse_poscar_species
+from vcstudio.generate.poscar import parse_poscar_species, read_cell_vectors
 
 
 def _read_maybe(src) -> str:
@@ -53,7 +53,7 @@ def _det3(m) -> float:
 def read_chgcar(path_or_text) -> dict:
     """CHGCAR/AECCAR(路径或文本)→ 头信息 + 网格值。
 
-    返回 ``{'comment','scale','lattice'(3×3 原始),'species','counts','natoms',
+    返回 ``{'comment','scale','lattice'(3×3 原始),'cell'(3×3 实际 Å),'species','counts','natoms',
     'ngx','ngy','ngz','grid'(长度 NGX*NGY*NGZ),'header'(POSCAR 头行,原样供重写)}``。
     只读主电荷网格,PAW 增广(augmentation)尾段读满 NGX*NGY*NGZ 即停、不解析。
     行数不足/网格维度非整数/数据不足或含非数值 → 中文 ValueError。
@@ -73,6 +73,10 @@ def read_chgcar(path_or_text) -> dict:
         if len(parts) < 3:
             raise ValueError(f'CHGCAR 第{i + 1}行晶格矢量不足 3 分量')
         lattice.append([float(x) for x in parts[:3]])
+    # CHGCAR/AECCAR/LOCPOT 共享 POSCAR 头格式。统一解析实际晶格，正确覆盖单个
+    # 负数目标体积及三个 Cartesian 分量缩放因子；``scale``/``lattice`` 仍保留
+    # 给旧调用方做原始头审计，内部几何计算一律使用 ``cell``。
+    cell = read_cell_vectors(text)
     toks5 = lines[5].split()
     if _is_all_int(toks5):                       # VASP4:第6行即计数(无元素符号行)
         species, counts, idx = [], [int(t) for t in toks5], 6
@@ -114,7 +118,7 @@ def read_chgcar(path_or_text) -> dict:
         idx += 1
     if len(grid) < ntot:
         raise ValueError(f'CHGCAR 网格数据不足:需 {ntot} 个,读到 {len(grid)}(文件截断?)')
-    return {'comment': comment, 'scale': scale, 'lattice': lattice,
+    return {'comment': comment, 'scale': scale, 'lattice': lattice, 'cell': cell,
             'species': species, 'counts': counts, 'natoms': natoms,
             'ngx': ngx, 'ngy': ngy, 'ngz': ngz, 'grid': grid, 'header': header}
 
@@ -146,8 +150,8 @@ def same_grid(a: dict, b: dict) -> bool:
 
 
 def same_lattice(a: dict, b: dict, tol: float = 1e-4) -> bool:
-    la = [[a['scale'] * x for x in v] for v in a['lattice']]
-    lb = [[b['scale'] * x for x in v] for v in b['lattice']]
+    la = a.get('cell') or [[a['scale'] * x for x in v] for v in a['lattice']]
+    lb = b.get('cell') or [[b['scale'] * x for x in v] for v in b['lattice']]
     return all(abs(la[i][j] - lb[i][j]) <= tol for i in range(3) for j in range(3))
 
 
@@ -348,8 +352,9 @@ def plane_averaged(chgcar_path_or_diff, axis: str = 'z') -> dict:
         k = key(i)
         sums[k] += v
         cnts[k] += 1
-    vol = abs(_det3([[c['scale'] * x for x in vec] for vec in c['lattice']]))
-    axis_vec = [c['scale'] * x for x in c['lattice'][{'x': 0, 'y': 1, 'z': 2}[axis]]]
+    cell = c.get('cell') or [[c['scale'] * x for x in vec] for vec in c['lattice']]
+    vol = abs(_det3(cell))
+    axis_vec = cell[{'x': 0, 'y': 1, 'z': 2}[axis]]
     length = math.sqrt(sum(x * x for x in axis_vec))
     zs = [(k / na) * length for k in range(na)]
     rho = [(sums[k] / cnts[k] / vol) if (cnts[k] and vol > 0) else 0.0

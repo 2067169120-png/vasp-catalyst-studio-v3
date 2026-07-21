@@ -127,10 +127,27 @@ def test_build_eos_series_default_seven_points(tmp_path):
     assert len(res['series']) == 7                          # 0.94..1.06 七点
 
 
-def test_scale_poscar_negative_scale_raises():
-    neg = _BULK.replace('1.0\n3.6', '-46.0\n3.6')
-    with pytest.raises(ValueError, match='缩放因子'):
-        eos._scale_poscar(neg, 1.02)
+def test_scale_poscar_negative_volume_mode_supported():
+    neg = _BULK.replace('1.0\n3.6', f'-{3.6 ** 3}\n3.6')
+    scaled = eos._scale_poscar(neg, 1.02)
+    # 负值仍表示目标体积，EOS 的线性 1.02 应把目标体积放大 1.02³。
+    assert float(scaled.splitlines()[1]) == pytest.approx(
+        -(3.6 ** 3) * 1.02 ** 3)
+    assert abs(eos._det3(eos.read_cell_vectors(scaled))) == pytest.approx(
+        3.6 ** 3 * 1.02 ** 3)
+
+
+def test_scale_poscar_three_component_scales_supported():
+    anisotropic = _BULK.replace('1.0\n3.6', '1 2 3\n3.6')
+    scaled = eos._scale_poscar(anisotropic, 0.98)
+    assert [float(value) for value in scaled.splitlines()[1].split()] == pytest.approx(
+        [0.98, 1.96, 2.94])
+
+
+@pytest.mark.parametrize('factor', [0, -1, float('nan')])
+def test_scale_poscar_rejects_invalid_eos_factor(factor):
+    with pytest.raises(ValueError, match='线性缩放因子'):
+        eos._scale_poscar(_BULK, factor)
 
 
 # ── eos_plot 出图 ───────────────────────────────────────────────────────────────

@@ -199,6 +199,7 @@ def test_build_freq_poscar_out_of_range_raises():
 # ── 频率 INCAR 逐键派生 ─────────────────────────────────────────────────────────
 def test_build_freq_incar_replaces_ionic_keys():
     d = parse_incar(fb.build_freq_incar(_RELAX_INCAR))
+    assert d['ISTART'] == 0 and d['ICHARG'] == 2
     assert d['IBRION'] == 5 and d['NFREE'] == 2 and d['NSW'] == 1
     assert d['ISYM'] == 0
     assert d['POTIM'] == pytest.approx(0.015)
@@ -233,8 +234,15 @@ def test_build_freq_incar_adds_missing_ionic_keys():
     d = parse_incar(fb.build_freq_incar(base))
     assert d['IBRION'] == 5 and d['NFREE'] == 2 and d['NSW'] == 1
     assert d['ISYM'] == 0 and d['POTIM'] == pytest.approx(0.015)
+    assert d['ISTART'] == 0 and d['ICHARG'] == 2
     assert d['EDIFF'] == pytest.approx(1e-7)              # 缺 → 补
     assert d['ENCUT'] == 400 and d['GGA'] == 'PE'
+
+
+def test_build_freq_incar_resets_parent_restart_state():
+    base = _RELAX_INCAR + 'ISTART = 1\nICHARG = 11\n'
+    d = parse_incar(fb.build_freq_incar(base))
+    assert d['ISTART'] == 0 and d['ICHARG'] == 2
 
 
 def test_derive_freq_incar_changes_manifest():

@@ -5,9 +5,9 @@
 解析各作业末态能量 → 判收敛点 → 出收敛曲线」做成闭环。
 
 设计原则(与 freq/aimd 生成端一致):
-- **只改目标参数**:ENCUT 系列只动 INCAR 的 ENCUT,k 系列只动 KPOINTS,真空/层厚只动
-  POSCAR;其余输入逐字复制(changes 留痕,口径可见)。同一系列各作业除目标参数外完全同一,
-  保证能量差只由目标参数引起。
+- **固定几何单点**:所有系列先把母 INCAR 规范成自洽静态(NSW=0/IBRION=-1，清掉
+  ISIF/EDIFFG 和续算态)，同一系列再只改变目标参数。这样不会把不同点各自重新弛豫后
+  的结构差误算成 ENCUT/k 点/真空收敛效应。
 - **绝不静默**:层厚系列需重建 slab(裸 CONTCAR 不含体相/米勒面信息无法再生),不可再生时
   显式返回说明而非编造结构;真空系列假设 c⊥ab 沿 z,倾斜胞附 warning。
 - 纯函数为主,复用 poscar/structure_view/kpoints 既有解析与 cluster.convergence 的 OSZICAR 解析。
@@ -34,6 +34,19 @@ from vcstudio.shared import manifest as manifest_mod
 
 DEFAULT_ENCUT_VALUES = (400, 450, 500, 550, 600, 650)
 DEFAULT_THRESHOLD_MEV = 1.0        # 相邻收敛判据:1 meV/atom
+
+_CONV_STATIC_SET = OrderedDict([
+    ('ISTART', 0), ('ICHARG', 2), ('IBRION', -1), ('NSW', 0),
+])
+_CONV_STATIC_STRIP = ('ISIF', 'EDIFFG')
+_CONV_STATIC_REASONS = {
+    'ISTART': '收敛扫描目录不依赖母作业 WAVECAR',
+    'ICHARG': '每个扫描点从原子叠加电荷独立自洽',
+    'IBRION': '收敛扫描采用固定几何静态单点',
+    'NSW': '收敛扫描不做离子步',
+    'ISIF': '固定几何单点不做应力/变胞',
+    'EDIFFG': '固定几何单点无离子收敛判据',
+}
 
 
 # ── 通用小工具(部分供 cell_opt / eos 复用) ─────────────────────────────────────
@@ -120,6 +133,18 @@ def derive_incar(base_incar_text: str, *, set_keys=None, strip_keys=(), reasons=
 
     head = (banner + '\n') if banner else ''
     return head + '\n'.join(new_lines) + '\n', changes
+
+
+def _derive_conv_static_incar(base_incar_text: str, *, set_keys=None,
+                              reasons=None, banner=None):
+    """把母作业统一派生为固定几何自洽单点，再叠加本系列唯一目标参数。"""
+    merged = OrderedDict(_CONV_STATIC_SET)
+    merged.update((str(k).upper(), v) for k, v in (set_keys or {}).items())
+    why = dict(_CONV_STATIC_REASONS)
+    why.update({str(k).upper(): v for k, v in (reasons or {}).items()})
+    return derive_incar(
+        base_incar_text, set_keys=merged, strip_keys=_CONV_STATIC_STRIP,
+        reasons=why, banner=banner)
 
 
 def _det3(m) -> float:
@@ -210,7 +235,7 @@ def _require_inputs(src_dir):
 
 
 def build_encut_series(src_dir, out_root, values=DEFAULT_ENCUT_VALUES) -> dict:
-    """ENCUT 收敛系列:各作业只改 INCAR 的 ENCUT(POSCAR/KPOINTS/POTCAR 逐字复制)。
+    """ENCUT 收敛系列:固定几何静态基线，各作业只改变 ENCUT。
 
     作业目录名 ``encut_<值>``。返回 ``{'out_root','dirs','series','results','warnings'}``,
     series=[{'value','label','dir'}, ...](供 analyze_series/conv_plot 消费)。
@@ -223,9 +248,9 @@ def build_encut_series(src_dir, out_root, values=DEFAULT_ENCUT_VALUES) -> dict:
         v = int(v)
         out_dir = os.path.join(out_root, f'encut_{v}')
         os.makedirs(out_dir, exist_ok=True)
-        new_incar, changes = derive_incar(
+        new_incar, changes = _derive_conv_static_incar(
             incar_text, set_keys={'ENCUT': v}, reasons={'ENCUT': 'ENCUT 收敛扫描目标值(eV)'},
-            banner=f'# === vcstudio ENCUT 收敛系列(仅改 ENCUT={v};其余同源) ===')
+            banner=f'# === vcstudio ENCUT 收敛系列(固定几何静态;ENCUT={v}) ===')
         warnings: list[str] = []
         with open(os.path.join(out_dir, 'POSCAR'), 'w', encoding='utf-8') as f:
             f.write(poscar_text)
@@ -245,7 +270,7 @@ def build_encut_series(src_dir, out_root, values=DEFAULT_ENCUT_VALUES) -> dict:
 
 
 def build_kmesh_series(src_dir, out_root, meshes) -> dict:
-    """k 网格收敛系列:各作业只改 KPOINTS(POSCAR/INCAR/POTCAR 逐字复制)。
+    """k 网格收敛系列:固定几何静态基线，各作业只改变 KPOINTS。
 
     meshes:``[[kx,ky,kz], ...]``。作业目录名 ``kmesh_<kx>x<ky>x<kz>``;series_value 取
     k 点积(kx·ky·kz,单调代理供收敛排序),series_label 为 'kx×ky×kz'。
@@ -260,15 +285,19 @@ def build_kmesh_series(src_dir, out_root, meshes) -> dict:
         out_dir = os.path.join(out_root, f'kmesh_{kx}x{ky}x{kz}')
         os.makedirs(out_dir, exist_ok=True)
         warnings: list[str] = []
+        new_incar, incar_changes = _derive_conv_static_incar(
+            incar_text,
+            banner='# === vcstudio k 网格收敛系列(固定几何静态) ===')
         with open(os.path.join(out_dir, 'POSCAR'), 'w', encoding='utf-8') as f:
             f.write(poscar_text)
         with open(os.path.join(out_dir, 'INCAR'), 'w', encoding='utf-8') as f:
-            f.write(incar_text)
+            f.write(new_incar)
         with open(os.path.join(out_dir, 'KPOINTS'), 'w', encoding='utf-8') as f:
             f.write(kpoints_str([kx, ky, kz]))
         if not _copy_if(src_dir, out_dir, 'POTCAR'):
             warnings.append('源目录缺 POTCAR,未复制;提交前须补齐同一套赝势。')
-        changes = [f'KPOINTS: → {label}(Gamma-centered;k 网格收敛扫描目标)']
+        changes = list(incar_changes)
+        changes.append(f'KPOINTS: → {label}(Gamma-centered;k 网格收敛扫描目标)')
         _save_conv_manifest(out_dir, src_dir, poscar_text, 'kmesh', nk, label,
                             changes, warnings)
         dirs[nk] = out_dir
@@ -279,7 +308,7 @@ def build_kmesh_series(src_dir, out_root, meshes) -> dict:
 
 
 def build_vacuum_series(src_dir, out_root, vacuums) -> dict:
-    """真空层收敛系列:各作业只改 POSCAR 的 c 真空(INCAR/KPOINTS/POTCAR 逐字复制)。
+    """真空层收敛系列:固定几何静态基线，各作业只改变 POSCAR 的 c 真空。
 
     vacuums:目标真空厚度列表(Å)。作业目录名 ``vac_<值>``(值取整或一位小数)。
     slab 沿 z 居中重建(见 set_vacuum),倾斜胞附 warning。
@@ -297,16 +326,21 @@ def build_vacuum_series(src_dir, out_root, vacuums) -> dict:
         out_dir = os.path.join(out_root, f'vac_{tag}')
         os.makedirs(out_dir, exist_ok=True)
         new_poscar, warnings = set_vacuum(poscar_text, vac)
+        new_incar, incar_changes = _derive_conv_static_incar(
+            incar_text,
+            banner='# === vcstudio 真空层收敛系列(固定几何静态) ===')
         with open(os.path.join(out_dir, 'POSCAR'), 'w', encoding='utf-8') as f:
             f.write(new_poscar)
         with open(os.path.join(out_dir, 'INCAR'), 'w', encoding='utf-8') as f:
-            f.write(incar_text)
+            f.write(new_incar)
         if not _copy_if(src_dir, out_dir, 'KPOINTS'):
             warnings.append('源目录缺 KPOINTS,未复制;收敛系列须各作业同一 k 网格,请补齐。')
         if not _copy_if(src_dir, out_dir, 'POTCAR'):
             warnings.append('源目录缺 POTCAR,未复制;提交前须补齐同一套赝势。')
         old_txt = f'{old_vac:.2f}' if old_vac is not None else '?'
-        changes = [f'POSCAR c 真空层: {old_txt} → {vac:g} Å(真空收敛扫描目标;slab 沿 z 居中)']
+        changes = list(incar_changes)
+        changes.append(
+            f'POSCAR c 真空层: {old_txt} → {vac:g} Å(真空收敛扫描目标;slab 沿 z 居中)')
         _save_conv_manifest(out_dir, src_dir, new_poscar, 'vacuum', vac, f'{vac:g} Å',
                             changes, warnings)
         dirs[vac] = out_dir
@@ -317,7 +351,7 @@ def build_vacuum_series(src_dir, out_root, vacuums) -> dict:
 
 
 def build_slab_thickness_series(src_dir, out_root, layers, *, slab_builder_fn=None) -> dict:
-    """层厚收敛系列:各作业改 POSCAR 的 slab 层数(INCAR/KPOINTS/POTCAR 复制)。
+    """层厚收敛系列:固定几何静态基线，各作业改变 POSCAR 的 slab 层数。
 
     **层厚系列需重建 slab**:裸 CONTCAR 不含体相晶胞/米勒面/终止面信息,无法从已有 slab 反推
     更厚/更薄的 slab。故必须由调用方提供 ``slab_builder_fn(n_layers) -> POSCAR 文本``(源自 sac/
@@ -342,15 +376,19 @@ def build_slab_thickness_series(src_dir, out_root, layers, *, slab_builder_fn=No
         os.makedirs(out_dir, exist_ok=True)
         poscar_text = slab_builder_fn(n)
         warnings: list[str] = []
+        new_incar, incar_changes = _derive_conv_static_incar(
+            incar_text,
+            banner='# === vcstudio slab 层厚收敛系列(固定几何静态) ===')
         with open(os.path.join(out_dir, 'POSCAR'), 'w', encoding='utf-8') as f:
             f.write(poscar_text)
         with open(os.path.join(out_dir, 'INCAR'), 'w', encoding='utf-8') as f:
-            f.write(incar_text)
+            f.write(new_incar)
         if not _copy_if(src_dir, out_dir, 'KPOINTS'):
             warnings.append('源目录缺 KPOINTS,未复制;层厚系列面内 k 网格须一致,请补齐。')
         if not _copy_if(src_dir, out_dir, 'POTCAR'):
             warnings.append('源目录缺 POTCAR,未复制;提交前须补齐同一套赝势。')
-        changes = [f'POSCAR: 重建为 {n} 层 slab(层厚收敛扫描目标)']
+        changes = list(incar_changes)
+        changes.append(f'POSCAR: 重建为 {n} 层 slab(层厚收敛扫描目标)')
         _save_conv_manifest(out_dir, src_dir, poscar_text, 'slab_thickness', n,
                             f'{n} 层', changes, warnings)
         dirs[n] = out_dir
@@ -362,7 +400,10 @@ def build_slab_thickness_series(src_dir, out_root, layers, *, slab_builder_fn=No
 
 # ── 系列解析 + 收敛判定 ──────────────────────────────────────────────────────────
 def _final_energy(job_dir: str):
-    """读作业目录 OSZICAR 末离子步 E0(eV);无 OSZICAR/无步 → None(未跑完)。"""
+    """读已完成扫描点的末态 E0；有 manifest 时非 DONE 的中间能量一律不用。"""
+    m = manifest_mod.load_manifest(job_dir)
+    if m is not None and m.get('state') != 'DONE':
+        return None
     txt = _read_text(os.path.join(str(job_dir), 'OSZICAR'))
     if txt is None:
         return None
@@ -387,7 +428,8 @@ def analyze_series(dirs, *, natoms=None, threshold_mev: float = DEFAULT_THRESHOL
     """解析收敛系列 → ``{'points','converged_at','threshold_mev','natoms','note'}``。
 
     dirs:``{x: 作业目录}`` 映射(推荐),或作业目录**列表**(x 从各 job.yaml 的 series_value 取)。
-    points=[{'x','energy','converged'},...](按 x 升序);energy 取 OSZICAR 末态 E0(未跑完→None)。
+    points=[{'x','energy','converged'},...](按 x 升序);energy 只取 DONE 作业的 OSZICAR
+    末态 E0(有 manifest 但未完成→None；无 manifest 的旧目录维持兼容)。
     收敛判据:相邻两点 |ΔE|/natoms < threshold_mev(默认 1 meV/atom)。converged_at=**首个**满足
     该判据的 x(即达到收敛的最小参数值);无一满足或有效点不足 → None + 中文 note。
     """

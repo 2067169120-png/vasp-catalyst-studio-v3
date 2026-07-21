@@ -63,6 +63,8 @@ def test_pdos_job_incar_keys_and_files(tmp_path):
     inc = parse_incar((out / 'INCAR').read_text(encoding='utf-8'))
     assert inc['NSW'] == 0
     assert inc['IBRION'] == -1
+    assert inc['ISTART'] == 0 and inc['ICHARG'] == 2
+    assert 'ISIF' not in inc and 'EDIFFG' not in inc
     assert inc['ISMEAR'] == -5                    # 3x3x1 ×2 → 7x7x1,积=49≥4
     assert inc['LORBIT'] == 11
     assert inc['NEDOS'] == 2000
@@ -135,6 +137,16 @@ def test_ediff_already_tight_preserved(tmp_path):
     estatic.build_static_job(relax, out, purpose='pdos')
     inc = parse_incar((out / 'INCAR').read_text(encoding='utf-8'))
     assert float(inc['EDIFF']) == pytest.approx(1e-7)   # 已 ≤1e-6,不放松
+
+
+def test_static_job_resets_parent_restart_state(tmp_path):
+    incar = _INCAR + 'ISTART = 1\nICHARG = 11\n'
+    relax = _make_relax(tmp_path, incar=incar)
+    out = tmp_path / 's_restart_parent'
+    estatic.build_static_job(relax, out, purpose='bader')
+    inc = parse_incar((out / 'INCAR').read_text(encoding='utf-8'))
+    assert inc['ISTART'] == 0
+    assert inc['ICHARG'] == 2
 
 
 def test_job_yaml_records_provenance(tmp_path):

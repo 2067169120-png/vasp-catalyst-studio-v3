@@ -142,19 +142,27 @@ def test_unknown_task_is_not_silently_treated_as_vasp(tmp_path):
     [
         ('gaussian', 'mol.gjf', 'mol.log',
          ' SCF Done:  E(RPBE) =  -2.0000000000 A.U.\n'
+         ' Stationary point found.\n'
          ' Normal termination of Gaussian 16\n', -2.0 * 27.211386),
         ('cp2k', 'cp2k.inp', 'cp2k.out',
          ' ENERGY| Total FORCE_EVAL ( QS ) energy [a.u.]: -3.0000000000\n'
-         ' SCF run converged\n GEOMETRY OPTIMIZATION COMPLETED\n', -3.0 * 27.211386),
-        ('castep', 'case.cell', 'case.castep',
-         ' Final energy, E = -123.456 eV\n Total time = 4.2 s\n', -123.456),
+         ' SCF run converged\n GEOMETRY OPTIMIZATION COMPLETED\n'
+         ' PROGRAM ENDED AT 2026-07-20\n', -3.0 * 27.211386),
+        ('castep', 'case.param', 'case.castep',
+         ' Final energy, E = -123.456 eV\n'
+         ' Geometry optimization completed successfully\n Total time = 4.2 s\n', -123.456),
     ],
 )
 def test_non_vasp_analysis_uses_declared_engine_output(
         tmp_path, engine, input_name, output_name, output_text, expected_ev):
     root = tmp_path / engine
     root.mkdir()
-    (root / input_name).write_text('declared input\n', encoding='utf-8')
+    input_text = {
+        'gaussian': '#P PBEPBE/def2-SVP opt\n\njob\n\n0 1\nH 0 0 0\n\n',
+        'cp2k': '&GLOBAL\n RUN_TYPE GEO_OPT\n&END GLOBAL\n',
+        'castep': 'task : GeometryOptimization\n',
+    }[engine]
+    (root / input_name).write_text(input_text, encoding='utf-8')
     (root / output_name).write_text(output_text, encoding='utf-8')
     m = manifest.new_manifest(
         job_id=f'{engine}-1', system='demo', task_type='relax', calc_type='molecule',

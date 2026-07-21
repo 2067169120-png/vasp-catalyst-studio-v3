@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from vcstudio.engines.calcspec import (
     HARTREE_TO_EV,
+    ENGINE_RUN_CONTRACTS,
+    EngineRunContract,
     KNOWN_ENGINES,
     NONEQUIV_MAP,
     VALID_TASKS,
@@ -22,6 +24,7 @@ from vcstudio.engines.calcspec import (
     EngineBackend,
     nonequivalence_report,
     parse_structure,
+    get_run_contract,
     validate,
 )
 from vcstudio.engines.castep import CastepBackend
@@ -63,6 +66,7 @@ def available_engines() -> list:
 __all__ = [
     'CalcSpec', 'EngineBackend', 'validate', 'parse_structure',
     'NONEQUIV_MAP', 'nonequivalence_report', 'HARTREE_TO_EV',
+    'ENGINE_RUN_CONTRACTS', 'EngineRunContract', 'get_run_contract',
     'VALID_TASKS', 'KNOWN_ENGINES',
     'get_backend', 'available_engines',
     'VaspBackend', 'Cp2kBackend', 'GaussianBackend', 'CastepBackend',

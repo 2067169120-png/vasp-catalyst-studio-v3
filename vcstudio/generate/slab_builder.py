@@ -7,7 +7,7 @@
 
 "层"的定义:原子按笛卡尔 z 升序,相邻 z 间隙 ≤ LAYER_TOL(默认 0.5 Å)归为同一层
 (slab 惯例 c 沿 z)。坐标/晶格一律走 poscar.read_cell_vectors 与 structure_view.parse_positions,
-与结构预览同源;负缩放因子沿用其显式拒绝语义。
+与结构预览同源，支持负值目标体积与三个分量缩放因子。
 中文注释允许,英文标识符。
 """
 from __future__ import annotations

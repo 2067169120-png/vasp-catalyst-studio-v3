@@ -16,6 +16,8 @@ import os
 import shutil
 import subprocess
 
+from vcstudio.generate.structure_view import parse_positions
+
 # ── 元素表:共价半径 Å(Cordero 2008)+ jmol 配色 ────────────────────────────────
 ELEMENTS = {
     'H': (0.31, '#FFFFFF'), 'He': (0.28, '#D9FFFF'),
@@ -62,50 +64,12 @@ def element_info(sym: str):
 def parse_poscar_atoms(text: str):
     """POSCAR/CONTCAR 文本 → (per-atom 元素列表, 笛卡尔坐标 Å 列表)。
 
-    支持 VASP5(元素行)、Selective dynamics、Direct/Cartesian。
-    畸形/VASP4/负 scale → ValueError(显式,不猜)。
+    与软件结构预览共用同一解析器，支持 VASP5(元素行)、Selective dynamics、
+    Direct/Cartesian、负值目标体积与三个分量缩放因子。畸形/VASP4 →
+    ValueError(显式,不猜元素)。
     """
-    lines = [ln.rstrip() for ln in text.splitlines()]
-    if len(lines) < 9:
-        raise ValueError('POSCAR 行数不足,无法解析结构')
-    try:
-        scale = float(lines[1].split()[0])
-    except (ValueError, IndexError):
-        raise ValueError('POSCAR 第2行缩放系数非数字')
-    if scale <= 0:
-        raise ValueError('POSCAR 负/零缩放系数(体积模式)不支持,请提供正 scale')
-    latt = []
-    for i in (2, 3, 4):
-        v = [float(t) * scale for t in lines[i].split()[:3]]
-        if len(v) != 3:
-            raise ValueError(f'POSCAR 第{i + 1}行晶格矢量不足 3 分量')
-        latt.append(v)
-    species = lines[5].split()
-    if not species or all(t.isdigit() for t in species):
-        raise ValueError('POSCAR 缺元素符号行(VASP4 格式),无法渲染')
-    counts = [int(t) for t in lines[6].split()]
-    if len(counts) != len(species):
-        raise ValueError('POSCAR 元素与计数不等长')
-    idx = 7
-    if lines[idx].strip()[:1] in ('s', 'S'):
-        idx += 1                                       # Selective dynamics
-    mode = lines[idx].strip()[:1].lower()              # d=Direct / c,k=Cartesian
-    idx += 1
-    total = sum(counts)
-    symbols = [s for s, n in zip(species, counts) for _ in range(n)]
-    coords = []
-    for ln in lines[idx:idx + total]:
-        parts = ln.split()
-        if len(parts) < 3:
-            raise ValueError('POSCAR 坐标行不足 3 分量(文件截断?)')
-        f = [float(parts[0]), float(parts[1]), float(parts[2])]
-        if mode == 'd':                                # 分数坐标 → 笛卡尔
-            coords.append([sum(f[k] * latt[k][a] for k in range(3)) for a in range(3)])
-        else:
-            coords.append([c * scale for c in f])
-    if len(coords) != total:
-        raise ValueError(f'POSCAR 坐标行数 {len(coords)} < 原子数 {total}(文件截断?)')
-    return symbols, coords
+    parsed = parse_positions(text)
+    return parsed['elements'], parsed['coords']
 
 
 def build_bonds(symbols: list, coords: list) -> list:

@@ -8,6 +8,7 @@ client/sftp 由调用方注入(GUI 经 connection.open_client;测试注入假件
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import posixpath
 import re
@@ -21,6 +22,7 @@ from vcstudio.cluster import diagnose
 from vcstudio.cluster.schedulers import (
     JobScriptSpec, get_dialect, QUEUED, RUNNING, GONE,
 )
+from vcstudio.engines.calcspec import ENGINE_RUN_CONTRACTS, get_run_contract
 from vcstudio.shared import manifest as manifest_mod
 
 SCRIPT_NAME = 'vcs_job.sh'
@@ -33,7 +35,7 @@ _VASP_TASK_INPUTS = {
     'band': ('CHGCAR',),                 # 兼容早期清单别名
     'dimer': ('MODECAR',),
 }
-_SUPPORTED_ENGINES = ('vasp', 'gaussian', 'cp2k', 'castep')
+_SUPPORTED_ENGINES = tuple(ENGINE_RUN_CONTRACTS)
 _ENGINE_LABELS = {
     'vasp': 'VASP',
     'gaussian': 'Gaussian',
@@ -41,9 +43,7 @@ _ENGINE_LABELS = {
     'castep': 'CASTEP',
 }
 _ENGINE_COMMAND_EXAMPLES = {
-    'gaussian': 'g16 < {input} > {stem}.log',
-    'cp2k': 'cp2k.psmp -i {input} -o {stem}.out',
-    'castep': 'mpirun -np {cores} castep.mpi {stem}',
+    key: contract.command_example for key, contract in ENGINE_RUN_CONTRACTS.items()
 }
 # NEB 根目录共享文件(POSCAR 在各 image 子目录,不在根)
 _NEB_ROOT_FILES = ('INCAR', 'POTCAR', 'KPOINTS')
@@ -132,9 +132,17 @@ def _declared_input_files(job_dir: str, m: dict | None) -> tuple[list[str], list
     credentials.
     """
     engine = _job_engine(m)
+    vasp_requirements: dict[str, str] = {}
     if engine == 'vasp':
         task = str((m or {}).get('task_type') or '').strip().lower()
-        raw = list(_INPUT_FILES) + list(_VASP_TASK_INPUTS.get(task, ()))
+        for name in _VASP_TASK_INPUTS.get(task, ()):
+            vasp_requirements[name] = (
+                '能带 ICHARG=11' if name == 'CHGCAR'
+                else 'Dimer 初始模式' if name == 'MODECAR' else '该任务')
+        icharg = _local_vasp_icharg(job_dir)
+        if icharg in (1, 11):
+            vasp_requirements['CHGCAR'] = f'INCAR ICHARG={icharg}'
+        raw = list(_INPUT_FILES) + list(vasp_requirements)
     else:
         inputs = (m or {}).get('inputs') or {}
         raw = inputs.get('files') if isinstance(inputs, dict) else None
@@ -155,11 +163,9 @@ def _declared_input_files(job_dir: str, m: dict | None) -> tuple[list[str], list
             continue
         local_path = os.path.join(job_dir, name)
         if not os.path.isfile(local_path):
-            if engine == 'vasp' and name in _VASP_TASK_INPUTS.get(
-                    str((m or {}).get('task_type') or '').strip().lower(), ()):
-                purpose = ('能带 ICHARG=11' if name == 'CHGCAR'
-                           else 'Dimer 初始模式' if name == 'MODECAR' else '该任务')
-                errs.append(f'作业目录缺 {name}（{purpose} 的必需输入，提交前请补齐）')
+            if engine == 'vasp' and name in vasp_requirements:
+                errs.append(
+                    f'作业目录缺 {name}（{vasp_requirements[name]} 的必需输入，提交前请补齐）')
             elif engine == 'vasp':
                 errs.append(f'作业目录缺 {name}(先在生成页产出四件套)')
             else:
@@ -180,18 +186,60 @@ def _declared_input_files(job_dir: str, m: dict | None) -> tuple[list[str], list
     return names, errs
 
 
+def _local_vasp_icharg(job_dir: str) -> int | None:
+    """读取本地 INCAR 的 ICHARG；提交/续算文件契约只以实际输入为准。"""
+    try:
+        from vcstudio.generate.incar_builder import parse_incar
+        with open(os.path.join(job_dir, 'INCAR'), 'r', encoding='utf-8',
+                  errors='replace') as handle:
+            value = parse_incar(handle.read()).get('ICHARG')
+        return int(value) if not isinstance(value, bool) else None
+    except (OSError, TypeError, ValueError):
+        return None
+
+
 def _primary_input(engine: str, names: list[str]) -> str:
     """Choose the main file used by ``{input}``/``{stem}`` placeholders."""
-    preferred = {
-        'gaussian': ('.gjf', '.com'),
-        'cp2k': ('.inp',),
-        'castep': ('.cell', '.param'),
-    }.get(engine, ())
-    for suffix in preferred:
-        for name in names:
-            if name.lower().endswith(suffix):
-                return name
-    return names[0] if names else ''
+    try:
+        return get_run_contract(engine).primary_input(names)
+    except ValueError:
+        return names[0] if names else ''
+
+
+def _engine_task(m: dict | None, job_dir: str | None = None) -> str | None:
+    """Resolve a non-VASP task from manifest evidence, then its local input."""
+    m = m or {}
+    inputs = m.get('inputs') or {}
+    if not isinstance(inputs, dict):
+        inputs = {}
+    raw = (inputs.get('gaussian_task') or inputs.get('task')
+           or (m.get('task_type') if m.get('task_type') != 'quick' else None))
+    if raw:
+        return str(raw).strip().lower()
+    if job_dir:
+        try:
+            from vcstudio.engines import get_backend
+            return get_backend(_job_engine(m)).infer_task(job_dir)
+        except (OSError, TypeError, ValueError):
+            return None
+    return None
+
+
+def _non_vasp_input_contract_issues(engine: str, job_dir: str, names: list[str]) -> list[str]:
+    """Run the engine checker before any SSH action."""
+    try:
+        from vcstudio.engines import get_backend
+        contract = get_run_contract(engine)
+        primary = contract.primary_input(names)
+        issues = []
+        if not primary or not primary.lower().endswith(contract.input_suffixes):
+            issues.append(
+                f'{_ENGINE_LABELS.get(engine, engine)} 清单没有受支持的主输入'
+                f'({"/".join(contract.input_suffixes)})。')
+        issues.extend(str(item) for item in get_backend(engine).check_inputs(job_dir))
+        return issues
+    except (OSError, TypeError, ValueError) as exc:
+        return [f'{_ENGINE_LABELS.get(engine, engine)} 输入检查失败：{exc}']
 
 
 def _render_engine_command(profile, engine: str, names: list[str],
@@ -359,6 +407,8 @@ def preflight(profile, job_dir: str) -> list:
     elif engine in _SUPPORTED_ENGINES:
         _names, input_errs = _declared_input_files(job_dir, m0)
         errs += input_errs
+        if engine != 'vasp' and not input_errs:
+            errs += _non_vasp_input_contract_issues(engine, job_dir, _names)
     if m0 is None:
         errs.append('作业目录缺 job.yaml(旧目录可重新生成一次以补台账)')
     else:
@@ -774,17 +824,9 @@ def _in_continue_settling(m: dict, reason, outcar_mtime) -> bool:
     return checks < SETTLE_MAX_CHECKS
 
 
-_ENGINE_NORMAL_MARKS = {
-    'gaussian': ('Normal termination of Gaussian',),
-    'cp2k': ('PROGRAM ENDED AT',),
-    'castep': ('Calculation completed successfully', 'Total time'),
-}
-_HARTREE_TO_EV = 27.211386245988
-
-
-def _engine_output_evidence(client, remote: str, m: dict):
+def _engine_output_evidence(client, remote: str, m: dict, job_dir: str | None = None):
     """Read the main non-VASP output's size and tail without downloading it."""
-    files = fetch_files_for_manifest(m)
+    files = fetch_files_for_manifest(m, job_dir=job_dir)
     name = files[0] if files else ''
     if not remote or not name:
         return name, None, ''
@@ -792,7 +834,7 @@ def _engine_output_evidence(client, remote: str, m: dict):
     out, _ = run_cmd(
         client,
         f'stat -c "%s" {path} 2>/dev/null || true; '
-        f'echo "___VCSENGINE___"; tail -n 300 {path} 2>/dev/null')
+        f'echo "___VCSENGINE___"; tail -n 2000 {path} 2>/dev/null')
     size_text, _sep, tail = out.partition('___VCSENGINE___')
     size = None
     for token in size_text.split():
@@ -800,25 +842,6 @@ def _engine_output_evidence(client, remote: str, m: dict):
             size = int(token)
             break
     return name, size, tail
-
-
-def _engine_energy_ev(engine: str, text: str):
-    """Best-effort final energy extraction for supported non-VASP engines."""
-    patterns = {
-        'gaussian': (r'SCF Done:\s+E\([^)]*\)\s*=\s*([-+.\dDEe]+)', _HARTREE_TO_EV),
-        'cp2k': (r'ENERGY\|.*?energy\s*\[a\.u\.\]:\s*([-+.\dDEe]+)', _HARTREE_TO_EV),
-        'castep': (r'(?:Final energy|Final free energy)\s*,?\s*E\s*=\s*([-+.\dEe]+)\s*eV', 1.0),
-    }
-    pattern, factor = patterns.get(engine, ('', 1.0))
-    if not pattern:
-        return None
-    found = re.findall(pattern, text or '', flags=re.IGNORECASE)
-    if not found:
-        return None
-    try:
-        return float(found[-1].replace('D', 'E').replace('d', 'e')) * factor
-    except (TypeError, ValueError):
-        return None
 
 
 def _refresh_non_vasp_terminal(client, job_dir: str, m: dict, reason):
@@ -832,11 +855,21 @@ def _refresh_non_vasp_terminal(client, job_dir: str, m: dict, reason):
     engine = _job_engine(m)
     remote = str(m.get('remote_dir') or '')
     jid = str(m.get('scheduler_job_id') or '')
-    output_name, output_size, output_tail = _engine_output_evidence(client, remote, m)
+    output_name, output_size, output_tail = _engine_output_evidence(
+        client, remote, m, job_dir=job_dir)
     exit_code, log_tail = _read_log(client, remote, jid)
     combined = (output_tail or '') + '\n' + (log_tail or '')
-    normal = any(mark.lower() in combined.lower()
-                 for mark in _ENGINE_NORMAL_MARKS.get(engine, ()))
+    task = _engine_task(m, job_dir)
+    try:
+        from vcstudio.engines import get_backend
+        parsed = dict(get_backend(engine).parse_output_text(combined, task=task) or {})
+    except (AttributeError, TypeError, ValueError) as exc:
+        parsed = {'energy_ev': None, 'converged': False,
+                  'normal_termination': False, 'task_converged': False,
+                  'failed': True, 'error': f'解析器异常：{exc}'}
+    normal = bool(parsed.get('normal_termination'))
+    task_converged = bool(parsed.get('task_converged'))
+    parser_failed = bool(parsed.get('failed'))
 
     reason_map = {
         diagnose.R_TIMEOUT: ('WALLTIME', 'UNCONVERGED'),
@@ -845,17 +878,31 @@ def _refresh_non_vasp_terminal(client, job_dir: str, m: dict, reason):
         diagnose.R_NODE_FAIL: ('NODE_FAIL', 'FAILED'),
         diagnose.R_FAILED: ('SCHEDULER_FAILED', 'FAILED'),
     }
-    restartable = False       # 通用 CONTCAR 续算仅适用于 VASP；不冒充跨引擎恢复已实现
+    contract = get_run_contract(engine)
+    restartable = bool(contract.restart_supported)
     if reason in reason_map:
         failure_class, state = reason_map[reason]
-        evidence = f'调度器报 {reason}；{engine} 自动续算尚无安全配方，请核对输出后重提'
+        evidence = f'调度器报 {reason}；{contract.restart_note}'
     elif exit_code not in (None, 0):
         failure_class, state = 'ENGINE_EXIT_NONZERO', 'FAILED'
         evidence = f'{_ENGINE_LABELS.get(engine, engine)} 退出码 {exit_code}'
-    elif normal and (output_size is None or output_size > 0):
+    elif parser_failed:
+        failure_class, state = 'ENGINE_OUTPUT_ERROR', 'FAILED'
+        evidence = str(parsed.get('error') or
+                       f'{_ENGINE_LABELS.get(engine, engine)} 输出含失败标志')
+    elif (parsed.get('converged') and parsed.get('energy_ev') is not None
+          and (output_size is None or output_size > 0)):
         failure_class, state = diagnose.CONVERGED, 'DONE'
-        evidence = (f'{_ENGINE_LABELS.get(engine, engine)} 正常结束标志在场'
-                    f'（{output_name or "主输出"}）')
+        evidence = (f'{_ENGINE_LABELS.get(engine, engine)} 正常结束、任务级完成与最终能量'
+                    f'三项证据齐全（{output_name or "主输出"}）')
+    elif normal and not task_converged:
+        failure_class, state = 'TASK_NOT_CONVERGED', 'UNCONVERGED'
+        evidence = str(parsed.get('error') or
+                       f'{_ENGINE_LABELS.get(engine, engine)} 正常退出但任务未收敛；'
+                       f'{contract.restart_note}')
+    elif normal and parsed.get('energy_ev') is None:
+        failure_class, state = 'FINAL_ENERGY_MISSING', 'NEEDS_HUMAN'
+        evidence = str(parsed.get('error') or '正常退出但缺最终能量，拒绝冒充完成')
     elif not output_size:
         failure_class, state = diagnose.NO_OUTPUT, 'NEEDS_HUMAN'
         evidence = f'{_ENGINE_LABELS.get(engine, engine)} 主输出 {output_name or "未声明"} 缺失或为空'
@@ -864,10 +911,20 @@ def _refresh_non_vasp_terminal(client, job_dir: str, m: dict, reason):
         evidence = (f'{output_name} 有内容但未见 {_ENGINE_LABELS.get(engine, engine)} '
                     '正常结束标志，拒绝冒充完成')
 
-    energy = _engine_energy_ev(engine, combined)
+    energy = parsed.get('energy_ev')
+    if (isinstance(energy, bool) or not isinstance(energy, (int, float))
+            or not math.isfinite(float(energy))):
+        energy = None
     results = m.setdefault('results', {})
     if energy is not None:
-        results['energy_e0_eV'] = energy
+        if state == 'DONE':
+            results['energy_e0_eV'] = float(energy)
+            results.pop('raw_energy_e0_eV', None)
+        else:
+            results['raw_energy_e0_eV'] = float(energy)
+            results.pop('energy_e0_eV', None)
+    elif state != 'DONE':
+        results.pop('energy_e0_eV', None)
     results['diagnosis'] = {
         'failure_class': failure_class,
         'restartable': restartable,
@@ -875,6 +932,11 @@ def _refresh_non_vasp_terminal(client, job_dir: str, m: dict, reason):
         'scheduler_reason': reason,
         'exit_code': exit_code,
         'engine': engine,
+        'task': parsed.get('task') or task,
+        'parser_error': parsed.get('error'),
+        'normal_termination': normal,
+        'task_converged': task_converged,
+        'restart_note': contract.restart_note,
         'output_file': output_name,
         'output_bytes': output_size,
         'classified_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
@@ -1345,7 +1407,7 @@ FETCH_FILES = ('CONTCAR', 'OSZICAR', 'OUTCAR')
 _VASP_FETCH_BY_TASK = {
     'static': ('vasprun.xml', 'CHGCAR'),
     'dos_pdos': ('DOSCAR', 'vasprun.xml'),
-    'bands': ('EIGENVAL', 'vasprun.xml'),
+    'bands': ('EIGENVAL', 'PROCAR', 'vasprun.xml'),
     'bader': ('CHGCAR', 'AECCAR0', 'AECCAR2', 'ACF.dat'),
     'chgdiff': ('CHGCAR',),
     'elf': ('ELFCAR',),
@@ -1375,7 +1437,30 @@ def _safe_manifest_names(raw) -> list[str]:
     return out
 
 
-def fetch_files_for_manifest(m: dict | None) -> tuple[str, ...]:
+def _gaussian_checkpoint_from_input(job_dir: str | None, input_files) -> str | None:
+    """Return a safe local ``%chk`` basename, or ``None`` when disabled/unknown."""
+    if not job_dir:
+        return None
+    for name in input_files or ():
+        if not str(name).lower().endswith(('.gjf', '.com')):
+            continue
+        try:
+            with open(os.path.join(job_dir, str(name)), 'r', encoding='utf-8',
+                      errors='replace') as handle:
+                match = re.search(r'^\s*%chk\s*=\s*(\S+)\s*$', handle.read(),
+                                  flags=re.MULTILINE | re.IGNORECASE)
+        except OSError:
+            return None
+        if not match:
+            return None
+        value = match.group(1).strip()
+        if os.path.basename(value) != value or '/' in value or '\\' in value:
+            return None
+        return value
+    return None
+
+
+def fetch_files_for_manifest(m: dict | None, *, job_dir: str | None = None) -> tuple[str, ...]:
     """Resolve the default result bundle for one manifest.
 
     VASP tasks receive their scientifically relevant parser inputs.  For
@@ -1388,23 +1473,28 @@ def fetch_files_for_manifest(m: dict | None) -> tuple[str, ...]:
     inputs = m.get('inputs') or {}
     if not isinstance(inputs, dict):
         inputs = {}
-    explicit = _safe_manifest_names(inputs.get('output_files'))
-    if explicit:
-        return tuple(explicit)
-
     engine = _job_engine(m)
+    explicit = _safe_manifest_names(inputs.get('output_files'))
     if engine == 'vasp':
+        if explicit:
+            return tuple(explicit)
         task = _canonical_vasp_task(m)
         names = list(FETCH_FILES) + list(_VASP_FETCH_BY_TASK.get(task, ()))
     else:
         declared = _safe_manifest_names(inputs.get('files'))
-        primary = _primary_input(engine, declared)
-        stem = os.path.splitext(primary)[0] if primary else 'calc'
-        names = {
-            'gaussian': [f'{stem}.log', f'{stem}.chk'],
-            'cp2k': [f'{stem}.out'],
-            'castep': [f'{stem}.castep', f'{stem}.geom'],
-        }.get(engine, [])
+        contract = get_run_contract(engine)
+        derived = list(contract.result_files(declared, task=_engine_task(m, job_dir)))
+        # Explicit output_files remain authoritative for imported/custom jobs.
+        # engine_generate manifests use the shared contract so task-specific
+        # CASTEP .phonon/.geom and restart evidence are not silently omitted.
+        names = list(explicit)
+        if not explicit or inputs.get('generator') == 'engine_generate':
+            names.extend(derived)
+        if engine == 'gaussian' and (not explicit or inputs.get('generator') == 'engine_generate'):
+            checkpoint = _gaussian_checkpoint_from_input(job_dir, declared)
+            names = [name for name in names if not name.lower().endswith('.chk')]
+            if checkpoint:
+                names.append(checkpoint)
     return tuple(dict.fromkeys(names))
 
 
@@ -1413,7 +1503,7 @@ def fetch_files_for_job(job_dir: str) -> tuple[str, ...]:
     m = manifest_mod.load_manifest(job_dir)
     if m is None:
         raise ValueError('作业目录缺 job.yaml,无法确定结果文件')
-    return fetch_files_for_manifest(m)
+    return fetch_files_for_manifest(m, job_dir=job_dir)
 
 
 def _clear_fetch_evidence(m: dict) -> None:
@@ -1468,7 +1558,7 @@ def fetch_results(client, sftp, job_dir: str, files=None, *, profile=None):
     if not remote:
         raise ValueError('该作业尚未提交过(manifest 无 remote_dir)')
     if files is None:
-        requested = list(fetch_files_for_manifest(m))
+        requested = list(fetch_files_for_manifest(m, job_dir=job_dir))
     else:
         raw_requested = list(files)
         requested = _safe_manifest_names(raw_requested)
@@ -1542,14 +1632,16 @@ def _contcar_min_distance(text: str):
         return None
 
 
-def _restart_cleanup_command(m: dict) -> str:
+def _restart_cleanup_command(m: dict, job_dir: str | None = None) -> str:
     """Return safe wavefunction-history cleanup for one VASP restart.
 
     Non-self-consistent bands (ICHARG=11) hard-require the parent CHGCAR, so
     deleting it turns every otherwise valid restart into an immediate crash.
     Other VASP tasks retain the established clean-charge restart policy.
     """
-    return ('rm -f WAVECAR' if _canonical_vasp_task(m) == 'bands'
+    needs_chgcar = (_canonical_vasp_task(m) == 'bands'
+                    or (job_dir is not None and _local_vasp_icharg(job_dir) in (1, 11)))
+    return ('rm -f WAVECAR' if needs_chgcar
             else 'rm -f WAVECAR CHGCAR')
 
 
@@ -1569,6 +1661,11 @@ def continue_from_contcar(client, profile, job_dir: str,
     m = manifest_mod.load_manifest(job_dir)
     if m is None:
         raise ValueError('作业目录缺 job.yaml,无法续算')
+    if _job_engine(m) != 'vasp':
+        contract = get_run_contract(_job_engine(m))
+        raise ValueError(
+            f'{_ENGINE_LABELS.get(_job_engine(m), _job_engine(m))} 不能走 VASP CONTCAR 续算；'
+            f'{contract.restart_note}')
     assert_profile_binding(profile, job_dir, '续算', manifest=m)
     if _is_neb(m):
         raise ValueError(
@@ -1615,7 +1712,7 @@ def continue_from_contcar(client, profile, job_dir: str,
         f.write(contcar)
 
     # 远端:CONTCAR→POSCAR + 清混合历史,再重投同一脚本(INCAR 不动)
-    cleanup = _restart_cleanup_command(m)
+    cleanup = _restart_cleanup_command(m, job_dir)
     run_cmd(client, f'cd {shlex.quote(remote)} && cp CONTCAR POSCAR && {cleanup}',
             check=True)
     dialect = get_dialect(profile.scheduler)
@@ -1682,6 +1779,11 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
     m = manifest_mod.load_manifest(job_dir)
     if m is None:
         raise ValueError('作业目录缺 job.yaml,无法改参续算')
+    if _job_engine(m) != 'vasp':
+        contract = get_run_contract(_job_engine(m))
+        raise ValueError(
+            f'{_ENGINE_LABELS.get(_job_engine(m), _job_engine(m))} 不能使用 INCAR 改参续算；'
+            f'{contract.restart_note}')
     assert_profile_binding(profile, job_dir, '改参续算', manifest=m)
     if _is_neb(m):
         raise ValueError(
@@ -1725,7 +1827,8 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
 
     # 3) 上传新 INCAR + 清混合历史,重投同一脚本
     sftp.put(local_incar, posixpath.join(remote, 'INCAR'))
-    run_cmd(client, f'cd {shlex.quote(remote)} && {_restart_cleanup_command(m)}', check=True)
+    run_cmd(client, f'cd {shlex.quote(remote)} && {_restart_cleanup_command(m, job_dir)}',
+            check=True)
     dialect = get_dialect(profile.scheduler)
     out, err = run_cmd(client, dialect.submit_cmd(
         posixpath.join(remote, SCRIPT_NAME), getattr(profile, 'scheduler_bin', '')))

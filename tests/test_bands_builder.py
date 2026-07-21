@@ -81,7 +81,8 @@ def test_build_bands_job_auto_cubic(tmp_path):
     res = bb.build_bands_job(str(src), str(tmp_path / 'bd'))
     assert res['lattice'] == 'cubic'
     d = parse_incar((tmp_path / 'bd' / 'INCAR').read_text())
-    assert d['ICHARG'] == 11 and d['LORBIT'] == 11 and d['ISMEAR'] == 0
+    assert d['ISTART'] == 0 and d['ICHARG'] == 11
+    assert d['LORBIT'] == 11 and d['ISMEAR'] == 0
     assert 'ISIF' not in d and 'EDIFFG' not in d
     assert d['ENCUT'] == 500 and d['GGA'] == 'PE'            # 电子学保留
     kp = (tmp_path / 'bd' / 'KPOINTS').read_text()
@@ -118,6 +119,17 @@ def test_build_bands_job_no_chgcar_warns(tmp_path):
     (src / 'POTCAR').write_text(_POT, encoding='utf-8')
     res = bb.build_bands_job(str(src), str(tmp_path / 'bd'))
     assert any('CHGCAR' in w for w in res['warnings'])
+
+
+def test_build_bands_job_does_not_inherit_wavecar_restart(tmp_path):
+    src = tmp_path / 'scf'
+    src.mkdir()
+    (src / 'CONTCAR').write_text(_bulk(_CUBIC), encoding='utf-8')
+    (src / 'INCAR').write_text(_INCAR + 'ISTART = 1\n', encoding='utf-8')
+    (src / 'CHGCAR').write_text('fake chgcar\n', encoding='utf-8')
+    bb.build_bands_job(str(src), str(tmp_path / 'bd'))
+    d = parse_incar((tmp_path / 'bd' / 'INCAR').read_text())
+    assert d['ISTART'] == 0 and d['ICHARG'] == 11
 
 
 def test_build_bands_job_manifest(tmp_path):

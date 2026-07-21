@@ -40,10 +40,30 @@ def test_settings_put_work_mode_and_exact_calculation_first():
     html = _read('index.html')
     settings = html[html.index('id="page-settings"'):]
     assert settings.index('id="set-scenario"') < settings.index('id="set-llm-provider"')
+    assert settings.index('id="set-engine"') < settings.index('id="set-calculation"')
     assert settings.index('id="set-calculation"') < settings.index('id="set-llm-provider"')
     js = _read('settings.js')
+    assert "VCS.call('engine_get')" in js
+    assert "VCS.call('engine_set'" in js
     assert "VCS.call('calculation_get')" in js
     assert "VCS.call('calculation_set'" in js
+
+
+def test_engine_selection_hides_other_engines_and_uses_native_units():
+    html = _read('index.html')
+    app = _read('app.js')
+    generate = _read('generate.js')
+    css = _read('app.css')
+    assert 'data-engine="vasp"' in html
+    assert 'data-engine="cp2k gaussian castep"' in html
+    assert 'data-engine-hidden' in app and '[data-engine-hidden]' in css
+    assert 'id="eng-task"' in html
+    assert "VCS.call('calculation_set', sel.value)" in generate
+    assert 'id="eng-cutoff-ry"' in html and '单位 Ry' in generate
+    assert 'id="eng-cp2k-kpts"' in html and "grid('eng-cp2k-kpts')" in generate
+    assert 'id="eng-cutoff"' in html and 'cut_off_energy（eV）' in generate
+    assert "boundaries.indexOf('periodic')" in generate
+    assert 'periodic.disabled = boundaries.length === 1' in generate
 
 
 def test_engine_and_task_lists_reload_after_mode_change():
@@ -51,7 +71,8 @@ def test_engine_and_task_lists_reload_after_mode_change():
     taskcat = _read('taskcat.js')
     assert '.filter(e => e.visible !== false)' in generate
     assert "addEventListener('vcs:scenario'" in generate
-    assert "VCS.call('task_catalog', sceneKey, active)" in taskcat
+    assert "VCS.call('task_catalog', sceneKey, active, VCS.activeEngine || 'vasp')" in taskcat
+    assert "addEventListener('vcs:engine'" in taskcat
     assert "addEventListener('vcs:calculation'" in taskcat
 
 
@@ -71,7 +92,7 @@ def test_dashboard_actions_are_driven_by_selected_mode():
     assert 'sc.home_actions' in js
     assert "addEventListener('vcs:scenario'" in js
     assert "addEventListener('vcs:calculation'" in js
-    assert "VCS.call('task_catalog', sc.key || null, active)" in js
+    assert "VCS.call('task_catalog', sc.key || null, active, VCS.activeEngine || 'vasp')" in js
     assert 'selected_calculation' in js
     assert 'VCS.openCalculation(active' in js
 

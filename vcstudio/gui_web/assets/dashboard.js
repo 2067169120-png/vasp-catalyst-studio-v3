@@ -84,14 +84,15 @@
     // Li-S 默认吸附项目保留“导入 / 一站式 / 四件套 / 继续”四入口；用户一旦
     // 明确改选其它 DFT 类型，首页第一项就变成该类型的真实入口，不再误导回吸附表单。
     if (active && sc.key !== 'molecular' && !(sc.key === 'lis' && active === 'adsorption_project')) {
-      const r = await VCS.call('task_catalog', sc.key || null, active);
+      const r = await VCS.call('task_catalog', sc.key || null, active, VCS.activeEngine || 'vasp');
       if (version !== startRenderVersion) return;
       const task = r && r.ok !== false && (r.tasks || [])[0];
       if (task) {
         const route = VCS.calculationRoute && VCS.calculationRoute(active, sc);
         const verb = route && route.page === 'project' ? '打开结果工具' : '开始准备';
+        const engine = String(VCS.activeEngine || 'vasp').toUpperCase();
         ACTIONS.selected_calculation = [
-          `${verb}：${task.name_zh}`,
+          `${verb}：${engine} · ${task.name_zh}`,
           `${task.requires || '按提示准备输入'} → ${task.outputs || '计算结果'}`,
           () => VCS.openCalculation
             ? VCS.openCalculation(active, { source: 'dashboard-selected-calculation' })
@@ -314,6 +315,7 @@
     if (e.detail && e.detail.page === 'dashboard') refresh();
   });
   document.addEventListener('vcs:scenario', e => renderStartActions(e.detail && e.detail.scenario));
+  document.addEventListener('vcs:engine', () => renderStartActions(VCS.scenario));
   document.addEventListener('vcs:calculation', () => renderStartActions(VCS.scenario));
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);

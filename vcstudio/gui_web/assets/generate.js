@@ -332,34 +332,102 @@
   }
 
   // ── 引擎选择器:VASP(用上方四件套)/ CP2K / Gaussian / CASTEP(文件级适配,简化表单) ──
-  const State2 = { engine: 'vasp', sceneKey: null };
+  const State2 = { engine: 'vasp', sceneKey: null, engines: [], capabilities: {} };
   // 引擎选择器:VASP 置顶(主引擎)的下拉,替代原 chips 墙。默认 VASP。
   async function loadEngines() {
     const sel = $('engine-select');
     if (!sel) return;
     const sceneKey = (window.VCS && VCS.scenario && VCS.scenario.key) || null;
-    const r = await VCS.call('engine_list', sceneKey);
+    const [r, current] = await Promise.all([
+      VCS.call('engine_list', sceneKey), VCS.call('engine_get')]);
     let engines = ((r && r.engines) || []).filter(e => e.visible !== false);
     if (!engines.length) engines = [{ key: 'vasp', name: 'VASP', experimental: false }];
     // VASP 恒置顶醒目;其余引擎(实验性)靠后
     engines = engines.slice().sort((a, b) => (a.key === 'vasp' ? -1 : b.key === 'vasp' ? 1 : 0));
+    State2.engines = engines;
+    State2.capabilities = Object.fromEntries(engines.map(row => [row.key, row]));
     sel.innerHTML = engines.map(e =>
       '<option value="' + VCS.esc(e.key) + '">' + VCS.esc(e.name) +
-      (e.key === 'vasp' ? '(主引擎)' : e.experimental ? '(实验性)' : '') + '</option>').join('');
+      (e.key === 'vasp' ? '（推荐·完整）' : '（文件级适配）') + '</option>').join('');
+    sel.disabled = engines.length < 2;
     const modeChanged = State2.sceneKey !== sceneKey;
     State2.sceneKey = sceneKey;
-    const preferred = (r && r.default) || engines[0].key;
+    const preferred = (current && current.engine) || VCS.activeEngine ||
+      (r && r.default) || engines[0].key;
     const has = engines.some(e => e.key === State2.engine);
     if (!has || modeChanged) {
       State2.engine = engines.some(e => e.key === preferred) ? preferred : engines[0].key;
     }
     sel.value = State2.engine;
-    selectEngine(sel.value);
+    await selectEngine(sel.value, false);
   }
-  async function selectEngine(key) {
+  function syncEngineTask() {
+    const sel = $('eng-task');
+    const cap = State2.capabilities[State2.engine] || {};
+    if (!sel) return;
+    const tasks = cap.tasks || [];
+    sel.innerHTML = tasks.map(task =>
+      `<option value="${VCS.esc(task.key)}">${VCS.esc(task.name)}</option>`).join('');
+    const active = VCS.activeCalculation || '';
+    if (tasks.some(task => task.key === active)) sel.value = active;
+    else if (tasks.length) sel.value = tasks[0].key;
+  }
+  async function saveEngineTask() {
+    const sel = $('eng-task');
+    if (!sel || !sel.value || sel.value === VCS.activeCalculation) return;
+    const r = await VCS.call('calculation_set', sel.value);
+    if (!r || r.ok === false || r.error) {
+      VCS.log('切换任务类型失败:' + ((r && r.error) || '未知'), 'failc');
+      syncEngineTask();
+      return;
+    }
+    if (VCS.applyCalculation) VCS.applyCalculation(r.active_calculation || sel.value);
+  }
+  function renderEngineCapability(key) {
+    const cap = State2.capabilities[key] || {};
+    const note = $('engine-capability-note');
+    const title = $('engine-card-title');
+    const sub = $('engine-card-sub');
+    const top = $('engine-note');
+    const summary = $('generate-engine-summary');
+    const name = ((State2.engines.find(row => row.key === key) || {}).name || key.toUpperCase());
+    if (title) title.textContent = name + ' 输入准备';
+    if (sub) sub.textContent = cap.input_contract && cap.result_contract
+      ? `${cap.input_contract}；结果：${cap.result_contract}` : (cap.summary || '');
+    if (top) top.textContent = key === 'vasp'
+      ? 'VASP 为默认完整工作流；下方仅显示当前任务需要的 VASP 入口'
+      : `${name}：${cap.support_label || '文件级适配'}；未接通的 VASP 专用任务已隐藏`;
+    if (summary) summary.textContent = key === 'vasp'
+      ? 'VASP · 完整输入、提交、回收与结果工作流'
+      : `${name} · ${cap.input_contract || '专属输入'} → 登记 → 提交 → 回收`;
+    if (note) {
+      const limits = cap.limitations || [];
+      note.hidden = key === 'vasp' || (!cap.summary && !limits.length);
+      note.innerHTML = key === 'vasp' ? '' : `<b>${VCS.esc(cap.summary || '')}</b>` +
+        limits.map(line => `<br>${VCS.esc(line)}`).join('');
+    }
+  }
+  async function selectEngine(key, persist = true) {
+    if (persist) {
+      const saved = await VCS.call('engine_set', key);
+      if (!saved || saved.ok === false || saved.error) {
+        VCS.log('切换计算引擎失败:' + ((saved && saved.error) || '未知'), 'failc');
+        const sel = $('engine-select'); if (sel) sel.value = State2.engine;
+        return;
+      }
+      key = saved.engine || key;
+      if (saved.capability) State2.capabilities[key] = Object.assign(
+        {}, State2.capabilities[key] || {}, saved.capability);
+      if (saved.active_calculation && VCS.applyCalculation) {
+        VCS.applyCalculation(saved.active_calculation);
+      }
+    }
     State2.engine = key;
     const sel = $('engine-select');
     if (sel && sel.value !== key) sel.value = key;
+    if (VCS.applyEngine) VCS.applyEngine(key, State2.capabilities[key] || {});
+    renderEngineCapability(key);
+    syncEngineTask();
     const isGauss = (key === 'gaussian');
     // 非 VASP:展开「引擎参数」折叠分区,让简化表单可见
     const card = $('engine-card');
@@ -370,6 +438,24 @@
     const gp = $('gauss-panel');
     if (gp) gp.hidden = !isGauss;
     if (isGauss && window.GaussMol && window.GaussMol.onShow) window.GaussMol.onShow();
+    document.querySelectorAll('[data-engine-field]').forEach(row => {
+      const engines = String(row.getAttribute('data-engine-field') || '').split(/\s+/);
+      row.hidden = engines.indexOf(key) < 0;
+    });
+    const periodic = $('eng-periodic');
+    const cap = State2.capabilities[key] || {};
+    if (periodic && !isGauss) {
+      const boundaries = cap.boundaries || ['periodic', 'molecule'];
+      periodic.disabled = boundaries.length === 1;
+      Array.from(periodic.options).forEach(option => {
+        const boundary = option.value === '1' ? 'periodic' : 'molecule';
+        option.hidden = boundaries.indexOf(boundary) < 0;
+      });
+      const currentBoundary = periodic.value === '1' ? 'periodic' : 'molecule';
+      if (boundaries.indexOf(currentBoundary) < 0) {
+        periodic.value = boundaries.indexOf('periodic') >= 0 ? '1' : '0';
+      }
+    }
     const banner = $('engine-nonequiv');
     if (banner) {
       if (key === 'vasp') { banner.hidden = true; }
@@ -387,15 +473,68 @@
     const out = val('eng-out');
     if (!val('eng-poscar')) { VCS.log('引擎:请选择结构 POSCAR', 'failc'); return; }
     if (!out) { VCS.log('引擎:请选择输出目录', 'failc'); return; }
-    const kpts = val('eng-kpts').split(/[\s,]+/).map(s => parseInt(s, 10)).filter(n => !isNaN(n));
+    if (eng !== 'cp2k' && eng !== 'castep') {
+      VCS.log('请使用当前引擎的专属输入面板', 'failc'); return;
+    }
+    const periodic = (val('eng-periodic') || '1') === '1';
+    const strictNumber = raw => {
+      const text = String(raw == null ? '' : raw).trim();
+      if (!text) return null;
+      const number = Number(text);
+      return Number.isFinite(number) ? number : null;
+    };
+    const strictInteger = raw => {
+      const number = strictNumber(raw);
+      return number !== null && Number.isInteger(number) ? number : null;
+    };
+    const grid = id => {
+      const tokens = val(id).split(/[\s,]+/).filter(Boolean);
+      if (tokens.length !== 3) return null;
+      const numbers = tokens.map(strictInteger);
+      return numbers.every(number => number !== null && number > 0) ? numbers : null;
+    };
+    const multiplicity = strictInteger(val('eng-multiplicity') || '1');
+    const charge = strictInteger(val('eng-charge') || '0');
+    if (multiplicity === null || multiplicity < 1) {
+      VCS.log('自旋多重度必须是正整数（2S+1）', 'failc'); return;
+    }
+    if (charge === null) {
+      VCS.log('体系净电荷必须是整数', 'failc'); return;
+    }
+    const kpts = eng === 'cp2k' ? grid('eng-cp2k-kpts') : grid('eng-kpts');
+    const extras = {};
+    if (eng === 'cp2k') {
+      const cutoffRy = strictNumber(val('eng-cutoff-ry'));
+      const relCutoffRy = strictNumber(val('eng-rel-cutoff-ry'));
+      if (!(cutoffRy > 0) || !(relCutoffRy > 0)) {
+        VCS.log('CP2K：CUTOFF 与 REL_CUTOFF 必须是正数（单位 Ry）', 'failc'); return;
+      }
+      if (periodic && !kpts) {
+        VCS.log('CP2K：周期计算请输入三个正整数 k 点网格', 'failc'); return;
+      }
+      extras.cutoff_ry = cutoffRy;
+      extras.rel_cutoff_ry = relCutoffRy;
+      if (val('eng-basis-file')) extras.basis_set_file = val('eng-basis-file');
+      if (val('eng-potential-file')) extras.potential_file = val('eng-potential-file');
+    }
+    const castepCutoff = strictNumber(val('eng-cutoff'));
+    if (eng === 'castep' && periodic && !(castepCutoff > 0)) {
+      VCS.log('CASTEP：周期计算必须填写正数 cut_off_energy（eV）', 'failc'); return;
+    }
+    if (eng === 'castep' && periodic && !kpts) {
+      VCS.log('CASTEP：周期计算请输入三个正整数 k 点网格', 'failc'); return;
+    }
     const params = {
-      poscar: val('eng-poscar'), functional: val('eng-func') || 'PBE',
+      poscar: val('eng-poscar'), task: val('eng-task') || 'relax',
+      functional: val('eng-func') || 'PBE',
       dispersion: val('eng-disp') || null,
-      cutoff_ev: val('eng-cutoff') || null,
-      kpoints: kpts.length >= 3 ? kpts.slice(0, 3) : null,
-      periodic: (val('eng-periodic') || '1') === '1',
-      spin: $('eng-spin') ? $('eng-spin').checked : false,
-      charge: parseInt(val('eng-charge') || '0', 10) || 0,
+      cutoff_ev: eng === 'castep' ? castepCutoff : null,
+      kpoints: periodic ? kpts : null,
+      periodic: periodic,
+      spin: ($('eng-spin') ? $('eng-spin').checked : false) || multiplicity > 1,
+      charge: charge,
+      multiplicity: multiplicity, extras: extras,
+      calc_type: periodic ? 'slab' : 'molecule',
     };
     const btn = $('engine-gen-btn');
     if (btn) btn.disabled = true;
@@ -526,6 +665,7 @@
     wire('eng-poscar-btn', () => pickFile('eng-poscar', 'poscar'));
     wire('eng-out-btn', () => pickDir('eng-out'));
     wire('engine-gen-btn', engineGenerate);
+    { const task = $('eng-task'); if (task) task.addEventListener('change', saveEngineTask); }
 
     const st = await VCS.call('gen_state');
     if (st) {
@@ -552,11 +692,16 @@
     }
     loadEngines();
   });
+  document.addEventListener('vcs:calculation', syncEngineTask);
+  document.addEventListener('vcs:engine', e => {
+    const engine = e.detail && e.detail.engine;
+    if (engine && engine !== State2.engine) loadEngines();
+  });
 
   // 供 molbuild.js(①分子建模「下一步」)携分子进 Gaussian 面板:选 Gaussian 引擎 + 载分子
   async function useMolecule(struct) {
     await loadEngines();
-    selectEngine('gaussian');
+    await selectEngine('gaussian');
     if (window.GaussMol && typeof window.GaussMol.useMolecule === 'function') {
       window.GaussMol.useMolecule(struct);
     }

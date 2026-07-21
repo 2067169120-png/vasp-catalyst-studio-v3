@@ -2749,6 +2749,7 @@ class Api:
             'autopilot_report': bool(ui.get('autopilot_report', True)),
             'autopilot_campaigns': bool(ui.get('autopilot_campaigns', False)),
             'scenario': str(ui.get('scenario') or ''),
+            'active_engine': str(ui.get('active_engine') or ''),
             'active_calculation': str(ui.get('active_calculation') or ''),
         }
 
@@ -4014,37 +4015,49 @@ class Api:
             return {'ok': False, 'scenario': None, 'error': str(e)}
 
     def calculation_get(self):
-        """当前“本次计算类型”。非法/不适用于当前工作模式时回退该模式默认值。"""
+        """当前“本次计算类型”。同时受工作模式与当前引擎能力白名单约束。"""
         try:
             cfg = self._config.load_config()
             ui = self._config.get_ui_state(cfg)
             sc = self._scenarios.active_scenario(cfg)
-            allowed = list(sc.get('task_keys') or [])
+            registered = [self._normalize_engine_key(e)
+                          for e in self._eng().available_engines()]
+            engine = self._active_engine(sc, ui, registered)
+            allowed = self._engine_task_keys(engine, sc)
             requested = str((ui or {}).get('active_calculation') or '')
             default = str((sc.get('defaults') or {}).get('active_calculation') or '')
             active = requested if requested in allowed else default
             if active not in allowed:
                 active = allowed[0] if allowed else ''
             return {'ok': True, 'configured': requested in allowed,
-                    'active_calculation': active, 'allowed': allowed, 'error': None}
+                    'engine': engine, 'active_calculation': active,
+                    'allowed': allowed, 'error': None}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'configured': False, 'active_calculation': '',
-                    'allowed': [], 'error': str(e)}
+                    'engine': 'vasp', 'allowed': [], 'error': str(e)}
 
     def calculation_set(self, key):
-        """保存本次计算类型；必须属于当前工作模式，不能靠前端绕过白名单。"""
+        """保存本次计算类型；必须同时属于当前工作模式与当前引擎能力白名单。"""
         try:
             k = str(key or '').strip()
             cfg = self._config.load_config()
+            ui = self._config.get_ui_state(cfg)
             sc = self._scenarios.active_scenario(cfg)
-            allowed = list(sc.get('task_keys') or [])
+            registered = [self._normalize_engine_key(e)
+                          for e in self._eng().available_engines()]
+            engine = self._active_engine(sc, ui, registered)
+            allowed = self._engine_task_keys(engine, sc)
             if k not in allowed:
                 return {'ok': False, 'active_calculation': None,
-                        'error': f'计算类型 {k!r} 不适用于工作模式「{sc.get("name", "")}」'}
+                        'engine': engine,
+                        'error': (f'计算类型 {k!r} 不适用于「{sc.get("name", "")} / '
+                                  f'{self._ENGINE_DISPLAY.get(engine, engine)}」')}
             self._config.set_ui_state(active_calculation=k)
-            return {'ok': True, 'active_calculation': k, 'error': None}
+            return {'ok': True, 'engine': engine,
+                    'active_calculation': k, 'error': None}
         except Exception as e:                            # noqa: BLE001
-            return {'ok': False, 'active_calculation': None, 'error': str(e)}
+            return {'ok': False, 'engine': None,
+                    'active_calculation': None, 'error': str(e)}
 
     # ── 界面语言(i18n:zh 基准 + en 回落) ──────────────────────────────────────
     def lang_get(self):
@@ -4283,9 +4296,135 @@ class Api:
     # ── 多引擎适配(生成页引擎选择器) ──────────────────────────────────────────
     _ENGINE_DISPLAY = {'vasp': 'VASP', 'cp2k': 'CP2K', 'gaussian': 'Gaussian',
                        'castep': 'CASTEP'}
+    _ENGINE_ALIASES = {
+        'g16': 'gaussian', 'g09': 'gaussian', 'gaussian16': 'gaussian',
+        'materials_studio': 'castep', 'materials studio': 'castep',
+        'ms': 'castep', 'castep/ms': 'castep',
+    }
+    # 这是 Web/API 能力合同，不替代引擎实现。界面只据此展示已经接通“生成→登记→
+    # 提交→回收→能量/收敛解析”的任务和字段，避免把 VASP 专用选项套到其它软件。
+    _ENGINE_CAPABILITIES = {
+        'vasp': {
+            'support_level': 'full',
+            'support_label': '完整工作流',
+            'summary': '主引擎；覆盖完整 VASP 任务目录、四件套、托管与结果工具。',
+            'generic_tasks': None,       # None = 取当前工作模式的完整 task_keys
+            'boundaries': ['periodic', 'molecule'],
+            'fields': ['poscar', 'incar', 'potcar_library', 'calc_type'],
+            'input_contract': 'POSCAR / INCAR / POTCAR / KPOINTS',
+            'result_contract': '按 VASP 任务自动回收 OUTCAR、OSZICAR、vasprun.xml 等关键产物',
+            'limitations': [],
+        },
+        'cp2k': {
+            'support_level': 'file_workflow',
+            'support_label': '文件级工作流',
+            'summary': '生成 cp2k.inp、登记提交并解析 cp2k.out；软件与 GTH 数据文件需自备。',
+            'generic_tasks': ['relax', 'static', 'freq'],
+            'boundaries': ['periodic', 'molecule'],
+            'fields': ['poscar', 'task', 'functional', 'dispersion', 'cutoff_ry',
+                       'rel_cutoff_ry', 'kpoints', 'basis_set_file', 'potential_file',
+                       'periodic', 'spin', 'charge', 'multiplicity'],
+            'input_contract': 'POSCAR → cp2k.inp',
+            'result_contract': 'cp2k.out（总能与收敛状态）',
+            'limitations': [
+                'CUTOFF 是 GTH 密度网格截断（Ry），不能从 VASP ENCUT 换算。',
+                '当前通用适配只开放结构优化、单点能和频率；绝对能量不可跨引擎比较。',
+            ],
+        },
+        'gaussian': {
+            'support_level': 'file_workflow',
+            'support_label': '分子文件级工作流',
+            'summary': '孤立分子专用；生成 .gjf、登记提交并解析 .log。',
+            # 设置页只保留三种通用意图；TD/IRC/扫描/NMR/TS 等在 Gaussian 专属面板
+            # 的唯一任务下拉中选择，避免两个任务选择器互相覆盖。
+            'generic_tasks': ['relax', 'static', 'freq'],
+            'boundaries': ['molecule'],
+            'fields': ['molecule', 'gaussian_task', 'functional', 'basis', 'dispersion',
+                       'solvent', 'charge', 'multiplicity', 'resources'],
+            'input_contract': '分子结构 → Gaussian .gjf',
+            'result_contract': 'Gaussian .log（能量、收敛与频率证据）',
+            'limitations': [
+                '仅支持孤立分子/团簇；周期 slab 或 bulk 必须改用 VASP、CP2K 或 CASTEP。',
+                'VASP 平面波/PAW 与 Gaussian 高斯基组的绝对能量不可直接比较。',
+            ],
+        },
+        'castep': {
+            'support_level': 'file_workflow',
+            'support_label': '文件级工作流',
+            'summary': '生成 .cell/.param、登记提交并解析 .castep；CASTEP 许可与赝势需自备。',
+            'generic_tasks': ['relax', 'static', 'freq'],
+            'boundaries': ['periodic'],
+            'fields': ['poscar', 'task', 'functional', 'dispersion', 'cutoff_ev',
+                       'kpoints', 'periodic', 'spin', 'charge', 'multiplicity'],
+            'input_contract': 'POSCAR → CASTEP .cell + .param',
+            'result_contract': '.castep（总能与收敛状态）',
+            'limitations': [
+                '当前通用适配只开放结构优化、单点能和频率。',
+                'CASTEP 赝势与 VASP PAW 不同；截断能需独立收敛，绝对能量不可跨引擎比较。',
+            ],
+        },
+    }
+    _GENERIC_TASK_NAMES = {
+        'relax': '结构优化', 'static': '单点能', 'freq': '频率分析',
+    }
+
+    @classmethod
+    def _normalize_engine_key(cls, engine):
+        key = str(engine or '').strip().lower()
+        return cls._ENGINE_ALIASES.get(key, key)
+
+    def _engine_task_keys(self, engine, scenario=None):
+        """引擎在当前工作模式真正可走通的“本次计算”交集。"""
+        key = self._normalize_engine_key(engine)
+        cap = self._ENGINE_CAPABILITIES.get(key) or {}
+        generic = cap.get('generic_tasks')
+        if scenario is not None:
+            allowed = list(scenario.get('task_keys') or [])
+        else:
+            try:
+                allowed = [str(t.get('key')) for t in self._tc().list_catalog()]
+            except Exception:                         # noqa: BLE001 元数据降级不挡引擎清单
+                allowed = []
+        if generic is None:
+            return allowed
+        return [task for task in generic if not allowed or task in allowed]
+
+    def _engine_capability_view(self, engine, scenario=None):
+        key = self._normalize_engine_key(engine)
+        cap = copy.deepcopy(self._ENGINE_CAPABILITIES.get(key) or {})
+        task_keys = self._engine_task_keys(key, scenario)
+        names = dict(self._GENERIC_TASK_NAMES)
+        try:
+            names.update({str(t.get('key')): str(t.get('name_zh') or t.get('key'))
+                          for t in self._tc().list_catalog()})
+        except Exception:                             # noqa: BLE001 显示名可安全回退 key
+            pass
+        cap['task_keys'] = task_keys
+        cap['tasks'] = [{'key': task, 'name': names.get(task, task)} for task in task_keys]
+        if key == 'gaussian':
+            try:
+                cap['native_tasks'] = [
+                    {'key': task, 'name': row.get('name_zh', task),
+                     'note': row.get('note', '')}
+                    for task, row in self._gauss().GAUSSIAN_TASKS.items()
+                ]
+            except Exception:                         # noqa: BLE001 专属面板仍会自行加载任务
+                cap['native_tasks'] = []
+        return cap
+
+    def _active_engine(self, scenario, ui, registered):
+        visible = [e for e in (scenario.get('engines') or []) if e in registered]
+        requested = self._normalize_engine_key((ui or {}).get('active_engine'))
+        default = self._normalize_engine_key(
+            (scenario.get('defaults') or {}).get('engine') or 'vasp')
+        if requested in visible:
+            return requested
+        if default in visible:
+            return default
+        return visible[0] if visible else ('vasp' if 'vasp' in registered else '')
 
     def engine_list(self, scenario_key=None):
-        """已注册引擎清单(按场景标可见)→ {'ok','engines':[{key,name,visible,experimental}],'default'}。
+        """已注册引擎清单与 UI 能力合同（按工作模式严格标可见）。
 
         VASP 为主引擎;CP2K/Gaussian/CASTEP 为文件级适配(实验性)。
         给 scenario_key 时严格按工作模式 engines 白名单标 visible，默认引擎也取模式声明。
@@ -4298,15 +4437,66 @@ class Api:
                 sc = self._scenarios.get_scenario(scenario_key)
                 vis = set(sc.get('engines') or [])
                 default = str((sc.get('defaults') or {}).get('engine') or 'vasp')
-            engines = [{'key': n, 'name': self._ENGINE_DISPLAY.get(n, n.upper()),
-                        'experimental': n != 'vasp',
-                        'visible': True if vis is None else (n in vis)}
-                       for n in names]
+            engines = []
+            for n in names:
+                row = {'key': n, 'name': self._ENGINE_DISPLAY.get(n, n.upper()),
+                       'experimental': n != 'vasp',
+                       'visible': True if vis is None else (n in vis)}
+                row.update(self._engine_capability_view(n, sc if scenario_key is not None else None))
+                engines.append(row)
             if default not in names or (vis is not None and default not in vis):
                 default = next((n for n in names if vis is None or n in vis), 'vasp')
             return {'ok': True, 'engines': engines, 'default': default, 'error': None}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'engines': [], 'default': 'vasp', 'error': str(e)}
+
+    def engine_get(self):
+        """当前计算引擎；无效旧配置按工作模式默认值回退，不静默开放模式外引擎。"""
+        try:
+            cfg = self._config.load_config()
+            ui = self._config.get_ui_state(cfg)
+            scenario = self._scenarios.active_scenario(cfg)
+            registered = [self._normalize_engine_key(e)
+                          for e in self._eng().available_engines()]
+            active = self._active_engine(scenario, ui, registered)
+            requested = self._normalize_engine_key((ui or {}).get('active_engine'))
+            return {
+                'ok': True, 'engine': active,
+                'configured': requested == active and bool(requested),
+                'capability': self._engine_capability_view(active, scenario),
+                'error': None,
+            }
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'engine': 'vasp', 'configured': False,
+                    'capability': {}, 'error': str(e)}
+
+    def engine_set(self, engine):
+        """保存本次引擎，并把不受该引擎支持的旧计算类型收敛到真实可用默认值。"""
+        try:
+            key = self._normalize_engine_key(engine)
+            cfg = self._config.load_config()
+            ui = self._config.get_ui_state(cfg)
+            scenario = self._scenarios.active_scenario(cfg)
+            registered = [self._normalize_engine_key(e)
+                          for e in self._eng().available_engines()]
+            if key not in registered:
+                return {'ok': False, 'engine': None, 'active_calculation': None,
+                        'error': f'计算引擎 {key!r} 未注册或当前安装不可用'}
+            if key not in (scenario.get('engines') or []):
+                return {'ok': False, 'engine': None, 'active_calculation': None,
+                        'error': f'计算引擎 {key!r} 不适用于工作模式「{scenario.get("name", "")}」'}
+            allowed = self._engine_task_keys(key, scenario)
+            requested = str((ui or {}).get('active_calculation') or '')
+            preferred = str((scenario.get('defaults') or {}).get('active_calculation') or '')
+            active = requested if requested in allowed else preferred
+            if active not in allowed:
+                active = allowed[0] if allowed else ''
+            self._config.set_ui_state(active_engine=key, active_calculation=active)
+            return {'ok': True, 'engine': key, 'active_calculation': active,
+                    'capability': self._engine_capability_view(key, scenario), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'engine': None, 'active_calculation': None,
+                    'capability': {}, 'error': str(e)}
 
     def _spec_from_params(self, mods, params):
         """params → (CalcSpec, err|None)。结构取 params['structure'](内联文本)或 poscar 路径;
@@ -4356,6 +4546,7 @@ class Api:
         try:
             params = dict(params or {})
             eng = (engine or '').strip()
+            engine_key = self._normalize_engine_key(eng)
             out = (out_dir or '').strip()
             if not eng:
                 return {'ok': False, 'files': [], 'warnings': [], 'issues': [],
@@ -4364,12 +4555,66 @@ class Api:
                 return {'ok': False, 'files': [], 'warnings': [], 'issues': [],
                         'out_dir': None, 'registered': False, 'error': '未选输出目录'}
             mods = self._eng()
+            registered_engines = [self._normalize_engine_key(e)
+                                  for e in mods.available_engines()]
+            if engine_key not in registered_engines or engine_key not in self._ENGINE_CAPABILITIES:
+                return {'ok': False, 'files': [], 'warnings': [], 'issues': [],
+                        'out_dir': None, 'registered': False,
+                        'error': f'计算引擎 {engine_key!r} 未注册或无 Web 工作流能力合同'}
+            if engine_key == 'vasp':
+                return {
+                    'ok': False, 'files': [], 'warnings': [], 'issues': [],
+                    'out_dir': None, 'registered': False,
+                    'error': ('VASP 请使用主工作流的四件套/专用任务生成器；'
+                              '通用 engine_generate 仅服务 CP2K、Gaussian 和 CASTEP，'
+                              '避免生成缺 POTCAR 且绕过 VASP 预检的重复入口。')}
+            task = str(params.get('task') or 'relax').strip().lower()
+            supported = self._engine_task_keys(engine_key)
+            if task not in supported:
+                names = '、'.join(self._GENERIC_TASK_NAMES.get(x, x) for x in supported)
+                return {'ok': False, 'files': [], 'warnings': [], 'issues': [],
+                        'out_dir': None, 'registered': False,
+                        'error': (f'{self._ENGINE_DISPLAY.get(engine_key, engine_key)} 当前文件级工作流'
+                                  f'不支持任务 {task!r}；可选：{names}')}
+            params['task'] = task
+            # CP2K 的 CUTOFF/REL_CUTOFF 单位为 Ry，属于引擎私有参数；绝不能继续
+            # 借用通用 cutoff_ev（那会让用户误以为 VASP ENCUT 可直接换算）。
+            if engine_key == 'cp2k':
+                extras = dict(params.get('extras') or {})
+                for key in ('cutoff_ry', 'rel_cutoff_ry', 'basis_set_file',
+                            'potential_file'):
+                    if params.get(key) not in (None, ''):
+                        extras[key] = params[key]
+                params['extras'] = extras
+                params['cutoff_ev'] = None
             spec, serr = self._spec_from_params(mods, params)
             if serr:
                 return {'ok': False, 'files': [], 'warnings': [], 'issues': [],
                         'out_dir': None, 'registered': False, 'error': serr}
+            boundary = 'periodic' if bool(getattr(spec, 'periodic', True)) else 'molecule'
+            boundaries = self._ENGINE_CAPABILITIES[engine_key].get('boundaries') or []
+            if boundary not in boundaries:
+                label = '周期体系' if boundary == 'periodic' else '孤立分子/团簇'
+                allowed_labels = '、'.join('周期体系' if item == 'periodic' else '孤立分子/团簇'
+                                          for item in boundaries)
+                return {'ok': False, 'files': [], 'warnings': [], 'issues': [],
+                        'out_dir': None, 'registered': False,
+                        'error': (f'{self._ENGINE_DISPLAY.get(engine_key, engine_key)} 当前适配不支持'
+                                  f'{label}；请选择：{allowed_labels}')}
             issues = list(mods.validate(spec))
-            backend = mods.get_backend(eng)
+            if engine_key == 'cp2k':
+                # CalcSpec 的 cutoff_ev 门禁服务于 VASP/CASTEP 平面波截断；CP2K 已由
+                # cutoff_ry 单独表达。保留真正的 CP2K 缺项提示，不输出错误单位建议。
+                issues = [x for x in issues if 'cutoff_ev' not in str(x)]
+                try:
+                    if float((getattr(spec, 'extras', {}) or {}).get('cutoff_ry', 0)) <= 0:
+                        issues.append('CP2K 周期计算应明确给出正数 CUTOFF（Ry），并独立做收敛测试。')
+                except (TypeError, ValueError):
+                    issues.append('CP2K CUTOFF（Ry）必须是正数。')
+            if engine_key == 'castep' and bool(getattr(spec, 'periodic', True)) \
+                    and getattr(spec, 'kpoints', None) is None:
+                issues.append('CASTEP 周期计算未指定 k 点网格；将回退 1×1×1，仅适合已验证的超胞。')
+            backend = mods.get_backend(engine_key)
             os.makedirs(out, exist_ok=True)
             res = backend.generate_inputs(spec, out)
             files = list(res.get('files') or [])
@@ -4387,7 +4632,7 @@ class Api:
                 if os.path.isfile(candidate):
                     hashes[name] = _sha256_file(candidate)
 
-            engine_key = self._ta().normalize_engine(eng)
+            engine_key = self._ta().normalize_engine(engine_key)
             output_files = self._ta().expected_engine_output_names(
                 engine_key, generated_names)
             task_type = str(getattr(spec, 'task', None) or 'relax').strip().lower()
@@ -4460,17 +4705,45 @@ class Api:
         {'ok','text','chars','warnings','issues','error'}。
         """
         try:
-            eng = (engine or '').strip().lower()
+            eng = self._normalize_engine_key(engine)
             if not eng:
                 return {'ok': False, 'text': '', 'chars': 0, 'warnings': [],
                         'issues': [], 'error': '未指定引擎'}
             mods = self._eng()
+            if eng not in [self._normalize_engine_key(e) for e in mods.available_engines()] \
+                    or eng not in self._ENGINE_CAPABILITIES:
+                return {'ok': False, 'text': '', 'chars': 0, 'warnings': [],
+                        'issues': [], 'error': f'计算引擎 {eng!r} 未注册或无 Web 工作流能力合同'}
+            if eng == 'vasp':
+                return {'ok': False, 'text': '', 'chars': 0, 'warnings': [],
+                        'issues': [],
+                        'error': 'VASP 预览请使用主四件套预览，不走非 VASP 通用适配器。'}
+            params = dict(params or {})
+            task = str(params.get('task') or 'relax').strip().lower()
+            if task not in self._engine_task_keys(eng):
+                return {'ok': False, 'text': '', 'chars': 0, 'warnings': [],
+                        'issues': [], 'error': f'{eng} 当前适配不支持任务 {task!r}'}
+            params['task'] = task
+            if eng == 'cp2k':
+                extras = dict(params.get('extras') or {})
+                for key in ('cutoff_ry', 'rel_cutoff_ry', 'basis_set_file',
+                            'potential_file'):
+                    if params.get(key) not in (None, ''):
+                        extras[key] = params[key]
+                params['extras'] = extras
+                params['cutoff_ev'] = None
             spec, serr = self._spec_from_params(mods, params)
             if serr:
                 return {'ok': False, 'text': '', 'chars': 0, 'warnings': [],
                         'issues': [], 'error': serr}
+            boundary = 'periodic' if bool(getattr(spec, 'periodic', True)) else 'molecule'
+            if boundary not in (self._ENGINE_CAPABILITIES[eng].get('boundaries') or []):
+                return {'ok': False, 'text': '', 'chars': 0, 'warnings': [],
+                        'issues': [], 'error': f'{eng} 当前适配不支持 {boundary} 边界'}
             issues = list(mods.validate(spec))
-            eng_norm = {'g16': 'gaussian', 'g09': 'gaussian'}.get(eng, eng)
+            if eng == 'cp2k':
+                issues = [x for x in issues if 'cutoff_ev' not in str(x)]
+            eng_norm = eng
             warnings: list = []
             if eng_norm == 'gaussian':
                 text = self._gauss().preview(spec)
@@ -5415,40 +5688,65 @@ class Api:
             return '结果计算器'
         return '作业生成'
 
-    def task_catalog(self, scenario_key=None, active_calculation=None):
+    def task_catalog(self, scenario_key=None, active_calculation=None, engine=None):
         """计算类型目录(五分类 23 项)→ {'ok','categories','tasks':[{key,name_zh,category,
         description,requires,outputs,figure,builder_ref,kind_badge}],'error'}。前端据此渲染卡片
-        网格与参数表单;kind_badge 按 builder_ref 分「作业生成/结果计算器/INCAR 顾问」区分。"""
+        网格与参数表单;kind_badge 按 builder_ref 分「作业生成/结果计算器/INCAR 顾问」区分。
+
+        engine 缺省保持 VASP 完整目录的兼容行为；显式指定非 VASP 引擎时只返回该
+        文件级适配真正接通的 relax/static/freq，且改写为对应引擎的输入/结果合同。
+        """
         try:
             tc = self._tc()
             rows = tc.list_catalog()
+            sc = None
             if scenario_key:
                 sc = self._scenarios.get_scenario(str(scenario_key))
                 allowed = set(sc.get('task_keys') or [])
                 rows = [t for t in rows if t.get('key') in allowed]
+            engine_key = self._normalize_engine_key(engine or 'vasp')
+            if engine_key not in self._ENGINE_CAPABILITIES:
+                return {'ok': False, 'categories': [], 'tasks': [],
+                        'engine': engine_key,
+                        'error': f'未知计算引擎 {engine_key!r}'}
+            if engine is not None:
+                supported = set(self._engine_task_keys(engine_key, sc))
+                rows = [t for t in rows if t.get('key') in supported]
             if active_calculation:
                 rows = [t for t in rows if t.get('key') == str(active_calculation)]
             tasks = []
+            cap_view = self._engine_capability_view(engine_key, sc)
             for t in rows:
                 cap = self._ta().capability(t['key'])
+                non_vasp = engine_key != 'vasp'
+                engine_name = self._ENGINE_DISPLAY.get(engine_key, engine_key.upper())
                 tasks.append({
                     'key': t['key'], 'name_zh': t.get('name_zh', t['key']),
                     'category': t.get('category', ''),
                     'description': t.get('description', ''),
-                    'requires': t.get('requires', ''),
-                    'outputs': t.get('outputs', ''), 'figure': t.get('figure'),
+                    'requires': (cap_view.get('input_contract', '') if non_vasp
+                                 else t.get('requires', '')),
+                    'outputs': (cap_view.get('result_contract', '') if non_vasp
+                                else t.get('outputs', '')),
+                    'figure': t.get('figure'),
                     'builder_ref': t.get('builder_ref', ''),
-                    'kind_badge': self._task_badge(t.get('builder_ref', '')),
+                    'kind_badge': ('引擎输入生成' if non_vasp
+                                   else self._task_badge(t.get('builder_ref', ''))),
                     'analysis_status': cap['analysis_status'],
                     'report_supported': cap['report_supported'],
-                    'next_action': cap['next_action'],
+                    'next_action': (f'在生成输入页填写 {engine_name} 专属字段，生成并纳管后到任务页提交。'
+                                    if non_vasp else cap['next_action']),
+                    'engine': engine_key,
                 })
             categories = [c for c in tc.CATEGORIES
                           if any(t.get('category') == c for t in rows)]
             return {'ok': True, 'categories': categories,
-                    'tasks': tasks, 'error': None}
+                    'tasks': tasks, 'engine': engine_key,
+                    'capability': cap_view, 'error': None}
         except Exception as e:                            # noqa: BLE001
-            return {'ok': False, 'categories': [], 'tasks': [], 'error': str(e)}
+            return {'ok': False, 'categories': [], 'tasks': [],
+                    'engine': self._normalize_engine_key(engine or 'vasp'),
+                    'capability': {}, 'error': str(e)}
 
     def task_capabilities(self):
         """全部 23 类任务的分析/报告能力矩阵，供 UI 如实显示可用程度。"""
@@ -6185,23 +6483,20 @@ class Api:
 
     @staticmethod
     def _poscar_volume(job_dir):
-        """CONTCAR/POSCAR 晶胞体积(Å³)→ float|None(scale>0 时乘 scale³)。"""
+        """CONTCAR/POSCAR 晶胞体积(Å³)，复用完整 VASP 缩放语义解析。"""
         try:
+            from vcstudio.generate.poscar import read_cell_vectors
+
             for name in ('CONTCAR', 'POSCAR'):
                 p = os.path.join(job_dir, name)
                 if not os.path.isfile(p):
                     continue
-                lines = open(p, encoding='utf-8', errors='replace').read().splitlines()
-                if len(lines) < 5:
-                    continue
-                scale = float(lines[1].split()[0])
-                a = [[float(x) for x in lines[2].split()[:3]],
-                     [float(x) for x in lines[3].split()[:3]],
-                     [float(x) for x in lines[4].split()[:3]]]
+                with open(p, encoding='utf-8', errors='replace') as handle:
+                    a = read_cell_vectors(handle.read())
                 det = (a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
                        - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
                        + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]))
-                return abs(det) * (scale ** 3 if scale > 0 else 1.0)
+                return abs(det)
             return None
         except Exception:                                 # noqa: BLE001
             return None

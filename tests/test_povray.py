@@ -48,10 +48,22 @@ def test_parse_cartesian_with_scale_and_seldyn():
 def test_parse_rejects_vasp4_and_truncated():
     with pytest.raises(ValueError, match='VASP4'):
         pr.parse_poscar_atoms(_POSCAR_D.replace('Li S\n', '9 9\n', 1).replace('2 1\n', 'Direct\n', 1))
-    with pytest.raises(ValueError, match='截断'):
+    with pytest.raises(ValueError, match='截断|不足'):
         pr.parse_poscar_atoms('\n'.join(_POSCAR_D.splitlines()[:-1]))
-    with pytest.raises(ValueError, match='scale|缩放'):
-        pr.parse_poscar_atoms(_POSCAR_D.replace('1.0\n', '-1.0\n', 1))
+    with pytest.raises(ValueError, match='缩放'):
+        pr.parse_poscar_atoms(_POSCAR_D.replace('1.0\n', '0\n', 1))
+
+
+def test_parse_supports_negative_volume_and_three_scales():
+    neg = _POSCAR_CART_SD.replace('2.0\n', '-6000\n', 1)
+    _syms, coords = pr.parse_poscar_atoms(neg)
+    # 原始晶胞 5*5*6=150；目标 6000 → factor=cuberoot(40)。
+    factor = 40 ** (1 / 3)
+    assert coords[1] == pytest.approx([0.6 * factor, 0.0, 0.0])
+
+    anisotropic = _POSCAR_CART_SD.replace('2.0\n', '2 3 4\n', 1)
+    _syms, coords = pr.parse_poscar_atoms(anisotropic)
+    assert coords[1] == pytest.approx([1.2, 0.0, 0.0])
 
 
 def test_build_bonds_heuristic():

@@ -19,6 +19,7 @@ BM3 公式(Birch 1947,能量形式):
 """
 from __future__ import annotations
 
+import math
 import os
 from collections import OrderedDict
 from pathlib import Path
@@ -38,21 +39,42 @@ def _det3(m) -> float:
 
 
 def _scale_poscar(poscar_text: str, linear_scale: float) -> str:
-    """等比缩放晶格:把 POSCAR 第2行的**通用缩放因子** ×linear_scale(VASP 语义下同时缩放
-    晶格矢量与笛卡尔坐标,Direct 坐标随晶格同缩放),得体积 ∝ linear_scale³ 的定容结构。
+    """等比缩放晶格:调整 POSCAR 第2行并保持 VASP 原始缩放表示。
 
-    只改第2行,其余逐字保留。缩放因子 ≤0(负=目标体积,不支持)→ ValueError。
+    - 单个正数乘 ``linear_scale``；
+    - 单个负数表示目标体积，绝对值乘 ``linear_scale³``；
+    - 三个正数分别乘 ``linear_scale``。
+
+    因而晶格与 Cartesian 坐标都等比缩放，Direct 坐标随晶格缩放，体积严格按
+    ``linear_scale³`` 变化。只改第2行，其余逐字保留。
     """
     lines = poscar_text.splitlines()
     if len(lines) < 2:
         raise ValueError('POSCAR 行数不足,无法缩放晶格')
     try:
-        base = float(lines[1].split()[0])
-    except (IndexError, ValueError):
-        raise ValueError('POSCAR 第2行不是合法缩放因子')
-    if base <= 0:
-        raise ValueError('POSCAR 缩放因子须为正(负缩放=目标体积,EOS 系列不支持);请提供正缩放 POSCAR')
-    lines[1] = f'{base * float(linear_scale):.10f}'
+        factor = float(linear_scale)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('EOS 线性缩放因子不是合法数值') from exc
+    if not math.isfinite(factor) or factor <= 0:
+        raise ValueError('EOS 线性缩放因子须为正的有限数值')
+    tokens = lines[1].split()
+    if len(tokens) not in (1, 3):
+        raise ValueError('POSCAR 第2行缩放因子须包含 1 个或 3 个数值')
+    try:
+        base = [float(token) for token in tokens]
+    except ValueError as exc:
+        raise ValueError('POSCAR 第2行不是合法缩放因子') from exc
+    if not all(math.isfinite(value) for value in base):
+        raise ValueError('POSCAR 缩放因子须为有限数值')
+    if len(base) == 1:
+        if base[0] == 0:
+            raise ValueError('POSCAR 缩放因子为 0(无物理意义)')
+        value = base[0] * factor if base[0] > 0 else -abs(base[0]) * factor ** 3
+        lines[1] = f'{value:.10f}'
+    else:
+        if any(value <= 0 for value in base):
+            raise ValueError('POSCAR 的三个分量缩放因子必须全部为正数')
+        lines[1] = ' '.join(f'{value * factor:.10f}' for value in base)
     return '\n'.join(lines) + ('\n' if poscar_text.endswith('\n') else '')
 
 

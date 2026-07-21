@@ -46,7 +46,7 @@
     onTaskChange();
   }
   function syncCalculationTask() {
-    if (!VCS.scenario || VCS.scenario.key !== 'molecular') return;
+    if (VCS.activeEngine !== 'gaussian') return;
     const sel = $('gauss-task');
     const target = CALCULATION_TASK[VCS.activeCalculation || ''];
     if (!sel || !target || !Array.from(sel.options).some(o => o.value === target)) return;

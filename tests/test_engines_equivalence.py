@@ -38,7 +38,7 @@ def test_consistency_superdiff_names_offenders():
     cp2k = {'H2O': -470.10, 'H2': -31.60, 'O2': -865.98}   # rxn = -5.51 → diff 2.99
     out = reference_consistency_check(_results(vasp, cp2k), RXN)
     assert out['ok'] is False
-    assert '不可混用' in out['note']
+    assert '不可并列比较' in out['note']
     assert 'H2O_formation' in out['note']
     assert any('vasp' in str(p['engines']) and 'cp2k' in str(p['engines'])
                for p in out['pairs'])
@@ -103,8 +103,24 @@ def test_mixing_gate_multi_reject_default():
 
 
 def test_mixing_gate_multi_pass_when_consistency():
-    out = mixing_gate({'vasp', 'cp2k'}, consistency_passed=True)
+    out = mixing_gate({'vasp', 'cp2k'}, consistency_passed=True,
+                      comparison_scope='relative_results')
     assert out['ok'] is True and '记录在案' in out['note']
+
+
+def test_mixing_gate_consistency_never_allows_raw_cross_engine_subtraction():
+    out = mixing_gate({'vasp', 'cp2k'}, consistency_passed=True)
+    assert out['ok'] is False
+    assert '原始能量' in out['note']
+
+
+def test_consistency_conflicting_duplicate_energy_fails_closed():
+    results = _results(
+        {'H2O': -14.22, 'H2': -6.77, 'O2': -9.86},
+        {'H2O': -467.11, 'H2': -31.60, 'O2': -865.98})
+    results.append({'engine': 'cp2k', 'species': 'H2O', 'energy_ev': -999.0})
+    out = reference_consistency_check(results, RXN)
+    assert out['ok'] is False and '不唯一' in out['note']
 
 
 def test_mixing_gate_empty_ok():

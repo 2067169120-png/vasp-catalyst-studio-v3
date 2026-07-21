@@ -152,7 +152,7 @@ silent (job.yaml state machine + audit history).
 
 **23 种计算类型目录**(收敛扫描/能带/EOS/功函数/表面能/Dimer/VASPsol/DFT+U 值库等全补齐,选类型→派生→解析→出图闭环);**一键出图管线**(自动托管终点场景感知整套图+多面板拼版+图表溯源,计算活动模板全链自动推进);**AI 数据闭环**(论文数据表抽取→复现 MAE 自动对照→变体矩阵推荐→论文草稿骨架);starpivot 细节对齐(精确依赖检测与可复制安装命令/核时四卡/波函数 16 种/Fukui·ELF-LOL·散点图)。**2051 测试通过(6 跳过)**。
 
-### 2026-07-20：本地结果导入与 Li-S 一站式流程
+### 2026-07-20：本地结果导入、VASP 主链与多引擎适配
 
 - 结果分析页可递归导入一个完整文件夹；仅有 `CONTCAR/OSZICAR/OUTCAR/vasprun.xml`
   的已算结果也能按多证据收敛门槛识别，不要求它原先属于集群台账。
@@ -179,6 +179,17 @@ silent (job.yaml state machine + audit history).
 - NEB 会把真实端点能量文件及 SHA256 带入 `00`/末态，Bader 在没有 `ACF.dat` 时只显示
   产物证据和下一步，不再假称已完成自动解析。表面能、形成/结合能、差分电荷和多自旋比较
   都会生成专用可追溯报告；大数相减前强制 DONE/完整页脚/方法一致性门槛。
+- VASP 结构层统一支持 POSCAR/CONTCAR/CHGCAR/LOCPOT 的单一正缩放、负值目标体积和
+  三分量缩放；预览、差分电荷、功函数、EOS、POV-Ray 与结果导入使用同一几何口径。
+- VASP 任务完成判定按 relax/static/freq/AIMD/NEB 分开，并强制干净结束页脚；派生的
+  静态、频率、能带和收敛扫描会清理父作业的续算/离子步状态。`ICHARG=1/11`
+  会在联网前强制要求 `CHGCAR`，能带回收包含 `PROCAR`；NEB 未实现 image 级安全续算时明确交人工。
+- 设置页与生成页共用唯一的“工作模式 → 计算引擎 → 本次任务”状态。VASP 默认显示完整流程；
+  CP2K/Gaussian/CASTEP 只显示已闭环的任务和引擎原生单位，后端用同一能力白名单再校验。
+- CP2K 补齐 Ry 截断、k 点、Selective Dynamics、RPBE/PBEsol XC 和频率/末结构；Gaussian 补齐
+  GD3/GD3BJ、任务级完成、MP2/CC/热校正与末结构；CASTEP 补齐 D3/D3-BJ、0 K 能量口径、
+  `.phonon/.geom` 和同 seed 输入门。所有非 VASP 失败/未收敛能量只记为 raw，不进入可信结果。
+- 当前回归基线：**2543 测试通过，8 项按本机可选软件/依赖环境跳过**。
 
 ## Install & quickstart
 

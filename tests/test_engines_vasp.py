@@ -85,9 +85,24 @@ def test_vasp_extras_incar_override(tmp_path):
     assert incar['ISMEAR'] == 1 and float(incar['SIGMA']) == pytest.approx(0.2)
 
 
-def test_vasp_charge_warns(tmp_path):
-    res = get_backend('vasp').generate_inputs(_spec(charge=1), str(tmp_path))
-    assert any('NELECT' in w for w in res['warnings'])
+def test_vasp_charge_requires_explicit_nelect(tmp_path):
+    with pytest.raises(ValueError, match='NELECT'):
+        get_backend('vasp').generate_inputs(_spec(charge=1), str(tmp_path))
+    res = get_backend('vasp').generate_inputs(
+        _spec(charge=1, extras={'incar': {'NELECT': 15}}), str(tmp_path))
+    assert any('带电体系' in w for w in res['warnings'])
+
+
+@pytest.mark.parametrize('kwargs', [
+    {'cutoff_ev': None}, {'cutoff_ev': float('nan')},
+    {'convergence': {'energy_ev': 0, 'force_ev_a': 0.02}},
+    {'convergence': {'energy_ev': 1e-5, 'force_ev_a': -0.02}},
+    {'kpoints': (3, 2.5, 1)}, {'task': 'aimd'},
+    {'extras': {'nsw': 0}}, {'task': 'freq', 'extras': {'nfree': 3}},
+])
+def test_vasp_invalid_generation_parameters_fail_closed(tmp_path, kwargs):
+    with pytest.raises(ValueError):
+        get_backend('vasp').generate_inputs(_spec(**kwargs), str(tmp_path))
 
 
 def test_vasp_molecule_kpoints_gamma(tmp_path):
@@ -141,6 +156,44 @@ def test_vasp_parse_toten_fallback(tmp_path):
                            'General timing and accounting\n')
     r = get_backend('vasp').parse_energy(str(tmp_path))
     assert r['energy_ev'] == pytest.approx(-42.5)
+    assert r['energy_kind'] == 'TOTEN' and r['energy_source'] == 'OUTCAR:TOTEN'
+
+
+def test_vasp_parse_prefers_sigma0_over_toten(tmp_path):
+    _write(tmp_path, outcar='  free  energy   TOTEN  =       -42.400000 eV\n'
+                           '  energy  without entropy= -42.510  energy(sigma->0) = -42.500000\n'
+                           'aborting loop because EDIFF is reached\n'
+                           'General timing and accounting informations for this job\n')
+    r = get_backend('vasp').parse_energy(str(tmp_path))
+    assert r['energy_ev'] == pytest.approx(-42.5)
+    assert r['energy_kind'] == 'sigma0'
+
+
+def test_vasp_parse_stale_relax_marker_without_footer_not_converged(tmp_path):
+    (tmp_path / 'INCAR').write_text('IBRION = 2\nNSW = 100\n', encoding='utf-8')
+    _write(tmp_path,
+           oszicar='1 F= -10 E0= -10 d E=0\n',
+           outcar='reached required accuracy - stopping structural energy minimisation\n'
+                  '...truncated before the timing footer...\n')
+    r = get_backend('vasp').parse_energy(str(tmp_path))
+    assert r['task'] == 'relax' and r['converged'] is False
+
+
+def test_vasp_parse_frequency_requires_modes_and_footer(tmp_path):
+    (tmp_path / 'INCAR').write_text('IBRION = 5\nNSW = 1\n', encoding='utf-8')
+    _write(tmp_path, oszicar='1 F= -10 E0= -10 d E=0\n',
+           outcar='  1 f  = 1.2 THz\nGeneral timing and accounting informations for this job\n')
+    r = get_backend('vasp').parse_energy(str(tmp_path))
+    assert r['task'] == 'freq' and r['converged'] is True
+
+
+def test_vasp_parse_relax_does_not_accept_static_ediff_marker(tmp_path):
+    (tmp_path / 'INCAR').write_text('IBRION = 2\nNSW = 100\n', encoding='utf-8')
+    _write(tmp_path, oszicar='1 F= -10 E0= -10 d E=0\n',
+           outcar='aborting loop because EDIFF is reached\n'
+                  'General timing and accounting informations for this job\n')
+    r = get_backend('vasp').parse_energy(str(tmp_path))
+    assert r['task'] == 'relax' and r['converged'] is False
 
 
 def test_vasp_parse_not_converged(tmp_path):

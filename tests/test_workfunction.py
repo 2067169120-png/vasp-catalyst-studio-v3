@@ -60,14 +60,15 @@ def _make_src(tmp_path, contcar=_SLAB_SYM):
     return d
 
 
-def _locpot(z_slices, ng_xy=(2, 2), cell=((3.0, 0, 0), (0, 3.0, 0), (0, 0, 8.0))):
+def _locpot(z_slices, ng_xy=(2, 2), cell=((3.0, 0, 0), (0, 3.0, 0), (0, 0, 8.0)),
+            scale='1.0'):
     """按 z 切片值(每片一个常数)合成 LOCPOT 文本。NGZ=len(z_slices)。"""
     ngx, ngy = ng_xy
     ngz = len(z_slices)
     grid = []
     for zv in z_slices:                                  # i = ix + ngx*(iy + ngy*iz)
         grid.extend([zv] * (ngx * ngy))
-    lines = ['LOCPOT', '1.0']
+    lines = ['LOCPOT', str(scale)]
     for v in cell:
         lines.append(f' {v[0]} {v[1]} {v[2]}')
     lines += ['H', '1', 'Direct', ' 0 0 0', '', f' {ngx} {ngy} {ngz}']
@@ -117,6 +118,12 @@ def test_parse_locpot_planar_no_volume_division():
     txt = _locpot([100.0, 100.0, 100.0, 100.0])
     r = wf.parse_locpot_planar(txt)
     assert r['v_planar'][0] == pytest.approx(100.0)
+
+
+def test_parse_locpot_planar_uses_three_component_scale_for_axis():
+    txt = _locpot([1.0, 2.0, 3.0, 4.0], scale='1 1 2')
+    r = wf.parse_locpot_planar(txt)
+    assert r['z'] == pytest.approx([0.0, 4.0, 8.0, 12.0])  # 实际 |c|=16 Å
 
 
 # ── work_function 平台判定 ──────────────────────────────────────────────────────
