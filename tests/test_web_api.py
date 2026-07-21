@@ -6534,6 +6534,99 @@ def test_proj_prepare_lis_reuses_only_done_reference_jobs_and_persists_mapping(t
     assert calls['lib_root'] == '/potentials'
 
 
+def test_proj_prepare_lis_binds_each_member_incar_and_keeps_runtime_controls_independent(
+        tmp_path):
+    clean_dir = tmp_path / 'inputs' / 'clean'
+    config_dir = tmp_path / 'inputs' / 'Li2S8_top'
+    clean_dir.mkdir(parents=True)
+    config_dir.mkdir(parents=True)
+    slab, config = clean_dir / 'POSCAR', config_dir / 'POSCAR'
+    header = '1.0\n10 0 0\n0 10 0\n0 0 20\n'
+    slab.write_text('slab\n' + header + 'C\n1\nDirect\n0 0 0\n', encoding='utf-8')
+    config.write_text(
+        'ads\n' + header + 'C Li S\n1 2 8\nDirect\n' + '0 0 0\n' * 11,
+        encoding='utf-8')
+    clean_incar = clean_dir / 'INCAR'
+    config_incar = config_dir / 'incar'
+    common = 'ENCUT=400\nGGA=RP\nISPIN=1\nIVDW=0\nLDAU=F\nMETAGGA=F\nLHFCALC=F\n'
+    clean_incar.write_text(common + 'NSW=40\nIBRION=2\n', encoding='utf-8')
+    config_incar.write_text(common + 'NSW=120\nIBRION=1\n', encoding='utf-8')
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config())
+    evidence = {
+        'clean_slab': {'path': str(clean_incar), 'sha256': _sha256_file(clean_incar)},
+        'configs': [{'path': str(config), 'incar_path': str(config_incar),
+                     'incar_sha256': _sha256_file(config_incar)}],
+    }
+
+    out = api.proj_prepare_lis(
+        'per-member', str(slab),
+        [{'path': str(config), 'species': 'Li2S8',
+          'incar_path': str(config_incar), 'incar_sha256': _sha256_file(config_incar)}],
+        '', str(tmp_path / 'out'), reference_path,
+        {'confirmed': True, 'reason': '逐成员只调整 NSW/IBRION；硬方法已核对一致'},
+        evidence)
+
+    assert out['ok'] is True
+    assert calls['member_incars'] == {
+        str(slab.resolve()): str(clean_incar.resolve()),
+        str(config.resolve()): str(config_incar.resolve()),
+    }
+    assert calls['member_source_evidence'] == {
+        str(slab.resolve()): {
+            'poscar': {'path': str(slab.resolve()), 'sha256': _sha256_file(slab)},
+            'incar': {'path': str(clean_incar.resolve()),
+                      'sha256': _sha256_file(clean_incar)},
+        },
+        str(config.resolve()): {
+            'poscar': {'path': str(config.resolve()), 'sha256': _sha256_file(config)},
+            'incar': {'path': str(config_incar.resolve()),
+                      'sha256': _sha256_file(config_incar)},
+        },
+    }
+    prepared_members = calls['preparation']['inputs']['members']
+    assert [row['incar']['sha256'] for row in prepared_members] == [
+        _sha256_file(clean_incar), _sha256_file(config_incar)]
+    assert calls['preparation']['schema'] == 2
+    assert not out['method_check']['issues']
+
+
+def test_proj_prepare_lis_blocks_clean_config_ispin_mismatch_before_generation(tmp_path):
+    clean_dir = tmp_path / 'clean'
+    config_dir = tmp_path / 'Li2S8_top'
+    clean_dir.mkdir()
+    config_dir.mkdir()
+    slab, config = clean_dir / 'POSCAR', config_dir / 'POSCAR'
+    header = '1.0\n10 0 0\n0 10 0\n0 0 20\n'
+    slab.write_text('slab\n' + header + 'C\n1\nDirect\n0 0 0\n', encoding='utf-8')
+    config.write_text(
+        'ads\n' + header + 'C Li S\n1 2 8\nDirect\n' + '0 0 0\n' * 11,
+        encoding='utf-8')
+    clean_incar, config_incar = clean_dir / 'INCAR', config_dir / 'INCAR'
+    base = 'ENCUT=400\nGGA=RP\nIVDW=0\nLDAU=F\nMETAGGA=F\nLHFCALC=F\nNSW=40\n'
+    clean_incar.write_text(base + 'ISPIN=1\n', encoding='utf-8')
+    config_incar.write_text(base + 'ISPIN=2\n', encoding='utf-8')
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config())
+
+    out = api.proj_prepare_lis(
+        'spin-mismatch', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        '', str(tmp_path / 'out'), reference_path,
+        {'confirmed': True, 'reason': '不应覆盖周期体系自旋硬冲突'})
+
+    assert out['ok'] is False
+    assert out['method_check']['status'] == 'incompatible'
+    assert any('clean slab' in issue and 'ISPIN' in issue
+               for issue in out['method_check']['issues'])
+    assert not calls
+
+
 def test_proj_prepare_lis_blocks_reference_encut_different_from_auto_effective(tmp_path):
     slab, config, incar = (tmp_path / name for name in
                            ('slab.vasp', 'Li2S8_top.vasp', 'INCAR'))

@@ -333,6 +333,71 @@ def test_scan_structure_without_shared_incar_is_actionable_blocked(tmp_path):
     assert item['missing'] == ['INCAR', 'KPOINTS', 'POTCAR']
 
 
+def test_scan_local_incar_symlink_is_blocked_even_with_shared_fallback(tmp_path):
+    source = tmp_path / 'structure'
+    _write(str(source / 'POSCAR'), POSCAR_FE)
+    target = _write(str(tmp_path / 'target' / 'INCAR'), 'ENCUT=450\n')
+    shared = _write(str(tmp_path / 'shared' / 'INCAR'), 'ENCUT=500\n')
+    try:
+        os.symlink(target, source / 'INCAR')
+    except (OSError, NotImplementedError):
+        pytest.skip('当前文件系统不支持文件符号链接')
+
+    out = quick_submit.scan_inputs([str(source)], shared_incar=shared)
+
+    item = out['items'][0]
+    assert item['status'] == 'invalid' and item['can_build'] is False
+    assert '符号链接' in item['message']
+
+
+@pytest.mark.parametrize('text,expected', [
+    ('# comments only\n', 'KEY=VALUE'),
+    ('ENCUT=abc\n', 'ENCUT'),
+    ('ENCUT=500\nISPIN=3\n', 'ISPIN'),
+    ('ENCUT=500\nNSW=ten\n', 'NSW'),
+])
+def test_scan_invalid_local_incar_is_not_masked_by_shared(tmp_path, text, expected):
+    source = tmp_path / expected
+    _write(str(source / 'POSCAR'), POSCAR_FE)
+    _write(str(source / 'INCAR'), text)
+    shared = _write(str(tmp_path / 'shared' / 'INCAR'), 'ENCUT=500\nISPIN=2\n')
+
+    item = quick_submit.scan_inputs([str(source)], shared_incar=shared)['items'][0]
+
+    assert item['status'] == 'invalid' and item['can_build'] is False
+    assert expected in item['message']
+
+
+def test_scan_structure_with_local_incar_is_generatable_without_shared(tmp_path):
+    source = tmp_path / 'structure'
+    _write(str(source / 'POSCAR'), POSCAR_FE)
+    local = _write(str(source / 'INCAR'), 'NSW=8\nIBRION=2\n')
+
+    out = quick_submit.scan_inputs([str(source)])
+
+    item = out['items'][0]
+    assert item['status'] == 'generatable' and item['can_build'] is True
+    assert item['source_incar'] == local
+    assert item['source_incar_origin'] == 'local'
+    assert item['missing'] == ['KPOINTS', 'POTCAR']
+    assert '本目录 INCAR' in item['message']
+
+
+def test_scan_ambiguous_local_incars_does_not_fall_back_to_shared(tmp_path):
+    source = tmp_path / 'structure'
+    _write(str(source / 'POSCAR'), POSCAR_FE)
+    _write(str(source / 'INCAR'), 'NSW=8\n')
+    _write(str(source / 'incar'), 'NSW=0\n')
+    shared = _write(str(tmp_path / 'shared' / 'INCAR'), 'NSW=0\n')
+
+    out = quick_submit.scan_inputs([str(source)], shared_incar=shared)
+
+    item = out['items'][0]
+    assert item['status'] == 'invalid' and item['can_build'] is False
+    assert item['source_incar'] == '' and item['source_incar_origin'] == ''
+    assert '多个可读 INCAR' in item['message']
+
+
 def test_scan_does_not_count_shared_incar_parent_as_a_job(tmp_path):
     root = tmp_path / 'batch'
     shared = _write(str(root / 'INCAR'), 'ENCUT=500\n')
@@ -368,6 +433,34 @@ def test_build_structure_with_shared_incar_generates_quartet_without_touching_so
     assert manifest['task_type'] == 'static'
     assert manifest['inputs']['quick_submit_mode'] == 'generate'
     assert manifest['inputs']['source_structure'] == poscar
+    assert manifest['inputs']['source_incar'] == shared
+    assert manifest['inputs']['source_incar_origin'] == 'shared'
+    assert manifest['inputs']['shared_incar'] == shared
+
+
+def test_build_local_incar_wins_over_shared_and_is_recorded(tmp_path):
+    source = tmp_path / 'source' / 'fe'
+    _write(str(source / 'POSCAR'), POSCAR_FE)
+    local = _write(
+        str(source / 'INCAR'), 'SYSTEM=local-member\nENCUT=400\nNSW=8\nIBRION=2\n')
+    shared = _write(
+        str(tmp_path / 'shared' / 'INCAR'), 'SYSTEM=shared-template\nENCUT=400\nNSW=0\n')
+    lib = _potlib(tmp_path / 'potpaw')
+
+    out = quick_submit.build_quick_jobs(
+        [str(source)], str(tmp_path / 'jobs'), shared_incar=shared, lib_root=lib)
+
+    assert out['ok'] is True and not out['skipped']
+    job = out['jobs'][0]
+    incar_out = Path(job['dir'], 'INCAR').read_text(encoding='utf-8')
+    assert 'SYSTEM=local-member' in incar_out
+    assert 'SYSTEM=shared-template' not in incar_out
+    manifest = manifest_mod.load_manifest(job['dir'])
+    assert manifest['task_type'] == 'relax'
+    assert manifest['inputs']['source_incar'] == local
+    assert manifest['inputs']['source_incar_origin'] == 'local'
+    assert manifest['inputs']['source_incar_sha256'] == manifest_mod.sha256_file(local)
+    assert 'shared_incar' not in manifest['inputs']
 
 
 def test_generated_batch_uses_one_group_encut(tmp_path):

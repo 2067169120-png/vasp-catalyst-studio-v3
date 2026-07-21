@@ -150,6 +150,43 @@ def test_preflight_catches_problems(tmp_path):
     assert any('缺 INCAR' in e for e in submitter.preflight(_profile(), str(empty)))
 
 
+@pytest.mark.parametrize('filename', ('INCAR', 'POSCAR', 'KPOINTS', 'POTCAR'))
+def test_preflight_rejects_managed_vasp_input_changed_after_preparation(
+        tmp_path, filename):
+    job_dir = _job_dir(tmp_path)
+    with open(os.path.join(job_dir, filename), 'a', encoding='utf-8') as handle:
+        handle.write('\n# changed after preparation\n')
+
+    errors = submitter.preflight(_profile(), job_dir)
+
+    assert any(filename in error and 'SHA256' in error and '重新准备' in error
+               for error in errors)
+
+
+def test_submit_hash_mismatch_stops_before_any_remote_operation(tmp_path):
+    job_dir = _job_dir(tmp_path)
+    with open(os.path.join(job_dir, 'INCAR'), 'a', encoding='utf-8') as handle:
+        handle.write('\nNSW = 999\n')
+    client, sftp = FakeClient(), FakeSFTP()
+
+    with pytest.raises(ValueError, match='INCAR.*SHA256.*重新准备'):
+        submitter.submit_job(client, sftp, _profile(), job_dir)
+
+    assert client.commands == []
+    assert sftp.uploaded == {} and sftp.written == {}
+
+
+def test_preflight_keeps_legacy_manifest_without_input_hashes_compatible(tmp_path):
+    job_dir = _job_dir(tmp_path)
+    item = manifest.load_manifest(job_dir)
+    item['inputs'].pop('sha256', None)
+    manifest.save_manifest(job_dir, item)
+    with open(os.path.join(job_dir, 'INCAR'), 'a', encoding='utf-8') as handle:
+        handle.write('\n# legacy manifest has no immutable hash evidence\n')
+
+    assert submitter.preflight(_profile(), job_dir) == []
+
+
 def test_preflight_potcar_titel_gate(tmp_path):
     """原版防线移植:POTCAR TITEL 段数 ≠ 物种数(截断/手改)→ 拒绝提交。"""
     d = _job_dir(tmp_path)
@@ -187,6 +224,35 @@ def test_submit_job_happy_path_pbs(tmp_path):
     assert m['attempts'][0]['job_id'] == '8812345'
     assert m['attempts'][0]['cores'] == 12                     # v3.3.0 记核数(nodes×ppn)供实耗核时
     assert manifest.load_manifest(d)['state'] == 'SUBMITTED'   # 已落盘
+
+
+def test_batch_members_upload_their_own_distinct_incars(tmp_path):
+    """同组成员的上传源必须是各自受管目录，不能回退到首个/共享 INCAR。"""
+    first = _job_dir(tmp_path / 'first')
+    second = _job_dir(tmp_path / 'second')
+    first_text = 'ENCUT = 400\nISPIN = 2\nNSW = 40\nMAGMOM = 1*0.0\n'
+    second_text = 'ENCUT = 400\nISPIN = 2\nNSW = 120\nMAGMOM = 1*2.0\n'
+    for job_dir, text in ((first, first_text), (second, second_text)):
+        incar = os.path.join(job_dir, 'INCAR')
+        with open(incar, 'w', encoding='utf-8') as handle:
+            handle.write(text)
+        item = manifest.load_manifest(job_dir)
+        item.setdefault('inputs', {}).setdefault('sha256', {})['INCAR'] = \
+            manifest.sha256_file(incar)
+        manifest.save_manifest(job_dir, item)
+
+    sftp = FakeSFTP()
+    first_manifest = submitter.submit_job(
+        FakeClient(script=[('qsub', '101.cluster\n')]), sftp, _profile(), first)
+    second_manifest = submitter.submit_job(
+        FakeClient(script=[('qsub', '102.cluster\n')]), sftp, _profile(), second)
+
+    first_upload = sftp.uploaded[posixpath.join(first_manifest['remote_dir'], 'INCAR')]
+    second_upload = sftp.uploaded[posixpath.join(second_manifest['remote_dir'], 'INCAR')]
+    assert first_upload == os.path.join(first, 'INCAR')
+    assert second_upload == os.path.join(second, 'INCAR')
+    assert open(first_upload, encoding='utf-8').read() == first_text
+    assert open(second_upload, encoding='utf-8').read() == second_text
 
 
 def test_submit_refuses_any_existing_remote_identity_or_non_created_state(tmp_path):
@@ -269,6 +335,11 @@ def test_vasp_icharg_hard_input_is_required_independent_of_task_name(tmp_path):
     d = _job_dir(tmp_path)
     with open(os.path.join(d, 'INCAR'), 'a', encoding='utf-8') as handle:
         handle.write('ICHARG = 11\n')
+    # This fixture intentionally constructs a newly prepared ICHARG=11 job;
+    # keep its immutable-input evidence in sync before testing CHGCAR gating.
+    item = manifest.load_manifest(d)
+    item['inputs']['sha256']['INCAR'] = manifest.sha256_file(os.path.join(d, 'INCAR'))
+    manifest.save_manifest(d, item)
     errs = submitter.preflight(_profile(), d)
     assert any('CHGCAR' in issue and 'ICHARG=11' in issue for issue in errs)
 

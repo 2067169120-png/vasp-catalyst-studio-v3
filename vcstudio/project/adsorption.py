@@ -216,12 +216,143 @@ def scan_structure_files(root: str | os.PathLike) -> list[dict]:
     return found
 
 
-def scan_lis_input_bundle(root: str | os.PathLike, reference_species=None) -> dict:
-    """只读扫描一整套 Li-S 吸附输入，自动分出共享 INCAR/slab/config。
+def _inspect_incar_file(path, *, source: str) -> dict:
+    """Read-only validation/provenance for one explicitly selected INCAR."""
+    raw_path = str(path or '').strip()
+    requested = Path(raw_path).expanduser() if raw_path else None
+    resolved = str(requested.absolute()) if requested is not None else ''
+    issues: list[str] = []
+    digest = ''
+    status = 'ready'
+    selected = requested
+    if selected is None:
+        status = 'missing'
+        issues.append(f'INCAR 不存在：{resolved}' if resolved else '同目录缺少 INCAR')
+    elif selected.is_symlink():
+        status = 'invalid'
+        issues.append('INCAR 不能是符号链接')
+    elif not selected.exists():
+        status = 'missing'
+        issues.append(f'INCAR 不存在：{resolved}')
+    elif not selected.is_file():
+        status = 'invalid'
+        issues.append(f'INCAR 不是普通文件：{resolved}')
+    else:
+        selected = selected.resolve()
+        resolved = str(selected)
+        try:
+            text = selected.read_text(encoding='utf-8', errors='replace')
+            digest = manifest_mod.sha256_file(selected)
+        except OSError as exc:
+            status = 'invalid'
+            issues.append(f'INCAR 无法读取：{exc}')
+            text = ''
+        if status == 'ready':
+            if not text.strip():
+                status = 'invalid'
+                issues.append('INCAR 为空')
+            parsed = parse_incar(text)
+            if not parsed:
+                status = 'invalid'
+                issues.append('INCAR 未解析到任何 KEY=VALUE 参数')
+            if parsed:
+                def _number(value):
+                    if isinstance(value, bool):
+                        return None
+                    try:
+                        number = float(value)
+                    except (TypeError, ValueError):
+                        return None
+                    return number if math.isfinite(number) else None
 
-    只有唯一且命名明确的候选才自动填入；多个 INCAR 或多个 clean/slab 候选
-    必须由用户确认。带 ``Li2Sx``/``S8`` 物种提示的目录不会因名字含 ``slab``
-    被误判为清洁表面。
+                def _integer(value):
+                    number = _number(value)
+                    return int(number) if number is not None and number == int(number) else None
+
+                if 'ENCUT' in parsed:
+                    encut = _number(parsed.get('ENCUT'))
+                    if encut is None or encut <= 0:
+                        status = 'invalid'
+                        issues.append(f'ENCUT={parsed.get("ENCUT")!r} 不是正数')
+                if 'ISPIN' in parsed and _integer(parsed.get('ISPIN')) not in {1, 2}:
+                    status = 'invalid'
+                    issues.append(f'ISPIN={parsed.get("ISPIN")!r} 无效（仅允许 1 或 2）')
+                for key in ('NSW', 'IBRION', 'NELM', 'ISIF'):
+                    if key in parsed and _integer(parsed.get(key)) is None:
+                        status = 'invalid'
+                        issues.append(f'{key}={parsed.get(key)!r} 必须是整数')
+    return {
+        'path': resolved, 'incar_path': resolved,
+        'sha256': digest, 'incar_sha256': digest,
+        'status': status, 'incar_status': status,
+        'source': source,
+        'issues': issues, 'incar_issues': list(issues),
+    }
+
+
+def resolve_structure_incar(structure_path, fallback='') -> dict:
+    """Resolve the INCAR belonging to one structure without guessing across folders.
+
+    A unique, case-insensitive ``INCAR`` in the structure's own directory always
+    wins.  An explicitly supplied fallback is considered only when that directory
+    contains no INCAR at all; it never masks an empty/invalid file or a case-name
+    conflict.  The returned path/hash pair lets callers detect scan-to-build races.
+    """
+    raw_structure = str(structure_path or '').strip()
+    if not raw_structure:
+        return {
+            'path': '', 'incar_path': '', 'sha256': '', 'incar_sha256': '',
+            'status': 'invalid', 'incar_status': 'invalid', 'source': '',
+            'issues': ['结构文件路径为空'], 'incar_issues': ['结构文件路径为空'],
+        }
+    structure = Path(raw_structure).expanduser().resolve()
+    if not structure.is_file():
+        issue = f'结构文件不存在：{structure}'
+        return {
+            'path': '', 'incar_path': '', 'sha256': '', 'incar_sha256': '',
+            'status': 'invalid', 'incar_status': 'invalid', 'source': '',
+            'issues': [issue], 'incar_issues': [issue],
+        }
+    try:
+        candidates = sorted(
+            (item for item in structure.parent.iterdir()
+             if item.name.casefold() == 'incar'),
+            key=lambda item: item.name.casefold(),
+        )
+    except OSError as exc:
+        issue = f'无法读取结构目录 {structure.parent}：{exc}'
+        return {
+            'path': '', 'incar_path': '', 'sha256': '', 'incar_sha256': '',
+            'status': 'invalid', 'incar_status': 'invalid', 'source': 'same_directory',
+            'issues': [issue], 'incar_issues': [issue],
+        }
+    if len(candidates) > 1:
+        names = '、'.join(item.name for item in candidates)
+        issue = f'同目录存在多个大小写不同的 INCAR（{names}），无法安全选择'
+        return {
+            'path': '', 'incar_path': '', 'sha256': '', 'incar_sha256': '',
+            'status': 'ambiguous', 'incar_status': 'ambiguous',
+            'source': 'same_directory', 'issues': [issue], 'incar_issues': [issue],
+        }
+    if candidates:
+        return _inspect_incar_file(candidates[0], source='same_directory')
+    if str(fallback or '').strip():
+        return _inspect_incar_file(fallback, source='explicit_fallback')
+    issue = f'{structure.parent} 同目录缺少 INCAR'
+    return {
+        'path': '', 'incar_path': '', 'sha256': '', 'incar_sha256': '',
+        'status': 'missing', 'incar_status': 'missing', 'source': 'same_directory',
+        'issues': [issue], 'incar_issues': [issue],
+    }
+
+
+def scan_lis_input_bundle(root: str | os.PathLike, reference_species=None) -> dict:
+    """只读扫描一整套 Li-S 吸附输入，绑定逐目录 INCAR/slab/config。
+
+    每个结构只绑定自己目录内唯一的 INCAR；不同目录各有 INCAR 是正常情况，
+    不再被当作全局歧义。只有同一目录出现大小写冲突、INCAR 空/无键，或结构
+    缺少 INCAR 时才标出问题。带 ``Li2Sx``/``S8`` 物种提示的目录不会因名字
+    含 ``slab`` 被误判为清洁表面。
     """
     base = Path(root).expanduser()
     if not base.is_dir():
@@ -230,6 +361,15 @@ def scan_lis_input_bundle(root: str | os.PathLike, reference_species=None) -> di
         raise ValueError('本次计算文件夹不能是符号链接')
     base = base.resolve()
     structures = scan_structure_files(base)
+    for item in structures:
+        resolution = resolve_structure_incar(item['path'])
+        item.update({
+            'incar_path': resolution['path'],
+            'incar_sha256': resolution['sha256'],
+            'incar_status': resolution['status'],
+            'incar_issues': list(resolution['issues']),
+            'incar_source': resolution['source'],
+        })
 
     incar_candidates = []
     for current, dirnames, filenames in os.walk(base, followlinks=False):
@@ -290,11 +430,16 @@ def scan_lis_input_bundle(root: str | os.PathLike, reference_species=None) -> di
             item['species_confirmed'] = bool(assignment['confirmed'])
             item['adsorbate_composition'] = assignment['composition']
 
+    root_incars = [path for path in incar_candidates if Path(path).parent == base]
+    root_incar = ''
+    if len(root_incars) == 1:
+        root_resolution = _inspect_incar_file(root_incars[0], source='explicit_fallback')
+        if root_resolution['status'] == 'ready':
+            root_incar = root_resolution['path']
+
     warnings = []
-    if not incar_candidates:
-        warnings.append('未找到固定 INCAR；请使用“选择 INCAR”补充')
-    elif len(incar_candidates) > 1:
-        warnings.append(f'找到 {len(incar_candidates)} 个 INCAR；为避免用错，请手动选择整组固定 INCAR')
+    if len(root_incars) > 1:
+        warnings.append('输入根目录存在多个大小写不同的 INCAR；不能作为显式共享后备')
     if not structures:
         warnings.append('未找到 POSCAR / CONTCAR / .vasp 结构文件')
     elif not clean_candidates:
@@ -310,11 +455,28 @@ def scan_lis_input_bundle(root: str | os.PathLike, reference_species=None) -> di
         warnings.extend(
             f'{Path(item["path"]).parent.name or Path(item["path"]).name}: {message}'
             for message in ((item.get('assignment') or {}).get('warnings') or []))
+    for item in structures:
+        if item.get('incar_status') != 'ready':
+            label = Path(item['path']).parent.name or Path(item['path']).name
+            warnings.extend(f'{label}: {message}' for message in item.get('incar_issues') or [])
+    clean_item = next((item for item in structures if item['path'] == clean_slab), None)
+    clean_incar = (clean_item or {}).get('incar_path', '')
+    clean_incar_sha256 = (clean_item or {}).get('incar_sha256', '')
+    clean_incar_status = (clean_item or {}).get('incar_status', 'missing')
+    clean_incar_issues = list((clean_item or {}).get('incar_issues') or [])
+    clean_incar_source = (clean_item or {}).get('incar_source', '')
     return {
         'root': str(base),
-        'incar': incar_candidates[0] if len(incar_candidates) == 1 else '',
+        # Legacy shared-INCAR field now means only a unique root-level, explicit
+        # fallback.  Per-member fields below are the authoritative binding.
+        'incar': root_incar,
         'incar_candidates': incar_candidates,
         'clean_slab': clean_slab,
+        'clean_incar': clean_incar,
+        'clean_incar_sha256': clean_incar_sha256,
+        'clean_incar_status': clean_incar_status,
+        'clean_incar_issues': clean_incar_issues,
+        'clean_incar_source': clean_incar_source,
         'clean_candidates': clean_candidates,
         'clean_inference': clean_inference,
         'configs': configs,
@@ -359,21 +521,50 @@ def identify_config_species(clean_slab, structures, reference_species=None) -> d
 
 
 # ── 项目创建(批量生成) ───────────────────────────────────────────────────────
-def _unified_encut(incar_path, poscars: list, lib_root) -> int | None:
-    """项目内各成员元素并集 → 统一 ENCUT(eV);算不出或用户已给 ENCUT → None。
+def _unified_encut(incar_paths, poscars: list, lib_root) -> int | None:
+    """Resolve a safe group ENCUT from the actual per-member INCAR files.
 
-    保吸附能 ΔE=E(slab+ads)−E(slab)−E(ref) 三个作业基组一致(缺口分析:此前各成员
-    按自身元素补 ENCUT 会得不同截断能,静默污染 ΔE)。best-effort:任一步失败即回落
-    逐成员(旧行为),绝不因统一逻辑拖垮生成。
+    All members lacking ENCUT get one value from the union of their elements.
+    If some members explicitly use one common ENCUT, missing members inherit it.
+    Different explicit values are never overwritten or silently mixed.
     """
-    # 用户显式给了 ENCUT → 尊重,不统一(共享 INCAR 本就一致)
-    try:
-        with open(incar_path, 'r', encoding='utf-8', errors='replace') as f:
-            incar = parse_incar(f.read())
-        if 'ENCUT' in {str(k).upper() for k in incar}:
+    paths = [incar_paths] if isinstance(incar_paths, (str, os.PathLike)) \
+        else list(incar_paths or [])
+    explicit: list[tuple[str, float]] = []
+    missing = 0
+    for path in paths:
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as handle:
+                incar = parse_incar(handle.read())
+        except OSError as exc:
+            raise ValueError(f'无法读取成员 INCAR {path}：{exc}') from exc
+        if 'ENCUT' not in incar:
+            missing += 1
+            continue
+        raw = incar.get('ENCUT')
+        try:
+            if isinstance(raw, bool):
+                raise ValueError
+            value = float(raw)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f'成员 INCAR {path} 的 ENCUT={raw!r} 不是正数') from exc
+        explicit.append((str(Path(path).resolve()), value))
+    if explicit:
+        baseline = explicit[0][1]
+        conflicts = [(path, value) for path, value in explicit
+                     if abs(value - baseline) > 1e-9]
+        if conflicts:
+            details = '；'.join(f'{path}={value:g}' for path, value in explicit)
+            raise ValueError(f'各成员 INCAR 的 ENCUT 不一致，不能安全生成吸附能组：{details}')
+        if not missing:
             return None
-    except (OSError, ValueError):
-        return None
+        if baseline != int(baseline):
+            raise ValueError(
+                f'部分成员缺 ENCUT，但其余成员使用非整数 ENCUT={baseline:g}；'
+                '请在每个成员 INCAR 中显式写入同一值')
+        return int(baseline)
     union: set = set()
     for p in poscars:
         try:
@@ -392,7 +583,7 @@ def _unified_encut(incar_path, poscars: list, lib_root) -> int | None:
 
 def create_project(root: str | os.PathLike, name: str, *,
                    clean_poscar: str, config_poscars: list,
-                   incar_path: str, ref_poscar: str | None = None,
+                   incar_path: str = '', ref_poscar: str | None = None,
                    lib_root: str | None = None, validate: bool = True,
                    kpoints=None, config_species: dict | None = None,
                    config_species_evidence: dict | None = None,
@@ -401,7 +592,9 @@ def create_project(root: str | os.PathLike, name: str, *,
                    molecules_dir: str | None = None,
                    reference_project: str | None = None,
                    preparation: dict | None = None,
-                   fail_if_exists: bool = False) -> dict:
+                   fail_if_exists: bool = False,
+                   member_incars: dict | None = None,
+                   member_source_evidence: dict | None = None) -> dict:
     """批量生成 清洁表面 + 构型族 + (可选)气相参考,写 project.yaml 并登记台账。
 
     Returns:
@@ -416,6 +609,106 @@ def create_project(root: str | os.PathLike, name: str, *,
     for label in dict(species_refs or {}):
         reference_labels.setdefault(label, None)
     structure_identity.build_dataset_groups([], {}, reference_labels)
+
+    def _source_key(path) -> str:
+        return os.path.normcase(os.path.realpath(os.path.abspath(
+            os.path.expanduser(os.fspath(path)))))
+
+    mapped_incars = {}
+    for source, selected in dict(member_incars or {}).items():
+        if isinstance(selected, dict):
+            selected = selected.get('path') or selected.get('incar_path') or ''
+        mapped_incars[_source_key(source)] = str(selected or '').strip()
+
+    mapped_source_evidence = {}
+    for source, evidence in dict(member_source_evidence or {}).items():
+        if not isinstance(evidence, dict):
+            raise ValueError(f'成员 {source} 的源文件哈希证据格式无效')
+        mapped_source_evidence[_source_key(source)] = dict(evidence)
+
+    def _source_evidence_part(evidence, kind):
+        nested = evidence.get(kind)
+        if isinstance(nested, dict):
+            return (str(nested.get('path') or '').strip(),
+                    str(nested.get('sha256') or '').strip().lower())
+        return (str(evidence.get(f'{kind}_path') or '').strip(),
+                str(evidence.get(f'{kind}_sha256') or '').strip().lower())
+
+    def _verify_member_sources(label, poscar, source_incar, phase):
+        """Bind method evidence to unchanged source bytes across job generation."""
+        evidence = mapped_source_evidence.get(_source_key(poscar))
+        if evidence is None:
+            return
+        for kind, display, actual_path in (
+                ('poscar', 'POSCAR', poscar), ('incar', 'INCAR', source_incar)):
+            expected_path, expected_hash = _source_evidence_part(evidence, kind)
+            if not re.fullmatch(r'[0-9a-f]{64}', expected_hash):
+                raise ValueError(
+                    f'{label} 的源 {display} 缺少有效 SHA256 证据；'
+                    '请重新扫描并准备整组作业')
+            if expected_path and _source_key(expected_path) != _source_key(actual_path):
+                raise ValueError(
+                    f'{label} 的源 {display} 路径在扫描后已变化；'
+                    '请重新扫描并准备整组作业')
+            try:
+                actual_hash = manifest_mod.sha256_file(actual_path).lower()
+            except OSError as exc:
+                raise ValueError(
+                    f'{label} 的源 {display} 在{phase}无法读取：{exc}；'
+                    '请重新扫描并准备整组作业') from exc
+            if actual_hash != expected_hash:
+                raise ValueError(
+                    f'{label} 的源 {display} 在扫描后内容已变化'
+                    f'（{phase}哈希不一致）；请重新扫描并准备整组作业')
+
+    planned = [('clean slab', clean_poscar)]
+    planned.extend((f'构型 {Path(path).parent.name or Path(path).name}', path)
+                   for path in config_poscars)
+    if ref_poscar:
+        planned.append(('气相参考', ref_poscar))
+    member_resolutions = {}
+    for label, poscar in planned:
+        key = _source_key(poscar)
+        selected = mapped_incars.get(key, '')
+        if selected:
+            resolution = _inspect_incar_file(selected, source='member_mapping')
+        else:
+            resolution = resolve_structure_incar(poscar, fallback=incar_path)
+        member_resolutions[key] = resolution
+    clean_resolution = member_resolutions[_source_key(clean_poscar)]
+    if clean_resolution.get('status') != 'ready':
+        details = '；'.join(clean_resolution.get('issues') or ['没有可用的 INCAR'])
+        raise ValueError(f'clean slab 的 INCAR 不可用：{details}')
+    if fail_if_exists:
+        invalid = [
+            f'{label}: {"；".join(member_resolutions[_source_key(poscar)].get("issues") or [])}'
+            for label, poscar in planned
+            if member_resolutions[_source_key(poscar)].get('status') != 'ready'
+        ]
+        if invalid:
+            raise ValueError('整组成员 INCAR 未完整，未发布任何项目：' + '；'.join(invalid))
+
+    # Validate the scan evidence before any output/staging directory is made.
+    # The same bytes are checked again immediately before and after each build
+    # so a source editor/synchroniser cannot race the method gate and copying.
+    for label, poscar in planned:
+        resolution = member_resolutions[_source_key(poscar)]
+        if resolution.get('status') == 'ready':
+            _verify_member_sources(
+                label, poscar, resolution['path'], '生成前')
+
+    # Resolve the group ENCUT before creating either the final target or its
+    # atomic staging directory.  A method conflict must leave no filesystem
+    # artefact behind.
+    valid_planned = [
+        (poscar, member_resolutions[_source_key(poscar)]['path'])
+        for _label, poscar in planned
+        if member_resolutions[_source_key(poscar)].get('status') == 'ready'
+    ]
+    force_encut = _unified_encut(
+        [incar for _poscar, incar in valid_planned],
+        [poscar for poscar, _incar in valid_planned], lib_root,
+    ) if validate else None
 
     final_root = Path(root).expanduser().resolve()
     stage_root = None
@@ -433,16 +726,20 @@ def create_project(root: str | os.PathLike, name: str, *,
 
     # 项目级统一 ENCUT:各成员元素并集算一个 ENCUT,防 ΔE 大数相减被不同基组污染。
     # 仅当用户 INCAR 未显式给 ENCUT 时生效(用户值永远尊重);算不出则回落逐成员(旧行为)。
-    all_poscars = [clean_poscar, *config_poscars] + ([ref_poscar] if ref_poscar else [])
-    force_encut = _unified_encut(incar_path, all_poscars, lib_root) if validate else None
-
     def _gen(member: str, poscar: str, calc_type: str):
+        resolution = member_resolutions[_source_key(poscar)]
+        if resolution.get('status') != 'ready':
+            details = '；'.join(resolution.get('issues') or ['没有可用的 INCAR'])
+            raise ValueError(f'{poscar} 的 INCAR 不可用：{details}')
+        source_incar = resolution['path']
         out = root / member
-        res = build_job_dir(poscar, incar_path, str(out), calc_type=calc_type,
+        _verify_member_sources(member, poscar, source_incar, '复制前')
+        res = build_job_dir(poscar, source_incar, str(out), calc_type=calc_type,
                             kpoints=kpoints, validate=validate, lib_root=lib_root,
                             force_encut=force_encut)
+        _verify_member_sources(member, poscar, source_incar, '复制后')
         manifest_mod.create_from_build(str(out), res, poscar_path=poscar,
-                                       validate=validate)
+                                       incar_path=source_incar, validate=validate)
         if stage_root is None:
             ledger.register(str(out))
         generated.append((member, str(out), res['warnings']))
@@ -557,7 +854,8 @@ def create_project(root: str | os.PathLike, name: str, *,
                     job_manifest.setdefault('inputs', {})['remote_namespace'] = namespace
                     manifest_mod.save_manifest(job_dir, job_manifest)
         save_project(root, project)
-        advisories = _project_advisories(incar_path, [str(root / Path(d).name) for d in config_dirs],
+        advisories = _project_advisories(clean_resolution['path'],
+                                         [str(root / Path(d).name) for d in config_dirs],
                                          ref_poscar, generated, lib_root)
         if stage_root is not None:
             os.replace(stage_root, final_root)

@@ -310,7 +310,8 @@ def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
         '本项目由外部已算结果导入，软件不默认其 INCAR/ENCUT/K 点一致；'
         '请以上方参数与赝势表为准，对缺失的复现信息做人工稽核。'
         if proj.get('import_source') else
-        '项目内各作业 ENCUT 统一(生成时按元素并集取一致截断能，保 ΔE 各成员基组一致)。')
+        '各成员使用其受管作业目录内的真实 INCAR；运行控制参数可按成员设置，'
+        'ΔE 只在 ENCUT、泛函、色散、DFT+U、自旋与赝势等方法门禁通过后给出。')
     method_check = delta.get('method_consistency') or {}
     if method_check.get('status') == 'verified':
         method_audit_line = '本次 ΔE 各直接能量项的方法指纹已通过一致性核验。'

@@ -125,6 +125,63 @@ def _vasp_structure(path: str) -> str | None:
     return None
 
 
+def _local_incar(path: str) -> tuple[str | None, str]:
+    """计算目录 -> (唯一可读 INCAR, 问题说明)。
+
+    文件名按大小写不敏感匹配，兼容从不同平台复制来的 ``incar``。存在多个可读
+    候选时不猜；存在候选但均不可读时也不回退共享 INCAR，避免一个坏的本地输入
+    被静默替换。只有目录中完全没有 INCAR 候选才允许调用方使用显式 shared。
+    """
+    try:
+        names = sorted(os.listdir(path), key=str.casefold)
+    except OSError as exc:
+        return None, f'无法读取计算目录以查找 INCAR:{exc}'
+    candidates = [os.path.join(path, name) for name in names
+                  if name.casefold() == 'incar']
+    if not candidates:
+        return None, ''
+    if len(candidates) > 1:
+        return None, ('本目录存在多个可读 INCAR（大小写冲突：' + '、'.join(
+            os.path.basename(candidate) for candidate in candidates) + '），无法安全选择')
+    candidate = candidates[0]
+    if os.path.islink(candidate):
+        return None, '本目录 INCAR 不能是符号链接'
+    if not os.path.isfile(candidate):
+        return None, '本目录 INCAR 不是普通文件'
+    try:
+        with open(candidate, 'r', encoding='utf-8', errors='replace') as handle:
+            text = handle.read()
+    except OSError as exc:
+        return None, f'本目录 INCAR 不可读：{exc}'
+    parsed = parse_incar(text)
+    if not parsed:
+        return None, '本目录 INCAR 未解析到任何 KEY=VALUE 参数'
+
+    def _number(value):
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    def _integer(value):
+        number = _number(value)
+        return int(number) if number is not None and number == int(number) else None
+
+    if 'ENCUT' in parsed:
+        encut = _number(parsed.get('ENCUT'))
+        if encut is None or encut <= 0:
+            return None, f'本目录 INCAR 的 ENCUT={parsed.get("ENCUT")!r} 不是正数'
+    if 'ISPIN' in parsed and _integer(parsed.get('ISPIN')) not in {1, 2}:
+        return None, f'本目录 INCAR 的 ISPIN={parsed.get("ISPIN")!r} 无效（仅允许 1 或 2）'
+    for key in ('NSW', 'IBRION', 'NELM', 'ISIF'):
+        if key in parsed and _integer(parsed.get(key)) is None:
+            return None, f'本目录 INCAR 的 {key}={parsed.get(key)!r} 必须是整数'
+    return os.path.abspath(candidate), ''
+
+
 def _is_vasp_candidate(path: str) -> bool:
     """是否为计算目录，而不是仅存放共享 INCAR 的批次根目录。
 
@@ -141,10 +198,17 @@ def _is_vasp_candidate(path: str) -> bool:
 def _scan_vasp_item(path: str, shared_incar: str | None) -> dict:
     """单个 VASP 候选目录 -> UI 可直接呈现的预检项。"""
     structure = _vasp_structure(path)
+    local_incar, local_incar_issue = _local_incar(path)
+    effective_incar = local_incar or (shared_incar if not local_incar_issue else None)
+    incar_origin = ('local' if local_incar else
+                    ('shared' if effective_incar is not None else ''))
     present = [name for name in _VASP_INPUTS
                if os.path.isfile(os.path.join(path, name))]
     missing = [name for name in _VASP_INPUTS if name not in present]
-    if not missing:
+    if local_incar_issue:
+        status, mode = 'invalid', 'blocked'
+        message = local_incar_issue
+    elif not missing:
         from vcstudio.project.result_import import validate_vasp_quartet
         issues = validate_vasp_quartet(path)
         if issues:
@@ -152,14 +216,15 @@ def _scan_vasp_item(path: str, shared_incar: str | None) -> dict:
             message = '四件套未通过输入检查：' + '；'.join(issues)
         else:
             status, mode, message = 'ready', 'copy', '四件套完整且已通过检查，可直接建作业'
-    elif structure and shared_incar:
+    elif structure and effective_incar:
         status, mode = 'generatable', 'generate'
         src = os.path.basename(structure)
-        message = f'将用 {src} + 共享 INCAR 自动生成标准四件套'
+        incar_label = '本目录 INCAR' if incar_origin == 'local' else '共享 INCAR'
+        message = f'将用 {src} + {incar_label} 自动生成标准四件套'
     else:
         status, mode = 'incomplete', 'blocked'
         if structure:
-            message = '已有结构；请选择一份共享 INCAR 后即可自动补齐'
+            message = '已有结构；请在本目录放入 INCAR，或显式选择一份共享 INCAR 后自动补齐'
         else:
             message = '缺少 POSCAR/CONTCAR，无法生成作业'
     return {
@@ -172,6 +237,8 @@ def _scan_vasp_item(path: str, shared_incar: str | None) -> dict:
         'can_build': status in ('ready', 'generatable'),
         'can_generate': status == 'generatable',
         'structure': os.path.abspath(structure) if structure else '',
+        'source_incar': effective_incar or '',
+        'source_incar_origin': incar_origin,
         'present': present,
         'missing': missing,
         'message': message,
@@ -390,7 +457,8 @@ def _uniform_generated_encut(items: list[dict], shared_incar: str,
 def _write_quick_manifest(job_dir: str, *, name: str, source: str,
                           engine: str, copied: list[str], mode: str,
                           build_result: dict | None = None,
-                          structure: str = '', shared_incar: str = '') -> None:
+                          structure: str = '', source_incar: str = '',
+                          source_incar_origin: str = '') -> None:
     """为复制/自动生成两条路径写统一、可追溯的 job.yaml。"""
     build_result = build_result or {}
     sha = {fn: manifest_mod.sha256_file(os.path.join(job_dir, fn)) for fn in copied}
@@ -401,16 +469,24 @@ def _write_quick_manifest(job_dir: str, *, name: str, source: str,
         'sha256': sha,
         'quick_submit_mode': mode,
     }
+    if engine == 'vasp' and source_incar:
+        inputs['source_incar'] = (os.path.abspath(source_incar)
+                                  if os.path.isfile(source_incar) else 'inline')
+        inputs['source_incar_origin'] = source_incar_origin or 'local'
+        if os.path.isfile(source_incar):
+            inputs['source_incar_sha256'] = manifest_mod.sha256_file(source_incar)
     if mode == 'generate':
         inputs.update({
             'source_structure': os.path.abspath(structure),
-            'shared_incar': (os.path.abspath(shared_incar)
-                             if os.path.isfile(shared_incar) else 'inline'),
             'completions': dict(build_result.get('completions') or {}),
             'elements': list(build_result.get('elements') or []),
             'kpoints': list(build_result.get('kpoints') or []),
             'potcar': list(build_result.get('potcar') or []),
         })
+        # 兼容已有清单消费者；仅实际使用 shared 时才写这个历史字段，不能把本目录
+        # INCAR 错记成共享来源。
+        if source_incar_origin == 'shared':
+            inputs['shared_incar'] = inputs.get('source_incar', 'inline')
     task_type = (str(build_result.get('task_type') or '')
                  if build_result else _manifest_task_type(engine, job_dir))
     if not task_type:
@@ -422,7 +498,8 @@ def _write_quick_manifest(job_dir: str, *, name: str, source: str,
     ]
     warnings.extend(list(build_result.get('warnings') or []))
     if mode == 'generate':
-        warnings.insert(0, '由源结构 + 共享 INCAR 自动生成；源文件未被修改')
+        incar_label = '本目录 INCAR' if source_incar_origin == 'local' else '共享 INCAR'
+        warnings.insert(0, f'由源结构 + {incar_label} 自动生成；源文件未被修改')
     manifest = manifest_mod.new_manifest(
         job_id=f'{name}-{time.strftime("%Y%m%d-%H%M%S")}',
         system=_job_name_for(source, engine),
@@ -474,15 +551,19 @@ def build_quick_jobs(files: list, out_root: str, *, job_prefix: str = '',
             return result
 
     generatable = [i for i in preflight['items'] if i['status'] == 'generatable']
+    # 原有“共享 INCAR 批次统一 ENCUT”只作用于确实使用 shared 的成员。本目录
+    # INCAR 是逐作业输入，不得被 shared 的组级补全反向覆盖。
+    shared_generatable = [i for i in generatable
+                          if i.get('source_incar_origin') == 'shared']
     force_encut, generate_errors = (None, {})
-    if shared and generatable:
+    if shared and shared_generatable:
         try:
             force_encut, generate_errors = _uniform_generated_encut(
-                generatable, shared, (lib_root or None))
+                shared_generatable, shared, (lib_root or None))
         except Exception as exc:                         # noqa: BLE001
             # 共享 INCAR 本身坏时，所有“自动生成”项失败；完整四件套仍照常导入。
             generate_errors = {i['path']: f'共享 INCAR 无法读取/解析:{exc}'
-                               for i in generatable}
+                               for i in shared_generatable}
 
     used: set[str] = set()
     root_ready = False
@@ -534,14 +615,16 @@ def build_quick_jobs(files: list, out_root: str, *, job_prefix: str = '',
             mode = item.get('mode') or 'copy'
             build_result = None
             if mode == 'generate':
-                if not shared:
-                    raise ValueError('未选择有效的共享 INCAR')
+                selected_incar = item.get('source_incar') or ''
+                if not selected_incar:
+                    raise ValueError('本目录无可读 INCAR，且未选择有效的共享 INCAR')
                 structure = item.get('structure') or ''
                 build_result = build_job_dir(
-                    structure, shared, stage,
+                    structure, selected_incar, stage,
                     calc_type=(calc_type or 'slab'), validate=True,
                     lib_root=(lib_root or None), system_name=item.get('name') or name,
-                    force_encut=force_encut,
+                    force_encut=(force_encut
+                                 if item.get('source_incar_origin') == 'shared' else None),
                 )
                 copied = [fn for fn in _VASP_INPUTS
                           if os.path.isfile(os.path.join(stage, fn))]
@@ -559,7 +642,8 @@ def build_quick_jobs(files: list, out_root: str, *, job_prefix: str = '',
             _write_quick_manifest(
                 stage, name=name, source=source, engine=engine, copied=copied,
                 mode=mode, build_result=build_result, structure=structure,
-                shared_incar=(shared or ''),
+                source_incar=(item.get('source_incar') or ''),
+                source_incar_origin=(item.get('source_incar_origin') or ''),
             )
             # unique_dir_name 已保证目标不存在；原子改名使台账看不到半成品。
             if os.path.exists(job_dir):

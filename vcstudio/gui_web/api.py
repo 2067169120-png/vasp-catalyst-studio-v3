@@ -1440,6 +1440,15 @@ class Api:
             if not source:
                 raise ValueError('请先选择结构根目录')
             items = self._adsorption.scan_structure_files(source)
+            for item in items:
+                resolution = self._resolve_lis_member_incar(item.get('path'))
+                item.update({
+                    'incar_path': resolution['path'],
+                    'incar_sha256': resolution['sha256'],
+                    'incar_status': resolution['status'],
+                    'incar_issues': resolution['issues'],
+                    'incar_source': resolution['source'],
+                })
             grouped = {'items': items, 'species_groups': [], 'warnings': []}
             clean = str(clean_slab or '').strip()
             if clean:
@@ -1457,10 +1466,13 @@ class Api:
                     'species_groups': [], 'warnings': [], 'error': str(e)}
 
     def proj_scan_lis_inputs(self, root, reference_species=None):
-        """一次只读识别固定 INCAR、clean slab 与 adsorption 结构族。"""
+        """一次只读识别逐目录 INCAR、clean slab 与 adsorption 结构族。"""
         empty = {
             'ok': False, 'root': str(root or ''), 'incar': '',
             'incar_candidates': [], 'clean_slab': '', 'clean_candidates': [],
+            'clean_incar': '', 'clean_incar_sha256': '',
+            'clean_incar_status': 'missing', 'clean_incar_issues': [],
+            'clean_incar_source': '',
             'configs': [], 'structures': [], 'warnings': [],
             'species_groups': [], 'unresolved_species': 0,
             'source_read_only': True,
@@ -1478,6 +1490,102 @@ class Api:
             return {**empty, **result, 'ok': True, 'error': None}
         except Exception as e:                            # noqa: BLE001
             return {**empty, 'error': str(e)}
+
+    def proj_resolve_member_incar(self, structure_path, fallback_incar=''):
+        """只读解析一个结构实际会使用的 INCAR，供逐项选择后的界面即时复核。"""
+        try:
+            result = self._resolve_lis_member_incar(
+                structure_path, fallback_incar=fallback_incar)
+            return {'ok': result.get('status') == 'ready', **result,
+                    'error': None if result.get('status') == 'ready'
+                    else '；'.join(result.get('issues') or ['没有可用的 INCAR'])}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'path': '', 'sha256': '', 'status': 'invalid',
+                    'source': '', 'issues': [str(e)], 'error': str(e)}
+
+    def _resolve_lis_member_incar(self, structure_path, *, fallback_incar='',
+                                  expected_path='', expected_sha256=''):
+        """后端重新绑定结构同目录 INCAR；本地文件优先，显式备用只补缺失。"""
+        structure = os.path.abspath(os.path.expanduser(str(structure_path or '').strip()))
+        if not os.path.isfile(structure):
+            raise ValueError(f'结构文件不存在：{structure}')
+        resolver = getattr(self._adsorption, 'resolve_structure_incar', None)
+        if callable(resolver):
+            resolved = dict(resolver(structure, fallback=str(fallback_incar or '').strip()) or {})
+        else:
+            parent = os.path.dirname(structure)
+            candidates = []
+            try:
+                names = os.listdir(parent)
+            except OSError as exc:
+                raise ValueError(f'无法读取结构目录：{parent}：{exc}') from exc
+            for name in names:
+                path = os.path.join(parent, name)
+                if name.casefold() == 'incar' and os.path.isfile(path) and not os.path.islink(path):
+                    candidates.append(os.path.abspath(path))
+            if len(candidates) > 1:
+                resolved = {'path': '', 'status': 'ambiguous', 'source': 'same_directory',
+                            'issues': ['同目录存在多个大小写不同的 INCAR，无法安全选择']}
+            else:
+                fallback = os.path.abspath(os.path.expanduser(str(fallback_incar).strip())) \
+                    if str(fallback_incar or '').strip() else ''
+                selected = candidates[0] if candidates else fallback
+                source = 'same_directory' if candidates else ('explicit_fallback' if selected else '')
+                resolved = {'path': selected, 'status': 'ready' if selected else 'missing',
+                            'source': source, 'issues': [] if selected else ['同目录缺少 INCAR']}
+        path = os.path.abspath(os.path.expanduser(str(
+            resolved.get('path') or resolved.get('incar_path') or '').strip())) \
+            if str(resolved.get('path') or resolved.get('incar_path') or '').strip() else ''
+        issues = [str(item) for item in (resolved.get('issues') or []) if str(item).strip()]
+        status = str(resolved.get('status') or ('ready' if path else 'missing'))
+        if path:
+            if not os.path.isfile(path):
+                status = 'missing'
+                issues.append(f'INCAR 不存在：{path}')
+            elif os.path.islink(path):
+                status = 'invalid'
+                issues.append('INCAR 不能是符号链接')
+            else:
+                from vcstudio.generate.incar_builder import parse_incar
+                try:
+                    with open(path, 'r', encoding='utf-8', errors='replace') as handle:
+                        parsed = parse_incar(handle.read())
+                except (OSError, ValueError) as exc:
+                    parsed = {}
+                    issues.append(f'INCAR 无法读取/解析：{exc}')
+                if not parsed:
+                    status = 'invalid'
+                    issues.append('INCAR 未解析到任何 KEY=VALUE 参数')
+                ispin = _method_integer(parsed.get('ISPIN')) if parsed else None
+                if parsed and 'ISPIN' in parsed and ispin not in {1, 2}:
+                    status = 'invalid'
+                    issues.append(f'ISPIN={parsed.get("ISPIN")!r} 无效（仅允许 1 或 2）')
+                if parsed and 'ENCUT' in parsed:
+                    encut = _method_number(parsed.get('ENCUT'))
+                    if encut is None or encut <= 0:
+                        status = 'invalid'
+                        issues.append(f'ENCUT={parsed.get("ENCUT")!r} 不是正数')
+                for key in ('NSW', 'IBRION', 'NELM', 'ISIF'):
+                    if parsed and key in parsed and _method_integer(parsed.get(key)) is None:
+                        status = 'invalid'
+                        issues.append(f'{key}={parsed.get(key)!r} 必须是整数')
+        digest = _sha256_file(path) if path and os.path.isfile(path) and not os.path.islink(path) else ''
+        expected = os.path.abspath(os.path.expanduser(str(expected_path or '').strip())) \
+            if str(expected_path or '').strip() else ''
+        if expected and path and os.path.normcase(expected) != os.path.normcase(path):
+            status = 'changed'
+            issues.append(f'扫描时绑定的 INCAR 已变化：原 {expected}，现 {path}；请重新扫描')
+        if expected_sha256 and digest and str(expected_sha256).lower() != digest.lower():
+            status = 'changed'
+            issues.append('INCAR 在扫描后内容已变化；请重新扫描并确认后再生成')
+        if issues and status == 'ready':
+            status = 'invalid'
+        return {
+            'path': path, 'incar_path': path, 'sha256': digest,
+            'incar_sha256': digest, 'status': status,
+            'incar_status': status, 'source': str(resolved.get('source') or ''),
+            'issues': issues, 'incar_issues': issues,
+        }
 
     @staticmethod
     def _reasonable_reference_energy(value) -> bool:
@@ -1716,24 +1824,107 @@ class Api:
                 'checked_fields': checked, 'planned': planned,
                 'reference_signatures': signatures}
 
+    @staticmethod
+    def _periodic_method_check(clean_plan, member_plans):
+        """核对 clean slab 与各 adsorption 的能量可比方法；运行控制键允许不同。"""
+        issues, warnings = [], []
+        checked = 0
+
+        def _same(left, right):
+            if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+                return abs(float(left) - float(right)) <= 1e-10
+            return left == right
+
+        def _title_map(plan):
+            orders = list(plan.get('element_orders') or [])
+            order = list(orders[0]) if len(orders) == 1 else []
+            titles = list(plan.get('potcar_titel') or [])
+            if not order or len(order) != len(titles) or len(set(order)) != len(order):
+                return None
+            return dict(zip(order, titles))
+
+        clean_name = 'clean slab'
+        if clean_plan.get('ispin') not in {1, 2}:
+            issues.append(f'{clean_name}: ISPIN={clean_plan.get("ispin")!r} 无效（仅允许 1 或 2）')
+        for member_name, plan in member_plans.items():
+            label = f'{clean_name} ↔ {member_name}'
+            if plan.get('ispin') not in {1, 2}:
+                issues.append(f'{member_name}: ISPIN={plan.get("ispin")!r} 无效（仅允许 1 或 2）')
+            for key in ('functional', 'ivdw', 'ispin', 'ldau', 'metagga', 'lhfcalc', 'encut'):
+                left, right = clean_plan.get(key), plan.get(key)
+                if left is None or right is None:
+                    warnings.append(f'{label}: 无法核对 {key.upper()}')
+                elif not _same(left, right):
+                    issues.append(f'{label}: {key.upper()} 不一致（{left!r} vs {right!r}）')
+                else:
+                    checked += 1
+            if clean_plan.get('ldau') is True and plan.get('ldau') is True:
+                left_type, right_type = clean_plan.get('ldautype'), plan.get('ldautype')
+                if left_type is None or right_type is None:
+                    warnings.append(f'{label}: 无法核对 LDAUTYPE')
+                elif left_type != right_type:
+                    issues.append(
+                        f'{label}: LDAUTYPE 不一致（{left_type!r} vs {right_type!r}）')
+                else:
+                    checked += 1
+                for key, integer in (('ldaul', True), ('ldauu', False), ('ldauj', False)):
+                    clean_map = _method_vector_map(
+                        clean_plan.get(key), clean_plan.get('element_orders'), integer=integer)
+                    member_map = _method_vector_map(
+                        plan.get(key), plan.get('element_orders'), integer=integer)
+                    if clean_map is None or member_map is None:
+                        warnings.append(f'{label}: 无法按元素顺序核对 {key.upper()}')
+                        continue
+                    for element in sorted(set(clean_map) & set(member_map)):
+                        if not _same(clean_map[element], member_map[element]):
+                            issues.append(
+                                f'{label}: {element} {key.upper()} 不一致 '
+                                f'（{clean_map[element]!r} vs {member_map[element]!r}）')
+                        else:
+                            checked += 1
+            if clean_plan.get('lhfcalc') is True and plan.get('lhfcalc') is True:
+                for key in ('aexx', 'hfscreen'):
+                    left, right = clean_plan.get(key), plan.get(key)
+                    if left is None or right is None:
+                        warnings.append(f'{label}: 无法核对 {key.upper()}')
+                    elif not _same(left, right):
+                        issues.append(
+                            f'{label}: {key.upper()} 不一致（{left!r} vs {right!r}）')
+                    else:
+                        checked += 1
+            clean_titles, member_titles = _title_map(clean_plan), _title_map(plan)
+            if clean_titles is None or member_titles is None:
+                warnings.append(f'{label}: POTCAR 元素/TITEL 证据不完整')
+            else:
+                for element in sorted(set(clean_titles) & set(member_titles)):
+                    if clean_titles[element] != member_titles[element]:
+                        issues.append(
+                            f'{label}: {element} POTCAR TITEL 不一致 '
+                            f'（{clean_titles[element]!r} vs {member_titles[element]!r}）')
+                    else:
+                        checked += 1
+        return {'issues': issues, 'warnings': warnings, 'checked_fields': checked}
+
     def proj_prepare_lis(self, name, slab_path, config_items, incar_path,
-                         out_root, reference_project_path, method_confirmation=None):
-        """用既有 Li-S 参考能量 + slab/config POSCAR 建立可直接提交的项目。"""
+                         out_root, reference_project_path, method_confirmation=None,
+                         member_incars=None):
+        """用既有参考能与每个结构同目录的 INCAR 建立可直接提交的 Li-S 项目。"""
         empty = {'ok': False, 'project_path': None, 'job_dirs': [],
                  'reference_species': [], 'advisories': [], 'warnings': [],
                  'method_check': None, 'needs_method_confirmation': False}
         try:
             project_name = str(name or '').strip()
             slab = os.path.abspath(os.path.expanduser(str(slab_path or '').strip()))
-            incar = os.path.abspath(os.path.expanduser(str(incar_path or '').strip()))
+            fallback_incar = os.path.abspath(os.path.expanduser(
+                str(incar_path or '').strip())) if str(incar_path or '').strip() else ''
             output = os.path.abspath(os.path.expanduser(str(out_root or '').strip()))
             if (not project_name or project_name in ('.', '..')
                     or os.path.basename(project_name) != project_name):
                 raise ValueError('项目名不能为空，且不能包含路径分隔符')
             if not os.path.isfile(slab):
                 raise ValueError('清洁表面结构文件不存在')
-            if not os.path.isfile(incar):
-                raise ValueError('共享 INCAR 不存在')
+            if fallback_incar and not os.path.isfile(fallback_incar):
+                raise ValueError('显式备用 INCAR 不存在')
             if not str(out_root or '').strip():
                 raise ValueError('请选择项目输出根目录')
             target = os.path.join(output, project_name)
@@ -1741,6 +1932,7 @@ class Api:
             reference, refs, ref_jobs, ref_signatures = self._validated_reference_project(
                 reference_project_path)
             configs, source_species, source_species_evidence = [], {}, {}
+            source_incar_evidence = {}
             seen_paths, seen_members = set(), set()
             for raw_item in (config_items or []):
                 if not isinstance(raw_item, dict):
@@ -1769,8 +1961,76 @@ class Api:
                 seen_members.add(member_key)
                 configs.append(path)
                 source_species[path] = species
+                source_incar_evidence[path] = {
+                    'path': str(raw_item.get('incar_path') or raw_item.get('incar') or '').strip(),
+                    'sha256': str(raw_item.get('incar_sha256') or '').strip(),
+                }
             if not configs:
                 raise ValueError('至少选择一个 adsorption 构型结构')
+
+            supplied_incars = dict(member_incars or {}) \
+                if isinstance(member_incars, dict) else {}
+            clean_expected = supplied_incars.get('clean_slab') or {}
+            if isinstance(clean_expected, str):
+                clean_expected = {'path': clean_expected}
+            clean_incar_result = self._resolve_lis_member_incar(
+                slab, fallback_incar=fallback_incar,
+                expected_path=str(clean_expected.get('path') or clean_expected.get('incar_path') or ''),
+                expected_sha256=str(clean_expected.get('sha256') or
+                                    clean_expected.get('incar_sha256') or ''))
+            if clean_incar_result['status'] != 'ready':
+                raise ValueError(
+                    'clean slab 的 INCAR 不可用：'
+                    + '；'.join(clean_incar_result['issues'] or ['同目录缺少 INCAR']))
+            member_incar_paths = {slab: clean_incar_result['path']}
+            member_incar_records = {slab: clean_incar_result}
+            config_expected_map = supplied_incars.get('configs') or {}
+            if isinstance(config_expected_map, list):
+                config_expected_map = {
+                    os.path.normcase(os.path.abspath(str(item.get('path') or ''))): item
+                    for item in config_expected_map if isinstance(item, dict) and item.get('path')
+                }
+            elif isinstance(config_expected_map, dict):
+                config_expected_map = {
+                    os.path.normcase(os.path.abspath(str(key))): value
+                    for key, value in config_expected_map.items()
+                }
+            else:
+                config_expected_map = {}
+            for config_path in configs:
+                expected = source_incar_evidence.get(config_path) or {}
+                supplied = config_expected_map.get(os.path.normcase(config_path)) or {}
+                if isinstance(supplied, str):
+                    supplied = {'path': supplied}
+                expected_path = str(supplied.get('incar_path') or supplied.get('path')
+                                    or expected.get('path') or '')
+                expected_sha = str(supplied.get('incar_sha256') or supplied.get('sha256')
+                                   or expected.get('sha256') or '')
+                resolved = self._resolve_lis_member_incar(
+                    config_path, fallback_incar=fallback_incar,
+                    expected_path=expected_path, expected_sha256=expected_sha)
+                if resolved['status'] != 'ready':
+                    label = os.path.basename(os.path.dirname(config_path)) or os.path.basename(config_path)
+                    raise ValueError(
+                        f'构型 {label} 的 INCAR 不可用：'
+                        + '；'.join(resolved['issues'] or ['同目录缺少 INCAR']))
+                member_incar_paths[config_path] = resolved['path']
+                member_incar_records[config_path] = resolved
+
+            # Capture the source structures before parsing/method planning.  These
+            # digests, together with the INCAR digests captured by the resolver,
+            # are passed into create_project and checked around every copy.
+            member_poscar_hashes = {
+                path: _sha256_file(path) for path in [slab, *configs]
+            }
+            member_source_evidence = {
+                path: {
+                    'poscar': {'path': path, 'sha256': member_poscar_hashes[path]},
+                    'incar': {'path': member_incar_paths[path],
+                              'sha256': member_incar_records[path]['sha256']},
+                }
+                for path in [slab, *configs]
+            }
 
             slab_composition, slab_cell = _poscar_composition_cell(slab)
             structure_compositions = {slab: slab_composition}
@@ -1815,43 +2075,106 @@ class Api:
                 element for composition in structure_compositions.values()
                 for element in composition
             })
-            planned_element_orders = [
-                list(structure_compositions[path]) for path in [slab, *configs]
-            ]
-            planned_titels = []
-            effective_encut = None
-            encut_source = 'unavailable:no_potcar_lib_root'
             from vcstudio.generate.incar_builder import parse_incar
-            with open(incar, 'r', encoding='utf-8', errors='replace') as handle:
-                planned_incar = {
-                    str(key).upper(): value for key, value in parse_incar(handle.read()).items()
-                }
-            if planned_incar.get('ENCUT') is not None:
-                try:
-                    effective_encut = float(planned_incar['ENCUT'])
-                    if not math.isfinite(effective_encut):
-                        raise ValueError
-                    encut_source = 'shared_incar'
-                except (TypeError, ValueError):
-                    encut_source = 'unavailable:invalid_shared_incar'
-            if lib_root:
+            parsed_incars = {}
+            explicit_encuts = {}
+            for structure_path, member_incar in member_incar_paths.items():
+                with open(member_incar, 'r', encoding='utf-8', errors='replace') as handle:
+                    parsed = {str(key).upper(): value
+                              for key, value in parse_incar(handle.read()).items()}
+                parsed_incars[structure_path] = parsed
+                if 'ENCUT' in parsed:
+                    value = _method_number(parsed.get('ENCUT'))
+                    if value is None or value <= 0:
+                        raise ValueError(
+                            f'{member_incar} 的 ENCUT={parsed.get("ENCUT")!r} 无效')
+                    explicit_encuts[structure_path] = value
+
+            distinct_encuts = sorted({round(value, 10) for value in explicit_encuts.values()})
+            encut_issues = []
+            if len(distinct_encuts) > 1:
+                encut_issues.append(
+                    '周期成员显式 ENCUT 不一致：' + '；'.join(
+                        f'{os.path.basename(os.path.dirname(path)) or os.path.basename(path)}='
+                        f'{value:g} eV' for path, value in explicit_encuts.items()))
+            group_encut = distinct_encuts[0] if len(distinct_encuts) == 1 else None
+            auto_encut = None
+            if not explicit_encuts and lib_root:
                 try:
                     from vcstudio.generate import potcar as _potcar
-                    planned_titels = [row.get('titel') or '' for row in
-                                      _potcar.potcar_provenance(all_elements, lib_root)]
-                    if 'ENCUT' not in planned_incar:
-                        max_enmax = _potcar.max_enmax(all_elements, lib_root)
-                        effective_encut = int(math.ceil(1.3 * max_enmax / 50.0) * 50)
-                        encut_source = 'potcar_enmax_1.3_round_up_50'
-                except Exception:                         # noqa: BLE001 生成阶段会给出精确赝势错误
-                    planned_titels = []
-                    if 'ENCUT' not in planned_incar:
-                        effective_encut = None
-                        encut_source = 'unavailable:potcar_enmax'
-            method_check = self._reference_method_check(
-                ref_signatures, incar, planned_potcar=planned_titels,
-                effective_encut=effective_encut, encut_source=encut_source,
-                planned_element_orders=planned_element_orders)
+                    max_enmax = _potcar.max_enmax(all_elements, lib_root)
+                    auto_encut = int(math.ceil(1.3 * max_enmax / 50.0) * 50)
+                except Exception:                         # noqa: BLE001 精确错误由生成阶段返回
+                    auto_encut = None
+
+            plans = {}
+            reference_issues, reference_warnings = list(encut_issues), []
+            checked_fields = 0
+            for structure_path in [slab, *configs]:
+                elements = list(structure_compositions[structure_path])
+                planned_titels = []
+                if lib_root:
+                    try:
+                        from vcstudio.generate import potcar as _potcar
+                        planned_titels = [row.get('titel') or '' for row in
+                                          _potcar.potcar_provenance(elements, lib_root)]
+                    except Exception:                     # noqa: BLE001 方法检查降级为证据缺项
+                        planned_titels = []
+                if structure_path in explicit_encuts:
+                    effective_encut = explicit_encuts[structure_path]
+                    encut_source = 'member_incar'
+                elif group_encut is not None:
+                    effective_encut = group_encut
+                    encut_source = 'project_member_incar'
+                elif auto_encut is not None:
+                    effective_encut = auto_encut
+                    encut_source = 'potcar_enmax_1.3_round_up_50'
+                else:
+                    effective_encut = None
+                    encut_source = ('unavailable:no_potcar_lib_root' if not lib_root
+                                    else 'unavailable:potcar_enmax')
+                signatures = ref_signatures if structure_path in configs else {}
+                check = self._reference_method_check(
+                    signatures, member_incar_paths[structure_path],
+                    planned_potcar=planned_titels,
+                    effective_encut=effective_encut, encut_source=encut_source,
+                    planned_element_orders=[elements])
+                check['planned']['element_orders'] = [elements]
+                plans[structure_path] = check['planned']
+                if structure_path in configs:
+                    label = os.path.basename(os.path.dirname(structure_path)) \
+                        if os.path.basename(structure_path).casefold() in ('poscar', 'contcar') \
+                        else os.path.basename(structure_path)
+                    reference_issues.extend(f'{label}: {item}' for item in check['issues'])
+                    reference_warnings.extend(f'{label}: {item}' for item in check['warnings'])
+                    checked_fields += int(check.get('checked_fields') or 0)
+
+            periodic = self._periodic_method_check(
+                plans[slab], {
+                    (os.path.basename(os.path.dirname(path))
+                     if os.path.basename(path).casefold() in ('poscar', 'contcar')
+                     else os.path.basename(path)): plans[path]
+                    for path in configs
+                })
+            reference_issues.extend(periodic['issues'])
+            reference_warnings.extend(periodic['warnings'])
+            checked_fields += periodic['checked_fields']
+            planned_members = {
+                ('clean_slab' if path == slab else
+                 (os.path.basename(os.path.dirname(path))
+                  if os.path.basename(path).casefold() in ('poscar', 'contcar')
+                  else os.path.basename(path))): plan
+                for path, plan in plans.items()
+            }
+            method_check = {
+                'status': ('incompatible' if reference_issues else
+                           ('unverified' if reference_warnings else 'verified')),
+                'issues': reference_issues, 'warnings': reference_warnings,
+                'checked_fields': checked_fields,
+                # 兼容旧消费者：代表性 planned 取首个 adsorption；完整矩阵另存。
+                'planned': plans[configs[0]], 'planned_members': planned_members,
+                'reference_signatures': ref_signatures,
+            }
             if method_check['status'] == 'incompatible':
                 return {**empty, 'reference_species': sorted(refs),
                         'method_check': method_check,
@@ -1883,26 +2206,47 @@ class Api:
             reference_path = os.path.abspath(str(reference_project_path))
             if os.path.isdir(reference_path):
                 reference_path = os.path.join(reference_path, 'project.yaml')
+            member_inputs = [{
+                'role': 'clean_slab',
+                'poscar': {'path': slab, 'sha256': member_poscar_hashes[slab]},
+                'incar': {'path': member_incar_paths[slab],
+                          'sha256': member_incar_records[slab]['sha256'],
+                          'source': member_incar_records[slab]['source']},
+            }]
+            member_inputs.extend({
+                'role': 'config', 'species': source_species[path],
+                'poscar': {'path': path, 'sha256': member_poscar_hashes[path]},
+                'incar': {'path': member_incar_paths[path],
+                          'sha256': member_incar_records[path]['sha256'],
+                          'source': member_incar_records[path]['source']},
+                'species_evidence': source_species_evidence[path],
+            } for path in configs)
             request_inputs = {
                 'name': project_name,
-                'slab': {'path': slab, 'sha256': _sha256_file(slab)},
-                'incar': {'path': incar, 'sha256': _sha256_file(incar)},
+                'slab': {'path': slab, 'sha256': member_poscar_hashes[slab]},
+                # 代表性旧字段保留；真实逐成员绑定以 members 为准。
+                'incar': {'path': member_incar_paths[slab],
+                          'sha256': member_incar_records[slab]['sha256']},
                 'configs': [
-                    {'path': path, 'sha256': _sha256_file(path),
+                    {'path': path, 'sha256': member_poscar_hashes[path],
+                     'incar_path': member_incar_paths[path],
+                     'incar_sha256': member_incar_records[path]['sha256'],
                      'species': source_species[path],
                      'species_evidence': source_species_evidence[path]}
                     for path in configs
                 ],
+                'members': member_inputs,
                 'reference_project': reference_path,
                 'species_refs': refs,
                 'species_ref_jobs': ref_jobs,
                 'planned_method': method_check['planned'],
+                'planned_methods': method_check['planned_members'],
             }
             request_sha256 = hashlib.sha256(json.dumps(
                 request_inputs, ensure_ascii=False, sort_keys=True,
                 separators=(',', ':')).encode('utf-8')).hexdigest()
             preparation = {
-                'schema': 1, 'request_sha256': request_sha256,
+                'schema': 2, 'request_sha256': request_sha256,
                 'inputs': request_inputs,
                 'prepared_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
                 'method_check': method_check,
@@ -1927,7 +2271,11 @@ class Api:
                     '请更换项目名')
             result = self._adsorption.create_project(
                 target, project_name, clean_poscar=slab,
-                config_poscars=configs, incar_path=incar, lib_root=(lib_root or None),
+                config_poscars=configs,
+                incar_path=(fallback_incar or member_incar_paths[slab]),
+                member_incars=member_incar_paths,
+                member_source_evidence=member_source_evidence,
+                lib_root=(lib_root or None),
                 config_species=source_species, species_refs=refs,
                 config_species_evidence=source_species_evidence,
                 species_ref_jobs=ref_jobs, molecules_dir=molecules_dir,

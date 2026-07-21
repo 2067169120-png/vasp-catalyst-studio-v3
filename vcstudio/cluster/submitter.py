@@ -553,6 +553,7 @@ def preflight(profile, job_dir: str) -> list:
         # POTCAR TITEL 闸(原版提交前防线):截断/拼错的 POTCAR 会给出"收敛但静默错"
         # 的能量——TITEL 段数必须等于 POSCAR 物种数,不等拒绝提交
         if engine == 'vasp':
+            errs += _managed_vasp_input_hash_gate(job_dir, m0)
             errs += _potcar_gate(job_dir, m0)
     if not profile.remote_root:
         errs.append('集群配置未填远程工作目录 remote_root')
@@ -606,6 +607,56 @@ def preflight(profile, job_dir: str) -> list:
     else:
         errs.append(f'未知脚本模式: {mode!r}')
     return errs
+
+
+def _managed_vasp_input_hash_gate(job_dir: str, manifest: dict) -> list[str]:
+    """Verify managed VASP inputs against hashes captured at preparation.
+
+    ``inputs.sha256`` was added after the original manifest schema shipped, so
+    its complete absence remains a supported legacy case.  Once the field is
+    present, however, every recorded managed input is immutable evidence: a
+    malformed digest, an unreadable file, or a content mismatch must stop the
+    submission before SSH is touched.  This prevents a prepared/reused project
+    from silently uploading an INCAR that bypassed the method gate.
+    """
+    inputs = manifest.get('inputs') or {}
+    if not isinstance(inputs, dict) or 'sha256' not in inputs:
+        return []
+    recorded = inputs.get('sha256')
+    if not isinstance(recorded, dict):
+        return [
+            '作业清单 inputs.sha256 格式无效；'
+            '请重新准备该作业后再提交']
+
+    errors: list[str] = []
+    for name in _INPUT_FILES:
+        if name not in recorded:
+            continue
+        expected = str(recorded.get(name) or '').strip().lower()
+        if not re.fullmatch(r'[0-9a-f]{64}', expected):
+            errors.append(
+                f'作业清单中 {name} 的 SHA256 无效；'
+                '请重新准备该作业后再提交')
+            continue
+        path = os.path.join(job_dir, name)
+        if not os.path.isfile(path):
+            errors.append(
+                f'受管输入 {name} 不存在，无法核对准备时哈希；'
+                '请重新准备该作业后再提交')
+            continue
+        try:
+            actual = manifest_mod.sha256_file(path).lower()
+        except OSError as exc:
+            errors.append(
+                f'受管输入 {name} 无法读取并核对哈希：{exc}；'
+                '请重新准备该作业后再提交')
+            continue
+        if actual != expected:
+            errors.append(
+                f'受管输入 {name} 在准备后已变化，'
+                '与 job.yaml 记录的 SHA256 不一致；'
+                '请重新准备该作业后再提交')
+    return errors
 
 
 def _potcar_gate(job_dir: str, m: dict) -> list:

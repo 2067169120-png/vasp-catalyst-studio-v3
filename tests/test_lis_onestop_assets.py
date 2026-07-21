@@ -14,7 +14,8 @@ def test_lis_builder_guides_reference_inputs_output_and_resources():
     for control in (
         'pj-create-card', 'lis-reference', 'lis-reference-status',
         'lis-input-dir', 'lis-bundle-status',
-        'pj-incar', 'pj-slab', 'pj-cfg-add', 'pj-cfg-dir', 'pj-cfg-list',
+        'pj-incar', 'pj-slab', 'lis-clean-incar-status',
+        'pj-cfg-add', 'pj-cfg-dir', 'pj-cfg-list',
         'lis-bulk-species', 'lis-apply-species', 'lis-only-unmatched',
         'pj-name', 'pj-root', 'lis-profile', 'lis-cores', 'lis-walltime',
         'lis-resource-summary',
@@ -22,7 +23,7 @@ def test_lis_builder_guides_reference_inputs_output_and_resources():
     ):
         assert f'id="{control}"' in html
     assert '生成并提交整组，开启自动续算/下载/报告' in html
-    assert '只生成，不提交（兼容旧流程）' in html
+    assert '只生成当前逐目录作业，不提交' in html
     assert '最多续算 3 轮' in html
     assert 'OUTCAR、OSZICAR、CONTCAR 3 个文件' in html
 
@@ -32,24 +33,34 @@ def test_lis_builder_uses_backend_contract_and_strict_species_mapping():
     assert "'proj_scan_lis_inputs', picked.path, selectedReferenceSpecies()" in js
     assert "'proj_scan_structures', picked.path, val('pj-slab'), selectedReferenceSpecies()" in js
     assert "VCS.call('proj_prepare_lis', val('pj-name'), val('pj-slab'), gate.items," in js
+    assert "VCS.call('proj_resolve_member_incar', path, val('pj-incar'))" in js
     assert "VCS.call('submit_project_with_resources', projectPath," in js
     assert 'State.configSpecies' in js
     assert 'reference_species' in js
     assert 'n_species_refs' in js
     assert 'const invalidSpecies = items.filter' in js
     assert "species: String(State.configSpecies[path] || '').trim()" in js
-    # 兼容旧流程：原 proj_create 仍收 string[]，不改既有参数顺序。
-    assert 'const configs = State.configs.slice()' in js
-    assert "VCS.call('proj_create', name, slab, configs, incar, gas, root)" in js
+    assert "incar_path: String(meta.incarPath || '')" in js
+    assert 'gate.memberIncars' in js
+    # 专家“只生成”也必须复用同一逐成员契约，不能退回共享 INCAR API。
+    create_block = js[js.index('async function create()'):js.index('// ── 已有项目')]
+    assert "'proj_prepare_lis', val('pj-name'), val('pj-slab'), gate.items" in create_block
+    assert 'gate.memberIncars' in create_block
+    assert "VCS.call('proj_create'" not in create_block
 
 
 def test_one_folder_input_import_only_autofills_unambiguous_members():
     html = _source('index.html')
     js = _source('project.js')
     assert '导入本次计算文件夹（推荐）' in html
-    assert '有歧义时只提示你确认，不会擅自选择' in html
-    assert 'if (result.incar) setVal' in js
+    assert '各自同目录 INCAR；缺失或冲突会精确指出成员' in html
+    assert '本目录文件始终优先' in html
+    assert "const rootFallback = String(result.incar || '').trim()" in js
+    assert "setVal('pj-incar', rootFallback)" in js
+    assert "setVal('pj-slab', String(result.clean_slab || ''))" in js
     assert 'if (result.clean_slab)' in js
+    assert 'clean_incar_sha256' in js
+    assert 'item.incar_path' in js
     assert 'removeConfigPath(result.clean_slab)' in js
     assert '原始文件没有被修改' in js
 
@@ -60,7 +71,7 @@ def test_large_config_folders_have_safe_bulk_species_tools():
     assert 'function applyBulkSpecies()' in js
     assert '应用并确认全部未确认项' in _source('index.html')
     assert '只看未确认' in _source('index.html')
-    assert '已确认 ${matched}/${State.configs.length} 个构型' in js
+    assert '物种已确认 ${matched}/${State.configs.length}，INCAR 已绑定 ${incars}/${State.configs.length}' in js
     assert '确认本组映射' in js
     assert '<select class="ipt lis-species"' in js
     assert '.lis-config-field .pj-cfglist' in css and 'max-height:' in css
@@ -127,7 +138,7 @@ def test_adsorption_is_the_default_low_cognitive_load_workflow():
     ):
         assert f'id="{control}"' in html
     assert 'data-flow-step="6"' in html
-    assert '专家 / 旧流程' in html
+    assert '专家：按当前逐目录输入' in html
     assert 'data-acc="project:import-results"' in html
     assert 'data-acc="project:results"' in html
 
@@ -253,12 +264,31 @@ def test_new_input_folder_scan_prefers_poscar_and_explains_contcar_fallback():
 def test_submit_button_stays_locked_while_async_method_check_or_submit_runs():
     js = _source('project.js')
     assert 'lisBusy: false' in js
+    assert 'inputScanBusy: false' in js
+    assert 'inputGeneration: 0' in js
+
+
+def test_new_bundle_replaces_old_group_atomically_and_discards_stale_scans():
+    js = _source('project.js')
+    bundle = js[js.index('async function addLisInputDirectory()'):
+                js.index('function lisGate()')]
+    scan_call = bundle.index("'proj_scan_lis_inputs', picked.path")
+    assert bundle.index('const generation = ++State.inputGeneration') < scan_call
+    assert bundle.index('State.configs = []') < scan_call
+    assert bundle.index("setVal('pj-slab', '')") < scan_call
+    assert bundle.index("setVal('pj-incar', '')") < scan_call
+    assert 'if (generation !== State.inputGeneration) return' in bundle
+    assert 'State.inputScanBusy = true' in bundle
+    config_scan = js[js.index('async function addConfigDirectory()'):
+                     js.index('function updateLisResourceSummary()')]
+    assert 'const generation = State.inputGeneration' in config_scan
+    assert 'if (generation !== State.inputGeneration) return' in config_scan
 
 
 def test_project_report_requests_backend_final_adsorption_gate():
     js = _source('project.js')
     assert "VCS.call('proj_report', proj.path, save, true)" in js
-    assert 'button.disabled = State.lisBusy || !gate.ok' in js
+    assert 'button.disabled = State.lisBusy || State.inputScanBusy || !gate.ok' in js
     assert 'State.lisBusy = true' in js
     assert 'State.lisBusy = false' in js
 
@@ -283,6 +313,37 @@ def test_project_progress_is_restored_after_reopening_the_app():
     assert 'localStorage.setItem(CURRENT_PROJECT_KEY' in js
     assert '处理任务异常' in js
     assert '<b>5</b>监控与续算' in html
+
+
+def test_workflow_distinguishes_pending_submit_analysis_and_written_report():
+    js = _source('project.js')
+    restore = js[js.index('function restoreWorkflowState(project)'):
+                 js.index('function updateJourney()')]
+    assert "State.workflowPendingSubmit = stage === 'submit'" in restore
+    assert "State.workflowSubmitted = ['monitor', 'recover'].includes(stage)" in restore
+    assert "State.workflowAnalysisReady = ['analysis', 'report_done'].includes(stage)" in restore
+    assert "State.workflowResultReady = stage === 'report_done'" in restore
+    delta = js[js.index('async function delta()'):js.index('function fmt(')]
+    assert 'State.workflowAnalysisReady = !!' in delta
+    assert "State.workflowResultReady = State.workflowStage === 'report_done'" in delta
+    assert 'State.workflowResultReady = !!' not in delta
+    report = js[js.index('async function report()'):js.index('// ── 一键成稿包')]
+    assert 'await reloadProjects(proj.path)' in report
+    assert '作业已生成，等待提交' in js
+    assert '此时自动监控尚未开始' in js
+
+
+def test_programmatic_project_selection_restores_matching_pipeline_state():
+    js = _source('project.js')
+    commit = js[js.index('async function commitImport()'):
+                js.index('function showImportDone(')]
+    assert 'restoreWorkflowState(hit)' in commit
+    for start, end in (
+            ('async function openProjectResults(', 'function canonicalRole('),
+            ('async function selectByPath(', 'async function selectByName('),
+            ('async function selectByName(', '// 切回项目页时刷新项目下拉')):
+        block = js[js.index(start):js.index(end)]
+        assert 'restoreWorkflowState(hit)' in block
 
 
 def test_multiple_servers_are_visible_in_pipeline_and_event_feed():

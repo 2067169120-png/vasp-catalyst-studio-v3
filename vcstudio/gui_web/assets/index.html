@@ -1266,12 +1266,12 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 
     <!-- 一站式 Li-S 吸附计算：参考能 → 输入 → 资源 → 自动托管 -->
     <div class="card acc lis-builder" data-ana="adsorption" data-scene="cards.project.adsorption" data-task="adsorption_project" data-acc="project:create-adsorption"
-      data-sum="已有 Li-S 参考能 + POSCAR + 固定 INCAR，一次生成并提交" data-acc-default="0"
+      data-sum="已有 Li-S 参考能 + 各目录 POSCAR/INCAR，一次生成并提交" data-acc-default="0"
       id="pj-create-card" style="padding:12px;margin-bottom:10px">
       <div class="pj-h acc-h">开始新的 Li-S 吸附计算（生成、提交、续算、下载、报告一站完成）</div>
 
       <div class="lis-intro">
-        <b>你只需准备：</b>已经导入的 Li-S 化合物能量、1 份固定 INCAR、clean slab POSCAR 和 adsorption POSCAR。
+        <b>你只需准备：</b>已经导入的 Li-S 化合物能量，以及每个 clean/adsorption 文件夹各自的 POSCAR 和 INCAR。
         选好服务器、核数和墙时后，软件接管后续流程。
       </div>
 
@@ -1292,19 +1292,20 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <div class="lis-step" data-lis-step="2">
         <div class="lis-step-no">2</div>
         <div class="lis-step-body">
-          <button class="lis-step-title" type="button" data-lis-open-step="2">放入这次计算的输入 <span>一份 INCAR 会用于整组任务</span></button>
+          <button class="lis-step-title" type="button" data-lis-open-step="2">放入这次计算的输入 <span>每个作业读取自己目录里的 INCAR</span></button>
           <div class="lis-bundle-import">
             <button class="btn primary" type="button" id="lis-input-dir">导入本次计算文件夹（推荐）</button>
-            <span>一次识别固定 INCAR、clean slab 和全部 adsorption 结构；有歧义时只提示你确认，不会擅自选择。</span>
+            <span>一次识别 clean slab、全部 adsorption 结构及各自同目录 INCAR；缺失或冲突会精确指出成员。</span>
           </div>
           <div class="lis-scan-status" id="lis-bundle-status" hidden aria-live="polite"></div>
           <div class="lis-input-grid">
             <div class="pj-fld">
-              <span class="pj-lbl">固定 INCAR</span>
+              <span class="pj-lbl">备用 INCAR（可选）</span>
               <div class="pj-inrow">
-                <input id="pj-incar" class="ipt" autocomplete="off" placeholder="整组共用的 INCAR">
-                <button class="btn" type="button" id="pj-incar-btn">选择 INCAR</button>
+                <input id="pj-incar" class="ipt" autocomplete="off" placeholder="仅补没有本地 INCAR 的目录；本目录文件始终优先">
+                <button class="btn" type="button" id="pj-incar-btn">选择备用 INCAR</button>
               </div>
+              <span class="sub">不会覆盖任何目录已有的 INCAR。</span>
             </div>
             <div class="pj-fld">
               <span class="pj-lbl">clean slab POSCAR</span>
@@ -1312,6 +1313,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
                 <input id="pj-slab" class="ipt" autocomplete="off" placeholder="未吸附的干净表面 POSCAR">
                 <button class="btn" type="button" id="pj-slab-btn">选择 POSCAR</button>
               </div>
+              <span class="sub" id="lis-clean-incar-status">选择后将核对同目录 INCAR。</span>
             </div>
           </div>
           <div class="pj-fld lis-config-field">
@@ -1388,15 +1390,9 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <div class="lis-submit-result" id="lis-submit-result" hidden aria-live="polite"></div>
 
       <details class="lis-legacy">
-        <summary>专家 / 旧流程：只生成作业或使用气相 POSCAR</summary>
-        <div class="pj-fld">
-          <span class="pj-lbl">气相参考 POSCAR（仅“只生成”旧流程使用，可选）</span>
-          <div class="pj-inrow">
-            <input id="pj-gas" class="ipt" autocomplete="off" placeholder="留空则旧流程按 slab + adsorption 处理">
-            <button class="btn" type="button" id="pj-gas-btn">浏览</button>
-          </div>
-        </div>
-        <button class="btn" type="button" id="pj-create">只生成，不提交（兼容旧流程）</button>
+        <summary>专家：按当前逐目录输入只生成作业，不提交</summary>
+        <p class="sub">复用上方参考能、物种映射和逐成员 INCAR 检查；不会调用旧的共享 INCAR 生成入口。</p>
+        <button class="btn" type="button" id="pj-create">只生成当前逐目录作业，不提交</button>
       </details>
     </div>
 

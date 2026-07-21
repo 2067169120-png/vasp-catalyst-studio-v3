@@ -162,7 +162,7 @@ def test_report_annotates_continuation_rounds(tmp_path):
 def test_report_methodology_fixed_sentences(tmp_path):
     h = _gen_repro(tmp_path)
     assert 'BSSE' in h                                    # 平面波基组无 BSSE
-    assert 'ENCUT' in h and '基组一致' in h                # 项目内 ENCUT 一致
+    assert '真实 INCAR' in h and 'ENCUT' in h and '方法门禁' in h  # 逐成员真实输入 + 可比性门
     assert '真空盒尺寸' in h                               # 气相参考盒尺寸见输入文件
 
 

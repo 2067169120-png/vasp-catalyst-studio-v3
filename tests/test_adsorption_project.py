@@ -1,5 +1,6 @@
 """吸附能项目测试:批量生成 / project.yaml / ΔE 门控 / CSV 导出。"""
 import os
+from pathlib import Path
 
 import pytest
 
@@ -358,8 +359,12 @@ def test_scan_lis_input_bundle_fills_unique_incar_clean_and_configs_read_only(tm
     s8.write_text(
         'S8 bridge\n1.0\n10 0 0\n0 10 0\n0 0 20\nC S\n2 8\nDirect\n'
         + '0 0 0\n' * 10, encoding='utf-8')
-    incar = root / 'INCAR'
-    incar.write_text('ENCUT = 500\n', encoding='utf-8')
+    clean_incar = clean.parent / 'INCAR'
+    lis_incar = lis.parent / 'incar'
+    s8_incar = s8.parent / 'InCaR'
+    clean_incar.write_text('ENCUT = 500\nNSW = 40\n', encoding='utf-8')
+    lis_incar.write_text('ENCUT = 500\nNSW = 80\n', encoding='utf-8')
+    s8_incar.write_text('ENCUT = 500\nNSW = 120\n', encoding='utf-8')
     before = {str(path.relative_to(root)): path.stat().st_mtime_ns
               for path in root.rglob('*') if path.is_file()}
 
@@ -367,10 +372,18 @@ def test_scan_lis_input_bundle_fills_unique_incar_clean_and_configs_read_only(tm
 
     after = {str(path.relative_to(root)): path.stat().st_mtime_ns
              for path in root.rglob('*') if path.is_file()}
-    assert result['incar'] == str(incar.resolve())
+    assert result['incar'] == ''
+    assert len(result['incar_candidates']) == 3
     assert result['clean_slab'] == str(clean.resolve())
+    assert result['clean_incar'] == str(clean_incar.resolve())
+    assert result['clean_incar_sha256'] == manifest.sha256_file(clean_incar)
+    assert result['clean_incar_status'] == 'ready'
     assert {item['path'] for item in result['configs']} == {
         str(lis.resolve()), str(s8.resolve())}
+    assert {item['incar_path'] for item in result['configs']} == {
+        str(lis_incar.resolve()), str(s8_incar.resolve())}
+    assert all(item['incar_status'] == 'ready' for item in result['configs'])
+    assert all(item['incar_sha256'] for item in result['configs'])
     assert {item['species'] for item in result['configs']} == {'Li2S8', 'S8'}
     assert all(item['species_confidence'] == 'exact' for item in result['configs'])
     assert result['warnings'] == [] and result['source_read_only'] is True
@@ -392,6 +405,245 @@ def test_scan_lis_input_bundle_never_guesses_ambiguous_incar_or_clean(tmp_path):
     assert result['clean_slab'] == '' and len(result['clean_candidates']) == 2
     assert {item['species'] for item in result['configs']} == {'Li2S8'}
     assert any('手动选择' in warning for warning in result['warnings'])
+
+
+def test_resolve_structure_incar_prefers_local_case_insensitive_and_never_masks_invalid(
+        tmp_path):
+    folder = tmp_path / 'member'
+    folder.mkdir()
+    structure = folder / 'POSCAR'
+    structure.write_text('structure', encoding='utf-8')
+    fallback = tmp_path / 'fallback.INCAR'
+    fallback.write_text('ENCUT = 500\n', encoding='utf-8')
+    local = folder / 'InCaR'
+    local.write_text('ENCUT = 450\nNSW = 20\n', encoding='utf-8')
+
+    resolved = adsorption.resolve_structure_incar(structure, fallback=fallback)
+
+    assert resolved['status'] == 'ready'
+    assert resolved['source'] == 'same_directory'
+    assert resolved['path'] == str(local.resolve())
+    assert resolved['sha256'] == manifest.sha256_file(local)
+
+    local.write_text('# comments only\nplain text without equals\n', encoding='utf-8')
+    invalid = adsorption.resolve_structure_incar(structure, fallback=fallback)
+    assert invalid['status'] == 'invalid'
+    assert invalid['source'] == 'same_directory'
+    assert invalid['path'] == str(local.resolve())
+    assert any('KEY=VALUE' in issue for issue in invalid['issues'])
+
+    local.unlink()
+    fallback_result = adsorption.resolve_structure_incar(structure, fallback=fallback)
+    assert fallback_result['status'] == 'ready'
+    assert fallback_result['source'] == 'explicit_fallback'
+    assert fallback_result['path'] == str(fallback.resolve())
+
+
+def test_resolve_structure_incar_reports_case_conflict_and_empty_file(tmp_path):
+    folder = tmp_path / 'member'
+    folder.mkdir()
+    structure = folder / 'POSCAR'
+    structure.write_text('structure', encoding='utf-8')
+    upper = folder / 'INCAR'
+    lower = folder / 'incar'
+    upper.write_text('ENCUT = 400\n', encoding='utf-8')
+    lower.write_text('ENCUT = 500\n', encoding='utf-8')
+
+    conflict = adsorption.resolve_structure_incar(structure)
+
+    assert conflict['status'] == 'ambiguous'
+    assert conflict['path'] == ''
+    assert any('多个大小写不同' in issue for issue in conflict['issues'])
+
+    lower.unlink()
+    upper.write_text('', encoding='utf-8')
+    empty = adsorption.resolve_structure_incar(structure)
+    assert empty['status'] == 'invalid'
+    assert any('为空' in issue for issue in empty['issues'])
+
+
+def test_resolve_structure_incar_never_uses_fallback_over_local_symlink(tmp_path):
+    folder = tmp_path / 'member'
+    folder.mkdir()
+    structure = folder / 'POSCAR'
+    structure.write_text('structure', encoding='utf-8')
+    target = tmp_path / 'target.INCAR'
+    target.write_text('ENCUT = 450\n', encoding='utf-8')
+    fallback = tmp_path / 'fallback.INCAR'
+    fallback.write_text('ENCUT = 500\n', encoding='utf-8')
+    try:
+        (folder / 'INCAR').symlink_to(target)
+    except (OSError, NotImplementedError):
+        pytest.skip('当前文件系统不支持文件符号链接')
+
+    result = adsorption.resolve_structure_incar(structure, fallback=fallback)
+
+    assert result['status'] == 'invalid'
+    assert result['source'] == 'same_directory'
+    assert any('符号链接' in issue for issue in result['issues'])
+
+
+def test_create_project_uses_each_members_own_incar_and_records_provenance(env):
+    def member(folder_name, nsw):
+        folder = env['tmp'] / folder_name
+        folder.mkdir()
+        poscar = folder / 'POSCAR'
+        poscar.write_text(
+            f'{folder_name}\n1.0\n10 0 0\n0 10 0\n0 0 10\nC\n1\n'
+            'Cartesian\n0 0 0\n', encoding='utf-8')
+        incar = folder / ('incar' if nsw % 20 else 'INCAR')
+        incar.write_text(f'ENCUT = 400\nNSW = {nsw}\nISMEAR = 0\n', encoding='utf-8')
+        return poscar, incar
+
+    clean, clean_incar = member('clean', 20)
+    top, top_incar = member('Li2S8_top', 40)
+    bridge, bridge_incar = member('Li2S8_bridge', 60)
+    mappings = {
+        str(clean.resolve()): str(clean_incar),
+        str(top.resolve()): str(top_incar),
+        str(bridge.resolve()): str(bridge_incar),
+    }
+
+    result = adsorption.create_project(
+        env['tmp'] / 'per-member-project', 'per-member',
+        clean_poscar=str(clean), config_poscars=[str(top), str(bridge)],
+        member_incars=mappings, lib_root=env['lib'],
+        config_species={str(top): 'Li2S8', str(bridge): 'Li2S8'})
+
+    project = adsorption.load_project(result['project_path'])
+    jobs = [project['members']['clean_slab'], *project['members']['configs']]
+    sources = [clean_incar, top_incar, bridge_incar]
+    for job_dir, source in zip(jobs, sources):
+        item = manifest.load_manifest(job_dir)
+        assert item['inputs']['source_incar_path'] == str(source.resolve())
+        assert item['inputs']['source_incar_sha256'] == manifest.sha256_file(source)
+        assert source.read_text(encoding='utf-8') == \
+            (Path(job_dir) / 'INCAR').read_text(encoding='utf-8')
+    assert project['dataset_groups'][0]['species'] == 'Li2S8'
+    assert project['dataset_groups'][0]['n_configs'] == 2
+
+
+def test_create_project_rejects_source_hash_changed_before_staging(env):
+    clean = Path(env['poscar']('evidence-clean.vasp'))
+    config = Path(env['poscar']('evidence-config.vasp'))
+    incar = Path(env['incar'])
+    evidence = {
+        str(clean): {
+            'poscar': {'path': str(clean), 'sha256': manifest.sha256_file(clean)},
+            'incar': {'path': str(incar), 'sha256': manifest.sha256_file(incar)},
+        },
+        str(config): {
+            'poscar': {'path': str(config), 'sha256': manifest.sha256_file(config)},
+            'incar': {'path': str(incar), 'sha256': manifest.sha256_file(incar)},
+        },
+    }
+    config.write_text(config.read_text(encoding='utf-8') + '\n# changed\n',
+                      encoding='utf-8')
+    target = env['tmp'] / 'source-evidence-mismatch'
+
+    with pytest.raises(ValueError, match='源 POSCAR.*内容已变化.*重新扫描'):
+        adsorption.create_project(
+            target, 'source-evidence', clean_poscar=str(clean),
+            config_poscars=[str(config)], incar_path=str(incar),
+            member_source_evidence=evidence, lib_root=env['lib'],
+            fail_if_exists=True)
+
+    assert not target.exists()
+
+
+def test_create_project_detects_source_incar_race_during_copy(env, monkeypatch):
+    def member(folder_name):
+        folder = env['tmp'] / folder_name
+        folder.mkdir()
+        poscar = folder / 'POSCAR'
+        poscar.write_text(
+            f'{folder_name}\n1.0\n10 0 0\n0 10 0\n0 0 10\nC\n1\n'
+            'Cartesian\n0 0 0\n', encoding='utf-8')
+        incar = folder / 'INCAR'
+        incar.write_text('ENCUT = 400\nISMEAR = 0\n', encoding='utf-8')
+        return poscar, incar
+
+    clean, clean_incar = member('race-clean')
+    config, config_incar = member('race-config')
+    member_incars = {str(clean): str(clean_incar), str(config): str(config_incar)}
+    evidence = {
+        str(poscar): {
+            'poscar': {'path': str(poscar), 'sha256': manifest.sha256_file(poscar)},
+            'incar': {'path': str(incar), 'sha256': manifest.sha256_file(incar)},
+        }
+        for poscar, incar in ((clean, clean_incar), (config, config_incar))
+    }
+    real_build = adsorption.build_job_dir
+
+    def racing_build(poscar, incar, out_dir, **kwargs):
+        result = real_build(poscar, incar, out_dir, **kwargs)
+        if Path(poscar).resolve() == config.resolve():
+            config_incar.write_text(
+                'ENCUT = 400\nISMEAR = 0\nNSW = 999\n', encoding='utf-8')
+        return result
+
+    monkeypatch.setattr(adsorption, 'build_job_dir', racing_build)
+    target = env['tmp'] / 'source-copy-race'
+
+    with pytest.raises(ValueError, match='源 INCAR.*复制后哈希不一致'):
+        adsorption.create_project(
+            target, 'source-copy-race', clean_poscar=str(clean),
+            config_poscars=[str(config)], member_incars=member_incars,
+            member_source_evidence=evidence, lib_root=env['lib'],
+            fail_if_exists=True)
+
+    assert not target.exists()
+
+
+def test_atomic_project_rejects_member_missing_incar_without_writing_target(env):
+    clean_dir = env['tmp'] / 'atomic-clean'
+    config_dir = env['tmp'] / 'atomic-config'
+    clean_dir.mkdir()
+    config_dir.mkdir()
+    clean = clean_dir / 'POSCAR'
+    config = config_dir / 'POSCAR'
+    poscar_text = ('member\n1.0\n10 0 0\n0 10 0\n0 0 10\nC\n1\n'
+                   'Cartesian\n0 0 0\n')
+    clean.write_text(poscar_text, encoding='utf-8')
+    config.write_text(poscar_text, encoding='utf-8')
+    (clean_dir / 'INCAR').write_text('ENCUT = 400\n', encoding='utf-8')
+    target = env['tmp'] / 'atomic-missing-incar'
+
+    with pytest.raises(ValueError, match='整组成员 INCAR 未完整.*构型'):
+        adsorption.create_project(
+            target, 'atomic-missing', clean_poscar=str(clean),
+            config_poscars=[str(config)], lib_root=env['lib'], fail_if_exists=True)
+
+    assert not target.exists()
+
+
+def test_member_incars_propagate_one_explicit_encut_and_reject_conflicts(env):
+    def member(folder_name, incar_text):
+        folder = env['tmp'] / folder_name
+        folder.mkdir()
+        poscar = folder / 'POSCAR'
+        poscar.write_text(
+            f'{folder_name}\n1.0\n10 0 0\n0 10 0\n0 0 10\nC\n1\n'
+            'Cartesian\n0 0 0\n', encoding='utf-8')
+        (folder / 'INCAR').write_text(incar_text, encoding='utf-8')
+        return poscar
+
+    clean = member('encut-clean', 'ENCUT = 500\nISMEAR = 0\n')
+    config = member('encut-config', 'ISMEAR = 0\n')
+    result = adsorption.create_project(
+        env['tmp'] / 'encut-inherit', 'encut-inherit', clean_poscar=str(clean),
+        config_poscars=[str(config)], lib_root=env['lib'])
+    project = adsorption.load_project(result['project_path'])
+    config_manifest = manifest.load_manifest(project['members']['configs'][0])
+    assert config_manifest['inputs']['completions']['ENCUT'] == 500
+
+    conflict = member('encut-conflict', 'ENCUT = 600\nISMEAR = 0\n')
+    conflict_target = env['tmp'] / 'encut-conflict-project'
+    with pytest.raises(ValueError, match='各成员 INCAR 的 ENCUT 不一致'):
+        adsorption.create_project(
+            conflict_target, 'encut-conflict', clean_poscar=str(clean),
+            config_poscars=[str(conflict)], lib_root=env['lib'], fail_if_exists=True)
+    assert not conflict_target.exists()
 
 
 def test_scan_lis_bundle_infers_generic_clean_and_groups_from_poscar_difference(tmp_path):

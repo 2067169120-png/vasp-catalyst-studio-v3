@@ -44,6 +44,46 @@ def test_create_from_build_writes_job_yaml(tmp_path):
     # 缺 ENCUT → 有补全项 → 来源标记 user+completion
     assert 'ENCUT' in loaded['inputs']['completions']
     assert loaded['inputs']['incar_source'] == 'user+completion'
+    # 旧调用方未传 incar_path 时保持兼容，不伪造源路径。
+    assert 'source_incar_path' not in loaded['inputs']
+    assert 'source_incar_sha256' not in loaded['inputs']
+
+
+def test_create_from_build_records_source_and_final_managed_input_hashes(tmp_path):
+    """源 INCAR 与受管目录最终输入分开溯源；自动补全会使两者哈希不同。"""
+    poscar, lib = _make_fixture(tmp_path)
+    source_incar = tmp_path / 'member-a' / 'INCAR'
+    source_incar.parent.mkdir()
+    source_incar.write_text('ISMEAR = 0\n', encoding='utf-8')
+    out = tmp_path / 'managed' / 'job-a'
+    res = build_job_dir(poscar, str(source_incar), str(out),
+                        calc_type='molecule', lib_root=lib)
+
+    manifest.create_from_build(
+        str(out), res, poscar_path=poscar, incar_path=source_incar, validate=True)
+    inputs = manifest.load_manifest(out)['inputs']
+
+    assert inputs['source_incar_path'] == str(source_incar.resolve())
+    assert inputs['source_incar_sha256'] == manifest.sha256_file(source_incar)
+    assert set(inputs['sha256']) == {'INCAR', 'POSCAR', 'KPOINTS', 'POTCAR'}
+    assert inputs['sha256'] == {
+        name: manifest.sha256_file(out / name)
+        for name in ('INCAR', 'POSCAR', 'KPOINTS', 'POTCAR')
+    }
+    assert inputs['sha256']['INCAR'] != inputs['source_incar_sha256']
+
+
+def test_create_from_build_hashes_only_existing_managed_inputs(tmp_path):
+    poscar, lib = _make_fixture(tmp_path)
+    out = tmp_path / 'partial-audit'
+    res = build_job_dir(poscar, 'ENCUT = 400\n', str(out),
+                        calc_type='molecule', lib_root=lib)
+    (out / 'KPOINTS').unlink()
+
+    manifest.create_from_build(str(out), res, poscar_path=poscar)
+
+    hashes = manifest.load_manifest(out)['inputs']['sha256']
+    assert set(hashes) == {'INCAR', 'POSCAR', 'POTCAR'}
 
 
 def test_manifest_records_potcar_provenance(tmp_path):

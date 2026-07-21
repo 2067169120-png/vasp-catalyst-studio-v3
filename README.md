@@ -156,8 +156,8 @@ silent (job.yaml state machine + audit history).
 
 - 结果分析页可递归导入一个完整文件夹；仅有 `CONTCAR/OSZICAR/OUTCAR/vasprun.xml`
   的已算结果也能按多证据收敛门槛识别，不要求它原先属于集群台账。
-- Li-S 向导复用已导入的分子参考能：固定 `INCAR` + clean slab POSCAR + 多个
-  adsorption POSCAR 自动补齐四件套；用户选择服务器、核数和墙时后可整组提交。
+- Li-S 向导复用已导入的分子参考能：clean slab 与每个 adsorption 目录分别读取自己的
+  `POSCAR + INCAR` 并自动补齐四件套；用户选择服务器、核数和墙时后可整组提交。
 - 自动托管在软件保持运行时监控、最多续算 3 轮、下载关键结果，并在整组完成后
   自动计算吸附能和生成报告。
 - 依赖入口改为“检测 → 推荐勾选 → 复制可直接执行的 PowerShell/终端命令 → 重新检测”。
@@ -193,6 +193,10 @@ silent (job.yaml state machine + audit history).
 
 ### 2026-07-21：批量吸附能智能分组与可信自动托管
 
+- 新计算扫描会把每个结构绑定到同目录唯一的 `INCAR`，不同目录多份 INCAR 不再视为歧义；
+  本地文件优先，显式备用只补真正缺失的目录，不会掩盖空文件、大小写冲突或非法参数。
+  生成、manifest 和 SSH 上传均逐成员保留源路径与 SHA256；上传前会再次核对最终四件套，
+  准备后被修改的成员必须重新准备。物种分组仍只由结构组成决定。
 - 新计算目录优先读取 `POSCAR`，已算结果优先读取 `CONTCAR`；以
   `composition(config) − composition(clean slab)` 识别吸附物化学计量，按组成稳定分组。
   文件夹名只作提示；同组成多参考、无法唯一识别或人工改映射时必须确认并留审计记录。
@@ -205,7 +209,7 @@ silent (job.yaml state machine + audit history).
 - ΔE 的 slab/config/reference 每个操作数都要通过 DONE、完整结束页脚和当前 `OSZICAR:E0`
   复核。无参考态、参考无效或未确认的方法差异只能生成诊断，不能标记为最终吸附能报告。
   报告绑定成员代次、能量、下载哈希与方法证据；结果变化或报告文件删除后会自动失效重建。
-- 当前回归基线：**2586 测试通过，8 项按本机可选软件/依赖环境跳过**。
+- 当前回归基线：**2624 测试通过，6 项按本机可选软件/依赖环境跳过**。
 
 ## Install & quickstart
 
@@ -229,7 +233,7 @@ report, no VASP or cluster): [examples/offline_analysis](examples/offline_analys
 — `python examples/offline_analysis/run_demo.py` drives a synthetic completed
 job set end-to-end so a reviewer can confirm the analysis half of the pipeline.
 
-**Tests**: `python -m pytest` — 2586 tests, 8 skipped (optional OriginLab smoke
+**Tests**: `python -m pytest` — 2624 tests, 6 skipped (optional OriginLab smoke
 behind `VCS_ORIGIN_SMOKE=1`, and a POV-Ray real-render smoke). Parser
 cross-checks against ASE run when `ase` is installed (in the `dev` extra).
 CI runs the suite on ubuntu/windows × Python 3.10/3.12.

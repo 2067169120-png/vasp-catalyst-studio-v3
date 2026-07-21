@@ -20,6 +20,7 @@ from vcstudio import __version__
 
 SCHEMA_VERSION = 1
 MANIFEST_NAME = 'job.yaml'
+_MANAGED_VASP_INPUTS = ('INCAR', 'POSCAR', 'KPOINTS', 'POTCAR')
 
 # 状态机:生成期 CREATED;M2 起 UPLOADED/SUBMITTED/QUEUED/RUNNING;
 # 终态 DONE/FAILED/UNCONVERGED;规则未命中交人工 NEEDS_HUMAN。
@@ -171,6 +172,7 @@ def _poscar_system_name(poscar_path: str | os.PathLike) -> str:
 
 def create_from_build(job_dir: str | os.PathLike, build_result: dict, *,
                       poscar_path: str | os.PathLike,
+                      incar_path: str | os.PathLike | None = None,
                       validate: bool = True,
                       task_type: str | None = None,
                       system: str = '') -> dict:
@@ -183,6 +185,10 @@ def create_from_build(job_dir: str | os.PathLike, build_result: dict, *,
     task_type=None(默认)→ 用 build_result['task_type'](build_job_dir 按 INCAR 的
     NSW/IBRION 推断:NSW=0→static、IBRION=5/6→freq),再退 'relax'。修复静态作业
     被按 relax 收敛标志('reached required accuracy')误判未收敛的正确性 bug。
+
+    incar_path 是可选的用户源 INCAR 路径；提供时记录其绝对路径与
+    SHA256。无论是否提供，都会对受管作业目录中已存在的 VASP 四件套
+    记录最终 SHA256，以区分用户源文本与自动补全后真正待提交的输入。
     """
     if task_type is None:
         task_type = str(build_result.get('task_type') or 'relax')
@@ -198,6 +204,15 @@ def create_from_build(job_dir: str | os.PathLike, build_result: dict, *,
         'kpoints': list(build_result.get('kpoints') or []),
         # 赝势身份(发刊级溯源):哪套 POTCAR 算的,结果永远可答
         'potcar': list(build_result.get('potcar') or []),
+    }
+    if incar_path is not None:
+        source_incar = Path(incar_path).resolve()
+        inputs['source_incar_path'] = str(source_incar)
+        inputs['source_incar_sha256'] = sha256_file(source_incar)
+    inputs['sha256'] = {
+        name: sha256_file(job_dir / name)
+        for name in _MANAGED_VASP_INPUTS
+        if (job_dir / name).is_file()
     }
     potcar_file = job_dir / 'POTCAR'
     if potcar_file.is_file():

@@ -46,7 +46,7 @@
 
   const ACTIONS = {
     import_adsorption_results: ['导入已算好的 Li-S 结果', '整文件夹识别参考态、slab 与吸附构型', openResultsImport],
-    lis_new: ['Li-S 一站式：开始新的吸附计算', '参考能 + 固定 INCAR + slab / adsorption POSCAR → 自动托管整组任务', async () => {
+    lis_new: ['Li-S 一站式：开始新的吸附计算', '参考能 + 各目录 POSCAR/INCAR → 自动托管整组任务', async () => {
       const out = await VCS.navigate('project', { source: 'dashboard-lis-new' });
       if (out.ok && window.Project && Project.startLiS) Project.startLiS();
     }],
