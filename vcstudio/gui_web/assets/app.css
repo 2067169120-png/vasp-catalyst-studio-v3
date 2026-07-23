@@ -247,6 +247,13 @@ pre.meth-pre{white-space:pre-wrap;word-break:break-word;max-height:200px}
 .feed-row .fbtn{flex-shrink:0}
 
 /* ── 项目管线(站点进度条:生成→提交→监控→恢复→分析→报告) ── */
+.db-automation{display:flex;align-items:center;gap:10px;margin:2px 4px 8px;padding:8px 10px;
+  border:1px solid var(--rule);border-left:3px solid var(--accent);border-radius:5px;
+  background:var(--surface);font-size:11.5px;color:var(--muted)}
+.db-automation b{color:var(--ink);white-space:nowrap}
+.db-automation.run{border-left-color:var(--ok);background:var(--ok-bg)}
+.db-automation.pause{border-left-color:var(--queue)}
+.db-automation.fail{border-left-color:var(--fail);background:var(--fail-bg);color:var(--fail)}
 .pl-proj{padding:9px 4px;border-bottom:1px solid var(--rule)}
 .pl-proj:last-child{border-bottom:none}
 .pl-head{display:flex;align-items:center;gap:8px;margin-bottom:7px;font-size:12.5px}
@@ -263,6 +270,10 @@ pre.meth-pre{white-space:pre-wrap;word-break:break-word;max-height:200px}
 .pl-step.done::before{background:var(--ok)}
 .pl-step.cur .dot{background:var(--accent);border-color:var(--accent-dark);box-shadow:0 0 0 3px var(--accent-soft)}
 .pl-step.cur .lbl{color:var(--accent-dark);font-weight:700}
+.pl-report{display:block;margin:7px 0 0;font-size:10.5px;color:var(--muted);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.pl-report.ok{color:var(--ok)}
+.pl-report.warn{color:var(--warn)}
 .pl-empty{color:var(--muted);font-size:12.5px;padding:10px 4px}
 
 /* ── 页顶错误条(dashboard 取数失败不再假装 0 作业) ── */
@@ -381,6 +392,32 @@ nav a.on .stepno{background:var(--accent);border-color:var(--accent);color:#fff}
 .fig-param label{font-size:11.5px;color:var(--muted)}
 
 /* ── AI 助手页 ── */
+.ai-chat-head{display:flex;gap:10px;align-items:center;margin-bottom:10px}
+.ai-chat-head>div:first-child{flex:1;min-width:220px}
+.ai-chat-head .gen-h{margin-bottom:3px!important;padding:0!important;border:0!important}
+.ai-chat-head select{flex:0 1 220px;min-width:150px}
+.ai-chat-messages{height:310px;overflow:auto;border:1px solid var(--rule);border-radius:6px;
+  background:var(--code-bg);padding:12px;display:flex;flex-direction:column;gap:10px}
+.ai-chat-empty{margin:auto;color:var(--muted);font-size:12px;text-align:center}
+.ai-msg{max-width:82%;padding:8px 11px;border-radius:7px;background:var(--surface);
+  border:1px solid var(--rule);white-space:pre-wrap;line-height:1.55;font-size:12.5px}
+.ai-msg.user{align-self:flex-end;background:var(--accent-soft);border-color:var(--accent)}
+.ai-msg.assistant{align-self:flex-start}
+.ai-msg .ai-msg-meta{display:block;font:9.5px/1.4 var(--mono);color:var(--muted);margin-bottom:4px}
+.ai-chat-files{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0;min-height:24px}
+.ai-file-chip{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--rule);
+  border-radius:12px;padding:3px 8px;font-size:10.5px;color:var(--muted);background:var(--surface)}
+.ai-file-chip input{margin:0}
+.ai-chat-compose{display:flex;align-items:flex-end;gap:8px}
+.ai-chat-compose textarea{flex:1;min-height:52px;max-height:130px}
+.ai-chat-compose .btn{flex:0 0 auto}
+.ai-chat-privacy{margin-top:7px;line-height:1.5}
+@media (max-width:760px){
+  .ai-chat-head{align-items:stretch;flex-wrap:wrap}
+  .ai-chat-head select{flex:1}
+  .ai-chat-compose{flex-wrap:wrap}
+  .ai-chat-compose textarea{order:-1;flex-basis:100%}
+}
 .ai-guide{background:var(--warn-bg);color:var(--warn);border:1px solid #E4CE93;border-radius:6px;
   padding:10px 13px;font-size:12.5px;line-height:1.6;margin-bottom:14px}
 .ai-autowarn{background:var(--fail-bg);color:var(--fail);border:1px solid var(--fail);border-radius:6px;

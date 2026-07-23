@@ -43,3 +43,4 @@ pytest-of-root/
 vcstudio_paste/
 vcs_solv_*_POSCAR
 vcstudio_deps_*.log
+qa_outputs/

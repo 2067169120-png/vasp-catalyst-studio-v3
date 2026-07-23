@@ -21,7 +21,7 @@ PUB_COLORS = ['#4477AA', '#EE6677', '#228833', '#CCBB44',
 # ── runner:在系统 Python 里跑的独立脚本(只依赖 originpro/numpy,不依赖 vcstudio) ──
 RUNNER_SOURCE = r'''# -*- coding: utf-8 -*-
 """vcstudio Origin 渲染 runner(自动生成,勿手改):spec.json → PNG + result.json"""
-import json, math, os, sys
+import json, math, os, sys, textwrap
 
 PUB = ['#4477AA', '#EE6677', '#228833', '#CCBB44', '#66CCEE', '#AA3377', '#BBBBBB', '#222255']
 # 出版级样式常量(移植原版 origin_ZnTa_plots.py 真机验证过的口径)
@@ -127,11 +127,22 @@ def _strip_common_prefix(names):
     return [n[k:] or n for n in names] if k > 0 else names
 
 
+def _wrap_species_label(name):
+    """保留完整构型名，优先在目录分隔符后换行，避免水平文字互相覆盖。"""
+    value = str(name)
+    if len(value) <= 14:
+        return value
+    breakable = value.replace('_', '_ ').replace('-', '- ')
+    return '\n'.join(textwrap.wrap(
+        breakable, width=14, break_long_words=False, break_on_hyphens=True))
+
+
 def _render_bar_single(op, c, out_dir, width):
     """单体系出版级柱状图(原版 _fig_ads_bar 口径):NPG 逐物种配色 + 数值标注 +
     物种名下置 + 隐藏 X 刻度 + 网格 + 阴影理想窗口带(失败降级为参考线)。"""
     d = c['data']
-    species = _strip_common_prefix([str(x) for x in d['cols']])
+    species = [_wrap_species_label(x)
+               for x in _strip_common_prefix([str(x) for x in d['cols']])]
     vals = [_nan(v) for v in d['matrix'][0]]
     n = len(species)
     x_spacing = 2.0

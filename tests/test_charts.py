@@ -135,8 +135,25 @@ def test_convergence_mismatched_raises():
 def test_bar_data_from_delta():
     rows = [{'name': 'ads_S8', 'delta_e': -4.1}, {'name': 'bad', 'delta_e': None}]
     d = charts.bar_data_from_delta('proj', rows, band=(-2.9, -1.65))
-    assert d == {'rows': ['proj'], 'cols': ['ads_S8'], 'matrix': [[-4.1]],
+    assert d == {'rows': ['proj'], 'cols': ['S8'], 'matrix': [[-4.1]],
                  'band': (-2.9, -1.65), 'band_label': ''}
+
+
+def test_bar_data_from_delta_shortens_long_names_without_losing_semantics():
+    semantic = 'Li2S8_bridge_site_long_relaxed_spin_polarized'
+    other = 'Li2S8_top_site_long_relaxed_spin_polarized'
+    rows = [
+        {'name': f'/E/results/Catalyst_Alpha_ads_{semantic}', 'delta_e': -2.11},
+        {'name': f'/E/results/ads_{semantic}', 'delta_e': -2.22},
+        {'name': f'/E/results/Catalyst_Alpha_{other}', 'delta_e': -2.33},
+    ]
+
+    data = charts.bar_data_from_delta('Catalyst_Alpha', rows)
+
+    assert data['cols'] == [semantic, f'{semantic} [2]', other]
+    assert data['matrix'] == [[-2.11, -2.22, -2.33]]
+    assert all('Catalyst_Alpha' not in label and not label.startswith('ads_')
+               for label in data['cols'])
 
 
 def test_bar_data_from_delta_all_none_raises():

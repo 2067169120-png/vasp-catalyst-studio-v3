@@ -547,6 +547,19 @@ def test_refresh_status_unknown_profile_error():
     assert out.get('error') and '集群' in out['error']
 
 
+def test_manual_refresh_does_not_race_background_pipeline():
+    api = Api(profiles_mod=_fake_profiles({}), ledger_mod=_fake_ledger([], []))
+    assert api._pipeline_lock.acquire(blocking=False)
+    try:
+        one = api.refresh_status('c1', None, False)
+        all_profiles = api.refresh_all_status()
+    finally:
+        api._pipeline_lock.release()
+
+    assert one['busy'] is True and '后台自动托管' in one['error']
+    assert all_profiles['busy'] is True and '后台自动托管' in all_profiles['error']
+
+
 def test_refresh_all_status_monitors_all_active_servers_and_isolates_failure():
     entries = [
         ('/a', {'scheduler_job_id': '1', 'cluster': 'c1', 'state': 'RUNNING'}),

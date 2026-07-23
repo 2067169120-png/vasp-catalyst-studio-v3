@@ -6,7 +6,11 @@
   const $ = id => document.getElementById(id);
   const METHOD_FIELDS = ['functional', 'dispersion', 'encut', 'kpoints_relax',
     'kpoints_static', 'ediff', 'ediffg', 'spin', 'u_values', 'solvation'];
-  const State = { spec: null, plan: null, tables: null, compareProj: null, variants: null };
+  const State = {
+    spec: null, plan: null, tables: null, compareProj: null, variants: null,
+    chatSession: null, chatMessages: [], chatAttachments: [],
+    chatSelected: new Set(), chatBusy: false,
+  };
 
   function leafVal(leaf) {
     if (leaf && typeof leaf === 'object') {
@@ -25,6 +29,171 @@
   }
   function isLow(leaf) {
     return leaf && typeof leaf === 'object' && leaf.confidence && leaf.confidence !== 'high';
+  }
+
+  // ── 对话式助手:持久会话 + 明确勾选附件 + 本地限定命令 ──
+  function setChatBusy(value) {
+    State.chatBusy = !!value;
+    const send = $('ai-chat-send'), stop = $('ai-chat-stop'), input = $('ai-chat-input');
+    if (send) send.disabled = State.chatBusy;
+    if (stop) stop.disabled = !State.chatBusy;
+    if (input) input.disabled = State.chatBusy;
+  }
+
+  function renderChat() {
+    const box = $('ai-chat-messages');
+    if (!box) return;
+    const messages = State.chatMessages || [];
+    if (!messages.length) {
+      box.innerHTML = '<div class="ai-chat-empty">输入 /help 查看离线命令，或添加文件后开始分析。</div>';
+    } else {
+      box.innerHTML = messages.map(item => {
+        const role = item.role === 'user' ? 'user' : 'assistant';
+        const who = role === 'user' ? '你' : (item.source === 'local' ? '本地助手' : 'AI 助手');
+        const files = (item.attachments || []).map(a => a.name).filter(Boolean);
+        const fileLine = files.length
+          ? `<span class="ai-msg-meta">附件：${files.map(VCS.esc).join('、')}</span>` : '';
+        return `<div class="ai-msg ${role}"><span class="ai-msg-meta">${VCS.esc(who)}</span>` +
+          fileLine + `${VCS.esc(item.content || '')}</div>`;
+      }).join('');
+      if (State.chatBusy) {
+        box.insertAdjacentHTML('beforeend',
+          '<div class="ai-msg assistant"><span class="ai-msg-meta">AI 助手</span>正在生成，可随时停止…</div>');
+      }
+    }
+    box.scrollTop = box.scrollHeight;
+    renderChatFiles();
+  }
+
+  function renderChatFiles() {
+    const box = $('ai-chat-files');
+    if (!box) return;
+    const files = State.chatAttachments || [];
+    if (!files.length) {
+      box.innerHTML = '<span class="sub">本会话暂无附件</span>';
+      return;
+    }
+    box.innerHTML = files.map(file => {
+      const checked = State.chatSelected.has(file.id) ? ' checked' : '';
+      const kb = Math.max(1, Math.ceil((Number(file.size_bytes) || 0) / 1024));
+      return `<label class="ai-file-chip" title="${VCS.esc(file.preview_note || '')}">` +
+        `<input type="checkbox" data-chat-file="${VCS.esc(file.id)}"${checked}>` +
+        `${VCS.esc(file.name || '附件')} · ${kb} KB</label>`;
+    }).join('');
+  }
+
+  async function loadChatHistory(sessionId, clearSelection) {
+    if (!sessionId) return;
+    if (clearSelection) State.chatSelected = new Set();
+    const r = await VCS.call('ai_chat_history', sessionId);
+    if (!r || r.ok === false || r.error) {
+      VCS.log('读取对话失败:' + ((r && r.error) || '未知错误'), 'failc');
+      return;
+    }
+    State.chatSession = sessionId;
+    State.chatMessages = r.messages || [];
+    State.chatAttachments = r.attachments || [];
+    const valid = new Set(State.chatAttachments.map(item => item.id));
+    State.chatSelected = new Set(
+      Array.from(State.chatSelected).filter(id => valid.has(id)));
+    renderChat();
+  }
+
+  async function loadChatSessions(createIfEmpty) {
+    let r = await VCS.call('ai_chat_sessions');
+    if (!r || r.ok === false || r.error) {
+      VCS.log('读取 AI 会话失败:' + ((r && r.error) || '未知错误'), 'failc');
+      return;
+    }
+    let sessions = r.sessions || [];
+    if (!sessions.length && createIfEmpty) {
+      const made = await VCS.call('ai_chat_new', '材料计算对话');
+      if (!made || made.ok === false || made.error) {
+        VCS.log('新建 AI 会话失败:' + ((made && made.error) || '未知错误'), 'failc');
+        return;
+      }
+      sessions = [made.session];
+    }
+    const select = $('ai-chat-session');
+    if (!select) return;
+    const wanted = sessions.some(item => item.id === State.chatSession)
+      ? State.chatSession : (sessions[0] && sessions[0].id);
+    select.innerHTML = sessions.map(item =>
+      `<option value="${VCS.esc(item.id)}">${VCS.esc(item.title || '新对话')}</option>`).join('');
+    if (wanted) {
+      select.value = wanted;
+      await loadChatHistory(wanted, wanted !== State.chatSession);
+    }
+  }
+
+  async function newChat() {
+    const r = await VCS.call('ai_chat_new', '材料计算对话');
+    if (!r || r.ok === false || r.error) {
+      VCS.log('新建 AI 会话失败:' + ((r && r.error) || '未知错误'), 'failc');
+      return;
+    }
+    State.chatSession = r.session.id;
+    State.chatSelected = new Set();
+    await loadChatSessions(false);
+    const input = $('ai-chat-input'); if (input) input.focus();
+  }
+
+  async function attachChatFiles() {
+    if (!State.chatSession) { await newChat(); }
+    if (!State.chatSession) return;
+    const picked = await VCS.call('pick_files', 'chat');
+    if (!picked || picked.error) {
+      VCS.log('选择附件失败:' + ((picked && picked.error) || '未知错误'), 'failc');
+      return;
+    }
+    if (!(picked.paths || []).length) return;
+    const r = await VCS.call('ai_chat_attach', State.chatSession, picked.paths);
+    if (!r) {
+      VCS.log('附件导入失败:后端没有返回结果', 'failc');
+      return;
+    }
+    (r.attachments || []).forEach(item => State.chatSelected.add(item.id));
+    if ((r.attachments || []).length) await loadChatHistory(State.chatSession, false);
+    if (r.ok === false || r.error) {
+      VCS.log('附件导入失败:' + ((r && r.error) || '未知错误'), 'failc');
+      return;
+    }
+    VCS.log('附件已安全导入本地会话；本次发送默认勾选新附件', 'okc');
+  }
+
+  async function sendChat() {
+    if (State.chatBusy) return;
+    if (!State.chatSession) { await newChat(); }
+    const input = $('ai-chat-input');
+    const text = (input && input.value.trim()) || '';
+    if (!text || !State.chatSession) return;
+    document.querySelectorAll('[data-chat-file]').forEach(el => {
+      if (el.checked) State.chatSelected.add(el.dataset.chatFile);
+      else State.chatSelected.delete(el.dataset.chatFile);
+    });
+    const selected = Array.from(State.chatSelected);
+    setChatBusy(true);
+    renderChat();
+    try {
+      const r = await VCS.call('ai_chat_send', State.chatSession, text, selected);
+      if (!r || r.ok === false || r.error) {
+        VCS.log('AI 对话失败:' + ((r && r.error) || '未知错误'), 'failc');
+      } else {
+        if (input) input.value = '';
+        State.chatSelected = new Set();
+      }
+    } finally {
+      setChatBusy(false);
+      await loadChatHistory(State.chatSession, false);
+      await loadChatSessions(false);
+    }
+  }
+
+  async function stopChat() {
+    if (!State.chatSession) return;
+    const r = await VCS.call('ai_chat_stop', State.chatSession);
+    if (r && r.result && r.result.stopped) VCS.toast('已停止当前 AI 回复；集群作业不受影响');
+    else VCS.toast('当前没有正在生成的 AI 回复');
   }
 
   // ── 联网门控引导条 ──
@@ -337,6 +506,27 @@
   let inited = false;
   function init() {
     if (inited) return; inited = true;
+    wire('ai-chat-new', newChat);
+    wire('ai-chat-attach', attachChatFiles);
+    wire('ai-chat-send', sendChat);
+    wire('ai-chat-stop', stopChat);
+    const chatSession = $('ai-chat-session');
+    if (chatSession) chatSession.addEventListener('change', () => {
+      loadChatHistory(chatSession.value, true);
+    });
+    const chatFiles = $('ai-chat-files');
+    if (chatFiles) chatFiles.addEventListener('change', e => {
+      const input = e.target.closest && e.target.closest('[data-chat-file]');
+      if (!input) return;
+      if (input.checked) State.chatSelected.add(input.dataset.chatFile);
+      else State.chatSelected.delete(input.dataset.chatFile);
+    });
+    const chatInput = $('ai-chat-input');
+    if (chatInput) chatInput.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault(); sendChat();
+      }
+    });
     wire('ai-pdf-btn', pickPdf);
     wire('ai-extract-btn', extract);
     wire('ai-plan-btn', plan);
@@ -358,6 +548,7 @@
     });
     refreshGuide();
     loadProjects();
+    loadChatSessions(true);
   }
 
   document.addEventListener('vcs:page', e => {
@@ -366,5 +557,7 @@
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 
-  window.AIAssistant = { reload: refreshGuide };
+  window.AIAssistant = { reload: () => {
+    refreshGuide(); loadChatSessions(false);
+  } };
 })();

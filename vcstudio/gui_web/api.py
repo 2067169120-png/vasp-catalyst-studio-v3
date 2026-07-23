@@ -12,6 +12,7 @@ import base64
 import binascii
 import copy
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -235,7 +236,8 @@ class Api:
                  manuscript_draft_mod=None, bands_parse_mod=None, deps_runner=None,
                  neb_builder_mod=None, references_mod=None, chgdiff_mod=None,
                  incar_builder_mod=None, metal_slab_mod=None, usage_mod=None,
-                 result_import_mod=None, task_analysis_mod=None):
+                 result_import_mod=None, task_analysis_mod=None,
+                 pipeline_supervisor_cls=None, assistant_chat_mod=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -335,13 +337,83 @@ class Api:
         self._result_import = result_import_mod
         # 23 类任务共用的能力矩阵/证据报告；未接解析器的任务必须显式标记。
         self._task_analysis = task_analysis_mod
+        # MatClaw 式对话入口仅复用会话/附件/状态设计；Python 原生实现延迟加载，
+        # 不把 Node、Docker 或任意 shell 执行面带进桌面程序。
+        self._assistant_chat = assistant_chat_mod
         # pywebview 可并发调用同一个 js_api；后端锁才是自动托管的正确性边界。
         # 前端的 running 标志只负责交互，不能阻止两条线程同时续算/出报告。
         self._pipeline_lock = threading.Lock()
+        self._pipeline_supervisor_cls = pipeline_supervisor_cls
+        self._pipeline_supervisor = None
+        self._pipeline_runtime_lock = threading.RLock()
+        self._pipeline_runtime = {
+            'running': False, 'paused': False, 'tick_running': False,
+            'enabled': None, 'interval_seconds': None, 'last_started': None,
+            'last_finished': None, 'next_check': None, 'outcome_seq': 0,
+            'outcome_history': [],
+            'last_outcome': None, 'last_error': None,
+        }
 
     # ── 桥活性探测(前端用来确认 js_api 已就绪) ──
     def ping(self) -> str:
         return 'pong'
+
+    # ── 进程级自动托管调度器 ────────────────────────────────────────────────
+    def _publish_pipeline_runtime(self, state):
+        """保存调度线程的只读快照；前端只轮询该快照，不再自己驱动计算。"""
+        with self._pipeline_runtime_lock:
+            self._pipeline_runtime = copy.deepcopy(state)
+
+    def start_background_services(self):
+        """启动唯一后台调度线程；由桌面入口调用，重复调用安全。"""
+        try:
+            if self._pipeline_supervisor is None:
+                cls = self._pipeline_supervisor_cls
+                if cls is None:
+                    from vcstudio.gui_web.pipeline_supervisor import PipelineSupervisor
+                    cls = PipelineSupervisor
+                self._pipeline_supervisor = cls(
+                    self._autopilot_cfg, self.pipeline_tick,
+                    self._publish_pipeline_runtime)
+            started = bool(self._pipeline_supervisor.start())
+            return {'ok': True, 'started': started,
+                    'state': self._pipeline_supervisor.snapshot(), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'started': False, 'state': None, 'error': str(e)}
+
+    def stop_background_services(self):
+        """关闭后台线程；已在执行的一拍不会被暴力终止。"""
+        try:
+            if self._pipeline_supervisor is None:
+                return {'ok': True, 'stopped': True, 'error': None}
+            stopped = bool(self._pipeline_supervisor.stop(timeout=2.0))
+            return {'ok': stopped, 'stopped': stopped,
+                    'error': None if stopped else '后台任务仍在收尾，将在本拍结束后退出'}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'stopped': False, 'error': str(e)}
+
+    def pipeline_runtime_status(self):
+        """返回调度器状态与最近一拍结果，供 UI 展示下一次检查和阻塞原因。"""
+        try:
+            if self._pipeline_supervisor is not None:
+                state = self._pipeline_supervisor.snapshot()
+            else:
+                with self._pipeline_runtime_lock:
+                    state = copy.deepcopy(self._pipeline_runtime)
+            return {'ok': True, 'state': state, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'state': None, 'error': str(e)}
+
+    def pipeline_wake(self):
+        """要求后台线程立即补跑一拍；不会创建第二个并发调度器。"""
+        started = self.start_background_services()
+        if not started.get('ok'):
+            return {'ok': False, 'queued': False, 'error': started.get('error')}
+        try:
+            queued = bool(self._pipeline_supervisor.wake())
+            return {'ok': True, 'queued': queued, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'queued': False, 'error': str(e)}
 
     # ── 内部:重模块延迟加载 ──
     def _bo(self):
@@ -395,6 +467,24 @@ class Api:
             from vcstudio.project import ai_analysis
             self._ai_analysis = ai_analysis
         return self._ai_analysis
+
+    def _chat(self):
+        """Python 原生对话服务；会话/附件落用户配置目录，不进入项目源文件。"""
+        service = self._assistant_chat
+        if service is not None and hasattr(service, 'list_sessions'):
+            return service
+        if service is None:
+            from vcstudio.project import assistant_chat as service
+        root_fn = getattr(self._config, 'user_config_dir', None)
+        root = (root_fn() if callable(root_fn)
+                else os.path.join(os.path.expanduser('~'), '.config', 'vcstudio'))
+        cls = getattr(service, 'AssistantChat')
+        self._assistant_chat = cls(
+            os.path.join(str(root), 'assistant'),
+            config_loader=self._config.load_config,
+            key_loader=self._ai().load_api_key,
+        )
+        return self._assistant_chat
 
     def _fb(self):
         """频率作业生成端(F14)延迟加载。"""
@@ -958,6 +1048,18 @@ class Api:
                                   prof, pw, list(dirs), trust_new))
 
     def refresh_status(self, name, password, trust_new=False):
+        """Refresh one profile without racing the background supervisor."""
+        if not self._pipeline_lock.acquire(blocking=False):
+            return {
+                'needs_trust': False, 'results': [], 'busy': True,
+                'error': '后台自动托管正在同步，请等待本轮完成后再手动查询',
+            }
+        try:
+            return self._refresh_status_once(name, password, trust_new)
+        finally:
+            self._pipeline_lock.release()
+
+    def _refresh_status_once(self, name, password, trust_new=False):
         def _refresh(prof, pw):
             # 目标 dirs 逻辑照抄 jobs_tab._on_refresh_status:
             # 台账里该集群 + 有作业号 + 状态 SUBMITTED/QUEUED/RUNNING
@@ -971,6 +1073,18 @@ class Api:
 
     def refresh_all_status(self):
         """并行刷新所有服务器上的活跃作业；单台失败、缺密码或待确认指纹不拖累其它服务器。"""
+        if not self._pipeline_lock.acquire(blocking=False):
+            return {
+                'ok': True, 'profiles': [], 'results': [], 'errors': [],
+                'needs_trust': False, 'busy': True,
+                'error': '后台自动托管正在同步，本次独立刷新已跳过',
+            }
+        try:
+            return self._refresh_all_status_once()
+        finally:
+            self._pipeline_lock.release()
+
+    def _refresh_all_status_once(self):
         try:
             profiles = self._profiles.load_profiles()
             active = set()
@@ -990,7 +1104,8 @@ class Api:
                 workers = min(8, len(names))
                 with ThreadPoolExecutor(max_workers=workers,
                                         thread_name_prefix='vcs-refresh') as pool:
-                    futures = {pool.submit(self.refresh_status, name, None, False): name
+                    futures = {pool.submit(
+                        self._refresh_status_once, name, None, False): name
                                for name in names}
                     for future in as_completed(futures):
                         name = futures[future]
@@ -2863,6 +2978,9 @@ class Api:
                     self._config.set_ui_state(
                         autopilot=True, autopilot_continue=True,
                         autopilot_fetch=True, autopilot_report=True)
+                    if self._pipeline_supervisor is not None:
+                        self._pipeline_supervisor.reconfigure()
+                        self._pipeline_supervisor.wake()
                 except Exception as e:                    # noqa: BLE001 自动化开关可重试
                     persistence_errors.append(f'任务已提交，但自动托管设置保存失败：{e}')
                 if getattr(prof, 'auth', 'key') == 'password' and pw:
@@ -2968,6 +3086,37 @@ class Api:
                 result['project']['work_mode'] = 'lis'
                 project_root = result['project'].get('root') or os.path.join(target, name)
                 self._adsorption.save_project(project_root, result['project'])
+                # 已算结果导入后不再要求用户额外点一次“生成报告”。只有全部成员
+                # 已完成且本地证据可读时才立即出报告；最终门禁未过则出诊断版。
+                try:
+                    states = self._member_states(result['project'])
+                    if states and self._project_all_done(states):
+                        project_path = (result.get('project_path')
+                                        or os.path.join(project_root, 'project.yaml'))
+                        summary = self._adsorption.delta_e_rows(result['project'])
+                        eligible, reason = self._final_report_gate(
+                            result['project'], summary)
+                        report_dir = os.path.join(project_root, 'report')
+                        report_name = (f'{name}_report.html' if eligible
+                                       else f'{name}_diagnostic.html')
+                        generated = self.proj_report(
+                            project_path, os.path.join(report_dir, report_name),
+                            final=eligible)
+                        result['auto_report'] = generated
+                        if not eligible:
+                            result['auto_report_reason'] = reason
+                            if generated.get('ok'):
+                                try:
+                                    result['auto_report_blocked'] = (
+                                        self._persist_blocked_report_marker(
+                                            result['project'], summary, reason,
+                                            generated.get('files')
+                                            or [generated.get('file')]))
+                                except Exception as marker_exc:  # noqa: BLE001 报告本体仍有效
+                                    generated['marker_error'] = str(marker_exc)
+                except Exception as exc:                 # noqa: BLE001 导入成功不因报告降级而回滚
+                    result['auto_report'] = {
+                        'ok': False, 'file': None, 'files': [], 'error': str(exc)}
             result.setdefault('ok', True)
             result.setdefault('imported', [])
             result.setdefault('summary', {})
@@ -3144,35 +3293,61 @@ class Api:
             return {'ok': False, 'file': None, 'error': str(e)}
 
     def proj_report(self, path, save_to, final=False):
-        """完整项目报告(镜像 project_tab._on_report);同步执行,耗时长在 JS 侧提示等待。
-
-        load_project → 无成员作业防呆(report_full._member_dirs)→ generate_project_report
-        (proj, save_to, config=load_config())。config 读失败降级为 {}(同 _on_report)。
-        """
+        """生成同源 HTML、Word 和 PDF；最终报告会立即写入哈希绑定标记。"""
         try:
             proj = self._adsorption.load_project((path or '').strip())
             if proj is None:
-                return {'ok': False, 'file': None,
+                return {'ok': False, 'file': None, 'files': [],
                         'error': '项目不存在或 project.yaml 已被移动'}
             out = (save_to or '').strip()
             if not out:
-                return {'ok': False, 'file': None, 'error': '未指定报告路径'}
+                return {'ok': False, 'file': None, 'files': [],
+                        'error': '未指定报告路径'}
             if not self._rf()._member_dirs(proj):
-                return {'ok': False, 'file': None, 'error': '项目无成员作业'}
+                return {'ok': False, 'file': None, 'files': [],
+                        'error': '项目无成员作业'}
+            summary = None
             if final:
                 summary = self._adsorption.delta_e_rows(proj)
                 eligible, reason = self._final_report_gate(proj, summary)
                 if not eligible:
-                    return {'ok': False, 'file': None,
+                    return {'ok': False, 'file': None, 'files': [],
                             'error': f'最终吸附能报告门禁未通过：{reason}'}
             try:
                 cfg = self._config.load_config()
             except Exception:                             # noqa: BLE001
                 cfg = {}
-            result = self._rf().generate_project_report(proj, out, config=cfg)
-            return {'ok': True, 'file': str(result), 'error': None}
+            generator = self._rf().generate_project_report
+            parameters = inspect.signature(generator).parameters
+            kwargs = {'config': cfg}
+            if ('report_status' in parameters
+                    or any(p.kind == inspect.Parameter.VAR_KEYWORD
+                           for p in parameters.values())):
+                kwargs['report_status'] = 'final' if final else 'diagnostic'
+            result = generator(proj, out, **kwargs)
+            primary = str(result)
+            bundle_fn = getattr(self._rf(), 'report_bundle_paths', None)
+            if callable(bundle_fn):
+                files = [str(item) for item in bundle_fn(primary)]
+            else:
+                candidates = [primary]
+                stem, _ext = os.path.splitext(primary)
+                candidates.extend([stem + '.docx', stem + '.pdf'])
+                files = [item for item in candidates if os.path.isfile(item)]
+            if not primary or (final and not os.path.isfile(primary)):
+                return {'ok': False, 'file': None, 'files': [],
+                        'error': '报告生成器未产出 HTML 主文件'}
+            if not files:
+                files = [primary]
+            if final:
+                summary = summary or self._adsorption.delta_e_rows(proj)
+                marker = self._persist_report_marker(proj, summary, files)
+            else:
+                marker = None
+            return {'ok': True, 'file': primary, 'files': files,
+                    'marker': marker, 'error': None}
         except Exception as e:                            # noqa: BLE001
-            return {'ok': False, 'file': None, 'error': str(e)}
+            return {'ok': False, 'file': None, 'files': [], 'error': str(e)}
 
     # ── 论文级出图(原生 matplotlib 引擎,不依赖 Origin/POV-Ray) ────────────────
     @staticmethod
@@ -3190,6 +3365,41 @@ class Api:
         shorts = [self._ads_short(r['name'], name) for r in rows]
         des = [r['delta_e'] for r in rows]
         return shorts, des, s
+
+    def _proj_stable_delta_map(self, proj, summary):
+        """多项目比较只取每个物种最低能的最稳构型；旧数据无 species 时兼容短名。"""
+        rows = list((summary or {}).get('rows') or [])
+        if not any(
+                str(row.get('species') or row.get('reference_species') or '').strip()
+                for row in rows):
+            name = str(proj.get('name') or '')
+            return {
+                self._ads_short(row.get('name'), name): row.get('delta_e')
+                for row in rows
+            }
+        grouped = {}
+        for row in rows:
+            species = str(row.get('species') or row.get('reference_species') or '').strip()
+            if not species:
+                continue
+            grouped.setdefault(species, []).append(row)
+        result = {}
+        for species, candidates in grouped.items():
+            marked = [row for row in candidates if row.get('is_most_stable')]
+            marked_complete = [
+                row for row in marked
+                if isinstance(row.get('delta_e'), (int, float))
+            ]
+            complete = [
+                row for row in candidates
+                if isinstance(row.get('delta_e'), (int, float))
+            ]
+            pool = marked_complete or complete or marked or candidates
+            chosen = (min(pool, key=lambda row: row['delta_e'])
+                      if isinstance(pool[0].get('delta_e'), (int, float))
+                      else pool[0])
+            result[species] = chosen.get('delta_e')
+        return result
 
     def _project_molecules_dir(self, proj) -> str:
         """项目自带分子库优先，失效时回退全局配置。
@@ -3222,6 +3432,11 @@ class Api:
                 summary['rows'], e_slab=e_slab, molecules_dir=mol_dir,
                 managed_dirs=(proj.get('species_ref_jobs') or {}).values(),
                 project=proj)
+            try:
+                fed['_comparison_reference_energies'] = self._fe().load_molecule_energies(
+                    mol_dir, managed_dirs=(proj.get('species_ref_jobs') or {}).values())
+            except Exception:                             # noqa: BLE001 路径本身仍可画，跨项目仅降级
+                fed['_comparison_reference_energies'] = None
             return fed, None
         except ValueError as e:
             return None, str(e)
@@ -3381,11 +3596,12 @@ class Api:
                     'error': str(e)}
 
     def proj_compare_figures(self, paths, kinds=None, save_to=None):
-        """多项目对比出图。kinds ⊂ {'heatmap','scaling','volcano'},缺省 heatmap。
+        """多项目对比。支持 heatmap/scaling/volcano/ladder/report。
 
         heatmap:催化剂(项目)×吸附质 ΔE 矩阵;scaling:两个共同吸附质 ΔE 线性标度
         (需 ≥3 个项目同时具备);volcano:x=共同吸附质 ΔE 描述符,y=各项目放电路径
-        U_L(需分子库,≥3 点)。缺数据记 skipped 不拖垮其他图。
+        U_L(需分子库,≥3 点);ladder:任意组数仍叠加在同一张自由能台阶图；
+        report:把最稳构型矩阵、U_L/PDS 和已生成图片写入同源 Word/PDF。
         """
         try:
             try:
@@ -3395,15 +3611,16 @@ class Api:
                         'error': '未安装 matplotlib/numpy(原生出图可选依赖):'
                                  'pip install matplotlib numpy 后重试'}
             kinds = [str(k) for k in (kinds or ['heatmap'])]
+            make_report = 'report' in kinds
             projs = []
             for p in (paths or []):
                 proj = self._adsorption.load_project(str(p or '').strip())
                 if proj is None:
                     continue
-                shorts, des, summary = self._proj_delta_data(proj)
+                _shorts, _des, summary = self._proj_delta_data(proj)
                 projs.append({'name': str(proj.get('name') or '') or '项目',
                               'proj': proj, 'summary': summary,
-                              'de': dict(zip(shorts, des))})
+                              'de': self._proj_stable_delta_map(proj, summary)})
             if len(projs) < 2:
                 return {'ok': False, 'files': [], 'skipped': [], 'out_dir': None,
                         'error': '多项目对比至少需要选中 2 个有效项目'}
@@ -3417,7 +3634,10 @@ class Api:
             os.makedirs(out_dir, exist_ok=True)
 
             files, skipped = [], []
+            ladder_cache = None
             for kind in kinds:
+                if kind == 'report':
+                    continue
                 if kind == 'heatmap':
                     values = [[pr['de'].get(c) for c in cols] for pr in projs]
                     if not any(v is not None for row in values for v in row):
@@ -3449,13 +3669,271 @@ class Api:
                         points, os.path.join(out_dir, 'volcano.png'),
                         descriptor_label=f'$\\Delta E$({sp}) (eV)',
                         activity_label='$U_L$ (V)')
+                elif kind == 'ladder':
+                    ladder_cache = self._compare_ladder_paths(projs)
+                    ladder_paths, step_labels, reason = ladder_cache
+                    if ladder_paths is None:
+                        skipped.append({'kind': 'ladder', 'reason': reason})
+                        continue
+                    files += nc.free_energy_ladder(
+                        ladder_paths,
+                        os.path.join(out_dir, 'multi_catalyst_free_energy.png'),
+                        step_labels=step_labels, show_ul=True,
+                        title='Multi-catalyst Li-S free-energy pathways')
+                    if reason:
+                        skipped.append({
+                            'kind': 'ladder',
+                            'reason': '对比说明：' + reason,
+                            'partial': True,
+                        })
                 else:
                     skipped.append({'kind': kind, 'reason': '未知图类型'})
+            if make_report:
+                if ladder_cache is None:
+                    ladder_cache = self._compare_ladder_paths(projs)
+                try:
+                    from vcstudio.project import report_documents
+                    model = self._compare_report_model(
+                        projs, cols, ladder_cache, files, out_dir)
+                    docx, pdf = report_documents.generate_report_documents(
+                        model,
+                        os.path.join(out_dir, 'multi_catalyst_comparison.docx'),
+                        os.path.join(out_dir, 'multi_catalyst_comparison.pdf'))
+                    files.extend([str(docx), str(pdf)])
+                except Exception as exc:                  # noqa: BLE001 其它图仍保留
+                    skipped.append({'kind': 'report', 'reason': str(exc)})
             return {'ok': True, 'files': files, 'skipped': skipped,
                     'out_dir': out_dir, 'error': None}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'files': [], 'skipped': [], 'out_dir': None,
                     'error': str(e)}
+
+    def _compare_ladder_paths(self, projs):
+        """聚合各催化剂权威 ΔG/PDS/U_L；物种顺序不同的项目明确跳过。"""
+        paths, labels, reasons = [], None, []
+        baseline_method = None
+        baseline_references = None
+        baseline_name = None
+        for item in projs:
+            method = (item.get('summary') or {}).get('method_consistency') or {}
+            if method.get('status') == 'incompatible':
+                reasons.append(
+                    f'{item["name"]}: 方法不兼容（'
+                    + '；'.join(method.get('issues') or ['未给出原因']) + '）')
+                continue
+            if method.get('status') == 'unverified':
+                reasons.append(
+                    f'{item["name"]}: 已纳入探索性同图，但方法证据尚未完整核验（'
+                    + '；'.join(method.get('warnings') or ['未给出原因']) + '）')
+            fed, reason = self._proj_fed(item['proj'], item['summary'])
+            if fed is None:
+                reasons.append(f'{item["name"]}: {reason}')
+                continue
+            current_labels = [step.get('label') for step in fed.get('steps') or []]
+            if labels is None:
+                labels = current_labels
+            elif current_labels != labels:
+                reasons.append(f'{item["name"]}: 反应中间体顺序与首个项目不同')
+                continue
+            candidate_method = self._comparison_method_record(item)
+            candidate_references = fed.get('_comparison_reference_energies')
+            if paths:
+                method_check = self._comparison_method_pair(
+                    baseline_method, candidate_method,
+                    baseline_name or '首个项目', item['name'])
+                if method_check['status'] == 'incompatible':
+                    reasons.append(
+                        f'{item["name"]}: 与 {baseline_name} 的跨项目方法不可比（'
+                        + '；'.join(method_check['issues']) + '）')
+                    continue
+                if method_check['status'] == 'unverified':
+                    reasons.append(
+                        f'{item["name"]}: 已纳入探索性同图，但跨项目方法证据不完整（'
+                        + '；'.join(method_check['warnings'][:3]) + '）')
+                ref_issue = self._comparison_reference_issue(
+                    baseline_references, candidate_references)
+                if ref_issue and ref_issue['blocking']:
+                    reasons.append(
+                        f'{item["name"]}: 与 {baseline_name} 的分子参考不可比（'
+                        f'{ref_issue["message"]}）')
+                    continue
+                if ref_issue:
+                    reasons.append(
+                        f'{item["name"]}: 已纳入探索性同图，但分子参考证据不完整（'
+                        f'{ref_issue["message"]}）')
+            else:
+                baseline_method = candidate_method
+                baseline_references = candidate_references
+                baseline_name = item['name']
+                if candidate_method is None:
+                    reasons.append(
+                        f'{item["name"]}: 已作为对比基线，但跨项目方法指纹不可读')
+                if not isinstance(candidate_references, dict):
+                    reasons.append(
+                        f'{item["name"]}: 已作为对比基线，但分子参考能量签名不可读')
+            paths.append({
+                'name': item['name'],
+                'G': [step.get('G') for step in fed.get('steps') or []],
+                'pds_index': fed.get('pds_index'),
+                'u_l': fed.get('u_l'),
+            })
+        if len(paths) < 2:
+            detail = '；'.join(reasons[:6]) or '具备完整自由能路径的项目不足 2 个'
+            return None, labels or [], detail
+        return paths, labels or [], '；'.join(reasons)
+
+    def _comparison_method_record(self, item):
+        """读取一个实际参与 ΔE 的构型方法指纹，供催化剂间配对核验。"""
+        from vcstudio.project import energy_gate
+
+        proj = item.get('proj') or {}
+        summary = item.get('summary') or {}
+        configs = list(((proj.get('members') or {}).get('configs') or []))
+        complete_names = {
+            os.path.normcase(str(row.get('name') or ''))
+            for row in (summary.get('rows') or [])
+            if isinstance(row.get('delta_e'), (int, float))
+        }
+        ordered = [
+            path for path in configs
+            if os.path.normcase(self._base(path)) in complete_names
+        ]
+        ordered.extend(path for path in configs if path not in ordered)
+        for job_dir in ordered:
+            if not os.path.isdir(str(job_dir)):
+                continue
+            manifest = self._manifest.load_manifest(job_dir)
+            return energy_gate.method_record(
+                job_dir, manifest, f'{item.get("name") or "项目"}代表构型')
+        return None
+
+    @staticmethod
+    def _comparison_method_pair(left, right, left_name, right_name):
+        """跨催化剂只硬比较能量方法；自旋与 K 点按各体系设置。"""
+        if left is None or right is None:
+            missing = left_name if left is None else right_name
+            return {
+                'status': 'unverified', 'issues': [],
+                'warnings': [f'{missing} 缺少可读的代表构型方法指纹'],
+            }
+        from vcstudio.project import energy_gate
+
+        check = energy_gate.compare_methods(
+            [left, right], require_same_kpoints=False)
+        # 不同催化剂可以有各自的磁性基态；不同晶胞也不要求 KPOINTS 文本相同。
+        issues = [
+            issue for issue in (check.get('issues') or [])
+            if not issue.startswith('ISPIN 不一致')
+            and not issue.startswith('各作业 POTCAR 没有可核对的共同元素身份')
+        ]
+        warnings = [
+            warning for warning in (check.get('warnings') or [])
+            if not warning.startswith('K 点方案不一致')
+        ]
+        status = 'incompatible' if issues else ('verified' if not warnings else 'unverified')
+        return {'status': status, 'issues': issues, 'warnings': warnings}
+
+    @staticmethod
+    def _comparison_reference_issue(left, right, tolerance=1e-3):
+        """比较实际分子参考能量；不同参考库不得被悄悄叠为定量结论。"""
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            return {'blocking': False, 'message': '至少一个项目缺少参考能量签名'}
+        left_keys, right_keys = set(left), set(right)
+        if left_keys != right_keys:
+            missing = sorted(left_keys ^ right_keys)
+            return {
+                'blocking': True,
+                'message': '参考物种集合不同：' + '、'.join(missing[:8]),
+            }
+        differences = []
+        for species in sorted(left_keys):
+            try:
+                delta = abs(float(left[species]) - float(right[species]))
+            except (TypeError, ValueError):
+                return {
+                    'blocking': True,
+                    'message': f'{species} 的参考能量不可解析',
+                }
+            if delta > tolerance:
+                differences.append(f'{species} 差 {delta:.6g} eV')
+        if differences:
+            return {
+                'blocking': True,
+                'message': '；'.join(differences[:8]),
+            }
+        return None
+
+    @staticmethod
+    def _compare_report_model(projs, cols, ladder_cache, files, out_dir):
+        ladder_paths, step_labels, ladder_reason = ladder_cache
+        matrix_rows = [
+            [item['name']] + [
+                (f'{item["de"][species]:.4f}'
+                 if isinstance(item['de'].get(species), (int, float)) else '—')
+                for species in cols
+            ]
+            for item in projs
+        ]
+        summary_rows = []
+        for path in ladder_paths or []:
+            pds = path.get('pds_index')
+            valid_pds = (isinstance(pds, int)
+                         and 0 <= pds < max(len(step_labels) - 1, 0))
+            pds_text = ('—' if not valid_pds else
+                        f'{pds + 1}: {step_labels[pds]} → {step_labels[pds + 1]}')
+            ul = path.get('u_l')
+            summary_rows.append([
+                path.get('name') or '—',
+                f'{ul:.4f}' if isinstance(ul, (int, float)) else '—',
+                pds_text,
+            ])
+        blocks = [{
+            'type': 'table', 'caption': 'Most-stable adsorption energies by catalyst',
+            'columns': ['Catalyst'] + list(cols), 'rows': matrix_rows,
+        }]
+        pngs = [str(path) for path in files
+                if str(path).lower().endswith('.png') and os.path.isfile(str(path))]
+        for path in pngs:
+            blocks.append({
+                'type': 'figure', 'path': path,
+                'caption': os.path.splitext(os.path.basename(path))[0].replace('_', ' '),
+            })
+        pathway_blocks = []
+        if summary_rows:
+            pathway_blocks.append({
+                'type': 'table', 'caption': 'Limiting potentials and PDS',
+                'columns': ['Catalyst', 'U_L / V', 'Potential-determining step'],
+                'rows': summary_rows, 'column_widths': [1.2, 0.8, 2.4],
+            })
+        if ladder_reason:
+            pathway_blocks.append({
+                'type': 'note',
+                'text': '比较说明：' + ladder_reason,
+            })
+        return {
+            'title': '多催化剂项目对比报告',
+            'subtitle': 'Most-stable adsorption energies and overlaid Li-S pathways',
+            'report_label': 'MULTI-CATALYST COMPARISON',
+            'base_dir': out_dir,
+            'metadata': {
+                'Catalyst projects': len(projs),
+                'Overlay policy': 'All comparable catalyst pathways in one stair plot',
+                'Generated': time.strftime('%Y-%m-%d %H:%M:%S'),
+            },
+            'abstract': (
+                '每个催化剂项目按物种选取最低吸附能的最稳构型。'
+                '只在反应中间体顺序和方法证据可比较时叠加自由能路径；'
+                '即使超过 5 组，也保留在同一台阶图并使用颜色、线型和标记联合区分。'
+            ),
+            'sections': [
+                {'title': '吸附能比较 / Adsorption comparison', 'blocks': blocks},
+                {'title': '自由能路径 / Free-energy pathways',
+                 'blocks': pathway_blocks or [{
+                     'type': 'note',
+                     'text': '没有至少两个可比较的完整自由能路径。',
+                 }]},
+            ],
+        }
 
     @staticmethod
     def _best_scaling_pair(projs, cols):
@@ -3499,6 +3977,212 @@ class Api:
             return None, '不足 3 个项目同时具备描述符 ΔE 与 U_L'
         return (best_sp, best_pts), None
 
+    # ── MatClaw 式对话助手（Python 原生、安全附件、限定本地工具） ───────────
+    def ai_chat_sessions(self):
+        try:
+            return {'ok': True, 'sessions': self._chat().list_sessions(), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'sessions': [], 'error': str(e)}
+
+    def ai_chat_new(self, title=''):
+        try:
+            session = self._chat().create_session(str(title or '').strip() or None)
+            return {'ok': True, 'session': session, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'session': None, 'error': str(e)}
+
+    def ai_chat_history(self, session_id):
+        try:
+            chat = self._chat()
+            return {
+                'ok': True,
+                'messages': chat.history(str(session_id or ''), include_previews=False),
+                'attachments': chat.list_attachments(
+                    str(session_id or ''), include_previews=False),
+                'error': None,
+            }
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'messages': [], 'attachments': [], 'error': str(e)}
+
+    def ai_chat_attach(self, session_id, paths):
+        """把用户明确选择的本地文件复制进会话隔离区；源路径不进数据库/模型。"""
+        try:
+            values = paths if isinstance(paths, (list, tuple)) else [paths]
+            values = [str(path or '').strip() for path in values if str(path or '').strip()]
+            if not values:
+                return {'ok': False, 'attachments': [], 'error': '未选择附件'}
+            if len(values) > 10:
+                return {'ok': False, 'attachments': [],
+                        'error': '一次最多导入 10 个附件，请分批选择'}
+            chat = self._chat()
+            attached, rejected = [], []
+            for path in values:
+                try:
+                    attached.append(chat.attach(str(session_id or ''), path))
+                except Exception as exc:                 # noqa: BLE001 单文件失败需如实返回部分成功
+                    rejected.append({
+                        'name': os.path.basename(path) or path,
+                        'error': str(exc),
+                    })
+            if rejected:
+                detail = '；'.join(
+                    f'{item["name"]}: {item["error"]}' for item in rejected)
+                return {
+                    'ok': False,
+                    'attachments': attached,
+                    'rejected': rejected,
+                    'error': ('部分附件导入失败；已成功导入的文件仍保留：' + detail
+                              if attached else '附件导入失败：' + detail),
+                }
+            return {'ok': True, 'attachments': attached, 'rejected': [], 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'attachments': [], 'rejected': [], 'error': str(e)}
+
+    def _chat_project_status_text(self, query=''):
+        status = self.pipeline_status()
+        if not status.get('ok'):
+            return '项目状态读取失败：' + str(status.get('error') or '未知错误')
+        projects = list(status.get('projects') or [])
+        needle = str(query or '').strip()
+        if needle:
+            key = os.path.normcase(os.path.abspath(os.path.normpath(needle)))
+            projects = [
+                item for item in projects
+                if str(item.get('name') or '').casefold() == needle.casefold()
+                or os.path.normcase(os.path.abspath(
+                    os.path.normpath(str(item.get('path') or '')))) == key
+            ]
+        if not projects:
+            return ('没有找到匹配的吸附能项目。用法：/status，或 '
+                    '/status 项目名（也可粘贴 project.yaml 路径）。')
+        stage_names = {
+            'generate': '待生成', 'submit': '待提交', 'monitor': '监控中',
+            'recover': '自动续算', 'analysis': '结果分析', 'report_done': '报告完成',
+        }
+        runtime = self.pipeline_runtime_status()
+        state = runtime.get('state') if runtime.get('ok') else {}
+        if isinstance(state, dict):
+            if state.get('last_error'):
+                supervisor = '后台主管异常：' + str(state['last_error'])
+            elif state.get('enabled') is False or state.get('paused'):
+                supervisor = '后台主管：已暂停'
+            elif state.get('tick_running'):
+                supervisor = '后台主管：正在检查'
+            elif state.get('running'):
+                supervisor = '后台主管：运行中'
+            else:
+                supervisor = '后台主管：尚未启动'
+            if state.get('next_check'):
+                supervisor += f'；下次检查 {state["next_check"]}'
+            if state.get('last_finished'):
+                supervisor += f'；上次完成 {state["last_finished"]}'
+        else:
+            supervisor = '后台主管状态不可用'
+        lines = [supervisor, '当前项目状态：']
+        for item in projects:
+            round_text = (f'，续算 {item.get("recover_round", 0)}/3'
+                          if item.get('stage') == 'recover' else '')
+            flag = '，需要人工处理' if item.get('needs_human') else ''
+            report_note = str(item.get('report_reason') or '').strip()
+            extra = f'；报告：{report_note}' if report_note else ''
+            lines.append(
+                f'- {item.get("name") or "(未命名)"}：'
+                f'{stage_names.get(item.get("stage"), item.get("stage"))}，'
+                f'{item.get("done", 0)}/{item.get("total", 0)} DONE'
+                f'{round_text}{flag}{extra}')
+        return '\n'.join(lines)
+
+    def _chat_project_report_text(self, query=''):
+        needle = str(query or '').strip()
+        matches = []
+        for path in self._adsorption.list_projects():
+            proj = self._adsorption.load_project(path)
+            if proj is None:
+                continue
+            if (not needle or str(proj.get('name') or '').casefold() == needle.casefold()
+                    or os.path.normcase(os.path.abspath(os.path.normpath(str(path))))
+                    == os.path.normcase(os.path.abspath(os.path.normpath(needle)))):
+                matches.append((path, proj))
+        if not needle:
+            return '请指定项目：/report 项目名（或 project.yaml 路径）。'
+        if len(matches) != 1:
+            return '没有找到唯一匹配的项目，请使用完整项目名或 project.yaml 路径。'
+        path, proj = matches[0]
+        root = str(proj.get('root') or os.path.dirname(str(path)))
+        name = str(proj.get('name') or 'project')
+        summary = self._adsorption.delta_e_rows(proj)
+        final, reason = self._final_report_gate(proj, summary)
+        report_dir = os.path.join(root, 'report')
+        suffix = 'report' if final else 'diagnostic'
+        out = os.path.join(report_dir, f'{name}_{suffix}.html')
+        result = self.proj_report(path, out, final=final)
+        if not result.get('ok'):
+            return '报告尚未生成：' + str(result.get('error') or '未知错误')
+        files = result.get('files') or [result.get('file')]
+        heading = ('最终报告已生成：' if final else
+                   f'诊断报告已生成（未标记为最终报告：{reason}）：')
+        return heading + '\n' + '\n'.join(f'- {item}' for item in files if item)
+
+    def ai_chat_send(self, session_id, text, attachment_ids=None):
+        """发送对话；/status 和 /report 走本地确定性工具，其余受联网开关约束。"""
+        try:
+            message = str(text or '').strip()
+            if not message:
+                return {'ok': False, 'result': None, 'error': '消息不能为空'}
+            command, _, argument = message.partition(' ')
+            command = command.casefold()
+            chat = self._chat()
+            if command == '/help':
+                reply = (
+                    '可用命令：\n'
+                    '/status [项目名] — 查看项目、续算轮次和报告状态\n'
+                    '/report 项目名 — 在本地生成最终 HTML、Word 与 PDF 报告\n'
+                    '/stop — 只停止当前 AI 回复，不会取消任何集群作业\n\n'
+                    '普通消息可明确勾选附件后发送；未勾选的本地文件不会提供给模型。'
+                )
+                result = chat.local_reply(str(session_id or ''), message, reply)
+            elif command == '/status':
+                result = chat.local_reply(
+                    str(session_id or ''), message,
+                    self._chat_project_status_text(argument))
+            elif command == '/report':
+                result = chat.local_reply(
+                    str(session_id or ''), message,
+                    self._chat_project_report_text(argument))
+            elif command == '/stop' and argument.strip():
+                result = chat.local_reply(
+                    str(session_id or ''), message,
+                    '/stop 不接受附加文本。请单独输入 /stop；它只停止 AI 回复，'
+                    '不会取消任何集群作业。')
+            elif command.startswith('/') and command != '/stop':
+                result = chat.local_reply(
+                    str(session_id or ''), message,
+                    '未知命令。输入 /help 查看可用命令；本助手不提供 shell 或任意集群操作。')
+            else:
+                if command != '/stop':
+                    cfg = self._config.load_config()
+                    llm = cfg.get('llm') if isinstance(cfg, dict) else {}
+                    if not isinstance(llm, dict) or not llm.get('allow_external'):
+                        return {
+                            'ok': False, 'result': None,
+                            'error': ('联网对话默认关闭。请在设置页配置模型并开启'
+                                      '“允许将项目数据发送到外部 LLM”；/status、'
+                                      '/report 和 /help 仍可离线使用。'),
+                        }
+                result = chat.send(
+                    str(session_id or ''), message,
+                    attachment_ids=list(attachment_ids or []))
+            return {'ok': True, 'result': result, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'result': None, 'error': str(e)}
+
+    def ai_chat_stop(self, session_id):
+        try:
+            result = self._chat().stop(str(session_id or ''))
+            return {'ok': True, 'result': result, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'result': None, 'error': str(e)}
+
     # ── 文件/目录选择(web 无原生 input;pywebview 延迟 import,测试注入 dialog_fn) ──
     def pick_file(self, kind='poscar'):
         try:
@@ -3511,6 +4195,24 @@ class Api:
             return {'path': path or None}
         except Exception as e:                            # noqa: BLE001
             return {'path': None, 'error': str(e)}
+
+    def pick_files(self, kind='files'):
+        try:
+            if self._dialog_fn is not None:
+                selected = self._dialog_fn(kind)
+            else:
+                import webview                            # 延迟:测试永不 import
+                selected = webview.windows[0].create_file_dialog(
+                    webview.OPEN_DIALOG, allow_multiple=True)
+            if not selected:
+                paths = []
+            elif isinstance(selected, (list, tuple)):
+                paths = [str(path) for path in selected if path]
+            else:
+                paths = [str(selected)]
+            return {'paths': paths, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'paths': [], 'error': str(e)}
 
     def pick_dir(self):
         try:
@@ -3746,6 +4448,10 @@ class Api:
             if autopilot_campaigns is not None:
                 kv['autopilot_campaigns'] = bool(autopilot_campaigns)
             self._config.set_ui_state(**kv)
+            if self._pipeline_supervisor is not None:
+                self._pipeline_supervisor.reconfigure()
+                if kv.get('autopilot') is True:
+                    self._pipeline_supervisor.wake()
             return {'ok': True, 'error': None}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'error': str(e)}
@@ -3872,6 +4578,12 @@ class Api:
                     states = self._member_states(proj)
                     has_marker = self._report_marker_current(proj)
                     stage, needs_human, rr = self._project_stage(states, has_marker)
+                    marker = proj.get('autopilot_report') if has_marker else {}
+                    blocked = (proj.get('autopilot_report_blocked')
+                               if isinstance(proj.get('autopilot_report_blocked'), dict)
+                               else {})
+                    report_files = ((marker or {}).get('files') or
+                                    (blocked or {}).get('files') or {})
                     projs.append({
                         'path': pp, 'name': proj.get('name', '') or '',
                         'profile': str((((proj.get('launch') or {}).get('resources') or {})
@@ -3881,6 +4593,11 @@ class Api:
                         'recover_round': rr,
                         'done': sum(1 for s in states if s['state'] == 'DONE'),
                         'total': len(states),
+                        'report_status': ('final' if has_marker
+                                          else 'blocked' if blocked else 'pending'),
+                        'report_reason': ('' if has_marker else
+                                          str((blocked or {}).get('reason') or '')),
+                        'report_files': report_files,
                     })
                 except Exception:                         # noqa: BLE001 单个坏项目跳过
                     continue
@@ -4073,6 +4790,69 @@ class Api:
                              separators=(',', ':'), default=str).encode('utf-8')
         return hashlib.sha256(encoded).hexdigest()
 
+    def _persist_blocked_report_marker(self, project, summary, reason, files):
+        """保存诊断报告状态；它可见但永远不能冒充最终报告。"""
+        paths = [os.path.abspath(str(path)) for path in files
+                 if path and os.path.isfile(str(path))]
+        if not paths:
+            raise RuntimeError('诊断报告状态落盘失败：没有可读的报告文件')
+        by_format = {
+            os.path.splitext(path)[1].lower().lstrip('.') or 'file': path
+            for path in paths
+        }
+        blocked = {
+            'updated_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'input_fingerprint': self._report_input_fingerprint(project, summary),
+            'reason': str(reason or '最终报告门禁未通过'),
+            'files': by_format,
+        }
+        root = project.get('root') or os.path.dirname(paths[0])
+        persisted = dict(project)
+        persisted['autopilot_report_blocked'] = blocked
+        persisted.pop('autopilot_report', None)
+        persisted.pop('autopilot_report_done', None)
+        self._adsorption.save_project(root, persisted)
+        project['autopilot_report_blocked'] = blocked
+        project.pop('autopilot_report', None)
+        project.pop('autopilot_report_done', None)
+        return blocked
+
+    def _persist_report_marker(self, project, summary, files):
+        """原子保存多格式最终报告标记；任一声明文件变化都会让标记失效。"""
+        paths = [os.path.abspath(str(path)) for path in files
+                 if path and os.path.isfile(str(path))]
+        if not paths:
+            raise RuntimeError('报告标记落盘失败：没有可读的报告文件')
+        by_format, hashes = {}, {}
+        for path in paths:
+            suffix = os.path.splitext(path)[1].lower().lstrip('.') or 'file'
+            by_format[suffix] = path
+            hashes[suffix] = _sha256_file(path)
+        html_path = by_format.get('html') or paths[0]
+        generated_at = time.strftime('%Y-%m-%dT%H:%M:%S')
+        marker = {
+            'generated_at': generated_at,
+            'input_fingerprint': self._report_input_fingerprint(project, summary),
+            'file': html_path,                       # 旧界面只读兼容
+            'report_sha256': _sha256_file(html_path),
+            'files': by_format,
+            'sha256': hashes,
+            'figures_dir': os.path.dirname(html_path),
+        }
+        root = project.get('root') or os.path.dirname(html_path)
+        persisted = dict(project)
+        persisted['autopilot_report'] = marker
+        persisted['autopilot_report_done'] = generated_at
+        persisted.pop('autopilot_report_blocked', None)
+        try:
+            self._adsorption.save_project(root, persisted)
+        except Exception as exc:                         # noqa: BLE001
+            raise RuntimeError(f'报告标记落盘失败：{exc}') from exc
+        project['autopilot_report'] = marker
+        project['autopilot_report_done'] = generated_at
+        project.pop('autopilot_report_blocked', None)
+        return marker
+
     def _report_marker_current(self, project, summary=None) -> bool:
         marker = (project or {}).get('autopilot_report')
         if not isinstance(marker, dict):
@@ -4084,17 +4864,25 @@ class Api:
             current = summary or self._adsorption.delta_e_rows(project)
             if marker.get('input_fingerprint') != self._report_input_fingerprint(project, current):
                 return False
+            declared = marker.get('files')
+            hashes = marker.get('sha256')
+            if isinstance(declared, dict) and isinstance(hashes, dict) and declared:
+                return all(
+                    os.path.isfile(str(path))
+                    and str(hashes.get(fmt) or '')
+                    and _sha256_file(str(path)) == str(hashes.get(fmt))
+                    for fmt, path in declared.items())
             expected_hash = str(marker.get('report_sha256') or '')
             return bool(expected_hash and _sha256_file(report_path) == expected_hash)
         except Exception:                                # noqa: BLE001 失效即重建，绝不误报完成
             return False
 
     def _tick_reports(self, events, errors):
-        """只为一站式托管且每个构型都有有效 ΔE 的项目生成最终报告。"""
+        """为全部已完成项目自动生成报告；最终门禁未过时生成诊断版并明示原因。"""
         for pp in self._adsorption.list_projects():
             try:
                 proj = self._adsorption.load_project(pp)
-                if proj is None or not proj.get('autopilot_managed'):
+                if proj is None:
                     continue
                 states = self._member_states(proj)
                 if not self._project_all_done(states):
@@ -4106,14 +4894,52 @@ class Api:
                 summary = self._adsorption.delta_e_rows(proj)
                 if self._report_marker_current(proj, summary):
                     continue
-                eligible, _gate_reason = self._final_report_gate(proj, summary)
-                if not eligible:
-                    # 诊断/相对能页面不是可交付吸附能报告，不能打 final marker。
-                    continue
+                eligible, gate_reason = self._final_report_gate(proj, summary)
                 name = proj.get('name', '') or self._base(os.path.dirname(str(pp)))
                 root = proj.get('root') or os.path.dirname(str(pp))
                 report_dir = os.path.join(root, 'report')
                 os.makedirs(report_dir, exist_ok=True)
+                if not eligible:
+                    # 老测试替身和第三方生成器没有 report_status 契约时维持旧行为；
+                    # 正式生成器则产诊断版，但绝不写 final marker。
+                    generator = self._rf().generate_project_report
+                    parameters = inspect.signature(generator).parameters
+                    supports_status = (
+                        'report_status' in parameters
+                        or any(p.kind == inspect.Parameter.VAR_KEYWORD
+                               for p in parameters.values()))
+                    if not supports_status or not self._rf()._member_dirs(proj):
+                        continue
+                    fingerprint = self._report_input_fingerprint(proj, summary)
+                    previous = proj.get('autopilot_report_blocked')
+                    previous_files = ((previous or {}).get('files') or {})
+                    if (isinstance(previous, dict)
+                            and previous.get('input_fingerprint') == fingerprint
+                            and previous.get('reason') == gate_reason
+                            and previous_files
+                            and all(os.path.isfile(str(path))
+                                    for path in previous_files.values())):
+                        continue
+                    rep = self.proj_report(
+                        pp, os.path.join(report_dir, f'{name}_diagnostic.html'),
+                        final=False)
+                    if not rep.get('ok'):
+                        errors.append(
+                            f'项目「{name}」诊断报告生成失败:{rep.get("error")}')
+                        continue
+                    try:
+                        self._persist_blocked_report_marker(
+                            proj, summary, gate_reason,
+                            rep.get('files') or [rep.get('file')])
+                    except Exception as exc:              # noqa: BLE001
+                        errors.append(f'项目「{name}」诊断报告标记落盘失败:{exc}')
+                        continue
+                    events.append({
+                        'kind': 'report_blocked', 'project': name,
+                        'report': rep.get('file'), 'reason': gate_reason,
+                        'text': f'项目「{name}」已生成诊断报告；最终报告暂停：{gate_reason}',
+                    })
+                    continue
                 fig = self._auto_figures_for_project(proj, pp, report_dir)
                 rep = self.proj_report(
                     pp, os.path.join(report_dir, f'{name}_report.html'), final=True)
@@ -4124,33 +4950,13 @@ class Api:
                 if not report_file or not os.path.isfile(report_file):
                     errors.append(f'项目「{name}」报告生成器未产出可读文件')
                     continue
-                generated_at = time.strftime('%Y-%m-%dT%H:%M:%S')
-                marker = {
-                    'generated_at': generated_at,
-                    'input_fingerprint': self._report_input_fingerprint(proj, summary),
-                    'file': report_file,
-                    'report_sha256': _sha256_file(report_file),
-                    'figures_dir': fig.get('out_dir'),
-                }
-                # 先用独立副本落盘，成功后才更新当前内存对象。
-                # 否则一次保存失败会在进程内留下“伪 marker”，
-                # 下一拍可能错误认为报告已持久化而不再重试。
-                persisted = dict(proj)
-                persisted['autopilot_report'] = marker
-                persisted['autopilot_report_done'] = generated_at  # 旧界面只读兼容
-                try:
-                    self._adsorption.save_project(root, persisted)
-                except Exception as e:                    # noqa: BLE001
-                    errors.append(f'项目「{name}」报告标记落盘失败:{e}')
-                    continue
-                proj['autopilot_report'] = marker
-                proj['autopilot_report_done'] = generated_at
                 nfig = len(fig.get('files') or [])
                 extra = f'(一键出图 {nfig} 张)' if fig.get('engine') == 'auto_figures' else ''
                 events.append({'kind': 'report_done', 'project': name,
                                'report': rep.get('file'), 'figures_dir': fig.get('out_dir'),
+                               'files': rep.get('files') or [],
                                'engine': fig.get('engine'), 'n_figures': nfig,
-                               'text': f'项目「{name}」报告已自动生成{extra}'})
+                               'text': f'项目「{name}」HTML、Word、PDF 报告已自动生成{extra}'})
             except Exception as e:                        # noqa: BLE001 单项目失败不拖垮其他
                 errors.append(f'项目报告自动化异常:{e}')
 

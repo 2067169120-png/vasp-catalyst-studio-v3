@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import html
 import math
+import os
 
 # Paul Tol "bright" 色板:期刊出版标准、色盲安全(对齐论文级配色,替换原版 seaborn deep)
 PUB_COLORS = ['#4477AA', '#EE6677', '#228833', '#CCBB44',
@@ -114,7 +115,16 @@ def render_bar_svg(data: dict, *, title='', ylabel='E_ads (eV)',
     ylo = min(vals + ([band[0]] if band else []) + [0])
     yhi = max(vals + ([band[1]] if band else []) + [0])
     pad = (yhi - ylo) * 0.18 or 0.5
-    p = _Plot(width, height, 0, len(cols), ylo - pad, yhi + pad)
+    # 完整作业目录名曾被直接塞进 760 px 横轴，6 个稍长标签就会互相覆盖。
+    # 报告层已先去掉公共项目/ads 前缀；这里仍按数量和最长标签自适应画布，
+    # 并在拥挤时旋转标签，保证 SVG 兜底也可直接用于论文预览。
+    max_label = max((len(str(c)) for c in cols), default=0)
+    crowded = len(cols) > 5 or max_label > 10
+    if crowded:
+        width = max(width, 92 * len(cols) + 120)
+        height = max(height, 470)
+    bottom = 92 if crowded else 46
+    p = _Plot(width, height, 0, len(cols), ylo - pad, yhi + pad, mb=bottom)
     p.title(title)
     p.ylabel(ylabel)
     p.yaxis(_nice_ticks(ylo - pad, yhi + pad))
@@ -130,8 +140,14 @@ def render_bar_svg(data: dict, *, title='', ylabel='E_ads (eV)',
           f"stroke='#374151' stroke-width='1'/>")
     gw = 0.7 / max(len(rows), 1)                       # 组内单柱宽(数据坐标)
     for i, col in enumerate(cols):
-        p.add(f"<text x='{p.x(i + 0.5):.1f}' y='{height - p.mb + 16}' text-anchor='middle' "
-              f"font-size='11.5' fill='#374151'>{_esc(col)}</text>")
+        tx, ty = p.x(i + 0.5), height - p.mb + 17
+        if crowded:
+            p.add(f"<text x='{tx:.1f}' y='{ty:.1f}' text-anchor='end' "
+                  f"font-size='11' fill='#374151' transform='rotate(-35 {tx:.1f} {ty:.1f})'>"
+                  f"{_esc(col)}</text>")
+        else:
+            p.add(f"<text x='{tx:.1f}' y='{ty:.1f}' text-anchor='middle' "
+                  f"font-size='11.5' fill='#374151'>{_esc(col)}</text>")
         for j, row in enumerate(rows):
             v = mat[j][i]
             if v is None:
@@ -257,7 +273,8 @@ def render_ladder_svg(data: dict, *, title='', ylabel='ΔG (eV)',
                   f"stroke-width='{2.6 if is_pds else 1.3}'{dash}/>")
     if pds is not None:
         dg = steps[pds + 1]['G'] - steps[pds]['G']
-        p.add(f"<text x='{p.x(pds + 0.5):.1f}' y='{p.mt + 14}' text-anchor='middle' "
+        # 左右分栏放置，避免 PDS 恰好位于末步时与右上角 U_L 叠字。
+        p.add(f"<text x='{p.ml + 6}' y='{p.mt + 14}' text-anchor='start' "
               f"font-size='11.5' font-weight='600' fill='{RDS_COLOR}'>"
               f"PDS: ΔG = {dg:+.2f} eV</text>")
     if data.get('u_l') is not None:
@@ -379,9 +396,31 @@ def render_dos_svg(data: dict, *, title='', width=760, height=420,
 # ── 契约构建助手:从项目 ΔE 结果直接出图数据 ─────────────────────────────────────
 def bar_data_from_delta(project_name: str, delta_rows: list,
                         band=None, band_label='') -> dict:
-    """adsorption.delta_e_rows 的 rows → 单体系柱状图契约(只取有 ΔE 的构型)。"""
-    cols = [r['name'] for r in delta_rows if r.get('delta_e') is not None]
-    vals = [r['delta_e'] for r in delta_rows if r.get('delta_e') is not None]
+    """adsorption.delta_e_rows 的 rows → 单体系柱状图契约(只取有 ΔE 的构型)。
+
+    横轴展示名会剥掉 ``<项目>_ads_`` / ``ads_`` 公共前缀，但不截断剩余文本，
+    从而同时解决长目录名重叠和不同构型被省略成同名的问题。
+    """
+    done = [r for r in delta_rows if r.get('delta_e') is not None]
+
+    def _short(row):
+        raw = os.path.basename(os.path.normpath(str(row.get('name') or '')))
+        prefixes = (f'{project_name}_ads_', f'{project_name}_', 'ads_')
+        lowered = raw.casefold()
+        for prefix in prefixes:
+            if prefix and lowered.startswith(prefix.casefold()):
+                raw = raw[len(prefix):]
+                break
+        return raw or str(row.get('species') or 'config')
+
+    cols = [_short(r) for r in done]
+    # 极少数目录只因公共前缀不同而收敛为同一展示名；显式加序号避免图上歧义。
+    seen: dict[str, int] = {}
+    for i, label in enumerate(cols):
+        seen[label] = seen.get(label, 0) + 1
+        if seen[label] > 1:
+            cols[i] = f'{label} [{seen[label]}]'
+    vals = [r['delta_e'] for r in done]
     if not cols:
         raise ValueError('没有任何构型有 ΔE(需成员全部 DONE)')
     return {'rows': [project_name], 'cols': cols, 'matrix': [vals],

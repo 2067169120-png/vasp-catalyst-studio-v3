@@ -376,10 +376,11 @@ VCS.elementBadge = function (systemName) {
   return '';   // 识别不出不加(不猜)
 };
 
-// ── 全局自动托管编排器:按间隔调 pipeline_tick,渲染事件 + 健康读数 + 断线横幅 ──
+// ── 自动托管观察器:计算由 Python 后台线程驱动；页面只读状态并渲染 ─────────
 VCS.pipeline = {
   timer: null, running: false, failStreak: 0, lastSuccess: null,
-  events: [],   // 最近 20 条(新在前),前端到达时间戳
+  events: [], runtime: null, lastFinished: null, lastOutcomeSeq: 0,
+  eventsSeen: new Set(),   // 最近 20 条(新在前),按后台一拍只消费一次
 };
 
 function hhmm(ts) {
@@ -433,14 +434,15 @@ function renderFeed() {
     return;
   }
   const KL = { refresh: '同步', continue: '续算', fetch: '下载', report_done: '报告',
-    skip: '跳过', error: '错误' };
+    report_blocked: '诊断报告', skip: '跳过', error: '错误' };
   box.innerHTML = evs.map(e => {
     const kcls = e.kind === 'report_done' ? 'report'
       : (e.kind === 'error' ? 'err' : (e.kind === 'skip' ? 'skip' : ''));
     const label = KL[e.kind] || e.kind;
     const cluster = e.cluster
       ? `<span class="fcluster" title="服务器">${VCS.esc(e.cluster)}</span>` : '';
-    const btn = (e.kind === 'report_done' && (e.report || e.figures_dir))
+    const btn = ((e.kind === 'report_done' || e.kind === 'report_blocked') &&
+      (e.report || e.figures_dir))
       ? `<button class="btn quiet fbtn" data-open="${VCS.esc(e.report || e.figures_dir)}">打开</button>` : '';
     return `<div class="feed-row"><span class="fk ${kcls}">${VCS.esc(label)}</span>${cluster}` +
       `<span class="ftxt" title="${VCS.esc(e.text || '')}">${VCS.esc(e.text || '')}</span>` +
@@ -488,40 +490,91 @@ function onPipelineOutcome(out) {
   renderFeed();
 }
 
-async function pipelineTick() {
+async function pipelineRuntimePoll() {
   const p = VCS.pipeline;
   if (p.running) return;
   p.running = true;
   try {
-    const out = await VCS.call('pipeline_tick');
-    if (!out || out.error) {
+    const res = await VCS.call('pipeline_runtime_status');
+    if (!res || res.error || !res.state) {
       p.failStreak++;
       renderHealth(); renderConnBanner();
       return;
     }
-    onPipelineOutcome(out);
+    const state = res.state;
+    p.runtime = state;
+    const finished = String(state.last_finished || '');
+    const sequence = Number(state.outcome_seq || 0);
+    const history = Array.isArray(state.outcome_history)
+      ? state.outcome_history
+          .filter(item => Number(item && item.seq) > p.lastOutcomeSeq)
+          .sort((a, b) => Number(a.seq) - Number(b.seq))
+      : [];
+    if (history.length) {
+      history.forEach(item => {
+        const itemSequence = Number(item.seq || 0);
+        if (itemSequence) p.lastOutcomeSeq = Math.max(p.lastOutcomeSeq, itemSequence);
+        if (item.finished) p.lastFinished = String(item.finished);
+        if (item.outcome) {
+          onPipelineOutcome(item.outcome);
+        } else if (item.error) {
+          p.events.unshift({
+            kind: 'error',
+            text: '后台自动托管异常：' + String(item.error),
+            time: hhmm(item.finished),
+          });
+          p.events = p.events.slice(0, 20);
+        }
+      });
+      renderHealth(); renderConnBanner(); renderFeed();
+    } else {
+      // 兼容没有 outcome_history 的旧后端；新后端即使两轮检查落在一次
+      // 前端轮询之间，也会按 seq 顺序逐条消费，而不会只看到最后一轮。
+      const hasNewOutcome = sequence
+        ? sequence > p.lastOutcomeSeq
+        : (finished && finished !== p.lastFinished);
+      if (hasNewOutcome && state.last_outcome) {
+        p.lastOutcomeSeq = sequence;
+        p.lastFinished = finished;
+        onPipelineOutcome(state.last_outcome);
+      } else {
+        if (sequence) p.lastOutcomeSeq = Math.max(p.lastOutcomeSeq, sequence);
+        if (finished) p.lastFinished = finished;
+        renderHealth(); renderConnBanner(); renderFeed();
+      }
+    }
+    document.dispatchEvent(new CustomEvent('vcs:pipeline-runtime', { detail: state }));
   } finally {
     p.running = false;
   }
 }
+
+async function pipelineTick() {
+  const queued = await VCS.call('pipeline_wake');
+  if (!queued || queued.error) {
+    VCS.toast('无法启动后台检查：' + ((queued && queued.error) || '未知错误'), 'fail');
+    return queued;
+  }
+  setTimeout(pipelineRuntimePoll, 350);
+  return queued;
+}
+
 VCS.pipeline.tick = pipelineTick;
+VCS.pipeline.poll = pipelineRuntimePoll;
 VCS.pipeline.renderFeed = renderFeed;
 
-// 从 config 校准主题 + 按开关/间隔(重新)装载定时器;设置页保存后可再调本函数
+// 从 config 校准主题；后台调度器读同一配置，前端只保持轻量状态轮询。
 VCS.pipeline.reconfigure = async function () {
   const s = await VCS.call('settings_get');
   const ui = (s && s.ui) || {};
   if (ui.theme) VCS.themeApply(ui.theme);
-  // Fail closed when settings cannot be read.  The Li-S submit flow explicitly
-  // enables automation for its managed project after a successful submission;
-  // a fresh install must never start mutating an old ledger on its own.
   const enabled = ui.autopilot === true;
-  const interval = (Number(ui.poll_interval) || 10) * 60000;
   if (VCS.pipeline.timer) { clearInterval(VCS.pipeline.timer); VCS.pipeline.timer = null; }
-  if (enabled) {
-    VCS.pipeline.timer = setInterval(pipelineTick, interval);
-    setTimeout(pipelineTick, 3500);                   // 启动后先跑一拍,让用户见到动态
-  }
+  VCS.pipeline.timer = setInterval(pipelineRuntimePoll, 5000);
+  await pipelineRuntimePoll();
+  // 设置保存和整组提交由后端在同一事务后唤醒主管；这里只更新观察器，
+  // 避免前后端各 wake 一次导致同秒重复检查。
+  if (!enabled) renderHealth();
 };
 
 // feed 内「打开」按钮委托 + 切回仪表盘时重渲 feed

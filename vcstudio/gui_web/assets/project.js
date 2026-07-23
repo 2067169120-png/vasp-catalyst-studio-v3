@@ -710,6 +710,13 @@
       textList(r.warnings).forEach(x => VCS.log(x, 'warnc'));
       showImportProblem('', '');
       VCS.log('本地结果已建立吸附能项目:' + (r.project_path || name), 'okc');
+      if (r.auto_report && r.auto_report.ok) {
+        const files = (r.auto_report.files || [r.auto_report.file]).filter(Boolean);
+        VCS.log((r.auto_report_reason ? '诊断报告' : '最终报告') +
+          '已自动生成:' + files.join('；'), r.auto_report_reason ? 'warnc' : 'okc');
+      } else if (r.auto_report && r.auto_report.error) {
+        VCS.log('项目已导入，但自动报告暂未生成:' + r.auto_report.error, 'warnc');
+      }
       if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
       await reloadProjects();
       const sel = $('pj-select');
@@ -718,8 +725,7 @@
         sel.value = hit.path;
         restoreWorkflowState(hit);
       }
-      // 建好项目后立即刷新 ΔE 表，让缺角色/缺能量在同一页直接可见；报告仍由用户
-      // 明确触发，避免自动产出一个科学数据尚不完整的文件。
+      // 建好项目后立即刷新 ΔE；后端已在全 DONE 时自动生成最终或诊断报告。
       const deltaResult = await delta();
       const deltaRows = (deltaResult && deltaResult.rows) || [];
       const deltaMethodBlocked = String(deltaResult && deltaResult.method_consistency &&
@@ -2406,7 +2412,8 @@
       return;
     }
     (r.files || []).forEach(f => VCS.log('已生成:' + f, 'okc'));
-    (r.skipped || []).forEach(s => VCS.log('跳过 ' + s.kind + ':' + s.reason, 'warnc'));
+    (r.skipped || []).forEach(s => VCS.log(
+      (s.partial ? '部分对比说明 ' : '跳过 ') + s.kind + ':' + s.reason, 'warnc'));
     (r.warnings || []).forEach(w => VCS.log('方法学提示:' + w, 'warnc'));
     if ((r.files || []).length) {
       VCS.log('图已输出到:' + r.out_dir, 'okc');
@@ -2448,15 +2455,17 @@
     if (paths.length < 2) { VCS.log('多项目对比请勾选至少 2 个项目', 'failc'); return; }
     const kinds = [];
     if ($('fig-heatmap') && $('fig-heatmap').checked) kinds.push('heatmap');
+    if ($('fig-cmp-ladder') && $('fig-cmp-ladder').checked) kinds.push('ladder');
     if ($('fig-scaling') && $('fig-scaling').checked) kinds.push('scaling');
     if ($('fig-volcano') && $('fig-volcano').checked) kinds.push('volcano');
+    if ($('fig-cmp-report') && $('fig-cmp-report').checked) kinds.push('report');
     if (!kinds.length) { VCS.log('请至少勾选一种对比图', 'failc'); return; }
     const btn = $('pj-cmpfigs');
     if (btn) btn.disabled = true;
-    VCS.log('对比出图中(' + paths.length + ' 个项目,' + kinds.join('/') + ')…');
+    VCS.log('多催化剂对比生成中(' + paths.length + ' 个项目,' + kinds.join('/') + ')…');
     try {
       const r = await VCS.call('proj_compare_figures', paths, kinds, null);
-      logFigResult(r, '对比出图');
+      logFigResult(r, '对比图与报告');
     } finally {
       if (btn) btn.disabled = false;
     }
@@ -2549,7 +2558,7 @@
       stage = '方法不一致，ΔE 已阻断';
       next = '下一步：统一泛函、ENCUT、色散和 POTCAR 后重算。';
     } else if (complete) {
-      stage = 'ΔE 已完整'; next = '下一步：核对下表后生成完整 HTML 报告。';
+      stage = 'ΔE 已完整'; next = '下一步：后台会自动生成 HTML、Word 与 PDF，也可立即手动生成。';
     } else if (rows && rows.length && rows.every(row => row.delta_e != null) && backendFinal === false) {
       stage = 'ΔE 可预览，最终报告仍被门禁阻止';
       next = `下一步：${deltaResult.final_report_reason || '补齐参考态与方法确认。'}`;
@@ -2734,7 +2743,7 @@
     VCS.toast('已导出 CSV');
   }
 
-  // ── 生成完整报告:pick_dir + 默认文件名 → proj_report(耗时长,按钮禁用) ──
+  // ── 生成完整报告:同一数据模型输出 HTML 预览 + Word + PDF ──
   async function report() {
     const proj = currentProject();
     if (!proj) return;
@@ -2744,7 +2753,7 @@
     const save = joinPath(dr.path, (proj.name || 'project') + '_完整报告.html');
     const btn = $('pj-report');
     if (btn) btn.disabled = true;
-    VCS.log('生成完整报告(Origin 图表 + 结构图 + AI 分析),生成中,可能需要几分钟…');
+    VCS.log('生成 HTML 预览、Word 与 PDF(同源表格/图表/方法溯源)，可能需要几分钟…');
     try {
       // 项目页的“完整报告”是最终吸附能交付物：后端必须再次核对参考态、
       // DONE 能量和方法确认，不能只依赖按钮当前是否可点。
@@ -2753,12 +2762,13 @@
         VCS.log('生成完整报告失败:' + ((r && r.error) || '未知错误'), 'failc');
         return;
       }
-      VCS.log('完整报告已生成:' + (r.file || save), 'okc');
+      const files = (r.files || [r.file || save]).filter(Boolean);
+      VCS.log('完整报告已生成:' + files.join('；'), 'okc');
       VCS.call('open_dir', r.file || save);     // 输出反馈统一:打开所在目录
       // final=true 已由后端落下与当前输入/结果哈希绑定的 report_done 标记；
       // 重新读取管线状态，避免只靠一次前端调用猜测报告是否完成。
       await reloadProjects(proj.path);
-      VCS.toast('报告已生成');
+      VCS.toast('HTML、Word、PDF 报告已生成');
     } finally {
       if (btn) btn.disabled = false;
     }

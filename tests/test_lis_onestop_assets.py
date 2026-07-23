@@ -263,7 +263,7 @@ def test_delta_and_project_summary_show_species_reference_truthfully():
     assert 'ΔΔE (eV)' in js
     assert '最稳构型' in js
     assert 'function deltaRepair(row)' in js
-    assert '下一步：核对下表后生成完整 HTML 报告' in js
+    assert '后台会自动生成 HTML、Word 与 PDF' in js
 
 
 def test_submitted_but_unattended_credential_failure_is_not_called_autopilot():

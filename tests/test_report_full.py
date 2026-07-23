@@ -87,6 +87,38 @@ def test_generate_report_origin_ok_and_ai_ok(tmp_path):
     assert '方法学约定' in h and '未含 ZPE/熵' in h
 
 
+def test_fig_html_stages_cross_drive_asset_before_relpath(monkeypatch, tmp_path):
+    """Windows 跨盘报告必须先把外部图收进报告包，再计算相对路径。"""
+    source_dir = tmp_path / 'E_drive' / 'calculation-results'
+    source_dir.mkdir(parents=True)
+    source = source_dir / 'external-result.png'
+    source.write_bytes(b'\x89PNG\r\n\x1a\nexternal figure bytes')
+
+    report_dir = tmp_path / 'C_drive' / 'paper-report'
+    report_dir.mkdir(parents=True)
+    real_relpath = report_full.os.path.relpath
+
+    def windows_like_relpath(path, start):
+        # 在 Windows 上 E: → C: 会直接 ValueError。若生产代码先完成暂存，
+        # relpath 收到的 source 应已经位于 report_dir 内，不会进入该分支。
+        candidate = os.path.abspath(os.fspath(path))
+        report_root = os.path.abspath(os.fspath(start))
+        if os.path.commonpath((candidate, report_root)) != report_root:
+            raise ValueError("path is on mount 'E:', start on mount 'C:'")
+        return real_relpath(path, start)
+
+    monkeypatch.setattr(report_full.os.path, 'relpath', windows_like_relpath)
+
+    html = report_full._fig_html(source, report_dir, 'external result')
+
+    staged = list((report_dir / 'report_assets').glob('external-result-*.png'))
+    assert len(staged) == 1
+    assert staged[0].read_bytes() == source.read_bytes()
+    assert "src='report_assets/external-result-" in html
+    assert source.as_posix() not in html
+    assert 'file:' not in html
+
+
 def test_delta_e_color_semantics(tmp_path):
     """ΔE 颜色语义(原版口径):>0 红、<-3 绿。"""
     from vcstudio.project import report

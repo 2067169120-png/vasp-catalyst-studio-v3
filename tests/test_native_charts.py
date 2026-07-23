@@ -164,6 +164,56 @@ def test_free_energy_ladder_single_dict(tmp_path):
     _assert_pdf(out[1])
 
 
+def test_free_energy_ladder_keeps_eight_catalysts_on_one_axes_and_own_ul(
+        monkeypatch, tmp_path):
+    captured = {}
+
+    def capture_figure(fig, out_path, formats=('png', 'pdf')):
+        captured['fig'] = fig
+        captured['out_path'] = out_path
+        captured['formats'] = formats
+        return [str(out_path)]
+
+    monkeypatch.setattr(nc, '_save_dual', capture_figure)
+    catalyst_names = [
+        f'Catalyst {letter} supported cobalt nitrogen long screening project'
+        for letter in 'ABCDEFGH'
+    ]
+    paths = [
+        {
+            'name': name,
+            'G': [0.0, 0.35, -0.10],
+            'pds_index': 0,
+            # 与从台阶高度回算的 -0.35 V 刻意不同，证明逐路径权威值生效。
+            'u_l': (i + 1) * 0.11,
+        }
+        for i, name in enumerate(catalyst_names)
+    ]
+
+    nc.free_energy_ladder(
+        paths, tmp_path / 'eight-catalysts',
+        step_labels=['S8', 'Li2S8', 'Li2S'],
+        show_ul=True)
+
+    fig = captured['fig']
+    assert len(fig.axes) == 1
+    assert fig.get_figwidth() >= nc.DOUBLE_COL
+    legend = fig.axes[0].get_legend()
+    labels = [text.get_text() for text in legend.get_texts()]
+    assert len(labels) == 8
+    for i, (name, label) in enumerate(zip(catalyst_names, labels), start=1):
+        assert name in label.replace('\n', ' ')
+        assert f'= {i * 0.11:.2f} V' in label
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    xlabel_box = fig.axes[0].xaxis.label.get_window_extent(renderer)
+    legend_box = legend.get_window_extent(renderer)
+    assert not xlabel_box.overlaps(legend_box)
+    assert xlabel_box.y0 - legend_box.y1 >= 2.0
+    assert legend_box.x0 >= fig.bbox.x0 and legend_box.x1 <= fig.bbox.x1
+    assert legend_box.y0 >= fig.bbox.y0 and legend_box.y1 <= fig.bbox.y1
+
+
 def test_free_energy_ladder_bad_data():
     with pytest.raises(ValueError):
         nc.free_energy_ladder([], 'x')

@@ -5,13 +5,13 @@ features therefore have to be selected *when the executable is built*:
 
 ``python packaging/build_exe.py``
     Build the normal, full Web executable. Charts (matplotlib/numpy), molecular
-    editing (RDKit), Word export and PDF reading are required and explicitly
-    collected. A missing prerequisite is a build error; the script never silently
-    emits a feature-incomplete executable.
+    editing (RDKit), Word/PDF report export and PDF reading are required and
+    explicitly collected. A missing prerequisite is a build error; the script
+    never silently emits a feature-incomplete executable.
 
 ``python packaging/build_exe.py --lite``
     Build a deliberately small executable without charts, numeric structure tools,
-    RDKit, Word export or PDF reading.
+    RDKit, Word/PDF report export or PDF reading.
 
 ``python packaging/build_exe.py --no-charts``
     Preserve the historical meaning of this flag: omit matplotlib only, while keeping
@@ -46,7 +46,9 @@ CONFIG_EXAMPLE = os.path.join(ROOT, 'config.example.yaml')
 # profile-independent also prevents an unrelated package in the build environment from
 # unexpectedly inflating the executable.
 EXCLUDES_ALWAYS = ('sklearn', 'scipy', 'pandas', 'pytest')
-EXCLUDES_LITE = ('numpy', 'matplotlib', 'rdkit', 'PIL', 'docx', 'pypdf')
+EXCLUDES_LITE = (
+    'numpy', 'matplotlib', 'rdkit', 'PIL', 'docx', 'pypdf', 'reportlab',
+)
 EXCLUDES_DECIMER = ('DECIMER', 'decimer', 'tensorflow', 'keras')
 
 # (import name, human-facing package name).  Core dependencies are required even for
@@ -65,6 +67,7 @@ FULL_REQUIREMENTS = (
     ('rdkit', 'rdkit'),
     ('docx', 'python-docx'),
     ('pypdf', 'pypdf'),
+    ('reportlab', 'reportlab'),
 )
 DECIMER_REQUIREMENTS = (
     ('DECIMER', 'decimer'),
@@ -212,6 +215,7 @@ def build_command(args: Sequence[str] = ()) -> tuple[list[str], BuildOptions]:
         cmd += ['--collect-all', 'rdkit']
         cmd += ['--collect-all', 'docx']
         cmd += ['--collect-all', 'pypdf']
+        cmd += ['--collect-all', 'reportlab']
 
     if options.with_decimer:
         cmd += ['--collect-all', 'DECIMER']

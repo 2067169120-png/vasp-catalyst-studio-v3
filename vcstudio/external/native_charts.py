@@ -32,6 +32,7 @@ import contextlib
 import csv
 import os
 import re
+import textwrap
 
 # ── 论文级配色(全部色盲安全) ────────────────────────────────────────────────
 PALETTES = {
@@ -63,6 +64,38 @@ def chem_label(name) -> str:
     if '$' in s:
         return s
     return _SUBSCRIPT_RE.sub(r'$_{\1}$', s)
+
+
+def _category_label(name, width=14) -> str:
+    """长目录型类目名按分隔符换行，保留全文并避免相邻标签互相覆盖。"""
+    value = str(name if name is not None else '')
+    if len(value) <= width:
+        return chem_label(value)
+    pieces = re.split(r'([_-])', value)
+    lines, current = [], ''
+    for piece in pieces:
+        if not piece:
+            continue
+        if current and len(current) + len(piece) > width:
+            lines.append(current)
+            current = piece
+        else:
+            current += piece
+    if current:
+        lines.append(current)
+    return '\n'.join(chem_label(line) for line in lines)
+
+
+def _legend_label(name, width=26) -> str:
+    """Wrap long series names without truncation so legends stay page-width."""
+    value = str(name if name is not None else '')
+    lines = textwrap.wrap(
+        value,
+        width=max(int(width), 8),
+        break_long_words=False,
+        break_on_hyphens=True,
+    ) or [value]
+    return '\n'.join(chem_label(line) for line in lines)
 
 
 # ── 论文级风格层 ────────────────────────────────────────────────────────────
@@ -233,7 +266,10 @@ def adsorption_bar(data: dict, out_path, *, ylabel: str | None = None,
     """
     ads, subs = _validate_matrix(data)
     n, m = len(ads), len(subs)
-    fig_w = width if width is not None else max(SINGLE_COL, 0.17 * n * m + 1.3)
+    longest = max((len(str(item)) for item in ads), default=0)
+    fig_w = width if width is not None else max(
+        SINGLE_COL, 0.17 * n * m + 1.3,
+        min(DOUBLE_COL, 0.075 * n * max(longest, 8) + 1.2))
 
     with apply_paper_style(palette=palette, **(style_kw or {})):
         fig, ax = _new_figure(width=fig_w, aspect=0.72)
@@ -266,7 +302,11 @@ def adsorption_bar(data: dict, out_path, *, ylabel: str | None = None,
         if negative_up:
             ax.invert_yaxis()
         ax.set_xticks(range(n))
-        ax.set_xticklabels([chem_label(a) for a in ads])
+        wrapped = [_category_label(a) for a in ads]
+        rotate = 28 if n > 8 and longest > 12 else 0
+        ax.set_xticklabels(
+            wrapped, rotation=rotate, ha='right' if rotate else 'center',
+            rotation_mode='anchor')
         ax.tick_params(axis='x', length=0)      # 类目轴不需要刻度线
         ax.set_xlim(-0.65, n - 0.35)
         ax.set_ylabel(ylabel if ylabel is not None else r'$E_\mathrm{ads}$ (eV)')
@@ -415,22 +455,39 @@ def free_energy_ladder(paths, out_path, *, step_labels=None,
         name, gs = str(p.get('name', '')), [float(g) for g in (p.get('G') or [])]
         if len(gs) < 2:
             raise ValueError(f"体系 '{name}' 的 G 至少需 2 个台阶")
-        systems.append((name, gs, p.get('pds_index', None)))
+        systems.append((name, gs, p.get('pds_index', None), p.get('u_l', None)))
     if not systems:
         raise ValueError('paths 不能为空')
-    n = max(len(gs) for _, gs, _ in systems)
-    fig_w = width if width is not None else max(SINGLE_COL, 0.52 * n + 1.2)
+    n = max(len(gs) for _, gs, _, _ in systems)
+    n_systems = len(systems)
+    # 5 组以上仍按用户要求叠在同一张图；双栏宽度 + 颜色/线型/标记联合编码，
+    # 而不是拆成小多图。图例行数会在下方单独预留空间。
+    max_legend_chars = max((len(name) for name, *_rest in systems), default=0)
+    if n_systems > 4:
+        legend_cols = 2 if max_legend_chars > 18 else min(n_systems, 3)
+    else:
+        legend_cols = min(n_systems, 2 if max_legend_chars > 28 else n_systems)
+    legend_rows = (n_systems + legend_cols - 1) // legend_cols
+    fig_w = width if width is not None else max(
+        DOUBLE_COL if n_systems > 4 else SINGLE_COL,
+        0.52 * n + 1.2)
+    aspect = 0.70 + (0.072 * max(legend_rows - 1, 0)
+                     if n_systems > 1 else 0.0)
+    line_styles = ('-', (0, (5, 2)), (0, (2, 1.6)), (0, (7, 2, 1.5, 2)))
+    markers = ('o', 's', '^', 'D', 'v', 'P', 'X', '*')
 
     with apply_paper_style(palette=palette, **(style_kw or {})):
-        fig, ax = _new_figure(width=fig_w, aspect=0.70)
+        fig, ax = _new_figure(width=fig_w, aspect=aspect)
         colors = PALETTES.get(palette, PALETTES['tol_bright'])
-        all_g = [g for _, gs, _ in systems for g in gs]
+        all_g = [g for _, gs, _, _ in systems for g in gs]
         rng = (max(all_g) - min(all_g)) or 1.0
         if min(all_g) < 0 < max(all_g):
             ax.axhline(0.0, color=ZERO_LINE_COLOR, lw=0.7, ls=(0, (5, 3)), zorder=1)
 
-        for si, (name, gs, path_pds) in enumerate(systems):
+        for si, (name, gs, path_pds, path_ul) in enumerate(systems):
             c = colors[si % len(colors)]
+            path_ls = line_styles[(si // len(colors)) % len(line_styles)]
+            marker = markers[si % len(markers)]
             climbs = [gs[i + 1] - gs[i] for i in range(len(gs) - 1)]
             # 决速步:体系自带 > 全局 pds_index > 按原始 ΔG 自判(仅逐 1e⁻ 路径正确)
             authoritative = path_pds if path_pds is not None else pds_index
@@ -443,26 +500,41 @@ def free_energy_ladder(paths, out_path, *, step_labels=None,
                 pds = max(range(len(climbs)), key=lambda i: climbs[i]) if climbs else None
                 if pds is not None and climbs[pds] <= 0:
                     pds = None
-            for i, g in enumerate(gs):          # 平台:实线
+            for i, g in enumerate(gs):
                 ax.plot([i - half, i + half], [g, g], color=c, lw=1.9,
-                        solid_capstyle='butt', zorder=3)
+                        ls=path_ls, solid_capstyle='butt', zorder=3)
+                # 中心小标记让灰度打印和色觉差异下仍能逐条追踪。
+                ax.plot([i], [g], color=c, marker=marker, ms=3.2,
+                        markeredgecolor='white', markeredgewidth=0.35,
+                        ls='none', zorder=4)
             for i in range(len(gs) - 1):        # 连接:虚线;决速步红实线
                 x0, x1 = i + half, i + 1 - half
                 if mark_pds and i == pds:
-                    ax.plot([x0, x1], [gs[i], gs[i + 1]], color=PDS_COLOR,
-                            lw=1.6, zorder=4)
-                    ax.annotate(f'{climbs[i]:+.2f}',
-                                ((x0 + x1) / 2, (gs[i] + gs[i + 1]) / 2),
-                                xytext=(3, -1), textcoords='offset points',
-                                ha='left', va='top', color=PDS_COLOR,
-                                fontsize=7)
+                    pds_color = PDS_COLOR if n_systems == 1 else c
+                    ax.plot([x0, x1], [gs[i], gs[i + 1]], color=pds_color,
+                            lw=2.0, ls=path_ls, zorder=4)
+                    ax.plot([(x0 + x1) / 2], [(gs[i] + gs[i + 1]) / 2],
+                            marker='D', ms=4.0, color=pds_color, ls='none', zorder=5)
+                    # 多于 4 组时逐条数字注释会天然互相遮挡；保留菱形 PDS 标记，
+                    # 精确 ΔG 与 U_L 放在图例/报告汇总表中。
+                    if n_systems <= 4:
+                        ax.annotate(f'{climbs[i]:+.2f}',
+                                    ((x0 + x1) / 2, (gs[i] + gs[i + 1]) / 2),
+                                    xytext=(3, -3 - 7 * (si % 2)),
+                                    textcoords='offset points', ha='left', va='top',
+                                    color=pds_color, fontsize=7)
                 else:
                     ax.plot([x0, x1], [gs[i], gs[i + 1]], color=c, lw=0.9,
-                            ls=(0, (4, 2.5)), zorder=2)
-            label = chem_label(name) if name else f'path {si + 1}'
+                            ls=path_ls, alpha=0.82, zorder=2)
+            label = (_legend_label(name, 28 if n_systems > 4 else 36)
+                     if name else f'path {si + 1}')
             if show_ul and pds is not None:
-                label += rf' ($U_\mathrm{{L}}$ = {-climbs[pds]:.2f} V)'
-            ax.plot([], [], color=c, lw=1.9, label=label)   # 图例句柄(实线样式)
+                # Li-S 各步电子数不等；优先使用自由能引擎给出的权威 U_L，
+                # 不能再从原始台阶高度擅自重算。
+                ul = float(path_ul) if path_ul is not None else -climbs[pds]
+                label += rf' ($U_\mathrm{{L}}$ = {ul:.2f} V)'
+            ax.plot([], [], color=c, lw=1.9, ls=path_ls, marker=marker,
+                    ms=3.2, label=label)
 
         ax.set_xlim(-0.55, n - 0.45)
         ax.set_ylim(min(all_g) - rng * 0.10, max(all_g) + rng * 0.16)
@@ -480,9 +552,13 @@ def free_energy_ladder(paths, out_path, *, step_labels=None,
             ax.set_xticks([])
         ax.tick_params(axis='x', length=0)
         if title:
-            ax.set_title(title)
+            ax.set_title(title, pad=8)
         if len(systems) > 1 or show_ul:
-            ax.legend(loc='best')
+            # 将图例锚在横轴标题下方；长名称在两列中换行后也不能与 xlabel 相叠。
+            ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.26),
+                      ncols=legend_cols, columnspacing=1.15, handlelength=2.0,
+                      handletextpad=0.55, labelspacing=0.65)
+            fig.subplots_adjust(bottom=min(0.48, 0.18 + legend_rows * 0.07))
         if panel:
             add_panel_label(ax, panel)
         return _save_dual(fig, out_path, formats)

@@ -375,6 +375,9 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     <!-- 卡片:项目管线(每项目一行站点进度) -->
     <div class="card acc" data-acc="dashboard:pipeline" data-sum="生成 → 提交 → 分析 → 报告" id="db-pipeline-card" style="padding:12px;margin-bottom:10px">
       <div class="db-h acc-h">项目管线 <span class="sub" style="font-weight:400">生成 → 提交 → 监控 → 恢复 → 分析 → 报告</span></div>
+      <div id="db-automation" class="db-automation">
+        <b>自动托管</b><span>正在读取后台状态…</span>
+      </div>
       <div id="db-pipeline"><div class="pl-empty">加载中…</div></div>
       <!-- 批次(campaign)区块:引擎可用且有批次才显示,否则隐藏 -->
       <div id="db-campaigns" hidden style="margin-top:10px;border-top:1px solid var(--rule);padding-top:12px">
@@ -1408,7 +1411,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <div class="pj-project-summary" id="pj-project-summary">正在读取项目…</div>
       <div class="actions" style="margin-bottom:12px">
         <button class="btn primary" id="pj-delta" disabled>刷新并计算 ΔE</button>
-        <button class="btn" id="pj-report" disabled>生成完整 HTML 报告</button>
+        <button class="btn" id="pj-report" disabled>生成 HTML + Word + PDF 报告</button>
         <button class="btn quiet" id="pj-csv" disabled>导出 ΔE CSV</button>
       </div>
       <div id="pj-table"></div>
@@ -1548,13 +1551,15 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
         <button class="btn primary" id="pj-figs">生成所选图</button>
       </div>
 
-      <div class="pj-lbl" style="margin:10px 0 6px">多项目对比(勾选 ≥2 个项目;火山图需 ≥3 组 + 分子库):</div>
+      <div class="pj-lbl" style="margin:10px 0 6px">多催化剂项目对比(每个物种取最稳构型；5 组以上仍叠加在同一台阶图):</div>
       <div id="fig-projlist" class="pj-figprojs">(先点上方「刷新」载入项目)</div>
       <div class="pj-figrow" style="margin-top:8px">
         <label><input type="checkbox" id="fig-heatmap" checked> 吸附能热图</label>
+        <label><input type="checkbox" id="fig-cmp-ladder" checked> 多催化剂 ΔG 台阶图</label>
         <label><input type="checkbox" id="fig-scaling"> 标度关系(拟合+R²)</label>
         <label><input type="checkbox" id="fig-volcano"> 火山图(Sabatier 峰顶)</label>
-        <button class="btn primary" id="pj-cmpfigs">生成对比图</button>
+        <label><input type="checkbox" id="fig-cmp-report" checked> Word + PDF 对比报告</label>
+        <button class="btn primary" id="pj-cmpfigs">生成对比图与报告</button>
       </div>
     </div>
 
@@ -1811,7 +1816,33 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
   <section class="page" data-page="ai" id="page-ai" hidden>
     <div class="pagebar">
       <h1 data-i18n="ai.title">AI 助手</h1>
-      <span class="stats" data-i18n="ai.subtitle">论文 → 规格表 → 计划 → 实例化(单点先行 · 机时闸 · 三态门禁)</span>
+      <span class="stats" data-i18n="ai.subtitle">对话与文件分析 · 论文 → 规格表 → 计划 → 实例化</span>
+    </div>
+
+    <div class="card ai-chat" id="ai-chat-card" style="padding:12px;margin-bottom:10px">
+      <div class="ai-chat-head">
+        <div>
+          <div class="gen-h">对话式材料计算助手</div>
+          <div class="sub">借鉴 MatClaw 的会话、附件与状态交互；沿用本软件已验证的计算和报告后端。</div>
+        </div>
+        <select id="ai-chat-session" class="ipt" aria-label="对话会话"></select>
+        <button class="btn" id="ai-chat-new">新对话</button>
+      </div>
+      <div id="ai-chat-messages" class="ai-chat-messages">
+        <div class="ai-chat-empty">新建会话后即可聊天。输入 /help 查看本地命令。</div>
+      </div>
+      <div id="ai-chat-files" class="ai-chat-files"></div>
+      <div class="ai-chat-compose">
+        <button class="btn" id="ai-chat-attach">添加文件 / ZIP</button>
+        <textarea id="ai-chat-input" class="ipt" rows="2"
+          placeholder="询问结果、参数或报告；支持 /status、/report、/help"></textarea>
+        <button class="btn primary" id="ai-chat-send">发送</button>
+        <button class="btn quiet" id="ai-chat-stop" disabled>停止回复</button>
+      </div>
+      <div class="sub ai-chat-privacy">
+        文件先复制到本地会话隔离区并做大小、软链接与 ZIP 安全检查；只有本次勾选的文本预览会发送给外部模型。
+        “停止回复”不会取消集群作业。
+      </div>
     </div>
 
     <div class="ai-guide" id="ai-guide" hidden>

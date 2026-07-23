@@ -15,6 +15,7 @@ in the numeric chain) and fully offline operation.
 > 📂 Repository map: **[STRUCTURE.md](STRUCTURE.md)** ·
 > 中文完整用法: **[使用说明.md](使用说明.md)** ·
 > English guide: **[docs/user-guide-en.md](docs/user-guide-en.md)** ·
+> MatClaw 式对话助手边界: **[docs/matclaw-integration.md](docs/matclaw-integration.md)** ·
 > 开发进度/待办: **[docs/planning/progress-2026-07-16.md](docs/planning/progress-2026-07-16.md)**
 
 ## 软件流程图 · Workflow
@@ -34,7 +35,7 @@ in the numeric chain) and fully offline operation.
 | ② 提交 Submit | `vcstudio/cluster/` | PBS/Slurm 双方言、preflight、SSH 上传+提交 | `schedulers.py` `script_builder.py` `submitter.py` `connection.py` |
 | ③ 监控+诊断 Monitor | `vcstudio/cluster/` | 查队列判排队/运行/终态 → 取证 → 15 类作业分类 + 15 条 VASP 错误签名([失败分类表](docs/failure-taxonomy.md));**续算沉降护栏** | `submitter.refresh_job` `diagnose.py` `convergence.py` |
 | ④ 有界恢复 Recovery | `vcstudio/cluster/` | CONTCAR/改参续算(≤3轮,INCAR 冻结),否则交人工 | `submitter.continue_from_contcar` `batch_ops.py` |
-| ⑤ 分析+报告 Analyze | `vcstudio/project/` + `external/` | ΔE 门控、吸附能/ΔG台阶/d带中心/Bader、论文级出图、报告 | `adsorption.py` `freeenergy.py` `thermo.py` `dosparse.py` `bader.py` `charts.py` `external/native_charts.py` |
+| ⑤ 分析+报告 Analyze | `vcstudio/project/` + `external/` | ΔE 门控、吸附能/ΔG台阶/d带中心/Bader、论文级出图、HTML 预览+DOCX+PDF 同源报告 | `adsorption.py` `freeenergy.py` `thermo.py` `dosparse.py` `bader.py` `charts.py` `report_documents.py` `external/native_charts.py` |
 | ⑥ 结构生成 StructGen (v3.1) | `vcstudio/generate/` | SAC 模板库(六类配位×金属矩阵)、LiPS 分子库、吸附位点枚举与摆放、参考态注册 | `sac_builder.py` `molecules.py` `sites.py` `project/references.py` |
 | ⑦ 派生计算 Derived (v3.1) | `vcstudio/generate/` + `project/` | 弛豫→频率(ZPE/熵)/电子结构静态(PDOS/Bader/差分电荷)一键派生;多自旋并跑;虚频质量闸 | `freq_builder.py` `estatic.py` `spin_scan.py` `chgdiff.py` |
 | ⑧ 通用 CHE 引擎 (v3.1) | `vcstudio/project/` | 反应网络预设(Li-S 16e/缔合解离/ORR/HER/OER/CO2RR),U_eq/U_L/η,多电位台阶 | `reactions.py` `freeenergy.free_energy_path` |
@@ -44,7 +45,7 @@ in the numeric chain) and fully offline operation.
 | ⑪ 全 DFT 目录 TaskCatalog (v3.2) | `vcstudio/generate/` + `project/` | 23 种计算类型五分类:收敛扫描/能带/EOS/功函数/表面能/Dimer/VASPsol/DFT+U 值库 | `task_catalog.py` `conv_scan.py` `bands_builder.py` `eos.py` `workfunction.py` `u_library.py` |
 | ⑫ 一键出图与 AI Pipeline (v3.2) | `vcstudio/project/` | 场景感知整套图+多面板拼版+图表溯源;计算活动模板全链推进;论文数据抽取→MAE 对照→变体推荐→论文草稿骨架 | `auto_figures.py` `panel_composer.py` `campaign_templates.py` `paper_data.py` `variant_advisor.py` `manuscript_draft.py` |
 | 多引擎 Engines (v3.1.1) | `vcstudio/engines/` | CalcSpec IR + VASP/CP2K/Gaussian/CASTEP 文件级后端;跨引擎不等价清单+参考态一致性闸 | `calcspec.py` `gaussian.py` `cp2k.py` `castep.py` `equivalence.py` |
-| 界面 GUI | `vcstudio/gui_web/`(默认 Web)+ `gui/`(旧 tkinter) | pywebview 前端 + `api.py` 薄门面;工作流式九页:概览/①结构建模/②生成输入/③提交计算/④结果分析/⑤论文出图/⑥AI助手/集群/设置 | `gui_web/api.py` `assets/*.js` |
+| 界面 GUI | `vcstudio/gui_web/`(默认 Web)+ `gui/`(旧 tkinter) | pywebview 前端 + `api.py` 薄门面;工作流式九页，以及带会话、附件、状态与停止功能的 MatClaw 式对话入口 | `gui_web/api.py` `gui_web/pipeline_supervisor.py` `project/assistant_chat.py` `assets/*.js` |
 
 ## Statement of need
 
@@ -68,7 +69,7 @@ guaranteed consistent with the actual INCAR/KPOINTS/POTCAR. See the full
 | Submit | `cluster/{schedulers,script_builder,submitter,connection}` | PBS/Slurm dialects (pure functions); preflight gates; dual-track scripts (auto / your template passed through verbatim) |
 | Monitor + diagnose | `submitter.refresh_job` + `cluster/diagnose.py` | scheduler exit reason + output integrity + log signatures + convergence + energy sanity → 15 job-classification outcomes + 15 VASP internal-error signatures → 4 terminal states ([taxonomy](docs/failure-taxonomy.md)) |
 | Bounded recovery | `submitter.continue_from_contcar` | only for recoverable classes; CONTCAR validated; INCAR frozen; **max 3 rounds**; anything else → NEEDS_HUMAN |
-| Analyze + report | `project/` + `external/` | ΔE gating (all-DONE before numbers), Li–S discharge path (ΔG/PDS/U_L), Origin/SVG dual chart engines, POV-Ray structure figures, bilingual LLM analysis (real INCAR injected, no fabricated citations) |
+| Analyze + report | `project/` + `external/` | ΔE gating (all-DONE before numbers), Li–S discharge path (ΔG/PDS/U_L), Origin/SVG dual chart engines, POV-Ray structure figures, one data model rendered as HTML preview + DOCX + PDF, bilingual LLM analysis (real INCAR injected, no fabricated citations) |
 | Publication aids | `cluster/convergence.py`, `generate/structure_view.py`, `generate/methods_text.py`, `project/dosparse.py` | per-ionic-step convergence charts; 3D structure preview with molecule–slab clash interception; bilingual Methods + BibTeX from real inputs; total-DOS SVG from vasprun.xml |
 
 Three invariants: ① methodology sovereignty (your INCAR/template is passed
@@ -218,7 +219,26 @@ silent (job.yaml state machine + audit history).
   标为 unverified。无参考态、参考无效或未确认的方法差异只能生成诊断，不能标记为最终
   吸附能报告。
   报告绑定成员代次、能量、下载哈希与方法证据；结果变化或报告文件删除后会自动失效重建。
-- 当前回归基线：**2695 测试通过，6 项按本机可选软件/依赖环境跳过**。
+- 该轮历史回归基线：**2695 测试通过，6 项按本机可选软件/依赖环境跳过**。
+
+### 2026-07-23：论文式报告、后台主管与对话助手
+
+- 项目报告改为同一份结构化数据同时写出 **HTML 预览、DOCX 和 PDF**。正文采用更接近
+  成熟论文的版式，表格、图片、方法证据和溯源信息在三种载体中保持同一口径；图像资源会
+  复制到报告目录后再引用，数据盘与报告盘不同也不依赖跨盘相对路径。
+- 吸附能图自动缩短并错开长构型标签；自由能台阶图分离 PDS 与限制电位标注。多个催化剂
+  项目统一按同一物种顺序比较，**5 组以上仍叠加在同一张台阶图**，用颜色、线型、标记和
+  图外图例区分，而不是擅自拆成小图。
+- 自动托管的调度从浏览器定时器移到应用内 Python 主管线程。只要应用进程仍在运行，
+  页面切换不会中断监控；界面可读取运行/暂停、上次与下次检查、续算轮次、阻塞原因和
+  报告状态。结果达到最终门后自动生成完整报告；证据不足时只生成诊断报告。
+- AI 助手新增受 [MatClaw](https://github.com/DingyangLyu/MatClaw) 启发的对话入口：
+  支持本地会话恢复、受限附件、只读状态和停止当前 AI 响应，同时复用 vcstudio 已有的
+  科学门禁。它不嵌入 Node/Docker/Claude SDK，不开放任意 shell，也不能通过 `/stop`
+  取消 HPC 作业。审计提交、许可证与安全边界见
+  [MatClaw 集成说明](docs/matclaw-integration.md)。
+- 本节不预写尚未完成的最终测试数字；当前分支的实际基线以
+  `python -m pytest` 和 CI 输出为准。
 
 ## Install & quickstart
 
@@ -237,14 +257,16 @@ vcs gen --poscar POSCAR --incar my.incar --calc-type slab -o results/job1/
 POTCAR library generator (real pseudopotentials are licensed material and are
 never distributed with this repository).
 
-**Verify the analysis chain offline** (diagnose → gated ΔE → chart → HTML
-report, no VASP or cluster): [examples/offline_analysis](examples/offline_analysis/README.md)
+**Verify the analysis chain offline** (diagnose → gated ΔE → chart →
+HTML/DOCX/PDF report bundle, no VASP or cluster):
+[examples/offline_analysis](examples/offline_analysis/README.md)
 — `python examples/offline_analysis/run_demo.py` drives a synthetic completed
 job set end-to-end so a reviewer can confirm the analysis half of the pipeline.
 
-**Tests**: `python -m pytest` — 2695 tests, 6 skipped (optional OriginLab smoke
-behind `VCS_ORIGIN_SMOKE=1`, and a POV-Ray real-render smoke). Parser
-cross-checks against ASE run when `ase` is installed (in the `dev` extra).
+**Tests**: run `python -m pytest`; the command and CI are the source of truth for
+the current branch's pass/skip counts. Optional OriginLab smoke tests remain behind
+`VCS_ORIGIN_SMOKE=1`, and POV-Ray real-render checks depend on the local executable.
+Parser cross-checks against ASE run when `ase` is installed (in the `dev` extra).
 CI runs the suite on ubuntu/windows × Python 3.10/3.12.
 
 ## Scientific conventions
@@ -283,14 +305,14 @@ Windows 单文件 EXE,确定性核心零 token,AI 只做助手绝不进数值链
   [examples/offline_analysis](examples/offline_analysis/README.md)
   (合成的已完成作业 → 诊断/ΔE/出图/报告,审稿人无 VASP/集群即可验证分析链路)
 - **完整用法**:[使用说明.md](使用说明.md);目录结构:[STRUCTURE.md](STRUCTURE.md)
-- **测试**:`python -m pytest`(2009 用例,6 项在无 OriginLab/POV-Ray/rdkit 时跳过)
+- **测试**:`python -m pytest`；当前分支的通过/跳过数以命令输出和 CI 为准
 - **科学约定/发刊工具链**:同上英文节;竞品对比见
   [docs/comparison.md](docs/comparison.md),验证协议见
   [docs/validation.md](docs/validation.md)
 
 ```
 vcstudio/       核心包(generate/cluster/project/external/engines/molbuild/campaign/gui_web/shared/cli)
-tests/          2009 测试   docs/superpowers/specs/  设计文档
+tests/          回归测试   docs/superpowers/specs/  设计文档
 config.example.yaml  配置模板(复制为 config.yaml 填写;config.yaml 已 gitignore)
 dist/           打包产物 EXE(gitignore)   results/  作业输出(不入 git)
 ```

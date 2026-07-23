@@ -156,6 +156,44 @@
   const STAGE_LABEL = { generate: '生成', submit: '提交', monitor: '监控',
     recover: '恢复', analysis: '分析', report_done: '报告' };
 
+  function shortTime(value) {
+    if (!value) return '—';
+    const d = new Date(value);
+    if (!Number.isNaN(d.getTime())) {
+      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+    return String(value);
+  }
+
+  function renderAutomation(runtime, err) {
+    const box = $('db-automation');
+    if (!box) return;
+    if (err) {
+      box.className = 'db-automation fail';
+      box.innerHTML = `<b>自动托管异常</b><span>${VCS.esc(err)}</span>`;
+      return;
+    }
+    const st = runtime || {};
+    if (st.last_error) {
+      box.className = 'db-automation fail';
+      box.innerHTML = `<b>自动托管需检查</b><span>${VCS.esc(st.last_error)}</span>`;
+    } else if (st.tick_running) {
+      box.className = 'db-automation run';
+      box.innerHTML = '<b>自动托管正在运行</b><span>正在同步状态、判断续算、拉回结果或生成报告</span>';
+    } else if (st.enabled === false || st.paused) {
+      box.className = 'db-automation pause';
+      box.innerHTML = '<b>自动托管已暂停</b><span>可在“设置 → 外观与自动化”启用</span>';
+    } else if (st.running) {
+      const last = shortTime(st.last_finished);
+      const next = shortTime(st.next_check);
+      box.className = 'db-automation';
+      box.innerHTML = `<b>自动托管后台待命</b><span>上次检查 ${VCS.esc(last)} · 下次检查 ${VCS.esc(next)}</span>`;
+    } else {
+      box.className = 'db-automation pause';
+      box.innerHTML = '<b>自动托管未启动</b><span>重新打开软件后将自动恢复已保存的托管设置</span>';
+    }
+  }
+
   function renderPipeline(projects, err) {
     const box = $('db-pipeline');
     if (!box) return;
@@ -176,6 +214,11 @@
       }).join('');
       const nextPage = p.stage_index <= 0 ? 'generate'
         : (p.stage_index <= 3 ? 'jobs' : 'project');
+      const reportState = p.report_status === 'final'
+        ? '<span class="pl-report ok">HTML · Word · PDF 已生成</span>'
+        : p.report_status === 'blocked'
+          ? `<span class="pl-report warn" title="${VCS.esc(p.report_reason || '')}">最终报告暂停：${VCS.esc(p.report_reason || '查看诊断报告')}</span>`
+          : '<span class="pl-report">报告等待计算完成</span>';
       return '<div class="pl-proj">' +
         '<div class="pl-head">' +
         (p.needs_human ? '<span class="redflag" title="需人工介入"></span>' : '') +
@@ -184,7 +227,7 @@
         (p.profile ? `<span class="pl-cluster">${VCS.esc(p.profile)}</span>` : '') +
         `<span class="plcount">${p.done}/${p.total} DONE</span>` +
         `<button class="btn quiet" data-goto="${nextPage}">继续下一步</button></div>` +
-        `<div class="pl-steps">${steps}</div></div>`;
+        `<div class="pl-steps">${steps}</div>${reportState}</div>`;
     }).join('');
   }
 
@@ -253,10 +296,10 @@
 
   // ── 取数 + 全量渲染(进页 / 启动时) ───────────────────────────────────────
   async function refresh() {
-    const [jr, pr, cr, sr, campr] = await Promise.all([
+    const [jr, pr, cr, sr, campr, runtime] = await Promise.all([
       VCS.call('list_jobs'), VCS.call('proj_list'),
       VCS.call('list_profiles'), VCS.call('pipeline_status'),
-      VCS.call('campaign_list')]);
+      VCS.call('campaign_list'), VCS.call('pipeline_runtime_status')]);
     const jobs = (jr && jr.jobs) || [];
     const stale = (jr && jr.stale) || [];
     const projects = (pr && pr.projects) || [];
@@ -267,11 +310,13 @@
     if (pr && pr.error) errs.push('项目列表:' + pr.error);
     if (cr && cr.error) errs.push('集群配置:' + cr.error);
     if (sr && sr.error) errs.push('项目管线:' + sr.error);
+    if (runtime && runtime.error) errs.push('自动托管:' + runtime.error);
     renderError(errs);
     renderNums(jobs);
     renderRecent(jobs);
     renderTodo(jobs, stale, profiles);
     renderPipeline((sr && sr.projects) || [], sr && sr.error);
+    renderAutomation(runtime && runtime.state, runtime && runtime.error);
     renderCampaigns(campr);
     if (VCS.pipeline && typeof VCS.pipeline.renderFeed === 'function') VCS.pipeline.renderFeed();
     if (typeof VCS.refreshNavFoot === 'function') VCS.refreshNavFoot();
@@ -286,6 +331,9 @@
   function init() {
     const page = $('page-dashboard');
     if (!page) return;
+    document.addEventListener('vcs:pipeline-runtime', event => {
+      renderAutomation(event && event.detail, null);
+    });
     // 快捷入口三个大按钮
     const wire = (id, fn) => { const el = $(id); if (el) el.addEventListener('click', fn); };
     renderStartActions(VCS.scenario);
