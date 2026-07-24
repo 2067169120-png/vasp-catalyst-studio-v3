@@ -4,6 +4,7 @@
 异常绝不穿透到 JS(错误落 'error' 字段)。中文注释允许,英文标识符。
 """
 import copy
+import json
 import os
 import sys
 import types
@@ -1581,6 +1582,165 @@ def _delta(names_to_de, slab=('DONE', -100.0)):
     return {'slab': slab, 'ref': ('无', None), 'has_ref': False, 'rows': rows}
 
 
+def _science_delta(name, *, method='verified', has_ref=True, values=None):
+    """Candidate/comparison summary with explicit method and reference evidence."""
+    values = values or {
+        'Li2S8': [-1.04],
+        'Li2S6': [-1.14],
+        'Li2S4': [-1.23],
+        'Li2S2': [-2.09],
+        'Li2S': [-2.81],
+    }
+    rows = []
+    for species, energies in values.items():
+        for index, value in enumerate(energies):
+            rows.append({
+                'name': f'{name}_{species}_{index}',
+                'species': species,
+                'state': 'DONE',
+                'e_config': -110.0 + value,
+                'delta_e': value,
+                'note': '',
+                'reference_valid': has_ref,
+                'method_check': {'status': method},
+            })
+    return {
+        'slab': ('DONE', -100.0),
+        'ref': (('DONE', -10.0) if has_ref else ('无', None)),
+        'has_ref': has_ref,
+        'reference_mode': 'species' if has_ref else 'none',
+        'method_consistency': {
+            'status': method,
+            'issues': [],
+            'warnings': ['方法证据待核验'] if method == 'unverified' else [],
+        },
+        'rows': rows,
+    }
+
+
+def _fake_paper_report(calls):
+    """Capture the semantic model without invoking DOCX/PDF/HTML renderers."""
+    def _render(model, out_dir, *, stem, formats):
+        calls.append({
+            'model': copy.deepcopy(model),
+            'out_dir': str(out_dir),
+            'stem': stem,
+            'formats': tuple(formats),
+        })
+        return {
+            'ok': True,
+            'files': {'html': os.path.join(str(out_dir), f'{stem}.html')},
+            'assets': [],
+        }
+
+    return types.SimpleNamespace(render_report_bundle=_render)
+
+
+def _fake_lis_freeenergy():
+    """Return one comparable Li-S path per project with an authoritative U_L."""
+    def _path(_rows, *, e_slab, molecules_dir, project=None, **_kwargs):
+        del e_slab, molecules_dir
+        name = str((project or {}).get('name') or 'M0')
+        index = int(name.removeprefix('M')) if name.removeprefix('M').isdigit() else 0
+        return {
+            'steps': [
+                {'label': 'S8*', 'G': 0.0},
+                {'label': 'Li2S4*', 'G': -0.5 - 0.01 * index},
+                {'label': 'Li2S*', 'G': -1.0 - 0.02 * index},
+            ],
+            'pds_index': 1,
+            'u_l': round(1.20 + 0.05 * index, 3),
+            'thermo_corrected': True,
+            'solvation_corrected': True,
+            'reference': 'Li/Li+',
+        }
+
+    return types.SimpleNamespace(path_from_project_and_molecules=_path)
+
+
+def test_proj_evaluate_candidate_returns_advance_and_blocked_json():
+    projects = {
+        '/advance': {
+            'name': 'Fe@B1N3', 'root': '/data/advance',
+            'project_uuid': 'advance-id',
+        },
+        '/blocked': {
+            'name': 'missing-reference', 'root': '/data/blocked',
+            'project_uuid': 'blocked-id',
+        },
+    }
+    summaries = {
+        'Fe@B1N3': _science_delta('Fe'),
+        'missing-reference': _science_delta('blocked', has_ref=False),
+    }
+    ads = _fake_adsorption(proj_map=projects)
+    ads.delta_e_rows = lambda project: summaries[project['name']]
+    api = Api(adsorption_mod=ads, config_mod=_fake_config())
+
+    advance = api.proj_evaluate_candidate('/advance')
+    blocked = api.proj_evaluate_candidate('/blocked')
+
+    assert advance['ok'] is True and advance['error'] is None
+    assert advance['evaluation']['decision']['priority'] == 'advance'
+    assert advance['evaluation']['candidate']['name'] == 'Fe@B1N3'
+    assert blocked['ok'] is True and blocked['error'] is None
+    assert blocked['evaluation']['decision']['priority'] == 'blocked'
+    assert 'ADSORBATE_REFERENCE_MISSING' in (
+        blocked['evaluation']['audit']['reason_codes'])
+    # pywebview 返回值必须能直接进入 JSON，不能泄漏 Path/集合等 Python 对象。
+    json.dumps({'advance': advance, 'blocked': blocked}, ensure_ascii=False)
+
+
+def test_proj_compare_preview_keeps_moved_project_and_canonical_stable_matrix():
+    projects = {
+        '/a': {
+            'name': 'A', 'root': '/data/a', 'project_uuid': 'a-id',
+            'comparison_method_fingerprint': 'same-method',
+        },
+        '/b': {
+            'name': 'B', 'root': '/data/b', 'project_uuid': 'b-id',
+            'comparison_method_fingerprint': 'same-method',
+        },
+    }
+    summaries = {
+        'A': _science_delta('A', values={
+            'Li₂S₈': [-1.10, -1.20],
+            'Li₂S': [-2.10],
+        }),
+        'B': _science_delta('B', values={
+            'Li2S8': [-0.90],
+            'Li₂S': [-2.40],
+        }),
+    }
+    ads = _fake_adsorption(proj_map=projects)
+    ads.delta_e_rows = lambda project: summaries[project['name']]
+    api = Api(adsorption_mod=ads, config_mod=_fake_config())
+
+    out = api.proj_compare_preview(['/a', '/moved/project.yaml', '/b'])
+
+    assert out['ok'] is True and out['selected_count'] == 3
+    assert out['ready_count'] == 2
+    assert [project['path'] for project in out['projects']] == [
+        '/a', '/moved/project.yaml', '/b',
+    ]
+    moved = out['projects'][1]
+    assert moved['status'] == 'blocked'
+    assert '已被移动' in moved['block_reasons'][0]
+    assert out['adsorption_matrix'] == {
+        'rows': ['A', 'B'],
+        'cols': ['Li2S8', 'Li2S'],
+        'values': [[-1.2, -2.1], [-0.9, -2.4]],
+    }
+    selected_a = {row['species']: row for row in out['projects'][0]['species']}
+    assert selected_a['Li2S8']['name'] == 'A_Li₂S₈_1'
+    assert selected_a['Li2S8']['co_minima'] == [{
+        'name': 'A_Li₂S₈_0',
+        'job': '',
+        'delta_e': -1.1,
+        'dd_e': 0.1,
+    }]
+
+
 def test_proj_figures_bar_table_with_short_names(tmp_path):
     calls = {}
     proj = _proj('liS', str(tmp_path))
@@ -1597,6 +1757,81 @@ def test_proj_figures_bar_table_with_short_names(tmp_path):
     assert data['substrates'] == {'liS': [-1.2]}
     assert calls['bar'][0]['negative_up'] is True
     assert out['out_dir'] == str(tmp_path / 'figures')
+
+
+def test_default_and_preset_ladders_share_filtered_thermo_corrections(
+        tmp_path, monkeypatch):
+    from vcstudio.project import thermo
+
+    molecules = tmp_path / 'molecules'
+    molecules.mkdir()
+    freq_dirs = {
+        'Li2S8': str(tmp_path / 'freq-Li2S8'),
+        'Li2S': str(tmp_path / 'freq-Li2S'),
+        'missing': str(tmp_path / 'freq-missing'),
+    }
+    monkeypatch.setattr(thermo, 'load_corrections', lambda _dirs: {
+        'Li2S8': {'g_corr': 0.123, 'excluded': False},
+        'Li2S': {
+            'g_corr': 0.456,
+            'excluded': True,
+            'exclude_reason': '存在大虚频',
+        },
+    })
+    calls = {}
+
+    def _lis_path(_rows, **kwargs):
+        calls['default'] = kwargs.get('g_corr')
+        return {
+            'steps': [{'label': 'S8*', 'G': 0.0}, {'label': 'Li2S8*', 'G': -0.1}],
+            'thermo_corrected': bool(kwargs.get('g_corr')),
+        }
+
+    def _preset_path(_spec, _energies, **kwargs):
+        calls['preset'] = kwargs.get('g_corr')
+        return {
+            'steps': [{'label': '*', 'G': 0.0}, {'label': 'Li2S8*', 'G': -0.2}],
+            'thermo_corrected': bool(kwargs.get('g_corr')),
+        }
+
+    freeenergy = types.SimpleNamespace(
+        path_from_project_and_molecules=_lis_path,
+        load_molecule_energies=lambda _path: {},
+        free_energy_path=_preset_path,
+    )
+    reactions = types.SimpleNamespace(get_preset=lambda _key: {
+        'name': 'test',
+        'description': 'test path',
+        'electrode': 'none',
+        'steps': [{'species': '*'}, {'species': 'Li2S8*'}],
+    })
+    api = Api(
+        freeenergy_mod=freeenergy,
+        reactions_mod=reactions,
+        config_mod=_fake_config(cfg={'freq_dirs': freq_dirs}),
+    )
+    project = {'name': 'P', 'molecules_dir': str(molecules)}
+    summary = {
+        'slab': ('DONE', -100.0),
+        'rows': [{
+            'name': 'P_ads_Li2S8_top',
+            'state': 'DONE',
+            'e_config': -110.0,
+        }],
+    }
+
+    default, default_reason = api._proj_fed(project, summary)
+    preset, preset_reason, _title = api._proj_fed_preset(project, summary, 'test')
+
+    assert default_reason is None and preset_reason is None
+    assert calls['default'] == {'Li2S8': 0.123}
+    assert calls['preset'] == {'Li2S8*': 0.123}
+    assert default['thermo_correction_fingerprint']
+    assert preset['thermo_correction_fingerprint']
+    assert default['temperature_K'] == thermo.DEFAULT_T
+    assert preset['temperature_K'] == thermo.DEFAULT_T
+    assert any('大虚频' in warning for warning in preset['warnings'])
+    assert any('没有可用振动证据' in warning for warning in default['warnings'])
 
 
 def test_proj_figures_no_done_rows_all_skipped(tmp_path):
@@ -1630,7 +1865,10 @@ def test_proj_figures_ladder_uses_fed_pds_index(tmp_path):
     lad = calls['ladder'][0]
     assert lad['pds_index'] == 0                      # 逐电子权威口径透传
     assert lad['step_labels'] == ['S8*', 'Li2S*']
-    assert lad['data'] == [{'name': 'liS', 'G': [0.0, -1.0]}]
+    assert lad['show_ul'] is True
+    assert lad['data'] == [{
+        'name': 'liS', 'G': [0.0, -1.0], 'pds_index': 0, 'u_l': 1.5,
+    }]
 
 
 def test_proj_figures_prefers_imported_project_molecules(tmp_path):
@@ -1677,6 +1915,17 @@ def test_proj_compare_figures_heatmap_union_cols(tmp_path):
     p1, p2 = _proj('A', str(tmp_path / 'a')), _proj('B', str(tmp_path / 'b'))
     deltas = {'/a': _delta({'A_ads_S8': -0.5, 'A_ads_Li2S': -2.0}),
               '/b': _delta({'B_ads_S8': -0.8})}
+    for summary in deltas.values():
+        summary.update({
+            'has_ref': True,
+            'reference_mode': 'single',
+            'ref': ('DONE', -10.0),
+            'method_consistency': {
+                'status': 'verified', 'issues': [], 'warnings': [],
+            },
+        })
+        for row in summary['rows']:
+            row['reference_valid'] = True
     ads = _fake_adsorption(proj_map={'/a': p1, '/b': p2})
     ads.delta_e_rows = lambda proj: deltas['/a' if proj['name'] == 'A' else '/b']
     api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
@@ -1712,6 +1961,150 @@ def test_proj_compare_scaling_pair_and_volcano_skip(tmp_path):
     assert sc['xs'] == [-1.0, -1.5, -2.0] and sc['ys'] == [-2.0, -2.6, -3.1]
     assert [s['kind'] for s in out['skipped']] == ['volcano']
     assert 'U_L' in out['skipped'][0]['reason']
+
+
+def test_proj_compare_eight_projects_share_one_ladder_with_explicit_ul(tmp_path):
+    calls = {}
+    molecules = tmp_path / 'molecules'
+    molecules.mkdir()
+    projects = {}
+    summaries = {}
+    for index in range(8):
+        name = f'M{index}'
+        path = f'/project/{index}'
+        projects[path] = {
+            'name': name,
+            'root': str(tmp_path / name),
+            'project_uuid': f'project-{index}',
+            'comparison_method_fingerprint': 'same-method',
+            'molecules_dir': str(molecules),
+        }
+        summaries[name] = _science_delta(name)
+    ads = _fake_adsorption(proj_map=projects)
+    ads.delta_e_rows = lambda project: summaries[project['name']]
+    api = Api(
+        adsorption_mod=ads,
+        native_charts_mod=_fake_ncharts(calls),
+        freeenergy_mod=_fake_lis_freeenergy(),
+        config_mod=_fake_config(),
+    )
+
+    out = api.proj_compare_figures(
+        list(projects), ['ladder'], save_to=str(tmp_path / 'figures'))
+
+    assert out['ok'] is True and out['skipped'] == []
+    assert len(calls['ladder']) == 1
+    call = calls['ladder'][0]
+    assert call['show_ul'] is True and call['mark_pds'] is False
+    assert call['step_labels'] == ['S8*', 'Li2S4*', 'Li2S*']
+    assert len(call['data']) == 8
+    assert [path['name'] for path in call['data']] == [
+        f'M{index}' for index in range(8)
+    ]
+    assert [path['u_l'] for path in call['data']] == [
+        round(1.20 + 0.05 * index, 3) for index in range(8)
+    ]
+    assert all('u_l' in path and path['u_l'] is not None for path in call['data'])
+
+
+def test_proj_batch_report_unverified_method_is_diagnostic(tmp_path):
+    render_calls = []
+    chart_calls = {}
+    projects = {
+        '/a': {
+            'name': 'A', 'root': '/data/a', 'project_uuid': 'a-id',
+            'comparison_method_fingerprint': 'same-method',
+        },
+        '/b': {
+            'name': 'B', 'root': '/data/b', 'project_uuid': 'b-id',
+            'comparison_method_fingerprint': 'same-method',
+        },
+    }
+    summaries = {
+        name: _science_delta(name, method='unverified')
+        for name in ('A', 'B')
+    }
+    ads = _fake_adsorption(proj_map=projects)
+    ads.delta_e_rows = lambda project: summaries[project['name']]
+    api = Api(
+        adsorption_mod=ads,
+        native_charts_mod=_fake_ncharts(chart_calls),
+        paper_report_mod=_fake_paper_report(render_calls),
+        config_mod=_fake_config(),
+    )
+
+    out = api.proj_batch_report(
+        ['/a', '/b'], str(tmp_path / 'reports'),
+        formats=['html'], include_individual=False, final=True)
+
+    assert out['ok'] is True
+    assert out['kind'] == 'diagnostic'
+    assert out['snapshot']['comparison_gate']['status'] == 'unverified'
+    assert out['snapshot']['can_final_report'] is False
+    assert len(render_calls) == 1
+    model = render_calls[0]['model']
+    assert model['report_kind'] == 'diagnostic'
+    assert '诊断' in model['subtitle']
+    assert model['metadata']['比较门禁'] == 'unverified'
+    assert model['candidate_evaluations']['rows']
+    assert all(row[1] == 'hold_for_evidence'
+               for row in model['candidate_evaluations']['rows'])
+    assert out['files']['individual'] == []
+    json.dumps(out, ensure_ascii=False)
+
+
+def test_proj_compare_volcano_requires_path_delta_g_and_labels_success(tmp_path):
+    calls = {}
+    molecules = tmp_path / 'molecules'
+    molecules.mkdir()
+    projects = {}
+    summaries = {}
+    for index in range(3):
+        name = f'M{index}'
+        path = f'/project/{index}'
+        projects[path] = {
+            'name': name,
+            'root': str(tmp_path / name),
+            'project_uuid': f'project-{index}',
+            'comparison_method_fingerprint': 'same-method',
+            'molecules_dir': str(molecules),
+        }
+        summaries[name] = _science_delta(name)
+    ads = _fake_adsorption(proj_map=projects)
+    ads.delta_e_rows = lambda project: summaries[project['name']]
+    api = Api(
+        adsorption_mod=ads,
+        native_charts_mod=_fake_ncharts(calls),
+        freeenergy_mod=_fake_lis_freeenergy(),
+        config_mod=_fake_config(),
+    )
+
+    skipped = api.proj_compare_figures(
+        list(projects), ['volcano'], save_to=str(tmp_path / 'missing'))
+
+    assert skipped['ok'] is True and skipped['files'] == []
+    assert skipped['skipped'][0]['kind'] == 'volcano'
+    assert 'ΔG_ads(*LiS2)' in skipped['skipped'][0]['reason']
+    assert 'volcano' not in calls
+
+    for index, project in enumerate(projects.values()):
+        project['volcano_descriptor'] = {
+            'quantity': 'delta_G_ads',
+            'species': '*LiS₂',
+            'reaction_path_id': 'LIS_ASSOC_LIS2',
+            'sign_convention': 'negative_is_stronger',
+            'value_eV': -1.60 - 0.10 * index,
+        }
+    rendered = api.proj_compare_figures(
+        list(projects), ['volcano'], save_to=str(tmp_path / 'ready'))
+
+    assert rendered['ok'] is True and rendered['skipped'] == []
+    assert len(calls['volcano']) == 1
+    volcano = calls['volcano'][0]
+    assert [point['name'] for point in volcano['data']] == ['M0', 'M1', 'M2']
+    assert [round(point['x'], 2) for point in volcano['data']] == [-1.6, -1.7, -1.8]
+    assert r'\Delta G_{\mathrm{ads}}' in volcano['descriptor_label']
+    assert r'\Delta E' not in volcano['descriptor_label']
 
 
 # ── 设置页 / 自动驾驶 假件 ────────────────────────────────────────────────────
@@ -1891,6 +2284,38 @@ def test_autopilot_save_persists_subswitches():
 
 
 # ── pipeline_tick(幂等:首拍 report_done + 写标记,次拍无重复) ──────────────────
+def _install_fake_report_bundle(api, calls, *, order=None):
+    """Replace the bundle entry point while preserving final/diagnostic gating."""
+    def _bundle(path, out_dir, formats=None, final=True, stem=None):
+        calls['reports'] = calls.get('reports', 0) + 1
+        if order is not None:
+            order.append('report')
+        project = api._adsorption.load_project(path)
+        summary = api._adsorption.delta_e_rows(project)
+        eligible, _reason = api._final_report_gate(project, summary)
+        kind = 'final' if final and eligible else 'diagnostic'
+        wanted = tuple(formats or ('html', 'docx', 'pdf'))
+        report_stem = stem or 'report'
+        files = {}
+        os.makedirs(out_dir, exist_ok=True)
+        for fmt in wanted:
+            output = os.path.join(out_dir, f'{report_stem}.{fmt}')
+            with open(output, 'w', encoding='utf-8') as handle:
+                handle.write(
+                    f'{kind} {fmt} bundle generation {calls["reports"]}')
+            files[str(fmt)] = output
+        calls.setdefault('kinds', []).append(kind)
+        return {
+            'ok': True,
+            'kind': kind,
+            'files': files,
+            'figures': [],
+            'error': None,
+        }
+
+    api.proj_report_bundle = _bundle
+
+
 def _report_gate_fixture(tmp_path, *, has_ref=True, method_status='verified',
                          save_project=None):
     """构造一个无远程依赖的最终报告门禁项目。"""
@@ -1956,9 +2381,7 @@ def _report_gate_fixture(tmp_path, *, has_ref=True, method_status='verified',
     manifest_mod = _fake_manifest_mod(manifests)
     api = Api(adsorption_mod=adsorption, manifest_mod=manifest_mod,
               report_full_mod=report_full, config_mod=_fake_config())
-    api._auto_figures_for_project = lambda _p, _pp, out_dir: {
-        'engine': 'none', 'out_dir': out_dir, 'files': [], 'panel': None,
-    }
+    _install_fake_report_bundle(api, calls)
     return api, project, manifests, summary, calls
 
 
@@ -1988,11 +2411,15 @@ def test_pipeline_tick_report_done_idempotent(tmp_path):
     api = Api(profiles_mod=_fake_profiles({}), adsorption_mod=ads, manifest_mod=manifest,
               native_charts_mod=_fake_ncharts(calls), report_full_mod=rf,
               config_mod=_fake_config(ui={'autopilot': True}))
+    _install_fake_report_bundle(api, calls)
     out1 = api.pipeline_tick()
     assert out1['ok'] is True and out1['last_sync']
     rd = [e for e in out1['events'] if e['kind'] == 'report_done']
     assert len(rd) == 1 and rd[0]['project'] == 'liS'
-    assert rd[0]['report'].endswith('liS_report.html')
+    assert rd[0]['report'].endswith('.pdf')
+    assert rd[0]['report_kind'] == 'final'
+    assert set(rd[0]['files']) == {'html', 'docx', 'pdf'}
+    assert set(proj['autopilot_report']['files']) == {'html', 'docx', 'pdf'}
     assert proj.get('autopilot_report_done') and saved == [str(tmp_path)]   # 标记已写
     # 次拍:标记已在 → 不再重复出报告
     out2 = api.pipeline_tick()
@@ -2007,9 +2434,12 @@ def test_final_report_rejects_numeric_difference_without_reference_state(tmp_pat
 
     api._tick_reports(events, errors)
 
-    assert events == [] and errors == []
-    assert calls['reports'] == 0 and calls['saved'] == 0
-    assert 'autopilot_report' not in project
+    assert errors == []
+    assert [event['kind'] for event in events] == ['report_done']
+    assert events[0]['report_kind'] == 'diagnostic'
+    assert calls['reports'] == 1 and calls['saved'] == 1
+    assert project['autopilot_report']['kind'] == 'diagnostic'
+    assert set(project['autopilot_report']['files']) == {'html', 'docx', 'pdf'}
     final = api.proj_report('/managed/project.yaml', str(tmp_path / 'manual.html'), final=True)
     assert final['ok'] is False and '未设置有效气相/逐物种参考态' in final['error']
 
@@ -2021,16 +2451,21 @@ def test_unverified_method_requires_persisted_reason_before_final_report(tmp_pat
 
     api._tick_reports(events, errors)
 
-    assert events == [] and errors == [] and calls['reports'] == 0
+    assert errors == [] and calls['reports'] == 1 and calls['saved'] == 1
+    assert [event['report_kind'] for event in events] == ['diagnostic']
+    assert project['autopilot_report']['kind'] == 'diagnostic'
     project['preparation'] = {'method_check': {'confirmation': {
         'confirmed': True,
         'reason': '已核对 Li2S8 非磁基态 ISPIN=1，周期吸附体系 ISPIN=2',
     }}}
 
-    api._tick_reports(events, errors)
+    confirmed_events, confirmed_errors = [], []
+    api._tick_reports(confirmed_events, confirmed_errors)
 
-    assert errors == [] and calls['reports'] == 1 and calls['saved'] == 1
-    assert [event['kind'] for event in events] == ['report_done']
+    assert confirmed_errors == [] and calls['reports'] == 2 and calls['saved'] == 2
+    assert [event['kind'] for event in confirmed_events] == ['report_done']
+    assert confirmed_events[0]['report_kind'] == 'final'
+    assert project['autopilot_report']['kind'] == 'final'
     assert project['autopilot_report']['input_fingerprint']
 
 
@@ -2175,6 +2610,7 @@ def test_pipeline_tick_disabled_has_no_cluster_campaign_or_report_side_effects()
         get_password=lambda _n: calls.append('password'), set_password=lambda *_a: None)
     api = Api(profiles_mod=profiles, adsorption_mod=adsorption, secrets_mod=secrets,
               config_mod=_fake_config(ui={'autopilot': False,
+                                          'autopilot_report': False,
                                           'autopilot_campaigns': True}))
     api._tick_campaigns = lambda *_a: calls.append('campaigns')
 
@@ -2182,6 +2618,39 @@ def test_pipeline_tick_disabled_has_no_cluster_campaign_or_report_side_effects()
 
     assert out['ok'] is True and out['events'] == [] and out['synced'] == 0
     assert calls == []
+
+
+def test_pipeline_report_only_mode_never_loads_remote_automation():
+    calls = []
+    profiles = types.SimpleNamespace(
+        load_profiles=lambda: (_ for _ in ()).throw(
+            AssertionError('report-only path must not load profiles')))
+    secrets = types.SimpleNamespace(
+        get_password=lambda _n: (_ for _ in ()).throw(
+            AssertionError('report-only path must not load credentials')),
+        set_password=lambda *_a: None,
+    )
+    api = Api(
+        profiles_mod=profiles,
+        secrets_mod=secrets,
+        config_mod=_fake_config(ui={
+            'autopilot': False,
+            'autopilot_report': True,
+            'autopilot_campaigns': True,
+        }),
+    )
+    api._tick_reports = lambda events, _errors: (
+        calls.append('reports'),
+        events.append({'kind': 'report_done', 'text': 'local report'}),
+    )
+    api._tick_campaigns = lambda *_a: (_ for _ in ()).throw(
+        AssertionError('report-only path must not advance campaigns'))
+
+    out = api.pipeline_tick()
+
+    assert calls == ['reports']
+    assert out['synced'] == 0
+    assert [event['kind'] for event in out['events']] == ['report_done']
 
 
 def test_pipeline_campaigns_require_independent_explicit_switch():
@@ -7869,17 +8338,28 @@ def test_pipeline_reports_skip_unmanaged_or_incomplete_delta_projects(tmp_path):
         delta_ret={'slab': ('DONE', -10.0), 'ref': ('无', None), 'has_ref': False,
                    'rows': [{'name': 'invalid_ads', 'state': 'DONE',
                              'delta_e': None, 'note': '参考态无效'}]})
+    saved, calls = [], {'reports': 0}
+    adsorption.save_project = lambda root, project: saved.append(
+        (root, project.get('name')))
     report = _fake_report_full()
     report.generate_project_report = lambda *_a, **_k: (_ for _ in ()).throw(
         AssertionError('诊断报告不能标记为最终报告'))
     api = Api(adsorption_mod=adsorption,
               manifest_mod=_fake_manifest_mod(manifests), report_full_mod=report)
+    _install_fake_report_bundle(api, calls)
     events, errors = [], []
 
     api._tick_reports(events, errors)
 
-    assert events == [] and errors == []
-    assert not any(project.get('autopilot_report_done') for project in projects.values())
+    assert errors == []
+    assert len(events) == 1 and events[0]['project'] == 'invalid'
+    assert events[0]['report_kind'] == 'diagnostic'
+    assert calls['reports'] == 1
+    assert saved == [(str(tmp_path / 'invalid'), 'invalid')]
+    assert 'autopilot_report' not in projects['/unmanaged/project.yaml']
+    invalid_marker = projects['/invalid/project.yaml']['autopilot_report']
+    assert invalid_marker['kind'] == 'diagnostic'
+    assert set(invalid_marker['files']) == {'html', 'docx', 'pdf'}
 
 
 def test_pipeline_reports_only_after_done_outputs_are_fetched_in_same_tick(tmp_path):
@@ -7954,16 +8434,21 @@ def test_pipeline_reports_only_after_done_outputs_are_fetched_in_same_tick(tmp_p
                                     'autopilot_continue': False,
                                     'autopilot_fetch': True,
                                     'autopilot_report': True}))
+    bundle_calls = {'reports': 0}
+    _install_fake_report_bundle(api, bundle_calls, order=order)
 
     first = api.pipeline_tick()
     assert not any(event['kind'] == 'report_done' for event in first['events'])
-    assert 'report' not in order and 'figures' not in order
+    assert 'report' not in order
 
     mode['fetch_ok'] = True
     order.clear()
     second = api.pipeline_tick()
     assert any(event['kind'] == 'report_done' for event in second['events'])
-    assert order.index('fetch') < order.index('figures') < order.index('report')
+    assert order.index('fetch') < order.index('report') < order.index('save-project')
+    assert bundle_calls['reports'] == 1
+    assert project['autopilot_report']['kind'] == 'final'
+    assert set(project['autopilot_report']['files']) == {'html', 'docx', 'pdf'}
 
 
 def test_auto_figures_prefers_project_molecules_dir_over_global(tmp_path):

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 import sys
 
@@ -39,6 +40,8 @@ def test_default_is_full_and_collects_chart_and_rdkit_resources(monkeypatch):
     assert 'numpy' not in excluded
     assert 'rdkit' not in excluded
     assert {'DECIMER', 'tensorflow'} <= set(excluded)
+    data_targets = _option_values(cmd, '--add-data')
+    assert any(value.endswith(os.pathsep + 'vcstudio_assets') for value in data_targets)
     assert cmd[-1] == build_exe.WEB_ENTRY
 
 
@@ -46,8 +49,7 @@ def test_lite_profile_is_explicit_and_does_not_require_heavy_modules(monkeypatch
     _all_available(
         monkeypatch,
         unavailable={
-            'matplotlib', 'numpy', 'rdkit', 'docx', 'pypdf', 'reportlab', 'DECIMER',
-        },
+            'matplotlib', 'numpy', 'rdkit', 'docx', 'pypdf', 'reportlab', 'DECIMER'},
     )
 
     cmd, options = build_exe.build_command(['--lite'])
@@ -55,7 +57,7 @@ def test_lite_profile_is_explicit_and_does_not_require_heavy_modules(monkeypatch
     assert options.lite is True
     excluded = set(_option_values(cmd, '--exclude-module'))
     assert {
-        'matplotlib', 'numpy', 'rdkit', 'docx', 'pypdf', 'reportlab', 'DECIMER',
+        'matplotlib', 'numpy', 'rdkit', 'docx', 'pypdf', 'reportlab', 'DECIMER'
     } <= excluded
     assert 'matplotlib' not in _option_values(cmd, '--collect-all')
     assert 'rdkit' not in _option_values(cmd, '--collect-all')

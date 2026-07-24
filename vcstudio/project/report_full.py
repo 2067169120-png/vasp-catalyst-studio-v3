@@ -677,7 +677,20 @@ def _try_fed(delta, config, log, proj=None):
         from vcstudio.project import thermo
         corr_meta = thermo.load_corrections(freq_dirs)
         if corr_meta:
-            g_corr = {sp: v['g_corr'] for sp, v in corr_meta.items()}
+            excluded = {
+                sp: value for sp, value in corr_meta.items()
+                if bool(value.get('excluded'))
+            }
+            corr_meta = {
+                sp: value for sp, value in corr_meta.items()
+                if sp not in excluded
+            }
+            g_corr = {
+                sp: v['g_corr'] for sp, v in corr_meta.items()
+            }
+            for species in excluded:
+                log(f'{species} thermochemistry excluded：虚频/质量门禁未通过，'
+                    '该校正未进入自由能路径')
             for sp, v in corr_meta.items():
                 if v['n_imag']:
                     log(f'⚠ {sp} 频率计算含 {v["n_imag"]} 个虚频'

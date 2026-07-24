@@ -120,7 +120,7 @@ def test_fig_html_stages_cross_drive_asset_before_relpath(monkeypatch, tmp_path)
 
 
 def test_delta_e_color_semantics(tmp_path):
-    """ΔE 颜色语义(原版口径):>0 红、<-3 绿。"""
+    """ΔE 颜色语义:>0 不利红、<-3 过强警戒橙红，绝不显示成优秀绿。"""
     from vcstudio.project import report
     rows = report.collect_jobs([])
     de = {'rows': [
@@ -129,8 +129,70 @@ def test_delta_e_color_semantics(tmp_path):
         {'name': 'mid', 'state': 'DONE', 'e_config': -5.0, 'delta_e': -1.5, 'note': ''},
     ]}
     h = report.render_html(rows, report.summarize(rows), delta_e=de)
-    assert h.count('#15803d;font-weight:600') == 1      # 仅 strong 绿
-    assert h.count('#b91c1c;font-weight:600') == 1      # 仅 bad 红
+    assert h.count('#c2410c;font-weight:600') == 1      # 仅 strong 过强警戒
+    assert h.count('#b91c1c;font-weight:600') == 1      # 仅 bad 不利
+
+
+def test_figure_html_stages_asset_when_relative_path_crosses_drive(tmp_path, monkeypatch):
+    """Windows C:/E: 不能 relpath 时，报告只复制图片资源而不改计算源文件。"""
+    source = tmp_path / 'source' / 'profile.png'
+    report_dir = tmp_path / 'report'
+    source.parent.mkdir()
+    report_dir.mkdir()
+    source.write_bytes(b'figure-bytes')
+    real_relpath = report_full.os.path.relpath
+
+    def fake_relpath(path, start):
+        if report_full.os.path.normpath(path) == report_full.os.path.normpath(source):
+            raise ValueError('path is on mount E:, start on mount C:')
+        return real_relpath(path, start)
+
+    monkeypatch.setattr(report_full.os.path, 'relpath', fake_relpath)
+    rendered = report_full._fig_html(source, report_dir, 'caption')
+
+    staged = list((report_dir / 'report_assets').iterdir())
+    assert len(staged) == 1 and staged[0].read_bytes() == b'figure-bytes'
+    assert 'report_assets/' in rendered and 'caption' in rendered
+    assert source.read_bytes() == b'figure-bytes'
+
+    source.write_bytes(b'new-figure-bytes')
+    rendered_after_change = report_full._fig_html(source, report_dir, 'caption')
+    staged = list((report_dir / 'report_assets').iterdir())
+    assert len(staged) == 2
+    assert {item.read_bytes() for item in staged} == {
+        b'figure-bytes', b'new-figure-bytes'}
+    assert rendered_after_change != rendered
+
+
+def test_excluded_thermochemistry_never_enters_free_energy_path(tmp_path, monkeypatch):
+    molecules = tmp_path / 'molecules'
+    molecules.mkdir()
+    captured = {}
+
+    from vcstudio.project import thermo
+
+    monkeypatch.setattr(thermo, 'load_corrections', lambda _dirs: {
+        'good': {'g_corr': 0.12, 'n_imag': 0, 'imag_cm1': []},
+        'bad': {'g_corr': 9.99, 'n_imag': 1, 'imag_cm1': [-250.0], 'excluded': True},
+    })
+
+    def fake_path(_rows, *, g_corr=None, **_kwargs):
+        captured['g_corr'] = g_corr
+        return {'warnings': []}
+
+    monkeypatch.setattr(
+        report_full.freeenergy, 'path_from_project_and_molecules', fake_path)
+    messages = []
+    fed = report_full._try_fed(
+        {'slab': ('DONE', -100.0), 'rows': []},
+        {'lis_molecules_dir': str(molecules), 'freq_dirs': {'good': '/g', 'bad': '/b'}},
+        messages.append)
+
+    assert captured['g_corr'] == {'good': 0.12}
+    assert fed['thermo_meta'] == {
+        'good': {'g_corr': 0.12, 'n_imag': 0, 'imag_cm1': []},
+    }
+    assert any('bad' in message and 'excluded' in message for message in messages)
 
 
 def test_generate_report_falls_back_to_svg_and_degrades_ai(tmp_path):

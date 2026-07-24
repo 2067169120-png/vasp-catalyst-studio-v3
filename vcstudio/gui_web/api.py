@@ -237,7 +237,9 @@ class Api:
                  neb_builder_mod=None, references_mod=None, chgdiff_mod=None,
                  incar_builder_mod=None, metal_slab_mod=None, usage_mod=None,
                  result_import_mod=None, task_analysis_mod=None,
-                 pipeline_supervisor_cls=None, assistant_chat_mod=None):
+                 pipeline_supervisor_cls=None, assistant_chat_mod=None,
+                 comparison_mod=None, candidate_evaluation_mod=None,
+                 paper_report_mod=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -340,6 +342,11 @@ class Api:
         # MatClaw 式对话入口仅复用会话/附件/状态设计；Python 原生实现延迟加载，
         # 不把 Node、Docker 或任意 shell 执行面带进桌面程序。
         self._assistant_chat = assistant_chat_mod
+        # 多项目比较、确定性候选评价与 DOCX/PDF 同源报告。三个模块均延迟加载，
+        # 使基础提交/监控路径不会因可选文档或绘图库缺失而无法启动。
+        self._comparison = comparison_mod
+        self._candidate_evaluation = candidate_evaluation_mod
+        self._paper_report = paper_report_mod
         # pywebview 可并发调用同一个 js_api；后端锁才是自动托管的正确性边界。
         # 前端的 running 标志只负责交互，不能阻止两条线程同时续算/出报告。
         self._pipeline_lock = threading.Lock()
@@ -440,6 +447,24 @@ class Api:
             from vcstudio.project import report_full
             self._report_full = report_full
         return self._report_full
+
+    def _comparison_model(self):
+        if self._comparison is None:
+            from vcstudio.project import comparison
+            self._comparison = comparison
+        return self._comparison
+
+    def _candidate_eval(self):
+        if self._candidate_evaluation is None:
+            from vcstudio.project import candidate_evaluation
+            self._candidate_evaluation = candidate_evaluation
+        return self._candidate_evaluation
+
+    def _paper(self):
+        if self._paper_report is None:
+            from vcstudio.project import paper_report
+            self._paper_report = paper_report
+        return self._paper_report
 
     def _ri(self):
         """本地结果文件夹扫描/导入引擎（纯本地 I/O）。"""
@@ -3349,6 +3374,645 @@ class Api:
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'file': None, 'files': [], 'error': str(e)}
 
+    @staticmethod
+    def _safe_report_stem(value) -> str:
+        """Filesystem-safe, readable report stem (also valid on Windows)."""
+        stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', '_', str(value or 'report')).strip(' ._')
+        return (stem or 'report')[:96]
+
+    @staticmethod
+    def _json_safe_report_result(value):
+        """Convert renderer ``Path`` objects to pywebview/JSON-safe strings."""
+        if isinstance(value, os.PathLike):
+            return os.fspath(value)
+        if isinstance(value, dict):
+            return {
+                str(key): Api._json_safe_report_result(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [Api._json_safe_report_result(item) for item in value]
+        return value
+
+    @staticmethod
+    def _comparison_u_by_element(fingerprint):
+        """Map DFT+U vectors onto POTCAR elements without comparing spin.
+
+        Catalyst projects can legitimately contain different metals, so a raw
+        LDAUU vector is not a cross-project protocol identifier.  Mapping the
+        vector to element names lets :mod:`project.comparison` check only
+        elements shared by a pair of projects.
+        """
+        fp = fingerprint if isinstance(fingerprint, dict) else {}
+        potcars = fp.get('potcar_ids') or {}
+        elements = [str(element) for element in potcars]
+        if not elements:
+            return None
+        values = fp.get('u_values')
+        if not isinstance(values, dict):
+            return {element: {'enabled': False} for element in elements}
+        enabled = _method_bool(values.get('LDAU'))
+        if enabled is False or values.get('LDAU') is False:
+            return {element: {'enabled': False} for element in elements}
+        if enabled is not True and values.get('LDAU') is not True:
+            return None
+
+        def _tokens(key, *, integer=False):
+            raw = values.get(key)
+            if isinstance(raw, (list, tuple)):
+                items = list(raw)
+            else:
+                items = str(raw or '').replace(',', ' ').split()
+            parsed = []
+            for item in items:
+                number = _method_number(item)
+                if number is None or (integer and number != int(number)):
+                    return None
+                parsed.append(int(number) if integer else round(number, 10))
+            return parsed
+
+        orbitals = _tokens('LDAUL', integer=True)
+        strengths = _tokens('LDAUU')
+        exchanges = _tokens('LDAUJ')
+        if (orbitals is None or strengths is None or exchanges is None
+                or not (len(orbitals) == len(strengths) == len(exchanges)
+                        == len(elements))):
+            return None
+        ldau_type = _method_integer(values.get('LDAUTYPE'))
+        result = {}
+        for index, element in enumerate(elements):
+            if orbitals[index] < 0:
+                result[element] = {'enabled': False}
+            else:
+                result[element] = {
+                    'enabled': True,
+                    'type': ldau_type,
+                    'l': orbitals[index],
+                    'u_eV': strengths[index],
+                    'j_eV': exchanges[index],
+                }
+        return result
+
+    def _comparison_method_evidence(self, project, summary):
+        """Build a spin-neutral cross-project protocol from actual job evidence."""
+        method = (summary or {}).get('method_consistency') or {}
+        if str(method.get('status') or '').lower() != 'verified':
+            return {
+                'status': 'unverified',
+                'fingerprint': '',
+                'missing': ['项目内部方法证据尚未 verified'],
+            }
+        members = (project or {}).get('members') or {}
+        configs = [str(path) for path in (members.get('configs') or []) if path]
+        selected_names = {
+            str(row.get('name') or '')
+            for row in self._comparison_model().stable_species_rows(summary)
+        }
+        representative = next(
+            (path for path in configs
+             if os.path.basename(os.path.normpath(path)) in selected_names),
+            configs[0] if configs else members.get('clean_slab'),
+        )
+        if not representative:
+            return {
+                'status': 'unverified',
+                'fingerprint': '',
+                'missing': ['没有可读取的周期能量操作数'],
+            }
+        try:
+            from vcstudio.project import energy_gate
+            manifest = self._manifest.load_manifest(representative)
+            record = energy_gate.method_record(
+                representative, manifest, '跨项目代表构型')
+        except Exception as exc:                         # noqa: BLE001
+            return {
+                'status': 'unverified',
+                'fingerprint': '',
+                'missing': [f'实际方法证据读取失败：{exc}'],
+            }
+        fp = record.get('fingerprint') or {}
+        known = record.get('known') or {}
+        required = ('functional', 'dispersion', 'encut',
+                    'kpoints_scheme', 'potcar_ids')
+        missing = [field for field in required if not known.get(field)]
+        potcars = dict(fp.get('potcar_ids') or {})
+        if not potcars and 'potcar_ids' not in missing:
+            missing.append('potcar_ids')
+        u_by_element = self._comparison_u_by_element(fp)
+        if u_by_element is None:
+            missing.append('u_values_by_element')
+        protocol = {
+            'functional': fp.get('functional'),
+            'dispersion': fp.get('dispersion'),
+            'encut_eV': _method_number(fp.get('encut')),
+            'kpoints_scheme': fp.get('kpoints_scheme'),
+            'reference_mode': str((summary or {}).get('reference_mode') or ''),
+            'energy_quantity': 'E0',
+        }
+        if missing:
+            return {
+                'status': 'unverified',
+                'fingerprint': '',
+                'protocol': protocol,
+                'potcar_ids': potcars,
+                'u_by_element': u_by_element or {},
+                'source_job': str(representative),
+                'missing': list(dict.fromkeys(missing)),
+            }
+        encoded = json.dumps(
+            protocol, ensure_ascii=False, sort_keys=True,
+            separators=(',', ':'), allow_nan=False).encode('utf-8')
+        return {
+            'status': 'verified',
+            'fingerprint': hashlib.sha256(encoded).hexdigest(),
+            'protocol': protocol,
+            'potcar_ids': potcars,
+            'u_by_element': u_by_element,
+            'source_job': str(representative),
+            'missing': [],
+        }
+
+    @staticmethod
+    def _candidate_evaluation_table(evaluations, *, title='候选材料后续计算优先级'):
+        rows = []
+        for evaluation in evaluations or []:
+            candidate = evaluation.get('candidate') or {}
+            decision = evaluation.get('decision') or {}
+            evidence = evaluation.get('evidence') or {}
+            profile = evaluation.get('profile') or {}
+            thermo = evaluation.get('thermodynamics') or {}
+            rows.append([
+                candidate.get('name') or '项目',
+                decision.get('priority') or 'hold_for_evidence',
+                decision.get('summary_zh') or '证据不足',
+                (profile.get('short_chain_risk') or {}).get('status') or 'unknown',
+                evidence.get('claim_ceiling') or 'electronic_adsorption_screen',
+                ('—' if thermo.get('u_l_V') is None
+                 else f'{thermo.get("u_l_V"):.3f}'),
+                ('—' if thermo.get('eta_V') is None
+                 else f'{thermo.get("eta_V"):.3f}'),
+            ])
+        return {
+            'title': title,
+            'columns': [
+                '催化剂', '建议', '评价结论', '短链风险',
+                '结论上限', 'U_L / V', 'η / V',
+            ],
+            'rows': rows,
+            'caption': (
+                'advance 表示建议优先进入自由能、溶剂化与关键 NEB；'
+                'hold_for_evidence 表示先补齐方法或物种证据。电子吸附能不直接等同于活性。'),
+        } if rows else None
+
+    @staticmethod
+    def _recommendation_blocks(evaluations):
+        blocks, seen = [], set()
+        for evaluation in evaluations or []:
+            candidate = (evaluation.get('candidate') or {}).get('name') or '项目'
+            for item in evaluation.get('recommendations') or []:
+                code = str(item.get('code') or '')
+                key = (candidate, code)
+                if key in seen:
+                    continue
+                seen.add(key)
+                targets = '、'.join(str(value) for value in item.get('targets') or [])
+                suffix = f'；目标：{targets}' if targets else ''
+                blocks.append({
+                    'title': (
+                        f'{item.get("priority") or "P2"} · {candidate} · '
+                        f'{item.get("action_zh") or code}'
+                    ),
+                    'text': f'{item.get("reason") or ""}{suffix}',
+                })
+        return blocks
+
+    def _project_report_model(self, proj, summary, fed, *, report_kind='final',
+                              figures=None, comparison_context=None):
+        """Build the single source of truth consumed by HTML/DOCX/PDF renderers."""
+        evaluation = self._candidate_eval().evaluate_candidate(
+            summary, project=proj, fed=fed)
+        selected = self._comparison_model().stable_species_rows(summary)
+        method = summary.get('method_consistency') or {}
+        basis = evaluation.get('basis') or {}
+        decision = evaluation.get('decision') or {}
+        profile = evaluation.get('profile') or {}
+        evidence = evaluation.get('evidence') or {}
+        trend = profile.get('trend') or {}
+        short_chain = profile.get('short_chain_risk') or {}
+        rows = []
+        for row in selected:
+            co_minima = row.get('co_minima') or []
+            rows.append([
+                row.get('species'),
+                row.get('name'),
+                f'{row.get("delta_e"):.3f}',
+                (f'{len(co_minima) + 1} 个近简并构型'
+                 if co_minima else '唯一最低构型'),
+                row.get('method_status') or 'unverified',
+            ])
+        findings = [
+            decision.get('summary_zh') or '当前数据仅支持吸附能层面的初筛判断。',
+            f'吸附序列趋势：{trend.get("status") or "insufficient"}；'
+            f'短链风险：{short_chain.get("status") or "unknown"}。',
+        ]
+        if fed:
+            findings.append(
+                f'自由能路径：U_L={fed.get("u_l") if fed.get("u_l") is not None else "—"} V，'
+                f'PDS={fed.get("pds_index") if fed.get("pds_index") is not None else "—"}。')
+        limitations = []
+        for missing in (evidence.get('coverage') or {}).get('missing_species') or []:
+            limitations.append(f'缺少证据：{missing}')
+        limitations.extend(str(value) for value in (method.get('warnings') or []))
+        comparability = evaluation.get('comparability') or {}
+        limitations.extend(
+            str(item.get('message') or item)
+            for item in comparability.get('blocking') or [])
+        limitations.extend(
+            str(item.get('message') or item)
+            for item in comparability.get('warnings') or [])
+        if not fed:
+            limitations.append('未获得配平反应路径的自由能台阶，不能由吸附能差值推导 U_L。')
+        else:
+            limitations.extend(str(value) for value in (fed.get('warnings') or []))
+        methods = [
+            '吸附能定义：E_ads = E(slab+ads) - E(slab) - E(adsorbate)，负值表示放热吸附。',
+            ('本报告使用 lis_eads_sabatier_screen_v1 初筛策略；区间是筛选启发式，'
+             '不是跨材料、覆盖度和计算设置通用的最佳吸附能标准。'),
+            f'方法可比性状态：{method.get("status") or "unverified"}。',
+            ('吸附能小于约 0.15 eV 的构型按近简并处理，不强行声明唯一最稳构型。'),
+        ]
+        if fed:
+            methods.append(
+                '反应台阶已叠加 ZPE−TS 热校正。'
+                if fed.get('thermo_corrected')
+                else '反应台阶当前为未叠加 ZPE−TS 的电子能口径。')
+        return {
+            'schema': 'vcstudio.research-report/v1',
+            'locale': 'zh-CN',
+            'title': f'{proj.get("name") or "催化剂"} 吸附能与反应路径评估',
+            'subtitle': ('锂硫电池正极催化材料第一性原理筛选报告'
+                         if report_kind == 'final' else '诊断报告：证据尚未满足最终结论门槛'),
+            'kicker': 'VASP CATALYST STUDIO · RESEARCH REPORT',
+            'report_kind': report_kind,
+            'metadata': {
+                '项目': proj.get('name') or '—',
+                '项目标识': proj.get('project_uuid') or '—',
+                '数据口径': basis.get('quantity') or 'delta_E_ads',
+                '方法门禁': method.get('status') or 'unverified',
+                '结论上限': decision.get('claim_ceiling') or
+                            evidence.get('level') or 'electronic_adsorption_screen',
+                '评价策略': (evaluation.get('audit') or {}).get('policy_id') or
+                            'lis_eads_sabatier_screen_v1',
+            },
+            'executive_summary': decision.get('summary_zh') or
+                                 '当前结果仅支持吸附能初筛，建议结合自由能和势垒继续验证。',
+            'key_findings': findings,
+            'candidate_evaluations': self._candidate_evaluation_table([evaluation]),
+            'adsorption_table': {
+                'title': '各物种最稳吸附构型与电子吸附能',
+                'columns': ['物种', '最稳构型', 'E_ads / eV', '近简并保护', '方法状态'],
+                'rows': rows,
+                'caption': ('同一物种按 E_ads 最低值选取；差值不超过 0.15 eV 的构型'
+                            '保留为近简并候选。该表不能直接相邻相减作为反应台阶。'),
+            },
+            'figures': list(figures or []),
+            'methods': methods,
+            'limitations': list(dict.fromkeys(limitations)),
+            'recommendations': self._recommendation_blocks([evaluation]),
+            'comparison_context': comparison_context or {},
+        }
+
+    def _project_report_figures(self, proj, summary, fed, out_dir):
+        """Generate report figures from the same selected rows/fed snapshot."""
+        nc = self._nc()
+        os.makedirs(out_dir, exist_ok=True)
+        selected = self._comparison_model().stable_species_rows(summary)
+        name = str(proj.get('name') or 'project')
+        figures, files = [], []
+        if selected:
+            data = {
+                'adsorbates': [row['species'] for row in selected],
+                'substrates': {name: [row['delta_e'] for row in selected]},
+            }
+            bar_files = nc.adsorption_bar(
+                data, os.path.join(out_dir, 'adsorption_profile.png'),
+                negative_up=False, value_labels=True,
+                title='Adsorption-energy profile', formats=('png', 'pdf'))
+            files.extend(bar_files)
+            figures.append({
+                'path': bar_files[0],
+                'title': 'Li-S 物种最稳构型的电子吸附能',
+                'caption': ('数值越负表示吸附越强；'
+                            '过强吸附不自动等同于更优催化性能。'),
+            })
+            table_files = nc.energy_matrix_table(
+                data, os.path.join(out_dir, 'adsorption_table.png'),
+                title='Adsorption-energy screening', formats=('png', 'pdf'))
+            files.extend(table_files)
+        if fed and fed.get('steps'):
+            ladder_files = nc.free_energy_ladder(
+                [{
+                    'name': name,
+                    'G': [step['G'] for step in fed['steps']],
+                    'pds_index': fed.get('pds_index'),
+                    'u_l': fed.get('u_l'),
+                }],
+                os.path.join(out_dir, 'free_energy_ladder.png'),
+                step_labels=[step.get('label') or step.get('species')
+                             for step in fed['steps']],
+                show_ul=True, title='Li-S reaction free-energy path',
+                formats=('png', 'pdf'))
+            files.extend(ladder_files)
+            figures.append({
+                'path': ladder_files[0],
+                'title': '配平反应路径的自由能台阶',
+                'caption': ('PDS 与 U_L 直接取自'
+                            '自由能模块的逐电子定义，不由绘图层重新推导。'),
+            })
+        return figures, files
+
+    def proj_report_bundle(self, path, out_dir, formats=None, final=True, stem=None):
+        """Generate a thesis-style HTML + DOCX + PDF bundle from one data snapshot.
+
+        A failed final-result gate produces an explicit diagnostic report instead
+        of silently skipping the request or pretending the result is final.
+        """
+        try:
+            proj = self._adsorption.load_project((path or '').strip())
+            if proj is None:
+                return {'ok': False, 'kind': None, 'files': {},
+                        'error': '项目不存在或 project.yaml 已被移动'}
+            target = os.path.abspath(os.path.normpath(str(out_dir or '').strip()))
+            if not str(out_dir or '').strip():
+                return {'ok': False, 'kind': None, 'files': {}, 'error': '未指定报告目录'}
+            os.makedirs(target, exist_ok=True)
+            summary = self._adsorption.delta_e_rows(proj)
+            eligible, reason = self._final_report_gate(proj, summary)
+            report_kind = 'final' if bool(final) and eligible else 'diagnostic'
+            fed, fed_reason = self._proj_fed(proj, summary)
+            figure_dir = os.path.join(target, 'figures')
+            figures, figure_files = self._project_report_figures(
+                proj, summary, fed, figure_dir)
+            model = self._project_report_model(
+                proj, summary, fed, report_kind=report_kind, figures=figures)
+            if reason and report_kind == 'diagnostic':
+                model['limitations'] = [f'最终报告门禁未通过：{reason}',
+                                        *model.get('limitations', [])]
+            if fed_reason:
+                model['limitations'] = [f'自由能台阶未生成：{fed_reason}',
+                                        *model.get('limitations', [])]
+            wanted = tuple(str(value).lower() for value in
+                           (formats or ('html', 'docx', 'pdf')))
+            safe_stem = self._safe_report_stem(
+                stem or f'{proj.get("name") or "project"}_吸附能评估报告')
+            rendered = self._json_safe_report_result(
+                self._paper().render_report_bundle(
+                    model, target, stem=safe_stem, formats=wanted))
+            rendered.setdefault('ok', True)
+            rendered.update({
+                'kind': report_kind,
+                'eligible_final': eligible,
+                'gate_reason': reason,
+                'figures': figure_files,
+                'error': rendered.get('error'),
+            })
+            return rendered
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'kind': None, 'files': {}, 'error': str(e)}
+
+    def _comparison_items(self, paths, preset_key=None):
+        items = []
+        for raw_path in paths or []:
+            path = str(raw_path or '').strip()
+            proj = self._adsorption.load_project(path)
+            if proj is None:
+                items.append({'path': path, 'project': None})
+                continue
+            summary = dict(self._adsorption.delta_e_rows(proj) or {})
+            explicit_fingerprint = (
+                summary.get('comparison_method_fingerprint')
+                or proj.get('comparison_method_fingerprint')
+            )
+            if not explicit_fingerprint:
+                method_evidence = self._comparison_method_evidence(proj, summary)
+                summary['comparison_method_evidence'] = method_evidence
+                if method_evidence.get('fingerprint'):
+                    summary['comparison_method_fingerprint'] = (
+                        method_evidence['fingerprint'])
+            if preset_key:
+                fed, reason, _title = self._proj_fed_preset(proj, summary, preset_key)
+            else:
+                fed, reason = self._proj_fed(proj, summary)
+            items.append({
+                'path': path, 'project': proj, 'summary': summary,
+                'fed': fed, 'fed_reason': reason,
+            })
+        return items
+
+    def proj_compare_preview(self, paths, preset_key=None):
+        """Preview every selected project, including moved/blocked selections."""
+        try:
+            snapshot = self._comparison_model().build_comparison_snapshot(
+                self._comparison_items(paths, preset_key), preset_key=preset_key)
+            return {'ok': True, **snapshot, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'projects': [], 'comparison_gate': {},
+                    'can_plot': False, 'can_final_report': False, 'error': str(e)}
+
+    def proj_evaluate_candidate(self, path, options=None):
+        """Return deterministic, auditable follow-up priority for one project."""
+        try:
+            proj = self._adsorption.load_project((path or '').strip())
+            if proj is None:
+                return {'ok': False, 'evaluation': None,
+                        'error': '项目不存在或 project.yaml 已被移动'}
+            summary = self._adsorption.delta_e_rows(proj)
+            fed, _reason = self._proj_fed(proj, summary)
+            evaluation = self._candidate_eval().evaluate_candidate(
+                summary, project=proj, fed=fed, options=options)
+            return {'ok': True, 'evaluation': evaluation, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'evaluation': None, 'error': str(e)}
+
+    def _comparison_figures(self, snapshot, out_dir):
+        nc = self._nc()
+        os.makedirs(out_dir, exist_ok=True)
+        figures, files, skipped = [], [], []
+        matrix = snapshot.get('adsorption_matrix') or {}
+        if matrix.get('rows') and matrix.get('cols'):
+            heat_files = nc.heatmap_matrix(
+                matrix, os.path.join(out_dir, 'adsorption_comparison.png'),
+                cbar_label=r'$E_\mathrm{ads}$ (eV)',
+                title='Most-stable adsorption configurations',
+                cmap='cividis_r',
+                formats=('png', 'pdf'))
+            files.extend(heat_files)
+            figures.append({
+                'path': heat_files[0],
+                'title': '多催化剂最稳构型吸附能矩阵',
+                'caption': ('仅比较同一规范物种，'
+                            '空白表示该项目没有可审计数值。'),
+            })
+        ladder = snapshot.get('ladder') or {}
+        if snapshot.get('can_plot') and ladder.get('paths'):
+            ladder_files = nc.free_energy_ladder(
+                ladder['paths'], os.path.join(out_dir, 'free_energy_comparison.png'),
+                step_labels=ladder.get('step_labels'), show_ul=True, mark_pds=False,
+                title='Multi-catalyst free-energy pathways',
+                formats=('png', 'pdf'))
+            files.extend(ladder_files)
+            figures.append({
+                'path': ladder_files[0],
+                'title': '多催化剂自由能台阶叠加比较',
+                'caption': ('图中项目使用相同步骤顺序'
+                            '与能量修正口径；U_L 采用各项目自由能模块的权威值。'),
+            })
+        else:
+            skipped.append({
+                'kind': 'ladder',
+                'reason': '；'.join((snapshot.get('comparison_gate') or {}).get('blocking') or
+                                    (snapshot.get('comparison_gate') or {}).get('warnings') or
+                                    ['没有至少两组可比自由能路径']),
+            })
+        return figures, files, skipped
+
+    def proj_batch_report(self, paths, out_dir, preset_key=None, formats=None,
+                          include_individual=True, final=True):
+        """Generate N individual reports and one multi-catalyst comparison report."""
+        try:
+            target = os.path.abspath(os.path.normpath(str(out_dir or '').strip()))
+            if not str(out_dir or '').strip():
+                return {'ok': False, 'kind': None, 'files': {},
+                        'error': '未指定批次报告目录'}
+            os.makedirs(target, exist_ok=True)
+            items = self._comparison_items(paths, preset_key)
+            snapshot = self._comparison_model().build_comparison_snapshot(
+                items, preset_key=preset_key)
+            if snapshot.get('selected_count', 0) < 2:
+                return {'ok': False, 'kind': None, 'files': {},
+                        'error': '批次报告至少需要选择 2 个项目'}
+            figures, figure_files, skipped = self._comparison_figures(
+                snapshot, os.path.join(target, 'comparison_figures'))
+            evaluations = []
+            item_by_path = {str(item.get('path') or ''): item for item in items}
+            for project in snapshot.get('projects') or []:
+                source = item_by_path.get(str(project.get('path') or ''))
+                if not source or not source.get('project'):
+                    continue
+                evaluations.append(self._candidate_eval().evaluate_candidate(
+                    source.get('summary') or {}, project=source['project'],
+                    fed=source.get('fed')))
+            matrix = snapshot.get('adsorption_matrix') or {}
+            comparison_rows = []
+            for name, values in zip(matrix.get('rows') or [], matrix.get('values') or []):
+                comparison_rows.append([
+                    name,
+                    *[('—' if value is None else f'{value:.3f}') for value in values],
+                ])
+            gate = snapshot.get('comparison_gate') or {}
+            report_kind = ('final' if bool(final) and snapshot.get('can_final_report')
+                           else 'diagnostic')
+            model = {
+                'schema': 'vcstudio.research-report/v1',
+                'locale': 'zh-CN',
+                'title': '多催化剂吸附能与自由能路径比较',
+                'subtitle': ('批次比较研究报告' if report_kind == 'final'
+                             else '诊断型批次报告：方法或路径证据尚未完全可比'),
+                'kicker': 'VASP CATALYST STUDIO · COMPARATIVE STUDY',
+                'report_kind': report_kind,
+                'metadata': {
+                    '已选项目': snapshot.get('selected_count'),
+                    '可评价项目': snapshot.get('ready_count'),
+                    '同图台阶项目': snapshot.get('ladder_ready_count'),
+                    '比较门禁': gate.get('status'),
+                    '反应预设': preset_key or 'Li-S discharge',
+                    '数据指纹': snapshot.get('data_fingerprint'),
+                },
+                'executive_summary': (
+                    f'本批次选择 {snapshot.get("selected_count")} 个催化剂项目，'
+                    f'{snapshot.get("ready_count")} 个具有可审计吸附能；'
+                    f'比较门禁状态为 {gate.get("status")}。'
+                    + ('当前可生成同轴自由能台阶比较。' if snapshot.get('can_plot')
+                       else '当前不强行叠加不可比的自由能路径。')),
+                'key_findings': [
+                    (evaluation.get('decision') or {}).get('summary_zh') or
+                    f'{(evaluation.get("candidate") or {}).get("name") or "项目"}：证据不足'
+                    for evaluation in evaluations
+                ],
+                'candidate_evaluations': self._candidate_evaluation_table(
+                    evaluations, title='候选材料后续计算优先级'),
+                'comparison_table': {
+                    'title': '多催化剂最稳构型吸附能比较',
+                    'columns': ['催化剂', *(matrix.get('cols') or [])],
+                    'rows': comparison_rows,
+                    'caption': ('每个物种采用项目内最低 E_ads 构型；0.15 eV 内的构型'
+                                '作为近简并候选保留。不同 Li2Sx 不能依次相减代替反应自由能。'),
+                },
+                'figures': figures,
+                'methods': [
+                    '各项目先按规范物种分组并选取最稳构型，再进行横向比较。',
+                    '台阶图仅叠加步骤标签、顺序和能量修正口径一致的自由能路径。',
+                    '项目间自旋初态可不同；是否可比较由实际能量操作数和方法证据决定。',
+                ],
+                'limitations': [
+                    *gate.get('blocking', []), *gate.get('warnings', []),
+                    *[f'{item.get("display_name")}: {reason}'
+                      for item in snapshot.get('projects') or []
+                      for reason in item.get('block_reasons') or []],
+                    *[f'{item.get("display_name")}: {warning}'
+                      for item in snapshot.get('projects') or []
+                      for warning in item.get('warnings') or []],
+                    *[f'图表未生成（{item.get("kind") or "unknown"}）：'
+                      f'{item.get("reason") or "原因未记录"}'
+                      for item in skipped],
+                ],
+                'recommendations': self._recommendation_blocks(evaluations),
+            }
+            wanted = tuple(str(value).lower() for value in
+                           (formats or ('html', 'docx', 'pdf')))
+            comparison_result = self._json_safe_report_result(
+                self._paper().render_report_bundle(
+                    model, target, stem='多催化剂_批次比较报告', formats=wanted))
+            individual = []
+            if include_individual:
+                used_stems = set()
+                for index, source in enumerate(items):
+                    project = source.get('project')
+                    if project is None:
+                        continue
+                    base = self._safe_report_stem(
+                        f'{project.get("name") or "project"}_吸附能评估报告')
+                    stem = base
+                    serial = 2
+                    while stem in used_stems:
+                        stem = f'{base}_{serial}'
+                        serial += 1
+                    used_stems.add(stem)
+                    result = self.proj_report_bundle(
+                        source['path'], target, wanted, final=final, stem=stem)
+                    individual.append({
+                        'path': source['path'], 'name': project.get('name') or f'项目{index + 1}',
+                        'kind': result.get('kind'), 'files': result.get('files') or {},
+                        'ok': bool(result.get('ok')), 'error': result.get('error'),
+                    })
+            return {
+                'ok': bool(comparison_result.get('ok', True)),
+                'kind': report_kind,
+                'files': {
+                    'comparison': comparison_result.get('files') or {},
+                    'individual': individual,
+                },
+                'figures': figure_files,
+                'skipped': skipped,
+                'blocked': gate.get('blocking') or [],
+                'warnings': gate.get('warnings') or [],
+                'snapshot': snapshot,
+                'out_dir': target,
+                'error': comparison_result.get('error'),
+            }
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'kind': None, 'files': {}, 'error': str(e)}
+
     # ── 论文级出图(原生 matplotlib 引擎,不依赖 Origin/POV-Ray) ────────────────
     @staticmethod
     def _ads_short(member_name, proj_name) -> str:
@@ -3418,6 +4082,71 @@ class Api:
         configured = str((cfg or {}).get('lis_molecules_dir') or '').strip()
         return configured if configured and os.path.isdir(configured) else ''
 
+    def _report_thermo_corrections(self):
+        """Load the same filtered ZPE−TS corrections used by legacy reports."""
+        try:
+            cfg = self._config.load_config()
+        except Exception:                                 # noqa: BLE001
+            cfg = {}
+        raw_freq_dirs = (cfg or {}).get('freq_dirs') or {}
+        if not isinstance(raw_freq_dirs, dict):
+            return (
+                None,
+                {},
+                ['freq_dirs 配置不是“物种 → 频率目录”映射，本次报告未加入热校正'],
+                None,
+                298.15,
+            )
+        freq_dirs = dict(raw_freq_dirs)
+        if not freq_dirs:
+            return None, {}, [], None, 298.15
+        from vcstudio.project import thermo
+        temperature = _method_number(getattr(thermo, 'DEFAULT_T', 298.15)) or 298.15
+        try:
+            corrections = thermo.load_corrections(freq_dirs)
+        except Exception as exc:                          # noqa: BLE001
+            return (
+                None,
+                {},
+                [f'频率热校正读取失败，本次报告保留电子能口径：{exc}'],
+                None,
+                temperature,
+            )
+        warnings = []
+        missing = [str(species) for species in freq_dirs if species not in corrections]
+        if missing:
+            warnings.append(
+                '以下频率目录没有可用振动证据，未加入热校正：' + '、'.join(missing))
+        accepted = {}
+        for species, value in corrections.items():
+            if not isinstance(value, dict) or value.get('excluded'):
+                detail = (value or {}).get('exclude_reason') if isinstance(value, dict) else ''
+                warnings.append(
+                    f'{species} 热校正未通过虚频/完整性门，已排除'
+                    + (f'：{detail}' if detail else ''))
+                continue
+            number = _method_number(value.get('g_corr'))
+            if number is None:
+                warnings.append(f'{species} 的 g_corr 不是有限数，已排除')
+                continue
+            accepted[str(species)] = {**value, 'g_corr': number}
+        if not accepted:
+            return None, {}, warnings, None, temperature
+        g_corr = {
+            species: value['g_corr'] for species, value in accepted.items()
+        }
+        encoded = json.dumps(
+            {'temperature_K': temperature, 'mode': 'zpe_ts', 'g_corr': g_corr},
+            ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+            allow_nan=False).encode('utf-8')
+        return (
+            g_corr,
+            accepted,
+            warnings,
+            hashlib.sha256(encoded).hexdigest(),
+            temperature,
+        )
+
     def _proj_fed(self, proj, summary):
         """项目 → Li-S 放电路径 fed;成功 (fed, None),失败 (None, 中文原因)。"""
         mol_dir = self._project_molecules_dir(proj)
@@ -3428,8 +4157,12 @@ class Api:
         if e_slab is None:
             return None, '清洁表面未完成,无法算 ΔG 台阶'
         try:
+            (g_corr, thermo_meta, thermo_warnings, thermo_fingerprint,
+             thermo_temperature) = (
+                self._report_thermo_corrections())
             fed = self._fe().path_from_project_and_molecules(
                 summary['rows'], e_slab=e_slab, molecules_dir=mol_dir,
+                g_corr=g_corr,
                 managed_dirs=(proj.get('species_ref_jobs') or {}).values(),
                 project=proj)
             try:
@@ -3437,6 +4170,11 @@ class Api:
                     mol_dir, managed_dirs=(proj.get('species_ref_jobs') or {}).values())
             except Exception:                             # noqa: BLE001 路径本身仍可画，跨项目仅降级
                 fed['_comparison_reference_energies'] = None
+            if thermo_meta:
+                fed['thermo_meta'] = thermo_meta
+                fed['temperature_K'] = thermo_temperature
+                fed['thermo_correction_fingerprint'] = thermo_fingerprint
+            fed.setdefault('warnings', []).extend(thermo_warnings)
             return fed, None
         except ValueError as e:
             return None, str(e)
@@ -3521,7 +4259,46 @@ class Api:
         if missing:
             return None, '缺 ' + '、'.join(missing) + ' 的能量(对应构型/分子需 DONE)', ptitle
         try:
-            fed = self._fe().free_energy_path(spec, energies)
+            (g_corr, thermo_meta, thermo_warnings, _thermo_fingerprint,
+             thermo_temperature) = self._report_thermo_corrections()
+            # 通用预设的能量键可能带 ``*``，而频率配置通常使用裸物种名。
+            # 只把本条路径实际用到的校正交给 free_energy_path；否则一个完全
+            # 不相关的 freq_dirs 条目也会把结果错误标成 thermo_corrected。
+            path_corr, path_meta = {}, {}
+            for key in energies:
+                source_key = next(
+                    (candidate for candidate in (str(key), str(key).rstrip('*'))
+                     if candidate in (g_corr or {})),
+                    None,
+                )
+                if source_key is None:
+                    continue
+                path_corr[key] = g_corr[source_key]
+                meta = dict((thermo_meta or {}).get(source_key) or {})
+                if source_key != key:
+                    meta['source_species'] = source_key
+                path_meta[key] = meta
+            if g_corr and not path_corr:
+                thermo_warnings.append(
+                    '已读取频率热校正，但其物种键与当前反应预设不匹配；'
+                    '本条台阶保留电子能口径')
+            fed = self._fe().free_energy_path(
+                spec, energies, g_corr=path_corr or None)
+            if path_meta:
+                encoded = json.dumps(
+                    {
+                        'temperature_K': thermo_temperature,
+                        'mode': 'zpe_ts',
+                        'g_corr': path_corr,
+                    },
+                    ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+                    allow_nan=False,
+                ).encode('utf-8')
+                fed['thermo_meta'] = path_meta
+                fed['temperature_K'] = thermo_temperature
+                fed['thermo_correction_fingerprint'] = hashlib.sha256(
+                    encoded).hexdigest()
+            fed.setdefault('warnings', []).extend(thermo_warnings)
             return fed, None, ptitle
         except ValueError as e:
             return None, str(e), ptitle
@@ -3583,10 +4360,15 @@ class Api:
                     title = (f'{ptitle} ($U_L$ = {fed["u_l"]:.2f} V)'
                              if fed.get('u_l') is not None else ptitle)
                     files += nc.free_energy_ladder(
-                        [{'name': pname, 'G': [st['G'] for st in fed['steps']]}],
+                        [{
+                            'name': pname,
+                            'G': [st['G'] for st in fed['steps']],
+                            'pds_index': fed.get('pds_index'),
+                            'u_l': fed.get('u_l'),
+                        }],
                         os.path.join(out_dir, 'free_energy_ladder.png'),
                         step_labels=[st['label'] for st in fed['steps']],
-                        pds_index=fed.get('pds_index'), title=title)
+                        pds_index=fed.get('pds_index'), show_ul=True, title=title)
                 else:
                     skipped.append({'kind': kind, 'reason': '未知图类型'})
             return {'ok': True, 'files': files, 'skipped': skipped,
@@ -3595,13 +4377,14 @@ class Api:
             return {'ok': False, 'files': [], 'skipped': [], 'out_dir': None,
                     'error': str(e)}
 
-    def proj_compare_figures(self, paths, kinds=None, save_to=None):
-        """多项目对比。支持 heatmap/scaling/volcano/ladder/report。
+    def proj_compare_figures(self, paths, kinds=None, save_to=None, preset_key=None):
+        """多项目对比出图。
 
-        heatmap:催化剂(项目)×吸附质 ΔE 矩阵;scaling:两个共同吸附质 ΔE 线性标度
-        (需 ≥3 个项目同时具备);volcano:x=共同吸附质 ΔE 描述符,y=各项目放电路径
-        U_L(需分子库,≥3 点);ladder:任意组数仍叠加在同一张自由能台阶图；
-        report:把最稳构型矩阵、U_L/PDS 和已生成图片写入同源 Word/PDF。
+        ``kinds`` 可含 heatmap/scaling/volcano/ladder。吸附能矩阵和自由能
+        台阶共用 :mod:`project.comparison` 的冻结快照，保证项目多选预览、
+        出图和批次报告使用同一组最稳构型及同一方法门禁。自由能路径即使
+        超过 5 组也保留在同一坐标轴；步骤或校正口径不一致时明确跳过，
+        不把不同 Li-S 物种的电子吸附能相减冒充台阶。
         """
         try:
             try:
@@ -3612,9 +4395,12 @@ class Api:
                                  'pip install matplotlib numpy 后重试'}
             kinds = [str(k) for k in (kinds or ['heatmap'])]
             make_report = 'report' in kinds
+            items = self._comparison_items(paths, preset_key)
+            snapshot = self._comparison_model().build_comparison_snapshot(
+                items, preset_key=preset_key)
             projs = []
-            for p in (paths or []):
-                proj = self._adsorption.load_project(str(p or '').strip())
+            for item in items:
+                proj = item.get('project')
                 if proj is None:
                     continue
                 _shorts, _des, summary = self._proj_delta_data(proj)
@@ -3624,11 +4410,8 @@ class Api:
             if len(projs) < 2:
                 return {'ok': False, 'files': [], 'skipped': [], 'out_dir': None,
                         'error': '多项目对比至少需要选中 2 个有效项目'}
-            cols: list = []
-            for pr in projs:                     # 首见序并集
-                for s in pr['de']:
-                    if s not in cols:
-                        cols.append(s)
+            matrix = snapshot.get('adsorption_matrix') or {}
+            cols = list(matrix.get('cols') or [])
             out_dir = (save_to or '').strip() or os.path.join(
                 str(projs[0]['proj'].get('root') or '.'), 'compare_figures')
             os.makedirs(out_dir, exist_ok=True)
@@ -3639,17 +4422,25 @@ class Api:
                 if kind == 'report':
                     continue
                 if kind == 'heatmap':
-                    values = [[pr['de'].get(c) for c in cols] for pr in projs]
+                    values = matrix.get('values') or []
                     if not any(v is not None for row in values for v in row):
                         skipped.append({'kind': 'heatmap',
                                         'reason': '所有项目均无已完成的 ΔE'})
                         continue
                     files += nc.heatmap_matrix(
-                        {'rows': [pr['name'] for pr in projs], 'cols': cols,
+                        {'rows': matrix.get('rows') or [], 'cols': cols,
                          'values': values},
-                        os.path.join(out_dir, 'delta_e_heatmap.png'))
+                        os.path.join(out_dir, 'delta_e_heatmap.png'),
+                        cmap='cividis_r')
                 elif kind == 'scaling':
-                    pair = self._best_scaling_pair(projs, cols)
+                    # 标度关系保留旧的任意吸附质支持；这里只做统计相关性，
+                    # 不把它当作配平反应路径或催化优劣的决定性证据。
+                    raw_cols = []
+                    for pr in projs:
+                        for species in pr['de']:
+                            if species not in raw_cols:
+                                raw_cols.append(species)
+                    pair = self._best_scaling_pair(projs, raw_cols)
                     if pair is None:
                         skipped.append({'kind': 'scaling',
                                         'reason': '不足 3 个项目同时具备两个共同吸附质的 ΔE'})
@@ -3667,7 +4458,11 @@ class Api:
                     sp, points = pts
                     files += nc.volcano_plot(
                         points, os.path.join(out_dir, 'volcano.png'),
-                        descriptor_label=f'$\\Delta E$({sp}) (eV)',
+                        descriptor_label=(
+                            r'$\Delta G_{\mathrm{ads}}(*\mathrm{LiS}_2)$ (eV)'
+                            if sp == 'LiS2' else
+                            f'$\\Delta G_{{\\mathrm{{ads}}}}({sp})$ (eV)'
+                        ),
                         activity_label='$U_L$ (V)')
                 elif kind == 'ladder':
                     ladder_cache = self._compare_ladder_paths(projs)
@@ -3678,7 +4473,7 @@ class Api:
                     files += nc.free_energy_ladder(
                         ladder_paths,
                         os.path.join(out_dir, 'multi_catalyst_free_energy.png'),
-                        step_labels=step_labels, show_ul=True,
+                        step_labels=step_labels, show_ul=True, mark_pds=False,
                         title='Multi-catalyst Li-S free-energy pathways')
                     if reason:
                         skipped.append({
@@ -3713,6 +4508,8 @@ class Api:
         paths, labels, reasons = [], None, []
         baseline_method = None
         baseline_references = None
+        baseline_explicit_fingerprint = None
+        baseline_molecules_dir = None
         baseline_name = None
         for item in projs:
             method = (item.get('summary') or {}).get('method_consistency') or {}
@@ -3737,10 +4534,23 @@ class Api:
                 continue
             candidate_method = self._comparison_method_record(item)
             candidate_references = fed.get('_comparison_reference_energies')
+            candidate_explicit_fingerprint = str(
+                (item.get('proj') or {}).get('comparison_method_fingerprint') or '')
+            raw_molecules_dir = str(
+                (item.get('proj') or {}).get('molecules_dir') or '')
+            candidate_molecules_dir = (
+                os.path.normcase(os.path.abspath(raw_molecules_dir))
+                if raw_molecules_dir else None
+            )
             if paths:
-                method_check = self._comparison_method_pair(
-                    baseline_method, candidate_method,
-                    baseline_name or '首个项目', item['name'])
+                if (baseline_explicit_fingerprint
+                        and candidate_explicit_fingerprint
+                        and baseline_explicit_fingerprint == candidate_explicit_fingerprint):
+                    method_check = {'status': 'verified', 'issues': [], 'warnings': []}
+                else:
+                    method_check = self._comparison_method_pair(
+                        baseline_method, candidate_method,
+                        baseline_name or '首个项目', item['name'])
                 if method_check['status'] == 'incompatible':
                     reasons.append(
                         f'{item["name"]}: 与 {baseline_name} 的跨项目方法不可比（'
@@ -3752,6 +4562,10 @@ class Api:
                         + '；'.join(method_check['warnings'][:3]) + '）')
                 ref_issue = self._comparison_reference_issue(
                     baseline_references, candidate_references)
+                if (ref_issue and not ref_issue['blocking']
+                        and baseline_molecules_dir
+                        and candidate_molecules_dir == baseline_molecules_dir):
+                    ref_issue = None
                 if ref_issue and ref_issue['blocking']:
                     reasons.append(
                         f'{item["name"]}: 与 {baseline_name} 的分子参考不可比（'
@@ -3764,11 +4578,14 @@ class Api:
             else:
                 baseline_method = candidate_method
                 baseline_references = candidate_references
+                baseline_explicit_fingerprint = candidate_explicit_fingerprint
+                baseline_molecules_dir = candidate_molecules_dir
                 baseline_name = item['name']
-                if candidate_method is None:
+                if candidate_method is None and not baseline_explicit_fingerprint:
                     reasons.append(
                         f'{item["name"]}: 已作为对比基线，但跨项目方法指纹不可读')
-                if not isinstance(candidate_references, dict):
+                if (not isinstance(candidate_references, dict)
+                        and not baseline_molecules_dir):
                     reasons.append(
                         f'{item["name"]}: 已作为对比基线，但分子参考能量签名不可读')
             paths.append({
@@ -3953,29 +4770,47 @@ class Api:
                 [n for _, _, n in pts])
 
     def _volcano_points(self, projs, cols):
-        """火山图数据:描述符=覆盖最好的共同吸附质 ΔE,活性=各项目 U_L。
+        """Return a path-specific ``ΔG_ads(*LiS2)`` volcano dataset.
 
-        → ((species, points), None) 或 (None, 中文原因)。"""
-        uls, reasons = {}, []
+        An arbitrary common ``ΔE_ads(Li2Sx)`` is *not* a valid substitute for
+        the descriptor used by the thesis volcano relationship.  Projects
+        therefore have to persist an explicit ``volcano_descriptor`` mapping
+        with quantity, species, reaction path, sign convention and value.
+        """
+        del cols  # historical argument retained for API compatibility
+        points, contexts, reasons = [], set(), []
         for pr in projs:
             fed, reason = self._proj_fed(pr['proj'], pr['summary'])
-            if fed is not None and fed.get('u_l') is not None:
-                uls[pr['name']] = fed['u_l']
-            elif reason:
-                reasons.append(f"{pr['name']}: {reason}")
-        if len(uls) < 3:
-            why = ';'.join(reasons[:3]) or '有 U_L 的项目不足'
-            return None, f'火山图需 ≥3 个项目具备放电路径 U_L(当前 {len(uls)} 个)。{why}'
-        best_sp, best_pts = None, []
-        for sp in cols:
-            pts = [{'name': pr['name'], 'x': pr['de'].get(sp),
-                    'y': uls.get(pr['name'])} for pr in projs]
-            pts = [p for p in pts if p['x'] is not None and p['y'] is not None]
-            if len(pts) > len(best_pts):
-                best_sp, best_pts = sp, pts
-        if len(best_pts) < 3:
-            return None, '不足 3 个项目同时具备描述符 ΔE 与 U_L'
-        return (best_sp, best_pts), None
+            descriptor = pr['proj'].get('volcano_descriptor') or {}
+            quantity = str(descriptor.get('quantity') or '')
+            species = self._comparison_model().canonical_species(
+                descriptor.get('species') or descriptor.get('descriptor_species'))
+            path_id = str(descriptor.get('reaction_path_id') or '')
+            sign = str(descriptor.get('sign_convention') or '')
+            value = descriptor.get('value_eV', descriptor.get('descriptor_value_eV'))
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                value = None
+            u_l = fed.get('u_l') if isinstance(fed, dict) else None
+            if (quantity != 'delta_G_ads' or species != 'LiS2' or
+                    not path_id or sign != 'negative_is_stronger' or
+                    value is None or not math.isfinite(value) or
+                    not isinstance(u_l, (int, float)) or not math.isfinite(u_l)):
+                detail = reason or (
+                    '缺少路径专用 ΔG_ads(*LiS2) 描述符及其反应路径/符号口径')
+                reasons.append(f"{pr['name']}: {detail}")
+                continue
+            contexts.add(path_id)
+            points.append({'name': pr['name'], 'x': value, 'y': float(u_l)})
+        if len(contexts) > 1:
+            return None, '火山图项目使用了不同反应路径，不能套用同一个描述符关系'
+        if len(points) < 3:
+            why = '；'.join(reasons[:3])
+            return None, (
+                f'火山图需 ≥3 个项目同时具备同一路径的 ΔG_ads(*LiS2) 与 U_L'
+                f'(当前 {len(points)} 个)。{why}')
+        return ('LiS2', points), None
 
     # ── MatClaw 式对话助手（Python 原生、安全附件、限定本地工具） ───────────
     def ai_chat_sessions(self):
@@ -4857,32 +5692,52 @@ class Api:
         marker = (project or {}).get('autopilot_report')
         if not isinstance(marker, dict):
             return False
-        report_path = str(marker.get('file') or '')
-        if not report_path or not os.path.isfile(report_path):
-            return False
         try:
             current = summary or self._adsorption.delta_e_rows(project)
             if marker.get('input_fingerprint') != self._report_input_fingerprint(project, current):
                 return False
             declared = marker.get('files')
-            hashes = marker.get('sha256')
+            hashes = marker.get('sha256') or marker.get('report_hashes')
             if isinstance(declared, dict) and isinstance(hashes, dict) and declared:
                 return all(
                     os.path.isfile(str(path))
                     and str(hashes.get(fmt) or '')
                     and _sha256_file(str(path)) == str(hashes.get(fmt))
                     for fmt, path in declared.items())
+            report_path = str(marker.get('file') or '')
+            if not report_path or not os.path.isfile(report_path):
+                return False
             expected_hash = str(marker.get('report_sha256') or '')
             return bool(expected_hash and _sha256_file(report_path) == expected_hash)
         except Exception:                                # noqa: BLE001 失效即重建，绝不误报完成
             return False
 
     def _tick_reports(self, events, errors):
-        """为全部已完成项目自动生成报告；最终门禁未过时生成诊断版并明示原因。"""
+        """Generate an idempotent HTML/DOCX/PDF bundle once calculations finish.
+
+        Managed submissions and imported-result projects share this close-out
+        path.  If the final scientific gate is not satisfied, the renderer
+        emits a clearly labelled diagnostic bundle instead of silently doing
+        nothing or mislabelling it as a final result.
+        """
         for pp in self._adsorption.list_projects():
             try:
                 proj = self._adsorption.load_project(pp)
                 if proj is None:
+                    continue
+                is_imported = bool(
+                    proj.get('import_source') or proj.get('result_import')
+                    or proj.get('imported_results'))
+                if not proj.get('autopilot_managed') and not is_imported:
+                    continue
+                # A reference-library-only import has no clean slab/config pair
+                # and therefore no project report to close out.  Keep it reusable
+                # as a reference library without producing a misleading
+                # “adsorption report”.
+                members = proj.get('members') or {}
+                if (is_imported
+                        and (not members.get('clean_slab')
+                             or not list(members.get('configs') or []))):
                     continue
                 states = self._member_states(proj)
                 if not self._project_all_done(states):
@@ -4894,69 +5749,62 @@ class Api:
                 summary = self._adsorption.delta_e_rows(proj)
                 if self._report_marker_current(proj, summary):
                     continue
-                eligible, gate_reason = self._final_report_gate(proj, summary)
                 name = proj.get('name', '') or self._base(os.path.dirname(str(pp)))
                 root = proj.get('root') or os.path.dirname(str(pp))
                 report_dir = os.path.join(root, 'report')
                 os.makedirs(report_dir, exist_ok=True)
-                if not eligible:
-                    # 老测试替身和第三方生成器没有 report_status 契约时维持旧行为；
-                    # 正式生成器则产诊断版，但绝不写 final marker。
-                    generator = self._rf().generate_project_report
-                    parameters = inspect.signature(generator).parameters
-                    supports_status = (
-                        'report_status' in parameters
-                        or any(p.kind == inspect.Parameter.VAR_KEYWORD
-                               for p in parameters.values()))
-                    if not supports_status or not self._rf()._member_dirs(proj):
-                        continue
-                    fingerprint = self._report_input_fingerprint(proj, summary)
-                    previous = proj.get('autopilot_report_blocked')
-                    previous_files = ((previous or {}).get('files') or {})
-                    if (isinstance(previous, dict)
-                            and previous.get('input_fingerprint') == fingerprint
-                            and previous.get('reason') == gate_reason
-                            and previous_files
-                            and all(os.path.isfile(str(path))
-                                    for path in previous_files.values())):
-                        continue
-                    rep = self.proj_report(
-                        pp, os.path.join(report_dir, f'{name}_diagnostic.html'),
-                        final=False)
-                    if not rep.get('ok'):
-                        errors.append(
-                            f'项目「{name}」诊断报告生成失败:{rep.get("error")}')
-                        continue
-                    try:
-                        self._persist_blocked_report_marker(
-                            proj, summary, gate_reason,
-                            rep.get('files') or [rep.get('file')])
-                    except Exception as exc:              # noqa: BLE001
-                        errors.append(f'项目「{name}」诊断报告标记落盘失败:{exc}')
-                        continue
-                    events.append({
-                        'kind': 'report_blocked', 'project': name,
-                        'report': rep.get('file'), 'reason': gate_reason,
-                        'text': f'项目「{name}」已生成诊断报告；最终报告暂停：{gate_reason}',
-                    })
-                    continue
-                fig = self._auto_figures_for_project(proj, pp, report_dir)
-                rep = self.proj_report(
-                    pp, os.path.join(report_dir, f'{name}_report.html'), final=True)
+                rep = self.proj_report_bundle(
+                    pp, report_dir, ('html', 'docx', 'pdf'), final=True,
+                    stem=f'{name}_吸附能评估报告')
                 if not rep.get('ok'):
                     errors.append(f'项目「{name}」自动报告失败:{rep.get("error")}')
                     continue
-                report_file = str(rep.get('file') or '')
-                if not report_file or not os.path.isfile(report_file):
-                    errors.append(f'项目「{name}」报告生成器未产出可读文件')
+                report_files = {
+                    str(fmt): str(path)
+                    for fmt, path in (rep.get('files') or {}).items()
+                    if path and os.path.isfile(str(path))
+                }
+                required = {'html', 'docx', 'pdf'}
+                if not required.issubset(report_files):
+                    missing = '、'.join(sorted(required - set(report_files)))
+                    errors.append(f'项目「{name}」报告包缺少:{missing}')
                     continue
-                nfig = len(fig.get('files') or [])
-                extra = f'(一键出图 {nfig} 张)' if fig.get('engine') == 'auto_figures' else ''
+                generated_at = time.strftime('%Y-%m-%dT%H:%M:%S')
+                primary = report_files.get('pdf') or report_files.get('html')
+                marker = {
+                    'generated_at': generated_at,
+                    'input_fingerprint': self._report_input_fingerprint(proj, summary),
+                    'kind': rep.get('kind') or 'diagnostic',
+                    'file': primary,
+                    'files': report_files,
+                    'report_sha256': _sha256_file(primary),
+                    'report_hashes': {
+                        fmt: _sha256_file(path) for fmt, path in report_files.items()
+                    },
+                    'figures_dir': os.path.join(report_dir, 'figures'),
+                }
+                # 先用独立副本落盘，成功后才更新当前内存对象。
+                # 否则一次保存失败会在进程内留下“伪 marker”，
+                # 下一拍可能错误认为报告已持久化而不再重试。
+                persisted = dict(proj)
+                persisted['autopilot_report'] = marker
+                persisted['autopilot_report_done'] = generated_at  # 旧界面只读兼容
+                try:
+                    self._adsorption.save_project(root, persisted)
+                except Exception as e:                    # noqa: BLE001
+                    errors.append(f'项目「{name}」报告标记落盘失败:{e}')
+                    continue
+                proj['autopilot_report'] = marker
+                proj['autopilot_report_done'] = generated_at
                 events.append({'kind': 'report_done', 'project': name,
-                               'report': rep.get('file'), 'figures_dir': fig.get('out_dir'),
-                               'files': rep.get('files') or [],
-                               'engine': fig.get('engine'), 'n_figures': nfig,
-                               'text': f'项目「{name}」HTML、Word、PDF 报告已自动生成{extra}'})
+                               'report': primary, 'files': report_files,
+                               'report_kind': marker['kind'],
+                               'figures_dir': marker['figures_dir'],
+                               'engine': 'paper_report_bundle',
+                               'n_figures': len(rep.get('figures') or []),
+                               'text': (f'项目「{name}」'
+                                        f'{"最终" if marker["kind"] == "final" else "诊断"}'
+                                        '报告（Word + PDF + HTML）已自动生成')})
             except Exception as e:                        # noqa: BLE001 单项目失败不拖垮其他
                 errors.append(f'项目报告自动化异常:{e}')
 
@@ -5066,8 +5914,17 @@ class Api:
         events, errors, synced = [], [], 0
         ap = self._autopilot_cfg()
         if not ap['enabled']:
-            # 总开关关闭时不能读凭据、连接集群、改 manifest、派生任务或写报告。
-            return {'ok': True, 'events': [], 'errors': [], 'synced': 0,
+            # Remote automation remains fail-closed.  Report close-out is an
+            # independent, local-only stage: imported completed results should
+            # still receive their report when the user has left the global
+            # cluster monitor disabled.  Do not load profiles/secrets/campaigns
+            # on this path.
+            if ap['report']:
+                try:
+                    self._tick_reports(events, errors)
+                except Exception as e:                    # noqa: BLE001
+                    errors.append(f'报告自动化失败:{e}')
+            return {'ok': True, 'events': events, 'errors': errors, 'synced': 0,
                     'last_sync': time.strftime('%Y-%m-%d %H:%M:%S')}
         try:
             profiles = self._profiles.load_profiles()

@@ -8,6 +8,7 @@
   const val = id => { const el = $(id); return el ? el.value.trim() : ''; };
   const setVal = (id, v) => { const el = $(id); if (el) el.value = v || ''; };
   const CURRENT_PROJECT_KEY = 'vcs.adsorption.current_project';
+  const COMPARE_PROJECTS_KEY = 'vcs.adsorption.compare_projects';
 
   const State = {
     configs: [],      // 构型 POSCAR 路径列表(逐个添加)
@@ -38,6 +39,14 @@
     lisBusy: false,
     inputScanBusy: false,
     inputGeneration: 0,
+    comparePaths: new Set(),
+    compareSelectionRestored: false,
+    comparePreview: null,
+    comparePreviewGeneration: 0,
+    comparePreviewTimer: null,
+    compareFiguresBusy: false,
+    batchReportBusy: false,
+    candidateEvaluationGeneration: 0,
   };
 
   const LIS_MUTABLE_CONTROLS = [
@@ -748,9 +757,14 @@
         gate.molecules > 0 && createdCount === 0,
         referenceOnly, createdCount, openCreatedJobs);
       setImportStep(4);
+      if (!createdCount && isAdsorption && VCS.pipeline &&
+          typeof VCS.pipeline.reconfigure === 'function') {
+        await VCS.pipeline.reconfigure();
+      }
       VCS.toast(createdCount ? `已导入；${createdCount} 个四件套作业等待提交`
         : referenceOnly ? 'Li-S 参考能库已建立，可以开始新的吸附计算'
-        : reportReady ? '结果与 ΔE 已载入，可以生成报告' : '结果已导入；请先处理表格中的缺项');
+        : reportReady ? '结果与 ΔE 已载入，报告将自动生成'
+          : '结果已导入；将生成诊断报告并列出缺项');
       if (typeof VCS.nextStep === 'function') {
         VCS.nextStep({
           title: '结果导入完成',
@@ -760,11 +774,11 @@
             : referenceOnly
             ? '这些已收敛的 Li-S 能量已加入参考库。下一步只需选择固定 INCAR、clean slab 和 adsorption 结构。'
             : reportReady
-            ? 'ΔE 已自动计算并显示在本页。请核对表格后生成完整报告。'
-            : 'ΔE 表已自动刷新，但仍有缺角色、缺能量或待确认结果；处理完再生成报告。',
+            ? 'ΔE 已自动计算并显示在本页；最终报告将自动生成，也可立即打开报告入口。'
+            : 'ΔE 表已自动刷新；系统将生成诊断报告并列出缺角色、缺能量或待确认结果。',
           primaryLabel: createdCount ? `提交 ${createdCount} 个待运行作业`
             : referenceOnly ? '用这些参考能开始吸附计算'
-            : reportReady ? '生成完整报告' : '查看 ΔE 缺项',
+            : reportReady ? '查看或立即生成报告' : '查看 ΔE 缺项',
           stayLabel: createdCount ? '先检查待提交成员'
             : referenceOnly ? '先检查参考能清单' : '先检查导入清单',
           onPrimary: createdCount ? openCreatedJobs
@@ -797,14 +811,14 @@
     box.hidden = false;
     box.innerHTML = `<b>导入完成：</b>${VCS.esc(result.project_name || val('pj-import-name'))}，` +
       `共 ${count} 个条目。${createdCount ? `${createdCount} 个四件套作业等待提交。` : referenceOnly ? 'Li-S 参考能库已就绪。' : reportReady
-        ? 'ΔE 已显示在下方，可以生成报告。' : '请先处理下方 ΔE 表中的缺项。'}` +
+        ? 'ΔE 已显示在下方，最终报告将自动生成。' : '将自动生成诊断报告并列出下方 ΔE 缺项。'}` +
       '<div class="actions">' + (referenceOnly ? ''
         : '<button class="btn" type="button" data-next="delta">重新计算 ΔE</button>') +
       (createdCount ? `<button class="btn primary" type="button" data-next="submit-created">提交 ${createdCount} 个待运行作业</button>` : '') +
       (hasSpeciesReferences
         ? '<button class="btn primary" type="button" data-next="lis">用这些参考能开始吸附计算</button>' : '') +
       (referenceOnly ? '' : `<button class="btn primary" type="button" data-next="report"${reportReady ? '' : ' disabled ' +
-        'title="ΔE 或收敛状态仍有缺项，暂不生成报告"'}>生成完整报告</button>`) + '</div>';
+        'title="ΔE 或收敛状态仍有缺项，暂不生成最终报告"'}>查看或立即生成报告</button>`) + '</div>';
     const deltaButton = box.querySelector('[data-next="delta"]');
     if (deltaButton) deltaButton.addEventListener('click', delta);
     const submitCreated = box.querySelector('[data-next="submit-created"]');
@@ -2330,6 +2344,227 @@
     }
   }
 
+  // ── 多项目选择:状态是唯一真相,DOM 仅负责显示 ─────────────────────────────
+  function restoreCompareSelection() {
+    if (State.compareSelectionRestored) return;
+    State.compareSelectionRestored = true;
+    try {
+      const raw = JSON.parse(localStorage.getItem(COMPARE_PROJECTS_KEY) || '[]');
+      if (Array.isArray(raw)) {
+        State.comparePaths = new Set(raw.map(path => String(path || '')).filter(Boolean));
+      }
+    } catch (_) {
+      State.comparePaths = new Set();
+    }
+  }
+
+  function persistCompareSelection() {
+    try {
+      localStorage.setItem(COMPARE_PROJECTS_KEY, JSON.stringify(Array.from(State.comparePaths)));
+    } catch (_) { /* 存储不可用不阻塞项目比较 */ }
+  }
+
+  function reconcileCompareSelection() {
+    restoreCompareSelection();
+    const known = new Set(State.projects.map(project => String(project.path || '')));
+    let changed = false;
+    Array.from(State.comparePaths).forEach(path => {
+      if (!known.has(path)) {
+        State.comparePaths.delete(path);
+        changed = true;
+      }
+    });
+    if (changed) persistCompareSelection();
+  }
+
+  function selectedComparePaths() {
+    return State.projects
+      .map(project => String(project.path || ''))
+      .filter(path => path && State.comparePaths.has(path));
+  }
+
+  function setCompareSelection(paths) {
+    const known = new Set(State.projects.map(project => String(project.path || '')));
+    State.comparePaths = new Set((paths || [])
+      .map(path => String(path || ''))
+      .filter(path => path && known.has(path)));
+    State.comparePreview = null;
+    State.comparePreviewGeneration += 1;
+    persistCompareSelection();
+    renderFigProjList();
+    scheduleComparePreview();
+  }
+
+  function comparePreviewProject(path) {
+    const projects = State.comparePreview && State.comparePreview.projects;
+    return Array.isArray(projects)
+      ? projects.find(project => String(project.path || '') === String(path || ''))
+      : null;
+  }
+
+  function comparisonCounts() {
+    const selected = selectedComparePaths();
+    const preview = State.comparePreview;
+    if (preview && preview.ok !== false && Array.isArray(preview.projects)) {
+      const blocked = preview.projects.filter(project => project.status === 'blocked').length;
+      return {
+        selected: Number(preview.selected_count != null ? preview.selected_count : selected.length),
+        valid: Number(preview.ready_count != null
+          ? preview.ready_count : Math.max(0, selected.length - blocked)),
+        blocked,
+        overlay: preview.can_plot === false ? 0 : Number(preview.ladder_ready_count || 0),
+        checked: true,
+      };
+    }
+    const known = new Set(State.projects.map(project => String(project.path || '')));
+    const valid = selected.filter(path => known.has(path)).length;
+    return {
+      selected: selected.length,
+      valid,
+      blocked: selected.length - valid,
+      overlay: 0,
+      checked: selected.length === 0,
+    };
+  }
+
+  function renderCompareSummary() {
+    const box = $('fig-selection-summary');
+    const status = $('fig-compare-status');
+    const counts = comparisonCounts();
+    if (box) {
+      box.innerHTML = '<span>已选 <b>' + counts.selected + '</b></span>' +
+        '<span>有效 <b>' + counts.valid + '</b></span>' +
+        '<span>阻断 <b>' + counts.blocked + '</b></span>' +
+        '<span>可叠加台阶 <b>' + counts.overlay + '</b></span>';
+      box.classList.toggle('checking', !counts.checked);
+    }
+    const compareButton = $('pj-cmpfigs');
+    const batchButton = $('pj-batch-report');
+    if (compareButton) compareButton.disabled = counts.selected < 2 || State.compareFiguresBusy;
+    if (batchButton) batchButton.disabled = counts.selected < 2 || State.batchReportBusy;
+    ['fig-select-all', 'fig-select-comparable', 'fig-select-clear'].forEach(id => {
+      const button = $(id);
+      if (button) button.disabled = State.compareFiguresBusy || State.batchReportBusy;
+    });
+    if (!status) return;
+    const preview = State.comparePreview;
+    if (!counts.selected) {
+      status.innerHTML = '<span class="pj-compare-empty">选择至少两个催化剂项目后，软件会先核对方法与反应路径。</span>';
+      return;
+    }
+    if (!preview) {
+      status.innerHTML = '<span class="pj-compare-empty">正在核对所选项目的数据、方法与台阶图口径…</span>';
+      return;
+    }
+    if (preview.ok === false) {
+      status.innerHTML = `<span class="pj-compare-error">${VCS.esc(preview.error || '比较预检失败')}</span>`;
+      return;
+    }
+    let h = '';
+    (preview.projects || []).forEach(project => {
+      const ready = project.status === 'ready';
+      const reasons = ready ? (project.warnings || []) : (project.block_reasons || []);
+      h += `<div class="pj-compare-project ${ready ? 'ready' : 'blocked'}">` +
+        `<b>${VCS.esc(project.display_name || project.name || pathBase(project.path))}</b>` +
+        `<span>${ready ? '吸附能有效' : '已阻断'} · ${project.ladder ? '台阶可用' : '无可叠加台阶'}</span>` +
+        (reasons.length ? `<small>${VCS.esc(reasons.join('；'))}</small>` : '') + '</div>';
+    });
+    const gate = preview.comparison_gate || {};
+    (gate.blocking || []).forEach(reason => {
+      h += `<div class="pj-compare-gate blocked">${VCS.esc(reason)}</div>`;
+    });
+    (gate.warnings || []).forEach(reason => {
+      h += `<div class="pj-compare-gate warning">${VCS.esc(reason)}</div>`;
+    });
+    status.innerHTML = h || '<span class="pj-compare-empty">预检完成。</span>';
+  }
+
+  function legacyComparisonPreview(paths) {
+    const projects = (paths || []).map(path => {
+      const project = State.projects.find(item => String(item.path || '') === String(path || ''));
+      const total = Number(project && project.n_members || 0);
+      const done = Number(project && project.n_done || 0);
+      const ready = !!project && total > 0 && done >= total;
+      return {
+        path,
+        name: project && project.name || pathBase(path),
+        display_name: project && project.name || pathBase(path),
+        status: ready ? 'ready' : 'blocked',
+        ladder: null,
+        warnings: ready ? ['旧版后端未提供跨项目方法与路径预检'] : [],
+        block_reasons: ready ? [] : [project ? '项目成员尚未全部完成' : '项目不存在或已移动'],
+      };
+    });
+    const readyCount = projects.filter(project => project.status === 'ready').length;
+    return {
+      ok: true,
+      legacy: true,
+      selected_count: projects.length,
+      ready_count: readyCount,
+      ladder_ready_count: 0,
+      projects,
+      can_plot: false,
+      comparison_gate: {
+        status: 'unverified',
+        blocking: [],
+        warnings: ['当前后端未提供跨项目预检；生成图表或报告时仍会再次校验。'],
+      },
+    };
+  }
+
+  async function refreshComparePreview() {
+    const paths = selectedComparePaths();
+    const generation = ++State.comparePreviewGeneration;
+    if (!paths.length) {
+      State.comparePreview = null;
+      renderCompareSummary();
+      return;
+    }
+    const preset = $('pj-preset') ? $('pj-preset').value : '';
+    const result = await VCS.call('proj_compare_preview', paths, preset || null);
+    if (generation !== State.comparePreviewGeneration) return;
+    if (bridgeMethodUnavailable(result)) {
+      State.comparePreview = legacyComparisonPreview(paths);
+    } else {
+      State.comparePreview = result && result.ok !== false && !result.error
+        ? result
+        : { ok: false, error: (result && result.error) || '比较预检失败', projects: [] };
+    }
+    renderFigProjList();
+  }
+
+  function scheduleComparePreview() {
+    if (State.comparePreviewTimer) clearTimeout(State.comparePreviewTimer);
+    renderCompareSummary();
+    State.comparePreviewTimer = setTimeout(() => {
+      State.comparePreviewTimer = null;
+      refreshComparePreview();
+    }, 120);
+  }
+
+  function selectAllCompareProjects() {
+    setCompareSelection(State.projects.map(project => project.path));
+  }
+
+  async function selectComparableProjects() {
+    const paths = State.projects.map(project => String(project.path || '')).filter(Boolean);
+    if (!paths.length) return;
+    const preset = $('pj-preset') ? $('pj-preset').value : '';
+    const result = await VCS.call('proj_compare_preview', paths, preset || null);
+    if (result && result.ok !== false && !result.error && Array.isArray(result.projects)) {
+      setCompareSelection(result.projects
+        .filter(project => project.status === 'ready')
+        .map(project => project.path));
+      return;
+    }
+    // 老后端没有预检接口时，只选已经完成全部成员的项目，不假装其台阶必然可比。
+    setCompareSelection(State.projects.filter(project => {
+      const total = Number(project.n_members || 0);
+      return total > 0 && Number(project.n_done || 0) >= total;
+    }).map(project => project.path));
+    VCS.log('当前后端未提供跨项目预检，已暂按“成员全部完成”筛选；生成时仍会再次校验。', 'warnc');
+  }
+
   // ── 已有项目:下拉 + 刷新 ──────────────────────────────────────────────────
   async function reloadProjects(preferredReference) {
     const sel = $('pj-select');
@@ -2337,9 +2572,11 @@
     const [r, pipeline] = await Promise.all([
       VCS.call('proj_list'), VCS.call('pipeline_status'),
     ]);
+    const listSucceeded = !!(r && r.ok !== false && !r.error && Array.isArray(r.projects));
     const pipelineByPath = new Map(((pipeline && pipeline.projects) || [])
       .map(item => [item.path, item]));
-    State.projects = ((r && r.projects) || []).map(project => {
+    const projectRows = listSucceeded ? r.projects : State.projects;
+    State.projects = projectRows.map(project => {
       const progress = pipelineByPath.get(project.path) || {};
       return Object.assign({}, project, {
         pipeline_stage: progress.stage || '',
@@ -2349,6 +2586,10 @@
         n_members: progress.total != null ? Number(progress.total) : project.n_members,
       });
     });
+    State.comparePreview = null;
+    State.comparePreviewGeneration += 1;
+    if (listSucceeded) reconcileCompareSelection();
+    else restoreCompareSelection();
     if (r && r.error) VCS.log('读取项目列表失败:' + r.error, 'failc');
     renderReferenceProjects(preferredReference);
     if (!sel) return;
@@ -2361,6 +2602,8 @@
       renderFigProjList();
       updateProjectSummary();
       updateJourney();
+      refreshCandidateEvaluation('');
+      scheduleComparePreview();
       return;
     }
     State.projects.forEach(p => {
@@ -2384,6 +2627,8 @@
     updateProjectSummary();
     updateJourney();
     renderFigProjList();
+    refreshCandidateEvaluation(want);
+    scheduleComparePreview();
   }
 
   // ── 论文级出图:多项目对比勾选列表(随项目列表刷新) ──────────────────────
@@ -2400,10 +2645,32 @@
       const cb = document.createElement('input');
       cb.type = 'checkbox';
       cb.dataset.path = p.path;
+      cb.checked = State.comparePaths.has(String(p.path || ''));
+      const preview = comparePreviewProject(p.path);
+      if (preview) lab.classList.add(preview.status === 'ready' ? 'ready' : 'blocked');
+      cb.addEventListener('change', () => {
+        if (cb.checked) State.comparePaths.add(String(p.path || ''));
+        else State.comparePaths.delete(String(p.path || ''));
+        State.comparePreview = null;
+        State.comparePreviewGeneration += 1;
+        persistCompareSelection();
+        renderCompareSummary();
+        scheduleComparePreview();
+      });
       lab.appendChild(cb);
-      lab.appendChild(document.createTextNode(p.name || '(未命名)'));
+      const text = document.createElement('span');
+      text.textContent = p.name || '(未命名)';
+      lab.appendChild(text);
+      if (preview) {
+        const state = document.createElement('small');
+        state.textContent = preview.status === 'ready'
+          ? (preview.ladder ? '有效 · 台阶可用' : '有效 · 无台阶')
+          : '阻断';
+        lab.appendChild(state);
+      }
       box.appendChild(lab);
     });
+    renderCompareSummary();
   }
 
   function logFigResult(r, what) {
@@ -2448,26 +2715,39 @@
 
   // 多项目对比出图:勾选的项目 + 勾选的图类型调 proj_compare_figures
   async function makeCompareFigures() {
-    const box = $('fig-projlist');
-    const paths = box
-      ? Array.from(box.querySelectorAll('input:checked')).map(cb => cb.dataset.path)
-      : [];
+    const paths = selectedComparePaths();
     if (paths.length < 2) { VCS.log('多项目对比请勾选至少 2 个项目', 'failc'); return; }
     const kinds = [];
     if ($('fig-heatmap') && $('fig-heatmap').checked) kinds.push('heatmap');
-    if ($('fig-cmp-ladder') && $('fig-cmp-ladder').checked) kinds.push('ladder');
     if ($('fig-scaling') && $('fig-scaling').checked) kinds.push('scaling');
     if ($('fig-volcano') && $('fig-volcano').checked) kinds.push('volcano');
-    if ($('fig-cmp-report') && $('fig-cmp-report').checked) kinds.push('report');
+    if ($('fig-compare-ladder') && $('fig-compare-ladder').checked) kinds.push('ladder');
     if (!kinds.length) { VCS.log('请至少勾选一种对比图', 'failc'); return; }
-    const btn = $('pj-cmpfigs');
-    if (btn) btn.disabled = true;
-    VCS.log('多催化剂对比生成中(' + paths.length + ' 个项目,' + kinds.join('/') + ')…');
+    const preset = $('pj-preset') ? $('pj-preset').value : '';
+    State.compareFiguresBusy = true;
+    renderCompareSummary();
+    VCS.log('对比出图中(' + paths.length + ' 个项目,' + kinds.join('/') + ')…');
     try {
-      const r = await VCS.call('proj_compare_figures', paths, kinds, null);
-      logFigResult(r, '对比图与报告');
+      let r = await VCS.call('proj_compare_figures', paths, kinds, null, preset || null);
+      const unsupported = r && r.error &&
+        /(positional argument|unexpected argument|桥方法不存在|method not found)/i.test(String(r.error));
+      if (unsupported) {
+        const legacyKinds = kinds.filter(kind => kind !== 'ladder');
+        r = legacyKinds.length
+          ? await VCS.call('proj_compare_figures', paths, legacyKinds, null)
+          : { ok: true, files: [], skipped: [] };
+        if (!r) r = { ok: false, files: [], skipped: [], error: '旧版对比接口没有返回结果' };
+        if (kinds.includes('ladder')) {
+          r.skipped = (r.skipped || []).concat([{
+            kind: 'ladder',
+            reason: '当前后端版本尚不支持多项目台阶图，请升级后重试',
+          }]);
+        }
+      }
+      logFigResult(r, '对比出图');
     } finally {
-      if (btn) btn.disabled = false;
+      State.compareFiguresBusy = false;
+      renderCompareSummary();
     }
   }
 
@@ -2519,6 +2799,101 @@
     }
   }
 
+  const CANDIDATE_PRIORITY_ZH = {
+    advance: '建议继续',
+    hold_for_evidence: '先补证据',
+    lower_priority: '降低优先级',
+    blocked: '阻止判断',
+  };
+  const CLAIM_CEILING_ZH = {
+    electronic_adsorption_screen: '电子吸附能初筛',
+    corrected_thermodynamics: '热校正热力学',
+    solvated_thermodynamics: '含溶剂化热力学',
+    kinetically_supported: '动力学支持',
+  };
+  const SHORT_CHAIN_RISK_ZH = {
+    high: '高：终产物过强结合警戒',
+    medium: '中：需检查 Li₂S 分解/脱锂',
+    weak_terminal_binding: '终产物结合偏弱',
+    low: '低',
+    unknown: '证据不足',
+  };
+
+  function hideCandidateEvaluation() {
+    const box = $('pj-candidate-evaluation');
+    if (!box) return;
+    box.hidden = true;
+    box.innerHTML = '';
+    box.className = 'pj-candidate-card';
+  }
+
+  function renderCandidateEvaluation(result) {
+    const box = $('pj-candidate-evaluation');
+    if (!box) return;
+    const evaluation = result && result.evaluation;
+    if (!evaluation || typeof evaluation !== 'object') {
+      box.hidden = false;
+      box.className = 'pj-candidate-card error';
+      box.innerHTML = '<div class="pj-candidate-head"><b>候选评价暂不可用</b></div>' +
+        `<p>${VCS.esc((result && result.error) || '后端没有返回可审计评价。')}</p>`;
+      return;
+    }
+    const decision = evaluation.decision || {};
+    const evidence = evaluation.evidence || {};
+    const profile = evaluation.profile || {};
+    const priority = Object.prototype.hasOwnProperty.call(
+      CANDIDATE_PRIORITY_ZH, decision.priority) ? decision.priority : 'hold_for_evidence';
+    const claim = String(decision.claim_ceiling || evidence.claim_ceiling ||
+      'electronic_adsorption_screen');
+    const risk = String((profile.short_chain_risk || {}).status || 'unknown');
+    const recommendations = (Array.isArray(evaluation.recommendations)
+      ? evaluation.recommendations : []).filter(
+      item => item && typeof item === 'object').slice(0, 3);
+    let html = `<div class="pj-candidate-head"><div><span>吸附能候选评价</span>` +
+      `<b>${VCS.esc(CANDIDATE_PRIORITY_ZH[priority])}</b></div>` +
+      '<small>Sabatier 初筛，不替代自由能与 NEB</small></div>' +
+      `<p class="pj-candidate-summary">${VCS.esc(decision.summary_zh || '当前证据不足。')}</p>` +
+      '<div class="pj-candidate-metrics">' +
+      `<span><small>结论上限</small><b>${VCS.esc(CLAIM_CEILING_ZH[claim] || claim)}</b>` +
+      `<code>${VCS.esc(claim)}</code></span>` +
+      `<span><small>短链风险</small><b>${VCS.esc(SHORT_CHAIN_RISK_ZH[risk] || risk)}</b>` +
+      `<code>${VCS.esc(risk)}</code></span></div>`;
+    if (recommendations.length) {
+      html += '<div class="pj-candidate-next"><b>建议的下一步（前 3 项）</b><ol>';
+      recommendations.forEach(item => {
+        const targets = (Array.isArray(item.targets) ? item.targets : []).map(String).join('、');
+        html += '<li><b>' + VCS.esc(
+          `${item.priority || 'P2'} · ${item.action_zh || item.code || '继续核验'}`) +
+          '</b><span>' + VCS.esc(item.reason || '') +
+          (targets ? `；目标：${VCS.esc(targets)}` : '') + '</span></li>';
+      });
+      html += '</ol></div>';
+    }
+    const disclaimer = evaluation.audit && evaluation.audit.policy_disclaimer;
+    if (disclaimer) html += `<div class="pj-candidate-note">${VCS.esc(disclaimer)}</div>`;
+    box.hidden = false;
+    box.className = `pj-candidate-card ${priority}`;
+    box.innerHTML = html;
+  }
+
+  async function refreshCandidateEvaluation(path) {
+    const generation = ++State.candidateEvaluationGeneration;
+    const wanted = String(path || '');
+    if (!wanted) {
+      hideCandidateEvaluation();
+      return;
+    }
+    // 切换项目时先移除旧结论，避免慢请求把上一项目的分级暂时留在新项目名下。
+    hideCandidateEvaluation();
+    const result = await VCS.call('proj_evaluate_candidate', wanted);
+    if (generation !== State.candidateEvaluationGeneration) return;
+    if (!result || bridgeMethodUnavailable(result)) {
+      hideCandidateEvaluation();
+      return;
+    }
+    renderCandidateEvaluation(result);
+  }
+
   function updateProjectSummary(deltaResult) {
     const box = $('pj-project-summary');
     const sel = $('pj-select');
@@ -2531,6 +2906,7 @@
     if (!project) {
       box.innerHTML = '<b>还没有可查看的项目</b><span>下一步：先导入已算结果，或用参考能开始新的吸附计算。</span>';
       [deltaButton, reportButton, csvButton].forEach(button => { if (button) button.disabled = true; });
+      if (reportButton) reportButton.textContent = '生成 HTML / Word / PDF 报告';
       return;
     }
     [deltaButton, reportButton, csvButton].forEach(button => { if (button) button.disabled = false; });
@@ -2584,7 +2960,12 @@
       `<span>${VCS.esc(refText)}</span><span>${VCS.esc(stage)}</span></div><b>${VCS.esc(next)}</b>`;
     if (deltaButton) deltaButton.classList.toggle('primary', !complete);
     if (reportButton) reportButton.classList.toggle('primary', complete);
-    if (reportButton) reportButton.disabled = !complete;
+    if (reportButton) {
+      reportButton.disabled = false;
+      reportButton.textContent = complete
+        ? '生成 HTML / Word / PDF 报告'
+        : '生成诊断报告（HTML / Word / PDF）';
+    }
   }
 
   function currentProject() {
@@ -2608,6 +2989,7 @@
       return null;
     }
     renderDelta(r);
+    refreshCandidateEvaluation(proj.path);
     const rows = r.rows || [];
     const methodBlocked = String(r.method_consistency && r.method_consistency.status || '')
       .toLowerCase() === 'incompatible';
@@ -2636,7 +3018,7 @@
       return '下一步：按方法检查列出的泛函、ENCUT、色散、共享元素 POTCAR/DFT+U 等硬冲突逐项修正后重算。合法的 ISPIN 差异本身不会触发此阻断。';
     }
     if (methodCheck.status === 'unverified') {
-      return '下一步：按方法检查逐项核对；分子参考与周期体系 ISPIN 不同，可在确认各自采用正确基态自旋后保留。';
+      return '下一步：按方法检查逐项核对；分子参考、clean slab 与吸附构型可采用各自正确的基态自旋，自旋差异本身只作提示。';
     }
     if (/构型未完成|清洁表面未完成|未完成/.test(note)) {
       return '下一步：保持软件运行等待自动续算/下载；任务 DONE 后重新计算 ΔE。';
@@ -2668,7 +3050,7 @@
         '</div>';
     } else if (methodStatus === 'unverified') {
       h += '<div class="pj-method-gate unverified"><b>方法一致性尚未完全核验</b>' +
-        '<span>请按下列具体项目逐项核对；分子参考与周期体系 ISPIN 不同，可在确认各自采用正确基态自旋后保留。</span>' +
+        '<span>请按下列具体项目逐项核对；分子参考、clean slab 与吸附构型可采用各自正确的基态自旋，自旋差异本身只作提示。</span>' +
         (methodWarnings.length ? `<ul>${methodWarnings.map(x => `<li>${VCS.esc(x)}</li>`).join('')}</ul>` : '') +
         '</div>';
     } else if (methodStatus === 'verified') {
@@ -2677,7 +3059,7 @@
     }
     if (methodAdvisories.length) {
       h += '<div class="pj-method-gate advisory"><b>体系自旋提示（不阻断 ΔE）</b>' +
-        '<span>分子、clean slab 与吸附体系可分别采用各自经验证的基态自旋；以下内容仅用于审计与复核。</span>' +
+        '<span>分子参考与周期体系 ISPIN 不同可以是合理的基态设置；分子、clean slab 与吸附体系可分别采用各自经验证的基态自旋；以下内容仅用于审计与复核。</span>' +
         `<ul>${methodAdvisories.map(x => `<li>${VCS.esc(x)}</li>`).join('')}</ul></div>`;
     }
     if (!rows.length) {
@@ -2743,34 +3125,196 @@
     VCS.toast('已导出 CSV');
   }
 
-  // ── 生成完整报告:同一数据模型输出 HTML 预览 + Word + PDF ──
+  function bridgeMethodUnavailable(result) {
+    const message = String(result && result.error || '');
+    return /(桥方法不存在|method not found|unknown method|has no attribute)/i.test(message);
+  }
+
+  function collectReportFiles(value) {
+    const found = [];
+    const formatNames = { html: 'HTML', docx: 'Word', pdf: 'PDF' };
+    const structural = new Set(['files', 'individual']);
+    function visit(item, trail) {
+      if (typeof item === 'string') {
+        const match = item.match(/\.([^.\\/]+)$/);
+        if (!match || !['html', 'htm', 'docx', 'pdf'].includes(match[1].toLowerCase())) return;
+        const extension = match[1].toLowerCase();
+        const format = extension === 'docx' ? 'Word' : extension === 'pdf' ? 'PDF' : 'HTML';
+        const labels = trail[trail.length - 1] === format ? trail : [...trail, format];
+        found.push({ path: item, label: labels.filter(Boolean).join(' · ') });
+        return;
+      }
+      if (Array.isArray(item)) {
+        item.forEach(child => {
+          const name = child && typeof child === 'object' ? child.name : '';
+          visit(child, name ? [...trail, String(name)] : trail);
+        });
+        return;
+      }
+      if (!item || typeof item !== 'object') return;
+      Object.entries(item).forEach(([key, child]) => {
+        if (['error', 'kind', 'ok', 'path', 'name'].includes(key)) return;
+        let next = trail;
+        if (key === 'comparison') next = [...trail, '批次比较'];
+        else if (formatNames[key]) next = [...trail, formatNames[key]];
+        else if (!structural.has(key)) next = [...trail, key];
+        visit(child, next);
+      });
+    }
+    visit(value, []);
+    const seen = new Set();
+    return found.filter(file => {
+      if (!file.path || seen.has(file.path)) return false;
+      seen.add(file.path);
+      return true;
+    });
+  }
+
+  function renderReportFiles(containerId, result, heading) {
+    const box = $(containerId);
+    if (!box) return;
+    const files = collectReportFiles((result && result.files) ||
+      (result && result.file ? { html: result.file } : {}));
+    if (!files.length) {
+      box.innerHTML = result && result.error
+        ? `<div class="pj-report-note bad">${VCS.esc(result.error)}</div>` : '';
+      return;
+    }
+    const diagnostic = result && result.kind === 'diagnostic';
+    let html = '<div class="pj-report-head"><b>' + VCS.esc(heading || '报告文件') + '</b>' +
+      `<span>${files.length} 个文件${diagnostic ? ' · 诊断版' : ''}</span></div>` +
+      '<div class="pj-report-links">';
+    files.forEach(file => {
+      const name = pathBase(file.path);
+      html += `<button type="button" class="btn quiet pj-report-file" data-report-open="${VCS.esc(file.path)}">` +
+        `<b>${VCS.esc(file.label || name)}</b><small>${VCS.esc(name)}</small></button>`;
+    });
+    html += '</div>';
+    if (diagnostic) {
+      html += '<div class="pj-report-note">当前生成的是诊断报告：保留真实结果与阻断原因，不冒充最终结论。</div>';
+    }
+    box.innerHTML = html;
+    box.querySelectorAll('[data-report-open]').forEach(button => {
+      button.addEventListener('click', () => VCS.call('open_dir', button.dataset.reportOpen));
+    });
+  }
+
+  async function legacyBatchReports(paths, outDir) {
+    const individual = [];
+    const failures = [];
+    for (const [index, path] of paths.entries()) {
+      const project = State.projects.find(item => String(item.path || '') === String(path || ''));
+      const name = String(project && project.name || `project_${index + 1}`);
+      const safeName = name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').trim() || `project_${index + 1}`;
+      const save = joinPath(outDir, `${String(index + 1).padStart(2, '0')}_${safeName}_完整报告.html`);
+      const result = await VCS.call('proj_report', path, save, true);
+      if (result && result.ok !== false && !result.error) {
+        individual.push({
+          name,
+          kind: 'final',
+          files: { html: result.file || save },
+          ok: true,
+        });
+      } else {
+        failures.push(`${name}: ${(result && result.error) || '未知错误'}`);
+      }
+    }
+    return {
+      ok: individual.length > 0,
+      kind: 'diagnostic',
+      files: { individual },
+      warnings: [
+        '当前后端仅支持逐项目 HTML；没有生成跨项目比较报告或 Word/PDF。',
+        ...failures,
+      ],
+      out_dir: outDir,
+      error: individual.length ? null : failures.join('；') || '旧版批次报告生成失败',
+    };
+  }
+
+  // ── 单项目报告:同一快照生成 HTML + Word + PDF；旧后端回退 HTML ───────────
   async function report() {
     const proj = currentProject();
     if (!proj) return;
     const dr = await VCS.call('pick_dir');
     if (dr && dr.error) { VCS.log('选择目录失败:' + dr.error, 'failc'); return; }
     if (!dr || !dr.path) return;   // 用户取消
-    const save = joinPath(dr.path, (proj.name || 'project') + '_完整报告.html');
     const btn = $('pj-report');
     if (btn) btn.disabled = true;
-    VCS.log('生成 HTML 预览、Word 与 PDF(同源表格/图表/方法溯源)，可能需要几分钟…');
+    const output = $('pj-report-files');
+    if (output) output.innerHTML = '';
+    VCS.log('正在从同一份数据快照生成 HTML、Word 与 PDF 报告，可能需要几分钟…');
     try {
-      // 项目页的“完整报告”是最终吸附能交付物：后端必须再次核对参考态、
-      // DONE 能量和方法确认，不能只依赖按钮当前是否可点。
-      const r = await VCS.call('proj_report', proj.path, save, true);
+      let r = await VCS.call(
+        'proj_report_bundle', proj.path, dr.path, ['html', 'docx', 'pdf'], true);
+      if (bridgeMethodUnavailable(r)) {
+        const save = joinPath(dr.path, (proj.name || 'project') + '_完整报告.html');
+        const legacy = await VCS.call('proj_report', proj.path, save, true);
+        r = legacy && !legacy.error
+          ? Object.assign({}, legacy, { files: { html: legacy.file || save }, kind: 'final' })
+          : legacy;
+        VCS.log('当前后端仅支持 HTML，已使用兼容模式生成。', 'warnc');
+      }
       if (!r || r.ok === false || r.error) {
         VCS.log('生成完整报告失败:' + ((r && r.error) || '未知错误'), 'failc');
+        renderReportFiles('pj-report-files', r, '单项目报告');
         return;
       }
-      const files = (r.files || [r.file || save]).filter(Boolean);
-      VCS.log('完整报告已生成:' + files.join('；'), 'okc');
-      VCS.call('open_dir', r.file || save);     // 输出反馈统一:打开所在目录
-      // final=true 已由后端落下与当前输入/结果哈希绑定的 report_done 标记；
-      // 重新读取管线状态，避免只靠一次前端调用猜测报告是否完成。
+      collectReportFiles(r.files || { html: r.file }).forEach(file => {
+        VCS.log('报告已生成:' + file.path, 'okc');
+      });
+      (r.warnings || []).forEach(warning => VCS.log('报告提示:' + warning, 'warnc'));
+      if (r.kind === 'diagnostic') {
+        VCS.log('最终报告门禁未通过，已生成带阻断原因的诊断报告。', 'warnc');
+      }
+      renderReportFiles('pj-report-files', r, '单项目报告');
+      VCS.call('open_dir', r.out_dir || dr.path);
+      // 重新读取管线状态；只有后端已经落下与当前输入/结果哈希绑定的
+      // report_done 标记时，界面才把整个自动流程显示为完成。
       await reloadProjects(proj.path);
-      VCS.toast('HTML、Word、PDF 报告已生成');
+      VCS.toast(r.kind === 'diagnostic' ? '诊断报告已生成' : 'HTML / Word / PDF 报告已生成');
     } finally {
       if (btn) btn.disabled = false;
+    }
+  }
+
+  async function batchReport() {
+    const paths = selectedComparePaths();
+    if (paths.length < 2) {
+      VCS.log('批次报告请至少选择 2 个催化剂项目', 'failc');
+      return;
+    }
+    const dr = await VCS.call('pick_dir');
+    if (dr && dr.error) { VCS.log('选择目录失败:' + dr.error, 'failc'); return; }
+    if (!dr || !dr.path) return;
+    const preset = $('pj-preset') ? $('pj-preset').value : '';
+    const output = $('pj-batch-files');
+    State.batchReportBusy = true;
+    renderCompareSummary();
+    if (output) output.innerHTML = '';
+    VCS.log(`正在生成 ${paths.length} 个单项目报告与一份批次比较报告…`);
+    try {
+      let r = await VCS.call(
+        'proj_batch_report', paths, dr.path, preset || null,
+        ['html', 'docx', 'pdf'], true, true);
+      if (bridgeMethodUnavailable(r)) {
+        r = await legacyBatchReports(paths, dr.path);
+      }
+      if (!r || r.ok === false || r.error) {
+        VCS.log('批次报告生成失败:' + ((r && r.error) || '未知错误'), 'failc');
+        renderReportFiles('pj-batch-files', r, '批次报告');
+        return;
+      }
+      collectReportFiles(r.files).forEach(file => VCS.log('报告已生成:' + file.path, 'okc'));
+      (r.blocked || []).forEach(reason => VCS.log('比较阻断:' + reason, 'warnc'));
+      (r.warnings || []).forEach(reason => VCS.log('比较提示:' + reason, 'warnc'));
+      renderReportFiles('pj-batch-files', r, '多催化剂批次报告');
+      VCS.call('open_dir', r.out_dir || dr.path);
+      VCS.toast(r.kind === 'diagnostic'
+        ? '批次诊断报告已生成' : '批次 HTML / Word / PDF 报告已生成');
+    } finally {
+      State.batchReportBusy = false;
+      renderCompareSummary();
     }
   }
 
@@ -2926,9 +3470,21 @@
       restoreWorkflowState(State.projects.find(p => p.path === projectSelect.value));
       try { localStorage.setItem(CURRENT_PROJECT_KEY, projectSelect.value); } catch (_) { /* 不阻塞 */ }
       updateProjectSummary(); updateJourney();
+      refreshCandidateEvaluation(projectSelect.value);
     });
     wire('pj-figs', makeFigures);
     wire('pj-cmpfigs', makeCompareFigures);
+    wire('fig-select-all', selectAllCompareProjects);
+    wire('fig-select-comparable', selectComparableProjects);
+    wire('fig-select-clear', () => setCompareSelection([]));
+    wire('pj-batch-report', batchReport);
+    const presetSelect = $('pj-preset');
+    if (presetSelect) presetSelect.addEventListener('change', () => {
+      State.comparePreview = null;
+      State.comparePreviewGeneration += 1;
+      renderFigProjList();
+      scheduleComparePreview();
+    });
     wire('pj-draft', draftReady);
     const analysis = $('analysis-type');
     if (analysis) analysis.addEventListener('change', () => {
@@ -2958,6 +3514,7 @@
       restoreWorkflowState(hit);
       updateProjectSummary();
       updateJourney();
+      refreshCandidateEvaluation(hit.path);
     }
     return !!hit;
   }
@@ -2971,6 +3528,7 @@
       restoreWorkflowState(hit);
       updateProjectSummary();
       updateJourney();
+      refreshCandidateEvaluation(hit.path);
     }
   }
 

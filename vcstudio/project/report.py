@@ -147,13 +147,17 @@ def render_html(rows: list, summary: dict, *, title: str = 'VASP 批量运行报
         for r in rows)
 
     def de_color(v):
-        """ΔE 颜色语义(原版口径):< -3 强吸附(绿)、> 0 不利(红)、其余默认。"""
+        """ΔE 颜色语义:< -3 过强警戒(橙红)、> 0 不利(红)、其余默认。
+
+        更负的吸附能不等于更好的催化性能；把过强吸附画成“成功绿”会违背
+        Sabatier 初筛口径，并可能掩盖 Li2S 产物陷阱。
+        """
         if not isinstance(v, (int, float)):
             return ''
         if v > 0:
             return 'color:#b91c1c;font-weight:600'
         if v < -3:
-            return 'color:#15803d;font-weight:600'
+            return 'color:#c2410c;font-weight:600'
         return ''
 
     de_section = ''

@@ -1411,9 +1411,11 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <div class="pj-project-summary" id="pj-project-summary">正在读取项目…</div>
       <div class="actions" style="margin-bottom:12px">
         <button class="btn primary" id="pj-delta" disabled>刷新并计算 ΔE</button>
-        <button class="btn" id="pj-report" disabled>生成 HTML + Word + PDF 报告</button>
+        <button class="btn" id="pj-report" disabled>生成 HTML / Word / PDF 报告</button>
         <button class="btn quiet" id="pj-csv" disabled>导出 ΔE CSV</button>
       </div>
+      <div id="pj-candidate-evaluation" class="pj-candidate-card" hidden aria-live="polite"></div>
+      <div id="pj-report-files" class="pj-report-output" aria-live="polite"></div>
       <div id="pj-table"></div>
     </div>
 
@@ -1551,16 +1553,30 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
         <button class="btn primary" id="pj-figs">生成所选图</button>
       </div>
 
-      <div class="pj-lbl" style="margin:10px 0 6px">多催化剂项目对比(每个物种取最稳构型；5 组以上仍叠加在同一台阶图):</div>
+      <div class="pj-lbl" style="margin:10px 0 6px">多催化剂项目对比(每个物种取最稳构型；选择会保留；5 组以上仍叠加在同一台阶图):</div>
+      <div class="pj-compare-toolbar">
+        <div class="actions">
+          <button class="btn quiet" type="button" id="fig-select-all">全选</button>
+          <button class="btn quiet" type="button" id="fig-select-comparable">仅选可比较</button>
+          <button class="btn quiet" type="button" id="fig-select-clear">清空</button>
+        </div>
+        <div class="pj-selection-summary" id="fig-selection-summary" aria-live="polite">
+          <span>已选 <b>0</b></span><span>有效 <b>0</b></span>
+          <span>阻断 <b>0</b></span><span>可叠加台阶 <b>0</b></span>
+        </div>
+      </div>
       <div id="fig-projlist" class="pj-figprojs">(先点上方「刷新」载入项目)</div>
+      <div id="fig-compare-status" class="pj-compare-status" aria-live="polite"></div>
       <div class="pj-figrow" style="margin-top:8px">
         <label><input type="checkbox" id="fig-heatmap" checked> 吸附能热图</label>
-        <label><input type="checkbox" id="fig-cmp-ladder" checked> 多催化剂 ΔG 台阶图</label>
+        <label><input type="checkbox" id="fig-compare-ladder" checked> 多催化剂 ΔG 台阶图</label>
         <label><input type="checkbox" id="fig-scaling"> 标度关系(拟合+R²)</label>
         <label><input type="checkbox" id="fig-volcano"> 火山图(Sabatier 峰顶)</label>
         <label><input type="checkbox" id="fig-cmp-report" checked> Word + PDF 对比报告</label>
         <button class="btn primary" id="pj-cmpfigs">生成对比图与报告</button>
+        <button class="btn" id="pj-batch-report">生成批次 HTML / Word / PDF 报告</button>
       </div>
+      <div id="pj-batch-files" class="pj-report-output" aria-live="polite"></div>
     </div>
 
     <!-- 一键成稿包(Draft-Ready 收尾流水线) -->
