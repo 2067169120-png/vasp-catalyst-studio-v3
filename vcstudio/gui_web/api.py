@@ -12,7 +12,6 @@ import base64
 import binascii
 import copy
 import hashlib
-import inspect
 import json
 import math
 import os
@@ -24,6 +23,7 @@ import time
 import types
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, fields as dc_fields
+from datetime import datetime, timezone
 
 # 合法计算类型(决定 KPOINTS 网格);前端下拉与后端都以此为准
 _CALC_TYPES = ('slab', 'bulk', 'molecule')
@@ -34,6 +34,20 @@ _STAGES = ('generate', 'submit', 'monitor', 'recover', 'analysis', 'report_done'
 # 活跃(在队/在跑)状态与可续算终态:pipeline_tick/status 复用
 _ACTIVE_STATES = ('UPLOADED', 'SUBMITTED', 'QUEUED', 'RUNNING')
 _TERMINAL_FAIL = ('FAILED', 'UNCONVERGED')
+_REPORT_KINDS = frozenset({'final', 'diagnostic', 'draft'})
+_REPORT_FORMATS = ('html', 'docx', 'pdf')
+_REPORT_QUALIFICATIONS = frozenset({
+    'diagnostic',
+    'adsorption_result_verified',
+    'thermodynamic_path_verified',
+    'kinetic_evidence_verified',
+    'publication_package_verified',
+    'human_scientific_reviewed',
+})
+
+
+class _ReportInputChanged(RuntimeError):
+    """Raised when report inputs change between snapshot and marker commit."""
 
 # SAC 矩阵机时粗估系数(核时·原子⁻¹·作业⁻¹,数量级参考,可解释:Σ原子数 × 系数)
 _SAC_EST_COEF = 0.8
@@ -350,6 +364,9 @@ class Api:
         # pywebview 可并发调用同一个 js_api；后端锁才是自动托管的正确性边界。
         # 前端的 running 标志只负责交互，不能阻止两条线程同时续算/出报告。
         self._pipeline_lock = threading.Lock()
+        # 报告渲染可持续数分钟；marker 提交必须串行重载当前项目并执行 CAS，
+        # 不能把渲染前的旧 project dict 覆盖回 project.yaml。
+        self._report_marker_lock = threading.RLock()
         self._pipeline_supervisor_cls = pipeline_supervisor_cls
         self._pipeline_supervisor = None
         self._pipeline_runtime_lock = threading.RLock()
@@ -3122,26 +3139,25 @@ class Api:
                         eligible, reason = self._final_report_gate(
                             result['project'], summary)
                         report_dir = os.path.join(project_root, 'report')
-                        report_name = (f'{name}_report.html' if eligible
-                                       else f'{name}_diagnostic.html')
-                        generated = self.proj_report(
-                            project_path, os.path.join(report_dir, report_name),
-                            final=eligible)
+                        report_formats = self._available_report_formats()
+                        generated = self.proj_report_bundle(
+                            project_path, report_dir,
+                            report_formats, final=True,
+                            stem=f'{name}_吸附能评估报告')
                         result['auto_report'] = generated
-                        if not eligible:
-                            result['auto_report_reason'] = reason
+                        actual_kind = str(
+                            generated.get('scientific_status')
+                            or generated.get('kind') or '').strip().lower()
+                        actual_reason = str(
+                            generated.get('gate_reason') or reason or '')
+                        if actual_kind != 'final':
+                            result['auto_report_reason'] = actual_reason
                             if generated.get('ok'):
-                                try:
-                                    result['auto_report_blocked'] = (
-                                        self._persist_blocked_report_marker(
-                                            result['project'], summary, reason,
-                                            generated.get('files')
-                                            or [generated.get('file')]))
-                                except Exception as marker_exc:  # noqa: BLE001 报告本体仍有效
-                                    generated['marker_error'] = str(marker_exc)
+                                # Compatibility response key; the canonical
+                                # diagnostic record now lives at autopilot_report.
+                                result['auto_report_blocked'] = generated.get('marker')
                 except Exception as exc:                 # noqa: BLE001 导入成功不因报告降级而回滚
-                    result['auto_report'] = {
-                        'ok': False, 'file': None, 'files': [], 'error': str(exc)}
+                    result['auto_report'] = self._report_failure_envelope(exc)
             result.setdefault('ok', True)
             result.setdefault('imported', [])
             result.setdefault('summary', {})
@@ -3318,67 +3334,109 @@ class Api:
             return {'ok': False, 'file': None, 'error': str(e)}
 
     def proj_report(self, path, save_to, final=False):
-        """生成同源 HTML、Word 和 PDF；最终报告会立即写入哈希绑定标记。"""
+        """Compatibility adapter for the canonical one-snapshot report bundle.
+
+        The historical API accepts one HTML filename and returns ``files`` as a
+        list.  Generation, validation, and marker persistence must nevertheless
+        use :meth:`proj_report_bundle`; keeping a second renderer here would let
+        old callers bypass the canonical contract chain.
+        """
+        out = str(save_to or '').strip()
+        if not out:
+            return {'ok': False, 'file': None, 'files': [],
+                    'kind': None, 'scientific_status': None, 'marker': None,
+                    'error': '未指定报告路径'}
         try:
-            proj = self._adsorption.load_project((path or '').strip())
-            if proj is None:
-                return {'ok': False, 'file': None, 'files': [],
-                        'error': '项目不存在或 project.yaml 已被移动'}
-            out = (save_to or '').strip()
-            if not out:
-                return {'ok': False, 'file': None, 'files': [],
-                        'error': '未指定报告路径'}
-            if not self._rf()._member_dirs(proj):
-                return {'ok': False, 'file': None, 'files': [],
-                        'error': '项目无成员作业'}
-            summary = None
-            if final:
-                summary = self._adsorption.delta_e_rows(proj)
-                eligible, reason = self._final_report_gate(proj, summary)
-                if not eligible:
-                    return {'ok': False, 'file': None, 'files': [],
-                            'error': f'最终吸附能报告门禁未通过：{reason}'}
-            try:
-                cfg = self._config.load_config()
-            except Exception:                             # noqa: BLE001
-                cfg = {}
-            generator = self._rf().generate_project_report
-            parameters = inspect.signature(generator).parameters
-            kwargs = {'config': cfg}
-            if ('report_status' in parameters
-                    or any(p.kind == inspect.Parameter.VAR_KEYWORD
-                           for p in parameters.values())):
-                kwargs['report_status'] = 'final' if final else 'diagnostic'
-            result = generator(proj, out, **kwargs)
-            primary = str(result)
-            bundle_fn = getattr(self._rf(), 'report_bundle_paths', None)
-            if callable(bundle_fn):
-                files = [str(item) for item in bundle_fn(primary)]
-            else:
-                candidates = [primary]
-                stem, _ext = os.path.splitext(primary)
-                candidates.extend([stem + '.docx', stem + '.pdf'])
-                files = [item for item in candidates if os.path.isfile(item)]
-            if not primary or (final and not os.path.isfile(primary)):
-                return {'ok': False, 'file': None, 'files': [],
-                        'error': '报告生成器未产出 HTML 主文件'}
-            if not files:
-                files = [primary]
-            if final:
-                summary = summary or self._adsorption.delta_e_rows(proj)
-                marker = self._persist_report_marker(proj, summary, files)
-            else:
-                marker = None
-            return {'ok': True, 'file': primary, 'files': files,
-                    'marker': marker, 'error': None}
+            requested_path = os.path.abspath(os.path.normpath(out))
+            out_dir = os.path.dirname(requested_path) or os.getcwd()
+            stem = os.path.splitext(os.path.basename(requested_path))[0]
+            bundle = self.proj_report_bundle(
+                path, out_dir, formats=('html',), final=bool(final), stem=stem)
+            bundle_files = (bundle.get('files')
+                            if isinstance(bundle.get('files'), dict) else {})
+            primary = str(bundle_files.get('html') or '') or None
+            ok = bool(bundle.get('ok')) and bool(primary)
+            error = bundle.get('error')
+            if bundle.get('ok') and not primary:
+                ok = False
+                error = error or '报告生成器未产出 HTML 主文件'
+            return {
+                'ok': ok,
+                'file': primary if ok else None,
+                'files': [primary] if primary else [],
+                'kind': bundle.get('kind'),
+                'scientific_status': bundle.get('scientific_status')
+                or bundle.get('kind'),
+                'scientific_qualification': bundle.get(
+                    'scientific_qualification'),
+                'artifact_status': bundle.get('artifact_status'),
+                'gate_reason': bundle.get('gate_reason') or '',
+                'marker': bundle.get('marker'),
+                'error': None if ok else (error or '报告生成失败'),
+            }
         except Exception as e:                            # noqa: BLE001
-            return {'ok': False, 'file': None, 'files': [], 'error': str(e)}
+            return {'ok': False, 'file': None, 'files': [],
+                    'kind': None, 'scientific_status': None, 'marker': None,
+                    'error': str(e)}
 
     @staticmethod
     def _safe_report_stem(value) -> str:
         """Filesystem-safe, readable report stem (also valid on Windows)."""
         stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', '_', str(value or 'report')).strip(' ._')
         return (stem or 'report')[:96]
+
+    @staticmethod
+    def _normalize_report_formats(formats) -> tuple[str, ...]:
+        """Normalize an explicit report-format request without treating [] as default."""
+        values = _REPORT_FORMATS if formats is None else formats
+        if isinstance(values, str):
+            values = (values,)
+        try:
+            raw = tuple(values)
+        except TypeError as exc:
+            raise TypeError('报告 formats 必须为字符串序列') from exc
+        if not raw:
+            raise ValueError('至少选择一种报告格式')
+        normalized = []
+        for value in raw:
+            fmt = str(value or '').strip().lower()
+            if fmt not in _REPORT_FORMATS:
+                raise ValueError(
+                    f'不支持的报告格式 {value!r}；可选值为 html、docx、pdf')
+            if fmt not in normalized:
+                normalized.append(fmt)
+        if not normalized:
+            raise ValueError('至少选择一种报告格式')
+        return tuple(normalized)
+
+    @staticmethod
+    def _report_failure_envelope(error, *, kind=None, qualification=None,
+                                 gate_reason='', artifact_status='failed',
+                                 preserve_artifact=False, files=None, **extra):
+        """Stable artifact/science axes for every canonical bundle failure."""
+        actual_kind = str(kind or '').strip().lower() or None
+        if actual_kind not in _REPORT_KINDS:
+            actual_kind = None
+        has_unrecorded_artifact = bool(preserve_artifact and actual_kind)
+        actual_qualification = str(qualification or '').strip().lower() or None
+        if actual_qualification not in _REPORT_QUALIFICATIONS:
+            actual_qualification = None
+        result = {
+            'ok': False,
+            'kind': actual_kind if has_unrecorded_artifact else None,
+            'artifact_status': str(artifact_status or 'failed'),
+            'scientific_status': actual_kind if has_unrecorded_artifact else None,
+            'scientific_qualification': (
+                actual_qualification if has_unrecorded_artifact else None),
+            'publication_gate_status': 'unknown',
+            'desired_report_kind': None,
+            'gate_reason': str(gate_reason or ''),
+            'marker': None,
+            'files': (dict(files or {}) if has_unrecorded_artifact else {}),
+            'error': str(error or '报告生成失败'),
+        }
+        result.update(extra)
+        return result
 
     @staticmethod
     def _json_safe_report_result(value):
@@ -3586,8 +3644,206 @@ class Api:
                 })
         return blocks
 
+    @staticmethod
+    def _portable_member_id(job_dir, project_root, index, manifest=None):
+        """Return a stable logical member id without assuming one Windows drive."""
+        manifest = manifest if isinstance(manifest, dict) else {}
+        job_uuid = str(manifest.get('job_uuid') or '').strip()
+        if job_uuid:
+            return job_uuid
+        absolute = os.path.abspath(os.path.normpath(str(job_dir)))
+        try:
+            relative = os.path.relpath(absolute, project_root).replace('\\', '/')
+        except ValueError:
+            relative = ''
+        if not relative or relative == '..' or relative.startswith('../'):
+            base = os.path.basename(absolute) or 'member'
+            relative = f'{base}:{index}'
+        return relative
+
+    @staticmethod
+    def _semantic_without_locators(value):
+        """Remove navigation-only paths from a scientific fingerprint payload."""
+        if isinstance(value, dict):
+            result = {}
+            for key, item in value.items():
+                lowered = str(key).lower()
+                if (lowered in {'path', 'root', 'dir', 'directory', 'locator',
+                                'source_job', 'display_name'}
+                        or lowered.endswith(('_path', '_dir', '_locator'))):
+                    continue
+                result[str(key)] = Api._semantic_without_locators(item)
+            return result
+        if isinstance(value, (list, tuple)):
+            return [Api._semantic_without_locators(item) for item in value]
+        return value
+
+    def _project_report_contracts(self, proj, project_path, summary, fed, *,
+                                  requested_kind, report_kind, formats,
+                                  eligible_final, gate_reason,
+                                  report_model_sha256):
+        """Freeze the report request, scientific snapshot and gate decision."""
+        from vcstudio.project.report_contracts import (
+            ClaimRecord,
+            ReportSnapshot,
+            ReportSpec,
+            ValidationCheck,
+            ValidationResult,
+            validate_bindings,
+        )
+
+        generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        project_id = str(proj.get('project_uuid') or proj.get('name') or 'project')
+        input_fingerprint = self._report_scientific_fingerprint(proj, summary)
+        member_dirs = self._project_member_dirs(proj)
+        project_root = os.path.abspath(os.path.normpath(str(
+            proj.get('root') or os.path.dirname(str(project_path)))))
+        resolved_jobs = []
+        for index, path in enumerate(member_dirs, 1):
+            manifest = self._manifest.load_manifest(path) or {}
+            resolved_jobs.append(self._portable_member_id(
+                path, project_root, index, manifest))
+        spec = ReportSpec(
+            requested_kind=requested_kind,
+            audience='researcher',
+            locale='zh-CN',
+            formats=tuple(formats),
+            scope={
+                'kind': 'project',
+                'project_ids': [project_id],
+                'job_ids': resolved_jobs,
+            },
+            policy_refs=({
+                'id': 'project-final-report-gate',
+                'version': '1',
+            },),
+            created_at_utc=generated_at,
+        )
+        project_locator = os.path.abspath(os.path.normpath(str(project_path)))
+        if os.path.isdir(project_locator):
+            project_locator = os.path.join(project_locator, 'project.yaml')
+        source = {
+            'source_id': f'project:{project_id}',
+            'kind': 'project_scientific_projection',
+            'schema': 'vcstudio.report-project-projection/v1',
+            'locator': project_locator,
+            # Bind the path-independent scientific projection, not raw
+            # project.yaml, which also contains report/runtime state.
+            'sha256': input_fingerprint,
+        }
+        snapshot = ReportSnapshot(
+            spec_sha256=spec.semantic_sha256,
+            input_fingerprint=input_fingerprint,
+            created_at_utc=generated_at,
+            resolved_scope={
+                'project_ids': [project_id],
+                'job_ids': resolved_jobs,
+            },
+            sources=(source,),
+            payload={
+                'project': {
+                    'project_id': project_id,
+                    'name': str(proj.get('name') or ''),
+                },
+                'adsorption_summary': self._report_scientific_payload(proj, summary),
+                'free_energy_path': self._json_safe_report_result(fed or {}),
+            },
+            evidence={
+                'final_report_gate': {
+                    'eligible': bool(eligible_final),
+                    'reason': str(gate_reason or ''),
+                },
+                'method_consistency': self._json_safe_report_result(
+                    (summary or {}).get('method_consistency') or {}),
+                'method_confirmation': self._json_safe_report_result(
+                    self._method_confirmation(proj)),
+            },
+        )
+        gate_check = ValidationCheck(
+            id='adsorption-result-delivery-gate',
+            status='pass' if eligible_final else 'fail',
+            severity='blocking',
+            required=True,
+            message=(
+                '参考态、吸附能与方法证据满足吸附结果交付门槛。'
+                if eligible_final else str(gate_reason or '最终报告门禁未通过')
+            ),
+            evidence_refs=('snapshot:evidence/final_report_gate',),
+            remediation=(None if eligible_final else
+                         '补齐参考态、有效 ΔE 与方法一致性证据后重新验证。'),
+        )
+        has_path = bool(fed and fed.get('steps'))
+        path_check = ValidationCheck(
+            id='thermodynamic-path-coverage',
+            status='pass' if has_path else 'warn',
+            severity='warning',
+            required=False,
+            message=('已包含配平反应路径的自由能台阶。' if has_path else
+                     '未包含完整自由能台阶；不得据此声称动力学或完整热力学结论。'),
+            evidence_refs=('snapshot:payload/free_energy_path',),
+        )
+        qualification = ('adsorption_result_verified'
+                         if report_kind == 'final' else 'diagnostic')
+        validation_status = ('passed_with_warnings'
+                             if eligible_final and not has_path
+                             else 'passed' if eligible_final else 'blocked')
+        claim = ClaimRecord(
+            id='claim.adsorption.delivery',
+            text=('本报告中的吸附能结果通过声明的交付门禁。'
+                  if report_kind == 'final' else
+                  '当前报告仅记录可用数据与阻断原因，不构成最终科学结论。'),
+            qualification=qualification,
+            status='supported' if report_kind == 'final' else 'limited',
+            evidence_refs=('check:adsorption-result-delivery-gate',),
+        )
+        validation = ValidationResult(
+            spec_sha256=spec.semantic_sha256,
+            snapshot_sha256=snapshot.semantic_sha256,
+            validated_at_utc=generated_at,
+            validator={
+                'id': 'project-final-report-gate',
+                'version': '1',
+            },
+            status=validation_status,
+            effective_kind=report_kind,
+            final_allowed=bool(report_kind == 'final' and eligible_final),
+            scientific_qualification=qualification,
+            claim_ceiling='electronic_adsorption_screen',
+            report_model_sha256=report_model_sha256,
+            checks=(gate_check, path_check),
+            claims=(claim,),
+        )
+        validate_bindings(spec, snapshot, validation)
+        return {
+            'report_id': f'{project_id}-{input_fingerprint[:16]}-{report_kind}',
+            'input_fingerprint': input_fingerprint,
+            'scientific_qualification': qualification,
+            'claim_ceiling': validation.claim_ceiling,
+            'preset_id': spec.preset_id,
+            'report_spec': spec.to_dict(),
+            'report_snapshot': snapshot.to_dict(),
+            'validation': validation.to_dict(),
+            'claims': [item.to_dict() for item in validation.claims],
+            'contract_refs': {
+                'spec': {'schema': spec.schema, 'sha256': spec.semantic_sha256},
+                'snapshot': {
+                    'schema': snapshot.schema,
+                    'sha256': snapshot.semantic_sha256,
+                    'input_fingerprint': input_fingerprint,
+                },
+                'validation': {
+                    'schema': validation.schema,
+                    'sha256': validation.semantic_sha256,
+                    'status': validation.status,
+                    'final_allowed': validation.final_allowed,
+                    'report_model_sha256': validation.report_model_sha256,
+                },
+            },
+        }
+
     def _project_report_model(self, proj, summary, fed, *, report_kind='final',
-                              figures=None, comparison_context=None):
+                              figures=None, comparison_context=None,
+                              report_contracts=None):
         """Build the single source of truth consumed by HTML/DOCX/PDF renderers."""
         evaluation = self._candidate_eval().evaluate_candidate(
             summary, project=proj, fed=fed)
@@ -3646,12 +3902,15 @@ class Api:
                 '反应台阶已叠加 ZPE−TS 热校正。'
                 if fed.get('thermo_corrected')
                 else '反应台阶当前为未叠加 ZPE−TS 的电子能口径。')
-        return {
+        model = {
             'schema': 'vcstudio.research-report/v1',
             'locale': 'zh-CN',
             'title': f'{proj.get("name") or "催化剂"} 吸附能与反应路径评估',
-            'subtitle': ('锂硫电池正极催化材料第一性原理筛选报告'
-                         if report_kind == 'final' else '诊断报告：证据尚未满足最终结论门槛'),
+            'subtitle': (
+                '锂硫电池正极催化材料第一性原理筛选报告'
+                if report_kind == 'final' else
+                '研究草稿：内容与证据仍可继续编辑' if report_kind == 'draft' else
+                '诊断报告：证据尚未满足最终结论门槛'),
             'kicker': 'VASP CATALYST STUDIO · RESEARCH REPORT',
             'report_kind': report_kind,
             'metadata': {
@@ -3681,6 +3940,21 @@ class Api:
             'recommendations': self._recommendation_blocks([evaluation]),
             'comparison_context': comparison_context or {},
         }
+        if report_contracts:
+            model.update(self._json_safe_report_result(report_contracts))
+        else:
+            # Legacy direct callers remain renderable, but the explicit
+            # qualification prevents the renderer from inferring science state
+            # from a subtitle or filename.
+            model.update({
+                'scientific_qualification': (
+                    'adsorption_result_verified' if report_kind == 'final'
+                    else 'diagnostic'),
+                'claim_ceiling': decision.get('claim_ceiling') or
+                                 evidence.get('level') or
+                                 'electronic_adsorption_screen',
+            })
+        return model
 
     def _project_report_figures(self, proj, summary, fed, out_dir):
         """Generate report figures from the same selected rows/fed snapshot."""
@@ -3731,54 +4005,352 @@ class Api:
             })
         return figures, files
 
-    def proj_report_bundle(self, path, out_dir, formats=None, final=True, stem=None):
+    def proj_report_capabilities(self):
+        """Expose report-format dependencies before the user starts a long render."""
+        def _fallback(reason):
+            detail = str(reason or '报告格式能力探测不可用')
+            return {
+                'ok': True,
+                'probe_ok': False,
+                'degraded': True,
+                'schema': 'vcstudio.paper-report.capabilities/v1',
+                'formats': {
+                    'html': {'available': True, 'reason': ''},
+                    'docx': {'available': False, 'reason': detail},
+                    'pdf': {'available': False, 'reason': detail},
+                },
+                'error': detail,
+            }
+
+        try:
+            probe = getattr(self._paper(), 'report_capabilities', None)
+            if not callable(probe):
+                return _fallback('报告格式能力探测器缺失；仅启用核心 HTML')
+            raw = self._json_safe_report_result(probe())
+            if not isinstance(raw, dict):
+                return _fallback('报告格式能力探测返回无效结果；仅启用核心 HTML')
+            declared = raw.get('formats')
+            if not isinstance(declared, dict):
+                return _fallback('报告格式能力探测缺少 formats；仅启用核心 HTML')
+            normalized = {}
+            for fmt in _REPORT_FORMATS:
+                record = declared.get(fmt)
+                if not isinstance(record, dict):
+                    normalized[fmt] = {
+                        'available': fmt == 'html',
+                        'reason': ('' if fmt == 'html' else
+                                   f'能力探测未返回 {fmt} 状态'),
+                    }
+                    continue
+                available = record.get('available') is True
+                reason = str(record.get('reason') or '')
+                if not available and not reason:
+                    reason = f'{fmt} 报告依赖不可用或状态未知'
+                normalized[fmt] = {'available': available, 'reason': reason}
+            result = dict(raw)
+            result.update({
+                'ok': True,
+                'probe_ok': True,
+                'degraded': not all(
+                    normalized[fmt]['available'] for fmt in _REPORT_FORMATS),
+                'formats': normalized,
+                'error': None,
+            })
+            return result
+        except Exception as e:                            # noqa: BLE001
+            return _fallback(f'报告格式能力探测失败：{e}；仅启用核心 HTML')
+
+    def _available_report_formats(self) -> tuple[str, ...]:
+        """Select every proven-available auto format; HTML is the hard baseline."""
+        capabilities = self.proj_report_capabilities()
+        declared = capabilities.get('formats') or {}
+        html = declared.get('html') if isinstance(declared, dict) else None
+        if not isinstance(html, dict) or html.get('available') is not True:
+            reason = (str((html or {}).get('reason') or '')
+                      if isinstance(html, dict) else '')
+            raise RuntimeError(reason or 'HTML 报告能力不可用，无法生成自动报告')
+        return tuple(
+            fmt for fmt in _REPORT_FORMATS
+            if isinstance(declared.get(fmt), dict)
+            and declared[fmt].get('available') is True
+        )
+
+    def proj_report_status(self, path):
+        """Return canonical marker freshness; report-file mtime is never evidence."""
+        project_path = str(path or '').strip()
+        if not project_path:
+            return {
+                'schema': 'vcstudio.report-status/v1',
+                'ok': False,
+                'path': '',
+                'artifact_status': 'missing',
+                'artifact_current': False,
+                'has_marker': False,
+                'scientific_status': None,
+                'scientific_qualification': None,
+                'scientific_stale': False,
+                'eligible_final': False,
+                'publication_gate_status': 'unknown',
+                'desired_report_kind': None,
+                'report_reason': '',
+                'files': {},
+                'error': '未指定项目路径',
+            }
+        try:
+            project = self._adsorption.load_project(project_path)
+            if project is None:
+                raise FileNotFoundError('项目不存在或 project.yaml 已被移动')
+            summary = self._adsorption.delta_e_rows(project)
+            status = self._canonical_report_status(project, summary)
+            status.update({'ok': True, 'path': project_path, 'error': None})
+            return status
+        except Exception as exc:                          # noqa: BLE001
+            return {
+                'schema': 'vcstudio.report-status/v1',
+                'ok': False,
+                'path': project_path,
+                'artifact_status': 'missing',
+                'artifact_current': False,
+                'has_marker': False,
+                'scientific_status': None,
+                'scientific_qualification': None,
+                'scientific_stale': False,
+                'eligible_final': False,
+                'publication_gate_status': 'unknown',
+                'desired_report_kind': None,
+                'report_reason': '',
+                'files': {},
+                'error': str(exc),
+            }
+
+    def proj_report_bundle(self, path, out_dir, formats=None, final=True, stem=None,
+                           record_artifact=True, requested_kind=None):
         """Generate a thesis-style HTML + DOCX + PDF bundle from one data snapshot.
 
         A failed final-result gate produces an explicit diagnostic report instead
         of silently skipping the request or pretending the result is final.
         """
+        report_kind = None
+        qualification = None
+        reason = ''
+        eligible = None
         try:
+            wanted = self._normalize_report_formats(formats)
+            requested = (('final' if bool(final) else 'diagnostic')
+                         if requested_kind is None else
+                         str(requested_kind or '').strip().lower())
+            if requested not in _REPORT_KINDS:
+                raise ValueError(
+                    'requested_kind 必须为 final、diagnostic 或 draft')
             proj = self._adsorption.load_project((path or '').strip())
             if proj is None:
-                return {'ok': False, 'kind': None, 'files': {},
-                        'error': '项目不存在或 project.yaml 已被移动'}
+                return self._report_failure_envelope(
+                    '项目不存在或 project.yaml 已被移动')
             target = os.path.abspath(os.path.normpath(str(out_dir or '').strip()))
             if not str(out_dir or '').strip():
-                return {'ok': False, 'kind': None, 'files': {}, 'error': '未指定报告目录'}
+                return self._report_failure_envelope('未指定报告目录')
             os.makedirs(target, exist_ok=True)
             summary = self._adsorption.delta_e_rows(proj)
             eligible, reason = self._final_report_gate(proj, summary)
-            report_kind = 'final' if bool(final) and eligible else 'diagnostic'
+            report_kind = ('final' if requested == 'final' and eligible else
+                           'draft' if requested == 'draft' else 'diagnostic')
+            qualification = ('adsorption_result_verified'
+                             if report_kind == 'final' else 'diagnostic')
             fed, fed_reason = self._proj_fed(proj, summary)
+            frozen_input_fingerprint = self._report_input_fingerprint(proj, summary)
+            frozen_project_id = str(
+                proj.get('project_uuid') or proj.get('name') or '')
             figure_dir = os.path.join(target, 'figures')
             figures, figure_files = self._project_report_figures(
                 proj, summary, fed, figure_dir)
             model = self._project_report_model(
                 proj, summary, fed, report_kind=report_kind, figures=figures)
+            model.update({
+                'scientific_qualification': (
+                    'adsorption_result_verified' if report_kind == 'final'
+                    else 'diagnostic'),
+                'claim_ceiling': 'electronic_adsorption_screen',
+            })
             if reason and report_kind == 'diagnostic':
                 model['limitations'] = [f'最终报告门禁未通过：{reason}',
                                         *model.get('limitations', [])]
             if fed_reason:
                 model['limitations'] = [f'自由能台阶未生成：{fed_reason}',
                                         *model.get('limitations', [])]
-            wanted = tuple(str(value).lower() for value in
-                           (formats or ('html', 'docx', 'pdf')))
+            content_hasher = getattr(self._paper(), 'report_content_sha256', None)
+            if not callable(content_hasher):
+                from vcstudio.project.paper_report import report_content_sha256
+
+                content_hasher = report_content_sha256
+            report_model_sha256 = str(content_hasher(model)).lower()
+            contracts = self._project_report_contracts(
+                proj, path, summary, fed,
+                requested_kind=requested,
+                report_kind=report_kind,
+                formats=wanted,
+                eligible_final=eligible,
+                gate_reason=reason,
+                report_model_sha256=report_model_sha256,
+            )
+            model.update(self._json_safe_report_result(contracts))
+            frozen_scientific_fingerprint = contracts['input_fingerprint']
             safe_stem = self._safe_report_stem(
                 stem or f'{proj.get("name") or "project"}_吸附能评估报告')
             rendered = self._json_safe_report_result(
                 self._paper().render_report_bundle(
                     model, target, stem=safe_stem, formats=wanted))
             rendered.setdefault('ok', True)
+            rendered_files = (dict(rendered.get('files') or {})
+                              if isinstance(rendered.get('files'), dict) else {})
+            sidecar_files = (rendered.get('sidecar_files')
+                             if isinstance(rendered.get('sidecar_files'), dict)
+                             else {})
+            model_file = str(
+                rendered.get('model_file') or sidecar_files.get('model')
+                or rendered_files.get('model') or '')
+            missing_formats = [
+                fmt for fmt in wanted
+                if not rendered_files.get(fmt)
+                or not os.path.isfile(str(rendered_files.get(fmt)))
+            ]
+            renderer_kinds = {
+                str(rendered.get(field) or '').strip().lower()
+                for field in ('scientific_status', 'report_kind')
+                if str(rendered.get(field) or '').strip()
+            }
+            renderer_fingerprint = str(
+                rendered.get('input_fingerprint') or '').strip()
+            renderer_report_model_sha256 = str(
+                rendered.get('report_model_sha256') or '').strip().lower()
+            renderer_qualification = str(
+                rendered.get('scientific_qualification') or '').strip().lower()
+            render_error = str(rendered.get('error') or '').strip()
+            if rendered.get('ok') is False or render_error:
+                rendered['ok'] = False
+                rendered['artifact_status'] = 'failed'
+                rendered['error'] = render_error or '报告渲染器返回失败状态'
+            elif missing_formats:
+                rendered['ok'] = False
+                rendered['artifact_status'] = 'failed'
+                rendered['error'] = ('报告渲染器未产出所请求格式：'
+                                     + '、'.join(sorted(missing_formats)))
+            elif not model_file or not os.path.isfile(model_file):
+                rendered['ok'] = False
+                rendered['artifact_status'] = 'failed'
+                rendered['error'] = '报告渲染器未产出冻结 model sidecar'
+            elif renderer_kinds and renderer_kinds != {report_kind}:
+                rendered['ok'] = False
+                rendered['artifact_status'] = 'failed'
+                rendered['error'] = (
+                    f'报告渲染器科学状态不一致：预期 {report_kind}，'
+                    f'实际 {"、".join(sorted(renderer_kinds))}')
+            elif (renderer_qualification
+                  and renderer_qualification
+                  != str(contracts['scientific_qualification']).lower()):
+                rendered['ok'] = False
+                rendered['artifact_status'] = 'failed'
+                rendered['error'] = '报告渲染器科学资格与冻结验证不一致'
+            elif (renderer_fingerprint
+                  and renderer_fingerprint != frozen_scientific_fingerprint):
+                rendered['ok'] = False
+                rendered['artifact_status'] = 'failed'
+                rendered['error'] = '报告渲染器输入指纹与冻结快照不一致'
+            elif (renderer_report_model_sha256
+                  and renderer_report_model_sha256 != report_model_sha256):
+                rendered['ok'] = False
+                rendered['artifact_status'] = 'failed'
+                rendered['error'] = '报告渲染器正文指纹与冻结验证不一致'
+            marker = None
+            if record_artifact and rendered.get('ok') is not False:
+                marker_files = dict(rendered_files)
+                marker_files['model'] = model_file
+                contract_files = rendered.get('contract_files') or {}
+                if not isinstance(contract_files, dict):
+                    raise TypeError('报告渲染器 contract_files 必须为对象')
+                for key, value in contract_files.items():
+                    marker_files[f'contract_{key}'] = value
+                if rendered.get('manifest'):
+                    marker_files.setdefault('manifest', rendered.get('manifest'))
+                try:
+                    marker = self._persist_report_marker(
+                        proj, summary, marker_files,
+                        kind=report_kind,
+                        reason=reason,
+                        figures_dir=figure_dir,
+                        model_sha256=rendered.get('model_sha256'),
+                        report_model_sha256=rendered.get('report_model_sha256'),
+                        contracts=(rendered.get('contracts')
+                                   or contracts.get('contract_refs') or {}),
+                        scientific_qualification=(
+                            contracts.get('scientific_qualification') or 'diagnostic'),
+                        manifest=rendered.get('manifest'),
+                        project_path=path,
+                        expected_input_fingerprint=frozen_input_fingerprint,
+                        expected_scientific_fingerprint=frozen_scientific_fingerprint,
+                        expected_project_id=frozen_project_id,
+                    )
+                except _ReportInputChanged as marker_exc:
+                    rendered['ok'] = False
+                    rendered['marker_error'] = str(marker_exc)
+                    rendered['artifact_status'] = 'generated_unrecorded'
+                    rendered['stale_input'] = True
+                    rendered['error'] = str(marker_exc)
+                except Exception as marker_exc:          # noqa: BLE001
+                    rendered['ok'] = False
+                    rendered['marker_error'] = str(marker_exc)
+                    rendered['artifact_status'] = 'generated_unrecorded'
+                    rendered['error'] = str(marker_exc)
             rendered.update({
                 'kind': report_kind,
+                'scientific_status': report_kind,
+                'scientific_qualification': contracts['scientific_qualification'],
+                'requested_kind': requested,
                 'eligible_final': eligible,
+                'publication_gate_status': (
+                    'eligible' if eligible else 'blocked'),
+                'desired_report_kind': ('final' if eligible else 'diagnostic'),
                 'gate_reason': reason,
                 'figures': figure_files,
+                'marker': marker,
                 'error': rendered.get('error'),
             })
+            if rendered.get('ok') is False:
+                generated_unrecorded = (
+                    rendered.get('artifact_status') == 'generated_unrecorded')
+                return self._report_failure_envelope(
+                    rendered.get('error'), kind=report_kind,
+                    qualification=contracts['scientific_qualification'],
+                    gate_reason=reason,
+                    artifact_status=rendered.get('artifact_status') or 'failed',
+                    preserve_artifact=generated_unrecorded,
+                    files=rendered_files,
+                    requested_kind=requested,
+                    eligible_final=eligible,
+                    publication_gate_status=(
+                        'eligible' if eligible else 'blocked'),
+                    desired_report_kind=('final' if eligible else 'diagnostic'),
+                    stale_input=bool(rendered.get('stale_input')),
+                    marker_error=rendered.get('marker_error'),
+                    manifest=(rendered.get('manifest')
+                              if generated_unrecorded else None),
+                    model_file=(model_file if generated_unrecorded else None),
+                    contract_files=(rendered.get('contract_files')
+                                    if generated_unrecorded else {}),
+                )
+            rendered.setdefault('artifact_status', 'complete')
             return rendered
         except Exception as e:                            # noqa: BLE001
-            return {'ok': False, 'kind': None, 'files': {}, 'error': str(e)}
+            gate_fields = ({
+                'publication_gate_status': (
+                    'eligible' if eligible else 'blocked'),
+                'desired_report_kind': ('final' if eligible else 'diagnostic'),
+            } if eligible is not None else {})
+            return self._report_failure_envelope(
+                e, kind=report_kind, qualification=qualification,
+                gate_reason=reason,
+                requested_kind=(str(requested_kind or '').strip().lower()
+                                or None),
+                **gate_fields)
 
     def _comparison_items(self, paths, preset_key=None):
         items = []
@@ -3876,21 +4448,167 @@ class Api:
             })
         return figures, files, skipped
 
+    def _comparison_report_contracts(self, snapshot, *, formats, requested_kind,
+                                     report_kind, preset_key=None,
+                                     report_model_sha256):
+        """Build the same versioned contract chain for a comparison report."""
+        from vcstudio.project.report_contracts import (
+            ClaimRecord,
+            ReportSnapshot,
+            ReportSpec,
+            ValidationCheck,
+            ValidationResult,
+            sha256_json,
+            validate_bindings,
+        )
+
+        generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        logical_projects = []
+        for index, project in enumerate(snapshot.get('projects') or [], 1):
+            stable_name = project.get('name') or f'project-{index}'
+            logical_projects.append({
+                'project_id': (project.get('project_uuid') or stable_name
+                               or f'project-{index}'),
+                'name': stable_name,
+                'status': project.get('status'),
+                'block_reasons': project.get('block_reasons') or [],
+                'warnings': project.get('warnings') or [],
+                'method_status': project.get('method_status'),
+                'method_signature': project.get('method_signature'),
+                'method_evidence': self._semantic_without_locators(
+                    project.get('method_evidence') or {}),
+                'species': project.get('species') or [],
+                'ladder': project.get('ladder') or {},
+            })
+        project_ids = [str(item['project_id']) for item in logical_projects]
+        scientific_payload = self._json_safe_report_result({
+            'schema': snapshot.get('schema'),
+            'preset_key': preset_key or '',
+            'ranking_deadband_eV': snapshot.get('ranking_deadband_eV'),
+            'projects': logical_projects,
+            'comparison_gate': snapshot.get('comparison_gate') or {},
+            'adsorption_matrix': snapshot.get('adsorption_matrix') or {},
+            'ladder': snapshot.get('ladder') or {},
+        })
+        scientific_fingerprint = sha256_json(scientific_payload)
+        spec = ReportSpec(
+            preset_id='multi-catalyst-comparison',
+            requested_kind=requested_kind,
+            audience='researcher',
+            locale='zh-CN',
+            formats=tuple(formats),
+            scope={
+                'kind': 'comparison',
+                'project_ids': project_ids,
+                'job_ids': [],
+            },
+            policy_refs=({
+                'id': 'multi-project-comparison-gate',
+                'version': '1',
+            },),
+            options={'preset_key': preset_key or ''},
+            created_at_utc=generated_at,
+        )
+        report_snapshot = ReportSnapshot(
+            spec_sha256=spec.semantic_sha256,
+            input_fingerprint=scientific_fingerprint,
+            created_at_utc=generated_at,
+            resolved_scope={'project_ids': project_ids, 'job_ids': []},
+            payload=scientific_payload,
+            evidence={'comparison_gate': snapshot.get('comparison_gate') or {}},
+        )
+        can_final = bool(snapshot.get('can_final_report'))
+        gate = snapshot.get('comparison_gate') or {}
+        gate_reason = '；'.join(gate.get('blocking') or gate.get('warnings') or [])
+        gate_check = ValidationCheck(
+            id='multi-project-comparison-gate',
+            status='pass' if can_final else 'fail',
+            severity='blocking',
+            required=True,
+            message=('项目数据、方法与自由能路径满足定量比较门槛。'
+                     if can_final else gate_reason or '跨项目比较门禁未通过'),
+            evidence_refs=('snapshot:evidence/comparison_gate',),
+            remediation=(None if can_final else
+                         '补齐项目内参考态、方法证据和同口径自由能路径后重试。'),
+        )
+        qualification = ('thermodynamic_path_verified'
+                         if report_kind == 'final' else 'diagnostic')
+        claim = ClaimRecord(
+            id='claim.comparison.delivery',
+            text=('所选项目满足声明的跨项目定量比较门槛。'
+                  if report_kind == 'final' else
+                  '当前比较仅用于诊断缺项，不支持定量排序结论。'),
+            qualification=qualification,
+            status='supported' if report_kind == 'final' else 'limited',
+            evidence_refs=('check:multi-project-comparison-gate',),
+        )
+        validation = ValidationResult(
+            spec_sha256=spec.semantic_sha256,
+            snapshot_sha256=report_snapshot.semantic_sha256,
+            validated_at_utc=generated_at,
+            validator={'id': 'multi-project-comparison-gate', 'version': '1'},
+            status='passed' if can_final else 'blocked',
+            effective_kind=report_kind,
+            final_allowed=bool(report_kind == 'final' and can_final),
+            scientific_qualification=qualification,
+            claim_ceiling='cross_project_thermodynamic_screen',
+            report_model_sha256=report_model_sha256,
+            checks=(gate_check,),
+            claims=(claim,),
+        )
+        validate_bindings(spec, report_snapshot, validation)
+        return {
+            'report_id': f'comparison-{scientific_fingerprint[:16]}-{report_kind}',
+            'input_fingerprint': scientific_fingerprint,
+            'scientific_qualification': qualification,
+            'claim_ceiling': validation.claim_ceiling,
+            'preset_id': spec.preset_id,
+            'report_spec': spec.to_dict(),
+            'report_snapshot': report_snapshot.to_dict(),
+            'validation': validation.to_dict(),
+            'claims': [item.to_dict() for item in validation.claims],
+            'contract_refs': {
+                'spec': {'schema': spec.schema, 'sha256': spec.semantic_sha256},
+                'snapshot': {
+                    'schema': report_snapshot.schema,
+                    'sha256': report_snapshot.semantic_sha256,
+                    'input_fingerprint': scientific_fingerprint,
+                },
+                'validation': {
+                    'schema': validation.schema,
+                    'sha256': validation.semantic_sha256,
+                    'status': validation.status,
+                    'final_allowed': validation.final_allowed,
+                    'report_model_sha256': validation.report_model_sha256,
+                },
+            },
+        }
+
     def proj_batch_report(self, paths, out_dir, preset_key=None, formats=None,
-                          include_individual=True, final=True):
+                          include_individual=True, final=True, requested_kind=None):
         """Generate N individual reports and one multi-catalyst comparison report."""
+        report_kind = None
+        qualification = None
+        gate_reason = ''
+        eligible = None
         try:
+            wanted = self._normalize_report_formats(formats)
+            requested = (('final' if bool(final) else 'diagnostic')
+                         if requested_kind is None else
+                         str(requested_kind or '').strip().lower())
+            if requested not in _REPORT_KINDS:
+                raise ValueError(
+                    'requested_kind 必须为 final、diagnostic 或 draft')
             target = os.path.abspath(os.path.normpath(str(out_dir or '').strip()))
             if not str(out_dir or '').strip():
-                return {'ok': False, 'kind': None, 'files': {},
-                        'error': '未指定批次报告目录'}
+                return self._report_failure_envelope('未指定批次报告目录')
             os.makedirs(target, exist_ok=True)
             items = self._comparison_items(paths, preset_key)
             snapshot = self._comparison_model().build_comparison_snapshot(
                 items, preset_key=preset_key)
             if snapshot.get('selected_count', 0) < 2:
-                return {'ok': False, 'kind': None, 'files': {},
-                        'error': '批次报告至少需要选择 2 个项目'}
+                return self._report_failure_envelope(
+                    '批次报告至少需要选择 2 个项目')
             figures, figure_files, skipped = self._comparison_figures(
                 snapshot, os.path.join(target, 'comparison_figures'))
             evaluations = []
@@ -3910,16 +4628,29 @@ class Api:
                     *[('—' if value is None else f'{value:.3f}') for value in values],
                 ])
             gate = snapshot.get('comparison_gate') or {}
-            report_kind = ('final' if bool(final) and snapshot.get('can_final_report')
-                           else 'diagnostic')
+            eligible = bool(snapshot.get('can_final_report'))
+            gate_reason = '；'.join(
+                gate.get('blocking') or gate.get('warnings') or [])
+            report_kind = ('final' if requested == 'final'
+                           and eligible else
+                           'draft' if requested == 'draft' else 'diagnostic')
+            qualification = ('thermodynamic_path_verified'
+                             if report_kind == 'final' else 'diagnostic')
             model = {
                 'schema': 'vcstudio.research-report/v1',
                 'locale': 'zh-CN',
                 'title': '多催化剂吸附能与自由能路径比较',
-                'subtitle': ('批次比较研究报告' if report_kind == 'final'
-                             else '诊断型批次报告：方法或路径证据尚未完全可比'),
+                'subtitle': (
+                    '批次比较研究报告' if report_kind == 'final' else
+                    '批次比较草稿：内容与证据仍可继续编辑'
+                    if report_kind == 'draft' else
+                    '诊断型批次报告：方法或路径证据尚未完全可比'),
                 'kicker': 'VASP CATALYST STUDIO · COMPARATIVE STUDY',
                 'report_kind': report_kind,
+                'scientific_qualification': (
+                    'thermodynamic_path_verified' if report_kind == 'final'
+                    else 'diagnostic'),
+                'claim_ceiling': 'cross_project_thermodynamic_screen',
                 'metadata': {
                     '已选项目': snapshot.get('selected_count'),
                     '可评价项目': snapshot.get('ready_count'),
@@ -3968,8 +4699,21 @@ class Api:
                 ],
                 'recommendations': self._recommendation_blocks(evaluations),
             }
-            wanted = tuple(str(value).lower() for value in
-                           (formats or ('html', 'docx', 'pdf')))
+            content_hasher = getattr(self._paper(), 'report_content_sha256', None)
+            if not callable(content_hasher):
+                from vcstudio.project.paper_report import report_content_sha256
+
+                content_hasher = report_content_sha256
+            report_model_sha256 = str(content_hasher(model)).lower()
+            contracts = self._comparison_report_contracts(
+                snapshot,
+                formats=wanted,
+                requested_kind=requested,
+                report_kind=report_kind,
+                preset_key=preset_key,
+                report_model_sha256=report_model_sha256,
+            )
+            model.update(self._json_safe_report_result(contracts))
             comparison_result = self._json_safe_report_result(
                 self._paper().render_report_bundle(
                     model, target, stem='多催化剂_批次比较报告', formats=wanted))
@@ -3989,15 +4733,35 @@ class Api:
                         serial += 1
                     used_stems.add(stem)
                     result = self.proj_report_bundle(
-                        source['path'], target, wanted, final=final, stem=stem)
+                        source['path'], target, wanted, final=final, stem=stem,
+                        record_artifact=False, requested_kind=requested)
                     individual.append({
                         'path': source['path'], 'name': project.get('name') or f'项目{index + 1}',
                         'kind': result.get('kind'), 'files': result.get('files') or {},
                         'ok': bool(result.get('ok')), 'error': result.get('error'),
                     })
+            if comparison_result.get('ok') is False or comparison_result.get('error'):
+                return self._report_failure_envelope(
+                    comparison_result.get('error') or '批次报告渲染失败',
+                    kind=report_kind, qualification=qualification,
+                    gate_reason=gate_reason, requested_kind=requested,
+                    publication_gate_status=(
+                        'eligible' if eligible else 'blocked'),
+                    desired_report_kind=('final' if eligible else 'diagnostic'))
             return {
-                'ok': bool(comparison_result.get('ok', True)),
+                'ok': True,
                 'kind': report_kind,
+                'artifact_status': str(
+                    comparison_result.get('artifact_status') or 'complete'),
+                'scientific_status': report_kind,
+                'scientific_qualification': qualification,
+                'gate_reason': gate_reason,
+                'publication_gate_status': (
+                    'eligible' if snapshot.get('can_final_report') else 'blocked'),
+                'desired_report_kind': (
+                    'final' if snapshot.get('can_final_report') else 'diagnostic'),
+                'marker': None,
+                'requested_kind': requested,
                 'files': {
                     'comparison': comparison_result.get('files') or {},
                     'individual': individual,
@@ -4011,7 +4775,17 @@ class Api:
                 'error': comparison_result.get('error'),
             }
         except Exception as e:                            # noqa: BLE001
-            return {'ok': False, 'kind': None, 'files': {}, 'error': str(e)}
+            gate_fields = ({
+                'publication_gate_status': (
+                    'eligible' if eligible else 'blocked'),
+                'desired_report_kind': ('final' if eligible else 'diagnostic'),
+            } if eligible is not None else {})
+            return self._report_failure_envelope(
+                e, kind=report_kind, qualification=qualification,
+                gate_reason=gate_reason,
+                requested_kind=(str(requested_kind or '').strip().lower()
+                                or None),
+                **gate_fields)
 
     # ── 论文级出图(原生 matplotlib 引擎,不依赖 Origin/POV-Ray) ────────────────
     @staticmethod
@@ -4949,13 +5723,24 @@ class Api:
         final, reason = self._final_report_gate(proj, summary)
         report_dir = os.path.join(root, 'report')
         suffix = 'report' if final else 'diagnostic'
-        out = os.path.join(report_dir, f'{name}_{suffix}.html')
-        result = self.proj_report(path, out, final=final)
+        try:
+            report_formats = self._available_report_formats()
+        except Exception as exc:                          # noqa: BLE001
+            return '报告尚未生成：' + str(exc)
+        result = self.proj_report_bundle(
+            path, report_dir, report_formats, final=True,
+            stem=f'{name}_{suffix}')
         if not result.get('ok'):
             return '报告尚未生成：' + str(result.get('error') or '未知错误')
-        files = result.get('files') or [result.get('file')]
-        heading = ('最终报告已生成：' if final else
-                   f'诊断报告已生成（未标记为最终报告：{reason}）：')
+        raw_files = result.get('files') or {}
+        files = (list(raw_files.values()) if isinstance(raw_files, dict)
+                 else list(raw_files))
+        actual_kind = str(
+            result.get('scientific_status') or result.get('kind') or ''
+        ).strip().lower()
+        actual_reason = str(result.get('gate_reason') or reason or '')
+        heading = ('最终报告已生成：' if actual_kind == 'final' else
+                   f'诊断报告已生成（未标记为最终报告：{actual_reason}）：')
         return heading + '\n' + '\n'.join(f'- {item}' for item in files if item)
 
     def ai_chat_send(self, session_id, text, attachment_ids=None):
@@ -5411,14 +6196,52 @@ class Api:
                     if proj is None:
                         continue
                     states = self._member_states(proj)
-                    has_marker = self._report_marker_current(proj)
-                    stage, needs_human, rr = self._project_stage(states, has_marker)
-                    marker = proj.get('autopilot_report') if has_marker else {}
-                    blocked = (proj.get('autopilot_report_blocked')
-                               if isinstance(proj.get('autopilot_report_blocked'), dict)
-                               else {})
+                    summary = self._adsorption.delta_e_rows(proj)
+                    raw_marker = (proj.get('autopilot_report')
+                                  if isinstance(proj.get('autopilot_report'), dict)
+                                  else {})
+                    canonical = self._canonical_report_status(proj, summary)
+                    has_marker = bool(canonical.get('artifact_current'))
+                    raw_blocked = (proj.get('autopilot_report_blocked')
+                                   if isinstance(proj.get('autopilot_report_blocked'), dict)
+                                   else {})
+                    has_legacy_blocked = self._blocked_report_marker_current(
+                        proj, summary)
+                    marker = raw_marker if has_marker else {}
+                    use_legacy_blocked = bool(has_legacy_blocked and not raw_marker)
+                    blocked = raw_blocked if use_legacy_blocked else {}
                     report_files = ((marker or {}).get('files') or
                                     (blocked or {}).get('files') or {})
+                    if raw_marker:
+                        scientific_status = canonical['scientific_status']
+                    elif use_legacy_blocked:
+                        scientific_status = 'diagnostic'
+                    else:
+                        scientific_status = None
+                    all_done = self._project_all_done(states)
+                    eligible_now = bool(canonical.get('eligible_final'))
+                    publication_gate_status = (
+                        'pending' if not all_done else
+                        'eligible' if eligible_now else 'blocked')
+                    desired_report_kind = ('final' if eligible_now else 'diagnostic')
+                    closes_pipeline = bool(
+                        (has_marker and scientific_status != 'draft')
+                        or use_legacy_blocked)
+                    stage, needs_human, rr = self._project_stage(
+                        states, closes_pipeline)
+                    artifact_status = (
+                        canonical['artifact_status'] if raw_marker else
+                        'ready' if use_legacy_blocked else
+                        'stale' if raw_blocked else 'missing')
+                    report_reason = str(
+                        (canonical.get('report_reason') if raw_marker else '')
+                        or (blocked or {}).get('reason')
+                        or (canonical.get('report_reason')
+                            if publication_gate_status == 'blocked' else '')
+                        or '')
+                    qualification = (
+                        (canonical.get('scientific_qualification') if raw_marker else '')
+                        or ('diagnostic' if use_legacy_blocked else None))
                     projs.append({
                         'path': pp, 'name': proj.get('name', '') or '',
                         'profile': str((((proj.get('launch') or {}).get('resources') or {})
@@ -5428,11 +6251,18 @@ class Api:
                         'recover_round': rr,
                         'done': sum(1 for s in states if s['state'] == 'DONE'),
                         'total': len(states),
-                        'report_status': ('final' if has_marker
-                                          else 'blocked' if blocked else 'pending'),
-                        'report_reason': ('' if has_marker else
-                                          str((blocked or {}).get('reason') or '')),
+                        'artifact_status': artifact_status,
+                        'scientific_status': scientific_status,
+                        'scientific_qualification': qualification,
+                        'publication_gate_status': publication_gate_status,
+                        'desired_report_kind': desired_report_kind,
+                        'report_kind': scientific_status,
+                        # Compatibility alias: unlike the legacy implementation,
+                        # this now reflects science state rather than file presence.
+                        'report_status': scientific_status,
+                        'report_reason': report_reason,
                         'report_files': report_files,
+                        'report_contracts': (marker or {}).get('contracts') or {},
                     })
                 except Exception:                         # noqa: BLE001 单个坏项目跳过
                     continue
@@ -5590,6 +6420,75 @@ class Api:
                 return False, '方法证据仍为 unverified，且没有保存带理由的人工确认'
         return True, ''
 
+    def _report_scientific_payload(self, project, summary) -> dict:
+        """Return path-independent scientific inputs for report contracts."""
+        project_root = os.path.abspath(os.path.normpath(str(
+            project.get('root') or os.curdir)))
+        members = []
+        for index, job_dir in enumerate(self._project_member_dirs(project), 1):
+            manifest = self._manifest.load_manifest(job_dir) or {}
+            results = manifest.get('results') or {}
+            attempts = []
+            for attempt in manifest.get('attempts') or []:
+                if not isinstance(attempt, dict):
+                    continue
+                attempts.append({
+                    key: attempt.get(key) for key in (
+                        'n', 'round', 'job_id', 'prev_job_id', 'action',
+                        'result', 'reason', 'attempt_token', 'engine')
+                    if key in attempt
+                })
+            members.append({
+                'member_id': self._portable_member_id(
+                    job_dir, project_root, index, manifest),
+                'state': manifest.get('state'),
+                'scheduler_job_id': manifest.get('scheduler_job_id'),
+                'attempts': attempts,
+                'energy_e0_eV': results.get('energy_e0_eV'),
+                'fetched_job_id': results.get('fetched_job_id'),
+                'fetched_attempt_token': results.get('fetched_attempt_token'),
+                'fetched_sha256': results.get('fetched_sha256') or {},
+                'fetched_sizes': results.get('fetched_sizes') or {},
+            })
+        reference_evidence = []
+        for item in (summary or {}).get('species_reference_evidence') or []:
+            if not isinstance(item, dict):
+                continue
+            reference_evidence.append({
+                key: item.get(key) for key in (
+                    'species', 'state', 'energy', 'valid', 'reference_valid',
+                    'cache_refresh_needed', 'sha256', 'fingerprint', 'note')
+                if key in item
+            })
+        confirmation = self._method_confirmation(project)
+        return self._json_safe_report_result({
+            'project_id': project.get('project_uuid') or project.get('name'),
+            'members': members,
+            'slab': (summary or {}).get('slab'),
+            'ref': (summary or {}).get('ref'),
+            'has_ref': bool((summary or {}).get('has_ref')),
+            'reference_mode': (summary or {}).get('reference_mode'),
+            'species_reference_evidence': reference_evidence,
+            'method_consistency': (summary or {}).get('method_consistency') or {},
+            'method_confirmation': {
+                key: confirmation.get(key) for key in (
+                    'confirmed', 'reason', 'scope', 'confirmed_by',
+                    'evidence_refs', 'allowed_claims') if key in confirmation
+            },
+            'rows': [{
+                key: row.get(key) for key in (
+                    'name', 'species', 'state', 'e_config', 'e_slab', 'e_ref',
+                    'delta_e', 'dd_e', 'reference_valid', 'reference_state',
+                    'method_status', 'note') if key in row
+            } for row in ((summary or {}).get('rows') or [])],
+        })
+
+    def _report_scientific_fingerprint(self, project, summary) -> str:
+        payload = self._report_scientific_payload(project, summary)
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                             separators=(',', ':'), allow_nan=False).encode('utf-8')
+        return hashlib.sha256(encoded).hexdigest()
+
     def _report_input_fingerprint(self, project, summary) -> str:
         """Bind a final report to member attempts, downloaded files and ΔE rows."""
         members = []
@@ -5625,68 +6524,436 @@ class Api:
                              separators=(',', ':'), default=str).encode('utf-8')
         return hashlib.sha256(encoded).hexdigest()
 
-    def _persist_blocked_report_marker(self, project, summary, reason, files):
-        """保存诊断报告状态；它可见但永远不能冒充最终报告。"""
-        paths = [os.path.abspath(str(path)) for path in files
-                 if path and os.path.isfile(str(path))]
-        if not paths:
-            raise RuntimeError('诊断报告状态落盘失败：没有可读的报告文件')
-        by_format = {
-            os.path.splitext(path)[1].lower().lstrip('.') or 'file': path
-            for path in paths
+    @staticmethod
+    def _validated_report_contract_refs(contracts, kind, *, require_sidecars=False) -> dict:
+        """Validate marker contract references; empty remains legacy-compatible."""
+        refs = Api._json_safe_report_result(contracts or {})
+        if not isinstance(refs, dict):
+            raise TypeError('报告 contracts 必须为对象')
+        if not refs:
+            return {}
+        expected = {
+            'spec': 'vcstudio.report-spec/v1',
+            'snapshot': 'vcstudio.report-snapshot/v1',
+            'validation': 'vcstudio.report-validation/v1',
         }
-        blocked = {
-            'updated_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
-            'input_fingerprint': self._report_input_fingerprint(project, summary),
-            'reason': str(reason or '最终报告门禁未通过'),
-            'files': by_format,
-        }
-        root = project.get('root') or os.path.dirname(paths[0])
-        persisted = dict(project)
-        persisted['autopilot_report_blocked'] = blocked
-        persisted.pop('autopilot_report', None)
-        persisted.pop('autopilot_report_done', None)
-        self._adsorption.save_project(root, persisted)
-        project['autopilot_report_blocked'] = blocked
-        project.pop('autopilot_report', None)
-        project.pop('autopilot_report_done', None)
-        return blocked
+        if set(refs) != set(expected):
+            missing = sorted(set(expected) - set(refs))
+            unknown = sorted(set(refs) - set(expected))
+            detail = []
+            if missing:
+                detail.append('缺少 ' + '、'.join(missing))
+            if unknown:
+                detail.append('未知 ' + '、'.join(unknown))
+            raise ValueError('报告 contracts 不完整：' + '；'.join(detail))
+        normalized = {}
+        for key, schema in expected.items():
+            record = refs.get(key)
+            if not isinstance(record, dict):
+                raise TypeError(f'报告 contract {key} 必须为对象')
+            if str(record.get('schema') or '') != schema:
+                raise ValueError(f'报告 contract {key} schema 无效')
+            digest = str(record.get('sha256') or '').strip().lower()
+            if not re.fullmatch(r'[0-9a-f]{64}', digest):
+                raise ValueError(f'报告 contract {key} sha256 无效')
+            normalized[key] = dict(record)
+            normalized[key]['sha256'] = digest
+            if require_sidecars:
+                sidecar = str(record.get('path') or '').strip()
+                file_digest = str(record.get('file_sha256') or '').strip().lower()
+                size = record.get('size')
+                if (not sidecar or os.path.basename(sidecar) != sidecar
+                        or sidecar in {'.', '..'}):
+                    raise ValueError(f'报告 contract {key} sidecar 路径无效')
+                if not re.fullmatch(r'[0-9a-f]{64}', file_digest):
+                    raise ValueError(f'报告 contract {key} file_sha256 无效')
+                if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+                    raise ValueError(f'报告 contract {key} size 无效')
+                normalized[key]['path'] = sidecar
+                normalized[key]['file_sha256'] = file_digest
+                normalized[key]['size'] = size
+        validation = normalized['validation']
+        status = str(validation.get('status') or '').strip().lower()
+        final_allowed = validation.get('final_allowed')
+        if status not in {'passed', 'passed_with_warnings', 'blocked', 'unknown'}:
+            raise ValueError('报告 validation status 无效')
+        if not isinstance(final_allowed, bool):
+            raise TypeError('报告 validation final_allowed 必须为布尔值')
+        if kind == 'final' and (
+                status not in {'passed', 'passed_with_warnings'}
+                or final_allowed is not True):
+            raise ValueError('最终报告 marker 缺少通过且 final_allowed=true 的验证')
+        if kind != 'final' and final_allowed is True:
+            raise ValueError('非最终报告 marker 不得声明 final_allowed=true')
+        if require_sidecars:
+            report_model_digest = str(
+                validation.get('report_model_sha256') or '').strip().lower()
+            if not re.fullmatch(r'[0-9a-f]{64}', report_model_digest):
+                raise ValueError('报告 validation report_model_sha256 无效')
+            normalized['validation']['report_model_sha256'] = report_model_digest
+        return normalized
 
-    def _persist_report_marker(self, project, summary, files):
-        """原子保存多格式最终报告标记；任一声明文件变化都会让标记失效。"""
-        paths = [os.path.abspath(str(path)) for path in files
-                 if path and os.path.isfile(str(path))]
-        if not paths:
-            raise RuntimeError('报告标记落盘失败：没有可读的报告文件')
-        by_format, hashes = {}, {}
-        for path in paths:
-            suffix = os.path.splitext(path)[1].lower().lstrip('.') or 'file'
-            by_format[suffix] = path
-            hashes[suffix] = _sha256_file(path)
-        html_path = by_format.get('html') or paths[0]
-        generated_at = time.strftime('%Y-%m-%dT%H:%M:%S')
-        marker = {
-            'generated_at': generated_at,
-            'input_fingerprint': self._report_input_fingerprint(project, summary),
-            'file': html_path,                       # 旧界面只读兼容
-            'report_sha256': _sha256_file(html_path),
-            'files': by_format,
-            'sha256': hashes,
-            'figures_dir': os.path.dirname(html_path),
-        }
-        root = project.get('root') or os.path.dirname(html_path)
-        persisted = dict(project)
-        persisted['autopilot_report'] = marker
-        persisted['autopilot_report_done'] = generated_at
-        persisted.pop('autopilot_report_blocked', None)
+    @staticmethod
+    def _validate_report_contract_sidecars(files, contracts, *, kind,
+                                             scientific_fingerprint,
+                                             scientific_qualification,
+                                             report_model_sha256) -> dict:
+        """Validate full sidecar bytes, semantic digests, and cross-bindings."""
+        from vcstudio.project.report_contracts import (
+            ReportSnapshot,
+            ReportSpec,
+            ValidationResult,
+            validate_bindings,
+        )
+
+        payloads = {}
+        for key, record in contracts.items():
+            sidecar_path = str((files or {}).get(f'contract_{key}') or '')
+            if not sidecar_path or not os.path.isfile(sidecar_path):
+                raise RuntimeError(
+                    f'报告标记落盘失败：缺少 contract {key} sidecar')
+            if os.path.basename(sidecar_path) != str(record.get('path') or ''):
+                raise RuntimeError(
+                    f'报告标记落盘失败：contract {key} 路径不一致')
+            if _sha256_file(sidecar_path) != str(record.get('file_sha256') or ''):
+                raise RuntimeError(
+                    f'报告标记落盘失败：contract {key} 文件哈希不一致')
+            if os.path.getsize(sidecar_path) != record.get('size'):
+                raise RuntimeError(
+                    f'报告标记落盘失败：contract {key} 文件大小不一致')
+            try:
+                with open(sidecar_path, 'r', encoding='utf-8') as handle:
+                    payload = json.load(handle)
+            except Exception as exc:                     # noqa: BLE001
+                raise RuntimeError(
+                    f'报告标记落盘失败：contract {key} 无法解析：{exc}') from exc
+            if not isinstance(payload, dict):
+                raise RuntimeError(
+                    f'报告标记落盘失败：contract {key} 必须为对象')
+            payloads[key] = payload
+
         try:
-            self._adsorption.save_project(root, persisted)
+            spec = ReportSpec.from_mapping(payloads['spec'])
+            snapshot = ReportSnapshot.from_mapping(payloads['snapshot'], spec=spec)
+            validation = ValidationResult.from_mapping(
+                payloads['validation'], spec=spec, snapshot=snapshot)
+            validate_bindings(spec, snapshot, validation)
         except Exception as exc:                         # noqa: BLE001
-            raise RuntimeError(f'报告标记落盘失败：{exc}') from exc
-        project['autopilot_report'] = marker
-        project['autopilot_report_done'] = generated_at
-        project.pop('autopilot_report_blocked', None)
-        return marker
+            raise RuntimeError(
+                f'报告标记落盘失败：contract 绑定或内容无效：{exc}') from exc
+
+        semantic = {
+            'spec': spec.semantic_sha256,
+            'snapshot': snapshot.semantic_sha256,
+            'validation': validation.semantic_sha256,
+        }
+        for key, digest in semantic.items():
+            if digest != contracts[key]['sha256']:
+                raise RuntimeError(
+                    f'报告标记落盘失败：contract {key} 语义哈希不一致')
+        if snapshot.input_fingerprint != scientific_fingerprint:
+            raise RuntimeError('报告标记落盘失败：snapshot 输入指纹不一致')
+        declared_snapshot_input = str(
+            contracts['snapshot'].get('input_fingerprint') or '')
+        if declared_snapshot_input and declared_snapshot_input != scientific_fingerprint:
+            raise RuntimeError('报告标记落盘失败：snapshot ref 输入指纹不一致')
+        if validation.effective_kind != kind:
+            raise RuntimeError('报告标记落盘失败：validation 科学状态不一致')
+        if validation.scientific_qualification != scientific_qualification:
+            raise RuntimeError('报告标记落盘失败：validation 科学资格不一致')
+        if validation.report_model_sha256 != report_model_sha256:
+            raise RuntimeError('报告标记落盘失败：validation 正文指纹不一致')
+        validation_ref = contracts['validation']
+        if (str(validation_ref.get('status') or '') != validation.status
+                or validation_ref.get('final_allowed') is not validation.final_allowed
+                or validation_ref.get('report_model_sha256')
+                != validation.report_model_sha256):
+            raise RuntimeError('报告标记落盘失败：validation ref 元数据不一致')
+        return payloads
+
+    @staticmethod
+    def _validate_report_manifest(path, *, kind, model_sha256,
+                                  scientific_fingerprint, contracts,
+                                  scientific_qualification, files,
+                                  report_model_sha256) -> dict:
+        """Validate the committed manifest before it may anchor a ready marker."""
+        manifest_path = str(path or '')
+        if not manifest_path or not os.path.isfile(manifest_path):
+            raise RuntimeError('报告标记落盘失败：manifest 不存在或不可读')
+        try:
+            with open(manifest_path, 'r', encoding='utf-8') as handle:
+                payload = json.load(handle)
+        except Exception as exc:                            # noqa: BLE001
+            raise RuntimeError(f'报告标记落盘失败：manifest 无法解析：{exc}') from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError('报告标记落盘失败：manifest 必须为对象')
+        if str(payload.get('schema') or '') != 'vcstudio.paper-report.bundle/v2':
+            raise RuntimeError('报告标记落盘失败：manifest schema 无效')
+        if str(payload.get('artifact_status') or '') != 'complete':
+            raise RuntimeError('报告标记落盘失败：manifest 未声明 complete')
+        for field in ('report_kind', 'scientific_status'):
+            if str(payload.get(field) or '').strip().lower() != kind:
+                raise RuntimeError('报告标记落盘失败：manifest 科学状态不一致')
+        if (str(payload.get('scientific_qualification') or '').strip().lower()
+                != scientific_qualification):
+            raise RuntimeError('报告标记落盘失败：manifest 科学资格不一致')
+        declared_model = str(payload.get('model_sha256') or '').strip().lower()
+        expected_model = str(model_sha256 or '').strip().lower()
+        if (not re.fullmatch(r'[0-9a-f]{64}', declared_model)
+                or not re.fullmatch(r'[0-9a-f]{64}', expected_model)
+                or declared_model != expected_model):
+            raise RuntimeError('报告标记落盘失败：manifest model_sha256 不一致')
+        declared_report_model = str(
+            payload.get('report_model_sha256') or '').strip().lower()
+        expected_report_model = str(report_model_sha256 or '').strip().lower()
+        if (not re.fullmatch(r'[0-9a-f]{64}', declared_report_model)
+                or not re.fullmatch(r'[0-9a-f]{64}', expected_report_model)
+                or declared_report_model != expected_report_model):
+            raise RuntimeError(
+                '报告标记落盘失败：manifest report_model_sha256 不一致')
+        model_path = str((files or {}).get('model') or '')
+        model_record = payload.get('model_file')
+        if (not model_path or not os.path.isfile(model_path)
+                or not isinstance(model_record, dict)):
+            raise RuntimeError('报告标记落盘失败：冻结 model sidecar 缺失')
+        if os.path.basename(model_path) != str(model_record.get('path') or ''):
+            raise RuntimeError('报告标记落盘失败：model sidecar 路径不一致')
+        model_file_sha256 = _sha256_file(model_path)
+        if (model_file_sha256 != str(model_record.get('sha256') or '').lower()
+                or model_file_sha256 != expected_model
+                or os.path.getsize(model_path) != model_record.get('size')):
+            raise RuntimeError('报告标记落盘失败：model sidecar 哈希或大小不一致')
+        try:
+            with open(model_path, 'rb') as handle:
+                frozen_model_bytes = handle.read()
+            frozen_model = json.loads(frozen_model_bytes.decode('utf-8'))
+        except Exception as exc:                         # noqa: BLE001
+            raise RuntimeError(
+                f'报告标记落盘失败：model sidecar 无法解析：{exc}') from exc
+        if not isinstance(frozen_model, dict):
+            raise RuntimeError('报告标记落盘失败：model sidecar 必须为对象')
+        try:
+            canonical_model_bytes = json.dumps(
+                frozen_model, ensure_ascii=False, sort_keys=True,
+                separators=(',', ':'), allow_nan=False).encode('utf-8')
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f'报告标记落盘失败：model sidecar 不是规范 JSON：{exc}') from exc
+        if (canonical_model_bytes != frozen_model_bytes
+                or hashlib.sha256(canonical_model_bytes).hexdigest()
+                != expected_model):
+            raise RuntimeError('报告标记落盘失败：model sidecar 不是规范冻结模型')
+        try:
+            from vcstudio.project.paper_report import frozen_report_content_sha256
+
+            frozen_report_model = frozen_report_content_sha256(frozen_model)
+        except Exception as exc:                         # noqa: BLE001
+            raise RuntimeError(
+                f'报告标记落盘失败：model sidecar 正文投影无法复算：{exc}') from exc
+        if frozen_report_model != expected_report_model:
+            raise RuntimeError(
+                '报告标记落盘失败：model sidecar 正文指纹与 validation 不一致')
+        declared_input = str(payload.get('input_fingerprint') or '').strip().lower()
+        if (not re.fullmatch(r'[0-9a-f]{64}', declared_input)
+                or declared_input != scientific_fingerprint):
+            raise RuntimeError('报告标记落盘失败：manifest 输入指纹不一致')
+        declared_contracts = payload.get('contracts')
+        if not isinstance(declared_contracts, dict):
+            raise RuntimeError('报告标记落盘失败：manifest contracts 无效')
+        if declared_contracts != contracts:
+            raise RuntimeError('报告标记落盘失败：manifest contracts 不一致')
+
+        report_files = {
+            fmt: str(value) for fmt, value in (files or {}).items()
+            if fmt in {'html', 'docx', 'pdf'}
+        }
+        declared_formats = payload.get('formats')
+        declared_files = payload.get('files')
+        if (not isinstance(declared_formats, list)
+                or set(map(str, declared_formats)) != set(report_files)
+                or not isinstance(declared_files, dict)
+                or set(declared_files) != set(report_files)):
+            raise RuntimeError('报告标记落盘失败：manifest 格式清单不一致')
+        for fmt, report_path in report_files.items():
+            record = declared_files.get(fmt)
+            if not isinstance(record, dict):
+                raise RuntimeError(
+                    f'报告标记落盘失败：manifest 文件记录 {fmt} 无效')
+            if os.path.basename(report_path) != str(record.get('path') or ''):
+                raise RuntimeError(
+                    f'报告标记落盘失败：manifest 文件路径 {fmt} 不一致')
+            if (_sha256_file(report_path) != str(record.get('sha256') or '').lower()
+                    or os.path.getsize(report_path) != record.get('size')):
+                raise RuntimeError(
+                    f'报告标记落盘失败：manifest 文件记录 {fmt} 不一致')
+        return payload
+
+    def _persist_blocked_report_marker(self, project, summary, reason, files):
+        """Compatibility wrapper: new diagnostic artifacts use the canonical marker."""
+        return self._persist_report_marker(
+            project, summary, files, kind='diagnostic', reason=reason)
+
+    def _persist_report_marker(self, project, summary, files, *, kind='final',
+                               reason='', figures_dir=None, model_sha256=None,
+                               report_model_sha256=None,
+                               contracts=None, scientific_qualification=None,
+                               manifest=None, project_path=None,
+                               expected_input_fingerprint=None,
+                               expected_scientific_fingerprint=None,
+                               expected_project_id=None):
+        """Atomically persist one canonical report artifact marker.
+
+        ``kind`` is the scientific status; successful persistence only proves
+        that files exist and match their hashes.  These axes must remain
+        independent so a diagnostic artifact can never be displayed as final.
+        """
+        kind = str(kind or '').strip().lower()
+        if kind not in _REPORT_KINDS:
+            raise ValueError('报告 marker kind 必须为 final、diagnostic 或 draft')
+        qualification = str(scientific_qualification or (
+            'adsorption_result_verified' if kind == 'final' else 'diagnostic'
+        )).strip().lower()
+        if qualification not in _REPORT_QUALIFICATIONS:
+            raise ValueError('报告 scientific_qualification 无效')
+        if kind == 'final' and qualification == 'diagnostic':
+            raise ValueError('最终报告不能使用 diagnostic 科学资格')
+        if kind != 'final' and qualification != 'diagnostic' and not contracts:
+            raise ValueError('无 contract 的非最终报告只能使用 diagnostic 科学资格')
+        if kind == 'final' and not contracts:
+            raise ValueError('最终报告 marker 必须包含完整 contract 链与 manifest')
+        normalized_contracts = self._validated_report_contract_refs(
+            contracts, kind, require_sidecars=bool(contracts))
+
+        with self._report_marker_lock:
+            current_project = project
+            current_summary = summary
+            if project_path:
+                current_project = self._adsorption.load_project(str(project_path).strip())
+                if current_project is None:
+                    raise _ReportInputChanged('报告已生成但项目在落盘前被移动或删除，未登记产物')
+                current_summary = self._adsorption.delta_e_rows(current_project)
+            current_project_id = str(
+                current_project.get('project_uuid') or current_project.get('name') or '')
+            if expected_project_id and current_project_id != str(expected_project_id):
+                raise _ReportInputChanged('报告已生成但项目身份已变化，未登记产物')
+            current_input_fingerprint = self._report_input_fingerprint(
+                current_project, current_summary)
+            current_scientific_fingerprint = self._report_scientific_fingerprint(
+                current_project, current_summary)
+            if (expected_input_fingerprint
+                    and current_input_fingerprint != expected_input_fingerprint):
+                raise _ReportInputChanged('报告生成期间作业或结果已变化，产物未登记；请重新生成')
+            if (expected_scientific_fingerprint
+                    and current_scientific_fingerprint
+                    != expected_scientific_fingerprint):
+                raise _ReportInputChanged('报告生成期间科学输入已变化，产物未登记；请重新生成')
+            if kind == 'final':
+                eligible, gate_reason = self._final_report_gate(
+                    current_project, current_summary)
+                if not eligible:
+                    raise _ReportInputChanged(
+                        '报告生成期间最终门禁已变化，产物未登记：' + gate_reason)
+
+            items = (files.items() if isinstance(files, dict)
+                     else ((None, path) for path in files))
+            by_format = {}
+            for declared_format, raw_path in items:
+                if not raw_path or not os.path.isfile(str(raw_path)):
+                    continue
+                output_path = os.path.abspath(str(raw_path))
+                suffix = str(declared_format or '').strip().lower()
+                if not suffix:
+                    suffix = (os.path.splitext(output_path)[1].lower().lstrip('.')
+                              or 'file')
+                by_format[suffix] = output_path
+            if not by_format:
+                raise RuntimeError('报告标记落盘失败：没有可读的报告文件')
+            if not {'html', 'docx', 'pdf'}.intersection(by_format):
+                raise RuntimeError('报告标记落盘失败：没有可读的报告产物格式')
+            manifest_path = os.path.abspath(str(
+                manifest or by_format.get('manifest') or '')) if (
+                    manifest or by_format.get('manifest')) else ''
+            marker_manifest = by_format.get('manifest')
+            if manifest_path and (not marker_manifest
+                                  or os.path.normcase(os.path.abspath(marker_manifest))
+                                  != os.path.normcase(manifest_path)):
+                raise RuntimeError(
+                    '报告标记落盘失败：manifest 未包含在哈希绑定文件中')
+            if kind == 'final' and not manifest_path:
+                raise RuntimeError('报告标记落盘失败：最终报告缺少 manifest')
+            if normalized_contracts:
+                normalized_report_model_sha256 = str(
+                    report_model_sha256 or '').strip().lower()
+                if not re.fullmatch(r'[0-9a-f]{64}', normalized_report_model_sha256):
+                    raise RuntimeError(
+                        '报告标记落盘失败：缺少有效 report_model_sha256')
+                self._validate_report_contract_sidecars(
+                    by_format, normalized_contracts, kind=kind,
+                    scientific_fingerprint=current_scientific_fingerprint,
+                    scientific_qualification=qualification,
+                    report_model_sha256=normalized_report_model_sha256)
+            else:
+                normalized_report_model_sha256 = ''
+            if normalized_contracts or manifest_path:
+                self._validate_report_manifest(
+                    manifest_path, kind=kind, model_sha256=model_sha256,
+                    scientific_fingerprint=current_scientific_fingerprint,
+                    contracts=normalized_contracts,
+                    scientific_qualification=qualification, files=by_format,
+                    report_model_sha256=normalized_report_model_sha256)
+            hashes = {fmt: _sha256_file(path) for fmt, path in by_format.items()}
+            primary = (by_format.get('pdf') or by_format.get('html')
+                       or next(iter(by_format.values())))
+            generated_at = time.strftime('%Y-%m-%dT%H:%M:%S')
+            marker = {
+                'schema': 'vcstudio.report-marker/v2',
+                'generated_at': generated_at,
+                'input_fingerprint': current_input_fingerprint,
+                'scientific_fingerprint': current_scientific_fingerprint,
+                'artifact_status': 'ready',
+                'kind': kind,
+                'scientific_status': kind,
+                'scientific_qualification': qualification,
+                'gate_reason': str(reason or ''),
+                'file': primary,                         # 旧界面只读兼容
+                'report_sha256': _sha256_file(primary),
+                'files': by_format,
+                'sha256': hashes,
+                'report_hashes': hashes,                 # 旧自动报告 marker 兼容
+                'figures_dir': os.path.abspath(str(
+                    figures_dir or os.path.dirname(primary))),
+                'model_sha256': str(model_sha256 or ''),
+                'report_model_sha256': normalized_report_model_sha256,
+                'contracts': normalized_contracts,
+                'manifest': (os.path.abspath(manifest_path)
+                             if manifest_path else ''),
+            }
+            root = current_project.get('root') or os.path.dirname(primary)
+            persisted = dict(current_project)
+            persisted['autopilot_report'] = marker
+            if kind == 'draft':
+                persisted.pop('autopilot_report_done', None)
+            else:
+                persisted['autopilot_report_done'] = generated_at
+            persisted.pop('autopilot_report_blocked', None)
+            try:
+                self._adsorption.save_project(root, persisted)
+            except Exception as exc:                     # noqa: BLE001
+                raise RuntimeError(f'报告标记落盘失败：{exc}') from exc
+            current_project['autopilot_report'] = marker
+            if kind == 'draft':
+                current_project.pop('autopilot_report_done', None)
+            else:
+                current_project['autopilot_report_done'] = generated_at
+            current_project.pop('autopilot_report_blocked', None)
+            if project is not current_project:
+                project['autopilot_report'] = marker
+                if kind == 'draft':
+                    project.pop('autopilot_report_done', None)
+                else:
+                    project['autopilot_report_done'] = generated_at
+                project.pop('autopilot_report_blocked', None)
+            return marker
 
     def _report_marker_current(self, project, summary=None) -> bool:
         marker = (project or {}).get('autopilot_report')
@@ -5694,23 +6961,238 @@ class Api:
             return False
         try:
             current = summary or self._adsorption.delta_e_rows(project)
-            if marker.get('input_fingerprint') != self._report_input_fingerprint(project, current):
+            scientific = str(marker.get('scientific_fingerprint') or '').strip().lower()
+            if scientific:
+                if (not re.fullmatch(r'[0-9a-f]{64}', scientific)
+                        or scientific != self._report_scientific_fingerprint(
+                            project, current)):
+                    return False
+            elif marker.get('input_fingerprint') != self._report_input_fingerprint(
+                    project, current):
                 return False
             declared = marker.get('files')
             hashes = marker.get('sha256') or marker.get('report_hashes')
             if isinstance(declared, dict) and isinstance(hashes, dict) and declared:
-                return all(
+                if not {'html', 'docx', 'pdf'}.intersection(declared):
+                    return False
+                files_current = all(
                     os.path.isfile(str(path))
                     and str(hashes.get(fmt) or '')
                     and _sha256_file(str(path)) == str(hashes.get(fmt))
                     for fmt, path in declared.items())
+                if not files_current:
+                    return False
+                return not self._report_marker_science_state(
+                    project, marker, current).get('stale', True)
             report_path = str(marker.get('file') or '')
             if not report_path or not os.path.isfile(report_path):
                 return False
             expected_hash = str(marker.get('report_sha256') or '')
-            return bool(expected_hash and _sha256_file(report_path) == expected_hash)
+            if not expected_hash or _sha256_file(report_path) != expected_hash:
+                return False
+            return not self._report_marker_science_state(
+                project, marker, current).get('stale', True)
         except Exception:                                # noqa: BLE001 失效即重建，绝不误报完成
             return False
+
+    def _blocked_report_marker_current(self, project, summary=None) -> bool:
+        """Validate legacy ``autopilot_report_blocked`` records fail closed."""
+        marker = (project or {}).get('autopilot_report_blocked')
+        if not isinstance(marker, dict):
+            return False
+        try:
+            current = summary or self._adsorption.delta_e_rows(project)
+            if marker.get('input_fingerprint') != self._report_input_fingerprint(
+                    project, current):
+                return False
+            declared = marker.get('files') or {}
+            hashes = marker.get('sha256') or marker.get('report_hashes') or {}
+            if not isinstance(declared, dict) or not declared:
+                return False
+            for fmt, path in declared.items():
+                if not os.path.isfile(str(path)):
+                    return False
+                if hashes and _sha256_file(str(path)) != str(hashes.get(fmt) or ''):
+                    return False
+            return True
+        except Exception:                                # noqa: BLE001
+            return False
+
+    def _report_marker_science_state(self, project, marker, summary=None) -> dict:
+        """Resolve current science state and staleness without trusting marker text."""
+        marker = marker if isinstance(marker, dict) else {}
+        current = summary or self._adsorption.delta_e_rows(project)
+        eligible, current_reason = self._final_report_gate(project, current)
+        desired_kind = 'final' if eligible else 'diagnostic'
+        raw_kind = str(marker.get('kind') or '').strip().lower()
+        stored_reason = str(
+            marker.get('gate_reason') or marker.get('reason') or '')
+        contracts = marker.get('contracts') if isinstance(
+            marker.get('contracts'), dict) else {}
+
+        def _stale(reason, *, kind='diagnostic', qualification='diagnostic'):
+            return {
+                'kind': kind,
+                'qualification': qualification,
+                'reason': str(reason or '报告 marker 验证失败'),
+                'stale': True,
+            }
+
+        if raw_kind and raw_kind not in _REPORT_KINDS:
+            return _stale(f'报告 marker kind 无效：{raw_kind}')
+
+        # A missing kind is the only accepted legacy-final shape.  Both it and
+        # explicit final markers must pass today's scientific gate.  Modern
+        # metadata on a kind-less marker is ambiguous and therefore not legacy.
+        if not raw_kind:
+            if contracts or marker.get('manifest') or marker.get('scientific_fingerprint'):
+                return _stale('报告 marker 缺少显式 kind，不能验证现代 contract 元数据')
+            if not eligible:
+                return _stale(current_reason or stored_reason)
+            return {
+                'kind': 'final',
+                'qualification': 'adsorption_result_verified',
+                'reason': '',
+                'stale': False,
+            }
+
+        if str(marker.get('artifact_status') or '').strip().lower() != 'ready':
+            return _stale('报告 marker 未声明 artifact_status=ready')
+        declared_science = str(marker.get('scientific_status') or '').strip().lower()
+        if declared_science != raw_kind:
+            return _stale('报告 marker kind 与 scientific_status 不一致')
+        qualification = str(
+            marker.get('scientific_qualification') or '').strip().lower()
+        if qualification not in _REPORT_QUALIFICATIONS:
+            return _stale('报告 marker scientific_qualification 无效')
+        if raw_kind == 'final' and qualification == 'diagnostic':
+            return _stale('最终报告 marker 使用了 diagnostic 科学资格')
+        if raw_kind != 'final' and qualification != 'diagnostic' and not contracts:
+            return _stale('无 contract 的非最终报告 marker 声明了越权科学资格')
+
+        scientific_fingerprint = str(
+            marker.get('scientific_fingerprint') or '').strip().lower()
+        if (not re.fullmatch(r'[0-9a-f]{64}', scientific_fingerprint)
+                or scientific_fingerprint
+                != self._report_scientific_fingerprint(project, current)):
+            return _stale('报告 marker 科学输入指纹已失效', kind=raw_kind,
+                          qualification=qualification)
+
+        modern_files = marker.get('files') if isinstance(marker.get('files'), dict) else {}
+        if raw_kind == 'final' and not contracts:
+            return _stale('最终报告 marker 缺少完整 contract 验证链')
+        if contracts:
+            try:
+                if str(marker.get('schema') or '') != 'vcstudio.report-marker/v2':
+                    raise ValueError('marker schema 无效')
+                report_model_sha256 = str(
+                    marker.get('report_model_sha256') or '').strip().lower()
+                if not re.fullmatch(r'[0-9a-f]{64}', report_model_sha256):
+                    raise ValueError('report_model_sha256 无效')
+                normalized_contracts = self._validated_report_contract_refs(
+                    contracts, raw_kind, require_sidecars=True)
+                self._validate_report_contract_sidecars(
+                    modern_files, normalized_contracts, kind=raw_kind,
+                    scientific_fingerprint=scientific_fingerprint,
+                    scientific_qualification=qualification,
+                    report_model_sha256=report_model_sha256)
+                manifest_path = str(marker.get('manifest') or '')
+                marker_manifest = str(modern_files.get('manifest') or '')
+                if (not manifest_path or not marker_manifest
+                        or os.path.normcase(os.path.abspath(manifest_path))
+                        != os.path.normcase(os.path.abspath(marker_manifest))):
+                    raise RuntimeError('manifest 路径未纳入 marker 文件绑定')
+                self._validate_report_manifest(
+                    manifest_path, kind=raw_kind,
+                    model_sha256=marker.get('model_sha256'),
+                    scientific_fingerprint=scientific_fingerprint,
+                    contracts=normalized_contracts,
+                    scientific_qualification=qualification,
+                    files=modern_files,
+                    report_model_sha256=report_model_sha256)
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                return _stale(
+                    f'报告验证记录无效：{exc}',
+                    kind=raw_kind,
+                    qualification=qualification,
+                )
+        elif marker.get('manifest') or any(
+                key.startswith('contract_') or key == 'manifest'
+                for key in modern_files):
+            return _stale('报告 marker 的 manifest/contract 元数据不完整')
+
+        if raw_kind == 'draft':
+            return {
+                'kind': 'draft',
+                'qualification': qualification,
+                'reason': stored_reason,
+                'stale': False,
+            }
+        if raw_kind != desired_kind:
+            if desired_kind == 'final':
+                return _stale(
+                    '当前最终门禁已通过，已有诊断报告需升级为最终报告',
+                    kind=raw_kind, qualification=qualification)
+            return _stale(current_reason or stored_reason,
+                          kind=raw_kind, qualification=qualification)
+        return {
+            'kind': raw_kind,
+            'qualification': qualification,
+            'reason': '' if raw_kind == 'final' else (current_reason or stored_reason),
+            'stale': False,
+        }
+
+    def _report_marker_kind(self, project, marker, summary=None) -> str:
+        """Compatibility wrapper returning the validated marker science kind."""
+        return self._report_marker_science_state(
+            project, marker, summary).get('kind') or 'diagnostic'
+
+    def _canonical_report_status(self, project, summary=None) -> dict:
+        """Resolve one project's canonical artifact and science axes."""
+        current = summary or self._adsorption.delta_e_rows(project)
+        marker = ((project or {}).get('autopilot_report')
+                  if isinstance((project or {}).get('autopilot_report'), dict)
+                  else {})
+        eligible, gate_reason = self._final_report_gate(project, current)
+        desired_kind = 'final' if eligible else 'diagnostic'
+        publication_gate_status = 'eligible' if eligible else 'blocked'
+        if marker:
+            science = self._report_marker_science_state(project, marker, current)
+            artifact_current = self._report_marker_current(project, current)
+            reason = str(science.get('reason') or '')
+            if not artifact_current and not reason:
+                reason = '报告产物文件、哈希或冻结输入已失效，请重新生成'
+            return {
+                'schema': 'vcstudio.report-status/v1',
+                'artifact_status': 'ready' if artifact_current else 'stale',
+                'artifact_current': bool(artifact_current),
+                'has_marker': True,
+                'marker_kind': str(marker.get('kind') or 'legacy-final'),
+                'scientific_status': science.get('kind') or desired_kind,
+                'scientific_qualification': (
+                    science.get('qualification') or 'diagnostic'),
+                'scientific_stale': bool(science.get('stale')),
+                'eligible_final': bool(eligible),
+                'publication_gate_status': publication_gate_status,
+                'desired_report_kind': desired_kind,
+                'report_reason': reason,
+                'files': dict(marker.get('files') or {}),
+            }
+        return {
+            'schema': 'vcstudio.report-status/v1',
+            'artifact_status': 'missing',
+            'artifact_current': False,
+            'has_marker': False,
+            'marker_kind': None,
+            'scientific_status': None,
+            'scientific_qualification': None,
+            'scientific_stale': False,
+            'eligible_final': bool(eligible),
+            'publication_gate_status': publication_gate_status,
+            'desired_report_kind': desired_kind,
+            'report_reason': '' if eligible else str(gate_reason or ''),
+            'files': {},
+        }
 
     def _tick_reports(self, events, errors):
         """Generate an idempotent HTML/DOCX/PDF bundle once calculations finish.
@@ -5748,13 +7230,24 @@ class Api:
                     continue
                 summary = self._adsorption.delta_e_rows(proj)
                 if self._report_marker_current(proj, summary):
-                    continue
+                    current_marker = proj.get('autopilot_report') or {}
+                    current_science = self._report_marker_science_state(
+                        proj, current_marker, summary)
+                    if (not current_science.get('stale')
+                            and current_science.get('kind') != 'draft'):
+                        continue
+                frozen_input_fingerprint = self._report_input_fingerprint(proj, summary)
+                frozen_scientific_fingerprint = self._report_scientific_fingerprint(
+                    proj, summary)
+                frozen_project_id = str(
+                    proj.get('project_uuid') or proj.get('name') or '')
                 name = proj.get('name', '') or self._base(os.path.dirname(str(pp)))
                 root = proj.get('root') or os.path.dirname(str(pp))
                 report_dir = os.path.join(root, 'report')
                 os.makedirs(report_dir, exist_ok=True)
+                report_formats = self._available_report_formats()
                 rep = self.proj_report_bundle(
-                    pp, report_dir, ('html', 'docx', 'pdf'), final=True,
+                    pp, report_dir, report_formats, final=True,
                     stem=f'{name}_吸附能评估报告')
                 if not rep.get('ok'):
                     errors.append(f'项目「{name}」自动报告失败:{rep.get("error")}')
@@ -5764,46 +7257,64 @@ class Api:
                     for fmt, path in (rep.get('files') or {}).items()
                     if path and os.path.isfile(str(path))
                 }
-                required = {'html', 'docx', 'pdf'}
+                required = set(report_formats)
                 if not required.issubset(report_files):
                     missing = '、'.join(sorted(required - set(report_files)))
                     errors.append(f'项目「{name}」报告包缺少:{missing}')
                     continue
-                generated_at = time.strftime('%Y-%m-%dT%H:%M:%S')
-                primary = report_files.get('pdf') or report_files.get('html')
-                marker = {
-                    'generated_at': generated_at,
-                    'input_fingerprint': self._report_input_fingerprint(proj, summary),
-                    'kind': rep.get('kind') or 'diagnostic',
-                    'file': primary,
-                    'files': report_files,
-                    'report_sha256': _sha256_file(primary),
-                    'report_hashes': {
-                        fmt: _sha256_file(path) for fmt, path in report_files.items()
-                    },
-                    'figures_dir': os.path.join(report_dir, 'figures'),
-                }
-                # 先用独立副本落盘，成功后才更新当前内存对象。
-                # 否则一次保存失败会在进程内留下“伪 marker”，
-                # 下一拍可能错误认为报告已持久化而不再重试。
-                persisted = dict(proj)
-                persisted['autopilot_report'] = marker
-                persisted['autopilot_report_done'] = generated_at  # 旧界面只读兼容
-                try:
-                    self._adsorption.save_project(root, persisted)
-                except Exception as e:                    # noqa: BLE001
-                    errors.append(f'项目「{name}」报告标记落盘失败:{e}')
+                marker = rep.get('marker') if isinstance(rep.get('marker'), dict) else None
+                if marker is None:
+                    # Test doubles and legacy render adapters may only return
+                    # files.  They still use the same canonical persistence seam.
+                    try:
+                        marker_files = dict(report_files)
+                        fallback_sidecars = (rep.get('sidecar_files')
+                                             if isinstance(rep.get('sidecar_files'), dict)
+                                             else {})
+                        model_file = (rep.get('model_file')
+                                      or fallback_sidecars.get('model'))
+                        if model_file:
+                            marker_files['model'] = model_file
+                        for key, value in (rep.get('contract_files') or {}).items():
+                            marker_files[f'contract_{key}'] = value
+                        if rep.get('manifest'):
+                            marker_files.setdefault('manifest', rep.get('manifest'))
+                        marker = self._persist_report_marker(
+                            proj, summary, marker_files,
+                            kind=rep.get('kind') or 'diagnostic',
+                            reason=rep.get('gate_reason') or '',
+                            figures_dir=os.path.join(report_dir, 'figures'),
+                            model_sha256=rep.get('model_sha256'),
+                            report_model_sha256=rep.get('report_model_sha256'),
+                            contracts=rep.get('contracts') or {},
+                            scientific_qualification=rep.get(
+                                'scientific_qualification'),
+                            manifest=rep.get('manifest'),
+                            project_path=pp,
+                            expected_input_fingerprint=frozen_input_fingerprint,
+                            expected_scientific_fingerprint=(
+                                frozen_scientific_fingerprint),
+                            expected_project_id=frozen_project_id,
+                        )
+                    except Exception as e:                # noqa: BLE001
+                        errors.append(f'项目「{name}」报告标记落盘失败:{e}')
+                        continue
+                marker_science = self._report_marker_science_state(
+                    proj, marker, summary)
+                if marker_science.get('stale'):
+                    errors.append(
+                        f'项目「{name}」报告验证状态在落盘后失效：'
+                        f'{marker_science.get("reason") or "请重新生成"}')
                     continue
-                proj['autopilot_report'] = marker
-                proj['autopilot_report_done'] = generated_at
+                primary = marker.get('file') or report_files.get('pdf') or report_files.get('html')
                 events.append({'kind': 'report_done', 'project': name,
                                'report': primary, 'files': report_files,
-                               'report_kind': marker['kind'],
+                               'report_kind': marker_science['kind'],
                                'figures_dir': marker['figures_dir'],
                                'engine': 'paper_report_bundle',
                                'n_figures': len(rep.get('figures') or []),
                                'text': (f'项目「{name}」'
-                                        f'{"最终" if marker["kind"] == "final" else "诊断"}'
+                                        f'{"最终" if marker_science["kind"] == "final" else "诊断"}'
                                         '报告（Word + PDF + HTML）已自动生成')})
             except Exception as e:                        # noqa: BLE001 单项目失败不拖垮其他
                 errors.append(f'项目报告自动化异常:{e}')

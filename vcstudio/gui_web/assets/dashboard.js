@@ -154,7 +154,61 @@
 
   // ── 卡片:项目管线(每项目一行站点进度;当前站高亮,NEEDS_HUMAN 红点) ─────────
   const STAGE_LABEL = { generate: '生成', submit: '提交', monitor: '监控',
-    recover: '恢复', analysis: '分析', report_done: '报告' };
+    recover: '恢复', analysis: '分析', report_done: '报告产物' };
+
+  function pipelineReportStates(project) {
+    const p = project || {};
+    const files = p.report_files && typeof p.report_files === 'object'
+      ? p.report_files : {};
+    const formats = ['html', 'docx', 'pdf'].filter(format => files[format]);
+    const artifactRaw = String(
+      p.artifact_status || p.report_artifact_status || ''
+    ).trim().toLowerCase();
+    // report_done 只说明文件生成流程结束，绝不用于推断科学结论是 final。
+    const legacyReady = !artifactRaw && (formats.length > 0 || p.stage === 'report_done');
+    const artifact = ['ready', 'complete'].includes(artifactRaw) || legacyReady
+      ? {
+        cls: 'ok',
+        label: formats.length
+          ? `已生成（${formats.map(value => value.toUpperCase()).join(' · ')}）`
+          : '已生成',
+      }
+      : artifactRaw === 'generated_unrecorded'
+        ? { cls: 'warn', label: '已生成但未登记' }
+        : artifactRaw === 'stale'
+          ? { cls: 'warn', label: '已过期' }
+          : artifactRaw === 'failed'
+            ? { cls: 'bad', label: '生成失败' }
+            : { cls: '', label: '尚未生成' };
+
+    const scienceRaw = String(
+      p.scientific_status || p.report_status || p.report_kind || 'pending'
+    ).trim().toLowerCase();
+    const science = scienceRaw === 'final'
+      ? { cls: 'ok', label: '最终' }
+      : scienceRaw === 'diagnostic'
+        ? { cls: 'warn', label: '诊断' }
+        : scienceRaw === 'draft'
+          ? { cls: '', label: '草稿' }
+          : { cls: '', label: '尚无当前报告' };
+    const gateRaw = String(p.publication_gate_status || 'unknown').trim().toLowerCase();
+    const gate = gateRaw === 'eligible'
+      ? { cls: 'ok', label: '可发布最终版' }
+      : gateRaw === 'blocked'
+        ? { cls: 'bad', label: '阻断' }
+        : gateRaw === 'pending'
+          ? { cls: '', label: '等待计算' }
+          : { cls: '', label: '未知' };
+    const reason = String(p.report_reason || '');
+    const desired = String(p.desired_report_kind || '');
+    const gateTitle = [reason, desired ? `目标报告：${desired}` : ''].filter(Boolean).join('；');
+    return '<div class="pl-report-states" aria-label="报告产物状态、科学状态与发布门禁">' +
+      `<span class="pl-report product ${artifact.cls}"><b>报告产物</b>${VCS.esc(artifact.label)}</span>` +
+      `<span class="pl-report science ${science.cls}"${reason ? ` title="${VCS.esc(reason)}"` : ''}>` +
+      `<b>科学状态</b>${VCS.esc(science.label)}</span>` +
+      `<span class="pl-report gate ${gate.cls}"${gateTitle ? ` title="${VCS.esc(gateTitle)}"` : ''}>` +
+      `<b>发布门禁</b>${VCS.esc(gate.label)}</span></div>`;
+  }
 
   function shortTime(value) {
     if (!value) return '—';
@@ -214,11 +268,7 @@
       }).join('');
       const nextPage = p.stage_index <= 0 ? 'generate'
         : (p.stage_index <= 3 ? 'jobs' : 'project');
-      const reportState = p.report_status === 'final'
-        ? '<span class="pl-report ok">HTML · Word · PDF 已生成</span>'
-        : p.report_status === 'blocked'
-          ? `<span class="pl-report warn" title="${VCS.esc(p.report_reason || '')}">最终报告暂停：${VCS.esc(p.report_reason || '查看诊断报告')}</span>`
-          : '<span class="pl-report">报告等待计算完成</span>';
+      const reportState = pipelineReportStates(p);
       return '<div class="pl-proj">' +
         '<div class="pl-head">' +
         (p.needs_human ? '<span class="redflag" title="需人工介入"></span>' : '') +

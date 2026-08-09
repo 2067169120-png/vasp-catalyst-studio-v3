@@ -347,6 +347,85 @@ def test_project_report_requests_backend_final_adsorption_gate():
     assert 'State.lisBusy = false' in js
 
 
+def test_single_report_format_selection_is_accessible_and_enforced():
+    html = _source('index.html')
+    js = _source('project.js')
+    css = _source('app.css')
+
+    assert '<fieldset class="pj-report-formats" id="pj-report-formats"' in html
+    assert 'aria-describedby="pj-report-format-status"' in html
+    assert 'aria-describedby="pj-report-format-status" aria-busy="true"' in html
+    for control, label in (
+            ('pj-report-format-html', 'HTML'),
+            ('pj-report-format-docx', 'Word（DOCX）'),
+            ('pj-report-format-pdf', 'PDF')):
+        assert f'id="{control}"' in html
+        assert f'for="{control}"' in html
+        assert label in html
+    assert 'id="pj-report-format-status" role="status"' in html
+    assert 'aria-live="polite" aria-atomic="true"' in html
+    assert '已选择：HTML；能力检测中：DOCX、PDF' in html
+    for control in ('pj-report-format-docx', 'pj-report-format-pdf'):
+        start = html.index(f'<input type="checkbox" id="{control}"')
+        end = html.index('>', start)
+        initial_control = html[start:end]
+        assert ' disabled' in initial_control
+        assert ' checked' not in initial_control
+        assert 'aria-disabled="true"' in initial_control
+    assert 'function selectedReportFormats()' in js
+    assert 'function requireReportFormats()' in js
+    assert "VCS.call('proj_report_capabilities')" in js
+    capability = js[js.index('function initialReportCapabilities()'):
+                    js.index('function requireReportFormats()')]
+    assert "reportCapabilities: initialReportCapabilities()" in js
+    assert "reportCapabilityState: 'pending'" in js
+    assert "html: { available: true, reason: '' }" in capability
+    assert capability.count('available: false') >= 2
+    assert 'capability.available === true' in capability
+    assert 'disabledByCapability = !(capability && capability.available === true)' in capability
+    assert "State.reportCapabilityState = 'failed'" in capability
+    assert "applyReportCapabilities(result.formats)" in capability
+    assert "setReportCapabilityFailure(" in capability
+    assert "description.textContent = disabledByCapability ? reason" in capability
+    assert 'unavailableReportFormatText(unavailable)' in capability
+    assert "fieldset.setAttribute(\n        'aria-busy'" in capability
+    init = js[js.index("wire('pj-report', report);"):]
+    assert init.index('\n    syncReportFormatControls();') < init.index('\n    loadReportCapabilities();')
+    assert 'if (!selectedFormats) return' in js
+    assert "'proj_report_bundle', proj.path, dr.path, selectedFormats, true" in js
+    assert '请至少选择一种报告格式' in js
+    assert "selectedFormats.length !== 1 || selectedFormats[0] !== 'html'" in js
+    assert '请只勾选 HTML 后重试' in js
+    assert "kind: 'final'" not in js[js.index('if (bridgeMethodUnavailable(r))'):
+                                      js.index("VCS.log('生成完整报告失败:")]
+    assert "first.focus()" in js
+    assert '.pj-report-format-options' in css
+    assert '.pj-report-formats.invalid' in css
+
+
+def test_report_artifact_and_scientific_states_are_rendered_separately():
+    project = _source('project.js')
+    dashboard = _source('dashboard.js')
+    css = _source('app.css')
+
+    science = project[project.index('function reportScienceState('):
+                      project.index('function reportStateMarkup(')]
+    pipeline = dashboard[dashboard.index('function pipelineReportStates('):
+                         dashboard.index('function shortTime(')]
+    assert 'result.scientific_status || result.report_status || result.report_kind || result.kind' in science
+    assert 'report_done' not in science
+    assert '<b>报告产物</b>' in project and '<b>科学状态</b>' in project
+    assert '<b>发布门禁</b>' in project
+    assert "p.stage === 'report_done'" in pipeline
+    assert 'report_done 只说明文件生成流程结束，绝不用于推断科学结论是 final' in pipeline
+    assert 'p.scientific_status || p.report_status || p.report_kind' in pipeline
+    assert '<b>报告产物</b>' in dashboard and '<b>科学状态</b>' in dashboard
+    assert '<b>发布门禁</b>' in dashboard
+    assert 'p.publication_gate_status' in pipeline
+    assert "artifactRaw === 'stale'" in pipeline
+    assert '.pj-report-states' in css and '.pl-report-states' in css
+
+
 def test_errors_offer_a_direct_repair_action_instead_of_log_only():
     js = _source('project.js')
     assert 'function lisRepairHint(message, stage)' in js

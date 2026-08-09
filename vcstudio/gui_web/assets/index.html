@@ -1409,9 +1409,34 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
         <button class="btn" id="pj-refresh">刷新</button>
       </div>
       <div class="pj-project-summary" id="pj-project-summary">正在读取项目…</div>
+      <fieldset class="pj-report-formats" id="pj-report-formats"
+        aria-describedby="pj-report-format-status" aria-busy="true">
+        <legend>单项目报告格式（至少选择一项）</legend>
+        <div class="pj-report-format-options">
+          <label for="pj-report-format-html">
+            <input type="checkbox" id="pj-report-format-html" value="html" checked
+              aria-describedby="pj-report-format-html-note" aria-disabled="false">
+            <span><b>HTML</b><small id="pj-report-format-html-note">浏览器预览（始终可用）</small></span>
+          </label>
+          <label class="unavailable pending" for="pj-report-format-docx">
+            <input type="checkbox" id="pj-report-format-docx" value="docx" disabled
+              aria-describedby="pj-report-format-docx-note" aria-disabled="true">
+            <span><b>Word（DOCX）</b><small id="pj-report-format-docx-note">正在等待后端明确确认；确认可用前不会提交此格式。</small></span>
+          </label>
+          <label class="unavailable pending" for="pj-report-format-pdf">
+            <input type="checkbox" id="pj-report-format-pdf" value="pdf" disabled
+              aria-describedby="pj-report-format-pdf-note" aria-disabled="true">
+            <span><b>PDF</b><small id="pj-report-format-pdf-note">正在等待后端明确确认；确认可用前不会提交此格式。</small></span>
+          </label>
+        </div>
+        <p class="pj-report-format-status" id="pj-report-format-status" role="status"
+          aria-live="polite" aria-atomic="true">
+          已选择：HTML；能力检测中：DOCX、PDF（正在等待后端明确确认；确认可用前不会提交此格式。）
+        </p>
+      </fieldset>
       <div class="actions" style="margin-bottom:12px">
         <button class="btn primary" id="pj-delta" disabled>刷新并计算 ΔE</button>
-        <button class="btn" id="pj-report" disabled>生成 HTML / Word / PDF 报告</button>
+        <button class="btn" id="pj-report" aria-describedby="pj-report-format-status" disabled>生成 HTML / Word / PDF 报告</button>
         <button class="btn quiet" id="pj-csv" disabled>导出 ΔE CSV</button>
       </div>
       <div id="pj-candidate-evaluation" class="pj-candidate-card" hidden aria-live="polite"></div>

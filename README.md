@@ -232,6 +232,8 @@ silent (job.yaml state machine + audit history).
 - 自动托管的调度从浏览器定时器移到应用内 Python 主管线程。只要应用进程仍在运行，
   页面切换不会中断监控；界面可读取运行/暂停、上次与下次检查、续算轮次、阻塞原因和
   报告状态。结果达到最终门后自动生成完整报告；证据不足时只生成诊断报告。
+  “产物已生成”、报告用途、科学资格、内容哈希、sidecar、manifest 与 marker 的边界见
+  [报告状态与证据合同](docs/report-state-contract.md)。
 - AI 助手新增受 [MatClaw](https://github.com/DingyangLyu/MatClaw) 启发的对话入口：
   支持本地会话恢复、受限附件、只读状态和停止当前 AI 响应，同时复用 vcstudio 已有的
   科学门禁。它不嵌入 Node/Docker/Claude SDK，不开放任意 shell，也不能通过 `/stop`

@@ -8,10 +8,14 @@ import json
 import os
 import sys
 import types
+from pathlib import Path
+
+import pytest
 
 from vcstudio.gui_web.api import Api, _sha256_file
 from vcstudio.cluster.profiles import ClusterProfile
 from vcstudio.cluster import submitter as cluster_submitter
+from vcstudio.project import paper_report as canonical_paper_report
 
 
 # ── 假件工厂 ────────────────────────────────────────────────────────────────
@@ -992,6 +996,95 @@ def test_proj_import_commit_passes_full_selection_and_injected_modules():
     assert got['manifest_mod'] is manifest
 
 
+def test_proj_import_commit_uses_actual_bundle_reason_after_preflight_changes(tmp_path):
+    members = [str(tmp_path / name) for name in ('clean', 'config')]
+    project_path = str(tmp_path / 'project.yaml')
+    project = {
+        'name': 'imported', 'root': str(tmp_path),
+        'members': {'clean_slab': members[0], 'gas_ref': None,
+                    'configs': [members[1]]},
+    }
+    result_import = types.SimpleNamespace(commit_import=lambda *_args, **_kwargs: {
+        'ok': True, 'project': project, 'project_path': project_path,
+        'imported': [], 'summary': {},
+    })
+    adsorption = _fake_adsorption(delta_ret={'rows': []})
+    adsorption.save_project = lambda *_args: None
+    manifests = {path: {'state': 'DONE', 'results': {}} for path in members}
+    api = Api(
+        result_import_mod=result_import,
+        adsorption_mod=adsorption,
+        manifest_mod=_fake_manifest_mod(manifests),
+        ledger_mod=_fake_ledger([], []),
+    )
+    api._final_report_gate = lambda *_args: (True, '')
+    marker = {'kind': 'diagnostic'}
+    api.proj_report_bundle = lambda *_args, **_kwargs: {
+        'ok': True,
+        'kind': 'diagnostic',
+        'scientific_status': 'diagnostic',
+        'gate_reason': '实际 bundle 发现参考态已变化',
+        'marker': marker,
+        'files': {'html': str(tmp_path / 'diagnostic.html')},
+        'error': None,
+    }
+
+    out = api.proj_import_commit(
+        '/raw', str(tmp_path), 'imported',
+        [{'path': '/raw/config', 'selected': True, 'role': 'config'}])
+
+    assert out['ok'] is True
+    assert out['auto_report_reason'] == '实际 bundle 发现参考态已变化'
+    assert out['auto_report_blocked'] is marker
+
+
+def test_proj_import_auto_report_uses_only_proven_available_formats(tmp_path):
+    members = [str(tmp_path / name) for name in ('clean', 'config')]
+    project_path = str(tmp_path / 'project.yaml')
+    project = {
+        'name': 'imported', 'root': str(tmp_path),
+        'members': {'clean_slab': members[0], 'gas_ref': None,
+                    'configs': [members[1]]},
+    }
+    result_import = types.SimpleNamespace(commit_import=lambda *_args, **_kwargs: {
+        'ok': True, 'project': project, 'project_path': project_path,
+        'imported': [], 'summary': {},
+    })
+    paper = types.SimpleNamespace(report_capabilities=lambda: {
+        'formats': {
+            'html': {'available': True, 'reason': ''},
+            'docx': {'available': False, 'reason': 'python-docx unavailable'},
+            'pdf': {'available': False, 'reason': 'PDF backend unavailable'},
+        },
+    })
+    adsorption = _fake_adsorption(delta_ret={'rows': []})
+    adsorption.save_project = lambda *_args: None
+    api = Api(
+        result_import_mod=result_import,
+        adsorption_mod=adsorption,
+        manifest_mod=_fake_manifest_mod({
+            path: {'state': 'DONE', 'results': {}} for path in members}),
+        ledger_mod=_fake_ledger([], []),
+        paper_report_mod=paper,
+    )
+    captured = {}
+    api.proj_report_bundle = lambda _path, _out, formats=None, **_kwargs: (
+        captured.update(formats=tuple(formats or ())) or {
+            'ok': True, 'kind': 'diagnostic',
+            'scientific_status': 'diagnostic', 'gate_reason': '参考态缺失',
+            'marker': {'kind': 'diagnostic'}, 'files': {'html': 'report.html'},
+            'error': None,
+        })
+
+    out = api.proj_import_commit(
+        '/raw', str(tmp_path), 'imported',
+        [{'path': '/raw/config', 'selected': True, 'role': 'config'}])
+
+    assert out['ok'] is True
+    assert captured['formats'] == ('html',)
+    assert out['auto_report']['ok'] is True
+
+
 def test_proj_import_commit_requires_selected_nonignored_item():
     api = Api(result_import_mod=_fake_result_import())
     out = api.proj_import_commit('/raw', '/managed', 'demo', [
@@ -1172,27 +1265,51 @@ def test_proj_export_csv_missing_project_error():
 
 
 # ── proj_report ──────────────────────────────────────────────────────────────
-def test_proj_report_generates_via_report_full():
-    proj = {'name': 'demo', 'members': {}}
+def test_proj_report_is_legacy_shape_adapter_for_canonical_bundle(tmp_path):
     calls = {}
-    ads = _fake_adsorption(proj_map={'/p': proj})
-    rf = _fake_report_full(member_dirs=['/s', '/c1'],
-                           report_ret='/save/报告.html', calls=calls)
-    api = Api(adsorption_mod=ads, report_full_mod=rf,
-              config_mod=_fake_config(cfg={'k': 'v'}))
-    out = api.proj_report('/p', '/save/报告.html')
-    assert out['ok'] is True and out['file'] == '/save/报告.html'
-    assert calls['report']['out'] == '/save/报告.html'
-    assert calls['report']['config'] == {'k': 'v'} and calls['report']['proj'] is proj
+    legacy = types.SimpleNamespace(
+        generate_project_report=lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError('legacy report_full renderer must not be called')))
+    api = Api(report_full_mod=legacy)
+
+    def _bundle(path, out_dir, formats=None, final=True, stem=None):
+        calls.update(path=path, out_dir=out_dir, formats=formats,
+                     final=final, stem=stem)
+        html = os.path.join(out_dir, f'{stem}.html')
+        return {
+            'ok': True, 'kind': 'diagnostic',
+            'scientific_status': 'diagnostic',
+            'scientific_qualification': 'diagnostic',
+            'artifact_status': 'complete', 'gate_reason': 'manual draft',
+            'marker': {'kind': 'diagnostic'}, 'files': {'html': html},
+            'error': None,
+        }
+
+    api.proj_report_bundle = _bundle
+    requested = tmp_path / '报告.html'
+    out = api.proj_report('/p', str(requested), final=False)
+
+    assert out['ok'] is True and out['file'] == str(requested)
+    assert out['files'] == [str(requested)]
+    assert calls == {
+        'path': '/p', 'out_dir': str(tmp_path), 'formats': ('html',),
+        'final': False, 'stem': '报告',
+    }
+    assert out['kind'] == out['scientific_status'] == 'diagnostic'
+    assert out['gate_reason'] == 'manual draft'
 
 
-def test_proj_report_no_members_error():
-    proj = {'name': 'demo', 'members': {}}
-    ads = _fake_adsorption(proj_map={'/p': proj})
-    rf = _fake_report_full(member_dirs=[])       # 无成员作业
-    api = Api(adsorption_mod=ads, report_full_mod=rf, config_mod=_fake_config())
-    out = api.proj_report('/p', '/save/x.html')
-    assert out['ok'] is False and out['file'] is None and '成员' in out['error']
+def test_proj_report_maps_canonical_bundle_failure_to_legacy_shape(tmp_path):
+    api = Api()
+    api.proj_report_bundle = lambda *_a, **_k: {
+        'ok': False, 'kind': None, 'files': {}, 'marker': None,
+        'error': '项目无成员作业',
+    }
+
+    out = api.proj_report('/p', str(tmp_path / 'x.html'))
+
+    assert out['ok'] is False and out['file'] is None and out['files'] == []
+    assert '成员' in out['error']
 
 
 # ── adopt_root_get / adopt_root_set(认领本地根目录配置) ──────────────────────
@@ -1633,7 +1750,10 @@ def _fake_paper_report(calls):
             'assets': [],
         }
 
-    return types.SimpleNamespace(render_report_bundle=_render)
+    return types.SimpleNamespace(
+        render_report_bundle=_render,
+        report_content_sha256=lambda _model, **_kwargs: 'd' * 64,
+    )
 
 
 def _fake_lis_freeenergy():
@@ -2045,6 +2165,10 @@ def test_proj_batch_report_unverified_method_is_diagnostic(tmp_path):
     model = render_calls[0]['model']
     assert model['report_kind'] == 'diagnostic'
     assert '诊断' in model['subtitle']
+    assert model['report_spec']['preset_id'] == 'multi-catalyst-comparison'
+    assert model['validation']['effective_kind'] == 'diagnostic'
+    assert model['validation']['final_allowed'] is False
+    assert model['contract_refs']['snapshot']['schema'] == 'vcstudio.report-snapshot/v1'
     assert model['metadata']['比较门禁'] == 'unverified'
     assert model['candidate_evaluations']['rows']
     assert all(row[1] == 'hold_for_evidence'
@@ -2286,32 +2410,50 @@ def test_autopilot_save_persists_subswitches():
 # ── pipeline_tick(幂等:首拍 report_done + 写标记,次拍无重复) ──────────────────
 def _install_fake_report_bundle(api, calls, *, order=None):
     """Replace the bundle entry point while preserving final/diagnostic gating."""
-    def _bundle(path, out_dir, formats=None, final=True, stem=None):
+    def _bundle(path, out_dir, formats=None, final=True, stem=None,
+                record_artifact=True):
         calls['reports'] = calls.get('reports', 0) + 1
         if order is not None:
             order.append('report')
         project = api._adsorption.load_project(path)
         summary = api._adsorption.delta_e_rows(project)
-        eligible, _reason = api._final_report_gate(project, summary)
+        eligible, reason = api._final_report_gate(project, summary)
         kind = 'final' if final and eligible else 'diagnostic'
         wanted = tuple(formats or ('html', 'docx', 'pdf'))
+        calls.setdefault('formats', []).append(wanted)
         report_stem = stem or 'report'
-        files = {}
-        os.makedirs(out_dir, exist_ok=True)
-        for fmt in wanted:
-            output = os.path.join(out_dir, f'{report_stem}.{fmt}')
-            with open(output, 'w', encoding='utf-8') as handle:
-                handle.write(
-                    f'{kind} {fmt} bundle generation {calls["reports"]}')
-            files[str(fmt)] = output
+        content_model = {
+            'locale': 'zh-CN',
+            'report_kind': kind,
+            'scientific_qualification': (
+                'adsorption_result_verified' if kind == 'final' else 'diagnostic'),
+            'claim_ceiling': 'electronic_adsorption_screen',
+        }
+        report_model_sha256 = canonical_paper_report.report_content_sha256(
+            content_model)
+        contracts = api._project_report_contracts(
+            project, path, summary, None,
+            requested_kind='final' if final else 'diagnostic',
+            report_kind=kind,
+            formats=wanted,
+            eligible_final=eligible,
+            gate_reason=reason,
+            report_model_sha256=report_model_sha256,
+        )
+        rendered = _contract_bundle_renderer()(
+            {**content_model, **contracts}, out_dir,
+            stem=report_stem, formats=wanted)
         calls.setdefault('kinds', []).append(kind)
-        return {
-            'ok': True,
+        rendered.update({
+            'ok': True, 'artifact_status': 'complete',
             'kind': kind,
-            'files': files,
+            'scientific_status': kind,
+            'scientific_qualification': contracts['scientific_qualification'],
+            'gate_reason': reason,
             'figures': [],
             'error': None,
-        }
+        })
+        return rendered
 
     api.proj_report_bundle = _bundle
 
@@ -2385,6 +2527,654 @@ def _report_gate_fixture(tmp_path, *, has_ref=True, method_status='verified',
     return api, project, manifests, summary, calls
 
 
+def _contract_bundle_renderer(*, captured=None, on_render=None):
+    """Small valid renderer double with manifest and portable contract sidecars."""
+    def _render(model, out_dir, *, stem, formats):
+        if captured is not None:
+            captured['model'] = copy.deepcopy(model)
+        if on_render is not None:
+            on_render()
+        files = {}
+        os.makedirs(out_dir, exist_ok=True)
+        for fmt in formats:
+            path = Path(out_dir) / f'{stem}.{fmt}'
+            path.write_text(f'{fmt} report', encoding='utf-8')
+            files[fmt] = path
+        contract_files = {}
+        contract_records = copy.deepcopy(model['contract_refs'])
+        for key, model_key in (
+                ('spec', 'report_spec'), ('snapshot', 'report_snapshot'),
+                ('validation', 'validation')):
+            contract_path = Path(out_dir) / f'{stem}.{key}.json'
+            contract_path.write_text(
+                json.dumps(model[model_key], ensure_ascii=False, sort_keys=True),
+                encoding='utf-8')
+            contract_files[key] = contract_path
+            contract_records[key].update({
+                'path': contract_path.name,
+                'file_sha256': _sha256_file(contract_path),
+                'size': contract_path.stat().st_size,
+            })
+        model_file = Path(out_dir) / f'{stem}.model.json'
+        # Mirror the production renderer's normalized, staged-model sidecar.
+        # These API fixtures deliberately use no figures, so no asset staging is
+        # required before the semantic model projection is frozen.
+        normalized_model = canonical_paper_report._normalize_model(
+            model, requested_formats=formats)
+        frozen_model = canonical_paper_report._fingerprint_model(normalized_model)
+        model_file.write_bytes(
+            canonical_paper_report._canonical_json_bytes(frozen_model))
+        model_sha256 = _sha256_file(model_file)
+        manifest = Path(out_dir) / f'{stem}.manifest.json'
+        manifest.write_text(json.dumps({
+            'schema': 'vcstudio.paper-report.bundle/v2',
+            'artifact_status': 'complete',
+            'report_kind': model['report_kind'],
+            'scientific_status': model['report_kind'],
+            'scientific_qualification': model['scientific_qualification'],
+            'model_sha256': model_sha256,
+            'report_model_sha256': model['validation']['report_model_sha256'],
+            'input_fingerprint': model['input_fingerprint'],
+            'contracts': contract_records,
+            'model_file': {
+                'path': model_file.name,
+                'sha256': model_sha256,
+                'size': model_file.stat().st_size,
+            },
+            'formats': list(formats),
+            'files': {
+                fmt: {
+                    'path': path.name,
+                    'sha256': _sha256_file(path),
+                    'size': path.stat().st_size,
+                }
+                for fmt, path in files.items()
+            },
+        }, ensure_ascii=False), encoding='utf-8')
+        return {
+            'schema': 'vcstudio.paper-report.bundle/v2',
+            'artifact_status': 'complete',
+            'model_sha256': model_sha256,
+            'report_model_sha256': model['validation']['report_model_sha256'],
+            'report_kind': model['report_kind'],
+            'scientific_status': model['report_kind'],
+            'scientific_qualification': model['scientific_qualification'],
+            'input_fingerprint': model['input_fingerprint'],
+            'contracts': contract_records,
+            'contract_files': contract_files,
+            'model_file': model_file,
+            'manifest': manifest,
+            'files': files,
+            'assets': [],
+        }
+
+    return _render
+
+
+def _persist_contract_marker(api, project, project_path, summary, out_dir, *,
+                             kind='final', eligible=True, reason=''):
+    """Persist a fully bound test marker through the production validation seam."""
+    content_model = {
+        'locale': 'zh-CN',
+        'report_kind': kind,
+        'scientific_qualification': (
+            'adsorption_result_verified' if kind == 'final' else 'diagnostic'),
+        'claim_ceiling': 'electronic_adsorption_screen',
+    }
+    report_model_sha256 = canonical_paper_report.report_content_sha256(
+        content_model)
+    contracts = api._project_report_contracts(
+        project, project_path, summary, None,
+        requested_kind='final' if kind == 'final' else kind,
+        report_kind=kind,
+        formats=('html',),
+        eligible_final=eligible,
+        gate_reason=reason,
+        report_model_sha256=report_model_sha256,
+    )
+    rendered = _contract_bundle_renderer()(
+        {**content_model, **contracts}, str(out_dir),
+        stem='bound-report', formats=('html',))
+    marker_files = dict(rendered['files'])
+    marker_files['manifest'] = rendered['manifest']
+    marker_files['model'] = rendered['model_file']
+    marker_files.update({
+        f'contract_{key}': value
+        for key, value in rendered['contract_files'].items()
+    })
+    marker = api._persist_report_marker(
+        project, summary, marker_files, kind=kind, reason=reason,
+        model_sha256=rendered['model_sha256'],
+        report_model_sha256=rendered['report_model_sha256'],
+        contracts=rendered['contracts'],
+        scientific_qualification=contracts['scientific_qualification'],
+        manifest=rendered['manifest'],
+    )
+    return marker, rendered
+
+
+def test_manual_bundle_persists_contract_bound_canonical_marker(tmp_path):
+    clean = str(tmp_path / 'clean')
+    config = str(tmp_path / 'config')
+    reference = str(tmp_path / 'reference')
+    project_path = str(tmp_path / 'project.yaml')
+    Path(project_path).write_text('schema: vcstudio.project/v1\n', encoding='utf-8')
+    project = {
+        'name': 'manual-report', 'project_uuid': 'project-manual-1',
+        'root': str(tmp_path),
+        'members': {'clean_slab': clean, 'gas_ref': reference, 'configs': [config]},
+    }
+    summary = _science_delta('manual-report')
+    manifests = {
+        clean: {'state': 'DONE', 'results': {'energy_e0_eV': -100.0}},
+        reference: {'state': 'DONE', 'results': {'energy_e0_eV': -10.0}},
+        config: {'state': 'DONE', 'results': {'energy_e0_eV': -111.04}},
+    }
+    saved = []
+    adsorption = _fake_adsorption(
+        projects=[project_path], proj_map={project_path: project}, delta_ret=summary)
+    adsorption.save_project = lambda root, value: saved.append((root, copy.deepcopy(value)))
+    captured = {}
+
+    api = Api(
+        adsorption_mod=adsorption,
+        manifest_mod=_fake_manifest_mod(manifests),
+        paper_report_mod=types.SimpleNamespace(
+            render_report_bundle=_contract_bundle_renderer(captured=captured)),
+        config_mod=_fake_config(),
+    )
+    api._project_report_figures = lambda *_args, **_kwargs: ([], [])
+    api._proj_fed = lambda *_args, **_kwargs: (None, '缺少完整自由能台阶')
+
+    out = api.proj_report_bundle(
+        project_path, str(tmp_path / 'report'), formats=['html'], final=True)
+
+    assert out['ok'] is True
+    assert out['kind'] == 'final'
+    assert out['artifact_status'] == 'complete'
+    assert saved and project['autopilot_report'] == out['marker']
+    marker = out['marker']
+    assert marker['artifact_status'] == 'ready'
+    assert marker['kind'] == marker['scientific_status'] == 'final'
+    assert marker['scientific_qualification'] == 'adsorption_result_verified'
+    assert set(marker['files']) == {
+        'html', 'manifest', 'contract_spec', 'contract_snapshot',
+        'contract_validation', 'model'}
+    assert marker['sha256'] == marker['report_hashes']
+    assert marker['model_sha256'] == out['model_sha256']
+    assert marker['model_sha256'] == _sha256_file(out['model_file'])
+    assert marker['contracts']['spec']['schema'] == 'vcstudio.report-spec/v1'
+    assert marker['contracts']['snapshot']['schema'] == 'vcstudio.report-snapshot/v1'
+    assert marker['contracts']['validation']['schema'] == 'vcstudio.report-validation/v1'
+    model = captured['model']
+    assert model['report_spec']['requested_kind'] == 'final'
+    assert model['validation']['effective_kind'] == 'final'
+    assert model['validation']['final_allowed'] is True
+    assert model['report_snapshot']['input_fingerprint'] == model['input_fingerprint']
+
+
+def test_bundle_never_records_failed_or_partial_renderer_output(tmp_path):
+    def _case(case_name, renderer):
+        root = tmp_path / case_name
+        root.mkdir()
+        project_path = str(root / 'project.yaml')
+        Path(project_path).write_text('schema: vcstudio.project/v1\n', encoding='utf-8')
+        members = [str(root / name) for name in ('clean', 'reference', 'config')]
+        project = {
+            'name': case_name, 'project_uuid': f'{case_name}-id', 'root': str(root),
+            'members': {'clean_slab': members[0], 'gas_ref': members[1],
+                        'configs': [members[2]]},
+        }
+        manifests = {
+            path: {'state': 'DONE', 'scheduler_job_id': f'job-{index}',
+                   'results': {'energy_e0_eV': -100.0 - index}}
+            for index, path in enumerate(members)
+        }
+        saved = []
+        adsorption = _fake_adsorption(
+            projects=[project_path], proj_map={project_path: project},
+            delta_ret=_science_delta(case_name))
+        adsorption.save_project = lambda root, value: saved.append(
+            (root, copy.deepcopy(value)))
+        api = Api(
+            adsorption_mod=adsorption,
+            manifest_mod=_fake_manifest_mod(manifests),
+            paper_report_mod=types.SimpleNamespace(render_report_bundle=renderer),
+            config_mod=_fake_config(),
+        )
+        api._project_report_figures = lambda *_args, **_kwargs: ([], [])
+        api._proj_fed = lambda *_args, **_kwargs: (None, 'not available')
+        return api, project, saved, project_path, root
+
+    def _failed(_model, out_dir, *, stem, formats):
+        os.makedirs(out_dir, exist_ok=True)
+        files = {}
+        for fmt in formats:
+            path = Path(out_dir) / f'{stem}.{fmt}'
+            path.write_text('partial bytes', encoding='utf-8')
+            files[fmt] = path
+        return {'ok': False, 'error': 'renderer failed', 'files': files}
+
+    api, project, saved, project_path, root = _case('failed-render', _failed)
+    failed = api.proj_report_bundle(
+        project_path, str(root / 'report'), formats=['html'], final=True)
+    assert failed['ok'] is False and 'renderer failed' in failed['error']
+    assert saved == [] and 'autopilot_report' not in project
+
+    def _partial(_model, out_dir, *, stem, formats):
+        os.makedirs(out_dir, exist_ok=True)
+        html = Path(out_dir) / f'{stem}.html'
+        html.write_text('html only', encoding='utf-8')
+        return {'ok': True, 'files': {'html': html}}
+
+    api, project, saved, project_path, root = _case('partial-render', _partial)
+    partial = api.proj_report_bundle(
+        project_path, str(root / 'report'), formats=['html', 'pdf'], final=True)
+    assert partial['ok'] is False and 'pdf' in partial['error']
+    assert saved == [] and 'autopilot_report' not in project
+
+    api, project, saved, project_path, root = _case(
+        'partial-individual-render', _partial)
+    individual = api.proj_report_bundle(
+        project_path, str(root / 'report'), formats=['html', 'pdf'], final=True,
+        record_artifact=False)
+    assert individual['ok'] is False and 'pdf' in individual['error']
+    assert individual.get('marker') is None
+    assert saved == [] and 'autopilot_report' not in project
+
+
+def test_bundle_marker_cas_preserves_concurrent_fields_and_rejects_changed_inputs(tmp_path):
+    def _case(case_name, on_render):
+        root = tmp_path / case_name
+        root.mkdir()
+        project_path = str(root / 'project.yaml')
+        Path(project_path).write_text('schema: vcstudio.project/v1\n', encoding='utf-8')
+        members = [str(root / name) for name in ('clean', 'reference', 'config')]
+        initial = {
+            'name': case_name, 'project_uuid': f'{case_name}-id', 'root': str(root),
+            'members': {'clean_slab': members[0], 'gas_ref': members[1],
+                        'configs': [members[2]]},
+        }
+        store = {'project': copy.deepcopy(initial), 'saved': 0}
+        manifests = {
+            path: {'state': 'DONE', 'scheduler_job_id': f'job-{index}',
+                   'attempts': [{'n': 1, 'job_id': f'job-{index}'}],
+                   'results': {'energy_e0_eV': -100.0 - index}}
+            for index, path in enumerate(members)
+        }
+        adsorption = _fake_adsorption(
+            projects=[project_path], proj_map={}, delta_ret=_science_delta(case_name))
+        adsorption.load_project = lambda _path: copy.deepcopy(store['project'])
+
+        def _save(_root, value):
+            store['saved'] += 1
+            store['project'] = copy.deepcopy(value)
+
+        adsorption.save_project = _save
+        api = Api(
+            adsorption_mod=adsorption,
+            manifest_mod=_fake_manifest_mod(manifests),
+            paper_report_mod=types.SimpleNamespace(
+                render_report_bundle=_contract_bundle_renderer(on_render=on_render)),
+            config_mod=_fake_config(),
+        )
+        api._project_report_figures = lambda *_args, **_kwargs: ([], [])
+        api._proj_fed = lambda *_args, **_kwargs: (None, 'not available')
+        return api, store, manifests, members, project_path, root
+
+    holder = {}
+
+    def _add_unrelated_field():
+        holder['store']['project']['concurrent_note'] = 'must survive marker commit'
+
+    api, store, _manifests, _members, project_path, root = _case(
+        'merge-current-project', _add_unrelated_field)
+    holder['store'] = store
+    merged = api.proj_report_bundle(
+        project_path, str(root / 'report'), formats=['html'], final=True)
+    assert merged['ok'] is True and store['saved'] == 1
+    assert store['project']['concurrent_note'] == 'must survive marker commit'
+    assert store['project']['autopilot_report']['scientific_fingerprint']
+
+    changed = {}
+
+    def _change_attempt():
+        changed['manifests'][changed['members'][2]]['scheduler_job_id'] = 'new-attempt'
+
+    api, store, manifests, members, project_path, root = _case(
+        'reject-changed-input', _change_attempt)
+    changed.update(manifests=manifests, members=members)
+    stale = api.proj_report_bundle(
+        project_path, str(root / 'report'), formats=['html'], final=True)
+    assert stale['ok'] is False and stale['stale_input'] is True
+    assert '变化' in stale['error']
+    assert store['saved'] == 0 and 'autopilot_report' not in store['project']
+
+
+def test_proj_report_capabilities_is_json_safe_and_keeps_format_reasons():
+    paper = types.SimpleNamespace(report_capabilities=lambda: {
+        'schema': 'vcstudio.paper-report.capabilities/v1',
+        'formats': {
+            'html': {'available': True, 'reason': ''},
+            'docx': {'available': False, 'reason': 'python-docx 未安装'},
+            'pdf': {'available': True, 'reason': ''},
+        },
+    })
+
+    out = Api(paper_report_mod=paper).proj_report_capabilities()
+
+    assert out['ok'] is True and out['error'] is None
+    assert out['formats']['docx']['available'] is False
+    assert 'python-docx' in out['formats']['docx']['reason']
+    json.dumps(out, ensure_ascii=False)
+
+
+def test_report_capabilities_fail_closed_when_probe_is_missing_or_raises():
+    missing = Api(paper_report_mod=types.SimpleNamespace()).proj_report_capabilities()
+    assert missing['ok'] is True and missing['probe_ok'] is False
+    assert missing['formats']['html']['available'] is True
+    assert missing['formats']['docx']['available'] is False
+    assert missing['formats']['pdf']['available'] is False
+    assert missing['formats']['docx']['reason']
+    assert Api(paper_report_mod=types.SimpleNamespace())._available_report_formats() == (
+        'html',)
+
+    broken = Api(paper_report_mod=types.SimpleNamespace(
+        report_capabilities=lambda: (_ for _ in ()).throw(
+            RuntimeError('dependency probe crashed'))))
+    status = broken.proj_report_capabilities()
+    assert status['ok'] is True and status['probe_ok'] is False
+    assert status['formats']['html']['available'] is True
+    assert all(not status['formats'][fmt]['available'] for fmt in ('docx', 'pdf'))
+    assert 'probe crashed' in status['formats']['pdf']['reason']
+    assert broken._available_report_formats() == ('html',)
+
+
+def test_explicit_empty_report_formats_fail_with_stable_two_axis_envelope(tmp_path):
+    api = Api()
+
+    project = api.proj_report_bundle('/missing', str(tmp_path), formats=[])
+    batch = api.proj_batch_report([], str(tmp_path), formats=[])
+
+    for result in (project, batch):
+        assert result['ok'] is False
+        assert result['artifact_status'] == 'failed'
+        assert result['scientific_status'] is None
+        assert result['scientific_qualification'] is None
+        assert result['marker'] is None and result['files'] == {}
+        assert result['publication_gate_status'] == 'unknown'
+        assert '至少选择一种报告格式' in result['error']
+
+
+def test_post_gate_renderer_failure_preserves_gate_axis_not_attempted_kind(tmp_path):
+    api, _project, _manifests, _summary, _calls = _report_gate_fixture(tmp_path)
+    del api.proj_report_bundle
+    api._project_report_figures = lambda *_args, **_kwargs: ([], [])
+    api._proj_fed = lambda *_args, **_kwargs: (None, 'not available')
+
+    def _raise_renderer(*_args, **_kwargs):
+        raise RuntimeError('renderer crashed after gate evaluation')
+
+    api._paper_report = types.SimpleNamespace(
+        report_content_sha256=canonical_paper_report.report_content_sha256,
+        render_report_bundle=_raise_renderer,
+    )
+
+    result = api.proj_report_bundle(
+        '/managed/project.yaml', str(tmp_path / 'failed-draft'),
+        formats=['html'], requested_kind='draft')
+
+    assert result['ok'] is False
+    assert result['artifact_status'] == 'failed'
+    assert result['scientific_status'] is None
+    assert result['kind'] is None
+    assert result['requested_kind'] == 'draft'
+    assert result['publication_gate_status'] == 'eligible'
+    assert result['desired_report_kind'] == 'final'
+    assert 'renderer crashed' in result['error']
+
+
+def test_real_html_bundle_accepts_api_contract_chain(tmp_path):
+    api, project, _manifests, _summary, calls = _report_gate_fixture(tmp_path)
+    del api.proj_report_bundle  # remove the lightweight fixture override
+    api._project_report_figures = lambda *_args, **_kwargs: ([], [])
+    api._proj_fed = lambda *_args, **_kwargs: (None, '缺少完整自由能台阶')
+
+    out = api.proj_report_bundle(
+        '/managed/project.yaml', str(tmp_path / 'real-html'),
+        formats=['html'], final=True)
+
+    assert out['ok'] is True
+    assert out['kind'] == 'final'
+    assert Path(out['files']['html']).is_file()
+    manifest = json.loads(Path(out['manifest']).read_text(encoding='utf-8'))
+    assert manifest['report_kind'] == 'final'
+    assert manifest['contracts']['spec']['sha256'] == (
+        out['marker']['contracts']['spec']['sha256'])
+    assert manifest['contracts']['validation']['final_allowed'] is True
+    assert project['autopilot_report']['model_sha256'] == manifest['model_sha256']
+    assert calls['saved'] == 1
+
+
+def test_real_draft_bundle_is_current_but_never_closes_automatic_pipeline(tmp_path):
+    api, project, _manifests, _summary, _calls = _report_gate_fixture(tmp_path)
+    del api.proj_report_bundle
+    api._project_report_figures = lambda *_args, **_kwargs: ([], [])
+    api._proj_fed = lambda *_args, **_kwargs: (None, '缺少完整自由能台阶')
+
+    out = api.proj_report_bundle(
+        '/managed/project.yaml', str(tmp_path / 'draft'), formats=['html'],
+        final=True, requested_kind='draft')
+
+    assert out['ok'] is True
+    assert out['requested_kind'] == out['kind'] == 'draft'
+    assert out['scientific_status'] == 'draft'
+    assert out['scientific_qualification'] == 'diagnostic'
+    assert out['marker']['schema'] == 'vcstudio.report-marker/v2'
+    assert out['marker']['kind'] == 'draft'
+    assert Path(out['marker']['files']['model']).is_file()
+    assert 'autopilot_report_done' not in project
+    manifest = json.loads(Path(out['manifest']).read_text(encoding='utf-8'))
+    validation = json.loads(Path(out['contract_files']['validation']).read_text(
+        encoding='utf-8'))
+    assert manifest['report_kind'] == 'draft'
+    assert validation['effective_kind'] == 'draft'
+    assert validation['final_allowed'] is False
+
+    canonical = api.proj_report_status('/managed/project.yaml')
+    assert canonical['artifact_status'] == 'ready'
+    assert canonical['artifact_current'] is True
+    assert canonical['scientific_status'] == 'draft'
+    assert canonical['desired_report_kind'] == 'final'
+    pipeline = api.pipeline_status()['projects'][0]
+    assert pipeline['artifact_status'] == 'ready'
+    assert pipeline['scientific_status'] == 'draft'
+    assert pipeline['publication_gate_status'] == 'eligible'
+    assert pipeline['desired_report_kind'] == 'final'
+    assert pipeline['stage'] == 'analysis'
+
+
+def test_manual_and_automatic_real_bundle_seams_commit_equivalent_markers(tmp_path):
+    from vcstudio.project import paper_report as real_paper_report
+
+    api, project, _manifests, summary, _calls = _report_gate_fixture(tmp_path)
+    del api.proj_report_bundle
+    api._paper_report = types.SimpleNamespace(
+        render_report_bundle=real_paper_report.render_report_bundle,
+        report_content_sha256=real_paper_report.report_content_sha256,
+        report_capabilities=lambda: {
+            'formats': {
+                'html': {'available': True, 'reason': ''},
+                'docx': {'available': False, 'reason': 'not requested in seam test'},
+                'pdf': {'available': False, 'reason': 'not requested in seam test'},
+            },
+        },
+    )
+    api._project_report_figures = lambda *_args, **_kwargs: ([], [])
+    api._proj_fed = lambda *_args, **_kwargs: (None, '缺少完整自由能台阶')
+    formats = api._available_report_formats()
+
+    manual_result = api.proj_report_bundle(
+        '/managed/project.yaml', str(tmp_path / 'manual-real'),
+        formats=formats, requested_kind='final')
+    assert manual_result['ok'] is True
+    manual = copy.deepcopy(manual_result['marker'])
+    assert api._report_marker_current(project, summary) is True
+
+    project.pop('autopilot_report', None)
+    project.pop('autopilot_report_done', None)
+    events, errors = [], []
+    api._tick_reports(events, errors)
+    assert errors == [] and [event['kind'] for event in events] == ['report_done']
+    automatic = copy.deepcopy(project['autopilot_report'])
+    assert api._report_marker_current(project, summary) is True
+
+    assert manual['schema'] == automatic['schema'] == 'vcstudio.report-marker/v2'
+    assert manual['kind'] == automatic['kind'] == 'final'
+    assert manual['scientific_qualification'] == (
+        automatic['scientific_qualification'])
+    assert manual['model_sha256'] == automatic['model_sha256']
+    assert manual['report_model_sha256'] == automatic['report_model_sha256']
+    assert set(manual['files']) == set(automatic['files'])
+    for key in ('spec', 'snapshot', 'validation'):
+        assert manual['contracts'][key]['schema'] == automatic['contracts'][key]['schema']
+        assert manual['contracts'][key]['sha256'] == automatic['contracts'][key]['sha256']
+    assert manual['contracts']['validation']['final_allowed'] is True
+    assert automatic['contracts']['validation']['final_allowed'] is True
+
+
+def test_pipeline_status_uses_gate_axis_when_no_report_artifact_exists(tmp_path):
+    eligible_api, _project, _manifests, _summary, _calls = _report_gate_fixture(
+        tmp_path / 'eligible')
+    eligible = eligible_api.pipeline_status()['projects'][0]
+    assert eligible['artifact_status'] == 'missing'
+    assert eligible['scientific_status'] is None
+    assert eligible['scientific_qualification'] is None
+    assert eligible['report_kind'] is None and eligible['report_status'] is None
+    assert eligible['publication_gate_status'] == 'eligible'
+    assert eligible['desired_report_kind'] == 'final'
+
+    blocked_api, _project, _manifests, _summary, _calls = _report_gate_fixture(
+        tmp_path / 'blocked', has_ref=False)
+    blocked = blocked_api.pipeline_status()['projects'][0]
+    assert blocked['artifact_status'] == 'missing'
+    assert blocked['scientific_status'] is None
+    assert blocked['scientific_qualification'] is None
+    assert blocked['publication_gate_status'] == 'blocked'
+    assert blocked['desired_report_kind'] == 'diagnostic'
+    assert '参考态' in blocked['report_reason']
+
+
+def test_manual_diagnostic_bundle_records_artifact_without_final_claim(tmp_path):
+    api, project, _manifests, _summary, calls = _report_gate_fixture(
+        tmp_path, has_ref=False)
+    # Exercise the shared marker seam used by a real bundle while keeping this
+    # fixture's renderer intentionally light-weight.
+    report_dir = tmp_path / 'manual-diagnostic'
+    report_dir.mkdir()
+    files = {}
+    for fmt in ('html', 'docx', 'pdf'):
+        path = report_dir / f'report.{fmt}'
+        path.write_text(f'diagnostic {fmt}', encoding='utf-8')
+        files[fmt] = str(path)
+    summary = api._adsorption.delta_e_rows(project)
+    marker = api._persist_report_marker(
+        project, summary, files, kind='diagnostic',
+        reason='未设置有效参考态', scientific_qualification='diagnostic')
+
+    status = api.pipeline_status()['projects'][0]
+    assert marker['kind'] == 'diagnostic'
+    assert calls['saved'] == 1
+    assert status['artifact_status'] == 'ready'
+    assert status['scientific_status'] == 'diagnostic'
+    assert '未设置有效气相/逐物种参考态' in status['report_reason']
+    assert status['report_status'] != 'final'
+    project['autopilot_report']['kind'] = 'final'  # 手工篡改标签也必须重新过门禁
+    assert api.pipeline_status()['projects'][0]['scientific_status'] == 'diagnostic'
+
+
+def test_report_scientific_fingerprint_is_independent_of_workspace_location(tmp_path):
+    summary = _science_delta('portable')
+    left_root = tmp_path / 'left' / 'portable'
+    right_root = tmp_path / 'moved' / 'portable'
+    left_members = [str(left_root / name) for name in ('clean', 'reference', 'config')]
+    right_members = [str(right_root / name) for name in ('clean', 'reference', 'config')]
+    left = {
+        'name': 'portable', 'project_uuid': 'portable-id', 'root': str(left_root),
+        'members': {'clean_slab': left_members[0], 'gas_ref': left_members[1],
+                    'configs': [left_members[2]]},
+    }
+    right = {
+        'name': 'portable', 'project_uuid': 'portable-id', 'root': str(right_root),
+        'members': {'clean_slab': right_members[0], 'gas_ref': right_members[1],
+                    'configs': [right_members[2]]},
+    }
+    manifests = {
+        path: {'state': 'DONE', 'scheduler_job_id': f'job-{index}',
+               'results': {'energy_e0_eV': -100.0 - index,
+                           'fetched_sha256': {'OUTCAR': str(index) * 64}}}
+        for index, path in enumerate(left_members)
+    }
+    manifests.update({
+        path: copy.deepcopy(manifests[left_members[index]])
+        for index, path in enumerate(right_members)
+    })
+    adsorption = _fake_adsorption(delta_ret=summary)
+    adsorption.save_project = lambda *_args: None
+    api = Api(adsorption_mod=adsorption, manifest_mod=_fake_manifest_mod(manifests))
+
+    assert (api._report_scientific_fingerprint(left, summary)
+            == api._report_scientific_fingerprint(right, summary))
+    marker, _rendered = _persist_contract_marker(
+        api, left, str(left_root / 'project.yaml'), summary,
+        tmp_path / 'portable-report')
+    right['autopilot_report'] = copy.deepcopy(marker)
+    assert marker['scientific_fingerprint']
+    assert api._report_marker_current(right, summary) is True
+
+
+def test_report_member_ids_and_comparison_contracts_ignore_machine_paths(monkeypatch):
+    def _cross_drive(*_args, **_kwargs):
+        raise ValueError("path is on mount 'D:', start on mount 'C:'")
+
+    monkeypatch.setattr(os.path, 'relpath', _cross_drive)
+    member_id = Api._portable_member_id(
+        r'D:\jobs\config', r'C:\project', 3, manifest={})
+    assert member_id.endswith(':3') and 'D:' not in member_id
+
+    def _snapshot(source_job, display_name):
+        return {
+            'schema': 'vcstudio.comparison-snapshot/v1',
+            'ranking_deadband_eV': 0.15,
+            'projects': [{
+                'project_uuid': 'project-a', 'name': 'Catalyst A',
+                'display_name': display_name, 'status': 'blocked',
+                'block_reasons': ['缺少路径'], 'warnings': [],
+                'method_status': 'verified', 'method_signature': 'same',
+                'method_evidence': {
+                    'status': 'verified', 'fingerprint': 'method-fp',
+                    'source_job': source_job,
+                },
+                'species': [], 'ladder': {},
+            }],
+            'comparison_gate': {'status': 'blocked', 'blocking': ['缺少路径']},
+            'adsorption_matrix': {}, 'ladder': {}, 'can_final_report': False,
+        }
+
+    api = Api()
+    left = api._comparison_report_contracts(
+        _snapshot(r'C:\workspace\job', 'Catalyst A · left'),
+        formats=('html',), requested_kind='final', report_kind='diagnostic',
+        report_model_sha256='d' * 64)
+    right = api._comparison_report_contracts(
+        _snapshot(r'D:\moved\job', 'Catalyst A · right'),
+        formats=('html',), requested_kind='final', report_kind='diagnostic',
+        report_model_sha256='d' * 64)
+    assert left['input_fingerprint'] == right['input_fingerprint']
+    assert (left['contract_refs']['snapshot']['sha256']
+            == right['contract_refs']['snapshot']['sha256'])
+
+
 def test_pipeline_tick_report_done_idempotent(tmp_path):
     calls, saved = {}, []
     proj = {'name': 'liS', 'root': str(tmp_path),
@@ -2419,11 +3209,40 @@ def test_pipeline_tick_report_done_idempotent(tmp_path):
     assert rd[0]['report'].endswith('.pdf')
     assert rd[0]['report_kind'] == 'final'
     assert set(rd[0]['files']) == {'html', 'docx', 'pdf'}
-    assert set(proj['autopilot_report']['files']) == {'html', 'docx', 'pdf'}
+    assert set(proj['autopilot_report']['files']) == {
+        'html', 'docx', 'pdf', 'manifest',
+        'contract_spec', 'contract_snapshot', 'contract_validation', 'model'}
     assert proj.get('autopilot_report_done') and saved == [str(tmp_path)]   # 标记已写
+    status = {item['name']: item for item in api.pipeline_status()['projects']}['liS']
+    assert status['stage'] == 'report_done'
+    assert status['artifact_status'] == 'ready'
+    assert status['scientific_status'] == 'final'
+    assert status['report_status'] == 'final'
     # 次拍:标记已在 → 不再重复出报告
     out2 = api.pipeline_tick()
     assert [e for e in out2['events'] if e['kind'] == 'report_done'] == []
+
+
+def test_pipeline_auto_report_degrades_to_html_when_optional_formats_unavailable(tmp_path):
+    api, project, _manifests, _summary, calls = _report_gate_fixture(tmp_path)
+    api._paper_report = types.SimpleNamespace(report_capabilities=lambda: {
+        'formats': {
+            'html': {'available': True, 'reason': ''},
+            'docx': {'available': False, 'reason': 'python-docx unavailable'},
+            'pdf': {'available': False, 'reason': 'PDF backend unavailable'},
+        },
+    })
+
+    events, errors = [], []
+    api._tick_reports(events, errors)
+
+    assert errors == []
+    assert calls['formats'] == [('html',)]
+    assert [event['report_kind'] for event in events] == ['final']
+    marker = project['autopilot_report']
+    assert 'html' in marker['files']
+    assert 'docx' not in marker['files'] and 'pdf' not in marker['files']
+    assert api._report_marker_current(project, _summary) is True
 
 
 def test_final_report_rejects_numeric_difference_without_reference_state(tmp_path):
@@ -2439,9 +3258,18 @@ def test_final_report_rejects_numeric_difference_without_reference_state(tmp_pat
     assert events[0]['report_kind'] == 'diagnostic'
     assert calls['reports'] == 1 and calls['saved'] == 1
     assert project['autopilot_report']['kind'] == 'diagnostic'
-    assert set(project['autopilot_report']['files']) == {'html', 'docx', 'pdf'}
+    assert set(project['autopilot_report']['files']) == {
+        'html', 'docx', 'pdf', 'manifest',
+        'contract_spec', 'contract_snapshot', 'contract_validation', 'model'}
+    status = api.pipeline_status()['projects'][0]
+    assert status['stage'] == 'report_done'
+    assert status['artifact_status'] == 'ready'
+    assert status['scientific_status'] == 'diagnostic'
+    assert status['report_status'] == 'diagnostic'
+    assert status['scientific_qualification'] == 'diagnostic'
     final = api.proj_report('/managed/project.yaml', str(tmp_path / 'manual.html'), final=True)
-    assert final['ok'] is False and '未设置有效气相/逐物种参考态' in final['error']
+    assert final['ok'] is True and final['kind'] == 'diagnostic'
+    assert '未设置有效气相/逐物种参考态' in final['gate_reason']
 
 
 def test_unverified_method_requires_persisted_reason_before_final_report(tmp_path):
@@ -2467,6 +3295,211 @@ def test_unverified_method_requires_persisted_reason_before_final_report(tmp_pat
     assert confirmed_events[0]['report_kind'] == 'final'
     assert project['autopilot_report']['kind'] == 'final'
     assert project['autopilot_report']['input_fingerprint']
+
+
+def test_stale_final_marker_is_not_terminal_after_current_gate_downgrades(tmp_path):
+    api, project, _manifests, _summary, calls = _report_gate_fixture(tmp_path)
+    first_events, first_errors = [], []
+    api._tick_reports(first_events, first_errors)
+    assert first_errors == [] and project['autopilot_report']['kind'] == 'final'
+    assert calls['reports'] == 1
+
+    api._final_report_gate = lambda _project, _summary: (
+        False, '当前报告政策已收紧，需要重新生成诊断报告')
+    status = api.pipeline_status()['projects'][0]
+    assert status['stage'] == 'analysis'
+    assert status['artifact_status'] == 'stale'
+    assert status['scientific_status'] == 'final'
+    assert status['scientific_qualification'] == 'adsorption_result_verified'
+    assert status['publication_gate_status'] == 'blocked'
+    assert status['desired_report_kind'] == 'diagnostic'
+    assert '政策已收紧' in status['report_reason']
+
+    events, errors = [], []
+    api._tick_reports(events, errors)
+    assert errors == [] and calls['reports'] == 2
+    assert [event['report_kind'] for event in events] == ['diagnostic']
+    assert project['autopilot_report']['kind'] == 'diagnostic'
+    assert api.pipeline_status()['projects'][0]['artifact_status'] == 'ready'
+
+
+def test_explicit_invalid_marker_kind_never_uses_legacy_final_compatibility(tmp_path):
+    api, project, _manifests, _summary, _calls = _report_gate_fixture(tmp_path)
+    events, errors = [], []
+    api._tick_reports(events, errors)
+    project['autopilot_report']['kind'] = 'garbage-kind'
+    project['autopilot_report']['scientific_qualification'] = 'human_scientific_reviewed'
+
+    status = api.pipeline_status()['projects'][0]
+
+    assert status['stage'] == 'analysis'
+    assert status['artifact_status'] == 'stale'
+    assert status['scientific_status'] == 'diagnostic'
+    assert status['scientific_qualification'] == 'diagnostic'
+    assert 'kind 无效' in status['report_reason']
+
+
+def test_new_final_marker_requires_contract_chain_but_kindless_legacy_is_readable(tmp_path):
+    api, project, _manifests, summary, _calls = _report_gate_fixture(tmp_path)
+    report = tmp_path / 'legacy-report.html'
+    report.write_text('historical report', encoding='utf-8')
+
+    with pytest.raises(ValueError, match='完整 contract'):
+        api._persist_report_marker(
+            project, summary, {'html': str(report)}, kind='final')
+
+    digest = _sha256_file(report)
+    project['autopilot_report'] = {
+        'input_fingerprint': api._report_input_fingerprint(project, summary),
+        'file': str(report), 'report_sha256': digest,
+        'files': {'html': str(report)}, 'sha256': {'html': digest},
+    }
+    assert api._report_marker_current(project, summary) is True
+    status = api.proj_report_status('/managed/project.yaml')
+    assert status['ok'] is True and status['artifact_current'] is True
+    assert status['marker_kind'] == 'legacy-final'
+    assert status['scientific_status'] == 'final'
+
+    project['autopilot_report'].update({
+        'kind': 'final', 'scientific_status': 'final',
+        'scientific_qualification': 'adsorption_result_verified',
+        'artifact_status': 'ready',
+    })
+    explicit = api.proj_report_status('/managed/project.yaml')
+    assert explicit['artifact_status'] == 'stale'
+    assert explicit['artifact_current'] is False
+    assert '指纹' in explicit['report_reason'] or 'contract' in explicit['report_reason']
+
+
+def test_proj_report_status_ignores_mtime_and_rejects_tampered_marker_metadata(tmp_path):
+    api, project, _manifests, _summary, _calls = _report_gate_fixture(tmp_path)
+    events, errors = [], []
+    api._tick_reports(events, errors)
+    assert errors == [] and events
+    marker = copy.deepcopy(project['autopilot_report'])
+
+    html = marker['files']['html']
+    os.utime(html, (1, 1))
+    current = api.proj_report_status('/managed/project.yaml')
+    assert current['schema'] == 'vcstudio.report-status/v1'
+    assert current['artifact_status'] == 'ready'
+    assert current['artifact_current'] is True
+    assert current['scientific_status'] == 'final'
+    assert current['scientific_qualification'] == 'adsorption_result_verified'
+
+    project['autopilot_report']['scientific_qualification'] = 'human_scientific_reviewed'
+    tampered_qualification = api.proj_report_status('/managed/project.yaml')
+    assert tampered_qualification['artifact_status'] == 'stale'
+    assert tampered_qualification['artifact_current'] is False
+    assert 'validation' in tampered_qualification['report_reason']
+
+    project['autopilot_report'] = copy.deepcopy(marker)
+    project['autopilot_report']['contracts']['validation']['sha256'] = '0' * 64
+    tampered_contract = api.proj_report_status('/managed/project.yaml')
+    assert tampered_contract['artifact_status'] == 'stale'
+    assert 'contract' in tampered_contract['report_reason']
+
+    project['autopilot_report'] = copy.deepcopy(marker)
+    project['autopilot_report']['report_model_sha256'] = 'e' * 64
+    tampered_content_binding = api.proj_report_status('/managed/project.yaml')
+    assert tampered_content_binding['artifact_status'] == 'stale'
+    assert '正文指纹' in tampered_content_binding['report_reason']
+
+    project['autopilot_report'] = copy.deepcopy(marker)
+    model_path = Path(marker['files']['model'])
+    original_model = model_path.read_bytes()
+    model_path.write_text('{}', encoding='utf-8')
+    try:
+        tampered_model = api.proj_report_status('/managed/project.yaml')
+        assert tampered_model['artifact_status'] == 'stale'
+        assert tampered_model['artifact_current'] is False
+    finally:
+        model_path.write_bytes(original_model)
+
+    model_path.unlink()
+    try:
+        missing_model = api.proj_report_status('/managed/project.yaml')
+        assert missing_model['artifact_status'] == 'stale'
+        assert missing_model['artifact_current'] is False
+    finally:
+        model_path.write_bytes(original_model)
+
+    project['autopilot_report'] = copy.deepcopy(marker)
+    manifest_path = Path(marker['manifest'])
+    original_manifest = manifest_path.read_text(encoding='utf-8')
+    manifest_payload = json.loads(original_manifest)
+    manifest_payload['scientific_qualification'] = 'human_scientific_reviewed'
+    manifest_path.write_text(json.dumps(manifest_payload), encoding='utf-8')
+    try:
+        tampered_manifest = api.proj_report_status('/managed/project.yaml')
+        assert tampered_manifest['artifact_status'] == 'stale'
+        assert tampered_manifest['artifact_current'] is False
+    finally:
+        manifest_path.write_text(original_manifest, encoding='utf-8')
+
+
+def test_report_status_rejects_consistently_rehashed_model_content_tamper(tmp_path):
+    """Ordinary file/model hashes cannot replace the validation content binding."""
+    api, project, _manifests, _summary, _calls = _report_gate_fixture(tmp_path)
+    events, errors = [], []
+    api._tick_reports(events, errors)
+    assert errors == [] and events
+
+    marker = project['autopilot_report']
+    model_path = Path(marker['files']['model'])
+    frozen = json.loads(model_path.read_text(encoding='utf-8'))
+    frozen['title'] = 'tampered title with internally consistent ordinary hashes'
+    model_bytes = json.dumps(
+        frozen, ensure_ascii=False, sort_keys=True,
+        separators=(',', ':'), allow_nan=False).encode('utf-8')
+    model_path.write_bytes(model_bytes)
+    model_sha256 = _sha256_file(model_path)
+
+    manifest_path = Path(marker['files']['manifest'])
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    manifest['model_sha256'] = model_sha256
+    manifest['model_file'].update({
+        'sha256': model_sha256,
+        'size': model_path.stat().st_size,
+    })
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False), encoding='utf-8')
+
+    marker['model_sha256'] = model_sha256
+    for hashes in (marker['sha256'], marker['report_hashes']):
+        hashes['model'] = model_sha256
+        hashes['manifest'] = _sha256_file(manifest_path)
+
+    status = api.proj_report_status('/managed/project.yaml')
+
+    assert status['artifact_status'] == 'stale'
+    assert status['artifact_current'] is False
+    assert status['scientific_status'] == 'final'
+    assert '正文指纹' in status['report_reason']
+
+
+def test_current_diagnostic_marker_is_regenerated_when_gate_now_allows_final(tmp_path):
+    api, project, _manifests, _summary, calls = _report_gate_fixture(
+        tmp_path, has_ref=False)
+    first_events, first_errors = [], []
+    api._tick_reports(first_events, first_errors)
+    assert first_errors == [] and project['autopilot_report']['kind'] == 'diagnostic'
+
+    api._final_report_gate = lambda _project, _summary: (True, '')
+    status = api.pipeline_status()['projects'][0]
+    assert status['stage'] == 'analysis'
+    assert status['artifact_status'] == 'stale'
+    assert status['scientific_status'] == 'diagnostic'
+    assert status['scientific_qualification'] == 'diagnostic'
+    assert status['publication_gate_status'] == 'eligible'
+    assert status['desired_report_kind'] == 'final'
+    assert '升级' in status['report_reason']
+
+    events, errors = [], []
+    api._tick_reports(events, errors)
+    assert errors == [] and calls['reports'] == 2
+    assert [event['report_kind'] for event in events] == ['final']
+    assert project['autopilot_report']['kind'] == 'final'
 
 
 def test_report_marker_invalidates_on_file_and_member_generation_changes(tmp_path):
@@ -2513,6 +3546,34 @@ def test_report_marker_save_failure_never_emits_report_done(tmp_path):
     assert calls['reports'] == 1 and calls['saved'] == 1
     assert any('报告标记落盘失败' in error and 'disk full' in error
                for error in errors)
+    assert 'autopilot_report' not in project
+    assert 'autopilot_report_done' not in project
+
+
+def test_generated_unrecorded_response_preserves_real_artifact_and_science(tmp_path):
+    def _fail_save(_root, _project):
+        raise OSError('disk full')
+
+    api, project, _manifests, _summary, _calls = _report_gate_fixture(
+        tmp_path, save_project=_fail_save)
+    del api.proj_report_bundle  # reveal the production class method behind the tick fake
+    api._project_report_figures = lambda *_args, **_kwargs: ([], [])
+    api._proj_fed = lambda *_args, **_kwargs: (None, 'not available')
+
+    result = api.proj_report_bundle(
+        '/managed/project.yaml', str(tmp_path / 'unrecorded'),
+        formats=['html'], requested_kind='final')
+
+    assert result['ok'] is False
+    assert result['artifact_status'] == 'generated_unrecorded'
+    assert result['kind'] == result['scientific_status'] == 'final'
+    assert result['scientific_qualification'] == 'adsorption_result_verified'
+    assert result['marker'] is None
+    assert Path(result['files']['html']).is_file()
+    assert Path(result['files']['manifest']).is_file()
+    assert Path(result['model_file']).is_file()
+    assert set(result['contract_files']) == {'spec', 'snapshot', 'validation'}
+    assert 'disk full' in result['error']
     assert 'autopilot_report' not in project
     assert 'autopilot_report_done' not in project
 
@@ -8359,7 +9420,9 @@ def test_pipeline_reports_skip_unmanaged_or_incomplete_delta_projects(tmp_path):
     assert 'autopilot_report' not in projects['/unmanaged/project.yaml']
     invalid_marker = projects['/invalid/project.yaml']['autopilot_report']
     assert invalid_marker['kind'] == 'diagnostic'
-    assert set(invalid_marker['files']) == {'html', 'docx', 'pdf'}
+    assert set(invalid_marker['files']) == {
+        'html', 'docx', 'pdf', 'manifest',
+        'contract_spec', 'contract_snapshot', 'contract_validation', 'model'}
 
 
 def test_pipeline_reports_only_after_done_outputs_are_fetched_in_same_tick(tmp_path):
@@ -8448,7 +9511,9 @@ def test_pipeline_reports_only_after_done_outputs_are_fetched_in_same_tick(tmp_p
     assert order.index('fetch') < order.index('report') < order.index('save-project')
     assert bundle_calls['reports'] == 1
     assert project['autopilot_report']['kind'] == 'final'
-    assert set(project['autopilot_report']['files']) == {'html', 'docx', 'pdf'}
+    assert set(project['autopilot_report']['files']) == {
+        'html', 'docx', 'pdf', 'manifest',
+        'contract_spec', 'contract_snapshot', 'contract_validation', 'model'}
 
 
 def test_auto_figures_prefers_project_molecules_dir_over_global(tmp_path):

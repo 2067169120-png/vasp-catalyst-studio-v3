@@ -270,10 +270,14 @@ pre.meth-pre{white-space:pre-wrap;word-break:break-word;max-height:200px}
 .pl-step.done::before{background:var(--ok)}
 .pl-step.cur .dot{background:var(--accent);border-color:var(--accent-dark);box-shadow:0 0 0 3px var(--accent-soft)}
 .pl-step.cur .lbl{color:var(--accent-dark);font-weight:700}
-.pl-report{display:block;margin:7px 0 0;font-size:10.5px;color:var(--muted);white-space:nowrap;
+.pl-report-states{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:7px}
+.pl-report{display:inline-flex;align-items:center;gap:5px;min-width:0;padding:3px 7px;border:1px solid var(--rule);
+  border-radius:999px;background:var(--surface);font-size:10.5px;color:var(--muted);white-space:nowrap;
   overflow:hidden;text-overflow:ellipsis}
+.pl-report b{font-size:9px;letter-spacing:.02em;color:var(--muted)}
 .pl-report.ok{color:var(--ok)}
 .pl-report.warn{color:var(--warn)}
+.pl-report.bad{color:var(--fail)}
 .pl-empty{color:var(--muted);font-size:12.5px;padding:10px 4px}
 
 /* ── 页顶错误条(dashboard 取数失败不再假装 0 作业) ── */
@@ -683,13 +687,39 @@ nav a.on .stepno{background:var(--accent);border-color:var(--accent);color:#fff}
 #page-project .pj-compare-project > small{width:100%;color:var(--muted);line-height:1.4}
 #page-project .pj-compare-project.ready{border-color:color-mix(in srgb,var(--ok) 35%,var(--rule))}
 #page-project .pj-compare-project.blocked{border-color:color-mix(in srgb,var(--fail) 35%,var(--rule))}
+.pj-report-formats{min-width:0;margin:0 0 10px;padding:8px 9px 9px;border:1px solid var(--rule);border-radius:7px;background:var(--th-bg)}
+.pj-report-formats legend{padding:0 5px;color:var(--muted);font-size:10.5px;font-weight:700}
+.pj-report-format-options{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
+.pj-report-format-options label{display:flex;align-items:center;gap:7px;min-width:0;padding:7px 8px;border:1px solid var(--rule);
+  border-radius:6px;background:var(--surface);cursor:pointer}
+.pj-report-format-options label:hover{border-color:var(--accent)}
+.pj-report-format-options label.unavailable{cursor:not-allowed;opacity:.58;background:var(--surface-2)}
+.pj-report-format-options label.unavailable:hover{border-color:var(--rule)}
+.pj-report-format-options label.pending{opacity:.72}
+.pj-report-format-options input{flex:0 0 auto;margin:0;accent-color:var(--accent)}
+.pj-report-format-options input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.pj-report-format-options label span,.pj-report-format-options label b,.pj-report-format-options label small{display:block;min-width:0}
+.pj-report-format-options label b{font-size:11px}.pj-report-format-options label small{margin-top:1px;color:var(--muted);font-size:9.5px}
+.pj-report-format-status{margin:6px 1px 0;color:var(--muted);font-size:10px;line-height:1.4}
+.pj-report-formats.invalid{border-color:var(--fail);background:var(--fail-bg)}
+.pj-report-format-status.bad{color:var(--fail);font-weight:700}
 .pj-report-output:empty{display:none}.pj-report-output{margin:8px 0 12px;padding:9px;border:1px solid var(--rule);border-radius:7px;background:var(--th-bg)}
 .pj-report-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:7px;font-size:11.5px}.pj-report-head span{color:var(--muted);font-size:10.5px}
+.pj-report-states{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:0 0 8px}
+.pj-report-state{display:inline-flex;align-items:center;gap:5px;padding:4px 7px;border:1px solid var(--rule);border-radius:999px;
+  background:var(--surface);color:var(--muted);font-size:10.5px}
+.pj-report-state b{color:var(--muted);font-size:9px;letter-spacing:.02em}
+.pj-report-state.ready,.pj-report-state.final{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 35%,var(--rule))}
+.pj-report-state.eligible{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 35%,var(--rule))}
+.pj-report-state.diagnostic{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 35%,var(--rule))}
+.pj-report-state.draft{color:var(--muted);border-color:color-mix(in srgb,var(--muted) 35%,var(--rule))}
+.pj-report-state.stale{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 35%,var(--rule))}
+.pj-report-state.failed,.pj-report-state.blocked{color:var(--fail);border-color:color-mix(in srgb,var(--fail) 35%,var(--rule))}
 .pj-report-links{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:6px}
 .pj-report-file{display:flex!important;flex-direction:column;align-items:flex-start!important;min-width:0;text-align:left}
 .pj-report-file b,.pj-report-file small{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.pj-report-file small{margin-top:2px;color:var(--muted);font:9.5px/1.3 var(--mono)}
 .pj-report-note{margin-top:7px;padding:6px 8px;border-radius:5px;background:var(--warn-bg);color:var(--warn);font-size:10.5px;line-height:1.45}.pj-report-note.bad{margin:0;background:var(--fail-bg);color:var(--fail)}
-@media(max-width:720px){#page-project .pj-compare-toolbar{align-items:stretch;flex-direction:column}#page-project .pj-selection-summary{justify-content:flex-start}}
+@media(max-width:720px){#page-project .pj-compare-toolbar{align-items:stretch;flex-direction:column}#page-project .pj-selection-summary{justify-content:flex-start}.pj-report-format-options{grid-template-columns:1fr}}
 
 /* ── 作业页:父目录预检 → 四件套自动补齐 → 自动勾选提交 ── */
 #page-jobs .qs-card{border-color:color-mix(in srgb,var(--accent) 35%,var(--rule))}

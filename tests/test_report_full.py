@@ -85,6 +85,15 @@ def test_generate_report_origin_ok_and_ai_ok(tmp_path):
     assert 'ΔE 汇总统计' in h and '最强吸附' in h
     assert '计算参数' in h and 'ENCUT' in h
     assert '方法学约定' in h and '未含 ZPE/熵' in h
+    assert '诊断报告 · 非最终科学结论' in h
+
+
+def test_legacy_status_never_claims_final_without_bound_validation():
+    delta = {'rows': [{'delta_e': -1.234}]}
+
+    assert report_full._effective_report_status('auto', delta) == 'diagnostic'
+    assert report_full._effective_report_status(None, delta) == 'diagnostic'
+    assert report_full._effective_report_status('final', delta) == 'diagnostic'
 
 
 def test_fig_html_stages_cross_drive_asset_before_relpath(monkeypatch, tmp_path):

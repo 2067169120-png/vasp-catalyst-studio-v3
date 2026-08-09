@@ -61,25 +61,34 @@ def test_report_bundle_and_batch_contracts_emit_clickable_files():
     js = _source("project.js")
 
     assert "生成 HTML / Word / PDF 报告" in html
-    assert "VCS.call(\n        'proj_report_bundle', proj.path, dr.path, ['html', 'docx', 'pdf'], true)" in js
+    assert 'id="pj-report-formats"' in html
+    assert "'proj_report_bundle', proj.path, dr.path, selectedFormats, true" in js
     assert (
         "'proj_batch_report', paths, dr.path, preset || null,\n"
         "        ['html', 'docx', 'pdf'], true, true"
     ) in js
     assert "function collectReportFiles(value)" in js
     assert "function renderReportFiles(containerId, result, heading)" in js
-    assert "生成诊断报告（HTML / Word / PDF）" in js
+    assert "State.reportDiagnostic ? '生成诊断报告' : '生成报告'" in js
     assert 'data-report-open="' in js
     assert "VCS.call('open_dir', button.dataset.reportOpen)" in js
 
 
 def test_single_report_keeps_legacy_html_fallback():
     js = _source("project.js")
+    legacy = _function(js, "legacyBatchReports", "report")
 
     assert "function bridgeMethodUnavailable(result)" in js
     assert "async function legacyBatchReports(paths, outDir)" in js
     assert "VCS.call('proj_report', proj.path, save, true)" in js
-    assert "VCS.call('proj_report', path, save, true)" in js
+    assert "VCS.call('proj_report', path, save, true)" in legacy
+    assert "individual.push(Object.assign({}, result, {" in legacy
+    preserved = legacy[legacy.index("individual.push(Object.assign({}, result, {"):
+                       legacy.index("}));", legacy.index("individual.push"))]
+    assert "kind: 'final'" not in preserved
+    assert "scientific_status:" not in preserved
+    assert "gate_reason:" not in preserved
+    assert "report_reason:" not in preserved
     assert "当前后端仅支持 HTML，已使用兼容模式生成" in js
 
 

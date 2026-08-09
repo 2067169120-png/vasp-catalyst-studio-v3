@@ -141,21 +141,62 @@ def test_chat_report_command_generates_diagnostic_when_final_gate_is_blocked(tmp
         load_project=lambda path: project if path == project_path else None,
         delta_e_rows=lambda _project: {'rows': []},
     )
+    paper = types.SimpleNamespace(report_capabilities=lambda: {
+        'formats': {
+            'html': {'available': True, 'reason': ''},
+            'docx': {'available': False, 'reason': 'python-docx unavailable'},
+            'pdf': {'available': False, 'reason': 'PDF backend unavailable'},
+        },
+    })
     api = Api(assistant_chat_mod=chat, config_mod=_config(False),
-              adsorption_mod=adsorption)
+              adsorption_mod=adsorption, paper_report_mod=paper)
     api._final_report_gate = lambda _project, _summary: (False, '参考态尚未完成')
     calls = []
-    api.proj_report = lambda path, out, final=False: (
-        calls.append((path, out, final))
-        or {'ok': True, 'file': out, 'files': [out, out[:-5] + '.docx'],
-            'error': None}
+    api.proj_report_bundle = lambda path, out_dir, formats=None, final=True, stem=None: (
+        calls.append((path, out_dir, tuple(formats or ()), final, stem))
+        or {'ok': True, 'kind': 'diagnostic', 'files': {
+            'html': str(tmp_path / 'report' / 'Catalyst A_diagnostic.html'),
+            'docx': str(tmp_path / 'report' / 'Catalyst A_diagnostic.docx'),
+        }, 'error': None}
     )
 
     result = api.ai_chat_send('s1', '/report Catalyst A')
 
     assert result['ok'] is True
     assert calls == [
-        (project_path, str(tmp_path / 'report' / 'Catalyst A_diagnostic.html'), False),
+        (project_path, str(tmp_path / 'report'), ('html',), True,
+         'Catalyst A_diagnostic'),
     ]
     assert '诊断报告已生成' in chat.local[-1][2]
     assert '参考态尚未完成' in chat.local[-1][2]
+
+
+def test_chat_report_uses_actual_bundle_kind_instead_of_stale_preflight(tmp_path):
+    chat = _Chat()
+    project_path = str(tmp_path / 'project.yaml')
+    project = {'name': 'Catalyst A', 'root': str(tmp_path)}
+    adsorption = types.SimpleNamespace(
+        list_projects=lambda: [project_path],
+        load_project=lambda path: project if path == project_path else None,
+        delta_e_rows=lambda _project: {'rows': [{'delta_e': -1.0}]},
+    )
+    api = Api(assistant_chat_mod=chat, config_mod=_config(False),
+              adsorption_mod=adsorption)
+    # First preflight passes, while the bundle's authoritative second snapshot
+    # has already downgraded to diagnostic.
+    api._final_report_gate = lambda _project, _summary: (True, '')
+    api.proj_report_bundle = lambda *_args, **_kwargs: {
+        'ok': True,
+        'kind': 'diagnostic',
+        'scientific_status': 'diagnostic',
+        'gate_reason': '生成期间参考态发生变化',
+        'files': {'html': str(tmp_path / 'report' / 'diagnostic.html')},
+        'error': None,
+    }
+
+    result = api.ai_chat_send('s1', '/report Catalyst A')
+
+    assert result['ok'] is True
+    assert '诊断报告已生成' in chat.local[-1][2]
+    assert '生成期间参考态发生变化' in chat.local[-1][2]
+    assert '最终报告已生成' not in chat.local[-1][2]

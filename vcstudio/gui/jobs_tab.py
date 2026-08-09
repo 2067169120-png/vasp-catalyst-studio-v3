@@ -14,7 +14,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
 
 from vcstudio.gui.widgets import LogBox
-from vcstudio.gui import runner
+from vcstudio.gui import report_bridge, runner
 from vcstudio.cluster import ledger, submitter, batch_ops
 from vcstudio.cluster.profiles import load_profiles
 from vcstudio.project import report
@@ -306,11 +306,6 @@ class JobsTab(ttk.Frame):
     def _maybe_auto_reports(self):
         """项目成员全 DONE 且报告缺失/过期 → 后台生成完整报告(用户决策:全自动)。"""
         from vcstudio.project import adsorption, report_full
-        from vcstudio.shared.config import load_config
-        try:
-            cfg = load_config()
-        except Exception:                                # noqa: BLE001
-            cfg = {}
         for pth in adsorption.list_projects():
             proj = adsorption.load_project(pth)
             if not proj:
@@ -329,26 +324,56 @@ class JobsTab(ttk.Frame):
                     self.log.write(f"⚠ 项目「{proj['name']}」被卡:{', '.join(stuck[:5])} "
                                    f"未 DONE(修复/续算后才会自动出报告)")
                 continue
-            out = os.path.join(proj.get('root', ''), f"{proj['name']}_完整报告.html")
-            newest = max((os.path.getmtime(manifest_mod.manifest_path(d))
-                          for d in dirs if manifest_mod.manifest_path(d).is_file()),
-                         default=0)
-            if os.path.isfile(out) and os.path.getmtime(out) >= newest:
-                continue                                 # 报告已新鲜
-            self.log.write(f"📄 项目「{proj['name']}」全部 DONE,后台生成完整报告…")
-            q = runner.submit(report_full.generate_project_report, proj, out, config=cfg)
-            self.after(500, lambda qq=q, o=out: self._poll_report(qq, o))
+            out_dir = str(proj.get('root') or os.path.dirname(os.path.abspath(str(pth))))
+            stem = f"{proj['name']}_完整报告"
+            report_status = report_bridge.project_report_status(pth)
+            if (report_status.get('ok')
+                    and report_status.get('artifact_current')
+                    and not report_status.get('scientific_stale')):
+                continue                                 # canonical marker 已证明当前
+            if not report_status.get('ok'):
+                self.log.write(
+                    f"⚠ 项目「{proj['name']}」无法读取报告 marker，将尝试重建："
+                    f"{report_status.get('error') or '未知原因'}")
+            self.log.write(
+                f"📄 项目「{proj['name']}」全部 DONE，后台通过统一报告引擎生成 HTML…")
+            q = runner.submit(
+                report_bridge.generate_project_report_bundle,
+                pth,
+                out_dir,
+                formats=('html',),
+                final=True,
+                stem=stem,
+            )
+            self.after(
+                500,
+                lambda qq=q, name=proj['name']: self._poll_report(qq, name),
+            )
 
-    def _poll_report(self, q, out):
+    def _poll_report(self, q, project_name=''):
         item = runner.poll(q)
         if item is None:
-            self.after(500, lambda: self._poll_report(q, out))
+            self.after(500, lambda: self._poll_report(q, project_name))
             return
         kind, payload = item
         if kind == 'error':
             self.log.write(f'❌ 自动报告失败:{payload}')
-        else:
-            self.log.write(f'✅ 完整报告已生成:{out}(含图表/结构图/AI 分析)')
+            return
+        if not isinstance(payload, dict):
+            self.log.write('❌ 自动报告失败:报告桥返回了无效结果')
+            return
+        prefix = f'项目「{project_name}」' if project_name else '项目'
+        self.log.write(f'ℹ {prefix}{report_bridge.status_text(payload)}')
+        if payload.get('gate_reason'):
+            self.log.write(f"⚠ {prefix}科学门禁:{payload['gate_reason']}")
+        if not payload.get('artifact_ok'):
+            self.log.write(
+                f"❌ {prefix}报告产物不可用:{payload.get('error') or '生成未完成'}")
+            return
+        out = payload.get('primary_file')
+        science = str(payload.get('scientific_status') or 'pending').lower()
+        icon = '✅' if science == 'final' else '⚠'
+        self.log.write(f'{icon} {prefix}报告产物已生成:{out or "路径未返回"}')
 
     # ── 拉回结果(S3):预设可选(轻量默认 / DOS·Bader / 自定义) ──
     _FETCH_PRESETS = (

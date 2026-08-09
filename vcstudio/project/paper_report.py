@@ -8,6 +8,8 @@ different Windows drives.
 """
 from __future__ import annotations
 
+import copy
+import errno
 import hashlib
 import html
 import importlib
@@ -20,14 +22,26 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from xml.sax.saxutils import escape as xml_escape
 
 
-BUNDLE_SCHEMA = "vcstudio.paper-report.bundle/v1"
-MODEL_SCHEMA = "vcstudio.paper-report.model/v1"
+BUNDLE_SCHEMA = "vcstudio.paper-report.bundle/v2"
+MODEL_SCHEMA = "vcstudio.paper-report.model/v2"
+_LEGACY_MODEL_SCHEMA = "vcstudio.paper-report.model/v1"
+_REPORT_KINDS = ("diagnostic", "final", "draft")
+_QUALIFICATION_LEVELS = (
+    "diagnostic",
+    "adsorption_result_verified",
+    "thermodynamic_path_verified",
+    "kinetic_evidence_verified",
+    "publication_package_verified",
+    "human_scientific_reviewed",
+)
 _ALLOWED_FORMATS = ("html", "docx", "pdf")
 _RASTER_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff"}
 _FIGURE_PATH_KEYS = ("path", "src", "image", "file")
@@ -36,6 +50,24 @@ _PDF_FONT_LOCK = threading.Lock()
 _REPORT_PUBLISH_LOCK = threading.RLock()
 _PDF_CJK_REGULAR = "PaperCJK"
 _PDF_CJK_BOLD = "PaperCJKBold"
+_CONTRACT_ADMIN_KEYS = {
+    "created_at", "created_at_utc", "generated_at", "generated_at_utc",
+    "updated_at", "updated_at_utc", "validated_at", "validated_at_utc",
+}
+_CONTRACT_SCHEMAS = {
+    "spec": "vcstudio.report-spec/v1",
+    "snapshot": "vcstudio.report-snapshot/v1",
+    "validation": "vcstudio.report-validation/v1",
+}
+_VALIDATION_STATUSES = {"passed", "passed_with_warnings", "blocked", "unknown"}
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
+_CONTENT_FINGERPRINT_KEYS = (
+    "report_kind", "scientific_qualification", "claim_ceiling",
+    "locale", "outline", "title", "subtitle", "kicker", "metadata",
+    "executive_summary", "key_findings", "candidate_evaluations",
+    "adsorption_table", "comparison_table", "figures", "methods",
+    "limitations", "recommendations", "comparison_context",
+)
 _SECTION_LABELS = {
     "en-US": {
         "executive_summary": "Executive Summary",
@@ -66,8 +98,83 @@ class ReportDependencyError(RuntimeError):
     """Raised when an explicitly requested report format is unavailable."""
 
 
+class ReportRecoveryError(OSError):
+    """Raised when publication failed and automatic rollback was incomplete.
+
+    ``recovery_dir`` is deliberately retained on disk.  It contains the
+    surviving pre-publication backups and a machine-readable recovery record;
+    callers must not treat the destination as a complete report generation.
+    """
+
+    def __init__(self, message: str, *, recovery_dir: Path):
+        super().__init__(message)
+        self.recovery_dir = Path(recovery_dir)
+
+
+@contextmanager
+def _report_publish_guard(destination: Path, stem: str):
+    """Serialize one report generation across threads and OS processes.
+
+    The persistent hidden lock file must not be unlinked after release: removing
+    it can split waiters across two inodes and re-introduce the publication race.
+    The operating system releases the advisory lock automatically if a writer
+    exits or crashes.
+    """
+
+    lock_path = Path(destination) / f".{stem}.publish.lock"
+    with _REPORT_PUBLISH_LOCK:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+b") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+
+            if os.name == "nt":
+                import msvcrt
+
+                while True:
+                    handle.seek(0)
+                    try:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError as exc:
+                        if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                            raise
+                        time.sleep(0.05)
+                try:
+                    yield lock_path
+                finally:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield lock_path
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def report_capabilities() -> dict:
+    """Return per-format availability without importing project calculation code."""
+    formats = {}
+    for fmt in _ALLOWED_FORMATS:
+        try:
+            _check_dependencies((fmt,))
+        except Exception as exc:  # noqa: BLE001 - capability probe is per-format
+            formats[fmt] = {"available": False, "reason": str(exc)}
+        else:
+            formats[fmt] = {"available": True, "reason": ""}
+    return {
+        "schema": "vcstudio.paper-report.capabilities/v1",
+        "formats": formats,
+    }
+
+
 def render_report_bundle(
-    model: dict,
+    model: Mapping[str, Any],
     out_dir,
     stem: str = "report",
     formats: Sequence[str] = ("html", "docx", "pdf"),
@@ -93,11 +200,14 @@ def render_report_bundle(
     -------
     dict
         ``files`` maps each requested format plus ``manifest`` to a :class:`Path`;
-        ``assets`` is a list of staged :class:`Path` objects.  The model hash and
-        schema are also returned for downstream completion markers.
+        ``contract_files`` maps every published full-contract sidecar to a
+        :class:`Path`, ``model_file`` points to the canonical normalized model
+        projection, and ``assets`` is a list of staged :class:`Path` objects. The
+        model hash and schema are also returned for downstream completion markers.
     """
-    if not isinstance(model, dict):
-        raise TypeError("model must be a dict")
+    if not isinstance(model, Mapping):
+        raise TypeError("model must be a mapping")
+    model = dict(model)
     safe_stem = _validate_stem(stem)
     requested = _normalize_formats(formats)
     _check_dependencies(requested)
@@ -107,16 +217,35 @@ def render_report_bundle(
     if not destination.is_dir():
         raise NotADirectoryError(f"report output is not a directory: {destination}")
 
-    normalized = _normalize_model(model)
+    normalized = _normalize_model(model, requested_formats=requested)
     temp_root = Path(tempfile.mkdtemp(prefix=f".{safe_stem}.tmp-", dir=destination))
+    preserve_temp_root = False
     try:
         staged_model, asset_records = _stage_figures(
             normalized,
             temp_root / "assets",
             requested,
         )
+        report_model_sha256 = _sha256_json(_content_fingerprint(staged_model))
+        declared_report_model_sha256 = _text(
+            (normalized.get("validation") or {}).get("report_model_sha256")
+        ).lower()
+        if (declared_report_model_sha256
+                and declared_report_model_sha256 != report_model_sha256):
+            raise ValueError(
+                "rendered report content conflicts with "
+                "ValidationResult.report_model_sha256"
+            )
         fingerprint_model = _fingerprint_model(staged_model)
         model_sha256 = _sha256_json(fingerprint_model)
+        temp_model_file = temp_root / f"{safe_stem}.model.json"
+        temp_model_file.write_bytes(_canonical_json_bytes(fingerprint_model))
+        model_file_record = _file_record(
+            temp_model_file, relative_path=temp_model_file.name)
+        if model_file_record["sha256"] != model_sha256:
+            raise AssertionError(
+                "canonical model sidecar bytes do not match model_sha256"
+            )
 
         temp_outputs: dict[str, Path] = {}
         if "html" in requested:
@@ -132,14 +261,41 @@ def render_report_bundle(
             _render_pdf(staged_model, path)
             temp_outputs["pdf"] = path
 
+        contract_outputs, contract_records = _stage_contract_sidecars(
+            normalized, temp_root, safe_stem)
+        obsolete_contract_paths = tuple(
+            destination / f"{safe_stem}.{key}.json"
+            for key in _CONTRACT_SCHEMAS
+            if f"contract_{key}" not in contract_outputs
+        )
+        obsolete_format_paths = tuple(
+            destination / f"{safe_stem}.{fmt}"
+            for fmt in _ALLOWED_FORMATS
+            if fmt not in requested
+        )
+
         file_records = {
             fmt: _file_record(path, relative_path=path.name)
             for fmt, path in temp_outputs.items()
         }
         manifest = {
             "schema": BUNDLE_SCHEMA,
-            "model_schema": MODEL_SCHEMA,
+            "artifact_status": "complete",
+            "model_schema": normalized["schema"],
+            "source_model_schema": normalized["source_model_schema"],
             "model_sha256": model_sha256,
+            "report_model_sha256": report_model_sha256,
+            "report_id": normalized["report_id"],
+            "report_kind": normalized["report_kind"],
+            "scientific_status": normalized["scientific_status"],
+            "scientific_qualification": normalized["scientific_qualification"],
+            "claim_ceiling": normalized["claim_ceiling"],
+            "input_fingerprint": normalized["input_fingerprint"],
+            "preset_id": normalized["preset_id"],
+            "revision": normalized["revision"],
+            "contract_status": normalized["contract_status"],
+            "contracts": contract_records,
+            "model_file": model_file_record,
             "generated_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
             "formats": list(requested),
             "files": file_records,
@@ -151,28 +307,55 @@ def render_report_bundle(
             encoding="utf-8",
         )
 
-        # Publishing is deliberately serialized inside one process.  Manual export
-        # and the background report worker can otherwise interleave replacements
-        # for the same stem and leave a manifest referring to another writer's
-        # files.  Assets are content-addressed and can safely be committed first.
-        with _REPORT_PUBLISH_LOCK:
+        # Publishing is deliberately serialized across threads and cooperating
+        # OS processes.  Manual export, background workers, or two application
+        # instances can otherwise interleave replacements for the same stem and
+        # leave a manifest referring to another writer's files.  Assets are
+        # content-addressed and can safely be committed first.
+        with _report_publish_guard(destination, safe_stem):
             asset_paths = _commit_assets(
                 temp_root / "assets",
                 destination / "assets",
                 asset_records,
             )
-            output_paths, final_manifest = _commit_report_files(
-                temp_outputs,
+            published_paths, final_manifest = _commit_report_files(
+                {**temp_outputs, "model": temp_model_file, **contract_outputs},
                 temp_manifest,
                 destination,
                 temp_root / "rollback",
+                obsolete_paths=(*obsolete_contract_paths, *obsolete_format_paths),
             )
+            contract_paths = {
+                key.removeprefix("contract_"): published_paths.pop(key)
+                for key in list(published_paths)
+                if key.startswith("contract_")
+            }
+            model_file = published_paths.pop("model")
+            output_paths = published_paths
+    except ReportRecoveryError:
+        # The rollback directory is the only remaining copy of one or more
+        # pre-publication files.  Keep the entire generation directory intact
+        # so a human or recovery tool can restore it.
+        preserve_temp_root = True
+        raise
     finally:
-        shutil.rmtree(temp_root, ignore_errors=True)
+        if not preserve_temp_root:
+            shutil.rmtree(temp_root, ignore_errors=True)
 
     return {
         "schema": BUNDLE_SCHEMA,
+        "artifact_status": "complete",
         "model_sha256": model_sha256,
+        "report_model_sha256": report_model_sha256,
+        "report_kind": normalized["report_kind"],
+        "scientific_status": normalized["scientific_status"],
+        "scientific_qualification": normalized["scientific_qualification"],
+        "input_fingerprint": normalized["input_fingerprint"],
+        "contract_status": normalized["contract_status"],
+        "contracts": contract_records,
+        "contract_files": contract_paths,
+        "model_file": model_file,
+        "revision": normalized["revision"],
         "files": output_paths,
         "assets": asset_paths,
         "manifest": final_manifest,
@@ -213,29 +396,133 @@ def _normalize_formats(formats: Sequence[str]) -> tuple[str, ...]:
 def _check_dependencies(formats: Sequence[str]) -> None:
     if "docx" in formats:
         try:
-            importlib.import_module("docx")
-        except ImportError as exc:
+            for module in (
+                "docx", "docx.enum.table", "docx.enum.text", "docx.image.image",
+                "docx.oxml", "docx.oxml.ns", "docx.shared",
+            ):
+                importlib.import_module(module)
+        except Exception as exc:  # noqa: BLE001 - normalize broken/partial installs
             raise ReportDependencyError(
                 "DOCX generation requires python-docx; install vcstudio[docs]"
             ) from exc
     if "pdf" in formats:
         try:
-            importlib.import_module("reportlab")
-        except ImportError as exc:
+            reportlab_package = importlib.import_module("reportlab")
+            ttfonts_module = None
+            for module in (
+                "reportlab.lib.colors", "reportlab.lib.enums", "reportlab.lib.pagesizes",
+                "reportlab.lib.styles", "reportlab.lib.units", "reportlab.pdfbase.pdfmetrics",
+                "reportlab.pdfbase.ttfonts", "reportlab.platypus",
+            ):
+                imported = importlib.import_module(module)
+                if module == "reportlab.pdfbase.ttfonts":
+                    ttfonts_module = imported
+            latin_fonts = _latin_pdf_font_files(reportlab_package)
+            cjk_root = _pdf_font_root()
+            font_files = {
+                **latin_fonts,
+                _PDF_CJK_REGULAR: cjk_root / "noto-sans-sc-400.ttf",
+                _PDF_CJK_BOLD: cjk_root / "noto-sans-sc-700.ttf",
+            }
+            if ttfonts_module is None or not hasattr(ttfonts_module, "TTFont"):
+                raise ImportError("reportlab.pdfbase.ttfonts.TTFont is unavailable")
+            _probe_pdf_font_files(ttfonts_module.TTFont, font_files)
+        except Exception as exc:  # noqa: BLE001 - normalize fonts/partial installs
             raise ReportDependencyError(
-                "PDF generation requires reportlab; install the reportlab package"
+                f"PDF generation dependencies are unavailable: {exc}"
             ) from exc
 
 
-def _normalize_model(model: Mapping[str, Any]) -> dict:
+def _probe_pdf_font_files(ttfont_class, font_files: Mapping[str, Path]) -> None:
+    """Parse every font required by the PDF renderer without registering it.
+
+    Merely checking that a ``.ttf`` path exists produces a false-positive for a
+    truncated or partially installed bundle.  ``TTFont`` parses the sfnt tables
+    during construction, which is the same boundary the real renderer crosses.
+    Probe names are local to these unregistered objects and therefore cannot
+    pollute ReportLab's process-global font registry.
+    """
+
+    for index, (logical_name, path) in enumerate(font_files.items(), 1):
+        candidate = Path(path)
+        if not candidate.is_file():
+            raise FileNotFoundError(f"PDF font is missing: {candidate}")
+        ttfont_class(f"VCStudioCapabilityProbe{index}_{logical_name}", str(candidate))
+
+
+def _normalize_model(model: Mapping[str, Any], *, requested_formats=()) -> dict:
+    source_schema = _text(model.get("schema")) or _LEGACY_MODEL_SCHEMA
+    report_spec = _normalize_full_contract(
+        model.get("report_spec"), "report_spec")
+    report_snapshot = _normalize_full_contract(
+        model.get("report_snapshot"), "report_snapshot")
+    validation = _normalize_full_contract(
+        model.get("validation"), "validation")
+    (contracts_validated, report_spec, report_snapshot,
+     validation) = _validate_full_contract_chain(
+        report_spec, report_snapshot, validation)
+    contract_refs = _normalize_contract_refs(
+        model.get("contract_refs"),
+        report_spec=report_spec,
+        report_snapshot=report_snapshot,
+        validation=validation,
+    )
+    report_kind, qualification = _resolve_scientific_state(
+        model, validation, contract_refs,
+        contracts_validated=contracts_validated)
+    locale = _normalize_locale(model.get("locale"))
+    context = _validate_model_contract_context(
+        model,
+        report_spec=report_spec,
+        report_snapshot=report_snapshot,
+        validation=validation,
+        contract_refs=contract_refs,
+        locale=locale,
+        requested_formats=requested_formats,
+        contracts_validated=contracts_validated,
+    )
+    content = _normalize_content_fields(
+        model, locale=locale, outline=context["outline"])
+
+    return {
+        "schema": MODEL_SCHEMA,
+        "source_model_schema": source_schema,
+        "report_id": _text(model.get("report_id")),
+        "report_kind": report_kind,
+        "scientific_status": report_kind,
+        "scientific_qualification": qualification,
+        "claim_ceiling": context["claim_ceiling"],
+        "input_fingerprint": context["input_fingerprint"],
+        "preset_id": context["preset_id"],
+        "template_ref": context["template_ref"],
+        "policy_refs": context["policy_refs"],
+        "revision": _json_safe(model.get("revision") or {}),
+        "contract_status": (
+            "bound" if contracts_validated else
+            "references_only" if contract_refs else "absent"
+        ),
+        "contract_refs": contract_refs,
+        "report_spec": report_spec,
+        "report_snapshot": report_snapshot,
+        "validation": validation,
+        "claims": context["claims"],
+        "claim_graph": _json_safe(model.get("claim_graph") or {}),
+        "comparison_context": _json_safe(model.get("comparison_context") or {}),
+        "extensions": _json_safe(model.get("extensions") or {}),
+        **content,
+    }
+
+
+def _normalize_content_fields(model: Mapping[str, Any], *, locale: str,
+                              outline: Sequence[str]) -> dict:
     figures = model.get("figures") or []
     if isinstance(figures, (str, os.PathLike, Mapping)):
         figures = [figures]
     if not isinstance(figures, Sequence):
         raise TypeError("model['figures'] must be a sequence")
-
     return {
-        "locale": _normalize_locale(model.get("locale")),
+        "locale": locale,
+        "outline": [str(item) for item in outline],
         "title": _text(model.get("title")) or "Scientific Report",
         "subtitle": _text(model.get("subtitle")),
         "kicker": _text(model.get("kicker")) or "Research Report",
@@ -243,22 +530,443 @@ def _normalize_model(model: Mapping[str, Any]) -> dict:
         "executive_summary": _normalize_blocks(model.get("executive_summary")),
         "key_findings": _normalize_blocks(model.get("key_findings")),
         "candidate_evaluations": _normalize_table(
-            model.get("candidate_evaluations"),
-            "Candidate evaluation",
-        ),
+            model.get("candidate_evaluations"), "Candidate evaluation"),
         "adsorption_table": _normalize_table(
-            model.get("adsorption_table"),
-            "Adsorption-energy results",
-        ),
+            model.get("adsorption_table"), "Adsorption-energy results"),
         "comparison_table": _normalize_table(
-            model.get("comparison_table"),
-            "Cross-project comparison",
-        ),
-        "figures": [_normalize_figure(item, index) for index, item in enumerate(figures, 1)],
+            model.get("comparison_table"), "Cross-project comparison"),
+        "figures": [
+            _normalize_figure(item, index) for index, item in enumerate(figures, 1)
+        ],
         "methods": _normalize_blocks(model.get("methods")),
         "limitations": _normalize_blocks(model.get("limitations")),
         "recommendations": _normalize_blocks(model.get("recommendations")),
+        "comparison_context": _json_safe(model.get("comparison_context") or {}),
     }
+
+
+def report_content_sha256(model: Mapping[str, Any], *, outline=None) -> str:
+    """Hash the exact normalized report content independently of its contracts.
+
+    Callers compute this before constructing ``ValidationResult``.  The renderer
+    recomputes the same digest after content-addressing figures and refuses a
+    bound report whose visible content changed after validation.
+    """
+    if not isinstance(model, Mapping):
+        raise TypeError("model must be a mapping")
+    if outline is None:
+        from vcstudio.project.report_contracts import DEFAULT_OUTLINE
+
+        outline = model.get("outline") or DEFAULT_OUTLINE
+    locale = _normalize_locale(model.get("locale"))
+    normalized = _normalize_content_fields(model, locale=locale, outline=outline)
+    normalized.update({
+        "report_kind": _normalize_report_kind(model.get("report_kind")),
+        # Content hashing is also used before ValidationResult exists.  Validate
+        # the vocabulary here, while leaving the final/qualification gate to the
+        # bound contract constructor and renderer.
+        "scientific_qualification": _normalize_qualification(
+            model.get("scientific_qualification"), "diagnostic"),
+        "claim_ceiling": _text(model.get("claim_ceiling")),
+    })
+    prepared_figures = []
+    for figure in normalized["figures"]:
+        source = Path(figure["_source_path"]).expanduser()
+        if not source.is_file():
+            raise FileNotFoundError(f"report figure does not exist: {source}")
+        prepared = {
+            key: value for key, value in figure.items() if not key.startswith("_")
+        }
+        prepared["asset_sha256"] = _sha256_file(source)
+        prepared_figures.append(prepared)
+    normalized["figures"] = prepared_figures
+    return _sha256_json(_content_fingerprint(normalized))
+
+
+def frozen_report_content_sha256(model: Mapping[str, Any]) -> str:
+    """Recompute visible-content SHA-256 from a published model sidecar.
+
+    Canonical ``MODEL_SCHEMA`` sidecars already contain normalized content and
+    content-addressed figure digests, so they must not reopen original figure
+    paths.  The legacy/source-model branch is retained for lightweight adapters
+    and test doubles that contain no staged figures; it normalizes those fields
+    through the same pre-render public helper.
+    """
+    if not isinstance(model, Mapping):
+        raise TypeError("frozen model must be a mapping")
+    if _text(model.get("schema")) != MODEL_SCHEMA:
+        return report_content_sha256(model, outline=model.get("outline"))
+    return _sha256_json(_content_fingerprint(_json_safe(dict(model))))
+
+
+def _normalize_report_kind(value: Any) -> str:
+    """Normalize the scientific label without ever inferring ``final`` from prose."""
+    kind = _text(value).lower() or "diagnostic"
+    if kind not in _REPORT_KINDS:
+        raise ValueError(f"model['report_kind'] must be one of {_REPORT_KINDS}")
+    return kind
+
+
+def _normalize_full_contract(value: Any, field_name: str) -> dict:
+    """Normalize one optional full contract without hiding wrong container types."""
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise TypeError(f"model[{field_name!r}] must be a mapping")
+    return _json_safe(value)
+
+
+def _normalize_qualification(value: Any, report_kind: str) -> str:
+    qualification = _text(value).lower() or "diagnostic"
+    if qualification not in _QUALIFICATION_LEVELS:
+        raise ValueError(
+            "model['scientific_qualification'] must be one of "
+            f"{_QUALIFICATION_LEVELS}"
+        )
+    if report_kind == "final" and qualification == "diagnostic":
+        raise ValueError("a final report requires an explicit verified qualification")
+    return qualification
+
+
+def _validate_full_contract_chain(report_spec: Any, report_snapshot: Any,
+                                  validation: Any) -> tuple[bool, dict, dict, dict]:
+    """Validate and canonicalize one exact full contract chain."""
+    contracts = (report_spec, report_snapshot, validation)
+    present = tuple(isinstance(item, Mapping) and bool(item) for item in contracts)
+    if not any(present):
+        return False, {}, {}, {}
+    if not all(present):
+        raise ValueError(
+            "full report contracts must include ReportSpec, ReportSnapshot, "
+            "and ValidationResult together"
+        )
+    schemas = (
+        report_spec.get("schema"),
+        report_snapshot.get("schema"),
+        validation.get("schema"),
+    )
+    expected = (
+        "vcstudio.report-spec/v1",
+        "vcstudio.report-snapshot/v1",
+        "vcstudio.report-validation/v1",
+    )
+    if schemas != expected:
+        raise ValueError(
+            "full report contract schemas do not match the supported v1 chain"
+        )
+    from vcstudio.project.report_contracts import (
+        ReportSnapshot,
+        ReportSpec,
+        ValidationResult,
+        validate_bindings,
+    )
+
+    spec_obj = ReportSpec.from_mapping(report_spec)
+    snapshot_obj = ReportSnapshot.from_mapping(report_snapshot, spec=spec_obj)
+    validation_obj = ValidationResult.from_mapping(
+        validation, spec=spec_obj, snapshot=snapshot_obj)
+    validate_bindings(spec_obj, snapshot_obj, validation_obj)
+    return (
+        True,
+        spec_obj.to_dict(),
+        snapshot_obj.to_dict(),
+        validation_obj.to_dict(),
+    )
+
+
+def _validate_model_contract_context(model: Mapping[str, Any], *, report_spec: Any,
+                                     report_snapshot: Any, validation: Any,
+                                     contract_refs: Any, locale: str,
+                                     requested_formats=(),
+                                     contracts_validated: bool = False) -> dict:
+    """Cross-check render context against the validated report contracts."""
+    if isinstance(report_spec, Mapping) and report_spec:
+        spec_locale = _text(report_spec.get("locale"))
+        if spec_locale and _normalize_locale(spec_locale) != locale:
+            raise ValueError("model locale conflicts with ReportSpec.locale")
+        spec_formats = report_spec.get("formats")
+        if spec_formats is not None and requested_formats:
+            if set(_normalize_formats(spec_formats)) != set(requested_formats):
+                raise ValueError("requested render formats conflict with ReportSpec.formats")
+
+    snapshot_fingerprint = (
+        _text(report_snapshot.get("input_fingerprint"))
+        if isinstance(report_snapshot, Mapping) else ""
+    )
+    snapshot_ref = (contract_refs.get("snapshot")
+                    if isinstance(contract_refs, Mapping) else {})
+    ref_fingerprint = (_text(snapshot_ref.get("input_fingerprint"))
+                       if isinstance(snapshot_ref, Mapping) else "")
+    if snapshot_fingerprint and ref_fingerprint and snapshot_fingerprint != ref_fingerprint:
+        raise ValueError("snapshot contract reference input_fingerprint mismatch")
+    contract_fingerprint = snapshot_fingerprint or ref_fingerprint
+    model_fingerprint = _text(model.get("input_fingerprint"))
+    if model_fingerprint and contract_fingerprint and model_fingerprint != contract_fingerprint:
+        raise ValueError("model input_fingerprint conflicts with ReportSnapshot")
+
+    model_preset = _text(model.get("preset_id"))
+    model_ceiling = _text(model.get("claim_ceiling"))
+    model_claims = _json_safe(model.get("claims") or [])
+    model_template = _json_safe(model.get("template_ref"))
+    model_policies = _json_safe(model.get("policy_refs") or [])
+    model_outline = list(_SECTION_LABELS[locale])
+    if contracts_validated:
+        spec_preset = _text(report_spec.get("preset_id"))
+        spec_template = _json_safe(report_spec.get("template_ref"))
+        spec_policies = _json_safe(report_spec.get("policy_refs") or [])
+        spec_outline = [str(item) for item in report_spec.get("outline") or []]
+        unsupported_sections = sorted(
+            set(spec_outline) - set(_SECTION_LABELS[locale])
+        )
+        if unsupported_sections:
+            raise ValueError(
+                "ReportSpec.outline contains unsupported sections: "
+                + ", ".join(unsupported_sections)
+            )
+        validation_ceiling = _text(validation.get("claim_ceiling"))
+        validation_claims = _json_safe(validation.get("claims") or [])
+        if model_preset and model_preset != spec_preset:
+            raise ValueError("model preset_id conflicts with ReportSpec.preset_id")
+        if model_ceiling and model_ceiling != validation_ceiling:
+            raise ValueError(
+                "model claim_ceiling conflicts with ValidationResult.claim_ceiling"
+            )
+        if "claims" in model and model_claims != validation_claims:
+            raise ValueError("model claims conflict with ValidationResult.claims")
+        if "template_ref" in model and model_template != spec_template:
+            raise ValueError("model template_ref conflicts with ReportSpec.template_ref")
+        if "policy_refs" in model and model_policies != spec_policies:
+            raise ValueError("model policy_refs conflict with ReportSpec.policy_refs")
+        model_preset = spec_preset
+        model_template = spec_template
+        model_policies = spec_policies
+        model_outline = spec_outline
+        model_ceiling = validation_ceiling
+        model_claims = validation_claims
+    return {
+        "input_fingerprint": model_fingerprint or contract_fingerprint,
+        "preset_id": model_preset,
+        "template_ref": model_template,
+        "policy_refs": model_policies,
+        "outline": model_outline,
+        "claim_ceiling": model_ceiling,
+        "claims": model_claims,
+    }
+
+
+def _resolve_scientific_state(model: Mapping[str, Any], validation: Any,
+                              contract_refs: Mapping[str, Any], *,
+                              contracts_validated: bool) -> tuple[str, str]:
+    """Resolve one fail-closed science label from validation, never from prose."""
+    explicit_kind = _text(model.get("report_kind")).lower()
+    explicit_qualification = _text(model.get("scientific_qualification")).lower()
+    validation_map = validation if isinstance(validation, Mapping) else {}
+    validation_kind = _text(
+        validation_map.get("effective_kind") or validation_map.get("report_kind")
+    ).lower()
+    validation_qualification = _text(
+        validation_map.get("scientific_qualification")
+        or validation_map.get("qualification")
+    ).lower()
+    validation_ref = contract_refs.get("validation")
+    validation_ref = validation_ref if isinstance(validation_ref, Mapping) else {}
+    status = _text(validation_map.get("status") or validation_ref.get("status")).lower()
+    final_allowed = (validation_map.get("final_allowed")
+                     if validation_map else validation_ref.get("final_allowed"))
+
+    if explicit_kind and validation_kind and explicit_kind != validation_kind:
+        raise ValueError(
+            "model['report_kind'] conflicts with validation.effective_kind"
+        )
+    report_kind = _normalize_report_kind(validation_kind or explicit_kind)
+    if report_kind == "final":
+        permitted = (
+            contracts_validated
+            and final_allowed is True
+            and status in {"passed", "passed_with_warnings"}
+        )
+        if not permitted:
+            if validation_map:
+                raise ValueError(
+                    "a final report requires a complete bound validation chain "
+                    "with final_allowed=true"
+                )
+            # Legacy content without validation remains renderable, but cannot
+            # acquire a final badge or verified qualification.
+            report_kind = "diagnostic"
+            explicit_qualification = "diagnostic"
+
+    if (explicit_qualification and validation_qualification
+            and explicit_qualification != validation_qualification):
+        raise ValueError(
+            "model['scientific_qualification'] conflicts with validation"
+        )
+    qualification = _normalize_qualification(
+        validation_qualification or explicit_qualification, report_kind)
+    if not contracts_validated:
+        # A caller-provided label or an opaque hash reference is not scientific
+        # evidence.  Unbound reports may retain their artifact kind (draft or
+        # diagnostic), but their qualification always fails closed.
+        qualification = "diagnostic"
+    return report_kind, qualification
+
+
+def _normalize_contract_refs(value: Any, *, report_spec: Any,
+                             report_snapshot: Any, validation: Any) -> dict:
+    refs = _json_safe({} if value is None else value)
+    if not isinstance(refs, Mapping):
+        raise TypeError("model['contract_refs'] must be a mapping")
+    unknown = sorted(set(refs) - set(_CONTRACT_SCHEMAS))
+    if unknown:
+        raise ValueError(f"unsupported contract reference keys: {', '.join(unknown)}")
+    result = {}
+    full_contracts = {
+        "spec": report_spec,
+        "snapshot": report_snapshot,
+        "validation": validation,
+    }
+    for key, expected_schema in _CONTRACT_SCHEMAS.items():
+        declared = refs.get(key)
+        contract = full_contracts[key]
+        has_contract = isinstance(contract, Mapping) and bool(contract)
+        if declared is None and not has_contract:
+            continue
+        if declared is not None and not isinstance(declared, Mapping):
+            raise TypeError(f"model contract_refs[{key!r}] must be a mapping")
+        declared = dict(declared or {})
+        if has_contract:
+            contract_schema = _text(contract.get("schema"))
+            if contract_schema != expected_schema:
+                raise ValueError(
+                    f"full {key} contract schema must be {expected_schema!r}"
+                )
+            semantic_sha256 = _contract_semantic_sha256(key, contract)
+            canonical = {
+                "schema": expected_schema,
+                "sha256": semantic_sha256,
+            }
+            if key == "validation":
+                canonical.update({
+                    "status": _text(contract.get("status")).lower(),
+                    "final_allowed": contract.get("final_allowed"),
+                    "report_model_sha256": _text(
+                        contract.get("report_model_sha256")
+                    ).lower(),
+                })
+            if key == "snapshot":
+                canonical["input_fingerprint"] = _text(
+                    contract.get("input_fingerprint"))
+            for field, expected_value in canonical.items():
+                if field in declared and declared[field] != expected_value:
+                    raise ValueError(
+                        f"model contract_refs[{key!r}].{field} conflicts with the full contract"
+                    )
+            result[key] = canonical
+            continue
+
+        schema = _text(declared.get("schema"))
+        if schema != expected_schema:
+            raise ValueError(
+                f"contract_refs[{key!r}].schema must be {expected_schema!r}"
+            )
+        digest = _text(declared.get("sha256")).lower()
+        if not _SHA256_HEX_RE.fullmatch(digest):
+            raise ValueError(
+                f"contract_refs[{key!r}].sha256 must be a 64-character SHA-256"
+            )
+        canonical = {"schema": expected_schema, "sha256": digest}
+        if key == "validation":
+            status = _text(declared.get("status")).lower()
+            if status not in _VALIDATION_STATUSES:
+                raise ValueError("validation contract reference has an invalid status")
+            final_allowed = declared.get("final_allowed")
+            if not isinstance(final_allowed, bool):
+                raise TypeError("validation contract reference final_allowed must be bool")
+            canonical.update({"status": status, "final_allowed": final_allowed})
+            report_model_sha256 = _text(
+                declared.get("report_model_sha256")
+            ).lower()
+            if report_model_sha256:
+                if not _SHA256_HEX_RE.fullmatch(report_model_sha256):
+                    raise ValueError(
+                        "validation contract reference report_model_sha256 "
+                        "must be a 64-character SHA-256"
+                    )
+                canonical["report_model_sha256"] = report_model_sha256
+        if key == "snapshot":
+            fingerprint = _text(declared.get("input_fingerprint"))
+            if fingerprint:
+                canonical["input_fingerprint"] = fingerprint
+        result[key] = canonical
+    return _json_safe(result)
+
+
+def _contract_semantic_sha256(key: str, contract: Mapping[str, Any]) -> str:
+    """Use the owning contract type's precise semantic projection."""
+    from vcstudio.project.report_contracts import (
+        ReportSnapshot,
+        ReportSpec,
+        ValidationResult,
+    )
+
+    classes = {
+        "spec": ReportSpec,
+        "snapshot": ReportSnapshot,
+        "validation": ValidationResult,
+    }
+    return classes[key].from_mapping(contract).semantic_sha256
+
+
+def _reference_semantic_value(value: Any, *, remove_times: bool = False) -> Any:
+    """Strip top-level navigation/admin fields from known reference records only."""
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        result = _json_safe(value)
+        for key in tuple(result):
+            lowered = str(key).lower()
+            if lowered == "locator" or lowered.endswith("_locator"):
+                result.pop(key, None)
+            elif remove_times and lowered in _CONTRACT_ADMIN_KEYS:
+                result.pop(key, None)
+        return result
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [
+            _reference_semantic_value(item, remove_times=remove_times)
+            for item in value
+        ]
+    return _json_safe(value)
+
+
+def _stage_contract_sidecars(model: Mapping[str, Any], temp_root: Path,
+                             stem: str) -> tuple[dict[str, Path], dict]:
+    """Write portable full-contract sidecars before the transactional commit."""
+    outputs: dict[str, Path] = {}
+    records = copy.deepcopy(model.get("contract_refs") or {})
+    for key, model_key in (
+        ("spec", "report_spec"),
+        ("snapshot", "report_snapshot"),
+        ("validation", "validation"),
+    ):
+        contract = model.get(model_key)
+        if not isinstance(contract, Mapping) or not contract:
+            continue
+        path = temp_root / f"{stem}.{key}.json"
+        path.write_text(
+            json.dumps(contract, ensure_ascii=False, indent=2, sort_keys=True,
+                       allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        file_record = _file_record(path, relative_path=path.name)
+        record = dict(records.get(key) or {})
+        record.update({
+            "path": file_record["path"],
+            "file_sha256": file_record["sha256"],
+            "size": file_record["size"],
+        })
+        records[key] = record
+        outputs[f"contract_{key}"] = path
+    return outputs, records
 
 
 def _normalize_locale(value: Any) -> str:
@@ -269,6 +977,22 @@ def _normalize_locale(value: Any) -> str:
     if normalized in {"zh", "zh-cn", "zh-hans"}:
         return "zh-CN"
     raise ValueError("model['locale'] must be 'en-US' or 'zh-CN'")
+
+
+def _report_kind_label(model: Mapping[str, Any]) -> str:
+    labels = {
+        "zh-CN": {
+            "final": "最终报告 · 科学资格已通过",
+            "diagnostic": "诊断报告 · 不构成最终科学结论",
+            "draft": "报告草稿 · 尚未完成科学审核",
+        },
+        "en-US": {
+            "final": "FINAL REPORT · SCIENTIFIC GATE PASSED",
+            "diagnostic": "DIAGNOSTIC REPORT · NOT A FINAL SCIENTIFIC CONCLUSION",
+            "draft": "DRAFT REPORT · SCIENTIFIC REVIEW INCOMPLETE",
+        },
+    }
+    return labels[model["locale"]][model["report_kind"]]
 
 
 def _normalize_metadata(value: Any) -> list[dict]:
@@ -435,6 +1159,15 @@ def _normalize_figure(item: Any, index: int) -> dict:
         "title": title,
         "caption": _text(item.get("caption")),
         "alt": _text(item.get("alt")) or title,
+        "figure_id": _text(item.get("figure_id")),
+        "evidence_refs": _json_safe(item.get("evidence_refs") or []),
+        "claim_refs": _json_safe(item.get("claim_refs") or []),
+        "source_ids": _json_safe(item.get("source_ids") or []),
+        "data_sha256": _text(item.get("data_sha256")),
+        "quantity": _text(item.get("quantity")),
+        "unit": _text(item.get("unit")),
+        "denominator": _json_safe(item.get("denominator")),
+        "extensions": _json_safe(item.get("extensions") or {}),
         "_source_path": Path(raw_path).expanduser(),
     }
 
@@ -510,6 +1243,8 @@ def _commit_report_files(
     temp_manifest: Path,
     destination: Path,
     rollback_dir: Path,
+    *,
+    obsolete_paths: Sequence[Path] = (),
 ) -> tuple[dict[str, Path], Path]:
     """Publish a report set with best-effort transactional rollback.
 
@@ -523,11 +1258,18 @@ def _commit_report_files(
         for fmt, source in temp_outputs.items()
     ]
     final_manifest = destination / temp_manifest.name
-    entries.append(("manifest", temp_manifest, final_manifest))
+    obsolete = tuple(
+        path for path in dict.fromkeys(Path(item) for item in obsolete_paths)
+        if path not in {target for _kind, _source, target in entries}
+    )
+    commit_entries = [*entries, ("manifest", temp_manifest, final_manifest)]
 
     rollback_dir.mkdir(parents=True, exist_ok=True)
     backups: dict[Path, Path] = {}
-    for _kind, _source, target in entries:
+    for target in dict.fromkeys([
+            *(target for _kind, _source, target in commit_entries),
+            *obsolete,
+    ]):
         if not target.exists():
             continue
         if not target.is_file():
@@ -539,12 +1281,29 @@ def _commit_report_files(
         backups[target] = backup
 
     published: list[Path] = []
+    deleted: list[Path] = []
+    manifest_invalidated = False
     try:
+        # Withdraw the old commit marker before touching any member file.  If a
+        # viewer holds it with a restrictive Windows lock, publication aborts
+        # here while every old artifact is still untouched.  If a later step
+        # fails, the old marker is restored only after all members roll back.
+        if final_manifest.exists():
+            if final_manifest not in backups:
+                raise OSError(f"report manifest backup is unavailable: {final_manifest}")
+            final_manifest.unlink()
+            manifest_invalidated = True
         for _kind, source, target in entries:
             os.replace(source, target)
             published.append(target)
+        for target in obsolete:
+            if target.exists():
+                target.unlink()
+                deleted.append(target)
+        os.replace(temp_manifest, final_manifest)
+        published.append(final_manifest)
     except Exception as publish_error:
-        rollback_errors = []
+        rollback_errors: list[str] = []
         for target in reversed(published):
             try:
                 backup = backups.get(target)
@@ -554,11 +1313,72 @@ def _commit_report_files(
                     os.replace(backup, target)
             except Exception as rollback_error:  # noqa: BLE001
                 rollback_errors.append(f"{target}: {rollback_error}")
+        for target in reversed(deleted):
+            try:
+                backup = backups.get(target)
+                if backup is not None:
+                    os.replace(backup, target)
+            except Exception as rollback_error:  # noqa: BLE001
+                rollback_errors.append(f"{target}: {rollback_error}")
+        if manifest_invalidated and not rollback_errors:
+            try:
+                os.replace(backups[final_manifest], final_manifest)
+            except Exception as rollback_error:  # noqa: BLE001
+                rollback_errors.append(f"{final_manifest}: {rollback_error}")
         if rollback_errors:
+            backup_records = []
+            recovery_record_errors = []
+            for target, backup in backups.items():
+                if not backup.exists():
+                    continue
+                record = {"target": str(target), "backup": str(backup)}
+                try:
+                    record.update({
+                        "sha256": _sha256_file(backup),
+                        "size": backup.stat().st_size,
+                    })
+                except Exception as evidence_error:  # noqa: BLE001
+                    recovery_record_errors.append(
+                        f"could not fingerprint {backup}: {evidence_error}"
+                    )
+                backup_records.append(record)
+            recovery_record = {
+                "schema": "vcstudio.paper-report.recovery/v1",
+                "artifact_status": "recovery_required",
+                "created_at_utc": datetime.now(timezone.utc).replace(
+                    microsecond=0).isoformat(),
+                "destination": str(destination),
+                "manifest_path": str(final_manifest),
+                "canonical_manifest_withheld": bool(manifest_invalidated),
+                "publication_error": str(publish_error),
+                "rollback_errors": rollback_errors,
+                "recovery_record_errors": recovery_record_errors,
+                "backups": backup_records,
+            }
+            recovery_record_path = rollback_dir / "RECOVERY.json"
+            record_error = None
+            try:
+                recovery_record_path.write_text(
+                    json.dumps(
+                        recovery_record,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                        allow_nan=False,
+                    ) + "\n",
+                    encoding="utf-8",
+                )
+            except Exception as recovery_error:  # noqa: BLE001
+                record_error = str(recovery_error)
             detail = "; ".join(rollback_errors)
-            raise OSError(
-                "report publication failed and rollback was incomplete: "
-                f"{detail}"
+            message = (
+                "report publication failed and rollback was incomplete; "
+                f"recovery evidence retained at {rollback_dir}: {detail}"
+            )
+            if record_error:
+                message += f"; RECOVERY.json could not be written: {record_error}"
+            raise ReportRecoveryError(
+                message, recovery_dir=rollback_dir
             ) from publish_error
         raise
 
@@ -573,18 +1393,57 @@ def _commit_report_files(
 def _fingerprint_model(model: dict) -> dict:
     payload = {}
     for key, value in model.items():
+        if key in {"report_spec", "report_snapshot", "validation"}:
+            # Full contracts are retained for audit, while their semantic
+            # digests in contract_refs bind the model without timestamps or
+            # machine-specific locators polluting reproducibility.
+            continue
+        if key == "revision":
+            payload[key] = _reference_semantic_value(value, remove_times=True)
+            continue
+        if key in {"template_ref", "policy_refs"}:
+            payload[key] = _reference_semantic_value(value)
+            continue
+        if key in {"extensions", "contract_refs", "claims", "claim_graph",
+                   "comparison_context"}:
+            payload[key] = _json_safe(value)
+            continue
         if key != "figures":
             payload[key] = value
             continue
         payload["figures"] = [
-            {
-                "title": figure["title"],
-                "caption": figure["caption"],
-                "alt": figure["alt"],
+            _json_safe({
+                key: value
+                for key, value in figure.items()
+                if not key.startswith("_") and key not in {"asset_path", "asset_name"}
+            } | {
                 "asset_sha256": figure["asset_sha256"],
-            }
+            })
             for figure in value
         ]
+    return _json_safe(payload)
+
+
+def _content_fingerprint(model: Mapping[str, Any]) -> dict:
+    """Return only visible/scientific report content for validation binding."""
+    payload = {}
+    for key in _CONTENT_FINGERPRINT_KEYS:
+        value = model.get(key)
+        if key != "figures":
+            payload[key] = _json_safe(value)
+            continue
+        figures = []
+        for figure in value or []:
+            digest = _text(figure.get("asset_sha256")).lower()
+            if not _SHA256_HEX_RE.fullmatch(digest):
+                raise ValueError("report figure is missing a content SHA-256")
+            figures.append(_json_safe({
+                item_key: item_value
+                for item_key, item_value in figure.items()
+                if not str(item_key).startswith("_")
+                and item_key not in {"asset_path", "asset_name"}
+            } | {"asset_sha256": digest}))
+        payload[key] = figures
     return _json_safe(payload)
 
 
@@ -628,6 +1487,8 @@ def _render_html(model: dict, output: Path) -> None:
     title = html.escape(model["title"])
     subtitle = html.escape(model["subtitle"])
     kicker = html.escape(model["kicker"])
+    report_kind = html.escape(model["report_kind"], quote=True)
+    report_status = html.escape(_report_kind_label(model))
     document = f"""<!doctype html>
 <html lang="{model['locale']}">
 <head>
@@ -654,6 +1515,12 @@ body {{
   text-align:center; page-break-after:always; }}
 .kicker {{ margin:0 0 16mm; color:#8a6a2e; font:700 9pt/1.2 Arial,sans-serif;
   letter-spacing:.18em; text-transform:uppercase; }}
+.report-status {{ align-self:center; margin:0 0 6mm; padding:2.2mm 5mm;
+  border:1px solid #9ca3af; border-radius:999px; color:#4b5563;
+  font:700 8.5pt/1.2 Arial,"Microsoft YaHei",sans-serif; letter-spacing:.04em; }}
+.report-status[data-kind="final"] {{ border-color:#15803d; background:#f0fdf4; color:#166534; }}
+.report-status[data-kind="diagnostic"] {{ border-color:#b45309; background:#fffbeb; color:#92400e; }}
+.report-status[data-kind="draft"] {{ border-color:#64748b; background:#f8fafc; color:#475569; }}
 h1 {{ margin:0; color:#203846; font-size:29pt; line-height:1.22; font-weight:600; }}
 .subtitle {{ margin:5mm auto 0; max-width:135mm; color:#435866; font-size:14pt; line-height:1.5; }}
 .metadata {{ width:min(125mm,100%); margin:25mm auto 0; padding-top:6mm;
@@ -702,6 +1569,7 @@ figcaption {{ margin-top:2.5mm; color:#39464e; font-size:9pt; line-height:1.45; 
 <main class="paper">
 <header class="cover">
   <p class="kicker">{kicker}</p>
+  <p class="report-status" data-kind="{report_kind}">{report_status}</p>
   <h1>{title}</h1>
   {f'<p class="subtitle">{subtitle}</p>' if subtitle else ''}
   {f'<dl class="metadata">{metadata}</dl>' if metadata else ''}
@@ -861,6 +1729,22 @@ def _render_docx(model: dict, output: Path) -> None:
         size=9,
         bold=True,
         color=(138, 106, 46),
+    )
+    status = doc.add_paragraph()
+    status.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    status.paragraph_format.space_after = Pt(16)
+    status_color = {
+        "final": (22, 101, 52),
+        "diagnostic": (146, 64, 14),
+        "draft": (71, 85, 105),
+    }[model["report_kind"]]
+    set_font(
+        status.add_run(_report_kind_label(model)),
+        name="Arial",
+        east_asia="Microsoft YaHei",
+        size=9,
+        bold=True,
+        color=status_color,
     )
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -1408,6 +2292,15 @@ def _render_pdf(model: dict, output: Path) -> None:
             alignment=TA_CENTER,
             spaceAfter=5 * mm,
         ),
+        "cover_status": ParagraphStyle(
+            "CoverStatus",
+            fontName=bold_font,
+            fontSize=8.5,
+            leading=12,
+            textColor=palette["muted"],
+            alignment=TA_CENTER,
+            spaceAfter=5 * mm,
+        ),
         "cover_subtitle": ParagraphStyle(
             "CoverSubtitle",
             fontName=font,
@@ -1517,6 +2410,9 @@ def _render_pdf(model: dict, output: Path) -> None:
     story = [Spacer(1, 43 * mm)]
     story.append(
         Paragraph(_pdf_markup(model["kicker"].upper(), _PDF_CJK_BOLD), styles["cover_kicker"])
+    )
+    story.append(
+        Paragraph(_pdf_markup(_report_kind_label(model), _PDF_CJK_BOLD), styles["cover_status"])
     )
     story.append(Paragraph(_pdf_markup(model["title"], _PDF_CJK_BOLD), styles["cover_title"]))
     if model["subtitle"]:
@@ -1736,7 +2632,11 @@ def _pdf_table(
 
 def _section_plan(model: dict) -> list[tuple[str, str]]:
     labels = _SECTION_LABELS[model["locale"]]
-    return [(key, heading) for key, heading in labels.items() if model.get(key)]
+    return [
+        (key, labels[key])
+        for key in model.get("outline") or labels
+        if key in labels and model.get(key)
+    ]
 
 
 def _column_widths_dxa(table: dict) -> list[int]:
@@ -1844,12 +2744,32 @@ def _display(value: Any) -> str:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         return "; ".join(_display(item) for item in value)
     if isinstance(value, os.PathLike):
-        return str(value)
-    return str(value)
+        return os.fspath(value)
+    raise TypeError(
+        f"report model contains unsupported display value type: {type(value).__name__}"
+    )
 
 
 def _text(value: Any) -> str:
-    return "" if value is None else str(value).strip()
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, bool):
+        return str(value).strip()
+    if isinstance(value, int):
+        return str(value).strip()
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("report model contains a non-finite number")
+        return str(value).strip()
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, os.PathLike):
+        return os.fspath(value).strip()
+    raise TypeError(
+        f"report model contains unsupported text value type: {type(value).__name__}"
+    )
 
 
 def _json_safe(value: Any) -> Any:
@@ -1862,23 +2782,33 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (date, datetime)):
         return value.isoformat()
     if isinstance(value, os.PathLike):
-        return str(value)
+        return os.fspath(value)
     if isinstance(value, Mapping):
-        return {str(key): _json_safe(val) for key, val in value.items()}
+        result = {}
+        for key, val in value.items():
+            if not isinstance(key, str):
+                raise TypeError("report model JSON object keys must be strings")
+            result[key] = _json_safe(val)
+        return result
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         return [_json_safe(item) for item in value]
-    return str(value)
+    raise TypeError(
+        f"report model contains a non-JSON value of type {type(value).__name__}"
+    )
 
 
-def _sha256_json(value: Any) -> str:
-    payload = json.dumps(
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
         _json_safe(value),
         ensure_ascii=False,
         allow_nan=False,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+
+
+def _sha256_json(value: Any) -> str:
+    return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
 
 
 def _sha256_file(path: Path) -> str:

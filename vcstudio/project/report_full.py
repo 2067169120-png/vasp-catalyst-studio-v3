@@ -210,15 +210,24 @@ def _fmt_number(value, digits=6):
     return f'{value:.{digits}f}' if isinstance(value, (int, float)) else '—'
 
 
+def _effective_report_status(report_status, delta):
+    """Resolve the legacy label without granting this renderer gate authority.
+
+    Historical callers may still pass ``auto`` or ``final``.  This low-level
+    renderer has no bound validation result, so every value must fail closed to
+    ``diagnostic``.  A caller with real gate evidence must use the canonical
+    report bundle instead of turning this compatibility renderer into a second
+    publication authority.
+    """
+    return 'diagnostic'
+
+
 def _document_model(*, proj, name, delta, rows, summary, fed, inc0,
                     kpts_repro, potcar_prov, ai_out, figures, report_status):
     """把 HTML 编排中的同一批真实数据压成 DOCX/PDF 共用结构模型。"""
     values = [row.get('delta_e') for row in delta.get('rows') or []
               if isinstance(row.get('delta_e'), (int, float))]
-    status = report_status
-    if status == 'auto':
-        status = ('final' if values and len(values) == len(delta.get('rows') or [])
-                  else 'diagnostic')
+    status = _effective_report_status(report_status, delta)
     final = status == 'final'
     strongest = None
     if values:
@@ -366,8 +375,12 @@ def _document_model(*, proj, name, delta, rows, summary, fed, inc0,
 
 def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
                             origin_render=None, ai_analyze=None, log=None,
-                            report_status='auto') -> Path:
-    """组装同源 HTML + DOCX + PDF 报告；返回 HTML 主路径。"""
+                            report_status='diagnostic') -> Path:
+    """组装旧版 HTML + DOCX + PDF 报告；默认仅允许诊断标签。
+
+    这个兼容函数没有绑定验证结果，因此即使旧调用方传入 ``final`` 也只
+    发布诊断标签。需要最终报告时必须改用统一报告 bundle 和科学门禁。
+    """
     config = config or {}
     log = log or (lambda s: None)
     origin_render = origin_render or _default_origin
@@ -384,6 +397,12 @@ def generate_project_report(proj: dict, out_path, *, config: dict | None = None,
     rows = report.collect_jobs(dirs)
     summary = report.summarize(rows)
     sections: list = []
+    effective_status = _effective_report_status(report_status, delta)
+    if effective_status != 'final':
+        sections.append(
+            '<section class="report-status diagnostic"><h2>诊断报告 · 非最终科学结论</h2>'
+            '<p>当前报告默认按诊断产物发布；只有已经执行科学门禁的上层调用方'
+            '才能显式请求最终状态。</p></section>')
 
     # 逐物种参考是 Li-S 公式的实际第三项，必须与ΔE同页可审计。
     ref_evidence = _species_reference_evidence(delta)

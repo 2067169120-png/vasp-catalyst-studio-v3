@@ -9,6 +9,30 @@
   const setVal = (id, v) => { const el = $(id); if (el) el.value = v || ''; };
   const CURRENT_PROJECT_KEY = 'vcs.adsorption.current_project';
   const COMPARE_PROJECTS_KEY = 'vcs.adsorption.compare_projects';
+  const SINGLE_REPORT_FORMATS = Object.freeze([
+    {
+      id: 'pj-report-format-html', value: 'html', label: 'HTML',
+      description: '浏览器预览（始终可用）',
+    },
+    {
+      id: 'pj-report-format-docx', value: 'docx', label: 'DOCX',
+      description: '编辑与批注',
+    },
+    {
+      id: 'pj-report-format-pdf', value: 'pdf', label: 'PDF',
+      description: '打印与归档',
+    },
+  ]);
+  const REPORT_CAPABILITY_PENDING_REASON =
+    '正在等待后端明确确认；确认可用前不会提交此格式。';
+
+  function initialReportCapabilities() {
+    return {
+      html: { available: true, reason: '' },
+      docx: { available: false, reason: REPORT_CAPABILITY_PENDING_REASON },
+      pdf: { available: false, reason: REPORT_CAPABILITY_PENDING_REASON },
+    };
+  }
 
   const State = {
     configs: [],      // 构型 POSCAR 路径列表(逐个添加)
@@ -47,6 +71,11 @@
     compareFiguresBusy: false,
     batchReportBusy: false,
     candidateEvaluationGeneration: 0,
+    reportDiagnostic: false,
+    reportBusy: false,
+    reportCapabilities: initialReportCapabilities(),
+    reportCapabilityState: 'pending',
+    reportCapabilityGeneration: 0,
   };
 
   const LIS_MUTABLE_CONTROLS = [
@@ -172,7 +201,7 @@
       if (newButton) newButton.textContent = '处理任务异常';
       setJourneyPrimary('ads-route-new');
     } else if (State.workflowResultReady || State.workflowStage === 'report_done') {
-      if (status) status.textContent = '任务和报告已完成，可以查看 ΔE 与最新报告。';
+      if (status) status.textContent = '任务已完成，报告产物已生成；科学状态可能是最终、诊断或阻断，请在报告卡中核对。';
       const resultButton = $('ads-route-results');
       if (resultButton) resultButton.textContent = '查看 ΔE 与报告';
       setJourneyPrimary('ads-route-results');
@@ -2876,6 +2905,162 @@
     box.innerHTML = html;
   }
 
+  function selectedReportFormats() {
+    return SINGLE_REPORT_FORMATS
+      .filter(item => {
+        const input = $(item.id);
+        const capability = State.reportCapabilities && State.reportCapabilities[item.value];
+        return !!(input && input.checked && capability && capability.available === true);
+      })
+      .map(item => item.value);
+  }
+
+  function reportFormatLabel(formats) {
+    const wanted = new Set(formats || []);
+    return SINGLE_REPORT_FORMATS
+      .filter(item => wanted.has(item.value))
+      .map(item => item.label)
+      .join(' / ');
+  }
+
+  function unavailableReportFormatText(items) {
+    const groups = new Map();
+    items.forEach(item => {
+      const reason = item.reason || '后端未明确报告此格式可用。';
+      const labels = groups.get(reason) || [];
+      labels.push(item.label);
+      groups.set(reason, labels);
+    });
+    return Array.from(groups, ([reason, labels]) =>
+      `${labels.join('、')}（${reason}）`).join('；');
+  }
+
+  function setReportCapabilityFailure(reason) {
+    const detail = String(reason || '报告格式能力检测失败。').trim();
+    const unavailableReason = `${detail}；未获得可用的明确确认。`;
+    State.reportCapabilities = {
+      html: { available: true, reason: '' },
+      docx: { available: false, reason: unavailableReason },
+      pdf: { available: false, reason: unavailableReason },
+    };
+    State.reportCapabilityState = 'failed';
+    syncReportFormatControls();
+  }
+
+  function applyReportCapabilities(formats) {
+    const normalized = { html: { available: true, reason: '' } };
+    ['docx', 'pdf'].forEach(format => {
+      const capability = formats && typeof formats[format] === 'object'
+        ? formats[format] : null;
+      const available = !!(capability && capability.available === true);
+      normalized[format] = {
+        available,
+        reason: available ? '' : String(
+          capability && capability.reason ||
+          '后端未明确报告此格式可用。'),
+      };
+    });
+    State.reportCapabilities = normalized;
+    State.reportCapabilityState = 'ready';
+    syncReportFormatControls();
+  }
+
+  function syncReportFormatControls() {
+    const formats = selectedReportFormats();
+    const valid = formats.length > 0;
+    const fieldset = $('pj-report-formats');
+    const status = $('pj-report-format-status');
+    const button = $('pj-report');
+    const selectedProject = !!val('pj-select');
+    const labels = reportFormatLabel(formats);
+    const unavailable = [];
+    SINGLE_REPORT_FORMATS.forEach(item => {
+      const input = $(item.id);
+      const capability = State.reportCapabilities && State.reportCapabilities[item.value];
+      const disabledByCapability = !(capability && capability.available === true);
+      const reason = disabledByCapability
+        ? String(capability && capability.reason || '后端未明确报告此格式可用。') : '';
+      if (disabledByCapability) unavailable.push({ label: item.label, reason });
+      if (input) {
+        const controlDisabled = State.reportBusy || disabledByCapability;
+        input.disabled = controlDisabled;
+        if (disabledByCapability) input.checked = false;
+        input.setAttribute('aria-disabled', controlDisabled ? 'true' : 'false');
+        const label = input.closest('label');
+        if (label) {
+          label.classList.toggle('unavailable', disabledByCapability);
+          label.classList.toggle(
+            'pending', disabledByCapability && State.reportCapabilityState === 'pending');
+          label.title = disabledByCapability ? reason : '';
+          const description = label.querySelector('small');
+          if (description) description.textContent = disabledByCapability ? reason : item.description;
+        }
+      }
+    });
+    if (fieldset) {
+      fieldset.classList.toggle('invalid', !valid);
+      fieldset.setAttribute('aria-invalid', valid ? 'false' : 'true');
+      fieldset.setAttribute(
+        'aria-busy', State.reportCapabilityState === 'pending' ? 'true' : 'false');
+    }
+    if (status) {
+      const unavailableText = unavailableReportFormatText(unavailable);
+      const unavailablePrefix = State.reportCapabilityState === 'pending'
+        ? '能力检测中' : '当前不可用';
+      status.classList.toggle('bad', !valid);
+      status.textContent = valid
+        ? `已选择：${labels.split(' / ').join('、')}` +
+          (unavailable.length ? `；${unavailablePrefix}：${unavailableText}` : '')
+        : '请至少选择一种报告格式。' +
+          (unavailable.length ? ` ${unavailablePrefix}：${unavailableText}` : '');
+    }
+    if (button) {
+      const prefix = State.reportDiagnostic ? '生成诊断报告' : '生成报告';
+      button.textContent = valid ? `${prefix}（${labels}）` : `${prefix}（请选择格式）`;
+      button.disabled = State.reportBusy || !selectedProject || !valid;
+    }
+    return formats;
+  }
+
+  async function loadReportCapabilities() {
+    const generation = ++State.reportCapabilityGeneration;
+    State.reportCapabilities = initialReportCapabilities();
+    State.reportCapabilityState = 'pending';
+    syncReportFormatControls();
+    try {
+      const result = await VCS.call('proj_report_capabilities');
+      if (generation !== State.reportCapabilityGeneration) return;
+      if (bridgeMethodUnavailable(result)) {
+        setReportCapabilityFailure(
+          result && result.error || '当前后端未提供报告格式能力检测。');
+        return;
+      }
+      if (!result || result.ok === false) {
+        setReportCapabilityFailure(result && result.error || '报告格式能力检测失败。');
+        return;
+      }
+      if (!result.formats || typeof result.formats !== 'object') {
+        setReportCapabilityFailure('能力检测未返回格式清单。');
+        return;
+      }
+      applyReportCapabilities(result.formats);
+    } catch (error) {
+      if (generation !== State.reportCapabilityGeneration) return;
+      setReportCapabilityFailure(
+        error && error.message || '报告格式能力检测调用失败。');
+    }
+  }
+
+  function requireReportFormats() {
+    const formats = syncReportFormatControls();
+    if (formats.length) return formats;
+    VCS.log('生成报告前请至少选择一种格式（HTML、DOCX 或 PDF）。', 'failc');
+    VCS.toast('请至少选择一种报告格式', 'fail');
+    const first = $(SINGLE_REPORT_FORMATS[0].id);
+    if (first && typeof first.focus === 'function') first.focus();
+    return null;
+  }
+
   async function refreshCandidateEvaluation(path) {
     const generation = ++State.candidateEvaluationGeneration;
     const wanted = String(path || '');
@@ -2906,7 +3091,8 @@
     if (!project) {
       box.innerHTML = '<b>还没有可查看的项目</b><span>下一步：先导入已算结果，或用参考能开始新的吸附计算。</span>';
       [deltaButton, reportButton, csvButton].forEach(button => { if (button) button.disabled = true; });
-      if (reportButton) reportButton.textContent = '生成 HTML / Word / PDF 报告';
+      State.reportDiagnostic = false;
+      syncReportFormatControls();
       return;
     }
     [deltaButton, reportButton, csvButton].forEach(button => { if (button) button.disabled = false; });
@@ -2960,12 +3146,8 @@
       `<span>${VCS.esc(refText)}</span><span>${VCS.esc(stage)}</span></div><b>${VCS.esc(next)}</b>`;
     if (deltaButton) deltaButton.classList.toggle('primary', !complete);
     if (reportButton) reportButton.classList.toggle('primary', complete);
-    if (reportButton) {
-      reportButton.disabled = false;
-      reportButton.textContent = complete
-        ? '生成 HTML / Word / PDF 报告'
-        : '生成诊断报告（HTML / Word / PDF）';
-    }
+    State.reportDiagnostic = !complete;
+    syncReportFormatControls();
   }
 
   function currentProject() {
@@ -3130,6 +3312,50 @@
     return /(桥方法不存在|method not found|unknown method|has no attribute)/i.test(message);
   }
 
+  function reportScienceState(result) {
+    const raw = String(result && (
+      result.scientific_status || result.report_status || result.report_kind || result.kind
+    ) || 'pending').trim().toLowerCase();
+    if (raw === 'final') return { key: 'final', label: '最终' };
+    if (raw === 'diagnostic') return { key: 'diagnostic', label: '诊断' };
+    if (raw === 'draft') return { key: 'draft', label: '草稿' };
+    if (raw === 'blocked') return { key: 'blocked', label: '阻断' };
+    return { key: 'pending', label: '待判定' };
+  }
+
+  function reportStateMarkup(result, files) {
+    const science = reportScienceState(result);
+    const artifactRaw = String(result && result.artifact_status || '').trim().toLowerCase();
+    const generated = files.length > 0;
+    const productKey = artifactRaw === 'stale' || artifactRaw === 'generated_unrecorded'
+      ? 'stale'
+      : artifactRaw === 'failed' || (result && result.error && !generated)
+        ? 'failed'
+        : generated ? 'ready' : 'pending';
+    const productLabel = artifactRaw === 'generated_unrecorded'
+      ? `已生成 ${files.length} 个文件但未登记`
+      : artifactRaw === 'stale'
+        ? '产物已过期'
+        : generated
+          ? `已生成 ${files.length} 个文件`
+          : (productKey === 'failed' ? '生成失败' : '尚未生成');
+    const reason = String(result && (result.gate_reason || result.report_reason) || '');
+    const gateRaw = String(result && result.publication_gate_status || 'unknown').toLowerCase();
+    const gate = gateRaw === 'eligible'
+      ? { key: 'eligible', label: '可发布最终版' }
+      : gateRaw === 'blocked'
+        ? { key: 'blocked', label: '阻断' }
+        : gateRaw === 'pending'
+          ? { key: 'pending', label: '等待计算' }
+          : { key: 'pending', label: '未知' };
+    return '<div class="pj-report-states" role="status" aria-label="报告产物状态、科学状态与发布门禁">' +
+      `<span class="pj-report-state product ${productKey}"><b>报告产物</b>${VCS.esc(productLabel)}</span>` +
+      `<span class="pj-report-state science ${science.key}"${reason ? ` title="${VCS.esc(reason)}"` : ''}>` +
+      `<b>科学状态</b>${VCS.esc(science.label)}</span>` +
+      `<span class="pj-report-state gate ${gate.key}"${reason ? ` title="${VCS.esc(reason)}"` : ''}>` +
+      `<b>发布门禁</b>${VCS.esc(gate.label)}</span></div>`;
+  }
+
   function collectReportFiles(value) {
     const found = [];
     const formatNames = { html: 'HTML', docx: 'Word', pdf: 'PDF' };
@@ -3175,14 +3401,15 @@
     if (!box) return;
     const files = collectReportFiles((result && result.files) ||
       (result && result.file ? { html: result.file } : {}));
+    const stateMarkup = reportStateMarkup(result, files);
     if (!files.length) {
-      box.innerHTML = result && result.error
-        ? `<div class="pj-report-note bad">${VCS.esc(result.error)}</div>` : '';
+      box.innerHTML = stateMarkup + (result && result.error
+        ? `<div class="pj-report-note bad">${VCS.esc(result.error)}</div>` : '');
       return;
     }
-    const diagnostic = result && result.kind === 'diagnostic';
+    const diagnostic = reportScienceState(result).key === 'diagnostic';
     let html = '<div class="pj-report-head"><b>' + VCS.esc(heading || '报告文件') + '</b>' +
-      `<span>${files.length} 个文件${diagnostic ? ' · 诊断版' : ''}</span></div>` +
+      `<span>${files.length} 个文件</span></div>${stateMarkup}` +
       '<div class="pj-report-links">';
     files.forEach(file => {
       const name = pathBase(file.path);
@@ -3192,6 +3419,10 @@
     html += '</div>';
     if (diagnostic) {
       html += '<div class="pj-report-note">当前生成的是诊断报告：保留真实结果与阻断原因，不冒充最终结论。</div>';
+    }
+    const gateReason = String(result && (result.gate_reason || result.report_reason) || '');
+    if (gateReason) {
+      html += `<div class="pj-report-note">发布门禁：${VCS.esc(gateReason)}</div>`;
     }
     box.innerHTML = html;
     box.querySelectorAll('[data-report-open]').forEach(button => {
@@ -3209,12 +3440,13 @@
       const save = joinPath(outDir, `${String(index + 1).padStart(2, '0')}_${safeName}_完整报告.html`);
       const result = await VCS.call('proj_report', path, save, true);
       if (result && result.ok !== false && !result.error) {
-        individual.push({
+        const returnedFiles = result.files && typeof result.files === 'object' &&
+          !Array.isArray(result.files) ? result.files : {};
+        individual.push(Object.assign({}, result, {
           name,
-          kind: 'final',
-          files: { html: result.file || save },
+          files: Object.assign({}, returnedFiles, { html: result.file || returnedFiles.html || save }),
           ok: true,
-        });
+        }));
       } else {
         failures.push(`${name}: ${(result && result.error) || '未知错误'}`);
       }
@@ -3236,22 +3468,37 @@
   async function report() {
     const proj = currentProject();
     if (!proj) return;
+    const selectedFormats = requireReportFormats();
+    if (!selectedFormats) return;
+    const selectedLabel = reportFormatLabel(selectedFormats);
     const dr = await VCS.call('pick_dir');
     if (dr && dr.error) { VCS.log('选择目录失败:' + dr.error, 'failc'); return; }
     if (!dr || !dr.path) return;   // 用户取消
-    const btn = $('pj-report');
-    if (btn) btn.disabled = true;
+    State.reportBusy = true;
+    syncReportFormatControls();
     const output = $('pj-report-files');
     if (output) output.innerHTML = '';
-    VCS.log('正在从同一份数据快照生成 HTML、Word 与 PDF 报告，可能需要几分钟…');
+    VCS.log(`正在从同一份数据快照生成 ${selectedLabel} 报告，可能需要几分钟…`);
     try {
       let r = await VCS.call(
-        'proj_report_bundle', proj.path, dr.path, ['html', 'docx', 'pdf'], true);
+        'proj_report_bundle', proj.path, dr.path, selectedFormats, true);
       if (bridgeMethodUnavailable(r)) {
+        if (selectedFormats.length !== 1 || selectedFormats[0] !== 'html') {
+          r = {
+            ok: false,
+            artifact_status: 'failed',
+            kind: null,
+            scientific_status: null,
+            error: '当前后端仅支持 HTML；请只勾选 HTML 后重试，或升级后端以导出 DOCX/PDF。',
+          };
+          VCS.log(r.error, 'failc');
+          renderReportFiles('pj-report-files', r, '单项目报告');
+          return;
+        }
         const save = joinPath(dr.path, (proj.name || 'project') + '_完整报告.html');
         const legacy = await VCS.call('proj_report', proj.path, save, true);
         r = legacy && !legacy.error
-          ? Object.assign({}, legacy, { files: { html: legacy.file || save }, kind: 'final' })
+          ? Object.assign({}, legacy, { files: { html: legacy.file || save } })
           : legacy;
         VCS.log('当前后端仅支持 HTML，已使用兼容模式生成。', 'warnc');
       }
@@ -3272,9 +3519,10 @@
       // 重新读取管线状态；只有后端已经落下与当前输入/结果哈希绑定的
       // report_done 标记时，界面才把整个自动流程显示为完成。
       await reloadProjects(proj.path);
-      VCS.toast(r.kind === 'diagnostic' ? '诊断报告已生成' : 'HTML / Word / PDF 报告已生成');
+      VCS.toast(r.kind === 'diagnostic' ? `${selectedLabel} 诊断报告已生成` : `${selectedLabel} 报告已生成`);
     } finally {
-      if (btn) btn.disabled = false;
+      State.reportBusy = false;
+      syncReportFormatControls();
     }
   }
 
@@ -3465,6 +3713,12 @@
     wire('pj-delta', delta);
     wire('pj-csv', exportCsv);
     wire('pj-report', report);
+    SINGLE_REPORT_FORMATS.forEach(item => {
+      const input = $(item.id);
+      if (input) input.addEventListener('change', syncReportFormatControls);
+    });
+    syncReportFormatControls();
+    loadReportCapabilities();
     const projectSelect = $('pj-select');
     if (projectSelect) projectSelect.addEventListener('change', () => {
       restoreWorkflowState(State.projects.find(p => p.path === projectSelect.value));
