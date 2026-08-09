@@ -1,5 +1,7 @@
 """本机作业运行器测试:_wrap_cmd 两平台、start→status→DONE/FAILED 全流程(真实短命令)、
 run_blocking 成功/失败/超时、cancel(假 subprocess)、log_tail、状态边界。"""
+import base64
+import json
 import os
 import sys
 import time
@@ -16,10 +18,11 @@ def test_wrap_cmd_posix():
 
 def test_wrap_cmd_windows():
     w = lr._wrap_cmd(['Multiwfn', 'mol path.wfn'], 'nt')
-    assert w[0] == 'cmd' and '/v:on' in w and w[2] == '/c'
-    joined = w[-1]
-    assert 'ERRORLEVEL' in joined and '.exit_code' in joined
-    assert '"mol path.wfn"' in joined                       # list2cmdline 给含空格路径加引号
+    assert w[0].lower().endswith('powershell.exe')
+    assert '-NoProfile' in w and '-NonInteractive' in w and '-EncodedCommand' in w
+    script = base64.b64decode(w[-1]).decode('utf-16le')
+    assert 'ProcessStartInfo' in script and 'UseShellExecute = $false' in script
+    assert '.exit_code' in script and 'cmd.exe' not in script
 
 
 # ── LocalJob ─────────────────────────────────────────────────────────────────
@@ -68,11 +71,47 @@ def test_start_status_failed(tmp_path):
 
 def test_start_with_env(tmp_path):
     log = str(tmp_path / 'env.log')
+    mark = 'hello 42 (x)&y|z^100%!'
     job = lr.LocalJob(cmd=[sys.executable, '-c', 'import os; print(os.environ["VCS_MARK"])'],
-                      cwd=str(tmp_path), log_file=log, env={'VCS_MARK': 'hello42'})
+                      cwd=str(tmp_path), log_file=log, env={'VCS_MARK': mark})
     assert lr.start(job)['ok']
     st = _poll_done(str(tmp_path))
-    assert st['state'] == 'DONE' and 'hello42' in st['log_tail']
+    assert st['state'] == 'DONE' and st['exit_code'] == 0
+    assert mark in st['log_tail']
+
+
+def test_start_preserves_argv_metacharacters(tmp_path):
+    probe = tmp_path / 'argv_probe.py'
+    captured = tmp_path / 'argv.json'
+    probe.write_text(
+        'import json, pathlib, sys\n'
+        'pathlib.Path(sys.argv[1]).write_text('
+        'json.dumps(sys.argv[2:], ensure_ascii=False), encoding="utf-8")\n',
+        encoding='utf-8',
+    )
+    expected = [
+        'two words',
+        'left(right)',
+        'left&right',
+        'left|right',
+        'left^right',
+        'left%VCS_EXPAND_ME%right',
+        'left!VCS_EXPAND_ME!right',
+        'quote"inside',
+        'ends-with-backslash\\',
+        '',
+        '中文参数',
+    ]
+    job = lr.LocalJob(
+        cmd=[sys.executable, str(probe), str(captured), *expected],
+        cwd=str(tmp_path),
+        log_file=str(tmp_path / 'argv.log'),
+        env={'VCS_EXPAND_ME': 'EXPANDED'},
+    )
+    assert lr.start(job)['ok']
+    st = _poll_done(str(tmp_path))
+    assert st['state'] == 'DONE' and st['exit_code'] == 0
+    assert json.loads(captured.read_text(encoding='utf-8')) == expected
 
 
 # ── run_blocking ─────────────────────────────────────────────────────────────
@@ -108,8 +147,9 @@ def test_cancel_posix_killpg(tmp_path, monkeypatch):
                       {'pid': 4242, 'cmd': ['x'], 'log_file': 'l', 'started_at': 'now'})
     killed = {}
     monkeypatch.setattr(lr, '_is_windows', lambda: False)
-    monkeypatch.setattr(lr.os, 'getpgid', lambda pid: pid)
-    monkeypatch.setattr(lr.os, 'killpg', lambda pg, sig: killed.setdefault('args', (pg, sig)))
+    monkeypatch.setattr(lr.os, 'getpgid', lambda pid: pid, raising=False)
+    monkeypatch.setattr(lr.os, 'killpg', lambda pg, sig: killed.setdefault('args', (pg, sig)),
+                        raising=False)
     r = lr.cancel(str(tmp_path))
     assert r['ok'] and killed['args'][0] == 4242
 
