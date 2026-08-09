@@ -388,6 +388,8 @@ def test_scan_ambiguous_local_incars_does_not_fall_back_to_shared(tmp_path):
     _write(str(source / 'POSCAR'), POSCAR_FE)
     _write(str(source / 'INCAR'), 'NSW=8\n')
     _write(str(source / 'incar'), 'NSW=0\n')
+    if (source / 'INCAR').samefile(source / 'incar'):
+        pytest.skip('filesystem is case-insensitive and cannot represent this conflict')
     shared = _write(str(tmp_path / 'shared' / 'INCAR'), 'NSW=0\n')
 
     out = quick_submit.scan_inputs([str(source)], shared_incar=shared)

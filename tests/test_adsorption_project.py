@@ -602,6 +602,8 @@ def test_resolve_structure_incar_reports_case_conflict_and_empty_file(tmp_path):
     lower = folder / 'incar'
     upper.write_text('ENCUT = 400\n', encoding='utf-8')
     lower.write_text('ENCUT = 500\n', encoding='utf-8')
+    if upper.samefile(lower):
+        pytest.skip('filesystem is case-insensitive and cannot represent this conflict')
 
     conflict = adsorption.resolve_structure_incar(structure)
 

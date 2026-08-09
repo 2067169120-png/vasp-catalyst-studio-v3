@@ -100,6 +100,7 @@ def test_open_with_editor_exe(tmp_path):
     assert out['ok'] and calls == [['gaussview.exe', r['path']]]
 
 
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX desktop opener only')
 def test_open_with_default_posix(tmp_path):
     r = ee.export_for_editor(_ELS, _XYZ, 'xyz', workdir=str(tmp_path))
     calls = []

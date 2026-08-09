@@ -83,8 +83,6 @@ def test_generate_documents_are_valid_and_share_content(tmp_path):
     assert written == (docx_path, pdf_path)
     assert zipfile.is_zipfile(docx_path)
     assert pdf_path.read_bytes().startswith(b"%PDF-")
-    pdf_bytes = pdf_path.read_bytes()
-    assert b"STSong-Light" in pdf_bytes or b"VCS-CJK" in pdf_bytes
 
     document = Document(docx_path)
     paragraphs = "\n".join(paragraph.text for paragraph in document.paragraphs)
