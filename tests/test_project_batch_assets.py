@@ -108,8 +108,9 @@ def test_candidate_evaluation_is_visible_and_refreshes_with_project():
     assert "decision.claim_ceiling || evidence.claim_ceiling" in js
     assert "profile.short_chain_risk" in js
     assert "typeof item === 'object').slice(0, 3)" in js
-    assert "refreshCandidateEvaluation(want)" in js
-    assert "refreshCandidateEvaluation(projectSelect.value)" in js
+    assert "refreshCandidateEvaluation(path)" in js
+    assert "applyProjectSelection(State.projects.find(p => p.path === want) || null)" in js
+    assert "await requestProjectSelection(hit, previous)" in js
     assert "refreshCandidateEvaluation(proj.path)" in js
     assert ".pj-candidate-card.advance" in css
     assert ".pj-candidate-card.blocked" in css

@@ -253,7 +253,7 @@ class Api:
                  result_import_mod=None, task_analysis_mod=None,
                  pipeline_supervisor_cls=None, assistant_chat_mod=None,
                  comparison_mod=None, candidate_evaluation_mod=None,
-                 paper_report_mod=None):
+                 paper_report_mod=None, workspace_state_store=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -361,6 +361,9 @@ class Api:
         self._comparison = comparison_mod
         self._candidate_evaluation = candidate_evaluation_mod
         self._paper_report = paper_report_mod
+        # Phase B 可恢复工作区状态只保存 UI 偏好/草稿引用，与 project.yaml 科学事实分离。
+        # 测试可注入内存/临时目录 store；生产首次调用时再创建用户级 JSON store。
+        self._workspace_state_store = workspace_state_store
         # pywebview 可并发调用同一个 js_api；后端锁才是自动托管的正确性边界。
         # 前端的 running 标志只负责交互，不能阻止两条线程同时续算/出报告。
         self._pipeline_lock = threading.Lock()
@@ -438,6 +441,514 @@ class Api:
             return {'ok': True, 'queued': queued, 'error': None}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'queued': False, 'error': str(e)}
+
+    # ── Phase B:可恢复工作区上下文（UI 偏好与项目科学事实严格分轴） ─────────────
+    _WORKSPACE_CONTEXT_SCHEMA = 'vcstudio.workspace-context/v1'
+    _WORKSPACE_RUNTIME_FIELDS = (
+        'running', 'paused', 'tick_running', 'enabled', 'interval_seconds',
+        'last_started', 'last_finished', 'next_check', 'outcome_seq',
+    )
+
+    @staticmethod
+    def _workspace_path_key(path):
+        return os.path.normcase(os.path.normpath(str(path or '')))
+
+    @staticmethod
+    def _workspace_project_id(path, project=None):
+        """Return a stable opaque id without exposing the registry path."""
+        project = project if isinstance(project, dict) else {}
+        prepared = project.get('preparation') or {}
+        raw_uuid = str(project.get('project_uuid') or
+                       (prepared.get('project_uuid') if isinstance(prepared, dict) else '') or '')
+        compact = raw_uuid.strip().lower().replace('-', '')
+        if re.fullmatch(r'[a-f0-9]{32}', compact):
+            return f'project-{compact}'
+        canonical = os.path.normcase(os.path.realpath(os.path.abspath(
+            os.path.expanduser(str(path or '')))))
+        digest = hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:24]
+        return f'registry-{digest}'
+
+    @staticmethod
+    def _workspace_job_id(job_dir, manifest=None):
+        manifest = manifest if isinstance(manifest, dict) else {}
+        candidate = str(manifest.get('job_uuid') or manifest.get('job_id') or '').strip()
+        if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', candidate):
+            return candidate
+        canonical = os.path.normcase(os.path.realpath(os.path.abspath(
+            os.path.expanduser(str(job_dir or '')))))
+        digest = hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:24]
+        return f'job-{digest}'
+
+    @staticmethod
+    def _workspace_public_text(value, limit=400):
+        """Redact local/UNC paths from context text that may reach an assistant."""
+        text = str(value or '')
+        remote_urls = []
+
+        def preserve_remote_url(match):
+            remote_urls.append(match.group(0))
+            return f'<workspace-remote-url-{len(remote_urls) - 1}>'
+
+        text = re.sub(r'(?i)\b(?:https?|s3)://[^\s,;，；]+',
+                      preserve_remote_url, text)
+        text = re.sub(r'(?i)\bfile:(?://+|\\+)[^\s,;，；]+',
+                      '<local-path>', text)
+        text = re.sub(r'(?i)\b[A-Z]:[\\/][^\s,;，；]+', '<local-path>', text)
+        text = re.sub(r'(?<![:A-Za-z0-9])(?:\\\\|//)[^\\/\s,;，；]+'
+                      r'[\\/][^\s,;，；]+', '<local-path>', text)
+        # Preserve URLs and canonical ``#/`` routes while redacting general
+        # POSIX absolute paths, including /mnt, /opt, /srv and custom roots.
+        text = re.sub(r'(?<![#/A-Za-z0-9_])/(?!/)[^\s,;，；]+',
+                      '<local-path>', text)
+        for index, url in enumerate(remote_urls):
+            text = text.replace(f'<workspace-remote-url-{index}>', url)
+        return text[:max(0, int(limit))]
+
+    @classmethod
+    def _workspace_context_failure(cls, error):
+        return {
+            'ok': False,
+            'schema': cls._WORKSPACE_CONTEXT_SCHEMA,
+            'state_revision': None,
+            'selection': None,
+            'workspace_intent': {'scenario': None, 'engine': None,
+                                 'calculation': None},
+            'project': None,
+            'pipeline': None,
+            'runtime': None,
+            'sync': {'last_check_at': None, 'last_success_at': None,
+                     'status': 'unknown', 'synced_targets': 0},
+            'restore': {'panels': {}, 'filters': {}, 'sort': {}, 'scroll': {},
+                        'draft_refs': {}},
+            'unsaved': {'known': False, 'dirty': None, 'draft_ids': []},
+            'activity': {'latest_cursor': 0, 'unread': 0, 'recent': [],
+                         'durable': False},
+            'projects': [],
+            'degraded': [{'kind': 'workspace_state_unavailable',
+                          'message': cls._workspace_public_text(error)}],
+            'error': cls._workspace_public_text(error),
+        }
+
+    def workspace_preferences_update(self, patch, expected_revision):
+        """Atomically update UI-only workspace preferences with revision CAS."""
+        try:
+            result = self._ws().update(patch, expected_revision)
+            return {
+                'ok': bool(result.get('ok')),
+                'conflict': bool(result.get('conflict')),
+                'state_revision': result.get('state_revision'),
+                'preferences': result.get('preferences'),
+                'error': self._workspace_public_text(result.get('error')) or None,
+            }
+        except Exception as e:                            # noqa: BLE001 JSON-safe bridge envelope
+            return {'ok': False, 'conflict': False, 'state_revision': None,
+                    'preferences': None,
+                    'error': self._workspace_public_text(e)}
+
+    def _workspace_intent(self, degraded):
+        scenario_view = None
+        engine_view = None
+        calculation_view = None
+        try:
+            result = self.scenario_get()
+            if result.get('ok') and isinstance(result.get('scenario'), dict):
+                scenario = result['scenario']
+                scenario_view = {
+                    'key': scenario.get('key'),
+                    'name': scenario.get('name'),
+                    'configured': bool(result.get('configured')),
+                    'source': 'config.ui.scenario',
+                }
+            else:
+                degraded.append({'kind': 'scenario_unavailable',
+                                 'message': self._workspace_public_text(result.get('error'))})
+        except Exception as e:                            # noqa: BLE001 partial context remains usable
+            degraded.append({'kind': 'scenario_unavailable',
+                             'message': self._workspace_public_text(e)})
+        try:
+            result = self.engine_get()
+            if result.get('ok'):
+                engine_view = {
+                    'key': result.get('engine'),
+                    'configured': bool(result.get('configured')),
+                    'allowed': bool(result.get('engine')),
+                    'capability': result.get('capability') or {},
+                    'source': 'config.ui.active_engine',
+                }
+            else:
+                degraded.append({'kind': 'engine_unavailable',
+                                 'message': self._workspace_public_text(result.get('error'))})
+        except Exception as e:                            # noqa: BLE001
+            degraded.append({'kind': 'engine_unavailable',
+                             'message': self._workspace_public_text(e)})
+        try:
+            result = self.calculation_get()
+            if result.get('ok'):
+                key = result.get('active_calculation') or None
+                calculation_view = {
+                    'key': key,
+                    'configured': bool(result.get('configured')),
+                    'allowed': bool(key and key in (result.get('allowed') or [])),
+                    'allowed_keys': list(result.get('allowed') or []),
+                    'engine': result.get('engine') or None,
+                    'source': 'config.ui.active_calculation',
+                }
+            else:
+                degraded.append({'kind': 'calculation_unavailable',
+                                 'message': self._workspace_public_text(result.get('error'))})
+        except Exception as e:                            # noqa: BLE001
+            degraded.append({'kind': 'calculation_unavailable',
+                             'message': self._workspace_public_text(e)})
+        return {'scenario': scenario_view, 'engine': engine_view,
+                'calculation': calculation_view}
+
+    def _workspace_runtime(self, degraded):
+        try:
+            result = self.pipeline_runtime_status()
+        except Exception as e:                            # noqa: BLE001
+            degraded.append({'kind': 'runtime_unavailable',
+                             'message': self._workspace_public_text(e)})
+            return None, {}, {'last_check_at': None, 'last_success_at': None,
+                              'status': 'unknown', 'synced_targets': 0}, {
+                                  'latest_cursor': 0, 'unread': 0, 'recent': [],
+                                  'durable': False}
+        state = result.get('state') if result.get('ok') else None
+        if not isinstance(state, dict):
+            degraded.append({'kind': 'runtime_unavailable',
+                             'message': self._workspace_public_text(result.get('error'))})
+            return None, {}, {'last_check_at': None, 'last_success_at': None,
+                              'status': 'unknown', 'synced_targets': 0}, {
+                                  'latest_cursor': 0, 'unread': 0, 'recent': [],
+                                  'durable': False}
+        runtime = {key: copy.deepcopy(state.get(key))
+                   for key in self._WORKSPACE_RUNTIME_FIELDS}
+        runtime['last_error'] = (self._workspace_public_text(state.get('last_error'))
+                                 if state.get('last_error') else None)
+        outcome = state.get('last_outcome') if isinstance(state.get('last_outcome'), dict) else {}
+        try:
+            synced = max(0, int(outcome.get('synced') or 0))
+        except (TypeError, ValueError):
+            synced = 0
+        outcome_errors = outcome.get('errors') if isinstance(outcome.get('errors'), list) else []
+        has_sync_error = bool(runtime['last_error'] or outcome_errors)
+        if synced and has_sync_error:
+            sync_status = 'partial'
+            degraded.append({
+                'kind': 'sync_partial_failure',
+                'message': f'{len(outcome_errors) + int(bool(runtime["last_error"]))} '
+                           'sync error(s) occurred after at least one target succeeded',
+            })
+        elif synced:
+            sync_status = 'succeeded'
+        elif has_sync_error:
+            sync_status = 'failed'
+        elif outcome:
+            sync_status = 'checked'
+        else:
+            sync_status = 'unknown'
+        sync = {
+            'last_check_at': state.get('last_finished'),
+            'last_success_at': state.get('last_finished') if synced else None,
+            'status': sync_status,
+            'synced_targets': synced,
+        }
+        recent = []
+        history = state.get('outcome_history') if isinstance(
+            state.get('outcome_history'), list) else []
+        for item in history[-5:]:
+            if not isinstance(item, dict):
+                continue
+            item_outcome = item.get('outcome') if isinstance(item.get('outcome'), dict) else {}
+            errors = item_outcome.get('errors') if isinstance(
+                item_outcome.get('errors'), list) else []
+            events = item_outcome.get('events') if isinstance(
+                item_outcome.get('events'), list) else []
+            try:
+                item_synced = max(0, int(item_outcome.get('synced') or 0))
+            except (TypeError, ValueError):
+                item_synced = 0
+            item_failed = bool(item.get('error') or errors)
+            recent.append({
+                'cursor': int(item.get('seq') or 0),
+                'ts': item.get('finished'),
+                'kind': 'pipeline_tick',
+                'status': ('partial' if item_synced and item_failed else
+                           'failed' if item_failed else 'completed'),
+                'event_count': len(events),
+                'error_count': len(errors) + int(bool(item.get('error'))),
+                'durability': 'process',
+            })
+        activity = {
+            'latest_cursor': int(state.get('outcome_seq') or 0),
+            'unread': 0,
+            'recent': recent,
+            'durable': False,
+        }
+        return runtime, state, sync, activity
+
+    def _workspace_project_facts(self, project_id, project, list_row, pipeline_row,
+                                 selected_job_id, degraded):
+        member_dirs = self._project_member_dirs(project)
+        engines, task_types = set(), set()
+        manifests = {}
+        unreadable = 0
+        for directory in member_dirs:
+            try:
+                manifest = self._manifest.load_manifest(directory)
+            except Exception:                             # noqa: BLE001 member remains explicitly partial
+                manifest = None
+            if not isinstance(manifest, dict):
+                unreadable += 1
+                continue
+            job_id = self._workspace_job_id(directory, manifest)
+            manifests[job_id] = manifest
+            inputs = manifest.get('inputs') if isinstance(manifest.get('inputs'), dict) else {}
+            raw_engine = inputs.get('engine') or 'vasp'
+            try:
+                engine = self._ta().normalize_engine(raw_engine)
+            except Exception:                             # noqa: BLE001 legacy-safe VASP fallback
+                engine = str(raw_engine or 'vasp').strip().lower() or 'vasp'
+            if engine:
+                engines.add(engine)
+            task_type = str(manifest.get('task_type') or '').strip()
+            if task_type:
+                task_types.add(task_type)
+        if unreadable:
+            degraded.append({
+                'kind': 'project_manifest_incomplete', 'project_id': project_id,
+                'count': unreadable,
+                'message': f'{unreadable} 个项目成员的 job.yaml 不可读',
+            })
+        preparation = project.get('preparation') or {}
+        project_mode = str(project.get('work_mode') or
+                           (preparation.get('work_mode')
+                            if isinstance(preparation, dict) else '') or '').strip() or None
+        engine_list = sorted(engines)
+        task_list = sorted(task_types)
+        project_view = {
+            'id': project_id,
+            'name': str(project.get('name') or list_row.get('name') or ''),
+            'selection_status': 'valid',
+            'project_mode': project_mode,
+            'member_count': int(list_row.get('n_members') or len(member_dirs)),
+            'done_count': int((pipeline_row or {}).get('done')
+                              if (pipeline_row or {}).get('done') is not None
+                              else list_row.get('n_done') or 0),
+            'actual_engines': engine_list,
+            'actual_engine': engine_list[0] if len(engine_list) == 1 and not unreadable else None,
+            'actual_task_types': task_list,
+            'actual_task_type': task_list[0] if len(task_list) == 1 and not unreadable else None,
+            'facts_completeness': 'complete' if not unreadable else 'partial',
+        }
+        selected_job = None
+        if selected_job_id:
+            manifest = manifests.get(selected_job_id)
+            if manifest is None:
+                degraded.append({
+                    'kind': 'selected_job_missing', 'job_id': selected_job_id,
+                    'message': '保存的作业选择不属于当前项目或其清单不可读',
+                })
+            else:
+                inputs = manifest.get('inputs') if isinstance(manifest.get('inputs'), dict) else {}
+                raw_engine = inputs.get('engine') or 'vasp'
+                try:
+                    job_engine = self._ta().normalize_engine(raw_engine)
+                except Exception:                         # noqa: BLE001
+                    job_engine = str(raw_engine or 'vasp').strip().lower() or 'vasp'
+                history = manifest.get('state_history') or []
+                updated = (history[-1].get('at') if history and isinstance(history[-1], dict)
+                           else manifest.get('created_at'))
+                selected_job = {
+                    'id': selected_job_id,
+                    'state': manifest.get('state'),
+                    'engine': job_engine,
+                    'task_type': manifest.get('task_type') or None,
+                    'calc_type': manifest.get('calc_type') or None,
+                    'updated_at': updated or None,
+                }
+        return project_view, selected_job
+
+    def _workspace_pipeline_view(self, pipeline_row):
+        if not isinstance(pipeline_row, dict):
+            return None
+        allowed = (
+            'stage', 'stage_index', 'stages', 'needs_human', 'recover_round',
+            'done', 'total', 'artifact_status', 'scientific_status',
+            'scientific_qualification', 'publication_gate_status',
+            'desired_report_kind', 'report_kind', 'report_status', 'report_reason',
+        )
+        out = {key: copy.deepcopy(pipeline_row.get(key)) for key in allowed}
+        out['report_reason'] = self._workspace_public_text(out.get('report_reason')) or None
+        blockers = []
+        if out.get('needs_human'):
+            blockers.append({'kind': 'manual_intervention_required',
+                             'message': '至少一个项目成员需要人工处理'})
+        if out.get('publication_gate_status') == 'blocked':
+            blockers.append({'kind': 'publication_gate_blocked',
+                             'message': out.get('report_reason') or '报告发布门禁未通过'})
+        out['blockers_state'] = 'known'
+        out['blockers'] = blockers
+        return out
+
+    def _workspace_context_build(self):
+        """Return one canonical, path-minimised workspace context snapshot.
+
+        ``workspace_intent`` contains user preferences.  ``project`` (including
+        its selected-job subrecord) and ``pipeline`` contain only facts read
+        from the selected registered project and its manifests.  Absolute paths
+        appear only in ``projects[].path`` for compatibility with local UI
+        actions.
+        """
+        try:
+            state = self._ws().read()
+        except Exception as e:                            # noqa: BLE001 state is the restore authority
+            return self._workspace_context_failure(e)
+        preferences = copy.deepcopy(state.get('preferences') or {})
+        degraded = []
+        intent = self._workspace_intent(degraded)
+
+        try:
+            listing = self.proj_list()
+        except Exception as e:                            # noqa: BLE001
+            listing = {'projects': [], 'error': str(e)}
+        if listing.get('error'):
+            degraded.append({'kind': 'project_registry_unavailable',
+                             'message': self._workspace_public_text(listing.get('error'))})
+        try:
+            pipeline_result = self.pipeline_status()
+        except Exception as e:                            # noqa: BLE001
+            pipeline_result = {'ok': False, 'projects': [], 'error': str(e)}
+        if not pipeline_result.get('ok'):
+            degraded.append({'kind': 'pipeline_status_unavailable',
+                             'message': self._workspace_public_text(
+                                 pipeline_result.get('error'))})
+        pipeline_by_path = {
+            self._workspace_path_key(row.get('path')): row
+            for row in (pipeline_result.get('projects') or []) if isinstance(row, dict)
+        }
+
+        projects = []
+        candidates = {}
+        for list_row in (listing.get('projects') or []):
+            if not isinstance(list_row, dict):
+                continue
+            path = str(list_row.get('path') or '')
+            project = None
+            try:
+                project = self._adsorption.load_project(path)
+            except Exception as e:                        # noqa: BLE001
+                degraded.append({'kind': 'project_unreadable',
+                                 'project_id': self._workspace_project_id(path),
+                                 'message': self._workspace_public_text(e)})
+            project_id = self._workspace_project_id(path, project)
+            pipeline_row = pipeline_by_path.get(self._workspace_path_key(path))
+            row = {
+                'id': project_id,
+                'name': str((project or {}).get('name') or list_row.get('name') or ''),
+                'path': path,
+                'n_members': int(list_row.get('n_members') or 0),
+                'n_done': int((pipeline_row or {}).get('done')
+                              if (pipeline_row or {}).get('done') is not None
+                              else list_row.get('n_done') or 0),
+                'stage': (pipeline_row or {}).get('stage'),
+                'needs_human': ((pipeline_row or {}).get('needs_human')
+                                if pipeline_row is not None else None),
+            }
+            projects.append(row)
+            candidates.setdefault(project_id, []).append(
+                {'path': path, 'project': project, 'list_row': list_row,
+                 'pipeline_row': pipeline_row})
+
+        current_id = preferences.get('current_project_id')
+        selection_status = 'none'
+        selected = None
+        if current_id:
+            matches = candidates.get(current_id) or []
+            if len(matches) == 1 and isinstance(matches[0].get('project'), dict):
+                selection_status = 'valid'
+                selected = matches[0]
+            elif len(matches) > 1:
+                selection_status = 'ambiguous'
+                degraded.append({'kind': 'duplicate_project_id', 'project_id': current_id,
+                                 'message': '保存的项目 ID 对应多个注册项目'})
+            else:
+                selection_status = 'missing'
+                degraded.append({'kind': 'selected_project_missing',
+                                 'project_id': current_id,
+                                 'message': '保存的项目选择已不存在或不可读'})
+
+        project_view = None
+        selected_job = None
+        pipeline_view = None
+        if selected is not None:
+            project_view, selected_job = self._workspace_project_facts(
+                current_id, selected['project'], selected['list_row'],
+                selected['pipeline_row'], preferences.get('selected_job_id'), degraded)
+            project_view['selected_job'] = selected_job
+            pipeline_view = self._workspace_pipeline_view(selected['pipeline_row'])
+            if pipeline_view is None:
+                degraded.append({'kind': 'selected_pipeline_unavailable',
+                                 'project_id': current_id,
+                                 'message': '当前项目的管线状态不可用'})
+
+        runtime, _runtime_state, sync, activity = self._workspace_runtime(degraded)
+        draft_refs = copy.deepcopy(preferences.get('draft_refs') or {})
+        dirty_drafts = sorted(
+            draft_id for draft_id, ref in draft_refs.items()
+            if isinstance(ref, dict) and ref.get('dirty') is True)
+        has_draft_signal = bool(draft_refs)
+        selection = {
+            'route': copy.deepcopy(preferences.get('route')),
+            'route_hash': ((preferences.get('route') or {}).get('hash')
+                           if isinstance(preferences.get('route'), dict) else None),
+            'project_id': current_id,
+            'analysis_id': preferences.get('current_analysis_id'),
+            'job_id': preferences.get('selected_job_id'),
+            'selection_status': selection_status,
+            'source': ('persisted_user_preference'
+                       if any(preferences.get(key) is not None
+                              for key in ('route', 'current_project_id',
+                                          'current_analysis_id', 'selected_job_id'))
+                       else 'default'),
+        }
+        return {
+            'ok': True,
+            'schema': self._WORKSPACE_CONTEXT_SCHEMA,
+            'state_revision': state.get('revision'),
+            'selection': selection,
+            'workspace_intent': intent,
+            'project': project_view,
+            'pipeline': pipeline_view,
+            'runtime': runtime,
+            'sync': sync,
+            'restore': {
+                'panels': copy.deepcopy(preferences.get('panels') or {}),
+                'filters': copy.deepcopy(preferences.get('filters') or {}),
+                'sort': copy.deepcopy(preferences.get('sort') or {}),
+                'scroll': copy.deepcopy(preferences.get('scroll') or {}),
+                'draft_refs': draft_refs,
+            },
+            'unsaved': {
+                'known': has_draft_signal,
+                'dirty': bool(dirty_drafts) if has_draft_signal else None,
+                'draft_ids': dirty_drafts,
+            },
+            'activity': activity,
+            'projects': projects,
+            'degraded': degraded,
+            'error': None,
+        }
+
+    def workspace_context(self):
+        """Public JSON-safe workspace context endpoint."""
+        try:
+            return self._workspace_context_build()
+        except Exception as e:                            # noqa: BLE001 bridge must never leak exceptions
+            return self._workspace_context_failure(e)
+
+    def workspace_context_get(self):
+        """Compatibility alias for clients that use explicit getter names."""
+        return self.workspace_context()
 
     # ── 内部:重模块延迟加载 ──
     def _bo(self):
@@ -527,6 +1038,13 @@ class Api:
             key_loader=self._ai().load_api_key,
         )
         return self._assistant_chat
+
+    def _ws(self):
+        """用户级工作区状态仓（原子/CAS；不写 project.yaml/config.yaml）。"""
+        if self._workspace_state_store is None:
+            from vcstudio.gui_web.workspace_state import WorkspaceStateStore
+            self._workspace_state_store = WorkspaceStateStore()
+        return self._workspace_state_store
 
     def _fb(self):
         """频率作业生成端(F14)延迟加载。"""
@@ -978,7 +1496,11 @@ class Api:
                         continue
                     pname = proj.get('name', '') or os.path.basename(
                         os.path.dirname(str(pp)))
-                    group = {'project': pname, 'project_path': str(pp)}
+                    group = {
+                        'project': pname,
+                        'project_path': str(pp),
+                        'project_id': self._workspace_project_id(pp, proj),
+                    }
                     mem = proj.get('members') or {}
                     if mem.get('clean_slab'):
                         mapping[norm(mem['clean_slab'])] = {**group, 'role': 'clean'}
@@ -1027,14 +1549,21 @@ class Api:
                         diag = f"{live['ionic_steps']}步" + (
                             f" |F|max={live['fmax']}" if live.get('fmax') else '')
                 grp = pmap.get(os.path.normcase(os.path.normpath(job_dir)))
+                inputs = m.get('inputs') if isinstance(m.get('inputs'), dict) else {}
                 jobs.append({
+                    'id': self._workspace_job_id(job_dir, m),
+                    'job_uuid': m.get('job_uuid') or '',
                     'dir': job_dir,
                     'name': os.path.basename(os.path.normpath(job_dir)),
                     'project': grp['project'] if grp else None,
                     'project_path': grp['project_path'] if grp else None,
+                    'project_id': grp['project_id'] if grp else None,
                     'role': grp['role'] if grp else None,
                     'state': state,
                     'task': f"{m.get('task_type', '')}/{m.get('calc_type', '')}",
+                    'task_type': m.get('task_type') or None,
+                    'calc_type': m.get('calc_type') or None,
+                    'engine': str(inputs.get('engine') or 'vasp').strip().lower(),
                     'cluster': m.get('cluster') or '',
                     'job_id': m.get('scheduler_job_id') or '',
                     'energy': f'{energy:.4f}' if isinstance(energy, float) else energy,
@@ -3191,6 +3720,10 @@ class Api:
                         if ((self._manifest.load_manifest(member_dir) or {}).get('state') == 'DONE'))
                     projects.append({
                         'path': pp,
+                        # Phase B canonical shell/deep links use this opaque id;
+                        # local paths remain an internal action locator only.
+                        'project_id': self._workspace_project_id(pp, proj),
+                        'project_uuid': proj.get('project_uuid') or None,
                         'name': proj.get('name', '') or '',
                         'n_members': len(member_dirs),
                         'n_done': n_done,

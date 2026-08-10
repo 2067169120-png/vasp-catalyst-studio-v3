@@ -154,5 +154,5 @@ def test_scan_html_on_real_index_html_finds_known_labels():
     from pathlib import Path
     idx = Path(i18n.__file__).resolve().parents[1] / 'gui_web' / 'assets' / 'index.html'
     strings = i18n.scan_html_strings(idx.read_text(encoding='utf-8'))
-    for label in ('仪表盘', '生成输入', '结果分析', '作业', '集群', '设置'):
+    for label in ('仪表盘', '生成输入', '分析', '作业', '集群', '设置'):
         assert label in strings, label

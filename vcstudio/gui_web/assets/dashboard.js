@@ -12,10 +12,10 @@
     return jobs.filter(j => states.indexOf(j.state) >= 0).length;
   }
 
-  // 跳页:点对应 nav a(与手动点导航完全同路径,触发 vcs:page 刷新)
-  function navTo(page) {
-    const a = document.querySelector('nav a[data-page=' + page + ']');
-    if (a) a.click();
+  // 跳页统一经 VCS.navigate：workspace 壳层会在这里完成 hash、
+  // 未保存拦截和旧页适配；不再依赖某个可见 nav link 存在。
+  function navTo(page, options = {}) {
+    return VCS.navigate(page, Object.assign({ source: 'dashboard' }, options));
   }
 
   async function openResultsImport() {
@@ -28,8 +28,9 @@
     VCS.toast('请在“吸附能项目”中选择“导入整个文件夹”');
   }
 
-  function openInputsSubmit() {
-    navTo('jobs');
+  async function openInputsSubmit() {
+    const out = await navTo('jobs', { source: 'dashboard-submit-inputs' });
+    if (!out || !out.ok) return;
     // 导航与手风琴初始化都是同步完成；下一帧聚焦到快速提交首步。
     window.setTimeout(() => {
       const card = $('quick-submit-card');
@@ -393,10 +394,11 @@
       const a = b && ACTIONS[b.dataset.action];
       if (a) a[2]();
     });
-    wire('db-go-generate', () => navTo('generate'));
-    wire('db-go-project', () => navTo('project'));
-    wire('db-go-queue', () => {
-      navTo('jobs');
+    wire('db-go-generate', () => navTo('generate', { source: 'dashboard-quick-generate' }));
+    wire('db-go-project', () => navTo('project', { source: 'dashboard-quick-project' }));
+    wire('db-go-queue', async () => {
+      const out = await navTo('jobs', { source: 'dashboard-quick-queue' });
+      if (!out || !out.ok) return;
       const q = document.getElementById('jb-queue');
       if (q) q.click();          // 直接拉起集群队列(未配置集群时任务页会给提示)
     });

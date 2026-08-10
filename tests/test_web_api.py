@@ -297,6 +297,7 @@ def test_preview_script_build_failure_caught():
 def test_list_jobs_row_assembly_and_stale():
     m_done = {
         'state': 'DONE', 'task_type': 'relax', 'calc_type': 'slab',
+        'job_uuid': 'manifest-job-a',
         'cluster': 'c1', 'scheduler_job_id': '12345',
         'state_history': [{'at': '2026-07-14T10:00:00'}],
         'results': {'energy_e0_eV': -12.3456},
@@ -314,6 +315,8 @@ def test_list_jobs_row_assembly_and_stale():
     rows = {r['dir']: r for r in out['jobs']}
     a = rows['/jobs/a']
     assert a['name'] == 'a' and a['state'] == 'DONE' and a['task'] == 'relax/slab'
+    assert a['id'] == 'manifest-job-a' and a['job_uuid'] == 'manifest-job-a'
+    assert a['task_type'] == 'relax' and a['calc_type'] == 'slab' and a['engine'] == 'vasp'
     assert a['cluster'] == 'c1' and a['job_id'] == '12345'
     assert a['energy'] == '-12.3456' and a['updated'] == '2026-07-14T10:00:00'
     b = rows['/jobs/b']
@@ -1103,10 +1106,14 @@ def test_proj_list_assembles_path_name_members():
     api = Api(adsorption_mod=ads, report_full_mod=rf)
     out = api.proj_list()
     assert out['error'] is None
-    assert out['projects'] == [{'path': '/p/project.yaml', 'name': 'demo',
-                                'n_members': 3, 'n_done': 0, 'reference_mode': 'none',
-                                'reference_species': [],
-                                'n_species_refs': 0}]
+    assert out['projects'] == [{
+        'path': '/p/project.yaml',
+        'project_id': out['projects'][0]['project_id'],
+        'project_uuid': None,
+        'name': 'demo', 'n_members': 3, 'n_done': 0,
+        'reference_mode': 'none', 'reference_species': [], 'n_species_refs': 0,
+    }]
+    assert out['projects'][0]['project_id'].startswith('registry-')
 
 
 def test_proj_list_counts_members_inline_without_report_full():
@@ -1122,10 +1129,14 @@ def test_proj_list_counts_members_inline_without_report_full():
     api = Api(adsorption_mod=ads, report_full_mod=boom_rf)
     out = api.proj_list()
     assert out['error'] is None
-    assert out['projects'] == [{'path': '/p/project.yaml', 'name': 'demo',
-                                'n_members': 3, 'n_done': 0, 'reference_mode': 'none',
-                                'reference_species': [],
-                                'n_species_refs': 0}]
+    assert out['projects'] == [{
+        'path': '/p/project.yaml',
+        'project_id': out['projects'][0]['project_id'],
+        'project_uuid': None,
+        'name': 'demo', 'n_members': 3, 'n_done': 0,
+        'reference_mode': 'none', 'reference_species': [], 'n_species_refs': 0,
+    }]
+    assert out['projects'][0]['project_id'].startswith('registry-')
 
 
 def test_proj_list_exposes_reference_species_for_lis_builder():

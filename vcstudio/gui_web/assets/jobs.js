@@ -16,12 +16,90 @@
     expanded: new Set(), // 展开的项目组 key(默认全部折叠;本会话内记忆)
     refreshing: false,   // 查询在飞(auto 跳过本轮的护栏)
     autoTimer: null,
+    reloadGeneration: 0,
+    reloadInFlight: null,
+    selectionGeneration: 0,
   };
 
   // 目录 → 末段名(本地日志用,兼容 \ 与 /)
   function base(p) { return String(p).replace(/[\\/]+$/, '').split(/[\\/]/).pop(); }
   function currentProfile() { const s = $('#jobs-profile'); return s ? s.value : ''; }
   function selectedDirs() { return Array.from(State.selected); }
+
+  function stableJobId(row) {
+    if (!row) return '';
+    // 只接受后端真实作业标识，不用本机路径伪造可恢复 ID。
+    const value = [row.job_uuid, row.id, row.job_id]
+      .find(item => item !== null && item !== undefined && String(item).trim());
+    return String(value === undefined ? '' : value).trim();
+  }
+
+  function publishJobContext(row) {
+    const id = stableJobId(row);
+    if (!id) return false;
+    // canonical project_id 必须优先于裸 project_uuid；workspace 路由只接受前者。
+    const projectId = String(row.project_id || row.project_uuid || '').trim();
+    document.dispatchEvent(new CustomEvent('vcs:job-context', {
+      detail: {
+        id,
+        job_id: id,
+        job_uuid: String(row.job_uuid || ''),
+        dir: String(row.dir || ''),
+        name: String(row.name || ''),
+        state: String(row.state || ''),
+        project_id: projectId,
+      },
+    }));
+    return true;
+  }
+
+  function publishJobContextCleared() {
+    document.dispatchEvent(new CustomEvent('vcs:job-context', {
+      detail: { id: null, job_id: null, clear: true },
+    }));
+  }
+
+  function publishCurrentJobSelection(preferredDir) {
+    const preferred = preferredDir && State.selected.has(preferredDir)
+      ? State.rows.find(row => row.dir === preferredDir) : null;
+    const row = preferred || State.rows.find(item => State.selected.has(item.dir)) || null;
+    if (row) return publishJobContext(row);
+    publishJobContextCleared();
+    return false;
+  }
+
+  function currentWorkspaceProjectId() {
+    const workspaceState = VCS.workspace && VCS.workspace.state;
+    return String(workspaceState && workspaceState.project_id || '').trim();
+  }
+
+  function jobBelongsToWorkspaceProject(row) {
+    const currentProjectId = currentWorkspaceProjectId();
+    if (!currentProjectId) return true;
+    const rowProjectId = String(row && (row.project_id || row.project_uuid) || '').trim();
+    return !!rowProjectId && rowProjectId === currentProjectId;
+  }
+
+  function ensureTableScrollRegion() {
+    const card = $('#jobs-card');
+    if (!card) return null;
+    card.classList.add('table-scroll', 'jobs-table-scroll-region');
+    card.setAttribute('role', 'region');
+    card.setAttribute('aria-label', '作业列表，可水平滚动');
+    card.setAttribute('tabindex', '0');
+    return card;
+  }
+
+  function syncTableSelection(card) {
+    if (!card) return;
+    card.querySelectorAll('tr[data-dir]').forEach(tr => {
+      const selected = State.selected.has(tr.dataset.dir);
+      tr.classList.toggle('sel', selected);
+      tr.setAttribute('aria-selected', selected ? 'true' : 'false');
+      const cb = tr.querySelector('.jrow-chk');
+      if (cb) cb.checked = selected;
+    });
+  }
 
   // 所有破坏性/远程动作都必须与 job.yaml 绑定的服务器一致。后端还会做同样的
   // 硬校验；这里先给用户可理解的提示，避免输完密码后才发现选错服务器。
@@ -57,8 +135,7 @@
   }
 
   // ── 台账取数 + 渲染 ────────────────────────────────────────────────────────
-  async function loadProfiles() {
-    const r = await VCS.call('list_profiles');
+  function applyProfiles(r) {
     const profs = (r && r.profiles) || [];
     State.profiles = {};
     profs.forEach(p => { State.profiles[p.name] = p; });
@@ -82,9 +159,15 @@
     sel.value = want || profs[0].name;
   }
 
-  async function reload() {
-    await loadProfiles();
-    const r = await VCS.call('list_jobs');
+  async function performReload(generation) {
+    const [profiles, r] = await Promise.all([
+      VCS.call('list_profiles'), VCS.call('list_jobs'),
+    ]);
+    // 后发刷新拥有列表；旧响应不得覆盖新工作区筛选、作业或选择。
+    if (generation !== State.reloadGeneration) {
+      return { ok: false, stale: true, generation };
+    }
+    applyProfiles(profiles);
     State.rows = (r && r.jobs) || [];
     State.stale = (r && r.stale) || [];
     if (r && r.error) VCS.log('读取台账失败:' + r.error, 'failc');
@@ -93,6 +176,21 @@
     renderTable();
     renderStats();
     renderStale();
+    return { ok: true, stale: false, generation };
+  }
+
+  async function reload() {
+    const generation = ++State.reloadGeneration;
+    const pending = performReload(generation);
+    State.reloadInFlight = { generation, promise: pending };
+    let result = await pending;
+    // 依赖 reload() 的提交流程应等到实际提交 DOM 的最新刷新，而非继续读旧 State。
+    while (result && result.stale) {
+      const latest = State.reloadInFlight;
+      if (!latest || latest.generation <= result.generation) break;
+      result = await latest.promise;
+    }
+    return result;
   }
 
   // 成员角色 → 中文标签(list_jobs 注入的 role 字段)
@@ -108,9 +206,11 @@
     const sel = checked ? ' class="sel"' : '';
     const role = ROLE_LABEL[r.role] || '';
     const isQuick = String(r.task || '').startsWith('quick');
+    const jobId = stableJobId(r);
     return `<tr data-dir="${VCS.esc(r.dir)}" data-name="${VCS.esc(r.name)}"` +
+      (jobId ? ` data-job-id="${VCS.esc(jobId)}"` : '') +
       (grpKey ? ` data-grp="${VCS.esc(grpKey)}"` : '') +
-      (hidden ? ' hidden' : '') + `${sel}>` +
+      (hidden ? ' hidden' : '') + `${sel} tabindex="-1" aria-selected="${checked ? 'true' : 'false'}">` +
       `<td class="chk"><input type="checkbox" class="jrow-chk"${checked ? ' checked' : ''}></td>` +
       `<td>${VCS.elementBadge(r.name)}<span class="name">${VCS.esc(r.name)}</span>` +
       (role ? ` <span class="role-tag">${VCS.esc(role)}</span>` : '') +
@@ -157,7 +257,7 @@
   }
 
   // 组头行:项目名 + done/total 进度 + 细进度条 + 聚合状态;全 DONE 给「算 ΔE」
-  function groupHeadHtml(key, label, rows, isProject, projectPath, projectKind) {
+  function groupHeadHtml(key, label, rows, isProject, projectPath, projectKind, projectId) {
     const st = groupStats(rows);
     const open = State.expanded.has(key);
     const pct = st.total ? Math.round(st.done / st.total * 100) : 0;
@@ -180,16 +280,19 @@
       (isProject && projectKind !== 'molecule_library' && allDone
         ? ` <button class="btn grp-de" data-proj="${VCS.esc(label)}" ` +
           `data-proj-path="${VCS.esc(projectPath || '')}" ` +
+          `data-project-id="${VCS.esc(projectId || '')}" ` +
           'title="切到吸附能项目页并选中该项目">算 ΔE</button>'
         : '') +
       `</td></tr>`;
   }
 
   function renderTable() {
-    const card = $('#jobs-card');
+    const card = ensureTableScrollRegion();
     if (!card) return;
+    const hadSelection = State.selected.size > 0;
     if (!State.rows.length) {
       State.selected.clear();
+      if (hadSelection) publishJobContextCleared();
       card.innerHTML = '<div class="empty"><p>还没有纳管的作业 — 去生成页产出四件套,' +
         '或从集群队列认领已有作业</p></div>';
       return;
@@ -197,6 +300,7 @@
     // 丢弃已不在台账里的选中项
     const present = new Set(State.rows.map(r => r.dir));
     State.selected.forEach(d => { if (!present.has(d)) State.selected.delete(d); });
+    if (hadSelection && !State.selected.size) publishJobContextCleared();
 
     const rows0 = visibleRows();
     if (!rows0.length) {
@@ -211,7 +315,15 @@
       if (r.project) {
         const groupKey = r.project_path ? 'path:' + r.project_path : 'name:' + r.project;
         if (!groups.has(groupKey)) {
-          groups.set(groupKey, { label: r.project, path: r.project_path || '', rows: [] });
+          groups.set(groupKey, {
+            label: r.project,
+            path: r.project_path || '',
+            projectId: String(r.project_id || '').trim(),
+            rows: [],
+          });
+        }
+        if (!groups.get(groupKey).projectId && r.project_id) {
+          groups.get(groupKey).projectId = String(r.project_id).trim();
         }
         groups.get(groupKey).rows.push(r);
       } else {
@@ -232,13 +344,14 @@
         const key = 'p:' + groupKey;
         const open = State.expanded.has(key);
         const projectKind = projectKindForGroup(group);
-        h += groupHeadHtml(key, group.label, rows, true, group.path, projectKind);
+        h += groupHeadHtml(
+          key, group.label, rows, true, group.path, projectKind, group.projectId);
         rows.forEach(r => { h += rowHtml(r, key, !open); });
       });
       if (single.length) {
         const key = 's:_single';
         const open = State.expanded.has(key);
-        h += groupHeadHtml(key, '单独作业', single, false, '', '');
+        h += groupHeadHtml(key, '单独作业', single, false, '', '', '');
         single.forEach(r => { h += rowHtml(r, key, !open); });
       }
     }
@@ -263,14 +376,80 @@
     else rows.sort((a, b) => String(b.updated || '').localeCompare(String(a.updated || '')));
     return rows;
   }
+
+  function workspaceJobControlValue(queryKey, stateKey) {
+    const workspace = VCS.workspace;
+    if (!workspace) return '';
+    const route = workspace.current;
+    if (route && route.def && route.def.page === 'jobs' && route.query && route.query[queryKey]) {
+      return String(route.query[queryKey]);
+    }
+    const workspaceState = workspace.state || {};
+    const filters = workspaceState.filters || {};
+    const sort = workspaceState.sort || {};
+    if (stateKey === 'jobs') return String(sort.jobs || '');
+    return String(filters[stateKey] || '');
+  }
+
+  function explicitJobRouteFilter(key) {
+    const workspace = VCS.workspace;
+    const route = workspace && workspace.current;
+    if (!route || !route.def || route.def.page !== 'jobs' || !route.query) return '';
+    return String(route.query[key] || '');
+  }
+
+  function jobMatchesStatusFilter(row, filter) {
+    return !filter || !STATUS_GROUP[filter] || STATUS_GROUP[filter].indexOf(row.state) >= 0;
+  }
+
+  function revealSelectedJob(row) {
+    const explicitCluster = explicitJobRouteFilter('cluster');
+    const explicitStatus = explicitJobRouteFilter('status');
+    if ((explicitCluster && String(row.cluster || '') !== explicitCluster) ||
+        !jobMatchesStatusFilter(row, explicitStatus)) return false;
+
+    const cluster = $('#jf-cluster');
+    if (cluster && cluster.value && String(row.cluster || '') !== cluster.value) {
+      cluster.value = '';
+      cluster.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    const status = $('#jf-status');
+    if (status && status.value && !jobMatchesStatusFilter(row, status.value)) {
+      status.value = '';
+      status.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    return true;
+  }
+
   function refreshClusterFilter() {
     const sel = $('#jf-cluster');
     if (!sel) return;
     const cur = sel.value;
-    const clusters = Array.from(new Set(State.rows.map(r => r.cluster).filter(Boolean)));
+    // workspace.js 可能在 list_jobs 返回前尝试恢复筛选；此时动态集群选项尚不存在。
+    // 生成选项后重新读取当前工作区状态，避免首次恢复退回“全部集群”。
+    const restored = workspaceJobControlValue('cluster', 'job_cluster');
+    const wanted = restored || cur;
+    const clusters = Array.from(new Set([
+      ...Object.keys(State.profiles), ...State.rows.map(r => r.cluster).filter(Boolean),
+    ]));
+    // 深链/恢复值即使暂时没有作业也必须保持为显式零结果筛选，不能悄悄回退到全部。
+    if (wanted && clusters.indexOf(wanted) < 0) clusters.push(wanted);
     sel.innerHTML = '<option value="">全部集群</option>' +
       clusters.map(c => `<option value="${VCS.esc(c)}">${VCS.esc(c)}</option>`).join('');
-    if (clusters.indexOf(cur) >= 0) sel.value = cur;
+    if (!wanted || clusters.indexOf(wanted) >= 0) {
+      sel.value = wanted;
+      // 深链查询可能早于动态 option 到达；只有此处确认可恢复后才回写 workspace state。
+      if (restored && cur !== wanted) sel.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    const status = $('#jf-status');
+    const restoredStatus = workspaceJobControlValue('status', 'job_status');
+    if (status && restoredStatus && Array.from(status.options || []).some(
+      option => option.value === restoredStatus)) status.value = restoredStatus;
+    const sort = $('#jf-sort');
+    const restoredSort = workspaceJobControlValue('', 'jobs');
+    if (sort && restoredSort && Array.from(sort.options || []).some(
+      option => option.value === restoredSort)) sort.value = restoredSort;
   }
 
   // 组头折叠开关:记忆到 State.expanded(重载/自动刷新后保持)
@@ -280,30 +459,101 @@
     renderTable();
   }
 
-  // 「算 ΔE」:切到吸附能项目页并尽量选中该项目
-  function gotoProject(name, path) {
-    const a = document.querySelector('nav a[data-page=project]');
-    if (a) a.click();
-    if (path && window.Project && typeof window.Project.selectByPath === 'function') {
-      window.Project.selectByPath(path);
-    } else if (window.Project && typeof window.Project.selectByName === 'function') {
-      window.Project.selectByName(name);
+  function projectRecordId(project) {
+    return String(project && (project.project_id || project.id) || '').trim();
+  }
+
+  function resolveProjectTarget(name, path, explicitProjectId) {
+    const wantedName = String(name || '');
+    const wantedPath = String(path || '');
+    let wantedId = String(explicitProjectId || '').trim();
+    const matchingRows = State.rows.filter(row => wantedPath
+      ? String(row.project_path || '') === wantedPath
+      : (wantedName && String(row.project || '') === wantedName));
+    if (!wantedId) {
+      const stableIds = Array.from(new Set(matchingRows
+        .map(row => String(row.project_id || '').trim()).filter(Boolean)));
+      if (stableIds.length === 1) wantedId = stableIds[0];
     }
+    if (!wantedId && !wantedPath && !wantedName) wantedId = currentWorkspaceProjectId();
+
+    const workspaceProjects = VCS.workspace && Array.isArray(VCS.workspace.projects)
+      ? VCS.workspace.projects : [];
+    const legacyProjects = window.Project && typeof window.Project.list === 'function'
+      ? window.Project.list() : [];
+    const projects = workspaceProjects.concat(legacyProjects || []);
+    let hit = wantedId
+      ? projects.find(project => projectRecordId(project) === wantedId) || null : null;
+    if (!hit && wantedPath) {
+      hit = projects.find(project => String(project.path || '') === wantedPath) || null;
+    }
+    if (!hit && wantedName) {
+      const named = projects.filter(project => String(project.name || '') === wantedName);
+      if (named.length === 1) hit = named[0];
+    }
+    return {
+      id: wantedId || projectRecordId(hit),
+      path: String(hit && hit.path || wantedPath),
+      name: String(hit && hit.name || wantedName),
+    };
+  }
+
+  // 「算 ΔE」:先原子同步 workspace + Project 业务页，成功后再提交项目深链。
+  async function gotoProject(name, path, projectId) {
+    const workspace = VCS.workspace;
+    let target = resolveProjectTarget(name, path, projectId);
+    const knownProjects = workspace && Array.isArray(workspace.projects)
+      ? workspace.projects : [];
+    if (workspace && typeof workspace.refresh === 'function' &&
+        (!target.id || !knownProjects.some(project => project.id === target.id))) {
+      await workspace.refresh();
+      target = resolveProjectTarget(name, path, projectId);
+    }
+    if (!target.id || !target.path || !window.Project ||
+        typeof window.Project.selectByPath !== 'function') {
+      VCS.log('无法打开项目：任务缺少可验证的 project_id 或项目路径', 'failc');
+      VCS.toast('无法确认任务所属项目', 'fail');
+      return false;
+    }
+
+    if (workspace && typeof workspace.requestProjectSwitch === 'function' &&
+        typeof workspace.navigateRoute === 'function') {
+      const switched = await workspace.requestProjectSwitch(target.id, async hit => {
+        const canonicalPath = String(hit && hit.path || target.path);
+        if (!canonicalPath) return false;
+        return window.Project.selectByPath(canonicalPath);
+      });
+      if (!switched) return false;
+      const out = await workspace.navigateRoute('project-overview', {
+        projectId: target.id,
+        source: 'jobs-project',
+      });
+      return !!(out && out.ok);
+    }
+
+    // 旧壳层兼容：仍保证业务项目先成功选中，再切换可见页面。
+    const selected = await window.Project.selectByPath(target.path);
+    if (!selected) return false;
+    const out = await VCS.navigate('project', { source: 'jobs-project' });
+    return !!(out && out.ok);
   }
 
   // 「导出报告」:报告在项目页生成 —— 跳项目页 + toast + 选中选中作业所属项目
-  function doReport() {
+  async function doReport() {
     const dirs = selectedDirs();
     let projName = '';
     let projPath = '';
+    let projectId = '';
     if (dirs.length) {
       const row = State.rows.find(r => r.dir === dirs[0]);
       if (row && row.project) {
         projName = row.project;
         projPath = row.project_path || '';
+        projectId = String(row.project_id || '').trim();
       }
     }
-    gotoProject(projName, projPath);
+    const opened = await gotoProject(projName, projPath, projectId);
+    if (!opened) return;
     VCS.toast('报告在项目页生成');
     VCS.log('报告在「吸附能项目」页生成' + (projName ? '(已为你选中项目「' + projName + '」)' : ''));
   }
@@ -340,7 +590,8 @@
         const de = e.target.closest('.grp-de');
         if (de) {
           e.stopPropagation();
-          gotoProject(de.dataset.proj, de.dataset.projPath || '');
+          gotoProject(
+            de.dataset.proj, de.dataset.projPath || '', de.dataset.projectId || '');
           return;
         }
         toggleGroup(gh.dataset.grp);
@@ -389,11 +640,14 @@
       const dir = tr.dataset.dir;
       // 勾选框:切换选中(不清空其他选中)
       if (e.target.closest('.jrow-chk')) {
+        State.selectionGeneration += 1;
         if (State.selected.has(dir)) State.selected.delete(dir);
         else State.selected.add(dir);
-        tr.classList.toggle('sel', State.selected.has(dir));
+        syncTableSelection(card);
+        publishCurrentJobSelection(dir);
         return;
       }
+      State.selectionGeneration += 1;
       if (e.ctrlKey || e.metaKey) {
         if (State.selected.has(dir)) State.selected.delete(dir);
         else State.selected.add(dir);
@@ -401,11 +655,8 @@
         State.selected.clear();
         State.selected.add(dir);
       }
-      card.querySelectorAll('tr[data-dir]').forEach(t => {
-        t.classList.toggle('sel', State.selected.has(t.dataset.dir));
-        const cb = t.querySelector('.jrow-chk');
-        if (cb) cb.checked = State.selected.has(t.dataset.dir);
-      });
+      syncTableSelection(card);
+      publishCurrentJobSelection(dir);
     });
     card.addEventListener('dblclick', async e => {
       const tr = e.target.closest('tr[data-dir]');
@@ -1027,6 +1278,7 @@
 
   // ── 全选/反选 + 批量取消勾选作业 ──
   function checkAll() {
+    State.selectionGeneration += 1;
     const name = currentProfile();
     // 全选不会跨服务器；未提交作业仍可勾选后提交到当前服务器。
     const rows = visibleRows().filter(r => !r.cluster || r.cluster === name);
@@ -1034,6 +1286,7 @@
     if (allSel) rows.forEach(r => State.selected.delete(r.dir));
     else rows.forEach(r => State.selected.add(r.dir));
     renderTable();
+    publishCurrentJobSelection('');
   }
   async function batchCancel() {
     const name = requireProfile();
@@ -1360,6 +1613,7 @@
   function wire(id, fn) { const el = $('#' + id); if (el) el.addEventListener('click', fn); }
 
   function init() {
+    ensureTableScrollRegion();
     wire('jb-submit', doSubmit);
     wire('jb-status', () => runStatus(false));
     wire('jb-status-all', () => runAllStatus(false));
@@ -1469,13 +1723,35 @@
       });
       if (removed) VCS.log(`切换服务器后已取消 ${removed} 个其它服务器作业的勾选`, 'warnc');
       renderTable();
+      if (removed) publishCurrentJobSelection('');
     });
     bindTable();
     reload();
   }
 
-  // 切回作业页时刷新台账
-  document.addEventListener('vcs:page', e => { if (e.detail && e.detail.page === 'jobs') reload(); });
+  // 切回作业页时刷新台账；离开任务页会使仍在等待 reload 的旧选择失效。
+  document.addEventListener('vcs:page', e => {
+    if (!e.detail || e.detail.overlay) return;
+    if (e.detail.page === 'jobs') reload();
+    else State.selectionGeneration += 1;
+  });
+  function invalidateJobSelectionForProject(event) {
+    State.selectionGeneration += 1;
+    const detail = (event && event.detail) || {};
+    const projectId = String(detail.id || detail.project_id || detail.project_uuid || '').trim();
+    const selectedRows = Array.from(State.selected)
+      .map(dir => State.rows.find(row => row.dir === dir)).filter(Boolean);
+    const belongsToProject = projectId && selectedRows.length && selectedRows.every(row =>
+      String(row.project_id || row.project_uuid || '').trim() === projectId);
+    if (!belongsToProject) {
+      State.selected.clear();
+      renderTable();
+      publishJobContextCleared();
+    }
+  }
+  document.addEventListener('vcs:workspace-project', invalidateJobSelectionForProject);
+  // Project 业务页会在壳层事件之前发布稳定项目上下文；这是旧调用路径的兜底。
+  document.addEventListener('vcs:project-context', invalidateJobSelectionForProject);
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
@@ -1483,7 +1759,9 @@
   // 结果导入可能带来只有完整四件套、尚未运行的 CREATED 成员。
   // 进入任务页时按 project_path 精确展开并勾选，用户仍需亲自确认服务器与远程目录。
   async function selectCreatedProject(projectPath) {
+    const selectionGeneration = ++State.selectionGeneration;
     await reload();
+    if (selectionGeneration !== State.selectionGeneration) return 0;
     const wanted = String(projectPath || '');
     const rows = State.rows.filter(row => row.state === 'CREATED' && !row.cluster &&
       (!wanted || String(row.project_path || '') === wanted));
@@ -1498,6 +1776,57 @@
     return rows.length;
   }
 
+  async function selectById(id) {
+    const wanted = String(id === null || id === undefined ? '' : id).trim();
+    if (!wanted) return false;
+    const selectionGeneration = ++State.selectionGeneration;
+    let row = State.rows.find(item => stableJobId(item) === wanted) || null;
+    if (!row) {
+      await reload();
+      if (selectionGeneration !== State.selectionGeneration) return false;
+      row = State.rows.find(item => stableJobId(item) === wanted) || null;
+    }
+    if (selectionGeneration !== State.selectionGeneration) return false;
+    if (!row) return false;
+    if (!jobBelongsToWorkspaceProject(row) || !revealSelectedJob(row)) {
+      publishJobContextCleared();
+      return false;
+    }
+
+    State.selected.clear();
+    State.selected.add(row.dir);
+    if (row.project) {
+      const groupKey = row.project_path ? 'path:' + row.project_path : 'name:' + row.project;
+      State.expanded.add('p:' + groupKey);
+    } else {
+      State.expanded.add('s:_single');
+    }
+    renderTable();
+    const card = ensureTableScrollRegion();
+    const target = card && Array.from(card.querySelectorAll('tr[data-dir]'))
+      .find(tr => tr.dataset.dir === String(row.dir || ''));
+    if (target) {
+      if (typeof target.scrollIntoView === 'function') {
+        target.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      }
+      if (typeof target.focus === 'function') {
+        try { target.focus({ preventScroll: true }); } catch (_) { target.focus(); }
+      }
+    }
+    publishJobContext(row);
+    return true;
+  }
+
+  function clearSelection() {
+    // 取消跨项目切换时，连同仍在等待 reload 的旧选择和批量作用域一起作废。
+    State.selectionGeneration += 1;
+    const hadSelection = State.selected.size > 0;
+    State.selected.clear();
+    renderTable();
+    publishJobContextCleared();
+    return hadSelection;
+  }
+
   // 供集群页保存与项目导入流程调用。
-  window.Jobs = { reload, selectCreatedProject };
+  window.Jobs = { reload, selectCreatedProject, selectById, clearSelection };
 })();

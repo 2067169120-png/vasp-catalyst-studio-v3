@@ -31,9 +31,20 @@ def test_scene_filter_is_composable_and_programmatic_navigation_is_guarded():
     app = _read('app.js')
     css = _read('app.css')
     assert "toggleAttribute('data-scene-hidden'" in app
-    assert "link.hasAttribute('data-scene-hidden')" in app
+    assert '!VCS.canActivatePage(name)' in app
+    assert "sceneVisible(sc, 'pages.' + name)" in app
+    assert 'VCS.calculationRoute(VCS.activeCalculation, sc)' in app
     assert '[data-scene-hidden]' in css
     assert 'MOL_SCENE_KEYS' not in app
+
+
+def test_stale_scenario_navigation_cannot_override_the_latest_mode():
+    app = _read('app.js')
+    assert 'let scenarioNavigationGeneration = 0;' in app
+    block = app.split('function keepCurrentPageReachable(sc, source)', 1)[1].split(
+        'VCS.applyScenario', 1)[0]
+    assert 'const generation = ++scenarioNavigationGeneration;' in block
+    assert 'generation !== scenarioNavigationGeneration || VCS.scenario !== sc' in block
 
 
 def test_settings_put_work_mode_and_exact_calculation_first():
@@ -105,6 +116,12 @@ def test_exact_calculation_can_reveal_its_required_page_without_bypassing_whitel
     assert 'sc.task_keys.indexOf(task) < 0' in app
     assert "page: 'generate'" in app
     assert "link.removeAttribute('data-scene-hidden')" in app
+    assert 'function pageAllowed(page, scenario)' in app
+    assert "if (sceneVisible(sc, 'pages.' + name)) return true" in app
+    assert 'return !!route && route.page === name' in app
+    assert 'VCS.canActivatePage = function (page, scenario)' in app
+    assert '!VCS.canActivatePage(name)' in app
+    assert 'const sceneBlocked =' not in app
     assert 'applySceneElements(VCS.scenario)' in app
     assert 'VCS.openCalculation = async function' in app
 
@@ -149,7 +166,7 @@ def test_specialized_panels_follow_exact_calculation_and_routes_are_callable():
     assert 'id="spin-card"' in html and 'data-task="spin_scan"' in html
     assert 'id="ta-spin-jobs"' in html
     assert "addEventListener('vcs:calculation', applyProjectCalculation)" in project
-    assert 'startLiS }' in project
+    assert re.search(r'\bstartLiS,?\s*\n?\s*\}', project)
     assert "'project': {'adsorption': True" in scenarios.read_text(encoding='utf-8')
 
 

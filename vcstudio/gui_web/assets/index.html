@@ -279,47 +279,151 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 #page-structure .solv-card .gen-inrow{flex-wrap:wrap}
 </style>
 </head>
-<body>
-<nav>
-  <div class="brand">
-    <svg class="logo" viewBox="0 0 32 32" fill="none" aria-hidden="true">
-      <polygon points="16,4 26.4,10 26.4,22 16,28 5.6,22 5.6,10" stroke="currentColor" stroke-width="1.4" opacity=".85"/>
-      <line x1="16" y1="16" x2="16" y2="4" stroke="currentColor" stroke-width="1.1" opacity=".7"/>
-      <line x1="16" y1="16" x2="26.4" y2="22" stroke="currentColor" stroke-width="1.1" opacity=".7"/>
-      <line x1="16" y1="16" x2="5.6" y2="22" stroke="currentColor" stroke-width="1.1" opacity=".7"/>
-      <circle cx="16" cy="4" r="1.8" fill="currentColor" opacity=".6"/>
-      <circle cx="26.4" cy="22" r="1.8" fill="currentColor" opacity=".6"/>
-      <circle cx="5.6" cy="22" r="1.8" fill="currentColor" opacity=".6"/>
-      <circle cx="16" cy="16" r="3.2" fill="currentColor"/>
-    </svg>
-    <div class="brandtxt"><b data-i18n="app.title">VASP Catalyst Studio</b><span data-i18n="app.subtitle">v3.2 · 催化计算平台</span></div>
+<body data-active-area="home" data-workspace-area="home" data-workspace-page="dashboard">
+<a class="skip-link" href="#workspace-main">跳到主内容</a>
+
+<nav class="shell-nav" id="shell-nav" aria-label="主导航" data-shell-panel="navigation">
+  <div class="shell-nav-surface">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+        <polygon points="16,4 26.4,10 26.4,22 16,28 5.6,22 5.6,10" stroke="currentColor" stroke-width="1.4" opacity=".85"/>
+        <line x1="16" y1="16" x2="16" y2="4" stroke="currentColor" stroke-width="1.1" opacity=".7"/>
+        <line x1="16" y1="16" x2="26.4" y2="22" stroke="currentColor" stroke-width="1.1" opacity=".7"/>
+        <line x1="16" y1="16" x2="5.6" y2="22" stroke="currentColor" stroke-width="1.1" opacity=".7"/>
+        <circle cx="16" cy="4" r="1.8" fill="currentColor" opacity=".6"/>
+        <circle cx="26.4" cy="22" r="1.8" fill="currentColor" opacity=".6"/>
+        <circle cx="5.6" cy="22" r="1.8" fill="currentColor" opacity=".6"/>
+        <circle cx="16" cy="16" r="3.2" fill="currentColor"/>
+      </svg>
+      <div class="brandtxt"><b data-i18n="app.title">VASP Catalyst Studio</b><span data-i18n="app.subtitle">v3.2 · 催化计算平台</span></div>
+      <button class="shell-icon-button nav-close" id="nav-close" type="button"
+        aria-label="关闭导航" aria-controls="shell-nav">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+
+    <div class="shell-primary-nav" id="workspace-primary-nav">
+      <a href="#/home" id="nav-home" data-route="home" data-area="home"
+        data-page="dashboard" data-scene="pages.dashboard"
+        aria-label="首页 Home" aria-current="page" title="首页 · Home">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11.5L12 4l9 7.5V21h-6v-6H9v6H3z"/></svg>
+        <span class="nav-label"><b>首页</b><small>Home</small></span>
+      </a>
+      <a href="#/projects/current/overview" id="nav-project" data-route="project-overview" data-area="project"
+        data-page="project" data-scene="pages.project"
+        aria-label="项目 Project" title="项目 · Project">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6.5h7l2 2h9V20H3z"/><path d="M3 6.5V4h7l2 2"/></svg>
+        <span class="nav-label"><b>项目</b><small>Project</small></span>
+      </a>
+      <a href="#/prepare/structure" id="nav-prepare" data-route="prepare-structure" data-area="prepare"
+        data-page="structure" data-scene="pages.structure"
+        aria-label="准备 Prepare" title="准备 · Prepare">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><circle cx="5" cy="7" r="2"/><circle cx="19" cy="7" r="2"/><circle cx="12" cy="20" r="2"/><path d="M7 8l3 2M17 8l-3 2M12 15v3"/></svg>
+        <span class="nav-label"><b>准备</b><small>Prepare</small></span>
+      </a>
+      <a href="#/jobs" id="nav-run" data-route="run-jobs" data-area="run"
+        data-page="jobs" data-scene="pages.jobs"
+        aria-label="运行 Run" title="运行 · Run">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5l11 7-11 7z"/><path d="M4 5v14"/></svg>
+        <span class="nav-label"><b>运行</b><small>Run</small></span>
+      </a>
+      <a href="#/projects/current/analysis/adsorption" id="nav-analyze" data-route="analyze-energy" data-area="analyze"
+        data-page="project" data-scene="pages.project"
+        aria-label="分析 Analyze" title="分析 · Analyze">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V9M10 19V5M16 19v-7M22 19H2"/><circle cx="18.5" cy="7.5" r="2.5"/></svg>
+        <span class="nav-label"><b>分析</b><small>Analyze</small></span>
+      </a>
+      <a href="#/publish/figures?project=current" id="nav-publish" data-route="publish-figures" data-area="publish"
+        data-page="figures" data-scene="pages.figures"
+        aria-label="发布 Publish" title="发布 · Publish">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h10l4 4v14H5z"/><path d="M15 3v5h4M8 13h8M8 17h6"/></svg>
+        <span class="nav-label"><b>发布</b><small>Publish</small></span>
+      </a>
+      <a href="#/environment/settings" id="nav-environment" data-route="environment-settings" data-area="environment"
+        data-page="settings" data-scene="pages.settings"
+        aria-label="环境 Environment" title="环境 · Environment">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6L7 7M17 17l1.4 1.4M18.4 5.6L17 7M7 17l-1.4 1.4"/></svg>
+        <span class="nav-label"><b>环境</b><small>Environment</small></span>
+      </a>
+    </div>
+
+    <div class="shell-nav-footer">
+      <div class="deps-panel" id="deps-panel">
+        <div class="deps-head" data-i18n="deps.title">依赖状态</div>
+        <div class="deps-list" id="deps-list"><span class="deps-empty" data-i18n="deps.loading">检测中…</span></div>
+        <button class="btn quiet deps-fix" id="deps-fix-btn" data-i18n="deps.fix">查看安装命令</button>
+      </div>
+      <div class="foot" id="nav-foot" data-i18n="nav.foot.no_cluster">未配置集群</div>
+    </div>
   </div>
-  <button class="mode-chip" id="mode-chip" type="button" title="切换本次工作模式">工作模式：加载中…</button>
-  <div class="grp" data-i18n="nav.group.workflow">工作流</div>
-  <a href="#" data-page="dashboard" data-scene="pages.dashboard" class="on"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg><span data-i18n="nav.overview">概览</span></a>
-  <a href="#" data-page="structure" data-scene="pages.structure"><i class="stepno">1</i><span data-i18n="nav.structure">结构建模</span></a>
-  <a href="#" data-page="generate" data-scene="pages.generate"><i class="stepno">2</i><span data-i18n="nav.generate">生成输入</span></a>
-  <a href="#" data-page="jobs" data-scene="pages.jobs"><i class="stepno">3</i><span data-i18n="nav.jobs">提交计算</span></a>
-  <a href="#" data-page="project" data-scene="pages.project"><i class="stepno">4</i><span data-i18n="nav.project">结果分析</span></a>
-  <a href="#" data-page="wavefunction" data-scene="pages.wavefunction"><i class="stepno">5</i><span data-i18n="nav.wavefunction">波函数分析</span></a>
-  <a href="#" data-page="figures" data-scene="pages.figures"><i class="stepno">6</i><span data-i18n="nav.figures">论文出图</span></a>
-  <a href="#" data-page="ai" data-scene="pages.ai"><i class="stepno">7</i><span data-i18n="nav.ai">AI 助手</span></a>
-  <div class="grp" data-i18n="nav.group.environment">环境</div>
-  <a href="#" data-page="cluster" data-scene="pages.cluster"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="1"/><rect x="3" y="13" width="18" height="7" rx="1"/><path d="M7 7.5h.01M7 16.5h.01"/></svg><span data-i18n="nav.cluster">集群</span></a>
-  <a href="#" data-page="settings" data-scene="pages.settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M18.4 5.6L17 7M7 17l-1.4 1.4"/></svg><span data-i18n="nav.settings">设置</span></a>
-  <!-- 侧栏依赖状态区(对齐 starpivot 左下角):各组件状态点 + 下载/修复依赖 -->
-  <div class="deps-panel" id="deps-panel">
-    <div class="deps-head" data-i18n="deps.title">依赖状态</div>
-    <div class="deps-list" id="deps-list"><span class="deps-empty" data-i18n="deps.loading">检测中…</span></div>
-    <button class="btn quiet deps-fix" id="deps-fix-btn" data-i18n="deps.fix">查看安装命令</button>
-  </div>
-  <div class="foot" id="nav-foot" data-i18n="nav.foot.no_cluster">未配置集群</div>
 </nav>
-<main>
-  <header>
-    <span id="conn"><span class="dot g"></span>桥就绪检测中…</span>
-    <span class="sp"></span>
+
+<div class="shell-backdrop" id="nav-backdrop" data-shell-dismiss="navigation" hidden></div>
+
+<main id="workspace-main" tabindex="-1">
+  <header class="workspace-context-bar" id="workspace-context-bar">
+    <button class="shell-icon-button nav-toggle" id="nav-toggle" type="button"
+      aria-label="打开主导航" aria-controls="shell-nav" aria-expanded="false">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+    </button>
+
+    <div class="workspace-context-scroll" aria-label="当前工作上下文">
+      <label class="workspace-context-control context-select" data-context="project">
+        <span class="context-label">项目</span>
+        <select class="context-value" id="workspace-project" aria-label="当前项目" title="切换当前项目">
+          <option value="">未选择项目</option>
+        </select>
+      </label>
+      <div class="workspace-context-control" id="workspace-mode" data-context="mode">
+        <span class="context-label">模式</span>
+        <button class="mode-chip context-value" id="mode-chip" type="button" title="切换本次工作模式">加载中…</button>
+      </div>
+      <div class="workspace-context-control" data-context="engine">
+        <span class="context-label">引擎</span><strong class="context-value" id="workspace-engine">VASP</strong>
+      </div>
+      <div class="workspace-context-control" data-context="task">
+        <span class="context-label">任务</span><strong class="context-value" id="workspace-task">未选择</strong>
+      </div>
+      <div class="workspace-context-control context-status" data-context="stage">
+        <span class="context-label">阶段</span><strong class="context-value" id="workspace-stage">准备中</strong>
+      </div>
+      <div class="workspace-context-control context-status" id="workspace-sync" data-context="sync"
+        role="status" aria-live="polite" aria-atomic="true">
+        <span class="context-label">同步</span>
+        <span class="context-value" id="conn"><span class="dot g"></span>桥就绪检测中…</span>
+      </div>
+    </div>
+
+    <div class="workspace-context-tools">
+      <span class="workspace-dirty" id="workspace-dirty" role="status" hidden>未保存</span>
+      <button class="shell-tool-button" id="activity-toggle" type="button"
+        aria-label="打开活动中心" aria-controls="activity-drawer" aria-expanded="false">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16M4 12h16M4 19h10"/><circle cx="18" cy="19" r="2"/></svg>
+        <span>活动</span><b class="tool-count" id="activity-count" data-activity-count hidden>0</b>
+      </button>
+      <button class="shell-tool-button" id="assistant-toggle" type="button" data-scene="pages.ai"
+        aria-label="打开上下文助手" aria-controls="page-ai" aria-expanded="false">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v12H9l-5 4z"/><path d="M8 9h8M8 13h5"/></svg>
+        <span>助手</span>
+      </button>
+    </div>
   </header>
+
+  <!-- workspace.js 会按当前一级区域重绘；静态链接是旧页面选择器与无脚本回退合同。 -->
+  <nav class="workspace-subnav" id="workspace-subnav" aria-label="当前区域导航">
+    <div class="workspace-subnav-fallback" data-subnav-fallback>
+      <a href="#/home" data-route="home" data-area="home" data-page="dashboard" data-scene="pages.dashboard" class="on" aria-current="page" data-i18n="nav.overview">概览</a>
+      <a href="#/projects/current/overview" data-route="project-overview" data-area="project" data-page="project" data-scene="pages.project">项目概览</a>
+      <a href="#/prepare/structure" data-route="prepare-structure" data-area="prepare" data-page="structure" data-scene="pages.structure" data-i18n="nav.structure">结构建模</a>
+      <a href="#/prepare/input" data-route="prepare-input" data-area="prepare" data-page="generate" data-scene="pages.generate" data-i18n="nav.generate">生成输入</a>
+      <a href="#/jobs" data-route="run-jobs" data-area="run" data-page="jobs" data-scene="pages.jobs" data-i18n="nav.jobs">作业与运行</a>
+      <a href="#/projects/current/analysis/adsorption" data-route="analyze-energy" data-area="analyze" data-page="project" data-scene="pages.project" data-i18n="nav.project">能量与稳定性</a>
+      <a href="#/projects/current/analysis/charge" data-route="analyze-charge" data-area="analyze" data-page="wavefunction" data-scene="pages.wavefunction" data-i18n="nav.wavefunction">电荷与波函数</a>
+      <a href="#/publish/figures?project=current" data-route="publish-figures" data-area="publish" data-page="figures" data-scene="pages.figures" data-i18n="nav.figures">图表工作台</a>
+      <a href="#/environment/cluster" data-route="environment-cluster" data-area="environment" data-page="cluster" data-scene="pages.cluster" data-i18n="nav.cluster">集群</a>
+      <a href="#/environment/settings" data-route="environment-settings" data-area="environment" data-page="settings" data-scene="pages.settings" data-i18n="nav.settings">设置</a>
+    </div>
+  </nav>
   <div class="conn-banner" id="conn-banner"></div>
 
   <section class="page" data-page="dashboard" id="page-dashboard">
@@ -1239,7 +1343,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
             title="只处理后端明确允许人工确认的条目；能量缺失、电子未收敛等硬性问题不会被绕过">确认这些结果已收敛</button>
         </div>
 
-        <div class="pj-import-table-wrap">
+        <div class="pj-import-table-wrap" role="region" aria-label="待导入结果列表" tabindex="0">
           <table class="pj-import-table">
             <thead><tr>
               <th class="pj-import-check"><input type="checkbox" id="pj-import-check-visible" aria-label="选择当前可见结果"></th>
@@ -1441,7 +1545,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       </div>
       <div id="pj-candidate-evaluation" class="pj-candidate-card" hidden aria-live="polite"></div>
       <div id="pj-report-files" class="pj-report-output" aria-live="polite"></div>
-      <div id="pj-table"></div>
+      <div id="pj-table" role="region" aria-label="项目结果表" tabindex="0"></div>
     </div>
 
     <!-- 任务解析:选作业 → 按 task_type 自动解析 + 出图 -->
@@ -1854,10 +1958,12 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     </div>
   </div>
 
-  <section class="page" data-page="ai" id="page-ai" hidden>
+  <section class="page shell-assistant-drawer" data-page="ai" id="page-ai"
+    data-shell-assistant role="dialog" aria-modal="false" aria-labelledby="assistant-title" hidden>
     <div class="pagebar">
-      <h1 data-i18n="ai.title">AI 助手</h1>
+      <h1 id="assistant-title" data-i18n="ai.title">AI 助手</h1>
       <span class="stats" data-i18n="ai.subtitle">对话与文件分析 · 论文 → 规格表 → 计划 → 实例化</span>
+      <span class="sp" aria-hidden="true"></span>
     </div>
 
     <div class="card ai-chat" id="ai-chat-card" style="padding:12px;margin-bottom:10px">
@@ -2117,7 +2223,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <div id="jl-chart" style="height:260px;margin-top:8px"></div>
       <div class="sub" id="jl-note"></div>
     </div>
-    <div class="card" id="jobs-card"></div>
+    <div class="card" id="jobs-card" role="region" aria-label="作业列表" tabindex="0"></div>
     <div class="sub" id="jobs-stale" style="margin-top:8px;color:var(--warn)"></div>
 
     <!-- 文件管理:列远端目录 + 下载选中 -->
@@ -2432,9 +2538,35 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     <div class="log" id="settings-log" data-anchor><div class="head">设置日志</div></div>
   </section>
 </main>
+
+<div class="shell-backdrop" id="activity-backdrop" data-shell-dismiss="activity" hidden></div>
+<aside class="shell-side-drawer activity-drawer" id="activity-drawer"
+  role="dialog" aria-modal="true" aria-labelledby="activity-title" aria-hidden="true" hidden>
+  <div class="shell-drawer-head">
+    <div>
+      <h2 id="activity-title">活动中心</h2>
+      <p>后台操作、阻断项与最近产物</p>
+    </div>
+    <button class="shell-icon-button" id="activity-close" type="button"
+      aria-label="关闭活动中心">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+    </button>
+  </div>
+  <div class="activity-list" id="activity-list" role="feed" aria-live="polite" aria-busy="false">
+    <div class="shell-drawer-empty" data-activity-empty>
+      <b>暂无活动</b><span>提交、监控、分析和报告操作会显示在这里。</span>
+    </div>
+  </div>
+</aside>
+
+<div class="shell-backdrop" id="assistant-backdrop" data-shell-dismiss="assistant" hidden></div>
+
+<div class="compact-actions" id="compact-actions" aria-label="当前页面操作" aria-live="polite"></div>
+
 <script src="vendor/echarts.min.js"></script>
 <script src="vendor/3Dmol-min.js"></script>
 <script src="app.js"></script>
+<script src="workspace.js"></script>
 <script src="converge.js"></script>
 <script src="structure.js"></script>
 <script src="methods.js"></script>

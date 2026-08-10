@@ -1,0 +1,1649 @@
+// workspace.js — V4 项目上下文壳层：语义路由、跨会话恢复、全局上下文与抽屉。
+// 旧业务模块仍使用 dashboard/structure/... 物理页；本文件只做稳定语义路由适配。
+'use strict';
+
+(function () {
+  const VCS = window.VCS;
+  if (!VCS) return;
+
+  const SCHEMA = 'vcstudio.workspace-context/v1';
+  const STORAGE_KEY = 'vcs.workspace.context.v1';
+  const DRAFT_PREFIX = 'vcs.workspace.draft.v1.';
+  const MAX_DRAFT_CHARS = 65536;
+  const PROJECT_TOKEN = /^[A-Za-z0-9._~-]{1,160}$/;
+  const JOB_TOKEN = /^[A-Za-z0-9._~:-]{1,160}$/;
+  const ROUTE_TOKEN = /^[a-z0-9][a-z0-9._-]{0,79}$/;
+  const JOB_STATUS_FILTERS = new Set(['queue', 'run', 'need', 'done', 'fail']);
+  const ROUTE_QUERY_KEYS = Object.freeze({
+    'run-jobs': new Set(['status', 'cluster']),
+    'publish-figures': new Set(['project']),
+    'publish-report': new Set(['project']),
+    'publish-si': new Set(['project']),
+    'publish-draftpack': new Set(['project']),
+    'publish-versions': new Set(['project']),
+    'publish-export': new Set(['project']),
+  });
+
+  const ROUTES = Object.freeze({
+    home: { area: 'home', page: 'dashboard', label: '首页', path: () => '/home' },
+    'project-overview': { area: 'project', page: 'project', label: '项目概览',
+      path: c => `/projects/${projectToken(c)}/overview` },
+    'project-members': { area: 'project', page: 'project', label: '成员与数据',
+      path: c => `/projects/${projectToken(c)}/members`, focus: '#pj-select' },
+    'project-workflow': { area: 'project', page: 'dashboard', label: '项目工作流',
+      path: c => `/projects/${projectToken(c)}/workflow`, focus: '#db-pipeline' },
+    'project-runs': { area: 'project', page: 'jobs', label: '项目运行',
+      path: c => `/projects/${projectToken(c)}/runs` },
+    'project-activity': { area: 'project', page: 'dashboard', label: '活动与版本',
+      path: c => `/projects/${projectToken(c)}/activity`, focus: '#db-feed' },
+
+    'prepare-structure': { area: 'prepare', page: 'structure', label: '结构',
+      path: () => '/prepare/structure' },
+    'prepare-input': { area: 'prepare', page: 'generate', label: '输入',
+      path: () => '/prepare/input' },
+    'prepare-batch': { area: 'prepare', page: 'generate', label: '批量',
+      path: () => '/prepare/batch' },
+    'prepare-templates': { area: 'prepare', page: 'generate', label: '模板',
+      path: () => '/prepare/templates', focus: '#taskcat-card' },
+    'prepare-preflight': { area: 'prepare', page: 'generate', label: '预检',
+      path: () => '/prepare/preflight' },
+
+    'run-jobs': { area: 'run', page: 'jobs', label: '作业', path: () => '/jobs' },
+    'run-remote': { area: 'run', page: 'cluster', label: '远程', path: () => '/run/remote' },
+
+    'analyze-energy': { area: 'analyze', page: 'project', label: '能量与稳定性',
+      path: c => `/projects/${projectToken(c)}/analysis/adsorption`, analysis: 'adsorption' },
+    'analyze-thermo': { area: 'analyze', page: 'project', label: '热力学与动力学',
+      path: c => `/projects/${projectToken(c)}/analysis/thermo`, analysis: 'taskana' },
+    'analyze-electronic': { area: 'analyze', page: 'wavefunction', label: '电子结构',
+      path: c => `/projects/${projectToken(c)}/analysis/electronic` },
+    'analyze-charge': { area: 'analyze', page: 'wavefunction', label: '电荷与波函数',
+      path: c => `/projects/${projectToken(c)}/analysis/charge` },
+    'analyze-comparison': { area: 'analyze', page: 'project', label: '比较',
+      path: c => `/projects/${projectToken(c)}/analysis/comparison`, analysis: 'figures',
+      focus: '#fig-compare-status' },
+    'analyze-custom': { area: 'analyze', page: 'project', label: '自定义',
+      path: c => `/projects/${projectToken(c)}/analysis/custom`, analysis: 'taskana' },
+
+    'publish-figures': { area: 'publish', page: 'figures', label: '图表',
+      path: c => `/publish/figures?project=${encodeURIComponent(projectToken(c))}` },
+    'publish-report': { area: 'publish', page: 'project', label: '报告',
+      path: c => `/publish/report?project=${encodeURIComponent(projectToken(c))}`,
+      analysis: 'adsorption', focus: '#pj-report' },
+    'publish-si': { area: 'publish', page: 'project', label: '补充信息',
+      path: c => `/publish/si?project=${encodeURIComponent(projectToken(c))}`,
+      analysis: 'draft', focus: '#pj-draft' },
+    'publish-draftpack': { area: 'publish', page: 'project', label: '草稿包',
+      path: c => `/publish/draftpack?project=${encodeURIComponent(projectToken(c))}`,
+      analysis: 'draft', focus: '#pj-draft' },
+    'publish-versions': { area: 'publish', page: 'project', label: '版本',
+      path: c => `/publish/versions?project=${encodeURIComponent(projectToken(c))}` },
+    'publish-export': { area: 'publish', page: 'figures', label: '导出与归档',
+      path: c => `/publish/export?project=${encodeURIComponent(projectToken(c))}` },
+
+    'environment-cluster': { area: 'environment', page: 'cluster', label: '集群',
+      path: () => '/environment/cluster' },
+    'environment-local': { area: 'environment', page: 'jobs', label: '本地运行器',
+      path: () => '/environment/local-runner' },
+    'environment-dependencies': { area: 'environment', page: 'settings', label: '依赖',
+      path: () => '/environment/dependencies', focus: '#deps-panel' },
+    'environment-paths': { area: 'environment', page: 'settings', label: '数据路径',
+      path: () => '/environment/data-paths' },
+    'environment-templates': { area: 'environment', page: 'settings', label: '模板',
+      path: () => '/environment/templates' },
+    'environment-settings': { area: 'environment', page: 'settings', label: '设置',
+      path: () => '/environment/settings' },
+  });
+
+  const AREA_LABELS = Object.freeze({
+    home: 'Home', project: 'Project', prepare: 'Prepare', run: 'Run',
+    analyze: 'Analyze', publish: 'Publish', environment: 'Environment',
+  });
+
+  const SUBNAV = Object.freeze({
+    home: [{ route: 'home', label: '首页' }],
+    project: [
+      { route: 'project-overview', label: '概览' },
+      { route: 'project-members', label: '成员与数据' },
+      { route: 'project-workflow', label: '工作流' },
+      { route: 'project-runs', label: '运行' },
+      { route: 'project-activity', label: '活动与版本' },
+    ],
+    prepare: [
+      { route: 'prepare-structure', label: '结构' },
+      { route: 'prepare-input', label: '输入' },
+      { route: 'prepare-batch', label: '批量' },
+      { route: 'prepare-templates', label: '模板' },
+      { route: 'prepare-preflight', label: '预检' },
+    ],
+    run: [
+      { route: 'run-jobs', label: '待处理', query: { status: 'queue' } },
+      { route: 'run-jobs', label: '运行中', query: { status: 'run' } },
+      { route: 'run-jobs', label: '需关注', query: { status: 'need' } },
+      { route: 'run-jobs', label: '已完成', query: { status: 'done' } },
+      { route: 'run-remote', label: '远程' },
+    ],
+    analyze: [
+      { route: 'analyze-energy', label: '能量与稳定性' },
+      { route: 'analyze-thermo', label: '热力学与动力学' },
+      { route: 'analyze-electronic', label: '电子结构' },
+      { route: 'analyze-charge', label: '电荷与波函数' },
+      { route: 'analyze-comparison', label: '比较' },
+      { route: 'analyze-custom', label: '自定义' },
+    ],
+    publish: [
+      { route: 'publish-figures', label: '图表' },
+      { route: 'publish-report', label: '报告' },
+      { route: 'publish-si', label: '补充信息' },
+      { route: 'publish-draftpack', label: '草稿包' },
+      { route: 'publish-versions', label: '版本' },
+      { route: 'publish-export', label: '导出与归档' },
+    ],
+    environment: [
+      { route: 'environment-cluster', label: '集群' },
+      { route: 'environment-local', label: '本地运行器' },
+      { route: 'environment-dependencies', label: '依赖' },
+      { route: 'environment-paths', label: '数据路径' },
+      { route: 'environment-templates', label: '模板' },
+      { route: 'environment-settings', label: '设置' },
+    ],
+  });
+
+  const LEGACY_ROUTE = Object.freeze({
+    dashboard: 'home', structure: 'prepare-structure', generate: 'prepare-input',
+    jobs: 'run-jobs', project: 'project-overview', wavefunction: 'analyze-electronic',
+    figures: 'publish-figures', cluster: 'environment-cluster',
+    settings: 'environment-settings', ai: 'assistant',
+  });
+
+  function blankState() {
+    return {
+      schema: SCHEMA,
+      route: '#/home',
+      project_id: '',
+      analysis_id: '',
+      selected_job_id: '',
+      panels: {},
+      filters: {},
+      sort: {},
+      scroll: {},
+      draft_refs: {},
+      server_revision: 0,
+      updated_at_ms: 0,
+    };
+  }
+
+  function plainObject(value) {
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  }
+
+  function safeToken(value, pattern = ROUTE_TOKEN) {
+    const out = String(value || '').trim();
+    return pattern.test(out) ? out : '';
+  }
+
+  function safeQueryValue(key, value) {
+    const name = String(key || '');
+    if (name === 'project') return safeToken(value, PROJECT_TOKEN);
+    if (name === 'status') {
+      const status = safeToken(value, JOB_TOKEN);
+      return JOB_STATUS_FILTERS.has(status) ? status : '';
+    }
+    if (name !== 'cluster') return safeToken(value, JOB_TOKEN);
+    const out = String(value || '').trim();
+    if (!out || out.length > 128 || /[\x00-\x1f\x7f\\/?#&=]/.test(out)) return '';
+    if (/(?:\bBearer\s+|gh[pousr]_|sk-[A-Za-z0-9_-]{12,}|-----BEGIN\s)/i.test(out)) return '';
+    return out;
+  }
+
+  function safeRoute(value) {
+    const out = String(value || '').trim();
+    if (!out.startsWith('#/') || out.length > 512 || /[\\\r\n]/.test(out)) return '';
+    if (/(?:^|[/?=&])(?:[A-Za-z]:|file:|\.\.)/i.test(decodeURIComponentSafe(out))) return '';
+    return out;
+  }
+
+  function decodeURIComponentSafe(value) {
+    try { return decodeURIComponent(value); } catch (_) { return String(value || ''); }
+  }
+
+  function finiteScrollMap(value) {
+    const out = {};
+    Object.entries(plainObject(value)).slice(-40).forEach(([key, raw]) => {
+      const n = Number(raw);
+      if (safeRoute(key) && Number.isFinite(n) && n >= 0) out[key] = Math.min(10000000, Math.round(n));
+    });
+    return out;
+  }
+
+  function smallRecord(value, maxKeys = 40) {
+    const out = {};
+    Object.entries(plainObject(value)).slice(-maxKeys).forEach(([key, raw]) => {
+      const cleanKey = safeToken(key, /^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$/);
+      if (!cleanKey) return;
+      if (typeof raw === 'string') out[cleanKey] = raw.slice(0, 512);
+      else if (typeof raw === 'number' && Number.isFinite(raw)) out[cleanKey] = raw;
+      else if (typeof raw === 'boolean' || raw === null) out[cleanKey] = raw;
+      else if (Array.isArray(raw)) out[cleanKey] = raw.slice(0, 40)
+        .map(item => String(item).slice(0, 160));
+    });
+    return out;
+  }
+
+  function normalizeState(raw) {
+    const src = plainObject(raw);
+    const state = blankState();
+    const route = safeRoute(src.route);
+    if (route) state.route = route;
+    state.project_id = safeToken(src.project_id || src.current_project_id, PROJECT_TOKEN);
+    state.analysis_id = safeToken(src.analysis_id || src.current_analysis_id);
+    state.selected_job_id = safeToken(src.selected_job_id, JOB_TOKEN);
+    state.panels = smallRecord(src.panels);
+    state.filters = smallRecord(src.filters);
+    state.sort = smallRecord(src.sort);
+    state.scroll = finiteScrollMap(src.scroll);
+    state.draft_refs = plainObject(src.draft_refs);
+    state.server_revision = Number.isSafeInteger(Number(src.server_revision))
+      ? Math.max(0, Number(src.server_revision)) : 0;
+    state.updated_at_ms = Number.isFinite(Number(src.updated_at_ms))
+      ? Math.max(0, Math.round(Number(src.updated_at_ms))) : 0;
+    return state;
+  }
+
+  function loadLocalState() {
+    try {
+      return normalizeState(JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'));
+    } catch (_) {
+      return blankState();
+    }
+  }
+
+  let state = loadLocalState();
+  let revision = state.server_revision;
+  let remoteSaveBlocked = false;
+  let remoteDirtyHold = false;
+  let currentRoute = null;
+  let projects = [];
+  let selectedProject = null;
+  let remoteSaveTimer = null;
+  let remoteSaveInFlight = null;
+  let remoteSaveRequested = false;
+  let localStateGeneration = 0;
+  let routeGeneration = 0;
+  let navigationTail = Promise.resolve();
+  let routeApplyTail = Promise.resolve();
+  let externalNavigationPromise = null;
+  let externalNavigationHash = '';
+  let historyIndex = Number.isSafeInteger(Number(history.state && history.state.vcsIndex))
+    ? Number(history.state.vcsIndex) : 0;
+  let historyCompensation = null;
+  let projectSwitchGeneration = 0;
+  let locationIntentGeneration = 0;
+  let jobContextGeneration = 0;
+  let pendingJobProjectSwitch = null;
+  let navReturnFocus = null;
+  let activityReturnFocus = null;
+  let assistantReturnFocus = null;
+  let scrollTimer = null;
+  let contextRefreshTimer = null;
+  let contextRefreshGeneration = 0;
+  let lastContextRefreshAt = 0;
+  let initialHashWasExplicit = !!safeRoute(window.location.hash);
+  const dirtyScopes = new Map();
+
+  function projectToken(context) {
+    const raw = context && (context.projectId || context.project_id) || state.project_id;
+    return safeToken(raw, PROJECT_TOKEN) || 'current';
+  }
+
+  function routeHash(id, options = {}) {
+    const def = ROUTES[id] || ROUTES.home;
+    const path = def.path({ projectId: options.projectId || state.project_id });
+    const url = new URL(path, 'https://vcstudio.local');
+    const allowed = ROUTE_QUERY_KEYS[id] || new Set();
+    Object.entries(plainObject(options.query)).forEach(([key, value]) => {
+      const cleanKey = safeToken(key);
+      const cleanValue = safeQueryValue(cleanKey, value);
+      if (allowed.has(cleanKey) && cleanValue) {
+        url.searchParams.set(cleanKey, cleanValue);
+      }
+    });
+    return '#' + url.pathname + (url.search ? url.search : '');
+  }
+
+  function parseRoute(hash) {
+    const safe = safeRoute(hash);
+    if (!safe) return null;
+    let url;
+    try { url = new URL(safe.slice(1), 'https://vcstudio.local'); } catch (_) { return null; }
+    const path = url.pathname.replace(/\/+$/, '') || '/';
+    const query = Object.fromEntries(url.searchParams.entries());
+    const queryPairs = Array.from(url.searchParams.entries());
+    if (new Set(queryPairs.map(pair => pair[0])).size !== queryPairs.length) return null;
+    const result = (id, params = {}) => {
+      const allowed = ROUTE_QUERY_KEYS[id] || new Set();
+      if (queryPairs.some(([key, value]) => !allowed.has(key) ||
+          !safeQueryValue(key, value))) return null;
+      return { id, def: ROUTES[id], params, query, hash: safe };
+    };
+    if (path === '/home') return result('home');
+
+    let match = path.match(/^\/projects\/([^/]+)\/(overview|members|workflow|runs|activity)$/);
+    if (match) {
+      const byView = { overview: 'project-overview', members: 'project-members',
+        workflow: 'project-workflow', runs: 'project-runs', activity: 'project-activity' };
+      const projectId = safeToken(decodeURIComponentSafe(match[1]), PROJECT_TOKEN);
+      return projectId ? result(byView[match[2]], { projectId }) : null;
+    }
+    match = path.match(/^\/projects\/([^/]+)\/analysis\/(adsorption|thermo|electronic|charge|comparison|custom)$/);
+    if (match) {
+      const byAnalysis = { adsorption: 'analyze-energy', thermo: 'analyze-thermo',
+        electronic: 'analyze-electronic', charge: 'analyze-charge',
+        comparison: 'analyze-comparison', custom: 'analyze-custom' };
+      const projectId = safeToken(decodeURIComponentSafe(match[1]), PROJECT_TOKEN);
+      return projectId ? result(byAnalysis[match[2]], { projectId }) : null;
+    }
+    match = path.match(/^\/prepare\/(structure|input|batch|templates|preflight)$/);
+    if (match) return result(`prepare-${match[1]}`);
+    if (path === '/jobs') return result('run-jobs');
+    if (path === '/run/remote') return result('run-remote');
+    match = path.match(/^\/publish\/(figures|report|si|draftpack|versions|export)$/);
+    if (match) {
+      const id = `publish-${match[1]}`;
+      const projectId = safeToken(query.project, PROJECT_TOKEN);
+      return result(id, projectId ? { projectId } : {});
+    }
+    match = path.match(/^\/environment\/(cluster|local-runner|dependencies|data-paths|templates|settings)$/);
+    if (match) {
+      const byView = { cluster: 'environment-cluster', 'local-runner': 'environment-local',
+        dependencies: 'environment-dependencies', 'data-paths': 'environment-paths',
+        templates: 'environment-templates', settings: 'environment-settings' };
+      return result(byView[match[1]]);
+    }
+    return null;
+  }
+
+  function statePayload() {
+    const route = currentRoute || parseRoute(state.route) || parseRoute('#/home');
+    const draftRefs = {};
+    Object.entries(plainObject(state.draft_refs)).forEach(([id, raw]) => {
+      const cleanId = safeToken(id);
+      if (!cleanId || !raw || typeof raw !== 'object' || Array.isArray(raw)) return;
+      const ref = plainObject(raw);
+      let updatedAtMs = Number(ref.updated_at_ms);
+      if (!Number.isFinite(updatedAtMs) || updatedAtMs <= 0) {
+        updatedAtMs = Date.parse(String(ref.updated_at || ''));
+      }
+      if (!Number.isFinite(updatedAtMs) || updatedAtMs <= 0) updatedAtMs = Date.now();
+      const rawSize = Number(ref.size);
+      const size = Number.isFinite(rawSize) && rawSize >= 0
+        ? Math.min(MAX_DRAFT_CHARS, Math.round(rawSize)) : 0;
+      draftRefs[cleanId] = {
+        project_id: safeToken(ref.project_id, PROJECT_TOKEN) || null,
+        route: safeRoute(ref.route) || state.route,
+        kind: 'unverified_draft',
+        dirty: ref.dirty !== false,
+        updated_at: new Date(updatedAtMs).toISOString(),
+        size,
+      };
+    });
+    return {
+      route: { hash: route.hash, area: route.def.area, view: route.id },
+      current_project_id: state.project_id || null,
+      current_analysis_id: state.analysis_id || null,
+      selected_job_id: state.selected_job_id || null,
+      panels: state.panels,
+      filters: state.filters,
+      sort: state.sort,
+      scroll: state.scroll,
+      draft_refs: draftRefs,
+    };
+  }
+
+  function persistLocal({ remote = true, touch = true } = {}) {
+    state.schema = SCHEMA;
+    if (touch) {
+      state.updated_at_ms = Date.now();
+      localStateGeneration += 1;
+    }
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch (_) { /* 本地存储不可用不阻断 */ }
+    if (remote) scheduleRemoteSave();
+  }
+
+  function scheduleRemoteSave() {
+    if (remoteSaveTimer) clearTimeout(remoteSaveTimer);
+    remoteSaveTimer = setTimeout(saveRemoteState, 900);
+  }
+
+  async function saveRemoteState() {
+    remoteSaveTimer = null;
+    remoteSaveRequested = true;
+    if (remoteSaveBlocked) return;
+    if (remoteSaveInFlight) return remoteSaveInFlight;
+    remoteSaveInFlight = (async () => {
+      while (remoteSaveRequested && !remoteSaveBlocked) {
+        remoteSaveRequested = false;
+        const savedGeneration = localStateGeneration;
+        try {
+          const out = await VCS.call('workspace_preferences_update',
+            { set: statePayload(), remove: [] }, revision);
+          if (!out || out.error === '桥方法不存在:workspace_preferences_update') return;
+          if (out.ok) {
+            revision = Number(out.state_revision || out.revision || revision);
+            state.server_revision = revision;
+            remoteSaveBlocked = false;
+            persistLocal({ remote: false, touch: false });
+            if (localStateGeneration !== savedGeneration) remoteSaveRequested = true;
+          } else if (out.conflict) {
+            remoteSaveBlocked = true;
+            document.dispatchEvent(new CustomEvent('vcs:workspace-conflict', { detail: out }));
+            VCS.toast('工作区状态已在另一个窗口更新；正在采用较新的状态', 'fail');
+            setTimeout(() => refreshWorkspaceContext(), 0);
+          }
+        } catch (_) { return; /* UI 恢复状态失败不影响科学文件 */ }
+      }
+    })().finally(() => { remoteSaveInFlight = null; });
+    return remoteSaveInFlight;
+  }
+
+  function saveCurrentScroll() {
+    if (!currentRoute) return;
+    state.scroll[currentRoute.hash] = Math.max(0, Math.round(window.scrollY || 0));
+    const entries = Object.entries(state.scroll);
+    if (entries.length > 40) state.scroll = Object.fromEntries(entries.slice(-40));
+    persistLocal();
+  }
+
+  function isProjectRoute(route) {
+    return !!(route && (route.params.projectId || route.def.area === 'project' ||
+      route.def.area === 'analyze' || route.def.area === 'publish'));
+  }
+
+  function routeProject(route) {
+    return safeToken(route && route.params && route.params.projectId, PROJECT_TOKEN) ||
+      safeToken(route && route.query && route.query.project, PROJECT_TOKEN) || '';
+  }
+
+  function resolveRemoteDirtyHold() {
+    if (!remoteDirtyHold || dirtyScopes.size) return;
+    remoteDirtyHold = false;
+    // Keep saves blocked until a fresh server snapshot has been adopted.
+    setTimeout(() => refreshWorkspaceContext(), 0);
+  }
+
+  async function guardUnsaved(reason) {
+    if (!dirtyScopes.size) return true;
+    const details = Array.from(dirtyScopes.values()).map(item => item.label).filter(Boolean);
+    const message = (reason || '离开当前内容') + '会丢弃尚未保存的修改。' +
+      (details.length ? `\n\n未保存：${details.join('、')}` : '') + '\n\n是否丢弃并继续？';
+    const ok = await VCS.confirm(message);
+    if (ok) {
+      dirtyScopes.clear();
+      renderDirty();
+      resolveRemoteDirtyHold();
+    }
+    return ok;
+  }
+
+  function findPrimaryRoute(area) {
+    const anchor = document.querySelector(`#shell-nav a[data-area="${area}"][data-route]`);
+    return anchor && anchor.dataset.route;
+  }
+
+  function routeIsAvailable(def) {
+    if (!def) return false;
+    if (typeof VCS.canActivatePage === 'function') return VCS.canActivatePage(def.page);
+    return !(VCS.scenario && typeof VCS.sceneVisible === 'function' &&
+      !VCS.sceneVisible(VCS.scenario, 'pages.' + def.page));
+  }
+
+  function syncPrimaryAreaRoutes(route) {
+    document.querySelectorAll('#shell-nav a[data-area][data-route]').forEach(anchor => {
+      const area = anchor.dataset.area;
+      if (!anchor.dataset.primaryRoute) anchor.dataset.primaryRoute = anchor.dataset.route;
+      const items = SUBNAV[area] || [];
+      const candidates = items.map(item => item.route).filter(id =>
+        ROUTES[id] && routeIsAvailable(ROUTES[id]));
+      let preferred = route && route.def.area === area && candidates.includes(route.id)
+        ? route.id : anchor.dataset.primaryRoute;
+      if (!candidates.includes(preferred)) preferred = candidates[0] || '';
+      if (!preferred) {
+        anchor.setAttribute('data-scene-hidden', '');
+        anchor.removeAttribute('aria-current');
+        return;
+      }
+      const def = ROUTES[preferred];
+      anchor.dataset.route = preferred;
+      anchor.dataset.page = def.page;
+      anchor.dataset.scene = 'pages.' + def.page;
+      anchor.removeAttribute('data-scene-hidden');
+      anchor.hidden = false;
+    });
+  }
+
+  function updateRouteLinks() {
+    document.querySelectorAll('[data-route]').forEach(anchor => {
+      const id = anchor.dataset.route;
+      if (!ROUTES[id]) return;
+      anchor.setAttribute('href', routeHash(id));
+    });
+  }
+
+  function routeSubnavKey(route) {
+    if (!route) return '';
+    if (route.id === 'run-jobs') return `run-jobs:${route.query.status || ''}`;
+    return route.id;
+  }
+
+  function renderSubnav(route) {
+    const box = document.getElementById('workspace-subnav');
+    if (!box || !route) return;
+    const items = SUBNAV[route.def.area] || [];
+    const activeKey = routeSubnavKey(route);
+    box.innerHTML = '';
+    items.forEach(item => {
+      const def = ROUTES[item.route];
+      if (!def) return;
+      if (!routeIsAvailable(def)) return;
+      const anchor = document.createElement('a');
+      anchor.dataset.route = item.route;
+      anchor.dataset.area = def.area;
+      anchor.dataset.page = def.page;
+      anchor.dataset.scene = 'pages.' + def.page;
+      anchor.href = routeHash(item.route, { query: item.query });
+      anchor.textContent = item.label;
+      const key = item.route === 'run-jobs'
+        ? `run-jobs:${(item.query && item.query.status) || ''}` : item.route;
+      if (key === activeKey) {
+        anchor.classList.add('on');
+        anchor.setAttribute('aria-current', 'page');
+      }
+      box.appendChild(anchor);
+    });
+    box.hidden = !items.length;
+  }
+
+  function renderRoute(route) {
+    if (!route) return;
+    const area = route.def.area;
+    syncPrimaryAreaRoutes(route);
+    document.querySelectorAll('#shell-nav a[data-area]').forEach(anchor => {
+      const active = anchor.dataset.area === area;
+      anchor.classList.toggle('on', active);
+      if (active) anchor.setAttribute('aria-current', 'page');
+      else anchor.removeAttribute('aria-current');
+    });
+    renderSubnav(route);
+    updateRouteLinks();
+    document.body.dataset.workspaceArea = area;
+    document.body.dataset.activeArea = area;
+    document.body.dataset.workspacePage = route.def.page;
+    document.title = `${route.def.label} · VASP Catalyst Studio`;
+  }
+
+  function applyRouteControls(route) {
+    const analysis = document.getElementById('analysis-type');
+    if (analysis && route.def.analysis && analysis.value !== route.def.analysis &&
+        Array.from(analysis.options || []).some(option => option.value === route.def.analysis)) {
+      analysis.value = route.def.analysis;
+      analysis.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    if (route.def.analysis) state.analysis_id = route.def.analysis;
+
+    const filterStatus = route.query.status || state.filters.job_status || '';
+    const status = document.getElementById('jf-status');
+    if (status && Array.from(status.options || []).some(option => option.value === filterStatus)) {
+      status.value = filterStatus;
+      status.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    const cluster = document.getElementById('jf-cluster');
+    const clusterValue = route.query.cluster || state.filters.job_cluster || '';
+    if (cluster && Array.from(cluster.options || []).some(option => option.value === clusterValue)) {
+      cluster.value = clusterValue;
+      cluster.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    const sort = document.getElementById('jf-sort');
+    if (sort && state.sort.jobs && Array.from(sort.options || []).some(
+      option => option.value === state.sort.jobs)) {
+      sort.value = state.sort.jobs;
+      sort.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  }
+
+  function restorePanels() {
+    document.querySelectorAll('[data-acc]').forEach(card => {
+      const key = safeToken(card.getAttribute('data-acc'));
+      if (key && Object.prototype.hasOwnProperty.call(state.panels, key)) {
+        card.setAttribute('data-open', state.panels[key] ? '1' : '0');
+      }
+    });
+  }
+
+  function focusPageHeading(route, source) {
+    if (source === 'history' || source === 'restore' || source === 'initial') return;
+    const section = document.querySelector(
+      `main section[data-page="${route.def.page}"]:not([data-shell-assistant])`);
+    const heading = section && section.querySelector('h1,.pagebar h1');
+    if (!heading) return;
+    if (!heading.hasAttribute('tabindex')) heading.tabIndex = -1;
+    try { heading.focus({ preventScroll: true }); } catch (_) { heading.focus(); }
+  }
+
+  async function selectProjectById(projectId, { syncPage = true } = {}) {
+    const id = safeToken(projectId, PROJECT_TOKEN);
+    const hit = projects.find(item => item.id === id) || null;
+    if (!hit) return false;
+    const previousProjectId = state.project_id;
+    if (syncPage && hit.path && window.Project && typeof window.Project.selectByPath === 'function') {
+      const applied = await window.Project.selectByPath(hit.path);
+      if (applied === false) return false;
+    }
+    selectedProject = hit;
+    state.project_id = hit.id;
+    if (previousProjectId !== hit.id) state.selected_job_id = '';
+    renderContext();
+    try { localStorage.setItem('vcs.adsorption.current_project', hit.path || ''); } catch (_) { /* 兼容旧页 */ }
+    const select = document.getElementById('workspace-project');
+    if (select && select.value !== hit.id) select.value = hit.id;
+    document.dispatchEvent(new CustomEvent('vcs:workspace-project', {
+      detail: Object.assign({}, hit),
+    }));
+    return true;
+  }
+
+  function routeCanApply(route, options = {}) {
+    if (!route || !routeIsAvailable(route.def)) return false;
+    const wantedProject = routeProject(route);
+    if (!wantedProject || wantedProject === 'current') return true;
+    if (projects.some(project => project.id === wantedProject)) return true;
+    return !!(options.allowUnresolvedProject && !projects.length);
+  }
+
+  async function applyRouteNow(route, options = {}) {
+    if (!route) return { ok: false, focused: false };
+    const generation = options.generation;
+    try {
+      if (generation !== routeGeneration || !routeCanApply(route, options)) {
+        return { ok: false, focused: false,
+          superseded: generation !== routeGeneration, blocked: generation === routeGeneration };
+      }
+      const wantedProject = routeProject(route);
+      if (wantedProject && wantedProject !== 'current' &&
+          (wantedProject !== state.project_id || !selectedProject)) {
+        if (!projects.length && options.allowUnresolvedProject) {
+          state.project_id = wantedProject;
+        } else {
+          const selected = await selectProjectById(wantedProject, { syncPage: true });
+          if (!selected) return { ok: false, focused: false, missingProject: true };
+        }
+      }
+      if (generation !== routeGeneration) {
+        return { ok: false, focused: false, superseded: true };
+      }
+      const ok = VCS.activatePage(route.def.page, null, {
+        source: options.source || 'route', route: route.id, area: route.def.area,
+      });
+      if (!ok) return { ok: false, focused: false };
+      currentRoute = route;
+      state.route = route.hash;
+      if (route.def.analysis) state.analysis_id = route.def.analysis;
+      renderRoute(route);
+      renderContext();
+      applyRouteControls(route);
+      restorePanels();
+      if (route.def.page === 'jobs' && state.selected_job_id && window.Jobs &&
+          typeof window.Jobs.selectById === 'function') {
+        const selectedJob = await window.Jobs.selectById(state.selected_job_id);
+        if (selectedJob === false) state.selected_job_id = '';
+        if (generation !== routeGeneration) {
+          return { ok: false, focused: false, superseded: true };
+        }
+      }
+      closeNav();
+      const restoreY = options.restoreScroll ? Number(state.scroll[route.hash] || 0) : 0;
+      requestAnimationFrame(() => {
+        window.scrollTo({ top: restoreY, left: 0, behavior: 'auto' });
+        focusPageHeading(route, options.source || 'route');
+        renderCompactActions();
+      });
+      const focused = await VCS.focusNavigationTarget({
+        focusJobDir: options.focusJobDir,
+        focusSelector: options.focusSelector || route.def.focus,
+      });
+      if (generation !== routeGeneration) {
+        return { ok: false, focused: false, superseded: true };
+      }
+      persistLocal({ remote: options.persist !== false });
+      document.dispatchEvent(new CustomEvent('vcs:route', {
+        detail: { id: route.id, area: route.def.area, page: route.def.page,
+          hash: route.hash, params: route.params, query: route.query },
+      }));
+      return { ok: true, focused };
+    } finally { /* generation 让最后一次导航获胜，无需全局互斥锁 */ }
+  }
+
+  function applyRoute(route, options = {}) {
+    const generation = ++routeGeneration;
+    const run = () => applyRouteNow(route, Object.assign({}, options, { generation }));
+    const task = routeApplyTail.then(run, run);
+    routeApplyTail = task.catch(() => undefined);
+    return task;
+  }
+
+  function queueNavigation(operation) {
+    const task = navigationTail.then(operation, operation);
+    navigationTail = task.catch(() => undefined);
+    return task;
+  }
+
+  async function performNavigateRoute(id, options = {}) {
+    const locationIntent = Number.isSafeInteger(options.locationIntent)
+      ? options.locationIntent : locationIntentGeneration;
+    const def = ROUTES[id];
+    if (!def) return { ok: false, focused: false };
+    const hash = routeHash(id, options);
+    const route = parseRoute(hash);
+    if (!route) return { ok: false, focused: false };
+    if (!routeCanApply(route)) {
+      VCS.toast('当前模式或项目上下文无法打开此页面', 'fail');
+      return { ok: false, focused: false, blocked: true };
+    }
+    if (!options.force && currentRoute && route.hash !== currentRoute.hash) {
+      const allowed = await guardUnsaved(options.reason || '切换页面');
+      if (!allowed) return { ok: false, focused: false, cancelled: true };
+      if (locationIntent !== locationIntentGeneration) {
+        return { ok: false, focused: false, superseded: true };
+      }
+    }
+    saveCurrentScroll();
+    const out = await applyRoute(route, Object.assign({}, options, {
+      source: options.source || 'navigate',
+    }));
+    if (locationIntent !== locationIntentGeneration) {
+      return { ok: false, focused: false, superseded: true };
+    }
+    if (!out || !out.ok) return out || { ok: false, focused: false };
+    if (options.replace) {
+      history.replaceState({ vcsRoute: route.id, vcsIndex: historyIndex }, '', route.hash);
+    }
+    else if (window.location.hash !== route.hash) {
+      historyIndex += 1;
+      history.pushState({ vcsRoute: route.id, vcsIndex: historyIndex }, '', route.hash);
+    }
+    return out;
+  }
+
+  function navigateRoute(id, options = {}) {
+    const locationIntent = locationIntentGeneration;
+    return queueNavigation(() => performNavigateRoute(
+      id, Object.assign({}, options, { locationIntent })));
+  }
+
+  async function navigateLegacy(page, options = {}) {
+    const name = String(page || '');
+    const routeId = LEGACY_ROUTE[name];
+    if (routeId === 'assistant') {
+      const opened = workspace.assistant.open(null);
+      return { ok: !!opened, focused: !!opened };
+    }
+    if (!routeId) return { ok: false, focused: false };
+    return navigateRoute(routeId, options);
+  }
+
+  function renderDirty() {
+    const chip = document.getElementById('workspace-dirty');
+    if (!chip) return;
+    const count = dirtyScopes.size;
+    chip.hidden = !count;
+    chip.textContent = count ? `未保存 ${count}` : '';
+    chip.setAttribute('aria-label', count ? `${count} 处内容尚未保存` : '没有未保存内容');
+  }
+
+  VCS.unsaved = {
+    mark(scope, label = '当前编辑') {
+      const key = safeToken(scope) || 'workspace';
+      dirtyScopes.set(key, { label: String(label || '当前编辑').slice(0, 120), at: Date.now() });
+      renderDirty();
+      document.dispatchEvent(new CustomEvent('vcs:unsaved', {
+        detail: { dirty: true, count: dirtyScopes.size },
+      }));
+    },
+    clear(scope) {
+      if (scope) dirtyScopes.delete(safeToken(scope)); else dirtyScopes.clear();
+      renderDirty();
+      document.dispatchEvent(new CustomEvent('vcs:unsaved', {
+        detail: { dirty: dirtyScopes.size > 0, count: dirtyScopes.size },
+      }));
+      resolveRemoteDirtyHold();
+    },
+    isDirty() { return dirtyScopes.size > 0; },
+    scopes() { return Array.from(dirtyScopes.keys()); },
+    confirm: guardUnsaved,
+  };
+
+  function renderContext() {
+    const projectSelect = document.getElementById('workspace-project');
+    if (projectSelect) {
+      const previous = projectSelect.value;
+      const signature = projects.map(project =>
+        `${project.id}\u0000${project.name}\u0000${project.n_done}/${project.n_members}`).join('\u0001');
+      if (projectSelect.dataset.optionsSignature !== signature) {
+        projectSelect.innerHTML = '<option value="">未选择项目</option>' + projects.map(project =>
+          `<option value="${VCS.esc(project.id)}">${VCS.esc(project.name || '未命名项目')} · ` +
+          `${VCS.esc(project.n_done)}/${VCS.esc(project.n_members)}</option>`).join('');
+        projectSelect.dataset.optionsSignature = signature;
+      }
+      const wanted = selectedProject && selectedProject.id || state.project_id || previous;
+      if (projects.some(project => project.id === wanted)) projectSelect.value = wanted;
+      else projectSelect.value = '';
+    }
+    const engine = document.getElementById('workspace-engine');
+    if (engine) {
+      const key = String(VCS.activeEngine || 'vasp').toUpperCase();
+      engine.textContent = key;
+      engine.title = '当前生成意图的计算引擎；不改写已有作业事实';
+    }
+    const task = document.getElementById('workspace-task');
+    if (task) {
+      task.textContent = VCS.activeCalculation || '未选择任务';
+      task.title = '当前生成意图；项目成员可以包含不同实际任务类型';
+    }
+    const stage = document.getElementById('workspace-stage');
+    if (stage) {
+      const value = selectedProject && selectedProject.stage;
+      stage.textContent = value ? `阶段 ${value}` : (selectedProject ? '阶段未知' : '未选择项目');
+      stage.classList.toggle('warn', !!(selectedProject && selectedProject.needs_human));
+    }
+    renderActivity();
+    renderDirty();
+  }
+
+  function normalizeProjectRows(rows, pipelineRows) {
+    const pipelineByPath = new Map((pipelineRows || []).map(row => [String(row.path || ''), row]));
+    return (rows || []).map((row, index) => {
+      const path = String(row.path || '');
+      const progress = pipelineByPath.get(path) || {};
+      let id = safeToken(row.id || row.project_id || row.project_uuid, PROJECT_TOKEN);
+      if (!id) id = `legacy-${index + 1}`;
+      return {
+        id,
+        name: String(row.name || ''),
+        path,
+        n_members: Number(progress.total != null ? progress.total : row.n_members || 0),
+        n_done: Number(progress.done != null ? progress.done : row.n_done || 0),
+        stage: String(progress.stage || row.stage || ''),
+        needs_human: !!(progress.needs_human || row.needs_human),
+      };
+    });
+  }
+
+  async function syncLegacyProjectSelection() {
+    if (!selectedProject || !window.Project) return true;
+    const current = typeof window.Project.current === 'function'
+      ? window.Project.current() : null;
+    const currentId = safeToken(current &&
+      (current.project_id || current.id || current.project_uuid), PROJECT_TOKEN);
+    if (currentId === selectedProject.id) return true;
+    try {
+      if (typeof window.Project.selectById === 'function') {
+        return !!(await window.Project.selectById(selectedProject.id));
+      }
+      if (selectedProject.path && typeof window.Project.selectByPath === 'function') {
+        return !!(await window.Project.selectByPath(selectedProject.path));
+      }
+    } catch (_) { return false; }
+    return false;
+  }
+
+  function remotePreferences(out) {
+    const selection = plainObject(out && out.selection);
+    const restore = plainObject(out && out.restore);
+    const preferences = plainObject(out && out.preferences);
+    const storedRoute = plainObject(preferences.route);
+    return normalizeState({
+      route: selection.route_hash || storedRoute.hash || '#/home',
+      current_project_id: selection.project_id || preferences.current_project_id,
+      current_analysis_id: selection.analysis_id || preferences.current_analysis_id,
+      selected_job_id: selection.job_id || preferences.selected_job_id,
+      panels: restore.panels || preferences.panels,
+      filters: restore.filters || preferences.filters,
+      sort: restore.sort || preferences.sort,
+      scroll: restore.scroll || preferences.scroll,
+      draft_refs: restore.draft_refs || preferences.draft_refs,
+      updated_at_ms: 0,
+    });
+  }
+
+  async function refreshWorkspaceContext() {
+    const refreshGeneration = ++contextRefreshGeneration;
+    let adoptedRemoteRoute = false;
+    lastContextRefreshAt = Date.now();
+    if (remoteSaveInFlight) await remoteSaveInFlight;
+    if (refreshGeneration !== contextRefreshGeneration) return;
+    let aggregated = null;
+    try { aggregated = await VCS.call('workspace_context'); } catch (_) { aggregated = null; }
+    if (!aggregated || aggregated.error === '桥方法不存在:workspace_context') {
+      try { aggregated = await VCS.call('workspace_context_get'); } catch (_) { aggregated = null; }
+    }
+    if (refreshGeneration !== contextRefreshGeneration) return;
+    if (aggregated && aggregated.ok) {
+      const serverRevision = Math.max(0,
+        Number(aggregated.state_revision || aggregated.revision || 0) || 0);
+      if (serverRevision < revision) return;
+      const remote = remotePreferences(aggregated);
+      const localBaseRevision = Math.max(0, Number(state.server_revision || 0) || 0);
+      const shouldAdoptRemote = remoteSaveBlocked || state.updated_at_ms <= 0 ||
+        localBaseRevision !== serverRevision;
+      if (shouldAdoptRemote) {
+        const localInteraction = state;
+        const preserveDirtyInteraction = dirtyScopes.size > 0;
+        const localDraftRefs = plainObject(state.draft_refs);
+        state = remote;
+        // Draft bodies remain local-only.  Keep their references while adopting
+        // the server snapshot so CAS never pairs a fresh revision with stale UI state.
+        state.draft_refs = Object.assign({}, plainObject(remote.draft_refs), localDraftRefs);
+        if (preserveDirtyInteraction) {
+          state.route = currentRoute ? currentRoute.hash : localInteraction.route;
+          state.project_id = localInteraction.project_id;
+          state.analysis_id = localInteraction.analysis_id;
+          state.selected_job_id = localInteraction.selected_job_id;
+          state.panels = localInteraction.panels;
+          state.filters = localInteraction.filters;
+          state.sort = localInteraction.sort;
+          state.scroll = localInteraction.scroll;
+        } else if (initialHashWasExplicit && currentRoute) {
+          state.route = currentRoute.hash;
+          const explicitProject = routeProject(currentRoute);
+          if (explicitProject && explicitProject !== 'current') state.project_id = explicitProject;
+        }
+        state.server_revision = serverRevision;
+        state.updated_at_ms = Date.now();
+        remoteSaveRequested = false;
+        persistLocal({ remote: false, touch: false });
+        remoteDirtyHold = preserveDirtyInteraction;
+        adoptedRemoteRoute = !preserveDirtyInteraction && !initialHashWasExplicit;
+      } else {
+        state.server_revision = serverRevision;
+      }
+      revision = serverRevision;
+      remoteSaveBlocked = remoteDirtyHold;
+      projects = normalizeProjectRows(aggregated.projects || [], []);
+    } else {
+      const [listed, pipeline] = await Promise.all([
+        VCS.call('proj_list'), VCS.call('pipeline_status'),
+      ]);
+      if (refreshGeneration !== contextRefreshGeneration) return;
+      projects = normalizeProjectRows((listed && listed.projects) || [],
+        (pipeline && pipeline.projects) || []);
+    }
+
+    const selectionRoute = adoptedRemoteRoute ? parseRoute(state.route) : currentRoute;
+    const targetId = routeProject(selectionRoute) || state.project_id;
+    if (targetId && targetId !== 'current') {
+      selectedProject = projects.find(project => project.id === targetId) || null;
+      if (!selectedProject && projects.length && isProjectRoute(selectionRoute)) {
+        if (dirtyScopes.size) {
+          VCS.toast('当前项目已移动、删除或未注册；请先处理未保存内容', 'fail');
+        } else {
+          VCS.toast('深链接中的项目已移动、删除或未注册，已返回首页', 'fail');
+          state.project_id = '';
+          await navigateRoute('home', { replace: true, force: true, source: 'missing-project' });
+        }
+      }
+    } else if (state.project_id) {
+      selectedProject = projects.find(project => project.id === state.project_id) || null;
+    }
+    if (!selectedProject && !state.project_id && projects.length) {
+      // 首次进入不替用户暗选最后项目；上下文栏保持明确“未选择”。
+      selectedProject = null;
+    }
+    if (selectedProject) await syncLegacyProjectSelection();
+    if (refreshGeneration !== contextRefreshGeneration) return;
+    renderContext();
+    updateRouteLinks();
+    if (!initialHashWasExplicit && state.route && state.route !== window.location.hash) {
+      const restored = parseRoute(state.route);
+      if (restored) {
+        const applied = await applyRoute(restored, {
+          source: 'restore', restoreScroll: true, persist: false,
+        });
+        if (applied && applied.ok) {
+          history.replaceState(
+            { vcsRoute: restored.id, vcsIndex: historyIndex }, '', restored.hash);
+        }
+      }
+    }
+    if (initialHashWasExplicit) {
+      initialHashWasExplicit = false;
+      persistLocal();
+    }
+  }
+
+  function scheduleContextRefresh() {
+    if (contextRefreshTimer) return;
+    const remaining = Math.max(0, 15000 - (Date.now() - lastContextRefreshAt));
+    contextRefreshTimer = setTimeout(async () => {
+      contextRefreshTimer = null;
+      await refreshWorkspaceContext();
+    }, remaining);
+  }
+
+  function renderActivity() {
+    const list = document.getElementById('activity-list');
+    const toggle = document.getElementById('activity-toggle');
+    const events = VCS.pipeline && Array.isArray(VCS.pipeline.events) ? VCS.pipeline.events : [];
+    const runtime = VCS.pipeline && VCS.pipeline.runtime || {};
+    const blockers = projects.filter(project => project.needs_human).length;
+    const errors = events.filter(event => event.kind === 'error').length;
+    const count = blockers + errors + (runtime.tick_running ? 1 : 0);
+    if (toggle) {
+      const badge = toggle.querySelector('[data-activity-count]');
+      if (badge) { badge.textContent = String(count); badge.hidden = !count; }
+      toggle.setAttribute('aria-label', count ? `活动中心，${count} 项需关注` : '活动中心，没有待处理提醒');
+    }
+    if (!list) return;
+    if (!events.length) {
+      list.innerHTML = '<div class="workspace-empty">本次会话暂无后台活动。作业状态史与报告证据仍保存在各自项目中。</div>';
+      return;
+    }
+    const labels = { refresh: '同步', continue: '续算', fetch: '下载', report_done: '报告',
+      report_blocked: '报告阻断', skip: '跳过', error: '错误' };
+    list.innerHTML = events.slice(0, 40).map(event => {
+      const severity = event.kind === 'error' ? 'error'
+        : event.kind === 'report_done' ? 'success' : 'info';
+      return `<div class="activity-item ${severity}"><span class="activity-kind">${VCS.esc(labels[event.kind] || event.kind || '活动')}</span>` +
+        `<div><b>${VCS.esc(event.project || event.cluster || '工作区')}</b>` +
+        `<p>${VCS.esc(event.text || '')}</p></div><time>${VCS.esc(event.time || '')}</time></div>`;
+    }).join('');
+  }
+
+  function focusableIn(container) {
+    return Array.from(container.querySelectorAll(
+      'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),' +
+      'textarea:not([disabled]),[tabindex]:not([tabindex="-1"])'))
+      .filter(el => !el.hidden && el.getAttribute('aria-hidden') !== 'true');
+  }
+
+  function trapDrawerFocus(event, drawer, close) {
+    if (event.key === 'Escape') { event.preventDefault(); close(); return; }
+    if (event.key !== 'Tab') return;
+    const items = focusableIn(drawer);
+    if (!items.length) { event.preventDefault(); drawer.focus(); return; }
+    const first = items[0]; const last = items[items.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault(); last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault(); first.focus();
+    }
+  }
+
+  function openNav(trigger) {
+    const nav = document.getElementById('shell-nav');
+    const backdrop = document.getElementById('nav-backdrop');
+    const button = document.getElementById('nav-toggle');
+    if (!nav || window.matchMedia('(min-width: 960px)').matches) return false;
+    navReturnFocus = trigger || document.activeElement;
+    nav.classList.add('open');
+    // WebView/background tabs may throttle CSS transitions indefinitely;
+    // the inline target keeps the drawer immediately operable and is removed on close.
+    nav.style.transition = 'none';
+    nav.style.transform = 'translateX(0)';
+    nav.removeAttribute('inert');
+    nav.inert = false;
+    nav.setAttribute('aria-hidden', 'false');
+    if (backdrop) backdrop.hidden = false;
+    if (button) button.setAttribute('aria-expanded', 'true');
+    document.body.classList.add('drawer-open');
+    document.body.classList.add('nav-open');
+    const first = nav.querySelector('a.on') || nav.querySelector('a,button');
+    if (first) first.focus();
+    return true;
+  }
+
+  function closeNav() {
+    const nav = document.getElementById('shell-nav');
+    const backdrop = document.getElementById('nav-backdrop');
+    const button = document.getElementById('nav-toggle');
+    if (!nav) return;
+    const wasOpen = nav.classList.contains('open');
+    nav.classList.remove('open');
+    if (window.matchMedia('(max-width: 959px)').matches) {
+      nav.style.transition = 'none';
+      nav.style.transform = 'translateX(-105%)';
+      nav.setAttribute('aria-hidden', 'true');
+      nav.setAttribute('inert', '');
+      nav.inert = true;
+    } else {
+      nav.style.removeProperty('transition');
+      nav.style.removeProperty('transform');
+      nav.removeAttribute('aria-hidden');
+      nav.removeAttribute('inert');
+      nav.inert = false;
+    }
+    if (backdrop) backdrop.hidden = true;
+    if (button) button.setAttribute('aria-expanded', 'false');
+    document.body.classList.remove('drawer-open');
+    document.body.classList.remove('nav-open');
+    if (wasOpen && navReturnFocus && navReturnFocus.isConnected) navReturnFocus.focus();
+    navReturnFocus = null;
+  }
+
+  function openActivity(trigger) {
+    const drawer = document.getElementById('activity-drawer');
+    const backdrop = document.getElementById('activity-backdrop');
+    if (!drawer) return false;
+    activityReturnFocus = trigger || document.activeElement;
+    drawer.hidden = false;
+    drawer.classList.add('open');
+    drawer.setAttribute('aria-hidden', 'false');
+    if (backdrop) backdrop.hidden = false;
+    const button = document.getElementById('activity-toggle');
+    if (button) button.setAttribute('aria-expanded', 'true');
+    renderActivity();
+    const close = document.getElementById('activity-close');
+    (close || drawer).focus();
+    return true;
+  }
+
+  function closeActivity() {
+    const drawer = document.getElementById('activity-drawer');
+    const backdrop = document.getElementById('activity-backdrop');
+    if (!drawer || drawer.hidden) return;
+    drawer.classList.remove('open'); drawer.hidden = true;
+    drawer.setAttribute('aria-hidden', 'true');
+    if (backdrop) backdrop.hidden = true;
+    const button = document.getElementById('activity-toggle');
+    if (button) button.setAttribute('aria-expanded', 'false');
+    if (activityReturnFocus && activityReturnFocus.isConnected) activityReturnFocus.focus();
+    activityReturnFocus = null;
+  }
+
+  function openAssistant(trigger) {
+    const drawer = document.getElementById('page-ai');
+    const backdrop = document.getElementById('assistant-backdrop');
+    const gate = document.getElementById('assistant-toggle');
+    if ((gate && gate.hasAttribute('data-scene-hidden')) ||
+        (VCS.scenario && typeof VCS.sceneVisible === 'function' &&
+          !VCS.sceneVisible(VCS.scenario, 'pages.ai'))) {
+      VCS.toast('当前工作模式未启用上下文助手', 'fail');
+      return false;
+    }
+    if (!drawer) return false;
+    assistantReturnFocus = trigger || document.activeElement;
+    drawer.hidden = false;
+    drawer.classList.add('open');
+    drawer.setAttribute('role', 'dialog');
+    drawer.setAttribute('aria-modal', 'true');
+    drawer.setAttribute('aria-label', '项目上下文助手');
+    if (backdrop) backdrop.hidden = false;
+    const button = document.getElementById('assistant-toggle');
+    if (button) button.setAttribute('aria-expanded', 'true');
+    document.body.classList.add('assistant-open');
+    document.dispatchEvent(new CustomEvent('vcs:page', {
+      detail: { page: 'ai', overlay: true, source: 'assistant-drawer' },
+    }));
+    let close = drawer.querySelector('[data-assistant-close]');
+    if (!close) {
+      close = document.createElement('button');
+      close.type = 'button'; close.className = 'btn quiet assistant-close';
+      close.dataset.assistantClose = '1'; close.textContent = '关闭助手';
+      drawer.insertBefore(close, drawer.firstChild);
+      close.addEventListener('click', closeAssistant);
+    }
+    close.focus();
+    return true;
+  }
+
+  function closeAssistant() {
+    const drawer = document.getElementById('page-ai');
+    const backdrop = document.getElementById('assistant-backdrop');
+    if (!drawer || drawer.hidden) return;
+    drawer.classList.remove('open'); drawer.hidden = true;
+    if (backdrop) backdrop.hidden = true;
+    const button = document.getElementById('assistant-toggle');
+    if (button) button.setAttribute('aria-expanded', 'false');
+    document.body.classList.remove('assistant-open');
+    if (assistantReturnFocus && assistantReturnFocus.isConnected) assistantReturnFocus.focus();
+    assistantReturnFocus = null;
+  }
+
+  function renderCompactActions() {
+    const bar = document.getElementById('compact-actions');
+    if (!bar) return;
+    bar.innerHTML = '';
+    const section = document.querySelector(
+      'main section[data-page]:not([data-shell-assistant]):not([hidden])');
+    if (!section) return;
+    const actions = Array.from(section.querySelectorAll(
+      '.actions .btn.primary:not([disabled]), .pagebar .btn.primary:not([disabled]), ' +
+      '.start-actions .start-action.primary:not([disabled])'))
+      .filter(button => {
+        if (button.closest('#compact-actions')) return false;
+        if (button.closest('[hidden],[aria-hidden="true"],[data-scene-hidden],'
+          + '[data-engine-hidden],[data-task-hidden],.acc[data-open="0"]')) return false;
+        const style = typeof window.getComputedStyle === 'function'
+          ? window.getComputedStyle(button) : null;
+        return !style || (style.display !== 'none' && style.visibility !== 'hidden');
+      }).slice(0, 3);
+    actions.forEach(original => {
+      const button = document.createElement('button');
+      button.type = 'button'; button.className = 'btn primary';
+      button.textContent = (original.textContent || original.getAttribute('aria-label') || '执行').trim();
+      button.addEventListener('click', () => original.click());
+      bar.appendChild(button);
+    });
+    bar.hidden = !actions.length;
+  }
+
+  async function requestProjectSwitch(projectId, apply) {
+    const generation = ++projectSwitchGeneration;
+    const id = safeToken(projectId, PROJECT_TOKEN);
+    if (id === state.project_id) {
+      if (typeof apply === 'function') {
+        const applied = await apply();
+        if (applied === false || generation !== projectSwitchGeneration) return false;
+      }
+      return true;
+    }
+    const allowed = await guardUnsaved('切换项目');
+    if (!allowed || generation !== projectSwitchGeneration) return false;
+    if (!id) {
+      if (typeof apply === 'function') {
+        const applied = await apply(null);
+        if (applied === false || generation !== projectSwitchGeneration) return false;
+      }
+      selectedProject = null;
+      state.project_id = '';
+      state.selected_job_id = '';
+      state.analysis_id = '';
+      state.filters = {};
+      state.sort = {};
+      persistLocal(); renderContext(); updateRouteLinks();
+      document.dispatchEvent(new CustomEvent('vcs:workspace-project', {
+        detail: { id: '', project_id: '', cleared: true },
+      }));
+      if (currentRoute && isProjectRoute(currentRoute)) {
+        await navigateRoute('home', { replace: true, force: true, source: 'project-clear' });
+      }
+      return true;
+    }
+    const hit = projects.find(project => project.id === id);
+    if (!hit) return false;
+    if (typeof apply === 'function') {
+      const applied = await apply(hit);
+      if (applied === false || generation !== projectSwitchGeneration) return false;
+    }
+    selectedProject = hit; state.project_id = id;
+    state.selected_job_id = ''; state.analysis_id = '';
+    state.filters = {}; state.sort = {};
+    persistLocal(); renderContext(); updateRouteLinks();
+    document.dispatchEvent(new CustomEvent('vcs:workspace-project', {
+      detail: Object.assign({}, hit),
+    }));
+    if (currentRoute && isProjectRoute(currentRoute)) {
+      await navigateRoute(currentRoute.id, { replace: true, force: true, projectId: id,
+        query: currentRoute.query, source: 'project-switch' });
+    }
+    return true;
+  }
+
+  const drafts = {
+    save(id, text, metadata = {}) {
+      const key = safeToken(id);
+      if (!key) throw new Error('草稿标识无效');
+      const body = String(text || '');
+      if (body.length > MAX_DRAFT_CHARS) throw new Error('草稿超过 64 KiB，请先保存到项目文件');
+      const record = { schema: 'vcstudio.unverified-draft/v1', id: key, text: body,
+        project_id: state.project_id || null, route: state.route,
+        updated_at_ms: Date.now(), metadata: smallRecord(metadata, 20) };
+      localStorage.setItem(DRAFT_PREFIX + key, JSON.stringify(record));
+      state.draft_refs[key] = { project_id: record.project_id, route: record.route,
+        updated_at_ms: record.updated_at_ms, dirty: true, status: 'unverified_draft',
+        size: body.length };
+      VCS.unsaved.mark('draft-' + key, metadata.label || '未完成草稿');
+      persistLocal();
+      return record;
+    },
+    load(id) {
+      const key = safeToken(id);
+      if (!key) return null;
+      try { return JSON.parse(localStorage.getItem(DRAFT_PREFIX + key) || 'null'); }
+      catch (_) { return null; }
+    },
+    remove(id) {
+      const key = safeToken(id); if (!key) return;
+      localStorage.removeItem(DRAFT_PREFIX + key);
+      delete state.draft_refs[key];
+      VCS.unsaved.clear('draft-' + key);
+      persistLocal();
+    },
+  };
+
+  function restoreCommittedLocation(route = currentRoute) {
+    const fallback = route || parseRoute(state.route) || parseRoute('#/home');
+    if (fallback) history.replaceState(
+      { vcsRoute: fallback.id, vcsIndex: historyIndex }, '', fallback.hash);
+  }
+
+  function restoreExternalLocation(source, targetIndex, route = currentRoute) {
+    if (source === 'popstate' && Number.isSafeInteger(targetIndex) &&
+        targetIndex !== historyIndex) {
+      historyCompensation = { hash: route && route.hash, index: historyIndex };
+      history.go(historyIndex - targetIndex);
+      return;
+    }
+    if ((source === 'hashchange' || source === 'popstate') && targetIndex === null && route) {
+      // A manually assigned hash creates a new, unindexed entry.  Remove that
+      // entry instead of replacing it with a duplicate of the current route.
+      historyCompensation = { hash: route.hash, index: historyIndex };
+      history.back();
+      return;
+    }
+    restoreCommittedLocation(route);
+  }
+
+  function handleExternalNavigation(source, event) {
+    const requestedHash = window.location.hash;
+    const eventIndex = Number(event && event.state && event.state.vcsIndex);
+    const targetIndex = Number.isSafeInteger(eventIndex) ? eventIndex : null;
+    if (historyCompensation && requestedHash === historyCompensation.hash &&
+        (targetIndex === null || targetIndex === historyCompensation.index)) {
+      locationIntentGeneration += 1;
+      historyCompensation = null;
+      return Promise.resolve({ ok: false, compensated: true });
+    }
+    if (externalNavigationPromise && externalNavigationHash === requestedHash) {
+      return externalNavigationPromise;
+    }
+    const locationIntent = ++locationIntentGeneration;
+    externalNavigationHash = requestedHash;
+    const task = queueNavigation(async () => {
+      if (locationIntent !== locationIntentGeneration || window.location.hash !== requestedHash) {
+        return { ok: false, superseded: true };
+      }
+      const route = parseRoute(requestedHash);
+      if (!route) {
+        restoreExternalLocation(source, targetIndex);
+        VCS.toast('链接无效，已保留当前页面', 'fail');
+        return { ok: false, blocked: true };
+      }
+      if (currentRoute && route.hash === currentRoute.hash) {
+        if (targetIndex !== null) historyIndex = targetIndex;
+        history.replaceState(
+          { vcsRoute: route.id, vcsIndex: historyIndex }, '', route.hash);
+        return { ok: true, unchanged: true };
+      }
+      if (!routeCanApply(route)) {
+        restoreExternalLocation(source, targetIndex);
+        VCS.toast('链接指向的页面在当前模式或项目上下文中不可用', 'fail');
+        return { ok: false, blocked: true };
+      }
+      const allowed = await guardUnsaved('返回到其他页面');
+      if (locationIntent !== locationIntentGeneration || window.location.hash !== requestedHash) {
+        return { ok: false, superseded: true };
+      }
+      if (!allowed) {
+        restoreExternalLocation(source, targetIndex);
+        return { ok: false, cancelled: true };
+      }
+      const previous = currentRoute;
+      saveCurrentScroll();
+      const out = await applyRoute(route, { source: source || 'history', restoreScroll: true });
+      if (locationIntent !== locationIntentGeneration || window.location.hash !== requestedHash) {
+        return { ok: false, superseded: true };
+      }
+      if (!out || !out.ok) {
+        restoreExternalLocation(source, targetIndex, previous);
+        return out || { ok: false };
+      }
+      // The browser already moved to this history entry.  Only attach canonical
+      // state after the route itself succeeds; never leave a new hash on old UI.
+      if (targetIndex !== null) historyIndex = targetIndex;
+      else historyIndex += 1;
+      history.replaceState(
+        { vcsRoute: route.id, vcsIndex: historyIndex }, '', route.hash);
+      return out;
+    });
+    externalNavigationPromise = task.catch(() => ({ ok: false })).finally(() => {
+      if (externalNavigationHash === requestedHash) {
+        externalNavigationPromise = null;
+        externalNavigationHash = '';
+      }
+    });
+    return externalNavigationPromise;
+  }
+
+  function wireShell() {
+    document.addEventListener('click', async event => {
+      const skip = event.target.closest && event.target.closest('.skip-link[href="#workspace-main"]');
+      if (skip) {
+        event.preventDefault();
+        const main = document.getElementById('workspace-main');
+        if (main) {
+          if (typeof main.scrollIntoView === 'function') main.scrollIntoView({ block: 'start' });
+          main.focus();
+        }
+        return;
+      }
+      const routeLink = event.target.closest && event.target.closest('a[data-route]');
+      if (routeLink) {
+        event.preventDefault();
+        const linkedRoute = parseRoute(routeLink.hash || routeLink.getAttribute('href'));
+        const query = linkedRoute ? linkedRoute.query : {};
+        await navigateRoute(routeLink.dataset.route, { query, source: 'navigation' });
+        return;
+      }
+      const toggle = event.target.closest && event.target.closest('#nav-toggle');
+      if (toggle) { event.preventDefault(); openNav(toggle); return; }
+      if (event.target.closest && event.target.closest('#nav-close')) { closeNav(); return; }
+      if (event.target.closest && event.target.closest('#nav-backdrop')) { closeNav(); return; }
+      const activity = event.target.closest && event.target.closest('#activity-toggle');
+      if (activity) { event.preventDefault(); openActivity(activity); return; }
+      if (event.target.closest && event.target.closest('#activity-close')) { closeActivity(); return; }
+      if (event.target.closest && event.target.closest('#activity-backdrop')) { closeActivity(); return; }
+      const assistant = event.target.closest && event.target.closest('#assistant-toggle');
+      if (assistant) { event.preventDefault(); openAssistant(assistant); return; }
+      if (event.target.closest && event.target.closest('#assistant-backdrop')) closeAssistant();
+    });
+
+    const project = document.getElementById('workspace-project');
+    if (project) project.addEventListener('change', async () => {
+      const previous = state.project_id;
+      const wanted = project.value;
+      const ok = await requestProjectSwitch(wanted, async hit => {
+        if (hit && hit.path && window.Project && typeof window.Project.selectByPath === 'function') {
+          await window.Project.selectByPath(hit.path);
+        }
+      });
+      if (!ok) project.value = previous;
+    });
+
+    const nav = document.getElementById('shell-nav');
+    if (nav) nav.addEventListener('keydown', event => {
+      if (nav.classList.contains('open')) trapDrawerFocus(event, nav, closeNav);
+    });
+    const activityDrawer = document.getElementById('activity-drawer');
+    if (activityDrawer) activityDrawer.addEventListener('keydown', event =>
+      trapDrawerFocus(event, activityDrawer, closeActivity));
+    const assistantDrawer = document.getElementById('page-ai');
+    if (assistantDrawer) assistantDrawer.addEventListener('keydown', event =>
+      trapDrawerFocus(event, assistantDrawer, closeAssistant));
+
+    window.addEventListener('beforeunload', event => {
+      if (!dirtyScopes.size) return;
+      event.preventDefault(); event.returnValue = '';
+    });
+    window.addEventListener('scroll', () => {
+      if (scrollTimer) clearTimeout(scrollTimer);
+      scrollTimer = setTimeout(saveCurrentScroll, 300);
+    }, { passive: true });
+    window.addEventListener('resize', () => {
+      const nav = document.getElementById('shell-nav');
+      if (window.matchMedia('(min-width: 960px)').matches ||
+          (nav && !nav.classList.contains('open'))) closeNav();
+      renderCompactActions();
+    });
+    window.addEventListener('popstate', event => handleExternalNavigation('popstate', event));
+    window.addEventListener('hashchange', event => handleExternalNavigation('hashchange', event));
+
+    document.addEventListener('change', event => {
+      const target = event.target;
+      if (!target || !target.id) return;
+      if (target.id === 'analysis-type') {
+        state.analysis_id = safeToken(target.value);
+      } else if (target.id === 'jf-cluster') {
+        state.filters.job_cluster = String(target.value || '').slice(0, 160);
+      } else if (target.id === 'jf-status') {
+        state.filters.job_status = String(target.value || '').slice(0, 80);
+      } else if (target.id === 'jf-sort') {
+        state.sort.jobs = String(target.value || '').slice(0, 80);
+      } else return;
+      persistLocal();
+    });
+    document.addEventListener('input', event => {
+      const target = event.target;
+      if (!target || !target.matches || !target.matches('[data-workspace-draft]')) return;
+      VCS.unsaved.mark(target.getAttribute('data-workspace-draft') || target.id || 'draft',
+        target.getAttribute('data-dirty-label') || '当前草稿');
+    });
+    document.addEventListener('click', event => {
+      const header = event.target.closest && event.target.closest('[data-acc]>.acc-h');
+      if (!header) return;
+      requestAnimationFrame(() => {
+        const card = header.closest('[data-acc]');
+        const key = safeToken(card && card.getAttribute('data-acc'));
+        if (!key) return;
+        state.panels[key] = card.getAttribute('data-open') === '1';
+        persistLocal();
+      });
+    });
+
+    document.addEventListener('vcs:scenario', () => {
+      if (currentRoute) renderRoute(currentRoute);
+      renderContext();
+    });
+    document.addEventListener('vcs:engine', renderContext);
+    document.addEventListener('vcs:calculation', renderContext);
+    document.addEventListener('vcs:pipeline-runtime', () => {
+      renderContext(); renderActivity(); scheduleContextRefresh();
+    });
+    document.addEventListener('vcs:pipeline-events', () => {
+      renderActivity(); scheduleContextRefresh();
+    });
+    document.addEventListener('vcs:project-context', event => {
+      const detail = plainObject(event.detail);
+      const id = safeToken(detail.id || detail.project_id || detail.project_uuid, PROJECT_TOKEN);
+      if (!id) return;
+      const hit = projects.find(project => project.id === id);
+      if (hit) {
+        if (state.project_id !== id) state.selected_job_id = '';
+        Object.assign(hit, detail);
+        selectedProject = hit; state.project_id = id; persistLocal(); renderContext(); updateRouteLinks();
+      }
+    });
+    document.addEventListener('vcs:job-context', async event => {
+      const detail = plainObject(event.detail);
+      const id = safeToken(detail.id || detail.job_id || detail.job_uuid, JOB_TOKEN);
+      if (!id) {
+        if (detail.clear === true || detail.cleared === true || detail.id === null) {
+          if (!pendingJobProjectSwitch) jobContextGeneration += 1;
+          state.selected_job_id = '';
+          persistLocal();
+          renderContext();
+        }
+        return;
+      }
+      const generation = ++jobContextGeneration;
+      const jobProjectId = safeToken(detail.project_id, PROJECT_TOKEN);
+      if (jobProjectId && jobProjectId !== state.project_id) {
+        const pending = { generation, id, project_id: jobProjectId };
+        pendingJobProjectSwitch = pending;
+        const switched = await requestProjectSwitch(jobProjectId, async hit => {
+          if (!hit || !hit.path || !window.Project ||
+              typeof window.Project.selectByPath !== 'function') return true;
+          return window.Project.selectByPath(hit.path);
+        });
+        if (generation !== jobContextGeneration || pendingJobProjectSwitch !== pending) return;
+        if (!switched) {
+          pendingJobProjectSwitch = null;
+          if (window.Jobs && typeof window.Jobs.clearSelection === 'function') {
+            window.Jobs.clearSelection();
+          }
+          state.selected_job_id = '';
+          persistLocal(); renderContext();
+          return;
+        }
+        if (window.Jobs && typeof window.Jobs.selectById === 'function') {
+          const selected = await window.Jobs.selectById(id);
+          if (selected === false && generation === jobContextGeneration) {
+            if (typeof window.Jobs.clearSelection === 'function') window.Jobs.clearSelection();
+            state.selected_job_id = '';
+            persistLocal(); renderContext();
+          }
+        }
+        if (pendingJobProjectSwitch === pending) pendingJobProjectSwitch = null;
+        return;
+      }
+      state.selected_job_id = id;
+      persistLocal();
+      renderContext();
+    });
+
+    const observer = new MutationObserver(() => {
+      clearTimeout(observer._timer);
+      observer._timer = setTimeout(renderCompactActions, 80);
+    });
+    const main = document.querySelector('main');
+    if (main) observer.observe(main, { subtree: true, childList: true, attributes: true,
+      attributeFilter: ['hidden', 'disabled', 'class', 'style', 'aria-hidden', 'data-open',
+        'data-scene-hidden', 'data-engine-hidden', 'data-task-hidden'] });
+  }
+
+  const workspace = {
+    schema: SCHEMA,
+    routes: ROUTES,
+    get current() { return currentRoute; },
+    get state() { return Object.assign({}, state); },
+    get projects() { return projects.slice(); },
+    navigateRoute,
+    navigateLegacy,
+    parseRoute,
+    routeHash,
+    refresh: refreshWorkspaceContext,
+    requestProjectSwitch,
+    drafts,
+    assistant: { open: openAssistant, close: closeAssistant },
+    activity: { open: openActivity, close: closeActivity, render: renderActivity },
+    navigation: { open: openNav, close: closeNav },
+  };
+  VCS.workspace = workspace;
+
+  async function init() {
+    wireShell();
+    closeNav();
+    renderDirty();
+    const initial = parseRoute(window.location.hash) || parseRoute(state.route) || parseRoute('#/home');
+    if (initial) {
+      let applied = await applyRoute(initial, {
+        source: 'initial', restoreScroll: true, allowUnresolvedProject: true, persist: false,
+      });
+      let committed = initial;
+      if (!applied || !applied.ok) {
+        committed = parseRoute('#/home');
+        applied = await applyRoute(committed, {
+          source: 'initial-fallback', allowUnresolvedProject: true, persist: false,
+        });
+      }
+      if (applied && applied.ok) {
+        history.replaceState(
+          { vcsRoute: committed.id, vcsIndex: historyIndex }, '', committed.hash);
+      }
+    }
+    try { await VCS.ready; await refreshWorkspaceContext(); }
+    catch (_) { renderContext(); }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => { init(); }, { once: true });
+  } else { init(); }
+})();

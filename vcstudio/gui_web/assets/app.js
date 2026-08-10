@@ -60,14 +60,21 @@ const VCS = {
   // ── 通用模态:建 .modal-mask+.modal,返回 {el, close, onDismiss?} ──
   // actions: [{label, primary?, quiet?, onClick(modal)}]
   modal({ title, bodyHTML = '', body = null, actions = [] }) {
+    const returnFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement : null;
     const mask = document.createElement('div');
     mask.className = 'modal-mask';
     const card = document.createElement('div');
     card.className = 'modal';
+    card.setAttribute('role', 'dialog');
+    card.setAttribute('aria-modal', 'true');
+    card.tabIndex = -1;
+    const titleId = 'vcs-dialog-title-' + Math.random().toString(36).slice(2);
     card.innerHTML =
-      (title ? `<div class="m-title"></div>` : '') +
+      (title ? `<div class="m-title" id="${titleId}"></div>` : '') +
       `<div class="m-body"></div>` +
       `<div class="m-actions"></div>`;
+    if (title) card.setAttribute('aria-labelledby', titleId);
     mask.appendChild(card);
 
     if (title) card.querySelector('.m-title').textContent = title;
@@ -76,7 +83,16 @@ const VCS = {
     else bodyEl.innerHTML = bodyHTML;
 
     const handle = { el: card, mask, onDismiss: null };
-    handle.close = () => { if (mask.parentNode) mask.parentNode.removeChild(mask); };
+    let closed = false;
+    handle.close = () => {
+      if (closed) return;
+      closed = true;
+      document.removeEventListener('keydown', onKey);
+      if (mask.parentNode) mask.parentNode.removeChild(mask);
+      if (returnFocus && returnFocus.isConnected && typeof returnFocus.focus === 'function') {
+        try { returnFocus.focus({ preventScroll: true }); } catch (_) { returnFocus.focus(); }
+      }
+    };
 
     const actEl = card.querySelector('.m-actions');
     (actions.length ? actions : [{ label: '关闭', quiet: true, onClick: h => h.close() }])
@@ -92,19 +108,34 @@ const VCS = {
     mask.addEventListener('mousedown', e => {
       if (e.target === mask) { if (handle.onDismiss) handle.onDismiss(); handle.close(); }
     });
-    // Esc 关闭
+    // Esc 关闭；Tab 在对话框内循环，关闭后把焦点还给触发器。
     const onKey = e => {
       if (e.key === 'Escape') {
-        document.removeEventListener('keydown', onKey);
         if (handle.onDismiss) handle.onDismiss();
         handle.close();
+      } else if (e.key === 'Tab') {
+        const focusable = Array.from(card.querySelectorAll(
+          'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),' +
+          'textarea:not([disabled]),[tabindex]:not([tabindex="-1"])'))
+          .filter(el => !el.hidden && el.getAttribute('aria-hidden') !== 'true');
+        if (!focusable.length) {
+          e.preventDefault(); card.focus(); return;
+        }
+        const first = focusable[0]; const last = focusable[focusable.length - 1];
+        if (e.shiftKey && document.activeElement === first) {
+          e.preventDefault(); last.focus();
+        } else if (!e.shiftKey && document.activeElement === last) {
+          e.preventDefault(); first.focus();
+        }
       }
     };
     document.addEventListener('keydown', onKey);
-    const origClose = handle.close;
-    handle.close = () => { document.removeEventListener('keydown', onKey); origClose(); };
 
     document.body.appendChild(mask);
+    const initialFocus = card.querySelector(
+      '[autofocus],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),' +
+      'button:not([disabled]),a[href]');
+    (initialFocus || card).focus();
     return handle;
   },
 
@@ -206,30 +237,37 @@ window.VCS = VCS;
 // ── 统一页面导航:手动点侧栏与程序化“下一步”共用同一路由 ──
 function activatePage(page, sourceLink, detail) {
   const name = String(page || '');
+  if (name === 'ai' && VCS.workspace && VCS.workspace.assistant) {
+    return VCS.workspace.assistant.open(sourceLink || null);
+  }
   const section = Array.from(document.querySelectorAll('main section[data-page]'))
-    .find(s => s.dataset.page === name);
+    .find(s => s.dataset.page === name && !s.hasAttribute('data-shell-assistant'));
   const link = sourceLink || Array.from(document.querySelectorAll('nav a[data-page]'))
     .find(a => a.dataset.page === name);
-  if (!name || !section || !link) return false;
-  // 工作模式是访问闸，不只是视觉隐藏。程序化导航也不能绕过侧栏裁剪。
-  if (link.hasAttribute('data-scene-hidden') || link.hidden) {
+  if (!name || !section) return false;
+  // 工作模式是访问闸，不只是视觉隐藏。许可只由场景白名单或当前计算的
+  // 明确路由给出，不依赖某一个导航适配器此刻是否被折叠。
+  if (typeof VCS.canActivatePage !== 'function' || !VCS.canActivatePage(name)) {
     VCS.toast('当前工作模式不需要此页面；可在“设置 → 本次计算”切换模式', 'fail');
     return false;
   }
-  document.querySelectorAll('nav a').forEach(x => x.classList.toggle('on', x === link));
-  document.querySelectorAll('main section[data-page]').forEach(
+  if (!VCS.workspace) {
+    document.querySelectorAll('nav a').forEach(x => x.classList.toggle('on', x === link));
+  }
+  document.querySelectorAll('main section[data-page]:not([data-shell-assistant])').forEach(
     s => { s.hidden = s.dataset.page !== name; });
   document.dispatchEvent(new CustomEvent('vcs:page', {
     detail: Object.assign({}, detail || {}, { page: name }),
   }));
   return true;
 }
+VCS.activatePage = activatePage;
 
 document.addEventListener('click', e => {
   const a = e.target.closest('a[data-page]');
-  if (!a) return;
+  if (!a || a.hasAttribute('data-route')) return;
   e.preventDefault();
-  activatePage(a.dataset.page, a);
+  VCS.navigate(a.dataset.page, { source: 'legacy-link' });
 });
 
 function findJobRow(jobDir) {
@@ -276,21 +314,32 @@ async function focusPendingJob(jobDir) {
   }
   return true;
 }
+VCS.focusPendingJob = focusPendingJob;
+
+VCS.focusNavigationTarget = async function (options = {}) {
+  if (options.focusJobDir) return focusPendingJob(options.focusJobDir);
+  if (!options.focusSelector) return true;
+  const el = document.querySelector(options.focusSelector);
+  if (!el) return false;
+  if (typeof el.scrollIntoView === 'function') el.scrollIntoView({ block: 'center' });
+  if (typeof el.focus === 'function') {
+    if (!el.hasAttribute('tabindex') && !/^(A|BUTTON|INPUT|SELECT|TEXTAREA)$/.test(el.tagName)) {
+      el.tabIndex = -1;
+    }
+    el.focus();
+  }
+  return true;
+};
 
 // 程序化导航公开入口。options.focusJobDir 专用于“生成 → 提交”的待提交作业聚焦。
 VCS.navigate = async function (page, options = {}) {
+  if (VCS.workspace && typeof VCS.workspace.navigateLegacy === 'function' &&
+      options.workspaceBypass !== true) {
+    return VCS.workspace.navigateLegacy(page, options);
+  }
   const ok = activatePage(page, null, { source: options.source || 'programmatic' });
   if (!ok) return { ok: false, focused: false };
-  let focused = true;
-  if (options.focusJobDir) focused = await focusPendingJob(options.focusJobDir);
-  else if (options.focusSelector) {
-    const el = document.querySelector(options.focusSelector);
-    focused = !!el;
-    if (el) {
-      if (typeof el.scrollIntoView === 'function') el.scrollIntoView({ block: 'center' });
-      if (typeof el.focus === 'function') el.focus();
-    }
-  }
+  const focused = await VCS.focusNavigationTarget(options);
   return { ok: true, focused };
 };
 
@@ -483,6 +532,9 @@ function onPipelineOutcome(out) {
   // 错误也进 feed(不用 VCS.log:避免给无日志区的页面凭空插入日志框)
   (out.errors || []).forEach(err => p.events.unshift({ kind: 'error', text: err, time: now }));
   p.events = p.events.slice(0, 20);
+  document.dispatchEvent(new CustomEvent('vcs:pipeline-events', {
+    detail: { events: p.events.slice(), outcome: out },
+  }));
   if (other) VCS.toast('自动托管：本轮 ' + other + ' 条动态', '');
   if ((out.errors || []).length) VCS.toast('自动托管遇到 ' + out.errors.length + ' 个问题（见任务动态）', 'fail');
   renderHealth();
@@ -665,6 +717,31 @@ function sceneVisible(sc, path) {
 }
 VCS.sceneVisible = sceneVisible;
 
+// 物理页面访问许可：场景原生页面白名单是基础；场景已授权的“本次计算”可
+// 额外放行其唯一目标页。calculationRoute 自身会先核验 task_keys，因此手工
+// 改 DOM 属性、直接改 hash 或程序化调用都不能放行其他页面。
+function pageAllowed(page, scenario) {
+  const name = String(page || '');
+  if (!name) return false;
+  const sc = (scenario === undefined) ? VCS.scenario : scenario;
+  if (!sc) return true;
+  if (sceneVisible(sc, 'pages.' + name)) return true;
+  const route = VCS.calculationRoute(VCS.activeCalculation, sc);
+  return !!route && route.page === name;
+}
+VCS.pageAllowed = pageAllowed;
+
+// 无副作用的壳层路由预检。workspace.js 在写入 History 前调用；这里只有
+// DOM/状态读取，不切页、不改 hash，也不显示提示。
+VCS.canActivatePage = function (page, scenario) {
+  const name = String(page || '');
+  if (!name) return false;
+  const section = Array.from(document.querySelectorAll('main section[data-page]'))
+    .find(s => s.dataset.page === name && !s.hasAttribute('data-shell-assistant'));
+  if (!section) return false;
+  return pageAllowed(name, scenario === undefined ? VCS.scenario : scenario);
+};
+
 function applySceneElements(sc) {
   if (!sc) return;
   document.querySelectorAll('[data-scene]').forEach(el => {
@@ -682,8 +759,8 @@ function applySceneElements(sc) {
   // 改选 NEB / DOS / 收敛扫描等类型时，只放行该类型真正需要的目标页。
   const route = VCS.calculationRoute(VCS.activeCalculation, sc);
   if (route) {
-    const link = document.querySelector(`nav a[data-page="${route.page}"]`);
-    if (link) link.removeAttribute('data-scene-hidden');
+    document.querySelectorAll(`nav a[data-page="${route.page}"]`).forEach(
+      link => link.removeAttribute('data-scene-hidden'));
   }
 }
 
@@ -704,13 +781,26 @@ function refreshModeChip() {
   chip.title = '切换工作模式、计算引擎或本次计算类型';
 }
 
+let scenarioNavigationGeneration = 0;
+
 function keepCurrentPageReachable(sc, source) {
-  const cur = document.querySelector('nav a.on');
-  if (!cur || !cur.hasAttribute('data-scene-hidden')) return;
+  const generation = ++scenarioNavigationGeneration;
+  const current = document.querySelector(
+    'main section[data-page]:not([data-shell-assistant]):not([hidden])');
+  if (!current || pageAllowed(current.dataset.page, sc)) return;
   const route = VCS.calculationRoute(VCS.activeCalculation, sc);
   const landing = (route && route.page) ||
     (sc.defaults && sc.defaults.landing_page) || 'dashboard';
-  if (!activatePage(landing, null, { source })) {
+  if (VCS.workspace && typeof VCS.workspace.navigateLegacy === 'function') {
+    VCS.workspace.navigateLegacy(landing, { source, replace: true }).then(out => {
+      if (generation !== scenarioNavigationGeneration || VCS.scenario !== sc) return;
+      if (!out || !out.ok) {
+        VCS.workspace.navigateLegacy('dashboard', {
+          source: source + '-fallback', replace: true, force: true,
+        });
+      }
+    });
+  } else if (!activatePage(landing, null, { source })) {
     activatePage('dashboard', null, { source: source + '-fallback' });
   }
 }

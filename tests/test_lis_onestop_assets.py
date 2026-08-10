@@ -471,12 +471,18 @@ def test_programmatic_project_selection_restores_matching_pipeline_state():
     commit = js[js.index('async function commitImport()'):
                 js.index('function showImportDone(')]
     assert 'restoreWorkflowState(hit)' in commit
-    for start, end in (
-            ('async function openProjectResults(', 'function canonicalRole('),
-            ('async function selectByPath(', 'async function selectByName('),
-            ('async function selectByName(', '// 切回项目页时刷新项目下拉')):
-        block = js[js.index(start):js.index(end)]
-        assert 'restoreWorkflowState(hit)' in block
+    open_results = js[js.index('async function openProjectResults('):
+                      js.index('function canonicalRole(')]
+    assert ('restoreWorkflowState(hit)' in open_results or
+            'applyProjectSelection(hit)' in open_results)
+    selector = js[js.index('async function selectRequestedProject('):
+                  js.index('function current()')]
+    assert 'applyProjectSelection(hit)' in selector
+    assert "return selectRequestedProject('path', wanted, wanted)" in selector
+    assert "return selectRequestedProject('name', name, '')" in selector
+    apply_selection = js[js.index('function applyProjectSelection('):
+                         js.index('async function requestProjectSelection(')]
+    assert 'restoreWorkflowState(project || null)' in apply_selection
 
 
 def test_multiple_servers_are_visible_in_pipeline_and_event_feed():

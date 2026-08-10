@@ -9,6 +9,7 @@
   const setVal = (id, v) => { const el = $(id); if (el) el.value = v || ''; };
   const CURRENT_PROJECT_KEY = 'vcs.adsorption.current_project';
   const COMPARE_PROJECTS_KEY = 'vcs.adsorption.compare_projects';
+  const PROJECT_ID_RE = /^[A-Za-z0-9._~-]{1,160}$/;
   const SINGLE_REPORT_FORMATS = Object.freeze([
     {
       id: 'pj-report-format-html', value: 'html', label: 'HTML',
@@ -76,7 +77,62 @@
     reportCapabilities: initialReportCapabilities(),
     reportCapabilityState: 'pending',
     reportCapabilityGeneration: 0,
+    currentProjectPath: '',
+    projectReloadGeneration: 0,
+    projectReloadInFlight: null,
+    projectSelectionGeneration: 0,
+    requestedProject: null,
   };
+
+  function rawProjectId(project) {
+    if (!project) return '';
+    // API project_id 是工作区 canonical opaque id（含 project-/registry- 前缀）；
+    // 裸 project_uuid 仅作旧后端兼容，不能反过来制造第二套 ID。
+    const value = String(project.project_id || project.id || project.project_uuid || '').trim();
+    return PROJECT_ID_RE.test(value) ? value : '';
+  }
+
+  function projectId(project) {
+    return rawProjectId(project) || String(project && project._workspace_id || '');
+  }
+
+  function projectContext(project) {
+    if (!project) return null;
+    const total = Math.max(0, Number(project.n_members || 0) || 0);
+    const done = Math.max(0, Number(project.n_done || 0) || 0);
+    const id = projectId(project);
+    return {
+      id,
+      project_id: id,
+      project_uuid: String(project.project_uuid || ''),
+      name: String(project.name || ''),
+      path: String(project.path || ''),
+      stage: String(project.pipeline_stage || project.stage || ''),
+      counts: { members: total, done, pending: Math.max(0, total - done) },
+      n_members: total,
+      n_done: done,
+      needs_human: !!(project.pipeline_needs_human || project.needs_human),
+    };
+  }
+
+  function publishProjectContext(project) {
+    const detail = projectContext(project);
+    if (!detail) return null;
+    document.dispatchEvent(new CustomEvent('vcs:project-context', { detail }));
+    return detail;
+  }
+
+  function currentProjectRecord() {
+    const path = State.currentProjectPath || val('pj-select');
+    return State.projects.find(project => String(project.path || '') === String(path || '')) || null;
+  }
+
+  function publicProject(project) {
+    if (!project) return null;
+    const out = Object.assign({}, project, { project_id: projectId(project) });
+    delete out._workspace_id;
+    return out;
+  }
 
   const LIS_MUTABLE_CONTROLS = [
     'lis-reference', 'lis-input-dir', 'pj-incar', 'pj-incar-btn',
@@ -2595,19 +2651,79 @@
   }
 
   // ── 已有项目:下拉 + 刷新 ──────────────────────────────────────────────────
-  async function reloadProjects(preferredReference) {
+  function applyProjectSelection(project, { persist = true, publish = true } = {}) {
     const sel = $('pj-select');
-    const previous = sel ? sel.value : '';
+    const path = String(project && project.path || '');
+    if (sel && sel.value !== path) sel.value = path;
+    State.currentProjectPath = path;
+    restoreWorkflowState(project || null);
+    if (persist) {
+      try { localStorage.setItem(CURRENT_PROJECT_KEY, path); } catch (_) { /* 不阻塞 */ }
+    }
+    updateProjectSummary();
+    updateJourney();
+    refreshCandidateEvaluation(path);
+    if (publish && project) publishProjectContext(project);
+    return !!project;
+  }
+
+  async function requestProjectSelection(project, previousPath) {
+    const sel = $('pj-select');
+    const before = String(previousPath || '');
+    const selectionGeneration = ++State.projectSelectionGeneration;
+    // 原生下拉与工作区程序化选择共用同一世代；后发意图使旧确认失效。
+    State.requestedProject = null;
+    // change 事件发生时 select 已显示新值；拦截确认期间恢复已提交项目，
+    // 避免表单和全局上下文暂时指向不同项目。
+    if (sel) sel.value = before;
+    if (!project) return false;
+
+    const apply = async () => {
+      if (selectionGeneration !== State.projectSelectionGeneration) return false;
+      applyProjectSelection(project);
+      return true;
+    };
+    let allowed = true;
+    if (VCS.workspace && typeof VCS.workspace.requestProjectSwitch === 'function') {
+      allowed = await VCS.workspace.requestProjectSwitch(projectId(project), apply);
+    } else if (VCS.unsaved && typeof VCS.unsaved.confirm === 'function') {
+      allowed = await VCS.unsaved.confirm('切换项目');
+      if (allowed) await apply();
+    } else {
+      allowed = await apply();
+    }
+    if (selectionGeneration !== State.projectSelectionGeneration) return false;
+    if (!allowed && sel) sel.value = before;
+    return !!allowed;
+  }
+
+  function matchesRequestedProject(project, request) {
+    if (!project || !request) return false;
+    if (request.kind === 'path') return String(project.path || '') === request.value;
+    if (request.kind === 'name') return String(project.name || '') === request.value;
+    if (request.kind === 'id') return projectId(project) === request.value;
+    return false;
+  }
+
+  async function performProjectReload(generation, preferredReference) {
+    const sel = $('pj-select');
     const [r, pipeline] = await Promise.all([
       VCS.call('proj_list'), VCS.call('pipeline_status'),
     ]);
+    // 后发请求拥有工作区上下文；旧响应不得再改 State、DOM 或当前项目。
+    if (generation !== State.projectReloadGeneration) {
+      return { ok: false, stale: true, generation };
+    }
     const listSucceeded = !!(r && r.ok !== false && !r.error && Array.isArray(r.projects));
     const pipelineByPath = new Map(((pipeline && pipeline.projects) || [])
       .map(item => [item.path, item]));
     const projectRows = listSucceeded ? r.projects : State.projects;
-    State.projects = projectRows.map(project => {
+    State.projects = projectRows.map((project, index) => {
       const progress = pipelineByPath.get(project.path) || {};
       return Object.assign({}, project, {
+        // 旧项目没有 UUID 时仅给当前列表一个不含本机路径的兼容标识。
+        // workspace.js 使用同样的 legacy-N 映射；路径继续只存旧 localStorage。
+        _workspace_id: rawProjectId(project) || `legacy-${index + 1}`,
         pipeline_stage: progress.stage || '',
         pipeline_needs_human: !!progress.needs_human,
         pipeline_recover_round: Number(progress.recover_round || 0),
@@ -2621,19 +2737,20 @@
     else restoreCompareSelection();
     if (r && r.error) VCS.log('读取项目列表失败:' + r.error, 'failc');
     renderReferenceProjects(preferredReference);
-    if (!sel) return;
+    if (!sel) return { ok: true, stale: false, generation };
     sel.innerHTML = '';
     if (!State.projects.length) {
       const o = document.createElement('option');
       o.value = ''; o.textContent = '(暂无项目)';
       sel.appendChild(o);
+      State.currentProjectPath = '';
       restoreWorkflowState(null);
       renderFigProjList();
       updateProjectSummary();
       updateJourney();
       refreshCandidateEvaluation('');
       scheduleComparePreview();
-      return;
+      return { ok: true, stale: false, generation };
     }
     State.projects.forEach(p => {
       const o = document.createElement('option');
@@ -2645,19 +2762,36 @@
     });
     let saved = '';
     try { saved = localStorage.getItem(CURRENT_PROJECT_KEY) || ''; } catch (_) { /* 不阻塞 */ }
+    const requested = State.requestedProject;
+    const requestedHit = requested && requested.generation === State.projectSelectionGeneration
+      ? State.projects.find(project => matchesRequestedProject(project, requested)) : null;
     const active = State.projects.slice().reverse().find(p =>
       ['submit', 'monitor', 'recover'].includes(p.pipeline_stage) || p.pipeline_needs_human);
-    const candidates = [preferredReference, previous, saved, active && active.path,
+    const liveSelection = State.currentProjectPath || (sel ? sel.value : '');
+    const candidates = [requestedHit && requestedHit.path, preferredReference, liveSelection, saved,
+      active && active.path,
       State.projects[State.projects.length - 1].path];
     const want = candidates.find(path => State.projects.some(p => p.path === path)) || '';
-    sel.value = want;
-    try { localStorage.setItem(CURRENT_PROJECT_KEY, want); } catch (_) { /* 不阻塞 */ }
-    restoreWorkflowState(State.projects.find(p => p.path === want));
-    updateProjectSummary();
-    updateJourney();
+    applyProjectSelection(State.projects.find(p => p.path === want) || null);
+    if (requestedHit && State.requestedProject === requested) State.requestedProject = null;
     renderFigProjList();
-    refreshCandidateEvaluation(want);
     scheduleComparePreview();
+    return { ok: true, stale: false, generation };
+  }
+
+  async function reloadProjects(preferredReference) {
+    const generation = ++State.projectReloadGeneration;
+    const pending = performProjectReload(generation, preferredReference);
+    State.projectReloadInFlight = { generation, promise: pending };
+    let result = await pending;
+    // 调用者等待期间若被更新的刷新取代，则跟随到真正提交 DOM 的最新一轮；
+    // 这样“刷新后继续处理”的旧流程也不会读取半旧 State。
+    while (result && result.stale) {
+      const latest = State.projectReloadInFlight;
+      if (!latest || latest.generation <= result.generation) break;
+      result = await latest.promise;
+    }
+    return result;
   }
 
   // ── 论文级出图:多项目对比勾选列表(随项目列表刷新) ──────────────────────
@@ -3720,11 +3854,11 @@
     syncReportFormatControls();
     loadReportCapabilities();
     const projectSelect = $('pj-select');
-    if (projectSelect) projectSelect.addEventListener('change', () => {
-      restoreWorkflowState(State.projects.find(p => p.path === projectSelect.value));
-      try { localStorage.setItem(CURRENT_PROJECT_KEY, projectSelect.value); } catch (_) { /* 不阻塞 */ }
-      updateProjectSummary(); updateJourney();
-      refreshCandidateEvaluation(projectSelect.value);
+    if (projectSelect) projectSelect.addEventListener('change', async () => {
+      const previous = State.currentProjectPath;
+      const requested = String(projectSelect.value || '');
+      const hit = State.projects.find(p => String(p.path || '') === requested) || null;
+      await requestProjectSelection(hit, previous);
     });
     wire('pj-figs', makeFigures);
     wire('pj-cmpfigs', makeCompareFigures);
@@ -3758,32 +3892,44 @@
 
   // 导入向导/任务页优先用 project.yaml 绝对路径精确选中，
   // 避免两个同名项目被选错。按名选中仅保留给旧数据兼容。
+  async function selectRequestedProject(kind, value, preferredReference) {
+    const raw = String(value || '');
+    // 路径必须逐字匹配；不能把合法目录名首尾的空格静默改成另一个路径。
+    const wanted = kind === 'path' ? raw : raw.trim();
+    if (!wanted.trim()) return false;
+    const generation = ++State.projectSelectionGeneration;
+    const request = { kind, value: wanted, generation };
+    State.requestedProject = request;
+    await reloadProjects(preferredReference);
+    // 较新的显式选择已接管；旧调用即使晚返回也不能重写项目上下文。
+    if (generation !== State.projectSelectionGeneration) return false;
+    const hit = State.projects.find(project => matchesRequestedProject(project, request)) || null;
+    if (State.requestedProject === request) State.requestedProject = null;
+    if (!hit) return false;
+    applyProjectSelection(hit);
+    return true;
+  }
+
   async function selectByPath(path) {
-    await reloadProjects();
     const wanted = String(path || '');
-    const hit = State.projects.find(p => String(p.path || '') === wanted);
-    const sel = $('pj-select');
-    if (hit && sel) {
-      sel.value = hit.path;
-      restoreWorkflowState(hit);
-      updateProjectSummary();
-      updateJourney();
-      refreshCandidateEvaluation(hit.path);
-    }
-    return !!hit;
+    return selectRequestedProject('path', wanted, wanted);
   }
 
   async function selectByName(name) {
-    await reloadProjects();
-    const hit = State.projects.find(p => p.name === name);
-    const sel = $('pj-select');
-    if (hit && sel) {
-      sel.value = hit.path;
-      restoreWorkflowState(hit);
-      updateProjectSummary();
-      updateJourney();
-      refreshCandidateEvaluation(hit.path);
-    }
+    return selectRequestedProject('name', name, '');
+  }
+
+  async function selectById(id) {
+    const wanted = String(id || '').trim();
+    return selectRequestedProject('id', wanted, '');
+  }
+
+  function current() {
+    return publicProject(currentProjectRecord());
+  }
+
+  function list() {
+    return State.projects.map(publicProject);
   }
 
   // 切回项目页时刷新项目下拉
@@ -3796,5 +3942,14 @@
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 
-  window.Project = { reload: reloadProjects, selectByPath, selectByName, openImport, startLiS };
+  window.Project = {
+    reload: reloadProjects,
+    selectByPath,
+    selectByName,
+    selectById,
+    current,
+    list,
+    openImport,
+    startLiS,
+  };
 })();

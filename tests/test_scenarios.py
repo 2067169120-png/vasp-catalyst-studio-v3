@@ -53,7 +53,15 @@ def test_page_registry_matches_real_html_pages():
         encoding='utf-8')
     assert set(re.findall(r'<section[^>]+data-page="([^"]+)"', html)) == set(S.PAGES)
     nav = set(re.findall(r'<a[^>]+data-page="([^"]+)"[^>]+data-scene="pages\.([^"]+)"', html))
-    assert {a for a, b in nav if a == b} == set(S.PAGES)
+    # AI 已从一级页导航改为右侧上下文助手；其余物理页仍需有
+    # data-page -> pages.<page> 能力适配，不得绕过工作模式白名单。
+    assert {a for a, b in nav if a == b and a != 'ai'} == set(S.PAGES) - {'ai'}
+    assert re.search(
+        r'id="assistant-toggle"[^>]*data-scene="pages\.ai"[^>]*aria-controls="page-ai"',
+        html)
+    assert re.search(
+        r'<section[^>]+data-page="ai"[^>]+id="page-ai"[^>]+data-shell-assistant',
+        html)
 
 
 def test_four_primary_modes_have_safe_defaults():
@@ -176,6 +184,14 @@ def test_task_keys_are_in_sync_with_catalog_and_defaults_are_allowed():
         assert set(sc['task_keys']) <= set(S.TASK_KEYS)
         assert sc['defaults']['active_calculation'] in sc['task_keys']
         assert set(sc['home_actions']) <= set(S.HOME_ACTIONS)
+
+
+def test_lis_neb_needs_an_explicit_page_allowance_without_broadening_the_mode():
+    """Li-S 的 NEB 只应临时放行生成页，不能把其他裁剪页面一并开放。"""
+    lis = S.get_scenario('lis')
+    assert 'neb' in lis['task_keys']
+    assert 'generate' not in lis['pages']
+    assert 'wavefunction' not in lis['pages']
 
 
 def test_is_visible_unknown_path_fails_open():
