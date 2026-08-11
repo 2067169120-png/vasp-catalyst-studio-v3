@@ -135,6 +135,22 @@ def test_adopt_explicit_task_is_strictly_normalized_and_conflicts_rejected(tmp_p
                 str(tmp_path / 'bad'), _profile(), '57', '/work/bad', task_type='statci')
         assert not (tmp_path / 'bad').exists()
 
+        # A new-target lock creates the target directory, so every malformed
+        # request must fail before the lock is acquired or written.
+        invalid_requests = (
+            ('empty_job_id', _profile(), '', '/work/invalid', ''),
+            ('relative_remote', _profile(), '59', 'work/invalid', ''),
+            ('empty_profile', _profile(name=''), '60', '/work/invalid', ''),
+            ('non_text_name', _profile(), '61', '/work/invalid', object()),
+        )
+        for label, profile, job_id, remote_dir, name in invalid_requests:
+            target = tmp_path / label
+            with pytest.raises(ValueError):
+                submitter.adopt_external_job(
+                    str(target), profile, job_id, remote_dir, name=name)
+            assert not target.exists()
+            assert not (target / '.vcstudio-job-operation.lock').exists()
+
         existing = tmp_path / 'existing_dos'
         existing.mkdir()
         manifest.save_manifest(existing, manifest.new_manifest(

@@ -17,8 +17,9 @@
   }
   const val = id => { const el = $(id); return el ? el.value.trim() : ''; };
   const setVal = (id, v) => { const el = $(id); if (el) el.value = v || ''; };
-  const CURRENT_PROJECT_KEY = 'vcs.adsorption.current_project';
-  const COMPARE_PROJECTS_KEY = 'vcs.adsorption.compare_projects';
+  const LEGACY_CURRENT_PROJECT_KEY = 'vcs.adsorption.current_project';
+  const LEGACY_COMPARE_PROJECTS_KEY = 'vcs.adsorption.compare_projects';
+  const COMPARE_PROJECT_IDS_KEY = 'vcs.adsorption.compare_project_ids.v1';
   const PROJECT_ID_RE = /^[A-Za-z0-9._~-]{1,160}$/;
   const SINGLE_REPORT_FORMATS = Object.freeze([
     {
@@ -53,11 +54,11 @@
       path: '', sha256: '', status: 'missing', source: '', issues: [],
       quartet: null, inputMode: '', quartetStatus: '',
     },
-    projects: [],     // proj_list 返回:[{path,name,n_members}]
+    projects: [],     // proj_list 返回的 opaque project DTO
     profiles: [],     // list_profiles 返回；一站式提交资源选择
     importRows: [],   // 本地结果扫描候选(前端只持有修正值;commit 时后端会重新验证)
     importResult: null,
-    preparedLis: null, // {path,fingerprint,name,submitted}:生成成功后复用，安全重试提交
+    preparedLis: null, // {projectId,fingerprint,name,submitted}:生成成功后复用，安全重试提交
     preparedConflictHint: null,
     methodCheck: null,
     methodCheckFingerprint: '',
@@ -70,11 +71,11 @@
     workflowResultReady: false,
     workflowStage: '',
     workflowNeedsHuman: false,
-    workflowProjectPath: '',
+    workflowProjectId: '',
     lisBusy: false,
     inputScanBusy: false,
     inputGeneration: 0,
-    comparePaths: new Set(),
+    compareProjectIds: new Set(),
     compareSelectionRestored: false,
     comparePreview: null,
     comparePreviewGeneration: 0,
@@ -89,23 +90,54 @@
     reportCapabilities: initialReportCapabilities(),
     reportCapabilityState: 'pending',
     reportCapabilityGeneration: 0,
-    currentProjectPath: '',
+    currentProjectId: '',
     projectReloadGeneration: 0,
     projectReloadInFlight: null,
     projectSelectionGeneration: 0,
     requestedProject: null,
+    explicitWorkflow: '',
+    lifecycleBusy: false,
+    lifecycleSelectionToken: '',
+    lifecycleOperationToken: '',
+    lifecycleAction: '',
+    adoptSelectionToken: '',
+    adoptOperationToken: '',
+    lifecycleQueueOperation: null,
+    adoptQueueOperation: null,
+    lifecycleOperationSequence: 0,
+    lifecycleGeneration: 0,
+    lifecycleBusyGeneration: 0,
+    lifecycleProjectIdentity: '',
   };
 
   function rawProjectId(project) {
     if (!project) return '';
-    // API project_id 是工作区 canonical opaque id（含 project-/registry- 前缀）；
-    // 裸 project_uuid 仅作旧后端兼容，不能反过来制造第二套 ID。
-    const value = String(project.project_id || project.id || project.project_uuid || '').trim();
+    const value = String(project.project_id || '').trim();
     return PROJECT_ID_RE.test(value) ? value : '';
   }
 
   function projectId(project) {
-    return rawProjectId(project) || String(project && project._workspace_id || '');
+    return rawProjectId(project);
+  }
+
+  function withoutProjectLocators(record) {
+    const source = record && typeof record === 'object' ? record : {};
+    const rejected = new Set([
+      'path', 'project' + '_path', 'root', 'locator', 'project' + '_yaml',
+    ]);
+    const clean = {};
+    Object.keys(source).forEach(key => {
+      if (!rejected.has(key)) clean[key] = source[key];
+    });
+    return clean;
+  }
+
+  function sanitizeComparisonPreview(result) {
+    if (!result || typeof result !== 'object') return result;
+    const clean = withoutProjectLocators(result);
+    clean.projects = Array.isArray(result.projects)
+      ? result.projects.map(withoutProjectLocators) : [];
+    return clean;
   }
 
   function projectContext(project) {
@@ -114,16 +146,9 @@
     const done = Math.max(0, Number(project.n_done || 0) || 0);
     const id = projectId(project);
     return {
-      id,
       project_id: id,
-      project_uuid: String(project.project_uuid || ''),
       name: String(project.name || ''),
-      path: String(project.path || ''),
-      stage: String(project.pipeline_stage || project.stage || ''),
       counts: { members: total, done, pending: Math.max(0, total - done) },
-      n_members: total,
-      n_done: done,
-      needs_human: !!(project.pipeline_needs_human || project.needs_human),
     };
   }
 
@@ -135,15 +160,401 @@
   }
 
   function currentProjectRecord() {
-    const path = State.currentProjectPath || val('pj-select');
-    return State.projects.find(project => String(project.path || '') === String(path || '')) || null;
+    const id = State.currentProjectId || val('pj-select');
+    return State.projects.find(project => projectId(project) === String(id || '')) || null;
+  }
+
+  function lifecycleStatus(id, message, state = '') {
+    const box = $(id);
+    if (!box) return;
+    box.textContent = String(message || '');
+    box.classList.toggle('ready', state === 'ready');
+    box.classList.toggle('blocked', state === 'blocked');
+    box.classList.toggle('running', state === 'running');
+  }
+
+  function lifecycleOperationLabel(kind) {
+    if (kind === 'adopt') return tr('runtime.project.operation.adopt', {},
+      '接管项目文件夹', 'Adopt project folder');
+    if (kind === 'move') return tr('runtime.project.operation.move', {},
+      '移动项目', 'Move project');
+    return tr('runtime.project.operation.clone', {}, '克隆项目', 'Clone project');
+  }
+
+  function publishLifecycleOperation(operation, status, error = '') {
+    if (!operation || !VCS.operations || typeof VCS.operations.publish !== 'function') return;
+    operation.status = status;
+    VCS.operations.publish({
+      id: operation.id,
+      kind: `project-${operation.kind}`,
+      status,
+      label: operation.label,
+      count: 1,
+      error: String(error || ''),
+      route: 'project-overview',
+      started_at: operation.startedAt,
+      updated_at: new Date().toISOString(),
+    });
+  }
+
+  function beginLifecycleOperation(kind) {
+    State.lifecycleOperationSequence += 1;
+    const operation = {
+      id: `projectop-${Date.now().toString(36)}-${State.lifecycleOperationSequence.toString(36)}`,
+      kind,
+      label: lifecycleOperationLabel(kind),
+      status: 'confirming',
+      startedAt: new Date().toISOString(),
+    };
+    publishLifecycleOperation(operation, 'confirming');
+    return operation;
+  }
+
+  function supersedeLifecycleOperation(operation) {
+    if (operation && operation.status === 'confirming') {
+      publishLifecycleOperation(operation, 'failed', tr(
+        'runtime.project.operation.superseded', {},
+        '已由新的预检替代', 'Superseded by a newer preflight'));
+    }
+  }
+
+  function lifecycleRequestCurrent(generation, identity) {
+    return generation === State.lifecycleGeneration &&
+      identity === State.lifecycleProjectIdentity &&
+      identity === projectId(currentProjectRecord());
+  }
+
+  function syncLifecycleProjectIdentity(project) {
+    const identity = projectId(project);
+    if (identity === State.lifecycleProjectIdentity) return identity;
+    State.lifecycleGeneration += 1;
+    State.lifecycleProjectIdentity = identity;
+    if (State.lifecycleBusyGeneration) {
+      State.lifecycleBusyGeneration = 0;
+      State.lifecycleBusy = false;
+    }
+    if (!State.lifecycleQueueOperation || State.lifecycleQueueOperation.status === 'confirming') {
+      supersedeLifecycleOperation(State.lifecycleQueueOperation);
+      State.lifecycleQueueOperation = null;
+    }
+    State.lifecycleSelectionToken = '';
+    State.lifecycleOperationToken = '';
+    State.lifecycleAction = '';
+    lifecycleStatus('pj-lifecycle-status', '');
+    const apply = $('pj-lifecycle-apply');
+    if (apply) apply.disabled = true;
+    return identity;
+  }
+
+  function updateProjectHub() {
+    const page = $('page-project');
+    const hub = $('project-empty-hub');
+    const lifecycle = $('pj-lifecycle-card');
+    const project = currentProjectRecord();
+    const hasProject = !!project;
+    const lifecycleIdentity = syncLifecycleProjectIdentity(project);
+    const explicit = !!State.explicitWorkflow;
+    if (page) page.classList.toggle('project-neutral', !hasProject && !explicit);
+    if (hub) hub.hidden = hasProject || explicit;
+    if (lifecycle) lifecycle.hidden = !hasProject;
+    const recent = $('pj-hub-recent');
+    if (recent) recent.disabled = !State.projects.length;
+    const identity = $('pj-lifecycle-identity');
+    if (identity) {
+      identity.textContent = hasProject
+        ? (projectId(project) || tr('runtime.project.lifecycle.legacy_identity', {},
+          '旧项目（路径注册身份）', 'Legacy project (registry-path identity)')) : '';
+    }
+    const target = $('pj-lifecycle-target-name');
+    if (target && hasProject) {
+      if (target.dataset.projectId !== lifecycleIdentity) {
+        target.dataset.projectId = lifecycleIdentity;
+        target.value = `${String(project.name || 'project').trim() || 'project'}-copy`;
+      }
+    } else if (target) {
+      target.dataset.projectId = '';
+    }
+  }
+
+  function setExplicitWorkflow(mode) {
+    State.explicitWorkflow = String(mode || '');
+    updateProjectHub();
+  }
+
+  function lifecyclePreflightMessage(result) {
+    if (!result) return tr('runtime.project.lifecycle.no_response', {},
+      '预检没有返回结果。', 'The preflight returned no result.');
+    const issues = (result.conflicts || []).map(item => String(item && item.message || '')).filter(Boolean);
+    if (!result.ready) return issues.join('；') || result.error || tr(
+      'runtime.project.lifecycle.blocked', {}, '预检未通过。', 'Preflight did not pass.');
+    const impact = result.impact || {};
+    const identity = impact.project_uuid_reminted
+      ? tr('runtime.project.lifecycle.remint_impact', {}, '将生成新的项目 ID', 'A new project ID will be minted')
+      : tr('runtime.project.lifecycle.preserve_impact', {}, '将保留当前项目 ID', 'The current project ID will be preserved');
+    const ready = tr('runtime.project.lifecycle.ready_summary', {
+      count: Number(impact.locator_rewrites || 0), identity,
+    }, `预检通过：将安全重写 {count} 个项目内定位器；{identity}。确认前尚未修改文件。`,
+    'Preflight passed: {count} project-local locators will be safely rebased; {identity}. No files have been changed yet.');
+    const jobs = result.jobs && Array.isArray(result.jobs.entries)
+      ? result.jobs.entries : [];
+    const jobEntries = jobs.map(item => {
+      const identityValue = String(item && (item.target_identity || item.source_identity) || '—');
+      return `${String(item && item.label || 'job')} · ${String(item && item.action || 'update')} · ${identityValue}`;
+    }).join('; ');
+    const jobSummary = tr('runtime.project.lifecycle.ready_jobs', {
+      count: jobs.length, entries: jobEntries || '—',
+    }, 'Jobs 登记表：{count} 个条目（{entries}）。',
+    'Jobs ledger: {count} entries ({entries}).');
+    return `${ready} ${jobSummary}`;
+  }
+
+  async function chooseAdoptFolder() {
+    if (State.lifecycleBusy) return;
+    const panel = $('pj-adopt-panel');
+    if (panel) panel.hidden = false;
+    lifecycleStatus('pj-adopt-status', tr('runtime.project.adopt.selecting', {},
+      '正在打开服务器文件夹选择器…', 'Opening the server folder picker…'), 'running');
+    State.lifecycleBusy = true;
+    try {
+      const selected = await VCS.call('proj_lifecycle_select', 'adopt_source');
+      if (!selected || !selected.ok) {
+        State.adoptSelectionToken = '';
+        State.adoptOperationToken = '';
+        lifecycleStatus('pj-adopt-status', selected && selected.cancelled
+          ? tr('runtime.project.adopt.cancelled', {}, '未选择文件夹。', 'No folder was selected.')
+          : ((selected && selected.error) || tr('runtime.project.adopt.select_failed', {},
+            '无法检查所选文件夹。', 'The selected folder could not be inspected.')), 'blocked');
+        return;
+      }
+      State.adoptSelectionToken = String(selected.selection_token || '');
+      const label = String(selected.selection && selected.selection.label || '');
+      const copy = $('pj-adopt-selection');
+      if (copy) copy.textContent = tr('runtime.project.adopt.selected', { name: label },
+        '已由服务器选择：{name}。下一步将检查 project.yaml、注册表路径和项目 ID。',
+        'Selected by the server: {name}. Next, project.yaml, the registry path, and the project ID will be checked.');
+    } finally {
+      State.lifecycleBusy = false;
+    }
+    await preflightAdopt();
+  }
+
+  async function preflightAdopt() {
+    if (!State.adoptSelectionToken || State.lifecycleBusy) return;
+    supersedeLifecycleOperation(State.adoptQueueOperation);
+    State.adoptQueueOperation = beginLifecycleOperation('adopt');
+    const mode = val('pj-adopt-mode') || 'remint';
+    const button = $('pj-adopt-apply');
+    if (button) button.disabled = true;
+    lifecycleStatus('pj-adopt-status', tr('runtime.project.adopt.preflighting', {},
+      '正在预检身份与重复注册…', 'Checking identity and duplicate registration…'), 'running');
+    State.lifecycleBusy = true;
+    try {
+      const result = await VCS.call('proj_lifecycle_preflight', 'adopt', null,
+        State.adoptSelectionToken, null, mode);
+      State.adoptOperationToken = result && result.ready
+        ? String(result.operation_token || '') : '';
+      lifecycleStatus('pj-adopt-status', lifecyclePreflightMessage(result),
+        result && result.ready ? 'ready' : 'blocked');
+      if (button) button.disabled = !State.adoptOperationToken;
+      if (!result || !result.ready) publishLifecycleOperation(
+        State.adoptQueueOperation, 'failed', (result && result.error) ||
+        lifecyclePreflightMessage(result));
+    } catch (error) {
+      const message = String(error && error.message || error);
+      State.adoptOperationToken = '';
+      lifecycleStatus('pj-adopt-status', message, 'blocked');
+      publishLifecycleOperation(State.adoptQueueOperation, 'failed', message);
+    } finally {
+      State.lifecycleBusy = false;
+    }
+  }
+
+  async function applyAdopt() {
+    if (!State.adoptOperationToken || State.lifecycleBusy) return;
+    const button = $('pj-adopt-apply');
+    if (button) button.disabled = true;
+    lifecycleStatus('pj-adopt-status', tr('runtime.project.adopt.applying', {},
+      '正在接管并原子更新注册表…', 'Adopting and atomically updating the registry…'), 'running');
+    const token = State.adoptOperationToken;
+    State.adoptOperationToken = '';
+    State.lifecycleBusy = true;
+    publishLifecycleOperation(State.adoptQueueOperation, 'running');
+    try {
+      const result = await VCS.call('proj_lifecycle_apply', token);
+      if (!result || !result.ok) {
+        const message = (result && result.error) || tr(
+          'runtime.project.adopt.failed', {}, '接管未完成；没有登记不确定状态。',
+          'Adoption did not complete; no uncertain state was registered.');
+        lifecycleStatus('pj-adopt-status', message, 'blocked');
+        publishLifecycleOperation(State.adoptQueueOperation, 'failed', message);
+        if (result && result.requires_manual_recovery) VCS.log(result.error, 'failc');
+        return;
+      }
+      State.explicitWorkflow = '';
+      await reloadProjects();
+      if (result.project && result.project.project_id) {
+        await selectById(result.project.project_id);
+      }
+      VCS.toast(tr('runtime.project.adopt.success', {},
+        '项目文件夹已接管并登记。', 'The project folder was adopted and registered.'), 'ok');
+      publishLifecycleOperation(State.adoptQueueOperation, 'succeeded');
+    } catch (error) {
+      const message = String(error && error.message || error);
+      lifecycleStatus('pj-adopt-status', message, 'blocked');
+      publishLifecycleOperation(State.adoptQueueOperation, 'failed', message);
+    } finally {
+      State.lifecycleBusy = false;
+      updateProjectHub();
+    }
+  }
+
+  async function preflightProjectLifecycle(action) {
+    if (State.lifecycleBusy) return;
+    const project = currentProjectRecord();
+    if (!project) {
+      lifecycleStatus('pj-lifecycle-status', tr('runtime.project.lifecycle.no_project', {},
+        '请先选择一个项目。', 'Select a project first.'), 'blocked');
+      return;
+    }
+    const targetName = val('pj-lifecycle-target-name');
+    if (!targetName) {
+      lifecycleStatus('pj-lifecycle-status', tr('runtime.project.lifecycle.name_required', {},
+        '请填写目标文件夹名。', 'Enter a destination folder name.'), 'blocked');
+      return;
+    }
+    const identity = projectId(project);
+    if (!identity || identity !== State.lifecycleProjectIdentity) {
+      syncLifecycleProjectIdentity(project);
+    }
+    const generation = ++State.lifecycleGeneration;
+    supersedeLifecycleOperation(State.lifecycleQueueOperation);
+    State.lifecycleQueueOperation = beginLifecycleOperation(action);
+    const apply = $('pj-lifecycle-apply');
+    if (apply) apply.disabled = true;
+    lifecycleStatus('pj-lifecycle-status', tr('runtime.project.lifecycle.selecting', {},
+      '正在选择目标父文件夹…', 'Selecting the destination parent folder…'), 'running');
+    State.lifecycleBusy = true;
+    State.lifecycleBusyGeneration = generation;
+    try {
+      const selected = await VCS.call('proj_lifecycle_select', `${action}_destination`);
+      if (!lifecycleRequestCurrent(generation, identity)) return;
+      if (!selected || !selected.ok) {
+        const message = selected && selected.cancelled
+          ? tr('runtime.project.lifecycle.cancelled', {}, '未选择目标文件夹。', 'No destination was selected.')
+          : ((selected && selected.error) || tr('runtime.project.lifecycle.select_failed', {},
+            '目标文件夹选择失败。', 'Destination selection failed.'));
+        lifecycleStatus('pj-lifecycle-status', message, 'blocked');
+        publishLifecycleOperation(State.lifecycleQueueOperation, 'failed', message);
+        return;
+      }
+      const selectionToken = String(selected.selection_token || '');
+      const result = await VCS.call('proj_lifecycle_preflight', action,
+        identity, selectionToken, targetName, null);
+      if (!lifecycleRequestCurrent(generation, identity)) return;
+      State.lifecycleSelectionToken = selectionToken;
+      State.lifecycleAction = action;
+      State.lifecycleOperationToken = result && result.ready
+        ? String(result.operation_token || '') : '';
+      lifecycleStatus('pj-lifecycle-status', lifecyclePreflightMessage(result),
+        result && result.ready ? 'ready' : 'blocked');
+      if (apply) {
+        apply.disabled = !State.lifecycleOperationToken;
+        apply.textContent = action === 'move'
+          ? tr('runtime.project.lifecycle.confirm_move', {}, '确认移动', 'Confirm move')
+          : tr('runtime.project.lifecycle.confirm_clone', {}, '确认克隆', 'Confirm clone');
+      }
+      if (!result || !result.ready) publishLifecycleOperation(
+        State.lifecycleQueueOperation, 'failed', (result && result.error) ||
+        lifecyclePreflightMessage(result));
+    } catch (error) {
+      if (!lifecycleRequestCurrent(generation, identity)) return;
+      const message = String(error && error.message || error);
+      State.lifecycleOperationToken = '';
+      lifecycleStatus('pj-lifecycle-status', message, 'blocked');
+      publishLifecycleOperation(State.lifecycleQueueOperation, 'failed', message);
+    } finally {
+      if (State.lifecycleBusyGeneration === generation) {
+        State.lifecycleBusyGeneration = 0;
+        State.lifecycleBusy = false;
+      }
+    }
+  }
+
+  async function applyProjectLifecycle() {
+    if (!State.lifecycleOperationToken || State.lifecycleBusy) return;
+    if (State.lifecycleAction === 'move' && !window.confirm(tr(
+      'runtime.project.lifecycle.move_warning', {},
+      '移动会改变项目位置并同步更新注册表。仅在预检内容正确时继续。',
+      'Move changes the project location and updates the registry. Continue only if the preflight is correct.'))) {
+      publishLifecycleOperation(State.lifecycleQueueOperation, 'failed', tr(
+        'runtime.project.operation.cancelled', {}, '用户取消了确认', 'Confirmation cancelled'));
+      State.lifecycleOperationToken = '';
+      const cancelledApply = $('pj-lifecycle-apply');
+      if (cancelledApply) cancelledApply.disabled = true;
+      return;
+    }
+    const apply = $('pj-lifecycle-apply');
+    if (apply) apply.disabled = true;
+    lifecycleStatus('pj-lifecycle-status', tr('runtime.project.lifecycle.applying', {},
+      '正在执行并核对注册表提交…', 'Applying and verifying the registry commit…'), 'running');
+    const token = State.lifecycleOperationToken;
+    State.lifecycleOperationToken = '';
+    State.lifecycleBusy = true;
+    publishLifecycleOperation(State.lifecycleQueueOperation, 'running');
+    try {
+      const result = await VCS.call('proj_lifecycle_apply', token);
+      if (!result || !result.ok) {
+        const message = (result && result.error) || tr(
+          'runtime.project.lifecycle.failed', {}, '项目操作未完成。',
+          'The project operation did not complete.');
+        lifecycleStatus('pj-lifecycle-status', message, 'blocked');
+        publishLifecycleOperation(State.lifecycleQueueOperation, 'failed', message);
+        if (result && result.requires_manual_recovery) VCS.log(result.error, 'failc');
+        return;
+      }
+      await reloadProjects();
+      if (result.project && result.project.project_id) {
+        await selectById(result.project.project_id);
+      }
+      VCS.toast(result.action === 'move'
+        ? tr('runtime.project.lifecycle.move_success', {}, '项目已移动，注册表已同步。', 'Project moved and registry synchronized.')
+        : tr('runtime.project.lifecycle.clone_success', {}, '项目已克隆为新的独立项目。', 'Project cloned as a new independent project.'), 'ok');
+      publishLifecycleOperation(State.lifecycleQueueOperation, 'succeeded');
+    } catch (error) {
+      const message = String(error && error.message || error);
+      lifecycleStatus('pj-lifecycle-status', message, 'blocked');
+      publishLifecycleOperation(State.lifecycleQueueOperation, 'failed', message);
+    } finally {
+      State.lifecycleBusy = false;
+      updateProjectHub();
+    }
+  }
+
+  async function openRecentProject() {
+    if (!State.projects.length) await reloadProjects();
+    const recent = State.projects[State.projects.length - 1] || null;
+    if (!recent) {
+      VCS.toast(tr('runtime.project.lifecycle.no_recent', {},
+        '还没有最近项目。', 'There are no recent projects yet.'), 'fail');
+      return;
+    }
+    State.explicitWorkflow = '';
+    const selected = await requestProjectSelection(recent, State.currentProjectId);
+    if (selected) {
+      setAccordionOpen('pj-results-card', true);
+      scrollToCard('pj-results-card');
+    }
   }
 
   function publicProject(project) {
     if (!project) return null;
-    const out = Object.assign({}, project, { project_id: projectId(project) });
-    delete out._workspace_id;
-    return out;
+    const total = Math.max(0, Number(project.n_members || 0) || 0);
+    const done = Math.max(0, Number(project.n_done || 0) || 0);
+    return {
+      project_id: projectId(project),
+      name: String(project.name || ''),
+      counts: { members: total, done, pending: Math.max(0, total - done) },
+    };
   }
 
   const LIS_MUTABLE_CONTROLS = [
@@ -249,7 +660,7 @@
     const stage = String(project && project.pipeline_stage || '').trim();
     State.workflowStage = stage;
     State.workflowNeedsHuman = !!(project && project.pipeline_needs_human);
-    State.workflowProjectPath = String(project && project.path || '');
+    State.workflowProjectId = projectId(project);
     State.workflowPendingSubmit = stage === 'submit';
     State.workflowSubmitted = ['monitor', 'recover'].includes(stage);
     State.workflowAnalysisReady = ['analysis', 'report_done'].includes(stage);
@@ -321,12 +732,12 @@
     }, `<b>{value1}</b><span>怎么处理：{value2}</span>`, '<b>{value1}</b><span>How to resolve it: {value2}</span>');
   }
 
-  async function openProjectResults(projectPath) {
+  async function openProjectResults(projectIdValue) {
     await reloadProjects();
     const sel = $('pj-select');
-    const hit = State.projects.find(p => p.path === projectPath || p.name === projectPath);
+    const hit = State.projects.find(p => projectId(p) === String(projectIdValue || ''));
     if (sel && hit) {
-      sel.value = hit.path;
+      sel.value = projectId(hit);
       restoreWorkflowState(hit);
     }
     updateProjectSummary();
@@ -831,6 +1242,15 @@
     }));
   }
 
+  function projectIdFrom(result) {
+    return rawProjectId(result && result.project) || rawProjectId(result);
+  }
+
+  function projectNameFrom(result, fallback = '') {
+    return String(result && (result.name || result.project_name ||
+      (result.project && result.project.name)) || fallback);
+  }
+
   async function commitImport() {
     const gate = importMethodGate();
     const source = val('pj-import-source'), root = val('pj-import-root');
@@ -851,7 +1271,9 @@
       }
       textList(r.warnings).forEach(x => VCS.log(x, 'warnc'));
       showImportProblem('', '');
-      VCS.log(tr("runtime.project.commitimport.text_54912ff73c", {}, '本地结果已建立吸附能项目:', 'Local results created an adsorption-energy project:') + (r.project_path || name), 'okc');
+      const createdProjectId = projectIdFrom(r);
+      const createdProjectName = projectNameFrom(r, name);
+      VCS.log(tr("runtime.project.commitimport.text_54912ff73c", {}, '本地结果已建立吸附能项目:', 'Local results created an adsorption-energy project:') + createdProjectName, 'okc');
       if (r.auto_report && r.auto_report.ok) {
         const files = (r.auto_report.files || [r.auto_report.file]).filter(Boolean);
         VCS.log((r.auto_report_reason ? tr("runtime.project.commitimport.text_7dd8c823cf", {}, '诊断报告', 'Diagnostic report') : tr("runtime.project.commitimport.text_2c48c34392", {}, '最终报告', 'Final report')) +
@@ -862,10 +1284,9 @@
       if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
       await reloadProjects();
       const sel = $('pj-select');
-      const hit = State.projects.find(p => p.path === r.project_path || p.name === (r.project_name || name));
+      const hit = State.projects.find(p => projectId(p) === createdProjectId);
       if (sel && hit) {
-        sel.value = hit.path;
-        restoreWorkflowState(hit);
+        applyProjectSelection(hit);
       }
       // 建好项目后立即刷新 ΔE；后端已在全 DONE 时自动生成最终或诊断报告。
       const deltaResult = await delta();
@@ -882,10 +1303,8 @@
       // locked until both clean slab and at least one config are present.
       const reportReady = isAdsorption && !hasNeedsHuman && !hasIncompleteDelta && !deltaMethodBlocked;
       const referenceOnly = gate.molecules > 0 && !isAdsorption;
-      const startWithReferences = () => startLiS(
-        r.project_path || r.path || r.project_name || name);
-      const openCreatedJobs = () => openImportedCreatedJobs(
-        r.project_path || r.path || '');
+      const startWithReferences = () => startLiS(createdProjectId);
+      const openCreatedJobs = () => openImportedCreatedJobs(createdProjectId);
       showImportDone(r, gate.selected.length, reportReady,
         gate.molecules > 0 && createdCount === 0,
         referenceOnly, createdCount, openCreatedJobs);
@@ -901,7 +1320,7 @@
       if (typeof VCS.nextStep === 'function') {
         VCS.nextStep({
           title: tr("runtime.project.commitimport.text_fc6573fc58", {}, '结果导入完成', 'Result import complete'),
-          message: tr("runtime.project.commitimport.text_6bb19d80e7", { value1: (gate.selected.length), value2: (r.project_name || name) }, `已导入 {value1} 个条目并建立项目「{value2}」。`, 'Imported {value1} entries and created project “{value2}”.'),
+          message: tr("runtime.project.commitimport.text_6bb19d80e7", { value1: (gate.selected.length), value2: createdProjectName }, `已导入 {value1} 个条目并建立项目「{value2}」。`, 'Imported {value1} entries and created project “{value2}”.'),
           detail: createdCount
             ? tr("runtime.project.commitimport.text_ebac0f1205", { value1: (createdCount) }, `其中 {value1} 个只有完整四件套、尚未运行。下一步到任务页选择服务器、核数和墙时后提交。`, '{value1} entries contain complete four-file input sets but have not run. Next, select a server, core count, and wall time on Jobs, then submit them.')
             : referenceOnly
@@ -928,11 +1347,11 @@
     }
   }
 
-  async function openImportedCreatedJobs(projectPath) {
+  async function openImportedCreatedJobs(projectIdValue) {
     const out = await VCS.navigate('jobs', { source: 'import-created-inputs' });
     if (!out.ok) return;
     if (window.Jobs && typeof window.Jobs.selectCreatedProject === 'function') {
-      const selected = await window.Jobs.selectCreatedProject(projectPath);
+      const selected = await window.Jobs.selectCreatedProject(projectIdValue);
       if (!selected) VCS.toast(tr("runtime.project.openimportedcreatedjobs.text_9a2318a251", {}, '未找到待提交成员，请在任务页清除筛选后检查', 'No members awaiting submission were found; clear the filters on Jobs and check again'), 'fail');
     }
   }
@@ -942,7 +1361,7 @@
     const box = $('pj-import-done');
     if (!box) return;
     box.hidden = false;
-    box.innerHTML = tr("runtime.project.showimportdone.text_b7d65b63a3", { value1: (VCS.esc(result.project_name || val('pj-import-name'))) }, `<b>导入完成：</b>{value1}，`, '<b>Import complete:</b> {value1}, ') +
+    box.innerHTML = tr("runtime.project.showimportdone.text_b7d65b63a3", { value1: VCS.esc(projectNameFrom(result, val('pj-import-name'))) }, `<b>导入完成：</b>{value1}，`, '<b>Import complete:</b> {value1}, ') +
       tr("runtime.project.showimportdone.text_1655f5a868", {
         value1: count,
         value2: createdCount ? tr('runtime.project.showimportdone.created_pending', {
@@ -974,8 +1393,7 @@
     const submitCreated = box.querySelector('[data-next="submit-created"]');
     if (submitCreated && openCreatedJobs) submitCreated.addEventListener('click', openCreatedJobs);
     const lis = box.querySelector('[data-next="lis"]');
-    if (lis) lis.addEventListener('click', () => startLiS(
-      result.project_path || result.path || result.project_name || val('pj-import-name')));
+    if (lis) lis.addEventListener('click', () => startLiS(projectIdFrom(result)));
     const reportButton = box.querySelector('[data-next="report"]');
     if (reportReady && reportButton) reportButton.addEventListener('click', report);
   }
@@ -1022,6 +1440,7 @@
   async function openImport(sourceRoot) {
     // 公开入口可从仪表盘直接调用；旧调用方曾传过模式名 "results"，它不是路径。
     if (sourceRoot === 'results') sourceRoot = '';
+    setExplicitWorkflow('import');
     if (typeof VCS.navigate === 'function') {
       await VCS.navigate('project', { source: 'result-import' });
     }
@@ -1073,8 +1492,8 @@
   }
 
   function selectedReferenceProject() {
-    const path = val('lis-reference');
-    return State.projects.find(p => p.path === path) || null;
+    const id = val('lis-reference');
+    return State.projects.find(p => projectId(p) === id) || null;
   }
 
   function selectedReferenceSpecies() {
@@ -1309,7 +1728,7 @@
     if (!prepared || prepared.fingerprint === fingerprint) return;
     State.preparedLis = null;
     State.workflowSubmitted = false;
-    State.preparedConflictHint = { oldName: prepared.name, path: prepared.path };
+    State.preparedConflictHint = { oldName: prepared.name, projectId: prepared.projectId };
     State.methodCheck = null;
     State.methodCheckFingerprint = '';
     State.repairPlan = null;
@@ -1317,7 +1736,7 @@
     const methodBox = $('lis-method-check');
     if (methodBox) methodBox.hidden = true;
     showLisFailure(tr("runtime.project.invalidatepreparedlis.text_f41190806b", {}, '输入已改变，不能复用刚才生成的项目', 'The input changed, so the project generated moments ago cannot be reused'),
-      tr("runtime.project.invalidatepreparedlis.text_c25ebd7c98", { value1: (prepared.path) }, `原项目仍安全保留在 {value1}。如果要按新输入再生成，请把项目名改成新名称；不要覆盖旧项目。`, 'The original project remains safely stored at {value1}. To generate again from the new input, use a new project name; do not overwrite the old project.'),
+      tr("runtime.project.invalidatepreparedlis.text_c25ebd7c98", { value1: prepared.name }, `原项目“{value1}”仍安全保留。如果要按新输入再生成，请把项目名改成新名称；不要覆盖旧项目。`, 'The original project “{value1}” remains safely stored. To generate again from the new input, use a new project name; do not overwrite the old project.'),
       'prepare');
   }
 
@@ -1684,7 +2103,7 @@
       const prepared = reusablePreparedLis();
       const analysisPaused = ['unverified', 'incompatible'].includes(gate.methodStatus);
       note.textContent = prepared && !prepared.submitted
-        ? tr("runtime.project.updatelisreadiness.text_c92c179248", { value1: (prepared.path) }, `本地项目已经生成。直接重试提交即可，不会重复生成或覆盖：{value1}`, 'The local project has already been generated. Retry submission directly; nothing will be regenerated or overwritten: {value1}')
+        ? tr("runtime.project.updatelisreadiness.text_c92c179248", { value1: prepared.name }, `本地项目“{value1}”已经生成。直接重试提交即可，不会重复生成或覆盖。`, 'The local project “{value1}” is already generated. Retry submission directly; nothing will be regenerated or overwritten.')
         : gate.ok
           ? analysisPaused
             ? tr("runtime.project.updatelisreadiness.text_3d79a69bba", { value1: (val('lis-profile')) }, `作业已就绪，可在 {value1} 提交；自动 ΔE / 最终报告将暂停，等方法证据修正或补齐后继续。`, 'Jobs are ready for submission on {value1}. Automatic ΔE and the final report will remain paused until method evidence is corrected or completed.')
@@ -1743,11 +2162,11 @@
       const english = !!(VCS.i18n && VCS.i18n.lang === 'en');
       const detail = species.length
         ? `${english ? ': ' : '：'}${species.join(english ? ', ' : '、')}` : '';
-      return tr("runtime.project.renderreferenceprojects.text_1d981dafe2", { value1: (VCS.esc(p.path)), value2: (VCS.esc(p.name || pathBase(p.path))), value3: (count), value4: (VCS.esc(detail)) }, `<option value="{value1}">{value2}（{value3} 个物种{value4}）</option>`, '<option value="{value1}">{value2} ({value3} species{value4})</option>');
+      return tr("runtime.project.renderreferenceprojects.text_1d981dafe2", { value1: VCS.esc(projectId(p)), value2: VCS.esc(p.name || projectId(p)), value3: count, value4: VCS.esc(detail) }, `<option value="{value1}">{value2}（{value3} 个物种{value4}）</option>`, '<option value="{value1}">{value2} ({value3} species{value4})</option>');
     }).join('');
-    const hit = refs.find(p => p.path === previous || p.name === previous) ||
+    const hit = refs.find(p => projectId(p) === previous) ||
       (!previous && refs.length === 1 ? refs[0] : null);
-    if (hit) sel.value = hit.path;
+    if (hit) sel.value = projectId(hit);
     const options = $('lis-species-options');
     if (options) options.innerHTML = selectedReferenceSpecies()
       .map(x => `<option value="${VCS.esc(x)}"></option>`).join('');
@@ -2127,11 +2546,11 @@
     applyLisProfileDefaults();
   }
 
-  async function submitLiSProject(projectPath, gate) {
+  async function submitLiSProject(projectIdValue, gate) {
     let password = null;
     let trust = false;
     for (let attempt = 0; attempt < 6; attempt++) {
-      const r = await VCS.call('submit_project_with_resources', projectPath,
+      const r = await VCS.call('submit_project_with_resources', projectIdValue,
         val('lis-profile'), gate.cores, gate.walltime, password, trust);
       if (!r || r.cancelled) return null;
       if (r.needPassword) { password = r.password; continue; }
@@ -2152,10 +2571,7 @@
     return { ok: false, error: tr("runtime.project.submitlisproject.text_7aed13d7ed", {}, '密码或主机信任重试次数过多，请检查服务器配置', 'Too many password or host-trust retries; check the server configuration') };
   }
 
-  function projectPathFrom(result) {
-    return String(result && (result.project_path || result.path ||
-      (result.project && (result.project.path || result.project.project_path))) || '');
-  }
+  function preparedProjectId(result) { return projectIdFrom(result); }
 
   function submissionRows(result) {
     const raw = result && (result.results || result.submissions || result.jobs || result.items) || [];
@@ -2239,7 +2655,7 @@
     box.hidden = false;
     const action = lisRepairAction(message, stage);
     box.innerHTML = `<div class="lis-result-head bad"><b>${VCS.esc(title)}</b>` +
-      (reusable ? `<span>${VCS.esc(reusable.path)}</span>` : '') + '</div>' +
+      (reusable ? `<span>${VCS.esc(reusable.name)}</span>` : '') + '</div>' +
       `<div class="lis-result-error">${VCS.esc(message || tr(
         'runtime.project.common.unknown_error', {}, '未知错误', 'Unknown error'))}</div>` +
       tr("runtime.project.showlisfailure.text_abaf4ecfde", { value1: (VCS.esc(lisRepairHint(message, stage))) }, `<div class="lis-result-fix"><b>怎么处理</b><span>{value1}</span>`, '<div class="lis-result-fix"><b>How to resolve it</b><span>{value1}</span>') +
@@ -2251,14 +2667,15 @@
     const box = $('lis-submit-result');
     if (!box) return;
     const rows = submissionRows(submitted);
-    const projectPath = projectPathFrom(prepared);
+    const preparedId = preparedProjectId(prepared);
+    const preparedName = projectNameFrom(prepared, val('pj-name'));
     const ok = submitted && submitted.ok !== false && !submitted.error;
     const automationNotReady = !ok && /凭据.*保存|keyring|无人值守|自动(?:托管|驾驶).*保存/i.test(
       String(submitted && submitted.error || '')) && rows.some(row => row.ok && !row.skipped);
     const heading = ok ? tr("runtime.project.renderlissubmitresult.text_0accad88ea", {}, '整组已生成并提交', 'The complete group was generated and submitted')
       : automationNotReady ? tr("runtime.project.renderlissubmitresult.text_99522945ec", {}, '任务已提交，但自动续算尚未接管', 'Tasks were submitted, but automatic continuation has not taken over') : tr("runtime.project.renderlissubmitresult.text_c51ae610f1", {}, '项目已生成，但提交没有全部完成', 'The project was generated, but submission did not complete for every member');
     let html = `<div class="lis-result-head ${ok ? 'ok' : 'bad'}"><b>${heading}</b>` +
-      `<span>${VCS.esc(projectPath || val('pj-name'))}</span></div>`;
+      `<span>${VCS.esc(preparedName)}</span></div>`;
     if (rows.length) {
       html += tr("runtime.project.renderlissubmitresult.text_a30d2b90af", {}, '<table><thead><tr><th>成员作业</th><th>提交结果</th><th>说明 / 作业号</th></tr></thead><tbody>', '<table><thead><tr><th>Member job</th><th>Submission result</th><th>Details / job ID</th></tr></thead><tbody>');
       rows.forEach(row => {
@@ -2292,7 +2709,7 @@
       if (typeof VCS.navigate === 'function') VCS.navigate('jobs', { source: 'lis-submitted' });
     });
     const results = box.querySelector('[data-lis-next="results"]');
-    if (results) results.addEventListener('click', () => openProjectResults(projectPath));
+    if (results) results.addEventListener('click', () => openProjectResults(preparedId));
   }
 
   async function prepareAndSubmitLiS() {
@@ -2310,15 +2727,15 @@
     if (button) { button.disabled = true; button.textContent = reusable ? tr("runtime.project.prepareandsubmitlis.text_175082b3d3", {}, '正在重试未提交成员…', 'Retrying unsubmitted members…') : tr("runtime.project.prepareandsubmitlis.text_873fa4203d", {}, '正在生成整组输入…', 'Generating the complete input group…'); }
     if (resultBox) resultBox.hidden = true;
     VCS.log(reusable
-      ? tr("runtime.project.prepareandsubmitlis.text_f63d528e50", {}, '复用已生成项目，直接重试尚未提交的成员：', 'Reusing the generated project and retrying only unsubmitted members:') + reusable.path
+      ? tr("runtime.project.prepareandsubmitlis.text_f63d528e50", {}, '复用已生成项目，直接重试尚未提交的成员：', 'Reusing the generated project and retrying only unsubmitted members:') + reusable.name
       : tr("runtime.project.prepareandsubmitlis.text_c7e00bfbb9", { value1: (gate.refs.length), value2: (gate.items.length) }, `正在按 {value1} 个 Li-S 参考物种准备 clean slab + {value2} 个 adsorption 作业…`, 'Preparing a clean slab plus {value2} adsorption jobs using {value1} Li-S reference species…'));
     try {
       let prepared;
       if (reusable) {
-        prepared = { ok: true, project_path: reusable.path, warnings: [], advisories: [] };
+        prepared = { ok: true, project_id: reusable.projectId, project_name: reusable.name, warnings: [], advisories: [] };
       } else {
         prepared = await VCS.call('proj_prepare_lis', val('pj-name'), val('pj-slab'), gate.items,
-          val('pj-incar'), val('pj-root'), gate.ref.path, gate.methodConfirmation,
+          val('pj-incar'), val('pj-root'), projectId(gate.ref), gate.methodConfirmation,
           gate.memberIncars, gate.repairRequest);
         const methodCheck = prepared && prepared.method_check;
         const needsMethod = !!(prepared && prepared.needs_method_confirmation);
@@ -2362,23 +2779,24 @@
         prepared && prepared.method_check))) {
         VCS.log(tr("runtime.project.prepareandsubmitlis.text_8469a9d68e", {}, '作业继续提交；自动 ΔE 与最终报告将等方法证据通过后再继续', 'Jobs will still be submitted; automatic ΔE and the final report resume after method evidence passes validation'), 'warnc');
       }
-      const projectPath = projectPathFrom(prepared);
-      if (!projectPath) {
-        VCS.log(tr("runtime.project.prepareandsubmitlis.text_4d130c0198", {}, 'Li-S 项目生成失败:后端没有返回项目路径', 'Li-S project generation failed: the backend returned no project path'), 'failc');
-        showLisFailure(tr("runtime.project.prepareandsubmitlis.text_6383f2c392", {}, '项目生成未完成', 'Project generation did not complete'), tr("runtime.project.prepareandsubmitlis.text_e2bc8e129a", {}, '后端没有返回项目路径', 'The backend returned no project path'), 'prepare');
+      const preparedId = preparedProjectId(prepared);
+      const preparedName = projectNameFrom(prepared, val('pj-name'));
+      if (!preparedId) {
+        VCS.log(tr("runtime.project.prepareandsubmitlis.text_4d130c0198", {}, 'Li-S 项目生成失败:后端没有返回项目 ID', 'Li-S project generation failed: the backend returned no project ID'), 'failc');
+        showLisFailure(tr("runtime.project.prepareandsubmitlis.text_6383f2c392", {}, '项目生成未完成', 'Project generation did not complete'), tr("runtime.project.prepareandsubmitlis.text_e2bc8e129a", {}, '后端没有返回项目 ID', 'The backend returned no project ID'), 'prepare');
         return;
       }
       if (!reusable) {
         State.preparedLis = {
-          path: projectPath, fingerprint: operationFingerprint, name: val('pj-name'), submitted: false,
+          projectId: preparedId, fingerprint: operationFingerprint, name: preparedName, submitted: false,
         };
         State.preparedConflictHint = null;
       }
       VCS.log(tr("runtime.project.prepareandsubmitlis.text_f804637f11", {}, '项目已生成，正在上传到 ', 'Project generated; uploading to ') + val('lis-profile') + tr("runtime.project.prepareandsubmitlis.text_fac92c00eb", {}, ' 并提交…', ' and submitting…'), 'okc');
       if (button) button.textContent = tr("runtime.project.prepareandsubmitlis.text_fe3f2f5151", {}, '正在上传并提交整组…', 'Uploading and submitting the complete group…');
-      const submitted = await submitLiSProject(projectPath, gate);
+      const submitted = await submitLiSProject(preparedId, gate);
       if (!submitted) {
-        VCS.log(tr("runtime.project.prepareandsubmitlis.text_8d7f1cb39e", {}, '已取消提交；本地项目仍保留在 ', 'Submission canceled; the local project remains at ') + projectPath, 'warnc');
+        VCS.log(tr("runtime.project.prepareandsubmitlis.text_8d7f1cb39e", {}, '已取消提交；本地项目仍保留：', 'Submission canceled; the local project remains: ') + preparedName, 'warnc');
         showLisFailure(tr("runtime.project.prepareandsubmitlis.text_c120dd5cc7", {}, '本地项目已生成，提交已取消', 'The local project was generated; submission was canceled'),
           tr("runtime.project.prepareandsubmitlis.text_e43a0afc44", {}, '没有提交任何新成员。再次点击主按钮即可直接重试，不会重复生成项目。', 'No new members were submitted. Select the primary button again to retry directly; the project will not be regenerated.'), 'submit');
         return;
@@ -2410,20 +2828,21 @@
     }
   }
 
-  async function startLiS(referenceProject) {
+  async function startLiS(referenceProjectId) {
+    setExplicitWorkflow('structure');
     const ana = $('analysis-type');
     if (ana && ana.value !== 'adsorption') {
       ana.value = 'adsorption';
       ana.dispatchEvent(new Event('change', { bubbles: true }));
     }
-    await reloadProjects(referenceProject);
+    await reloadProjects(referenceProjectId);
     setAccordionOpen('pj-import-card', false);
     setAccordionOpen('pj-results-card', false);
     setAccordionOpen('pj-create-card', true);
     scrollToCard('pj-create-card');
     const sel = $('lis-reference');
-    const hit = State.projects.find(p => p.path === referenceProject || p.name === referenceProject);
-    if (sel && hit) { sel.value = hit.path; onReferenceChanged(); }
+    const hit = State.projects.find(p => projectId(p) === String(referenceProjectId || ''));
+    if (sel && hit) { sel.value = projectId(hit); onReferenceChanged(); }
     else updateLisReadiness();
   }
 
@@ -2474,7 +2893,7 @@
     try {
       const prepared = await VCS.call(
         'proj_prepare_lis', val('pj-name'), val('pj-slab'), gate.items,
-        val('pj-incar'), val('pj-root'), gate.ref.path, gate.methodConfirmation,
+        val('pj-incar'), val('pj-root'), projectId(gate.ref), gate.methodConfirmation,
         gate.memberIncars, gate.repairRequest);
       const methodCheck = prepared && prepared.method_check;
       const needsMethod = !!(prepared && prepared.needs_method_confirmation);
@@ -2501,25 +2920,26 @@
       }
       textList(prepared.advisories).forEach(x => VCS.log(tr("runtime.project.create.text_b0364d757b", {}, '方法学提示:', 'Methodology note:') + x, 'warnc'));
       textList(prepared.warnings).forEach(x => VCS.log(x, 'warnc'));
-      const projectPath = projectPathFrom(prepared);
-      if (!projectPath) {
-        showLisFailure(tr("runtime.project.create.text_6383f2c392", {}, '项目生成未完成', 'Project generation did not complete'), tr("runtime.project.create.text_e2bc8e129a", {}, '后端没有返回项目路径', 'The backend returned no project path'), 'prepare');
+      const preparedId = preparedProjectId(prepared);
+      const preparedName = projectNameFrom(prepared, val('pj-name'));
+      if (!preparedId) {
+        showLisFailure(tr("runtime.project.create.text_6383f2c392", {}, '项目生成未完成', 'Project generation did not complete'), tr("runtime.project.create.text_e2bc8e129a", {}, '后端没有返回项目 ID', 'The backend returned no project ID'), 'prepare');
         return;
       }
       State.preparedLis = {
-        path: projectPath, fingerprint: operationFingerprint,
-        name: val('pj-name'), submitted: false,
+        projectId: preparedId, fingerprint: operationFingerprint,
+        name: preparedName, submitted: false,
       };
       State.preparedConflictHint = null;
       const resultBox = $('lis-submit-result');
       if (resultBox) {
         resultBox.hidden = false;
         resultBox.innerHTML = tr("runtime.project.create.text_9fca54aec8", {}, '<div class="lis-result-head ok"><b>逐目录作业已生成，尚未提交</b>', '<div class="lis-result-head ok"><b>Per-directory jobs generated; not yet submitted</b>') +
-          `<span>${VCS.esc(projectPath)}</span></div>` +
+          `<span>${VCS.esc(preparedName)}</span></div>` +
           tr("runtime.project.create.text_e7525bccc8", {}, '<div class="lis-result-next"><b>输入已冻结</b><span>完整成员使用同目录原始四件套；不完整成员按本目录 POSCAR+INCAR 生成受管四件套。', '<div class="lis-result-next"><b>Input frozen</b><span>Complete members use their original four-file input sets; incomplete members use managed four-file sets generated from the directory\'s POSCAR+INCAR.') +
           tr("runtime.project.create.text_28e51f5f49", {}, '可回到主按钮选择服务器并提交；不会重复生成项目。</span></div>', 'Return to the primary button to select a server and submit; the project will not be regenerated.</span></div>');
       }
-      VCS.log(tr("runtime.project.create.text_b955457174", {}, '逐目录作业已生成，尚未提交：', 'Per-directory jobs generated and awaiting submission:') + projectPath, 'okc');
+      VCS.log(tr("runtime.project.create.text_b955457174", {}, '逐目录作业已生成，尚未提交：', 'Per-directory jobs generated and awaiting submission:') + preparedName, 'okc');
       if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
       await reloadProjects();
       if (typeof VCS.nextStep === 'function') {
@@ -2543,45 +2963,49 @@
     if (State.compareSelectionRestored) return;
     State.compareSelectionRestored = true;
     try {
-      const raw = JSON.parse(localStorage.getItem(COMPARE_PROJECTS_KEY) || '[]');
+      localStorage.removeItem(LEGACY_CURRENT_PROJECT_KEY);
+      localStorage.removeItem(LEGACY_COMPARE_PROJECTS_KEY);
+      const raw = JSON.parse(localStorage.getItem(COMPARE_PROJECT_IDS_KEY) || '[]');
       if (Array.isArray(raw)) {
-        State.comparePaths = new Set(raw.map(path => String(path || '')).filter(Boolean));
+        State.compareProjectIds = new Set(raw.map(id => String(id || '').trim())
+          .filter(id => PROJECT_ID_RE.test(id)));
       }
     } catch (_) {
-      State.comparePaths = new Set();
+      State.compareProjectIds = new Set();
     }
   }
 
   function persistCompareSelection() {
     try {
-      localStorage.setItem(COMPARE_PROJECTS_KEY, JSON.stringify(Array.from(State.comparePaths)));
+      localStorage.setItem(COMPARE_PROJECT_IDS_KEY,
+        JSON.stringify(Array.from(State.compareProjectIds)));
     } catch (_) { /* 存储不可用不阻塞项目比较 */ }
   }
 
   function reconcileCompareSelection() {
     restoreCompareSelection();
-    const known = new Set(State.projects.map(project => String(project.path || '')));
+    const known = new Set(State.projects.map(projectId).filter(Boolean));
     let changed = false;
-    Array.from(State.comparePaths).forEach(path => {
-      if (!known.has(path)) {
-        State.comparePaths.delete(path);
+    Array.from(State.compareProjectIds).forEach(id => {
+      if (!known.has(id)) {
+        State.compareProjectIds.delete(id);
         changed = true;
       }
     });
     if (changed) persistCompareSelection();
   }
 
-  function selectedComparePaths() {
+  function selectedCompareProjectIds() {
     return State.projects
-      .map(project => String(project.path || ''))
-      .filter(path => path && State.comparePaths.has(path));
+      .map(projectId)
+      .filter(id => id && State.compareProjectIds.has(id));
   }
 
-  function setCompareSelection(paths) {
-    const known = new Set(State.projects.map(project => String(project.path || '')));
-    State.comparePaths = new Set((paths || [])
-      .map(path => String(path || ''))
-      .filter(path => path && known.has(path)));
+  function setCompareSelection(ids) {
+    const known = new Set(State.projects.map(projectId).filter(Boolean));
+    State.compareProjectIds = new Set((ids || [])
+      .map(id => String(id || '').trim())
+      .filter(id => PROJECT_ID_RE.test(id) && known.has(id)));
     State.comparePreview = null;
     State.comparePreviewGeneration += 1;
     persistCompareSelection();
@@ -2589,15 +3013,15 @@
     scheduleComparePreview();
   }
 
-  function comparePreviewProject(path) {
+  function comparePreviewProject(id) {
     const projects = State.comparePreview && State.comparePreview.projects;
     return Array.isArray(projects)
-      ? projects.find(project => String(project.path || '') === String(path || ''))
+      ? projects.find(project => projectId(project) === String(id || ''))
       : null;
   }
 
   function comparisonCounts() {
-    const selected = selectedComparePaths();
+    const selected = selectedCompareProjectIds();
     const preview = State.comparePreview;
     if (preview && preview.ok !== false && Array.isArray(preview.projects)) {
       const blocked = preview.projects.filter(project => project.status === 'blocked').length;
@@ -2610,8 +3034,8 @@
         checked: true,
       };
     }
-    const known = new Set(State.projects.map(project => String(project.path || '')));
-    const valid = selected.filter(path => known.has(path)).length;
+    const known = new Set(State.projects.map(projectId).filter(Boolean));
+    const valid = selected.filter(id => known.has(id)).length;
     return {
       selected: selected.length,
       valid,
@@ -2661,7 +3085,7 @@
       const ready = project.status === 'ready';
       const reasons = ready ? (project.warnings || []) : (project.block_reasons || []);
       h += `<div class="pj-compare-project ${ready ? 'ready' : 'blocked'}">` +
-        `<b>${VCS.esc(project.display_name || project.name || pathBase(project.path))}</b>` +
+        `<b>${VCS.esc(project.display_name || project.name || projectId(project))}</b>` +
         `<span>${ready
           ? tr('runtime.project.compare.adsorption_valid', {}, '吸附能有效', 'Adsorption energy valid')
           : tr('runtime.project.compare.blocked', {}, '已阻断', 'Blocked')} · ${project.ladder
@@ -2680,16 +3104,16 @@
     status.innerHTML = h || tr("runtime.project.rendercomparesummary.text_602596d9ab", {}, '<span class="pj-compare-empty">预检完成。</span>', '<span class="pj-compare-empty">Preflight complete.</span>');
   }
 
-  function legacyComparisonPreview(paths) {
-    const projects = (paths || []).map(path => {
-      const project = State.projects.find(item => String(item.path || '') === String(path || ''));
+  function localComparisonPreview(ids) {
+    const projects = (ids || []).map(id => {
+      const project = State.projects.find(item => projectId(item) === id);
       const total = Number(project && project.n_members || 0);
       const done = Number(project && project.n_done || 0);
       const ready = !!project && total > 0 && done >= total;
       return {
-        path,
-        name: project && project.name || pathBase(path),
-        display_name: project && project.name || pathBase(path),
+        project_id: id,
+        name: project && project.name || id,
+        display_name: project && project.name || id,
         status: ready ? 'ready' : 'blocked',
         ladder: null,
         warnings: ready ? [tr("runtime.project.legacycomparisonpreview.text_abb5c72a71", {}, '旧版后端未提供跨项目方法与路径预检', 'The legacy backend did not provide cross-project method and pathway preflight')] : [],
@@ -2699,7 +3123,7 @@
     const readyCount = projects.filter(project => project.status === 'ready').length;
     return {
       ok: true,
-      legacy: true,
+      local_only: true,
       selected_count: projects.length,
       ready_count: readyCount,
       ladder_ready_count: 0,
@@ -2714,21 +3138,21 @@
   }
 
   async function refreshComparePreview() {
-    const paths = selectedComparePaths();
+    const ids = selectedCompareProjectIds();
     const generation = ++State.comparePreviewGeneration;
-    if (!paths.length) {
+    if (!ids.length) {
       State.comparePreview = null;
       renderCompareSummary();
       return;
     }
     const preset = $('pj-preset') ? $('pj-preset').value : '';
-    const result = await VCS.call('proj_compare_preview', paths, preset || null);
+    const result = await VCS.call('proj_compare_preview', ids, preset || null);
     if (generation !== State.comparePreviewGeneration) return;
     if (bridgeMethodUnavailable(result)) {
-      State.comparePreview = legacyComparisonPreview(paths);
+      State.comparePreview = localComparisonPreview(ids);
     } else {
       State.comparePreview = result && result.ok !== false && !result.error
-        ? result
+        ? sanitizeComparisonPreview(result)
         : { ok: false, error: (result && result.error) || tr("runtime.project.refreshcomparepreview.text_15f465b7c9", {}, '比较预检失败', 'Comparison preflight failed'), projects: [] };
     }
     renderFigProjList();
@@ -2744,50 +3168,49 @@
   }
 
   function selectAllCompareProjects() {
-    setCompareSelection(State.projects.map(project => project.path));
+    setCompareSelection(State.projects.map(projectId));
   }
 
   async function selectComparableProjects() {
-    const paths = State.projects.map(project => String(project.path || '')).filter(Boolean);
-    if (!paths.length) return;
+    const ids = State.projects.map(projectId).filter(Boolean);
+    if (!ids.length) return;
     const preset = $('pj-preset') ? $('pj-preset').value : '';
-    const result = await VCS.call('proj_compare_preview', paths, preset || null);
+    const result = await VCS.call('proj_compare_preview', ids, preset || null);
     if (result && result.ok !== false && !result.error && Array.isArray(result.projects)) {
       setCompareSelection(result.projects
         .filter(project => project.status === 'ready')
-        .map(project => project.path));
+        .map(projectId));
       return;
     }
     // 老后端没有预检接口时，只选已经完成全部成员的项目，不假装其台阶必然可比。
     setCompareSelection(State.projects.filter(project => {
       const total = Number(project.n_members || 0);
       return total > 0 && Number(project.n_done || 0) >= total;
-    }).map(project => project.path));
+    }).map(projectId));
     VCS.log(tr("runtime.project.selectcomparableprojects.text_8827694da8", {}, '当前后端未提供跨项目预检，已暂按“成员全部完成”筛选；生成时仍会再次校验。', 'The current backend does not provide cross-project preflight, so projects were temporarily filtered by all-members-complete; generation will validate again.'), 'warnc');
   }
 
   // ── 已有项目:下拉 + 刷新 ──────────────────────────────────────────────────
   function applyProjectSelection(project, { persist = true, publish = true } = {}) {
     const sel = $('pj-select');
-    const path = String(project && project.path || '');
-    if (sel && sel.value !== path) sel.value = path;
-    State.currentProjectPath = path;
+    const id = projectId(project);
+    if (sel && sel.value !== id) sel.value = id;
+    State.currentProjectId = id;
     State.deltaResult = null;
     State.candidateEvaluation = null;
     restoreWorkflowState(project || null);
-    if (persist) {
-      try { localStorage.setItem(CURRENT_PROJECT_KEY, path); } catch (_) { /* 不阻塞 */ }
-    }
+    if (persist) purgeLegacyProjectStorage();
     updateProjectSummary();
     updateJourney();
-    refreshCandidateEvaluation(path);
+    updateProjectHub();
+    refreshCandidateEvaluation(id);
     if (publish && project) publishProjectContext(project);
     return !!project;
   }
 
-  async function requestProjectSelection(project, previousPath) {
+  async function requestProjectSelection(project, previousId) {
     const sel = $('pj-select');
-    const before = String(previousPath || '');
+    const before = String(previousId || '');
     const selectionGeneration = ++State.projectSelectionGeneration;
     // 原生下拉与工作区程序化选择共用同一世代；后发意图使旧确认失效。
     State.requestedProject = null;
@@ -2817,10 +3240,15 @@
 
   function matchesRequestedProject(project, request) {
     if (!project || !request) return false;
-    if (request.kind === 'path') return String(project.path || '') === request.value;
-    if (request.kind === 'name') return String(project.name || '') === request.value;
     if (request.kind === 'id') return projectId(project) === request.value;
     return false;
+  }
+
+  function purgeLegacyProjectStorage() {
+    try {
+      localStorage.removeItem(LEGACY_CURRENT_PROJECT_KEY);
+      localStorage.removeItem(LEGACY_COMPARE_PROJECTS_KEY);
+    } catch (_) { /* 本地存储不可用不阻塞 */ }
   }
 
   async function performProjectReload(generation, preferredReference) {
@@ -2833,22 +3261,29 @@
       return { ok: false, stale: true, generation };
     }
     const listSucceeded = !!(r && r.ok !== false && !r.error && Array.isArray(r.projects));
-    const pipelineByPath = new Map(((pipeline && pipeline.projects) || [])
-      .map(item => [item.path, item]));
+    const pipelineById = new Map(((pipeline && pipeline.projects) || [])
+      .map(item => [rawProjectId(item), item]).filter(entry => entry[0]));
     const projectRows = listSucceeded ? r.projects : State.projects;
-    State.projects = projectRows.map((project, index) => {
-      const progress = pipelineByPath.get(project.path) || {};
-      return Object.assign({}, project, {
-        // 旧项目没有 UUID 时仅给当前列表一个不含本机路径的兼容标识。
-        // workspace.js 使用同样的 legacy-N 映射；路径继续只存旧 localStorage。
-        _workspace_id: rawProjectId(project) || `legacy-${index + 1}`,
+    State.projects = projectRows.map(project => {
+      const id = rawProjectId(project);
+      if (!id) return null;
+      const cleanProject = withoutProjectLocators(project);
+      const progress = withoutProjectLocators(pipelineById.get(id) || {});
+      const projectCounts = project.counts || {};
+      const progressCounts = progress.counts || {};
+      return Object.assign({}, cleanProject, {
+        project_id: id,
         pipeline_stage: progress.stage || '',
         pipeline_needs_human: !!progress.needs_human,
         pipeline_recover_round: Number(progress.recover_round || 0),
-        n_done: progress.done != null ? Number(progress.done) : project.n_done,
-        n_members: progress.total != null ? Number(progress.total) : project.n_members,
+        n_done: Number(progressCounts.done != null ? progressCounts.done
+          : progress.done != null ? progress.done
+            : projectCounts.done != null ? projectCounts.done : project.n_done || 0),
+        n_members: Number(progressCounts.members != null ? progressCounts.members
+          : progress.total != null ? progress.total
+            : projectCounts.members != null ? projectCounts.members : project.n_members || 0),
       });
-    });
+    }).filter(Boolean);
     State.comparePreview = null;
     State.comparePreviewGeneration += 1;
     if (listSucceeded) reconcileCompareSelection();
@@ -2861,36 +3296,42 @@
       const o = document.createElement('option');
       o.value = ''; o.textContent = tr("runtime.project.performprojectreload.text_2115ae53c9", {}, '(暂无项目)', '(No projects)');
       sel.appendChild(o);
-      State.currentProjectPath = '';
+      State.currentProjectId = '';
       restoreWorkflowState(null);
       renderFigProjList();
       updateProjectSummary();
       updateJourney();
+      updateProjectHub();
       refreshCandidateEvaluation('');
       scheduleComparePreview();
       return { ok: true, stale: false, generation };
     }
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = tr('runtime.project.performprojectreload.no_selection', {},
+      '(未选择项目)', '(No project selected)');
+    sel.appendChild(placeholder);
     State.projects.forEach(p => {
       const o = document.createElement('option');
-      o.value = p.path;
+      o.value = projectId(p);
       const refs = referenceSpecies(p).length;
       o.textContent = (p.name || tr("runtime.project.performprojectreload.text_6b1efca7fc", {}, '(未命名)', '(Unnamed)')) + tr("runtime.project.performprojectreload.text_b79209ecf1", { value1: (p.n_members) }, `（{value1} 成员`, ' ({value1} members') +
         (refs ? tr("runtime.project.performprojectreload.text_df72e94e17", { value1: (refs) }, ` · {value1} 参考物种`, ' · {value1} reference species') : '') + '）';
       sel.appendChild(o);
     });
-    let saved = '';
-    try { saved = localStorage.getItem(CURRENT_PROJECT_KEY) || ''; } catch (_) { /* 不阻塞 */ }
+    purgeLegacyProjectStorage();
     const requested = State.requestedProject;
     const requestedHit = requested && requested.generation === State.projectSelectionGeneration
       ? State.projects.find(project => matchesRequestedProject(project, requested)) : null;
     const active = State.projects.slice().reverse().find(p =>
       ['submit', 'monitor', 'recover'].includes(p.pipeline_stage) || p.pipeline_needs_human);
-    const liveSelection = State.currentProjectPath || (sel ? sel.value : '');
-    const candidates = [requestedHit && requestedHit.path, preferredReference, liveSelection, saved,
-      active && active.path,
-      State.projects[State.projects.length - 1].path];
-    const want = candidates.find(path => State.projects.some(p => p.path === path)) || '';
-    applyProjectSelection(State.projects.find(p => p.path === want) || null);
+    const workspaceId = String(VCS.workspace && VCS.workspace.state &&
+      VCS.workspace.state.project_id || '');
+    const liveSelection = State.currentProjectId || (sel ? sel.value : '');
+    const candidates = [requestedHit && projectId(requestedHit), preferredReference,
+      workspaceId, liveSelection, active && projectId(active)];
+    const want = candidates.find(id => State.projects.some(p => projectId(p) === id)) || '';
+    applyProjectSelection(State.projects.find(p => projectId(p) === want) || null);
     if (requestedHit && State.requestedProject === requested) State.requestedProject = null;
     renderFigProjList();
     scheduleComparePreview();
@@ -2925,13 +3366,13 @@
       const lab = document.createElement('label');
       const cb = document.createElement('input');
       cb.type = 'checkbox';
-      cb.dataset.path = p.path;
-      cb.checked = State.comparePaths.has(String(p.path || ''));
-      const preview = comparePreviewProject(p.path);
+      cb.dataset.projectId = projectId(p);
+      cb.checked = State.compareProjectIds.has(projectId(p));
+      const preview = comparePreviewProject(projectId(p));
       if (preview) lab.classList.add(preview.status === 'ready' ? 'ready' : 'blocked');
       cb.addEventListener('change', () => {
-        if (cb.checked) State.comparePaths.add(String(p.path || ''));
-        else State.comparePaths.delete(String(p.path || ''));
+        if (cb.checked) State.compareProjectIds.add(projectId(p));
+        else State.compareProjectIds.delete(projectId(p));
         State.comparePreview = null;
         State.comparePreviewGeneration += 1;
         persistCompareSelection();
@@ -2987,7 +3428,7 @@
     VCS.log(tr("runtime.project.makefigures.text_76f9eab9f4", {}, '出图中(', 'Generating figures (') + kinds.join('/') + (preset ? tr("runtime.project.makefigures.text_e801f1dccc", {}, ',反应 ', ', reaction ') + preset : '') + ')…');
     try {
       // preset 为空 → Li-S 默认(向后兼容);非空 → ladder 走通用反应引擎
-      const r = await VCS.call('proj_figures', proj.path, kinds, null, preset || null);
+      const r = await VCS.call('proj_figures', projectId(proj), kinds, null, preset || null);
       logFigResult(r, tr("runtime.project.makefigures.text_7f60352d5b", {}, '出图', 'Figure generation'));
     } finally {
       if (btn) btn.disabled = false;
@@ -2996,8 +3437,8 @@
 
   // 多项目对比出图:勾选的项目 + 勾选的图类型调 proj_compare_figures
   async function makeCompareFigures() {
-    const paths = selectedComparePaths();
-    if (paths.length < 2) { VCS.log(tr("runtime.project.makecomparefigures.text_6e949fcef4", {}, '多项目对比请勾选至少 2 个项目', 'Select at least two projects for multi-project comparison'), 'failc'); return; }
+    const ids = selectedCompareProjectIds();
+    if (ids.length < 2) { VCS.log(tr("runtime.project.makecomparefigures.text_6e949fcef4", {}, '多项目对比请勾选至少 2 个项目', 'Select at least two projects for multi-project comparison'), 'failc'); return; }
     const kinds = [];
     if ($('fig-heatmap') && $('fig-heatmap').checked) kinds.push('heatmap');
     if ($('fig-scaling') && $('fig-scaling').checked) kinds.push('scaling');
@@ -3007,15 +3448,15 @@
     const preset = $('pj-preset') ? $('pj-preset').value : '';
     State.compareFiguresBusy = true;
     renderCompareSummary();
-    VCS.log(tr("runtime.project.makecomparefigures.text_51dfa86f1d", {}, '对比出图中(', 'Generating comparison figures (') + paths.length + tr("runtime.project.makecomparefigures.text_36d2ed7a91", {}, ' 个项目,', ' projects,') + kinds.join('/') + ')…');
+    VCS.log(tr("runtime.project.makecomparefigures.text_51dfa86f1d", {}, '对比出图中(', 'Generating comparison figures (') + ids.length + tr("runtime.project.makecomparefigures.text_36d2ed7a91", {}, ' 个项目,', ' projects,') + kinds.join('/') + ')…');
     try {
-      let r = await VCS.call('proj_compare_figures', paths, kinds, null, preset || null);
+      let r = await VCS.call('proj_compare_figures', ids, kinds, null, preset || null);
       const unsupported = r && r.error &&
         /(positional argument|unexpected argument|桥方法不存在|method not found)/i.test(String(r.error));
       if (unsupported) {
         const legacyKinds = kinds.filter(kind => kind !== 'ladder');
         r = legacyKinds.length
-          ? await VCS.call('proj_compare_figures', paths, legacyKinds, null)
+          ? await VCS.call('proj_compare_figures', ids, legacyKinds, null)
           : { ok: true, files: [], skipped: [] };
         if (!r) r = { ok: false, files: [], skipped: [], error: tr("runtime.project.makecomparefigures.text_28c66f3dad", {}, '旧版对比接口没有返回结果', 'The legacy comparison endpoint returned no result') };
         if (kinds.includes('ladder')) {
@@ -3333,9 +3774,9 @@
     return null;
   }
 
-  async function refreshCandidateEvaluation(path) {
+  async function refreshCandidateEvaluation(projectIdValue) {
     const generation = ++State.candidateEvaluationGeneration;
-    const wanted = String(path || '');
+    const wanted = String(projectIdValue || '');
     if (!wanted) {
       State.candidateEvaluation = null;
       hideCandidateEvaluation();
@@ -3357,8 +3798,8 @@
   function updateProjectSummary(deltaResult) {
     const box = $('pj-project-summary');
     const sel = $('pj-select');
-    const path = sel ? sel.value : '';
-    const project = State.projects.find(p => p.path === path);
+    const id = sel ? sel.value : '';
+    const project = State.projects.find(p => projectId(p) === id);
     const deltaButton = $('pj-delta');
     const reportButton = $('pj-report');
     const csvButton = $('pj-csv');
@@ -3436,9 +3877,9 @@
 
   function currentProject() {
     const sel = $('pj-select');
-    const path = sel ? sel.value : '';
-    if (!path) { VCS.log(tr("runtime.project.currentproject.text_27420ded1e", {}, '请先选择一个项目', 'Select a project first'), 'failc'); return null; }
-    return State.projects.find(p => p.path === path) || { path, name: '' };
+    const id = sel ? sel.value : '';
+    if (!id) { VCS.log(tr("runtime.project.currentproject.text_27420ded1e", {}, '请先选择一个项目', 'Select a project first'), 'failc'); return null; }
+    return State.projects.find(p => projectId(p) === id) || null;
   }
 
   // ── 计算 ΔE:proj_delta → 表格渲染(缺员门控原样展示,绝不编数) ──────────
@@ -3448,7 +3889,7 @@
     const box = $('pj-table');
     if (box) box.innerHTML = '';
     VCS.log(tr("runtime.project.delta.text_b9609f43e7", {}, '计算项目「', 'Calculating ΔE for project “') + (proj.name || '') + tr("runtime.project.delta.text_0d02fca122", {}, '」的 ΔE…', '”…'));
-    const r = await VCS.call('proj_delta', proj.path);
+    const r = await VCS.call('proj_delta', projectId(proj));
     if (!r || r.ok === false || r.error) {
       VCS.log(tr("runtime.project.delta.text_bebc908a4e", {}, '计算 ΔE 失败:', 'ΔE calculation failed:') + ((r && r.error) || tr("runtime.project.delta.text_bd5e21c357", {}, '未知错误', 'Unknown error')), 'failc');
       updateProjectSummary();
@@ -3456,7 +3897,7 @@
     }
     State.deltaResult = r;
     renderDelta(r);
-    refreshCandidateEvaluation(proj.path);
+    refreshCandidateEvaluation(projectId(proj));
     const rows = r.rows || [];
     const methodBlocked = String(r.method_consistency && r.method_consistency.status || '')
       .toLowerCase() === 'incompatible';
@@ -3588,7 +4029,7 @@
     if (!dr || !dr.path) return;   // 用户取消
     const save = joinPath(dr.path, (proj.name || 'project') + '_delta_e.csv');
     VCS.log(tr("runtime.project.exportcsv.text_ad1a1424a5", {}, '导出 ΔE 表到:', 'Exporting the ΔE table to:') + save + '…');
-    const r = await VCS.call('proj_export_csv', proj.path, save);
+    const r = await VCS.call('proj_export_csv', projectId(proj), save);
     if (!r || r.ok === false || r.error) {
       VCS.log(tr("runtime.project.exportcsv.text_37ffc76d79", {}, '导出 CSV 失败:', 'CSV export failed:') + ((r && r.error) || tr("runtime.project.exportcsv.text_bd5e21c357", {}, '未知错误', 'Unknown error')), 'failc');
       return;
@@ -3721,15 +4162,15 @@
     });
   }
 
-  async function legacyBatchReports(paths, outDir) {
+  async function legacyBatchReports(ids, outDir) {
     const individual = [];
     const failures = [];
-    for (const [index, path] of paths.entries()) {
-      const project = State.projects.find(item => String(item.path || '') === String(path || ''));
+    for (const [index, id] of ids.entries()) {
+      const project = State.projects.find(item => projectId(item) === id);
       const name = String(project && project.name || `project_${index + 1}`);
       const safeName = name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').trim() || `project_${index + 1}`;
       const save = joinPath(outDir, tr("runtime.project.legacybatchreports.text_fb7a064363", { value1: (String(index + 1).padStart(2, '0')), value2: (safeName) }, `{value1}_{value2}_完整报告.html`, '{value1}_{value2}_full_report.html'));
-      const result = await VCS.call('proj_report', path, save, true);
+      const result = await VCS.call('proj_report', id, save, true);
       if (result && result.ok !== false && !result.error) {
         const returnedFiles = result.files && typeof result.files === 'object' &&
           !Array.isArray(result.files) ? result.files : {};
@@ -3773,17 +4214,13 @@
     }
     const kind = String(mode || 'report');
     const route = kind === 'draftpack' ? 'publish-draftpack' : 'publish-report';
-    const compareIds = kind === 'comparison'
-      ? selectedComparePaths().map(path => State.projects.find(project =>
-        String(project.path || '') === String(path || '')))
-        .map(projectId).filter(Boolean)
-      : [];
+    const compareIds = kind === 'comparison' ? selectedCompareProjectIds() : [];
     const intent = {
       mode: kind,
       projectId: id,
       formats: selectedReportFormats(),
       comparisonProjectIds: compareIds,
-      source: `legacy-project-${kind}`,
+      source: `project-${kind}`,
     };
     if (window.ReportWorkbench && typeof window.ReportWorkbench.open === 'function') {
       return window.ReportWorkbench.open(intent);
@@ -3815,7 +4252,7 @@
     VCS.log(tr("runtime.project.report.text_70579408f2", { value1: (selectedLabel) }, `正在从同一份数据快照生成 {value1} 报告，可能需要几分钟…`, 'Generating {value1} reports from the same data snapshot; this may take several minutes…'));
     try {
       let r = await VCS.call(
-        'proj_report_bundle', proj.path, dr.path, selectedFormats, true);
+        'proj_report_bundle', projectId(proj), dr.path, selectedFormats, true);
       if (bridgeMethodUnavailable(r)) {
         if (selectedFormats.length !== 1 || selectedFormats[0] !== 'html') {
           r = {
@@ -3830,7 +4267,7 @@
           return;
         }
         const save = joinPath(dr.path, (proj.name || 'project') + tr("runtime.project.report.text_b428d9b3ca", {}, '_完整报告.html', '_full_report.html'));
-        const legacy = await VCS.call('proj_report', proj.path, save, true);
+        const legacy = await VCS.call('proj_report', projectId(proj), save, true);
         r = legacy && !legacy.error
           ? Object.assign({}, legacy, { files: { html: legacy.file || save } })
           : legacy;
@@ -3852,7 +4289,7 @@
       VCS.call('open_dir', r.out_dir || dr.path);
       // 重新读取管线状态；只有后端已经落下与当前输入/结果哈希绑定的
       // report_done 标记时，界面才把整个自动流程显示为完成。
-      await reloadProjects(proj.path);
+      await reloadProjects(projectId(proj));
       VCS.toast(r.kind === 'diagnostic' ? tr("runtime.project.report.text_6d3deb78d8", { value1: (selectedLabel) }, `{value1} 诊断报告已生成`, '{value1} diagnostic report generated') : tr("runtime.project.report.text_0ebad8042a", { value1: (selectedLabel) }, `{value1} 报告已生成`, '{value1} report generated'));
     } finally {
       State.reportBusy = false;
@@ -3861,8 +4298,8 @@
   }
 
   async function batchReport() {
-    const paths = selectedComparePaths();
-    if (paths.length < 2) {
+    const ids = selectedCompareProjectIds();
+    if (ids.length < 2) {
       VCS.log(tr("runtime.project.batchreport.text_ee03b663b9", {}, '批次报告请至少选择 2 个催化剂项目', 'Select at least two catalyst projects for a batch report'), 'failc');
       return;
     }
@@ -3874,13 +4311,13 @@
     State.batchReportBusy = true;
     renderCompareSummary();
     if (output) output.innerHTML = '';
-    VCS.log(tr("runtime.project.batchreport.text_023d43b8bb", { value1: (paths.length) }, `正在生成 {value1} 个单项目报告与一份批次比较报告…`, 'Generating {value1} single-project reports and one batch-comparison report…'));
+    VCS.log(tr("runtime.project.batchreport.text_023d43b8bb", { value1: ids.length }, `正在生成 {value1} 个单项目报告与一份批次比较报告…`, 'Generating {value1} single-project reports and one batch-comparison report…'));
     try {
       let r = await VCS.call(
-        'proj_batch_report', paths, dr.path, preset || null,
+        'proj_batch_report', ids, dr.path, preset || null,
         ['html', 'docx', 'pdf'], true, true);
       if (bridgeMethodUnavailable(r)) {
-        r = await legacyBatchReports(paths, dr.path);
+        r = await legacyBatchReports(ids, dr.path);
       }
       if (!r || r.ok === false || r.error) {
         VCS.log(tr("runtime.project.batchreport.text_0832df83b1", {}, '批次报告生成失败:', 'Batch-report generation failed:') + ((r && r.error) || tr("runtime.project.batchreport.text_bd5e21c357", {}, '未知错误', 'Unknown error')), 'failc');
@@ -3913,7 +4350,7 @@
     if (box) box.innerHTML = '';
     VCS.log(tr("runtime.project.draftready.text_d3b79a5428", {}, '生成成稿包(SI + 三线表 + 口径稽核 + 方法学),生成中…', 'Generating the publication-ready package (SI + three-line tables + basis audit + methodology)…'));
     try {
-      const r = await VCS.call('draft_ready', proj.path, dr.path);
+      const r = await VCS.call('draft_ready', projectId(proj), dr.path);
       if (!r || r.ok === false && r.error) {
         // ok=False 但有产物(稽核不过仍出全套)时 error 为 null;仅真错误(error 非空)才失败
         if (r && r.error) { VCS.log(tr("runtime.project.draftready.text_76fa71f31b", {}, '成稿包生成失败:', 'Publication-ready package generation failed:') + r.error, 'failc'); return; }
@@ -4012,6 +4449,16 @@
     wire('ads-route-new', routeNewCalculation);
     wire('ads-route-quartets', routeQuartetSubmit);
     wire('ads-route-results', () => openProjectResults());
+    wire('pj-hub-import', () => openImport());
+    wire('pj-hub-structure', () => startLiS());
+    wire('pj-hub-recent', openRecentProject);
+    wire('pj-hub-adopt', chooseAdoptFolder);
+    wire('pj-adopt-apply', applyAdopt);
+    const adoptMode = $('pj-adopt-mode');
+    if (adoptMode) adoptMode.addEventListener('change', preflightAdopt);
+    wire('pj-clone-preflight', () => preflightProjectLifecycle('clone'));
+    wire('pj-move-preflight', () => preflightProjectLifecycle('move'));
+    wire('pj-lifecycle-apply', applyProjectLifecycle);
     wire('lis-open-import', () => openImport());
     wire('lis-open-cluster', () => {
       if (typeof VCS.navigate === 'function') VCS.navigate('cluster', { source: 'lis-builder' });
@@ -4055,9 +4502,9 @@
     loadReportCapabilities();
     const projectSelect = $('pj-select');
     if (projectSelect) projectSelect.addEventListener('change', async () => {
-      const previous = State.currentProjectPath;
+      const previous = State.currentProjectId;
       const requested = String(projectSelect.value || '');
-      const hit = State.projects.find(p => String(p.path || '') === requested) || null;
+      const hit = State.projects.find(p => projectId(p) === requested) || null;
       await requestProjectSelection(hit, previous);
     });
     wire('pj-figs', makeFigures);
@@ -4085,22 +4532,19 @@
     });
     renderConfigs();
     updateJourney();
+    updateProjectHub();
     loadPresets();
     reloadProjects();
     loadLisProfiles();
   }
 
-  // 导入向导/任务页优先用 project.yaml 绝对路径精确选中，
-  // 避免两个同名项目被选错。按名选中仅保留给旧数据兼容。
-  async function selectRequestedProject(kind, value, preferredReference) {
-    const raw = String(value || '');
-    // 路径必须逐字匹配；不能把合法目录名首尾的空格静默改成另一个路径。
-    const wanted = kind === 'path' ? raw : raw.trim();
-    if (!wanted.trim()) return false;
+  async function selectRequestedProject(value) {
+    const wanted = String(value || '').trim();
+    if (!PROJECT_ID_RE.test(wanted)) return false;
     const generation = ++State.projectSelectionGeneration;
-    const request = { kind, value: wanted, generation };
+    const request = { kind: 'id', value: wanted, generation };
     State.requestedProject = request;
-    await reloadProjects(preferredReference);
+    await reloadProjects(wanted);
     // 较新的显式选择已接管；旧调用即使晚返回也不能重写项目上下文。
     if (generation !== State.projectSelectionGeneration) return false;
     const hit = State.projects.find(project => matchesRequestedProject(project, request)) || null;
@@ -4110,18 +4554,8 @@
     return true;
   }
 
-  async function selectByPath(path) {
-    const wanted = String(path || '');
-    return selectRequestedProject('path', wanted, wanted);
-  }
-
-  async function selectByName(name) {
-    return selectRequestedProject('name', name, '');
-  }
-
   async function selectById(id) {
-    const wanted = String(id || '').trim();
-    return selectRequestedProject('id', wanted, '');
+    return selectRequestedProject(id);
   }
 
   function current() {
@@ -4139,6 +4573,7 @@
       State.reportCapabilities.pdf = { available: false, reason };
     }
     updateJourney();
+    updateProjectHub();
     if (State.importRows.length || State.importResult) renderImport();
     renderCleanIncarStatus();
     renderReferenceProjects(val('lis-reference'));
@@ -4154,7 +4589,12 @@
 
   // 切回项目页时刷新项目下拉
   document.addEventListener('vcs:page', e => {
-    if (e.detail && e.detail.page === 'project') { reloadProjects(); loadLisProfiles(); }
+    if (e.detail && e.detail.page === 'project') {
+      reloadProjects(); loadLisProfiles();
+    } else {
+      State.explicitWorkflow = '';
+      updateProjectHub();
+    }
   });
   document.addEventListener('vcs:scenario', e => applyProjectMode(e.detail && e.detail.scenario));
   document.addEventListener('vcs:calculation', applyProjectCalculation);
@@ -4165,12 +4605,23 @@
 
   window.Project = {
     reload: reloadProjects,
-    selectByPath,
-    selectByName,
     selectById,
     current,
     list,
     openImport,
     startLiS,
   };
+  if (window.__VCS_TEST__) {
+    window.Project.__test = {
+      State,
+      preflightProjectLifecycle,
+      updateProjectHub,
+      lifecycleRequestCurrent,
+      applyProjectSelection,
+      setCompareSelection,
+      refreshComparePreview,
+      makeFigures,
+      makeCompareFigures,
+    };
+  }
 })();

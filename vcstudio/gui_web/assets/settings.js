@@ -10,7 +10,37 @@
   const State = {
     scenarios: [], engines: [], tasks: [], keySaved: false,
     scenarioKey: 'full', engineKey: 'vasp', calculationKey: '',
+    workspaceBusy: false,
+    labPolicies: [], labPolicyRevision: 0, labPolicyPreview: null,
+    labPolicySelection: null, labPolicyBusy: false,
   };
+  let workspaceIntentGeneration = 0;
+  let labPolicyIntentGeneration = 0;
+  const draftSnapshots = new Map();
+  const dirtyDraftScopes = new Set();
+  const DRAFT_FIELDS = Object.freeze({
+    'settings-llm': ['set-llm-provider', 'set-llm-baseurl', 'set-llm-model', 'set-llm-external'],
+    'settings-llm-key': ['set-llm-key'],
+    'settings-prompt': ['set-prompt'],
+    'settings-paths': ['set-potcar', 'set-molecules', 'set-idw-lo', 'set-idw-hi'],
+    'settings-autopilot': ['set-ap-on', 'set-ap-interval', 'set-ap-continue', 'set-ap-fetch', 'set-ap-report'],
+    'settings-figures': ['set-fig-journal', 'set-fig-auto', 'set-fig-panel'],
+    'settings-lab-policy': [
+      'set-lab-policy', 'set-lab-applicability', 'set-lab-cores',
+      'set-lab-walltime', 'set-lab-encut', 'set-lab-force',
+    ],
+  });
+  const DRAFT_LABELS = Object.freeze({
+    'settings-llm': ['settings.draft.llm', 'LLM 配置', 'LLM configuration'],
+    'settings-llm-key': ['settings.draft.llm_key', '尚未保存的 API 密钥', 'Unsaved API key'],
+    'settings-prompt': ['settings.draft.prompt', '报告分析提示词', 'Report-analysis prompt'],
+    'settings-paths': ['settings.draft.paths', '数据路径', 'Data paths'],
+    'settings-autopilot': ['settings.draft.autopilot', '自动托管设置', 'Managed-workflow settings'],
+    'settings-figures': ['settings.draft.figures', '出图偏好', 'Figure preferences'],
+    'settings-lab-policy': [
+      'settings.draft.lab_policy', '实验室推荐策略', 'Laboratory recommendation policy',
+    ],
+  });
   const english = () => !!(VCS.i18n && VCS.i18n.lang === 'en');
   const tr = (key, params, zh, en) => {
     const fallback = english() ? (en || key) : (zh || key);
@@ -20,6 +50,90 @@
         (match, name) => Object.prototype.hasOwnProperty.call(params || {}, name)
           ? String(params[name]) : match);
   };
+  function draftLabel(scope) {
+    const record = DRAFT_LABELS[scope] || [
+      'settings.draft.generic', '设置草稿', 'Settings draft',
+    ];
+    return tr(record[0], {}, record[1], record[2]);
+  }
+  function fieldSnapshot(id) {
+    const element = $(id);
+    if (!element) return null;
+    if (element.type === 'checkbox' || element.type === 'radio') return !!element.checked;
+    return String(element.value == null ? '' : element.value);
+  }
+  function applyFieldSnapshot(id, value) {
+    const element = $(id);
+    if (!element) return;
+    if (element.type === 'checkbox' || element.type === 'radio') element.checked = !!value;
+    else element.value = value == null ? '' : String(value);
+  }
+  function scopeSnapshot(scope) {
+    return (DRAFT_FIELDS[scope] || []).map(id => [id, fieldSnapshot(id)]);
+  }
+  function captureDraftScope(scope) {
+    draftSnapshots.set(scope, scopeSnapshot(scope));
+    dirtyDraftScopes.delete(scope);
+    if (VCS.unsaved && typeof VCS.unsaved.clear === 'function') VCS.unsaved.clear(scope);
+  }
+  function restoreDraftScope(scope) {
+    const snapshot = draftSnapshots.get(scope) || [];
+    snapshot.forEach(([id, value]) => applyFieldSnapshot(id, value));
+    dirtyDraftScopes.delete(scope);
+    if (VCS.unsaved && typeof VCS.unsaved.clear === 'function') VCS.unsaved.clear(scope);
+    return true;
+  }
+  function updateDraftScope(scope) {
+    const baseline = JSON.stringify(draftSnapshots.get(scope) || []);
+    const current = JSON.stringify(scopeSnapshot(scope));
+    if (baseline === current) {
+      dirtyDraftScopes.delete(scope);
+      if (VCS.unsaved && typeof VCS.unsaved.clear === 'function') VCS.unsaved.clear(scope);
+      return;
+    }
+    dirtyDraftScopes.add(scope);
+    if (VCS.unsaved && typeof VCS.unsaved.mark === 'function') {
+      VCS.unsaved.mark(scope, draftLabel(scope), {
+        discard: () => restoreDraftScope(scope),
+      });
+    }
+  }
+  function captureAllDraftScopes() {
+    Object.keys(DRAFT_FIELDS).forEach(captureDraftScope);
+  }
+  function wireDraftTracking() {
+    Object.entries(DRAFT_FIELDS).forEach(([scope, ids]) => {
+      ids.forEach(id => {
+        const element = $(id);
+        if (!element) return;
+        const eventName = element.tagName === 'SELECT' || element.type === 'checkbox'
+          || element.type === 'radio' ? 'change' : 'input';
+        element.addEventListener(eventName, () => updateDraftScope(scope));
+      });
+    });
+  }
+  function setWorkspaceControlsBusy(busy) {
+    State.workspaceBusy = !!busy;
+    const scenario = $('set-scenario');
+    const engine = $('set-engine');
+    const calculation = $('set-calculation');
+    if (scenario) scenario.disabled = State.workspaceBusy;
+    if (engine) engine.disabled = State.workspaceBusy || engine.options.length < 2;
+    if (calculation) calculation.disabled = State.workspaceBusy || !State.tasks.length;
+    const region = $('set-workflow-card');
+    if (region) region.setAttribute('aria-busy', State.workspaceBusy ? 'true' : 'false');
+  }
+  function beginWorkspaceIntent() {
+    const generation = ++workspaceIntentGeneration;
+    setWorkspaceControlsBusy(true);
+    return generation;
+  }
+  function currentWorkspaceIntent(generation) {
+    return generation === workspaceIntentGeneration;
+  }
+  function endWorkspaceIntent(generation) {
+    if (currentWorkspaceIntent(generation)) setWorkspaceControlsBusy(false);
+  }
   const rawError = (result, key, zh, en) =>
     (result && result.error) || tr(key, {}, zh, en);
   const localField = (row, zhField, enField, enFallback) => {
@@ -128,6 +242,231 @@
     custom: ['', ''],
   };
 
+  // ── 实验室策略:只预览/确认用户级推荐，不改作业或触发提交 ───────────────
+  function setLabPolicyBusy(busy) {
+    State.labPolicyBusy = !!busy;
+    ['set-lab-preview', 'set-lab-confirm'].forEach(id => {
+      const button = $(id);
+      if (button) button.disabled = !!busy || !State.labPolicies.length;
+    });
+    const card = $('set-lab-policy-card');
+    if (card) card.setAttribute('aria-busy', busy ? 'true' : 'false');
+  }
+
+  function selectedLabPolicy() {
+    const id = val('set-lab-policy');
+    return State.labPolicies.find(item => item.id === id) || null;
+  }
+
+  function renderLabPolicyOptions(selectedId) {
+    const policy = $('set-lab-policy');
+    if (!policy) return;
+    const wanted = selectedId || policy.value;
+    policy.innerHTML = State.labPolicies.map(item => {
+      const label = english() ? item.label_en : item.label_zh;
+      return `<option value="${VCS.esc(item.id)}">${VCS.esc(label || item.id)}</option>`;
+    }).join('');
+    if (State.labPolicies.some(item => item.id === wanted)) policy.value = wanted;
+    renderLabApplicability();
+  }
+
+  function renderLabApplicability(selectedValue) {
+    const element = $('set-lab-applicability');
+    const policy = selectedLabPolicy();
+    if (!element) return;
+    const wanted = selectedValue || element.value;
+    const labels = {
+      bulk: tr('settings.lab.applicability.bulk', {}, '体相', 'Bulk'),
+      slab: tr('settings.lab.applicability.slab', {}, '表面', 'Slab'),
+      adsorption: tr('settings.lab.applicability.adsorption', {}, '吸附', 'Adsorption'),
+      molecule: tr('settings.lab.applicability.molecule', {}, '分子', 'Molecule'),
+    };
+    const values = (policy && policy.applicability) || [];
+    element.innerHTML = values.map(value =>
+      `<option value="${VCS.esc(value)}">${VCS.esc(labels[value] || value)}</option>`).join('');
+    if (values.indexOf(wanted) >= 0) element.value = wanted;
+  }
+
+  function labOverrides() {
+    const fields = [
+      ['set-lab-cores', 'cores', value => Number.parseInt(value, 10)],
+      ['set-lab-walltime', 'walltime', value => value],
+      ['set-lab-encut', 'encut_enmax_multiplier', value => Number(value)],
+      ['set-lab-force', 'force_tolerance_eV_A', value => Number(value)],
+    ];
+    const overrides = {};
+    fields.forEach(([id, key, parse]) => {
+      const raw = val(id);
+      if (raw !== '') overrides[key] = parse(raw);
+    });
+    return overrides;
+  }
+
+  function labPolicyRequest() {
+    return {
+      policy_id: val('set-lab-policy'),
+      applicability: val('set-lab-applicability') || null,
+      overrides: labOverrides(),
+    };
+  }
+
+  function renderLabPolicySummary() {
+    const current = $('set-lab-current');
+    const revision = $('set-lab-revision');
+    if (revision) revision.textContent = tr(
+      'settings.lab.revision', { revision: State.labPolicyRevision },
+      '当前修订：{revision}', 'Current revision: {revision}');
+    if (!current) return;
+    const selection = State.labPolicySelection;
+    current.textContent = selection
+      ? tr('settings.lab.current', {
+        policy: selection.policy_id, actor: selection.actor,
+        confirmed_at: selection.confirmed_at,
+      }, '已确认：{policy}；确认人 {actor}；{confirmed_at}',
+      'Confirmed: {policy}; actor {actor}; {confirmed_at}')
+      : tr('settings.lab.current_none', {}, '尚未确认策略', 'No policy has been confirmed');
+  }
+
+  function renderLabPolicyPreview() {
+    const box = $('set-lab-preview-out');
+    if (!box) return;
+    const preview = State.labPolicyPreview;
+    box.hidden = !preview;
+    box.replaceChildren();
+    if (!preview) return;
+    const rows = [
+      [tr('settings.lab.preview.policy', {}, '策略', 'Policy'),
+        `${preview.policy_id} v${preview.policy_version}`],
+      [tr('settings.lab.preview.applicability', {}, '适用对象', 'Applicability'),
+        preview.applicability || '—'],
+      [tr('settings.lab.preview.method', {}, '方法推荐', 'Method recommendation'),
+        JSON.stringify(preview.method || {})],
+      [tr('settings.lab.preview.resources', {}, '资源推荐', 'Resource recommendation'),
+        JSON.stringify(preview.resources || {})],
+      [tr('settings.lab.preview.checks', {}, '必做检查', 'Required checks'),
+        (preview.required_checks || []).join(', ')],
+      [tr('settings.lab.preview.hash', {}, '语义哈希', 'Semantic hash'),
+        preview.semantic_sha256 || '—'],
+    ];
+    rows.forEach(([term, value]) => {
+      const row = document.createElement('div');
+      const label = document.createElement('b');
+      const output = document.createElement('span');
+      label.textContent = term;
+      output.textContent = String(value);
+      row.append(label, output);
+      box.append(row);
+    });
+  }
+
+  async function loadLabPolicies() {
+    const generation = ++labPolicyIntentGeneration;
+    setLabPolicyBusy(true);
+    try {
+      const [catalog, snapshot] = await Promise.all([
+        VCS.call('lab_policy_catalog'), VCS.call('lab_policy_read'),
+      ]);
+      if (generation !== labPolicyIntentGeneration) return false;
+      if (!(catalog && catalog.ok) || !(snapshot && snapshot.ok)) {
+        const failed = !(catalog && catalog.ok) ? catalog : snapshot;
+        throw new Error(rawError(failed, 'common.unknown_error', '未知错误', 'Unknown error'));
+      }
+      State.labPolicies = (catalog.catalog && catalog.catalog.policies) || [];
+      State.labPolicyRevision = Number(snapshot.revision || 0);
+      State.labPolicySelection = snapshot.selection || null;
+      const selected = State.labPolicySelection;
+      renderLabPolicyOptions(selected && selected.policy_id);
+      if (selected) {
+        renderLabApplicability(selected.applicability);
+        const overrides = selected.overrides || {};
+        setVal('set-lab-cores', overrides.cores);
+        setVal('set-lab-walltime', overrides.walltime);
+        setVal('set-lab-encut', overrides.encut_enmax_multiplier);
+        setVal('set-lab-force', overrides.force_tolerance_eV_A);
+      }
+      renderLabPolicySummary();
+      return true;
+    } catch (error) {
+      if (generation !== labPolicyIntentGeneration) return false;
+      State.labPolicies = [];
+      logLocalizedSetting('settings.lab.load_failed', { error: String(error.message || error) },
+        '读取实验室策略失败：{error}', 'Failed to load laboratory policies: {error}', 'failc');
+      return false;
+    } finally {
+      if (generation === labPolicyIntentGeneration) setLabPolicyBusy(false);
+    }
+  }
+
+  async function previewLabPolicy() {
+    const generation = ++labPolicyIntentGeneration;
+    setLabPolicyBusy(true);
+    try {
+      const result = await VCS.call('lab_policy_preview', labPolicyRequest());
+      if (generation !== labPolicyIntentGeneration) return false;
+      if (!(result && result.ok)) throw new Error(rawError(
+        result, 'common.unknown_error', '未知错误', 'Unknown error'));
+      State.labPolicyPreview = result.preview;
+      State.labPolicyRevision = Number(result.revision || 0);
+      State.labPolicySelection = result.current_selection || null;
+      renderLabPolicyPreview();
+      renderLabPolicySummary();
+      logLocalizedSetting('settings.lab.preview_ready', {},
+        '实验室策略预览已更新；尚未确认，也不会修改作业',
+        'Laboratory policy preview updated; it is unconfirmed and no job was changed', 'okc');
+      return true;
+    } catch (error) {
+      if (generation !== labPolicyIntentGeneration) return false;
+      State.labPolicyPreview = null;
+      renderLabPolicyPreview();
+      logLocalizedSetting('settings.lab.preview_failed', { error: String(error.message || error) },
+        '策略预览失败：{error}', 'Policy preview failed: {error}', 'failc');
+      return false;
+    } finally {
+      if (generation === labPolicyIntentGeneration) setLabPolicyBusy(false);
+    }
+  }
+
+  async function confirmLabPolicy() {
+    if (typeof window.confirm === 'function' && !window.confirm(tr(
+      'settings.lab.confirm_prompt', {},
+      '确认保存这份“仅推荐”策略？它不会修改或提交任何作业。',
+      'Save this recommendation-only policy? It will not modify or submit any job.'))) return false;
+    const generation = ++labPolicyIntentGeneration;
+    setLabPolicyBusy(true);
+    try {
+      const result = await VCS.call(
+        'lab_policy_confirm', labPolicyRequest(), State.labPolicyRevision, true);
+      if (generation !== labPolicyIntentGeneration) return false;
+      if (!(result && result.ok)) {
+        if (result && result.conflict) {
+          State.labPolicyRevision = Number(result.revision || 0);
+          State.labPolicySelection = result.selection || null;
+          renderLabPolicySummary();
+          logLocalizedSetting('settings.lab.conflict', {},
+            '策略已被另一会话更新；已显示权威修订，请检查草稿后重试',
+            'Another session updated the policy; the authoritative revision is shown. Review the draft and retry', 'warnc');
+          return false;
+        }
+        throw new Error(rawError(result, 'common.unknown_error', '未知错误', 'Unknown error'));
+      }
+      State.labPolicyRevision = Number(result.revision || 0);
+      State.labPolicySelection = result.selection || null;
+      renderLabPolicySummary();
+      captureDraftScope('settings-lab-policy');
+      logLocalizedSetting('settings.lab.confirmed', {},
+        '已确认用户级实验室推荐策略；既有作业未改变，未触发提交',
+        'User-level laboratory recommendation confirmed; existing jobs are unchanged and no submission was triggered', 'okc');
+      return true;
+    } catch (error) {
+      if (generation !== labPolicyIntentGeneration) return false;
+      logLocalizedSetting('settings.lab.confirm_failed', { error: String(error.message || error) },
+        '策略确认失败：{error}', 'Policy confirmation failed: {error}', 'failc');
+      return false;
+    } finally {
+      if (generation === labPolicyIntentGeneration) setLabPolicyBusy(false);
+    }
+  }
+
   // ── 载入 / 回填 ──────────────────────────────────────────────────────────────
   async function load() {
     const s = await VCS.call('settings_get');
@@ -170,6 +509,8 @@
     if ($('set-fig-auto')) $('set-fig-auto').checked = fig.auto_figures !== false;
     if ($('set-fig-panel')) $('set-fig-panel').checked = fig.multi_panel !== false;
 
+    await loadLabPolicies();
+    captureAllDraftScopes();
     loadWorkspace();          // 界面语言 + 工作模式 + 本次计算类型
   }
 
@@ -179,6 +520,7 @@
       $('set-fig-auto') ? $('set-fig-auto').checked : true,
       $('set-fig-panel') ? $('set-fig-panel').checked : true);
     if (r && r.ok) {
+      captureDraftScope('settings-figures');
       logLocalizedSetting('settings.status.figure_saved', {},
         '已保存出图偏好', 'Figure preferences saved', 'okc');
       VCS.toast(tr('settings.status.figure_saved', {},
@@ -236,6 +578,7 @@
         : '已保存 LLM 端点/模型（项目数据不外发）',
       external ? 'LLM endpoint/model saved (project-data transfer is allowed)'
         : 'LLM endpoint/model saved (project data stays local)', 'okc');
+    captureDraftScope('settings-llm');
     VCS.toast(tr('common.saved', {}, '已保存', 'Saved'));
   }
 
@@ -253,6 +596,7 @@
       return;
     }
     setVal('set-llm-key', '');            // 存后立即清空输入,绝不回显
+    captureDraftScope('settings-llm-key');
     State.keySaved = true;
     renderKeyState(true);
     logLocalizedSetting('settings.status.key_saved_securely', {},
@@ -303,6 +647,7 @@
     logLocalizedSetting('settings.status.prompt_saved', {},
       '已保存自定义报告分析提示词',
       'Custom report-analysis prompt saved', 'okc');
+    captureDraftScope('settings-prompt');
     VCS.toast(tr('common.saved', {}, '已保存', 'Saved'));
   }
 
@@ -319,6 +664,7 @@
       return;
     }
     setVal('set-prompt', r.text);
+    captureDraftScope('settings-prompt');
     logLocalizedSetting('settings.status.prompt_reset', {},
       '已恢复默认提示词', 'Default prompt restored', 'okc');
     VCS.toast(tr('settings.status.default_restored', {}, '已恢复默认', 'Defaults restored'));
@@ -332,7 +678,10 @@
         '选择目录失败：{error}', 'Failed to select directory: {error}', 'failc');
       return;
     }
-    if (r && r.path) setVal(id, r.path);
+    if (r && r.path) {
+      setVal(id, r.path);
+      updateDraftScope('settings-paths');
+    }
   }
 
   async function savePaths() {
@@ -347,6 +696,7 @@
     logLocalizedSetting('settings.status.paths_saved', {},
       '已保存数据路径（赝势库 / 分子库 / 理想窗口）',
       'Data paths saved (pseudopotential library / molecule library / ideal window)', 'okc');
+    captureDraftScope('settings-paths');
     VCS.toast(tr('common.saved', {}, '已保存', 'Saved'));
   }
 
@@ -408,6 +758,7 @@
     }
     logLocalizedSetting('settings.status.managed_saved', {},
       '已保存自动托管设置', 'Managed-workflow settings saved', 'okc');
+    captureDraftScope('settings-autopilot');
     VCS.toast(tr('common.saved', {}, '已保存', 'Saved'));
     if (VCS.pipeline && typeof VCS.pipeline.reconfigure === 'function') VCS.pipeline.reconfigure();
   }
@@ -491,7 +842,7 @@
     const active = State.engines.some(row => row.key === selectedKey)
       ? selectedKey : sel.options[0].value;
     sel.value = active;
-    sel.disabled = sel.options.length < 2;
+    sel.disabled = State.workspaceBusy || sel.options.length < 2;
     State.engineKey = active;
   }
 
@@ -522,36 +873,47 @@
     if (State.tasks.some(task => task.key === selectedKey)) sel.value = selectedKey;
     else if (State.tasks.length) sel.value = State.tasks[0].key;
     State.calculationKey = sel.value || '';
+    sel.disabled = State.workspaceBusy || !State.tasks.length;
   }
 
-  async function loadWorkspace() {
-    // 语言下拉
-    const langSel = $('set-lang');
-    if (langSel) {
-      const g = await VCS.call('lang_get');
-      const avail = (g && g.available) || ['zh', 'en'];
-      langSel.innerHTML = avail.map(l =>
-        `<option value="${l}">${VCS.esc(languageName(l))}</option>`).join('');
-      langSel.value = (g && g.lang) || 'zh';
-    }
-    // 场景下拉
-    const scSel = $('set-scenario');
-    if (scSel) {
-      const [list, cur] = await Promise.all([
-        VCS.call('scenario_list'), VCS.call('scenario_get')]);
-      State.scenarios = (list && list.scenarios) || [];
-      const curKey = (cur && cur.scenario && cur.scenario.key) || 'full';
-      renderScenarioOptions(curKey);
-      renderScenarioDesc(curKey);
-      await loadEngines(curKey);
+  async function loadWorkspace(intentGeneration = null) {
+    const ownsIntent = intentGeneration == null;
+    const generation = ownsIntent ? beginWorkspaceIntent() : intentGeneration;
+    try {
+      // 语言下拉
+      const langSel = $('set-lang');
+      if (langSel) {
+        const g = await VCS.call('lang_get');
+        if (!currentWorkspaceIntent(generation)) return false;
+        const avail = (g && g.available) || ['zh', 'en'];
+        langSel.innerHTML = avail.map(l =>
+          `<option value="${l}">${VCS.esc(languageName(l))}</option>`).join('');
+        langSel.value = (g && g.lang) || 'zh';
+      }
+      // 场景下拉
+      const scSel = $('set-scenario');
+      if (scSel) {
+        const [list, cur] = await Promise.all([
+          VCS.call('scenario_list'), VCS.call('scenario_get')]);
+        if (!currentWorkspaceIntent(generation)) return false;
+        State.scenarios = (list && list.scenarios) || [];
+        const curKey = (cur && cur.scenario && cur.scenario.key) || 'full';
+        renderScenarioOptions(curKey);
+        renderScenarioDesc(curKey);
+        return await loadEngines(curKey, generation);
+      }
+      return true;
+    } finally {
+      if (ownsIntent) endWorkspaceIntent(generation);
     }
   }
 
-  async function loadEngines(scenarioKey) {
+  async function loadEngines(scenarioKey, generation = workspaceIntentGeneration) {
     const sel = $('set-engine');
-    if (!sel) { await loadCalculations(scenarioKey, 'vasp'); return; }
+    if (!sel) return loadCalculations(scenarioKey, 'vasp', generation);
     const [listed, current] = await Promise.all([
       VCS.call('engine_list', scenarioKey || null), VCS.call('engine_get')]);
+    if (!currentWorkspaceIntent(generation)) return false;
     State.engines = ((listed && listed.engines) || []).filter(row => row.visible !== false);
     State.engines.sort((a, b) => (a.key === 'vasp' ? -1 : b.key === 'vasp' ? 1 : 0));
     const active = (current && current.engine) || (listed && listed.default) || 'vasp';
@@ -560,24 +922,28 @@
       ((State.engines.find(row => row.key === sel.value) || {}));
     if (VCS.applyEngine) VCS.applyEngine(sel.value, capability);
     renderEngineDesc(sel.value);
-    await loadCalculations(scenarioKey, sel.value);
+    return loadCalculations(scenarioKey, sel.value, generation);
   }
 
-  async function loadCalculations(scenarioKey, engineKey) {
+  async function loadCalculations(scenarioKey, engineKey, generation = workspaceIntentGeneration) {
     const sel = $('set-calculation');
-    if (!sel) return;
+    if (!sel) return true;
     const [catalog, current] = await Promise.all([
       VCS.call('task_catalog', scenarioKey || null, null, engineKey || 'vasp'),
       VCS.call('calculation_get')]);
+    if (!currentWorkspaceIntent(generation)) return false;
     State.tasks = (catalog && catalog.tasks) || [];
     const active = (current && current.active_calculation) ||
       ((VCS.scenario && VCS.scenario.defaults) || {}).active_calculation || '';
     renderCalculationOptions(active);
     if (sel.value && (!current || !current.configured)) {
-      await VCS.call('calculation_set', sel.value);
+      const configured = await VCS.call('calculation_set', sel.value);
+      if (!currentWorkspaceIntent(generation)) return false;
+      if (configured && configured.ok === false) return false;
     }
     if (VCS.applyCalculation) VCS.applyCalculation(sel.value || '');
     renderCalculationGuide(sel.value || '');
+    return true;
   }
 
   function renderEngineDesc(key) {
@@ -646,6 +1012,9 @@
     renderCalculationOptions(
       ($('set-calculation') && $('set-calculation').value) || State.calculationKey);
     renderCalculationGuide(State.calculationKey);
+    renderLabPolicyOptions(val('set-lab-policy'));
+    renderLabPolicySummary();
+    renderLabPolicyPreview();
     redrawLocalizedSettingLogs();
   }
   async function onLangChange() {
@@ -669,69 +1038,115 @@
   }
   async function onScenarioChange() {
     const key = $('set-scenario') ? $('set-scenario').value : 'full';
-    const r = await VCS.call('scenario_set', key);
-    if (!(r && r.ok)) {
-      logLocalizedSetting('settings.status.scenario_failed',
-        { error: rawError(r, 'common.unknown_error', '未知错误', 'Unknown error') },
+    const generation = beginWorkspaceIntent();
+    try {
+      const r = await VCS.call('scenario_set', key);
+      if (!currentWorkspaceIntent(generation)) return false;
+      if (!(r && r.ok)) {
+        logLocalizedSetting('settings.status.scenario_failed',
+          { error: rawError(r, 'common.unknown_error', '未知错误', 'Unknown error') },
+          '切换工作模式失败：{error}', 'Failed to change workflow: {error}', 'failc');
+        await loadWorkspace(generation);
+        return false;
+      }
+      State.scenarioKey = key;
+      if (r.scenario) {
+        const index = State.scenarios.findIndex(item => item.key === r.scenario.key);
+        if (index >= 0) State.scenarios[index] = r.scenario;
+      }
+      renderScenarioDesc(key);
+      if (VCS.applyScenario && r.scenario) VCS.applyScenario(r.scenario);
+      const preferredEngine = r.scenario && r.scenario.defaults && r.scenario.defaults.engine;
+      if (preferredEngine) {
+        await VCS.call('engine_set', preferredEngine);
+        if (!currentWorkspaceIntent(generation)) return false;
+      }
+      if (await loadEngines(key, generation) === false) return false;
+      if (!currentWorkspaceIntent(generation)) return false;
+      const name = r.scenario ? scenarioName(r.scenario) : key;
+      logLocalizedSetting('settings.status.scenario_changed', { name },
+        '工作模式已切换：{name}', 'Workflow changed: {name}', 'okc');
+      VCS.toast(tr('settings.status.scenario_changed_short', {},
+        '已切换工作模式', 'Workflow changed'));
+      return true;
+    } catch (error) {
+      if (!currentWorkspaceIntent(generation)) return false;
+      logLocalizedSetting('settings.status.scenario_failed', { error: String(error) },
         '切换工作模式失败：{error}', 'Failed to change workflow: {error}', 'failc');
-      return;
+      await loadWorkspace(generation);
+      return false;
+    } finally {
+      endWorkspaceIntent(generation);
     }
-    State.scenarioKey = key;
-    if (r.scenario) {
-      const index = State.scenarios.findIndex(item => item.key === r.scenario.key);
-      if (index >= 0) State.scenarios[index] = r.scenario;
-    }
-    renderScenarioDesc(key);
-    if (VCS.applyScenario && r.scenario) VCS.applyScenario(r.scenario);
-    const preferredEngine = r.scenario && r.scenario.defaults && r.scenario.defaults.engine;
-    if (preferredEngine) await VCS.call('engine_set', preferredEngine);
-    await loadEngines(key);
-    const name = r.scenario ? scenarioName(r.scenario) : key;
-    logLocalizedSetting('settings.status.scenario_changed', { name },
-      '工作模式已切换：{name}', 'Workflow changed: {name}', 'okc');
-    VCS.toast(tr('settings.status.scenario_changed_short', {},
-      '已切换工作模式', 'Workflow changed'));
   }
   async function onEngineChange() {
     const key = $('set-engine') ? $('set-engine').value : 'vasp';
-    const r = await VCS.call('engine_set', key);
-    if (!(r && r.ok)) {
-      logLocalizedSetting('settings.status.engine_failed',
-        { error: rawError(r, 'common.unknown_error', '未知错误', 'Unknown error') },
+    const generation = beginWorkspaceIntent();
+    try {
+      const r = await VCS.call('engine_set', key);
+      if (!currentWorkspaceIntent(generation)) return false;
+      if (!(r && r.ok)) {
+        logLocalizedSetting('settings.status.engine_failed',
+          { error: rawError(r, 'common.unknown_error', '未知错误', 'Unknown error') },
+          '切换计算引擎失败：{error}', 'Failed to change compute engine: {error}', 'failc');
+        await loadEngines(State.scenarioKey, generation);
+        return false;
+      }
+      State.engineKey = key;
+      const row = State.engines.find(item => item.key === key) || r.capability || {};
+      if (VCS.applyEngine) VCS.applyEngine(key, Object.assign({}, row, r.capability || {}));
+      renderEngineDesc(key);
+      if (await loadCalculations(State.scenarioKey, key, generation) === false) return false;
+      if (!currentWorkspaceIntent(generation)) return false;
+      logLocalizedSetting('settings.status.engine_changed', { name: row.name || key.toUpperCase() },
+        '本次计算引擎已切换：{name}', 'Compute engine changed: {name}', 'okc');
+      VCS.toast(tr('settings.status.engine_filtered', {},
+        '已按引擎收起不支持的任务和字段',
+        'Tasks and fields unsupported by this engine are now hidden'));
+      return true;
+    } catch (error) {
+      if (!currentWorkspaceIntent(generation)) return false;
+      logLocalizedSetting('settings.status.engine_failed', { error: String(error) },
         '切换计算引擎失败：{error}', 'Failed to change compute engine: {error}', 'failc');
-      await loadEngines(($('set-scenario') && $('set-scenario').value) || null);
-      return;
+      await loadEngines(State.scenarioKey, generation);
+      return false;
+    } finally {
+      endWorkspaceIntent(generation);
     }
-    State.engineKey = key;
-    const row = State.engines.find(item => item.key === key) || r.capability || {};
-    if (VCS.applyEngine) VCS.applyEngine(key, Object.assign({}, row, r.capability || {}));
-    renderEngineDesc(key);
-    await loadCalculations(($('set-scenario') && $('set-scenario').value) || null, key);
-    logLocalizedSetting('settings.status.engine_changed', { name: row.name || key.toUpperCase() },
-      '本次计算引擎已切换：{name}', 'Compute engine changed: {name}', 'okc');
-    VCS.toast(tr('settings.status.engine_filtered', {},
-      '已按引擎收起不支持的任务和字段',
-      'Tasks and fields unsupported by this engine are now hidden'));
   }
   async function onCalculationChange() {
     const key = $('set-calculation') ? $('set-calculation').value : '';
     if (!key) return;
-    const r = await VCS.call('calculation_set', key);
-    if (!(r && r.ok)) {
-      logLocalizedSetting('settings.status.calculation_failed',
-        { error: rawError(r, 'common.unknown_error', '未知错误', 'Unknown error') },
+    const generation = beginWorkspaceIntent();
+    try {
+      const r = await VCS.call('calculation_set', key);
+      if (!currentWorkspaceIntent(generation)) return false;
+      if (!(r && r.ok)) {
+        logLocalizedSetting('settings.status.calculation_failed',
+          { error: rawError(r, 'common.unknown_error', '未知错误', 'Unknown error') },
+          '切换计算类型失败：{error}', 'Failed to change calculation type: {error}', 'failc');
+        await loadCalculations(State.scenarioKey, State.engineKey, generation);
+        return false;
+      }
+      State.calculationKey = key;
+      if (VCS.applyCalculation) VCS.applyCalculation(key);
+      const task = State.tasks.find(t => t.key === key);
+      renderCalculationGuide(key);
+      logLocalizedSetting('settings.status.calculation_changed', { name: task ? taskName(task) : key },
+        '本次计算类型已切换：{name}', 'Calculation type changed: {name}', 'okc');
+      VCS.toast(tr('settings.status.calculation_ready', {},
+        '已切换本次计算类型；可直接进入对应步骤',
+        'Calculation type changed; you can open its next step now'));
+      return true;
+    } catch (error) {
+      if (!currentWorkspaceIntent(generation)) return false;
+      logLocalizedSetting('settings.status.calculation_failed', { error: String(error) },
         '切换计算类型失败：{error}', 'Failed to change calculation type: {error}', 'failc');
-      return;
+      await loadCalculations(State.scenarioKey, State.engineKey, generation);
+      return false;
+    } finally {
+      endWorkspaceIntent(generation);
     }
-    State.calculationKey = key;
-    if (VCS.applyCalculation) VCS.applyCalculation(key);
-    const task = State.tasks.find(t => t.key === key);
-    renderCalculationGuide(key);
-    logLocalizedSetting('settings.status.calculation_changed', { name: task ? taskName(task) : key },
-      '本次计算类型已切换：{name}', 'Calculation type changed: {name}', 'okc');
-    VCS.toast(tr('settings.status.calculation_ready', {},
-      '已切换本次计算类型；可直接进入对应步骤',
-      'Calculation type changed; you can open its next step now'));
   }
 
   // ── 初始化 ──────────────────────────────────────────────────────────────────
@@ -754,6 +1169,12 @@
     wire('set-engine', 'change', onEngineChange);
     wire('set-calculation', 'change', onCalculationChange);
     wire('set-calculation-start', 'click', startCalculation);
+    wire('set-lab-policy', 'change', () => {
+      renderLabApplicability();
+      updateDraftScope('settings-lab-policy');
+    });
+    wire('set-lab-preview', 'click', previewLabPolicy);
+    wire('set-lab-confirm', 'click', confirmLabPolicy);
     document.querySelectorAll('input[name="set-density"]').forEach(input => {
       input.addEventListener('change', e => {
         if (e.target.checked) selectDensity(e.target.value, true);
@@ -764,17 +1185,42 @@
       const o = e.target.closest('.theme-opt');
       if (o) selectTheme(o.dataset.theme, true);
     });
+    wireDraftTracking();
     load();
   }
 
   // 切回设置页时刷新(密钥状态 / 其他会话可能改过 config)
   document.addEventListener('vcs:page', e => {
-    if (e.detail && e.detail.page === 'settings') load();
+    if (e.detail && e.detail.page === 'settings' && !dirtyDraftScopes.size) load();
   });
   document.addEventListener('vcs:language', redrawLocalizedWorkspace);
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 
-  window.Settings = { reload: load };
+  window.Settings = {
+    reload: load,
+    discardDrafts() {
+      Array.from(dirtyDraftScopes).forEach(restoreDraftScope);
+      return true;
+    },
+  };
+  if (window.__VCS_TEST__ === true) {
+    window.__VCS_SETTINGS_TEST__ = Object.freeze({
+      onScenarioChange,
+      loadLabPolicies,
+      previewLabPolicy,
+      confirmLabPolicy,
+      renderLabPolicyPreview,
+      captureDraftScope,
+      updateDraftScope,
+      restoreDraftScope,
+      snapshot() {
+        return {
+          state: Object.assign({}, State),
+          dirty_scopes: Array.from(dirtyDraftScopes),
+        };
+      },
+    });
+  }
 })();

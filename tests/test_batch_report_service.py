@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from vcstudio.gui_web.api import Api
 from vcstudio.project import paper_report
+from vcstudio.project.report_service import ReportService, _PreviewRecord
 
 
 _PNG = (
@@ -156,15 +157,20 @@ def _batch_api(tmp_path):
     return api, paths, stores, summaries, state
 
 
+def _project_ids(api, paths, stores):
+    return [api._workspace_project_id(path, stores[path]) for path in paths]
+
+
 def test_comparison_report_uses_revision_history_marker_and_stale_replay(tmp_path):
     api, paths, stores, summaries, state = _batch_api(tmp_path)
+    project_ids = _project_ids(api, paths, stores)
     out_dir = tmp_path / "reports"
 
     first = api.proj_batch_report(
-        paths, str(out_dir), formats=["html"], include_individual=False,
+        project_ids, str(out_dir), formats=["html"], include_individual=False,
         requested_kind="final")
     second = api.proj_batch_report(
-        paths, str(out_dir), formats=["html"], include_individual=False,
+        project_ids, str(out_dir), formats=["html"], include_individual=False,
         requested_kind="final")
 
     assert first["ok"] is True and second["ok"] is True
@@ -175,28 +181,87 @@ def test_comparison_report_uses_revision_history_marker_and_stale_replay(tmp_pat
     assert second["marker"]["comparison_project_ids"] == [
         api._workspace_project_id(path, stores[path]) for path in paths]
     assert state["renders"] == 2
-    history = api.report_workbench_history(paths[0])
+    history = api.report_workbench_history(
+        api._workspace_project_id(paths[0], stores[paths[0]]))
     assert history["ok"] is True
     assert [item["sequence"] for item in history["revisions"]] == [2, 1]
     assert all(item["current"] is True for item in history["revisions"])
-    status = api.proj_report_status(paths[0])
+    status = api.proj_report_status(project_ids[0])
     assert status["artifact_status"] == "ready"
     assert status["artifact_current"] is True
     assert status["revision"]["sequence"] == 2
 
     summaries[stores[paths[1]]["project_uuid"]]["rows"][0]["delta_e"] -= 0.5
-    stale = api.proj_report_status(paths[0])
+    stale = api.proj_report_status(project_ids[0])
     assert stale["artifact_status"] == "stale"
     assert stale["artifact_current"] is False
 
 
+def test_comparison_preview_uses_shared_bounded_store_and_cleans_temp_roots(tmp_path):
+    api, paths, stores, _summaries, _state = _batch_api(tmp_path)
+    project_ids = _project_ids(api, paths, stores)
+    service = ReportService(
+        api, preview_limit=1, temp_root=tmp_path / "bounded-previews"
+    )
+    api._report_service_instance = service
+    sentinel_root = tmp_path / "bounded-previews" / "sentinel"
+    sentinel_root.mkdir(parents=True)
+    anchor_id = api._workspace_project_id(paths[0], stores[paths[0]])
+    sentinel = _PreviewRecord(
+        preview_id="sentinel-preview",
+        operation_id="sentinel-operation",
+        project_id=anchor_id,
+        project_path=paths[0],
+        project_root=str(Path(paths[0]).parent),
+        report_id="sentinel-report",
+        created_at_utc="2026-01-01T00:00:00+00:00",
+        created_at=0.0,
+        expires_at=service._clock() + service._ttl,
+        base_revision=0,
+        base_manifest_sha256=None,
+        build={},
+        token={},
+        temp_root=str(sentinel_root),
+    )
+    service._register_preview(sentinel)
+    registered = []
+    original_register = service._register_preview
+
+    def observe_register(record):
+        original_register(record)
+        registered.append({
+            "kind": record.build.get("build_kind"),
+            "count": len(service._previews),
+            "sentinel_exists": sentinel_root.exists(),
+            "temp_root": Path(record.temp_root),
+        })
+
+    service._register_preview = observe_register
+
+    result = api.proj_batch_report(
+        project_ids,
+        str(tmp_path / "reports"),
+        formats=["html"],
+        include_individual=False,
+        requested_kind="diagnostic",
+    )
+
+    assert result["ok"] is True
+    assert registered and registered[0]["kind"] == "comparison"
+    assert registered[0]["count"] == 1
+    assert registered[0]["sentinel_exists"] is False
+    assert not registered[0]["temp_root"].exists()
+    assert service._previews == {}
+
+
 def test_batch_individual_reports_are_revisioned_and_main_marker_wins(tmp_path):
     api, paths, stores, _summaries, state = _batch_api(tmp_path)
+    project_ids = _project_ids(api, paths, stores)
     api._report_bundle_unrecorded = lambda *_args, **_kwargs: (_ for _ in ()).throw(
         AssertionError("batch reports must not use the unrecorded seam"))
 
     result = api.proj_batch_report(
-        paths, str(tmp_path / "reports"), formats=["html"],
+        project_ids, str(tmp_path / "reports"), formats=["html"],
         include_individual=True, requested_kind="diagnostic")
 
     assert result["ok"] is True
@@ -208,21 +273,24 @@ def test_batch_individual_reports_are_revisioned_and_main_marker_wins(tmp_path):
     assert stores[paths[0]]["autopilot_report"]["scope_kind"] == "comparison"
     assert stores[paths[1]]["autopilot_report"].get("scope_kind") != "comparison"
     assert state["renders"] == 3
-    anchor_history = api.report_workbench_history(paths[0])
-    second_history = api.report_workbench_history(paths[1])
+    anchor_history = api.report_workbench_history(
+        api._workspace_project_id(paths[0], stores[paths[0]]))
+    second_history = api.report_workbench_history(
+        api._workspace_project_id(paths[1], stores[paths[1]]))
     assert len(anchor_history["revisions"]) == 2
     assert len(second_history["revisions"]) == 1
 
 
 def test_comparison_exception_preserves_successful_individual_revisions(tmp_path):
     api, paths, stores, _summaries, state = _batch_api(tmp_path)
+    project_ids = _project_ids(api, paths, stores)
 
     def fail_comparison(*_args, **_kwargs):
         raise RuntimeError("comparison publisher unavailable")
 
     api._comparison_report_publish_via_service = fail_comparison
     result = api.proj_batch_report(
-        paths, str(tmp_path / "reports"), formats=["html"],
+        project_ids, str(tmp_path / "reports"), formats=["html"],
         include_individual=True, requested_kind="diagnostic")
 
     assert result["ok"] is False
@@ -243,7 +311,8 @@ def test_comparison_exception_preserves_successful_individual_revisions(tmp_path
 
 def test_comparison_failure_without_success_is_failed_and_has_no_fake_file(
         tmp_path):
-    api, paths, _stores, _summaries, state = _batch_api(tmp_path)
+    api, paths, stores, _summaries, state = _batch_api(tmp_path)
+    project_ids = _project_ids(api, paths, stores)
 
     def reject_comparison(selected, _out_dir, *, preset_key, wanted, requested):
         build = api._comparison_report_build(
@@ -257,7 +326,7 @@ def test_comparison_failure_without_success_is_failed_and_has_no_fake_file(
 
     api._comparison_report_publish_via_service = reject_comparison
     result = api.proj_batch_report(
-        paths, str(tmp_path / "reports"), formats=["html"],
+        project_ids, str(tmp_path / "reports"), formats=["html"],
         include_individual=False, requested_kind="diagnostic")
 
     assert result["ok"] is False

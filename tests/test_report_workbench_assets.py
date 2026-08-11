@@ -49,9 +49,22 @@ def test_workbench_has_seven_accessible_steps_and_required_landmarks():
 def test_presets_and_editable_spec_come_from_bootstrap_not_copied_defaults():
     js = _source("report-workbench.js")
 
-    assert "VCS.call('report_workbench_bootstrap', projectPath, presetId || null)" in js
+    assert "VCS.call('report_workbench_bootstrap', projectId, presetId || null)" in js
     assert "const presets = catalogRecord(catalog.presets" in js
     assert "bootstrap.report_spec || bootstrap.spec" in js
+
+
+def test_page_and_semantic_route_events_coalesce_into_one_workbench_entry():
+    js = _source("report-workbench.js")
+    assert 'let pendingWorkbenchEntry = null;' in js
+    assert 'let workbenchEntryTimer = null;' in js
+    assert 'function scheduleWorkbenchEntry(intent = {})' in js
+    assert 'if (workbenchEntryTimer !== null) return;' in js
+    assert "scheduleWorkbenchEntry(event.detail);" in js
+    listeners = js[js.index("document.addEventListener('vcs:page'"):
+                   js.index("document.addEventListener('vcs:language'")]
+    assert listeners.count('enterWorkbench(') == 0
+    assert listeners.count('scheduleWorkbenchEntry(') >= 3
     for copied_label in (
         "快速决策简报", "科学审阅报告", "论文正文材料", "诊断与修复报告"
     ):
@@ -68,10 +81,10 @@ def test_presets_and_editable_spec_come_from_bootstrap_not_copied_defaults():
 def test_preview_is_sandboxed_last_wins_and_project_bound():
     js = _source("report-workbench.js")
 
-    assert "VCS.call('report_workbench_preview', projectPath, request)" in js
+    assert "VCS.call('report_workbench_preview', projectId, request)" in js
     assert "const generation = ++State.previewGeneration" in js
     assert "generation !== State.previewGeneration" in js
-    assert "!sameProject(projectId, projectPath)" in js
+    assert "!sameProject(projectId)" in js
     assert "fingerprint !== specFingerprint()" in js
     assert "safeId(result.project_id) !== projectId" in js
     assert "function hasCompletePreviewToken(preview)" in js
@@ -88,7 +101,7 @@ def test_publish_uses_only_preview_id_and_expected_bindings():
                  js.index("function handleFormChange(")]
 
     assert "State.dirty || !State.preview || !State.preview.preview_id" in publish
-    assert "'report_workbench_publish', projectPath, outputDir, previewId, expected" in publish
+    assert "'report_workbench_publish', projectId, destinationToken, previewId, expected" in publish
     assert "requestFromSpec()" not in publish
     assert "public_snapshot" not in publish
     assert "validation" not in publish
@@ -217,11 +230,32 @@ def test_history_has_explicit_empty_state_and_revision_list_renderer():
     html = _source("index.html")
     js = _source("report-workbench.js")
 
-    assert "VCS.call('report_workbench_history', projectPath)" in js
+    assert "VCS.call('report_workbench_history', projectId)" in js
     assert "当前项目还没有已登记的报告 revision。" in js
     assert "State.history.forEach" in js
     assert 'id="rw-compare-revision"' in html
-    assert "当前 MVP 只提供历史列表，尚未开放差异 API" in js
+    assert "VCS.call('report_revision_scientific_diff'" in js
+    assert "VCS.call('report_evidence_graph'" in js
+    assert "VCS.call('report_capsule_pick_destination')" in js
+    assert "VCS.call('report_capsule_export'" in js
+    assert 'id="rw-diff-left"' in html
+    assert 'id="rw-diff-right"' in html
+    assert "created_at_utc" not in js[js.index("function insightRevisionLabel("):
+                                         js.index("function setInsightState(")]
+
+
+def test_report_insights_expose_fail_closed_states_and_operation_lifecycle():
+    js = _source("report-workbench.js")
+
+    assert "new Set(['loading', 'empty', 'unavailable', 'stale', 'blocked', 'ready'])" in js
+    assert "report.insights.state.${State.insightStatus}" in js
+    assert "record.current === true" in js
+    assert "record.artifact_status !== 'stale'" in js
+    assert "VCS.operations.publish" in js
+    assert "route = 'publish-versions'" in js
+    assert "'publish-export'" in js
+    assert "destination_token" in js
+    assert "destination.path" not in js
 
 
 def test_publish_freezes_editors_and_only_clears_matching_spec_draft():
@@ -242,7 +276,7 @@ def test_publish_freezes_editors_and_only_clears_matching_spec_draft():
     assert "else if (!specUnchanged) persistDraft()" in publish
 
 
-def test_output_directory_is_bound_to_project_and_cleared_on_switch():
+def test_output_destination_token_is_bound_to_project_and_cleared_on_switch():
     js = _source("report-workbench.js")
     picker = js[js.index("async function pickOutputDirectory(") :
                 js.index("function collectPublishedFiles(")]
@@ -252,12 +286,17 @@ def test_output_directory_is_bound_to_project_and_cleared_on_switch():
                  js.index("function handleFormChange(")]
 
     assert "outputProjectId: ''" in js
-    assert "sameProject(expectedProjectId, expectedProjectPath)" in picker
+    assert "VCS.call('report_workbench_pick_destination', expectedProjectId)" in picker
+    assert "sameProject(expectedProjectId)" in picker
+    assert "result.destination_token" in picker
+    assert "result.path" not in picker
     assert "State.outputProjectId = expectedProjectId" in picker
     assert "const projectChanged = projectId !== State.projectId" in bootstrap
-    assert "State.outputDir = ''; State.outputProjectId = ''" in bootstrap
-    assert "State.outputProjectId === projectId && State.outputDir" in publish
-    assert "State.outputProjectId === State.projectId ? State.outputDir" in js
+    assert "State.outputDestinationToken = ''; State.outputDisplayName = ''; State.outputProjectId = ''" in bootstrap
+    assert "State.outputProjectId === projectId && State.outputDestinationToken" in publish
+    assert "State.outputDestinationToken = '';" in publish
+    assert "pick_dir" not in picker
+    assert "open_dir" not in js
 
 
 def test_same_project_route_queries_are_last_wins_and_rerender_history():

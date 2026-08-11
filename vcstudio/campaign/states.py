@@ -10,12 +10,14 @@
 
 **红线**:AI / 外部调用无权直接写 accepted。本模块只暴露两条提升边——
 `promote_validated(task, checker_results)`(须 checker 全通过)与
-`promote_accepted(task, gate_verdict, signed_by)`(须携带 accept_gate 的通过/豁免裁决)。
+`promote_accepted(task, GateDecision, signed_by, campaign_dir)`(须是 named-ledger-backed 的
+accept_gate 通过/豁免裁决，最终状态写入走 task revision CAS)。
 发现问题可 `downgrade` 回退,并记入账本(append-only,可审计)。
 中文注释允许,英文标识符。
 """
 from __future__ import annotations
 
+import copy
 import time
 
 # 执行态与三态 rung
@@ -122,30 +124,48 @@ def promote_validated(task: dict, checker_results, *, by: str = 'checker',
 
 
 # ── accepted:只由 accept_gate 通过/豁免 +(可选)人工签字提升 ─────────────────
-def promote_accepted(task: dict, gate_verdict: dict, *, signed_by: str | None = None,
+def promote_accepted(task: dict, gate_verdict, *, signed_by: str | None = None,
                      campaign_dir=None) -> dict:
-    """validated → accepted。gate_verdict 须是 accept_gate 的 pass/waived 裁决。
+    """validated → accepted，且最终写入必须通过 task revision CAS。
 
-    这条边是「AI/外部无权直接写 accepted」的执行点:必须出示一份真实的 accept_gate
-    通过或已豁免裁决;signed_by 记录人工签字(半自动模式下的强制人工确认闸)。
+    这条边只接受 :class:`gates.GateDecision`，重读 named campaign ledger 校验
+    campaign/task/revision/fingerprints/checks/digest/actor/time/waiver 撤销状态；自由 dict
+    永远没有 accepted 权威。校验通过后，以 GateDecision 绑定的 revision 做 CAS +1。
     """
     cur = rung(task)
     if cur != 'validated':
         raise ValueError(f'只能从 validated 提升到 accepted,当前 rung={cur}')
-    if not isinstance(gate_verdict, dict):
-        raise ValueError('accepted 需要 accept_gate 裁决 dict')
-    if gate_verdict.get('gate') != 'accept_gate':
-        raise ValueError('accepted 只能由 accept_gate 裁决提升,'
-                         f'收到的 gate={gate_verdict.get("gate")!r}')
-    if gate_verdict.get('status') not in ('pass', 'waived'):
-        raise ValueError('accept_gate 未通过且未豁免,不能提升到 accepted;'
-                         f'当前 status={gate_verdict.get("status")!r}')
-    note = f'gate={gate_verdict.get("status")}'
+    if not campaign_dir:
+        raise ValueError('accepted 状态推进必须指定 named campaign_dir 并使用 revision CAS')
+    from vcstudio.campaign import gates, schema
+    gates.verify_gate_decision(gate_verdict, campaign_dir, task)
+    if signed_by and signed_by != gate_verdict.actor:
+        raise ValueError(
+            f'signed_by={signed_by!r} 与 GateDecision 绑定 actor={gate_verdict.actor!r} 不一致')
+
+    expected_revision = gate_verdict.task_revision
+    candidate = copy.deepcopy(task)
+    note = f'gate={gate_verdict.status}; decision={gate_verdict.ledger_decision_id}'
     if signed_by:
         note += f'; signed_by={signed_by}'
-    _record(task, 'accepted', by=(signed_by or 'gate'), note=note)
-    _emit_event(campaign_dir, 'accepted', task,
-                {'gate_status': gate_verdict.get('status'), 'signed_by': signed_by})
+    _record(candidate, 'accepted', by=(signed_by or gate_verdict.actor), note=note)
+    candidate.pop('claim', None)
+    # persist_task performs the final GateDecision/revocation check under the shared campaign
+    # ledger lock immediately before the revision CAS write.  The earlier verification provides
+    # a precise caller error; this second check closes the verify-to-persist race.
+    schema.persist_task(
+        campaign_dir, candidate, expected_revision=expected_revision,
+        gate_decision=gate_verdict)
+    task.clear()
+    task.update(copy.deepcopy(candidate))
+    _emit_event(campaign_dir, 'accepted', task, {
+        'gate_status': gate_verdict.status,
+        'signed_by': signed_by,
+        'actor': gate_verdict.actor,
+        'task_revision': task.get('revision'),
+        'gate_decision_id': gate_verdict.ledger_decision_id,
+        'gate_decision_digest': gate_verdict.ledger_decision_digest,
+    })
     return task
 
 

@@ -38,8 +38,9 @@ from typing import Sequence
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 ENTRY = os.path.join(ROOT, 'vcstudio', 'gui', '__main__.py')
-WEB_ENTRY = os.path.join(ROOT, 'vcstudio', 'gui_web', '__main__.py')
+WEB_ENTRY = os.path.join(ROOT, 'vcstudio', 'gui_web', 'frozen_entry.py')
 WEB_ASSETS = os.path.join(ROOT, 'vcstudio', 'gui_web', 'assets')
+LOCALES = os.path.join(ROOT, 'vcstudio', 'shared', 'locales')
 CONFIG_EXAMPLE = os.path.join(ROOT, 'config.example.yaml')
 
 # These packages are not used by the shipped application.  Keeping the exclusions
@@ -72,6 +73,25 @@ FULL_REQUIREMENTS = (
 DECIMER_REQUIREMENTS = (
     ('DECIMER', 'decimer'),
     ('tensorflow', 'tensorflow'),
+)
+JOURNEY_HIDDEN_IMPORTS = (
+    'vcstudio.gui_web.frozen_healthcheck',
+    'vcstudio.gui_web.api',
+    'vcstudio.project.adsorption',
+    'vcstudio.project.analysis_sources',
+    'vcstudio.project.analysis_registry',
+    'vcstudio.project.analysis_views',
+    'vcstudio.project.elf',
+    'vcstudio.project.lab_policies',
+    'vcstudio.project.next_calculation',
+    'vcstudio.project.paper_report',
+    'vcstudio.project.project_lifecycle',
+    'vcstudio.project.report_contracts',
+    'vcstudio.project.report_insights',
+    'vcstudio.project.report_service',
+    'vcstudio.project.resource_forecast',
+    'vcstudio.cluster.ledger',
+    'vcstudio.shared.manifest',
 )
 
 
@@ -172,7 +192,7 @@ def _preflight(options: BuildOptions) -> None:
 
     required_paths = [ENTRY if options.legacy else WEB_ENTRY]
     if not options.legacy:
-        required_paths.append(WEB_ASSETS)
+        required_paths.extend((WEB_ASSETS, LOCALES))
     missing_paths = [path for path in required_paths if not os.path.exists(path)]
     if missing_paths:
         raise BuildConfigurationError(
@@ -234,8 +254,18 @@ def build_command(args: Sequence[str] = ()) -> tuple[list[str], BuildOptions]:
 
     if not options.legacy:
         cmd += ['--add-data', WEB_ASSETS + os.pathsep + 'vcstudio_assets']
+        # Package data is not discovered reliably from delayed imports.  Keep the
+        # destination beside ``vcstudio.shared.i18n`` so its normal ``__file__`` based
+        # lookup works unchanged inside ``sys._MEIPASS``.
+        locale_target = os.path.join('vcstudio', 'shared', 'locales')
+        cmd += ['--add-data', LOCALES + os.pathsep + locale_target]
         if os.path.isfile(CONFIG_EXAMPLE):
             cmd += ['--add-data', CONFIG_EXAMPLE + os.pathsep + '.']
+        # The frozen healthcheck imports the CLI by name to verify a second public
+        # entry path.  Declare it explicitly instead of relying on source-tree imports.
+        cmd += ['--hidden-import', 'vcstudio.cli.main']
+        for module in JOURNEY_HIDDEN_IMPORTS:
+            cmd += ['--hidden-import', module]
         cmd += ['--collect-all', 'webview']
         # The EdgeChromium backend uses pythonnet on Windows.  It is a platform-specific
         # pywebview dependency, so collect it when the selected build environment has it.

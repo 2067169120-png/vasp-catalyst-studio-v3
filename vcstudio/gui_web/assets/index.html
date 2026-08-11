@@ -62,6 +62,9 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
 #page-dashboard .db-row .sp{flex:1}
 #page-dashboard .db-row[data-goto]{cursor:pointer}
 #page-dashboard .db-row[data-goto]:hover{background:var(--accent-soft)}
+#page-dashboard .db-resume-row>span:first-child{min-width:0;display:flex;flex-direction:column;gap:2px}
+#page-dashboard .db-resume-row b,#page-dashboard .db-resume-row small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#page-dashboard .db-resume-row small{color:var(--muted);font:10px/1.35 var(--mono)}
 #page-dashboard .db-proj{font-family:var(--mono);font-size:10px;color:var(--accent-dark);background:var(--accent-soft);padding:1px 6px;border-radius:4px}
 #page-dashboard .db-time{font-family:var(--mono);font-size:10.5px;color:var(--muted)}
 #page-dashboard .db-todo-txt{line-height:1.5}
@@ -519,6 +522,13 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
           <div id="db-todo"><div class="db-empty">加载中…</div></div>
         </div>
       </div>
+    </div>
+
+    <div class="card acc" id="db-resume-card" data-acc="dashboard:resume"
+         data-sum="设置 / 导入 / 报告草稿" data-i18n-sum="accordion.summary.dashboard.resume"
+         data-acc-default="0" style="padding:12px;margin-top:10px">
+      <h2 class="db-h acc-h"><button type="button" class="acc-toggle" data-i18n="dashboard.resume.title">恢复中心</button></h2>
+      <div id="db-resume" aria-live="polite"><div class="db-empty" data-i18n="dashboard.resume.loading">正在检查可恢复内容…</div></div>
     </div>
 
     <!-- 卡片:任务动态 feed(自动托管事件,最近 20 条) -->
@@ -1240,13 +1250,59 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
     <div class="log" id="generate-log" data-anchor><div class="head" data-i18n="generate.log">生成日志</div></div>
   </section>
 
-  <section class="page" data-page="project" id="page-project" hidden>
+  <section class="page project-neutral" data-page="project" id="page-project" hidden>
     <div class="pagebar">
       <h1>计算与结果分析</h1>
       <span class="stats">按工作模式只显示本次计算需要的分析与报告工具</span>
     </div>
 
     <!-- 吸附能为默认主流程；其它结果工具保留给专家。 -->
+    <div class="card project-empty-hub" id="project-empty-hub" aria-live="polite">
+      <span class="project-empty-kicker" data-i18n="project.hub.kicker">项目中心</span>
+      <h2 data-i18n="project.hub.title">未选择项目</h2>
+      <p data-i18n="project.hub.description">选择一种明确的开始方式。项目模式、分析和发布工具只会在选择项目或进入指定流程后显示。</p>
+      <div class="project-empty-actions">
+        <button class="btn primary" type="button" id="pj-hub-import" data-i18n="project.hub.import">导入计算结果</button>
+        <button class="btn" type="button" id="pj-hub-structure" data-i18n="project.hub.structure">从结构开始</button>
+        <button class="btn" type="button" id="pj-hub-recent" data-i18n="project.hub.recent">打开最近项目</button>
+        <button class="btn" type="button" id="pj-hub-adopt" data-i18n="project.hub.adopt">接管现有文件夹</button>
+      </div>
+      <div class="project-adopt-panel" id="pj-adopt-panel" hidden>
+        <div>
+          <b data-i18n="project.adopt.title">接管项目副本</b>
+          <p id="pj-adopt-selection" data-i18n="project.adopt.unselected">先选择包含 project.yaml 的文件夹。浏览器不会提供或决定项目身份。</p>
+        </div>
+        <label for="pj-adopt-mode" data-i18n="project.adopt.identity_label">身份处理</label>
+        <select class="ipt" id="pj-adopt-mode">
+          <option value="remint" selected data-i18n="project.adopt.remint">安全副本：生成新的项目 ID（推荐）</option>
+          <option value="preserve" data-i18n="project.adopt.preserve">原项目：保留现有项目 ID</option>
+        </select>
+        <div class="project-lifecycle-status" id="pj-adopt-status" role="status"></div>
+        <button class="btn primary" type="button" id="pj-adopt-apply" disabled data-i18n="project.adopt.confirm">确认接管</button>
+      </div>
+    </div>
+
+    <div class="card project-lifecycle-card" id="pj-lifecycle-card" hidden>
+      <div class="project-lifecycle-head">
+        <div>
+          <span class="project-empty-kicker" data-i18n="project.lifecycle.kicker">项目位置与身份</span>
+          <h2 data-i18n="project.lifecycle.title">克隆或移动当前项目</h2>
+          <p data-i18n="project.lifecycle.description">先选择目标父文件夹并完成预检；确认前不会复制、移动或改写注册表。</p>
+        </div>
+        <span class="project-identity-badge" id="pj-lifecycle-identity"></span>
+      </div>
+      <label class="project-lifecycle-name" for="pj-lifecycle-target-name">
+        <span data-i18n="project.lifecycle.folder_name">目标文件夹名</span>
+        <input class="ipt" id="pj-lifecycle-target-name" maxlength="96" autocomplete="off">
+      </label>
+      <div class="project-lifecycle-actions">
+        <button class="btn" type="button" id="pj-clone-preflight" data-i18n="project.lifecycle.clone">选择位置并预检克隆</button>
+        <button class="btn" type="button" id="pj-move-preflight" data-i18n="project.lifecycle.move">选择位置并预检移动</button>
+        <button class="btn primary" type="button" id="pj-lifecycle-apply" disabled data-i18n="project.lifecycle.apply">确认执行</button>
+      </div>
+      <div class="project-lifecycle-status" id="pj-lifecycle-status" role="status"></div>
+    </div>
+
     <div class="ana-bar">
       <span class="ana-lbl">当前工作区</span>
       <select id="analysis-type" data-switch="data-ana" data-switch-store="project.ana.adsorption-first" aria-label="分析类型">
@@ -1785,6 +1841,11 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
           <section class="aw-inspector-group"><h3>方法矩阵</h3><div class="aw-method-scroll" id="aw-method-matrix"><div class="aw-empty">尚未读取。</div></div></section>
           <section class="aw-inspector-group"><h3>阻断项</h3><ul id="aw-blocking"><li>尚未读取</li></ul></section>
           <section class="aw-inspector-group"><h3>告警与限制</h3><ul id="aw-warnings"><li>尚未读取</li></ul></section>
+          <section class="aw-inspector-group aw-next-calculation" aria-labelledby="aw-next-title">
+            <h3 id="aw-next-title" data-i18n="analysis.next.title">下一步计算建议</h3>
+            <p class="aw-readonly-note" data-i18n="analysis.next.readOnly">仅显示经治理的只读建议；不会生成命令或自动提交。</p>
+            <div id="aw-next-calculation" aria-live="polite"><div class="aw-empty" data-i18n="analysis.next.not_loaded">尚未读取建议门槛。</div></div>
+          </section>
           <p class="aw-operation" id="aw-operation" aria-live="polite">等待项目上下文。</p>
         </div>
       </aside>
@@ -2006,6 +2067,46 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
         <p>历史 revision 保持可复核；项目数据变化不会改写旧报告。</p></div></header>
       <div id="rw-history-list" class="rw-history-list" aria-live="polite">
         <div class="rw-history-empty">尚未读取版本历史。</div>
+      </div>
+    </section>
+
+    <section class="rw-insights" id="rw-insights" aria-labelledby="rw-insights-heading">
+      <header class="rw-pane-heading">
+        <div>
+          <h2 id="rw-insights-heading" data-i18n="report.insights.title">版本科学检查与补充材料</h2>
+          <p data-i18n="report.insights.description">从已冻结、重新校验的 revision 读取差异、证据关系和可复现胶囊。</p>
+        </div>
+        <span id="rw-insights-state" data-state="empty" role="status" aria-live="polite">空</span>
+      </header>
+      <div class="rw-insights-controls">
+        <div class="rw-field">
+          <label for="rw-diff-left" data-i18n="report.insights.left_revision">基准 revision</label>
+          <select class="ipt" id="rw-diff-left" disabled></select>
+        </div>
+        <div class="rw-field">
+          <label for="rw-diff-right" data-i18n="report.insights.right_revision">比较 revision</label>
+          <select class="ipt" id="rw-diff-right" disabled></select>
+        </div>
+        <div class="actions rw-insights-actions">
+          <button class="btn" type="button" id="rw-load-diff" disabled
+                  data-i18n="report.insights.compare">科学差异</button>
+          <button class="btn" type="button" id="rw-load-graph" disabled
+                  data-i18n="report.insights.graph">证据图</button>
+          <button class="btn quiet" type="button" id="rw-export-capsule" disabled
+                  data-i18n="report.insights.capsule">导出 SI 胶囊</button>
+        </div>
+      </div>
+      <p class="rw-insights-note" id="rw-insights-note" aria-live="polite"
+         data-i18n="report.insights.empty">至少需要一个已登记 revision；科学差异需要两个。</p>
+      <div class="rw-insights-results" id="rw-insights-results" hidden>
+        <section aria-labelledby="rw-diff-heading">
+          <h3 id="rw-diff-heading" data-i18n="report.insights.diff_heading">科学差异</h3>
+          <div id="rw-diff-result" class="rw-insight-result"></div>
+        </section>
+        <section aria-labelledby="rw-graph-heading">
+          <h3 id="rw-graph-heading" data-i18n="report.insights.graph_heading">证据 / 声明图</h3>
+          <div id="rw-graph-result" class="rw-insight-result"></div>
+        </section>
       </div>
     </section>
 
@@ -2267,6 +2368,28 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
       <span class="sp" aria-hidden="true"></span>
     </div>
 
+    <div class="card assistant-context" role="region" aria-labelledby="assistant-context-heading">
+      <div class="assistant-context-head">
+        <div>
+          <h2 id="assistant-context-heading" data-i18n="ai.context.heading">当前上下文</h2>
+          <p data-i18n="ai.context.description">助手先围绕当前项目、任务和报告状态给出可执行下一步。</p>
+        </div>
+      </div>
+      <dl class="assistant-context-grid">
+        <div><dt data-i18n="ai.context.project">项目</dt><dd id="assistant-context-project">未选择项目</dd></div>
+        <div><dt data-i18n="ai.context.task">任务</dt><dd id="assistant-context-task">未选择任务</dd></div>
+        <div><dt data-i18n="ai.context.stage">阶段</dt><dd id="assistant-context-stage">—</dd></div>
+        <div><dt data-i18n="ai.context.report">报告</dt><dd id="assistant-context-report">尚未检查</dd></div>
+      </dl>
+      <div class="assistant-context-actions" role="toolbar" aria-label="上下文建议操作"
+           data-i18n-aria-label="ai.context.actions">
+        <button class="btn" type="button" data-assistant-route="run-jobs" data-i18n="ai.context.open_jobs">查看作业</button>
+        <button class="btn" type="button" data-assistant-route="analyze-energy" data-project-required data-i18n="ai.context.open_analysis">检查分析</button>
+        <button class="btn primary" type="button" data-assistant-route="publish-report" data-project-required data-i18n="ai.context.open_report">检查报告</button>
+      </div>
+      <p class="assistant-context-data" data-i18n="ai.context.data_boundary">外部模型只会收到你在本次会话中明确选择的文本预览；本地路径、凭据和原始计算文件不会自动发送。</p>
+    </div>
+
     <div class="card ai-chat" id="ai-chat-card" style="padding:12px;margin-bottom:10px">
       <div class="ai-chat-head">
         <div>
@@ -2291,6 +2414,10 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
       </div>
       <div class="sub ai-chat-privacy" data-i18n="ai.chat.privacy">文件先复制到本地会话隔离区并做大小、软链接与 ZIP 安全检查；只有本次勾选的文本预览会发送给外部模型。“停止回复”不会取消集群作业。</div>
     </div>
+
+    <details class="assistant-advanced" id="assistant-advanced-tools">
+      <summary><b data-i18n="ai.context.advanced_tools">高级工具</b><span data-i18n="ai.context.advanced_description">论文抽取、材料变体、文献对照与稿件生成</span></summary>
+      <div class="assistant-advanced-body">
 
     <div class="ai-guide" id="ai-guide" data-i18n="ai.guide.external_disabled" hidden>未开启联网抽取:请到设置页开启「允许将项目数据发送到外部 LLM」并配置密钥后再用「提取规格表」;或直接在下方粘贴论文方法学段落手填规格表(离线)。</div>
 
@@ -2390,6 +2517,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
       </div>
       <div id="ai-ms-out"></div>
     </div>
+      </div>
+    </details>
 
     <div class="log" id="ai-log" data-anchor><div class="head" data-i18n="ai.log">AI 助手日志</div></div>
   </section>
@@ -2506,6 +2635,47 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
       <button class="btn quiet" id="jb-checkall" data-i18n="jobs.filter.checkall">全选/反选</button>
       <button class="btn quiet" id="jb-cancelchecked" data-i18n="jobs.filter.cancelchecked">批量取消勾选作业</button>
     </div>
+
+    <div class="jobs-ledger-state" id="jobs-ledger-state" role="status" aria-live="polite" hidden></div>
+
+    <!-- 选择托盘不随列表筛选消失：明确显示跨筛选仍保留的批量作用域。 -->
+    <section class="card jobs-selection-tray" id="jobs-selection-tray"
+             aria-labelledby="jobs-selection-heading" hidden>
+      <div class="jobs-selection-head">
+        <div>
+          <h2 id="jobs-selection-heading" data-i18n="jobs.selection.title">选择托盘</h2>
+          <span class="sub" id="jobs-selection-summary" aria-live="polite"></span>
+        </div>
+        <span class="sp" style="flex:1"></span>
+        <button class="btn quiet" id="jobs-selection-review" aria-expanded="true"
+                aria-controls="jobs-selection-list">收起明细</button>
+        <button class="btn quiet" id="jobs-selection-clear" data-i18n="jobs.selection.clear">清空选择</button>
+      </div>
+      <div class="jobs-selection-actions" role="toolbar" aria-label="所选作业操作"
+           data-i18n-aria-label="jobs.selection.actions">
+        <button class="btn primary" id="jb-tray-submit" data-i18n="jobs.submit">上传并提交</button>
+        <button class="btn" id="jb-tray-fetch" data-i18n="jobs.fetch">拉回结果</button>
+        <button class="btn" id="jb-tray-continue" data-i18n="jobs.continue">续算</button>
+        <button class="btn" id="jb-tray-cancel" data-i18n="jobs.selection.cancel">取消作业</button>
+        <button class="btn quiet" id="jb-tray-remove" data-i18n="jobs.selection.remove">移出台账</button>
+        <button class="btn quiet" id="jb-tray-forecast" data-i18n="jobs.forecast.action">估算资源</button>
+      </div>
+      <section class="jobs-resource-forecast" id="jobs-resource-forecast"
+               aria-labelledby="jobs-resource-forecast-heading" aria-live="polite" hidden>
+        <h3 id="jobs-resource-forecast-heading" data-i18n="jobs.forecast.title">只读资源估算</h3>
+        <div id="jobs-resource-forecast-out"></div>
+      </section>
+      <ul class="jobs-selection-list" id="jobs-selection-list"></ul>
+    </section>
+
+    <!-- 同一时间只允许一个高风险作业动作进入确认/认证/远端执行链。 -->
+    <section class="card jobs-operation-queue" id="jobs-operation-queue"
+             aria-labelledby="jobs-operation-heading" hidden>
+      <h2 id="jobs-operation-heading" data-i18n="jobs.operation.title">操作队列</h2>
+      <div class="jobs-operation-active" id="jobs-operation-active" role="status"
+           aria-live="polite" hidden></div>
+      <ul id="jobs-operation-history" class="jobs-operation-history"></ul>
+    </section>
 
     <!-- v3.3.0 实时能量曲线:行内「实时」按钮打开;本地 OSZICAR 优先,远端 SSH 轮询 -->
     <div class="card" id="jobs-live" hidden style="padding:12px;margin-bottom:10px">
@@ -2664,7 +2834,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
     </div>
 
     <!-- 最先决定本次做什么；切换只影响界面显隐，不删除、移动或提交已有任务。 -->
-    <div class="card acc" data-acc="settings:workspace" data-sum="工作模式 / 计算引擎 / 本次计算类型" data-i18n-sum="accordion.summary.settings.workspace" data-acc-default="1" style="padding:12px;margin-bottom:10px">
+    <div class="card acc" id="set-workflow-card" data-acc="settings:workspace" data-sum="工作模式 / 计算引擎 / 本次计算类型" data-i18n-sum="accordion.summary.settings.workspace" data-acc-default="1" style="padding:12px;margin-bottom:10px">
       <h2 class="set-h acc-h"><button type="button" class="acc-toggle" data-i18n="settings.workspace.title">本次计算</button></h2>
       <div class="set-sub" data-i18n="settings.workspace.sub">依次选择工作模式、计算引擎和本次任务；VASP 默认且功能最完整，切换其它引擎后只保留已接通的任务和字段。</div>
       <div class="set-workspace-grid">
@@ -2855,6 +3025,51 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
       </div>
       <div class="actions" style="margin-top:12px">
         <button class="btn primary" id="set-fig-save" data-i18n="settings.figures.save">保存出图偏好</button>
+      </div>
+    </div>
+
+    <div class="card set-lab-policy-card" id="set-lab-policy-card"
+         aria-labelledby="set-lab-policy-heading" style="padding:12px;margin-bottom:10px">
+      <div class="set-lab-policy-head">
+        <div>
+          <h2 class="set-h" id="set-lab-policy-heading" data-i18n="settings.lab.title">实验室推荐策略</h2>
+          <p class="set-sub" data-i18n="settings.lab.subtitle">仅预览并确认用户级推荐；不修改既有作业，不自动提交，也不授予提交权限。</p>
+        </div>
+        <span class="set-lab-boundary" data-i18n="settings.lab.recommendation_only">仅推荐</span>
+      </div>
+      <div class="set-2col">
+        <label class="set-fld"><span class="set-lbl" data-i18n="settings.lab.policy">策略</span>
+          <select id="set-lab-policy" class="ipt"></select>
+        </label>
+        <label class="set-fld"><span class="set-lbl" data-i18n="settings.lab.applicability">适用对象</span>
+          <select id="set-lab-applicability" class="ipt"></select>
+        </label>
+        <label class="set-fld"><span class="set-lbl" data-i18n="settings.lab.cores">明确覆盖：核数</span>
+          <input id="set-lab-cores" class="ipt" type="number" min="1" max="4096" step="1"
+                 placeholder="留空使用策略值" data-i18n-placeholder="settings.lab.use_policy_value">
+        </label>
+        <label class="set-fld"><span class="set-lbl" data-i18n="settings.lab.walltime">明确覆盖：墙钟时间</span>
+          <input id="set-lab-walltime" class="ipt" type="text" inputmode="numeric"
+                 placeholder="HHH:MM:SS" data-i18n-placeholder="settings.lab.walltime_placeholder">
+        </label>
+        <label class="set-fld"><span class="set-lbl" data-i18n="settings.lab.encut">明确覆盖：ENCUT/ENMAX 倍数</span>
+          <input id="set-lab-encut" class="ipt" type="number" min="1" max="3" step="0.01"
+                 placeholder="留空使用策略值" data-i18n-placeholder="settings.lab.use_policy_value">
+        </label>
+        <label class="set-fld"><span class="set-lbl" data-i18n="settings.lab.force">明确覆盖：力阈值 (eV/Å)</span>
+          <input id="set-lab-force" class="ipt" type="number" min="0.00001" max="1" step="0.001"
+                 placeholder="留空使用策略值" data-i18n-placeholder="settings.lab.use_policy_value">
+        </label>
+      </div>
+      <p class="set-lab-attribution" data-i18n="settings.lab.attribution">确认记录由服务端归因为 manual-local-user；该标识仅用于审计归因，不代表授权。</p>
+      <div class="set-lab-current-row" role="status" aria-live="polite">
+        <span id="set-lab-revision" data-i18n="settings.lab.revision_initial">当前修订：0</span>
+        <span id="set-lab-current">尚未确认策略</span>
+      </div>
+      <div class="set-lab-preview" id="set-lab-preview-out" hidden></div>
+      <div class="actions" style="margin-top:12px">
+        <button class="btn" id="set-lab-preview" data-i18n="settings.lab.preview">只读预览</button>
+        <button class="btn primary" id="set-lab-confirm" data-i18n="settings.lab.confirm">明确确认并保存</button>
       </div>
     </div>
 

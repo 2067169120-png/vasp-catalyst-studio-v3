@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from vcstudio.gui_web.api import Api
 from vcstudio.project.analysis_preferences import AnalysisPreferencesStore
+from vcstudio.project.report_contracts import ValidationCheck, ValidationResult
 
 
 def _analysis_api(tmp_path):
@@ -147,6 +148,33 @@ def _assert_public(payload, tmp_path):
     assert "super-secret-value" not in encoded
 
 
+def test_elf_capability_card_requires_done_file_and_verified_method(tmp_path):
+    api = Api()
+    job = tmp_path / "elf"
+    job.mkdir()
+    target = {
+        "path": str(job), "source_id": "job-elf", "task_type": "elf",
+        "state": "DONE", "manifest": {},
+    }
+    api._analysis_workbench_targets = lambda _context: [target]
+    api._analysis_workbench_method_evidence = lambda _target: {"status": "verified"}
+    context = {"project": {"members": {}}, "project_id": "project-a"}
+
+    missing = api._analysis_workbench_capability_cards(context, [], {})
+    assert missing["charge-wavefunction"]["status"] == "missing_prerequisite"
+    assert missing["charge-wavefunction"]["activatable"] is False
+
+    (job / "ELFCAR").write_text("present", encoding="utf-8")
+    available = api._analysis_workbench_capability_cards(context, [], {})
+    assert available["charge-wavefunction"]["status"] == "available"
+    assert available["charge-wavefunction"]["activatable"] is True
+
+    api._analysis_workbench_method_evidence = lambda _target: {"status": "unverified"}
+    unavailable = api._analysis_workbench_capability_cards(context, [], {})
+    assert unavailable["charge-wavefunction"]["status"] == "unavailable"
+    assert unavailable["charge-wavefunction"]["activatable"] is False
+
+
 def test_bootstrap_and_single_project_all_stable_views_are_path_free(tmp_path):
     api, paths, projects = _analysis_api(tmp_path)
     project_id = api._workspace_project_id(paths[0], projects[paths[0]])
@@ -230,13 +258,14 @@ def test_multi_project_ids_are_server_resolved_with_baseline_and_sensitivity(tmp
 def test_comparison_unknown_duplicate_too_small_and_cross_binding_fail_closed(tmp_path):
     api, paths, projects = _analysis_api(tmp_path)
     ids = [api._workspace_project_id(path, projects[path]) for path in paths]
+    unknown_id = "project-" + "f" * 32
     base = {
         "analysis_id": "multi-project-comparison",
         "project_id": ids[0],
     }
 
     unknown = api.analysis_workbench_preview(ids[0], {
-        **base, "comparison_project_ids": [ids[0], "project-unknown"],
+        **base, "comparison_project_ids": [ids[0], unknown_id],
     })
     duplicate = api.analysis_workbench_preview(ids[0], {
         **base, "comparison_project_ids": [ids[0], ids[1], ids[1]],
@@ -262,12 +291,17 @@ def test_comparison_unknown_duplicate_too_small_and_cross_binding_fail_closed(tm
         assert response["spec"] is None and response["view"] is None
         assert response["error"]
         _assert_public(response, tmp_path)
+    assert unknown["error_code"] == "invalid_project_identity"
+    assert unknown["error_field"] == "comparison_project_ids"
     assert "comparison_project_ids" in unknown["error"]
+    assert unknown_id not in unknown["error"]
     assert "重复" in duplicate["error"]
     assert "至少" in too_small["error"]
     assert "binding mismatch" in cross_bound["error"]
     assert "unknown analysis_id" in unknown_analysis["error"]
-    assert "workspace opaque" in unknown_project["error"]
+    assert unknown_project["error_code"] == "invalid_project_identity"
+    assert unknown_project["error_field"] == "project_id"
+    assert "registered opaque" in unknown_project["error"]
 
 
 def test_every_registered_analysis_bootstraps_with_real_or_blocked_view(tmp_path):
@@ -291,13 +325,16 @@ def test_every_registered_analysis_bootstraps_with_real_or_blocked_view(tmp_path
         view = results[analysis_id]["view"]
         assert view["schema"] == "vcstudio.analysis-view/v1"
         assert view["analysis_id"] == analysis_id
-        assert view["scientific_status"] == "unavailable"
+        assert view["scientific_status"] in {"unavailable", "blocked"}
         assert view["available"] is False
-        assert view["rows"] == []
-        assert view["blocking"] and view["reason"]
-        assert view["denominator"] == {
-            "available_results": 0, "visible_rows": 0,
+        assert all(row.get("available") is False for row in view["rows"])
+        assert view["blocking"] or view.get("missing")
+        assert view["capability_status"] in {
+            "missing_prerequisite", "mode_mismatch", "not_implemented",
+            "unavailable",
         }
+        assert view["denominator"]["available_results"] == 0
+        assert view["denominator"]["visible_rows"] == len(view["rows"])
     for result in results.values():
         assert result["preferences"]["ok"] is True
         assert result["preference_revision"] == 0
@@ -439,3 +476,114 @@ def test_analysis_preferences_bridge_validates_opaque_project_and_bootstrap_revi
     for result in (
             initial, saved, rejected, favored, defaulted, deleted, bootstrap):
         _assert_public(result, tmp_path)
+
+
+def test_electronic_bootstrap_uses_only_manifest_descendant_and_opaque_source_id(
+        tmp_path):
+    api, paths, projects = _analysis_api(tmp_path)
+    project_path = paths[0]
+    project = projects[project_path]
+    project_id = api._workspace_project_id(project_path, project)
+    parent = project["members"]["configs"][0]
+    derived = tmp_path / "private-ledger" / "bands-child"
+    derived.mkdir(parents=True)
+    manifest = {
+        "job_uuid": "opaque-bands-child", "task_type": "bands",
+        "state": "DONE", "parent_job": parent,
+        "inputs": {"engine": "vasp"},
+    }
+    (derived / "job.yaml").write_text(
+        "schema: 1\njob_uuid: opaque-bands-child\ntask_type: bands\nstate: DONE\n",
+        encoding="utf-8")
+    (derived / "EIGENVAL").write_text("server evidence", encoding="utf-8")
+    unrelated = tmp_path / "private-ledger" / "unrelated"
+    unrelated.mkdir()
+    unrelated_manifest = {
+        "job_uuid": "must-not-appear", "task_type": "bands", "state": "DONE",
+        "inputs": {"engine": "vasp"},
+    }
+    api._ledger = SimpleNamespace(load_all=lambda: [
+        (str(derived), copy.deepcopy(manifest)),
+        (str(unrelated), copy.deepcopy(unrelated_manifest)),
+    ])
+    api._analysis_workbench_method_evidence = lambda _target: {
+        "status": "verified", "fingerprint": "method-bound"}
+    api.analyze_task = lambda path, kind=None: {
+        "ok": path == str(derived) and kind == "bands",
+        "kind": kind, "result": {
+            "gap": {"value": 1.25, "direct": False, "metal": False}},
+        "summary": "server finalized", "error": None,
+    }
+
+    response = api.analysis_workbench_bootstrap(
+        project_id, "electronic-structure")
+
+    assert response["ok"] is True
+    view = response["view"]
+    assert view["available"] is True
+    assert view["capability_status"] == "available"
+    assert len(view["rows"]) == 1
+    assert view["rows"][0]["source"]["source_id"] == "opaque-bands-child"
+    assert view["rows"][0]["values"][0]["display"] == "1.2500"
+    electronic = next(item for item in response["catalog"]["analyses"]
+                      if item["id"] == "electronic-structure")
+    assert electronic["activatable"] is True
+    assert electronic["capability_status"] == "available"
+    encoded = json.dumps(response, ensure_ascii=False)
+    assert str(derived) not in encoded
+    assert str(unrelated) not in encoded
+    assert "must-not-appear" not in encoded
+
+
+def test_governed_next_calculation_card_and_confirmation_stay_draft_only(tmp_path):
+    api, paths, projects = _analysis_api(tmp_path)
+    project_id = api._workspace_project_id(paths[0], projects[paths[0]])
+    initial = api.analysis_workbench_preview(project_id, {
+        "analysis_id": "adsorption-energy", "project_id": project_id,
+    })
+    fingerprint = initial["view"]["data_fingerprint"]
+    validation = ValidationResult(
+        spec_sha256="b" * 64, snapshot_sha256="c" * 64,
+        validated_at_utc="2026-08-11T01:02:03Z",
+        validator={"id": "scientific-gate", "version": "1"},
+        status="passed", effective_kind="final", final_allowed=True,
+        scientific_qualification="human_scientific_reviewed",
+        claim_ceiling="electronic_screen", report_model_sha256="d" * 64,
+        checks=(ValidationCheck(
+            id="scientific-gate", status="pass", severity="blocking",
+            required=True, evidence_refs=("snapshot:scientific",)),),
+        human_review={
+            "reviewer_type": "human", "reviewed_by": "reviewer-42",
+            "reviewed_at_utc": "2026-08-11T01:02:03Z",
+            "decision": "approved",
+            "evidence_refs": [f"analysis-view:{fingerprint}"],
+        },
+    )
+    api._analysis_workbench_validation_result = lambda _context: (validation, None)
+
+    bootstrap = api.analysis_workbench_bootstrap(
+        project_id, "adsorption-energy")
+    governed = bootstrap["view"]["next_calculation"]
+    assert governed["available"] is True
+    assert governed["recommendation_only"] is True
+    assert governed["requires_user_confirmation"] is True
+    assert governed["authorizes_submission"] is False
+    assert [item["id"] for item in governed["recommendations"]] == [
+        "resolve-missing-evidence", "refine-near-degenerate-set"]
+
+    rejected = api.analysis_workbench_next_intent(
+        project_id, {"analysis_id": "adsorption-energy"},
+        "resolve-missing-evidence", False)
+    drafted = api.analysis_workbench_next_intent(
+        project_id, {"analysis_id": "adsorption-energy"},
+        "resolve-missing-evidence", True)
+
+    assert rejected["ok"] is False and rejected["draft"] is None
+    assert drafted["ok"] is True
+    assert drafted["draft"]["status"] == "draft"
+    assert drafted["draft"]["draft_only"] is True
+    assert drafted["draft"]["authorizes_submission"] is False
+    assert drafted["draft"]["contains_executable_commands"] is False
+    encoded = json.dumps(drafted, ensure_ascii=False).lower()
+    assert str(tmp_path) not in encoded
+    assert "qsub" not in encoded and "sbatch" not in encoded

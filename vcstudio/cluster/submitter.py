@@ -59,29 +59,242 @@ _REMOTE_NAMESPACE_RE = re.compile(r'^[A-Za-z0-9_.-]{1,120}$')
 
 _JOB_LOCKS: dict[str, threading.RLock] = {}
 _JOB_LOCKS_GUARD = threading.Lock()
+_JOB_OPERATION_LOCK_FILE = '.vcstudio-job-operation.lock'
+_SUBMISSION_RECOVERY_FILE = '.vcstudio-submit-recovery.json'
+_SUBMISSION_RECOVERY_SCHEMA = 1
+
+
+class JobOperationBusy(RuntimeError):
+    """A different process or thread currently owns a job mutation."""
+
+    code = 'job_busy'
+    busy = True
+    requires_manual_recovery = False
+
+
+class UnknownRemoteSubmission(RuntimeError):
+    """A scheduler may have accepted a job whose local identity is not durable."""
+
+    code = 'unknown_remote_submission'
+    busy = False
+    requires_manual_recovery = True
+
+    def __init__(self, message, *, recovery_status='unknown_remote_submission',
+                 scheduler_job_id=''):
+        super().__init__(message)
+        self.recovery_status = str(recovery_status or 'unknown_remote_submission')
+        self.scheduler_job_id = str(scheduler_job_id or '')
+
+
+def _canonical_job_dir(job_dir) -> str:
+    return os.path.normcase(os.path.realpath(os.path.abspath(os.path.normpath(str(job_dir)))))
+
+
+def _fsync_directory(path: str) -> None:
+    try:
+        flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
+        descriptor = os.open(path, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
 
 
 @contextmanager
-def job_operation(job_dir, action='远程操作'):
-    """Serialize manifest/remote mutations for one job inside the GUI process.
+def _exclusive_job_file_lock(job_dir, action, *, create_dir=False):
+    """Take a non-blocking OS lock on a stable per-job lock-file inode."""
+    root = _canonical_job_dir(job_dir)
+    if not os.path.isdir(root):
+        if create_dir:
+            os.makedirs(root, exist_ok=True)
+        else:
+            raise ValueError('作业目录不存在，无法执行远程操作')
+    lock_path = os.path.join(root, _JOB_OPERATION_LOCK_FILE)
+    try:
+        handle = open(lock_path, 'a+b')
+    except OSError as exc:
+        raise RuntimeError('作业操作锁不可用，未执行任何远程操作') from exc
+    locked = False
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b'\0')
+            handle.flush()
+            os.fsync(handle.fileno())
+        handle.seek(0)
+        try:
+            if os.name == 'nt':
+                import msvcrt
 
-    pywebview dispatches API calls on independent threads.  Without this lock,
-    a manual fetch and an automatic continuation can both load the old
-    manifest and the later save may orphan a newly submitted scheduler job.
-    The fetch-generation CAS remains the second line of defence.
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+        except (BlockingIOError, OSError) as exc:
+            raise JobOperationBusy(
+                f'{action}已跳过：该作业正在执行另一项提交/刷新/下载/续算操作') from exc
+        yield
+    finally:
+        if locked:
+            try:
+                handle.seek(0)
+                if os.name == 'nt':
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                # Closing the descriptor also releases the kernel lock.
+                pass
+        handle.close()
+
+
+@contextmanager
+def job_operation(job_dir, action='远程操作', *, create_dir=False):
+    """Serialize manifest/remote mutations for one job across all GUI processes.
+
+    The in-process lock rejects concurrent pywebview threads promptly.  The
+    stable advisory file lock is the authority across independent desktop/EXE
+    instances and covers the entire read-check-remote-write transaction.
     """
-    key = os.path.normcase(os.path.abspath(os.path.normpath(str(job_dir))))
+    key = _canonical_job_dir(job_dir)
     with _JOB_LOCKS_GUARD:
         lock = _JOB_LOCKS.setdefault(key, threading.RLock())
     if not lock.acquire(blocking=False):
-        raise RuntimeError(f'{action}已跳过：该作业正在执行另一项提交/刷新/下载/续算操作')
+        raise JobOperationBusy(
+            f'{action}已跳过：该作业正在执行另一项提交/刷新/下载/续算操作')
     try:
-        yield
+        with _exclusive_job_file_lock(key, action, create_dir=create_dir):
+            yield
     finally:
         lock.release()
 
 
-def _serialized_job_argument(position: int, action: str):
+def _submission_recovery_path(job_dir) -> str:
+    return os.path.join(_canonical_job_dir(job_dir), _SUBMISSION_RECOVERY_FILE)
+
+
+def _durable_json_write(path: str, payload: dict) -> None:
+    parent = os.path.dirname(path)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f'.{os.path.basename(path)}.', suffix='.tmp', dir=parent)
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8', newline='\n') as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True,
+                      separators=(',', ':'))
+            handle.write('\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(parent)
+    finally:
+        try:
+            os.remove(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _read_submission_recovery(job_dir) -> dict | None:
+    path = _submission_recovery_path(job_dir)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            payload = json.load(handle)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise UnknownRemoteSubmission(
+            '提交恢复记录不可读；为避免重复提交，必须人工核对调度器后再处理。',
+            recovery_status='invalid_recovery_journal') from exc
+    valid_statuses = {'submitting', 'remote_accepted', 'unknown_remote_submission'}
+    if (not isinstance(payload, dict)
+            or payload.get('schema') != _SUBMISSION_RECOVERY_SCHEMA
+            or payload.get('status') not in valid_statuses
+            or not isinstance(payload.get('transaction_id'), str)):
+        raise UnknownRemoteSubmission(
+            '提交恢复记录无效；为避免重复提交，必须人工核对调度器后再处理。',
+            recovery_status='invalid_recovery_journal')
+    return payload
+
+
+def _write_submission_recovery(job_dir, payload: dict) -> None:
+    _durable_json_write(_submission_recovery_path(job_dir), payload)
+
+
+def _clear_submission_recovery(job_dir) -> None:
+    path = _submission_recovery_path(job_dir)
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return
+    _fsync_directory(os.path.dirname(path))
+
+
+def _submission_attempt_for_key(manifest: dict | None, idempotency_key: str) -> dict | None:
+    if not idempotency_key or not isinstance(manifest, dict):
+        return None
+    attempts = manifest.get('attempts')
+    if not isinstance(attempts, list):
+        return None
+    for attempt in reversed(attempts):
+        if (isinstance(attempt, dict)
+                and str(attempt.get('idempotency_key') or '') == idempotency_key
+                and str(attempt.get('job_id') or '')):
+            return attempt
+    return None
+
+
+def _reconcile_submission_recovery(job_dir, manifest: dict | None,
+                                   idempotency_key: str) -> dict | None:
+    """Return an authoritative replay or fail closed on an uncertain submit."""
+    recovery = _read_submission_recovery(job_dir)
+    if recovery is None:
+        attempt = _submission_attempt_for_key(manifest, idempotency_key)
+        if attempt and str((manifest or {}).get('scheduler_job_id') or '') == \
+                str(attempt.get('job_id') or ''):
+            replay = dict(manifest)
+            replay['_submission_replayed'] = True
+            return replay
+        return None
+
+    recovery_job_id = str(recovery.get('scheduler_job_id') or '')
+    current_job_id = str((manifest or {}).get('scheduler_job_id') or '')
+    attempts = (manifest or {}).get('attempts') or []
+    recorded = any(
+        isinstance(attempt, dict)
+        and str(attempt.get('job_id') or '') == recovery_job_id
+        for attempt in attempts
+    )
+    if (recovery.get('status') == 'remote_accepted' and recovery_job_id
+            and current_job_id == recovery_job_id and recorded):
+        # Crash/cleanup failure after the manifest replacement: the canonical
+        # manifest already carries the exact remote identity, so cleanup and
+        # replay are safe without another scheduler call.
+        try:
+            _clear_submission_recovery(job_dir)
+        except OSError:
+            # A stale journal is safe once the same remote identity is durable
+            # in job.yaml; keep returning the authoritative current state.
+            pass
+        replay = dict(manifest)
+        replay['_submission_replayed'] = True
+        return replay
+
+    raise UnknownRemoteSubmission(
+        '上次提交的远端结果尚未安全写入本地；已禁止自动重试，请人工核对调度器。',
+        recovery_status=str(recovery.get('status') or 'unknown_remote_submission'),
+        scheduler_job_id=recovery_job_id)
+
+
+def _serialized_job_argument(position: int, action: str, *, create_dir=False):
     def decorate(function):
         @functools.wraps(function)
         def wrapped(*args, **kwargs):
@@ -90,7 +303,7 @@ def _serialized_job_argument(position: int, action: str):
                 job_dir = args[position]
             if job_dir is None:
                 raise TypeError('缺少 job_dir')
-            with job_operation(job_dir, action):
+            with job_operation(job_dir, action, create_dir=create_dir):
                 return function(*args, **kwargs)
         return wrapped
     return decorate
@@ -527,6 +740,11 @@ def preflight(profile, job_dir: str) -> list:
             errs.append(
                 '作业已带远端身份(' + '、'.join(occupied) + ')，拒绝重复提交；'
                 '如需重算请新建作业目录或使用续算流程')
+        attempts = m0.get('attempts')
+        if isinstance(attempts, list) and attempts:
+            errs.append(
+                '作业已有提交尝试记录，不能按全新 CREATED 作业再次提交；'
+                '请核对调度器或使用明确的恢复/续算流程')
     if engine not in _SUPPORTED_ENGINES:
         errs.append(
             f'不支持的计算引擎:{engine!r}；可选 '
@@ -769,11 +987,31 @@ def build_script_text(profile, job_dir: str) -> str:
 
 # ── 提交 ───────────────────────────────────────────────────────────────────
 @_serialized_job_argument(3, '提交')
-def submit_job(client, sftp, profile, job_dir: str) -> dict:
-    """上传 + 提交一个作业;成功回写 manifest(UPLOADED→SUBMITTED)并返回之。
+def submit_job(client, sftp, profile, job_dir: str, *,
+               idempotency_key: str | None = None) -> dict:
+    """Upload and submit one job under a durable, fail-closed transaction.
 
-    失败抛 RuntimeError/ValueError(中文),manifest 不落 SUBMITTED。
+    The per-job OS lock is already held by the decorator before this function
+    re-reads ``job.yaml``.  A recovery journal is fsynced before the scheduler
+    command, then advanced with the returned job id before ``job.yaml`` is
+    replaced.  A crash can therefore be reported honestly as an unknown remote
+    outcome and can never trigger an automatic second submission.
     """
+    operation_key = str(idempotency_key or '').strip()
+    if operation_key and (len(operation_key) > 128
+                          or not re.fullmatch(r'[A-Za-z0-9_.:-]{12,128}',
+                                              operation_key)):
+        raise ValueError('无效的作业操作请求标识')
+
+    # Re-read only after acquiring both the in-process and OS advisory locks.
+    # A matching durable operation id may safely replay an already-recorded
+    # submission; every other non-CREATED/uncertain state remains fail closed.
+    authoritative = manifest_mod.load_manifest(job_dir)
+    replay = _reconcile_submission_recovery(
+        job_dir, authoritative, operation_key)
+    if replay is not None:
+        return replay
+
     errs = preflight(profile, job_dir)
     if errs:
         raise ValueError('；'.join(errs))
@@ -802,35 +1040,101 @@ def submit_job(client, sftp, profile, job_dir: str) -> dict:
     m['remote_dir'] = spec.remote_dir
     manifest_mod.set_state(m, 'UPLOADED', note=upload_note)
 
-    out, err = run_cmd(client, dialect.submit_cmd(
-        posixpath.join(spec.remote_dir, SCRIPT_NAME),
-        getattr(profile, 'scheduler_bin', '')))
+    recovery = {
+        'schema': _SUBMISSION_RECOVERY_SCHEMA,
+        'transaction_id': os.urandom(16).hex(),
+        'status': 'submitting',
+        'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'manifest_job_id': str(m.get('job_id') or ''),
+        'cluster': str(profile.name or ''),
+        'remote_dir': str(spec.remote_dir or ''),
+        'idempotency_key': operation_key or None,
+        'scheduler_job_id': None,
+    }
+    _write_submission_recovery(job_dir, recovery)
+    try:
+        out, err = run_cmd(client, dialect.submit_cmd(
+            posixpath.join(spec.remote_dir, SCRIPT_NAME),
+            getattr(profile, 'scheduler_bin', '')))
+    except Exception as exc:  # noqa: BLE001 - remote acceptance may be unknowable
+        recovery['status'] = 'unknown_remote_submission'
+        try:
+            _write_submission_recovery(job_dir, recovery)
+        except OSError:
+            # The already-fsynced ``submitting`` record is the conservative
+            # recovery gate even if advancing it fails.
+            pass
+        try:
+            manifest_mod.save_manifest(job_dir, m)
+        except OSError:
+            pass
+        raise UnknownRemoteSubmission(
+            '提交命令返回前连接中断，远端是否受理未知；已禁止自动重试，请人工核对调度器。',
+            recovery_status='unknown_remote_submission') from exc
+
     job_id = dialect.parse_job_id(out)
     if not job_id:
-        manifest_mod.save_manifest(job_dir, m)     # 保留 UPLOADED 痕迹
-        raise RuntimeError(f'提交失败,{dialect.name} 返回:{(out or err).strip()[:300]}')
+        recovery['status'] = 'unknown_remote_submission'
+        try:
+            _write_submission_recovery(job_dir, recovery)
+        except OSError:
+            # The original fsynced ``submitting`` journal still blocks retry.
+            pass
+        try:
+            # Preserve the UPLOADED evidence, but keep the recovery gate: a
+            # malformed response is not proof that the scheduler rejected it.
+            manifest_mod.save_manifest(job_dir, m)
+        except OSError:
+            pass
+        raise UnknownRemoteSubmission(
+            f'提交失败：命令未返回可核验作业号（{dialect.name}）；'
+            '已禁止自动重试，请人工核对调度器。',
+            recovery_status='unknown_remote_submission')
 
-    m['scheduler_job_id'] = job_id
-    m['attempts'] = list(m.get('attempts') or [])
-    attempt = {
-        'n': len(m['attempts']) + 1,
-        'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
-        'job_id': job_id,
-        'cluster': profile.name,
-        'queue': spec.queue or None,
-        'script_mode': getattr(profile, 'script_mode', 'auto'),
-        'engine': _job_engine(m),
-        # v3.3.0 实际核时统计:提交时点核数(nodes×ppn;ppn 未配 → None,usage 端不编数)
-        'cores': (spec.nodes * spec.ppn) if spec.ppn else None,
-    }
-    # The token is part of the immutable attempt audit record and later binds
-    # downloaded files to this exact scheduler generation.
-    token_manifest = {**m, 'scheduler_job_id': job_id,
-                      'attempts': [*m['attempts'], attempt]}
-    attempt['attempt_token'] = current_attempt_token(token_manifest)
-    m['attempts'].append(attempt)
-    manifest_mod.set_state(m, 'SUBMITTED', note=f'{dialect.name} {job_id}')
-    manifest_mod.save_manifest(job_dir, m)
+    recovery['status'] = 'remote_accepted'
+    recovery['scheduler_job_id'] = str(job_id)
+    try:
+        _write_submission_recovery(job_dir, recovery)
+    except Exception as exc:  # noqa: BLE001 - retain prior durable submitting gate
+        raise UnknownRemoteSubmission(
+            '远端已返回作业号但恢复记录未能推进；已禁止自动重试，请人工核对调度器。',
+            recovery_status='submitting', scheduler_job_id=job_id) from exc
+
+    try:
+        m['scheduler_job_id'] = job_id
+        m['attempts'] = list(m.get('attempts') or [])
+        attempt = {
+            'n': len(m['attempts']) + 1,
+            'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'job_id': job_id,
+            'cluster': profile.name,
+            'queue': spec.queue or None,
+            'script_mode': getattr(profile, 'script_mode', 'auto'),
+            'engine': _job_engine(m),
+            # v3.3.0 实际核时统计:提交时点核数(nodes×ppn;ppn 未配 → None,usage 端不编数)
+            'cores': (spec.nodes * spec.ppn) if spec.ppn else None,
+        }
+        if operation_key:
+            attempt['idempotency_key'] = operation_key
+        # The token is part of the immutable attempt audit record and later binds
+        # downloaded files to this exact scheduler generation.
+        token_manifest = {**m, 'scheduler_job_id': job_id,
+                          'attempts': [*m['attempts'], attempt]}
+        attempt['attempt_token'] = current_attempt_token(token_manifest)
+        m['attempts'].append(attempt)
+        manifest_mod.set_state(m, 'SUBMITTED', note=f'{dialect.name} {job_id}')
+        manifest_mod.save_manifest(job_dir, m)
+    except Exception as exc:  # noqa: BLE001 - journal owns the unresolved identity
+        raise UnknownRemoteSubmission(
+            '远端已受理作业，但本地清单未能安全持久化；已禁止自动重试，请人工恢复。',
+            recovery_status='remote_accepted', scheduler_job_id=job_id) from exc
+
+    try:
+        _clear_submission_recovery(job_dir)
+    except OSError:
+        # The manifest is already authoritative.  A later retry reconciles the
+        # matching journal and removes it without contacting the scheduler.
+        pass
     return m
 
 
@@ -886,8 +1190,34 @@ def query_workdir(client, profile, job_id: str) -> str:
     return dialect.parse_workdir(out)
 
 
-@_serialized_job_argument(0, '认领')
+def _validate_adopt_request(profile, job_id, remote_dir, name, task_type) -> None:
+    """Reject malformed adoption requests before creating a target lock file."""
+    if not str(getattr(profile, 'name', '') or '').strip():
+        raise ValueError('认领作业需要一个具名集群配置')
+    normalized_job_id = str(job_id).strip() if job_id is not None else ''
+    if not normalized_job_id:
+        raise ValueError('认领作业需要非空调度器作业号')
+    if not isinstance(remote_dir, str) or not remote_dir.startswith('/'):
+        raise ValueError('远程目录需为绝对路径(以 / 开头)')
+    if name is not None and not isinstance(name, str):
+        raise ValueError('作业名称必须是文本')
+    if isinstance(name, str) and '\0' in name:
+        raise ValueError('作业名称不能包含空字符')
+    requested_task = str(task_type).strip() if task_type is not None else ''
+    if requested_task:
+        manifest_mod.normalize_task_type(requested_task)
+
+
 def adopt_external_job(local_dir: str, profile, job_id: str, remote_dir: str,
+                       name: str = '', task_type: str | None = None) -> dict:
+    """Validate an adoption request before its directory-level mutation lock."""
+    _validate_adopt_request(profile, job_id, remote_dir, name, task_type)
+    return _adopt_external_job_locked(
+        local_dir, profile, job_id, remote_dir, name=name, task_type=task_type)
+
+
+@_serialized_job_argument(0, '认领', create_dir=True)
+def _adopt_external_job_locked(local_dir: str, profile, job_id: str, remote_dir: str,
                        name: str = '', task_type: str | None = None) -> dict:
     """认领一个非本软件提交的集群作业:落 job.yaml + 入台账,之后查状态/拉回/续算全走原生路径。
 

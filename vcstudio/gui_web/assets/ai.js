@@ -745,12 +745,18 @@
 
   async function loadProjects() {
     const r = await VCS.call('proj_list');
-    const projs = (r && r.projects) || [];
+    const projs = ((r && r.projects) || []).filter(p => String(p.project_id || '').trim());
     const opts = `<option value="">${VCS.esc(tr(
       'runtime.ai.projects.select', {}, '(选项目)', '(Select project)',
     ))}</option>` +
-      projs.map(p => `<option value="${VCS.esc(p.path)}">${VCS.esc(p.name || p.path)}</option>`).join('');
-    ['ai-cmp-project', 'ai-ms-project'].forEach(id => { const s = $(id); if (s) s.innerHTML = opts; });
+      projs.map(p => `<option value="${VCS.esc(p.project_id)}">${VCS.esc(p.name || p.project_id)}</option>`).join('');
+    ['ai-cmp-project', 'ai-ms-project'].forEach(id => {
+      const s = $(id);
+      if (!s) return;
+      const previous = s.value;
+      s.innerHTML = opts;
+      if (projs.some(p => p.project_id === previous)) s.value = previous;
+    });
   }
 
   // ── 初始化 ──
@@ -818,4 +824,7 @@
   window.AIAssistant = { reload: () => {
     refreshGuide(); loadChatSessions(false);
   } };
+  if (window.__VCS_TEST__) {
+    window.AIAssistant.__test = { State, loadProjects, compareLit, genManuscript };
+  }
 })();

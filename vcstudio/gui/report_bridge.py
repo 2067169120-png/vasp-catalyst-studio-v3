@@ -144,7 +144,7 @@ def project_report_status(project_path) -> dict:
             "error": "未指定 project.yaml 路径",
         }
     try:
-        raw = get_api().proj_report_status(project)
+        raw = get_api()._proj_report_status_for_path(project)
     except Exception as exc:  # noqa: BLE001 - keep Tk status reads structured
         return {
             "ok": False,
@@ -225,7 +225,7 @@ def generate_project_report_bundle(
         }
         if normalized_kind:
             kwargs["requested_kind"] = normalized_kind
-        raw = get_api().proj_report_bundle(project, target, **kwargs)
+        raw = get_api()._proj_report_bundle_for_path(project, target, **kwargs)
     except Exception as exc:  # noqa: BLE001 - Tk needs a structured failure
         return _failure(exc)
     if not isinstance(raw, dict):

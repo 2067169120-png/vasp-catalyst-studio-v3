@@ -16,6 +16,20 @@
     'analyze-custom': 'task-results',
     'analyze-properties': 'property-calculators',
   });
+  const CAPABILITY_LABEL_KEYS = Object.freeze({
+    available: 'analysis.capability.available',
+    missing_prerequisite: 'analysis.capability.missing_prerequisite',
+    mode_mismatch: 'analysis.capability.mode_mismatch',
+    not_implemented: 'analysis.capability.not_implemented',
+    unavailable: 'analysis.capability.unavailable',
+  });
+  const CAPABILITY_ACTION_KEYS = Object.freeze({
+    available: 'analysis.capability.action.available',
+    missing_prerequisite: 'analysis.capability.action.missing_prerequisite',
+    mode_mismatch: 'analysis.capability.action.mode_mismatch',
+    not_implemented: 'analysis.capability.action.not_implemented',
+    unavailable: 'analysis.capability.action.unavailable',
+  });
   const State = {
     projectId: '', projectName: '', analysisId: '',
     catalog: null, spec: null, view: null, projects: [],
@@ -42,11 +56,11 @@
     return String(source[field + suffix] || source[field] || fallback || '');
   }
   function projectIdentity(project) {
-    return safeId(project && (project.project_id || project.id || project.project_uuid));
+    return safeId(project && project.project_id);
   }
   function currentProject() {
     if (window.Project && typeof window.Project.current === 'function') {
-      const project = window.Project.current(); if (project && project.path) return project;
+      const project = window.Project.current(); if (projectIdentity(project)) return project;
     }
     const workspace = VCS.workspace; const id = safeId(workspace && workspace.state && workspace.state.project_id);
     if (!id || !workspace || !Array.isArray(workspace.projects)) return null;
@@ -123,7 +137,10 @@
     records.forEach(record => {
       const item = document.createElement('li'); const button = document.createElement('button');
       button.type = 'button'; button.dataset.analysisId = String(record.id || '');
-      button.disabled = State.busy;
+      const capabilityStatus = String(record.capability_status || 'unavailable');
+      const activatable = record.activatable === true && capabilityStatus === 'available';
+      button.disabled = State.busy || !activatable;
+      button.dataset.capabilityStatus = capabilityStatus;
       button.dataset.favorite = favorites.has(record.id) ? 'true' : 'false';
       button.setAttribute('aria-current', record.id === State.analysisId ? 'true' : 'false');
       const label = localized(record, 'label', record.id || tr('analysis.generic', '分析'));
@@ -134,8 +151,15 @@
       const desc = document.createElement('small');
       desc.id = `aw-analysis-desc-${String(record.id || '').replace(/[^A-Za-z0-9_-]/g, '-')}`;
       desc.textContent = localized(record, 'description');
+      const status = document.createElement('span'); status.className = 'aw-capability-status';
+      status.dataset.status = capabilityStatus;
+      const statusKey = CAPABILITY_LABEL_KEYS[capabilityStatus] || CAPABILITY_LABEL_KEYS.unavailable;
+      status.textContent = tr(statusKey, capabilityStatus);
+      const action = document.createElement('small'); action.className = 'aw-next-action';
+      const actionKey = CAPABILITY_ACTION_KEYS[capabilityStatus] || CAPABILITY_ACTION_KEYS.unavailable;
+      action.textContent = tr(actionKey, String(record.next_action || ''));
       button.setAttribute('aria-describedby', desc.id);
-      button.append(title, desc); item.appendChild(button); list.appendChild(item);
+      button.append(title, status, desc, action); item.appendChild(button); list.appendChild(item);
     });
     list.setAttribute('aria-busy', State.busy || !State.catalog ? 'true' : 'false');
   }
@@ -330,6 +354,59 @@
     box.innerHTML = ''; box.appendChild(tableElement(headers, rows));
   }
 
+  function renderServerResults(view, box) {
+    const rows = Array.isArray(view.rows) ? view.rows : [];
+    box.innerHTML = '';
+    if (!rows.length) {
+      const empty = document.createElement('div'); empty.className = 'aw-empty';
+      empty.textContent = String(view.reason || (view.missing || view.blocking || [])[0] ||
+        tr('analysis.results.empty', '没有服务器最终确认的结果；请检查前置条件。'));
+      box.appendChild(empty); return;
+    }
+    rows.forEach(row => {
+      const card = document.createElement('section'); card.className = 'aw-result-card';
+      const header = document.createElement('header');
+      const title = document.createElement('b');
+      const source = plain(row.source); const sourceIds = row.source_ids || [];
+      title.textContent = String(row.kind || source.task_type || tr('analysis.record', '记录'));
+      const status = document.createElement('span'); status.className = 'aw-capability-status';
+      status.dataset.status = String(row.status || (row.available ? 'available' : 'unavailable'));
+      status.textContent = String(row.status || (row.available ? 'available' : 'unavailable'));
+      header.append(title, status); card.appendChild(header);
+      const identity = document.createElement('code');
+      identity.textContent = String(source.source_id || sourceIds.join(', ') || '—');
+      card.appendChild(identity);
+      const values = Array.isArray(row.values) ? row.values : [];
+      if (values.length) card.appendChild(tableElement([
+        { label: tr('analysis.results.quantity', '量') },
+        { label: tr('analysis.results.value', '服务器结果'), numeric: true },
+        { label: tr('analysis.results.unit', '单位') },
+      ], values.map(value => ({ cells: [value.label || value.key, value.display, value.unit] }))));
+      const summary = document.createElement('p'); summary.textContent = String(row.summary || '');
+      card.appendChild(summary);
+      const serverResult = plain(row.result);
+      if (serverResult.analysis_kind === 'elf_distribution_summary') {
+        const quantiles = Array.isArray(serverResult.display_quantiles)
+          ? serverResult.display_quantiles : [];
+        if (quantiles.length) card.appendChild(tableElement([
+          { label: tr('analysis.elf.quantile', '分位点') },
+          { label: tr('analysis.elf.value', '服务器 ELF 值'), numeric: true },
+        ], quantiles.map(item => ({ cells: [item.fraction, item.value] }))));
+        const histogram = Array.isArray(serverResult.display_histogram)
+          ? serverResult.display_histogram : [];
+        if (histogram.length) card.appendChild(tableElement([
+          { label: tr('analysis.elf.bin', 'ELF 区间') },
+          { label: tr('analysis.elf.count', '服务器网格点数'), numeric: true },
+        ], histogram.map(item => ({ cells: [`${item.low}–${item.high}`, item.count] }))));
+        const boundary = document.createElement('small'); boundary.className = 'aw-elf-boundary';
+        boundary.textContent = tr('analysis.elf.boundary',
+          '仅显示 ELFCAR 网格分布摘要；不据此宣称成键、盆、临界点或拓扑结论。');
+        card.appendChild(boundary);
+      }
+      box.appendChild(card);
+    });
+  }
+
   function appendFreeEnergyMetric(list, labelText, value, unit = '') {
     const group = document.createElement('div'); group.className = 'aw-free-energy-metric';
     const term = document.createElement('dt'); const detail = document.createElement('dd');
@@ -426,7 +503,48 @@
     });
   }
 
+  function renderNextCalculation(view) {
+    const box = $('aw-next-calculation'); if (!box) return; box.innerHTML = '';
+    const governed = plain(view && view.next_calculation);
+    const status = document.createElement('span'); status.className = 'aw-capability-status';
+    status.dataset.status = governed.available === true ? 'available' : 'unavailable';
+    status.textContent = governed.available === true
+      ? tr('analysis.next.governed', '已通过治理门槛')
+      : tr('analysis.next.blocked', '建议不可用');
+    box.appendChild(status);
+    if (governed.available !== true) {
+      const list = document.createElement('ul');
+      (governed.blocking || []).forEach(reason => {
+        const item = document.createElement('li'); item.textContent = String(reason); list.appendChild(item);
+      });
+      if (!list.children.length) {
+        const item = document.createElement('li');
+        item.textContent = tr('analysis.next.validation_missing', '缺少与当前数据指纹绑定的人审 ValidationResult。');
+        list.appendChild(item);
+      }
+      box.appendChild(list); return;
+    }
+    const recommendations = Array.isArray(governed.recommendations)
+      ? governed.recommendations : [];
+    if (!recommendations.length) {
+      const empty = document.createElement('p');
+      empty.textContent = tr('analysis.next.none', '当前没有需要追加计算的可审计不确定性信号。');
+      box.appendChild(empty); return;
+    }
+    recommendations.forEach(recommendation => {
+      const card = document.createElement('article'); card.className = 'aw-next-card';
+      const title = document.createElement('b'); title.textContent = String(recommendation.title || '');
+      const reason = document.createElement('p'); reason.textContent = String(recommendation.reason || '');
+      const refs = document.createElement('code');
+      refs.textContent = (recommendation.evidence_refs || []).map(String).join(' · ');
+      const policy = document.createElement('small');
+      policy.textContent = tr('analysis.next.policy', '仅建议 · 需用户确认 · 不授权提交');
+      card.append(title, reason, refs, policy); box.appendChild(card);
+    });
+  }
+
   function renderInspector(view) {
+    renderNextCalculation(view);
     const methods = $('aw-method-matrix'); if (methods) { methods.innerHTML = '';
       (view.method_matrix || []).forEach(record => {
         const card = document.createElement('div'); card.className = 'aw-method';
@@ -457,7 +575,8 @@
     const denominator = plain(view.denominator);
     const inputDenominator = denominator.input_configurations != null ? denominator.input_configurations
       : denominator.selected_projects != null ? denominator.selected_projects
-        : denominator.requested_paths != null ? denominator.requested_paths : denominator.input_steps;
+        : denominator.requested_paths != null ? denominator.requested_paths
+          : denominator.resolved_targets != null ? denominator.resolved_targets : denominator.input_steps;
     setText('aw-status-input', inputDenominator, 0);
     setText('aw-status-visible', denominator.visible_rows != null ? denominator.visible_rows : denominator.observed_numeric_cells, 0);
     setText('aw-status-hash', view.data_fingerprint ? String(view.data_fingerprint).slice(0, 12) : '—');
@@ -465,8 +584,7 @@
     if (State.analysisId === 'adsorption-energy') renderAdsorptionTable(view, box);
     else if (State.analysisId === 'free-energy-path') renderFreeEnergyView(view, box);
     else if (State.analysisId === 'multi-project-comparison') renderComparisonTable(view, box);
-    else box.innerHTML = `<div class="aw-empty">${esc(view.error || tr('analysis.placeholder',
-      '该注册分析已建立能力入口；请选择实际作业后使用对应解析器。'))}</div>`;
+    else renderServerResults(view, box);
   }
 
   function renderAll() {
@@ -529,7 +647,12 @@
       if (safeId(result.project_id) !== id) throw new Error(tr(
         'analysis.bootstrap.project_mismatch', 'bootstrap 项目身份不一致'));
       State.projectName = String(result.project_name || plain(result.project).name || project.name || '');
-      State.catalog = clone(result.catalog || {}); State.projects = clone(result.projects || []);
+      State.catalog = clone(result.catalog || {});
+      State.projects = (Array.isArray(result.projects) ? result.projects : []).map(project => ({
+        project_id: safeId(project && project.project_id),
+        name: String(project && (project.name || project.display_name) || ''),
+        counts: clone(project && project.counts || {}) || {},
+      })).filter(project => project.project_id);
       State.spec = clone(result.default_spec || result.spec || {});
       State.view = clone(result.view || result.analysis_view || {});
       State.analysisId = safeId(State.spec.analysis_id) || State.analysisId;

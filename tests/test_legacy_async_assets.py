@@ -43,20 +43,21 @@ def test_project_explicit_selection_survives_eager_reload_and_stale_selector_los
         'async function reloadProjects(',
     )
     assert 'const requested = State.requestedProject' in perform
-    assert perform.index('requestedHit && requestedHit.path') < perform.index(
-        'preferredReference, liveSelection, saved'
+    assert perform.index('requestedHit && projectId(requestedHit)') < perform.index(
+        'workspaceId, liveSelection, active && projectId(active)'
     )
     selector = _block(
         source,
         'async function selectRequestedProject(',
-        'async function selectByPath(',
+        'async function selectById(',
     )
     assert 'const generation = ++State.projectSelectionGeneration' in selector
     assert 'State.requestedProject = request' in selector
     assert selector.index('await reloadProjects(') < selector.index(
         'generation !== State.projectSelectionGeneration'
     ) < selector.index('applyProjectSelection(hit)')
-    assert "return selectRequestedProject('path', wanted, wanted)" in source
+    assert 'return selectRequestedProject(id)' in source
+    assert 'selectByPath' not in source
 
 
 def test_native_project_switch_uses_same_generation_and_returns_stale_apply_signal():
@@ -147,20 +148,20 @@ def test_manual_job_context_always_prefers_canonical_project_id():
     source = _source('jobs.js')
     publish = _block(source, 'function publishJobContext(row)',
                      'function publishJobContextCleared()')
-    assert "row.project_id || row.project_uuid || ''" in publish
+    assert "row.project_id || ''" in publish
     assert 'project_id: projectId' in publish
-    assert 'row.project_uuid || row.project_id' not in publish
+    assert 'project_uuid' not in publish
 
 
 def test_jobs_project_jump_selects_atomically_before_committing_project_deep_link():
     source = _source('jobs.js')
     goto = _block(source, 'async function gotoProject(', '// 「导出报告」')
     modern = goto[goto.index('if (workspace && typeof workspace.requestProjectSwitch'):
-                  goto.index('// 旧壳层兼容')]
-    assert 'workspace.requestProjectSwitch(target.id, async hit =>' in modern
-    assert 'return window.Project.selectByPath(canonicalPath)' in modern
+                  goto.index('const selected = await window.Project.selectById')]
+    assert 'workspace.requestProjectSwitch(targetId' in modern
+    assert 'window.Project.selectById(targetId)' in modern
     assert "workspace.navigateRoute('project-overview', {" in modern
-    assert 'projectId: target.id' in modern
+    assert 'projectId: targetId' in modern
     assert modern.index('workspace.requestProjectSwitch(') < modern.index(
         "workspace.navigateRoute('project-overview'"
     )
@@ -168,9 +169,10 @@ def test_jobs_project_jump_selects_atomically_before_committing_project_deep_lin
 
     grouping = _block(source, 'function groupHeadHtml(', 'function renderTable()')
     assert 'data-project-id=' in grouping
+    assert 'data-proj-path=' not in grouping
     report = _block(source, 'async function doReport()', 'function renderStats()')
     assert "projectId = String(row.project_id || '').trim()" in report
-    assert 'gotoProject(projName, projPath, projectId)' in report
+    assert 'gotoProject(projectId)' in report
 
 
 def test_jobs_exposes_deterministic_cross_project_selection_rollback():
@@ -180,4 +182,8 @@ def test_jobs_exposes_deterministic_cross_project_selection_rollback():
     assert clear.index('State.selected.clear()') < clear.index('renderTable()')
     assert clear.index('renderTable()') < clear.index('publishJobContextCleared()')
     assert 'return hadSelection' in clear
-    assert 'window.Jobs = { reload, selectCreatedProject, selectById, clearSelection }' in source
+    assert (
+        'const publicJobs = { reload, selectCreatedProject, selectById, clearSelection }'
+        in source
+    )
+    assert 'window.Jobs = publicJobs' in source

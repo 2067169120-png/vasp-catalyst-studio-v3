@@ -1,7 +1,7 @@
 """campaign.gates 测试:三门 deny-by-default、机时/单点/指纹拦截、waive 需 decision_id。"""
 import pytest
 
-from vcstudio.campaign import gates
+from vcstudio.campaign import gates, ledger, schema
 
 
 # ── submit_gate ───────────────────────────────────────────────────────────────
@@ -108,11 +108,8 @@ def test_waive_requires_decision_id():
 def test_waive_with_decision_id_flips_to_waived():
     ctx = {'estimated_core_hours': 800, 'remaining_budget': 500,
            'waiver': {'decision_id': 'dec-abc123'}}
-    v = gates.submit_gate(ctx)
-    assert v['status'] == 'waived'
-    assert v['waiver']['decision_id'] == 'dec-abc123'
-    # 被豁免的阻断项仍保留可审计
-    assert v['blocking_issues']
+    with pytest.raises(ValueError, match='named campaign'):
+        gates.submit_gate(ctx)
 
 
 def test_waive_ignored_when_gate_passes():
@@ -121,3 +118,83 @@ def test_waive_ignored_when_gate_passes():
     v = gates.submit_gate(ctx)
     assert v['status'] == 'pass'
     assert 'waiver' not in v
+
+
+def _waiver_fixture(tmp_path):
+    task = schema.new_task('a', 'relax', fingerprint_hash='fp')
+    camp = schema.init_campaign(str(tmp_path), 'demo', tasks=[task], fingerprint_hash='fp')
+    task = camp['tasks'][0]
+    fps = gates.task_input_fingerprints(task, camp['meta'])
+    context = {
+        'campaign_dir': camp['dir'], 'campaign_id': 'demo',
+        'task_id': 'a', 'task_revision': 0, 'input_fingerprints': fps,
+        'estimated_core_hours': 800, 'remaining_budget': 500,
+    }
+    return camp, task, fps, context
+
+
+def test_real_task_bound_waiver_is_authoritative_and_keeps_blockers(tmp_path):
+    camp, _task, fps, context = _waiver_fixture(tmp_path)
+    decision_id = ledger.record_waiver_decision(
+        camp['dir'], campaign_id='demo', task_id='a', gate='submit_gate',
+        task_revision=0, input_fingerprints=fps,
+        detail='导师批准本任务超预算一次', actor='reviewer-A')
+    decision = gates.submit_gate({**context, 'waiver': {'decision_id': decision_id}})
+    assert isinstance(decision, gates.GateDecision)
+    assert decision.status == 'waived' and decision.authoritative is True
+    assert (decision.campaign_id, decision.task_id, decision.task_revision) == ('demo', 'a', 0)
+    assert decision.input_fingerprints == fps
+    assert decision.checks_digest == gates.checks_digest(decision.checks)
+    assert decision.ledger_decision_digest and decision.actor == 'reviewer-A'
+    assert decision.decided_at
+    assert decision.waiver['decision_id'] == decision_id
+    assert decision.waiver['decision_digest']
+    assert decision.blocking_issues
+
+
+@pytest.mark.parametrize('mismatch', ['kind', 'task', 'gate', 'fingerprint', 'revision'])
+def test_waiver_scope_mismatch_fails_closed(tmp_path, mismatch):
+    camp, _task, fps, context = _waiver_fixture(tmp_path)
+    if mismatch == 'kind':
+        decision_id = ledger.record_decision(
+            camp['dir'], 'budget-waiver', '旧式自由决策', 'user', context={'task': 'a'})
+    else:
+        bound = {
+            'campaign_id': 'demo', 'task_id': 'a', 'gate': 'submit_gate',
+            'task_revision': 0, 'input_fingerprints': fps,
+        }
+        if mismatch == 'task':
+            bound['task_id'] = 'other'
+        elif mismatch == 'gate':
+            bound['gate'] = 'accept_gate'
+        elif mismatch == 'fingerprint':
+            bound['input_fingerprints'] = {**fps, 'task_method_fingerprint': 'other'}
+        elif mismatch == 'revision':
+            bound['task_revision'] = 1
+        decision_id = ledger.record_waiver_decision(
+            camp['dir'], **bound, detail='不匹配的授权', actor='reviewer-A')
+    with pytest.raises(ValueError, match='waiver'):
+        gates.submit_gate({**context, 'waiver': {'decision_id': decision_id}})
+
+
+def test_waiver_from_other_named_campaign_is_not_authority(tmp_path):
+    _camp, _task, _fps, context = _waiver_fixture(tmp_path / 'one')
+    other, _otask, other_fps, _other_context = _waiver_fixture(tmp_path / 'two')
+    decision_id = ledger.record_waiver_decision(
+        other['dir'], campaign_id='demo', task_id='a', gate='submit_gate',
+        task_revision=0, input_fingerprints=other_fps,
+        detail='另一个 named campaign 的决策', actor='reviewer-A')
+    with pytest.raises(ValueError, match='不存在'):
+        gates.submit_gate({**context, 'waiver': {'decision_id': decision_id}})
+
+
+def test_revoked_waiver_fails_closed(tmp_path):
+    camp, _task, fps, context = _waiver_fixture(tmp_path)
+    decision_id = ledger.record_waiver_decision(
+        camp['dir'], campaign_id='demo', task_id='a', gate='submit_gate',
+        task_revision=0, input_fingerprints=fps,
+        detail='临时授权', actor='reviewer-A')
+    ledger.revoke_decision(
+        camp['dir'], decision_id, actor='reviewer-A', reason='输入重新核对后撤销')
+    with pytest.raises(ValueError, match='已撤销'):
+        gates.submit_gate({**context, 'waiver': {'decision_id': decision_id}})

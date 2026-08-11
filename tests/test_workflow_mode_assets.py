@@ -60,6 +60,37 @@ def test_settings_put_work_mode_and_exact_calculation_first():
     assert "VCS.call('calculation_set'" in js
 
 
+def test_settings_context_changes_are_latest_intent_wins_and_restore_authority():
+    js = _read('settings.js')
+    assert 'let workspaceIntentGeneration = 0;' in js
+    assert 'function beginWorkspaceIntent()' in js
+    assert 'function currentWorkspaceIntent(generation)' in js
+    for name in ('onScenarioChange', 'onEngineChange', 'onCalculationChange'):
+        block = js.split(f'async function {name}()', 1)[1].split('\n  }', 1)[0]
+        assert 'const generation = beginWorkspaceIntent();' in block
+        assert 'currentWorkspaceIntent(generation)' in block
+        assert 'finally {' in block and 'endWorkspaceIntent(generation)' in block
+    assert 'await loadWorkspace(generation);' in js
+    assert 'await loadEngines(State.scenarioKey, generation);' in js
+    assert 'await loadCalculations(State.scenarioKey, State.engineKey, generation);' in js
+
+
+def test_settings_explicit_save_cards_have_real_discard_lifecycle():
+    js = _read('settings.js')
+    html = _read('index.html')
+    for scope in ('settings-llm', 'settings-llm-key', 'settings-prompt',
+                  'settings-paths', 'settings-autopilot', 'settings-figures'):
+        assert f"'{scope}':" in js
+    assert 'function wireDraftTracking()' in js
+    assert 'VCS.unsaved.mark(scope, draftLabel(scope)' in js
+    assert 'function draftLabel(scope)' in js
+    assert 'id="set-workflow-card"' in html
+    assert 'discard: () => restoreDraftScope(scope)' in js
+    assert "captureDraftScope('settings-prompt')" in js
+    assert "captureDraftScope('settings-paths')" in js
+    assert "captureDraftScope('settings-autopilot')" in js
+
+
 def test_engine_selection_hides_other_engines_and_uses_native_units():
     html = _read('index.html')
     app = _read('app.js')
@@ -255,9 +286,7 @@ def test_jobs_ui_blocks_cross_server_and_repeat_submission_before_password_promp
     assert "r.cluster !== name" in js
     assert "r.cluster || r.state !== 'CREATED'" in js
     assert "runtime.jobs.cancel.action_name" in js
-    assert re.search(
-        r"actionDirs\(name, tr\('runtime\.jobs\.cancel\.action_name'.*?'bound'\)",
-        js,
-        re.S,
-    )
+    cancel = js[js.index('async function batchCancel()'):js.index('// ── 快速批量提交')]
+    assert "const actionLabel = tr('runtime.jobs.cancel.action_name'" in cancel
+    assert "actionDirs(name, actionLabel, 'bound')" in cancel
     assert '切换服务器后已取消' in js

@@ -173,6 +173,32 @@ _FORMAT_LABELS = {
     "pdf": ("PDF", "PDF"),
 }
 
+# A final badge cannot be attached to a shell containing only methodology,
+# caveats, or next-step prose.  The policy is keyed by the server-owned preset
+# even though the current v1 presets share most result-bearing sections; this
+# keeps later preset versions from silently inheriting a weaker generic rule.
+_FINAL_OUTLINE_POLICY = {
+    "quick-decision-brief": frozenset({
+        "executive_summary", "key_findings",
+    }),
+    "scientific-review": frozenset({
+        "executive_summary", "key_findings", "candidate_evaluations",
+        "adsorption_table", "comparison_table",
+    }),
+    "manuscript-materials": frozenset({
+        "executive_summary", "key_findings", "candidate_evaluations",
+        "adsorption_table", "comparison_table",
+    }),
+    "supporting-information": frozenset({
+        "executive_summary", "candidate_evaluations", "adsorption_table",
+        "comparison_table",
+    }),
+    "diagnostic-repair": frozenset({
+        "executive_summary", "key_findings", "candidate_evaluations",
+        "adsorption_table", "comparison_table",
+    }),
+}
+
 
 class ReportRequestError(ValueError):
     """An untrusted report-workbench request violates its public contract."""
@@ -444,6 +470,7 @@ def normalize_report_request(
     formats = _normalize_formats(
         data.get("formats", preset["formats"]), capabilities=capabilities)
     outline = _normalize_outline(data.get("outline", preset["outline"]))
+    enforce_report_outline_policy(preset["id"], requested_kind, outline)
     theme_id = _enum_value(
         data.get("theme_id", preset["theme_id"]),
         field="theme_id",
@@ -566,6 +593,32 @@ def _normalize_outline(value: Any) -> tuple[str, ...]:
             raise ReportRequestError("outline must not contain duplicates")
         result.append(section)
     return tuple(result)
+
+
+def enforce_report_outline_policy(
+    preset_id: str,
+    report_kind: str,
+    outline: Sequence[str],
+) -> tuple[str, ...]:
+    """Enforce the server-owned minimum content required for a final report."""
+
+    identifier = str(preset_id or "").strip()
+    kind = str(report_kind or "").strip().lower()
+    normalized = tuple(str(item) for item in outline)
+    if kind != "final":
+        return normalized
+    required_any = _FINAL_OUTLINE_POLICY.get(identifier)
+    if required_any is None:
+        raise ReportRequestError(
+            f"final outline policy is unavailable for preset {identifier!r}"
+        )
+    if required_any.isdisjoint(normalized):
+        allowed = ", ".join(sorted(required_any))
+        raise ReportRequestError(
+            "final report outline must include at least one scientific result "
+            f"section for preset {identifier!r}: {allowed}"
+        )
+    return normalized
 
 
 def _safe_capability_reason(value: Any, fallback: str = "") -> str:
@@ -805,6 +858,7 @@ __all__ = [
     "SUPPORTED_THEMES",
     "ReportRequestError",
     "builtin_report_presets",
+    "enforce_report_outline_policy",
     "get_report_preset",
     "normalize_report_request",
     "report_workbench_catalog",

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -131,13 +132,43 @@ def manifest_path(job_dir: str | os.PathLike) -> Path:
 
 
 def save_manifest(job_dir: str | os.PathLike, manifest: dict) -> Path:
-    """原子写 job.yaml(tmp + os.replace),UTF-8。返回写入路径。"""
+    """Durably and atomically write ``job.yaml`` with a unique sibling temp.
+
+    A fixed ``job.yaml.tmp`` name lets two application processes truncate or
+    replace each other's staging file.  Per-job operation locks are the primary
+    serialization boundary, but a unique temp also keeps this low-level writer
+    safe for callers that are not remote-operation aware.  The file is flushed
+    before ``os.replace``; the best-effort directory flush makes the rename
+    durable on filesystems that expose directory descriptors.
+    """
     target = manifest_path(job_dir)
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix('.yaml.tmp')
-    with open(tmp, 'w', encoding='utf-8') as f:
-        yaml.safe_dump(manifest, f, allow_unicode=True, sort_keys=False)
-    os.replace(tmp, target)
+    descriptor, tmp_name = tempfile.mkstemp(
+        prefix=f'.{target.name}.', suffix='.tmp', dir=str(target.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8', newline='\n') as f:
+            yaml.safe_dump(manifest, f, allow_unicode=True, sort_keys=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, target)
+        try:
+            flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
+            parent_fd = os.open(str(target.parent), flags)
+        except OSError:
+            pass
+        else:
+            try:
+                os.fsync(parent_fd)
+            except OSError:
+                pass
+            finally:
+                os.close(parent_fd)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
     return target
 
 

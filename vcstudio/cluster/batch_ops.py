@@ -38,7 +38,7 @@ def _job_errors():
     return (ValueError, RuntimeError, OSError, SSHException)
 
 
-def submit_batch(prof, pw, dirs, trust_new):
+def submit_batch(prof, pw, dirs, trust_new, *, idempotency_key=None):
     dirs = list(dirs)
     # 整批联网前解析远程目标。不同本地目录（或同一路径被重复选中）若映射到同一个
     # remote_dir，后上传者会覆盖先上传者并产生两个同目录作业，必须整批 fail closed。
@@ -64,18 +64,53 @@ def submit_batch(prof, pw, dirs, trust_new):
             return _trust_payload(e, results=[])
         raise RuntimeError(str(e))
     results = []
+    busy_count = 0
+    recovery_count = 0
+    recovery_job_ids = []
     try:
         sftp = client.open_sftp()
         for d in dirs:
             try:
-                m = submitter.submit_job(client, sftp, prof, d)
-                results.append((d, True, f"已提交,作业号 {m['scheduler_job_id']}"))
+                if idempotency_key:
+                    m = submitter.submit_job(
+                        client, sftp, prof, d, idempotency_key=idempotency_key)
+                else:
+                    # Preserve the historical injectable four-argument seam;
+                    # production web calls always provide their operation id.
+                    m = submitter.submit_job(client, sftp, prof, d)
+                verb = '已确认提交' if m.get('_submission_replayed') else '已提交'
+                results.append((d, True, f"{verb},作业号 {m['scheduler_job_id']}"))
+            except submitter.JobOperationBusy as e:
+                busy_count += 1
+                results.append((d, False, str(e)))
+            except submitter.UnknownRemoteSubmission as e:
+                recovery_count += 1
+                if e.scheduler_job_id:
+                    recovery_job_ids.append(e.scheduler_job_id)
+                results.append((d, False, str(e)))
             except _job_errors() as e:
                 results.append((d, False, str(e)))
         sftp.close()
     finally:
         close_quiet(client, jump)
-    return {'needs_trust': False, 'results': results}
+    payload = {'needs_trust': False, 'results': results}
+    if busy_count:
+        payload.update({
+            'ok': False,
+            'busy': True,
+            'code': 'job_busy',
+            'busy_count': busy_count,
+        })
+    if recovery_count:
+        payload.update({
+            'ok': False,
+            'code': 'unknown_remote_submission',
+            'requires_manual_recovery': True,
+            'recovery_count': recovery_count,
+        })
+        if recovery_job_ids:
+            payload['scheduler_job_ids'] = recovery_job_ids
+    return payload
 
 
 def fetch_batch(prof, pw, dirs, trust_new, files=None):

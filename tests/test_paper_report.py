@@ -1050,6 +1050,36 @@ def test_bound_outline_controls_section_order_and_exclusion(tmp_path):
     assert "Adsorption-Energy Results" not in html
 
 
+def test_bound_final_methods_only_outline_is_rejected_by_renderer(tmp_path):
+    model = _validated_model(
+        tmp_path,
+        formats=("html",),
+        outline=("methods",),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="final report outline.*scientific result section",
+    ):
+        paper_report.render_report_bundle(
+            model,
+            tmp_path / "methods-only-final",
+            formats=("html",),
+        )
+
+
+def test_bound_preview_redacts_local_paths_from_visible_metadata(tmp_path):
+    model = _validated_model(tmp_path, formats=("html",))
+    secret = r"C:\Users\alice\secret\project.yaml"
+    model["metadata"]["Source"] = secret
+    _rebind_report_content(model)
+
+    preview = paper_report.render_report_html_preview(model)
+
+    assert secret not in preview["html"]
+    assert "local path redacted" in preview["html"]
+
+
 def test_bound_outline_rejects_unknown_renderer_section(tmp_path):
     model = _validated_model(
         tmp_path,

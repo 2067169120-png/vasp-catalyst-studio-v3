@@ -8,6 +8,9 @@
 
   const SCHEMA = 'vcstudio.workspace-context/v1';
   const STORAGE_KEY = 'vcs.workspace.context.v1';
+  const LEGACY_PROJECT_STORAGE_KEYS = [
+    'vcs.adsorption.current_project', 'vcs.adsorption.compare_projects',
+  ];
   const DRAFT_PREFIX = 'vcs.workspace.draft.v1.';
   const MAX_DRAFT_CHARS = 65536;
   const PROJECT_TOKEN = /^[A-Za-z0-9._~-]{1,160}$/;
@@ -273,6 +276,7 @@
 
   function loadLocalState() {
     try {
+      LEGACY_PROJECT_STORAGE_KEYS.forEach(key => localStorage.removeItem(key));
       return normalizeState(JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'));
     } catch (_) {
       return blankState();
@@ -314,6 +318,37 @@
   let lastContextRefreshAt = 0;
   let initialHashWasExplicit = !!safeRoute(window.location.hash);
   const dirtyScopes = new Map();
+  const operationRecords = new Map();
+
+  function publishOperation(record = {}) {
+    const id = safeToken(record.id, JOB_TOKEN);
+    if (!id) return false;
+    const previous = operationRecords.get(id) || {};
+    const status = String(record.status || previous.status || 'pending').slice(0, 40);
+    const normalized = {
+      id,
+      kind: String(record.kind || previous.kind || 'operation').slice(0, 60),
+      label: String(record.label || previous.label || 'Operation').slice(0, 160),
+      status,
+      count: Math.max(0, Number(record.count != null ? record.count : previous.count || 0) || 0),
+      error: String(record.error || '').slice(0, 500),
+      route: safeToken(record.route || previous.route, ROUTE_TOKEN),
+      started_at: String(record.started_at || previous.started_at || new Date().toISOString()),
+      updated_at: String(record.updated_at || new Date().toISOString()),
+    };
+    operationRecords.set(id, normalized);
+    if (operationRecords.size > 50) {
+      const oldest = operationRecords.keys().next().value;
+      operationRecords.delete(oldest);
+    }
+    renderActivity();
+    return true;
+  }
+
+  VCS.operations = {
+    publish: publishOperation,
+    snapshot() { return Array.from(operationRecords.values()).map(item => Object.assign({}, item)); },
+  };
 
   function projectToken(context) {
     const raw = context && (context.projectId || context.project_id) || state.project_id;
@@ -498,7 +533,8 @@
 
   async function guardUnsaved(reason) {
     if (!dirtyScopes.size) return true;
-    const details = Array.from(dirtyScopes.values()).map(item => item.label).filter(Boolean);
+    const pending = Array.from(dirtyScopes.entries());
+    const details = pending.map(([, item]) => item.label).filter(Boolean);
     const detailText = details.length ? tr('workspace.unsaved.details',
       '\n\n未保存：{items}', { items: details.join('、') }) : '';
     const message = tr('workspace.unsaved.confirm',
@@ -507,12 +543,24 @@
         details: detailText,
       });
     const ok = await VCS.confirm(message);
-    if (ok) {
-      dirtyScopes.clear();
-      renderDirty();
-      resolveRemoteDirtyHold();
+    if (!ok) return false;
+    try {
+      for (const [, item] of pending) {
+        if (typeof item.canDiscard === 'function' && await item.canDiscard() === false) return false;
+      }
+      for (const [, item] of pending) {
+        if (typeof item.discard === 'function' && await item.discard() === false) return false;
+      }
+    } catch (error) {
+      VCS.log(`discard failed: ${error && error.message || error}`, 'failc');
+      VCS.toast(tr('workspace.unsaved.discard_failed',
+        '未能丢弃当前修改，请处理后重试。'));
+      return false;
     }
-    return ok;
+    dirtyScopes.clear();
+    renderDirty();
+    resolveRemoteDirtyHold();
+    return true;
   }
 
   function findPrimaryRoute(area) {
@@ -679,19 +727,23 @@
     const hit = projects.find(item => item.id === id) || null;
     if (!hit) return false;
     const previousProjectId = state.project_id;
-    if (syncPage && hit.path && window.Project && typeof window.Project.selectByPath === 'function') {
-      const applied = await window.Project.selectByPath(hit.path);
+    if (syncPage && window.Project && typeof window.Project.selectById === 'function') {
+      const applied = await window.Project.selectById(hit.id);
       if (applied === false) return false;
     }
     selectedProject = hit;
     state.project_id = hit.id;
     if (previousProjectId !== hit.id) state.selected_job_id = '';
     renderContext();
-    try { localStorage.setItem('vcs.adsorption.current_project', hit.path || ''); } catch (_) { /* 兼容旧页 */ }
     const select = document.getElementById('workspace-project');
     if (select && select.value !== hit.id) select.value = hit.id;
     document.dispatchEvent(new CustomEvent('vcs:workspace-project', {
-      detail: Object.assign({}, hit),
+      detail: {
+        project_id: hit.id,
+        name: hit.name,
+        counts: { members: hit.n_members, done: hit.n_done,
+          pending: Math.max(0, hit.n_members - hit.n_done) },
+      },
     }));
     return true;
   }
@@ -747,11 +799,18 @@
       }
       closeNav();
       const restoreY = options.restoreScroll ? Number(state.scroll[route.hash] || 0) : 0;
-      requestAnimationFrame(() => {
+      const hasExplicitFocus = !!(options.focusJobDir || options.focusSelector || route.def.focus);
+      // 等页面显示与滚动提交到下一帧后再做显式聚焦；否则随后运行的标题聚焦会
+      // 抢走深链目标（例如 Templates 卡片或指定 Job 行）的键盘焦点。
+      await new Promise(resolve => requestAnimationFrame(() => {
         window.scrollTo({ top: restoreY, left: 0, behavior: 'auto' });
-        focusPageHeading(route, options.source || 'route');
+        if (!hasExplicitFocus) focusPageHeading(route, options.source || 'route');
         renderCompactActions();
-      });
+        resolve();
+      }));
+      if (generation !== routeGeneration) {
+        return { ok: false, focused: false, superseded: true };
+      }
       const focused = await VCS.focusNavigationTarget({
         focusJobDir: options.focusJobDir,
         focusSelector: options.focusSelector || route.def.focus,
@@ -848,9 +907,17 @@
   }
 
   VCS.unsaved = {
-    mark(scope, label = '当前编辑') {
+    mark(scope, label = '当前编辑', lifecycle = null) {
       const key = safeToken(scope) || 'workspace';
-      dirtyScopes.set(key, { label: String(label || '当前编辑').slice(0, 120), at: Date.now() });
+      const previous = dirtyScopes.get(key) || {};
+      const hooks = lifecycle && typeof lifecycle === 'object' ? lifecycle : {};
+      dirtyScopes.set(key, {
+        label: String(label || previous.label || '当前编辑').slice(0, 120),
+        at: Date.now(),
+        canDiscard: typeof hooks.canDiscard === 'function' ? hooks.canDiscard : previous.canDiscard,
+        discard: typeof hooks.discard === 'function' ? hooks.discard : previous.discard,
+        save: typeof hooks.save === 'function' ? hooks.save : previous.save,
+      });
       renderDirty();
       document.dispatchEvent(new CustomEvent('vcs:unsaved', {
         detail: { dirty: true, count: dirtyScopes.size },
@@ -866,8 +933,38 @@
     },
     isDirty() { return dirtyScopes.size > 0; },
     scopes() { return Array.from(dirtyScopes.keys()); },
+    lifecycle(scope, lifecycle = {}) {
+      const key = safeToken(scope) || 'workspace';
+      const previous = dirtyScopes.get(key);
+      if (!previous) return false;
+      this.mark(key, previous.label, lifecycle);
+      return true;
+    },
     confirm: guardUnsaved,
   };
+
+  function renderAssistantContext() {
+    const set = (id, value) => {
+      const element = document.getElementById(id);
+      if (element) element.textContent = String(value == null || value === '' ? '—' : value);
+    };
+    set('assistant-context-project', selectedProject
+      ? selectedProject.name || selectedProject.id
+      : tr('ai.context.no_project', '未选择项目'));
+    set('assistant-context-task', VCS.activeCalculation ||
+      tr('ai.context.no_task', '未选择任务'));
+    set('assistant-context-stage', selectedProject && selectedProject.stage || '—');
+    const reportState = selectedProject && (
+      selectedProject.scientific_status || selectedProject.artifact_status ||
+      selectedProject.report_status);
+    set('assistant-context-report', reportState ||
+      tr('ai.context.report_unchecked', '尚未检查'));
+    document.querySelectorAll('[data-assistant-route][data-project-required]').forEach(button => {
+      button.disabled = !selectedProject;
+      button.title = selectedProject ? '' : tr(
+        'ai.context.project_required', '请先选择项目');
+    });
+  }
 
   function renderContext() {
     const projectSelect = document.getElementById('workspace-project');
@@ -906,42 +1003,51 @@
           : tr('workspace.context.no_project', '未选择项目'));
       stage.classList.toggle('warn', !!(selectedProject && selectedProject.needs_human));
     }
+    renderAssistantContext();
     renderActivity();
     renderDirty();
   }
 
   function normalizeProjectRows(rows, pipelineRows) {
-    const pipelineByPath = new Map((pipelineRows || []).map(row => [String(row.path || ''), row]));
-    return (rows || []).map((row, index) => {
-      const path = String(row.path || '');
-      const progress = pipelineByPath.get(path) || {};
-      let id = safeToken(row.id || row.project_id || row.project_uuid, PROJECT_TOKEN);
-      if (!id) id = `legacy-${index + 1}`;
+    const pipelineById = new Map((pipelineRows || []).map(row => [
+      safeToken(row.project_id, PROJECT_TOKEN), row,
+    ]).filter(entry => entry[0]));
+    return (rows || []).map(row => {
+      const id = safeToken(row.project_id, PROJECT_TOKEN);
+      if (!id) return null;
+      const progress = pipelineById.get(id) || {};
+      const counts = plainObject(row.counts);
+      const progressCounts = plainObject(progress.counts);
       return {
         id,
+        project_id: id,
         name: String(row.name || ''),
-        path,
-        n_members: Number(progress.total != null ? progress.total : row.n_members || 0),
-        n_done: Number(progress.done != null ? progress.done : row.n_done || 0),
+        n_members: Number(progressCounts.members != null ? progressCounts.members
+          : progress.total != null ? progress.total
+            : counts.members != null ? counts.members : row.n_members || 0),
+        n_done: Number(progressCounts.done != null ? progressCounts.done
+          : progress.done != null ? progress.done
+            : counts.done != null ? counts.done : row.n_done || 0),
         stage: String(progress.stage || row.stage || ''),
         needs_human: !!(progress.needs_human || row.needs_human),
+        artifact_status: String(progress.artifact_status || row.artifact_status || ''),
+        scientific_status: String(progress.scientific_status || row.scientific_status || ''),
+        scientific_qualification: String(
+          progress.scientific_qualification || row.scientific_qualification || ''),
+        report_status: String(progress.report_status || row.report_status || ''),
       };
-    });
+    }).filter(Boolean);
   }
 
   async function syncLegacyProjectSelection() {
     if (!selectedProject || !window.Project) return true;
     const current = typeof window.Project.current === 'function'
       ? window.Project.current() : null;
-    const currentId = safeToken(current &&
-      (current.project_id || current.id || current.project_uuid), PROJECT_TOKEN);
+    const currentId = safeToken(current && current.project_id, PROJECT_TOKEN);
     if (currentId === selectedProject.id) return true;
     try {
       if (typeof window.Project.selectById === 'function') {
         return !!(await window.Project.selectById(selectedProject.id));
-      }
-      if (selectedProject.path && typeof window.Project.selectByPath === 'function') {
-        return !!(await window.Project.selectByPath(selectedProject.path));
       }
     } catch (_) { return false; }
     return false;
@@ -1083,11 +1189,24 @@
   function renderActivity() {
     const list = document.getElementById('activity-list');
     const toggle = document.getElementById('activity-toggle');
-    const events = VCS.pipeline && Array.isArray(VCS.pipeline.events) ? VCS.pipeline.events : [];
+    const pipelineEvents = VCS.pipeline && Array.isArray(VCS.pipeline.events) ? VCS.pipeline.events : [];
+    const operationEvents = Array.from(operationRecords.values()).reverse().map(operation => ({
+      kind: 'operation', source: 'operation', operation,
+      project: operation.label,
+      text: tr('workspace.operation.summary', '{count} 项 · {status}{error}', {
+        count: operation.count,
+        status: operation.status,
+        error: operation.error ? ` · ${operation.error}` : '',
+      }),
+      time: operation.updated_at,
+    }));
+    const events = operationEvents.concat(pipelineEvents);
     const runtime = VCS.pipeline && VCS.pipeline.runtime || {};
     const blockers = projects.filter(project => project.needs_human).length;
     const errors = events.filter(event => event.kind === 'error').length;
-    const count = blockers + errors + (runtime.tick_running ? 1 : 0);
+    const activeOperations = operationEvents.filter(event =>
+      ['pending', 'confirming', 'running'].includes(event.operation.status)).length;
+    const count = blockers + errors + activeOperations + (runtime.tick_running ? 1 : 0);
     if (toggle) {
       const badge = toggle.querySelector('[data-activity-count]');
       if (badge) { badge.textContent = String(count); badge.hidden = !count; }
@@ -1109,10 +1228,14 @@
       report_blocked: ['workspace.activity.report_blocked', '报告阻断'],
       skip: ['workspace.activity.skip', '跳过'], error: ['workspace.activity.error', '错误'] };
     list.innerHTML = events.slice(0, 40).map(event => {
-      const severity = event.kind === 'error' ? 'error'
-        : event.kind === 'report_done' ? 'success' : 'info';
+      const severity = event.kind === 'error' || event.operation && event.operation.status === 'failed'
+        ? 'error' : event.kind === 'report_done' || event.operation && event.operation.status === 'succeeded'
+          ? 'success' : 'info';
       const label = labels[event.kind];
-      return `<div class="activity-item ${severity}"><span class="activity-kind">${VCS.esc(label ? tr(label[0], label[1]) : event.kind || tr('workspace.activity.item', '活动'))}</span>` +
+      const route = event.operation && event.operation.route;
+      return `<div class="activity-item ${severity}"${route ? ` data-operation-route="${VCS.esc(route)}" role="link" tabindex="0"` : ''}><span class="activity-kind">${VCS.esc(event.operation
+        ? tr('workspace.activity.operation', '操作')
+        : label ? tr(label[0], label[1]) : event.kind || tr('workspace.activity.item', '活动'))}</span>` +
         `<div><b>${VCS.esc(event.project || event.cluster || tr('workspace.context.workspace', '工作区'))}</b>` +
         `<p>${VCS.esc(event.text || '')}</p></div><time>${VCS.esc(event.time || '')}</time></div>`;
     }).join('');
@@ -1301,6 +1424,7 @@
     const button = document.getElementById('assistant-toggle');
     if (button) button.setAttribute('aria-expanded', 'true');
     document.body.classList.add('assistant-open');
+    renderAssistantContext();
     document.dispatchEvent(new CustomEvent('vcs:page', {
       detail: { page: 'ai', overlay: true, source: 'assistant-drawer' },
     }));
@@ -1339,9 +1463,14 @@
     const section = document.querySelector(
       'main section[data-page]:not([data-shell-assistant]):not([hidden])');
     if (!section) return;
-    const actions = Array.from(section.querySelectorAll(
+    // 首页四种起点同等重要，不用“前三个 primary”在窄屏暗中替用户排序。
+    // 其它页面优先采用显式 data-compact-primary；没有声明时只镜像一个主动作。
+    if (section.dataset.page === 'dashboard') { bar.hidden = true; return; }
+    const declared = Array.from(section.querySelectorAll('[data-compact-primary]:not([disabled])'));
+    const candidates = declared.length ? declared : Array.from(section.querySelectorAll(
       '.actions .btn.primary:not([disabled]), .pagebar .btn.primary:not([disabled]), ' +
-      '.start-actions .start-action.primary:not([disabled])'))
+      '.start-actions .start-action.primary:not([disabled])'));
+    const actions = candidates
       .filter(button => {
         if (button.closest('#compact-actions')) return false;
         if (button.closest('[hidden],[aria-hidden="true"],[data-scene-hidden],'
@@ -1349,7 +1478,7 @@
         const style = typeof window.getComputedStyle === 'function'
           ? window.getComputedStyle(button) : null;
         return !style || (style.display !== 'none' && style.visibility !== 'hidden');
-      }).slice(0, 3);
+      }).slice(0, 1);
     actions.forEach(original => {
       const button = document.createElement('button');
       button.type = 'button'; button.className = 'btn primary';
@@ -1385,7 +1514,7 @@
       state.sort = {};
       persistLocal(); renderContext(); updateRouteLinks();
       document.dispatchEvent(new CustomEvent('vcs:workspace-project', {
-        detail: { id: '', project_id: '', cleared: true },
+        detail: { project_id: '', cleared: true },
       }));
       if (currentRoute && isProjectRoute(currentRoute)) {
         await navigateRoute('home', { replace: true, force: true, source: 'project-clear' });
@@ -1403,7 +1532,12 @@
     state.filters = {}; state.sort = {};
     persistLocal(); renderContext(); updateRouteLinks();
     document.dispatchEvent(new CustomEvent('vcs:workspace-project', {
-      detail: Object.assign({}, hit),
+      detail: {
+        project_id: hit.id,
+        name: hit.name,
+        counts: { members: hit.n_members, done: hit.n_done,
+          pending: Math.max(0, hit.n_members - hit.n_done) },
+      },
     }));
     if (currentRoute && isProjectRoute(currentRoute)) {
       await navigateRoute(currentRoute.id, { replace: true, force: true, projectId: id,
@@ -1566,8 +1700,29 @@
       if (activity) { event.preventDefault(); openActivity(activity); return; }
       if (event.target.closest && event.target.closest('#activity-close')) { closeActivity(); return; }
       if (event.target.closest && event.target.closest('#activity-backdrop')) { closeActivity(); return; }
+      const operationRoute = event.target.closest && event.target.closest('[data-operation-route]');
+      if (operationRoute) {
+        event.preventDefault(); closeActivity();
+        await navigateRoute(operationRoute.dataset.operationRoute, { source: 'operation-queue' });
+        return;
+      }
       const assistant = event.target.closest && event.target.closest('#assistant-toggle');
       if (assistant) { event.preventDefault(); openAssistant(assistant); return; }
+      const assistantAction = event.target.closest && event.target.closest('[data-assistant-route]');
+      if (assistantAction) {
+        event.preventDefault();
+        if (assistantAction.hasAttribute('data-project-required') && !selectedProject) {
+          VCS.toast(tr('ai.context.project_required', '请先选择项目'), 'fail');
+          return;
+        }
+        const routeId = safeToken(assistantAction.dataset.assistantRoute, ROUTE_TOKEN);
+        closeAssistant();
+        await navigateRoute(routeId, {
+          projectId: selectedProject && selectedProject.id || undefined,
+          source: 'assistant-context',
+        });
+        return;
+      }
       if (event.target.closest && event.target.closest('#assistant-backdrop')) closeAssistant();
     });
 
@@ -1576,9 +1731,10 @@
       const previous = state.project_id;
       const wanted = project.value;
       const ok = await requestProjectSwitch(wanted, async hit => {
-        if (hit && hit.path && window.Project && typeof window.Project.selectByPath === 'function') {
-          await window.Project.selectByPath(hit.path);
+        if (hit && window.Project && typeof window.Project.selectById === 'function') {
+          return window.Project.selectById(hit.id);
         }
+        return true;
       });
       if (!ok) project.value = previous;
     });
@@ -1588,8 +1744,13 @@
       if (nav.classList.contains('open')) trapDrawerFocus(event, nav, closeNav);
     });
     const activityDrawer = document.getElementById('activity-drawer');
-    if (activityDrawer) activityDrawer.addEventListener('keydown', event =>
-      trapDrawerFocus(event, activityDrawer, closeActivity));
+    if (activityDrawer) activityDrawer.addEventListener('keydown', event => {
+      const route = event.target.closest && event.target.closest('[data-operation-route]');
+      if (route && (event.key === 'Enter' || event.key === ' ')) {
+        event.preventDefault(); route.click(); return;
+      }
+      trapDrawerFocus(event, activityDrawer, closeActivity);
+    });
     const assistantDrawer = document.getElementById('page-ai');
     if (assistantDrawer) assistantDrawer.addEventListener('keydown', event =>
       trapDrawerFocus(event, assistantDrawer, closeAssistant));
@@ -1661,12 +1822,15 @@
     });
     document.addEventListener('vcs:project-context', event => {
       const detail = plainObject(event.detail);
-      const id = safeToken(detail.id || detail.project_id || detail.project_uuid, PROJECT_TOKEN);
+      const id = safeToken(detail.project_id, PROJECT_TOKEN);
       if (!id) return;
       const hit = projects.find(project => project.id === id);
       if (hit) {
         if (state.project_id !== id) state.selected_job_id = '';
-        Object.assign(hit, detail);
+        const counts = plainObject(detail.counts);
+        hit.name = String(detail.name || hit.name || '');
+        hit.n_members = Number(counts.members != null ? counts.members : hit.n_members || 0);
+        hit.n_done = Number(counts.done != null ? counts.done : hit.n_done || 0);
         selectedProject = hit; state.project_id = id; persistLocal(); renderContext(); updateRouteLinks();
       }
     });
@@ -1688,9 +1852,8 @@
         const pending = { generation, id, project_id: jobProjectId };
         pendingJobProjectSwitch = pending;
         const switched = await requestProjectSwitch(jobProjectId, async hit => {
-          if (!hit || !hit.path || !window.Project ||
-              typeof window.Project.selectByPath !== 'function') return true;
-          return window.Project.selectByPath(hit.path);
+          if (!hit || !window.Project || typeof window.Project.selectById !== 'function') return true;
+          return window.Project.selectById(hit.id);
         });
         if (generation !== jobContextGeneration || pendingJobProjectSwitch !== pending) return;
         if (!switched) {
@@ -1746,6 +1909,30 @@
     navigation: { open: openNav, close: closeNav },
   };
   VCS.workspace = workspace;
+
+  if (window.__VCS_TEST__ === true) {
+    window.__VCS_WORKSPACE_TEST__ = Object.freeze({
+      requestProjectSwitch,
+      guardUnsaved,
+      parseRoute,
+      applyRoute,
+      configure({ projectRows = [], projectId = '', route = null } = {}) {
+        projects = Array.isArray(projectRows)
+          ? projectRows.map(item => Object.assign({}, item)) : [];
+        state.project_id = safeToken(projectId, PROJECT_TOKEN);
+        selectedProject = projects.find(item => item.id === state.project_id) || null;
+        currentRoute = route || null;
+      },
+      snapshot() {
+        return {
+          state: Object.assign({}, state),
+          selected_project: selectedProject && Object.assign({}, selectedProject),
+          current_route: currentRoute,
+          dirty_scopes: Array.from(dirtyScopes.keys()),
+        };
+      },
+    });
+  }
 
   async function init() {
     wireShell();

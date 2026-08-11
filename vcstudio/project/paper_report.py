@@ -63,6 +63,24 @@ _CONTRACT_SCHEMAS = {
 }
 _VALIDATION_STATUSES = {"passed", "passed_with_warnings", "blocked", "unknown"}
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
+_VISIBLE_URL_RE = re.compile(r"(?i)\b(?:https?|s3)://[^\s]+")
+_VISIBLE_LOCAL_PATH_RE = re.compile(
+    r"(?i)(?:"
+    r"(?<![A-Za-z0-9])[A-Z]:[\\/]"
+    r"|(?<![:A-Za-z0-9])(?:\\\\|//)[^\\/\s]+[\\/][^\s]+"
+    r"|(?<![A-Za-z0-9_])~[\\/]"
+    r"|(?<![:A-Za-z0-9_])/(?!/)[^\s]+"
+    r"|(?<![A-Za-z0-9_])file:(?:/{0,3}|\\)"
+    r")"
+)
+_VISIBLE_CREDENTIAL_RE = re.compile(
+    r"(?i)(?:"
+    r"\b(?:github_pat_|gh[opusr]_|sk-)[A-Za-z0-9_-]{12,}"
+    r"|\bBearer\s+\S+"
+    r"|\b(?:password|passwd|secret|token|api[_-]?key)\s*[:=]\s*\S+"
+    r"|-----BEGIN[^\r\n]{0,40}PRIVATE KEY-----"
+    r")"
+)
 _CONTENT_FINGERPRINT_KEYS = (
     "report_kind", "scientific_qualification", "claim_ceiling",
     "template_ref",
@@ -666,6 +684,11 @@ def _normalize_model(model: Mapping[str, Any], *, requested_formats=()) -> dict:
         requested_formats=requested_formats,
         contracts_validated=contracts_validated,
     )
+    from vcstudio.project.report_presets import enforce_report_outline_policy
+
+    enforce_report_outline_policy(
+        context["preset_id"], report_kind, context["outline"]
+    )
     content = _normalize_content_fields(
         model, locale=locale, outline=context["outline"])
 
@@ -1185,9 +1208,15 @@ def _normalize_metadata(value: Any) -> list[dict]:
     if value is None:
         return []
     if isinstance(value, Mapping):
-        return [{"label": _text(key), "value": _display(val)} for key, val in value.items()]
+        return [
+            {
+                "label": _portable_metadata_display(key),
+                "value": _portable_metadata_display(val),
+            }
+            for key, val in value.items()
+        ]
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
-        return [{"label": "Metadata", "value": _display(value)}]
+        return [{"label": "Metadata", "value": _portable_metadata_display(value)}]
 
     rows = []
     for item in value:
@@ -1196,12 +1225,31 @@ def _normalize_metadata(value: Any) -> list[dict]:
             val = item.get("value", item.get("text", item.get("detail", "")))
             if not label and len(item) == 1:
                 label, val = next(iter(item.items()))
-            rows.append({"label": _text(label), "value": _display(val)})
+            rows.append({
+                "label": _portable_metadata_display(label),
+                "value": _portable_metadata_display(val),
+            })
         elif isinstance(item, Sequence) and not isinstance(item, (str, bytes)) and len(item) >= 2:
-            rows.append({"label": _text(item[0]), "value": _display(item[1])})
+            rows.append({
+                "label": _portable_metadata_display(item[0]),
+                "value": _portable_metadata_display(item[1]),
+            })
         else:
-            rows.append({"label": "Metadata", "value": _display(item)})
+            rows.append({
+                "label": "Metadata",
+                "value": _portable_metadata_display(item),
+            })
     return rows
+
+
+def _portable_metadata_display(value: Any) -> str:
+    text = _display(value)
+    inspected = _VISIBLE_URL_RE.sub("", text)
+    if _VISIBLE_CREDENTIAL_RE.search(text):
+        return "<sensitive value redacted>"
+    if _VISIBLE_LOCAL_PATH_RE.search(inspected):
+        return "<local path redacted>"
+    return text
 
 
 def _normalize_blocks(value: Any) -> list[dict]:

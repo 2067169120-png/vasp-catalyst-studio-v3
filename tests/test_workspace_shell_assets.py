@@ -69,6 +69,34 @@ def test_shell_removes_global_step_numbers_and_ai_is_a_context_drawer():
     assert '#page-ai[data-shell-assistant]' in css
 
 
+def test_assistant_drawer_is_context_first_and_separates_advanced_tools():
+    html = _source('index.html')
+    workspace = _source('workspace.js')
+    context = html.index('id="assistant-context-heading"')
+    chat = html.index('id="ai-chat-card"')
+    advanced = html.index('id="assistant-advanced-tools"')
+    assert context < chat < advanced
+    assert 'id="assistant-context-project"' in html
+    assert 'id="assistant-context-task"' in html
+    assert 'id="assistant-context-stage"' in html
+    assert 'id="assistant-context-report"' in html
+    assert html.count('data-assistant-route=') == 3
+    assert '<details class="assistant-advanced"' in html
+    assert 'function renderAssistantContext()' in workspace
+    assert "selectedProject.scientific_status || selectedProject.artifact_status" in workspace
+    assert "source: 'assistant-context'" in workspace
+
+
+def test_compact_action_bar_does_not_bias_dashboard_and_exposes_one_recommendation():
+    workspace = _source('workspace.js')
+    compact = re.search(
+        r'function renderCompactActions\(\) \{(.*?)\n  \}', workspace, re.S,
+    ).group(1)
+    assert "section.dataset.page === 'dashboard'" in compact
+    assert "section.querySelectorAll('[data-compact-primary]:not([disabled])')" in compact
+    assert '}).slice(0, 1);' in compact
+
+
 def test_responsive_navigation_dirty_guard_and_activity_center_are_first_class():
     html = _source('index.html')
     css = _source('app.css')
@@ -90,6 +118,11 @@ def test_responsive_navigation_dirty_guard_and_activity_center_are_first_class()
         r'<aside\b[^>]*id="activity-drawer"[^>]*role="dialog"[^>]*aria-modal="true"',
         html, re.S)
     assert 'id="activity-list" role="feed" aria-live="polite"' in html
+    assert 'const operationRecords = new Map();' in workspace
+    assert 'VCS.operations = {' in workspace
+    assert 'publish: publishOperation' in workspace
+    assert "data-operation-route=" in workspace
+    assert "source: 'operation-queue'" in workspace
 
 
 def test_dashboard_delegates_navigation_without_clicking_a_sidebar_link():
@@ -101,15 +134,36 @@ def test_dashboard_delegates_navigation_without_clicking_a_sidebar_link():
     ).group(1)
 
 
+def test_dashboard_resume_center_uses_workspace_draft_refs_without_exposing_bodies():
+    html = _source('index.html')
+    dashboard = _source('dashboard.js')
+    assert 'id="db-resume-card"' in html and 'id="db-resume" aria-live="polite"' in html
+    assert 'function renderResumeCenter()' in dashboard
+    assert 'state.draft_refs' in dashboard
+    assert "VCS.unsaved.scopes()" in dashboard
+    assert "VCS.workspace.parseRoute(resume.dataset.resumeRoute)" in dashboard
+    assert "source: 'resume-center'" in dashboard
+    resume = dashboard[dashboard.index('function renderResumeCenter()'):
+                       dashboard.index('// 取数出错')]
+    assert '.text' not in resume and 'localStorage' not in resume
+
+
 def test_project_selection_uses_workspace_guard_and_publishes_stable_context():
     project = _source('project.js')
     assert "new CustomEvent('vcs:project-context', { detail })" in project
-    for field in ('project_uuid:', 'project_id:', 'name:', 'path:', 'stage:', 'counts:'):
+    context = project[project.index('function projectContext('):
+                      project.index('function publishProjectContext(')]
+    for field in ('project_id:', 'name:', 'counts:'):
         assert field in project
+    for locator in ('project_uuid:', 'path:', 'project_path:', 'locator:'):
+        assert locator not in context
     assert 'VCS.workspace.requestProjectSwitch(projectId(project), apply)' in project
-    assert "localStorage.setItem(CURRENT_PROJECT_KEY, path)" in project
+    assert 'localStorage.removeItem(LEGACY_CURRENT_PROJECT_KEY)' in project
+    assert 'localStorage.removeItem(LEGACY_COMPARE_PROJECTS_KEY)' in project
+    assert 'localStorage.setItem(LEGACY_CURRENT_PROJECT_KEY' not in project
     assert 'location.hash' not in project and 'history.pushState' not in project
     assert 'selectById,' in project and 'current,' in project and 'list,' in project
+    assert 'selectByPath' not in project
 
 
 def test_jobs_table_is_a_focusable_scroll_region_and_publishes_stable_job_context():
@@ -125,7 +179,8 @@ def test_jobs_table_is_a_focusable_scroll_region_and_publishes_stable_job_contex
     for field in ('id,', 'dir:', 'name:', 'state:', 'project_id:'):
         assert field in jobs
     assert 'async function selectById(id)' in jobs
-    assert 'window.Jobs = { reload, selectCreatedProject, selectById, clearSelection }' in jobs
+    assert 'const publicJobs = { reload, selectCreatedProject, selectById, clearSelection }' in jobs
+    assert 'window.Jobs = publicJobs' in jobs
     assert "return String(row.dir" not in re.search(
         r'function stableJobId\(row\) \{(.*?)\n  \}', jobs, re.S
     ).group(1)
@@ -142,6 +197,19 @@ def test_router_commits_history_only_after_route_preflight_and_application():
         'history.pushState(')
     assert "VCS.canActivatePage(def.page)" in workspace
     assert 'if (!selected) return { ok: false' in workspace
+
+
+def test_explicit_route_focus_runs_after_next_frame_and_is_not_stolen_by_heading():
+    workspace = _source('workspace.js')
+    apply_now = re.search(
+        r'async function applyRouteNow\(route, options = \{\}\) \{(.*?)\n  \}',
+        workspace, re.S,
+    ).group(1)
+    frame = apply_now.index('await new Promise(resolve => requestAnimationFrame(')
+    explicit = apply_now.index('const focused = await VCS.focusNavigationTarget(')
+    assert frame < explicit
+    assert 'if (!hasExplicitFocus) focusPageHeading(' in apply_now
+    assert 'generation !== routeGeneration' in apply_now[frame:explicit]
 
 
 def test_history_events_share_one_dirty_guarded_external_navigation_path():
@@ -281,3 +349,17 @@ def test_project_and_job_context_switches_are_atomic_and_fail_closed():
     assert "typeof window.Jobs.clearSelection === 'function'" in workspace
     assert 'const jobProjectId = safeToken(detail.project_id, PROJECT_TOKEN);' in workspace
     assert 'await requestProjectSwitch(jobProjectId' in workspace
+    selector = workspace.split("const project = document.getElementById('workspace-project');", 1)[1]
+    selector = selector.split("const nav = document.getElementById('shell-nav');", 1)[0]
+    assert 'return window.Project.selectById(hit.id);' in selector
+    assert 'selectByPath' not in selector
+
+
+def test_unsaved_scopes_run_component_discard_before_shell_clear():
+    workspace = _source('workspace.js')
+    guard = workspace.split('async function guardUnsaved(reason)', 1)[1].split(
+        'function findPrimaryRoute', 1)[0]
+    assert "typeof item.canDiscard === 'function'" in guard
+    assert "typeof item.discard === 'function'" in guard
+    assert guard.index('await item.discard()') < guard.index('dirtyScopes.clear()')
+    assert "mark(scope, label = '当前编辑', lifecycle = null)" in workspace

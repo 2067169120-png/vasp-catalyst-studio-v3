@@ -26,8 +26,9 @@ class _FakeApi:
         self.raise_error = raise_error
         self.write_file = write_file
 
-    def proj_report_bundle(self, project_path, out_dir, *, formats, final, stem,
-                           requested_kind=None):
+    def _proj_report_bundle_for_path(
+            self, project_path, out_dir, *, formats, final, stem,
+            requested_kind=None):
         call = {
             "project_path": project_path,
             "out_dir": out_dir,
@@ -57,7 +58,7 @@ class _FakeApi:
             "error": None,
         }
 
-    def proj_report_status(self, project_path):
+    def _proj_report_status_for_path(self, project_path):
         self.calls.append({"status_path": project_path})
         return {
             "schema": "vcstudio.report-status/v1",

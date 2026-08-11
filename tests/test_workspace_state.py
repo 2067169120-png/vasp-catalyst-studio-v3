@@ -315,6 +315,7 @@ def _api_for_context(tmp_path, *, selected=True, work_mode="lis", pipeline_ok=Tr
         "state_history": [{"state": "RUNNING", "at": "2026-08-10T10:00:00"}],
     }
     adsorption = SimpleNamespace(
+        list_projects=lambda: [project_path],
         load_project=lambda path: project if path == project_path else None)
     manifests = SimpleNamespace(load_manifest=lambda path: manifest if path == member_dir else None)
     store = WorkspaceStateStore(tmp_path / "state" / "workspace-state.json")
@@ -336,13 +337,10 @@ def _api_for_context(tmp_path, *, selected=True, work_mode="lis", pipeline_ok=Tr
 
     api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
               workspace_state_store=store)
-    api.proj_list = lambda: {
-        "projects": [{"path": project_path, "name": "demo", "n_members": 1,
-                      "n_done": 0}], "error": None}
     api.pipeline_status = lambda: ({
         "ok": True,
         "projects": [{
-            "path": project_path, "name": "demo", "stage": "monitor",
+            "project_id": project_id, "name": "demo", "stage": "monitor",
             "stage_index": 2, "stages": ["generate", "submit", "monitor"],
             "needs_human": False, "recover_round": 0, "done": 0, "total": 1,
             "artifact_status": "missing", "scientific_status": None,
@@ -413,10 +411,8 @@ def test_workspace_context_separates_intent_from_project_facts_and_redacts_paths
     }
     assert result["unsaved"] == {
         "known": True, "dirty": True, "draft_ids": ["draft-1"]}
-    assert result["projects"][0]["path"] == project_path
-    public = dict(result)
-    public.pop("projects")
-    assert project_path not in json.dumps(public, ensure_ascii=False)
+    assert result["projects"][0]["project_id"] == project_id
+    assert project_path not in json.dumps(result, ensure_ascii=False)
     assert api.workspace_context_get() == result
 
 

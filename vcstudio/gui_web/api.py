@@ -12,6 +12,7 @@ import base64
 import binascii
 import copy
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -21,6 +22,7 @@ import tempfile
 import threading
 import time
 import types
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, fields as dc_fields
 from datetime import datetime, timezone
@@ -255,7 +257,8 @@ class Api:
                  pipeline_supervisor_cls=None, assistant_chat_mod=None,
                  comparison_mod=None, candidate_evaluation_mod=None,
                  paper_report_mod=None, workspace_state_store=None,
-                 report_service=None, analysis_preferences_store=None):
+                 report_service=None, analysis_preferences_store=None,
+                 project_lifecycle_service=None, lab_policy_store=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -366,15 +369,41 @@ class Api:
         # Phase C report workbench orchestration.  The service is lazy so the
         # normal submit/monitor path does not import report dependencies.
         self._report_service_instance = report_service
+        # Report publication uses its own purpose-bound destination registry.
+        # It is intentionally separate from SI capsule export tokens.
+        self._report_workbench_destinations = None
+        # Insight export destinations remain server-side behind opaque,
+        # single-use tokens; browser callers never submit filesystem paths.
+        self._report_insight_destinations = None
         # Phase B 可恢复工作区状态只保存 UI 偏好/草稿引用，与 project.yaml 科学事实分离。
         # 测试可注入内存/临时目录 store；生产首次调用时再创建用户级 JSON store。
         self._workspace_state_store = workspace_state_store
         # Phase D reusable analysis templates/favourites are user-level state,
         # never project.yaml fields.  Keep the store lazy for normal job paths.
         self._analysis_preferences_store = analysis_preferences_store
+        # Confirmed laboratory recommendations are user-level state.  They do
+        # not mutate job manifests or grant submission authority.
+        self._lab_policy_store = lab_policy_store
+        # Phase 3 project location/identity mutations are isolated behind a
+        # hash-bound lifecycle service. Browser callers receive opaque server
+        # selections and plans, never an authority-bearing filesystem path.
+        self._project_lifecycle_service = project_lifecycle_service
+        self._project_lifecycle_lock = threading.RLock()
+        self._project_lifecycle_selections = {}
+        self._project_lifecycle_plans = {}
+        # Every browser project-ID request is rebound under one process-local
+        # transaction lock before any private path helper may use it.  The
+        # thread-local map also makes every nested project reload verify the
+        # originally resolved opaque identity before returning data.
+        self._project_identity_lock = threading.RLock()
+        self._project_identity_local = threading.local()
         # pywebview 可并发调用同一个 js_api；后端锁才是自动托管的正确性边界。
         # 前端的 running 标志只负责交互，不能阻止两条线程同时续算/出报告。
         self._pipeline_lock = threading.Lock()
+        # 高风险批量动作的请求键在确认框之前由前端创建，并在密码/主机指纹重试中复用。
+        # 这里才是真正的并发边界：相同请求不得再次进入 SSH 提交/续算/取消实现。
+        self._job_operation_lock = threading.RLock()
+        self._job_operations = {}
         # 报告渲染可持续数分钟；marker 提交必须串行重载当前项目并执行 CAS，
         # 不能把渲染前的旧 project dict 覆盖回 project.yaml。
         self._report_marker_lock = threading.RLock()
@@ -394,10 +423,66 @@ class Api:
         return 'pong'
 
     # ── 进程级自动托管调度器 ────────────────────────────────────────────────
+    _PIPELINE_LOCATOR_KEYS = frozenset({
+        'path', 'paths', 'project_path', 'project_paths', 'project_root',
+        'root', 'dir', 'dirs', 'directory', 'directories', 'locator',
+        'locators', 'destination', 'report', 'files', 'figures_dir',
+        'out_dir', 'output_dir', 'manifest_path', 'recovery_path',
+    })
+    _PIPELINE_RUNTIME_KEYS = (
+        'running', 'paused', 'tick_running', 'enabled', 'interval_seconds',
+        'last_started', 'last_finished', 'next_check', 'outcome_seq',
+        'outcome_history', 'last_outcome', 'last_error',
+    )
+
+    @classmethod
+    def _pipeline_public_value(cls, value, *, key=''):
+        """Recursively project one pipeline value across the browser boundary."""
+        normalized = str(key or '').strip().lower().replace('-', '_')
+        if isinstance(value, dict):
+            projected = {}
+            for raw_key, item in value.items():
+                item_key = str(raw_key)
+                item_normalized = item_key.strip().lower().replace('-', '_')
+                if (item_normalized in cls._PIPELINE_LOCATOR_KEYS
+                        or item_normalized.endswith(('_path', '_paths', '_dir', '_dirs'))):
+                    continue
+                safe_key = cls._pipeline_public_value(item_key, key='field_name')
+                projected[str(safe_key)] = cls._pipeline_public_value(
+                    item, key=item_normalized)
+            return projected
+        if isinstance(value, (list, tuple)):
+            return [cls._pipeline_public_value(item, key=normalized) for item in value]
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if normalized == 'last_error' and value:
+            return 'Pipeline scheduler operation failed.'
+        try:
+            from vcstudio.project.report_insights import redact
+            projected = redact(value, key=normalized)
+            # ``redact`` JSON-normalises unknown objects with ``str(value)``.
+            # Re-check that resulting string so PathLike/custom objects cannot
+            # smuggle a locator or credential through their textual form.
+            if isinstance(projected, str):
+                projected = redact(projected, key=normalized)
+                return cls._workspace_public_text(projected)
+            return projected
+        except Exception:                                 # noqa: BLE001 fail-safe projection
+            return '[redacted-sensitive-value]'
+
+    @classmethod
+    def _pipeline_public_state(cls, state):
+        source = state if isinstance(state, dict) else {}
+        return {
+            key: cls._pipeline_public_value(source.get(key), key=key)
+            for key in cls._PIPELINE_RUNTIME_KEYS
+        }
+
     def _publish_pipeline_runtime(self, state):
         """保存调度线程的只读快照；前端只轮询该快照，不再自己驱动计算。"""
         with self._pipeline_runtime_lock:
-            self._pipeline_runtime = copy.deepcopy(state)
+            self._pipeline_runtime = copy.deepcopy(
+                self._pipeline_public_state(state))
 
     def start_background_services(self):
         """启动唯一后台调度线程；由桌面入口调用，重复调用安全。"""
@@ -412,9 +497,11 @@ class Api:
                     self._publish_pipeline_runtime)
             started = bool(self._pipeline_supervisor.start())
             return {'ok': True, 'started': started,
-                    'state': self._pipeline_supervisor.snapshot(), 'error': None}
-        except Exception as e:                            # noqa: BLE001
-            return {'ok': False, 'started': False, 'state': None, 'error': str(e)}
+                    'state': self._pipeline_public_state(
+                        self._pipeline_supervisor.snapshot()), 'error': None}
+        except Exception:                                 # noqa: BLE001 public boundary
+            return {'ok': False, 'started': False, 'state': None,
+                    'error': 'Pipeline scheduler could not be started.'}
 
     def stop_background_services(self):
         """关闭后台线程；已在执行的一拍不会被暴力终止。"""
@@ -424,8 +511,9 @@ class Api:
             stopped = bool(self._pipeline_supervisor.stop(timeout=2.0))
             return {'ok': stopped, 'stopped': stopped,
                     'error': None if stopped else '后台任务仍在收尾，将在本拍结束后退出'}
-        except Exception as e:                            # noqa: BLE001
-            return {'ok': False, 'stopped': False, 'error': str(e)}
+        except Exception:                                 # noqa: BLE001 public boundary
+            return {'ok': False, 'stopped': False,
+                    'error': 'Pipeline scheduler could not be stopped.'}
 
     def pipeline_runtime_status(self):
         """返回调度器状态与最近一拍结果，供 UI 展示下一次检查和阻塞原因。"""
@@ -435,9 +523,11 @@ class Api:
             else:
                 with self._pipeline_runtime_lock:
                     state = copy.deepcopy(self._pipeline_runtime)
-            return {'ok': True, 'state': state, 'error': None}
-        except Exception as e:                            # noqa: BLE001
-            return {'ok': False, 'state': None, 'error': str(e)}
+            return {'ok': True, 'state': self._pipeline_public_state(state),
+                    'error': None}
+        except Exception:                                 # noqa: BLE001 public boundary
+            return {'ok': False, 'state': None,
+                    'error': 'Pipeline runtime status is unavailable.'}
 
     def pipeline_wake(self):
         """要求后台线程立即补跑一拍；不会创建第二个并发调度器。"""
@@ -447,8 +537,9 @@ class Api:
         try:
             queued = bool(self._pipeline_supervisor.wake())
             return {'ok': True, 'queued': queued, 'error': None}
-        except Exception as e:                            # noqa: BLE001
-            return {'ok': False, 'queued': False, 'error': str(e)}
+        except Exception:                                 # noqa: BLE001 public boundary
+            return {'ok': False, 'queued': False,
+                    'error': 'Pipeline scheduler could not be woken.'}
 
     # ── Phase B:可恢复工作区上下文（UI 偏好与项目科学事实严格分轴） ─────────────
     _WORKSPACE_CONTEXT_SCHEMA = 'vcstudio.workspace-context/v1'
@@ -475,6 +566,319 @@ class Api:
             os.path.expanduser(str(path or '')))))
         digest = hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:24]
         return f'registry-{digest}'
+
+    _PROJECT_ID_RE = re.compile(
+        r'(?:project-[a-f0-9]{32}|registry-[a-f0-9]{24})')
+
+    @staticmethod
+    def _canonical_project_path(path):
+        """Canonicalise one server-held registry locator for internal use."""
+        locator = str(path or '').strip()
+        if not locator:
+            raise ValueError('registered project locator is empty')
+        return os.path.realpath(os.path.abspath(os.path.expanduser(locator)))
+
+    @classmethod
+    def _project_identity_fingerprint(cls, path, project):
+        """Fingerprint only stable identity fields, not mutable project facts."""
+        project = project if isinstance(project, dict) else {}
+        preparation = project.get('preparation') or {}
+        payload = {
+            'path': cls._workspace_path_key(cls._canonical_project_path(path)),
+            'project_id': cls._workspace_project_id(path, project),
+            'project_uuid': str(project.get('project_uuid') or ''),
+            'prepared_project_uuid': str(
+                preparation.get('project_uuid')
+                if isinstance(preparation, dict) else ''),
+        }
+        encoded = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True,
+            separators=(',', ':')).encode('utf-8')
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _project_registry_snapshot(self):
+        """Build the single private project identity authority.
+
+        Browser DTOs are projected from ``public_rows``.  Filesystem locators
+        and loaded project dictionaries exist only in the private ``records``
+        and ``by_id`` members.  Duplicate identities are deliberately retained
+        in ``by_id`` so resolution can fail closed rather than selecting one.
+        """
+        locators = list(self._adsorption.list_projects())
+        records = []
+        failures = []
+        for index, raw_locator in enumerate(locators, start=1):
+            try:
+                project = self._adsorption.load_project(raw_locator)
+                if not isinstance(project, dict):
+                    raise ValueError('registered project is unreadable')
+                path = self._canonical_project_path(raw_locator)
+                project_id = self._workspace_project_id(path, project)
+                member_dirs = self._project_member_dirs(project)
+                reference_species = sorted(
+                    str(species) for species in
+                    (project.get('species_ref_jobs') or {})
+                    if str(species).strip())
+                n_done = sum(
+                    1 for member_dir in member_dirs
+                    if ((self._manifest.load_manifest(member_dir) or {}).get('state')
+                        == 'DONE'))
+                public = {
+                    'project_id': project_id,
+                    'name': str(project.get('name') or ''),
+                    'n_members': len(member_dirs),
+                    'n_done': n_done,
+                    'reference_mode': (
+                        'species' if reference_species else
+                        'single' if (project.get('members') or {}).get('gas_ref')
+                        else 'none'),
+                    'reference_species': reference_species,
+                    'n_species_refs': len(reference_species),
+                }
+                records.append({
+                    'project_id': project_id,
+                    'request_project_id': project_id,
+                    'path': path,
+                    'project': project,
+                    'identity_fingerprint': self._project_identity_fingerprint(
+                        path, project),
+                    'public': public,
+                })
+            except Exception:                             # noqa: BLE001 safe registry projection
+                failures.append({
+                    'project_ref': f'registered-project-{index}',
+                    'code': 'project_unreadable',
+                    'message': 'Registered project could not be read.',
+                })
+
+        by_id = {}
+        for record in records:
+            by_id.setdefault(record['project_id'], []).append(record)
+        duplicate_ids = {
+            project_id for project_id, matches in by_id.items()
+            if len(matches) != 1
+        }
+        public_rows = [
+            copy.deepcopy(record['public']) for record in records
+            if record['project_id'] not in duplicate_ids
+        ]
+        return {
+            'registered_total': len(locators),
+            'records': records,
+            'by_id': by_id,
+            'duplicate_ids': duplicate_ids,
+            'public_rows': public_rows,
+            'failures': failures,
+        }
+
+    def _resolve_project_id(self, project_id, *, snapshot=None):
+        """Resolve exactly one opaque ID; paths, unknown IDs and duplicates fail."""
+        identifier = str(project_id or '').strip().lower()
+        if not self._PROJECT_ID_RE.fullmatch(identifier):
+            raise ValueError('project_id is not a registered opaque identity')
+        authority = snapshot or self._project_registry_snapshot()
+        matches = authority['by_id'].get(identifier) or []
+        if len(matches) != 1:
+            raise LookupError('project identity is missing or ambiguous')
+        record = dict(matches[0])
+        record['request_project_id'] = identifier
+        return record
+
+    def _resolve_project_ids(self, project_ids, *, min_count=1, max_count=None):
+        """Resolve an ordered, duplicate-free opaque project-ID sequence."""
+        if isinstance(project_ids, (str, bytes)) or project_ids is None:
+            raise TypeError('project_ids must be a sequence of opaque identities')
+        identifiers = [str(item or '').strip().lower() for item in project_ids]
+        if len(identifiers) < int(min_count):
+            raise ValueError(f'at least {int(min_count)} project identities are required')
+        if max_count is not None and len(identifiers) > int(max_count):
+            raise ValueError(f'at most {int(max_count)} project identities are allowed')
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError('project_ids must not contain duplicate identities')
+        snapshot = self._project_registry_snapshot()
+        return [self._resolve_project_id(item, snapshot=snapshot)
+                for item in identifiers]
+
+    def _project_records_for_request(
+            self, anchor, request=None, *, include_registry=False):
+        """Collect every opaque project identity one public request may consume."""
+        identifiers = [anchor['request_project_id']]
+        if isinstance(request, dict):
+            comparison = request.get('comparison_project_ids')
+            if isinstance(comparison, (list, tuple)):
+                identifiers.extend(str(item or '').strip() for item in comparison)
+            spec = request.get('spec')
+            scope = spec.get('scope') if isinstance(spec, dict) else None
+            scoped = scope.get('project_ids') if isinstance(scope, dict) else None
+            if isinstance(scoped, (list, tuple)):
+                identifiers.extend(str(item or '').strip() for item in scoped)
+        identifiers = list(dict.fromkeys(item for item in identifiers if item))
+        if include_registry:
+            snapshot = self._project_registry_snapshot()
+            identifiers.extend(
+                record['project_id'] for record in snapshot['records']
+                if record['project_id'] not in snapshot['duplicate_ids'])
+            identifiers = list(dict.fromkeys(identifiers))
+        if identifiers == [anchor['request_project_id']]:
+            return [anchor]
+        return self._resolve_project_ids(identifiers, min_count=1)
+
+    def _active_project_bindings(self):
+        bindings = getattr(self._project_identity_local, 'bindings', None)
+        return bindings if isinstance(bindings, dict) else {}
+
+    @staticmethod
+    def _identity_mismatch_message():
+        return 'identity_mismatch'
+
+    def _assert_project_binding(self, record, loaded):
+        """Reject a reload whose identity differs from the resolved request."""
+        if not isinstance(loaded, dict):
+            raise RuntimeError(self._identity_mismatch_message())
+        current_id = self._workspace_project_id(record['path'], loaded)
+        current_fingerprint = self._project_identity_fingerprint(
+            record['path'], loaded)
+        if (current_id != record['request_project_id']
+                or current_fingerprint != record['identity_fingerprint']):
+            raise RuntimeError(self._identity_mismatch_message())
+        return loaded
+
+    def _rebind_project_record(self, record):
+        """Reload and validate one record immediately before/after private use."""
+        try:
+            loaded = self._adsorption.load_project(record['path'])
+        except Exception as exc:                          # noqa: BLE001 fail closed
+            raise RuntimeError(self._identity_mismatch_message()) from exc
+        return self._assert_project_binding(record, loaded)
+
+    def _load_project_for_path(self, path):
+        """Load a project and enforce the active browser-request binding, if any."""
+        try:
+            key = self._workspace_path_key(self._canonical_project_path(path))
+        except Exception:                                 # noqa: BLE001 normal load semantics
+            return self._adsorption.load_project(path)
+        record = self._active_project_bindings().get(key)
+        try:
+            loaded = self._adsorption.load_project(path)
+        except Exception as exc:                          # noqa: BLE001 fail closed when bound
+            if record:
+                raise RuntimeError(self._identity_mismatch_message()) from exc
+            raise
+        return self._assert_project_binding(record, loaded) if record else loaded
+
+    def _call_with_project_bindings(self, records, invoke, *, failure=None):
+        """Run one private operation under resolve/rebind identity authority."""
+        records = list(records or [])
+        try:
+            with self._project_identity_lock:
+                previous = getattr(self._project_identity_local, 'bindings', None)
+                bindings = dict(previous) if isinstance(previous, dict) else {}
+                for record in records:
+                    key = self._workspace_path_key(
+                        self._canonical_project_path(record['path']))
+                    bindings[key] = record
+                self._project_identity_local.bindings = bindings
+                try:
+                    for record in records:
+                        self._rebind_project_record(record)
+                    result = invoke()
+                    for record in records:
+                        self._rebind_project_record(record)
+                    return result
+                finally:
+                    if previous is None:
+                        try:
+                            del self._project_identity_local.bindings
+                        except AttributeError:
+                            pass
+                    else:
+                        self._project_identity_local.bindings = previous
+        except RuntimeError as exc:
+            if str(exc) != self._identity_mismatch_message() or failure is None:
+                raise
+            return self._project_identity_mismatch(**failure)
+
+    @classmethod
+    def _project_identity_mismatch(cls, **extra):
+        return {
+            'ok': False,
+            **extra,
+            'error_code': 'identity_mismatch',
+            'error': cls._identity_mismatch_message(),
+        }
+
+    @classmethod
+    def _project_public_result(cls, value):
+        """Redact diagnostic text while preserving legitimate output artifacts."""
+        if isinstance(value, dict):
+            projected = {}
+            for key, item in value.items():
+                if key in {'error', 'message', 'reason', 'gate_reason'} and item is not None:
+                    projected[key] = cls._workspace_public_text(item) or None
+                elif key in {'warnings', 'advisories'} and isinstance(item, (list, tuple)):
+                    projected[key] = [cls._workspace_public_text(entry)
+                                      for entry in item]
+                else:
+                    projected[key] = cls._project_public_result(item)
+            return projected
+        if isinstance(value, list):
+            return [cls._project_public_result(item) for item in value]
+        if isinstance(value, tuple):
+            return [cls._project_public_result(item) for item in value]
+        return value
+
+    @classmethod
+    def _project_identity_failure(cls, **extra):
+        """Return a path-free public failure for any resolver rejection."""
+        return {
+            'ok': False,
+            **extra,
+            'error': 'The project identity is not registered or is ambiguous.',
+        }
+
+    def _project_locator_projection(self, value, records):
+        """Replace registered-project locators in an otherwise public result."""
+        by_path = {}
+        by_uuid = {}
+        for record in records:
+            project_id = record['project_id']
+            project_path = self._workspace_path_key(record['path'])
+            project_root = self._workspace_path_key(
+                os.path.dirname(record['path']))
+            by_path[project_path] = project_id
+            by_path[project_root] = project_id
+            raw_uuid = str(record['project'].get('project_uuid') or '').strip()
+            if raw_uuid:
+                by_uuid[raw_uuid] = project_id
+
+        def project(value):
+            if isinstance(value, dict):
+                current = dict(value)
+                matched = None
+                for key in ('path', 'project_path', 'root'):
+                    raw = current.get(key)
+                    if not isinstance(raw, str) or not raw.strip():
+                        continue
+                    try:
+                        candidate = self._workspace_path_key(
+                            self._canonical_project_path(raw))
+                    except Exception:                     # noqa: BLE001 non-path public value
+                        candidate = ''
+                    if candidate in by_path:
+                        matched = by_path[candidate]
+                        current.pop(key, None)
+                raw_uuid = str(current.get('project_uuid') or '').strip()
+                if raw_uuid in by_uuid:
+                    matched = matched or by_uuid[raw_uuid]
+                    current.pop('project_uuid', None)
+                if matched:
+                    current['project_id'] = matched
+                return {key: project(item) for key, item in current.items()}
+            if isinstance(value, (list, tuple)):
+                return [project(item) for item in value]
+            return value
+
+        return self._project_public_result(project(value))
 
     @staticmethod
     def _workspace_job_id(job_dir, manifest=None):
@@ -799,13 +1203,11 @@ class Api:
         return out
 
     def _workspace_context_build(self):
-        """Return one canonical, path-minimised workspace context snapshot.
+        """Return one canonical, path-free workspace context snapshot.
 
         ``workspace_intent`` contains user preferences.  ``project`` (including
         its selected-job subrecord) and ``pipeline`` contain only facts read
-        from the selected registered project and its manifests.  Absolute paths
-        appear only in ``projects[].path`` for compatibility with local UI
-        actions.
+        from the selected registered project and its manifests.
         """
         try:
             state = self._ws().read()
@@ -816,12 +1218,19 @@ class Api:
         intent = self._workspace_intent(degraded)
 
         try:
-            listing = self.proj_list()
+            registry = self._project_registry_snapshot()
         except Exception as e:                            # noqa: BLE001
-            listing = {'projects': [], 'error': str(e)}
-        if listing.get('error'):
+            registry = {'public_rows': [], 'by_id': {}, 'duplicate_ids': set(),
+                        'failures': []}
             degraded.append({'kind': 'project_registry_unavailable',
-                             'message': self._workspace_public_text(listing.get('error'))})
+                             'message': self._workspace_public_text(e)})
+        if registry['duplicate_ids']:
+            degraded.append({'kind': 'duplicate_project_id',
+                             'message': '项目注册表包含重复 opaque project_id'})
+        if registry['failures']:
+            degraded.append({'kind': 'project_registry_incomplete',
+                             'count': len(registry['failures']),
+                             'message': '部分注册项目不可读'})
         try:
             pipeline_result = self.pipeline_status()
         except Exception as e:                            # noqa: BLE001
@@ -830,30 +1239,26 @@ class Api:
             degraded.append({'kind': 'pipeline_status_unavailable',
                              'message': self._workspace_public_text(
                                  pipeline_result.get('error'))})
-        pipeline_by_path = {
-            self._workspace_path_key(row.get('path')): row
+        pipeline_by_id = {
+            str(row.get('project_id') or ''): row
             for row in (pipeline_result.get('projects') or []) if isinstance(row, dict)
         }
 
         projects = []
         candidates = {}
-        for list_row in (listing.get('projects') or []):
+        for list_row in registry['public_rows']:
             if not isinstance(list_row, dict):
                 continue
-            path = str(list_row.get('path') or '')
-            project = None
-            try:
-                project = self._adsorption.load_project(path)
-            except Exception as e:                        # noqa: BLE001
-                degraded.append({'kind': 'project_unreadable',
-                                 'project_id': self._workspace_project_id(path),
-                                 'message': self._workspace_public_text(e)})
-            project_id = self._workspace_project_id(path, project)
-            pipeline_row = pipeline_by_path.get(self._workspace_path_key(path))
+            project_id = str(list_row.get('project_id') or '')
+            matches = registry['by_id'].get(project_id) or []
+            if len(matches) != 1:
+                continue
+            record = matches[0]
+            project = record['project']
+            pipeline_row = pipeline_by_id.get(project_id)
             row = {
-                'id': project_id,
-                'name': str((project or {}).get('name') or list_row.get('name') or ''),
-                'path': path,
+                'project_id': project_id,
+                'name': str(project.get('name') or list_row.get('name') or ''),
                 'n_members': int(list_row.get('n_members') or 0),
                 'n_done': int((pipeline_row or {}).get('done')
                               if (pipeline_row or {}).get('done') is not None
@@ -864,7 +1269,7 @@ class Api:
             }
             projects.append(row)
             candidates.setdefault(project_id, []).append(
-                {'path': path, 'project': project, 'list_row': list_row,
+                {'project': project, 'list_row': list_row,
                  'pipeline_row': pipeline_row})
 
         current_id = preferences.get('current_project_id')
@@ -1512,37 +1917,32 @@ class Api:
 
         mapping = {}
         try:
-            for pp in self._adsorption.list_projects():
-                try:
-                    proj = self._adsorption.load_project(pp)
-                    if proj is None:
-                        continue
-                    pname = proj.get('name', '') or os.path.basename(
-                        os.path.dirname(str(pp)))
-                    group = {
-                        'project': pname,
-                        'project_path': str(pp),
-                        'project_id': self._workspace_project_id(pp, proj),
-                    }
-                    mem = proj.get('members') or {}
-                    if mem.get('clean_slab'):
-                        mapping[norm(mem['clean_slab'])] = {**group, 'role': 'clean'}
-                    if mem.get('gas_ref'):
-                        mapping[norm(mem['gas_ref'])] = {**group, 'role': 'gas'}
-                    for d in (mem.get('configs') or []):
-                        if d:
-                            mapping[norm(d)] = {**group, 'role': 'config'}
-                    molecule_dirs = []
-                    for refs in (mem.get('molecules'), proj.get('species_ref_jobs')):
-                        if isinstance(refs, dict):
-                            molecule_dirs.extend(refs.values())
-                        elif isinstance(refs, (list, tuple)):
-                            molecule_dirs.extend(refs)
-                    for d in molecule_dirs:
-                        if d:
-                            mapping.setdefault(norm(d), {**group, 'role': 'molecule'})
-                except Exception:                         # noqa: BLE001 单个坏项目跳过
+            snapshot = self._project_registry_snapshot()
+            for record in snapshot['records']:
+                if record['project_id'] in snapshot['duplicate_ids']:
                     continue
+                proj = record['project']
+                group = {
+                    'project': str(proj.get('name') or ''),
+                    'project_id': record['project_id'],
+                }
+                mem = proj.get('members') or {}
+                if mem.get('clean_slab'):
+                    mapping[norm(mem['clean_slab'])] = {**group, 'role': 'clean'}
+                if mem.get('gas_ref'):
+                    mapping[norm(mem['gas_ref'])] = {**group, 'role': 'gas'}
+                for d in (mem.get('configs') or []):
+                    if d:
+                        mapping[norm(d)] = {**group, 'role': 'config'}
+                molecule_dirs = []
+                for refs in (mem.get('molecules'), proj.get('species_ref_jobs')):
+                    if isinstance(refs, dict):
+                        molecule_dirs.extend(refs.values())
+                    elif isinstance(refs, (list, tuple)):
+                        molecule_dirs.extend(refs)
+                for d in molecule_dirs:
+                    if d:
+                        mapping.setdefault(norm(d), {**group, 'role': 'molecule'})
         except Exception:                                 # noqa: BLE001 注册表坏 → 全部不分组
             return {}
         return mapping
@@ -1579,7 +1979,6 @@ class Api:
                     'dir': job_dir,
                     'name': os.path.basename(os.path.normpath(job_dir)),
                     'project': grp['project'] if grp else None,
-                    'project_path': grp['project_path'] if grp else None,
                     'project_id': grp['project_id'] if grp else None,
                     'role': grp['role'] if grp else None,
                     'state': state,
@@ -1597,7 +1996,383 @@ class Api:
                 })
             return {'jobs': jobs, 'stale': stale}
         except Exception as e:                            # noqa: BLE001
-            return {'jobs': [], 'stale': [], 'error': str(e)}
+            return {'jobs': [], 'stale': [],
+                    'error': self._workspace_public_text(e)}
+
+    # ── Selection Tray: server-evidenced, advisory resource forecast ────────
+    _RESOURCE_FORECAST_SCHEMA = 'vcstudio.resource-forecast-api/v1'
+    _RESOURCE_ANALYSIS_TASKS = frozenset({
+        'analysis', 'dos', 'dos_pdos', 'bands', 'band', 'bader', 'chgdiff',
+        'charge_difference', 'elf', 'workfunction', 'work_function',
+        'surface_energy', 'formation_energy', 'binding_energy',
+        'formation_binding', 'vaspsol', 'solvation', 'eos', 'conv_encut',
+        'conv_kpoints', 'conv_vacuum', 'conv_layers', 'conv_slab',
+    })
+
+    @classmethod
+    def _resource_task_kind(cls, manifest):
+        raw = str((manifest or {}).get('task_type') or '').strip().lower()
+        if raw in {'static'}:
+            return 'static'
+        if raw in {'relax', 'cellopt', 'cell_opt', 'geometry_optimization'}:
+            return 'relax'
+        if raw in {'neb', 'dimer'}:
+            return 'neb'
+        if raw == 'aimd':
+            return 'aimd'
+        if raw in {'freq', 'frequency'}:
+            return 'freq'
+        if raw in cls._RESOURCE_ANALYSIS_TASKS:
+            return 'analysis'
+        return None
+
+    @staticmethod
+    def _resource_positive_int(value, *, maximum):
+        if isinstance(value, bool):
+            return None
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return None
+        return number if 1 <= number <= maximum else None
+
+    @classmethod
+    def _resource_cores(cls, manifest):
+        attempts = [item for item in ((manifest or {}).get('attempts') or [])
+                    if isinstance(item, dict)]
+        if not attempts:
+            return None
+        # Only the submission-time record is actual evidence.  Current
+        # profile defaults may have changed and are deliberately not used.
+        return cls._resource_positive_int(
+            attempts[-1].get('cores'), maximum=65_536)
+
+    @staticmethod
+    def _resource_structure_text(job_dir, manifest):
+        for name in ('CONTCAR', 'POSCAR'):
+            candidate = os.path.join(job_dir, name)
+            if os.path.isfile(candidate):
+                with open(candidate, encoding='utf-8', errors='replace') as handle:
+                    return handle.read()
+        if str((manifest or {}).get('task_type') or '').strip().lower() == 'neb':
+            try:
+                image_dirs = sorted(
+                    name for name in os.listdir(job_dir)
+                    if name.isdigit() and os.path.isdir(os.path.join(job_dir, name)))
+            except OSError:
+                image_dirs = []
+            for image in image_dirs:
+                candidate = os.path.join(job_dir, image, 'POSCAR')
+                if os.path.isfile(candidate):
+                    with open(candidate, encoding='utf-8', errors='replace') as handle:
+                        return handle.read()
+        return ''
+
+    @classmethod
+    def _resource_natoms(cls, job_dir, manifest):
+        text = cls._resource_structure_text(job_dir, manifest)
+        lines = [line.strip() for line in text.splitlines()]
+        if len(lines) < 7:
+            return None
+        # VASP 4 places counts on line 6; VASP 5/6 uses a symbol line then
+        # counts on line 7.  Do not scan later coordinate rows, which could
+        # otherwise be mistaken for counts in a malformed file.
+        for index in (5, 6):
+            parts = lines[index].split()
+            if not parts or not all(re.fullmatch(r'\d+', part) for part in parts):
+                continue
+            counts = [int(part) for part in parts]
+            total = sum(counts)
+            return cls._resource_positive_int(total, maximum=100_000)
+        return None
+
+    @classmethod
+    def _resource_nkpts(cls, job_dir, manifest):
+        candidate = os.path.join(job_dir, 'KPOINTS')
+        if os.path.isfile(candidate):
+            try:
+                with open(candidate, encoding='utf-8', errors='replace') as handle:
+                    lines = [line.strip() for line in handle if line.strip()]
+            except OSError:
+                lines = []
+            if len(lines) >= 2:
+                count = cls._resource_positive_int(lines[1], maximum=10_000_000)
+                mode = lines[2].lower() if len(lines) >= 3 else ''
+                if count is not None and 'line' not in mode:
+                    return count
+                if lines[1] == '0' and len(lines) >= 4:
+                    mesh = lines[3].split()
+                    if len(mesh) >= 3:
+                        axes = [cls._resource_positive_int(item, maximum=10_000_000)
+                                for item in mesh[:3]]
+                        if all(item is not None for item in axes):
+                            product = axes[0] * axes[1] * axes[2]
+                            return product if product <= 10_000_000 else None
+            # An existing but malformed/unsupported (for example line-mode)
+            # KPOINTS file is conflicting evidence.  Never mask it with a
+            # possibly stale manifest summary.
+            return None
+        inputs = ((manifest or {}).get('inputs')
+                  if isinstance((manifest or {}).get('inputs'), dict) else {})
+        raw_mesh = inputs.get('kpoints')
+        if isinstance(raw_mesh, (list, tuple)) and len(raw_mesh) == 3:
+            axes = [cls._resource_positive_int(item, maximum=10_000_000)
+                    for item in raw_mesh]
+            if all(item is not None for item in axes):
+                product = axes[0] * axes[1] * axes[2]
+                return product if product <= 10_000_000 else None
+        return None
+
+    @staticmethod
+    def _resource_budget_evidence(manifest):
+        candidates = []
+        for container, key in (
+                (manifest, 'remaining_budget_core_hours'),
+                (manifest.get('budget') if isinstance(manifest.get('budget'), dict) else {},
+                 'remaining_core_hours'),
+                (manifest.get('resources')
+                 if isinstance(manifest.get('resources'), dict) else {},
+                 'remaining_budget_core_hours')):
+            if key in container:
+                candidates.append(container.get(key))
+        if not candidates:
+            return 'missing', None
+        if len(candidates) != 1 or isinstance(candidates[0], bool):
+            return 'invalid', None
+        try:
+            number = float(candidates[0])
+        except (TypeError, ValueError):
+            return 'invalid', None
+        if not math.isfinite(number) or number < 0:
+            return 'invalid', None
+        return 'available', number
+
+    @classmethod
+    def _resource_request(cls, job_dir, manifest, job_id):
+        values = {
+            'task_kind': cls._resource_task_kind(manifest),
+            'natoms': cls._resource_natoms(job_dir, manifest),
+            'nkpts': cls._resource_nkpts(job_dir, manifest),
+            'cores': cls._resource_cores(manifest),
+        }
+        missing = sorted(key for key, value in values.items() if value is None)
+        return ({'job_id': job_id, **values} if not missing else None), missing
+
+    @staticmethod
+    def _resource_history_state(manifest):
+        state = str((manifest or {}).get('state') or '').strip().upper()
+        if state in {'DONE', 'COMPLETED', 'FINISHED', 'SUCCESS'}:
+            return 'DONE'
+        if state in {'FAILED', 'ERROR', 'CANCELLED', 'TIMEOUT', 'LOST',
+                     'UNCONVERGED', 'NEEDS_HUMAN'}:
+            return 'FAILED'
+        return None
+
+    def _resource_history(self, entries):
+        from vcstudio.cluster.usage import runtime_window
+
+        usable, unknown_reasons = [], {}
+        for job_dir, manifest in entries:
+            if not isinstance(manifest, dict):
+                unknown_reasons['manifest'] = unknown_reasons.get('manifest', 0) + 1
+                continue
+            job_id = self._workspace_job_id(job_dir, manifest)
+            request, missing = self._resource_request(job_dir, manifest, job_id)
+            state = self._resource_history_state(manifest)
+            start, end, running, why = runtime_window(manifest)
+            if state is None:
+                missing.append('terminal_state')
+            if start is None or end is None or running or why:
+                missing.append('actual_walltime')
+            if missing:
+                for reason in sorted(set(missing)):
+                    unknown_reasons[reason] = unknown_reasons.get(reason, 0) + 1
+                continue
+            seconds = (end - start).total_seconds()
+            if not math.isfinite(seconds) or seconds < 0:
+                unknown_reasons['actual_walltime'] = (
+                    unknown_reasons.get('actual_walltime', 0) + 1)
+                continue
+            usable.append({
+                'task_kind': request['task_kind'], 'natoms': request['natoms'],
+                'nkpts': request['nkpts'], 'cores': request['cores'],
+                'elapsed_seconds': seconds, 'state': state,
+            })
+        return usable, dict(sorted(unknown_reasons.items()))
+
+    @staticmethod
+    def _resource_history_basis_sha256(history):
+        normalized = [{
+            'task_kind': str(item['task_kind']),
+            'natoms': int(item['natoms']),
+            'nkpts': int(item['nkpts']),
+            'cores': int(item['cores']),
+            'elapsed_seconds': round(float(item['elapsed_seconds']), 6),
+            'state': str(item['state']),
+        } for item in history]
+        normalized.sort(key=lambda item: json.dumps(
+            item, sort_keys=True, separators=(',', ':'), allow_nan=False))
+        payload = json.dumps(
+            normalized, sort_keys=True, separators=(',', ':'),
+            allow_nan=False).encode('utf-8')
+        return hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _resource_forecast_display(forecast):
+        if not isinstance(forecast, dict):
+            return None
+        def fixed(value):
+            return f'{float(value):.3f}'
+
+        rows = []
+        for item in forecast.get('jobs') or []:
+            failure_rate = item.get('failure_rate')
+            rows.append({
+                'job_id': str(item.get('job_id') or ''),
+                'estimate_core_hours': fixed(item.get('estimate_core_hours')),
+                'range_core_hours': (
+                    f'{fixed((item.get("range_core_hours") or {}).get("low"))}–'
+                    f'{fixed((item.get("range_core_hours") or {}).get("high"))}'),
+                'matching_successful_samples': str(
+                    int(item.get('matching_successful_samples') or 0)),
+                'matching_observed_samples': str(
+                    int(item.get('matching_observed_samples') or 0)),
+                'confidence': str(item.get('confidence') or 'low'),
+                'failure_rate': ('unknown' if failure_rate is None
+                                 else f'{float(failure_rate):.1%}'),
+            })
+        remaining = forecast.get('remaining_budget_core_hours')
+        return {
+            'estimate_core_hours': fixed(forecast.get('estimate_core_hours')),
+            'range_core_hours': (
+                f'{fixed((forecast.get("range_core_hours") or {}).get("low"))}–'
+                f'{fixed((forecast.get("range_core_hours") or {}).get("high"))}'),
+            'remaining_budget_core_hours': (
+                'unknown' if remaining is None else fixed(remaining)),
+            'confidence': str(forecast.get('confidence') or 'low'),
+            'budget_status': str(forecast.get('budget_status') or 'unlimited_or_unknown'),
+            'jobs': rows,
+        }
+
+    def jobs_resource_forecast(self, job_ids):
+        """Forecast selected ledger jobs from server evidence only.
+
+        Browser callers provide opaque job IDs only.  Scientific/resource
+        values, historical measurements, and remaining budget are reconstructed
+        from the current ledger and manifests on the server.
+        """
+        from vcstudio.project.resource_forecast import forecast_batch
+
+        boundary = {
+            'recommendation_only': True,
+            'requires_user_confirmation': True,
+            'authorizes_submission': False,
+        }
+        try:
+            if (not isinstance(job_ids, list) or not 1 <= len(job_ids) <= 512
+                    or any(not isinstance(item, str) or not item.strip()
+                           for item in job_ids)):
+                raise ValueError('job_ids must contain between 1 and 512 opaque IDs')
+            requested = [item.strip() for item in job_ids]
+            if len(set(requested)) != len(requested):
+                raise ValueError('job_ids must be unique')
+            entries = list(self._ledger.load_all())
+            index = {}
+            for job_dir, manifest in entries:
+                if not isinstance(manifest, dict):
+                    continue
+                opaque_id = self._workspace_job_id(job_dir, manifest)
+                if opaque_id in index:
+                    raise ValueError('ledger contains duplicate opaque job IDs')
+                index[opaque_id] = (job_dir, manifest)
+            missing_ids = sorted(set(requested) - set(index))
+            if missing_ids:
+                raise ValueError('one or more job IDs are not present in the server ledger')
+
+            requests, unknown_jobs, budget_rows = [], [], []
+            for job_id in requested:
+                job_dir, manifest = index[job_id]
+                request, missing = self._resource_request(job_dir, manifest, job_id)
+                if request is None:
+                    unknown_jobs.append({'job_id': job_id, 'missing': missing})
+                else:
+                    requests.append(request)
+                budget_rows.append(self._resource_budget_evidence(manifest))
+
+            budget = None
+            if all(status == 'available' for status, _value in budget_rows):
+                values = {round(float(value), 9) for _status, value in budget_rows}
+                if len(values) == 1:
+                    budget_status = 'available'
+                    budget = values.pop()
+                else:
+                    budget_status = 'conflicting'
+            elif any(status == 'invalid' for status, _value in budget_rows):
+                budget_status = 'invalid'
+            else:
+                budget_status = 'unknown'
+
+            history, history_missing = self._resource_history(entries)
+            history_basis_sha256 = self._resource_history_basis_sha256(history)
+            forecast = (forecast_batch(
+                requests, history, remaining_budget_core_hours=budget)
+                if requests else None)
+            status = 'unavailable'
+            if forecast is not None:
+                critical_risks = {'budget_at_risk', 'high_recent_failure_rate'}
+                status = ('at_risk' if critical_risks.intersection(
+                    forecast.get('risk_flags') or []) else 'ready')
+            semantic = {
+                'schema': self._RESOURCE_FORECAST_SCHEMA,
+                'selected_job_ids': sorted(requested),
+                'forecast_semantic_sha256': (
+                    forecast.get('semantic_sha256') if forecast else None),
+                'forecast_jobs': [{
+                    'job_id': item.get('job_id'),
+                    'request': item.get('request'),
+                    'semantic_sha256': item.get('semantic_sha256'),
+                } for item in ((forecast or {}).get('jobs') or [])],
+                'unknown_jobs': sorted(unknown_jobs, key=lambda item: item['job_id']),
+                'history_basis_sha256': history_basis_sha256,
+                'budget_evidence_status': budget_status,
+            }
+            semantic_sha256 = hashlib.sha256(json.dumps(
+                semantic, sort_keys=True, separators=(',', ':'),
+                allow_nan=False).encode('utf-8')).hexdigest()
+            result = {
+                'schema': self._RESOURCE_FORECAST_SCHEMA,
+                'ok': True,
+                'status': status,
+                'forecast': forecast,
+                'display': self._resource_forecast_display(forecast),
+                'unknown_jobs': sorted(unknown_jobs, key=lambda item: item['job_id']),
+                'denominators': {
+                    'selected_jobs': len(requested),
+                    'forecastable_jobs': len(requests),
+                    'unknown_jobs': len(unknown_jobs),
+                    'ledger_entries': len(entries),
+                    'usable_history_entries': len(history),
+                    'unknown_history_entries': len(entries) - len(history),
+                },
+                'history_missing_reasons': history_missing,
+                'history_basis_sha256': history_basis_sha256,
+                'budget_evidence_status': budget_status,
+                'semantic_sha256': semantic_sha256,
+                **boundary,
+                'error': None,
+            }
+            return self._analysis_workbench_public_value(result)
+        except Exception as exc:                         # noqa: BLE001 public seam
+            return {
+                'schema': self._RESOURCE_FORECAST_SCHEMA,
+                'ok': False, 'status': 'unavailable', 'forecast': None,
+                'display': None,
+                'unknown_jobs': [], 'denominators': {},
+                'history_missing_reasons': {},
+                'history_basis_sha256': None, 'semantic_sha256': None,
+                'budget_evidence_status': 'unknown', **boundary,
+                'error': self._workspace_public_text(exc),
+            }
 
     # ── 任务:远程动作(一律先 _resolve 再委托 batch_ops 同名函数) ─────────
     def _delegate(self, name, password, fn):
@@ -1615,6 +2390,117 @@ class Api:
             return {'error': str(e)}
 
     @staticmethod
+    def _job_operation_fingerprint(action, profile, dirs):
+        payload = {
+            'action': str(action or ''),
+            'profile': str(profile or ''),
+            'dirs': sorted({str(item) for item in (dirs or [])}),
+        }
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                         separators=(',', ':')).encode('utf-8')
+        return hashlib.sha256(raw).hexdigest()
+
+    @staticmethod
+    def _submit_batch_with_idempotency(submit_batch, profile, password, dirs,
+                                       trust_new, idempotency_key):
+        """Pass the durable operation id while retaining old injected adapters.
+
+        Production ``batch_ops.submit_batch`` accepts the keyword.  Some
+        extensions and lightweight tests still expose the historical four-
+        argument callable, so signature inspection avoids a retry-on-TypeError
+        pattern that could itself duplicate a remote mutation.
+        """
+        try:
+            parameters = inspect.signature(submit_batch).parameters.values()
+        except (TypeError, ValueError):
+            parameters = ()
+        supports_key = any(
+            parameter.name == 'idempotency_key'
+            or parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        if supports_key:
+            return submit_batch(
+                profile, password, list(dirs), trust_new,
+                idempotency_key=idempotency_key)
+        return submit_batch(profile, password, list(dirs), trust_new)
+
+    def _run_job_operation_once(self, idempotency_key, *, action, profile, dirs, invoke):
+        """Run one mutating remote batch exactly once per client operation key.
+
+        Password discovery and host-key confirmation deliberately happen before this seam.  Their
+        provisional replies must remain retryable with the same key; only an invocation that reaches
+        the mutating batch implementation is reserved and cached.  The cache is process-local because
+        the job manifests remain the durable source of state across restarts.
+        """
+        key = str(idempotency_key or '').strip()
+        if not key:
+            return invoke()
+        if len(key) > 128 or not re.fullmatch(r'[A-Za-z0-9_.:-]{12,128}', key):
+            return {'ok': False, 'busy': False, 'duplicate': False,
+                    'error': '无效的作业操作请求标识'}
+        fingerprint = self._job_operation_fingerprint(action, profile, dirs)
+        now = time.monotonic()
+        with self._job_operation_lock:
+            # 有界缓存避免长期开机时无限增长；正在执行的记录绝不逐出。
+            expired = [item for item, record in self._job_operations.items()
+                       if record.get('state') == 'complete'
+                       and now - float(record.get('finished_at') or now) > 3600]
+            for item in expired:
+                self._job_operations.pop(item, None)
+            if len(self._job_operations) > 256:
+                complete = sorted(
+                    ((item, record) for item, record in self._job_operations.items()
+                     if record.get('state') == 'complete'),
+                    key=lambda pair: float(pair[1].get('finished_at') or 0))
+                for item, _record in complete[:len(self._job_operations) - 256]:
+                    self._job_operations.pop(item, None)
+
+            previous = self._job_operations.get(key)
+            if previous:
+                if previous.get('fingerprint') != fingerprint:
+                    return {'ok': False, 'busy': False, 'duplicate': True,
+                            'idempotency_key': key,
+                            'error': '同一作业操作请求标识不能用于不同的目标'}
+                if previous.get('state') == 'running':
+                    return {'ok': False, 'busy': True, 'duplicate': True,
+                            'idempotency_key': key,
+                            'error': '相同作业操作正在执行，请等待当前请求完成'}
+                replay = copy.deepcopy(previous.get('result') or {})
+                replay['idempotency_key'] = key
+                replay['duplicate'] = True
+                replay['replayed'] = True
+                return replay
+            self._job_operations[key] = {
+                'state': 'running', 'fingerprint': fingerprint, 'started_at': now,
+            }
+
+        try:
+            result = invoke()
+            if not isinstance(result, dict):
+                result = {'ok': False, 'error': '作业操作返回格式无效'}
+        except Exception as exc:                          # noqa: BLE001 public bridge must not raise
+            result = {'ok': False, 'error': str(exc)}
+
+        provisional = (bool(result.get('needs_trust'))
+                       or result.get('error') == 'NEED_PASSWORD'
+                       or bool(result.get('busy')))
+        with self._job_operation_lock:
+            if provisional:
+                self._job_operations.pop(key, None)
+            else:
+                stored = copy.deepcopy(result)
+                stored['idempotency_key'] = key
+                stored['duplicate'] = False
+                stored['replayed'] = False
+                self._job_operations[key] = {
+                    'state': 'complete', 'fingerprint': fingerprint,
+                    'finished_at': time.monotonic(), 'result': stored,
+                }
+                result = stored
+        return result
+
+    @staticmethod
     def _host_key_evidence(value):
         """从连接异常/结果对象或 dict 透传可核对的 SSH 主机证据。"""
         def _get(key):
@@ -1624,10 +2510,13 @@ class Api:
         return {key: str(_get(key) or '')
                 for key in ('fingerprint', 'algorithm', 'host')}
 
-    def submit_jobs(self, dirs, name, password, trust_new=False):
+    def submit_jobs(self, dirs, name, password, trust_new=False, idempotency_key=None):
         return self._delegate(name, password,
-                              lambda prof, pw: self._bo().submit_batch(
-                                  prof, pw, list(dirs), trust_new))
+                              lambda prof, pw: self._run_job_operation_once(
+                                  idempotency_key, action='submit', profile=prof.name,
+                                  dirs=dirs, invoke=lambda: self._submit_batch_with_idempotency(
+                                      self._bo().submit_batch, prof, pw, dirs, trust_new,
+                                      idempotency_key)))
 
     def fetch_jobs(self, dirs, name, password, trust_new=False, files=None):
         def _fetch(prof, pw):
@@ -1636,10 +2525,12 @@ class Api:
             return self._bo().fetch_batch(prof, pw, list(dirs), trust_new, files)
         return self._delegate(name, password, _fetch)
 
-    def continue_jobs(self, dirs, name, password, trust_new=False):
+    def continue_jobs(self, dirs, name, password, trust_new=False, idempotency_key=None):
         return self._delegate(name, password,
-                              lambda prof, pw: self._bo().continue_batch(
-                                  prof, pw, list(dirs), trust_new))
+                              lambda prof, pw: self._run_job_operation_once(
+                                  idempotency_key, action='continue', profile=prof.name,
+                                  dirs=dirs, invoke=lambda: self._bo().continue_batch(
+                                      prof, pw, list(dirs), trust_new)))
 
     def refresh_status(self, name, password, trust_new=False):
         """Refresh one profile without racing the background supervisor."""
@@ -2333,7 +3224,7 @@ class Api:
         raw_path = str(reference_project_path or '').strip()
         if not raw_path:
             raise ValueError('请选择已导入并收敛的 Li-S 参考结果项目')
-        project = self._adsorption.load_project(raw_path)
+        project = self._load_project_for_path(raw_path)
         if project is None:
             raise ValueError('Li-S 参考项目不存在或 project.yaml 无法读取')
         jobs = dict(project.get('species_ref_jobs') or {})
@@ -2735,8 +3626,56 @@ class Api:
                 'source_unchanged': True, 'target': 'managed_project_copy'}
 
     def proj_prepare_lis(self, name, slab_path, config_items, incar_path,
-                         out_root, reference_project_path, method_confirmation=None,
+                         out_root, reference_project_id, method_confirmation=None,
                          member_incars=None, repair_request=None):
+        """Prepare Li-S inputs using one registry-owned opaque reference ID."""
+        try:
+            reference = self._resolve_project_id(reference_project_id)
+        except Exception:                                 # noqa: BLE001 public identity seam
+            return self._project_identity_failure(
+                project_id=None, name=None, reference_species=[],
+                advisories=[], warnings=[], method_check=None,
+                needs_method_confirmation=False, repair_plan=None,
+                needs_repair_decision=False)
+        result = self._call_with_project_bindings(
+            [reference],
+            lambda: self._proj_prepare_lis_for_reference_path(
+                name, slab_path, config_items, incar_path, out_root,
+                reference['path'], method_confirmation=method_confirmation,
+                member_incars=member_incars, repair_request=repair_request),
+            failure={
+                'project_id': None, 'name': None, 'reference_species': [],
+                'advisories': [], 'warnings': [], 'method_check': None,
+                'needs_method_confirmation': False, 'repair_plan': None,
+                'needs_repair_decision': False,
+            })
+        if result.get('error_code') == 'identity_mismatch':
+            return result
+        locator = str(result.pop('project_path', '') or '')
+        result.pop('job_dirs', None)
+        result.pop('preparation', None)
+        result['project_id'] = None
+        result['name'] = None
+        records = []
+        if locator:
+            try:
+                project = self._load_project_for_path(locator)
+                if isinstance(project, dict):
+                    result['project_id'] = self._workspace_project_id(locator, project)
+                    result['name'] = str(project.get('name') or name or '')
+                    records.append({
+                        'project_id': result['project_id'],
+                        'path': self._canonical_project_path(locator),
+                        'project': project,
+                    })
+            except Exception:                             # noqa: BLE001 result remains fail-closed
+                pass
+        return self._project_locator_projection(result, records)
+
+    def _proj_prepare_lis_for_reference_path(
+            self, name, slab_path, config_items, incar_path,
+            out_root, reference_project_path, method_confirmation=None,
+            member_incars=None, repair_request=None):
         """用既有参考能与每个结构同目录的 INCAR 建立可直接提交的 Li-S 项目。"""
         empty = {'ok': False, 'project_path': None, 'job_dirs': [],
                  'reference_species': [], 'advisories': [], 'warnings': [],
@@ -3343,7 +4282,7 @@ class Api:
                 'method_check': method_check,
             }
             if os.path.exists(target):
-                existing = self._adsorption.load_project(target)
+                existing = self._load_project_for_path(target)
                 old_hash = ((existing or {}).get('preparation') or {}).get('request_sha256')
                 if existing is not None and old_hash == request_sha256:
                     members = existing.get('members') or {}
@@ -3397,13 +4336,34 @@ class Api:
         except Exception as e:                            # noqa: BLE001
             return {**empty, 'error': str(e)}
 
-    def submit_project_with_resources(self, project_path, profile_name, cores,
+    def submit_project_with_resources(self, project_id, profile_name, cores,
                                       walltime, password=None, trust_new=False):
+        """Submit one registered project selected by opaque identity."""
+        try:
+            record = self._resolve_project_id(project_id)
+        except Exception:                                 # noqa: BLE001 public identity seam
+            return self._project_identity_failure(
+                results=[], submitted=[], skipped=[], resources={},
+                needs_trust=False)
+        result = self._call_with_project_bindings(
+            [record],
+            lambda: self._submit_project_with_resources_for_path(
+                record['path'], profile_name, cores, walltime,
+                password=password, trust_new=trust_new),
+            failure={
+                'results': [], 'submitted': [], 'skipped': [],
+                'resources': {}, 'needs_trust': False,
+            })
+        return self._project_public_result(result)
+
+    def _submit_project_with_resources_for_path(
+            self, project_path, profile_name, cores,
+            walltime, password=None, trust_new=False):
         """按本次选择的核数/墙时提交项目，不改集群 profile 的持久配置。"""
         base = {'ok': False, 'results': [], 'submitted': [], 'skipped': [],
                 'resources': {}, 'needs_trust': False}
         try:
-            project = self._adsorption.load_project(str(project_path or '').strip())
+            project = self._load_project_for_path(str(project_path or '').strip())
             if project is None:
                 raise ValueError('项目不存在或 project.yaml 无法读取')
             try:
@@ -3692,7 +4652,7 @@ class Api:
                             result['project'], summary)
                         report_dir = os.path.join(project_root, 'report')
                         report_formats = self._available_report_formats()
-                        generated = self.proj_report_bundle(
+                        generated = self._proj_report_bundle_for_path(
                             project_path, report_dir,
                             report_formats, final=True,
                             stem=f'{name}_吸附能评估报告')
@@ -3713,53 +4673,261 @@ class Api:
             result.setdefault('ok', True)
             result.setdefault('imported', [])
             result.setdefault('summary', {})
-            result['error'] = None
-            return result
+            project = result.get('project') if isinstance(
+                result.get('project'), dict) else None
+            locator = str(result.get('project_path') or '')
+            project_id = (self._workspace_project_id(locator, project)
+                          if project is not None and locator else None)
+            public = {
+                'ok': bool(result.get('ok')),
+                'project_id': project_id,
+                'name': str((project or {}).get('name') or name or '') or None,
+                'imported_count': len(result.get('imported') or []),
+                'summary': result.get('summary') or {},
+                'warnings': list(result.get('warnings') or []),
+                'blocking_reasons': list(result.get('blocking_reasons') or []),
+                'auto_report': result.get('auto_report'),
+                'auto_report_reason': result.get('auto_report_reason'),
+                'auto_report_blocked': result.get('auto_report_blocked'),
+                'error': None,
+            }
+            if project_id and project is not None:
+                return self._project_locator_projection(public, [{
+                    'project_id': project_id,
+                    'path': self._canonical_project_path(locator),
+                    'project': project,
+                }])
+            return self._project_public_result(public)
         except Exception as e:                            # noqa: BLE001
-            return {'ok': False, 'project_path': None, 'project': None,
-                    'imported': [], 'summary': {}, 'error': str(e)}
+            return {'ok': False, 'project_id': None, 'name': None,
+                    'imported_count': 0, 'summary': {},
+                    'error': self._workspace_public_text(e)}
+
+    # -- Phase 3 project clone / move / copied-folder adoption -------------
+    def _project_lifecycle_backend(self):
+        if self._project_lifecycle_service is None:
+            from vcstudio.project.project_lifecycle import ProjectLifecycleService
+            registry_path = getattr(self._adsorption, 'default_registry_path', None)
+            if not callable(registry_path):
+                raise RuntimeError('Project registry location is unavailable')
+            ledger_path = getattr(self._ledger, 'default_ledger_path', None)
+            self._project_lifecycle_service = ProjectLifecycleService(
+                registry_path(),
+                ledger_path=(ledger_path() if callable(ledger_path) else None))
+        return self._project_lifecycle_service
+
+    def _project_lifecycle_prune(self):
+        now = time.monotonic()
+        for store in (self._project_lifecycle_selections,
+                      self._project_lifecycle_plans):
+            expired = [key for key, item in store.items()
+                       if now - float(item.get('created_at') or 0) > 900]
+            for key in expired:
+                store.pop(key, None)
+            overflow = max(0, len(store) - 64)
+            if overflow:
+                oldest = sorted(
+                    store,
+                    key=lambda key: float(store[key].get('created_at') or 0),
+                )[:overflow]
+                for key in oldest:
+                    store.pop(key, None)
+
+    @staticmethod
+    def _project_lifecycle_leaf(value):
+        name = str(value or '').strip()
+        if (not name or name in {'.', '..'} or len(name) > 96
+                or name.endswith((' ', '.'))
+                or re.search(r'[<>:"/\\|?*\x00-\x1f]', name)):
+            raise ValueError('Destination folder name is invalid')
+        reserved = {'CON', 'PRN', 'AUX', 'NUL',
+                    *(f'COM{i}' for i in range(1, 10)),
+                    *(f'LPT{i}' for i in range(1, 10))}
+        if name.split('.', 1)[0].upper() in reserved:
+            raise ValueError('Destination folder name is reserved by Windows')
+        return name
+
+    def _project_lifecycle_registered_source(self, project_id):
+        record = self._resolve_project_id(project_id)
+        return self._call_with_project_bindings(
+            [record], lambda: record['path'])
+
+    def proj_lifecycle_select(self, kind):
+        """Create an opaque, short-lived server selection for lifecycle use.
+
+        The browser never receives the selected absolute path.  In particular,
+        copied-folder adoption can only inspect a folder returned by the native
+        server-side picker; a browser-supplied identity or locator is ignored.
+        """
+        selection_kind = str(kind or '').strip().lower()
+        allowed = {'adopt_source', 'clone_destination', 'move_destination'}
+        if selection_kind not in allowed:
+            return {'ok': False, 'selection_token': None, 'selection': None,
+                    'error': 'Unsupported project lifecycle selection'}
+        try:
+            picked = self.pick_dir()
+            path = str((picked or {}).get('path') or '').strip()
+            if not path:
+                return {'ok': False, 'cancelled': True, 'selection_token': None,
+                        'selection': None, 'error': None}
+            canonical = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+            if not os.path.isdir(canonical):
+                raise ValueError('The selected folder is unavailable')
+            contains_project = os.path.isfile(os.path.join(canonical, 'project.yaml'))
+            if selection_kind == 'adopt_source' and not contains_project:
+                raise ValueError('The selected folder does not contain project.yaml')
+            token = uuid.uuid4().hex
+            label = os.path.basename(os.path.normpath(canonical)) or 'Selected folder'
+            label = re.sub(r'[\x00-\x1f]+', '', label)[:80] or 'Selected folder'
+            with self._project_lifecycle_lock:
+                self._project_lifecycle_prune()
+                self._project_lifecycle_selections[token] = {
+                    'kind': selection_kind, 'path': canonical, 'label': label,
+                    'contains_project': contains_project,
+                    'created_at': time.monotonic(),
+                }
+            return {
+                'ok': True,
+                'cancelled': False,
+                'selection_token': token,
+                'selection': {'label': label,
+                              'contains_project': contains_project},
+                'error': None,
+            }
+        except Exception as e:                            # noqa: BLE001 JSON-safe bridge
+            return {'ok': False, 'cancelled': False, 'selection_token': None,
+                    'selection': None,
+                    'error': self._workspace_public_text(e) or
+                             'Project folder selection failed'}
+
+    def proj_lifecycle_preflight(self, action, project_id=None,
+                                 selection_token=None, target_name=None,
+                                 identity_mode='remint'):
+        """Return a path-free dry-run and an opaque one-use operation token."""
+        lifecycle_action = str(action or '').strip().lower()
+        token = str(selection_token or '').strip().lower()
+        if lifecycle_action not in {'clone', 'move', 'adopt'}:
+            return {'ok': False, 'ready': False, 'operation_token': None,
+                    'conflicts': [], 'warnings': [],
+                    'error': 'Unsupported project lifecycle action'}
+        if not re.fullmatch(r'[a-f0-9]{32}', token):
+            return {'ok': False, 'ready': False, 'operation_token': None,
+                    'conflicts': [], 'warnings': [],
+                    'error': 'The server folder selection is missing or expired'}
+        try:
+            with self._project_lifecycle_lock:
+                self._project_lifecycle_prune()
+                selection = copy.deepcopy(
+                    self._project_lifecycle_selections.get(token))
+            expected_kind = ('adopt_source' if lifecycle_action == 'adopt'
+                             else f'{lifecycle_action}_destination')
+            if not selection or selection.get('kind') != expected_kind:
+                raise ValueError('The server folder selection is missing or expired')
+            backend = self._project_lifecycle_backend()
+            if lifecycle_action == 'adopt':
+                mode = str(identity_mode or 'remint').strip().lower()
+                if mode not in {'remint', 'preserve'}:
+                    raise ValueError('Identity mode must be remint or preserve')
+                plan = backend.preflight_adopt(selection['path'], mode)
+            else:
+                record = self._resolve_project_id(project_id)
+                leaf = self._project_lifecycle_leaf(target_name)
+                destination = os.path.join(selection['path'], leaf)
+                plan = self._call_with_project_bindings(
+                    [record],
+                    lambda: (
+                        backend.preflight_clone(record['path'], destination)
+                        if lifecycle_action == 'clone'
+                        else backend.preflight_move(record['path'], destination)))
+            public = plan.public_summary()
+            public['selection'] = {'label': selection.get('label') or 'Selected folder'}
+            public['operation_token'] = None
+            if plan.ready:
+                operation_token = uuid.uuid4().hex
+                with self._project_lifecycle_lock:
+                    self._project_lifecycle_prune()
+                    self._project_lifecycle_plans[operation_token] = {
+                        'plan': plan, 'created_at': time.monotonic(),
+                    }
+                public['operation_token'] = operation_token
+            return public
+        except Exception as e:                            # noqa: BLE001 dry-run never raises to JS
+            return {
+                'ok': False, 'ready': False, 'action': lifecycle_action,
+                'operation_token': None, 'project': None, 'target': None,
+                'identity_mode': (str(identity_mode or '').strip().lower() or None),
+                'impact': None, 'conflicts': [], 'warnings': [],
+                'error': self._workspace_public_text(e) or
+                         'Project lifecycle preflight failed',
+            }
+
+    def proj_lifecycle_apply(self, operation_token):
+        """Consume one server-held plan; no browser path or identity is accepted."""
+        token = str(operation_token or '').strip().lower()
+        if not re.fullmatch(r'[a-f0-9]{32}', token):
+            return {'ok': False, 'action': None, 'project': None,
+                    'error_code': 'operation_token_invalid',
+                    'requires_manual_recovery': False,
+                    'error': 'The lifecycle preflight is missing or expired'}
+        with self._project_lifecycle_lock:
+            self._project_lifecycle_prune()
+            stored = self._project_lifecycle_plans.pop(token, None)
+        if not stored:
+            return {'ok': False, 'action': None, 'project': None,
+                    'error_code': 'operation_token_expired',
+                    'requires_manual_recovery': False,
+                    'error': 'The lifecycle preflight is missing, expired, or already used'}
+        plan = stored['plan']
+        try:
+            result = self._project_lifecycle_backend().apply(plan)
+            project = result.get('project') if isinstance(result, dict) else None
+            locator = str((result or {}).get('project_path') or '')
+            if not isinstance(project, dict) or not locator:
+                raise RuntimeError('Lifecycle service returned an invalid result')
+            project_id = self._workspace_project_id(locator, project)
+            return {
+                'ok': True,
+                'action': plan.action,
+                'project': {
+                    'id': project_id,
+                    'project_id': project_id,
+                    'name': str(project.get('name') or ''),
+                },
+                'identity_mode': plan.identity_mode,
+                'registry_updated': True,
+                'jobs_ledger_updated': True,
+                'jobs_updated': int(result.get('jobs_updated') or 0),
+                'error_code': None,
+                'requires_manual_recovery': False,
+                'error': None,
+            }
+        except Exception as e:                            # noqa: BLE001 one-use failure envelope
+            code = str(getattr(e, 'code', '') or 'lifecycle_apply_failed')
+            return {
+                'ok': False, 'action': getattr(plan, 'action', None),
+                'project': None, 'identity_mode': getattr(plan, 'identity_mode', None),
+                'registry_updated': False, 'jobs_ledger_updated': False,
+                'jobs_updated': 0, 'error_code': code,
+                'requires_manual_recovery': code == 'partial_rollback',
+                'error': self._workspace_public_text(e) or
+                         'Project lifecycle operation failed',
+            }
 
     def proj_list(self):
-        """项目注册表 → 基本成员数 + 可复用 Li-S 参考物种。
-
-        n_members 内联算(清洁表面 + 气相参考 + 构型族,镜像 project_tab._member_dirs):
-        列表渲染绝不触碰 report_full(避免仅为计数拖入 matplotlib,matplotlib 坏时也不
-        整体失败)。畸形/已移动的 project.yaml(load_project→None)或坏成员静默跳过。
-        """
+        """Return the path-free public projection of the private registry."""
         try:
-            projects = []
-            for pp in self._adsorption.list_projects():
-                try:
-                    proj = self._adsorption.load_project(pp)
-                    if proj is None:
-                        continue
-                    mem = proj.get('members') or {}
-                    member_dirs = self._project_member_dirs(proj)
-                    reference_species = sorted(
-                        str(species) for species in (proj.get('species_ref_jobs') or {})
-                        if str(species).strip())
-                    n_done = sum(
-                        1 for member_dir in member_dirs
-                        if ((self._manifest.load_manifest(member_dir) or {}).get('state') == 'DONE'))
-                    projects.append({
-                        'path': pp,
-                        # Phase B canonical shell/deep links use this opaque id;
-                        # local paths remain an internal action locator only.
-                        'project_id': self._workspace_project_id(pp, proj),
-                        'project_uuid': proj.get('project_uuid') or None,
-                        'name': proj.get('name', '') or '',
-                        'n_members': len(member_dirs),
-                        'n_done': n_done,
-                        'reference_mode': ('species' if reference_species else
-                                           'single' if mem.get('gas_ref') else 'none'),
-                        'reference_species': reference_species,
-                        'n_species_refs': len(reference_species),
-                    })
-                except Exception:                         # noqa: BLE001 单个坏项目不拖垮全表
-                    continue
-            return {'projects': projects, 'error': None}
-        except Exception as e:                            # noqa: BLE001
-            return {'projects': [], 'error': str(e)}
+            snapshot = self._project_registry_snapshot()
+            ambiguous = len(snapshot['duplicate_ids'])
+            unreadable = len(snapshot['failures'])
+            error = None
+            if ambiguous or unreadable:
+                error = (
+                    f'{ambiguous} ambiguous and {unreadable} unreadable registered '
+                    'project identities were excluded.')
+            return {'projects': snapshot['public_rows'], 'error': error}
+        except Exception:                                 # noqa: BLE001 public registry seam
+            return {'projects': [],
+                    'error': 'The registered project list is unavailable.'}
 
     def proj_create(self, name, slab_path, config_paths, incar_path, gas_path,
                     out_root):
@@ -3791,8 +4959,9 @@ class Api:
             if gas and not os.path.isfile(gas):
                 errs.append('气相参考文件不存在')
             if errs:
-                return {'ok': False, 'project_path': None, 'advisories': [],
-                        'warnings': [], 'error': ';'.join(errs)}
+                return {'ok': False, 'project_id': None, 'name': None,
+                        'advisories': [], 'warnings': [],
+                        'error': self._workspace_public_text(';'.join(errs))}
             lib = ''
             try:
                 lib = self._config.load_config().get('potcar_lib_root', '') or ''
@@ -3815,14 +4984,32 @@ class Api:
                     warnings.append(f'{member}:{w}')
             for member, msg in (res.get('errors') or []):
                 warnings.append(f'{member}:{msg}')
-            return {'ok': bool(res.get('ok')),
-                    'project_path': res.get('project_path'),
-                    'advisories': advisories, 'warnings': warnings, 'error': None}
+            project = res.get('project') if isinstance(res.get('project'), dict) else None
+            locator = str(res.get('project_path') or '')
+            project_id = (self._workspace_project_id(locator, project)
+                          if project is not None and locator else None)
+            return self._project_public_result({
+                'ok': bool(res.get('ok')),
+                'project_id': project_id,
+                'name': str((project or {}).get('name') or name or '') or None,
+                'advisories': advisories, 'warnings': warnings, 'error': None,
+            })
         except Exception as e:                            # noqa: BLE001
-            return {'ok': False, 'project_path': None, 'advisories': [],
-                    'warnings': [], 'error': str(e)}
+            return {'ok': False, 'project_id': None, 'name': None,
+                    'advisories': [], 'warnings': [],
+                    'error': self._workspace_public_text(e)}
 
-    def proj_delta(self, path):
+    def proj_delta(self, project_id):
+        try:
+            record = self._resolve_project_id(project_id)
+        except Exception:                                 # noqa: BLE001 public identity seam
+            return self._project_identity_failure(rows=[], note='')
+        result = self._call_with_project_bindings(
+            [record], lambda: self._proj_delta_for_path(record['path']),
+            failure={'rows': [], 'note': ''})
+        return self._project_public_result(result)
+
+    def _proj_delta_for_path(self, path):
         """项目 ΔE 汇总(镜像 project_tab._on_delta)。
 
         rows 忠实透传 delta_e_rows 的字段(name/state/e_config/delta_e/note);ΔE 门控语义
@@ -3830,7 +5017,7 @@ class Api:
         表面/气相参考状态(镜像 _on_delta 头部两行)。
         """
         try:
-            proj = self._adsorption.load_project((path or '').strip())
+            proj = self._load_project_for_path((path or '').strip())
             if proj is None:
                 return {'ok': False, 'rows': [], 'note': '',
                         'error': '项目不存在或 project.yaml 已被移动'}
@@ -3873,10 +5060,21 @@ class Api:
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'rows': [], 'note': '', 'error': str(e)}
 
-    def proj_export_csv(self, path, save_to):
+    def proj_export_csv(self, project_id, save_to):
+        try:
+            record = self._resolve_project_id(project_id)
+        except Exception:                                 # noqa: BLE001 public identity seam
+            return self._project_identity_failure(file=None)
+        result = self._call_with_project_bindings(
+            [record],
+            lambda: self._proj_export_csv_for_path(record['path'], save_to),
+            failure={'file': None})
+        return self._project_public_result(result)
+
+    def _proj_export_csv_for_path(self, path, save_to):
         """ΔE 表导出 CSV(镜像 project_tab._on_export;utf-8-sig 语义在 adsorption 层)。"""
         try:
-            proj = self._adsorption.load_project((path or '').strip())
+            proj = self._load_project_for_path((path or '').strip())
             if proj is None:
                 return {'ok': False, 'file': None,
                         'error': '项目不存在或 project.yaml 已被移动'}
@@ -3889,7 +5087,24 @@ class Api:
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'file': None, 'error': str(e)}
 
-    def proj_report(self, path, save_to, final=False):
+    def proj_report(self, project_id, save_to, final=False):
+        try:
+            record = self._resolve_project_id(project_id)
+        except Exception:                                 # noqa: BLE001 public identity seam
+            return self._project_identity_failure(
+                file=None, files=[], kind=None, scientific_status=None,
+                marker=None)
+        result = self._call_with_project_bindings(
+            [record],
+            lambda: self._proj_report_for_path(
+                record['path'], save_to, final=final),
+            failure={
+                'file': None, 'files': [], 'kind': None,
+                'scientific_status': None, 'marker': None,
+            })
+        return self._project_public_result(result)
+
+    def _proj_report_for_path(self, path, save_to, final=False):
         """Compatibility adapter for the canonical one-snapshot report bundle.
 
         The historical API accepts one HTML filename and returns ``files`` as a
@@ -3906,7 +5121,7 @@ class Api:
             requested_path = os.path.abspath(os.path.normpath(out))
             out_dir = os.path.dirname(requested_path) or os.getcwd()
             stem = os.path.splitext(os.path.basename(requested_path))[0]
-            bundle = self.proj_report_bundle(
+            bundle = self._proj_report_bundle_for_path(
                 path, out_dir, formats=('html',), final=bool(final), stem=stem)
             bundle_files = (bundle.get('files')
                             if isinstance(bundle.get('files'), dict) else {})
@@ -4963,7 +6178,7 @@ class Api:
         project_path = str(path or '').strip()
         if not project_path:
             raise ValueError('未指定项目路径')
-        project = self._adsorption.load_project(project_path)
+        project = self._load_project_for_path(project_path)
         if project is None:
             raise FileNotFoundError('项目不存在或 project.yaml 已被移动')
         root = str(project.get('root') or '').strip()
@@ -5703,18 +6918,236 @@ class Api:
             revision=revision,
         )
 
-    def report_workbench_bootstrap(self, path, preset_id=None):
-        return self._reports().bootstrap(path, preset_id=preset_id)
+    @staticmethod
+    def _report_workbench_error(error):
+        from vcstudio.project.report_insights import redact
 
-    def report_workbench_preview(self, path, request=None):
-        return self._reports().preview(path, request)
+        return str(redact(str(error)))
 
-    def report_workbench_publish(self, path, out_dir, preview_id, expected=None):
-        return self._reports().publish(
-            path, out_dir, preview_id, expected, public=True, record_artifact=True)
+    def _report_workbench_project_path(self, project_id):
+        """Resolve only a unique registry-owned opaque project identity."""
+        return self._report_workbench_project_record(project_id)['path']
 
-    def report_workbench_history(self, path):
-        return self._reports().history(path)
+    def _report_workbench_project_record(self, project_id):
+        record = self._resolve_project_id(project_id)
+        canonical = record['path']
+        if not os.path.isfile(canonical):
+            raise ValueError('registered project is unavailable')
+        return record
+
+    def _workbench_destination_registry(self):
+        if self._report_workbench_destinations is None:
+            from vcstudio.project.report_insights import OpaqueDestinationRegistry
+
+            self._report_workbench_destinations = OpaqueDestinationRegistry(
+                schema='vcstudio.report-workbench-destination/v1',
+                purpose='report-workbench',
+                token_prefix='report-workbench.',
+            )
+        return self._report_workbench_destinations
+
+    def report_workbench_bootstrap(self, project_id, preset_id=None):
+        try:
+            record = self._report_workbench_project_record(project_id)
+            return self._call_with_project_bindings(
+                [record], lambda: self._reports().bootstrap(
+                    record['path'], preset_id=preset_id))
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return {
+                'schema': 'vcstudio.report-workbench-bootstrap/v1',
+                'ok': False, 'project_id': None, 'project': None,
+                'catalog': None, 'report_spec': None, 'status': None,
+                'history': None, 'error': self._report_workbench_error(exc),
+            }
+
+    def report_workbench_preview(self, project_id, request=None):
+        try:
+            record = self._report_workbench_project_record(project_id)
+            records = self._project_records_for_request(record, request)
+            return self._call_with_project_bindings(
+                records, lambda: self._reports().preview(
+                    record['path'], request))
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return {
+                'schema': 'vcstudio.report-preview/v1', 'ok': False,
+                'project_id': None, 'preview_id': None, 'preview_token': None,
+                'artifact_status': 'failed', 'error': self._report_workbench_error(exc),
+            }
+
+    def report_workbench_pick_destination(self, project_id):
+        """Select a directory natively and expose only a project-bound token."""
+
+        schema = 'vcstudio.report-workbench-destination/v1'
+        try:
+            identifier = str(project_id or '').strip()
+            record = self._report_workbench_project_record(identifier)
+
+            def select_destination():
+                if self._dialog_fn is not None:
+                    path = self._dialog_fn('dir')
+                else:
+                    import webview
+
+                    win = webview.windows[0] if webview.windows else None
+                    selected = (win.create_file_dialog(webview.FOLDER_DIALOG)
+                                if win else None)
+                    path = selected[0] if selected else None
+                if not path:
+                    return {
+                        'schema': schema, 'ok': True, 'cancelled': True,
+                        'destination_token': None, 'display_name': None,
+                        'error': None,
+                    }
+                selected = self._workbench_destination_registry().register(
+                    path, binding=identifier)
+                return {'ok': True, 'cancelled': False, 'error': None, **selected}
+
+            return self._call_with_project_bindings(
+                [record], select_destination)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return {
+                'schema': schema, 'ok': False, 'cancelled': False,
+                'destination_token': None, 'display_name': None,
+                'error': self._report_workbench_error(exc),
+            }
+
+    def report_workbench_publish(self, project_id, destination_token,
+                                 preview_id, expected=None):
+        try:
+            identifier = str(project_id or '').strip()
+            record = self._report_workbench_project_record(identifier)
+
+            def publish():
+                if self._report_workbench_destinations is None:
+                    raise ValueError('report destination has not been selected')
+                out_dir = self._report_workbench_destinations.consume(
+                    destination_token, expected_binding=identifier)
+                return self._reports().publish(
+                    record['path'], out_dir, preview_id, expected,
+                    public=True, record_artifact=True)
+
+            return self._call_with_project_bindings([record], publish)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return {
+                'schema': 'vcstudio.report-publish/v1', 'ok': False,
+                'project_id': None, 'preview_id': str(preview_id or '') or None,
+                'kind': None, 'artifact_status': 'failed', 'files': {},
+                'error': self._report_workbench_error(exc),
+            }
+
+    def report_workbench_history(self, project_id):
+        try:
+            record = self._report_workbench_project_record(project_id)
+            return self._call_with_project_bindings(
+                [record], lambda: self._reports().history(record['path']))
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return {
+                'schema': 'vcstudio.report-history/v1', 'ok': False,
+                'project_id': None, 'generation': 0, 'revisions': [],
+                'error': self._report_workbench_error(exc),
+            }
+
+    def _report_insight_path(self, project_id):
+        """Resolve one workspace opaque identity entirely on the server."""
+        return self._report_insight_record(project_id)['path']
+
+    def _report_insight_record(self, project_id):
+        return self._resolve_project_id(project_id)
+
+    @staticmethod
+    def _report_insight_failure(schema, exc, **extra):
+        from vcstudio.project.report_insights import StaleRevisionError, redact
+
+        status = ('stale' if isinstance(exc, StaleRevisionError) else
+                  'blocked' if isinstance(exc, FileExistsError) else
+                  'unavailable')
+        result = {
+            'schema': schema, 'ok': False, 'status': status,
+            'project_id': None, 'error': redact(str(exc)),
+        }
+        result.update(extra)
+        return result
+
+    def report_revision_scientific_diff(self, project_id, left_revision_id,
+                                        right_revision_id):
+        """Compare two revalidated frozen revisions, never timestamps alone."""
+        from vcstudio.project.report_insights import DIFF_SCHEMA, scientific_diff
+
+        try:
+            record = self._report_insight_record(project_id)
+            return self._call_with_project_bindings(
+                [record], lambda: scientific_diff(
+                    self._reports(), record['path'], left_revision_id,
+                    right_revision_id))
+        except Exception as exc:                         # noqa: BLE001 public seam
+            return self._report_insight_failure(
+                DIFF_SCHEMA, exc, left=None, right=None, changed=None)
+
+    def report_evidence_graph(self, project_id, revision_id):
+        """Project a path-free graph from one revalidated frozen bundle."""
+        from vcstudio.project.report_insights import GRAPH_SCHEMA, evidence_graph
+
+        try:
+            record = self._report_insight_record(project_id)
+            return self._call_with_project_bindings(
+                [record], lambda: evidence_graph(
+                    self._reports(), record['path'], revision_id))
+        except Exception as exc:                         # noqa: BLE001 public seam
+            return self._report_insight_failure(
+                GRAPH_SCHEMA, exc, revision=None, nodes=[], edges=[],
+                missing_links=[])
+
+    def report_capsule_pick_destination(self):
+        """Open a server-side directory picker and return only an opaque token."""
+        from vcstudio.project.report_insights import (
+            DESTINATION_SCHEMA,
+            CapsuleDestinations,
+        )
+
+        try:
+            if self._dialog_fn is not None:
+                path = self._dialog_fn('dir')
+            else:
+                import webview                         # delayed optional dependency
+
+                result = webview.windows[0].create_file_dialog(
+                    webview.FOLDER_DIALOG)
+                path = result[0] if result else None
+            if not path:
+                return {
+                    'schema': DESTINATION_SCHEMA, 'ok': True,
+                    'cancelled': True, 'destination_token': None,
+                    'display_name': None, 'error': None,
+                }
+            if self._report_insight_destinations is None:
+                self._report_insight_destinations = CapsuleDestinations()
+            selected = self._report_insight_destinations.register(path)
+            return {'ok': True, 'cancelled': False, 'error': None, **selected}
+        except Exception as exc:                         # noqa: BLE001 public seam
+            return self._report_insight_failure(
+                DESTINATION_SCHEMA, exc, cancelled=False,
+                destination_token=None, display_name=None)
+
+    def report_capsule_export(self, project_id, revision_id,
+                              destination_token):
+        """Export a deterministic capsule; destination_token is single-use."""
+        from vcstudio.project.report_insights import CAPSULE_SCHEMA, export_capsule
+
+        try:
+            record = self._report_insight_record(project_id)
+
+            def export():
+                if self._report_insight_destinations is None:
+                    raise ValueError('capsule destination has not been selected')
+                destination = self._report_insight_destinations.consume(
+                    destination_token)
+                return export_capsule(
+                    self._reports(), record['path'], revision_id, destination)
+
+            return self._call_with_project_bindings([record], export)
+        except Exception as exc:                         # noqa: BLE001 public seam
+            return self._report_insight_failure(
+                CAPSULE_SCHEMA, exc, revision=None, file=None)
 
     # ── Phase D:分析配置工作台 API ───────────────────────────────────────
     _ANALYSIS_BOOTSTRAP_SCHEMA = 'vcstudio.analysis-workbench-bootstrap/v1'
@@ -5761,34 +7194,12 @@ class Api:
 
     def _analysis_workbench_project_index(self):
         """Resolve registry IDs to paths internally and return a path-free list."""
-        listing = self.proj_list()
-        if not isinstance(listing, dict) or listing.get('error'):
-            raise RuntimeError(
-                str((listing or {}).get('error') or '项目注册表不可用'))
-        index = {}
-        projects = []
-        for raw in listing.get('projects') or []:
-            if not isinstance(raw, dict):
-                continue
-            project_id = str(raw.get('project_id') or '').strip()
-            path = str(raw.get('path') or '').strip()
-            if not project_id or not path:
-                continue
-            if project_id in index:
-                raise RuntimeError(
-                    f'项目注册表存在重复 opaque project_id：{project_id}')
-            index[project_id] = path
-            projects.append({
-                'project_id': project_id,
-                'name': str(raw.get('name') or ''),
-                'n_members': int(raw.get('n_members') or 0),
-                'n_done': int(raw.get('n_done') or 0),
-                'reference_mode': str(raw.get('reference_mode') or 'none'),
-                'reference_species': [
-                    str(item) for item in raw.get('reference_species') or []],
-                'n_species_refs': int(raw.get('n_species_refs') or 0),
-            })
-        return index, projects
+        snapshot = self._project_registry_snapshot()
+        if snapshot['duplicate_ids']:
+            raise RuntimeError('项目注册表存在重复 opaque project_id')
+        return ({record['project_id']: record['path']
+                 for record in snapshot['records']},
+                copy.deepcopy(snapshot['public_rows']))
 
     @classmethod
     def _analysis_preferences_failure(cls, error, **extra):
@@ -5878,7 +7289,8 @@ class Api:
             raise ValueError('comparison_project_ids 不得包含重复项目身份')
 
     @staticmethod
-    def _analysis_workbench_unavailable_view(spec, reason):
+    def _analysis_workbench_unavailable_view(
+            spec, reason, *, capability_status='unavailable', next_action=None):
         """Describe a registered capability without inventing parsed values."""
         message = str(reason or '该分析尚未接入实时解析器')
         payload = {
@@ -5887,11 +7299,14 @@ class Api:
             'spec': spec.to_dict(),
             'spec_sha256': spec.semantic_sha256,
             'scientific_status': 'unavailable',
+            'capability_status': capability_status,
             'available': False,
             'rows': [],
+            'missing': ([message] if capability_status == 'missing_prerequisite' else []),
             'blocking': [message],
             'warnings': [],
             'reason': message,
+            'next_action': str(next_action or 'Complete the listed prerequisite and refresh.'),
             'denominator': {
                 'available_results': 0,
                 'visible_rows': 0,
@@ -5905,6 +7320,304 @@ class Api:
         payload['data_fingerprint'] = hashlib.sha256(encoded).hexdigest()
         return payload
 
+    def _analysis_workbench_targets(self, context):
+        """Resolve only server-ledger members and manifest-linked descendants."""
+        from vcstudio.project.analysis_sources import resolve_project_targets
+
+        try:
+            ledger_entries = list(self._ledger.load_all())
+        except Exception:                                 # noqa: BLE001 fail closed
+            ledger_entries = []
+        return resolve_project_targets(
+            context['project'], ledger_entries,
+            manifest_loader=self._manifest.load_manifest,
+            opaque_id=lambda path, manifest: self._workspace_job_id(path, manifest),
+        )
+
+    @staticmethod
+    def _analysis_workbench_parser_identities():
+        from vcstudio import __version__
+        from vcstudio.project import task_analysis
+
+        routes = {
+            'dos_pdos': ('vcstudio.project.task_analysis', 'analyze_dos'),
+            'bands': ('vcstudio.project.bands', 'parse_bands'),
+            'workfunction': ('vcstudio.project.workfunction', 'work_function'),
+            'bader': ('vcstudio.project.task_analysis', 'analyze_bader'),
+            'chgdiff': ('vcstudio.project.task_analysis', 'analyze_chgdiff'),
+            'elf': ('vcstudio.project.elf', 'summarize_elfcar'),
+        }
+        route_callables = {
+            'generic': 'analyze_vasp_outputs', 'freq': 'analyze_frequency',
+            'aimd': 'analyze_aimd', 'neb': 'analyze_neb',
+            'artifact': 'inspect_artifacts', 'dos': 'analyze_dos',
+            'bader': 'analyze_bader', 'chgdiff': 'analyze_chgdiff',
+            'elf': 'analyze_elf',
+        }
+        for task_key in task_analysis.capability_matrix():
+            if task_key in routes:
+                continue
+            cap = task_analysis.capability(task_key)
+            callable_name = route_callables.get(cap.get('route'))
+            routes[task_key] = (
+                'vcstudio.project.task_analysis' if callable_name else '',
+                callable_name or '',
+            )
+        return {
+            key: {'module': module, 'callable': callable_name,
+                  'version': str(__version__) if module and callable_name else '',
+                  'version_source': ('vcstudio.__version__'
+                                     if module and callable_name else '')}
+            for key, (module, callable_name) in routes.items()
+        }
+
+    @staticmethod
+    def _analysis_workbench_method_evidence(target):
+        """Require a complete, non-drifted method identity before parsing."""
+        from vcstudio.project import energy_gate
+
+        manifest = target.get('manifest') or {}
+        inputs = manifest.get('inputs') or {}
+        engine = str(inputs.get('engine') or 'vasp').strip().lower()
+        if engine != 'vasp':
+            method = inputs.get('method') or inputs.get('method_fingerprint')
+            if method:
+                return {'status': 'verified', 'engine': engine,
+                        'identity': copy.deepcopy(method), 'missing': []}
+            return {'status': 'unverified', 'engine': engine,
+                    'missing': ['non-VASP manifest lacks method identity']}
+        record = energy_gate.method_record(
+            target['path'], manifest, str(target.get('source_id') or 'job'))
+        required = ('functional', 'dispersion', 'encut', 'spin',
+                    'kpoints_scheme', 'potcar_ids')
+        missing = [key for key in required if not record['known'].get(key)]
+        warnings = list(record.get('evidence_warnings') or [])
+        return {
+            'status': 'verified' if not missing and not warnings else 'unverified',
+            'fingerprint': copy.deepcopy(record.get('fingerprint') or {}),
+            'missing': missing, 'warnings': warnings,
+        }
+
+    def _analysis_workbench_property_results(self, kind, targets):
+        """Run calculators from manifest-bound server operands only."""
+        by_key = {target['path_key']: target for target in targets}
+        by_id = {str(target['source_id']): target for target in targets}
+
+        def resolve(value):
+            if not value:
+                return None
+            return by_id.get(str(value)) or by_key.get(
+                self._analysis_workbench_path_key(value))
+
+        if kind == 'vaspsol':
+            from vcstudio.project import vaspsol
+
+            pairs = {}
+            for target in targets:
+                manifest = target.get('manifest') or {}
+                meta = manifest.get('vaspsol') or (manifest.get('inputs') or {}).get('vaspsol') or {}
+                pair_id = str(meta.get('pair_id') or '')
+                role = str(meta.get('role') or '')
+                if target.get('task_type') == 'vaspsol' and pair_id and role in {'vacuum', 'solvent'}:
+                    pairs.setdefault(pair_id, {})[role] = target
+            results = []
+            for pair in pairs.values():
+                if set(pair) != {'vacuum', 'solvent'}:
+                    continue
+                source_ids = [pair['vacuum']['source_id'], pair['solvent']['source_id']]
+                try:
+                    result = vaspsol.analyze_pair(
+                        pair['vacuum']['path'], pair['solvent']['path'])
+                    results.append({
+                        'ok': True, 'source_ids': source_ids,
+                        'solvation_energy_eV': result['solvation_energy_eV'],
+                        'e_vacuum_eV': result['e_vacuum_eV'],
+                        'e_solvent_eV': result['e_solvent_eV'],
+                        'eb_k': result.get('eb_k'),
+                        'patch_evidence': result.get('patch_evidence'),
+                        'method_signature': result.get('method_signature'),
+                        'hashes': result.get('hashes'),
+                        'parser_module': 'vcstudio.project.vaspsol',
+                        'parser_callable': 'analyze_pair',
+                        'summary': 'VASPsol solvent minus vacuum energy.',
+                    })
+                except Exception as exc:                  # noqa: BLE001 fail closed
+                    results.append({'ok': False, 'source_ids': source_ids,
+                                    'error': str(exc)})
+            return results
+
+        results = []
+        for owner in targets:
+            if owner.get('task_type') != kind:
+                continue
+            manifest = owner.get('manifest') or {}
+            inputs = manifest.get('inputs') or {}
+            operands = inputs.get('analysis_operands') or inputs.get('operands') or {}
+            if not isinstance(operands, dict):
+                operands = {}
+            if kind == 'surface_energy':
+                slab = resolve(operands.get('slab_job'))
+                bulk = resolve(operands.get('bulk_job'))
+                if not slab or not bulk:
+                    results.append({'ok': False, 'source_ids': [owner['source_id']],
+                                    'error': 'surface-energy manifest lacks resolved slab_job/bulk_job operands'})
+                    continue
+                result = self._surface_energy_calc(
+                    slab['path'], bulk['path'], write_report=False)
+                results.append({
+                    **dict(result or {}),
+                    'source_ids': [owner['source_id'], slab['source_id'], bulk['source_id']],
+                    'parser_module': 'vcstudio.project.surface_energy',
+                    'parser_callable': 'surface_energy',
+                    'summary': (result or {}).get('note') or (result or {}).get('error'),
+                })
+                continue
+
+            sac = resolve(operands.get('sac_job'))
+            substrate = resolve(operands.get('substrate_job'))
+            atom_jobs = operands.get('atom_energy_jobs') or {}
+            chemical_jobs = operands.get('chemical_potential_jobs') or {}
+            if not sac or not substrate or not isinstance(atom_jobs, dict) or not isinstance(chemical_jobs, dict):
+                results.append({'ok': False, 'source_ids': [owner['source_id']],
+                                'error': 'formation/binding manifest lacks resolved SAC/reference operands'})
+                continue
+            atom_targets = {key: resolve(value) for key, value in atom_jobs.items()}
+            chemical_targets = {key: resolve(value) for key, value in chemical_jobs.items()}
+            referenced = [sac, substrate, *atom_targets.values(), *chemical_targets.values()]
+            if any(target is None for target in referenced):
+                results.append({'ok': False, 'source_ids': [owner['source_id']],
+                                'error': 'formation/binding manifest references a job outside the project ledger chain'})
+                continue
+            try:
+                from vcstudio.project import energy_gate
+
+                records, energies = [], {}
+                for target in referenced:
+                    energy, source_manifest, _notes = energy_gate.validate_done_energy(
+                        target['path'], target['source_id'], self._manifest)
+                    records.append(energy_gate.method_record(
+                        target['path'], source_manifest, target['source_id']))
+                    energies[target['source_id']] = energy
+                method = energy_gate.compare_methods(records, require_same_kpoints=False)
+                if method['status'] != 'verified':
+                    raise ValueError('formation/binding method evidence is not verified: ' +
+                                     '; '.join(method['issues'] + method['warnings']))
+                atom_energies = {
+                    key: energies[target['source_id']]
+                    for key, target in atom_targets.items()
+                }
+                chem_pots = {
+                    key: energies[target['source_id']]
+                    for key, target in chemical_targets.items()
+                }
+                result = self._formation_binding_calc(
+                    sac['path'], substrate['path'], atom_energies, chem_pots,
+                    write_report=False)
+                results.append({
+                    **dict(result or {}), 'method_check_all_operands': method,
+                    'binding_energy_eV': (result or {}).get('binding_energy'),
+                    'formation_energy_eV': (result or {}).get('formation_energy'),
+                    'source_ids': [owner['source_id'], *energies],
+                    'parser_module': 'vcstudio.project.references',
+                    'parser_callable': 'binding_energy/formation_energy',
+                    'summary': (result or {}).get('stability_note') or (result or {}).get('error'),
+                })
+            except Exception as exc:                      # noqa: BLE001 fail closed
+                results.append({'ok': False, 'source_ids': [owner['source_id']],
+                                'error': str(exc)})
+        return results
+
+    def _analysis_workbench_validation_result(self, context):
+        """Load one current server-authored ValidationResult sidecar."""
+        from vcstudio.project.report_contracts import ValidationResult
+
+        project = context['project']
+        marker = project.get('autopilot_report')
+        if not isinstance(marker, dict):
+            return None, 'No registered report ValidationResult is available.'
+        try:
+            summary = self._adsorption.delta_e_rows(project)
+            if not self._report_marker_current(project, summary):
+                return None, 'The registered report validation is stale for current project evidence.'
+            files = marker.get('files') or {}
+            if not isinstance(files, dict):
+                return None, 'The registered report marker has no validated contract files.'
+            path = str(files.get('contract_validation') or '')
+            if not path or not os.path.isfile(path):
+                return None, 'The registered ValidationResult sidecar is unavailable.'
+            with open(path, 'r', encoding='utf-8') as handle:
+                validation = ValidationResult.from_mapping(json.load(handle))
+            refs = marker.get('contracts') or {}
+            expected = str((refs.get('validation') or {}).get('sha256') or '')
+            if not expected or expected != validation.semantic_sha256:
+                return None, 'ValidationResult does not match the registered contract hash.'
+            return validation, None
+        except Exception as exc:                          # noqa: BLE001 fail closed
+            return None, f'ValidationResult could not be revalidated: {exc}'
+
+    def _analysis_workbench_next_calculation(self, context, view):
+        from vcstudio.project.next_calculation import build_recommendations
+
+        validation, reason = self._analysis_workbench_validation_result(context)
+        return build_recommendations(
+            view, validation, validation_error=reason)
+
+    def _analysis_workbench_capability_cards(self, context, projects, selected_view):
+        """Project-specific activation states for every registry card."""
+        targets = self._analysis_workbench_targets(context)
+        task_types = {str(target.get('task_type') or '') for target in targets}
+        project = context['project']
+        preparation = project.get('preparation')
+        mode = str(project.get('work_mode') or
+                   (preparation.get('work_mode') if isinstance(preparation, dict) else '')
+                   or '').strip().lower()
+        charge_status = 'missing_prerequisite'
+        if task_types & {'bader', 'chgdiff'}:
+            charge_status = 'available'
+        elif 'elf' in task_types:
+            elf_targets = [target for target in targets if target.get('task_type') == 'elf']
+            elf_ready = [target for target in elf_targets
+                         if target.get('state') == 'DONE'
+                         and os.path.isfile(os.path.join(target['path'], 'ELFCAR'))]
+            if elf_ready:
+                charge_status = (
+                    'available' if any(
+                        self._analysis_workbench_method_evidence(target).get('status') ==
+                        'verified' for target in elf_ready)
+                    else 'unavailable')
+        states = {
+            'adsorption-energy': (
+                'available' if self._project_member_dirs(project) else 'missing_prerequisite'),
+            'free-energy-path': (
+                'available' if mode == 'lis' else 'mode_mismatch'),
+            'task-results': ('available' if targets else 'missing_prerequisite'),
+            'electronic-structure': (
+                'available' if task_types & {'dos_pdos', 'bands', 'workfunction'}
+                else 'missing_prerequisite'),
+            'charge-wavefunction': charge_status,
+            'multi-project-comparison': (
+                'available' if len(projects) >= 2 else 'missing_prerequisite'),
+            'property-calculators': (
+                'available' if task_types & {'surface_energy', 'formation_binding', 'vaspsol'}
+                else 'missing_prerequisite'),
+        }
+        selected_id = str((selected_view or {}).get('analysis_id') or '')
+        selected_status = str((selected_view or {}).get('capability_status') or '')
+        if selected_id and selected_status:
+            states[selected_id] = selected_status
+        actions = {
+            'available': 'Open this analysis and inspect its server-finalized evidence.',
+            'missing_prerequisite': 'Create or complete the required registered job, then refresh.',
+            'mode_mismatch': 'Switch to the required explicit project mode, then refresh.',
+            'not_implemented': 'Use a registered quantitative parser; artifact presence alone is not a result.',
+            'unavailable': 'Restore the parser/version dependency, then refresh.',
+        }
+        return {
+            analysis_id: {'status': status, 'activatable': status == 'available',
+                          'next_action': actions[status]}
+            for analysis_id, status in states.items()
+        }
+
     def _analysis_workbench_build(self, path, request=None, *,
                                   default_analysis_id='adsorption-energy'):
         from vcstudio.project.analysis_registry import normalize_analysis_request
@@ -5912,6 +7625,10 @@ class Api:
             build_adsorption_view,
             build_comparison_view,
             build_free_energy_view,
+        )
+        from vcstudio.project.analysis_sources import (
+            build_property_view,
+            build_task_analysis_view,
         )
 
         context = self._report_workbench_project_context(path)
@@ -5977,7 +7694,9 @@ class Api:
                  if isinstance(preparation, dict) else '') or '').strip().lower()
             if declared_mode != 'lis':
                 view = self._analysis_workbench_unavailable_view(
-                    spec, f'分析 {spec.analysis_id} 已注册，但实时解析器尚未接入')
+                    spec, '该自由能分析只适用于显式 Li-S 工作模式',
+                    capability_status='mode_mismatch',
+                    next_action='将项目工作模式显式设为 Li-S，并完成反应路径证据。')
             else:
                 summary = self._adsorption.delta_e_rows(project)
                 fed, fed_reason = self._proj_fed(project, summary)
@@ -5988,9 +7707,31 @@ class Api:
                         (summary or {}).get('method_consistency') or {}),
                 }
                 view = build_free_energy_view(frozen, spec)
+        elif spec.analysis_id in {
+                'electronic-structure', 'charge-wavefunction', 'task-results'}:
+            targets = self._analysis_workbench_targets(context)
+            view = build_task_analysis_view(
+                spec, targets,
+                runner=lambda target_path, kind: self.analyze_task(
+                    target_path, kind=kind),
+                parser_identities=self._analysis_workbench_parser_identities(),
+                method_evidence=self._analysis_workbench_method_evidence,
+            )
+        elif spec.analysis_id == 'property-calculators':
+            from vcstudio import __version__
+
+            targets = self._analysis_workbench_targets(context)
+            view = build_property_view(
+                spec, targets,
+                runner=self._analysis_workbench_property_results,
+                parser_version=str(__version__),
+            )
         else:
             view = self._analysis_workbench_unavailable_view(
                 spec, f'分析 {spec.analysis_id} 已注册，但实时解析器尚未接入')
+        view = dict(view)
+        view['next_calculation'] = self._analysis_workbench_next_calculation(
+            context, view)
         return context, spec, view
 
     def analysis_workbench_catalog(self):
@@ -6008,25 +7749,78 @@ class Api:
             }
 
     def _analysis_workbench_project_path(self, project_id):
-        identifier = str(project_id or '').strip()
-        index, _projects = self._analysis_workbench_project_index()
-        if not identifier or identifier not in index:
-            raise ValueError('project_id 不是服务端已知的 workspace opaque 身份')
-        return index[identifier]
+        return self._analysis_workbench_project_record(project_id)['path']
+
+    def _analysis_workbench_project_record(self, project_id):
+        return self._resolve_project_id(project_id)
+
+    @classmethod
+    def _analysis_workbench_identity_failure(cls, *, field):
+        """Return a stable, locator-free invalid-identity response."""
+        return {
+            'ok': False, 'schema': cls._ANALYSIS_PREVIEW_SCHEMA,
+            'project_id': None, 'spec': None, 'view': None,
+            'error_code': 'invalid_project_identity', 'error_field': field,
+            'error': f'{field} must contain registered opaque project identities.',
+        }
 
     def analysis_workbench_preview(self, project_id, request=None):
         try:
-            path = self._analysis_workbench_project_path(project_id)
-            context, spec, view = self._analysis_workbench_build(path, request)
-            return self._analysis_workbench_public_value({
-                'ok': True, 'schema': self._ANALYSIS_PREVIEW_SCHEMA,
-                'project_id': context['project_id'], 'spec': spec.to_dict(),
-                'view': view, 'error': None,
-            })
+            record = self._analysis_workbench_project_record(project_id)
+        except (LookupError, ValueError):
+            return self._analysis_workbench_identity_failure(field='project_id')
+        try:
+            records = self._project_records_for_request(record, request)
+        except (LookupError, ValueError):
+            field = ('comparison_project_ids' if isinstance(request, dict)
+                     and isinstance(request.get('comparison_project_ids'),
+                                    (list, tuple)) else 'project_ids')
+            return self._analysis_workbench_identity_failure(field=field)
+
+        try:
+
+            def build():
+                context, spec, view = self._analysis_workbench_build(
+                    record['path'], request)
+                return self._analysis_workbench_public_value({
+                    'ok': True, 'schema': self._ANALYSIS_PREVIEW_SCHEMA,
+                    'project_id': context['project_id'], 'spec': spec.to_dict(),
+                    'view': view, 'error': None,
+                })
+
+            return self._call_with_project_bindings(records, build)
         except Exception as exc:                         # noqa: BLE001 public bridge
             return {
                 'ok': False, 'schema': self._ANALYSIS_PREVIEW_SCHEMA,
                 'project_id': None, 'spec': None, 'view': None,
+                'error': self._analysis_workbench_public_value(str(exc)),
+            }
+
+    def analysis_workbench_next_intent(
+            self, project_id, request, recommendation_id, confirmed=False):
+        """Create a non-executable draft; this seam never calls submission APIs."""
+        try:
+            from vcstudio.project.next_calculation import draft_intent
+
+            record = self._analysis_workbench_project_record(project_id)
+            records = self._project_records_for_request(record, request)
+
+            def build():
+                context, _spec, view = self._analysis_workbench_build(
+                    record['path'], request)
+                recommendations = view.get('next_calculation') or {}
+                draft = draft_intent(
+                    recommendations, str(recommendation_id or ''),
+                    confirmed=confirmed is True)
+                return self._analysis_workbench_public_value({
+                    'ok': True, 'project_id': context['project_id'],
+                    'draft': draft, 'error': None,
+                })
+
+            return self._call_with_project_bindings(records, build)
+        except Exception as exc:                          # noqa: BLE001 public bridge
+            return {
+                'ok': False, 'project_id': None, 'draft': None,
                 'error': self._analysis_workbench_public_value(str(exc)),
             }
 
@@ -6036,39 +7830,58 @@ class Api:
 
             selected_analysis = str(analysis_id or 'adsorption-energy').strip()
             get_analysis(selected_analysis)
-            path = self._analysis_workbench_project_path(project_id)
-            context = self._report_workbench_project_context(path)
-            index, projects = self._analysis_workbench_project_index()
-            request = {'analysis_id': selected_analysis}
-            if selected_analysis == 'multi-project-comparison':
-                if context['project_id'] not in index:
-                    raise ValueError('当前项目不在项目注册表中，不能建立多项目比较')
-                other_ids = [
-                    item['project_id'] for item in projects
-                    if item['project_id'] != context['project_id']]
-                if not other_ids:
-                    raise ValueError('多项目比较至少需要两个可解析项目')
-                request['comparison_project_ids'] = [
-                    context['project_id'], other_ids[0]]
-            built_context, spec, view = self._analysis_workbench_build(
-                path, request, default_analysis_id=selected_analysis)
-            catalog_result = self.analysis_workbench_catalog()
-            if catalog_result.get('ok') is not True:
-                raise RuntimeError(catalog_result.get('error') or '分析目录不可用')
-            catalog = {
-                key: value for key, value in catalog_result.items()
-                if key not in {'ok', 'error'}
-            }
-            preferences = self.analysis_preferences_read()
-            return self._analysis_workbench_public_value({
-                'ok': True, 'schema': self._ANALYSIS_BOOTSTRAP_SCHEMA,
-                'project_id': built_context['project_id'],
-                'project': self._analysis_workbench_current_project(context),
-                'catalog': catalog, 'default_spec': spec.to_dict(),
-                'projects': projects, 'view': view, 'error': None,
-                'preferences': preferences,
-                'preference_revision': preferences.get('revision'),
-            })
+            anchor = self._analysis_workbench_project_record(project_id)
+            records = self._project_records_for_request(
+                anchor, include_registry=(
+                    selected_analysis == 'multi-project-comparison'))
+
+            def build():
+                path = anchor['path']
+                context = self._report_workbench_project_context(path)
+                index, projects = self._analysis_workbench_project_index()
+                request = {'analysis_id': selected_analysis}
+                if selected_analysis == 'multi-project-comparison':
+                    if context['project_id'] not in index:
+                        raise ValueError(
+                            '当前项目不在项目注册表中，不能建立多项目比较')
+                    other_ids = [
+                        item['project_id'] for item in projects
+                        if item['project_id'] != context['project_id']]
+                    if not other_ids:
+                        raise ValueError('多项目比较至少需要两个可解析项目')
+                    request['comparison_project_ids'] = [
+                        context['project_id'], other_ids[0]]
+                built_context, spec, view = self._analysis_workbench_build(
+                    path, request, default_analysis_id=selected_analysis)
+                catalog_result = self.analysis_workbench_catalog()
+                if catalog_result.get('ok') is not True:
+                    raise RuntimeError(
+                        catalog_result.get('error') or '分析目录不可用')
+                catalog = {
+                    key: value for key, value in catalog_result.items()
+                    if key not in {'ok', 'error'}
+                }
+                cards = self._analysis_workbench_capability_cards(
+                    context, projects, view)
+                for item in catalog.get('analyses') or []:
+                    card = cards.get(str(item.get('id') or ''), {})
+                    item['capability_status'] = card.get(
+                        'status', 'unavailable')
+                    item['activatable'] = card.get('activatable') is True
+                    item['next_action'] = str(
+                        card.get('next_action') or item.get('next_action') or '')
+                preferences = self.analysis_preferences_read()
+                return self._analysis_workbench_public_value({
+                    'ok': True, 'schema': self._ANALYSIS_BOOTSTRAP_SCHEMA,
+                    'project_id': built_context['project_id'],
+                    'project': self._analysis_workbench_current_project(context),
+                    'catalog': catalog, 'default_spec': spec.to_dict(),
+                    'projects': projects, 'view': view, 'error': None,
+                    'preferences': preferences,
+                    'preference_revision': preferences.get('revision'),
+                })
+
+            return self._call_with_project_bindings(records, build)
         except Exception as exc:                         # noqa: BLE001 public bridge
             return {
                 'ok': False, 'schema': self._ANALYSIS_BOOTSTRAP_SCHEMA,
@@ -6148,7 +7961,35 @@ class Api:
             and declared[fmt].get('available') is True
         )
 
-    def proj_report_status(self, path):
+    def proj_report_status(self, project_id):
+        try:
+            record = self._resolve_project_id(project_id)
+        except Exception:                                 # noqa: BLE001 public identity seam
+            return self._project_identity_failure(
+                schema='vcstudio.report-status/v1', project_id=None,
+                artifact_status='missing', artifact_current=False,
+                has_marker=False, scientific_status=None,
+                scientific_qualification=None, scientific_stale=False,
+                eligible_final=False, publication_gate_status='unknown',
+                desired_report_kind=None, report_reason='', files={})
+        result = self._call_with_project_bindings(
+            [record],
+            lambda: self._proj_report_status_for_path(record['path']),
+            failure={
+                'schema': 'vcstudio.report-status/v1', 'project_id': None,
+                'artifact_status': 'missing', 'artifact_current': False,
+                'has_marker': False, 'scientific_status': None,
+                'scientific_qualification': None, 'scientific_stale': False,
+                'eligible_final': False,
+                'publication_gate_status': 'unknown',
+                'desired_report_kind': None, 'report_reason': '', 'files': {},
+            })
+        result.pop('path', None)
+        if result.get('error_code') != 'identity_mismatch':
+            result['project_id'] = record['project_id']
+        return self._project_public_result(result)
+
+    def _proj_report_status_for_path(self, path):
         """Return canonical marker freshness; report-file mtime is never evidence."""
         project_path = str(path or '').strip()
         if not project_path:
@@ -6170,7 +8011,7 @@ class Api:
                 'error': '未指定项目路径',
             }
         try:
-            project = self._adsorption.load_project(project_path)
+            project = self._load_project_for_path(project_path)
             if project is None:
                 raise FileNotFoundError('项目不存在或 project.yaml 已被移动')
             summary = self._adsorption.delta_e_rows(project)
@@ -6196,8 +8037,29 @@ class Api:
                 'error': str(exc),
             }
 
-    def proj_report_bundle(self, path, out_dir, formats=None, final=True, stem=None,
+    def proj_report_bundle(self, project_id, out_dir, formats=None, final=True, stem=None,
                            record_artifact=True, requested_kind=None):
+        try:
+            record = self._resolve_project_id(project_id)
+        except Exception:                                 # noqa: BLE001 public identity seam
+            return self._project_identity_failure(
+                files={}, marker=None, kind=None, scientific_status=None,
+                artifact_status='failed')
+        result = self._call_with_project_bindings(
+            [record],
+            lambda: self._proj_report_bundle_for_path(
+                record['path'], out_dir, formats=formats, final=final, stem=stem,
+                record_artifact=record_artifact,
+                requested_kind=requested_kind),
+            failure={
+                'files': {}, 'marker': None, 'kind': None,
+                'scientific_status': None, 'artifact_status': 'failed',
+            })
+        return self._project_public_result(result)
+
+    def _proj_report_bundle_for_path(
+            self, path, out_dir, formats=None, final=True, stem=None,
+            record_artifact=True, requested_kind=None):
         """Compatibility adapter into the unified Phase C report service."""
         if record_artifact is not True:
             return self._report_failure_envelope(
@@ -6254,7 +8116,7 @@ class Api:
             if requested not in _REPORT_KINDS:
                 raise ValueError(
                     'requested_kind 必须为 final、diagnostic 或 draft')
-            proj = self._adsorption.load_project((path or '').strip())
+            proj = self._load_project_for_path((path or '').strip())
             if proj is None:
                 return self._report_failure_envelope(
                     '项目不存在或 project.yaml 已被移动')
@@ -6468,7 +8330,7 @@ class Api:
         items = []
         for raw_path in paths or []:
             path = str(raw_path or '').strip()
-            proj = self._adsorption.load_project(path)
+            proj = self._load_project_for_path(path)
             if proj is None:
                 items.append({'path': path, 'project': None})
                 continue
@@ -6541,7 +8403,24 @@ class Api:
             raise RuntimeError('比较快照项目身份与冻结请求不一致')
         return items, snapshot, project_ids
 
-    def proj_compare_preview(self, paths, preset_key=None):
+    def proj_compare_preview(self, project_ids, preset_key=None):
+        try:
+            records = self._resolve_project_ids(project_ids, min_count=2)
+        except Exception:                                 # noqa: BLE001 public identity seam
+            return self._project_identity_failure(
+                projects=[], comparison_gate={}, can_plot=False,
+                can_final_report=False)
+        result = self._call_with_project_bindings(
+            records,
+            lambda: self._proj_compare_preview_for_paths(
+                [record['path'] for record in records], preset_key=preset_key),
+            failure={
+                'projects': [], 'comparison_gate': {}, 'can_plot': False,
+                'can_final_report': False,
+            })
+        return self._project_locator_projection(result, records)
+
+    def _proj_compare_preview_for_paths(self, paths, preset_key=None):
         """Preview every selected project, including moved/blocked selections."""
         try:
             snapshot = self._comparison_model().build_comparison_snapshot(
@@ -6551,10 +8430,22 @@ class Api:
             return {'ok': False, 'projects': [], 'comparison_gate': {},
                     'can_plot': False, 'can_final_report': False, 'error': str(e)}
 
-    def proj_evaluate_candidate(self, path, options=None):
+    def proj_evaluate_candidate(self, project_id, options=None):
+        try:
+            record = self._resolve_project_id(project_id)
+        except Exception:                                 # noqa: BLE001 public identity seam
+            return self._project_identity_failure(evaluation=None)
+        result = self._call_with_project_bindings(
+            [record],
+            lambda: self._proj_evaluate_candidate_for_path(
+                record['path'], options),
+            failure={'evaluation': None})
+        return self._project_public_result(result)
+
+    def _proj_evaluate_candidate_for_path(self, path, options=None):
         """Return deterministic, auditable follow-up priority for one project."""
         try:
-            proj = self._adsorption.load_project((path or '').strip())
+            proj = self._load_project_for_path((path or '').strip())
             if proj is None:
                 return {'ok': False, 'evaluation': None,
                         'error': '项目不存在或 project.yaml 已被移动'}
@@ -6945,6 +8836,7 @@ class Api:
                 report_id=report_id,
                 created_at_utc=datetime.now(timezone.utc).replace(
                     microsecond=0).isoformat(),
+                created_at=now,
                 expires_at=now + service._ttl,
                 base_revision=base_revision,
                 base_manifest_sha256=base_manifest,
@@ -6952,8 +8844,7 @@ class Api:
                 token=token,
                 temp_root=temp_root,
             )
-            with service._lock:
-                service._previews[preview_id] = record
+            service._register_preview(record)
         except Exception:
             shutil.rmtree(temp_root, ignore_errors=True)
             raise
@@ -6998,7 +8889,7 @@ class Api:
                         stem = f'{base}_{serial}'
                         serial += 1
                     used_stems.add(stem)
-                    child = self.proj_report_bundle(
+                    child = self._proj_report_bundle_for_path(
                         source['path'], target, wanted, final=final, stem=stem,
                         requested_kind=requested)
                     individual.append({
@@ -7068,7 +8959,7 @@ class Api:
                 'blocked': gate.get('blocking') or [],
                 'warnings': gate.get('warnings') or [],
                 'snapshot': snapshot,
-                'history': self.report_workbench_history(build['project_path']),
+                'history': self._reports().history(build['project_path']),
                 'out_dir': target,
                 'error': comparison_result.get('error'),
             }
@@ -7096,8 +8987,30 @@ class Api:
                 failed['out_dir'] = target
             return failed
 
-    def proj_batch_report(self, paths, out_dir, preset_key=None, formats=None,
+    def proj_batch_report(self, project_ids, out_dir, preset_key=None, formats=None,
                           include_individual=True, final=True, requested_kind=None):
+        try:
+            records = self._resolve_project_ids(project_ids, min_count=2)
+        except Exception:                                 # noqa: BLE001 public identity seam
+            return self._project_identity_failure(
+                files={}, marker=None, kind=None, scientific_status=None,
+                artifact_status='failed')
+        result = self._call_with_project_bindings(
+            records,
+            lambda: self._proj_batch_report_for_paths(
+                [record['path'] for record in records], out_dir,
+                preset_key=preset_key, formats=formats,
+                include_individual=include_individual, final=final,
+                requested_kind=requested_kind),
+            failure={
+                'files': {}, 'marker': None, 'kind': None,
+                'scientific_status': None, 'artifact_status': 'failed',
+            })
+        return self._project_locator_projection(result, records)
+
+    def _proj_batch_report_for_paths(
+            self, paths, out_dir, preset_key=None, formats=None,
+            include_individual=True, final=True, requested_kind=None):
         """Generate revisioned individual and multi-catalyst reports."""
         return self._proj_batch_report_revisioned_impl(
             paths, out_dir, preset_key=preset_key, formats=formats,
@@ -7394,7 +9307,21 @@ class Api:
         except ValueError as e:
             return None, str(e), ptitle
 
-    def proj_figures(self, path, kinds=None, save_to=None, preset_key=None):
+    def proj_figures(self, project_id, kinds=None, save_to=None, preset_key=None):
+        try:
+            record = self._resolve_project_id(project_id)
+        except Exception:                                 # noqa: BLE001 public identity seam
+            return self._project_identity_failure(
+                files=[], skipped=[], out_dir=None)
+        result = self._call_with_project_bindings(
+            [record],
+            lambda: self._proj_figures_for_path(
+                record['path'], kinds=kinds, save_to=save_to,
+                preset_key=preset_key),
+            failure={'files': [], 'skipped': [], 'out_dir': None})
+        return self._project_public_result(result)
+
+    def _proj_figures_for_path(self, path, kinds=None, save_to=None, preset_key=None):
         """单项目论文级出图(原生引擎)。kinds ⊂ {'bar','table','ladder'},缺省全选。
 
         bar/table 只用已完成的 ΔE 行;ladder 需 config.lis_molecules_dir 分子库。
@@ -7405,7 +9332,7 @@ class Api:
         返回 {'ok','files','skipped','out_dir','error'}。
         """
         try:
-            proj = self._adsorption.load_project((path or '').strip())
+            proj = self._load_project_for_path((path or '').strip())
             if proj is None:
                 return {'ok': False, 'files': [], 'skipped': [], 'out_dir': None,
                         'error': '项目不存在或 project.yaml 已被移动'}
@@ -7468,7 +9395,23 @@ class Api:
             return {'ok': False, 'files': [], 'skipped': [], 'out_dir': None,
                     'error': str(e)}
 
-    def proj_compare_figures(self, paths, kinds=None, save_to=None, preset_key=None):
+    def proj_compare_figures(
+            self, project_ids, kinds=None, save_to=None, preset_key=None):
+        try:
+            records = self._resolve_project_ids(project_ids, min_count=2)
+        except Exception:                                 # noqa: BLE001 public identity seam
+            return self._project_identity_failure(
+                files=[], skipped=[], out_dir=None)
+        result = self._call_with_project_bindings(
+            records,
+            lambda: self._proj_compare_figures_for_paths(
+                [record['path'] for record in records], kinds=kinds,
+                save_to=save_to, preset_key=preset_key),
+            failure={'files': [], 'skipped': [], 'out_dir': None})
+        return self._project_locator_projection(result, records)
+
+    def _proj_compare_figures_for_paths(
+            self, paths, kinds=None, save_to=None, preset_key=None):
         """多项目对比出图。
 
         ``kinds`` 可含 heatmap/scaling/volcano/ladder。吸附能矩阵和自由能
@@ -8022,7 +9965,7 @@ class Api:
         needle = str(query or '').strip()
         matches = []
         for path in self._adsorption.list_projects():
-            proj = self._adsorption.load_project(path)
+            proj = self._load_project_for_path(path)
             if proj is None:
                 continue
             if (not needle or str(proj.get('name') or '').casefold() == needle.casefold()
@@ -8044,7 +9987,7 @@ class Api:
             report_formats = self._available_report_formats()
         except Exception as exc:                          # noqa: BLE001
             return '报告尚未生成：' + str(exc)
-        result = self.proj_report_bundle(
+        result = self._proj_report_bundle_for_path(
             path, report_dir, report_formats, final=True,
             stem=f'{name}_{suffix}')
         if not result.get('ok'):
@@ -8192,6 +10135,126 @@ class Api:
             return {'ok': True, 'path': p, 'error': None}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'path': None, 'error': str(e)}
+
+    # ── 设置页:实验室推荐策略(用户级原子/CAS store，不改任何作业) ──────────
+    _LAB_POLICY_API_SCHEMA = 'vcstudio.lab-policy-api/v1'
+    _LAB_POLICY_SERVER_ACTOR = 'manual-local-user'
+
+    def _lab_policy_backend(self):
+        from vcstudio.project import lab_policies
+
+        return lab_policies
+
+    def _lab_policy_selection_store(self):
+        if self._lab_policy_store is None:
+            self._lab_policy_store = self._lab_policy_backend().LabPolicySelectionStore()
+        return self._lab_policy_store
+
+    @staticmethod
+    def _lab_policy_request(request):
+        if not isinstance(request, dict):
+            raise ValueError('policy request must be an object')
+        allowed = {'policy_id', 'overrides', 'applicability'}
+        unknown = sorted(set(request) - allowed)
+        if unknown:
+            raise ValueError('policy request contains unknown fields')
+        return {
+            'policy_id': request.get('policy_id'),
+            'overrides': request.get('overrides'),
+            'applicability': request.get('applicability'),
+        }
+
+    def lab_policy_catalog(self):
+        try:
+            result = self._lab_policy_backend().catalog()
+            return self._analysis_workbench_public_value({
+                'schema': self._LAB_POLICY_API_SCHEMA,
+                'ok': True, 'catalog': result,
+                'recommendation_only': True,
+                'authorizes_submission': False,
+                'error': None,
+            })
+        except Exception as exc:                         # noqa: BLE001 public seam
+            return {
+                'schema': self._LAB_POLICY_API_SCHEMA,
+                'ok': False, 'catalog': None,
+                'recommendation_only': True,
+                'authorizes_submission': False,
+                'error': self._analysis_workbench_public_value(str(exc)),
+            }
+
+    def lab_policy_read(self):
+        try:
+            snapshot = self._lab_policy_selection_store().read()
+            return self._analysis_workbench_public_value({
+                'schema': self._LAB_POLICY_API_SCHEMA,
+                **snapshot,
+                'recommendation_only': True,
+                'authorizes_submission': False,
+            })
+        except Exception as exc:                         # noqa: BLE001 public seam
+            return {
+                'schema': self._LAB_POLICY_API_SCHEMA,
+                'ok': False, 'conflict': False, 'revision': None,
+                'selection': None, 'recommendation_only': True,
+                'authorizes_submission': False,
+                'error': self._analysis_workbench_public_value(str(exc)),
+            }
+
+    def lab_policy_preview(self, request):
+        try:
+            prepared = self._lab_policy_request(request)
+            resolved = self._lab_policy_backend().resolve(
+                prepared['policy_id'], prepared['overrides'],
+                applicability=prepared['applicability'])
+            snapshot = self._lab_policy_selection_store().read()
+            return self._analysis_workbench_public_value({
+                'schema': self._LAB_POLICY_API_SCHEMA,
+                'ok': True, 'preview': resolved,
+                'revision': snapshot['revision'],
+                'current_selection': snapshot['selection'],
+                'recommendation_only': True,
+                'requires_user_confirmation': True,
+                'authorizes_submission': False,
+                'error': None,
+            })
+        except Exception as exc:                         # noqa: BLE001 public seam
+            return {
+                'schema': self._LAB_POLICY_API_SCHEMA,
+                'ok': False, 'preview': None, 'revision': None,
+                'current_selection': None,
+                'recommendation_only': True,
+                'requires_user_confirmation': True,
+                'authorizes_submission': False,
+                'error': self._analysis_workbench_public_value(str(exc)),
+            }
+
+    def lab_policy_confirm(self, request, expected_revision, confirmed=False):
+        try:
+            prepared = self._lab_policy_request(request)
+            result = self._lab_policy_selection_store().confirm(
+                prepared['policy_id'], prepared['overrides'],
+                applicability=prepared['applicability'],
+                actor=self._LAB_POLICY_SERVER_ACTOR,
+                confirmed=confirmed, expected_revision=expected_revision)
+            return self._analysis_workbench_public_value({
+                'schema': self._LAB_POLICY_API_SCHEMA,
+                **result,
+                'recommendation_only': True,
+                'requires_user_confirmation': True,
+                'authorizes_submission': False,
+                'actor_attribution_only': True,
+            })
+        except Exception as exc:                         # noqa: BLE001 public seam
+            return {
+                'schema': self._LAB_POLICY_API_SCHEMA,
+                'ok': False, 'conflict': False, 'revision': None,
+                'selection': None, 'recommendation_only': True,
+                'requires_user_confirmation': True,
+                'authorizes_submission': False,
+                'actor_attribution_only': True,
+                'error': self._analysis_workbench_public_value(str(exc)),
+            }
 
     # ── 设置页(config 读写 + keyring 状态;全走注入的 config/ai_analysis,可测) ─────────
     @staticmethod
@@ -8520,12 +10583,22 @@ class Api:
     def pipeline_status(self):
         """每项目管线阶段:生成→提交→监控→恢复(n/3)→分析→报告完成;NEEDS_HUMAN 红旗。"""
         try:
+            snapshot = self._project_registry_snapshot()
             projs = []
-            for pp in self._adsorption.list_projects():
+            failures = copy.deepcopy(snapshot['failures'])
+            failures.extend({
+                'project_ref': f'ambiguous-project-{index}',
+                'code': 'duplicate_project_id',
+                'message': 'Registered project identity is ambiguous.',
+            } for index, _project_id in enumerate(
+                sorted(snapshot['duplicate_ids']), start=1))
+            records = [
+                record for record in snapshot['records']
+                if record['project_id'] not in snapshot['duplicate_ids']
+            ]
+            for registered_index, record in enumerate(records, start=1):
                 try:
-                    proj = self._adsorption.load_project(pp)
-                    if proj is None:
-                        continue
+                    proj = record['project']
                     states = self._member_states(proj)
                     summary = self._adsorption.delta_e_rows(proj)
                     raw_marker = (proj.get('autopilot_report')
@@ -8543,6 +10616,20 @@ class Api:
                     blocked = raw_blocked if use_legacy_blocked else {}
                     report_files = ((marker or {}).get('files') or
                                     (blocked or {}).get('files') or {})
+                    public_report_files = {
+                        str(fmt): True for fmt, value in report_files.items()
+                        if value
+                    }
+                    raw_contracts = ((marker or {}).get('contracts') or {})
+                    public_contracts = {
+                        str(kind): {
+                            field: contract.get(field)
+                            for field in ('schema', 'sha256', 'file_sha256', 'size')
+                            if field in contract
+                        }
+                        for kind, contract in raw_contracts.items()
+                        if isinstance(contract, dict)
+                    }
                     if raw_marker:
                         scientific_status = canonical['scientific_status']
                     elif use_legacy_blocked:
@@ -8574,7 +10661,8 @@ class Api:
                         (canonical.get('scientific_qualification') if raw_marker else '')
                         or ('diagnostic' if use_legacy_blocked else None))
                     projs.append({
-                        'path': pp, 'name': proj.get('name', '') or '',
+                        'project_id': record['project_id'],
+                        'name': proj.get('name', '') or '',
                         'profile': str((((proj.get('launch') or {}).get('resources') or {})
                                        .get('profile') or '')),
                         'stage': stage, 'stage_index': _STAGES.index(stage),
@@ -8583,8 +10671,10 @@ class Api:
                         'done': sum(1 for s in states if s['state'] == 'DONE'),
                         'total': len(states),
                         'artifact_status': artifact_status,
+                        'artifact_current': bool(canonical.get('artifact_current')),
                         'scientific_status': scientific_status,
                         'scientific_qualification': qualification,
+                        'scientific_stale': bool(canonical.get('scientific_stale')),
                         'publication_gate_status': publication_gate_status,
                         'desired_report_kind': desired_report_kind,
                         'report_kind': scientific_status,
@@ -8592,14 +10682,55 @@ class Api:
                         # this now reflects science state rather than file presence.
                         'report_status': scientific_status,
                         'report_reason': report_reason,
-                        'report_files': report_files,
-                        'report_contracts': (marker or {}).get('contracts') or {},
+                        'report_files': public_report_files,
+                        'report_contracts': public_contracts,
                     })
-                except Exception:                         # noqa: BLE001 单个坏项目跳过
-                    continue
-            return {'ok': True, 'projects': projs, 'error': None}
-        except Exception as e:                            # noqa: BLE001
-            return {'ok': False, 'projects': [], 'error': str(e)}
+                except Exception:                         # noqa: BLE001 单个坏项目降级但不泄露路径
+                    failures.append({
+                        'project_ref': f'registered-project-{registered_index}',
+                        'code': 'project_status_unavailable',
+                        'message': 'Registered project status could not be read.',
+                    })
+            registered_total = snapshot['registered_total']
+            successful_count = len(projs)
+            failed_count = len(failures)
+            if failed_count:
+                status = 'unavailable' if successful_count == 0 else 'degraded'
+                error = (
+                    'No registered project status could be read.'
+                    if status == 'unavailable' else
+                    f'{failed_count} of {registered_total} registered project statuses '
+                    f'could not be read; counts cover {successful_count} readable '
+                    'projects only.'
+                )
+            else:
+                status = 'ready'
+                error = None
+            return {
+                'ok': status != 'unavailable',
+                'status': status,
+                'registered_total': registered_total,
+                'successful_count': successful_count,
+                'failed_count': failed_count,
+                'failures': failures,
+                'projects': projs,
+                'error': error,
+            }
+        except Exception:                                 # noqa: BLE001 registry failure is public-safe
+            return {
+                'ok': False,
+                'status': 'unavailable',
+                'registered_total': None,
+                'successful_count': 0,
+                'failed_count': None,
+                'failures': [{
+                    'project_ref': 'project-registry',
+                    'code': 'project_registry_unavailable',
+                    'message': 'Registered projects could not be listed.',
+                }],
+                'projects': [],
+                'error': 'Project registry status is unavailable.',
+            }
 
     @staticmethod
     def _base(d):
@@ -8611,9 +10742,10 @@ class Api:
             return os.path.normcase(os.path.abspath(os.path.normpath(str(path))))
 
         managed_dirs = {}
-        for project_path in self._adsorption.list_projects():
+        for registered_index, project_path in enumerate(
+                self._adsorption.list_projects(), start=1):
             try:
-                project = self._adsorption.load_project(project_path)
+                project = self._load_project_for_path(project_path)
                 launch = (project or {}).get('launch') or {}
                 resources = launch.get('resources') or {}
                 if not (project or {}).get('autopilot_managed') or resources.get('profile') != name:
@@ -8626,8 +10758,10 @@ class Api:
                 for path in submitted_dirs:
                     if path and _key(path) in member_dirs:
                         managed_dirs[_key(path)] = str(path)
-            except Exception as exc:                     # noqa: BLE001 单个坏项目不拖停同服务器
-                errors.append(f'集群「{name}」项目托管清单读取失败({project_path}):{exc}')
+            except Exception:                             # noqa: BLE001 isolated project
+                errors.append(
+                    f'集群「{name}」项目托管清单读取失败'
+                    f'(registered-project-{registered_index})')
 
         def _in_scope(job_dir):
             # 空白名单必须 fail closed，绝不能退化成“台账里的所有旧任务”。
@@ -8636,13 +10770,13 @@ class Api:
         sync_ok = True
         did_remote_action = False
 
-        def _record_remote_failure(stage, detail):
+        def _record_remote_failure(stage, _detail=None):
             nonlocal sync_ok
             sync_ok = False
             label = {'refresh': '刷新', 'continue': '续算', 'fetch': '下载'}.get(stage, stage)
-            text = f'集群「{name}」{label}跳过:{detail}'
+            text = f'集群「{name}」{label}失败；请查看集群诊断'
             events.append({'kind': stage, 'cluster': name, 'text': text})
-            errors.append(f'集群「{name}」同步失败({label}):{detail}')
+            errors.append(f'集群「{name}」同步失败({label})')
 
         # project.launch.submitted_job_dirs 是远程写操作的授权真源；台账只是 UI 索引，
         # 丢条目后仍须继续监控明确托管的项目，不能静默停管。
@@ -8663,9 +10797,9 @@ class Api:
             did_remote_action = True
             for d, note in (res.get('results') or []):
                 events.append({'kind': 'refresh', 'cluster': name,
-                               'text': f'{self._base(d)}:{note}'})
+                               'text': f'集群「{name}」任务状态已刷新'})
                 if str(note).startswith('查询失败:'):
-                    _record_remote_failure('refresh', f'{self._base(d)}:{note}')
+                    _record_remote_failure('refresh')
         entries2 = [(path, self._manifest.load_manifest(path))
                     for path in managed_dirs.values()]
         # 续算:刷新后 restartable 终态且 attempts<3 → 自动续算(复用 filter_continuable)
@@ -8682,11 +10816,11 @@ class Api:
                     did_remote_action = True
                     for d, ok, msg in (cres.get('results') or []):
                         events.append({'kind': 'continue', 'cluster': name,
-                                       'text': f'{self._base(d)}:{msg}'})
+                                       'text': f'集群「{name}」续算请求已处理'})
                         if not ok:
-                            _record_remote_failure('continue', f'{self._base(d)}:{msg}')
-            except Exception as e:                        # noqa: BLE001 单集群失败不拖垮其它集群
-                _record_remote_failure('continue', str(e))
+                            _record_remote_failure('continue')
+            except Exception:                             # noqa: BLE001 isolated cluster
+                _record_remote_failure('continue')
         # 拉回：不能只看“本轮新变 DONE”。应用可能在任务结束后才重启，此时本地
         # 没有 fetched_at/关键输出；每拍重新检查缺口，fetch_results 成功写 fetched_at，
         # 因而完整结果天然幂等，未完整的结果会在下拍继续补拉。
@@ -8708,11 +10842,11 @@ class Api:
                     did_remote_action = True
                     for d, ok, msg in (fres.get('results') or []):
                         events.append({'kind': 'fetch', 'cluster': name,
-                                       'text': f'{self._base(d)}:{msg}'})
+                                       'text': f'集群「{name}」结果回收请求已处理'})
                         if not ok:
-                            _record_remote_failure('fetch', f'{self._base(d)}:{msg}')
-            except Exception as e:                        # noqa: BLE001 单集群失败不拖垮其它集群
-                _record_remote_failure('fetch', str(e))
+                            _record_remote_failure('fetch')
+            except Exception:                             # noqa: BLE001 isolated cluster
+                _record_remote_failure('fetch')
         return sync_ok and did_remote_action
 
     def _project_all_done(self, states):
@@ -9194,7 +11328,7 @@ class Api:
             current_project = project
             current_summary = summary
             if project_path:
-                current_project = self._adsorption.load_project(str(project_path).strip())
+                current_project = self._load_project_for_path(str(project_path).strip())
                 if current_project is None:
                     raise _ReportInputChanged('报告已生成但项目在落盘前被移动或删除，未登记产物')
                 current_summary = self._adsorption.delta_e_rows(current_project)
@@ -9801,7 +11935,7 @@ class Api:
         """
         for pp in self._adsorption.list_projects():
             try:
-                proj = self._adsorption.load_project(pp)
+                proj = self._load_project_for_path(pp)
                 if proj is None:
                     continue
                 is_imported = bool(
@@ -9843,11 +11977,11 @@ class Api:
                 report_dir = os.path.join(root, 'report')
                 os.makedirs(report_dir, exist_ok=True)
                 report_formats = self._available_report_formats()
-                rep = self.proj_report_bundle(
+                rep = self._proj_report_bundle_for_path(
                     pp, report_dir, report_formats, final=True,
                     stem=f'{name}_吸附能评估报告')
                 if not rep.get('ok'):
-                    errors.append(f'项目「{name}」自动报告失败:{rep.get("error")}')
+                    errors.append(f'项目「{name}」自动报告生成失败')
                     continue
                 report_files = {
                     str(fmt): str(path)
@@ -9893,28 +12027,26 @@ class Api:
                                 frozen_scientific_fingerprint),
                             expected_project_id=frozen_project_id,
                         )
-                    except Exception as e:                # noqa: BLE001
-                        errors.append(f'项目「{name}」报告标记落盘失败:{e}')
+                    except Exception:                     # noqa: BLE001 isolated project
+                        errors.append(f'项目「{name}」报告标记落盘失败')
                         continue
                 marker_science = self._report_marker_science_state(
                     proj, marker, summary)
                 if marker_science.get('stale'):
-                    errors.append(
-                        f'项目「{name}」报告验证状态在落盘后失效：'
-                        f'{marker_science.get("reason") or "请重新生成"}')
+                    errors.append(f'项目「{name}」报告验证状态在落盘后失效')
                     continue
-                primary = marker.get('file') or report_files.get('pdf') or report_files.get('html')
-                events.append({'kind': 'report_done', 'project': name,
-                               'report': primary, 'files': report_files,
+                events.append({'kind': 'report_done',
+                               'project_id': self._workspace_project_id(pp, proj),
+                               'project': name,
+                               'formats': sorted(report_files),
                                'report_kind': marker_science['kind'],
-                               'figures_dir': marker['figures_dir'],
                                'engine': 'paper_report_bundle',
                                'n_figures': len(rep.get('figures') or []),
                                'text': (f'项目「{name}」'
                                         f'{"最终" if marker_science["kind"] == "final" else "诊断"}'
                                         '报告（Word + PDF + HTML）已自动生成')})
-            except Exception as e:                        # noqa: BLE001 单项目失败不拖垮其他
-                errors.append(f'项目报告自动化异常:{e}')
+            except Exception:                             # noqa: BLE001 isolated project
+                errors.append('项目报告自动化异常')
 
     # ── 一键出图接线:全 DONE 项目自动出图升级(auto_figures 场景感知 + 期刊风格) ──
     def _af_scenario(self, proj):
@@ -9949,7 +12081,8 @@ class Api:
                             'engine': 'auto_figures'}
             except Exception:                             # noqa: BLE001 引擎不可用 → 回退
                 pass
-        fig = self.proj_figures(pp, ['bar', 'table', 'ladder'], out_dir)
+        fig = self._proj_figures_for_path(
+            pp, ['bar', 'table', 'ladder'], out_dir)
         return {'out_dir': fig.get('out_dir'), 'files': [], 'panel': None,
                 'manifest': [], 'engine': 'proj_figures'}
 
@@ -10001,15 +12134,23 @@ class Api:
     def pipeline_tick(self):
         """Run at most one automation tick in this backend process."""
         if not self._pipeline_lock.acquire(blocking=False):
-            return {
+            return self._pipeline_public_value({
                 'ok': True,
                 'events': [{'kind': 'skip', 'text': '上一轮自动托管仍在执行，本轮已跳过'}],
                 'errors': [], 'synced': 0,
                 'last_sync': time.strftime('%Y-%m-%d %H:%M:%S'),
                 'busy': True,
-            }
+            })
         try:
-            return self._pipeline_tick_once()
+            try:
+                outcome = self._pipeline_tick_once()
+            except Exception:                             # noqa: BLE001 browser boundary
+                outcome = {
+                    'ok': False, 'events': [],
+                    'errors': ['Pipeline automation failed.'], 'synced': 0,
+                    'last_sync': time.strftime('%Y-%m-%d %H:%M:%S'),
+                }
+            return self._pipeline_public_value(outcome)
         finally:
             self._pipeline_lock.release()
 
@@ -10030,33 +12171,38 @@ class Api:
             if ap['report']:
                 try:
                     self._tick_reports(events, errors)
-                except Exception as e:                    # noqa: BLE001
-                    errors.append(f'报告自动化失败:{e}')
+                except Exception:                         # noqa: BLE001 isolated stage
+                    errors.append('报告自动化失败')
             return {'ok': True, 'events': events, 'errors': errors, 'synced': 0,
                     'last_sync': time.strftime('%Y-%m-%d %H:%M:%S')}
         try:
             profiles = self._profiles.load_profiles()
-        except Exception as e:                            # noqa: BLE001
+        except Exception:                                 # noqa: BLE001 public-safe error
             profiles = {}
-            errors.append(f'读取集群配置失败:{e}')
+            errors.append('读取集群配置失败')
         # 项目仍声明托管、但配置已删除时必须明确报警；静默忽略会让用户误以为
         # 任务仍在监控。逐项目隔离，坏项目不能掩盖其它服务器。
         try:
-            for project_path in self._adsorption.list_projects():
+            for registered_index, project_path in enumerate(
+                    self._adsorption.list_projects(), start=1):
                 try:
-                    project = self._adsorption.load_project(project_path)
+                    project = self._load_project_for_path(project_path)
                     if not (project or {}).get('autopilot_managed'):
                         continue
                     profile_name = str(((((project or {}).get('launch') or {})
                                         .get('resources') or {}).get('profile') or '')).strip()
                     if profile_name and profile_name not in profiles:
+                        project_ref = self._workspace_project_id(
+                            project_path, project)
                         errors.append(
-                            f'托管项目「{(project or {}).get("name") or project_path}」引用的'
+                            f'托管项目「{project_ref}」引用的'
                             f'服务器「{profile_name}」已不存在；请恢复该配置或停止托管')
-                except Exception as exc:                 # noqa: BLE001
-                    errors.append(f'托管项目读取失败({project_path}):{exc}')
-        except Exception as exc:                         # noqa: BLE001
-            errors.append(f'托管项目注册表读取失败:{exc}')
+                except Exception:                         # noqa: BLE001 isolated project
+                    errors.append(
+                        '托管项目读取失败'
+                        f'(registered-project-{registered_index})')
+        except Exception:                                 # noqa: BLE001 public-safe error
+            errors.append('托管项目注册表读取失败')
         runnable = []
         for name, prof in profiles.items():
             try:
@@ -10069,17 +12215,17 @@ class Api:
                 else:
                     pw = None
                 runnable.append((name, prof, pw))
-            except Exception as e:                        # noqa: BLE001 单集群凭据失败隔离
-                errors.append(f'集群「{name}」读取凭据失败:{e}')
+            except Exception:                             # noqa: BLE001 isolated credential
+                errors.append(f'集群「{name}」读取凭据失败')
 
         def _run_cluster(name, profile, password):
             cluster_events, cluster_errors = [], []
             try:
                 did_sync = bool(self._tick_cluster(
                     name, profile, password, ap, cluster_events, cluster_errors))
-            except Exception as exc:                     # noqa: BLE001 单集群失败不拖垮其他
+            except Exception:                             # noqa: BLE001 isolated cluster
                 did_sync = False
-                cluster_errors.append(f'集群「{name}」同步失败:{exc}')
+                cluster_errors.append(f'集群「{name}」同步失败')
             return did_sync, cluster_events, cluster_errors
 
         completed = {}
@@ -10104,13 +12250,13 @@ class Api:
         if ap['campaigns']:
             try:
                 self._tick_campaigns(events, errors)
-            except Exception as e:                        # noqa: BLE001
-                errors.append(f'批次全链推进失败:{e}')
+            except Exception:                             # noqa: BLE001 isolated stage
+                errors.append('批次全链推进失败')
         if ap['report']:
             try:
                 self._tick_reports(events, errors)
-            except Exception as e:                        # noqa: BLE001
-                errors.append(f'报告自动化失败:{e}')
+            except Exception:                             # noqa: BLE001 isolated stage
+                errors.append('报告自动化失败')
         return {'ok': True, 'events': events, 'errors': errors, 'synced': synced,
                 'last_sync': time.strftime('%Y-%m-%d %H:%M:%S')}
 
@@ -10314,7 +12460,7 @@ class Api:
         job_builder 四件套链,INCAR 用用户提供的)→ 入台账;按 slab 建吸附能项目(清洁面
         + 构型族);引擎可用则同步注册 campaign(记预估机时)。
 
-        返回 {'ok','created','project_paths','skipped','campaign','error'}。
+        返回 {'ok','created','projects','skipped','campaign','error'}。
         """
         try:
             metals = [str(m).strip() for m in (metals or []) if str(m).strip()]
@@ -10330,7 +12476,7 @@ class Api:
             if not root:
                 errs.append('未选输出根目录')
             if errs:
-                return {'ok': False, 'created': 0, 'project_paths': [],
+                return {'ok': False, 'created': 0, 'projects': [],
                         'skipped': [], 'campaign': None, 'error': ';'.join(errs)}
             lib = ''
             try:
@@ -10339,7 +12485,7 @@ class Api:
                 pass
             sac = self._sac()
             rots = self._rotations_tuple(rotations)
-            created, project_paths, skipped, tasks = 0, [], [], []
+            created, projects, skipped, tasks = 0, [], [], []
             for metal in metals:
                 for template in templates:
                     label = f'{metal}@{template}'
@@ -10401,18 +12547,25 @@ class Api:
                                               'natoms': self._poscar_natoms(text)})
                                 created += 1
                     if config_dirs:
-                        pp = self._save_sac_project(base, proj_root, cdir, config_dirs)
-                        if pp:
-                            project_paths.append(pp)
+                        record = self._save_sac_project(
+                            base, proj_root, cdir, config_dirs)
+                        if record:
+                            projects.append({
+                                'project_id': self._workspace_project_id(
+                                    record['path'], record['project']),
+                                'name': str(record['project'].get('name') or base),
+                            })
             campaign = self._register_sac_campaign(root, tasks)
-            return {'ok': True, 'created': created, 'project_paths': project_paths,
-                    'skipped': skipped, 'campaign': campaign, 'error': None}
+            return self._project_public_result({
+                'ok': True, 'created': created, 'projects': projects,
+                'skipped': skipped, 'campaign': campaign, 'error': None})
         except Exception as e:                            # noqa: BLE001
-            return {'ok': False, 'created': 0, 'project_paths': [],
-                    'skipped': [], 'campaign': None, 'error': str(e)}
+            return {'ok': False, 'created': 0, 'projects': [],
+                    'skipped': [], 'campaign': None,
+                    'error': self._workspace_public_text(e)}
 
     def _save_sac_project(self, name, proj_root, clean_dir, config_dirs):
-        """按 slab 建吸附能项目(清洁面 + 构型族)并登记注册表 → project.yaml 路径|None。"""
+        """Persist one private SAC project record; never return it to the browser."""
         try:
             proj = {'name': name, 'root': proj_root, 'work_mode': 'lis',
                     'members': {'clean_slab': clean_dir, 'gas_ref': None,
@@ -10423,7 +12576,7 @@ class Api:
                 self._adsorption.register_project(pp)
             except Exception:                             # noqa: BLE001 注册失败不致命
                 pass
-            return pp
+            return {'path': pp, 'project': proj}
         except Exception:                                 # noqa: BLE001 建项目失败不拖垮生成
             return None
 
@@ -10919,7 +13072,23 @@ class Api:
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'presets': [], 'categories': [], 'error': str(e)}
 
-    def render_figure_preset(self, key, project_path, params=None):
+    def render_figure_preset(self, key, project_id, params=None):
+        try:
+            record = self._resolve_project_id(project_id)
+        except Exception:                                 # noqa: BLE001 public identity seam
+            return self._project_identity_failure(
+                files=[], skipped=[], out_dir=None, provenance=None)
+        result = self._call_with_project_bindings(
+            [record],
+            lambda: self._render_figure_preset_for_path(
+                key, record['path'], params=params),
+            failure={
+                'files': [], 'skipped': [], 'out_dir': None,
+                'provenance': None,
+            })
+        return self._project_public_result(result)
+
+    def _render_figure_preset_for_path(self, key, project_path, params=None):
         """按图表预设 + 当前项目出图:后端从项目数据装配 → figure_presets.render_preset 出图。
 
         能量学类(柱/表/热图)取 delta_e_rows 的已完成 ΔE;台阶图取 freeenergy/reactions 路径
@@ -10945,7 +13114,7 @@ class Api:
                 return {**empty, 'skipped': [{'kind': k,
                         'reason': '标度关系/火山图需多催化剂横向对比(≥3 组);'
                                   '请在④结果分析页用「多项目对比」出图。'}]}
-            proj = self._adsorption.load_project((project_path or '').strip())
+            proj = self._load_project_for_path((project_path or '').strip())
             if proj is None:
                 return {**empty, 'ok': False,
                         'error': '项目不存在或 project.yaml 已被移动'}
@@ -11002,14 +13171,29 @@ class Api:
             return {**empty, 'ok': False, 'error': str(e)}
 
     # ── 一键成稿包(Draft-Ready 收尾流水线) ────────────────────────────────────
-    def draft_ready(self, path, out):
+    def draft_ready(self, project_id, out):
+        try:
+            record = self._resolve_project_id(project_id)
+        except Exception:                                 # noqa: BLE001 public identity seam
+            return self._project_identity_failure(
+                summary=None, issues=[], products=[], issues_total=0,
+                summary_path=None, out_dir=None)
+        result = self._call_with_project_bindings(
+            [record], lambda: self._draft_ready_for_path(record['path'], out),
+            failure={
+                'summary': None, 'issues': [], 'products': [],
+                'issues_total': 0, 'summary_path': None, 'out_dir': None,
+            })
+        return self._project_public_result(result)
+
+    def _draft_ready_for_path(self, path, out):
         """一键成稿包:SI zip + 三线表 + 口径稽核 + Methods → {'ok','summary','issues','products'}。
 
         稽核不过/SI 缺关键输入仍产全套工件但 ok=False(DRAFT_READY.md 首行醒目);products 汇
         总全部落盘文件供前端列出 + open_dir。
         """
         try:
-            proj = self._adsorption.load_project((path or '').strip())
+            proj = self._load_project_for_path((path or '').strip())
             if proj is None:
                 return {'ok': False, 'summary': None, 'issues': [], 'products': [],
                         'issues_total': 0, 'summary_path': None, 'out_dir': None,
@@ -11977,7 +14161,7 @@ class Api:
             return {'ok': False, 'jobs': [], 'skipped': [], 'preflight': None,
                     'error': str(e)}
 
-    def jobs_cancel_batch(self, dirs, name, password, trust_new=False):
+    def jobs_cancel_batch(self, dirs, name, password, trust_new=False, idempotency_key=None):
         """批量取消集群作业(逐作业 qdel/scancel + 回写 manifest FAILED/用户取消)。
 
         返回 {'ok','cancelled':[job_id],'failed':[{job_id,reason}],'needs_trust','error'}。
@@ -11990,11 +14174,17 @@ class Api:
             prof, pw, err = self._resolve(name, password)
             if err:
                 return err
-            res = self._bo().cancel_batch(prof, ds, password=pw, trust_new=trust_new)
-            return {'ok': bool(res.get('ok')), 'cancelled': list(res.get('cancelled') or []),
-                    'failed': list(res.get('failed') or []),
-                    'needs_trust': bool(res.get('needs_trust')),
-                    **self._host_key_evidence(res), 'error': res.get('error')}
+            def _cancel():
+                res = self._bo().cancel_batch(
+                    prof, ds, password=pw, trust_new=trust_new)
+                return {'ok': bool(res.get('ok')),
+                        'cancelled': list(res.get('cancelled') or []),
+                        'failed': list(res.get('failed') or []),
+                        'needs_trust': bool(res.get('needs_trust')),
+                        **self._host_key_evidence(res), 'error': res.get('error')}
+            return self._run_job_operation_once(
+                idempotency_key, action='cancel', profile=prof.name,
+                dirs=ds, invoke=_cancel)
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'cancelled': [], 'failed': [],
                     'needs_trust': False, 'error': str(e)}
@@ -13069,6 +15259,13 @@ class Api:
     # 位置或关键字参(非 keyword-only):前端经 pywebview 桥按位置传参,keyword-only 会断桥。
     def formation_binding_calc(self, sac_dir, substrate_dir=None,
                                atom_energies=None, chem_pots=None):
+        return self._formation_binding_calc(
+            sac_dir, substrate_dir, atom_energies, chem_pots,
+            write_report=True)
+
+    def _formation_binding_calc(self, sac_dir, substrate_dir=None,
+                                atom_energies=None, chem_pots=None, *,
+                                write_report=False):
         """形成能/结合能计算器:DONE/完整性/方法闸 → references 计算 + σ。
 
         - sac_dir:单原子催化剂(SAC)作业目录(读 OSZICAR 末 E0 作 E_sac,读 CONTCAR/POSCAR 组成)。
@@ -13195,7 +15392,7 @@ class Api:
                       'sigma': sigma, 'stable': stable, 'stability_note': stab_note,
                       'hints': hints, 'warnings': warnings, 'method_check': method_check,
                       'evidence': completion_evidence, 'error': None}
-            if result['ok']:
+            if result['ok'] and write_report:
                 try:
                     from vcstudio.project import special_report
                     evidence_dirs = [sd] + ([sub] if sub else [])
@@ -13457,6 +15654,8 @@ class Api:
                 out = self._ta().analyze_bader(d)
             elif route == 'chgdiff':
                 out = self._ta().analyze_chgdiff(d)
+            elif route == 'elf':
+                out = self._ta().analyze_elf(d)
             elif route == 'generic':
                 out = self._ta().analyze_vasp_outputs(d, k)
             elif route == 'freq':
@@ -13603,6 +15802,11 @@ class Api:
                 'summary': summary, 'files': [fig] if fig else [], 'error': None}
 
     def surface_energy_calc(self, slab_dir, bulk_dir, e_bulk_per_atom=None, area=None):
+        return self._surface_energy_calc(
+            slab_dir, bulk_dir, e_bulk_per_atom, area, write_report=True)
+
+    def _surface_energy_calc(self, slab_dir, bulk_dir, e_bulk_per_atom=None, area=None,
+                             *, write_report=False):
         """表面能计算器:选 slab + bulk 作业 → γ (J/m²)。面积从 slab POSCAR 自动算。
 
         slab/bulk 都必须通过 DONE + 干净收尾闸，已知方法冲突拒绝大数相减。
@@ -13679,16 +15883,17 @@ class Api:
                         'evidence': completion_evidence,
                         'note': result.get('note') or
                         f'γ = (E_slab − N·E_bulk)/2A = {gamma:.4f} J/m²', 'error': None}
-            try:
-                from vcstudio.project import special_report
-                evidence_dirs = [sd] + ([(bulk_dir or '').strip()]
-                                        if (bulk_dir or '').strip() else [])
-                response['report_file'] = special_report.write(
-                    '表面能报告', response, evidence_dirs,
-                    os.path.join(sd, 'vcstudio-surface-energy-report.html'))
-            except Exception as report_error:             # noqa: BLE001
-                response['report_file'] = None
-                warnings.append(f'报告生成失败：{report_error}')
+            response['report_file'] = None
+            if write_report:
+                try:
+                    from vcstudio.project import special_report
+                    evidence_dirs = [sd] + ([(bulk_dir or '').strip()]
+                                            if (bulk_dir or '').strip() else [])
+                    response['report_file'] = special_report.write(
+                        '表面能报告', response, evidence_dirs,
+                        os.path.join(sd, 'vcstudio-surface-energy-report.html'))
+                except Exception as report_error:         # noqa: BLE001
+                    warnings.append(f'报告生成失败：{report_error}')
             return response
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'gamma_jm2': None, 'warnings': [],
@@ -13847,14 +16052,25 @@ class Api:
                             'quantity': 'E_ads', 'value': float(r['delta_e'])})
         return out
 
-    def ai_compare(self, project_path, reference):
+    def ai_compare(self, project_id, reference):
+        try:
+            record = self._resolve_project_id(project_id)
+        except Exception:                                 # noqa: BLE001 public identity seam
+            return self._project_identity_failure(n=0)
+        result = self._call_with_project_bindings(
+            [record],
+            lambda: self._ai_compare_for_path(record['path'], reference),
+            failure={'n': 0})
+        return self._project_public_result(result)
+
+    def _ai_compare_for_path(self, project_path, reference):
         """项目计算值 × 文献参考(体系×物种×量对齐)→ MAE/RMSE/最差3项/对照表(纯确定性)。
 
         reference 为 ai_extract_tables 的 tables(或已归一参考集)。返回 {'ok','n','mae','rmse',
         'worst','pairs','unmatched','summary','error'};无对齐项 ok=True 但 n=0 + 说明。
         """
         try:
-            proj = self._adsorption.load_project((project_path or '').strip())
+            proj = self._load_project_for_path((project_path or '').strip())
             if proj is None:
                 return {'ok': False, 'n': 0, 'error': '项目不存在或 project.yaml 已移动'}
             pd = self._pd()
@@ -13873,10 +16089,22 @@ class Api:
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'n': 0, 'error': str(e)}
 
-    def ai_write_validation(self, project_path, reference, out=None):
+    def ai_write_validation(self, project_id, reference, out=None):
+        try:
+            record = self._resolve_project_id(project_id)
+        except Exception:                                 # noqa: BLE001 public identity seam
+            return self._project_identity_failure(path=None, n=0)
+        result = self._call_with_project_bindings(
+            [record],
+            lambda: self._ai_write_validation_for_path(
+                record['path'], reference, out=out),
+            failure={'path': None, 'n': 0})
+        return self._project_public_result(result)
+
+    def _ai_write_validation_for_path(self, project_path, reference, out=None):
         """把文献对照写成 validation.md(项目 report/ 下或指定路径)→ {'ok','path','n','error'}。"""
         try:
-            proj = self._adsorption.load_project((project_path or '').strip())
+            proj = self._load_project_for_path((project_path or '').strip())
             if proj is None:
                 return {'ok': False, 'path': None, 'error': '项目不存在或 project.yaml 已移动'}
             pd = self._pd()
@@ -13918,19 +16146,32 @@ class Api:
             return {'ok': False, 'variants': [], 'matrix_spec': {},
                     'plan': {}, 'error': str(e)}
 
-    def ai_manuscript(self, project_path, fmt='markdown', reference=None):
+    def ai_manuscript(self, project_id, fmt='markdown', reference=None):
+        try:
+            record = self._resolve_project_id(project_id)
+        except Exception:                                 # noqa: BLE001 public identity seam
+            return self._project_identity_failure(path=None)
+        result = self._call_with_project_bindings(
+            [record],
+            lambda: self._ai_manuscript_for_path(
+                record['path'], fmt=fmt, reference=reference),
+            failure={'path': None})
+        return self._project_public_result(result)
+
+    def _ai_manuscript_for_path(
+            self, project_path, fmt='markdown', reference=None):
         """生成论文骨架:Methods 全自动 + Results 逐图数据句 + 占位待补 → 诚实展示自动/占位比。
 
         返回 {'ok','path','md_path','docx_path','docx_available','sections','stats':{auto,
         placeholder,total,auto_ratio},'note','error'}。fmt='docx' 时缺 python-docx 降级只出 .md。
         """
         try:
-            proj = self._adsorption.load_project((project_path or '').strip())
+            proj = self._load_project_for_path((project_path or '').strip())
             if proj is None:
                 return {'ok': False, 'path': None, 'error': '项目不存在或 project.yaml 已移动'}
             comparison = None
             if reference is not None:
-                cr = self.ai_compare(project_path, reference)
+                cr = self._ai_compare_for_path(project_path, reference)
                 if cr.get('ok') and cr.get('n'):
                     comparison = {'pairs': cr.get('pairs'), 'mae': cr.get('mae'),
                                   'rmse': cr.get('rmse'), 'n': cr.get('n'),

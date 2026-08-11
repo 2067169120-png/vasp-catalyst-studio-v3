@@ -28,7 +28,9 @@
     const scope = root || document;
     scope.querySelectorAll('[data-acc][data-sum]').forEach(el => {
       const head = el.querySelector(':scope > .acc-h > button.acc-toggle');
-      const summary = head && head.querySelector(':scope > .acc-sum');
+      const summaries = head ? Array.from(head.querySelectorAll(':scope > .acc-sum')) : [];
+      const summary = summaries.shift() || null;
+      summaries.forEach(extra => extra.remove());
       if (summary) summary.textContent = localizedAccordionSummary(el);
     });
   }
@@ -54,7 +56,9 @@
         head.insertBefore(car, head.firstChild);
       }
       const sum = localizedAccordionSummary(el);
-      if (sum && !head.querySelector('.acc-sum')) {
+      const existingSummaries = Array.from(head.querySelectorAll(':scope > .acc-sum'));
+      existingSummaries.slice(1).forEach(extra => extra.remove());
+      if (sum && !existingSummaries.length) {
         const s = document.createElement('span');
         s.className = 'acc-sum';
         s.textContent = sum;

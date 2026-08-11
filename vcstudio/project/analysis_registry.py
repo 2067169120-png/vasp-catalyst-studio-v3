@@ -27,6 +27,10 @@ VIEW_TEMPLATE_SCHEMA = "vcstudio.analysis-view-template/v1"
 DATA_MODES = ("stable", "all")
 MISSING_POLICIES = ("show_missing", "complete_cases")
 SORT_DIRECTIONS = ("asc", "desc")
+CAPABILITY_STATUSES = (
+    "available", "missing_prerequisite", "mode_mismatch",
+    "not_implemented", "unavailable",
+)
 ANALYSIS_CATEGORIES = (
     "energy-stability",
     "thermodynamics-kinetics",
@@ -198,6 +202,16 @@ _ANALYSES = (
     },
 )
 _ANALYSIS_BY_ID = {record["id"]: record for record in _ANALYSES}
+
+_NEXT_ACTIONS = {
+    "adsorption-energy": "Complete project member energies and reference evidence, then refresh.",
+    "free-energy-path": "Use an explicit Li-S work mode and complete its reaction-path evidence.",
+    "task-results": "Complete a registered project member or descendant job, then refresh.",
+    "electronic-structure": "Create and complete a DOS/PDOS, bands, or work-function descendant job.",
+    "charge-wavefunction": "Create and complete a Bader or charge-difference descendant job.",
+    "multi-project-comparison": "Register at least two comparable projects with method evidence.",
+    "property-calculators": "Create a manifest-bound surface, formation/binding, or VASPsol operand set.",
+}
 
 _VIEW_TEMPLATES = (
     {
@@ -493,10 +507,22 @@ def analysis_catalog() -> dict[str, Any]:
         # browser capability.  The stable task key is sufficient for dispatch.
         task.pop("builder_ref", None)
         tasks.append(task)
+    analyses = copy.deepcopy(list(_ANALYSES))
+    for analysis in analyses:
+        analysis.update({
+            "implementation_status": "live",
+            # A project-specific bootstrap replaces this neutral state with a
+            # server preflight/result state.  The catalog alone has no source
+            # authority and therefore cannot claim availability.
+            "capability_status": "unavailable",
+            "activatable": False,
+            "next_action": _NEXT_ACTIONS[analysis["id"]],
+        })
     return {
         "schema": CATALOG_SCHEMA,
-        "analyses": copy.deepcopy(list(_ANALYSES)),
+        "analyses": analyses,
         "categories": list(ANALYSIS_CATEGORIES),
+        "capability_statuses": list(CAPABILITY_STATUSES),
         "task_capabilities": tasks,
         "view_templates": builtin_view_templates(),
         "data_modes": list(DATA_MODES),
@@ -522,7 +548,7 @@ def analysis_catalog() -> dict[str, Any]:
 
 
 __all__ = [
-    "ANALYSIS_CATEGORIES", "CATALOG_SCHEMA", "DATA_MODES",
+    "ANALYSIS_CATEGORIES", "CAPABILITY_STATUSES", "CATALOG_SCHEMA", "DATA_MODES",
     "MISSING_POLICIES", "SPEC_SCHEMA", "VIEW_TEMPLATE_SCHEMA",
     "AnalysisRequestError", "AnalysisSpec", "analysis_catalog",
     "builtin_view_templates", "get_analysis", "normalize_analysis_request",

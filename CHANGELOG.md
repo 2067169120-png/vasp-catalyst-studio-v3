@@ -2,7 +2,9 @@
 
 ## [Unreleased] — V4.0.0
 
-V4.0.0 尚未发布。本节汇总 Phase A–E 已合入但尚未形成正式 release 的工作。
+V4.0.0 尚未发布，`v4.0.0` 标签也尚未创建。本节汇总当前 Unreleased 工作树中已实现的工作。2026-08-12 已完成本地最终门禁：免缓存完整 pytest 为 **3581 passed、5 skipped**（247.79 秒；15 条 ASE/NumPy 上游弃用警告），全仓 Ruff 和 23 个第一方 JavaScript 文件的 `node --check` 均通过；PyInstaller 单文件构建成功。最终 EXE 为 **113,290,120 bytes（108.04 MiB）**，SHA-256 为 `8298a608b0b24d44213c5d10d8235ce6bdc9ab61aff0fe62e42c2a8aa052b642`。
+
+V4.0.0 is not released, and the `v4.0.0` tag has not been created. This section records implemented work in the current Unreleased tree. The final local gates ran on 2026-08-12: cache-free full pytest completed with **3581 passed and 5 skipped** (247.79 s; 15 upstream ASE/NumPy deprecation warnings); full-repository Ruff and `node --check` for 23 first-party JavaScript files passed; and the PyInstaller one-file build succeeded. The final EXE is **113,290,120 bytes (108.04 MiB)**, SHA-256 `8298a608b0b24d44213c5d10d8235ce6bdc9ab61aff0fe62e42c2a8aa052b642`.
 
 ### 报告、状态与项目工作区（Phase A–B）
 - 建立报告与状态合同，明确稳定项目身份、服务端快照、门禁结论、产物状态和 revision
@@ -24,9 +26,73 @@ V4.0.0 尚未发布。本节汇总 Phase A–E 已合入但尚未形成正式 re
 - 分离“可生成”与“可访问性”能力：HTML、DOCX、PDF 分别记录视觉、可搜索、语义结构、
   文档语言、元数据、图片替代文本、tagged / PDF-UA 和人工复核要求；未验证的能力不作过度声明。
 
+### 项目身份、批处理与恢复 / Project identity, batch operations, and recovery
+- Project 新增 Clone、Move 与 Adopt Copy 的服务端预检/确认流程。Clone 铸造新身份，Move 保留身份，
+  Adopt Copy 默认重铸身份；只重定位项目内 locator，不覆盖已存在目标。注册表/台账失败触发回滚，
+  无法完整回滚时保留 partial-rollback 恢复证据，不报告假成功。
+  Project now provides server-preflighted, explicitly confirmed Clone, Move, and Adopt Copy flows. Clone
+  mints a new identity, Move preserves identity, and Adopt Copy remints by default. Existing destinations
+  are never overwritten; failed registry/ledger updates roll back or retain explicit partial-recovery evidence.
+- Jobs 新增 Selection Tray 与 Batch Review，完整显示跨筛选选择和隐藏项；提交、续算、取消采用服务端
+  幂等键，页面互斥锁阻止重复并发副作用。Jobs、Project、Analysis 与 Publish 的长操作汇入统一
+  Operation Queue。Home 新增 Resume Center，只恢复有界草稿引用并重新读取权威状态。
+  Jobs now includes a Selection Tray and Batch Review, including filter-hidden selections. Server
+  idempotency and a UI mutex prevent duplicate remote effects. Long Project/Jobs/Analysis/Publish operations
+  share one Operation Queue, while Resume Center restores bounded draft references without promoting them.
+
+### 分析、资源与治理 / Analysis, resources, and governance
+- Analysis capability cards 以服务端证据区分 available、missing prerequisite、mode mismatch、
+  not implemented 与 unavailable。Task Results、DOS/PDOS、Bands/带隙、功函数、Bader、差分电荷和
+  Property calculators 使用真实 parser、来源 hash、opaque ID 与分母；浏览器不复算数值。
+  Capability cards expose server-owned availability and evidence. Task Results, DOS/PDOS, bands/gaps,
+  work function, Bader, charge-density difference, and property calculators use real parsers, opaque sources,
+  hashes, and denominators rather than browser-computed values.
+- **ELF 分布摘要解析已接入**：严格校验 ELFCAR 主网格、有限数和物理范围，并输出确定性统计、
+  分位点、直方图与来源哈希；它不宣称成键、盆、临界点或拓扑结论。The read-only ELF parser
+  reports a validated distribution summary only, never a bonding or topology conclusion.
+- 新增只读资源预测和实验室建议策略。预测缺历史/输入时保持低置信度或 unavailable，不授权提交；
+  策略必须显式确认、带 revision/hash，且不改写旧作业。治理后的下一步计算建议只从绑定当前数据指纹、
+  经人工科学复核且允许 final 的 ValidationResult 生成；确认只产生不含命令、绝不自动提交的 draft intent。
+  Read-only resource forecasts and laboratory recommendation policies never authorize submission or rewrite
+  existing jobs. Governed next-calculation recommendations require a human-reviewed, final-allowing validation
+  bound to the current fingerprint; confirmation creates a non-executable draft intent only.
+
+### 报告洞察与可复现性 / Report insights and reproducibility
+- Publish → Versions 新增 scientific diff：从权威 history 选择两个 revision，分别重新校验 bundle，
+  比较 scope、输入/快照 hash、validation、科学资格、模型/表格数值、图表及 manifest/file hash，
+  不以日期差异代替科学差异。Scientific diff revalidates both authoritative revisions and compares frozen
+  scientific content and hashes, never dates alone.
+- 新增 Evidence/Claim Graph，只从冻结 model/spec/snapshot/validation/claim 记录建立 conclusion/table/
+  figure/check/source/job/file-hash 关系，缺边显式标记且不泄漏本地路径。
+  Evidence/Claim Graph derives only from frozen records, marks missing links, and omits local paths.
+- 新增确定性 SI capsule：包含规范化合同、输入 manifest、模型/图表元数据、Methods、BibTeX、环境/版本、
+  validation、capsule manifest 与 `SHA256SUMS`；排除密钥、绝对路径、缓存和 mutable live files，
+  使用有 TTL/上限的单次目录 token，并以 no-overwrite 写入。Diagnostic/blocked capsule 仍不是 scientific final。
+  Deterministic SI capsules are redacted, self-checksummed, destination-token bounded, and no-overwrite.
+  Export success does not upgrade a diagnostic/blocked revision to scientific final.
+
+### 冻结发行门 / Frozen release gate
+- Windows package-smoke 现配置为构建真实最终 EXE，并在冻结进程内强制运行 `full` 与 `journey`。
+  Journey 隔离 HOME/config、禁用网络、运行真实 Api/ReportService、离线作业、Analysis preview 和
+  diagnostic HTML 报告，然后重建服务并验证项目/作业/report history/status 持久化。
+  Windows package-smoke is configured to run both `full` and `journey` inside the real frozen executable.
+  The journey is offline and isolated, exercises the real bridge and diagnostic report path, then verifies
+  persistence after service reconstruction.
+
 ### 验证
-- 2026-08-11 在本机执行整库 pytest：**3336 passed, 5 skipped**。测试数量会随代码演进；
-  当前通过数、跳过数和失败状态始终以 CI 或实际执行的 pytest 输出为准。
+- 上述新增能力已执行聚焦 Python 合同测试和/或真实 Node 生产 IIFE 回归；最终冻结 EXE 中的 `full` 与
+  `journey` 都以退出码 0 完成，并各自报告 `ok=true`、`frozen=true`。`journey` 完成 10/10 阶段、网络尝试
+  为 0、集群操作为 0，且服务重建后的重启持久化检查通过；它仍保持 Analysis `unverified/blocked`、report
+  `diagnostic/blocked`，没有伪造科学验证。
+  The features above have focused Python and/or executable-Node production-script coverage. In the final frozen EXE,
+  both `full` and `journey` exited 0 and reported `ok=true` and `frozen=true`; journey completed 10/10 phases with
+  0 network attempts, 0 cluster operations, and passed restart persistence after service reconstruction, while
+  preserving honest Analysis `unverified/blocked` and report `diagnostic/blocked` scientific states.
+- GitHub-hosted 远端 CI 仍待变更推送后运行，不能由本地门禁替代；5 个 skip 不等于功能通过。未执行真实远程集群
+  作业或真实科学/实验验证，因此 Unreleased 不能据此描述为科学有效或正式 release-ready。
+  GitHub-hosted CI remains pending until the changes are pushed and is not replaced by local gates; the 5 skips are
+  not functionality passes. No real remote-cluster work or scientific/experimental validation was performed, so
+  Unreleased must not be described as scientifically validated or formally release-ready.
 
 ## v3.3.0 — 2026-07-18 · 对齐 starpivot 体验四缺口:实时曲线 / 贴图识别 / 实耗核时 / VMD 场景补齐
 

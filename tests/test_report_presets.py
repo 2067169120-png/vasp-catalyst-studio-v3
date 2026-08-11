@@ -383,6 +383,32 @@ def test_outline_is_nonempty_unique_and_renderer_bounded(outline):
         normalize_report_request(_request(outline=outline), project_id=PROJECT_ID)
 
 
+@pytest.mark.parametrize("preset_id", PRESET_IDS)
+def test_methods_only_outline_cannot_claim_final_for_any_server_preset(preset_id):
+    with pytest.raises(
+        ReportRequestError,
+        match="final report outline.*scientific result section",
+    ):
+        normalize_report_request(
+            _request(
+                preset_id=preset_id,
+                requested_kind="final",
+                outline=["methods"],
+            ),
+            project_id=PROJECT_ID,
+        )
+
+
+def test_methods_only_outline_remains_available_for_explicit_diagnostic_work():
+    spec = normalize_report_request(
+        _request(requested_kind="diagnostic", outline=["methods"]),
+        project_id=PROJECT_ID,
+    )
+
+    assert spec.requested_kind == "diagnostic"
+    assert spec.outline == ("methods",)
+
+
 @pytest.mark.parametrize("formats", [
     [],
     "html",

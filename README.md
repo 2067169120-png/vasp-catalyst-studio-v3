@@ -26,6 +26,22 @@ The deterministic core runs locally and over user-configured SSH connections. Ex
 
 全局项目上下文贯穿 Prepare、Run、Analyze 和 Publish。深链接、未保存状态与当前工作模式均显式处理；界面切换不会把显示层状态写成科学事实。
 
+### 已实现的 Web 工作流与边界
+
+当前 Web 工作台已实现下列用户流程，并为后端合同或生产 JavaScript 状态机提供了聚焦自动化测试。这里的“已实现”只表示相应软件合同已落地，不表示当前工作树已经完成 root 全量回归、重建最终 EXE 或通过远端 CI，更不表示 diagnostic/blocked 数据通过了科学验证。
+
+| 区域 | 已实现能力 | 必须保留的边界 |
+|---|---|---|
+| Project | Clone、Move、Adopt Copy；操作前预检、显式确认、注册表/台账更新和失败回滚 | Clone 铸造新项目身份；Move 保留原身份；Adopt Copy 默认重新铸造身份。目标已存在时不覆盖；部分回滚会留下明确恢复证据，不报告假成功 |
+| Run / Jobs | Selection Tray、包含筛选后隐藏项的 Batch Review、统一 Operation Queue、提交/续算/取消幂等键 | 一次只运行一个互斥批操作；重复请求不会再次执行远程副作用；资源预测只读且不授权提交 |
+| Analyze | capability cards；Task Results；DOS/PDOS、Bands、功函数、Bader、差分电荷、ELF 分布摘要；Property calculators | 只显示服务端解析器给出的数值、来源 hash 和分母。ELF 解析严格校验 ELFCAR 主网格并仅给分布统计，不据此宣称成键、盆、临界点或拓扑结论 |
+| Analyze / Governance | 下一步计算建议与确认后的只读 draft intent | 只从绑定当前数据指纹、经人工科学复核的 ValidationResult 和冻结分析信号派生；不含命令，不授权或自动提交作业 |
+| Publish | revision scientific diff、Evidence/Claim Graph、确定性 SI capsule | 每次从权威历史重新校验冻结 revision；缺失证据边显式标记。capsule 去除密钥/绝对路径、不覆盖已有文件；生成 diagnostic capsule 不等于科学 final |
+| Home / Resume Center | 恢复当前会话的设置、导入流程和报告配置草稿入口 | 恢复的是有界草稿引用和权威持久状态，不把浏览器草稿提升为项目事实或已发布报告 |
+| Environment / Jobs | 实验室策略模板和基于台账/manifest 的资源预测 | 都是建议；策略必须显式确认且不改写旧作业，预测缺证据时保持 unavailable/低置信度，二者都不能旁路提交确认和幂等门禁 |
+
+这些新工作台能力属于默认 Web 界面。`vcs gui --legacy` / `vcs-gui` 的 Tk 四页界面仅用于兼容，不提供当前 Web shell、Project lifecycle、Selection Tray、Resume Center、report insights 或治理建议合同。
+
 ## 启动
 
 Windows 打包版可直接启动 `dist\VASP Catalyst Studio.exe`。从源码启动默认 Web 工作台：
@@ -104,6 +120,12 @@ ReportSpec → ReportSnapshot → ValidationResult → revision + manifest
 
 文件生成成功不证明科学结论为 final。输入在渲染期间变化时，产物可以保留为未登记文件，但不能写 ready marker 或冒充当前 revision。
 
+Publish → Versions 还提供三种只读/导出工具：
+
+- **Scientific diff**：选择两个权威 history revision，分别重新校验 bundle，再比较 ReportSpec scope、输入/快照 hash、validation 状态与 checks、科学资格、模型数值、图表以及文件/manifest hash；不会用日期差异冒充科学差异；
+- **Evidence/Claim Graph**：只从冻结 spec、snapshot、validation、model 和 claim 记录构建 conclusion/table/figure/check/source/job/file-hash 关系；缺边明确显示为 missing，不读取可变 live 文件，也不公开本地路径；
+- **SI capsule**：通过服务端目录选择生成确定性 ZIP，包含规范化合同、输入 manifest、模型/图表元数据、Methods、BibTeX、环境/版本、validation 记录、capsule manifest 和 `SHA256SUMS`；排除秘密、绝对路径、缓存和可变 live 文件，且绝不覆盖同名文件。
+
 格式边界：
 
 - HTML：具备语义结构、语言和图像描述基础；可访问性为 conditional，仍需浏览器、屏幕阅读器和人工复核；
@@ -130,9 +152,13 @@ LLM 可用于结果解读、论文方法段抽取和对话辅助。它不能修�
 python -m pytest
 ```
 
-2026-08-11 的一次全量证据记录为 **3336 passed, 5 skipped**。该数字是日期绑定的运行快照；当前分支的事实源始终是最新 `python -m pytest` 输出与 CI。
+2026-08-12 的本地最终门禁已实际运行：免缓存完整 `python -m pytest` 为 **3581 passed、5 skipped**，247.79 秒内出现 **15 条 ASE/NumPy 上游弃用警告**；全仓 Ruff 通过；23 个第一方 JavaScript 文件的 `node --check` 通过。PyInstaller 单文件构建成功，最终 EXE 为 **113,290,120 bytes（108.04 MiB）**，SHA-256 为 `8298a608b0b24d44213c5d10d8235ce6bdc9ab61aff0fe62e42c2a8aa052b642`。
 
-CI 矩阵覆盖 Ubuntu/Windows × Python 3.10、3.11、3.12。可选外部程序和平台能力可能产生有理由的 skip；skip 不应被改写为功能通过。
+该最终冻结 EXE 内的 `full` 和 `journey` healthcheck 都以退出码 0 完成，并各自报告 `ok=true`、`frozen=true`。`journey` 完成 10/10 个阶段，网络尝试为 0、集群操作为 0，且服务重建后的重启持久化检查通过。上述新增工作流也保留聚焦 Python 合同测试和/或真实 Node 生产 IIFE 回归；冻结 journey 保持 `blocked`/`diagnostic` 科学状态的诚实边界。
+
+这些是本地软件门禁，不替代 GitHub-hosted 远端 CI：变更尚未推送，远端 CI 结果仍待产生。`v4.0.0` 标签尚未创建，CHANGELOG 仍保持 Unreleased；5 个 skip 不等于对应功能通过。也未执行真实远程集群作业或真实科学/实验验证，不能从这些自动化检查、离线 journey 或 EXE 产物推断科学有效性或发布就绪。
+
+CI 矩阵覆盖 Ubuntu/Windows × Python 3.10、3.11、3.12。Windows package-smoke 会构建真实 EXE，并要求最终二进制的 `full` 与 `journey` 两个 profile 都成功后才上传 EXE 和 JSON 健康检查证据。
 
 ## 仓库地图
 

@@ -75,6 +75,42 @@ def test_submit_batch_closes_client_and_jump(monkeypatch):
     assert client.closed and jump.closed          # 跳板连接同样必须关
 
 
+def test_submit_batch_reports_cross_process_busy_as_structured_retryable_state(monkeypatch):
+    client, jump = _patch_open(monkeypatch)
+
+    def busy(*_args, **_kwargs):
+        raise batch_ops.submitter.JobOperationBusy('job is owned by another process')
+
+    monkeypatch.setattr(batch_ops.submitter, 'submit_job', busy)
+    payload = batch_ops.submit_batch(
+        object(), None, ['d1'], False, idempotency_key='jobop-busy-submit-001')
+
+    assert payload['busy'] is True
+    assert payload['code'] == 'job_busy' and payload['busy_count'] == 1
+    assert payload['results'] == [('d1', False, 'job is owned by another process')]
+    assert client.closed and jump.closed
+
+
+def test_submit_batch_reports_unknown_remote_submission_without_path(monkeypatch):
+    client, jump = _patch_open(monkeypatch)
+
+    def unknown(*_args, **_kwargs):
+        raise batch_ops.submitter.UnknownRemoteSubmission(
+            'manual recovery required', recovery_status='remote_accepted',
+            scheduler_job_id='991')
+
+    monkeypatch.setattr(batch_ops.submitter, 'submit_job', unknown)
+    payload = batch_ops.submit_batch(
+        object(), None, ['C:/secret/job'], False,
+        idempotency_key='jobop-recovery-submit-001')
+
+    assert payload['requires_manual_recovery'] is True
+    assert payload['code'] == 'unknown_remote_submission'
+    assert payload['scheduler_job_ids'] == ['991']
+    assert 'C:/secret/job' not in payload['results'][0][2]
+    assert client.closed and jump.closed
+
+
 def test_submit_batch_duplicate_selection_fails_whole_batch_before_network(tmp_path, monkeypatch):
     a = tmp_path / 'calc'
     a.mkdir()

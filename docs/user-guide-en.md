@@ -46,6 +46,8 @@ The launchers have different meanings:
 | `vcs gui --legacy` | Legacy four-tab Tkinter interface |
 | `vcs-gui` | Still the legacy four-tab Tkinter entry point; it is not the default Web UI |
 
+The legacy Tk UI is compatibility-only. It does not provide the current Web shell's Project lifecycle, Selection Tray, Resume Center, report insights, laboratory policies, or governed next-calculation recommendations.
+
 ## 2. Current information architecture
 
 The default Web interface has **7 top-level areas and 32 semantic routes**. Those routes reuse **11 ordinary physical workspace pages**; the AI Assistant opens as a drawer rather than another ordinary page.
@@ -61,6 +63,8 @@ The default Web interface has **7 top-level areas and 32 semantic routes**. Thos
 | Environment | Clusters, local runner, dependencies, data paths, templates, and settings |
 
 A global project context connects Prepare, Run, Analyze, and Publish. Deep links, moved projects, unsupported routes, and unsaved edits are handled explicitly; the interface does not silently substitute another project or turn display state into scientific state.
+
+The Home **Resume Center** lists resumable settings, imports, and report-configuration drafts from the current session. It stores bounded draft references only; opening one still makes the owning component reload authoritative server state. A browser draft does not become a project fact, job status, or published revision. Explicitly saved settings and published reports are already durable and do not depend on Resume Center.
 
 ## 3. First-time configuration
 
@@ -89,11 +93,23 @@ Settings selects the workflow mode, compute engine, and intended calculation typ
 
 VASP is the primary engine. CP2K, Gaussian, and CASTEP expose only their explicitly supported adapter capabilities.
 
+Environment → Settings also provides **laboratory recommendation policies**. A template may propose method and resource values, with explicit overrides limited to approved fields; previewing it changes no job. Confirmation persists a revisioned, hashed selection, but the policy remains `recommendation_only`: it does not rewrite existing `job.yaml` files, modify generated inputs, or submit work. A concurrent policy update produces a revision conflict and requires the user to review and confirm again.
+
 ## 4. End-to-end workflow
 
-### Create or select a project
+### Create, clone, move, or adopt a project
 
 Use Project to create or import a project, inspect its members, references, method fingerprint, and workflow stage. Project state is read from manifests and evidence, not inferred from a label on screen.
+
+Project lifecycle identity rules are explicit:
+
+| Operation | Identity and path semantics |
+|---|---|
+| Clone | Copies the current project to a new directory and mints a new project UUID/opaque ID and remote namespace; only project-local locators are rebased, while external references remain external |
+| Move | Moves the current project while preserving its UUID/opaque ID; project-local locators are rebased and the registry atomically replaces the old location for the same identity |
+| Adopt Copy | Claims an existing copied project folder; **Remint identity** is the default so two folders do not share one identity. Preserve is allowed only when explicitly selected and no identity/path conflict exists |
+
+All three flows use a server-selected source/destination and a dry-run preflight. No copy, move, or registry write occurs before explicit confirmation. Apply rechecks whether the project, registry, or ledger changed after preflight, and never overwrites an existing destination. Registry or ledger failure rolls back files, `project.yaml`, and registration projections. If the filesystem prevents complete rollback, the UI reports partial rollback and retains recovery evidence instead of reporting false success. Clone, Move, and Adopt also publish their lifecycle to the shared Operation Queue.
 
 ### Prepare structures and inputs
 
@@ -113,11 +129,15 @@ Minimal CLI generation:
 vcs gen --poscar POSCAR --incar my.incar --calc-type slab -o results/job1
 ```
 
-### Submit and monitor
+### Submit, batch-review, and monitor
 
 Run → Jobs supports single and batch submission, multi-server refresh, result fetching, remote file management, the local runner, and supported derived calculations.
 
 The nine-state `job.yaml` lifecycle records operational progress such as CREATED, SUBMITTED, and RUNNING. Submission is blocked before network access when the project, server, input, or capability contract is invalid.
+
+After selecting multiple jobs, the **Selection Tray** lists the entire selection. Jobs hidden by current status, cluster, or project filters remain counted and are called out explicitly. Expand **Batch Review** before Submit, Fetch, Continue, Cancel, or Remove. The page acquires an exclusive operation lock before confirmation can race with a second click. Submission, continuation, and cancellation also use server idempotency keys: retrying the same payload replays the recorded result, while an in-flight duplicate remains busy and cannot repeat the remote side effect. Long operations from Jobs, Project lifecycle, Analysis, and Publish share the global **Operation Queue**, with confirming/running/succeeded/failed states.
+
+The Selection Tray's **read-only resource forecast** reconstructs evidence from the server ledger, manifests, and matching historical task records. It reports a core-hour point estimate and range, confidence, failure rate, and budget risk; batch budget checks use the high end of the interval. Sparse history or incomplete inputs remain low-confidence/unavailable rather than guessed. A forecast always has `recommendation_only=true` and `authorizes_submission=false`; it cannot bypass confirmation, host trust, or idempotency gates.
 
 ### Diagnose and recover
 
@@ -136,11 +156,23 @@ The current implementation has:
 
 A permitted continuation validates CONTCAR, freezes INCAR, and is limited to three rounds. There are no unlimited silent retries.
 
-### Analyze
+### Analyze, Task Results, and governed recommendations
 
 Available analysis routes include adsorption, reaction thermodynamics, electronic structure, charge, NEB, comparisons, and custom properties. The current Multiwfn registry contains **14 analysis entries**, and the UI menu is derived from that registry.
 
 If convergence, reference state, structure, method fingerprint, unit, or complete-output evidence is missing, the result remains blocked or `unknown`.
+
+Start with the Analysis **capability cards**. The server assigns `available`, `missing_prerequisite`, `mode_mismatch`, `not_implemented`, or `unavailable`. A non-available card cannot run and offers one action tied to the actual missing condition. Numeric values, display precision, parser module/version, opaque source identity, manifest/file hashes, and denominators are finalized on the server; the browser does not recompute scientific values.
+
+Current parser boundaries are:
+
+- Electronic structure can parse DOS/PDOS, bands/band gaps, and work function from registered project members or manifest-linked descendants with `vasprun.xml`, `EIGENVAL`, `LOCPOT`, and `OUTCAR` evidence;
+- Charge and wavefunction can parse Bader and charge-density-difference results from `ACF.dat` and `CHGDIFF.vasp`;
+- **ELF has a read-only quantitative distribution parser.** The server validates the main `ELFCAR` grid, finite values, and physical ELF range, then reports grid shape, atom count, min/max/mean/std, deterministic quantiles, and a histogram. This is not a bond, basin, critical-point, or topology analysis;
+- **Task Results** summarizes server-parseable registered tasks and their evidence. A nearby directory outside the project-member/manifest-descendant chain is not silently included;
+- **Property calculators** currently cover surface energy, formation/binding energy, and VASPsol solvation energy from manifest-bound operands. Incomplete sources, missing parser identity/version, or calculation failure fail closed.
+
+The **Next-calculation recommendations** card is a governed read-only aid. Recommendations are produced only when the current analysis data fingerprint is bound to a `human_scientific_reviewed`, final-allowing ValidationResult, and only from frozen signals such as missing evidence, near-degeneracy, or sensitivity. Confirmation creates a hashed, non-executable draft intent. It contains no shell command, `sbatch`, `qsub`, or submission bridge and never creates or submits a job automatically. Missing human review, a closed final gate, or a fingerprint mismatch leaves the card blocked/unavailable.
 
 ## 5. Engine boundaries
 
@@ -187,6 +219,14 @@ Two independent axes must remain separate:
 
 A generated file is not proof of a final scientific conclusion. If project inputs change during rendering, files may be preserved for recovery but cannot become the current ready revision.
 
+Publish → Versions also provides:
+
+- **Scientific diff** — select two authoritative history revisions. The server revalidates each complete bundle and compares ReportSpec scope, snapshot/input hashes, validation checks/status, scientific qualification, table/model numbers, figures, and manifest/file hashes. A date difference alone is not a scientific difference;
+- **Evidence/Claim Graph** — derives conclusion, table, figure, check, source, job, and file-hash nodes/edges only from frozen model/spec/snapshot/validation/claim records. Missing links are explicit; mutable live files are not used to fill gaps, and local paths are not returned to the browser;
+- **SI capsule** — obtains a single-use opaque server token from the directory picker and writes a deterministic ZIP containing canonical input manifests, contracts, model/figure metadata, Methods, BibTeX, environment/version, validation records, a capsule manifest, and `SHA256SUMS`. Secrets, absolute paths, caches, and mutable live files are excluded. Destination tokens expire after 15 minutes, at most 64 pending tokens are retained, and an existing ZIP is never overwritten.
+
+These tools accept only the current opaque project ID and a revision ID. A stale or tampered bundle, wrong project, or missing evidence becomes stale/blocked/unavailable. A successfully written capsule proves the archive and checksums, not scientific validation; a diagnostic/blocked revision remains diagnostic/blocked rather than becoming final publication.
+
 ### Format and accessibility boundaries
 
 | Format | Current boundary |
@@ -225,6 +265,9 @@ See [matclaw-integration.md](matclaw-integration.md) for the assistant boundary.
 | AI is unavailable | It is off by default; enable external transfer explicitly and configure a credential only if desired |
 | DECIMER needs a download | The default EXE excludes DECIMER; an uncached model may require first-use network access |
 | Analysis is unknown or blocked | Follow the listed missing-evidence items rather than inferring a value |
+| The ELF card is unavailable | Check that the job is DONE, ELFCAR is complete, and method evidence is verifiable. The parser reports only an ELF distribution summary, not bonding or topology conclusions |
+| Next-calculation recommendations are unavailable | They require a human-scientific-reviewed, final-allowing ValidationResult bound to the current data fingerprint; the gate is not bypassed |
+| Clone/Move reports partial rollback | Do not repeat the mutation blindly. Preserve the recovery evidence and inspect the original location, destination, registry, and ledger before choosing recovery |
 
 ## 10. Tests, history, and citation
 
@@ -234,9 +277,13 @@ Run:
 python -m pytest
 ```
 
-A full-suite evidence snapshot on **2026-08-11** recorded **3336 passed, 5 skipped**. This is date-bound evidence; the current source of truth is always the latest pytest output and CI.
+The final local gates were actually run on 2026-08-12: cache-free full `python -m pytest` completed with **3581 passed and 5 skipped**, plus **15 upstream ASE/NumPy deprecation warnings**, in 247.79 s; full-repository Ruff passed; and `node --check` passed for 23 first-party JavaScript files. The PyInstaller one-file build succeeded. The final EXE is **113,290,120 bytes (108.04 MiB)** with SHA-256 `8298a608b0b24d44213c5d10d8235ce6bdc9ab61aff0fe62e42c2a8aa052b642`.
 
-CI covers Ubuntu and Windows on Python 3.10, 3.11, and 3.12.
+Inside that final frozen EXE, both `full` and `journey` healthchecks exited 0 and each reported `ok=true` and `frozen=true`. `journey` completed all 10/10 phases, recorded 0 network attempts and 0 cluster operations, and passed the restart-persistence check after service reconstruction. Project lifecycle, the Jobs state machine, Analysis source/capability handling, report insights, Resume Center, resource forecasting, laboratory policies, and next-calculation governance also retain focused Python and/or executable-Node production-script regressions; the frozen journey preserves honest `blocked`/`diagnostic` scientific states.
+
+These are local software gates, not a substitute for GitHub-hosted remote CI: the changes have not been pushed, so the hosted CI result remains pending. The `v4.0.0` tag has not been created and the changelog remains Unreleased; the 5 skips are not functionality passes. No real remote-cluster work or real scientific/experimental validation was performed, so automated checks, the offline journey, and the EXE artifact do not establish scientific validity or release readiness.
+
+CI covers Ubuntu and Windows on Python 3.10, 3.11, and 3.12. Windows package-smoke is configured to build the real single-file EXE and run both `full` and `journey` inside that final binary. Journey uses an isolated HOME/config, real Api/ReportService, minimal offline jobs, a real Analysis preview, a diagnostic HTML report, and service reconstruction followed by persistence checks.
 
 [progress-2026-07-16.md](planning/progress-2026-07-16.md) is a historical snapshot, not the current 4.0 capability or test baseline. Release history and its date-bound counts remain in [CHANGELOG.md](../CHANGELOG.md) and should not be mechanically replaced with current numbers.
 

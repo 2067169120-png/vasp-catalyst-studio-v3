@@ -6,7 +6,13 @@ import re
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from vcstudio.gui_web.api import Api
+from vcstudio.project.report_insights import (
+    CapsuleDestinations,
+    OpaqueDestinationRegistry,
+)
 
 
 _PNG = (
@@ -116,6 +122,7 @@ def _workbench_api(tmp_path):
         state["saved"].append(copy.deepcopy(value))
 
     adsorption = SimpleNamespace(
+        list_projects=lambda: [project_path],
         load_project=load_project,
         save_project=save_project,
         delta_e_rows=lambda project: copy.deepcopy(state["summary"]),
@@ -127,6 +134,49 @@ def _workbench_api(tmp_path):
         native_charts_mod=_Charts(),
     )
     return api, project_path, state, manifests
+
+
+def _project_id(api, project_path):
+    return api._workspace_project_id(
+        project_path, api._adsorption.load_project(project_path)
+    )
+
+
+def _destination_token(api, project_id, directory):
+    target = Path(directory)
+    target.mkdir(parents=True, exist_ok=True)
+    return api._workbench_destination_registry().register(
+        str(target), binding=project_id
+    )["destination_token"]
+
+
+def _publish(api, project_path, directory, preview, expected=None):
+    project_id = _project_id(api, project_path)
+    destination_token = _destination_token(api, project_id, directory)
+    return api.report_workbench_publish(
+        project_id,
+        destination_token,
+        preview["preview_id"],
+        preview["preview_token"] if expected is None else expected,
+    )
+
+
+def _assert_public_path_free(value, *private_paths):
+    encoded = json.dumps(value, ensure_ascii=False)
+    for private_path in private_paths:
+        assert str(private_path) not in encoded
+    forbidden_keys = {"path", "project_path", "root", "out_dir", "destination"}
+
+    def visit(item):
+        if isinstance(item, dict):
+            assert forbidden_keys.isdisjoint(item)
+            for nested in item.values():
+                visit(nested)
+        elif isinstance(item, list):
+            for nested in item:
+                visit(nested)
+
+    visit(value)
 
 
 def _html_request(project_id, **overrides):
@@ -149,11 +199,12 @@ def _html_request(project_id, **overrides):
 
 def test_workbench_preview_is_self_contained_and_has_no_project_side_effect(tmp_path):
     api, project_path, state, _ = _workbench_api(tmp_path)
-    boot = api.report_workbench_bootstrap(project_path, "diagnostic-repair")
+    project_id = _project_id(api, project_path)
+    boot = api.report_workbench_bootstrap(project_id, "diagnostic-repair")
     before = copy.deepcopy(state["project"])
 
     preview = api.report_workbench_preview(
-        project_path,
+        project_id,
         _html_request(
             boot["project_id"],
             outline=["executive_summary", "figures", "methods", "limitations"],
@@ -171,25 +222,25 @@ def test_workbench_preview_is_self_contained_and_has_no_project_side_effect(tmp_
 
 def test_workbench_final_request_is_gate_owned_and_publishes_bound_revision(tmp_path):
     api, project_path, state, _ = _workbench_api(tmp_path)
-    boot = api.report_workbench_bootstrap(project_path, "diagnostic-repair")
+    project_id = _project_id(api, project_path)
+    boot = api.report_workbench_bootstrap(project_id, "diagnostic-repair")
     request = _html_request(
         boot["project_id"], requested_kind="final", outline=[
             "executive_summary", "adsorption_table", "methods", "limitations"
         ]
     )
-    preview = api.report_workbench_preview(project_path, request)
+    preview = api.report_workbench_preview(project_id, request)
+    preview_record = api._reports()._previews[preview["preview_id"]]
+    preview_temp_root = Path(preview_record.temp_root)
     out_dir = tmp_path / "published"
 
-    published = api.report_workbench_publish(
-        project_path,
-        str(out_dir),
-        preview["preview_id"],
-        preview["preview_token"],
-    )
+    published = _publish(api, project_path, out_dir, preview)
 
     assert preview["scientific_status"] == "final"
     assert preview["scientific_qualification"] == "adsorption_result_verified"
     assert published["ok"] is True and published["artifact_status"] == "complete"
+    assert preview["preview_id"] not in api._reports()._previews
+    assert not preview_temp_root.exists()
     assert published["revision"]["sequence"] == 1
     assert published["revision"]["spec_sha256"] == preview["preview_token"]["spec_sha256"]
     assert published["files"]["html"]["available"] is True
@@ -204,34 +255,31 @@ def test_workbench_final_request_is_gate_owned_and_publishes_bound_revision(tmp_
 
 def test_workbench_publish_rejects_source_change_after_preview(tmp_path):
     api, project_path, state, manifests = _workbench_api(tmp_path)
-    boot = api.report_workbench_bootstrap(project_path, "diagnostic-repair")
+    project_id = _project_id(api, project_path)
+    boot = api.report_workbench_bootstrap(project_id, "diagnostic-repair")
     preview = api.report_workbench_preview(
-        project_path, _html_request(boot["project_id"], requested_kind="final")
+        project_id, _html_request(boot["project_id"], requested_kind="final")
     )
     config = state["project"]["members"]["configs"][0]
     manifests[config]["attempts"].append({"n": 2, "attempt_token": "config-a2"})
     manifests[config]["results"]["energy_e0_eV"] = -114.0
 
-    result = api.report_workbench_publish(
-        project_path,
-        str(tmp_path / "out"),
-        preview["preview_id"],
-        preview["preview_token"],
-    )
+    result = _publish(api, project_path, tmp_path / "out", preview)
 
     assert result["ok"] is False
     assert result["artifact_status"] == "stale_preview"
     assert "autopilot_report" not in state["project"]
-    assert not (tmp_path / "out").exists()
+    assert list((tmp_path / "out").iterdir()) == []
 
 
 def test_workbench_scope_rejects_member_from_another_project(tmp_path):
     api, project_path, _, _ = _workbench_api(tmp_path)
-    boot = api.report_workbench_bootstrap(project_path, "diagnostic-repair")
+    project_id = _project_id(api, project_path)
+    boot = api.report_workbench_bootstrap(project_id, "diagnostic-repair")
     request = _html_request(boot["project_id"])
     request["spec"]["scope"]["configuration_ids"] = ["job-foreign"]
 
-    preview = api.report_workbench_preview(project_path, request)
+    preview = api.report_workbench_preview(project_id, request)
 
     assert preview["ok"] is False
     assert "configuration_id" in preview["error"]
@@ -239,28 +287,159 @@ def test_workbench_scope_rejects_member_from_another_project(tmp_path):
 
 def test_workbench_publish_rejects_tampered_binding_and_creates_no_history(tmp_path):
     api, project_path, _, _ = _workbench_api(tmp_path)
-    boot = api.report_workbench_bootstrap(project_path, "diagnostic-repair")
+    project_id = _project_id(api, project_path)
+    boot = api.report_workbench_bootstrap(project_id, "diagnostic-repair")
     preview = api.report_workbench_preview(
-        project_path, _html_request(boot["project_id"])
+        project_id, _html_request(boot["project_id"])
     )
     token = copy.deepcopy(preview["preview_token"])
     token["report_model_sha256"] = "0" * 64
 
-    result = api.report_workbench_publish(
-        project_path, str(tmp_path / "out"), preview["preview_id"], token
-    )
+    result = _publish(api, project_path, tmp_path / "out", preview, token)
 
     assert result["ok"] is False
     assert "report_model_sha256" in result["error"]
-    history = api.report_workbench_history(project_path)
+    history = api.report_workbench_history(project_id)
     assert history["revisions"] == []
-    assert not (tmp_path / "out").exists()
+    assert list((tmp_path / "out").iterdir()) == []
+
+
+def test_public_workbench_journey_uses_only_opaque_inputs_and_path_free_dtos(tmp_path):
+    api, project_path, _state, _manifests = _workbench_api(tmp_path)
+    project_id = _project_id(api, project_path)
+    destination = tmp_path / "private-publication-directory"
+    destination.mkdir()
+    api._dialog_fn = lambda kind: str(destination) if kind == "dir" else None
+
+    bootstrap = api.report_workbench_bootstrap(project_id, "diagnostic-repair")
+    preview = api.report_workbench_preview(
+        project_id, _html_request(bootstrap["project_id"])
+    )
+    selected = api.report_workbench_pick_destination(project_id)
+    published = api.report_workbench_publish(
+        project_id,
+        selected["destination_token"],
+        preview["preview_id"],
+        preview["preview_token"],
+    )
+    history = api.report_workbench_history(project_id)
+
+    assert all(
+        result["ok"] is True
+        for result in (bootstrap, preview, selected, published, history)
+    )
+    assert selected["destination_token"].startswith("report-workbench.")
+    assert api._report_workbench_destinations._max_items == 64
+    assert api._report_workbench_destinations._ttl_seconds == 15 * 60
+    for result in (bootstrap, preview, selected, published, history):
+        _assert_public_path_free(result, tmp_path, project_path, destination)
+
+    replay = api.report_workbench_publish(
+        project_id,
+        selected["destination_token"],
+        preview["preview_id"],
+        preview["preview_token"],
+    )
+    assert replay["ok"] is False
+    assert "invalid or expired" in replay["error"]
+    _assert_public_path_free(replay, tmp_path, project_path, destination)
+
+
+def test_workbench_rejects_raw_unknown_and_duplicate_project_identity_without_leak(
+    tmp_path,
+):
+    api, project_path, state, _manifests = _workbench_api(tmp_path)
+    project_id = _project_id(api, project_path)
+
+    for untrusted in (project_path, "project-" + "f" * 32):
+        responses = (
+            api.report_workbench_bootstrap(untrusted),
+            api.report_workbench_preview(untrusted, {}),
+            api.report_workbench_history(untrusted),
+            api.report_workbench_pick_destination(untrusted),
+        )
+        assert all(result["ok"] is False for result in responses)
+        for result in responses:
+            _assert_public_path_free(result, tmp_path, project_path)
+
+    duplicate_path = str(tmp_path / "duplicate" / "project.yaml")
+    Path(duplicate_path).parent.mkdir()
+    Path(duplicate_path).write_text("schema: vcstudio.project/v1\n", encoding="utf-8")
+    original_load = api._adsorption.load_project
+
+    def duplicate_load(path):
+        if str(path) == duplicate_path:
+            clone = copy.deepcopy(state["project"])
+            clone["root"] = str(Path(duplicate_path).parent)
+            return clone
+        return original_load(path)
+
+    api._adsorption.load_project = duplicate_load
+    api._adsorption.list_projects = lambda: [project_path, duplicate_path]
+
+    duplicate = api.report_workbench_bootstrap(project_id)
+    assert duplicate["ok"] is False
+    assert "missing or ambiguous" in duplicate["error"]
+    _assert_public_path_free(duplicate, tmp_path, project_path, duplicate_path)
+
+
+def test_workbench_destination_tokens_are_ttl_bounded_project_bound_and_isolated(
+    tmp_path,
+):
+    api, project_path, _state, _manifests = _workbench_api(tmp_path)
+    project_id = _project_id(api, project_path)
+    now = [10.0]
+    registry = OpaqueDestinationRegistry(
+        clock=lambda: now[0],
+        ttl_seconds=5,
+        max_items=2,
+        schema="vcstudio.report-workbench-destination/v1",
+        purpose="report-workbench",
+        token_prefix="report-workbench.",
+    )
+    api._report_workbench_destinations = registry
+    directories = []
+    tokens = []
+    for index in range(3):
+        directory = tmp_path / f"destination-{index}"
+        directory.mkdir()
+        directories.append(directory)
+        now[0] += 1
+        tokens.append(registry.register(str(directory), binding=project_id))
+
+    assert len(registry._items) == 2
+    assert tokens[0]["destination_token"] not in registry._items
+    with pytest.raises(ValueError, match="invalid or expired"):
+        registry.consume(tokens[0]["destination_token"], expected_binding=project_id)
+
+    wrong_binding = registry.register(str(directories[0]), binding="project-other")
+    with pytest.raises(ValueError, match="binding mismatch"):
+        registry.consume(
+            wrong_binding["destination_token"], expected_binding=project_id
+        )
+    assert wrong_binding["destination_token"] not in registry._items
+
+    expiring = registry.register(str(directories[0]), binding=project_id)
+    now[0] += 6
+    with pytest.raises(ValueError, match="invalid or expired"):
+        registry.consume(expiring["destination_token"], expected_binding=project_id)
+
+    capsule = CapsuleDestinations()
+    capsule_token = capsule.register(str(directories[0]))["destination_token"]
+    assert capsule_token.startswith("capsule.")
+    with pytest.raises(ValueError, match="invalid or expired"):
+        registry.consume(capsule_token, expected_binding=project_id)
+    workbench_token = registry.register(
+        str(directories[0]), binding=project_id
+    )["destination_token"]
+    with pytest.raises(ValueError, match="invalid or expired"):
+        capsule.consume(workbench_token)
 
 
 def test_legacy_bundle_is_adapter_to_revisioned_service(tmp_path):
     api, project_path, state, _ = _workbench_api(tmp_path)
 
-    result = api.proj_report_bundle(
+    result = api._proj_report_bundle_for_path(
         project_path,
         str(tmp_path / "legacy"),
         formats=["html"],
@@ -271,17 +450,18 @@ def test_legacy_bundle_is_adapter_to_revisioned_service(tmp_path):
     assert result["ok"] is True
     assert result["revision"]["sequence"] == 1
     assert state["project"]["autopilot_report"]["revision"] == result["revision"]
-    history = api.report_workbench_history(project_path)
+    history = api.report_workbench_history(_project_id(api, project_path))
     assert len(history["revisions"]) == 1
 
 
 def test_public_legacy_bundle_rejects_unrecorded_mode_before_render(tmp_path):
     api, project_path, state, _ = _workbench_api(tmp_path)
+    project_id = _project_id(api, project_path)
     api._reports = lambda: (_ for _ in ()).throw(
         AssertionError("report service must not be reached"))
 
     result = api.proj_report_bundle(
-        project_path,
+        project_id,
         str(tmp_path / "must-not-exist"),
         formats=["html"],
         record_artifact=False,
@@ -330,10 +510,11 @@ def test_scoped_workbench_marker_replays_frozen_scope_for_current_status(tmp_pat
     state["summary"]["rows"][1]["name"] = Path(second).name
     state["summary"]["rows"][0].pop("job", None)
     state["summary"]["rows"][1].pop("job", None)
-    boot = api.report_workbench_bootstrap(project_path, "diagnostic-repair")
+    project_id = _project_id(api, project_path)
+    boot = api.report_workbench_bootstrap(project_id, "diagnostic-repair")
     request = _html_request(boot["project_id"], requested_kind="final")
     request["spec"]["scope"]["configuration_ids"] = ["job-config"]
-    preview = api.report_workbench_preview(project_path, request)
+    preview = api.report_workbench_preview(project_id, request)
 
     assert preview["ok"] is True
     assert preview["report_spec"]["scope"]["configuration_ids"] == ["job-config"]
@@ -350,11 +531,8 @@ def test_scoped_workbench_marker_replays_frozen_scope_for_current_status(tmp_pat
     }
     assert [row["configuration_id"] for row in adsorption["rows"]] == ["job-config"]
 
-    published = api.report_workbench_publish(
-        project_path, str(tmp_path / "scoped"), preview["preview_id"],
-        preview["preview_token"],
-    )
-    status = api.proj_report_status(project_path)
+    published = _publish(api, project_path, tmp_path / "scoped", preview)
+    status = api.proj_report_status(project_id)
 
     assert published["ok"] is True
     assert status["ok"] is True
@@ -366,7 +544,8 @@ def test_scoped_workbench_marker_replays_frozen_scope_for_current_status(tmp_pat
 def test_english_precision_and_theme_are_visible_content_bindings(tmp_path):
     api, project_path, state, _ = _workbench_api(tmp_path)
     state["summary"]["rows"][0]["delta_e"] = -5.123456789
-    boot = api.report_workbench_bootstrap(project_path, "diagnostic-repair")
+    project_id = _project_id(api, project_path)
+    boot = api.report_workbench_bootstrap(project_id, "diagnostic-repair")
     base = _html_request(
         boot["project_id"],
         requested_kind="final",
@@ -380,11 +559,11 @@ def test_english_precision_and_theme_are_visible_content_bindings(tmp_path):
         theme_id="diagnostic-a4",
     )
 
-    diagnostic = api.report_workbench_preview(project_path, base)
+    diagnostic = api.report_workbench_preview(project_id, base)
     academic_request = copy.deepcopy(base)
     academic_request["spec"]["theme_id"] = "academic-a4"
     academic_request["operation_id"] = "preview-theme-2"
-    academic = api.report_workbench_preview(project_path, academic_request)
+    academic = api.report_workbench_preview(project_id, academic_request)
 
     assert diagnostic["ok"] is True and academic["ok"] is True
     assert "-5.12345679" in diagnostic["html"]
@@ -399,14 +578,12 @@ def test_english_precision_and_theme_are_visible_content_bindings(tmp_path):
 
 def test_history_reaudits_sidecars_and_exact_revision(tmp_path):
     api, project_path, _, _ = _workbench_api(tmp_path)
-    boot = api.report_workbench_bootstrap(project_path, "diagnostic-repair")
+    project_id = _project_id(api, project_path)
+    boot = api.report_workbench_bootstrap(project_id, "diagnostic-repair")
     preview = api.report_workbench_preview(
-        project_path, _html_request(boot["project_id"], requested_kind="final")
+        project_id, _html_request(boot["project_id"], requested_kind="final")
     )
-    published = api.report_workbench_publish(
-        project_path, str(tmp_path / "history"), preview["preview_id"],
-        preview["preview_token"],
-    )
+    published = _publish(api, project_path, tmp_path / "history", preview)
     assert published["ok"] is True
     history_path = tmp_path / ".vcstudio" / "reports" / "history.json"
     raw = json.loads(history_path.read_text(encoding="utf-8"))
@@ -425,7 +602,7 @@ def test_history_reaudits_sidecars_and_exact_revision(tmp_path):
 
     Path(entry["contract_files"]["validation"]).write_text(
         "{}", encoding="utf-8")
-    history = api.report_workbench_history(project_path)
+    history = api.report_workbench_history(project_id)
     assert history["ok"] is True and len(history["revisions"]) == 1
     assert history["revisions"][0]["artifact_status"] == "stale"
     assert history["revisions"][0]["current"] is False
@@ -433,18 +610,16 @@ def test_history_reaudits_sidecars_and_exact_revision(tmp_path):
 
 def test_current_status_rejects_marker_revision_that_conflicts_with_manifest(tmp_path):
     api, project_path, state, _ = _workbench_api(tmp_path)
-    boot = api.report_workbench_bootstrap(project_path, "diagnostic-repair")
+    project_id = _project_id(api, project_path)
+    boot = api.report_workbench_bootstrap(project_id, "diagnostic-repair")
     preview = api.report_workbench_preview(
-        project_path, _html_request(boot["project_id"], requested_kind="final")
+        project_id, _html_request(boot["project_id"], requested_kind="final")
     )
-    published = api.report_workbench_publish(
-        project_path, str(tmp_path / "out"), preview["preview_id"],
-        preview["preview_token"],
-    )
+    published = _publish(api, project_path, tmp_path / "out", preview)
     assert published["ok"] is True
     state["project"]["autopilot_report"]["revision"]["sequence"] = 99
 
-    status = api.proj_report_status(project_path)
+    status = api.proj_report_status(project_id)
 
     assert status["artifact_status"] == "stale"
     assert status["artifact_current"] is False

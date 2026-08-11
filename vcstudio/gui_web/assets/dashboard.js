@@ -190,6 +190,117 @@
   // ── 卡片:项目管线(每项目一行站点进度;当前站高亮,NEEDS_HUMAN 红点) ─────────
   const STAGE_LABEL = { generate: '生成', submit: '提交', monitor: '监控',
     recover: '恢复', analysis: '分析', report_done: '报告产物' };
+  const ACTIVE_PIPELINE_STAGES = new Set(['generate', 'submit', 'monitor', 'recover', 'analysis']);
+
+  function portfolioStatus(value) {
+    return String(value == null ? '' : value).trim().toLowerCase();
+  }
+
+  // Every value uses the exact same registered-project denominator.  Rows are
+  // only the successfully read server facts, so degraded responses can retain
+  // honest lower-bound counts without silently shrinking that denominator.
+  // Categories deliberately overlap.  report_reason is explanatory text and
+  // report_done is only a workflow stage; neither is scientific-final evidence.
+  function summarizeProjectPortfolio(projects, registeredTotal = null) {
+    const rows = Array.isArray(projects) ? projects : [];
+    const declaredTotal = registeredTotal == null ? null : Number(registeredTotal);
+    const denominator = Number.isInteger(declaredTotal) && declaredTotal >= rows.length
+      ? declaredTotal : rows.length;
+    const summary = {
+      projects: denominator,
+      active_pipeline: 0,
+      needs_human: 0,
+      publication_gate_blocked: 0,
+      eligible_final: 0,
+      human_scientific_reviewed_final: 0,
+    };
+    rows.forEach(project => {
+      const row = project && typeof project === 'object' ? project : {};
+      if (ACTIVE_PIPELINE_STAGES.has(portfolioStatus(row.stage))) summary.active_pipeline += 1;
+      if (row.needs_human === true) summary.needs_human += 1;
+      const gate = portfolioStatus(row.publication_gate_status);
+      if (gate === 'blocked') summary.publication_gate_blocked += 1;
+      if (gate === 'eligible') summary.eligible_final += 1;
+      if (row.artifact_current === true &&
+          portfolioStatus(row.artifact_status) === 'ready' &&
+          row.scientific_stale === false && gate === 'eligible' &&
+          portfolioStatus(row.scientific_status) === 'final' &&
+          portfolioStatus(row.scientific_qualification) === 'human_scientific_reviewed') {
+        summary.human_scientific_reviewed_final += 1;
+      }
+    });
+    return summary;
+  }
+
+  function portfolioStateMarkup(state, projects, error, metadata = {}) {
+    if (state === 'loading') {
+      return '<section class="project-portfolio state" data-state="loading" aria-live="polite">' +
+        `<b>${VCS.esc(tr('dashboard.portfolio.title', '实验室 Portfolio'))}</b>` +
+        `<span>${VCS.esc(tr('dashboard.portfolio.loading', '正在读取项目事实…'))}</span></section>`;
+    }
+    if (state === 'unavailable') {
+      return '<section class="project-portfolio state unavailable" data-state="unavailable" aria-live="polite">' +
+        `<b>${VCS.esc(tr('dashboard.portfolio.title', '实验室 Portfolio'))}</b>` +
+        `<span>${VCS.esc(tr('dashboard.portfolio.unavailable',
+          'Portfolio 暂不可用：{error}', { error: error || tr('common.unknown', '未知错误') }))}</span></section>`;
+    }
+    const summary = summarizeProjectPortfolio(projects, metadata.registered_total);
+    if (!summary.projects) {
+      return '<section class="project-portfolio state empty" data-state="empty" aria-live="polite">' +
+        `<b>${VCS.esc(tr('dashboard.portfolio.title', '实验室 Portfolio'))}</b>` +
+        `<span>${VCS.esc(tr('dashboard.portfolio.empty', '尚无项目，暂无 Portfolio 计数。'))}</span></section>`;
+    }
+    const total = summary.projects;
+    const metrics = [
+      ['active_pipeline', 'dashboard.portfolio.active', '活跃管线', 'project-workflow', ''],
+      ['needs_human', 'dashboard.portfolio.needs_human', '需人工介入', 'run-jobs', 'need'],
+      ['publication_gate_blocked', 'dashboard.portfolio.blocked', '发布门禁阻断', 'publish-report', ''],
+      ['eligible_final', 'dashboard.portfolio.eligible', '最终版资格通过', 'publish-report', ''],
+      ['human_scientific_reviewed_final', 'dashboard.portfolio.human_final',
+        '人工科学复核最终版', 'publish-report', ''],
+    ];
+    const denominator = tr('dashboard.portfolio.denominator', '{count} projects', { count: total });
+    const cards = metrics.map(([key, labelKey, fallback, route, filter]) => {
+      const countValue = summary[key];
+      const label = tr(labelKey, fallback);
+      const action = route === 'project-workflow'
+        ? tr('dashboard.portfolio.open_pipeline', '打开项目管线')
+        : route === 'run-jobs'
+          ? tr('dashboard.portfolio.open_jobs', '打开作业页')
+          : tr('dashboard.portfolio.open_publish', '打开发布工作台');
+      return `<button type="button" class="portfolio-metric" data-portfolio-route="${route}" ` +
+        `data-portfolio-filter="${filter}" aria-label="${VCS.esc(`${label} ${countValue} / ${total}；${action}`)}">` +
+        `<b data-portfolio-count="${key}">${countValue}<small> / ${total}</small></b>` +
+        `<span>${VCS.esc(label)}</span><em>${VCS.esc(action)}</em></button>`;
+    }).join('');
+    const detail = state === 'degraded'
+      ? tr('dashboard.data.partial_failure',
+        '部分数据读取失败（下列读数可能不完整）：{errors}', {
+          errors: error || 'Some registered project facts are unavailable.',
+      })
+      : tr('dashboard.portfolio.overlap',
+        '五项使用同一项目分母；类别可重叠，不是完成率。');
+    const stateClass = state === 'degraded' ? ' degraded' : '';
+    return `<section class="project-portfolio${stateClass}" data-state="${state}" aria-live="polite">` +
+      '<div class="portfolio-head"><span>' +
+      `<b>${VCS.esc(tr('dashboard.portfolio.title', '实验室 Portfolio'))}</b>` +
+      `<small>${VCS.esc(denominator)}</small></span>` +
+      `<p role="status">${VCS.esc(detail)}</p></div>` +
+      `<div class="portfolio-grid">${cards}</div></section>`;
+  }
+
+  function navigatePortfolio(route, filter = '') {
+    const routeId = String(route || '');
+    const query = routeId === 'run-jobs' && filter ? { status: filter } : {};
+    if (VCS.workspace && typeof VCS.workspace.navigateRoute === 'function') {
+      return VCS.workspace.navigateRoute(routeId, {
+        query, source: 'dashboard-portfolio',
+      });
+    }
+    const fallback = routeId === 'run-jobs' ? 'jobs'
+      : routeId === 'publish-report' ? 'report-workbench' : 'dashboard';
+    return navTo(fallback, { source: 'dashboard-portfolio' });
+  }
 
   function pipelineReportStates(project) {
     const p = project || {};
@@ -289,19 +400,28 @@
     }
   }
 
-  function renderPipeline(projects, err) {
+  function renderPipeline(projects, err, state = 'ready', metadata = {}) {
     const box = $('db-pipeline');
     if (!box) return;
-    if (err) {
-      box.innerHTML = `<div class="pl-empty">${VCS.esc(tr(
+    const rows = Array.isArray(projects) ? projects : [];
+    const responseState = portfolioStatus(metadata.status || state) || 'ready';
+    if (responseState === 'loading') {
+      box.innerHTML = portfolioStateMarkup('loading');
+      return;
+    }
+    if (responseState === 'unavailable' || (err && responseState !== 'degraded')) {
+      box.innerHTML = portfolioStateMarkup('unavailable', null, err) +
+        `<div class="pl-empty">${VCS.esc(tr(
         'dashboard.pipeline.read_failed', '读取项目管线失败：{error}', { error: err }
       ))}</div>`; return;
     }
-    if (!projects.length) {
-      box.innerHTML = '<div class="pl-empty">暂无吸附能项目 — 去「吸附能项目」新建一组</div>';
+    if (!rows.length) {
+      box.innerHTML = portfolioStateMarkup('empty', []) +
+        '<div class="pl-empty">暂无吸附能项目 — 去「吸附能项目」新建一组</div>';
       return;
     }
-    box.innerHTML = projects.map(p => {
+    const portfolioState = responseState === 'degraded' ? 'degraded' : 'ready';
+    box.innerHTML = portfolioStateMarkup(portfolioState, rows, err, metadata) + rows.map(p => {
       const stages = p.stages || ['generate', 'submit', 'monitor', 'recover', 'analysis', 'report_done'];
       const steps = stages.map((st, i) => {
         let cls = '';
@@ -392,6 +512,62 @@
       '</div>').join('');
   }
 
+  function resumeScopeLabel(scope) {
+    const labels = {
+      'settings-llm': tr('settings.draft.llm', 'LLM 配置'),
+      'settings-llm-key': tr('settings.draft.llm_key', '尚未保存的 API 密钥'),
+      'settings-prompt': tr('settings.draft.prompt', '报告分析提示词'),
+      'settings-paths': tr('settings.draft.paths', '数据路径'),
+      'settings-autopilot': tr('settings.draft.autopilot', '自动托管设置'),
+      'settings-figures': tr('settings.draft.figures', '出图偏好'),
+    };
+    return labels[scope] || String(scope || tr('dashboard.resume.unnamed', '未命名草稿'));
+  }
+
+  function renderResumeCenter() {
+    const box = $('db-resume'); if (!box) return;
+    const workspace = VCS.workspace || {};
+    const state = workspace.state || {};
+    const refs = state.draft_refs && typeof state.draft_refs === 'object' ? state.draft_refs : {};
+    const persistedIds = new Set(Object.keys(refs).map(id => 'draft-' + id));
+    const runtimeScopes = VCS.unsaved && typeof VCS.unsaved.scopes === 'function'
+      ? VCS.unsaved.scopes().filter(scope => !persistedIds.has(scope)) : [];
+    const rows = runtimeScopes.map(scope => ({
+      id: '', label: resumeScopeLabel(scope), route: '#/environment/settings',
+      projectId: '', updated: '', status: 'current',
+    }));
+    Object.entries(refs).forEach(([id, ref]) => {
+      if (!ref || ref.dirty !== true) return;
+      const route = String(ref.route || '');
+      const reportDraft = /^report-/.test(id) || route.includes('/publish/');
+      rows.push({
+        id, label: reportDraft
+          ? tr('dashboard.resume.report_draft', '报告配置草稿')
+          : tr('dashboard.resume.workflow_draft', '工作流草稿'),
+        route, projectId: String(ref.project_id || ''), updated: Number(ref.updated_at_ms || 0),
+        status: String(ref.status || 'unverified_draft'),
+      });
+    });
+    if (!rows.length) {
+      box.innerHTML = `<div class="db-empty">${VCS.esc(tr(
+        'dashboard.resume.empty', '没有待恢复内容；显式保存的设置和已发布报告均已落盘。'))}</div>`;
+      return;
+    }
+    box.innerHTML = rows.sort((a, b) => Number(b.updated) - Number(a.updated)).map(row => {
+      const project = row.projectId && workspace.projects
+        ? workspace.projects.find(item => item.id === row.projectId) : null;
+      const context = [project && project.name, row.updated
+        ? new Date(row.updated).toLocaleString() : '', row.status].filter(Boolean).join(' · ');
+      return '<div class="db-row db-resume-row">' +
+        `<span><b>${VCS.esc(row.label)}</b><small>${VCS.esc(context || tr(
+          'dashboard.resume.current_session', '当前会话'))}</small></span>` +
+        '<span class="sp"></span>' +
+        `<button class="btn quiet" data-resume-route="${VCS.esc(row.route)}" ` +
+        `data-resume-project="${VCS.esc(row.projectId)}">${VCS.esc(tr(
+          'dashboard.resume.open', '继续处理'))}</button></div>`;
+    }).join('');
+  }
+
   // 取数出错 → 页顶错误条(不再吞 error 假装 0 作业)
   function renderError(msgs) {
     const bar = $('db-error');
@@ -404,6 +580,7 @@
 
   // ── 取数 + 全量渲染(进页 / 启动时) ───────────────────────────────────────
   async function refresh() {
+    renderPipeline(null, null, 'loading');
     const [jr, pr, cr, sr, campr, runtime] = await Promise.all([
       VCS.call('list_jobs'), VCS.call('proj_list'),
       VCS.call('list_profiles'), VCS.call('pipeline_status'),
@@ -417,15 +594,20 @@
     if (jr && jr.error) errs.push(tr('dashboard.error.jobs', '作业台账：{error}', { error: jr.error }));
     if (pr && pr.error) errs.push(tr('dashboard.error.projects', '项目列表：{error}', { error: pr.error }));
     if (cr && cr.error) errs.push(tr('dashboard.error.clusters', '集群配置：{error}', { error: cr.error }));
-    if (sr && sr.error) errs.push(tr('dashboard.error.pipeline', '项目管线：{error}', { error: sr.error }));
+    const pipelineError = sr && sr.error
+      ? sr.error : (!sr ? 'Pipeline status response is unavailable.' : null);
+    if (pipelineError) errs.push(tr('dashboard.error.pipeline', '项目管线：{error}', { error: pipelineError }));
     if (runtime && runtime.error) errs.push(tr('dashboard.error.automation', '自动托管：{error}', { error: runtime.error }));
     renderError(errs);
     renderNums(jobs);
     renderRecent(jobs);
     renderTodo(jobs, stale, profiles);
-    renderPipeline((sr && sr.projects) || [], sr && sr.error);
+    const pipelineState = sr && sr.status
+      ? sr.status : (pipelineError ? 'unavailable' : 'ready');
+    renderPipeline((sr && sr.projects) || [], pipelineError, pipelineState, sr || {});
     renderAutomation(runtime && runtime.state, runtime && runtime.error);
     renderCampaigns(campr);
+    renderResumeCenter();
     if (VCS.pipeline && typeof VCS.pipeline.renderFeed === 'function') VCS.pipeline.renderFeed();
     if (typeof VCS.refreshNavFoot === 'function') VCS.refreshNavFoot();
     const el = $('db-stats');
@@ -463,9 +645,25 @@
     });
     // 大数字 / 最近活动行 / 待办按钮:统一 data-goto 跳页
     page.addEventListener('click', e => {
+      const resume = e.target.closest('[data-resume-route]');
+      if (resume && VCS.workspace) {
+        const parsed = VCS.workspace.parseRoute(resume.dataset.resumeRoute);
+        if (parsed) VCS.workspace.navigateRoute(parsed.id, {
+          projectId: resume.dataset.resumeProject || undefined,
+          query: parsed.query, source: 'resume-center',
+        });
+        return;
+      }
+      const portfolio = e.target.closest('[data-portfolio-route]');
+      if (portfolio) {
+        navigatePortfolio(portfolio.dataset.portfolioRoute,
+          portfolio.dataset.portfolioFilter || '');
+        return;
+      }
       const el = e.target.closest('[data-goto]');
       if (el) navTo(el.dataset.goto);
     });
+    document.addEventListener('vcs:unsaved', renderResumeCenter);
     page.addEventListener('keydown', e => {
       const el = e.target.closest('[data-goto][role="link"]');
       if (!el || e.key !== 'Enter') return;
@@ -491,4 +689,9 @@
   else init();
 
   window.Dashboard = { refresh };
+  if (window.__VCS_TEST__) {
+    window.Dashboard.__test = {
+      summarizeProjectPortfolio, portfolioStateMarkup, renderPipeline, navigatePortfolio,
+    };
+  }
 })();

@@ -32,7 +32,8 @@ TASK_CAPABILITIES = {
               '已下载 CHGCAR/AECCAR0/AECCAR2 时，请先用 Henkelman Bader '
               '生成 ACF.dat；导入 ACF.dat 后可在软件内解析与出报告。'),
     'chgdiff': ('chgdiff', 'integrated', '读取 CHGDIFF.vasp 并生成法向面平均 Δρ(z)。'),
-    'elf': ('artifact', 'evidence_only', '已核对 ELFCAR；请用 VESTA 等工具检查等值面。'),
+    'elf': ('elf', 'integrated',
+            '读取 ELFCAR 主网格并给出只读分布统计；不据此宣称成键或拓扑结论。'),
     'freq': ('freq', 'integrated', '检查虚频质量闸，再决定热校正能否进入自由能。'),
     'aimd': ('aimd', 'integrated', '检查能量/温度序列；热稳定结论仍需足够长轨迹。'),
     'neb': ('neb', 'integrated', '检查能垒、最高点位置和各 image 力收敛。'),
@@ -582,6 +583,27 @@ def analyze_frequency(job_dir, *, temperature: float = 298.15) -> dict:
                f'G_corr={vib.g_corr_ev:.6f} eV；{gate["advice"]}')
     return {'ok': True, 'kind': 'freq', 'result': result, 'figure': None,
             'summary': summary, 'files': [str(outcar)], 'error': None}
+
+
+def analyze_elf(job_dir) -> dict:
+    """Read ELFCAR distribution statistics without topology interpretation."""
+    from vcstudio.project.elf import summarize_elfcar
+
+    path = Path(job_dir) / 'ELFCAR'
+    if not path.is_file():
+        return {'ok': False, 'kind': 'elf', 'result': None, 'figure': None,
+                'summary': '', 'files': [], 'error': '未找到 ELFCAR'}
+    try:
+        result = summarize_elfcar(path)
+    except (OSError, ValueError) as exc:
+        return {'ok': False, 'kind': 'elf', 'result': None, 'figure': None,
+                'summary': '', 'files': [], 'error': str(exc)}
+    return {
+        'ok': True, 'kind': 'elf', 'result': result, 'figure': None,
+        'summary': ('ELF distribution summary only; '
+                    'no bond, basin, critical-point, or topology conclusion.'),
+        'files': [str(path)], 'error': None,
+    }
 
 
 def analyze_aimd(job_dir) -> dict:

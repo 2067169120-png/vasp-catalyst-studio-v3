@@ -96,6 +96,7 @@ def test_eight_catalyst_projects_share_one_ladder_and_keep_authoritative_ul(tmp_
         }
 
     adsorption = SimpleNamespace(
+        list_projects=lambda: list(projects),
         load_project=lambda path: projects.get(path),
         delta_e_rows=lambda project: summaries[project['name']],
     )
@@ -122,8 +123,10 @@ def test_eight_catalyst_projects_share_one_ladder_and_keep_authoritative_ul(tmp_
         }, None
 
     api._proj_fed = fed
+    project_ids = [api._workspace_project_id(path, project)
+                   for path, project in projects.items()]
     result = api.proj_compare_figures(
-        list(projects), ['ladder'], str(tmp_path / 'comparison'))
+        project_ids, ['ladder'], str(tmp_path / 'comparison'))
 
     assert result['ok'] is True
     assert result['skipped'][0]['kind'] == 'ladder'
@@ -163,6 +166,7 @@ def test_partial_ladder_exclusion_is_returned_to_the_frontend(tmp_path):
         for name in ('A', 'B', 'C')
     }
     adsorption = SimpleNamespace(
+        list_projects=lambda: list(projects),
         load_project=lambda path: projects.get(path),
         delta_e_rows=lambda project: summaries[project['name']],
     )
@@ -178,8 +182,11 @@ def test_partial_ladder_exclusion_is_returned_to_the_frontend(tmp_path):
         'pds_index': 0,
         'u_l': -0.2,
     }, None)
+    project_ids = [api._workspace_project_id(path, project)
+                   for path, project in projects.items()]
 
-    result = api.proj_compare_figures(paths, ['ladder'], str(tmp_path / 'out'))
+    result = api.proj_compare_figures(
+        project_ids, ['ladder'], str(tmp_path / 'out'))
 
     assert result['ok'] is True
     assert len(result['files']) == 1

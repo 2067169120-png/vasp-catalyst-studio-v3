@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -458,6 +459,105 @@ def test_submit_jobs_batch_ops_exception_caught():
     api = Api(profiles_mod=_fake_profiles(store), batch_ops_mod=bo)
     out = api.submit_jobs(['/a'], 'c1', None, False)
     assert '连不上' in out['error']
+
+
+def test_submit_jobs_idempotency_key_replays_without_second_remote_mutation():
+    calls = []
+    bo = types.SimpleNamespace(submit_batch=lambda _prof, _pw, dirs, _trust:
+        calls.append(list(dirs)) or {'needs_trust': False,
+                                     'results': [(dirs[0], True, 'ok')]})
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store), batch_ops_mod=bo)
+    key = 'jobop-fixed-submit-001'
+
+    first = api.submit_jobs(['/a'], 'c1', None, False, key)
+    replay = api.submit_jobs(['/a'], 'c1', None, False, key)
+
+    assert calls == [['/a']]
+    assert first['replayed'] is False and first['idempotency_key'] == key
+    assert replay['duplicate'] is True and replay['replayed'] is True
+    assert replay['results'] == first['results']
+
+
+def test_submit_jobs_idempotency_blocks_inflight_duplicate_and_payload_reuse():
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def _submit(_prof, _pw, dirs, _trust):
+        calls.append(list(dirs))
+        started.set()
+        assert release.wait(timeout=3)
+        return {'needs_trust': False, 'results': [(dirs[0], True, 'ok')]}
+
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              batch_ops_mod=types.SimpleNamespace(submit_batch=_submit))
+    key = 'jobop-inflight-submit-001'
+    result = {}
+    worker = threading.Thread(target=lambda: result.update(
+        api.submit_jobs(['/a'], 'c1', None, False, key)))
+    worker.start()
+    assert started.wait(timeout=3)
+
+    duplicate = api.submit_jobs(['/a'], 'c1', None, False, key)
+    conflict = api.submit_jobs(['/different'], 'c1', None, False, key)
+    release.set()
+    worker.join(timeout=3)
+
+    assert not worker.is_alive() and calls == [['/a']]
+    assert duplicate['busy'] is True and duplicate['duplicate'] is True
+    assert conflict['busy'] is False and conflict['duplicate'] is True
+    assert '不同' in conflict['error']
+    assert result['replayed'] is False
+
+
+def test_submit_jobs_host_trust_challenge_does_not_consume_idempotency_key():
+    calls = []
+
+    def _submit(_prof, _pw, dirs, trust):
+        calls.append(trust)
+        if not trust:
+            return {'needs_trust': True, 'results': [], 'host': 'h'}
+        return {'needs_trust': False, 'results': [(dirs[0], True, 'ok')]}
+
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              batch_ops_mod=types.SimpleNamespace(submit_batch=_submit))
+    key = 'jobop-trust-submit-001'
+
+    challenge = api.submit_jobs(['/a'], 'c1', None, False, key)
+    success = api.submit_jobs(['/a'], 'c1', None, {'fingerprint': 'SHA256:x'}, key)
+
+    assert challenge['needs_trust'] is True
+    assert calls == [False, {'fingerprint': 'SHA256:x'}]
+    assert success['replayed'] is False
+
+
+def test_submit_jobs_cross_process_busy_does_not_consume_idempotency_key():
+    calls = []
+
+    def _submit(_prof, _pw, dirs, _trust, *, idempotency_key=None):
+        calls.append((list(dirs), idempotency_key))
+        return {
+            'ok': False,
+            'needs_trust': False,
+            'busy': True,
+            'code': 'job_busy',
+            'busy_count': 1,
+            'results': [(dirs[0], False, 'busy')],
+        }
+
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              batch_ops_mod=types.SimpleNamespace(submit_batch=_submit))
+    key = 'jobop-cross-process-busy-001'
+
+    first = api.submit_jobs(['/a'], 'c1', None, False, key)
+    retry = api.submit_jobs(['/a'], 'c1', None, False, key)
+
+    assert first['busy'] is True and retry['busy'] is True
+    assert calls == [(['/a'], key), (['/a'], key)]
 
 
 # ── fetch_jobs / continue_jobs / queue_detail ────────────────────────────────
@@ -1023,7 +1123,7 @@ def test_proj_import_commit_uses_actual_bundle_reason_after_preflight_changes(tm
     )
     api._final_report_gate = lambda *_args: (True, '')
     marker = {'kind': 'diagnostic'}
-    api.proj_report_bundle = lambda *_args, **_kwargs: {
+    api._proj_report_bundle_for_path = lambda *_args, **_kwargs: {
         'ok': True,
         'kind': 'diagnostic',
         'scientific_status': 'diagnostic',
@@ -1039,7 +1139,7 @@ def test_proj_import_commit_uses_actual_bundle_reason_after_preflight_changes(tm
 
     assert out['ok'] is True
     assert out['auto_report_reason'] == '实际 bundle 发现参考态已变化'
-    assert out['auto_report_blocked'] is marker
+    assert out['auto_report_blocked'] == marker
 
 
 def test_proj_import_auto_report_uses_only_proven_available_formats(tmp_path):
@@ -1072,7 +1172,7 @@ def test_proj_import_auto_report_uses_only_proven_available_formats(tmp_path):
         paper_report_mod=paper,
     )
     captured = {}
-    api.proj_report_bundle = lambda _path, _out, formats=None, **_kwargs: (
+    api._proj_report_bundle_for_path = lambda _path, _out, formats=None, **_kwargs: (
         captured.update(formats=tuple(formats or ())) or {
             'ok': True, 'kind': 'diagnostic',
             'scientific_status': 'diagnostic', 'gate_reason': '参考态缺失',
@@ -1108,9 +1208,7 @@ def test_proj_list_assembles_path_name_members():
     out = api.proj_list()
     assert out['error'] is None
     assert out['projects'] == [{
-        'path': '/p/project.yaml',
         'project_id': out['projects'][0]['project_id'],
-        'project_uuid': None,
         'name': 'demo', 'n_members': 3, 'n_done': 0,
         'reference_mode': 'none', 'reference_species': [], 'n_species_refs': 0,
     }]
@@ -1131,9 +1229,7 @@ def test_proj_list_counts_members_inline_without_report_full():
     out = api.proj_list()
     assert out['error'] is None
     assert out['projects'] == [{
-        'path': '/p/project.yaml',
         'project_id': out['projects'][0]['project_id'],
-        'project_uuid': None,
         'name': 'demo', 'n_members': 3, 'n_done': 0,
         'reference_mode': 'none', 'reference_species': [], 'n_species_refs': 0,
     }]
@@ -1157,7 +1253,8 @@ def test_proj_list_skips_unloadable_and_catches_error():
         list_projects=lambda *a, **k: (_ for _ in ()).throw(RuntimeError('注册表坏了')))
     api = Api(adsorption_mod=boom, report_full_mod=_fake_report_full())
     out = api.proj_list()
-    assert out['projects'] == [] and '注册表坏了' in out['error']
+    assert out['projects'] == []
+    assert out['error'] == 'The registered project list is unavailable.'
 
 
 # ── proj_create ──────────────────────────────────────────────────────────────
@@ -1169,17 +1266,21 @@ def test_proj_create_mirrors_on_generate_params_and_transforms(tmp_path):
     calls = {}
     create_ret = {
         'ok': True, 'project_path': str(tmp_path / 'demo' / 'project.yaml'),
+        'project': {'name': 'demo', 'members': {
+            'clean_slab': '/s', 'gas_ref': None, 'configs': ['/c1', '/c2']}},
         'generated': [('demo_ads_x', '/o/x', ['偶极建议'])],
         'errors': [('demo_ads_bad', 'POTCAR 缺 Ta')],       # 坏构型 → warnings,不整体失败
         'advisories': [('P1', 'ENCUT', '建议统一 ENCUT=400')],
     }
     ads = _fake_adsorption(create_ret=create_ret, calls=calls)
+    ads.save_project = lambda *_args: None
     api = Api(adsorption_mod=ads, report_full_mod=_fake_report_full(),
               config_mod=_fake_config(cfg={'potcar_lib_root': '/lib'}))
     out = api.proj_create('demo', str(slab), ['/c1', '/c2'], str(incar), '',
                           str(tmp_path))
     assert out['ok'] is True
-    assert out['project_path'] == str(tmp_path / 'demo' / 'project.yaml')
+    assert out['project_id'].startswith('registry-') and out['name'] == 'demo'
+    assert 'project_path' not in out
     assert out['error'] is None
     # 参数顺序/键忠实镜像 _on_generate → create_project
     c = calls['create']
@@ -1206,7 +1307,8 @@ def test_proj_create_validation_error_short_circuits(tmp_path):
         AssertionError('不应生成'))
     out = api.proj_create('demo', '/no/such/slab', ['/c1'], str(incar), '',
                           str(tmp_path))
-    assert out['ok'] is False and out['project_path'] is None
+    assert out['ok'] is False and out['project_id'] is None
+    assert 'project_path' not in out
     assert '清洁表面' in out['error']
 
 
@@ -1220,7 +1322,8 @@ def test_proj_create_exception_is_caught(tmp_path):
         RuntimeError('赝势缺失'))
     api = Api(adsorption_mod=ads, config_mod=_fake_config())
     out = api.proj_create('demo', str(slab), ['/c1'], str(incar), '', str(tmp_path))
-    assert out['ok'] is False and out['project_path'] is None
+    assert out['ok'] is False and out['project_id'] is None
+    assert 'project_path' not in out
     assert '赝势缺失' in out['error']
 
 
@@ -1239,7 +1342,7 @@ def test_proj_delta_passes_through_rows_and_gating():
     }
     ads = _fake_adsorption(proj_map={'/p': proj}, delta_ret=delta_ret)
     api = Api(adsorption_mod=ads, report_full_mod=_fake_report_full())
-    out = api.proj_delta('/p')
+    out = api._proj_delta_for_path('/p')
     assert out['ok'] is True and out['error'] is None
     assert out['rows'][0]['delta_e'] == -2.5
     assert out['rows'][0]['reference_state'] == 'DONE'
@@ -1252,7 +1355,7 @@ def test_proj_delta_passes_through_rows_and_gating():
 def test_proj_delta_missing_project_error():
     ads = _fake_adsorption(proj_map={})
     api = Api(adsorption_mod=ads, report_full_mod=_fake_report_full())
-    out = api.proj_delta('/gone')
+    out = api._proj_delta_for_path('/gone')
     assert out['ok'] is False and out['rows'] == []
     assert '项目' in out['error']
 
@@ -1264,7 +1367,7 @@ def test_proj_export_csv_delegates():
     ads = _fake_adsorption(proj_map={'/p': proj}, delta_ret={'rows': []},
                            csv_ret='/save/demo.csv', calls=calls)
     api = Api(adsorption_mod=ads, report_full_mod=_fake_report_full())
-    out = api.proj_export_csv('/p', '/save/demo.csv')
+    out = api._proj_export_csv_for_path('/p', '/save/demo.csv')
     assert out['ok'] is True and out['file'] == '/save/demo.csv'
     assert out['error'] is None and calls['export']['out'] == '/save/demo.csv'
 
@@ -1272,7 +1375,7 @@ def test_proj_export_csv_delegates():
 def test_proj_export_csv_missing_project_error():
     ads = _fake_adsorption(proj_map={})
     api = Api(adsorption_mod=ads, report_full_mod=_fake_report_full())
-    out = api.proj_export_csv('/gone', '/save/x.csv')
+    out = api._proj_export_csv_for_path('/gone', '/save/x.csv')
     assert out['ok'] is False and out['file'] is None and '项目' in out['error']
 
 
@@ -1297,9 +1400,9 @@ def test_proj_report_is_legacy_shape_adapter_for_canonical_bundle(tmp_path):
             'error': None,
         }
 
-    api.proj_report_bundle = _bundle
+    api._proj_report_bundle_for_path = _bundle
     requested = tmp_path / '报告.html'
-    out = api.proj_report('/p', str(requested), final=False)
+    out = api._proj_report_for_path('/p', str(requested), final=False)
 
     assert out['ok'] is True and out['file'] == str(requested)
     assert out['files'] == [str(requested)]
@@ -1313,12 +1416,12 @@ def test_proj_report_is_legacy_shape_adapter_for_canonical_bundle(tmp_path):
 
 def test_proj_report_maps_canonical_bundle_failure_to_legacy_shape(tmp_path):
     api = Api()
-    api.proj_report_bundle = lambda *_a, **_k: {
+    api._proj_report_bundle_for_path = lambda *_a, **_k: {
         'ok': False, 'kind': None, 'files': {}, 'marker': None,
         'error': '项目无成员作业',
     }
 
-    out = api.proj_report('/p', str(tmp_path / 'x.html'))
+    out = api._proj_report_for_path('/p', str(tmp_path / 'x.html'))
 
     assert out['ok'] is False and out['file'] is None and out['files'] == []
     assert '成员' in out['error']
@@ -1809,8 +1912,8 @@ def test_proj_evaluate_candidate_returns_advance_and_blocked_json():
     ads.delta_e_rows = lambda project: summaries[project['name']]
     api = Api(adsorption_mod=ads, config_mod=_fake_config())
 
-    advance = api.proj_evaluate_candidate('/advance')
-    blocked = api.proj_evaluate_candidate('/blocked')
+    advance = api._proj_evaluate_candidate_for_path('/advance')
+    blocked = api._proj_evaluate_candidate_for_path('/blocked')
 
     assert advance['ok'] is True and advance['error'] is None
     assert advance['evaluation']['decision']['priority'] == 'advance'
@@ -1848,7 +1951,7 @@ def test_proj_compare_preview_keeps_moved_project_and_canonical_stable_matrix():
     ads.delta_e_rows = lambda project: summaries[project['name']]
     api = Api(adsorption_mod=ads, config_mod=_fake_config())
 
-    out = api.proj_compare_preview(['/a', '/moved/project.yaml', '/b'])
+    out = api._proj_compare_preview_for_paths(['/a', '/moved/project.yaml', '/b'])
 
     assert out['ok'] is True and out['selected_count'] == 3
     assert out['ready_count'] == 2
@@ -1881,7 +1984,7 @@ def test_proj_figures_bar_table_with_short_names(tmp_path):
                                              'liS_ads_Li2S2': None}))
     api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
               config_mod=_fake_config())
-    out = api.proj_figures('/p/project.yaml', ['bar', 'table'])
+    out = api._proj_figures_for_path('/p/project.yaml', ['bar', 'table'])
     assert out['ok'] is True and len(out['files']) == 2
     # 短名剥前缀 + 只收已完成 ΔE
     data = calls['bar'][0]['data']
@@ -1972,7 +2075,7 @@ def test_proj_figures_no_done_rows_all_skipped(tmp_path):
                            delta_ret=_delta({'x_ads_a': None}))
     api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
               config_mod=_fake_config())
-    out = api.proj_figures('/p', ['bar', 'table'])
+    out = api._proj_figures_for_path('/p', ['bar', 'table'])
     assert out['ok'] is True and out['files'] == []
     assert {s['kind'] for s in out['skipped']} == {'bar', 'table'}
     assert 'bar' not in calls
@@ -1992,7 +2095,7 @@ def test_proj_figures_ladder_uses_fed_pds_index(tmp_path):
     api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
               freeenergy_mod=fe,
               config_mod=_fake_config(cfg={'lis_molecules_dir': str(mol_dir)}))
-    out = api.proj_figures('/p', ['ladder'])
+    out = api._proj_figures_for_path('/p', ['ladder'])
     assert out['ok'] is True and len(out['files']) == 1
     lad = calls['ladder'][0]
     assert lad['pds_index'] == 0                      # 逐电子权威口径透传
@@ -2024,7 +2127,7 @@ def test_proj_figures_prefers_imported_project_molecules(tmp_path):
               freeenergy_mod=types.SimpleNamespace(path_from_project_and_molecules=_path),
               config_mod=_fake_config(cfg={'lis_molecules_dir': str(configured_mols)}))
 
-    out = api.proj_figures('/p', ['ladder'])
+    out = api._proj_figures_for_path('/p', ['ladder'])
 
     assert out['ok'] is True and len(out['files']) == 1
     assert seen['molecules_dir'] == str(project_mols)
@@ -2036,7 +2139,7 @@ def test_proj_figures_ladder_skipped_without_molecules_dir(tmp_path):
                            delta_ret=_delta({'liS_ads_a': -1.0}))
     api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
               config_mod=_fake_config())          # 无 lis_molecules_dir
-    out = api.proj_figures('/p', ['ladder'])
+    out = api._proj_figures_for_path('/p', ['ladder'])
     assert out['ok'] is True and out['files'] == []
     assert out['skipped'][0]['kind'] == 'ladder'
     assert 'lis_molecules_dir' in out['skipped'][0]['reason']
@@ -2062,7 +2165,7 @@ def test_proj_compare_figures_heatmap_union_cols(tmp_path):
     ads.delta_e_rows = lambda proj: deltas['/a' if proj['name'] == 'A' else '/b']
     api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
               config_mod=_fake_config())
-    out = api.proj_compare_figures(['/a', '/b'], ['heatmap'])
+    out = api._proj_compare_figures_for_paths(['/a', '/b'], ['heatmap'])
     assert out['ok'] is True and len(out['files']) == 1
     data = calls['heatmap'][0]['data']
     assert data['rows'] == ['A', 'B']
@@ -2073,7 +2176,7 @@ def test_proj_compare_figures_heatmap_union_cols(tmp_path):
 def test_proj_compare_figures_needs_two_projects():
     api = Api(adsorption_mod=_fake_adsorption(proj_map={}),
               native_charts_mod=_fake_ncharts({}), config_mod=_fake_config())
-    out = api.proj_compare_figures(['/only'], ['heatmap'])
+    out = api._proj_compare_figures_for_paths(['/only'], ['heatmap'])
     assert out['ok'] is False and '2 个' in out['error']
 
 
@@ -2087,7 +2190,7 @@ def test_proj_compare_scaling_pair_and_volcano_skip(tmp_path):
     ads.delta_e_rows = lambda proj: _delta(des[proj['name']])
     api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
               config_mod=_fake_config())          # 无分子库 → volcano 应 skip
-    out = api.proj_compare_figures(list(projs), ['scaling', 'volcano'])
+    out = api._proj_compare_figures_for_paths(list(projs), ['scaling', 'volcano'])
     assert out['ok'] is True
     sc = calls['scaling'][0]
     assert sc['xs'] == [-1.0, -1.5, -2.0] and sc['ys'] == [-2.0, -2.6, -3.1]
@@ -2121,7 +2224,7 @@ def test_proj_compare_eight_projects_share_one_ladder_with_explicit_ul(tmp_path)
         config_mod=_fake_config(),
     )
 
-    out = api.proj_compare_figures(
+    out = api._proj_compare_figures_for_paths(
         list(projects), ['ladder'], save_to=str(tmp_path / 'figures'))
 
     assert out['ok'] is True and out['skipped'] == []
@@ -2186,7 +2289,7 @@ def test_proj_batch_report_unverified_method_is_diagnostic(tmp_path):
     )
     api._comparison_figures = lambda *_args, **_kwargs: ([], [], [])
 
-    out = api.proj_batch_report(
+    out = api._proj_batch_report_for_paths(
         project_paths, str(tmp_path / 'reports'),
         formats=['html'], include_individual=False, final=True)
 
@@ -2207,6 +2310,7 @@ def test_proj_batch_report_unverified_method_is_diagnostic(tmp_path):
     assert all(row[1] == 'hold_for_evidence'
                for row in model['candidate_evaluations']['rows'])
     assert out['files']['individual'] == []
+    assert api._reports()._previews == {}
     json.dumps(out, ensure_ascii=False)
 
 
@@ -2236,7 +2340,7 @@ def test_proj_compare_volcano_requires_path_delta_g_and_labels_success(tmp_path)
         config_mod=_fake_config(),
     )
 
-    skipped = api.proj_compare_figures(
+    skipped = api._proj_compare_figures_for_paths(
         list(projects), ['volcano'], save_to=str(tmp_path / 'missing'))
 
     assert skipped['ok'] is True and skipped['files'] == []
@@ -2252,7 +2356,7 @@ def test_proj_compare_volcano_requires_path_delta_g_and_labels_success(tmp_path)
             'sign_convention': 'negative_is_stronger',
             'value_eV': -1.60 - 0.10 * index,
         }
-    rendered = api.proj_compare_figures(
+    rendered = api._proj_compare_figures_for_paths(
         list(projects), ['volcano'], save_to=str(tmp_path / 'ready'))
 
     assert rendered['ok'] is True and rendered['skipped'] == []
@@ -2511,12 +2615,16 @@ def _install_fake_report_bundle(api, calls, *, order=None):
         })
         return rendered
 
-    api.proj_report_bundle = _bundle
+    api._proj_report_bundle_for_path = _bundle
 
 
 def _report_gate_fixture(tmp_path, *, has_ref=True, method_status='verified',
                          save_project=None):
     """构造一个无远程依赖的最终报告门禁项目。"""
+    project_path = str(tmp_path / 'project.yaml')
+    Path(project_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(project_path).write_text(
+        'schema: vcstudio.project/v1\n', encoding='utf-8')
     clean = str(tmp_path / 'clean')
     config = str(tmp_path / 'config')
     reference = str(tmp_path / 'reference') if has_ref else None
@@ -2557,8 +2665,8 @@ def _report_gate_fixture(tmp_path, *, has_ref=True, method_status='verified',
     }
     calls = {'reports': 0, 'saved': 0}
     adsorption = _fake_adsorption(
-        projects=['/managed/project.yaml'],
-        proj_map={'/managed/project.yaml': project}, delta_ret=summary)
+        projects=[project_path],
+        proj_map={project_path: project}, delta_ret=summary)
 
     def _save(root, saved_project):
         calls['saved'] += 1
@@ -2748,7 +2856,7 @@ def test_manual_bundle_persists_contract_bound_canonical_marker(tmp_path):
     api._project_report_figures = lambda *_args, **_kwargs: ([], [])
     api._proj_fed = lambda *_args, **_kwargs: (None, '缺少完整自由能台阶')
 
-    out = api.proj_report_bundle(
+    out = api._proj_report_bundle_for_path(
         project_path, str(tmp_path / 'report'), formats=['html'], final=True)
 
     assert out['ok'] is True
@@ -2821,7 +2929,7 @@ def test_bundle_never_records_failed_or_partial_renderer_output(tmp_path):
         return {'ok': False, 'error': 'renderer failed', 'files': files}
 
     api, project, saved, project_path, root = _case('failed-render', _failed)
-    failed = api.proj_report_bundle(
+    failed = api._proj_report_bundle_for_path(
         project_path, str(root / 'report'), formats=['html'], final=True)
     assert failed['ok'] is False and 'renderer failed' in failed['error']
     assert saved == [] and 'autopilot_report' not in project
@@ -2833,7 +2941,7 @@ def test_bundle_never_records_failed_or_partial_renderer_output(tmp_path):
         return {'ok': True, 'files': {'html': html}}
 
     api, project, saved, project_path, root = _case('partial-render', _partial)
-    partial = api.proj_report_bundle(
+    partial = api._proj_report_bundle_for_path(
         project_path, str(root / 'report'), formats=['html', 'pdf'], final=True)
     assert partial['ok'] is False and 'pdf' in partial['error']
     assert saved == [] and 'autopilot_report' not in project
@@ -2897,7 +3005,7 @@ def test_bundle_marker_cas_preserves_concurrent_fields_and_rejects_changed_input
     api, store, _manifests, _members, project_path, root = _case(
         'merge-current-project', _add_unrelated_field)
     holder['store'] = store
-    merged = api.proj_report_bundle(
+    merged = api._proj_report_bundle_for_path(
         project_path, str(root / 'report'), formats=['html'], final=True)
     assert merged['ok'] is True and store['saved'] == 1
     assert store['project']['concurrent_note'] == 'must survive marker commit'
@@ -2911,7 +3019,7 @@ def test_bundle_marker_cas_preserves_concurrent_fields_and_rejects_changed_input
     api, store, manifests, members, project_path, root = _case(
         'reject-changed-input', _change_attempt)
     changed.update(manifests=manifests, members=members)
-    stale = api.proj_report_bundle(
+    stale = api._proj_report_bundle_for_path(
         project_path, str(root / 'report'), formats=['html'], final=True)
     assert stale['ok'] is False and stale['stale_input'] is True
     assert '变化' in stale['error']
@@ -2960,8 +3068,8 @@ def test_report_capabilities_fail_closed_when_probe_is_missing_or_raises():
 def test_explicit_empty_report_formats_fail_with_stable_two_axis_envelope(tmp_path):
     api = Api()
 
-    project = api.proj_report_bundle('/missing', str(tmp_path), formats=[])
-    batch = api.proj_batch_report([], str(tmp_path), formats=[])
+    project = api._proj_report_bundle_for_path('/missing', str(tmp_path), formats=[])
+    batch = api._proj_batch_report_for_paths([], str(tmp_path), formats=[])
 
     for result in (project, batch):
         assert result['ok'] is False
@@ -2975,7 +3083,7 @@ def test_explicit_empty_report_formats_fail_with_stable_two_axis_envelope(tmp_pa
 
 def test_post_gate_renderer_failure_preserves_gate_axis_not_attempted_kind(tmp_path):
     api, _project, _manifests, _summary, _calls = _report_gate_fixture(tmp_path)
-    del api.proj_report_bundle
+    del api._proj_report_bundle_for_path
     api._project_report_figures = lambda *_args, **_kwargs: ([], [])
     api._proj_fed = lambda *_args, **_kwargs: (None, 'not available')
 
@@ -2987,8 +3095,8 @@ def test_post_gate_renderer_failure_preserves_gate_axis_not_attempted_kind(tmp_p
         render_report_bundle=_raise_renderer,
     )
 
-    result = api.proj_report_bundle(
-        '/managed/project.yaml', str(tmp_path / 'failed-draft'),
+    result = api._proj_report_bundle_for_path(
+        str(tmp_path / 'project.yaml'), str(tmp_path / 'failed-draft'),
         formats=['html'], requested_kind='draft')
 
     assert result['ok'] is False
@@ -3003,12 +3111,12 @@ def test_post_gate_renderer_failure_preserves_gate_axis_not_attempted_kind(tmp_p
 
 def test_real_html_bundle_accepts_api_contract_chain(tmp_path):
     api, project, _manifests, _summary, calls = _report_gate_fixture(tmp_path)
-    del api.proj_report_bundle  # remove the lightweight fixture override
+    del api._proj_report_bundle_for_path  # remove the lightweight fixture override
     api._project_report_figures = lambda *_args, **_kwargs: ([], [])
     api._proj_fed = lambda *_args, **_kwargs: (None, '缺少完整自由能台阶')
 
-    out = api.proj_report_bundle(
-        '/managed/project.yaml', str(tmp_path / 'real-html'),
+    out = api._proj_report_bundle_for_path(
+        str(tmp_path / 'project.yaml'), str(tmp_path / 'real-html'),
         formats=['html'], final=True)
 
     assert out['ok'] is True
@@ -3025,12 +3133,12 @@ def test_real_html_bundle_accepts_api_contract_chain(tmp_path):
 
 def test_real_draft_bundle_is_current_but_never_closes_automatic_pipeline(tmp_path):
     api, project, _manifests, _summary, _calls = _report_gate_fixture(tmp_path)
-    del api.proj_report_bundle
+    del api._proj_report_bundle_for_path
     api._project_report_figures = lambda *_args, **_kwargs: ([], [])
     api._proj_fed = lambda *_args, **_kwargs: (None, '缺少完整自由能台阶')
 
-    out = api.proj_report_bundle(
-        '/managed/project.yaml', str(tmp_path / 'draft'), formats=['html'],
+    out = api._proj_report_bundle_for_path(
+        str(tmp_path / 'project.yaml'), str(tmp_path / 'draft'), formats=['html'],
         final=True, requested_kind='draft')
 
     assert out['ok'] is True
@@ -3048,7 +3156,7 @@ def test_real_draft_bundle_is_current_but_never_closes_automatic_pipeline(tmp_pa
     assert validation['effective_kind'] == 'draft'
     assert validation['final_allowed'] is False
 
-    canonical = api.proj_report_status('/managed/project.yaml')
+    canonical = api._proj_report_status_for_path(str(tmp_path / 'project.yaml'))
     assert canonical['artifact_status'] == 'ready'
     assert canonical['artifact_current'] is True
     assert canonical['scientific_status'] == 'draft'
@@ -3065,7 +3173,7 @@ def test_manual_and_automatic_real_bundle_seams_commit_equivalent_markers(tmp_pa
     from vcstudio.project import paper_report as real_paper_report
 
     api, project, _manifests, summary, _calls = _report_gate_fixture(tmp_path)
-    del api.proj_report_bundle
+    del api._proj_report_bundle_for_path
     api._paper_report = types.SimpleNamespace(
         render_report_bundle=real_paper_report.render_report_bundle,
         report_content_sha256=real_paper_report.report_content_sha256,
@@ -3081,8 +3189,8 @@ def test_manual_and_automatic_real_bundle_seams_commit_equivalent_markers(tmp_pa
     api._proj_fed = lambda *_args, **_kwargs: (None, '缺少完整自由能台阶')
     formats = api._available_report_formats()
 
-    manual_result = api.proj_report_bundle(
-        '/managed/project.yaml', str(tmp_path / 'manual-real'),
+    manual_result = api._proj_report_bundle_for_path(
+        str(tmp_path / 'project.yaml'), str(tmp_path / 'manual-real'),
         formats=formats, requested_kind='final')
     assert manual_result['ok'] is True
     manual = copy.deepcopy(manual_result['marker'])
@@ -3291,9 +3399,9 @@ def test_pipeline_tick_report_done_idempotent(tmp_path):
     assert out1['ok'] is True and out1['last_sync']
     rd = [e for e in out1['events'] if e['kind'] == 'report_done']
     assert len(rd) == 1 and rd[0]['project'] == 'liS'
-    assert rd[0]['report'].endswith('.pdf')
     assert rd[0]['report_kind'] == 'final'
-    assert set(rd[0]['files']) == {'html', 'docx', 'pdf'}
+    assert rd[0]['formats'] == ['docx', 'html', 'pdf']
+    assert {'report', 'files', 'figures_dir'}.isdisjoint(rd[0])
     assert set(proj['autopilot_report']['files']) == {
         'html', 'docx', 'pdf', 'manifest',
         'contract_spec', 'contract_snapshot', 'contract_validation', 'model'}
@@ -3352,7 +3460,8 @@ def test_final_report_rejects_numeric_difference_without_reference_state(tmp_pat
     assert status['scientific_status'] == 'diagnostic'
     assert status['report_status'] == 'diagnostic'
     assert status['scientific_qualification'] == 'diagnostic'
-    final = api.proj_report('/managed/project.yaml', str(tmp_path / 'manual.html'), final=True)
+    final = api._proj_report_for_path(
+        str(tmp_path / 'project.yaml'), str(tmp_path / 'manual.html'), final=True)
     assert final['ok'] is True and final['kind'] == 'diagnostic'
     assert '未设置有效气相/逐物种参考态' in final['gate_reason']
 
@@ -3440,7 +3549,7 @@ def test_new_final_marker_requires_contract_chain_but_kindless_legacy_is_readabl
         'files': {'html': str(report)}, 'sha256': {'html': digest},
     }
     assert api._report_marker_current(project, summary) is True
-    status = api.proj_report_status('/managed/project.yaml')
+    status = api._proj_report_status_for_path(str(tmp_path / 'project.yaml'))
     assert status['ok'] is True and status['artifact_current'] is True
     assert status['marker_kind'] == 'legacy-final'
     assert status['scientific_status'] == 'final'
@@ -3450,7 +3559,7 @@ def test_new_final_marker_requires_contract_chain_but_kindless_legacy_is_readabl
         'scientific_qualification': 'adsorption_result_verified',
         'artifact_status': 'ready',
     })
-    explicit = api.proj_report_status('/managed/project.yaml')
+    explicit = api._proj_report_status_for_path(str(tmp_path / 'project.yaml'))
     assert explicit['artifact_status'] == 'stale'
     assert explicit['artifact_current'] is False
     assert '指纹' in explicit['report_reason'] or 'contract' in explicit['report_reason']
@@ -3465,7 +3574,7 @@ def test_proj_report_status_ignores_mtime_and_rejects_tampered_marker_metadata(t
 
     html = marker['files']['html']
     os.utime(html, (1, 1))
-    current = api.proj_report_status('/managed/project.yaml')
+    current = api._proj_report_status_for_path(str(tmp_path / 'project.yaml'))
     assert current['schema'] == 'vcstudio.report-status/v1'
     assert current['artifact_status'] == 'ready'
     assert current['artifact_current'] is True
@@ -3473,20 +3582,20 @@ def test_proj_report_status_ignores_mtime_and_rejects_tampered_marker_metadata(t
     assert current['scientific_qualification'] == 'adsorption_result_verified'
 
     project['autopilot_report']['scientific_qualification'] = 'human_scientific_reviewed'
-    tampered_qualification = api.proj_report_status('/managed/project.yaml')
+    tampered_qualification = api._proj_report_status_for_path(str(tmp_path / 'project.yaml'))
     assert tampered_qualification['artifact_status'] == 'stale'
     assert tampered_qualification['artifact_current'] is False
     assert 'validation' in tampered_qualification['report_reason']
 
     project['autopilot_report'] = copy.deepcopy(marker)
     project['autopilot_report']['contracts']['validation']['sha256'] = '0' * 64
-    tampered_contract = api.proj_report_status('/managed/project.yaml')
+    tampered_contract = api._proj_report_status_for_path(str(tmp_path / 'project.yaml'))
     assert tampered_contract['artifact_status'] == 'stale'
     assert 'contract' in tampered_contract['report_reason']
 
     project['autopilot_report'] = copy.deepcopy(marker)
     project['autopilot_report']['report_model_sha256'] = 'e' * 64
-    tampered_content_binding = api.proj_report_status('/managed/project.yaml')
+    tampered_content_binding = api._proj_report_status_for_path(str(tmp_path / 'project.yaml'))
     assert tampered_content_binding['artifact_status'] == 'stale'
     assert '正文指纹' in tampered_content_binding['report_reason']
 
@@ -3495,7 +3604,7 @@ def test_proj_report_status_ignores_mtime_and_rejects_tampered_marker_metadata(t
     original_model = model_path.read_bytes()
     model_path.write_text('{}', encoding='utf-8')
     try:
-        tampered_model = api.proj_report_status('/managed/project.yaml')
+        tampered_model = api._proj_report_status_for_path(str(tmp_path / 'project.yaml'))
         assert tampered_model['artifact_status'] == 'stale'
         assert tampered_model['artifact_current'] is False
     finally:
@@ -3503,7 +3612,7 @@ def test_proj_report_status_ignores_mtime_and_rejects_tampered_marker_metadata(t
 
     model_path.unlink()
     try:
-        missing_model = api.proj_report_status('/managed/project.yaml')
+        missing_model = api._proj_report_status_for_path(str(tmp_path / 'project.yaml'))
         assert missing_model['artifact_status'] == 'stale'
         assert missing_model['artifact_current'] is False
     finally:
@@ -3516,7 +3625,7 @@ def test_proj_report_status_ignores_mtime_and_rejects_tampered_marker_metadata(t
     manifest_payload['scientific_qualification'] = 'human_scientific_reviewed'
     manifest_path.write_text(json.dumps(manifest_payload), encoding='utf-8')
     try:
-        tampered_manifest = api.proj_report_status('/managed/project.yaml')
+        tampered_manifest = api._proj_report_status_for_path(str(tmp_path / 'project.yaml'))
         assert tampered_manifest['artifact_status'] == 'stale'
         assert tampered_manifest['artifact_current'] is False
     finally:
@@ -3555,7 +3664,7 @@ def test_report_status_rejects_consistently_rehashed_model_content_tamper(tmp_pa
         hashes['model'] = model_sha256
         hashes['manifest'] = _sha256_file(manifest_path)
 
-    status = api.proj_report_status('/managed/project.yaml')
+    status = api._proj_report_status_for_path(str(tmp_path / 'project.yaml'))
 
     assert status['artifact_status'] == 'stale'
     assert status['artifact_current'] is False
@@ -3629,8 +3738,9 @@ def test_report_marker_save_failure_never_emits_report_done(tmp_path):
 
     assert events == []
     assert calls['reports'] == 1 and calls['saved'] == 1
-    assert any('报告标记落盘失败' in error and 'disk full' in error
-               for error in errors)
+    assert errors == ['项目「report-gate」报告标记落盘失败']
+    assert 'disk full' not in json.dumps(errors, ensure_ascii=False)
+    assert str(tmp_path) not in json.dumps(errors, ensure_ascii=False)
     assert 'autopilot_report' not in project
     assert 'autopilot_report_done' not in project
 
@@ -3641,12 +3751,12 @@ def test_generated_unrecorded_response_preserves_real_artifact_and_science(tmp_p
 
     api, project, _manifests, _summary, _calls = _report_gate_fixture(
         tmp_path, save_project=_fail_save)
-    del api.proj_report_bundle  # reveal the production class method behind the tick fake
+    del api._proj_report_bundle_for_path  # reveal the production class method behind the tick fake
     api._project_report_figures = lambda *_args, **_kwargs: ([], [])
     api._proj_fed = lambda *_args, **_kwargs: (None, 'not available')
 
-    result = api.proj_report_bundle(
-        '/managed/project.yaml', str(tmp_path / 'unrecorded'),
+    result = api._proj_report_bundle_for_path(
+        str(tmp_path / 'project.yaml'), str(tmp_path / 'unrecorded'),
         formats=['html'], requested_kind='final')
 
     assert result['ok'] is False
@@ -3876,6 +3986,72 @@ def test_pipeline_status_monitor_recover_and_needs_human():
     assert by['M']['stage'] == 'monitor'
     assert by['R']['stage'] == 'recover' and by['R']['recover_round'] == 2
     assert by['R']['needs_human'] is True
+
+
+def test_pipeline_status_partial_failure_is_degraded_with_registered_denominator():
+    good_path = '/managed/good/project.yaml'
+    bad_path = r'C:\private\customer\broken\project.yaml'
+    good = {'name': 'good', 'members': {'clean_slab': '/good/slab',
+                                        'gas_ref': None, 'configs': []}}
+    ads = _fake_adsorption(projects=[good_path, bad_path],
+                           proj_map={good_path: good})
+
+    def _load(path):
+        if path == bad_path:
+            raise OSError(f'cannot read {path} or /home/alice/private/project.yaml')
+        return good
+
+    ads.load_project = _load
+    api = Api(adsorption_mod=ads, manifest_mod=_fake_manifest_mod({
+        '/good/slab': {'state': 'DONE', 'results': {}},
+    }))
+
+    out = api.pipeline_status()
+
+    assert out['ok'] is True and out['status'] == 'degraded'
+    assert out['registered_total'] == 2
+    assert out['successful_count'] == 1 and out['failed_count'] == 1
+    assert len(out['projects']) == 1 and out['projects'][0]['name'] == 'good'
+    assert out['projects'][0]['artifact_current'] is False
+    assert out['projects'][0]['scientific_stale'] is False
+    assert out['error']
+    public_failure = json.dumps(
+        {'error': out['error'], 'failures': out['failures']}, ensure_ascii=False)
+    assert bad_path not in public_failure
+    assert '/home/alice/private' not in public_failure
+    assert 'cannot read' not in public_failure
+    assert out['failures'] == [{
+        'project_ref': 'registered-project-2',
+        'code': 'project_unreadable',
+        'message': 'Registered project could not be read.',
+    }]
+
+
+def test_pipeline_status_all_failures_and_registry_failure_are_unavailable_and_redacted():
+    secret_path = r'C:\private\all-broken\project.yaml'
+    ads = _fake_adsorption(projects=[secret_path])
+    ads.load_project = lambda _path: (_ for _ in ()).throw(
+        OSError(f'failed at {secret_path}'))
+
+    out = Api(adsorption_mod=ads).pipeline_status()
+
+    assert out['ok'] is False and out['status'] == 'unavailable'
+    assert out['registered_total'] == 1
+    assert out['successful_count'] == 0 and out['failed_count'] == 1
+    assert out['projects'] == [] and out['error']
+    assert secret_path not in json.dumps(out, ensure_ascii=False)
+
+    registry = _fake_adsorption(projects=[])
+    registry.list_projects = lambda: (_ for _ in ()).throw(
+        OSError(r'registry C:\private\registry.json is unreadable'))
+    registry_out = Api(adsorption_mod=registry).pipeline_status()
+    assert registry_out['ok'] is False
+    assert registry_out['status'] == 'unavailable'
+    assert registry_out['registered_total'] is None
+    assert registry_out['successful_count'] == 0
+    assert registry_out['failed_count'] is None
+    assert registry_out['projects'] == [] and registry_out['error']
+    assert 'private' not in json.dumps(registry_out, ensure_ascii=False)
 
 
 # ── open_dir 文件路径 → 打开所在目录 ─────────────────────────────────────────
@@ -4227,7 +4403,8 @@ def test_sac_matrix_generate_creates_jobs_project_and_campaign(tmp_path):
     assert out['created'] == 2                        # 1 清洁面 + 1 构型
     assert len(registered) == 2                       # 全部入台账
     # 每 slab 一个吸附能项目(清洁面 + 构型族)
-    assert len(out['project_paths']) == 1 and len(saved) == 1
+    assert len(out['projects']) == 1 and len(saved) == 1
+    assert out['projects'][0]['project_id'].startswith('registry-')
     assert saved[0][1]['members']['clean_slab'].endswith('_clean')
     assert len(saved[0][1]['members']['configs']) == 1
     # 同步注册 campaign(2 任务节点 + 逐任务记预估机时)
@@ -4247,7 +4424,7 @@ def test_sac_matrix_generate_place_rejection_skipped(tmp_path):
                                   str(incar), str(tmp_path))
     assert out['ok'] is True and out['created'] == 1          # 仅清洁面
     assert any('拒绝' in s['reason'] for s in out['skipped'])
-    assert out['project_paths'] == []                         # 无构型 → 不建项目
+    assert out['projects'] == []                              # 无构型 → 不建项目
 
 
 def test_sac_matrix_generate_clean_only_no_project(tmp_path):
@@ -4261,7 +4438,7 @@ def test_sac_matrix_generate_clean_only_no_project(tmp_path):
     out = api.sac_matrix_generate(['Fe'], ['MN4'], [], 'all', 1,
                                   str(incar), str(tmp_path))
     assert out['ok'] is True and out['created'] == 1
-    assert out['project_paths'] == [] and saved == []
+    assert out['projects'] == [] and saved == []
 
 
 def test_sac_matrix_generate_missing_incar_error(tmp_path):
@@ -4406,7 +4583,7 @@ def test_proj_figures_preset_ladder_maps_species(tmp_path):
               freeenergy_mod=_fake_fe_preset(
                   mol_e={'O2': -9.8, 'H2O': -14.2, 'H2': -6.8}, path_calls=path_calls),
               config_mod=_fake_config(cfg={'lis_molecules_dir': str(mol)}))
-    out = api.proj_figures('/p', ['ladder'], str(tmp_path), 'ORR_4E')
+    out = api._proj_figures_for_path('/p', ['ladder'], str(tmp_path), 'ORR_4E')
     assert out['ok'] is True and len(out['files']) == 1
     e = path_calls['energies']
     assert e['*'] == -100.0                            # 干净基底 '*' → 清洁表面能量
@@ -4427,7 +4604,7 @@ def test_proj_figures_preset_ladder_missing_species_skipped(tmp_path):
               reactions_mod=_fake_reactions_orr(),
               freeenergy_mod=_fake_fe_preset(mol_e={'O2': -9.8, 'H2O': -14.2, 'H2': -6.8}),
               config_mod=_fake_config(cfg={'lis_molecules_dir': str(mol)}))
-    out = api.proj_figures('/p', ['ladder'], str(tmp_path), 'ORR_4E')
+    out = api._proj_figures_for_path('/p', ['ladder'], str(tmp_path), 'ORR_4E')
     assert out['ok'] is True and out['files'] == []
     assert out['skipped'][0]['kind'] == 'ladder'
     assert 'OOH*' in out['skipped'][0]['reason'] and '缺' in out['skipped'][0]['reason']
@@ -4451,7 +4628,7 @@ def test_proj_figures_default_ladder_unchanged_when_no_preset(tmp_path):
     api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
               freeenergy_mod=fe,
               config_mod=_fake_config(cfg={'lis_molecules_dir': str(mol_dir)}))
-    out = api.proj_figures('/p', ['ladder'])          # 无 preset_key
+    out = api._proj_figures_for_path('/p', ['ladder'])          # 无 preset_key
     assert out['ok'] is True and len(out['files']) == 1
     assert seen.get('called') is True                 # 仍走 Li-S 便捷入口
     assert 'Li-S discharge path' in calls['ladder'][0]['title']
@@ -4843,7 +5020,7 @@ def test_render_figure_preset_bar_assembles_from_delta(tmp_path):
     ads = _fake_adsorption(proj_map={'/p': _proj('demo', str(tmp_path))},
                            delta_ret=_delta({'O': -1.0, 'OH': -2.0}))
     api = Api(figure_presets_mod=_fake_figpresets(calls=calls), adsorption_mod=ads)
-    out = api.render_figure_preset('adsorption_bar', '/p', {'save_to': str(tmp_path)})
+    out = api._render_figure_preset_for_path('adsorption_bar', '/p', {'save_to': str(tmp_path)})
     assert out['ok'] is True and len(out['files']) == 1 and out['skipped'] == []
     data = calls['render'][0]['data']
     assert data['adsorbates'] == ['O', 'OH']
@@ -4856,7 +5033,7 @@ def test_render_figure_preset_heatmap_rows_cols_values(tmp_path):
     ads = _fake_adsorption(proj_map={'/p': _proj('demo', str(tmp_path))},
                            delta_ret=_delta({'O': -1.0, 'OH': -2.0}))
     api = Api(figure_presets_mod=_fake_figpresets(calls=calls), adsorption_mod=ads)
-    out = api.render_figure_preset('delta_e_heatmap', '/p', {'save_to': str(tmp_path)})
+    out = api._render_figure_preset_for_path('delta_e_heatmap', '/p', {'save_to': str(tmp_path)})
     assert out['ok'] is True
     data = calls['render'][0]['data']
     assert data['rows'] == ['demo'] and data['cols'] == ['O', 'OH']
@@ -4876,7 +5053,7 @@ def test_render_figure_preset_ladder_lis_default(tmp_path):
     api = Api(figure_presets_mod=_fake_figpresets(calls=calls), adsorption_mod=ads,
               freeenergy_mod=fe,
               config_mod=_fake_config(cfg={'lis_molecules_dir': str(mol)}))
-    out = api.render_figure_preset('free_energy_ladder', '/p', {'save_to': str(tmp_path)})
+    out = api._render_figure_preset_for_path('free_energy_ladder', '/p', {'save_to': str(tmp_path)})
     assert out['ok'] is True and len(out['files']) == 1
     data = calls['render'][0]['data']
     assert data['paths'][0]['G'] == [0.0, -1.0] and data['pds_index'] == 0
@@ -4885,14 +5062,14 @@ def test_render_figure_preset_ladder_lis_default(tmp_path):
 
 def test_render_figure_preset_pdos_skipped_needs_parse(tmp_path):
     api = Api(figure_presets_mod=_fake_figpresets(), adsorption_mod=_fake_adsorption())
-    out = api.render_figure_preset('pdos', '/p', {})
+    out = api._render_figure_preset_for_path('pdos', '/p', {})
     assert out['ok'] is True and out['files'] == []
     assert out['skipped'][0]['kind'] == 'pdos' and 'PDOS' in out['skipped'][0]['reason']
 
 
 def test_render_figure_preset_volcano_skipped_multi(tmp_path):
     api = Api(figure_presets_mod=_fake_figpresets(), adsorption_mod=_fake_adsorption())
-    out = api.render_figure_preset('volcano', '/p', {})
+    out = api._render_figure_preset_for_path('volcano', '/p', {})
     assert out['ok'] is True and out['files'] == []
     assert '多催化剂' in out['skipped'][0]['reason']
 
@@ -4905,14 +5082,14 @@ def test_render_figure_preset_no_done_skipped(tmp_path):
                                                 'e_config': None, 'delta_e': None,
                                                 'note': ''}]})
     api = Api(figure_presets_mod=_fake_figpresets(), adsorption_mod=ads)
-    out = api.render_figure_preset('adsorption_bar', '/p', {})
+    out = api._render_figure_preset_for_path('adsorption_bar', '/p', {})
     assert out['ok'] is True and out['files'] == []
     assert 'ΔE' in out['skipped'][0]['reason']
 
 
 def test_render_figure_preset_unknown_key_error():
     api = Api(figure_presets_mod=_fake_figpresets(), adsorption_mod=_fake_adsorption())
-    out = api.render_figure_preset('nope', '/p', {})
+    out = api._render_figure_preset_for_path('nope', '/p', {})
     assert out['ok'] is False and '未知图表预设' in out['error']
 
 
@@ -4921,7 +5098,7 @@ def test_draft_ready_aggregates_products(tmp_path):
     calls = {}
     ads = _fake_adsorption(proj_map={'/p': _proj('demo', str(tmp_path))})
     api = Api(adsorption_mod=ads, draftpack_mod=_fake_draftpack(calls=calls))
-    out = api.draft_ready('/p', str(tmp_path))
+    out = api._draft_ready_for_path('/p', str(tmp_path))
     assert out['ok'] is True and out['error'] is None
     assert out['out_dir'] == str(tmp_path)
     # products 汇总 SI + 表格 + 方法学 + 总结
@@ -4938,14 +5115,14 @@ def test_draft_ready_not_ok_passthrough(tmp_path):
                       'tables': {'files': []}, 'methods': {'files': []}}}
     ads = _fake_adsorption(proj_map={'/p': _proj('demo', str(tmp_path))})
     api = Api(adsorption_mod=ads, draftpack_mod=_fake_draftpack(ret=ret))
-    out = api.draft_ready('/p', str(tmp_path))
+    out = api._draft_ready_for_path('/p', str(tmp_path))
     assert out['ok'] is False and out['issues_total'] == 1
     assert out['issues'] == ['[待确认:X 无 ΔE]']
 
 
 def test_draft_ready_missing_project_error():
     api = Api(adsorption_mod=_fake_adsorption(), draftpack_mod=_fake_draftpack())
-    out = api.draft_ready('/nope', '/out')
+    out = api._draft_ready_for_path('/nope', '/out')
     assert out['ok'] is False and '项目不存在' in out['error']
 
 
@@ -6785,14 +6962,14 @@ def test_ai_compare_project_vs_reference(tmp_path):
     api = Api(adsorption_mod=ads, paper_data_mod=_fake_paper_data())
     tables = [{'label': 'T1', 'kind': 'E_ads',
                'rows': [{'system': 'Fe@N4', 'species': 'Li2S4', 'value_ev': -1.5}]}]
-    out = api.ai_compare(str(tmp_path), tables)
+    out = api._ai_compare_for_path(str(tmp_path), tables)
     assert out['ok'] is True and out['n'] == 1 and out['mae'] == 0.1
     assert 'MAE' in out['summary']
 
 
 def test_ai_compare_missing_project():
     api = Api(adsorption_mod=_fake_adsorption(proj_map={}), paper_data_mod=_fake_paper_data())
-    out = api.ai_compare('/no/proj', [])
+    out = api._ai_compare_for_path('/no/proj', [])
     assert out['ok'] is False and '项目' in out['error']
 
 
@@ -6802,7 +6979,7 @@ def test_ai_write_validation_writes_md(tmp_path):
                            delta_ret={'rows': [{'species': 'Li2S4', 'delta_e': -1.4,
                                                  'is_most_stable': True, 'name': 'c1'}]})
     api = Api(adsorption_mod=ads, paper_data_mod=_fake_paper_data(md_ret='## 文献对照\n表格\n'))
-    out = api.ai_write_validation(str(tmp_path), [{'kind': 'E_ads', 'rows': []}])
+    out = api._ai_write_validation_for_path(str(tmp_path), [{'kind': 'E_ads', 'rows': []}])
     assert out['ok'] is True and out['path'].endswith('validation.md')
     assert os.path.isfile(out['path'])
     assert '文献对照' in open(out['path'], encoding='utf-8').read()
@@ -6810,7 +6987,7 @@ def test_ai_write_validation_writes_md(tmp_path):
 
 def test_ai_write_validation_missing_project():
     api = Api(adsorption_mod=_fake_adsorption(proj_map={}), paper_data_mod=_fake_paper_data())
-    out = api.ai_write_validation('/no/proj', [])
+    out = api._ai_write_validation_for_path('/no/proj', [])
     assert out['ok'] is False and '项目' in out['error']
 
 
@@ -6838,7 +7015,7 @@ def test_ai_manuscript_returns_stats(tmp_path):
     ads = _fake_adsorption(proj_map={str(tmp_path): proj})
     calls = {}
     api = Api(adsorption_mod=ads, manuscript_draft_mod=_fake_manuscript(calls=calls))
-    out = api.ai_manuscript(str(tmp_path), fmt='markdown')
+    out = api._ai_manuscript_for_path(str(tmp_path), fmt='markdown')
     assert out['ok'] is True and out['stats']['auto'] == 10
     assert out['placeholders_count'] == 5 and out['docx_available'] is False
     assert calls['build']['fmt'] == 'markdown'
@@ -6847,7 +7024,7 @@ def test_ai_manuscript_returns_stats(tmp_path):
 def test_ai_manuscript_missing_project():
     api = Api(adsorption_mod=_fake_adsorption(proj_map={}),
               manuscript_draft_mod=_fake_manuscript())
-    out = api.ai_manuscript('/no/proj')
+    out = api._ai_manuscript_for_path('/no/proj')
     assert out['ok'] is False and '项目' in out['error']
 
 
@@ -8202,7 +8379,7 @@ def test_proj_prepare_lis_reuses_only_required_done_reference_jobs_and_persists_
     api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
               config_mod=_fake_config(cfg={'potcar_lib_root': '/potentials'}))
 
-    out = api.proj_prepare_lis(
+    out = api._proj_prepare_lis_for_reference_path(
         'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
         str(incar), str(tmp_path / 'out'), reference_path,
         {'confirmed': True, 'reason': '单测假赝势库无法核对 TITEL'})
@@ -8246,7 +8423,7 @@ def test_proj_prepare_lis_binds_each_member_incar_and_keeps_runtime_controls_ind
                      'incar_sha256': _sha256_file(config_incar)}],
     }
 
-    out = api.proj_prepare_lis(
+    out = api._proj_prepare_lis_for_reference_path(
         'per-member', str(slab),
         [{'path': str(config), 'species': 'Li2S8',
           'incar_path': str(config_incar), 'incar_sha256': _sha256_file(config_incar)}],
@@ -8323,7 +8500,7 @@ def test_proj_prepare_lis_rejects_quartet_changed_after_browser_scan(tmp_path):
         }],
     }
 
-    out = api.proj_prepare_lis(
+    out = api._proj_prepare_lis_for_reference_path(
         'changed-after-scan', str(slab),
         [{'path': str(config), 'species': 'Li2S8'}], '',
         str(tmp_path / 'out'), reference_path, member_incars=evidence)
@@ -8356,7 +8533,7 @@ def test_proj_prepare_lis_allows_clean_config_ispin_difference_as_advisory(tmp_p
     api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
               config_mod=_fake_config(cfg={'potcar_lib_root': str(potcars)}))
 
-    out = api.proj_prepare_lis(
+    out = api._proj_prepare_lis_for_reference_path(
         'spin-mismatch', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
         '', str(tmp_path / 'out'), reference_path)
 
@@ -8398,7 +8575,7 @@ def test_proj_prepare_lis_previews_and_applies_only_managed_copy_encut_repair(
     api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
               config_mod=_fake_config(cfg={'potcar_lib_root': str(potcars)}))
 
-    preview = api.proj_prepare_lis(
+    preview = api._proj_prepare_lis_for_reference_path(
         'repair-preview', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
         '', str(tmp_path / 'out'), reference_path)
 
@@ -8408,7 +8585,7 @@ def test_proj_prepare_lis_previews_and_applies_only_managed_copy_encut_repair(
     assert [(item['key'], item['old'], item['new'], item['risk']) for item in actions] == [
         ('ENCUT', 400.0, 450, 'low')]
 
-    applied = api.proj_prepare_lis(
+    applied = api._proj_prepare_lis_for_reference_path(
         'repair-preview', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
         '', str(tmp_path / 'out'), reference_path,
         repair_request={'plan_id': preview['repair_plan']['plan_id'], 'mode': 'apply'})
@@ -8479,7 +8656,7 @@ def test_proj_prepare_lis_generates_with_reference_encut_analysis_blocked(tmp_pa
     api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
               config_mod=_fake_config(cfg={'potcar_lib_root': str(potcars)}))
 
-    out = api.proj_prepare_lis(
+    out = api._proj_prepare_lis_for_reference_path(
         'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
         str(incar), str(tmp_path / 'out'), reference_path)
 
@@ -8512,7 +8689,7 @@ def test_proj_prepare_lis_auto_effective_encut_can_be_fully_verified(tmp_path):
     api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
               config_mod=_fake_config(cfg={'potcar_lib_root': str(potcars)}))
 
-    out = api.proj_prepare_lis(
+    out = api._proj_prepare_lis_for_reference_path(
         'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
         str(incar), str(tmp_path / 'out'), reference_path)
 
@@ -8543,7 +8720,7 @@ def test_proj_prepare_lis_molecular_ispin_difference_is_advisory_without_confirm
     api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
               config_mod=_fake_config(cfg={'potcar_lib_root': str(potcars)}))
 
-    out = api.proj_prepare_lis(
+    out = api._proj_prepare_lis_for_reference_path(
         'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
         str(incar), str(tmp_path / 'out'), reference_path)
 
@@ -8582,7 +8759,7 @@ def test_proj_prepare_lis_shared_element_dft_u_mismatch_allows_generation_but_bl
     api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
               config_mod=_fake_config())
 
-    out = api.proj_prepare_lis(
+    out = api._proj_prepare_lis_for_reference_path(
         'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
         str(incar), str(tmp_path / 'out'), reference_path)
 
@@ -8852,7 +9029,7 @@ def test_proj_prepare_lis_ignores_unfinished_reference_species_not_used_by_batch
     api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
               config_mod=_fake_config())
 
-    out = api.proj_prepare_lis(
+    out = api._proj_prepare_lis_for_reference_path(
         'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
         str(incar), str(tmp_path / 'out'), reference_path)
 
@@ -8869,14 +9046,14 @@ def test_proj_prepare_lis_rejects_missing_species_and_existing_target(tmp_path):
         tmp_path, {'Li2S8': 'DONE'}, calls)
     api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
               config_mod=_fake_config())
-    missing = api.proj_prepare_lis(
+    missing = api._proj_prepare_lis_for_reference_path(
         'lis', str(slab), [{'path': str(config), 'species': 'Li2S6'}],
         str(incar), str(tmp_path / 'out'), reference_path)
     assert missing['ok'] is False and 'Li2S6' in missing['error']
 
     target = tmp_path / 'out' / 'lis'
     target.mkdir(parents=True)
-    existing = api.proj_prepare_lis(
+    existing = api._proj_prepare_lis_for_reference_path(
         'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
         str(incar), str(tmp_path / 'out'), reference_path,
         {'confirmed': True, 'reason': '单测假赝势库无法核对 TITEL'})
@@ -8926,7 +9103,7 @@ def test_submit_project_resources_are_ephemeral_retry_safe_and_enable_autopilot(
               batch_ops_mod=types.SimpleNamespace(submit_batch=submit_batch),
               config_mod=_fake_config_rw(config_backing), secrets_mod=secrets)
 
-    first = api.submit_project_with_resources(
+    first = api._submit_project_with_resources_for_path(
         '/p/project.yaml', 'hpc', 32, '48:00:00', password='cluster-secret')
     assert first['ok'] is False
     assert first['submitted'] == [dirs['clean']]
@@ -8942,7 +9119,7 @@ def test_submit_project_resources_are_ephemeral_retry_safe_and_enable_autopilot(
                                    'autopilot_fetch', 'autopilot_report'))
     assert passwords == {'hpc': 'cluster-secret'}
 
-    second = api.submit_project_with_resources('/p/project.yaml', 'hpc', 32, '48:00:00')
+    second = api._submit_project_with_resources_for_path('/p/project.yaml', 'hpc', 32, '48:00:00')
     assert second['ok'] is True and second['submitted'] == [dirs['retry']]
     assert captured[1][1] == [dirs['retry']]
     assert project['launch']['submitted_job_dirs'] == [dirs['clean'], dirs['retry']]
@@ -8969,7 +9146,7 @@ def test_submit_project_same_basename_members_are_not_rejected(tmp_path):
               manifest_mod=types.SimpleNamespace(load_manifest=lambda path: states[path]),
               batch_ops_mod=batch, config_mod=_fake_config_rw({}))
 
-    out = api.submit_project_with_resources('/p/project.yaml', 'hpc', 16, '10:00:00')
+    out = api._submit_project_with_resources_for_path('/p/project.yaml', 'hpc', 16, '10:00:00')
 
     assert out['ok'] is True
     assert submitted == [first, second]
@@ -9005,7 +9182,7 @@ def test_submit_project_includes_created_species_refs_and_skips_done_refs(tmp_pa
               manifest_mod=types.SimpleNamespace(load_manifest=lambda path: states[path]),
               batch_ops_mod=batch, config_mod=_fake_config_rw({}))
 
-    out = api.submit_project_with_resources('/p/project.yaml', 'hpc', 16, '10:00:00')
+    out = api._submit_project_with_resources_for_path('/p/project.yaml', 'hpc', 16, '10:00:00')
 
     assert out['ok'] is True
     assert submitted == [clean, config, created_ref]
@@ -9032,7 +9209,7 @@ def test_submit_project_rejects_switching_managed_project_to_other_profile(tmp_p
         manifest_mod=types.SimpleNamespace(load_manifest=lambda _path: manifest),
         batch_ops_mod=batch, config_mod=_fake_config_rw({}))
 
-    out = api.submit_project_with_resources(
+    out = api._submit_project_with_resources_for_path(
         '/p/project.yaml', 'server-b', 16, '10:00:00')
 
     assert out['ok'] is False
@@ -9073,8 +9250,8 @@ def test_submit_project_retry_repairs_launch_after_persistence_failure(tmp_path)
         manifest_mod=types.SimpleNamespace(load_manifest=lambda _path: manifest),
         batch_ops_mod=batch, config_mod=_fake_config_rw({}))
 
-    first = api.submit_project_with_resources('/p/project.yaml', 'hpc', 16, '10:00:00')
-    second = api.submit_project_with_resources('/p/project.yaml', 'hpc', 16, '10:00:00')
+    first = api._submit_project_with_resources_for_path('/p/project.yaml', 'hpc', 16, '10:00:00')
+    second = api._submit_project_with_resources_for_path('/p/project.yaml', 'hpc', 16, '10:00:00')
 
     assert first['ok'] is False and 'launch' in first['error']
     assert second['ok'] is True and second['submitted'] == []
@@ -9108,7 +9285,7 @@ def test_submit_project_round_trips_host_key_evidence_and_exact_pin(tmp_path):
         batch_ops_mod=types.SimpleNamespace(submit_batch=_submit),
         config_mod=_fake_config_rw({}))
 
-    out = api.submit_project_with_resources(
+    out = api._submit_project_with_resources_for_path(
         '/p/project.yaml', 'hpc', 32, '24:00:00', trust_new=pin)
 
     assert seen['trust'] is pin
@@ -9133,7 +9310,7 @@ def test_submit_blocks_literal_mpi_count_and_renders_cores_placeholder(tmp_path)
         api = Api(profiles_mod=_fake_profiles({'hpc': hardcoded}),
                   adsorption_mod=adsorption, manifest_mod=manifests,
                   config_mod=_fake_config_rw({}))
-        blocked = api.submit_project_with_resources(
+        blocked = api._submit_project_with_resources_for_path(
             '/p/project.yaml', 'hpc', 32, '24:00:00')
         assert blocked['ok'] is False and '不一致' in blocked['error']
 
@@ -9146,7 +9323,7 @@ def test_submit_blocks_literal_mpi_count_and_renders_cores_placeholder(tmp_path)
     api = Api(profiles_mod=_fake_profiles({'hpc': template}), adsorption_mod=adsorption,
               manifest_mod=manifests, batch_ops_mod=batch,
               config_mod=_fake_config_rw({}))
-    submitted = api.submit_project_with_resources('/p/project.yaml', 'hpc', 32, '24:00:00')
+    submitted = api._submit_project_with_resources_for_path('/p/project.yaml', 'hpc', 32, '24:00:00')
     assert submitted['ok'] and captured[0][0] == 'mpirun -np 32 vasp_std'
 
 
@@ -9171,7 +9348,7 @@ def test_submit_project_renders_mapped_vasp_command_without_mutating_profile(tmp
               adsorption_mod=adsorption, manifest_mod=manifests,
               batch_ops_mod=batch, config_mod=_fake_config_rw({}))
 
-    out = api.submit_project_with_resources('/p/project.yaml', 'hpc', 24, '12:00:00')
+    out = api._submit_project_with_resources_for_path('/p/project.yaml', 'hpc', 24, '12:00:00')
 
     assert out['ok'] is True
     assert captured[0][0].engine_commands['vasp'] == 'srun -n 24 vasp_std'
@@ -9201,7 +9378,7 @@ def test_submit_template_requires_effective_resource_placeholders_and_no_conflic
         api = Api(profiles_mod=_fake_profiles({'hpc': profile}),
                   adsorption_mod=adsorption, manifest_mod=manifests,
                   batch_ops_mod=batch, config_mod=_fake_config_rw({}))
-        return api.submit_project_with_resources(
+        return api._submit_project_with_resources_for_path(
             '/p/project.yaml', 'hpc', 32, '24:00:00')
 
     valid = _run(
@@ -9252,7 +9429,7 @@ def test_submit_reports_keyring_setter_success_without_readback_as_failure(tmp_p
               batch_ops_mod=batch, secrets_mod=secrets,
               config_mod=_fake_config_rw({}))
 
-    out = api.submit_project_with_resources(
+    out = api._submit_project_with_resources_for_path(
         '/p/project.yaml', 'hpc', 32, '24:00:00', password='secret')
 
     assert out['submitted'] == [job] and out['ok'] is False
@@ -9278,7 +9455,7 @@ def test_missing_reference_method_evidence_allows_generation_in_review_state(tmp
     ref_manifest['results']['reference_method_signature'] = {}
     api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
               config_mod=_fake_config())
-    out = api.proj_prepare_lis(
+    out = api._proj_prepare_lis_for_reference_path(
         'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
         str(incar), str(tmp_path / 'out'), reference_path)
     assert out['ok'] is True and calls
@@ -9401,8 +9578,11 @@ def test_pipeline_continue_needs_trust_marks_cluster_unsynced(tmp_path):
         {'cont': True, 'fetch': False}, events, errors)
 
     assert synced is False
-    assert any('主机指纹未信任' in error for error in errors)
+    assert errors == ['集群「hpc」同步失败(续算)']
     assert any(event['kind'] == 'continue' for event in events)
+    public = json.dumps({'events': events, 'errors': errors}, ensure_ascii=False)
+    assert 'SHA256:abc' not in public
+    assert str(tmp_path) not in public
 
 
 def test_pipeline_fetch_exception_marks_cluster_unsynced(tmp_path):
@@ -9432,8 +9612,11 @@ def test_pipeline_fetch_exception_marks_cluster_unsynced(tmp_path):
         {'cont': False, 'fetch': True}, events, errors)
 
     assert synced is False
-    assert any('network down' in error for error in errors)
+    assert errors == ['集群「hpc」同步失败(下载)']
     assert any(event['kind'] == 'fetch' for event in events)
+    public = json.dumps({'events': events, 'errors': errors}, ensure_ascii=False)
+    assert 'network down' not in public
+    assert str(tmp_path) not in public
 
 
 def test_pipeline_fetch_needs_trust_marks_cluster_unsynced(tmp_path):
@@ -9456,14 +9639,18 @@ def test_pipeline_fetch_needs_trust_marks_cluster_unsynced(tmp_path):
         manifest_mod=_fake_manifest_mod({job: manifest}),
         adsorption_mod=_fake_adsorption(
             projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project}))
-    errors = []
+    events, errors = [], []
 
     synced = api._tick_cluster(
         'hpc', ClusterProfile(name='hpc'), None,
-        {'cont': False, 'fetch': True}, [], errors)
+        {'cont': False, 'fetch': True}, events, errors)
 
     assert synced is False
-    assert any('主机指纹未信任' in error for error in errors)
+    assert errors == ['集群「hpc」同步失败(下载)']
+    assert any(event['kind'] == 'fetch' for event in events)
+    public = json.dumps({'events': events, 'errors': errors}, ensure_ascii=False)
+    assert 'SHA256:def' not in public
+    assert str(tmp_path) not in public
 
 
 def test_pipeline_cluster_empty_or_nonmember_allowlist_fails_closed(tmp_path):

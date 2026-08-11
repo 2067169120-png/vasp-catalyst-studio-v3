@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import re
+import json
 from pathlib import Path
 
 
 ASSETS = Path(__file__).parents[1] / "vcstudio" / "gui_web" / "assets"
+LOCALES = ASSETS.parents[1] / "shared" / "locales"
 
 
 def _source(name: str) -> str:
@@ -102,6 +104,105 @@ def test_browser_sends_only_analysis_spec_and_never_computes_scientific_values()
     assert "lowest_energy_eV =" not in script
     assert "if (parameters.includes('sort'))" in request
     assert "request.sort = {" in request
+
+
+def test_capability_cards_disable_every_non_available_state_and_offer_one_action():
+    script = _source("analysis-workbench.js")
+    css = _source("analysis-workbench.css")
+    registry = re.search(
+        r"function renderRegistry\(\) \{(.*?)\n  \}\n\n  function renderTemplates",
+        script, re.S,
+    ).group(1)
+
+    for status in (
+            "available", "missing_prerequisite", "mode_mismatch",
+            "not_implemented", "unavailable"):
+        assert f"{status}: 'analysis.capability." in script
+        assert f'data-status="{status}"' in css
+    assert "record.activatable === true" in registry
+    assert "capabilityStatus === 'available'" in registry
+    assert "button.disabled = State.busy || !activatable" in registry
+    assert "action.className = 'aw-next-action'" in registry
+    assert "CAPABILITY_ACTION_KEYS[capabilityStatus]" in registry
+    assert ".aw-registry button:disabled" in css
+
+
+def test_analysis_capability_and_server_result_i18n_keys_are_synced():
+    script = _source("analysis-workbench.js")
+    en = json.loads((LOCALES / "en.json").read_text(encoding="utf-8"))
+    zh = json.loads((LOCALES / "zh.json").read_text(encoding="utf-8"))
+    keys = {
+        *re.findall(r"'(analysis\.capability\.[^']+)'", script),
+        *re.findall(r"tr\('(analysis\.results\.[^']+)'", script),
+    }
+
+    assert keys
+    assert not (keys - set(en))
+    assert not (keys - set(zh))
+    assert set(en) == set(zh)
+    assert all(en[key] != zh[key] for key in keys)
+
+
+def test_generic_analysis_renderer_only_consumes_server_display_values():
+    script = _source("analysis-workbench.js")
+    renderer = re.search(
+        r"function renderServerResults\(view, box\) \{(.*?)\n  \}\n\n",
+        script, re.S,
+    ).group(1)
+
+    assert "value.display" in renderer
+    assert "source.source_id" in renderer
+    assert "row.source_ids" in renderer
+    for forbidden in ("toFixed(", "Math.", ".reduce(", "value.value -", "parseFloat("):
+        assert forbidden not in renderer
+    assert "serverResult.analysis_kind === 'elf_distribution_summary'" in renderer
+    assert "analysis.elf.boundary" in renderer
+
+
+def test_next_calculation_card_is_read_only_and_has_no_execution_control():
+    html = _source("index.html")
+    script = _source("analysis-workbench.js")
+    backend = (ASSETS.parent / "api.py").read_text(encoding="utf-8")
+    renderer = re.search(
+        r"function renderNextCalculation\(view\) \{(.*?)\n  \}\n\n",
+        script, re.S,
+    ).group(1)
+    draft_bridge = backend.split(
+        "def analysis_workbench_next_intent", 1)[1].split(
+            "def analysis_workbench_bootstrap", 1)[0]
+
+    assert 'id="aw-next-calculation"' in html
+    assert 'data-i18n="analysis.next.title"' in html
+    assert 'data-i18n="analysis.next.readOnly"' in html
+    assert 'data-i18n="analysis.next.not_loaded"' in html
+    assert "governed.recommendations" in renderer
+    assert "recommendation.evidence_refs" in renderer
+    assert "recommendation.reason" in renderer
+    assert "createElement('button')" not in renderer
+    assert "VCS.call" not in renderer
+    for forbidden in (
+            "submit_jobs", "continue_jobs", "jobs_cancel_batch",
+            "surface_energy_calc", "formation_binding_calc"):
+        assert forbidden not in draft_bridge
+
+
+def test_next_calculation_i18n_keys_exist_and_static_fallbacks_match_zh():
+    html = _source("index.html")
+    script = _source("analysis-workbench.js")
+    en = json.loads((LOCALES / "en.json").read_text(encoding="utf-8"))
+    zh = json.loads((LOCALES / "zh.json").read_text(encoding="utf-8"))
+    keys = set(re.findall(r"analysis\.next\.[A-Za-z_]+", html + script))
+
+    assert {"analysis.next.title", "analysis.next.readOnly",
+            "analysis.next.not_loaded"} <= keys
+    assert not (keys - set(en))
+    assert not (keys - set(zh))
+    assert set(en) == set(zh)
+    for key in ("analysis.next.title", "analysis.next.readOnly",
+                "analysis.next.not_loaded"):
+        match = re.search(
+            rf'data-i18n="{re.escape(key)}"[^>]*>([^<]+)<', html)
+        assert match and match.group(1).strip() == zh[key]
 
 
 def test_sort_controls_follow_the_registry_capability_and_never_replay_placeholder_sort():

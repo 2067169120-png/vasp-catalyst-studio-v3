@@ -42,6 +42,14 @@ def test_default_is_full_and_collects_chart_and_rdkit_resources(monkeypatch):
     assert {'DECIMER', 'tensorflow'} <= set(excluded)
     data_targets = _option_values(cmd, '--add-data')
     assert any(value.endswith(os.pathsep + 'vcstudio_assets') for value in data_targets)
+    assert any(
+        value.endswith(os.pathsep + os.path.join('vcstudio', 'shared', 'locales'))
+        for value in data_targets
+    )
+    assert 'vcstudio.cli.main' in _option_values(cmd, '--hidden-import')
+    hidden_imports = set(_option_values(cmd, '--hidden-import'))
+    assert set(build_exe.JOURNEY_HIDDEN_IMPORTS) <= hidden_imports
+    assert Path(build_exe.WEB_ENTRY).name == 'frozen_entry.py'
     assert cmd[-1] == build_exe.WEB_ENTRY
 
 

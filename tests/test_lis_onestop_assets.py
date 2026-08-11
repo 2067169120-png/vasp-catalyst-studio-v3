@@ -34,7 +34,7 @@ def test_lis_builder_uses_backend_contract_and_strict_species_mapping():
     assert "'proj_scan_structures', picked.path, val('pj-slab'), selectedReferenceSpecies()" in js
     assert "VCS.call('proj_prepare_lis', val('pj-name'), val('pj-slab'), gate.items," in js
     assert "VCS.call('proj_resolve_member_incar', path, val('pj-incar'))" in js
-    assert "VCS.call('submit_project_with_resources', projectPath," in js
+    assert "VCS.call('submit_project_with_resources', projectIdValue," in js
     assert 'State.configSpecies' in js
     assert 'reference_species' in js
     assert 'n_species_refs' in js
@@ -100,10 +100,11 @@ def test_import_completion_can_start_lis_with_preselected_references():
     assert '用这些参考能开始吸附计算' in js
     assert 'startLiS(' in js
     assert 'window.Project = {' in js
-    for member in ('reload: reloadProjects', 'selectByPath', 'selectByName',
+    for member in ('reload: reloadProjects', 'selectById',
                    'openImport', 'startLiS'):
         assert member in js
-    assert "sel.value = hit.path; onReferenceChanged()" in js
+    assert "sel.value = projectId(hit); onReferenceChanged()" in js
+    assert 'selectByPath' not in js
 
 
 def test_reference_only_import_is_not_mislabelled_as_missing_delta_e():
@@ -171,7 +172,7 @@ def test_prepared_project_is_reused_for_cancelled_or_partial_submit():
     assert 'function lisContentFingerprint()' in js
     assert 'function reusablePreparedLis()' in js
     assert 'if (reusable)' in js
-    assert "prepared = { ok: true, project_path: reusable.path" in js
+    assert "prepared = { ok: true, project_id: reusable.projectId" in js
     assert 'State.preparedLis = {' in js
     assert 'State.preparedLis.submitted = true' in js
     assert '重试未提交成员（不会重复生成）' in js
@@ -189,7 +190,7 @@ def test_method_check_separates_execution_from_energy_comparability():
         assert f'id="{control}"' in html
     assert 'id="lis-method-confirm"' not in html
     assert 'id="lis-method-reason"' not in html
-    assert 'gate.ref.path, gate.methodConfirmation' in js
+    assert 'projectId(gate.ref), gate.methodConfirmation' in js
     assert 'prepared.needs_method_confirmation' in js
     assert 'check.execution_status' in js
     assert 'check.comparability_status || check.status' in js
@@ -351,7 +352,7 @@ def test_new_bundle_replaces_old_group_atomically_and_discards_stale_scans():
 
 def test_project_report_requests_backend_final_adsorption_gate():
     js = _source('project.js')
-    assert "VCS.call('proj_report', proj.path, save, true)" in js
+    assert "VCS.call('proj_report', projectId(proj), save, true)" in js
     assert 'button.disabled = State.lisBusy || State.inputScanBusy || !gate.ok' in js
     assert 'State.lisBusy = true' in js
     assert 'State.lisBusy = false' in js
@@ -402,7 +403,7 @@ def test_single_report_format_selection_is_accessible_and_enforced():
     init = js[js.index("wire('pj-report', () => openReportWorkbench('report'));"):]
     assert init.index('\n    syncReportFormatControls();') < init.index('\n    loadReportCapabilities();')
     assert 'if (!selectedFormats) return' in js
-    assert "'proj_report_bundle', proj.path, dr.path, selectedFormats, true" in js
+    assert "'proj_report_bundle', projectId(proj), dr.path, selectedFormats, true" in js
     assert '请至少选择一种报告格式' in js
     assert "selectedFormats.length !== 1 || selectedFormats[0] !== 'html'" in js
     assert '请只勾选 HTML 后重试' in js
@@ -450,11 +451,12 @@ def test_errors_offer_a_direct_repair_action_instead_of_log_only():
 def test_project_progress_is_restored_after_reopening_the_app():
     js = _source('project.js')
     html = _source('index.html')
-    assert "CURRENT_PROJECT_KEY = 'vcs.adsorption.current_project'" in js
+    assert "LEGACY_CURRENT_PROJECT_KEY = 'vcs.adsorption.current_project'" in js
     assert "VCS.call('pipeline_status')" in js
     assert 'function restoreWorkflowState(project)' in js
     assert 'pipeline_needs_human' in js
-    assert 'localStorage.setItem(CURRENT_PROJECT_KEY' in js
+    assert 'localStorage.removeItem(LEGACY_CURRENT_PROJECT_KEY)' in js
+    assert 'localStorage.setItem(LEGACY_CURRENT_PROJECT_KEY' not in js
     assert '处理任务异常' in js
     assert '<b>5</b>监控与续算' in html
 
@@ -472,7 +474,7 @@ def test_workflow_distinguishes_pending_submit_analysis_and_written_report():
     assert "State.workflowResultReady = State.workflowStage === 'report_done'" in delta
     assert 'State.workflowResultReady = !!' not in delta
     report = js[js.index('async function report()'):js.index('// ── 一键成稿包')]
-    assert 'await reloadProjects(proj.path)' in report
+    assert 'await reloadProjects(projectId(proj))' in report
     assert '作业已生成，等待提交' in js
     assert '此时自动监控尚未开始' in js
 
@@ -481,7 +483,7 @@ def test_programmatic_project_selection_restores_matching_pipeline_state():
     js = _source('project.js')
     commit = js[js.index('async function commitImport()'):
                 js.index('function showImportDone(')]
-    assert 'restoreWorkflowState(hit)' in commit
+    assert 'applyProjectSelection(hit)' in commit
     open_results = js[js.index('async function openProjectResults('):
                       js.index('function canonicalRole(')]
     assert ('restoreWorkflowState(hit)' in open_results or
@@ -489,8 +491,8 @@ def test_programmatic_project_selection_restores_matching_pipeline_state():
     selector = js[js.index('async function selectRequestedProject('):
                   js.index('function current()')]
     assert 'applyProjectSelection(hit)' in selector
-    assert "return selectRequestedProject('path', wanted, wanted)" in selector
-    assert "return selectRequestedProject('name', name, '')" in selector
+    assert 'return selectRequestedProject(id)' in selector
+    assert 'selectByPath' not in selector
     apply_selection = js[js.index('function applyProjectSelection('):
                          js.index('async function requestProjectSelection(')]
     assert 'restoreWorkflowState(project || null)' in apply_selection

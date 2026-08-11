@@ -21,14 +21,25 @@
   const State = {
     rows: [],            // list_jobs 返回的行
     stale: [],           // 失效条目目录
+    ledgerStatus: 'loading', // loading | ready | stale | unavailable
+    ledgerError: '',
+    lastLoadedAt: '',
     profiles: {},        // name -> profile dict
     selected: new Set(), // 选中的 dir
     expanded: new Set(), // 展开的项目组 key(默认全部折叠;本会话内记忆)
+    selectionTrayExpanded: true,
+    activeOperation: null,
+    operationHistory: [],
+    operationSequence: 0,
     refreshing: false,   // 查询在飞(auto 跳过本轮的护栏)
     autoTimer: null,
     reloadGeneration: 0,
     reloadInFlight: null,
     selectionGeneration: 0,
+    resourceForecastStatus: 'idle',
+    resourceForecastResult: null,
+    resourceForecastGeneration: 0,
+    resourceForecastSelection: '',
   };
 
   // 目录 → 末段名(本地日志用,兼容 \ 与 /)
@@ -47,8 +58,7 @@
   function publishJobContext(row) {
     const id = stableJobId(row);
     if (!id) return false;
-    // canonical project_id 必须优先于裸 project_uuid；workspace 路由只接受前者。
-    const projectId = String(row.project_id || row.project_uuid || '').trim();
+    const projectId = String(row.project_id || '').trim();
     document.dispatchEvent(new CustomEvent('vcs:job-context', {
       detail: {
         id,
@@ -86,7 +96,7 @@
   function jobBelongsToWorkspaceProject(row) {
     const currentProjectId = currentWorkspaceProjectId();
     if (!currentProjectId) return true;
-    const rowProjectId = String(row && (row.project_id || row.project_uuid) || '').trim();
+    const rowProjectId = String(row && row.project_id || '').trim();
     return !!rowProjectId && rowProjectId === currentProjectId;
   }
 
@@ -197,10 +207,34 @@
       return { ok: false, stale: true, generation };
     }
     applyProfiles(profiles);
-    State.rows = (r && r.jobs) || [];
-    State.stale = (r && r.stale) || [];
-    if (r && r.error) VCS.log(tr('runtime.jobs.ledger.read_failed', { error: r.error },
-      '读取台账失败:{error}', 'Failed to read job ledger: {error}'), 'failc');
+    const validPayload = r && !r.error && Array.isArray(r.jobs) && Array.isArray(r.stale);
+    if (validPayload) {
+      invalidateResourceForecast();
+      State.rows = r.jobs.map(row => {
+        const clean = {};
+        const rejected = new Set(['project' + '_path', 'project' + '_uuid']);
+        Object.keys(row || {}).forEach(key => {
+          if (!rejected.has(key)) clean[key] = row[key];
+        });
+        return clean;
+      });
+      State.stale = r.stale;
+      State.ledgerStatus = 'ready';
+      State.ledgerError = '';
+      State.lastLoadedAt = new Date().toISOString();
+    } else {
+      // 读取失败时保留最后一次成功台账。把“服务不可用”误渲染成“没有作业”会诱导用户
+      // 重复提交，且会让筛选外的选择上下文无声消失。
+      State.ledgerStatus = State.lastLoadedAt ? 'stale' : 'unavailable';
+      State.ledgerError = String((r && r.error) || tr(
+        'runtime.jobs.ledger.invalid_response', {}, '台账返回格式无效',
+        'The job ledger returned an invalid response'));
+      VCS.log(tr('runtime.jobs.ledger.read_failed', { error: State.ledgerError },
+        '读取台账失败:{error}', 'Failed to read job ledger: {error}'), 'failc');
+      VCS.toast(tr('runtime.jobs.ledger.last_good_retained', {},
+        '台账刷新失败；已保留上次成功读取的作业',
+        'Ledger refresh failed; the last successfully loaded jobs are retained'), 'fail');
+    }
     refreshClusterFilter();
     if (typeof fmClusters === 'function') fmClusters();
     renderTable();
@@ -307,9 +341,8 @@
   }
 
   function projectKindForGroup(group) {
-    const allRows = State.rows.filter(row => group.path
-      ? row.project_path === group.path
-      : (!row.project_path && row.project === group.label));
+    const allRows = State.rows.filter(row =>
+      String(row.project_id || '') === String(group.projectId || ''));
     return allRows.length && allRows.every(row => row.role === 'molecule')
       ? 'molecule_library' : 'adsorption';
   }
@@ -325,7 +358,7 @@
   }
 
   // 组头行:项目名 + done/total 进度 + 细进度条 + 聚合状态;全 DONE 给「算 ΔE」
-  function groupHeadHtml(key, label, rows, isProject, projectPath, projectKind, projectId) {
+  function groupHeadHtml(key, label, rows, isProject, projectKind, projectId) {
     const st = groupStats(rows);
     const open = State.expanded.has(key);
     const pct = st.total ? Math.round(st.done / st.total * 100) : 0;
@@ -364,7 +397,6 @@
       agg +
       (isProject && projectKind !== 'molecule_library' && allDone
         ? ` <button class="btn grp-de" data-proj="${VCS.esc(label)}" ` +
-          `data-proj-path="${VCS.esc(projectPath || '')}" ` +
           `data-project-id="${VCS.esc(projectId || '')}" ` +
           `title="${VCS.esc(tr('runtime.jobs.group.energy_title', {},
             '切到吸附能项目页并选中该项目',
@@ -381,9 +413,16 @@
     if (!State.rows.length) {
       State.selected.clear();
       if (hadSelection) publishJobContextCleared();
-      card.innerHTML = `<div class="empty"><p>${VCS.esc(tr('runtime.jobs.empty.none_managed', {},
-        '还没有纳管的作业 — 去生成页产出四件套,或从集群队列认领已有作业',
-        'No managed jobs yet. Create a four-file input set on the Generate page or claim an existing job from the cluster queue'))}</p></div>`;
+      const unavailable = State.ledgerStatus === 'unavailable';
+      card.innerHTML = `<div class="empty"><p>${VCS.esc(unavailable
+        ? tr('runtime.jobs.empty.ledger_unavailable', {},
+          '作业台账暂时不可用；这不表示当前没有作业，请稍后重试',
+          'The job ledger is temporarily unavailable. This does not mean there are no jobs; retry shortly')
+        : tr('runtime.jobs.empty.none_managed', {},
+          '还没有纳管的作业 — 去生成页产出四件套,或从集群队列认领已有作业',
+          'No managed jobs yet. Create a four-file input set on the Generate page or claim an existing job from the cluster queue'))}</p></div>`;
+      renderLedgerState();
+      renderSelectionTray();
       return;
     }
     // 丢弃已不在台账里的选中项
@@ -396,6 +435,8 @@
       card.innerHTML = `<div class="empty"><p>${VCS.esc(tr('runtime.jobs.empty.no_filter_match', {},
         '当前筛选无匹配作业 — 调整上方筛选条件',
         'No jobs match the current filters. Adjust the filters above'))}</p></div>`;
+      renderLedgerState();
+      renderSelectionTray();
       return;
     }
 
@@ -403,18 +444,15 @@
     const groups = new Map();
     const single = [];
     rows0.forEach(r => {
-      if (r.project) {
-        const groupKey = r.project_path ? 'path:' + r.project_path : 'name:' + r.project;
+      const rowProjectId = String(r.project_id || '').trim();
+      if (r.project && rowProjectId) {
+        const groupKey = 'id:' + rowProjectId;
         if (!groups.has(groupKey)) {
           groups.set(groupKey, {
             label: r.project,
-            path: r.project_path || '',
-            projectId: String(r.project_id || '').trim(),
+            projectId: rowProjectId,
             rows: [],
           });
-        }
-        if (!groups.get(groupKey).projectId && r.project_id) {
-          groups.get(groupKey).projectId = String(r.project_id).trim();
         }
         groups.get(groupKey).rows.push(r);
       } else {
@@ -447,7 +485,7 @@
         const open = State.expanded.has(key);
         const projectKind = projectKindForGroup(group);
         h += '<tbody class="job-group-heading">' + groupHeadHtml(
-          key, group.label, rows, true, group.path, projectKind, group.projectId) + '</tbody>' +
+          key, group.label, rows, true, projectKind, group.projectId) + '</tbody>' +
           `<tbody id="${groupBodyId(key)}" class="job-group-body">`;
         rows.forEach(r => { h += rowHtml(r, key, !open); });
         h += '</tbody>';
@@ -457,7 +495,7 @@
         const open = State.expanded.has(key);
         h += '<tbody class="job-group-heading">' +
           groupHeadHtml(key, tr('runtime.jobs.group.standalone', {}, '单独作业', 'Standalone jobs'),
-            single, false, '', '', '') + '</tbody>' +
+            single, false, '', '') + '</tbody>' +
           `<tbody id="${groupBodyId(key)}" class="job-group-body">`;
         single.forEach(r => { h += rowHtml(r, key, !open); });
         h += '</tbody>';
@@ -465,6 +503,319 @@
     }
     h += '</table>';
     card.innerHTML = h;
+    renderLedgerState();
+    renderSelectionTray();
+  }
+
+  function renderLedgerState() {
+    const el = $('#jobs-ledger-state');
+    if (!el) return;
+    if (State.ledgerStatus === 'ready') {
+      el.hidden = true;
+      el.textContent = '';
+      el.className = 'jobs-ledger-state';
+      return;
+    }
+    el.hidden = false;
+    const hasLastGood = State.ledgerStatus === 'stale';
+    el.className = 'jobs-ledger-state ' + (hasLastGood ? 'stale' : 'unavailable');
+    el.textContent = hasLastGood
+      ? tr('runtime.jobs.ledger.showing_last_good', { error: State.ledgerError },
+        '当前显示上次成功读取的数据；本次刷新失败：{error}',
+        'Showing the last successfully loaded data; this refresh failed: {error}')
+      : tr('runtime.jobs.ledger.unavailable', { error: State.ledgerError },
+        '作业台账不可用：{error}', 'Job ledger unavailable: {error}');
+  }
+
+  function selectedRows() {
+    return State.rows.filter(row => State.selected.has(row.dir));
+  }
+
+  function resourceForecastSelectionKey(rows) {
+    const ids = (rows || []).map(stableJobId).filter(Boolean).sort();
+    return ids.length === (rows || []).length ? ids.join('\n') : '';
+  }
+
+  function invalidateResourceForecast(selectionKey) {
+    State.resourceForecastGeneration += 1;
+    State.resourceForecastStatus = 'idle';
+    State.resourceForecastResult = null;
+    State.resourceForecastSelection = selectionKey === undefined
+      ? resourceForecastSelectionKey(selectedRows()) : selectionKey;
+  }
+
+  function resourceRiskLabel(value) {
+    const labels = {
+      no_matching_history: ['jobs.forecast.risk.no_history', '无匹配历史', 'No matching history'],
+      sparse_history: ['jobs.forecast.risk.sparse_history', '历史样本稀少', 'Sparse history'],
+      high_recent_failure_rate: ['jobs.forecast.risk.failure_rate', '近期失败率高', 'High recent failure rate'],
+      wide_uncertainty: ['jobs.forecast.risk.wide', '不确定区间较宽', 'Wide uncertainty'],
+      budget_at_risk: ['jobs.forecast.risk.budget', '剩余预算有风险', 'Remaining budget at risk'],
+    };
+    const label = labels[value];
+    return label ? tr(label[0], {}, label[1], label[2]) : String(value);
+  }
+
+  function renderResourceForecast() {
+    const panel = $('#jobs-resource-forecast');
+    const output = $('#jobs-resource-forecast-out');
+    const button = $('#jb-tray-forecast');
+    const rows = selectedRows();
+    if (!panel || !output || !button) return;
+    const key = resourceForecastSelectionKey(rows);
+    if (key !== State.resourceForecastSelection) invalidateResourceForecast(key);
+    button.disabled = !key || State.resourceForecastStatus === 'loading';
+    panel.hidden = State.resourceForecastStatus === 'idle';
+    panel.className = `jobs-resource-forecast ${State.resourceForecastStatus}`;
+    panel.setAttribute('aria-busy', State.resourceForecastStatus === 'loading' ? 'true' : 'false');
+    if (State.resourceForecastStatus === 'idle') {
+      output.replaceChildren();
+      return;
+    }
+    if (State.resourceForecastStatus === 'loading') {
+      output.textContent = tr('jobs.forecast.loading', {},
+        '正在从服务端台账与清单重建证据…',
+        'Reconstructing evidence from the server ledger and manifests…');
+      return;
+    }
+    const result = State.resourceForecastResult || {};
+    if (!result.ok || State.resourceForecastStatus === 'unavailable' || !result.display) {
+      output.textContent = result.error || tr('jobs.forecast.unavailable', {},
+        '证据不足，资源估算不可用；不会猜测缺失值',
+        'Resource forecast unavailable because evidence is incomplete; missing values are not guessed');
+      return;
+    }
+    const display = result.display;
+    const denom = result.denominators || {};
+    const risks = ((result.forecast || {}).risk_flags || []).map(resourceRiskLabel);
+    const historyReasons = Object.entries(result.history_missing_reasons || {}).map(
+      ([reason, count]) => `${reason}: ${count}`);
+    const unknown = (result.unknown_jobs || []).map(item =>
+      `${item.job_id}: ${(item.missing || []).join(', ')}`);
+    const statusLabel = State.resourceForecastStatus === 'at_risk'
+      ? tr('jobs.forecast.at_risk', {}, '预算风险', 'At risk')
+      : tr('jobs.forecast.ready', {}, '估算就绪', 'Ready');
+    const summary = [
+      `<div class="jobs-resource-forecast-summary"><b>${VCS.esc(statusLabel)}</b>` +
+        `<span>${VCS.esc(tr('jobs.forecast.point', { value: display.estimate_core_hours },
+          '点估计 {value} 核时', 'Point estimate: {value} core-hours'))}</span>` +
+        `<span>${VCS.esc(tr('jobs.forecast.range', { value: display.range_core_hours },
+          '区间 {value} 核时', 'Range: {value} core-hours'))}</span>` +
+        `<span>${VCS.esc(tr('jobs.forecast.confidence', { value: display.confidence },
+          '置信度 {value}', 'Confidence: {value}'))}</span></div>`,
+      `<div class="jobs-resource-forecast-meta">${VCS.esc(tr(
+        'jobs.forecast.denominator', {
+          ready: denom.forecastable_jobs, total: denom.selected_jobs,
+          samples: denom.usable_history_entries,
+        }, '可估算 {ready}/{total}；可用历史 {samples} 条',
+        '{ready}/{total} forecastable; {samples} usable history records'))}<br>` +
+        `${VCS.esc(tr('jobs.forecast.budget', {
+          value: display.remaining_budget_core_hours,
+          status: display.budget_status, evidence: result.budget_evidence_status,
+        }, '剩余预算：{value} 核时；状态 {status}；证据 {evidence}',
+        'Remaining budget: {value} core-hours; status: {status}; evidence: {evidence}'))}<br>` +
+        `${VCS.esc(tr('jobs.forecast.history_unknown', {
+          count: denom.unknown_history_entries,
+          reasons: historyReasons.length ? historyReasons.join(', ') : '—',
+        }, '未采用历史 {count} 条；缺项 {reasons}',
+        '{count} history records not used; missing evidence: {reasons}'))}<br>` +
+        `${VCS.esc(tr('jobs.forecast.history_hash', {
+          hash: result.history_basis_sha256,
+        }, '历史依据哈希：{hash}', 'History-basis hash: {hash}'))}</div>`,
+    ];
+    const jobRows = (display.jobs || []).map(item =>
+      `<li><b>${VCS.esc(item.job_id)}</b><span>${VCS.esc(tr(
+        'jobs.forecast.job_row', {
+          point: item.estimate_core_hours, range: item.range_core_hours,
+          success: item.matching_successful_samples,
+          observed: item.matching_observed_samples,
+          confidence: item.confidence, failure: item.failure_rate,
+        }, '点估计 {point}；区间 {range} 核时；成功样本 {success}/{observed}；置信度 {confidence}；失败率 {failure}',
+        'Point {point}; range {range} core-hours; successful samples {success}/{observed}; confidence {confidence}; failure rate {failure}'))}</span></li>`).join('');
+    if (jobRows) summary.push(`<ul>${jobRows}</ul>`);
+    if (risks.length) summary.push(`<p class="warn">${VCS.esc(tr(
+      'jobs.forecast.risks', { risks: risks.join('；') },
+      '风险：{risks}', 'Risks: {risks}'))}</p>`);
+    if (unknown.length) summary.push(`<p class="unknown">${VCS.esc(tr(
+      'jobs.forecast.unknown_jobs', { jobs: unknown.join('；') },
+      '缺证据作业：{jobs}', 'Jobs with missing evidence: {jobs}'))}</p>`);
+    summary.push(`<p class="boundary">${VCS.esc(tr('jobs.forecast.boundary', {},
+      '此估算仅供建议；不授权提交。提交仍须经过原确认与幂等门。',
+      'This forecast is advisory only and does not authorize submission. The existing confirmation and idempotency gates still apply.'))}</p>`);
+    output.innerHTML = summary.join('');
+  }
+
+  async function estimateSelectedResources() {
+    const rows = selectedRows();
+    const key = resourceForecastSelectionKey(rows);
+    const ids = rows.map(stableJobId);
+    if (!key || ids.length !== rows.length) {
+      State.resourceForecastStatus = 'unavailable';
+      State.resourceForecastResult = { ok: false, error: tr(
+        'jobs.forecast.missing_ids', {},
+        '所选作业缺少稳定服务端标识，无法估算',
+        'A selected job lacks a stable server ID, so it cannot be forecast') };
+      renderResourceForecast();
+      return false;
+    }
+    const generation = ++State.resourceForecastGeneration;
+    State.resourceForecastSelection = key;
+    State.resourceForecastStatus = 'loading';
+    State.resourceForecastResult = null;
+    renderResourceForecast();
+    try {
+      const result = await VCS.call('jobs_resource_forecast', ids);
+      if (generation !== State.resourceForecastGeneration ||
+          key !== resourceForecastSelectionKey(selectedRows())) return false;
+      State.resourceForecastResult = result || { ok: false };
+      State.resourceForecastStatus = result && result.ok
+        ? (result.status || 'unavailable') : 'unavailable';
+      renderResourceForecast();
+      return State.resourceForecastStatus === 'ready' ||
+        State.resourceForecastStatus === 'at_risk';
+    } catch (error) {
+      if (generation !== State.resourceForecastGeneration) return false;
+      State.resourceForecastResult = { ok: false, error: String(error && error.message || error) };
+      State.resourceForecastStatus = 'unavailable';
+      renderResourceForecast();
+      return false;
+    }
+  }
+
+  function renderSelectionTray() {
+    const tray = $('#jobs-selection-tray');
+    const list = $('#jobs-selection-list');
+    const summary = $('#jobs-selection-summary');
+    const toggle = $('#jobs-selection-review');
+    if (!tray || !list || !summary || !toggle) return;
+    const rows = selectedRows();
+    const selectionKey = resourceForecastSelectionKey(rows);
+    if (selectionKey !== State.resourceForecastSelection) invalidateResourceForecast(selectionKey);
+    tray.hidden = rows.length === 0;
+    if (!rows.length) {
+      list.innerHTML = '';
+      summary.textContent = '';
+      renderResourceForecast();
+      return;
+    }
+    const visible = new Set(visibleRows().map(row => row.dir));
+    const hiddenCount = rows.filter(row => !visible.has(row.dir)).length;
+    summary.textContent = hiddenCount
+      ? tr('runtime.jobs.selection.summary_hidden', {
+        count: rows.length, hidden: hiddenCount,
+      }, '已选 {count} 个，其中 {hidden} 个被筛选条件隐藏',
+      '{count} selected; {hidden} hidden by the current filters')
+      : tr('runtime.jobs.selection.summary', { count: rows.length },
+        '已选 {count} 个作业', '{count} jobs selected');
+    toggle.setAttribute('aria-expanded', State.selectionTrayExpanded ? 'true' : 'false');
+    toggle.textContent = State.selectionTrayExpanded
+      ? tr('runtime.jobs.selection.collapse', {}, '收起明细', 'Collapse details')
+      : tr('runtime.jobs.selection.expand', {}, '查看明细', 'Review details');
+    list.hidden = !State.selectionTrayExpanded;
+    list.innerHTML = rows.map(row => {
+      const project = String(row.project || tr('runtime.jobs.group.standalone', {},
+        '单独作业', 'Standalone jobs'));
+      const cluster = String(row.cluster || tr('runtime.jobs.selection.unbound', {},
+        '未绑定集群', 'Unbound'));
+      return `<li><div><b>${VCS.esc(row.name || base(row.dir))}</b>` +
+        `<span>${VCS.esc(project)} · ${VCS.esc(cluster)}</span></div>` +
+        `${VCS.pill(row.state || 'CREATED')}</li>`;
+    }).join('');
+    renderResourceForecast();
+  }
+
+  const OPERATION_BUTTONS = [
+    'jb-submit', 'jb-fetch', 'jb-continue', 'jb-cancelchecked', 'jb-remove',
+    'jb-tray-submit', 'jb-tray-fetch', 'jb-tray-continue', 'jb-tray-cancel',
+    'jb-tray-remove',
+  ];
+
+  function operationId(kind) {
+    State.operationSequence += 1;
+    return 'jobop-' + Date.now().toString(36) + '-' + State.operationSequence.toString(36) +
+      '-' + String(kind || 'operation').replace(/[^A-Za-z0-9_.-]/g, '-');
+  }
+
+  function setOperationControlsBusy(busy) {
+    OPERATION_BUTTONS.forEach(id => {
+      const button = $('#' + id);
+      if (button) button.disabled = !!busy;
+    });
+  }
+
+  function renderOperationQueue() {
+    const box = $('#jobs-operation-queue');
+    const active = $('#jobs-operation-active');
+    const history = $('#jobs-operation-history');
+    if (!box || !active || !history) return;
+    const op = State.activeOperation;
+    box.hidden = !op && !State.operationHistory.length;
+    active.hidden = !op;
+    active.innerHTML = op
+      ? `<b>${VCS.esc(op.label)}</b><span>${VCS.esc(tr(
+        'runtime.jobs.operation.active', { count: op.dirs.length, status: op.status },
+        '{count} 个作业 · {status}', '{count} jobs · {status}'))}</span>`
+      : '';
+    history.innerHTML = State.operationHistory.slice(0, 5).map(item =>
+      `<li class="${VCS.esc(item.status)}"><b>${VCS.esc(item.label)}</b>` +
+      `<span>${VCS.esc(tr('runtime.jobs.operation.history_item', {
+        count: item.dirs.length, status: item.status,
+      }, '{count} 个作业 · {status}', '{count} jobs · {status}'))}</span></li>`).join('');
+    setOperationControlsBusy(!!op);
+  }
+
+  function publishWorkspaceOperation(op) {
+    if (!op || !VCS.operations || typeof VCS.operations.publish !== 'function') return;
+    VCS.operations.publish({
+      id: op.id, kind: op.kind, label: op.label, status: op.status,
+      count: op.dirs.length, error: op.error || '', route: 'run-jobs',
+      started_at: op.startedAt, updated_at: op.finishedAt || new Date().toISOString(),
+    });
+  }
+
+  function updateOperation(op, status) {
+    if (!op || State.activeOperation !== op) return false;
+    op.status = status;
+    renderOperationQueue();
+    publishWorkspaceOperation(op);
+    return true;
+  }
+
+  async function withExclusiveOperation(kind, label, dirs, profile, work) {
+    if (State.activeOperation) {
+      VCS.toast(tr('runtime.jobs.operation.busy', { operation: State.activeOperation.label },
+        '另一项作业操作“{operation}”仍在进行，请等待其完成',
+        'Another job operation, "{operation}", is still active; wait for it to finish'), 'fail');
+      return null;
+    }
+    const op = {
+      id: operationId(kind), kind, label, profile: String(profile || ''),
+      dirs: Array.from(new Set((dirs || []).map(String))).sort(),
+      status: 'confirming', startedAt: new Date().toISOString(),
+    };
+    State.activeOperation = op;
+    renderOperationQueue();
+    publishWorkspaceOperation(op);
+    let outcome = { status: 'failed' };
+    try {
+      outcome = (await work(op)) || { status: 'cancelled' };
+    } catch (error) {
+      outcome = { status: 'failed', error: String(error && error.message || error) };
+      VCS.log(tr('runtime.jobs.operation.failed', { operation: label, error: outcome.error },
+        '{operation}失败：{error}', '{operation} failed: {error}'), 'failc');
+    } finally {
+      if (State.activeOperation === op) {
+        op.status = outcome.status || 'failed';
+        op.finishedAt = new Date().toISOString();
+        op.error = String(outcome.error || '');
+        State.activeOperation = null;
+        State.operationHistory.unshift(op);
+        State.operationHistory = State.operationHistory.slice(0, 20);
+        renderOperationQueue();
+        publishWorkspaceOperation(op);
+      }
+    }
+    return outcome.value === undefined ? outcome : outcome.value;
   }
 
   // ── 筛选(集群 / 状态)+ 排序(时间↓/名称/状态) ──
@@ -579,57 +930,32 @@
     return String(project && (project.project_id || project.id) || '').trim();
   }
 
-  function resolveProjectTarget(name, path, explicitProjectId) {
-    const wantedName = String(name || '');
-    const wantedPath = String(path || '');
-    let wantedId = String(explicitProjectId || '').trim();
-    const matchingRows = State.rows.filter(row => wantedPath
-      ? String(row.project_path || '') === wantedPath
-      : (wantedName && String(row.project || '') === wantedName));
-    if (!wantedId) {
-      const stableIds = Array.from(new Set(matchingRows
-        .map(row => String(row.project_id || '').trim()).filter(Boolean)));
-      if (stableIds.length === 1) wantedId = stableIds[0];
-    }
-    if (!wantedId && !wantedPath && !wantedName) wantedId = currentWorkspaceProjectId();
-
+  function knownProject(projectId) {
+    const wantedId = String(projectId || '').trim();
+    if (!wantedId) return null;
     const workspaceProjects = VCS.workspace && Array.isArray(VCS.workspace.projects)
       ? VCS.workspace.projects : [];
-    const legacyProjects = window.Project && typeof window.Project.list === 'function'
+    const projectPageProjects = window.Project && typeof window.Project.list === 'function'
       ? window.Project.list() : [];
-    const projects = workspaceProjects.concat(legacyProjects || []);
-    let hit = wantedId
-      ? projects.find(project => projectRecordId(project) === wantedId) || null : null;
-    if (!hit && wantedPath) {
-      hit = projects.find(project => String(project.path || '') === wantedPath) || null;
-    }
-    if (!hit && wantedName) {
-      const named = projects.filter(project => String(project.name || '') === wantedName);
-      if (named.length === 1) hit = named[0];
-    }
-    return {
-      id: wantedId || projectRecordId(hit),
-      path: String(hit && hit.path || wantedPath),
-      name: String(hit && hit.name || wantedName),
-    };
+    return workspaceProjects.concat(projectPageProjects || [])
+      .find(project => projectRecordId(project) === wantedId) || null;
   }
 
-  // 「算 ΔE」:先原子同步 workspace + Project 业务页，成功后再提交项目深链。
-  async function gotoProject(name, path, projectId) {
+  // 「算 ΔE」:只按 opaque project_id 原子同步 workspace + Project 业务页。
+  async function gotoProject(projectId) {
     const workspace = VCS.workspace;
-    let target = resolveProjectTarget(name, path, projectId);
-    const knownProjects = workspace && Array.isArray(workspace.projects)
-      ? workspace.projects : [];
+    const targetId = String(projectId || '').trim();
+    let target = knownProject(targetId);
     if (workspace && typeof workspace.refresh === 'function' &&
-        (!target.id || !knownProjects.some(project => project.id === target.id))) {
+        !target) {
       await workspace.refresh();
-      target = resolveProjectTarget(name, path, projectId);
+      target = knownProject(targetId);
     }
-    if (!target.id || !target.path || !window.Project ||
-        typeof window.Project.selectByPath !== 'function') {
+    if (!targetId || !target || !window.Project ||
+        typeof window.Project.selectById !== 'function') {
       VCS.log(tr('runtime.jobs.project.open_unverifiable', {},
-        '无法打开项目：任务缺少可验证的 project_id 或项目路径',
-        'Cannot open project: the job lacks a verifiable project_id or project path'), 'failc');
+        '无法打开项目：任务缺少可验证的 project_id',
+        'Cannot open project: the job lacks a verifiable project_id'), 'failc');
       VCS.toast(tr('runtime.jobs.project.unconfirmed', {},
         '无法确认任务所属项目', 'Cannot determine which project owns this job'), 'fail');
       return false;
@@ -637,21 +963,17 @@
 
     if (workspace && typeof workspace.requestProjectSwitch === 'function' &&
         typeof workspace.navigateRoute === 'function') {
-      const switched = await workspace.requestProjectSwitch(target.id, async hit => {
-        const canonicalPath = String(hit && hit.path || target.path);
-        if (!canonicalPath) return false;
-        return window.Project.selectByPath(canonicalPath);
-      });
+      const switched = await workspace.requestProjectSwitch(targetId,
+        () => window.Project.selectById(targetId));
       if (!switched) return false;
       const out = await workspace.navigateRoute('project-overview', {
-        projectId: target.id,
+        projectId: targetId,
         source: 'jobs-project',
       });
       return !!(out && out.ok);
     }
 
-    // 旧壳层兼容：仍保证业务项目先成功选中，再切换可见页面。
-    const selected = await window.Project.selectByPath(target.path);
+    const selected = await window.Project.selectById(targetId);
     if (!selected) return false;
     const out = await VCS.navigate('project', { source: 'jobs-project' });
     return !!(out && out.ok);
@@ -661,17 +983,15 @@
   async function doReport() {
     const dirs = selectedDirs();
     let projName = '';
-    let projPath = '';
     let projectId = '';
     if (dirs.length) {
       const row = State.rows.find(r => r.dir === dirs[0]);
       if (row && row.project) {
         projName = row.project;
-        projPath = row.project_path || '';
         projectId = String(row.project_id || '').trim();
       }
     }
-    const opened = await gotoProject(projName, projPath, projectId);
+    const opened = await gotoProject(projectId);
     if (!opened) return;
     VCS.toast(tr('runtime.jobs.report.generated_on_project_page', {},
       '报告在项目页生成', 'Generate the report on the project page'));
@@ -721,8 +1041,7 @@
         const de = e.target.closest('.grp-de');
         if (de) {
           e.stopPropagation();
-          gotoProject(
-            de.dataset.proj, de.dataset.projPath || '', de.dataset.projectId || '');
+          gotoProject(de.dataset.projectId || '');
           return;
         }
         const toggle = e.target.closest('[data-group-toggle]');
@@ -1136,8 +1455,8 @@
   async function doSubmit() {
     const name = requireProfile();
     if (!name) return;
-    const dirs = actionDirs(name, tr('runtime.jobs.submit.action_name', {},
-      '提交', 'Submit'), 'new');
+    const actionLabel = tr('runtime.jobs.submit.action_name', {}, '提交', 'Submit');
+    const dirs = actionDirs(name, actionLabel, 'new');
     if (dirs === null) return;
     if (!dirs.length) {
       VCS.log(tr('runtime.jobs.submit.selection_required', {},
@@ -1145,26 +1464,31 @@
         'Select one or more jobs to submit from the list'), 'failc');
       return;
     }
-    const prof = State.profiles[name];
-    const ok = await VCS.confirm(tr('runtime.jobs.submit.confirm', {
-      count: dirs.length,
-      server: name,
-      remote_root: prof.remote_root || tr('runtime.jobs.common.not_set', {}, '(未设置)', '(Not set)'),
-      script_mode: prof.script_mode,
-    }, '将上传并提交 {count} 个作业到「{server}」\n远程根目录:{remote_root}\n脚本模式:{script_mode}\n\n继续?',
-    'Upload and submit {count} jobs to "{server}"?\nRemote root: {remote_root}\nScript mode: {script_mode}\n\nContinue?'));
-    if (!ok) return;
-    VCS.log(tr('runtime.jobs.submit.connecting', { count: dirs.length },
-      '连接并提交 {count} 个作业…', 'Connecting and submitting {count} jobs…'));
-    const res = await remote(name, (pw, trust) => VCS.call('submit_jobs', dirs, name, pw, trust));
-    if (!res) return;
-    if (res.error) {
-      VCS.log(tr('runtime.jobs.submit.failed', { error: res.error },
-        '提交异常:{error}', 'Submission failed: {error}'), 'failc');
-      return;
-    }
-    logResults(res.results, true);
-    await reload();
+    return withExclusiveOperation('submit', actionLabel, dirs, name, async op => {
+      const prof = State.profiles[name];
+      const ok = await VCS.confirm(tr('runtime.jobs.submit.confirm', {
+        count: dirs.length,
+        server: name,
+        remote_root: prof.remote_root || tr('runtime.jobs.common.not_set', {}, '(未设置)', '(Not set)'),
+        script_mode: prof.script_mode,
+      }, '将上传并提交 {count} 个作业到「{server}」\n远程根目录:{remote_root}\n脚本模式:{script_mode}\n\n继续?',
+      'Upload and submit {count} jobs to "{server}"?\nRemote root: {remote_root}\nScript mode: {script_mode}\n\nContinue?'));
+      if (!ok) return { status: 'cancelled' };
+      updateOperation(op, 'running');
+      VCS.log(tr('runtime.jobs.submit.connecting', { count: dirs.length },
+        '连接并提交 {count} 个作业…', 'Connecting and submitting {count} jobs…'));
+      const res = await remote(name, (pw, trust) =>
+        VCS.call('submit_jobs', dirs, name, pw, trust, op.id));
+      if (!res) return { status: 'cancelled' };
+      if (res.error) {
+        VCS.log(tr('runtime.jobs.submit.failed', { error: res.error },
+          '提交异常:{error}', 'Submission failed: {error}'), 'failc');
+        return { status: 'failed', error: res.error, value: res };
+      }
+      logResults(res.results, true);
+      await reload();
+      return { status: 'succeeded', value: res };
+    });
   }
 
   // ── 查询状态(手动 / 自动共用) ────────────────────────────────────────────
@@ -1335,8 +1659,8 @@
   async function doFetch() {
     const name = requireProfile();
     if (!name) return;
-    const dirs = actionDirs(name, tr('runtime.jobs.fetch.action_name', {},
-      '拉回结果', 'Retrieve results'), 'bound');
+    const actionLabel = tr('runtime.jobs.fetch.action_name', {}, '拉回结果', 'Retrieve results');
+    const dirs = actionDirs(name, actionLabel, 'bound');
     if (dirs === null) return;
     if (!dirs.length) {
       VCS.log(tr('runtime.jobs.fetch.selection_required', {},
@@ -1344,30 +1668,34 @@
         'Select jobs whose results should be retrieved (usually DONE or unconverged jobs)'), 'failc');
       return;
     }
-    const choice = await askFetchFiles(dirs.length);
-    if (!choice) return;
-    const files = choice.files;
-    VCS.log(tr('runtime.jobs.fetch.starting', {
-      count: dirs.length, files: files ? files.join(', ') : choice.label,
-    }, '拉回 {count} 个作业：{files}…', 'Retrieving {count} jobs: {files}…'));
-    const res = await remote(name, (pw, trust) =>
-      VCS.call('fetch_jobs', dirs, name, pw, trust, files));
-    if (!res) return;
-    if (res.error) {
-      VCS.log(tr('runtime.jobs.fetch.failed', { error: res.error },
-        '拉回异常:{error}', 'Result retrieval failed: {error}'), 'failc');
-      return;
-    }
-    logResults(res.results, true);
-    await reload();
+    return withExclusiveOperation('fetch', actionLabel, dirs, name, async op => {
+      const choice = await askFetchFiles(dirs.length);
+      if (!choice) return { status: 'cancelled' };
+      updateOperation(op, 'running');
+      const files = choice.files;
+      VCS.log(tr('runtime.jobs.fetch.starting', {
+        count: dirs.length, files: files ? files.join(', ') : choice.label,
+      }, '拉回 {count} 个作业：{files}…', 'Retrieving {count} jobs: {files}…'));
+      const res = await remote(name, (pw, trust) =>
+        VCS.call('fetch_jobs', dirs, name, pw, trust, files));
+      if (!res) return { status: 'cancelled' };
+      if (res.error) {
+        VCS.log(tr('runtime.jobs.fetch.failed', { error: res.error },
+          '拉回异常:{error}', 'Result retrieval failed: {error}'), 'failc');
+        return { status: 'failed', error: res.error, value: res };
+      }
+      logResults(res.results, true);
+      await reload();
+      return { status: 'succeeded', value: res };
+    });
   }
 
   // ── 续算(有界恢复) ───────────────────────────────────────────────────────
   async function doContinue() {
     const name = requireProfile();
     if (!name) return;
-    const dirs = actionDirs(name, tr('runtime.jobs.continue.action_name', {},
-      '续算', 'Continue'), 'bound');
+    const actionLabel = tr('runtime.jobs.continue.action_name', {}, '续算', 'Continue');
+    const dirs = actionDirs(name, actionLabel, 'bound');
     if (dirs === null) return;
     if (!dirs.length) {
       VCS.log(tr('runtime.jobs.continue.selection_required', {},
@@ -1375,22 +1703,27 @@
         'Select jobs to continue (only unconverged, wall-time, ZBRENT, and similar recoverable jobs)'), 'failc');
       return;
     }
-    const ok = await VCS.confirm(tr('runtime.jobs.continue.confirm', {
-      count: dirs.length, server: name,
-    }, '将对选中的 {count} 个作业从 CONTCAR 续算并重投到「{server}」\nINCAR 冻结;每作业上限 3 轮。不可续算的会被后端跳过。\n\n继续?',
-    'Continue {count} selected jobs from CONTCAR and resubmit them to "{server}"?\nINCAR is frozen and each job is limited to 3 rounds. The backend will skip jobs that cannot be continued.\n\nContinue?'));
-    if (!ok) return;
-    VCS.log(tr('runtime.jobs.continue.connecting', { count: dirs.length },
-      '连接并续算 {count} 个作业…', 'Connecting and continuing {count} jobs…'));
-    const res = await remote(name, (pw, trust) => VCS.call('continue_jobs', dirs, name, pw, trust));
-    if (!res) return;
-    if (res.error) {
-      VCS.log(tr('runtime.jobs.continue.failed', { error: res.error },
-        '续算异常:{error}', 'Continuation failed: {error}'), 'failc');
-      return;
-    }
-    logResults(res.results, true);
-    await reload();
+    return withExclusiveOperation('continue', actionLabel, dirs, name, async op => {
+      const ok = await VCS.confirm(tr('runtime.jobs.continue.confirm', {
+        count: dirs.length, server: name,
+      }, '将对选中的 {count} 个作业从 CONTCAR 续算并重投到「{server}」\nINCAR 冻结;每作业上限 3 轮。不可续算的会被后端跳过。\n\n继续?',
+      'Continue {count} selected jobs from CONTCAR and resubmit them to "{server}"?\nINCAR is frozen and each job is limited to 3 rounds. The backend will skip jobs that cannot be continued.\n\nContinue?'));
+      if (!ok) return { status: 'cancelled' };
+      updateOperation(op, 'running');
+      VCS.log(tr('runtime.jobs.continue.connecting', { count: dirs.length },
+        '连接并续算 {count} 个作业…', 'Connecting and continuing {count} jobs…'));
+      const res = await remote(name, (pw, trust) =>
+        VCS.call('continue_jobs', dirs, name, pw, trust, op.id));
+      if (!res) return { status: 'cancelled' };
+      if (res.error) {
+        VCS.log(tr('runtime.jobs.continue.failed', { error: res.error },
+          '续算异常:{error}', 'Continuation failed: {error}'), 'failc');
+        return { status: 'failed', error: res.error, value: res };
+      }
+      logResults(res.results, true);
+      await reload();
+      return { status: 'succeeded', value: res };
+    });
   }
 
   // ── 集群队列 + 认领 ────────────────────────────────────────────────────────
@@ -1656,19 +1989,24 @@
         '请先选中要移出台账的作业', 'Select jobs to remove from the ledger'), 'failc');
       return;
     }
-    const ok = await VCS.confirm(tr('runtime.jobs.remove.confirm', { count: dirs.length },
-      '把 {count} 个作业移出台账?(不删除磁盘文件)',
-      'Remove {count} jobs from the ledger? Files on disk will not be deleted.'));
-    if (!ok) return;
-    const r = await VCS.call('remove_jobs', dirs);
-    if (r && r.error) {
-      VCS.log(tr('runtime.jobs.remove.failed', { error: r.error },
-        '移出失败:{error}', 'Failed to remove jobs: {error}'), 'failc');
-      return;
-    }
-    VCS.log(tr('runtime.jobs.remove.succeeded', { count: dirs.length },
-      '已移出 {count} 个作业', 'Removed {count} jobs from the ledger'), 'okc');
-    await reload();
+    const actionLabel = tr('runtime.jobs.remove.action_name', {}, '移出台账', 'Remove from ledger');
+    return withExclusiveOperation('remove', actionLabel, dirs, '', async op => {
+      const ok = await VCS.confirm(tr('runtime.jobs.remove.confirm', { count: dirs.length },
+        '把 {count} 个作业移出台账?(不删除磁盘文件)',
+        'Remove {count} jobs from the ledger? Files on disk will not be deleted.'));
+      if (!ok) return { status: 'cancelled' };
+      updateOperation(op, 'running');
+      const r = await VCS.call('remove_jobs', dirs);
+      if (r && r.error) {
+        VCS.log(tr('runtime.jobs.remove.failed', { error: r.error },
+          '移出失败:{error}', 'Failed to remove jobs: {error}'), 'failc');
+        return { status: 'failed', error: r.error, value: r };
+      }
+      VCS.log(tr('runtime.jobs.remove.succeeded', { count: dirs.length },
+        '已移出 {count} 个作业', 'Removed {count} jobs from the ledger'), 'okc');
+      await reload();
+      return { status: 'succeeded', value: r };
+    });
   }
 
   async function doClean() {
@@ -1729,30 +2067,37 @@
   async function batchCancel() {
     const name = requireProfile();
     if (!name) return;
-    const dirs = actionDirs(name, tr('runtime.jobs.cancel.action_name', {},
-      '批量取消', 'Batch cancel'), 'bound');
+    const actionLabel = tr('runtime.jobs.cancel.action_name', {}, '批量取消', 'Batch cancel');
+    const dirs = actionDirs(name, actionLabel, 'bound');
     if (dirs === null) return;
     if (!dirs.length) {
       VCS.log(tr('runtime.jobs.cancel.selection_required', {},
         '批量取消:请先勾选要取消的作业', 'Batch cancel: select the jobs to cancel'), 'failc');
       return;
     }
-    if (!await VCS.confirm(tr('runtime.jobs.cancel.confirm', { count: dirs.length },
-      '确认取消勾选的 {count} 个作业?(qdel/scancel + 台账标记 FAILED/用户取消)',
-      'Cancel the {count} selected jobs? This runs qdel/scancel and marks them FAILED/user-cancelled in the ledger.'))) return;
-    const res = await remote(name, (pw, trust) => VCS.call('jobs_cancel_batch', dirs, name, pw, trust));
-    if (!res) return;
-    if (res.error) {
-      VCS.log(tr('runtime.jobs.cancel.failed', { error: res.error },
-        '批量取消失败:{error}', 'Batch cancellation failed: {error}'), 'failc');
-      return;
-    }
-    (res.cancelled || []).forEach(j => VCS.log(tr('runtime.jobs.cancel.job_cancelled', { job_id: j },
-      '已取消作业号 {job_id}', 'Cancelled job ID {job_id}'), 'okc'));
-    (res.failed || []).forEach(f => VCS.log(tr('runtime.jobs.cancel.job_failed', {
-      job_id: f.job_id, reason: f.reason,
-    }, '取消失败 {job_id}:{reason}', 'Cancellation failed for {job_id}: {reason}'), 'failc'));
-    await reload();
+    return withExclusiveOperation('cancel', actionLabel, dirs, name, async op => {
+      if (!await VCS.confirm(tr('runtime.jobs.cancel.confirm', { count: dirs.length },
+        '确认取消勾选的 {count} 个作业?(qdel/scancel + 台账标记 FAILED/用户取消)',
+        'Cancel the {count} selected jobs? This runs qdel/scancel and marks them FAILED/user-cancelled in the ledger.'))) {
+        return { status: 'cancelled' };
+      }
+      updateOperation(op, 'running');
+      const res = await remote(name, (pw, trust) =>
+        VCS.call('jobs_cancel_batch', dirs, name, pw, trust, op.id));
+      if (!res) return { status: 'cancelled' };
+      if (res.error) {
+        VCS.log(tr('runtime.jobs.cancel.failed', { error: res.error },
+          '批量取消失败:{error}', 'Batch cancellation failed: {error}'), 'failc');
+        return { status: 'failed', error: res.error, value: res };
+      }
+      (res.cancelled || []).forEach(j => VCS.log(tr('runtime.jobs.cancel.job_cancelled', { job_id: j },
+        '已取消作业号 {job_id}', 'Cancelled job ID {job_id}'), 'okc'));
+      (res.failed || []).forEach(f => VCS.log(tr('runtime.jobs.cancel.job_failed', {
+        job_id: f.job_id, reason: f.reason,
+      }, '取消失败 {job_id}:{reason}', 'Cancellation failed for {job_id}: {reason}'), 'failc'));
+      await reload();
+      return { status: 'succeeded', value: res };
+    });
   }
 
   // ── 快速批量提交:父目录扫描 → 四件套补齐 → 建作业 → 自动勾选 ──
@@ -2239,6 +2584,17 @@
     wire('jb-clean', doClean);
     wire('jb-checkall', checkAll);
     wire('jb-cancelchecked', batchCancel);
+    wire('jb-tray-submit', doSubmit);
+    wire('jb-tray-fetch', doFetch);
+    wire('jb-tray-continue', doContinue);
+    wire('jb-tray-cancel', batchCancel);
+    wire('jb-tray-remove', doRemove);
+    wire('jb-tray-forecast', estimateSelectedResources);
+    wire('jobs-selection-clear', clearSelection);
+    wire('jobs-selection-review', () => {
+      State.selectionTrayExpanded = !State.selectionTrayExpanded;
+      renderSelectionTray();
+    });
     // 实时能量曲线面板(v3.3.0)
     wire('jl-refresh', () => livePoll());
     wire('jl-close', () => liveStop(true));
@@ -2363,11 +2719,11 @@
   function invalidateJobSelectionForProject(event) {
     State.selectionGeneration += 1;
     const detail = (event && event.detail) || {};
-    const projectId = String(detail.id || detail.project_id || detail.project_uuid || '').trim();
+    const projectId = String(detail.project_id || '').trim();
     const selectedRows = Array.from(State.selected)
       .map(dir => State.rows.find(row => row.dir === dir)).filter(Boolean);
     const belongsToProject = projectId && selectedRows.length && selectedRows.every(row =>
-      String(row.project_id || row.project_uuid || '').trim() === projectId);
+      String(row.project_id || '').trim() === projectId);
     if (!belongsToProject) {
       State.selected.clear();
       renderTable();
@@ -2391,6 +2747,8 @@
     renderTable();
     renderStats();
     renderStale();
+    renderOperationQueue();
+    renderResourceForecast();
     renderQsFiles();
     renderQsPreview(QS.scan);
     renderQsNext();
@@ -2402,16 +2760,16 @@
   else init();
 
   // 结果导入可能带来只有完整四件套、尚未运行的 CREATED 成员。
-  // 进入任务页时按 project_path 精确展开并勾选，用户仍需亲自确认服务器与远程目录。
-  async function selectCreatedProject(projectPath) {
+  // 进入任务页时按 opaque project_id 精确展开并勾选。
+  async function selectCreatedProject(projectId) {
     const selectionGeneration = ++State.selectionGeneration;
     await reload();
     if (selectionGeneration !== State.selectionGeneration) return 0;
-    const wanted = String(projectPath || '');
+    const wanted = String(projectId || '').trim();
     const rows = State.rows.filter(row => row.state === 'CREATED' && !row.cluster &&
-      (!wanted || String(row.project_path || '') === wanted));
+      String(row.project_id || '') === wanted);
     rows.forEach(row => State.selected.add(row.dir));
-    if (wanted) State.expanded.add('path:' + wanted);
+    if (wanted) State.expanded.add('p:id:' + wanted);
     ['jf-cluster', 'jf-status'].forEach(id => {
       const filter = $('#' + id);
       if (filter && filter.value) filter.value = '';
@@ -2442,9 +2800,8 @@
 
     State.selected.clear();
     State.selected.add(row.dir);
-    if (row.project) {
-      const groupKey = row.project_path ? 'path:' + row.project_path : 'name:' + row.project;
-      State.expanded.add('p:' + groupKey);
+    if (row.project && row.project_id) {
+      State.expanded.add('p:id:' + String(row.project_id));
     } else {
       State.expanded.add('s:_single');
     }
@@ -2474,6 +2831,15 @@
     return hadSelection;
   }
 
-  // 供集群页保存与项目导入流程调用。
-  window.Jobs = { reload, selectCreatedProject, selectById, clearSelection };
+  // 供集群页保存与项目导入流程调用。测试 seam 仅在显式 __VCS_TEST__ 环境暴露，
+  // 让 Node fake-DOM 回归执行真实状态机而不扩大生产桥接口。
+  const publicJobs = { reload, selectCreatedProject, selectById, clearSelection };
+  if (window.__VCS_TEST__) {
+    publicJobs.__test = {
+      State, performReload, renderSelectionTray, renderOperationQueue,
+      renderResourceForecast, estimateSelectedResources, invalidateResourceForecast,
+      withExclusiveOperation,
+    };
+  }
+  window.Jobs = publicJobs;
 })();

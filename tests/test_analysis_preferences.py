@@ -67,7 +67,10 @@ def test_missing_file_reads_safe_default_without_creating_files(tmp_path):
 
 def test_template_roundtrip_strips_every_cross_project_identity(tmp_path):
     path = tmp_path / "analysis-preferences.json"
-    clock = lambda: "2026-08-11T12:00:00.000000Z"
+
+    def clock():
+        return "2026-08-11T12:00:00.000000Z"
+
     store = preferences.AnalysisPreferencesStore(path, clock=clock)
     request = {
         "id": "comparison-screen",

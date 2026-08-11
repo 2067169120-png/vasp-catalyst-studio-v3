@@ -41,9 +41,10 @@ def test_result_import_calls_scan_then_commit_with_full_review_payload():
     assert '用这些参考能开始吸附计算' in js
     assert 'Start an adsorption calculation with these reference energies' in js
     assert 'window.Project = {' in js
-    for member in ('reload: reloadProjects', 'selectByPath', 'selectByName',
+    for member in ('reload: reloadProjects', 'selectById',
                    'openImport', 'startLiS'):
         assert member in js
+    assert 'selectByPath' not in js
 
 
 def test_molecule_reference_only_import_is_not_misreported_as_report_ready():
@@ -125,6 +126,7 @@ def test_input_only_quartets_are_visible_and_continue_to_real_submission():
     assert 'createdCount' in project
     assert 'openImportedCreatedJobs' in project
     assert 'window.Jobs.selectCreatedProject' in project
-    assert 'async function selectCreatedProject(projectPath)' in jobs
+    assert 'async function selectCreatedProject(projectId)' in jobs
+    assert "String(row.project_id || '') === wanted" in jobs
     assert "row.state === 'CREATED'" in jobs
     assert "CREATED: ['q', '待提交']" in app

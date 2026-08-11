@@ -1,7 +1,6 @@
 """Focused contracts for keyboard-operable dynamic WebView controls."""
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 
@@ -110,6 +109,21 @@ def test_programmatic_accordion_opening_updates_disclosure_state():
     assert 'enhanceAccordion, enhanceSwitchers, enhanceSegmented, setAccordionOpen' in ui
     for name in ('app.js', 'generate.js', 'taskcat.js', 'workspace.js'):
         assert 'VCS.ui.setAccordionOpen' in _source(name), name
+
+
+def test_accordion_summary_enhancement_removes_duplicate_runtime_nodes():
+    ui = _source('ui.js')
+    assert "head.querySelectorAll(':scope > .acc-sum')" in ui
+    assert 'existingSummaries.slice(1).forEach(extra => extra.remove())' in ui
+    assert 'summaries.forEach(extra => extra.remove())' in ui
+
+
+def test_toasts_are_atomic_live_regions_with_assertive_failures():
+    app = _source('app.js')
+    toast = _block(app, "toast(msg, kind = '')", '// 状态 → pill HTML')
+    assert "t.setAttribute('role', kind === 'fail' ? 'alert' : 'status')" in toast
+    assert "t.setAttribute('aria-live', kind === 'fail' ? 'assertive' : 'polite')" in toast
+    assert "t.setAttribute('aria-atomic', 'true')" in toast
 
 
 def test_modal_drawers_filter_hidden_descendants_and_isolate_background():

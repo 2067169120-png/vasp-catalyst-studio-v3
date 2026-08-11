@@ -20,7 +20,6 @@
 
   const State = {
     projectId: '',
-    projectPath: '',
     projectName: '',
     mode: 'report',
     appliedMode: '',
@@ -36,7 +35,8 @@
     history: [],
     historyStatus: 'loading',
     historyError: '',
-    outputDir: '',
+    outputDestinationToken: '',
+    outputDisplayName: '',
     outputProjectId: '',
     lastPublish: null,
     publishedPreviewId: '',
@@ -51,6 +51,12 @@
     previewTimer: null,
     activeStep: 'scope',
     formatStates: Object.create(null),
+    insightBusy: false,
+    insightStatus: 'empty',
+    insightDiff: null,
+    insightGraph: null,
+    capsuleDestinationToken: '',
+    capsuleDestinationName: '',
   };
 
   function plain(value) {
@@ -71,10 +77,9 @@
     return String(value);
   }
 
-  function sameProject(projectId, projectPath) {
+  function sameProject(projectId) {
     const current = currentProject();
-    return !!current && projectIdentity(current) === projectId &&
-      String(current.path || '') === String(projectPath || '');
+    return !!current && projectIdentity(current) === projectId;
   }
 
   function projectIdentity(project) {
@@ -84,7 +89,7 @@
   function currentProject() {
     if (window.Project && typeof window.Project.current === 'function') {
       const project = window.Project.current();
-      if (project && project.path) return project;
+      if (project && projectIdentity(project)) return project;
     }
     const workspace = VCS.workspace;
     const id = safeId(workspace && workspace.state && workspace.state.project_id);
@@ -842,11 +847,242 @@
     }
     const compare = $('rw-compare-revision');
     if (compare) {
-      compare.disabled = true;
+      compare.disabled = State.historyStatus !== 'ready' || State.history.length < 2 || State.insightBusy;
       compare.title = State.historyStatus === 'unavailable' ? '版本历史当前不可用'
         : State.history.length < 2 ? '至少需要两个 revision'
-          : '当前 MVP 只提供历史列表，尚未开放差异 API';
+          : VCS.t('report.insights.compare_title', {}, 'Select two revisions and revalidate their scientific differences');
     }
+    renderInsightControls();
+  }
+
+  function insightRevision(row) {
+    return String(plain(row).revision_id || '');
+  }
+
+  function insightRevisionLabel(row) {
+    const record = plain(row);
+    const revision = revisionNumber(record);
+    const scientific = safeText(record.scientific_qualification || record.scientific_status,
+      VCS.t('report.insights.unknown_scientific_status', {}, 'Unknown scientific status'));
+    const hash = String(record.manifest_sha256 || '').slice(0, 12) ||
+      VCS.t('report.insights.missing_manifest_hash', {}, 'No manifest hash');
+    return `Rev. ${revision == null ? '?' : revision} · ${scientific} · ${hash}`;
+  }
+
+  function setInsightState(status, message) {
+    const allowed = new Set(['loading', 'empty', 'unavailable', 'stale', 'blocked', 'ready']);
+    State.insightStatus = allowed.has(status) ? status : 'unavailable';
+    const badge = $('rw-insights-state');
+    if (badge) {
+      badge.dataset.state = State.insightStatus;
+      badge.textContent = VCS.t(`report.insights.state.${State.insightStatus}`, {}, State.insightStatus);
+    }
+    const note = $('rw-insights-note');
+    if (note && message !== undefined) note.textContent = String(message || '');
+  }
+
+  function publishInsightOperation(id, kind, label, status, error = '', route = 'publish-versions') {
+    if (!VCS.operations || typeof VCS.operations.publish !== 'function') return;
+    VCS.operations.publish({ id, kind, label, status, count: 1, error, route });
+  }
+
+  function insightResponseError(result, fallback) {
+    const error = new Error(result && result.error || fallback);
+    const status = String(result && result.status || 'unavailable');
+    error.insightStatus = ['unavailable', 'stale', 'blocked'].includes(status)
+      ? status : 'unavailable';
+    return error;
+  }
+
+  function selectedInsightRow(selectId) {
+    const select = $(selectId);
+    const revisionId = String(select && select.value || '');
+    return State.history.find(row => insightRevision(row) === revisionId) || null;
+  }
+
+  function revisionIsUsable(row) {
+    const record = plain(row);
+    return !!insightRevision(record) && record.current === true && record.artifact_status !== 'stale';
+  }
+
+  function renderInsightControls() {
+    const left = $('rw-diff-left'); const right = $('rw-diff-right');
+    if (!left || !right) return;
+    const previousLeft = left.value; const previousRight = right.value;
+    [left, right].forEach(select => { select.innerHTML = ''; });
+    State.history.forEach(row => {
+      const revisionId = insightRevision(row); if (!revisionId) return;
+      [left, right].forEach(select => {
+        const option = document.createElement('option');
+        option.value = revisionId; option.textContent = insightRevisionLabel(row);
+        if (!revisionIsUsable(row)) option.dataset.stale = 'true';
+        select.appendChild(option);
+      });
+    });
+    const ids = State.history.map(insightRevision).filter(Boolean);
+    left.value = ids.includes(previousLeft) ? previousLeft : (ids[1] || ids[0] || '');
+    right.value = ids.includes(previousRight) ? previousRight : (ids[0] || '');
+    const unavailable = State.historyStatus === 'unavailable';
+    left.disabled = unavailable || !ids.length || State.insightBusy;
+    right.disabled = unavailable || !ids.length || State.insightBusy;
+    const leftRow = selectedInsightRow('rw-diff-left');
+    const rightRow = selectedInsightRow('rw-diff-right');
+    const stale = (leftRow && !revisionIsUsable(leftRow)) || (rightRow && !revisionIsUsable(rightRow));
+    const compare = $('rw-load-diff'); const graph = $('rw-load-graph'); const capsule = $('rw-export-capsule');
+    if (compare) compare.disabled = State.insightBusy || ids.length < 2 || !leftRow || !rightRow ||
+      insightRevision(leftRow) === insightRevision(rightRow) || stale;
+    if (graph) graph.disabled = State.insightBusy || !rightRow || !revisionIsUsable(rightRow);
+    if (capsule) capsule.disabled = State.insightBusy || !rightRow || !revisionIsUsable(rightRow);
+    if (State.insightBusy) setInsightState('loading', VCS.t('report.insights.loading', {}, '正在重新校验冻结 revision…'));
+    else if (unavailable) setInsightState('unavailable', State.historyError ||
+      VCS.t('report.insights.unavailable', {}, '版本历史不可用；不能推断为没有 revision。'));
+    else if (!ids.length) setInsightState('empty', VCS.t('report.insights.empty', {}, '至少需要一个已登记 revision；科学差异需要两个。'));
+    else if (stale) setInsightState('stale', VCS.t('report.insights.stale', {}, '所选 revision 已过期或校验失败，检查功能保持阻止。'));
+    else if (State.insightStatus === 'empty' || State.insightStatus === 'stale') {
+      setInsightState('ready', VCS.t('report.insights.ready', {}, '所选 revision 可重新校验。'));
+    }
+  }
+
+  function insightResultList(container, rows, emptyText) {
+    container.innerHTML = '';
+    if (!rows.length) {
+      const empty = document.createElement('p'); empty.className = 'rw-insight-empty';
+      empty.textContent = emptyText; container.appendChild(empty); return;
+    }
+    const list = document.createElement('ul'); list.className = 'rw-insight-list';
+    rows.forEach(row => {
+      const item = document.createElement('li');
+      const title = document.createElement('b'); title.textContent = String(row.title || row.key || row.id || 'item');
+      const detail = document.createElement('code'); detail.textContent = String(row.detail || '');
+      item.append(title, detail); list.appendChild(item);
+    });
+    container.appendChild(list);
+  }
+
+  function renderScientificDiff(result) {
+    const box = $('rw-diff-result'); if (!box) return;
+    const rows = [];
+    if (result.scope && result.scope.changed) rows.push({ title: 'ReportSpec scope', detail: 'changed' });
+    (result.hashes || []).forEach(item => rows.push({ title: `hash · ${item.key}`, detail: `${safeText(item.left)} → ${safeText(item.right)}` }));
+    (result.numeric_values || []).forEach(item => rows.push({ title: `numeric · ${item.key}`, detail: `${safeText(item.left)} → ${safeText(item.right)}` }));
+    (result.figures || []).forEach(item => rows.push({ title: `figure · ${item.key}`, detail: 'metadata/hash changed' }));
+    Object.entries(plain(result.validation)).forEach(([key, value]) => {
+      if (value && value.changed) rows.push({ title: `validation · ${key}`, detail: 'changed' });
+    });
+    Object.entries(plain(result.scientific)).forEach(([key, value]) => {
+      if (value && value.changed) rows.push({ title: `scientific · ${key}`, detail: `${safeText(value.left)} → ${safeText(value.right)}` });
+    });
+    insightResultList(box, rows, VCS.t('report.insights.diff_none', {}, '未发现科学内容或文件哈希差异。'));
+  }
+
+  function renderEvidenceGraph(result) {
+    const box = $('rw-graph-result'); if (!box) return;
+    const nodes = Array.isArray(result.nodes) ? result.nodes : [];
+    const edges = Array.isArray(result.edges) ? result.edges : [];
+    const missing = Array.isArray(result.missing_links) ? result.missing_links : [];
+    const rows = nodes.map(node => ({
+      title: `${safeText(node.type, 'node')} · ${safeText(node.label, node.id)}`,
+      detail: `${edges.filter(edge => edge.source === node.id || edge.target === node.id).length} links`,
+    }));
+    missing.forEach(link => rows.push({
+      title: `missing · ${safeText(link.expected)}`,
+      detail: safeText(link.reason, 'unresolved frozen link'),
+    }));
+    insightResultList(box, rows, VCS.t('report.insights.graph_empty', {}, '冻结 revision 中没有可显示的节点。'));
+  }
+
+  async function loadScientificDiff() {
+    if (State.insightBusy) return false;
+    const left = selectedInsightRow('rw-diff-left'); const right = selectedInsightRow('rw-diff-right');
+    if (!revisionIsUsable(left) || !revisionIsUsable(right) || insightRevision(left) === insightRevision(right)) return false;
+    const projectId = State.projectId; const operationId = `report-diff-${Date.now()}`;
+    publishInsightOperation(operationId, 'report-scientific-diff', 'Report revision scientific diff', 'running');
+    State.insightBusy = true; setInsightState('loading'); renderInsightControls();
+    try {
+      const result = await VCS.call('report_revision_scientific_diff', projectId, insightRevision(left), insightRevision(right));
+      if (projectId !== State.projectId) {
+        publishInsightOperation(operationId, 'report-scientific-diff', 'Report revision scientific diff', 'cancelled');
+        return false;
+      }
+      if (!result || result.ok !== true) throw insightResponseError(result, 'scientific diff unavailable');
+      State.insightDiff = result; renderScientificDiff(result);
+      const results = $('rw-insights-results'); if (results) results.hidden = false;
+      setInsightState('ready', result.changed
+        ? VCS.t('report.insights.diff_changed', {}, '已发现内容或哈希差异。')
+        : VCS.t('report.insights.diff_unchanged', {}, '两版冻结科学内容一致。'));
+      publishInsightOperation(operationId, 'report-scientific-diff', 'Report revision scientific diff', 'succeeded');
+      return true;
+    } catch (error) {
+      const message = error && error.message || String(error);
+      setInsightState(error && error.insightStatus || 'unavailable', message);
+      publishInsightOperation(operationId, 'report-scientific-diff', 'Report revision scientific diff', 'failed', message);
+      return false;
+    } finally { State.insightBusy = false; renderInsightControls(); }
+  }
+
+  async function loadEvidenceGraph() {
+    if (State.insightBusy) return false;
+    const row = selectedInsightRow('rw-diff-right'); if (!revisionIsUsable(row)) return false;
+    const projectId = State.projectId; const operationId = `report-graph-${Date.now()}`;
+    publishInsightOperation(operationId, 'report-evidence-graph', 'Report evidence graph', 'running');
+    State.insightBusy = true; setInsightState('loading'); renderInsightControls();
+    try {
+      const result = await VCS.call('report_evidence_graph', projectId, insightRevision(row));
+      if (projectId !== State.projectId) {
+        publishInsightOperation(operationId, 'report-evidence-graph', 'Report evidence graph', 'cancelled');
+        return false;
+      }
+      if (!result || result.ok !== true) throw insightResponseError(result, 'evidence graph unavailable');
+      State.insightGraph = result; renderEvidenceGraph(result);
+      const results = $('rw-insights-results'); if (results) results.hidden = false;
+      setInsightState(result.status === 'blocked' ? 'blocked' : 'ready', result.status === 'blocked'
+        ? VCS.t('report.insights.graph_blocked', { count: (result.missing_links || []).length }, '证据图存在 {count} 个缺失链接。')
+        : VCS.t('report.insights.graph_ready', {}, '证据关系已从冻结记录重建。'));
+      publishInsightOperation(operationId, 'report-evidence-graph', 'Report evidence graph', 'succeeded');
+      return true;
+    } catch (error) {
+      const message = error && error.message || String(error);
+      setInsightState(error && error.insightStatus || 'unavailable', message);
+      publishInsightOperation(operationId, 'report-evidence-graph', 'Report evidence graph', 'failed', message);
+      return false;
+    } finally { State.insightBusy = false; renderInsightControls(); }
+  }
+
+  async function exportInsightCapsule() {
+    if (State.insightBusy) return false;
+    const row = selectedInsightRow('rw-diff-right'); if (!revisionIsUsable(row)) return false;
+    const projectId = State.projectId; const operationId = `report-capsule-${Date.now()}`;
+    publishInsightOperation(operationId, 'report-si-capsule', 'Reproducibility / SI capsule', 'pending', '', 'publish-export');
+    State.insightBusy = true; setInsightState('loading'); renderInsightControls();
+    try {
+      const selected = await VCS.call('report_capsule_pick_destination');
+      if (projectId !== State.projectId || !selected || selected.cancelled) {
+        publishInsightOperation(operationId, 'report-si-capsule', 'Reproducibility / SI capsule', 'cancelled', '', 'publish-export');
+        return false;
+      }
+      if (selected.ok !== true || !selected.destination_token) throw new Error(selected && selected.error || 'capsule destination unavailable');
+      State.capsuleDestinationToken = String(selected.destination_token);
+      State.capsuleDestinationName = String(selected.display_name || 'selected directory');
+      publishInsightOperation(operationId, 'report-si-capsule', 'Reproducibility / SI capsule', 'running', '', 'publish-export');
+      const result = await VCS.call('report_capsule_export', projectId, insightRevision(row), State.capsuleDestinationToken);
+      State.capsuleDestinationToken = '';
+      if (projectId !== State.projectId) {
+        publishInsightOperation(operationId, 'report-si-capsule', 'Reproducibility / SI capsule', 'cancelled', '', 'publish-export');
+        return false;
+      }
+      if (!result || result.ok !== true) throw insightResponseError(result, 'capsule export unavailable');
+      setInsightState('ready', VCS.t('report.insights.capsule_ready', {
+        file: plain(result.file).name || 'SI capsule', destination: State.capsuleDestinationName,
+      }, '已导出 {file} 到 {destination}；不会覆盖同名文件。'));
+      publishInsightOperation(operationId, 'report-si-capsule', 'Reproducibility / SI capsule', 'succeeded', '', 'publish-export');
+      return true;
+    } catch (error) {
+      State.capsuleDestinationToken = '';
+      const message = error && error.message || String(error);
+      setInsightState(error && error.insightStatus || 'blocked', message);
+      publishInsightOperation(operationId, 'report-si-capsule', 'Reproducibility / SI capsule', 'failed', message, 'publish-export');
+      return false;
+    } finally { State.insightBusy = false; renderInsightControls(); }
   }
 
   function renderActions() {
@@ -866,8 +1102,7 @@
       publishButton.textContent = State.publishBusy ? '正在生成…' : '生成所选格式';
     }
     if (pick) pick.disabled = State.publishBusy;
-    const hasProjectOutput = State.outputProjectId === State.projectId && !!State.outputDir;
-    if (open) open.disabled = !(hasProjectOutput || State.lastPublish && State.lastPublish.out_dir);
+    if (open) open.disabled = true;
     const discard = $('rw-discard-draft'); const key = draftKey();
     const hasDraft = !!(key && VCS.workspace && VCS.workspace.drafts &&
       VCS.workspace.drafts.load(key));
@@ -917,7 +1152,7 @@
 
   async function discardDraft({ reload = true } = {}) {
     if (State.publishBusy) return false;
-    const projectId = State.projectId; const projectPath = State.projectPath;
+    const projectId = State.projectId;
     const mode = State.mode; const key = draftKey(projectId, mode);
     if (!key || !VCS.workspace || !VCS.workspace.drafts) return false;
     VCS.workspace.drafts.remove(key);
@@ -928,7 +1163,7 @@
       recoverDraft: false,
       explicitSpecQuery: explicitSpec,
     });
-    return loaded !== false && sameProject(projectId, projectPath) && State.mode === mode;
+    return loaded !== false && sameProject(projectId) && State.mode === mode;
   }
 
   function markSpecDirty({ schedule = true } = {}) {
@@ -973,10 +1208,10 @@
     return wanted && presets.some(record => record.id === wanted) ? wanted : null;
   }
 
-  async function fetchHistory(projectId, projectPath, generation) {
+  async function fetchHistory(projectId, generation) {
     try {
-      const result = await VCS.call('report_workbench_history', projectPath);
-      if (generation !== State.bootstrapGeneration || !sameProject(projectId, projectPath)) {
+      const result = await VCS.call('report_workbench_history', projectId);
+      if (generation !== State.bootstrapGeneration || !sameProject(projectId)) {
         return { status: 'stale', revisions: [], error: '' };
       }
       if (!result || result.ok === false || result.error) {
@@ -992,24 +1227,24 @@
 
   async function loadBootstrap(presetId = null, options = {}) {
     const project = currentProject();
-    const projectId = projectIdentity(project); const projectPath = String(project && project.path || '');
-    if (!projectId || !projectPath) {
+    const projectId = projectIdentity(project);
+    if (!projectId) {
       State.spec = null; State.preview = null;
       State.history = []; State.historyStatus = 'unavailable';
       State.historyError = '当前报告路由没有可解析的项目上下文';
-      State.outputDir = ''; State.outputProjectId = '';
+      State.outputDestinationToken = ''; State.outputDisplayName = ''; State.outputProjectId = '';
       const output = $('rw-output-path');
       if (output) output.textContent = '发布时尚未选择目录';
-      showAlert('当前报告路由没有可解析的项目路径和稳定项目 ID。');
+      showAlert(tr('legacy.dynamic.report_workbench.0012', '当前项目无法解析。'));
       setOperation('无法加载报告工作台。', 'bad'); renderHistory(); renderActions(); return false;
     }
-    const projectChanged = projectId !== State.projectId || projectPath !== State.projectPath;
+    const projectChanged = projectId !== State.projectId;
     if (projectChanged) {
-      State.outputDir = ''; State.outputProjectId = '';
+      State.outputDestinationToken = ''; State.outputDisplayName = ''; State.outputProjectId = '';
       const output = $('rw-output-path');
       if (output) output.textContent = '发布时尚未选择目录';
     }
-    State.projectId = projectId; State.projectPath = projectPath;
+    State.projectId = projectId;
     State.projectName = String(project.name || project.display_name || projectId);
     const generation = ++State.bootstrapGeneration;
     State.previewGeneration += 1; State.publishGeneration += 1;
@@ -1017,15 +1252,18 @@
     State.preview = null; State.lastPublish = null; State.publishedPreviewId = '';
     State.history = []; State.historyStatus = 'loading'; State.historyError = '';
     State.formatStates = Object.create(null); State.dirty = true;
+    State.insightBusy = false; State.insightStatus = 'empty';
+    State.insightDiff = null; State.insightGraph = null;
+    State.capsuleDestinationToken = ''; State.capsuleDestinationName = '';
     showAlert(''); setOperation('正在读取版本化预设、格式能力与报告状态…', 'busy');
     renderHistory(); renderActions();
     try {
-      const bootstrapPromise = VCS.call('report_workbench_bootstrap', projectPath, presetId || null);
+      const bootstrapPromise = VCS.call('report_workbench_bootstrap', projectId, presetId || null);
       const capabilityPromise = VCS.call('proj_report_capabilities');
-      const historyPromise = fetchHistory(projectId, projectPath, generation);
+      const historyPromise = fetchHistory(projectId, generation);
       const [bootstrap, capabilities, history] = await Promise.all(
         [bootstrapPromise, capabilityPromise, historyPromise]);
-      if (generation !== State.bootstrapGeneration || !sameProject(projectId, projectPath)) return false;
+      if (generation !== State.bootstrapGeneration || !sameProject(projectId)) return false;
       if (!bootstrap || bootstrap.ok === false || bootstrap.error) {
         throw new Error(bootstrap && bootstrap.error || '报告工作台 bootstrap 没有返回有效结果');
       }
@@ -1106,7 +1344,7 @@
       activateStep('language'); renderActions(); return false;
     }
     const request = requestFromSpec(); const fingerprint = JSON.stringify(request);
-    const projectId = State.projectId; const projectPath = State.projectPath;
+    const projectId = State.projectId;
     const generation = ++State.previewGeneration;
     State.previewBusy = true; State.dirty = true; showAlert('');
     setOperation(automatic ? '配置已保存，正在刷新绑定预览…' : '正在生成绑定 HTML 预览…', 'busy');
@@ -1115,8 +1353,8 @@
     });
     renderActions();
     try {
-      const result = await VCS.call('report_workbench_preview', projectPath, request);
-      if (generation !== State.previewGeneration || !sameProject(projectId, projectPath) ||
+      const result = await VCS.call('report_workbench_preview', projectId, request);
+      if (generation !== State.previewGeneration || !sameProject(projectId) ||
           fingerprint !== specFingerprint()) return false;
       if (!result || result.ok === false || result.error) {
         throw new Error(result && result.error || '报告预览没有返回有效结果');
@@ -1167,18 +1405,17 @@
     return expected;
   }
 
-  async function pickOutputDirectory(expectedProjectId = State.projectId,
-                                     expectedProjectPath = State.projectPath) {
+  async function pickOutputDirectory(expectedProjectId = State.projectId) {
     if (State.publishBusy) return '';
-    const result = await VCS.call('pick_dir');
-    if (!sameProject(expectedProjectId, expectedProjectPath) ||
-        State.projectId !== expectedProjectId || State.projectPath !== expectedProjectPath) return '';
-    if (!result || result.cancelled || !result.path) return '';
+    const result = await VCS.call('report_workbench_pick_destination', expectedProjectId);
+    if (!sameProject(expectedProjectId) || State.projectId !== expectedProjectId) return '';
+    if (!result || result.cancelled || !result.destination_token) return '';
     if (result.error) { showAlert(result.error); return ''; }
-    State.outputDir = String(result.path);
+    State.outputDestinationToken = String(result.destination_token);
+    State.outputDisplayName = String(result.display_name || 'selected directory');
     State.outputProjectId = expectedProjectId;
-    const output = $('rw-output-path'); if (output) output.textContent = State.outputDir;
-    renderActions(); return State.outputDir;
+    const output = $('rw-output-path'); if (output) output.textContent = State.outputDisplayName;
+    renderActions(); return State.outputDestinationToken;
   }
 
   function collectPublishedFiles(value, output) {
@@ -1214,10 +1451,10 @@
         State.preview.project_id !== State.projectId || !selectedFormatsAreAvailable()) {
       showAlert('当前配置没有可发布的绑定预览。请先刷新预览。'); renderActions(); return false;
     }
-    const projectId = State.projectId; const projectPath = State.projectPath;
-    const outputDir = State.outputProjectId === projectId && State.outputDir
-      ? State.outputDir : await pickOutputDirectory(projectId, projectPath);
-    if (!outputDir) return false;
+    const projectId = State.projectId;
+    const destinationToken = State.outputProjectId === projectId && State.outputDestinationToken
+      ? State.outputDestinationToken : await pickOutputDirectory(projectId);
+    if (!destinationToken) return false;
     const previewId = String(State.preview.preview_id); const generation = ++State.publishGeneration;
     const expected = expectedBindings(State.preview);
     const publishFingerprint = specFingerprint(); const publishDraftKey = draftKey();
@@ -1229,9 +1466,10 @@
     try {
       // Security boundary: publish receives only preview_id plus optimistic bindings;
       // no editable or server-owned scientific contracts are resubmitted.
+      State.outputDestinationToken = '';
       result = await VCS.call(
-        'report_workbench_publish', projectPath, outputDir, previewId, expected);
-      if (generation !== State.publishGeneration || !sameProject(projectId, projectPath)) return false;
+        'report_workbench_publish', projectId, destinationToken, previewId, expected);
+      if (generation !== State.publishGeneration || !sameProject(projectId)) return false;
       if (!result || result.ok === false || result.error) {
         throw new Error(result && result.error || '报告发布没有返回有效结果');
       }
@@ -1255,8 +1493,8 @@
       }, '报告已发布{revision}；{status}'));
       VCS.toast('报告 revision 已生成');
       try {
-        const history = await VCS.call('report_workbench_history', projectPath);
-        if (generation === State.publishGeneration && sameProject(projectId, projectPath)) {
+        const history = await VCS.call('report_workbench_history', projectId);
+        if (generation === State.publishGeneration && sameProject(projectId)) {
           if (history && history.ok !== false && !history.error) {
             State.history = normalizeHistory(history); State.historyStatus = 'ready'; State.historyError = '';
           } else {
@@ -1266,7 +1504,7 @@
           renderHistory();
         }
       } catch (historyError) {
-        if (generation === State.publishGeneration && sameProject(projectId, projectPath)) {
+        if (generation === State.publishGeneration && sameProject(projectId)) {
           State.history = []; State.historyStatus = 'unavailable';
           State.historyError = String(historyError && historyError.message || historyError);
           renderHistory();
@@ -1344,12 +1582,12 @@
     State.mode = modeFromRoute(route.id);
     State.routeQuery = plain(route.query);
     const project = currentProject();
-    if (!project || !project.path) {
+    if (!project || !projectIdentity(project)) {
       if (window.Project && typeof window.Project.reload === 'function') await window.Project.reload();
     }
     if (routeGeneration !== State.routeGeneration) return false;
     const refreshed = currentProject(); const id = projectIdentity(refreshed);
-    if (!id || !refreshed || !refreshed.path) {
+    if (!id || !refreshed) {
       showAlert('当前项目尚未加载。请从全局项目栏选择项目后重试。');
       setOperation('等待项目上下文。', 'bad'); return;
     }
@@ -1357,7 +1595,7 @@
     const requestedRevision = /^[1-9][0-9]{0,8}$/.test(String(State.routeQuery.revision || ''))
       ? String(State.routeQuery.revision) : '';
     const configMode = ['si', 'draftpack'].includes(State.mode) ? State.mode : 'report';
-    if (id !== State.projectId || String(refreshed.path) !== State.projectPath || !State.spec ||
+    if (id !== State.projectId || !State.spec ||
         requestedSpec !== State.loadedSpecQuery || configMode !== State.appliedMode ||
         !!State.pendingIntent) {
       const loaded = await loadBootstrap(requestedSpec || null, {
@@ -1395,6 +1633,21 @@
     });
   }
 
+  let pendingWorkbenchEntry = null;
+  let workbenchEntryTimer = null;
+  function scheduleWorkbenchEntry(intent = {}) {
+    // VCS.activatePage emits vcs:page and the semantic router emits vcs:route in the same
+    // navigation. Coalesce both notifications so one user entry creates one bootstrap/preview.
+    pendingWorkbenchEntry = Object.assign({}, pendingWorkbenchEntry || {}, plain(intent));
+    if (workbenchEntryTimer !== null) return;
+    workbenchEntryTimer = setTimeout(() => {
+      const entry = pendingWorkbenchEntry || {};
+      pendingWorkbenchEntry = null;
+      workbenchEntryTimer = null;
+      enterWorkbench(entry);
+    }, 0);
+  }
+
   function wire() {
     const steps = $('rw-step-list');
     if (steps) {
@@ -1417,31 +1670,39 @@
     const preview = $('rw-preview'); if (preview) preview.addEventListener('click', () => previewCurrentSpec());
     const publish = $('rw-publish'); if (publish) publish.addEventListener('click', publishBoundPreview);
     const pick = $('rw-pick-output'); if (pick) pick.addEventListener('click', () =>
-      pickOutputDirectory(State.projectId, State.projectPath));
+      pickOutputDirectory(State.projectId));
     const discard = $('rw-discard-draft');
     if (discard) discard.addEventListener('click', () => discardDraft({ reload: true }));
-    const openOutput = $('rw-open-output'); if (openOutput) openOutput.addEventListener('click', () => {
-      const path = State.outputProjectId === State.projectId ? State.outputDir : '';
-      if (path) VCS.call('open_dir', path);
-    });
+    const openOutput = $('rw-open-output'); if (openOutput) openOutput.disabled = true;
     const compare = $('rw-compare-revision'); if (compare) compare.addEventListener('click', () => {
-      VCS.toast('当前 MVP 已保留 revision 历史；差异 API 尚未开放。');
+      const panel = $('rw-insights'); if (panel) panel.scrollIntoView({ block: 'start', behavior: 'smooth' });
+      loadScientificDiff();
+    });
+    const diffButton = $('rw-load-diff'); if (diffButton) diffButton.addEventListener('click', loadScientificDiff);
+    const graphButton = $('rw-load-graph'); if (graphButton) graphButton.addEventListener('click', loadEvidenceGraph);
+    const capsuleButton = $('rw-export-capsule'); if (capsuleButton) capsuleButton.addEventListener('click', exportInsightCapsule);
+    ['rw-diff-left', 'rw-diff-right'].forEach(id => {
+      const select = $(id); if (select) select.addEventListener('change', () => {
+        State.insightStatus = 'empty'; renderInsightControls();
+      });
     });
     document.addEventListener('vcs:page', event => {
       if (event.detail && event.detail.page === 'report-workbench') {
-        setTimeout(() => enterWorkbench(), 0);
+        scheduleWorkbenchEntry(event.detail);
       }
     });
     document.addEventListener('vcs:route', event => {
-      if (event.detail && event.detail.page === 'report-workbench') enterWorkbench(event.detail);
+      if (event.detail && event.detail.page === 'report-workbench') {
+        scheduleWorkbenchEntry(event.detail);
+      }
     });
     document.addEventListener('vcs:workspace-project', () => {
       const page = $('page-report-workbench');
-      if (page && !page.hidden) enterWorkbench();
+      if (page && !page.hidden) scheduleWorkbenchEntry({ source: 'workspace-project' });
     });
     document.addEventListener('vcs:language', () => {
       if (State.spec) renderSpec();
-      renderPreview(State.preview); renderHistory(); renderFormatStates();
+      renderPreview(State.preview); renderHistory(); renderFormatStates(); renderInsightControls();
     });
     document.addEventListener('vcs:report-workbench-discard-draft', event => {
       const detail = plain(event.detail);
@@ -1463,11 +1724,24 @@
         mode: State.mode,
         dirty: State.dirty,
         preview_id: State.preview && State.preview.preview_id || null,
-        output_dir: State.outputProjectId === State.projectId ? State.outputDir || null : null,
+        output_destination_selected: State.outputProjectId === State.projectId &&
+          !!State.outputDestinationToken,
         history_status: State.historyStatus,
       };
     },
   };
+
+  if (window.__VCS_TEST__ === true) {
+    window.__VCS_REPORT_WORKBENCH_TEST__ = {
+      state: State,
+      sameProject,
+      fetchHistory,
+      loadBootstrap,
+      previewCurrentSpec,
+      pickOutputDirectory,
+      publishBoundPreview,
+    };
+  }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wire, { once: true });
   else wire();

@@ -141,6 +141,122 @@
   color: var(--accent-dark);
 }
 
+.aw-capability-status {
+  display: inline-flex;
+  align-self: flex-start;
+  margin-top: 4px;
+  padding: 2px 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font: 8.5px/1.3 var(--mono);
+}
+
+.aw-capability-status[data-status="available"] {
+  border-color: color-mix(in srgb, var(--ok) 55%, var(--line));
+  color: var(--ok);
+}
+
+.aw-capability-status[data-status="missing_prerequisite"],
+.aw-capability-status[data-status="mode_mismatch"] {
+  border-color: color-mix(in srgb, var(--warn) 55%, var(--line));
+  color: var(--warn);
+}
+
+.aw-capability-status[data-status="not_implemented"],
+.aw-capability-status[data-status="unavailable"] {
+  border-color: color-mix(in srgb, var(--fail) 45%, var(--line));
+  color: var(--fail);
+}
+
+.aw-registry button:disabled {
+  cursor: not-allowed;
+  opacity: .72;
+}
+
+.aw-next-action {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.aw-result-card {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 10px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-soft);
+}
+
+.aw-result-card > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.aw-result-card > code {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.aw-result-card > p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.aw-result-card .aw-elf-boundary {
+  display: block;
+  padding: 7px 8px;
+  border-left: 3px solid var(--warn);
+  background: var(--warn-bg);
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
+.aw-readonly-note {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.aw-next-calculation {
+  grid-column: 1 / -1;
+}
+
+#aw-next-calculation {
+  display: grid;
+  gap: 8px;
+}
+
+.aw-next-card {
+  display: grid;
+  gap: 5px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-soft);
+}
+
+.aw-next-card p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.aw-next-card code {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 8.5px;
+}
+
+.aw-next-card small {
+  color: var(--warn);
+  font-weight: 650;
+}
+
 .aw-registry b,
 .aw-registry small,
 .aw-template-list b,

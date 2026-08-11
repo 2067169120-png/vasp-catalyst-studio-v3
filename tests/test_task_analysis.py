@@ -24,6 +24,7 @@ def test_capability_matrix_covers_exact_catalog():
     assert all(row['report_supported'] for row in matrix.values())
     assert matrix['bands']['analysis_status'] == 'integrated'
     assert matrix['bader']['analysis_status'] == 'evidence_only'
+    assert matrix['elf']['analysis_status'] == 'integrated'
     assert matrix['surface_energy']['analysis_status'] == 'dedicated'
 
 
@@ -48,13 +49,16 @@ def test_generic_vasp_analysis_is_evidence_based(tmp_path):
     assert out['result']['ionic_converged_marker'] is True
 
 
-def test_artifact_only_analysis_says_it_is_not_quantitative(tmp_path):
-    (tmp_path / 'ELFCAR').write_text('real artifact', encoding='utf-8')
+def test_elf_analysis_returns_distribution_without_topology_claim(tmp_path):
+    (tmp_path / 'ELFCAR').write_text(
+        'ELF\n1\n1 0 0\n0 1 0\n0 0 1\nSi\n1\nDirect\n0 0 0\n\n'
+        '2 1 1\n0.25 0.75\n', encoding='utf-8')
     out = Api().analyze_task(str(tmp_path), kind='elf')
     assert out['ok'] is True
-    assert out['analysis_status'] == 'evidence_only'
-    assert out['result']['present'] == ['ELFCAR']
-    assert '未生成定量科学结论' in out['summary']
+    assert out['analysis_status'] == 'integrated'
+    assert out['result']['mean'] == 0.5
+    assert out['result']['denominator']['grid_points'] == 2
+    assert 'topology conclusion' in out['summary']
 
 
 def test_bader_analysis_uses_real_zval_and_charge(tmp_path):

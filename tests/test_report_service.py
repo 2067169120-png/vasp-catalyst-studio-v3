@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
+from typing import get_type_hints
 
 import pytest
 
@@ -14,6 +16,7 @@ from vcstudio.project.report_service import (
     PREVIEW_SCHEMA,
     PREVIEW_TOKEN_SCHEMA,
     ReportService,
+    ReportServiceHost,
 )
 
 
@@ -48,6 +51,7 @@ class _Host:
         self.history_audit_error = None
         self.render_extras = {}
         self.current_state_error = None
+        self.marker = None
 
     def _report_workbench_project_context(self, path):
         if str(path) != "project.yaml":
@@ -71,10 +75,25 @@ class _Host:
         }
 
     @staticmethod
-    def proj_report_status(path):
+    def _normalize_report_formats(formats):
+        return tuple(formats or ("html",))
+
+    def _proj_report_status_for_path(self, path):
+        if self.marker is not None:
+            return {
+                "ok": True,
+                "artifact_status": "ready",
+                "artifact_current": True,
+                "has_marker": True,
+                "scientific_status": "diagnostic",
+                "revision": copy.deepcopy(self.marker["revision"]),
+                "path": str(path),
+            }
         return {
             "ok": True,
             "artifact_status": "missing",
+            "artifact_current": False,
+            "has_marker": False,
             "scientific_status": None,
             "path": str(path),
         }
@@ -231,7 +250,11 @@ class _Host:
         self.marker_calls += 1
         if self.fail_marker:
             raise RuntimeError("marker disk full")
-        return {"revision": copy.deepcopy(revision), "artifact_status": "ready"}
+        self.marker = {
+            "revision": copy.deepcopy(revision),
+            "artifact_status": "ready",
+        }
+        return copy.deepcopy(self.marker)
 
     def _report_workbench_validate_history_entry(self, entry):
         self.history_audit_calls += 1
@@ -246,6 +269,30 @@ class _Host:
             "scientific_qualification": entry.get("scientific_qualification"),
             "error": None,
         }
+
+
+def test_report_service_host_protocol_is_narrow_and_web_independent(tmp_path):
+    required_seams = {
+        "_report_workbench_project_context",
+        "proj_report_capabilities",
+        "_proj_report_status_for_path",
+        "_normalize_report_formats",
+        "_report_workbench_build",
+        "_report_workbench_render_preview",
+        "_report_workbench_current_state",
+        "_report_workbench_render_build",
+        "_report_workbench_persist_build",
+        "_report_workbench_validate_history_entry",
+    }
+    declared_seams = {
+        name for name, value in vars(ReportServiceHost).items()
+        if callable(value) and not name.startswith("__")
+    }
+
+    assert declared_seams == required_seams
+    assert isinstance(_Host(tmp_path), ReportServiceHost)
+    assert get_type_hints(ReportService.__init__)["host"] is ReportServiceHost
+    assert "vcstudio.gui_web" not in inspect.getsource(report_service_module)
 
 
 def _request(project_id: str, *, operation_id="op-1", title_path=False):
@@ -280,6 +327,8 @@ def test_bootstrap_returns_five_server_presets_without_creating_history(tmp_path
     assert len(result["catalog"]["presets"]) == 5
     assert result["report_spec"]["preset_id"] == "diagnostic-repair"
     assert result["history"]["revisions"] == []
+    assert "path" not in result["status"]
+    assert str(tmp_path) not in json.dumps(result, ensure_ascii=False)
     assert not (tmp_path / ".vcstudio").exists()
 
 
@@ -314,6 +363,59 @@ def test_preview_rejects_unsafe_nested_request_before_build(tmp_path):
     assert host.preview_calls == host.render_calls == host.marker_calls == 0
 
 
+def test_preview_failure_and_format_reasons_redact_host_paths_and_secrets(
+    tmp_path, monkeypatch,
+):
+    host = _Host(tmp_path)
+    service = ReportService(host, temp_root=tmp_path / "previews")
+    original_capabilities = host.proj_report_capabilities
+
+    def leaky_capabilities():
+        value = original_capabilities()
+        value["formats"]["html"]["reason"] = (
+            rf"font probe at {tmp_path}\private; token=super-secret-value"
+        )
+        return value
+
+    monkeypatch.setattr(host, "proj_report_capabilities", leaky_capabilities)
+    preview = service.preview("project.yaml", _request(host.project_id))
+    assert preview["ok"] is True
+    encoded = json.dumps(preview["format_status"], ensure_ascii=False)
+    assert str(tmp_path) not in encoded
+    assert "super-secret-value" not in encoded
+
+    def fail_build(path, spec, temp_root):
+        raise RuntimeError(
+            rf"build failed at {tmp_path}\private; token=super-secret-value"
+        )
+
+    monkeypatch.setattr(host, "_report_workbench_build", fail_build)
+    failed = service.preview(
+        "project.yaml", _request(host.project_id, operation_id="failed")
+    )
+    encoded = json.dumps(failed, ensure_ascii=False)
+    assert failed["ok"] is False
+    assert str(tmp_path) not in encoded
+    assert "super-secret-value" not in encoded
+
+
+def test_preview_rejects_methods_only_final_before_scientific_build(tmp_path):
+    host = _Host(tmp_path)
+    service = ReportService(host, temp_root=tmp_path / "previews")
+    request = _request(host.project_id)
+    request["spec"].update({
+        "requested_kind": "final",
+        "outline": ["methods"],
+    })
+
+    result = service.preview("project.yaml", request)
+
+    assert result["ok"] is False
+    assert "final report outline" in result["error"]
+    assert "scientific result section" in result["error"]
+    assert host.preview_calls == host.render_calls == host.marker_calls == 0
+
+
 def test_publish_requires_complete_exact_preview_token(tmp_path):
     host = _Host(tmp_path)
     service = ReportService(host, temp_root=tmp_path / "previews")
@@ -345,6 +447,59 @@ def test_changed_scientific_input_makes_preview_stale_without_artifact(tmp_path)
     assert result["ok"] is False
     assert result["artifact_status"] == "stale_preview"
     assert result["stale_preview"] is True
+    assert host.render_calls == host.marker_calls == 0
+
+
+def test_same_uuid_copy_cannot_publish_another_instance_preview(tmp_path):
+    original_root = tmp_path / "original"
+    copied_root = tmp_path / "copied"
+    original_root.mkdir()
+    copied_root.mkdir()
+    original_path = original_root / "project.yaml"
+    copied_path = copied_root / "project.yaml"
+    original_path.write_text("name: Demo\n", encoding="utf-8")
+    copied_path.write_text("name: Demo\n", encoding="utf-8")
+
+    class _CopiedProjectHost(_Host):
+        def _report_workbench_project_context(self, path):
+            candidate = Path(path).resolve()
+            if candidate not in {original_path.resolve(), copied_path.resolve()}:
+                raise FileNotFoundError(path)
+            return {
+                "project": {"name": "Demo", "root": str(candidate.parent)},
+                "project_path": str(candidate),
+                "project_root": str(candidate.parent),
+                "project_id": self.project_id,
+                "project_name": "Demo",
+            }
+
+    host = _CopiedProjectHost(original_root)
+    service = ReportService(host, temp_root=tmp_path / "previews")
+    original_preview = service.preview(
+        str(original_path), _request(host.project_id, operation_id="original")
+    )
+    copied_preview = service.preview(
+        str(copied_path), _request(host.project_id, operation_id="copied")
+    )
+
+    original_record = service._previews[original_preview["preview_id"]]
+    copied_record = service._previews[copied_preview["preview_id"]]
+    assert original_record.report_id == copied_record.report_id
+    assert original_preview["preview_token"]["spec_sha256"] == (
+        copied_preview["preview_token"]["spec_sha256"]
+    )
+    assert str(original_root) not in json.dumps(original_preview, ensure_ascii=False)
+
+    crossed = service.publish(
+        str(copied_path),
+        str(tmp_path / "out"),
+        original_preview["preview_id"],
+        original_preview["preview_token"],
+        public=False,
+    )
+
+    assert crossed["ok"] is False
+    assert "physical project instance" in crossed["error"]
     assert host.render_calls == host.marker_calls == 0
 
 
@@ -395,6 +550,111 @@ def test_two_previews_from_same_base_revision_conflict_after_first_publish(tmp_p
     assert conflict["artifact_status"] == "revision_conflict"
     assert conflict["base_revision"] == 0 and conflict["current_revision"] == 1
     assert host.render_calls == 1 and host.marker_calls == 1
+
+
+def test_cross_project_r0002_destination_cas_never_overwrites(tmp_path):
+    shared_output = tmp_path / "shared-output"
+    host_a = _Host(tmp_path / "project-a")
+    host_b = _Host(tmp_path / "project-b")
+    host_b.project_id = "project-" + "b" * 32
+    service_a = ReportService(host_a, temp_root=tmp_path / "previews-a")
+    service_b = ReportService(host_b, temp_root=tmp_path / "previews-b")
+
+    first_a = service_a.preview("project.yaml", _request(host_a.project_id))
+    published_a1 = service_a.publish(
+        "project.yaml", str(shared_output), first_a["preview_id"],
+        first_a["preview_token"], stem="shared", public=False,
+    )
+    second_a = service_a.preview(
+        "project.yaml", _request(host_a.project_id, operation_id="a-r2")
+    )
+    published_a2 = service_a.publish(
+        "project.yaml", str(shared_output), second_a["preview_id"],
+        second_a["preview_token"], stem="shared", public=False,
+    )
+    protected_path = Path(published_a2["files"]["html"])
+    protected_bytes = protected_path.read_bytes()
+
+    first_b = service_b.preview("project.yaml", _request(host_b.project_id))
+    published_b1 = service_b.publish(
+        "project.yaml", str(tmp_path / "project-b-r1"), first_b["preview_id"],
+        first_b["preview_token"], stem="shared", public=False,
+    )
+    second_b = service_b.preview(
+        "project.yaml", _request(host_b.project_id, operation_id="b-r2")
+    )
+    conflict = service_b.publish(
+        "project.yaml", str(shared_output), second_b["preview_id"],
+        second_b["preview_token"], stem="shared", public=False,
+    )
+
+    assert published_a1["ok"] is published_a2["ok"] is published_b1["ok"] is True
+    assert published_a2["revision"]["sequence"] == 2
+    assert published_b1["revision"]["sequence"] == 1
+    assert conflict["ok"] is False
+    assert conflict["artifact_status"] == "revision_conflict"
+    assert conflict["destination_conflict"] is True
+    assert conflict["reserved_revision"] == 2
+    assert protected_path.read_bytes() == protected_bytes
+    assert service_b.history("project.yaml")["revisions"][0]["sequence"] == 1
+    assert host_b.render_calls == host_b.marker_calls == 1
+
+
+@pytest.mark.parametrize("failure_mode", ("return", "raise"))
+def test_clean_precommit_render_failure_can_retry_same_reservation(
+    tmp_path, failure_mode,
+):
+    class _TransientRenderHost(_Host):
+        def __init__(self, root):
+            super().__init__(root)
+            self.failures_remaining = 1
+
+        def _report_workbench_render_build(
+            self, build, out_dir, *, stem, revision
+        ):
+            if self.failures_remaining:
+                self.failures_remaining -= 1
+                self.render_calls += 1
+                if failure_mode == "raise":
+                    raise RuntimeError("transient renderer unavailable")
+                return {
+                    "ok": False,
+                    "artifact_status": "failed",
+                    "files": {},
+                    "error": "transient renderer unavailable",
+                }
+            return super()._report_workbench_render_build(
+                build, out_dir, stem=stem, revision=revision
+            )
+
+    host = _TransientRenderHost(tmp_path)
+    service = ReportService(host, temp_root=tmp_path / "previews")
+    preview = service.preview("project.yaml", _request(host.project_id))
+    destination = tmp_path / "out"
+
+    failed = service.publish(
+        "project.yaml", str(destination), preview["preview_id"],
+        preview["preview_token"], stem="retry", public=False,
+    )
+    reservation_path = next(
+        destination.glob(".vcstudio-report-reservation-*.json")
+    )
+    failed_reservation = json.loads(
+        reservation_path.read_text(encoding="utf-8")
+    )
+    retried = service.publish(
+        "project.yaml", str(destination), preview["preview_id"],
+        preview["preview_token"], stem="retry", public=False,
+    )
+
+    assert failed["ok"] is False
+    assert failed_reservation["state"] == "render_failed_clean"
+    assert retried["ok"] is True
+    assert retried["revision"]["sequence"] == 1
+    assert Path(retried["files"]["html"]).is_file()
+    assert host.render_calls == 2 and host.marker_calls == 1
+    committed = json.loads(reservation_path.read_text(encoding="utf-8"))
+    assert committed["state"] == "bundle_committed"
 
 
 def test_marker_failure_retains_generated_unrecorded_revision(tmp_path):
@@ -480,6 +740,8 @@ def test_expired_preview_cannot_publish(tmp_path):
         temp_root=tmp_path / "previews",
     )
     preview = service.preview("project.yaml", _request(host.project_id))
+    preview_root = Path(service._previews[preview["preview_id"]].temp_root)
+    assert preview_root.is_dir()
     now[0] += 61
 
     result = service.publish(
@@ -489,6 +751,87 @@ def test_expired_preview_cannot_publish(tmp_path):
 
     assert result["ok"] is False
     assert "expired" in result["error"]
+    assert not preview_root.exists()
+
+
+def test_preview_store_evicts_oldest_and_never_exceeds_fixed_limit(tmp_path):
+    now = [1000.0]
+    host = _Host(tmp_path)
+    service = ReportService(
+        host,
+        preview_limit=2,
+        clock=lambda: now[0],
+        temp_root=tmp_path / "previews",
+    )
+
+    previews = []
+    roots = []
+    for index in range(3):
+        now[0] += 1
+        preview = service.preview(
+            "project.yaml",
+            {**_request(host.project_id), "operation_id": f"op-{index}"},
+        )
+        previews.append(preview)
+        record = service._previews[preview["preview_id"]]
+        roots.append(Path(record.temp_root))
+        assert len(service._previews) <= 2
+
+    assert previews[0]["preview_id"] not in service._previews
+    assert previews[1]["preview_id"] in service._previews
+    assert previews[2]["preview_id"] in service._previews
+    assert not roots[0].exists()
+    assert roots[1].is_dir() and roots[2].is_dir()
+
+
+def test_successful_publish_discards_preview_and_temp_build(tmp_path):
+    host = _Host(tmp_path)
+    service = ReportService(host, temp_root=tmp_path / "previews")
+    preview = service.preview("project.yaml", _request(host.project_id))
+    preview_root = Path(service._previews[preview["preview_id"]].temp_root)
+
+    published = service.publish(
+        "project.yaml",
+        str(tmp_path / "out"),
+        preview["preview_id"],
+        preview["preview_token"],
+    )
+
+    assert published["ok"] is True
+    assert preview["preview_id"] not in service._previews
+    assert not preview_root.exists()
+
+
+def test_preview_cleanup_failure_is_path_free_auditable_and_nonfatal(
+    tmp_path, monkeypatch,
+):
+    host = _Host(tmp_path)
+    service = ReportService(
+        host, preview_limit=1, temp_root=tmp_path / "previews"
+    )
+    first = service.preview("project.yaml", _request(host.project_id))
+    first_root = service._previews[first["preview_id"]].temp_root
+    original_rmtree = report_service_module.shutil.rmtree
+
+    def selective_failure(path, *args, **kwargs):
+        if os.path.normcase(str(path)) == os.path.normcase(str(first_root)):
+            raise PermissionError(f"cannot remove {path}")
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(report_service_module.shutil, "rmtree", selective_failure)
+    second = service.preview(
+        "project.yaml", {**_request(host.project_id), "operation_id": "op-2"}
+    )
+
+    assert second["ok"] is True
+    assert list(service._previews) == [second["preview_id"]]
+    events = service._preview_cleanup_events()
+    assert events == ({
+        "preview_id": first["preview_id"],
+        "reason": "capacity_eviction",
+        "error_type": "PermissionError",
+    },)
+    assert str(tmp_path) not in json.dumps(events)
 
 
 def test_history_schema_is_stable(tmp_path):
@@ -665,16 +1008,36 @@ def test_final_history_write_failure_after_marker_preserves_recoverable_bundle(
     )
 
     assert result["ok"] is False
-    assert result["artifact_status"] == "generated_unrecorded"
+    assert result["artifact_status"] == "ready"
     assert result["partial_success"] is True
     assert result["marker_recorded"] is True
     assert result["history_recorded"] is True
     assert result["history_ready_recorded"] is False
+    assert result["journal_recorded"] is True
+    assert result["recovery_required"] is True
     assert result["recovery_state"] == "marker_ready_history_finalize_failed"
     assert Path(result["manifest"]).is_file()
     assert Path(result["files"]["html"]).is_file()
+    status = host._proj_report_status_for_path("project.yaml")
+    assert status["artifact_status"] == "ready"
+    assert status["revision"] == result["revision"]
     history = service.history("project.yaml")
-    assert history["revisions"][0]["artifact_status"] == "generated_unrecorded"
+    assert history["revisions"][0]["artifact_status"] == "ready"
+    assert history["revisions"][0]["recovery_state"] == "history_finalize_pending"
+    assert "history finalization failed" in history["revisions"][0]["error"]
+    history_payload = json.loads(
+        (tmp_path / ".vcstudio" / "reports" / "history.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    report_id = result["revision"]["report_id"]
+    frozen_entry = history_payload["reports"][report_id]["revisions"][0]
+    assert frozen_entry["artifact_status"] == "generated_unrecorded"
+    journal = json.loads(
+        Path(frozen_entry["transaction_journal"]).read_text(encoding="utf-8")
+    )
+    assert journal["state"] == "marker_ready"
+    assert journal["marker_recorded"] is True
 
 
 def test_missing_history_never_overwrites_same_lineage_first_revision(tmp_path):

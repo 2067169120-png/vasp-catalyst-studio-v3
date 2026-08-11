@@ -232,6 +232,9 @@ const VCS = {
   toast(msg, kind = '') {
     const t = document.createElement('div');
     t.className = 'toast' + (kind ? ' ' + kind : '');
+    t.setAttribute('role', kind === 'fail' ? 'alert' : 'status');
+    t.setAttribute('aria-live', kind === 'fail' ? 'assertive' : 'polite');
+    t.setAttribute('aria-atomic', 'true');
     t.textContent = String(msg);
     document.body.appendChild(t);
     setTimeout(() => { if (t.parentNode) t.parentNode.removeChild(t); }, 2600);

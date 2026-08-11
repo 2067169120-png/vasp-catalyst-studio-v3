@@ -32,7 +32,15 @@
   async function loadProjects() {
     const sel = $('fig-project');
     const r = await VCS.call('proj_list');
-    State.projects = (r && r.projects) || [];
+    State.projects = ((r && r.projects) || [])
+      .filter(project => String(project.project_id || '').trim())
+      .map(project => ({
+        project_id: String(project.project_id),
+        name: String(project.name || ''),
+        counts: project.counts && typeof project.counts === 'object'
+          ? Object.assign({}, project.counts) : {},
+        n_members: Number(project.n_members || 0),
+      }));
     if (!sel) return;
     const prev = sel.value;
     sel.innerHTML = '';
@@ -44,13 +52,14 @@
     }
     State.projects.forEach(p => {
       const o = document.createElement('option');
-      o.value = p.path;
+      o.value = p.project_id;
       o.textContent = tr('figures.project.option', '{name}（{count} 成员）', {
-        name: p.name || tr('common.unnamed', '(未命名)'), count: p.n_members,
+        name: p.name || tr('common.unnamed', '(未命名)'),
+        count: p.counts && p.counts.members != null ? p.counts.members : p.n_members,
       });
       sel.appendChild(o);
     });
-    if (State.projects.some(p => p.path === prev)) sel.value = prev;
+    if (State.projects.some(p => p.project_id === prev)) sel.value = prev;
   }
 
   async function loadReactions() {
@@ -233,4 +242,5 @@
   });
 
   window.Figures = { reload: loadProjects };
+  if (window.__VCS_TEST__) window.Figures.__test = { State, loadProjects, generate };
 })();

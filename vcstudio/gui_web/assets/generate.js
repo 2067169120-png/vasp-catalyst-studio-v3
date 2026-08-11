@@ -338,9 +338,10 @@
       VCS.log(tr('runtime.generate.sac.created', { count: r.created },
         'SAC 已生成 {count} 个作业,入台账',
         'SAC generated and registered {count} jobs'), 'okc');
-      (r.project_paths || []).forEach(pp => VCS.log(tr(
-        'runtime.generate.sac.project_created', { path: pp },
-        '已建吸附能项目:{path}', 'Adsorption-energy project created: {path}'), 'okc'));
+      (r.projects || []).forEach(project => VCS.log(tr(
+        'runtime.generate.sac.project_created', {
+          path: project.name || project.project_id || '',
+        }, '已建吸附能项目:{path}', 'Adsorption-energy project created: {path}'), 'okc'));
       (r.skipped || []).forEach(s => VCS.log(tr(
         'runtime.generate.sac.skipped', { name: s.name || '', reason: s.reason },
         '跳过 {name}:{reason}', 'Skipped {name}: {reason}'), 'warnc'));
