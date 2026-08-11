@@ -5,6 +5,16 @@
 'use strict';
 (function () {
   const $ = id => document.getElementById(id);
+  function tr(key, params = {}, zhFallback = '', enFallback = '') {
+    const english = !!(VCS.i18n && VCS.i18n.lang === 'en');
+    const fallback = english
+      ? (enFallback || `Translation unavailable (${key})`)
+      : zhFallback;
+    if (typeof VCS.t === 'function') return VCS.t(key, params, fallback);
+    return String(fallback).replace(/\{([A-Za-z0-9_]+)\}/g,
+      (match, name) => Object.prototype.hasOwnProperty.call(params, name)
+        ? String(params[name]) : match);
+  }
   const val = id => { const el = $(id); return el ? el.value.trim() : ''; };
   const setVal = (id, v) => { const el = $(id); if (el) el.value = v || ''; };
   const CURRENT_PROJECT_KEY = 'vcs.adsorption.current_project';
@@ -13,25 +23,25 @@
   const SINGLE_REPORT_FORMATS = Object.freeze([
     {
       id: 'pj-report-format-html', value: 'html', label: 'HTML',
-      description: '浏览器预览（始终可用）',
+      description: () => tr("runtime.project.tr.text_7a9ffb0460", {}, '浏览器预览（始终可用）', 'Browser preview (always available)'),
     },
     {
       id: 'pj-report-format-docx', value: 'docx', label: 'DOCX',
-      description: '编辑与批注',
+      description: () => tr("runtime.project.tr.text_5af8aeae5b", {}, '编辑与批注', 'Editing and annotation'),
     },
     {
       id: 'pj-report-format-pdf', value: 'pdf', label: 'PDF',
-      description: '打印与归档',
+      description: () => tr("runtime.project.tr.text_b22000266d", {}, '打印与归档', 'Printing and archiving'),
     },
   ]);
-  const REPORT_CAPABILITY_PENDING_REASON =
-    '正在等待后端明确确认；确认可用前不会提交此格式。';
+  const reportCapabilityPendingReason = () =>
+    tr("runtime.project.tr.text_34e6026ae2", {}, '正在等待后端明确确认；确认可用前不会提交此格式。', 'Waiting for explicit backend confirmation; this format will not be submitted until availability is confirmed.');
 
   function initialReportCapabilities() {
     return {
       html: { available: true, reason: '' },
-      docx: { available: false, reason: REPORT_CAPABILITY_PENDING_REASON },
-      pdf: { available: false, reason: REPORT_CAPABILITY_PENDING_REASON },
+      docx: { available: false, reason: reportCapabilityPendingReason() },
+      pdf: { available: false, reason: reportCapabilityPendingReason() },
     };
   }
 
@@ -72,6 +82,8 @@
     compareFiguresBusy: false,
     batchReportBusy: false,
     candidateEvaluationGeneration: 0,
+    candidateEvaluation: null,
+    deltaResult: null,
     reportDiagnostic: false,
     reportBusy: false,
     reportCapabilities: initialReportCapabilities(),
@@ -163,15 +175,25 @@
 
   // ── 本地已算结果导入:四步向导 ─────────────────────────────────────────────
   const ROLE_LABELS = {
-    clean_slab: '清洁表面', config: '吸附构型', gas_ref: '吸附质气相参考',
-    molecule_ref: '锂硫 / 分子能量库', standalone: '独立计算结果', ignore: '不导入',
+    clean_slab: () => tr("runtime.project.joinpath.text_1333fd3434", {}, '清洁表面', 'Clean surface'),
+    config: () => tr("runtime.project.joinpath.text_3f8c1a0e1d", {}, '吸附构型', 'Adsorption configuration'),
+    gas_ref: () => tr("runtime.project.joinpath.text_0aa9f27384", {}, '吸附质气相参考', 'Gas-phase adsorbate reference'),
+    molecule_ref: () => tr("runtime.project.joinpath.text_f5b33b770a", {}, '锂硫 / 分子能量库', 'Li-S / molecular-energy library'),
+    standalone: () => tr("runtime.project.joinpath.text_f696c7f1ce", {}, '独立计算结果', 'Standalone calculation result'),
+    ignore: () => tr("runtime.project.joinpath.text_83a4be6e41", {}, '不导入', 'Do not import'),
   };
   const TASK_LABELS = {
-    auto: '自动识别', relax: '结构优化 relax', cellopt: '晶胞优化 cellopt',
-    static: '静态能量 static', freq: '频率 freq', dos: '态密度 DOS',
-    band: '能带 band', unknown: '尚未识别',
+    auto: () => tr("runtime.project.joinpath.text_4b874a93b7", {}, '自动识别', 'Detect automatically'),
+    relax: () => tr("runtime.project.joinpath.text_3034a7858e", {}, '结构优化 relax', 'Structural relaxation (relax)'),
+    cellopt: () => tr("runtime.project.joinpath.text_d8280c82f8", {}, '晶胞优化 cellopt', 'Cell optimization (cellopt)'),
+    static: () => tr("runtime.project.joinpath.text_dc1ecf9b18", {}, '静态能量 static', 'Static energy (static)'),
+    freq: () => tr("runtime.project.joinpath.text_8b0f011739", {}, '频率 freq', 'Frequency calculation (freq)'),
+    dos: () => tr("runtime.project.joinpath.text_11da7d2aa5", {}, '态密度 DOS', 'Density of states (DOS)'),
+    band: () => tr("runtime.project.joinpath.text_29a65e5403", {}, '能带 band', 'Band structure (band)'),
+    unknown: () => tr("runtime.project.joinpath.text_06bccf5a69", {}, '尚未识别', 'Not identified yet'),
   };
-  const DEFAULT_CONFIRMATION_REASON = '已核对原始 OUTCAR/OSZICAR 与末结构，确认该任务收敛';
+  const labelFor = (labels, key) => typeof labels[key] === 'function' ? labels[key]() : key;
+  const defaultConfirmationReason = () => tr("runtime.project.joinpath.text_94a1de12b2", {}, '已核对原始 OUTCAR/OSZICAR 与末结构，确认该任务收敛', 'I checked the original OUTCAR/OSZICAR and final structure and confirmed that this task converged');
 
   function pathBase(path) {
     const s = String(path || '').replace(/[\\/]+$/, '');
@@ -252,37 +274,37 @@
       el.classList.toggle('current', step === current);
     });
     if (State.workflowNeedsHuman) {
-      if (status) status.textContent = '当前项目有需要处理的任务。打开任务页即可查看原因并续算或重新下载。';
+      if (status) status.textContent = tr("runtime.project.updatejourney.text_88d1cf1af0", {}, '当前项目有需要处理的任务。打开任务页即可查看原因并续算或重新下载。', 'The current project contains tasks that need attention. Open Jobs to review the reasons and continue the calculation or download the results again.');
       const newButton = $('ads-route-new');
-      if (newButton) newButton.textContent = '处理任务异常';
+      if (newButton) newButton.textContent = tr("runtime.project.updatejourney.text_f6f89f5b2d", {}, '处理任务异常', 'Resolve task issues');
       setJourneyPrimary('ads-route-new');
     } else if (State.workflowResultReady || State.workflowStage === 'report_done') {
-      if (status) status.textContent = '任务已完成，报告产物已生成；科学状态可能是最终、诊断或阻断，请在报告卡中核对。';
+      if (status) status.textContent = tr("runtime.project.updatejourney.text_ea8f044511", {}, '任务已完成，报告产物已生成；科学状态可能是最终、诊断或阻断，请在报告卡中核对。', 'The tasks are complete and report artifacts were generated. The scientific state may be final, diagnostic, or blocked; verify it on the report card.');
       const resultButton = $('ads-route-results');
-      if (resultButton) resultButton.textContent = '查看 ΔE 与报告';
+      if (resultButton) resultButton.textContent = tr("runtime.project.updatejourney.text_95d312da59", {}, '查看 ΔE 与报告', 'View ΔE and reports');
       setJourneyPrimary('ads-route-results');
     } else if (State.workflowAnalysisReady || State.workflowStage === 'analysis') {
-      if (status) status.textContent = '整组任务已完成。下一步检查 ΔE；全部有效后即可生成报告。';
+      if (status) status.textContent = tr("runtime.project.updatejourney.text_1ace5962cb", {}, '整组任务已完成。下一步检查 ΔE；全部有效后即可生成报告。', 'All tasks in the group are complete. Check ΔE next; when every value is valid, the report can be generated.');
       const resultButton = $('ads-route-results');
-      if (resultButton) resultButton.textContent = '检查 ΔE 并生成报告';
+      if (resultButton) resultButton.textContent = tr("runtime.project.updatejourney.text_351eaa7d8f", {}, '检查 ΔE 并生成报告', 'Check ΔE and generate report');
       setJourneyPrimary('ads-route-results');
     } else if (State.workflowSubmitted) {
-      if (status) status.textContent = '整组任务已提交，自动托管正在监控、续算和下载关键结果。请保持软件运行。';
+      if (status) status.textContent = tr("runtime.project.updatejourney.text_91412ec3b3", {}, '整组任务已提交，自动托管正在监控、续算和下载关键结果。请保持软件运行。', 'All tasks in the group were submitted. Autopilot is monitoring them, continuing eligible calculations, and downloading key results. Keep the application running.');
       const newButton = $('ads-route-new');
-      if (newButton) newButton.textContent = '查看任务进度';
+      if (newButton) newButton.textContent = tr("runtime.project.updatejourney.text_184c5eb9c2", {}, '查看任务进度', 'View task progress');
       setJourneyPrimary('ads-route-new');
     } else if (State.workflowPendingSubmit) {
-      if (status) status.textContent = '整组输入已生成，但仍有作业等待提交。请到任务页完成提交。';
+      if (status) status.textContent = tr("runtime.project.updatejourney.text_b724f9d48c", {}, '整组输入已生成，但仍有作业等待提交。请到任务页完成提交。', 'All input sets were generated, but some jobs are still waiting for submission. Complete submission on Jobs.');
       const newButton = $('ads-route-new');
-      if (newButton) newButton.textContent = '提交已生成作业';
+      if (newButton) newButton.textContent = tr("runtime.project.updatejourney.text_6931896a36", {}, '提交已生成作业', 'Submit generated jobs');
       setJourneyPrimary('ads-route-new');
     } else if (refs.length) {
-      if (status) status.textContent = `已找到 ${refs.length} 个可复用的参考能项目。下一步添加 slab 与 adsorption 结构。`;
+      if (status) status.textContent = tr("runtime.project.updatejourney.text_b876ecb689", { value1: (refs.length) }, `已找到 {value1} 个可复用的参考能项目。下一步添加 slab 与 adsorption 结构。`, 'Found {value1} reusable reference-energy projects. Next, add the slab and adsorption structures.');
       const newButton = $('ads-route-new');
-      if (newButton) newButton.textContent = '已有参考能，开始新的吸附计算';
+      if (newButton) newButton.textContent = tr("runtime.project.updatejourney.text_a4d3af3d8f", {}, '已有参考能，开始新的吸附计算', 'Start a new adsorption calculation with existing reference energies');
       setJourneyPrimary('ads-route-new');
     } else {
-      if (status) status.textContent = '还没有可复用的 Li-S 参考能。先导入你已经算好并收敛的 Li-S 化合物结果。';
+      if (status) status.textContent = tr("runtime.project.updatejourney.text_b7c893b686", {}, '还没有可复用的 Li-S 参考能。先导入你已经算好并收敛的 Li-S 化合物结果。', 'No reusable Li-S reference energies are available yet. First import Li-S compound results that have already been calculated and converged.');
       setJourneyPrimary('ads-route-import');
     }
   }
@@ -292,7 +314,11 @@
     if (!box) return;
     if (!message) { box.hidden = true; box.innerHTML = ''; return; }
     box.hidden = false;
-    box.innerHTML = `<b>${VCS.esc(message)}</b><span>怎么处理：${VCS.esc(fix || '按提示修正后重新检查。')}</span>`;
+    box.innerHTML = tr("runtime.project.showimportproblem.text_b1758e3a83", {
+      value1: VCS.esc(message),
+      value2: VCS.esc(fix || tr('runtime.project.showimportproblem.default_fix', {},
+        '按提示修正后重新检查。', 'Apply the suggested correction, then check again.')),
+    }, `<b>{value1}</b><span>怎么处理：{value2}</span>`, '<b>{value1}</b><span>How to resolve it: {value2}</span>');
   }
 
   async function openProjectResults(projectPath) {
@@ -326,39 +352,47 @@
     const electronic = raw.electronic || {};
     const ionic = raw.ionic || {};
     const completion = raw.completion || {};
-    if (energy.value_eV != null) out.push(`能量 ${energy.value_eV} eV（${energy.source || '来源未知'}）`);
+    if (energy.value_eV != null) out.push(tr("runtime.project.evidencelist.text_648bed00f5", {
+      value1: energy.value_eV,
+      value2: energy.source || tr('runtime.project.evidencelist.unknown_source', {},
+        '来源未知', 'Unknown source'),
+    }, `能量 {value1} eV（{value2}）`, 'Energy {value1} eV ({value2})'));
     if (electronic.final_scf_steps != null) {
-      out.push(`末电子步 ${electronic.final_scf_steps}/${electronic.nelm || 'NELM 未知'}` +
-        (electronic.nelm_saturated ? '，已达到上限' : '，未达到上限'));
+      out.push(tr("runtime.project.evidencelist.text_95aef18919", {
+        value1: electronic.final_scf_steps,
+        value2: electronic.nelm || tr('runtime.project.evidencelist.unknown_nelm', {},
+          'NELM 未知', 'NELM unknown'),
+      }, `末电子步 {value1}/{value2}`, 'Final electronic step {value1}/{value2}') +
+        (electronic.nelm_saturated ? tr("runtime.project.evidencelist.text_bf521725b6", {}, '，已达到上限', ', limit reached') : tr("runtime.project.evidencelist.text_5807b073fd", {}, '，未达到上限', ', limit not reached')));
     }
-    if (ionic.converged_marker) out.push('OUTCAR 含结构优化收敛标志');
-    if (ionic.final_force_max_eV_A != null) out.push(`末最大力 ${ionic.final_force_max_eV_A} eV/Å`);
-    if (completion.outcar_footer) out.push('OUTCAR 含正常结束页脚');
-    if (completion.vasprun_complete) out.push('vasprun.xml 结构完整');
-    if (completion.soft_stopped) out.push('检测到 STOPCAR / soft stop');
+    if (ionic.converged_marker) out.push(tr("runtime.project.evidencelist.text_3934a7fec6", {}, 'OUTCAR 含结构优化收敛标志', 'OUTCAR contains the structural-relaxation convergence marker'));
+    if (ionic.final_force_max_eV_A != null) out.push(tr("runtime.project.evidencelist.text_39f9b48c46", { value1: (ionic.final_force_max_eV_A) }, `末最大力 {value1} eV/Å`, 'Final maximum force {value1} eV/Å'));
+    if (completion.outcar_footer) out.push(tr("runtime.project.evidencelist.text_dec98d3f14", {}, 'OUTCAR 含正常结束页脚', 'OUTCAR contains a normal-termination footer'));
+    if (completion.vasprun_complete) out.push(tr("runtime.project.evidencelist.text_b17c6cbb52", {}, 'vasprun.xml 结构完整', 'vasprun.xml is structurally complete'));
+    if (completion.soft_stopped) out.push(tr("runtime.project.evidencelist.text_1007ec9cb5", {}, '检测到 STOPCAR / soft stop', 'STOPCAR / soft stop detected'));
     const cross = raw.cross_file_energy || {};
     const crossDelta = cross.spread_eV != null ? cross.spread_eV
       : cross.max_delta_eV != null ? cross.max_delta_eV
         : cross.max_difference_eV != null ? cross.max_difference_eV : cross.max_delta;
     if (cross.consistent === true) {
-      out.push('跨文件末能量一致' +
-        (crossDelta != null ? `（最大差 ${crossDelta} eV）` : '（OSZICAR / OUTCAR / vasprun.xml）'));
+      out.push(tr("runtime.project.evidencelist.text_0bd8fa7c1f", {}, '跨文件末能量一致', 'Final energies agree across files') +
+        (crossDelta != null ? tr("runtime.project.evidencelist.text_900cb9fa6c", { value1: (crossDelta) }, `（最大差 {value1} eV）`, ' (maximum difference {value1} eV)') : '（OSZICAR / OUTCAR / vasprun.xml）'));
     } else if (cross.consistent === false) {
-      out.push('跨文件末能量不一致' + (crossDelta != null ? `（最大差 ${crossDelta} eV）` : ''));
+      out.push(tr("runtime.project.evidencelist.text_cdda10ac24", {}, '跨文件末能量不一致', 'Final energies disagree across files') + (crossDelta != null ? tr("runtime.project.evidencelist.text_900cb9fa6c", { value1: (crossDelta) }, `（最大差 {value1} eV）`, ' (maximum difference {value1} eV)') : ''));
     }
-    if (raw.fatal_error) out.push(`致命错误：${raw.fatal_error}`);
+    if (raw.fatal_error) out.push(tr("runtime.project.evidencelist.text_673e30c330", { value1: (raw.fatal_error) }, `致命错误：{value1}`, 'Fatal error: {value1}'));
     return out.length ? out : textList(raw);
   }
 
   function actionLabel(value) {
     const action = String(value || '');
     return ({
-      import_done: '无需额外处理，可直接导入',
-      manual_confirm: '核对原始输出确已正常结束后，可勾选人工确认',
-      repair_or_recalculate: '按硬性问题补齐输出或续算，然后重新检查',
-      inspect_output: '打开原始输出核对结束状态，补齐文件后重新检查',
-      submit_created: '四件套已就绪；导入后前往任务页选择服务器提交',
-      submit: '四件套已就绪；导入后前往任务页选择服务器提交',
+      import_done: tr("runtime.project.actionlabel.text_b5b0ebd372", {}, '无需额外处理，可直接导入', 'No further action is required; ready to import'),
+      manual_confirm: tr("runtime.project.actionlabel.text_8ec396e1bb", {}, '核对原始输出确已正常结束后，可勾选人工确认', 'After verifying that the original output ended normally, select manual confirmation'),
+      repair_or_recalculate: tr("runtime.project.actionlabel.text_88b652b396", {}, '按硬性问题补齐输出或续算，然后重新检查', 'Resolve the blocking issues by completing the output or continuing the calculation, then check again'),
+      inspect_output: tr("runtime.project.actionlabel.text_eac5bf042b", {}, '打开原始输出核对结束状态，补齐文件后重新检查', 'Open the original output, verify its completion state, add any missing files, and check again'),
+      submit_created: tr("runtime.project.actionlabel.text_796ff94dca", {}, '四件套已就绪；导入后前往任务页选择服务器提交', 'The four-file input set is ready; after import, select a server and submit it from Jobs'),
+      submit: tr("runtime.project.actionlabel.text_796ff94dca", {}, '四件套已就绪；导入后前往任务页选择服务器提交', 'The four-file input set is ready; after import, select a server and submit it from Jobs'),
     })[action] || action;
   }
 
@@ -405,7 +439,7 @@
       raw: c,
       index,
       path,
-      name: String(c.name || pathBase(path) || `结果 ${index + 1}`),
+      name: String(c.name || pathBase(path) || tr("runtime.project.normalizeimportcandidate.text_f8e61a2106", { value1: (index + 1) }, `结果 {value1}`, 'Result {value1}')),
       role,
       species: String(c.species || ''),
       speciesSource: String(c.species_source || ''),
@@ -482,27 +516,27 @@
     const missingConfirmationReasons = selected.filter(row => row.manualConfirm &&
       row.confirmationEligible && !row.confirmationReason.trim());
     let issue = '';
-    if (!selected.length) issue = '请至少勾选一个可导入结果';
+    if (!selected.length) issue = tr("runtime.project.importmethodgate.text_5a37c6948a", {}, '请至少勾选一个可导入结果', 'Select at least one importable result');
     else if (missingConfirmationReasons.length) issue =
-      `有 ${missingConfirmationReasons.length} 个人工确认结果尚未填写核对依据`;
-    else if (unresolved.length) issue = `仍有 ${unresolved.length} 个已选结果需要处理`;
-    else if (pendingMappings.length) issue = `请确认 ${pendingMappings.length} 个已选结果的智能角色/物种分组`;
-    else if (clean > 1) issue = '一个吸附能项目只能选择 1 个清洁表面';
-    else if (gas > 1) issue = '一个吸附能项目只能选择 1 个吸附质气相参考';
-    else if (missingSpecies.length) issue = `有 ${missingSpecies.length} 个分子参考未填写物种名称（如 Li2S4、S8）`;
+      tr("runtime.project.importmethodgate.text_cc9bc5bb50", { value1: (missingConfirmationReasons.length) }, `有 {value1} 个人工确认结果尚未填写核对依据`, '{value1} manually confirmed results still need a verification rationale');
+    else if (unresolved.length) issue = tr("runtime.project.importmethodgate.text_22631ec6b9", { value1: (unresolved.length) }, `仍有 {value1} 个已选结果需要处理`, '{value1} selected results still need attention');
+    else if (pendingMappings.length) issue = tr("runtime.project.importmethodgate.text_24eb314ac7", { value1: (pendingMappings.length) }, `请确认 {value1} 个已选结果的智能角色/物种分组`, 'Confirm the inferred role/species grouping for {value1} selected results');
+    else if (clean > 1) issue = tr("runtime.project.importmethodgate.text_4bf7ba3488", {}, '一个吸附能项目只能选择 1 个清洁表面', 'An adsorption-energy project can contain only one clean surface');
+    else if (gas > 1) issue = tr("runtime.project.importmethodgate.text_0cac64179b", {}, '一个吸附能项目只能选择 1 个吸附质气相参考', 'An adsorption-energy project can contain only one gas-phase adsorbate reference');
+    else if (missingSpecies.length) issue = tr("runtime.project.importmethodgate.text_feac85ebcd", { value1: (missingSpecies.length) }, `有 {value1} 个分子参考未填写物种名称（如 Li2S4、S8）`, '{value1} molecular references are missing species names (for example, Li2S4 or S8)');
     else if (missingConfigSpecies.length) issue =
-      `已选择逐物种分子参考：请为 ${missingConfigSpecies.length} 个吸附构型填写对应物种（如 Li2S8）`;
+      tr("runtime.project.importmethodgate.text_3fecfe8cfe", { value1: (missingConfigSpecies.length) }, `已选择逐物种分子参考：请为 {value1} 个吸附构型填写对应物种（如 Li2S8）`, 'Per-species molecular references are selected. Assign the corresponding species (for example, Li2S8) to {value1} adsorption configurations.');
     else if (duplicateMoleculeSpecies.length) issue =
-      `分子参考物种重复：${Array.from(new Set(duplicateMoleculeSpecies)).join('、')}`;
+      tr("runtime.project.importmethodgate.text_66bec779e5", { value1: (Array.from(new Set(duplicateMoleculeSpecies)).join('、')) }, `分子参考物种重复：{value1}`, 'Duplicate molecular-reference species: {value1}');
     else if (unmatchedConfigSpecies.length) issue =
-      `有 ${unmatchedConfigSpecies.length} 个吸附构型没有同名分子参考`;
+      tr("runtime.project.importmethodgate.text_075fc1a8b0", { value1: (unmatchedConfigSpecies.length) }, `有 {value1} 个吸附构型没有同名分子参考`, '{value1} adsorption configurations do not have molecular references with the same species name');
     else if (unsafeMolecules.length) issue =
-      '分子参考仅接收 DONE 结果或已验证的完整四件套待提交；待核项请改为“独立计算结果”';
-    else if (invalidTasks.length) issue = `有 ${invalidTasks.length} 个结果尚未选择受支持的任务类型`;
-    else if (configs && clean !== 1) issue = '已选择吸附构型，请再指定 1 个清洁表面';
-    else if (clean && !configs) issue = '已选择清洁表面，请至少再选择 1 个吸附构型';
-    else if (gas && !clean) issue = '吸附质气相参考需与清洁表面和吸附构型一起导入';
-    else if (!clean && !molecules && !standalone) issue = '请修正结果角色后再导入';
+      tr("runtime.project.importmethodgate.text_425b86bf4d", {}, '分子参考仅接收 DONE 结果或已验证的完整四件套待提交；待核项请改为“独立计算结果”', 'Molecular references accept only DONE results or verified complete four-file input sets awaiting submission. Change pending-review items to Standalone calculation result.');
+    else if (invalidTasks.length) issue = tr("runtime.project.importmethodgate.text_e59c82dece", { value1: (invalidTasks.length) }, `有 {value1} 个结果尚未选择受支持的任务类型`, '{value1} results do not yet have a supported task type selected');
+    else if (configs && clean !== 1) issue = tr("runtime.project.importmethodgate.text_84d19f9237", {}, '已选择吸附构型，请再指定 1 个清洁表面', 'Adsorption configurations are selected; also specify one clean surface');
+    else if (clean && !configs) issue = tr("runtime.project.importmethodgate.text_a31bab58f5", {}, '已选择清洁表面，请至少再选择 1 个吸附构型', 'A clean surface is selected; also select at least one adsorption configuration');
+    else if (gas && !clean) issue = tr("runtime.project.importmethodgate.text_a1350f8232", {}, '吸附质气相参考需与清洁表面和吸附构型一起导入', 'The gas-phase adsorbate reference must be imported together with a clean surface and adsorption configuration');
+    else if (!clean && !molecules && !standalone) issue = tr("runtime.project.importmethodgate.text_4c03391b4c", {}, '请修正结果角色后再导入', 'Correct the result roles before importing');
     return { ok: !issue, issue, selected, clean, configs, gas, molecules, standalone };
   }
 
@@ -512,23 +546,23 @@
     if (!box || !attention) return;
     const n = importCounts();
     box.innerHTML = [
-      ['total', n.total, '扫描到的计算目录'],
-      ['ready', n.ready, '可直接导入'],
-      ['created', n.created, '四件套待提交'],
-      ['review', n.review, '需你确认'],
-      ['blocked', n.blocked, '暂不可导入'],
+      ['total', n.total, tr("runtime.project.renderimportsummary.text_502d09fbf8", {}, '扫描到的计算目录', 'Calculation directories scanned')],
+      ['ready', n.ready, tr("runtime.project.renderimportsummary.text_ca8cae839d", {}, '可直接导入', 'Ready to import')],
+      ['created', n.created, tr("runtime.project.renderimportsummary.text_5cb25b54c0", {}, '四件套待提交', 'Four-file input sets awaiting submission')],
+      ['review', n.review, tr("runtime.project.renderimportsummary.text_157de8355b", {}, '需你确认', 'Needs your confirmation')],
+      ['blocked', n.blocked, tr("runtime.project.renderimportsummary.text_b7f4ee0577", {}, '暂不可导入', 'Cannot be imported yet')],
     ].map(x => `<div class="pj-import-stat ${x[0]}"><b>${x[1]}</b><span>${x[2]}</span></div>`).join('');
     const gate = importMethodGate();
     const pending = n.review + n.blocked;
     attention.classList.toggle('warn', pending > 0 || !gate.ok);
     if (pending) {
-      attention.textContent = `软件已先选中 ${n.ready - n.created} 个可靠结果` +
-        (n.created ? `和 ${n.created} 个待提交四件套` : '') +
-        '。请处理黄色/红色条目；点击每行“查看证据”可看到无法导入的具体原因。';
+      attention.textContent = tr("runtime.project.renderimportsummary.text_6da4b45008", { value1: (n.ready - n.created) }, `软件已先选中 {value1} 个可靠结果`, 'The application preselected {value1} reliable results') +
+        (n.created ? tr("runtime.project.renderimportsummary.text_225b75919b", { value1: (n.created) }, `和 {value1} 个待提交四件套`, ' and {value1} four-file input sets awaiting submission') : '') +
+        tr("runtime.project.renderimportsummary.text_fe8c4a0eba", {}, '。请处理黄色/红色条目；点击每行“查看证据”可看到无法导入的具体原因。', '. Resolve the yellow/red items; select View evidence on a row to see why it cannot be imported.');
     } else if (n.created) {
-      attention.textContent = `其中 ${n.created} 个目录只有完整四件套、尚未计算；会以“待提交”导入，随后前往任务页选择服务器提交，不会冒充已收敛结果。`;
+      attention.textContent = tr("runtime.project.renderimportsummary.text_534f374a94", { value1: (n.created) }, `其中 {value1} 个目录只有完整四件套、尚未计算；会以“待提交”导入，随后前往任务页选择服务器提交，不会冒充已收敛结果。`, '{value1} directories contain complete four-file input sets but have not been calculated. They will be imported as Awaiting submission, then submitted from Jobs after a server is selected; they will not be presented as converged results.');
     } else {
-      attention.textContent = '所有结果均已通过检查。确认清洁表面和吸附构型角色后即可建立项目。';
+      attention.textContent = tr("runtime.project.renderimportsummary.text_8d5b60e5cf", {}, '所有结果均已通过检查。确认清洁表面和吸附构型角色后即可建立项目。', 'All results passed the checks. Confirm the clean-surface and adsorption-configuration roles to create the project.');
     }
   }
 
@@ -549,7 +583,7 @@
   function optionHtml(options, current, labels) {
     const values = Array.from(new Set([current, ...options].filter(Boolean)));
     return values.map(value => `<option value="${VCS.esc(value)}"${value === current ? ' selected' : ''}>` +
-      `${VCS.esc(labels[value] || value)}</option>`).join('');
+      `${VCS.esc(labelFor(labels, value))}</option>`).join('');
   }
 
   function renderImportRows() {
@@ -561,53 +595,67 @@
     visible.forEach(row => {
       const key = `${row.role}:${row.species || '未识别'}`;
       let group = groups.find(item => item.key === key);
-      if (!group) { group = { key, role: row.role, species: row.species || '未识别', rows: [] }; groups.push(group); }
+      if (!group) { group = { key, role: row.role, species: row.species || tr("runtime.project.renderimportrows.text_6ea09ad378", {}, '未识别', 'Unidentified'), rows: [] }; groups.push(group); }
       group.rows.push(row);
     });
     groups.sort((left, right) => left.key.localeCompare(right.key));
     body.innerHTML = groups.map((group, groupIndex) => {
       const pending = group.rows.filter(row => row.mappingRequired && !row.mappingConfirmed);
       const groupHeader = '<tr class="pj-import-group-row"><td colspan="6"><span><b>' +
-        `${VCS.esc(ROLE_LABELS[group.role] || group.role)}</b> / ${VCS.esc(group.species)} · ` +
-        `${group.rows.length} 项</span>` + (pending.length
-          ? `<button class="btn quiet" type="button" data-confirm-import-group="${groupIndex}">确认本组并选中</button>` : '') +
+        `${VCS.esc(labelFor(ROLE_LABELS, group.role))}</b> / ${VCS.esc(group.species)} · ` +
+        tr("runtime.project.renderimportrows.text_2397863033", { value1: (group.rows.length) }, `{value1} 项</span>`, '{value1} items</span>') + (pending.length
+          ? tr("runtime.project.renderimportrows.text_fca3d9d7f8", { value1: (groupIndex) }, `<button class="btn quiet" type="button" data-confirm-import-group="{value1}">确认本组并选中</button>`, '<button class="btn quiet" type="button" data-confirm-import-group="{value1}">Confirm and select this group</button>') : '') +
         '</td></tr>';
       const groupRows = group.rows.map(row => {
       const status = importStatus(row);
       const convergenceStatus = convergenceImportStatus(row);
       const created = isCreatedInput(row);
-      const statusLabel = created ? '四件套完整，待提交'
-        : { ready: '可导入', review: '需确认', blocked: '暂不可导入' }[status];
+      const statusLabel = created ? tr("runtime.project.renderimportrows.text_3ad85eb4bd", {}, '四件套完整，待提交', 'Complete four-file input set; awaiting submission')
+        : { ready: tr("runtime.project.renderimportrows.text_eb9e2c08c7", {}, '可导入', 'Importable'), review: tr("runtime.project.renderimportrows.text_da8ce55c93", {}, '需确认', 'Needs confirmation'), blocked: tr("runtime.project.renderimportrows.text_b7f4ee0577", {}, '暂不可导入', 'Cannot be imported yet') }[status];
       const statusClass = created ? 'run'
         : { ready: 'ok', review: 'warn', blocked: 'fail' }[status];
       const reasons = [...row.blocking, ...row.diagnosis, ...row.warnings, ...row.evidence];
       const mappingPending = row.mappingRequired && !row.mappingConfirmed;
-      const mainReason = (mappingPending ? `智能分组待确认：${row.roleReason || '请核对角色与物种'}` : '') ||
+      const mainReason = (mappingPending ? tr("runtime.project.renderimportrows.text_3639145889", {
+        value1: row.roleReason || tr('runtime.project.renderimportrows.review_role_species', {},
+          '请核对角色与物种', 'Review the role and species'),
+      }, `智能分组待确认：{value1}`, 'Inferred grouping needs confirmation: {value1}') : '') ||
         row.blocking[0] || row.diagnosis[0] || row.warnings[0] ||
-        (created ? '输入文件已通过检查；尚无输出，导入后需要提交计算'
-          : status === 'ready' ? '能量与收敛证据已通过检查' : '尚缺少足够的完成证据');
-      const detail = reasons.length ? '<details><summary>查看证据与完整原因</summary><ul class="pj-import-evidence">' +
+        (created ? tr("runtime.project.renderimportrows.text_e33305863e", {}, '输入文件已通过检查；尚无输出，导入后需要提交计算', 'Input files passed validation; no output exists yet, so the calculation must be submitted after import')
+          : status === 'ready' ? tr("runtime.project.renderimportrows.text_f3c5445ea7", {}, '能量与收敛证据已通过检查', 'Energy and convergence evidence passed validation') : tr("runtime.project.renderimportrows.text_d68c757e2b", {}, '尚缺少足够的完成证据', 'Insufficient completion evidence'));
+      const detail = reasons.length ? tr("runtime.project.renderimportrows.text_cb265b6367", {}, '<details><summary>查看证据与完整原因</summary><ul class="pj-import-evidence">', '<details><summary>View evidence and full reasons</summary><ul class="pj-import-evidence">') +
         reasons.map(item => `<li>${VCS.esc(item)}</li>`).join('') + '</ul></details>' : '';
       const roleOptions = ['clean_slab', 'config', 'gas_ref', 'molecule_ref', 'standalone', 'ignore'];
       const taskOptions = ['unknown', 'relax', 'static', 'freq', 'dos', 'band'];
       const disabled = status === 'blocked' && !row.confirmationEligible ? ' disabled' : '';
+      const speciesPlaceholder = row.role === 'molecule_ref'
+        ? tr('runtime.project.import.species_placeholder_molecule', {},
+          '物种，如 Li2S4', 'Species, e.g. Li2S4')
+        : tr('runtime.project.import.species_placeholder_adsorption', {},
+          '吸附物种，如 Li2S8（使用分子参考时必填）',
+          'Adsorbed species, e.g. Li2S8 (required when using a molecular reference)');
       const speciesInput = ['config', 'molecule_ref'].includes(row.role)
         ? `<input class="ipt pj-import-species" data-act="species" value="${VCS.esc(row.species)}" ` +
-          `placeholder="${row.role === 'molecule_ref' ? '物种，如 Li2S4' : '吸附物种，如 Li2S8（使用分子参考时必填）'}">`
+          `placeholder="${VCS.esc(speciesPlaceholder)}">`
         : '';
+      const mappingState = mappingPending
+        ? tr('runtime.project.import.mapping_pending', {}, '待确认', 'Awaiting confirmation')
+        : tr('runtime.project.import.mapping_confirmed', {}, '已确认', 'Confirmed');
+      const mappingSource = row.speciesSource || row.roleReason || tr(
+        'runtime.project.import.mapping_manual_source', {}, '人工设置', 'Set manually');
       const mappingHint = `<span class="pj-import-mapping ${mappingPending ? 'pending' : 'confirmed'}">` +
-        `${mappingPending ? '待确认' : '已确认'} · ${VCS.esc(row.speciesSource || row.roleReason || '人工设置')}</span>`;
+        `${VCS.esc(mappingState)} · ${VCS.esc(mappingSource)}</span>`;
       const confirmationInput = row.confirmationEligible
         ? `<textarea class="ipt pj-import-confirm-reason" data-act="confirm-reason" rows="2" ` +
-          `placeholder="请填写你核对了哪些输出证据">${VCS.esc(row.confirmationReason)}</textarea>`
+          tr("runtime.project.renderimportrows.text_44d7aa83d4", { value1: (VCS.esc(row.confirmationReason)) }, `placeholder="请填写你核对了哪些输出证据">{value1}</textarea>`, 'placeholder="Describe the output evidence you checked">{value1}</textarea>')
         : '';
-      const manualLabel = created ? '输入检查已通过，不是收敛结果'
-        : convergenceStatus === 'ready' ? '自动检查已通过，无需人工确认'
-        : row.confirmationEligible ? '我已核对并确认收敛' : '存在硬性问题，不能人工跳过';
-      const manualHint = created ? '导入后在任务页选择服务器、核数和墙时再提交'
-        : convergenceStatus === 'ready' ? '可直接导入；提交时仍会复核源文件是否变化'
-        : row.confirmationEligible ? '请保留可审计的核对依据；提交时仍会复核硬性门禁'
-          : '请按左侧原因补齐结果';
+      const manualLabel = created ? tr("runtime.project.renderimportrows.text_719572715d", {}, '输入检查已通过，不是收敛结果', 'Input validation passed; this is not a converged result')
+        : convergenceStatus === 'ready' ? tr("runtime.project.renderimportrows.text_8ed8e28e25", {}, '自动检查已通过，无需人工确认', 'Automatic checks passed; manual confirmation is unnecessary')
+        : row.confirmationEligible ? tr("runtime.project.renderimportrows.text_1ed86bf93a", {}, '我已核对并确认收敛', 'I checked the evidence and confirm convergence') : tr("runtime.project.renderimportrows.text_aa19bd5f9b", {}, '存在硬性问题，不能人工跳过', 'Blocking issues cannot be bypassed manually');
+      const manualHint = created ? tr("runtime.project.renderimportrows.text_29606e476e", {}, '导入后在任务页选择服务器、核数和墙时再提交', 'After import, select a server, core count, and wall time on Jobs, then submit')
+        : convergenceStatus === 'ready' ? tr("runtime.project.renderimportrows.text_403b6b1621", {}, '可直接导入；提交时仍会复核源文件是否变化', 'Ready to import; the source files will be revalidated during submission')
+        : row.confirmationEligible ? tr("runtime.project.renderimportrows.text_689d56f7f8", {}, '请保留可审计的核对依据；提交时仍会复核硬性门禁', 'Keep an auditable verification rationale; blocking gates will be revalidated during submission')
+          : tr("runtime.project.renderimportrows.text_468dfcbb5b", {}, '请按左侧原因补齐结果', 'Resolve the reasons shown on the left');
       return `<tr data-import-index="${row.index}" class="pj-import-${status}">` +
         `<td class="pj-import-check"><input type="checkbox" data-act="select"${row.selected ? ' checked' : ''}${disabled}></td>` +
         `<td class="pj-import-dir"><span class="name" title="${VCS.esc(row.path)}">${VCS.esc(row.name)}</span>` +
@@ -616,7 +664,7 @@
         `<td><select class="ipt" data-act="task">${optionHtml(taskOptions, row.taskType, TASK_LABELS)}</select></td>` +
         `<td class="pj-import-reason"><span class="pill ${statusClass}"><i></i>${statusLabel}</span> ` +
         `<span class="pj-import-mainreason">${VCS.esc(mainReason)}</span>` +
-        (row.action ? `<span class="pj-import-action">下一步：${VCS.esc(row.action)}</span>` : '') + detail + '</td>' +
+        (row.action ? tr("runtime.project.renderimportrows.text_f4e2a52f1d", { value1: (VCS.esc(row.action)) }, `<span class="pj-import-action">下一步：{value1}</span>`, '<span class="pj-import-action">Next: {value1}</span>') : '') + detail + '</td>' +
         `<td class="pj-import-manual"><label><input type="checkbox" data-act="confirm"` +
         `${row.manualConfirm ? ' checked' : ''}${row.confirmationEligible ? '' : ' disabled'}>` +
         `${manualLabel}</label><span class="sub">${manualHint}</span>` +
@@ -671,7 +719,7 @@
       tr.querySelector('[data-act="confirm"]').addEventListener('change', e => {
         row.manualConfirm = row.confirmationEligible && e.target.checked;
         if (row.manualConfirm && !row.confirmationReason.trim()) {
-          row.confirmationReason = DEFAULT_CONFIRMATION_REASON;
+          row.confirmationReason = defaultConfirmationReason();
         }
         if (row.manualConfirm && row.role !== 'ignore') row.selected = true;
         renderImport();
@@ -693,7 +741,7 @@
     const root = val('pj-import-root');
     if (note) {
       note.textContent = gate.ok
-        ? `将导入 ${gate.selected.length} 个结果（清洁表面 ${gate.clean}、吸附构型 ${gate.configs}、分子参考 ${gate.molecules}、独立结果 ${gate.standalone}）`
+        ? tr("runtime.project.updateimportcommit.text_aa3ceaf4b3", { value1: (gate.selected.length), value2: (gate.clean), value3: (gate.configs), value4: (gate.molecules), value5: (gate.standalone) }, `将导入 {value1} 个结果（清洁表面 {value2}、吸附构型 {value3}、分子参考 {value4}、独立结果 {value5}）`, 'Import {value1} results (clean surfaces {value2}, adsorption configurations {value3}, molecular references {value4}, standalone results {value5})')
         : gate.issue;
     }
     if (button) button.disabled = !gate.ok || !name || !root;
@@ -708,8 +756,8 @@
   async function chooseImportSource() {
     const r = await VCS.call('pick_dir');
     if (r && r.error) {
-      VCS.log('选择结果文件夹失败:' + r.error, 'failc');
-      showImportProblem('没有选中结果文件夹', '重新点击“选择整个文件夹”；应选择包含多个计算子目录的上层文件夹。');
+      VCS.log(tr("runtime.project.chooseimportsource.text_88689b28ee", {}, '选择结果文件夹失败:', 'Failed to select results folder:') + r.error, 'failc');
+      showImportProblem(tr("runtime.project.chooseimportsource.text_715116e131", {}, '没有选中结果文件夹', 'No results folder was selected'), tr("runtime.project.chooseimportsource.text_52c91b302d", {}, '重新点击“选择整个文件夹”；应选择包含多个计算子目录的上层文件夹。', 'Select Choose entire folder again and choose a parent folder that contains multiple calculation subdirectories.'));
       return;
     }
     if (!r || !r.path) return;
@@ -723,25 +771,25 @@
   async function scanImport() {
     const source = val('pj-import-source');
     if (!source) {
-      showImportProblem('尚未选择结果根文件夹', '点击“选择整个文件夹”，选择包含 OUTCAR / OSZICAR 等结果的上层目录。');
-      VCS.toast('请先选择包含计算结果的根文件夹', 'fail');
+      showImportProblem(tr("runtime.project.scanimport.text_70d0a50069", {}, '尚未选择结果根文件夹', 'No results root folder has been selected'), tr("runtime.project.scanimport.text_d8ddead88b", {}, '点击“选择整个文件夹”，选择包含 OUTCAR / OSZICAR 等结果的上层目录。', 'Select Choose entire folder and choose the parent folder containing OUTCAR, OSZICAR, or other result files.'));
+      VCS.toast(tr("runtime.project.scanimport.text_1df4aff6b5", {}, '请先选择包含计算结果的根文件夹', 'Select the root folder containing calculation results first'), 'fail');
       return;
     }
     const button = $('pj-import-scan');
     const review = $('pj-import-review');
     const done = $('pj-import-done');
-    if (button) { button.disabled = true; button.textContent = '正在检查…'; }
+    if (button) { button.disabled = true; button.textContent = tr("runtime.project.scanimport.text_a5b0d8e078", {}, '正在检查…', 'Checking…'); }
     if (done) done.hidden = true;
     setImportStep(2);
-    VCS.log('正在检查本地结果:' + source + '…');
+    VCS.log(tr("runtime.project.scanimport.text_c99805cbc9", {}, '正在检查本地结果:', 'Checking local results:') + source + '…');
     showImportProblem('', '');
     try {
       const r = await VCS.call('proj_import_scan', source);
       if (!r || r.ok === false || r.error) {
-        VCS.log('结果检查失败:' + ((r && r.error) || '未知错误'), 'failc');
-        showImportProblem('结果检查未完成：' + ((r && r.error) || '未知错误'),
-          '确认目录仍可访问，并选择含 OUTCAR、OSZICAR 或 vasprun.xml 的上层文件夹后重新检查。');
-        VCS.toast('没有完成检查，请查看日志中的具体原因', 'fail');
+        VCS.log(tr("runtime.project.scanimport.text_a6d0abed72", {}, '结果检查失败:', 'Result validation failed:') + ((r && r.error) || tr("runtime.project.scanimport.text_bd5e21c357", {}, '未知错误', 'Unknown error')), 'failc');
+        showImportProblem(tr("runtime.project.scanimport.text_0ed65668a2", {}, '结果检查未完成：', 'Result validation did not complete:') + ((r && r.error) || tr("runtime.project.scanimport.text_bd5e21c357", {}, '未知错误', 'Unknown error')),
+          tr("runtime.project.scanimport.text_a62b9f427c", {}, '确认目录仍可访问，并选择含 OUTCAR、OSZICAR 或 vasprun.xml 的上层文件夹后重新检查。', 'Confirm that the directory is still accessible, select a parent folder containing OUTCAR, OSZICAR, or vasprun.xml, and check again.'));
+        VCS.toast(tr("runtime.project.scanimport.text_61981b51f9", {}, '没有完成检查，请查看日志中的具体原因', 'Validation did not complete; see the log for the specific reason'), 'fail');
         setImportStep(1);
         return;
       }
@@ -756,15 +804,15 @@
       // 清洁表面/吸附构型在哪里确认。
       if (!n.review && !n.blocked && $('pj-import-filter')) $('pj-import-filter').value = 'all';
       renderImport();
-      VCS.log(`已检查 ${n.total} 个计算目录：${n.ready} 个可导入，${n.review} 个需确认，${n.blocked} 个暂不可导入`,
+      VCS.log(tr("runtime.project.scanimport.text_da9c2b91be", { value1: (n.total), value2: (n.ready), value3: (n.review), value4: (n.blocked) }, `已检查 {value1} 个计算目录：{value2} 个可导入，{value3} 个需确认，{value4} 个暂不可导入`, 'Checked {value1} calculation directories: {value2} importable, {value3} needing confirmation, and {value4} not yet importable'),
         n.blocked ? 'warnc' : 'okc');
       if (!n.total) {
-        showImportProblem('没有发现可识别的 VASP 结果',
-          '不要只选空的项目目录；请选择包含 OUTCAR、OSZICAR 或 vasprun.xml 的计算目录或其上层文件夹。');
-        VCS.toast('没有发现可识别的 VASP 结果，请确认选择的是上层根文件夹', 'fail');
+        showImportProblem(tr("runtime.project.scanimport.text_2d590676e2", {}, '没有发现可识别的 VASP 结果', 'No recognizable VASP results were found'),
+          tr("runtime.project.scanimport.text_d522a68c65", {}, '不要只选空的项目目录；请选择包含 OUTCAR、OSZICAR 或 vasprun.xml 的计算目录或其上层文件夹。', 'Do not select an empty project directory. Select a calculation directory containing OUTCAR, OSZICAR, or vasprun.xml, or its parent folder.'));
+        VCS.toast(tr("runtime.project.scanimport.text_0eeedf5208", {}, '没有发现可识别的 VASP 结果，请确认选择的是上层根文件夹', 'No recognizable VASP results were found; confirm that you selected the parent root folder'), 'fail');
       }
     } finally {
-      if (button) { button.disabled = false; button.textContent = '重新检查'; }
+      if (button) { button.disabled = false; button.textContent = tr("runtime.project.scanimport.text_20089c4224", {}, '重新检查', 'Check again'); }
     }
   }
 
@@ -789,27 +837,27 @@
     const name = val('pj-import-name');
     if (!gate.ok || !source || !root || !name) { updateImportCommit(); return; }
     const button = $('pj-import-commit');
-    if (button) { button.disabled = true; button.textContent = '正在导入并复核…'; }
-    VCS.log(`正在导入 ${gate.selected.length} 个本地结果并建立项目「${name}」…`);
+    if (button) { button.disabled = true; button.textContent = tr("runtime.project.commitimport.text_d14fcc9562", {}, '正在导入并复核…', 'Importing and revalidating…'); }
+    VCS.log(tr("runtime.project.commitimport.text_9988c46628", { value1: (gate.selected.length), value2: (name) }, `正在导入 {value1} 个本地结果并建立项目「{value2}」…`, 'Importing {value1} local results and creating project “{value2}”…'));
     try {
       const r = await VCS.call('proj_import_commit', source, root, name, importSelections());
       if (!r || r.ok === false || r.error) {
-        VCS.log('导入失败:' + ((r && r.error) || '未知错误'), 'failc');
-        showImportProblem('导入未完成：' + ((r && r.error) || '未知错误'),
-          '按黄色/红色条目的“下一步”修正；若目标项目已存在，请更换项目名或保存位置后重试。');
+        VCS.log(tr("runtime.project.commitimport.text_b79a0db205", {}, '导入失败:', 'Import failed:') + ((r && r.error) || tr("runtime.project.commitimport.text_bd5e21c357", {}, '未知错误', 'Unknown error')), 'failc');
+        showImportProblem(tr("runtime.project.commitimport.text_bc45eb83a8", {}, '导入未完成：', 'Import did not complete:') + ((r && r.error) || tr("runtime.project.commitimport.text_bd5e21c357", {}, '未知错误', 'Unknown error')),
+          tr("runtime.project.commitimport.text_2fb54d1268", {}, '按黄色/红色条目的“下一步”修正；若目标项目已存在，请更换项目名或保存位置后重试。', 'Follow Next on each yellow/red item. If the target project already exists, use a different project name or save location, then try again.'));
         textList(r && (r.errors || r.blocking_reasons)).forEach(x => VCS.log(x, 'warnc'));
-        VCS.toast('导入未完成；扫描后结果可能有变化，请按提示重新检查', 'fail');
+        VCS.toast(tr("runtime.project.commitimport.text_f06f2852dd", {}, '导入未完成；扫描后结果可能有变化，请按提示重新检查', 'Import did not complete; results may have changed since scanning, so check again as instructed'), 'fail');
         return;
       }
       textList(r.warnings).forEach(x => VCS.log(x, 'warnc'));
       showImportProblem('', '');
-      VCS.log('本地结果已建立吸附能项目:' + (r.project_path || name), 'okc');
+      VCS.log(tr("runtime.project.commitimport.text_54912ff73c", {}, '本地结果已建立吸附能项目:', 'Local results created an adsorption-energy project:') + (r.project_path || name), 'okc');
       if (r.auto_report && r.auto_report.ok) {
         const files = (r.auto_report.files || [r.auto_report.file]).filter(Boolean);
-        VCS.log((r.auto_report_reason ? '诊断报告' : '最终报告') +
-          '已自动生成:' + files.join('；'), r.auto_report_reason ? 'warnc' : 'okc');
+        VCS.log((r.auto_report_reason ? tr("runtime.project.commitimport.text_7dd8c823cf", {}, '诊断报告', 'Diagnostic report') : tr("runtime.project.commitimport.text_2c48c34392", {}, '最终报告', 'Final report')) +
+          tr("runtime.project.commitimport.text_20271719ff", {}, '已自动生成:', 'Generated automatically:') + files.join('；'), r.auto_report_reason ? 'warnc' : 'okc');
       } else if (r.auto_report && r.auto_report.error) {
-        VCS.log('项目已导入，但自动报告暂未生成:' + r.auto_report.error, 'warnc');
+        VCS.log(tr("runtime.project.commitimport.text_7ca522b3d8", {}, '项目已导入，但自动报告暂未生成:', 'The project was imported, but the automatic report has not been generated yet:') + r.auto_report.error, 'warnc');
       }
       if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
       await reloadProjects();
@@ -846,26 +894,26 @@
           typeof VCS.pipeline.reconfigure === 'function') {
         await VCS.pipeline.reconfigure();
       }
-      VCS.toast(createdCount ? `已导入；${createdCount} 个四件套作业等待提交`
-        : referenceOnly ? 'Li-S 参考能库已建立，可以开始新的吸附计算'
-        : reportReady ? '结果与 ΔE 已载入，报告将自动生成'
-          : '结果已导入；将生成诊断报告并列出缺项');
+      VCS.toast(createdCount ? tr("runtime.project.commitimport.text_2b2c2ce317", { value1: (createdCount) }, `已导入；{value1} 个四件套作业等待提交`, 'Imported; {value1} four-file input-set jobs are awaiting submission')
+        : referenceOnly ? tr("runtime.project.commitimport.text_a27eb0bb92", {}, 'Li-S 参考能库已建立，可以开始新的吸附计算', 'The Li-S reference-energy library is ready; you can start a new adsorption calculation')
+        : reportReady ? tr("runtime.project.commitimport.text_4bf2b58f2f", {}, '结果与 ΔE 已载入，报告将自动生成', 'Results and ΔE have been loaded; the report will be generated automatically')
+          : tr("runtime.project.commitimport.text_ec0fd5f48a", {}, '结果已导入；将生成诊断报告并列出缺项', 'Results imported; a diagnostic report will list the missing items'));
       if (typeof VCS.nextStep === 'function') {
         VCS.nextStep({
-          title: '结果导入完成',
-          message: `已导入 ${gate.selected.length} 个条目并建立项目「${r.project_name || name}」。`,
+          title: tr("runtime.project.commitimport.text_fc6573fc58", {}, '结果导入完成', 'Result import complete'),
+          message: tr("runtime.project.commitimport.text_6bb19d80e7", { value1: (gate.selected.length), value2: (r.project_name || name) }, `已导入 {value1} 个条目并建立项目「{value2}」。`, 'Imported {value1} entries and created project “{value2}”.'),
           detail: createdCount
-            ? `其中 ${createdCount} 个只有完整四件套、尚未运行。下一步到任务页选择服务器、核数和墙时后提交。`
+            ? tr("runtime.project.commitimport.text_ebac0f1205", { value1: (createdCount) }, `其中 {value1} 个只有完整四件套、尚未运行。下一步到任务页选择服务器、核数和墙时后提交。`, '{value1} entries contain complete four-file input sets but have not run. Next, select a server, core count, and wall time on Jobs, then submit them.')
             : referenceOnly
-            ? '这些已收敛的 Li-S 能量已加入参考库。下一步只需选择固定 INCAR、clean slab 和 adsorption 结构。'
+            ? tr("runtime.project.commitimport.text_67dbb52494", {}, '这些已收敛的 Li-S 能量已加入参考库。下一步只需选择固定 INCAR、clean slab 和 adsorption 结构。', 'These converged Li-S energies were added to the reference library. Next, select a fixed INCAR, clean slab, and adsorption structures.')
             : reportReady
-            ? 'ΔE 已自动计算并显示在本页；最终报告将自动生成，也可立即打开报告入口。'
-            : 'ΔE 表已自动刷新；系统将生成诊断报告并列出缺角色、缺能量或待确认结果。',
-          primaryLabel: createdCount ? `提交 ${createdCount} 个待运行作业`
-            : referenceOnly ? '用这些参考能开始吸附计算'
-            : reportReady ? '查看或立即生成报告' : '查看 ΔE 缺项',
-          stayLabel: createdCount ? '先检查待提交成员'
-            : referenceOnly ? '先检查参考能清单' : '先检查导入清单',
+            ? tr("runtime.project.commitimport.text_d09ad2cc9a", {}, 'ΔE 已自动计算并显示在本页；最终报告将自动生成，也可立即打开报告入口。', 'ΔE was calculated automatically and is shown on this page. The final report will be generated automatically, and you can open the report entry now.')
+            : tr("runtime.project.commitimport.text_b4e2289f9f", {}, 'ΔE 表已自动刷新；系统将生成诊断报告并列出缺角色、缺能量或待确认结果。', 'The ΔE table was refreshed automatically. A diagnostic report will list missing roles, missing energies, and results awaiting confirmation.'),
+          primaryLabel: createdCount ? tr("runtime.project.commitimport.text_4fb032f671", { value1: (createdCount) }, `提交 {value1} 个待运行作业`, 'Submit {value1} jobs awaiting execution')
+            : referenceOnly ? tr("runtime.project.commitimport.text_3f87e40b80", {}, '用这些参考能开始吸附计算', 'Start an adsorption calculation with these reference energies')
+            : reportReady ? tr("runtime.project.commitimport.text_0fc5feb884", {}, '查看或立即生成报告', 'View or generate the report now') : tr("runtime.project.commitimport.text_328e3082d0", {}, '查看 ΔE 缺项', 'View missing ΔE items'),
+          stayLabel: createdCount ? tr("runtime.project.commitimport.text_ac1637dfd4", {}, '先检查待提交成员', 'Inspect members awaiting submission first')
+            : referenceOnly ? tr("runtime.project.commitimport.text_18f5b251ea", {}, '先检查参考能清单', 'Inspect the reference-energy list first') : tr("runtime.project.commitimport.text_56344b9d82", {}, '先检查导入清单', 'Inspect the import list first'),
           onPrimary: createdCount ? openCreatedJobs
             : referenceOnly ? startWithReferences : reportReady ? report : () => {
             const table = $('pj-table');
@@ -876,7 +924,7 @@
         });
       }
     } finally {
-      if (button) { button.textContent = '导入所选结果并建立项目'; updateImportCommit(); }
+      if (button) { button.textContent = tr("runtime.project.commitimport.text_46487dd941", {}, '导入所选结果并建立项目', 'Import selected results and create project'); updateImportCommit(); }
     }
   }
 
@@ -885,7 +933,7 @@
     if (!out.ok) return;
     if (window.Jobs && typeof window.Jobs.selectCreatedProject === 'function') {
       const selected = await window.Jobs.selectCreatedProject(projectPath);
-      if (!selected) VCS.toast('未找到待提交成员，请在任务页清除筛选后检查', 'fail');
+      if (!selected) VCS.toast(tr("runtime.project.openimportedcreatedjobs.text_9a2318a251", {}, '未找到待提交成员，请在任务页清除筛选后检查', 'No members awaiting submission were found; clear the filters on Jobs and check again'), 'fail');
     }
   }
 
@@ -894,16 +942,33 @@
     const box = $('pj-import-done');
     if (!box) return;
     box.hidden = false;
-    box.innerHTML = `<b>导入完成：</b>${VCS.esc(result.project_name || val('pj-import-name'))}，` +
-      `共 ${count} 个条目。${createdCount ? `${createdCount} 个四件套作业等待提交。` : referenceOnly ? 'Li-S 参考能库已就绪。' : reportReady
-        ? 'ΔE 已显示在下方，最终报告将自动生成。' : '将自动生成诊断报告并列出下方 ΔE 缺项。'}` +
+    box.innerHTML = tr("runtime.project.showimportdone.text_b7d65b63a3", { value1: (VCS.esc(result.project_name || val('pj-import-name'))) }, `<b>导入完成：</b>{value1}，`, '<b>Import complete:</b> {value1}, ') +
+      tr("runtime.project.showimportdone.text_1655f5a868", {
+        value1: count,
+        value2: createdCount ? tr('runtime.project.showimportdone.created_pending', {
+          count: createdCount,
+        }, '{count} 个四件套作业等待提交。',
+        '{count} four-file input-set jobs are awaiting submission.')
+          : referenceOnly ? tr('runtime.project.showimportdone.references_ready', {},
+            'Li-S 参考能库已就绪。', 'The Li-S reference-energy library is ready.')
+            : reportReady ? tr('runtime.project.showimportdone.delta_ready', {},
+              'ΔE 已显示在下方，最终报告将自动生成。',
+              'ΔE is shown below; the final report will be generated automatically.')
+              : tr('runtime.project.showimportdone.diagnostic_pending', {},
+                '将自动生成诊断报告并列出下方 ΔE 缺项。',
+                'A diagnostic report will be generated automatically and list the missing ΔE items below.'),
+      }, `共 {value1} 个条目。{value2}`, '{value1} entries in total. {value2}') +
       '<div class="actions">' + (referenceOnly ? ''
-        : '<button class="btn" type="button" data-next="delta">重新计算 ΔE</button>') +
-      (createdCount ? `<button class="btn primary" type="button" data-next="submit-created">提交 ${createdCount} 个待运行作业</button>` : '') +
+        : tr("runtime.project.showimportdone.text_fee5e6543c", {}, '<button class="btn" type="button" data-next="delta">重新计算 ΔE</button>', '<button class="btn" type="button" data-next="delta">Recalculate ΔE</button>')) +
+      (createdCount ? tr("runtime.project.showimportdone.text_f662cf0125", { value1: (createdCount) }, `<button class="btn primary" type="button" data-next="submit-created">提交 {value1} 个待运行作业</button>`, '<button class="btn primary" type="button" data-next="submit-created">Submit {value1} jobs awaiting execution</button>') : '') +
       (hasSpeciesReferences
-        ? '<button class="btn primary" type="button" data-next="lis">用这些参考能开始吸附计算</button>' : '') +
-      (referenceOnly ? '' : `<button class="btn primary" type="button" data-next="report"${reportReady ? '' : ' disabled ' +
-        'title="ΔE 或收敛状态仍有缺项，暂不生成最终报告"'}>查看或立即生成报告</button>`) + '</div>';
+        ? tr("runtime.project.showimportdone.text_76283c0e5f", {}, '<button class="btn primary" type="button" data-next="lis">用这些参考能开始吸附计算</button>', '<button class="btn primary" type="button" data-next="lis">Start an adsorption calculation with these reference energies</button>') : '') +
+      (referenceOnly ? '' : tr("runtime.project.showimportdone.text_ca078ec46f", {
+        value1: reportReady ? '' : ' disabled title="' + tr(
+          'runtime.project.showimportdone.report_blocked_title', {},
+          'ΔE 或收敛状态仍有缺项，暂不生成最终报告',
+          'ΔE or convergence evidence is incomplete; the final report cannot be generated yet') + '"',
+      }, `<button class="btn primary" type="button" data-next="report"{value1}>查看或立即生成报告</button>`, '<button class="btn primary" type="button" data-next="report"{value1}>View or generate the report now</button>')) + '</div>';
     const deltaButton = box.querySelector('[data-next="delta"]');
     if (deltaButton) deltaButton.addEventListener('click', delta);
     const submitCreated = box.querySelector('[data-next="submit-created"]');
@@ -927,9 +992,9 @@
 
   function applyImportTask() {
     const task = val('pj-import-batch-task');
-    if (!task) { VCS.toast('请先选择要设置的任务类型', 'fail'); return; }
+    if (!task) { VCS.toast(tr("runtime.project.applyimporttask.text_2cc51c3cc1", {}, '请先选择要设置的任务类型', 'Select the task type to assign first'), 'fail'); return; }
     const rows = selectedImportRows();
-    if (!rows.length) { VCS.toast('请先勾选要修改的结果', 'fail'); return; }
+    if (!rows.length) { VCS.toast(tr("runtime.project.applyimporttask.text_58e4cc61ce", {}, '请先勾选要修改的结果', 'Select the results to modify first'), 'fail'); return; }
     rows.forEach(row => { row.taskType = task; });
     renderImport();
   }
@@ -937,15 +1002,21 @@
   function confirmSelectedImports() {
     const selected = selectedImportRows();
     const eligible = selected.filter(row => row.confirmationEligible);
-    if (!selected.length) { VCS.toast('请先勾选要确认的结果', 'fail'); return; }
+    if (!selected.length) { VCS.toast(tr("runtime.project.confirmselectedimports.text_61252d3918", {}, '请先勾选要确认的结果', 'Select the results to confirm first'), 'fail'); return; }
     if (!eligible.length) {
-      VCS.toast('所选结果没有可人工确认项；请按行内原因补齐文件或重新计算', 'fail');
+      VCS.toast(tr("runtime.project.confirmselectedimports.text_94ddcbc145", {}, '所选结果没有可人工确认项；请按行内原因补齐文件或重新计算', 'The selected results have no manually confirmable items. Add the missing files or recalculate as instructed on each row.'), 'fail');
       return;
     }
     eligible.forEach(row => { row.manualConfirm = true; });
     renderImport();
     const refused = selected.length - eligible.length;
-    VCS.toast(`已标记 ${eligible.length} 项；${refused ? `${refused} 项硬性问题未被跳过` : '提交时仍会重新复核'}`);
+    VCS.toast(tr("runtime.project.confirmselectedimports.text_eff62a2aa4", {
+      value1: eligible.length,
+      value2: refused ? tr('runtime.project.confirmselectedimports.refused', { count: refused },
+        '{count} 项硬性问题未被跳过', '{count} blocking issues were not bypassed')
+        : tr('runtime.project.confirmselectedimports.revalidate', {},
+          '提交时仍会重新复核', 'The evidence will be revalidated during submission'),
+    }, `已标记 {value1} 项；{value2}`, 'Marked {value1} items; {value2}'));
   }
 
   async function openImport(sourceRoot) {
@@ -976,13 +1047,13 @@
   // ── 新建项目:文件/目录选择 ────────────────────────────────────────────────
   async function pickInto(id, kind) {
     const r = await VCS.call('pick_file', kind);
-    if (r && r.error) { VCS.log('选择文件失败:' + r.error, 'failc'); return ''; }
+    if (r && r.error) { VCS.log(tr("runtime.project.pickinto.text_1e0a7f688a", {}, '选择文件失败:', 'Failed to select file:') + r.error, 'failc'); return ''; }
     if (r && r.path) { setVal(id, r.path); return r.path; }
     return '';
   }
   async function pickDirInto(id) {
     const r = await VCS.call('pick_dir');
-    if (r && r.error) { VCS.log('选择目录失败:' + r.error, 'failc'); return; }
+    if (r && r.error) { VCS.log(tr("runtime.project.pickdirinto.text_d802c7d8d3", {}, '选择目录失败:', 'Failed to select directory:') + r.error, 'failc'); return; }
     if (r && r.path) setVal(id, r.path);
   }
 
@@ -1037,7 +1108,7 @@
       value: fallback, source: fallback ? 'backend_suggestion' : 'unresolved',
       ambiguous: matches.length > 1,
       warnings: matches.length > 1
-        ? [`文件夹名同时匹配 ${matches.join('、')}，没有自动选择`] : [],
+        ? [tr("runtime.project.guessspeciesevidence.text_2d65f863ba", { value1: (matches.join('、')) }, `文件夹名同时匹配 {value1}，没有自动选择`, 'The folder name matches {value1}; no value was selected automatically')] : [],
     };
   }
 
@@ -1107,9 +1178,13 @@
     if (!value || typeof value !== 'object') return String(value || '');
     const target = [value.member, value.key].filter(Boolean).join(' / ');
     const change = value.old != null || value.new != null
-      ? `${value.old == null ? '缺失' : value.old} → ${value.new == null ? '已补齐' : value.new}` : '';
-    const reason = textList(value.reason || value.message || value.description).join('；');
-    return [target, change, reason].filter(Boolean).join('：');
+      ? `${value.old == null ? tr('runtime.project.method.missing_value', {}, '缺失', 'Missing') : value.old} → ` +
+        `${value.new == null ? tr('runtime.project.method.filled_value', {}, '已补齐', 'Filled in') : value.new}`
+      : '';
+    const english = !!(VCS.i18n && VCS.i18n.lang === 'en');
+    const reason = textList(value.reason || value.message || value.description)
+      .join(english ? '; ' : '；');
+    return [target, change, reason].filter(Boolean).join(english ? ': ' : '：');
   }
 
   function renderMethodCheck(check, legacyNeedsReview) {
@@ -1118,7 +1193,7 @@
     if (!check && legacyNeedsReview) {
       check = {
         execution_status: 'ready', comparability_status: 'unverified',
-        warnings: ['方法可比性证据尚未完整；作业可提交，自动 ΔE 与最终报告暂停'],
+        warnings: [tr("runtime.project.rendermethodcheck.text_0a1cb6e7f0", {}, '方法可比性证据尚未完整；作业可提交，自动 ΔE 与最终报告暂停', 'Method-comparability evidence is incomplete. Jobs may be submitted, but automatic ΔE and the final report are paused.')],
       };
     }
     const fingerprint = lisContentFingerprint();
@@ -1145,30 +1220,30 @@
       comparabilityStatus === 'verified' ? 'ok' : 'analysis');
     const title = $('lis-method-title');
     if (title) title.textContent = executionStatus === 'blocked'
-      ? '输入执行检查未通过'
+      ? tr("runtime.project.rendermethodcheck.text_4dc7ff4adc", {}, '输入执行检查未通过', 'Input execution validation failed')
       : comparabilityStatus === 'incompatible'
-        ? '作业可提交；方法不一致会暂停自动 ΔE 与最终报告'
+        ? tr("runtime.project.rendermethodcheck.text_50e187061a", {}, '作业可提交；方法不一致会暂停自动 ΔE 与最终报告', 'Jobs may be submitted; method differences will pause automatic ΔE and the final report')
         : comparabilityStatus === 'unverified'
-          ? '作业可提交；方法证据待核验'
-          : '作业可提交；方法可比性已核验';
+          ? tr("runtime.project.rendermethodcheck.text_6ffab5355b", {}, '作业可提交；方法证据待核验', 'Jobs may be submitted; method evidence still needs verification')
+          : tr("runtime.project.rendermethodcheck.text_b551fe38ef", {}, '作业可提交；方法可比性已核验', 'Jobs may be submitted; method comparability was verified');
     const outcome = $('lis-method-outcome');
     if (outcome) {
       const submitText = executionStatus === 'blocked'
-        ? '作业生成 / 提交：已阻止'
-        : '作业生成 / 提交：可继续';
+        ? tr("runtime.project.rendermethodcheck.text_39d54c7d0e", {}, '作业生成 / 提交：已阻止', 'Job generation / submission: blocked')
+        : tr("runtime.project.rendermethodcheck.text_9521dcd8c6", {}, '作业生成 / 提交：可继续', 'Job generation / submission: may continue');
       const analysisText = executionStatus === 'blocked'
-        ? '自动 ΔE / 最终报告：尚未运行，请先修正本目录输入'
+        ? tr("runtime.project.rendermethodcheck.text_ca84d77346", {}, '自动 ΔE / 最终报告：尚未运行，请先修正本目录输入', 'Automatic ΔE / final report: not run; correct the input in this directory first')
         : comparabilityStatus === 'verified'
-          ? '自动 ΔE / 最终报告：可继续'
+          ? tr("runtime.project.rendermethodcheck.text_178223f9e3", {}, '自动 ΔE / 最终报告：可继续', 'Automatic ΔE / final report: may continue')
           : comparabilityStatus === 'incompatible'
-            ? '自动 ΔE / 最终报告：已暂停，需重算或修正方法差异'
-            : '自动 ΔE / 最终报告：待补齐证据后继续';
+            ? tr("runtime.project.rendermethodcheck.text_eeed7c7083", {}, '自动 ΔE / 最终报告：已暂停，需重算或修正方法差异', 'Automatic ΔE / final report: paused; recalculate or resolve the method differences')
+            : tr("runtime.project.rendermethodcheck.text_fdfa2159ac", {}, '自动 ΔE / 最终报告：待补齐证据后继续', 'Automatic ΔE / final report: continues after the missing evidence is provided');
       outcome.innerHTML = `<span>${VCS.esc(submitText)}</span><span>${VCS.esc(analysisText)}</span>`;
     }
-    renderMethodSection('lis-method-issues', '影响 ΔE / 报告的问题（不阻止作业提交）', issues);
-    renderMethodSection('lis-method-notes', '体系说明（包括 ISPIN）', notes);
-    renderMethodSection('lis-method-warnings', '需留意', warnings);
-    renderMethodSection('lis-method-repairs', '已在受管副本安全修复（源文件未改）', repairs,
+    renderMethodSection('lis-method-issues', tr("runtime.project.rendermethodcheck.text_f60b1dcbb9", {}, '影响 ΔE / 报告的问题（不阻止作业提交）', 'Issues affecting ΔE / reports (do not block job submission)'), issues);
+    renderMethodSection('lis-method-notes', tr("runtime.project.rendermethodcheck.text_0ff74ab0d7", {}, '体系说明（包括 ISPIN）', 'System notes (including ISPIN)'), notes);
+    renderMethodSection('lis-method-warnings', tr("runtime.project.rendermethodcheck.text_dbec2358a1", {}, '需留意', 'Needs attention'), warnings);
+    renderMethodSection('lis-method-repairs', tr("runtime.project.rendermethodcheck.text_9cc61621ea", {}, '已在受管副本安全修复（源文件未改）', 'Safely repaired in the managed copy (source files unchanged)'), repairs,
       methodRepairText);
     renderRepairPlan(check && check.repair_plan);
     updateLisReadiness();
@@ -1189,27 +1264,31 @@
     const current = State.repairDecision && State.repairDecision.plan_id === plan.plan_id
       ? State.repairDecision.mode : '';
     box.hidden = false;
-    box.innerHTML = '<div class="lis-repair-title"><b>智能修复预览</b>' +
-      '<span>只有低风险项可自动写入受管副本；源目录四件套保持原字节不变。' +
-      (reviewActions.length ? ' MAGMOM、ISPIN 等科学选择只给建议，不自动改。' : '') + '</span></div>' +
-      '<table><thead><tr><th>成员</th><th>参数</th><th>原值</th><th>建议值</th><th>处理</th><th>原因</th></tr></thead><tbody>' +
+    box.innerHTML = tr("runtime.project.renderrepairplan.text_f81016ddfc", {}, '<div class="lis-repair-title"><b>智能修复预览</b>', '<div class="lis-repair-title"><b>Smart-repair preview</b>') +
+      tr("runtime.project.renderrepairplan.text_da9ad50919", {}, '<span>只有低风险项可自动写入受管副本；源目录四件套保持原字节不变。', '<span>Only low-risk items can be written automatically to the managed copy; the source four-file input sets remain byte-for-byte unchanged.') +
+      (reviewActions.length ? tr("runtime.project.renderrepairplan.text_bcd03a1450", {}, ' MAGMOM、ISPIN 等科学选择只给建议，不自动改。', ' Scientific choices such as MAGMOM and ISPIN are recommendations only and will not be changed automatically.') : '') + '</span></div>' +
+      tr("runtime.project.renderrepairplan.text_5ae9b87fe5", {}, '<table><thead><tr><th>成员</th><th>参数</th><th>原值</th><th>建议值</th><th>处理</th><th>原因</th></tr></thead><tbody>', '<table><thead><tr><th>Member</th><th>Parameter</th><th>Original value</th><th>Suggested value</th><th>Action</th><th>Reason</th></tr></thead><tbody>') +
       rows.map(action => `<tr><td>${VCS.esc(action.member || '')}</td>` +
-        `<td>${VCS.esc(action.key || '')}</td><td>${VCS.esc(action.old == null ? '缺失' : action.old)}</td>` +
+        `<td>${VCS.esc(action.key || '')}</td><td>${VCS.esc(action.old == null
+          ? tr('runtime.project.method.missing_value', {}, '缺失', 'Missing') : action.old)}</td>` +
         `<td>${VCS.esc(action.new)}</td><td>${String(action.risk || '').toLowerCase() === 'low'
-          ? '低风险，可修复副本' : '仅建议，不自动'}</td>` +
+          ? tr('runtime.project.repair.low_risk_copy', {},
+            '低风险，可修复副本', 'Low risk; managed copy can be repaired')
+          : tr('runtime.project.repair.recommendation_only', {},
+            '仅建议，不自动', 'Recommendation only; not automatic')}</td>` +
         `<td>${VCS.esc(action.reason || '')}</td></tr>`).join('') +
       '</tbody></table><div class="actions">' +
       (safeActions.length
-        ? `<button class="btn primary" type="button" data-lis-repair="apply"${current === 'apply' ? ' disabled' : ''}>仅修复 ${safeActions.length} 个低风险副本项并继续</button>` +
-          `<button class="btn" type="button" data-lis-repair="keep"${current === 'keep' ? ' disabled' : ''}>保持各目录原样继续</button>`
-        : '<span class="sub">这些是科学设置建议，不会自动修改，也不阻止提交。</span>') +
+        ? tr("runtime.project.renderrepairplan.text_af16ce0ec2", { value1: (current === 'apply' ? ' disabled' : ''), value2: (safeActions.length) }, `<button class="btn primary" type="button" data-lis-repair="apply"{value1}>仅修复 {value2} 个低风险副本项并继续</button>`, '<button class="btn primary" type="button" data-lis-repair="apply"{value1}>Repair only {value2} low-risk items in managed copies and continue</button>') +
+          tr("runtime.project.renderrepairplan.text_c98f4c2e3b", { value1: (current === 'keep' ? ' disabled' : '') }, `<button class="btn" type="button" data-lis-repair="keep"{value1}>保持各目录原样继续</button>`, '<button class="btn" type="button" data-lis-repair="keep"{value1}>Keep each directory unchanged and continue</button>')
+        : tr("runtime.project.renderrepairplan.text_14ac7e8ca5", {}, '<span class="sub">这些是科学设置建议，不会自动修改，也不阻止提交。</span>', '<span class="sub">These are scientific-setting recommendations. They will not be applied automatically and do not block submission.</span>')) +
       '</div>';
     box.querySelectorAll('[data-lis-repair]').forEach(button => {
       button.addEventListener('click', () => {
         State.repairDecision = { plan_id: plan.plan_id, mode: button.dataset.lisRepair };
         VCS.log(button.dataset.lisRepair === 'apply'
-          ? '已确认：仅低风险项修复到受管项目副本；MAGMOM/ISPIN 只建议，源目录不改'
-          : '已确认：保持每个目录的原始四件套提交；最终 ΔE 仍受方法门禁约束', 'warnc');
+          ? tr("runtime.project.renderrepairplan.text_2152d69e6b", {}, '已确认：仅低风险项修复到受管项目副本；MAGMOM/ISPIN 只建议，源目录不改', 'Confirmed: only low-risk items will be repaired in managed project copies; MAGMOM/ISPIN remain recommendations and source directories are unchanged')
+          : tr("runtime.project.renderrepairplan.text_4547023915", {}, '已确认：保持每个目录的原始四件套提交；最终 ΔE 仍受方法门禁约束', "Confirmed: submit each directory's original four-file input set unchanged; final ΔE remains subject to the method gate"), 'warnc');
         const resume = $(State.repairResume === 'create' ? 'pj-create' : 'pj-submit-all');
         if (resume && !resume.disabled) resume.click();
       });
@@ -1237,8 +1316,8 @@
     State.repairDecision = null;
     const methodBox = $('lis-method-check');
     if (methodBox) methodBox.hidden = true;
-    showLisFailure('输入已改变，不能复用刚才生成的项目',
-      `原项目仍安全保留在 ${prepared.path}。如果要按新输入再生成，请把项目名改成新名称；不要覆盖旧项目。`,
+    showLisFailure(tr("runtime.project.invalidatepreparedlis.text_f41190806b", {}, '输入已改变，不能复用刚才生成的项目', 'The input changed, so the project generated moments ago cannot be reused'),
+      tr("runtime.project.invalidatepreparedlis.text_c25ebd7c98", { value1: (prepared.path) }, `原项目仍安全保留在 {value1}。如果要按新输入再生成，请把项目名改成新名称；不要覆盖旧项目。`, 'The original project remains safely stored at {value1}. To generate again from the new input, use a new project name; do not overwrite the old project.'),
       'prepare');
   }
 
@@ -1268,16 +1347,16 @@
       box.innerHTML = quartetHtml(quartet);
     } else if (local.status === 'ready' && local.path) {
       box.className = 'sub';
-      box.textContent = `将使用同目录 INCAR：${local.path}`;
+      box.textContent = tr("runtime.project.rendercleanincarstatus.text_7ad53e0964", { value1: (local.path) }, `将使用同目录 INCAR：{value1}`, 'Using INCAR from the same directory: {value1}');
     } else if (local.status && local.status !== 'missing') {
       box.className = 'sub';
-      box.textContent = `clean slab INCAR 不可用：${textList(local.issues).join('；') || local.status}`;
+      box.textContent = tr("runtime.project.rendercleanincarstatus.text_b0851d92d7", { value1: (textList(local.issues).join('；') || local.status) }, `clean slab INCAR 不可用：{value1}`, 'The clean-slab INCAR is unavailable: {value1}');
     } else if (val('pj-incar')) {
       box.className = 'sub';
-      box.textContent = `同目录无 INCAR，将使用你显式选择的备用文件：${val('pj-incar')}`;
+      box.textContent = tr("runtime.project.rendercleanincarstatus.text_cedb15d9e2", { value1: (val('pj-incar')) }, `同目录无 INCAR，将使用你显式选择的备用文件：{value1}`, 'No INCAR exists in the same directory; using the fallback you explicitly selected: {value1}');
     } else {
       box.className = 'sub';
-      box.textContent = 'clean slab 同目录尚未找到 INCAR。';
+      box.textContent = tr("runtime.project.rendercleanincarstatus.text_da55322e17", {}, 'clean slab 同目录尚未找到 INCAR。', 'No INCAR has been found in the clean-slab directory yet.');
     }
   }
 
@@ -1323,15 +1402,19 @@
     const blocked = quartetBlocked(raw);
     let summary = '';
     if (blocked) {
-      summary = `四件套不可提交：${quartet.issues.join('；') || '输入文件无效或冲突'}`;
+      summary = tr("runtime.project.quartetpresentation.text_21b470e49f", {
+        value1: quartet.issues.join('; ') || tr(
+          'runtime.project.quartetpresentation.invalid_or_conflicting', {},
+          '输入文件无效或冲突', 'Input files are invalid or conflicting'),
+      }, `四件套不可提交：{value1}`, 'The four-file input set cannot be submitted: {value1}');
     } else if (copyMode) {
-      summary = '完整四件套原样绑定（源文件不改）';
+      summary = tr("runtime.project.quartetpresentation.text_9450d05165", {}, '完整四件套原样绑定（源文件不改）', 'Bind the complete four-file input set unchanged (source files unchanged)');
     } else if (generateMode || quartet.hasEvidence) {
-      const generated = missing.length ? missing.join('、') : '无';
-      summary = `不完整输入（缺 ${generated}）：将以本目录 POSCAR+INCAR 生成受管四件套；源目录不改`;
+      const generated = missing.length ? missing.join('、') : tr("runtime.project.quartetpresentation.text_54e953f1bb", {}, '无', 'None');
+      summary = tr("runtime.project.quartetpresentation.text_edd4d2ee93", { value1: (generated) }, `不完整输入（缺 {value1}）：将以本目录 POSCAR+INCAR 生成受管四件套；源目录不改`, "Incomplete input (missing {value1}): generate a managed four-file input set from this directory's POSCAR+INCAR; source directory unchanged");
     }
     if (!present.includes('INCAR') && fallbackIncar && !blocked) {
-      fileRows.push(`INCAR 备用：${fallbackIncar}`);
+      fileRows.push(tr("runtime.project.quartetpresentation.text_85ba3dc20a", { value1: (fallbackIncar) }, `INCAR 备用：{value1}`, 'Fallback INCAR: {value1}'));
     }
     return { ...quartet, blocked, mode: copyMode ? 'copy' : blocked ? 'blocked' : 'generate',
       summary, details: fileRows };
@@ -1398,13 +1481,13 @@
 
   async function addLisInputDirectory() {
     if (lisInputsLocked()) {
-      VCS.toast('当前输入仍在扫描、生成或提交，请完成后再导入新组', 'fail');
+      VCS.toast(tr("runtime.project.addlisinputdirectory.text_043e0e5aab", {}, '当前输入仍在扫描、生成或提交，请完成后再导入新组', 'The current input is still being scanned, generated, or submitted. Finish that operation before importing a new group.'), 'fail');
       return;
     }
     const picked = await VCS.call('pick_dir');
     if (picked && picked.error) {
-      VCS.log('选择本次计算文件夹失败:' + picked.error, 'failc');
-      showBundleStatus('bad', '没有选中文件夹。请选择包含 clean slab 与 adsorption 各成员输入的上层目录。');
+      VCS.log(tr("runtime.project.addlisinputdirectory.text_9d39c3ca1c", {}, '选择本次计算文件夹失败:', "Failed to select this calculation's folder:") + picked.error, 'failc');
+      showBundleStatus('bad', tr("runtime.project.addlisinputdirectory.text_9cdecab650", {}, '没有选中文件夹。请选择包含 clean slab 与 adsorption 各成员输入的上层目录。', 'No folder was selected. Select the parent folder containing the clean-slab and adsorption-member inputs.'));
       return;
     }
     if (!picked || !picked.path) return;
@@ -1428,16 +1511,16 @@
     syncLisInputLocks();
     updateLisReadiness();
     const button = $('lis-input-dir');
-    if (button) { button.disabled = true; button.textContent = '正在识别整套输入…'; }
-    showBundleStatus('', '正在只读扫描 clean slab、adsorption 结构及各自 POSCAR/INCAR/KPOINTS/POTCAR…');
+    if (button) { button.disabled = true; button.textContent = tr("runtime.project.addlisinputdirectory.text_7abf81f7bf", {}, '正在识别整套输入…', 'Identifying the complete input set…'); }
+    showBundleStatus('', tr("runtime.project.addlisinputdirectory.text_b9abe2844a", {}, '正在只读扫描 clean slab、adsorption 结构及各自 POSCAR/INCAR/KPOINTS/POTCAR…', 'Read-only scan of the clean slab, adsorption structures, and their POSCAR/INCAR/KPOINTS/POTCAR files…'));
     try {
       const result = await VCS.call(
         'proj_scan_lis_inputs', picked.path, selectedReferenceSpecies());
       if (generation !== State.inputGeneration) return;
       if (!result || result.ok === false || result.error) {
-        const message = (result && result.error) || '未知错误';
-        VCS.log('识别本次计算文件夹失败:' + message, 'failc');
-        showBundleStatus('bad', '识别失败：' + message + '。原始文件没有被修改，请修正目录后重试。');
+        const message = (result && result.error) || tr("runtime.project.addlisinputdirectory.text_bd5e21c357", {}, '未知错误', 'Unknown error');
+        VCS.log(tr("runtime.project.addlisinputdirectory.text_bb440f7745", {}, '识别本次计算文件夹失败:', "Failed to identify this calculation's folder:") + message, 'failc');
+        showBundleStatus('bad', tr("runtime.project.addlisinputdirectory.text_7599901047", {}, '识别失败：', 'Identification failed: ') + message + tr("runtime.project.addlisinputdirectory.text_d62e7a9821", {}, '。原始文件没有被修改，请修正目录后重试。', '. Original files were not modified; correct the directory and try again.'));
         return;
       }
       // 顶层 legacy INCAR 只代表用户所选根目录中的显式备用；它只补成员目录
@@ -1487,15 +1570,15 @@
         quartetPresentation(item, rootFallback).mode === 'copy').length;
       const generatedQuartets = quartetMembers.filter(item =>
         quartetPresentation(item, rootFallback).mode === 'generate').length;
-      const summary = `已识别 ${result.clean_slab ? 'clean slab，' : ''}新增 ${added} 个 adsorption 结构，` +
-        `${readyIncars + (State.cleanIncar.status === 'ready' ? 1 : 0)} 个成员已绑定本目录 INCAR。` +
+      const summary = tr("runtime.project.addlisinputdirectory.text_fb7e5272cf", { value1: (result.clean_slab ? 'clean slab，' : ''), value2: (added) }, `已识别 {value1}新增 {value2} 个 adsorption 结构，`, 'Identified {value1}and added {value2} adsorption structures; ') +
+        tr("runtime.project.addlisinputdirectory.text_4aac6169a3", { value1: (readyIncars + (State.cleanIncar.status === 'ready' ? 1 : 0)) }, `{value1} 个成员已绑定本目录 INCAR。`, '{value1} members are bound to INCAR files from their own directories.') +
         (quartetMembers.length
-          ? ` 完整四件套原样绑定 ${copiedQuartets} 组，受管副本智能补齐 ${generatedQuartets} 组。` : '') +
-        (rootFallback ? ` 根目录 INCAR 已作为显式备用：${rootFallback}。` : '');
+          ? tr("runtime.project.addlisinputdirectory.text_9507d5b141", { value1: (copiedQuartets), value2: (generatedQuartets) }, ` 完整四件套原样绑定 {value1} 组，受管副本智能补齐 {value2} 组。`, ' {value1} complete four-file sets were bound unchanged, and {value2} managed copies were completed safely.') : '') +
+        (rootFallback ? tr("runtime.project.addlisinputdirectory.text_e58c6c27a7", { value1: (rootFallback) }, ` 根目录 INCAR 已作为显式备用：{value1}。`, ' The root INCAR is an explicit fallback: {value1}.') : '');
       showBundleStatus(warnings.length ? 'warn' : 'ok', summary +
-        (warnings.length ? ' 还需确认：' + warnings.join('；') : ' 请检查物种映射后继续。'));
+        (warnings.length ? tr("runtime.project.addlisinputdirectory.text_4b17ccf927", {}, ' 还需确认：', ' Still needs confirmation: ') + warnings.join('；') : tr("runtime.project.addlisinputdirectory.text_7f4ec7381e", {}, ' 请检查物种映射后继续。', ' Check the species mapping before continuing.')));
       warnings.forEach(message => VCS.log(message, 'warnc'));
-      VCS.log(`整套输入识别完成：${summary}`, warnings.length ? 'warnc' : 'okc');
+      VCS.log(tr("runtime.project.addlisinputdirectory.text_229debc051", { value1: (summary) }, `整套输入识别完成：{value1}`, 'Complete input-set identification finished: {value1}'), warnings.length ? 'warnc' : 'okc');
     } finally {
       if (generation === State.inputGeneration) {
         State.inputScanBusy = false;
@@ -1503,7 +1586,7 @@
         updateLisReadiness();
         if (button) {
           button.disabled = false;
-          button.textContent = '导入本次计算文件夹（推荐）';
+          button.textContent = tr("runtime.project.addlisinputdirectory.text_f133aeaae8", {}, '导入本次计算文件夹（推荐）', "Import this calculation's folder (recommended)");
         }
       }
     }
@@ -1542,31 +1625,31 @@
       4: !!val('lis-profile') && Number.isInteger(cores) && cores > 0 && validWalltime,
     };
     let issue = '';
-    if (State.inputScanBusy) issue = '第 2 步：正在扫描并核对新输入组，请稍候';
-    else if (!ref) issue = '第 1 步：请选择已经导入的 Li-S 参考能项目';
-    else if (!refs.length) issue = '第 1 步：所选项目没有可用的 Li-S 物种参考能';
-    else if (!val('pj-slab')) issue = '第 2 步：请选择 clean slab POSCAR';
-    else if (cleanQuartetBlocked) issue = '第 2 步：clean slab 的四件套无效或冲突，请按成员明细修正';
+    if (State.inputScanBusy) issue = tr("runtime.project.lisgate.text_754ceeef53", {}, '第 2 步：正在扫描并核对新输入组，请稍候', 'Step 2: scanning and validating the new input group; please wait');
+    else if (!ref) issue = tr("runtime.project.lisgate.text_763ede7826", {}, '第 1 步：请选择已经导入的 Li-S 参考能项目', 'Step 1: select an imported Li-S reference-energy project');
+    else if (!refs.length) issue = tr("runtime.project.lisgate.text_43c7fd4ae8", {}, '第 1 步：所选项目没有可用的 Li-S 物种参考能', 'Step 1: the selected project has no usable Li-S species reference energies');
+    else if (!val('pj-slab')) issue = tr("runtime.project.lisgate.text_8973d81b96", {}, '第 2 步：请选择 clean slab POSCAR', 'Step 2: select a clean-slab POSCAR');
+    else if (cleanQuartetBlocked) issue = tr("runtime.project.lisgate.text_3d8eed6bfe", {}, '第 2 步：clean slab 的四件套无效或冲突，请按成员明细修正', 'Step 2: the clean-slab four-file input set is invalid or conflicting; correct it using the member details');
     else if (!cleanIncarReady) issue = State.cleanIncar.status === 'missing'
-      ? '第 2 步：clean slab 同目录缺少 INCAR；补齐文件或显式选择备用 INCAR'
-      : `第 2 步：clean slab 的 INCAR 不可用（${textList(State.cleanIncar.issues).join('；') || State.cleanIncar.status}）`;
-    else if (!items.length) issue = '第 2 步：至少添加一个 adsorption POSCAR';
+      ? tr("runtime.project.lisgate.text_21372eb8f6", {}, '第 2 步：clean slab 同目录缺少 INCAR；补齐文件或显式选择备用 INCAR', 'Step 2: the clean-slab directory has no INCAR; add the file or explicitly select a fallback INCAR')
+      : tr("runtime.project.lisgate.text_c296d5b6d9", { value1: (textList(State.cleanIncar.issues).join('；') || State.cleanIncar.status) }, `第 2 步：clean slab 的 INCAR 不可用（{value1}）`, 'Step 2: the clean-slab INCAR is unavailable ({value1})');
+    else if (!items.length) issue = tr("runtime.project.lisgate.text_ea884bd5eb", {}, '第 2 步：至少添加一个 adsorption POSCAR', 'Step 2: add at least one adsorption POSCAR');
     else if (invalidIncars.length) issue =
-      `第 2 步：有 ${invalidIncars.length} 个构型的同目录 INCAR 冲突或无效`;
+      tr("runtime.project.lisgate.text_9a62c9ca07", { value1: (invalidIncars.length) }, `第 2 步：有 {value1} 个构型的同目录 INCAR 冲突或无效`, 'Step 2: {value1} configurations have conflicting or invalid INCAR files in their own directories');
     else if (missingIncars.length) issue =
-      `第 2 步：有 ${missingIncars.length} 个构型缺少同目录 INCAR；补齐文件或显式选择备用 INCAR`;
+      tr("runtime.project.lisgate.text_b9d6b13b9b", { value1: (missingIncars.length) }, `第 2 步：有 {value1} 个构型缺少同目录 INCAR；补齐文件或显式选择备用 INCAR`, 'Step 2: {value1} configurations are missing an INCAR in their own directory; add the file or explicitly select a fallback INCAR');
     else if (blockedQuartets.length) issue =
-      `第 2 步：有 ${blockedQuartets.length} 个构型的四件套无效或冲突`;
-    else if (invalidSpecies.length) issue = `第 2 步：有 ${invalidSpecies.length} 个构型的物种不在参考能集合中`;
+      tr("runtime.project.lisgate.text_6be901a714", { value1: (blockedQuartets.length) }, `第 2 步：有 {value1} 个构型的四件套无效或冲突`, 'Step 2: {value1} configurations have invalid or conflicting four-file input sets');
+    else if (invalidSpecies.length) issue = tr("runtime.project.lisgate.text_2e79018c32", { value1: (invalidSpecies.length) }, `第 2 步：有 {value1} 个构型的物种不在参考能集合中`, 'Step 2: the species for {value1} configurations are not in the reference-energy set');
     else if (unconfirmedSpecies.length) issue =
-      `第 2 步：请确认 ${unconfirmedSpecies.length} 个构型的智能物种分组`;
-    else if (!val('pj-name')) issue = '第 3 步：填写项目名';
-    else if (!val('pj-root')) issue = '第 3 步：选择输出根目录';
-    else if (nameConflict) issue = `第 3 步：旧项目“${State.preparedConflictHint.oldName}”已存在；请改用新项目名`;
-    else if (!val('lis-profile')) issue = '第 4 步：选择用于提交的服务器';
-    else if (!Number.isInteger(cores) || cores < 1) issue = '第 4 步：核数必须是正整数';
-    else if (!validWalltime) issue = '第 4 步：墙时请填写为 HH:MM:SS（例如 24:00:00）';
-    else if (methodBlocked) issue = '输入执行检查已阻止生成 / 提交；请按方法面板中的输入错误修正';
+      tr("runtime.project.lisgate.text_60f822638a", { value1: (unconfirmedSpecies.length) }, `第 2 步：请确认 {value1} 个构型的智能物种分组`, 'Step 2: confirm the inferred species grouping for {value1} configurations');
+    else if (!val('pj-name')) issue = tr("runtime.project.lisgate.text_d4222e9ef6", {}, '第 3 步：填写项目名', 'Step 3: enter a project name');
+    else if (!val('pj-root')) issue = tr("runtime.project.lisgate.text_9810ca3fe0", {}, '第 3 步：选择输出根目录', 'Step 3: select an output root');
+    else if (nameConflict) issue = tr("runtime.project.lisgate.text_a46e61eebf", { value1: (State.preparedConflictHint.oldName) }, `第 3 步：旧项目“{value1}”已存在；请改用新项目名`, 'Step 3: project “{value1}” already exists; use a new project name');
+    else if (!val('lis-profile')) issue = tr("runtime.project.lisgate.text_1af7c2c238", {}, '第 4 步：选择用于提交的服务器', 'Step 4: select the server used for submission');
+    else if (!Number.isInteger(cores) || cores < 1) issue = tr("runtime.project.lisgate.text_134ac63735", {}, '第 4 步：核数必须是正整数', 'Step 4: the core count must be a positive integer');
+    else if (!validWalltime) issue = tr("runtime.project.lisgate.text_a2f81dc55d", {}, '第 4 步：墙时请填写为 HH:MM:SS（例如 24:00:00）', 'Step 4: enter wall time as HH:MM:SS (for example, 24:00:00)');
+    else if (methodBlocked) issue = tr("runtime.project.lisgate.text_592887ca40", {}, '输入执行检查已阻止生成 / 提交；请按方法面板中的输入错误修正', 'Input execution validation blocked generation / submission; resolve the input errors shown on the method panel');
     const memberIncars = {
       clean_slab: {
         path: State.cleanIncar.path || '', sha256: State.cleanIncar.sha256 || '',
@@ -1601,11 +1684,11 @@
       const prepared = reusablePreparedLis();
       const analysisPaused = ['unverified', 'incompatible'].includes(gate.methodStatus);
       note.textContent = prepared && !prepared.submitted
-        ? `本地项目已经生成。直接重试提交即可，不会重复生成或覆盖：${prepared.path}`
+        ? tr("runtime.project.updatelisreadiness.text_c92c179248", { value1: (prepared.path) }, `本地项目已经生成。直接重试提交即可，不会重复生成或覆盖：{value1}`, 'The local project has already been generated. Retry submission directly; nothing will be regenerated or overwritten: {value1}')
         : gate.ok
           ? analysisPaused
-            ? `作业已就绪，可在 ${val('lis-profile')} 提交；自动 ΔE / 最终报告将暂停，等方法证据修正或补齐后继续。`
-            : `已就绪：将生成 clean slab + ${gate.items.length} 个 adsorption 作业，并在 ${val('lis-profile')} 提交。`
+            ? tr("runtime.project.updatelisreadiness.text_3d79a69bba", { value1: (val('lis-profile')) }, `作业已就绪，可在 {value1} 提交；自动 ΔE / 最终报告将暂停，等方法证据修正或补齐后继续。`, 'Jobs are ready for submission on {value1}. Automatic ΔE and the final report will remain paused until method evidence is corrected or completed.')
+            : tr("runtime.project.updatelisreadiness.text_4a420e5e04", { value1: (gate.items.length), value2: (val('lis-profile')) }, `已就绪：将生成 clean slab + {value1} 个 adsorption 作业，并在 {value2} 提交。`, 'Ready to generate a clean slab plus {value1} adsorption jobs and submit them on {value2}.')
           : gate.issue;
     }
     const button = $('pj-submit-all');
@@ -1615,20 +1698,20 @@
         !!(prepared && prepared.submitted);
       if (!State.lisBusy) {
         button.textContent = prepared && prepared.submitted
-          ? '整组已提交，自动托管运行中'
-          : prepared ? '重试未提交成员（不会重复生成）'
+          ? tr("runtime.project.updatelisreadiness.text_3fe6ea482c", {}, '整组已提交，自动托管运行中', 'The group was submitted; autopilot is running')
+          : prepared ? tr("runtime.project.updatelisreadiness.text_cae1b23b18", {}, '重试未提交成员（不会重复生成）', 'Retry unsubmitted members (do not regenerate)')
             : ['unverified', 'incompatible'].includes(gate.methodStatus)
-              ? '生成并提交整组（ΔE / 报告待核验）'
-              : '生成并提交整组，开启自动续算/下载/报告';
+              ? tr("runtime.project.updatelisreadiness.text_a63336ae96", {}, '生成并提交整组（ΔE / 报告待核验）', 'Generate and submit the group (ΔE / report pending validation)')
+              : tr("runtime.project.updatelisreadiness.text_8869314e61", {}, '生成并提交整组，开启自动续算/下载/报告', 'Generate and submit the group; enable automatic continuation, download, and reporting');
       }
     }
     const status = $('lis-reference-status');
     if (status) {
       status.classList.toggle('ready', !!gate.ref && gate.refs.length > 0);
       status.textContent = gate.ref && gate.refs.length
-        ? `已找到 ${gate.refs.length} 个参考物种：${gate.refs.join('、')}。每个 adsorption 构型必须从中选择。`
-        : gate.ref ? '这个项目没有可用的物种参考能，请先导入已收敛的 Li-S 化合物结果。'
-          : '请选择包含 Li-S 分子参考能的已导入项目。';
+        ? tr("runtime.project.updatelisreadiness.text_bd267c3642", { value1: (gate.refs.length), value2: (gate.refs.join('、')) }, `已找到 {value1} 个参考物种：{value2}。每个 adsorption 构型必须从中选择。`, 'Found {value1} reference species: {value2}. Select one for every adsorption configuration.')
+        : gate.ref ? tr("runtime.project.updatelisreadiness.text_5667fcc4aa", {}, '这个项目没有可用的物种参考能，请先导入已收敛的 Li-S 化合物结果。', 'This project has no usable species reference energies. First import converged Li-S compound results.')
+          : tr("runtime.project.updatelisreadiness.text_62be8c2cc7", {}, '请选择包含 Li-S 分子参考能的已导入项目。', 'Select an imported project containing Li-S molecular reference energies.');
     }
     updateJourney();
   }
@@ -1637,7 +1720,7 @@
     const gate = lisGate();
     const firstIncomplete = [1, 2, 3, 4].find(value => !gate.step[value]) || 4;
     if (step > firstIncomplete) {
-      VCS.toast(`请先完成第 ${firstIncomplete} 步；完成后下一步会自动展开`, 'fail');
+      VCS.toast(tr("runtime.project.openlisstep.text_c4cb9d76b5", { value1: (firstIncomplete) }, `请先完成第 {value1} 步；完成后下一步会自动展开`, 'Complete step {value1} first; the next step will expand automatically'), 'fail');
       updateLisReadiness();
       return;
     }
@@ -1649,11 +1732,18 @@
     if (!sel) return;
     const previous = preferred || sel.value;
     const refs = State.projects.filter(p => referenceSpecies(p).length || Number(p.n_species_refs || 0) > 0);
-    sel.innerHTML = `<option value="">${refs.length ? '请选择 Li-S 参考能项目' : '暂无已导入的 Li-S 参考能项目'}</option>` + refs.map(p => {
+    const emptyLabel = refs.length
+      ? tr('runtime.project.reference.select_prompt', {},
+        '请选择 Li-S 参考能项目', 'Select a Li-S reference-energy project')
+      : tr('runtime.project.reference.none_imported', {},
+        '暂无已导入的 Li-S 参考能项目', 'No imported Li-S reference-energy projects');
+    sel.innerHTML = `<option value="">${VCS.esc(emptyLabel)}</option>` + refs.map(p => {
       const species = referenceSpecies(p);
       const count = species.length || Number(p.n_species_refs || 0);
-      const detail = species.length ? `：${species.join('、')}` : '';
-      return `<option value="${VCS.esc(p.path)}">${VCS.esc(p.name || pathBase(p.path))}（${count} 个物种${VCS.esc(detail)}）</option>`;
+      const english = !!(VCS.i18n && VCS.i18n.lang === 'en');
+      const detail = species.length
+        ? `${english ? ': ' : '：'}${species.join(english ? ', ' : '、')}` : '';
+      return tr("runtime.project.renderreferenceprojects.text_1d981dafe2", { value1: (VCS.esc(p.path)), value2: (VCS.esc(p.name || pathBase(p.path))), value3: (count), value4: (VCS.esc(detail)) }, `<option value="{value1}">{value2}（{value3} 个物种{value4}）</option>`, '<option value="{value1}">{value2} ({value3} species{value4})</option>');
     }).join('');
     const hit = refs.find(p => p.path === previous || p.name === previous) ||
       (!previous && refs.length === 1 ? refs[0] : null);
@@ -1689,7 +1779,7 @@
     if (!select) return;
     const previous = select.value;
     const values = refs || selectedReferenceSpecies();
-    select.innerHTML = '<option value="">选择物种后批量应用…</option>' + values.map(value =>
+    select.innerHTML = tr("runtime.project.updatebulkspeciesoptions.text_ddcde6022e", {}, '<option value="">选择物种后批量应用…</option>', '<option value="">Select a species to apply in bulk…</option>') + values.map(value =>
       `<option value="${VCS.esc(value)}">${VCS.esc(value)}</option>`).join('');
     if (values.includes(previous)) select.value = previous;
   }
@@ -1715,14 +1805,14 @@
     const copiedQuartets = quartetRows.filter(item => item.hasEvidence && item.mode === 'copy').length;
     const generatedQuartets = quartetRows.filter(item => item.hasEvidence && item.mode === 'generate').length;
     if (count) count.textContent = State.configs.length
-      ? `物种已确认 ${matched}/${State.configs.length}，INCAR 已绑定 ${incars}/${State.configs.length}` +
+      ? tr("runtime.project.renderconfigs.text_9b721810b2", { value1: (matched), value2: (State.configs.length), value3: (incars), value4: (State.configs.length) }, `物种已确认 {value1}/{value2}，INCAR 已绑定 {value3}/{value4}`, 'Species confirmed {value1}/{value2}; INCAR bound {value3}/{value4}') +
         (copiedQuartets || generatedQuartets
-          ? `；四件套原样 ${copiedQuartets}，受管副本补齐 ${generatedQuartets}` : '')
-      : '尚未添加构型';
+          ? tr("runtime.project.renderconfigs.text_ca49938584", { value1: (copiedQuartets), value2: (generatedQuartets) }, `；四件套原样 {value1}，受管副本补齐 {value2}`, '; {value1} four-file sets unchanged, {value2} managed copies completed') : '')
+      : tr("runtime.project.renderconfigs.text_37d3aaf153", {}, '尚未添加构型', 'No configurations added yet');
     updateBulkSpeciesOptions(refs);
     if (!box) return;
     if (!State.configs.length) {
-      box.innerHTML = '<div class="pj-cfgempty">尚未添加 adsorption POSCAR；可逐个添加，也可一次扫描整个文件夹。</div>';
+      box.innerHTML = tr("runtime.project.renderconfigs.text_9d36216783", {}, '<div class="pj-cfgempty">尚未添加 adsorption POSCAR；可逐个添加，也可一次扫描整个文件夹。</div>', '<div class="pj-cfgempty">No adsorption POSCAR has been added. Add them individually or scan an entire folder.</div>');
       updateLisReadiness();
       return;
     }
@@ -1731,14 +1821,14 @@
       .filter(item => !onlyUnmatched || !confirmedSpecies(item.path) ||
         !incarReady(item.path) || quartetBlocked(State.configSpeciesMeta[item.path]));
     if (!rows.length) {
-      box.innerHTML = '<div class="pj-cfgempty">所有构型的物种映射都已确认。</div>';
+      box.innerHTML = tr("runtime.project.renderconfigs.text_c11368873c", {}, '<div class="pj-cfgempty">所有构型的物种映射都已确认。</div>', '<div class="pj-cfgempty">Species mappings have been confirmed for every configuration.</div>');
       updateLisReadiness();
       return;
     }
     const groups = [];
     rows.forEach(row => {
       const species = String(State.configSpecies[row.path] || '').trim();
-      const key = species || '未识别';
+      const key = species || tr("runtime.project.renderconfigs.text_6ea09ad378", {}, '未识别', 'Unidentified');
       let group = groups.find(item => item.key.toLowerCase() === key.toLowerCase());
       if (!group) { group = { key, rows: [] }; groups.push(group); }
       group.rows.push(row);
@@ -1749,8 +1839,8 @@
       const canConfirm = group.rows.some(row => validSpecies(row.path) && !confirmedSpecies(row.path));
       const confirmed = group.rows.filter(row => confirmedSpecies(row.path)).length;
       const header = `<div class="lis-species-group"><span><b>${VCS.esc(group.key)}</b> · ` +
-        `${group.rows.length} 个构型 · ${confirmed} 个已确认</span>` +
-        (canConfirm ? `<button class="btn quiet" type="button" data-confirm-group="${groupIndex}">确认本组映射</button>` : '') +
+        tr("runtime.project.renderconfigs.text_80f91df239", { value1: (group.rows.length), value2: (confirmed) }, `{value1} 个构型 · {value2} 个已确认</span>`, '{value1} configurations · {value2} confirmed</span>') +
+        (canConfirm ? tr("runtime.project.renderconfigs.text_c56d3f87a7", { value1: (groupIndex) }, `<button class="btn quiet" type="button" data-confirm-group="{value1}">确认本组映射</button>`, '<button class="btn quiet" type="button" data-confirm-group="{value1}">Confirm this group\'s mappings</button>') : '') +
         '</div>';
       const body = group.rows.map(({ path: p, index: i }) => {
         const species = String(State.configSpecies[p] || '');
@@ -1763,29 +1853,36 @@
         const incarText = incarStatus === 'ready' && meta.incarPath
           ? `INCAR：${meta.incarPath}`
           : incarStatus === 'missing' && val('pj-incar')
-            ? `本目录无 INCAR；将使用显式备用：${val('pj-incar')}`
-            : `INCAR 不可用：${textList(meta.incarIssues).join('；') || '同目录缺失'}`;
+            ? tr("runtime.project.renderconfigs.text_a121aa08d6", { value1: (val('pj-incar')) }, `本目录无 INCAR；将使用显式备用：{value1}`, 'No INCAR in this directory; using the explicit fallback: {value1}')
+            : tr("runtime.project.renderconfigs.text_c329704ebc", {
+              value1: textList(meta.incarIssues).join('; ') || tr(
+                'runtime.project.renderconfigs.missing_same_directory', {},
+                '同目录缺失', 'Missing from the same directory'),
+            }, `INCAR 不可用：{value1}`, 'INCAR unavailable: {value1}');
         const inputEvidence = quartet.hasEvidence
           ? `<div class="lis-quartet ${quartet.blocked ? 'blocked' : quartet.mode}">${quartetHtml(quartet)}</div>`
           : `<span class="sub" title="${VCS.esc(incarText)}">${VCS.esc(incarText)}</span>`;
         const sourceLabel = meta.source === 'poscar_minus_clean_slab' ||
           String(meta.source || '').startsWith('poscar_minus_clean_slab+')
-          ? 'POSCAR−clean slab 组成差'
-          : meta.source === 'user' ? '人工选择' : meta.source === 'path_name' ? '文件夹/文件名建议' : '未识别';
-        const speciesCheck = confirmedRow ? `已确认：${sourceLabel}`
-          : valid ? `自动建议 ${species}，待确认（${sourceLabel}）`
-            : `未匹配参考能；请选择：${refs.join('、') || '先选参考项目'}`;
-        const speciesOptions = '<option value="">请选择对应物种</option>' +
-          (!valid && species ? `<option value="${VCS.esc(species)}" selected>${VCS.esc(species)}（未匹配）</option>` : '') +
+          ? tr("runtime.project.renderconfigs.text_1886efc918", {}, 'POSCAR−clean slab 组成差', 'POSCAR−clean-slab composition difference')
+          : meta.source === 'user' ? tr("runtime.project.renderconfigs.text_f4c944fa98", {}, '人工选择', 'Selected manually') : meta.source === 'path_name' ? tr("runtime.project.renderconfigs.text_f0a01b1c3a", {}, '文件夹/文件名建议', 'Folder/file-name suggestion') : tr("runtime.project.renderconfigs.text_6ea09ad378", {}, '未识别', 'Unidentified');
+        const speciesCheck = confirmedRow ? tr("runtime.project.renderconfigs.text_917c0ed620", { value1: (sourceLabel) }, `已确认：{value1}`, 'Confirmed: {value1}')
+          : valid ? tr("runtime.project.renderconfigs.text_980097fae4", { value1: (species), value2: (sourceLabel) }, `自动建议 {value1}，待确认（{value2}）`, 'Automatic suggestion {value1}, awaiting confirmation ({value2})')
+            : tr("runtime.project.renderconfigs.text_80dbd4bd3b", {
+              value1: refs.join(', ') || tr('runtime.project.renderconfigs.select_reference_first', {},
+                '先选参考项目', 'Select a reference project first'),
+            }, `未匹配参考能；请选择：{value1}`, 'No matching reference energy; select one: {value1}');
+        const speciesOptions = tr("runtime.project.renderconfigs.text_f0b110751e", {}, '<option value="">请选择对应物种</option>', '<option value="">Select the corresponding species</option>') +
+          (!valid && species ? tr("runtime.project.renderconfigs.text_df45dfb36d", { value1: (VCS.esc(species)), value2: (VCS.esc(species)) }, `<option value="{value1}" selected>{value2}（未匹配）</option>`, '<option value="{value1}" selected>{value2} (unmatched)</option>') : '') +
           refs.map(value => `<option value="${VCS.esc(value)}"${value.toLowerCase() === species.trim().toLowerCase() ? ' selected' : ''}>${VCS.esc(value)}</option>`).join('');
         return `<div class="pj-cfgrow lis-cfgrow${quartet.blocked ? ' invalid' :
           confirmedRow && memberIncarReady ? '' : valid && memberIncarReady ? ' pending' : ' invalid'}">` +
           `<div class="lis-cfgpath"><span class="path" title="${VCS.esc(p)}">${VCS.esc(pathBase(p))}</span>` +
           `<span class="sub" title="${VCS.esc(p)}">${VCS.esc(p)}</span>` +
           `${inputEvidence}</div>` +
-          `<label>对应物种<select class="ipt lis-species" data-species-index="${i}">${speciesOptions}</select></label>` +
+          tr("runtime.project.renderconfigs.text_d1d9cb205a", { value1: (i), value2: (speciesOptions) }, `<label>对应物种<select class="ipt lis-species" data-species-index="{value1}">{value2}</select></label>`, '<label>Corresponding species<select class="ipt lis-species" data-species-index="{value1}">{value2}</select></label>') +
           `<span class="lis-species-check">${VCS.esc(speciesCheck)}</span>` +
-          `<button class="btn quiet" type="button" data-rm="${i}">移除</button></div>`;
+          tr("runtime.project.renderconfigs.text_8a4636eecb", { value1: (i) }, `<button class="btn quiet" type="button" data-rm="{value1}">移除</button></div>`, '<button class="btn quiet" type="button" data-rm="{value1}">Remove</button></div>');
       }).join('');
       return header + body;
     }).join('');
@@ -1803,7 +1900,7 @@
         });
         invalidatePreparedLis();
         renderConfigs();
-        VCS.toast(`已确认 ${changed} 个 ${group.key} 构型的物种映射`);
+        VCS.toast(tr("runtime.project.renderconfigs.text_1f8b649a8d", { value1: (changed), value2: (group.key) }, `已确认 {value1} 个 {value2} 构型的物种映射`, 'Confirmed species mappings for {value1} {value2} configurations'));
       });
     });
     box.querySelectorAll('select[data-species-index]').forEach(input => {
@@ -1842,7 +1939,7 @@
     if (lisInputsLocked()) return;
     const species = exactReferenceSpecies(val('lis-bulk-species'));
     if (!species) {
-      VCS.toast('请先从参考物种中选择一个值', 'fail');
+      VCS.toast(tr("runtime.project.applybulkspecies.text_8cc177f7d0", {}, '请先从参考物种中选择一个值', 'Select a value from the reference species first'), 'fail');
       return;
     }
     let changed = 0;
@@ -1858,7 +1955,7 @@
     });
     invalidatePreparedLis();
     renderConfigs();
-    VCS.toast(changed ? `已为 ${changed} 个未确认构型绑定并确认 ${species}` : '所有构型已经确认，无需修改');
+    VCS.toast(changed ? tr("runtime.project.applybulkspecies.text_e3ae8be9cb", { value1: (changed), value2: (species) }, `已为 {value1} 个未确认构型绑定并确认 {value2}`, 'Assigned and confirmed {value2} for {value1} unconfirmed configurations') : tr("runtime.project.applybulkspecies.text_0c5eb165e4", {}, '所有构型已经确认，无需修改', 'Every configuration is already confirmed; no change is needed'));
   }
 
   async function resolveMemberIncar(path) {
@@ -1877,12 +1974,12 @@
     const generation = State.inputGeneration;
     const r = await VCS.call('pick_file', 'poscar');
     if (generation !== State.inputGeneration || lisInputsLocked()) return;
-    if (r && r.error) { VCS.log('选择构型失败:' + r.error, 'failc'); return; }
+    if (r && r.error) { VCS.log(tr("runtime.project.addconfig.text_3df70eb2f3", {}, '选择构型失败:', 'Failed to select configuration:') + r.error, 'failc'); return; }
     if (r && r.path) {
       const incar = await resolveMemberIncar(r.path);
       if (generation !== State.inputGeneration || lisInputsLocked()) return;
       if (!appendConfig(r.path, '', incar)) {
-        VCS.log('该构型已在列表中，已跳过:' + r.path);
+        VCS.log(tr("runtime.project.addconfig.text_07efeaa935", {}, '该构型已在列表中，已跳过:', 'This configuration is already in the list and was skipped:') + r.path);
         return;
       }
       renderConfigs();
@@ -1930,8 +2027,8 @@
     const picked = await VCS.call('pick_dir');
     if (generation !== State.inputGeneration || lisInputsLocked()) return;
     if (picked && picked.error) {
-      VCS.log('选择构型文件夹失败:' + picked.error, 'failc');
-      showConfigScanStatus('bad', '没有选中结构文件夹。请重新选择包含 POSCAR / CONTCAR / .vasp 文件的上层目录。');
+      VCS.log(tr("runtime.project.addconfigdirectory.text_d85d1ab904", {}, '选择构型文件夹失败:', 'Failed to select configuration folder:') + picked.error, 'failc');
+      showConfigScanStatus('bad', tr("runtime.project.addconfigdirectory.text_91cf51500d", {}, '没有选中结构文件夹。请重新选择包含 POSCAR / CONTCAR / .vasp 文件的上层目录。', 'No structure folder was selected. Select the parent folder containing POSCAR, CONTCAR, or .vasp files.'));
       return;
     }
     if (!picked || !picked.path) return;
@@ -1941,17 +2038,17 @@
     State.inputScanBusy = true;
     syncLisInputLocks();
     updateLisReadiness();
-    if (button) { button.disabled = true; button.textContent = '正在扫描结构…'; }
-    showConfigScanStatus('', '正在递归寻找 POSCAR / CONTCAR / .vasp 结构文件…');
-    VCS.log('正在递归扫描 adsorption POSCAR:' + picked.path + '…');
+    if (button) { button.disabled = true; button.textContent = tr("runtime.project.addconfigdirectory.text_4dc57b639d", {}, '正在扫描结构…', 'Scanning structures…'); }
+    showConfigScanStatus('', tr("runtime.project.addconfigdirectory.text_7f9d0900ad", {}, '正在递归寻找 POSCAR / CONTCAR / .vasp 结构文件…', 'Recursively searching for POSCAR, CONTCAR, and .vasp structure files…'));
+    VCS.log(tr("runtime.project.addconfigdirectory.text_e2d132baf6", {}, '正在递归扫描 adsorption POSCAR:', 'Recursively scanning adsorption POSCAR files:') + picked.path + '…');
     try {
       const r = await VCS.call(
         'proj_scan_structures', picked.path, val('pj-slab'), selectedReferenceSpecies());
       if (generation !== State.inputGeneration) return;
       if (!r || r.ok === false || r.error) {
-        VCS.log('扫描结构文件夹失败:' + ((r && r.error) || '未知错误'), 'failc');
-        showConfigScanStatus('bad', '扫描失败：' + ((r && r.error) || '未知错误') +
-          '。请确认目录可访问，并选择包含结构文件的上层目录。');
+        VCS.log(tr("runtime.project.addconfigdirectory.text_156c42206c", {}, '扫描结构文件夹失败:', 'Failed to scan structure folder:') + ((r && r.error) || tr("runtime.project.addconfigdirectory.text_bd5e21c357", {}, '未知错误', 'Unknown error')), 'failc');
+        showConfigScanStatus('bad', tr("runtime.project.addconfigdirectory.text_fb421fc5fd", {}, '扫描失败：', 'Scan failed: ') + ((r && r.error) || tr("runtime.project.addconfigdirectory.text_bd5e21c357", {}, '未知错误', 'Unknown error')) +
+          tr("runtime.project.addconfigdirectory.text_a9ae1d19b0", {}, '。请确认目录可访问，并选择包含结构文件的上层目录。', '. Confirm that the directory is accessible and select the parent folder containing the structure files.'));
         return;
       }
       const raw = r.structures || r.items || r.configs || r.candidates || r.paths || [];
@@ -1966,23 +2063,23 @@
       });
       textList(r.warnings).forEach(x => VCS.log(x, 'warnc'));
       renderConfigs();
-      VCS.log(`结构扫描完成：新增 ${added} 个，重复或无效跳过 ${raw.length - added} 个`, added ? 'okc' : 'warnc');
+      VCS.log(tr("runtime.project.addconfigdirectory.text_adc73ae2a9", { value1: (added), value2: (raw.length - added) }, `结构扫描完成：新增 {value1} 个，重复或无效跳过 {value2} 个`, 'Structure scan complete: added {value1}; skipped {value2} duplicates or invalid files'), added ? 'okc' : 'warnc');
       if (!raw.length) {
-        showConfigScanStatus('bad', '没有找到结构文件。请确认文件名为 POSCAR / CONTCAR，或扩展名为 .vasp / .poscar。');
-        VCS.toast('没有找到 POSCAR / CONTCAR 结构文件', 'fail');
+        showConfigScanStatus('bad', tr("runtime.project.addconfigdirectory.text_f8a77ceb25", {}, '没有找到结构文件。请确认文件名为 POSCAR / CONTCAR，或扩展名为 .vasp / .poscar。', 'No structure files were found. Confirm that files are named POSCAR or CONTCAR, or use the .vasp or .poscar extension.'));
+        VCS.toast(tr("runtime.project.addconfigdirectory.text_f15ed493fa", {}, '没有找到 POSCAR / CONTCAR 结构文件', 'No POSCAR / CONTCAR structure files were found'), 'fail');
       } else {
         const choice = preferred.suppressed
-          ? `；同目录冲突时已优先选择本次输入 POSCAR（跳过 ${preferred.suppressed} 个重复文件）` : '';
+          ? tr("runtime.project.addconfigdirectory.text_bf83944034", { value1: (preferred.suppressed) }, `；同目录冲突时已优先选择本次输入 POSCAR（跳过 {value1} 个重复文件）`, "; when files conflicted in the same directory, this calculation's POSCAR was preferred ({value1} duplicates skipped)") : '';
         const finalNote = preferred.finalStructures
-          ? `；${preferred.finalStructures} 个目录仅能回退使用 CONTCAR，请确认不是旧结果残留` : '';
-        showConfigScanStatus('ok', `已新增 ${added} 个结构${choice}${finalNote}。请逐行确认“对应物种”，红色项必须修正后才能提交。`);
+          ? tr("runtime.project.addconfigdirectory.text_5da426fe93", { value1: (preferred.finalStructures) }, `；{value1} 个目录仅能回退使用 CONTCAR，请确认不是旧结果残留`, '; {value1} directories could only fall back to CONTCAR; confirm that these are not stale results') : '';
+        showConfigScanStatus('ok', tr("runtime.project.addconfigdirectory.text_aca817a143", { value1: (added), value2: (choice), value3: (finalNote) }, `已新增 {value1} 个结构{value2}{value3}。请逐行确认“对应物种”，红色项必须修正后才能提交。`, 'Added {value1} structures{value2}{value3}. Confirm Corresponding species on every row; red items must be resolved before submission.'));
       }
     } finally {
       if (generation === State.inputGeneration) {
         State.inputScanBusy = false;
         syncLisInputLocks();
         updateLisReadiness();
-        if (button) { button.disabled = false; button.textContent = '导入整个结构文件夹'; }
+        if (button) { button.disabled = false; button.textContent = tr("runtime.project.addconfigdirectory.text_8b3e2e34d1", {}, '导入整个结构文件夹', 'Import entire structure folder'); }
       }
     }
   }
@@ -1992,12 +2089,12 @@
     if (!box) return;
     const profile = State.profiles.find(item => item.name === val('lis-profile'));
     if (!profile) {
-      box.textContent = '选择服务器后会自动带入该服务器的默认核数与墙时；本项目只绑定所选服务器。';
+      box.textContent = tr("runtime.project.updatelisresourcesummary.text_7aabe9e704", {}, '选择服务器后会自动带入该服务器的默认核数与墙时；本项目只绑定所选服务器。', 'Selecting a server fills in its default core count and wall time. This project is bound only to the selected server.');
       return;
     }
-    const queue = profile.queue ? `，队列 ${profile.queue}` : '';
-    box.textContent = `本项目将提交到 ${profile.name}${queue}：每个作业 ${val('lis-cores') || '—'} 核，` +
-      `墙时 ${val('lis-walltime') || '—'}。其他项目可同时选择别的服务器，软件会并行监控。`;
+    const queue = profile.queue ? tr("runtime.project.updatelisresourcesummary.text_8bf8e66261", { value1: (profile.queue) }, `，队列 {value1}`, ', queue {value1}') : '';
+    box.textContent = tr("runtime.project.updatelisresourcesummary.text_f236905f5a", { value1: (profile.name), value2: (queue), value3: (val('lis-cores') || '—') }, `本项目将提交到 {value1}{value2}：每个作业 {value3} 核，`, 'This project will be submitted to {value1}{value2}: {value3} cores per job, ') +
+      tr("runtime.project.updatelisresourcesummary.text_cd44da726b", { value1: (val('lis-walltime') || '—') }, `墙时 {value1}。其他项目可同时选择别的服务器，软件会并行监控。`, 'wall time {value1}. Other projects may use different servers; the application monitors them in parallel.');
   }
 
   function applyLisProfileDefaults() {
@@ -2014,12 +2111,12 @@
     if (!sel) return;
     const r = await VCS.call('list_profiles');
     State.profiles = (r && r.profiles) || [];
-    if (r && r.error) VCS.log('读取服务器列表失败:' + r.error, 'failc');
+    if (r && r.error) VCS.log(tr("runtime.project.loadlisprofiles.text_6bebecf3b2", {}, '读取服务器列表失败:', 'Failed to load the server list:') + r.error, 'failc');
     const previous = sel.value;
     let saved = '';
     try { saved = localStorage.getItem('vcs.jobs.profile') || ''; } catch (e) { /* 不阻塞 */ }
     if (!State.profiles.length) {
-      sel.innerHTML = '<option value="">尚未配置服务器</option>';
+      sel.innerHTML = tr("runtime.project.loadlisprofiles.text_dcb559991e", {}, '<option value="">尚未配置服务器</option>', '<option value="">No server configured</option>');
       updateLisReadiness();
       return;
     }
@@ -2046,13 +2143,13 @@
       if (r.needs_trust) {
         const pin = await VCS.confirmHostKey(r);
         if (!pin) return { ok: false, results: r.results || [], skipped: r.skipped || [],
-          error: '服务器主机指纹未通过核对。请到“集群”页测试连接后再重试。' };
+          error: tr("runtime.project.submitlisproject.text_02633fe5d6", {}, '服务器主机指纹未通过核对。请到“集群”页测试连接后再重试。', 'The server host fingerprint was not verified. Test the connection on Clusters before trying again.') };
         trust = pin;
         continue;
       }
       return r;
     }
-    return { ok: false, error: '密码或主机信任重试次数过多，请检查服务器配置' };
+    return { ok: false, error: tr("runtime.project.submitlisproject.text_7aed13d7ed", {}, '密码或主机信任重试次数过多，请检查服务器配置', 'Too many password or host-trust retries; check the server configuration') };
   }
 
   function projectPathFrom(result) {
@@ -2064,24 +2161,24 @@
     const raw = result && (result.results || result.submissions || result.jobs || result.items) || [];
     const rows = raw.map((item, index) => {
       if (Array.isArray(item)) {
-        return { name: pathBase(item[0] || `作业 ${index + 1}`), ok: item.length > 2 ? !!item[1] : true,
+        return { name: pathBase(item[0] || tr("runtime.project.submissionrows.text_ca271f224f", { value1: (index + 1) }, `作业 {value1}`, 'Job {value1}')), ok: item.length > 2 ? !!item[1] : true,
           message: item.length > 2 ? item[2] : item[1] };
       }
       const row = item || {};
       const state = String(row.state || row.status || '').toUpperCase();
       return {
-        name: row.name || pathBase(row.dir || row.job_dir || row.path || `作业 ${index + 1}`),
+        name: row.name || pathBase(row.dir || row.job_dir || row.path || tr("runtime.project.submissionrows.text_ca271f224f", { value1: (index + 1) }, `作业 {value1}`, 'Job {value1}')),
         ok: row.ok != null ? !!row.ok : !['FAILED', 'ERROR', 'BLOCKED'].includes(state),
-        message: row.message || row.error || row.job_id || state || '已提交',
+        message: row.message || row.error || row.job_id || state || tr("runtime.project.submissionrows.text_69df1816f0", {}, '已提交', 'Submitted'),
       };
     });
     (result && result.skipped || []).forEach((item, index) => {
       const row = item || {};
       rows.push({
-        name: row.name || pathBase(row.dir || row.job_dir || row.path || `跳过项 ${index + 1}`),
+        name: row.name || pathBase(row.dir || row.job_dir || row.path || tr("runtime.project.submissionrows.text_c4b783edd7", { value1: (index + 1) }, `跳过项 {value1}`, 'Skipped item {value1}')),
         ok: true,
         skipped: true,
-        message: row.reason || row.message || '状态无需重复提交',
+        message: row.reason || row.message || tr("runtime.project.submissionrows.text_762befbe3b", {}, '状态无需重复提交', 'Current status does not require resubmission'),
       });
     });
     return rows;
@@ -2089,30 +2186,30 @@
 
   function lisRepairHint(message, stage) {
     const text = String(message || '');
-    if (/已存在|不会覆盖/.test(text)) return '目标项目已经存在。请回到第 3 步换一个项目名，旧项目不会被覆盖。';
-    if (/方法|核验|不能直接相减|可比性/.test(text)) return '作业输入可继续生成和提交；这些差异只会暂停自动 ΔE 与最终报告。请查看方法面板，按具体能量项补齐证据或重算；ISPIN 体系说明无需勾选确认。';
-    if (/INCAR|POSCAR|结构文件|文件不存在|无法读取/.test(text)) return '文件路径已经失效或不可读。回到第 2 步重新选择对应文件。';
-    if (/物种|species|参考/.test(text)) return '回到第 1、2 步：确认参考能项目，并把每个红色构型改为参考集合中的物种。';
-    if (/POTCAR|赝势/.test(text)) return '到“设置”中配置可用的 POTCAR 库，再返回重试；不要手工拼接不一致的赝势。';
+    if (/已存在|不会覆盖/.test(text)) return tr("runtime.project.lisrepairhint.text_003f43f9fb", {}, '目标项目已经存在。请回到第 3 步换一个项目名，旧项目不会被覆盖。', 'The target project already exists. Return to step 3 and use a new project name; the old project will not be overwritten.');
+    if (/方法|核验|不能直接相减|可比性/.test(text)) return tr("runtime.project.lisrepairhint.text_63ed3e168b", {}, '作业输入可继续生成和提交；这些差异只会暂停自动 ΔE 与最终报告。请查看方法面板，按具体能量项补齐证据或重算；ISPIN 体系说明无需勾选确认。', 'Job input may still be generated and submitted; these differences only pause automatic ΔE and the final report. Review the method panel and provide evidence or recalculate the affected energy terms. ISPIN system notes do not require confirmation.');
+    if (/INCAR|POSCAR|结构文件|文件不存在|无法读取/.test(text)) return tr("runtime.project.lisrepairhint.text_0eec3fd4e9", {}, '文件路径已经失效或不可读。回到第 2 步重新选择对应文件。', 'The file path is stale or unreadable. Return to step 2 and select the file again.');
+    if (/物种|species|参考/.test(text)) return tr("runtime.project.lisrepairhint.text_bd132731bd", {}, '回到第 1、2 步：确认参考能项目，并把每个红色构型改为参考集合中的物种。', 'Return to steps 1 and 2: confirm the reference-energy project and change every red configuration to a species in the reference set.');
+    if (/POTCAR|赝势/.test(text)) return tr("runtime.project.lisrepairhint.text_e04d564731", {}, '到“设置”中配置可用的 POTCAR 库，再返回重试；不要手工拼接不一致的赝势。', 'Configure an available POTCAR library in Settings, then return and try again. Do not manually concatenate inconsistent pseudopotentials.');
     if (/凭据.*保存|keyring|无人值守|自动(?:托管|驾驶).*保存/i.test(text)) {
-      return '任务已经提交，不要重新生成项目。请到“集群”页重新保存可供无人值守使用的凭据，再回来重试接管。';
+      return tr("runtime.project.lisrepairhint.text_401ba95ead", {}, '任务已经提交，不要重新生成项目。请到“集群”页重新保存可供无人值守使用的凭据，再回来重试接管。', 'The tasks were submitted; do not regenerate the project. On Clusters, save credentials that can be used unattended, then return and retry takeover.');
     }
-    if (/密码|认证|credential/i.test(text)) return '再次点击“重试未提交成员”，重新输入正确密码；已经生成的本地项目会直接复用。';
-    if (/主机|指纹|host/i.test(text)) return '核对服务器指纹；确认无误后再次提交并选择信任。';
-    if (/集群|服务器|profile|队列/.test(text)) return '回到第 4 步选择有效服务器；如列表为空，点击“配置服务器”。';
+    if (/密码|认证|credential/i.test(text)) return tr("runtime.project.lisrepairhint.text_368b9fb2f8", {}, '再次点击“重试未提交成员”，重新输入正确密码；已经生成的本地项目会直接复用。', 'Select Retry unsubmitted members and enter the correct password. The generated local project will be reused directly.');
+    if (/主机|指纹|host/i.test(text)) return tr("runtime.project.lisrepairhint.text_b39e2be8a9", {}, '核对服务器指纹；确认无误后再次提交并选择信任。', 'Verify the server fingerprint; if it is correct, submit again and choose to trust it.');
+    if (/集群|服务器|profile|队列/.test(text)) return tr("runtime.project.lisrepairhint.text_9779a0783c", {}, '回到第 4 步选择有效服务器；如列表为空，点击“配置服务器”。', 'Return to step 4 and select a valid server. If the list is empty, select Configure server.');
     return stage === 'prepare'
-      ? '按上面的错误回到对应步骤修正；若刚才已经生成过同名项目，请使用新项目名。'
-      : '本地项目已经保留。修正服务器、密码或资源后，再点“重试未提交成员”；成功项不会重复提交。';
+      ? tr("runtime.project.lisrepairhint.text_e597375658", {}, '按上面的错误回到对应步骤修正；若刚才已经生成过同名项目，请使用新项目名。', 'Use the error above to return to the corresponding step. If a same-named project was already generated, use a new project name.')
+      : tr("runtime.project.lisrepairhint.text_6d1b909450", {}, '本地项目已经保留。修正服务器、密码或资源后，再点“重试未提交成员”；成功项不会重复提交。', 'The local project was preserved. After correcting the server, password, or resources, select Retry unsubmitted members; successful items will not be resubmitted.');
   }
 
   function lisRepairAction(message, stage) {
     const text = String(message || '');
-    if (/方法|核验|不能直接相减|可比性/.test(text)) return ['method', '查看 ΔE / 报告门禁'];
-    if (/已存在|不会覆盖/.test(text)) return ['step3', '返回修改项目名'];
-    if (/参考项目|参考能/.test(text)) return ['step1', '返回选择参考能'];
-    if (/INCAR|POSCAR|结构文件|物种|species/.test(text)) return ['step2', '返回检查输入'];
-    if (/主机|指纹|集群|服务器|profile|密码|认证|凭据|keyring/i.test(text)) return ['cluster', '前往集群配置'];
-    return stage === 'submit' ? ['retry', '修正后重试未提交成员'] : ['step1', '返回逐步检查'];
+    if (/方法|核验|不能直接相减|可比性/.test(text)) return ['method', tr("runtime.project.lisrepairaction.text_fc5b0d432a", {}, '查看 ΔE / 报告门禁', 'View ΔE / report gate')];
+    if (/已存在|不会覆盖/.test(text)) return ['step3', tr("runtime.project.lisrepairaction.text_bc8a6ca2b8", {}, '返回修改项目名', 'Return to edit project name')];
+    if (/参考项目|参考能/.test(text)) return ['step1', tr("runtime.project.lisrepairaction.text_cc7673f5a1", {}, '返回选择参考能', 'Return to select reference energies')];
+    if (/INCAR|POSCAR|结构文件|物种|species/.test(text)) return ['step2', tr("runtime.project.lisrepairaction.text_5f92f1e351", {}, '返回检查输入', 'Return to check input')];
+    if (/主机|指纹|集群|服务器|profile|密码|认证|凭据|keyring/i.test(text)) return ['cluster', tr("runtime.project.lisrepairaction.text_961fb7cb49", {}, '前往集群配置', 'Open cluster configuration')];
+    return stage === 'submit' ? ['retry', tr("runtime.project.lisrepairaction.text_3e91bdbf35", {}, '修正后重试未提交成员', 'Retry unsubmitted members after correcting the issue')] : ['step1', tr("runtime.project.lisrepairaction.text_f290d0fa8c", {}, '返回逐步检查', 'Return to step-by-step checks')];
   }
 
   function bindLisRepairAction(box) {
@@ -2143,8 +2240,9 @@
     const action = lisRepairAction(message, stage);
     box.innerHTML = `<div class="lis-result-head bad"><b>${VCS.esc(title)}</b>` +
       (reusable ? `<span>${VCS.esc(reusable.path)}</span>` : '') + '</div>' +
-      `<div class="lis-result-error">${VCS.esc(message || '未知错误')}</div>` +
-      `<div class="lis-result-fix"><b>怎么处理</b><span>${VCS.esc(lisRepairHint(message, stage))}</span>` +
+      `<div class="lis-result-error">${VCS.esc(message || tr(
+        'runtime.project.common.unknown_error', {}, '未知错误', 'Unknown error'))}</div>` +
+      tr("runtime.project.showlisfailure.text_abaf4ecfde", { value1: (VCS.esc(lisRepairHint(message, stage))) }, `<div class="lis-result-fix"><b>怎么处理</b><span>{value1}</span>`, '<div class="lis-result-fix"><b>How to resolve it</b><span>{value1}</span>') +
       `<button class="btn" type="button" data-lis-fix="${action[0]}">${VCS.esc(action[1])}</button></div>`;
     bindLisRepairAction(box);
   }
@@ -2157,14 +2255,19 @@
     const ok = submitted && submitted.ok !== false && !submitted.error;
     const automationNotReady = !ok && /凭据.*保存|keyring|无人值守|自动(?:托管|驾驶).*保存/i.test(
       String(submitted && submitted.error || '')) && rows.some(row => row.ok && !row.skipped);
-    const heading = ok ? '整组已生成并提交'
-      : automationNotReady ? '任务已提交，但自动续算尚未接管' : '项目已生成，但提交没有全部完成';
+    const heading = ok ? tr("runtime.project.renderlissubmitresult.text_0accad88ea", {}, '整组已生成并提交', 'The complete group was generated and submitted')
+      : automationNotReady ? tr("runtime.project.renderlissubmitresult.text_99522945ec", {}, '任务已提交，但自动续算尚未接管', 'Tasks were submitted, but automatic continuation has not taken over') : tr("runtime.project.renderlissubmitresult.text_c51ae610f1", {}, '项目已生成，但提交没有全部完成', 'The project was generated, but submission did not complete for every member');
     let html = `<div class="lis-result-head ${ok ? 'ok' : 'bad'}"><b>${heading}</b>` +
       `<span>${VCS.esc(projectPath || val('pj-name'))}</span></div>`;
     if (rows.length) {
-      html += '<table><thead><tr><th>成员作业</th><th>提交结果</th><th>说明 / 作业号</th></tr></thead><tbody>';
+      html += tr("runtime.project.renderlissubmitresult.text_a30d2b90af", {}, '<table><thead><tr><th>成员作业</th><th>提交结果</th><th>说明 / 作业号</th></tr></thead><tbody>', '<table><thead><tr><th>Member job</th><th>Submission result</th><th>Details / job ID</th></tr></thead><tbody>');
       rows.forEach(row => {
-        html += `<tr><td>${VCS.esc(row.name)}</td><td>${row.skipped ? '<span class="lis-submit-skip">已跳过</span>' : row.ok ? VCS.pill('SUBMITTED') : VCS.pill('FAILED')}</td>` +
+        const resultBadge = row.skipped
+          ? tr('runtime.project.submission.skipped_badge', {},
+            '<span class="lis-submit-skip">已跳过</span>',
+            '<span class="lis-submit-skip">Skipped</span>')
+          : row.ok ? VCS.pill('SUBMITTED') : VCS.pill('FAILED');
+        html += `<tr><td>${VCS.esc(row.name)}</td><td>${resultBadge}</td>` +
           `<td class="sub">${VCS.esc(row.message || '')}</td></tr>`;
       });
       html += '</tbody></table>';
@@ -2172,14 +2275,14 @@
     if (submitted && submitted.error) html += `<div class="lis-result-error">${VCS.esc(submitted.error)}</div>`;
     if (!ok) {
       const action = lisRepairAction(submitted && submitted.error, 'submit');
-      html += `<div class="lis-result-fix"><b>怎么处理</b><span>${VCS.esc(lisRepairHint(submitted && submitted.error, 'submit'))}</span>` +
+      html += tr("runtime.project.renderlissubmitresult.text_b7356ec468", { value1: (VCS.esc(lisRepairHint(submitted && submitted.error, 'submit'))) }, `<div class="lis-result-fix"><b>怎么处理</b><span>{value1}</span>`, '<div class="lis-result-fix"><b>How to resolve it</b><span>{value1}</span>') +
         `<button class="btn" type="button" data-lis-fix="${action[0]}">${VCS.esc(action[1])}</button></div>`;
     }
     if (ok) {
-      html += '<div class="lis-result-next"><b>自动托管已开启</b><span>请保持软件运行。软件会监控队列，未收敛时最多续算 3 轮，' +
-        '每轮轻量拉回 OUTCAR、OSZICAR、CONTCAR，全部完成后自动生成报告。</span></div>' +
-        '<div class="actions lis-result-actions"><button class="btn primary" type="button" data-lis-next="jobs">查看任务进度</button>' +
-        '<button class="btn" type="button" data-lis-next="results">查看项目 ΔE 与报告</button></div>';
+      html += tr("runtime.project.renderlissubmitresult.text_406259b1ed", {}, '<div class="lis-result-next"><b>自动托管已开启</b><span>请保持软件运行。软件会监控队列，未收敛时最多续算 3 轮，', '<div class="lis-result-next"><b>Autopilot is enabled</b><span>Keep the application running. It monitors the queue and continues unconverged jobs for up to three rounds, ') +
+        tr("runtime.project.renderlissubmitresult.text_ee26eff34b", {}, '每轮轻量拉回 OUTCAR、OSZICAR、CONTCAR，全部完成后自动生成报告。</span></div>', 'retrieving OUTCAR, OSZICAR, and CONTCAR after each round, then generating the report when all jobs complete.</span></div>') +
+        tr("runtime.project.renderlissubmitresult.text_54d2d76ad1", {}, '<div class="actions lis-result-actions"><button class="btn primary" type="button" data-lis-next="jobs">查看任务进度</button>', '<div class="actions lis-result-actions"><button class="btn primary" type="button" data-lis-next="jobs">View task progress</button>') +
+        tr("runtime.project.renderlissubmitresult.text_b861ebf90c", {}, '<button class="btn" type="button" data-lis-next="results">查看项目 ΔE 与报告</button></div>', '<button class="btn" type="button" data-lis-next="results">View project ΔE and reports</button></div>');
     }
     box.innerHTML = html;
     box.hidden = false;
@@ -2204,11 +2307,11 @@
     State.repairResume = 'submit';
     State.lisBusy = true;
     syncLisInputLocks();
-    if (button) { button.disabled = true; button.textContent = reusable ? '正在重试未提交成员…' : '正在生成整组输入…'; }
+    if (button) { button.disabled = true; button.textContent = reusable ? tr("runtime.project.prepareandsubmitlis.text_175082b3d3", {}, '正在重试未提交成员…', 'Retrying unsubmitted members…') : tr("runtime.project.prepareandsubmitlis.text_873fa4203d", {}, '正在生成整组输入…', 'Generating the complete input group…'); }
     if (resultBox) resultBox.hidden = true;
     VCS.log(reusable
-      ? '复用已生成项目，直接重试尚未提交的成员：' + reusable.path
-      : `正在按 ${gate.refs.length} 个 Li-S 参考物种准备 clean slab + ${gate.items.length} 个 adsorption 作业…`);
+      ? tr("runtime.project.prepareandsubmitlis.text_f63d528e50", {}, '复用已生成项目，直接重试尚未提交的成员：', 'Reusing the generated project and retrying only unsubmitted members:') + reusable.path
+      : tr("runtime.project.prepareandsubmitlis.text_c7e00bfbb9", { value1: (gate.refs.length), value2: (gate.items.length) }, `正在按 {value1} 个 Li-S 参考物种准备 clean slab + {value2} 个 adsorption 作业…`, 'Preparing a clean slab plus {value2} adsorption jobs using {value1} Li-S reference species…'));
     try {
       let prepared;
       if (reusable) {
@@ -2222,14 +2325,14 @@
         const needsRepair = !!(prepared && prepared.needs_repair_decision);
         if (methodCheck || needsMethod) renderMethodCheck(methodCheck, needsMethod);
         if (methodExecutionStatus(methodCheck) === 'blocked') {
-          const error = (prepared && prepared.error) || '本地输入无法安全生成或提交';
-          VCS.log('输入执行检查阻止提交:' + error, 'failc');
-          showLisFailure('输入执行检查未通过', error, 'prepare');
+          const error = (prepared && prepared.error) || tr("runtime.project.prepareandsubmitlis.text_98597e6cb9", {}, '本地输入无法安全生成或提交', 'Local input cannot be generated or submitted safely');
+          VCS.log(tr("runtime.project.prepareandsubmitlis.text_df5c1b18bb", {}, '输入执行检查阻止提交:', 'Input execution validation blocked submission:') + error, 'failc');
+          showLisFailure(tr("runtime.project.prepareandsubmitlis.text_4dc7ff4adc", {}, '输入执行检查未通过', 'Input execution validation failed'), error, 'prepare');
           return;
         }
         if (needsRepair) {
-          VCS.log('已生成智能修复预览；请选择“修复副本”或“保持原样”后继续', 'warnc');
-          VCS.toast('请在方法检查中选择智能修复或保持原样');
+          VCS.log(tr("runtime.project.prepareandsubmitlis.text_a1e47afffa", {}, '已生成智能修复预览；请选择“修复副本”或“保持原样”后继续', 'A smart-repair preview was generated. Select Repair copy or Keep unchanged to continue.'), 'warnc');
+          VCS.toast(tr("runtime.project.prepareandsubmitlis.text_145885c75e", {}, '请在方法检查中选择智能修复或保持原样', 'Select smart repair or keep unchanged in the method check'));
           const method = $('lis-method-check');
           if (method && typeof method.scrollIntoView === 'function') {
             method.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -2237,32 +2340,32 @@
           return;
         }
         if (needsMethod) {
-          VCS.log('旧版后端标记了方法待核对；不要求 ISPIN 确认，作业继续，自动 ΔE / 报告暂停', 'warnc');
+          VCS.log(tr("runtime.project.prepareandsubmitlis.text_93c72c1e18", {}, '旧版后端标记了方法待核对；不要求 ISPIN 确认，作业继续，自动 ΔE / 报告暂停', 'The legacy backend marked the method for review. ISPIN confirmation is not required; jobs continue, while automatic ΔE and reports remain paused.'), 'warnc');
         }
         if (!prepared || prepared.ok === false || prepared.error) {
-          const error = (prepared && prepared.error) || '未知错误';
+          const error = (prepared && prepared.error) || tr("runtime.project.prepareandsubmitlis.text_bd5e21c357", {}, '未知错误', 'Unknown error');
           if (!methodCheck && /方法.*(?:不一致|不兼容)|不能直接相减/.test(error)) {
             renderMethodCheck({
               execution_status: 'ready', comparability_status: 'incompatible',
               status: 'incompatible', issues: [error],
             });
           }
-          VCS.log('Li-S 项目生成失败:' + error, 'failc');
+          VCS.log(tr("runtime.project.prepareandsubmitlis.text_e9c267c42d", {}, 'Li-S 项目生成失败:', 'Li-S project generation failed:') + error, 'failc');
           textList(prepared && prepared.warnings).forEach(x => VCS.log(x, 'warnc'));
-          showLisFailure('项目生成未完成', error, 'prepare');
+          showLisFailure(tr("runtime.project.prepareandsubmitlis.text_6383f2c392", {}, '项目生成未完成', 'Project generation did not complete'), error, 'prepare');
           return;
         }
       }
-      textList(prepared.advisories).forEach(x => VCS.log('方法学提示:' + x, 'warnc'));
+      textList(prepared.advisories).forEach(x => VCS.log(tr("runtime.project.prepareandsubmitlis.text_b0364d757b", {}, '方法学提示:', 'Methodology note:') + x, 'warnc'));
       textList(prepared.warnings).forEach(x => VCS.log(x, 'warnc'));
       if (['unverified', 'incompatible'].includes(methodComparabilityStatus(
         prepared && prepared.method_check))) {
-        VCS.log('作业继续提交；自动 ΔE 与最终报告将等方法证据通过后再继续', 'warnc');
+        VCS.log(tr("runtime.project.prepareandsubmitlis.text_8469a9d68e", {}, '作业继续提交；自动 ΔE 与最终报告将等方法证据通过后再继续', 'Jobs will still be submitted; automatic ΔE and the final report resume after method evidence passes validation'), 'warnc');
       }
       const projectPath = projectPathFrom(prepared);
       if (!projectPath) {
-        VCS.log('Li-S 项目生成失败:后端没有返回项目路径', 'failc');
-        showLisFailure('项目生成未完成', '后端没有返回项目路径', 'prepare');
+        VCS.log(tr("runtime.project.prepareandsubmitlis.text_4d130c0198", {}, 'Li-S 项目生成失败:后端没有返回项目路径', 'Li-S project generation failed: the backend returned no project path'), 'failc');
+        showLisFailure(tr("runtime.project.prepareandsubmitlis.text_6383f2c392", {}, '项目生成未完成', 'Project generation did not complete'), tr("runtime.project.prepareandsubmitlis.text_e2bc8e129a", {}, '后端没有返回项目路径', 'The backend returned no project path'), 'prepare');
         return;
       }
       if (!reusable) {
@@ -2271,29 +2374,35 @@
         };
         State.preparedConflictHint = null;
       }
-      VCS.log('项目已生成，正在上传到 ' + val('lis-profile') + ' 并提交…', 'okc');
-      if (button) button.textContent = '正在上传并提交整组…';
+      VCS.log(tr("runtime.project.prepareandsubmitlis.text_f804637f11", {}, '项目已生成，正在上传到 ', 'Project generated; uploading to ') + val('lis-profile') + tr("runtime.project.prepareandsubmitlis.text_fac92c00eb", {}, ' 并提交…', ' and submitting…'), 'okc');
+      if (button) button.textContent = tr("runtime.project.prepareandsubmitlis.text_fe3f2f5151", {}, '正在上传并提交整组…', 'Uploading and submitting the complete group…');
       const submitted = await submitLiSProject(projectPath, gate);
       if (!submitted) {
-        VCS.log('已取消提交；本地项目仍保留在 ' + projectPath, 'warnc');
-        showLisFailure('本地项目已生成，提交已取消',
-          '没有提交任何新成员。再次点击主按钮即可直接重试，不会重复生成项目。', 'submit');
+        VCS.log(tr("runtime.project.prepareandsubmitlis.text_8d7f1cb39e", {}, '已取消提交；本地项目仍保留在 ', 'Submission canceled; the local project remains at ') + projectPath, 'warnc');
+        showLisFailure(tr("runtime.project.prepareandsubmitlis.text_c120dd5cc7", {}, '本地项目已生成，提交已取消', 'The local project was generated; submission was canceled'),
+          tr("runtime.project.prepareandsubmitlis.text_e43a0afc44", {}, '没有提交任何新成员。再次点击主按钮即可直接重试，不会重复生成项目。', 'No new members were submitted. Select the primary button again to retry directly; the project will not be regenerated.'), 'submit');
         return;
       }
       renderLisSubmitResult(prepared, submitted);
-      submissionRows(submitted).forEach(row =>
-        VCS.log(`${row.name}：${row.message || (row.ok ? '已提交' : '失败')}`, row.ok ? 'okc' : 'failc'));
+      submissionRows(submitted).forEach(row => {
+        const fallbackStatus = row.ok
+          ? tr('runtime.project.submission.submitted', {}, '已提交', 'Submitted')
+          : tr('runtime.project.submission.failed', {}, '失败', 'Failed');
+        VCS.log(tr('runtime.project.submission.log_entry', {
+          name: row.name, result: row.message || fallbackStatus,
+        }, '{name}：{result}', '{name}: {result}'), row.ok ? 'okc' : 'failc');
+      });
       if (submitted.ok === false || submitted.error) {
-        VCS.log('整组提交未完成:' + (submitted.error || '部分成员失败，请查看上方逐项结果'), 'failc');
+        VCS.log(tr("runtime.project.prepareandsubmitlis.text_4863988582", {}, '整组提交未完成:', 'Group submission did not complete:') + (submitted.error || tr("runtime.project.prepareandsubmitlis.text_4e3adff1ca", {}, '部分成员失败，请查看上方逐项结果', 'Some members failed; review the per-item results above')), 'failc');
         return;
       }
       if (State.preparedLis) State.preparedLis.submitted = true;
       State.workflowSubmitted = true;
-      VCS.log('整组提交完成；自动续算、轻量下载和报告流程已开启', 'okc');
+      VCS.log(tr("runtime.project.prepareandsubmitlis.text_4a778e4c11", {}, '整组提交完成；自动续算、轻量下载和报告流程已开启', 'Group submission complete; automatic continuation, lightweight retrieval, and reporting are enabled'), 'okc');
       if (window.Jobs && typeof window.Jobs.reload === 'function') await window.Jobs.reload();
       await reloadProjects();
       if (VCS.pipeline && typeof VCS.pipeline.reconfigure === 'function') await VCS.pipeline.reconfigure();
-      VCS.toast('整组已提交；请保持软件运行以完成自动流程');
+      VCS.toast(tr("runtime.project.prepareandsubmitlis.text_5ece070042", {}, '整组已提交；请保持软件运行以完成自动流程', 'The group was submitted; keep the application running to complete the automatic workflow'));
     } finally {
       State.lisBusy = false;
       syncLisInputLocks();
@@ -2354,14 +2463,14 @@
     updateLisReadiness();
     let issue = '';
     if (!gate.step[1] || !gate.step[2] || !gate.step[3]) issue = gate.issue;
-    else if (gate.methodBlocked) issue = '输入执行检查已阻止生成；请修正本目录输入错误';
+    else if (gate.methodBlocked) issue = tr("runtime.project.create.text_29227be002", {}, '输入执行检查已阻止生成；请修正本目录输入错误', 'Input execution validation blocked generation; correct the input errors in this directory');
     if (issue) { VCS.toast(issue, 'fail'); return; }
     const operationFingerprint = lisContentFingerprint();
     State.repairResume = 'create';
     State.lisBusy = true;
     syncLisInputLocks();
-    if (btn) { btn.disabled = true; btn.textContent = '正在生成逐目录作业…'; }
-    VCS.log(`仅生成：正在准备 clean slab + ${gate.items.length} 个逐成员四件套作业…`);
+    if (btn) { btn.disabled = true; btn.textContent = tr("runtime.project.create.text_2a3eebf49b", {}, '正在生成逐目录作业…', 'Generating per-directory jobs…'); }
+    VCS.log(tr("runtime.project.create.text_0207cf0a1b", { value1: (gate.items.length) }, `仅生成：正在准备 clean slab + {value1} 个逐成员四件套作业…`, 'Generate only: preparing a clean slab plus {value1} per-member four-file input-set jobs…'));
     try {
       const prepared = await VCS.call(
         'proj_prepare_lis', val('pj-name'), val('pj-slab'), gate.items,
@@ -2372,29 +2481,29 @@
       const needsRepair = !!(prepared && prepared.needs_repair_decision);
       if (methodCheck || needsMethod) renderMethodCheck(methodCheck, needsMethod);
       if (methodExecutionStatus(methodCheck) === 'blocked') {
-        const error = (prepared && prepared.error) || '本地输入无法安全生成';
-        VCS.log('仅生成已停止：' + error, 'failc');
-        showLisFailure('输入执行检查未通过', error, 'prepare');
+        const error = (prepared && prepared.error) || tr("runtime.project.create.text_52027290d4", {}, '本地输入无法安全生成', 'Local input cannot be generated safely');
+        VCS.log(tr("runtime.project.create.text_5cb57a8992", {}, '仅生成已停止：', 'Generate-only operation stopped:') + error, 'failc');
+        showLisFailure(tr("runtime.project.create.text_4dc7ff4adc", {}, '输入执行检查未通过', 'Input execution validation failed'), error, 'prepare');
         return;
       }
       if (needsRepair) {
-        VCS.log('已生成智能修复预览；选择如何处理后再次执行“只生成”', 'warnc');
-        VCS.toast('请先选择智能修复或保持原样');
+        VCS.log(tr("runtime.project.create.text_f01effc54b", {}, '已生成智能修复预览；选择如何处理后再次执行“只生成”', 'A smart-repair preview was generated. Choose how to handle it, then run Generate only again.'), 'warnc');
+        VCS.toast(tr("runtime.project.create.text_cfb67edcbd", {}, '请先选择智能修复或保持原样', 'Select smart repair or keep unchanged first'));
         return;
       }
       if (needsMethod) VCS.log(
-        '方法证据待核对；作业继续生成，自动 ΔE / 报告暂停', 'warnc');
+        tr("runtime.project.create.text_2a22c1fd76", {}, '方法证据待核对；作业继续生成，自动 ΔE / 报告暂停', 'Method evidence needs review; jobs will still be generated, while automatic ΔE and reports remain paused'), 'warnc');
       if (!prepared || prepared.ok === false || prepared.error) {
-        const error = (prepared && prepared.error) || '未知错误';
-        VCS.log('逐目录作业生成失败:' + error, 'failc');
-        showLisFailure('项目生成未完成', error, 'prepare');
+        const error = (prepared && prepared.error) || tr("runtime.project.create.text_bd5e21c357", {}, '未知错误', 'Unknown error');
+        VCS.log(tr("runtime.project.create.text_49b380622b", {}, '逐目录作业生成失败:', 'Per-directory job generation failed:') + error, 'failc');
+        showLisFailure(tr("runtime.project.create.text_6383f2c392", {}, '项目生成未完成', 'Project generation did not complete'), error, 'prepare');
         return;
       }
-      textList(prepared.advisories).forEach(x => VCS.log('方法学提示:' + x, 'warnc'));
+      textList(prepared.advisories).forEach(x => VCS.log(tr("runtime.project.create.text_b0364d757b", {}, '方法学提示:', 'Methodology note:') + x, 'warnc'));
       textList(prepared.warnings).forEach(x => VCS.log(x, 'warnc'));
       const projectPath = projectPathFrom(prepared);
       if (!projectPath) {
-        showLisFailure('项目生成未完成', '后端没有返回项目路径', 'prepare');
+        showLisFailure(tr("runtime.project.create.text_6383f2c392", {}, '项目生成未完成', 'Project generation did not complete'), tr("runtime.project.create.text_e2bc8e129a", {}, '后端没有返回项目路径', 'The backend returned no project path'), 'prepare');
         return;
       }
       State.preparedLis = {
@@ -2405,26 +2514,26 @@
       const resultBox = $('lis-submit-result');
       if (resultBox) {
         resultBox.hidden = false;
-        resultBox.innerHTML = '<div class="lis-result-head ok"><b>逐目录作业已生成，尚未提交</b>' +
+        resultBox.innerHTML = tr("runtime.project.create.text_9fca54aec8", {}, '<div class="lis-result-head ok"><b>逐目录作业已生成，尚未提交</b>', '<div class="lis-result-head ok"><b>Per-directory jobs generated; not yet submitted</b>') +
           `<span>${VCS.esc(projectPath)}</span></div>` +
-          '<div class="lis-result-next"><b>输入已冻结</b><span>完整成员使用同目录原始四件套；不完整成员按本目录 POSCAR+INCAR 生成受管四件套。' +
-          '可回到主按钮选择服务器并提交；不会重复生成项目。</span></div>';
+          tr("runtime.project.create.text_e7525bccc8", {}, '<div class="lis-result-next"><b>输入已冻结</b><span>完整成员使用同目录原始四件套；不完整成员按本目录 POSCAR+INCAR 生成受管四件套。', '<div class="lis-result-next"><b>Input frozen</b><span>Complete members use their original four-file input sets; incomplete members use managed four-file sets generated from the directory\'s POSCAR+INCAR.') +
+          tr("runtime.project.create.text_28e51f5f49", {}, '可回到主按钮选择服务器并提交；不会重复生成项目。</span></div>', 'Return to the primary button to select a server and submit; the project will not be regenerated.</span></div>');
       }
-      VCS.log('逐目录作业已生成，尚未提交：' + projectPath, 'okc');
+      VCS.log(tr("runtime.project.create.text_b955457174", {}, '逐目录作业已生成，尚未提交：', 'Per-directory jobs generated and awaiting submission:') + projectPath, 'okc');
       if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
       await reloadProjects();
       if (typeof VCS.nextStep === 'function') {
         VCS.nextStep({
-          title: '逐目录吸附作业已生成',
-          message: `clean slab 和 ${gate.items.length} 个吸附构型已按各自四件套证据加入任务列表。`,
-          detail: '下一步可在当前页面选择服务器后点击主按钮提交；生成阶段不会覆盖任何成员的本地 INCAR。',
-          primaryLabel: '留在当前页选择服务器',
+          title: tr("runtime.project.create.text_364b855a24", {}, '逐目录吸附作业已生成', 'Per-directory adsorption jobs generated'),
+          message: tr("runtime.project.create.text_33cbc78563", { value1: (gate.items.length) }, `clean slab 和 {value1} 个吸附构型已按各自四件套证据加入任务列表。`, "The clean slab and {value1} adsorption configurations were added to the job list using each member's four-file-set evidence."),
+          detail: tr("runtime.project.create.text_e9a52499f3", {}, '下一步可在当前页面选择服务器后点击主按钮提交；生成阶段不会覆盖任何成员的本地 INCAR。', "Next, select a server on this page and use the primary button to submit. Generation does not overwrite any member's local INCAR."),
+          primaryLabel: tr("runtime.project.create.text_d97cdf3d53", {}, '留在当前页选择服务器', 'Stay on this page and select a server'),
         });
       }
     } finally {
       State.lisBusy = false;
       syncLisInputLocks();
-      if (btn) { btn.disabled = false; btn.textContent = '只生成当前逐目录作业，不提交'; }
+      if (btn) { btn.disabled = false; btn.textContent = tr("runtime.project.create.text_8391a3976f", {}, '只生成当前逐目录作业，不提交', 'Generate current per-directory jobs without submitting'); }
       updateLisReadiness();
     }
   }
@@ -2517,10 +2626,10 @@
     const status = $('fig-compare-status');
     const counts = comparisonCounts();
     if (box) {
-      box.innerHTML = '<span>已选 <b>' + counts.selected + '</b></span>' +
-        '<span>有效 <b>' + counts.valid + '</b></span>' +
-        '<span>阻断 <b>' + counts.blocked + '</b></span>' +
-        '<span>可叠加台阶 <b>' + counts.overlay + '</b></span>';
+      box.innerHTML = tr("runtime.project.rendercomparesummary.text_1c82495bbb", {}, '<span>已选 <b>', '<span>Selected <b>') + counts.selected + '</b></span>' +
+        tr("runtime.project.rendercomparesummary.text_6012327763", {}, '<span>有效 <b>', '<span>Valid <b>') + counts.valid + '</b></span>' +
+        tr("runtime.project.rendercomparesummary.text_117ca28ec1", {}, '<span>阻断 <b>', '<span>Blocked <b>') + counts.blocked + '</b></span>' +
+        tr("runtime.project.rendercomparesummary.text_09d92998fc", {}, '<span>可叠加台阶 <b>', '<span>Overlayable steps <b>') + counts.overlay + '</b></span>';
       box.classList.toggle('checking', !counts.checked);
     }
     const compareButton = $('pj-cmpfigs');
@@ -2534,15 +2643,17 @@
     if (!status) return;
     const preview = State.comparePreview;
     if (!counts.selected) {
-      status.innerHTML = '<span class="pj-compare-empty">选择至少两个催化剂项目后，软件会先核对方法与反应路径。</span>';
+      status.innerHTML = tr("runtime.project.rendercomparesummary.text_52270befc2", {}, '<span class="pj-compare-empty">选择至少两个催化剂项目后，软件会先核对方法与反应路径。</span>', '<span class="pj-compare-empty">Select at least two catalyst projects; the application will first validate their methods and reaction pathways.</span>');
       return;
     }
     if (!preview) {
-      status.innerHTML = '<span class="pj-compare-empty">正在核对所选项目的数据、方法与台阶图口径…</span>';
+      status.innerHTML = tr("runtime.project.rendercomparesummary.text_c6aee36e39", {}, '<span class="pj-compare-empty">正在核对所选项目的数据、方法与台阶图口径…</span>', '<span class="pj-compare-empty">Validating the selected projects\' data, methods, and step-diagram basis…</span>');
       return;
     }
     if (preview.ok === false) {
-      status.innerHTML = `<span class="pj-compare-error">${VCS.esc(preview.error || '比较预检失败')}</span>`;
+      status.innerHTML = `<span class="pj-compare-error">${VCS.esc(preview.error || tr(
+        'runtime.project.compare.preflight_failed', {},
+        '比较预检失败', 'Comparison preflight failed'))}</span>`;
       return;
     }
     let h = '';
@@ -2551,7 +2662,12 @@
       const reasons = ready ? (project.warnings || []) : (project.block_reasons || []);
       h += `<div class="pj-compare-project ${ready ? 'ready' : 'blocked'}">` +
         `<b>${VCS.esc(project.display_name || project.name || pathBase(project.path))}</b>` +
-        `<span>${ready ? '吸附能有效' : '已阻断'} · ${project.ladder ? '台阶可用' : '无可叠加台阶'}</span>` +
+        `<span>${ready
+          ? tr('runtime.project.compare.adsorption_valid', {}, '吸附能有效', 'Adsorption energy valid')
+          : tr('runtime.project.compare.blocked', {}, '已阻断', 'Blocked')} · ${project.ladder
+          ? tr('runtime.project.compare.ladder_available', {}, '台阶可用', 'Step diagram available')
+          : tr('runtime.project.compare.no_ladder', {},
+            '无可叠加台阶', 'No overlayable step diagram')}</span>` +
         (reasons.length ? `<small>${VCS.esc(reasons.join('；'))}</small>` : '') + '</div>';
     });
     const gate = preview.comparison_gate || {};
@@ -2561,7 +2677,7 @@
     (gate.warnings || []).forEach(reason => {
       h += `<div class="pj-compare-gate warning">${VCS.esc(reason)}</div>`;
     });
-    status.innerHTML = h || '<span class="pj-compare-empty">预检完成。</span>';
+    status.innerHTML = h || tr("runtime.project.rendercomparesummary.text_602596d9ab", {}, '<span class="pj-compare-empty">预检完成。</span>', '<span class="pj-compare-empty">Preflight complete.</span>');
   }
 
   function legacyComparisonPreview(paths) {
@@ -2576,8 +2692,8 @@
         display_name: project && project.name || pathBase(path),
         status: ready ? 'ready' : 'blocked',
         ladder: null,
-        warnings: ready ? ['旧版后端未提供跨项目方法与路径预检'] : [],
-        block_reasons: ready ? [] : [project ? '项目成员尚未全部完成' : '项目不存在或已移动'],
+        warnings: ready ? [tr("runtime.project.legacycomparisonpreview.text_abb5c72a71", {}, '旧版后端未提供跨项目方法与路径预检', 'The legacy backend did not provide cross-project method and pathway preflight')] : [],
+        block_reasons: ready ? [] : [project ? tr("runtime.project.legacycomparisonpreview.text_6b2e33ad0e", {}, '项目成员尚未全部完成', 'Not all project members are complete') : tr("runtime.project.legacycomparisonpreview.text_8927cb3363", {}, '项目不存在或已移动', 'The project does not exist or was moved')],
       };
     });
     const readyCount = projects.filter(project => project.status === 'ready').length;
@@ -2592,7 +2708,7 @@
       comparison_gate: {
         status: 'unverified',
         blocking: [],
-        warnings: ['当前后端未提供跨项目预检；生成图表或报告时仍会再次校验。'],
+        warnings: [tr("runtime.project.legacycomparisonpreview.text_0f696f4b74", {}, '当前后端未提供跨项目预检；生成图表或报告时仍会再次校验。', 'The current backend does not provide cross-project preflight; charts and reports will validate again during generation.')],
       },
     };
   }
@@ -2613,7 +2729,7 @@
     } else {
       State.comparePreview = result && result.ok !== false && !result.error
         ? result
-        : { ok: false, error: (result && result.error) || '比较预检失败', projects: [] };
+        : { ok: false, error: (result && result.error) || tr("runtime.project.refreshcomparepreview.text_15f465b7c9", {}, '比较预检失败', 'Comparison preflight failed'), projects: [] };
     }
     renderFigProjList();
   }
@@ -2647,7 +2763,7 @@
       const total = Number(project.n_members || 0);
       return total > 0 && Number(project.n_done || 0) >= total;
     }).map(project => project.path));
-    VCS.log('当前后端未提供跨项目预检，已暂按“成员全部完成”筛选；生成时仍会再次校验。', 'warnc');
+    VCS.log(tr("runtime.project.selectcomparableprojects.text_8827694da8", {}, '当前后端未提供跨项目预检，已暂按“成员全部完成”筛选；生成时仍会再次校验。', 'The current backend does not provide cross-project preflight, so projects were temporarily filtered by all-members-complete; generation will validate again.'), 'warnc');
   }
 
   // ── 已有项目:下拉 + 刷新 ──────────────────────────────────────────────────
@@ -2656,6 +2772,8 @@
     const path = String(project && project.path || '');
     if (sel && sel.value !== path) sel.value = path;
     State.currentProjectPath = path;
+    State.deltaResult = null;
+    State.candidateEvaluation = null;
     restoreWorkflowState(project || null);
     if (persist) {
       try { localStorage.setItem(CURRENT_PROJECT_KEY, path); } catch (_) { /* 不阻塞 */ }
@@ -2687,7 +2805,7 @@
     if (VCS.workspace && typeof VCS.workspace.requestProjectSwitch === 'function') {
       allowed = await VCS.workspace.requestProjectSwitch(projectId(project), apply);
     } else if (VCS.unsaved && typeof VCS.unsaved.confirm === 'function') {
-      allowed = await VCS.unsaved.confirm('切换项目');
+      allowed = await VCS.unsaved.confirm(tr("runtime.project.requestprojectselection.text_361adf4473", {}, '切换项目', 'Switch project'));
       if (allowed) await apply();
     } else {
       allowed = await apply();
@@ -2735,13 +2853,13 @@
     State.comparePreviewGeneration += 1;
     if (listSucceeded) reconcileCompareSelection();
     else restoreCompareSelection();
-    if (r && r.error) VCS.log('读取项目列表失败:' + r.error, 'failc');
+    if (r && r.error) VCS.log(tr("runtime.project.performprojectreload.text_7c736d8790", {}, '读取项目列表失败:', 'Failed to load project list:') + r.error, 'failc');
     renderReferenceProjects(preferredReference);
     if (!sel) return { ok: true, stale: false, generation };
     sel.innerHTML = '';
     if (!State.projects.length) {
       const o = document.createElement('option');
-      o.value = ''; o.textContent = '(暂无项目)';
+      o.value = ''; o.textContent = tr("runtime.project.performprojectreload.text_2115ae53c9", {}, '(暂无项目)', '(No projects)');
       sel.appendChild(o);
       State.currentProjectPath = '';
       restoreWorkflowState(null);
@@ -2756,8 +2874,8 @@
       const o = document.createElement('option');
       o.value = p.path;
       const refs = referenceSpecies(p).length;
-      o.textContent = (p.name || '(未命名)') + `（${p.n_members} 成员` +
-        (refs ? ` · ${refs} 参考物种` : '') + '）';
+      o.textContent = (p.name || tr("runtime.project.performprojectreload.text_6b1efca7fc", {}, '(未命名)', '(Unnamed)')) + tr("runtime.project.performprojectreload.text_b79209ecf1", { value1: (p.n_members) }, `（{value1} 成员`, ' ({value1} members') +
+        (refs ? tr("runtime.project.performprojectreload.text_df72e94e17", { value1: (refs) }, ` · {value1} 参考物种`, ' · {value1} reference species') : '') + '）';
       sel.appendChild(o);
     });
     let saved = '';
@@ -2800,7 +2918,7 @@
     if (!box) return;
     box.innerHTML = '';
     if (!State.projects.length) {
-      box.textContent = '(暂无项目)';
+      box.textContent = tr("runtime.project.renderfigprojlist.text_2115ae53c9", {}, '(暂无项目)', '(No projects)');
       return;
     }
     State.projects.forEach(p => {
@@ -2822,13 +2940,13 @@
       });
       lab.appendChild(cb);
       const text = document.createElement('span');
-      text.textContent = p.name || '(未命名)';
+      text.textContent = p.name || tr("runtime.project.renderfigprojlist.text_6b1efca7fc", {}, '(未命名)', '(Unnamed)');
       lab.appendChild(text);
       if (preview) {
         const state = document.createElement('small');
         state.textContent = preview.status === 'ready'
-          ? (preview.ladder ? '有效 · 台阶可用' : '有效 · 无台阶')
-          : '阻断';
+          ? (preview.ladder ? tr("runtime.project.renderfigprojlist.text_e156f53a54", {}, '有效 · 台阶可用', 'Valid · steps available') : tr("runtime.project.renderfigprojlist.text_77a5c2eb5e", {}, '有效 · 无台阶', 'Valid · no steps'))
+          : tr("runtime.project.renderfigprojlist.text_2378769b47", {}, '阻断', 'Blocked');
         lab.appendChild(state);
       }
       box.appendChild(lab);
@@ -2838,19 +2956,19 @@
 
   function logFigResult(r, what) {
     if (!r || r.ok === false || r.error) {
-      VCS.log(what + '失败:' + ((r && r.error) || '未知错误'), 'failc');
+      VCS.log(what + tr("runtime.project.logfigresult.text_8021928e6b", {}, '失败:', 'Failed:') + ((r && r.error) || tr("runtime.project.logfigresult.text_bd5e21c357", {}, '未知错误', 'Unknown error')), 'failc');
       return;
     }
-    (r.files || []).forEach(f => VCS.log('已生成:' + f, 'okc'));
+    (r.files || []).forEach(f => VCS.log(tr("runtime.project.logfigresult.text_1009e8f59a", {}, '已生成:', 'Generated:') + f, 'okc'));
     (r.skipped || []).forEach(s => VCS.log(
-      (s.partial ? '部分对比说明 ' : '跳过 ') + s.kind + ':' + s.reason, 'warnc'));
-    (r.warnings || []).forEach(w => VCS.log('方法学提示:' + w, 'warnc'));
+      (s.partial ? tr("runtime.project.logfigresult.text_8e9895d66d", {}, '部分对比说明 ', 'Partial comparison note ') : tr("runtime.project.logfigresult.text_bf429f3063", {}, '跳过 ', 'Skipped ')) + s.kind + ':' + s.reason, 'warnc'));
+    (r.warnings || []).forEach(w => VCS.log(tr("runtime.project.logfigresult.text_b0364d757b", {}, '方法学提示:', 'Methodology note:') + w, 'warnc'));
     if ((r.files || []).length) {
-      VCS.log('图已输出到:' + r.out_dir, 'okc');
+      VCS.log(tr("runtime.project.logfigresult.text_98c06e3b4c", {}, '图已输出到:', 'Figure written to:') + r.out_dir, 'okc');
       VCS.call('open_dir', r.out_dir);          // 生成即可看
-      VCS.toast('已生成 ' + r.files.length + ' 个文件');
+      VCS.toast(tr("runtime.project.logfigresult.text_9f83e11a41", {}, '已生成 ', 'Generated ') + r.files.length + tr("runtime.project.logfigresult.text_a44d163e69", {}, ' 个文件', ' files'));
     } else if ((r.skipped || []).length) {
-      VCS.toast('本次没有可生成的图(原因见日志)', 'fail');
+      VCS.toast(tr("runtime.project.logfigresult.text_af58679cec", {}, '本次没有可生成的图(原因见日志)', 'No figures could be generated (see the log for reasons)'), 'fail');
     }
   }
 
@@ -2862,15 +2980,15 @@
     if ($('fig-bar') && $('fig-bar').checked) kinds.push('bar');
     if ($('fig-table') && $('fig-table').checked) kinds.push('table');
     if ($('fig-ladder') && $('fig-ladder').checked) kinds.push('ladder');
-    if (!kinds.length) { VCS.log('请至少勾选一种图', 'failc'); return; }
+    if (!kinds.length) { VCS.log(tr("runtime.project.makefigures.text_02117a2f61", {}, '请至少勾选一种图', 'Select at least one figure type'), 'failc'); return; }
     const preset = $('pj-preset') ? $('pj-preset').value : '';
     const btn = $('pj-figs');
     if (btn) btn.disabled = true;
-    VCS.log('出图中(' + kinds.join('/') + (preset ? ',反应 ' + preset : '') + ')…');
+    VCS.log(tr("runtime.project.makefigures.text_76f9eab9f4", {}, '出图中(', 'Generating figures (') + kinds.join('/') + (preset ? tr("runtime.project.makefigures.text_e801f1dccc", {}, ',反应 ', ', reaction ') + preset : '') + ')…');
     try {
       // preset 为空 → Li-S 默认(向后兼容);非空 → ladder 走通用反应引擎
       const r = await VCS.call('proj_figures', proj.path, kinds, null, preset || null);
-      logFigResult(r, '出图');
+      logFigResult(r, tr("runtime.project.makefigures.text_7f60352d5b", {}, '出图', 'Figure generation'));
     } finally {
       if (btn) btn.disabled = false;
     }
@@ -2879,17 +2997,17 @@
   // 多项目对比出图:勾选的项目 + 勾选的图类型调 proj_compare_figures
   async function makeCompareFigures() {
     const paths = selectedComparePaths();
-    if (paths.length < 2) { VCS.log('多项目对比请勾选至少 2 个项目', 'failc'); return; }
+    if (paths.length < 2) { VCS.log(tr("runtime.project.makecomparefigures.text_6e949fcef4", {}, '多项目对比请勾选至少 2 个项目', 'Select at least two projects for multi-project comparison'), 'failc'); return; }
     const kinds = [];
     if ($('fig-heatmap') && $('fig-heatmap').checked) kinds.push('heatmap');
     if ($('fig-scaling') && $('fig-scaling').checked) kinds.push('scaling');
     if ($('fig-volcano') && $('fig-volcano').checked) kinds.push('volcano');
     if ($('fig-compare-ladder') && $('fig-compare-ladder').checked) kinds.push('ladder');
-    if (!kinds.length) { VCS.log('请至少勾选一种对比图', 'failc'); return; }
+    if (!kinds.length) { VCS.log(tr("runtime.project.makecomparefigures.text_ebde079599", {}, '请至少勾选一种对比图', 'Select at least one comparison-figure type'), 'failc'); return; }
     const preset = $('pj-preset') ? $('pj-preset').value : '';
     State.compareFiguresBusy = true;
     renderCompareSummary();
-    VCS.log('对比出图中(' + paths.length + ' 个项目,' + kinds.join('/') + ')…');
+    VCS.log(tr("runtime.project.makecomparefigures.text_51dfa86f1d", {}, '对比出图中(', 'Generating comparison figures (') + paths.length + tr("runtime.project.makecomparefigures.text_36d2ed7a91", {}, ' 个项目,', ' projects,') + kinds.join('/') + ')…');
     try {
       let r = await VCS.call('proj_compare_figures', paths, kinds, null, preset || null);
       const unsupported = r && r.error &&
@@ -2899,15 +3017,15 @@
         r = legacyKinds.length
           ? await VCS.call('proj_compare_figures', paths, legacyKinds, null)
           : { ok: true, files: [], skipped: [] };
-        if (!r) r = { ok: false, files: [], skipped: [], error: '旧版对比接口没有返回结果' };
+        if (!r) r = { ok: false, files: [], skipped: [], error: tr("runtime.project.makecomparefigures.text_28c66f3dad", {}, '旧版对比接口没有返回结果', 'The legacy comparison endpoint returned no result') };
         if (kinds.includes('ladder')) {
           r.skipped = (r.skipped || []).concat([{
             kind: 'ladder',
-            reason: '当前后端版本尚不支持多项目台阶图，请升级后重试',
+            reason: tr("runtime.project.makecomparefigures.text_9718c651e7", {}, '当前后端版本尚不支持多项目台阶图，请升级后重试', 'The current backend does not support multi-project step diagrams yet; upgrade and try again'),
           }]);
         }
       }
-      logFigResult(r, '对比出图');
+      logFigResult(r, tr("runtime.project.makecomparefigures.text_49f4d5e8ec", {}, '对比出图', 'Comparison figure generation'));
     } finally {
       State.compareFiguresBusy = false;
       renderCompareSummary();
@@ -2920,7 +3038,7 @@
     if (!sel) return;
     const sceneKey = (VCS.scenario && VCS.scenario.key) || null;
     const r = await VCS.call('reaction_presets', sceneKey);
-    sel.innerHTML = '<option value="">Li-S 放电(默认)</option>';
+    sel.innerHTML = tr("runtime.project.loadpresets.text_1729346044", {}, '<option value="">Li-S 放电(默认)</option>', '<option value="">Li-S discharge (default)</option>');
     (r && r.presets || []).forEach(p => {
       const o = document.createElement('option');
       o.value = p.key;
@@ -2963,24 +3081,25 @@
   }
 
   const CANDIDATE_PRIORITY_ZH = {
-    advance: '建议继续',
-    hold_for_evidence: '先补证据',
-    lower_priority: '降低优先级',
-    blocked: '阻止判断',
+    advance: () => tr("runtime.project.applyprojectcalculation.text_32f3c37764", {}, '建议继续', 'Continue recommended'),
+    hold_for_evidence: () => tr("runtime.project.applyprojectcalculation.text_bcd462ee6a", {}, '先补证据', 'Add evidence first'),
+    lower_priority: () => tr("runtime.project.applyprojectcalculation.text_703ef9302d", {}, '降低优先级', 'Lower priority'),
+    blocked: () => tr("runtime.project.applyprojectcalculation.text_c6dcb59e7f", {}, '阻止判断', 'Block the conclusion'),
   };
   const CLAIM_CEILING_ZH = {
-    electronic_adsorption_screen: '电子吸附能初筛',
-    corrected_thermodynamics: '热校正热力学',
-    solvated_thermodynamics: '含溶剂化热力学',
-    kinetically_supported: '动力学支持',
+    electronic_adsorption_screen: () => tr("runtime.project.applyprojectcalculation.text_a465149454", {}, '电子吸附能初筛', 'Electronic adsorption-energy screening'),
+    corrected_thermodynamics: () => tr("runtime.project.applyprojectcalculation.text_5cc5aa09e6", {}, '热校正热力学', 'Thermodynamics with thermal corrections'),
+    solvated_thermodynamics: () => tr("runtime.project.applyprojectcalculation.text_c4eb050bbf", {}, '含溶剂化热力学', 'Thermodynamics with solvation'),
+    kinetically_supported: () => tr("runtime.project.applyprojectcalculation.text_7f53893bc0", {}, '动力学支持', 'Kinetic support'),
   };
   const SHORT_CHAIN_RISK_ZH = {
-    high: '高：终产物过强结合警戒',
-    medium: '中：需检查 Li₂S 分解/脱锂',
-    weak_terminal_binding: '终产物结合偏弱',
-    low: '低',
-    unknown: '证据不足',
+    high: () => tr("runtime.project.applyprojectcalculation.text_7bc19ee43c", {}, '高：终产物过强结合警戒', 'High: warning for excessively strong final-product binding'),
+    medium: () => tr("runtime.project.applyprojectcalculation.text_6c71bfba67", {}, '中：需检查 Li₂S 分解/脱锂', 'Medium: inspect Li₂S decomposition / delithiation'),
+    weak_terminal_binding: () => tr("runtime.project.applyprojectcalculation.text_a1739a4bd3", {}, '终产物结合偏弱', 'Final-product binding is weak'),
+    low: () => tr("runtime.project.applyprojectcalculation.text_596381ccb8", {}, '低', 'Low'),
+    unknown: () => tr("runtime.project.applyprojectcalculation.text_d408a0a3c1", {}, '证据不足', 'Insufficient evidence'),
   };
+  const candidateLabel = (labels, key) => labels[key] ? labels[key]() : key;
 
   function hideCandidateEvaluation() {
     const box = $('pj-candidate-evaluation');
@@ -2997,8 +3116,10 @@
     if (!evaluation || typeof evaluation !== 'object') {
       box.hidden = false;
       box.className = 'pj-candidate-card error';
-      box.innerHTML = '<div class="pj-candidate-head"><b>候选评价暂不可用</b></div>' +
-        `<p>${VCS.esc((result && result.error) || '后端没有返回可审计评价。')}</p>`;
+      box.innerHTML = tr("runtime.project.rendercandidateevaluation.text_439f5bf2d9", {}, '<div class="pj-candidate-head"><b>候选评价暂不可用</b></div>', '<div class="pj-candidate-head"><b>Candidate evaluation is temporarily unavailable</b></div>') +
+        `<p>${VCS.esc((result && result.error) || tr(
+          'runtime.project.rendercandidateevaluation.no_auditable_result', {},
+          '后端没有返回可审计评价。', 'The backend returned no auditable evaluation.'))}</p>`;
       return;
     }
     const decision = evaluation.decision || {};
@@ -3012,23 +3133,33 @@
     const recommendations = (Array.isArray(evaluation.recommendations)
       ? evaluation.recommendations : []).filter(
       item => item && typeof item === 'object').slice(0, 3);
-    let html = `<div class="pj-candidate-head"><div><span>吸附能候选评价</span>` +
-      `<b>${VCS.esc(CANDIDATE_PRIORITY_ZH[priority])}</b></div>` +
-      '<small>Sabatier 初筛，不替代自由能与 NEB</small></div>' +
-      `<p class="pj-candidate-summary">${VCS.esc(decision.summary_zh || '当前证据不足。')}</p>` +
+    let html = tr("runtime.project.rendercandidateevaluation.text_4bf0ff4438", {}, `<div class="pj-candidate-head"><div><span>吸附能候选评价</span>`, '<div class="pj-candidate-head"><div><span>Adsorption-energy candidate evaluation</span>') +
+      `<b>${VCS.esc(candidateLabel(CANDIDATE_PRIORITY_ZH, priority))}</b></div>` +
+      tr("runtime.project.rendercandidateevaluation.text_c96dd21661", {}, '<small>Sabatier 初筛，不替代自由能与 NEB</small></div>', '<small>Sabatier screening; not a substitute for free-energy or NEB calculations</small></div>') +
+      `<p class="pj-candidate-summary">${VCS.esc(decision.summary_zh || tr(
+        'runtime.project.rendercandidateevaluation.insufficient_evidence', {},
+        '当前证据不足。', 'Current evidence is insufficient.'))}</p>` +
       '<div class="pj-candidate-metrics">' +
-      `<span><small>结论上限</small><b>${VCS.esc(CLAIM_CEILING_ZH[claim] || claim)}</b>` +
+      tr("runtime.project.rendercandidateevaluation.text_483a763f67", {
+        value1: VCS.esc(candidateLabel(CLAIM_CEILING_ZH, claim)),
+      }, `<span><small>结论上限</small><b>{value1}</b>`, '<span><small>Conclusion ceiling</small><b>{value1}</b>') +
       `<code>${VCS.esc(claim)}</code></span>` +
-      `<span><small>短链风险</small><b>${VCS.esc(SHORT_CHAIN_RISK_ZH[risk] || risk)}</b>` +
+      tr("runtime.project.rendercandidateevaluation.text_cbc7517082", {
+        value1: VCS.esc(candidateLabel(SHORT_CHAIN_RISK_ZH, risk)),
+      }, `<span><small>短链风险</small><b>{value1}</b>`, '<span><small>Short-chain risk</small><b>{value1}</b>') +
       `<code>${VCS.esc(risk)}</code></span></div>`;
     if (recommendations.length) {
-      html += '<div class="pj-candidate-next"><b>建议的下一步（前 3 项）</b><ol>';
+      html += tr("runtime.project.rendercandidateevaluation.text_aa249c39c5", {}, '<div class="pj-candidate-next"><b>建议的下一步（前 3 项）</b><ol>', '<div class="pj-candidate-next"><b>Recommended next steps (top 3)</b><ol>');
       recommendations.forEach(item => {
-        const targets = (Array.isArray(item.targets) ? item.targets : []).map(String).join('、');
+        const english = !!(VCS.i18n && VCS.i18n.lang === 'en');
+        const targets = (Array.isArray(item.targets) ? item.targets : []).map(String)
+          .join(english ? ', ' : '、');
         html += '<li><b>' + VCS.esc(
-          `${item.priority || 'P2'} · ${item.action_zh || item.code || '继续核验'}`) +
+          `${item.priority || 'P2'} · ${item.action_zh || item.code || tr(
+            'runtime.project.rendercandidateevaluation.continue_validation', {},
+            '继续核验', 'Continue validation')}`) +
           '</b><span>' + VCS.esc(item.reason || '') +
-          (targets ? `；目标：${VCS.esc(targets)}` : '') + '</span></li>';
+          (targets ? tr("runtime.project.rendercandidateevaluation.text_55acf455ef", { value1: (VCS.esc(targets)) }, `；目标：{value1}`, '; target: {value1}') : '') + '</span></li>';
       });
       html += '</ol></div>';
     }
@@ -3060,18 +3191,22 @@
   function unavailableReportFormatText(items) {
     const groups = new Map();
     items.forEach(item => {
-      const reason = item.reason || '后端未明确报告此格式可用。';
+      const reason = item.reason || tr("runtime.project.unavailablereportformattext.text_892f4795ec", {}, '后端未明确报告此格式可用。', 'The backend did not explicitly report this format as available.');
       const labels = groups.get(reason) || [];
       labels.push(item.label);
       groups.set(reason, labels);
     });
-    return Array.from(groups, ([reason, labels]) =>
-      `${labels.join('、')}（${reason}）`).join('；');
+    const english = !!(VCS.i18n && VCS.i18n.lang === 'en');
+    return Array.from(groups, ([reason, labels]) => tr(
+      'runtime.project.report.unavailable_format_group', {
+        formats: labels.join(english ? ', ' : '、'), reason,
+      }, '{formats}（{reason}）', '{formats} ({reason})'))
+      .join(english ? '; ' : '；');
   }
 
   function setReportCapabilityFailure(reason) {
-    const detail = String(reason || '报告格式能力检测失败。').trim();
-    const unavailableReason = `${detail}；未获得可用的明确确认。`;
+    const detail = String(reason || tr("runtime.project.setreportcapabilityfailure.text_1114919714", {}, '报告格式能力检测失败。', 'Report-format capability detection failed.')).trim();
+    const unavailableReason = tr("runtime.project.setreportcapabilityfailure.text_5a10b244e0", { value1: (detail) }, `{value1}；未获得可用的明确确认。`, '{value1}; no explicit confirmation of availability was obtained.');
     State.reportCapabilities = {
       html: { available: true, reason: '' },
       docx: { available: false, reason: unavailableReason },
@@ -3091,7 +3226,7 @@
         available,
         reason: available ? '' : String(
           capability && capability.reason ||
-          '后端未明确报告此格式可用。'),
+          tr("runtime.project.applyreportcapabilities.text_892f4795ec", {}, '后端未明确报告此格式可用。', 'The backend did not explicitly report this format as available.')),
       };
     });
     State.reportCapabilities = normalized;
@@ -3113,7 +3248,7 @@
       const capability = State.reportCapabilities && State.reportCapabilities[item.value];
       const disabledByCapability = !(capability && capability.available === true);
       const reason = disabledByCapability
-        ? String(capability && capability.reason || '后端未明确报告此格式可用。') : '';
+        ? String(capability && capability.reason || tr("runtime.project.syncreportformatcontrols.text_892f4795ec", {}, '后端未明确报告此格式可用。', 'The backend did not explicitly report this format as available.')) : '';
       if (disabledByCapability) unavailable.push({ label: item.label, reason });
       if (input) {
         const controlDisabled = State.reportBusy || disabledByCapability;
@@ -3127,7 +3262,7 @@
             'pending', disabledByCapability && State.reportCapabilityState === 'pending');
           label.title = disabledByCapability ? reason : '';
           const description = label.querySelector('small');
-          if (description) description.textContent = disabledByCapability ? reason : item.description;
+          if (description) description.textContent = disabledByCapability ? reason : item.description();
         }
       }
     });
@@ -3140,17 +3275,20 @@
     if (status) {
       const unavailableText = unavailableReportFormatText(unavailable);
       const unavailablePrefix = State.reportCapabilityState === 'pending'
-        ? '能力检测中' : '当前不可用';
+        ? tr("runtime.project.syncreportformatcontrols.text_c5d534da64", {}, '能力检测中', 'Detecting capability') : tr("runtime.project.syncreportformatcontrols.text_2bf37fbe50", {}, '当前不可用', 'Currently unavailable');
       status.classList.toggle('bad', !valid);
       status.textContent = valid
-        ? `已选择：${labels.split(' / ').join('、')}` +
+        ? tr("runtime.project.syncreportformatcontrols.text_c1358558fd", { value1: (labels.split(' / ').join('、')) }, `已选择：{value1}`, 'Selected: {value1}') +
           (unavailable.length ? `；${unavailablePrefix}：${unavailableText}` : '')
-        : '请至少选择一种报告格式。' +
+        : tr("runtime.project.syncreportformatcontrols.text_322b55db53", {}, '请至少选择一种报告格式。', 'Select at least one report format.') +
           (unavailable.length ? ` ${unavailablePrefix}：${unavailableText}` : '');
     }
     if (button) {
-      const prefix = State.reportDiagnostic ? '在工作台配置诊断报告' : '打开报告工作台';
-      button.textContent = valid ? `${prefix}（${labels}）` : `${prefix}（请选择格式）`;
+      const prefix = State.reportDiagnostic ? tr("runtime.project.syncreportformatcontrols.text_a73e7ab0fe", {}, '在工作台配置诊断报告', 'Configure diagnostic report in the workbench') : tr("runtime.project.syncreportformatcontrols.text_a92bdc8948", {}, '打开报告工作台', 'Open Report Workbench');
+      button.textContent = valid
+        ? tr('runtime.project.report.selected_formats', { prefix, formats: labels },
+          '{prefix}（{formats}）', '{prefix} ({formats})')
+        : tr("runtime.project.syncreportformatcontrols.text_9abe43dfb0", { value1: (prefix) }, `{value1}（请选择格式）`, '{value1} (select a format)');
       button.disabled = State.reportBusy || !selectedProject || !valid;
     }
     return formats;
@@ -3166,30 +3304,30 @@
       if (generation !== State.reportCapabilityGeneration) return;
       if (bridgeMethodUnavailable(result)) {
         setReportCapabilityFailure(
-          result && result.error || '当前后端未提供报告格式能力检测。');
+          result && result.error || tr("runtime.project.loadreportcapabilities.text_ae789b9f8d", {}, '当前后端未提供报告格式能力检测。', 'The current backend does not provide report-format capability detection.'));
         return;
       }
       if (!result || result.ok === false) {
-        setReportCapabilityFailure(result && result.error || '报告格式能力检测失败。');
+        setReportCapabilityFailure(result && result.error || tr("runtime.project.loadreportcapabilities.text_1114919714", {}, '报告格式能力检测失败。', 'Report-format capability detection failed.'));
         return;
       }
       if (!result.formats || typeof result.formats !== 'object') {
-        setReportCapabilityFailure('能力检测未返回格式清单。');
+        setReportCapabilityFailure(tr("runtime.project.loadreportcapabilities.text_c980c806d4", {}, '能力检测未返回格式清单。', 'Capability detection returned no format list.'));
         return;
       }
       applyReportCapabilities(result.formats);
     } catch (error) {
       if (generation !== State.reportCapabilityGeneration) return;
       setReportCapabilityFailure(
-        error && error.message || '报告格式能力检测调用失败。');
+        error && error.message || tr("runtime.project.loadreportcapabilities.text_9bad8763ac", {}, '报告格式能力检测调用失败。', 'The report-format capability request failed.'));
     }
   }
 
   function requireReportFormats() {
     const formats = syncReportFormatControls();
     if (formats.length) return formats;
-    VCS.log('生成报告前请至少选择一种格式（HTML、DOCX 或 PDF）。', 'failc');
-    VCS.toast('请至少选择一种报告格式', 'fail');
+    VCS.log(tr("runtime.project.requirereportformats.text_b4e051bf74", {}, '生成报告前请至少选择一种格式（HTML、DOCX 或 PDF）。', 'Select at least one format (HTML, DOCX, or PDF) before generating a report.'), 'failc');
+    VCS.toast(tr("runtime.project.requirereportformats.text_7d6a817607", {}, '请至少选择一种报告格式', 'Select at least one report format'), 'fail');
     const first = $(SINGLE_REPORT_FORMATS[0].id);
     if (first && typeof first.focus === 'function') first.focus();
     return null;
@@ -3199,6 +3337,7 @@
     const generation = ++State.candidateEvaluationGeneration;
     const wanted = String(path || '');
     if (!wanted) {
+      State.candidateEvaluation = null;
       hideCandidateEvaluation();
       return;
     }
@@ -3207,9 +3346,11 @@
     const result = await VCS.call('proj_evaluate_candidate', wanted);
     if (generation !== State.candidateEvaluationGeneration) return;
     if (!result || bridgeMethodUnavailable(result)) {
+      State.candidateEvaluation = null;
       hideCandidateEvaluation();
       return;
     }
+    State.candidateEvaluation = result;
     renderCandidateEvaluation(result);
   }
 
@@ -3223,7 +3364,7 @@
     const csvButton = $('pj-csv');
     if (!box) return;
     if (!project) {
-      box.innerHTML = '<b>还没有可查看的项目</b><span>下一步：先导入已算结果，或用参考能开始新的吸附计算。</span>';
+      box.innerHTML = tr("runtime.project.updateprojectsummary.text_f514e76994", {}, '<b>还没有可查看的项目</b><span>下一步：先导入已算结果，或用参考能开始新的吸附计算。</span>', '<b>No project is available to view</b><span>Next: import completed results, or start a new adsorption calculation with reference energies.</span>');
       [deltaButton, reportButton, csvButton].forEach(button => { if (button) button.disabled = true; });
       State.reportDiagnostic = false;
       syncReportFormatControls();
@@ -3237,9 +3378,9 @@
     const refs = referenceSpecies(project);
     const referenceMode = String(project.reference_mode || '').toLowerCase();
     const refText = refs.length
-      ? `逐物种参考 ${refs.length} 个：${refs.join('、')}`
-      : ['species', 'species_refs'].includes(referenceMode) ? '逐物种参考（具体物种见 ΔE 表）'
-        : ['single', 'gas_ref'].includes(referenceMode) ? '统一气相参考' : '参考模式待 ΔE 检查确认';
+      ? tr("runtime.project.updateprojectsummary.text_5285830c2a", { value1: (refs.length), value2: (refs.join('、')) }, `逐物种参考 {value1} 个：{value2}`, '{value1} per-species references: {value2}')
+      : ['species', 'species_refs'].includes(referenceMode) ? tr("runtime.project.updateprojectsummary.text_0c3f09a792", {}, '逐物种参考（具体物种见 ΔE 表）', 'Per-species references (see the ΔE table for species)')
+        : ['single', 'gas_ref'].includes(referenceMode) ? tr("runtime.project.updateprojectsummary.text_2141611425", {}, '统一气相参考', 'Unified gas-phase reference') : tr("runtime.project.updateprojectsummary.text_1a7d5a3e1b", {}, '参考模式待 ΔE 检查确认', 'Reference mode awaits ΔE validation');
     const rows = deltaResult && (deltaResult.rows || []);
     const methodBlocked = String(deltaResult && deltaResult.method_consistency &&
       deltaResult.method_consistency.status || '').toLowerCase() === 'incompatible';
@@ -3251,32 +3392,41 @@
     let stage;
     let next;
     if (methodBlocked) {
-      stage = '方法不一致，ΔE 已阻断';
-      next = '下一步：统一泛函、ENCUT、色散和 POTCAR 后重算。';
+      stage = tr("runtime.project.updateprojectsummary.text_202ca8b170", {}, '方法不一致，ΔE 已阻断', 'Method mismatch; ΔE blocked');
+      next = tr("runtime.project.updateprojectsummary.text_6f1d108025", {}, '下一步：统一泛函、ENCUT、色散和 POTCAR 后重算。', 'Next: align the functional, ENCUT, dispersion, and POTCAR, then recalculate.');
     } else if (complete) {
-      stage = 'ΔE 已完整'; next = '下一步：后台会自动生成 HTML、Word 与 PDF，也可立即手动生成。';
+      stage = tr("runtime.project.updateprojectsummary.text_78a04f189e", {}, 'ΔE 已完整', 'ΔE is complete'); next = tr("runtime.project.updateprojectsummary.text_b678f7c02f", {}, '下一步：后台会自动生成 HTML、Word 与 PDF，也可立即手动生成。', 'Next: HTML, Word, and PDF will be generated in the background, or you can generate them now.');
     } else if (rows && rows.length && rows.every(row => row.delta_e != null) && backendFinal === false) {
-      stage = 'ΔE 可预览，最终报告仍被门禁阻止';
-      next = `下一步：${deltaResult.final_report_reason || '补齐参考态与方法确认。'}`;
+      stage = tr("runtime.project.updateprojectsummary.text_2cd4b30065", {}, 'ΔE 可预览，最终报告仍被门禁阻止', 'ΔE preview is available, but the final report is still blocked by the gate');
+      next = tr("runtime.project.updateprojectsummary.text_dcc99113a2", {
+        value1: deltaResult.final_report_reason || tr(
+          'runtime.project.updateprojectsummary.complete_reference_and_method', {},
+          '补齐参考态与方法确认。', 'Complete the reference-state and method confirmations.'),
+      }, `下一步：{value1}`, 'Next: {value1}');
     } else if (missing != null && missing > 0) {
-      stage = `${missing} 个构型尚缺可靠 ΔE`;
-      next = '下一步：保持软件运行等待自动下载/续算，完成后点“刷新并计算 ΔE”。';
+      stage = tr("runtime.project.updateprojectsummary.text_6447ef3714", { value1: (missing) }, `{value1} 个构型尚缺可靠 ΔE`, '{value1} configurations still lack reliable ΔE');
+      next = tr("runtime.project.updateprojectsummary.text_79bd6b9f2d", {}, '下一步：保持软件运行等待自动下载/续算，完成后点“刷新并计算 ΔE”。', 'Next: keep the application running for automatic download/continuation; when complete, select Refresh and calculate ΔE.');
     } else if (done != null && total && done < total) {
-      stage = `自动运行中 ${done}/${total}`;
-      next = '下一步：保持软件运行；任务完成后回来刷新 ΔE。';
+      stage = tr("runtime.project.updateprojectsummary.text_649f897b50", { value1: (done), value2: (total) }, `自动运行中 {value1}/{value2}`, 'Automatic execution {value1}/{value2}');
+      next = tr("runtime.project.updateprojectsummary.text_9374d1b15a", {}, '下一步：保持软件运行；任务完成后回来刷新 ΔE。', 'Next: keep the application running; return and refresh ΔE after the tasks complete.');
     } else if (!total && refs.length) {
-      stage = '参考能库已就绪'; next = '下一步：用这些参考能开始新的 slab / adsorption 计算。';
+      stage = tr("runtime.project.updateprojectsummary.text_8ba08115c9", {}, '参考能库已就绪', 'Reference-energy library ready'); next = tr("runtime.project.updateprojectsummary.text_bb26b8d3a6", {}, '下一步：用这些参考能开始新的 slab / adsorption 计算。', 'Next: use these reference energies for a new slab / adsorption calculation.');
     } else if (pipelineStage === 'submit') {
-      stage = '作业已生成，等待提交';
-      next = '下一步：到任务页提交尚未上传的成员；此时自动监控尚未开始。';
+      stage = tr("runtime.project.updateprojectsummary.text_b4b81e5b9d", {}, '作业已生成，等待提交', 'Jobs generated and awaiting submission');
+      next = tr("runtime.project.updateprojectsummary.text_343a3df991", {}, '下一步：到任务页提交尚未上传的成员；此时自动监控尚未开始。', 'Next: submit members that have not been uploaded from Jobs; automatic monitoring has not started yet.');
     } else if (pipelineStage) {
-      stage = `管线阶段：${pipelineStage}`;
-      next = '下一步：保持软件运行；任务完成后点“刷新并计算 ΔE”。';
+      stage = tr("runtime.project.updateprojectsummary.text_fde78e08e2", { value1: (pipelineStage) }, `管线阶段：{value1}`, 'Pipeline stage: {value1}');
+      next = tr("runtime.project.updateprojectsummary.text_04e3993d4a", {}, '下一步：保持软件运行；任务完成后点“刷新并计算 ΔE”。', 'Next: keep the application running; when tasks complete, select Refresh and calculate ΔE.');
     } else {
-      stage = State.workflowSubmitted ? '自动托管运行中' : '等待结果检查';
-      next = '下一步：点击“刷新并计算 ΔE”，软件会明确列出仍缺少的结果。';
+      stage = State.workflowSubmitted ? tr("runtime.project.updateprojectsummary.text_9786ecf452", {}, '自动托管运行中', 'Autopilot running') : tr("runtime.project.updateprojectsummary.text_db3a5192cd", {}, '等待结果检查', 'Waiting for result validation');
+      next = tr("runtime.project.updateprojectsummary.text_b95529f1af", {}, '下一步：点击“刷新并计算 ΔE”，软件会明确列出仍缺少的结果。', 'Next: select Refresh and calculate ΔE; the application will list every result that is still missing.');
     }
-    box.innerHTML = `<div class="pj-summary-chips"><span>${VCS.esc(total ? `成员 ${done == null ? '?' : done}/${total}` : '参考项目')}</span>` +
+    const progressText = total
+      ? tr('runtime.project.summary.member_progress', {
+        done: done == null ? '?' : done, total,
+      }, '成员 {done}/{total}', 'Members {done}/{total}')
+      : tr('runtime.project.summary.reference_project', {}, '参考项目', 'Reference project');
+    box.innerHTML = `<div class="pj-summary-chips"><span>${VCS.esc(progressText)}</span>` +
       `<span>${VCS.esc(refText)}</span><span>${VCS.esc(stage)}</span></div><b>${VCS.esc(next)}</b>`;
     if (deltaButton) deltaButton.classList.toggle('primary', !complete);
     if (reportButton) reportButton.classList.toggle('primary', complete);
@@ -3287,7 +3437,7 @@
   function currentProject() {
     const sel = $('pj-select');
     const path = sel ? sel.value : '';
-    if (!path) { VCS.log('请先选择一个项目', 'failc'); return null; }
+    if (!path) { VCS.log(tr("runtime.project.currentproject.text_27420ded1e", {}, '请先选择一个项目', 'Select a project first'), 'failc'); return null; }
     return State.projects.find(p => p.path === path) || { path, name: '' };
   }
 
@@ -3297,13 +3447,14 @@
     if (!proj) return null;
     const box = $('pj-table');
     if (box) box.innerHTML = '';
-    VCS.log('计算项目「' + (proj.name || '') + '」的 ΔE…');
+    VCS.log(tr("runtime.project.delta.text_b9609f43e7", {}, '计算项目「', 'Calculating ΔE for project “') + (proj.name || '') + tr("runtime.project.delta.text_0d02fca122", {}, '」的 ΔE…', '”…'));
     const r = await VCS.call('proj_delta', proj.path);
     if (!r || r.ok === false || r.error) {
-      VCS.log('计算 ΔE 失败:' + ((r && r.error) || '未知错误'), 'failc');
+      VCS.log(tr("runtime.project.delta.text_bebc908a4e", {}, '计算 ΔE 失败:', 'ΔE calculation failed:') + ((r && r.error) || tr("runtime.project.delta.text_bd5e21c357", {}, '未知错误', 'Unknown error')), 'failc');
       updateProjectSummary();
       return null;
     }
+    State.deltaResult = r;
     renderDelta(r);
     refreshCandidateEvaluation(proj.path);
     const rows = r.rows || [];
@@ -3317,7 +3468,7 @@
     updateProjectSummary(r);
     updateJourney();
     if (State.workflowAnalysisReady && !State.workflowResultReady) {
-      VCS.toast('ΔE 已完整；下一步生成完整报告');
+      VCS.toast(tr("runtime.project.delta.text_5fbd22e8e9", {}, 'ΔE 已完整；下一步生成完整报告', 'ΔE is complete; generate the full report next'));
     }
     return r;
   }
@@ -3331,21 +3482,21 @@
     if (row && row.delta_e != null) return '';
     const methodCheck = row && row.method_check || {};
     if (methodCheck.status === 'incompatible' || /方法不一致/.test(note)) {
-      return '下一步：按方法检查列出的泛函、ENCUT、色散、共享元素 POTCAR/DFT+U 等硬冲突逐项修正后重算。合法的 ISPIN 差异本身不会触发此阻断。';
+      return tr("runtime.project.deltarepair.text_4a2b80130f", {}, '下一步：按方法检查列出的泛函、ENCUT、色散、共享元素 POTCAR/DFT+U 等硬冲突逐项修正后重算。合法的 ISPIN 差异本身不会触发此阻断。', 'Next: resolve each blocking conflict listed by the method check—functional, ENCUT, dispersion, shared-element POTCAR/DFT+U, and so on—then recalculate. A valid ISPIN difference alone does not trigger this block.');
     }
     if (methodCheck.status === 'unverified') {
-      return '下一步：按方法检查逐项核对；分子参考、clean slab 与吸附构型可采用各自正确的基态自旋，自旋差异本身只作提示。';
+      return tr("runtime.project.deltarepair.text_29614719ba", {}, '下一步：按方法检查逐项核对；分子参考、clean slab 与吸附构型可采用各自正确的基态自旋，自旋差异本身只作提示。', 'Next: review each method-check item. Molecular references, the clean slab, and adsorption configurations may use their own correct ground-state spins; spin differences alone are advisory.');
     }
     if (/构型未完成|清洁表面未完成|未完成/.test(note)) {
-      return '下一步：保持软件运行等待自动续算/下载；任务 DONE 后重新计算 ΔE。';
+      return tr("runtime.project.deltarepair.text_64af0891f4", {}, '下一步：保持软件运行等待自动续算/下载；任务 DONE 后重新计算 ΔE。', 'Next: keep the application running for automatic continuation/download; recalculate ΔE after the task is DONE.');
     }
     if (/无匹配物种参考|参考能量/.test(note)) {
-      return '下一步：确认该构型的物种映射，并导入同名 Li-S 参考能。';
+      return tr("runtime.project.deltarepair.text_76c53399d6", {}, '下一步：确认该构型的物种映射，并导入同名 Li-S 参考能。', 'Next: confirm the species mapping for this configuration and import the matching Li-S reference energy.');
     }
     if (/能量缺失|不合理/.test(note)) {
-      return '下一步：拉回 OUTCAR / OSZICAR，若仍无可靠 E0 则修复或续算该成员。';
+      return tr("runtime.project.deltarepair.text_2802c02350", {}, '下一步：拉回 OUTCAR / OSZICAR，若仍无可靠 E0 则修复或续算该成员。', 'Next: retrieve OUTCAR / OSZICAR; if reliable E0 is still unavailable, repair or continue that member.');
     }
-    return '下一步：查看备注中的缺项，修正后点“刷新并计算 ΔE”。';
+    return tr("runtime.project.deltarepair.text_3ddf57fb7a", {}, '下一步：查看备注中的缺项，修正后点“刷新并计算 ΔE”。', 'Next: review the missing items in the notes, correct them, then select Refresh and calculate ΔE.');
   }
 
   function renderDelta(r) {
@@ -3360,34 +3511,34 @@
     const methodWarnings = (method.warnings || []).map(String);
     const methodAdvisories = (method.advisories || []).map(String);
     if (methodStatus === 'incompatible') {
-      h += '<div class="pj-method-gate incompatible"><b>方法不一致：ΔE 已阻断</b>' +
-        '<span>请按下列泛函、ENCUT、色散、共享元素 POTCAR/DFT+U 等硬冲突逐项修正后重新计算。合法的 ISPIN 差异不属于硬冲突。</span>' +
+      h += tr("runtime.project.renderdelta.text_fc3e9fc6b4", {}, '<div class="pj-method-gate incompatible"><b>方法不一致：ΔE 已阻断</b>', '<div class="pj-method-gate incompatible"><b>Method mismatch: ΔE blocked</b>') +
+        tr("runtime.project.renderdelta.text_21c2919912", {}, '<span>请按下列泛函、ENCUT、色散、共享元素 POTCAR/DFT+U 等硬冲突逐项修正后重新计算。合法的 ISPIN 差异不属于硬冲突。</span>', '<span>Resolve each blocking conflict below—functional, ENCUT, dispersion, shared-element POTCAR/DFT+U, and so on—then recalculate. Valid ISPIN differences are not blocking conflicts.</span>') +
         (methodIssues.length ? `<ul>${methodIssues.map(x => `<li>${VCS.esc(x)}</li>`).join('')}</ul>` : '') +
         '</div>';
     } else if (methodStatus === 'unverified') {
-      h += '<div class="pj-method-gate unverified"><b>方法一致性尚未完全核验</b>' +
-        '<span>请按下列具体项目逐项核对；分子参考、clean slab 与吸附构型可采用各自正确的基态自旋，自旋差异本身只作提示。</span>' +
+      h += tr("runtime.project.renderdelta.text_a9970cd3e2", {}, '<div class="pj-method-gate unverified"><b>方法一致性尚未完全核验</b>', '<div class="pj-method-gate unverified"><b>Method consistency is not fully verified</b>') +
+        tr("runtime.project.renderdelta.text_6c7afbe712", {}, '<span>请按下列具体项目逐项核对；分子参考、clean slab 与吸附构型可采用各自正确的基态自旋，自旋差异本身只作提示。</span>', '<span>Review each item below. Molecular references, the clean slab, and adsorption configurations may use their own correct ground-state spins; spin differences alone are advisory.</span>') +
         (methodWarnings.length ? `<ul>${methodWarnings.map(x => `<li>${VCS.esc(x)}</li>`).join('')}</ul>` : '') +
         '</div>';
     } else if (methodStatus === 'verified') {
-      h += '<div class="pj-method-gate verified"><b>方法一致性已核验</b>' +
-        '<span>本项目能量相减项已通过记录层面的一致性检查。</span></div>';
+      h += tr("runtime.project.renderdelta.text_ff5287fde8", {}, '<div class="pj-method-gate verified"><b>方法一致性已核验</b>', '<div class="pj-method-gate verified"><b>Method consistency verified</b>') +
+        tr("runtime.project.renderdelta.text_a5c91c27ee", {}, '<span>本项目能量相减项已通过记录层面的一致性检查。</span></div>', '<span>The energy terms subtracted in this project passed record-level consistency checks.</span></div>');
     }
     if (methodAdvisories.length) {
-      h += '<div class="pj-method-gate advisory"><b>体系自旋提示（不阻断 ΔE）</b>' +
-        '<span>分子参考与周期体系 ISPIN 不同可以是合理的基态设置；分子、clean slab 与吸附体系可分别采用各自经验证的基态自旋；以下内容仅用于审计与复核。</span>' +
+      h += tr("runtime.project.renderdelta.text_c3fe9dada3", {}, '<div class="pj-method-gate advisory"><b>体系自旋提示（不阻断 ΔE）</b>', '<div class="pj-method-gate advisory"><b>System-spin note (does not block ΔE)</b>') +
+        tr("runtime.project.renderdelta.text_2b1eea08b1", {}, '<span>分子参考与周期体系 ISPIN 不同可以是合理的基态设置；分子、clean slab 与吸附体系可分别采用各自经验证的基态自旋；以下内容仅用于审计与复核。</span>', '<span>Different ISPIN values for molecular references and periodic systems may be valid ground-state settings. Molecules, the clean slab, and adsorption systems may each use their independently validated ground-state spin; the following information is for audit and review only.</span>') +
         `<ul>${methodAdvisories.map(x => `<li>${VCS.esc(x)}</li>`).join('')}</ul></div>`;
     }
     if (!rows.length) {
-      h += '<div class="empty"><p>该项目暂无吸附构型成员</p></div>';
+      h += tr("runtime.project.renderdelta.text_d7da2ed3d4", {}, '<div class="empty"><p>该项目暂无吸附构型成员</p></div>', '<div class="empty"><p>This project has no adsorption-configuration members</p></div>');
       box.innerHTML = h;
       return;
     }
     const referenceMode = String(r.reference_mode || '').toLowerCase();
     h += '<table><thead><tr>' +
-      '<th>构型</th><th>状态</th><th class="num">E_config (eV)</th>' +
-      '<th>参考物种 / E_ref (eV)</th><th class="num">ΔE (eV)</th>' +
-      '<th class="num">ΔΔE (eV)</th><th>组内比较</th><th>公式与备注</th>' +
+      tr("runtime.project.renderdelta.text_ac3a1c1ce9", {}, '<th>构型</th><th>状态</th><th class="num">E_config (eV)</th>', '<th>Configuration</th><th>Status</th><th class="num">E_config (eV)</th>') +
+      tr("runtime.project.renderdelta.text_84e02a4d13", {}, '<th>参考物种 / E_ref (eV)</th><th class="num">ΔE (eV)</th>', '<th>Reference species / E_ref (eV)</th><th class="num">ΔE (eV)</th>') +
+      tr("runtime.project.renderdelta.text_6a385c2f9f", {}, '<th class="num">ΔΔE (eV)</th><th>组内比较</th><th>公式与备注</th>', '<th class="num">ΔΔE (eV)</th><th>Within-group comparison</th><th>Formula and notes</th>') +
       '</tr></thead><tbody>';
     rows.forEach(row => {
       const rowMode = String(row.reference_mode || referenceMode || '').toLowerCase();
@@ -3396,11 +3547,12 @@
         : row.reference_energy_e0_eV != null ? row.reference_energy_e0_eV : row.e_reference;
       let refLabel;
       if (['species', 'species_refs'].includes(rowMode) || species) {
-        refLabel = `${species || '逐物种参考'} / ${fmt(eRef, 6)}`;
+        refLabel = `${species || tr('runtime.project.delta.species_reference', {},
+          '逐物种参考', 'Per-species reference')} / ${fmt(eRef, 6)}`;
       } else if (['single', 'gas_ref'].includes(rowMode) || eRef != null) {
-        refLabel = `统一气相参考 / ${fmt(eRef, 6)}`;
+        refLabel = tr("runtime.project.renderdelta.text_b1c743dcff", { value1: (fmt(eRef, 6)) }, `统一气相参考 / {value1}`, 'Unified gas-phase reference / {value1}');
       } else {
-        refLabel = '参考信息待确认';
+        refLabel = tr("runtime.project.renderdelta.text_46cdc9a3db", {}, '参考信息待确认', 'Reference information awaiting confirmation');
       }
       const formula = row.formula || row.delta_formula ||
         (['species', 'species_refs'].includes(rowMode) || species
@@ -3413,7 +3565,12 @@
         `<td class="mono">${VCS.esc(refLabel)}</td>` +
         `<td class="num">${row.delta_e == null ? '—' : VCS.esc(fmt(row.delta_e, 4))}</td>` +
         `<td class="num">${row.dd_e == null ? '—' : VCS.esc(fmt(row.dd_e, 4))}</td>` +
-        `<td>${row.delta_e == null ? '—' : row.is_most_stable ? '<span class="pj-stable">最稳构型</span>' : '同物种对照'}</td>` +
+        `<td>${row.delta_e == null ? '—' : row.is_most_stable
+          ? tr('runtime.project.delta.most_stable_badge', {},
+            '<span class="pj-stable">最稳构型</span>',
+            '<span class="pj-stable">Most stable</span>')
+          : tr('runtime.project.delta.same_species_comparison', {},
+            '同物种对照', 'Same-species comparison')}</td>` +
         `<td class="sub"><span class="pj-delta-formula">${VCS.esc(formula)}</span>` +
         `${VCS.esc(row.note ? ' · ' + row.note : '')}` +
         (row.delta_e == null ? `<span class="pj-delta-fix">${VCS.esc(deltaRepair(row))}</span>` : '') + '</td></tr>';
@@ -3427,18 +3584,18 @@
     const proj = currentProject();
     if (!proj) return;
     const dr = await VCS.call('pick_dir');
-    if (dr && dr.error) { VCS.log('选择目录失败:' + dr.error, 'failc'); return; }
+    if (dr && dr.error) { VCS.log(tr("runtime.project.exportcsv.text_d802c7d8d3", {}, '选择目录失败:', 'Failed to select directory:') + dr.error, 'failc'); return; }
     if (!dr || !dr.path) return;   // 用户取消
     const save = joinPath(dr.path, (proj.name || 'project') + '_delta_e.csv');
-    VCS.log('导出 ΔE 表到:' + save + '…');
+    VCS.log(tr("runtime.project.exportcsv.text_ad1a1424a5", {}, '导出 ΔE 表到:', 'Exporting the ΔE table to:') + save + '…');
     const r = await VCS.call('proj_export_csv', proj.path, save);
     if (!r || r.ok === false || r.error) {
-      VCS.log('导出 CSV 失败:' + ((r && r.error) || '未知错误'), 'failc');
+      VCS.log(tr("runtime.project.exportcsv.text_37ffc76d79", {}, '导出 CSV 失败:', 'CSV export failed:') + ((r && r.error) || tr("runtime.project.exportcsv.text_bd5e21c357", {}, '未知错误', 'Unknown error')), 'failc');
       return;
     }
-    VCS.log('已导出 CSV:' + (r.file || save), 'okc');
+    VCS.log(tr("runtime.project.exportcsv.text_a3f7b7abdd", {}, '已导出 CSV:', 'CSV exported:') + (r.file || save), 'okc');
     VCS.call('open_dir', r.file || save);       // 输出反馈统一:打开所在目录
-    VCS.toast('已导出 CSV');
+    VCS.toast(tr("runtime.project.exportcsv.text_bccd5bb6de", {}, '已导出 CSV', 'CSV exported'));
   }
 
   function bridgeMethodUnavailable(result) {
@@ -3450,11 +3607,11 @@
     const raw = String(result && (
       result.scientific_status || result.report_status || result.report_kind || result.kind
     ) || 'pending').trim().toLowerCase();
-    if (raw === 'final') return { key: 'final', label: '最终' };
-    if (raw === 'diagnostic') return { key: 'diagnostic', label: '诊断' };
-    if (raw === 'draft') return { key: 'draft', label: '草稿' };
-    if (raw === 'blocked') return { key: 'blocked', label: '阻断' };
-    return { key: 'pending', label: '待判定' };
+    if (raw === 'final') return { key: 'final', label: tr("runtime.project.reportsciencestate.text_04cbc58d7a", {}, '最终', 'Final') };
+    if (raw === 'diagnostic') return { key: 'diagnostic', label: tr("runtime.project.reportsciencestate.text_bb9d7d9b21", {}, '诊断', 'Diagnostic') };
+    if (raw === 'draft') return { key: 'draft', label: tr("runtime.project.reportsciencestate.text_f6afc42806", {}, '草稿', 'Draft') };
+    if (raw === 'blocked') return { key: 'blocked', label: tr("runtime.project.reportsciencestate.text_2378769b47", {}, '阻断', 'Blocked') };
+    return { key: 'pending', label: tr("runtime.project.reportsciencestate.text_4e1c2e9f82", {}, '待判定', 'Undetermined') };
   }
 
   function reportStateMarkup(result, files) {
@@ -3467,27 +3624,27 @@
         ? 'failed'
         : generated ? 'ready' : 'pending';
     const productLabel = artifactRaw === 'generated_unrecorded'
-      ? `已生成 ${files.length} 个文件但未登记`
+      ? tr("runtime.project.reportstatemarkup.text_d80d825de3", { value1: (files.length) }, `已生成 {value1} 个文件但未登记`, 'Generated {value1} files but did not register them')
       : artifactRaw === 'stale'
-        ? '产物已过期'
+        ? tr("runtime.project.reportstatemarkup.text_9ddd9ddc4f", {}, '产物已过期', 'Artifacts are stale')
         : generated
-          ? `已生成 ${files.length} 个文件`
-          : (productKey === 'failed' ? '生成失败' : '尚未生成');
+          ? tr("runtime.project.reportstatemarkup.text_c2a1fa04ac", { value1: (files.length) }, `已生成 {value1} 个文件`, 'Generated {value1} files')
+          : (productKey === 'failed' ? tr("runtime.project.reportstatemarkup.text_9e378de73a", {}, '生成失败', 'Generation failed') : tr("runtime.project.reportstatemarkup.text_a52f4f1196", {}, '尚未生成', 'Not generated yet'));
     const reason = String(result && (result.gate_reason || result.report_reason) || '');
     const gateRaw = String(result && result.publication_gate_status || 'unknown').toLowerCase();
     const gate = gateRaw === 'eligible'
-      ? { key: 'eligible', label: '可发布最终版' }
+      ? { key: 'eligible', label: tr("runtime.project.reportstatemarkup.text_7997228f36", {}, '可发布最终版', 'Final version may be published') }
       : gateRaw === 'blocked'
-        ? { key: 'blocked', label: '阻断' }
+        ? { key: 'blocked', label: tr("runtime.project.reportstatemarkup.text_2378769b47", {}, '阻断', 'Blocked') }
         : gateRaw === 'pending'
-          ? { key: 'pending', label: '等待计算' }
-          : { key: 'pending', label: '未知' };
-    return '<div class="pj-report-states" role="status" aria-label="报告产物状态、科学状态与发布门禁">' +
-      `<span class="pj-report-state product ${productKey}"><b>报告产物</b>${VCS.esc(productLabel)}</span>` +
+          ? { key: 'pending', label: tr("runtime.project.reportstatemarkup.text_887402ac81", {}, '等待计算', 'Waiting for calculations') }
+          : { key: 'pending', label: tr("runtime.project.reportstatemarkup.text_8d3451355b", {}, '未知', 'Unknown') };
+    return tr("runtime.project.reportstatemarkup.text_56710da0c0", {}, '<div class="pj-report-states" role="status" aria-label="报告产物状态、科学状态与发布门禁">', '<div class="pj-report-states" role="status" aria-label="Report artifact status, scientific state, and publication gate">') +
+      tr("runtime.project.reportstatemarkup.text_29c40f9e3e", { value1: (productKey), value2: (VCS.esc(productLabel)) }, `<span class="pj-report-state product {value1}"><b>报告产物</b>{value2}</span>`, '<span class="pj-report-state product {value1}"><b>Report artifact</b>{value2}</span>') +
       `<span class="pj-report-state science ${science.key}"${reason ? ` title="${VCS.esc(reason)}"` : ''}>` +
-      `<b>科学状态</b>${VCS.esc(science.label)}</span>` +
+      tr("runtime.project.reportstatemarkup.text_14347481f4", { value1: (VCS.esc(science.label)) }, `<b>科学状态</b>{value1}</span>`, '<b>Scientific state</b>{value1}</span>') +
       `<span class="pj-report-state gate ${gate.key}"${reason ? ` title="${VCS.esc(reason)}"` : ''}>` +
-      `<b>发布门禁</b>${VCS.esc(gate.label)}</span></div>`;
+      tr("runtime.project.reportstatemarkup.text_24dd797a82", { value1: (VCS.esc(gate.label)) }, `<b>发布门禁</b>{value1}</span></div>`, '<b>Publication gate</b>{value1}</span></div>');
   }
 
   function collectReportFiles(value) {
@@ -3515,7 +3672,7 @@
       Object.entries(item).forEach(([key, child]) => {
         if (['error', 'kind', 'ok', 'path', 'name'].includes(key)) return;
         let next = trail;
-        if (key === 'comparison') next = [...trail, '批次比较'];
+        if (key === 'comparison') next = [...trail, tr("runtime.project.visit.text_6a5ec4b18c", {}, '批次比较', 'Batch comparison')];
         else if (formatNames[key]) next = [...trail, formatNames[key]];
         else if (!structural.has(key)) next = [...trail, key];
         visit(child, next);
@@ -3542,8 +3699,8 @@
       return;
     }
     const diagnostic = reportScienceState(result).key === 'diagnostic';
-    let html = '<div class="pj-report-head"><b>' + VCS.esc(heading || '报告文件') + '</b>' +
-      `<span>${files.length} 个文件</span></div>${stateMarkup}` +
+    let html = '<div class="pj-report-head"><b>' + VCS.esc(heading || tr("runtime.project.renderreportfiles.text_e60fbba2c4", {}, '报告文件', 'Report files')) + '</b>' +
+      tr("runtime.project.renderreportfiles.text_a723b26c0d", { value1: (files.length), value2: (stateMarkup) }, `<span>{value1} 个文件</span></div>{value2}`, '<span>{value1} files</span></div>{value2}') +
       '<div class="pj-report-links">';
     files.forEach(file => {
       const name = pathBase(file.path);
@@ -3552,11 +3709,11 @@
     });
     html += '</div>';
     if (diagnostic) {
-      html += '<div class="pj-report-note">当前生成的是诊断报告：保留真实结果与阻断原因，不冒充最终结论。</div>';
+      html += tr("runtime.project.renderreportfiles.text_91bd933d77", {}, '<div class="pj-report-note">当前生成的是诊断报告：保留真实结果与阻断原因，不冒充最终结论。</div>', '<div class="pj-report-note">This is a diagnostic report: it preserves real results and blocking reasons without presenting them as final conclusions.</div>');
     }
     const gateReason = String(result && (result.gate_reason || result.report_reason) || '');
     if (gateReason) {
-      html += `<div class="pj-report-note">发布门禁：${VCS.esc(gateReason)}</div>`;
+      html += tr("runtime.project.renderreportfiles.text_ed21cc6337", { value1: (VCS.esc(gateReason)) }, `<div class="pj-report-note">发布门禁：{value1}</div>`, '<div class="pj-report-note">Publication gate: {value1}</div>');
     }
     box.innerHTML = html;
     box.querySelectorAll('[data-report-open]').forEach(button => {
@@ -3571,7 +3728,7 @@
       const project = State.projects.find(item => String(item.path || '') === String(path || ''));
       const name = String(project && project.name || `project_${index + 1}`);
       const safeName = name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').trim() || `project_${index + 1}`;
-      const save = joinPath(outDir, `${String(index + 1).padStart(2, '0')}_${safeName}_完整报告.html`);
+      const save = joinPath(outDir, tr("runtime.project.legacybatchreports.text_fb7a064363", { value1: (String(index + 1).padStart(2, '0')), value2: (safeName) }, `{value1}_{value2}_完整报告.html`, '{value1}_{value2}_full_report.html'));
       const result = await VCS.call('proj_report', path, save, true);
       if (result && result.ok !== false && !result.error) {
         const returnedFiles = result.files && typeof result.files === 'object' &&
@@ -3582,7 +3739,8 @@
           ok: true,
         }));
       } else {
-        failures.push(`${name}: ${(result && result.error) || '未知错误'}`);
+        failures.push(`${name}: ${(result && result.error) || tr(
+          'runtime.project.common.unknown_error', {}, '未知错误', 'Unknown error')}`);
       }
     }
     return {
@@ -3590,11 +3748,11 @@
       kind: 'diagnostic',
       files: { individual },
       warnings: [
-        '当前后端仅支持逐项目 HTML；没有生成跨项目比较报告或 Word/PDF。',
+        tr("runtime.project.legacybatchreports.text_169594dc7d", {}, '当前后端仅支持逐项目 HTML；没有生成跨项目比较报告或 Word/PDF。', 'The current backend supports only per-project HTML; it did not generate a cross-project comparison report or Word/PDF files.'),
         ...failures,
       ],
       out_dir: outDir,
-      error: individual.length ? null : failures.join('；') || '旧版批次报告生成失败',
+      error: individual.length ? null : failures.join('；') || tr("runtime.project.legacybatchreports.text_5665d911e3", {}, '旧版批次报告生成失败', 'Legacy batch-report generation failed'),
     };
   }
 
@@ -3605,12 +3763,12 @@
   async function openReportWorkbench(mode) {
     const proj = currentProject();
     if (!proj) {
-      VCS.toast('请先选择项目', 'fail');
+      VCS.toast(tr("runtime.project.openreportworkbench.text_3447494da6", {}, '请先选择项目', 'Select a project first'), 'fail');
       return { ok: false, missingProject: true };
     }
     const id = projectId(proj);
     if (!id) {
-      VCS.toast('当前项目缺少稳定项目 ID，无法打开报告工作台', 'fail');
+      VCS.toast(tr("runtime.project.openreportworkbench.text_ecd8621204", {}, '当前项目缺少稳定项目 ID，无法打开报告工作台', 'The current project lacks a stable project ID, so Report Workbench cannot be opened'), 'fail');
       return { ok: false, missingProjectId: true };
     }
     const kind = String(mode || 'report');
@@ -3648,13 +3806,13 @@
     if (!selectedFormats) return;
     const selectedLabel = reportFormatLabel(selectedFormats);
     const dr = await VCS.call('pick_dir');
-    if (dr && dr.error) { VCS.log('选择目录失败:' + dr.error, 'failc'); return; }
+    if (dr && dr.error) { VCS.log(tr("runtime.project.report.text_d802c7d8d3", {}, '选择目录失败:', 'Failed to select directory:') + dr.error, 'failc'); return; }
     if (!dr || !dr.path) return;   // 用户取消
     State.reportBusy = true;
     syncReportFormatControls();
     const output = $('pj-report-files');
     if (output) output.innerHTML = '';
-    VCS.log(`正在从同一份数据快照生成 ${selectedLabel} 报告，可能需要几分钟…`);
+    VCS.log(tr("runtime.project.report.text_70579408f2", { value1: (selectedLabel) }, `正在从同一份数据快照生成 {value1} 报告，可能需要几分钟…`, 'Generating {value1} reports from the same data snapshot; this may take several minutes…'));
     try {
       let r = await VCS.call(
         'proj_report_bundle', proj.path, dr.path, selectedFormats, true);
@@ -3665,37 +3823,37 @@
             artifact_status: 'failed',
             kind: null,
             scientific_status: null,
-            error: '当前后端仅支持 HTML；请只勾选 HTML 后重试，或升级后端以导出 DOCX/PDF。',
+            error: tr("runtime.project.report.text_56c4158b77", {}, '当前后端仅支持 HTML；请只勾选 HTML 后重试，或升级后端以导出 DOCX/PDF。', 'The current backend supports HTML only. Select only HTML and try again, or upgrade the backend to export DOCX/PDF.'),
           };
           VCS.log(r.error, 'failc');
-          renderReportFiles('pj-report-files', r, '单项目报告');
+          renderReportFiles('pj-report-files', r, tr("runtime.project.report.text_62d9d73bc6", {}, '单项目报告', 'Single-project report'));
           return;
         }
-        const save = joinPath(dr.path, (proj.name || 'project') + '_完整报告.html');
+        const save = joinPath(dr.path, (proj.name || 'project') + tr("runtime.project.report.text_b428d9b3ca", {}, '_完整报告.html', '_full_report.html'));
         const legacy = await VCS.call('proj_report', proj.path, save, true);
         r = legacy && !legacy.error
           ? Object.assign({}, legacy, { files: { html: legacy.file || save } })
           : legacy;
-        VCS.log('当前后端仅支持 HTML，已使用兼容模式生成。', 'warnc');
+        VCS.log(tr("runtime.project.report.text_d775d80fa0", {}, '当前后端仅支持 HTML，已使用兼容模式生成。', 'The current backend supports HTML only; compatibility mode was used.'), 'warnc');
       }
       if (!r || r.ok === false || r.error) {
-        VCS.log('生成完整报告失败:' + ((r && r.error) || '未知错误'), 'failc');
-        renderReportFiles('pj-report-files', r, '单项目报告');
+        VCS.log(tr("runtime.project.report.text_74a017ddde", {}, '生成完整报告失败:', 'Full-report generation failed:') + ((r && r.error) || tr("runtime.project.report.text_bd5e21c357", {}, '未知错误', 'Unknown error')), 'failc');
+        renderReportFiles('pj-report-files', r, tr("runtime.project.report.text_62d9d73bc6", {}, '单项目报告', 'Single-project report'));
         return;
       }
       collectReportFiles(r.files || { html: r.file }).forEach(file => {
-        VCS.log('报告已生成:' + file.path, 'okc');
+        VCS.log(tr("runtime.project.report.text_d0462cce17", {}, '报告已生成:', 'Report generated:') + file.path, 'okc');
       });
-      (r.warnings || []).forEach(warning => VCS.log('报告提示:' + warning, 'warnc'));
+      (r.warnings || []).forEach(warning => VCS.log(tr("runtime.project.report.text_4a4ddae974", {}, '报告提示:', 'Report note:') + warning, 'warnc'));
       if (r.kind === 'diagnostic') {
-        VCS.log('最终报告门禁未通过，已生成带阻断原因的诊断报告。', 'warnc');
+        VCS.log(tr("runtime.project.report.text_7dd893daee", {}, '最终报告门禁未通过，已生成带阻断原因的诊断报告。', 'The final-report gate did not pass, so a diagnostic report containing the blocking reasons was generated.'), 'warnc');
       }
-      renderReportFiles('pj-report-files', r, '单项目报告');
+      renderReportFiles('pj-report-files', r, tr("runtime.project.report.text_62d9d73bc6", {}, '单项目报告', 'Single-project report'));
       VCS.call('open_dir', r.out_dir || dr.path);
       // 重新读取管线状态；只有后端已经落下与当前输入/结果哈希绑定的
       // report_done 标记时，界面才把整个自动流程显示为完成。
       await reloadProjects(proj.path);
-      VCS.toast(r.kind === 'diagnostic' ? `${selectedLabel} 诊断报告已生成` : `${selectedLabel} 报告已生成`);
+      VCS.toast(r.kind === 'diagnostic' ? tr("runtime.project.report.text_6d3deb78d8", { value1: (selectedLabel) }, `{value1} 诊断报告已生成`, '{value1} diagnostic report generated') : tr("runtime.project.report.text_0ebad8042a", { value1: (selectedLabel) }, `{value1} 报告已生成`, '{value1} report generated'));
     } finally {
       State.reportBusy = false;
       syncReportFormatControls();
@@ -3705,18 +3863,18 @@
   async function batchReport() {
     const paths = selectedComparePaths();
     if (paths.length < 2) {
-      VCS.log('批次报告请至少选择 2 个催化剂项目', 'failc');
+      VCS.log(tr("runtime.project.batchreport.text_ee03b663b9", {}, '批次报告请至少选择 2 个催化剂项目', 'Select at least two catalyst projects for a batch report'), 'failc');
       return;
     }
     const dr = await VCS.call('pick_dir');
-    if (dr && dr.error) { VCS.log('选择目录失败:' + dr.error, 'failc'); return; }
+    if (dr && dr.error) { VCS.log(tr("runtime.project.batchreport.text_d802c7d8d3", {}, '选择目录失败:', 'Failed to select directory:') + dr.error, 'failc'); return; }
     if (!dr || !dr.path) return;
     const preset = $('pj-preset') ? $('pj-preset').value : '';
     const output = $('pj-batch-files');
     State.batchReportBusy = true;
     renderCompareSummary();
     if (output) output.innerHTML = '';
-    VCS.log(`正在生成 ${paths.length} 个单项目报告与一份批次比较报告…`);
+    VCS.log(tr("runtime.project.batchreport.text_023d43b8bb", { value1: (paths.length) }, `正在生成 {value1} 个单项目报告与一份批次比较报告…`, 'Generating {value1} single-project reports and one batch-comparison report…'));
     try {
       let r = await VCS.call(
         'proj_batch_report', paths, dr.path, preset || null,
@@ -3725,17 +3883,17 @@
         r = await legacyBatchReports(paths, dr.path);
       }
       if (!r || r.ok === false || r.error) {
-        VCS.log('批次报告生成失败:' + ((r && r.error) || '未知错误'), 'failc');
-        renderReportFiles('pj-batch-files', r, '批次报告');
+        VCS.log(tr("runtime.project.batchreport.text_0832df83b1", {}, '批次报告生成失败:', 'Batch-report generation failed:') + ((r && r.error) || tr("runtime.project.batchreport.text_bd5e21c357", {}, '未知错误', 'Unknown error')), 'failc');
+        renderReportFiles('pj-batch-files', r, tr("runtime.project.batchreport.text_d25760be5e", {}, '批次报告', 'Batch report'));
         return;
       }
-      collectReportFiles(r.files).forEach(file => VCS.log('报告已生成:' + file.path, 'okc'));
-      (r.blocked || []).forEach(reason => VCS.log('比较阻断:' + reason, 'warnc'));
-      (r.warnings || []).forEach(reason => VCS.log('比较提示:' + reason, 'warnc'));
-      renderReportFiles('pj-batch-files', r, '多催化剂批次报告');
+      collectReportFiles(r.files).forEach(file => VCS.log(tr("runtime.project.batchreport.text_d0462cce17", {}, '报告已生成:', 'Report generated:') + file.path, 'okc'));
+      (r.blocked || []).forEach(reason => VCS.log(tr("runtime.project.batchreport.text_c8a1975bad", {}, '比较阻断:', 'Comparison blocked:') + reason, 'warnc'));
+      (r.warnings || []).forEach(reason => VCS.log(tr("runtime.project.batchreport.text_2b0344490d", {}, '比较提示:', 'Comparison note:') + reason, 'warnc'));
+      renderReportFiles('pj-batch-files', r, tr("runtime.project.batchreport.text_91f0451a3d", {}, '多催化剂批次报告', 'Multi-catalyst batch report'));
       VCS.call('open_dir', r.out_dir || dr.path);
       VCS.toast(r.kind === 'diagnostic'
-        ? '批次诊断报告已生成' : '批次 HTML / Word / PDF 报告已生成');
+        ? tr("runtime.project.batchreport.text_c501d12b45", {}, '批次诊断报告已生成', 'Batch diagnostic report generated') : tr("runtime.project.batchreport.text_05611cae28", {}, '批次 HTML / Word / PDF 报告已生成', 'Batch HTML / Word / PDF reports generated'));
     } finally {
       State.batchReportBusy = false;
       renderCompareSummary();
@@ -3747,27 +3905,27 @@
     const proj = currentProject();
     if (!proj) return;
     const dr = await VCS.call('pick_dir');
-    if (dr && dr.error) { VCS.log('选择目录失败:' + dr.error, 'failc'); return; }
+    if (dr && dr.error) { VCS.log(tr("runtime.project.draftready.text_d802c7d8d3", {}, '选择目录失败:', 'Failed to select directory:') + dr.error, 'failc'); return; }
     if (!dr || !dr.path) return;
     const btn = $('pj-draft');
     const box = $('pj-draft-out');
     if (btn) btn.disabled = true;
     if (box) box.innerHTML = '';
-    VCS.log('生成成稿包(SI + 三线表 + 口径稽核 + 方法学),生成中…');
+    VCS.log(tr("runtime.project.draftready.text_d3b79a5428", {}, '生成成稿包(SI + 三线表 + 口径稽核 + 方法学),生成中…', 'Generating the publication-ready package (SI + three-line tables + basis audit + methodology)…'));
     try {
       const r = await VCS.call('draft_ready', proj.path, dr.path);
       if (!r || r.ok === false && r.error) {
         // ok=False 但有产物(稽核不过仍出全套)时 error 为 null;仅真错误(error 非空)才失败
-        if (r && r.error) { VCS.log('成稿包生成失败:' + r.error, 'failc'); return; }
+        if (r && r.error) { VCS.log(tr("runtime.project.draftready.text_76fa71f31b", {}, '成稿包生成失败:', 'Publication-ready package generation failed:') + r.error, 'failc'); return; }
       }
-      if (!r) { VCS.log('成稿包生成失败:未知错误', 'failc'); return; }
-      VCS.log((r.ok ? '✓ 稽核通过:' : '⚠ 稽核未通过(仍产全套工件):') + (r.summary || ''),
+      if (!r) { VCS.log(tr("runtime.project.draftready.text_312a5e1ad1", {}, '成稿包生成失败:未知错误', 'Publication-ready package generation failed: unknown error'), 'failc'); return; }
+      VCS.log((r.ok ? tr("runtime.project.draftready.text_754f66bc5d", {}, '✓ 稽核通过:', '✓ Audit passed:') : tr("runtime.project.draftready.text_b51fe5abe7", {}, '⚠ 稽核未通过(仍产全套工件):', '⚠ Audit failed (the complete artifact set was still generated):')) + (r.summary || ''),
         r.ok ? 'okc' : 'warnc');
-      (r.products || []).forEach(p => VCS.log('产物:' + p, 'okc'));
+      (r.products || []).forEach(p => VCS.log(tr("runtime.project.draftready.text_9c0aa3ce40", {}, '产物:', 'Artifacts:') + p, 'okc'));
       (r.issues || []).forEach(i => VCS.log(i, 'warnc'));
       renderDraft(r);
       if (r.out_dir) VCS.call('open_dir', r.out_dir);
-      VCS.toast(r.ok ? '成稿包已生成' : '成稿包已生成(有待确认项)', r.ok ? '' : 'fail');
+      VCS.toast(r.ok ? tr("runtime.project.draftready.text_c3ef9b2afe", {}, '成稿包已生成', 'Publication-ready package generated') : tr("runtime.project.draftready.text_1e243758c0", {}, '成稿包已生成(有待确认项)', 'Publication-ready package generated (items still need confirmation)'), r.ok ? '' : 'fail');
     } finally {
       if (btn) btn.disabled = false;
     }
@@ -3777,7 +3935,7 @@
     const box = $('pj-draft-out');
     if (!box) return;
     let h = `<div class="pj-note" style="color:var(--${r.ok ? 'ok' : 'warn'})">` +
-      VCS.esc(r.summary || '') + `(待确认 ${r.issues_total || 0} 项)</div>`;
+      VCS.esc(r.summary || '') + tr("runtime.project.renderdraft.text_a07d924437", { value1: (r.issues_total || 0) }, `(待确认 {value1} 项)</div>`, '({value1} items awaiting confirmation)</div>');
     h += '<div class="pj-cfglist">';
     (r.products || []).forEach(p => {
       h += `<div class="pj-cfgrow"><span class="path" title="${VCS.esc(p)}">${VCS.esc(p)}</span></div>`;
@@ -3922,7 +4080,7 @@
         analysis.value = 'taskana';
         analysis.dispatchEvent(new Event('change', { bubbles: true }));
         VCS.navigate('jobs', { source: 'spin-analysis' });
-        VCS.toast('自旋态对比在任务页：勾选同一家族后点击“自旋对比”');
+        VCS.toast(tr("runtime.project.init.text_e1e981c5e4", {}, '自旋态对比在任务页：勾选同一家族后点击“自旋对比”', 'Spin-state comparison is on Jobs: select members of the same family, then select Spin comparison'));
       }
     });
     renderConfigs();
@@ -3974,12 +4132,33 @@
     return State.projects.map(publicProject);
   }
 
+  function redrawLanguage() {
+    if (State.reportCapabilityState === 'pending') {
+      const reason = reportCapabilityPendingReason();
+      State.reportCapabilities.docx = { available: false, reason };
+      State.reportCapabilities.pdf = { available: false, reason };
+    }
+    updateJourney();
+    if (State.importRows.length || State.importResult) renderImport();
+    renderCleanIncarStatus();
+    renderReferenceProjects(val('lis-reference'));
+    renderConfigs();
+    updateLisReadiness();
+    renderFigProjList();
+    renderCompareSummary();
+    updateProjectSummary(State.deltaResult);
+    if (State.deltaResult) renderDelta(State.deltaResult);
+    if (State.candidateEvaluation) renderCandidateEvaluation(State.candidateEvaluation);
+    syncReportFormatControls();
+  }
+
   // 切回项目页时刷新项目下拉
   document.addEventListener('vcs:page', e => {
     if (e.detail && e.detail.page === 'project') { reloadProjects(); loadLisProfiles(); }
   });
   document.addEventListener('vcs:scenario', e => applyProjectMode(e.detail && e.detail.scenario));
   document.addEventListener('vcs:calculation', applyProjectCalculation);
+  document.addEventListener('vcs:language', redrawLanguage);
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();

@@ -30,6 +30,20 @@ PRESET_IDS = (
 )
 SUPPORTED_LOCALES = ("zh-CN", "en-US")
 SUPPORTED_FORMATS = ("html", "docx", "pdf")
+_ACCESSIBILITY_STATUSES = frozenset({
+    "conditional", "partial", "unsupported", "unknown",
+})
+_ACCESSIBILITY_BOOLEAN_FIELDS = (
+    "visual",
+    "searchable",
+    "semantic_structure",
+    "document_language",
+    "metadata",
+    "image_alt",
+    "tagged",
+    "pdf_ua",
+    "manual_review_required",
+)
 SUPPORTED_THEMES = (
     "compact-brief",
     "academic-a4",
@@ -554,10 +568,43 @@ def _normalize_outline(value: Any) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _safe_capability_reason(value: Any, fallback: str = "") -> str:
+    reason = value if isinstance(value, str) else fallback
+    if len(reason) > _MAX_STRING_LENGTH or _looks_like_path(reason) \
+            or _looks_like_credential(reason):
+        return fallback
+    return reason
+
+
+def _normalize_accessibility_capability(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        value = {}
+    raw_status = value.get("status")
+    status = raw_status if raw_status in _ACCESSIBILITY_STATUSES else "unknown"
+    fallback = "accessibility capability not declared"
+    reason = _safe_capability_reason(value.get("reason"), fallback)
+    reason_zh = _safe_capability_reason(value.get("reason_zh"), reason)
+    reason_en = _safe_capability_reason(value.get("reason_en"), reason)
+    record: dict[str, Any] = {
+        "status": status,
+        "reason": reason,
+        "reason_zh": reason_zh,
+        "reason_en": reason_en,
+    }
+    for field in _ACCESSIBILITY_BOOLEAN_FIELDS:
+        raw = value.get(field)
+        record[field] = raw if isinstance(raw, bool) else None
+    return record
+
+
 def _normalize_capabilities(value: Any) -> dict[str, dict[str, Any]]:
     if value is None:
         return {
-            fmt: {"available": True, "reason": ""}
+            fmt: {
+                "available": True,
+                "reason": "",
+                "accessibility": _normalize_accessibility_capability(None),
+            }
             for fmt in SUPPORTED_FORMATS
         }
     if not isinstance(value, Mapping):
@@ -565,9 +612,17 @@ def _normalize_capabilities(value: Any) -> dict[str, dict[str, Any]]:
     source = value.get("formats", value)
     if not isinstance(source, Mapping):
         raise ReportRequestError("format capabilities.formats must be a mapping")
+    accessibility_source = value.get("accessibility")
+    if not isinstance(accessibility_source, Mapping):
+        accessibility_source = {}
     result = {}
     for fmt in SUPPORTED_FORMATS:
         raw = source.get(fmt)
+        nested_accessibility = (
+            raw.get("accessibility")
+            if isinstance(raw, Mapping) and isinstance(raw.get("accessibility"), Mapping)
+            else accessibility_source.get(fmt)
+        )
         if isinstance(raw, bool):
             available = raw
             reason = ""
@@ -581,10 +636,12 @@ def _normalize_capabilities(value: Any) -> dict[str, dict[str, Any]]:
         else:
             available = False
             reason = "invalid capability record"
-        if len(reason) > _MAX_STRING_LENGTH or _looks_like_path(reason) \
-                or _looks_like_credential(reason):
-            reason = "format capability unavailable"
-        result[fmt] = {"available": bool(available), "reason": reason}
+        reason = _safe_capability_reason(reason, "format capability unavailable")
+        result[fmt] = {
+            "available": bool(available),
+            "reason": reason,
+            "accessibility": _normalize_accessibility_capability(nested_accessibility),
+        }
     return result
 
 

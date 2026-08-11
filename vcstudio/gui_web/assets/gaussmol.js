@@ -5,6 +5,8 @@
 'use strict';
 (function () {
   const $ = id => document.getElementById(id);
+  const tr = (key, fallback, params) => typeof VCS.t === 'function'
+    ? VCS.t(key, params || {}, fallback) : fallback;
   const val = id => { const el = $(id); return el ? el.value.trim() : ''; };
 
   const State = { molStruct: null, mixed: null, previewText: '' };
@@ -149,20 +151,36 @@
     if (pre) { pre.style.color = ''; pre.textContent = '正在生成预览…'; }
     const r = await VCS.call('engine_preview', 'gaussian', buildParams());
     if (!r || r.ok === false || r.error) {
-      if (pre) { pre.style.color = 'var(--fail)'; pre.textContent = '预览失败:' + ((r && r.error) || '未知错误'); }
+      if (pre) {
+        pre.style.color = 'var(--fail)';
+        pre.textContent = tr('gaussian.preview.failed', '预览失败：{error}', {
+          error: (r && r.error) || tr('common.unknown_error', '未知错误'),
+        });
+      }
       return;
     }
     State.previewText = r.text || '';
     if (pre) { pre.style.color = ''; pre.textContent = State.previewText || '(空)'; }
-    if (head) head.textContent = '字符数:' + (r.chars || 0) +
-      ((r.issues && r.issues.length) ? ' · 自洽提示 ' + r.issues.length + ' 条(见日志)' : '');
-    (r.issues || []).forEach(i => VCS.log('Gaussian 自洽校验:' + i, 'warnc'));
+    if (head) head.textContent = tr('gaussian.preview.summary',
+      '字符数：{characters}{issues}', {
+        characters: r.chars || 0,
+        issues: r.issues && r.issues.length
+          ? tr('gaussian.preview.issue_suffix', ' · 自洽提示 {count} 条（见日志）', {
+            count: r.issues.length,
+          }) : '',
+      });
+    (r.issues || []).forEach(i => VCS.log(tr('gaussian.consistency.issue',
+      'Gaussian 自洽校验：{issue}', { issue: i }), 'warnc'));
     (r.warnings || []).forEach(w => VCS.log('Gaussian:' + w, 'warnc'));
   }
   async function generate() {
     if (!hasStructure()) { VCS.log('Gaussian:请先带入分子或选结构文件', 'failc'); return; }
     const dr = await VCS.call('pick_dir');
-    if (dr && dr.error) { VCS.log('选择输出目录失败:' + dr.error, 'failc'); return; }
+    if (dr && dr.error) {
+      VCS.log(tr('gaussian.output.pick_failed', '选择输出目录失败：{error}', {
+        error: dr.error,
+      }), 'failc'); return;
+    }
     if (!dr || !dr.path) return;
     await doGenerate(dr.path);
   }
@@ -174,10 +192,14 @@
     try {
       const r = await VCS.call('engine_generate', 'gaussian', buildParams(), outDir);
       if (!r || r.ok === false || r.error) {
-        VCS.log('Gaussian 生成失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+        VCS.log(tr('gaussian.generate.failed', 'Gaussian 生成失败：{error}', {
+          error: (r && r.error) || tr('common.unknown_error', '未知错误'),
+        }), 'failc'); return;
       }
-      (r.files || []).forEach(f => VCS.log('已生成:' + f, 'okc'));
-      (r.issues || []).forEach(i => VCS.log('自洽校验:' + i, 'warnc'));
+      (r.files || []).forEach(f => VCS.log(tr('gaussian.generate.file',
+        '已生成：{file}', { file: f }), 'okc'));
+      (r.issues || []).forEach(i => VCS.log(tr('gaussian.consistency.short',
+        '自洽校验：{issue}', { issue: i }), 'warnc'));
       (r.warnings || []).forEach(w => VCS.log(w, 'warnc'));
       if (!r.registered) {
         VCS.log('Gaussian 输入已生成，但 job.yaml/台账登记失败；已打开目录，不能直接提交', 'failc');
@@ -237,7 +259,11 @@
   }
   async function openMixed() {
     const r = await VCS.call('gauss_periodic_table');
-    if (!r || r.ok === false || !r.table) { VCS.log('周期表加载失败:' + ((r && r.error) || '未知'), 'failc'); return; }
+    if (!r || r.ok === false || !r.table) {
+      VCS.log(tr('gaussian.periodic_table.failed', '周期表加载失败：{error}', {
+        error: (r && r.error) || tr('common.unknown', '未知'),
+      }), 'failc'); return;
+    }
     const elements = r.table.elements || [];
     // 已选混合基组的工作副本
     const work = State.mixed ? JSON.parse(JSON.stringify(State.mixed))
@@ -267,7 +293,9 @@
       cell.dataset.sym = e.symbol;
       cell.dataset.suggest = (e.basis_suggestion || []).join(',');
       cell.textContent = e.symbol;
-      cell.title = e.symbol + '(建议 ' + (e.basis_suggestion || []).join('/') + ')';
+      cell.title = tr('gaussian.basis.suggestion', '{symbol}（建议 {basis}）', {
+        symbol: e.symbol, basis: (e.basis_suggestion || []).join('/'),
+      });
       grid.appendChild(cell);
     });
 
@@ -296,7 +324,8 @@
       if (sug.length && bsel) { for (const o of bsel.options) if (o.value === sug[0]) bsel.value = sug[0]; }
       const ecpBox = box.querySelector('#pt-ecp');
       if (ecpBox) ecpBox.checked = work.ecp_elements.indexOf(cur) >= 0;
-      box.querySelector('#pt-selhint').textContent = '已选 ' + cur + ';设基组后「加入混合基组」';
+      box.querySelector('#pt-selhint').textContent = tr('gaussian.basis.selected',
+        '已选 {element}；设基组后「加入混合基组」', { element: cur });
       markGrid();
     });
     box.querySelector('#pt-add').addEventListener('click', () => {
@@ -345,7 +374,9 @@
       const parts = Object.keys(State.mixed.per_element).map(
         k => k + ':' + State.mixed.per_element[k]);
       const ecp = State.mixed.ecp_elements.length ? ' · ECP ' + State.mixed.ecp_elements.join('/') : '';
-      el.textContent = '混合基组 ' + parts.join('、') + ecp;
+      el.textContent = tr('gaussian.basis.mixed_summary', '混合基组 {basis}{ecp}', {
+        basis: parts.join('、'), ecp,
+      });
       el.classList.add('on');
     }
   }
@@ -354,8 +385,11 @@
   function useMolecule(struct) {
     State.molStruct = struct;
     const info = $('gauss-structinfo');
-    if (info) info.textContent = '当前分子:' + (struct.formula || '') + '(' +
-      (struct.natoms != null ? struct.natoms : struct.elements.length) + ' 原子)';
+    if (info) info.textContent = tr('gaussian.molecule.current',
+      '当前分子：{formula}（{count} 原子）', {
+        formula: struct.formula || '',
+        count: struct.natoms != null ? struct.natoms : struct.elements.length,
+      });
     onShow();
   }
   function onShow() {
@@ -380,7 +414,9 @@
       if (r && r.path) {
         const el = $('gauss-poscar'); if (el) el.value = r.path;
         State.molStruct = null;
-        const info = $('gauss-structinfo'); if (info) info.textContent = '结构文件:' + r.path;
+        const info = $('gauss-structinfo');
+        if (info) info.textContent = tr('gaussian.structure.file',
+          '结构文件：{path}', { path: r.path });
       }
     });
     wire('gauss-mixed-btn', openMixed);

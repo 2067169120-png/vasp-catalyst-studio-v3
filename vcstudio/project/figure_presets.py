@@ -336,6 +336,130 @@ PRESETS = [
 ]
 
 
+CATEGORY_EN = {
+    '能量学': 'Energetics',
+    '电子结构': 'Electronic structure',
+    '结构': 'Structure',
+    '电池': 'Electrochemistry',
+}
+
+_PRESET_EN = {
+    'adsorption_bar': {
+        'name_en': 'Grouped adsorption-energy bar chart',
+        'description_en': (
+            'Grouped adsorption energies for multiple adsorbates and substrates, '
+            'with value labels above the bars.'),
+        'required_data_en': (
+            'adsorbates (list) + substrates ({substrate: [ΔE for each adsorbate]}; '
+            'use None for missing values); each substrate list must match the '
+            'adsorbates length.'),
+    },
+    'delta_e_heatmap': {
+        'name_en': 'ΔE/ΔG matrix heatmap',
+        'description_en': (
+            'A catalyst-by-adsorbate energy heatmap with cell annotations and a '
+            'color scale for cross-catalyst comparison.'),
+        'required_data_en': (
+            'rows (substrates or catalysts) + cols (adsorbates) + values (row-wise '
+            'ΔE matrix); use None for a blank cell.'),
+    },
+    'scaling_relation': {
+        'name_en': 'Scaling-relation plot',
+        'description_en': (
+            'Scatter plot for two adsorption descriptors with a least-squares line, '
+            'fitted equation, and R² diagnostic.'),
+        'required_data_en': (
+            'xs and ys (equal-length descriptor series, such as ΔE for two '
+            'adsorbates); labels is optional and names each point.'),
+    },
+    'volcano': {
+        'name_en': 'Two-leg volcano plot',
+        'description_en': (
+            'Sabatier activity versus an adsorption descriptor; when two fitted '
+            'legs are provided, their intersection defines the volcano peak.'),
+        'required_data_en': (
+            'points=[{name, x=descriptor, y=activity}]; optional legs contains two '
+            '[{slope, intercept}] records used to determine the peak.'),
+    },
+    'energy_matrix_table': {
+        'name_en': 'Three-line energy matrix table',
+        'description_en': (
+            'Publication-style adsorbate-by-substrate energy table in PNG, PDF, and '
+            'CSV, with ΔE and optional ΔG columns.'),
+        'required_data_en': (
+            'adsorbates + substrates (one ΔE column per substrate); optional dg maps '
+            'each substrate to one ΔG column.'),
+    },
+    'free_energy_ladder': {
+        'name_en': 'Single-path ΔG free-energy ladder',
+        'description_en': (
+            'Single-system free-energy ladder with solid plateaus, dashed '
+            'connections, and optional potential-determining-step annotation.'),
+        'required_data_en': (
+            'paths={name, G:[cumulative ΔG for each step]}; step_labels and '
+            'pds_index are optional.'),
+    },
+    'free_energy_ladder_multi': {
+        'name_en': 'Multi-potential or multi-system ΔG ladder',
+        'description_en': (
+            'Overlay of free-energy ladders for several systems or potentials, such '
+            'as U=0, U_eq, and U_L or a catalyst comparison.'),
+        'required_data_en': (
+            'paths=[{name, G:[...]}, ...] for different potentials or catalysts; '
+            'pds_index follows the per-electron convention.'),
+    },
+    'neb_profile': {
+        'name_en': 'NEB minimum-energy path profile',
+        'description_en': (
+            'CI-NEB relative energy along the reaction coordinate with the '
+            'transition-state point and forward/reverse barriers annotated.'),
+        'required_data_en': (
+            'The parse_neb_energies result, including rel energies, ts_index, '
+            'barrier_f, and barrier_r.'),
+    },
+    'pdos': {
+        'name_en': 'Spin-mirrored PDOS',
+        'description_en': (
+            'Overlay of projected densities of states with spin-down mirrored below '
+            'zero, the Fermi level marked, and optional d-band centers.'),
+        'required_data_en': (
+            'series=[{label, energies, dos_up, dos_down?}]; efermi and band_centers '
+            'are optional.'),
+    },
+    'cohp': {
+        'name_en': 'COHP bond-strength plot',
+        'description_en': (
+            'LOBSTER −pCOHP curves with bonding plotted positive, a Fermi zero line, '
+            'and ICOHP bond-strength annotations.'),
+        'required_data_en': (
+            'The parse_cohpcar result: energies plus pairs containing cohp_up, '
+            'optional cohp_down, and icohp.'),
+    },
+    'charge_profile': {
+        'name_en': 'Planar-averaged difference charge Δρ̄(z)',
+        'description_en': (
+            'Planar-averaged difference-charge profile with accumulation (>0) and '
+            'depletion (<0) filled separately and optional region shading.'),
+        'required_data_en': (
+            'z and rho planar-average series from chgdiff.plane_averaged; regions is '
+            'optional and defines shaded intervals.'),
+    },
+    'convergence_curve': {
+        'name_en': 'Convergence-test curve',
+        'description_en': (
+            'Cutoff-energy, k-point, or ionic-step convergence of energy or force. '
+            'This plot type is planned for a later release.'),
+        'required_data_en': (
+            'Real parameter values and their measured energies or forces, such as '
+            'an ENCUT series versus E0; no synthetic values are allowed.'),
+    },
+}
+
+for _preset in PRESETS:
+    _preset.update(_PRESET_EN[_preset['key']])
+    _preset['category_en'] = CATEGORY_EN[_preset['category']]
+
+
 # ── 公开 API ─────────────────────────────────────────────────────────────────
 
 def list_presets(category: str | None = None) -> list:

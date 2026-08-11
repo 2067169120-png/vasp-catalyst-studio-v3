@@ -35,7 +35,31 @@ def _html_only_capabilities():
             "html": {"available": True, "reason": ""},
             "docx": {"available": False, "reason": "python-docx unavailable"},
             "pdf": {"available": False, "reason": "PDF fonts unavailable"},
-        }
+        },
+        "accessibility": {
+            "html": {
+                "status": "conditional",
+                "reason": "semantic HTML; manual review required",
+                "semantic_structure": True,
+                "manual_review_required": True,
+            },
+            "docx": {
+                "status": "conditional",
+                "reason": "Word structure is independent of renderer availability",
+                "semantic_structure": True,
+                "manual_review_required": True,
+            },
+            "pdf": {
+                "status": "partial",
+                "reason": "visual/searchable but untagged; pdf_ua=false",
+                "visual": True,
+                "searchable": True,
+                "semantic_structure": False,
+                "tagged": False,
+                "pdf_ua": False,
+                "manual_review_required": True,
+            },
+        },
     }
 
 
@@ -107,13 +131,20 @@ def test_catalog_is_json_safe_ordered_and_reflects_format_capabilities():
     assert [item["id"] for item in catalog["locales"]] == ["zh-CN", "en-US"]
     assert list(catalog["formats"]) == ["html", "docx", "pdf"]
     assert catalog["formats"]["html"]["available"] is True
-    assert catalog["formats"]["docx"] == {
-        "id": "docx",
-        "label_zh": "Word",
-        "label_en": "Word",
-        "available": False,
-        "reason": "python-docx unavailable",
-    }
+    assert catalog["formats"]["docx"]["id"] == "docx"
+    assert catalog["formats"]["docx"]["label_zh"] == "Word"
+    assert catalog["formats"]["docx"]["label_en"] == "Word"
+    assert catalog["formats"]["docx"]["available"] is False
+    assert catalog["formats"]["docx"]["reason"] == "python-docx unavailable"
+    assert catalog["formats"]["docx"]["accessibility"]["status"] == "conditional"
+    assert catalog["formats"]["docx"]["accessibility"]["semantic_structure"] is True
+    pdf_accessibility = catalog["formats"]["pdf"]["accessibility"]
+    assert pdf_accessibility["status"] == "partial"
+    assert pdf_accessibility["visual"] is True
+    assert pdf_accessibility["searchable"] is True
+    assert pdf_accessibility["semantic_structure"] is False
+    assert pdf_accessibility["tagged"] is False
+    assert pdf_accessibility["pdf_ua"] is False
     assert [item["id"] for item in catalog["themes"]] == [
         "compact-brief", "academic-a4", "diagnostic-a4"]
     assert all(item["available"] is True for item in catalog["locales"])
@@ -130,13 +161,55 @@ def test_catalog_is_json_safe_ordered_and_reflects_format_capabilities():
 def test_catalog_detaches_presets_and_redacts_unsafe_capability_reason():
     catalog = report_workbench_catalog({
         "html": True,
-        "docx": {"available": False, "reason": r"missing C:\private\font.ttf"},
+        "docx": {
+            "available": False,
+            "reason": r"missing C:\private\font.ttf",
+            "accessibility": {
+                "status": "partial",
+                "reason": r"checked at C:\private\report.docx",
+            },
+        },
         "pdf": False,
     })
     catalog["presets"][0]["formats"].append("docx")
 
     assert report_workbench_catalog()["presets"][0]["formats"] == ["html", "pdf"]
     assert catalog["formats"]["docx"]["reason"] == "format capability unavailable"
+    assert catalog["formats"]["docx"]["accessibility"]["reason"] == (
+        "accessibility capability not declared"
+    )
+
+
+def test_accessibility_capability_is_fail_closed_and_independent_of_rendering():
+    catalog = report_workbench_catalog({
+        "formats": {
+            "html": {"available": True},
+            "docx": {"available": False},
+            "pdf": {"available": True},
+        },
+        "accessibility": {
+            "docx": {
+                "status": "conditional",
+                "semantic_structure": True,
+            },
+            "pdf": {
+                "status": "partial",
+                "visual": True,
+                "searchable": True,
+                "semantic_structure": False,
+                "tagged": False,
+                "pdf_ua": False,
+            },
+        },
+    })
+
+    assert catalog["formats"]["html"]["available"] is True
+    assert catalog["formats"]["html"]["accessibility"]["status"] == "unknown"
+    assert catalog["formats"]["docx"]["available"] is False
+    assert catalog["formats"]["docx"]["accessibility"]["status"] == "conditional"
+    assert catalog["formats"]["pdf"]["available"] is True
+    assert catalog["formats"]["pdf"]["accessibility"]["status"] == "partial"
+    assert catalog["formats"]["pdf"]["accessibility"]["pdf_ua"] is False
 
 
 def test_minimal_request_uses_scientific_review_defaults_and_server_project():

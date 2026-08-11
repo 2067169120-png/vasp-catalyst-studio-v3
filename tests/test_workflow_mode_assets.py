@@ -205,8 +205,10 @@ def test_task_analysis_exposes_capability_next_step_and_trace_report():
 def test_energy_subtraction_calculators_render_scientific_gate_warnings():
     js = _read('taskcat.js')
     assert '(r.warnings || []).forEach' in js
-    assert "VCS.log('表面能:' + warning, 'warnc')" in js
-    assert "VCS.log('形成能/结合能:' + warning, 'warnc')" in js
+    assert 'runtime.taskcat.surface_energy.warning' in js
+    assert "'表面能:{warning}', 'Surface energy: {warning}'" in js
+    assert 'runtime.taskcat.formation.warning' in js
+    assert "'形成能/结合能:{warning}', 'Formation/binding energy: {warning}'" in js
 
 
 def test_molecular_mode_has_one_task_selector_and_syncs_gaussian_intent():
@@ -252,5 +254,10 @@ def test_jobs_ui_blocks_cross_server_and_repeat_submission_before_password_promp
     assert 'function actionDirs(name, action, mode)' in js
     assert "r.cluster !== name" in js
     assert "r.cluster || r.state !== 'CREATED'" in js
-    assert "actionDirs(name, '批量取消', 'bound')" in js
+    assert "runtime.jobs.cancel.action_name" in js
+    assert re.search(
+        r"actionDirs\(name, tr\('runtime\.jobs\.cancel\.action_name'.*?'bound'\)",
+        js,
+        re.S,
+    )
     assert '切换服务器后已取消' in js

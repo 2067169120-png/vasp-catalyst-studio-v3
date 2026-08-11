@@ -4,6 +4,8 @@
 'use strict';
 (function () {
   const $ = id => document.getElementById(id);
+  const tr = (key, fallback, params) => typeof VCS.t === 'function'
+    ? VCS.t(key, params || {}, fallback) : fallback;
 
   const QUEUE_STATES = ['QUEUED', 'SUBMITTED', 'UPLOADED'];
   const NEED_STATES = ['FAILED', 'UNCONVERGED', 'NEEDS_HUMAN'];
@@ -90,11 +92,24 @@
       const task = r && r.ok !== false && (r.tasks || [])[0];
       if (task) {
         const route = VCS.calculationRoute && VCS.calculationRoute(active, sc);
-        const verb = route && route.page === 'project' ? '打开结果工具' : '开始准备';
+        const isEnglish = VCS.i18n && VCS.i18n.lang === 'en';
+        const verb = route && route.page === 'project'
+          ? tr('dashboard.action.open_result_tool', '打开结果工具')
+          : tr('dashboard.action.start_preparing', '开始准备');
         const engine = String(VCS.activeEngine || 'vasp').toUpperCase();
+        const taskName = isEnglish ? (task.name_en || task.key) : (task.name_zh || task.key);
+        const requires = isEnglish
+          ? (task.requires_en || 'Follow the task-specific input requirements')
+          : (task.requires || '按提示准备输入');
+        const outputs = isEnglish
+          ? (task.outputs_en || 'calculation results') : (task.outputs || '计算结果');
         ACTIONS.selected_calculation = [
-          `${verb}：${engine} · ${task.name_zh}`,
-          `${task.requires || '按提示准备输入'} → ${task.outputs || '计算结果'}`,
+          tr('dashboard.action.selected_title', '{verb}：{engine} · {task}', {
+            verb, engine, task: taskName,
+          }),
+          tr('dashboard.action.selected_contract', '{requires} → {outputs}', {
+            requires, outputs,
+          }),
           () => VCS.openCalculation
             ? VCS.openCalculation(active, { source: 'dashboard-selected-calculation' })
             : navTo((route && route.page) || 'generate'),
@@ -114,8 +129,14 @@
       ? '这次要导入结果，还是开始新的吸附计算？' :
       sc.key === 'molecular' ? '这次从分子结构、Gaussian 输入还是已有任务开始？' :
         active ? '按本次计算类型继续' : '这次从哪一步开始？';
-    if (sub) sub.textContent = '当前工作模式：' + (sc.name || sc.key) +
-      '。这里只保留本次需要的入口，可随时在设置中切换。';
+    if (sub) {
+      const scenarioName = VCS.i18n && VCS.i18n.lang === 'en'
+        ? (sc.name_en || sc.key) : (sc.name || sc.key);
+      sub.textContent = tr('dashboard.scenario.summary',
+        '当前工作模式：{scenario}。这里只保留本次需要的入口，可随时在设置中切换。', {
+          scenario: scenarioName,
+        });
+    }
   }
 
   // ── 卡片 1:状态汇总大数字(点击跳作业页) ─────────────────────────────────
@@ -128,9 +149,15 @@
       ['ok', '已完成', count(jobs, ['DONE'])],
       ['fail', '需处理', count(jobs, NEED_STATES)],
     ];
-    box.innerHTML = items.map(([cls, label, n]) =>
-      `<div class="db-num ${cls}" data-goto="jobs" title="点击查看作业页">` +
-      `<b>${n}</b><span>${VCS.esc(label)}</span></div>`).join('');
+    box.innerHTML = items.map(([cls, label, n]) => {
+      const aria = tr('dashboard.jobs.summary_aria', '{label} {count}，查看作业页', {
+        label, count: n,
+      });
+      const title = tr('dashboard.jobs.open', '查看作业页');
+      return `<div class="db-num ${cls}" data-goto="jobs" role="link" tabindex="0" ` +
+        `aria-label="${VCS.esc(aria)}" title="${VCS.esc(title)}">` +
+        `<b>${n}</b><span>${VCS.esc(label)}</span></div>`;
+    }).join('');
   }
 
   // ── 卡片 2:最近活动(按更新时间倒序取前 6 个作业;体系名加元素徽章) ─────────
@@ -144,13 +171,20 @@
       box.innerHTML = '<div class="db-empty">还没有纳管的作业 — 从「生成输入」开始</div>';
       return;
     }
-    box.innerHTML = rows.map(r =>
-      '<div class="db-row" data-goto="jobs" title="点击查看作业页">' +
-      VCS.elementBadge(r.name) +
-      `<span class="name">${VCS.esc(r.name)}</span>` +
-      (r.project ? `<span class="db-proj">${VCS.esc(r.project)}</span>` : '') +
-      '<span class="sp"></span>' + VCS.pill(r.state) +
-      `<span class="db-time">${VCS.esc(r.updated || '')}</span></div>`).join('');
+    box.innerHTML = rows.map(r => {
+      const name = r.name || tr('dashboard.jobs.unnamed', '未命名作业');
+      const state = r.state || tr('dashboard.jobs.state_unknown', '状态未知');
+      const aria = tr('dashboard.jobs.row_aria', '{name}，{state}，查看作业页', {
+        name, state,
+      });
+      return `<div class="db-row" data-goto="jobs" role="link" tabindex="0" ` +
+        `aria-label="${VCS.esc(aria)}" title="${VCS.esc(tr('dashboard.jobs.open', '查看作业页'))}">` +
+        VCS.elementBadge(r.name) +
+        `<span class="name">${VCS.esc(r.name)}</span>` +
+        (r.project ? `<span class="db-proj">${VCS.esc(r.project)}</span>` : '') +
+        '<span class="sp"></span>' + VCS.pill(r.state) +
+        `<span class="db-time">${VCS.esc(r.updated || '')}</span></div>`;
+    }).join('');
   }
 
   // ── 卡片:项目管线(每项目一行站点进度;当前站高亮,NEEDS_HUMAN 红点) ─────────
@@ -171,7 +205,9 @@
       ? {
         cls: 'ok',
         label: formats.length
-          ? `已生成（${formats.map(value => value.toUpperCase()).join(' · ')}）`
+          ? tr('dashboard.report.generated_formats', '已生成（{formats}）', {
+            formats: formats.map(value => value.toUpperCase()).join(' · '),
+          })
           : '已生成',
       }
       : artifactRaw === 'generated_unrecorded'
@@ -202,7 +238,9 @@
           : { cls: '', label: '未知' };
     const reason = String(p.report_reason || '');
     const desired = String(p.desired_report_kind || '');
-    const gateTitle = [reason, desired ? `目标报告：${desired}` : ''].filter(Boolean).join('；');
+    const gateTitle = [reason, desired ? tr('dashboard.report.desired', '目标报告：{kind}', {
+      kind: desired,
+    }) : ''].filter(Boolean).join('；');
     return '<div class="pl-report-states" aria-label="报告产物状态、科学状态与发布门禁">' +
       `<span class="pl-report product ${artifact.cls}"><b>报告产物</b>${VCS.esc(artifact.label)}</span>` +
       `<span class="pl-report science ${science.cls}"${reason ? ` title="${VCS.esc(reason)}"` : ''}>` +
@@ -242,7 +280,9 @@
       const last = shortTime(st.last_finished);
       const next = shortTime(st.next_check);
       box.className = 'db-automation';
-      box.innerHTML = `<b>自动托管后台待命</b><span>上次检查 ${VCS.esc(last)} · 下次检查 ${VCS.esc(next)}</span>`;
+      box.innerHTML = `<b>自动托管后台待命</b><span>${VCS.esc(tr(
+        'dashboard.automation.schedule', '上次检查 {last} · 下次检查 {next}', { last, next }
+      ))}</span>`;
     } else {
       box.className = 'db-automation pause';
       box.innerHTML = '<b>自动托管未启动</b><span>重新打开软件后将自动恢复已保存的托管设置</span>';
@@ -252,7 +292,11 @@
   function renderPipeline(projects, err) {
     const box = $('db-pipeline');
     if (!box) return;
-    if (err) { box.innerHTML = `<div class="pl-empty">读取项目管线失败:${VCS.esc(err)}</div>`; return; }
+    if (err) {
+      box.innerHTML = `<div class="pl-empty">${VCS.esc(tr(
+        'dashboard.pipeline.read_failed', '读取项目管线失败：{error}', { error: err }
+      ))}</div>`; return;
+    }
     if (!projects.length) {
       box.innerHTML = '<div class="pl-empty">暂无吸附能项目 — 去「吸附能项目」新建一组</div>';
       return;
@@ -297,15 +341,25 @@
       const pct = n => Math.round((n || 0) / t * 100);
       const bud = c.budget || {};
       const cap = (bud.cap == null) ? '不限' : bud.cap;
-      const mh = '机时 ' + (bud.estimated == null ? '—' : bud.estimated) + ' / ' + cap;
+      const mh = tr('dashboard.campaign.core_hours', '机时 {estimated} / {cap}', {
+        estimated: bud.estimated == null ? '—' : bud.estimated, cap,
+      });
+      const summary = tr('dashboard.campaign.summary',
+        '共 {total} 任务：完成 {completed} / 验证 {validated} / 采纳 {accepted}', {
+          total: c.n_tasks, completed: s.completed || 0,
+          validated: s.validated || 0, accepted: s.accepted || 0,
+        });
+      const meta = tr('dashboard.campaign.meta', '{states} · {total} 任务 · {hours}', {
+        states: `${s.completed || 0}/${s.validated || 0}/${s.accepted || 0}`,
+        total: c.n_tasks, hours: mh,
+      });
       return '<div class="cmp-row">' +
         `<span class="cmp-name" title="${VCS.esc(c.name || '')}">${VCS.esc(c.name || '(未命名)')}</span>` +
-        `<span class="cmp-bar" title="共 ${c.n_tasks} 任务:完成 ${s.completed || 0} / 验证 ${s.validated || 0} / 采纳 ${s.accepted || 0}">` +
+        `<span class="cmp-bar" title="${VCS.esc(summary)}">` +
         `<i class="b-completed" style="width:${pct(s.completed)}%"></i>` +
         `<i class="b-validated" style="width:${pct(s.validated)}%"></i>` +
         `<i class="b-accepted" style="width:${pct(s.accepted)}%"></i></span>` +
-        `<span class="cmp-meta">${s.completed || 0}/${s.validated || 0}/${s.accepted || 0}` +
-        ` · ${c.n_tasks} 任务 · ${VCS.esc(mh)}</span></div>`;
+        `<span class="cmp-meta">${VCS.esc(meta)}</span></div>`;
     }).join('');
   }
 
@@ -316,10 +370,12 @@
     const items = [];
     const need = count(jobs, NEED_STATES);
     if (need) {
-      items.push([`${need} 个作业需处理(失败 / 未收敛 / 需人工)`, 'jobs', '去作业页']);
+      items.push([tr('dashboard.todo.jobs',
+        '{count} 个作业需处理（失败 / 未收敛 / 需人工）', { count: need }), 'jobs', '去作业页']);
     }
     if (stale.length) {
-      items.push([`${stale.length} 个失效台账条目待清理(目录或 job.yaml 已不存在)`,
+      items.push([tr('dashboard.todo.stale',
+        '{count} 个失效台账条目待清理（目录或 job.yaml 已不存在）', { count: stale.length }),
         'jobs', '去清理']);
     }
     if (!profiles.length) {
@@ -342,7 +398,8 @@
     if (!bar) return;
     if (!msgs.length) { bar.hidden = true; bar.textContent = ''; return; }
     bar.hidden = false;
-    bar.textContent = '部分数据读取失败(下列读数可能不完整):' + msgs.join(';');
+    bar.textContent = tr('dashboard.data.partial_failure',
+      '部分数据读取失败（下列读数可能不完整）：{errors}', { errors: msgs.join('；') });
   }
 
   // ── 取数 + 全量渲染(进页 / 启动时) ───────────────────────────────────────
@@ -357,11 +414,11 @@
     const profiles = (cr && cr.profiles) || [];
     // 任一取数带 error → 错误条如实呈现,绝不静默当 0
     const errs = [];
-    if (jr && jr.error) errs.push('作业台账:' + jr.error);
-    if (pr && pr.error) errs.push('项目列表:' + pr.error);
-    if (cr && cr.error) errs.push('集群配置:' + cr.error);
-    if (sr && sr.error) errs.push('项目管线:' + sr.error);
-    if (runtime && runtime.error) errs.push('自动托管:' + runtime.error);
+    if (jr && jr.error) errs.push(tr('dashboard.error.jobs', '作业台账：{error}', { error: jr.error }));
+    if (pr && pr.error) errs.push(tr('dashboard.error.projects', '项目列表：{error}', { error: pr.error }));
+    if (cr && cr.error) errs.push(tr('dashboard.error.clusters', '集群配置：{error}', { error: cr.error }));
+    if (sr && sr.error) errs.push(tr('dashboard.error.pipeline', '项目管线：{error}', { error: sr.error }));
+    if (runtime && runtime.error) errs.push(tr('dashboard.error.automation', '自动托管：{error}', { error: runtime.error }));
     renderError(errs);
     renderNums(jobs);
     renderRecent(jobs);
@@ -373,8 +430,10 @@
     if (typeof VCS.refreshNavFoot === 'function') VCS.refreshNavFoot();
     const el = $('db-stats');
     if (el) {
-      el.innerHTML = `<b>${jobs.length}</b> 作业 · <b>${projects.length}</b> 吸附能项目 · ` +
-        `<b>${profiles.length}</b> 集群`;
+      el.textContent = tr('dashboard.stats.summary',
+        '{jobs} 作业 · {projects} 吸附能项目 · {clusters} 集群', {
+          jobs: jobs.length, projects: projects.length, clusters: profiles.length,
+        });
     }
   }
 
@@ -407,6 +466,12 @@
       const el = e.target.closest('[data-goto]');
       if (el) navTo(el.dataset.goto);
     });
+    page.addEventListener('keydown', e => {
+      const el = e.target.closest('[data-goto][role="link"]');
+      if (!el || e.key !== 'Enter') return;
+      e.preventDefault();
+      navTo(el.dataset.goto);
+    });
     refresh();
   }
 
@@ -417,6 +482,10 @@
   document.addEventListener('vcs:scenario', e => renderStartActions(e.detail && e.detail.scenario));
   document.addEventListener('vcs:engine', () => renderStartActions(VCS.scenario));
   document.addEventListener('vcs:calculation', () => renderStartActions(VCS.scenario));
+  document.addEventListener('vcs:language', () => {
+    renderStartActions(VCS.scenario);
+    refresh();
+  });
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();

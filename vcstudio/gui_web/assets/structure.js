@@ -12,11 +12,17 @@
   function gapSummary(gap) {
     if (!gap) return '';
     if (gap.separated) {
-      let s = `分子-衬底最近 ${gap.min_dist} Å(垂直间隙 ${gap.vertical_gap} Å`;
-      if (gap.mol_formula) s += `,分子 ${gap.mol_formula}`;
-      return s + ')';
+      return VCS.t('structure.gap.separated', {
+        minimum: gap.min_dist, vertical: gap.vertical_gap,
+        molecule: gap.mol_formula
+          ? VCS.t('structure.gap.molecule_suffix', {
+            formula: gap.mol_formula,
+          }, '，分子 {formula}') : '',
+      }, '分子-衬底最近 {minimum} Å（垂直间隙 {vertical} Å{molecule}）');
     }
-    if (gap.min_dist != null) return `最近原子对 ${gap.min_dist} Å`;
+    if (gap.min_dist != null) return VCS.t('structure.gap.closest_pair', {
+      distance: gap.min_dist,
+    }, '最近原子对 {distance} Å');
     return '';
   }
 
@@ -41,7 +47,7 @@
       if (viewer) { try { viewer.resize(); viewer.render(); } catch (e) { /* 忽略 */ } }
     };
     const m = VCS.modal({
-      title: '结构预览 — ' + title,
+      title: VCS.t('structure.preview.title', { title }, '结构预览 — {title}'),
       body: wrap,
       actions: [{ label: '关闭', quiet: true, onClick: h => h.close() }],
     });
@@ -65,8 +71,10 @@
     }
     const v = out.view;
     const gap = v.gap || {};
-    info.textContent = `${v.formula} · ${v.natoms} 原子 · 文件 ${out.used}` +
-      (gapSummary(gap) ? ' · ' + gapSummary(gap) : '');
+    info.textContent = VCS.t('structure.preview.summary', {
+      formula: v.formula, count: v.natoms, file: out.used,
+      gap: gapSummary(gap) ? ' · ' + gapSummary(gap) : '',
+    }, '{formula} · {count} 原子 · 文件 {file}{gap}');
 
     // 间隙告警条:crash 红字 / warn 黄条;后端 notes 原样列出
     const msgs = [].concat(gap.notes || [], v.notes || []);
@@ -118,7 +126,9 @@
     } catch (e) {
       note.hidden = false;
       note.className = 'struct-note warn-banner';
-      note.textContent = '3D 渲染失败(当前环境可能不支持 WebGL):' + (e && e.message ? e.message : e);
+      note.textContent = VCS.t('structure.preview.render_failed', {
+        error: e && e.message ? e.message : e,
+      }, '3D 渲染失败（当前环境可能不支持 WebGL）：{error}');
     }
   };
 })();

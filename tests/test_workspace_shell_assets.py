@@ -162,6 +162,14 @@ def test_history_events_share_one_dirty_guarded_external_navigation_path():
     assert 'vcsIndex: historyIndex' in workspace
 
 
+def test_initial_history_index_handles_a_null_browser_state():
+    workspace = _source('workspace.js')
+    assert "const initialHistoryState = history.state && typeof history.state === 'object'" in workspace
+    assert 'let historyIndex = initialHistoryState &&' in workspace
+    assert 'Number(initialHistoryState.vcsIndex)' in workspace
+    assert 'Number(history.state.vcsIndex)' not in workspace
+
+
 def test_job_route_rejects_unknown_status_instead_of_showing_all_jobs():
     workspace = _source('workspace.js')
     assert "const JOB_STATUS_FILTERS = new Set(['queue', 'run', 'need', 'done', 'fail']);" in workspace

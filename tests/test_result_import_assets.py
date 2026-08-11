@@ -37,7 +37,9 @@ def test_result_import_calls_scan_then_commit_with_full_review_payload():
     assert 'confirmationEligible' in js
     assert 'row.manualConfirm && row.confirmationEligible' in js
     assert 'const deltaResult = await delta()' in js
-    assert "? '用这些参考能开始吸附计算'" in js
+    assert 'runtime.project.showimportdone.text_76283c0e5f' in js
+    assert '用这些参考能开始吸附计算' in js
+    assert 'Start an adsorption calculation with these reference energies' in js
     assert 'window.Project = {' in js
     for member in ('reload: reloadProjects', 'selectByPath', 'selectByName',
                    'openImport', 'startLiS'):
@@ -73,10 +75,13 @@ def test_species_reference_import_requires_species_for_every_config():
 
 def test_manual_confirmation_carries_editable_audit_reason():
     js = _source('project.js')
-    assert "const DEFAULT_CONFIRMATION_REASON = '已核对原始 OUTCAR/OSZICAR 与末结构，确认该任务收敛'" in js
+    assert 'const defaultConfirmationReason = () => tr(' in js
+    assert 'runtime.project.joinpath.text_94a1de12b2' in js
+    assert '已核对原始 OUTCAR/OSZICAR 与末结构，确认该任务收敛' in js
+    assert 'confirmed that this task converged' in js
     assert "String(row.confirmationReason || '').trim()) return 'ready'" in js
     assert 'data-act="confirm-reason"' in js
-    assert 'row.confirmationReason = DEFAULT_CONFIRMATION_REASON' in js
+    assert 'row.confirmationReason = defaultConfirmationReason()' in js
     assert 'confirmation_reason: row.manualConfirm ? row.confirmationReason.trim() : null' in js
     assert '人工确认结果尚未填写核对依据' in js
     assert '.pj-import-confirm-reason' in _source('app.css')

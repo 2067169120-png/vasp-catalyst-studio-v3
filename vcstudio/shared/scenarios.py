@@ -11,7 +11,9 @@ VASP Catalyst Studio 覆盖锂硫电池、电催化、热催化、体相/电解�
     {
       'key':                 str,   # 唯一标识(英文小写)
       'name':                str,   # 中文显示名
+      'name_en':             str,   # 英文显示名
       'description':          str,   # 一句话说明
+      'description_en':       str,   # 英文一句话说明
       'pages':               [str], # 显示哪些 data-page,顺序即导航序(PAGES 子集)
       'cards':               dict,  # 页内卡片显隐细粒度覆盖表(嵌套 bool;缺省即可见)
       'figure_preset_order': [str], # 图型 key 排序(即可见图型白名单 + 顺序,FIGURE_KEYS 子集)
@@ -81,7 +83,8 @@ HOME_ACTIONS = (
 
 # 场景 schema 必备键
 _REQUIRED_KEYS = (
-    'key', 'name', 'description', 'pages', 'cards', 'figure_preset_order',
+    'key', 'name', 'name_en', 'description', 'description_en',
+    'pages', 'cards', 'figure_preset_order',
     'reaction_presets', 'advisor_profile', 'defaults', 'engines', 'ai_context',
     'primary', 'task_keys', 'home_actions',
 )
@@ -116,7 +119,11 @@ ALL_RULES = _AllRules(ADVISOR_RULES)
 _FULL = {
     'key': 'full',
     'name': '专家模式（全部功能）',
+    'name_en': 'Expert mode (all features)',
     'description': '开放全部页面、引擎和计算类型，适合熟悉软件或跨方向工作；新手建议选具体模式。',
+    'description_en': (
+        'Opens every page, engine, and calculation type for experienced or '
+        'cross-domain work; newcomers should choose a focused workflow.'),
     'primary': True,
     'pages': list(PAGES),
     'cards': {},                                   # 无任何隐藏
@@ -138,9 +145,14 @@ _FULL = {
 _LIS = {
     'key': 'lis',
     'name': 'Li–S 吸附能全流程',
+    'name_en': 'Li–S adsorption-energy workflow',
     'description': (
         '锂硫正极催化全流程:清洁表面 + 多硫化物构型族 + 气相参考,'
         'Li–S 放电台阶图与 SAC 批量筛选一应俱全。'),
+    'description_en': (
+        'End-to-end Li–S cathode-catalysis workflow with clean surfaces, '
+        'polysulfide configuration families, gas-phase references, discharge '
+        'free-energy ladders, and SAC batch screening.'),
     'primary': True,
     'pages': ['dashboard', 'structure', 'jobs', 'project', 'analysis-workbench',
               'report-workbench', 'figures',
@@ -178,7 +190,11 @@ _LIS = {
 _VASP = {
     'key': 'vasp',
     'name': '通用 VASP 计算',
+    'name_en': 'General VASP calculations',
     'description': '从 23 类 VASP 任务中选择本次计算，只展示建模、输入、提交和对应结果工具。',
+    'description_en': (
+        'Choose from 23 VASP tasks and show only the required modeling, input, '
+        'submission, and result tools.'),
     'primary': True,
     'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project', 'analysis-workbench',
               'report-workbench', 'figures', 'cluster', 'settings'],
@@ -209,9 +225,14 @@ _VASP = {
 _ELECTROCAT = {
     'key': 'electrocat',
     'name': '电催化(ORR / HER / OER / CO₂RR)',
+    'name_en': 'Electrocatalysis (ORR / HER / OER / CO₂RR)',
     'description': (
         '水系电催化:CHE 计算氢电极台阶图与 Sabatier 火山图前置,'
         'ORR / HER / OER / CO₂RR 反应组默认置顶。'),
+    'description_en': (
+        'Aqueous electrocatalysis with CHE free-energy ladders and Sabatier '
+        'volcano plots prioritized, followed by ORR, HER, OER, and CO₂RR '
+        'reaction presets.'),
     'primary': False,
     'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project', 'analysis-workbench',
               'report-workbench', 'figures', 'cluster', 'settings'],
@@ -241,9 +262,14 @@ _ELECTROCAT = {
 _THERMOCAT = {
     'key': 'thermocat',
     'name': '热催化(表面反应)',
+    'name_en': 'Thermocatalysis (surface reactions)',
     'description': (
         '气固热催化表面反应:NEB 过渡态与频率(ZPE / 热校正)前置,'
         '电位类图型(火山图 / 台阶图)后置。'),
+    'description_en': (
+        'Gas–solid thermocatalytic surface reactions with NEB transition '
+        'states and frequency-based ZPE/thermal corrections prioritized; '
+        'potential-dependent plots are de-emphasized.'),
     'primary': False,
     'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project', 'analysis-workbench',
               'report-workbench', 'figures', 'cluster', 'settings'],
@@ -275,9 +301,14 @@ _THERMOCAT = {
 _BATTERY_BULK = {
     'key': 'battery_bulk',
     'name': '电池体相 / 电解液',
+    'name_en': 'Battery bulk phases / electrolytes',
     'description': (
         '电极体相与电解液:以 bulk 与分子为主,吸附 / 表面卡片弱化,'
         '方法学告警按体相口径裁剪(无真空 / 偶极项)。'),
+    'description_en': (
+        'Bulk-electrode and electrolyte workflows centered on periodic solids '
+        'and molecules, with adsorption/surface tools de-emphasized and '
+        'method checks tailored to calculations without vacuum or dipole terms.'),
     'primary': False,
     'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project', 'analysis-workbench',
               'report-workbench', 'figures', 'cluster', 'settings'],
@@ -312,9 +343,14 @@ _BATTERY_BULK = {
 _MOLECULAR = {
     'key': 'molecular',
     'name': '分子化学',
+    'name_en': 'Molecular chemistry',
     'description': (
         '分子体系(团簇 / 自由基 / 反应能):可见 Gaussian 引擎,'
         '隐藏周期性(slab / 真空)相关卡片,以分子单点与反应能为主。'),
+    'description_en': (
+        'Molecular systems (clusters, radicals, and reaction energies) with '
+        'the Gaussian engine available, periodic slab/vacuum tools hidden, and '
+        'molecular single-point and reaction-energy work prioritized.'),
     'primary': True,
     # 分子化学不走"吸附能项目"(表面 slab 工作流),隐藏该页
     'pages': ['dashboard', 'structure', 'generate', 'jobs', 'analysis-workbench', 'wavefunction',
@@ -498,6 +534,12 @@ def validate_scenario(scenario) -> list:
     for k in _REQUIRED_KEYS:
         if k not in scenario:
             issues.append(f'缺少必备键 {k!r}')
+
+    for field in ('key', 'name', 'name_en', 'description', 'description_en'):
+        if field in scenario and (
+                not isinstance(scenario.get(field), str)
+                or not scenario.get(field).strip()):
+            issues.append(f'{field} 必须是非空字符串')
 
     for page in scenario.get('pages') or []:
         if page not in PAGES:

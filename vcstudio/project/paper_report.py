@@ -112,6 +112,86 @@ _REPORT_THEMES = {
         "cover_spacer_mm": 38,
     },
 }
+_FORMAT_ACCESSIBILITY = {
+    "html": {
+        "status": "conditional",
+        "reason": (
+            "生成语义 HTML（含 lang、标题层级和图片 alt）；是否可访问仍取决于每幅"
+            "非装饰图片具有有意义的替代文本并完成人工检查。"
+        ),
+        "reason_zh": (
+            "生成语义 HTML（含 lang、标题层级和图片 alt）；是否可访问仍取决于每幅"
+            "非装饰图片具有有意义的替代文本并完成人工检查。"
+        ),
+        "reason_en": (
+            "Semantic HTML emits lang, heading structure, and image alt text; "
+            "accessibility still depends on meaningful text for every "
+            "non-decorative figure and manual review."
+        ),
+        "visual": True,
+        "searchable": True,
+        "semantic_structure": True,
+        "document_language": True,
+        "metadata": True,
+        "image_alt": True,
+        "tagged": None,
+        "pdf_ua": None,
+        "manual_review_required": True,
+    },
+    "docx": {
+        "status": "conditional",
+        "reason": (
+            "Word 输出包含标题样式、文档语言、重复表头、元数据和图片替代文本；仍须"
+            "保证替代文本有意义，并通过 Word 可访问性检查器和人工阅读顺序检查。"
+        ),
+        "reason_zh": (
+            "Word 输出包含标题样式、文档语言、重复表头、元数据和图片替代文本；仍须"
+            "保证替代文本有意义，并通过 Word 可访问性检查器和人工阅读顺序检查。"
+        ),
+        "reason_en": (
+            "Word output includes heading styles, document language, repeating "
+            "table headers, metadata, and image alt text; meaningful alt text plus "
+            "Word Accessibility Checker and manual reading-order review remain required."
+        ),
+        "visual": True,
+        "searchable": True,
+        "semantic_structure": True,
+        "document_language": True,
+        "metadata": True,
+        "image_alt": True,
+        "tagged": None,
+        "pdf_ua": None,
+        "manual_review_required": True,
+    },
+    "pdf": {
+        "status": "partial",
+        "reason": (
+            "ReportLab 仅生成可视、可搜索 PDF；当前输出未标记，不包含结构树或图片"
+            "替代文本，pdf_ua=false。"
+        ),
+        "reason_zh": (
+            "ReportLab 仅生成可视、可搜索 PDF；当前输出未标记，不包含结构树或图片"
+            "替代文本，pdf_ua=false。"
+        ),
+        "reason_en": (
+            "ReportLab produces a visual, searchable PDF only. The output is "
+            "untagged, has no structure tree or image alt text, and pdf_ua=false."
+        ),
+        "visual": True,
+        "searchable": True,
+        "semantic_structure": False,
+        "document_language": True,
+        "metadata": True,
+        "image_alt": False,
+        "tagged": False,
+        "pdf_ua": False,
+        "manual_review_required": True,
+    },
+}
+_GENERIC_FIGURE_ALT_RE = re.compile(
+    r"(?i)^(?:(?:figure|fig\.?|image|plot|chart)\s*(?:#|no\.?\s*)?\d+"
+    r"|(?:图|图片|图表)\s*[一二三四五六七八九十百\d]+)[.。]?$"
+)
 _SECTION_LABELS = {
     "en-US": {
         "executive_summary": "Executive Summary",
@@ -202,7 +282,13 @@ def _report_publish_guard(destination: Path, stem: str):
 
 
 def report_capabilities() -> dict:
-    """Return per-format availability without importing project calculation code."""
+    """Return render availability separately from accessibility support.
+
+    ``formats`` remains the generation dependency gate used by existing callers.
+    ``accessibility`` is deliberately independent: a renderer can be available
+    while its output is only conditionally accessible (HTML/DOCX) or explicitly
+    partial and non-PDF/UA (the current ReportLab PDF renderer).
+    """
     formats = {}
     for fmt in _ALLOWED_FORMATS:
         try:
@@ -214,6 +300,7 @@ def report_capabilities() -> dict:
     return {
         "schema": "vcstudio.paper-report.capabilities/v1",
         "formats": formats,
+        "accessibility": copy.deepcopy(_FORMAT_ACCESSIBILITY),
     }
 
 
@@ -265,6 +352,7 @@ def render_report_bundle(
     temp_root = Path(tempfile.mkdtemp(prefix=f".{safe_stem}.tmp-", dir=destination))
     preserve_temp_root = False
     try:
+        accessibility_records = _report_accessibility(normalized, requested)
         staged_model, asset_records = _stage_figures(
             normalized,
             temp_root / "assets",
@@ -342,6 +430,7 @@ def render_report_bundle(
             "model_file": model_file_record,
             "generated_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
             "formats": list(requested),
+            "accessibility": accessibility_records,
             "files": file_records,
             "assets": asset_records,
         }
@@ -402,6 +491,7 @@ def render_report_bundle(
         "revision": normalized["revision"],
         "files": output_paths,
         "assets": asset_paths,
+        "accessibility": accessibility_records,
         "manifest": final_manifest,
     }
 
@@ -453,6 +543,7 @@ def render_report_html_preview(model: Mapping[str, Any]) -> dict:
         "preset_id": preview_model["preset_id"],
         "contract_status": preview_model["contract_status"],
         "contract_refs": _json_safe(preview_model["contract_refs"]),
+        "accessibility": _report_accessibility(normalized, ("html",))["html"],
     }
 
 
@@ -1241,7 +1332,7 @@ def _normalize_figure(item: Any, index: int) -> dict:
         return {
             "title": f"Figure {index}",
             "caption": "",
-            "alt": f"Figure {index}",
+            "alt": "",
             "_source_path": source,
         }
     if not isinstance(item, Mapping):
@@ -1253,7 +1344,10 @@ def _normalize_figure(item: Any, index: int) -> dict:
     return {
         "title": title,
         "caption": _text(item.get("caption")),
-        "alt": _text(item.get("alt")) or title,
+        # Do not manufacture alternative text from a display title.  Renderers
+        # still emit their native description attribute, but an absent source
+        # description remains empty and the accessibility record fails closed.
+        "alt": _text(item.get("alt")),
         "figure_id": _text(item.get("figure_id")),
         "evidence_refs": _json_safe(item.get("evidence_refs") or []),
         "claim_refs": _json_safe(item.get("claim_refs") or []),
@@ -1265,6 +1359,53 @@ def _normalize_figure(item: Any, index: int) -> dict:
         "extensions": _json_safe(item.get("extensions") or {}),
         "_source_path": Path(raw_path).expanduser(),
     }
+
+
+def _has_meaningful_figure_alt(figure: Mapping[str, Any]) -> bool:
+    """Return whether a figure description clears the fail-closed baseline.
+
+    This is intentionally a narrow mechanical gate, not an editorial quality
+    claim.  Empty text and generated labels such as ``Figure 1`` are never
+    accepted as meaningful alternative text.  A human still needs to confirm
+    that non-generic descriptions convey the figure's scientific purpose.
+    """
+
+    value = " ".join(_text(figure.get("alt")).split())
+    return bool(value) and _GENERIC_FIGURE_ALT_RE.fullmatch(value) is None
+
+
+def _report_accessibility(model: Mapping[str, Any], formats: Sequence[str]) -> dict:
+    """Build format-specific, fail-closed accessibility evidence.
+
+    Records describe only what each renderer encodes.  They do not promote a
+    generated artifact to WCAG, Word-checker, or PDF/UA conformance.  Missing or
+    generic figure descriptions downgrade HTML/DOCX to ``partial``; ReportLab
+    PDF remains partial regardless because it does not encode a structure tree
+    or image alternative text.
+    """
+
+    figures = list(model.get("figures") or [])
+    missing_alt = sum(
+        1 for figure in figures
+        if not isinstance(figure, Mapping) or not _has_meaningful_figure_alt(figure)
+    )
+    records = {}
+    for fmt in formats:
+        record = copy.deepcopy(_FORMAT_ACCESSIBILITY[fmt])
+        record["figures_total"] = len(figures)
+        record["figures_missing_meaningful_alt"] = missing_alt
+        record["source_figure_alt_complete"] = missing_alt == 0
+        if fmt in {"html", "docx"} and missing_alt:
+            record["status"] = "partial"
+            prefix_zh = f"{missing_alt} 幅图片缺少有意义的替代文本；"
+            prefix_en = (
+                f"{missing_alt} figure(s) lack meaningful alternative text; "
+            )
+            record["reason_zh"] = prefix_zh + record["reason_zh"]
+            record["reason_en"] = prefix_en + record["reason_en"]
+            record["reason"] = record["reason_zh"]
+        records[fmt] = record
+    return records
 
 
 def _stage_figures(model: dict, assets_dir: Path, formats: Sequence[str]) -> tuple[dict, list[dict]]:
@@ -1650,6 +1791,8 @@ def _html_document(model: dict) -> str:
     title = html.escape(model["title"])
     subtitle = html.escape(model["subtitle"])
     kicker = html.escape(model["kicker"])
+    meta_description = html.escape(
+        model["subtitle"] or model["title"], quote=True)
     report_kind = html.escape(model["report_kind"], quote=True)
     report_status = html.escape(_report_kind_label(model))
     document = f"""<!doctype html>
@@ -1657,6 +1800,8 @@ def _html_document(model: dict) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="author" content="VASP Catalyst Studio">
+<meta name="description" content="{meta_description}">
 <title>{title}</title>
 <style>
 @page {{
@@ -1806,6 +1951,7 @@ def _render_docx(model: dict, output: Path) -> None:
     highlight_color = _hex_rgb(theme["highlight"])
     ink_color = _hex_rgb(theme["ink"])
     doc = Document()
+    _set_docx_document_language(doc, model["locale"], qn, OxmlElement)
     section = doc.sections[0]
     section.page_width = Mm(210)
     section.page_height = Mm(297)
@@ -1889,6 +2035,7 @@ def _render_docx(model: dict, output: Path) -> None:
     doc.core_properties.subject = model["subtitle"]
     doc.core_properties.author = "VASP Catalyst Studio"
     doc.core_properties.keywords = "scientific report; adsorption energy; catalysis"
+    doc.core_properties.language = model["locale"]
 
     spacer = doc.add_paragraph()
     spacer.paragraph_format.space_after = Pt(theme["cover_spacer_mm"] * 2.2)
@@ -1980,10 +2127,15 @@ def _render_docx(model: dict, output: Path) -> None:
                 width, height = image.scaled_dimensions(width=max_width)
                 if height > max_height:
                     width, height = image.scaled_dimensions(height=max_height)
-                paragraph.add_run().add_picture(
+                inline_shape = paragraph.add_run().add_picture(
                     str(figure["_render_path"]),
                     width=width,
                     height=height,
+                )
+                _set_docx_picture_accessibility(
+                    inline_shape,
+                    alt=figure["alt"],
+                    title=figure["title"],
                 )
                 caption = doc.add_paragraph(style="Caption")
                 caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -2005,6 +2157,55 @@ def _render_docx(model: dict, output: Path) -> None:
 
     # Save from the temporary directory; the caller commits only complete files.
     doc.save(output)
+
+
+def _set_docx_document_language(doc, locale, qn, element_factory) -> None:
+    """Set Word document defaults and report styles to one BCP-47 locale."""
+
+    def set_language(run_properties) -> None:
+        language = run_properties.find(qn("w:lang"))
+        if language is None:
+            language = element_factory("w:lang")
+            run_properties.append(language)
+        language.set(qn("w:val"), locale)
+        language.set(qn("w:eastAsia"), locale)
+
+    styles = doc.styles.element
+    defaults = styles.find(qn("w:docDefaults"))
+    if defaults is None:
+        defaults = element_factory("w:docDefaults")
+        styles.insert(0, defaults)
+    run_defaults = defaults.find(qn("w:rPrDefault"))
+    if run_defaults is None:
+        run_defaults = element_factory("w:rPrDefault")
+        defaults.append(run_defaults)
+    run_properties = run_defaults.find(qn("w:rPr"))
+    if run_properties is None:
+        run_properties = element_factory("w:rPr")
+        run_defaults.append(run_properties)
+    set_language(run_properties)
+
+    for style_name in (
+        "Normal", "Title", "Subtitle", "Heading 1", "Heading 2", "Heading 3",
+        "Caption",
+    ):
+        try:
+            style = doc.styles[style_name]
+        except KeyError:
+            continue
+        set_language(style._element.get_or_add_rPr())
+
+
+def _set_docx_picture_accessibility(inline_shape, *, alt, title) -> None:
+    """Write image description/title to the standard ``wp:docPr`` element."""
+
+    properties = inline_shape._inline.docPr
+    properties.set("descr", _text(alt))
+    display_title = _text(title)
+    if not display_title or _GENERIC_FIGURE_ALT_RE.fullmatch(display_title):
+        display_title = _text(alt)
+    if display_title:
+        properties.set("title", display_title)
 
 
 def _append_word_field(run, instruction: str, element_factory) -> None:
@@ -2581,6 +2782,8 @@ def _render_pdf(model: dict, output: Path) -> None:
         author="VASP Catalyst Studio",
         subject=model["subtitle"],
         creator="VASP Catalyst Studio paper_report",
+        keywords=["scientific report", "adsorption energy", "catalysis"],
+        lang=model["locale"],
     )
 
     story = [Spacer(1, theme["cover_spacer_mm"] * mm)]
@@ -2669,6 +2872,9 @@ def _render_pdf(model: dict, output: Path) -> None:
         canvas.saveState()
         canvas.setTitle(model["title"])
         canvas.setAuthor("VASP Catalyst Studio")
+        canvas.setSubject(model["subtitle"])
+        canvas.setCreator("VASP Catalyst Studio paper_report")
+        canvas.setKeywords(["scientific report", "adsorption energy", "catalysis"])
         canvas.setFont(font, 7.8)
         canvas.setFillColor(palette["muted"])
         if doc.page > 1:

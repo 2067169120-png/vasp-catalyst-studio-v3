@@ -29,5 +29,6 @@ def test_generate_success_guides_to_and_focuses_new_job_without_losing_feedback(
     assert '前往任务页并提交' in generate
     # 新引导为增量行为：保留原有的打开目录、toast 和台账刷新。
     assert "VCS.call('open_dir', r.job_dir)" in generate
-    assert "VCS.toast('已生成四件套')" in generate
+    assert 'runtime.generate.run.four_files_created' in generate
+    assert "'已生成四件套', 'Four-file input set generated'" in generate
     assert "typeof window.Jobs.reload === 'function'" in generate

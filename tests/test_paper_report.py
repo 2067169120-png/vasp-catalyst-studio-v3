@@ -228,6 +228,14 @@ def test_render_all_formats_from_one_model_and_write_manifest(tmp_path):
         "sha256": result["model_sha256"],
         "size": result["model_file"].stat().st_size,
     }
+    assert manifest["accessibility"] == result["accessibility"]
+    assert manifest["accessibility"]["html"]["status"] == "conditional"
+    assert manifest["accessibility"]["docx"]["status"] == "conditional"
+    assert manifest["accessibility"]["pdf"]["status"] == "partial"
+    assert manifest["accessibility"]["pdf"]["visual"] is True
+    assert manifest["accessibility"]["pdf"]["searchable"] is True
+    assert manifest["accessibility"]["pdf"]["tagged"] is False
+    assert manifest["accessibility"]["pdf"]["pdf_ua"] is False
     assert set(manifest["files"]) == {"html", "docx", "pdf"}
     for record in manifest["files"].values():
         path = result["manifest"].parent / record["path"]
@@ -290,6 +298,11 @@ def test_html_preview_uses_bound_outline_locale_and_matches_formal_hashes(tmp_pa
     formal_html = published["files"]["html"].read_text(encoding="utf-8")
 
     assert '<html lang="zh-CN">' in preview["html"]
+    assert '<meta name="author" content="VASP Catalyst Studio">' in preview["html"]
+    assert "<main class=\"paper\">" in preview["html"]
+    assert "<section><h2>" in preview["html"]
+    assert "<figure>" not in preview["html"]  # outline intentionally omits figures.
+    assert preview["accessibility"]["status"] == "conditional"
     assert preview["html"].index("局限性") < preview["html"].index("执行摘要")
     assert "核心结论" not in preview["html"]
     assert formal_html.index("局限性") < formal_html.index("执行摘要")
@@ -493,6 +506,7 @@ def test_docx_is_a4_with_header_footer_page_field_and_three_line_table(tmp_path)
     from docx import Document
     from docx.oxml.ns import qn
     from docx.shared import Mm
+    from xml.etree import ElementTree as ET
 
     result = paper_report.render_report_bundle(
         _model(tmp_path),
@@ -508,8 +522,33 @@ def test_docx_is_a4_with_header_footer_page_field_and_three_line_table(tmp_path)
     with zipfile.ZipFile(path) as archive:
         footer_xml = archive.read("word/footer1.xml").decode("utf-8")
         document_xml = archive.read("word/document.xml").decode("utf-8")
+        styles_xml = archive.read("word/styles.xml").decode("utf-8")
+        core_xml = archive.read("docProps/core.xml").decode("utf-8")
     assert "PAGE" in footer_xml
     assert "w:numPr" in document_xml  # findings/recommendations use real Word numbering.
+    namespaces = {
+        "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+        "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+        "dc": "http://purl.org/dc/elements/1.1/",
+    }
+    document_root = ET.fromstring(document_xml)
+    image_properties = document_root.findall(".//wp:docPr", namespaces)
+    assert any(
+        item.get("descr") == "Overlaid free-energy pathways"
+        and item.get("title") == "Free-energy pathways"
+        for item in image_properties
+    )
+    assert document_root.find(".//w:trPr/w:tblHeader", namespaces) is not None
+    styles_root = ET.fromstring(styles_xml)
+    language_nodes = styles_root.findall(".//w:lang", namespaces)
+    assert language_nodes
+    assert all(
+        node.get(qn("w:val")) == "en-US"
+        and node.get(qn("w:eastAsia")) == "en-US"
+        for node in language_nodes
+    )
+    core_root = ET.fromstring(core_xml)
+    assert core_root.find("dc:language", namespaces).text == "en-US"
     assert doc.tables
     borders = doc.tables[0]._tbl.tblPr.find(qn("w:tblBorders"))
     assert borders.find(qn("w:top")).get(qn("w:val")) == "single"
@@ -519,6 +558,10 @@ def test_docx_is_a4_with_header_footer_page_field_and_three_line_table(tmp_path)
     assert "Adsorption Screening Report" in all_text
     assert "Table 1. Candidate evaluation" in all_text
     assert "Figure 1. Free-energy pathways" in all_text
+    assert any(paragraph.style.name == "Heading 1" for paragraph in doc.paragraphs)
+    assert any(paragraph.style.name == "Caption" for paragraph in doc.paragraphs)
+    assert result["accessibility"]["docx"]["status"] == "conditional"
+    assert result["accessibility"]["docx"]["source_figure_alt_complete"] is True
 
 
 def test_pdf_is_a4_multipage_and_contains_shared_model_text(tmp_path):
@@ -530,6 +573,7 @@ def test_pdf_is_a4_multipage_and_contains_shared_model_text(tmp_path):
         formats=("pdf",),
     )
     reader = PdfReader(result["files"]["pdf"])
+    catalog = reader.trailer["/Root"]
     assert len(reader.pages) >= 2
     page = reader.pages[0]
     width = float(page.mediabox.width)
@@ -541,6 +585,49 @@ def test_pdf_is_a4_multipage_and_contains_shared_model_text(tmp_path):
     assert "Candidate A" in text
     assert "Figure 1." in text
     assert "Page 2" in text
+    assert catalog["/Lang"] == "en-US"
+    assert "/StructTreeRoot" not in catalog
+    assert reader.metadata.title == "Adsorption Screening Report"
+    assert reader.metadata.author == "VASP Catalyst Studio"
+    assert reader.metadata.subject == "A reproducible multi-catalyst comparison"
+    assert "scientific report" in str(reader.metadata.get("/Keywords"))
+    assert result["accessibility"]["pdf"]["status"] == "partial"
+    assert result["accessibility"]["pdf"]["tagged"] is False
+    assert result["accessibility"]["pdf"]["pdf_ua"] is False
+
+
+@pytest.mark.parametrize(
+    ("alt_value", "title"),
+    [
+        (None, "Free-energy pathways"),
+        ("Figure 1", "Free-energy pathways"),
+        ("图 1", "自由能路径"),
+    ],
+)
+def test_missing_or_generic_figure_alt_is_fail_closed(tmp_path, alt_value, title):
+    model = _model(tmp_path)
+    model["figures"][0]["title"] = title
+    if alt_value is None:
+        model["figures"][0].pop("alt", None)
+    else:
+        model["figures"][0]["alt"] = alt_value
+
+    result = paper_report.render_report_bundle(
+        model, tmp_path / f"alt-{alt_value or 'missing'}", formats=("html",)
+    )
+    record = result["accessibility"]["html"]
+
+    assert record["status"] == "partial"
+    assert record["figures_total"] == 1
+    assert record["figures_missing_meaningful_alt"] == 1
+    assert record["source_figure_alt_complete"] is False
+    assert "1" in record["reason_zh"]
+    html_document = result["files"]["html"].read_text(encoding="utf-8")
+    if alt_value is None:
+        assert "alt=''" in html_document
+        assert "alt='Free-energy pathways'" not in html_document
+    manifest = json.loads(result["manifest"].read_text(encoding="utf-8"))
+    assert manifest["accessibility"]["html"] == record
 
 
 def test_model_hash_tracks_figure_content_not_source_location(tmp_path):
@@ -1189,6 +1276,15 @@ def test_report_capabilities_exposes_each_optional_dependency(monkeypatch):
     assert result["formats"]["docx"]["available"] is False
     assert "python-docx" in result["formats"]["docx"]["reason"]
     assert result["formats"]["pdf"]["available"] is True
+    assert result["accessibility"]["html"]["status"] == "conditional"
+    assert result["accessibility"]["docx"]["status"] == "conditional"
+    assert result["accessibility"]["pdf"]["status"] == "partial"
+    assert result["accessibility"]["pdf"]["visual"] is True
+    assert result["accessibility"]["pdf"]["searchable"] is True
+    assert result["accessibility"]["pdf"]["semantic_structure"] is False
+    assert result["accessibility"]["pdf"]["tagged"] is False
+    assert result["accessibility"]["pdf"]["pdf_ua"] is False
+    assert "untagged" in result["accessibility"]["pdf"]["reason_en"]
 
 
 def test_report_capabilities_rejects_corrupt_pdf_fonts(monkeypatch, tmp_path):

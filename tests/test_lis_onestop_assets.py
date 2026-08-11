@@ -74,7 +74,10 @@ def test_large_config_folders_have_safe_bulk_species_tools():
     assert 'function applyBulkSpecies()' in js
     assert '应用并确认全部未确认项' in _source('index.html')
     assert '只看未确认' in _source('index.html')
-    assert '物种已确认 ${matched}/${State.configs.length}，INCAR 已绑定 ${incars}/${State.configs.length}' in js
+    assert 'runtime.project.renderconfigs.text_9b721810b2' in js
+    assert 'value1: (matched)' in js
+    assert 'value2: (State.configs.length)' in js
+    assert 'value3: (incars)' in js
     assert '确认本组映射' in js
     assert '<select class="ipt lis-species"' in js
     assert '.lis-config-field .pj-cfglist' in css and 'max-height:' in css
@@ -107,8 +110,9 @@ def test_reference_only_import_is_not_mislabelled_as_missing_delta_e():
     js = _source('project.js')
     assert 'const referenceOnly = gate.molecules > 0 && !isAdsorption' in js
     assert 'Li-S 参考能库已建立，可以开始新的吸附计算' in js
-    assert "? '用这些参考能开始吸附计算'" in js
-    assert "referenceOnly ? 'Li-S 参考能库已就绪。'" in js
+    assert "referenceOnly ? tr('runtime.project.showimportdone.references_ready'" in js
+    assert 'runtime.project.commitimport.text_3f87e40b80' in js
+    assert '用这些参考能开始吸附计算' in js
 
 
 def test_cross_file_energy_evidence_is_visible_to_user():
@@ -154,7 +158,9 @@ def test_lis_progressively_opens_only_the_current_step():
         assert f'data-lis-open-step="{step}"' in html
     assert 'const firstIncomplete = [1, 2, 3, 4].find' in js
     assert "el.classList.toggle('current', step === activeStep)" in js
-    assert '请先完成第 ${firstIncomplete} 步' in js
+    assert 'runtime.project.openlisstep.text_c4cb9d76b5' in js
+    assert 'value1: (firstIncomplete)' in js
+    assert '请先完成第 {value1} 步' in js
     assert '.lis-step:not(.current) .lis-step-body' in css
     assert 'content:"当前步骤"' in css
 
@@ -201,8 +207,12 @@ def test_ispin_notes_and_managed_copy_repairs_are_informational():
     method = js[js.index('function renderMethodCheck('):
                 js.index('function renderRepairPlan(')]
     assert 'check.notes' in method
-    assert "'lis-method-notes', '体系说明（包括 ISPIN）'" in method
-    assert "'lis-method-repairs', '已在受管副本安全修复（源文件未改）'" in method
+    assert "renderMethodSection('lis-method-notes'" in method
+    assert 'runtime.project.rendermethodcheck.text_0ff74ab0d7' in method
+    assert '体系说明（包括 ISPIN）' in method
+    assert "renderMethodSection('lis-method-repairs'" in method
+    assert 'runtime.project.rendermethodcheck.text_9cc61621ea' in method
+    assert '已在受管副本安全修复（源文件未改）' in method
     assert 'checkbox' not in method
     repair = js[js.index('function renderRepairPlan('):
                 js.index('function invalidatePreparedLis(')]
@@ -396,8 +406,9 @@ def test_single_report_format_selection_is_accessible_and_enforced():
     assert '请至少选择一种报告格式' in js
     assert "selectedFormats.length !== 1 || selectedFormats[0] !== 'html'" in js
     assert '请只勾选 HTML 后重试' in js
-    assert "kind: 'final'" not in js[js.index('if (bridgeMethodUnavailable(r))'):
-                                      js.index("VCS.log('生成完整报告失败:")]
+    bundle_fallback = js[js.index('if (bridgeMethodUnavailable(r))'):
+                         js.index('runtime.project.report.text_74a017ddde')]
+    assert "kind: 'final'" not in bundle_fallback
     assert "first.focus()" in js
     assert '.pj-report-format-options' in css
     assert '.pj-report-formats.invalid' in css
@@ -431,9 +442,9 @@ def test_errors_offer_a_direct_repair_action_instead_of_log_only():
     assert 'function lisRepairHint(message, stage)' in js
     assert 'function lisRepairAction(message, stage)' in js
     assert 'data-lis-fix=' in js
-    assert "return ['cluster', '前往集群配置']" in js
-    assert "return ['step3', '返回修改项目名']" in js
-    assert "return ['method', '查看 ΔE / 报告门禁']" in js
+    assert "return ['cluster', tr(\"runtime.project.lisrepairaction.text_961fb7cb49\"" in js
+    assert "return ['step3', tr(\"runtime.project.lisrepairaction.text_bc8a6ca2b8\"" in js
+    assert "return ['method', tr(\"runtime.project.lisrepairaction.text_fc5b0d432a\"" in js
 
 
 def test_project_progress_is_restored_after_reopening_the_app():

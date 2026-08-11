@@ -25,84 +25,88 @@
     'publish-export': REPORT_QUERY_KEYS,
   });
 
+  function tr(key, fallback, params) {
+    return typeof VCS.t === 'function' ? VCS.t(key, params || {}, fallback) : fallback;
+  }
+
   const ROUTES = Object.freeze({
-    home: { area: 'home', page: 'dashboard', label: '首页', path: () => '/home' },
-    'project-overview': { area: 'project', page: 'project', label: '项目概览',
+    home: { area: 'home', page: 'dashboard', label: '首页', labelKey: 'workspace.route.home', path: () => '/home' },
+    'project-overview': { area: 'project', page: 'project', label: '项目概览', labelKey: 'workspace.route.project_overview',
       path: c => `/projects/${projectToken(c)}/overview` },
-    'project-members': { area: 'project', page: 'project', label: '成员与数据',
+    'project-members': { area: 'project', page: 'project', label: '成员与数据', labelKey: 'workspace.route.project_members',
       path: c => `/projects/${projectToken(c)}/members`, focus: '#pj-select' },
-    'project-workflow': { area: 'project', page: 'dashboard', label: '项目工作流',
+    'project-workflow': { area: 'project', page: 'dashboard', label: '项目工作流', labelKey: 'workspace.route.project_workflow',
       path: c => `/projects/${projectToken(c)}/workflow`, focus: '#db-pipeline' },
-    'project-runs': { area: 'project', page: 'jobs', label: '项目运行',
+    'project-runs': { area: 'project', page: 'jobs', label: '项目运行', labelKey: 'workspace.route.project_runs',
       path: c => `/projects/${projectToken(c)}/runs` },
-    'project-activity': { area: 'project', page: 'dashboard', label: '活动与版本',
+    'project-activity': { area: 'project', page: 'dashboard', label: '活动与版本', labelKey: 'workspace.route.project_activity',
       path: c => `/projects/${projectToken(c)}/activity`, focus: '#db-feed' },
 
-    'prepare-structure': { area: 'prepare', page: 'structure', label: '结构',
+    'prepare-structure': { area: 'prepare', page: 'structure', label: '结构', labelKey: 'workspace.route.prepare_structure',
       path: () => '/prepare/structure' },
-    'prepare-input': { area: 'prepare', page: 'generate', label: '输入',
+    'prepare-input': { area: 'prepare', page: 'generate', label: '输入', labelKey: 'workspace.route.prepare_input',
       path: () => '/prepare/input' },
-    'prepare-batch': { area: 'prepare', page: 'generate', label: '批量',
+    'prepare-batch': { area: 'prepare', page: 'generate', label: '批量', labelKey: 'workspace.route.prepare_batch',
       path: () => '/prepare/batch' },
-    'prepare-templates': { area: 'prepare', page: 'generate', label: '模板',
+    'prepare-templates': { area: 'prepare', page: 'generate', label: '模板', labelKey: 'workspace.route.prepare_templates',
       path: () => '/prepare/templates', focus: '#taskcat-card' },
-    'prepare-preflight': { area: 'prepare', page: 'generate', label: '预检',
+    'prepare-preflight': { area: 'prepare', page: 'generate', label: '预检', labelKey: 'workspace.route.prepare_preflight',
       path: () => '/prepare/preflight' },
 
-    'run-jobs': { area: 'run', page: 'jobs', label: '作业', path: () => '/jobs' },
-    'run-remote': { area: 'run', page: 'cluster', label: '远程', path: () => '/run/remote' },
+    'run-jobs': { area: 'run', page: 'jobs', label: '作业', labelKey: 'workspace.route.run_jobs', path: () => '/jobs' },
+    'run-remote': { area: 'run', page: 'cluster', label: '远程', labelKey: 'workspace.route.run_remote', path: () => '/run/remote' },
 
-    'analyze-energy': { area: 'analyze', page: 'analysis-workbench', label: '能量与稳定性',
+    'analyze-energy': { area: 'analyze', page: 'analysis-workbench', label: '能量与稳定性', labelKey: 'workspace.route.analyze_energy',
       path: c => `/projects/${projectToken(c)}/analysis/adsorption`,
       analysisId: 'adsorption-energy', scenePage: 'project', focus: '#aw-title' },
-    'analyze-thermo': { area: 'analyze', page: 'analysis-workbench', label: '热力学与动力学',
+    'analyze-thermo': { area: 'analyze', page: 'analysis-workbench', label: '热力学与动力学', labelKey: 'workspace.route.analyze_thermo',
       path: c => `/projects/${projectToken(c)}/analysis/thermo`,
       analysisId: 'free-energy-path', scenePage: 'project', focus: '#aw-title' },
-    'analyze-electronic': { area: 'analyze', page: 'analysis-workbench', label: '电子结构',
+    'analyze-electronic': { area: 'analyze', page: 'analysis-workbench', label: '电子结构', labelKey: 'workspace.route.analyze_electronic',
       path: c => `/projects/${projectToken(c)}/analysis/electronic`,
       analysisId: 'electronic-structure', scenePage: 'wavefunction', focus: '#aw-title' },
-    'analyze-charge': { area: 'analyze', page: 'analysis-workbench', label: '电荷与波函数',
+    'analyze-charge': { area: 'analyze', page: 'analysis-workbench', label: '电荷与波函数', labelKey: 'workspace.route.analyze_charge',
       path: c => `/projects/${projectToken(c)}/analysis/charge`,
       analysisId: 'charge-wavefunction', scenePage: 'wavefunction', focus: '#aw-title' },
-    'analyze-comparison': { area: 'analyze', page: 'analysis-workbench', label: '比较',
+    'analyze-comparison': { area: 'analyze', page: 'analysis-workbench', label: '比较', labelKey: 'workspace.route.analyze_comparison',
       path: c => `/projects/${projectToken(c)}/analysis/comparison`,
       analysisId: 'multi-project-comparison', scenePage: 'project', focus: '#aw-title' },
-    'analyze-custom': { area: 'analyze', page: 'analysis-workbench', label: '自定义',
+    'analyze-custom': { area: 'analyze', page: 'analysis-workbench', label: '自定义', labelKey: 'workspace.route.analyze_custom',
       path: c => `/projects/${projectToken(c)}/analysis/custom`,
       analysisId: 'task-results', scenePage: 'project', focus: '#aw-title' },
-    'analyze-properties': { area: 'analyze', page: 'analysis-workbench', label: '性质计算器',
+    'analyze-properties': { area: 'analyze', page: 'analysis-workbench', label: '性质计算器', labelKey: 'workspace.route.analyze_properties',
       path: c => `/projects/${projectToken(c)}/analysis/properties`,
       analysisId: 'property-calculators', scenePage: 'project', focus: '#aw-title' },
 
-    'publish-figures': { area: 'publish', page: 'figures', label: '图表',
+    'publish-figures': { area: 'publish', page: 'figures', label: '图表', labelKey: 'workspace.route.publish_figures',
       path: c => `/publish/figures?project=${encodeURIComponent(projectToken(c))}` },
-    'publish-report': { area: 'publish', page: 'report-workbench', label: '报告',
+    'publish-report': { area: 'publish', page: 'report-workbench', label: '报告', labelKey: 'workspace.route.publish_report',
       path: c => `/publish/report?project=${encodeURIComponent(projectToken(c))}`,
       reportMode: 'report', focus: '#rw-title' },
-    'publish-si': { area: 'publish', page: 'report-workbench', label: '补充信息',
+    'publish-si': { area: 'publish', page: 'report-workbench', label: '补充信息', labelKey: 'workspace.route.publish_si',
       path: c => `/publish/si?project=${encodeURIComponent(projectToken(c))}`,
       reportMode: 'si', focus: '#rw-step-button-outline' },
-    'publish-draftpack': { area: 'publish', page: 'report-workbench', label: '草稿包',
+    'publish-draftpack': { area: 'publish', page: 'report-workbench', label: '草稿包', labelKey: 'workspace.route.publish_draftpack',
       path: c => `/publish/draftpack?project=${encodeURIComponent(projectToken(c))}`,
       reportMode: 'draftpack', focus: '#rw-step-button-export' },
-    'publish-versions': { area: 'publish', page: 'report-workbench', label: '版本',
+    'publish-versions': { area: 'publish', page: 'report-workbench', label: '版本', labelKey: 'workspace.route.publish_versions',
       path: c => `/publish/versions?project=${encodeURIComponent(projectToken(c))}`,
       reportMode: 'versions', focus: '#rw-history-heading' },
-    'publish-export': { area: 'publish', page: 'report-workbench', label: '导出与归档',
+    'publish-export': { area: 'publish', page: 'report-workbench', label: '导出与归档', labelKey: 'workspace.route.publish_export',
       path: c => `/publish/export?project=${encodeURIComponent(projectToken(c))}`,
       reportMode: 'export', focus: '#rw-step-button-export' },
 
-    'environment-cluster': { area: 'environment', page: 'cluster', label: '集群',
+    'environment-cluster': { area: 'environment', page: 'cluster', label: '集群', labelKey: 'workspace.route.environment_cluster',
       path: () => '/environment/cluster' },
-    'environment-local': { area: 'environment', page: 'jobs', label: '本地运行器',
+    'environment-local': { area: 'environment', page: 'jobs', label: '本地运行器', labelKey: 'workspace.route.environment_local',
       path: () => '/environment/local-runner' },
-    'environment-dependencies': { area: 'environment', page: 'settings', label: '依赖',
+    'environment-dependencies': { area: 'environment', page: 'settings', label: '依赖', labelKey: 'workspace.route.environment_dependencies',
       path: () => '/environment/dependencies', focus: '#deps-panel' },
-    'environment-paths': { area: 'environment', page: 'settings', label: '数据路径',
+    'environment-paths': { area: 'environment', page: 'settings', label: '数据路径', labelKey: 'workspace.route.environment_paths',
       path: () => '/environment/data-paths' },
-    'environment-templates': { area: 'environment', page: 'settings', label: '模板',
+    'environment-templates': { area: 'environment', page: 'settings', label: '模板', labelKey: 'workspace.route.environment_templates',
       path: () => '/environment/templates' },
-    'environment-settings': { area: 'environment', page: 'settings', label: '设置',
+    'environment-settings': { area: 'environment', page: 'settings', label: '设置', labelKey: 'workspace.route.environment_settings',
       path: () => '/environment/settings' },
   });
 
@@ -112,7 +116,7 @@
   });
 
   const SUBNAV = Object.freeze({
-    home: [{ route: 'home', label: '首页' }],
+    home: [{ route: 'home', label: '首页', labelKey: 'workspace.route.home' }],
     project: [
       { route: 'project-overview', label: '概览' },
       { route: 'project-members', label: '成员与数据' },
@@ -128,10 +132,10 @@
       { route: 'prepare-preflight', label: '预检' },
     ],
     run: [
-      { route: 'run-jobs', label: '待处理', query: { status: 'queue' } },
-      { route: 'run-jobs', label: '运行中', query: { status: 'run' } },
-      { route: 'run-jobs', label: '需关注', query: { status: 'need' } },
-      { route: 'run-jobs', label: '已完成', query: { status: 'done' } },
+      { route: 'run-jobs', label: '待处理', labelKey: 'workspace.jobs.queue', query: { status: 'queue' } },
+      { route: 'run-jobs', label: '运行中', labelKey: 'workspace.jobs.run', query: { status: 'run' } },
+      { route: 'run-jobs', label: '需关注', labelKey: 'workspace.jobs.need', query: { status: 'need' } },
+      { route: 'run-jobs', label: '已完成', labelKey: 'workspace.jobs.done', query: { status: 'done' } },
       { route: 'run-remote', label: '远程' },
     ],
     analyze: [
@@ -291,8 +295,11 @@
   let routeApplyTail = Promise.resolve();
   let externalNavigationPromise = null;
   let externalNavigationHash = '';
-  let historyIndex = Number.isSafeInteger(Number(history.state && history.state.vcsIndex))
-    ? Number(history.state.vcsIndex) : 0;
+  const initialHistoryState = history.state && typeof history.state === 'object'
+    ? history.state : null;
+  let historyIndex = initialHistoryState &&
+    Number.isSafeInteger(Number(initialHistoryState.vcsIndex))
+    ? Number(initialHistoryState.vcsIndex) : 0;
   let historyCompensation = null;
   let projectSwitchGeneration = 0;
   let locationIntentGeneration = 0;
@@ -492,8 +499,13 @@
   async function guardUnsaved(reason) {
     if (!dirtyScopes.size) return true;
     const details = Array.from(dirtyScopes.values()).map(item => item.label).filter(Boolean);
-    const message = (reason || '离开当前内容') + '会丢弃尚未保存的修改。' +
-      (details.length ? `\n\n未保存：${details.join('、')}` : '') + '\n\n是否丢弃并继续？';
+    const detailText = details.length ? tr('workspace.unsaved.details',
+      '\n\n未保存：{items}', { items: details.join('、') }) : '';
+    const message = tr('workspace.unsaved.confirm',
+      '{reason}会丢弃尚未保存的修改。{details}\n\n是否丢弃并继续？', {
+        reason: reason || tr('workspace.unsaved.leave_current', '离开当前内容'),
+        details: detailText,
+      });
     const ok = await VCS.confirm(message);
     if (ok) {
       dirtyScopes.clear();
@@ -576,7 +588,7 @@
       anchor.dataset.page = def.page;
       anchor.dataset.scene = 'pages.' + def.page;
       anchor.href = routeHash(item.route, { query: item.query });
-      anchor.textContent = item.label;
+      anchor.textContent = tr(item.labelKey || def.labelKey, item.label || def.label);
       const key = item.route === 'run-jobs'
         ? `run-jobs:${(item.query && item.query.status) || ''}` : item.route;
       if (key === activeKey) {
@@ -603,7 +615,7 @@
     document.body.dataset.workspaceArea = area;
     document.body.dataset.activeArea = area;
     document.body.dataset.workspacePage = route.def.page;
-    document.title = `${route.def.label} · VASP Catalyst Studio`;
+    document.title = `${tr(route.def.labelKey, route.def.label)} · VASP Catalyst Studio`;
   }
 
   function applyRouteControls(route) {
@@ -641,7 +653,13 @@
     document.querySelectorAll('[data-acc]').forEach(card => {
       const key = safeToken(card.getAttribute('data-acc'));
       if (key && Object.prototype.hasOwnProperty.call(state.panels, key)) {
-        card.setAttribute('data-open', state.panels[key] ? '1' : '0');
+        if (VCS.ui && typeof VCS.ui.setAccordionOpen === 'function') {
+          VCS.ui.setAccordionOpen(card, !!state.panels[key], true);
+        } else {
+          card.setAttribute('data-open', state.panels[key] ? '1' : '0');
+          const toggle = card.querySelector(':scope > .acc-h > .acc-toggle');
+          if (toggle) toggle.setAttribute('aria-expanded', state.panels[key] ? 'true' : 'false');
+        }
       }
     });
   }
@@ -823,8 +841,10 @@
     if (!chip) return;
     const count = dirtyScopes.size;
     chip.hidden = !count;
-    chip.textContent = count ? `未保存 ${count}` : '';
-    chip.setAttribute('aria-label', count ? `${count} 处内容尚未保存` : '没有未保存内容');
+    chip.textContent = count ? tr('workspace.unsaved.count', '未保存 {count}', { count }) : '';
+    chip.setAttribute('aria-label', count
+      ? tr('workspace.unsaved.count_aria', '{count} 处内容尚未保存', { count })
+      : tr('workspace.unsaved.none', '没有未保存内容'));
   }
 
   VCS.unsaved = {
@@ -879,7 +899,11 @@
     const stage = document.getElementById('workspace-stage');
     if (stage) {
       const value = selectedProject && selectedProject.stage;
-      stage.textContent = value ? `阶段 ${value}` : (selectedProject ? '阶段未知' : '未选择项目');
+      stage.textContent = value
+        ? tr('workspace.context.stage_value', '阶段 {stage}', { stage: value })
+        : (selectedProject
+          ? tr('workspace.context.stage_unknown', '阶段未知')
+          : tr('workspace.context.no_project', '未选择项目'));
       stage.classList.toggle('warn', !!(selectedProject && selectedProject.needs_human));
     }
     renderActivity();
@@ -1067,20 +1091,29 @@
     if (toggle) {
       const badge = toggle.querySelector('[data-activity-count]');
       if (badge) { badge.textContent = String(count); badge.hidden = !count; }
-      toggle.setAttribute('aria-label', count ? `活动中心，${count} 项需关注` : '活动中心，没有待处理提醒');
+      toggle.setAttribute('aria-label', count
+        ? tr('workspace.activity.attention', `活动中心，${count} 项需关注`, { count })
+        : tr('workspace.activity.clear', '活动中心，没有待处理提醒'));
     }
     if (!list) return;
     if (!events.length) {
-      list.innerHTML = '<div class="workspace-empty">本次会话暂无后台活动。作业状态史与报告证据仍保存在各自项目中。</div>';
+      const empty = document.createElement('div'); empty.className = 'workspace-empty';
+      empty.textContent = tr('workspace.activity.empty',
+        '本次会话暂无后台活动。作业状态史与报告证据仍保存在各自项目中。');
+      list.replaceChildren(empty);
       return;
     }
-    const labels = { refresh: '同步', continue: '续算', fetch: '下载', report_done: '报告',
-      report_blocked: '报告阻断', skip: '跳过', error: '错误' };
+    const labels = { refresh: ['workspace.activity.refresh', '同步'],
+      continue: ['workspace.activity.continue', '续算'], fetch: ['workspace.activity.fetch', '下载'],
+      report_done: ['workspace.activity.report_done', '报告'],
+      report_blocked: ['workspace.activity.report_blocked', '报告阻断'],
+      skip: ['workspace.activity.skip', '跳过'], error: ['workspace.activity.error', '错误'] };
     list.innerHTML = events.slice(0, 40).map(event => {
       const severity = event.kind === 'error' ? 'error'
         : event.kind === 'report_done' ? 'success' : 'info';
-      return `<div class="activity-item ${severity}"><span class="activity-kind">${VCS.esc(labels[event.kind] || event.kind || '活动')}</span>` +
-        `<div><b>${VCS.esc(event.project || event.cluster || '工作区')}</b>` +
+      const label = labels[event.kind];
+      return `<div class="activity-item ${severity}"><span class="activity-kind">${VCS.esc(label ? tr(label[0], label[1]) : event.kind || tr('workspace.activity.item', '活动'))}</span>` +
+        `<div><b>${VCS.esc(event.project || event.cluster || tr('workspace.context.workspace', '工作区'))}</b>` +
         `<p>${VCS.esc(event.text || '')}</p></div><time>${VCS.esc(event.time || '')}</time></div>`;
     }).join('');
   }
@@ -1089,7 +1122,60 @@
     return Array.from(container.querySelectorAll(
       'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),' +
       'textarea:not([disabled]),[tabindex]:not([tabindex="-1"])'))
-      .filter(el => !el.hidden && el.getAttribute('aria-hidden') !== 'true');
+      .filter(el => {
+        if (el.closest('[hidden],[inert],[aria-hidden="true"],fieldset[disabled]')) return false;
+        const style = typeof window.getComputedStyle === 'function'
+          ? window.getComputedStyle(el) : null;
+        if (style && (style.display === 'none' || style.visibility === 'hidden')) return false;
+        return !el.getClientRects || el.getClientRects().length > 0;
+      });
+  }
+
+  const drawerIsolation = new Map();
+
+  function restoreDrawerIsolation() {
+    drawerIsolation.forEach((saved, element) => {
+      if (!element || !element.isConnected) return;
+      if (saved.inert) element.setAttribute('inert', ''); else element.removeAttribute('inert');
+      if (saved.ariaHidden == null) element.removeAttribute('aria-hidden');
+      else element.setAttribute('aria-hidden', saved.ariaHidden);
+    });
+    drawerIsolation.clear();
+  }
+
+  function isolateDrawer(drawer, backdrop) {
+    restoreDrawerIsolation();
+    if (!drawer) return;
+    const keep = new Set([drawer]);
+    if (backdrop) keep.add(backdrop);
+    let ancestor = drawer.parentElement;
+    while (ancestor && ancestor !== document.body) {
+      keep.add(ancestor); ancestor = ancestor.parentElement;
+    }
+    function save(element) {
+      if (!drawerIsolation.has(element)) {
+        drawerIsolation.set(element, {
+          inert: element.hasAttribute('inert'),
+          ariaHidden: element.getAttribute('aria-hidden'),
+        });
+      }
+    }
+    function visit(parent) {
+      Array.from(parent.children).forEach(element => {
+        if (keep.has(element)) {
+          if (element === drawer) {
+            element.removeAttribute('inert');
+            element.setAttribute('aria-hidden', 'false');
+          } else if (element !== backdrop) visit(element);
+          return;
+        }
+        save(element);
+        element.setAttribute('inert', '');
+        element.setAttribute('aria-hidden', 'true');
+      });
+    }
+    visit(document.body);
+    if (backdrop) backdrop.setAttribute('aria-hidden', 'true');
   }
 
   function trapDrawerFocus(event, drawer, close) {
@@ -1160,11 +1246,14 @@
     const drawer = document.getElementById('activity-drawer');
     const backdrop = document.getElementById('activity-backdrop');
     if (!drawer) return false;
+    closeAssistant(); closeNav();
     activityReturnFocus = trigger || document.activeElement;
     drawer.hidden = false;
     drawer.classList.add('open');
     drawer.setAttribute('aria-hidden', 'false');
+    drawer.setAttribute('aria-modal', 'true');
     if (backdrop) backdrop.hidden = false;
+    isolateDrawer(drawer, backdrop);
     const button = document.getElementById('activity-toggle');
     if (button) button.setAttribute('aria-expanded', 'true');
     renderActivity();
@@ -1179,7 +1268,9 @@
     if (!drawer || drawer.hidden) return;
     drawer.classList.remove('open'); drawer.hidden = true;
     drawer.setAttribute('aria-hidden', 'true');
+    drawer.setAttribute('aria-modal', 'false');
     if (backdrop) backdrop.hidden = true;
+    restoreDrawerIsolation();
     const button = document.getElementById('activity-toggle');
     if (button) button.setAttribute('aria-expanded', 'false');
     if (activityReturnFocus && activityReturnFocus.isConnected) activityReturnFocus.focus();
@@ -1197,13 +1288,16 @@
       return false;
     }
     if (!drawer) return false;
+    closeActivity(); closeNav();
     assistantReturnFocus = trigger || document.activeElement;
     drawer.hidden = false;
     drawer.classList.add('open');
     drawer.setAttribute('role', 'dialog');
     drawer.setAttribute('aria-modal', 'true');
+    drawer.setAttribute('aria-hidden', 'false');
     drawer.setAttribute('aria-label', '项目上下文助手');
     if (backdrop) backdrop.hidden = false;
+    isolateDrawer(drawer, backdrop);
     const button = document.getElementById('assistant-toggle');
     if (button) button.setAttribute('aria-expanded', 'true');
     document.body.classList.add('assistant-open');
@@ -1227,7 +1321,10 @@
     const backdrop = document.getElementById('assistant-backdrop');
     if (!drawer || drawer.hidden) return;
     drawer.classList.remove('open'); drawer.hidden = true;
+    drawer.setAttribute('aria-modal', 'false');
+    drawer.setAttribute('aria-hidden', 'true');
     if (backdrop) backdrop.hidden = true;
+    restoreDrawerIsolation();
     const button = document.getElementById('assistant-toggle');
     if (button) button.setAttribute('aria-expanded', 'false');
     document.body.classList.remove('assistant-open');
@@ -1549,6 +1646,10 @@
     document.addEventListener('vcs:scenario', () => {
       if (currentRoute) renderRoute(currentRoute);
       renderContext();
+    });
+    document.addEventListener('vcs:language', () => {
+      if (currentRoute) renderRoute(currentRoute);
+      renderContext(); renderActivity();
     });
     document.addEventListener('vcs:engine', renderContext);
     document.addEventListener('vcs:calculation', renderContext);

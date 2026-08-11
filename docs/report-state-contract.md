@@ -151,15 +151,63 @@ full sidecar/manifest chain.
 
 ## Format capabilities
 
-The UI asks the backend for per-format capabilities before generation. HTML is
-always available; DOCX and PDF are enabled only when their real renderer
-imports are available and packaged font assets can actually be parsed. Merely
-finding a font-shaped path is insufficient. At least one format is required.
-Missing one requested format makes the operation incomplete and prevents marker
-persistence; successful generation of another format does not silently satisfy
-the request. Non-interactive import, chat, and automatic close-out paths request
-HTML plus only those optional formats that the same capability probe has
-positively confirmed.
+The UI asks the backend for two independent per-format capability axes before
+generation:
+
+- `formats.<format>.available` means that the renderer and its required assets
+  are available. It controls whether the format can be selected.
+- `accessibility.<format>` describes properties the renderer can encode. It
+  never changes renderer availability and must not be inferred from a file
+  having been created.
+
+HTML is always renderable; DOCX and PDF are enabled only when their real
+renderer imports are available and packaged font assets can actually be parsed.
+Merely finding a font-shaped path is insufficient. At least one format is
+required. Missing one requested format makes the operation incomplete and
+prevents marker persistence; successful generation of another format does not
+silently satisfy the request. Non-interactive import, chat, and automatic
+close-out paths request HTML plus only those optional formats that the same
+render-availability probe has positively confirmed.
+
+Accessibility records use fail-closed states. `conditional` means the renderer
+encodes the listed foundations but author-supplied content and human review are
+still required. `partial` means a known accessibility requirement is absent.
+`unsupported` is reserved for a known unavailable accessibility mode, and
+`unknown` means the backend did not provide enough evidence. The manifest stores
+artifact-specific accessibility records, including the number of figures whose
+source descriptions failed the narrow meaningful-alt baseline. Empty text and
+labels such as `Figure 1` or `图 1` do not satisfy that baseline.
+
+Current format boundaries are:
+
+- HTML emits a document `lang`, metadata, headings, tables, figure/caption
+  structure, and `img alt`. Its status is conditional when every figure has a
+  non-generic description and partial otherwise. Browser/screen-reader review
+  remains required for reading order, text quality, contrast, reflow, and
+  keyboard behavior.
+- DOCX emits core metadata and document language, applies `w:lang` to document
+  defaults and report styles, preserves Word Heading/Caption styles and
+  repeating table-header rows, and writes each image description to
+  `wp:docPr/@descr` with a useful title. Its status is conditional when every
+  figure has a non-generic description and partial otherwise. A structural OOXML
+  test can verify those fields, but Word Accessibility Checker and human review
+  must still confirm alt-text quality, reading order, table usability, color,
+  and pagination.
+- The ReportLab PDF is visual and searchable and records `/Lang` plus document
+  metadata. It is nevertheless untagged: it has no structure tree and does not
+  encode image alternative text. Its accessibility status therefore remains
+  `partial`, with `tagged=false` and `pdf_ua=false`, even when generation
+  succeeds. The application must never describe this artifact as PDF/UA or as
+  an accessible substitute for the HTML or DOCX.
+
+Automated tests may prove the presence of declared HTML elements/attributes,
+OOXML language/style/header/alt fields, PDF text, `/Lang`, metadata, and the
+absence of `/StructTreeRoot`. They cannot honestly certify WCAG conformance,
+scientific adequacy of alternative text, screen-reader experience, usable
+reading order, color-blind distinguishability, or PDF/UA conformance. Those
+claims require suitable assistive-technology and human review; PDF/UA also
+requires a tagged-PDF-capable renderer and a standards validator, which the
+current ReportLab path does not provide.
 
 ## Legacy boundary
 

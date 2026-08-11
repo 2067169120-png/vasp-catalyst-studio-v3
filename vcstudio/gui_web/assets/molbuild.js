@@ -7,6 +7,8 @@
 'use strict';
 (function () {
   const $ = id => document.getElementById(id);
+  const tr = (key, fallback, params) => typeof VCS.t === 'function'
+    ? VCS.t(key, params || {}, fallback) : fallback;
   const val = id => { const el = $(id); return el ? el.value.trim() : ''; };
   const setVal = (id, v) => { const el = $(id); if (el) el.value = (v == null ? '' : v); };
 
@@ -26,7 +28,11 @@
   }
   async function pickImage() {
     const r = await VCS.call('pick_file', 'image');
-    if (r && r.error) { VCS.log('选择图片失败:' + r.error, 'failc'); return; }
+    if (r && r.error) {
+      VCS.log(tr('molecule.image.pick_failed', '选择图片失败：{error}', {
+        error: r.error,
+      }), 'failc'); return;
+    }
     if (r && r.path) setVal('mol-img-path', r.path);
   }
   async function runOcsr() {
@@ -38,10 +44,14 @@
     try {
       const r = await VCS.call('mol_image_to_smiles', p);
       if (!r || r.ok === false || r.error) {
-        VCS.log('图片识别失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+        VCS.log(tr('molecule.ocsr.failed', '图片识别失败：{error}', {
+          error: (r && r.error) || tr('common.unknown_error', '未知错误'),
+        }), 'failc'); return;
       }
       setVal('mol-img-smiles', r.smiles);
-      VCS.log('识别出 SMILES:' + r.smiles + '(耗时 ' + r.elapsed_ms + ' ms)', 'okc');
+      VCS.log(tr('molecule.ocsr.result', '识别出 SMILES：{smiles}（耗时 {elapsed} ms）', {
+        smiles: r.smiles, elapsed: r.elapsed_ms,
+      }), 'okc');
       refreshSvg();
     } finally {
       if (btn) btn.disabled = false;
@@ -56,11 +66,15 @@
     try {
       const r = await VCS.call('mol_image_b64_to_smiles', dataUrl, '.png');
       if (!r || r.ok === false || r.error) {
-        VCS.log('剪贴板识别失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+        VCS.log(tr('molecule.clipboard.failed', '剪贴板识别失败：{error}', {
+          error: (r && r.error) || tr('common.unknown_error', '未知错误'),
+        }), 'failc'); return;
       }
       if (r.image_path) setVal('mol-img-path', r.image_path);   // 落盘临时图回填,便于复查
       setVal('mol-img-smiles', r.smiles);
-      VCS.log('识别出 SMILES:' + r.smiles + '(耗时 ' + r.elapsed_ms + ' ms)', 'okc');
+      VCS.log(tr('molecule.ocsr.result', '识别出 SMILES：{smiles}（耗时 {elapsed} ms）', {
+        smiles: r.smiles, elapsed: r.elapsed_ms,
+      }), 'okc');
       refreshSvg();
       VCS.toast('剪贴板图片已识别');
     } finally {
@@ -111,7 +125,10 @@
     if (!s) { box.innerHTML = '<span class="sub">先识别或填入 SMILES</span>'; return; }
     const r = await VCS.call('mol_smiles_svg', s, 420, 300);
     if (!r || r.ok === false || r.error) {
-      box.innerHTML = '<span class="sub">' + VCS.esc('2D 结构图失败:' + ((r && r.error) || '未知')) + '</span>';
+      box.innerHTML = '<span class="sub">' + VCS.esc(tr(
+        'molecule.svg.failed', '2D 结构图失败：{error}', {
+          error: (r && r.error) || tr('common.unknown', '未知'),
+        })) + '</span>';
       return;
     }
     box.innerHTML = r.svg;   // RDKit 生成的可信 SVG
@@ -148,16 +165,23 @@
     const ff = val('mol-ff') || 'auto';
     const btn = $('mol-3d-run');
     if (btn) btn.disabled = true;
-    VCS.log('SMILES → 3D 建模(' + ff + ')…');
+    VCS.log(tr('molecule.build.running', 'SMILES → 3D 建模（{forcefield}）…', {
+      forcefield: ff,
+    }));
     try {
       const r = await VCS.call('mol_smiles_to_3d', s, ff);
       if (!r || r.ok === false || r.error) {
-        VCS.log('3D 建模失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+        VCS.log(tr('molecule.build.failed', '3D 建模失败：{error}', {
+          error: (r && r.error) || tr('common.unknown_error', '未知错误'),
+        }), 'failc'); return;
       }
       if (window.Editor && window.Editor.loadStruct) window.Editor.loadStruct(r.struct, null, null);
       renderProps(r.struct, r.charge, r.multiplicity_hint);
       (r.warnings || []).forEach(w => VCS.log('  ⚠ ' + w, 'warnc'));
-      VCS.log('已生成 3D 结构:' + r.struct.formula + '(' + r.struct.natoms + ' 原子)已载入编辑器', 'okc');
+      VCS.log(tr('molecule.build.loaded',
+        '已生成 3D 结构：{formula}（{count} 原子），已载入编辑器', {
+          formula: r.struct.formula, count: r.struct.natoms,
+        }), 'okc');
       VCS.toast('已生成 3D 结构');
     } finally {
       if (btn) btn.disabled = false;
@@ -165,15 +189,23 @@
   }
   async function openFile() {
     const r = await VCS.call('pick_file', 'xyz');
-    if (r && r.error) { VCS.log('选择结构文件失败:' + r.error, 'failc'); return; }
+    if (r && r.error) {
+      VCS.log(tr('molecule.structure.pick_failed', '选择结构文件失败：{error}', {
+        error: r.error,
+      }), 'failc'); return;
+    }
     if (!r || !r.path) return;
     const out = await VCS.call('mol_reimport', r.path);   // xyz/mol 纯手写解析
     if (!out || out.ok === false || out.error) {
-      VCS.log('打开结构文件失败:' + ((out && out.error) || '未知错误'), 'failc'); return;
+      VCS.log(tr('molecule.structure.open_failed', '打开结构文件失败：{error}', {
+        error: (out && out.error) || tr('common.unknown_error', '未知错误'),
+      }), 'failc'); return;
     }
     if (window.Editor && window.Editor.loadStruct) window.Editor.loadStruct(out.struct, null, r.path);
     refreshProps();
-    VCS.log('已打开结构文件:' + r.path + '(' + out.struct.formula + ')', 'okc');
+    VCS.log(tr('molecule.structure.opened', '已打开结构文件：{path}（{formula}）', {
+      path: r.path, formula: out.struct.formula,
+    }), 'okc');
   }
   async function refreshProps() {
     const st = window.Editor && window.Editor.getStruct ? window.Editor.getStruct() : null;
@@ -217,8 +249,8 @@
     a.download = 'molecule.' + fmt;
     document.body.appendChild(a); a.click();
     setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 100);
-    VCS.log('已保存 molecule.' + fmt, 'okc');
-    VCS.toast('已保存 ' + fmt.toUpperCase());
+    VCS.log(tr('molecule.file.saved', '已保存 molecule.{format}', { format: fmt }), 'okc');
+    VCS.toast(tr('molecule.format.saved', '已保存 {format}', { format: fmt.toUpperCase() }));
   }
   function toXyz(st) {
     const lines = [String(st.elements.length), 'vcstudio molecule'];
@@ -297,7 +329,9 @@
     const fmt = val('mol-editor-fmt') || 'xyz';
     const r = await VCS.call('mol_export_editor', st.elements, st.coords, fmt, null);
     if (!r || r.ok === false || r.error) {
-      VCS.log('导出编辑文件失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+      VCS.log(tr('molecule.editor.export_failed', '导出编辑文件失败：{error}', {
+        error: (r && r.error) || tr('common.unknown_error', '未知错误'),
+      }), 'failc'); return;
     }
     State.editPath = r.path;
     State.editMtime = r.mtime;
@@ -305,9 +339,14 @@
     const exe = val('mol-editor-path') || null;
     const o = await VCS.call('mol_open_with', r.path, exe);
     if (!o || o.ok === false || o.error) {
-      VCS.log('打开外部编辑器失败:' + ((o && o.error) || '未知错误') + '(编辑文件已导出:' + r.path + ')', 'warnc');
+      VCS.log(tr('molecule.editor.open_failed',
+        '打开外部编辑器失败：{error}（编辑文件已导出：{path}）', {
+          error: (o && o.error) || tr('common.unknown_error', '未知错误'), path: r.path,
+        }), 'warnc');
     } else {
-      VCS.log('已导出并用外部编辑器打开:' + r.path, 'okc');
+      VCS.log(tr('molecule.editor.opened', '已导出并用外部编辑器打开：{path}', {
+        path: r.path,
+      }), 'okc');
     }
     setImportReady(false);
     startPoll();
@@ -316,12 +355,17 @@
     if (!State.editPath) { VCS.log('请先「导出并打开」再导入', 'failc'); return; }
     const r = await VCS.call('mol_reimport', State.editPath);
     if (!r || r.ok === false || r.error) {
-      VCS.log('导入编辑结果失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+      VCS.log(tr('molecule.editor.import_failed', '导入编辑结果失败：{error}', {
+        error: (r && r.error) || tr('common.unknown_error', '未知错误'),
+      }), 'failc'); return;
     }
     if (window.Editor && window.Editor.loadStruct) window.Editor.loadStruct(r.struct, null, null);
     refreshProps();
     setImportReady(false);
-    VCS.log('已导入外部编辑结果:' + r.struct.formula + '(' + r.struct.natoms + ' 原子)', 'okc');
+    VCS.log(tr('molecule.editor.imported',
+      '已导入外部编辑结果：{formula}（{count} 原子）', {
+        formula: r.struct.formula, count: r.struct.natoms,
+      }), 'okc');
     VCS.toast('已导入编辑结果');
   }
   function setImportReady(ready) {
@@ -372,25 +416,37 @@
       const sep = d.path.indexOf('\\') >= 0 ? '\\' : '/';
       saveTo = d.path + sep + a.core + '_solvated.vasp';
     }
-    VCS.log('组装溶剂化复合物(' + a.core + ' + ' + a.preset + ')…');
+    VCS.log(tr('molecule.solvation.building',
+      '组装溶剂化复合物（{core} + {preset}）…', { core: a.core, preset: a.preset }));
     const r = await VCS.call('build_solvated', a.core, a.preset, a.box, 2.5, 42, saveTo);
     const out = $('solv-out');
     if (!r || r.ok === false || r.error) {
-      VCS.log('溶剂化组装失败:' + ((r && r.error) || '未知'), 'failc');
+      VCS.log(tr('molecule.solvation.failed', '溶剂化组装失败：{error}', {
+        error: (r && r.error) || tr('common.unknown', '未知'),
+      }), 'failc');
       if (out) out.innerHTML = `<span class="sub" style="color:var(--fail)">${VCS.esc((r && r.error) || '失败')}</span>`;
       return;
     }
-    if (out) out.innerHTML = `<b>${r.n_atoms}</b> 原子 · ${VCS.esc(r.note || '')}`;
-    if (saveTo) { VCS.log('已保存:' + r.saved_to, 'okc'); VCS.toast('已保存溶剂化 POSCAR'); return; }
+    if (out) out.innerHTML = VCS.esc(tr('molecule.solvation.summary',
+      '{count} 原子 · {note}', { count: r.n_atoms, note: r.note || '' }));
+    if (saveTo) {
+      VCS.log(tr('molecule.solvation.saved', '已保存：{path}', {
+        path: r.saved_to,
+      }), 'okc'); VCS.toast('已保存溶剂化 POSCAR'); return;
+    }
     // 载入编辑器(经临时 POSCAR → struct_load)
     if (r.temp_path) {
       const sr = await VCS.call('struct_load', r.temp_path);
       if (sr && sr.ok && sr.struct && window.Editor && window.Editor.loadStruct) {
         window.Editor.loadStruct(sr.struct, null, null);
-        VCS.log('溶剂化复合物已载入编辑器:' + r.n_atoms + ' 原子', 'okc');
+        VCS.log(tr('molecule.solvation.loaded',
+          '溶剂化复合物已载入编辑器：{count} 原子', { count: r.n_atoms }), 'okc');
         VCS.toast('已载入编辑器');
       } else {
-        VCS.log('已组装 ' + r.n_atoms + ' 原子(载入编辑器失败,可点保存 POSCAR)', 'warnc');
+        VCS.log(tr('molecule.solvation.load_failed',
+          '已组装 {count} 原子（载入编辑器失败，可点保存 POSCAR）', {
+            count: r.n_atoms,
+          }), 'warnc');
       }
     }
   }

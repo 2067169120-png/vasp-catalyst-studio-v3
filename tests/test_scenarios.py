@@ -42,6 +42,18 @@ def test_every_builtin_has_all_required_keys():
         assert sc['ai_context'].strip()          # 领域上下文非空
 
 
+def test_every_builtin_exposes_complete_english_display_fields():
+    for sc in S.list_scenarios():
+        assert sc['name_en'].strip(), sc['key']
+        assert sc['description_en'].strip(), sc['key']
+        assert not re.search(r'[\u3400-\u9fff]', sc['name_en']), sc['key']
+        assert not re.search(r'[\u3400-\u9fff]', sc['description_en']), sc['key']
+
+    assert 'Li–S' in S.get_scenario('lis')['name_en']
+    assert 'Gaussian' in S.get_scenario('molecular')['description_en']
+    assert 'CO₂RR' in S.get_scenario('electrocat')['description_en']
+
+
 def test_pages_are_subset_of_valid_pages():
     for sc in S.list_scenarios():
         assert sc['pages'], sc['key']
@@ -244,7 +256,8 @@ def test_export_import_roundtrip(tmp_path):
 
 def test_import_bad_file_reports_issues(tmp_path):
     bad = {
-        'key': 'x', 'name': 'x', 'description': 'x',
+        'key': 'x', 'name': 'x', 'name_en': 'x',
+        'description': 'x', 'description_en': 'x',
         'pages': ['dashboard', 'nonsense_page'],            # 未知页面
         'cards': {'weird_page': {'a': True}},               # 未知页面卡片组
         'figure_preset_order': ['volcano', 'no_such_fig'],  # 未知图型
@@ -283,7 +296,18 @@ def test_import_non_mapping_is_not_ok(tmp_path):
 def test_missing_required_keys_flagged():
     issues = S.validate_scenario({'key': 'x'})
     assert any('name' in i for i in issues)
+    assert any('name_en' in i for i in issues)
+    assert any('description_en' in i for i in issues)
     assert any('pages' in i for i in issues)
+
+
+def test_empty_bilingual_display_fields_are_rejected():
+    scenario = S.get_scenario('vasp')
+    scenario['name_en'] = '  '
+    scenario['description'] = None
+    issues = S.validate_scenario(scenario)
+    assert any('name_en' in issue for issue in issues)
+    assert any('description' in issue for issue in issues)
 
 
 # ── config 读写(假 config 路径) ─────────────────────────────────────────────

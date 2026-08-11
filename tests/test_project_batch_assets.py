@@ -69,7 +69,10 @@ def test_report_bundle_and_batch_contracts_emit_clickable_files():
     ) in js
     assert "function collectReportFiles(value)" in js
     assert "function renderReportFiles(containerId, result, heading)" in js
-    assert "State.reportDiagnostic ? '在工作台配置诊断报告' : '打开报告工作台'" in js
+    assert 'State.reportDiagnostic ? tr(' in js
+    assert 'runtime.project.syncreportformatcontrols.text_a73e7ab0fe' in js
+    assert 'runtime.project.syncreportformatcontrols.text_a92bdc8948' in js
+    assert '在工作台配置诊断报告' in js and '打开报告工作台' in js
     assert 'data-report-open="' in js
     assert "VCS.call('open_dir', button.dataset.reportOpen)" in js
 

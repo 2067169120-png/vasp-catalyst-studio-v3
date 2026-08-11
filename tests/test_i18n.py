@@ -108,12 +108,29 @@ def test_export_for_js_is_a_copy():
     assert i18n.t('nav.dashboard', 'en') == 'Dashboard'
 
 
+def test_export_bundle_includes_exact_source_and_detached_target():
+    bundle = i18n.export_bundle_for_js('en')
+    assert bundle['lang'] == 'en'
+    assert bundle['source']['nav.dashboard'] == '仪表盘'
+    assert bundle['dict']['nav.dashboard'] == 'Dashboard'
+    bundle['source']['nav.dashboard'] = 'MUTATED'
+    assert i18n.t('nav.dashboard', 'zh') == '仪表盘'
+
+
+def test_language_identifiers_are_bounded_and_installed(tmp_path):
+    with pytest.raises(ValueError, match='safe locale'):
+        i18n.export_for_js('../en')
+    with pytest.raises(ValueError, match='unsupported interface language'):
+        i18n.set_lang('fr', config_path=tmp_path / 'config.yaml')
+
+
 # ── current_lang / set_lang ──────────────────────────────────────────────────
 
 def test_current_lang_from_config_defaults_zh():
     assert i18n.current_lang({'ui': {'lang': 'en'}}) == 'en'
     assert i18n.current_lang({}) == 'zh'
     assert i18n.current_lang(None) == 'zh'
+    assert i18n.current_lang({'ui': {'lang': '../../secret'}}) == 'zh'
 
 
 def test_set_lang_persists_and_switches_active(tmp_path):
@@ -133,6 +150,7 @@ def test_scan_html_strings_smoke():
     html = (
         '<a href="#" data-page="dashboard">仪表盘</a>'
         '<input placeholder="结构文件路径">'
+        '<button aria-label="关闭活动中心" title="关闭抽屉">×</button>'
         '<button>Generate</button>'          # 纯英文不收
         '<span>运行中</span>'
         '<div class="x"></div>'              # 空文本不收
@@ -140,6 +158,8 @@ def test_scan_html_strings_smoke():
     got = i18n.scan_html_strings(html)
     assert '仪表盘' in got
     assert '结构文件路径' in got
+    assert '关闭活动中心' in got
+    assert '关闭抽屉' in got
     assert '运行中' in got
     assert 'Generate' not in got
 

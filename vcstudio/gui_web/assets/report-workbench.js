@@ -178,9 +178,12 @@
       Object.assign({ id }, plain(record)));
   }
 
+  function uiIsEnglish() {
+    return !!(VCS.i18n && VCS.i18n.lang === 'en');
+  }
+
   function labelOf(record, fallback) {
-    const locale = String(State.spec && State.spec.locale || 'zh-CN');
-    return String(locale === 'en-US'
+    return String(uiIsEnglish()
       ? (record.label_en || record.label || record.name || fallback)
       : (record.label_zh || record.label || record.name || fallback));
   }
@@ -192,6 +195,37 @@
     return Array.isArray(rows) ? rows.filter(item => item && typeof item === 'object') : [];
   }
 
+  function normalizeAccessibility(value) {
+    const record = plain(value);
+    const statuses = new Set(['conditional', 'partial', 'unsupported', 'unknown']);
+    const status = statuses.has(record.status) ? record.status : 'unknown';
+    const normalized = {
+      status,
+      reason: String(record.reason || '服务端未声明该格式的可访问性能力。'),
+      reason_zh: String(record.reason_zh || record.reason || '服务端未声明该格式的可访问性能力。'),
+      reason_en: String(record.reason_en || record.reason ||
+        'The server did not declare accessibility support for this format.'),
+    };
+    [
+      'visual', 'searchable', 'semantic_structure', 'document_language',
+      'metadata', 'image_alt', 'tagged', 'pdf_ua', 'manual_review_required',
+    ].forEach(name => {
+      normalized[name] = typeof record[name] === 'boolean' ? record[name] : null;
+    });
+    return normalized;
+  }
+
+  function accessibilitySummary(value) {
+    const accessibility = normalizeAccessibility(value);
+    const labels = uiIsEnglish()
+      ? { conditional: 'conditional', partial: 'partial', unsupported: 'unsupported', unknown: 'unknown' }
+      : { conditional: '有条件', partial: '部分', unsupported: '不支持', unknown: '未知' };
+    const reason = uiIsEnglish() ? accessibility.reason_en : accessibility.reason_zh;
+    return VCS.t('report.accessibility.summary', {
+      status: labels[accessibility.status], reason,
+    }, '可访问性：{status}。{reason}');
+  }
+
   function explicitCapabilities(bootstrap, capabilityResult) {
     const catalog = plain(bootstrap && (bootstrap.catalog || bootstrap.report_catalog));
     const sources = [
@@ -200,13 +234,25 @@
       plain(bootstrap && bootstrap.formats),
       plain(catalog.formats),
     ];
+    const accessibilitySources = [
+      plain(capabilityResult && capabilityResult.accessibility),
+      plain(bootstrap && bootstrap.capabilities && bootstrap.capabilities.accessibility),
+      plain(bootstrap && bootstrap.accessibility),
+      plain(catalog.accessibility),
+    ];
     const normalized = Object.create(null);
     FORMAT_ORDER.forEach(format => {
       const record = sources.map(source => source[format]).find(item =>
         item && typeof item === 'object' && typeof item.available === 'boolean');
-      normalized[format] = record
-        ? { available: record.available === true, reason: String(record.reason || '') }
-        : { available: false, reason: '服务端未明确确认此格式可用。' };
+      const nestedAccessibility = sources.map(source => plain(source[format]).accessibility)
+        .find(item => item && typeof item === 'object');
+      const topLevelAccessibility = accessibilitySources.map(source => source[format])
+        .find(item => item && typeof item === 'object');
+      normalized[format] = {
+        available: record ? record.available === true : false,
+        reason: record ? String(record.reason || '') : '服务端未明确确认此格式可用。',
+        accessibility: normalizeAccessibility(nestedAccessibility || topLevelAccessibility),
+      };
     });
     return normalized;
   }
@@ -297,7 +343,9 @@
     if (!blocked.length) return current;
     const details = blocked.map(record =>
       `${labelOf(record, record.id || '选项')}（${capabilityReason(record)}）`);
-    return `${current}；当前不可用：${details.join('、')}`;
+    return VCS.t('report.capability.unavailable_summary', {
+      current, details: details.join('、'),
+    }, '{current}；当前不可用：{details}');
   }
 
   function syncCapabilityControls() {
@@ -371,7 +419,9 @@
       input.setAttribute('data-preset-id', id);
       const title = document.createElement('b'); title.textContent = labelOf(record, id);
       const description = document.createElement('small');
-      description.textContent = String(record.description_zh || record.description || record.description_en || '');
+      description.textContent = String(uiIsEnglish()
+        ? (record.description_en || record.description || record.description_zh || '')
+        : (record.description_zh || record.description || record.description_en || ''));
       label.append(input, title, description); list.appendChild(label);
     });
     fieldset.appendChild(list);
@@ -419,7 +469,11 @@
     }
     FORMAT_ORDER.forEach(format => {
       const record = Object.assign({ id: format }, plain(records[format]));
-      const capability = State.capabilities[format] || { available: false, reason: '能力状态未知。' };
+      const capability = State.capabilities[format] || {
+        available: false,
+        reason: '能力状态未知。',
+        accessibility: normalizeAccessibility(null),
+      };
       let input = list.querySelector(`[data-format-id="${format}"]`);
       let label = input && input.closest('label');
       if (!label) {
@@ -439,8 +493,15 @@
       const title = label.querySelector(`[data-format-title="${format}"]`);
       const reason = label.querySelector(`[data-format-reason="${format}"]`);
       if (title) title.textContent = labelOf(record, format.toUpperCase());
-      reason.textContent = capability.available === true ? '服务端已确认可用' :
-        (capability.reason || '服务端未明确确认可用');
+      const renderStatus = capability.available === true
+        ? (uiIsEnglish() ? 'Rendering available' : '生成可用')
+        : `${uiIsEnglish() ? 'Rendering unavailable' : '生成不可用'}：${
+          capability.reason || (uiIsEnglish()
+            ? 'The server did not confirm availability.' : '服务端未明确确认可用')}`;
+      const accessibility = normalizeAccessibility(capability.accessibility);
+      label.setAttribute('data-accessibility-status', accessibility.status);
+      reason.textContent = `${renderStatus}${uiIsEnglish() ? '; ' : '；'}${
+        accessibilitySummary(accessibility)}`;
     });
   }
 
@@ -655,8 +716,8 @@
   function renderSectionNav() {
     const nav = $('rw-section-nav'); if (!nav) return; nav.innerHTML = '';
     sectionRecords().forEach(record => {
-      const chip = document.createElement('span');
-      chip.textContent = labelOf(record, record.id); nav.appendChild(chip);
+      const item = document.createElement('li');
+      item.textContent = labelOf(record, record.id); nav.appendChild(item);
     });
   }
 
@@ -835,7 +896,9 @@
         report_spec: requestFromSpec(),
       }), { label: '报告配置尚未绑定新预览' });
     } catch (error) {
-      setOperation(`报告配置草稿未能保存：${error && error.message || error}`, 'bad');
+      setOperation(VCS.t('report.draft.save_failed', {
+        error: error && error.message || error,
+      }, '报告配置草稿未能保存：{error}'), 'bad');
     }
   }
 
@@ -895,8 +958,10 @@
     }
     if (intent.mode === 'comparison' && Array.isArray(intent.comparisonProjectIds) &&
         intent.comparisonProjectIds.length > 1) {
-      showAlert(`已从多项目入口进入并保留 ${intent.comparisonProjectIds.length} 个选择。` +
-        '当前 Phase C ReportSpec 只允许服务端冻结当前主项目；不会把其它项目路径或身份静默写入单项目快照。');
+      showAlert(VCS.t('report.comparison.single_project_boundary', {
+        count: intent.comparisonProjectIds.length,
+      }, '已从多项目入口进入并保留 {count} 个选择。当前 Phase C ReportSpec 只允许服务端冻结当前主项目；' +
+        '不会把其它项目路径或身份静默写入单项目快照。'));
     }
     return changed;
   }
@@ -1179,8 +1244,15 @@
         VCS.workspace.drafts.remove(publishDraftKey);
       } else if (!specUnchanged) persistDraft();
       const revision = revisionNumber(result.revision);
-      setOperation(`报告已发布${revision != null ? `为 Rev. ${revision}` : ''}；` +
-        (specUnchanged ? '各格式状态见下方。' : '编辑内容已变化，仍需生成新的绑定预览。'));
+      const revisionText = revision != null ? VCS.t('report.publish.revision_suffix', {
+        revision,
+      }, '为 Rev. {revision}') : '';
+      const statusText = specUnchanged
+        ? VCS.t('report.publish.formats_below', {}, '各格式状态见下方。')
+        : VCS.t('report.publish.preview_stale', {}, '编辑内容已变化，仍需生成新的绑定预览。');
+      setOperation(VCS.t('report.publish.completed', {
+        revision: revisionText, status: statusText,
+      }, '报告已发布{revision}；{status}'));
       VCS.toast('报告 revision 已生成');
       try {
         const history = await VCS.call('report_workbench_history', projectPath);
@@ -1366,6 +1438,10 @@
     document.addEventListener('vcs:workspace-project', () => {
       const page = $('page-report-workbench');
       if (page && !page.hidden) enterWorkbench();
+    });
+    document.addEventListener('vcs:language', () => {
+      if (State.spec) renderSpec();
+      renderPreview(State.preview); renderHistory(); renderFormatStates();
     });
     document.addEventListener('vcs:report-workbench-discard-draft', event => {
       const detail = plain(event.detail);

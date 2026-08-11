@@ -2,6 +2,59 @@
 // Task 5/6 的页面模块只依赖此文件暴露的全局 VCS.*。
 'use strict';
 
+const vcsModalStack = [];
+const vcsModalBackground = new Map();
+
+function vcsModalFocusable(container) {
+  return Array.from(container.querySelectorAll(
+    'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),' +
+    'textarea:not([disabled]),[tabindex]:not([tabindex="-1"])'))
+    .filter(element => !element.closest('[hidden],[inert],[aria-hidden="true"],fieldset[disabled]'));
+}
+
+function vcsModalRestore(element, saved) {
+  if (!element || !saved) return;
+  if (saved.inert) element.setAttribute('inert', ''); else element.removeAttribute('inert');
+  if (saved.ariaHidden == null) element.removeAttribute('aria-hidden');
+  else element.setAttribute('aria-hidden', saved.ariaHidden);
+}
+
+function vcsModalSyncBackground() {
+  const top = vcsModalStack.length ? vcsModalStack[vcsModalStack.length - 1] : null;
+  if (!top) {
+    vcsModalBackground.forEach((saved, element) => vcsModalRestore(element, saved));
+    vcsModalBackground.clear(); return;
+  }
+  Array.from(document.body.children).forEach(element => {
+    if (!vcsModalBackground.has(element)) {
+      vcsModalBackground.set(element, {
+        inert: element.hasAttribute('inert'), ariaHidden: element.getAttribute('aria-hidden'),
+      });
+    }
+    if (element === top.mask) vcsModalRestore(element, vcsModalBackground.get(element));
+    else { element.setAttribute('inert', ''); element.setAttribute('aria-hidden', 'true'); }
+  });
+}
+
+function vcsModalKeydown(event) {
+  const top = vcsModalStack.length ? vcsModalStack[vcsModalStack.length - 1] : null;
+  if (!top) return;
+  if (event.key === 'Escape') {
+    event.preventDefault(); event.stopPropagation(); top.dismiss(); return;
+  }
+  if (event.key !== 'Tab') return;
+  const focusable = vcsModalFocusable(top.el);
+  if (!focusable.length) { event.preventDefault(); top.el.focus(); return; }
+  const first = focusable[0]; const last = focusable[focusable.length - 1];
+  if (event.shiftKey && (document.activeElement === first || !top.el.contains(document.activeElement))) {
+    event.preventDefault(); last.focus();
+  } else if (!event.shiftKey && (document.activeElement === last || !top.el.contains(document.activeElement))) {
+    event.preventDefault(); first.focus();
+  }
+}
+
+document.addEventListener('keydown', vcsModalKeydown, true);
+
 const VCS = {
   // pywebview 就绪信号:桥挂载完成后触发 'pywebviewready'
   ready: new Promise(res => {
@@ -16,7 +69,7 @@ const VCS = {
     await VCS.ready;
     const fn = window.pywebview && window.pywebview.api && window.pywebview.api[method];
     if (typeof fn !== 'function') {
-      return { error: `桥方法不存在:${method}` };
+      return { error: VCS.t('bridge.method_missing', { method }, '桥方法不存在：{method}') };
     }
     const out = await fn(...args);
     if (out && out.error === 'NEED_PASSWORD') {
@@ -33,13 +86,16 @@ const VCS = {
       let done = false;
       const finish = v => { if (!done) { done = true; res(v); } };
       const m = VCS.modal({
-        title: '集群密码',
+        title: VCS.t ? VCS.t('cluster.password.title', {}, '集群密码') : '集群密码',
         bodyHTML:
-          '<input id="pw" type="password" class="ipt" ' +
-          'placeholder="输入密码(成功后存入系统凭据库)" autocomplete="off">',
+          '<label class="sr-only" for="pw" data-i18n="cluster.password.label">集群密码</label>' +
+          `<input id="pw" type="password" class="ipt" data-i18n-ph="cluster.password.placeholder" ` +
+          `placeholder="${VCS.esc(VCS.t('cluster.password.placeholder', {},
+            '输入密码(成功后存入系统凭据库)'))}" autocomplete="off">`,
         actions: [
-          { label: '取消', quiet: true, onClick: mm => { mm.close(); finish(null); } },
-          { label: '连接', primary: true, onClick: mm => {
+          { label: VCS.t ? VCS.t('common.cancel', {}, '取消') : '取消', quiet: true,
+            onClick: mm => { mm.close(); finish(null); } },
+          { label: VCS.t ? VCS.t('cluster.connect', {}, '连接') : '连接', primary: true, onClick: mm => {
               const v = mm.el.querySelector('#pw').value;
               mm.close(); finish(v);
             } },
@@ -60,6 +116,8 @@ const VCS = {
   // ── 通用模态:建 .modal-mask+.modal,返回 {el, close, onDismiss?} ──
   // actions: [{label, primary?, quiet?, onClick(modal)}]
   modal({ title, bodyHTML = '', body = null, actions = [] }) {
+    const dialogTitle = String(title || '').trim();
+    if (!dialogTitle) throw new Error('modal title is required for an accessible dialog');
     const returnFocus = document.activeElement instanceof HTMLElement
       ? document.activeElement : null;
     const mask = document.createElement('div');
@@ -71,33 +129,48 @@ const VCS = {
     card.tabIndex = -1;
     const titleId = 'vcs-dialog-title-' + Math.random().toString(36).slice(2);
     card.innerHTML =
-      (title ? `<div class="m-title" id="${titleId}"></div>` : '') +
+      `<div class="m-title" id="${titleId}"></div>` +
       `<div class="m-body"></div>` +
       `<div class="m-actions"></div>`;
-    if (title) card.setAttribute('aria-labelledby', titleId);
+    card.setAttribute('aria-labelledby', titleId);
     mask.appendChild(card);
 
-    if (title) card.querySelector('.m-title').textContent = title;
+    card.querySelector('.m-title').textContent = dialogTitle;
     const bodyEl = card.querySelector('.m-body');
     if (body instanceof Node) bodyEl.appendChild(body);
     else bodyEl.innerHTML = bodyHTML;
 
-    const handle = { el: card, mask, onDismiss: null };
+    const handle = { el: card, mask, onDismiss: null, returnFocus };
     let closed = false;
     handle.close = () => {
       if (closed) return;
       closed = true;
-      document.removeEventListener('keydown', onKey);
+      const index = vcsModalStack.indexOf(handle);
+      const wasTop = index === vcsModalStack.length - 1;
+      if (index >= 0) vcsModalStack.splice(index, 1);
       if (mask.parentNode) mask.parentNode.removeChild(mask);
-      if (returnFocus && returnFocus.isConnected && typeof returnFocus.focus === 'function') {
-        try { returnFocus.focus({ preventScroll: true }); } catch (_) { returnFocus.focus(); }
+      vcsModalSyncBackground();
+      if (wasTop) {
+        const previous = vcsModalStack.length ? vcsModalStack[vcsModalStack.length - 1].el : returnFocus;
+        if (previous && previous.isConnected && typeof previous.focus === 'function') {
+          try { previous.focus({ preventScroll: true }); } catch (_) { previous.focus(); }
+        }
       }
+    };
+    handle.dismiss = () => {
+      if (closed) return;
+      if (handle.onDismiss) handle.onDismiss();
+      handle.close();
     };
 
     const actEl = card.querySelector('.m-actions');
-    (actions.length ? actions : [{ label: '关闭', quiet: true, onClick: h => h.close() }])
+    (actions.length ? actions : [{
+      label: VCS.t ? VCS.t('common.close', {}, '关闭') : '关闭',
+      quiet: true, onClick: h => h.close(),
+    }])
       .forEach(a => {
         const b = document.createElement('button');
+        b.type = 'button';
         b.className = 'btn' + (a.primary ? ' primary' : a.quiet ? ' quiet' : '');
         b.textContent = a.label;
         b.addEventListener('click', () => a.onClick ? a.onClick(handle) : handle.close());
@@ -106,32 +179,11 @@ const VCS = {
 
     // 点遮罩空白处 = 取消(触发 onDismiss 后关闭)
     mask.addEventListener('mousedown', e => {
-      if (e.target === mask) { if (handle.onDismiss) handle.onDismiss(); handle.close(); }
+      if (e.target === mask) handle.dismiss();
     });
-    // Esc 关闭；Tab 在对话框内循环，关闭后把焦点还给触发器。
-    const onKey = e => {
-      if (e.key === 'Escape') {
-        if (handle.onDismiss) handle.onDismiss();
-        handle.close();
-      } else if (e.key === 'Tab') {
-        const focusable = Array.from(card.querySelectorAll(
-          'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),' +
-          'textarea:not([disabled]),[tabindex]:not([tabindex="-1"])'))
-          .filter(el => !el.hidden && el.getAttribute('aria-hidden') !== 'true');
-        if (!focusable.length) {
-          e.preventDefault(); card.focus(); return;
-        }
-        const first = focusable[0]; const last = focusable[focusable.length - 1];
-        if (e.shiftKey && document.activeElement === first) {
-          e.preventDefault(); last.focus();
-        } else if (!e.shiftKey && document.activeElement === last) {
-          e.preventDefault(); first.focus();
-        }
-      }
-    };
-    document.addEventListener('keydown', onKey);
 
     document.body.appendChild(mask);
+    vcsModalStack.push(handle); vcsModalSyncBackground();
     const initialFocus = card.querySelector(
       '[autofocus],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),' +
       'button:not([disabled]),a[href]');
@@ -145,11 +197,13 @@ const VCS = {
       let done = false;
       const finish = v => { if (!done) { done = true; res(v); } };
       const m = VCS.modal({
-        title: '请确认',
+        title: VCS.t ? VCS.t('common.confirm', {}, '请确认') : '请确认',
         bodyHTML: `<div></div>`,
         actions: [
-          { label: '取消', quiet: true, onClick: mm => { mm.close(); finish(false); } },
-          { label: '确定', primary: true, onClick: mm => { mm.close(); finish(true); } },
+          { label: VCS.t ? VCS.t('common.cancel', {}, '取消') : '取消', quiet: true,
+            onClick: mm => { mm.close(); finish(false); } },
+          { label: VCS.t ? VCS.t('common.ok', {}, '确定') : '确定', primary: true,
+            onClick: mm => { mm.close(); finish(true); } },
         ],
       });
       m.el.querySelector('.m-body div').textContent = String(msg);
@@ -167,12 +221,10 @@ const VCS = {
       VCS.log('服务器没有返回可核对的主机名和 SHA256 指纹，已阻止连接。请先在“集群”页测试连接。', 'failc');
       return null;
     }
-    const ok = await VCS.confirm(
-      '首次连接服务器，请与管理员提供的信息逐字核对：\n\n' +
-      '主机：' + host + '\n' +
-      '算法：' + (algorithm || '未提供') + '\n' +
-      'SHA256 指纹：' + fingerprint + '\n\n' +
-      '只有完全一致时才选择“确定”。');
+    const ok = await VCS.confirm(VCS.t('cluster.host_key.confirm', {
+      host, algorithm: algorithm || VCS.t('common.not_provided', {}, '未提供'), fingerprint,
+    }, '首次连接服务器，请与管理员提供的信息逐字核对：\n\n主机：{host}\n算法：{algorithm}' +
+      '\nSHA256 指纹：{fingerprint}\n\n只有完全一致时才选择“确定”。'));
     return ok ? { host, fingerprint, algorithm } : null;
   },
 
@@ -321,6 +373,15 @@ VCS.focusNavigationTarget = async function (options = {}) {
   if (!options.focusSelector) return true;
   const el = document.querySelector(options.focusSelector);
   if (!el) return false;
+  const card = el.matches && el.matches('[data-acc]')
+    ? el : el.closest && el.closest('[data-acc]');
+  if (card && VCS.ui && typeof VCS.ui.setAccordionOpen === 'function') {
+    VCS.ui.setAccordionOpen(card, true, true);
+  } else if (card) {
+    card.setAttribute('data-open', '1');
+    const toggle = card.querySelector(':scope > .acc-h > .acc-toggle');
+    if (toggle) toggle.setAttribute('aria-expanded', 'true');
+  }
   if (typeof el.scrollIntoView === 'function') el.scrollIntoView({ block: 'center' });
   if (typeof el.focus === 'function') {
     if (!el.hasAttribute('tabindex') && !/^(A|BUTTON|INPUT|SELECT|TEXTAREA)$/.test(el.tagName)) {
@@ -374,7 +435,9 @@ VCS.nextStep = function ({ title = '操作已完成', message = '', detail = '',
               }
             }
           } catch (err) {
-            VCS.toast('无法打开下一步:' + (err && err.message ? err.message : err), 'fail');
+            VCS.toast(VCS.t('next_step.open_failed', {
+              error: err && err.message ? err.message : err,
+            }, '无法打开下一步：{error}'), 'fail');
           }
         } },
     ],
@@ -389,6 +452,17 @@ VCS.themeApply = function (name) {
   document.documentElement.dataset.theme = t;
   try { localStorage.setItem('vcs.theme', t); } catch (_) { /* 隐私模式忽略 */ }
   return t;
+};
+
+// ── 视觉密度:三档尺寸 token；与主题颜色、科学数据和图表坐标完全独立 ──
+// <head> 会先按严格白名单预绘制；桥就绪后再用服务端设置校准并回写本地首帧缓存。
+const DENSITIES = ['comfortable', 'standard', 'compact'];
+VCS.densityApply = function (name) {
+  const density = DENSITIES.indexOf(name) >= 0 ? name : 'standard';
+  document.documentElement.dataset.density = density;
+  try { localStorage.setItem('vcs.density', density); } catch (_) { /* 隐私模式忽略 */ }
+  document.dispatchEvent(new CustomEvent('vcs:density', { detail: { density } }));
+  return density;
 };
 
 // ── 侧栏底部:动态显示当前默认集群(取 profiles 首个;无则"未配置集群") ──
@@ -419,7 +493,8 @@ VCS.elementBadge = function (systemName) {
   while ((m = re.exec(s))) {
     const sym = m[0];
     if (EL_CPK[sym]) {
-      return `<span class="elbadge" style="--el:${EL_CPK[sym]}" title="金属位:${sym}">${sym}</span>`;
+      const title = VCS.t('chemistry.metal_site', { symbol: sym }, '金属位：{symbol}');
+      return `<span class="elbadge" style="--el:${EL_CPK[sym]}" title="${VCS.esc(title)}">${sym}</span>`;
     }
   }
   return '';   // 识别不出不加(不猜)
@@ -446,15 +521,20 @@ function renderHealth() {
   const p = VCS.pipeline;
   if (p.failStreak >= 1) {
     el.className = 'warn';
-    el.innerHTML = `<span class="dot g"></span>同步失败×${p.failStreak}` +
-      `<span class="bridge">界面桥 ✓</span>`;
+    el.innerHTML = `<span class="dot g"></span>${VCS.esc(VCS.t('pipeline.sync_failed_count', {
+      count: p.failStreak,
+    }, '同步失败×{count}'))}<span class="bridge">${VCS.esc(VCS.t(
+      'bridge.healthy', {}, '界面桥 ✓'))}</span>`;
   } else if (p.lastSuccess) {
     el.className = '';
-    el.innerHTML = `<span class="dot g"></span>同步 ${hhmm(p.lastSuccess)} ✓` +
-      `<span class="bridge">界面桥 ✓</span>`;
+    el.innerHTML = `<span class="dot g"></span>${VCS.esc(VCS.t('pipeline.synced_at', {
+      time: hhmm(p.lastSuccess),
+    }, '同步 {time} ✓'))}<span class="bridge">${VCS.esc(VCS.t(
+      'bridge.healthy', {}, '界面桥 ✓'))}</span>`;
   } else {
     el.className = '';
-    el.innerHTML = `<span class="dot g"></span><span class="bridge">界面桥 ✓</span>`;
+    el.innerHTML = `<span class="dot g"></span><span class="bridge">${VCS.esc(VCS.t(
+      'bridge.healthy', {}, '界面桥 ✓'))}</span>`;
   }
 }
 
@@ -464,8 +544,10 @@ function renderConnBanner() {
   const p = VCS.pipeline;
   if (p.failStreak >= 2) {
     b.classList.add('show');
-    b.innerHTML = `⚠ 集群连接可能已断:最近 <b>${p.failStreak}</b> 次同步失败` +
-      `(上次成功 ${p.lastSuccess ? hhmm(p.lastSuccess) : '—'}),数据可能过期`;
+    b.textContent = VCS.t('pipeline.connection_stale', {
+      count: p.failStreak,
+      last: p.lastSuccess ? hhmm(p.lastSuccess) : '—',
+    }, '⚠ 集群连接可能已断：最近 {count} 次同步失败（上次成功 {last}），数据可能过期');
   } else {
     b.classList.remove('show');
   }
@@ -502,7 +584,9 @@ function renderFeed() {
 function reportToast(ev) {
   const t = document.createElement('div');
   t.className = 'toast ok';
-  t.textContent = '报告已自动生成:' + (ev.project || '');
+  t.textContent = VCS.t('pipeline.report_generated', {
+    project: ev.project || '',
+  }, '报告已自动生成：{project}');
   const b = document.createElement('button');
   b.className = 'btn quiet';
   b.style.marginLeft = '12px';
@@ -535,8 +619,12 @@ function onPipelineOutcome(out) {
   document.dispatchEvent(new CustomEvent('vcs:pipeline-events', {
     detail: { events: p.events.slice(), outcome: out },
   }));
-  if (other) VCS.toast('自动托管：本轮 ' + other + ' 条动态', '');
-  if ((out.errors || []).length) VCS.toast('自动托管遇到 ' + out.errors.length + ' 个问题（见任务动态）', 'fail');
+  if (other) VCS.toast(VCS.t('pipeline.events_summary', {
+    count: other,
+  }, '自动托管：本轮 {count} 条动态'), '');
+  if ((out.errors || []).length) VCS.toast(VCS.t('pipeline.errors_summary', {
+    count: out.errors.length,
+  }, '自动托管遇到 {count} 个问题（见任务动态）'), 'fail');
   renderHealth();
   renderConnBanner();
   renderFeed();
@@ -572,7 +660,9 @@ async function pipelineRuntimePoll() {
         } else if (item.error) {
           p.events.unshift({
             kind: 'error',
-            text: '后台自动托管异常：' + String(item.error),
+            text: VCS.t('pipeline.runtime_error', {
+              error: String(item.error),
+            }, '后台自动托管异常：{error}'),
             time: hhmm(item.finished),
           });
           p.events = p.events.slice(0, 20);
@@ -604,7 +694,9 @@ async function pipelineRuntimePoll() {
 async function pipelineTick() {
   const queued = await VCS.call('pipeline_wake');
   if (!queued || queued.error) {
-    VCS.toast('无法启动后台检查：' + ((queued && queued.error) || '未知错误'), 'fail');
+    VCS.toast(VCS.t('pipeline.wake_failed', {
+      error: (queued && queued.error) || VCS.t('common.unknown_error', {}, '未知错误'),
+    }, '无法启动后台检查：{error}'), 'fail');
     return queued;
   }
   setTimeout(pipelineRuntimePoll, 350);
@@ -620,6 +712,8 @@ VCS.pipeline.reconfigure = async function () {
   const s = await VCS.call('settings_get');
   const ui = (s && s.ui) || {};
   if (ui.theme) VCS.themeApply(ui.theme);
+  if (ui.density) VCS.densityApply(ui.density);
+  else if (!document.documentElement.dataset.density) VCS.densityApply('standard');
   const enabled = ui.autopilot === true;
   if (VCS.pipeline.timer) { clearInterval(VCS.pipeline.timer); VCS.pipeline.timer = null; }
   VCS.pipeline.timer = setInterval(pipelineRuntimePoll, 5000);
@@ -638,27 +732,135 @@ document.addEventListener('vcs:page', e => {
   if (e.detail && e.detail.page === 'dashboard') renderFeed();
 });
 
-// ── i18n:按 data-i18n 属性替换文本(缺键保留原中文,en 缺失回落 zh 已在后端处理) ──
-VCS.i18n = { dict: {}, lang: 'zh' };
-VCS.applyI18n = function (dict) {
+// ── i18n:显式键 + 旧页面精确短语映射；不调用在线翻译，也不猜测科学文本。 ──
+const I18N_RAW_SELECTOR = 'script,style,code,pre,textarea,.log,.log-box,[data-i18n-raw]';
+const I18N_ATTRIBUTES = Object.freeze({
+  'data-i18n-ph': 'placeholder', 'data-i18n-title': 'title',
+  'data-i18n-aria-label': 'aria-label',
+  'data-i18n-aria-description': 'aria-description', 'data-i18n-alt': 'alt',
+});
+const i18nTextSource = new WeakMap();
+const i18nAttributeSource = new WeakMap();
+VCS.i18n = { dict: {}, source: {}, reverse: new Map(), lang: 'zh', observer: null };
+
+function i18nFormat(value, params) {
+  let text = String(value == null ? '' : value);
+  Object.entries(params || {}).forEach(([key, replacement]) => {
+    text = text.replace(new RegExp('\\{' + String(key).replace(/[.*+?^${}()|[\\]\\]/g, '\\$&') + '\\}', 'g'),
+      String(replacement));
+  });
+  return text;
+}
+
+VCS.t = function (key, params, fallback) {
+  const table = VCS.i18n.dict || {};
+  const value = Object.prototype.hasOwnProperty.call(table, key) ? table[key]
+    : (fallback == null ? key : fallback);
+  return i18nFormat(value, params);
+};
+
+function rebuildI18nReverse() {
+  const source = VCS.i18n.source || {};
+  const reverse = new Map();
+  Object.keys(source).sort().forEach(key => {
+    const value = source[key];
+    if (typeof value === 'string' && value.trim() && !reverse.has(value.trim())) {
+      reverse.set(value.trim(), key);
+    }
+  });
+  VCS.i18n.reverse = reverse;
+}
+
+function translatedLegacyText(source) {
+  const trimmed = String(source || '').trim();
+  const key = VCS.i18n.reverse.get(trimmed);
+  return key ? VCS.t(key, {}, trimmed) : source;
+}
+
+function translateLegacyTextNode(node) {
+  const parent = node && node.parentElement;
+  if (!parent || parent.closest(I18N_RAW_SELECTOR)) return;
+  let source = i18nTextSource.get(node);
+  if (source == null) {
+    const candidate = String(node.nodeValue || '');
+    if (!VCS.i18n.reverse.has(candidate.trim())) return;
+    source = candidate; i18nTextSource.set(node, source);
+  }
+  const leading = source.match(/^\s*/)[0]; const trailing = source.match(/\s*$/)[0];
+  const translated = translatedLegacyText(source.trim());
+  const next = leading + translated + trailing;
+  if (node.nodeValue !== next) node.nodeValue = next;
+}
+
+function translateLegacyAttributes(element) {
+  if (!element || element.closest(I18N_RAW_SELECTOR)) return;
+  const attributes = ['placeholder', 'title', 'aria-label', 'aria-description', 'alt'];
+  let originals = i18nAttributeSource.get(element);
+  if (!originals) { originals = {}; i18nAttributeSource.set(element, originals); }
+  attributes.forEach(name => {
+    if (!element.hasAttribute(name)) return;
+    if (Object.values(I18N_ATTRIBUTES).includes(name) &&
+        Object.entries(I18N_ATTRIBUTES).some(([marker, attr]) => attr === name && element.hasAttribute(marker))) return;
+    if (!Object.prototype.hasOwnProperty.call(originals, name)) {
+      const candidate = element.getAttribute(name) || '';
+      if (!VCS.i18n.reverse.has(candidate.trim())) return;
+      originals[name] = candidate;
+    }
+    const next = translatedLegacyText(originals[name]);
+    if (element.getAttribute(name) !== next) element.setAttribute(name, next);
+  });
+}
+
+function translateI18nSubtree(root) {
+  const scope = root && root.nodeType === Node.ELEMENT_NODE ? root : document;
+  const elements = scope === document ? Array.from(document.querySelectorAll('*'))
+    : [scope, ...scope.querySelectorAll('*')];
+  elements.forEach(element => {
+    const textKey = element.getAttribute && element.getAttribute('data-i18n');
+    // `textContent` on a container would delete its input/select/button descendants.
+    // Authored translation anchors are required to be leaves; fail closed if a future
+    // template violates that contract, while the static semantic test identifies it.
+    if (textKey && element.childElementCount === 0) {
+      element.textContent = VCS.t(textKey, {}, element.textContent);
+    }
+    Object.entries(I18N_ATTRIBUTES).forEach(([marker, attribute]) => {
+      const key = element.getAttribute && element.getAttribute(marker);
+      if (key) element.setAttribute(attribute, VCS.t(key, {}, element.getAttribute(attribute) || ''));
+    });
+    translateLegacyAttributes(element);
+  });
+  const walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT);
+  let textNode;
+  while ((textNode = walker.nextNode())) translateLegacyTextNode(textNode);
+}
+
+VCS.applyI18n = function (dict, source) {
   if (dict) VCS.i18n.dict = dict;
-  const d = VCS.i18n.dict || {};
-  document.querySelectorAll('[data-i18n]').forEach(el => {
-    const k = el.getAttribute('data-i18n');
-    if (k && Object.prototype.hasOwnProperty.call(d, k)) el.textContent = d[k];
-  });
-  document.querySelectorAll('[data-i18n-ph]').forEach(el => {
-    const k = el.getAttribute('data-i18n-ph');
-    if (k && Object.prototype.hasOwnProperty.call(d, k)) el.setAttribute('placeholder', d[k]);
-  });
+  if (source) VCS.i18n.source = source;
+  rebuildI18nReverse(); translateI18nSubtree(document);
+  if (!VCS.i18n.observer) {
+    VCS.i18n.observer = new MutationObserver(records => records.forEach(record => {
+      record.addedNodes.forEach(node => {
+        if (node.nodeType === Node.TEXT_NODE) translateLegacyTextNode(node);
+        else if (node.nodeType === Node.ELEMENT_NODE) translateI18nSubtree(node);
+      });
+      if (record.type === 'attributes') translateLegacyAttributes(record.target);
+    }));
+    VCS.i18n.observer.observe(document.documentElement, {
+      subtree: true, childList: true, attributes: true,
+      attributeFilter: ['placeholder', 'title', 'aria-label', 'aria-description', 'alt'],
+    });
+  }
 };
 VCS.loadLang = async function (lang) {
   let lg = lang;
   if (!lg) { const g = await VCS.call('lang_get'); lg = (g && g.lang) || 'zh'; }
-  VCS.i18n.lang = lg;
   const r = await VCS.call('i18n_dict', lg);
-  if (r && r.dict) VCS.applyI18n(r.dict);
+  if (!(r && r.ok && r.dict && r.source)) throw new Error((r && r.error) || 'language bundle unavailable');
+  lg = r.lang === 'en' ? 'en' : 'zh'; VCS.i18n.lang = lg;
+  VCS.applyI18n(r.dict, r.source);
   try { document.documentElement.lang = (lg === 'en' ? 'en' : 'zh-CN'); } catch (_) { /* 忽略 */ }
+  document.dispatchEvent(new CustomEvent('vcs:language', { detail: { lang: lg } }));
   return lg;
 };
 
@@ -777,9 +979,16 @@ function refreshModeChip() {
   if (!chip) return;
   const sc = VCS.scenario || {};
   const engine = String(VCS.activeEngine || 'vasp').toUpperCase();
-  chip.textContent = (sc.name || sc.key || '工作模式') + ' · ' + engine;
-  chip.title = '切换工作模式、计算引擎或本次计算类型';
+  const scenarioName = (VCS.i18n.lang === 'en' && sc.name_en) || sc.name || sc.key ||
+    VCS.t('settings.scenario.label', {}, '工作模式', 'Workflow mode');
+  chip.textContent = scenarioName + ' · ' + engine;
+  chip.title = VCS.t(
+    'legacy.dynamic.app.0010', {},
+    '切换工作模式、计算引擎或本次计算类型',
+    'Switch workflow mode, compute engine, or calculation type');
 }
+
+document.addEventListener('vcs:language', refreshModeChip);
 
 let scenarioNavigationGeneration = 0;
 
@@ -872,7 +1081,13 @@ VCS.openCalculation = async function (key, options = {}) {
   if (target) {
     const card = target.classList && target.classList.contains('acc')
       ? target : target.closest && target.closest('.acc');
-    if (card) card.setAttribute('data-open', '1');
+    if (card && VCS.ui && typeof VCS.ui.setAccordionOpen === 'function') {
+      VCS.ui.setAccordionOpen(card, true, true);
+    } else if (card) {
+      card.setAttribute('data-open', '1');
+      const toggle = card.querySelector(':scope > .acc-h > .acc-toggle');
+      if (toggle) toggle.setAttribute('aria-expanded', 'true');
+    }
     if (typeof target.scrollIntoView === 'function') {
       target.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
@@ -902,9 +1117,9 @@ async function firstLaunchScenario() {
   if (!list.length) return;
   const box = document.createElement('div');
   box.innerHTML = '<div class="scene-grid">' + list.map(s =>
-    `<div class="scene-card" data-key="${VCS.esc(s.key)}"><b>${VCS.esc(s.name)}${s.key === 'vasp' ? '（推荐）' : ''}</b>` +
-    `<span>${VCS.esc(s.description)}</span></div>`).join('') + '</div>';
-  const m = VCS.modal({ title: '这次要做哪类计算？（之后可在设置中切换）',
+    `<button type="button" class="scene-card" data-key="${VCS.esc(s.key)}"><b>${VCS.esc((VCS.i18n.lang === 'en' && s.name_en) || s.name)}${s.key === 'vasp' ? VCS.esc(VCS.t('common.recommended_suffix', {}, '（推荐）')) : ''}</b>` +
+    `<span>${VCS.esc((VCS.i18n.lang === 'en' && s.description_en) || s.description)}</span></button>`).join('') + '</div>';
+  const m = VCS.modal({ title: VCS.t('scenario.first_launch.title', {}, '这次要做哪类计算？（之后可在设置中切换）'),
     body: box, actions: [] });
   m.el.classList.add('modal-wide');
   box.querySelectorAll('.scene-card').forEach(c => c.addEventListener('click', async () => {
@@ -915,7 +1130,8 @@ async function firstLaunchScenario() {
       VCS.applyScenario(res.scenario);
       await VCS.loadEngine();
       await VCS.loadCalculation();
-      VCS.toast('已选择工作模式：' + (res.scenario.name || key));
+      const name = (VCS.i18n.lang === 'en' && res.scenario.name_en) || res.scenario.name || key;
+      VCS.toast(VCS.t('scenario.selected', { name }, '已选择工作模式：{name}'));
     }
   }));
 }

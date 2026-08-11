@@ -34,6 +34,13 @@
     const text = String(value || '').trim(); return SAFE_ID.test(text) ? text : '';
   }
   function esc(value) { return VCS.esc ? VCS.esc(String(value == null ? '' : value)) : String(value || ''); }
+  function tr(key, fallback, params) {
+    return typeof VCS.t === 'function' ? VCS.t(key, params || {}, fallback) : fallback;
+  }
+  function localized(record, field, fallback = '') {
+    const source = plain(record); const suffix = VCS.i18n && VCS.i18n.lang === 'en' ? '_en' : '_zh';
+    return String(source[field + suffix] || source[field] || fallback || '');
+  }
   function projectIdentity(project) {
     return safeId(project && (project.project_id || project.id || project.project_uuid));
   }
@@ -119,13 +126,14 @@
       button.disabled = State.busy;
       button.dataset.favorite = favorites.has(record.id) ? 'true' : 'false';
       button.setAttribute('aria-current', record.id === State.analysisId ? 'true' : 'false');
-      const label = String(record.label_zh || record.id || '分析');
-      button.setAttribute('aria-label', label + (favorites.has(record.id) ? '，已收藏' : ''));
+      const label = localized(record, 'label', record.id || tr('analysis.generic', '分析'));
+      button.setAttribute('aria-label', label + (favorites.has(record.id)
+        ? tr('analysis.favorite.suffix', '，已收藏') : ''));
       const title = document.createElement('b');
       title.textContent = (favorites.has(record.id) ? '★ ' : '') + label;
       const desc = document.createElement('small');
       desc.id = `aw-analysis-desc-${String(record.id || '').replace(/[^A-Za-z0-9_-]/g, '-')}`;
-      desc.textContent = String(record.description_zh || '');
+      desc.textContent = localized(record, 'description');
       button.setAttribute('aria-describedby', desc.id);
       button.append(title, desc); item.appendChild(button); list.appendChild(item);
     });
@@ -138,13 +146,16 @@
     const user = plain(State.preferences).templates || [];
     const templates = [...builtins, ...user];
     const compatible = templates.filter(item => String(item.analysis_id || '') === State.analysisId);
-    if (!compatible.length) { const item = document.createElement('li'); item.textContent = '当前分析没有视图模板。'; list.appendChild(item); return; }
+    if (!compatible.length) { const item = document.createElement('li');
+      item.textContent = tr('analysis.templates.empty', '当前分析没有视图模板。'); list.appendChild(item); return; }
     compatible.forEach(template => {
       const item = document.createElement('li'); const button = document.createElement('button');
       button.type = 'button'; button.dataset.templateId = safeId(template.id);
       button.disabled = State.busy;
-      const title = document.createElement('b'); title.textContent = String(template.label_zh || template.name || template.id);
-      const desc = document.createElement('small'); desc.textContent = template.schema === 'vcstudio.analysis-view-template/v1' ? '内置模板' : '用户模板';
+      const title = document.createElement('b'); title.textContent = localized(
+        template, 'label', template.name || template.id);
+      const desc = document.createElement('small'); desc.textContent = template.schema === 'vcstudio.analysis-view-template/v1'
+        ? tr('analysis.templates.builtin', '内置模板') : tr('analysis.templates.user', '用户模板');
       button.append(title, desc); item.appendChild(button); list.appendChild(item);
     });
   }
@@ -154,7 +165,7 @@
     values.forEach(value => {
       const record = typeof value === 'string' ? { id: value, label: value } : plain(value);
       const option = document.createElement('option'); option.value = String(record.id || '');
-      option.textContent = String(record.label_zh || record.label_en || record.label || record.id || '');
+      option.textContent = localized(record, 'label', record.id || '');
       if (option.value === current) option.selected = true; select.appendChild(option);
     });
   }
@@ -170,7 +181,9 @@
   function renderBaselineOptions(selectedIds, selectedBaseline) {
     const baseline = $('aw-baseline'); if (!baseline) return;
     const selected = new Set((selectedIds || []).map(safeId));
-    baseline.innerHTML = '<option value="">不设基准</option>';
+    baseline.innerHTML = '';
+    const none = document.createElement('option'); none.value = '';
+    none.textContent = tr('analysis.baseline.none', '不设基准'); baseline.appendChild(none);
     State.projects.forEach(project => {
       const id = projectIdentity(project); if (!id || !selected.has(id)) return;
       const option = document.createElement('option'); option.value = id;
@@ -209,6 +222,7 @@
     const supportsSort = parameters.includes('sort');
     replaceOptions($('aw-data-mode'), (record && record.data_modes || ['stable']).map(id => ({
       id, label_zh: id === 'stable' ? '最稳/近简并' : '全部构型',
+      label_en: id === 'stable' ? 'Stable / near-degenerate' : 'All configurations',
     })), spec.data_mode);
     if ($('aw-deadband')) $('aw-deadband').value = String(spec.near_degenerate_eV == null ? 0.15 : spec.near_degenerate_eV);
     if ($('aw-precision')) $('aw-precision').value = String(spec.precision == null ? 4 : spec.precision);
@@ -230,22 +244,37 @@
     const box = $('aw-denominator'); if (!box) return; box.innerHTML = '';
     const source = plain(view && view.denominator);
     const labels = {
-      input_configurations: '输入构型', numeric_configurations: '数值构型',
-      missing_configurations: '缺失构型', species_with_numeric_results: '有效物种',
-      visible_rows: '可见行', near_degenerate_groups: '近简并组',
-      selected_projects: '所选项目', ready_projects: '有效项目', blocked_projects: '阻断项目',
-      species_columns: '物种列', possible_numeric_cells: '应有数值',
-      observed_numeric_cells: '已有数值', missing_numeric_cells: '缺失数值',
-      requested_paths: '请求路径', available_paths: '可用路径',
-      input_steps: '输入台阶', numeric_steps: '数值台阶', missing_steps: '缺失台阶',
-      input_transitions: '输入转化', valid_transitions: '有效转化',
+      input_configurations: tr('analysis.denominator.input_configurations', '输入构型'),
+      numeric_configurations: tr('analysis.denominator.numeric_configurations', '数值构型'),
+      missing_configurations: tr('analysis.denominator.missing_configurations', '缺失构型'),
+      species_with_numeric_results: tr('analysis.denominator.species_numeric', '有效物种'),
+      visible_rows: tr('analysis.denominator.visible_rows', '可见行'),
+      near_degenerate_groups: tr('analysis.denominator.near_degenerate', '近简并组'),
+      selected_projects: tr('analysis.denominator.selected_projects', '所选项目'),
+      ready_projects: tr('analysis.denominator.ready_projects', '有效项目'),
+      blocked_projects: tr('analysis.denominator.blocked_projects', '阻断项目'),
+      species_columns: tr('analysis.denominator.species_columns', '物种列'),
+      possible_numeric_cells: tr('analysis.denominator.possible_cells', '应有数值'),
+      observed_numeric_cells: tr('analysis.denominator.observed_cells', '已有数值'),
+      missing_numeric_cells: tr('analysis.denominator.missing_cells', '缺失数值'),
+      requested_paths: tr('analysis.denominator.requested_paths', '请求路径'),
+      available_paths: tr('analysis.denominator.available_paths', '可用路径'),
+      input_steps: tr('analysis.denominator.input_steps', '输入台阶'),
+      numeric_steps: tr('analysis.denominator.numeric_steps', '数值台阶'),
+      missing_steps: tr('analysis.denominator.missing_steps', '缺失台阶'),
+      input_transitions: tr('analysis.denominator.input_transitions', '输入转化'),
+      valid_transitions: tr('analysis.denominator.valid_transitions', '有效转化'),
     };
     Object.entries(source).forEach(([key, value]) => {
       const item = document.createElement('span'); const label = document.createElement('small');
       const number = document.createElement('b'); label.textContent = labels[key] || key; number.textContent = String(value);
       item.append(label, number); box.appendChild(item);
     });
-    if (!box.children.length) box.innerHTML = '<span><small>分母</small><b>未知</b></span>';
+    if (!box.children.length) {
+      const item = document.createElement('span'); const label = document.createElement('small');
+      const value = document.createElement('b'); label.textContent = tr('analysis.denominator.label', '分母');
+      value.textContent = tr('common.unknown', '未知'); item.append(label, value); box.appendChild(item);
+    }
   }
 
   function tableElement(headers, rows) {
@@ -265,26 +294,39 @@
     const rows = (view.rows || []).map(row => ({
       missing: row.delta_e_eV == null,
       cells: [row.species, row.name || row.configuration_id, row.delta_e_display,
-        row.relative_to_minimum_display, row.near_degenerate ? '近简并' : row.is_minimum ? '最低' : '',
+        row.relative_to_minimum_display,
+        row.near_degenerate ? tr('analysis.stability.near_degenerate', '近简并')
+          : row.is_minimum ? tr('analysis.stability.minimum', '最低') : '',
         row.method_status, row.state, row.note],
     }));
-    if (!rows.length) { box.innerHTML = '<div class="aw-empty">当前范围没有可显示构型；请查看阻断项与分母。</div>'; return; }
+    if (!rows.length) { box.innerHTML = '';
+      const empty = document.createElement('div'); empty.className = 'aw-empty';
+      empty.textContent = tr('analysis.adsorption.empty', '当前范围没有可显示构型；请查看阻断项与分母。');
+      box.appendChild(empty); return; }
     box.innerHTML = ''; box.appendChild(tableElement([
-      { label: '物种' }, { label: '构型' }, { label: 'E_ads / eV', numeric: true },
-      { label: 'ΔΔE / eV', numeric: true }, { label: '稳定性' }, { label: '方法' },
-      { label: '作业状态' }, { label: '说明' },
+      { label: tr('analysis.table.species', '物种') },
+      { label: tr('analysis.table.configuration', '构型') },
+      { label: 'E_ads / eV', numeric: true }, { label: 'ΔΔE / eV', numeric: true },
+      { label: tr('analysis.table.stability', '稳定性') },
+      { label: tr('analysis.table.method', '方法') },
+      { label: tr('analysis.table.job_status', '作业状态') },
+      { label: tr('analysis.table.notes', '说明') },
     ], rows));
   }
 
   function renderComparisonTable(view, box) {
     const matrix = plain(view.matrix); const projectIds = matrix.project_ids || [];
     const projects = new Map((view.projects || []).map(project => [String(project.project_id || ''), project]));
-    const headers = [{ label: '项目' }, ...(matrix.cols || []).map(label => ({ label, numeric: true }))];
+    const headers = [{ label: tr('analysis.table.project', '项目') },
+      ...(matrix.cols || []).map(label => ({ label, numeric: true }))];
     const rows = projectIds.map((projectId, index) => ({
       cells: [plain(projects.get(projectId)).display_name || plain(projects.get(projectId)).name || projectId,
         ...((matrix.display_values || [])[index] || [])],
     }));
-    if (!rows.length) { box.innerHTML = '<div class="aw-empty">没有通过比较门禁的项目；请查看阻断项。</div>'; return; }
+    if (!rows.length) { box.innerHTML = '';
+      const empty = document.createElement('div'); empty.className = 'aw-empty';
+      empty.textContent = tr('analysis.comparison.empty', '没有通过比较门禁的项目；请查看阻断项。');
+      box.appendChild(empty); return; }
     box.innerHTML = ''; box.appendChild(tableElement(headers, rows));
   }
 
@@ -316,58 +358,70 @@
     box.innerHTML = '';
 
     const summary = document.createElement('section'); summary.className = 'aw-free-energy-summary';
-    summary.setAttribute('aria-label', '服务器确定的自由能路径摘要');
-    const heading = document.createElement('h3'); heading.textContent = '自由能路径摘要';
+    summary.setAttribute('aria-label', tr('analysis.free_energy.summary_aria', '服务器确定的自由能路径摘要'));
+    const heading = document.createElement('h3'); heading.textContent = tr('analysis.free_energy.summary', '自由能路径摘要');
     const metrics = document.createElement('dl'); metrics.className = 'aw-free-energy-metrics';
     const pdsText = pds.index === null || pds.index === undefined
       ? null
       : `#${String(pds.index)} · ${String(pds.from_label || '—')} → ${String(pds.to_label || '—')}`;
-    appendFreeEnergyMetric(metrics, '路径可用性', view.available === true ? '可用' : '阻断');
-    appendFreeEnergyMetric(metrics, '科学状态', view.scientific_status);
-    appendFreeEnergyMetric(metrics, '势决定步（PDS）', pdsText);
+    appendFreeEnergyMetric(metrics, tr('analysis.free_energy.availability', '路径可用性'),
+      view.available === true ? tr('common.available', '可用') : tr('common.blocked', '阻断'));
+    appendFreeEnergyMetric(metrics, tr('analysis.free_energy.scientific_status', '科学状态'), view.scientific_status);
+    appendFreeEnergyMetric(metrics, tr('analysis.free_energy.pds', '势决定步（PDS）'), pdsText);
     appendFreeEnergyMetric(metrics, 'U_L', view.u_l_display, 'V');
     appendFreeEnergyMetric(metrics, 'μLi', view.mu_li_display, 'eV');
-    appendFreeEnergyMetric(metrics, '热校正状态', thermo.status);
-    appendFreeEnergyMetric(metrics, '温度', thermo.temperature_display, 'K');
-    appendFreeEnergyMetric(metrics, '热校正指纹', thermo.correction_fingerprint);
-    appendFreeEnergyMetric(metrics, '方法状态', view.method_status || method.status);
-    appendFreeEnergyMetric(metrics, '方法受管', Object.prototype.hasOwnProperty.call(method, 'managed') ? (method.managed === true ? '是' : '否') : null);
-    appendFreeEnergyMetric(metrics, '参考电极', view.reference);
-    appendFreeEnergyMetric(metrics, '反应路径标识', view.reaction_path_id);
+    appendFreeEnergyMetric(metrics, tr('analysis.free_energy.thermo_status', '热校正状态'), thermo.status);
+    appendFreeEnergyMetric(metrics, tr('analysis.free_energy.temperature', '温度'), thermo.temperature_display, 'K');
+    appendFreeEnergyMetric(metrics, tr('analysis.free_energy.thermo_fingerprint', '热校正指纹'), thermo.correction_fingerprint);
+    appendFreeEnergyMetric(metrics, tr('analysis.free_energy.method_status', '方法状态'), view.method_status || method.status);
+    appendFreeEnergyMetric(metrics, tr('analysis.free_energy.method_managed', '方法受管'),
+      Object.prototype.hasOwnProperty.call(method, 'managed')
+        ? (method.managed === true ? tr('common.yes', '是') : tr('common.no', '否')) : null);
+    appendFreeEnergyMetric(metrics, tr('analysis.free_energy.reference', '参考电极'), view.reference);
+    appendFreeEnergyMetric(metrics, tr('analysis.free_energy.path_id', '反应路径标识'), view.reaction_path_id);
     summary.append(heading, metrics); box.appendChild(summary);
 
     const evidence = document.createElement('div'); evidence.className = 'aw-free-energy-evidence-grid';
-    appendFreeEnergyMessages(evidence, '缺失数据', view.missing, '服务器未报告缺失数据。');
-    appendFreeEnergyMessages(evidence, '门禁阻断', view.blocking, '当前无阻断项。');
-    appendFreeEnergyMessages(evidence, '方法错误', method.errors, '服务器未报告方法错误。');
-    appendFreeEnergyMessages(evidence, '方法告警', method.warnings, '服务器未报告方法告警。');
+    appendFreeEnergyMessages(evidence, tr('analysis.free_energy.missing', '缺失数据'), view.missing,
+      tr('analysis.free_energy.missing_empty', '服务器未报告缺失数据。'));
+    appendFreeEnergyMessages(evidence, tr('analysis.free_energy.blocking', '门禁阻断'), view.blocking,
+      tr('analysis.blocking.empty', '当前无阻断项。'));
+    appendFreeEnergyMessages(evidence, tr('analysis.free_energy.method_errors', '方法错误'), method.errors,
+      tr('analysis.free_energy.method_errors_empty', '服务器未报告方法错误。'));
+    appendFreeEnergyMessages(evidence, tr('analysis.free_energy.method_warnings', '方法告警'), method.warnings,
+      tr('analysis.free_energy.method_warnings_empty', '服务器未报告方法告警。'));
     box.appendChild(evidence);
 
     if (!rows.length) {
       const empty = document.createElement('div'); empty.className = 'aw-empty';
-      empty.textContent = String(view.reason || '服务器未返回可展示的自由能台阶；请查看缺失数据与门禁阻断。');
+      empty.textContent = String(view.reason || tr('analysis.free_energy.rows_empty',
+        '服务器未返回可展示的自由能台阶；请查看缺失数据与门禁阻断。'));
       box.appendChild(empty); return;
     }
 
     const table = tableElement([
-      { label: '台阶序号', numeric: true }, { label: '状态' }, { label: '补充标注' },
+      { label: tr('analysis.free_energy.step_index', '台阶序号'), numeric: true },
+      { label: tr('analysis.free_energy.state', '状态') },
+      { label: tr('analysis.free_energy.annotation', '补充标注') },
       { label: 'G / eV', numeric: true },
     ], rows.map(row => ({
       cells: [row.step_index, row.label, row.sub_label, row.G_display],
     })));
     const caption = document.createElement('caption');
-    caption.textContent = '服务器确定的有序自由能台阶（未在浏览器中重排或重算）';
+    caption.textContent = tr('analysis.free_energy.caption', '服务器确定的有序自由能台阶（未在浏览器中重排或重算）');
     table.prepend(caption); box.appendChild(table);
   }
 
   function renderSensitivity(view) {
     const box = $('aw-sensitivity-results'); if (!box) return; box.innerHTML = '';
     const sensitivity = plain(view && view.sensitivity); const points = sensitivity.points || [];
-    if (!points.length) { box.innerHTML = '<div class="aw-empty">当前分析没有敏感性结果。</div>'; return; }
+    if (!points.length) { const empty = document.createElement('div'); empty.className = 'aw-empty';
+      empty.textContent = tr('analysis.sensitivity.empty', '当前分析没有敏感性结果。');
+      box.appendChild(empty); return; }
     points.forEach(point => {
       const card = document.createElement('div'); card.className = 'aw-sensitivity-point';
       const sets = (point.lowest_energy_sets || []).map(item =>
-        `${item.species}: ${(item.within_deadband_project_ids || []).join(', ') || '无数值'} (n=${item.observed_denominator || 0})`);
+        `${item.species}: ${(item.within_deadband_project_ids || []).join(', ') || tr('analysis.no_numeric', '无数值')} (n=${item.observed_denominator || 0})`);
       card.textContent = `deadband ${Number(point.deadband_eV).toFixed(2)} eV · ${sets.join('；')}`; box.appendChild(card);
     });
   }
@@ -376,15 +430,18 @@
     const methods = $('aw-method-matrix'); if (methods) { methods.innerHTML = '';
       (view.method_matrix || []).forEach(record => {
         const card = document.createElement('div'); card.className = 'aw-method';
-        const title = document.createElement('b'); title.textContent = `${record.name || record.species || record.configuration_id || '记录'} · ${record.status || 'unknown'}`;
-        const detail = document.createElement('code'); detail.textContent = [record.functional, record.dispersion, record.encut_eV != null ? `ENCUT ${record.encut_eV}` : '', record.kpoints_scheme].filter(Boolean).join(' · ') || (record.issues || record.warnings || []).join('；') || '没有完整方法投影';
+        const title = document.createElement('b'); title.textContent = `${record.name || record.species || record.configuration_id || tr('analysis.record', '记录')} · ${record.status || 'unknown'}`;
+        const detail = document.createElement('code'); detail.textContent = [record.functional, record.dispersion, record.encut_eV != null ? `ENCUT ${record.encut_eV}` : '', record.kpoints_scheme].filter(Boolean).join(' · ') || (record.issues || record.warnings || []).join('；') || tr('analysis.method_projection.empty', '没有完整方法投影');
         card.append(title, detail); methods.appendChild(card);
       });
-      if (!methods.children.length) methods.innerHTML = '<div class="aw-empty">没有方法矩阵记录。</div>';
+      if (!methods.children.length) { const empty = document.createElement('div');
+        empty.className = 'aw-empty'; empty.textContent = tr('analysis.method_matrix.empty', '没有方法矩阵记录。');
+        methods.appendChild(empty); }
     }
     const gate = plain(view.comparison_gate); const blocking = view.blocking || gate.blocking || [];
     const warnings = view.warnings || gate.warnings || [];
-    [['aw-blocking', blocking, '当前无阻断项'], ['aw-warnings', warnings, '当前无告警']].forEach(([id, values, empty]) => {
+    [['aw-blocking', blocking, tr('analysis.blocking.empty', '当前无阻断项')],
+      ['aw-warnings', warnings, tr('analysis.warnings.empty', '当前无告警')]].forEach(([id, values, empty]) => {
       const list = $(id); if (!list) return; list.innerHTML = '';
       (values || []).forEach(value => { const item = document.createElement('li'); item.textContent = String(value); list.appendChild(item); });
       if (!list.children.length) { const item = document.createElement('li'); item.textContent = empty; list.appendChild(item); }
@@ -394,8 +451,9 @@
   function renderView() {
     const view = plain(State.view); const box = $('aw-table-scroll');
     renderDenominator(view); renderSensitivity(view); renderInspector(view);
-    const record = analysisRecord(); setText('aw-status-analysis', record && record.label_zh || State.analysisId, '未读取');
-    setText('aw-status-science', view.scientific_status, '未知');
+    const record = analysisRecord(); setText('aw-status-analysis', localized(record, 'label', State.analysisId),
+      tr('common.not_loaded', '未读取'));
+    setText('aw-status-science', view.scientific_status, tr('common.unknown', '未知'));
     const denominator = plain(view.denominator);
     const inputDenominator = denominator.input_configurations != null ? denominator.input_configurations
       : denominator.selected_projects != null ? denominator.selected_projects
@@ -407,18 +465,22 @@
     if (State.analysisId === 'adsorption-energy') renderAdsorptionTable(view, box);
     else if (State.analysisId === 'free-energy-path') renderFreeEnergyView(view, box);
     else if (State.analysisId === 'multi-project-comparison') renderComparisonTable(view, box);
-    else box.innerHTML = `<div class="aw-empty">${esc(view.error || '该注册分析已建立能力入口；请选择实际作业后使用对应解析器。')}</div>`;
+    else box.innerHTML = `<div class="aw-empty">${esc(view.error || tr('analysis.placeholder',
+      '该注册分析已建立能力入口；请选择实际作业后使用对应解析器。'))}</div>`;
   }
 
   function renderAll() {
     renderRegistry(); renderTemplates(); renderControls(); renderView();
-    setText('aw-project-name', State.projectName ? `${State.projectName} · ${State.projectId}` : '当前项目不可用');
+    setText('aw-project-name', State.projectName ? `${State.projectName} · ${State.projectId}`
+      : tr('analysis.project.unavailable', '当前项目不可用'));
     const refresh = $('aw-refresh'); if (refresh) refresh.disabled = State.busy || !State.spec;
     const save = $('aw-save-view'); if (save) save.disabled = State.busy || !State.spec || State.preferenceRevision == null;
     const favorite = $('aw-favorite'); if (favorite) {
       const active = (plain(State.preferences).favorites || []).includes(State.analysisId);
       favorite.disabled = State.busy || State.preferenceRevision == null;
-      favorite.setAttribute('aria-pressed', active ? 'true' : 'false'); favorite.textContent = active ? '取消收藏' : '收藏分析';
+      favorite.setAttribute('aria-pressed', active ? 'true' : 'false');
+      favorite.textContent = active ? tr('analysis.favorite.remove', '取消收藏')
+        : tr('analysis.favorite.add', '收藏分析');
     }
     const form = $('aw-spec-form'); if (form) form.setAttribute('aria-busy', State.busy ? 'true' : 'false');
     const controls = $('aw-controls'); if (controls) controls.disabled = State.busy || !State.spec;
@@ -430,35 +492,42 @@
     const projectId = State.projectId;
     const analysisId = State.analysisId; const intent = ++State.intentGeneration;
     const generation = ++State.previewGeneration; const busyToken = beginBusy();
-    showAlert(''); operation('正在由服务端重建分析视图…', 'busy'); renderAll();
+    showAlert(''); operation(tr('analysis.operation.rebuilding', '正在由服务端重建分析视图…'), 'busy'); renderAll();
     try {
       const result = await VCS.call('analysis_workbench_preview', projectId, request);
       if (intent !== State.intentGeneration || generation !== State.previewGeneration ||
           analysisId !== State.analysisId || !sameProject(projectId)) return false;
-      if (!result || result.ok === false || result.error) throw new Error(result && result.error || '分析接口没有返回有效结果');
-      if (safeId(result.project_id) !== projectId) throw new Error('分析结果项目身份与当前项目不一致');
+      if (!result || result.ok === false || result.error) throw new Error(result && result.error || tr(
+        'analysis.error.invalid_response', '分析接口没有返回有效结果'));
+      if (safeId(result.project_id) !== projectId) throw new Error(tr(
+        'analysis.error.project_mismatch', '分析结果项目身份与当前项目不一致'));
       if (JSON.stringify(request) !== requestFingerprint) return false;
       State.spec = clone(result.spec || plain(result.view).spec || request); State.view = clone(result.view || result.analysis_view || {});
-      State.dirty = false; operation('分析视图已由服务器数据与门禁重新生成。', 'ok'); renderAll(); return true;
+      State.dirty = false; operation(tr('analysis.operation.rebuilt', '分析视图已由服务器数据与门禁重新生成。'), 'ok'); renderAll(); return true;
     } catch (error) {
       if (intent !== State.intentGeneration || generation !== State.previewGeneration) return false;
-      showAlert(error && error.message || String(error)); operation('分析失败；保留上一份已验证视图。', 'bad'); return false;
+      showAlert(error && error.message || String(error)); operation(tr(
+        'analysis.operation.failed', '分析失败；保留上一份已验证视图。'), 'bad'); return false;
     } finally { endBusy(busyToken); }
   }
 
   async function loadBootstrap(analysisId) {
     const project = currentProject(); const id = projectIdentity(project);
-    if (!id) { showAlert('当前项目尚未加载。请先从全局项目栏选择项目。'); operation('等待项目上下文。', 'bad'); return false; }
+    if (!id) { showAlert(tr('analysis.bootstrap.project_missing', '当前项目尚未加载。请先从全局项目栏选择项目。'));
+      operation(tr('analysis.bootstrap.waiting_context', '等待项目上下文。'), 'bad'); return false; }
     const intent = ++State.intentGeneration; const generation = ++State.bootstrapGeneration;
     State.previewGeneration += 1; const busyToken = beginBusy();
     State.projectId = id;
-    State.analysisId = safeId(analysisId) || 'adsorption-energy'; showAlert(''); operation('正在读取分析注册表与项目证据…', 'busy'); renderAll();
+    State.analysisId = safeId(analysisId) || 'adsorption-energy'; showAlert('');
+    operation(tr('analysis.bootstrap.loading', '正在读取分析注册表与项目证据…'), 'busy'); renderAll();
     try {
       const result = await VCS.call('analysis_workbench_bootstrap', id, State.analysisId);
       if (intent !== State.intentGeneration || generation !== State.bootstrapGeneration ||
           !sameProject(id)) return false;
-      if (!result || result.ok === false || result.error) throw new Error(result && result.error || '分析工作台 bootstrap 失败');
-      if (safeId(result.project_id) !== id) throw new Error('bootstrap 项目身份不一致');
+      if (!result || result.ok === false || result.error) throw new Error(result && result.error || tr(
+        'analysis.bootstrap.failed', '分析工作台 bootstrap 失败'));
+      if (safeId(result.project_id) !== id) throw new Error(tr(
+        'analysis.bootstrap.project_mismatch', 'bootstrap 项目身份不一致'));
       State.projectName = String(result.project_name || plain(result.project).name || project.name || '');
       State.catalog = clone(result.catalog || {}); State.projects = clone(result.projects || []);
       State.spec = clone(result.default_spec || result.spec || {});
@@ -466,10 +535,12 @@
       State.analysisId = safeId(State.spec.analysis_id) || State.analysisId;
       const preferences = plain(result.preferences); State.preferences = clone(preferences.preferences || preferences);
       State.preferenceRevision = Number.isInteger(result.preference_revision) ? result.preference_revision : Number.isInteger(preferences.revision) ? preferences.revision : null;
-      State.dirty = false; operation('分析工作台已加载。', 'ok'); renderAll(); return true;
+      State.dirty = false; operation(tr('analysis.bootstrap.loaded', '分析工作台已加载。'), 'ok');
+      renderAll(); return true;
     } catch (error) {
       if (intent !== State.intentGeneration || generation !== State.bootstrapGeneration) return false;
-      State.spec = null; State.view = null; showAlert(error && error.message || String(error)); operation('分析工作台加载失败。', 'bad'); renderAll(); return false;
+      State.spec = null; State.view = null; showAlert(error && error.message || String(error));
+      operation(tr('analysis.bootstrap.load_failed', '分析工作台加载失败。'), 'bad'); renderAll(); return false;
     } finally { endBusy(busyToken); }
   }
 
@@ -481,8 +552,12 @@
   }
 
   async function saveView() {
-    if (State.preferenceRevision == null || State.busy) { VCS.toast('分析偏好服务尚未可用', 'fail'); return; }
-    const name = window.prompt('视图模板名称', `${analysisRecord() && analysisRecord().label_zh || '分析'}视图`);
+    if (State.preferenceRevision == null || State.busy) {
+      VCS.toast(tr('analysis.preferences.unavailable', '分析偏好服务尚未可用'), 'fail'); return;
+    }
+    const analysisLabel = localized(analysisRecord(), 'label', tr('analysis.generic', '分析'));
+    const name = window.prompt(tr('analysis.templates.name_prompt', '视图模板名称'),
+      tr('analysis.templates.default_name', '{analysis}视图', { analysis: analysisLabel }));
     if (!name) return; const id = `view-${Date.now().toString(36)}`;
     const busyToken = beginBusy(); renderAll();
     try {
@@ -494,8 +569,10 @@
         State.preferenceRevision = result.revision;
         State.preferences = clone(result.preferences || {});
       }
-      if (!result || result.ok === false) throw new Error(result && result.error || '保存视图失败');
-      State.preferenceRevision = result.revision; State.preferences = clone(result.preferences || {}); renderAll(); VCS.toast('分析视图已保存');
+      if (!result || result.ok === false) throw new Error(result && result.error || tr(
+        'analysis.templates.save_failed', '保存视图失败'));
+      State.preferenceRevision = result.revision; State.preferences = clone(result.preferences || {});
+      renderAll(); VCS.toast(tr('analysis.templates.saved', '分析视图已保存'));
     } catch (error) { showAlert(error && error.message || String(error)); }
     finally { endBusy(busyToken); }
   }
@@ -510,7 +587,8 @@
         State.preferenceRevision = result.revision;
         State.preferences = clone(result.preferences || {});
       }
-      if (!result || result.ok === false) throw new Error(result && result.error || '更新收藏失败');
+      if (!result || result.ok === false) throw new Error(result && result.error || tr(
+        'analysis.favorite.update_failed', '更新收藏失败'));
       State.preferenceRevision = result.revision; State.preferences = clone(result.preferences || {}); renderAll();
     } catch (error) { showAlert(error && error.message || String(error)); }
     finally { endBusy(busyToken); }
@@ -555,6 +633,7 @@
     document.addEventListener('vcs:workspace-project', () => {
       const page = $('page-analysis-workbench'); if (page && !page.hidden) enterWorkbench();
     });
+    document.addEventListener('vcs:language', () => { if (State.catalog) renderAll(); });
   }
 
   window.AnalysisWorkbench = { refresh: previewCurrent, open: analysisId => loadBootstrap(analysisId) };

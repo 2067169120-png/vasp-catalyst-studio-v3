@@ -5,6 +5,7 @@ list 过滤与轻量化、get_preset 完整版、render_preset 分发(假 render
 from __future__ import annotations
 
 import xml.dom.minidom as minidom
+import re
 
 import pytest
 
@@ -21,6 +22,7 @@ def test_at_least_12_presets():
 
 def test_every_preset_schema_complete():
     required = {'key', 'name', 'category', 'description', 'required_data',
+                'name_en', 'category_en', 'description_en', 'required_data_en',
                 'thumbnail_svg', 'renderer', 'params_schema'}
     for p in fp.PRESETS:
         assert required <= set(p), (p.get('key'), required - set(p))
@@ -28,6 +30,10 @@ def test_every_preset_schema_complete():
         assert isinstance(p['params_schema'], dict)
         assert isinstance(p['name'], str) and p['name']
         assert isinstance(p['required_data'], str) and p['required_data']
+        for field in ('name_en', 'category_en', 'description_en', 'required_data_en'):
+            assert isinstance(p[field], str) and p[field].strip(), (p['key'], field)
+            assert not re.search(r'[\u3400-\u9fff]', p[field]), (p['key'], field)
+        assert p['category_en'] == fp.CATEGORY_EN[p['category']]
 
 
 def test_preset_keys_unique():

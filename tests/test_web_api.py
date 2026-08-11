@@ -6,6 +6,7 @@
 import copy
 import json
 import os
+import re
 import sys
 import types
 from pathlib import Path
@@ -2315,7 +2316,8 @@ def test_settings_get_aggregates_and_masks_key():
     backing = {'potcar_lib_root': '/lib', 'lis_molecules_dir': '/mols',
                'ideal_window': [-1.0, 0.5],
                'llm': {'base_url': 'u', 'model': 'm', 'allow_external': True},
-               'ui': {'theme': 'paper', 'poll_interval': 5, 'autopilot_fetch': False}}
+               'ui': {'theme': 'paper', 'density': 'comfortable',
+                      'poll_interval': 5, 'autopilot_fetch': False}}
     api = Api(config_mod=_fake_config_rw(backing), ai_analysis_mod=_fake_ai(key_saved=True))
     out = api.settings_get()
     assert out['ok'] is True
@@ -2325,6 +2327,7 @@ def test_settings_get_aggregates_and_masks_key():
     assert out['paths']['lis_molecules_dir'] == '/mols'
     assert out['paths']['ideal_window'] == [-1.0, 0.5]
     assert out['ui']['theme'] == 'paper' and out['ui']['poll_interval'] == 5
+    assert out['ui']['density'] == 'comfortable'
     assert out['ui']['autopilot_fetch'] is False and out['ui']['autopilot'] is False
     assert out['prompt']['is_default'] is True and 'DEFAULT_PRESET_TEXT' in out['prompt']['text']
 
@@ -2332,7 +2335,8 @@ def test_settings_get_aggregates_and_masks_key():
 def test_settings_get_defaults_when_unset():
     api = Api(config_mod=_fake_config_rw({}), ai_analysis_mod=_fake_ai(key_saved=False))
     out = api.settings_get()
-    assert out['ui'] == {'theme': 'classic', 'autopilot': False, 'poll_interval': 10,
+    assert out['ui'] == {'theme': 'classic', 'density': 'standard',
+                         'autopilot': False, 'poll_interval': 10,
                          'autopilot_continue': True, 'autopilot_fetch': True,
                          'autopilot_report': True, 'autopilot_campaigns': False,
                          'scenario': '', 'active_engine': '', 'active_calculation': ''}
@@ -2423,6 +2427,26 @@ def test_theme_set_persists_and_validates():
     api = Api(config_mod=_fake_config_rw(backing))
     assert api.theme_set('deep')['theme'] == 'deep' and backing['ui']['theme'] == 'deep'
     assert api.theme_set('bogus')['theme'] == 'classic'   # 非法 → classic
+
+
+def test_density_set_persists_only_whitelisted_values():
+    backing = {}
+    api = Api(config_mod=_fake_config_rw(backing))
+    assert api.density_set('compact') == {
+        'ok': True, 'density': 'compact', 'error': None}
+    assert backing['ui']['density'] == 'compact'
+
+    rejected = api.density_set('spacious')
+    assert rejected['ok'] is False
+    assert rejected['density'] == 'standard'
+    assert rejected['error']
+    assert backing['ui']['density'] == 'compact'  # 非法值不得覆盖已保存设置
+
+
+def test_settings_get_rejects_invalid_stored_density_to_safe_default():
+    api = Api(config_mod=_fake_config_rw({'ui': {'density': '../compact'}}),
+              ai_analysis_mod=_fake_ai(key_saved=False))
+    assert api.settings_get()['ui']['density'] == 'standard'
 
 
 def test_autopilot_save_persists_subswitches():
@@ -4352,6 +4376,8 @@ def test_reaction_presets_shape():
     assert {p['key'] for p in out['presets']} == {'ORR_4E', 'HER'}
     orr = next(p for p in out['presets'] if p['key'] == 'ORR_4E')
     assert orr['name'] == 'ORR_4E' and '氧还原' in orr['description']
+    assert orr['name_en'] == 'ORR_4E'
+    assert orr['description_en'] == ''  # compatibility fake has no bilingual field
 
 
 def test_reaction_presets_error_caught():
@@ -4499,12 +4525,14 @@ def test_campaign_list_bad_campaign_does_not_break():
 def _fake_scenarios(calls=None, reg=None, active=None):
     """scenarios 假件:list/get/active/set 全可注入;set 落 calls 便于断言持久化。"""
     calls = calls if calls is not None else {}
-    full = {'key': 'full', 'name': '通用', 'description': '兜底',
+    full = {'key': 'full', 'name': '通用', 'name_en': 'General',
+            'description': '兜底', 'description_en': 'General-purpose fallback mode.',
             'pages': ['dashboard', 'generate', 'project', 'jobs', 'cluster', 'settings'],
             'cards': {}, 'figure_preset_order': ['bar', 'ladder'],
             'reaction_presets': [], 'engines': ['vasp'],
             'defaults': {'calc_type': 'slab'}, 'ai_context': 'x'}
-    lis = {'key': 'lis', 'name': '锂硫', 'description': 'Li-S',
+    lis = {'key': 'lis', 'name': '锂硫', 'name_en': 'Lithium-sulfur batteries',
+           'description': 'Li-S', 'description_en': 'Lithium-sulfur reaction workflows.',
            'pages': ['dashboard', 'generate', 'project', 'jobs', 'cluster', 'settings'],
            'cards': {}, 'figure_preset_order': ['ladder', 'volcano'],
            'reaction_presets': ['LIS_16E'], 'engines': ['vasp'],
@@ -4533,8 +4561,11 @@ def _fake_figpresets(calls=None, reg=None):
     calls = calls if calls is not None else {}
     reg = reg if reg is not None else {
         'adsorption_bar': {'key': 'adsorption_bar', 'name': '吸附能柱状图',
-                           'category': '能量学', 'description': '柱状',
+                           'name_en': 'Adsorption-energy bar chart',
+                           'category': '能量学', 'category_en': 'Energetics',
+                           'description': '柱状', 'description_en': 'Grouped bars.',
                            'required_data': 'adsorbates+substrates',
+                           'required_data_en': 'adsorbates+substrates',
                            'thumbnail_svg': '<svg id="bar"/>',
                            'params_schema': {'negative_up': False, 'title': ''}},
         'delta_e_heatmap': {'key': 'delta_e_heatmap', 'name': 'ΔE 热图',
@@ -4555,6 +4586,10 @@ def _fake_figpresets(calls=None, reg=None):
                     'thumbnail_svg': '<svg id="vo"/>', 'params_schema': {}},
     }
     m = types.SimpleNamespace()
+    m.CATEGORY_EN = {
+        '能量学': 'Energetics', '电池': 'Electrochemistry',
+        '电子结构': 'Electronic structure', '结构': 'Structure',
+    }
     m.list_presets = lambda category=None: [
         {k: v for k, v in p.items() if k != 'thumbnail_svg'}
         for p in reg.values() if category is None or p['category'] == category]
@@ -4658,6 +4693,8 @@ def test_scenario_list_shape():
     assert {s['key'] for s in out['scenarios']} == {'full', 'lis'}
     lis = next(s for s in out['scenarios'] if s['key'] == 'lis')
     assert 'project' in lis['pages'] and lis['reaction_presets'] == ['LIS_16E']
+    assert lis['name_en'] == 'Lithium-sulfur batteries'
+    assert lis['description_en'] == 'Lithium-sulfur reaction workflows.'
 
 
 def test_scenario_get_configured_true_reads_active():
@@ -4760,6 +4797,7 @@ def test_i18n_dict_returns_full_table():
     out = api.i18n_dict('en')
     assert out['ok'] is True and out['lang'] == 'en'
     assert out['dict']['nav.dashboard'] == 'Dashboard'
+    assert out['source']['nav.dashboard'] == '仪表盘'
 
 
 def test_lang_get_error_caught():
@@ -4778,7 +4816,26 @@ def test_figure_presets_gallery_with_thumbnails():
     bar = next(p for p in out['presets'] if p['key'] == 'adsorption_bar')
     assert bar['thumbnail_svg'] == '<svg id="bar"/>'
     assert bar['params_schema'] == {'negative_up': False, 'title': ''}
+    assert bar['name_en'] == 'Adsorption-energy bar chart'
+    assert bar['category_en'] == 'Energetics'
+    assert bar['description_en'] == 'Grouped bars.'
+    assert bar['required_data_en'] == 'adsorbates+substrates'
     assert '能量学' in out['categories']
+    assert out['categories_en'][0] == 'Energetics'
+
+
+def test_real_figure_preset_catalog_exposes_complete_english_metadata():
+    out = Api().figure_presets()
+    assert out['ok'] is True and out['presets']
+    for preset in out['presets']:
+        for field in ('name_en', 'category_en', 'description_en', 'required_data_en'):
+            assert preset[field].strip(), (preset['key'], field)
+            assert not re.search(r'[\u3400-\u9fff]', preset[field]), (preset['key'], field)
+    assert out['categories_en'] == [
+        'Energetics', 'Electrochemistry', 'Electronic structure', 'Structure',
+    ] or set(out['categories_en']) == {
+        'Energetics', 'Electrochemistry', 'Electronic structure', 'Structure',
+    }
 
 
 def test_render_figure_preset_bar_assembles_from_delta(tmp_path):
@@ -6048,10 +6105,20 @@ def _fake_task_catalog():
     m = types.SimpleNamespace()
     m.CATEGORIES = ('基础', '电子结构', '热力学与动力学', '性质', '收敛与校验')
     m.list_catalog = lambda category=None: [
-        {'key': 'relax', 'name_zh': '结构优化', 'category': '基础',
-         'description': '弛豫', 'requires': 'POSCAR', 'outputs': 'CONTCAR', 'figure': None},
-        {'key': 'eos', 'name_zh': '状态方程', 'category': '性质',
-         'description': 'BM3', 'requires': '平衡结构', 'outputs': 'E-V', 'figure': 'eos'},
+        {'key': 'relax', 'name_zh': '结构优化', 'name_en': 'Geometry optimization',
+         'category': '基础', 'category_en': 'Fundamentals',
+         'description': '弛豫', 'description_en': 'Relax the geometry.',
+         'requires': 'POSCAR', 'requires_en': 'POSCAR',
+         'outputs': 'CONTCAR', 'outputs_en': 'CONTCAR',
+         'next_action_en': 'Verify force convergence before using CONTCAR.',
+         'figure': None},
+        {'key': 'eos', 'name_zh': '状态方程', 'name_en': 'Equation of state',
+         'category': '性质', 'category_en': 'Properties',
+         'description': 'BM3', 'description_en': 'Fit an equation of state.',
+         'requires': '平衡结构', 'requires_en': 'Equilibrium structure',
+         'outputs': 'E-V', 'outputs_en': 'Energy-volume series',
+         'next_action_en': 'Inspect the fitted minimum and residuals.',
+         'figure': 'eos'},
     ]
     return m
 
@@ -6306,6 +6373,13 @@ def test_task_catalog_shape():
     keys = {t['key'] for t in out['tasks']}
     assert 'relax' in keys and 'eos' in keys
     assert out['tasks'][0]['name_zh'] == '结构优化'
+    assert out['categories_en'] == ['Fundamentals', 'Properties']
+    relax = next(row for row in out['tasks'] if row['key'] == 'relax')
+    assert relax['name_en'] == 'Geometry optimization'
+    assert relax['description_en'] == 'Relax the geometry.'
+    assert relax['requires_en'] == 'POSCAR' and relax['outputs_en'] == 'CONTCAR'
+    assert relax['kind_badge_en'] == 'Job generator'
+    assert relax['next_action_en'] == 'Verify force convergence before using CONTCAR.'
 
 
 def test_task_catalog_filters_by_work_mode_and_active_calculation():
@@ -6325,6 +6399,10 @@ def test_task_catalog_filters_non_vasp_to_closed_loop_tasks():
     assert [row['key'] for row in out['tasks']] == ['relax', 'static', 'freq']
     assert all(row['kind_badge'] == '引擎输入生成' for row in out['tasks'])
     assert all('CP2K' in row['next_action'] for row in out['tasks'])
+    assert all(row['kind_badge_en'] == 'Engine input generator' for row in out['tasks'])
+    assert all('cp2k.inp' in row['requires_en'] for row in out['tasks'])
+    assert all('cp2k.out' in row['outputs_en'] for row in out['tasks'])
+    assert all('CP2K' in row['next_action_en'] for row in out['tasks'])
 
 
 def test_task_catalog_error_caught():

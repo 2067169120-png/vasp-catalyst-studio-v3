@@ -7,6 +7,8 @@
 'use strict';
 (function () {
   const $ = id => document.getElementById(id);
+  const i18n = (key, fallback, params) => typeof VCS.t === 'function'
+    ? VCS.t(key, params || {}, fallback) : fallback;
   const COMMON_ELEMENTS = ['H', 'B', 'C', 'N', 'O', 'F', 'Na', 'Mg', 'Al', 'Si', 'P', 'S',
     'Cl', 'K', 'Ca', 'Ti', 'V', 'Cr', 'Mn', 'Fe', 'Co', 'Ni', 'Cu', 'Zn', 'Mo', 'Ru',
     'Rh', 'Pd', 'Ag', 'W', 'Ir', 'Pt', 'Au', 'Li'];
@@ -142,7 +144,8 @@
     const info = $('ed-selinfo');
     if (st && i != null && i < st.elements.length) {
       const c = st.coords[i];
-      const fx = (st.fixed || [])[i] ? ' · 已冻结' : '';
+      const fx = (st.fixed || [])[i]
+        ? i18n('editor.atom.frozen_suffix', ' · 已冻结') : '';
       if (info) info.textContent = `#${i} ${st.elements[i]}  (${(+c[0]).toFixed(3)}, ` +
         `${(+c[1]).toFixed(3)}, ${(+c[2]).toFixed(3)}) Å${fx}`;
       if ($('ed-edit')) $('ed-edit').hidden = false;
@@ -151,7 +154,9 @@
     } else {
       if (info) {
         info.textContent = State.selected.size > 1
-          ? `已选 ${State.selected.size} 个原子` : '未选中原子';
+          ? i18n('editor.selection.count', '已选 {count} 个原子', {
+            count: State.selected.size,
+          }) : '未选中原子';
       }
       if ($('ed-edit')) $('ed-edit').hidden = true;
     }
@@ -180,13 +185,17 @@
 
   function updateVacuum(v) {
     const el = $('ed-vacuum');
-    if (el) el.textContent = '真空:' + (v == null ? '—' : v + ' Å');
+    if (el) el.textContent = i18n('editor.vacuum.value', '真空：{value}', {
+      value: v == null ? '—' : v + ' Å',
+    });
   }
   function updateFixState() {
     const el = $('ed-fixstate');
     if (!el) return;
     const n = (State.struct && State.struct.fixed || []).filter(Boolean).length;
-    el.textContent = n ? '已冻结 ' + n + ' 个原子' : '';
+    el.textContent = n ? i18n('editor.frozen.count', '已冻结 {count} 个原子', {
+      count: n,
+    }) : '';
   }
 
   // ── 原子列表表格(右侧折叠面板;点行 = 选中联动) ──
@@ -209,15 +218,24 @@
   // ── 加载:pick_file → struct_load → 状态 ──
   async function load() {
     const r = await VCS.call('pick_file', 'poscar');
-    if (r && r.error) { VCS.log('选择结构失败:' + r.error, 'failc'); return; }
+    if (r && r.error) {
+      VCS.log(i18n('editor.structure.pick_failed', '选择结构失败：{error}', {
+        error: r.error,
+      }), 'failc'); return;
+    }
     if (!r || !r.path) return;
     const out = await VCS.call('struct_load', r.path);
     if (!out || out.ok === false || out.error) {
-      VCS.log('加载结构失败:' + ((out && out.error) || '未知错误'), 'failc'); return;
+      VCS.log(i18n('editor.structure.load_failed', '加载结构失败：{error}', {
+        error: (out && out.error) || i18n('common.unknown_error', '未知错误'),
+      }), 'failc'); return;
     }
     setStruct(out.struct, out.vacuum, r.path);
-    VCS.log('已加载结构:' + r.path + '(' + out.struct.formula + ',真空 ' +
-      (out.vacuum == null ? '—' : out.vacuum + ' Å') + ')', 'okc');
+    VCS.log(i18n('editor.structure.loaded',
+      '已加载结构：{path}（{formula}，真空 {vacuum}）', {
+        path: r.path, formula: out.struct.formula,
+        vacuum: out.vacuum == null ? '—' : out.vacuum + ' Å',
+      }), 'okc');
   }
 
   // ── 编辑:移动 / 删除 / 改元素(纯状态操作 + undo) ──
@@ -233,7 +251,7 @@
     if (State.struct == null || State.sel == null) return;
     const i = State.sel;
     removeAtoms([i]);
-    VCS.log('已删除原子 #' + i, 'okc');
+    VCS.log(i18n('editor.atom.deleted', '已删除原子 #{index}', { index: i }), 'okc');
   }
   function removeAtoms(indices) {
     if (!State.struct || !indices.length) return;
@@ -285,7 +303,9 @@
     if (!State.selected.size) { VCS.toast('未选中任何原子', 'fail'); return; }
     const n = State.selected.size;
     removeAtoms(Array.from(State.selected));
-    VCS.log('已删除选中的 ' + n + ' 个原子', 'okc');
+    VCS.log(i18n('editor.selection.deleted', '已删除选中的 {count} 个原子', {
+      count: n,
+    }), 'okc');
   }
 
   // ── 测量:2 原子键长 / 3 原子键角 ──
@@ -317,20 +337,30 @@
     const bar = $('ed-measbar');
     if (p.length === 2) {
       const d = norm(vec(p[0], p[1]));
-      if (bar) bar.textContent = `键长 #${p[0]}–#${p[1]} = ${d.toFixed(3)} Å(再点 1 个原子测键角)`;
+      if (bar) bar.textContent = i18n('editor.measure.distance',
+        '键长 #{first}–#{second} = {value} Å（再点 1 个原子测键角）', {
+          first: p[0], second: p[1], value: d.toFixed(3),
+        });
     } else if (p.length === 3) {
       const v1 = vec(p[1], p[0]), v2 = vec(p[1], p[2]);
       const cos = dot(v1, v2) / (norm(v1) * norm(v2) || 1);
       const ang = Math.acos(Math.max(-1, Math.min(1, cos))) * 180 / Math.PI;
-      if (bar) bar.textContent = `键角 #${p[0]}–#${p[1]}–#${p[2]} = ${ang.toFixed(2)}°(再点 1 个原子测二面角)`;
+      if (bar) bar.textContent = i18n('editor.measure.angle',
+        '键角 #{first}–#{second}–#{third} = {value}°（再点 1 个原子测二面角）', {
+          first: p[0], second: p[1], third: p[2], value: ang.toFixed(2),
+        });
     } else if (p.length === 4) {
       const b1 = vec(p[0], p[1]), b2 = vec(p[1], p[2]), b3 = vec(p[2], p[3]);
       const n1 = cross(b1, b2), n2 = cross(b2, b3);
       const m1 = cross(n1, [b2[0] / (norm(b2) || 1), b2[1] / (norm(b2) || 1), b2[2] / (norm(b2) || 1)]);
       const dih = Math.atan2(dot(m1, n2), dot(n1, n2)) * 180 / Math.PI;
-      if (bar) bar.textContent = `二面角 #${p[0]}–#${p[1]}–#${p[2]}–#${p[3]} = ${dih.toFixed(2)}°(点原子重新测量)`;
+      if (bar) bar.textContent = i18n('editor.measure.dihedral',
+        '二面角 #{first}–#{second}–#{third}–#{fourth} = {value}°（点原子重新测量）', {
+          first: p[0], second: p[1], third: p[2], fourth: p[3], value: dih.toFixed(2),
+        });
     } else if (bar) {
-      bar.textContent = `已选 #${i};再点 1 个原子测键长`;
+      bar.textContent = i18n('editor.measure.first_selected',
+        '已选 #{index}；再点 1 个原子测键长', { index: i });
     }
     render3D();
   }
@@ -365,7 +395,11 @@
       a.href = uri; a.download = 'structure.png';
       document.body.appendChild(a); a.click(); a.remove();
       VCS.toast('已保存结构图片');
-    } catch (e) { VCS.log('保存图片失败:' + e, 'failc'); }
+    } catch (e) {
+      VCS.log(i18n('editor.image.save_failed', '保存图片失败：{error}', {
+        error: e,
+      }), 'failc');
+    }
   }
   function toggleAtomList() {
     const box = $('ed-atomlist');
@@ -378,14 +412,18 @@
     const n = parseInt(($('ed-fixn') && $('ed-fixn').value) || '1', 10) || 1;
     const r = await VCS.call('struct_fix_layers', stateForApi(), n);
     if (!r || r.ok === false || r.error) {
-      VCS.log('固定底层失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+      VCS.log(i18n('editor.layers.fix_failed', '固定底层失败：{error}', {
+        error: (r && r.error) || i18n('common.unknown_error', '未知错误'),
+      }), 'failc'); return;
     }
     pushUndo();
     State.struct.fixed = r.fixed || [];
     updateVacuum(r.vacuum);
     updateFixState();
     render3D();
-    VCS.log('已固定底 ' + n + ' 层(冻结 ' + r.fixed_count + ' 个原子)', 'okc');
+    VCS.log(i18n('editor.layers.fixed', '已固定底 {layers} 层（冻结 {count} 个原子）', {
+      layers: n, count: r.fixed_count,
+    }), 'okc');
   }
   async function refreshVacuum() {
     if (!State.struct) return;
@@ -403,17 +441,23 @@
   async function save() {
     if (!State.struct) { VCS.log('请先加载结构', 'failc'); return; }
     const dr = await VCS.call('pick_dir');
-    if (dr && dr.error) { VCS.log('选择目录失败:' + dr.error, 'failc'); return; }
+    if (dr && dr.error) {
+      VCS.log(i18n('editor.directory.pick_failed', '选择目录失败：{error}', {
+        error: dr.error,
+      }), 'failc'); return;
+    }
     if (!dr || !dr.path) return;
     const d = String(dr.path).replace(/[\\/]+$/, '');
     const sep = d.indexOf('\\') >= 0 ? '\\' : '/';
     const dest = d + sep + 'POSCAR';
     const r = await VCS.call('struct_save', stateForApi(), dest);
     if (!r || r.ok === false || r.error) {
-      VCS.log('保存 POSCAR 失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+      VCS.log(i18n('editor.poscar.save_failed', '保存 POSCAR 失败：{error}', {
+        error: (r && r.error) || i18n('common.unknown_error', '未知错误'),
+      }), 'failc'); return;
     }
     State.path = r.path;
-    VCS.log('已保存 POSCAR:' + r.path, 'okc');
+    VCS.log(i18n('editor.poscar.saved', '已保存 POSCAR：{path}', { path: r.path }), 'okc');
     VCS.call('open_dir', r.path);
     VCS.toast('已保存 POSCAR');
   }
@@ -437,8 +481,9 @@
   // ── 输入原子坐标(粘贴 xyz 文本 → 载入编辑器)──
   function pasteXyz() {
     const box = document.createElement('div');
-    box.innerHTML = '<div class="sub" style="margin-bottom:6px">每行一个原子:元素 x y z(单位 Å);' +
-      '可含/不含 XYZ 头两行。</div>' +
+    box.innerHTML = '<div class="sub" style="margin-bottom:6px">' + VCS.esc(i18n(
+      'editor.xyz.instructions',
+      '每行一个原子：元素 x y z（单位 Å）；可含/不含 XYZ 头两行。')) + '</div>' +
       '<textarea id="ed-xyz-ta" class="ipt" rows="10" spellcheck="false" ' +
       'placeholder="O   0.000   0.000   0.000&#10;H   0.757   0.586   0.000&#10;H  -0.757   0.586   0.000"></textarea>';
     const m = VCS.modal({
@@ -470,8 +515,12 @@
     const formula = Object.keys(counts).map(e => e + (counts[e] > 1 ? counts[e] : '')).join('');
     setStruct({ elements: elements, coords: coords, fixed: elements.map(() => false), formula: formula },
       null, null);
-    VCS.log('已载入粘贴坐标:' + elements.length + ' 原子(' + formula + ')', 'okc');
-    VCS.toast('已载入 ' + elements.length + ' 原子');
+    VCS.log(i18n('editor.xyz.loaded', '已载入粘贴坐标：{count} 原子（{formula}）', {
+      count: elements.length, formula,
+    }), 'okc');
+    VCS.toast(i18n('editor.xyz.loaded_count', '已载入 {count} 原子', {
+      count: elements.length,
+    }));
     return true;
   }
 
@@ -485,7 +534,9 @@
     box.innerHTML = mols.map(m =>
       `<div class="mol-card"><b>${VCS.esc(m.name)}</b>` +
       `<span>${VCS.esc(m.formula || m.name)}</span>` +
-      (m.spin_hint ? `<span class="spin-hint">自旋 ${VCS.esc(String(m.spin_hint))}</span>` : '') +
+      (m.spin_hint ? `<span class="spin-hint">${VCS.esc(i18n(
+        'editor.molecule.spin', '自旋 {spin}', { spin: String(m.spin_hint) }
+      ))}</span>` : '') +
       `</div>`).join('');
   }
 

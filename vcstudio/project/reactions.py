@@ -346,6 +346,37 @@ _PRESETS = {
     )
 }
 
+DESCRIPTION_EN = {
+    'LIS_16E': (
+        'Full 16-electron Li-S discharge path: S8→Li2S8→Li2S6→Li2S4→Li2S2→Li2S '
+        '(successive lithiation and polysulfide precipitation).'),
+    'LIS_ASSOC_LIS': (
+        'Associative *LiS route for Li2S3 reduction: Li2S3*→LiS*→Li2S* '
+        '(2 e−, with Li2S2 precipitation).'),
+    'LIS_ASSOC_LIS2': (
+        'Associative *LiS2 route for Li2S3 reduction: Li2S3*→LiS2*→Li2S2* '
+        '(2 e−, with Li2S precipitation).'),
+    'LIS_DISSOC': (
+        'Dissociative Li2S3 reduction: Li2S3*→Li2S2*+*LiS→Li2S2* '
+        '(2 e−, with Li2S precipitation in the final state).'),
+    'ORR_4E': (
+        'Four-electron oxygen reduction (associative ORR): '
+        'O2→*OOH→*O→*OH→H2O.'),
+    'OER_4E': (
+        'Four-electron oxygen evolution: 2H2O→*OH→*O→*OOH→O2 '
+        '(OER convention, η=U_L−U_eq).'),
+    'HER': (
+        'Hydrogen evolution: 2(H+ + e−)→*H→H2 through a single adsorbed-H '
+        'intermediate (η=|ΔG_H*|).'),
+    'CO2RR_TO_CO': (
+        'CO2 reduction to CO: CO2→*COOH→*CO→CO; the final desorption is a '
+        'chemical step and is excluded from the limiting potential.'),
+}
+
+for _key, _preset in _PRESETS.items():
+    _preset['name_en'] = _key
+    _preset['description_en'] = DESCRIPTION_EN[_key]
+
 
 def list_presets() -> dict:
     """返回全部内置预设 {name: spec}(浅拷贝顶层字典,防止外部误改注册表)。"""

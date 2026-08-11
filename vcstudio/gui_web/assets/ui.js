@@ -13,16 +13,37 @@
     return String(s == null ? '' : s).replace(/[&<>"']/g,
       c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   }
+  function tr(key, fallback, params) {
+    const vcs = window.VCS;
+    return vcs && typeof vcs.t === 'function' ? vcs.t(key, params || {}, fallback) : fallback;
+  }
+
+  function localizedAccordionSummary(el) {
+    const fallback = el.getAttribute('data-sum') || '';
+    const key = el.getAttribute('data-i18n-sum') || '';
+    return key ? tr(key, fallback) : fallback;
+  }
+
+  function refreshAccordionSummaries(root) {
+    const scope = root || document;
+    scope.querySelectorAll('[data-acc][data-sum]').forEach(el => {
+      const head = el.querySelector(':scope > .acc-h > button.acc-toggle');
+      const summary = head && head.querySelector(':scope > .acc-sum');
+      if (summary) summary.textContent = localizedAccordionSummary(el);
+    });
+  }
 
   // ── 1) 分区手风琴 ──────────────────────────────────────────────
-  // 约定:分区根元素带 data-acc="page:key",内部含直接子 .acc-h 头部。
-  // 头部注入箭头 + 摘要(取 data-sum);点击/键盘切换 data-open;每页默认仅展开首个。
+  // 约定:分区根元素带 data-acc="page:key",内部含直接子标题 .acc-h，
+  // 标题内必须使用原生 button.acc-toggle。按钮获得确定性的 aria-controls，
+  // 每个被控制的直接子内容也获得稳定 id；点击切换 data-open，每页默认仅展开首个。
   function enhanceAccordion(root) {
     const seenPage = {};
     root.querySelectorAll('[data-acc]').forEach(el => {
       if (el._accReady) return;
-      const head = el.querySelector(':scope > .acc-h');
-      if (!head) return;
+      const heading = el.querySelector(':scope > .acc-h');
+      const head = heading && heading.querySelector(':scope > button.acc-toggle');
+      if (!heading || !head) return;
       el._accReady = true;
       const key = el.getAttribute('data-acc') || '';
       const page = key.split(':')[0];
@@ -32,34 +53,41 @@
         car.setAttribute('aria-hidden', 'true');
         head.insertBefore(car, head.firstChild);
       }
-      const sum = el.getAttribute('data-sum');
+      const sum = localizedAccordionSummary(el);
       if (sum && !head.querySelector('.acc-sum')) {
         const s = document.createElement('span');
         s.className = 'acc-sum';
         s.textContent = sum;
         head.appendChild(s);
       }
+      const idStem = (key || ('section-' + (++accordionSequence)))
+        .replace(/[^A-Za-z0-9_-]+/g, '-');
+      const panels = Array.from(el.children).filter(child => child !== heading);
+      panels.forEach((panel, index) => {
+        if (!panel.id) panel.id = 'vcs-acc-' + idStem + '-panel-' + (index + 1);
+      });
+      if (panels.length) head.setAttribute('aria-controls', panels.map(panel => panel.id).join(' '));
       const first = !seenPage[page];
       seenPage[page] = true;
       const stored = LS.get('vcs.acc.' + key, null);
       const dflt = el.getAttribute('data-acc-default');   // 显式默认态优先于"每页首个"规则
       let open = stored != null ? stored : (dflt != null ? dflt : (first ? '1' : '0'));
       apply(open);
-      head.setAttribute('role', 'button');
-      head.setAttribute('tabindex', '0');
+      head.type = 'button';
       function apply(v) {
         el.setAttribute('data-open', v);
         head.setAttribute('aria-expanded', v === '1' ? 'true' : 'false');
       }
+      el._accSetOpen = (value, persist = false) => {
+        open = value === true || value === '1' ? '1' : '0';
+        apply(open);
+        if (persist) LS.set('vcs.acc.' + key, open);
+      };
       function toggle() {
         open = open === '1' ? '0' : '1';
-        apply(open);
-        LS.set('vcs.acc.' + key, open);
+        el._accSetOpen(open, true);
       }
       head.addEventListener('click', toggle);
-      head.addEventListener('keydown', e => {
-        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
-      });
     });
   }
 
@@ -68,8 +96,22 @@
   // opts.groups:[{group,items:[{val,label,exp,note}]}] 或 opts.items:[{val,label,exp,note}]
   // opts.selected:[val...] · opts.placeholder · opts.onChange(selArr)
   // 返回 controller,并挂到 host._ms:{getSelected,setSelected,setGroups,setItems}
+  let accordionSequence = 0;
+  let multiselectSequence = 0;
+  let segmentedSequence = 0;
+  function setPopOpen(pop, open, returnFocus) {
+    if (!pop) return;
+    pop.hidden = !open;
+    const button = pop._msButton;
+    if (button) {
+      button.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (!open && returnFocus) button.focus();
+    }
+  }
   function closeAllPops(except) {
-    document.querySelectorAll('.ms-pop').forEach(p => { if (p !== except) p.hidden = true; });
+    document.querySelectorAll('.ms-pop').forEach(p => {
+      if (p !== except) setPopOpen(p, false, false);
+    });
   }
   function multiselect(host, opts) {
     opts = opts || {};
@@ -87,6 +129,15 @@
     host.appendChild(btn);
     host.appendChild(pop);
     host.appendChild(pills);
+    const idStem = host.id ? host.id.replace(/[^A-Za-z0-9_-]/g, '-')
+      : 'vcs-multiselect-' + (++multiselectSequence);
+    btn.id = idStem + '-toggle';
+    pop.id = idStem + '-options';
+    btn.setAttribute('aria-controls', pop.id);
+    btn.setAttribute('aria-expanded', 'false');
+    pop.setAttribute('role', 'group');
+    pop.setAttribute('aria-labelledby', btn.id);
+    pop._msButton = btn;
 
     function normGroups(o) {
       if (o.groups && o.groups.length) return o.groups;
@@ -103,7 +154,9 @@
     }
     function renderBtn() {
       const n = state.sel.size;
-      btn.textContent = n ? ('已选 ' + n + ' 项') : (opts.placeholder || '点此选择');
+      btn.textContent = n
+        ? tr('multiselect.selected_count', '已选 {count} 项', { count: n })
+        : (opts.placeholder || '点此选择');
       btn.classList.toggle('has', n > 0);
     }
     function renderPop() {
@@ -117,8 +170,13 @@
       }).join('') || '<div class="ms-empty">暂无可选项</div>';
     }
     function renderPills() {
-      pills.innerHTML = Array.from(state.sel).map(v =>
-        '<span class="ms-pill" data-v="' + esc(v) + '">' + esc(labelOf(v)) + '<b aria-hidden="true">×</b></span>').join('');
+      pills.innerHTML = Array.from(state.sel).map(v => {
+        const label = labelOf(v);
+        const remove = tr('multiselect.remove', '移除 {label}', { label });
+        return '<button type="button" class="ms-pill" data-v="' + esc(v) +
+          '" aria-label="' + esc(remove) + '">' + esc(label) +
+          '<b aria-hidden="true">×</b></button>';
+      }).join('');
     }
     function fire() { renderBtn(); renderPills(); if (opts.onChange) opts.onChange(Array.from(state.sel)); }
 
@@ -126,7 +184,7 @@
       e.stopPropagation();
       const willShow = pop.hidden;
       closeAllPops(pop);
-      pop.hidden = !willShow;
+      setPopOpen(pop, willShow, false);
     });
     pop.addEventListener('change', e => {
       const cb = e.target.closest('input[data-v]');
@@ -142,7 +200,15 @@
       renderPop();
       fire();
     });
-    document.addEventListener('click', e => { if (!host.contains(e.target)) pop.hidden = true; });
+    host.addEventListener('keydown', e => {
+      if (e.key !== 'Escape' || pop.hidden) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setPopOpen(pop, false, true);
+    });
+    document.addEventListener('click', e => {
+      if (!host.contains(e.target)) setPopOpen(pop, false, false);
+    });
 
     renderPop(); renderBtn(); renderPills();
     const ctrl = {
@@ -198,18 +264,52 @@
       const attr = seg.getAttribute('data-seg');
       const store = seg.getAttribute('data-seg-store');
       const btns = Array.from(seg.querySelectorAll('button[data-seg-val]'));
+      seg.setAttribute('role', 'group');
+      if (!seg.hasAttribute('aria-label') && !seg.hasAttribute('aria-labelledby')) {
+        const bar = seg.closest('.seg-bar');
+        const label = bar && bar.querySelector('.seg-lbl');
+        if (label) {
+          if (!label.id) label.id = 'vcs-segment-label-' + (++segmentedSequence);
+          seg.setAttribute('aria-labelledby', label.id);
+        } else {
+          seg.setAttribute('aria-label', '切换选项');
+        }
+      }
+      btns.forEach(b => { b.type = 'button'; });
       const saved = store ? LS.get('vcs.seg.' + store, null) : null;
       let cur = (saved != null && btns.some(b => b.dataset.segVal === saved)) ? saved
         : (btns[0] ? btns[0].dataset.segVal : '');
       const run = v => {
         cur = v;
-        btns.forEach(b => b.classList.toggle('on', b.dataset.segVal === v));
+        btns.forEach(b => {
+          const selected = b.dataset.segVal === v;
+          b.classList.toggle('on', selected);
+          b.setAttribute('aria-pressed', selected ? 'true' : 'false');
+          b.setAttribute('tabindex', selected ? '0' : '-1');
+        });
         groupToggle(page, attr, v);
         if (store) LS.set('vcs.seg.' + store, v);
       };
       seg.addEventListener('click', e => {
         const b = e.target.closest('button[data-seg-val]');
         if (b) run(b.dataset.segVal);
+      });
+      seg.addEventListener('keydown', e => {
+        const b = e.target.closest('button[data-seg-val]');
+        if (!b || !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+        const enabled = btns.filter(item => !item.disabled);
+        if (!enabled.length) return;
+        const index = Math.max(0, enabled.indexOf(b));
+        let next;
+        if (e.key === 'Home') next = enabled[0];
+        else if (e.key === 'End') next = enabled[enabled.length - 1];
+        else {
+          const step = e.key === 'ArrowRight' ? 1 : -1;
+          next = enabled[(index + step + enabled.length) % enabled.length];
+        }
+        e.preventDefault();
+        next.click();
+        next.focus();
       });
       run(cur);
     });
@@ -222,11 +322,34 @@
     enhanceSwitchers(root);
   }
 
+  function setAccordionOpen(target, value, persist = false) {
+    const el = typeof target === 'string' ? document.querySelector(target) : target;
+    if (!el || !el.matches || !el.matches('[data-acc]')) return false;
+    const open = value === true || value === '1';
+    if (typeof el._accSetOpen === 'function') {
+      el._accSetOpen(open, persist);
+      return true;
+    }
+    el.setAttribute('data-open', open ? '1' : '0');
+    const toggle = el.querySelector(':scope > .acc-h > button.acc-toggle');
+    if (toggle) toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (persist) {
+      const key = el.getAttribute('data-acc') || '';
+      if (key) LS.set('vcs.acc.' + key, open ? '1' : '0');
+    }
+    return true;
+  }
+
   window.VCS = window.VCS || {};
   window.VCS.ui = {
     multiselect, groupToggle, enhanceAll,
-    enhanceAccordion, enhanceSwitchers, enhanceSegmented, esc,
+    enhanceAccordion, enhanceSwitchers, enhanceSegmented, setAccordionOpen,
+    refreshAccordionSummaries, esc,
   };
+
+  document.addEventListener('vcs:language', () => {
+    refreshAccordionSummaries(document);
+  });
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => enhanceAll(document));

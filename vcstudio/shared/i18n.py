@@ -30,10 +30,32 @@ _ACTIVE_LANG = DEFAULT_LANG
 _MISSING_LOOKUPS: Counter = Counter()
 
 _CJK_RE = re.compile(r'[一-鿿]')
+_LANG_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_-]{0,15}$')
+
+
+def normalize_lang(lang: str | None, *, require_available: bool = True) -> str:
+    """Return one bounded locale identifier or fail closed.
+
+    Locale names cross the webview bridge and are later used to select a JSON
+    resource.  They must never become arbitrary path fragments.  Production
+    language changes additionally require an installed locale; tests may set a
+    temporary locale directory and therefore use the same availability check.
+    """
+    candidate = str(lang or DEFAULT_LANG).strip().lower()
+    if not _LANG_RE.fullmatch(candidate):
+        raise ValueError('language must be a safe locale identifier')
+    if require_available:
+        installed = {
+            path.stem.lower() for path in _LOCALES_DIR.glob('*.json')
+            if _LANG_RE.fullmatch(path.stem)
+        }
+        if candidate not in installed:
+            raise ValueError(f'unsupported interface language: {candidate}')
+    return candidate
 
 
 def _locale_file(lang: str) -> Path:
-    return _LOCALES_DIR / f'{lang}.json'
+    return _LOCALES_DIR / f'{normalize_lang(lang, require_available=False)}.json'
 
 
 def _read_raw(lang: str) -> dict:
@@ -67,6 +89,7 @@ def load_locale(lang: str) -> dict:
 
     结果进 _CACHE;非基准语言的缺键同时记入日志式结构(见 missing_keys 独立复算)。
     """
+    lang = normalize_lang(lang)
     if lang in _CACHE:
         return _CACHE[lang]
     base = _read_raw(BASE_LANG)
@@ -103,13 +126,17 @@ def current_lang(config: dict | None = None) -> str:
     if isinstance(config, dict):
         ui = config.get('ui')
         if isinstance(ui, dict) and ui.get('lang'):
-            return ui['lang']
+            try:
+                return normalize_lang(ui['lang'])
+            except ValueError:
+                return DEFAULT_LANG
     return DEFAULT_LANG
 
 
 def set_lang(lang: str, config_path=None) -> Path:
     """把界面语言写入 config 的 ui.lang 并持久化;同时更新进程内活动语言(t() 立即生效)。"""
     global _ACTIVE_LANG
+    lang = normalize_lang(lang)
     _ACTIVE_LANG = lang
     from vcstudio.shared.config import set_ui_state
     return set_ui_state(config_path, lang=lang)
@@ -118,6 +145,22 @@ def set_lang(lang: str, config_path=None) -> Path:
 def export_for_js(lang: str) -> dict:
     """返回整棵(回落补齐后的)扁平词典 dict,供前端一次性注入(GUI 按点分 key 查表)。"""
     return dict(load_locale(lang))
+
+
+def export_bundle_for_js(lang: str) -> dict:
+    """Return target and source dictionaries for deterministic DOM translation.
+
+    ``dict`` remains the keyed target-language table used by explicit
+    ``data-i18n`` annotations.  ``source`` is the exact zh baseline for the
+    same keys, allowing the frontend to translate legacy text nodes without
+    guessing or calling an online translation service.
+    """
+    selected = normalize_lang(lang)
+    return {
+        'lang': selected,
+        'dict': dict(load_locale(selected)),
+        'source': dict(load_locale(BASE_LANG)),
+    }
 
 
 def missing_lookups() -> dict:
@@ -134,9 +177,12 @@ def reset_runtime_state() -> None:
 
 
 def scan_html_strings(html_text: str) -> list:
-    """从 HTML 文本粗提用户可见中文串:`>中文<` 文本节点 与 `placeholder="中文"`。
+    """粗提 HTML 中需要本地化的中文文本与可访问属性。
 
-    辅助后续扩充字典用,去重保序,不求完备(不解析 title=/多属性/JS 模板)。
+    This deliberately remains a lightweight scanner rather than an HTML
+    rewriter.  It covers visible text plus the attributes that form control
+    names/help in the accessibility tree, so translation coverage tests do not
+    overlook an English-looking screen reader surface.
     """
     found: list = []
     seen: set = set()
@@ -149,6 +195,12 @@ def scan_html_strings(html_text: str) -> list:
 
     for m in re.finditer(r'>([^<>]+)<', html_text or ''):
         _push(m.group(1))
-    for m in re.finditer(r'placeholder="([^"]+)"', html_text or ''):
-        _push(m.group(1))
+    translated_attributes = (
+        'placeholder', 'title', 'aria-label', 'aria-description', 'alt',
+    )
+    attr_pattern = '|'.join(re.escape(item) for item in translated_attributes)
+    for match in re.finditer(
+            rf'(?:{attr_pattern})\s*=\s*(["\'])(.*?)\1',
+            html_text or '', flags=re.IGNORECASE | re.DOTALL):
+        _push(match.group(2))
     return found

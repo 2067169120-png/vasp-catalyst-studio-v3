@@ -28,8 +28,9 @@ from datetime import datetime, timezone
 # 合法计算类型(决定 KPOINTS 网格);前端下拉与后端都以此为准
 _CALC_TYPES = ('slab', 'bulk', 'molecule')
 
-# 主题白名单(设置页三选);自动驾驶管线阶段序(pipeline_status 的 stage_index 取此序)
+# 主题/视觉密度白名单；二者都只影响 UI，不参与任何科学数据或计算参数。
 _THEMES = ('classic', 'paper', 'deep')
+_DENSITIES = ('comfortable', 'standard', 'compact')
 _STAGES = ('generate', 'submit', 'monitor', 'recover', 'analysis', 'report_done')
 # 活跃(在队/在跑)状态与可续算终态:pipeline_tick/status 复用
 _ACTIVE_STATES = ('UPLOADED', 'SUBMITTED', 'QUEUED', 'RUNNING')
@@ -8210,6 +8211,8 @@ class Api:
         """ui 小节 → 外观/自动化设置(带默认值)。"""
         return {
             'theme': ui.get('theme') if ui.get('theme') in _THEMES else 'classic',
+            'density': (ui.get('density')
+                        if ui.get('density') in _DENSITIES else 'standard'),
             'autopilot': bool(ui.get('autopilot', False)),
             'poll_interval': int(ui.get('poll_interval', 10) or 10),
             'autopilot_continue': bool(ui.get('autopilot_continue', True)),
@@ -8361,6 +8364,18 @@ class Api:
                 n = 'classic'
             self._config.set_ui_state(theme=n)
             return {'ok': True, 'theme': n, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def density_set(self, name):
+        """保存三档视觉密度；非法值拒绝写入，避免污染跨会话 UI 状态。"""
+        try:
+            n = str(name or '').strip().lower()
+            if n not in _DENSITIES:
+                return {'ok': False, 'density': 'standard',
+                        'error': '不支持的视觉密度'}
+            self._config.set_ui_state(density=n)
+            return {'ok': True, 'density': n, 'error': None}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'error': str(e)}
 
@@ -10662,7 +10677,9 @@ class Api:
                 sc = self._scenarios.get_scenario(str(scenario_key))
                 keys = [key for key in (sc.get('reaction_presets') or []) if key in presets]
             out = [{'key': key, 'name': presets[key].get('name') or key,
-                    'description': presets[key].get('description') or ''}
+                    'name_en': presets[key].get('name_en') or key,
+                    'description': presets[key].get('description') or '',
+                    'description_en': presets[key].get('description_en') or ''}
                    for key in keys]
             return {'ok': True, 'presets': out, 'error': None}
         except Exception as e:                            # noqa: BLE001
@@ -10728,6 +10745,8 @@ class Api:
         return {
             'key': sc.get('key'), 'name': sc.get('name'),
             'description': sc.get('description'),
+            'name_en': sc.get('name_en') or '',
+            'description_en': sc.get('description_en') or '',
             'pages': list(sc.get('pages') or []),
             'cards': sc.get('cards') or {},
             'figure_preset_order': list(sc.get('figure_preset_order') or []),
@@ -10840,19 +10859,32 @@ class Api:
         """切换界面语言(写 config ui.lang);前端据返回值重拉 i18n_dict 换文案。"""
         try:
             lg = (lang or '').strip() or 'zh'
+            normalize = getattr(self._i18n, 'normalize_lang', None)
+            if callable(normalize):
+                lg = normalize(lg)
             self._i18n.set_lang(lg)
             return {'ok': True, 'lang': lg, 'error': None}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'error': str(e)}
 
     def i18n_dict(self, lang):
-        """某语言的完整词典(回落补齐后)→ {'ok','lang','dict','error'};供前端一次性注入替换。"""
+        """Return keyed target and zh-source dictionaries for one UI locale."""
         try:
             lg = (lang or '').strip() or 'zh'
-            return {'ok': True, 'lang': lg,
-                    'dict': self._i18n.export_for_js(lg), 'error': None}
+            bundle = getattr(self._i18n, 'export_bundle_for_js', None)
+            if callable(bundle):
+                payload = dict(bundle(lg))
+                lg = payload.get('lang') or lg
+                target = payload.get('dict') or {}
+                source = payload.get('source') or {}
+            else:                                       # compatibility seam
+                target = self._i18n.export_for_js(lg)
+                source = self._i18n.export_for_js('zh')
+            return {'ok': True, 'lang': lg, 'dict': target,
+                    'source': source, 'error': None}
         except Exception as e:                            # noqa: BLE001
-            return {'ok': False, 'lang': lang, 'dict': {}, 'error': str(e)}
+            return {'ok': False, 'lang': lang, 'dict': {}, 'source': {},
+                    'error': str(e)}
 
     # ── 论文出图:图表预设画廊 + 一键出图(数据后端装配) ───────────────────────
     def figure_presets(self):
@@ -10868,13 +10900,22 @@ class Api:
                     thumb = ''
                 presets.append({
                     'key': key, 'name': p.get('name'), 'category': p.get('category'),
+                    'name_en': p.get('name_en') or '',
+                    'category_en': p.get('category_en') or '',
                     'description': p.get('description', ''),
+                    'description_en': p.get('description_en') or '',
                     'required_data': p.get('required_data', ''),
+                    'required_data_en': p.get('required_data_en') or '',
                     'thumbnail_svg': thumb,
                     'params_schema': p.get('params_schema') or {},
                 })
+            categories = fp.categories()
+            category_en = getattr(fp, 'CATEGORY_EN', {})
             return {'ok': True, 'presets': presets,
-                    'categories': fp.categories(), 'error': None}
+                    'categories': categories,
+                    'categories_en': [category_en.get(value, value)
+                                      for value in categories],
+                    'error': None}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'presets': [], 'categories': [], 'error': str(e)}
 
@@ -12480,31 +12521,73 @@ class Api:
                 rows = [t for t in rows if t.get('key') == str(active_calculation)]
             tasks = []
             cap_view = self._engine_capability_view(engine_key, sc)
+            engine_contracts_en = {
+                'vasp': {
+                    'requires': 'POSCAR / INCAR / POTCAR / KPOINTS',
+                    'outputs': 'Task-specific VASP evidence such as OUTCAR, OSZICAR, and vasprun.xml',
+                },
+                'cp2k': {
+                    'requires': 'POSCAR → cp2k.inp',
+                    'outputs': 'cp2k.out (total energy and convergence status)',
+                },
+                'gaussian': {
+                    'requires': 'Molecular structure → Gaussian .gjf',
+                    'outputs': 'Gaussian .log (energy, convergence, and frequency evidence)',
+                },
+                'castep': {
+                    'requires': 'POSCAR → CASTEP .cell + .param',
+                    'outputs': '.castep (total energy and convergence status)',
+                },
+            }
             for t in rows:
                 cap = self._ta().capability(t['key'])
                 non_vasp = engine_key != 'vasp'
                 engine_name = self._ENGINE_DISPLAY.get(engine_key, engine_key.upper())
                 tasks.append({
                     'key': t['key'], 'name_zh': t.get('name_zh', t['key']),
+                    'name_en': t.get('name_en', ''),
                     'category': t.get('category', ''),
+                    'category_en': t.get('category_en', ''),
                     'description': t.get('description', ''),
+                    'description_en': t.get('description_en', ''),
                     'requires': (cap_view.get('input_contract', '') if non_vasp
                                  else t.get('requires', '')),
+                    'requires_en': (engine_contracts_en.get(engine_key, {}).get('requires', '')
+                                    if non_vasp else t.get('requires_en', '')),
                     'outputs': (cap_view.get('result_contract', '') if non_vasp
                                 else t.get('outputs', '')),
+                    'outputs_en': (engine_contracts_en.get(engine_key, {}).get('outputs', '')
+                                   if non_vasp else t.get('outputs_en', '')),
                     'figure': t.get('figure'),
                     'builder_ref': t.get('builder_ref', ''),
                     'kind_badge': ('引擎输入生成' if non_vasp
                                    else self._task_badge(t.get('builder_ref', ''))),
+                    'kind_badge_en': ('Engine input generator' if non_vasp else {
+                        'INCAR 顾问': 'INCAR advisor',
+                        '结果计算器': 'Result calculator',
+                        '作业生成': 'Job generator',
+                    }.get(self._task_badge(t.get('builder_ref', '')), 'Job generator')),
                     'analysis_status': cap['analysis_status'],
                     'report_supported': cap['report_supported'],
                     'next_action': (f'在生成输入页填写 {engine_name} 专属字段，生成并纳管后到任务页提交。'
                                     if non_vasp else cap['next_action']),
+                    'next_action_en': (
+                        f'Complete the {engine_name} fields on Generate inputs, create and register '
+                        'the job, then submit it from Jobs.' if non_vasp else
+                        t.get('next_action_en') or
+                        'Continue from the applicable task page to run the job, inspect its evidence, '
+                        'and publish only supported outputs.'),
                     'engine': engine_key,
                 })
             categories = [c for c in tc.CATEGORIES
                           if any(t.get('category') == c for t in rows)]
+            categories_en = []
+            for category in categories:
+                translated = next((str(t.get('category_en') or '') for t in rows
+                                   if t.get('category') == category and t.get('category_en')), '')
+                categories_en.append(translated or category)
             return {'ok': True, 'categories': categories,
+                    'categories_en': categories_en,
                     'tasks': tasks, 'engine': engine_key,
                     'capability': cap_view, 'error': None}
         except Exception as e:                            # noqa: BLE001

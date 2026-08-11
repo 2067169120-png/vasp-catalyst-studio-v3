@@ -4,6 +4,8 @@
 'use strict';
 (function () {
   const $ = id => document.getElementById(id);
+  const tr = (key, fallback, params) => typeof VCS.t === 'function'
+    ? VCS.t(key, params || {}, fallback) : fallback;
   const State = { deps: [], runtimeInstallSupported: true, installNote: '' };
   const RECOMMENDED = new Set(['rdkit', 'matplotlib', 'python-docx', 'pypdf']);
 
@@ -69,14 +71,19 @@
     intro.className = State.runtimeInstallSupported ? 'sub' : 'warn-banner';
     intro.textContent = State.runtimeInstallSupported
       ? '三步即可：1. 复制推荐命令；2. 在 PowerShell / 终端粘贴并回车；3. 重启软件后点“重新检测”。'
-      : (State.installNote || '当前是单文件 EXE，运行时无法把新包装入 EXE。') +
-        ' 下方命令仅用于源码版 Python 环境，不会改造当前 EXE。';
+      : tr('dependencies.frozen.source_only',
+        '{note} 下方命令仅用于源码版 Python 环境，不会改造当前 EXE。', {
+          note: State.installNote || tr('dependencies.frozen.default_note',
+            '当前是单文件 EXE，运行时无法把新包装入 EXE。'),
+        });
     box.appendChild(intro);
     const installed = installable.filter(d => d.available).length;
     const status = document.createElement('div');
     status.className = 'deps-command-status';
-    status.textContent = `Python 组件已安装 ${installed}/${installable.length}；` +
-      '默认不选体积很大的 DECIMER。';
+    status.textContent = tr('dependencies.installed_summary',
+      'Python 组件已安装 {installed}/{total}；默认不选体积很大的 DECIMER。', {
+        installed, total: installable.length,
+      });
     box.appendChild(status);
     const matplotlib = State.deps.find(d => d.key === 'matplotlib');
     const readiness = document.createElement('div');
@@ -170,14 +177,19 @@
     set('ov-used30', r.used_core_hours_30d != null ? Math.round(r.used_core_hours_30d) : '—');
     const usedEl = $('ov-used30');
     if (usedEl) {
-      usedEl.title = '实耗 =(RUNNING→终态)时长 × 提交核数;在跑作业实时累计'
-        + (r.usage_unknown_n ? ';另有 ' + r.usage_unknown_n + ' 个作业缺核数/时间戳未计入' : '');
+      const unknown = r.usage_unknown_n ? tr('overview.usage.unknown_suffix',
+        '；另有 {count} 个作业缺核数/时间戳未计入', { count: r.usage_unknown_n }) : '';
+      usedEl.title = tr('overview.usage.tooltip',
+        '实耗 =（RUNNING→终态）时长 × 提交核数；在跑作业实时累计{unknown}', { unknown });
     }
     set('ov-remain', r.remaining_core_hours != null ? Math.round(r.remaining_core_hours) : '∞');
     const mon = r.monitor || {};
     set('ov-monitor', mon.status || '—');
     const monEl = $('ov-monitor');
-    if (monEl && mon.active) monEl.title = '运行 ' + (mon.running || 0) + ' · 排队 ' + (mon.queued || 0);
+    if (monEl && mon.active) monEl.title = tr('overview.monitor.summary',
+      '运行 {running} · 排队 {queued}', {
+        running: mon.running || 0, queued: mon.queued || 0,
+      });
   }
 
   // ── 初始化 ──

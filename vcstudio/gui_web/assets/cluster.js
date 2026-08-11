@@ -5,6 +5,8 @@
 'use strict';
 (function () {
   const $ = id => document.getElementById(id);
+  const tr = (key, fallback, params) => typeof VCS.t === 'function'
+    ? VCS.t(key, params || {}, fallback) : fallback;
   const State = { profiles: {} };   // name -> profile dict
 
   // ── 表单读写 ────────────────────────────────────────────────────────────────
@@ -131,7 +133,8 @@
         sel.value = profs.some(p => p.name === prev) ? prev : profs[0].name;
       }
     }
-    if (r && r.error) VCS.log('读取集群配置失败:' + r.error, 'failc');
+    if (r && r.error) VCS.log(tr('cluster.load_failed',
+      '读取集群配置失败：{error}', { error: r.error }), 'failc');
     return profs;
   }
 
@@ -142,9 +145,15 @@
     const data = readForm();
     if (!data.name) { VCS.log('集群名称不能为空', 'failc'); return false; }
     const r = await VCS.call('save_profile', data);
-    if (!(r && r.ok)) { VCS.log('保存失败:' + ((r && r.error) || '未知错误'), 'failc'); return false; }
+    if (!(r && r.ok)) {
+      VCS.log(tr('cluster.save_failed', '保存失败：{error}', {
+        error: (r && r.error) || tr('common.unknown_error', '未知错误'),
+      }), 'failc'); return false;
+    }
     await loadProfiles(data.name);
-    VCS.log(`已保存集群「${data.name}」(密码不写入 yaml)`, 'okc');
+    VCS.log(tr('cluster.saved', '已保存集群「{name}」（密码不写入 yaml）', {
+      name: data.name,
+    }), 'okc');
     // 同步作业页集群下拉 + 侧栏底部默认集群(若已加载)
     if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
     if (typeof VCS.refreshNavFoot === 'function') VCS.refreshNavFoot();
@@ -155,11 +164,13 @@
   async function deleteProfile() {
     const name = currentName();
     if (!name || !State.profiles[name]) { VCS.log('没有可删除的集群', 'failc'); return; }
-    const ok = await VCS.confirm(`删除集群「${name}」?`);
+    const ok = await VCS.confirm(tr('cluster.delete_confirm', '删除集群「{name}」？', { name }));
     if (!ok) return;
     const r = await VCS.call('delete_profile', name);
-    if (!(r && r.ok)) { VCS.log('删除失败:「' + name + '」', 'failc'); return; }
-    VCS.log(`已删除集群「${name}」`, 'okc');
+    if (!(r && r.ok)) {
+      VCS.log(tr('cluster.delete_failed', '删除失败：「{name}」', { name }), 'failc'); return;
+    }
+    VCS.log(tr('cluster.deleted', '已删除集群「{name}」', { name }), 'okc');
     const profs = await loadProfiles();
     if (profs.length) fillForm(State.profiles[currentName()]);
     else newProfile();
@@ -185,7 +196,7 @@
       }
     }
 
-    VCS.log(`测试连接「${data.name}」…`);
+    VCS.log(tr('cluster.testing', '测试连接「{name}」…', { name: data.name }));
     let trust = false;
     for (;;) {
       const res = await VCS.call('test_connection', data.name, password, trust);
@@ -201,12 +212,24 @@
         // 探测调度器 vs 表单选择:不一致 → 黄色警告条 + 自动切下拉(用户可改回再保存)
         const chosen = data.scheduler;
         if (res.scheduler && ['Slurm', 'PBS'].indexOf(res.scheduler) < 0) {
-          showWarn(`远端探测到 ${res.scheduler}，当前版本只支持 Slurm / PBS 自动提交；连接可用，但不会允许保存为可提交配置。`);
-          VCS.log(`探测到尚未支持的调度器 ${res.scheduler}；请勿按 Slurm/PBS 误提交`, 'failc');
+          showWarn(tr('cluster.scheduler.unsupported_warning',
+            '远端探测到 {scheduler}，当前版本只支持 Slurm / PBS 自动提交；连接可用，但不会允许保存为可提交配置。', {
+              scheduler: res.scheduler,
+            }));
+          VCS.log(tr('cluster.scheduler.unsupported_log',
+            '探测到尚未支持的调度器 {scheduler}；请勿按 Slurm/PBS 误提交', {
+              scheduler: res.scheduler,
+            }), 'failc');
         } else if (res.scheduler && res.scheduler !== chosen) {
-          showWarn(`远端探测到 ${res.scheduler},与当前选择的 ${chosen} 不一致,已为你选中(可改回再保存)`);
+          showWarn(tr('cluster.scheduler.mismatch_warning',
+            '远端探测到 {detected}，与当前选择的 {chosen} 不一致，已为你选中（可改回再保存）', {
+              detected: res.scheduler, chosen,
+            }));
           if ($('cl-scheduler')) $('cl-scheduler').value = res.scheduler;
-          VCS.log(`探测到调度器 ${res.scheduler}(原选择 ${chosen}),已自动切换下拉;如需保留请改回后重新保存`, 'okc');
+          VCS.log(tr('cluster.scheduler.mismatch_log',
+            '探测到调度器 {detected}（原选择 {chosen}），已自动切换下拉；如需保留请改回后重新保存', {
+              detected: res.scheduler, chosen,
+            }), 'okc');
         } else {
           hideWarn();
         }
@@ -233,7 +256,7 @@
       `<pre class="cl-pre" id="cl-prevtext" style="margin-top:12px;max-height:46vh">正在生成…</pre>`;
 
     const m = VCS.modal({
-      title: `预览提交脚本 — ${VCS.esc(name)}`,
+      title: tr('cluster.preview.title', '预览提交脚本 — {name}', { name }),
       bodyHTML: body,
       actions: [{ label: '关闭', onClick: mm => mm.close() }],
     });
@@ -244,7 +267,9 @@
       pre.textContent = '正在生成…';
       const pr = await VCS.call('preview_script', name, dir);
       pre.textContent = (pr && pr.ok) ? (pr.text || '(空脚本)')
-                                      : ('预览失败:' + ((pr && pr.error) || '未知错误'));
+        : tr('cluster.preview.failed', '预览失败：{error}', {
+          error: (pr && pr.error) || tr('common.unknown_error', '未知错误'),
+        });
     };
     m.el.querySelector('#cl-prevdir').addEventListener('change', render);
     render();

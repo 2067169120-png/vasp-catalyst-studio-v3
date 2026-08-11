@@ -1,9 +1,11 @@
 """Phase C report-workbench DOM, routing, safety and adapter contracts."""
+import json
 from pathlib import Path
 import re
 
 
 ASSETS = Path(__file__).resolve().parents[1] / "vcstudio" / "gui_web" / "assets"
+LOCALES = ASSETS.parents[1] / "shared" / "locales"
 
 
 def _source(name):
@@ -106,12 +108,53 @@ def test_capabilities_fail_closed_and_each_format_has_independent_status():
     js = _source("report-workbench.js")
 
     assert "record.available === true" in js
-    assert "available: false, reason: '服务端未明确确认此格式可用。'" in js
+    assert "reason: record ? String(record.reason || '') : '服务端未明确确认此格式可用。'" in js
     assert "selectedFormatsAreAvailable()" in js
     for fmt in ("html", "docx", "pdf", "model_json", "validation_json", "manifest"):
         assert f'data-format="{fmt}"' in html
     assert "State.spec.formats.forEach(format => formatState(format, '生成中', 'busy'))" in js
     assert "State.spec.formats.forEach(format => formatState(format, '生成失败', 'bad'))" in js
+
+
+def test_render_availability_and_accessibility_are_independent_and_visible():
+    js = _source("report-workbench.js")
+    capabilities = js[js.index("function normalizeAccessibility(") :
+                      js.index("function selectedFormatsAreAvailable(")]
+    formats = js[js.index("function renderFormats(") :
+                 js.index("function syncSimpleControls(")]
+
+    assert "capabilityResult && capabilityResult.accessibility" in capabilities
+    assert "plain(catalog.formats)" in capabilities
+    assert "plain(source[format]).accessibility" in capabilities
+    assert "available: record ? record.available === true : false" in capabilities
+    assert "accessibility: normalizeAccessibility" in capabilities
+    for field in (
+        "visual", "searchable", "semantic_structure", "document_language",
+        "metadata", "image_alt", "tagged", "pdf_ua", "manual_review_required",
+    ):
+        assert f"'{field}'" in capabilities
+    assert "report.accessibility.summary" in capabilities
+    en = json.loads((LOCALES / "en.json").read_text(encoding="utf-8"))
+    zh = json.loads((LOCALES / "zh.json").read_text(encoding="utf-8"))
+    assert en["report.accessibility.summary"].startswith("Accessibility:")
+    assert zh["report.accessibility.summary"].startswith("可访问性：")
+    assert "data-accessibility-status" in formats
+    assert "accessibilitySummary(accessibility)" in formats
+    assert "生成可用" in formats and "Rendering available" in formats
+    assert "input.disabled = capability.available !== true" in formats
+
+
+def test_interface_language_is_independent_from_report_output_locale():
+    js = _source("report-workbench.js")
+    labels = js[js.index("function uiIsEnglish("):
+                js.index("function normalizeHistory(")]
+    accessibility = js[js.index("function accessibilitySummary("):
+                       js.index("function explicitCapabilities(")]
+
+    assert "VCS.i18n && VCS.i18n.lang === 'en'" in labels
+    assert "State.spec && State.spec.locale" not in labels
+    assert "State.spec && State.spec.locale" not in accessibility
+    assert "document.addEventListener('vcs:language'" in js
 
 
 def test_report_routes_share_the_new_page_and_strict_query_contract():
