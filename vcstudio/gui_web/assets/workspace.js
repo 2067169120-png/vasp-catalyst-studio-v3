@@ -14,14 +14,15 @@
   const JOB_TOKEN = /^[A-Za-z0-9._~:-]{1,160}$/;
   const ROUTE_TOKEN = /^[a-z0-9][a-z0-9._-]{0,79}$/;
   const JOB_STATUS_FILTERS = new Set(['queue', 'run', 'need', 'done', 'fail']);
+  const REPORT_QUERY_KEYS = new Set(['project', 'spec', 'revision']);
   const ROUTE_QUERY_KEYS = Object.freeze({
     'run-jobs': new Set(['status', 'cluster']),
     'publish-figures': new Set(['project']),
-    'publish-report': new Set(['project']),
-    'publish-si': new Set(['project']),
-    'publish-draftpack': new Set(['project']),
-    'publish-versions': new Set(['project']),
-    'publish-export': new Set(['project']),
+    'publish-report': REPORT_QUERY_KEYS,
+    'publish-si': REPORT_QUERY_KEYS,
+    'publish-draftpack': REPORT_QUERY_KEYS,
+    'publish-versions': REPORT_QUERY_KEYS,
+    'publish-export': REPORT_QUERY_KEYS,
   });
 
   const ROUTES = Object.freeze({
@@ -67,19 +68,21 @@
 
     'publish-figures': { area: 'publish', page: 'figures', label: '图表',
       path: c => `/publish/figures?project=${encodeURIComponent(projectToken(c))}` },
-    'publish-report': { area: 'publish', page: 'project', label: '报告',
+    'publish-report': { area: 'publish', page: 'report-workbench', label: '报告',
       path: c => `/publish/report?project=${encodeURIComponent(projectToken(c))}`,
-      analysis: 'adsorption', focus: '#pj-report' },
-    'publish-si': { area: 'publish', page: 'project', label: '补充信息',
+      reportMode: 'report', focus: '#rw-title' },
+    'publish-si': { area: 'publish', page: 'report-workbench', label: '补充信息',
       path: c => `/publish/si?project=${encodeURIComponent(projectToken(c))}`,
-      analysis: 'draft', focus: '#pj-draft' },
-    'publish-draftpack': { area: 'publish', page: 'project', label: '草稿包',
+      reportMode: 'si', focus: '#rw-step-button-outline' },
+    'publish-draftpack': { area: 'publish', page: 'report-workbench', label: '草稿包',
       path: c => `/publish/draftpack?project=${encodeURIComponent(projectToken(c))}`,
-      analysis: 'draft', focus: '#pj-draft' },
-    'publish-versions': { area: 'publish', page: 'project', label: '版本',
-      path: c => `/publish/versions?project=${encodeURIComponent(projectToken(c))}` },
-    'publish-export': { area: 'publish', page: 'figures', label: '导出与归档',
-      path: c => `/publish/export?project=${encodeURIComponent(projectToken(c))}` },
+      reportMode: 'draftpack', focus: '#rw-step-button-export' },
+    'publish-versions': { area: 'publish', page: 'report-workbench', label: '版本',
+      path: c => `/publish/versions?project=${encodeURIComponent(projectToken(c))}`,
+      reportMode: 'versions', focus: '#rw-history-heading' },
+    'publish-export': { area: 'publish', page: 'report-workbench', label: '导出与归档',
+      path: c => `/publish/export?project=${encodeURIComponent(projectToken(c))}`,
+      reportMode: 'export', focus: '#rw-step-button-export' },
 
     'environment-cluster': { area: 'environment', page: 'cluster', label: '集群',
       path: () => '/environment/cluster' },
@@ -185,6 +188,11 @@
   function safeQueryValue(key, value) {
     const name = String(key || '');
     if (name === 'project') return safeToken(value, PROJECT_TOKEN);
+    if (name === 'spec') return safeToken(value, PROJECT_TOKEN);
+    if (name === 'revision') {
+      const out = String(value || '').trim();
+      return /^[1-9][0-9]{0,8}$/.test(out) ? out : '';
+    }
     if (name === 'status') {
       const status = safeToken(value, JOB_TOKEN);
       return JOB_STATUS_FILTERS.has(status) ? status : '';

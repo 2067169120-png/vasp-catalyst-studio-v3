@@ -8,6 +8,7 @@ different Windows drives.
 """
 from __future__ import annotations
 
+import base64
 import copy
 import errno
 import hashlib
@@ -32,6 +33,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 BUNDLE_SCHEMA = "vcstudio.paper-report.bundle/v2"
 MODEL_SCHEMA = "vcstudio.paper-report.model/v2"
+PREVIEW_SCHEMA = "vcstudio.paper-report.html-preview/v1"
 _LEGACY_MODEL_SCHEMA = "vcstudio.paper-report.model/v1"
 _REPORT_KINDS = ("diagnostic", "final", "draft")
 _QUALIFICATION_LEVELS = (
@@ -63,11 +65,53 @@ _VALIDATION_STATUSES = {"passed", "passed_with_warnings", "blocked", "unknown"}
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
 _CONTENT_FINGERPRINT_KEYS = (
     "report_kind", "scientific_qualification", "claim_ceiling",
+    "template_ref",
     "locale", "outline", "title", "subtitle", "kicker", "metadata",
     "executive_summary", "key_findings", "candidate_evaluations",
     "adsorption_table", "comparison_table", "figures", "methods",
     "limitations", "recommendations", "comparison_context",
 )
+_REPORT_THEMES = {
+    "academic-a4": {
+        "ink": "#17212B",
+        "muted": "#66717C",
+        "accent": "#1F4F64",
+        "highlight": "#8A6A2E",
+        "rule": "#23313A",
+        "title": "#203846",
+        "subtitle": "#435866",
+        "caption": "#39464E",
+        "screen": "#E9ECEF",
+        "page_margin_mm": 23,
+        "cover_spacer_mm": 43,
+    },
+    "compact-brief": {
+        "ink": "#132A2E",
+        "muted": "#526A6D",
+        "accent": "#0F766E",
+        "highlight": "#0F766E",
+        "rule": "#134E4A",
+        "title": "#123F3C",
+        "subtitle": "#355E5A",
+        "caption": "#355E5A",
+        "screen": "#E7EFEE",
+        "page_margin_mm": 18,
+        "cover_spacer_mm": 26,
+    },
+    "diagnostic-a4": {
+        "ink": "#2B2118",
+        "muted": "#756353",
+        "accent": "#9A3412",
+        "highlight": "#B45309",
+        "rule": "#7C2D12",
+        "title": "#7C2D12",
+        "subtitle": "#795548",
+        "caption": "#6B4F3F",
+        "screen": "#F3ECE6",
+        "page_margin_mm": 23,
+        "cover_spacer_mm": 38,
+    },
+}
 _SECTION_LABELS = {
     "en-US": {
         "executive_summary": "Executive Summary",
@@ -362,6 +406,56 @@ def render_report_bundle(
     }
 
 
+def render_report_html_preview(model: Mapping[str, Any]) -> dict:
+    """Render a deterministic, self-contained HTML preview without publishing.
+
+    Preview is deliberately a separate seam from :func:`render_report_bundle`:
+    it performs the same model normalization, full-contract validation, section
+    planning and HTML rendering, but never creates an output directory, model or
+    contract sidecars, a manifest, a marker, history, or a report revision.  Any
+    figures are read once and embedded as ``data:`` URIs so the returned payload
+    contains no source or temporary filesystem path.
+
+    ``ReportSpec.formats`` describes the eventual publication request, not the
+    transport used to inspect this preview.  Consequently the normalizer is
+    invoked without a requested-format override; a later formal publication will
+    still enforce the exact requested format set and its dependencies.
+    """
+    if not isinstance(model, Mapping):
+        raise TypeError("model must be a mapping")
+
+    normalized = _normalize_model(dict(model))
+    preview_model = _inline_preview_figures(normalized)
+    report_model_sha256 = _sha256_json(_content_fingerprint(preview_model))
+    declared_report_model_sha256 = _text(
+        (normalized.get("validation") or {}).get("report_model_sha256")
+    ).lower()
+    if (declared_report_model_sha256
+            and declared_report_model_sha256 != report_model_sha256):
+        raise ValueError(
+            "rendered report content conflicts with "
+            "ValidationResult.report_model_sha256"
+        )
+
+    model_sha256 = _sha256_json(_fingerprint_model(preview_model))
+    return {
+        "schema": PREVIEW_SCHEMA,
+        "artifact_status": "preview",
+        "html": _html_document(preview_model),
+        "model_sha256": model_sha256,
+        "report_model_sha256": report_model_sha256,
+        "report_id": preview_model["report_id"],
+        "report_kind": preview_model["report_kind"],
+        "scientific_status": preview_model["scientific_status"],
+        "scientific_qualification": preview_model["scientific_qualification"],
+        "claim_ceiling": preview_model["claim_ceiling"],
+        "input_fingerprint": preview_model["input_fingerprint"],
+        "preset_id": preview_model["preset_id"],
+        "contract_status": preview_model["contract_status"],
+        "contract_refs": _json_safe(preview_model["contract_refs"]),
+    }
+
+
 def _validate_stem(stem: str) -> str:
     value = str(stem).strip()
     if (
@@ -568,6 +662,7 @@ def report_content_sha256(model: Mapping[str, Any], *, outline=None) -> str:
         "scientific_qualification": _normalize_qualification(
             model.get("scientific_qualification"), "diagnostic"),
         "claim_ceiling": _text(model.get("claim_ceiling")),
+        "template_ref": _json_safe(model.get("template_ref")),
     })
     prepared_figures = []
     for figure in normalized["figures"]:
@@ -1219,6 +1314,46 @@ def _stage_figures(model: dict, assets_dir: Path, formats: Sequence[str]) -> tup
     return result, list(records_by_digest.values())
 
 
+def _inline_preview_figures(model: dict) -> dict:
+    """Return an HTML-ready model whose figures are content-addressed data URIs."""
+    result = dict(model)
+    result["figures"] = []
+    encoded_by_digest: dict[str, tuple[str, str]] = {}
+
+    for index, figure in enumerate(model["figures"], 1):
+        source = figure["_source_path"]
+        if not source.is_file():
+            # Do not disclose a local source locator through a preview error.
+            raise FileNotFoundError(
+                f"figure {index} does not exist or is not a regular file"
+            )
+        payload = source.read_bytes()
+        digest = hashlib.sha256(payload).hexdigest()
+        encoded = encoded_by_digest.get(digest)
+        if encoded is None:
+            media_type = mimetypes.guess_type(source.name)[0]
+            if not media_type or not media_type.startswith("image/"):
+                raise ValueError(
+                    f"figure {index} has no browser-safe image media type"
+                )
+            data_uri = (
+                f"data:{media_type};base64,"
+                + base64.b64encode(payload).decode("ascii")
+            )
+            encoded = (data_uri, media_type)
+            encoded_by_digest[digest] = encoded
+
+        staged = {
+            key: value for key, value in figure.items() if not key.startswith("_")
+        }
+        staged.update({
+            "asset_path": encoded[0],
+            "asset_sha256": digest,
+        })
+        result["figures"].append(staged)
+    return result
+
+
 def _commit_assets(source_dir: Path, destination_dir: Path, records: Sequence[dict]) -> list[Path]:
     if not records:
         return []
@@ -1429,6 +1564,9 @@ def _content_fingerprint(model: Mapping[str, Any]) -> dict:
     payload = {}
     for key in _CONTENT_FINGERPRINT_KEYS:
         value = model.get(key)
+        if key == "template_ref":
+            payload[key] = _reference_semantic_value(value)
+            continue
         if key != "figures":
             payload[key] = _json_safe(value)
             continue
@@ -1448,6 +1586,31 @@ def _content_fingerprint(model: Mapping[str, Any]) -> dict:
 
 
 def _render_html(model: dict, output: Path) -> None:
+    output.write_text(_html_document(model), encoding="utf-8")
+
+
+def _report_theme_id(model: Mapping[str, Any]) -> str:
+    reference = model.get("template_ref")
+    raw = _text(reference.get("id")) if isinstance(reference, Mapping) else ""
+    if raw.startswith("vcstudio-"):
+        raw = raw[len("vcstudio-"):]
+    return raw if raw in _REPORT_THEMES else "academic-a4"
+
+
+def _report_theme(model: Mapping[str, Any]) -> dict[str, Any]:
+    return dict(_REPORT_THEMES[_report_theme_id(model)])
+
+
+def _hex_rgb(value: str) -> tuple[int, int, int]:
+    text = str(value or "").lstrip("#")
+    if not re.fullmatch(r"[0-9A-Fa-f]{6}", text):
+        raise ValueError(f"invalid report theme color: {value!r}")
+    return tuple(int(text[index:index + 2], 16) for index in (0, 2, 4))
+
+
+def _html_document(model: dict) -> str:
+    theme_id = _report_theme_id(model)
+    theme = _report_theme(model)
     sections = _section_plan(model)
     metadata = "".join(
         "<div class='meta-row'><dt>{}</dt><dd>{}</dd></div>".format(
@@ -1498,22 +1661,25 @@ def _render_html(model: dict, output: Path) -> None:
 <style>
 @page {{
   size: A4 portrait;
-  margin: 22mm 23mm 20mm;
+  margin: 22mm {theme['page_margin_mm']}mm 20mm;
   @top-left {{ content: "{_css_string(model['kicker'])}"; color: #6b7280; font-size: 8pt; }}
   @bottom-right {{ content: {_page_counter_css(model['locale'])}; color: #6b7280; font-size: 8pt; }}
 }}
-:root {{ --ink:#17212b; --muted:#66717c; --accent:#1f4f64; --rule:#23313a; }}
+:root {{ --ink:{theme['ink']}; --muted:{theme['muted']};
+  --accent:{theme['accent']}; --highlight:{theme['highlight']};
+  --rule:{theme['rule']}; --title:{theme['title']};
+  --subtitle:{theme['subtitle']}; --caption:{theme['caption']}; }}
 * {{ box-sizing:border-box; }}
 body {{
-  margin:0; color:var(--ink); background:#e9ecef;
+  margin:0; color:var(--ink); background:{theme['screen']};
   font-family:"Noto Serif CJK SC","Songti SC",SimSun,"Times New Roman",serif;
   font-size:10.5pt; line-height:1.68;
 }}
 .paper {{ width:210mm; min-height:297mm; margin:18px auto; background:#fff;
-  padding:22mm 23mm 20mm; box-shadow:0 8px 30px rgba(30,41,59,.12); }}
+  padding:22mm {theme['page_margin_mm']}mm 20mm; box-shadow:0 8px 30px rgba(30,41,59,.12); }}
 .cover {{ min-height:248mm; display:flex; flex-direction:column; justify-content:center;
   text-align:center; page-break-after:always; }}
-.kicker {{ margin:0 0 16mm; color:#8a6a2e; font:700 9pt/1.2 Arial,sans-serif;
+.kicker {{ margin:0 0 16mm; color:var(--highlight); font:700 9pt/1.2 Arial,sans-serif;
   letter-spacing:.18em; text-transform:uppercase; }}
 .report-status {{ align-self:center; margin:0 0 6mm; padding:2.2mm 5mm;
   border:1px solid #9ca3af; border-radius:999px; color:#4b5563;
@@ -1521,8 +1687,8 @@ body {{
 .report-status[data-kind="final"] {{ border-color:#15803d; background:#f0fdf4; color:#166534; }}
 .report-status[data-kind="diagnostic"] {{ border-color:#b45309; background:#fffbeb; color:#92400e; }}
 .report-status[data-kind="draft"] {{ border-color:#64748b; background:#f8fafc; color:#475569; }}
-h1 {{ margin:0; color:#203846; font-size:29pt; line-height:1.22; font-weight:600; }}
-.subtitle {{ margin:5mm auto 0; max-width:135mm; color:#435866; font-size:14pt; line-height:1.5; }}
+h1 {{ margin:0; color:var(--title); font-size:29pt; line-height:1.22; font-weight:600; }}
+.subtitle {{ margin:5mm auto 0; max-width:135mm; color:var(--subtitle); font-size:14pt; line-height:1.5; }}
 .metadata {{ width:min(125mm,100%); margin:25mm auto 0; padding-top:6mm;
   border-top:.8pt solid #b7c0c7; }}
 .meta-row {{ display:grid; grid-template-columns:35mm 1fr; gap:5mm; text-align:left;
@@ -1532,14 +1698,14 @@ h1 {{ margin:0; color:#203846; font-size:29pt; line-height:1.22; font-weight:600
 .meta-row dd {{ margin:0; }}
 section {{ margin:0 0 10mm; break-inside:auto; }}
 h2 {{ display:flex; align-items:baseline; gap:4mm; margin:12mm 0 4mm;
-  color:#203846; font-size:16pt; line-height:1.25; font-weight:600;
+  color:var(--title); font-size:16pt; line-height:1.25; font-weight:600;
   border-bottom:.6pt solid #c4ccd1; padding-bottom:2mm; }}
-h2 span {{ color:#8a6a2e; font:700 8.5pt/1 Arial,sans-serif; letter-spacing:.08em; }}
-h3 {{ margin:5mm 0 1.5mm; color:#2f5365; font-size:11.5pt; }}
+h2 span {{ color:var(--highlight); font:700 8.5pt/1 Arial,sans-serif; letter-spacing:.08em; }}
+h3 {{ margin:5mm 0 1.5mm; color:var(--accent); font-size:11.5pt; }}
 p {{ margin:0 0 3.2mm; text-align:justify; }}
 ol.findings {{ margin:0; padding-left:7mm; }}
 ol.findings li {{ margin:0 0 3mm; padding-left:2mm; }}
-ol.findings li strong {{ color:#2f5365; }}
+ol.findings li strong {{ color:var(--accent); }}
 table.three-line {{ width:100%; border-collapse:collapse; table-layout:auto;
   margin:1mm 0 2mm; border-top:1.4pt solid var(--rule); border-bottom:1.4pt solid var(--rule);
   font-size:9.2pt; }}
@@ -1553,7 +1719,7 @@ table.three-line td.numeric, table.three-line th.numeric {{ text-align:right; }}
 .table-note {{ margin:1mm 0 0; color:var(--muted); font-size:8.5pt; text-align:left; }}
 figure {{ margin:6mm auto 9mm; break-inside:avoid; text-align:center; }}
 figure img {{ display:block; max-width:100%; max-height:150mm; margin:0 auto; object-fit:contain; }}
-figcaption {{ margin-top:2.5mm; color:#39464e; font-size:9pt; line-height:1.45; text-align:center; }}
+figcaption {{ margin-top:2.5mm; color:var(--caption); font-size:9pt; line-height:1.45; text-align:center; }}
 .screen-running {{ display:none; }}
 @media print {{
   body {{ background:#fff; }}
@@ -1565,7 +1731,7 @@ figcaption {{ margin-top:2.5mm; color:#39464e; font-size:9pt; line-height:1.45; 
 }}
 </style>
 </head>
-<body>
+<body data-report-theme="{theme_id}">
 <main class="paper">
 <header class="cover">
   <p class="kicker">{kicker}</p>
@@ -1579,7 +1745,7 @@ figcaption {{ margin-top:2.5mm; color:#39464e; font-size:9pt; line-height:1.45; 
 </body>
 </html>
 """
-    output.write_text(document, encoding="utf-8")
+    return document
 
 
 def _html_blocks(blocks: Sequence[dict], *, ordered: bool) -> str:
@@ -1632,14 +1798,21 @@ def _render_docx(model: dict, output: Path) -> None:
     from docx.oxml.ns import qn
     from docx.shared import Inches, Mm, Pt, RGBColor
 
+    theme = _report_theme(model)
+    title_color = _hex_rgb(theme["title"])
+    accent_color = _hex_rgb(theme["accent"])
+    muted_color = _hex_rgb(theme["muted"])
+    caption_color = _hex_rgb(theme["caption"])
+    highlight_color = _hex_rgb(theme["highlight"])
+    ink_color = _hex_rgb(theme["ink"])
     doc = Document()
     section = doc.sections[0]
     section.page_width = Mm(210)
     section.page_height = Mm(297)
     section.top_margin = Mm(22)
     section.bottom_margin = Mm(20)
-    section.left_margin = Mm(23)
-    section.right_margin = Mm(23)
+    section.left_margin = Mm(theme["page_margin_mm"])
+    section.right_margin = Mm(theme["page_margin_mm"])
     section.header_distance = Mm(10)
     section.footer_distance = Mm(10)
 
@@ -1666,9 +1839,9 @@ def _render_docx(model: dict, output: Path) -> None:
     normal.paragraph_format.space_after = Pt(6)
     normal.paragraph_format.line_spacing = 1.25
     for name, size, before, after, color in (
-        ("Heading 1", 16, 18, 8, (32, 56, 70)),
-        ("Heading 2", 13, 12, 6, (47, 83, 101)),
-        ("Heading 3", 11.5, 8, 4, (47, 83, 101)),
+        ("Heading 1", 16, 18, 8, title_color),
+        ("Heading 2", 13, 12, 6, accent_color),
+        ("Heading 3", 11.5, 8, 4, accent_color),
     ):
         style = styles[name]
         style.font.name = "Times New Roman"
@@ -1683,7 +1856,7 @@ def _render_docx(model: dict, output: Path) -> None:
     caption_style.font.name = "Times New Roman"
     caption_style.font.size = Pt(9)
     caption_style.font.italic = False
-    caption_style.font.color.rgb = RGBColor(57, 70, 78)
+    caption_style.font.color.rgb = RGBColor(*caption_color)
     caption_style._element.get_or_add_rPr().rFonts.set(qn("w:eastAsia"), "SimSun")
     caption_style.paragraph_format.space_before = Pt(4)
     caption_style.paragraph_format.space_after = Pt(5)
@@ -1693,14 +1866,14 @@ def _render_docx(model: dict, output: Path) -> None:
     header.alignment = WD_ALIGN_PARAGRAPH.LEFT
     header.paragraph_format.space_after = Pt(0)
     run = header.add_run(f"{model['kicker'].upper()}  ·  {model['title']}")
-    set_font(run, name="Arial", east_asia="Microsoft YaHei", size=8, color=(103, 113, 121))
+    set_font(run, name="Arial", east_asia="Microsoft YaHei", size=8, color=muted_color)
 
     footer = section.footer.paragraphs[0]
     footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
     footer.paragraph_format.space_before = Pt(0)
     page_prefix = "第 " if model["locale"] == "zh-CN" else "Page "
     run = footer.add_run(page_prefix)
-    set_font(run, name="Arial", east_asia="Microsoft YaHei", size=8, color=(103, 113, 121))
+    set_font(run, name="Arial", east_asia="Microsoft YaHei", size=8, color=muted_color)
     _append_word_field(run, "PAGE", OxmlElement)
     if model["locale"] == "zh-CN":
         suffix = footer.add_run(" 页")
@@ -1709,7 +1882,7 @@ def _render_docx(model: dict, output: Path) -> None:
             name="Arial",
             east_asia="Microsoft YaHei",
             size=8,
-            color=(103, 113, 121),
+            color=muted_color,
         )
 
     doc.core_properties.title = model["title"]
@@ -1718,7 +1891,7 @@ def _render_docx(model: dict, output: Path) -> None:
     doc.core_properties.keywords = "scientific report; adsorption energy; catalysis"
 
     spacer = doc.add_paragraph()
-    spacer.paragraph_format.space_after = Pt(76)
+    spacer.paragraph_format.space_after = Pt(theme["cover_spacer_mm"] * 2.2)
     kicker = doc.add_paragraph()
     kicker.alignment = WD_ALIGN_PARAGRAPH.CENTER
     kicker.paragraph_format.space_after = Pt(20)
@@ -1728,7 +1901,7 @@ def _render_docx(model: dict, output: Path) -> None:
         east_asia="Microsoft YaHei",
         size=9,
         bold=True,
-        color=(138, 106, 46),
+        color=highlight_color,
     )
     status = doc.add_paragraph()
     status.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -1749,12 +1922,12 @@ def _render_docx(model: dict, output: Path) -> None:
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     title.paragraph_format.space_after = Pt(10)
-    set_font(title.add_run(model["title"]), size=29, bold=True, color=(32, 56, 70))
+    set_font(title.add_run(model["title"]), size=29, bold=True, color=title_color)
     if model["subtitle"]:
         subtitle = doc.add_paragraph()
         subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
         subtitle.paragraph_format.space_after = Pt(28)
-        set_font(subtitle.add_run(model["subtitle"]), size=14, color=(67, 88, 102))
+        set_font(subtitle.add_run(model["subtitle"]), size=14, color=_hex_rgb(theme["subtitle"]))
     for item in model["metadata"]:
         paragraph = doc.add_paragraph()
         paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -1765,9 +1938,9 @@ def _render_docx(model: dict, output: Path) -> None:
             east_asia="Microsoft YaHei",
             size=8,
             bold=True,
-            color=(103, 113, 121),
+            color=muted_color,
         )
-        set_font(paragraph.add_run(item["value"]), size=9.5, color=(32, 45, 54))
+        set_font(paragraph.add_run(item["value"]), size=9.5, color=ink_color)
     doc.add_page_break()
 
     sections = _section_plan(model)
@@ -1791,6 +1964,7 @@ def _render_docx(model: dict, output: Path) -> None:
                 OxmlElement,
                 WD_ALIGN_PARAGRAPH,
                 WD_CELL_VERTICAL_ALIGNMENT,
+                theme["rule"].lstrip("#"),
             )
         elif key == "figures":
             for figure in model["figures"]:
@@ -1947,6 +2121,7 @@ def _docx_add_table(
     element_factory,
     paragraph_alignment,
     vertical_alignment,
+    rule_color,
 ) -> None:
     from docx.shared import Pt
 
@@ -1958,14 +2133,14 @@ def _docx_add_table(
     table = doc.add_table(rows=1, cols=len(columns))
     table.autofit = False
     _set_table_geometry(table, widths, qn, element_factory)
-    _set_three_line_table(table, qn, element_factory)
+    _set_three_line_table(table, qn, element_factory, rule_color)
     _repeat_table_header(table.rows[0], qn, element_factory)
     for index, column in enumerate(columns):
         cell = table.rows[0].cells[index]
         cell.vertical_alignment = vertical_alignment.CENTER
         _set_cell_width(cell, widths[index], qn, element_factory)
         _set_cell_margins(cell, qn, element_factory)
-        _set_cell_border(cell, "bottom", 8, "23313A", qn, element_factory)
+        _set_cell_border(cell, "bottom", 8, rule_color, qn, element_factory)
         paragraph = cell.paragraphs[0]
         paragraph.alignment = _docx_alignment(column, table_model["rows"], index, paragraph_alignment)
         paragraph.paragraph_format.space_before = Pt(0)
@@ -1976,7 +2151,7 @@ def _docx_add_table(
             east_asia="Microsoft YaHei",
             size=8.5,
             bold=True,
-            color=(35, 49, 58),
+            color=_hex_rgb(f"#{rule_color}"),
         )
     for row_values in table_model["rows"]:
         cells = table.add_row().cells
@@ -2032,7 +2207,7 @@ def _set_table_geometry(table, widths, qn, element_factory) -> None:
         grid.append(col)
 
 
-def _set_three_line_table(table, qn, element_factory) -> None:
+def _set_three_line_table(table, qn, element_factory, rule_color) -> None:
     properties = table._tbl.tblPr
     borders = properties.find(qn("w:tblBorders"))
     if borders is None:
@@ -2046,7 +2221,7 @@ def _set_three_line_table(table, qn, element_factory) -> None:
         if edge in {"top", "bottom"}:
             node.set(qn("w:val"), "single")
             node.set(qn("w:sz"), "12")
-            node.set(qn("w:color"), "23313A")
+            node.set(qn("w:color"), rule_color)
         else:
             node.set(qn("w:val"), "nil")
 
@@ -2255,12 +2430,13 @@ def _render_pdf(model: dict, output: Path) -> None:
     _register_pdf_fonts(reportlab_package, pdfmetrics, TTFont, model)
     font = "PaperSans"
     bold_font = "PaperSansBold"
+    theme = _report_theme(model)
     palette = {
-        "ink": colors.HexColor("#17212B"),
-        "muted": colors.HexColor("#66717C"),
-        "accent": colors.HexColor("#1F4F64"),
-        "gold": colors.HexColor("#8A6A2E"),
-        "rule": colors.HexColor("#23313A"),
+        key: colors.HexColor(theme[key])
+        for key in (
+            "ink", "muted", "accent", "highlight", "rule", "title",
+            "subtitle", "caption",
+        )
     }
     base = getSampleStyleSheet()
     styles = {
@@ -2279,7 +2455,7 @@ def _render_pdf(model: dict, output: Path) -> None:
             fontName=font,
             fontSize=9,
             leading=12,
-            textColor=palette["gold"],
+            textColor=palette["highlight"],
             alignment=TA_CENTER,
             spaceAfter=18 * mm,
         ),
@@ -2288,7 +2464,7 @@ def _render_pdf(model: dict, output: Path) -> None:
             fontName=bold_font,
             fontSize=28,
             leading=35,
-            textColor=colors.HexColor("#203846"),
+            textColor=palette["title"],
             alignment=TA_CENTER,
             spaceAfter=5 * mm,
         ),
@@ -2306,7 +2482,7 @@ def _render_pdf(model: dict, output: Path) -> None:
             fontName=font,
             fontSize=14,
             leading=21,
-            textColor=colors.HexColor("#435866"),
+            textColor=palette["subtitle"],
             alignment=TA_CENTER,
             spaceAfter=20 * mm,
         ),
@@ -2324,7 +2500,7 @@ def _render_pdf(model: dict, output: Path) -> None:
             fontName=bold_font,
             fontSize=15.5,
             leading=20,
-            textColor=colors.HexColor("#203846"),
+            textColor=palette["title"],
             spaceBefore=11 * mm,
             spaceAfter=4 * mm,
             keepWithNext=True,
@@ -2355,7 +2531,7 @@ def _render_pdf(model: dict, output: Path) -> None:
             fontName=bold_font,
             fontSize=8.8,
             leading=12,
-            textColor=colors.HexColor("#303C44"),
+            textColor=palette["caption"],
             spaceBefore=2 * mm,
             spaceAfter=2 * mm,
             keepWithNext=True,
@@ -2365,7 +2541,7 @@ def _render_pdf(model: dict, output: Path) -> None:
             fontName=bold_font,
             fontSize=8,
             leading=10,
-            textColor=colors.HexColor("#23313A"),
+            textColor=palette["rule"],
         ),
         "table_cell": ParagraphStyle(
             "TableCell",
@@ -2387,7 +2563,7 @@ def _render_pdf(model: dict, output: Path) -> None:
             fontName=font,
             fontSize=8.8,
             leading=12,
-            textColor=colors.HexColor("#39464E"),
+            textColor=palette["caption"],
             alignment=TA_CENTER,
             spaceBefore=2.5 * mm,
             spaceAfter=5 * mm,
@@ -2397,8 +2573,8 @@ def _render_pdf(model: dict, output: Path) -> None:
     document = BaseDocTemplate(
         str(output),
         pagesize=A4,
-        rightMargin=23 * mm,
-        leftMargin=23 * mm,
+        rightMargin=theme["page_margin_mm"] * mm,
+        leftMargin=theme["page_margin_mm"] * mm,
         topMargin=22 * mm,
         bottomMargin=24 * mm,
         title=model["title"],
@@ -2407,7 +2583,7 @@ def _render_pdf(model: dict, output: Path) -> None:
         creator="VASP Catalyst Studio paper_report",
     )
 
-    story = [Spacer(1, 43 * mm)]
+    story = [Spacer(1, theme["cover_spacer_mm"] * mm)]
     story.append(
         Paragraph(_pdf_markup(model["kicker"].upper(), _PDF_CJK_BOLD), styles["cover_kicker"])
     )
@@ -2456,6 +2632,7 @@ def _render_pdf(model: dict, output: Path) -> None:
                     TA_LEFT,
                     TA_RIGHT,
                     TA_CENTER,
+                    palette["rule"],
                 )
             )
         elif key == "figures":
@@ -2498,7 +2675,7 @@ def _render_pdf(model: dict, output: Path) -> None:
             _draw_pdf_mixed_text(
                 canvas,
                 model["kicker"].upper(),
-                23 * mm,
+                document.leftMargin,
                 A4[1] - 11 * mm,
                 font,
                 _PDF_CJK_REGULAR,
@@ -2511,7 +2688,7 @@ def _render_pdf(model: dict, output: Path) -> None:
             _draw_pdf_mixed_text(
                 canvas,
                 title_text,
-                A4[0] - 23 * mm,
+                A4[0] - document.rightMargin,
                 A4[1] - 11 * mm,
                 font,
                 _PDF_CJK_REGULAR,
@@ -2584,6 +2761,7 @@ def _pdf_table(
     align_left,
     align_right,
     align_center,
+    rule_color,
 ):
     caption = paragraph_class(
         _pdf_markup(_table_caption(locale, number, table_model["title"]), _PDF_CJK_BOLD),
@@ -2606,9 +2784,9 @@ def _pdf_table(
     widths = [content_width * value / sum(dxa_widths) for value in dxa_widths]
     table = table_class(data, colWidths=widths, repeatRows=1, hAlign="LEFT")
     commands = [
-        ("LINEABOVE", (0, 0), (-1, 0), 1.1, colors.HexColor("#23313A")),
-        ("LINEBELOW", (0, 0), (-1, 0), 0.7, colors.HexColor("#23313A")),
-        ("LINEBELOW", (0, -1), (-1, -1), 1.1, colors.HexColor("#23313A")),
+        ("LINEABOVE", (0, 0), (-1, 0), 1.1, rule_color),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.7, rule_color),
+        ("LINEBELOW", (0, -1), (-1, -1), 1.1, rule_color),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("LEFTPADDING", (0, 0), (-1, -1), 5),
         ("RIGHTPADDING", (0, 0), (-1, -1), 5),

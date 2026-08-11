@@ -233,6 +233,9 @@ def _parse_route_hash(route_hash: str) -> tuple[str, set[str]]:
             if name == "cluster" and re.search(r"[\\/?#&=]", query_value):
                 raise WorkspaceStateError(
                     "preferences.route.hash has an invalid cluster filter")
+            if name == "revision" and not re.fullmatch(r"[1-9][0-9]{0,8}", query_value):
+                raise WorkspaceStateError(
+                    "preferences.route.hash has an invalid report revision")
             if name != "cluster" and not _SAFE_ID_RE.fullmatch(query_value):
                 raise WorkspaceStateError(
                     "preferences.route.hash has an invalid query value")
@@ -284,7 +287,9 @@ def _parse_route_hash(route_hash: str) -> tuple[str, set[str]]:
         return route_result("prepare", {f"prepare-{segments[1]}"})
     if head == "publish" and len(segments) == 2 \
             and segments[1] in {"figures", "report", "si", "draftpack", "versions", "export"}:
-        return route_result("publish", {f"publish-{segments[1]}"}, {"project"})
+        allowed = ({"project"} if segments[1] == "figures"
+                   else {"project", "spec", "revision"})
+        return route_result("publish", {f"publish-{segments[1]}"}, allowed)
     environment_views = {
         "cluster": "environment-cluster",
         "local-runner": "environment-local",

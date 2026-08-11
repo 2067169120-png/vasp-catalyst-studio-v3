@@ -242,6 +242,8 @@ def test_draft_reference_metadata_is_fail_closed(tmp_path, ref, message):
     {"hash": "#/run/remote", "area": "run", "view": "run-remote"},
     {"hash": "#/publish/report?project=project-abc", "area": "publish",
      "view": "publish-report"},
+    {"hash": "#/publish/report?project=project-abc&spec=spec-01&revision=4",
+     "area": "publish", "view": "publish-report"},
     {"hash": "#/environment/local-runner", "area": "environment",
      "view": "environment-local"},
     {"hash": "#/environment/data-paths", "area": "environment",
@@ -252,6 +254,23 @@ def test_canonical_phase_b_routes_round_trip(tmp_path, route):
     result = store.update({"set": {"route": route}, "remove": []}, 0)
     assert result["ok"] is True
     assert result["preferences"]["route"] == route
+
+
+@pytest.mark.parametrize("route_hash", [
+    "#/publish/report?project=project-abc&revision=0",
+    "#/publish/report?project=project-abc&revision=-1",
+    "#/publish/report?project=project-abc&revision=latest",
+    "#/publish/report?project=project-abc&revision=01",
+    "#/publish/figures?project=project-abc&spec=spec-01",
+])
+def test_report_route_query_is_strict_and_revision_is_positive_integer(
+        tmp_path, route_hash):
+    store = WorkspaceStateStore(tmp_path / "workspace-state.json")
+    with pytest.raises(WorkspaceStateError):
+        store.update({"set": {"route": {
+            "hash": route_hash, "area": "publish", "view": (
+                "publish-figures" if "/figures" in route_hash else "publish-report")
+        }}, "remove": []}, 0)
 
 
 def test_legacy_registry_hash_is_stable_and_does_not_reveal_path(tmp_path):

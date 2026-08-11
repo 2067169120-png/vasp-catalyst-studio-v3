@@ -1,6 +1,7 @@
 """Unified paper report renderer tests (offline, no Office dependency)."""
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import json
@@ -109,6 +110,7 @@ def _validated_model(
     effective_kind="final",
     locale="en-US",
     outline=None,
+    theme_id="academic-a4",
 ) -> dict:
     """Return a render model with a real, fully bound validation chain."""
     from vcstudio.project.report_contracts import (
@@ -129,6 +131,8 @@ def _validated_model(
         locale=locale,
         formats=tuple(formats),
         scope={"kind": "project", "project_ids": ["project-1"], "job_ids": []},
+        theme_id=theme_id,
+        template_ref={"id": f"vcstudio-{theme_id}", "version": "1"},
         **spec_kwargs,
     )
     snapshot = ReportSnapshot(
@@ -143,6 +147,7 @@ def _validated_model(
         locale=locale,
         report_kind=effective_kind,
         scientific_qualification=qualification,
+        template_ref=spec.template_ref,
     )
     report_model_sha256 = paper_report.report_content_sha256(
         model, outline=spec.outline)
@@ -233,6 +238,125 @@ def test_render_all_formats_from_one_model_and_write_manifest(tmp_path):
         assert path == result["manifest"].parent / record["path"]
         assert hashlib.sha256(path.read_bytes()).hexdigest() == record["file_sha256"]
         assert path.stat().st_size == record["size"]
+
+
+def test_html_preview_is_self_contained_deterministic_and_side_effect_free(tmp_path):
+    model = _validated_model(tmp_path)
+    figure = Path(model["figures"][0]["path"]).resolve()
+    before = {
+        path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*")
+    }
+
+    first = paper_report.render_report_html_preview(model)
+    second = paper_report.render_report_html_preview(model)
+
+    after = {
+        path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*")
+    }
+    assert first == second
+    assert before == after
+    assert first["schema"] == "vcstudio.paper-report.html-preview/v1"
+    assert first["artifact_status"] == "preview"
+    assert first["report_model_sha256"] == model["validation"]["report_model_sha256"]
+    assert first["report_kind"] == first["scientific_status"] == "final"
+    assert first["scientific_qualification"] == "adsorption_result_verified"
+    assert first["input_fingerprint"] == model["input_fingerprint"]
+    assert first["contract_status"] == "bound"
+    assert "files" not in first and "manifest" not in first and "revision" not in first
+
+    document = first["html"]
+    match = re.search(r"<img src='data:image/png;base64,([^']+)'", document)
+    assert match is not None
+    assert base64.b64decode(match.group(1)) == figure.read_bytes()
+    assert str(figure) not in document
+    assert "assets/" not in document
+    assert "locator" not in json.dumps(first["contract_refs"], ensure_ascii=False)
+    assert not list(tmp_path.rglob("*.manifest.json"))
+    assert not list(tmp_path.rglob("*.model.json"))
+
+
+def test_html_preview_uses_bound_outline_locale_and_matches_formal_hashes(tmp_path):
+    model = _validated_model(
+        tmp_path,
+        formats=("html",),
+        locale="zh-CN",
+        outline=("limitations", "executive_summary"),
+    )
+
+    preview = paper_report.render_report_html_preview(model)
+    published = paper_report.render_report_bundle(
+        model, tmp_path / "published", formats=("html",)
+    )
+    formal_html = published["files"]["html"].read_text(encoding="utf-8")
+
+    assert '<html lang="zh-CN">' in preview["html"]
+    assert preview["html"].index("局限性") < preview["html"].index("执行摘要")
+    assert "核心结论" not in preview["html"]
+    assert formal_html.index("局限性") < formal_html.index("执行摘要")
+    assert "核心结论" not in formal_html
+    assert preview["report_model_sha256"] == published["report_model_sha256"]
+    assert preview["model_sha256"] == published["model_sha256"]
+    published_refs = {
+        key: {
+            field: value
+            for field, value in record.items()
+            if field not in {"path", "file_sha256", "size"}
+        }
+        for key, record in published["contracts"].items()
+    }
+    assert preview["contract_refs"] == published_refs
+
+
+@pytest.mark.parametrize(
+    ("theme_id", "accent"),
+    [
+        ("academic-a4", "#1F4F64"),
+        ("compact-brief", "#0F766E"),
+        ("diagnostic-a4", "#9A3412"),
+    ],
+)
+def test_html_preview_applies_and_binds_server_owned_theme(
+        tmp_path, theme_id, accent):
+    model = _validated_model(
+        tmp_path, formats=("html",), theme_id=theme_id)
+
+    preview = paper_report.render_report_html_preview(model)
+
+    assert f'data-report-theme="{theme_id}"' in preview["html"]
+    assert f"--accent:{accent}" in preview["html"]
+    assert preview["report_model_sha256"] == (
+        model["validation"]["report_model_sha256"])
+
+
+def test_report_content_digest_changes_with_visible_theme(tmp_path):
+    model = _model(tmp_path)
+    model["template_ref"] = {
+        "id": "vcstudio-academic-a4", "version": "1"}
+    academic = paper_report.report_content_sha256(model)
+    model["template_ref"] = {
+        "id": "vcstudio-diagnostic-a4", "version": "1"}
+
+    assert paper_report.report_content_sha256(model) != academic
+
+
+def test_html_preview_rejects_contract_mismatch_and_validated_content_tamper(tmp_path):
+    mismatched = _validated_model(tmp_path, formats=("html",))
+    mismatched["report_snapshot"]["spec_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="snapshot spec binding mismatch"):
+        paper_report.render_report_html_preview(mismatched)
+
+    tampered = _validated_model(tmp_path, formats=("html",))
+    tampered["executive_summary"] = "Validated content was replaced after the gate."
+    with pytest.raises(ValueError, match="report content conflicts"):
+        paper_report.render_report_html_preview(tampered)
+
+
+def test_html_preview_rejects_figure_bytes_changed_after_validation(tmp_path):
+    model = _validated_model(tmp_path, formats=("html",))
+    _png(Path(model["figures"][0]["path"]), color=(220, 38, 38))
+
+    with pytest.raises(ValueError, match="report content conflicts"):
+        paper_report.render_report_html_preview(model)
 
 
 def test_model_hash_and_visible_label_change_with_report_kind(tmp_path):
@@ -475,6 +599,7 @@ def test_model_hash_uses_contract_semantics_not_time_or_locator(tmp_path):
         content_model.update(
             report_kind="final",
             scientific_qualification="adsorption_result_verified",
+            template_ref=spec.template_ref,
         )
         validation = ValidationResult(
             spec_sha256=spec.semantic_sha256,

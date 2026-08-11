@@ -37,7 +37,7 @@ import yaml
 # 导航页(与 gui_web/assets/index.html 的 data-page 清单严格一致;顺序为默认导航序)
 PAGES = (
     'dashboard', 'structure', 'generate', 'jobs', 'project',
-    'wavefunction', 'figures', 'ai', 'cluster', 'settings',
+    'report-workbench', 'wavefunction', 'figures', 'ai', 'cluster', 'settings',
 )
 
 # 图型 key(对齐 external/native_charts.py 出图函数:bar=adsorption_bar、table=energy_matrix_table、
@@ -142,7 +142,7 @@ _LIS = {
         '锂硫正极催化全流程:清洁表面 + 多硫化物构型族 + 气相参考,'
         'Li–S 放电台阶图与 SAC 批量筛选一应俱全。'),
     'primary': True,
-    'pages': ['dashboard', 'structure', 'jobs', 'project', 'figures',
+    'pages': ['dashboard', 'structure', 'jobs', 'project', 'report-workbench', 'figures',
               'cluster', 'settings'],
     'cards': {
         'project': {'adsorption': True, 'task_analysis': False,
@@ -180,7 +180,7 @@ _VASP = {
     'description': '从 23 类 VASP 任务中选择本次计算，只展示建模、输入、提交和对应结果工具。',
     'primary': True,
     'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project',
-              'figures', 'cluster', 'settings'],
+              'report-workbench', 'figures', 'cluster', 'settings'],
     'cards': {
         'structure': {'molecular': False},
         'generate': {'task_catalog': True, 'neb': True, 'vasp_inputs': True,
@@ -213,7 +213,7 @@ _ELECTROCAT = {
         'ORR / HER / OER / CO₂RR 反应组默认置顶。'),
     'primary': False,
     'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project',
-              'figures', 'cluster', 'settings'],
+              'report-workbench', 'figures', 'cluster', 'settings'],
     'cards': {},
     # 火山图(Sabatier 峰顶)是电催化筛选的招牌图,置最前;标度关系次之
     'figure_preset_order': ['volcano', 'ladder', 'scaling', 'heatmap',
@@ -245,7 +245,7 @@ _THERMOCAT = {
         '电位类图型(火山图 / 台阶图)后置。'),
     'primary': False,
     'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project',
-              'figures', 'cluster', 'settings'],
+              'report-workbench', 'figures', 'cluster', 'settings'],
     # 热催化非电化学:隐藏项目页的反应(台阶图)预设卡片
     'cards': {'project': {'reactions': False}},
     # 能量学/热图/标度前置,电位类(台阶图、火山图)后置
@@ -279,7 +279,7 @@ _BATTERY_BULK = {
         '方法学告警按体相口径裁剪(无真空 / 偶极项)。'),
     'primary': False,
     'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project',
-              'figures', 'cluster', 'settings'],
+              'report-workbench', 'figures', 'cluster', 'settings'],
     # 吸附卡片弱化:隐藏 SAC 表面批量建模;隐藏火山图/标度(吸附质筛选专用)
     'cards': {
         'structure': {'sac_matrix': False, 'metal_slab': False},

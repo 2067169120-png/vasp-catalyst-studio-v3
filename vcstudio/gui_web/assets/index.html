@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>VASP Catalyst Studio</title>
 <link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="report-workbench.css">
 <script>/* 主题先粉刷防闪烁:CSS 生效前按上次选择置 data-theme,app.js 再从 config 校准 */
 try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.dataset.theme=_t;}catch(e){}</script>
 <style>
@@ -420,6 +421,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <a href="#/projects/current/analysis/adsorption" data-route="analyze-energy" data-area="analyze" data-page="project" data-scene="pages.project" data-i18n="nav.project">能量与稳定性</a>
       <a href="#/projects/current/analysis/charge" data-route="analyze-charge" data-area="analyze" data-page="wavefunction" data-scene="pages.wavefunction" data-i18n="nav.wavefunction">电荷与波函数</a>
       <a href="#/publish/figures?project=current" data-route="publish-figures" data-area="publish" data-page="figures" data-scene="pages.figures" data-i18n="nav.figures">图表工作台</a>
+      <a href="#/publish/report?project=current" data-route="publish-report" data-area="publish" data-page="report-workbench" data-scene="pages.report-workbench">报告工作台</a>
       <a href="#/environment/cluster" data-route="environment-cluster" data-area="environment" data-page="cluster" data-scene="pages.cluster" data-i18n="nav.cluster">集群</a>
       <a href="#/environment/settings" data-route="environment-settings" data-area="environment" data-page="settings" data-scene="pages.settings" data-i18n="nav.settings">设置</a>
     </div>
@@ -1540,7 +1542,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       </fieldset>
       <div class="actions" style="margin-bottom:12px">
         <button class="btn primary" id="pj-delta" disabled>刷新并计算 ΔE</button>
-        <button class="btn" id="pj-report" aria-describedby="pj-report-format-status" disabled>生成 HTML / Word / PDF 报告</button>
+        <button class="btn" id="pj-report" aria-describedby="pj-report-format-status" disabled>在报告工作台预览与生成</button>
         <button class="btn quiet" id="pj-csv" disabled>导出 ΔE CSV</button>
       </div>
       <div id="pj-candidate-evaluation" class="pj-candidate-card" hidden aria-live="polite"></div>
@@ -1701,9 +1703,8 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
         <label><input type="checkbox" id="fig-compare-ladder" checked> 多催化剂 ΔG 台阶图</label>
         <label><input type="checkbox" id="fig-scaling"> 标度关系(拟合+R²)</label>
         <label><input type="checkbox" id="fig-volcano"> 火山图(Sabatier 峰顶)</label>
-        <label><input type="checkbox" id="fig-cmp-report" checked> Word + PDF 对比报告</label>
-        <button class="btn primary" id="pj-cmpfigs">生成对比图与报告</button>
-        <button class="btn" id="pj-batch-report">生成批次 HTML / Word / PDF 报告</button>
+        <button class="btn primary" id="pj-cmpfigs">生成所选对比图</button>
+        <button class="btn" id="pj-batch-report">在报告工作台配置批次报告</button>
       </div>
       <div id="pj-batch-files" class="pj-report-output" aria-live="polite"></div>
     </div>
@@ -1714,12 +1715,244 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <div class="sub" style="color:var(--muted);margin-bottom:10px;line-height:1.6">
         只组织磁盘上真实数据,绝不生成数值;缺项以「待确认」标注。稽核不过仍产全套工件,但会醒目提示进稿前须核对。</div>
       <div class="actions" style="margin-bottom:10px">
-        <button class="btn primary" id="pj-draft" data-i18n="project.draft.btn">生成成稿包</button>
+        <button class="btn primary" id="pj-draft" data-i18n="project.draft.btn">在报告工作台配置成稿包</button>
       </div>
       <div id="pj-draft-out"></div>
     </div>
 
     <div class="log" id="project-log" data-anchor><div class="head">项目日志</div></div>
+  </section>
+
+  <!-- Phase C：统一报告工作台。预设、ReportSpec、快照与门禁均由后端 bootstrap 提供。 -->
+  <section class="page report-workbench-page" data-page="report-workbench"
+    id="page-report-workbench" aria-labelledby="rw-title" hidden>
+    <header class="rw-header">
+      <div class="rw-heading">
+        <span class="rw-kicker">Publish / Report</span>
+        <h1 id="rw-title" tabindex="-1">报告工作台</h1>
+        <p id="rw-project-name">选择项目后读取报告配置、数据快照与科学门禁。</p>
+      </div>
+      <div class="rw-state-strip" id="rw-state-strip" role="status"
+        aria-live="polite" aria-atomic="true">
+        <span class="rw-state" data-rw-state="artifact"><b>报告产物</b><i>未读取</i></span>
+        <span class="rw-state" data-rw-state="science"><b>科学状态</b><i>未判定</i></span>
+        <span class="rw-state" data-rw-state="gate"><b>发布门禁</b><i>未知</i></span>
+      </div>
+      <div class="rw-header-actions actions" aria-label="报告操作">
+        <button class="btn" type="button" id="rw-preview" disabled>刷新 HTML 预览</button>
+        <button class="btn primary" type="button" id="rw-publish"
+          aria-describedby="rw-publish-help" disabled>生成所选格式</button>
+        <button class="btn quiet" type="button" id="rw-compare-revision"
+          aria-describedby="rw-compare-help" disabled>比较上一版</button>
+        <button class="btn quiet" type="button" id="rw-open-output" disabled>打开产物目录</button>
+      </div>
+    </header>
+
+    <p class="rw-operation-status" id="rw-operation-status" role="status"
+      aria-live="polite" aria-atomic="true">尚未加载报告工作台。</p>
+    <div class="rw-alert" id="rw-alert" role="alert" hidden></div>
+    <p class="rw-help" id="rw-publish-help">修改配置后必须先得到与当前项目绑定的新预览，才能发布。</p>
+    <p class="rw-help" id="rw-compare-help">没有至少两个已登记 revision 时，版本比较保持不可用。</p>
+
+    <dl class="rw-meta" aria-label="报告版本和快照">
+      <div><dt>报告预设</dt><dd id="rw-meta-preset">—</dd></div>
+      <div><dt>数据快照</dt><dd id="rw-meta-snapshot">—</dd></div>
+      <div><dt>版本</dt><dd id="rw-meta-revision">尚未发布</dd></div>
+      <div><dt>模型哈希</dt><dd id="rw-meta-model" title="">—</dd></div>
+    </dl>
+
+    <div class="rw-layout">
+      <aside class="rw-config" aria-labelledby="rw-config-heading">
+        <h2 id="rw-config-heading">报告配置</h2>
+        <nav class="rw-steps" aria-label="报告配置步骤">
+          <ol id="rw-step-list">
+            <li><button type="button" id="rw-step-button-scope" data-rw-step="scope"
+              aria-controls="rw-step-scope" aria-current="step"><b>1</b><span>数据范围</span></button></li>
+            <li><button type="button" id="rw-step-button-audience" data-rw-step="audience"
+              aria-controls="rw-step-audience" tabindex="-1"><b>2</b><span>用途和受众</span></button></li>
+            <li><button type="button" id="rw-step-button-gates" data-rw-step="gates"
+              aria-controls="rw-step-gates" tabindex="-1"><b>3</b><span>科学门禁</span></button></li>
+            <li><button type="button" id="rw-step-button-outline" data-rw-step="outline"
+              aria-controls="rw-step-outline" tabindex="-1"><b>4</b><span>章节大纲</span></button></li>
+            <li><button type="button" id="rw-step-button-content" data-rw-step="content"
+              aria-controls="rw-step-content" tabindex="-1"><b>5</b><span>图表与表格</span></button></li>
+            <li><button type="button" id="rw-step-button-language" data-rw-step="language"
+              aria-controls="rw-step-language" tabindex="-1"><b>6</b><span>语言与主题</span></button></li>
+            <li><button type="button" id="rw-step-button-export" data-rw-step="export"
+              aria-controls="rw-step-export" tabindex="-1"><b>7</b><span>导出和版本</span></button></li>
+          </ol>
+        </nav>
+
+        <form id="rw-spec-form" novalidate aria-describedby="rw-spec-help">
+          <p class="rw-help" id="rw-spec-help">这里仅编辑展示、范围和导出要求；科学快照、门禁、资格和 revision 由服务端冻结。</p>
+
+          <section class="rw-step-panel" id="rw-step-scope" data-rw-panel="scope"
+            aria-labelledby="rw-step-button-scope">
+            <h3>1 数据范围</h3>
+            <div class="rw-field">
+              <span>当前项目</span>
+              <output id="rw-scope-project">—</output>
+            </div>
+            <label class="rw-check"><input type="checkbox" id="rw-stable-only"
+              data-spec-path="scope.stable_only"> 仅包含稳定构型</label>
+            <label class="rw-check"><input type="checkbox" id="rw-include-failed"
+              data-spec-path="scope.include_failed"> 包含失败记录及其原因</label>
+            <div class="rw-field">
+              <label for="rw-species">物种筛选</label>
+              <input class="ipt" id="rw-species" data-spec-list="scope.species"
+                autocomplete="off" placeholder="留空表示全部；多个 ID 用逗号分隔">
+            </div>
+            <div class="rw-field">
+              <label for="rw-configurations">构型筛选</label>
+              <input class="ipt" id="rw-configurations" data-spec-list="scope.configuration_ids"
+                autocomplete="off" placeholder="留空表示全部；多个 ID 用逗号分隔">
+            </div>
+          </section>
+
+          <section class="rw-step-panel" id="rw-step-audience" data-rw-panel="audience"
+            aria-labelledby="rw-step-button-audience" hidden>
+            <h3>2 报告用途和受众</h3>
+            <fieldset class="rw-presets" id="rw-presets" aria-busy="true">
+              <legend>内置预设</legend>
+              <p>正在从服务端读取五个版本化预设…</p>
+            </fieldset>
+            <div class="rw-two-fields">
+              <div class="rw-field"><label for="rw-requested-kind">请求类型</label>
+                <select class="ipt" id="rw-requested-kind" data-spec-path="requested_kind">
+                  <option value="final">最终报告请求</option>
+                  <option value="diagnostic">诊断报告</option>
+                  <option value="draft">草稿材料</option>
+                </select>
+              </div>
+              <div class="rw-field"><label for="rw-audience">受众</label>
+                <select class="ipt" id="rw-audience" data-spec-path="audience"></select>
+              </div>
+            </div>
+          </section>
+
+          <section class="rw-step-panel" id="rw-step-gates" data-rw-panel="gates"
+            aria-labelledby="rw-step-button-gates" hidden>
+            <h3>3 科学门禁</h3>
+            <p class="rw-readonly-note">门禁为只读服务端结论；前端不能覆盖、豁免或提交自造 ValidationResult。</p>
+            <div id="rw-validation-summary" class="rw-gate-list" aria-live="polite">
+              尚未生成预览。
+            </div>
+          </section>
+
+          <section class="rw-step-panel" id="rw-step-outline" data-rw-panel="outline"
+            aria-labelledby="rw-step-button-outline" hidden>
+            <h3>4 章节大纲</h3>
+            <fieldset class="rw-outline" id="rw-outline" aria-busy="true">
+              <legend>选择并按预设顺序生成章节</legend>
+              <p>正在读取可用章节…</p>
+            </fieldset>
+          </section>
+
+          <section class="rw-step-panel" id="rw-step-content" data-rw-panel="content"
+            aria-labelledby="rw-step-button-content" hidden>
+            <h3>5 图表与表格</h3>
+            <label class="rw-check"><input type="checkbox" id="rw-include-thermo"
+              data-spec-path="options.include_thermochemistry"> 包含可验证的热化学校正</label>
+            <div class="rw-field"><label for="rw-precision">数值小数位</label>
+              <input class="ipt" id="rw-precision" type="number" min="2" max="8" step="1"
+                data-spec-path="options.precision" aria-describedby="rw-precision-capability">
+              <small class="rw-capability-note" id="rw-precision-capability">正在读取精度能力…</small>
+            </div>
+            <p class="rw-readonly-note">图表只引用快照中真实存在的产物。缺图和缺表会进入 ValidationResult，不会生成占位数值。</p>
+          </section>
+
+          <section class="rw-step-panel" id="rw-step-language" data-rw-panel="language"
+            aria-labelledby="rw-step-button-language" hidden>
+            <h3>6 语言与主题</h3>
+            <div class="rw-field"><label for="rw-locale">语言</label>
+              <select class="ipt" id="rw-locale" data-spec-path="locale"
+                aria-describedby="rw-locale-capability"></select>
+              <small class="rw-capability-note" id="rw-locale-capability">正在读取语言能力…</small>
+            </div>
+            <div class="rw-field"><label for="rw-bilingual">双语模式</label>
+              <select class="ipt" id="rw-bilingual" data-spec-path="options.bilingual_mode"
+                aria-describedby="rw-bilingual-capability">
+                <option value="">正在读取双语能力…</option>
+              </select>
+              <small class="rw-capability-note" id="rw-bilingual-capability">正在读取双语能力…</small>
+            </div>
+            <div class="rw-field"><label for="rw-theme">报告主题</label>
+              <select class="ipt" id="rw-theme" data-spec-path="theme_id"
+                aria-describedby="rw-theme-capability"></select>
+              <small class="rw-capability-note" id="rw-theme-capability">正在读取主题能力…</small>
+            </div>
+          </section>
+
+          <section class="rw-step-panel" id="rw-step-export" data-rw-panel="export"
+            aria-labelledby="rw-step-button-export" hidden>
+            <h3>7 导出和版本</h3>
+            <fieldset class="rw-formats" id="rw-formats" aria-busy="true"
+              aria-describedby="rw-format-capability-note">
+              <legend>输出格式（至少一种）</legend>
+              <p>正在检测格式依赖…</p>
+            </fieldset>
+            <p class="rw-readonly-note" id="rw-format-capability-note">只有服务端明确声明 available=true 的格式才能选择。</p>
+            <div class="rw-field"><label for="rw-version-policy">版本策略</label>
+              <select class="ipt" id="rw-version-policy" data-spec-path="options.version_policy">
+                <option value="new_revision">创建不可变的新 revision</option>
+              </select>
+            </div>
+            <div class="actions">
+              <button class="btn" type="button" id="rw-pick-output">选择生成目录</button>
+              <button class="btn quiet" type="button" id="rw-discard-draft" disabled>丢弃当前草稿</button>
+            </div>
+            <output class="rw-output-path" id="rw-output-path">发布时尚未选择目录</output>
+          </section>
+        </form>
+      </aside>
+
+      <section class="rw-preview-region" aria-labelledby="rw-preview-heading">
+        <header class="rw-pane-heading">
+          <div><h2 id="rw-preview-heading">HTML 实时预览</h2>
+            <p>预览与当前 ReportSpec、快照、ValidationResult 和项目 ID 绑定。</p></div>
+          <span id="rw-preview-binding">未绑定</span>
+        </header>
+        <nav class="rw-section-nav" id="rw-section-nav" aria-label="预览章节"></nav>
+        <div class="rw-preview-scroll" id="rw-preview-scroll" tabindex="0"
+          role="region" aria-label="报告打印宽度预览">
+          <div class="rw-preview-empty" id="rw-preview-empty">
+            <b>等待报告预览</b>
+            <span>读取项目后，工作台会用服务端冻结的快照生成 HTML。</span>
+          </div>
+          <iframe id="rw-preview-frame" title="报告 HTML 预览" sandbox=""
+            referrerpolicy="no-referrer" hidden></iframe>
+        </div>
+      </section>
+
+      <aside class="rw-evidence" id="rw-evidence" aria-labelledby="rw-evidence-heading">
+        <header class="rw-pane-heading"><div><h2 id="rw-evidence-heading">证据检查器</h2>
+          <p>只显示公开快照、验证与合同引用。</p></div></header>
+        <div id="rw-evidence-body" class="rw-evidence-body" aria-live="polite">
+          <div class="rw-evidence-empty"><b>尚无可检查证据</b><span>预览完成后在这里核对公式、来源与哈希。</span></div>
+        </div>
+      </aside>
+    </div>
+
+    <section class="rw-history" aria-labelledby="rw-history-heading">
+      <header class="rw-pane-heading"><div><h2 id="rw-history-heading" tabindex="-1">版本历史</h2>
+        <p>历史 revision 保持可复核；项目数据变化不会改写旧报告。</p></div></header>
+      <div id="rw-history-list" class="rw-history-list" aria-live="polite">
+        <div class="rw-history-empty">尚未读取版本历史。</div>
+      </div>
+    </section>
+
+    <footer class="rw-generation" aria-labelledby="rw-format-heading">
+      <div><h2 id="rw-format-heading">格式生成状态</h2>
+        <p>产物状态与科学资格分别显示；单项失败不会抹掉其它成功格式。</p></div>
+      <ul id="rw-format-status" aria-live="polite" aria-atomic="false">
+        <li data-format="html"><b>HTML</b><span>未请求</span></li>
+        <li data-format="docx"><b>Word</b><span>未请求</span></li>
+        <li data-format="pdf"><b>PDF</b><span>未请求</span></li>
+        <li data-format="model_json"><b>模型 JSON</b><span>等待预览</span></li>
+        <li data-format="validation_json"><b>验证 JSON</b><span>等待预览</span></li>
+        <li data-format="manifest"><b>Manifest</b><span>等待发布</span></li>
+      </ul>
+    </footer>
   </section>
 
   <!-- ⑤ 波函数分析(分子化学 / 全功能场景显示) -->
@@ -2575,6 +2808,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 <script src="cluster.js"></script>
 <script src="generate.js"></script>
 <script src="project.js"></script>
+<script src="report-workbench.js"></script>
 <script src="dashboard.js"></script>
 <script src="settings.js"></script>
 <script src="editor.js"></script>

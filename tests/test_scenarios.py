@@ -78,7 +78,14 @@ def test_molecular_drops_project_page():
     # 分子化学不走表面吸附项目页(pages 子集)
     mol = S.get_scenario('molecular')
     assert 'project' not in mol['pages']
+    assert 'report-workbench' not in mol['pages']
     assert 'project' in S.get_scenario('full')['pages']
+
+
+def test_project_scenarios_expose_the_report_workbench_page():
+    for scenario in S.list_scenarios():
+        if 'project' in scenario['pages']:
+            assert 'report-workbench' in scenario['pages'], scenario['key']
 
 
 def test_engines_are_valid():

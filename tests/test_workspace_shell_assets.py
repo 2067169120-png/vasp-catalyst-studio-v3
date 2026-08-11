@@ -248,8 +248,8 @@ def test_semantic_routes_select_the_visible_project_analysis_panel():
     draft = routes.split("'publish-draftpack':", 1)[1].split(
         "'publish-versions':", 1)[0]
     assert "analysis: 'figures'" in comparison and "focus: '#fig-compare-status'" in comparison
-    assert "analysis: 'adsorption'" in report and "focus: '#pj-report'" in report
-    assert "analysis: 'draft'" in draft and "focus: '#pj-draft'" in draft
+    assert "page: 'report-workbench'" in report and "focus: '#rw-title'" in report
+    assert "page: 'report-workbench'" in draft and "focus: '#rw-step-button-export'" in draft
     assert 'function syncPrimaryAreaRoutes(route)' in workspace
 
 

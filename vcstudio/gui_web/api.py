@@ -253,7 +253,8 @@ class Api:
                  result_import_mod=None, task_analysis_mod=None,
                  pipeline_supervisor_cls=None, assistant_chat_mod=None,
                  comparison_mod=None, candidate_evaluation_mod=None,
-                 paper_report_mod=None, workspace_state_store=None):
+                 paper_report_mod=None, workspace_state_store=None,
+                 report_service=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -361,6 +362,9 @@ class Api:
         self._comparison = comparison_mod
         self._candidate_evaluation = candidate_evaluation_mod
         self._paper_report = paper_report_mod
+        # Phase C report workbench orchestration.  The service is lazy so the
+        # normal submit/monitor path does not import report dependencies.
+        self._report_service_instance = report_service
         # Phase B 可恢复工作区状态只保存 UI 偏好/草稿引用，与 project.yaml 科学事实分离。
         # 测试可注入内存/临时目录 store；生产首次调用时再创建用户级 JSON store。
         self._workspace_state_store = workspace_state_store
@@ -993,6 +997,14 @@ class Api:
             from vcstudio.project import paper_report
             self._paper_report = paper_report
         return self._paper_report
+
+    def _reports(self):
+        """Return the single Phase C report-service instance for every adapter."""
+        if self._report_service_instance is None:
+            from vcstudio.project.report_service import ReportService
+
+            self._report_service_instance = ReportService(self)
+        return self._report_service_instance
 
     def _ri(self):
         """本地结果文件夹扫描/导入引擎（纯本地 I/O）。"""
@@ -4124,7 +4136,17 @@ class Api:
         }
 
     @staticmethod
-    def _candidate_evaluation_table(evaluations, *, title='候选材料后续计算优先级'):
+    def _candidate_evaluation_table(
+            evaluations, *, title=None, locale='zh-CN', precision=3):
+        """Render candidate decisions in the report's selected locale.
+
+        The evaluator deliberately stores auditable machine codes plus Chinese
+        operator guidance.  An English report must not merely translate the
+        section heading while leaking that operator guidance into its body, so
+        this projection is rebuilt from the locale-neutral decision fields.
+        """
+        english = str(locale or '').strip() == 'en-US'
+        precision = max(2, min(8, int(precision)))
         rows = []
         for evaluation in evaluations or []:
             candidate = evaluation.get('candidate') or {}
@@ -4132,48 +4154,130 @@ class Api:
             evidence = evaluation.get('evidence') or {}
             profile = evaluation.get('profile') or {}
             thermo = evaluation.get('thermodynamics') or {}
+            if english:
+                summary = (
+                    f"Priority: {decision.get('priority') or 'hold_for_evidence'}; "
+                    f"profile verdict: {decision.get('profile_verdict') or 'unknown'}; "
+                    f"data quality: {decision.get('data_quality') or 'unknown'}."
+                )
+            else:
+                summary = decision.get('summary_zh') or '证据不足'
             rows.append([
-                candidate.get('name') or '项目',
+                candidate.get('name') or ('Project' if english else '项目'),
                 decision.get('priority') or 'hold_for_evidence',
-                decision.get('summary_zh') or '证据不足',
+                summary,
                 (profile.get('short_chain_risk') or {}).get('status') or 'unknown',
                 evidence.get('claim_ceiling') or 'electronic_adsorption_screen',
                 ('—' if thermo.get('u_l_V') is None
-                 else f'{thermo.get("u_l_V"):.3f}'),
+                 else f'{thermo.get("u_l_V"):.{precision}f}'),
                 ('—' if thermo.get('eta_V') is None
-                 else f'{thermo.get("eta_V"):.3f}'),
+                 else f'{thermo.get("eta_V"):.{precision}f}'),
             ])
-        return {
-            'title': title,
-            'columns': [
+        if english:
+            resolved_title = title or 'Candidate follow-up priority'
+            columns = [
+                'Catalyst', 'Recommendation', 'Assessment', 'Short-chain risk',
+                'Claim ceiling', 'U_L / V', 'eta / V',
+            ]
+            caption = (
+                'advance prioritizes free-energy, solvation, and key-barrier '
+                'calculations; hold_for_evidence requires the stated evidence '
+                'gaps to be closed first. Adsorption energy alone is not activity.'
+            )
+        else:
+            resolved_title = title or '候选材料后续计算优先级'
+            columns = [
                 '催化剂', '建议', '评价结论', '短链风险',
                 '结论上限', 'U_L / V', 'η / V',
-            ],
-            'rows': rows,
-            'caption': (
+            ]
+            caption = (
                 'advance 表示建议优先进入自由能、溶剂化与关键 NEB；'
-                'hold_for_evidence 表示先补齐方法或物种证据。电子吸附能不直接等同于活性。'),
+                'hold_for_evidence 表示先补齐方法或物种证据。电子吸附能不直接等同于活性。')
+        return {
+            'title': resolved_title,
+            'columns': columns,
+            'rows': rows,
+            'caption': caption,
         } if rows else None
 
     @staticmethod
-    def _recommendation_blocks(evaluations):
+    def _recommendation_blocks(evaluations, *, locale='zh-CN'):
+        english = str(locale or '').strip() == 'en-US'
+        english_guidance = {
+            'RECONCILE_METHOD_CONFLICTS': (
+                'Reconcile method conflicts',
+                'Known method conflicts invalidate direct subtraction of total energies.'),
+            'AUDIT_METHOD_PROVENANCE': (
+                'Audit method provenance',
+                'Complete method fingerprints and comparability evidence before ranking.'),
+            'CALC_VALID_ADSORBATE_REFERENCE': (
+                'Calculate a valid adsorbate reference',
+                'A verified reference energy is required for the declared adsorption-energy formula.'),
+            'RESOLVE_ADSORPTION_ENERGIES': (
+                'Resolve adsorption-energy inputs',
+                'At least one numeric and method-compatible adsorption energy is required.'),
+            'CALC_MISSING_LIS_SPECIES': (
+                'Calculate missing Li-S species',
+                'Sequence coverage is required to assess anchoring and terminal-product risk.'),
+            'SAMPLE_MORE_CONFIGURATIONS': (
+                'Sample more configurations',
+                'One geometry cannot establish the global minimum adsorption state.'),
+            'VERIFY_ADSORPTION_GEOMETRY': (
+                'Verify adsorption geometries',
+                'Check adsorbate integrity and surface reconstruction before comparing minima.'),
+            'CALC_ZPE_ENTROPY': (
+                'Calculate ZPE and entropy corrections',
+                'Electronic adsorption energy does not replace adsorption or reaction free energy.'),
+            'CALC_SOLVATION_LONG_CHAIN': (
+                'Calculate consistent solvation corrections',
+                'Vacuum adsorption energies may misrepresent long-chain anchoring in electrolyte.'),
+            'BUILD_BALANCED_FREE_ENERGY_PATH': (
+                'Build a balanced free-energy pathway',
+                'Adsorption energies of different Li2Sx species are not adjacent reaction steps.'),
+            'AUDIT_FREE_ENERGY_METRICS': (
+                'Audit free-energy metrics',
+                'Inconsistent potential identities cannot support activity ranking.'),
+            'NEB_LI2S_CHARGE_DECOMPOSITION': (
+                'Calculate the Li2S charge-decomposition barrier',
+                'Strong short-chain binding may create a terminal-product trap.'),
+            'NEB_DISCHARGE_KEY_STEPS': (
+                'Calculate key discharge barriers',
+                'Adsorption energy is thermodynamic evidence and cannot replace kinetics.'),
+            'ADD_DAC_BASELINES': (
+                'Add DAC baseline calculations',
+                'Bare-slab and corresponding SAC baselines are required to test dual-site synergy.'),
+        }
         blocks, seen = [], set()
         for evaluation in evaluations or []:
-            candidate = (evaluation.get('candidate') or {}).get('name') or '项目'
+            candidate = ((evaluation.get('candidate') or {}).get('name')
+                         or ('Project' if english else '项目'))
             for item in evaluation.get('recommendations') or []:
                 code = str(item.get('code') or '')
                 key = (candidate, code)
                 if key in seen:
                     continue
                 seen.add(key)
-                targets = '、'.join(str(value) for value in item.get('targets') or [])
-                suffix = f'；目标：{targets}' if targets else ''
-                blocks.append({
-                    'title': (
+                separator = ', ' if english else '、'
+                targets = separator.join(
+                    str(value) for value in item.get('targets') or [])
+                if english:
+                    action, reason = english_guidance.get(code, (
+                        code.replace('_', ' ').title() or 'Complete evidence action',
+                        'Complete this evidence action before making stronger claims.',
+                    ))
+                    suffix = f' Targets: {targets}.' if targets else ''
+                    title = f'{item.get("priority") or "P2"} · {candidate} · {action}'
+                    text = f'{reason}{suffix}'
+                else:
+                    suffix = f'；目标：{targets}' if targets else ''
+                    title = (
                         f'{item.get("priority") or "P2"} · {candidate} · '
                         f'{item.get("action_zh") or code}'
-                    ),
-                    'text': f'{item.get("reason") or ""}{suffix}',
+                    )
+                    text = f'{item.get("reason") or ""}{suffix}'
+                blocks.append({
+                    'title': title,
+                    'text': text,
                 })
         return blocks
 
@@ -4214,7 +4318,7 @@ class Api:
     def _project_report_contracts(self, proj, project_path, summary, fed, *,
                                   requested_kind, report_kind, formats,
                                   eligible_final, gate_reason,
-                                  report_model_sha256):
+                                  report_model_sha256, report_spec=None):
         """Freeze the report request, scientific snapshot and gate decision."""
         from vcstudio.project.report_contracts import (
             ClaimRecord,
@@ -4226,7 +4330,6 @@ class Api:
         )
 
         generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-        project_id = str(proj.get('project_uuid') or proj.get('name') or 'project')
         input_fingerprint = self._report_scientific_fingerprint(proj, summary)
         member_dirs = self._project_member_dirs(proj)
         project_root = os.path.abspath(os.path.normpath(str(
@@ -4234,24 +4337,60 @@ class Api:
         resolved_jobs = []
         for index, path in enumerate(member_dirs, 1):
             manifest = self._manifest.load_manifest(path) or {}
-            resolved_jobs.append(self._portable_member_id(
-                path, project_root, index, manifest))
-        spec = ReportSpec(
-            requested_kind=requested_kind,
-            audience='researcher',
-            locale='zh-CN',
-            formats=tuple(formats),
-            scope={
-                'kind': 'project',
-                'project_ids': [project_id],
-                'job_ids': resolved_jobs,
-            },
-            policy_refs=({
-                'id': 'project-final-report-gate',
-                'version': '1',
-            },),
-            created_at_utc=generated_at,
-        )
+            resolved_jobs.append(
+                self._workspace_job_id(path, manifest)
+                if report_spec is not None else
+                self._portable_member_id(path, project_root, index, manifest))
+        if report_spec is None:
+            project_id = str(
+                proj.get('project_uuid') or proj.get('name') or 'project')
+            spec = ReportSpec(
+                requested_kind=requested_kind,
+                audience='researcher',
+                locale='zh-CN',
+                formats=tuple(formats),
+                scope={
+                    'kind': 'project',
+                    'project_ids': [project_id],
+                    'job_ids': resolved_jobs,
+                },
+                policy_refs=({
+                    'id': 'project-final-report-gate',
+                    'version': '1',
+                },),
+                created_at_utc=generated_at,
+            )
+        else:
+            source_spec = (report_spec if isinstance(report_spec, ReportSpec)
+                           else ReportSpec.from_mapping(report_spec))
+            if source_spec.requested_kind != requested_kind:
+                raise ValueError('工作台 ReportSpec.requested_kind 与报告请求不一致')
+            if tuple(source_spec.formats) != tuple(formats):
+                raise ValueError('工作台 ReportSpec.formats 与渲染格式不一致')
+            project_ids = list(source_spec.scope.get('project_ids') or [])
+            if len(project_ids) != 1:
+                raise ValueError('单项目报告必须绑定恰好一个 opaque project_id')
+            project_id = str(project_ids[0])
+            spec = ReportSpec(
+                preset_id=source_spec.preset_id,
+                requested_kind=source_spec.requested_kind,
+                audience=source_spec.audience,
+                locale=source_spec.locale,
+                formats=source_spec.formats,
+                scope=source_spec.scope,
+                outline=source_spec.outline,
+                theme_id=source_spec.theme_id,
+                template_ref={
+                    'id': f'vcstudio-{source_spec.theme_id}',
+                    'version': '1',
+                },
+                policy_refs=({
+                    'id': 'project-final-report-gate',
+                    'version': '1',
+                },),
+                options=source_spec.options,
+                created_at_utc=generated_at,
+            )
         project_locator = os.path.abspath(os.path.normpath(str(project_path)))
         if os.path.isdir(project_locator):
             project_locator = os.path.join(project_locator, 'project.yaml')
@@ -4264,21 +4403,71 @@ class Api:
             # project.yaml, which also contains report/runtime state.
             'sha256': input_fingerprint,
         }
+        scope_state = ((summary or {}).get('_report_scope')
+                       if isinstance(summary, dict) else {}) or {}
+        if report_spec is not None:
+            selected_configuration_ids = list(
+                scope_state.get('selected_configuration_ids') or [])
+            dependency_job_ids = list(
+                scope_state.get('dependency_job_ids') or [])
+            excluded_configuration_ids = list(
+                scope_state.get('excluded_configuration_ids') or [])
+            resolved_jobs = list(dict.fromkeys(
+                [*dependency_job_ids, *selected_configuration_ids]))
+        else:
+            selected_configuration_ids = list(resolved_jobs)
+            dependency_job_ids = []
+            excluded_configuration_ids = []
+        resolved_scope = {
+            'project_ids': [project_id],
+            'scope_sha256': self._report_scope_sha256(spec),
+            # ``job_ids`` is retained for v1 readers, but now means exactly the
+            # members whose bytes participate in this frozen snapshot.
+            'job_ids': resolved_jobs,
+            'requested_job_ids': list(spec.scope.get('job_ids') or []),
+            'requested_configuration_ids': list(
+                spec.scope.get('configuration_ids') or []),
+            'selected_configuration_ids': selected_configuration_ids,
+            'dependency_job_ids': dependency_job_ids,
+            'excluded_configuration_ids': excluded_configuration_ids,
+            'species': list(spec.scope.get('species') or []),
+            'configuration_ids': list(
+                spec.scope.get('configuration_ids') or []),
+            'stable_only': bool(spec.scope.get('stable_only')),
+            'include_failed': bool(spec.scope.get('include_failed')),
+            'selected_rows': len((summary or {}).get('rows') or []),
+        }
+        scientific_payload = self._report_scientific_payload(proj, summary)
+        if report_spec is not None:
+            payload_member_ids = {
+                str(item.get('member_id') or '')
+                for item in scientific_payload.get('members') or []
+                if isinstance(item, dict) and item.get('member_id')
+            }
+            payload_configuration_ids = {
+                str(item.get('configuration_id') or item.get('job_id') or '')
+                for item in scientific_payload.get('rows') or []
+                if isinstance(item, dict)
+                and (item.get('configuration_id') or item.get('job_id'))
+            }
+            if payload_member_ids != set(resolved_jobs):
+                raise RuntimeError(
+                    'ReportSnapshot payload members 与 resolved_scope.job_ids 不一致')
+            if payload_configuration_ids != set(selected_configuration_ids):
+                raise RuntimeError(
+                    'ReportSnapshot payload rows 与 selected_configuration_ids 不一致')
         snapshot = ReportSnapshot(
             spec_sha256=spec.semantic_sha256,
             input_fingerprint=input_fingerprint,
             created_at_utc=generated_at,
-            resolved_scope={
-                'project_ids': [project_id],
-                'job_ids': resolved_jobs,
-            },
+            resolved_scope=resolved_scope,
             sources=(source,),
             payload={
                 'project': {
                     'project_id': project_id,
                     'name': str(proj.get('name') or ''),
                 },
-                'adsorption_summary': self._report_scientific_payload(proj, summary),
+                'adsorption_summary': scientific_payload,
                 'free_energy_path': self._json_safe_report_result(fed or {}),
             },
             evidence={
@@ -4292,18 +4481,27 @@ class Api:
                     self._method_confirmation(proj)),
             },
         )
+        english = spec.locale == 'en-US'
         gate_check = ValidationCheck(
             id='adsorption-result-delivery-gate',
             status='pass' if eligible_final else 'fail',
             severity='blocking',
             required=True,
             message=(
-                '参考态、吸附能与方法证据满足吸附结果交付门槛。'
-                if eligible_final else str(gate_reason or '最终报告门禁未通过')
+                ('Reference-state, adsorption-energy, and method evidence satisfy '
+                 'the adsorption-result delivery gate.'
+                 if english else '参考态、吸附能与方法证据满足吸附结果交付门槛。')
+                if eligible_final else
+                ('The final-report delivery gate is blocked; inspect the bound '
+                 'snapshot evidence.' if english else
+                 str(gate_reason or '最终报告门禁未通过'))
             ),
             evidence_refs=('snapshot:evidence/final_report_gate',),
             remediation=(None if eligible_final else
-                         '补齐参考态、有效 ΔE 与方法一致性证据后重新验证。'),
+                         ('Complete reference-state, numeric Delta E, and method-'
+                          'comparability evidence, then validate again.'
+                          if english else
+                          '补齐参考态、有效 ΔE 与方法一致性证据后重新验证。')),
         )
         has_path = bool(fed and fed.get('steps'))
         path_check = ValidationCheck(
@@ -4311,8 +4509,13 @@ class Api:
             status='pass' if has_path else 'warn',
             severity='warning',
             required=False,
-            message=('已包含配平反应路径的自由能台阶。' if has_path else
-                     '未包含完整自由能台阶；不得据此声称动力学或完整热力学结论。'),
+            message=(
+                ('A balanced reaction free-energy pathway is included.'
+                 if english else '已包含配平反应路径的自由能台阶。')
+                if has_path else
+                ('A complete free-energy pathway is absent; no kinetic or '
+                 'complete thermodynamic claim is supported.' if english else
+                 '未包含完整自由能台阶；不得据此声称动力学或完整热力学结论。')),
             evidence_refs=('snapshot:payload/free_energy_path',),
         )
         qualification = ('adsorption_result_verified'
@@ -4322,9 +4525,14 @@ class Api:
                              else 'passed' if eligible_final else 'blocked')
         claim = ClaimRecord(
             id='claim.adsorption.delivery',
-            text=('本报告中的吸附能结果通过声明的交付门禁。'
-                  if report_kind == 'final' else
-                  '当前报告仅记录可用数据与阻断原因，不构成最终科学结论。'),
+            text=(
+                ('The adsorption-energy results in this report pass the declared '
+                 'delivery gate.' if english else
+                 '本报告中的吸附能结果通过声明的交付门禁。')
+                if report_kind == 'final' else
+                ('This report records available data and blocking evidence only; '
+                 'it is not a final scientific conclusion.' if english else
+                 '当前报告仅记录可用数据与阻断原因，不构成最终科学结论。')),
             qualification=qualification,
             status='supported' if report_kind == 'final' else 'limited',
             evidence_refs=('check:adsorption-result-delivery-gate',),
@@ -4348,7 +4556,7 @@ class Api:
         )
         validate_bindings(spec, snapshot, validation)
         return {
-            'report_id': f'{project_id}-{input_fingerprint[:16]}-{report_kind}',
+            'report_id': f'{project_id}-{spec.preset_id}-{report_kind}',
             'input_fingerprint': input_fingerprint,
             'scientific_qualification': qualification,
             'claim_ceiling': validation.claim_ceiling,
@@ -4376,11 +4584,60 @@ class Api:
 
     def _project_report_model(self, proj, summary, fed, *, report_kind='final',
                               figures=None, comparison_context=None,
-                              report_contracts=None):
+                              report_contracts=None, report_spec=None):
         """Build the single source of truth consumed by HTML/DOCX/PDF renderers."""
+        from vcstudio.project.report_contracts import ReportSpec
+
+        spec = None
+        if report_spec is not None:
+            spec = (report_spec if isinstance(report_spec, ReportSpec)
+                    else ReportSpec.from_mapping(report_spec))
+        locale = spec.locale if spec is not None else 'zh-CN'
+        english = locale == 'en-US'
+        try:
+            precision = int((spec.options if spec is not None else {}).get(
+                'precision', 3))
+        except (TypeError, ValueError):
+            precision = 3
+        precision = max(2, min(8, precision))
+        # These service-owned references are part of visible-content identity.
+        # Put them on the base model before report_content_sha256 is computed;
+        # adding them only after ValidationResult would make preview/render
+        # bindings disagree and would let theme changes escape the content hash.
+        template_ref = None
+        policy_refs = []
+        if spec is not None:
+            template_ref = self._json_safe_report_result(
+                spec.template_ref or {
+                    'id': f'vcstudio-{spec.theme_id}',
+                    'version': '1',
+                })
+            policy_refs = self._json_safe_report_result(
+                list(spec.policy_refs) or [{
+                    'id': 'project-final-report-gate',
+                    'version': '1',
+                }])
         evaluation = self._candidate_eval().evaluate_candidate(
             summary, project=proj, fed=fed)
-        selected = self._comparison_model().stable_species_rows(summary)
+        stable_only = True if spec is None else bool(
+            spec.scope.get('stable_only'))
+        if stable_only:
+            selected = self._comparison_model().stable_species_rows(summary)
+        else:
+            selected = []
+            for raw in (summary or {}).get('rows') or []:
+                row = dict(raw or {})
+                selected.append({
+                    'species': row.get('species') or 'unknown',
+                    'name': row.get('name') or row.get('job_id') or '—',
+                    'delta_e': row.get('delta_e'),
+                    'co_minima': [],
+                    'method_status': (
+                        (row.get('method_check') or {}).get('status')
+                        if isinstance(row.get('method_check'), dict) else
+                        row.get('method_status')) or 'unverified',
+                    'state': row.get('state') or 'UNKNOWN',
+                })
         method = summary.get('method_consistency') or {}
         basis = evaluation.get('basis') or {}
         decision = evaluation.get('decision') or {}
@@ -4391,86 +4648,223 @@ class Api:
         rows = []
         for row in selected:
             co_minima = row.get('co_minima') or []
+            delta_e = _method_number(row.get('delta_e'))
             rows.append([
                 row.get('species'),
                 row.get('name'),
-                f'{row.get("delta_e"):.3f}',
-                (f'{len(co_minima) + 1} 个近简并构型'
-                 if co_minima else '唯一最低构型'),
+                (f'{delta_e:.{precision}f}' if delta_e is not None else '—'),
+                (
+                    f'{len(co_minima) + 1} near-degenerate configurations'
+                    if english and co_minima else
+                    'Unique minimum configuration'
+                    if english and stable_only else
+                    f'{len(co_minima) + 1} 个近简并构型'
+                    if co_minima else
+                    '唯一最低构型' if stable_only else
+                    str(row.get('state') or 'UNKNOWN')
+                ),
                 row.get('method_status') or 'unverified',
             ])
-        findings = [
-            decision.get('summary_zh') or '当前数据仅支持吸附能层面的初筛判断。',
-            f'吸附序列趋势：{trend.get("status") or "insufficient"}；'
-            f'短链风险：{short_chain.get("status") or "unknown"}。',
-        ]
+        if english:
+            findings = [
+                (
+                    f"Decision priority: {decision.get('priority') or 'hold_for_evidence'}; "
+                    f"profile verdict: {decision.get('profile_verdict') or 'unknown'}; "
+                    f"data quality: {decision.get('data_quality') or 'unknown'}."
+                ),
+                f'Adsorption-sequence trend: {trend.get("status") or "insufficient"}; '
+                f'short-chain risk: {short_chain.get("status") or "unknown"}.',
+            ]
+        else:
+            findings = [
+                decision.get('summary_zh') or '当前数据仅支持吸附能层面的初筛判断。',
+                f'吸附序列趋势：{trend.get("status") or "insufficient"}；'
+                f'短链风险：{short_chain.get("status") or "unknown"}。',
+            ]
         if fed:
-            findings.append(
-                f'自由能路径：U_L={fed.get("u_l") if fed.get("u_l") is not None else "—"} V，'
-                f'PDS={fed.get("pds_index") if fed.get("pds_index") is not None else "—"}。')
+            u_l = _method_number(fed.get('u_l'))
+            pds = fed.get('pds_index')
+            if english:
+                findings.append(
+                    'Free-energy pathway: '
+                    f'U_L={f"{u_l:.{precision}f}" if u_l is not None else "—"} V; '
+                    f'PDS={pds if pds is not None else "—"}.')
+            else:
+                findings.append(
+                    '自由能路径：'
+                    f'U_L={f"{u_l:.{precision}f}" if u_l is not None else "—"} V，'
+                    f'PDS={pds if pds is not None else "—"}。')
         limitations = []
         for missing in (evidence.get('coverage') or {}).get('missing_species') or []:
-            limitations.append(f'缺少证据：{missing}')
-        limitations.extend(str(value) for value in (method.get('warnings') or []))
+            limitations.append(
+                f'Missing species evidence: {missing}.' if english
+                else f'缺少证据：{missing}')
+        method_warnings = list(method.get('warnings') or [])
+        if english and method_warnings:
+            limitations.append(
+                f'Method comparability has {len(method_warnings)} unresolved '
+                'warning(s); inspect the bound validation evidence before reuse.')
+        elif not english:
+            limitations.extend(str(value) for value in method_warnings)
         comparability = evaluation.get('comparability') or {}
-        limitations.extend(
-            str(item.get('message') or item)
-            for item in comparability.get('blocking') or [])
-        limitations.extend(
-            str(item.get('message') or item)
-            for item in comparability.get('warnings') or [])
-        if not fed:
-            limitations.append('未获得配平反应路径的自由能台阶，不能由吸附能差值推导 U_L。')
+        if english:
+            for category, prefix in (
+                    ('blocking', 'Comparability blocker'),
+                    ('warnings', 'Comparability warning')):
+                for index, item in enumerate(comparability.get(category) or [], 1):
+                    code = (str(item.get('code') or '').strip()
+                            if isinstance(item, dict) else '')
+                    limitations.append(
+                        f'{prefix}: {code or f"UNSPECIFIED_{index}"}.')
         else:
-            limitations.extend(str(value) for value in (fed.get('warnings') or []))
-        methods = [
-            '吸附能定义：E_ads = E(slab+ads) - E(slab) - E(adsorbate)，负值表示放热吸附。',
-            ('本报告使用 lis_eads_sabatier_screen_v1 初筛策略；区间是筛选启发式，'
-             '不是跨材料、覆盖度和计算设置通用的最佳吸附能标准。'),
-            f'方法可比性状态：{method.get("status") or "unverified"}。',
-            ('吸附能小于约 0.15 eV 的构型按近简并处理，不强行声明唯一最稳构型。'),
-        ]
+            limitations.extend(
+                str(item.get('message') or item)
+                for item in comparability.get('blocking') or [])
+            limitations.extend(
+                str(item.get('message') or item)
+                for item in comparability.get('warnings') or [])
+        if not fed:
+            limitations.append(
+                'No balanced reaction free-energy pathway is available; U_L '
+                'cannot be inferred from adsorption-energy differences.'
+                if english else
+                '未获得配平反应路径的自由能台阶，不能由吸附能差值推导 U_L。')
+        else:
+            fed_warnings = list(fed.get('warnings') or [])
+            if english and fed_warnings:
+                limitations.append(
+                    f'The free-energy pathway has {len(fed_warnings)} validation '
+                    'warning(s); inspect the bound pathway evidence.')
+            elif not english:
+                limitations.extend(str(value) for value in fed_warnings)
+        if english:
+            methods = [
+                'Adsorption energy is defined as E_ads = E(slab+ads) - E(slab) '
+                '- E(adsorbate); negative values indicate exothermic adsorption.',
+                'This report uses the lis_eads_sabatier_screen_v1 screening policy. '
+                'Its intervals are heuristics, not a universal optimum across '
+                'materials, coverages, or computational settings.',
+                f'Method-comparability status: {method.get("status") or "unverified"}.',
+                'Configurations within approximately 0.15 eV are retained as '
+                'near-degenerate candidates rather than forced into one minimum.',
+            ]
+        else:
+            methods = [
+                '吸附能定义：E_ads = E(slab+ads) - E(slab) - E(adsorbate)，负值表示放热吸附。',
+                ('本报告使用 lis_eads_sabatier_screen_v1 初筛策略；区间是筛选启发式，'
+                 '不是跨材料、覆盖度和计算设置通用的最佳吸附能标准。'),
+                f'方法可比性状态：{method.get("status") or "unverified"}。',
+                ('吸附能小于约 0.15 eV 的构型按近简并处理，不强行声明唯一最稳构型。'),
+            ]
         if fed:
-            methods.append(
-                '反应台阶已叠加 ZPE−TS 热校正。'
-                if fed.get('thermo_corrected')
-                else '反应台阶当前为未叠加 ZPE−TS 的电子能口径。')
-        model = {
-            'schema': 'vcstudio.research-report/v1',
-            'locale': 'zh-CN',
-            'title': f'{proj.get("name") or "催化剂"} 吸附能与反应路径评估',
-            'subtitle': (
+            if english:
+                methods.append(
+                    'Reaction steps include ZPE-TS corrections.'
+                    if fed.get('thermo_corrected') else
+                    'Reaction steps currently use electronic energies without '
+                    'ZPE-TS corrections.')
+            else:
+                methods.append(
+                    '反应台阶已叠加 ZPE−TS 热校正。'
+                    if fed.get('thermo_corrected')
+                    else '反应台阶当前为未叠加 ZPE−TS 的电子能口径。')
+        project_name = str(proj.get('name') or ('Catalyst' if english else '催化剂'))
+        claim_ceiling = (decision.get('claim_ceiling') or
+                         evidence.get('level') or 'electronic_adsorption_screen')
+        if english:
+            subtitle = (
+                'First-principles screening report for Li-S cathode catalysts'
+                if report_kind == 'final' else
+                'Research draft: content and evidence remain editable'
+                if report_kind == 'draft' else
+                'Diagnostic report: evidence does not yet satisfy the final gate')
+            metadata = {
+                'Project': project_name,
+                'Project ID': proj.get('project_uuid') or '—',
+                'Data quantity': basis.get('quantity') or 'delta_E_ads',
+                'Method gate': method.get('status') or 'unverified',
+                'Claim ceiling': claim_ceiling,
+                'Evaluation policy': (evaluation.get('audit') or {}).get('policy_id')
+                                     or 'lis_eads_sabatier_screen_v1',
+                'Numeric precision': f'{precision} decimal places',
+            }
+            executive_summary = (
+                f"The selected evidence supports an adsorption-energy screening "
+                f"decision of {decision.get('priority') or 'hold_for_evidence'}. "
+                'Free-energy and kinetic evidence are required before broader '
+                'catalytic-performance claims.'
+            )
+            table_title = (
+                'Minimum-energy configuration and electronic adsorption energy by species'
+                if stable_only else
+                'Electronic adsorption energy and state for selected configurations')
+            table_columns = [
+                'Species', 'Configuration', 'E_ads / eV',
+                'Near-degeneracy protection' if stable_only else 'Job state',
+                'Method status',
+            ]
+            table_caption = (
+                'The minimum E_ads is selected within each species; configurations '
+                'within 0.15 eV remain near-degenerate candidates. Adjacent rows '
+                'must not be subtracted directly as reaction steps.'
+                if stable_only else
+                'All configurations in the frozen workbench scope are retained; '
+                'failed or unfinished entries display an explicit missing value.')
+        else:
+            subtitle = (
                 '锂硫电池正极催化材料第一性原理筛选报告'
                 if report_kind == 'final' else
                 '研究草稿：内容与证据仍可继续编辑' if report_kind == 'draft' else
-                '诊断报告：证据尚未满足最终结论门槛'),
-            'kicker': 'VASP CATALYST STUDIO · RESEARCH REPORT',
-            'report_kind': report_kind,
-            'metadata': {
-                '项目': proj.get('name') or '—',
+                '诊断报告：证据尚未满足最终结论门槛')
+            metadata = {
+                '项目': project_name,
                 '项目标识': proj.get('project_uuid') or '—',
                 '数据口径': basis.get('quantity') or 'delta_E_ads',
                 '方法门禁': method.get('status') or 'unverified',
-                '结论上限': decision.get('claim_ceiling') or
-                            evidence.get('level') or 'electronic_adsorption_screen',
-                '评价策略': (evaluation.get('audit') or {}).get('policy_id') or
-                            'lis_eads_sabatier_screen_v1',
-            },
-            'executive_summary': decision.get('summary_zh') or
-                                 '当前结果仅支持吸附能初筛，建议结合自由能和势垒继续验证。',
+                '结论上限': claim_ceiling,
+                '评价策略': (evaluation.get('audit') or {}).get('policy_id')
+                            or 'lis_eads_sabatier_screen_v1',
+                '数值精度': f'小数点后 {precision} 位',
+            }
+            executive_summary = decision.get('summary_zh') or (
+                '当前结果仅支持吸附能初筛，建议结合自由能和势垒继续验证。')
+            table_title = ('各物种最稳吸附构型与电子吸附能' if stable_only
+                           else '所选构型的电子吸附能与状态')
+            table_columns = ['物种', '构型', 'E_ads / eV',
+                             '近简并保护' if stable_only else '作业状态', '方法状态']
+            table_caption = (
+                '同一物种按 E_ads 最低值选取；差值不超过 0.15 eV 的构型'
+                '保留为近简并候选。该表不能直接相邻相减作为反应台阶。'
+                if stable_only else
+                '按工作台冻结的数据范围保留全部所选构型；失败或未完成项以缺失数值明确显示。')
+        model = {
+            'schema': 'vcstudio.research-report/v1',
+            'locale': locale,
+            'outline': (list(spec.outline) if spec is not None else None),
+            'preset_id': (spec.preset_id if spec is not None else 'scientific-review'),
+            'template_ref': template_ref,
+            'policy_refs': policy_refs,
+            'title': (f'{project_name} Adsorption-Energy and Reaction-Path Assessment'
+                      if english else f'{project_name} 吸附能与反应路径评估'),
+            'subtitle': subtitle,
+            'kicker': 'VASP CATALYST STUDIO · RESEARCH REPORT',
+            'report_kind': report_kind,
+            'metadata': metadata,
+            'executive_summary': executive_summary,
             'key_findings': findings,
-            'candidate_evaluations': self._candidate_evaluation_table([evaluation]),
+            'candidate_evaluations': self._candidate_evaluation_table(
+                [evaluation], locale=locale, precision=precision),
             'adsorption_table': {
-                'title': '各物种最稳吸附构型与电子吸附能',
-                'columns': ['物种', '最稳构型', 'E_ads / eV', '近简并保护', '方法状态'],
+                'title': table_title,
+                'columns': table_columns,
                 'rows': rows,
-                'caption': ('同一物种按 E_ads 最低值选取；差值不超过 0.15 eV 的构型'
-                            '保留为近简并候选。该表不能直接相邻相减作为反应台阶。'),
+                'caption': table_caption,
             },
             'figures': list(figures or []),
             'methods': methods,
             'limitations': list(dict.fromkeys(limitations)),
-            'recommendations': self._recommendation_blocks([evaluation]),
+            'recommendations': self._recommendation_blocks(
+                [evaluation], locale=locale),
             'comparison_context': comparison_context or {},
         }
         if report_contracts:
@@ -4483,14 +4877,19 @@ class Api:
                 'scientific_qualification': (
                     'adsorption_result_verified' if report_kind == 'final'
                     else 'diagnostic'),
-                'claim_ceiling': decision.get('claim_ceiling') or
-                                 evidence.get('level') or
-                                 'electronic_adsorption_screen',
+                'claim_ceiling': claim_ceiling,
             })
         return model
 
-    def _project_report_figures(self, proj, summary, fed, out_dir):
+    def _project_report_figures(self, proj, summary, fed, out_dir, report_spec=None):
         """Generate report figures from the same selected rows/fed snapshot."""
+        from vcstudio.project.report_contracts import ReportSpec
+
+        spec = None
+        if report_spec is not None:
+            spec = (report_spec if isinstance(report_spec, ReportSpec)
+                    else ReportSpec.from_mapping(report_spec))
+        english = bool(spec is not None and spec.locale == 'en-US')
         nc = self._nc()
         os.makedirs(out_dir, exist_ok=True)
         selected = self._comparison_model().stable_species_rows(summary)
@@ -4508,9 +4907,14 @@ class Api:
             files.extend(bar_files)
             figures.append({
                 'path': bar_files[0],
-                'title': 'Li-S 物种最稳构型的电子吸附能',
-                'caption': ('数值越负表示吸附越强；'
-                            '过强吸附不自动等同于更优催化性能。'),
+                'title': ('Electronic adsorption energies of minimum-energy '
+                          'Li-S configurations' if english else
+                          'Li-S 物种最稳构型的电子吸附能'),
+                'caption': (
+                    'More negative values indicate stronger adsorption; stronger '
+                    'adsorption does not automatically imply better catalytic performance.'
+                    if english else
+                    '数值越负表示吸附越强；过强吸附不自动等同于更优催化性能。'),
             })
             table_files = nc.energy_matrix_table(
                 data, os.path.join(out_dir, 'adsorption_table.png'),
@@ -4532,11 +4936,607 @@ class Api:
             files.extend(ladder_files)
             figures.append({
                 'path': ladder_files[0],
-                'title': '配平反应路径的自由能台阶',
-                'caption': ('PDS 与 U_L 直接取自'
-                            '自由能模块的逐电子定义，不由绘图层重新推导。'),
+                'title': ('Free-energy steps of the balanced reaction pathway'
+                          if english else '配平反应路径的自由能台阶'),
+                'caption': (
+                    'PDS and U_L are taken from the electron-resolved free-energy '
+                    'definition and are not re-derived by the plotting layer.'
+                    if english else
+                    'PDS 与 U_L 直接取自自由能模块的逐电子定义，不由绘图层重新推导。'),
             })
         return figures, files
+
+    # ── Phase C:统一报告工作台服务接线 ─────────────────────────────────────
+    def _report_workbench_project_context(self, path):
+        """Resolve one project without exposing its registry path to the browser."""
+        project_path = str(path or '').strip()
+        if not project_path:
+            raise ValueError('未指定项目路径')
+        project = self._adsorption.load_project(project_path)
+        if project is None:
+            raise FileNotFoundError('项目不存在或 project.yaml 已被移动')
+        root = str(project.get('root') or '').strip()
+        if not root:
+            absolute = os.path.abspath(os.path.normpath(project_path))
+            root = absolute if os.path.isdir(absolute) else os.path.dirname(absolute)
+        return {
+            'project': project,
+            'project_path': project_path,
+            'project_root': os.path.abspath(os.path.normpath(root)),
+            'project_id': self._workspace_project_id(project_path, project),
+            'project_name': str(project.get('name') or ''),
+        }
+
+    @staticmethod
+    def _report_scope_sha256(report_spec):
+        """Hash only the selector semantics shared by request and replay.
+
+        Service-owned template/policy references change the full ReportSpec
+        digest, but they must not make an otherwise identical data selector look
+        different while a marker is replayed.  This projection is therefore
+        intentionally limited to ``scope``.
+        """
+        from vcstudio.project.report_contracts import ReportSpec
+
+        spec = (report_spec if isinstance(report_spec, ReportSpec)
+                else ReportSpec.from_mapping(report_spec))
+        scope = Api._json_safe_report_result(dict(spec.scope))
+        encoded = json.dumps(
+            scope, ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+            allow_nan=False).encode('utf-8')
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _report_workbench_scope_summary(self, context, summary, report_spec):
+        """Apply a validated opaque-ID scope and reject unresolved selections."""
+        from vcstudio.project.report_contracts import ReportSpec
+
+        spec = (report_spec if isinstance(report_spec, ReportSpec)
+                else ReportSpec.from_mapping(report_spec))
+        scope = spec.scope
+        project_ids = list(scope.get('project_ids') or [])
+        if project_ids != [context['project_id']]:
+            raise ValueError('ReportSpec 项目范围与当前项目身份不一致')
+        project = context['project']
+        member_ids = {}
+        config_ids = set()
+        config_name_ids = {}
+        members = project.get('members') or {}
+        config_paths = {
+            self._workspace_path_key(path)
+            for path in (members.get('configs') or [])
+        }
+        for member_dir in self._project_member_dirs(project):
+            manifest = self._manifest.load_manifest(member_dir) or {}
+            job_id = self._workspace_job_id(member_dir, manifest)
+            member_key = self._workspace_path_key(member_dir)
+            member_ids[member_key] = job_id
+            if member_key in config_paths:
+                config_ids.add(job_id)
+                base_name = os.path.basename(os.path.normpath(str(member_dir)))
+                config_name_ids.setdefault(os.path.normcase(base_name), []).append(job_id)
+
+        requested_jobs = set(scope.get('job_ids') or [])
+        requested_configs = set(scope.get('configuration_ids') or [])
+        known_jobs = set(member_ids.values())
+        unknown_jobs = sorted(requested_jobs - known_jobs)
+        unknown_configs = sorted(requested_configs - config_ids)
+        if unknown_jobs:
+            raise ValueError('ReportSpec 包含不属于当前项目的 job_id：'
+                             + '、'.join(unknown_jobs))
+        if unknown_configs:
+            raise ValueError('ReportSpec 包含不属于当前项目的 configuration_id：'
+                             + '、'.join(unknown_configs))
+
+        species = set(scope.get('species') or [])
+        selected_ids = requested_configs | {
+            item for item in requested_jobs if item in config_ids
+        }
+        has_member_filter = bool(requested_jobs or requested_configs)
+        include_failed = bool(scope.get('include_failed'))
+        rows = []
+        for raw in (summary or {}).get('rows') or []:
+            row = copy.deepcopy(dict(raw or {}))
+            raw_job = (row.get('job') or row.get('dir') or row.get('path')
+                       or row.get('source_job') or row.get('job_id')
+                       or row.get('configuration_id'))
+            raw_job_text = str(raw_job or '').strip()
+            job_id = (raw_job_text if raw_job_text in config_ids else
+                      member_ids.get(self._workspace_path_key(raw_job))
+                      if raw_job else None)
+            if not job_id:
+                row_name = os.path.basename(os.path.normpath(
+                    str(row.get('name') or '')))
+                candidates = config_name_ids.get(os.path.normcase(row_name)) or []
+                if len(candidates) == 1:
+                    job_id = candidates[0]
+            if job_id not in config_ids:
+                job_id = None
+            if job_id:
+                row['job_id'] = job_id
+                row['configuration_id'] = job_id
+            if has_member_filter and job_id not in selected_ids:
+                continue
+            if species and str(row.get('species') or '') not in species:
+                continue
+            if not include_failed:
+                if (str(row.get('state') or '').upper() != 'DONE'
+                        or _method_number(row.get('delta_e')) is None):
+                    continue
+            rows.append(row)
+        has_explicit_row_filter = bool(has_member_filter or species)
+        if has_explicit_row_filter and not rows:
+            raise ValueError('ReportSpec 数据范围没有解析到任何项目构型')
+        selected_configuration_ids = sorted({
+            row.get('job_id') for row in rows if row.get('job_id')
+        })
+        unresolved_rows = [
+            str(row.get('name') or '?') for row in rows if not row.get('job_id')
+        ]
+        if unresolved_rows:
+            raise ValueError(
+                'ReportSpec 无法把构型行绑定到服务器 opaque configuration_id：'
+                + '、'.join(unresolved_rows))
+
+        dependency_paths = []
+        clean_slab = members.get('clean_slab')
+        if clean_slab:
+            dependency_paths.append(clean_slab)
+        reference_mode = str((summary or {}).get('reference_mode') or '')
+        if reference_mode == 'single' and members.get('gas_ref'):
+            dependency_paths.append(members.get('gas_ref'))
+        elif reference_mode == 'species':
+            selected_species = {
+                str(row.get('species') or '') for row in rows if row.get('species')
+            }
+            species_ref_jobs = project.get('species_ref_jobs') or {}
+            if isinstance(species_ref_jobs, dict):
+                dependency_paths.extend(
+                    species_ref_jobs.get(species) for species in selected_species
+                    if species_ref_jobs.get(species))
+            dependency_paths.extend(
+                row.get('reference_job') for row in rows if row.get('reference_job'))
+        dependency_job_ids = sorted({
+            member_ids.get(self._workspace_path_key(path))
+            for path in dependency_paths if path
+        } - {None})
+        included_member_ids = sorted({
+            *selected_configuration_ids, *dependency_job_ids,
+        })
+        excluded_configuration_ids = sorted(config_ids - set(
+            selected_configuration_ids))
+
+        scoped = copy.deepcopy(dict(summary or {}))
+        scoped['rows'] = rows
+        # Method evidence must describe the selected rows, not configurations
+        # excluded by the ReportSpec.  Every production delta_e row carries its
+        # pairwise method check; legacy rows without it retain the aggregate.
+        selected_checks = [
+            row.get('method_check') for row in rows
+            if isinstance(row.get('method_check'), dict)
+        ]
+        if selected_checks:
+            issues = list(dict.fromkeys(
+                item for check in selected_checks
+                for item in (check.get('issues') or [])))
+            warnings = list(dict.fromkeys(
+                item for check in selected_checks
+                for item in (check.get('warnings') or [])))
+            advisories = list(dict.fromkeys(
+                item for check in selected_checks
+                for item in (check.get('advisories') or [])))
+            scoped['method_consistency'] = {
+                'status': ('incompatible' if issues else
+                           'verified' if not warnings else 'unverified'),
+                'issues': issues,
+                'warnings': warnings,
+                'advisories': advisories,
+            }
+        scoped['_report_scope'] = {
+            'scope_sha256': self._report_scope_sha256(spec),
+            'available_member_ids': sorted(known_jobs),
+            'available_configuration_ids': sorted(config_ids),
+            'requested_job_ids': sorted(requested_jobs),
+            'requested_configuration_ids': sorted(requested_configs),
+            'selected_configuration_ids': selected_configuration_ids,
+            'dependency_job_ids': dependency_job_ids,
+            'excluded_configuration_ids': excluded_configuration_ids,
+            'included_member_ids': included_member_ids,
+            'selected_species': sorted(
+                {str(row.get('species')) for row in rows if row.get('species')}),
+            'input_rows': len((summary or {}).get('rows') or []),
+            'selected_rows': len(rows),
+        }
+        return scoped
+
+    def _report_workbench_build(self, path, report_spec, work_dir):
+        """Build one frozen model/contract chain without publishing artifacts."""
+        from vcstudio.project.report_contracts import ReportSpec
+
+        spec = (report_spec if isinstance(report_spec, ReportSpec)
+                else ReportSpec.from_mapping(report_spec))
+        context = self._report_workbench_project_context(path)
+        project = context['project']
+        raw_summary = self._adsorption.delta_e_rows(project)
+        summary = self._report_workbench_scope_summary(context, raw_summary, spec)
+        eligible, gate_reason = self._final_report_gate(project, summary)
+        requested = spec.requested_kind
+        report_kind = ('final' if requested == 'final' and eligible else
+                       'draft' if requested == 'draft' else 'diagnostic')
+        include_thermo = bool(spec.options.get('include_thermochemistry'))
+        if include_thermo:
+            fed, fed_reason = self._proj_fed(project, summary)
+        else:
+            fed, fed_reason = None, '当前 ReportSpec 未请求热化学校正或反应路径'
+        input_fingerprint = self._report_input_fingerprint(project, summary)
+        scientific_fingerprint = self._report_scientific_fingerprint(project, summary)
+        figure_dir = os.path.join(str(work_dir), 'figures')
+        figures, figure_files = self._project_report_figures(
+            project, summary, fed, figure_dir, report_spec=spec)
+        model = self._project_report_model(
+            project, summary, fed, report_kind=report_kind, figures=figures,
+            report_spec=spec)
+        qualification = ('adsorption_result_verified'
+                         if report_kind == 'final' else 'diagnostic')
+        model.update({
+            'scientific_qualification': qualification,
+            'claim_ceiling': 'electronic_adsorption_screen',
+        })
+        english = spec.locale == 'en-US'
+        if gate_reason and report_kind == 'diagnostic':
+            model['limitations'] = [
+                ('The final-report gate is blocked; inspect ValidationResult '
+                 'and its bound evidence before publication.'
+                 if english else f'最终报告门禁未通过：{gate_reason}'),
+                *model.get('limitations', []),
+            ]
+        if fed_reason:
+            model['limitations'] = [
+                ('The free-energy pathway was not generated for the selected '
+                 'scope; no pathway-derived claim is made.'
+                 if english else f'自由能台阶未生成：{fed_reason}'),
+                *model.get('limitations', []),
+            ]
+        content_hasher = getattr(self._paper(), 'report_content_sha256', None)
+        if not callable(content_hasher):
+            from vcstudio.project.paper_report import report_content_sha256
+
+            content_hasher = report_content_sha256
+        try:
+            report_model_sha256 = str(
+                content_hasher(model, outline=spec.outline)).lower()
+        except TypeError:
+            report_model_sha256 = str(content_hasher(model)).lower()
+        contracts = self._project_report_contracts(
+            project, path, summary, fed,
+            requested_kind=requested,
+            report_kind=report_kind,
+            formats=spec.formats,
+            eligible_final=eligible,
+            gate_reason=gate_reason,
+            report_model_sha256=report_model_sha256,
+            report_spec=spec,
+        )
+        model.update(self._json_safe_report_result(contracts))
+        canonical_spec = contracts['report_spec']
+        model.update({
+            'locale': canonical_spec['locale'],
+            'outline': list(canonical_spec['outline']),
+            'preset_id': canonical_spec['preset_id'],
+            'template_ref': canonical_spec.get('template_ref'),
+            'policy_refs': canonical_spec.get('policy_refs') or [],
+        })
+        return {
+            'project': project,
+            'project_path': str(path),
+            'project_root': context['project_root'],
+            'project_id': context['project_id'],
+            'summary': summary,
+            'report_spec': spec.to_dict(),
+            'requested_kind': requested,
+            'report_kind': report_kind,
+            'eligible_final': bool(eligible),
+            'gate_reason': str(gate_reason or ''),
+            'fed_reason': str(fed_reason or ''),
+            'input_fingerprint': input_fingerprint,
+            'scientific_fingerprint': scientific_fingerprint,
+            'report_model_sha256': report_model_sha256,
+            'contracts': contracts,
+            'model': model,
+            'figure_dir': figure_dir,
+            'figure_files': figure_files,
+            'default_stem': self._safe_report_stem(
+                f'{project.get("name") or "project"}_{spec.preset_id}'),
+        }
+
+    def _report_workbench_render_preview(self, model):
+        renderer = getattr(self._paper(), 'render_report_html_preview', None)
+        if not callable(renderer):
+            from vcstudio.project.paper_report import render_report_html_preview
+
+            renderer = render_report_html_preview
+        return self._json_safe_report_result(renderer(model))
+
+    def _report_workbench_current_state(self, path, report_spec=None):
+        context = self._report_workbench_project_context(path)
+        project = context['project']
+        summary = self._adsorption.delta_e_rows(project)
+        if report_spec is not None:
+            summary = self._report_workbench_scope_summary(
+                context, summary, report_spec)
+        eligible, reason = self._final_report_gate(project, summary)
+        return {
+            'project_id': context['project_id'],
+            'input_fingerprint': self._report_input_fingerprint(project, summary),
+            'scientific_fingerprint': self._report_scientific_fingerprint(
+                project, summary),
+            'eligible_final': bool(eligible),
+            'gate_reason': str(reason or ''),
+        }
+
+    def _report_workbench_validate_history_entry(self, entry):
+        """Re-audit one immutable revision from bytes, never history labels.
+
+        History is an index, not scientific authority.  This seam verifies the
+        manifest hash, all rendered files, the frozen model, the three contract
+        sidecars, their semantic bindings, and the exact revision projection.
+        Only then are scientific status and qualification derived from the
+        validated ValidationResult.
+        """
+        result = {
+            'ok': False,
+            'current': False,
+            'scientific_status': None,
+            'scientific_qualification': None,
+            'validation_status': None,
+            'publication_gate_status': 'unknown',
+            'error': None,
+        }
+        try:
+            if not isinstance(entry, dict):
+                raise TypeError('历史报告 revision 必须为对象')
+            manifest_path = str(entry.get('manifest') or '')
+            expected_manifest_sha256 = str(
+                entry.get('manifest_sha256') or '').strip().lower()
+            if (not manifest_path or not os.path.isabs(manifest_path)
+                    or not os.path.isfile(manifest_path)
+                    or not re.fullmatch(r'[0-9a-f]{64}',
+                                        expected_manifest_sha256)
+                    or _sha256_file(manifest_path)
+                    != expected_manifest_sha256):
+                raise RuntimeError('历史报告 manifest 不存在或哈希已变化')
+            try:
+                with open(manifest_path, 'r', encoding='utf-8') as handle:
+                    manifest = json.load(handle)
+            except Exception as exc:                     # noqa: BLE001 fail closed
+                raise RuntimeError(f'历史报告 manifest 无法解析：{exc}') from exc
+            if not isinstance(manifest, dict):
+                raise RuntimeError('历史报告 manifest 必须为对象')
+
+            raw_kind = str(manifest.get('report_kind') or '').strip().lower()
+            raw_qualification = str(
+                manifest.get('scientific_qualification') or '').strip().lower()
+            scientific_fingerprint = str(
+                manifest.get('input_fingerprint') or '').strip().lower()
+            report_model_sha256 = str(
+                manifest.get('report_model_sha256') or '').strip().lower()
+            model_sha256 = str(
+                manifest.get('model_sha256') or '').strip().lower()
+            normalized_contracts = self._validated_report_contract_refs(
+                manifest.get('contracts'), raw_kind, require_sidecars=True)
+            for key in ('spec', 'snapshot', 'validation'):
+                if (str(entry.get(f'{key}_sha256') or '').strip().lower()
+                        != normalized_contracts[key]['sha256']):
+                    raise RuntimeError(
+                        f'历史报告 {key} 语义哈希与 revision 不一致')
+            if (str(entry.get('report_model_sha256') or '').strip().lower()
+                    != report_model_sha256):
+                raise RuntimeError('历史报告正文指纹与 revision 不一致')
+
+            report_files = entry.get('files')
+            contract_files = entry.get('contract_files')
+            if not isinstance(report_files, dict) or not report_files:
+                raise RuntimeError('历史报告格式文件清单无效')
+            if (not isinstance(contract_files, dict)
+                    or set(contract_files) != {'spec', 'snapshot', 'validation'}):
+                raise RuntimeError('历史报告 contract sidecar 清单不完整')
+            files = {
+                str(fmt): str(path) for fmt, path in report_files.items()
+                if fmt in _REPORT_FORMATS and path
+            }
+            if set(files) != set(report_files):
+                raise RuntimeError('历史报告包含未知格式文件')
+            files['model'] = str(entry.get('model_file') or '')
+            files['manifest'] = manifest_path
+            for key, path in contract_files.items():
+                files[f'contract_{key}'] = str(path or '')
+
+            payloads = self._validate_report_contract_sidecars(
+                files,
+                normalized_contracts,
+                kind=raw_kind,
+                scientific_fingerprint=scientific_fingerprint,
+                scientific_qualification=raw_qualification,
+                report_model_sha256=report_model_sha256,
+            )
+            from vcstudio.project.report_contracts import (
+                ReportSnapshot,
+                ReportSpec,
+                ValidationResult,
+                validate_bindings,
+            )
+
+            spec = ReportSpec.from_mapping(payloads['spec'])
+            snapshot = ReportSnapshot.from_mapping(
+                payloads['snapshot'], spec=spec)
+            validation = ValidationResult.from_mapping(
+                payloads['validation'], spec=spec, snapshot=snapshot)
+            validate_bindings(spec, snapshot, validation)
+            derived_kind = validation.effective_kind
+            derived_qualification = validation.scientific_qualification
+            if raw_kind != derived_kind:
+                raise RuntimeError('历史报告 manifest 与 ValidationResult 科学状态不一致')
+            if raw_qualification != derived_qualification:
+                raise RuntimeError('历史报告 manifest 与 ValidationResult 科学资格不一致')
+            if str(entry.get('scientific_status') or '') != derived_kind:
+                raise RuntimeError('历史报告 revision 科学状态不一致')
+            if (str(entry.get('scientific_qualification') or '')
+                    != derived_qualification):
+                raise RuntimeError('历史报告 revision 科学资格不一致')
+            if snapshot.input_fingerprint != scientific_fingerprint:
+                raise RuntimeError('历史报告 snapshot 与 manifest 输入指纹不一致')
+
+            revision_fields = (
+                'schema', 'report_id', 'revision_id', 'sequence',
+                'parent_manifest_sha256', 'spec_sha256', 'snapshot_sha256',
+                'validation_sha256', 'report_model_sha256', 'created_at_utc',
+            )
+            revision = {key: entry.get(key) for key in revision_fields}
+            self._validate_report_manifest(
+                manifest_path,
+                kind=derived_kind,
+                model_sha256=model_sha256,
+                scientific_fingerprint=scientific_fingerprint,
+                contracts=normalized_contracts,
+                scientific_qualification=derived_qualification,
+                files=files,
+                report_model_sha256=validation.report_model_sha256,
+                revision=revision,
+            )
+            result.update({
+                'ok': True,
+                'current': True,
+                'scientific_status': derived_kind,
+                'scientific_qualification': derived_qualification,
+                'validation_status': validation.status,
+                'publication_gate_status': (
+                    'eligible' if validation.final_allowed else 'blocked'),
+                'error': None,
+            })
+        except Exception as exc:                         # noqa: BLE001 public seam
+            result['error'] = str(exc)
+        return result
+
+    def _report_workbench_render_build(self, build, out_dir, *, stem, revision):
+        """Render one already frozen preview build; marker/history remain separate."""
+        target = os.path.abspath(os.path.normpath(str(out_dir or '').strip()))
+        if not str(out_dir or '').strip():
+            raise ValueError('未指定报告目录')
+        os.makedirs(target, exist_ok=True)
+        model = copy.deepcopy(build['model'])
+        model['revision'] = copy.deepcopy(dict(revision or {}))
+        if revision and revision.get('report_id'):
+            model['report_id'] = revision['report_id']
+        wanted = tuple((build['contracts']['report_spec'] or {}).get('formats') or [])
+        safe_stem = self._safe_report_stem(stem)
+        rendered = self._json_safe_report_result(
+            self._paper().render_report_bundle(
+                model, target, stem=safe_stem, formats=wanted))
+        rendered.setdefault('ok', True)
+        rendered_files = (dict(rendered.get('files') or {})
+                          if isinstance(rendered.get('files'), dict) else {})
+        sidecars = (dict(rendered.get('sidecar_files') or {})
+                    if isinstance(rendered.get('sidecar_files'), dict) else {})
+        model_file = str(rendered.get('model_file') or sidecars.get('model')
+                         or rendered_files.get('model') or '')
+        missing = [
+            fmt for fmt in wanted
+            if not rendered_files.get(fmt)
+            or not os.path.isfile(str(rendered_files.get(fmt)))
+        ]
+        error = str(rendered.get('error') or '').strip()
+        if rendered.get('ok') is False or error:
+            rendered.update({
+                'ok': False, 'artifact_status': 'failed',
+                'error': error or '报告渲染器返回失败状态',
+            })
+        elif missing:
+            rendered.update({
+                'ok': False, 'artifact_status': 'failed',
+                'error': '报告渲染器未产出所请求格式：' + '、'.join(sorted(missing)),
+            })
+        elif not model_file or not os.path.isfile(model_file):
+            rendered.update({
+                'ok': False, 'artifact_status': 'failed',
+                'error': '报告渲染器未产出冻结 model sidecar',
+            })
+        elif (str(rendered.get('report_model_sha256') or '').lower()
+              != build['report_model_sha256']):
+            rendered.update({
+                'ok': False, 'artifact_status': 'failed',
+                'error': '报告渲染器正文指纹与冻结预览不一致',
+            })
+        elif (str(rendered.get('input_fingerprint') or '')
+              != build['scientific_fingerprint']):
+            rendered.update({
+                'ok': False, 'artifact_status': 'failed',
+                'error': '报告渲染器输入指纹与冻结快照不一致',
+            })
+        rendered.update({
+            'kind': build['report_kind'],
+            'scientific_status': build['report_kind'],
+            'scientific_qualification': build['contracts'][
+                'scientific_qualification'],
+            'requested_kind': build['requested_kind'],
+            'eligible_final': build['eligible_final'],
+            'publication_gate_status': (
+                'eligible' if build['eligible_final'] else 'blocked'),
+            'desired_report_kind': (
+                'final' if build['eligible_final'] else 'diagnostic'),
+            'gate_reason': build['gate_reason'],
+            'figures': build['figure_files'],
+            'model_file': model_file,
+            'error': rendered.get('error'),
+        })
+        rendered.setdefault('artifact_status', 'complete')
+        return rendered
+
+    def _report_workbench_persist_build(self, build, rendered, *, revision):
+        if rendered.get('ok') is False:
+            raise RuntimeError(rendered.get('error') or '报告渲染失败，不能登记 marker')
+        rendered_files = dict(rendered.get('files') or {})
+        marker_files = dict(rendered_files)
+        marker_files['model'] = rendered.get('model_file')
+        contract_files = rendered.get('contract_files') or {}
+        if not isinstance(contract_files, dict):
+            raise TypeError('报告渲染器 contract_files 必须为对象')
+        for key, value in contract_files.items():
+            marker_files[f'contract_{key}'] = value
+        if rendered.get('manifest'):
+            marker_files.setdefault('manifest', rendered.get('manifest'))
+        return self._persist_report_marker(
+            build['project'], build['summary'], marker_files,
+            kind=build['report_kind'],
+            reason=build['gate_reason'],
+            figures_dir=build['figure_dir'],
+            model_sha256=rendered.get('model_sha256'),
+            report_model_sha256=rendered.get('report_model_sha256'),
+            contracts=(rendered.get('contracts')
+                       or build['contracts'].get('contract_refs') or {}),
+            scientific_qualification=build['contracts'][
+                'scientific_qualification'],
+            manifest=rendered.get('manifest'),
+            project_path=build['project_path'],
+            expected_input_fingerprint=build['input_fingerprint'],
+            expected_scientific_fingerprint=build['scientific_fingerprint'],
+            expected_project_id=(build['project'].get('project_uuid')
+                                 or build['project'].get('name') or ''),
+            workspace_project_id=build['project_id'],
+            report_spec=build['contracts']['report_spec'],
+            revision=revision,
+        )
+
+    def report_workbench_bootstrap(self, path, preset_id=None):
+        return self._reports().bootstrap(path, preset_id=preset_id)
+
+    def report_workbench_preview(self, path, request=None):
+        return self._reports().preview(path, request)
+
+    def report_workbench_publish(self, path, out_dir, preview_id, expected=None):
+        return self._reports().publish(
+            path, out_dir, preview_id, expected, public=True, record_artifact=True)
+
+    def report_workbench_history(self, path):
+        return self._reports().history(path)
 
     def proj_report_capabilities(self):
         """Expose report-format dependencies before the user starts a long render."""
@@ -4658,6 +5658,45 @@ class Api:
 
     def proj_report_bundle(self, path, out_dir, formats=None, final=True, stem=None,
                            record_artifact=True, requested_kind=None):
+        """Compatibility adapter into the unified Phase C report service."""
+        if record_artifact is not True:
+            return self._report_failure_envelope(
+                '公开报告入口不允许绕过 revision、manifest 与 marker 登记',
+                requested_kind=(str(requested_kind or '').strip().lower() or None),
+                record_artifact_required=True,
+            )
+        return self._reports().legacy_publish(
+            path,
+            out_dir,
+            formats=formats,
+            final=final,
+            stem=stem,
+            record_artifact=record_artifact,
+            requested_kind=requested_kind,
+        )
+
+    def _report_bundle_unrecorded(self, path, out_dir, formats=None, final=True,
+                                  stem=None, requested_kind=None):
+        """Private seam for a parent artifact that owns the final audit record.
+
+        This method is intentionally not a public pywebview API contract.  Batch
+        comparison may render child documents into its own bundle, while the
+        browser-facing ``proj_report_bundle`` can never request an unrecorded
+        formal artifact.
+        """
+        return self._reports().legacy_publish(
+            path,
+            out_dir,
+            formats=formats,
+            final=final,
+            stem=stem,
+            record_artifact=False,
+            requested_kind=requested_kind,
+        )
+
+    def _proj_report_bundle_legacy_impl(
+            self, path, out_dir, formats=None, final=True, stem=None,
+            record_artifact=True, requested_kind=None):
         """Generate a thesis-style HTML + DOCX + PDF bundle from one data snapshot.
 
         A failed final-result gate produces an explicit diagnostic report instead
@@ -5265,9 +6304,9 @@ class Api:
                         stem = f'{base}_{serial}'
                         serial += 1
                     used_stems.add(stem)
-                    result = self.proj_report_bundle(
+                    result = self._report_bundle_unrecorded(
                         source['path'], target, wanted, final=final, stem=stem,
-                        record_artifact=False, requested_kind=requested)
+                        requested_kind=requested)
                     individual.append({
                         'path': source['path'], 'name': project.get('name') or f'项目{index + 1}',
                         'kind': result.get('kind'), 'files': result.get('files') or {},
@@ -6955,11 +7994,18 @@ class Api:
 
     def _report_scientific_payload(self, project, summary) -> dict:
         """Return path-independent scientific inputs for report contracts."""
+        summary = summary if isinstance(summary, dict) else {}
         project_root = os.path.abspath(os.path.normpath(str(
             project.get('root') or os.curdir)))
+        scope_state = summary.get('_report_scope') or {}
+        scoped = isinstance(scope_state, dict) and 'included_member_ids' in scope_state
+        included_member_ids = set(scope_state.get('included_member_ids') or [])
         members = []
         for index, job_dir in enumerate(self._project_member_dirs(project), 1):
             manifest = self._manifest.load_manifest(job_dir) or {}
+            workspace_member_id = self._workspace_job_id(job_dir, manifest)
+            if scoped and workspace_member_id not in included_member_ids:
+                continue
             results = manifest.get('results') or {}
             attempts = []
             for attempt in manifest.get('attempts') or []:
@@ -6972,8 +8018,9 @@ class Api:
                     if key in attempt
                 })
             members.append({
-                'member_id': self._portable_member_id(
-                    job_dir, project_root, index, manifest),
+                'member_id': (workspace_member_id if scoped else
+                              self._portable_member_id(
+                                  job_dir, project_root, index, manifest)),
                 'state': manifest.get('state'),
                 'scheduler_job_id': manifest.get('scheduler_job_id'),
                 'attempts': attempts,
@@ -6984,8 +8031,12 @@ class Api:
                 'fetched_sizes': results.get('fetched_sizes') or {},
             })
         reference_evidence = []
-        for item in (summary or {}).get('species_reference_evidence') or []:
+        selected_species = set(scope_state.get('selected_species') or [])
+        for item in summary.get('species_reference_evidence') or []:
             if not isinstance(item, dict):
+                continue
+            if (scoped and selected_species
+                    and str(item.get('species') or '') not in selected_species):
                 continue
             reference_evidence.append({
                 key: item.get(key) for key in (
@@ -6997,12 +8048,12 @@ class Api:
         return self._json_safe_report_result({
             'project_id': project.get('project_uuid') or project.get('name'),
             'members': members,
-            'slab': (summary or {}).get('slab'),
-            'ref': (summary or {}).get('ref'),
-            'has_ref': bool((summary or {}).get('has_ref')),
-            'reference_mode': (summary or {}).get('reference_mode'),
+            'slab': summary.get('slab'),
+            'ref': summary.get('ref'),
+            'has_ref': bool(summary.get('has_ref')),
+            'reference_mode': summary.get('reference_mode'),
             'species_reference_evidence': reference_evidence,
-            'method_consistency': (summary or {}).get('method_consistency') or {},
+            'method_consistency': summary.get('method_consistency') or {},
             'method_confirmation': {
                 key: confirmation.get(key) for key in (
                     'confirmed', 'reason', 'scope', 'confirmed_by',
@@ -7010,10 +8061,11 @@ class Api:
             },
             'rows': [{
                 key: row.get(key) for key in (
-                    'name', 'species', 'state', 'e_config', 'e_slab', 'e_ref',
-                    'delta_e', 'dd_e', 'reference_valid', 'reference_state',
-                    'method_status', 'note') if key in row
-            } for row in ((summary or {}).get('rows') or [])],
+                    'configuration_id', 'job_id', 'name', 'species', 'state',
+                    'e_config', 'e_slab', 'e_ref', 'delta_e', 'dd_e',
+                    'reference_valid', 'reference_state', 'method_status',
+                    'note') if key in row
+            } for row in (summary.get('rows') or [])],
         })
 
     def _report_scientific_fingerprint(self, project, summary) -> str:
@@ -7024,9 +8076,16 @@ class Api:
 
     def _report_input_fingerprint(self, project, summary) -> str:
         """Bind a final report to member attempts, downloaded files and ΔE rows."""
+        summary = summary if isinstance(summary, dict) else {}
+        scope_state = summary.get('_report_scope') or {}
+        scoped = isinstance(scope_state, dict) and 'included_member_ids' in scope_state
+        included_member_ids = set(scope_state.get('included_member_ids') or [])
         members = []
         for job_dir in self._project_member_dirs(project):
             manifest = self._manifest.load_manifest(job_dir) or {}
+            if (scoped and self._workspace_job_id(job_dir, manifest)
+                    not in included_member_ids):
+                continue
             results = manifest.get('results') or {}
             attempts = manifest.get('attempts') or []
             members.append({
@@ -7039,11 +8098,19 @@ class Api:
                 'fetched_remote_dir': results.get('fetched_remote_dir'),
                 'fetched_sha256': results.get('fetched_sha256') or {},
             })
+        reference_evidence = summary.get('species_reference_evidence') or []
+        selected_species = set(scope_state.get('selected_species') or [])
+        if scoped and selected_species:
+            reference_evidence = [
+                item for item in reference_evidence
+                if isinstance(item, dict)
+                and str(item.get('species') or '') in selected_species
+            ]
         payload = {
             'project': project.get('project_uuid') or project.get('name'),
             'members': members,
             'reference_mode': summary.get('reference_mode'),
-            'species_reference_evidence': summary.get('species_reference_evidence') or [],
+            'species_reference_evidence': reference_evidence,
             'method_consistency': summary.get('method_consistency') or {},
             'method_confirmation': self._method_confirmation(project),
             'rows': [{
@@ -7208,7 +8275,7 @@ class Api:
     def _validate_report_manifest(path, *, kind, model_sha256,
                                   scientific_fingerprint, contracts,
                                   scientific_qualification, files,
-                                  report_model_sha256) -> dict:
+                                  report_model_sha256, revision=None) -> dict:
         """Validate the committed manifest before it may anchor a ready marker."""
         manifest_path = str(path or '')
         if not manifest_path or not os.path.isfile(manifest_path):
@@ -7295,6 +8362,11 @@ class Api:
             raise RuntimeError('报告标记落盘失败：manifest contracts 无效')
         if declared_contracts != contracts:
             raise RuntimeError('报告标记落盘失败：manifest contracts 不一致')
+        if revision is not None:
+            declared_revision = payload.get('revision')
+            expected_revision = Api._json_safe_report_result(revision)
+            if declared_revision != expected_revision:
+                raise RuntimeError('报告标记落盘失败：manifest revision 不一致')
 
         report_files = {
             fmt: str(value) for fmt, value in (files or {}).items()
@@ -7333,7 +8405,9 @@ class Api:
                                manifest=None, project_path=None,
                                expected_input_fingerprint=None,
                                expected_scientific_fingerprint=None,
-                               expected_project_id=None):
+                               expected_project_id=None,
+                               workspace_project_id=None, report_spec=None,
+                               revision=None):
         """Atomically persist one canonical report artifact marker.
 
         ``kind`` is the scientific status; successful persistence only proves
@@ -7369,6 +8443,22 @@ class Api:
                 current_project.get('project_uuid') or current_project.get('name') or '')
             if expected_project_id and current_project_id != str(expected_project_id):
                 raise _ReportInputChanged('报告已生成但项目身份已变化，未登记产物')
+            if report_spec is not None:
+                if not str(workspace_project_id or '').strip():
+                    raise _ReportInputChanged(
+                        '报告已生成但缺少工作台项目身份，未登记 scoped 产物')
+                try:
+                    current_summary = self._report_workbench_scope_summary(
+                        {
+                            'project': current_project,
+                            'project_id': str(workspace_project_id),
+                        },
+                        current_summary,
+                        report_spec,
+                    )
+                except Exception as exc:                 # noqa: BLE001 scope CAS boundary
+                    raise _ReportInputChanged(
+                        f'报告生成期间冻结范围无法重放，产物未登记：{exc}') from exc
             current_input_fingerprint = self._report_input_fingerprint(
                 current_project, current_summary)
             current_scientific_fingerprint = self._report_scientific_fingerprint(
@@ -7433,7 +8523,8 @@ class Api:
                     scientific_fingerprint=current_scientific_fingerprint,
                     contracts=normalized_contracts,
                     scientific_qualification=qualification, files=by_format,
-                    report_model_sha256=normalized_report_model_sha256)
+                    report_model_sha256=normalized_report_model_sha256,
+                    revision=revision)
             hashes = {fmt: _sha256_file(path) for fmt, path in by_format.items()}
             primary = (by_format.get('pdf') or by_format.get('html')
                        or next(iter(by_format.values())))
@@ -7460,6 +8551,8 @@ class Api:
                 'contracts': normalized_contracts,
                 'manifest': (os.path.abspath(manifest_path)
                              if manifest_path else ''),
+                'workspace_project_id': str(workspace_project_id or ''),
+                'revision': self._json_safe_report_result(revision or {}),
             }
             root = current_project.get('root') or os.path.dirname(primary)
             persisted = dict(current_project)
@@ -7488,12 +8581,56 @@ class Api:
                 project.pop('autopilot_report_blocked', None)
             return marker
 
+    def _report_marker_scoped_summary(self, project, marker, summary):
+        """Reapply the frozen workbench scope before checking marker freshness."""
+        current = summary or self._adsorption.delta_e_rows(project)
+        workspace_project_id = str(
+            (marker or {}).get('workspace_project_id') or '').strip()
+        if not workspace_project_id:
+            return current, None
+        files = marker.get('files') if isinstance(marker.get('files'), dict) else {}
+        spec_path = str(files.get('contract_spec') or '')
+        if not spec_path or not os.path.isfile(spec_path):
+            return None, '报告 marker 缺少冻结 ReportSpec sidecar'
+        try:
+            from vcstudio.project.report_contracts import ReportSpec
+
+            with open(spec_path, 'r', encoding='utf-8') as handle:
+                spec = ReportSpec.from_mapping(json.load(handle))
+            spec_ref = ((marker.get('contracts') or {}).get('spec')
+                        if isinstance(marker.get('contracts'), dict) else {}) or {}
+            if str(spec_ref.get('sha256') or '') != spec.semantic_sha256:
+                raise ValueError('ReportSpec sidecar 与 marker contract ref 不一致')
+            expected_scope_sha256 = self._report_scope_sha256(spec)
+            current_scope = (current.get('_report_scope')
+                             if isinstance(current, dict) else None)
+            if (isinstance(current_scope, dict)
+                    and current_scope.get('scope_sha256') == expected_scope_sha256):
+                return current, None
+            # A caller may have supplied a summary filtered by a different
+            # ReportSpec.  Re-expanding from the project is the only safe way to
+            # replay the marker's frozen selector; filtering an already-filtered
+            # projection could silently drop selected configurations.
+            if isinstance(current_scope, dict):
+                current = self._adsorption.delta_e_rows(project)
+            context = {
+                'project': project,
+                'project_id': workspace_project_id,
+            }
+            return self._report_workbench_scope_summary(context, current, spec), None
+        except Exception as exc:                          # noqa: BLE001 fail-closed status
+            return None, f'冻结 ReportSpec 范围无法重放：{exc}'
+
     def _report_marker_current(self, project, summary=None) -> bool:
         marker = (project or {}).get('autopilot_report')
         if not isinstance(marker, dict):
             return False
         try:
             current = summary or self._adsorption.delta_e_rows(project)
+            current, scope_error = self._report_marker_scoped_summary(
+                project, marker, current)
+            if scope_error:
+                return False
             scientific = str(marker.get('scientific_fingerprint') or '').strip().lower()
             if scientific:
                 if (not re.fullmatch(r'[0-9a-f]{64}', scientific)
@@ -7555,8 +8692,6 @@ class Api:
         """Resolve current science state and staleness without trusting marker text."""
         marker = marker if isinstance(marker, dict) else {}
         current = summary or self._adsorption.delta_e_rows(project)
-        eligible, current_reason = self._final_report_gate(project, current)
-        desired_kind = 'final' if eligible else 'diagnostic'
         raw_kind = str(marker.get('kind') or '').strip().lower()
         stored_reason = str(
             marker.get('gate_reason') or marker.get('reason') or '')
@@ -7570,6 +8705,13 @@ class Api:
                 'reason': str(reason or '报告 marker 验证失败'),
                 'stale': True,
             }
+
+        current, scope_error = self._report_marker_scoped_summary(
+            project, marker, current)
+        if scope_error:
+            return _stale(scope_error, kind=raw_kind or 'diagnostic')
+        eligible, current_reason = self._final_report_gate(project, current)
+        desired_kind = 'final' if eligible else 'diagnostic'
 
         if raw_kind and raw_kind not in _REPORT_KINDS:
             return _stale(f'报告 marker kind 无效：{raw_kind}')
@@ -7642,7 +8784,8 @@ class Api:
                     contracts=normalized_contracts,
                     scientific_qualification=qualification,
                     files=modern_files,
-                    report_model_sha256=report_model_sha256)
+                    report_model_sha256=report_model_sha256,
+                    revision=marker.get('revision') or {})
             except (OSError, RuntimeError, TypeError, ValueError) as exc:
                 return _stale(
                     f'报告验证记录无效：{exc}',
@@ -7686,12 +8829,21 @@ class Api:
         marker = ((project or {}).get('autopilot_report')
                   if isinstance((project or {}).get('autopilot_report'), dict)
                   else {})
-        eligible, gate_reason = self._final_report_gate(project, current)
+        gate_current = current
+        scope_error = None
+        if marker:
+            gate_current, scope_error = self._report_marker_scoped_summary(
+                project, marker, current)
+        if scope_error:
+            eligible, gate_reason = False, scope_error
+            gate_current = current
+        else:
+            eligible, gate_reason = self._final_report_gate(project, gate_current)
         desired_kind = 'final' if eligible else 'diagnostic'
         publication_gate_status = 'eligible' if eligible else 'blocked'
         if marker:
-            science = self._report_marker_science_state(project, marker, current)
-            artifact_current = self._report_marker_current(project, current)
+            science = self._report_marker_science_state(project, marker, gate_current)
+            artifact_current = self._report_marker_current(project, gate_current)
             reason = str(science.get('reason') or '')
             if not artifact_current and not reason:
                 reason = '报告产物文件、哈希或冻结输入已失效，请重新生成'
@@ -7710,6 +8862,8 @@ class Api:
                 'desired_report_kind': desired_kind,
                 'report_reason': reason,
                 'files': dict(marker.get('files') or {}),
+                'revision': self._json_safe_report_result(
+                    marker.get('revision') or {}),
             }
         return {
             'schema': 'vcstudio.report-status/v1',
@@ -7725,6 +8879,7 @@ class Api:
             'desired_report_kind': desired_kind,
             'report_reason': '' if eligible else str(gate_reason or ''),
             'files': {},
+            'revision': {},
         }
 
     def _tick_reports(self, events, errors):

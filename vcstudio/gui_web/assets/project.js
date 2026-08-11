@@ -3149,7 +3149,7 @@
           (unavailable.length ? ` ${unavailablePrefix}：${unavailableText}` : '');
     }
     if (button) {
-      const prefix = State.reportDiagnostic ? '生成诊断报告' : '生成报告';
+      const prefix = State.reportDiagnostic ? '在工作台配置诊断报告' : '打开报告工作台';
       button.textContent = valid ? `${prefix}（${labels}）` : `${prefix}（请选择格式）`;
       button.disabled = State.reportBusy || !selectedProject || !valid;
     }
@@ -3598,6 +3598,48 @@
     };
   }
 
+  // ── Phase C 旧入口适配器 ──────────────────────────────────────────────────
+  // 项目页按钮只负责把当前稳定项目身份与用户已选展示格式交给统一工作台。
+  // 旧 report()/batchReport()/draftReady() 保留给兼容层和回归测试，但不再由
+  // 页面按钮直接调用，避免前端继续分叉快照、门禁与 revision 语义。
+  async function openReportWorkbench(mode) {
+    const proj = currentProject();
+    if (!proj) {
+      VCS.toast('请先选择项目', 'fail');
+      return { ok: false, missingProject: true };
+    }
+    const id = projectId(proj);
+    if (!id) {
+      VCS.toast('当前项目缺少稳定项目 ID，无法打开报告工作台', 'fail');
+      return { ok: false, missingProjectId: true };
+    }
+    const kind = String(mode || 'report');
+    const route = kind === 'draftpack' ? 'publish-draftpack' : 'publish-report';
+    const compareIds = kind === 'comparison'
+      ? selectedComparePaths().map(path => State.projects.find(project =>
+        String(project.path || '') === String(path || '')))
+        .map(projectId).filter(Boolean)
+      : [];
+    const intent = {
+      mode: kind,
+      projectId: id,
+      formats: selectedReportFormats(),
+      comparisonProjectIds: compareIds,
+      source: `legacy-project-${kind}`,
+    };
+    if (window.ReportWorkbench && typeof window.ReportWorkbench.open === 'function') {
+      return window.ReportWorkbench.open(intent);
+    }
+    if (VCS.workspace && typeof VCS.workspace.navigateRoute === 'function') {
+      return VCS.workspace.navigateRoute(route, {
+        projectId: id,
+        query: { project: id },
+        source: intent.source,
+      });
+    }
+    return VCS.navigate('project', { source: intent.source });
+  }
+
   // ── 单项目报告:同一快照生成 HTML + Word + PDF；旧后端回退 HTML ───────────
   async function report() {
     const proj = currentProject();
@@ -3846,7 +3888,7 @@
     wire('pj-refresh', () => reloadProjects());
     wire('pj-delta', delta);
     wire('pj-csv', exportCsv);
-    wire('pj-report', report);
+    wire('pj-report', () => openReportWorkbench('report'));
     SINGLE_REPORT_FORMATS.forEach(item => {
       const input = $(item.id);
       if (input) input.addEventListener('change', syncReportFormatControls);
@@ -3865,7 +3907,7 @@
     wire('fig-select-all', selectAllCompareProjects);
     wire('fig-select-comparable', selectComparableProjects);
     wire('fig-select-clear', () => setCompareSelection([]));
-    wire('pj-batch-report', batchReport);
+    wire('pj-batch-report', () => openReportWorkbench('comparison'));
     const presetSelect = $('pj-preset');
     if (presetSelect) presetSelect.addEventListener('change', () => {
       State.comparePreview = null;
@@ -3873,7 +3915,7 @@
       renderFigProjList();
       scheduleComparePreview();
     });
-    wire('pj-draft', draftReady);
+    wire('pj-draft', () => openReportWorkbench('draftpack'));
     const analysis = $('analysis-type');
     if (analysis) analysis.addEventListener('change', () => {
       if (analysis.value === 'spin') {

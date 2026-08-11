@@ -60,7 +60,7 @@ def test_report_bundle_and_batch_contracts_emit_clickable_files():
     html = _source("index.html")
     js = _source("project.js")
 
-    assert "生成 HTML / Word / PDF 报告" in html
+    assert "在报告工作台预览与生成" in html
     assert 'id="pj-report-formats"' in html
     assert "'proj_report_bundle', proj.path, dr.path, selectedFormats, true" in js
     assert (
@@ -69,9 +69,22 @@ def test_report_bundle_and_batch_contracts_emit_clickable_files():
     ) in js
     assert "function collectReportFiles(value)" in js
     assert "function renderReportFiles(containerId, result, heading)" in js
-    assert "State.reportDiagnostic ? '生成诊断报告' : '生成报告'" in js
+    assert "State.reportDiagnostic ? '在工作台配置诊断报告' : '打开报告工作台'" in js
     assert 'data-report-open="' in js
     assert "VCS.call('open_dir', button.dataset.reportOpen)" in js
+
+
+def test_legacy_report_buttons_only_enter_the_unified_workbench():
+    js = _source("project.js")
+    init = js[js.index("function init()") :]
+
+    assert "async function openReportWorkbench(mode)" in js
+    assert "wire('pj-report', () => openReportWorkbench('report'))" in init
+    assert "wire('pj-batch-report', () => openReportWorkbench('comparison'))" in init
+    assert "wire('pj-draft', () => openReportWorkbench('draftpack'))" in init
+    assert "wire('pj-report', report)" not in init
+    assert "wire('pj-batch-report', batchReport)" not in init
+    assert "wire('pj-draft', draftReady)" not in init
 
 
 def test_single_report_keeps_legacy_html_fallback():

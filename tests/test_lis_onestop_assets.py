@@ -389,7 +389,7 @@ def test_single_report_format_selection_is_accessible_and_enforced():
     assert "description.textContent = disabledByCapability ? reason" in capability
     assert 'unavailableReportFormatText(unavailable)' in capability
     assert "fieldset.setAttribute(\n        'aria-busy'" in capability
-    init = js[js.index("wire('pj-report', report);"):]
+    init = js[js.index("wire('pj-report', () => openReportWorkbench('report'));"):]
     assert init.index('\n    syncReportFormatControls();') < init.index('\n    loadReportCapabilities();')
     assert 'if (!selectedFormats) return' in js
     assert "'proj_report_bundle', proj.path, dr.path, selectedFormats, true" in js

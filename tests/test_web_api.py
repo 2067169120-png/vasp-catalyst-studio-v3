@@ -2502,7 +2502,9 @@ def _report_gate_fixture(tmp_path, *, has_ref=True, method_status='verified',
                          else ['ISPIN 不一致：分子参考、吸附构型']),
         },
         'rows': [{
-            'name': 'report-gate_ads_Li2S8', 'species': 'Li2S8',
+            # Match the production adsorption.delta_e_rows contract: ``name``
+            # is the managed configuration-directory basename.
+            'name': Path(config).name, 'species': 'Li2S8',
             'state': 'DONE', 'e_config': -115.0, 'delta_e': -5.0,
             'dd_e': 0.0, 'reference_valid': has_ref,
             'reference_job': reference, 'note': '',
@@ -2586,6 +2588,7 @@ def _contract_bundle_renderer(*, captured=None, on_render=None):
             'model_sha256': model_sha256,
             'report_model_sha256': model['validation']['report_model_sha256'],
             'input_fingerprint': model['input_fingerprint'],
+            'revision': copy.deepcopy(model.get('revision') or {}),
             'contracts': contract_records,
             'model_file': {
                 'path': model_file.name,
@@ -2611,6 +2614,7 @@ def _contract_bundle_renderer(*, captured=None, on_render=None):
             'scientific_status': model['report_kind'],
             'scientific_qualification': model['scientific_qualification'],
             'input_fingerprint': model['input_fingerprint'],
+            'revision': copy.deepcopy(model.get('revision') or {}),
             'contracts': contract_records,
             'contract_files': contract_files,
             'model_file': model_file,
@@ -2675,7 +2679,9 @@ def test_manual_bundle_persists_contract_bound_canonical_marker(tmp_path):
         'root': str(tmp_path),
         'members': {'clean_slab': clean, 'gas_ref': reference, 'configs': [config]},
     }
-    summary = _science_delta('manual-report')
+    summary = _science_delta(
+        'manual-report', values={'Li2S8': [-1.04]})
+    summary['rows'][0]['name'] = Path(config).name
     manifests = {
         clean: {'state': 'DONE', 'results': {'energy_e0_eV': -100.0}},
         reference: {'state': 'DONE', 'results': {'energy_e0_eV': -10.0}},
@@ -2730,11 +2736,14 @@ def test_bundle_never_records_failed_or_partial_renderer_output(tmp_path):
         root.mkdir()
         project_path = str(root / 'project.yaml')
         Path(project_path).write_text('schema: vcstudio.project/v1\n', encoding='utf-8')
-        members = [str(root / name) for name in ('clean', 'reference', 'config')]
+        summary = _science_delta(case_name)
+        config_dirs = [str(root / row['name']) for row in summary['rows']]
+        members = [str(root / name) for name in ('clean', 'reference')]
+        members.extend(config_dirs)
         project = {
             'name': case_name, 'project_uuid': f'{case_name}-id', 'root': str(root),
             'members': {'clean_slab': members[0], 'gas_ref': members[1],
-                        'configs': [members[2]]},
+                        'configs': config_dirs},
         }
         manifests = {
             path: {'state': 'DONE', 'scheduler_job_id': f'job-{index}',
@@ -2744,7 +2753,7 @@ def test_bundle_never_records_failed_or_partial_renderer_output(tmp_path):
         saved = []
         adsorption = _fake_adsorption(
             projects=[project_path], proj_map={project_path: project},
-            delta_ret=_science_delta(case_name))
+            delta_ret=summary)
         adsorption.save_project = lambda root, value: saved.append(
             (root, copy.deepcopy(value)))
         api = Api(
@@ -2786,9 +2795,9 @@ def test_bundle_never_records_failed_or_partial_renderer_output(tmp_path):
 
     api, project, saved, project_path, root = _case(
         'partial-individual-render', _partial)
-    individual = api.proj_report_bundle(
+    individual = api._report_bundle_unrecorded(
         project_path, str(root / 'report'), formats=['html', 'pdf'], final=True,
-        record_artifact=False)
+    )
     assert individual['ok'] is False and 'pdf' in individual['error']
     assert individual.get('marker') is None
     assert saved == [] and 'autopilot_report' not in project
@@ -2813,8 +2822,10 @@ def test_bundle_marker_cas_preserves_concurrent_fields_and_rejects_changed_input
                    'results': {'energy_e0_eV': -100.0 - index}}
             for index, path in enumerate(members)
         }
+        summary = _science_delta(case_name, values={'Li2S8': [-1.04]})
+        summary['rows'][0]['name'] = Path(members[2]).name
         adsorption = _fake_adsorption(
-            projects=[project_path], proj_map={}, delta_ret=_science_delta(case_name))
+            projects=[project_path], proj_map={}, delta_ret=summary)
         adsorption.load_project = lambda _path: copy.deepcopy(store['project'])
 
         def _save(_root, value):
@@ -3044,8 +3055,14 @@ def test_manual_and_automatic_real_bundle_seams_commit_equivalent_markers(tmp_pa
     assert manual['kind'] == automatic['kind'] == 'final'
     assert manual['scientific_qualification'] == (
         automatic['scientific_qualification'])
-    assert manual['model_sha256'] == automatic['model_sha256']
+    # Visible/scientific content stays equivalent, while immutable revision
+    # identity intentionally changes the full frozen-model hash.
+    assert manual['model_sha256'] != automatic['model_sha256']
     assert manual['report_model_sha256'] == automatic['report_model_sha256']
+    assert manual['revision']['sequence'] == 1
+    assert automatic['revision']['sequence'] == 2
+    assert (automatic['revision']['parent_manifest_sha256']
+            == manual['sha256']['manifest'])
     assert set(manual['files']) == set(automatic['files'])
     for key in ('spec', 'snapshot', 'validation'):
         assert manual['contracts'][key]['schema'] == automatic['contracts'][key]['schema']
