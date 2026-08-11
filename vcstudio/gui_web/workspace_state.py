@@ -268,6 +268,7 @@ def _parse_route_hash(route_hash: str) -> tuple[str, set[str]]:
             "charge": "analyze-charge",
             "comparison": "analyze-comparison",
             "custom": "analyze-custom",
+            "properties": "analyze-properties",
         }
         if len(segments) == 4 and segments[2] == "analysis" \
                 and segments[3] in analysis_views:

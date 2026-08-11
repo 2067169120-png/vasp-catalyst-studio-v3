@@ -254,7 +254,7 @@ class Api:
                  pipeline_supervisor_cls=None, assistant_chat_mod=None,
                  comparison_mod=None, candidate_evaluation_mod=None,
                  paper_report_mod=None, workspace_state_store=None,
-                 report_service=None):
+                 report_service=None, analysis_preferences_store=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -368,6 +368,9 @@ class Api:
         # Phase B 可恢复工作区状态只保存 UI 偏好/草稿引用，与 project.yaml 科学事实分离。
         # 测试可注入内存/临时目录 store；生产首次调用时再创建用户级 JSON store。
         self._workspace_state_store = workspace_state_store
+        # Phase D reusable analysis templates/favourites are user-level state,
+        # never project.yaml fields.  Keep the store lazy for normal job paths.
+        self._analysis_preferences_store = analysis_preferences_store
         # pywebview 可并发调用同一个 js_api；后端锁才是自动托管的正确性边界。
         # 前端的 running 标志只负责交互，不能阻止两条线程同时续算/出报告。
         self._pipeline_lock = threading.Lock()
@@ -1005,6 +1008,13 @@ class Api:
 
             self._report_service_instance = ReportService(self)
         return self._report_service_instance
+
+    def _analysis_preferences(self):
+        if self._analysis_preferences_store is None:
+            from vcstudio.project.analysis_preferences import AnalysisPreferencesStore
+
+            self._analysis_preferences_store = AnalysisPreferencesStore()
+        return self._analysis_preferences_store
 
     def _ri(self):
         """本地结果文件夹扫描/导入引擎（纯本地 I/O）。"""
@@ -5257,6 +5267,13 @@ class Api:
         return self._json_safe_report_result(renderer(model))
 
     def _report_workbench_current_state(self, path, report_spec=None):
+        if report_spec is not None:
+            from vcstudio.project.report_contracts import ReportSpec
+
+            candidate = (report_spec if isinstance(report_spec, ReportSpec)
+                         else ReportSpec.from_mapping(report_spec))
+            if str(candidate.scope.get('kind') or '') == 'comparison':
+                return self._comparison_report_current_state(path, candidate)
         context = self._report_workbench_project_context(path)
         project = context['project']
         summary = self._adsorption.delta_e_rows(project)
@@ -5271,6 +5288,47 @@ class Api:
                 project, summary),
             'eligible_final': bool(eligible),
             'gate_reason': str(reason or ''),
+        }
+
+    def _comparison_report_current_state(self, path, report_spec):
+        """Rebuild one comparison selector for preview CAS and marker freshness."""
+        from vcstudio.project.report_contracts import ReportSpec, sha256_json
+
+        spec = (report_spec if isinstance(report_spec, ReportSpec)
+                else ReportSpec.from_mapping(report_spec))
+        if str(spec.scope.get('kind') or '') != 'comparison':
+            raise ValueError('比较报告 current-state 需要 comparison scope')
+        project_ids = [str(item) for item in spec.scope.get('project_ids') or []]
+        if (len(project_ids) < 2 or len(project_ids) != len(set(project_ids))):
+            raise ValueError('比较报告 scope 至少需要两个不同项目')
+        context = self._report_workbench_project_context(path)
+        if context['project_id'] != project_ids[0]:
+            raise ValueError('比较报告锚点项目与 scope 首项目不一致')
+        index, _projects = self._analysis_workbench_project_index()
+        unresolved = [project_id for project_id in project_ids if project_id not in index]
+        if unresolved:
+            raise ValueError('比较报告项目已无法从注册表解析：' + '、'.join(unresolved))
+        anchor = index[project_ids[0]]
+        if (self._analysis_workbench_path_key(anchor)
+                != self._analysis_workbench_path_key(context['project_path'])):
+            raise ValueError('比较报告锚点项目注册表绑定已变化')
+        preset_key = str(spec.options.get('preset_key') or '') or None
+        _items, snapshot, resolved_ids = self._comparison_snapshot_for_paths(
+            [index[project_id] for project_id in project_ids], preset_key)
+        if resolved_ids != project_ids:
+            raise ValueError('比较报告项目顺序或身份已变化')
+        fingerprint = sha256_json(
+            self._comparison_report_scientific_payload(snapshot, preset_key))
+        gate = snapshot.get('comparison_gate') or {}
+        eligible = bool(snapshot.get('can_final_report'))
+        reason = '；'.join(gate.get('blocking') or gate.get('warnings') or [])
+        return {
+            'project_id': context['project_id'],
+            'input_fingerprint': fingerprint,
+            'scientific_fingerprint': fingerprint,
+            'eligible_final': eligible,
+            'gate_reason': reason,
+            'comparison_project_ids': project_ids,
         }
 
     def _report_workbench_validate_history_entry(self, entry):
@@ -5490,9 +5548,128 @@ class Api:
         rendered.setdefault('artifact_status', 'complete')
         return rendered
 
+    def _persist_comparison_report_marker(self, build, rendered, *, revision):
+        """Persist a comparison marker after replaying every selected project."""
+        kind = str(build.get('report_kind') or '').strip().lower()
+        qualification = str(
+            build.get('contracts', {}).get('scientific_qualification') or '')
+        if kind not in _REPORT_KINDS or qualification not in _REPORT_QUALIFICATIONS:
+            raise ValueError('比较报告科学状态或资格无效')
+        normalized_contracts = self._validated_report_contract_refs(
+            rendered.get('contracts') or
+            build.get('contracts', {}).get('contract_refs') or {},
+            kind, require_sidecars=True)
+        with self._report_marker_lock:
+            current = self._comparison_report_current_state(
+                build['project_path'], build['contracts']['report_spec'])
+            if (current.get('scientific_fingerprint')
+                    != build.get('scientific_fingerprint')):
+                raise _ReportInputChanged(
+                    '比较报告生成期间项目结果已变化，产物未登记；请重新生成')
+            if kind == 'final' and current.get('eligible_final') is not True:
+                raise _ReportInputChanged(
+                    '比较报告生成期间最终门禁已变化，产物未登记：'
+                    + str(current.get('gate_reason') or '比较门禁未通过'))
+            context = self._report_workbench_project_context(build['project_path'])
+            if context['project_id'] != build['project_id']:
+                raise _ReportInputChanged('比较报告锚点项目身份已变化，产物未登记')
+
+            rendered_files = dict(rendered.get('files') or {})
+            marker_files = dict(rendered_files)
+            marker_files['model'] = rendered.get('model_file')
+            contract_files = rendered.get('contract_files') or {}
+            if not isinstance(contract_files, dict):
+                raise TypeError('比较报告 contract_files 必须为对象')
+            for key, value in contract_files.items():
+                marker_files[f'contract_{key}'] = value
+            if rendered.get('manifest'):
+                marker_files.setdefault('manifest', rendered.get('manifest'))
+            by_format = {}
+            for declared_format, raw_path in marker_files.items():
+                if not raw_path or not os.path.isfile(str(raw_path)):
+                    continue
+                by_format[str(declared_format)] = os.path.abspath(str(raw_path))
+            if not {'html', 'docx', 'pdf'}.intersection(by_format):
+                raise RuntimeError('比较报告 marker 没有可读的正式产物')
+            manifest_path = os.path.abspath(str(rendered.get('manifest') or ''))
+            if (not manifest_path or by_format.get('manifest') != manifest_path):
+                raise RuntimeError('比较报告 manifest 未纳入 marker 文件绑定')
+            report_model_sha256 = str(
+                rendered.get('report_model_sha256') or '').strip().lower()
+            scientific_fingerprint = str(
+                current.get('scientific_fingerprint') or '').strip().lower()
+            self._validate_report_contract_sidecars(
+                by_format, normalized_contracts, kind=kind,
+                scientific_fingerprint=scientific_fingerprint,
+                scientific_qualification=qualification,
+                report_model_sha256=report_model_sha256)
+            self._validate_report_manifest(
+                manifest_path, kind=kind,
+                model_sha256=rendered.get('model_sha256'),
+                scientific_fingerprint=scientific_fingerprint,
+                contracts=normalized_contracts,
+                scientific_qualification=qualification,
+                files=by_format,
+                report_model_sha256=report_model_sha256,
+                revision=revision)
+            hashes = {fmt: _sha256_file(path) for fmt, path in by_format.items()}
+            primary = (by_format.get('pdf') or by_format.get('html')
+                       or next(iter(by_format.values())))
+            generated_at = time.strftime('%Y-%m-%dT%H:%M:%S')
+            marker = {
+                'schema': 'vcstudio.report-marker/v2',
+                'generated_at': generated_at,
+                'input_fingerprint': scientific_fingerprint,
+                'scientific_fingerprint': scientific_fingerprint,
+                'artifact_status': 'ready',
+                'kind': kind,
+                'scientific_status': kind,
+                'scientific_qualification': qualification,
+                'gate_reason': str(build.get('gate_reason') or ''),
+                'file': primary,
+                'report_sha256': _sha256_file(primary),
+                'files': by_format,
+                'sha256': hashes,
+                'report_hashes': hashes,
+                'figures_dir': os.path.abspath(str(build.get('figure_dir') or
+                                                   os.path.dirname(primary))),
+                'model_sha256': str(rendered.get('model_sha256') or ''),
+                'report_model_sha256': report_model_sha256,
+                'contracts': normalized_contracts,
+                'manifest': manifest_path,
+                'workspace_project_id': build['project_id'],
+                'scope_kind': 'comparison',
+                'comparison_project_ids': list(build['comparison_project_ids']),
+                'comparison_preset_key': str(build.get('preset_key') or ''),
+                'revision': self._json_safe_report_result(revision or {}),
+            }
+            project = context['project']
+            persisted = dict(project)
+            persisted['autopilot_report'] = marker
+            if kind == 'draft':
+                persisted.pop('autopilot_report_done', None)
+            else:
+                persisted['autopilot_report_done'] = generated_at
+            persisted.pop('autopilot_report_blocked', None)
+            try:
+                self._adsorption.save_project(context['project_root'], persisted)
+            except Exception as exc:                     # noqa: BLE001 durable boundary
+                raise RuntimeError(f'比较报告 marker 落盘失败：{exc}') from exc
+            project['autopilot_report'] = marker
+            if kind == 'draft':
+                project.pop('autopilot_report_done', None)
+            else:
+                project['autopilot_report_done'] = generated_at
+            project.pop('autopilot_report_blocked', None)
+            build['project'].update(project)
+            return marker
+
     def _report_workbench_persist_build(self, build, rendered, *, revision):
         if rendered.get('ok') is False:
             raise RuntimeError(rendered.get('error') or '报告渲染失败，不能登记 marker')
+        if build.get('build_kind') == 'comparison':
+            return self._persist_comparison_report_marker(
+                build, rendered, revision=revision)
         rendered_files = dict(rendered.get('files') or {})
         marker_files = dict(rendered_files)
         marker_files['model'] = rendered.get('model_file')
@@ -5537,6 +5714,368 @@ class Api:
 
     def report_workbench_history(self, path):
         return self._reports().history(path)
+
+    # ── Phase D:分析配置工作台 API ───────────────────────────────────────
+    _ANALYSIS_BOOTSTRAP_SCHEMA = 'vcstudio.analysis-workbench-bootstrap/v1'
+    _ANALYSIS_PREVIEW_SCHEMA = 'vcstudio.analysis-workbench-preview/v1'
+
+    @classmethod
+    def _analysis_workbench_public_value(cls, value):
+        """Return a detached public projection without paths or credentials."""
+        private_keys = {
+            'path', 'project_path', 'root', 'dir', 'directory', 'locator',
+            'source_job', 'secret', 'password', 'passwd', 'credential',
+            'authorization', 'cookie', 'token', 'api_key', 'private_key',
+        }
+        if isinstance(value, os.PathLike):
+            return '<local-path>'
+        if isinstance(value, dict):
+            result = {}
+            for raw_key, item in value.items():
+                key = str(raw_key)
+                normalized = re.sub(r'[^a-z0-9]+', '_', key.lower()).strip('_')
+                if (normalized in private_keys
+                        or normalized.endswith(('_path', '_dir', '_directory',
+                                                '_locator', '_secret', '_password',
+                                                '_token', '_credential', '_cookie'))):
+                    continue
+                result[key] = cls._analysis_workbench_public_value(item)
+            return result
+        if isinstance(value, (list, tuple)):
+            return [cls._analysis_workbench_public_value(item) for item in value]
+        if isinstance(value, str):
+            if re.search(
+                    r'(?i)(?:\b(?:github_pat_|gh[opusr]_|sk-)[A-Za-z0-9_-]{12,}'
+                    r'|\bBearer\s+\S+|-----BEGIN[^\r\n]{0,40}PRIVATE KEY-----'
+                    r'|\b(?:password|passwd|secret|token|api[_-]?key)\s*[:=]\s*\S+)',
+                    value):
+                return '<redacted>'
+            return cls._workspace_public_text(value, limit=4000)
+        return cls._json_safe_report_result(value)
+
+    @staticmethod
+    def _analysis_workbench_path_key(path):
+        return os.path.normcase(os.path.realpath(os.path.abspath(
+            os.path.expanduser(str(path or '')))))
+
+    def _analysis_workbench_project_index(self):
+        """Resolve registry IDs to paths internally and return a path-free list."""
+        listing = self.proj_list()
+        if not isinstance(listing, dict) or listing.get('error'):
+            raise RuntimeError(
+                str((listing or {}).get('error') or '项目注册表不可用'))
+        index = {}
+        projects = []
+        for raw in listing.get('projects') or []:
+            if not isinstance(raw, dict):
+                continue
+            project_id = str(raw.get('project_id') or '').strip()
+            path = str(raw.get('path') or '').strip()
+            if not project_id or not path:
+                continue
+            if project_id in index:
+                raise RuntimeError(
+                    f'项目注册表存在重复 opaque project_id：{project_id}')
+            index[project_id] = path
+            projects.append({
+                'project_id': project_id,
+                'name': str(raw.get('name') or ''),
+                'n_members': int(raw.get('n_members') or 0),
+                'n_done': int(raw.get('n_done') or 0),
+                'reference_mode': str(raw.get('reference_mode') or 'none'),
+                'reference_species': [
+                    str(item) for item in raw.get('reference_species') or []],
+                'n_species_refs': int(raw.get('n_species_refs') or 0),
+            })
+        return index, projects
+
+    @classmethod
+    def _analysis_preferences_failure(cls, error, **extra):
+        result = {
+            'ok': False,
+            'conflict': False,
+            'revision': None,
+            'preferences': None,
+            'error': cls._analysis_workbench_public_value(str(error)),
+        }
+        result.update(extra)
+        return result
+
+    def analysis_preferences_read(self):
+        try:
+            return self._analysis_workbench_public_value(
+                self._analysis_preferences().read())
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return self._analysis_preferences_failure(exc)
+
+    def analysis_preferences_update(self, template, project_id,
+                                    expected_revision, set_default=False):
+        try:
+            opaque_id = str(project_id or '').strip()
+            index, _projects = self._analysis_workbench_project_index()
+            if not opaque_id or opaque_id not in index:
+                raise ValueError('project_id 不是服务端已知的 workspace opaque 身份')
+            result = self._analysis_preferences().update(
+                template, project_id=opaque_id,
+                expected_revision=expected_revision,
+                set_default=set_default)
+            return self._analysis_workbench_public_value(result)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return self._analysis_preferences_failure(exc, template=None)
+
+    def analysis_preferences_delete(self, template_id, expected_revision):
+        try:
+            result = self._analysis_preferences().delete(
+                template_id, expected_revision=expected_revision)
+            return self._analysis_workbench_public_value(result)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return self._analysis_preferences_failure(
+                exc, deleted_template_id=None)
+
+    def analysis_preferences_favorite(self, analysis_id, favorite,
+                                      expected_revision):
+        try:
+            result = self._analysis_preferences().favorite(
+                analysis_id, favorite=favorite,
+                expected_revision=expected_revision)
+            return self._analysis_workbench_public_value(result)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return self._analysis_preferences_failure(exc)
+
+    def analysis_preferences_set_default(self, analysis_id, template_id,
+                                         expected_revision):
+        try:
+            result = self._analysis_preferences().set_default(
+                analysis_id, template_id,
+                expected_revision=expected_revision)
+            return self._analysis_workbench_public_value(result)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return self._analysis_preferences_failure(exc)
+
+    def _analysis_workbench_current_project(self, context):
+        project = context['project']
+        members = self._project_member_dirs(project)
+        return {
+            'project_id': context['project_id'],
+            'name': context['project_name'],
+            'n_members': len(members),
+            'n_done': sum(
+                1 for member in members
+                if ((self._manifest.load_manifest(member) or {}).get('state')
+                    == 'DONE')),
+        }
+
+    @staticmethod
+    def _analysis_workbench_reject_duplicate_ids(request):
+        if not isinstance(request, dict):
+            return
+        raw = request.get('comparison_project_ids')
+        if not isinstance(raw, (list, tuple)):
+            return
+        normalized = [str(item) for item in raw]
+        if len(normalized) != len(set(normalized)):
+            raise ValueError('comparison_project_ids 不得包含重复项目身份')
+
+    @staticmethod
+    def _analysis_workbench_unavailable_view(spec, reason):
+        """Describe a registered capability without inventing parsed values."""
+        message = str(reason or '该分析尚未接入实时解析器')
+        payload = {
+            'schema': 'vcstudio.analysis-view/v1',
+            'analysis_id': spec.analysis_id,
+            'spec': spec.to_dict(),
+            'spec_sha256': spec.semantic_sha256,
+            'scientific_status': 'unavailable',
+            'available': False,
+            'rows': [],
+            'blocking': [message],
+            'warnings': [],
+            'reason': message,
+            'denominator': {
+                'available_results': 0,
+                'visible_rows': 0,
+            },
+        }
+        encoded = json.dumps(
+            {'spec_sha256': spec.semantic_sha256,
+             'scientific_status': 'unavailable', 'reason': message},
+            ensure_ascii=False, sort_keys=True,
+            separators=(',', ':')).encode('utf-8')
+        payload['data_fingerprint'] = hashlib.sha256(encoded).hexdigest()
+        return payload
+
+    def _analysis_workbench_build(self, path, request=None, *,
+                                  default_analysis_id='adsorption-energy'):
+        from vcstudio.project.analysis_registry import normalize_analysis_request
+        from vcstudio.project.analysis_views import (
+            build_adsorption_view,
+            build_comparison_view,
+            build_free_energy_view,
+        )
+
+        context = self._report_workbench_project_context(path)
+        prepared = {} if request is None else copy.deepcopy(request)
+        if not isinstance(prepared, dict):
+            raise TypeError('analysis request 必须为对象')
+        self._analysis_workbench_reject_duplicate_ids(prepared)
+        spec = normalize_analysis_request(
+            prepared,
+            project_id=context['project_id'],
+            default_analysis_id=default_analysis_id,
+        )
+        if spec.analysis_id == 'adsorption-energy':
+            from vcstudio.project.report_contracts import ReportSpec
+
+            identity_spec = ReportSpec(
+                requested_kind='diagnostic', formats=('html',),
+                scope={
+                    'kind': 'project',
+                    'project_ids': [context['project_id']],
+                    'job_ids': [], 'species': [], 'configuration_ids': [],
+                    'stable_only': False, 'include_failed': True,
+                })
+            summary = self._report_workbench_scope_summary(
+                context, self._adsorption.delta_e_rows(context['project']),
+                identity_spec)
+            view = build_adsorption_view(summary, spec)
+        elif spec.analysis_id == 'multi-project-comparison':
+            comparison_ids = list(spec.comparison_project_ids)
+            if len(comparison_ids) < 2:
+                raise ValueError('多项目比较至少需要两个不同的项目身份')
+            if len(comparison_ids) != len(set(comparison_ids)):
+                raise ValueError('多项目比较不得包含重复项目身份')
+            index, _safe_projects = self._analysis_workbench_project_index()
+            unresolved = [item for item in comparison_ids if item not in index]
+            if unresolved:
+                raise ValueError(
+                    '无法从项目注册表解析 comparison_project_ids：'
+                    + '、'.join(unresolved))
+            current_registry_path = index.get(context['project_id'])
+            if (not current_registry_path
+                    or self._analysis_workbench_path_key(current_registry_path)
+                    != self._analysis_workbench_path_key(context['project_path'])):
+                raise ValueError('当前项目与项目注册表 opaque 身份绑定不一致')
+            paths = [index[item] for item in comparison_ids]
+            items = self._comparison_items(paths)
+            if len(items) != len(comparison_ids):
+                raise RuntimeError('比较项目解析数量与冻结 spec 不一致')
+            resolved_items = []
+            for project_id, item in zip(comparison_ids, items):
+                if not isinstance(item, dict) or item.get('project') is None:
+                    raise ValueError(f'比较项目不可解析：{project_id}')
+                resolved = copy.deepcopy(item)
+                resolved['project_id'] = project_id
+                resolved_items.append(resolved)
+            view = build_comparison_view(resolved_items, spec)
+        elif spec.analysis_id == 'free-energy-path':
+            project = context['project']
+            preparation = project.get('preparation')
+            declared_mode = str(
+                project.get('work_mode') or
+                (preparation.get('work_mode')
+                 if isinstance(preparation, dict) else '') or '').strip().lower()
+            if declared_mode != 'lis':
+                view = self._analysis_workbench_unavailable_view(
+                    spec, f'分析 {spec.analysis_id} 已注册，但实时解析器尚未接入')
+            else:
+                summary = self._adsorption.delta_e_rows(project)
+                fed, fed_reason = self._proj_fed(project, summary)
+                frozen = {
+                    'result': copy.deepcopy(fed),
+                    'missing': ([str(fed_reason)] if fed_reason else []),
+                    'method_consistency': copy.deepcopy(
+                        (summary or {}).get('method_consistency') or {}),
+                }
+                view = build_free_energy_view(frozen, spec)
+        else:
+            view = self._analysis_workbench_unavailable_view(
+                spec, f'分析 {spec.analysis_id} 已注册，但实时解析器尚未接入')
+        return context, spec, view
+
+    def analysis_workbench_catalog(self):
+        try:
+            from vcstudio.project.analysis_registry import analysis_catalog
+
+            catalog = self._analysis_workbench_public_value(analysis_catalog())
+            return {'ok': True, **catalog, 'error': None}
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return {
+                'ok': False, 'schema': 'vcstudio.analysis-catalog/v1',
+                'analyses': [], 'categories': [], 'task_capabilities': [],
+                'view_templates': [],
+                'error': self._analysis_workbench_public_value(str(exc)),
+            }
+
+    def _analysis_workbench_project_path(self, project_id):
+        identifier = str(project_id or '').strip()
+        index, _projects = self._analysis_workbench_project_index()
+        if not identifier or identifier not in index:
+            raise ValueError('project_id 不是服务端已知的 workspace opaque 身份')
+        return index[identifier]
+
+    def analysis_workbench_preview(self, project_id, request=None):
+        try:
+            path = self._analysis_workbench_project_path(project_id)
+            context, spec, view = self._analysis_workbench_build(path, request)
+            return self._analysis_workbench_public_value({
+                'ok': True, 'schema': self._ANALYSIS_PREVIEW_SCHEMA,
+                'project_id': context['project_id'], 'spec': spec.to_dict(),
+                'view': view, 'error': None,
+            })
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return {
+                'ok': False, 'schema': self._ANALYSIS_PREVIEW_SCHEMA,
+                'project_id': None, 'spec': None, 'view': None,
+                'error': self._analysis_workbench_public_value(str(exc)),
+            }
+
+    def analysis_workbench_bootstrap(self, project_id, analysis_id=None):
+        try:
+            from vcstudio.project.analysis_registry import get_analysis
+
+            selected_analysis = str(analysis_id or 'adsorption-energy').strip()
+            get_analysis(selected_analysis)
+            path = self._analysis_workbench_project_path(project_id)
+            context = self._report_workbench_project_context(path)
+            index, projects = self._analysis_workbench_project_index()
+            request = {'analysis_id': selected_analysis}
+            if selected_analysis == 'multi-project-comparison':
+                if context['project_id'] not in index:
+                    raise ValueError('当前项目不在项目注册表中，不能建立多项目比较')
+                other_ids = [
+                    item['project_id'] for item in projects
+                    if item['project_id'] != context['project_id']]
+                if not other_ids:
+                    raise ValueError('多项目比较至少需要两个可解析项目')
+                request['comparison_project_ids'] = [
+                    context['project_id'], other_ids[0]]
+            built_context, spec, view = self._analysis_workbench_build(
+                path, request, default_analysis_id=selected_analysis)
+            catalog_result = self.analysis_workbench_catalog()
+            if catalog_result.get('ok') is not True:
+                raise RuntimeError(catalog_result.get('error') or '分析目录不可用')
+            catalog = {
+                key: value for key, value in catalog_result.items()
+                if key not in {'ok', 'error'}
+            }
+            preferences = self.analysis_preferences_read()
+            return self._analysis_workbench_public_value({
+                'ok': True, 'schema': self._ANALYSIS_BOOTSTRAP_SCHEMA,
+                'project_id': built_context['project_id'],
+                'project': self._analysis_workbench_current_project(context),
+                'catalog': catalog, 'default_spec': spec.to_dict(),
+                'projects': projects, 'view': view, 'error': None,
+                'preferences': preferences,
+                'preference_revision': preferences.get('revision'),
+            })
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return {
+                'ok': False, 'schema': self._ANALYSIS_BOOTSTRAP_SCHEMA,
+                'project_id': None, 'project': None, 'catalog': None,
+                'default_spec': None, 'projects': [], 'view': None,
+                'preferences': None, 'preference_revision': None,
+                'error': self._analysis_workbench_public_value(str(exc)),
+            }
 
     def proj_report_capabilities(self):
         """Expose report-format dependencies before the user starts a long render."""
@@ -5953,6 +6492,54 @@ class Api:
             })
         return items
 
+    def _comparison_snapshot_for_paths(self, paths, preset_key=None):
+        """Resolve one ordered comparison set and bind every row to opaque IDs."""
+        normalized_paths = [str(path or '').strip() for path in (paths or [])]
+        if (len(normalized_paths) < 2 or any(not path for path in normalized_paths)
+                or len({self._analysis_workbench_path_key(path)
+                        for path in normalized_paths}) != len(normalized_paths)):
+            raise ValueError('批次报告至少需要选择 2 个不同项目')
+        items = self._comparison_items(normalized_paths, preset_key)
+        if len(items) != len(normalized_paths):
+            raise RuntimeError('比较项目解析数量与请求不一致')
+        id_by_path = {}
+        id_by_uuid = {}
+        project_ids = []
+        for path, item in zip(normalized_paths, items):
+            project = item.get('project') if isinstance(item, dict) else None
+            if not isinstance(project, dict):
+                raise ValueError('比较项目不存在或 project.yaml 已移动')
+            project_id = self._workspace_project_id(path, project)
+            if project_id in project_ids:
+                raise ValueError(f'比较项目 opaque 身份重复：{project_id}')
+            project_ids.append(project_id)
+            item['project_id'] = project_id
+            id_by_path[self._analysis_workbench_path_key(path)] = project_id
+            raw_uuid = str(project.get('project_uuid') or '').strip()
+            if raw_uuid:
+                id_by_uuid[raw_uuid] = project_id
+        snapshot = self._comparison_model().build_comparison_snapshot(
+            items, preset_key=preset_key)
+        projects = snapshot.get('projects') or []
+        if len(projects) != len(items):
+            raise RuntimeError('比较快照项目数量与冻结请求不一致')
+        resolved_ids = []
+        for project in projects:
+            if not isinstance(project, dict):
+                raise RuntimeError('比较快照包含无效项目记录')
+            raw_path = str(project.get('path') or '')
+            project_id = (id_by_path.get(self._analysis_workbench_path_key(raw_path))
+                          if raw_path else None)
+            if not project_id:
+                project_id = id_by_uuid.get(str(project.get('project_uuid') or ''))
+            if not project_id or project_id in resolved_ids:
+                raise RuntimeError('比较快照无法确定绑定 opaque project_id')
+            project['project_id'] = project_id
+            resolved_ids.append(project_id)
+        if set(resolved_ids) != set(project_ids):
+            raise RuntimeError('比较快照项目身份与冻结请求不一致')
+        return items, snapshot, project_ids
+
     def proj_compare_preview(self, paths, preset_key=None):
         """Preview every selected project, including moved/blocked selections."""
         try:
@@ -6020,6 +6607,36 @@ class Api:
             })
         return figures, files, skipped
 
+    def _comparison_report_scientific_payload(self, snapshot, preset_key=None):
+        """Return the path-free projection shared by build, CAS and marker replay."""
+        logical_projects = []
+        for index, project in enumerate(snapshot.get('projects') or [], 1):
+            stable_name = project.get('name') or f'project-{index}'
+            logical_projects.append({
+                'project_id': (project.get('project_id')
+                               or project.get('project_uuid') or stable_name
+                               or f'project-{index}'),
+                'name': stable_name,
+                'status': project.get('status'),
+                'block_reasons': project.get('block_reasons') or [],
+                'warnings': project.get('warnings') or [],
+                'method_status': project.get('method_status'),
+                'method_signature': project.get('method_signature'),
+                'method_evidence': self._semantic_without_locators(
+                    project.get('method_evidence') or {}),
+                'species': project.get('species') or [],
+                'ladder': project.get('ladder') or {},
+            })
+        return self._json_safe_report_result({
+            'schema': snapshot.get('schema'),
+            'preset_key': preset_key or '',
+            'ranking_deadband_eV': snapshot.get('ranking_deadband_eV'),
+            'projects': logical_projects,
+            'comparison_gate': snapshot.get('comparison_gate') or {},
+            'adsorption_matrix': snapshot.get('adsorption_matrix') or {},
+            'ladder': snapshot.get('ladder') or {},
+        })
+
     def _comparison_report_contracts(self, snapshot, *, formats, requested_kind,
                                      report_kind, preset_key=None,
                                      report_model_sha256):
@@ -6035,33 +6652,14 @@ class Api:
         )
 
         generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-        logical_projects = []
-        for index, project in enumerate(snapshot.get('projects') or [], 1):
-            stable_name = project.get('name') or f'project-{index}'
-            logical_projects.append({
-                'project_id': (project.get('project_uuid') or stable_name
-                               or f'project-{index}'),
-                'name': stable_name,
-                'status': project.get('status'),
-                'block_reasons': project.get('block_reasons') or [],
-                'warnings': project.get('warnings') or [],
-                'method_status': project.get('method_status'),
-                'method_signature': project.get('method_signature'),
-                'method_evidence': self._semantic_without_locators(
-                    project.get('method_evidence') or {}),
-                'species': project.get('species') or [],
-                'ladder': project.get('ladder') or {},
-            })
-        project_ids = [str(item['project_id']) for item in logical_projects]
-        scientific_payload = self._json_safe_report_result({
-            'schema': snapshot.get('schema'),
-            'preset_key': preset_key or '',
-            'ranking_deadband_eV': snapshot.get('ranking_deadband_eV'),
-            'projects': logical_projects,
-            'comparison_gate': snapshot.get('comparison_gate') or {},
-            'adsorption_matrix': snapshot.get('adsorption_matrix') or {},
-            'ladder': snapshot.get('ladder') or {},
-        })
+        scientific_payload = self._comparison_report_scientific_payload(
+            snapshot, preset_key)
+        project_ids = [
+            str(item.get('project_id') or '')
+            for item in scientific_payload.get('projects') or []]
+        if (len(project_ids) < 2 or any(not item for item in project_ids)
+                or len(project_ids) != len(set(project_ids))):
+            raise ValueError('比较报告必须绑定至少两个不同的 opaque project_id')
         scientific_fingerprint = sha256_json(scientific_payload)
         spec = ReportSpec(
             preset_id='multi-catalyst-comparison',
@@ -6156,143 +6754,238 @@ class Api:
             },
         }
 
-    def proj_batch_report(self, paths, out_dir, preset_key=None, formats=None,
-                          include_individual=True, final=True, requested_kind=None):
-        """Generate N individual reports and one multi-catalyst comparison report."""
+    def _comparison_report_build(self, paths, preset_key, wanted, requested,
+                                 work_dir):
+        """Freeze a comparison model for the shared ReportService lifecycle."""
+        items, snapshot, project_ids = self._comparison_snapshot_for_paths(
+            paths, preset_key)
+        figures, figure_files, skipped = self._comparison_figures(
+            snapshot, os.path.join(str(work_dir), 'comparison_figures'))
+        evaluations = []
+        item_by_path = {
+            self._analysis_workbench_path_key(item.get('path')): item
+            for item in items if isinstance(item, dict) and item.get('path')}
+        for project in snapshot.get('projects') or []:
+            raw_path = str(project.get('path') or '')
+            source = item_by_path.get(self._analysis_workbench_path_key(raw_path))
+            if not source or not source.get('project'):
+                continue
+            evaluations.append(self._candidate_eval().evaluate_candidate(
+                source.get('summary') or {}, project=source['project'],
+                fed=source.get('fed')))
+        matrix = snapshot.get('adsorption_matrix') or {}
+        comparison_rows = [
+            [name, *[('—' if value is None else f'{value:.3f}')
+                     for value in values]]
+            for name, values in zip(
+                matrix.get('rows') or [], matrix.get('values') or [])
+        ]
+        gate = snapshot.get('comparison_gate') or {}
+        eligible = bool(snapshot.get('can_final_report'))
+        gate_reason = '；'.join(
+            gate.get('blocking') or gate.get('warnings') or [])
+        report_kind = ('final' if requested == 'final' and eligible else
+                       'draft' if requested == 'draft' else 'diagnostic')
+        qualification = ('thermodynamic_path_verified'
+                         if report_kind == 'final' else 'diagnostic')
+        model = {
+            'schema': 'vcstudio.research-report/v1',
+            'locale': 'zh-CN',
+            'title': '多催化剂吸附能与自由能路径比较',
+            'subtitle': (
+                '批次比较研究报告' if report_kind == 'final' else
+                '批次比较草稿：内容与证据仍可继续编辑'
+                if report_kind == 'draft' else
+                '诊断型批次报告：方法或路径证据尚未完全可比'),
+            'kicker': 'VASP CATALYST STUDIO · COMPARATIVE STUDY',
+            'report_kind': report_kind,
+            'scientific_qualification': qualification,
+            'claim_ceiling': 'cross_project_thermodynamic_screen',
+            'metadata': {
+                '已选项目': snapshot.get('selected_count'),
+                '可评价项目': snapshot.get('ready_count'),
+                '同图台阶项目': snapshot.get('ladder_ready_count'),
+                '比较门禁': gate.get('status'),
+                '反应预设': preset_key or 'Li-S discharge',
+                '数据指纹': snapshot.get('data_fingerprint'),
+            },
+            'executive_summary': (
+                f'本批次选择 {snapshot.get("selected_count")} 个催化剂项目，'
+                f'{snapshot.get("ready_count")} 个具有可审计吸附能；'
+                f'比较门禁状态为 {gate.get("status")}。'
+                + ('当前可生成同轴自由能台阶比较。' if snapshot.get('can_plot')
+                   else '当前不强行叠加不可比的自由能路径。')),
+            'key_findings': [
+                (evaluation.get('decision') or {}).get('summary_zh') or
+                f'{(evaluation.get("candidate") or {}).get("name") or "项目"}：证据不足'
+                for evaluation in evaluations
+            ],
+            'candidate_evaluations': self._candidate_evaluation_table(
+                evaluations, title='候选材料后续计算优先级'),
+            'comparison_table': {
+                'title': '多催化剂最稳构型吸附能比较',
+                'columns': ['催化剂', *(matrix.get('cols') or [])],
+                'rows': comparison_rows,
+                'caption': ('每个物种采用项目内最低 E_ads 构型；0.15 eV 内的构型'
+                            '作为近简并候选保留。不同 Li2Sx 不能依次相减代替反应自由能。'),
+            },
+            'figures': figures,
+            'methods': [
+                '各项目先按规范物种分组并选取最稳构型，再进行横向比较。',
+                '台阶图仅叠加步骤标签、顺序和能量修正口径一致的自由能路径。',
+                '项目间自旋初态可不同；是否可比较由实际能量操作数和方法证据决定。',
+            ],
+            'limitations': [
+                *gate.get('blocking', []), *gate.get('warnings', []),
+                *[f'{item.get("display_name")}: {reason}'
+                  for item in snapshot.get('projects') or []
+                  for reason in item.get('block_reasons') or []],
+                *[f'{item.get("display_name")}: {warning}'
+                  for item in snapshot.get('projects') or []
+                  for warning in item.get('warnings') or []],
+                *[f'图表未生成（{item.get("kind") or "unknown"}）：'
+                  f'{item.get("reason") or "原因未记录"}' for item in skipped],
+            ],
+            'recommendations': self._recommendation_blocks(evaluations),
+        }
+        content_hasher = getattr(self._paper(), 'report_content_sha256', None)
+        if not callable(content_hasher):
+            from vcstudio.project.paper_report import report_content_sha256
+
+            content_hasher = report_content_sha256
+        report_model_sha256 = str(content_hasher(model)).lower()
+        contracts = self._comparison_report_contracts(
+            snapshot, formats=wanted, requested_kind=requested,
+            report_kind=report_kind, preset_key=preset_key,
+            report_model_sha256=report_model_sha256)
+        scope_ids = list((contracts.get('report_spec') or {}).get(
+            'scope', {}).get('project_ids') or [])
+        if scope_ids != project_ids:
+            raise RuntimeError('比较报告 contract scope 与冻结项目身份不一致')
+        model.update(self._json_safe_report_result(contracts))
+        anchor = self._report_workbench_project_context(str(paths[0]))
+        return {
+            'build_kind': 'comparison',
+            'project': anchor['project'],
+            'project_path': anchor['project_path'],
+            'project_root': anchor['project_root'],
+            'project_id': anchor['project_id'],
+            'report_spec': contracts['report_spec'],
+            'requested_kind': requested,
+            'report_kind': report_kind,
+            'eligible_final': eligible,
+            'gate_reason': gate_reason,
+            'fed_reason': '',
+            'input_fingerprint': contracts['input_fingerprint'],
+            'scientific_fingerprint': contracts['input_fingerprint'],
+            'report_model_sha256': report_model_sha256,
+            'contracts': contracts,
+            'model': model,
+            'figure_dir': os.path.join(str(work_dir), 'comparison_figures'),
+            'figure_files': figure_files,
+            'default_stem': '多催化剂_批次比较报告',
+            'comparison_snapshot': snapshot,
+            'comparison_project_ids': project_ids,
+            'comparison_paths': [str(item) for item in paths],
+            'comparison_items': items,
+            'comparison_skipped': skipped,
+            'qualification': qualification,
+            'preset_key': preset_key,
+        }
+
+    def _comparison_report_publish_via_service(
+            self, paths, out_dir, *, preset_key, wanted, requested):
+        """Register a server-built comparison preview, then use ReportService."""
+        import shutil
+        import uuid
+        from vcstudio.project.report_service import (
+            PREVIEW_TOKEN_SCHEMA,
+            _PreviewRecord,
+            _lineage_id,
+        )
+
+        service = self._reports()
+        service._cleanup_expired()
+        temp_root = tempfile.mkdtemp(
+            prefix='vcstudio-comparison-preview-', dir=service._temp_root)
+        try:
+            build = self._comparison_report_build(
+                paths, preset_key, wanted, requested, temp_root)
+            report_id = _lineage_id(
+                build['project_id'], build['contracts']['report_spec'])
+            base_revision, base_manifest = service._history_base(
+                build['project_root'], build['project_id'], report_id)
+            refs = build['contracts'].get('contract_refs') or {}
+            preview_id = uuid.uuid4().hex + uuid.uuid4().hex
+            token = {
+                'schema': PREVIEW_TOKEN_SCHEMA,
+                'preview_id': preview_id,
+                'project_id': build['project_id'],
+                'spec_sha256': str((refs.get('spec') or {}).get('sha256') or ''),
+                'snapshot_sha256': str(
+                    (refs.get('snapshot') or {}).get('sha256') or ''),
+                'validation_sha256': str(
+                    (refs.get('validation') or {}).get('sha256') or ''),
+                'report_model_sha256': build['report_model_sha256'],
+                'base_revision': base_revision,
+                'base_manifest_sha256': base_manifest,
+            }
+            for field in ('spec_sha256', 'snapshot_sha256',
+                          'validation_sha256', 'report_model_sha256'):
+                if not re.fullmatch(r'[0-9a-f]{64}', str(token.get(field) or '')):
+                    raise RuntimeError(f'比较报告冻结预览缺少有效 {field}')
+            now = float(service._clock())
+            record = _PreviewRecord(
+                preview_id=preview_id,
+                operation_id='comparison-' + uuid.uuid4().hex,
+                project_id=build['project_id'],
+                project_path=build['project_path'],
+                project_root=build['project_root'],
+                report_id=report_id,
+                created_at_utc=datetime.now(timezone.utc).replace(
+                    microsecond=0).isoformat(),
+                expires_at=now + service._ttl,
+                base_revision=base_revision,
+                base_manifest_sha256=base_manifest,
+                build=build,
+                token=token,
+                temp_root=temp_root,
+            )
+            with service._lock:
+                service._previews[preview_id] = record
+        except Exception:
+            shutil.rmtree(temp_root, ignore_errors=True)
+            raise
+        result = service.publish(
+            build['project_path'], out_dir, preview_id, token,
+            stem=build['default_stem'], public=False, record_artifact=True)
+        return result, build
+
+    def _proj_batch_report_revisioned_impl(
+            self, paths, out_dir, preset_key=None, formats=None,
+            include_individual=True, final=True, requested_kind=None):
+        """Publish comparison and child reports through revisioned services."""
         report_kind = None
         qualification = None
         gate_reason = ''
         eligible = None
+        requested = None
+        target = None
+        individual = []
         try:
             wanted = self._normalize_report_formats(formats)
             requested = (('final' if bool(final) else 'diagnostic')
                          if requested_kind is None else
                          str(requested_kind or '').strip().lower())
             if requested not in _REPORT_KINDS:
-                raise ValueError(
-                    'requested_kind 必须为 final、diagnostic 或 draft')
-            target = os.path.abspath(os.path.normpath(str(out_dir or '').strip()))
+                raise ValueError('requested_kind 必须为 final、diagnostic 或 draft')
             if not str(out_dir or '').strip():
                 return self._report_failure_envelope('未指定批次报告目录')
-            os.makedirs(target, exist_ok=True)
-            items = self._comparison_items(paths, preset_key)
-            snapshot = self._comparison_model().build_comparison_snapshot(
-                items, preset_key=preset_key)
-            if snapshot.get('selected_count', 0) < 2:
-                return self._report_failure_envelope(
-                    '批次报告至少需要选择 2 个项目')
-            figures, figure_files, skipped = self._comparison_figures(
-                snapshot, os.path.join(target, 'comparison_figures'))
-            evaluations = []
-            item_by_path = {str(item.get('path') or ''): item for item in items}
-            for project in snapshot.get('projects') or []:
-                source = item_by_path.get(str(project.get('path') or ''))
-                if not source or not source.get('project'):
-                    continue
-                evaluations.append(self._candidate_eval().evaluate_candidate(
-                    source.get('summary') or {}, project=source['project'],
-                    fed=source.get('fed')))
-            matrix = snapshot.get('adsorption_matrix') or {}
-            comparison_rows = []
-            for name, values in zip(matrix.get('rows') or [], matrix.get('values') or []):
-                comparison_rows.append([
-                    name,
-                    *[('—' if value is None else f'{value:.3f}') for value in values],
-                ])
-            gate = snapshot.get('comparison_gate') or {}
-            eligible = bool(snapshot.get('can_final_report'))
-            gate_reason = '；'.join(
-                gate.get('blocking') or gate.get('warnings') or [])
-            report_kind = ('final' if requested == 'final'
-                           and eligible else
-                           'draft' if requested == 'draft' else 'diagnostic')
-            qualification = ('thermodynamic_path_verified'
-                             if report_kind == 'final' else 'diagnostic')
-            model = {
-                'schema': 'vcstudio.research-report/v1',
-                'locale': 'zh-CN',
-                'title': '多催化剂吸附能与自由能路径比较',
-                'subtitle': (
-                    '批次比较研究报告' if report_kind == 'final' else
-                    '批次比较草稿：内容与证据仍可继续编辑'
-                    if report_kind == 'draft' else
-                    '诊断型批次报告：方法或路径证据尚未完全可比'),
-                'kicker': 'VASP CATALYST STUDIO · COMPARATIVE STUDY',
-                'report_kind': report_kind,
-                'scientific_qualification': (
-                    'thermodynamic_path_verified' if report_kind == 'final'
-                    else 'diagnostic'),
-                'claim_ceiling': 'cross_project_thermodynamic_screen',
-                'metadata': {
-                    '已选项目': snapshot.get('selected_count'),
-                    '可评价项目': snapshot.get('ready_count'),
-                    '同图台阶项目': snapshot.get('ladder_ready_count'),
-                    '比较门禁': gate.get('status'),
-                    '反应预设': preset_key or 'Li-S discharge',
-                    '数据指纹': snapshot.get('data_fingerprint'),
-                },
-                'executive_summary': (
-                    f'本批次选择 {snapshot.get("selected_count")} 个催化剂项目，'
-                    f'{snapshot.get("ready_count")} 个具有可审计吸附能；'
-                    f'比较门禁状态为 {gate.get("status")}。'
-                    + ('当前可生成同轴自由能台阶比较。' if snapshot.get('can_plot')
-                       else '当前不强行叠加不可比的自由能路径。')),
-                'key_findings': [
-                    (evaluation.get('decision') or {}).get('summary_zh') or
-                    f'{(evaluation.get("candidate") or {}).get("name") or "项目"}：证据不足'
-                    for evaluation in evaluations
-                ],
-                'candidate_evaluations': self._candidate_evaluation_table(
-                    evaluations, title='候选材料后续计算优先级'),
-                'comparison_table': {
-                    'title': '多催化剂最稳构型吸附能比较',
-                    'columns': ['催化剂', *(matrix.get('cols') or [])],
-                    'rows': comparison_rows,
-                    'caption': ('每个物种采用项目内最低 E_ads 构型；0.15 eV 内的构型'
-                                '作为近简并候选保留。不同 Li2Sx 不能依次相减代替反应自由能。'),
-                },
-                'figures': figures,
-                'methods': [
-                    '各项目先按规范物种分组并选取最稳构型，再进行横向比较。',
-                    '台阶图仅叠加步骤标签、顺序和能量修正口径一致的自由能路径。',
-                    '项目间自旋初态可不同；是否可比较由实际能量操作数和方法证据决定。',
-                ],
-                'limitations': [
-                    *gate.get('blocking', []), *gate.get('warnings', []),
-                    *[f'{item.get("display_name")}: {reason}'
-                      for item in snapshot.get('projects') or []
-                      for reason in item.get('block_reasons') or []],
-                    *[f'{item.get("display_name")}: {warning}'
-                      for item in snapshot.get('projects') or []
-                      for warning in item.get('warnings') or []],
-                    *[f'图表未生成（{item.get("kind") or "unknown"}）：'
-                      f'{item.get("reason") or "原因未记录"}'
-                      for item in skipped],
-                ],
-                'recommendations': self._recommendation_blocks(evaluations),
-            }
-            content_hasher = getattr(self._paper(), 'report_content_sha256', None)
-            if not callable(content_hasher):
-                from vcstudio.project.paper_report import report_content_sha256
-
-                content_hasher = report_content_sha256
-            report_model_sha256 = str(content_hasher(model)).lower()
-            contracts = self._comparison_report_contracts(
-                snapshot,
-                formats=wanted,
-                requested_kind=requested,
-                report_kind=report_kind,
-                preset_key=preset_key,
-                report_model_sha256=report_model_sha256,
-            )
-            model.update(self._json_safe_report_result(contracts))
-            comparison_result = self._json_safe_report_result(
-                self._paper().render_report_bundle(
-                    model, target, stem='多催化剂_批次比较报告', formats=wanted))
-            individual = []
+            target = os.path.abspath(os.path.normpath(str(out_dir).strip()))
             if include_individual:
                 used_stems = set()
-                for index, source in enumerate(items):
+                for index, source in enumerate(
+                        self._comparison_items(list(paths or []), preset_key)):
                     project = source.get('project')
                     if project is None:
                         continue
@@ -6304,22 +6997,51 @@ class Api:
                         stem = f'{base}_{serial}'
                         serial += 1
                     used_stems.add(stem)
-                    result = self._report_bundle_unrecorded(
+                    child = self.proj_report_bundle(
                         source['path'], target, wanted, final=final, stem=stem,
                         requested_kind=requested)
                     individual.append({
-                        'path': source['path'], 'name': project.get('name') or f'项目{index + 1}',
-                        'kind': result.get('kind'), 'files': result.get('files') or {},
-                        'ok': bool(result.get('ok')), 'error': result.get('error'),
+                        'path': source['path'],
+                        'name': project.get('name') or f'项目{index + 1}',
+                        'kind': child.get('kind'),
+                        'files': child.get('files') or {},
+                        'revision': child.get('revision') or {},
+                        'marker': child.get('marker'),
+                        'ok': bool(child.get('ok')),
+                        'error': child.get('error'),
                     })
-            if comparison_result.get('ok') is False or comparison_result.get('error'):
-                return self._report_failure_envelope(
-                    comparison_result.get('error') or '批次报告渲染失败',
-                    kind=report_kind, qualification=qualification,
-                    gate_reason=gate_reason, requested_kind=requested,
-                    publication_gate_status=(
-                        'eligible' if eligible else 'blocked'),
-                    desired_report_kind=('final' if eligible else 'diagnostic'))
+            comparison_result, build = self._comparison_report_publish_via_service(
+                list(paths or []), target, preset_key=preset_key,
+                wanted=wanted, requested=requested)
+            report_kind = build['report_kind']
+            qualification = build['qualification']
+            gate_reason = build['gate_reason']
+            eligible = build['eligible_final']
+            snapshot = build['comparison_snapshot']
+            gate = snapshot.get('comparison_gate') or {}
+            if comparison_result.get('ok') is not True:
+                failed = copy.deepcopy(comparison_result)
+                failed.update({
+                    'ok': False,
+                    'artifact_status': (
+                        'partial_success' if any(
+                            item.get('ok') is True for item in individual)
+                        else 'failed'),
+                    'requested_kind': requested,
+                    'gate_reason': gate_reason,
+                    'files': {
+                        'comparison': {},
+                        'individual': individual,
+                    },
+                    'figures': comparison_result.get('assets') or [],
+                    'skipped': build['comparison_skipped'],
+                    'blocked': gate.get('blocking') or [],
+                    'warnings': gate.get('warnings') or [],
+                    'snapshot': snapshot,
+                    'out_dir': target,
+                })
+                return failed
+
             return {
                 'ok': True,
                 'kind': report_kind,
@@ -6329,35 +7051,57 @@ class Api:
                 'scientific_qualification': qualification,
                 'gate_reason': gate_reason,
                 'publication_gate_status': (
-                    'eligible' if snapshot.get('can_final_report') else 'blocked'),
-                'desired_report_kind': (
-                    'final' if snapshot.get('can_final_report') else 'diagnostic'),
-                'marker': None,
+                    'eligible' if eligible else 'blocked'),
+                'desired_report_kind': ('final' if eligible else 'diagnostic'),
+                'marker': comparison_result.get('marker'),
+                'revision': comparison_result.get('revision') or {},
+                'manifest': comparison_result.get('manifest'),
                 'requested_kind': requested,
                 'files': {
                     'comparison': comparison_result.get('files') or {},
                     'individual': individual,
                 },
-                'figures': figure_files,
-                'skipped': skipped,
+                'figures': (comparison_result.get('assets')
+                            or build['figure_files']),
+                'skipped': build['comparison_skipped'],
                 'blocked': gate.get('blocking') or [],
                 'warnings': gate.get('warnings') or [],
                 'snapshot': snapshot,
+                'history': self.report_workbench_history(build['project_path']),
                 'out_dir': target,
                 'error': comparison_result.get('error'),
             }
-        except Exception as e:                            # noqa: BLE001
+        except Exception as exc:                         # noqa: BLE001 stable adapter
             gate_fields = ({
-                'publication_gate_status': (
-                    'eligible' if eligible else 'blocked'),
+                'publication_gate_status': ('eligible' if eligible else 'blocked'),
                 'desired_report_kind': ('final' if eligible else 'diagnostic'),
             } if eligible is not None else {})
-            return self._report_failure_envelope(
-                e, kind=report_kind, qualification=qualification,
+            failed = self._report_failure_envelope(
+                exc, kind=report_kind, qualification=qualification,
                 gate_reason=gate_reason,
-                requested_kind=(str(requested_kind or '').strip().lower()
-                                or None),
+                requested_kind=(requested or
+                                str(requested_kind or '').strip().lower() or None),
                 **gate_fields)
+            has_success = any(item.get('ok') is True for item in individual)
+            failed['artifact_status'] = (
+                'partial_success' if has_success else 'failed')
+            # Preserve the batch breakdown only after at least one child was
+            # actually attempted.  Validation failures that happen before any
+            # publication retain the stable generic failure envelope (`files={}`).
+            if individual:
+                failed['files'] = {
+                    'comparison': {}, 'individual': individual}
+            if target is not None:
+                failed['out_dir'] = target
+            return failed
+
+    def proj_batch_report(self, paths, out_dir, preset_key=None, formats=None,
+                          include_individual=True, final=True, requested_kind=None):
+        """Generate revisioned individual and multi-catalyst reports."""
+        return self._proj_batch_report_revisioned_impl(
+            paths, out_dir, preset_key=preset_key, formats=formats,
+            include_individual=include_individual, final=final,
+            requested_kind=requested_kind)
 
     # ── 论文级出图(原生 matplotlib 引擎,不依赖 Origin/POV-Ray) ────────────────
     @staticmethod
@@ -8621,10 +9365,133 @@ class Api:
         except Exception as exc:                          # noqa: BLE001 fail-closed status
             return None, f'冻结 ReportSpec 范围无法重放：{exc}'
 
+    def _comparison_report_marker_science_state(self, project, marker):
+        """Validate a comparison marker against every frozen project input."""
+        marker = marker if isinstance(marker, dict) else {}
+        raw_kind = str(marker.get('kind') or '').strip().lower()
+        qualification = str(
+            marker.get('scientific_qualification') or '').strip().lower()
+
+        def stale(reason):
+            return {
+                'kind': raw_kind if raw_kind in _REPORT_KINDS else 'diagnostic',
+                'qualification': (qualification
+                                  if qualification in _REPORT_QUALIFICATIONS
+                                  else 'diagnostic'),
+                'reason': str(reason or '比较报告 marker 验证失败'),
+                'stale': True,
+                'eligible_final': False,
+                'gate_reason': str(reason or ''),
+            }
+
+        try:
+            if str(marker.get('scope_kind') or '') != 'comparison':
+                return stale('比较报告 marker 缺少 comparison scope 标记')
+            if raw_kind not in _REPORT_KINDS:
+                return stale('比较报告 marker kind 无效')
+            if str(marker.get('scientific_status') or '') != raw_kind:
+                return stale('比较报告 marker 科学状态不一致')
+            if qualification not in _REPORT_QUALIFICATIONS:
+                return stale('比较报告 marker 科学资格无效')
+            if raw_kind == 'final' and qualification != 'thermodynamic_path_verified':
+                return stale('最终比较报告缺少 thermodynamic_path_verified 资格')
+            if raw_kind != 'final' and qualification != 'diagnostic':
+                return stale('非最终比较报告声明了越权科学资格')
+            if str(marker.get('artifact_status') or '') != 'ready':
+                return stale('比较报告 marker 未声明 ready')
+            files = marker.get('files') if isinstance(marker.get('files'), dict) else {}
+            spec_path = str(files.get('contract_spec') or '')
+            if not spec_path or not os.path.isfile(spec_path):
+                return stale('比较报告 marker 缺少 ReportSpec sidecar')
+            from vcstudio.project.report_contracts import ReportSpec
+
+            with open(spec_path, 'r', encoding='utf-8') as handle:
+                spec = ReportSpec.from_mapping(json.load(handle))
+            if str(spec.scope.get('kind') or '') != 'comparison':
+                return stale('比较报告 ReportSpec scope 无效')
+            project_ids = [str(item) for item in spec.scope.get('project_ids') or []]
+            if project_ids != list(marker.get('comparison_project_ids') or []):
+                return stale('比较报告 marker 与 ReportSpec 项目身份不一致')
+            workspace_id = str(marker.get('workspace_project_id') or '')
+            if not project_ids or workspace_id != project_ids[0]:
+                return stale('比较报告锚点身份无效')
+            refs = marker.get('contracts') if isinstance(marker.get('contracts'), dict) else {}
+            if str((refs.get('spec') or {}).get('sha256') or '') != spec.semantic_sha256:
+                return stale('比较报告 ReportSpec 与 contract ref 不一致')
+            index, _projects = self._analysis_workbench_project_index()
+            anchor_path = index.get(workspace_id)
+            if not anchor_path:
+                return stale('比较报告锚点项目已无法从注册表解析')
+            current = self._comparison_report_current_state(anchor_path, spec)
+            scientific_fingerprint = str(
+                marker.get('scientific_fingerprint') or '').strip().lower()
+            if (not re.fullmatch(r'[0-9a-f]{64}', scientific_fingerprint)
+                    or scientific_fingerprint
+                    != current.get('scientific_fingerprint')):
+                return stale('比较报告科学输入指纹已失效')
+            report_model_sha256 = str(
+                marker.get('report_model_sha256') or '').strip().lower()
+            normalized_contracts = self._validated_report_contract_refs(
+                refs, raw_kind, require_sidecars=True)
+            self._validate_report_contract_sidecars(
+                files, normalized_contracts, kind=raw_kind,
+                scientific_fingerprint=scientific_fingerprint,
+                scientific_qualification=qualification,
+                report_model_sha256=report_model_sha256)
+            manifest_path = str(marker.get('manifest') or '')
+            if (not manifest_path or not files.get('manifest')
+                    or self._analysis_workbench_path_key(manifest_path)
+                    != self._analysis_workbench_path_key(files['manifest'])):
+                return stale('比较报告 manifest 未纳入 marker 文件绑定')
+            self._validate_report_manifest(
+                manifest_path, kind=raw_kind,
+                model_sha256=marker.get('model_sha256'),
+                scientific_fingerprint=scientific_fingerprint,
+                contracts=normalized_contracts,
+                scientific_qualification=qualification,
+                files=files,
+                report_model_sha256=report_model_sha256,
+                revision=marker.get('revision') or {})
+            eligible = bool(current.get('eligible_final'))
+            desired = 'final' if eligible else 'diagnostic'
+            gate_reason = str(current.get('gate_reason') or '')
+            if raw_kind != 'draft' and raw_kind != desired:
+                return stale(
+                    '当前比较门禁已通过，诊断报告需升级为最终报告'
+                    if desired == 'final' else gate_reason or '比较门禁已阻断')
+            return {
+                'kind': raw_kind,
+                'qualification': qualification,
+                'reason': '' if raw_kind == 'final' else gate_reason,
+                'stale': False,
+                'eligible_final': eligible,
+                'gate_reason': gate_reason,
+            }
+        except Exception as exc:                          # noqa: BLE001 fail closed
+            return stale(f'比较报告验证记录无效：{exc}')
+
     def _report_marker_current(self, project, summary=None) -> bool:
         marker = (project or {}).get('autopilot_report')
         if not isinstance(marker, dict):
             return False
+        if marker.get('scope_kind') == 'comparison':
+            try:
+                declared = marker.get('files')
+                hashes = marker.get('sha256') or marker.get('report_hashes')
+                if (not isinstance(declared, dict) or not declared
+                        or not isinstance(hashes, dict)
+                        or not {'html', 'docx', 'pdf'}.intersection(declared)):
+                    return False
+                if not all(
+                        os.path.isfile(str(path))
+                        and str(hashes.get(fmt) or '')
+                        and _sha256_file(str(path)) == str(hashes.get(fmt))
+                        for fmt, path in declared.items()):
+                    return False
+                return not self._comparison_report_marker_science_state(
+                    project, marker).get('stale', True)
+            except Exception:                            # noqa: BLE001 stale on uncertainty
+                return False
         try:
             current = summary or self._adsorption.delta_e_rows(project)
             current, scope_error = self._report_marker_scoped_summary(
@@ -8691,6 +9558,8 @@ class Api:
     def _report_marker_science_state(self, project, marker, summary=None) -> dict:
         """Resolve current science state and staleness without trusting marker text."""
         marker = marker if isinstance(marker, dict) else {}
+        if marker.get('scope_kind') == 'comparison':
+            return self._comparison_report_marker_science_state(project, marker)
         current = summary or self._adsorption.delta_e_rows(project)
         raw_kind = str(marker.get('kind') or '').strip().lower()
         stored_reason = str(
@@ -8829,6 +9698,31 @@ class Api:
         marker = ((project or {}).get('autopilot_report')
                   if isinstance((project or {}).get('autopilot_report'), dict)
                   else {})
+        if marker.get('scope_kind') == 'comparison':
+            science = self._comparison_report_marker_science_state(project, marker)
+            artifact_current = self._report_marker_current(project, current)
+            eligible = bool(science.get('eligible_final'))
+            reason = str(science.get('reason') or '')
+            if not artifact_current and not reason:
+                reason = '比较报告产物文件、哈希或冻结输入已失效，请重新生成'
+            return {
+                'schema': 'vcstudio.report-status/v1',
+                'artifact_status': 'ready' if artifact_current else 'stale',
+                'artifact_current': bool(artifact_current),
+                'has_marker': True,
+                'marker_kind': str(marker.get('kind') or 'diagnostic'),
+                'scientific_status': science.get('kind') or 'diagnostic',
+                'scientific_qualification': (
+                    science.get('qualification') or 'diagnostic'),
+                'scientific_stale': bool(science.get('stale')),
+                'eligible_final': eligible,
+                'publication_gate_status': 'eligible' if eligible else 'blocked',
+                'desired_report_kind': 'final' if eligible else 'diagnostic',
+                'report_reason': reason,
+                'files': dict(marker.get('files') or {}),
+                'revision': self._json_safe_report_result(
+                    marker.get('revision') or {}),
+            }
         gate_current = current
         scope_error = None
         if marker:

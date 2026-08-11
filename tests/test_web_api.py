@@ -2141,13 +2141,18 @@ def test_proj_compare_eight_projects_share_one_ladder_with_explicit_ul(tmp_path)
 def test_proj_batch_report_unverified_method_is_diagnostic(tmp_path):
     render_calls = []
     chart_calls = {}
+    project_paths = [
+        str(tmp_path / name / 'project.yaml') for name in ('a', 'b')]
+    for path in project_paths:
+        Path(path).parent.mkdir()
+        Path(path).write_text('schema: vcstudio.project/v1\n', encoding='utf-8')
     projects = {
-        '/a': {
-            'name': 'A', 'root': '/data/a', 'project_uuid': 'a-id',
+        project_paths[0]: {
+            'name': 'A', 'root': str(tmp_path / 'a'), 'project_uuid': 'a' * 32,
             'comparison_method_fingerprint': 'same-method',
         },
-        '/b': {
-            'name': 'B', 'root': '/data/b', 'project_uuid': 'b-id',
+        project_paths[1]: {
+            'name': 'B', 'root': str(tmp_path / 'b'), 'project_uuid': 'b' * 32,
             'comparison_method_fingerprint': 'same-method',
         },
     }
@@ -2155,17 +2160,33 @@ def test_proj_batch_report_unverified_method_is_diagnostic(tmp_path):
         name: _science_delta(name, method='unverified')
         for name in ('A', 'B')
     }
-    ads = _fake_adsorption(proj_map=projects)
+    ads = _fake_adsorption(projects=project_paths, proj_map=projects)
     ads.delta_e_rows = lambda project: summaries[project['name']]
+    ads.save_project = lambda root, project: projects.__setitem__(
+        next(path for path, value in projects.items()
+             if os.path.normcase(value['root']) == os.path.normcase(str(root))),
+        copy.deepcopy(project))
+    renderer = _contract_bundle_renderer()
+
+    def capture_renderer(model, out_dir, *, stem, formats):
+        render_calls.append({
+            'model': copy.deepcopy(model), 'out_dir': str(out_dir),
+            'stem': stem, 'formats': tuple(formats),
+        })
+        return renderer(model, out_dir, stem=stem, formats=formats)
+
     api = Api(
         adsorption_mod=ads,
         native_charts_mod=_fake_ncharts(chart_calls),
-        paper_report_mod=_fake_paper_report(render_calls),
+        paper_report_mod=types.SimpleNamespace(
+            render_report_bundle=capture_renderer,
+            report_content_sha256=canonical_paper_report.report_content_sha256),
         config_mod=_fake_config(),
     )
+    api._comparison_figures = lambda *_args, **_kwargs: ([], [], [])
 
     out = api.proj_batch_report(
-        ['/a', '/b'], str(tmp_path / 'reports'),
+        project_paths, str(tmp_path / 'reports'),
         formats=['html'], include_individual=False, final=True)
 
     assert out['ok'] is True
@@ -3174,17 +3195,29 @@ def test_report_member_ids_and_comparison_contracts_ignore_machine_paths(monkeyp
         return {
             'schema': 'vcstudio.comparison-snapshot/v1',
             'ranking_deadband_eV': 0.15,
-            'projects': [{
-                'project_uuid': 'project-a', 'name': 'Catalyst A',
-                'display_name': display_name, 'status': 'blocked',
-                'block_reasons': ['缺少路径'], 'warnings': [],
-                'method_status': 'verified', 'method_signature': 'same',
-                'method_evidence': {
-                    'status': 'verified', 'fingerprint': 'method-fp',
-                    'source_job': source_job,
+            'projects': [
+                {
+                    'project_id': 'project-a', 'name': 'Catalyst A',
+                    'display_name': display_name, 'status': 'blocked',
+                    'block_reasons': ['缺少路径'], 'warnings': [],
+                    'method_status': 'verified', 'method_signature': 'same',
+                    'method_evidence': {
+                        'status': 'verified', 'fingerprint': 'method-fp',
+                        'source_job': source_job,
+                    },
+                    'species': [], 'ladder': {},
                 },
-                'species': [], 'ladder': {},
-            }],
+                {
+                    'project_id': 'project-b', 'name': 'Catalyst B',
+                    'display_name': 'Catalyst B', 'status': 'blocked',
+                    'block_reasons': ['缺少路径'], 'warnings': [],
+                    'method_status': 'verified', 'method_signature': 'same',
+                    'method_evidence': {
+                        'status': 'verified', 'fingerprint': 'method-fp-b',
+                    },
+                    'species': [], 'ladder': {},
+                },
+            ],
             'comparison_gate': {'status': 'blocked', 'blocking': ['缺少路径']},
             'adsorption_matrix': {}, 'ladder': {}, 'can_final_report': False,
         }

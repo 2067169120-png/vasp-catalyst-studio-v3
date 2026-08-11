@@ -36,7 +36,7 @@ import yaml
 # ── 合法取值域(自包含,不 import project/*;由 tests 断言与 advisor/reactions 真实同步) ──
 # 导航页(与 gui_web/assets/index.html 的 data-page 清单严格一致;顺序为默认导航序)
 PAGES = (
-    'dashboard', 'structure', 'generate', 'jobs', 'project',
+    'dashboard', 'structure', 'generate', 'jobs', 'project', 'analysis-workbench',
     'report-workbench', 'wavefunction', 'figures', 'ai', 'cluster', 'settings',
 )
 
@@ -142,7 +142,8 @@ _LIS = {
         '锂硫正极催化全流程:清洁表面 + 多硫化物构型族 + 气相参考,'
         'Li–S 放电台阶图与 SAC 批量筛选一应俱全。'),
     'primary': True,
-    'pages': ['dashboard', 'structure', 'jobs', 'project', 'report-workbench', 'figures',
+    'pages': ['dashboard', 'structure', 'jobs', 'project', 'analysis-workbench',
+              'report-workbench', 'figures',
               'cluster', 'settings'],
     'cards': {
         'project': {'adsorption': True, 'task_analysis': False,
@@ -179,7 +180,7 @@ _VASP = {
     'name': '通用 VASP 计算',
     'description': '从 23 类 VASP 任务中选择本次计算，只展示建模、输入、提交和对应结果工具。',
     'primary': True,
-    'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project',
+    'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project', 'analysis-workbench',
               'report-workbench', 'figures', 'cluster', 'settings'],
     'cards': {
         'structure': {'molecular': False},
@@ -212,7 +213,7 @@ _ELECTROCAT = {
         '水系电催化:CHE 计算氢电极台阶图与 Sabatier 火山图前置,'
         'ORR / HER / OER / CO₂RR 反应组默认置顶。'),
     'primary': False,
-    'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project',
+    'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project', 'analysis-workbench',
               'report-workbench', 'figures', 'cluster', 'settings'],
     'cards': {},
     # 火山图(Sabatier 峰顶)是电催化筛选的招牌图,置最前;标度关系次之
@@ -244,7 +245,7 @@ _THERMOCAT = {
         '气固热催化表面反应:NEB 过渡态与频率(ZPE / 热校正)前置,'
         '电位类图型(火山图 / 台阶图)后置。'),
     'primary': False,
-    'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project',
+    'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project', 'analysis-workbench',
               'report-workbench', 'figures', 'cluster', 'settings'],
     # 热催化非电化学:隐藏项目页的反应(台阶图)预设卡片
     'cards': {'project': {'reactions': False}},
@@ -278,7 +279,7 @@ _BATTERY_BULK = {
         '电极体相与电解液:以 bulk 与分子为主,吸附 / 表面卡片弱化,'
         '方法学告警按体相口径裁剪(无真空 / 偶极项)。'),
     'primary': False,
-    'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project',
+    'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project', 'analysis-workbench',
               'report-workbench', 'figures', 'cluster', 'settings'],
     # 吸附卡片弱化:隐藏 SAC 表面批量建模;隐藏火山图/标度(吸附质筛选专用)
     'cards': {
@@ -316,7 +317,7 @@ _MOLECULAR = {
         '隐藏周期性(slab / 真空)相关卡片,以分子单点与反应能为主。'),
     'primary': True,
     # 分子化学不走"吸附能项目"(表面 slab 工作流),隐藏该页
-    'pages': ['dashboard', 'structure', 'generate', 'jobs', 'wavefunction',
+    'pages': ['dashboard', 'structure', 'generate', 'jobs', 'analysis-workbench', 'wavefunction',
               'figures', 'cluster', 'settings'],
     # SAC 批量建模是周期 slab 建模,隐藏;多自旋家族对自由基仍有用,保留
     'cards': {'structure': {'molecular': True, 'metal_slab': False,

@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>VASP Catalyst Studio</title>
 <link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="analysis-workbench.css">
 <link rel="stylesheet" href="report-workbench.css">
 <script>/* 主题先粉刷防闪烁:CSS 生效前按上次选择置 data-theme,app.js 再从 config 校准 */
 try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.dataset.theme=_t;}catch(e){}</script>
@@ -329,7 +330,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
         <span class="nav-label"><b>运行</b><small>Run</small></span>
       </a>
       <a href="#/projects/current/analysis/adsorption" id="nav-analyze" data-route="analyze-energy" data-area="analyze"
-        data-page="project" data-scene="pages.project"
+        data-page="analysis-workbench" data-scene="pages.analysis-workbench"
         aria-label="分析 Analyze" title="分析 · Analyze">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V9M10 19V5M16 19v-7M22 19H2"/><circle cx="18.5" cy="7.5" r="2.5"/></svg>
         <span class="nav-label"><b>分析</b><small>Analyze</small></span>
@@ -418,8 +419,9 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
       <a href="#/prepare/structure" data-route="prepare-structure" data-area="prepare" data-page="structure" data-scene="pages.structure" data-i18n="nav.structure">结构建模</a>
       <a href="#/prepare/input" data-route="prepare-input" data-area="prepare" data-page="generate" data-scene="pages.generate" data-i18n="nav.generate">生成输入</a>
       <a href="#/jobs" data-route="run-jobs" data-area="run" data-page="jobs" data-scene="pages.jobs" data-i18n="nav.jobs">作业与运行</a>
-      <a href="#/projects/current/analysis/adsorption" data-route="analyze-energy" data-area="analyze" data-page="project" data-scene="pages.project" data-i18n="nav.project">能量与稳定性</a>
-      <a href="#/projects/current/analysis/charge" data-route="analyze-charge" data-area="analyze" data-page="wavefunction" data-scene="pages.wavefunction" data-i18n="nav.wavefunction">电荷与波函数</a>
+      <a href="#/projects/current/analysis/adsorption" data-route="analyze-energy" data-area="analyze" data-page="analysis-workbench" data-scene="pages.analysis-workbench">能量与稳定性</a>
+      <!-- 旧 wavefunction 物理页的场景适配器；语义路由仍进入统一分析工作台。 -->
+      <a href="#/projects/current/analysis/charge" data-route="analyze-charge" data-area="analyze" data-page="wavefunction" data-scene="pages.wavefunction">电荷与波函数</a>
       <a href="#/publish/figures?project=current" data-route="publish-figures" data-area="publish" data-page="figures" data-scene="pages.figures" data-i18n="nav.figures">图表工作台</a>
       <a href="#/publish/report?project=current" data-route="publish-report" data-area="publish" data-page="report-workbench" data-scene="pages.report-workbench">报告工作台</a>
       <a href="#/environment/cluster" data-route="environment-cluster" data-area="environment" data-page="cluster" data-scene="pages.cluster" data-i18n="nav.cluster">集群</a>
@@ -1723,6 +1725,72 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
     <div class="log" id="project-log" data-anchor><div class="head">项目日志</div></div>
   </section>
 
+  <!-- Phase D：分析注册表驱动的统一工作台。前端只选择参数，不计算科学结果。 -->
+  <section class="page analysis-workbench-page" data-page="analysis-workbench"
+    id="page-analysis-workbench" aria-labelledby="aw-title" hidden>
+    <header class="aw-header">
+      <div class="aw-title-wrap">
+        <h1 id="aw-title" tabindex="-1">分析工作台</h1>
+        <p id="aw-project-name">选择项目后读取服务端分析注册表和证据。</p>
+      </div>
+      <div class="aw-actions actions" aria-label="分析工作台操作">
+        <button class="btn primary" id="aw-refresh" type="button">刷新分析</button>
+        <button class="btn" id="aw-save-view" type="button">保存视图</button>
+        <button class="btn" id="aw-favorite" type="button" aria-pressed="false">收藏分析</button>
+      </div>
+    </header>
+    <div class="aw-alert" id="aw-alert" role="alert" hidden></div>
+    <div class="aw-status-strip" id="aw-status-strip" role="status" aria-live="polite" aria-atomic="true">
+      <span class="aw-stat"><small>分析</small><b id="aw-status-analysis">未读取</b></span>
+      <span class="aw-stat"><small>科学状态</small><b id="aw-status-science">未知</b></span>
+      <span class="aw-stat"><small>输入分母</small><b id="aw-status-input">0</b></span>
+      <span class="aw-stat"><small>可见结果</small><b id="aw-status-visible">0</b></span>
+      <span class="aw-stat"><small>数据指纹</small><b id="aw-status-hash">—</b></span>
+    </div>
+    <div class="aw-layout">
+      <aside class="aw-panel aw-nav" aria-labelledby="aw-nav-title">
+        <header><h2 id="aw-nav-title">分析注册表</h2><p>能力来自服务端，缺证据不会自动解锁。</p></header>
+        <div class="aw-nav-body">
+          <ul class="aw-registry" id="aw-registry" aria-busy="true"><li>正在读取…</li></ul>
+          <h3 class="aw-subhead">视图模板</h3>
+          <ul class="aw-template-list" id="aw-template-list"><li>尚未读取</li></ul>
+        </div>
+      </aside>
+      <div class="aw-panel aw-main" role="region" aria-labelledby="aw-results-title">
+        <header><h2 id="aw-results-title">数据集与结果</h2><p id="aw-results-description">所有数值由后端冻结数据生成。</p></header>
+        <form id="aw-spec-form" novalidate>
+          <fieldset class="aw-controls" id="aw-controls">
+            <legend class="sr-only">分析参数</legend>
+            <div class="aw-field"><label for="aw-data-mode">数据模式</label><select class="ipt" id="aw-data-mode"><option value="stable">最稳/近简并</option><option value="all">全部构型</option></select></div>
+            <div class="aw-field"><label for="aw-deadband">近简并阈值 / eV</label><input class="ipt" id="aw-deadband" type="number" min="0" max="1" step="0.01" value="0.15"></div>
+            <div class="aw-field"><label for="aw-precision">小数位</label><input class="ipt" id="aw-precision" type="number" min="2" max="8" step="1" value="4"></div>
+            <div class="aw-field"><label for="aw-missing-policy">缺失策略</label><select class="ipt" id="aw-missing-policy"><option value="show_missing">明确显示缺失</option><option value="complete_cases">仅完整案例</option></select></div>
+            <div class="aw-field aw-field-wide"><label for="aw-projects">比较项目</label><select class="ipt" id="aw-projects" multiple size="4" aria-describedby="aw-projects-help"></select><small id="aw-projects-help">仅多项目比较使用；当前项目始终由服务端绑定。</small></div>
+            <div class="aw-field"><label for="aw-baseline">比较基准</label><select class="ipt" id="aw-baseline"><option value="">不设基准</option></select></div>
+            <div class="aw-field"><label for="aw-sort-key">排序字段</label><select class="ipt" id="aw-sort-key"></select></div>
+            <div class="aw-field"><label for="aw-sort-direction">排序方向</label><select class="ipt" id="aw-sort-direction"><option value="asc">升序</option><option value="desc">降序</option></select></div>
+            <div class="aw-field aw-field-wide"><span id="aw-sensitivity-label">敏感性 deadband / eV</span><div class="aw-sensitivity" id="aw-sensitivity" role="group" aria-labelledby="aw-sensitivity-label"></div></div>
+          </fieldset>
+        </form>
+        <div class="aw-denominator" id="aw-denominator" aria-label="分析分母"></div>
+        <div class="aw-table-scroll" id="aw-table-scroll" tabindex="0" aria-label="分析结果表，较宽时可局部滚动"><div class="aw-empty">尚未生成分析视图。</div></div>
+        <section class="aw-chartless" aria-labelledby="aw-sensitivity-title">
+          <h3 id="aw-sensitivity-title">稳健性与阈值敏感性</h3>
+          <div class="aw-sensitivity-list" id="aw-sensitivity-results"><div class="aw-empty">当前分析没有敏感性结果。</div></div>
+        </section>
+      </div>
+      <aside class="aw-panel aw-inspector" aria-labelledby="aw-inspector-title">
+        <header><h2 id="aw-inspector-title">证据与方法检查器</h2><p>状态、分母和缺项均由服务端返回。</p></header>
+        <div class="aw-inspector-body">
+          <section class="aw-inspector-group"><h3>方法矩阵</h3><div class="aw-method-scroll" id="aw-method-matrix"><div class="aw-empty">尚未读取。</div></div></section>
+          <section class="aw-inspector-group"><h3>阻断项</h3><ul id="aw-blocking"><li>尚未读取</li></ul></section>
+          <section class="aw-inspector-group"><h3>告警与限制</h3><ul id="aw-warnings"><li>尚未读取</li></ul></section>
+          <p class="aw-operation" id="aw-operation" aria-live="polite">等待项目上下文。</p>
+        </div>
+      </aside>
+    </div>
+  </section>
+
   <!-- Phase C：统一报告工作台。预设、ReportSpec、快照与门禁均由后端 bootstrap 提供。 -->
   <section class="page report-workbench-page" data-page="report-workbench"
     id="page-report-workbench" aria-labelledby="rw-title" hidden>
@@ -2808,6 +2876,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(_t)document.documentElement.data
 <script src="cluster.js"></script>
 <script src="generate.js"></script>
 <script src="project.js"></script>
+<script src="analysis-workbench.js"></script>
 <script src="report-workbench.js"></script>
 <script src="dashboard.js"></script>
 <script src="settings.js"></script>

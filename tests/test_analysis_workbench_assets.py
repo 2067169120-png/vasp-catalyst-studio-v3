@@ -1,0 +1,208 @@
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+
+ASSETS = Path(__file__).parents[1] / "vcstudio" / "gui_web" / "assets"
+
+
+def _source(name: str) -> str:
+    return (ASSETS / name).read_text(encoding="utf-8")
+
+
+def test_analysis_workbench_assets_and_semantic_page_are_loaded_once():
+    html = _source("index.html")
+
+    assert html.count('href="analysis-workbench.css"') == 1
+    assert html.count('src="analysis-workbench.js"') == 1
+    assert html.count('data-page="analysis-workbench"') >= 2
+    assert html.count('id="page-analysis-workbench"') == 1
+    assert html.index('src="analysis-workbench.js"') < html.index(
+        'src="report-workbench.js"')
+    assert re.search(
+        r'id="nav-analyze"[^>]+data-page="analysis-workbench"'
+        r'[^>]+data-scene="pages\.analysis-workbench"',
+        html,
+    )
+
+
+def test_workbench_uses_native_labels_groups_status_and_locally_scrollable_table():
+    html = _source("index.html")
+    css = _source("analysis-workbench.css")
+
+    for control_id in (
+        "aw-data-mode", "aw-deadband", "aw-precision", "aw-missing-policy",
+        "aw-projects", "aw-baseline", "aw-sort-key", "aw-sort-direction",
+    ):
+        assert f'for="{control_id}"' in html
+        assert f'id="{control_id}"' in html
+    assert 'id="aw-sensitivity" role="group"' in html
+    assert 'id="aw-alert" role="alert"' in html
+    assert 'id="aw-operation" aria-live="polite"' in html
+    assert 'id="aw-table-scroll" tabindex="0"' in html
+    assert '<main class="aw-panel aw-main"' not in html
+    assert 'class="aw-panel aw-main" role="region"' in html
+    assert ".aw-table-scroll" in css and "overflow: auto" in css
+    assert re.search(r"@media\s*\(max-width:\s*959px\)", css)
+    assert re.search(r"@media\s*\(max-width:\s*520px\)", css)
+    assert "grid-template-columns: minmax(0, 1fr)" in css
+
+
+def test_six_analysis_routes_share_one_physical_workbench_and_keep_opaque_ids():
+    workspace = _source("workspace.js")
+    routes = workspace.split("const ROUTES = Object.freeze({", 1)[1].split(
+        "const AREA_LABELS", 1)[0]
+    expected = {
+        "analyze-energy": ("adsorption-energy", "project"),
+        "analyze-thermo": ("free-energy-path", "project"),
+        "analyze-electronic": ("electronic-structure", "wavefunction"),
+        "analyze-charge": ("charge-wavefunction", "wavefunction"),
+        "analyze-comparison": ("multi-project-comparison", "project"),
+        "analyze-custom": ("task-results", "project"),
+    }
+    for route_id, (analysis_id, scene_page) in expected.items():
+        block = routes.split(f"'{route_id}':", 1)[1].split("},", 1)[0]
+        assert "page: 'analysis-workbench'" in block
+        assert f"analysisId: '{analysis_id}'" in block
+        assert f"scenePage: '{scene_page}'" in block
+        assert "focus: '#aw-title'" in block
+    assert "const analysisId = route.def.analysisId || route.def.analysis || '';" in workspace
+    assert "route.def.page !== 'analysis-workbench'" in workspace
+    assert "return !def.scenePage || VCS.canActivatePage(def.scenePage);" in workspace
+    properties = routes.split("'analyze-properties':", 1)[1].split("},", 1)[0]
+    assert "analysisId: 'property-calculators'" in properties
+    assert "scenePage: 'project'" in properties
+    assert "'analyze-properties': 'property-calculators'" in _source(
+        "analysis-workbench.js")
+
+
+def test_browser_sends_only_analysis_spec_and_never_computes_scientific_values():
+    script = _source("analysis-workbench.js")
+    request = re.search(
+        r"function requestFromControls\(\) \{(.*?)\n  \}", script, re.S
+    ).group(1)
+
+    for key in (
+        "analysis_id", "project_id", "comparison_project_ids", "data_mode",
+        "near_degenerate_eV", "precision", "baseline_project_id",
+        "missing_policy", "sort", "sensitivity_deadbands_eV", "view_id",
+    ):
+        assert key in request
+    for forbidden in (
+        "project_path", "source_job", "delta_e", "energy_e0", "method_matrix",
+        "scientific_status", "data_fingerprint", "results",
+    ):
+        assert forbidden not in request
+    assert "analysis_workbench_preview" in script
+    assert "analysis_workbench_bootstrap" in script
+    assert "projectPath" not in script
+    assert "Scientific rows, rankings, gates and sensitivity sets are server-owned" in script
+    assert "delta_e_eV -" not in script
+    assert "lowest_energy_eV =" not in script
+    assert "if (parameters.includes('sort'))" in request
+    assert "request.sort = {" in request
+
+
+def test_sort_controls_follow_the_registry_capability_and_never_replay_placeholder_sort():
+    script = _source("analysis-workbench.js")
+    request = re.search(
+        r"function requestFromControls\(\) \{(.*?)\n  \}", script, re.S
+    ).group(1)
+    controls = re.search(
+        r"function renderControls\(\) \{(.*?)\n  \}", script, re.S
+    ).group(1)
+
+    assert "const parameters = Array.isArray(record && record.parameters)" in request
+    assert "if (parameters.includes('sort'))" in request
+    assert "request.sort = {" in request
+    assert "const supportsSort = parameters.includes('sort')" in controls
+    assert "supportsSort && Array.isArray(record && record.sort_keys)" in controls
+    assert "!supportsSort || State.busy" in controls
+
+
+def test_free_energy_renderer_projects_only_server_owned_rows_and_conclusions():
+    script = _source("analysis-workbench.js")
+    css = _source("analysis-workbench.css")
+    renderer = re.search(
+        r"function renderFreeEnergyView\(view, box\) \{(.*?)\n  \}\n\n"
+        r"  function renderSensitivity",
+        script,
+        re.S,
+    ).group(1)
+
+    assert "State.analysisId === 'free-energy-path'" in script
+    assert "renderFreeEnergyView(view, box)" in script
+    assert "Array.isArray(view.rows) ? view.rows : []" in renderer
+    for server_field in (
+        "row.step_index", "row.label", "row.sub_label", "row.G_display",
+        "pds.index", "pds.from_label", "pds.to_label", "view.u_l_display",
+        "view.mu_li_display", "thermo.status", "thermo.temperature_display",
+        "thermo.correction_fingerprint", "view.method_status", "method.status",
+        "method.errors", "method.warnings", "view.missing", "view.blocking",
+        "view.reference", "view.reaction_path_id",
+    ):
+        assert server_field in renderer
+
+    # Rendering may format labels and units, but it must not reconstruct the
+    # ladder, energy differences, limiting potential, or PDS in JavaScript.
+    for forbidden in (
+        ".sort(", ".reduce(", "Math.", "row.G -", "steps[pds", "pds_index",
+        "u_l =", "mu_li =",
+    ):
+        assert forbidden not in renderer
+    assert "textContent" in renderer
+    assert "innerHTML = `<" not in renderer
+    assert ".aw-free-energy-summary" in css
+    assert ".aw-free-energy-evidence-grid" in css
+
+
+def test_async_results_are_project_bound_and_last_request_wins():
+    script = _source("analysis-workbench.js")
+
+    assert "const generation = ++State.previewGeneration" in script
+    assert "const intent = ++State.intentGeneration" in script
+    assert "State.previewGeneration += 1" in script
+    assert "analysisId !== State.analysisId" in script
+    assert "function beginBusy()" in script and "function endBusy(token)" in script
+    assert "generation !== State.previewGeneration" in script
+    assert "const generation = ++State.bootstrapGeneration" in script
+    assert "generation !== State.bootstrapGeneration" in script
+    assert "sameProject(projectId)" in script
+    assert "safeId(result.project_id) !== projectId" in script
+    assert "vcs:workspace-project" in script
+    assert "result.default_spec || result.spec" in script
+    assert "controls.disabled = State.busy || !State.spec" in script
+
+
+def test_project_multiselect_rebuilds_only_the_baseline_without_resetting_selection():
+    script = _source("analysis-workbench.js")
+    change = re.search(
+        r"const form = \$\('aw-spec-form'\); if \(form\) "
+        r"form\.addEventListener\('change', event => \{(.*?)\n    \}\);",
+        script,
+        re.S,
+    ).group(1)
+
+    assert "selectedComparisonProjectIds()" in change
+    assert "renderBaselineOptions(" in change
+    assert "renderProjects()" not in change
+    assert "if (!selected.includes(State.projectId)) selected.unshift(State.projectId)" in script
+
+
+def test_view_templates_and_favorites_use_revision_cas_and_do_not_persist_project_scope():
+    script = _source("analysis-workbench.js")
+
+    assert "analysis_preferences_update" in script
+    assert "analysis_preferences_favorite" in script
+    assert "State.preferenceRevision" in script
+    assert "result.conflict === true" in script
+    assert "favorites.has(right.id)" in script
+    assert "button.dataset.favorite" in script
+    assert "aria-describedby" in script
+    assert "option.disabled = true" in script
+    assert "spec: requestFromControls()" in script
+    assert "values: requestFromControls()" not in script
+    assert "comparison_project_ids" not in re.search(
+        r"async function saveView\(\) \{(.*?)\n  \}", script, re.S
+    ).group(1)

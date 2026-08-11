@@ -52,19 +52,27 @@
     'run-jobs': { area: 'run', page: 'jobs', label: '作业', path: () => '/jobs' },
     'run-remote': { area: 'run', page: 'cluster', label: '远程', path: () => '/run/remote' },
 
-    'analyze-energy': { area: 'analyze', page: 'project', label: '能量与稳定性',
-      path: c => `/projects/${projectToken(c)}/analysis/adsorption`, analysis: 'adsorption' },
-    'analyze-thermo': { area: 'analyze', page: 'project', label: '热力学与动力学',
-      path: c => `/projects/${projectToken(c)}/analysis/thermo`, analysis: 'taskana' },
-    'analyze-electronic': { area: 'analyze', page: 'wavefunction', label: '电子结构',
-      path: c => `/projects/${projectToken(c)}/analysis/electronic` },
-    'analyze-charge': { area: 'analyze', page: 'wavefunction', label: '电荷与波函数',
-      path: c => `/projects/${projectToken(c)}/analysis/charge` },
-    'analyze-comparison': { area: 'analyze', page: 'project', label: '比较',
-      path: c => `/projects/${projectToken(c)}/analysis/comparison`, analysis: 'figures',
-      focus: '#fig-compare-status' },
-    'analyze-custom': { area: 'analyze', page: 'project', label: '自定义',
-      path: c => `/projects/${projectToken(c)}/analysis/custom`, analysis: 'taskana' },
+    'analyze-energy': { area: 'analyze', page: 'analysis-workbench', label: '能量与稳定性',
+      path: c => `/projects/${projectToken(c)}/analysis/adsorption`,
+      analysisId: 'adsorption-energy', scenePage: 'project', focus: '#aw-title' },
+    'analyze-thermo': { area: 'analyze', page: 'analysis-workbench', label: '热力学与动力学',
+      path: c => `/projects/${projectToken(c)}/analysis/thermo`,
+      analysisId: 'free-energy-path', scenePage: 'project', focus: '#aw-title' },
+    'analyze-electronic': { area: 'analyze', page: 'analysis-workbench', label: '电子结构',
+      path: c => `/projects/${projectToken(c)}/analysis/electronic`,
+      analysisId: 'electronic-structure', scenePage: 'wavefunction', focus: '#aw-title' },
+    'analyze-charge': { area: 'analyze', page: 'analysis-workbench', label: '电荷与波函数',
+      path: c => `/projects/${projectToken(c)}/analysis/charge`,
+      analysisId: 'charge-wavefunction', scenePage: 'wavefunction', focus: '#aw-title' },
+    'analyze-comparison': { area: 'analyze', page: 'analysis-workbench', label: '比较',
+      path: c => `/projects/${projectToken(c)}/analysis/comparison`,
+      analysisId: 'multi-project-comparison', scenePage: 'project', focus: '#aw-title' },
+    'analyze-custom': { area: 'analyze', page: 'analysis-workbench', label: '自定义',
+      path: c => `/projects/${projectToken(c)}/analysis/custom`,
+      analysisId: 'task-results', scenePage: 'project', focus: '#aw-title' },
+    'analyze-properties': { area: 'analyze', page: 'analysis-workbench', label: '性质计算器',
+      path: c => `/projects/${projectToken(c)}/analysis/properties`,
+      analysisId: 'property-calculators', scenePage: 'project', focus: '#aw-title' },
 
     'publish-figures': { area: 'publish', page: 'figures', label: '图表',
       path: c => `/publish/figures?project=${encodeURIComponent(projectToken(c))}` },
@@ -155,6 +163,7 @@
   const LEGACY_ROUTE = Object.freeze({
     dashboard: 'home', structure: 'prepare-structure', generate: 'prepare-input',
     jobs: 'run-jobs', project: 'project-overview', wavefunction: 'analyze-electronic',
+    'analysis-workbench': 'analyze-energy',
     figures: 'publish-figures', cluster: 'environment-cluster',
     settings: 'environment-settings', ai: 'assistant',
   });
@@ -343,11 +352,12 @@
       const projectId = safeToken(decodeURIComponentSafe(match[1]), PROJECT_TOKEN);
       return projectId ? result(byView[match[2]], { projectId }) : null;
     }
-    match = path.match(/^\/projects\/([^/]+)\/analysis\/(adsorption|thermo|electronic|charge|comparison|custom)$/);
+    match = path.match(/^\/projects\/([^/]+)\/analysis\/(adsorption|thermo|electronic|charge|comparison|custom|properties)$/);
     if (match) {
       const byAnalysis = { adsorption: 'analyze-energy', thermo: 'analyze-thermo',
         electronic: 'analyze-electronic', charge: 'analyze-charge',
-        comparison: 'analyze-comparison', custom: 'analyze-custom' };
+        comparison: 'analyze-comparison', custom: 'analyze-custom',
+        properties: 'analyze-properties' };
       const projectId = safeToken(decodeURIComponentSafe(match[1]), PROJECT_TOKEN);
       return projectId ? result(byAnalysis[match[2]], { projectId }) : null;
     }
@@ -500,9 +510,16 @@
 
   function routeIsAvailable(def) {
     if (!def) return false;
-    if (typeof VCS.canActivatePage === 'function') return VCS.canActivatePage(def.page);
-    return !(VCS.scenario && typeof VCS.sceneVisible === 'function' &&
-      !VCS.sceneVisible(VCS.scenario, 'pages.' + def.page));
+    if (typeof VCS.canActivatePage === 'function') {
+      if (!VCS.canActivatePage(def.page)) return false;
+      return !def.scenePage || VCS.canActivatePage(def.scenePage);
+    }
+    if (VCS.scenario && typeof VCS.sceneVisible === 'function') {
+      if (!VCS.sceneVisible(VCS.scenario, 'pages.' + def.page)) return false;
+      if (def.scenePage && !VCS.sceneVisible(
+          VCS.scenario, 'pages.' + def.scenePage)) return false;
+    }
+    return true;
   }
 
   function syncPrimaryAreaRoutes(route) {
@@ -590,13 +607,15 @@
   }
 
   function applyRouteControls(route) {
+    const analysisId = route.def.analysisId || route.def.analysis || '';
     const analysis = document.getElementById('analysis-type');
-    if (analysis && route.def.analysis && analysis.value !== route.def.analysis &&
+    if (route.def.page !== 'analysis-workbench' && analysis && route.def.analysis &&
+        analysis.value !== route.def.analysis &&
         Array.from(analysis.options || []).some(option => option.value === route.def.analysis)) {
       analysis.value = route.def.analysis;
       analysis.dispatchEvent(new Event('change', { bubbles: true }));
     }
-    if (route.def.analysis) state.analysis_id = route.def.analysis;
+    if (analysisId) state.analysis_id = analysisId;
 
     const filterStatus = route.query.status || state.filters.job_status || '';
     const status = document.getElementById('jf-status');
@@ -694,7 +713,8 @@
       if (!ok) return { ok: false, focused: false };
       currentRoute = route;
       state.route = route.hash;
-      if (route.def.analysis) state.analysis_id = route.def.analysis;
+      const analysisId = route.def.analysisId || route.def.analysis || '';
+      if (analysisId) state.analysis_id = analysisId;
       renderRoute(route);
       renderContext();
       applyRouteControls(route);

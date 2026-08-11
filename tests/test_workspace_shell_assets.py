@@ -238,7 +238,7 @@ def test_compact_actions_exclude_hidden_and_collapsed_controls_and_refresh():
     assert "'data-scene-hidden'" in workspace
 
 
-def test_semantic_routes_select_the_visible_project_analysis_panel():
+def test_semantic_routes_select_the_registry_driven_analysis_workbench():
     workspace = _source('workspace.js')
     routes = workspace.split('const ROUTES = Object.freeze({', 1)[1].split(
         'const AREA_LABELS', 1)[0]
@@ -247,7 +247,15 @@ def test_semantic_routes_select_the_visible_project_analysis_panel():
     report = routes.split("'publish-report':", 1)[1].split("'publish-si':", 1)[0]
     draft = routes.split("'publish-draftpack':", 1)[1].split(
         "'publish-versions':", 1)[0]
-    assert "analysis: 'figures'" in comparison and "focus: '#fig-compare-status'" in comparison
+    assert "page: 'analysis-workbench'" in comparison
+    assert "analysisId: 'multi-project-comparison'" in comparison
+    assert "scenePage: 'project'" in comparison
+    assert "focus: '#aw-title'" in comparison
+    for analysis_id in (
+        'adsorption-energy', 'free-energy-path', 'electronic-structure',
+        'charge-wavefunction', 'multi-project-comparison', 'task-results',
+    ):
+        assert f"analysisId: '{analysis_id}'" in routes
     assert "page: 'report-workbench'" in report and "focus: '#rw-title'" in report
     assert "page: 'report-workbench'" in draft and "focus: '#rw-step-button-export'" in draft
     assert 'function syncPrimaryAreaRoutes(route)' in workspace

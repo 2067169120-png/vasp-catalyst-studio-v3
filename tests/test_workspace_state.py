@@ -31,6 +31,7 @@ def _route(area="analyze", view="analyze-energy",
             "analyze-charge": "charge",
             "analyze-comparison": "comparison",
             "analyze-custom": "custom",
+            "analyze-properties": "properties",
         }[view]
         route_hash = f"#/projects/{project_id}/analysis/{analysis_path}"
     elif area == "run":
