@@ -18,7 +18,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 90
     env:
-      MPLCONFIGDIR: ${{ runner.temp }}/vcstudio-matplotlib-release
+      MPLCONFIGDIR: ${{ github.workspace }}/.vcstudio-matplotlib-release
     steps:
       - uses: actions/checkout@v4
         with:

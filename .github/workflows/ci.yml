@@ -54,7 +54,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     env:
-      MPLCONFIGDIR: ${{ runner.temp }}/vcstudio-matplotlib-core
+      MPLCONFIGDIR: ${{ github.workspace }}/.vcstudio-matplotlib-core
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -80,7 +80,7 @@ jobs:
     env:
       # Keep matplotlib deterministic and writable on Windows runners.  PYTHONUTF8
       # above is the process-wide contract; -X utf8 below makes it explicit in logs.
-      MPLCONFIGDIR: ${{ runner.temp }}/vcstudio-matplotlib-full
+      MPLCONFIGDIR: ${{ github.workspace }}/.vcstudio-matplotlib-full
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -101,7 +101,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     env:
-      MPLCONFIGDIR: ${{ runner.temp }}/vcstudio-matplotlib-package
+      MPLCONFIGDIR: ${{ github.workspace }}/.vcstudio-matplotlib-package
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

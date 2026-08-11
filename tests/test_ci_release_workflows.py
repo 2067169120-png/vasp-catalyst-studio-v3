@@ -22,6 +22,23 @@ def test_workflow_files_are_valid_yaml_mappings():
         assert parsed.get('jobs')
 
 
+def test_job_environment_uses_contexts_allowed_by_github_actions():
+    """Job-level ``env`` cannot access the runtime-only ``runner`` context."""
+    workspace_cache_values = []
+    for path in (CI, RELEASE):
+        jobs = yaml.safe_load(_read(path))['jobs']
+        for job in jobs.values():
+            environment = job.get('env') or {}
+            assert all('runner.' not in str(value) for value in environment.values())
+            cache = environment.get('MPLCONFIGDIR')
+            if cache:
+                workspace_cache_values.append(cache)
+
+    assert len(workspace_cache_values) == 4
+    assert all('${{ github.workspace }}' in value
+               for value in workspace_cache_values)
+
+
 def test_full_matrix_and_first_party_javascript_gate_are_explicit():
     text = _read(CI)
 
