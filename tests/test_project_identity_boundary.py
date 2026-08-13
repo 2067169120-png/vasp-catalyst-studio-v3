@@ -358,3 +358,15 @@ def test_pipeline_unknown_scalars_are_rechecked_after_stringification():
     assert public["ratio"] == 1.25 and type(public["ratio"]) is float
     assert public["enabled"] is True
     assert public["missing"] is None
+
+
+def test_portable_member_identity_keeps_opaque_ids_and_rejects_locator_values():
+    """A manifest identity is public only when it is an opaque identifier."""
+    assert Api._portable_member_id(
+        r"C:\private\config", r"C:\project", 3,
+        manifest={"job_uuid": "opaque-job-42"},
+    ) == "opaque-job-42"
+    assert Api._portable_member_id(
+        r"C:\private\config", r"C:\project", 3,
+        manifest={"job_uuid": r"C:\private\config"},
+    ) == "config:3"

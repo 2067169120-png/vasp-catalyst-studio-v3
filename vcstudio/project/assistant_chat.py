@@ -23,6 +23,7 @@ import stat
 import threading
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import zipfile
@@ -351,6 +352,50 @@ class AssistantChat:
         ]
 
     # ── public chat APIs ─────────────────────────────────────────────────
+    def outbound_preview(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        attachment_ids: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        """Return the exact path-free message payload that a send would expose.
+
+        This method is read-only: it does not insert a pending message, obtain a
+        credential, or call the configured transport.  The UI can therefore show
+        informed consent before the external operation begins.
+        """
+        self._get_session(session_id)
+        if not isinstance(text, str) or not text.strip():
+            raise AssistantChatError("Message must not be empty")
+        if len(text) > MAX_MESSAGE_CHARS:
+            raise AssistantChatError(
+                f"Message exceeds the {MAX_MESSAGE_CHARS}-character limit"
+            )
+        selected = self._validate_attachment_ids(session_id, attachment_ids or ())
+        config = self._load_chat_config()
+        messages = self._model_messages_preview(
+            session_id,
+            text=text,
+            attachment_ids=selected,
+            history_limit=config["history_messages"],
+            system_prompt=config["system_prompt"],
+        )
+        parsed = urllib.parse.urlsplit(config["url"])
+        destination = f"{parsed.scheme}://{parsed.hostname or ''}"
+        if parsed.port is not None:
+            destination += f":{parsed.port}"
+        return {
+            "schema": "vcstudio.ai-outbound-preview/v1",
+            "external": True,
+            "destination": destination,
+            "model": config["model"],
+            "messages": messages,
+            "message_count": len(messages),
+            "character_count": sum(len(item["content"]) for item in messages),
+            "selected_attachment_count": len(selected),
+        }
+
     def send(
         self,
         session_id: str,
@@ -850,27 +895,67 @@ class AssistantChat:
                     attachments = self._message_attachments(
                         conn, int(row["id"]), include_preview=True
                     )
-                    if attachments:
-                        sections = []
-                        for attachment in attachments:
-                            section = _attachment_for_model(attachment)
-                            remaining = (
-                                MAX_REMOTE_ATTACHMENT_CHARS
-                                - remote_attachment_chars
-                            )
-                            if remaining <= 0:
-                                sections.append(
-                                    "[其余附件预览因本地隐私/上下文上限未发送]"
-                                )
-                                break
-                            section = section[:remaining]
-                            remote_attachment_chars += len(section)
-                            sections.append(section)
-                        content += (
-                            "\n\n[用户明确选择的本地附件预览]\n"
-                            + "\n\n".join(sections)
-                        )
+                    content, remote_attachment_chars = _content_with_attachments(
+                        content, attachments, remote_attachment_chars
+                    )
                 result.append({"role": row["role"], "content": content})
+        return result
+
+    def _model_messages_preview(
+        self,
+        session_id: str,
+        *,
+        text: str,
+        attachment_ids: list[str],
+        history_limit: int,
+        system_prompt: str,
+    ) -> list[dict[str, str]]:
+        """Mirror ``_model_messages`` with one virtual, unpersisted user turn."""
+        prior_limit = max(0, history_limit - 1)
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, role, content
+                FROM messages
+                WHERE session_id = ? AND source = 'model' AND status = 'complete'
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (session_id, prior_limit),
+            ).fetchall()
+            rows = list(reversed(rows))
+            result: list[dict[str, str]] = [
+                {"role": "system", "content": system_prompt}
+            ]
+            remote_attachment_chars = 0
+            for row in rows:
+                content = row["content"]
+                if row["role"] == "user":
+                    attachments = self._message_attachments(
+                        conn, int(row["id"]), include_preview=True
+                    )
+                    content, remote_attachment_chars = _content_with_attachments(
+                        content, attachments, remote_attachment_chars
+                    )
+                result.append({"role": row["role"], "content": content})
+
+            attachments: list[dict[str, Any]] = []
+            if attachment_ids:
+                placeholders = ",".join("?" for _ in attachment_ids)
+                attachment_rows = conn.execute(
+                    f"SELECT * FROM attachments WHERE session_id = ? "
+                    f"AND id IN ({placeholders})",
+                    (session_id, *attachment_ids),
+                ).fetchall()
+                by_id = {row["id"]: row for row in attachment_rows}
+                attachments = [
+                    self._attachment_dict(by_id[item], include_preview=True)
+                    for item in attachment_ids
+                ]
+            content, _remote_attachment_chars = _content_with_attachments(
+                text, attachments, remote_attachment_chars
+            )
+            result.append({"role": "user", "content": content})
         return result
 
     def _load_chat_config(self) -> dict[str, Any]:
@@ -1268,6 +1353,31 @@ def _attachment_for_model(attachment: dict[str, Any]) -> str:
         return metadata + "\nLocal bounded preview:\n" + preview[:MAX_PREVIEW_CHARS]
     note = attachment.get("preview_note") or "No content preview is available."
     return metadata + "\n" + note
+
+
+def _content_with_attachments(
+    content: str,
+    attachments: Sequence[dict[str, Any]],
+    remote_attachment_chars: int,
+) -> tuple[str, int]:
+    if not attachments:
+        return content, remote_attachment_chars
+    sections = []
+    for attachment in attachments:
+        section = _attachment_for_model(attachment)
+        remaining = MAX_REMOTE_ATTACHMENT_CHARS - remote_attachment_chars
+        if remaining <= 0:
+            sections.append("[其余附件预览因本地隐私/上下文上限未发送]")
+            break
+        section = section[:remaining]
+        remote_attachment_chars += len(section)
+        sections.append(section)
+    return (
+        content
+        + "\n\n[用户明确选择的本地附件预览]\n"
+        + "\n\n".join(sections),
+        remote_attachment_chars,
+    )
 
 
 def _stored_name(original_name: str, digest: str, *, token: str | None = None) -> str:

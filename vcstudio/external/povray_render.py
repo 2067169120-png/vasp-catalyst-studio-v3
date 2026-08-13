@@ -205,6 +205,7 @@ def render_poscar_views(poscar_path, out_dir, basename: str = '', *,
     base = basename or os.path.splitext(os.path.basename(str(poscar_path)))[0]
     src_mtime = os.path.getmtime(poscar_path)
     images, errors = {}, []
+    timed_out = False
     for view in views:
         png = os.path.join(out_dir, f'{base}_{view}.png')
         if os.path.isfile(png) and os.path.getmtime(png) >= src_mtime:
@@ -222,7 +223,11 @@ def render_poscar_views(poscar_path, out_dir, basename: str = '', *,
                        cwd=out_dir, timeout=timeout,
                        stdin=subprocess.DEVNULL, capture_output=True)
             code = getattr(proc, 'returncode', 1)
-        except (OSError, subprocess.TimeoutExpired) as e:
+        except subprocess.TimeoutExpired as e:
+            timed_out = True
+            errors.append(f'{view}: {e}')
+            continue
+        except OSError as e:
             errors.append(f'{view}: {e}')
             continue
         if code == 0 and os.path.isfile(png) and os.path.getsize(png) > 0:
@@ -230,7 +235,7 @@ def render_poscar_views(poscar_path, out_dir, basename: str = '', *,
         else:
             errors.append(f'{view}: pvengine 退出码 {code} 或无输出')
     return {'ok': bool(images), 'images': images,
-            'error': '; '.join(errors)}
+            'error': '; '.join(errors), 'timed_out': timed_out}
 
 
 def _aspect(symbols, coords, view) -> float:

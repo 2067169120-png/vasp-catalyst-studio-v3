@@ -65,6 +65,33 @@ def test_scientific_diff_revalidates_bundles_and_compares_file_hashes(tmp_path):
     assert "created_at_utc" not in json.dumps(result)
 
 
+def test_scientific_diff_reports_structured_method_matrix_changes(
+    tmp_path, monkeypatch,
+):
+    _host, service, first, second = _two_revisions(tmp_path)
+    left = load_frozen_revision(service, "project.yaml", first["revision"]["revision_id"])
+    right = load_frozen_revision(service, "project.yaml", second["revision"]["revision_id"])
+    left_model = copy.deepcopy(left.model)
+    right_model = copy.deepcopy(right.model)
+    left_model["method_consistency"] = {"functional": "PBE", "encut_ev": 450}
+    right_model["method_consistency"] = {"functional": "PBE", "encut_ev": 520}
+    bundles = iter((
+        FrozenRevision(**{**left.__dict__, "model": left_model}),
+        FrozenRevision(**{**right.__dict__, "model": right_model}),
+    ))
+    monkeypatch.setattr(
+        "vcstudio.project.report_insights.load_frozen_revision",
+        lambda *_args, **_kwargs: next(bundles),
+    )
+
+    result = scientific_diff(service, "project.yaml", left.revision_id, right.revision_id)
+
+    assert result["method_matrix"] == [{
+        "key": "model.method_consistency.encut_ev", "left": 450, "right": 520,
+    }]
+    assert result["changed"] is True
+
+
 def test_tampered_revision_fails_closed_before_diff(tmp_path):
     _host, service, first, second = _two_revisions(tmp_path)
     Path(first["files"]["html"]).write_text("tampered", encoding="utf-8")
@@ -112,6 +139,7 @@ def test_evidence_graph_is_path_free_and_marks_unresolved_claim_links(
     assert graph["status"] == "blocked"
     assert graph["missing_links"][0]["expected"] == "source:missing"
     assert any(node["type"] == "conclusion" for node in graph["nodes"])
+    assert all(node.get("route") for node in graph["nodes"])
     assert str(tmp_path) not in encoded
     assert r"C:\private\project.yaml" not in encoded
 

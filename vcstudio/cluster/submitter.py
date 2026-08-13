@@ -62,6 +62,12 @@ _JOB_LOCKS_GUARD = threading.Lock()
 _JOB_OPERATION_LOCK_FILE = '.vcstudio-job-operation.lock'
 _SUBMISSION_RECOVERY_FILE = '.vcstudio-submit-recovery.json'
 _SUBMISSION_RECOVERY_SCHEMA = 1
+_JOB_ACTION_JOURNAL_FILE = '.vcstudio-job-actions.json'
+_JOB_ACTION_JOURNAL_SCHEMA = 1
+_JOB_ACTION_STATUSES = {
+    'prepared', 'remote_accepted', 'succeeded', 'failed', 'unknown_remote_outcome',
+}
+_JOB_ACTION_UNRESOLVED = {'prepared', 'remote_accepted', 'unknown_remote_outcome'}
 
 
 class JobOperationBusy(RuntimeError):
@@ -84,6 +90,30 @@ class UnknownRemoteSubmission(RuntimeError):
         super().__init__(message)
         self.recovery_status = str(recovery_status or 'unknown_remote_submission')
         self.scheduler_job_id = str(scheduler_job_id or '')
+
+
+class UnknownRemoteJobOperation(RuntimeError):
+    """A continue/cancel command may have reached the scheduler but is unresolved."""
+
+    code = 'unknown_remote_job_operation'
+    busy = False
+    requires_manual_recovery = True
+
+    def __init__(self, message, *, action='', recovery_status='unknown_remote_outcome',
+                 scheduler_job_id=''):
+        super().__init__(message)
+        self.action = str(action or '')
+        self.recovery_status = str(recovery_status or 'unknown_remote_outcome')
+        self.scheduler_job_id = str(scheduler_job_id or '')
+
+
+class ReplayedJobOperationFailure(RuntimeError):
+    """A durable operation key already has a terminal failed result."""
+
+    code = 'job_operation_failed'
+    busy = False
+    requires_manual_recovery = False
+    replayed = True
 
 
 def _canonical_job_dir(job_dir) -> str:
@@ -236,6 +266,238 @@ def _clear_submission_recovery(job_dir) -> None:
     except FileNotFoundError:
         return
     _fsync_directory(os.path.dirname(path))
+
+
+def _job_action_journal_path(job_dir) -> str:
+    return os.path.join(_canonical_job_dir(job_dir), _JOB_ACTION_JOURNAL_FILE)
+
+
+def _validate_job_action_key(value) -> str:
+    key = str(value or '').strip()
+    if key and (len(key) > 128
+                or not re.fullmatch(r'[A-Za-z0-9_.:-]{12,128}', key)):
+        raise ValueError('无效的作业操作请求标识')
+    return key
+
+
+def _empty_job_action_journal() -> dict:
+    return {'schema': _JOB_ACTION_JOURNAL_SCHEMA, 'operations': []}
+
+
+def _read_job_action_journal(job_dir) -> dict:
+    """Read and validate the durable continue/cancel operation ledger.
+
+    An unreadable journal is never treated as empty: doing so after a crash
+    could repeat a scheduler mutation whose result was already accepted.
+    """
+    path = _job_action_journal_path(job_dir)
+    if not os.path.isfile(path):
+        return _empty_job_action_journal()
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            payload = json.load(handle)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise UnknownRemoteJobOperation(
+            '作业远端操作 journal 不可读；为避免重复续算/取消，必须人工核对调度器。',
+            recovery_status='invalid_journal') from exc
+    operations = payload.get('operations') if isinstance(payload, dict) else None
+    valid = (payload.get('schema') == _JOB_ACTION_JOURNAL_SCHEMA
+             if isinstance(payload, dict) else False)
+    valid = valid and isinstance(operations, list)
+    if valid:
+        for record in operations:
+            if (not isinstance(record, dict)
+                    or not isinstance(record.get('transaction_id'), str)
+                    or not record.get('transaction_id')
+                    or record.get('action') not in {'continue', 'cancel'}
+                    or record.get('status') not in _JOB_ACTION_STATUSES
+                    or not isinstance(record.get('source_job_id'), str)
+                    or record.get('idempotency_key') is not None
+                    and not isinstance(record.get('idempotency_key'), str)):
+                valid = False
+                break
+    if not valid:
+        raise UnknownRemoteJobOperation(
+            '作业远端操作 journal 无效；为避免重复续算/取消，必须人工核对调度器。',
+            recovery_status='invalid_journal')
+    return payload
+
+
+def _write_job_action_journal(job_dir, payload: dict) -> None:
+    _durable_json_write(_job_action_journal_path(job_dir), payload)
+
+
+def _job_action_attempt(manifest: dict | None, *, action: str,
+                        transaction_id: str = '', idempotency_key: str = '') -> dict | None:
+    attempts = (manifest or {}).get('attempts') if isinstance(manifest, dict) else None
+    if not isinstance(attempts, list):
+        return None
+    expected_action = 'contcar_restart' if action == 'continue' else 'cancel'
+    for attempt in reversed(attempts):
+        if not isinstance(attempt, dict) or attempt.get('action') != expected_action:
+            continue
+        if transaction_id and str(attempt.get('operation_transaction_id') or '') == transaction_id:
+            return attempt
+        if idempotency_key and str(attempt.get('idempotency_key') or '') == idempotency_key:
+            return attempt
+    return None
+
+
+def _job_action_replay(manifest: dict, action: str, evidence: dict) -> dict:
+    replay = dict(manifest)
+    replay[f'_{action}_replayed'] = True
+    if action == 'cancel':
+        replay['_cancelled_job_id'] = str(
+            evidence.get('target_job_id') or evidence.get('source_job_id') or '')
+    return replay
+
+
+def _job_action_generation_matches(manifest: dict, record: dict,
+                                   evidence: dict | None) -> bool:
+    if not evidence:
+        return False
+    current = str(manifest.get('scheduler_job_id') or '')
+    if record.get('action') == 'continue':
+        expected = str(record.get('result_job_id') or evidence.get('job_id') or '')
+    else:
+        expected = str(record.get('source_job_id') or
+                       evidence.get('target_job_id') or '')
+    return bool(expected and current == expected)
+
+
+def _job_action_unknown(record: dict, *, message: str | None = None):
+    action = str(record.get('action') or '')
+    label = '续算' if action == 'continue' else '取消'
+    status = str(record.get('status') or 'unknown_remote_outcome')
+    job_id = str(record.get('result_job_id') or record.get('source_job_id') or '')
+    raise UnknownRemoteJobOperation(
+        message or f'上次{label}的远端结果尚未安全落盘；已禁止自动重试，请人工核对调度器。',
+        action=action, recovery_status=status, scheduler_job_id=job_id)
+
+
+def _reconcile_job_action(job_dir, manifest: dict, action: str,
+                          idempotency_key: str) -> dict | None:
+    """Replay one completed key or reject every unresolved remote outcome."""
+    journal = _read_job_action_journal(job_dir)
+    changed = False
+    for record in journal['operations']:
+        if record.get('status') not in _JOB_ACTION_UNRESOLVED:
+            continue
+        evidence = _job_action_attempt(
+            manifest, action=str(record.get('action') or ''),
+            transaction_id=str(record.get('transaction_id') or ''))
+        if (record.get('status') == 'remote_accepted'
+                and _job_action_generation_matches(manifest, record, evidence)):
+            # The manifest replacement is authoritative.  A crash while marking
+            # the journal terminal can be reconciled without another scheduler call.
+            record['status'] = 'succeeded'
+            record['finished_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+            changed = True
+            continue
+        _job_action_unknown(record)
+    if changed:
+        try:
+            _write_job_action_journal(job_dir, journal)
+        except OSError:
+            # The manifest already proves the exact transaction.  Retaining the
+            # remote_accepted record remains safe and will be reconciled again.
+            pass
+
+    if idempotency_key:
+        matches = [record for record in journal['operations']
+                   if str(record.get('idempotency_key') or '') == idempotency_key]
+        if matches:
+            record = matches[-1]
+            if record.get('action') != action:
+                raise ValueError('同一作业操作请求标识不能用于不同的远端动作')
+            status = record.get('status')
+            if status == 'failed':
+                raise ReplayedJobOperationFailure(
+                    str(record.get('message') or '远端作业操作失败'))
+            if status == 'succeeded':
+                evidence = _job_action_attempt(
+                    manifest, action=action,
+                    transaction_id=str(record.get('transaction_id') or ''))
+                if not _job_action_generation_matches(manifest, record, evidence):
+                    _job_action_unknown(
+                        record,
+                        message='远端操作 journal 与当前作业代次不一致；'
+                        '已禁止用旧请求重放，请刷新后重新确认。')
+                return _job_action_replay(manifest, action, evidence)
+
+        # A successfully committed manifest remains sufficient if a user or
+        # maintenance tool removed only the bounded terminal journal history.
+        evidence = _job_action_attempt(
+            manifest, action=action, idempotency_key=idempotency_key)
+        if evidence:
+            fallback_record = {
+                'action': action,
+                'source_job_id': str(
+                    evidence.get('prev_job_id') if action == 'continue'
+                    else evidence.get('target_job_id') or ''),
+                'result_job_id': str(
+                    evidence.get('job_id') if action == 'continue'
+                    else evidence.get('target_job_id') or ''),
+            }
+            if _job_action_generation_matches(manifest, fallback_record, evidence):
+                return _job_action_replay(manifest, action, evidence)
+            _job_action_unknown(
+                fallback_record,
+                message='作业操作请求属于旧的调度器代次；请刷新目标列表后重新确认。')
+    return None
+
+
+def _start_job_action(job_dir, action: str, idempotency_key: str,
+                      source_job_id: str) -> dict:
+    journal = _read_job_action_journal(job_dir)
+    # Reconciliation should have rejected every unresolved record.  Re-check
+    # before writing so this helper is safe if used by a future caller directly.
+    unresolved = [record for record in journal['operations']
+                  if record.get('status') in _JOB_ACTION_UNRESOLVED]
+    if unresolved:
+        _job_action_unknown(unresolved[-1])
+    terminal = [record for record in journal['operations']
+                if record.get('status') in {'succeeded', 'failed'}]
+    journal['operations'] = terminal[-63:]
+    now = time.strftime('%Y-%m-%dT%H:%M:%S')
+    record = {
+        'transaction_id': os.urandom(16).hex(),
+        'action': action,
+        'status': 'prepared',
+        'idempotency_key': idempotency_key or None,
+        'source_job_id': str(source_job_id or ''),
+        'result_job_id': None,
+        'created_at': now,
+        'updated_at': now,
+        'message': None,
+    }
+    journal['operations'].append(record)
+    _write_job_action_journal(job_dir, journal)
+    return record
+
+
+def _update_job_action(job_dir, record: dict, status: str, **fields) -> None:
+    journal = _read_job_action_journal(job_dir)
+    transaction_id = str(record.get('transaction_id') or '')
+    stored = next((item for item in journal['operations']
+                   if item.get('transaction_id') == transaction_id), None)
+    if stored is None:
+        raise OSError('作业远端操作 journal 丢失当前事务')
+    stored.update(fields)
+    stored['status'] = status
+    stored['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+    if status in {'succeeded', 'failed'}:
+        stored['finished_at'] = stored['updated_at']
+    _write_job_action_journal(job_dir, journal)
+    record.update(stored)
+
+
+def _mark_job_action_unknown(job_dir, record: dict, message: str) -> None:
+    try:
+        _update_job_action(
+            job_dir, record, 'unknown_remote_outcome', message=str(message or ''))
+    except Exception:  # noqa: BLE001 - the fsynced prepared record is the safety gate
+        pass
 
 
 def _submission_attempt_for_key(manifest: dict | None, idempotency_key: str) -> dict | None:
@@ -1136,6 +1398,98 @@ def submit_job(client, sftp, profile, job_dir: str, *,
         # matching journal and removes it without contacting the scheduler.
         pass
     return m
+
+
+@_serialized_job_argument(2, '取消作业')
+def cancel_job(client, profile, job_dir: str, *,
+               idempotency_key: str | None = None,
+               expected_job_id: str | None = None) -> dict:
+    """Cancel one scheduler generation under a durable at-most-once contract.
+
+    The operation journal is fsynced before qdel/scancel.  A known non-zero
+    scheduler result is a terminal replayable failure; a transport interruption
+    or local persistence failure is retained as an unresolved fail-closed gate.
+    """
+    operation_key = _validate_job_action_key(idempotency_key)
+    m = manifest_mod.load_manifest(job_dir)
+    if m is None:
+        raise ValueError('无 job.yaml,无法取消')
+    assert_profile_binding(profile, job_dir, '取消作业', manifest=m)
+    job_id = str(m.get('scheduler_job_id') or '')
+    expected = str(expected_job_id or '').strip()
+    if expected and job_id != expected:
+        raise RuntimeError('取消前作业代次已变化，请刷新目标列表后重新确认')
+    replay = _reconcile_job_action(job_dir, m, 'cancel', operation_key)
+    if replay is not None:
+        return replay
+    if not job_id:
+        raise ValueError('缺 scheduler_job_id,无法取消')
+    dialect = get_dialect(profile.scheduler)
+    record = _start_job_action(job_dir, 'cancel', operation_key, job_id)
+    try:
+        run_cmd(
+            client,
+            dialect.cancel_cmd(job_id, getattr(profile, 'scheduler_bin', '')),
+            check=True)
+    except RuntimeError as exc:
+        # run_cmd(check=True) has received a complete non-zero scheduler result,
+        # so no cancellation was accepted.  Persist that terminal result so a
+        # restarted client with the same operation id does not issue it again.
+        try:
+            _update_job_action(
+                job_dir, record, 'failed', message=str(exc), result_job_id=job_id)
+        except Exception as journal_exc:  # noqa: BLE001 - uncertainty wins
+            _mark_job_action_unknown(job_dir, record, str(exc))
+            raise UnknownRemoteJobOperation(
+                '取消命令失败且最终结果未能安全记录；已禁止自动重试，请人工核对。',
+                action='cancel', recovery_status=record.get('status') or 'prepared',
+                scheduler_job_id=job_id) from journal_exc
+        raise
+    except Exception as exc:  # noqa: BLE001 - acceptance may be unknowable
+        _mark_job_action_unknown(job_dir, record, str(exc))
+        raise UnknownRemoteJobOperation(
+            '取消命令返回前连接中断，调度器是否受理未知；'
+            '已禁止自动重试，请人工核对。',
+            action='cancel', recovery_status=record.get('status') or 'prepared',
+            scheduler_job_id=job_id) from exc
+
+    try:
+        _update_job_action(
+            job_dir, record, 'remote_accepted', result_job_id=job_id)
+    except Exception as exc:  # noqa: BLE001 - prepared record still blocks retry
+        raise UnknownRemoteJobOperation(
+            '调度器已确认取消，但 journal 未能推进；已禁止自动重试，请人工核对。',
+            action='cancel', recovery_status='prepared',
+            scheduler_job_id=job_id) from exc
+
+    attempt = {
+        'n': len(m.get('attempts') or []) + 1,
+        'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'result': 'cancelled',
+        'action': 'cancel',
+        'target_job_id': job_id,
+        'operation_transaction_id': record['transaction_id'],
+    }
+    if operation_key:
+        attempt['idempotency_key'] = operation_key
+    m.setdefault('attempts', []).append(attempt)
+    manifest_mod.set_state(m, 'FAILED', note='用户取消')
+    try:
+        manifest_mod.save_manifest(job_dir, m)
+    except Exception as exc:  # noqa: BLE001 - remote_accepted journal blocks retry
+        raise UnknownRemoteJobOperation(
+            '调度器已取消作业，但本地 job.yaml 未能安全持久化；'
+            '已禁止自动重试，请人工恢复。',
+            action='cancel', recovery_status='remote_accepted',
+            scheduler_job_id=job_id) from exc
+    try:
+        _update_job_action(
+            job_dir, record, 'succeeded', result_job_id=job_id, message='')
+    except Exception:  # noqa: BLE001 - job.yaml proves the exact transaction
+        pass
+    result = dict(m)
+    result['_cancelled_job_id'] = job_id
+    return result
 
 
 # ── 状态刷新(含最小收敛判定,S3 雏形) ────────────────────────────────────────
@@ -2352,7 +2706,8 @@ def _restore_local_restart_file(path: str, round_number: int,
 
 @_serialized_job_argument(2, '续算')
 def continue_from_contcar(client, profile, job_dir: str,
-                          max_rounds: int = CONTINUE_MAX_ROUNDS) -> dict:
+                          max_rounds: int = CONTINUE_MAX_ROUNDS, *,
+                          idempotency_key: str | None = None) -> dict:
     """把一个可续算作业从 CONTCAR 接着跑(cp CONTCAR POSCAR + 冻结 INCAR 重投同一脚本)。
 
     有界恢复(论文核心 + 交接三不变式):
@@ -2364,6 +2719,7 @@ def continue_from_contcar(client, profile, job_dir: str,
       记 prev_job_id 溯源。
     失败抛 ValueError/RuntimeError(中文)。成功返回更新后的 manifest(state=SUBMITTED)。
     """
+    operation_key = _validate_job_action_key(idempotency_key)
     m = manifest_mod.load_manifest(job_dir)
     if m is None:
         raise ValueError('作业目录缺 job.yaml,无法续算')
@@ -2373,6 +2729,9 @@ def continue_from_contcar(client, profile, job_dir: str,
             f'{_ENGINE_LABELS.get(_job_engine(m), _job_engine(m))} 不能走 VASP CONTCAR 续算；'
             f'{contract.restart_note}')
     assert_profile_binding(profile, job_dir, '续算', manifest=m)
+    replay = _reconcile_job_action(job_dir, m, 'continue', operation_key)
+    if replay is not None:
+        return replay
     if _is_neb(m):
         raise ValueError(
             'NEB 不能使用通用 CONTCAR 续算：NEB 根目录没有单一 CONTCAR，'
@@ -2410,40 +2769,56 @@ def continue_from_contcar(client, profile, job_dir: str,
     # 续算沉降基线:重投前记下上一轮 OUTCAR 的 mtime(此刻新作业尚未启动,仍是旧文件)
     _o0, _z0, _base_outcar_mtime = _stat_outcar_full(client, remote)
 
+    # 从第一个本地/远端变更开始，持久 journal 必须先落盘。若进程在重投响应前
+    # 退出，下一实例只能 fail closed，绝不能再发第二次 qsub/sbatch。
+    record = _start_job_action(
+        job_dir, 'continue', operation_key,
+        str(m.get('scheduler_job_id') or ''))
+
     # 本地也留证:备份旧 POSCAR,用 CONTCAR 覆盖(保持本地目录与远端一致)
     local_poscar = os.path.join(job_dir, 'POSCAR')
     local_poscar_existed = os.path.isfile(local_poscar)
-    if local_poscar_existed:
-        shutil.copyfile(local_poscar, f'{local_poscar}.bak{rounds + 1}')
-    with open(local_poscar, 'w', encoding='utf-8', newline='') as f:
-        f.write(contcar)
+    try:
+        if local_poscar_existed:
+            shutil.copyfile(local_poscar, f'{local_poscar}.bak{rounds + 1}')
+        with open(local_poscar, 'w', encoding='utf-8', newline='') as f:
+            f.write(contcar)
 
-    # 远端:CONTCAR→POSCAR + 清混合历史,再重投同一脚本(INCAR 不动)
-    cleanup = _restart_cleanup_command(m, job_dir)
-    archive_command, archive_dir = _restart_archive_command(
-        rounds + 1, backup_inputs=('POSCAR',), promote_contcar=True)
-    run_cmd(
-        client,
-        f'cd {shlex.quote(remote)} && {archive_command} && {cleanup}',
-        check=True)
-    dialect = get_dialect(profile.scheduler)
-    out, err = run_cmd(client, dialect.submit_cmd(
-        posixpath.join(remote, SCRIPT_NAME), getattr(profile, 'scheduler_bin', '')))
+        # 远端:CONTCAR→POSCAR + 清混合历史,再重投同一脚本(INCAR 不动)
+        cleanup = _restart_cleanup_command(m, job_dir)
+        archive_command, archive_dir = _restart_archive_command(
+            rounds + 1, backup_inputs=('POSCAR',), promote_contcar=True)
+        run_cmd(
+            client,
+            f'cd {shlex.quote(remote)} && {archive_command} && {cleanup}',
+            check=True)
+        dialect = get_dialect(profile.scheduler)
+        out, err = run_cmd(client, dialect.submit_cmd(
+            posixpath.join(remote, SCRIPT_NAME), getattr(profile, 'scheduler_bin', '')))
+    except Exception as exc:  # noqa: BLE001 - remote mutation may be partial
+        _mark_job_action_unknown(job_dir, record, str(exc))
+        raise UnknownRemoteJobOperation(
+            '续算远端事务中断，远端目录或调度器结果未知；已禁止自动重试，请人工核对。',
+            action='continue', recovery_status=record.get('status') or 'prepared',
+            scheduler_job_id=str(m.get('scheduler_job_id') or '')) from exc
+
     job_id = dialect.parse_job_id(out)
     if not job_id:
-        rollback_error = ''
-        try:
-            run_cmd(
-                client,
-                f'cd {shlex.quote(remote)} && '
-                f'{_restart_restore_command(archive_dir, restore_inputs=("POSCAR",))}',
-                check=True)
-        except Exception as exc:                         # noqa: BLE001 保留原始提交错误
-            rollback_error = f'；且旧输出归档回滚失败:{exc}'
-        _restore_local_restart_file(local_poscar, rounds + 1, local_poscar_existed)
-        raise RuntimeError(
-            f'续算重投失败,{dialect.name} 返回:{(out or err).strip()[:300]}'
-            f'{rollback_error}')
+        detail = (out or err).strip()[:300]
+        _mark_job_action_unknown(job_dir, record, detail)
+        raise UnknownRemoteJobOperation(
+            f'续算重投未返回可核验作业号（{dialect.name}：{detail}）；'
+            '远端是否受理未知，已禁止自动重试，请人工核对。',
+            action='continue', recovery_status=record.get('status') or 'prepared')
+
+    try:
+        _update_job_action(
+            job_dir, record, 'remote_accepted', result_job_id=str(job_id))
+    except Exception as exc:  # noqa: BLE001 - prepared record still blocks retry
+        raise UnknownRemoteJobOperation(
+            '续算已返回新作业号，但 journal 未能推进；已禁止自动重试，请人工核对。',
+            action='continue', recovery_status='prepared',
+            scheduler_job_id=str(job_id)) from exc
 
     prev = m.get('scheduler_job_id')
     m['scheduler_job_id'] = job_id
@@ -2458,7 +2833,7 @@ def continue_from_contcar(client, profile, job_dir: str,
         'round': rounds + 1,
         'files': ['OUTCAR', 'OSZICAR', 'vasprun.xml', 'CONTCAR', 'XDATCAR'],
     }
-    m.setdefault('attempts', []).append({
+    attempt = {
         'n': len(m.get('attempts') or []) + 1,
         'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'result': 'continued',
@@ -2466,10 +2841,28 @@ def continue_from_contcar(client, profile, job_dir: str,
         'prev_job_id': prev,
         'job_id': job_id,
         'round': rounds + 1,
-    })
+        'operation_transaction_id': record['transaction_id'],
+    }
+    if operation_key:
+        attempt['idempotency_key'] = operation_key
+    m.setdefault('attempts', []).append(attempt)
     manifest_mod.set_state(m, 'SUBMITTED',
                            note=f'CONTCAR 续算 第{rounds + 1}轮(prev {prev} → {job_id},INCAR 冻结)')
-    manifest_mod.save_manifest(job_dir, m)
+    try:
+        manifest_mod.save_manifest(job_dir, m)
+    except Exception as exc:  # noqa: BLE001 - remote_accepted journal is authoritative gate
+        raise UnknownRemoteJobOperation(
+            '续算已被调度器受理，但本地 job.yaml 未能安全持久化；'
+            '已禁止自动重试，请人工恢复。',
+            action='continue', recovery_status='remote_accepted',
+            scheduler_job_id=str(job_id)) from exc
+    try:
+        _update_job_action(
+            job_dir, record, 'succeeded', result_job_id=str(job_id), message='')
+    except OSError:
+        # job.yaml carries the exact transaction id and can reconcile this
+        # remote_accepted record after restart without another scheduler call.
+        pass
     return m
 
 

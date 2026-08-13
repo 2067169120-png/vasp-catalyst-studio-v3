@@ -21,6 +21,7 @@ import re
 import tempfile
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -49,6 +50,7 @@ _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _SAFE_ANALYSIS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _SAFE_VIEW_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _HEX_SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
+_AUTHORITY_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 _URL_RE = re.compile(r"(?i)\b(?:https?|s3)://[^\s]+")
 _DRIVE_PATH_RE = re.compile(r"(?i)(?<![A-Za-z0-9])[A-Z]:[\\/]")
 _UNC_PATH_RE = re.compile(
@@ -58,12 +60,21 @@ _TILDE_PATH_RE = re.compile(r"(?<![A-Za-z0-9_])~[\\/]")
 _FILE_URI_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])file:(?:/{0,3}|\\)")
 _CREDENTIAL_VALUE_RE = re.compile(
     r"(?i)(?:\b(?:github_pat_|gh[opusr]_|sk-)[A-Za-z0-9_-]{12,}"
+    r"|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"
     r"|\bBearer\s+\S+|-----BEGIN[^\r\n]{0,40}PRIVATE KEY-----)")
+_CREDENTIAL_ASSIGNMENT_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])(?:password|passwd|pwd|secret|token|credential|"
+    r"credentials|auth|authorization|cookie|api[-_ ]?key|access[-_ ]?key|"
+    r"private[-_ ]?key|client[-_ ]?secret|access[-_ ]?token|"
+    r"refresh[-_ ]?token|aws[-_ ]?(?:access[-_ ]?key[-_ ]?id|"
+    r"secret[-_ ]?access[-_ ]?key))\s*[:=]\s*[^\s,;&]+")
+_URL_USERINFO_RE = re.compile(
+    r"(?i)\b[A-Z][A-Z0-9+.-]{1,31}://[^\s/@]+(?::[^\s/@]*)?@[^\s/]+")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 _SENSITIVE_KEY_WORDS = frozenset({
     "password", "passwd", "secret", "token", "credential", "credentials",
-    "auth", "authorization", "cookie", "cookies",
+    "auth", "authorization", "cookie", "cookies", "pwd",
 })
 _SENSITIVE_KEY_NAMES = frozenset({
     "key", "apikey", "api_key", "accesskey", "access_key", "privatekey",
@@ -122,7 +133,12 @@ def _looks_like_path(value: str) -> bool:
 
 
 def _looks_like_credential(value: str) -> bool:
-    return bool(_CREDENTIAL_VALUE_RE.search(str(value or "")))
+    text = str(value or "")
+    return bool(
+        _CREDENTIAL_VALUE_RE.search(text)
+        or _CREDENTIAL_ASSIGNMENT_RE.search(text)
+        or _URL_USERINFO_RE.search(text)
+    )
 
 
 def _is_sensitive_key(value: str) -> bool:
@@ -133,6 +149,12 @@ def _is_sensitive_key(value: str) -> bool:
     if set(normalised.split("_")) & _SENSITIVE_KEY_WORDS:
         return True
     compact = normalised.replace("_", "")
+    if any(compound in compact for compound in (
+        "apikey", "accesskey", "secretkey", "privatekey", "clientsecret",
+        "accesstoken", "refreshtoken", "sshkey", "signingkey",
+        "encryptionkey",
+    )):
+        return True
     return any(compact.endswith(word) for word in (
         "password", "passwd", "secret", "token", "credential", "credentials",
         "authorization", "cookie", "auth",
@@ -180,7 +202,7 @@ def _validate_route(value: Any) -> dict | None:
         raise WorkspaceStateError("preferences.route.view is invalid")
     route_hash = _validate_string(
         value.get("hash"), field="preferences.route.hash", max_length=512,
-        allow_path=True, allow_credential=True)
+        allow_path=True)
     expected_area, allowed_views = _parse_route_hash(route_hash)
     if area != expected_area or view not in allowed_views:
         raise WorkspaceStateError(
@@ -214,6 +236,10 @@ def _parse_route_hash(route_hash: str) -> tuple[str, set[str]]:
         raise WorkspaceStateError("preferences.route.hash must be a safe #/ deep link")
     if any(not _SAFE_ID_RE.fullmatch(segment) for segment in segments):
         raise WorkspaceStateError("preferences.route.hash must be a safe #/ deep link")
+    if any(_is_sensitive_key(segment) or _looks_like_credential(segment)
+           for segment in segments):
+        raise WorkspaceStateError(
+            "preferences.route.hash must not contain a sensitive route segment")
 
     def route_result(area: str, views: set[str], allowed_query=()) -> tuple[str, set[str]]:
         unexpected = set(query_names) - set(allowed_query)
@@ -466,25 +492,40 @@ def validate_preferences(value: Any) -> dict:
     return out
 
 
-def validate_state(value: Any) -> dict:
+def validate_state(value: Any, *, allow_legacy: bool = False) -> dict:
     if not isinstance(value, dict):
         raise WorkspaceStateError("workspace state must be an object")
-    if set(value) != {"schema", "revision", "preferences"}:
+    current_shape = {"schema", "authority_id", "revision", "preferences"}
+    legacy_shape = {"schema", "revision", "preferences"}
+    keys = set(value)
+    if keys != current_shape and not (allow_legacy and keys == legacy_shape):
         raise WorkspaceStateError("workspace state has an invalid top-level shape")
     if value.get("schema") != SCHEMA:
         raise WorkspaceStateError(f"unsupported workspace state schema {value.get('schema')!r}")
+    authority_id = value.get("authority_id")
+    if keys == legacy_shape:
+        authority_id = uuid.uuid4().hex
+    if not isinstance(authority_id, str) or not _AUTHORITY_ID_RE.fullmatch(authority_id):
+        raise WorkspaceStateError(
+            "workspace state authority_id must be a 32-character lowercase hex token")
     revision = value.get("revision")
     if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
         raise WorkspaceStateError("workspace state revision must be a non-negative integer")
     return {
         "schema": SCHEMA,
+        "authority_id": authority_id,
         "revision": revision,
         "preferences": validate_preferences(value.get("preferences")),
     }
 
 
 def _default_state() -> dict:
-    return {"schema": SCHEMA, "revision": 0, "preferences": default_preferences()}
+    return {
+        "schema": SCHEMA,
+        "authority_id": uuid.uuid4().hex,
+        "revision": 0,
+        "preferences": default_preferences(),
+    }
 
 
 @contextmanager
@@ -559,9 +600,9 @@ class WorkspaceStateStore:
         self.lock_path = self.path.parent / LOCK_FILENAME
         self.lock_timeout = float(lock_timeout)
 
-    def _read_unlocked(self) -> dict:
+    def _read_unlocked(self) -> tuple[dict, bool]:
         if not self.path.exists():
-            return _default_state()
+            return _default_state(), True
         try:
             size = self.path.stat().st_size
         except OSError as exc:
@@ -573,11 +614,18 @@ class WorkspaceStateStore:
                 value = json.load(handle)
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise WorkspaceStateError(f"cannot read workspace state: {exc}") from exc
-        return validate_state(value)
+        legacy = isinstance(value, dict) and set(value) == {
+            "schema", "revision", "preferences",
+        }
+        return validate_state(value, allow_legacy=True), legacy
 
     def read(self) -> dict:
         with _PROCESS_LOCK:
-            return copy.deepcopy(self._read_unlocked())
+            with _advisory_lock(self.lock_path, timeout=self.lock_timeout):
+                state, needs_persistence = self._read_unlocked()
+                if needs_persistence:
+                    self._write_unlocked(state)
+                return copy.deepcopy(state)
 
     def _write_unlocked(self, state: dict) -> None:
         validated = validate_state(state)
@@ -613,10 +661,16 @@ class WorkspaceStateStore:
                 except OSError:
                     pass
 
-    def update(self, patch: Any, expected_revision: Any) -> dict:
+    def update(self, patch: Any, expected_revision: Any,
+               expected_authority_id: Any = None) -> dict:
         if not isinstance(expected_revision, int) or isinstance(expected_revision, bool) \
                 or expected_revision < 0:
             raise WorkspaceStateError("expected_revision must be a non-negative integer")
+        if expected_authority_id is not None and (
+                not isinstance(expected_authority_id, str)
+                or not _AUTHORITY_ID_RE.fullmatch(expected_authority_id)):
+            raise WorkspaceStateError(
+                "expected_authority_id must be a 32-character lowercase hex token or null")
         if not isinstance(patch, dict) or not set(patch).issubset({"set", "remove"}):
             raise WorkspaceStateError("patch must contain only set and remove")
         set_values = patch.get("set", {})
@@ -632,13 +686,32 @@ class WorkspaceStateStore:
         if len(removals) > MAX_COLLECTION_ITEMS:
             raise WorkspaceStateError("patch.remove contains too many entries")
 
+        # Validate every caller-controlled value before reading, creating, or
+        # migrating the durable file.  Invalid credential/path-bearing updates
+        # therefore cannot have a filesystem side effect, even when this is the
+        # first access or the on-disk state still uses the legacy three-field
+        # envelope.
+        preflight = default_preferences()
+        for key, value in set_values.items():
+            preflight[key] = copy.deepcopy(value)
+        for raw_path in removals:
+            _remove_preference(preflight, raw_path)
+        validate_preferences(preflight)
+
         with _PROCESS_LOCK:
             with _advisory_lock(self.lock_path, timeout=self.lock_timeout):
-                current = self._read_unlocked()
-                if current["revision"] != expected_revision:
+                current, needs_persistence = self._read_unlocked()
+                authority_conflict = (
+                    expected_authority_id is not None
+                    and current["authority_id"] != expected_authority_id
+                )
+                if current["revision"] != expected_revision or authority_conflict:
+                    if needs_persistence:
+                        self._write_unlocked(current)
                     return {
                         "ok": False,
                         "conflict": True,
+                        "authority_id": current["authority_id"],
                         "state_revision": current["revision"],
                         "preferences": copy.deepcopy(current["preferences"]),
                         "error": "workspace state revision conflict",
@@ -651,6 +724,7 @@ class WorkspaceStateStore:
                 preferences = validate_preferences(preferences)
                 updated = {
                     "schema": SCHEMA,
+                    "authority_id": current["authority_id"],
                     "revision": current["revision"] + 1,
                     "preferences": preferences,
                 }
@@ -658,6 +732,7 @@ class WorkspaceStateStore:
                 return {
                     "ok": True,
                     "conflict": False,
+                    "authority_id": updated["authority_id"],
                     "state_revision": updated["revision"],
                     "preferences": copy.deepcopy(preferences),
                     "error": None,

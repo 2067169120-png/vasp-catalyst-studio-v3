@@ -1364,6 +1364,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
               placeholder="例如 D:\VASP\Li-S-results（里面可包含 clean、S8、Li2Sx 等多个子目录）">
             <button class="btn" type="button" id="pj-import-source-btn">选择整个文件夹</button>
             <button class="btn primary" type="button" id="pj-import-scan">检查结果</button>
+            <button class="btn quiet" type="button" id="pj-import-cancel" data-i18n="runtime.project.import_draft.cancel" disabled>取消本次导入</button>
           </span>
         </div>
         <p class="pj-import-tip">不会移动或修改原始计算文件；扫描只是读取 INCAR、OSZICAR、OUTCAR、vasprun.xml 等结果证据。</p>
@@ -2406,11 +2407,17 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
       <div id="ai-chat-files" class="ai-chat-files"></div>
       <div class="ai-chat-compose">
         <button class="btn" id="ai-chat-attach" data-i18n="ai.chat.attach">添加文件 / ZIP</button>
+        <button class="btn quiet" id="ai-chat-preview-outbound" data-i18n="ai.chat.preview_outbound">预览将发送的数据</button>
         <textarea id="ai-chat-input" class="ipt" rows="2" aria-label="询问结果、参数或报告；支持 /status、/report、/help"
           data-i18n-aria-label="ai.chat.prompt" placeholder="询问结果、参数或报告；支持 /status、/report、/help"
           data-i18n-ph="ai.chat.prompt"></textarea>
         <button class="btn primary" id="ai-chat-send" data-i18n="ai.chat.send">发送</button>
         <button class="btn quiet" id="ai-chat-stop" data-i18n="ai.chat.stop" disabled>停止回复</button>
+      </div>
+      <div id="ai-chat-outbound" class="ai-chat-outbound" role="region" aria-live="polite"
+           aria-label="外部模型数据预览" data-i18n-aria-label="ai.chat.outbound_region" hidden>
+        <p id="ai-chat-outbound-summary" class="sub"></p>
+        <pre id="ai-chat-outbound-content" class="mono" tabindex="0"></pre>
       </div>
       <div class="sub ai-chat-privacy" data-i18n="ai.chat.privacy">文件先复制到本地会话隔离区并做大小、软链接与 ZIP 安全检查；只有本次勾选的文本预览会发送给外部模型。“停止回复”不会取消集群作业。</div>
     </div>
@@ -2820,6 +2827,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
 
     <div class="actions">
       <button class="btn primary" id="cl-save" data-i18n="cluster.save">保存</button>
+      <button class="btn quiet" id="cl-cancel" data-i18n="cluster.draft.cancel">取消未保存修改</button>
       <button class="btn" id="cl-test" data-i18n="cluster.test">测试连接</button>
       <button class="btn" id="cl-preview" data-i18n="cluster.preview">预览 job 脚本</button>
     </div>

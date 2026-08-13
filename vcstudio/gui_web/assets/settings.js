@@ -10,11 +10,13 @@
   const State = {
     scenarios: [], engines: [], tasks: [], keySaved: false,
     scenarioKey: 'full', engineKey: 'vasp', calculationKey: '',
+    contextRevision: null,
     workspaceBusy: false,
     labPolicies: [], labPolicyRevision: 0, labPolicyPreview: null,
     labPolicySelection: null, labPolicyBusy: false,
   };
   let workspaceIntentGeneration = 0;
+  const workspaceIntentSession = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   let labPolicyIntentGeneration = 0;
   const draftSnapshots = new Map();
   const dirtyDraftScopes = new Set();
@@ -133,6 +135,31 @@
   }
   function endWorkspaceIntent(generation) {
     if (currentWorkspaceIntent(generation)) setWorkspaceControlsBusy(false);
+  }
+  async function loadWorkspaceAuthority() {
+    if (typeof VCS.loadWorkspaceContext === 'function') return VCS.loadWorkspaceContext();
+    return VCS.call('settings_context_get');
+  }
+  async function updateWorkspaceAuthority(patch, generation) {
+    if (typeof VCS.updateWorkspaceContext === 'function') {
+      const result = await VCS.updateWorkspaceContext(patch);
+      if (!currentWorkspaceIntent(generation)) return { ok: false, superseded: true };
+      return result;
+    }
+    if (!Number.isInteger(State.contextRevision)) {
+      const loaded = await loadWorkspaceAuthority();
+      if (!currentWorkspaceIntent(generation)) return { ok: false, superseded: true };
+      if (!(loaded && loaded.ok && loaded.context)) return loaded;
+      State.contextRevision = loaded.context.revision;
+    }
+    const intentId = `${workspaceIntentSession}:${generation}`;
+    const result = await VCS.call(
+      'settings_context_update', patch, State.contextRevision, intentId);
+    if (!currentWorkspaceIntent(generation)) return { ok: false, superseded: true };
+    if (result && result.context) State.contextRevision = result.context.revision;
+    // Never replay a conflicted patch at the returned revision: that would
+    // let an older window overwrite the intent that won the CAS.
+    return result;
   }
   const rawError = (result, key, zh, en) =>
     (result && result.error) || tr(key, {}, zh, en);
@@ -894,13 +921,11 @@
       const scSel = $('set-scenario');
       if (scSel) {
         const [list, cur] = await Promise.all([
-          VCS.call('scenario_list'), VCS.call('scenario_get')]);
+          VCS.call('scenario_list'), loadWorkspaceAuthority()]);
         if (!currentWorkspaceIntent(generation)) return false;
+        if (!(cur && cur.ok && cur.context)) return false;
         State.scenarios = (list && list.scenarios) || [];
-        const curKey = (cur && cur.scenario && cur.scenario.key) || 'full';
-        renderScenarioOptions(curKey);
-        renderScenarioDesc(curKey);
-        return await loadEngines(curKey, generation);
+        return await renderWorkspaceContext(cur.context, generation);
       }
       return true;
     } finally {
@@ -908,39 +933,63 @@
     }
   }
 
-  async function loadEngines(scenarioKey, generation = workspaceIntentGeneration) {
+  async function renderWorkspaceContext(context, generation = workspaceIntentGeneration) {
+    if (!context || !currentWorkspaceIntent(generation)) return false;
+    State.contextRevision = context.revision;
+    const scenario = context.scenario || {};
+    const scenarioKey = scenario.key || 'full';
+    State.scenarioKey = scenarioKey;
+    if (scenario.key && !State.scenarios.some(item => item.key === scenario.key)) {
+      State.scenarios.push(scenario);
+    }
+    renderScenarioOptions(scenarioKey);
+    renderScenarioDesc(scenarioKey);
+    if (VCS.applyScenario && scenario.key) VCS.applyScenario(scenario);
+    return loadEngines(scenarioKey, generation, context);
+  }
+
+  async function adoptRejectedWorkspaceContext(result, generation) {
+    if (result && result.context) {
+      return renderWorkspaceContext(result.context, generation);
+    }
+    return loadWorkspace(generation);
+  }
+
+  async function loadEngines(scenarioKey, generation = workspaceIntentGeneration,
+                             context = null) {
     const sel = $('set-engine');
-    if (!sel) return loadCalculations(scenarioKey, 'vasp', generation);
-    const [listed, current] = await Promise.all([
-      VCS.call('engine_list', scenarioKey || null), VCS.call('engine_get')]);
+    const authoritative = context || ((await loadWorkspaceAuthority()) || {}).context;
+    if (!currentWorkspaceIntent(generation) || !authoritative) return false;
+    if (!sel) return loadCalculations(
+      scenarioKey, authoritative.engine || 'vasp', generation, authoritative);
+    const listed = await VCS.call('engine_list', scenarioKey || null);
     if (!currentWorkspaceIntent(generation)) return false;
     State.engines = ((listed && listed.engines) || []).filter(row => row.visible !== false);
     State.engines.sort((a, b) => (a.key === 'vasp' ? -1 : b.key === 'vasp' ? 1 : 0));
-    const active = (current && current.engine) || (listed && listed.default) || 'vasp';
+    const active = authoritative.engine || (listed && listed.default) || 'vasp';
+    State.engineKey = active;
     renderEngineOptions(active);
-    const capability = (current && current.engine === sel.value && current.capability) ||
+    const capability = (authoritative.engine === sel.value && authoritative.capability) ||
       ((State.engines.find(row => row.key === sel.value) || {}));
     if (VCS.applyEngine) VCS.applyEngine(sel.value, capability);
     renderEngineDesc(sel.value);
-    return loadCalculations(scenarioKey, sel.value, generation);
+    return loadCalculations(scenarioKey, sel.value, generation, authoritative);
   }
 
-  async function loadCalculations(scenarioKey, engineKey, generation = workspaceIntentGeneration) {
+  async function loadCalculations(scenarioKey, engineKey,
+                                  generation = workspaceIntentGeneration, context = null) {
     const sel = $('set-calculation');
     if (!sel) return true;
-    const [catalog, current] = await Promise.all([
-      VCS.call('task_catalog', scenarioKey || null, null, engineKey || 'vasp'),
-      VCS.call('calculation_get')]);
+    const authoritative = context || ((await loadWorkspaceAuthority()) || {}).context;
+    if (!currentWorkspaceIntent(generation) || !authoritative) return false;
+    const catalog = await VCS.call(
+      'task_catalog', scenarioKey || null, null, engineKey || 'vasp');
     if (!currentWorkspaceIntent(generation)) return false;
     State.tasks = (catalog && catalog.tasks) || [];
-    const active = (current && current.active_calculation) ||
+    const active = authoritative.calculation ||
       ((VCS.scenario && VCS.scenario.defaults) || {}).active_calculation || '';
     renderCalculationOptions(active);
-    if (sel.value && (!current || !current.configured)) {
-      const configured = await VCS.call('calculation_set', sel.value);
-      if (!currentWorkspaceIntent(generation)) return false;
-      if (configured && configured.ok === false) return false;
-    }
+    State.calculationKey = sel.value || active;
     if (VCS.applyCalculation) VCS.applyCalculation(sel.value || '');
     renderCalculationGuide(sel.value || '');
     return true;
@@ -1040,30 +1089,19 @@
     const key = $('set-scenario') ? $('set-scenario').value : 'full';
     const generation = beginWorkspaceIntent();
     try {
-      const r = await VCS.call('scenario_set', key);
+      const r = await updateWorkspaceAuthority({ scenario: key }, generation);
       if (!currentWorkspaceIntent(generation)) return false;
       if (!(r && r.ok)) {
         logLocalizedSetting('settings.status.scenario_failed',
           { error: rawError(r, 'common.unknown_error', '未知错误', 'Unknown error') },
           '切换工作模式失败：{error}', 'Failed to change workflow: {error}', 'failc');
-        await loadWorkspace(generation);
+        await adoptRejectedWorkspaceContext(r, generation);
         return false;
       }
-      State.scenarioKey = key;
-      if (r.scenario) {
-        const index = State.scenarios.findIndex(item => item.key === r.scenario.key);
-        if (index >= 0) State.scenarios[index] = r.scenario;
-      }
-      renderScenarioDesc(key);
-      if (VCS.applyScenario && r.scenario) VCS.applyScenario(r.scenario);
-      const preferredEngine = r.scenario && r.scenario.defaults && r.scenario.defaults.engine;
-      if (preferredEngine) {
-        await VCS.call('engine_set', preferredEngine);
-        if (!currentWorkspaceIntent(generation)) return false;
-      }
-      if (await loadEngines(key, generation) === false) return false;
+      if (await renderWorkspaceContext(r.context, generation) === false) return false;
       if (!currentWorkspaceIntent(generation)) return false;
-      const name = r.scenario ? scenarioName(r.scenario) : key;
+      const name = r.context && r.context.scenario
+        ? scenarioName(r.context.scenario) : key;
       logLocalizedSetting('settings.status.scenario_changed', { name },
         '工作模式已切换：{name}', 'Workflow changed: {name}', 'okc');
       VCS.toast(tr('settings.status.scenario_changed_short', {},
@@ -1083,21 +1121,20 @@
     const key = $('set-engine') ? $('set-engine').value : 'vasp';
     const generation = beginWorkspaceIntent();
     try {
-      const r = await VCS.call('engine_set', key);
+      const r = await updateWorkspaceAuthority({ engine: key }, generation);
       if (!currentWorkspaceIntent(generation)) return false;
       if (!(r && r.ok)) {
         logLocalizedSetting('settings.status.engine_failed',
           { error: rawError(r, 'common.unknown_error', '未知错误', 'Unknown error') },
           '切换计算引擎失败：{error}', 'Failed to change compute engine: {error}', 'failc');
-        await loadEngines(State.scenarioKey, generation);
+        await adoptRejectedWorkspaceContext(r, generation);
         return false;
       }
-      State.engineKey = key;
-      const row = State.engines.find(item => item.key === key) || r.capability || {};
-      if (VCS.applyEngine) VCS.applyEngine(key, Object.assign({}, row, r.capability || {}));
-      renderEngineDesc(key);
-      if (await loadCalculations(State.scenarioKey, key, generation) === false) return false;
+      if (await renderWorkspaceContext(r.context, generation) === false) return false;
       if (!currentWorkspaceIntent(generation)) return false;
+      const active = (r.context && r.context.engine) || key;
+      const row = State.engines.find(item => item.key === active) ||
+        ((r.context && r.context.capability) || {});
       logLocalizedSetting('settings.status.engine_changed', { name: row.name || key.toUpperCase() },
         '本次计算引擎已切换：{name}', 'Compute engine changed: {name}', 'okc');
       VCS.toast(tr('settings.status.engine_filtered', {},
@@ -1119,19 +1156,18 @@
     if (!key) return;
     const generation = beginWorkspaceIntent();
     try {
-      const r = await VCS.call('calculation_set', key);
+      const r = await updateWorkspaceAuthority({ calculation: key }, generation);
       if (!currentWorkspaceIntent(generation)) return false;
       if (!(r && r.ok)) {
         logLocalizedSetting('settings.status.calculation_failed',
           { error: rawError(r, 'common.unknown_error', '未知错误', 'Unknown error') },
           '切换计算类型失败：{error}', 'Failed to change calculation type: {error}', 'failc');
-        await loadCalculations(State.scenarioKey, State.engineKey, generation);
+        await adoptRejectedWorkspaceContext(r, generation);
         return false;
       }
-      State.calculationKey = key;
-      if (VCS.applyCalculation) VCS.applyCalculation(key);
-      const task = State.tasks.find(t => t.key === key);
-      renderCalculationGuide(key);
+      if (await renderWorkspaceContext(r.context, generation) === false) return false;
+      const active = (r.context && r.context.calculation) || key;
+      const task = State.tasks.find(t => t.key === active);
       logLocalizedSetting('settings.status.calculation_changed', { name: task ? taskName(task) : key },
         '本次计算类型已切换：{name}', 'Calculation type changed: {name}', 'okc');
       VCS.toast(tr('settings.status.calculation_ready', {},

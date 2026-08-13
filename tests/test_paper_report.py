@@ -111,6 +111,7 @@ def _validated_model(
     locale="en-US",
     outline=None,
     theme_id="academic-a4",
+    preset_id="scientific-review",
 ) -> dict:
     """Return a render model with a real, fully bound validation chain."""
     from vcstudio.project.report_contracts import (
@@ -127,6 +128,7 @@ def _validated_model(
     if outline is not None:
         spec_kwargs["outline"] = tuple(outline)
     spec = ReportSpec(
+        preset_id=preset_id,
         requested_kind=requested_kind,
         locale=locale,
         formats=tuple(formats),
@@ -145,6 +147,7 @@ def _validated_model(
     qualification = "adsorption_result_verified" if is_final else "diagnostic"
     model.update(
         locale=locale,
+        preset_id=preset_id,
         report_kind=effective_kind,
         scientific_qualification=qualification,
         template_ref=spec.template_ref,
@@ -288,7 +291,9 @@ def test_html_preview_uses_bound_outline_locale_and_matches_formal_hashes(tmp_pa
         tmp_path,
         formats=("html",),
         locale="zh-CN",
-        outline=("limitations", "executive_summary"),
+        outline=(
+            "limitations", "methods", "adsorption_table", "executive_summary",
+        ),
     )
 
     preview = paper_report.render_report_html_preview(model)
@@ -711,7 +716,7 @@ def test_model_hash_uses_contract_semantics_not_time_or_locator(tmp_path):
     )
     spec, snapshot, validation = contracts(
         9, "C:/templates/a", "C:/project/a",
-        ["executive_summary", "limitations"])
+        ["executive_summary", "adsorption_table", "methods", "limitations"])
     first_model.update(
         report_spec=spec,
         report_snapshot=snapshot,
@@ -723,7 +728,7 @@ def test_model_hash_uses_contract_semantics_not_time_or_locator(tmp_path):
     moved = copy.deepcopy(first_model)
     spec, snapshot, validation = contracts(
         10, "D:/templates/moved", "Z:/project/moved",
-        ["executive_summary", "limitations"])
+        ["executive_summary", "adsorption_table", "methods", "limitations"])
     moved.update(
         report_spec=spec,
         report_snapshot=snapshot,
@@ -735,7 +740,7 @@ def test_model_hash_uses_contract_semantics_not_time_or_locator(tmp_path):
     changed_contract = copy.deepcopy(moved)
     spec, snapshot, validation = contracts(
         10, "D:/templates/moved", "Z:/project/moved",
-        ["limitations", "executive_summary"])
+        ["limitations", "methods", "adsorption_table", "executive_summary"])
     changed_contract.update(
         report_spec=spec,
         report_snapshot=snapshot,
@@ -1037,7 +1042,9 @@ def test_bound_outline_controls_section_order_and_exclusion(tmp_path):
     model = _validated_model(
         tmp_path,
         formats=("html",),
-        outline=("limitations", "executive_summary"),
+        outline=(
+            "limitations", "methods", "adsorption_table", "executive_summary",
+        ),
     )
 
     result = paper_report.render_report_bundle(
@@ -1047,7 +1054,8 @@ def test_bound_outline_controls_section_order_and_exclusion(tmp_path):
 
     assert html.index("Limitations") < html.index("Executive Summary")
     assert "Key Findings" not in html
-    assert "Adsorption-Energy Results" not in html
+    assert "Adsorption-Energy Results" in html
+    assert "Cross-Project Comparison" not in html
 
 
 def test_bound_final_methods_only_outline_is_rejected_by_renderer(tmp_path):
@@ -1059,12 +1067,56 @@ def test_bound_final_methods_only_outline_is_rejected_by_renderer(tmp_path):
 
     with pytest.raises(
         ValueError,
-        match="final report outline.*scientific result section",
+        match="final report outline.*scientific result/evidence section",
     ):
         paper_report.render_report_bundle(
             model,
             tmp_path / "methods-only-final",
             formats=("html",),
+        )
+
+
+@pytest.mark.parametrize(
+    ("preset_id", "outline", "empty_field", "message"),
+    [
+        (
+            "scientific-review",
+            ("executive_summary", "adsorption_table", "methods", "limitations"),
+            "adsorption_table",
+            "result/evidence content",
+        ),
+        (
+            "scientific-review",
+            ("executive_summary", "adsorption_table", "methods", "limitations"),
+            "limitations",
+            "limitations content",
+        ),
+        (
+            "quick-decision-brief",
+            ("key_findings", "figures", "limitations"),
+            "figures",
+            "rendered figure/table",
+        ),
+    ],
+)
+def test_final_renderer_requires_real_visible_content_not_only_outline_names(
+    tmp_path, preset_id, outline, empty_field, message,
+):
+    model = _validated_model(
+        tmp_path,
+        formats=("html",),
+        outline=outline,
+        preset_id=preset_id,
+    )
+    if empty_field == "figures":
+        model[empty_field] = []
+    else:
+        model[empty_field] = None
+    _rebind_report_content(model)
+
+    with pytest.raises(ValueError, match=message):
+        paper_report.render_report_bundle(
+            model, tmp_path / f"empty-{empty_field}", formats=("html",)
         )
 
 

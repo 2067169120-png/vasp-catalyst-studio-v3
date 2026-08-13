@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from vcstudio.gui_web import frozen_entry, frozen_healthcheck
 
 
@@ -38,6 +40,49 @@ def test_source_tree_lite_probe_can_validate_every_non_frozen_contract():
     assert report['checks']['locales']['detail']['languages'][:1] == ['zh']
     core = report['checks']['core-modules']['detail']
     assert set(frozen_healthcheck.WORKBENCH_MODULE_CONTRACTS) <= set(core)
+
+
+def test_document_probe_imports_openpyxl_and_returns_version_evidence(monkeypatch):
+    imported = []
+    real_import = frozen_healthcheck.importlib.import_module
+
+    def tracked_import(name):
+        imported.append(name)
+        return real_import(name)
+
+    monkeypatch.setattr(frozen_healthcheck.importlib, 'import_module', tracked_import)
+
+    detail = frozen_healthcheck._probe_molecule_and_document_modules()
+
+    assert 'openpyxl' in imported
+    assert detail['openpyxl'] == real_import('openpyxl').__version__
+
+
+@pytest.mark.parametrize('profile', ['full', 'no-charts'])
+def test_document_profiles_keep_the_openpyxl_contract(monkeypatch, profile):
+    expected = {'openpyxl': 'test-version'}
+    monkeypatch.setattr(
+        frozen_healthcheck,
+        '_probe_molecule_and_document_modules',
+        lambda: expected,
+    )
+    monkeypatch.setattr(
+        frozen_healthcheck,
+        '_probe_numeric_and_chart_modules',
+        lambda **_kwargs: {},
+    )
+
+    report = frozen_healthcheck.run_healthcheck(
+        profile=profile,
+        require_frozen=False,
+        bundle_root=ROOT,
+    )
+
+    assert report['ok'] is True
+    assert report['checks']['molecule-and-documents'] == {
+        'ok': True,
+        'detail': expected,
+    }
 
 
 def test_core_probe_fails_when_a_workbench_module_contract_is_incomplete(monkeypatch):

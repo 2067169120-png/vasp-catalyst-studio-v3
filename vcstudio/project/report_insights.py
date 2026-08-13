@@ -232,6 +232,38 @@ def _map_diff(left: Mapping[str, Any], right: Mapping[str, Any]) -> list[dict[st
     return rows
 
 
+def _flatten_values(value: Any, prefix: str = "") -> dict[str, Any]:
+    """Flatten a frozen scientific structure without inventing comparison semantics."""
+    found: dict[str, Any] = {}
+    if isinstance(value, Mapping):
+        for key, item in sorted(value.items(), key=lambda pair: str(pair[0])):
+            path = f"{prefix}.{key}" if prefix else str(key)
+            found.update(_flatten_values(item, path))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            found.update(_flatten_values(item, f"{prefix}[{index}]"))
+    elif prefix:
+        found[prefix] = redact(value, key=prefix.rsplit(".", 1)[-1])
+    return found
+
+
+def _method_matrix(bundle: FrozenRevision) -> dict[str, Any]:
+    matrix: dict[str, Any] = {}
+    for source_name, source in (
+        ("model", bundle.model),
+        ("snapshot", bundle.snapshot.get("payload") or {}),
+    ):
+        if not isinstance(source, Mapping):
+            continue
+        for key in (
+            "methods", "methodology", "calculation_details", "method_consistency",
+            "method_evidence", "method_status",
+        ):
+            if key in source:
+                matrix.update(_flatten_values(source[key], f"{source_name}.{key}"))
+    return matrix
+
+
 def _figure_records(bundle: FrozenRevision) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     candidates = []
@@ -266,6 +298,8 @@ def scientific_diff(service: Any, path: str, left_revision_id: str,
     numeric_right = _flatten_numeric(right.model)
     figures_left = {str(item["id"]): item for item in _figure_records(left)}
     figures_right = {str(item["id"]): item for item in _figure_records(right)}
+    methods_left = _method_matrix(left)
+    methods_right = _method_matrix(right)
     result = {
         "schema": DIFF_SCHEMA,
         "ok": True,
@@ -300,6 +334,7 @@ def scientific_diff(service: Any, path: str, left_revision_id: str,
                                right.validation.get("claims") or right.model.get("claims") or []),
         },
         "numeric_values": _map_diff(numeric_left, numeric_right),
+        "method_matrix": _map_diff(methods_left, methods_right),
         "figures": _map_diff(figures_left, figures_right),
         "files": _map_diff(left.file_hashes, right.file_hashes),
         "error": None,
@@ -308,7 +343,8 @@ def scientific_diff(service: Any, path: str, left_revision_id: str,
         result["scope"]["changed"], bool(result["hashes"]),
         any(item["changed"] for item in result["validation"].values()),
         any(item["changed"] for item in result["scientific"].values()),
-        bool(result["numeric_values"]), bool(result["figures"]), bool(result["files"]),
+        bool(result["numeric_values"]), bool(result["method_matrix"]),
+        bool(result["figures"]), bool(result["files"]),
     ))
     return result
 
@@ -342,6 +378,17 @@ def evidence_graph(service: Any, path: str, revision_id: str) -> dict[str, Any]:
                 "type": kind,
                 "label": _safe_graph_text(label, fallback=identifier),
                 "record": redact(value),
+                "route": {
+                    "revision": "publish-versions",
+                    "file_hash": "publish-export",
+                    "source": "project-members",
+                    "validation_check": "publish-versions",
+                    "snapshot_record": "publish-versions",
+                    "job": "run-jobs",
+                    "table": "publish-report",
+                    "figure": "publish-figures",
+                    "conclusion": "publish-report",
+                }.get(kind),
             })
         return identifier
 

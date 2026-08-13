@@ -180,7 +180,7 @@ def filter_continuable(dirs):
     return eligible, skipped
 
 
-def continue_batch(prof, pw, dirs, trust_new):
+def continue_batch(prof, pw, dirs, trust_new, *, idempotency_key=None):
     """CONTCAR 续算批量线程体:每作业调 submitter.continue_from_contcar(不可续算的自失败)。"""
     try:
         client, jump = open_client(prof, pw, trust_new=trust_new)
@@ -189,16 +189,47 @@ def continue_batch(prof, pw, dirs, trust_new):
             return _trust_payload(e, results=[])
         raise RuntimeError(str(e))
     results = []
+    busy_count = 0
+    recovery_count = 0
+    recovery_job_ids = []
     try:
         for d in dirs:
             try:
-                m = submitter.continue_from_contcar(client, prof, d)
-                results.append((d, True, f"已续算重投,新作业号 {m['scheduler_job_id']}"))
+                if idempotency_key:
+                    m = submitter.continue_from_contcar(
+                        client, prof, d, idempotency_key=idempotency_key)
+                else:
+                    # Preserve the historical injectable three-argument seam.
+                    m = submitter.continue_from_contcar(client, prof, d)
+                verb = '已确认续算' if m.get('_continue_replayed') else '已续算重投'
+                results.append((d, True, f"{verb},新作业号 {m['scheduler_job_id']}"))
+            except submitter.JobOperationBusy as e:
+                busy_count += 1
+                results.append((d, False, str(e)))
+            except submitter.UnknownRemoteJobOperation as e:
+                recovery_count += 1
+                if e.scheduler_job_id:
+                    recovery_job_ids.append(e.scheduler_job_id)
+                results.append((d, False, str(e)))
             except _job_errors() as e:
                 results.append((d, False, str(e)))
     finally:
         close_quiet(client, jump)
-    return {'needs_trust': False, 'results': results}
+    payload = {'needs_trust': False, 'results': results}
+    if busy_count:
+        payload.update({
+            'ok': False, 'busy': True, 'code': 'job_busy',
+            'busy_count': busy_count,
+        })
+    if recovery_count:
+        payload.update({
+            'ok': False, 'code': 'unknown_remote_job_operation',
+            'requires_manual_recovery': True,
+            'recovery_count': recovery_count,
+        })
+        if recovery_job_ids:
+            payload['scheduler_job_ids'] = recovery_job_ids
+    return payload
 
 
 def workdir_lookup(prof, pw, job_id, trust_new):
@@ -388,7 +419,8 @@ def refresh_batch(prof, pw, dirs, trust_new):
     return {'needs_trust': False, 'results': results}
 
 
-def cancel_batch(profile, jobs, *, password=None, trust_new=False):
+def cancel_batch(profile, jobs, *, password=None, trust_new=False,
+                 idempotency_key=None):
     """批量取消作业线程体:逐作业 qdel/scancel + 回写 manifest 状态。
 
     jobs:作业目录列表(每目录 job.yaml 的 scheduler_job_id 提供调度器作业号)。复用
@@ -405,7 +437,7 @@ def cancel_batch(profile, jobs, *, password=None, trust_new=False):
     out = {'ok': False, 'cancelled': [], 'failed': [], 'error': None,
            'needs_trust': False}
     try:
-        dialect = get_dialect(profile.scheduler)      # 不支持的调度器早失败(绝不静默)
+        get_dialect(profile.scheduler)                # 不支持的调度器早失败(绝不静默)
     except ValueError as e:
         out['error'] = str(e)
         return out
@@ -422,7 +454,9 @@ def cancel_batch(profile, jobs, *, password=None, trust_new=False):
             })
         return out
 
-    bin_path = getattr(profile, 'scheduler_bin', '')
+    busy_count = 0
+    recovery_count = 0
+    recovery_job_ids = []
     try:
         for d in jobs:
             m = manifest_mod.load_manifest(d)
@@ -433,23 +467,40 @@ def cancel_batch(profile, jobs, *, password=None, trust_new=False):
                      'reason': '无 job.yaml 或缺 scheduler_job_id,无法取消'})
                 continue
             try:
-                with submitter.job_operation(d, '取消作业'):
-                    # 入锁后重读，防止等待期间作业已被续算为另一 job id。
-                    m = manifest_mod.load_manifest(d)
-                    current_jid = str((m or {}).get('scheduler_job_id') or '')
-                    if not m or current_jid != jid:
-                        raise RuntimeError('取消前作业代次已变化，请刷新后重试')
-                    submitter.assert_profile_binding(
-                        profile, d, '取消作业', manifest=m)
-                    submitter.run_cmd(
-                        client, dialect.cancel_cmd(jid, bin_path), check=True)
-                    # CANCELLED 非 manifest 合法态 → FAILED + note '用户取消'(裁决口径)
-                    manifest_mod.set_state(m, 'FAILED', note='用户取消')
-                    manifest_mod.save_manifest(d, m)
-                    out['cancelled'].append(jid)
+                if idempotency_key:
+                    result = submitter.cancel_job(
+                        client, profile, d, idempotency_key=idempotency_key,
+                        expected_job_id=jid)
+                else:
+                    result = submitter.cancel_job(
+                        client, profile, d, expected_job_id=jid)
+                cancelled_id = str(result.get('_cancelled_job_id') or jid)
+                out['cancelled'].append(cancelled_id)
+                if result.get('_cancel_replayed'):
+                    out.setdefault('replayed', []).append(cancelled_id)
+            except submitter.JobOperationBusy as e:
+                busy_count += 1
+                out['failed'].append({'job_id': jid, 'reason': str(e)})
+            except submitter.UnknownRemoteJobOperation as e:
+                recovery_count += 1
+                if e.scheduler_job_id:
+                    recovery_job_ids.append(e.scheduler_job_id)
+                out['failed'].append({'job_id': jid, 'reason': str(e)})
             except _job_errors() as e:
                 out['failed'].append({'job_id': jid, 'reason': str(e)})
     finally:
         close_quiet(client, jump)
-    out['ok'] = True
+    out['ok'] = not (busy_count or recovery_count)
+    if busy_count:
+        out.update({
+            'busy': True, 'code': 'job_busy', 'busy_count': busy_count,
+        })
+    if recovery_count:
+        out.update({
+            'code': 'unknown_remote_job_operation',
+            'requires_manual_recovery': True,
+            'recovery_count': recovery_count,
+        })
+        if recovery_job_ids:
+            out['scheduler_job_ids'] = recovery_job_ids
     return out

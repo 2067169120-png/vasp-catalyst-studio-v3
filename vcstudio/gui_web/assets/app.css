@@ -502,6 +502,8 @@ pre.meth-pre{white-space:pre-wrap;word-break:break-word;max-height:200px}
 .ai-chat-compose textarea{flex:1;min-height:52px;max-height:130px}
 .ai-chat-compose .btn{flex:0 0 auto}
 .ai-chat-privacy{margin-top:7px;line-height:1.5}
+.ai-chat-outbound{margin-top:8px;padding:9px;border:1px solid var(--rule);border-radius:6px;background:var(--panel2)}
+.ai-chat-outbound pre{margin:7px 0 0;max-height:220px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}
 @media (max-width:760px){
   .ai-chat-head{align-items:stretch;flex-wrap:wrap}
   .ai-chat-head select{flex:1}

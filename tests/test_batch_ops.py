@@ -336,6 +336,31 @@ def test_cancel_batch_wrong_cluster_never_calls_scheduler(tmp_path, monkeypatch)
     assert manifest_mod.load_manifest(d)['state'] == 'RUNNING'
 
 
+def test_cancel_batch_rejects_scheduler_generation_changed_after_target_snapshot(
+        tmp_path, monkeypatch):
+    _fake_conn(monkeypatch)
+    d = _make_job(tmp_path, 'race', '777')
+    real_cancel = batch_ops.submitter.cancel_job
+    commands = []
+
+    def change_generation_then_cancel(client, profile, job_dir, **kwargs):
+        data = manifest_mod.load_manifest(job_dir)
+        data['scheduler_job_id'] = '888'
+        manifest_mod.save_manifest(job_dir, data)
+        return real_cancel(client, profile, job_dir, **kwargs)
+
+    monkeypatch.setattr(batch_ops.submitter, 'cancel_job', change_generation_then_cancel)
+    monkeypatch.setattr(
+        batch_ops.submitter, 'run_cmd',
+        lambda _client, command, **_kwargs: commands.append(command) or ('', ''))
+
+    out = batch_ops.cancel_batch(_prof('Slurm'), [d], password='pw')
+
+    assert out['cancelled'] == []
+    assert '代次已变化' in out['failed'][0]['reason']
+    assert commands == []
+
+
 def test_cancel_batch_needs_trust(monkeypatch):
     """首次未知主机指纹:open_client 抛 ConnectError(needs_trust)→ ok=False + needs_trust。"""
     from vcstudio.cluster.connection import ConnectError

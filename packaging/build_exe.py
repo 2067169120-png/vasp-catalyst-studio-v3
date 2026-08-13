@@ -5,7 +5,7 @@ features therefore have to be selected *when the executable is built*:
 
 ``python packaging/build_exe.py``
     Build the normal, full Web executable. Charts (matplotlib/numpy), molecular
-    editing (RDKit), Word/PDF report export and PDF reading are required and
+    editing (RDKit), Word/PDF/XLSX report export and PDF reading are required and
     explicitly collected. A missing prerequisite is a build error; the script
     never silently emits a feature-incomplete executable.
 
@@ -48,7 +48,7 @@ CONFIG_EXAMPLE = os.path.join(ROOT, 'config.example.yaml')
 # unexpectedly inflating the executable.
 EXCLUDES_ALWAYS = ('sklearn', 'scipy', 'pandas', 'pytest')
 EXCLUDES_LITE = (
-    'numpy', 'matplotlib', 'rdkit', 'PIL', 'docx', 'pypdf', 'reportlab',
+    'numpy', 'matplotlib', 'rdkit', 'PIL', 'docx', 'pypdf', 'reportlab', 'openpyxl',
 )
 EXCLUDES_DECIMER = ('DECIMER', 'decimer', 'tensorflow', 'keras')
 
@@ -69,6 +69,7 @@ FULL_REQUIREMENTS = (
     ('docx', 'python-docx'),
     ('pypdf', 'pypdf'),
     ('reportlab', 'reportlab'),
+    ('openpyxl', 'openpyxl'),
 )
 DECIMER_REQUIREMENTS = (
     ('DECIMER', 'decimer'),
@@ -236,6 +237,7 @@ def build_command(args: Sequence[str] = ()) -> tuple[list[str], BuildOptions]:
         cmd += ['--collect-all', 'docx']
         cmd += ['--collect-all', 'pypdf']
         cmd += ['--collect-all', 'reportlab']
+        cmd += ['--collect-all', 'openpyxl']
 
     if options.with_decimer:
         cmd += ['--collect-all', 'DECIMER']

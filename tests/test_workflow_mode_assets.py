@@ -54,25 +54,34 @@ def test_settings_put_work_mode_and_exact_calculation_first():
     assert settings.index('id="set-engine"') < settings.index('id="set-calculation"')
     assert settings.index('id="set-calculation"') < settings.index('id="set-llm-provider"')
     js = _read('settings.js')
-    assert "VCS.call('engine_get')" in js
-    assert "VCS.call('engine_set'" in js
-    assert "VCS.call('calculation_get')" in js
-    assert "VCS.call('calculation_set'" in js
+    assert "VCS.call('settings_context_get')" in js
+    assert "'settings_context_update', patch, State.contextRevision, intentId" in js
+    assert "VCS.call('engine_set'" not in js
+    assert "VCS.call('calculation_set'" not in js
 
 
 def test_settings_context_changes_are_latest_intent_wins_and_restore_authority():
     js = _read('settings.js')
     assert 'let workspaceIntentGeneration = 0;' in js
+    assert 'contextRevision: null' in js
     assert 'function beginWorkspaceIntent()' in js
     assert 'function currentWorkspaceIntent(generation)' in js
     for name in ('onScenarioChange', 'onEngineChange', 'onCalculationChange'):
         block = js.split(f'async function {name}()', 1)[1].split('\n  }', 1)[0]
         assert 'const generation = beginWorkspaceIntent();' in block
         assert 'currentWorkspaceIntent(generation)' in block
+        assert 'updateWorkspaceAuthority({' in block
         assert 'finally {' in block and 'endWorkspaceIntent(generation)' in block
-    assert 'await loadWorkspace(generation);' in js
-    assert 'await loadEngines(State.scenarioKey, generation);' in js
-    assert 'await loadCalculations(State.scenarioKey, State.engineKey, generation);' in js
+    assert 'adoptRejectedWorkspaceContext(r, generation)' in js
+    assert 'renderWorkspaceContext(r.context, generation)' in js
+    assert 'for (let attempt = 0; attempt < 4; attempt++)' not in js
+    app = _read('app.js')
+    assert 'VCS.updateWorkspaceContext = async function (patch)' in app
+    assert "'settings_context_update', patch, workspaceContextState.revision, intentId" in app
+    assert 'generation !== workspaceContextState.generation' in app
+    coordinator = app.split('VCS.updateWorkspaceContext = async function (patch)', 1)[1].split(
+        'VCS.openCalculation', 1)[0]
+    assert 'for (let attempt' not in coordinator
 
 
 def test_settings_explicit_save_cards_have_real_discard_lifecycle():
@@ -100,7 +109,7 @@ def test_engine_selection_hides_other_engines_and_uses_native_units():
     assert 'data-engine="cp2k gaussian castep"' in html
     assert 'data-engine-hidden' in app and '[data-engine-hidden]' in css
     assert 'id="eng-task"' in html
-    assert "VCS.call('calculation_set', sel.value)" in generate
+    assert 'VCS.updateWorkspaceContext({ calculation: sel.value })' in generate
     assert 'id="eng-cutoff-ry"' in html and '单位 Ry' in generate
     assert 'id="eng-cp2k-kpts"' in html and "grid('eng-cp2k-kpts')" in generate
     assert 'id="eng-cutoff"' in html and 'cut_off_energy（eV）' in generate

@@ -118,9 +118,12 @@ def test_responsive_navigation_dirty_guard_and_activity_center_are_first_class()
         r'<aside\b[^>]*id="activity-drawer"[^>]*role="dialog"[^>]*aria-modal="true"',
         html, re.S)
     assert 'id="activity-list" role="feed" aria-live="polite"' in html
-    assert 'const operationRecords = new Map();' in workspace
+    assert 'const operationRecords = loadOperationRecords();' in workspace
     assert 'VCS.operations = {' in workspace
     assert 'publish: publishOperation' in workspace
+    assert "OPERATION_STORAGE_KEY = 'vcs.workspace.operations.v1'" in workspace
+    assert 'retry: retryOperation' in workspace
+    assert 'clearCompleted: clearCompletedOperations' in workspace
     assert "data-operation-route=" in workspace
     assert "source: 'operation-queue'" in workspace
 
@@ -249,7 +252,10 @@ def test_job_route_rejects_unknown_status_instead_of_showing_all_jobs():
 
 def test_remote_workspace_revision_never_pairs_with_a_stale_local_snapshot():
     workspace = _source('workspace.js')
+    assert "AUTHORITY_TOKEN = /^[a-f0-9]{32}$/" in workspace
+    assert "server_authority_id: ''" in workspace
     assert 'server_revision: 0' in workspace
+    assert 'state.server_authority_id = serverAuthorityId;' in workspace
     assert 'localBaseRevision !== serverRevision' in workspace
     assert 'if (shouldAdoptRemote)' in workspace
     assert 'state = remote;' in workspace
@@ -267,7 +273,9 @@ def test_remote_saves_and_context_refreshes_are_serialized_last_wins():
     assert 'localStateGeneration !== savedGeneration' in workspace
     assert 'const refreshGeneration = ++contextRefreshGeneration;' in workspace
     assert workspace.count('refreshGeneration !== contextRefreshGeneration') >= 3
-    assert 'if (serverRevision < revision) return;' in workspace
+    assert 'if (sameAuthority && serverRevision < revision) return;' in workspace
+    assert "{ set: statePayload(), remove: [] }, revision, authorityId" in workspace
+    assert 'const authorityReset = !!authorityId && serverAuthorityId !== authorityId;' in workspace
     assert 'let adoptedRemoteRoute = false;' in workspace
     assert 'const selectionRoute = adoptedRemoteRoute ? parseRoute(state.route) : currentRoute;' in workspace
 

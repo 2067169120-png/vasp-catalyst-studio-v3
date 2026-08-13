@@ -9,6 +9,8 @@
 
   const QUEUE_STATES = ['QUEUED', 'SUBMITTED', 'UPLOADED'];
   const NEED_STATES = ['FAILED', 'UNCONVERGED', 'NEEDS_HUMAN'];
+  const PROJECT_IMPORT_DRAFT_ID = 'project-import';
+  const CLUSTER_PROFILE_DRAFT_ID = 'cluster-profile';
 
   function count(jobs, states) {
     return jobs.filter(j => states.indexOf(j.state) >= 0).length;
@@ -520,34 +522,98 @@
       'settings-paths': tr('settings.draft.paths', '数据路径'),
       'settings-autopilot': tr('settings.draft.autopilot', '自动托管设置'),
       'settings-figures': tr('settings.draft.figures', '出图偏好'),
+      'project-import': tr('dashboard.resume.project_import', '项目导入流程草稿'),
+      'draft-project-import': tr('dashboard.resume.project_import', '项目导入流程草稿'),
+      'cluster-profile': tr('dashboard.resume.cluster_profile', '集群配置草稿'),
+      'draft-cluster-profile': tr('dashboard.resume.cluster_profile', '集群配置草稿'),
     };
     return labels[scope] || String(scope || tr('dashboard.resume.unnamed', '未命名草稿'));
   }
 
-  function renderResumeCenter() {
-    const box = $('db-resume'); if (!box) return;
+  function resumeRoute(id, ref, workspace) {
+    if (id === PROJECT_IMPORT_DRAFT_ID) {
+      return typeof workspace.routeHash === 'function'
+        ? workspace.routeHash('project-overview', { projectId: 'current' })
+        : '#/projects/current/overview';
+    }
+    if (id === CLUSTER_PROFILE_DRAFT_ID) {
+      return typeof workspace.routeHash === 'function'
+        ? workspace.routeHash('environment-cluster') : '#/environment/cluster';
+    }
+    return String(ref && ref.route || '');
+  }
+
+  function runtimeResumeRoute(scope, workspace) {
+    const id = String(scope || '').replace(/^draft-/, '');
+    if (id === PROJECT_IMPORT_DRAFT_ID) return resumeRoute(id, {}, workspace);
+    if (id === CLUSTER_PROFILE_DRAFT_ID) return resumeRoute(id, {}, workspace);
+    return '#/environment/settings';
+  }
+
+  function localDraftAvailable(id, workspace) {
+    const drafts = workspace && workspace.drafts;
+    if (!(drafts && typeof drafts.load === 'function')) return false;
+    try {
+      const record = drafts.load(id);
+      return !!(record && record.schema === 'vcstudio.unverified-draft/v1');
+    } catch (_) { return false; }
+  }
+
+  function resumeRouteAvailable(route, projectId, workspace) {
+    const parsed = workspace && typeof workspace.parseRoute === 'function'
+      ? workspace.parseRoute(route) : null;
+    if (!parsed) return false;
+    if (typeof VCS.canActivatePage === 'function' && !VCS.canActivatePage(parsed.def.page)) {
+      return false;
+    }
+    if (projectId && Array.isArray(workspace.projects) &&
+      !workspace.projects.some(item => item.id === projectId)) return false;
+    return true;
+  }
+
+  function collectResumeRows() {
     const workspace = VCS.workspace || {};
     const state = workspace.state || {};
     const refs = state.draft_refs && typeof state.draft_refs === 'object' ? state.draft_refs : {};
     const persistedIds = new Set(Object.keys(refs).map(id => 'draft-' + id));
     const runtimeScopes = VCS.unsaved && typeof VCS.unsaved.scopes === 'function'
       ? VCS.unsaved.scopes().filter(scope => !persistedIds.has(scope)) : [];
-    const rows = runtimeScopes.map(scope => ({
-      id: '', label: resumeScopeLabel(scope), route: '#/environment/settings',
-      projectId: '', updated: '', status: 'current',
-    }));
+    const rows = runtimeScopes.map(scope => {
+      const route = runtimeResumeRoute(scope, workspace);
+      return {
+        id: '', label: resumeScopeLabel(scope), route,
+        projectId: '', updated: '', status: 'current',
+        available: resumeRouteAvailable(route, '', workspace),
+      };
+    });
     Object.entries(refs).forEach(([id, ref]) => {
       if (!ref || ref.dirty !== true) return;
-      const route = String(ref.route || '');
+      const route = resumeRoute(id, ref, workspace);
       const reportDraft = /^report-/.test(id) || route.includes('/publish/');
+      const specialDraft = id === PROJECT_IMPORT_DRAFT_ID || id === CLUSTER_PROFILE_DRAFT_ID;
+      const projectId = specialDraft ? '' : String(ref.project_id || '');
+      const available = localDraftAvailable(id, workspace) &&
+        resumeRouteAvailable(route, projectId, workspace);
       rows.push({
-        id, label: reportDraft
-          ? tr('dashboard.resume.report_draft', '报告配置草稿')
-          : tr('dashboard.resume.workflow_draft', '工作流草稿'),
-        route, projectId: String(ref.project_id || ''), updated: Number(ref.updated_at_ms || 0),
-        status: String(ref.status || 'unverified_draft'),
+        id,
+        label: id === PROJECT_IMPORT_DRAFT_ID
+          ? tr('dashboard.resume.project_import', '项目导入流程草稿')
+          : id === CLUSTER_PROFILE_DRAFT_ID
+            ? tr('dashboard.resume.cluster_profile', '集群配置草稿')
+            : reportDraft
+              ? tr('dashboard.resume.report_draft', '报告配置草稿')
+              : tr('dashboard.resume.workflow_draft', '工作流草稿'),
+        route, projectId, updated: Number(ref.updated_at_ms || 0),
+        status: available ? 'current' : 'unavailable', available,
       });
     });
+    return rows;
+  }
+
+  function renderResumeCenter() {
+    const box = $('db-resume'); if (!box) return;
+    const workspace = VCS.workspace || {};
+    const rows = collectResumeRows();
     if (!rows.length) {
       box.innerHTML = `<div class="db-empty">${VCS.esc(tr(
         'dashboard.resume.empty', '没有待恢复内容；显式保存的设置和已发布报告均已落盘。'))}</div>`;
@@ -556,15 +622,22 @@
     box.innerHTML = rows.sort((a, b) => Number(b.updated) - Number(a.updated)).map(row => {
       const project = row.projectId && workspace.projects
         ? workspace.projects.find(item => item.id === row.projectId) : null;
+      const status = row.status === 'current'
+        ? tr('dashboard.resume.current', '当前设备可继续')
+        : tr('dashboard.resume.unavailable', '当前设备不可用');
       const context = [project && project.name, row.updated
-        ? new Date(row.updated).toLocaleString() : '', row.status].filter(Boolean).join(' · ');
+        ? new Date(row.updated).toLocaleString() : '', status].filter(Boolean).join(' · ');
+      const action = row.available
+        ? `data-resume-route="${VCS.esc(row.route)}" data-resume-project="${VCS.esc(row.projectId)}"`
+        : `disabled aria-disabled="true" title="${VCS.esc(tr('dashboard.resume.local_only',
+          '草稿正文只保存在创建它的设备；请回到原设备继续。'))}"`;
       return '<div class="db-row db-resume-row">' +
         `<span><b>${VCS.esc(row.label)}</b><small>${VCS.esc(context || tr(
           'dashboard.resume.current_session', '当前会话'))}</small></span>` +
         '<span class="sp"></span>' +
-        `<button class="btn quiet" data-resume-route="${VCS.esc(row.route)}" ` +
-        `data-resume-project="${VCS.esc(row.projectId)}">${VCS.esc(tr(
-          'dashboard.resume.open', '继续处理'))}</button></div>`;
+        `<button class="btn quiet" ${action}>${VCS.esc(row.available
+          ? tr('dashboard.resume.open', '继续处理')
+          : tr('dashboard.resume.not_here', '仅原设备可继续'))}</button></div>`;
     }).join('');
   }
 
@@ -692,6 +765,7 @@
   if (window.__VCS_TEST__) {
     window.Dashboard.__test = {
       summarizeProjectPortfolio, portfolioStateMarkup, renderPipeline, navigatePortfolio,
+      collectResumeRows, renderResumeCenter, resumeScopeLabel,
     };
   }
 })();

@@ -110,6 +110,9 @@ assert.ok(hooks, 'test seam was not exposed');
   assert.match(elements['jobs-selection-summary'].textContent, /2 selected; 1 hidden/);
   assert.match(elements['jobs-selection-list'].innerHTML, />A</);
   assert.match(elements['jobs-selection-list'].innerHTML, />B</);
+  const targets = hooks.operationTargetText(['/a', '/b']);
+  assert.match(targets, /1\. A \| Project: P \| Status: CREATED \| Cluster: c1/);
+  assert.match(targets, /2\. B \| Project: P \| Status: DONE \| Cluster: c2/);
 
   // The mutex is acquired before the async confirmation/work callback can settle.
   install('jobs-operation-queue'); install('jobs-operation-active'); install('jobs-operation-history');

@@ -594,11 +594,32 @@ def _probe_molecule_and_document_modules() -> dict:
     if not reportlab_bytes.getvalue().startswith(b'%PDF'):
         raise RuntimeError('ReportLab failed to produce a PDF')
 
+    openpyxl = importlib.import_module('openpyxl')
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet['A1'] = 'VASP Catalyst Studio healthcheck'
+    xlsx_bytes = BytesIO()
+    workbook.save(xlsx_bytes)
+    workbook.close()
+    if not xlsx_bytes.getvalue().startswith(b'PK'):
+        raise RuntimeError('openpyxl failed to produce an OOXML package')
+    loaded_workbook = openpyxl.load_workbook(
+        BytesIO(xlsx_bytes.getvalue()),
+        read_only=True,
+        data_only=True,
+    )
+    try:
+        if loaded_workbook.active['A1'].value != 'VASP Catalyst Studio healthcheck':
+            raise RuntimeError('openpyxl failed to round-trip a workbook cell')
+    finally:
+        loaded_workbook.close()
+
     return {
         'rdkit': _module_version(rdkit),
         'docx': _module_version(docx),
         'pypdf': _module_version(pypdf),
         'reportlab': _module_version(reportlab),
+        'openpyxl': _module_version(openpyxl),
     }
 
 

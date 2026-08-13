@@ -15,7 +15,9 @@ import hashlib
 import inspect
 import json
 import math
+import ntpath
 import os
+import posixpath
 import re
 import sys
 import tempfile
@@ -23,6 +25,7 @@ import threading
 import time
 import types
 import uuid
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, fields as dc_fields
 from datetime import datetime, timezone
@@ -258,7 +261,8 @@ class Api:
                  comparison_mod=None, candidate_evaluation_mod=None,
                  paper_report_mod=None, workspace_state_store=None,
                  report_service=None, analysis_preferences_store=None,
-                 project_lifecycle_service=None, lab_policy_store=None):
+                 project_lifecycle_service=None, lab_policy_store=None,
+                 workspace_context_store=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -378,6 +382,10 @@ class Api:
         # Phase B 可恢复工作区状态只保存 UI 偏好/草稿引用，与 project.yaml 科学事实分离。
         # 测试可注入内存/临时目录 store；生产首次调用时再创建用户级 JSON store。
         self._workspace_state_store = workspace_state_store
+        # Workflow/engine/calculation form one revisioned server-owned
+        # context.  The store remains lazy so unrelated API tests and startup
+        # paths do not touch user configuration.
+        self._workspace_context_store = workspace_context_store
         # Phase D reusable analysis templates/favourites are user-level state,
         # never project.yaml fields.  Keep the store lazy for normal job paths.
         self._analysis_preferences_store = analysis_preferences_store
@@ -921,6 +929,7 @@ class Api:
         return {
             'ok': False,
             'schema': cls._WORKSPACE_CONTEXT_SCHEMA,
+            'authority_id': None,
             'state_revision': None,
             'selection': None,
             'workspace_intent': {'scenario': None, 'engine': None,
@@ -941,76 +950,106 @@ class Api:
             'error': cls._workspace_public_text(error),
         }
 
-    def workspace_preferences_update(self, patch, expected_revision):
+    def workspace_preferences_update(self, patch, expected_revision,
+                                     expected_authority_id=None):
         """Atomically update UI-only workspace preferences with revision CAS."""
         try:
-            result = self._ws().update(patch, expected_revision)
+            if not isinstance(expected_authority_id, str) \
+                    or not re.fullmatch(r'[a-f0-9]{32}', expected_authority_id):
+                raise ValueError(
+                    'expected_authority_id is required for workspace-state CAS')
+            result = self._ws().update(
+                patch, expected_revision, expected_authority_id)
             return {
                 'ok': bool(result.get('ok')),
                 'conflict': bool(result.get('conflict')),
+                'authority_id': result.get('authority_id'),
                 'state_revision': result.get('state_revision'),
                 'preferences': result.get('preferences'),
                 'error': self._workspace_public_text(result.get('error')) or None,
             }
         except Exception as e:                            # noqa: BLE001 JSON-safe bridge envelope
-            return {'ok': False, 'conflict': False, 'state_revision': None,
+            return {'ok': False, 'conflict': False, 'authority_id': None,
+                    'state_revision': None,
                     'preferences': None,
                     'error': self._workspace_public_text(e)}
 
     def _workspace_intent(self, degraded):
-        scenario_view = None
-        engine_view = None
-        calculation_view = None
-        try:
-            result = self.scenario_get()
-            if result.get('ok') and isinstance(result.get('scenario'), dict):
-                scenario = result['scenario']
+        # Embedders historically override these three narrow accessors on an
+        # Api instance.  Preserve that explicit adapter seam; the production
+        # class path below always reads one atomic settings-context snapshot.
+        legacy_names = ('scenario_get', 'engine_get', 'calculation_get')
+        if all(callable(self.__dict__.get(name)) for name in legacy_names):
+            try:
+                scenario_result = self.scenario_get()
+                engine_result = self.engine_get()
+                calculation_result = self.calculation_get()
+                scenario = scenario_result.get('scenario') or {}
                 scenario_view = {
-                    'key': scenario.get('key'),
-                    'name': scenario.get('name'),
-                    'configured': bool(result.get('configured')),
-                    'source': 'config.ui.scenario',
+                    'key': scenario.get('key'), 'name': scenario.get('name'),
+                    'configured': bool(scenario_result.get('configured')),
+                    'source': 'legacy.context.adapter',
                 }
-            else:
-                degraded.append({'kind': 'scenario_unavailable',
-                                 'message': self._workspace_public_text(result.get('error'))})
-        except Exception as e:                            # noqa: BLE001 partial context remains usable
-            degraded.append({'kind': 'scenario_unavailable',
-                             'message': self._workspace_public_text(e)})
-        try:
-            result = self.engine_get()
-            if result.get('ok'):
                 engine_view = {
-                    'key': result.get('engine'),
-                    'configured': bool(result.get('configured')),
-                    'allowed': bool(result.get('engine')),
-                    'capability': result.get('capability') or {},
-                    'source': 'config.ui.active_engine',
+                    'key': engine_result.get('engine'),
+                    'configured': bool(engine_result.get('configured')),
+                    'allowed': bool(engine_result.get('engine')),
+                    'capability': engine_result.get('capability') or {},
+                    'source': 'legacy.context.adapter',
                 }
-            else:
-                degraded.append({'kind': 'engine_unavailable',
-                                 'message': self._workspace_public_text(result.get('error'))})
-        except Exception as e:                            # noqa: BLE001
-            degraded.append({'kind': 'engine_unavailable',
-                             'message': self._workspace_public_text(e)})
-        try:
-            result = self.calculation_get()
-            if result.get('ok'):
-                key = result.get('active_calculation') or None
+                key = calculation_result.get('active_calculation') or None
                 calculation_view = {
                     'key': key,
-                    'configured': bool(result.get('configured')),
-                    'allowed': bool(key and key in (result.get('allowed') or [])),
-                    'allowed_keys': list(result.get('allowed') or []),
-                    'engine': result.get('engine') or None,
-                    'source': 'config.ui.active_calculation',
+                    'configured': bool(calculation_result.get('configured')),
+                    'allowed': bool(key and key in (calculation_result.get('allowed') or [])),
+                    'allowed_keys': list(calculation_result.get('allowed') or []),
+                    'engine': calculation_result.get('engine') or None,
+                    'source': 'legacy.context.adapter',
                 }
-            else:
-                degraded.append({'kind': 'calculation_unavailable',
-                                 'message': self._workspace_public_text(result.get('error'))})
-        except Exception as e:                            # noqa: BLE001
-            degraded.append({'kind': 'calculation_unavailable',
-                             'message': self._workspace_public_text(e)})
+                return {'scenario': scenario_view, 'engine': engine_view,
+                        'calculation': calculation_view}
+            except Exception as e:                       # noqa: BLE001 compatibility adapter
+                degraded.append({'kind': 'workspace_intent_unavailable',
+                                 'message': self._workspace_public_text(e)})
+        try:
+            result = self.settings_context_get()
+            context = result.get('context') if result.get('ok') else None
+            if not isinstance(context, dict):
+                raise RuntimeError(result.get('error') or 'workspace context unavailable')
+            scenario = context.get('scenario') or {}
+            configured = context.get('configured') or {}
+            scenario_view = {
+                'key': scenario.get('key'),
+                'name': scenario.get('name'),
+                'configured': bool(configured.get('scenario')),
+                'source': 'settings_context.authority',
+            }
+            engine_view = {
+                'key': context.get('engine'),
+                'configured': bool(configured.get('engine')),
+                'allowed': bool(context.get('engine')),
+                'capability': context.get('capability') or {},
+                'source': 'settings_context.authority',
+            }
+            key = context.get('calculation') or None
+            calculation_view = {
+                'key': key,
+                'configured': bool(configured.get('calculation')),
+                'allowed': bool(key and key in (context.get('allowed') or [])),
+                'allowed_keys': list(context.get('allowed') or []),
+                'engine': context.get('engine') or None,
+                'source': 'settings_context.authority',
+            }
+        except Exception as e:                            # noqa: BLE001 partial context remains usable
+            message = self._workspace_public_text(e)
+            degraded.extend([
+                {'kind': 'scenario_unavailable', 'message': message},
+                {'kind': 'engine_unavailable', 'message': message},
+                {'kind': 'calculation_unavailable', 'message': message},
+            ])
+            scenario_view = None
+            engine_view = None
+            calculation_view = None
         return {'scenario': scenario_view, 'engine': engine_view,
                 'calculation': calculation_view}
 
@@ -1327,6 +1366,7 @@ class Api:
         return {
             'ok': True,
             'schema': self._WORKSPACE_CONTEXT_SCHEMA,
+            'authority_id': state.get('authority_id'),
             'state_revision': state.get('revision'),
             'selection': selection,
             'workspace_intent': intent,
@@ -1473,6 +1513,13 @@ class Api:
             from vcstudio.gui_web.workspace_state import WorkspaceStateStore
             self._workspace_state_store = WorkspaceStateStore()
         return self._workspace_state_store
+
+    def _workspace_context(self):
+        """Atomic/CAS authority for scenario, engine, and calculation."""
+        if self._workspace_context_store is None:
+            from vcstudio.gui_web.workspace_context import WorkspaceContextStore
+            self._workspace_context_store = WorkspaceContextStore(self._config)
+        return self._workspace_context_store
 
     def _fb(self):
         """频率作业生成端(F14)延迟加载。"""
@@ -2401,6 +2448,24 @@ class Api:
         return hashlib.sha256(raw).hexdigest()
 
     @staticmethod
+    def _job_batch_with_idempotency(function, *args, idempotency_key=None, **kwargs):
+        """Pass an operation id exactly once when an injected adapter supports it."""
+        try:
+            parameters = inspect.signature(function).parameters.values()
+        except (TypeError, ValueError):
+            parameters = ()
+        supports_key = any(
+            parameter.name == 'idempotency_key'
+            or parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        if supports_key:
+            call_kwargs = dict(kwargs)
+            call_kwargs['idempotency_key'] = idempotency_key
+            return function(*args, **call_kwargs)
+        return function(*args, **kwargs)
+
+    @staticmethod
     def _submit_batch_with_idempotency(submit_batch, profile, password, dirs,
                                        trust_new, idempotency_key):
         """Pass the durable operation id while retaining old injected adapters.
@@ -2410,20 +2475,9 @@ class Api:
         argument callable, so signature inspection avoids a retry-on-TypeError
         pattern that could itself duplicate a remote mutation.
         """
-        try:
-            parameters = inspect.signature(submit_batch).parameters.values()
-        except (TypeError, ValueError):
-            parameters = ()
-        supports_key = any(
-            parameter.name == 'idempotency_key'
-            or parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters
-        )
-        if supports_key:
-            return submit_batch(
-                profile, password, list(dirs), trust_new,
-                idempotency_key=idempotency_key)
-        return submit_batch(profile, password, list(dirs), trust_new)
+        return Api._job_batch_with_idempotency(
+            submit_batch, profile, password, list(dirs), trust_new,
+            idempotency_key=idempotency_key)
 
     def _run_job_operation_once(self, idempotency_key, *, action, profile, dirs, invoke):
         """Run one mutating remote batch exactly once per client operation key.
@@ -2529,8 +2583,10 @@ class Api:
         return self._delegate(name, password,
                               lambda prof, pw: self._run_job_operation_once(
                                   idempotency_key, action='continue', profile=prof.name,
-                                  dirs=dirs, invoke=lambda: self._bo().continue_batch(
-                                      prof, pw, list(dirs), trust_new)))
+                                  dirs=dirs, invoke=lambda: self._job_batch_with_idempotency(
+                                      self._bo().continue_batch,
+                                      prof, pw, list(dirs), trust_new,
+                                      idempotency_key=idempotency_key)))
 
     def refresh_status(self, name, password, trust_new=False):
         """Refresh one profile without racing the background supervisor."""
@@ -5508,21 +5564,111 @@ class Api:
         return blocks
 
     @staticmethod
-    def _portable_member_id(job_dir, project_root, index, manifest=None):
-        """Return a stable logical member id without assuming one Windows drive."""
+    def _portable_locator_parts(value):
+        """Parse a locator lexically, independent from this process's host OS.
+
+        Report contracts may be replayed or validated on a host other than the
+        one which first wrote their private locators.  ``os.path`` therefore
+        cannot decide whether a value is Windows, UNC, or POSIX: on Linux, for
+        example, ``D:\\jobs\\config`` is one ordinary filename.  This helper
+        intentionally does no expansion, realpath lookup, or filesystem access.
+        It merely normalizes explicit separators and returns an anchor plus the
+        path components below it.
+        """
+        raw = str(value or '').strip()
+        if not raw:
+            return '', '', ()
+
+        # A drive prefix, a backslash-rooted locator, and //host/share all use
+        # Windows rules even if the current process is running on POSIX.
+        windows_style = bool(re.match(r'^[A-Za-z]:', raw)) or raw.startswith(
+            ('\\\\', '\\', '//'))
+        if windows_style:
+            normalized = ntpath.normpath(raw.replace('/', '\\'))
+            drive, tail = ntpath.splitdrive(normalized)
+            if drive.startswith(('\\\\', '//')):
+                unc_drive = drive.replace('/', '\\').casefold()
+                anchor = f'unc:{unc_drive}'
+            elif drive:
+                anchor = f'drive:{drive.casefold()}'
+            elif ntpath.isabs(normalized):
+                # A locator rooted on the current Windows drive has no public
+                # drive letter, but remains a distinct lexical namespace.
+                anchor = 'windows-root'
+            else:
+                anchor = ''
+            parts = tuple(
+                part for part in tail.replace('\\', '/').split('/')
+                if part and part != '.')
+            return 'windows', anchor, parts
+
+        normalized = posixpath.normpath(raw.replace('\\', '/'))
+        anchor = 'posix-root' if normalized.startswith('/') else ''
+        parts = tuple(
+            part for part in normalized.split('/') if part and part != '.')
+        return 'posix', anchor, parts
+
+    @classmethod
+    def _portable_relative_locator(cls, job_dir, project_root):
+        """Return a safe lexical member-relative locator, or ``None``.
+
+        Relative output is allowed only where both locators have the same
+        lexical namespace and the member is demonstrably below the project
+        root.  Different drives, UNC shares, absolute-vs-relative locators,
+        and sibling paths deliberately fall back to a basename-plus-index ID.
+        """
+        job_style, job_anchor, job_parts = cls._portable_locator_parts(job_dir)
+        root_style, root_anchor, root_parts = cls._portable_locator_parts(
+            project_root)
+        if (not job_parts or job_style != root_style
+                or job_anchor != root_anchor or len(job_parts) <= len(root_parts)):
+            return None
+
+        # Windows paths are case-insensitive regardless of the CI host.  POSIX
+        # paths remain case-sensitive so two scientific member names are not
+        # silently collapsed merely because tests execute on Windows.
+        if job_style == 'windows':
+            same_root = tuple(part.casefold() for part in job_parts[:len(root_parts)]) == (
+                tuple(part.casefold() for part in root_parts))
+        else:
+            same_root = job_parts[:len(root_parts)] == root_parts
+        if not same_root:
+            return None
+
+        relative_parts = job_parts[len(root_parts):]
+        if not relative_parts or any(part == '..' for part in relative_parts):
+            return None
+        if job_style == 'windows':
+            relative_parts = tuple(part.casefold() for part in relative_parts)
+        return '/'.join(relative_parts)
+
+    @classmethod
+    def _portable_member_id(cls, job_dir, project_root, index, manifest=None):
+        """Return a path-free logical member ID for report contracts.
+
+        Stable opaque manifest identities take precedence.  Without one, use a
+        lexical relative locator only when it is safe across Windows, POSIX, and
+        UNC syntax; otherwise use a basename plus the caller's deterministic
+        member index.  Neither branch resolves a browser-facing locator.
+        """
         manifest = manifest if isinstance(manifest, dict) else {}
         job_uuid = str(manifest.get('job_uuid') or '').strip()
-        if job_uuid:
+        if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', job_uuid):
             return job_uuid
-        absolute = os.path.abspath(os.path.normpath(str(job_dir)))
-        try:
-            relative = os.path.relpath(absolute, project_root).replace('\\', '/')
-        except ValueError:
-            relative = ''
-        if not relative or relative == '..' or relative.startswith('../'):
-            base = os.path.basename(absolute) or 'member'
-            relative = f'{base}:{index}'
-        return relative
+
+        relative = cls._portable_relative_locator(job_dir, project_root)
+        if relative:
+            return relative
+
+        style, _anchor, parts = cls._portable_locator_parts(job_dir)
+        base = parts[-1] if parts else 'member'
+        if style == 'windows':
+            base = base.casefold()
+        # A bare drive name is an absolute-locator fragment, not a useful
+        # logical basename.  Avoid ever returning it as a public member ID.
+        if re.fullmatch(r'[A-Za-z]:', base):
+            base = 'member'
+        return f'{base}:{index}'
 
     @staticmethod
     def _semantic_without_locators(value):
@@ -7974,7 +8120,7 @@ class Api:
                 desired_report_kind=None, report_reason='', files={})
         result = self._call_with_project_bindings(
             [record],
-            lambda: self._proj_report_status_for_path(record['path']),
+            lambda: self._reports().status(record['path']),
             failure={
                 'schema': 'vcstudio.report-status/v1', 'project_id': None,
                 'artifact_status': 'missing', 'artifact_current': False,
@@ -10056,6 +10202,33 @@ class Api:
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'result': None, 'error': str(e)}
 
+    def ai_chat_outbound_preview(self, session_id, text, attachment_ids=None):
+        """Read-only disclosure of the exact chat payload before external send."""
+        try:
+            message = str(text or '').strip()
+            if not message:
+                return {'ok': False, 'preview': None, 'error': '消息不能为空'}
+            command = message.partition(' ')[0].casefold()
+            if command.startswith('/'):
+                return {
+                    'ok': False, 'preview': None,
+                    'error': '本地命令不会发送到外部模型，不需要外部数据预览',
+                }
+            cfg = self._config.load_config()
+            llm = cfg.get('llm') if isinstance(cfg, dict) else {}
+            if not isinstance(llm, dict) or not llm.get('allow_external'):
+                return {
+                    'ok': False, 'preview': None,
+                    'error': '联网对话未开启；当前不会向外部模型发送数据',
+                }
+            preview = self._chat().outbound_preview(
+                str(session_id or ''), message,
+                attachment_ids=list(attachment_ids or []),
+            )
+            return {'ok': True, 'preview': preview, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'preview': None, 'error': str(e)}
+
     def ai_chat_stop(self, session_id):
         try:
             result = self._chat().stop(str(session_id or ''))
@@ -10301,6 +10474,17 @@ class Api:
                 key_saved = False
             preset = llm.get('prompt_preset')
             is_default = not (isinstance(preset, str) and preset.strip())
+            context_result = self.settings_context_get()
+            context = (context_result.get('context')
+                       if context_result.get('ok') else None)
+            ui_view = self._ui_defaults(ui)
+            if isinstance(context, dict):
+                scenario = context.get('scenario') or {}
+                ui_view.update({
+                    'scenario': str(scenario.get('key') or ''),
+                    'active_engine': str(context.get('engine') or ''),
+                    'active_calculation': str(context.get('calculation') or ''),
+                })
             return {
                 'ok': True, 'error': None,
                 'llm': {'base_url': llm.get('base_url', '') or '',
@@ -10312,7 +10496,8 @@ class Api:
                 'paths': {'potcar_lib_root': cfg.get('potcar_lib_root', '') or '',
                           'lis_molecules_dir': cfg.get('lis_molecules_dir', '') or '',
                           'ideal_window': list(iw) if isinstance(iw, (list, tuple)) else []},
-                'ui': self._ui_defaults(ui),
+                'ui': ui_view,
+                'workspace_context': context,
                 'figures': {  # 出图偏好(期刊风格 / 自动出图 / 多面板)
                     'journal_style': (str(ui.get('journal_style') or 'nature').lower()
                                       if str(ui.get('journal_style') or 'nature').lower()
@@ -12920,80 +13105,223 @@ class Api:
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'scenarios': [], 'error': str(e)}
 
-    def scenario_get(self):
-        """当前生效场景 + 是否已显式配置(config 无 ui.scenario → configured=False,首启弹模态)。"""
-        try:
-            try:
-                cfg = self._config.load_config()
-            except Exception:                             # noqa: BLE001
-                cfg = {}
-            ui = self._config.get_ui_state(cfg)
-            configured = bool(isinstance(ui, dict) and ui.get('scenario'))
-            sc = self._scenarios.active_scenario(cfg)
-            return {'ok': True, 'configured': configured,
-                    'scenario': self._scenario_view(sc), 'error': None}
-        except Exception as e:                            # noqa: BLE001
-            return {'ok': False, 'configured': False, 'scenario': None, 'error': str(e)}
+    def _workspace_context_projection(self, snapshot):
+        """Validate one stored tuple and return its canonical public projection."""
+        rows = list(self._scenarios.list_scenarios())
+        registry = {str(row.get('key') or ''): row for row in rows if row.get('key')}
+        if not registry:
+            raise RuntimeError('没有可用的工作模式')
+        default_scenario = 'full' if 'full' in registry else next(iter(registry))
+        requested_scenario = str(snapshot.get('scenario') or '').strip()
+        scenario_key = (requested_scenario if requested_scenario in registry
+                        else default_scenario)
+        scenario = registry[scenario_key]
 
-    def scenario_set(self, key):
-        """切换研究场景(写 config ui.scenario)→ 返回新场景视图供前端即时 applyScenario。"""
+        registered = [self._normalize_engine_key(value)
+                      for value in self._eng().available_engines()]
+        registered = [value for value in registered if value]
+        visible = [self._normalize_engine_key(value)
+                   for value in (scenario.get('engines') or [])]
+        allowed_engines = [value for value in registered if value in visible]
+        if not allowed_engines:
+            raise RuntimeError(f'工作模式「{scenario.get("name", scenario_key)}」没有可用引擎')
+        default_engine = self._normalize_engine_key(
+            (scenario.get('defaults') or {}).get('engine'))
+        if default_engine not in allowed_engines:
+            default_engine = ('vasp' if 'vasp' in allowed_engines else allowed_engines[0])
+        requested_engine = self._normalize_engine_key(snapshot.get('engine'))
+        engine = requested_engine if requested_engine in allowed_engines else default_engine
+
+        allowed = self._engine_task_keys(engine, scenario)
+        if not allowed:
+            raise RuntimeError(
+                f'工作模式「{scenario.get("name", scenario_key)}」与引擎 '
+                f'{self._ENGINE_DISPLAY.get(engine, engine)} 没有共同计算类型')
+        default_calculation = str(
+            (scenario.get('defaults') or {}).get('active_calculation') or '')
+        if default_calculation not in allowed:
+            default_calculation = allowed[0]
+        requested_calculation = str(snapshot.get('calculation') or '').strip()
+        calculation = (requested_calculation if requested_calculation in allowed
+                       else default_calculation)
+        configured = {
+            'scenario': bool(requested_scenario and requested_scenario == scenario_key),
+            'engine': bool(requested_engine and requested_engine == engine),
+            'calculation': bool(
+                requested_calculation and requested_calculation == calculation),
+        }
+        return {
+            'revision': int(snapshot.get('revision') or 0),
+            'intent_id': snapshot.get('last_intent_id') or None,
+            'scenario': self._scenario_view(scenario),
+            'engine': engine,
+            'calculation': calculation,
+            'capability': self._engine_capability_view(engine, scenario),
+            'allowed': list(allowed),
+            'configured': configured,
+        }
+
+    def _workspace_context_envelope(self, store_result):
+        snapshot = store_result.get('context') or {}
+        context = self._workspace_context_projection(snapshot)
+        return {
+            'ok': bool(store_result.get('ok')),
+            'conflict': bool(store_result.get('conflict')),
+            'replayed': bool(store_result.get('replayed')),
+            'revision': context['revision'],
+            'context': context,
+            'error': store_result.get('error'),
+        }
+
+    def settings_context_get(self):
+        """Return the single authoritative workflow/engine/calculation snapshot."""
         try:
-            k = (key or '').strip()
-            known = {str(s.get('key')) for s in self._scenarios.list_scenarios()}
-            if k not in known:
-                return {'ok': False, 'scenario': None,
-                        'error': f'未知工作模式 {k!r}；可选：{", ".join(sorted(known))}'}
-            self._scenarios.set_scenario(k)
-            sc = self._scenarios.get_scenario(k)
-            return {'ok': True, 'key': sc.get('key'),
-                    'scenario': self._scenario_view(sc), 'error': None}
-        except Exception as e:                            # noqa: BLE001
-            return {'ok': False, 'scenario': None, 'error': str(e)}
+            snapshot = self._workspace_context().read()
+            return self._workspace_context_envelope({
+                'ok': True, 'conflict': False, 'replayed': False,
+                'context': snapshot, 'error': None,
+            })
+        except Exception as e:                            # noqa: BLE001 JSON-safe bridge envelope
+            return {'ok': False, 'conflict': False, 'replayed': False,
+                    'revision': None, 'context': None, 'error': str(e)}
+
+    def settings_context_update(self, patch, expected_revision, intent_id):
+        """CAS-update any subset while committing one fully validated tuple."""
+        try:
+            if not isinstance(patch, dict) or not patch \
+                    or not set(patch).issubset({'scenario', 'engine', 'calculation'}):
+                raise ValueError(
+                    'patch must contain scenario, engine, and/or calculation only')
+            if (not isinstance(expected_revision, int)
+                    or isinstance(expected_revision, bool) or expected_revision < 0):
+                raise ValueError('expected_revision 必须是非负整数')
+            current_snapshot = self._workspace_context().read()
+            current = self._workspace_context_projection(current_snapshot)
+
+            scenario_key = current['scenario']['key']
+            requested_scenario = patch.get('scenario')
+            if requested_scenario is not None:
+                if not isinstance(requested_scenario, str):
+                    raise ValueError('scenario 必须是字符串')
+                scenario_key = requested_scenario.strip()
+            registry = {
+                str(row.get('key') or ''): row
+                for row in self._scenarios.list_scenarios() if row.get('key')
+            }
+            if scenario_key not in registry:
+                raise ValueError(
+                    f'未知工作模式 {scenario_key!r}；可选：{", ".join(sorted(registry))}')
+            scenario = registry[scenario_key]
+            scenario_changed = scenario_key != current['scenario']['key']
+
+            registered = [self._normalize_engine_key(value)
+                          for value in self._eng().available_engines()]
+            visible = [self._normalize_engine_key(value)
+                       for value in (scenario.get('engines') or [])]
+            allowed_engines = [value for value in registered if value and value in visible]
+            if not allowed_engines:
+                raise ValueError(f'工作模式「{scenario.get("name", scenario_key)}」没有可用引擎')
+            if 'engine' in patch:
+                if not isinstance(patch['engine'], str):
+                    raise ValueError('engine 必须是字符串')
+                engine = self._normalize_engine_key(patch['engine'])
+            elif scenario_changed:
+                engine = self._normalize_engine_key(
+                    (scenario.get('defaults') or {}).get('engine'))
+            else:
+                engine = current['engine']
+            if engine not in allowed_engines:
+                if 'engine' in patch:
+                    raise ValueError(
+                        f'计算引擎 {engine!r} 未注册或不适用于工作模式'
+                        f'「{scenario.get("name", scenario_key)}」')
+                engine = ('vasp' if 'vasp' in allowed_engines else allowed_engines[0])
+
+            allowed = self._engine_task_keys(engine, scenario)
+            if not allowed:
+                raise ValueError('当前工作模式与引擎没有共同计算类型')
+            if 'calculation' in patch:
+                if not isinstance(patch['calculation'], str):
+                    raise ValueError('calculation 必须是字符串')
+                calculation = patch['calculation'].strip()
+            elif scenario_changed:
+                calculation = str(
+                    (scenario.get('defaults') or {}).get('active_calculation') or '')
+            else:
+                calculation = current['calculation']
+            if calculation not in allowed:
+                if 'calculation' in patch:
+                    raise ValueError(
+                        f'计算类型 {calculation!r} 不适用于「{scenario.get("name", "")} / '
+                        f'{self._ENGINE_DISPLAY.get(engine, engine)}」')
+                preferred = str(
+                    (scenario.get('defaults') or {}).get('active_calculation') or '')
+                calculation = preferred if preferred in allowed else allowed[0]
+
+            stored = self._workspace_context().compare_and_swap(
+                {'scenario': scenario_key, 'engine': engine,
+                 'calculation': calculation},
+                expected_revision=expected_revision, intent_id=intent_id)
+            return self._workspace_context_envelope(stored)
+        except Exception as e:                            # noqa: BLE001 JSON-safe bridge envelope
+            authoritative = self.settings_context_get()
+            return {
+                'ok': False, 'conflict': False, 'replayed': False,
+                'revision': authoritative.get('revision'),
+                'context': authoritative.get('context'), 'error': str(e),
+            }
+
+    def _legacy_workspace_context_update(self, patch, expected_revision=None,
+                                         intent_id=None):
+        """Compatibility seam; production browser code uses context_update."""
+        if expected_revision is None:
+            current = self.settings_context_get()
+            if not current.get('ok'):
+                return current
+            expected_revision = current['revision']
+        token = intent_id or f'legacy:{uuid.uuid4().hex}'
+        return self.settings_context_update(patch, expected_revision, token)
+
+    def scenario_get(self):
+        result = self.settings_context_get()
+        context = result.get('context') or {}
+        configured = context.get('configured') or {}
+        return {
+            **result,
+            'configured': bool(configured.get('scenario')),
+            'scenario': context.get('scenario'),
+        }
+
+    def scenario_set(self, key, expected_revision=None, intent_id=None):
+        result = self._legacy_workspace_context_update(
+            {'scenario': key}, expected_revision, intent_id)
+        context = result.get('context') or {}
+        scenario = context.get('scenario')
+        return {**result, 'key': scenario.get('key') if scenario else None,
+                'scenario': scenario}
 
     def calculation_get(self):
-        """当前“本次计算类型”。同时受工作模式与当前引擎能力白名单约束。"""
-        try:
-            cfg = self._config.load_config()
-            ui = self._config.get_ui_state(cfg)
-            sc = self._scenarios.active_scenario(cfg)
-            registered = [self._normalize_engine_key(e)
-                          for e in self._eng().available_engines()]
-            engine = self._active_engine(sc, ui, registered)
-            allowed = self._engine_task_keys(engine, sc)
-            requested = str((ui or {}).get('active_calculation') or '')
-            default = str((sc.get('defaults') or {}).get('active_calculation') or '')
-            active = requested if requested in allowed else default
-            if active not in allowed:
-                active = allowed[0] if allowed else ''
-            return {'ok': True, 'configured': requested in allowed,
-                    'engine': engine, 'active_calculation': active,
-                    'allowed': allowed, 'error': None}
-        except Exception as e:                            # noqa: BLE001
-            return {'ok': False, 'configured': False, 'active_calculation': '',
-                    'engine': 'vasp', 'allowed': [], 'error': str(e)}
+        result = self.settings_context_get()
+        context = result.get('context') or {}
+        configured = context.get('configured') or {}
+        return {
+            **result,
+            'configured': bool(configured.get('calculation')),
+            'engine': context.get('engine'),
+            'active_calculation': context.get('calculation') or '',
+            'allowed': list(context.get('allowed') or []),
+        }
 
-    def calculation_set(self, key):
-        """保存本次计算类型；必须同时属于当前工作模式与当前引擎能力白名单。"""
-        try:
-            k = str(key or '').strip()
-            cfg = self._config.load_config()
-            ui = self._config.get_ui_state(cfg)
-            sc = self._scenarios.active_scenario(cfg)
-            registered = [self._normalize_engine_key(e)
-                          for e in self._eng().available_engines()]
-            engine = self._active_engine(sc, ui, registered)
-            allowed = self._engine_task_keys(engine, sc)
-            if k not in allowed:
-                return {'ok': False, 'active_calculation': None,
-                        'engine': engine,
-                        'error': (f'计算类型 {k!r} 不适用于「{sc.get("name", "")} / '
-                                  f'{self._ENGINE_DISPLAY.get(engine, engine)}」')}
-            self._config.set_ui_state(active_calculation=k)
-            return {'ok': True, 'engine': engine,
-                    'active_calculation': k, 'error': None}
-        except Exception as e:                            # noqa: BLE001
-            return {'ok': False, 'engine': None,
-                    'active_calculation': None, 'error': str(e)}
+    def calculation_set(self, key, expected_revision=None, intent_id=None):
+        result = self._legacy_workspace_context_update(
+            {'calculation': key}, expected_revision, intent_id)
+        context = result.get('context') or {}
+        return {
+            **result,
+            'engine': context.get('engine'),
+            'active_calculation': context.get('calculation'),
+            'allowed': list(context.get('allowed') or []),
+        }
 
     # ── 界面语言(i18n:zh 基准 + en 回落) ──────────────────────────────────────
     def lang_get(self):
@@ -13369,6 +13697,11 @@ class Api:
         generic = cap.get('generic_tasks')
         if scenario is not None:
             allowed = list(scenario.get('task_keys') or [])
+            if 'task_keys' not in scenario:
+                try:
+                    allowed = [str(t.get('key')) for t in self._tc().list_catalog()]
+                except Exception:                     # noqa: BLE001 legacy scenario compatibility
+                    allowed = []
         else:
             try:
                 allowed = [str(t.get('key')) for t in self._tc().list_catalog()]
@@ -13440,52 +13773,26 @@ class Api:
             return {'ok': False, 'engines': [], 'default': 'vasp', 'error': str(e)}
 
     def engine_get(self):
-        """当前计算引擎；无效旧配置按工作模式默认值回退，不静默开放模式外引擎。"""
-        try:
-            cfg = self._config.load_config()
-            ui = self._config.get_ui_state(cfg)
-            scenario = self._scenarios.active_scenario(cfg)
-            registered = [self._normalize_engine_key(e)
-                          for e in self._eng().available_engines()]
-            active = self._active_engine(scenario, ui, registered)
-            requested = self._normalize_engine_key((ui or {}).get('active_engine'))
-            return {
-                'ok': True, 'engine': active,
-                'configured': requested == active and bool(requested),
-                'capability': self._engine_capability_view(active, scenario),
-                'error': None,
-            }
-        except Exception as e:                            # noqa: BLE001
-            return {'ok': False, 'engine': 'vasp', 'configured': False,
-                    'capability': {}, 'error': str(e)}
+        result = self.settings_context_get()
+        context = result.get('context') or {}
+        configured = context.get('configured') or {}
+        return {
+            **result,
+            'engine': context.get('engine') or 'vasp',
+            'configured': bool(configured.get('engine')),
+            'capability': context.get('capability') or {},
+        }
 
-    def engine_set(self, engine):
-        """保存本次引擎，并把不受该引擎支持的旧计算类型收敛到真实可用默认值。"""
-        try:
-            key = self._normalize_engine_key(engine)
-            cfg = self._config.load_config()
-            ui = self._config.get_ui_state(cfg)
-            scenario = self._scenarios.active_scenario(cfg)
-            registered = [self._normalize_engine_key(e)
-                          for e in self._eng().available_engines()]
-            if key not in registered:
-                return {'ok': False, 'engine': None, 'active_calculation': None,
-                        'error': f'计算引擎 {key!r} 未注册或当前安装不可用'}
-            if key not in (scenario.get('engines') or []):
-                return {'ok': False, 'engine': None, 'active_calculation': None,
-                        'error': f'计算引擎 {key!r} 不适用于工作模式「{scenario.get("name", "")}」'}
-            allowed = self._engine_task_keys(key, scenario)
-            requested = str((ui or {}).get('active_calculation') or '')
-            preferred = str((scenario.get('defaults') or {}).get('active_calculation') or '')
-            active = requested if requested in allowed else preferred
-            if active not in allowed:
-                active = allowed[0] if allowed else ''
-            self._config.set_ui_state(active_engine=key, active_calculation=active)
-            return {'ok': True, 'engine': key, 'active_calculation': active,
-                    'capability': self._engine_capability_view(key, scenario), 'error': None}
-        except Exception as e:                            # noqa: BLE001
-            return {'ok': False, 'engine': None, 'active_calculation': None,
-                    'capability': {}, 'error': str(e)}
+    def engine_set(self, engine, expected_revision=None, intent_id=None):
+        result = self._legacy_workspace_context_update(
+            {'engine': engine}, expected_revision, intent_id)
+        context = result.get('context') or {}
+        return {
+            **result,
+            'engine': context.get('engine'),
+            'active_calculation': context.get('calculation'),
+            'capability': context.get('capability') or {},
+        }
 
     def _spec_from_params(self, mods, params):
         """params → (CalcSpec, err|None)。结构取 params['structure'](内联文本)或 poscar 路径;
@@ -14175,13 +14482,21 @@ class Api:
             if err:
                 return err
             def _cancel():
-                res = self._bo().cancel_batch(
-                    prof, ds, password=pw, trust_new=trust_new)
-                return {'ok': bool(res.get('ok')),
-                        'cancelled': list(res.get('cancelled') or []),
-                        'failed': list(res.get('failed') or []),
-                        'needs_trust': bool(res.get('needs_trust')),
-                        **self._host_key_evidence(res), 'error': res.get('error')}
+                res = self._job_batch_with_idempotency(
+                    self._bo().cancel_batch, prof, ds,
+                    password=pw, trust_new=trust_new,
+                    idempotency_key=idempotency_key)
+                payload = {'ok': bool(res.get('ok')),
+                           'cancelled': list(res.get('cancelled') or []),
+                           'failed': list(res.get('failed') or []),
+                           'needs_trust': bool(res.get('needs_trust')),
+                           **self._host_key_evidence(res), 'error': res.get('error')}
+                for key in ('busy', 'code', 'busy_count', 'replayed',
+                            'requires_manual_recovery', 'recovery_count',
+                            'scheduler_job_ids'):
+                    if key in res:
+                        payload[key] = copy.deepcopy(res[key])
+                return payload
             return self._run_job_operation_once(
                 idempotency_key, action='cancel', profile=prof.name,
                 dirs=ds, invoke=_cancel)

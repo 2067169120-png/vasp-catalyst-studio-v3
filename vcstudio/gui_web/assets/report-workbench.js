@@ -952,7 +952,13 @@
     const list = document.createElement('ul'); list.className = 'rw-insight-list';
     rows.forEach(row => {
       const item = document.createElement('li');
-      const title = document.createElement('b'); title.textContent = String(row.title || row.key || row.id || 'item');
+      const title = document.createElement(row.route ? 'button' : 'b');
+      title.textContent = String(row.title || row.key || row.id || 'item');
+      if (row.route) {
+        title.type = 'button'; title.className = 'btn quiet rw-insight-link';
+        title.dataset.insightRoute = String(row.route);
+        title.dataset.insightNode = String(row.nodeId || '');
+      }
       const detail = document.createElement('code'); detail.textContent = String(row.detail || '');
       item.append(title, detail); list.appendChild(item);
     });
@@ -965,6 +971,7 @@
     if (result.scope && result.scope.changed) rows.push({ title: 'ReportSpec scope', detail: 'changed' });
     (result.hashes || []).forEach(item => rows.push({ title: `hash · ${item.key}`, detail: `${safeText(item.left)} → ${safeText(item.right)}` }));
     (result.numeric_values || []).forEach(item => rows.push({ title: `numeric · ${item.key}`, detail: `${safeText(item.left)} → ${safeText(item.right)}` }));
+    (result.method_matrix || []).forEach(item => rows.push({ title: `method · ${item.key}`, detail: `${safeText(item.left)} → ${safeText(item.right)}` }));
     (result.figures || []).forEach(item => rows.push({ title: `figure · ${item.key}`, detail: 'metadata/hash changed' }));
     Object.entries(plain(result.validation)).forEach(([key, value]) => {
       if (value && value.changed) rows.push({ title: `validation · ${key}`, detail: 'changed' });
@@ -983,6 +990,7 @@
     const rows = nodes.map(node => ({
       title: `${safeText(node.type, 'node')} · ${safeText(node.label, node.id)}`,
       detail: `${edges.filter(edge => edge.source === node.id || edge.target === node.id).length} links`,
+      route: safeText(node.route), nodeId: safeText(node.id),
     }));
     missing.forEach(link => rows.push({
       title: `missing · ${safeText(link.expected)}`,
@@ -1681,6 +1689,12 @@
     const diffButton = $('rw-load-diff'); if (diffButton) diffButton.addEventListener('click', loadScientificDiff);
     const graphButton = $('rw-load-graph'); if (graphButton) graphButton.addEventListener('click', loadEvidenceGraph);
     const capsuleButton = $('rw-export-capsule'); if (capsuleButton) capsuleButton.addEventListener('click', exportInsightCapsule);
+    const insightResults = $('rw-insights-results');
+    if (insightResults) insightResults.addEventListener('click', event => {
+      const target = event.target.closest && event.target.closest('[data-insight-route]');
+      if (!target || !target.dataset.insightRoute || typeof VCS.navigate !== 'function') return;
+      VCS.navigate(target.dataset.insightRoute, { source: 'report-evidence-graph' });
+    });
     ['rw-diff-left', 'rw-diff-right'].forEach(id => {
       const select = $(id); if (select) select.addEventListener('change', () => {
         State.insightStatus = 'empty'; renderInsightControls();

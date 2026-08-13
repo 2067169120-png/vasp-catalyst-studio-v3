@@ -7,6 +7,7 @@ import copy
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import types
@@ -15,9 +16,11 @@ from pathlib import Path
 import pytest
 
 from vcstudio.gui_web.api import Api, _sha256_file
+from vcstudio.gui_web.workspace_context import WorkspaceContextStore
 from vcstudio.cluster.profiles import ClusterProfile
 from vcstudio.cluster import submitter as cluster_submitter
 from vcstudio.project import paper_report as canonical_paper_report
+from vcstudio.shared import config as shared_config
 
 
 # ── 假件工厂 ────────────────────────────────────────────────────────────────
@@ -597,6 +600,23 @@ def test_continue_jobs_delegates():
     api = Api(profiles_mod=_fake_profiles(store), batch_ops_mod=bo)
     api.continue_jobs(['/a', '/b'], 'c1', None, False)
     assert calls['dirs'] == ['/a', '/b']
+
+
+def test_continue_jobs_sinks_operation_id_into_durable_batch_seam():
+    calls = {}
+
+    def _continue(_prof, _pw, dirs, _trust, *, idempotency_key=None):
+        calls.update(dirs=list(dirs), idempotency_key=idempotency_key)
+        return {'needs_trust': False, 'results': []}
+
+    store = {'c1': ClusterProfile(name='c1', auth='key', key_path='/k')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              batch_ops_mod=types.SimpleNamespace(continue_batch=_continue))
+    key = 'jobop-continue-api-contract-001'
+
+    api.continue_jobs(['/a'], 'c1', None, False, key)
+
+    assert calls == {'dirs': ['/a'], 'idempotency_key': key}
 
 
 def test_continue_jobs_unknown_profile_error():
@@ -2443,7 +2463,11 @@ def test_settings_get_defaults_when_unset():
                          'autopilot': False, 'poll_interval': 10,
                          'autopilot_continue': True, 'autopilot_fetch': True,
                          'autopilot_report': True, 'autopilot_campaigns': False,
-                         'scenario': '', 'active_engine': '', 'active_calculation': ''}
+                         'scenario': 'full', 'active_engine': 'vasp',
+                         'active_calculation': 'relax'}
+    assert out['workspace_context']['revision'] == 0
+    assert out['workspace_context']['configured'] == {
+        'scenario': False, 'engine': False, 'calculation': False}
     assert out['llm']['key_saved'] is False and out['llm']['base_url'] == ''
 
 
@@ -2588,6 +2612,13 @@ def _install_fake_report_bundle(api, calls, *, order=None):
             'scientific_qualification': (
                 'adsorption_result_verified' if kind == 'final' else 'diagnostic'),
             'claim_ceiling': 'electronic_adsorption_screen',
+            'executive_summary': ['Bound test summary.'],
+            'adsorption_table': {
+                'columns': [{'key': 'species', 'label': 'Species'}],
+                'rows': [{'species': 'Li2S8'}],
+            },
+            'methods': ['Bound method evidence.'],
+            'limitations': ['Bound test limitation.'],
         }
         report_model_sha256 = canonical_paper_report.report_content_sha256(
             content_model)
@@ -2788,6 +2819,13 @@ def _persist_contract_marker(api, project, project_path, summary, out_dir, *,
         'scientific_qualification': (
             'adsorption_result_verified' if kind == 'final' else 'diagnostic'),
         'claim_ceiling': 'electronic_adsorption_screen',
+        'executive_summary': ['Bound test summary.'],
+        'adsorption_table': {
+            'columns': [{'key': 'species', 'label': 'Species'}],
+            'rows': [{'species': 'Li2S8'}],
+        },
+        'methods': ['Bound method evidence.'],
+        'limitations': ['Bound test limitation.'],
     }
     report_model_sha256 = canonical_paper_report.report_content_sha256(
         content_model)
@@ -3321,7 +3359,7 @@ def test_report_member_ids_and_comparison_contracts_ignore_machine_paths(monkeyp
     monkeypatch.setattr(os.path, 'relpath', _cross_drive)
     member_id = Api._portable_member_id(
         r'D:\jobs\config', r'C:\project', 3, manifest={})
-    assert member_id.endswith(':3') and 'D:' not in member_id
+    assert member_id == 'config:3'
 
     def _snapshot(source_job, display_name):
         return {
@@ -3366,6 +3404,30 @@ def test_report_member_ids_and_comparison_contracts_ignore_machine_paths(monkeyp
     assert left['input_fingerprint'] == right['input_fingerprint']
     assert (left['contract_refs']['snapshot']['sha256']
             == right['contract_refs']['snapshot']['sha256'])
+
+
+def test_portable_member_ids_parse_windows_posix_and_unc_without_host_paths():
+    """Foreign-style locators must be lexical, not host-OS filesystem paths."""
+    cases = [
+        (r'D:\PROJECT\configs\Config', r'd:/project', 'configs/config'),
+        (r'\\server\share\project\configs\config',
+         r'//server/share/project', 'configs/config'),
+        ('/srv/project/configs/config', '/srv/project', 'configs/config'),
+    ]
+    for job_dir, project_root, expected in cases:
+        assert (Api._portable_member_id(job_dir, project_root, 3, manifest={})
+                == expected)
+
+    # Separate roots cannot emit their absolute drive/UNC locators.  The index
+    # makes same-basename members deterministic rather than silently colliding.
+    assert Api._portable_member_id(
+        r'D:\jobs\config', r'C:\project', 3, manifest={}) == 'config:3'
+    assert Api._portable_member_id(
+        r'\\server\share-a\config', r'\\server\share-b\project', 1,
+        manifest={}) == 'config:1'
+    assert Api._portable_member_id(
+        r'\\server\share-a\config', r'\\server\share-b\project', 2,
+        manifest={}) == 'config:2'
 
 
 def test_pipeline_tick_report_done_idempotent(tmp_path):
@@ -3563,6 +3625,42 @@ def test_new_final_marker_requires_contract_chain_but_kindless_legacy_is_readabl
     assert explicit['artifact_status'] == 'stale'
     assert explicit['artifact_current'] is False
     assert '指纹' in explicit['report_reason'] or 'contract' in explicit['report_reason']
+
+
+def test_public_report_status_routes_through_report_service_recovery_adapter():
+    calls = []
+    service = types.SimpleNamespace(status=lambda path: calls.append(path) or {
+        'schema': 'vcstudio.report-status/v1',
+        'ok': True,
+        'artifact_status': 'ready',
+        'artifact_current': True,
+        'has_marker': True,
+        'scientific_status': 'final',
+        'scientific_qualification': 'adsorption_result_verified',
+        'scientific_stale': False,
+        'eligible_final': True,
+        'publication_gate_status': 'eligible',
+        'desired_report_kind': 'final',
+        'report_reason': '',
+        'files': {},
+        'error': None,
+    })
+    api = Api(report_service=service)
+    project_id = 'project-' + 'a' * 32
+    api._resolve_project_id = lambda candidate: {
+        'project_id': candidate, 'path': 'project.yaml',
+    }
+    api._call_with_project_bindings = lambda _records, callback, **_kwargs: callback()
+    api._proj_report_status_for_path = lambda _path: (_ for _ in ()).throw(
+        AssertionError('public status bypassed ReportService.status recovery')
+    )
+
+    result = api.proj_report_status(project_id)
+
+    assert result['ok'] is True
+    assert result['project_id'] == project_id
+    assert result['artifact_status'] == 'ready'
+    assert calls == ['project.yaml']
 
 
 def test_proj_report_status_ignores_mtime_and_rejects_tampered_marker_metadata(tmp_path):
@@ -4707,13 +4805,17 @@ def _fake_scenarios(calls=None, reg=None, active=None):
             'pages': ['dashboard', 'generate', 'project', 'jobs', 'cluster', 'settings'],
             'cards': {}, 'figure_preset_order': ['bar', 'ladder'],
             'reaction_presets': [], 'engines': ['vasp'],
-            'defaults': {'calc_type': 'slab'}, 'ai_context': 'x'}
+            'defaults': {'calc_type': 'slab', 'engine': 'vasp',
+                         'active_calculation': 'relax'},
+            'task_keys': ['relax', 'static', 'bands'], 'ai_context': 'x'}
     lis = {'key': 'lis', 'name': '锂硫', 'name_en': 'Lithium-sulfur batteries',
            'description': 'Li-S', 'description_en': 'Lithium-sulfur reaction workflows.',
            'pages': ['dashboard', 'generate', 'project', 'jobs', 'cluster', 'settings'],
            'cards': {}, 'figure_preset_order': ['ladder', 'volcano'],
            'reaction_presets': ['LIS_16E'], 'engines': ['vasp'],
-           'defaults': {'calc_type': 'slab'}, 'ai_context': 'y'}
+           'defaults': {'calc_type': 'slab', 'engine': 'vasp',
+                        'active_calculation': 'relax'},
+           'task_keys': ['relax', 'static'], 'ai_context': 'y'}
     reg = reg if reg is not None else {'full': full, 'lis': lis}
     m = types.SimpleNamespace()
     m.list_scenarios = lambda: [dict(v) for v in reg.values()]
@@ -4875,11 +4977,7 @@ def test_scenario_list_shape():
 
 
 def test_scenario_get_configured_true_reads_active():
-    calls = {}
-    api = Api(scenarios_mod=_fake_scenarios(active={'key': 'lis', 'name': '锂硫',
-              'pages': ['dashboard'], 'cards': {}, 'figure_preset_order': [],
-              'reaction_presets': [], 'engines': ['vasp'], 'defaults': {},
-              'ai_context': ''}, calls=calls),
+    api = Api(scenarios_mod=_fake_scenarios(),
               config_mod=_fake_config(ui={'scenario': 'lis'}))
     out = api.scenario_get()
     assert out['ok'] is True and out['configured'] is True
@@ -4894,19 +4992,23 @@ def test_scenario_get_unconfigured_first_launch():
 
 
 def test_scenario_set_persists_and_returns_view():
-    calls = {}
-    api = Api(scenarios_mod=_fake_scenarios(calls=calls))
+    backing = {'ui': {}}
+    api = Api(scenarios_mod=_fake_scenarios(), config_mod=_fake_config_rw(backing))
     out = api.scenario_set('lis')
-    assert out['ok'] is True and out['key'] == 'lis' and calls['set'] == 'lis'
+    assert out['ok'] is True and out['key'] == 'lis'
+    assert backing['ui']['scenario'] == 'lis'
+    assert backing['ui']['workspace_context_revision'] == 1
+    assert backing['ui']['active_engine'] == 'vasp'
+    assert backing['ui']['active_calculation'] == 'relax'
     assert out['scenario']['reaction_presets'] == ['LIS_16E']
 
 
 def test_scenario_set_rejects_unknown_before_persisting():
-    calls = {}
-    api = Api(scenarios_mod=_fake_scenarios(calls=calls))
+    backing = {'ui': {}}
+    api = Api(scenarios_mod=_fake_scenarios(), config_mod=_fake_config_rw(backing))
     out = api.scenario_set('typo-mode')
     assert out['ok'] is False and '未知工作模式' in out['error']
-    assert 'set' not in calls
+    assert backing == {'ui': {}}
 
 
 def test_calculation_get_falls_back_to_mode_default_and_set_validates():
@@ -4947,10 +5049,178 @@ def test_engine_selection_rejects_mode_incompatible_engine():
 
 def test_scenario_get_error_caught():
     boom = _fake_scenarios()
-    boom.active_scenario = lambda cfg=None: (_ for _ in ()).throw(RuntimeError('场景坏'))
+    boom.list_scenarios = lambda: (_ for _ in ()).throw(RuntimeError('场景坏'))
     api = Api(scenarios_mod=boom, config_mod=_fake_config())
     out = api.scenario_get()
     assert out['ok'] is False and '场景坏' in out['error']
+
+
+def test_workspace_context_store_migrates_legacy_config_and_two_instances_conflict(
+        tmp_path):
+    config_path = tmp_path / 'config.yaml'
+    shared_config.save_config({
+        'potcar_lib_root': '/preserved',
+        'ui': {'scenario': 'full', 'active_engine': 'vasp',
+               'active_calculation': 'relax', 'theme': 'paper'},
+    }, config_path)
+    original_config = config_path.read_bytes()
+    first = WorkspaceContextStore(shared_config, config_path)
+    second = WorkspaceContextStore(shared_config, config_path)
+
+    legacy = first.read()
+    assert legacy['revision'] == 0
+    assert legacy['last_intent_id'] is None
+    winner = second.compare_and_swap(
+        {'scenario': 'full', 'engine': 'cp2k', 'calculation': 'relax'},
+        expected_revision=0, intent_id='window-b:1')
+    loser = first.compare_and_swap(
+        {'scenario': 'lis', 'engine': 'vasp', 'calculation': 'relax'},
+        expected_revision=0, intent_id='window-a:1')
+
+    assert winner['ok'] is True and winner['context']['revision'] == 1
+    assert loser['ok'] is False and loser['conflict'] is True
+    assert loser['context']['engine'] == 'cp2k'
+    assert loser['context']['last_intent_id'] == 'window-b:1'
+    persisted = shared_config.load_config(config_path)
+    assert persisted['potcar_lib_root'] == '/preserved'
+    assert persisted['ui'] == {
+        'scenario': 'full', 'active_engine': 'vasp',
+        'active_calculation': 'relax', 'theme': 'paper'}
+    assert config_path.read_bytes() == original_config
+    state_path = tmp_path / 'workspace-context.json'
+    assert state_path.is_file()
+    assert not list(tmp_path.glob('.config.yaml.*.tmp'))
+    assert not list(tmp_path.glob('.workspace-context.json.*.tmp'))
+
+    # An unrelated Settings writer owns config.yaml.  Its new value must be
+    # preserved, and it cannot roll the server-owned snapshot back to rev 0.
+    shared_config.save_config({
+        'potcar_lib_root': '/changed-elsewhere',
+        'ui': {'scenario': 'lis', 'active_engine': 'vasp',
+               'active_calculation': 'static', 'theme': 'classic'},
+    }, config_path)
+    fresh = WorkspaceContextStore(shared_config, config_path).read()
+    assert fresh['revision'] == 1
+    assert fresh['last_intent_id'] == 'window-b:1'
+    assert {key: fresh[key] for key in ('scenario', 'engine', 'calculation')} == {
+        'scenario': 'full', 'engine': 'cp2k', 'calculation': 'relax'}
+    assert shared_config.load_config(config_path)['ui']['theme'] == 'classic'
+
+
+def test_workspace_context_store_without_path_keeps_revisioned_adapter_authority():
+    backing = {
+        'ui': {'scenario': 'full', 'active_engine': 'vasp',
+               'active_calculation': 'relax'},
+    }
+    store = WorkspaceContextStore(_fake_config_rw(backing))
+
+    first = store.compare_and_swap(
+        {'scenario': 'full', 'engine': 'cp2k', 'calculation': 'relax'},
+        expected_revision=0, intent_id='adapter:1')
+    after_first = store.read()
+    second = store.compare_and_swap(
+        {'scenario': 'lis', 'engine': 'vasp', 'calculation': 'static'},
+        expected_revision=1, intent_id='adapter:2')
+
+    assert first['ok'] is True and after_first['revision'] == 1
+    assert after_first['last_intent_id'] == 'adapter:1'
+    assert second['ok'] is True and second['context']['revision'] == 2
+    assert store.read()['last_intent_id'] == 'adapter:2'
+
+
+def test_workspace_context_store_cross_process_cas_has_one_winner(tmp_path):
+    config_path = tmp_path / 'config.yaml'
+    start_path = tmp_path / 'start.signal'
+    shared_config.save_config({
+        'ui': {'scenario': 'full', 'active_engine': 'vasp',
+               'active_calculation': 'relax'},
+    }, config_path)
+    script = r'''import json, sys, time
+from pathlib import Path
+from vcstudio.gui_web.workspace_context import WorkspaceContextStore
+from vcstudio.shared import config
+path, start, intent, engine = sys.argv[1:]
+while not Path(start).exists():
+    time.sleep(0.005)
+store = WorkspaceContextStore(config, path, lock_timeout=10)
+result = store.compare_and_swap(
+    {"scenario": "full", "engine": engine, "calculation": "relax"},
+    expected_revision=0, intent_id=intent)
+print(json.dumps(result, sort_keys=True))
+'''
+    processes = [
+        subprocess.Popen(
+            [sys.executable, '-c', script, str(config_path), str(start_path),
+             f'process-{index}:1', engine],
+            cwd=Path(__file__).resolve().parents[1], stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, encoding='utf-8')
+        for index, engine in enumerate(('vasp', 'cp2k'))
+    ]
+    start_path.write_text('go', encoding='utf-8')
+    outputs = []
+    for process in processes:
+        stdout, stderr = process.communicate(timeout=20)
+        assert process.returncode == 0, stderr
+        outputs.append(json.loads(stdout))
+
+    assert sum(bool(item['ok']) for item in outputs) == 1
+    assert sum(bool(item['conflict']) for item in outputs) == 1
+    assert {item['context']['revision'] for item in outputs} == {1}
+    final = WorkspaceContextStore(shared_config, config_path).read()
+    assert final['revision'] == 1
+    assert final['last_intent_id'] in {'process-0:1', 'process-1:1'}
+
+
+def test_two_api_instances_reverse_arrival_keeps_committed_latest_context(tmp_path):
+    config_path = tmp_path / 'config.yaml'
+    shared_config.save_config({
+        'ui': {'scenario': 'full', 'active_engine': 'vasp',
+               'active_calculation': 'relax'},
+    }, config_path)
+    slow_store = WorkspaceContextStore(shared_config, config_path)
+    fast_store = WorkspaceContextStore(shared_config, config_path)
+    slow_entered_cas = threading.Event()
+    fast_committed = threading.Event()
+
+    class DelayedStore:
+        def read(self):
+            return slow_store.read()
+
+        def compare_and_swap(self, context, *, expected_revision, intent_id):
+            slow_entered_cas.set()
+            assert fast_committed.wait(timeout=5)
+            return slow_store.compare_and_swap(
+                context, expected_revision=expected_revision, intent_id=intent_id)
+
+    slow_api = Api(workspace_context_store=DelayedStore())
+    fast_api = Api(workspace_context_store=fast_store)
+    results = {}
+
+    thread = threading.Thread(target=lambda: results.setdefault(
+        'a', slow_api.settings_context_update(
+            {'scenario': 'lis'}, 0, 'old-window-a:1')))
+    thread.start()
+    assert slow_entered_cas.wait(timeout=5)
+    results['b'] = fast_api.settings_context_update(
+        {'engine': 'cp2k'}, 0, 'latest-window-b:1')
+    fast_committed.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+    assert results['b']['ok'] is True
+    assert results['b']['context']['engine'] == 'cp2k'
+    assert results['a']['ok'] is False and results['a']['conflict'] is True
+    assert results['a']['context']['revision'] == results['b']['context']['revision'] == 1
+    # A lost response can be retried with the same intent and original
+    # expected revision without creating another commit.
+    replay = fast_api.settings_context_update(
+        {'engine': 'cp2k'}, 0, 'latest-window-b:1')
+    assert replay['ok'] is True and replay['replayed'] is True
+    assert replay['revision'] == 1
+    authoritative = fast_api.settings_context_get()
+    assert authoritative['context']['scenario']['key'] == 'full'
+    assert authoritative['context']['engine'] == 'cp2k'
+    assert authoritative['context']['intent_id'] == 'latest-window-b:1'
 
 
 # ── lang_* / i18n_dict ───────────────────────────────────────────────────────
@@ -5769,6 +6039,29 @@ def test_jobs_cancel_batch_ok():
     out = api.jobs_cancel_batch(['/j/a', '/j/b'], 'c1', None, False)
     assert out['ok'] is True and out['cancelled'] == ['12345']
     assert calls['cancel']['jobs'] == ['/j/a', '/j/b']
+
+
+def test_jobs_cancel_batch_sinks_operation_id_and_preserves_recovery_contract():
+    calls = {}
+
+    def _cancel(_profile, jobs, *, password=None, trust_new=False,
+                idempotency_key=None):
+        calls.update(jobs=list(jobs), password=password, trust_new=trust_new,
+                     idempotency_key=idempotency_key)
+        return {
+            'ok': False, 'cancelled': [], 'failed': [], 'needs_trust': False,
+            'busy': True, 'code': 'job_busy', 'busy_count': 1, 'error': None,
+        }
+
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              batch_ops_mod=types.SimpleNamespace(cancel_batch=_cancel))
+    key = 'jobop-cancel-api-contract-001'
+
+    out = api.jobs_cancel_batch(['/j/a'], 'c1', None, False, key)
+
+    assert calls['idempotency_key'] == key
+    assert out['busy'] is True and out['code'] == 'job_busy'
 
 
 def test_jobs_cancel_batch_no_dirs_error():

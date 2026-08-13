@@ -45,12 +45,15 @@ def _route(area="analyze", view="analyze-energy",
     return {"hash": route_hash, "area": area, "view": view}
 
 
-def test_missing_state_reads_canonical_defaults_without_writing(tmp_path):
+def test_missing_state_creates_stable_authority_with_canonical_defaults(tmp_path):
     target = tmp_path / "workspace-state.json"
     store = WorkspaceStateStore(target)
 
     state = store.read()
 
+    authority_id = state.pop("authority_id")
+    assert len(authority_id) == 32
+    assert int(authority_id, 16) >= 0
     assert state == {
         "schema": SCHEMA,
         "revision": 0,
@@ -66,7 +69,9 @@ def test_missing_state_reads_canonical_defaults_without_writing(tmp_path):
             "draft_refs": {},
         },
     }
-    assert not target.exists()
+    persisted = json.loads(target.read_text(encoding="utf-8"))
+    assert persisted["authority_id"] == authority_id
+    assert WorkspaceStateStore(target).read()["authority_id"] == authority_id
 
 
 def test_update_is_cas_and_explicit_remove_resets_or_deletes(tmp_path):
@@ -83,9 +88,11 @@ def test_update_is_cas_and_explicit_remove_resets_or_deletes(tmp_path):
     }, 0)
 
     assert first["ok"] is True and first["state_revision"] == 1
+    assert len(first["authority_id"]) == 32
     conflict = store.update({"set": {"current_analysis_id": "taskana"}}, 0)
     assert conflict["ok"] is False and conflict["conflict"] is True
     assert conflict["state_revision"] == 1
+    assert conflict["authority_id"] == first["authority_id"]
     assert conflict["preferences"] == first["preferences"]
 
     second = store.update({
@@ -96,6 +103,7 @@ def test_update_is_cas_and_explicit_remove_resets_or_deletes(tmp_path):
     assert second["preferences"]["current_project_id"] is None
     assert second["preferences"]["current_analysis_id"] == "taskana"
     assert second["preferences"]["panels"] == {"left": True}
+    assert second["authority_id"] == first["authority_id"]
     assert json.loads((tmp_path / "workspace-state.json").read_text(encoding="utf-8"))[
         "revision"] == 2
 
@@ -141,6 +149,70 @@ def test_atomic_replace_failure_preserves_previous_bytes_and_cleans_temp(tmp_pat
     assert not list(tmp_path.glob(".workspace-state.json.*.tmp"))
 
 
+def test_legacy_three_field_state_is_atomically_migrated_with_stable_authority(tmp_path):
+    target = tmp_path / "workspace-state.json"
+    legacy = {
+        "schema": SCHEMA,
+        "revision": 7,
+        "preferences": workspace_state.default_preferences(),
+    }
+    target.write_text(json.dumps(legacy), encoding="utf-8")
+
+    first = WorkspaceStateStore(target).read()
+    persisted = json.loads(target.read_text(encoding="utf-8"))
+    second = WorkspaceStateStore(target).read()
+
+    assert first["revision"] == 7
+    assert first["preferences"] == legacy["preferences"]
+    assert persisted == first == second
+    assert len(first["authority_id"]) == 32
+    assert int(first["authority_id"], 16) >= 0
+
+
+def test_invalid_patch_does_not_migrate_or_modify_legacy_state(tmp_path):
+    target = tmp_path / "workspace-state.json"
+    legacy = {
+        "schema": SCHEMA,
+        "revision": 7,
+        "preferences": workspace_state.default_preferences(),
+    }
+    target.write_text(json.dumps(legacy), encoding="utf-8")
+    before = target.read_bytes()
+
+    with pytest.raises(WorkspaceStateError, match="credential"):
+        WorkspaceStateStore(target).update({
+            "set": {"filters": {"nested": {"label": "password=hunter2"}}},
+            "remove": [],
+        }, 7)
+
+    assert target.read_bytes() == before
+
+
+def test_authority_id_prevents_revision_aba_after_state_rebuild(tmp_path):
+    target = tmp_path / "workspace-state.json"
+    old_store = WorkspaceStateStore(target)
+    old = old_store.update({"set": {"current_analysis_id": "adsorption"}}, 0)
+    old_bytes = target.read_bytes()
+
+    target.unlink()
+    rebuilt_store = WorkspaceStateStore(target)
+    rebuilt = rebuilt_store.update({"set": {"current_analysis_id": "taskana"}}, 0)
+    assert rebuilt["state_revision"] == old["state_revision"] == 1
+    assert rebuilt["authority_id"] != old["authority_id"]
+    rebuilt_bytes = target.read_bytes()
+
+    stale = rebuilt_store.update(
+        {"set": {"current_analysis_id": "electronic"}},
+        old["state_revision"],
+        old["authority_id"],
+    )
+
+    assert stale["ok"] is False and stale["conflict"] is True
+    assert stale["authority_id"] == rebuilt["authority_id"]
+    assert target.read_bytes() == rebuilt_bytes
+    assert target.read_bytes() != old_bytes
+
+
 @pytest.mark.parametrize("patch, message", [
     ({"set": {"current_project_id": r"C:\\Users\\alice\\project.yaml"}},
      "filesystem path"),
@@ -169,9 +241,34 @@ def test_atomic_replace_failure_preserves_previous_bytes_and_cleans_temp(tmp_pat
      "sensitive credential key"),
     ({"set": {"filters": {"label": "ghp_abcdefghijklmnopqrst"}}},
      "credential"),
+    ({"set": {"filters": {"label": "password=hunter2"}}},
+     "credential"),
+    ({"set": {"filters": {
+        "nested": ["safe", {"endpoint": "https://alice:hunter2@example.test/api"}],
+    }}}, "credential"),
+    ({"set": {"panels": {"cloud_identity": "AKIAIOSFODNN7EXAMPLE"}}},
+     "credential"),
+    ({"set": {"filters": {"awsAccessKeyIdHint": "masked"}}},
+     "sensitive credential key"),
+    ({"set": {"route": {
+        "hash": "#/projects/password/overview",
+        "area": "project", "view": "project-overview"}}},
+     "sensitive route segment"),
+    ({"set": {"route": {
+        "hash": "#/projects/AKIAIOSFODNN7EXAMPLE/overview",
+        "area": "project", "view": "project-overview"}}},
+     "credential"),
+    ({"set": {"route": {
+        "hash": "#/publish/report?project=ghp_abcdefghijklmnopqrst",
+        "area": "publish", "view": "publish-report"}}},
+     "credential"),
+    ({"set": {"route": {
+        "hash": "#/jobs?cluster=password%3Dhunter2",
+        "area": "run", "view": "run-jobs"}}},
+     "credential"),
     ({"set": {"route": {
         "hash": "#/home?api_key=ghp_abcdefghijklmnopqrst",
-        "area": "home", "view": "home"}}}, "unsupported query parameters"),
+        "area": "home", "view": "home"}}}, "credential|unsupported query parameters"),
     ({"set": {"route": {
         "hash": "#/jobs?project=project-abc",
         "area": "run", "view": "run-jobs"}}}, "unsupported query parameters"),
@@ -190,6 +287,32 @@ def test_validation_rejects_unknown_unsafe_or_path_bearing_state(tmp_path, patch
     with pytest.raises(WorkspaceStateError, match=message):
         store.update({**patch, "remove": []}, 0)
     assert not (tmp_path / "workspace-state.json").exists()
+
+
+@pytest.mark.parametrize("unsafe_value", [
+    "password=hunter2",
+    "https://alice:hunter2@example.test/api",
+    "ssh://alice:hunter2@example.test/private",
+    "ftp://alice:hunter2@example.test/private",
+    "postgresql://alice:hunter2@example.test/private",
+    "AKIAIOSFODNN7EXAMPLE",
+    "github_pat_abcdefghijklmnopqrstuvwx",
+    "/srv/private/research/job-a",
+])
+def test_recursive_secret_gate_preserves_existing_state_bytes(tmp_path, unsafe_value):
+    target = tmp_path / "workspace-state.json"
+    store = WorkspaceStateStore(target)
+    initial = store.update({"set": {"filters": {"status": "ready"}}}, 0)
+    before = target.read_bytes()
+
+    with pytest.raises(WorkspaceStateError):
+        store.update({
+            "set": {"filters": {"nested": [{"value": unsafe_value}]}},
+            "remove": [],
+        }, initial["state_revision"], initial["authority_id"])
+
+    assert target.read_bytes() == before
+    assert store.read()["revision"] == initial["state_revision"]
 
 
 def test_draft_refs_store_only_bounded_metadata(tmp_path):
@@ -388,6 +511,7 @@ def test_workspace_context_separates_intent_from_project_facts_and_redacts_paths
 
     assert result["ok"] is True
     assert result["schema"] == "vcstudio.workspace-context/v1"
+    assert len(result["authority_id"]) == 32
     assert result["state_revision"] == 1
     assert result["selection"] == {
         "route": _route(project_id=project_id),
@@ -511,23 +635,48 @@ def test_workspace_context_pipeline_failure_does_not_fall_back_to_generate(tmp_p
 
 
 def test_workspace_preferences_api_returns_stable_conflict_and_validation_envelopes(tmp_path):
-    store = WorkspaceStateStore(tmp_path / "workspace-state.json")
+    target = tmp_path / "workspace-state.json"
+    store = WorkspaceStateStore(target)
     api = Api(workspace_state_store=store)
+    authority_id = store.read()["authority_id"]
 
     first = api.workspace_preferences_update(
-        {"set": {"route": _route("home", "home")}, "remove": []}, 0)
+        {"set": {"route": _route("home", "home")}, "remove": []},
+        0,
+        authority_id,
+    )
     assert first == {
-        "ok": True, "conflict": False, "state_revision": 1,
+        "ok": True, "conflict": False, "authority_id": first["authority_id"],
+        "state_revision": 1,
         "preferences": first["preferences"], "error": None,
     }
     conflict = api.workspace_preferences_update(
-        {"set": {"current_analysis_id": "adsorption"}, "remove": []}, 0)
+        {"set": {"current_analysis_id": "adsorption"}, "remove": []},
+        0,
+        authority_id,
+    )
     assert conflict["ok"] is False and conflict["conflict"] is True
     assert conflict["state_revision"] == 1 and conflict["preferences"]
     invalid = api.workspace_preferences_update(
-        {"set": {"current_project_id": "/home/alice/project.yaml"}, "remove": []}, 1)
+        {"set": {"current_project_id": "/home/alice/project.yaml"}, "remove": []},
+        1,
+        authority_id,
+    )
     assert invalid["ok"] is False and invalid["conflict"] is False
     assert invalid["state_revision"] is None and "filesystem path" in invalid["error"]
+
+    before = target.read_bytes()
+    missing_authority = api.workspace_preferences_update(
+        {"set": {"current_analysis_id": "electronic"}, "remove": []}, 1)
+    assert missing_authority == {
+        "ok": False,
+        "conflict": False,
+        "authority_id": None,
+        "state_revision": None,
+        "preferences": None,
+        "error": "expected_authority_id is required for workspace-state CAS",
+    }
+    assert target.read_bytes() == before
 
 
 def test_workspace_context_corrupt_state_has_full_failure_contract(tmp_path):
@@ -538,10 +687,11 @@ def test_workspace_context_corrupt_state_has_full_failure_contract(tmp_path):
     result = api.workspace_context()
 
     assert set(result) == {
-        "ok", "schema", "state_revision", "selection", "workspace_intent",
+        "ok", "schema", "authority_id", "state_revision", "selection", "workspace_intent",
         "project", "pipeline", "runtime", "sync", "restore", "unsaved",
         "activity", "projects", "degraded", "error",
     }
     assert result["ok"] is False and result["selection"] is None
+    assert result["authority_id"] is None
     assert result["project"] is None and result["pipeline"] is None
     assert result["degraded"][0]["kind"] == "workspace_state_unavailable"

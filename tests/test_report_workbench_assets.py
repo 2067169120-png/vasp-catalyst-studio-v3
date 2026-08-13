@@ -249,6 +249,14 @@ def test_report_insights_expose_fail_closed_states_and_operation_lifecycle():
 
     assert "new Set(['loading', 'empty', 'unavailable', 'stale', 'blocked', 'ready'])" in js
     assert "report.insights.state.${State.insightStatus}" in js
+
+
+def test_scientific_diff_renders_method_matrix_and_evidence_nodes_are_navigable():
+    js = _source("report-workbench.js")
+    assert "result.method_matrix || []" in js
+    assert "title.dataset.insightRoute" in js
+    assert "data-insight-route" in js
+    assert "source: 'report-evidence-graph'" in js
     assert "record.current === true" in js
     assert "record.artifact_status !== 'stale'" in js
     assert "VCS.operations.publish" in js

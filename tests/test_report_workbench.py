@@ -194,6 +194,10 @@ def _html_request(project_id, **overrides):
         },
     }
     spec.update(overrides)
+    if spec.get("requested_kind") == "final" and "outline" not in overrides:
+        spec["outline"] = [
+            "executive_summary", "adsorption_table", "methods", "limitations",
+        ]
     return {"operation_id": "preview-1", "spec": spec}
 
 

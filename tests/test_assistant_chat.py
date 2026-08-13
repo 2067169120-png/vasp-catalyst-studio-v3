@@ -188,6 +188,41 @@ def test_unselected_attachment_and_local_paths_are_not_sent_to_model(tmp_path):
             assert key.encode() not in path.read_bytes()
 
 
+def test_outbound_preview_is_exact_read_only_and_contains_no_locator_or_key(tmp_path):
+    calls = []
+    key = "memory-only-preview-key"
+    backend = _chat(
+        tmp_path,
+        transport=_reply_transport(calls),
+        key_loader=lambda: key,
+    )
+    session = backend.create_session()
+    source = tmp_path / "private" / "INCAR"
+    source.parent.mkdir()
+    source.write_text("ENCUT = 520\n", encoding="utf-8")
+    attachment = backend.attach(session["id"], source)
+
+    preview = backend.outbound_preview(
+        session["id"], "check this input", attachment_ids=[attachment["id"]]
+    )
+
+    assert preview["schema"] == "vcstudio.ai-outbound-preview/v1"
+    assert preview["destination"] == "https://llm.invalid"
+    assert preview["model"] == "offline-test-model"
+    assert preview["selected_attachment_count"] == 1
+    assert "ENCUT = 520" in preview["messages"][-1]["content"]
+    wire = json.dumps(preview, ensure_ascii=False)
+    assert str(tmp_path) not in wire
+    assert key not in wire
+    assert backend.history(session["id"]) == []
+    assert calls == []
+
+    backend.send(
+        session["id"], "check this input", attachment_ids=[attachment["id"]]
+    )
+    assert calls[0]["body"]["messages"] == preview["messages"]
+
+
 def test_unknown_binary_sends_metadata_only_when_explicitly_selected(tmp_path):
     calls = []
     backend = _chat(tmp_path, transport=_reply_transport(calls))

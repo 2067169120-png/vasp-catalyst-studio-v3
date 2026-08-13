@@ -684,13 +684,17 @@ def _normalize_model(model: Mapping[str, Any], *, requested_formats=()) -> dict:
         requested_formats=requested_formats,
         contracts_validated=contracts_validated,
     )
-    from vcstudio.project.report_presets import enforce_report_outline_policy
+    from vcstudio.project.report_presets import (
+        enforce_report_content_policy,
+        enforce_report_outline_policy,
+    )
 
     enforce_report_outline_policy(
         context["preset_id"], report_kind, context["outline"]
     )
     content = _normalize_content_fields(
         model, locale=locale, outline=context["outline"])
+    enforce_report_content_policy(context["preset_id"], report_kind, content)
 
     return {
         "schema": MODEL_SCHEMA,

@@ -4,6 +4,7 @@ import copy
 import hashlib
 import inspect
 import json
+import multiprocessing
 import os
 from pathlib import Path
 from typing import get_type_hints
@@ -271,6 +272,44 @@ class _Host:
         }
 
 
+class _DurableHost(_Host):
+    """Test host whose marker survives a fresh service and spawned process."""
+
+    @property
+    def marker_path(self) -> Path:
+        return self.root / ".vcstudio" / "durable-report-marker.json"
+
+    def _report_workbench_persist_build(self, build, rendered, *, revision):
+        marker = super()._report_workbench_persist_build(
+            build, rendered, revision=revision
+        )
+        self.marker_path.parent.mkdir(parents=True, exist_ok=True)
+        self.marker_path.write_text(
+            json.dumps(marker, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return marker
+
+    def _proj_report_status_for_path(self, path):
+        if self.marker_path.is_file():
+            self.marker = json.loads(self.marker_path.read_text(encoding="utf-8"))
+        return super()._proj_report_status_for_path(path)
+
+
+def _recover_history_in_spawned_process(root, ready, start, output):
+    """Spawn-safe recovery contender used by the process-lock regression."""
+
+    try:
+        host = _DurableHost(Path(root))
+        service = ReportService(host, temp_root=Path(root) / "spawned-previews")
+        ready.set()
+        if not start.wait(20):
+            raise TimeoutError("spawned report recovery start timed out")
+        output.put(("result", service.history("project.yaml")))
+    except BaseException as exc:  # pragma: no cover - surfaced in parent assertion
+        output.put(("error", type(exc).__name__, str(exc)))
+
+
 def test_report_service_host_protocol_is_narrow_and_web_independent(tmp_path):
     required_seams = {
         "_report_workbench_project_context",
@@ -412,7 +451,7 @@ def test_preview_rejects_methods_only_final_before_scientific_build(tmp_path):
 
     assert result["ok"] is False
     assert "final report outline" in result["error"]
-    assert "scientific result section" in result["error"]
+    assert "scientific result/evidence section" in result["error"]
     assert host.preview_calls == host.render_calls == host.marker_calls == 0
 
 
@@ -1021,23 +1060,211 @@ def test_final_history_write_failure_after_marker_preserves_recoverable_bundle(
     status = host._proj_report_status_for_path("project.yaml")
     assert status["artifact_status"] == "ready"
     assert status["revision"] == result["revision"]
+    history_path = tmp_path / ".vcstudio" / "reports" / "history.json"
+    pending_payload = json.loads(history_path.read_text(encoding="utf-8"))
+    report_id = result["revision"]["report_id"]
+    pending_entry = pending_payload["reports"][report_id]["revisions"][0]
+    assert pending_entry["artifact_status"] == "generated_unrecorded"
+    journal_path = Path(pending_entry["transaction_journal"])
+    pending_journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert pending_journal["state"] == "marker_ready"
+    assert pending_journal["marker_recorded"] is True
+    assert pending_journal["history_entry"]["artifact_status"] == "ready"
+
     history = service.history("project.yaml")
     assert history["revisions"][0]["artifact_status"] == "ready"
-    assert history["revisions"][0]["recovery_state"] == "history_finalize_pending"
-    assert "history finalization failed" in history["revisions"][0]["error"]
-    history_payload = json.loads(
-        (tmp_path / ".vcstudio" / "reports" / "history.json").read_text(
-            encoding="utf-8"
-        )
+    assert history["revisions"][0]["recovery_state"] is None
+    assert history["revisions"][0]["error"] is None
+    recovered_payload = json.loads(history_path.read_text(encoding="utf-8"))
+    recovered_entry = recovered_payload["reports"][report_id]["revisions"][0]
+    assert recovered_entry["artifact_status"] == "ready"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert journal["state"] == "complete"
+    assert journal["history_ready_recorded"] is True
+
+
+def _leave_durable_marker_ready_intent(tmp_path, monkeypatch):
+    host = _DurableHost(tmp_path)
+    service = ReportService(host, temp_root=tmp_path / "previews")
+    preview = service.preview("project.yaml", _request(host.project_id))
+    original_atomic_json = report_service_module._atomic_json
+    writes = 0
+
+    def fail_second_history_write(path, value):
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise OSError("history finalization failed")
+        return original_atomic_json(path, value)
+
+    monkeypatch.setattr(
+        report_service_module, "_atomic_json", fail_second_history_write
     )
-    report_id = result["revision"]["report_id"]
-    frozen_entry = history_payload["reports"][report_id]["revisions"][0]
-    assert frozen_entry["artifact_status"] == "generated_unrecorded"
+    result = service.publish(
+        "project.yaml",
+        str(tmp_path / "out"),
+        preview["preview_id"],
+        preview["preview_token"],
+        public=False,
+    )
+    assert result["recovery_required"] is True
+    return result
+
+
+@pytest.mark.parametrize("entrypoint", ("status", "history", "bootstrap"))
+def test_fresh_service_read_entrypoints_recover_marker_ready_journal_intent(
+    tmp_path, monkeypatch, entrypoint,
+):
+    result = _leave_durable_marker_ready_intent(tmp_path, monkeypatch)
+
+    rebuilt = ReportService(
+        _DurableHost(tmp_path), temp_root=tmp_path / "rebuilt-previews"
+    )
+    if entrypoint == "status":
+        observed = rebuilt.status("project.yaml")
+        assert observed["artifact_status"] == "ready"
+        assert observed["revision"] == result["revision"]
+    elif entrypoint == "history":
+        observed = rebuilt.history("project.yaml")
+        assert observed["revisions"][0]["artifact_status"] == "ready"
+    else:
+        observed = rebuilt.bootstrap("project.yaml", "diagnostic-repair")
+        assert observed["history"]["revisions"][0]["artifact_status"] == "ready"
+    history = rebuilt.history("project.yaml")
+
+    assert history["revisions"][0]["artifact_status"] == "ready"
+    assert history["revisions"][0]["error"] is None
+    history_path = tmp_path / ".vcstudio" / "reports" / "history.json"
+    disk = json.loads(history_path.read_text(encoding="utf-8"))
+    entry = disk["reports"][result["revision"]["report_id"]]["revisions"][0]
     journal = json.loads(
-        Path(frozen_entry["transaction_journal"]).read_text(encoding="utf-8")
+        Path(entry["transaction_journal"]).read_text(encoding="utf-8")
     )
-    assert journal["state"] == "marker_ready"
-    assert journal["marker_recorded"] is True
+    assert entry["artifact_status"] == "ready"
+    assert journal["state"] == "complete"
+
+
+def test_fresh_service_publish_recovers_pending_intent_before_next_revision(
+    tmp_path, monkeypatch,
+):
+    first = _leave_durable_marker_ready_intent(tmp_path, monkeypatch)
+    history_path = tmp_path / ".vcstudio" / "reports" / "history.json"
+    disk = json.loads(history_path.read_text(encoding="utf-8"))
+    report_id = first["revision"]["report_id"]
+    lineage = disk["reports"][report_id]
+
+    rebuilt = ReportService(
+        _DurableHost(tmp_path), temp_root=tmp_path / "rebuilt-previews"
+    )
+    original_history_base = rebuilt._history_base
+
+    def frozen_history_base(*_args, **_kwargs):
+        return lineage["latest_sequence"], lineage["latest_manifest_sha256"]
+
+    # Freeze a legitimate next-revision preview without using the read-side
+    # recovery path; publish itself must perform reconciliation under the lock.
+    rebuilt._history_base = frozen_history_base
+    preview = rebuilt.preview(
+        "project.yaml", _request(rebuilt._host.project_id, operation_id="next")
+    )
+    rebuilt._history_base = original_history_base
+
+    published = rebuilt.publish(
+        "project.yaml",
+        str(tmp_path / "next-out"),
+        preview["preview_id"],
+        preview["preview_token"],
+        public=False,
+    )
+
+    assert published["ok"] is True
+    assert published["revision"]["sequence"] == 2
+    after = json.loads(history_path.read_text(encoding="utf-8"))
+    entries = after["reports"][report_id]["revisions"]
+    assert [entry["artifact_status"] for entry in entries] == ["ready", "ready"]
+    first_journal = json.loads(
+        Path(entries[0]["transaction_journal"]).read_text(encoding="utf-8")
+    )
+    assert first_journal["state"] == "complete"
+
+
+def test_two_spawned_services_recover_one_history_projection_idempotently(
+    tmp_path, monkeypatch,
+):
+    result = _leave_durable_marker_ready_intent(tmp_path, monkeypatch)
+    history_path = tmp_path / ".vcstudio" / "reports" / "history.json"
+    before = json.loads(history_path.read_text(encoding="utf-8"))
+    before_generation = before["generation"]
+    context = multiprocessing.get_context("spawn")
+    ready = [context.Event(), context.Event()]
+    start = context.Event()
+    output = context.Queue()
+    processes = [
+        context.Process(
+            target=_recover_history_in_spawned_process,
+            args=(str(tmp_path), ready[index], start, output),
+        )
+        for index in range(2)
+    ]
+    for process in processes:
+        process.start()
+    assert all(event.wait(20) for event in ready)
+    start.set()
+    rows = [output.get(timeout=30) for _ in processes]
+    for process in processes:
+        process.join(30)
+        if process.is_alive():  # pragma: no cover - cleanup for failed synchronization
+            process.terminate()
+            process.join(5)
+
+    assert all(row[0] == "result" for row in rows), rows
+    assert all(
+        row[1]["revisions"][0]["artifact_status"] == "ready" for row in rows
+    )
+    assert all(process.exitcode == 0 for process in processes)
+    after = json.loads(history_path.read_text(encoding="utf-8"))
+    assert after["generation"] == before_generation + 1
+    entry = after["reports"][result["revision"]["report_id"]]["revisions"][0]
+    journal = json.loads(
+        Path(entry["transaction_journal"]).read_text(encoding="utf-8")
+    )
+    assert entry["artifact_status"] == "ready"
+    assert journal["state"] == "complete"
+
+
+@pytest.mark.parametrize("corruption", ("missing_member", "forged_journal"))
+def test_recovery_never_promotes_missing_or_forged_evidence(
+    tmp_path, monkeypatch, corruption,
+):
+    result = _leave_durable_marker_ready_intent(tmp_path, monkeypatch)
+    history_path = tmp_path / ".vcstudio" / "reports" / "history.json"
+    disk = json.loads(history_path.read_text(encoding="utf-8"))
+    entry = disk["reports"][result["revision"]["report_id"]]["revisions"][0]
+    journal_path = Path(entry["transaction_journal"])
+    if corruption == "missing_member":
+        Path(entry["files"]["html"]).unlink()
+    else:
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        journal["history_entry"]["scientific_qualification"] = "forged"
+        journal["intent_sha256"] = report_service_module._sha256_json(
+            journal["history_entry"]
+        )
+        journal_path.write_text(
+            json.dumps(journal, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    rebuilt = ReportService(
+        _DurableHost(tmp_path), temp_root=tmp_path / "rebuilt-previews"
+    )
+    history = rebuilt.history("project.yaml")
+    after = json.loads(history_path.read_text(encoding="utf-8"))
+    after_entry = after["reports"][result["revision"]["report_id"]]["revisions"][0]
+    after_journal = json.loads(journal_path.read_text(encoding="utf-8"))
+
+    assert history["revisions"][0]["artifact_status"] != "ready"
+    assert after_entry["artifact_status"] == "generated_unrecorded"
+    assert after_journal["state"] == "marker_ready"
 
 
 def test_missing_history_never_overwrites_same_lineage_first_revision(tmp_path):

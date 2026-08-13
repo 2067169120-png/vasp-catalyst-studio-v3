@@ -8,6 +8,9 @@
 
   const SCHEMA = 'vcstudio.workspace-context/v1';
   const STORAGE_KEY = 'vcs.workspace.context.v1';
+  const OPERATION_STORAGE_KEY = 'vcs.workspace.operations.v1';
+  const OPERATION_SCHEMA = 'vcstudio.operation-queue/v1';
+  const MAX_OPERATION_RECORDS = 80;
   const LEGACY_PROJECT_STORAGE_KEYS = [
     'vcs.adsorption.current_project', 'vcs.adsorption.compare_projects',
   ];
@@ -16,6 +19,7 @@
   const PROJECT_TOKEN = /^[A-Za-z0-9._~-]{1,160}$/;
   const JOB_TOKEN = /^[A-Za-z0-9._~:-]{1,160}$/;
   const ROUTE_TOKEN = /^[a-z0-9][a-z0-9._-]{0,79}$/;
+  const AUTHORITY_TOKEN = /^[a-f0-9]{32}$/;
   const JOB_STATUS_FILTERS = new Set(['queue', 'run', 'need', 'done', 'fail']);
   const REPORT_QUERY_KEYS = new Set(['project', 'spec', 'revision']);
   const ROUTE_QUERY_KEYS = Object.freeze({
@@ -187,6 +191,7 @@
       sort: {},
       scroll: {},
       draft_refs: {},
+      server_authority_id: '',
       server_revision: 0,
       updated_at_ms: 0,
     };
@@ -199,6 +204,102 @@
   function safeToken(value, pattern = ROUTE_TOKEN) {
     const out = String(value || '').trim();
     return pattern.test(out) ? out : '';
+  }
+
+  function safeAuthorityId(value) {
+    return safeToken(value, AUTHORITY_TOKEN);
+  }
+
+  function safeOperationText(value, limit) {
+    let out = String(value || '');
+    // Keep a useful public error while stripping credentials before paths.  In
+    // particular, do not leave user/password pairs in otherwise valid URLs.
+    out = out.replace(/\b([A-Za-z][A-Za-z0-9+.-]{1,31}:\/\/)[^\s/@:]+:[^\s/@]+@/g,
+      '$1[redacted]@');
+    out = out.replace(
+      /\b((?:proxy[-_ ]?)?authorization\s*:\s*)(?:Basic|Bearer)\s+[^\s,;&]+/gi,
+      '$1[redacted]');
+    out = out.replace(
+      /\b((?:password|passwd|pwd|token|secret|client[_-]?secret|authorization|cookie|api[_-]?key|access[_-]?key|aws_access_key_id|aws_secret_access_key|aws_session_token)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&]+)/gi,
+      '$1[redacted]');
+    out = out.replace(/(?:\bBearer\s+|github_pat_|gh[pousr]_|sk-)[A-Za-z0-9_.-]{8,}/gi,
+      '[redacted]');
+    out = out.replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, '[redacted]');
+    out = out.replace(/-----BEGIN[^\r\n]*PRIVATE KEY-----[^\r\n]*/gi, '[redacted]');
+    out = out.replace(/(?:[A-Za-z]:[\\/]|\\\\)[^\s<>"'`]+/g, '[redacted-path]');
+    // A POSIX absolute path may live under any mount point (for example
+    // /scratch or /work), so a directory-name allowlist is not sufficient.
+    // Requiring a boundary and rejecting // avoids treating URL separators as
+    // local paths.
+    out = out.replace(/(^|[\s("'`=:,;\[])\/(?!\/)[^\s<>"'`]+/g,
+      (_match, prefix) => `${prefix}[redacted-path]`);
+    return out.slice(0, limit);
+  }
+
+  function sanitizeOperationValue(value, depth = 0) {
+    if (typeof value === 'string') return safeOperationText(value, 1000);
+    if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+    if (typeof value === 'boolean' || value === null) return value;
+    if (depth >= 5) return null;
+    if (Array.isArray(value)) {
+      return value.slice(0, 100).map(item => sanitizeOperationValue(item, depth + 1));
+    }
+    if (!value || typeof value !== 'object') return null;
+    const out = {};
+    Object.entries(value).slice(0, 100).forEach(([key, raw]) => {
+      const safeKey = safeToken(key, /^[A-Za-z][A-Za-z0-9._-]{0,79}$/);
+      if (safeKey) out[safeKey] = sanitizeOperationValue(raw, depth + 1);
+    });
+    return out;
+  }
+
+  function normalizedOperation(record) {
+    const source = plainObject(sanitizeOperationValue(record));
+    const id = safeToken(source.id, JOB_TOKEN);
+    if (!id) return null;
+    const status = safeToken(source.status, /^[a-z][a-z0-9._-]{0,39}$/) || 'pending';
+    return {
+      id,
+      kind: safeToken(source.kind, /^[A-Za-z0-9][A-Za-z0-9._:-]{0,59}$/) || 'operation',
+      label: safeOperationText(source.label || 'Operation', 160),
+      status,
+      count: Math.max(0, Number(source.count || 0) || 0),
+      error: safeOperationText(source.error, 500),
+      route: safeToken(source.route, ROUTE_TOKEN),
+      started_at: String(source.started_at || new Date().toISOString()).slice(0, 40),
+      updated_at: String(source.updated_at || new Date().toISOString()).slice(0, 40),
+    };
+  }
+
+  function loadOperationRecords() {
+    const records = new Map();
+    try {
+      const parsed = JSON.parse(localStorage.getItem(OPERATION_STORAGE_KEY) || '{}');
+      if (parsed.schema !== OPERATION_SCHEMA || !Array.isArray(parsed.records)) return records;
+      parsed.records.slice(-MAX_OPERATION_RECORDS).forEach(raw => {
+        const item = normalizedOperation(raw);
+        if (item) records.set(item.id, item);
+      });
+      // Rewrite even a previously stored v1 record through today's sanitizer;
+      // local activity is a cache, never an archive for raw backend payloads.
+      writeOperationRecords(records);
+    } catch (_) { /* malformed local activity is non-authoritative */ }
+    return records;
+  }
+
+  function writeOperationRecords(records) {
+    const safeRecords = Array.from(records.values()).slice(-MAX_OPERATION_RECORDS)
+      .map(item => normalizedOperation(item)).filter(Boolean);
+    localStorage.setItem(OPERATION_STORAGE_KEY, JSON.stringify({
+      schema: OPERATION_SCHEMA,
+      records: sanitizeOperationValue(safeRecords),
+    }));
+  }
+
+  function persistOperationRecords() {
+    try {
+      writeOperationRecords(operationRecords);
+    } catch (_) { /* the queue remains usable in memory when storage is unavailable */ }
   }
 
   function safeQueryValue(key, value) {
@@ -267,6 +368,7 @@
     state.sort = smallRecord(src.sort);
     state.scroll = finiteScrollMap(src.scroll);
     state.draft_refs = plainObject(src.draft_refs);
+    state.server_authority_id = safeAuthorityId(src.server_authority_id);
     state.server_revision = Number.isSafeInteger(Number(src.server_revision))
       ? Math.max(0, Number(src.server_revision)) : 0;
     state.updated_at_ms = Number.isFinite(Number(src.updated_at_ms))
@@ -284,6 +386,7 @@
   }
 
   let state = loadLocalState();
+  let authorityId = state.server_authority_id;
   let revision = state.server_revision;
   let remoteSaveBlocked = false;
   let remoteDirtyHold = false;
@@ -318,36 +421,55 @@
   let lastContextRefreshAt = 0;
   let initialHashWasExplicit = !!safeRoute(window.location.hash);
   const dirtyScopes = new Map();
-  const operationRecords = new Map();
+  const operationRecords = loadOperationRecords();
 
   function publishOperation(record = {}) {
     const id = safeToken(record.id, JOB_TOKEN);
     if (!id) return false;
     const previous = operationRecords.get(id) || {};
     const status = String(record.status || previous.status || 'pending').slice(0, 40);
-    const normalized = {
+    const normalized = normalizedOperation({
       id,
-      kind: String(record.kind || previous.kind || 'operation').slice(0, 60),
-      label: String(record.label || previous.label || 'Operation').slice(0, 160),
+      kind: record.kind || previous.kind,
+      label: record.label || previous.label,
       status,
-      count: Math.max(0, Number(record.count != null ? record.count : previous.count || 0) || 0),
-      error: String(record.error || '').slice(0, 500),
-      route: safeToken(record.route || previous.route, ROUTE_TOKEN),
-      started_at: String(record.started_at || previous.started_at || new Date().toISOString()),
-      updated_at: String(record.updated_at || new Date().toISOString()),
-    };
+      count: record.count != null ? record.count : previous.count,
+      error: record.error,
+      route: record.route || previous.route,
+      started_at: record.started_at || previous.started_at,
+      updated_at: record.updated_at || new Date().toISOString(),
+    });
+    operationRecords.delete(id);
     operationRecords.set(id, normalized);
-    if (operationRecords.size > 50) {
+    if (operationRecords.size > MAX_OPERATION_RECORDS) {
       const oldest = operationRecords.keys().next().value;
       operationRecords.delete(oldest);
     }
+    persistOperationRecords();
     renderActivity();
     return true;
+  }
+
+  function retryOperation(id) {
+    const key = safeToken(id, JOB_TOKEN);
+    const operation = key && operationRecords.get(key);
+    if (!operation || operation.status !== 'failed' || !operation.route) return false;
+    return navigateRoute(operation.route, { source: 'operation-retry' });
+  }
+
+  function clearCompletedOperations() {
+    Array.from(operationRecords.entries()).forEach(([id, operation]) => {
+      if (['succeeded', 'cancelled'].includes(operation.status)) operationRecords.delete(id);
+    });
+    persistOperationRecords();
+    renderActivity();
   }
 
   VCS.operations = {
     publish: publishOperation,
     snapshot() { return Array.from(operationRecords.values()).map(item => Object.assign({}, item)); },
+    retry: retryOperation,
+    clearCompleted: clearCompletedOperations,
   };
 
   function projectToken(context) {
@@ -476,9 +598,15 @@
   }
 
   async function saveRemoteState() {
+    if (remoteSaveTimer) clearTimeout(remoteSaveTimer);
     remoteSaveTimer = null;
     remoteSaveRequested = true;
     if (remoteSaveBlocked) return;
+    if (!authorityId) {
+      remoteSaveBlocked = true;
+      setTimeout(() => refreshWorkspaceContext(), 0);
+      return;
+    }
     if (remoteSaveInFlight) return remoteSaveInFlight;
     remoteSaveInFlight = (async () => {
       while (remoteSaveRequested && !remoteSaveBlocked) {
@@ -486,10 +614,18 @@
         const savedGeneration = localStateGeneration;
         try {
           const out = await VCS.call('workspace_preferences_update',
-            { set: statePayload(), remove: [] }, revision);
+            { set: statePayload(), remove: [] }, revision, authorityId);
           if (!out || out.error === '桥方法不存在:workspace_preferences_update') return;
           if (out.ok) {
+            const returnedAuthorityId = safeAuthorityId(out.authority_id);
+            if (!returnedAuthorityId || returnedAuthorityId !== authorityId) {
+              remoteSaveBlocked = true;
+              setTimeout(() => refreshWorkspaceContext(), 0);
+              return;
+            }
             revision = Number(out.state_revision || out.revision || revision);
+            authorityId = returnedAuthorityId;
+            state.server_authority_id = authorityId;
             state.server_revision = revision;
             remoteSaveBlocked = false;
             persistLocal({ remote: false, touch: false });
@@ -1072,6 +1208,16 @@
     });
   }
 
+  function completeWorkspaceSnapshot(out) {
+    if (!out || out.ok !== true || out.schema !== SCHEMA ||
+        !safeAuthorityId(out.authority_id)) return false;
+    const serverRevision = Number(out.state_revision);
+    return Number.isSafeInteger(serverRevision) && serverRevision >= 0 &&
+      !!out.selection && typeof out.selection === 'object' && !Array.isArray(out.selection) &&
+      !!out.restore && typeof out.restore === 'object' && !Array.isArray(out.restore) &&
+      Array.isArray(out.projects);
+  }
+
   async function refreshWorkspaceContext() {
     const refreshGeneration = ++contextRefreshGeneration;
     let adoptedRemoteRoute = false;
@@ -1084,13 +1230,21 @@
       try { aggregated = await VCS.call('workspace_context_get'); } catch (_) { aggregated = null; }
     }
     if (refreshGeneration !== contextRefreshGeneration) return;
-    if (aggregated && aggregated.ok) {
+    if (aggregated && aggregated.ok && !completeWorkspaceSnapshot(aggregated)) {
+      remoteSaveBlocked = true;
+      return;
+    }
+    if (completeWorkspaceSnapshot(aggregated)) {
+      const serverAuthorityId = safeAuthorityId(aggregated.authority_id);
       const serverRevision = Math.max(0,
         Number(aggregated.state_revision || aggregated.revision || 0) || 0);
-      if (serverRevision < revision) return;
+      const sameAuthority = authorityId && serverAuthorityId === authorityId;
+      if (sameAuthority && serverRevision < revision) return;
+      const authorityReset = !!authorityId && serverAuthorityId !== authorityId;
       const remote = remotePreferences(aggregated);
       const localBaseRevision = Math.max(0, Number(state.server_revision || 0) || 0);
-      const shouldAdoptRemote = remoteSaveBlocked || state.updated_at_ms <= 0 ||
+      const shouldAdoptRemote = authorityReset || !authorityId || remoteSaveBlocked ||
+        state.updated_at_ms <= 0 ||
         localBaseRevision !== serverRevision;
       if (shouldAdoptRemote) {
         const localInteraction = state;
@@ -1114,6 +1268,7 @@
           const explicitProject = routeProject(currentRoute);
           if (explicitProject && explicitProject !== 'current') state.project_id = explicitProject;
         }
+        state.server_authority_id = serverAuthorityId;
         state.server_revision = serverRevision;
         state.updated_at_ms = Date.now();
         remoteSaveRequested = false;
@@ -1121,8 +1276,10 @@
         remoteDirtyHold = preserveDirtyInteraction;
         adoptedRemoteRoute = !preserveDirtyInteraction && !initialHashWasExplicit;
       } else {
+        state.server_authority_id = serverAuthorityId;
         state.server_revision = serverRevision;
       }
+      authorityId = serverAuthorityId;
       revision = serverRevision;
       remoteSaveBlocked = remoteDirtyHold;
       projects = normalizeProjectRows(aggregated.projects || [], []);
@@ -1233,11 +1390,16 @@
           ? 'success' : 'info';
       const label = labels[event.kind];
       const route = event.operation && event.operation.route;
+      const action = event.operation && route
+        ? (event.operation.status === 'failed'
+          ? tr('workspace.operation.retry', '打开并重试')
+          : tr('workspace.operation.open', '打开')) : '';
       return `<div class="activity-item ${severity}"${route ? ` data-operation-route="${VCS.esc(route)}" role="link" tabindex="0"` : ''}><span class="activity-kind">${VCS.esc(event.operation
         ? tr('workspace.activity.operation', '操作')
         : label ? tr(label[0], label[1]) : event.kind || tr('workspace.activity.item', '活动'))}</span>` +
         `<div><b>${VCS.esc(event.project || event.cluster || tr('workspace.context.workspace', '工作区'))}</b>` +
-        `<p>${VCS.esc(event.text || '')}</p></div><time>${VCS.esc(event.time || '')}</time></div>`;
+        `<p>${VCS.esc(event.text || '')}</p>${action ? `<small>${VCS.esc(action)}</small>` : ''}</div>` +
+        `<time>${VCS.esc(event.time || '')}</time></div>`;
     }).join('');
   }
 
@@ -1916,6 +2078,8 @@
       guardUnsaved,
       parseRoute,
       applyRoute,
+      refreshWorkspaceContext,
+      saveRemoteState,
       configure({ projectRows = [], projectId = '', route = null } = {}) {
         projects = Array.isArray(projectRows)
           ? projectRows.map(item => Object.assign({}, item)) : [];
@@ -1926,6 +2090,9 @@
       snapshot() {
         return {
           state: Object.assign({}, state),
+          authority_id: authorityId,
+          revision,
+          remote_save_blocked: remoteSaveBlocked,
           selected_project: selectedProject && Object.assign({}, selectedProject),
           current_route: currentRoute,
           dirty_scopes: Array.from(dirtyScopes.keys()),

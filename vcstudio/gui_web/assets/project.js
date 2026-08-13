@@ -21,6 +21,14 @@
   const LEGACY_COMPARE_PROJECTS_KEY = 'vcs.adsorption.compare_projects';
   const COMPARE_PROJECT_IDS_KEY = 'vcs.adsorption.compare_project_ids.v1';
   const PROJECT_ID_RE = /^[A-Za-z0-9._~-]{1,160}$/;
+  const IMPORT_DRAFT_ID = 'project-import';
+  // This marker deliberately contains no source/output path, project name,
+  // candidate detail, confirmation rationale, or other form body.  The
+  // workspace service projects only its opaque reference; reopening the entry
+  // returns the user to the import flow and asks them to reselect local data.
+  const IMPORT_DRAFT_MARKER = JSON.stringify({
+    schema: 'vcstudio.safe-draft-ref/v1', kind: 'project-import',
+  });
   const SINGLE_REPORT_FORMATS = Object.freeze([
     {
       id: 'pj-report-format-html', value: 'html', label: 'HTML',
@@ -1156,6 +1164,83 @@
         : gate.issue;
     }
     if (button) button.disabled = !gate.ok || !name || !root;
+    persistImportDraftReference();
+  }
+
+  function importDrafts() {
+    return VCS.workspace && VCS.workspace.drafts || null;
+  }
+
+  function hasImportDraftContent() {
+    return !!(val('pj-import-source') || val('pj-import-name') || val('pj-import-root') ||
+      State.importResult || State.importRows.length);
+  }
+
+  function updateImportDraftAction() {
+    const button = $('pj-import-cancel');
+    const drafts = importDrafts();
+    if (button) button.disabled = !(drafts && drafts.load(IMPORT_DRAFT_ID));
+  }
+
+  function persistImportDraftReference() {
+    const drafts = importDrafts();
+    if (!drafts) return false;
+    if (!hasImportDraftContent()) {
+      if (drafts.load(IMPORT_DRAFT_ID)) drafts.remove(IMPORT_DRAFT_ID);
+      updateImportDraftAction();
+      return false;
+    }
+    drafts.save(IMPORT_DRAFT_ID, IMPORT_DRAFT_MARKER, {
+      label: tr('runtime.project.import_draft.label', {},
+        '项目导入流程尚未完成', 'Project import flow is unfinished'),
+      kind: 'project-import',
+    });
+    updateImportDraftAction();
+    return true;
+  }
+
+  function clearImportDraftReference() {
+    const drafts = importDrafts();
+    if (drafts && drafts.load(IMPORT_DRAFT_ID)) drafts.remove(IMPORT_DRAFT_ID);
+    updateImportDraftAction();
+  }
+
+  function discardImportDraft() {
+    clearImportDraftReference();
+    State.importRows = [];
+    State.importResult = null;
+    ['pj-import-source', 'pj-import-name', 'pj-import-root', 'pj-import-search'].forEach(
+      id => setVal(id, ''));
+    if ($('pj-import-filter')) $('pj-import-filter').value = 'attention';
+    if ($('pj-import-review')) $('pj-import-review').hidden = true;
+    if ($('pj-import-done')) $('pj-import-done').hidden = true;
+    showImportProblem('', '');
+    setImportStep(1);
+    renderImport();
+    const source = $('pj-import-source');
+    if (source) source.focus();
+    VCS.toast(tr('runtime.project.import_draft.discarded', {},
+      '已取消本次导入并清除恢复入口', 'The import was cancelled and its resume entry was cleared'));
+  }
+
+  function resumeImportDraftEntry() {
+    const drafts = importDrafts();
+    if (!(drafts && drafts.load(IMPORT_DRAFT_ID))) return false;
+    setExplicitWorkflow('import');
+    setAccordionOpen('pj-create-card', false);
+    setAccordionOpen('pj-import-card', true);
+    scrollToCard('pj-import-card');
+    if (!hasImportDraftContent()) {
+      showImportProblem(tr('runtime.project.import_draft.restored', {},
+        '已恢复到项目导入入口', 'Returned to the project import entry'),
+      tr('runtime.project.import_draft.private', {},
+        '为保护本地路径和核对说明，恢复引用不保存表单正文；请重新选择结果文件夹。',
+        'To protect local paths and review notes, the resume reference stores no form body. Reselect the results folder.'));
+    }
+    const source = $('pj-import-source');
+    if (source) source.focus();
+    updateImportDraftAction();
+    return true;
   }
 
   function renderImport() {
@@ -1186,6 +1271,10 @@
       VCS.toast(tr("runtime.project.scanimport.text_1df4aff6b5", {}, '请先选择包含计算结果的根文件夹', 'Select the root folder containing calculation results first'), 'fail');
       return;
     }
+    // Folder pickers assign values programmatically and therefore do not emit
+    // an input event.  Record the safe resume marker before validation so a
+    // failed/interrupted scan still leaves a truthful entry point.
+    persistImportDraftReference();
     const button = $('pj-import-scan');
     const review = $('pj-import-review');
     const done = $('pj-import-done');
@@ -1269,6 +1358,9 @@
         VCS.toast(tr("runtime.project.commitimport.text_f06f2852dd", {}, '导入未完成；扫描后结果可能有变化，请按提示重新检查', 'Import did not complete; results may have changed since scanning, so check again as instructed'), 'fail');
         return;
       }
+      // The project was durably created.  Follow-up analysis/report refreshes
+      // may still fail independently, but this import draft is complete.
+      clearImportDraftReference();
       textList(r.warnings).forEach(x => VCS.log(x, 'warnc'));
       showImportProblem('', '');
       const createdProjectId = projectIdFrom(r);
@@ -4393,6 +4485,7 @@
     wire('pj-import-apply-task', applyImportTask);
     wire('pj-import-confirm-selected', confirmSelectedImports);
     wire('pj-import-commit', commitImport);
+    wire('pj-import-cancel', discardImportDraft);
     const importSearch = $('pj-import-search');
     if (importSearch) importSearch.addEventListener('input', renderImportRows);
     const importFilter = $('pj-import-filter');
@@ -4404,7 +4497,7 @@
       });
       renderImport();
     });
-    ['pj-import-name', 'pj-import-root'].forEach(id => {
+    ['pj-import-source', 'pj-import-name', 'pj-import-root'].forEach(id => {
       const el = $(id); if (el) el.addEventListener('input', updateImportCommit);
     });
     wire('pj-slab-btn', () => {
@@ -4591,6 +4684,7 @@
   document.addEventListener('vcs:page', e => {
     if (e.detail && e.detail.page === 'project') {
       reloadProjects(); loadLisProfiles();
+      if (e.detail.source === 'resume-center') resumeImportDraftEntry();
     } else {
       State.explicitWorkflow = '';
       updateProjectHub();
@@ -4622,6 +4716,10 @@
       refreshComparePreview,
       makeFigures,
       makeCompareFigures,
+      persistImportDraftReference,
+      clearImportDraftReference,
+      discardImportDraft,
+      resumeImportDraftEntry,
     };
   }
 })();

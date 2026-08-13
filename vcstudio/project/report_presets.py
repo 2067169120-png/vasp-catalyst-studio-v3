@@ -173,31 +173,27 @@ _FORMAT_LABELS = {
     "pdf": ("PDF", "PDF"),
 }
 
-# A final badge cannot be attached to a shell containing only methodology,
-# caveats, or next-step prose.  The policy is keyed by the server-owned preset
-# even though the current v1 presets share most result-bearing sections; this
-# keeps later preset versions from silently inheriting a weaker generic rule.
-_FINAL_OUTLINE_POLICY = {
-    "quick-decision-brief": frozenset({
-        "executive_summary", "key_findings",
-    }),
-    "scientific-review": frozenset({
-        "executive_summary", "key_findings", "candidate_evaluations",
-        "adsorption_table", "comparison_table",
-    }),
-    "manuscript-materials": frozenset({
-        "executive_summary", "key_findings", "candidate_evaluations",
-        "adsorption_table", "comparison_table",
-    }),
-    "supporting-information": frozenset({
-        "executive_summary", "candidate_evaluations", "adsorption_table",
-        "comparison_table",
-    }),
-    "diagnostic-repair": frozenset({
-        "executive_summary", "key_findings", "candidate_evaluations",
-        "adsorption_table", "comparison_table",
-    }),
-}
+# These categories are server-owned.  A client may reorder or omit optional
+# sections, but it cannot attach a ``final`` badge to a methods-only shell.  The
+# decision brief is intentionally stricter than a general research report: a
+# finding must be accompanied by a figure or table which will actually be bound
+# into the rendered outline.
+_DECISION_BRIEF_PRESETS = frozenset({"quick-decision-brief"})
+_FINAL_RESEARCH_REPORT_PRESETS = frozenset({
+    "scientific-review",
+    "manuscript-materials",
+    "supporting-information",
+    "diagnostic-repair",
+})
+_SUMMARY_OR_CONCLUSION_SECTIONS = frozenset({
+    "executive_summary", "key_findings",
+})
+_RESULT_OR_EVIDENCE_SECTIONS = frozenset({
+    "candidate_evaluations", "adsorption_table", "comparison_table", "figures",
+})
+_BOUND_FIGURE_OR_TABLE_SECTIONS = frozenset({
+    "candidate_evaluations", "adsorption_table", "comparison_table", "figures",
+})
 
 
 class ReportRequestError(ValueError):
@@ -600,25 +596,104 @@ def enforce_report_outline_policy(
     report_kind: str,
     outline: Sequence[str],
 ) -> tuple[str, ...]:
-    """Enforce the server-owned minimum content required for a final report."""
+    """Enforce the server-owned section contract required for a final report."""
 
     identifier = str(preset_id or "").strip()
     kind = str(report_kind or "").strip().lower()
     normalized = tuple(str(item) for item in outline)
     if kind != "final":
         return normalized
-    required_any = _FINAL_OUTLINE_POLICY.get(identifier)
-    if required_any is None:
+    selected = frozenset(normalized)
+    if identifier in _DECISION_BRIEF_PRESETS:
+        missing = []
+        if "key_findings" not in selected:
+            missing.append("key_findings")
+        if _BOUND_FIGURE_OR_TABLE_SECTIONS.isdisjoint(selected):
+            missing.append("a bound figure/table section")
+        if "limitations" not in selected:
+            missing.append("limitations")
+        if missing:
+            raise ReportRequestError(
+                "final decision brief outline must include key_findings, at least "
+                "one bound figure/table section, and limitations; missing: "
+                + ", ".join(missing)
+            )
+        return normalized
+    if identifier not in _FINAL_RESEARCH_REPORT_PRESETS:
         raise ReportRequestError(
             f"final outline policy is unavailable for preset {identifier!r}"
         )
-    if required_any.isdisjoint(normalized):
-        allowed = ", ".join(sorted(required_any))
+    missing = []
+    if _SUMMARY_OR_CONCLUSION_SECTIONS.isdisjoint(selected):
+        missing.append("a summary/conclusion section")
+    if _RESULT_OR_EVIDENCE_SECTIONS.isdisjoint(selected):
+        missing.append("a scientific result/evidence section")
+    if "methods" not in selected:
+        missing.append("methods")
+    if "limitations" not in selected:
+        missing.append("limitations")
+    if missing:
         raise ReportRequestError(
-            "final report outline must include at least one scientific result "
-            f"section for preset {identifier!r}: {allowed}"
+            "final report outline for a research report must include a "
+            "summary/conclusion, at least one scientific result/evidence section, "
+            "methods, and limitations; missing: " + ", ".join(missing)
         )
     return normalized
+
+
+def enforce_report_content_policy(
+    preset_id: str,
+    report_kind: str,
+    content: Mapping[str, Any],
+) -> None:
+    """Reject a visually empty final even when its outline names every section.
+
+    ``content`` is the normalized renderer model.  Consequently a truthy table
+    already has rows and every figure has a concrete source; checking only
+    selected outline members guarantees the evidence will be visible rather
+    than merely present in an unrendered model field.
+    """
+
+    identifier = str(preset_id or "").strip()
+    kind = str(report_kind or "").strip().lower()
+    if kind != "final":
+        return
+    outline = tuple(str(item) for item in content.get("outline") or ())
+    enforce_report_outline_policy(identifier, kind, outline)
+    selected = frozenset(outline)
+
+    def has_content(section: str) -> bool:
+        return section in selected and bool(content.get(section))
+
+    if identifier in _DECISION_BRIEF_PRESETS:
+        missing = []
+        if not has_content("key_findings"):
+            missing.append("key_findings content")
+        if not any(has_content(section) for section in _BOUND_FIGURE_OR_TABLE_SECTIONS):
+            missing.append("a rendered figure/table")
+        if not has_content("limitations"):
+            missing.append("limitations content")
+        if missing:
+            raise ReportRequestError(
+                "final decision brief content is incomplete; missing: "
+                + ", ".join(missing)
+            )
+        return
+
+    missing = []
+    if not any(has_content(section) for section in _SUMMARY_OR_CONCLUSION_SECTIONS):
+        missing.append("summary/conclusion content")
+    if not any(has_content(section) for section in _RESULT_OR_EVIDENCE_SECTIONS):
+        missing.append("scientific result/evidence content")
+    if not has_content("methods"):
+        missing.append("methods content")
+    if not has_content("limitations"):
+        missing.append("limitations content")
+    if missing:
+        raise ReportRequestError(
+            "final research report content is incomplete; missing: "
+            + ", ".join(missing)
+        )
 
 
 def _safe_capability_reason(value: Any, fallback: str = "") -> str:
@@ -858,6 +933,7 @@ __all__ = [
     "SUPPORTED_THEMES",
     "ReportRequestError",
     "builtin_report_presets",
+    "enforce_report_content_policy",
     "enforce_report_outline_policy",
     "get_report_preset",
     "normalize_report_request",

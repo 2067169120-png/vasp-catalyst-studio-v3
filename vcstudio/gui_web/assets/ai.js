@@ -20,7 +20,7 @@
     spec: null, plan: null, planResult: null, tables: null, compareProj: null,
     variants: null,
     chatSession: null, chatMessages: [], chatAttachments: [],
-    chatSelected: new Set(), chatBusy: false,
+    chatSelected: new Set(), chatBusy: false, outboundGeneration: 0,
   };
 
   function leafVal(leaf) {
@@ -48,9 +48,54 @@
   function setChatBusy(value) {
     State.chatBusy = !!value;
     const send = $('ai-chat-send'), stop = $('ai-chat-stop'), input = $('ai-chat-input');
+    const preview = $('ai-chat-preview-outbound');
     if (send) send.disabled = State.chatBusy;
     if (stop) stop.disabled = !State.chatBusy;
     if (input) input.disabled = State.chatBusy;
+    if (preview) preview.disabled = State.chatBusy;
+  }
+
+  function invalidateOutboundPreview() {
+    State.outboundGeneration += 1;
+    const box = $('ai-chat-outbound');
+    if (box) box.hidden = true;
+  }
+
+  async function previewChatOutbound() {
+    if (State.chatBusy) return;
+    if (!State.chatSession) await newChat();
+    const input = $('ai-chat-input');
+    const text = (input && input.value.trim()) || '';
+    if (!text || !State.chatSession) return;
+    document.querySelectorAll('[data-chat-file]').forEach(el => {
+      if (el.checked) State.chatSelected.add(el.dataset.chatFile);
+      else State.chatSelected.delete(el.dataset.chatFile);
+    });
+    const generation = ++State.outboundGeneration;
+    const sessionId = State.chatSession;
+    const result = await VCS.call(
+      'ai_chat_outbound_preview', sessionId, text, Array.from(State.chatSelected));
+    if (generation !== State.outboundGeneration || sessionId !== State.chatSession) return;
+    if (!result || result.ok === false || result.error || !result.preview) {
+      VCS.log(tr('runtime.ai.chat.outbound_failed', {
+        error: result && result.error || tr(
+          'runtime.ai.common.unknown_error', {}, '未知错误', 'Unknown error'),
+      }, '外部数据预览失败：{error}', 'External-data preview failed: {error}'), 'failc');
+      return;
+    }
+    const preview = result.preview;
+    const box = $('ai-chat-outbound');
+    const summary = $('ai-chat-outbound-summary');
+    const content = $('ai-chat-outbound-content');
+    if (summary) summary.textContent = tr('runtime.ai.chat.outbound_summary', {
+      destination: preview.destination || '-', model: preview.model || '-',
+      messages: preview.message_count || 0, attachments: preview.selected_attachment_count || 0,
+      characters: preview.character_count || 0,
+    }, '目标 {destination} · 模型 {model} · {messages} 条消息 · {attachments} 个附件 · {characters} 字符',
+    'Destination {destination} · model {model} · {messages} messages · {attachments} attachments · {characters} characters');
+    if (content) content.textContent = (preview.messages || []).map(item =>
+      `[${String(item.role || 'message')}]\n${String(item.content || '')}`).join('\n\n');
+    if (box) box.hidden = false;
   }
 
   function renderChat() {
@@ -133,6 +178,7 @@
     const valid = new Set(State.chatAttachments.map(item => item.id));
     State.chatSelected = new Set(
       Array.from(State.chatSelected).filter(id => valid.has(id)));
+    invalidateOutboundPreview();
     renderChat();
   }
 
@@ -246,6 +292,7 @@
       } else {
         if (input) input.value = '';
         State.chatSelected = new Set();
+        invalidateOutboundPreview();
       }
     } finally {
       setChatBusy(false);
@@ -766,6 +813,7 @@
     if (inited) return; inited = true;
     wire('ai-chat-new', newChat);
     wire('ai-chat-attach', attachChatFiles);
+    wire('ai-chat-preview-outbound', previewChatOutbound);
     wire('ai-chat-send', sendChat);
     wire('ai-chat-stop', stopChat);
     const chatSession = $('ai-chat-session');
@@ -778,6 +826,7 @@
       if (!input) return;
       if (input.checked) State.chatSelected.add(input.dataset.chatFile);
       else State.chatSelected.delete(input.dataset.chatFile);
+      invalidateOutboundPreview();
     });
     const chatInput = $('ai-chat-input');
     if (chatInput) chatInput.addEventListener('keydown', e => {
@@ -785,6 +834,7 @@
         e.preventDefault(); sendChat();
       }
     });
+    if (chatInput) chatInput.addEventListener('input', invalidateOutboundPreview);
     wire('ai-pdf-btn', pickPdf);
     wire('ai-extract-btn', extract);
     wire('ai-plan-btn', plan);

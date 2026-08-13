@@ -437,6 +437,10 @@ def save_task(campaign_dir_path: str | os.PathLike, task: dict, *,
     candidate.setdefault('revision', 0)
     candidate.setdefault('input_fingerprints', {})
     validate_task(candidate)
+    if candidate.get('rung') == 'accepted':
+        raise ValueError(
+            'accepted 任务不能通过 create-only save_task 写入；'
+            '必须由 states.promote_accepted 使用权威 GateDecision 持久化')
     tid = str(candidate['id'])
     path = task_path(campaign_dir_path, tid)
     with _task_guard(path):
@@ -474,6 +478,10 @@ def persist_task(campaign_dir_path: str | os.PathLike, task: dict, *,
     candidate['revision'] = expected_revision + 1
     candidate.setdefault('input_fingerprints', {})
     validate_task(candidate)
+    if candidate.get('rung') == 'accepted' and gate_decision is None:
+        raise ValueError(
+            'accepted 任务持久化必须携带权威 GateDecision；'
+            '不能通过普通 revision CAS 直写')
     if gate_decision is not None and candidate.get('rung') != 'accepted':
         raise ValueError('GateDecision 事务只允许持久化 accepted 候选任务')
 

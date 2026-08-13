@@ -161,6 +161,26 @@
     return rows.map(r => r.dir);
   }
 
+  function operationTargetRows(dirs) {
+    const byDir = new Map(State.rows.map(row => [String(row.dir || ''), row]));
+    return Array.from(new Set((dirs || []).map(String))).map(dir => byDir.get(dir)).filter(Boolean);
+  }
+
+  function operationTargetText(dirs) {
+    return operationTargetRows(dirs).map((row, index) => {
+      const name = String(row.name || base(row.dir));
+      const project = String(row.project || tr('runtime.jobs.group.standalone', {},
+        '单独作业', 'Standalone jobs'));
+      const state = String(row.state || 'CREATED');
+      const cluster = String(row.cluster || tr('runtime.jobs.selection.unbound', {},
+        '未绑定集群', 'Unbound'));
+      return tr('runtime.jobs.confirm.target_row', {
+        index: index + 1, name, project, state, cluster,
+      }, '{index}. {name}｜项目：{project}｜状态：{state}｜集群：{cluster}',
+      '{index}. {name} | Project: {project} | Status: {state} | Cluster: {cluster}');
+    }).join('\n');
+  }
+
   function requireProfile() {
     const name = currentProfile();
     if (!name || !State.profiles[name]) {
@@ -1705,9 +1725,9 @@
     }
     return withExclusiveOperation('continue', actionLabel, dirs, name, async op => {
       const ok = await VCS.confirm(tr('runtime.jobs.continue.confirm', {
-        count: dirs.length, server: name,
-      }, '将对选中的 {count} 个作业从 CONTCAR 续算并重投到「{server}」\nINCAR 冻结;每作业上限 3 轮。不可续算的会被后端跳过。\n\n继续?',
-      'Continue {count} selected jobs from CONTCAR and resubmit them to "{server}"?\nINCAR is frozen and each job is limited to 3 rounds. The backend will skip jobs that cannot be continued.\n\nContinue?'));
+        count: dirs.length, server: name, targets: operationTargetText(dirs),
+      }, '将从 CONTCAR 续算并重投以下 {count} 个作业到「{server}」：\n{targets}\n\nINCAR 冻结；每作业上限 3 轮。不可续算的会被后端跳过。\n\n继续?',
+      'Continue and resubmit these {count} jobs from CONTCAR to "{server}":\n{targets}\n\nINCAR is frozen and each job is limited to 3 rounds. The backend will skip jobs that cannot be continued.\n\nContinue?'));
       if (!ok) return { status: 'cancelled' };
       updateOperation(op, 'running');
       VCS.log(tr('runtime.jobs.continue.connecting', { count: dirs.length },
@@ -2076,9 +2096,10 @@
       return;
     }
     return withExclusiveOperation('cancel', actionLabel, dirs, name, async op => {
-      if (!await VCS.confirm(tr('runtime.jobs.cancel.confirm', { count: dirs.length },
-        '确认取消勾选的 {count} 个作业?(qdel/scancel + 台账标记 FAILED/用户取消)',
-        'Cancel the {count} selected jobs? This runs qdel/scancel and marks them FAILED/user-cancelled in the ledger.'))) {
+      if (!await VCS.confirm(tr('runtime.jobs.cancel.confirm', {
+        count: dirs.length, server: name, targets: operationTargetText(dirs),
+      }, '确认在「{server}」取消以下 {count} 个作业？\n{targets}\n\n这会执行 qdel/scancel，并在台账标记 FAILED/用户取消。',
+      'Cancel these {count} jobs on "{server}"?\n{targets}\n\nThis runs qdel/scancel and marks them FAILED/user-cancelled in the ledger.'))) {
         return { status: 'cancelled' };
       }
       updateOperation(op, 'running');
@@ -2838,7 +2859,7 @@
     publicJobs.__test = {
       State, performReload, renderSelectionTray, renderOperationQueue,
       renderResourceForecast, estimateSelectedResources, invalidateResourceForecast,
-      withExclusiveOperation,
+      withExclusiveOperation, operationTargetRows, operationTargetText,
     };
   }
   window.Jobs = publicJobs;

@@ -33,7 +33,9 @@ def test_default_is_full_and_collects_chart_and_rdkit_resources(monkeypatch):
 
     assert options.lite is False
     collected = set(_option_values(cmd, '--collect-all'))
-    assert {'matplotlib', 'rdkit', 'docx', 'pypdf', 'reportlab'} <= collected
+    assert {
+        'matplotlib', 'rdkit', 'docx', 'pypdf', 'reportlab', 'openpyxl',
+    } <= collected
     assert _option_values(cmd, '--collect-binaries') == ['numpy']
     excluded = _option_values(cmd, '--exclude-module')
     assert 'matplotlib' not in excluded
@@ -57,7 +59,9 @@ def test_lite_profile_is_explicit_and_does_not_require_heavy_modules(monkeypatch
     _all_available(
         monkeypatch,
         unavailable={
-            'matplotlib', 'numpy', 'rdkit', 'docx', 'pypdf', 'reportlab', 'DECIMER'},
+            'matplotlib', 'numpy', 'rdkit', 'docx', 'pypdf', 'reportlab',
+            'openpyxl', 'DECIMER',
+        },
     )
 
     cmd, options = build_exe.build_command(['--lite'])
@@ -65,7 +69,8 @@ def test_lite_profile_is_explicit_and_does_not_require_heavy_modules(monkeypatch
     assert options.lite is True
     excluded = set(_option_values(cmd, '--exclude-module'))
     assert {
-        'matplotlib', 'numpy', 'rdkit', 'docx', 'pypdf', 'reportlab', 'DECIMER'
+        'matplotlib', 'numpy', 'rdkit', 'docx', 'pypdf', 'reportlab', 'openpyxl',
+        'DECIMER',
     } <= excluded
     assert 'matplotlib' not in _option_values(cmd, '--collect-all')
     assert 'rdkit' not in _option_values(cmd, '--collect-all')
@@ -82,7 +87,7 @@ def test_no_charts_preserves_old_meaning_and_keeps_other_full_features(monkeypat
     collected = set(_option_values(cmd, '--collect-all'))
     assert 'matplotlib' in excluded
     assert 'numpy' not in excluded
-    assert {'rdkit', 'docx', 'pypdf', 'reportlab'} <= collected
+    assert {'rdkit', 'docx', 'pypdf', 'reportlab', 'openpyxl'} <= collected
     assert _option_values(cmd, '--collect-binaries') == ['numpy']
 
 
@@ -115,6 +120,7 @@ def test_core_dependencies_are_required_even_for_lite_build(monkeypatch):
     ('docx', 'python-docx'),
     ('pypdf', 'pypdf'),
     ('reportlab', 'reportlab'),
+    ('openpyxl', 'openpyxl'),
 ])
 def test_full_build_requires_document_features(monkeypatch, module, package):
     _all_available(monkeypatch, unavailable={module})

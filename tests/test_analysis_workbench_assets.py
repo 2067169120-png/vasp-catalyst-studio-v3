@@ -4,6 +4,8 @@ import re
 import json
 from pathlib import Path
 
+from tests.test_workspace_runtime_assets import _run_node
+
 
 ASSETS = Path(__file__).parents[1] / "vcstudio" / "gui_web" / "assets"
 LOCALES = ASSETS.parents[1] / "shared" / "locales"
@@ -125,6 +127,41 @@ def test_capability_cards_disable_every_non_available_state_and_offer_one_action
     assert "action.className = 'aw-next-action'" in registry
     assert "CAPABILITY_ACTION_KEYS[capabilityStatus]" in registry
     assert ".aw-registry button:disabled" in css
+
+
+def test_unavailable_analysis_is_disabled_in_the_executable_fake_dom():
+    """A server-declared unavailable capability is never an ordinary action."""
+    _run_node(
+        r"""
+const registry = element('aw-registry', { tagName: 'UL' });
+loadAsset(process.argv[1]);
+const seam = window.__VCS_ANALYSIS_TEST__;
+assert.ok(seam, 'guarded analysis seam was not exposed');
+seam.configure({
+  analysisId: 'adsorption-energy',
+  preferences: { favorites: [] },
+  catalog: { analyses: [
+    { id: 'adsorption-energy', label_en: 'Adsorption', description_en: 'Ready',
+      capability_status: 'available', activatable: true },
+    { id: 'elf-analysis', label_en: 'ELF', description_en: 'Missing ELFCAR',
+      capability_status: 'unavailable', activatable: false,
+      next_action: 'Generate ELFCAR first' },
+  ] },
+});
+seam.renderRegistry();
+assert.strictEqual(registry.children.length, 2);
+const available = registry.children[0].children[0];
+const unavailable = registry.children[1].children[0];
+assert.strictEqual(available.disabled, false);
+assert.strictEqual(available.dataset.capabilityStatus, 'available');
+assert.strictEqual(unavailable.disabled, true);
+assert.strictEqual(unavailable.dataset.capabilityStatus, 'unavailable');
+assert.strictEqual(unavailable.children[1].dataset.status, 'unavailable');
+assert.match(unavailable.children[3].textContent, /Generate ELFCAR first/);
+assert.strictEqual(registry.getAttribute('aria-busy'), 'false');
+""",
+        str(ASSETS / "analysis-workbench.js"),
+    )
 
 
 def test_analysis_capability_and_server_result_i18n_keys_are_synced():

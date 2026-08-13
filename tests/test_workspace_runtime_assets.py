@@ -281,6 +281,173 @@ assert.strictEqual(trace.events.filter(item => item.type === 'vcs:workspace-proj
     )
 
 
+def test_operation_queue_persists_redacted_failures_and_exposes_safe_retry_route():
+    _run_node(
+        r"""
+storage.set('vcs.workspace.operations.v1', JSON.stringify({
+  schema: 'vcstudio.operation-queue/v1',
+  records: [{
+    id: 'old-job', kind: 'submit', label: 'Old cached failure', status: 'failed',
+    count: 1, route: 'run-jobs', error: 'Safe summary',
+    nested_backend_payload: {
+      password: 'must-not-survive', path: '/scratch/private/old-job',
+    },
+  }],
+}));
+loadAsset(process.argv[1]);
+assert.ok(VCS.operations && typeof VCS.operations.publish === 'function');
+const rewrittenCache = storage.get('vcs.workspace.operations.v1');
+assert.ok(!rewrittenCache.includes('must-not-survive'));
+assert.ok(!rewrittenCache.includes('/scratch/private'));
+assert.strictEqual(VCS.operations.publish({
+  id: 'continue-job-1', kind: 'continue', label: 'Continue one job',
+  status: 'failed', count: 1, route: 'run-jobs',
+  error: [
+    'Submission failed but can be retried.',
+    'C:\\Users\\alice\\Private\\job.yaml',
+    '/scratch/team/private/job.yaml',
+    'password=hunter2',
+    'https://alice:swordfish@example.test/api',
+    'AKIA1234567890ABCDEF',
+    'aws_secret_access_key=abcdEFGH0123456789/secret',
+    'github_pat_1234567890secret',
+    'client_secret=hunter2-client',
+    'Authorization: Basic dXNlcjpwYXNzd29yZA==',
+    'failed,/scratch/private/punctuated-job.yaml',
+  ].join(' '),
+}), true);
+const records = VCS.operations.snapshot();
+assert.strictEqual(records.length, 2);
+const current = records.find(item => item.id === 'continue-job-1');
+assert.strictEqual(current.status, 'failed');
+assert.strictEqual(current.route, 'run-jobs');
+assert.ok(current.error.includes('Submission failed but can be retried.'));
+assert.ok(current.error.includes('[redacted-path]'));
+assert.ok(current.error.includes('[redacted]'));
+const rawStored = storage.get('vcs.workspace.operations.v1');
+for (const forbidden of [
+  'alice', 'swordfish', 'hunter2', 'github_pat_', 'AKIA1234567890ABCDEF',
+  'abcdEFGH0123456789', 'dXNlcjpwYXNzd29yZA', '/scratch/', 'C:\\Users\\',
+]) assert.ok(!rawStored.includes(forbidden), forbidden + ' leaked to localStorage');
+const stored = JSON.parse(rawStored);
+assert.strictEqual(stored.schema, 'vcstudio.operation-queue/v1');
+assert.strictEqual(stored.records.length, 2);
+assert.strictEqual(stored.records.find(item => item.id === 'continue-job-1').error, current.error);
+assert.ok(await VCS.operations.retry('continue-job-1'));
+assert.strictEqual(trace.history.at(-1).url, '#/jobs');
+""",
+        str(ASSETS / "workspace.js"),
+    )
+
+
+def test_workspace_adopts_explicit_authority_reset_and_resumes_cas_saves():
+    _run_node(
+        r"""
+const oldAuthority = 'a'.repeat(32);
+const newAuthority = 'b'.repeat(32);
+storage.set('vcs.workspace.context.v1', JSON.stringify({
+  schema: 'vcstudio.workspace-context/v1', route: '#/home', project_id: '',
+  analysis_id: '', selected_job_id: '', panels: {}, filters: {}, sort: {}, scroll: {},
+  draft_refs: {
+    import_flow: { project_id: null, route: '#/home', updated_at_ms: 10,
+      dirty: true, status: 'unverified_draft', size: 12 },
+  },
+  server_authority_id: oldAuthority, server_revision: 5, updated_at_ms: 20,
+}));
+const completeSnapshot = {
+  ok: true, schema: 'vcstudio.workspace-context/v1', authority_id: newAuthority,
+  state_revision: 0,
+  selection: { route_hash: '#/home', project_id: null, analysis_id: null, job_id: null },
+  restore: { panels: {}, filters: {}, sort: {}, scroll: {}, draft_refs: {} },
+  projects: [],
+};
+let updateCalls = 0;
+VCS.call = async (method, ...args) => {
+  trace.calls.push({ method, args });
+  if (method === 'workspace_preferences_update') {
+    updateCalls += 1;
+    if (updateCalls === 1) {
+      return { ok: false, conflict: true, authority_id: newAuthority,
+        state_revision: 0, preferences: {} };
+    }
+    return { ok: true, conflict: false, authority_id: newAuthority,
+      state_revision: 1, preferences: args[0].set };
+  }
+  if (method === 'workspace_context') return completeSnapshot;
+  return {};
+};
+loadAsset(process.argv[1]);
+const seam = window.__VCS_WORKSPACE_TEST__;
+let snapshot = seam.snapshot();
+assert.strictEqual(snapshot.authority_id, oldAuthority);
+assert.strictEqual(snapshot.revision, 5);
+
+await seam.saveRemoteState();
+assert.strictEqual(seam.snapshot().remote_save_blocked, true);
+await seam.refreshWorkspaceContext();
+snapshot = seam.snapshot();
+assert.strictEqual(snapshot.authority_id, newAuthority);
+assert.strictEqual(snapshot.revision, 0);
+assert.strictEqual(snapshot.remote_save_blocked, false);
+assert.ok(snapshot.state.draft_refs.import_flow, 'local draft reference must survive reset adoption');
+
+await seam.saveRemoteState();
+const updates = trace.calls.filter(item => item.method === 'workspace_preferences_update');
+assert.strictEqual(updates.length, 2);
+assert.deepStrictEqual(updates.map(item => item.args.slice(1)), [
+  [5, oldAuthority], [0, newAuthority],
+]);
+snapshot = seam.snapshot();
+assert.strictEqual(snapshot.authority_id, newAuthority);
+assert.strictEqual(snapshot.revision, 1);
+assert.strictEqual(snapshot.remote_save_blocked, false);
+""",
+        str(ASSETS / "workspace.js"),
+    )
+
+
+def test_workspace_rejects_lower_revision_from_same_authority():
+    _run_node(
+        r"""
+const authority = 'c'.repeat(32);
+storage.set('vcs.workspace.context.v1', JSON.stringify({
+  schema: 'vcstudio.workspace-context/v1', route: '#/home', project_id: 'local-project',
+  analysis_id: '', selected_job_id: '', panels: {}, filters: {}, sort: {}, scroll: {},
+  draft_refs: {}, server_authority_id: authority, server_revision: 5, updated_at_ms: 20,
+}));
+VCS.call = async (method, ...args) => {
+  trace.calls.push({ method, args });
+  if (method === 'workspace_context') return {
+    ok: true, schema: 'vcstudio.workspace-context/v1', authority_id: authority,
+    state_revision: 4,
+    selection: { route_hash: '#/home', project_id: 'stale-project' },
+    restore: { panels: {}, filters: {}, sort: {}, scroll: {}, draft_refs: {} },
+    projects: [],
+  };
+  if (method === 'workspace_preferences_update') return {
+    ok: true, authority_id: authority, state_revision: 6, preferences: args[0].set,
+  };
+  return {};
+};
+loadAsset(process.argv[1]);
+const seam = window.__VCS_WORKSPACE_TEST__;
+await seam.refreshWorkspaceContext();
+let snapshot = seam.snapshot();
+assert.strictEqual(snapshot.authority_id, authority);
+assert.strictEqual(snapshot.revision, 5);
+assert.strictEqual(snapshot.state.project_id, 'local-project');
+
+await seam.saveRemoteState();
+const update = trace.calls.find(item => item.method === 'workspace_preferences_update');
+assert.deepStrictEqual(update.args.slice(1), [5, authority]);
+snapshot = seam.snapshot();
+assert.strictEqual(snapshot.revision, 6);
+assert.strictEqual(snapshot.state.project_id, 'local-project');
+""",
+        str(ASSETS / "workspace.js"),
+    )
+
+
 def test_workspace_project_switch_uses_only_opaque_id_and_purges_legacy_locator_storage():
     _run_node(
         r"""
@@ -442,9 +609,18 @@ def test_settings_reverse_async_responses_keep_latest_intent_authoritative():
         r"""
 const scenario = element('set-scenario', { tagName: 'SELECT', value: 'A' });
 const pending = { A: deferred(), B: deferred() };
-VCS.call = async (method, value) => {
-  trace.calls.push({ method, value });
-  if (method === 'scenario_set') return pending[value].promise;
+const authority = (key, revision, intent = null) => ({
+  revision, intent_id: intent,
+  scenario: { key, defaults: {} }, engine: 'vasp', calculation: 'relax',
+  capability: {}, allowed: ['relax'],
+  configured: { scenario: true, engine: true, calculation: true },
+});
+VCS.call = async (method, ...args) => {
+  trace.calls.push({ method, args });
+  if (method === 'settings_context_get') {
+    return { ok: true, revision: 0, context: authority('full', 0) };
+  }
+  if (method === 'settings_context_update') return pending[args[0].scenario].promise;
   return {};
 };
 loadAsset(process.argv[1]);
@@ -453,22 +629,182 @@ assert.ok(seam, 'guarded settings seam was not exposed');
 
 scenario.value = 'A';
 const requestA = seam.onScenarioChange();
-await waitFor(() => trace.calls.some(item => item.method === 'scenario_set' && item.value === 'A'));
+await waitFor(() => trace.calls.some(item =>
+  item.method === 'settings_context_update' && item.args[0].scenario === 'A'));
 scenario.value = 'B';
 const requestB = seam.onScenarioChange();
-await waitFor(() => trace.calls.some(item => item.method === 'scenario_set' && item.value === 'B'));
+await waitFor(() => trace.calls.some(item =>
+  item.method === 'settings_context_update' && item.args[0].scenario === 'B'));
 
-pending.B.resolve({ ok: true, scenario: { key: 'B', defaults: {} } });
+pending.B.resolve({ ok: true, revision: 1, context: authority('B', 1, 'B:1') });
 assert.strictEqual(await requestB, true);
-pending.A.resolve({ ok: true, scenario: { key: 'A', defaults: {} } });
+pending.A.resolve({
+  ok: false, conflict: true, revision: 1, context: authority('B', 1, 'B:1'),
+});
 assert.strictEqual(await requestA, false, 'superseded A response must be rejected');
 
 const snapshot = seam.snapshot();
 assert.strictEqual(snapshot.state.scenarioKey, 'B');
+assert.strictEqual(snapshot.state.contextRevision, 1);
 assert.deepStrictEqual(trace.appliedScenarios, ['B']);
 assert.strictEqual(snapshot.state.workspaceBusy, false);
 """,
         str(ASSETS / "settings.js"),
+    )
+
+
+def test_settings_conflict_adopts_authority_until_user_creates_new_intent():
+    _run_node(
+        r"""
+const scenario = element('set-scenario', { tagName: 'SELECT', value: 'A' });
+const first = { A: deferred(), B: deferred() };
+const authority = (key, revision, intent = null) => ({
+  revision, intent_id: intent,
+  scenario: { key, defaults: {} }, engine: 'vasp', calculation: 'relax',
+  capability: {}, allowed: ['relax'],
+  configured: { scenario: true, engine: true, calculation: true },
+});
+let bAttempts = 0;
+VCS.call = async (method, ...args) => {
+  trace.calls.push({ method, args });
+  if (method === 'settings_context_get') {
+    return { ok: true, revision: 0, context: authority('full', 0) };
+  }
+  if (method === 'settings_context_update') {
+    const key = args[0].scenario;
+    if (key === 'A') return first.A.promise;
+    bAttempts += 1;
+    if (bAttempts === 1) return first.B.promise;
+    return { ok: true, revision: 2, context: authority('B', 2, args[2]) };
+  }
+  return {};
+};
+loadAsset(process.argv[1]);
+const seam = window.__VCS_SETTINGS_TEST__;
+
+scenario.value = 'A';
+const requestA = seam.onScenarioChange();
+await waitFor(() => trace.calls.some(item =>
+  item.method === 'settings_context_update' && item.args[0].scenario === 'A'));
+scenario.value = 'B';
+const requestB = seam.onScenarioChange();
+await waitFor(() => trace.calls.some(item =>
+  item.method === 'settings_context_update' && item.args[0].scenario === 'B'));
+
+first.A.resolve({ ok: true, revision: 1, context: authority('A', 1, 'A:1') });
+assert.strictEqual(await requestA, false);
+const firstBCall = trace.calls.find(item =>
+  item.method === 'settings_context_update' && item.args[0].scenario === 'B');
+first.B.resolve({
+  ok: false, conflict: true, revision: 1, context: authority('A', 1, 'A:1'),
+});
+assert.strictEqual(await requestB, false);
+
+let bCalls = trace.calls.filter(item =>
+  item.method === 'settings_context_update' && item.args[0].scenario === 'B');
+assert.strictEqual(bCalls.length, 1, 'a conflicted patch must not be replayed automatically');
+assert.strictEqual(firstBCall.args[1], 0);
+let snapshot = seam.snapshot();
+assert.strictEqual(snapshot.state.scenarioKey, 'A');
+assert.strictEqual(snapshot.state.contextRevision, 1);
+assert.deepStrictEqual(trace.appliedScenarios, ['A']);
+
+// A second user change is a new intent and may commit against revision 1.
+scenario.value = 'B';
+assert.strictEqual(await seam.onScenarioChange(), true);
+bCalls = trace.calls.filter(item =>
+  item.method === 'settings_context_update' && item.args[0].scenario === 'B');
+assert.deepStrictEqual(bCalls.map(item => item.args[1]), [0, 1]);
+assert.notStrictEqual(bCalls[0].args[2], bCalls[1].args[2]);
+snapshot = seam.snapshot();
+assert.strictEqual(snapshot.state.scenarioKey, 'B');
+assert.strictEqual(snapshot.state.contextRevision, 2);
+assert.deepStrictEqual(trace.appliedScenarios, ['A', 'B']);
+""",
+        str(ASSETS / "settings.js"),
+    )
+
+
+def test_app_context_conflict_adopts_authority_until_new_user_intent():
+    _run_node(
+        r"""
+loadAsset(process.argv[1]);
+const pendingA = deferred();
+const pendingB = deferred();
+const context = (key, revision, intent) => ({
+  revision, intent_id: intent,
+  scenario: {
+    key, name: key, pages: ['report-workbench'], cards: {}, defaults: {},
+    figure_preset_order: [], reaction_presets: [], engines: ['vasp'], task_keys: ['relax'],
+  },
+  engine: key === 'A' ? 'cp2k' : 'vasp',
+  calculation: key === 'A' ? 'static' : 'relax',
+  capability: {}, allowed: ['relax', 'static'],
+  configured: { scenario: true, engine: true, calculation: true },
+});
+const observed = [];
+['vcs:scenario', 'vcs:engine', 'vcs:calculation'].forEach(name => {
+  document.addEventListener(name, () => observed.push([
+    VCS.scenario && VCS.scenario.key, VCS.activeEngine, VCS.activeCalculation,
+  ]));
+});
+let bAttempt = 0;
+VCS.call = async (method, ...args) => {
+  trace.calls.push({ method, args });
+  if (method === 'settings_context_get') {
+    return { ok: true, revision: 0, context: context('full', 0, null) };
+  }
+  if (method === 'settings_context_update') {
+    if (args[0].scenario === 'A') return pendingA.promise;
+    bAttempt += 1;
+    if (bAttempt === 1) return pendingB.promise;
+    return { ok: true, revision: 2, context: context('B', 2, args[2]) };
+  }
+  return {};
+};
+
+const requestA = VCS.updateWorkspaceContext({ scenario: 'A' });
+await waitFor(() => trace.calls.some(item =>
+  item.method === 'settings_context_update' && item.args[0].scenario === 'A'));
+const requestB = VCS.updateWorkspaceContext({ scenario: 'B' });
+await waitFor(() => trace.calls.some(item =>
+  item.method === 'settings_context_update' && item.args[0].scenario === 'B'));
+pendingA.resolve({ ok: true, revision: 1, context: context('A', 1, 'A:1') });
+assert.strictEqual((await requestA).superseded, true);
+pendingB.resolve({
+  ok: false, conflict: true, revision: 1, context: context('A', 1, 'A:1'),
+});
+const conflict = await requestB;
+assert.strictEqual(conflict.ok, false);
+assert.strictEqual(conflict.conflict, true);
+
+let bCalls = trace.calls.filter(item =>
+  item.method === 'settings_context_update' && item.args[0].scenario === 'B');
+assert.strictEqual(bCalls.length, 1, 'a conflicted patch must not be replayed automatically');
+assert.strictEqual(VCS.workspaceContext.revision, 1);
+assert.strictEqual(VCS.workspaceContext.context.scenario.key, 'A');
+assert.strictEqual(VCS.scenario.key, 'A');
+
+const committed = await VCS.updateWorkspaceContext({ scenario: 'B' });
+assert.strictEqual(committed.ok, true);
+bCalls = trace.calls.filter(item =>
+  item.method === 'settings_context_update' && item.args[0].scenario === 'B');
+assert.deepStrictEqual(bCalls.map(item => item.args[1]), [0, 1]);
+assert.notStrictEqual(bCalls[0].args[2], bCalls[1].args[2]);
+assert.strictEqual(VCS.workspaceContext.revision, 2);
+assert.strictEqual(VCS.workspaceContext.context.scenario.key, 'B');
+assert.strictEqual(VCS.scenario.key, 'B');
+const eventCount = observed.length;
+await VCS.loadWorkspaceContext();
+assert.strictEqual(observed.length, eventCount, 'stale/equal loads must not redispatch context events');
+assert.ok(observed.length >= 9);
+assert.ok(observed.every(item =>
+  (item[0] === 'full' && item[1] === 'vasp' && item[2] === 'relax') ||
+  (item[0] === 'A' && item[1] === 'cp2k' && item[2] === 'static') ||
+  (item[0] === 'B' && item[1] === 'vasp' && item[2] === 'relax')),
+  JSON.stringify(observed));
+""",
+        str(ASSETS / "app.js"),
     )
 
 

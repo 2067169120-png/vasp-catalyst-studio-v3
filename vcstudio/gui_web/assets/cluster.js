@@ -8,6 +8,20 @@
   const tr = (key, fallback, params) => typeof VCS.t === 'function'
     ? VCS.t(key, params || {}, fallback) : fallback;
   const State = { profiles: {} };   // name -> profile dict
+  const CLUSTER_DRAFT_ID = 'cluster-profile';
+  // Never persist host/user/path/command/auth material as workspace draft
+  // content.  This fixed marker is enough for Resume Center to offer the
+  // semantic cluster entry on the same device.
+  const CLUSTER_DRAFT_MARKER = JSON.stringify({
+    schema: 'vcstudio.safe-draft-ref/v1', kind: 'cluster-profile',
+  });
+  const CLUSTER_DRAFT_FIELDS = new Set([
+    'cl-name', 'cl-hostname', 'cl-port', 'cl-username', 'cl-keypath',
+    'cl-usejump', 'cl-jumphost', 'cl-jumpuser', 'cl-jumpport',
+    'cl-remoteroot', 'cl-scheduler', 'cl-schedbin', 'cl-queue', 'cl-nodes',
+    'cl-ppn', 'cl-walltime', 'cl-env', 'cl-vaspcmd', 'cl-cp2kcmd',
+    'cl-gaussiancmd', 'cl-castepcmd', 'cl-template',
+  ]);
 
   // ── 表单读写 ────────────────────────────────────────────────────────────────
   function radio(name) {
@@ -93,11 +107,50 @@
     hideWarn();
   }
 
+  function clusterDrafts() {
+    return VCS.workspace && VCS.workspace.drafts || null;
+  }
+
+  function updateClusterDraftAction() {
+    const button = $('cl-cancel');
+    const drafts = clusterDrafts();
+    if (button) button.disabled = !(drafts && drafts.load(CLUSTER_DRAFT_ID));
+  }
+
+  function persistClusterDraftReference() {
+    const drafts = clusterDrafts();
+    if (!drafts) return false;
+    drafts.save(CLUSTER_DRAFT_ID, CLUSTER_DRAFT_MARKER, {
+      label: tr('cluster.draft.label', '集群配置尚未保存'),
+      kind: 'cluster-profile',
+    });
+    updateClusterDraftAction();
+    return true;
+  }
+
+  function clearClusterDraftReference() {
+    const drafts = clusterDrafts();
+    if (drafts && drafts.load(CLUSTER_DRAFT_ID)) drafts.remove(CLUSTER_DRAFT_ID);
+    updateClusterDraftAction();
+  }
+
   function newProfile() {
     fillForm({ name: '', port: 22, jump_port: 22, nodes: 1, walltime: '24:00:00',
                auth: 'key', scheduler: 'Slurm', script_mode: 'auto', env_lines: [] });
     if ($('cl-profile')) $('cl-profile').value = '';
     if ($('cl-name')) $('cl-name').focus();
+  }
+
+  function startNewProfile() {
+    clearClusterDraftReference();
+    newProfile();
+  }
+
+  function discardClusterDraft() {
+    clearClusterDraftReference();
+    const saved = State.profiles[currentName()];
+    if (saved) fillForm(saved); else newProfile();
+    VCS.toast(tr('cluster.draft.discarded', '已取消未保存的集群修改'));
   }
 
   // auth=password 时隐藏密钥文件行
@@ -151,6 +204,7 @@
       }), 'failc'); return false;
     }
     await loadProfiles(data.name);
+    clearClusterDraftReference();
     VCS.log(tr('cluster.saved', '已保存集群「{name}」（密码不写入 yaml）', {
       name: data.name,
     }), 'okc');
@@ -170,6 +224,7 @@
     if (!(r && r.ok)) {
       VCS.log(tr('cluster.delete_failed', '删除失败：「{name}」', { name }), 'failc'); return;
     }
+    clearClusterDraftReference();
     VCS.log(tr('cluster.deleted', '已删除集群「{name}」', { name }), 'okc');
     const profs = await loadProfiles();
     if (profs.length) fillForm(State.profiles[currentName()]);
@@ -279,26 +334,57 @@
   function wire(id, fn) { const el = $(id); if (el) el.addEventListener('click', fn); }
 
   async function init() {
-    wire('cl-new', newProfile);
+    wire('cl-new', startNewProfile);
     wire('cl-delete', deleteProfile);
     wire('cl-save', save);
+    wire('cl-cancel', discardClusterDraft);
     wire('cl-test', testConnection);
     wire('cl-preview', previewScript);
     const sel = $('cl-profile');
     if (sel) sel.addEventListener('change', () => {
+      clearClusterDraftReference();
       const p = State.profiles[sel.value];
       if (p) fillForm(p); else newProfile();
     });
-    document.querySelectorAll('input[name="cl-auth"]').forEach(r =>
-      r.addEventListener('change', toggleKeyRow));
+    document.querySelectorAll('input[name="cl-auth"]').forEach(r => {
+      r.addEventListener('change', toggleKeyRow);
+      r.addEventListener('change', persistClusterDraftReference);
+    });
+    document.querySelectorAll('input[name="cl-mode"]').forEach(r =>
+      r.addEventListener('change', persistClusterDraftReference));
+    CLUSTER_DRAFT_FIELDS.forEach(id => {
+      const control = $(id); if (!control) return;
+      control.addEventListener('input', persistClusterDraftReference);
+      control.addEventListener('change', persistClusterDraftReference);
+    });
 
     const profs = await loadProfiles();
     if (profs.length) fillForm(State.profiles[currentName()] || profs[0]);
     else newProfile();
+    updateClusterDraftAction();
   }
+
+  document.addEventListener('vcs:page', event => {
+    if (!(event.detail && event.detail.page === 'cluster' &&
+      event.detail.source === 'resume-center')) return;
+    const drafts = clusterDrafts();
+    if (!(drafts && drafts.load(CLUSTER_DRAFT_ID))) return;
+    showWarn(tr('cluster.draft.private',
+      '已恢复到集群配置入口。主机、用户、路径、命令和凭据不会写入恢复引用；请检查或重新填写后保存。'));
+    const name = $('cl-name'); if (name) name.focus();
+    updateClusterDraftAction();
+  });
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 
   window.Cluster = { reload: () => loadProfiles() };
+  if (window.__VCS_TEST__) {
+    window.Cluster.__test = {
+      State,
+      persistClusterDraftReference,
+      clearClusterDraftReference,
+      discardClusterDraft,
+    };
+  }
 })();

@@ -145,6 +145,7 @@ def test_ai_assistant_static_copy_has_explicit_semantic_anchors():
         "ai.chat.new",
         "ai.chat.initial_empty",
         "ai.chat.attach",
+        "ai.chat.preview_outbound",
         "ai.chat.send",
         "ai.chat.stop",
         "ai.chat.privacy",
@@ -162,6 +163,9 @@ def test_ai_assistant_static_copy_has_explicit_semantic_anchors():
         assert f'data-i18n="{key}"' in assistant, key
 
     attribute_keys = {
+        "ai-chat-outbound": {
+            "data-i18n-aria-label": "ai.chat.outbound_region",
+        },
         "ai-chat-session": {"data-i18n-aria-label": "ai.chat.session"},
         "ai-chat-input": {
             "data-i18n-aria-label": "ai.chat.prompt",

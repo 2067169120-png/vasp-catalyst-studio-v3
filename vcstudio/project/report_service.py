@@ -248,6 +248,12 @@ def _validate_history(value: Any, project_id: str) -> dict[str, Any]:
                 raise RuntimeError("report history revision schema is invalid")
             if str(entry.get("report_id") or "") != report_id:
                 raise RuntimeError("report history revision binding mismatch")
+            entry_preset = entry.get("preset_id")
+            if (
+                entry_preset is not None
+                and str(entry_preset or "") != preset_id
+            ):
+                raise RuntimeError("report history revision preset binding mismatch")
             sequence = entry.get("sequence")
             if (isinstance(sequence, bool) or not isinstance(sequence, int)
                     or sequence != previous_sequence + 1):
@@ -907,6 +913,9 @@ def _write_revision_journal(
         raise RuntimeError("report revision journal state is invalid")
     revision_id = str(entry.get("revision_id") or "")
     path = _revision_journal_path(project_root, revision_id)
+    intent = copy.deepcopy(dict(entry))
+    intent["artifact_status"] = "ready"
+    intent["error"] = None
     payload = {
         "schema": REVISION_JOURNAL_SCHEMA,
         "project_id": project_id,
@@ -917,6 +926,8 @@ def _write_revision_journal(
         "state": state,
         "marker_recorded": marker_recorded,
         "history_ready_recorded": history_ready_recorded,
+        "history_entry": intent,
+        "intent_sha256": _sha256_json(intent),
         "updated_at_utc": _utc_now(),
         "error": error,
     }
@@ -976,6 +987,22 @@ def _read_revision_journal(
         journal_error = payload.get("error")
         if journal_error is not None and not isinstance(journal_error, str):
             raise RuntimeError("report revision journal error is invalid")
+        intent = payload.get("history_entry")
+        if not isinstance(intent, Mapping):
+            raise RuntimeError("report revision journal intent is missing")
+        intent = copy.deepcopy(dict(intent))
+        if (
+            intent.get("artifact_status") != "ready"
+            or intent.get("error") is not None
+            or payload.get("intent_sha256") != _sha256_json(intent)
+        ):
+            raise RuntimeError("report revision journal intent is invalid")
+        current_intent = copy.deepcopy(dict(entry))
+        current_intent["artifact_status"] = "ready"
+        current_intent["error"] = None
+        if _sha256_json(current_intent) != payload["intent_sha256"]:
+            raise RuntimeError("report revision journal intent binding mismatch")
+        payload["history_entry"] = intent
         return payload, None
     except Exception as exc:  # noqa: BLE001 - callers reconcile with the marker
         return None, str(exc)
@@ -1163,9 +1190,7 @@ class ReportService:
                 },
                 "catalog": catalog,
                 "report_spec": spec.to_dict(),
-                "status": _public_value(
-                    self._host._proj_report_status_for_path(path)
-                ),
+                "status": _public_value(self.status(path)),
                 "history": history,
                 "error": None,
             }
@@ -1256,8 +1281,111 @@ class ReportService:
         with self._lock:
             return tuple(copy.deepcopy(self._preview_cleanup_audit))
 
+    def _audit_history_entry(
+        self,
+        entry: Mapping[str, Any],
+        lineage: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Prove a history entry against its bundle and host science contract."""
+
+        _validated_history_bundle(entry, lineage)
+        validator = getattr(
+            self._host, "_report_workbench_validate_history_entry", None
+        )
+        if not callable(validator):
+            raise RuntimeError("report history host validator is unavailable")
+        audit = validator(copy.deepcopy(dict(entry)))
+        if not isinstance(audit, Mapping):
+            raise RuntimeError(
+                "report history host validator returned an invalid result"
+            )
+        if audit.get("ok") is not True or audit.get("current") is not True:
+            raise RuntimeError(
+                str(audit.get("error") or "report history host audit failed")
+            )
+        for field in ("scientific_status", "scientific_qualification"):
+            if str(audit.get(field) or "") != str(entry.get(field) or ""):
+                raise RuntimeError(f"report history host {field} binding mismatch")
+        return audit
+
+    def _reconcile_history_locked(
+        self,
+        context: Mapping[str, Any],
+        history_path: Path,
+        history: dict[str, Any],
+        marker_status: Any,
+    ) -> dict[str, Any]:
+        """Finalize durable journal intents while holding the project history lock.
+
+        The journal supplies the immutable intended ``ready`` entry.  Recovery
+        still requires both a byte-for-byte valid report bundle and the current
+        host marker for that exact revision.  A forged journal, stale marker, or
+        missing member therefore remains fail-closed as ``generated_unrecorded``.
+        """
+
+        project_root = str(context["project_root"])
+        project_id = str(context["project_id"])
+        recovered: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        history_recovered = 0
+        for lineage in history["reports"].values():
+            if not isinstance(lineage, dict):
+                continue
+            revisions = lineage.get("revisions")
+            if not isinstance(revisions, list):
+                continue
+            for index, current_entry in enumerate(revisions):
+                if not isinstance(current_entry, Mapping):
+                    continue
+                journal, _journal_error = _read_revision_journal(
+                    project_root, project_id, current_entry
+                )
+                if journal is None or journal.get("state") == "marker_failed":
+                    continue
+                if (
+                    current_entry.get("artifact_status") == "ready"
+                    and journal.get("state") == "complete"
+                ):
+                    continue
+                intent = journal.get("history_entry")
+                if not isinstance(intent, Mapping):
+                    continue
+                intended_entry = copy.deepcopy(dict(intent))
+                if not _marker_matches_revision(marker_status, intended_entry):
+                    continue
+                try:
+                    self._audit_history_entry(intended_entry, lineage)
+                except Exception:  # noqa: BLE001 - corrupt recovery evidence stays stale
+                    continue
+                if current_entry.get("artifact_status") != "ready":
+                    revisions[index] = intended_entry
+                    recovered.append((lineage, intended_entry))
+                    history_recovered += 1
+                elif journal.get("state") != "complete":
+                    recovered.append((lineage, intended_entry))
+
+        if history_recovered:
+            history["generation"] += history_recovered
+            _atomic_json(history_path, history)
+
+        for _lineage, entry in recovered:
+            with contextlib.suppress(Exception):
+                _write_revision_journal(
+                    project_root,
+                    project_id,
+                    entry,
+                    state="complete",
+                    marker_recorded=True,
+                    history_ready_recorded=True,
+                )
+        return history
+
     def _history_base(
-        self, project_root: str, project_id: str, report_id: str
+        self,
+        project_root: str,
+        project_id: str,
+        report_id: str,
+        *,
+        project_path: str | None = None,
     ) -> tuple[int, str | None]:
         history_path, lock_path = _history_paths(project_root)
         # A first preview is observational: do not create .vcstudio/history or
@@ -1267,6 +1395,18 @@ class ReportService:
             return 0, None
         with _exclusive_file_lock(lock_path):
             history = _read_history(history_path, project_id)
+            if project_path:
+                marker_status = self._host._proj_report_status_for_path(project_path)
+                history = self._reconcile_history_locked(
+                    {
+                        "project_id": project_id,
+                        "project_root": project_root,
+                        "project_path": project_path,
+                    },
+                    history_path,
+                    history,
+                    marker_status,
+                )
             lineage = history["reports"].get(report_id) or {}
             sequence = lineage.get("latest_sequence", 0)
             manifest_sha256 = lineage.get("latest_manifest_sha256")
@@ -1311,7 +1451,10 @@ class ReportService:
         )
         report_id = _lineage_id(context["project_id"], spec.to_dict())
         base_revision, base_manifest = self._history_base(
-            context["project_root"], context["project_id"], report_id
+            context["project_root"],
+            context["project_id"],
+            report_id,
+            project_path=context["project_path"],
         )
         temp_root = tempfile.mkdtemp(
             prefix="vcstudio-report-preview-", dir=self._temp_root
@@ -1615,6 +1758,12 @@ class ReportService:
             history_path, lock_path = _history_paths(record.project_root)
             with _exclusive_file_lock(lock_path):
                 history = _read_history(history_path, record.project_id)
+                marker_status = self._host._proj_report_status_for_path(
+                    context["project_path"]
+                )
+                history = self._reconcile_history_locked(
+                    context, history_path, history, marker_status
+                )
                 lineage = history["reports"].get(record.report_id) or {
                     "report_id": record.report_id,
                     "preset_id": record.build["contracts"].get("preset_id"),
@@ -1715,6 +1864,9 @@ class ReportService:
                         rendered["destination_reservation_warning"] = str(exc)
                 entry = {
                     **revision,
+                    "preset_id": str(
+                        record.build["contracts"].get("preset_id") or ""
+                    ),
                     "manifest_sha256": manifest_sha256,
                     "manifest": os.path.abspath(manifest),
                     "artifact_status": "generated_unrecorded",
@@ -2093,19 +2245,67 @@ class ReportService:
             return _public_publish_result(result)
         return result
 
-    def history(self, path: str) -> dict[str, Any]:
+    def status(self, path: str) -> dict[str, Any]:
+        """Return marker status after reconciling any durable revision intent."""
+
         try:
             context = self._project_context(str(path or "").strip())
-            try:
-                marker_status = self._host._proj_report_status_for_path(
-                    context["project_path"]
-                )
-            except Exception:  # noqa: BLE001 - journals still support recovery
-                marker_status = None
             history_path, lock_path = _history_paths(context["project_root"])
             if history_path.is_file():
                 with _exclusive_file_lock(lock_path):
                     history = _read_history(history_path, context["project_id"])
+                    marker_status = self._host._proj_report_status_for_path(
+                        context["project_path"]
+                    )
+                    self._reconcile_history_locked(
+                        context, history_path, history, marker_status
+                    )
+                    # Keep the status read within the same lock as recovery so a
+                    # concurrent publisher cannot interleave a newer projection.
+                    result = self._host._proj_report_status_for_path(
+                        context["project_path"]
+                    )
+            else:
+                result = self._host._proj_report_status_for_path(
+                    context["project_path"]
+                )
+            if not isinstance(result, Mapping):
+                raise RuntimeError("report status host returned an invalid result")
+            return copy.deepcopy(dict(result))
+        except Exception as exc:  # noqa: BLE001 - JSON-safe public adapter seam
+            return {
+                "schema": "vcstudio.report-status/v1",
+                "ok": False,
+                "artifact_status": "missing",
+                "artifact_current": False,
+                "has_marker": False,
+                "scientific_status": None,
+                "scientific_qualification": None,
+                "scientific_stale": False,
+                "eligible_final": False,
+                "publication_gate_status": "unknown",
+                "desired_report_kind": None,
+                "report_reason": "",
+                "files": {},
+                "error": _public_value(str(exc)),
+            }
+
+    def history(self, path: str) -> dict[str, Any]:
+        try:
+            context = self._project_context(str(path or "").strip())
+            history_path, lock_path = _history_paths(context["project_root"])
+            if history_path.is_file():
+                with _exclusive_file_lock(lock_path):
+                    history = _read_history(history_path, context["project_id"])
+                    try:
+                        marker_status = self._host._proj_report_status_for_path(
+                            context["project_path"]
+                        )
+                    except Exception:  # noqa: BLE001 - audit still fails closed
+                        marker_status = None
+                    history = self._reconcile_history_locked(
+                        context, history_path, history, marker_status
+                    )
                     public_revisions = self._validated_public_history(
                         history,
                         project_root=context["project_root"],
@@ -2149,9 +2349,6 @@ class ReportService:
         reports = history.get("reports")
         if not isinstance(reports, Mapping):
             raise RuntimeError("report history reports must be an object")
-        validator = getattr(
-            self._host, "_report_workbench_validate_history_entry", None
-        )
         for report_id, lineage in reports.items():
             if not isinstance(lineage, Mapping):
                 raise RuntimeError("report history lineage must be an object")
@@ -2161,59 +2358,24 @@ class ReportService:
                 current = False
                 audit_error: str | None = None
                 try:
-                    _validated_history_bundle(entry, lineage)
-                    if not callable(validator):
-                        raise RuntimeError(
-                            "report history host validator is unavailable"
-                        )
-                    audit = validator(copy.deepcopy(dict(entry)))
-                    if not isinstance(audit, Mapping):
-                        raise RuntimeError(
-                            "report history host validator returned an invalid result"
-                        )
-                    if audit.get("ok") is not True or audit.get("current") is not True:
-                        raise RuntimeError(
-                            str(audit.get("error") or "report history host audit failed")
-                        )
-                    for field in (
-                        "scientific_status", "scientific_qualification"
-                    ):
-                        if str(audit.get(field) or "") != str(entry.get(field) or ""):
-                            raise RuntimeError(
-                                f"report history host {field} binding mismatch"
-                            )
+                    self._audit_history_entry(entry, lineage)
                     current = True
                 except Exception as exc:  # noqa: BLE001 - one bad bundle is stale
                     audit_error = str(exc)
                 original_status = str(entry.get("artifact_status") or "")
-                journal, journal_error = _read_revision_journal(
+                _journal, journal_error = _read_revision_journal(
                     project_root,
                     str(history.get("project_id") or ""),
                     entry,
                 )
                 marker_committed = _marker_matches_revision(marker_status, entry)
-                journal_committed = bool(
-                    journal
-                    and journal.get("marker_recorded") is True
-                    and journal.get("state") in {"marker_ready", "complete"}
-                )
-                reconciled_ready = bool(
-                    current
-                    and original_status == "generated_unrecorded"
-                    and (journal_committed or marker_committed)
-                )
-                status = (
-                    "stale" if not current else
-                    "ready" if reconciled_ready else original_status
-                )
-                recovery_state = (
-                    "history_finalize_pending" if reconciled_ready else None
-                )
+                status = "stale" if not current else original_status
+                recovery_state = None
+                if original_status == "generated_unrecorded" and marker_committed:
+                    recovery_state = "history_recovery_required"
                 visible_error = audit_error
                 if visible_error is None:
-                    if reconciled_ready and journal is not None:
-                        visible_error = journal.get("error")
-                    elif original_status == "generated_unrecorded":
+                    if original_status == "generated_unrecorded":
                         visible_error = entry.get("error") or journal_error
                 projected = {
                     "report_id": report_id,

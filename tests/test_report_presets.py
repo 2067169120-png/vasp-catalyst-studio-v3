@@ -308,6 +308,7 @@ def test_valid_overrides_preserve_outline_and_scope_token_order():
 
 def test_input_mutation_cannot_drift_normalized_spec():
     request = _request(
+        requested_kind="draft",
         outline=["executive_summary", "limitations"],
         scope={"project_ids": [PROJECT_ID], "job_ids": ["job-1"]},
         options={"precision": 5},
@@ -385,10 +386,7 @@ def test_outline_is_nonempty_unique_and_renderer_bounded(outline):
 
 @pytest.mark.parametrize("preset_id", PRESET_IDS)
 def test_methods_only_outline_cannot_claim_final_for_any_server_preset(preset_id):
-    with pytest.raises(
-        ReportRequestError,
-        match="final report outline.*scientific result section",
-    ):
+    with pytest.raises(ReportRequestError, match="final .* outline"):
         normalize_report_request(
             _request(
                 preset_id=preset_id,
@@ -399,13 +397,81 @@ def test_methods_only_outline_cannot_claim_final_for_any_server_preset(preset_id
         )
 
 
-def test_methods_only_outline_remains_available_for_explicit_diagnostic_work():
-    spec = normalize_report_request(
-        _request(requested_kind="diagnostic", outline=["methods"]),
+@pytest.mark.parametrize(
+    ("outline", "missing"),
+    [
+        (["adsorption_table", "methods", "limitations"], "summary/conclusion"),
+        (["executive_summary", "methods", "limitations"], "result/evidence"),
+        (["executive_summary", "adsorption_table", "limitations"], "methods"),
+        (["executive_summary", "adsorption_table", "methods"], "limitations"),
+    ],
+)
+def test_final_research_report_outline_enforces_every_minimum_category(
+    outline, missing,
+):
+    with pytest.raises(ReportRequestError, match=missing):
+        normalize_report_request(
+            _request(
+                preset_id="scientific-review",
+                requested_kind="final",
+                outline=outline,
+            ),
+            project_id=PROJECT_ID,
+        )
+
+
+@pytest.mark.parametrize(
+    ("outline", "missing"),
+    [
+        (["figures", "limitations"], "key_findings"),
+        (["key_findings", "limitations"], "figure/table"),
+        (["key_findings", "figures"], "limitations"),
+    ],
+)
+def test_final_decision_brief_outline_requires_findings_evidence_and_limitations(
+    outline, missing,
+):
+    with pytest.raises(ReportRequestError, match=missing):
+        normalize_report_request(
+            _request(
+                preset_id="quick-decision-brief",
+                requested_kind="final",
+                outline=outline,
+            ),
+            project_id=PROJECT_ID,
+        )
+
+
+def test_canonical_minimum_outlines_are_accepted_for_both_final_families():
+    research = normalize_report_request(
+        _request(
+            requested_kind="final",
+            outline=[
+                "executive_summary", "adsorption_table", "methods", "limitations",
+            ],
+        ),
+        project_id=PROJECT_ID,
+    )
+    brief = normalize_report_request(
+        _request(
+            preset_id="quick-decision-brief",
+            requested_kind="final",
+            outline=["key_findings", "figures", "limitations"],
+        ),
         project_id=PROJECT_ID,
     )
 
-    assert spec.requested_kind == "diagnostic"
+    assert research.requested_kind == brief.requested_kind == "final"
+
+
+@pytest.mark.parametrize("kind", ("draft", "diagnostic"))
+def test_methods_only_outline_remains_available_for_nonfinal_work(kind):
+    spec = normalize_report_request(
+        _request(requested_kind=kind, outline=["methods"]),
+        project_id=PROJECT_ID,
+    )
+
+    assert spec.requested_kind == kind
     assert spec.outline == ("methods",)
 
 

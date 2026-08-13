@@ -635,8 +635,8 @@ def test_continue_from_contcar_happy(tmp_path):
     assert os.path.isfile(os.path.join(d, 'OUTCAR'))             # 旧文件保留作审计，不算新轮证据
 
 
-def test_continue_from_contcar_qsub_without_job_id_rolls_back(tmp_path):
-    """qsub 未返回作业号时恢复本地 POSCAR 及远端本轮归档，清单不得推进。"""
+def test_continue_from_contcar_qsub_without_job_id_fails_closed(tmp_path):
+    """qsub 未返回可核验号时保留恢复证据，重启后不得自动再发一次。"""
     d = _restartable_job(tmp_path)
     local_poscar = os.path.join(d, 'POSCAR')
     before_poscar = open(local_poscar, encoding='utf-8').read()
@@ -647,19 +647,25 @@ def test_continue_from_contcar_qsub_without_job_id_rolls_back(tmp_path):
         ('qsub', 'qsub: submission rejected\n'),
     ])
 
-    with pytest.raises(RuntimeError, match='submission rejected'):
+    with pytest.raises(submitter.UnknownRemoteJobOperation,
+                       match='submission rejected') as failure:
         submitter.continue_from_contcar(client, _profile(), d)
 
-    assert open(local_poscar, encoding='utf-8').read() == before_poscar
+    assert failure.value.requires_manual_recovery is True
+    assert failure.value.action == 'continue'
+    assert open(local_poscar, encoding='utf-8').read() != before_poscar
     assert os.path.isfile(f'{local_poscar}.bak1')
     assert manifest.load_manifest(d) == before_manifest
     assert any('cp CONTCAR POSCAR' in command and
                '.vcstudio_previous_POSCAR' in command
                for command in client.commands)
-    rollback = client.commands[-1]
-    assert '.vcstudio_history/round_01/OUTCAR' in rollback
-    assert '.vcstudio_history/round_01/CONTCAR' in rollback
-    assert '.vcstudio_previous_POSCAR' in rollback
+    journal = submitter._read_job_action_journal(d)
+    assert journal['operations'][-1]['status'] == 'unknown_remote_outcome'
+
+    restarted = FakeClient()
+    with pytest.raises(submitter.UnknownRemoteJobOperation):
+        submitter.continue_from_contcar(restarted, _profile(), d)
+    assert restarted.commands == []
 
 
 def test_continue_refuses_wrong_cluster_before_remote_mutation(tmp_path):

@@ -2,9 +2,9 @@
 
 ## [Unreleased] — V4.0.0
 
-V4.0.0 尚未发布，`v4.0.0` 标签也尚未创建。本节汇总当前 Unreleased 工作树中已实现的工作。2026-08-12 已完成本地最终门禁：免缓存完整 pytest 为 **3581 passed、5 skipped**（247.79 秒；15 条 ASE/NumPy 上游弃用警告），全仓 Ruff 和 23 个第一方 JavaScript 文件的 `node --check` 均通过；PyInstaller 单文件构建成功。最终 EXE 为 **113,290,120 bytes（108.04 MiB）**，SHA-256 为 `8298a608b0b24d44213c5d10d8235ce6bdc9ab61aff0fe62e42c2a8aa052b642`。
+V4.0.0 尚未发布，`v4.0.0` 标签也尚未创建。本节汇总当前 Unreleased 工作树中已实现的工作。2026-08-13 已完成本地最终门禁：免缓存完整 pytest 为 **3658 passed、5 skipped**（330.80 秒；15 条 ASE/NumPy 上游弃用警告），全仓 Ruff、actionlint 和 23 个第一方 JavaScript 文件的 `node --check` 均通过；PyInstaller `--full` 单文件构建成功。最终 EXE 为 **113,586,017 bytes（108.32 MiB）**，SHA-256 为 `bcadc9046685c62cf1a9157d0ceba49b131190184dbe30073ce4189ec6817e2d`。
 
-V4.0.0 is not released, and the `v4.0.0` tag has not been created. This section records implemented work in the current Unreleased tree. The final local gates ran on 2026-08-12: cache-free full pytest completed with **3581 passed and 5 skipped** (247.79 s; 15 upstream ASE/NumPy deprecation warnings); full-repository Ruff and `node --check` for 23 first-party JavaScript files passed; and the PyInstaller one-file build succeeded. The final EXE is **113,290,120 bytes (108.04 MiB)**, SHA-256 `8298a608b0b24d44213c5d10d8235ce6bdc9ab61aff0fe62e42c2a8aa052b642`.
+V4.0.0 is not released, and the `v4.0.0` tag has not been created. This section records implemented work in the current Unreleased tree. The final local gates ran on 2026-08-13: cache-free full pytest completed with **3658 passed and 5 skipped** (330.80 s; 15 upstream ASE/NumPy deprecation warnings); full-repository Ruff, actionlint, and `node --check` for 23 first-party JavaScript files passed; and the PyInstaller `--full` one-file build succeeded. The final EXE is **113,586,017 bytes (108.32 MiB)**, SHA-256 `bcadc9046685c62cf1a9157d0ceba49b131190184dbe30073ce4189ec6817e2d`.
 
 ### 报告、状态与项目工作区（Phase A–B）
 - 建立报告与状态合同，明确稳定项目身份、服务端快照、门禁结论、产物状态和 revision
@@ -88,9 +88,9 @@ V4.0.0 is not released, and the `v4.0.0` tag has not been created. This section 
   both `full` and `journey` exited 0 and reported `ok=true` and `frozen=true`; journey completed 10/10 phases with
   0 network attempts, 0 cluster operations, and passed restart persistence after service reconstruction, while
   preserving honest Analysis `unverified/blocked` and report `diagnostic/blocked` scientific states.
-- GitHub-hosted 远端 CI 仍待变更推送后运行，不能由本地门禁替代；5 个 skip 不等于功能通过。未执行真实远程集群
+- 推送后的具体提交仍须通过 GitHub-hosted 远端 CI，不能由本地门禁替代；5 个 skip 不等于功能通过。未执行真实远程集群
   作业或真实科学/实验验证，因此 Unreleased 不能据此描述为科学有效或正式 release-ready。
-  GitHub-hosted CI remains pending until the changes are pushed and is not replaced by local gates; the 5 skips are
+  The exact pushed commit must still pass GitHub-hosted CI, which is not replaced by local gates; the 5 skips are
   not functionality passes. No real remote-cluster work or scientific/experimental validation was performed, so
   Unreleased must not be described as scientifically validated or formally release-ready.
 

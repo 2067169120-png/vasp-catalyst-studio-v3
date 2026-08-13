@@ -6,6 +6,7 @@
 contradicts-halt。硬护栏落到断言:LLM 只抽文本、每格带出处、spec 过校验、accepted 只由门产生。
 """
 import json
+import multiprocessing
 import threading
 
 from vcstudio.campaign import derive, ledger, lock, schema
@@ -42,6 +43,25 @@ def _good_spec():
         'outputs': [cell('volcano plot')],
         'mode': cell('reproduce'),
     }
+
+
+def _process_autopilot_with_blocking_runner(
+        campaign_dir, entered, release_runner, calls, output):
+    """Spawn-safe contender used to prove the campaign run lock is process-wide."""
+    def blocking_runner(task):
+        with calls.get_lock():
+            calls.value += 1
+        entered.set()
+        if not release_runner.wait(20):
+            raise TimeoutError('spawn runner release timed out')
+        return _good_runner(task)
+
+    try:
+        result = ap.autopilot_step(
+            campaign_dir, runners={'execute': blocking_runner})
+        output.put(('result', result))
+    except BaseException as exc:  # pragma: no cover - surfaced to parent assertion
+        output.put(('error', type(exc).__name__, str(exc)))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -478,6 +498,51 @@ def test_two_autopilot_calls_execute_exactly_one_runner_and_other_is_busy(tmp_pa
     task = schema.load_task(r['campaign_dir'], 'relax__Fe@MN4')
     assert task is not None and task['rung'] == 'accepted' and task['revision'] == 4
     assert schema.load_campaign(r['campaign_dir']) is not None
+
+
+def test_two_spawned_autopilots_execute_exactly_one_ready_task(tmp_path):
+    """Two desktop processes cannot both claim/execute the same ready task."""
+    campaign = _single_slab_campaign(tmp_path)
+    context = multiprocessing.get_context('spawn')
+    entered = context.Event()
+    release_runner = context.Event()
+    calls = context.Value('i', 0)
+    output = context.Queue()
+
+    first = context.Process(
+        target=_process_autopilot_with_blocking_runner,
+        args=(campaign['campaign_dir'], entered, release_runner, calls, output),
+    )
+    first.start()
+    assert entered.wait(20), 'first spawned autopilot never entered its runner'
+
+    second = context.Process(
+        target=_process_autopilot_with_blocking_runner,
+        args=(campaign['campaign_dir'], entered, release_runner, calls, output),
+    )
+    second.start()
+    second_row = output.get(timeout=20)
+    assert second_row[0] == 'result', second_row
+    assert second_row[1]['busy'] is True
+    assert second_row[1]['actions'] == []
+    assert '未读取/claim/执行任何任务' in second_row[1]['reason']
+
+    release_runner.set()
+    first_row = output.get(timeout=30)
+    assert first_row[0] == 'result', first_row
+    assert first_row[1]['actions'] == [
+        {'task': 'relax__Fe@MN4', 'action': 'accepted'}]
+
+    for process in (first, second):
+        process.join(30)
+        if process.is_alive():  # pragma: no cover - cleanup for failed synchronization
+            process.terminate()
+            process.join(5)
+    assert first.exitcode == 0 and second.exitcode == 0
+    assert calls.value == 1
+    disk = schema.load_task(campaign['campaign_dir'], 'relax__Fe@MN4')
+    assert disk is not None and disk['rung'] == 'accepted' and disk['revision'] == 4
+    assert lock.is_held(campaign['campaign_dir']) is False
 
 
 def test_autopilot_held_lock_returns_before_campaign_read(tmp_path, monkeypatch):

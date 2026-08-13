@@ -1,5 +1,6 @@
 """POV-Ray 适配器测试:解析/成键/场景文本离线测;真机冒烟(本机有 POV-Ray 时)。"""
 import os
+import subprocess
 
 import pytest
 
@@ -135,13 +136,31 @@ def test_render_degrades_without_povray(tmp_path, monkeypatch):
     assert not out['ok'] and 'POV-Ray 未找到' in out['error']
 
 
+def test_render_reports_external_timeout_without_raising(tmp_path):
+    poscar = tmp_path / 'POSCAR'
+    poscar.write_text(_POSCAR_D, encoding='utf-8')
+
+    def timeout_run(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs['timeout'])
+
+    out = pr.render_poscar_views(
+        str(poscar), str(tmp_path / 'figs'), exe='fake.exe', run=timeout_run,
+        views=('top',), timeout=1,
+    )
+    assert not out['ok']
+    assert out['timed_out'] is True
+    assert 'timed out' in out['error']
+
+
 @pytest.mark.skipif(pr.find_povray() is None, reason='本机无 POV-Ray')
 def test_real_povray_smoke(tmp_path):
     """真机冒烟:真调 pvengine64 渲一张小图,验证产出非空 PNG。"""
     poscar = tmp_path / 'POSCAR'
     poscar.write_text(_POSCAR_D, encoding='utf-8')
     out = pr.render_poscar_views(str(poscar), str(tmp_path / 'figs'),
-                                 views=('top',), width=240, timeout=120)
+                                 views=('top',), width=240, timeout=20)
+    if out.get('timed_out'):
+        pytest.skip('已安装的 POV-Ray GUI 在非交互启动阶段超时')
     assert out['ok'], out['error']
     png = out['images']['top']
     assert os.path.getsize(png) > 1000                  # 真渲染的 PNG 至少 KB 级

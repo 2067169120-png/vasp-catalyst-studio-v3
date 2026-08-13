@@ -1,6 +1,7 @@
 """发刊要件结构校验:LICENSE / pyproject 元数据。"""
 import json
 import os
+import re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -24,6 +25,18 @@ def test_pyproject_declares_license_and_metadata():
     assert 'MIT' in text
     assert 'classifiers' in text
     assert 'License :: OSI Approved :: MIT License' in text
+
+
+def test_docs_extra_declares_xlsx_backend_for_draftpack():
+    """Full CI's docs extra must provide the optional Draft-Ready XLSX writer."""
+    text = _read('pyproject.toml')
+    match = re.search(r'^docs\s*=\s*\[(?P<requirements>.*?)^\]', text,
+                      flags=re.MULTILINE | re.DOTALL)
+    assert match, 'pyproject.toml must define the docs optional-dependency extra'
+    requirements = match.group('requirements').lower()
+    assert re.search(r'"openpyxl(?:[<>=!~ ].*)?"', requirements), (
+        'the docs extra must declare openpyxl so Draft-Ready tables emit XLSX'
+    )
 
 
 def test_citation_cff_parses_with_required_keys():

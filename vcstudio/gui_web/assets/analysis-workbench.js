@@ -759,6 +759,25 @@
     document.addEventListener('vcs:language', () => { if (State.catalog) renderAll(); });
   }
 
+  if (window.__VCS_TEST__ === true) {
+    window.__VCS_ANALYSIS_TEST__ = Object.freeze({
+      renderRegistry,
+      configure({ catalog = null, preferences = null, analysisId = '', busy = false } = {}) {
+        State.catalog = clone(catalog);
+        State.preferences = clone(preferences) || {};
+        State.analysisId = String(analysisId || '');
+        State.busy = busy === true;
+      },
+      snapshot() {
+        return {
+          analysis_id: State.analysisId,
+          busy: State.busy,
+          catalog: clone(State.catalog),
+        };
+      },
+    });
+  }
+
   window.AnalysisWorkbench = { refresh: previewCurrent, open: analysisId => loadBootstrap(analysisId) };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wire, { once: true });
   else wire();

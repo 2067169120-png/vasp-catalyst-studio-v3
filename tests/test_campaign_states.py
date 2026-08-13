@@ -99,6 +99,33 @@ def test_cannot_write_accepted_directly():
         states.promote_accepted(t, {'gate': 'accept_gate', 'status': 'pass'})
 
 
+def test_persistence_boundary_rejects_direct_accepted_revision_write(tmp_path):
+    """The schema CAS itself must not be a back door around GateDecision."""
+    camp, task = _validated_campaign(tmp_path)
+    forged = copy.deepcopy(task)
+    forged['rung'] = 'accepted'
+
+    with pytest.raises(ValueError, match='必须携带权威 GateDecision'):
+        schema.persist_task(
+            camp['dir'], forged, expected_revision=task['revision'])
+
+    disk = schema.load_task(camp['dir'], task['id'])
+    assert disk['rung'] == 'validated'
+    assert disk['revision'] == task['revision']
+    assert forged['revision'] == task['revision']
+
+
+def test_create_only_boundary_rejects_preaccepted_task(tmp_path):
+    camp = schema.init_campaign(str(tmp_path), 'demo')
+    forged = schema.new_task('forged', 'relax')
+    forged['rung'] = 'accepted'
+
+    with pytest.raises(ValueError, match='不能通过 create-only save_task'):
+        schema.save_task(camp['dir'], forged)
+
+    assert not schema.task_path(camp['dir'], 'forged').exists()
+
+
 def test_accepted_requires_passing_gate_decision(tmp_path):
     camp, t = _validated_campaign(tmp_path)
     blocked = _accept_decision(camp, t, energy=None)

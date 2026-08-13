@@ -1058,6 +1058,68 @@ VCS.applyCalculation = function (key) {
   }));
 };
 
+// 工作模式、引擎、计算类型是一个服务端 revisioned snapshot。前端 generation
+// 只过滤本窗口中过期的响应；真正的覆盖保护由 expected_revision CAS 提供。
+const workspaceContextState = {
+  revision: null,
+  context: null,
+  generation: 0,
+  session: (window.crypto && typeof window.crypto.randomUUID === 'function')
+    ? window.crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+};
+VCS.workspaceContext = workspaceContextState;
+
+VCS.applyWorkspaceContext = function (result) {
+  const context = result && result.context;
+  if (!context || !Number.isInteger(context.revision)) return false;
+  if (Number.isInteger(workspaceContextState.revision) &&
+      context.revision < workspaceContextState.revision) return false;
+  if (workspaceContextState.context &&
+      context.revision === workspaceContextState.revision) return false;
+  workspaceContextState.revision = context.revision;
+  workspaceContextState.context = context;
+  // Publish every raw value before any legacy per-field event fires.  Event
+  // listeners therefore always observe the same authoritative tuple even
+  // though the compatibility render hooks remain separate.
+  VCS.scenario = context.scenario;
+  VCS.activeEngine = String(context.engine || 'vasp').toLowerCase();
+  VCS.engineCapability = context.capability || {};
+  VCS.activeCalculation = String(context.calculation || '');
+  VCS.applyScenario(context.scenario);
+  VCS.applyEngine(context.engine || 'vasp', context.capability || {});
+  VCS.applyCalculation(context.calculation || '');
+  return true;
+};
+
+VCS.loadWorkspaceContext = async function () {
+  const result = await VCS.call('settings_context_get');
+  if (result && result.ok) VCS.applyWorkspaceContext(result);
+  return result;
+};
+
+VCS.updateWorkspaceContext = async function (patch) {
+  const generation = ++workspaceContextState.generation;
+  const intentId = `${workspaceContextState.session}:${generation}`;
+  if (!Number.isInteger(workspaceContextState.revision)) {
+    const loaded = await VCS.loadWorkspaceContext();
+    if (generation !== workspaceContextState.generation) {
+      return Object.assign({}, loaded || {}, { ok: false, superseded: true });
+    }
+    if (!(loaded && loaded.ok)) return loaded;
+  }
+  const result = await VCS.call(
+    'settings_context_update', patch, workspaceContextState.revision, intentId);
+  if (generation !== workspaceContextState.generation) {
+    return Object.assign({}, result || {}, { ok: false, superseded: true });
+  }
+  // A conflict is a completed server decision, not permission to replay the
+  // old patch against a newer revision.  Adopt the authority snapshot and
+  // require another explicit user action to create a new intent.
+  if (result && result.context) VCS.applyWorkspaceContext(result);
+  return result;
+};
+
 // 设置页与仪表盘共用：进入所选计算的唯一主入口，并展开/聚焦目标卡片。
 VCS.openCalculation = async function (key, options = {}) {
   const task = String(key || VCS.activeCalculation || '');
@@ -1100,15 +1162,13 @@ VCS.openCalculation = async function (key, options = {}) {
 };
 
 VCS.loadCalculation = async function () {
-  const r = await VCS.call('calculation_get');
-  if (r && r.ok) VCS.applyCalculation(r.active_calculation || '');
+  await VCS.loadWorkspaceContext();
   return VCS.activeCalculation;
 };
 
 VCS.loadEngine = async function () {
-  const r = await VCS.call('engine_get');
-  if (r && r.ok) VCS.applyEngine(r.engine || 'vasp', r.capability || {});
-  else VCS.applyEngine('vasp', {});
+  const r = await VCS.loadWorkspaceContext();
+  if (!(r && r.ok)) VCS.applyEngine('vasp', {});
   return VCS.activeEngine;
 };
 
@@ -1128,12 +1188,11 @@ async function firstLaunchScenario() {
   box.querySelectorAll('.scene-card').forEach(c => c.addEventListener('click', async () => {
     const key = c.dataset.key;
     m.close();
-    const res = await VCS.call('scenario_set', key);
-    if (res && res.scenario) {
-      VCS.applyScenario(res.scenario);
-      await VCS.loadEngine();
-      await VCS.loadCalculation();
-      const name = (VCS.i18n.lang === 'en' && res.scenario.name_en) || res.scenario.name || key;
+    const res = await VCS.updateWorkspaceContext({ scenario: key });
+    const context = res && res.context;
+    if (res && res.ok && context && context.scenario) {
+      const scenario = context.scenario;
+      const name = (VCS.i18n.lang === 'en' && scenario.name_en) || scenario.name || key;
       VCS.toast(VCS.t('scenario.selected', { name }, '已选择工作模式：{name}'));
     }
   }));
@@ -1154,12 +1213,12 @@ VCS.ready.then(async () => {
     VCS.pipeline.reconfigure();
     try { await VCS.loadLang(); } catch (_) { /* 语言失败不挡界面 */ }
     try {
-      const sc = await VCS.call('scenario_get');
-      if (sc && sc.scenario) {
-        VCS.applyScenario(sc.scenario);
-        await VCS.loadEngine();
-        await VCS.loadCalculation();
-        if (!sc.configured) firstLaunchScenario();   // 首启弹场景选择模态
+      const sc = await VCS.loadWorkspaceContext();
+      const context = sc && sc.context;
+      if (sc && sc.ok && context && context.scenario) {
+        if (!(context.configured && context.configured.scenario)) {
+          firstLaunchScenario();   // 首启弹场景选择模态
+        }
       }
     } catch (_) { /* 场景失败不挡界面 */ }
   } catch (_) {

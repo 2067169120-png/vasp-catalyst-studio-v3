@@ -507,7 +507,8 @@
     if (!sel) return;
     const sceneKey = (window.VCS && VCS.scenario && VCS.scenario.key) || null;
     const [r, current] = await Promise.all([
-      VCS.call('engine_list', sceneKey), VCS.call('engine_get')]);
+      VCS.call('engine_list', sceneKey), VCS.loadWorkspaceContext()]);
+    const context = (current && current.context) || {};
     let engines = ((r && r.engines) || []).filter(e => e.visible !== false);
     if (!engines.length) engines = [{ key: 'vasp', name: 'VASP', experimental: false }];
     // VASP 恒置顶醒目;其余引擎(实验性)靠后
@@ -523,7 +524,7 @@
     sel.disabled = engines.length < 2;
     const modeChanged = State2.sceneKey !== sceneKey;
     State2.sceneKey = sceneKey;
-    const preferred = (current && current.engine) || VCS.activeEngine ||
+    const preferred = context.engine || VCS.activeEngine ||
       (r && r.default) || engines[0].key;
     const has = engines.some(e => e.key === State2.engine);
     if (!has || modeChanged) {
@@ -546,7 +547,7 @@
   async function saveEngineTask() {
     const sel = $('eng-task');
     if (!sel || !sel.value || sel.value === VCS.activeCalculation) return;
-    const r = await VCS.call('calculation_set', sel.value);
+    const r = await VCS.updateWorkspaceContext({ calculation: sel.value });
     if (!r || r.ok === false || r.error) {
       VCS.log(tr('runtime.generate.engine.task_switch_failed', {
         error: (r && r.error) || tr('runtime.generate.common.unknown', {}, '未知', 'Unknown'),
@@ -554,7 +555,9 @@
       syncEngineTask();
       return;
     }
-    if (VCS.applyCalculation) VCS.applyCalculation(r.active_calculation || sel.value);
+    if (VCS.applyCalculation) {
+      VCS.applyCalculation((r.context && r.context.calculation) || sel.value);
+    }
   }
   function renderEngineCapability(key) {
     const cap = State2.capabilities[key] || {};
@@ -597,7 +600,7 @@
   }
   async function selectEngine(key, persist = true) {
     if (persist) {
-      const saved = await VCS.call('engine_set', key);
+      const saved = await VCS.updateWorkspaceContext({ engine: key });
       if (!saved || saved.ok === false || saved.error) {
         VCS.log(tr('runtime.generate.engine.switch_failed', {
           error: (saved && saved.error) || tr(
@@ -606,11 +609,12 @@
         const sel = $('engine-select'); if (sel) sel.value = State2.engine;
         return;
       }
-      key = saved.engine || key;
-      if (saved.capability) State2.capabilities[key] = Object.assign(
-        {}, State2.capabilities[key] || {}, saved.capability);
-      if (saved.active_calculation && VCS.applyCalculation) {
-        VCS.applyCalculation(saved.active_calculation);
+      const context = saved.context || {};
+      key = context.engine || key;
+      if (context.capability) State2.capabilities[key] = Object.assign(
+        {}, State2.capabilities[key] || {}, context.capability);
+      if (context.calculation && VCS.applyCalculation) {
+        VCS.applyCalculation(context.calculation);
       }
     }
     State2.engine = key;
