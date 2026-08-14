@@ -262,7 +262,7 @@ class Api:
                  paper_report_mod=None, workspace_state_store=None,
                  report_service=None, analysis_preferences_store=None,
                  project_lifecycle_service=None, lab_policy_store=None,
-                 workspace_context_store=None):
+                 workspace_context_store=None, method_recipe_service=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -392,6 +392,10 @@ class Api:
         # Confirmed laboratory recommendations are user-level state.  They do
         # not mutate job manifests or grant submission authority.
         self._lab_policy_store = lab_policy_store
+        # Method Recipe previews are short-lived, server-owned capabilities.  The browser sees an
+        # opaque token/target hash, never the authority-bearing resolved target or POTCAR path.
+        self._method_recipe_service = method_recipe_service
+        self._method_recipe_service_lock = threading.Lock()
         # Phase 3 project location/identity mutations are isolated behind a
         # hash-bound lifecycle service. Browser callers receive opaque server
         # selections and plans, never an authority-bearing filesystem path.
@@ -2857,6 +2861,100 @@ class Api:
             return {'ok': False, 'error': str(e)}
 
     # ── 生成页(镜像 gui/generate_tab 的调用面:预览/回填/一键生成/文件选择) ─────
+    def _method_recipe_backend(self):
+        from vcstudio.generate import method_recipes
+
+        return method_recipes
+
+    def _method_recipe_service_instance(self):
+        if self._method_recipe_service is None:
+            with self._method_recipe_service_lock:
+                if self._method_recipe_service is None:
+                    self._method_recipe_service = self._method_recipe_backend().MethodRecipeService()
+        return self._method_recipe_service
+
+    @staticmethod
+    def _method_recipe_failure(exc):
+        """Return a bounded failure without reflecting request paths or secret-like values."""
+        from vcstudio.generate.method_recipes import MethodRecipeError
+
+        if isinstance(exc, MethodRecipeError):
+            message = str(exc)
+        else:
+            message = 'method recipe operation failed'
+        return {
+            'ok': False, 'error': message, 'authorizes_submission': False,
+            'scientifically_validated': False,
+        }
+
+    def method_recipe_catalog(self):
+        try:
+            return {'ok': True, 'catalog': self._method_recipe_backend().catalog(),
+                    'error': None, 'authorizes_submission': False,
+                    'scientifically_validated': False}
+        except Exception as exc:                          # noqa: BLE001
+            return self._method_recipe_failure(exc)
+
+    def method_recipe_suggest(self, system_type, task, policy_id=None):
+        try:
+            result = self._method_recipe_backend().suggested_draft(
+                system_type, task, policy_id)
+            return {'ok': True, **result, 'error': None}
+        except Exception as exc:                          # noqa: BLE001
+            return self._method_recipe_failure(exc)
+
+    def method_recipe_preview(self, request):
+        """Pure-read recipe preview: no config, input, manifest, or ledger writes."""
+        try:
+            return self._method_recipe_service_instance().preview(request)
+        except Exception as exc:                          # noqa: BLE001
+            return self._method_recipe_failure(exc)
+
+    def _write_method_recipe(self, plan):
+        """Write one confirmed input set through the existing build→manifest→ledger chain."""
+        backend = self._method_recipe_backend()
+        target = str(plan['target'])
+        try:
+            payload = self._job_builder.build_job_dir(
+                str(plan['poscar_path']), plan['final_incar'], target,
+                calc_type=plan['calc_type'], kpoints=plan['kpoints'],
+                validate=False, lib_root=plan['lib_root'])
+            incar_hash = self._manifest.sha256_file(os.path.join(target, 'INCAR'))
+            record = backend.sidecar_record(plan, incar_sha256=incar_hash)
+            _sidecar, sidecar_hash = backend.write_sidecar(target, record)
+            reference = backend.manifest_reference(record, sidecar_sha256=sidecar_hash)
+            written = self._manifest.create_from_build(
+                target, payload, poscar_path=str(plan['poscar_path']), validate=False,
+                task_type=plan['task'], method_recipe_ref=reference)
+            self._ledger.register(target)
+            input_hashes = dict((written.get('inputs') or {}).get('sha256') or {})
+            return {
+                'ok': True, 'error': None, 'target_id': plan['target_id'],
+                'job_id': self._analysis_workbench_public_value(written.get('job_id')),
+                'state': written.get('state', 'CREATED'),
+                'recipe_semantic_sha256': record['recipe_semantic_sha256'],
+                'sidecar_sha256': sidecar_hash, 'input_hashes': input_hashes,
+                'warnings': self._analysis_workbench_public_value(
+                    list(payload.get('warnings') or [])),
+                'authorizes_submission': False, 'scientifically_validated': False,
+                'scientific_status': 'candidate', 'submitted': False,
+            }
+        except Exception:                                 # noqa: BLE001
+            # POTCAR/build exceptions commonly contain local absolute paths.  The recipe endpoint
+            # intentionally does not reflect them across the browser bridge.
+            return {
+                'ok': False, 'error': 'confirmed input write failed',
+                'target_id': plan['target_id'], 'authorizes_submission': False,
+                'scientifically_validated': False, 'submitted': False,
+            }
+
+    def method_recipe_confirm(self, request):
+        try:
+            return self._method_recipe_service_instance().confirm(
+                request, self._write_method_recipe)
+        except Exception as exc:                          # noqa: BLE001
+            return self._method_recipe_failure(exc)
+
     def gen_preview(self, poscar_path, incar_path, calc_type='slab'):
         """即时解析预览(镜像 generate_tab._refresh_preview):纯读、不写任何文件。
 

@@ -1029,6 +1029,162 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
       </div>
     </div>
 
+    <div class="card method-recipe" id="method-recipe-card" data-scene="cards.generate.vasp_inputs"
+         data-task="relax cellopt static dos_pdos bader elf workfunction freq vaspsol"
+         data-engine="vasp" aria-labelledby="mr-heading" style="padding:12px;margin-bottom:10px">
+      <div class="mr-head">
+        <div>
+          <h2 class="gen-h" id="mr-heading" data-i18n="generate.recipe.title">Method Recipe / INCAR 向导</h2>
+          <p class="sub" data-i18n="generate.recipe.subtitle">从可解释建议开始；后端预览与逐项冲突确认后才写输入。不会自动提交，也不代表科学验证。</p>
+        </div>
+        <span class="mr-boundary" data-i18n="generate.recipe.candidate">候选输入</span>
+      </div>
+
+      <ol class="mr-steps" aria-label="Method Recipe steps" data-i18n-aria-label="generate.recipe.steps_aria">
+        <li class="mr-step">
+          <fieldset>
+            <legend><span class="mr-step-no">1</span><span data-i18n="generate.recipe.step1">选择体系、任务与建议策略</span></legend>
+            <p class="sub" data-i18n="generate.recipe.shared_paths">复用上方 POSCAR、可选已有 INCAR、输出目录和赝势库；路径只发送给本机后端，不写入浏览器存储。</p>
+            <div class="mr-grid">
+              <label class="gen-fld" for="mr-system"><span class="gen-lbl" data-i18n="generate.recipe.system">体系</span>
+                <select id="mr-system" class="ipt">
+                  <option value="slab" data-i18n="generate.recipe.system.slab">表面 / 吸附 slab</option>
+                  <option value="bulk" data-i18n="generate.recipe.system.bulk">体相 bulk</option>
+                  <option value="molecule" data-i18n="generate.recipe.system.molecule">分子 molecule</option>
+                </select>
+              </label>
+              <label class="gen-fld" for="mr-task"><span class="gen-lbl" data-i18n="generate.recipe.task">任务</span>
+                <select id="mr-task" class="ipt"></select>
+              </label>
+              <label class="gen-fld" for="mr-policy"><span class="gen-lbl" data-i18n="generate.recipe.policy">实验室建议策略</span>
+                <select id="mr-policy" class="ipt"></select>
+              </label>
+            </div>
+            <div class="actions mr-actions">
+              <button class="btn" id="mr-suggest" type="button" data-i18n="generate.recipe.suggest">生成建议草稿</button>
+            </div>
+          </fieldset>
+        </li>
+
+        <li class="mr-step">
+          <fieldset>
+            <legend><span class="mr-step-no">2</span><span data-i18n="generate.recipe.step2">编辑方法草稿并解决未知项</span></legend>
+            <div class="mr-grid">
+              <label class="gen-fld" for="mr-xc"><span class="gen-lbl" data-i18n="generate.recipe.xc">XC / 赝势族</span>
+                <select id="mr-xc" class="ipt"><option value="PBE">PBE / PAW_PBE</option></select>
+              </label>
+              <label class="gen-fld" for="mr-dispersion"><span class="gen-lbl" data-i18n="generate.recipe.dispersion">色散</span>
+                <select id="mr-dispersion" class="ipt">
+                  <option value="unresolved" data-i18n="generate.recipe.unresolved">必须明确选择</option>
+                  <option value="none" data-i18n="generate.recipe.dispersion.none">不启用</option>
+                  <option value="d3-zero">D3 zero damping (IVDW=11)</option>
+                  <option value="d3-bj">D3(BJ) (IVDW=12)</option>
+                </select>
+              </label>
+              <label class="gen-fld" for="mr-precision"><span class="gen-lbl" data-i18n="generate.recipe.precision">精度</span>
+                <select id="mr-precision" class="ipt">
+                  <option value="accurate">Accurate</option><option value="normal">Normal</option>
+                </select>
+              </label>
+              <label class="gen-fld" for="mr-ediff"><span class="gen-lbl" data-i18n="generate.recipe.ediff">电子收敛 EDIFF (eV)</span>
+                <input id="mr-ediff" class="ipt" inputmode="decimal" value="0.00001">
+              </label>
+              <label class="gen-fld" for="mr-ediffg"><span class="gen-lbl" data-i18n="generate.recipe.ediffg">离子力阈值 |EDIFFG| (eV/Å)</span>
+                <input id="mr-ediffg" class="ipt" inputmode="decimal" value="0.02">
+              </label>
+              <label class="gen-fld" for="mr-spin"><span class="gen-lbl" data-i18n="generate.recipe.spin">自旋 / 磁态</span>
+                <select id="mr-spin" class="ipt">
+                  <option value="unresolved" data-i18n="generate.recipe.unresolved">必须明确选择</option>
+                  <option value="nonspin" data-i18n="generate.recipe.spin.nonspin">非自旋 ISPIN=1</option>
+                  <option value="collinear" data-i18n="generate.recipe.spin.collinear">共线自旋 ISPIN=2</option>
+                </select>
+              </label>
+              <label class="gen-fld mr-span-2" for="mr-magmom"><span class="gen-lbl" data-i18n="generate.recipe.magmom">MAGMOM（共线自旋时必须覆盖每个原子）</span>
+                <input id="mr-magmom" class="ipt mono" autocomplete="off" placeholder="2*5.0 4*0.0" data-i18n-placeholder="generate.recipe.magmom_placeholder">
+              </label>
+              <label class="gen-fld" for="mr-u-mode"><span class="gen-lbl" data-i18n="generate.recipe.u_mode">DFT+U</span>
+                <select id="mr-u-mode" class="ipt">
+                  <option value="unresolved" data-i18n="generate.recipe.unresolved">必须明确选择</option>
+                  <option value="off" data-i18n="generate.recipe.u_off">明确关闭</option>
+                  <option value="manual" data-i18n="generate.recipe.u_manual">按元素手工映射</option>
+                </select>
+              </label>
+              <label class="gen-fld mr-span-2" for="mr-u-json"><span class="gen-lbl" data-i18n="generate.recipe.u_json">+U 元素映射 JSON（manual 时每个 POSCAR 物种都要有 l/u/j）</span>
+                <textarea id="mr-u-json" class="ipt mono" rows="2" spellcheck="false" placeholder='{"Fe":{"l":2,"u":4.0,"j":0.0},"O":{"l":-1,"u":0,"j":0}}'></textarea>
+              </label>
+              <label class="gen-fld" for="mr-dipole"><span class="gen-lbl" data-i18n="generate.recipe.dipole">偶极修正</span>
+                <select id="mr-dipole" class="ipt">
+                  <option value="unresolved" data-i18n="generate.recipe.unresolved">必须明确选择</option>
+                  <option value="off" data-i18n="generate.recipe.dipole.off">明确关闭</option>
+                  <option value="slab-z" data-i18n="generate.recipe.dipole.slab_z">slab z 方向</option>
+                </select>
+              </label>
+              <label class="gen-fld" for="mr-solvent"><span class="gen-lbl" data-i18n="generate.recipe.solvent">溶剂</span>
+                <select id="mr-solvent" class="ipt">
+                  <option value="off" data-i18n="generate.recipe.solvent.off">不启用</option>
+                  <option value="vaspsol">VASPsol</option>
+                </select>
+              </label>
+              <label class="gen-fld" for="mr-dielectric"><span class="gen-lbl" data-i18n="generate.recipe.dielectric">介电常数 EB_K</span>
+                <input id="mr-dielectric" class="ipt" inputmode="decimal" value="78.4">
+              </label>
+              <label class="gen-fld" for="mr-encut-mode"><span class="gen-lbl" data-i18n="generate.recipe.encut_mode">ENCUT 模式</span>
+                <select id="mr-encut-mode" class="ipt">
+                  <option value="enmax_multiplier" data-i18n="generate.recipe.encut.relative">ENMAX 倍率</option>
+                  <option value="explicit" data-i18n="generate.recipe.encut.explicit">明确 eV 值</option>
+                </select>
+              </label>
+              <label class="gen-fld" for="mr-encut-multiplier"><span class="gen-lbl" data-i18n="generate.recipe.encut_multiplier">ENMAX 倍率</span>
+                <input id="mr-encut-multiplier" class="ipt" inputmode="decimal" value="1.3">
+              </label>
+              <label class="gen-fld" for="mr-encut-value"><span class="gen-lbl" data-i18n="generate.recipe.encut_value">明确 ENCUT (eV)</span>
+                <input id="mr-encut-value" class="ipt" inputmode="decimal" placeholder="520">
+              </label>
+              <label class="gen-fld" for="mr-kpoints-mode"><span class="gen-lbl" data-i18n="generate.recipe.kpoints_mode">KPOINTS 模式</span>
+                <select id="mr-kpoints-mode" class="ipt">
+                  <option value="recommended" data-i18n="generate.recipe.kpoints.recommended">后端起始建议（非收敛证据）</option>
+                  <option value="explicit" data-i18n="generate.recipe.kpoints.explicit">明确 Gamma 网格</option>
+                </select>
+              </label>
+              <label class="gen-fld" for="mr-kpoints-grid"><span class="gen-lbl" data-i18n="generate.recipe.kpoints_grid">Gamma 网格</span>
+                <input id="mr-kpoints-grid" class="ipt mono" autocomplete="off" placeholder="5 5 1">
+              </label>
+            </div>
+            <label class="mr-check" for="mr-dry-run">
+              <input type="checkbox" id="mr-dry-run">
+              <span data-i18n="generate.recipe.dry_run">附带 ENCUT/k/vacuum/thickness 收敛 dry-run 候选（绝不标记已收敛）</span>
+            </label>
+          </fieldset>
+        </li>
+
+        <li class="mr-step">
+          <fieldset>
+            <legend><span class="mr-step-no">3</span><span data-i18n="generate.recipe.step3">只读预览、语义 diff 与风险</span></legend>
+            <div class="actions mr-actions">
+              <button class="btn primary" id="mr-preview" type="button" data-i18n="generate.recipe.preview">生成只读预览</button>
+            </div>
+            <div id="mr-preview-status" class="mr-status" role="status" aria-live="polite"></div>
+            <div id="mr-risk-list" class="mr-risk-list"></div>
+            <div id="mr-diff" class="mr-diff" aria-live="polite"></div>
+          </fieldset>
+        </li>
+
+        <li class="mr-step">
+          <fieldset>
+            <legend><span class="mr-step-no">4</span><span data-i18n="generate.recipe.step4">逐项确认并只写输入</span></legend>
+            <label class="mr-check" for="mr-ack">
+              <input type="checkbox" id="mr-ack">
+              <span data-i18n="generate.recipe.ack">我已检查 recipe、每个冲突与风险；生成成功不等于可提交或科学 validated。</span>
+            </label>
+            <div class="actions mr-actions">
+              <button class="btn primary" id="mr-confirm" type="button" disabled data-i18n="generate.recipe.confirm">明确确认并写入输入</button>
+            </div>
+            <p class="sub" data-i18n="generate.recipe.no_submit">确认只写本地输入、sidecar 和 CREATED manifest，并登记现有任务台账；不自动提交、不提升科学状态。</p>
+          </fieldset>
+        </li>
+      </ol>
+    </div>
+
     <div class="card acc" data-acc="generate:preview" data-sum="四件套解析预览,可编辑保存" data-i18n-sum="accordion.summary.generate.preview" data-acc-default="0" data-scene="cards.generate.preview" data-task="relax vaspsol" data-engine="vasp" style="padding:12px;margin-bottom:10px">
       <h2 class="gen-h acc-h"><button type="button" class="acc-toggle">解析预览 <span class="sub" style="font-weight:400" data-i18n="generate.preview.editable">可直接编辑;可保存到文件</span></button></h2>
       <div class="gen-fld">

@@ -22,6 +22,7 @@
     previewKey: null,
     previewView: { kind: 'waiting', error: '' },
     solvationPreview: null,
+    methodRecipe: { catalog: null, preview: null, confirmKey: null },
   };   // 预览去重 + 防旧响应覆盖
 
   function renderPreviewLanguage() {
@@ -111,7 +112,11 @@
         '选择文件失败:{error}', 'Failed to select file: {error}'), 'failc');
       return;
     }
-    if (r && r.path) { setVal(id, r.path); refreshPreview(); }
+    if (r && r.path) {
+      setVal(id, r.path);
+      refreshPreview();
+      if (id === 'gen-poscar' || id === 'gen-incar') invalidateMethodRecipePreview();
+    }
   }
   async function pickDir(id) {
     const r = await VCS.call('pick_dir');
@@ -120,7 +125,10 @@
         '选择目录失败:{error}', 'Failed to select directory: {error}'), 'failc');
       return;
     }
-    if (r && r.path) setVal(id, r.path);
+    if (r && r.path) {
+      setVal(id, r.path);
+      if (id === 'gen-out' || id === 'gen-lib') invalidateMethodRecipePreview();
+    }
   }
 
   // ── 一键生成:gen_run → 成功落台账 + 逐条 warnings + 提示去任务页;失败 log 错误 ──
@@ -210,6 +218,333 @@
     } finally {
       if (btn) btn.disabled = false;
     }
+  }
+
+  // ── Method Recipe / INCAR 向导 ─────────────────────────────────────────────
+  // 浏览器只收集声明性草稿、展示后端结果并回传 opaque capability。ENCUT、KPOINTS、
+  // +U 映射、INCAR 解析/合并与哈希全部留在 Python seam。
+  const MR_FIELDS = [
+    'mr-system', 'mr-task', 'mr-policy', 'mr-xc', 'mr-dispersion', 'mr-precision',
+    'mr-ediff', 'mr-ediffg', 'mr-spin', 'mr-magmom', 'mr-u-mode', 'mr-u-json',
+    'mr-dipole', 'mr-solvent', 'mr-dielectric', 'mr-encut-mode',
+    'mr-encut-multiplier', 'mr-encut-value', 'mr-kpoints-mode', 'mr-kpoints-grid',
+    'mr-dry-run',
+  ];
+
+  function mrEnglish() { return !!(VCS.i18n && VCS.i18n.lang === 'en'); }
+
+  function mrNumber(id, nullable) {
+    const raw = val(id);
+    if (!raw && nullable) return null;
+    return Number(raw);
+  }
+
+  function collectMethodRecipeDraft() {
+    let hubbard = {};
+    if (val('mr-u-mode') === 'manual') {
+      const raw = val('mr-u-json');
+      if (!raw) throw new Error(tr('runtime.generate.recipe.u_required', {},
+        'manual +U 必须填写完整元素映射 JSON',
+        'Manual +U requires a complete element-mapping JSON object'));
+      try { hubbard = JSON.parse(raw); }
+      catch (_error) {
+        throw new Error(tr('runtime.generate.recipe.u_invalid', {},
+          '+U 元素映射不是合法 JSON', 'The +U element mapping is not valid JSON'));
+      }
+    }
+    return {
+      schema: 'vcstudio.method-recipe-draft/v1',
+      system_type: val('mr-system'),
+      task: val('mr-task'),
+      xc: val('mr-xc'),
+      dispersion: val('mr-dispersion'),
+      precision: val('mr-precision'),
+      ediff: mrNumber('mr-ediff', false),
+      ediffg: mrNumber('mr-ediffg', false),
+      spin_mode: val('mr-spin'),
+      magmom: val('mr-magmom'),
+      hubbard_mode: val('mr-u-mode'),
+      hubbard_u: hubbard,
+      dipole_mode: val('mr-dipole'),
+      solvent_mode: val('mr-solvent'),
+      solvent_dielectric: mrNumber('mr-dielectric', false),
+      encut_mode: val('mr-encut-mode'),
+      encut_value: mrNumber('mr-encut-value', true),
+      encut_multiplier: mrNumber('mr-encut-multiplier', false),
+      kpoints_mode: val('mr-kpoints-mode'),
+      kpoints_grid: val('mr-kpoints-grid') || null,
+      include_convergence_dry_run: !!($('mr-dry-run') && $('mr-dry-run').checked),
+    };
+  }
+
+  function setMethodRecipeDraft(draft) {
+    if (!draft) return;
+    const values = {
+      'mr-system': draft.system_type, 'mr-task': draft.task, 'mr-xc': draft.xc,
+      'mr-dispersion': draft.dispersion, 'mr-precision': draft.precision,
+      'mr-ediff': draft.ediff, 'mr-ediffg': draft.ediffg,
+      'mr-spin': draft.spin_mode, 'mr-magmom': draft.magmom,
+      'mr-u-mode': draft.hubbard_mode,
+      'mr-u-json': draft.hubbard_u && Object.keys(draft.hubbard_u).length
+        ? JSON.stringify(draft.hubbard_u) : '',
+      'mr-dipole': draft.dipole_mode, 'mr-solvent': draft.solvent_mode,
+      'mr-dielectric': draft.solvent_dielectric,
+      'mr-encut-mode': draft.encut_mode,
+      'mr-encut-multiplier': draft.encut_multiplier,
+      'mr-encut-value': draft.encut_value == null ? '' : draft.encut_value,
+      'mr-kpoints-mode': draft.kpoints_mode,
+      'mr-kpoints-grid': draft.kpoints_grid == null
+        ? '' : (Array.isArray(draft.kpoints_grid) ? draft.kpoints_grid.join(' ') : draft.kpoints_grid),
+    };
+    Object.keys(values).forEach(id => {
+      const el = $(id); if (el) el.value = values[id] == null ? '' : String(values[id]);
+    });
+    if ($('mr-dry-run')) $('mr-dry-run').checked = !!draft.include_convergence_dry_run;
+  }
+
+  function invalidateMethodRecipePreview() {
+    State.methodRecipe.preview = null;
+    State.methodRecipe.confirmKey = null;
+    if ($('mr-ack')) $('mr-ack').checked = false;
+    const status = $('mr-preview-status');
+    if (status) {
+      status.className = 'mr-status';
+      status.textContent = tr('runtime.generate.recipe.preview_stale', {},
+        '草稿已变化，请重新生成只读预览。',
+        'The draft changed; generate a new read-only preview.');
+    }
+    if ($('mr-risk-list')) $('mr-risk-list').replaceChildren();
+    if ($('mr-diff')) $('mr-diff').replaceChildren();
+    updateMethodRecipeConfirmState();
+  }
+
+  function renderMethodRecipeCatalog() {
+    const catalog = State.methodRecipe.catalog;
+    if (!catalog) return;
+    const task = $('mr-task');
+    const selectedTask = task ? task.value : '';
+    if (task) {
+      task.replaceChildren();
+      (catalog.tasks || []).forEach(item => {
+        const option = document.createElement('option');
+        option.value = item.key;
+        option.textContent = mrEnglish() ? item.name_en : item.name_zh;
+        task.appendChild(option);
+      });
+      if (Array.from(task.options).some(option => option.value === selectedTask)) {
+        task.value = selectedTask;
+      }
+    }
+    const policy = $('mr-policy');
+    const selectedPolicy = policy ? policy.value : '';
+    if (policy) {
+      policy.replaceChildren();
+      const none = document.createElement('option');
+      none.value = '';
+      none.textContent = tr('generate.recipe.policy.none', {}, '不套用策略', 'No policy seed');
+      policy.appendChild(none);
+      const system = val('mr-system');
+      const records = ((catalog.lab_policies || {}).policies || []);
+      records.filter(item => (item.applicability || []).indexOf(system) >= 0).forEach(item => {
+        const option = document.createElement('option');
+        option.value = item.id;
+        option.textContent = mrEnglish() ? item.label_en : item.label_zh;
+        policy.appendChild(option);
+      });
+      if (Array.from(policy.options).some(option => option.value === selectedPolicy)) {
+        policy.value = selectedPolicy;
+      }
+    }
+  }
+
+  async function loadMethodRecipeCatalog() {
+    const result = await VCS.call('method_recipe_catalog');
+    if (!result || result.ok === false || result.error) {
+      const status = $('mr-preview-status');
+      if (status) {
+        status.className = 'mr-status fail';
+        status.textContent = tr('runtime.generate.recipe.catalog_failed', {
+          error: (result && result.error) || tr(
+            'runtime.generate.common.unknown_error', {}, '未知错误', 'Unknown error'),
+        }, 'Method Recipe 目录读取失败：{error}', 'Failed to load Method Recipe catalog: {error}');
+      }
+      return;
+    }
+    State.methodRecipe.catalog = result.catalog;
+    renderMethodRecipeCatalog();
+  }
+
+  async function suggestMethodRecipe() {
+    const result = await VCS.call(
+      'method_recipe_suggest', val('mr-system'), val('mr-task'), val('mr-policy') || null);
+    if (!result || result.ok === false || result.error) {
+      VCS.log(tr('runtime.generate.recipe.suggest_failed', {
+        error: (result && result.error) || tr(
+          'runtime.generate.common.unknown_error', {}, '未知错误', 'Unknown error'),
+      }, '建议草稿生成失败：{error}', 'Failed to create the suggested draft: {error}'), 'failc');
+      return;
+    }
+    setMethodRecipeDraft(result.draft);
+    invalidateMethodRecipePreview();
+    VCS.log(tr('runtime.generate.recipe.suggested', {},
+      '建议草稿已载入；色散、磁态、+U 与偶极仍需明确选择。',
+      'Suggested draft loaded; dispersion, magnetic state, +U, and dipole still require explicit choices.'));
+  }
+
+  function mrValue(value) {
+    if (value == null) return tr('runtime.generate.recipe.omit', {}, '（不写入）', '(omit)');
+    if (typeof value === 'object') return JSON.stringify(value);
+    return String(value);
+  }
+
+  function renderMethodRecipePreview() {
+    const preview = State.methodRecipe.preview;
+    const status = $('mr-preview-status');
+    const risks = $('mr-risk-list');
+    const diff = $('mr-diff');
+    if (!preview || !status || !risks || !diff) return;
+    status.className = 'mr-status ok';
+    status.textContent = tr('runtime.generate.recipe.preview_ready', {
+      hash: String(preview.preview_sha256 || '').slice(0, 12),
+      count: (preview.conflicts || []).length,
+    }, '预览已绑定（hash {hash}）；有 {count} 个冲突必须逐项选择。',
+    'Preview bound (hash {hash}); {count} conflicts require per-key choices.');
+    risks.replaceChildren();
+    const dimensions = (preview.recipe && preview.recipe.dimensions) || {};
+    Object.keys(dimensions).forEach(name => {
+      const item = dimensions[name];
+      if (item.risk !== 'high' && item.risk !== 'blocking') return;
+      const row = document.createElement('div');
+      row.className = 'mr-risk';
+      const reason = item.reason || {};
+      row.textContent = `${name} · ${item.risk}: ${mrEnglish() ? reason.en : reason.zh}`;
+      risks.appendChild(row);
+    });
+    diff.replaceChildren();
+    (preview.diff || []).filter(item => item.status !== 'unchanged_absent').forEach(item => {
+      const row = document.createElement('div');
+      row.className = `mr-diff-row${item.requires_resolution ? ' conflict' : ''}`;
+      const key = document.createElement('div'); key.className = 'mr-diff-key'; key.textContent = item.key;
+      const current = document.createElement('div'); current.className = 'mr-diff-value';
+      current.textContent = tr('runtime.generate.recipe.existing', { value: mrValue(item.existing) },
+        '已有：{value}', 'Existing: {value}');
+      const proposed = document.createElement('div'); proposed.className = 'mr-diff-value';
+      proposed.textContent = tr('runtime.generate.recipe.proposed', { value: mrValue(item.proposed) },
+        '建议：{value}', 'Proposed: {value}');
+      const decision = document.createElement('div'); decision.className = 'mr-diff-resolution';
+      if (item.requires_resolution) {
+        const label = document.createElement('label');
+        label.textContent = tr('runtime.generate.recipe.resolve', {}, '明确选择：', 'Explicit choice:');
+        const select = document.createElement('select'); select.className = 'ipt mr-resolution';
+        select.dataset.key = item.key;
+        [
+          ['', tr('runtime.generate.recipe.choose', {}, '请选择', 'Choose')],
+          ['existing', tr('runtime.generate.recipe.keep_existing', {}, '保留已有（默认不覆盖）', 'Keep existing (no overwrite)')],
+          ['recipe', tr('runtime.generate.recipe.use_recipe', {}, '采用 recipe', 'Use recipe')],
+        ].forEach(pair => {
+          const option = document.createElement('option'); option.value = pair[0];
+          option.textContent = pair[1]; select.appendChild(option);
+        });
+        select.addEventListener('change', updateMethodRecipeConfirmState);
+        label.appendChild(select); decision.appendChild(label);
+      } else {
+        decision.textContent = tr(`runtime.generate.recipe.diff.${item.status}`, {},
+          item.status, item.status);
+      }
+      row.append(key, current, proposed, decision);
+      diff.appendChild(row);
+    });
+    updateMethodRecipeConfirmState();
+  }
+
+  function collectMethodRecipeResolutions() {
+    const resolutions = {};
+    let complete = true;
+    document.querySelectorAll('#mr-diff .mr-resolution').forEach(select => {
+      if (!select.value) complete = false;
+      else resolutions[select.dataset.key] = select.value;
+    });
+    return { complete, resolutions };
+  }
+
+  function updateMethodRecipeConfirmState() {
+    const button = $('mr-confirm');
+    if (!button) return;
+    const choices = collectMethodRecipeResolutions();
+    button.disabled = !(State.methodRecipe.preview && choices.complete
+      && $('mr-ack') && $('mr-ack').checked);
+  }
+
+  async function previewMethodRecipe() {
+    let draft;
+    try { draft = collectMethodRecipeDraft(); }
+    catch (error) {
+      VCS.log(error.message || String(error), 'failc'); return;
+    }
+    const status = $('mr-preview-status');
+    if (status) {
+      status.className = 'mr-status';
+      status.textContent = tr('runtime.generate.recipe.previewing', {},
+        '后端正在解析结构、赝势证据与已有 INCAR…',
+        'The backend is parsing structure, pseudopotential evidence, and the existing INCAR…');
+    }
+    const request = {
+      poscar_path: val('gen-poscar'), incar_path: val('gen-incar'),
+      out_dir: val('gen-out'), lib_root: val('gen-lib'), draft,
+      policy_id: val('mr-policy') || null, project_id: null,
+    };
+    const result = await VCS.call('method_recipe_preview', request);
+    if (!result || result.ok === false || result.error) {
+      State.methodRecipe.preview = null;
+      if (status) {
+        status.className = 'mr-status fail';
+        status.textContent = tr('runtime.generate.recipe.preview_failed', {
+          error: (result && result.error) || tr(
+            'runtime.generate.common.unknown_error', {}, '未知错误', 'Unknown error'),
+        }, 'Recipe 预览被拒绝：{error}', 'Recipe preview rejected: {error}');
+      }
+      updateMethodRecipeConfirmState();
+      return;
+    }
+    State.methodRecipe.preview = result;
+    State.methodRecipe.confirmKey = `method-recipe-${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
+    if ($('mr-ack')) $('mr-ack').checked = false;
+    renderMethodRecipePreview();
+  }
+
+  async function confirmMethodRecipe() {
+    const preview = State.methodRecipe.preview;
+    const choices = collectMethodRecipeResolutions();
+    if (!preview || !choices.complete || !$('mr-ack') || !$('mr-ack').checked) return;
+    const approved = await VCS.confirm(tr('runtime.generate.recipe.confirm_prompt', {},
+      '确认只写候选输入并登记 CREATED 作业？这不会自动提交，也不代表科学 validated。',
+      'Write candidate inputs and register a CREATED job? This will not submit automatically or imply scientific validation.'));
+    if (!approved) return;
+    const button = $('mr-confirm'); if (button) button.disabled = true;
+    const request = {
+      token: preview.token, preview_sha256: preview.preview_sha256,
+      target_id: preview.target_id, confirmed: true,
+      idempotency_key: State.methodRecipe.confirmKey,
+      resolutions: choices.resolutions,
+    };
+    const result = await VCS.call('method_recipe_confirm', request);
+    if (!result || result.ok === false || result.error) {
+      VCS.log(tr('runtime.generate.recipe.write_failed', {
+        error: (result && result.error) || tr(
+          'runtime.generate.common.unknown_error', {}, '未知错误', 'Unknown error'),
+      }, '确认写入失败：{error}', 'Confirmed write failed: {error}'), 'failc');
+      updateMethodRecipeConfirmState();
+      return;
+    }
+    VCS.log(tr('runtime.generate.recipe.created', {
+      job: result.job_id || '', hash: String(result.recipe_semantic_sha256 || '').slice(0, 12),
+    }, '候选输入已写入并登记 CREATED 作业 {job}（recipe {hash}）；未提交、未科学验证。',
+    'Candidate inputs were written and registered as CREATED job {job} (recipe {hash}); not submitted or scientifically validated.'), 'okc');
+    (result.warnings || []).forEach(warning => VCS.log(warning));
+    VCS.toast(tr('runtime.generate.recipe.created_toast', {},
+      '候选输入已生成（未提交）', 'Candidate inputs generated (not submitted)'));
+    if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
+    if (button) button.disabled = true;
   }
 
   // ── SAC 批量建模:chips 多选 + 预览矩阵 + 生成矩阵(生成前弹确认显示预估) ──
@@ -900,10 +1235,29 @@
     wire('gen-out-btn', () => pickDir('gen-out'));
     wire('gen-lib-btn', () => pickDir('gen-lib'));
     wire('gen-run', run);
+    wire('mr-suggest', suggestMethodRecipe);
+    wire('mr-preview', previewMethodRecipe);
+    wire('mr-confirm', confirmMethodRecipe);
+    MR_FIELDS.forEach(id => {
+      const el = $(id);
+      if (!el) return;
+      const eventName = (el.tagName === 'INPUT' && el.type !== 'checkbox') || el.tagName === 'TEXTAREA'
+        ? 'input' : 'change';
+      el.addEventListener(eventName, invalidateMethodRecipePreview);
+    });
+    { const el = $('mr-system'); if (el) el.addEventListener('change', renderMethodRecipeCatalog); }
+    { const el = $('mr-ack'); if (el) el.addEventListener('change', updateMethodRecipeConfirmState); }
     // POSCAR/INCAR 手动改路径(change/blur)也触发预览
     ['gen-poscar', 'gen-incar'].forEach(id => {
       const el = $(id);
-      if (el) { el.addEventListener('change', refreshPreview); el.addEventListener('blur', refreshPreview); }
+      if (el) {
+        el.addEventListener('change', refreshPreview);
+        el.addEventListener('blur', refreshPreview);
+        el.addEventListener('input', invalidateMethodRecipePreview);
+      }
+    });
+    ['gen-out', 'gen-lib'].forEach(id => {
+      const el = $(id); if (el) el.addEventListener('input', invalidateMethodRecipePreview);
     });
     // 切换计算类型即刷新预览(KPOINTS 随之变化)
     { const el = $('gen-calc'); if (el) el.addEventListener('change', refreshPreview); }
@@ -946,6 +1300,7 @@
     wire('engine-gen-btn', engineGenerate);
     { const task = $('eng-task'); if (task) task.addEventListener('change', saveEngineTask); }
 
+    await loadMethodRecipeCatalog();
     const st = await VCS.call('gen_state');
     if (st) {
       setVal('gen-poscar', st.poscar);
@@ -982,6 +1337,8 @@
     syncEngineTask();
     onMslabChange();
     onCampTplChange();
+    renderMethodRecipeCatalog();
+    if (State.methodRecipe.preview) renderMethodRecipePreview();
   });
   document.addEventListener('vcs:engine', e => {
     const engine = e.detail && e.detail.engine;
@@ -998,5 +1355,10 @@
   }
 
   window.Generate = { reload: () => refreshPreview(), useMolecule,
-    selectEngine: async key => { await loadEngines(); return selectEngine(key); } };
+    selectEngine: async key => { await loadEngines(); return selectEngine(key); },
+    methodRecipe: {
+      collectDraft: collectMethodRecipeDraft,
+      preview: previewMethodRecipe,
+      confirm: confirmMethodRecipe,
+    } };
 })();

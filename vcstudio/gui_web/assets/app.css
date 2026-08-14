@@ -250,6 +250,36 @@ button:disabled{opacity:.5;cursor:not-allowed}
 /* ── Task 6:集群页(表单栅格 + 调度器探测警告条 + 脚本预览等宽) ── */
 .warn-banner{background:var(--warn-bg);color:var(--warn);border:1px solid #E4CE93;border-radius:5px;padding:9px 13px;font-size:12.5px;margin-bottom:12px}
 .warn-banner[hidden]{display:none}
+
+/* Explainable Method Recipe wizard: native fieldsets/selects keep the whole path keyboard-usable. */
+#page-generate .method-recipe{border-left:3px solid var(--accent)}
+#page-generate .mr-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}
+#page-generate .mr-head .gen-h{margin-bottom:4px}
+#page-generate .mr-head p{margin:0 0 10px}
+#page-generate .mr-boundary{flex:0 0 auto;border:1px solid var(--rule);border-radius:999px;padding:3px 9px;color:var(--warn);background:var(--warn-bg);font-size:11px;font-weight:700}
+#page-generate .mr-steps{list-style:none;margin:0;padding:0;display:grid;gap:10px}
+#page-generate .mr-step fieldset{min-width:0;margin:0;border:1px solid var(--rule);border-radius:7px;padding:11px;background:var(--surface)}
+#page-generate .mr-step legend{padding:0 5px;font-weight:700;font-size:12.5px;color:var(--ink)}
+#page-generate .mr-step-no{display:inline-grid;place-items:center;width:22px;height:22px;margin-right:7px;border-radius:50%;background:var(--accent);color:#fff;font-size:11px}
+#page-generate .mr-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:0 12px}
+#page-generate .mr-grid .gen-fld{min-width:0}
+#page-generate .mr-span-2{grid-column:span 2}
+#page-generate .mr-actions{justify-content:flex-start;margin-top:6px}
+#page-generate .mr-check{display:flex;align-items:flex-start;gap:8px;font-size:12px;line-height:1.45;margin:6px 0}
+#page-generate .mr-check input{margin-top:2px}
+#page-generate .mr-status{min-height:22px;margin-top:8px;font-size:12px;color:var(--muted);overflow-wrap:anywhere}
+#page-generate .mr-status.ok{color:var(--ok)}
+#page-generate .mr-status.fail{color:var(--fail)}
+#page-generate .mr-risk-list{display:grid;gap:6px;margin-top:7px}
+#page-generate .mr-risk{border-left:3px solid var(--warn);background:var(--warn-bg);padding:7px 9px;font-size:12px}
+#page-generate .mr-diff{display:grid;gap:6px;margin-top:8px}
+#page-generate .mr-diff-row{display:grid;grid-template-columns:minmax(80px,.5fr) minmax(110px,.8fr) minmax(110px,.8fr) minmax(150px,1fr);gap:8px;align-items:start;padding:7px 9px;border:1px solid var(--rule);border-radius:5px;font-size:11.5px;background:var(--bg)}
+#page-generate .mr-diff-row.conflict{border-left:3px solid var(--warn)}
+#page-generate .mr-diff-key{font-family:var(--mono);font-weight:700}
+#page-generate .mr-diff-value{font-family:var(--mono);overflow-wrap:anywhere}
+#page-generate .mr-diff-resolution .ipt{width:100%;min-width:0}
+@media(max-width:820px){#page-generate .mr-grid{grid-template-columns:repeat(2,minmax(0,1fr))}#page-generate .mr-diff-row{grid-template-columns:minmax(75px,.5fr) minmax(0,1fr)}#page-generate .mr-span-2{grid-column:span 2}}
+@media(max-width:560px){#page-generate .mr-head{flex-direction:column}#page-generate .mr-grid{grid-template-columns:minmax(0,1fr)}#page-generate .mr-span-2{grid-column:auto}#page-generate .mr-diff-row{grid-template-columns:minmax(0,1fr)}#page-generate .mr-actions{align-items:stretch;flex-direction:column}#page-generate .mr-actions .btn{width:100%}}
 .deps-command-status{margin-top:10px;padding:8px 10px;border:1px solid var(--rule);border-radius:7px;background:var(--th-bg);font-size:12px;color:var(--muted)}
 .deps-readiness,.deps-frozen-help{display:grid;grid-template-columns:max-content 1fr;gap:6px 12px;margin-top:10px;padding:10px;border:1px solid var(--rule);border-radius:7px;background:var(--surface);font-size:11.5px;line-height:1.5}.deps-readiness span,.deps-frozen-help span{color:var(--muted)}.deps-frozen-help{grid-template-columns:1fr;background:var(--warn-bg);color:var(--warn)}
 .deps-command-quick{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 2px}
