@@ -19,6 +19,7 @@ import ntpath
 import os
 import posixpath
 import re
+import shutil
 import sys
 import tempfile
 import threading
@@ -261,8 +262,10 @@ class Api:
                  comparison_mod=None, candidate_evaluation_mod=None,
                  paper_report_mod=None, workspace_state_store=None,
                  report_service=None, analysis_preferences_store=None,
-                 project_lifecycle_service=None, lab_policy_store=None,
-                 workspace_context_store=None):
+                  project_lifecycle_service=None, lab_policy_store=None,
+                  workspace_context_store=None, structure_sources_mod=None,
+                  structure_source_session=None, external_structure_gateway=None,
+                  surface_workbench_mod=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -399,6 +402,17 @@ class Api:
         self._project_lifecycle_lock = threading.RLock()
         self._project_lifecycle_selections = {}
         self._project_lifecycle_plans = {}
+        # 本地结构 provider 与 External Reference Gateway 的消费端保持惰性。
+        # 远端 registry/网络/缓存不在本包实现；浏览器只持有短期 opaque token。
+        self._structure_sources_mod = structure_sources_mod
+        self._structure_source_session = structure_source_session
+        self._external_structure_gateway = external_structure_gateway
+        self._surface_workbench = surface_workbench_mod
+        self._structure_hub_lock = threading.RLock()
+        self._structure_confirmed_sources = {}
+        self._structure_confirmation_aliases = {}
+        self._structure_output_selections = {}
+        self._structure_operations = {}
         # Every browser project-ID request is rebound under one process-local
         # transaction lock before any private path helper may use it.  The
         # thread-local map also makes every nested project reload verify the
@@ -1677,6 +1691,23 @@ class Api:
             from vcstudio.generate import metal_slab
             self._metal_slab = metal_slab
         return self._metal_slab
+
+    def _structure_sources(self):
+        """本地 provider + 外部 gateway 消费会话；本模块自身不发网络请求。"""
+        if self._structure_source_session is None:
+            if self._structure_sources_mod is None:
+                from vcstudio.generate import structure_sources
+                self._structure_sources_mod = structure_sources
+            self._structure_source_session = self._structure_sources_mod.StructureSourceSession(
+                gateway=self._external_structure_gateway)
+        return self._structure_source_session
+
+    def _surface_wb(self):
+        """通用 surface/site 几何内核；与旧 metal_slab 兼容入口相互独立。"""
+        if self._surface_workbench is None:
+            from vcstudio.generate import surface_workbench
+            self._surface_workbench = surface_workbench
+        return self._surface_workbench
 
     def _usage(self):
         """实际核时统计引擎(纯函数)延迟加载。"""
@@ -12805,7 +12836,599 @@ class Api:
         except Exception:                                 # noqa: BLE001 记不进注册表不致命
             pass
 
-    # ── 金属 slab 建模(结构建模页;层厚收敛的可再生入口,Backlog #2) ────────────────
+    # ── Structure Source Hub + 通用 surface/site 向导 ───────────────────────
+    @staticmethod
+    def _structure_result_public(value):
+        """只投影搜索合同允许的字段，避免 gateway/local locator 意外外泄。"""
+        raw = dict(value or {})
+        token = str(raw.get('token') or raw.get('source_token') or '').strip()
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}', token):
+            raise ValueError('Structure source returned an invalid opaque token')
+        provenance = raw.get('provenance') if isinstance(raw.get('provenance'), dict) else {}
+        method = (raw.get('method') or raw.get('method_metadata')
+                  or provenance.get('method') or {})
+        structure_hash = str(
+            raw.get('structure_hash') or raw.get('raw_structure_sha256')
+            or raw.get('structure_sha256') or provenance.get('raw_structure_sha256')
+            or '').strip().lower()
+        if not re.fullmatch(r'[a-f0-9]{64}', structure_hash):
+            raise ValueError('Structure source returned an invalid structure hash')
+        return {
+            'token': token,
+            'source_id': str(raw.get('source_id') or raw.get('database_id') or '').strip(),
+            'formula': str(raw.get('formula') or '').strip(),
+            'license': copy.deepcopy(raw.get('license') or provenance.get('license')),
+            'citation': copy.deepcopy(raw.get('citation') or provenance.get('citation')),
+            'method': copy.deepcopy(method),
+            'structure_hash': structure_hash,
+        }
+
+    @staticmethod
+    def _structure_source_provenance(source):
+        """把 provider 各自命名归一为 job.yaml 的路径无关 provenance。"""
+        raw = dict(source or {})
+        nested = raw.get('source') if isinstance(raw.get('source'), dict) else {}
+        result = {**nested, **raw}
+        provenance = result.get('provenance')
+        if isinstance(provenance, dict):
+            result = {**result, **provenance}
+        structure_hash = str(
+            result.get('raw_structure_hash') or result.get('raw_structure_sha256')
+            or result.get('structure_hash') or result.get('structure_sha256') or '').lower()
+        if not re.fullmatch(r'[a-f0-9]{64}', structure_hash):
+            raise ValueError('Confirmed structure is missing its raw SHA-256 identity')
+        return {
+            'provider': str(result.get('provider') or '').strip(),
+            'database_id': str(
+                result.get('database_id') or result.get('source_id') or '').strip(),
+            'query': copy.deepcopy(result.get('query')),
+            'retrieved_at': str(
+                result.get('retrieved_at') or result.get('retrieved_at_utc')
+                or result.get('obtained_at') or '').strip(),
+            'license': copy.deepcopy(result.get('license')),
+            'citation': copy.deepcopy(result.get('citation')),
+            'method': copy.deepcopy(
+                result.get('method') or result.get('method_metadata') or {}),
+            'raw_structure_hash': structure_hash,
+        }
+
+    @staticmethod
+    def _structure_request(value, *, allowed, label):
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError(f'{label} request must be an object')
+        unsupported = sorted(set(value) - set(allowed))
+        if unsupported:
+            raise ValueError(f'{label} request contains unsupported fields: '
+                             + ', '.join(unsupported))
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        if len(encoded.encode('utf-8')) > 64 * 1024:
+            raise ValueError(f'{label} request is too large')
+        # 数值/枚举参数可以过桥，但路径、URI 与凭据既不需要也不允许进入此 API。
+        if (re.search(r'(?i)(?:[A-Z]:[\\/]|file:/{0,3}|\\\\|(?:^|[\s"\'])/[^/])',
+                      encoded)
+                or re.search(r'(?i)(?:api.?key|password|secret|credential|token)\s*["=:]',
+                             encoded.replace('adsorbate_source_token', ''))):
+            raise ValueError(f'{label} request must not contain paths or credentials')
+        return copy.deepcopy(value)
+
+    def _structure_top_view(self, poscar_text):
+        parsed = self._sview.parse_positions(poscar_text)
+        atoms = [
+            {'index': index, 'element': element,
+             'x': round(float(coord[0]), 8), 'y': round(float(coord[1]), 8),
+             'z': round(float(coord[2]), 8)}
+            for index, (element, coord) in enumerate(
+                zip(parsed['elements'], parsed['coords']))
+        ]
+        if len(atoms) > 5000:
+            atoms = atoms[:5000]
+        return {
+            'projection': 'xy', 'atoms': atoms,
+            'truncated': len(parsed['elements']) > len(atoms),
+            'cell': [[round(float(v), 8) for v in vector]
+                     for vector in parsed['cell'][:2]],
+        }
+
+    def _structure_hub_prune(self):
+        now = time.monotonic()
+        for store in (self._structure_confirmed_sources,
+                      self._structure_output_selections, self._structure_operations):
+            expired = [key for key, item in store.items()
+                       if now - float(item.get('created_at') or 0) > 900]
+            for key in expired:
+                store.pop(key, None)
+            if len(store) > 64:
+                oldest = sorted(
+                    store, key=lambda key: float(store[key].get('created_at') or 0))
+                for key in oldest[:len(store) - 64]:
+                    store.pop(key, None)
+        live = set(self._structure_confirmed_sources)
+        self._structure_confirmation_aliases = {
+            source_token: confirmed_token
+            for source_token, confirmed_token in self._structure_confirmation_aliases.items()
+            if confirmed_token in live
+        }
+
+    def structure_source_capabilities(self):
+        try:
+            providers = self._structure_sources().capabilities()
+            if isinstance(providers, dict):
+                providers = providers.get('providers') or []
+            if not isinstance(providers, list):
+                raise ValueError('Structure provider capabilities are invalid')
+            public = []
+            for raw in providers:
+                item = dict(raw or {})
+                public.append({
+                    'provider': str(item.get('provider') or item.get('id') or '').strip(),
+                    'label': copy.deepcopy(item.get('label') or {}),
+                    'modes': list(item.get('modes') or []),
+                    'formats': list(item.get('formats') or []),
+                    'available': bool(item.get('available', item.get('enabled'))),
+                    'network': bool(item.get('network')),
+                    'reason': self._workspace_public_text(item.get('reason') or '') or None,
+                })
+            return {'ok': True, 'providers': public, 'error': None}
+        except Exception as e:                            # noqa: BLE001 browser boundary
+            return {'ok': False, 'providers': [],
+                    'error': self._workspace_public_text(e)}
+
+    def structure_source_select_local(self):
+        """原生 picker → server-held source token；浏览器从不接收所选路径。"""
+        try:
+            if self._dialog_fn is not None:
+                selected = self._dialog_fn('structure_source')
+            else:
+                import webview                            # 延迟:测试永不 import
+                chosen = webview.windows[0].create_file_dialog(webview.OPEN_DIALOG)
+                selected = chosen[0] if chosen else None
+            if not selected:
+                return {'ok': False, 'cancelled': True, 'results': [], 'error': None}
+            results = self._structure_sources().select_local(str(selected))
+            public = [self._structure_result_public(item) for item in (results or [])]
+            if not public:
+                raise ValueError('Selected file did not contain an importable CIF/POSCAR')
+            return {'ok': True, 'cancelled': False, 'results': public, 'error': None}
+        except Exception as e:                            # noqa: BLE001 browser boundary
+            return {'ok': False, 'cancelled': False, 'results': [],
+                    'error': self._workspace_public_text(e)}
+
+    def structure_source_search(self, provider, query):
+        """消费 External Reference Gateway；本方法不实现网络、registry 或缓存。"""
+        try:
+            provider_id = str(provider or '').strip()
+            query_text = str(query or '').strip()
+            if not provider_id or not query_text:
+                raise ValueError('Provider and query are required')
+            if len(provider_id) > 64 or len(query_text) > 512:
+                raise ValueError('Provider or query is too long')
+            results = self._structure_sources().search(provider_id, query_text)
+            public = [self._structure_result_public(item) for item in (results or [])]
+            return {'ok': True, 'results': public, 'error': None}
+        except Exception as e:                            # noqa: BLE001 remote failure is local to this card
+            return {'ok': False, 'results': [],
+                    'error': self._workspace_public_text(e)}
+
+    def structure_source_preview(self, source_token):
+        try:
+            preview = dict(self._structure_sources().preview(str(source_token or '')) or {})
+            structure = preview.pop('structure', {})
+            structure = structure if isinstance(structure, dict) else {}
+            poscar = str(preview.pop('poscar', '') or preview.pop('raw_source', '')
+                         or structure.pop('poscar', '') or '')
+            public = self._structure_result_public(preview)
+            view = preview.get('view')
+            if not isinstance(view, dict):
+                if not poscar:
+                    raise ValueError('Structure preview did not include renderable structure data')
+                view = self._sview.structure_view(poscar)
+            top_view = preview.get('top_view')
+            if not isinstance(top_view, dict):
+                if not poscar:
+                    raise ValueError('Structure preview did not include top-view data')
+                top_view = self._structure_top_view(poscar)
+            provenance = self._structure_source_provenance(preview)
+            return {
+                'ok': True,
+                'preview': {**public, 'natoms': int(preview.get('natoms') or
+                                                   view.get('natoms') or 0),
+                            'view': view, 'top_view': top_view,
+                            'provenance': provenance},
+                'error': None,
+            }
+        except Exception as e:                            # noqa: BLE001 browser boundary
+            return {'ok': False, 'preview': None,
+                    'error': self._workspace_public_text(e)}
+
+    def structure_source_confirm(self, source_token):
+        """预览后显式确认并导入冻结快照；返回可复用的短期 opaque token。"""
+        self._structure_hub_lock.acquire()
+        try:
+            original_token = str(source_token or '')
+            with self._structure_hub_lock:
+                self._structure_hub_prune()
+                imported_token = self._structure_confirmation_aliases.get(original_token)
+                imported = (self._structure_confirmed_sources.get(imported_token)
+                            if imported_token else None)
+                if imported:
+                    return {
+                        'ok': True, 'confirmed': True, 'source_token': imported_token,
+                        'source': copy.deepcopy(imported['public']), 'error': None,
+                    }
+            confirmed = dict(
+                self._structure_sources().confirm(original_token) or {})
+            confirmation_token = str(confirmed.get('confirmation_token') or '').strip()
+            if not re.fullmatch(
+                    r'[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}', confirmation_token):
+                raise ValueError('Structure confirmation returned an invalid token')
+            resolved = dict(
+                self._structure_sources().resolve_confirmed(confirmation_token) or {})
+            if not (resolved.get('poscar') or resolved.get('raw_source')):
+                raise ValueError('Confirmed source did not include structure content')
+            source = confirmed.get('source') or resolved
+            public = self._structure_result_public(source)
+            imported_token = uuid.uuid4().hex
+            with self._structure_hub_lock:
+                self._structure_hub_prune()
+                existing_token = self._structure_confirmation_aliases.get(original_token)
+                if existing_token in self._structure_confirmed_sources:
+                    imported_token = existing_token
+                    public = copy.deepcopy(
+                        self._structure_confirmed_sources[existing_token]['public'])
+                else:
+                    self._structure_confirmed_sources[imported_token] = {
+                        'created_at': time.monotonic(), 'resolved': resolved,
+                        'public': copy.deepcopy(public),
+                    }
+                    self._structure_confirmation_aliases[original_token] = imported_token
+            return {'ok': True, 'confirmed': True, 'source_token': imported_token,
+                    'source': public, 'error': None}
+        except Exception as e:                            # noqa: BLE001 browser boundary
+            return {'ok': False, 'confirmed': False, 'source_token': None,
+                    'source': None, 'error': self._workspace_public_text(e)}
+        finally:
+            self._structure_hub_lock.release()
+
+    def surface_dry_run(self, source_token, slab_request=None, site_request=None):
+        """消费已确认源，生成路径无关 dry-run；不写磁盘、不建作业、不提交。"""
+        operation_token = None
+        try:
+            slab_params = self._structure_request(
+                slab_request, label='Slab',
+                allowed={'miller', 'termination', 'layers', 'vacuum',
+                         'fixed_layers', 'surface_sides', 'termination_id'})
+            site_params = self._structure_request(
+                site_request, label='Site',
+                allowed={'adsorbate_source_token', 'sides', 'binding_atom',
+                         'orientation', 'coverage', 'height', 'min_distance',
+                         'rotations', 'site_ids', 'site_kinds'})
+            with self._structure_hub_lock:
+                self._structure_hub_prune()
+                stored_source = self._structure_confirmed_sources.get(
+                    str(source_token or '').strip().lower())
+                source = copy.deepcopy(stored_source.get('resolved')) if stored_source else None
+            if not isinstance(source, dict):
+                raise ValueError('Confirmed structure source is missing or expired')
+            bulk_poscar = str(source.get('poscar') or source.get('raw_source') or '')
+            if not bulk_poscar:
+                raise ValueError('Confirmed source did not include structure content')
+            source_provenance = self._structure_source_provenance(source)
+            adsorbate_poscar = None
+            adsorbate_provenance = None
+            adsorbate_token = site_params.pop('adsorbate_source_token', None)
+            if adsorbate_token:
+                with self._structure_hub_lock:
+                    self._structure_hub_prune()
+                    stored_adsorbate = self._structure_confirmed_sources.get(
+                        str(adsorbate_token).strip().lower())
+                    adsorbate = (copy.deepcopy(stored_adsorbate.get('resolved'))
+                                 if stored_adsorbate else None)
+                if not isinstance(adsorbate, dict):
+                    raise ValueError('Confirmed adsorbate source is missing or expired')
+                adsorbate_poscar = str(
+                    adsorbate.get('poscar') or adsorbate.get('raw_source') or '')
+                if not adsorbate_poscar:
+                    raise ValueError('Confirmed adsorbate did not include structure content')
+                adsorbate_provenance = self._structure_source_provenance(adsorbate)
+
+            surface = self._surface_wb()
+            slabs = list(surface.build_slabs(bulk_poscar, slab_params) or [])
+            if not slabs:
+                raise ValueError('The slab builder returned no geometric candidates')
+            if len(slabs) > 24:
+                raise ValueError('The slab builder returned too many candidates (maximum 24)')
+            requested_sites = {str(item) for item in (site_params.get('site_ids') or [])}
+            site_call = dict(site_params)
+            private_candidates = []
+            public_slabs = []
+            all_rejections = []
+            all_warnings = []
+            for slab_index, slab in enumerate(slabs):
+                slab = dict(slab or {})
+                poscar = str(slab.pop('poscar', '') or '')
+                if not poscar:
+                    raise ValueError('Slab candidate is missing POSCAR content')
+                structure_hash = str(slab.get('structure_hash') or '').lower()
+                if not re.fullmatch(r'[a-f0-9]{64}', structure_hash):
+                    raise ValueError('Slab candidate is missing a deterministic SHA-256')
+                exploration = surface.explore_sites(
+                    poscar, site_call, adsorbate_poscar=adsorbate_poscar)
+                exploration = dict(exploration or {})
+                sites = [dict(item or {}) for item in exploration.get('sites') or []]
+                groups = [dict(item or {}) for item in
+                          exploration.get('equivalence_groups') or []]
+                rejections = [dict(item or {}) for item in
+                              exploration.get('rejections') or []]
+                if requested_sites:
+                    sites = [item for item in sites
+                             if str(item.get('site_id')) in requested_sites]
+                    rejections = [item for item in rejections
+                                  if str(item.get('site_id')) in requested_sites]
+                all_rejections.extend(rejections)
+                generated = [dict(item or {}) for item in exploration.get('generated') or []]
+                if requested_sites:
+                    generated = [
+                        item for item in generated
+                        if (str(item.get('site_id')) in requested_sites
+                            or bool(requested_sites.intersection(
+                                str(site_id) for site_id in item.get('site_ids') or [])))
+                    ]
+                if len(private_candidates) + len(generated) > 256:
+                    raise ValueError('Dry-run exceeds the 256 candidate safety limit')
+                if adsorbate_poscar is not None:
+                    for generated_index, item in enumerate(generated):
+                        generated_poscar = str(item.pop('poscar', '') or '')
+                        if not generated_poscar:
+                            continue
+                        generated_hash = str(item.get('structure_hash') or '').lower()
+                        if not re.fullmatch(r'[a-f0-9]{64}', generated_hash):
+                            raise ValueError('Adsorption candidate is missing a deterministic SHA-256')
+                        private_candidates.append({
+                            'poscar': generated_poscar,
+                            'poscar_sha256': hashlib.sha256(
+                                generated_poscar.encode('utf-8')).hexdigest(),
+                            'structure_hash': generated_hash,
+                            'natoms': self._sview.structure_view(generated_poscar)['natoms'],
+                            'termination': copy.deepcopy(slab.get('termination')),
+                            'slab_parameters': copy.deepcopy(slab.get('parameters') or slab_params),
+                            'builder': copy.deepcopy(slab.get('provenance') or {}),
+                            'site': item,
+                            'site_explorer': copy.deepcopy(exploration.get('provenance') or {}),
+                            'source': source_provenance,
+                            'adsorbate_source': adsorbate_provenance,
+                            'limitations': copy.deepcopy(exploration.get('limitations') or []),
+                            'ordinal': [slab_index, generated_index],
+                        })
+                else:
+                    private_candidates.append({
+                        'poscar': poscar, 'structure_hash': structure_hash,
+                        'poscar_sha256': hashlib.sha256(
+                            poscar.encode('utf-8')).hexdigest(),
+                        'natoms': int(slab.get('natoms') or 0),
+                        'termination': copy.deepcopy(slab.get('termination')),
+                        'slab_parameters': copy.deepcopy(slab.get('parameters') or slab_params),
+                        'builder': copy.deepcopy(slab.get('provenance') or {}),
+                        'site': None,
+                        'site_explorer': copy.deepcopy(exploration.get('provenance') or {}),
+                        'source': source_provenance, 'adsorbate_source': None,
+                        'limitations': copy.deepcopy(exploration.get('limitations') or []),
+                        'ordinal': [slab_index, 0],
+                    })
+                view = self._sview.structure_view(poscar)
+                public_slabs.append({
+                    **slab, 'view': view, 'top_view': self._structure_top_view(poscar),
+                    'sites': sites, 'equivalence_groups': groups,
+                    'rejections': rejections,
+                    'generated_count': len(generated),
+                })
+                all_warnings.extend(str(item) for item in
+                                    exploration.get('limitations') or [])
+                slab_provenance = slab.get('provenance')
+                if isinstance(slab_provenance, dict):
+                    all_warnings.extend(str(item) for item in
+                                        slab_provenance.get('limitations') or [])
+
+            ready = bool(private_candidates)
+            if adsorbate_poscar is not None and not ready:
+                message = ('All adsorption candidates were rejected by collision/minimum-distance '
+                           'checks; no candidate operation was created')
+                return {
+                    'ok': False, 'ready': False, 'operation_token': None,
+                    'dry_run': {
+                        'scientific_status': 'candidate', 'source': source_provenance,
+                        'adsorbate_source': adsorbate_provenance, 'slabs': public_slabs,
+                        'candidate_count': 0, 'rejections': all_rejections,
+                        'warnings': list(dict.fromkeys(all_warnings)),
+                    },
+                    'error': message,
+                }
+            operation_token = uuid.uuid4().hex
+            public_dry_run = {
+                'scientific_status': 'candidate', 'source': source_provenance,
+                'adsorbate_source': adsorbate_provenance, 'slabs': public_slabs,
+                'candidate_count': len(private_candidates),
+                'rejections': all_rejections,
+                'warnings': list(dict.fromkeys(all_warnings)),
+                'submission': 'not_performed', 'promotion': 'not_performed',
+            }
+            with self._structure_hub_lock:
+                self._structure_hub_prune()
+                self._structure_operations[operation_token] = {
+                    'created_at': time.monotonic(), 'status': 'prepared',
+                    'candidates': private_candidates, 'public': public_dry_run,
+                }
+            return {'ok': True, 'ready': ready, 'operation_token': operation_token,
+                    'dry_run': public_dry_run, 'error': None}
+        except Exception as e:                            # noqa: BLE001 dry-run must stay structured
+            return {'ok': False, 'ready': False, 'operation_token': operation_token,
+                    'dry_run': None, 'error': self._workspace_public_text(e)}
+
+    def structure_output_select(self):
+        """选择候选批次根目录；只把 label 与 opaque token 返回浏览器。"""
+        try:
+            selected = self.pick_dir()
+            path = str((selected or {}).get('path') or '').strip()
+            if not path:
+                return {'ok': False, 'cancelled': True, 'output_token': None,
+                        'selection': None, 'error': None}
+            canonical = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+            if not os.path.isdir(canonical):
+                raise ValueError('Selected output folder is unavailable')
+            token = uuid.uuid4().hex
+            label = os.path.basename(os.path.normpath(canonical)) or 'Selected folder'
+            label = re.sub(r'[\x00-\x1f]+', '', label)[:80] or 'Selected folder'
+            with self._structure_hub_lock:
+                self._structure_hub_prune()
+                self._structure_output_selections[token] = {
+                    'created_at': time.monotonic(), 'path': canonical, 'label': label,
+                }
+            return {'ok': True, 'cancelled': False, 'output_token': token,
+                    'selection': {'label': label}, 'error': None}
+        except Exception as e:                            # noqa: BLE001 browser boundary
+            return {'ok': False, 'cancelled': False, 'output_token': None,
+                    'selection': None, 'error': self._workspace_public_text(e)}
+
+    @staticmethod
+    def _structure_candidate_stem(candidate, index):
+        site = candidate.get('site') if isinstance(candidate.get('site'), dict) else {}
+        term = (candidate.get('termination')
+                if isinstance(candidate.get('termination'), dict) else {})
+        hint = str(site.get('site_id') or term.get('termination_id') or f'candidate-{index + 1}')
+        safe = re.sub(r'[^A-Za-z0-9_.-]+', '-', hint).strip('-.')[:48]
+        return f'{index + 1:03d}-{safe or "candidate"}-{candidate["structure_hash"][:10]}'
+
+    def surface_create_candidates(self, operation_token, output_token):
+        """显式确认后原子创建 candidate 批次；相同 operation token 幂等重放。"""
+        operation_id = str(operation_token or '').strip().lower()
+        destination_id = str(output_token or '').strip().lower()
+        failure = {'ok': False, 'replayed': False, 'operation_id': operation_id or None,
+                   'scientific_status': 'candidate',
+                   'batch_id': None, 'jobs': [], 'warnings': [], 'error': None}
+        if (not re.fullmatch(r'[a-f0-9]{32}', operation_id)
+                or not re.fullmatch(r'[a-f0-9]{32}', destination_id)):
+            failure['error'] = 'Candidate operation or output selection is missing or expired'
+            return failure
+        stage = None
+        with self._structure_hub_lock:
+            self._structure_hub_prune()
+            operation = self._structure_operations.get(operation_id)
+            destination = self._structure_output_selections.get(destination_id)
+            if not operation or not destination:
+                failure['error'] = 'Candidate operation or output selection is missing or expired'
+                return failure
+            if operation.get('status') == 'complete':
+                if operation.get('destination_id') != destination_id:
+                    failure['error'] = 'Candidate operation is bound to a different output selection'
+                    return failure
+                return {**copy.deepcopy(operation['result']), 'replayed': True}
+            if operation.get('status') == 'creating':
+                failure['error'] = 'Candidate operation is already being created'
+                return failure
+            bound_destination = operation.get('destination_id')
+            if bound_destination and bound_destination != destination_id:
+                failure['error'] = 'Candidate operation is bound to a different output selection'
+                return failure
+            operation['destination_id'] = destination_id
+            operation['status'] = 'creating'
+            try:
+                root = destination['path']
+                batch_id = f'structure-candidates-{operation_id[:12]}'
+                final_batch = os.path.join(root, batch_id)
+                if os.path.exists(final_batch):
+                    raise FileExistsError(
+                        'A candidate batch with this operation identity already exists')
+                stage = tempfile.mkdtemp(prefix='.vcstudio-structure-', dir=root)
+                public_jobs = []
+                staged_dirs = []
+                for index, candidate in enumerate(operation['candidates']):
+                    job_id = ('structure-' + candidate['structure_hash'][:20]
+                              + f'-{index + 1:03d}')
+                    job_name = self._structure_candidate_stem(candidate, index)
+                    job_dir = os.path.join(stage, job_name)
+                    os.makedirs(job_dir, exist_ok=False)
+                    poscar_path = os.path.join(job_dir, 'POSCAR')
+                    with open(poscar_path, 'w', encoding='utf-8', newline='\n') as handle:
+                        handle.write(candidate['poscar'])
+                    hub = {
+                        'schema': 'vcstudio.structure-hub/v1',
+                        'operation_id': operation_id,
+                        'scientific_status': 'candidate',
+                        'source': copy.deepcopy(candidate['source']),
+                        'adsorbate_source': copy.deepcopy(candidate.get('adsorbate_source')),
+                        'builder': copy.deepcopy(candidate.get('builder') or {}),
+                        'site_explorer': copy.deepcopy(candidate.get('site_explorer') or {}),
+                        'parameters': copy.deepcopy(candidate.get('slab_parameters') or {}),
+                        'termination': copy.deepcopy(candidate.get('termination')),
+                        'site': copy.deepcopy(candidate.get('site')),
+                        'structure_hash': candidate['structure_hash'],
+                        'limitations': copy.deepcopy(candidate.get('limitations') or []),
+                    }
+                    warnings = [
+                        'Candidate geometry only: no calculation was submitted and no scientific '
+                        'state was promoted.',
+                    ]
+                    if candidate.get('site'):
+                        warnings.append(
+                            'Geometric adsorption site candidate; this is not an active-site claim.')
+                    manifest = self._manifest.new_manifest(
+                        job_id=job_id,
+                        system=candidate['poscar'].splitlines()[0].strip() or job_id,
+                        task_type='relax', calc_type='slab',
+                        inputs={
+                            'natoms': int(candidate.get('natoms') or 0),
+                            'poscar_sha256': candidate['poscar_sha256'],
+                            'recipe': {
+                                'kind': 'surface_workbench',
+                                'builder': copy.deepcopy(candidate.get('builder') or {}),
+                                'parameters': copy.deepcopy(
+                                    candidate.get('slab_parameters') or {}),
+                            },
+                            'structure_hub': hub,
+                        },
+                        warnings=warnings,
+                    )
+                    manifest['job_uuid'] = job_id
+                    manifest['scientific_status'] = 'candidate'
+                    manifest['submission_ready'] = False
+                    self._manifest.save_manifest(job_dir, manifest)
+                    staged_dirs.append((job_dir, job_name))
+                    public_jobs.append({
+                        'job_id': job_id, 'structure_hash': candidate['structure_hash'],
+                        'scientific_status': 'candidate', 'state': 'CREATED',
+                        'submission_ready': False,
+                    })
+                os.replace(stage, final_batch)
+                stage = None
+                warnings = []
+                for _old_dir, job_name in staged_dirs:
+                    try:
+                        self._ledger.register(os.path.join(final_batch, job_name))
+                    except Exception as exc:               # noqa: BLE001 files remain authoritative
+                        warnings.append(
+                            'Candidate files were created but ledger registration failed: '
+                            + self._workspace_public_text(exc))
+                result = {
+                    'ok': True, 'replayed': False, 'operation_id': operation_id,
+                    'scientific_status': 'candidate',
+                    'batch_id': batch_id, 'jobs': public_jobs, 'warnings': warnings,
+                    'submission': 'not_performed', 'promotion': 'not_performed',
+                    'error': None,
+                }
+                operation['status'] = 'complete'
+                operation['result'] = copy.deepcopy(result)
+                return result
+            except Exception as e:                        # noqa: BLE001 atomic stage is recoverable
+                operation['status'] = 'prepared'
+                operation.pop('destination_id', None)
+                failure['error'] = self._workspace_public_text(e)
+                return failure
+            finally:
+                if stage:
+                    shutil.rmtree(stage, ignore_errors=True)
+
+    # ── 金属 slab 建模(兼容入口;新向导不再向此处扩硬编码) ────────────────────────
     def metal_slab_catalog(self):
         """支持的(结构,晶面)组合 + 晶格常数初猜表 → {'ok','surfaces','guess','error'}。
 
