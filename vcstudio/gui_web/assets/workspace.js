@@ -56,7 +56,7 @@
     'prepare-batch': { area: 'prepare', page: 'generate', label: '批量', labelKey: 'workspace.route.prepare_batch',
       path: () => '/prepare/batch' },
     'prepare-templates': { area: 'prepare', page: 'generate', label: '模板', labelKey: 'workspace.route.prepare_templates',
-      path: () => '/prepare/templates', focus: '#taskcat-card' },
+      path: () => '/prepare/templates', focus: '#research-recipes-card' },
     'prepare-preflight': { area: 'prepare', page: 'generate', label: '预检', labelKey: 'workspace.route.prepare_preflight',
       path: () => '/prepare/preflight' },
 

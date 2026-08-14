@@ -252,6 +252,7 @@ class Api:
                  bands_mod=None, cell_opt_mod=None, eos_mod=None,
                  workfunction_mod=None, surface_energy_mod=None, dimer_mod=None,
                  auto_figures_mod=None, campaign_templates_mod=None,
+                 research_recipes_mod=None,
                  solvation_mod=None, paper_data_mod=None, variant_advisor_mod=None,
                  manuscript_draft_mod=None, bands_parse_mod=None, deps_runner=None,
                  neb_builder_mod=None, references_mod=None, chgdiff_mod=None,
@@ -344,6 +345,9 @@ class Api:
         self._dimer = dimer_mod                     # generate.dimer_builder(Dimer 派生)
         self._auto_figures = auto_figures_mod       # project.auto_figures(场景感知一键出图)
         self._campaign_tpl = campaign_templates_mod  # project.campaign_templates(活动模板)
+        # 版本化催化研究配方仅提供目录和 dry-run DAG；不复用会落盘的旧 campaign
+        # instantiate 路径，也不授予任何提交/远程操作权限。
+        self._research_recipes = research_recipes_mod
         self._solvation = solvation_mod             # generate.solvation(溶剂化复合物)
         self._paper_data = paper_data_mod           # project.paper_data(数据表提取/文献对照)
         self._variant_advisor = variant_advisor_mod  # project.variant_advisor(材料变体)
@@ -1753,6 +1757,13 @@ class Api:
             from vcstudio.project import campaign_templates
             self._campaign_tpl = campaign_templates
         return self._campaign_tpl
+
+    def _rr(self):
+        """版本化研究配方目录与纯 dry-run 预览延迟加载。"""
+        if self._research_recipes is None:
+            from vcstudio.project import research_recipes
+            self._research_recipes = research_recipes
+        return self._research_recipes
 
     def _sv(self):
         """溶剂化复合物建模引擎延迟加载(numpy 相邻,重)。"""
@@ -16225,6 +16236,49 @@ class Api:
     # ══════════════════════════════════════════════════════════════════════════
     # 二、一键出图管线接线:活动模板 + 溶剂化复合物 + 出图偏好
     # ══════════════════════════════════════════════════════════════════════════
+    @classmethod
+    def _research_recipe_public_value(cls, value):
+        """Recursively redact paths/secrets at the recipe browser boundary."""
+        try:
+            from vcstudio.project.catalysis_contracts import redact_sensitive
+            projected = redact_sensitive(value)
+            if isinstance(projected, str):
+                return cls._workspace_public_text(projected, limit=4000)
+            return projected
+        except Exception:                                 # noqa: BLE001 fail closed
+            return '[redacted-sensitive-value]'
+
+    def research_recipe_catalog(self):
+        """Return the built-in versioned recipe gallery without side effects."""
+        try:
+            result = self._rr().catalog()
+            return self._research_recipe_public_value({
+                'ok': True, **result, 'error_code': None, 'error': None,
+            })
+        except Exception:                                 # noqa: BLE001 public boundary
+            return {
+                'ok': False, 'schema': 'vcstudio.research-recipe-catalog/v1',
+                'recipes': [], 'recipe_count': 0,
+                'read_only': True, 'authorizes_execution': False,
+                'error_code': 'research_recipe_catalog_unavailable',
+                'error': 'Research recipe catalog is unavailable.',
+            }
+
+    def research_recipe_preview(self, recipe_id, recipe_version=None, request=None):
+        """Return a path-free, read-only DAG; never create jobs or directories."""
+        try:
+            result = self._rr().preview(recipe_id, recipe_version, request)
+            return self._research_recipe_public_value({
+                'ok': True, 'preview': result, 'error_code': None, 'error': None,
+            })
+        except Exception:                                 # noqa: BLE001 do not echo untrusted input
+            return {
+                'ok': False, 'preview': None,
+                'error_code': 'research_recipe_preview_invalid',
+                'error': 'Research recipe preview request is invalid.',
+                'read_only': True, 'authorizes_execution': False,
+            }
+
     def campaign_templates(self):
         """计算活动模板清单 → {'ok','templates':[{key,name_zh,description,figures_scenario,
         n_stages,analyses}],'error'}(①结构建模 SAC 矩阵卡下拉)。"""

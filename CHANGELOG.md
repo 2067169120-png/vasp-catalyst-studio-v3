@@ -11,6 +11,10 @@ V4.0.0 is not released, and the `v4.0.0` tag has not been created. This section 
   之间的绑定关系；未通过门禁或缺少证据时保留诊断状态，不冒充最终发布结果。
 - 引入项目工作区壳，统一项目上下文、路由、选择恢复和跨页面入口，使分析与报告围绕同一
   项目身份工作，而不是由各页面各自维护易漂移的副本。
+- 新增严格、版本化的催化领域 DTO 与五条内置研究配方；Prepare → Templates 可用 typed evidence
+  和显式参数覆盖生成零副作用 DAG 预览及 semantic hash。配方 ready 不代表科学 validated/accepted，
+  `job.yaml` 仍是作业事实源。Versioned catalysis DTOs and five built-in research recipes now provide
+  typed-evidence, parameter-source-aware, side-effect-free DAG previews without granting execution authority.
 
 ### Revisioned 工作台与适配器（Phase C–D）
 - 新增 revisioned report workbench，将配置草稿、绑定预览、发布 revision、产物清单及
