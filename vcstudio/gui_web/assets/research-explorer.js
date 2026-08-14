@@ -159,6 +159,31 @@
         '{count} method-incompatible rows excluded', { count: compatibility.excluded_rows }))}</span>`;
   }
 
+  function energyMarkup(result) {
+    const compatibility = result && result.energy_compatibility;
+    if (!compatibility) return '';
+    const identity = compatibility.selected_energy_contract_id || t(
+      'research.energy_contract_unavailable', '口径未证明一致', 'Contract compatibility unproven');
+    return `<span><b>${esc(t('research.energy_contract', '能量口径', 'Energy contract'))}：</b>` +
+      `${esc(identity)}</span><span><b>${esc(t('research.numeric_samples', '数值样本',
+        'Numeric samples'))}：</b>${esc(compatibility.numeric_rows)} · ${esc(t(
+        'research.unverified_contracts', '未验证口径 {count}', '{count} unverified contracts',
+        { count: compatibility.unverified_contract_rows }))}</span>`;
+  }
+
+  function aggregationMessage(status) {
+    if (status === 'unavailable_incompatible_energy_contract') return t(
+      'research.energy_aggregate_unavailable',
+      '能量 quantity / reference contract 不一致或无法证明，科学聚合不可用。',
+      'Scientific aggregation is unavailable because energy quantity/reference contracts differ or are unproven.');
+    if (status === 'unavailable_method_compatibility' ||
+        status === 'blocked_mixed_or_unverified_methods') return t(
+      'research.method_aggregate_unavailable',
+      '方法或 engine cohort 未验证一致，科学聚合不可用。',
+      'Scientific aggregation is unavailable because the method/engine cohort is not verified.');
+    return t('research.aggregate_missing', '没有可聚合的数值。', 'No numeric values to aggregate.');
+  }
+
   function tableRowsMarkup(result) {
     const table = result && result.table;
     const rows = table && Array.isArray(table.rows) ? table.rows : [];
@@ -167,6 +192,8 @@
       'No complete index rows match the current filters.'))}</td></tr>`;
     return rows.map(row => {
       const display = row.display || {};
+      const quantityEvidence = Object.entries(row.quantity_evidence || {})
+        .map(([quantity, status]) => `${quantity}:${status}`).join(' · ');
       return `<tr>
         <td><b>${esc(row.project_name)}</b><span class="rex-identity">${esc(row.project_id)}</span></td>
         <td>${esc(row.formula || '—')}</td><td>${esc(row.facet || '—')}</td>
@@ -174,8 +201,9 @@
         <td>${esc(row.state || '—')}</td>
         <td><span class="rex-identity">${esc(row.method_fingerprint || '—')}</span></td>
         <td>${esc(row.evidence_level || '—')}<span class="rex-identity">${esc(
-          row.provenance_status || '')}</span></td>
-        <td class="num">${esc(display.energy_eV || '—')} eV</td>
+          row.provenance_status || '')}${quantityEvidence ? ` · ${esc(quantityEvidence)}` : ''}</span></td>
+        <td class="num">${esc(display.energy_eV || '—')} eV<span class="rex-identity">${esc(
+          row.energy_quantity || 'missing')} · ${esc(row.energy_contract_status || 'missing')}</span></td>
         <td class="num">${esc(display.barrier_eV || '—')} eV<br>
           <button class="btn quiet" type="button" data-rex-action="provenance"
             data-project-id="${esc(row.project_id)}" data-job-id="${esc(row.job_id)}"
@@ -187,8 +215,8 @@
 
   function histogramMarkup(result) {
     const histogram = result && result.histogram;
-    if (!histogram || histogram.status !== 'ready') return `<div class="rex-empty">${esc(t(
-      'research.hist_missing', '没有可聚合的数值。', 'No numeric values to aggregate.'))}</div>`;
+    if (!histogram || histogram.status !== 'ready') return `<div class="rex-empty">${esc(
+      aggregationMessage(histogram && histogram.status))}</div>`;
     return `<div class="rex-chart-body">${histogram.bins.map(bin => `
       <div class="rex-hist-row"><span>${esc(bin.low_display)}–${esc(bin.high_display)}</span>
         <span class="rex-hist-track"><span class="rex-hist-bar" style="width:${esc(
@@ -204,9 +232,8 @@
   function scatterMarkup(result) {
     const scatter = result && result.scatter;
     if (!scatter || scatter.status !== 'ready') {
-      return `<div class="rex-empty">${esc(scatter && scatter.reason || t(
-        'research.scatter_missing', '散点不可用；缺失数值或方法 cohort 未对齐。',
-        'Scatter unavailable: values are missing or method cohorts are not aligned.'))}</div>`;
+      return `<div class="rex-empty">${esc(scatter && scatter.reason ||
+        aggregationMessage(scatter && scatter.status))}</div>`;
     }
     return `<div class="rex-scatter" role="img" aria-label="${esc(t(
       'research.scatter', '服务端定稿散点图', 'Server-finalized scatter plot'))}">
@@ -223,8 +250,8 @@
 
   function periodicMarkup(result) {
     const periodic = result && result.periodic_table;
-    if (!periodic || periodic.status !== 'ready') return `<div class="rex-empty">${esc(t(
-      'research.periodic_missing', '没有可识别元素。', 'No recognized elements.'))}</div>`;
+    if (!periodic || periodic.status !== 'ready') return `<div class="rex-empty">${esc(
+      aggregationMessage(periodic && periodic.status))}</div>`;
     return `<div class="rex-periodic-wrap" tabindex="0" role="region" aria-label="${esc(t(
       'research.periodic', '元素周期表聚合', 'Periodic-table aggregation'))}">
       <div class="rex-periodic">${periodic.cells.map(cell => `<div class="rex-element"
@@ -285,7 +312,7 @@
             'research.rebuild', '重建索引', 'Rebuild index'))}</button></div></div>
       ${error ? `<p class="rex-alert" role="alert">${esc(error)}</p>` : ''}
       ${controlMarkup(State.request)}
-      <div class="rex-meta" aria-live="polite">${methodMarkup(result)}
+      <div class="rex-meta" aria-live="polite">${methodMarkup(result)}${energyMarkup(result)}
         <span><b>${esc(t('research.index_freshness', '索引 freshness', 'Index freshness'))}：</b>` +
           `${esc(freshness.age_seconds == null ? '—' : freshness.age_seconds)} s</span>
         <span><b>${esc(t('research.denominator', '分母', 'Denominator'))}：</b>` +
@@ -545,6 +572,7 @@
       shellMarkup,
       tableRowsMarkup,
       histogramMarkup,
+      aggregationMessage,
       scatterMarkup,
       periodicMarkup,
       provenanceMarkup,

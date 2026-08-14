@@ -76,9 +76,12 @@ def _build(tmp_path, *, failures=(), max_age_seconds=300, monotonic=None):
 
     def summary(project):
         record = next(item for item in records if item["project"] is project)
-        return {"rows": [{
+        species = next(iter(project["config_species"].values()))
+        return {"reference_mode": "species", "rows": [{
             "name": "config", "species": next(iter(project["config_species"].values())),
             "delta_e": record["summary_energy"], "reference_valid": True,
+            "reference_species": species, "reference_source": "OSZICAR:E0",
+            "method_check": {"status": "verified"},
         }]}
 
     def method(target):
@@ -219,8 +222,10 @@ def test_live_provenance_separates_layers_and_never_merges_frozen_report_graph(t
     origins = {node["origin_status"] for node in graph["nodes"]}
     assert origins <= {"observed", "imported", "inferred", "missing"}
     report = next(node for node in graph["nodes"] if node["type"] == "report")
+    assert report["origin_status"] == "missing"
     assert report["record"]["frozen_graph_separate"] is True
     assert report["record"]["frozen_graph_endpoint"] == "report_evidence_graph"
+    assert not any(edge["type"] == "reported_in" for edge in graph["edges"])
 
     encoded = json.dumps({"query": result, "graph": graph}, ensure_ascii=False)
     assert str(tmp_path) not in encoded

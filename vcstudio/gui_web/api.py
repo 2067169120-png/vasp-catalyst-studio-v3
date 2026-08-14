@@ -395,6 +395,7 @@ class Api:
         # store.  Neither is a project/job/report fact source.
         self._research_index_service = research_index_service
         self._research_view_store = research_view_store
+        self._research_index_lock = threading.RLock()
         # Confirmed laboratory recommendations are user-level state.  They do
         # not mutate job manifests or grant submission authority.
         self._lab_policy_store = lab_policy_store
@@ -7493,26 +7494,260 @@ class Api:
         ]
         return snapshot, records, failures, self._research_source_version(records)
 
-    def _research_prepare(self, *, force=False):
-        snapshot, records, failures, source_version = self._research_authority()
-        service = self._research_index()
-        fingerprint = service.source_fingerprint(
-            records, registry_total=snapshot['registered_total'],
-            registry_failures=failures, source_version=source_version)
-        current = service.index_status()
-        if (force or current.get('status') in {'unavailable', 'stale'}
-                or current.get('source_fingerprint') != fingerprint):
-            service.rebuild(
-                records,
-                manifest_loader=self._manifest.load_manifest,
-                summary_loader=self._adsorption.delta_e_rows,
-                job_id_resolver=self._workspace_job_id,
-                method_resolver=self._analysis_workbench_method_evidence,
-                registry_total=snapshot['registered_total'],
-                registry_failures=failures,
-                source_version=source_version,
+    @staticmethod
+    def _research_report_revision_id(project):
+        marker = project.get('autopilot_report') if isinstance(project, dict) else None
+        if not isinstance(marker, dict):
+            return ''
+        revision = marker.get('revision')
+        revision = revision if isinstance(revision, dict) else {}
+        return str(marker.get('revision_id') or revision.get('revision_id') or '').strip()
+
+    def _research_frozen_context(self, target, cache):
+        """Revalidate one current frozen revision and its separate evidence graph."""
+        project = target.get('project') or {}
+        record = target.get('record') or {}
+        revision_id = self._research_report_revision_id(project)
+        key = (str(record.get('path') or ''), revision_id)
+        if key in cache:
+            return cache[key]
+        cache[key] = None
+        if (not revision_id
+                or not self._report_marker_current(project, target.get('summary'))):
+            return None
+        try:
+            from vcstudio.project.report_contracts import (
+                ReportSnapshot,
+                ReportSpec,
+                ValidationResult,
+                validate_bindings,
             )
-        return service
+            from vcstudio.project.report_insights import (
+                evidence_graph,
+                load_frozen_revision,
+            )
+
+            reports = self._reports()
+            bundle = load_frozen_revision(reports, record['path'], revision_id)
+            spec = ReportSpec.from_mapping(bundle.spec)
+            snapshot = ReportSnapshot.from_mapping(bundle.snapshot, spec=spec)
+            validation = ValidationResult.from_mapping(
+                bundle.validation, spec=spec, snapshot=snapshot)
+            validate_bindings(spec, snapshot, validation)
+            if (validation.status not in {'passed', 'passed_with_warnings'}
+                    or validation.scientific_qualification == 'diagnostic'):
+                return None
+            graph = evidence_graph(reports, record['path'], revision_id)
+            if not isinstance(graph, dict) or graph.get('ok') is not True:
+                return None
+            cache[key] = {
+                'bundle': bundle,
+                'validation': validation,
+                'graph': graph,
+            }
+            return cache[key]
+        except Exception:                               # noqa: BLE001 fail closed
+            return None
+
+    @staticmethod
+    def _research_frozen_members(context):
+        summary = ((context['bundle'].snapshot.get('payload') or {})
+                   .get('adsorption_summary') or {})
+        members = {}
+        for item in summary.get('members') or []:
+            if isinstance(item, dict) and item.get('member_id'):
+                members[str(item['member_id'])] = item
+        return summary, members
+
+    @staticmethod
+    def _research_graph_job_ids(context):
+        return {
+            str((node.get('record') or {}).get('job_id') or '')
+            for node in context['graph'].get('nodes') or []
+            if isinstance(node, dict) and node.get('type') == 'job'
+        }
+
+    def _research_current_member_hashes(self, target):
+        current = {}
+        for path in self._project_member_dirs(target.get('project') or {}):
+            manifest = self._manifest.load_manifest(path) or {}
+            job_id = self._workspace_job_id(path, manifest)
+            results = manifest.get('results') or {}
+            hashes = results.get('fetched_sha256') or {}
+            if not isinstance(hashes, dict) or not hashes:
+                current[job_id] = {}
+                continue
+            root = os.path.realpath(os.path.abspath(str(path)))
+            verified = {}
+            for name, expected in hashes.items():
+                filename = str(name or '').replace('\\', '/')
+                parts = filename.split('/')
+                digest = str(expected or '').lower()
+                if (not filename or any(part in {'', '.', '..'} for part in parts)
+                        or not re.fullmatch(r'[0-9a-f]{64}', digest)):
+                    verified = {}
+                    break
+                output = os.path.realpath(os.path.join(root, *parts))
+                try:
+                    if (os.path.commonpath((root, output)) != root
+                            or not os.path.isfile(output)
+                            or _sha256_file(output) != digest):
+                        verified = {}
+                        break
+                except (OSError, ValueError):
+                    verified = {}
+                    break
+                verified[filename] = digest
+            current[job_id] = verified
+        return current
+
+    def _research_validation_evidence(self, target, cache):
+        context = self._research_frozen_context(target, cache)
+        if context is None:
+            return {}
+        job_id = str(target.get('job_id') or '')
+        summary, members = self._research_frozen_members(context)
+        member = members.get(job_id) or {}
+        current_members = self._research_current_member_hashes(target)
+        output_hash_bound = bool(members) and all(
+            bool(current_members.get(member_id))
+            and current_members[member_id] == (frozen.get('fetched_sha256') or {})
+            for member_id, frozen in members.items()
+        )
+        if (job_id not in self._research_graph_job_ids(context)
+                or not output_hash_bound):
+            return {}
+        current_row = target.get('summary_row') or {}
+        verified_quantities = {}
+        if current_row.get('delta_e') is not None:
+            frozen_row = next((
+                row for row in summary.get('rows') or []
+                if isinstance(row, dict)
+                and str(row.get('configuration_id') or row.get('job_id') or '')
+                == job_id
+            ), None)
+            if (not frozen_row or frozen_row.get('reference_valid') is not True
+                    or frozen_row.get('delta_e') != current_row.get('delta_e')):
+                return {}
+            verified_quantities['energy_eV'] = (
+                (target.get('quantity_sha256') or {}).get('energy_eV'))
+        else:
+            current_energy = (target.get('energy') or {}).get('energy_eV')
+            if (current_energy is not None
+                    and member.get('energy_e0_eV') == current_energy):
+                verified_quantities['energy_eV'] = (
+                    (target.get('quantity_sha256') or {}).get('energy_eV'))
+        if (target.get('barrier_eV') is not None
+                and 'barrier_eV' in member
+                and member.get('barrier_eV') == target.get('barrier_eV')):
+            verified_quantities['barrier_eV'] = (
+                (target.get('quantity_sha256') or {}).get('barrier_eV'))
+        verified_quantities = {
+            key: value for key, value in verified_quantities.items() if value
+        }
+        return {
+            'authority': 'validation_result',
+            'status': 'verified',
+            'hash_bound': True,
+            'current': True,
+            'output_hash_bound': True,
+            'job_id': job_id,
+            'source_id': str(target.get('source_id') or ''),
+            'reference_mode': summary.get('reference_mode'),
+            'verified_quantities': verified_quantities,
+        }
+
+    def _research_report_binding(self, target, cache):
+        context = self._research_frozen_context(target, cache)
+        if context is None:
+            return {}
+        summary, members = self._research_frozen_members(context)
+        rows = {
+            str(item.get('configuration_id') or item.get('job_id') or ''): item
+            for item in summary.get('rows') or [] if isinstance(item, dict)
+        }
+        graph_jobs = self._research_graph_job_ids(context)
+        current_members = self._research_current_member_hashes(target)
+        # The frozen graph must expose the exact frozen adsorption evidence,
+        # not only a revision label or a raw project marker.
+        graph_has_summary = any(
+            isinstance(node, dict)
+            and node.get('type') == 'snapshot_record'
+            and (node.get('record') or {}).get('pointer')
+            == 'snapshot:payload/adsorption_summary'
+            for node in context['graph'].get('nodes') or []
+        )
+        if not graph_has_summary:
+            return {}
+        bound = []
+        for entry in target.get('entries') or []:
+            if (entry.get('role') != 'configuration'
+                    or entry.get('energy_origin') != 'analysis'):
+                continue
+            row = rows.get(str(entry.get('job_id') or ''))
+            if (not row or row.get('reference_valid') is not True
+                    or row.get('delta_e') != entry.get('energy_eV')):
+                continue
+            operand_jobs = {
+                str(operand.get('job_id') or '')
+                for operand in entry.get('_operands') or []
+                if isinstance(operand, dict) and operand.get('job_id')
+            }
+            if (len(operand_jobs) != 3 or not operand_jobs.issubset(graph_jobs)
+                    or not operand_jobs.issubset(members)):
+                continue
+            output_bound = True
+            for operand_id in operand_jobs:
+                frozen_hashes = (members.get(operand_id) or {}).get('fetched_sha256') or {}
+                if (not current_members.get(operand_id)
+                        or current_members[operand_id] != frozen_hashes):
+                    output_bound = False
+                    break
+            if not output_bound:
+                continue
+            bound.append({
+                'job_id': entry['job_id'],
+                'source_id': entry['source_id'],
+                'quantity': 'energy_eV',
+                'energy_contract_id': entry['energy_contract_id'],
+                'quantity_sha256': (entry.get('_quantity_sha256') or {})['energy_eV'],
+            })
+        if not bound:
+            return {}
+        return {
+            'revision_id': context['bundle'].revision_id,
+            'current': True,
+            'frozen_graph_revalidated': True,
+            'bound_job_ids': sorted(graph_jobs),
+            'bound_analyses': bound,
+        }
+
+    def _research_prepare(self, *, force=False):
+        with self._research_index_lock:
+            snapshot, records, failures, source_version = self._research_authority()
+            service = self._research_index()
+            fingerprint = service.source_fingerprint(
+                records, registry_total=snapshot['registered_total'],
+                registry_failures=failures, source_version=source_version)
+            current = service.index_status()
+            if (force or current.get('status') in {'unavailable', 'stale'}
+                    or current.get('source_fingerprint') != fingerprint):
+                frozen_cache = {}
+                service.rebuild(
+                    records,
+                    manifest_loader=self._manifest.load_manifest,
+                    summary_loader=self._adsorption.delta_e_rows,
+                    job_id_resolver=self._workspace_job_id,
+                    method_resolver=self._analysis_workbench_method_evidence,
+                    validation_resolver=lambda target: (
+                        self._research_validation_evidence(target, frozen_cache)),
+                    report_binding_resolver=lambda target: (
+                        self._research_report_binding(target, frozen_cache)),
+                    registry_total=snapshot['registered_total'],
+                    registry_failures=failures,
+                    source_version=source_version,
+                )
+            return service
 
     @classmethod
     def _research_failure(cls, exc, *, schema='vcstudio.research-query/v1'):

@@ -224,12 +224,18 @@ def _method_projection(method: Any, manifest: Mapping[str, Any]) -> dict[str, An
     if not identity:
         identity = inputs.get("method_fingerprint") or inputs.get("method")
     engine = _safe_label(
-        method.get("engine") or inputs.get("engine") or "vasp",
+        method.get("engine") or inputs.get("engine") or "unknown",
         fallback="unknown", maximum=32).lower()
     fingerprint = ""
     if identity:
-        fingerprint = f"method-{_digest(identity, 20)}"
-    status = str(method.get("status") or ("verified" if fingerprint else "unverified"))
+        # Engine semantics are part of a computational-method identity.  The
+        # same nominal functional in two engines is not silently comparable.
+        fingerprint = f"method-{_digest({'engine': engine, 'identity': identity}, 20)}"
+    # A fingerprint identifies a cohort; it is not itself verification that
+    # the cohort evidence is complete.
+    status = str(method.get("status") or "unverified").lower()
+    if engine == "unknown" or not fingerprint:
+        status = "unverified"
     return {
         "fingerprint": fingerprint,
         "status": status if status in {"verified", "unverified", "incompatible"}
@@ -272,24 +278,83 @@ def _matching_summary_row(member: Mapping[str, str], manifest: Mapping[str, Any]
     return next((rows[key] for key in candidates if key and key in rows), {})
 
 
-def _energy_projection(manifest: Mapping[str, Any], summary_row: Mapping[str, Any]) -> dict[str, Any]:
+def _energy_projection(manifest: Mapping[str, Any], summary_row: Mapping[str, Any],
+                       summary: Mapping[str, Any]) -> dict[str, Any]:
     delta = _finite(summary_row.get("delta_e"))
     if delta is not None:
+        reference_mode = _safe_label(
+            summary_row.get("reference_mode") or summary.get("reference_mode"),
+            maximum=32).lower()
+        reference_species = _safe_label(
+            summary_row.get("reference_species"), maximum=64)
+        reference_source = _safe_label(
+            summary_row.get("reference_source"), maximum=96)
+        method_check = summary_row.get("method_check")
+        method_check = method_check if isinstance(method_check, Mapping) else {}
+        quantity = (
+            "slab_difference" if reference_mode == "none"
+            else "adsorption_energy"
+        )
+        contract: dict[str, Any] | None = None
+        if (summary_row.get("reference_valid") is True
+                and method_check.get("status") == "verified"
+                and reference_source
+                and ((reference_mode == "species" and reference_species)
+                     or reference_mode == "none")):
+            contract = {
+                "schema": "vcstudio.energy-contract/v1",
+                "quantity": quantity,
+                "unit": "eV",
+                "reference_mode": reference_mode,
+                "reference_species": reference_species or None,
+                "reference_source": reference_source,
+                "formula": (
+                    "E(config)-E(clean)-E(reference)"
+                    if reference_mode == "species" else
+                    "E(config)-E(clean)"
+                ),
+            }
         return {
             "energy_eV": delta,
-            "energy_quantity": "adsorption_energy",
+            "energy_quantity": quantity,
             "energy_origin": "analysis",
+            "energy_contract_id": (
+                f"energy-{_digest(contract, 20)}" if contract else ""),
+            "energy_contract_status": "verified" if contract else "unverified",
+            "energy_reference_mode": reference_mode or "missing",
         }
     results = manifest.get("results")
     results = results if isinstance(results, Mapping) else {}
-    energy = _finite(_nested(results,
-        ("energy_e0_eV",), ("energy_eV",), ("final_energy_eV",),
-        ("energy", "value_eV")))
+    fields = (
+        ("energy_e0_eV", ("energy_e0_eV",)),
+        ("energy_eV", ("energy_eV",)),
+        ("final_energy_eV", ("final_energy_eV",)),
+        ("energy.value_eV", ("energy", "value_eV")),
+    )
+    energy = None
+    source_field = ""
+    for label, field_path in fields:
+        energy = _finite(_nested(results, field_path))
+        if energy is not None:
+            source_field = label
+            break
     quantity = "total_energy" if energy is not None else "missing"
+    contract = ({
+        "schema": "vcstudio.energy-contract/v1",
+        "quantity": quantity,
+        "unit": "eV",
+        "reference_mode": "absolute_electronic_total",
+        "source_field": source_field,
+    } if energy is not None else None)
     return {
         "energy_eV": energy,
         "energy_quantity": quantity,
         "energy_origin": "job_manifest" if energy is not None else "missing",
+        "energy_contract_id": (
+            f"energy-{_digest(contract, 20)}" if contract else ""),
+        "energy_contract_status": "verified" if contract else "missing",
+        "energy_reference_mode": (
+            "absolute_electronic_total" if energy is not None else "missing"),
     }
 
 
@@ -318,7 +383,10 @@ def _provenance_status(manifest: Mapping[str, Any], *, has_numeric: bool) -> str
         return "imported"
     results = manifest.get("results")
     results = results if isinstance(results, Mapping) else {}
-    hashes = results.get("sha256") or results.get("hashes") or inputs.get("sha256")
+    hashes = (
+        results.get("fetched_sha256") or results.get("sha256")
+        or results.get("hashes")
+    )
     if has_numeric and hashes:
         return "observed"
     if has_numeric:
@@ -326,19 +394,61 @@ def _provenance_status(manifest: Mapping[str, Any], *, has_numeric: bool) -> str
     return "observed"
 
 
+def _authority_projection(value: Any, *, job_id: str, source_id: str,
+                          quantity_sha256: Mapping[str, str]
+                          ) -> dict[str, Any]:
+    value = value if isinstance(value, Mapping) else {}
+    authority = str(value.get("authority") or "").lower()
+    status = str(value.get("status") or "").lower()
+    identity_bound = (
+        str(value.get("job_id") or "") == job_id
+        and str(value.get("source_id") or "") == source_id
+    )
+    base_verified = (
+        authority in {"validation_result", "accepted_ledger"}
+        and status == "verified"
+        and value.get("hash_bound") is True
+        and value.get("current") is True
+        and value.get("output_hash_bound") is True
+        and identity_bound
+    )
+    declared = value.get("verified_quantities")
+    declared = declared if isinstance(declared, Mapping) else {}
+    verified_quantities = {
+        str(quantity): str(digest)
+        for quantity, digest in declared.items()
+        if (base_verified and quantity in quantity_sha256
+            and str(digest) == quantity_sha256[quantity])
+    }
+    return {
+        "authority": authority if authority in {
+            "validation_result", "accepted_ledger"} else "missing",
+        "status": "verified" if verified_quantities else "unverified",
+        "hash_bound": bool(value.get("hash_bound")),
+        "current": bool(value.get("current")),
+        "output_hash_bound": bool(value.get("output_hash_bound")),
+        "identity_bound": identity_bound,
+        "verified_quantities": verified_quantities,
+    }
+
+
 def _evidence_level(manifest: Mapping[str, Any], method: Mapping[str, Any],
-                    provenance: str, *, has_numeric: bool) -> str:
-    validation = _validation_status(manifest)
+                    provenance: str, authority: Mapping[str, Any], *,
+                    numeric_quantities: Sequence[str]) -> str:
+    has_numeric = bool(numeric_quantities)
+    verified_quantities = authority.get("verified_quantities")
+    verified_quantities = (
+        verified_quantities if isinstance(verified_quantities, Mapping) else {})
     if (has_numeric and manifest.get("state") == "DONE"
             and method.get("status") == "verified"
-            and validation in {"ready", "verified", "passed", "pass", "accepted"}):
+            and provenance == "observed"
+            and all(quantity in verified_quantities
+                    for quantity in numeric_quantities)):
         return "verified"
-    if provenance == "imported":
-        return "imported"
-    if provenance == "inferred":
-        return "inferred"
+    if has_numeric and provenance == "observed":
+        return "unverified"
     if has_numeric or manifest:
-        return "observed"
+        return "diagnostic"
     return "missing"
 
 
@@ -360,7 +470,9 @@ def _public_row(entry: Mapping[str, Any]) -> dict[str, Any]:
         "project_id", "project_name", "job_id", "source_id", "role", "formula",
         "elements", "facet", "adsorbate", "task_type", "state",
         "method_fingerprint", "method_status", "engine", "evidence_level",
+        "quantity_evidence",
         "provenance_status", "validation_status", "energy_eV", "energy_quantity",
+        "energy_contract_id", "energy_contract_status", "energy_reference_mode",
         "barrier_eV", "attempt_count",
     )
     row = {key: copy.deepcopy(entry.get(key)) for key in fields}
@@ -422,9 +534,42 @@ class ResearchIndexService:
                 summary_loader: Callable[[Mapping[str, Any]], Mapping[str, Any]],
                 job_id_resolver: Callable[[str, Mapping[str, Any]], str],
                 method_resolver: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+                validation_resolver: Callable[[Mapping[str, Any]], Mapping[str, Any]
+                                              ] | None = None,
+                report_binding_resolver: Callable[[Mapping[str, Any]], Mapping[str, Any]
+                                                  ] | None = None,
                 registry_total: int | None = None,
                 registry_failures: Sequence[Mapping[str, Any]] = (),
                 source_version: Any = None) -> dict[str, Any]:
+        # Authority reads and publication of the replacement snapshot are one
+        # transaction.  Queries cannot combine entries from one rebuild with
+        # freshness/cursors from another.
+        with self._lock:
+            return self._rebuild_locked(
+                records,
+                manifest_loader=manifest_loader,
+                summary_loader=summary_loader,
+                job_id_resolver=job_id_resolver,
+                method_resolver=method_resolver,
+                validation_resolver=validation_resolver,
+                report_binding_resolver=report_binding_resolver,
+                registry_total=registry_total,
+                registry_failures=registry_failures,
+                source_version=source_version,
+            )
+
+    def _rebuild_locked(self, records: Sequence[Mapping[str, Any]], *,
+                        manifest_loader: Callable[[str], Mapping[str, Any] | None],
+                        summary_loader: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+                        job_id_resolver: Callable[[str, Mapping[str, Any]], str],
+                        method_resolver: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+                        validation_resolver: Callable[[Mapping[str, Any]], Mapping[str, Any]
+                                                      ] | None,
+                        report_binding_resolver: Callable[[Mapping[str, Any]], Mapping[str, Any]
+                                                          ] | None,
+                        registry_total: int | None,
+                        registry_failures: Sequence[Mapping[str, Any]],
+                        source_version: Any) -> dict[str, Any]:
         entries: list[dict[str, Any]] = []
         failures = [
             {
@@ -451,6 +596,7 @@ class ResearchIndexService:
                     project, "facet", "surface_facet", "miller_index")
                 report = project.get("autopilot_report")
                 report = copy.deepcopy(report) if isinstance(report, Mapping) else {}
+                project_entries: list[dict[str, Any]] = []
                 member_count = 0
                 for member in _member_records(project):
                     manifest = manifest_loader(member["path"])
@@ -471,7 +617,7 @@ class ResearchIndexService:
                         method_raw = {"status": "unverified", "missing": ["method resolver"]}
                     method = _method_projection(method_raw, manifest)
                     summary_row = _matching_summary_row(member, manifest, rows)
-                    energy = _energy_projection(manifest, summary_row)
+                    energy = _energy_projection(manifest, summary_row, summary)
                     barrier = _barrier(manifest)
                     formula_raw = _nested(manifest,
                         ("inputs", "formula"), ("inputs", "material_formula"),
@@ -485,6 +631,56 @@ class ResearchIndexService:
                         elements = ads_elements
                     has_numeric = energy["energy_eV"] is not None or barrier is not None
                     provenance = _provenance_status(manifest, has_numeric=has_numeric)
+                    quantity_sha256: dict[str, str] = {}
+                    if energy["energy_eV"] is not None:
+                        quantity_sha256["energy_eV"] = hashlib.sha256(
+                            _canonical_bytes({
+                                "quantity": energy["energy_quantity"],
+                                "value": energy["energy_eV"],
+                                "unit": "eV",
+                                "energy_contract_id": energy["energy_contract_id"],
+                                "method_fingerprint": method["fingerprint"],
+                                "engine": method["engine"],
+                            })).hexdigest()
+                    if barrier is not None:
+                        quantity_sha256["barrier_eV"] = hashlib.sha256(
+                            _canonical_bytes({
+                                "quantity": "activation_barrier",
+                                "value": barrier,
+                                "unit": "eV",
+                                "method_fingerprint": method["fingerprint"],
+                                "engine": method["engine"],
+                                "task_type": manifest.get("task_type"),
+                            })).hexdigest()
+                    authority_raw: Mapping[str, Any] = {}
+                    if validation_resolver is not None and manifest:
+                        try:
+                            authority_raw = validation_resolver({
+                                "project_id": project_id,
+                                "project": project,
+                                "record": record,
+                                "path": member["path"],
+                                "manifest": manifest,
+                                "job_id": job_id,
+                                "source_id": source_id,
+                                "summary": summary,
+                                "summary_row": summary_row,
+                                "energy": energy,
+                                "barrier_eV": barrier,
+                                "quantity_sha256": copy.deepcopy(quantity_sha256),
+                            })
+                        except Exception:  # noqa: BLE001 authority absence is unverified
+                            authority_raw = {}
+                    authority = _authority_projection(
+                        authority_raw, job_id=job_id, source_id=source_id,
+                        quantity_sha256=quantity_sha256)
+                    quantity_evidence = {
+                        quantity: (
+                            "verified" if quantity in authority["verified_quantities"] else
+                            "unverified" if provenance == "observed" else "diagnostic"
+                        )
+                        for quantity in quantity_sha256
+                    }
                     attempts = manifest.get("attempts")
                     attempts = attempts if isinstance(attempts, list) else []
                     entry = {
@@ -508,17 +704,29 @@ class ResearchIndexService:
                         "method_status": method["status"],
                         "engine": method["engine"],
                         "evidence_level": _evidence_level(
-                            manifest, method, provenance, has_numeric=has_numeric),
+                            manifest, method, provenance, authority,
+                            numeric_quantities=tuple(quantity_sha256)),
+                        "quantity_evidence": quantity_evidence,
                         "provenance_status": provenance,
                         "validation_status": _validation_status(manifest),
                         **energy,
                         "barrier_eV": barrier,
                         "attempt_count": len(attempts),
+                        "_quantity_sha256": quantity_sha256,
                         "_manifest": manifest,
                         "_method": method,
+                        "_validation_authority": authority,
                         "_report": report,
+                        "_report_binding": {},
+                        "_path_key": member["path_key"],
+                        "_summary_row": copy.deepcopy(dict(summary_row)),
+                        "_reference_mode": _safe_label(
+                            summary_row.get("reference_mode")
+                            or (summary.get("reference_mode")
+                                if isinstance(summary, Mapping) else ""),
+                            maximum=32).lower(),
                     }
-                    entries.append(entry)
+                    project_entries.append(entry)
                     member_count += 1
                 if member_count == 0:
                     # Empty projects are still indexed explicitly as missing evidence.
@@ -532,11 +740,37 @@ class ResearchIndexService:
                         "state": "MISSING", "method_fingerprint": "",
                         "method_status": "unverified", "engine": "unknown",
                         "evidence_level": "missing", "provenance_status": "missing",
+                        "quantity_evidence": {},
                         "validation_status": "missing", "energy_eV": None,
                         "energy_quantity": "missing", "energy_origin": "missing",
+                        "energy_contract_id": "", "energy_contract_status": "missing",
+                        "energy_reference_mode": "missing",
                         "barrier_eV": None, "attempt_count": 0,
-                        "_manifest": {}, "_method": {}, "_report": report,
+                        "_quantity_sha256": {},
+                        "_manifest": {}, "_method": {},
+                        "_validation_authority": {}, "_report": report,
+                        "_report_binding": {}, "_path_key": "",
+                        "_summary_row": {}, "_reference_mode": "",
                     })
+                else:
+                    self._bind_project_operands(project_entries)
+                    if report_binding_resolver is not None:
+                        try:
+                            raw_binding = report_binding_resolver({
+                                "project_id": project_id,
+                                "project": project,
+                                "record": record,
+                                "report": report,
+                                "summary": summary,
+                                "entries": project_entries,
+                            })
+                        except Exception:  # noqa: BLE001 report lineage is absent
+                            raw_binding = {}
+                        binding = self._report_binding_projection(
+                            raw_binding, project_entries)
+                        for entry in project_entries:
+                            entry["_report_binding"] = binding
+                    entries.extend(project_entries)
                 indexed_projects += 1
             except Exception:  # noqa: BLE001 one project makes completeness partial
                 failures.append({
@@ -570,21 +804,133 @@ class ResearchIndexService:
             "failures": failures,
             "entries": entries,
         }
-        with self._lock:
-            self._snapshot = snapshot
-        return self.index_status()
+        # A private deep copy prevents later caller mutation from changing the
+        # immutable read snapshot behind an already issued cursor.
+        self._snapshot = copy.deepcopy(snapshot)
+        return self._status_from_snapshot(self._snapshot, now=self._monotonic())
 
-    def index_status(self) -> dict[str, Any]:
-        with self._lock:
-            snapshot = copy.deepcopy(self._snapshot)
+    @staticmethod
+    def _bind_project_operands(entries: list[dict[str, Any]]) -> None:
+        by_path = {
+            str(entry.get("_path_key") or ""): entry
+            for entry in entries if entry.get("_path_key")
+        }
+        clean = next(
+            (entry for entry in entries if entry.get("role") == "clean_slab"), None)
+        gas = next(
+            (entry for entry in entries if entry.get("role") == "gas_reference"), None)
+
+        def operand(role: str, entry: Mapping[str, Any] | None) -> dict[str, Any]:
+            return {
+                "role": role,
+                "status": "observed" if entry else "missing",
+                "job_id": entry.get("job_id") if entry else None,
+                "source_id": entry.get("source_id") if entry else None,
+            }
+
+        for config in entries:
+            if (config.get("role") != "configuration"
+                    or config.get("energy_origin") != "analysis"):
+                config["_operands"] = []
+                continue
+            row = config.get("_summary_row")
+            row = row if isinstance(row, Mapping) else {}
+            mode = str(config.get("_reference_mode") or "")
+            reference: Mapping[str, Any] | None = None
+            raw_reference = row.get("reference_job")
+            if raw_reference:
+                reference = by_path.get(_path_key(raw_reference))
+            if reference is None and mode == "species":
+                wanted = str(row.get("reference_species") or "")
+                reference = next((
+                    entry for entry in entries
+                    if entry.get("role") == "species_reference"
+                    and str(entry.get("adsorbate") or "") == wanted
+                ), None)
+            if reference is None and mode == "single":
+                reference = gas
+            config["_operands"] = [
+                operand("configuration", config),
+                operand("clean_slab", clean),
+                operand("reference", reference),
+            ]
+
+    @staticmethod
+    def _report_binding_projection(value: Any,
+                                   entries: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        value = value if isinstance(value, Mapping) else {}
+        revision = _safe_label(value.get("revision_id"), maximum=128)
+        if (not revision or value.get("current") is not True
+                or value.get("frozen_graph_revalidated") is not True):
+            return {}
+        bound_jobs = {
+            str(item) for item in value.get("bound_job_ids") or []
+            if _OPAQUE_RE.fullmatch(str(item)) and not _PATH_RE.search(str(item))
+        }
+        valid: list[dict[str, str]] = []
+        for raw in value.get("bound_analyses") or []:
+            if not isinstance(raw, Mapping):
+                continue
+            quantity = str(raw.get("quantity") or "")
+            if quantity not in {"energy_eV", "barrier_eV"}:
+                continue
+            match = next((entry for entry in entries if (
+                str(entry.get("job_id") or "") == str(raw.get("job_id") or "")
+                and str(entry.get("source_id") or "") == str(raw.get("source_id") or "")
+                and (quantity != "energy_eV"
+                     or str(entry.get("energy_contract_id") or "")
+                     == str(raw.get("energy_contract_id") or ""))
+                and str((entry.get("_quantity_sha256") or {}).get(quantity) or "")
+                == str(raw.get("quantity_sha256") or "")
+            )), None)
+            if match is None:
+                continue
+            operand_jobs = {
+                str(item.get("job_id"))
+                for item in match.get("_operands") or []
+                if isinstance(item, Mapping) and item.get("job_id")
+            }
+            operand_roles = {
+                str(item.get("role") or "")
+                for item in match.get("_operands") or []
+                if isinstance(item, Mapping) and item.get("job_id")
+            }
+            if (operand_roles != {"configuration", "clean_slab", "reference"}
+                    or len(operand_jobs) != 3
+                    or str(match["job_id"]) not in bound_jobs
+                    or not operand_jobs.issubset(bound_jobs)):
+                continue
+            valid.append({
+                "job_id": str(match["job_id"]),
+                "source_id": str(match["source_id"]),
+                "quantity": quantity,
+                "energy_contract_id": (
+                    str(match.get("energy_contract_id") or "")
+                    if quantity == "energy_eV" else ""),
+                "quantity_sha256": str(
+                    (match.get("_quantity_sha256") or {}).get(quantity) or ""),
+            })
+        if not valid:
+            return {}
+        return {
+            "revision_id": revision,
+            "current": True,
+            "frozen_graph_revalidated": True,
+            "bound_job_ids": sorted(bound_jobs),
+            "bound_analyses": valid,
+        }
+
+    def _status_from_snapshot(self, snapshot: Mapping[str, Any] | None, *,
+                              now: float) -> dict[str, Any]:
         if snapshot is None:
             return {
                 "schema": INDEX_SCHEMA, "status": "unavailable", "snapshot_id": None,
-                "built_at": None, "age_seconds": None, "max_age_seconds": self.max_age_seconds,
+                "built_at": None, "age_seconds": None,
+                "max_age_seconds": self.max_age_seconds,
                 "registry_total": None, "indexed_projects": 0, "indexed_jobs": 0,
                 "failed_sources": None, "failures": [], "rebuildable": True,
             }
-        age = max(0.0, self._monotonic() - snapshot["built_monotonic"])
+        age = max(0.0, now - float(snapshot["built_monotonic"]))
         status = "stale" if age > self.max_age_seconds else snapshot["status"]
         return {
             key: copy.deepcopy(snapshot[key])
@@ -598,6 +944,11 @@ class ResearchIndexService:
             "max_age_seconds": self.max_age_seconds,
             "rebuildable": True,
         }
+
+    def index_status(self) -> dict[str, Any]:
+        with self._lock:
+            return self._status_from_snapshot(
+                self._snapshot, now=self._monotonic())
 
     @staticmethod
     def _normalize_request(request: Any) -> dict[str, Any]:
@@ -672,17 +1023,21 @@ class ResearchIndexService:
                        ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         counts = Counter(
             str(entry.get("method_fingerprint") or "") for entry in entries
-            if entry.get("method_fingerprint"))
+            if (entry.get("method_fingerprint")
+                and entry.get("method_status") == "verified"))
         selected = None
         output = [dict(entry) for entry in entries]
         missing_fingerprints = sum(
             1 for entry in entries if not entry.get("method_fingerprint"))
+        nonverified = sum(
+            1 for entry in entries if entry.get("method_status") != "verified")
         if enabled:
             if counts:
                 selected = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
                 output = [
                     dict(entry) for entry in entries
-                    if entry.get("method_fingerprint") == selected
+                    if (entry.get("method_fingerprint") == selected
+                        and entry.get("method_status") == "verified")
                 ]
             else:
                 # Compatibility cannot be proven from an absent fingerprint.
@@ -691,7 +1046,7 @@ class ResearchIndexService:
         status = (
             "compatible" if selected else
             "blocked_missing_method" if enabled else
-            "mixed_or_unverified" if len(counts) > 1 or missing_fingerprints
+            "mixed_or_unverified" if len(counts) > 1 or nonverified
             else "explicitly_unfiltered"
         )
         return output, {
@@ -706,6 +1061,33 @@ class ResearchIndexService:
             "compatible_rows": len(output),
             "excluded_rows": len(entries) - len(output),
             "missing_method_fingerprint_rows": missing_fingerprints,
+            "nonverified_rows": nonverified,
+        }
+
+    @staticmethod
+    def _energy_cohort(entries: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        numeric = [entry for entry in entries if _finite(entry.get("energy_eV")) is not None]
+        counts = Counter(
+            str(entry.get("energy_contract_id") or "") for entry in numeric
+            if (entry.get("energy_contract_status") == "verified"
+                and entry.get("energy_contract_id"))
+        )
+        missing = len(numeric) - sum(counts.values())
+        status = (
+            "missing" if not numeric else
+            "compatible" if len(counts) == 1 and missing == 0 else
+            "unavailable_incompatible_energy_contract"
+        )
+        selected = next(iter(counts)) if status == "compatible" else None
+        return {
+            "status": status,
+            "selected_energy_contract_id": selected,
+            "cohorts": [
+                {"energy_contract_id": key, "sample_count": value}
+                for key, value in sorted(counts.items())
+            ],
+            "numeric_rows": len(numeric),
+            "unverified_contract_rows": missing,
         }
 
     @staticmethod
@@ -760,8 +1142,22 @@ class ResearchIndexService:
         return value["offset"]
 
     @staticmethod
-    def _histogram(entries: Sequence[Mapping[str, Any]], metric: str,
-                   *, bins: int = 12) -> dict[str, Any]:
+    def _histogram(entries: Sequence[Mapping[str, Any]], metric: str, *,
+                   method_ready: bool, energy: Mapping[str, Any],
+                   bins: int = 12) -> dict[str, Any]:
+        if not method_ready:
+            return {
+                "status": "unavailable_method_compatibility", "metric": metric,
+                "unit": _NUMERIC_FIELDS[metric]["unit"], "bins": [],
+                "sample_count": 0, "missing_count": len(entries),
+            }
+        if (metric == "energy_eV"
+                and energy.get("status") == "unavailable_incompatible_energy_contract"):
+            return {
+                "status": "unavailable_incompatible_energy_contract", "metric": metric,
+                "unit": _NUMERIC_FIELDS[metric]["unit"], "bins": [],
+                "sample_count": 0, "missing_count": len(entries),
+            }
         values = [_finite(item.get(metric)) for item in entries]
         observed = [value for value in values if value is not None]
         missing = len(values) - len(observed)
@@ -797,15 +1193,8 @@ class ResearchIndexService:
 
     @staticmethod
     def _scatter(entries: Sequence[Mapping[str, Any]], axes: Mapping[str, str],
-                 compatibility: Mapping[str, Any]) -> dict[str, Any]:
-        fingerprints = {
-            str(item.get("method_fingerprint")) for item in entries
-            if item.get("method_fingerprint")
-        }
-        missing_methods = sum(
-            1 for item in entries if not item.get("method_fingerprint"))
-        if (not compatibility["enabled"]
-                and (len(fingerprints) > 1 or missing_methods)):
+                 *, method_ready: bool, energy: Mapping[str, Any]) -> dict[str, Any]:
+        if not method_ready:
             return {
                 "status": "blocked_mixed_or_unverified_methods",
                 "axes": copy.deepcopy(dict(axes)),
@@ -814,6 +1203,16 @@ class ResearchIndexService:
                     "Select one verified method fingerprint before plotting a scatter view."),
             }
         x_axis, y_axis = axes["x"], axes["y"]
+        if ("energy_eV" in {x_axis, y_axis}
+                and energy.get("status") == "unavailable_incompatible_energy_contract"):
+            return {
+                "status": "unavailable_incompatible_energy_contract",
+                "axes": copy.deepcopy(dict(axes)), "points": [],
+                "sample_count": 0, "missing_count": len(entries),
+                "units": {x_axis: _NUMERIC_FIELDS[x_axis]["unit"],
+                          y_axis: _NUMERIC_FIELDS[y_axis]["unit"]},
+                "reason": "Energy quantity/reference contracts are not one proven cohort.",
+            }
         complete = []
         for item in entries:
             x_value, y_value = _finite(item.get(x_axis)), _finite(item.get(y_axis))
@@ -855,7 +1254,8 @@ class ResearchIndexService:
         }
 
     @staticmethod
-    def _periodic(entries: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    def _periodic(entries: Sequence[Mapping[str, Any]], *, method_ready: bool,
+                  energy: Mapping[str, Any]) -> dict[str, Any]:
         by_element: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
         for item in entries:
             for element in item.get("elements") or []:
@@ -869,18 +1269,26 @@ class ResearchIndexService:
                 value for value in (_finite(row.get("energy_eV")) for row in rows)
                 if value is not None
             ]
+            energy_ready = (
+                method_ready and energy.get("status") in {"compatible", "missing"})
+            mean = sum(energies) / len(energies) if energies and energy_ready else None
             cells.append({
                 "element": element, **_PERIODIC_POSITION[element],
                 "sample_count": len(rows),
                 "project_count": len({row["project_id"] for row in rows}),
                 "numeric_energy_count": len(energies),
-                "mean_energy_eV": (sum(energies) / len(energies) if energies else None),
-                "mean_energy_display": _display(
-                    sum(energies) / len(energies) if energies else None),
+                "mean_energy_eV": mean,
+                "mean_energy_display": _display(mean),
                 "unit": "eV",
             })
+        if not method_ready:
+            status = "unavailable_method_compatibility"
+        elif energy.get("status") == "unavailable_incompatible_energy_contract":
+            status = "unavailable_incompatible_energy_contract"
+        else:
+            status = "ready" if cells else "missing"
         return {
-            "status": "ready" if cells else "missing", "cells": cells,
+            "status": status, "cells": cells,
             "sample_count": len(entries), "element_count": len(cells),
             "missing_element_rows": sum(1 for item in entries if not item.get("elements")),
         }
@@ -889,13 +1297,15 @@ class ResearchIndexService:
         normalized = self._normalize_request(request)
         with self._lock:
             snapshot = copy.deepcopy(self._snapshot)
-        freshness = self.index_status()
+            freshness = self._status_from_snapshot(
+                self._snapshot, now=self._monotonic())
         if snapshot is None or freshness["status"] in {"stale", "partial", "unavailable"}:
             status = freshness["status"]
             return {
                 "ok": False, "schema": QUERY_SCHEMA, "status": status,
                 "request": normalized, "freshness": freshness,
                 "method_compatibility": None,
+                "energy_compatibility": None,
                 "table": {"columns": [], "rows": [], "sample_count": 0,
                           "visible_count": 0, "next_cursor": None},
                 "histogram": None, "scatter": None, "periodic_table": None,
@@ -912,6 +1322,13 @@ class ResearchIndexService:
         filtered = self._filter_entries(snapshot["entries"], normalized["filters"])
         compatible, compatibility = self._method_cohort(
             filtered, enabled=normalized["filters"]["method_compatible"])
+        method_ready = (
+            compatibility["status"] == "compatible"
+            or (compatibility["status"] == "explicitly_unfiltered"
+                and len(compatibility["cohorts"]) == 1
+                and compatibility["nonverified_rows"] == 0)
+        )
+        energy_compatibility = self._energy_cohort(compatible)
         ordered = self._sort(compatible, normalized["sort"])
         query_hash = self._query_hash(normalized)
         offset = self._cursor_offset(
@@ -934,6 +1351,7 @@ class ResearchIndexService:
             "ok": True, "schema": QUERY_SCHEMA, "status": "ready",
             "request": normalized, "freshness": freshness,
             "method_compatibility": compatibility,
+            "energy_compatibility": energy_compatibility,
             "table": {
                 "columns": [
                     {"key": "project_name", "unit": None},
@@ -953,9 +1371,14 @@ class ResearchIndexService:
                 "next_cursor": next_cursor,
                 "stable_sort": [normalized["sort"], "project_id", "job_id", "source_id"],
             },
-            "histogram": self._histogram(compatible, histogram_metric),
-            "scatter": self._scatter(compatible, normalized["axes"], compatibility),
-            "periodic_table": self._periodic(compatible),
+            "histogram": self._histogram(
+                compatible, histogram_metric, method_ready=method_ready,
+                energy=energy_compatibility),
+            "scatter": self._scatter(
+                compatible, normalized["axes"], method_ready=method_ready,
+                energy=energy_compatibility),
+            "periodic_table": self._periodic(
+                compatible, method_ready=method_ready, energy=energy_compatibility),
             "denominator": {
                 "registry_total": freshness["registry_total"],
                 "indexed_projects": freshness["indexed_projects"],
@@ -980,7 +1403,8 @@ class ResearchIndexService:
                         source_id: Any = None) -> dict[str, Any]:
         with self._lock:
             snapshot = copy.deepcopy(self._snapshot)
-        freshness = self.index_status()
+            freshness = self._status_from_snapshot(
+                self._snapshot, now=self._monotonic())
         if snapshot is None or freshness["status"] != "ready":
             return {
                 "ok": False, "schema": PROVENANCE_SCHEMA, "status": freshness["status"],
@@ -998,21 +1422,38 @@ class ResearchIndexService:
         ]
         if not selected:
             raise ResearchExplorerError("provenance identity is unavailable")
+        graph_entries = list(selected)
+        selected_keys = {
+            (entry["job_id"], entry["source_id"]) for entry in graph_entries
+        }
+        for entry in selected:
+            for operand in entry.get("_operands") or []:
+                if not isinstance(operand, Mapping) or not operand.get("job_id"):
+                    continue
+                match = next((candidate for candidate in snapshot["entries"] if (
+                    candidate["project_id"] == project
+                    and candidate["job_id"] == operand["job_id"]
+                    and candidate["source_id"] == operand["source_id"]
+                )), None)
+                if match is not None and (match["job_id"], match["source_id"]) not in selected_keys:
+                    graph_entries.append(match)
+                    selected_keys.add((match["job_id"], match["source_id"]))
         nodes: list[dict[str, Any]] = []
         edges: list[dict[str, Any]] = []
         missing: list[dict[str, Any]] = []
 
-        def edge(source: str, target: str, relation: str, layer: str) -> None:
+        def edge(source: str, target: str, relation: str, layer: str,
+                 **extra: Any) -> None:
             edges.append({
                 "source": source, "target": target, "type": relation, "layer": layer,
+                **extra,
             })
 
         project_node = f"project:{project}"
         nodes.append(self._node(
             project_node, "project", "data", "observed",
             selected[0]["project_name"], {"project_id": project}))
-        report_added = False
-        for entry in selected:
+        for entry in graph_entries:
             manifest = entry["_manifest"]
             input_node = f"input:{entry['source_id']}"
             input_hashes = _nested(manifest, ("inputs", "sha256"))
@@ -1067,54 +1508,140 @@ class ResearchIndexService:
                     "reason": "no parsed scientific result is recorded",
                 })
 
-            analysis_id = f"analysis:{entry['job_id']}"
-            has_analysis = entry["energy_eV"] is not None or entry["barrier_eV"] is not None
-            nodes.append(self._node(
-                analysis_id, "analysis", "logical",
-                entry["provenance_status"] if has_analysis else "missing",
-                entry["energy_quantity"],
-                {"energy_quantity": entry["energy_quantity"],
-                 "energy_eV": entry["energy_eV"], "barrier_eV": entry["barrier_eV"],
-                 "units": {"energy_eV": "eV", "barrier_eV": "eV"}}))
-            edge(parser_id, analysis_id, "analyzed_as", "logical")
+            analysis_records = []
+            if entry["energy_eV"] is not None:
+                analysis_records.append((
+                    "energy_eV", entry["energy_quantity"], {
+                        "quantity": "energy_eV",
+                        "energy_quantity": entry["energy_quantity"],
+                        "energy_eV": entry["energy_eV"],
+                        "energy_contract_id": entry["energy_contract_id"],
+                        "unit": "eV",
+                        "evidence_level": (
+                            entry.get("quantity_evidence") or {}).get(
+                                "energy_eV", "unverified"),
+                    }))
+            if entry["barrier_eV"] is not None:
+                analysis_records.append((
+                    "barrier_eV", "activation_barrier", {
+                        "quantity": "barrier_eV",
+                        "barrier_eV": entry["barrier_eV"],
+                        "unit": "eV",
+                        "evidence_level": (
+                            entry.get("quantity_evidence") or {}).get(
+                                "barrier_eV", "unverified"),
+                    }))
+            if not analysis_records:
+                analysis_records.append((
+                    "missing", "missing analysis", {
+                        "quantity": None, "evidence_level": "missing",
+                    }))
+            analysis_ids = []
+            for quantity, label, record in analysis_records:
+                analysis_id = f"analysis:{entry['job_id']}:{quantity}"
+                analysis_ids.append(analysis_id)
+                nodes.append(self._node(
+                    analysis_id, "analysis", "logical",
+                    entry["provenance_status"] if quantity != "missing" else "missing",
+                    label, record))
+                edge(parser_id, analysis_id, "analyzed_as", "logical")
 
             method_id = f"method:{entry['method_fingerprint'] or entry['job_id']}"
             nodes.append(self._node(
                 method_id, "method", "logical",
-                "observed" if entry["method_fingerprint"] else "missing",
+                ("observed" if entry["method_status"] == "verified" else
+                 "inferred" if entry["method_fingerprint"] else "missing"),
                 entry["method_fingerprint"] or "missing method fingerprint",
                 {"method_fingerprint": entry["method_fingerprint"],
                  "method_status": entry["method_status"], "engine": entry["engine"]}))
-            edge(method_id, analysis_id, "governs", "logical")
             validation_id = f"validation:{entry['job_id']}"
+            authority = entry.get("_validation_authority")
+            authority = authority if isinstance(authority, Mapping) else {}
             validation_origin = (
-                "observed" if entry["validation_status"] != "missing" else "missing")
+                "observed" if authority.get("status") == "verified" else
+                "inferred" if entry["validation_status"] != "missing" else "missing")
             nodes.append(self._node(
                 validation_id, "validation", "logical", validation_origin,
                 entry["validation_status"],
                 {"status": entry["validation_status"],
-                 "evidence_level": entry["evidence_level"]}))
-            edge(validation_id, analysis_id, "qualifies", "logical")
+                 "evidence_level": entry["evidence_level"],
+                 "quantity_evidence": entry.get("quantity_evidence") or {},
+                 "authority": authority.get("authority") or "missing",
+                 "authority_status": authority.get("status") or "unverified"}))
+            for analysis_id in analysis_ids:
+                edge(method_id, analysis_id, "governs", "logical")
+                edge(validation_id, analysis_id, "qualifies", "logical")
 
-            report = entry["_report"]
-            if not report_added:
-                report_added = True
-                report_id = f"report-live:{project}"
-                revision = _safe_label(
-                    report.get("revision_id") or report.get("revision"), maximum=128)
-                report_status = "observed" if revision or report.get("contracts") else "missing"
-                nodes.append(self._node(
-                    report_id, "report", "logical", report_status,
-                    revision or "no current report revision",
-                    {"revision_id": revision or None,
-                     "frozen_graph_separate": True,
-                     "frozen_graph_endpoint": "report_evidence_graph"}))
-                edge(analysis_id, report_id, "reported_in", "logical")
-                if report_status == "missing":
+        for entry in selected:
+            if (entry.get("role") != "configuration"
+                    or entry.get("energy_origin") != "analysis"):
+                continue
+            analysis_id = f"analysis:{entry['job_id']}:energy_eV"
+            for operand in entry.get("_operands") or []:
+                operand = operand if isinstance(operand, Mapping) else {}
+                role = str(operand.get("role") or "reference")
+                if operand.get("job_id"):
+                    operand_id = f"job:{operand['job_id']}"
+                else:
+                    operand_id = f"operand-missing:{entry['job_id']}:{role}"
+                    nodes.append(self._node(
+                        operand_id, "input", "data", "missing",
+                        f"missing {role}", {"operand_role": role, "job_id": None}))
                     missing.append({
-                        "from": analysis_id, "expected": "current report revision",
-                        "reason": "live project has no current report revision",
+                        "from": analysis_id, "expected": f"{role} operand",
+                        "reason": f"adsorption analysis has no bound {role} job",
                     })
+                edge(
+                    operand_id, analysis_id, "uses_operand", "logical",
+                    operand_role=role)
+
+        report_id = f"report-live:{project}"
+        bindings = [
+            entry.get("_report_binding") for entry in selected
+            if isinstance(entry.get("_report_binding"), Mapping)
+        ]
+        binding = next((item for item in bindings if item), {})
+        revision = str(binding.get("revision_id") or "")
+        nodes.append(self._node(
+            report_id, "report", "logical", "observed" if binding else "missing",
+            revision or "no revalidated report binding",
+            {"revision_id": revision or None,
+             "binding_status": "verified" if binding else "unverified",
+             "frozen_graph_separate": True,
+             "frozen_graph_endpoint": "report_evidence_graph"}))
+        bound_analyses = {
+            (str(item.get("job_id") or ""), str(item.get("source_id") or ""),
+             str(item.get("quantity") or ""),
+             str(item.get("energy_contract_id") or ""),
+             str(item.get("quantity_sha256") or ""))
+            for item in binding.get("bound_analyses") or []
+            if isinstance(item, Mapping)
+        }
+        reported: set[tuple[str, str]] = set()
+        for entry in selected:
+            for quantity, digest in (entry.get("_quantity_sha256") or {}).items():
+                key = (
+                    str(entry["job_id"]), str(entry["source_id"]), quantity,
+                    str(entry.get("energy_contract_id") or "")
+                    if quantity == "energy_eV" else "",
+                    str(digest),
+                )
+                if key in bound_analyses:
+                    edge(
+                        f"analysis:{entry['job_id']}:{quantity}", report_id,
+                        "reported_in", "logical", quantity=quantity)
+                    reported.add((str(entry["job_id"]), quantity))
+        for entry in selected:
+            for quantity in (entry.get("_quantity_sha256") or {"missing": ""}):
+                if (str(entry["job_id"]), quantity) in reported:
+                    continue
+                missing.append({
+                    "from": f"analysis:{entry['job_id']}:{quantity}",
+                    "expected": (
+                        "revalidated frozen report analysis/evidence binding"),
+                    "reason": (
+                        f"no current frozen revision proves {quantity} for this live analysis"),
+                })
 
         nodes.sort(key=lambda item: item["id"])
         edges.sort(key=lambda item: (
