@@ -196,6 +196,131 @@ def test_generic_analysis_renderer_only_consumes_server_display_values():
     assert "analysis.elf.boundary" in renderer
 
 
+def test_neb_convergence_and_aimd_have_dedicated_server_only_renderers():
+    script = _source("analysis-workbench.js")
+    css = _source("analysis-workbench.css")
+    dispatch = re.search(
+        r"function renderView\(\) \{(.*?)\n  \}\n\n  function renderAll",
+        script, re.S,
+    ).group(1)
+    for analysis_id, renderer in (
+        ("neb-path", "renderNebView"),
+        ("convergence-scan", "renderConvergenceView"),
+        ("aimd-diagnostics", "renderAimdView"),
+    ):
+        assert f"State.analysisId === '{analysis_id}'" in dispatch
+        assert f"{renderer}(view, box)" in dispatch
+        body = re.search(
+            rf"function {renderer}\(view, box\) \{{(.*?)\n  \}}\n\n",
+            script, re.S,
+        ).group(1)
+        for forbidden in ("toFixed(", "Math.", "parseFloat(", ".reduce(", "ECharts"):
+            assert forbidden not in body
+    aimd = re.search(
+        r"function renderAimdView\(view, box\) \{(.*?)\n  \}\n\n",
+        script, re.S,
+    ).group(1)
+    assert "createElement('button')" not in aimd
+    assert "createElement('input')" not in aimd
+    assert "quantityText(sample.time)" in aimd
+    assert "quantityText(sample.total_energy)" in aimd
+    assert "quantityText(sample.temperature)" in aimd
+    assert "appendSourceDetails" in script
+    for selector in (
+        ".aw-specialized-card", ".aw-diagnostic-strip", ".aw-source-details",
+        ".aw-specialized-evidence", ".aw-specialized-metrics",
+    ):
+        assert selector in css
+
+
+def test_specialized_renderers_preserve_server_display_strings_in_fake_dom():
+    _run_node(
+        r"""
+loadAsset(process.argv[1]);
+const seam = window.__VCS_ANALYSIS_TEST__;
+assert.ok(seam, 'guarded analysis seam was not exposed');
+function q(display, unit = '', value = 1) {
+  return { display, unit, value, denominator: 'server denominator',
+    source_id: 'source-a', parser_module: 'parser.module', parser_version: '9.1',
+    file_hashes: [{ name: 'OSZICAR', sha256: 'a'.repeat(64) }] };
+}
+function source(id) {
+  return { source_id: id, files: [{ name: 'OSZICAR', sha256: 'b'.repeat(64) }] };
+}
+function parser() { return { module: 'parser.module', version: '9.1' }; }
+
+const nebBox = new FakeElement('neb-box');
+seam.renderNebView({ paths: [{
+  status: 'available', source: source('neb-source'), parser: parser(),
+  scientific_boundary: 'NEB supplied-path diagnostic only',
+  path_quality: { status: 'diagnostic', issues: ['manual TS review'], warnings: [] },
+  barriers: { forward: q('SERVER-FWD', 'eV'), reverse: q('SERVER-REV', 'eV') },
+  points: [{ image_label: '01', reaction_coordinate: q('SERVER-RC'),
+    relative_energy: q('SERVER-DE'), max_force: q('SERVER-FMAX'),
+    electronic_convergence: 'server-electronic', ionic_convergence: 'server-ionic' }],
+}] }, nebBox);
+assert.strictEqual(nebBox.children.length, 1);
+const nebCard = nebBox.children[0];
+assert.strictEqual(nebCard.children[1].textContent, 'NEB supplied-path diagnostic only');
+const nebRow = nebCard.children[3].children[1].children[0];
+assert.deepStrictEqual(nebRow.children.map(cell => cell.textContent),
+  ['01', 'SERVER-RC', 'SERVER-DE', 'SERVER-FMAX', 'server-electronic', 'server-ionic']);
+const nebDetails = nebCard.children[6];
+assert.strictEqual(nebDetails.tagName, 'DETAILS');
+assert.match(nebDetails.children[1].textContent, /parser\.module @ 9\.1/);
+
+const convergenceBox = new FakeElement('convergence-box');
+seam.renderConvergenceView({ series: [{
+  kind: 'encut', series_id: 'series-1', status: 'available', parser: parser(),
+  scientific_boundary: 'Threshold-defined platform only', issues: ['missing point noted'],
+  platform: { status: 'available', threshold_mev_per_atom: 1,
+    recommendation: q('SERVER-REC', 'eV') },
+  sensitivity: [{ threshold: q('SERVER-THR', 'meV/atom'),
+    recommended_parameter: q('SERVER-SENS', 'eV') }],
+  points: [{ label: '450 eV', source: source('conv-source'),
+    parameter: q('SERVER-X'), absolute_energy: q('SERVER-E', 'eV', -10),
+    energy_per_atom: q('SERVER-EPA'), delta_per_atom: q('SERVER-DELTA'),
+    platform_member: true, anomalies: ['server anomaly'] }],
+}] }, convergenceBox);
+const convergenceCard = convergenceBox.children[0];
+const convergenceRow = convergenceCard.children[3].children[1].children[0];
+assert.deepStrictEqual(convergenceRow.children.map(cell => cell.textContent),
+  ['450 eV', 'SERVER-X', 'SERVER-E', 'SERVER-EPA', 'SERVER-DELTA', 'yes', 'server anomaly']);
+const sensitivityRow = convergenceCard.children[4].children[1].children[0];
+assert.strictEqual(sensitivityRow.children[0].textContent, 'SERVER-THR');
+assert.strictEqual(sensitivityRow.children[1].textContent, 'SERVER-SENS');
+
+const aimdBox = new FakeElement('aimd-box');
+seam.renderAimdView({ trajectories: [{
+  status: 'available', source: source('aimd-source'), parser: parser(),
+  scientific_boundary: 'Short AIMD is diagnostic only', issues: [], warnings: ['short'],
+  metrics: { drift: Object.assign(q('SERVER-DRIFT', 'eV'), { label: 'Drift' }) },
+  samples: [{ sample_index: 0, time: q('SERVER-TIME'),
+    total_energy: q('SERVER-ENERGY'), temperature: q('SERVER-TEMP') }],
+}] }, aimdBox);
+const aimdCard = aimdBox.children[0];
+const metricRow = aimdCard.children[2].children[1].children[0];
+assert.strictEqual(metricRow.children[1].textContent, 'SERVER-DRIFT');
+const sampleRow = aimdCard.children[3].children[1].children[0];
+assert.deepStrictEqual(sampleRow.children.map(cell => cell.textContent),
+  ['0', 'SERVER-TIME', 'SERVER-ENERGY', 'SERVER-TEMP']);
+assert.strictEqual(aimdCard.children[1].textContent, 'Short AIMD is diagnostic only');
+""",
+        str(ASSETS / "analysis-workbench.js"),
+    )
+
+
+def test_registry_directly_loads_capabilities_that_share_a_semantic_route():
+    script = _source("analysis-workbench.js")
+    wire = re.search(
+        r"function wire\(\) \{(.*?)\n  \}\n\n  if \(window\.__VCS_TEST__",
+        script, re.S,
+    ).group(1)
+
+    assert "ROUTE_ANALYSIS[record.route] === record.id" in wire
+    assert "else loadBootstrap(record.id)" in wire
+
+
 def test_next_calculation_card_is_read_only_and_has_no_execution_control():
     html = _source("index.html")
     script = _source("analysis-workbench.js")

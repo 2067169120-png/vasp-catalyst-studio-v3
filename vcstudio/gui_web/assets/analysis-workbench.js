@@ -407,6 +407,199 @@
     });
   }
 
+  function quantityText(value) {
+    const record = plain(value);
+    return record.display === null || record.display === undefined || record.display === ''
+      ? '—' : String(record.display);
+  }
+
+  function appendDiagnosticStrip(parent, text, status = 'diagnostic') {
+    const strip = document.createElement('div'); strip.className = 'aw-diagnostic-strip';
+    strip.dataset.status = String(status || 'diagnostic'); strip.setAttribute('role', 'status');
+    strip.textContent = String(text || 'Diagnostic evidence only.'); parent.appendChild(strip);
+  }
+
+  function appendEvidenceList(parent, titleText, values) {
+    const section = document.createElement('section'); section.className = 'aw-specialized-evidence';
+    const title = document.createElement('h4'); const list = document.createElement('ul');
+    title.textContent = String(titleText || 'Evidence notes');
+    (Array.isArray(values) ? values : []).forEach(value => {
+      const item = document.createElement('li'); item.textContent = String(value); list.appendChild(item);
+    });
+    if (!list.children.length) {
+      const item = document.createElement('li'); item.textContent = '—'; list.appendChild(item);
+    }
+    section.append(title, list); parent.appendChild(section);
+  }
+
+  function appendSourceDetails(parent, sourceValue, parserValue) {
+    const source = plain(sourceValue); const parser = plain(parserValue);
+    const details = document.createElement('details'); details.className = 'aw-source-details';
+    const summary = document.createElement('summary');
+    summary.textContent = `Evidence · ${String(source.source_id || '—')}`; details.appendChild(summary);
+    const identity = document.createElement('code');
+    identity.textContent = [parser.module, parser.version].filter(Boolean).join(' @ ') || 'parser unavailable';
+    details.appendChild(identity);
+    const list = document.createElement('ul');
+    (Array.isArray(source.files) ? source.files : []).forEach(file => {
+      const item = document.createElement('li'); const name = document.createElement('span');
+      const hash = document.createElement('code'); name.textContent = String(file.name || 'file');
+      hash.textContent = String(file.sha256 || 'hash unavailable'); item.append(name, hash); list.appendChild(item);
+    });
+    if (!list.children.length) {
+      const item = document.createElement('li'); item.textContent = 'No hashed file evidence.'; list.appendChild(item);
+    }
+    details.appendChild(list); parent.appendChild(details);
+  }
+
+  function appendSpecializedHeader(card, label, statusValue, sourceId) {
+    const header = document.createElement('header'); const title = document.createElement('b');
+    const status = document.createElement('span'); status.className = 'aw-capability-status';
+    title.textContent = String(label || sourceId || tr('analysis.record', '记录'));
+    status.dataset.status = String(statusValue || 'unavailable');
+    status.textContent = String(statusValue || 'unavailable'); header.append(title, status); card.appendChild(header);
+  }
+
+  function renderNebView(view, box) {
+    const paths = Array.isArray(view.paths) ? view.paths : [];
+    box.innerHTML = '';
+    if (!paths.length) {
+      const empty = document.createElement('div'); empty.className = 'aw-empty';
+      empty.textContent = String((view.missing || view.blocking || [])[0] ||
+        tr('analysis.results.empty', '没有服务器最终确认的结果；请检查前置条件。'));
+      box.appendChild(empty); return;
+    }
+    paths.forEach(pathValue => {
+      const path = plain(pathValue); const source = plain(path.source); const barriers = plain(path.barriers);
+      const quality = plain(path.path_quality); const points = Array.isArray(path.points) ? path.points : [];
+      const card = document.createElement('section'); card.className = 'aw-specialized-card aw-neb-card';
+      appendSpecializedHeader(card, 'NEB image path', path.status, source.source_id);
+      appendDiagnosticStrip(card, path.scientific_boundary, quality.status);
+      const metrics = document.createElement('dl'); metrics.className = 'aw-specialized-metrics';
+      [
+        ['Forward barrier', plain(barriers.forward)],
+        ['Reverse barrier', plain(barriers.reverse)],
+      ].forEach(([label, quantity]) => {
+        const group = document.createElement('div'); const term = document.createElement('dt');
+        const detail = document.createElement('dd'); term.textContent = label;
+        detail.textContent = `${quantityText(quantity)} ${String(quantity.unit || '')}`.trim();
+        group.append(term, detail); metrics.appendChild(group);
+      });
+      card.appendChild(metrics);
+      if (points.length) {
+        const table = tableElement([
+          { label: 'Image' }, { label: 'Reaction coordinate', numeric: true },
+          { label: 'Relative energy / eV', numeric: true },
+          { label: 'Max force / eV/Å', numeric: true },
+          { label: 'Electronic convergence' }, { label: 'Ionic convergence' },
+        ], points.map(point => ({ cells: [
+          point.image_label, quantityText(point.reaction_coordinate),
+          quantityText(point.relative_energy), quantityText(point.max_force),
+          point.electronic_convergence, point.ionic_convergence,
+        ] })));
+        table.setAttribute('aria-label', 'Server-finalized NEB image curve data'); card.appendChild(table);
+      }
+      appendEvidenceList(card, 'Path-quality diagnostics', quality.issues);
+      appendEvidenceList(card, 'Path warnings', quality.warnings);
+      appendSourceDetails(card, source, path.parser); box.appendChild(card);
+    });
+  }
+
+  function renderConvergenceView(view, box) {
+    const records = Array.isArray(view.series) ? view.series : [];
+    box.innerHTML = '';
+    if (!records.length) {
+      const empty = document.createElement('div'); empty.className = 'aw-empty';
+      empty.textContent = String((view.missing || view.blocking || [])[0] ||
+        tr('analysis.results.empty', '没有服务器最终确认的结果；请检查前置条件。'));
+      box.appendChild(empty); return;
+    }
+    records.forEach(recordValue => {
+      const record = plain(recordValue); const platform = plain(record.platform);
+      const points = Array.isArray(record.points) ? record.points : [];
+      const card = document.createElement('section'); card.className = 'aw-specialized-card aw-convergence-card';
+      appendSpecializedHeader(card, `Convergence · ${String(record.kind || '')}`, record.status, record.series_id);
+      appendDiagnosticStrip(card, record.scientific_boundary, platform.status);
+      const recommendation = document.createElement('p'); recommendation.className = 'aw-recommendation';
+      const recommended = plain(platform.recommendation);
+      recommendation.textContent = `Threshold ${String(platform.threshold_mev_per_atom == null ? '—' : platform.threshold_mev_per_atom)} meV/atom · recommended ${quantityText(recommended)} ${String(recommended.unit || '')}${recommended.reason ? ` · ${String(recommended.reason)}` : ''}`;
+      card.appendChild(recommendation);
+      if (points.length) {
+        const table = tableElement([
+          { label: 'Point' }, { label: 'Parameter', numeric: true },
+          { label: 'E / eV', numeric: true }, { label: 'E / atom', numeric: true },
+          { label: 'Δ terminal / meV/atom', numeric: true },
+          { label: 'Platform' }, { label: 'Missing / anomaly' },
+        ], points.map(point => ({
+          missing: plain(point.absolute_energy).value == null,
+          cells: [point.label, quantityText(point.parameter), quantityText(point.absolute_energy),
+            quantityText(point.energy_per_atom), quantityText(point.delta_per_atom),
+            point.platform_member === true ? 'yes' : 'no', (point.anomalies || []).join('; ')],
+        })));
+        table.setAttribute('aria-label', 'Server-finalized convergence curve data'); card.appendChild(table);
+      }
+      const sensitivity = Array.isArray(record.sensitivity) ? record.sensitivity : [];
+      if (sensitivity.length) {
+        const table = tableElement([
+          { label: 'Threshold / meV/atom', numeric: true },
+          { label: 'Server recommendation', numeric: true },
+          { label: 'Denominator' },
+        ], sensitivity.map(item => ({ cells: [
+          quantityText(item.threshold), quantityText(item.recommended_parameter),
+          plain(item.recommended_parameter).denominator,
+        ] })));
+        table.setAttribute('aria-label', 'Server-finalized convergence threshold sensitivity');
+        card.appendChild(table);
+      }
+      appendEvidenceList(card, 'Missing points and anomalies', record.issues);
+      points.forEach(point => appendSourceDetails(card, point.source, record.parser));
+      box.appendChild(card);
+    });
+  }
+
+  function renderAimdView(view, box) {
+    const trajectories = Array.isArray(view.trajectories) ? view.trajectories : [];
+    box.innerHTML = '';
+    if (!trajectories.length) {
+      const empty = document.createElement('div'); empty.className = 'aw-empty';
+      empty.textContent = String((view.missing || view.blocking || [])[0] ||
+        tr('analysis.results.empty', '没有服务器最终确认的结果；请检查前置条件。'));
+      box.appendChild(empty); return;
+    }
+    trajectories.forEach(trajectoryValue => {
+      const trajectory = plain(trajectoryValue); const source = plain(trajectory.source);
+      const metrics = Object.values(plain(trajectory.metrics));
+      const samples = Array.isArray(trajectory.samples) ? trajectory.samples : [];
+      const card = document.createElement('section'); card.className = 'aw-specialized-card aw-aimd-card';
+      appendSpecializedHeader(card, 'AIMD diagnostics', trajectory.status, source.source_id);
+      appendDiagnosticStrip(card, trajectory.scientific_boundary, 'diagnostic');
+      if (metrics.length) {
+        const table = tableElement([
+          { label: tr('analysis.results.quantity', '量') },
+          { label: tr('analysis.results.value', '服务器结果'), numeric: true },
+          { label: tr('analysis.results.unit', '单位') }, { label: 'Denominator' },
+        ], metrics.map(metric => ({ cells: [
+          metric.label || metric.key, quantityText(metric), metric.unit, metric.denominator,
+        ] })));
+        table.setAttribute('aria-label', 'Server-finalized AIMD diagnostic metrics'); card.appendChild(table);
+      }
+      if (samples.length) {
+        const table = tableElement([
+          { label: 'Sample', numeric: true }, { label: 'Time / ps', numeric: true },
+          { label: 'Total energy / eV', numeric: true },
+          { label: 'Temperature / K', numeric: true },
+        ], samples.map(sample => ({ cells: [
+          sample.sample_index, quantityText(sample.time), quantityText(sample.total_energy),
+          quantityText(sample.temperature),
+        ] })));
+        table.setAttribute('aria-label', 'Server-finalized AIMD curve data'); card.appendChild(table);
+      }
+      appendEvidenceList(card, 'Diagnostic limitations', trajectory.issues);
+      appendEvidenceList(card, 'Sampling warnings', trajectory.warnings);
+      appendSourceDetails(card, source, trajectory.parser); box.appendChild(card);
+    });
+  }
+
   function appendFreeEnergyMetric(list, labelText, value, unit = '') {
     const group = document.createElement('div'); group.className = 'aw-free-energy-metric';
     const term = document.createElement('dt'); const detail = document.createElement('dd');
@@ -584,6 +777,9 @@
     if (State.analysisId === 'adsorption-energy') renderAdsorptionTable(view, box);
     else if (State.analysisId === 'free-energy-path') renderFreeEnergyView(view, box);
     else if (State.analysisId === 'multi-project-comparison') renderComparisonTable(view, box);
+    else if (State.analysisId === 'neb-path') renderNebView(view, box);
+    else if (State.analysisId === 'convergence-scan') renderConvergenceView(view, box);
+    else if (State.analysisId === 'aimd-diagnostics') renderAimdView(view, box);
     else renderServerResults(view, box);
   }
 
@@ -727,7 +923,8 @@
     const registry = $('aw-registry'); if (registry) registry.addEventListener('click', event => {
       const button = event.target.closest('[data-analysis-id]'); if (!button || State.busy) return;
       const record = analysisRecord(button.dataset.analysisId); if (!record) return;
-      if (VCS.workspace && typeof VCS.workspace.navigateRoute === 'function' && record.route) {
+      if (VCS.workspace && typeof VCS.workspace.navigateRoute === 'function' && record.route &&
+          ROUTE_ANALYSIS[record.route] === record.id) {
         VCS.workspace.navigateRoute(record.route, { projectId: State.projectId, source: 'analysis-registry' });
       } else loadBootstrap(record.id);
     });
@@ -762,6 +959,10 @@
   if (window.__VCS_TEST__ === true) {
     window.__VCS_ANALYSIS_TEST__ = Object.freeze({
       renderRegistry,
+      renderNebView,
+      renderConvergenceView,
+      renderAimdView,
+      appendSourceDetails,
       configure({ catalog = null, preferences = null, analysisId = '', busy = false } = {}) {
         State.catalog = clone(catalog);
         State.preferences = clone(preferences) || {};

@@ -587,6 +587,127 @@
   color: var(--ok);
 }
 
+.aw-specialized-card {
+  display: grid;
+  gap: 9px;
+  margin-bottom: 12px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-soft);
+}
+
+.aw-specialized-card > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.aw-diagnostic-strip {
+  padding: 8px 10px;
+  border-left: 3px solid var(--warn);
+  background: var(--warn-bg);
+  color: var(--text);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.aw-diagnostic-strip[data-status="pass"],
+.aw-diagnostic-strip[data-status="available"] {
+  border-left-color: var(--ok);
+}
+
+.aw-specialized-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0;
+  gap: 6px;
+}
+
+.aw-specialized-metrics > div {
+  min-width: 0;
+  padding: 6px 8px;
+  border-radius: 5px;
+  background: var(--th-bg);
+}
+
+.aw-specialized-metrics dt,
+.aw-specialized-metrics dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.aw-specialized-metrics dt {
+  color: var(--muted);
+  font-size: 8.5px;
+}
+
+.aw-specialized-metrics dd {
+  font-variant-numeric: tabular-nums;
+}
+
+.aw-recommendation {
+  margin: 0;
+  padding: 7px 9px;
+  border: 1px solid var(--rule);
+  border-radius: 5px;
+  background: var(--th-bg);
+  font: 9.5px/1.5 var(--mono);
+  overflow-wrap: anywhere;
+}
+
+.aw-specialized-evidence {
+  padding: 7px 8px;
+  border: 1px solid var(--rule);
+  border-radius: 5px;
+  background: var(--th-bg);
+}
+
+.aw-specialized-evidence h4 {
+  margin: 0 0 5px;
+  font-size: 10px;
+}
+
+.aw-specialized-evidence ul,
+.aw-source-details ul {
+  margin: 0;
+  padding-left: 17px;
+  font-size: 9px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.aw-source-details {
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid var(--rule);
+  border-radius: 5px;
+  background: var(--surface);
+}
+
+.aw-source-details summary {
+  cursor: pointer;
+  font-weight: 650;
+}
+
+.aw-source-details > code {
+  display: block;
+  margin: 6px 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.aw-source-details li {
+  display: grid;
+  grid-template-columns: minmax(100px, .45fr) minmax(0, 1fr);
+  gap: 7px;
+}
+
+.aw-source-details li code {
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 1180px) {
   .aw-layout {
     grid-template-columns: minmax(200px, 230px) minmax(0, 1fr);
@@ -647,6 +768,10 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .aw-specialized-metrics {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .aw-inspector-body {
     grid-template-columns: 1fr;
   }
@@ -668,6 +793,10 @@
   .aw-denominator,
   .aw-free-energy-metrics,
   .aw-free-energy-evidence-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .aw-source-details li {
     grid-template-columns: minmax(0, 1fr);
   }
 
