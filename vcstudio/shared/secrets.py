@@ -11,6 +11,7 @@ except Exception:  # pragma: no cover - 环境相关
     keyring = None  # type: ignore
 
 SERVICE = 'vcstudio-cluster'
+EXTERNAL_REFERENCE_SERVICE = 'vcstudio-external-reference'
 
 
 def available() -> bool:
@@ -45,5 +46,39 @@ def delete_password(profile: str) -> None:
         return
     try:
         keyring.delete_password(SERVICE, profile)
+    except Exception:
+        pass
+
+
+def set_external_reference_api_key(provider: str, api_key: str) -> bool:
+    """把外部参考库 API key 写入独立 keyring 命名空间。"""
+    if keyring is None:
+        return False
+    try:
+        keyring.set_password(
+            EXTERNAL_REFERENCE_SERVICE, str(provider), str(api_key))
+        return True
+    except Exception:
+        return False
+
+
+def get_external_reference_api_key(provider: str) -> str | None:
+    """读取外部参考库 API key；绝不从环境变量或配置文件回退。"""
+    if keyring is None:
+        return None
+    try:
+        return keyring.get_password(
+            EXTERNAL_REFERENCE_SERVICE, str(provider))
+    except Exception:
+        return None
+
+
+def delete_external_reference_api_key(provider: str) -> None:
+    """删除外部参考库 API key；不存在或后端不可用时静默。"""
+    if keyring is None:
+        return
+    try:
+        keyring.delete_password(
+            EXTERNAL_REFERENCE_SERVICE, str(provider))
     except Exception:
         pass
