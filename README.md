@@ -9,6 +9,8 @@ The deterministic core runs locally and over user-configured SSH connections. Ex
 > 工程地图：[STRUCTURE.md](STRUCTURE.md) · 历史发布记录：[CHANGELOG.md](CHANGELOG.md)
 >
 > 科学边界：[验证说明](docs/validation.md) · [失败分类](docs/failure-taxonomy.md) · [报告状态与证据合同](docs/report-state-contract.md)
+>
+> 产品对标与路线：[计算材料与催化工作台对标（2026-08）](docs/research-workbench-landscape-2026-08.md)
 
 ## 当前工作台
 
