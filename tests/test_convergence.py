@@ -56,6 +56,12 @@ def test_parse_outcar_fmax():
     assert fmax[1] == pytest.approx(0.05)  # sqrt(0.03^2+0.04^2)
 
 
+def test_streaming_outcar_fmax_matches_text_parser():
+    streamed = convergence.parse_outcar_fmax_lines(
+        iter(OUTCAR_2STEP.splitlines(keepends=True)))
+    assert streamed == pytest.approx(convergence.parse_outcar_fmax(OUTCAR_2STEP))
+
+
 def test_convergence_series_full():
     s = convergence.convergence_series(OSZICAR_2STEP, OUTCAR_2STEP)
     assert s['steps'] == [1, 2]

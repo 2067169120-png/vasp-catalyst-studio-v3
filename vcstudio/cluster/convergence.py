@@ -53,42 +53,63 @@ def parse_oszicar(text: str) -> list[dict]:
     return steps
 
 
+def parse_outcar_fmax_lines(lines) -> list[float]:
+    """OUTCAR 行迭代器 → 逐离子步 |F|max(eV/Å)。
+
+    这是 ``parse_outcar_fmax`` 的流式同源入口，供大型 OUTCAR 调用方直接传文件
+    句柄；力范数与块终止语义保持一致，不形成第二套数值口径。
+    """
+    fmax: list[float] = []
+    in_block = False
+    found = False
+    cur_max = 0.0
+    start_separator_pending = False
+    for raw_line in lines:
+        line = str(raw_line).rstrip('\r\n')
+        if 'TOTAL-FORCE' in line:
+            if in_block and found:
+                fmax.append(cur_max)
+            in_block = True
+            found = False
+            cur_max = 0.0
+            start_separator_pending = True
+            continue
+        if not in_block:
+            continue
+        if start_separator_pending:
+            start_separator_pending = False
+            stripped = line.strip()
+            if stripped and set(stripped) <= set('-'):
+                continue
+        row = line.split()
+        if len(row) != 6:
+            # 有原子力后遇到终止虚线/total drift 才提交该块。
+            if found:
+                fmax.append(cur_max)
+            in_block = False
+            found = False
+            cur_max = 0.0
+            continue
+        try:
+            fx, fy, fz = float(row[3]), float(row[4]), float(row[5])
+        except ValueError:
+            # 6 列但非数值:Fortran F13 字段打满成 ****(力过大),跳过该
+            # 原子行(其真值不可恢复,|F|max 取余下原子)而非终止整块。
+            continue
+        mag = math.sqrt(fx * fx + fy * fy + fz * fz)
+        if mag > cur_max:
+            cur_max = mag
+        found = True
+    if in_block and found:
+        fmax.append(cur_max)
+    return fmax
+
+
 def parse_outcar_fmax(text: str) -> list[float]:
     """OUTCAR 文本 → 逐离子步 |F|max(eV/Å)。逐行流式,只在力块内累加。"""
     if not text:
         return []
-    fmax: list[float] = []
-    lines = text.splitlines()
-    i, n = 0, len(lines)
-    while i < n:
-        if 'TOTAL-FORCE' not in lines[i]:
-            i += 1
-            continue
-        i += 1
-        # 跳过力块起始的分隔虚线行。
-        if i < n and lines[i].strip() and set(lines[i].strip()) <= set('-'):
-            i += 1
-        cur_max = 0.0
-        found = False
-        while i < n:
-            row = lines[i].split()
-            if len(row) != 6:
-                break               # 结构终止(分隔虚线/total drift 行),块结束
-            try:
-                fx, fy, fz = float(row[3]), float(row[4]), float(row[5])
-            except ValueError:
-                # 6 列但非数值:Fortran F13 字段打满成 ****(力过大),跳过该
-                # 原子行(其真值不可恢复,|F|max 取余下原子)而非终止整块。
-                i += 1
-                continue
-            mag = math.sqrt(fx * fx + fy * fy + fz * fz)
-            if mag > cur_max:
-                cur_max = mag
-            found = True
-            i += 1
-        if found:
-            fmax.append(cur_max)
-    return fmax
+    return parse_outcar_fmax_lines(text.splitlines())
 
 
 def convergence_series(oszicar_text: str,

@@ -262,7 +262,7 @@ class Api:
                  paper_report_mod=None, workspace_state_store=None,
                  report_service=None, analysis_preferences_store=None,
                  project_lifecycle_service=None, lab_policy_store=None,
-                 workspace_context_store=None):
+                 workspace_context_store=None, trajectory_review_service=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -396,6 +396,8 @@ class Api:
         # hash-bound lifecycle service. Browser callers receive opaque server
         # selections and plans, never an authority-bearing filesystem path.
         self._project_lifecycle_service = project_lifecycle_service
+        # 轨迹播放器只接收台账 opaque job ID；目录、帧索引和修复计划均留在服务端。
+        self._trajectory_review_service = trajectory_review_service
         self._project_lifecycle_lock = threading.RLock()
         self._project_lifecycle_selections = {}
         self._project_lifecycle_plans = {}
@@ -898,6 +900,23 @@ class Api:
             os.path.expanduser(str(job_dir or '')))))
         digest = hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:24]
         return f'job-{digest}'
+
+    def _resolve_workspace_job_id(self, job_id):
+        """Resolve exactly one ledger-owned opaque job identity, never a path."""
+        identifier = str(job_id or '').strip()
+        if (not identifier or len(identifier) > 160
+                or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:~-]{0,159}', identifier)):
+            raise ValueError('job_id is not a registered opaque identity')
+        matches = []
+        for job_dir, manifest in self._ledger.load_all():
+            if not isinstance(manifest, dict):
+                continue
+            if self._workspace_job_id(job_dir, manifest) == identifier:
+                matches.append((job_dir, manifest))
+        if len(matches) != 1:
+            raise LookupError('job identity is missing or ambiguous')
+        return {'job_id': identifier, 'job_dir': matches[0][0],
+                'manifest': matches[0][1]}
 
     @staticmethod
     def _workspace_public_text(value, limit=400):
@@ -1656,6 +1675,14 @@ class Api:
             from vcstudio.project import task_analysis
             self._task_analysis = task_analysis
         return self._task_analysis
+
+    def _trj(self):
+        """服务端轨迹索引/修复审阅；不向浏览器暴露路径。"""
+        if self._trajectory_review_service is None:
+            from vcstudio.project.trajectory_review import TrajectoryReviewService
+            self._trajectory_review_service = TrajectoryReviewService(
+                task_analysis_mod=self._ta(), manifest_mod=self._manifest)
+        return self._trajectory_review_service
 
     def _ul(self):
         """DFT+U 建议库延迟加载。"""
@@ -15923,6 +15950,87 @@ class Api:
         out['report_supported'] = bool(cap.get('report_supported'))
         out['next_action'] = cap.get('next_action', '')
         return out
+
+    # ── 结构—轨迹—诊断播放器（opaque job/frame token only）──────────────
+    def trajectory_open(self, job_id, kind=None):
+        try:
+            record = self._resolve_workspace_job_id(job_id)
+            return self._trj().open(
+                record['job_dir'], record['job_id'], kind=(str(kind).strip() if kind else None))
+        except Exception as exc:                          # noqa: BLE001 public boundary
+            return {'ok': False, 'stale': False,
+                    'error': self._workspace_public_text(exc)}
+
+    def trajectory_steps(self, session_token, offset=0, limit=50, stride=1):
+        try:
+            return self._trj().steps(
+                str(session_token or ''), offset=offset, limit=limit, stride=stride)
+        except Exception as exc:                          # noqa: BLE001 public boundary
+            return {'ok': False, 'stale': False,
+                    'error': self._workspace_public_text(exc)}
+
+    def trajectory_frame(self, frame_token):
+        try:
+            return self._trj().frame(str(frame_token or ''))
+        except Exception as exc:                          # noqa: BLE001 public boundary
+            return {'ok': False, 'stale': False,
+                    'error': self._workspace_public_text(exc)}
+
+    def trajectory_repair_preview(self, session_token):
+        try:
+            return self._trj().repair_preview(str(session_token or ''))
+        except Exception as exc:                          # noqa: BLE001 public boundary
+            return {'ok': False, 'stale': False,
+                    'error': self._workspace_public_text(exc)}
+
+    @classmethod
+    def _public_repair_operation(cls, result, job_id):
+        """Strip job directories from the existing batch-operation response."""
+        result = result if isinstance(result, dict) else {}
+        public = {key: copy.deepcopy(result.get(key)) for key in (
+            'ok', 'needs_trust', 'needPassword', 'cancelled', 'busy', 'code',
+            'requires_manual_recovery', 'idempotency_key', 'duplicate', 'replayed',
+            'fingerprint', 'algorithm', 'host', 'scheduler_job_ids',
+        ) if result.get(key) is not None}
+        rows = []
+        for row in result.get('results') or []:
+            if not isinstance(row, (list, tuple)) or len(row) < 3:
+                continue
+            rows.append({'job_id': job_id, 'ok': bool(row[1]),
+                         'message': cls._workspace_public_text(row[2])})
+        public['results'] = rows
+        if result.get('error'):
+            public['error'] = cls._workspace_public_text(result.get('error'))
+        return public
+
+    def trajectory_confirm_repair(self, plan_token, decision, name, password,
+                                  trust_new=False, idempotency_key=None):
+        """Confirm only the existing bounded, idempotent, INCAR-frozen recovery seam."""
+        try:
+            prepared = self._trj().prepare_repair(
+                str(plan_token or ''), str(decision or ''), str(idempotency_key or ''))
+            current = self._resolve_workspace_job_id(prepared['job_id'])
+            if (os.path.realpath(current['job_dir'])
+                    != os.path.realpath(str(prepared['job_dir']))):
+                raise RuntimeError('job registry binding changed; repair remains paused')
+            result = self.continue_jobs(
+                [current['job_dir']], name, password, trust_new,
+                idempotency_key=prepared['operation_key'])
+            public = self._public_repair_operation(result, prepared['job_id'])
+            provisional = (bool(result.get('needs_trust'))
+                           or result.get('error') == 'NEED_PASSWORD'
+                           or bool(result.get('busy')))
+            public['correction_intent'] = {
+                'record_hash': prepared['intent_record_hash'],
+                'status': 'prepared',
+            }
+            if not provisional:
+                public['correction_outcome'] = self._trj().record_repair_outcome(
+                    prepared, result)
+            return public
+        except Exception as exc:                          # noqa: BLE001 public boundary
+            return {'ok': False, 'stale': False,
+                    'error': self._workspace_public_text(exc)}
 
     def analyze_task(self, job_dir, kind=None):
         """统一任务解析：按 23 类能力矩阵分发；未接解析器时返回明确下一步，不编结果。"""
