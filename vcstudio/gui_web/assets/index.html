@@ -6,6 +6,7 @@
 <title>VASP Catalyst Studio</title>
 <link rel="stylesheet" href="app.css">
 <link rel="stylesheet" href="analysis-workbench.css">
+<link rel="stylesheet" href="reference-browser.css">
 <link rel="stylesheet" href="report-workbench.css">
 <script>/* 外观先粉刷防闪烁；只接受固定白名单，桥就绪后 app.js 再从 config 校准。 */
 try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].indexOf(_t)>=0)document.documentElement.dataset.theme=_t;var _d=localStorage.getItem('vcs.density');document.documentElement.dataset.density=['comfortable','standard','compact'].indexOf(_d)>=0?_d:'standard';}catch(e){document.documentElement.dataset.density='standard';}</script>
@@ -423,6 +424,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
       <a href="#/prepare/input" data-route="prepare-input" data-area="prepare" data-page="generate" data-scene="pages.generate" data-i18n="nav.generate">生成输入</a>
       <a href="#/jobs" data-route="run-jobs" data-area="run" data-page="jobs" data-scene="pages.jobs" data-i18n="nav.jobs">作业与运行</a>
       <a href="#/projects/current/analysis/adsorption" data-route="analyze-energy" data-area="analyze" data-page="analysis-workbench" data-scene="pages.analysis-workbench">能量与稳定性</a>
+      <a href="#/projects/current/analysis/references" data-route="analyze-references" data-area="analyze" data-page="reference-browser" data-scene="pages.project" data-i18n="reference.route">外部参考</a>
       <!-- 旧 wavefunction 物理页的场景适配器；语义路由仍进入统一分析工作台。 -->
       <a href="#/projects/current/analysis/charge" data-route="analyze-charge" data-area="analyze" data-page="wavefunction" data-scene="pages.wavefunction">电荷与波函数</a>
       <a href="#/publish/figures?project=current" data-route="publish-figures" data-area="publish" data-page="figures" data-scene="pages.figures" data-i18n="nav.figures">图表工作台</a>
@@ -1853,6 +1855,100 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
     </div>
   </section>
 
+  <!-- 外部参考浏览器：只消费服务端窄 Protocol，不接受 URL/GraphQL/路径。 -->
+  <section class="page reference-browser-page" data-page="reference-browser"
+    id="page-reference-browser" aria-labelledby="rb-title" hidden>
+    <header class="rb-header">
+      <div>
+        <span class="rb-kicker">Analyze / External reference</span>
+        <h1 id="rb-title" tabindex="-1" data-i18n="reference.title">外部参考浏览器</h1>
+        <p id="rb-project-name" data-i18n="reference.project.waiting">选择项目后可并排比较或显式导入候选 provenance。</p>
+      </div>
+      <div class="rb-network-card" role="status" aria-live="polite" aria-atomic="true">
+        <span data-i18n="reference.network.label">外部网络</span>
+        <b id="rb-network-state" data-i18n="reference.network.disabled">已禁用</b>
+        <button class="btn" id="rb-network-toggle" type="button"
+          data-i18n="reference.network.enable">本会话启用</button>
+      </div>
+    </header>
+
+    <div class="rb-alert" id="rb-alert" role="alert" hidden></div>
+    <div class="rb-policy" role="note">
+      <b data-i18n="reference.policy.title">证据边界</b>
+      <span data-i18n="reference.policy.body">外部数值仅作 external_reference 并排参考；默认不能进入 method-compatible aggregate、ValidationResult 或 final claims。</span>
+    </div>
+
+    <div class="rb-layout">
+      <aside class="rb-panel rb-providers" aria-labelledby="rb-providers-title">
+        <header>
+          <h2 id="rb-providers-title" data-i18n="reference.providers.title">Provider 能力</h2>
+          <p data-i18n="reference.providers.help">Endpoint、字段、分页和超时由服务端固定。</p>
+        </header>
+        <ul id="rb-provider-list" class="rb-provider-list" aria-busy="true">
+          <li data-i18n="reference.loading">正在读取…</li>
+        </ul>
+        <div class="rb-credential" id="rb-key-group" hidden>
+          <label for="rb-api-key" data-i18n="reference.key.label">Materials Project API key</label>
+          <input class="ipt" id="rb-api-key" type="password" autocomplete="off"
+            spellcheck="false" data-i18n-ph="reference.key.placeholder"
+            placeholder="仅写入系统凭据库">
+          <div class="actions">
+            <button class="btn" id="rb-key-save" type="button" data-i18n="reference.key.save">保存到 keyring</button>
+            <button class="btn quiet" id="rb-key-delete" type="button" data-i18n="reference.key.delete">删除 key</button>
+          </div>
+          <small data-i18n="reference.key.help">保存后不会回显，也不会写入配置、项目或缓存。</small>
+        </div>
+      </aside>
+
+      <div class="rb-panel rb-main" role="region" aria-labelledby="rb-search-title">
+        <header>
+          <h2 id="rb-search-title" data-i18n="reference.search.title">受限搜索</h2>
+          <p data-i18n="reference.search.help">浏览器只提交 provider 与当前 provider 的有界 filters。</p>
+        </header>
+        <form id="rb-search-form" class="rb-search-form" novalidate>
+          <div class="rb-field rb-provider-field">
+            <label for="rb-provider" data-i18n="reference.provider.label">Provider</label>
+            <select class="ipt" id="rb-provider" required></select>
+          </div>
+          <div class="rb-field" id="rb-filter-group-1"><label for="rb-filter-1" id="rb-filter-label-1">Formula</label><input class="ipt" id="rb-filter-1" type="text" maxlength="96" spellcheck="false"></div>
+          <div class="rb-field" id="rb-filter-group-2"><label for="rb-filter-2" id="rb-filter-label-2">Elements</label><input class="ipt" id="rb-filter-2" type="text" maxlength="96" spellcheck="false"></div>
+          <div class="rb-field" id="rb-filter-group-3"><label for="rb-filter-3" id="rb-filter-label-3">Filter 3</label><input class="ipt" id="rb-filter-3" type="text" maxlength="96" spellcheck="false"></div>
+          <div class="rb-field" id="rb-filter-group-4"><label for="rb-filter-4" id="rb-filter-label-4">Filter 4</label><input class="ipt" id="rb-filter-4" type="text" maxlength="96" spellcheck="false"></div>
+          <div class="rb-field" id="rb-filter-group-5"><label for="rb-filter-5" id="rb-filter-label-5">Filter 5</label><input class="ipt" id="rb-filter-5" type="text" maxlength="96" spellcheck="false"></div>
+          <div class="rb-field rb-small-field">
+            <label for="rb-page" data-i18n="reference.page">页</label>
+            <input class="ipt" id="rb-page" type="number" min="1" max="4" step="1" value="1">
+          </div>
+          <div class="rb-field rb-small-field">
+            <label for="rb-limit" data-i18n="reference.limit">每页</label>
+            <select class="ipt" id="rb-limit"><option value="5">5</option><option value="10" selected>10</option><option value="20">20</option><option value="25">25</option></select>
+          </div>
+          <div class="rb-search-actions actions">
+            <button class="btn primary" id="rb-search" type="submit" data-i18n="reference.search.button">搜索参考数据</button>
+            <button class="btn" id="rb-compare" type="button" disabled data-i18n="reference.compare.button">与本地结果并排比较</button>
+          </div>
+        </form>
+        <div class="rb-results-head">
+          <h3 data-i18n="reference.results.title">结果</h3>
+          <span id="rb-results-summary" aria-live="polite" data-i18n="reference.results.empty">尚未搜索。</span>
+        </div>
+        <div id="rb-results" class="rb-results" role="region" tabindex="0"
+          aria-label="外部参考搜索结果"><div class="rb-empty" data-i18n="reference.results.empty">尚未搜索。</div></div>
+        <p id="rb-operation" class="rb-operation" aria-live="polite" data-i18n="reference.operation.ready">等待受限搜索。</p>
+      </div>
+    </div>
+
+    <section class="rb-panel rb-comparison" aria-labelledby="rb-comparison-title">
+      <header>
+        <h2 id="rb-comparison-title" data-i18n="reference.comparison.title">本地 / 外部并排比较</h2>
+        <p data-i18n="reference.comparison.help">数量和方法口径分别显示；此区域不生成 aggregate。</p>
+      </header>
+      <div id="rb-comparison" class="rb-comparison-body" tabindex="0">
+        <div class="rb-empty" data-i18n="reference.comparison.empty">选择一个或多个结果后比较。</div>
+      </div>
+    </section>
+  </section>
+
   <!-- Phase C：统一报告工作台。预设、ReportSpec、快照与门禁均由后端 bootstrap 提供。 -->
   <section class="page report-workbench-page" data-page="report-workbench"
     id="page-report-workbench" aria-labelledby="rw-title" hidden>
@@ -3122,6 +3218,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
 <script src="generate.js"></script>
 <script src="project.js"></script>
 <script src="analysis-workbench.js"></script>
+<script src="reference-browser.js"></script>
 <script src="report-workbench.js"></script>
 <script src="dashboard.js"></script>
 <script src="settings.js"></script>

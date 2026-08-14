@@ -100,6 +100,22 @@ Network failure, rate limiting, schema drift and partial data return structured
 `status=unavailable` results.  They are isolated from local analysis, cluster,
 pipeline and report workflows.
 
+## Reference Browser UI adapter
+
+The bilingual `#/projects/<opaque-id>/analysis/references` page consumes only
+the gateway's public bridge methods.  Its provider-specific form maps visible
+controls to fixed filter names; it has no control for URLs, GraphQL text,
+response fields, headers, timeouts or paths.  Results show method, property,
+license, attribution and DOI metadata, and provide explicit candidate import
+and side-by-side comparison actions.
+
+The page uses native labelled form controls and buttons, live status/error
+regions, visible keyboard focus, local table scrolling and single-column
+reflow below 720 px.  Browser QA at 1280 px and 480 px confirmed no
+document-level horizontal overflow.  HTTP-only browser fixtures cannot prove
+the native pywebview bridge; the bridge contracts are therefore also covered
+by offline Python and Node tests.
+
 ## License boundary
 
 The repository contains protocol clients and synthetic test fixtures only.  It
