@@ -27,6 +27,10 @@ VASP Catalyst Studio 的差异化方向应保持为：
 | [Catalysis-Hub](https://docs.catalysis-hub.org/en/latest/tutorials/index.html) | 按反应物、产物、表面组成和 facet 检索反应能、能垒、结构及论文 | 建立只读外部参考浏览器；保存 GraphQL 查询、DOI、许可、获取时间和原始快照 |
 | [CatMAP](https://catmap.readthedocs.io/en/latest/) | 反应网络、自由能图、覆盖度、TOF、火山图和敏感性分析 | 在完整自由能/能垒证据之后增加微观动力学实验室；明确 steady-state mean-field 适用范围 |
 | [FAIR Chemistry](https://fair-chem.github.io/models-1/) | 催化预训练模型与大规模吸附/NEB 数据集 | 只作为可选预筛选层；模型、checkpoint、训练域和 OOD 风险必须可见，候选仍须一致方法 DFT 确认 |
+| [QCArchive](https://docs.qcarchive.molssi.org/) | 计算记录、specification、manager、软件版本与 provenance 分离；数据集可持续追加计算 | 为非 VASP 文件适配器采用“规范输入 + 计算记录 + 软件身份”合同，避免把解析后的表格当成完整可复现记录 |
+| [OPTIMADE 1.3](https://www.optimade.org/specification/latest/) | 跨材料数据库的版本化 REST、标准过滤、provider namespace 与可发现索引 | 外部结构入口优先走标准 provider 发现与结构 DTO；数据库扩展字段保留命名空间，不能静默映射成本地科学字段 |
+| [jobflow](https://materialsproject.github.io/jobflow/) / FireWorks | Python Job/Flow、输出引用、可视化和本地/远端执行解耦 | DAG 预览与执行器分层；配方只描述不可变意图，真正执行仍经过本工作台的确认、锁、幂等和集群边界 |
+| [Avogadro](https://avogadro.cc/docs/) | 跨平台分子编辑、渲染、输入生成与插件式工具 | 强化结构编辑的选择/约束/测量/撤销与插件端口，但插件不得直接绕过项目身份、输入审计或作业清单 |
 
 ## 3. 当前覆盖与主要缺口
 
@@ -63,6 +67,15 @@ VASP Catalyst Studio 的差异化方向应保持为：
 - 缺少 Reaction Map、热化学逐项账本和条件浏览器；
 - 微观动力学、表面稳定性、Pourbaix/Wulff 与外部反应数据库仍是后续能力。
 
+### 跨代码、质量与协作能力
+
+- 缺少 QCArchive 风格的通用 calculation record；目前非 VASP 结果只能有限适配，软件版本、输入 specification 与计算 manager 证据尚未统一；
+- 缺少针对“同一体系、不同方法/参数”的正式 benchmark suite、误差预算和不确定性传播；
+- 缺少标准化 OPTIMADE provider 发现、字段 namespace 和跨数据库重复结构消歧；
+- 缺少结构编辑器插件边界、第三方 parser 合规包和沙箱化能力声明；
+- 缺少团队评审批注、科学异议、决策记录与最终 claim 的可查询关联；
+- 缺少资源消耗、失败成本和碳排只读估算；这些只能作为调度/规划指标，不能成为科学质量分数。
+
 ## 4. 分阶段路线
 
 ### Now：第一批可验证增强
@@ -88,6 +101,9 @@ VASP Catalyst Studio 的差异化方向应保持为：
 3. 跨项目搜索、方法兼容过滤和可保存研究视图；
 4. Catalysis-Hub 只读参考浏览器；
 5. DOI-ready 本地 `.vcs-archive`，含 dry-run、许可证和敏感信息扫描。
+6. QCArchive 风格的跨代码 calculation record 与 parser conformance kit；
+7. 方法 benchmark / uncertainty ledger：同体系对照、误差来源、敏感性和适用域显式化；
+8. Research Notebook / Human Review Ledger，把批注、异议、决策和 claim 绑定到证据 revision。
 
 ### Later：独立验证后再开放
 
@@ -96,6 +112,9 @@ VASP Catalyst Studio 的差异化方向应保持为：
 3. 可解释的严格科学指纹缓存；
 4. 用户自装的 FAIR-Chem/UMA 预筛选适配器；
 5. 多用户空间、审阅角色、冻结发布和第三方插件 SDK。
+6. 主动学习/高通量候选编排，但只能生成候选与计算计划，不能自动提升科学结论；
+7. 实验数据对照与校准层，强制记录样品、条件、误差棒和不可比原因；
+8. 资源与可持续性仪表板，记录估算口径和实际调度历史，不虚构能耗或碳强度。
 
 ## 5. 科学与许可边界
 
@@ -136,4 +155,9 @@ VASP Catalyst Studio 的差异化方向应保持为：
 - [Catalysis-Hub tutorials](https://docs.catalysis-hub.org/en/latest/tutorials/index.html)
 - [CatMAP tutorials](https://catmap.readthedocs.io/en/latest/tutorials/index.html)
 - [FAIR Chemistry pretrained models](https://fair-chem.github.io/models-1/)
-
+- [QCArchive documentation](https://docs.qcarchive.molssi.org/)
+- [QCArchive base record provenance](https://docs.qcarchive.molssi.org/user_guide/records/base.html)
+- [OPTIMADE API specification 1.3](https://www.optimade.org/specification/latest/)
+- [Materials Cloud OPTIMADE providers](https://optimade.materialscloud.org/)
+- [jobflow documentation](https://materialsproject.github.io/jobflow/)
+- [Avogadro documentation](https://avogadro.cc/docs/)
