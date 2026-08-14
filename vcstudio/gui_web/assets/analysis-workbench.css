@@ -390,6 +390,40 @@
   border-bottom: 1px solid var(--rule);
 }
 
+.aw-kinetic-actions {
+  padding: 9px;
+  border-bottom: 1px solid var(--rule);
+  background: color-mix(in srgb, var(--accent-soft) 35%, transparent);
+}
+
+.aw-kinetic-actions h3,
+.aw-kinetic-actions p {
+  margin: 0 0 7px;
+}
+
+.aw-kinetic-actions .actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.aw-kinetic-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+  padding: 9px;
+}
+
+.aw-kinetic-point {
+  border-bottom: 1px solid var(--rule);
+}
+
+.aw-kinetic-point > h3,
+.aw-kinetic-point > .aw-readonly-note {
+  margin: 0;
+  padding: 8px 9px 0;
+}
+
 .aw-free-energy-summary h3,
 .aw-free-energy-evidence h4 {
   margin: 0 0 6px;
@@ -668,6 +702,10 @@
   .aw-denominator,
   .aw-free-energy-metrics,
   .aw-free-energy-evidence-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .aw-kinetic-grid {
     grid-template-columns: minmax(0, 1fr);
   }
 

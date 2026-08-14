@@ -1829,6 +1829,22 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
             <div class="aw-field aw-field-wide"><span id="aw-sensitivity-label">敏感性 deadband / eV</span><div class="aw-sensitivity" id="aw-sensitivity" role="group" aria-labelledby="aw-sensitivity-label"></div></div>
           </fieldset>
         </form>
+        <section class="aw-kinetic-actions" id="aw-kinetics-actions"
+          aria-labelledby="aw-kinetics-actions-title" hidden>
+          <h3 id="aw-kinetics-actions-title" data-i18n="analysis.kinetic.adapter_actions">CatMAP 安全适配器</h3>
+          <p data-i18n="analysis.kinetic.adapter_boundary">仅预览并导出固定数据合同；应用不安装、不打包、也不执行 CatMAP。</p>
+          <div class="actions">
+            <button class="btn" id="aw-kinetics-preview-export" type="button"
+              data-i18n="analysis.kinetic.preview_export">预览导出</button>
+            <button class="btn primary" id="aw-kinetics-confirm-export" type="button"
+              data-i18n="analysis.kinetic.confirm_export" disabled>明确确认并导出</button>
+            <label class="btn" for="aw-kinetics-result-file"
+              data-i18n="analysis.kinetic.select_result">选择结果 JSON</label>
+            <input id="aw-kinetics-result-file" type="file" accept="application/json,.json" hidden>
+          </div>
+          <p class="aw-operation" id="aw-kinetics-adapter-status" aria-live="polite"
+            data-i18n="analysis.kinetic.adapter_waiting">等待服务端输入审计。</p>
+        </section>
         <div class="aw-denominator" id="aw-denominator" aria-label="分析分母"></div>
         <div class="aw-table-scroll" id="aw-table-scroll" tabindex="0" aria-label="分析结果表，较宽时可局部滚动"><div class="aw-empty">尚未生成分析视图。</div></div>
         <section class="aw-chartless" aria-labelledby="aw-sensitivity-title">

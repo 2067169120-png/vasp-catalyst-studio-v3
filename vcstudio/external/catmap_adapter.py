@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import shutil
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
@@ -30,6 +31,8 @@ MANIFEST_SCHEMA = "vcstudio.catmap-export-manifest/v1"
 PROCESS_SCHEMA = "vcstudio.external-process-contract/v1"
 CATMAP_LICENSE = "GPL-3.0"
 CATMAP_PROJECT = "https://github.com/SUNCAT-Center/catmap"
+_MAX_MANIFEST_BYTES = 1024 * 1024
+_MAX_ARTIFACT_BYTES = 20 * 1024 * 1024
 
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _SAFE_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}$")
@@ -80,6 +83,11 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _is_link(path: Path) -> bool:
+    is_junction = getattr(path, "is_junction", None)
+    return path.is_symlink() or bool(callable(is_junction) and is_junction())
+
+
 def inspect_tool_path(tool_path: str | os.PathLike | None, *,
                       version: str | None = None) -> dict[str, Any]:
     """Hash a user-configured regular file without importing or executing it."""
@@ -96,7 +104,7 @@ def inspect_tool_path(tool_path: str | os.PathLike | None, *,
     if not candidate.is_absolute():
         return unavailable
     try:
-        if candidate.is_symlink() or not candidate.is_file():
+        if _is_link(candidate) or not candidate.is_file():
             return unavailable
         resolved = candidate.resolve(strict=True)
         if not resolved.is_file():
@@ -219,12 +227,34 @@ def _expanded_state(state: Mapping[str, Any], names: Mapping[str, str]) -> str:
 
 
 def _model_text(network: Mapping[str, Any], names: Mapping[str, str]) -> str:
+    methodology = network.get("methodology") or {}
+    if methodology.get("energy_basis") != "gibbs_free_energy":
+        raise CatmapAdapterError(
+            "phase-1 CatMAP export requires frozen Gibbs formation energies")
+    if methodology.get("potential_model") != "none":
+        raise CatmapAdapterError(
+            "phase-1 CatMAP export does not encode electrochemical potential dependence")
     reactions = []
+    prefactors = []
     for step in network.get("elementary_steps") or []:
         reactions.append(
             f"{_expanded_state(step['reactants'], names)} <-> "
             f"{_expanded_state(step['transition_state'], names)} -> "
             f"{_expanded_state(step['products'], names)}")
+        records = step.get("prefactors") or {}
+        forward = records.get("forward") or {}
+        reverse = records.get("reverse") or {}
+        if (forward.get("unit") != "s^-1" or reverse.get("unit") != "s^-1"):
+            raise CatmapAdapterError(
+                "phase-1 CatMAP export supports only symmetric s^-1 prefactors")
+        forward_value = float(forward.get("value"))
+        reverse_value = float(reverse.get("value"))
+        if (not math.isfinite(forward_value) or not math.isfinite(reverse_value)
+                or not math.isclose(
+                    forward_value, reverse_value, rel_tol=1.0e-12, abs_tol=0.0)):
+            raise CatmapAdapterError(
+                "phase-1 CatMAP export requires equal forward/reverse prefactors")
+        prefactors.append(_format_number(forward_value))
     site_types = sorted({
         site
         for species in network.get("species") or []
@@ -248,6 +278,7 @@ def _model_text(network: Mapping[str, Any], names: Mapping[str, str]) -> str:
         f"surface_names = [{_catmap_base(str(network['network_id']), 'adsorbate')!r}]",
         f"species_definitions = {species_definitions!r}",
         f"temperature = {_format_number(temperature)}",
+        f"prefactor_list = {prefactors!r}",
         "gas_thermo_mode = 'frozen_gas'",
         "adsorbate_thermo_mode = 'frozen_adsorbate'",
         "adsorbate_interaction_model = 'ideal'",
@@ -309,15 +340,30 @@ def build_export_bundle(network_source, *, tool_path=None,
     audit = kinetics.audit_network(network)
     tool = inspect_tool_path(tool_path, version=tool_version)
     files = {"kinetics-audit.json": _json_text(audit)}
+    adapter_issues = []
     if audit["export_ready"] is True:
-        names = _species_names(network)
-        files.update({
-            "kinetics-input.json": _json_text(network),
-            "energetics.tsv": _table_text(network, names),
-            "model.mkm": _model_text(network, names),
-            "process-contract.json": _json_text(
-                _process_contract(tool, audit["input_sha256"])),
-        })
+        try:
+            names = _species_names(network)
+            files.update({
+                "kinetics-input.json": _json_text(network),
+                "energetics.tsv": _table_text(network, names),
+                "model.mkm": _model_text(network, names),
+                "process-contract.json": _json_text(
+                    _process_contract(tool, audit["input_sha256"])),
+            })
+        except CatmapAdapterError as exc:
+            adapter_issues.append({
+                "severity": "error",
+                "code": "CATMAP_PHASE1_CONTRACT_UNSUPPORTED",
+                "message": str(exc),
+            })
+            files["catmap-adapter-audit.json"] = _json_text({
+                "schema": "vcstudio.catmap-adapter-audit/v1",
+                "input_sha256": audit.get("input_sha256"),
+                "export_ready": False,
+                "issues": adapter_issues,
+            })
+    export_ready = audit["export_ready"] is True and not adapter_issues
     artifacts = _artifact_records(files)
     token_payload = {
         "schema": BUNDLE_SCHEMA,
@@ -327,7 +373,7 @@ def build_export_bundle(network_source, *, tool_path=None,
         "artifacts": artifacts,
     }
     preview_token = hashlib.sha256(_canonical_bytes(token_payload)).hexdigest()
-    if audit["export_ready"] is True:
+    if export_ready:
         manifest = {
             "schema": MANIFEST_SCHEMA,
             "input_sha256": audit["input_sha256"],
@@ -349,6 +395,8 @@ def build_export_bundle(network_source, *, tool_path=None,
         "adapter": {"id": ADAPTER_ID, "version": ADAPTER_VERSION},
         "tool": tool,
         "audit": audit,
+        "adapter_issues": adapter_issues,
+        "export_ready": export_ready,
         "files": files,
         "artifacts": artifacts,
         "preview_token": preview_token,
@@ -360,21 +408,22 @@ def preview_export(network_source, *, tool_path=None,
     """Return hashes and audit only; do not expose file contents or local paths."""
     bundle = build_export_bundle(
         network_source, tool_path=tool_path, tool_version=tool_version)
-    audit_ready = bundle["audit"]["export_ready"] is True
+    export_ready = bundle["export_ready"] is True
     return {
         "schema": PREVIEW_SCHEMA,
         "input_sha256": bundle["input_sha256"],
         "adapter": copy.deepcopy(bundle["adapter"]),
         "tool": copy.deepcopy(bundle["tool"]),
         "audit": copy.deepcopy(bundle["audit"]),
+        "adapter_issues": copy.deepcopy(bundle["adapter_issues"]),
         "artifacts": copy.deepcopy(bundle["artifacts"]),
         "preview_token": bundle["preview_token"],
         "explicit_confirmation_required": True,
         "capability_status": (
-            "available" if audit_ready and bundle["tool"]["available"] is True
+            "available" if export_ready and bundle["tool"]["available"] is True
             else "unavailable"),
-        "export_ready": audit_ready,
-        "scientific_status": "diagnostic" if audit_ready else "unavailable",
+        "export_ready": export_ready,
+        "scientific_status": "diagnostic" if export_ready else "unavailable",
         "eligible_final": False,
         "limitations": {
             "catmap_bundled": False,
@@ -406,6 +455,21 @@ def _atomic_write(path: Path, content: str) -> None:
             pass
 
 
+def _safe_child_directory(parent: Path, name: str, root: Path) -> Path:
+    path = parent / name
+    if path.exists() and _is_link(path):
+        raise CatmapAdapterError(f"export directory {name} must not be a symlink")
+    path.mkdir(exist_ok=True)
+    resolved = path.resolve(strict=True)
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise CatmapAdapterError("export directory escaped the project root") from exc
+    if not resolved.is_dir():
+        raise CatmapAdapterError(f"export directory {name} is not a directory")
+    return resolved
+
+
 def confirm_export(network_source, project_root, preview_token: str, *,
                    confirmed: bool, tool_path=None,
                    tool_version: str | None = None) -> dict[str, Any]:
@@ -428,17 +492,48 @@ def confirm_export(network_source, project_root, preview_token: str, *,
         raise CatmapAdapterError("project root does not exist") from exc
     if not root.is_dir():
         raise CatmapAdapterError("project root must be a directory")
+    export_parent = root
+    for name in (".vcstudio", "kinetics", "exports"):
+        export_parent = _safe_child_directory(export_parent, name, root)
     identity = bundle.get("input_sha256") or bundle["preview_token"]
-    export_dir = root / ".vcstudio" / "kinetics" / "exports" / identity
-    export_dir.mkdir(parents=True, exist_ok=True)
-    resolved_export = export_dir.resolve(strict=True)
-    expected_parent = (root / ".vcstudio" / "kinetics" / "exports").resolve(strict=True)
-    if resolved_export.parent != expected_parent:
-        raise CatmapAdapterError("export directory escaped the project kinetics boundary")
-    for name, content in sorted(bundle["files"].items()):
-        if Path(name).name != name or name in {".", ".."}:
-            raise CatmapAdapterError("export artifact name is unsafe")
-        _atomic_write(resolved_export / name, content)
+    final_dir = export_parent / identity
+    expected_files = set(bundle["files"])
+    if final_dir.exists():
+        if _is_link(final_dir) or not final_dir.is_dir():
+            raise CatmapAdapterError("final export directory is unsafe")
+        resolved_export = final_dir.resolve(strict=True)
+        try:
+            resolved_export.relative_to(root)
+        except ValueError as exc:
+            raise CatmapAdapterError("final export directory escaped project root") from exc
+        entries = list(resolved_export.iterdir())
+        if any(_is_link(item) or not item.is_file() for item in entries):
+            raise CatmapAdapterError("existing export directory contains unsafe entries")
+        actual = {item.name for item in entries}
+        if actual != expected_files:
+            raise CatmapAdapterError("existing export directory does not match the preview")
+        for name, content in bundle["files"].items():
+            if (resolved_export / name).read_bytes() != content.encode("utf-8"):
+                raise CatmapAdapterError(
+                    f"refusing to overwrite changed export file {name}")
+    else:
+        stage = Path(tempfile.mkdtemp(prefix=".vcs-kinetics-stage-", dir=export_parent))
+        try:
+            resolved_stage = stage.resolve(strict=True)
+            if resolved_stage.parent != export_parent:
+                raise CatmapAdapterError("staged export escaped project boundary")
+            for name, content in sorted(bundle["files"].items()):
+                if Path(name).name != name or name in {".", ".."}:
+                    raise CatmapAdapterError("export artifact name is unsafe")
+                _atomic_write(resolved_stage / name, content)
+            os.replace(resolved_stage, final_dir)
+            resolved_export = final_dir.resolve(strict=True)
+        finally:
+            if stage.exists():
+                resolved_stage = stage.resolve(strict=True)
+                if resolved_stage.parent != export_parent:
+                    raise CatmapAdapterError("refusing to clean unsafe staged export")
+                shutil.rmtree(resolved_stage)
     return {
         "ok": True,
         "schema": MANIFEST_SCHEMA,
@@ -453,8 +548,107 @@ def confirm_export(network_source, project_root, preview_token: str, *,
     }
 
 
+def load_confirmed_manifest(project_root, input_sha256: str) -> dict[str, Any]:
+    """Revalidate one fixed export manifest and every declared artifact hash."""
+    if not isinstance(input_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", input_sha256):
+        raise CatmapAdapterError("input_sha256 must be a SHA-256 value")
+    root = Path(project_root)
+    if not root.is_absolute():
+        root = root.resolve()
+    try:
+        root = root.resolve(strict=True)
+    except OSError as exc:
+        raise CatmapAdapterError("project root does not exist") from exc
+    export_dir = root
+    for name in (".vcstudio", "kinetics", "exports", input_sha256):
+        candidate = export_dir / name
+        if _is_link(candidate) or not candidate.is_dir():
+            raise CatmapAdapterError("confirmed CatMAP export manifest is unavailable")
+        export_dir = candidate.resolve(strict=True)
+        try:
+            export_dir.relative_to(root)
+        except ValueError as exc:
+            raise CatmapAdapterError(
+                "confirmed CatMAP export directory escaped project root") from exc
+    manifest_path = export_dir / "manifest.json"
+    if _is_link(manifest_path) or not manifest_path.is_file():
+        raise CatmapAdapterError("confirmed CatMAP export manifest is unavailable")
+    try:
+        if manifest_path.stat().st_size > _MAX_MANIFEST_BYTES:
+            raise CatmapAdapterError(
+                "confirmed CatMAP export manifest exceeds the size limit")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise CatmapAdapterError("confirmed CatMAP export manifest is invalid") from exc
+    if not isinstance(manifest, Mapping) or manifest.get("schema") != MANIFEST_SCHEMA:
+        raise CatmapAdapterError("confirmed CatMAP export manifest schema mismatch")
+    if manifest.get("input_sha256") != input_sha256:
+        raise CatmapAdapterError("confirmed CatMAP export input hash mismatch")
+    adapter = manifest.get("adapter")
+    if adapter != {"id": ADAPTER_ID, "version": ADAPTER_VERSION}:
+        raise CatmapAdapterError("confirmed CatMAP export adapter mismatch")
+    tool = manifest.get("external_tool")
+    if not isinstance(tool, Mapping):
+        raise CatmapAdapterError("confirmed CatMAP export tool identity is invalid")
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        raise CatmapAdapterError("confirmed CatMAP export artifact manifest is empty")
+    normalized_artifacts = []
+    for index, item in enumerate(artifacts):
+        if (not isinstance(item, Mapping)
+                or set(item) != {"name", "sha256", "size"}):
+            raise CatmapAdapterError(
+                f"confirmed CatMAP export artifact {index} is invalid")
+        name = item.get("name")
+        digest = item.get("sha256")
+        size = item.get("size")
+        if (not isinstance(name, str) or Path(name).name != name
+                or not isinstance(digest, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                or isinstance(size, bool) or not isinstance(size, int)
+                or not 0 <= size <= _MAX_ARTIFACT_BYTES):
+            raise CatmapAdapterError(
+                f"confirmed CatMAP export artifact {index} metadata is unsafe")
+        artifact_path = export_dir / name
+        if _is_link(artifact_path) or not artifact_path.is_file():
+            raise CatmapAdapterError(f"confirmed CatMAP export artifact {name} is missing")
+        if artifact_path.stat().st_size != size:
+            raise CatmapAdapterError(
+                f"confirmed CatMAP export artifact size mismatch: {name}")
+        data = artifact_path.read_bytes()
+        if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
+            raise CatmapAdapterError(f"confirmed CatMAP export artifact hash mismatch: {name}")
+        normalized_artifacts.append(dict(item))
+    token_payload = {
+        "schema": BUNDLE_SCHEMA,
+        "input_sha256": input_sha256,
+        "adapter": {"id": ADAPTER_ID, "version": ADAPTER_VERSION},
+        "tool": dict(tool),
+        "artifacts": normalized_artifacts,
+    }
+    token = hashlib.sha256(_canonical_bytes(token_payload)).hexdigest()
+    if manifest.get("preview_token") != token:
+        raise CatmapAdapterError("confirmed CatMAP export preview token mismatch")
+    if (manifest.get("catmap_bundled") is not False
+            or manifest.get("catmap_copied") is not False
+            or manifest.get("scientific_status") != "diagnostic"
+            or manifest.get("eligible_final") is not False):
+        raise CatmapAdapterError("confirmed CatMAP export boundary metadata mismatch")
+    return {
+        "schema": MANIFEST_SCHEMA,
+        "input_sha256": input_sha256,
+        "preview_token": token,
+        "adapter": {"id": ADAPTER_ID, "version": ADAPTER_VERSION},
+        "tool": dict(tool),
+        "artifacts": normalized_artifacts,
+        "scientific_status": "diagnostic",
+        "eligible_final": False,
+    }
+
+
 __all__ = [
     "ADAPTER_ID", "ADAPTER_VERSION", "BUNDLE_SCHEMA", "CATMAP_LICENSE",
     "CatmapAdapterError", "MANIFEST_SCHEMA", "PREVIEW_SCHEMA", "PROCESS_SCHEMA",
-    "build_export_bundle", "confirm_export", "inspect_tool_path", "preview_export",
+    "build_export_bundle", "confirm_export", "inspect_tool_path",
+    "load_confirmed_manifest", "preview_export",
 ]

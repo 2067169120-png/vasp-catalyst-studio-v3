@@ -54,12 +54,25 @@ files compatible with CatMAP's documented TableParser/setup conventions.
 - TableParser input format: <https://catmap.readthedocs.io/en/latest/tutorials/generating_an_input_file.html>
 - Reaction/setup conventions: <https://catmap.readthedocs.io/en/latest/tutorials/creating_a_microkinetic_model.html>
 - Output variables: <https://catmap.readthedocs.io/en/latest/topics/output_variables.html>
+- Electrochemical requirements: <https://catmap.readthedocs.io/en/latest/topics/electrochemistry.html>
 
 The table contains the documented required columns:
 `surface_name`, `site_name`, `species_name`, `formation_energy`, `frequencies`,
 and `reference`.  Because the input values are already frozen Gibbs free
 energies, the generated setup uses `frozen_gas` and `frozen_adsorbate` to avoid
 adding a second thermochemical correction.
+
+The phase-1 setup generator is intentionally narrower than all features that a
+scientifically valid canonical projection may describe.  It emits only frozen
+Gibbs energies, thermal/non-electrochemical conditions, single-site explicit
+surface states, ideal lateral interactions, and equal forward/reverse `s^-1`
+prefactors (frozen into CatMAP's `prefactor_list`).  Electrochemical potential
+dependence, liquid/solution species, non-Gibbs energy bases, asymmetric or
+pressure/concentration-dependent prefactors, multisite species, and
+parameterized lateral interactions remain unavailable until an equally strict
+export mapping exists.  Such a projection retains its core audit and receives
+a separate `CATMAP_PHASE1_CONTRACT_UNSUPPORTED` adapter audit; no model scaffold
+is emitted.
 
 ## Preview and explicit confirmation
 
@@ -94,6 +107,13 @@ different files are not overwritten.  The frozen bundle contains:
 - `process-contract.json`
 - `manifest.json`
 
+Every project-local directory component is resolved under the project root and
+rejected if it is a symbolic link or Windows junction.  New bundles are built
+in a sibling staging directory and published with one directory rename, so a
+partially written bundle is never treated as confirmed.  Loading a confirmed
+bundle rechecks the directory chain, manifest size, artifact names, sizes,
+SHA-256 values, adapter identity, preview token, and diagnostic-only status.
+
 When scientific evidence fails, only `kinetics-audit.json` is exportable.  The
 process contract is explicitly non-executable: `execution_permitted=false`,
 `shell=false`, `accepts_user_arguments=false`, and `auto_install=false`.  It
@@ -120,6 +140,38 @@ Imported values are server-normalized into
 `vcstudio.kinetics-normalized-result/v1`.  A browser may render those values but
 must not solve equations, recompute metrics, change units, or infer missing
 results.
+
+Validated raw and normalized results are stored immutably below
+`<project>/.vcstudio/kinetics/results/<input_sha256>/<result_sha256>/`.  A small
+atomic `latest.json` pointer selects the current result for that exact input.
+Every load revalidates the directory chain, raw-result hash, strict result
+schema, unit map, input/adapter/tool hashes, and receipt hash.  Changing the
+configured CatMAP tool after confirmation makes the old result unavailable;
+the Dashboard keeps the confirmed and currently configured tool identities
+separate and requires a new preview/confirmation cycle.
+
+## Kinetic Dashboard boundary
+
+`kinetic-dashboard` reuses the registry-driven analysis workbench.  Its browser
+request may select only bounded display precision.  Reaction facts, methods,
+conditions, barriers, prefactors, BEP/scaling parameters, uncertainty, audit
+outcomes, and result values come only from the server-owned frozen projection,
+confirmed adapter manifest, and revalidated result receipt.
+
+Python formats every displayed condition and value for TOF, coverage,
+selectivity, DRC, DSC, reaction order, apparent activation energy, free-energy
+diagram, convergence, and sensitivity.  The browser preserves the server
+order and renders only `display` strings plus server-projected units.  It has no
+solver, unit conversion, rate expression, sensitivity perturbation, or
+free-energy inference.  Missing CatMAP, a failed audit, a changed tool, a hash
+mismatch, an unconverged result, or missing sensitivity evidence leaves the
+numeric Dashboard unavailable while keeping the audit and export preview
+accessible.
+
+The public bridge accepts opaque project IDs only.  Export preview accepts no
+destination; confirmation accepts only the exact preview SHA-256 plus an
+explicit boolean confirmation; result import accepts a bounded JSON object,
+not a path, executable, command, argv, or reaction-network payload.
 
 ## Scientific and publication limitations
 

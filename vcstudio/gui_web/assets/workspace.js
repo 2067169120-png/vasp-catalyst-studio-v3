@@ -69,6 +69,9 @@
     'analyze-thermo': { area: 'analyze', page: 'analysis-workbench', label: '热力学与动力学', labelKey: 'workspace.route.analyze_thermo',
       path: c => `/projects/${projectToken(c)}/analysis/thermo`,
       analysisId: 'free-energy-path', scenePage: 'project', focus: '#aw-title' },
+    'analyze-kinetics': { area: 'analyze', page: 'analysis-workbench', label: '微观动力学', labelKey: 'workspace.route.analyze_kinetics',
+      path: c => `/projects/${projectToken(c)}/analysis/kinetics`,
+      analysisId: 'kinetic-dashboard', scenePage: 'project', focus: '#aw-title' },
     'analyze-electronic': { area: 'analyze', page: 'analysis-workbench', label: '电子结构', labelKey: 'workspace.route.analyze_electronic',
       path: c => `/projects/${projectToken(c)}/analysis/electronic`,
       analysisId: 'electronic-structure', scenePage: 'wavefunction', focus: '#aw-title' },
@@ -148,6 +151,7 @@
     analyze: [
       { route: 'analyze-energy', label: '能量与稳定性' },
       { route: 'analyze-thermo', label: '热力学与动力学' },
+      { route: 'analyze-kinetics', label: '微观动力学' },
       { route: 'analyze-electronic', label: '电子结构' },
       { route: 'analyze-charge', label: '电荷与波函数' },
       { route: 'analyze-comparison', label: '比较' },
@@ -516,9 +520,10 @@
       const projectId = safeToken(decodeURIComponentSafe(match[1]), PROJECT_TOKEN);
       return projectId ? result(byView[match[2]], { projectId }) : null;
     }
-    match = path.match(/^\/projects\/([^/]+)\/analysis\/(adsorption|thermo|electronic|charge|comparison|custom|properties)$/);
+    match = path.match(/^\/projects\/([^/]+)\/analysis\/(adsorption|thermo|kinetics|electronic|charge|comparison|custom|properties)$/);
     if (match) {
       const byAnalysis = { adsorption: 'analyze-energy', thermo: 'analyze-thermo',
+        kinetics: 'analyze-kinetics',
         electronic: 'analyze-electronic', charge: 'analyze-charge',
         comparison: 'analyze-comparison', custom: 'analyze-custom',
         properties: 'analyze-properties' };

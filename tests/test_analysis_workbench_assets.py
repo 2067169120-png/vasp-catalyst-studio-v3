@@ -53,13 +53,14 @@ def test_workbench_uses_native_labels_groups_status_and_locally_scrollable_table
     assert "grid-template-columns: minmax(0, 1fr)" in css
 
 
-def test_six_analysis_routes_share_one_physical_workbench_and_keep_opaque_ids():
+def test_analysis_routes_share_one_physical_workbench_and_keep_opaque_ids():
     workspace = _source("workspace.js")
     routes = workspace.split("const ROUTES = Object.freeze({", 1)[1].split(
         "const AREA_LABELS", 1)[0]
     expected = {
         "analyze-energy": ("adsorption-energy", "project"),
         "analyze-thermo": ("free-energy-path", "project"),
+        "analyze-kinetics": ("kinetic-dashboard", "project"),
         "analyze-electronic": ("electronic-structure", "wavefunction"),
         "analyze-charge": ("charge-wavefunction", "wavefunction"),
         "analyze-comparison": ("multi-project-comparison", "project"),
@@ -106,6 +107,10 @@ def test_browser_sends_only_analysis_spec_and_never_computes_scientific_values()
     assert "lowest_energy_eV =" not in script
     assert "if (parameters.includes('sort'))" in request
     assert "request.sort = {" in request
+    assert "if (parameters.includes('near_degenerate_eV'))" in request
+    assert "if (parameters.includes('missing_policy'))" in request
+    assert "if (parameters.includes('precision'))" in request
+    assert "record && record.data_modes) && record.data_modes.length > 1" in request
 
 
 def test_capability_cards_disable_every_non_available_state_and_offer_one_action():
@@ -178,6 +183,22 @@ def test_analysis_capability_and_server_result_i18n_keys_are_synced():
     assert not (keys - set(zh))
     assert set(en) == set(zh)
     assert all(en[key] != zh[key] for key in keys)
+
+
+def test_kinetic_dashboard_i18n_keys_are_exactly_synced():
+    html = _source("index.html")
+    script = _source("analysis-workbench.js")
+    en = json.loads((LOCALES / "en.json").read_text(encoding="utf-8"))
+    zh = json.loads((LOCALES / "zh.json").read_text(encoding="utf-8"))
+    referenced = set(re.findall(r"analysis\.kinetic\.[A-Za-z0-9_]+", html + script))
+    en_keys = {key for key in en if key.startswith("analysis.kinetic.")}
+    zh_keys = {key for key in zh if key.startswith("analysis.kinetic.")}
+
+    assert referenced
+    assert referenced == en_keys == zh_keys
+    assert set(en) == set(zh)
+    assert all(en[key] and zh[key] for key in referenced)
+    assert sum(en[key] != zh[key] for key in referenced) >= len(referenced) - 2
 
 
 def test_generic_analysis_renderer_only_consumes_server_display_values():
@@ -264,7 +285,7 @@ def test_free_energy_renderer_projects_only_server_owned_rows_and_conclusions():
     css = _source("analysis-workbench.css")
     renderer = re.search(
         r"function renderFreeEnergyView\(view, box\) \{(.*?)\n  \}\n\n"
-        r"  function renderSensitivity",
+        r"  function appendKineticTable",
         script,
         re.S,
     ).group(1)
@@ -293,6 +314,131 @@ def test_free_energy_renderer_projects_only_server_owned_rows_and_conclusions():
     assert "innerHTML = `<" not in renderer
     assert ".aw-free-energy-summary" in css
     assert ".aw-free-energy-evidence-grid" in css
+
+
+def test_kinetic_renderer_only_projects_server_display_values_and_units():
+    script = _source("analysis-workbench.js")
+    css = _source("analysis-workbench.css")
+    renderer = re.search(
+        r"function appendKineticTable\(.*?\) \{(.*?)\n  \}\n\n"
+        r"  function renderKineticDashboard\(view, box\) \{(.*?)\n  \}\n\n"
+        r"  function renderSensitivity",
+        script,
+        re.S,
+    ).group(0)
+
+    for server_field in (
+        "point.condition_display", "record.display", "view.units",
+        "point.tof", "point.coverage", "point.selectivity", "point.drc",
+        "point.dsc", "point.reaction_order",
+        "point.apparent_activation_energy", "point.free_energy_diagram",
+        "convergence.status", "convergence.residual_display",
+        "convergence.iterations", "convergence.solver", "view.audit",
+        "view.adapter", "view.limitations", "view.reason_codes",
+    ):
+        assert server_field in renderer
+    for forbidden in (
+        "Number(", "parseFloat(", "parseInt(", "toFixed(", "Math.",
+        ".reduce(", ".sort(", "record.value", "point.conditions",
+        "convergence.residual ", "fetch(", "VCS.call", "new Function", "eval(",
+    ):
+        assert forbidden not in renderer
+    assert "innerHTML = `<" not in renderer
+    assert ".aw-kinetic-grid" in css
+
+
+def test_kinetic_renderer_uses_server_text_without_bridge_calls_or_raw_math():
+    _run_node(
+        r"""
+const box = element('kinetic-results');
+const sensitivityBox = element('aw-sensitivity-results');
+loadAsset(process.argv[1]);
+const seam = window.__VCS_ANALYSIS_TEST__;
+assert.ok(seam, 'guarded analysis seam was not exposed');
+seam.configure({ analysisId: 'kinetic-dashboard' });
+const view = {
+  scientific_status: 'diagnostic', input_audit_status: 'passed',
+  solver_status: 'available', result_status: 'diagnostic',
+  units: {
+    tof: 'SERVER_TOF_UNIT', coverage: 'SERVER_COVERAGE_UNIT',
+    selectivity: 'SERVER_SELECTIVITY_UNIT', drc: 'SERVER_DRC_UNIT',
+    dsc: 'SERVER_DSC_UNIT', reaction_order: 'SERVER_ORDER_UNIT',
+    apparent_activation_energy: 'SERVER_EA_UNIT',
+    free_energy: 'SERVER_FREE_ENERGY_UNIT', residual: 'SERVER_RESIDUAL_UNIT',
+  },
+  audit: { input_sha256: 'SERVER_INPUT_HASH', issues: [] },
+  adapter: { version: 'SERVER_ADAPTER_VERSION' },
+  reason_codes: [],
+  points: [{
+    condition_display: 'SERVER_CONDITION',
+    conditions: { temperature: 11111, pressure: 22222, potential: 33333 },
+    tof: [{ species_id: '<img onerror=boom>', value: 10101, display: 'SERVER_TOF' }],
+    coverage: [{ species_id: 'A*', site_type: 'top', value: 20202,
+      display: 'SERVER_COVERAGE' }],
+    selectivity: [{ species_id: 'P', value: 30303, display: 'SERVER_SELECTIVITY' }],
+    drc: [{ step_id: 's1', value: 40404, display: 'SERVER_DRC' }],
+    dsc: [{ step_id: 's1', value: 50505, display: 'SERVER_DSC' }],
+    reaction_order: [{ species_id: 'A_g', value: 60606, display: 'SERVER_ORDER' }],
+    apparent_activation_energy: [{ species_id: 'P', value: 70707,
+      display: 'SERVER_EA' }],
+    free_energy_diagram: [
+      { state_id: 'reactants', value: 80808, display: 'SERVER_G0' },
+      { state_id: 'ts', value: 90909, display: 'SERVER_G1' },
+    ],
+    convergence: { status: 'converged', residual: 0.123456789,
+      residual_display: 'SERVER_RESIDUAL', iterations: 42, solver: 'SERVER_SOLVER' },
+  }],
+  kinetic_sensitivity: { status: 'passed', analyses: [{ kind: 'energy_uncertainty',
+    max_relative_change: 99999, max_relative_change_display: 'SERVER_SENSITIVITY' }],
+    warnings: [] },
+  limitations: { mean_field: true, steady_state: true, uniform_sites: true,
+    lateral_interactions: 'none', mechanism_completeness: 'asserted_complete',
+    mechanism_completeness_is_asserted_not_proven: true, browser_solves: false,
+    diagnostic_only: true, may_enter_accepted_or_final: false },
+};
+seam.renderKineticDashboard(view, box);
+seam.renderSensitivity(view);
+function renderedText(node) {
+  return [String(node.textContent || ''),
+    ...(node.children || []).map(renderedText)].join('|');
+}
+const text = renderedText(box) + '|' + renderedText(sensitivityBox);
+for (const token of [
+  'SERVER_CONDITION', 'SERVER_TOF', 'SERVER_COVERAGE', 'SERVER_SELECTIVITY',
+  'SERVER_DRC', 'SERVER_DSC', 'SERVER_ORDER', 'SERVER_EA', 'SERVER_G0',
+  'SERVER_G1', 'SERVER_RESIDUAL', 'SERVER_SOLVER', 'SERVER_SENSITIVITY',
+  'SERVER_TOF_UNIT', 'SERVER_COVERAGE_UNIT', 'SERVER_FREE_ENERGY_UNIT',
+  'diagnostic', 'accepted/final', 'asserted_complete', '<img onerror=boom>',
+]) assert.ok(text.includes(token), token + ' missing');
+for (const raw of [10101, 20202, 30303, 40404, 50505, 60606, 70707, 80808,
+  90909, 99999, 0.123456789, 11111, 22222, 33333]) {
+  assert.ok(!text.includes(String(raw)), 'raw numeric value leaked: ' + raw);
+}
+assert.ok(text.indexOf('SERVER_G0') < text.indexOf('SERVER_G1'));
+assert.strictEqual(trace.calls.length, 0);
+""",
+        str(ASSETS / "analysis-workbench.js"),
+    )
+
+
+def test_kinetic_adapter_controls_require_preview_and_explicit_confirmation():
+    html = _source("index.html")
+    script = _source("analysis-workbench.js")
+
+    assert 'id="aw-kinetics-actions"' in html
+    assert 'id="aw-kinetics-confirm-export"' in html and "disabled" in html
+    assert 'type="file" accept="application/json,.json"' in html
+    assert "window.confirm(" in script
+    assert "kinetics_export_preview', projectId" in script
+    assert "kinetics_export_confirm', projectId, previewSha, true" in script
+    assert "kinetics_result_import', projectId, resultObject" in script
+    assert "20 * 1024 * 1024" in script
+    assert "JSON.parse(await file.text())" in script
+    for forbidden in (
+        "webkitdirectory", "result_path", "project_path", "project_root",
+        "command:", "argv:", "subprocess", "child_process", "eval(",
+    ):
+        assert forbidden not in html + script
 
 
 def test_async_results_are_project_bound_and_last_request_wins():

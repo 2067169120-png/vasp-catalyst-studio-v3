@@ -29,6 +29,7 @@ def test_catalog_unifies_analysis_and_task_capabilities_without_builder_locators
     assert [item["id"] for item in catalog["analyses"]] == [
         "adsorption-energy",
         "free-energy-path",
+        "kinetic-dashboard",
         "task-results",
         "electronic-structure",
         "charge-wavefunction",
@@ -148,6 +149,19 @@ def test_semantic_hash_changes_with_scientifically_visible_options():
         "sensitivity_deadbands_eV": [0.05, 0.15, 0.25],
     }, project_id=PROJECT)
     assert sensitivity.semantic_sha256 != comparison.semantic_sha256
+
+
+def test_view_template_identity_never_changes_semantic_hash():
+    baseline = normalize_analysis_request({
+        "analysis_id": "kinetic-dashboard", "precision": 6,
+    }, project_id=PROJECT)
+    named = normalize_analysis_request({
+        "analysis_id": "kinetic-dashboard", "precision": 6,
+        "view_id": "operator-layout-a",
+    }, project_id=PROJECT)
+
+    assert named.view_id == "operator-layout-a"
+    assert named.semantic_sha256 == baseline.semantic_sha256
 
 
 @pytest.mark.parametrize("analysis_id", [

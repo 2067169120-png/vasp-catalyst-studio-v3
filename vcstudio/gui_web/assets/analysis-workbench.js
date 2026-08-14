@@ -10,6 +10,7 @@
   const ROUTE_ANALYSIS = Object.freeze({
     'analyze-energy': 'adsorption-energy',
     'analyze-thermo': 'free-energy-path',
+    'analyze-kinetics': 'kinetic-dashboard',
     'analyze-electronic': 'electronic-structure',
     'analyze-charge': 'charge-wavefunction',
     'analyze-comparison': 'multi-project-comparison',
@@ -36,6 +37,7 @@
     busy: false, dirty: false, busyToken: 0, intentGeneration: 0,
     bootstrapGeneration: 0, previewGeneration: 0,
     preferenceRevision: null, preferences: null,
+    kineticsPreviewSha: '',
   };
 
   function plain(value) {
@@ -102,12 +104,20 @@
       schema: 'vcstudio.analysis-spec/v1',
       analysis_id: State.analysisId,
       project_id: State.projectId,
-      data_mode: $('aw-data-mode') && $('aw-data-mode').value || source.data_mode || 'stable',
-      near_degenerate_eV: Number($('aw-deadband') && $('aw-deadband').value),
-      precision: Number($('aw-precision') && $('aw-precision').value),
-      missing_policy: $('aw-missing-policy') && $('aw-missing-policy').value || 'show_missing',
       view_id: source.view_id || null,
     };
+    if (Array.isArray(record && record.data_modes) && record.data_modes.length > 1) {
+      request.data_mode = $('aw-data-mode') && $('aw-data-mode').value || source.data_mode || 'stable';
+    }
+    if (parameters.includes('near_degenerate_eV')) {
+      request.near_degenerate_eV = Number($('aw-deadband') && $('aw-deadband').value);
+    }
+    if (parameters.includes('precision')) {
+      request.precision = Number($('aw-precision') && $('aw-precision').value);
+    }
+    if (parameters.includes('missing_policy')) {
+      request.missing_policy = $('aw-missing-policy') && $('aw-missing-policy').value || 'show_missing';
+    }
     if (parameters.includes('sort')) {
       request.sort = {
         key: $('aw-sort-key') && $('aw-sort-key').value || plain(source.sort).key || 'species',
@@ -256,9 +266,13 @@
     if ($('aw-sort-direction')) $('aw-sort-direction').value = String(plain(spec.sort).direction || 'asc');
     renderProjects(); renderSensitivityControls();
     const comparison = State.analysisId === 'multi-project-comparison';
+    if ($('aw-data-mode')) $('aw-data-mode').disabled =
+      !Array.isArray(record && record.data_modes) || record.data_modes.length <= 1 || State.busy;
     ['aw-projects', 'aw-baseline'].forEach(id => { if ($(id)) $(id).disabled = !comparison || State.busy; });
     ['aw-sort-key', 'aw-sort-direction'].forEach(id => { if ($(id)) $(id).disabled = !supportsSort || State.busy; });
     if ($('aw-deadband')) $('aw-deadband').disabled = !parameters.includes('near_degenerate_eV') || State.busy;
+    if ($('aw-precision')) $('aw-precision').disabled = !parameters.includes('precision') || State.busy;
+    if ($('aw-missing-policy')) $('aw-missing-policy').disabled = !parameters.includes('missing_policy') || State.busy;
     document.querySelectorAll('#aw-sensitivity input').forEach(input => {
       input.disabled = !(record && record.supports_sensitivity === true) || State.busy;
     });
@@ -288,6 +302,10 @@
       missing_steps: tr('analysis.denominator.missing_steps', '缺失台阶'),
       input_transitions: tr('analysis.denominator.input_transitions', '输入转化'),
       valid_transitions: tr('analysis.denominator.valid_transitions', '有效转化'),
+      condition_points: tr('analysis.denominator.condition_points', '工况点'),
+      converged_points: tr('analysis.denominator.converged_points', '收敛工况点'),
+      elementary_steps: tr('analysis.denominator.elementary_steps', '基元步骤'),
+      species: tr('analysis.denominator.species', '物种'),
     };
     Object.entries(source).forEach(([key, value]) => {
       const item = document.createElement('span'); const label = document.createElement('small');
@@ -489,8 +507,138 @@
     table.prepend(caption); box.appendChild(table);
   }
 
+  function appendKineticTable(parent, titleText, identityLabel, records, identity, unit) {
+    if (!Array.isArray(records) || !records.length) return;
+    const section = document.createElement('section'); section.className = 'aw-result-card';
+    const heading = document.createElement('header'); const title = document.createElement('b');
+    title.textContent = titleText; heading.appendChild(title); section.appendChild(heading);
+    section.appendChild(tableElement([
+      { label: identityLabel },
+      { label: tr('analysis.kinetic.server_value', '服务端结果'), numeric: true },
+      { label: tr('analysis.kinetic.unit', '单位') },
+    ], records.map(record => ({
+      cells: [identity(record), record.display, unit || '—'],
+    }))));
+    parent.appendChild(section);
+  }
+
+  function renderKineticDashboard(view, box) {
+    const points = Array.isArray(view.points) ? view.points : [];
+    const units = plain(view.units); const audit = plain(view.audit);
+    const adapter = plain(view.adapter); const configuredAdapter = plain(view.configured_adapter);
+    const limitations = plain(view.limitations);
+    box.innerHTML = '';
+    const summary = document.createElement('section'); summary.className = 'aw-free-energy-summary';
+    const title = document.createElement('h3');
+    title.textContent = tr('analysis.kinetic.title', '微观动力学诊断 Dashboard');
+    const metrics = document.createElement('dl'); metrics.className = 'aw-free-energy-metrics';
+    appendFreeEnergyMetric(metrics, tr('analysis.kinetic.scientific_status', '科学状态'), view.scientific_status);
+    appendFreeEnergyMetric(metrics, tr('analysis.kinetic.input_audit', '输入审计'), view.input_audit_status);
+    appendFreeEnergyMetric(metrics, tr('analysis.kinetic.solver_status', '求解器状态'), view.solver_status);
+    appendFreeEnergyMetric(metrics, tr('analysis.kinetic.result_status', '结果状态'), view.result_status);
+    appendFreeEnergyMetric(metrics, tr('analysis.kinetic.catmap_version', 'CatMAP 版本'), adapter.version);
+    appendFreeEnergyMetric(metrics, tr('analysis.kinetic.configured_catmap_version', '当前配置版本'),
+      configuredAdapter.version);
+    appendFreeEnergyMetric(metrics, tr('analysis.kinetic.tool_identity_match', '工具身份匹配'),
+      configuredAdapter.matches_confirmed_export);
+    appendFreeEnergyMetric(metrics, tr('analysis.kinetic.input_hash', '输入哈希'), audit.input_sha256);
+    summary.append(title, metrics);
+    const boundary = document.createElement('p'); boundary.className = 'aw-readonly-note';
+    boundary.textContent = tr('analysis.kinetic.diagnostic_boundary',
+      '只读诊断结果；浏览器不求解，且结果不能直接进入 accepted/final。');
+    summary.appendChild(boundary); box.appendChild(summary);
+
+    const evidence = document.createElement('div'); evidence.className = 'aw-free-energy-evidence-grid';
+    appendFreeEnergyMessages(evidence, tr('analysis.kinetic.audit', '输入审计'),
+      (audit.issues || []).map(item => `${String(item.code || '')}: ${String(item.message || '')}`),
+      tr('analysis.kinetic.audit_empty', '输入审计未报告问题。'));
+    appendFreeEnergyMessages(evidence, tr('analysis.kinetic.reason_codes', '不可用原因'),
+      view.reason_codes || [], tr('analysis.kinetic.reason_codes_empty', '未报告不可用原因。'));
+    box.appendChild(evidence);
+
+    if (!points.length) {
+      const empty = document.createElement('div'); empty.className = 'aw-empty';
+      empty.textContent = tr('analysis.kinetic.unavailable',
+        '没有可展示的哈希匹配动力学结果；审计报告仍可预览和导出。');
+      box.appendChild(empty);
+    }
+    points.forEach(point => {
+      const pointSection = document.createElement('section'); pointSection.className = 'aw-kinetic-point';
+      const pointTitle = document.createElement('h3');
+      pointTitle.textContent = String(point.condition_display || tr('analysis.kinetic.condition', '工况'));
+      pointSection.appendChild(pointTitle);
+      const convergence = plain(point.convergence); const convergenceText = document.createElement('p');
+      convergenceText.className = 'aw-readonly-note';
+      convergenceText.textContent = [
+        `${tr('analysis.kinetic.convergence', '数值收敛')}: ${String(convergence.status || '—')}`,
+        `${tr('analysis.kinetic.residual', '残差')}: ${String(convergence.residual_display || '—')} ${String(units.residual || '')}`,
+        `${tr('analysis.kinetic.iterations', '迭代')}: ${String(convergence.iterations == null ? '—' : convergence.iterations)}`,
+        `${tr('analysis.kinetic.solver', '求解器')}: ${String(convergence.solver || '—')}`,
+      ].join(' · ');
+      pointSection.appendChild(convergenceText);
+      const grid = document.createElement('div'); grid.className = 'aw-kinetic-grid';
+      appendKineticTable(grid, tr('analysis.kinetic.tof', 'TOF'),
+        tr('analysis.table.species', '物种'), point.tof,
+        record => record.species_id, units.tof);
+      appendKineticTable(grid, tr('analysis.kinetic.coverage', '覆盖度'),
+        tr('analysis.table.species', '物种'), point.coverage,
+        record => `${String(record.species_id || '')} @ ${String(record.site_type || '')}`, units.coverage);
+      appendKineticTable(grid, tr('analysis.kinetic.selectivity', '选择性'),
+        tr('analysis.table.species', '物种'), point.selectivity,
+        record => record.species_id, units.selectivity);
+      appendKineticTable(grid, tr('analysis.kinetic.drc', '速率控制度 DRC'),
+        tr('analysis.kinetic.step', '步骤'), point.drc,
+        record => record.step_id, units.drc);
+      appendKineticTable(grid, tr('analysis.kinetic.dsc', '选择性控制度 DSC'),
+        tr('analysis.kinetic.step', '步骤'), point.dsc,
+        record => record.step_id, units.dsc);
+      appendKineticTable(grid, tr('analysis.kinetic.reaction_order', '反应级数'),
+        tr('analysis.table.species', '物种'), point.reaction_order,
+        record => record.species_id, units.reaction_order);
+      appendKineticTable(grid, tr('analysis.kinetic.apparent_activation_energy', '表观活化能'),
+        tr('analysis.table.species', '物种'), point.apparent_activation_energy,
+        record => record.species_id, units.apparent_activation_energy);
+      appendKineticTable(grid, tr('analysis.kinetic.free_energy', '自由能图'),
+        tr('analysis.kinetic.state', '状态'), point.free_energy_diagram,
+        record => record.state_id, units.free_energy);
+      pointSection.appendChild(grid); box.appendChild(pointSection);
+    });
+
+    const limits = document.createElement('section'); limits.className = 'aw-free-energy-evidence';
+    const limitsTitle = document.createElement('h4');
+    limitsTitle.textContent = tr('analysis.kinetic.limitations', '模型与报告边界');
+    const list = document.createElement('ul');
+    [
+      `${tr('analysis.kinetic.mean_field', '平均场')}: ${String(limitations.mean_field)}`,
+      `${tr('analysis.kinetic.steady_state', '稳态')}: ${String(limitations.steady_state)}`,
+      `${tr('analysis.kinetic.uniform_sites', '均一位点')}: ${String(limitations.uniform_sites)}`,
+      `${tr('analysis.kinetic.lateral_interactions', '横向相互作用')}: ${String(limitations.lateral_interactions || '—')}`,
+      `${tr('analysis.kinetic.mechanism_completeness', '机制完整性')}: ${String(limitations.mechanism_completeness || '—')}`,
+      tr('analysis.kinetic.mechanism_claim', '机制完整性是上游声明，不是未遗漏步骤的证明。'),
+      tr('analysis.kinetic.no_final', '结果固定为 diagnostic，不能直接进入 accepted/final。'),
+    ].forEach(value => { const item = document.createElement('li'); item.textContent = value; list.appendChild(item); });
+    limits.append(limitsTitle, list); box.appendChild(limits);
+  }
+
   function renderSensitivity(view) {
     const box = $('aw-sensitivity-results'); if (!box) return; box.innerHTML = '';
+    if (State.analysisId === 'kinetic-dashboard') {
+      const sensitivity = plain(view && view.kinetic_sensitivity);
+      const analyses = Array.isArray(sensitivity.analyses) ? sensitivity.analyses : [];
+      const status = document.createElement('div'); status.className = 'aw-sensitivity-point';
+      status.textContent = `${tr('analysis.kinetic.sensitivity', '数值敏感性')}: ${String(sensitivity.status || 'unavailable')}`;
+      box.appendChild(status);
+      analyses.forEach(item => {
+        const card = document.createElement('div'); card.className = 'aw-sensitivity-point';
+        card.textContent = `${String(item.kind || '')}: ${String(item.max_relative_change_display || '—')}`;
+        box.appendChild(card);
+      });
+      (sensitivity.warnings || []).forEach(value => {
+        const card = document.createElement('div'); card.className = 'aw-sensitivity-point';
+        card.textContent = String(value); box.appendChild(card);
+      });
+      return;
+    }
     const sensitivity = plain(view && view.sensitivity); const points = sensitivity.points || [];
     if (!points.length) { const empty = document.createElement('div'); empty.className = 'aw-empty';
       empty.textContent = tr('analysis.sensitivity.empty', '当前分析没有敏感性结果。');
@@ -549,7 +697,12 @@
       (view.method_matrix || []).forEach(record => {
         const card = document.createElement('div'); card.className = 'aw-method';
         const title = document.createElement('b'); title.textContent = `${record.name || record.species || record.configuration_id || tr('analysis.record', '记录')} · ${record.status || 'unknown'}`;
-        const detail = document.createElement('code'); detail.textContent = [record.functional, record.dispersion, record.encut_eV != null ? `ENCUT ${record.encut_eV}` : '', record.kpoints_scheme].filter(Boolean).join(' · ') || (record.issues || record.warnings || []).join('；') || tr('analysis.method_projection.empty', '没有完整方法投影');
+        const detail = document.createElement('code'); detail.textContent = [
+          record.functional, record.dispersion,
+          record.encut_eV != null ? `ENCUT ${record.encut_eV}` : '',
+          record.kpoints_scheme, record.energy_basis, record.thermochemistry,
+          record.solvation, record.potential_model,
+        ].filter(Boolean).join(' · ') || (record.issues || record.warnings || []).join('；') || tr('analysis.method_projection.empty', '没有完整方法投影');
         card.append(title, detail); methods.appendChild(card);
       });
       if (!methods.children.length) { const empty = document.createElement('div');
@@ -576,19 +729,33 @@
     const inputDenominator = denominator.input_configurations != null ? denominator.input_configurations
       : denominator.selected_projects != null ? denominator.selected_projects
         : denominator.requested_paths != null ? denominator.requested_paths
-          : denominator.resolved_targets != null ? denominator.resolved_targets : denominator.input_steps;
+          : denominator.resolved_targets != null ? denominator.resolved_targets
+            : denominator.condition_points != null ? denominator.condition_points : denominator.input_steps;
     setText('aw-status-input', inputDenominator, 0);
     setText('aw-status-visible', denominator.visible_rows != null ? denominator.visible_rows : denominator.observed_numeric_cells, 0);
     setText('aw-status-hash', view.data_fingerprint ? String(view.data_fingerprint).slice(0, 12) : '—');
     if (!box) return;
     if (State.analysisId === 'adsorption-energy') renderAdsorptionTable(view, box);
     else if (State.analysisId === 'free-energy-path') renderFreeEnergyView(view, box);
+    else if (State.analysisId === 'kinetic-dashboard') renderKineticDashboard(view, box);
     else if (State.analysisId === 'multi-project-comparison') renderComparisonTable(view, box);
     else renderServerResults(view, box);
   }
 
+  function renderKineticsActions() {
+    const box = $('aw-kinetics-actions'); if (!box) return;
+    const active = State.analysisId === 'kinetic-dashboard'; box.hidden = !active;
+    if (!active) State.kineticsPreviewSha = '';
+    const preview = $('aw-kinetics-preview-export');
+    const confirm = $('aw-kinetics-confirm-export');
+    const file = $('aw-kinetics-result-file');
+    if (preview) preview.disabled = !active || State.busy || !State.projectId;
+    if (confirm) confirm.disabled = !active || State.busy || !State.kineticsPreviewSha;
+    if (file) file.disabled = !active || State.busy || !State.projectId;
+  }
+
   function renderAll() {
-    renderRegistry(); renderTemplates(); renderControls(); renderView();
+    renderRegistry(); renderTemplates(); renderControls(); renderView(); renderKineticsActions();
     setText('aw-project-name', State.projectName ? `${State.projectName} · ${State.projectId}`
       : tr('analysis.project.unavailable', '当前项目不可用'));
     const refresh = $('aw-refresh'); if (refresh) refresh.disabled = State.busy || !State.spec;
@@ -629,12 +796,118 @@
     } finally { endBusy(busyToken); }
   }
 
+  function kineticsOperation(message, tone = '') {
+    const box = $('aw-kinetics-adapter-status'); if (!box) return;
+    box.textContent = String(message || '');
+    box.className = 'aw-operation' + (tone ? ` ${tone}` : '');
+  }
+
+  async function previewKineticsExport() {
+    if (State.busy || State.analysisId !== 'kinetic-dashboard' ||
+        !sameProject(State.projectId)) return false;
+    const projectId = State.projectId; const intent = ++State.intentGeneration;
+    const busyToken = beginBusy(); State.kineticsPreviewSha = '';
+    kineticsOperation(tr('analysis.kinetic.preview_loading',
+      '正在审计并生成固定导出预览…'), 'busy'); renderAll();
+    try {
+      const result = await VCS.call('kinetics_export_preview', projectId);
+      if (intent !== State.intentGeneration || !sameProject(projectId)) return false;
+      if (!result || result.ok === false || result.error) throw new Error(result && result.error || tr(
+        'analysis.kinetic.preview_failed', 'CatMAP 导出预览失败。'));
+      if (safeId(result.project_id) !== projectId) throw new Error(tr(
+        'analysis.error.project_mismatch', '分析结果项目身份与当前项目不一致'));
+      const previewSha = String(result.preview_sha256 || '');
+      if (!/^[a-f0-9]{64}$/.test(previewSha)) throw new Error(tr(
+        'analysis.kinetic.preview_hash_invalid', '服务端未返回有效的固定预览哈希。'));
+      State.kineticsPreviewSha = previewSha;
+      const names = (Array.isArray(result.artifacts) ? result.artifacts : [])
+        .map(item => String(item && item.name || '')).filter(Boolean).join(', ');
+      kineticsOperation(`${tr('analysis.kinetic.preview_ready',
+        '预览已冻结；请核对后明确确认。')} ${names}`, 'ok');
+      renderAll(); return true;
+    } catch (error) {
+      if (intent !== State.intentGeneration) return false;
+      State.kineticsPreviewSha = '';
+      kineticsOperation(error && error.message || String(error), 'bad'); return false;
+    } finally { endBusy(busyToken); }
+  }
+
+  async function confirmKineticsExport() {
+    const previewSha = State.kineticsPreviewSha;
+    if (State.busy || State.analysisId !== 'kinetic-dashboard' ||
+        !/^[a-f0-9]{64}$/.test(previewSha) || !sameProject(State.projectId)) return false;
+    if (!window.confirm(tr('analysis.kinetic.confirm_prompt',
+      '确认导出当前预览中已冻结的输入、适配器、版本与哈希？'))) {
+      kineticsOperation(tr('analysis.kinetic.confirm_cancelled', '已取消导出确认。')); return false;
+    }
+    const projectId = State.projectId; const intent = ++State.intentGeneration;
+    const busyToken = beginBusy();
+    kineticsOperation(tr('analysis.kinetic.confirm_loading', '正在发布固定导出包…'), 'busy');
+    renderAll();
+    try {
+      const result = await VCS.call(
+        'kinetics_export_confirm', projectId, previewSha, true);
+      if (intent !== State.intentGeneration || !sameProject(projectId)) return false;
+      if (!result || result.ok === false || result.error) throw new Error(result && result.error || tr(
+        'analysis.kinetic.confirm_failed', '固定导出包发布失败。'));
+      if (safeId(result.project_id) !== projectId) throw new Error(tr(
+        'analysis.error.project_mismatch', '分析结果项目身份与当前项目不一致'));
+      State.kineticsPreviewSha = '';
+      kineticsOperation(tr('analysis.kinetic.confirmed',
+        '已发布固定导出包；应用未执行 CatMAP。'), 'ok');
+      return true;
+    } catch (error) {
+      if (intent !== State.intentGeneration) return false;
+      kineticsOperation(error && error.message || String(error), 'bad'); return false;
+    } finally { endBusy(busyToken); }
+  }
+
+  async function importKineticsResult(event) {
+    const input = event && event.target; const file = input && input.files && input.files[0];
+    if (!file || State.busy || State.analysisId !== 'kinetic-dashboard' ||
+        !sameProject(State.projectId)) return false;
+    const maxBytes = 20 * 1024 * 1024;
+    if (!Number.isFinite(file.size) || file.size < 1 || file.size > maxBytes) {
+      kineticsOperation(tr('analysis.kinetic.result_size_invalid',
+        '结果 JSON 必须非空且不超过 20 MiB。'), 'bad'); input.value = ''; return false;
+    }
+    const projectId = State.projectId; const intent = ++State.intentGeneration;
+    const busyToken = beginBusy(); let imported = false;
+    kineticsOperation(tr('analysis.kinetic.import_loading',
+      '正在由服务端校验 schema、单位与冻结输入哈希…'), 'busy'); renderAll();
+    try {
+      const resultObject = JSON.parse(await file.text());
+      if (!resultObject || typeof resultObject !== 'object' || Array.isArray(resultObject)) {
+        throw new Error(tr('analysis.kinetic.result_object_required',
+          '结果 JSON 顶层必须是对象。'));
+      }
+      const result = await VCS.call('kinetics_result_import', projectId, resultObject);
+      if (intent !== State.intentGeneration || !sameProject(projectId)) return false;
+      if (!result || result.ok === false || result.error) throw new Error(result && result.error || tr(
+        'analysis.kinetic.import_failed', '动力学结果导入失败。'));
+      if (safeId(result.project_id) !== projectId) throw new Error(tr(
+        'analysis.error.project_mismatch', '分析结果项目身份与当前项目不一致'));
+      kineticsOperation(tr('analysis.kinetic.imported',
+        '结果已校验并保存为 diagnostic；正在刷新 Dashboard。'), 'ok');
+      imported = true;
+    } catch (error) {
+      if (intent === State.intentGeneration) {
+        kineticsOperation(error && error.message || String(error), 'bad');
+      }
+    } finally {
+      input.value = ''; endBusy(busyToken);
+    }
+    if (imported) return previewCurrent();
+    return false;
+  }
+
   async function loadBootstrap(analysisId) {
     const project = currentProject(); const id = projectIdentity(project);
     if (!id) { showAlert(tr('analysis.bootstrap.project_missing', '当前项目尚未加载。请先从全局项目栏选择项目。'));
       operation(tr('analysis.bootstrap.waiting_context', '等待项目上下文。'), 'bad'); return false; }
     const intent = ++State.intentGeneration; const generation = ++State.bootstrapGeneration;
     State.previewGeneration += 1; const busyToken = beginBusy();
+    State.kineticsPreviewSha = '';
     State.projectId = id;
     State.analysisId = safeId(analysisId) || 'adsorption-energy'; showAlert('');
     operation(tr('analysis.bootstrap.loading', '正在读取分析注册表与项目证据…'), 'busy'); renderAll();
@@ -745,6 +1018,15 @@
     if ($('aw-refresh')) $('aw-refresh').addEventListener('click', previewCurrent);
     if ($('aw-save-view')) $('aw-save-view').addEventListener('click', saveView);
     if ($('aw-favorite')) $('aw-favorite').addEventListener('click', toggleFavorite);
+    if ($('aw-kinetics-preview-export')) {
+      $('aw-kinetics-preview-export').addEventListener('click', previewKineticsExport);
+    }
+    if ($('aw-kinetics-confirm-export')) {
+      $('aw-kinetics-confirm-export').addEventListener('click', confirmKineticsExport);
+    }
+    if ($('aw-kinetics-result-file')) {
+      $('aw-kinetics-result-file').addEventListener('change', importKineticsResult);
+    }
     document.addEventListener('vcs:route', event => {
       if (event.detail && event.detail.page === 'analysis-workbench') enterWorkbench(event.detail);
     });
@@ -762,6 +1044,8 @@
   if (window.__VCS_TEST__ === true) {
     window.__VCS_ANALYSIS_TEST__ = Object.freeze({
       renderRegistry,
+      renderKineticDashboard,
+      renderSensitivity,
       configure({ catalog = null, preferences = null, analysisId = '', busy = false } = {}) {
         State.catalog = clone(catalog);
         State.preferences = clone(preferences) || {};

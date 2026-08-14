@@ -67,7 +67,9 @@ _ANALYSES = (
         "page": "analysis-workbench",
         "task_keys": ["adsorption_project", "relax", "static"],
         "data_modes": ["stable", "all"],
-        "parameters": ["precision", "near_degenerate_eV", "sort"],
+        "parameters": [
+            "precision", "near_degenerate_eV", "missing_policy", "sort",
+        ],
         "sort_keys": ["species", "energy", "name", "state"],
         "evidence": ["reference_state", "method_consistency", "energy_source"],
         "outputs": ["configuration_table", "near_degenerate_groups", "adsorption_bar"],
@@ -91,6 +93,33 @@ _ANALYSES = (
         "evidence": ["reaction_path", "thermochemistry", "solvation", "reference"],
         "outputs": ["free_energy_ladder", "pds", "limiting_potential"],
         "report_sections": ["key_findings", "figures", "methods", "limitations"],
+        "supports_baseline": False,
+        "supports_sensitivity": False,
+    },
+    {
+        "id": "kinetic-dashboard",
+        "version": "1",
+        "category": "thermodynamics-kinetics",
+        "label_zh": "微观动力学 Dashboard",
+        "label_en": "Microkinetic Dashboard",
+        "description_zh": "审计冻结反应网络，并只读展示外部 CatMAP 的服务端归一化结果。",
+        "route": "analyze-kinetics",
+        "page": "analysis-workbench",
+        "task_keys": ["neb", "dimer", "freq"],
+        "data_modes": ["stable"],
+        "parameters": ["precision"],
+        "sort_keys": [],
+        "evidence": [
+            "frozen_reaction_projection", "element_charge_site_balance",
+            "forward_reverse_barriers", "detailed_balance", "standard_state",
+            "method_consistency", "prefactor_bep_scaling_provenance", "uncertainty",
+        ],
+        "outputs": [
+            "turnover_frequency", "coverage", "selectivity", "rate_control",
+            "selectivity_control", "reaction_order", "apparent_activation_energy",
+            "free_energy_diagram", "convergence", "sensitivity",
+        ],
+        "report_sections": ["methods", "limitations"],
         "supports_baseline": False,
         "supports_sensitivity": False,
     },
@@ -206,6 +235,9 @@ _ANALYSIS_BY_ID = {record["id"]: record for record in _ANALYSES}
 _NEXT_ACTIONS = {
     "adsorption-energy": "Complete project member energies and reference evidence, then refresh.",
     "free-energy-path": "Use an explicit Li-S work mode and complete its reaction-path evidence.",
+    "kinetic-dashboard": (
+        "Provide a frozen reaction/thermochemistry projection, configure an external "
+        "CatMAP adapter, and import a hash-matched diagnostic result."),
     "task-results": "Complete a registered project member or descendant job, then refresh.",
     "electronic-structure": "Create and complete a DOS/PDOS, bands, or work-function descendant job.",
     "charge-wavefunction": "Create and complete a Bader or charge-difference descendant job.",
@@ -361,13 +393,27 @@ class AnalysisSpec:
     @property
     def semantic_sha256(self) -> str:
         payload = self.to_dict()
+        # ``view_id`` names a user-interface preset; it is not a scientific or
+        # presentation value and must never manufacture a new data identity.
+        payload.pop("view_id", None)
         capability = _ANALYSIS_BY_ID.get(self.analysis_id)
-        if capability is not None and "sort" not in capability["parameters"]:
+        parameters = set((capability or {}).get("parameters") or ())
+        if capability is not None and "sort" not in parameters:
             # ``sort`` remains in the wire-compatible canonical spec, but it
             # has no scientific or presentation meaning for this analysis.
             # Excluding it here prevents a manually constructed stale spec
             # from manufacturing a distinct semantic identity.
             payload.pop("sort", None)
+        for field, parameter in (
+                ("near_degenerate_eV", "near_degenerate_eV"),
+                ("missing_policy", "missing_policy"),
+                ("sensitivity_deadbands_eV", "sensitivity_deadbands_eV")):
+            if capability is not None and parameter not in parameters:
+                payload.pop(field, None)
+        if capability is not None and not capability["supports_baseline"]:
+            payload.pop("baseline_project_id", None)
+        if self.analysis_id != "multi-project-comparison":
+            payload.pop("comparison_project_ids", None)
         return hashlib.sha256(_canonical_bytes(payload)).hexdigest()
 
 
@@ -404,6 +450,10 @@ def normalize_analysis_request(
     data_mode = _enum(
         data.get("data_mode", capability["data_modes"][0]),
         field="data_mode", allowed=capability["data_modes"])
+    if ("near_degenerate_eV" in data
+            and "near_degenerate_eV" not in capability["parameters"]):
+        raise AnalysisRequestError(
+            "this analysis does not support near_degenerate_eV")
     deadband = _bounded_number(
         data.get("near_degenerate_eV", 0.15), field="near_degenerate_eV",
         minimum=0.0, maximum=1.0)
@@ -428,6 +478,10 @@ def normalize_analysis_request(
             raise AnalysisRequestError("this analysis does not support a baseline")
         if baseline not in comparison_ids:
             raise AnalysisRequestError("baseline_project_id must be in comparison_project_ids")
+    if ("missing_policy" in data
+            and "missing_policy" not in capability["parameters"]):
+        raise AnalysisRequestError(
+            "this analysis does not support missing_policy")
     missing_policy = _enum(
         data.get("missing_policy", "show_missing"), field="missing_policy",
         allowed=MISSING_POLICIES)

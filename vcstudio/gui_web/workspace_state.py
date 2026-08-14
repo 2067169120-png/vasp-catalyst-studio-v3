@@ -290,6 +290,7 @@ def _parse_route_hash(route_hash: str) -> tuple[str, set[str]]:
         analysis_views = {
             "adsorption": "analyze-energy",
             "thermo": "analyze-thermo",
+            "kinetics": "analyze-kinetics",
             "electronic": "analyze-electronic",
             "charge": "analyze-charge",
             "comparison": "analyze-comparison",

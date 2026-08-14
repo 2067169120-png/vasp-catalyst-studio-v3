@@ -41,6 +41,7 @@ def test_catmap_table_and_mkm_follow_fixed_data_only_contract():
     assert "CO_s + O_s <-> COO_ts_s + *_s -> CO2_g + *_s + *_s" in model
     assert "input_file = 'energetics.tsv'" in model
     assert "output_variables" in model
+    assert "prefactor_list = ['10000000000000']" in model
     assert all(token not in model for token in (
         "import ", "subprocess", "os.system", "eval(", "exec(", "__import__",
     ))
@@ -101,6 +102,10 @@ def test_confirm_writes_frozen_bundle_only_after_matching_preview(tmp_path):
     for item in manifest["artifacts"]:
         data = (export_dir / item["name"]).read_bytes()
         assert hashlib.sha256(data).hexdigest() == item["sha256"]
+    verified = catmap_adapter.load_confirmed_manifest(
+        project, network["input_sha256"])
+    assert verified["adapter"]["id"] == catmap_adapter.ADAPTER_ID
+    assert verified["tool"]["sha256"] is None
 
 
 def test_preview_token_binds_network_adapter_tool_and_artifact_hashes(tmp_path):
@@ -127,6 +132,47 @@ def test_failed_audit_still_exports_audit_report_but_not_catmap_inputs():
     assert bundle["preview_token"]
 
 
+@pytest.mark.parametrize("mutate,reason", [
+    (
+        lambda network: (
+            network["methodology"].update({"potential_model": "che"}),
+            network["standard_state"].update({
+                "potential": {"value": 0.0, "unit": "V", "reference": "RHE"},
+            }),
+            network["operating_range"].update({"potential_V": [-1.0, 1.0]}),
+        ),
+        "electrochemical potential",
+    ),
+    (
+        lambda network: network["elementary_steps"][0]["prefactors"][
+            "reverse"].update({"value": 2.0e13}),
+        "equal forward/reverse",
+    ),
+    (
+        lambda network: network["methodology"].update({
+            "energy_basis": "electronic_plus_corrections",
+        }),
+        "frozen Gibbs",
+    ),
+])
+def test_valid_but_unencoded_catmap_features_fail_closed_to_audit_only(
+        mutate, reason):
+    network = frozen_network()
+    mutate(network)
+    network["input_sha256"] = kinetics.compute_input_sha256(network)
+    assert kinetics.audit_network(network)["machine_pass"] is True
+
+    bundle = catmap_adapter.build_export_bundle(network, tool_path=None)
+
+    assert bundle["export_ready"] is False
+    assert bundle["adapter_issues"][0]["code"] == (
+        "CATMAP_PHASE1_CONTRACT_UNSUPPORTED")
+    assert reason in bundle["adapter_issues"][0]["message"]
+    assert set(bundle["files"]) == {
+        "kinetics-audit.json", "catmap-adapter-audit.json",
+    }
+
+
 def test_export_identifiers_cannot_inject_python_or_tsv_rows():
     network = frozen_network()
     network["species"][0]["id"] = "CO_g\n__import__('os').system('whoami')"
@@ -136,3 +182,81 @@ def test_export_identifiers_cannot_inject_python_or_tsv_rows():
 
     assert bundle["audit"]["export_ready"] is False
     assert set(bundle["files"]) == {"kinetics-audit.json"}
+
+
+def test_confirmed_manifest_rejects_artifact_tampering(tmp_path):
+    network = frozen_network()
+    preview = catmap_adapter.preview_export(network, tool_path=None)
+    confirmed = catmap_adapter.confirm_export(
+        network, tmp_path, preview["preview_token"], confirmed=True)
+    export_dir = Path(confirmed["export_dir"])
+    (export_dir / "model.mkm").write_text("tampered", encoding="utf-8")
+
+    with pytest.raises(catmap_adapter.CatmapAdapterError, match="artifact (size|hash)"):
+        catmap_adapter.load_confirmed_manifest(tmp_path, network["input_sha256"])
+
+
+def test_export_rejects_symlinked_directory_chain(tmp_path):
+    project = tmp_path / "project"
+    outside = tmp_path / "outside"
+    project.mkdir()
+    outside.mkdir()
+    link = project / ".vcstudio"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    network = frozen_network()
+    preview = catmap_adapter.preview_export(network, tool_path=None)
+
+    with pytest.raises(catmap_adapter.CatmapAdapterError, match="symlink"):
+        catmap_adapter.confirm_export(
+            network, project, preview["preview_token"], confirmed=True)
+    assert not any(outside.iterdir())
+
+
+def test_confirmed_export_rejects_directory_swap_to_external_symlink(tmp_path):
+    project = tmp_path / "project"
+    outside = tmp_path / "outside"
+    project.mkdir()
+    outside.mkdir()
+    network = frozen_network()
+    preview = catmap_adapter.preview_export(network, tool_path=None)
+    confirmed = catmap_adapter.confirm_export(
+        network, project, preview["preview_token"], confirmed=True)
+    export_dir = Path(confirmed["export_dir"])
+    moved = outside / export_dir.name
+    export_dir.rename(moved)
+    try:
+        export_dir.symlink_to(moved, target_is_directory=True)
+    except OSError as exc:
+        moved.rename(export_dir)
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    with pytest.raises(catmap_adapter.CatmapAdapterError, match="unavailable"):
+        catmap_adapter.load_confirmed_manifest(project, network["input_sha256"])
+
+
+def test_confirmed_manifest_and_artifacts_have_hard_size_limits(tmp_path):
+    network = frozen_network()
+    preview = catmap_adapter.preview_export(network, tool_path=None)
+    confirmed = catmap_adapter.confirm_export(
+        network, tmp_path, preview["preview_token"], confirmed=True)
+    manifest = Path(confirmed["export_dir"]) / "manifest.json"
+    manifest.write_bytes(b"{" + b" " * (1024 * 1024) + b"}")
+
+    with pytest.raises(catmap_adapter.CatmapAdapterError, match="size limit"):
+        catmap_adapter.load_confirmed_manifest(tmp_path, network["input_sha256"])
+
+
+def test_windows_junctions_are_classified_as_links():
+    class JunctionLike:
+        @staticmethod
+        def is_symlink():
+            return False
+
+        @staticmethod
+        def is_junction():
+            return True
+
+    assert catmap_adapter._is_link(JunctionLike()) is True
