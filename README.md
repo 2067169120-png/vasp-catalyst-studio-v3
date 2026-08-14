@@ -36,6 +36,7 @@ The deterministic core runs locally and over user-configured SSH connections. Ex
 | Run / Jobs | Selection Tray、包含筛选后隐藏项的 Batch Review、统一 Operation Queue、提交/续算/取消幂等键 | 一次只运行一个互斥批操作；重复请求不会再次执行远程副作用；资源预测只读且不授权提交 |
 | Analyze | capability cards；Task Results；DOS/PDOS、Bands、功函数、Bader、差分电荷、ELF 分布摘要；Property calculators | 只显示服务端解析器给出的数值、来源 hash 和分母。ELF 解析严格校验 ELFCAR 主网格并仅给分布统计，不据此宣称成键、盆、临界点或拓扑结论 |
 | Analyze / Governance | 下一步计算建议与确认后的只读 draft intent | 只从绑定当前数据指纹、经人工科学复核的 ValidationResult 和冻结分析信号派生；不含命令，不授权或自动提交作业 |
+| Home / Project · Research Explorer | 跨项目元素/化学式、facet、adsorbate、任务、状态、方法、证据、能量/能垒筛选；表格、histogram、scatter、元素周期表聚合和 live provenance | 索引只读派生且可重建，不是事实源；默认只保留一个方法兼容 cohort，散点不静默混方法；partial/stale/unavailable 时扣留科学 DTO；保存视图只写 filters/sort/axes，并受 authority_id + revision CAS 约束 |
 | Publish | revision scientific diff、Evidence/Claim Graph、确定性 SI capsule | 每次从权威历史重新校验冻结 revision；缺失证据边显式标记。capsule 去除密钥/绝对路径、不覆盖已有文件；生成 diagnostic capsule 不等于科学 final |
 | Home / Resume Center | 恢复当前会话的设置、导入流程和报告配置草稿入口 | 恢复的是有界草稿引用和权威持久状态，不把浏览器草稿提升为项目事实或已发布报告 |
 | Environment / Jobs | 实验室策略模板和基于台账/manifest 的资源预测 | 都是建议；策略必须显式确认且不改写旧作业，预测缺证据时保持 unavailable/低置信度，二者都不能旁路提交确认和幂等门禁 |
@@ -104,6 +105,25 @@ Multiwfn 的当前注册表包含 14 个分析入口；UI 菜单以该注册表�
 - 不同结构、参考态、计算方法、赝势、k 点、单位或引擎之间的比较需要相应一致性证据。
 
 真实 MAE、真实文献复现完成度和投稿/接收状态目前保持 `UNKNOWN`，不得从自动化测试、合成示例或文件生成成功推断。验证计划见 [docs/validation.md](docs/validation.md)。
+
+## 跨项目 Research Explorer
+
+Home 与 Project 复用同一个 Research Explorer 组件，不新增第 33 个语义路由。后端从项目注册表、
+`project.yaml`、每个成员的 `job.yaml`、manifest 结果与 validation 记录构建内存索引；索引可随时
+重建，不会回写上述文件，也不会替代它们成为第二事实源。
+
+- 支持元素/化学式、facet、adsorbate、任务、状态、方法指纹、证据等级以及能量/能垒范围筛选；
+- 服务端完成稳定排序、分页 cursor、单位/缺失值/样本分母、histogram bins、scatter 坐标和
+  periodic-table 聚合，浏览器只渲染 DTO；
+- 默认只选择一个方法兼容 cohort。用户显式关闭兼容过滤后可以查看混合表格，但多方法散点会
+  `blocked_mixed_or_unverified_methods`，不会把不同或未验证的方法静默画在一起；
+- 索引 freshness、注册项目分母、成功/失败来源数均公开；`partial`、`stale`、`unavailable` 时
+  fail closed，扣留科学表格与聚合，直到成功重建；
+- drill-down 只使用 opaque project/job/source ID。live provenance 将 input、job、repair/resume、
+  parser、analysis、validation、report 分成 data/logical 两层，并标注
+  `observed/imported/inferred/missing`；Publish 的 frozen Evidence Graph 仍是单独的 revision 工具；
+- 保存的 research view 仅含有界名称、filters、sort、axes，通过 `authority_id + revision` CAS
+  更新；不保存路径、密钥、结果行或任意正文。
 
 ## 报告合同
 

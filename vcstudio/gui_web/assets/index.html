@@ -6,6 +6,7 @@
 <title>VASP Catalyst Studio</title>
 <link rel="stylesheet" href="app.css">
 <link rel="stylesheet" href="analysis-workbench.css">
+<link rel="stylesheet" href="research-explorer.css">
 <link rel="stylesheet" href="report-workbench.css">
 <script>/* 外观先粉刷防闪烁；只接受固定白名单，桥就绪后 app.js 再从 config 校准。 */
 try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].indexOf(_t)>=0)document.documentElement.dataset.theme=_t;var _d=localStorage.getItem('vcs.density');document.documentElement.dataset.density=['comfortable','standard','compact'].indexOf(_d)>=0?_d:'standard';}catch(e){document.documentElement.dataset.density='standard';}</script>
@@ -467,6 +468,15 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
       </div>
       <div class="start-note">推荐直接选择包含多个计算子目录的根文件夹；识别不确定时，软件只会请你确认角色，不会替你猜科学含义。</div>
     </div>
+
+    <section class="card research-explorer-host" data-research-explorer-host="home"
+      aria-labelledby="rex-home-title">
+      <div class="research-explorer-fallback">
+        <span class="research-explorer-kicker">Research Explorer</span>
+        <h2 id="rex-home-title">跨项目研究浏览器</h2>
+        <p>正在从本地权威 registry、project.yaml 与 job.yaml 构建可重建只读索引…</p>
+      </div>
+    </section>
 
     <!-- 取数失败错误条(不再假装 0 作业) -->
     <div class="errbar" id="db-error" hidden></div>
@@ -1255,6 +1265,15 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
       <h1>计算与结果分析</h1>
       <span class="stats">按工作模式只显示本次计算需要的分析与报告工具</span>
     </div>
+
+    <section class="card research-explorer-host" data-research-explorer-host="project"
+      aria-labelledby="rex-project-title">
+      <div class="research-explorer-fallback">
+        <span class="research-explorer-kicker">Research Explorer</span>
+        <h2 id="rex-project-title">跨项目研究浏览器</h2>
+        <p>按项目、作业、方法与证据浏览；所有科学数值和聚合均由服务端定稿。</p>
+      </div>
+    </section>
 
     <!-- 吸附能为默认主流程；其它结果工具保留给专家。 -->
     <div class="card project-empty-hub" id="project-empty-hub" aria-live="polite">
@@ -3121,6 +3140,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
 <script src="cluster.js"></script>
 <script src="generate.js"></script>
 <script src="project.js"></script>
+<script src="research-explorer.js"></script>
 <script src="analysis-workbench.js"></script>
 <script src="report-workbench.js"></script>
 <script src="dashboard.js"></script>

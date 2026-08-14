@@ -261,6 +261,7 @@ class Api:
                  comparison_mod=None, candidate_evaluation_mod=None,
                  paper_report_mod=None, workspace_state_store=None,
                  report_service=None, analysis_preferences_store=None,
+                 research_index_service=None, research_view_store=None,
                  project_lifecycle_service=None, lab_policy_store=None,
                  workspace_context_store=None):
         from vcstudio.cluster import profiles as _p
@@ -389,6 +390,11 @@ class Api:
         # Phase D reusable analysis templates/favourites are user-level state,
         # never project.yaml fields.  Keep the store lazy for normal job paths.
         self._analysis_preferences_store = analysis_preferences_store
+        # Cross-project research discovery is a rebuildable in-memory read
+        # model; saved filters live in their own authority_id + revision CAS
+        # store.  Neither is a project/job/report fact source.
+        self._research_index_service = research_index_service
+        self._research_view_store = research_view_store
         # Confirmed laboratory recommendations are user-level state.  They do
         # not mutate job manifests or grant submission authority.
         self._lab_policy_store = lab_policy_store
@@ -7409,6 +7415,187 @@ class Api:
             return self._analysis_workbench_public_value(result)
         except Exception as exc:                         # noqa: BLE001 public bridge
             return self._analysis_preferences_failure(exc)
+
+    def _research_index(self):
+        if self._research_index_service is None:
+            from vcstudio.project.research_explorer import ResearchIndexService
+
+            self._research_index_service = ResearchIndexService()
+        return self._research_index_service
+
+    def _research_views(self):
+        if self._research_view_store is None:
+            from vcstudio.project.research_views import ResearchViewStore
+
+            self._research_view_store = ResearchViewStore()
+        return self._research_view_store
+
+    def _research_source_version(self, records):
+        """Fingerprint source-file versions without returning their locators."""
+        rows = []
+        for record in records:
+            project_id = str(record.get('project_id') or '')
+            project = record.get('project') or {}
+            candidates = [('project.yaml', record.get('path'))]
+            for member in self._project_member_dirs(project):
+                candidates.extend((name, os.path.join(member, name)) for name in (
+                    'job.yaml', 'INCAR', 'POSCAR', 'KPOINTS', 'POTCAR',
+                    'OSZICAR', 'OUTCAR', 'vasprun.xml', 'validation.json',
+                    'validation.yaml'))
+            reference_jobs = project.get('species_ref_jobs') or {}
+            if isinstance(reference_jobs, dict):
+                for member in reference_jobs.values():
+                    candidates.extend((name, os.path.join(str(member), name)) for name in (
+                        'job.yaml', 'INCAR', 'POSCAR', 'KPOINTS', 'POTCAR',
+                        'OSZICAR', 'OUTCAR', 'vasprun.xml', 'validation.json',
+                        'validation.yaml'))
+            seen = set()
+            member_index = 0
+            for kind, raw_path in candidates:
+                if not raw_path:
+                    continue
+                try:
+                    path = self._canonical_project_path(raw_path)
+                except Exception:                         # noqa: BLE001 unreadable source
+                    continue
+                key = self._workspace_path_key(path)
+                if key in seen:
+                    continue
+                seen.add(key)
+                member_index += 1
+                try:
+                    stat = os.stat(path)
+                    rows.append({
+                        'project_id': project_id, 'source_index': member_index,
+                        'kind': kind, 'size': int(stat.st_size),
+                        'mtime_ns': int(stat.st_mtime_ns), 'available': True,
+                    })
+                except OSError:
+                    rows.append({
+                        'project_id': project_id, 'source_index': member_index,
+                        'kind': kind, 'size': None, 'mtime_ns': None,
+                        'available': False,
+                    })
+        return rows
+
+    def _research_authority(self):
+        snapshot = self._project_registry_snapshot()
+        failures = copy.deepcopy(snapshot['failures'])
+        failures.extend({
+            'project_ref': f'ambiguous-project-{index}',
+            'code': 'duplicate_project_id',
+            'message': 'Registered project identity is ambiguous.',
+        } for index, _project_id in enumerate(
+            sorted(snapshot['duplicate_ids']), start=1))
+        records = [
+            record for record in snapshot['records']
+            if record['project_id'] not in snapshot['duplicate_ids']
+        ]
+        return snapshot, records, failures, self._research_source_version(records)
+
+    def _research_prepare(self, *, force=False):
+        snapshot, records, failures, source_version = self._research_authority()
+        service = self._research_index()
+        fingerprint = service.source_fingerprint(
+            records, registry_total=snapshot['registered_total'],
+            registry_failures=failures, source_version=source_version)
+        current = service.index_status()
+        if (force or current.get('status') in {'unavailable', 'stale'}
+                or current.get('source_fingerprint') != fingerprint):
+            service.rebuild(
+                records,
+                manifest_loader=self._manifest.load_manifest,
+                summary_loader=self._adsorption.delta_e_rows,
+                job_id_resolver=self._workspace_job_id,
+                method_resolver=self._analysis_workbench_method_evidence,
+                registry_total=snapshot['registered_total'],
+                registry_failures=failures,
+                source_version=source_version,
+            )
+        return service
+
+    @classmethod
+    def _research_failure(cls, exc, *, schema='vcstudio.research-query/v1'):
+        return cls._analysis_workbench_public_value({
+            'ok': False, 'schema': schema, 'status': 'unavailable',
+            'error': str(exc),
+        })
+
+    def research_explorer_query(self, request=None):
+        try:
+            result = self._research_prepare().query(request)
+            return self._analysis_workbench_public_value(result)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return self._research_failure(exc)
+
+    def research_explorer_rebuild(self, request=None):
+        """Explicitly rebuild the derived index; never mutate scientific sources."""
+        try:
+            result = self._research_prepare(force=True).query(request)
+            result['rebuild'] = {
+                'performed': True, 'fact_source_changed': False,
+                'remote_side_effects': False,
+            }
+            return self._analysis_workbench_public_value(result)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return self._research_failure(exc)
+
+    def research_explorer_bootstrap(self):
+        try:
+            result = self._research_prepare().query()
+            result['saved_views'] = self._research_views().read()
+            result['contracts'] = {
+                'index_is_authority': False,
+                'scientific_values_server_finalized': True,
+                'default_method_compatible': True,
+                'live_graph_kind': 'live_derived',
+                'frozen_report_graph_separate': True,
+            }
+            return self._analysis_workbench_public_value(result)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return self._research_failure(exc)
+
+    def research_explorer_provenance(self, project_id, job_id=None, source_id=None):
+        try:
+            record = self._resolve_project_id(project_id)
+
+            def build():
+                return self._research_index().live_provenance(
+                    record['request_project_id'], job_id=job_id, source_id=source_id)
+
+            self._research_prepare()
+            result = self._call_with_project_bindings([record], build)
+            return self._analysis_workbench_public_value(result)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return self._research_failure(
+                exc, schema='vcstudio.live-provenance/v1')
+
+    def research_views_read(self):
+        try:
+            return self._analysis_workbench_public_value(self._research_views().read())
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return self._research_failure(
+                exc, schema='vcstudio.research-views/v1')
+
+    def research_view_save(self, view, authority_id, expected_revision):
+        try:
+            result = self._research_views().save(
+                view, authority_id=authority_id,
+                expected_revision=expected_revision)
+            return self._analysis_workbench_public_value(result)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return self._research_failure(
+                exc, schema='vcstudio.research-views/v1')
+
+    def research_view_delete(self, view_id, authority_id, expected_revision):
+        try:
+            result = self._research_views().delete(
+                view_id, authority_id=authority_id,
+                expected_revision=expected_revision)
+            return self._analysis_workbench_public_value(result)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return self._research_failure(
+                exc, schema='vcstudio.research-views/v1')
 
     def _analysis_workbench_current_project(self, context):
         project = context['project']
