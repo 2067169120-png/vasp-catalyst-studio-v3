@@ -81,18 +81,29 @@ _ANALYSES = (
         "category": "thermodynamics-kinetics",
         "label_zh": "自由能与反应路径",
         "label_en": "Free-energy and reaction pathway",
-        "description_zh": "检查步骤、热校正、溶剂和参比口径后展示自由能台阶。",
+        "description_zh": "从 canonical 催化对象投影构建反应图、热化学账本、条件派生修订与冻结网络。",
         "route": "analyze-thermo",
         "page": "analysis-workbench",
         "task_keys": ["freq", "neb", "dimer", "aimd"],
         "data_modes": ["stable"],
-        "parameters": ["precision"],
+        "parameters": ["precision", "conditions"],
         "sort_keys": [],
-        "evidence": ["reaction_path", "thermochemistry", "solvation", "reference"],
-        "outputs": ["free_energy_ladder", "pds", "limiting_potential"],
-        "report_sections": ["key_findings", "figures", "methods", "limitations"],
+        "evidence": [
+            "canonical_domain_projection", "reaction_topology", "thermochemistry",
+            "frequency_mode", "condition_set", "applicability", "reference",
+        ],
+        "outputs": [
+            "reaction_graph", "thermochemistry_ledger",
+            "condition_derived_revision", "parameter_sensitivity",
+            "frozen_reaction_network",
+        ],
+        "report_sections": [
+            "reaction_map", "thermochemistry_ledger", "figures",
+            "methods", "limitations",
+        ],
         "supports_baseline": False,
         "supports_sensitivity": False,
+        "supports_parameter_sensitivity": True,
     },
     {
         "id": "task-results",
@@ -336,6 +347,7 @@ class AnalysisSpec:
     sort_key: str = "species"
     sort_direction: str = "asc"
     sensitivity_deadbands_eV: tuple[float, ...] = (0.10, 0.15, 0.20)
+    conditions: tuple[tuple[str, float], ...] = ()
     view_id: str | None = None
 
     @property
@@ -343,7 +355,7 @@ class AnalysisSpec:
         return SPEC_SCHEMA
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "schema": self.schema,
             "analysis_id": self.analysis_id,
             "project_id": self.project_id,
@@ -357,6 +369,9 @@ class AnalysisSpec:
             "sensitivity_deadbands_eV": list(self.sensitivity_deadbands_eV),
             "view_id": self.view_id,
         }
+        if self.analysis_id == "free-energy-path":
+            result["conditions"] = dict(self.conditions)
+        return result
 
     @property
     def semantic_sha256(self) -> str:
@@ -375,7 +390,39 @@ _REQUEST_KEYS = frozenset({
     "schema", "analysis_id", "project_id", "comparison_project_ids",
     "data_mode", "near_degenerate_eV", "precision", "baseline_project_id",
     "missing_policy", "sort", "sensitivity_deadbands_eV", "view_id",
+    "conditions",
 })
+
+
+_CONDITION_RANGES = {
+    "temperature_k": (1.0, 5000.0),
+    "pressure_pa": (1e-12, 1e12),
+    "ph": (-5.0, 20.0),
+    "electrode_potential_v": (-20.0, 20.0),
+    "coverage": (0.0, 1.0),
+}
+
+
+def _condition_values(value: Any, *, supported: bool) -> tuple[tuple[str, float], ...]:
+    if value is None:
+        return ()
+    if not supported:
+        raise AnalysisRequestError("conditions are only supported by free-energy-path")
+    if not isinstance(value, Mapping):
+        raise AnalysisRequestError("conditions must be an object")
+    unknown = set(value) - set(_CONDITION_RANGES)
+    if unknown:
+        raise AnalysisRequestError(
+            "conditions contains unknown fields: " + ", ".join(sorted(unknown)))
+    result = []
+    for key in sorted(value):
+        raw = value[key]
+        if raw in (None, ""):
+            continue
+        lower, upper = _CONDITION_RANGES[key]
+        result.append((key, _bounded_number(
+            raw, field=f"conditions.{key}", minimum=lower, maximum=upper)))
+    return tuple(result)
 
 
 def normalize_analysis_request(
@@ -463,6 +510,8 @@ def normalize_analysis_request(
         raise AnalysisRequestError("this analysis does not support sensitivity options")
     view_id = _safe_identifier(
         data.get("view_id"), field="view_id", optional=True)
+    conditions = _condition_values(
+        data.get("conditions"), supported=analysis_id == "free-energy-path")
     return AnalysisSpec(
         analysis_id=analysis_id,
         project_id=server_project_id,
@@ -475,6 +524,7 @@ def normalize_analysis_request(
         sort_key=sort_key,
         sort_direction=sort_direction,
         sensitivity_deadbands_eV=sensitivity,
+        conditions=conditions,
         view_id=view_id,
     )
 
@@ -543,6 +593,10 @@ def analysis_catalog() -> dict[str, Any]:
             "near_degenerate_eV": {"minimum": 0.0, "maximum": 1.0},
             "comparison_projects": 32,
             "sensitivity_points": 16,
+            "conditions": {
+                key: {"minimum": bounds[0], "maximum": bounds[1]}
+                for key, bounds in _CONDITION_RANGES.items()
+            },
         },
     }
 

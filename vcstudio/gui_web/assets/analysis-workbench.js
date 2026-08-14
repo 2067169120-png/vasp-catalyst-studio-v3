@@ -126,6 +126,19 @@
       request.comparison_project_ids = selected;
       request.baseline_project_id = safeId($('aw-baseline') && $('aw-baseline').value) || null;
     }
+    if (State.analysisId === 'free-energy-path' && parameters.includes('conditions')) {
+      const conditions = {};
+      [
+        ['aw-temperature', 'temperature_k'], ['aw-pressure', 'pressure_pa'],
+        ['aw-ph', 'ph'], ['aw-potential', 'electrode_potential_v'],
+        ['aw-coverage', 'coverage'],
+      ].forEach(([id, key]) => {
+        const raw = $(id) && String($(id).value || '').trim();
+        if (!raw) return;
+        const value = Number(raw); if (Number.isFinite(value)) conditions[key] = value;
+      });
+      request.conditions = conditions;
+    }
     return request;
   }
 
@@ -254,11 +267,24 @@
     const sortKeys = supportsSort && Array.isArray(record && record.sort_keys) ? record.sort_keys : [];
     replaceOptions($('aw-sort-key'), sortKeys.map(id => ({ id, label: id })), plain(spec.sort).key);
     if ($('aw-sort-direction')) $('aw-sort-direction').value = String(plain(spec.sort).direction || 'asc');
+    const conditions = plain(spec.conditions);
+    [
+      ['aw-temperature', 'temperature_k'], ['aw-pressure', 'pressure_pa'],
+      ['aw-ph', 'ph'], ['aw-potential', 'electrode_potential_v'],
+      ['aw-coverage', 'coverage'],
+    ].forEach(([id, key]) => {
+      if ($(id)) $(id).value = conditions[key] == null ? '' : String(conditions[key]);
+    });
     renderProjects(); renderSensitivityControls();
     const comparison = State.analysisId === 'multi-project-comparison';
     ['aw-projects', 'aw-baseline'].forEach(id => { if ($(id)) $(id).disabled = !comparison || State.busy; });
     ['aw-sort-key', 'aw-sort-direction'].forEach(id => { if ($(id)) $(id).disabled = !supportsSort || State.busy; });
     if ($('aw-deadband')) $('aw-deadband').disabled = !parameters.includes('near_degenerate_eV') || State.busy;
+    const supportsConditions = State.analysisId === 'free-energy-path' && parameters.includes('conditions');
+    if ($('aw-condition-fields')) $('aw-condition-fields').hidden = !supportsConditions;
+    ['aw-temperature', 'aw-pressure', 'aw-ph', 'aw-potential', 'aw-coverage'].forEach(id => {
+      if ($(id)) $(id).disabled = !supportsConditions || State.busy;
+    });
     document.querySelectorAll('#aw-sensitivity input').forEach(input => {
       input.disabled = !(record && record.supports_sensitivity === true) || State.busy;
     });
@@ -429,7 +455,163 @@
     section.append(title, list); parent.appendChild(section);
   }
 
+  function reactionSection(parent, id, titleText, description) {
+    const section = document.createElement('section'); section.className = 'aw-reaction-section';
+    section.setAttribute('role', 'region'); section.setAttribute('aria-labelledby', id);
+    const heading = document.createElement('h3'); heading.id = id; heading.textContent = titleText;
+    section.appendChild(heading);
+    if (description) {
+      const note = document.createElement('p'); note.className = 'aw-reaction-note';
+      note.textContent = description; section.appendChild(note);
+    }
+    parent.appendChild(section); return section;
+  }
+
+  function ledgerTermDisplay(row, key) {
+    const term = (row.terms || []).find(item => String(item.key || '') === key);
+    return String(term && term.display || 'unavailable');
+  }
+
+  function renderReactionWorkbench(view, box) {
+    box.innerHTML = '';
+    const graph = plain(view.graph); const ledger = plain(view.ledger);
+    const revision = plain(view.condition_revision);
+    const mapSection = reactionSection(box, 'aw-reaction-map-title',
+      tr('analysis.reaction.map.title', 'Reaction Map'),
+      tr('analysis.reaction.map.boundary', '拓扑、哈希、缺边和状态均由服务器冻结；图完整不等于机理完整。'));
+    const nodes = graph.nodes || []; const edges = graph.edges || [];
+    if (nodes.length) {
+      const table = tableElement([
+        { label: tr('analysis.reaction.object_id', 'Opaque ID') },
+        { label: tr('analysis.reaction.entity_type', '类型') },
+        { label: tr('analysis.reaction.label', '标签') },
+        { label: tr('analysis.reaction.structure_hash', '结构 hash') },
+        { label: tr('analysis.reaction.method_hash', '方法 hash') },
+        { label: tr('analysis.reaction.evidence_hash', '证据 hash') },
+        { label: tr('analysis.reaction.status', '状态') },
+      ], nodes.map(node => ({ cells: [
+        node.node_id, node.entity_type, node.label, node.structure_sha256,
+        node.method_sha256, node.evidence_sha256, node.artifact_status,
+      ] })));
+      const caption = document.createElement('caption');
+      caption.textContent = tr('analysis.reaction.map.nodes', '绑定节点');
+      table.prepend(caption); mapSection.appendChild(table);
+    }
+    const edgeTable = tableElement([
+      { label: tr('analysis.reaction.step', 'ElementaryStep') },
+      { label: tr('analysis.reaction.reactants', '反应物') },
+      { label: tr('analysis.reaction.products', '产物') },
+      { label: 'TS' }, { label: 'ΔG / eV', numeric: true },
+      { label: 'ΔG‡ / eV', numeric: true },
+      { label: tr('analysis.reaction.status', '状态') },
+      { label: tr('analysis.reaction.missing', '缺失') },
+    ], edges.map(edge => {
+      const display = plain(edge.display); const thermo = plain(edge.thermochemistry);
+      return { cells: [edge.edge_id, display.reactants, display.products,
+        display.transition_state, thermo.reaction_delta_g_display,
+        thermo.activation_delta_g_display, edge.artifact_status,
+        (edge.missing || []).join(', ') || '—'] };
+    }));
+    const edgeCaption = document.createElement('caption');
+    edgeCaption.textContent = tr('analysis.reaction.map.edges', '绑定边与显式缺边');
+    edgeTable.prepend(edgeCaption); mapSection.appendChild(edgeTable);
+    appendFreeEnergyMessages(mapSection,
+      tr('analysis.reaction.map.missing_edges', 'Missing edges'),
+      (graph.missing_edges || []).map(item => `${item.edge_id}: ${item.reason}`),
+      tr('analysis.reaction.map.missing_edges_empty', '服务器未报告缺边。'));
+
+    const ledgerSection = reactionSection(box, 'aw-thermo-ledger-title',
+      tr('analysis.reaction.ledger.title', 'Thermochemistry Ledger'),
+      tr('analysis.reaction.ledger.boundary', 'E0、ZPE、ΔH、-TΔS、标准态与最终 ΔG 逐项显示；缺证据即 unavailable。'));
+    const ledgerRows = ledger.rows || [];
+    const ledgerTable = tableElement([
+      { label: tr('analysis.reaction.entity', '实体') }, { label: 'E0 / eV', numeric: true },
+      { label: 'ZPE / eV', numeric: true }, { label: 'ΔH / eV', numeric: true },
+      { label: '-TΔS / eV', numeric: true },
+      { label: tr('analysis.reaction.standard_state', '标准态') },
+      { label: tr('analysis.reaction.conditions', 'T / P') },
+      { label: tr('analysis.reaction.models', '模型') },
+      { label: 'ΔG / eV', numeric: true },
+      { label: tr('analysis.reaction.status', '状态') },
+    ], ledgerRows.map(row => ({ cells: [
+      `${row.label} (${row.entity_id})`, ledgerTermDisplay(row, 'electronic_energy_e0_eV'),
+      ledgerTermDisplay(row, 'zpe_eV'), ledgerTermDisplay(row, 'delta_h_thermal_eV'),
+      ledgerTermDisplay(row, 'minus_t_delta_s_eV'), plain(row.standard_state).display,
+      `${row.temperature_display} / ${row.pressure_display}`, row.models_display,
+      row.final_delta_g_display, row.artifact_status,
+    ] })));
+    const ledgerCaption = document.createElement('caption');
+    ledgerCaption.textContent = tr('analysis.reaction.ledger.caption', '服务器最终确定的热化学账本');
+    ledgerTable.prepend(ledgerCaption); ledgerSection.appendChild(ledgerTable);
+    const modeGrid = document.createElement('div'); modeGrid.className = 'aw-reaction-evidence-grid';
+    ledgerRows.forEach(row => {
+      const card = document.createElement('article'); card.className = 'aw-reaction-evidence-card';
+      const title = document.createElement('h4'); title.textContent = `${row.label} · ${row.entity_type}`;
+      const low = plain(row.low_frequency); const frequency = plain(row.frequency_qualification);
+      const original = document.createElement('p'); original.textContent =
+        `${tr('analysis.reaction.low_frequency.original', '原始低频')}: ${low.original_frequencies_display || 'unavailable'}`;
+      const rule = document.createElement('p'); rule.textContent =
+        `${tr('analysis.reaction.low_frequency.rule', '规则')}: ${low.rule || 'none'} · ${low.reason || '—'}`;
+      const qualification = document.createElement('p'); qualification.textContent =
+        `${tr('analysis.reaction.ts_qualification', 'TS 频率/模式资格')}: ${frequency.display || 'unavailable'} · ${frequency.reason || '—'}`;
+      card.append(title, original, rule, qualification); modeGrid.appendChild(card);
+    });
+    ledgerSection.appendChild(modeGrid);
+
+    const conditionSection = reactionSection(box, 'aw-condition-revision-title',
+      tr('analysis.reaction.condition_revision.title', 'Condition Explorer derived revision'),
+      tr('analysis.reaction.condition_revision.boundary', '参数只生成 hash-bound derived revision；不改写 canonical DTO 或原始 evidence。'));
+    const revisionMeta = document.createElement('dl'); revisionMeta.className = 'aw-free-energy-metrics';
+    appendFreeEnergyMetric(revisionMeta, tr('analysis.reaction.revision_id', 'Revision ID'), revision.revision_id);
+    appendFreeEnergyMetric(revisionMeta, tr('analysis.reaction.revision_hash', 'Revision hash'), revision.revision_sha256);
+    appendFreeEnergyMetric(revisionMeta, tr('analysis.reaction.applicability', '适用范围'),
+      Object.entries(plain(revision.applicability_display)).map(([key, value]) => `${key}: ${value}`).join(' · '));
+    appendFreeEnergyMetric(revisionMeta, tr('analysis.reaction.source_mutated', '原始证据改写'),
+      revision.source_evidence_mutated === false ? tr('common.no', '否') : 'unavailable');
+    conditionSection.appendChild(revisionMeta);
+    const conditionTable = tableElement([
+      { label: tr('analysis.reaction.entity', '实体') },
+      { label: tr('analysis.reaction.base_g', '基准 ΔG / eV'), numeric: true },
+      { label: tr('analysis.reaction.condition_delta', '条件修正 / eV'), numeric: true },
+      { label: tr('analysis.reaction.derived_g', '派生 ΔG / eV'), numeric: true },
+      { label: tr('analysis.reaction.status', '状态') },
+      { label: tr('analysis.reaction.missing', '缺失') },
+    ], (revision.rows || []).map(row => ({ cells: [
+      row.label, row.base_delta_g_display, row.condition_delta_g_display,
+      row.derived_delta_g_display, row.status, (row.missing || []).join(', ') || '—',
+    ] })));
+    const conditionCaption = document.createElement('caption');
+    conditionCaption.textContent = tr('analysis.reaction.condition_revision.caption',
+      '服务器确定的条件派生值；浏览器不重算');
+    conditionTable.prepend(conditionCaption); conditionSection.appendChild(conditionTable);
+
+    const sensitivitySection = reactionSection(box, 'aw-parameter-sensitivity-title',
+      tr('analysis.reaction.sensitivity.title', 'Parameter sensitivity'),
+      tr('analysis.reaction.sensitivity.boundary', '保留低频原值、处理规则、理由及 evidence-bound sensitivity。'));
+    const sensitivityRows = [];
+    ledgerRows.forEach(row => (plain(row.low_frequency).sensitivity || []).forEach(item => {
+      sensitivityRows.push({ cells: [row.label, item.parameter, item.value,
+        item.unit, item.delta_g_eV, item.evidence_sha256] });
+    }));
+    if (sensitivityRows.length) sensitivitySection.appendChild(tableElement([
+      { label: tr('analysis.reaction.entity', '实体') },
+      { label: tr('analysis.reaction.parameter', '参数') },
+      { label: tr('analysis.reaction.value', '取值'), numeric: true },
+      { label: tr('analysis.reaction.unit', '单位') },
+      { label: 'ΔG sensitivity / eV', numeric: true },
+      { label: tr('analysis.reaction.evidence_hash', '证据 hash') },
+    ], sensitivityRows));
+    else {
+      const empty = document.createElement('div'); empty.className = 'aw-empty';
+      empty.textContent = tr('analysis.reaction.sensitivity.empty', '没有 evidence-bound 参数敏感性结果。');
+      sensitivitySection.appendChild(empty);
+    }
+  }
+
   function renderFreeEnergyView(view, box) {
+    if (view.schema === 'vcstudio.reaction-workbench-view/v1') {
+      renderReactionWorkbench(view, box); return;
+    }
     const rows = Array.isArray(view.rows) ? view.rows : [];
     const pds = plain(view.pds); const thermo = plain(view.thermo); const method = plain(view.method);
     box.innerHTML = '';
@@ -762,6 +944,8 @@
   if (window.__VCS_TEST__ === true) {
     window.__VCS_ANALYSIS_TEST__ = Object.freeze({
       renderRegistry,
+      renderReactionWorkbench,
+      requestFromControls,
       configure({ catalog = null, preferences = null, analysisId = '', busy = false } = {}) {
         State.catalog = clone(catalog);
         State.preferences = clone(preferences) || {};
