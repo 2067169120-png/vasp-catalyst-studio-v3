@@ -17,6 +17,9 @@ V4.0.0 is not released, and the `v4.0.0` tag has not been created. This section 
   HTML / DOCX / PDF 格式能力纳入同一流程，并保留诊断报告与最终报告的边界。
 - 新增 analysis workbench、preferences 与 batch adapters；旧项目页、批次入口和分析入口
   通过适配器进入统一合同，不旁路现有科学门禁、格式能力检查或项目身份约束。
+- Publish → Export 新增本地 DOI-ready `vcs-archive`：从重新校验的 report revision 生成
+  path-free dry-run、许可/风险/排除清单和 submission-readiness gaps，确认后原子写出绑定
+  revision/manifest/plan hash 的确定性 ZIP；不会上传、申请 DOI 或把 archive integrity 冒充科学发布。
 
 ### 密度、键盘、双语与可访问性边界（Phase E）
 - 提供舒展、标准、紧凑三档界面密度，补齐键盘导航、焦点可见性、动态 ARIA / title /

@@ -389,3 +389,96 @@ def test_language_theme_bilingual_and_precision_follow_catalog_capabilities():
         assert f'id="rw-{name}-capability"' in html
     assert '<option value="zh-en">' not in html
     assert "!specCapabilitiesSatisfied()" in js
+
+
+def test_export_step_has_accessible_archive_dry_run_confirmation_and_result_regions():
+    html = _source("index.html")
+
+    assert 'id="rw-archive" aria-labelledby="rw-archive-heading"' in html
+    assert 'id="rw-archive-state" data-state="idle" role="status"' in html
+    assert 'id="rw-archive-revision" disabled' in html
+    assert 'id="rw-archive-plan" disabled' in html
+    assert 'id="rw-archive-export" disabled' in html
+    assert 'id="rw-archive-summary" role="status"' in html
+    assert 'id="rw-archive-inventory" role="region"' in html
+    assert 'aria-labelledby="rw-archive-inventory-heading" tabindex="0"' in html
+    assert 'id="rw-archive-result-heading" tabindex="-1"' in html
+    assert 'data-i18n="report.archive.boundary"' in html
+
+
+def test_archive_frontend_is_dry_run_first_last_wins_and_opaque_token_only():
+    js = _source("report-workbench.js")
+    plan = js[js.index("async function planReproducibilityArchive("):
+              js.index("async function exportReproducibilityArchive(")]
+    export = js[js.index("async function exportReproducibilityArchive("):
+                js.index("function renderActions(")]
+
+    assert "VCS.call('report_archive_dry_run', projectId, revisionId)" in plan
+    assert "const generation = ++State.archiveGeneration" in plan
+    assert "generation !== State.archiveGeneration" in plan
+    assert "result.confirmation_token" in plan
+    assert "result.plan_sha256" in plan
+    assert "revision.revision_id !== revisionId" in plan
+    assert "result.project_id !== projectId" in plan
+    assert "await VCS.confirm" in export
+    assert "'report_archive_pick_destination', projectId, revisionId, confirmationToken" in export
+    assert "'report_archive_export', projectId, revisionId, confirmationToken, destinationToken" in export
+    assert "plain(result.verification).ok !== true" in export
+    assert "State.archiveDestinationToken = ''; State.archiveConfirmationToken = '';" in export
+    for forbidden in ("outputDir", "destination.path", "project_path", "manifest_path"):
+        assert forbidden not in export
+
+
+def test_archive_project_revision_switch_invalidation_and_keyboard_focus_are_explicit():
+    js = _source("report-workbench.js")
+    reset = js[js.index("function resetArchiveState("):
+               js.index("function selectedArchiveRow(")]
+    wire = js[js.index("function wire("):]
+
+    assert "State.archiveGeneration += 1" in reset
+    assert "State.archiveConfirmationToken = ''" in reset
+    assert "State.archiveDestinationToken = ''" in reset
+    assert "resetArchiveState();" in js[js.index("async function loadBootstrap("):
+                                          js.index("async function selectPreset(")]
+    assert "archiveRevision.addEventListener('change'" in wire
+    assert "resetArchiveState({ keepRevision: true })" in wire
+    assert "heading.focus({ preventScroll: true })" in js
+    assert "await VCS.confirm" in js
+    assert "button:not([disabled])" in _source("app.js")
+
+
+def test_archive_inventory_uses_local_scroll_long_text_wrapping_and_narrow_actions():
+    css = _source("report-workbench.css")
+
+    assert ".rw-archive-inventory{max-width:100%" in css
+    assert "overflow-x:auto" in css
+    assert ".rw-archive-inventory table{width:100%;min-width:720px" in css
+    assert ".rw-archive-heading h4" in css and "overflow-wrap:anywhere" in css
+    assert ".rw-archive-result dd" in css and "overflow-wrap:anywhere" in css
+    compact = css.split("@media(max-width:520px){", 1)[1]
+    assert ".rw-archive-actions{flex-direction:column}" in compact
+    assert ".rw-archive-actions .btn{width:100%;flex-basis:auto}" in compact
+
+
+def test_archive_visible_and_dynamic_copy_is_complete_in_both_locales():
+    en = json.loads((LOCALES / "en.json").read_text(encoding="utf-8"))
+    zh = json.loads((LOCALES / "zh.json").read_text(encoding="utf-8"))
+    required = {
+        "report.archive.title", "report.archive.description", "report.archive.boundary",
+        "report.archive.revision", "report.archive.dry_run",
+        "report.archive.confirm_export", "report.archive.confirm_message",
+        "report.archive.inventory", "report.archive.plan_summary",
+        "report.archive.gaps", "report.archive.result", "report.archive.verification",
+        "report.archive.readiness", "report.archive.release_boundary",
+        "report.archive.state.idle", "report.archive.state.planning",
+        "report.archive.state.planned", "report.archive.state.exporting",
+        "report.archive.state.verified", "report.archive.state.blocked",
+        "report.archive.state.stale", "report.archive.state.failed",
+    }
+
+    assert required.issubset(en)
+    assert required.issubset(zh)
+    assert "not uploaded" in en["report.archive.local_only"]
+    assert "no DOI requested" in en["report.archive.local_only"]
+    assert "未上传" in zh["report.archive.local_only"]
+    assert "未申请 DOI" in zh["report.archive.local_only"]

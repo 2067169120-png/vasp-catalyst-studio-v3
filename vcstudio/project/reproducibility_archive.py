@@ -1508,6 +1508,17 @@ class ArchiveConfirmations:
             raise ValueError("archive confirmation is invalid, expired, or already used")
         return selected[1]
 
+    def peek(self, token: str) -> Any:
+        """Validate a confirmation for destination binding without consuming it."""
+
+        with self._lock:
+            now = float(self._clock())
+            self._prune(now)
+            selected = self._items.get(str(token or ""))
+        if selected is None:
+            raise ValueError("archive confirmation is invalid, expired, or already used")
+        return selected[1]
+
 
 __all__ = [
     "ARCHIVE_SCHEMA", "ATTACHMENT_SCHEMA", "PLAN_SCHEMA", "RESULT_SCHEMA",

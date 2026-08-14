@@ -57,6 +57,14 @@
     insightGraph: null,
     capsuleDestinationToken: '',
     capsuleDestinationName: '',
+    archiveBusy: false,
+    archiveStatus: 'idle',
+    archiveRevisionId: '',
+    archivePlan: null,
+    archiveConfirmationToken: '',
+    archiveDestinationToken: '',
+    archiveResult: null,
+    archiveGeneration: 0,
   };
 
   function plain(value) {
@@ -852,7 +860,7 @@
         : State.history.length < 2 ? '至少需要两个 revision'
           : VCS.t('report.insights.compare_title', {}, 'Select two revisions and revalidate their scientific differences');
     }
-    renderInsightControls();
+    renderInsightControls(); renderArchiveControls();
   }
 
   function insightRevision(row) {
@@ -1093,6 +1101,283 @@
     } finally { State.insightBusy = false; renderInsightControls(); }
   }
 
+  function archiveState(status, message) {
+    const allowed = new Set([
+      'idle', 'planning', 'planned', 'blocked', 'exporting', 'verified', 'stale', 'failed',
+    ]);
+    State.archiveStatus = allowed.has(status) ? status : 'failed';
+    const badge = $('rw-archive-state');
+    if (badge) {
+      badge.dataset.state = State.archiveStatus;
+      badge.textContent = VCS.t(`report.archive.state.${State.archiveStatus}`, {}, State.archiveStatus);
+    }
+    if (message !== undefined) {
+      const summary = $('rw-archive-summary'); if (summary) summary.textContent = String(message || '');
+    }
+  }
+
+  function resetArchiveState({ keepRevision = false } = {}) {
+    State.archiveGeneration += 1;
+    State.archiveBusy = false;
+    State.archiveStatus = 'idle';
+    if (!keepRevision) State.archiveRevisionId = '';
+    State.archivePlan = null;
+    State.archiveConfirmationToken = '';
+    State.archiveDestinationToken = '';
+    State.archiveResult = null;
+    const inventory = $('rw-archive-inventory'); if (inventory) inventory.hidden = true;
+    const table = $('rw-archive-inventory-table'); if (table) table.innerHTML = '';
+    const gaps = $('rw-archive-gaps'); if (gaps) { gaps.hidden = true; gaps.innerHTML = ''; }
+    const result = $('rw-archive-result'); if (result) result.hidden = true;
+    const resultBody = $('rw-archive-result-body'); if (resultBody) resultBody.innerHTML = '';
+    archiveState('idle', VCS.t('report.archive.idle', {},
+      '选择一个 current revision 后先运行 dry-run。'));
+  }
+
+  function selectedArchiveRow() {
+    const select = $('rw-archive-revision');
+    const revisionId = String(select && select.value || '');
+    return State.history.find(row => insightRevision(row) === revisionId) || null;
+  }
+
+  function archiveBytes(value) {
+    const size = Number(value);
+    if (!Number.isFinite(size) || size < 0) return '—';
+    if (size < 1024) return `${size} B`;
+    if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KiB`;
+    return `${(size / (1024 * 1024)).toFixed(2)} MiB`;
+  }
+
+  function appendArchiveCell(row, value, { code = false, className = '' } = {}) {
+    const cell = document.createElement('td');
+    const content = code ? document.createElement('code') : document.createElement('span');
+    content.textContent = safeText(value);
+    if (className) content.className = className;
+    cell.appendChild(content); row.appendChild(cell);
+  }
+
+  function renderArchivePlan() {
+    const plan = plain(State.archivePlan);
+    const decisions = Array.isArray(plan.decisions) ? plan.decisions : [];
+    const inventory = $('rw-archive-inventory'); const target = $('rw-archive-inventory-table');
+    if (inventory && target) {
+      target.innerHTML = '';
+      inventory.hidden = !decisions.length;
+      if (decisions.length) {
+        const table = document.createElement('table');
+        const head = document.createElement('thead'); const headRow = document.createElement('tr');
+        [
+          ['report.archive.file', '文件'], ['report.archive.role', '逻辑角色'],
+          ['report.archive.size', '大小'], ['report.archive.license', 'License / attribution'],
+          ['report.archive.risk', '敏感风险'], ['report.archive.decision', '决定'],
+          ['report.archive.reason', '排除理由'],
+        ].forEach(([key, fallback]) => {
+          const th = document.createElement('th'); th.scope = 'col';
+          th.textContent = VCS.t(key, {}, fallback); headRow.appendChild(th);
+        });
+        head.appendChild(headRow); table.appendChild(head);
+        const body = document.createElement('tbody');
+        decisions.forEach(raw => {
+          const item = plain(raw); const row = document.createElement('tr');
+          appendArchiveCell(row, item.archive_path, { code: true });
+          appendArchiveCell(row, item.logical_role);
+          appendArchiveCell(row, archiveBytes(item.size));
+          appendArchiveCell(row, `${safeText(item.license)} · ${safeText(item.attribution,
+            VCS.t('report.archive.attribution_missing', {}, 'attribution missing'))}`);
+          appendArchiveCell(row, item.sensitive_risk);
+          appendArchiveCell(row, item.decision, {
+            className: `rw-archive-decision-${String(item.decision || '')}`,
+          });
+          appendArchiveCell(row, item.exclusion_reason || '—');
+          body.appendChild(row);
+        });
+        table.appendChild(body); target.appendChild(table);
+      }
+    }
+    const readiness = plain(plan.readiness); const denominator = plain(plan.denominator);
+    const summary = $('rw-archive-summary');
+    if (summary && plan.ok === true) {
+      summary.textContent = VCS.t('report.archive.plan_summary', {
+        included: denominator.included || 0,
+        excluded: denominator.excluded || 0,
+        status: safeText(readiness.status, 'unknown'),
+        file: safeText(plain(plan.archive).name),
+      }, 'Dry-run：包含 {included}，排除 {excluded}；可提交准备度 {status}；目标 {file}。');
+    }
+    const gapsBox = $('rw-archive-gaps'); const gaps = Array.isArray(readiness.gaps)
+      ? readiness.gaps : [];
+    if (gapsBox) {
+      gapsBox.innerHTML = ''; gapsBox.hidden = false;
+      const title = document.createElement('b');
+      title.textContent = gaps.length
+        ? VCS.t('report.archive.gaps', {}, '可提交缺口')
+        : VCS.t('report.archive.no_gaps', {}, '未发现机器缺口；仍需人工提交者复核。');
+      gapsBox.appendChild(title);
+      if (gaps.length) {
+        const list = document.createElement('ul');
+        gaps.forEach(raw => {
+          const gap = plain(raw); const item = document.createElement('li');
+          item.textContent = `${safeText(gap.code)} · ${safeText(gap.message)}`;
+          list.appendChild(item);
+        });
+        gapsBox.appendChild(list);
+      }
+    }
+  }
+
+  function renderArchiveResult() {
+    const result = plain(State.archiveResult); const panel = $('rw-archive-result');
+    const target = $('rw-archive-result-body'); if (!panel || !target) return;
+    target.innerHTML = ''; panel.hidden = !result.ok;
+    if (!result.ok) return;
+    const file = plain(result.file); const verification = plain(result.verification);
+    const readiness = plain(result.readiness); const dl = document.createElement('dl');
+    [
+      [VCS.t('report.archive.file', {}, '文件'), file.name],
+      [VCS.t('report.archive.size', {}, '大小'), archiveBytes(file.size)],
+      ['SHA-256', file.sha256],
+      [VCS.t('report.archive.verification', {}, '自动校验'),
+        `${safeText(verification.status)} · ${safeText(verification.checksums)}`],
+      [VCS.t('report.archive.readiness', {}, '可提交准备度'), readiness.status],
+      [VCS.t('report.archive.release_boundary', {}, '发行边界'),
+        VCS.t('report.archive.local_only', {}, '仅本地；未上传、未申请 DOI、未发布')],
+    ].forEach(([label, value]) => {
+      const dt = document.createElement('dt'); dt.textContent = label;
+      const dd = document.createElement('dd'); dd.textContent = safeText(value);
+      dl.append(dt, dd);
+    });
+    target.appendChild(dl);
+  }
+
+  function renderArchiveControls() {
+    const select = $('rw-archive-revision'); if (!select) return;
+    const previous = select.value; select.innerHTML = '';
+    const rows = State.history.filter(revisionIsUsable);
+    rows.forEach(row => {
+      const option = document.createElement('option'); option.value = insightRevision(row);
+      option.textContent = insightRevisionLabel(row); select.appendChild(option);
+    });
+    const ids = rows.map(insightRevision);
+    const preferred = State.archiveRevisionId || previous;
+    select.value = ids.includes(preferred) ? preferred : (ids[0] || '');
+    select.disabled = State.archiveBusy || State.historyStatus !== 'ready' || !ids.length;
+    const planButton = $('rw-archive-plan'); const exportButton = $('rw-archive-export');
+    if (planButton) planButton.disabled = select.disabled || State.archiveBusy;
+    const planRevision = String(plain(State.archivePlan).revision &&
+      plain(State.archivePlan).revision.revision_id || '');
+    if (exportButton) exportButton.disabled = State.archiveBusy ||
+      !State.archiveConfirmationToken || !select.value || planRevision !== select.value;
+    if (State.archivePlan) renderArchivePlan();
+    if (State.archiveResult) renderArchiveResult();
+  }
+
+  async function planReproducibilityArchive() {
+    if (State.archiveBusy) return false;
+    const row = selectedArchiveRow(); if (!revisionIsUsable(row)) return false;
+    const projectId = State.projectId; const revisionId = insightRevision(row);
+    resetArchiveState({ keepRevision: true }); State.archiveRevisionId = revisionId;
+    const generation = ++State.archiveGeneration; State.archiveBusy = true;
+    archiveState('planning', VCS.t('report.archive.planning', {},
+      '正在重新校验 revision 并生成文件、许可、风险与排除清单…'));
+    renderArchiveControls();
+    publishInsightOperation(`vcs-archive-plan-${Date.now()}`, 'vcs-archive-plan',
+      'VCS archive dry-run', 'running', '', 'publish-export');
+    try {
+      const result = await VCS.call('report_archive_dry_run', projectId, revisionId);
+      if (generation !== State.archiveGeneration || projectId !== State.projectId) return false;
+      const revision = plain(result && result.revision);
+      if (!result || result.ok !== true || !result.confirmation_token ||
+          !/^[0-9a-f]{64}$/.test(String(result.plan_sha256 || '')) ||
+          revision.revision_id !== revisionId || result.project_id !== projectId) {
+        throw insightResponseError(result, 'archive dry-run unavailable');
+      }
+      State.archivePlan = result;
+      State.archiveConfirmationToken = String(result.confirmation_token);
+      archiveState('planned'); renderArchivePlan(); renderArchiveControls();
+      const heading = $('rw-archive-heading'); if (heading) heading.focus({ preventScroll: true });
+      publishInsightOperation(`vcs-archive-plan-${generation}`, 'vcs-archive-plan',
+        'VCS archive dry-run', 'succeeded', '', 'publish-export');
+      return true;
+    } catch (error) {
+      if (generation !== State.archiveGeneration) return false;
+      State.archiveConfirmationToken = '';
+      const status = error && error.insightStatus === 'stale' ? 'stale' : 'failed';
+      archiveState(status, error && error.message || String(error));
+      publishInsightOperation(`vcs-archive-plan-${generation}`, 'vcs-archive-plan',
+        'VCS archive dry-run', 'failed', error && error.message || String(error), 'publish-export');
+      return false;
+    } finally {
+      if (generation === State.archiveGeneration) {
+        State.archiveBusy = false; renderArchiveControls();
+      }
+    }
+  }
+
+  async function exportReproducibilityArchive() {
+    if (State.archiveBusy || !State.archiveConfirmationToken || !State.archivePlan) return false;
+    const row = selectedArchiveRow(); const revisionId = insightRevision(row);
+    const plan = plain(State.archivePlan); const archive = plain(plan.archive);
+    if (!revisionIsUsable(row) || revisionId !== plain(plan.revision).revision_id) return false;
+    const denominator = plain(plan.denominator); const projectId = State.projectId;
+    const accepted = await VCS.confirm(VCS.t('report.archive.confirm_message', {
+      revision: revisionId,
+      manifest: String(plain(plan.revision).manifest_sha256 || '').slice(0, 12),
+      plan: String(plan.plan_sha256 || '').slice(0, 12),
+      included: denominator.included || 0,
+      excluded: denominator.excluded || 0,
+      file: safeText(archive.name),
+    }, '确认从 revision {revision} 生成 {file}？\nmanifest {manifest} · plan {plan}\n' +
+      '包含 {included}，排除 {excluded}。仅本地生成，不上传、不申请 DOI。'));
+    if (!accepted || projectId !== State.projectId) return false;
+    const generation = ++State.archiveGeneration; State.archiveBusy = true;
+    archiveState('exporting', VCS.t('report.archive.selecting_destination', {},
+      '请选择本地目录；浏览器只会收到一次性 opaque destination token。'));
+    renderArchiveControls();
+    const confirmationToken = State.archiveConfirmationToken;
+    try {
+      const selected = await VCS.call(
+        'report_archive_pick_destination', projectId, revisionId, confirmationToken);
+      if (generation !== State.archiveGeneration || projectId !== State.projectId ||
+          !selected || selected.cancelled) return false;
+      if (selected.ok !== true || !selected.destination_token) {
+        throw insightResponseError(selected, 'archive destination unavailable');
+      }
+      State.archiveDestinationToken = String(selected.destination_token);
+      const destinationToken = State.archiveDestinationToken;
+      State.archiveDestinationToken = ''; State.archiveConfirmationToken = '';
+      archiveState('exporting', VCS.t('report.archive.exporting', {},
+        '正在生成并自动校验本地 archive…'));
+      const result = await VCS.call(
+        'report_archive_export', projectId, revisionId, confirmationToken, destinationToken);
+      if (generation !== State.archiveGeneration || projectId !== State.projectId) return false;
+      if (!result || result.ok !== true || plain(result.verification).ok !== true) {
+        throw insightResponseError(result, 'archive export or verification failed');
+      }
+      State.archiveResult = result; archiveState('verified', VCS.t('report.archive.verified', {
+        file: safeText(plain(result.file).name),
+      }, '本地 archive {file} 已生成并通过 SHA256SUMS/manifest 自动校验；未上传、未申请 DOI。'));
+      renderArchiveResult();
+      const heading = $('rw-archive-result-heading'); if (heading) heading.focus({ preventScroll: true });
+      publishInsightOperation(`vcs-archive-export-${generation}`, 'vcs-archive-export',
+        'Verified local VCS archive', 'succeeded', '', 'publish-export');
+      return true;
+    } catch (error) {
+      State.archiveDestinationToken = ''; State.archiveConfirmationToken = '';
+      const insightStatus = error && error.insightStatus;
+      const status = insightStatus === 'stale' ? 'stale'
+        : insightStatus === 'blocked' ? 'blocked' : 'failed';
+      archiveState(status, error && error.message || String(error));
+      publishInsightOperation(`vcs-archive-export-${generation}`, 'vcs-archive-export',
+        'Verified local VCS archive', 'failed', error && error.message || String(error),
+        'publish-export');
+      return false;
+    } finally {
+      if (generation === State.archiveGeneration) {
+        State.archiveBusy = false; renderArchiveControls();
+      }
+    }
+  }
+
   function renderActions() {
     const previewButton = $('rw-preview'); const publishButton = $('rw-publish');
     const pick = $('rw-pick-output'); const open = $('rw-open-output');
@@ -1241,6 +1526,7 @@
       State.history = []; State.historyStatus = 'unavailable';
       State.historyError = '当前报告路由没有可解析的项目上下文';
       State.outputDestinationToken = ''; State.outputDisplayName = ''; State.outputProjectId = '';
+      resetArchiveState();
       const output = $('rw-output-path');
       if (output) output.textContent = '发布时尚未选择目录';
       showAlert(tr('legacy.dynamic.report_workbench.0012', '当前项目无法解析。'));
@@ -1263,6 +1549,7 @@
     State.insightBusy = false; State.insightStatus = 'empty';
     State.insightDiff = null; State.insightGraph = null;
     State.capsuleDestinationToken = ''; State.capsuleDestinationName = '';
+    resetArchiveState();
     showAlert(''); setOperation('正在读取版本化预设、格式能力与报告状态…', 'busy');
     renderHistory(); renderActions();
     try {
@@ -1689,6 +1976,16 @@
     const diffButton = $('rw-load-diff'); if (diffButton) diffButton.addEventListener('click', loadScientificDiff);
     const graphButton = $('rw-load-graph'); if (graphButton) graphButton.addEventListener('click', loadEvidenceGraph);
     const capsuleButton = $('rw-export-capsule'); if (capsuleButton) capsuleButton.addEventListener('click', exportInsightCapsule);
+    const archivePlanButton = $('rw-archive-plan');
+    if (archivePlanButton) archivePlanButton.addEventListener('click', planReproducibilityArchive);
+    const archiveExportButton = $('rw-archive-export');
+    if (archiveExportButton) archiveExportButton.addEventListener('click', exportReproducibilityArchive);
+    const archiveRevision = $('rw-archive-revision');
+    if (archiveRevision) archiveRevision.addEventListener('change', () => {
+      const revisionId = String(archiveRevision.value || '');
+      resetArchiveState({ keepRevision: true }); State.archiveRevisionId = revisionId;
+      renderArchiveControls();
+    });
     const insightResults = $('rw-insights-results');
     if (insightResults) insightResults.addEventListener('click', event => {
       const target = event.target.closest && event.target.closest('[data-insight-route]');
@@ -1716,7 +2013,8 @@
     });
     document.addEventListener('vcs:language', () => {
       if (State.spec) renderSpec();
-      renderPreview(State.preview); renderHistory(); renderFormatStates(); renderInsightControls();
+      renderPreview(State.preview); renderHistory(); renderFormatStates();
+      renderInsightControls(); renderArchiveControls();
     });
     document.addEventListener('vcs:report-workbench-discard-draft', event => {
       const detail = plain(event.detail);
@@ -1754,6 +2052,10 @@
       previewCurrentSpec,
       pickOutputDirectory,
       publishBoundPreview,
+      planReproducibilityArchive,
+      exportReproducibilityArchive,
+      resetArchiveState,
+      renderArchiveControls,
     };
   }
 

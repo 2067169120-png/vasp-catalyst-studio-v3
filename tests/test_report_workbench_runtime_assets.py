@@ -121,7 +121,9 @@ window.VCS = {
     };
     if (method === 'report_workbench_history') return {
       schema: 'vcstudio.report-history/v1', ok: true, project_id: projectId,
-      generation: 0, revisions: [], error: null,
+      generation: 1, revisions: [{ report_id: 'report-opaque', revision_id: 'report-r0001',
+        sequence: 1, current: true, artifact_status: 'ready', scientific_status: 'diagnostic',
+        manifest_sha256: hash }], error: null,
     };
     if (method === 'report_workbench_preview') return {
       schema: 'vcstudio.report-preview/v1', ok: true, project_id: projectId,
@@ -141,6 +143,33 @@ window.VCS = {
       preview_id: token.preview_id, artifact_status: 'complete', files: {},
       revision: { sequence: 1, revision_id: 'report-r0001' }, error: null,
     };
+    if (method === 'report_archive_dry_run') return {
+      schema: 'vcstudio.vcs-archive-plan/v1', ok: true, status: 'dry_run_ready',
+      project_id: projectId, confirmation_token: 'archive-confirm.opaque',
+      plan_sha256: hash,
+      revision: { report_id: 'report-opaque', revision_id: 'report-r0001',
+        manifest_sha256: hash },
+      archive: { name: 'vcs-archive-report-r0001-v1.zip', sha256: hash, size: 100, version: 1 },
+      readiness: { status: 'not_ready', gaps: [{ code: 'human-review', message: 'review' }] },
+      denominator: { decisions: 2, included: 1, excluded: 1 },
+      decisions: [{ archive_path: 'README.md', logical_role: 'archive_readme', size: 10,
+        sha256: hash, license: 'NOASSERTION', attribution: '', sensitive_risk: 'low',
+        decision: 'include', exclusion_reason: null }], error: null,
+    };
+    if (method === 'report_archive_pick_destination') return {
+      schema: 'vcstudio.vcs-archive-destination/v1', ok: true, cancelled: false,
+      destination_token: 'archive-destination.opaque', display_name: 'Archives', error: null,
+    };
+    if (method === 'report_archive_export') return {
+      schema: 'vcstudio.vcs-archive-result/v1', ok: true,
+      status: 'verified_local_archive', project_id: projectId,
+      revision: { revision_id: 'report-r0001', manifest_sha256: hash },
+      file: { name: 'vcs-archive-report-r0001-v1.zip', sha256: hash, size: 100 },
+      verification: { ok: true, status: 'verified', checksums: 'pass' },
+      readiness: { status: 'not_ready', gaps: [{ code: 'human-review', message: 'review' }] },
+      boundaries: { local_only: true, uploaded: false, doi_requested: false,
+        doi_assigned: false, published: false }, error: null,
+    };
     throw new Error('unexpected bridge method: ' + method);
   },
 };
@@ -154,6 +183,8 @@ assert.ok(window.__VCS_REPORT_WORKBENCH_TEST__);
   assert.strictEqual(await seam.pickOutputDirectory(projectId),
     'report-workbench.destination-token');
   assert.strictEqual(await seam.publishBoundPreview(), true);
+  assert.strictEqual(await seam.planReproducibilityArchive(), true);
+  assert.strictEqual(await seam.exportReproducibilityArchive(), true);
 
   const workbench = calls.filter(item => item[0].startsWith('report_workbench_'));
   const methods = workbench.map(item => item[0]);
@@ -165,6 +196,17 @@ assert.ok(window.__VCS_REPORT_WORKBENCH_TEST__);
   assert.strictEqual(publish[2], 'report-workbench.destination-token');
   assert.ok(!JSON.stringify(workbench).includes(privatePath));
   assert.ok(!JSON.stringify(workbench).includes('outputDir'));
+  const archive = calls.filter(item => item[0].startsWith('report_archive_'));
+  assert.deepStrictEqual(archive.map(item => item[0]), [
+    'report_archive_dry_run', 'report_archive_pick_destination', 'report_archive_export']);
+  archive.forEach(item => assert.strictEqual(item[1], projectId));
+  assert.deepStrictEqual(archive[0].slice(1), [projectId, 'report-r0001']);
+  assert.deepStrictEqual(archive[1].slice(1), [projectId, 'report-r0001',
+    'archive-confirm.opaque']);
+  assert.deepStrictEqual(archive[2].slice(1), [projectId, 'report-r0001',
+    'archive-confirm.opaque', 'archive-destination.opaque']);
+  assert.ok(!JSON.stringify(archive).includes(privatePath));
+  assert.ok(!JSON.stringify(archive).includes('outputDir'));
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """
     completed = subprocess.run(

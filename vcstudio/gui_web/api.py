@@ -261,8 +261,8 @@ class Api:
                  comparison_mod=None, candidate_evaluation_mod=None,
                  paper_report_mod=None, workspace_state_store=None,
                  report_service=None, analysis_preferences_store=None,
-                 project_lifecycle_service=None, lab_policy_store=None,
-                 workspace_context_store=None):
+                  project_lifecycle_service=None, lab_policy_store=None,
+                  workspace_context_store=None, archive_attachment_providers=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -379,6 +379,13 @@ class Api:
         # Insight export destinations remain server-side behind opaque,
         # single-use tokens; browser callers never submit filesystem paths.
         self._report_insight_destinations = None
+        # DOI-ready local archives use a separate dry-run confirmation and
+        # purpose-bound destination registry.  Optional notebook/ledger exports
+        # arrive only through the generic provider contract; this API never
+        # imports a notebook implementation.
+        self._report_archive_destinations = None
+        self._report_archive_confirmations = None
+        self._archive_attachment_providers = tuple(archive_attachment_providers or ())
         # Phase B 可恢复工作区状态只保存 UI 偏好/草稿引用，与 project.yaml 科学事实分离。
         # 测试可注入内存/临时目录 store；生产首次调用时再创建用户级 JSON store。
         self._workspace_state_store = workspace_state_store
@@ -7294,6 +7301,131 @@ class Api:
         except Exception as exc:                         # noqa: BLE001 public seam
             return self._report_insight_failure(
                 CAPSULE_SCHEMA, exc, revision=None, file=None)
+
+    def _archive_confirmation_registry(self):
+        from vcstudio.project.reproducibility_archive import ArchiveConfirmations
+
+        if self._report_archive_confirmations is None:
+            self._report_archive_confirmations = ArchiveConfirmations(
+                clock=time.monotonic)
+        return self._report_archive_confirmations
+
+    def _archive_destination_registry(self):
+        from vcstudio.project.report_insights import OpaqueDestinationRegistry
+
+        if self._report_archive_destinations is None:
+            self._report_archive_destinations = OpaqueDestinationRegistry(
+                schema='vcstudio.vcs-archive-destination/v1',
+                purpose='archive', token_prefix='archive-destination.')
+        return self._report_archive_destinations
+
+    def report_archive_dry_run(self, project_id, revision_id):
+        """Revalidate one revision and return a path-free archive inventory."""
+        from vcstudio.project.reproducibility_archive import (
+            PLAN_SCHEMA,
+            build_archive_plan,
+        )
+
+        try:
+            identifier = str(project_id or '').strip()
+            record = self._report_insight_record(identifier)
+
+            def plan_archive():
+                plan = build_archive_plan(
+                    self._reports(), record['path'], revision_id,
+                    attachment_providers=self._archive_attachment_providers)
+                confirmation_token = self._archive_confirmation_registry().register({
+                    'project_id': identifier,
+                    'revision_id': plan.revision_id,
+                    'manifest_sha256': plan.source_manifest_sha256,
+                    'plan_sha256': plan.plan_sha256,
+                    'plan': plan,
+                })
+                public = plan.public_summary()
+                public['confirmation_token'] = confirmation_token
+                return public
+
+            return self._call_with_project_bindings([record], plan_archive)
+        except Exception as exc:                         # noqa: BLE001 public seam
+            return self._report_insight_failure(
+                PLAN_SCHEMA, exc, revision=None, archive=None,
+                plan_sha256=None, confirmation_token=None,
+                readiness=None, decisions=[])
+
+    def report_archive_pick_destination(self, project_id, revision_id,
+                                        confirmation_token):
+        """Bind a server-selected directory to one opaque confirmed plan."""
+        schema = 'vcstudio.vcs-archive-destination/v1'
+        try:
+            identifier = str(project_id or '').strip()
+            record = self._report_insight_record(identifier)
+
+            def pick_destination():
+                stored = self._archive_confirmation_registry().peek(
+                    confirmation_token)
+                if (stored.get('project_id') != identifier
+                        or stored.get('revision_id') != str(revision_id or '')):
+                    raise ValueError('archive confirmation binding mismatch')
+                if self._dialog_fn is not None:
+                    path = self._dialog_fn('dir')
+                else:
+                    import webview                         # delayed optional dependency
+
+                    selected = webview.windows[0].create_file_dialog(
+                        webview.FOLDER_DIALOG)
+                    path = selected[0] if selected else None
+                if not path:
+                    return {
+                        'schema': schema, 'ok': True, 'cancelled': True,
+                        'destination_token': None, 'error': None,
+                    }
+                selected = self._archive_destination_registry().register(
+                    path, binding=str(confirmation_token or ''))
+                return {
+                    'schema': schema,
+                    'ok': True,
+                    'cancelled': False,
+                    'destination_token': selected['destination_token'],
+                    'error': None,
+                }
+
+            return self._call_with_project_bindings([record], pick_destination)
+        except Exception as exc:                         # noqa: BLE001 public seam
+            return self._report_insight_failure(
+                schema, exc, cancelled=False,
+                destination_token=None)
+
+    def report_archive_export(self, project_id, revision_id,
+                              confirmation_token, destination_token):
+        """Consume a dry-run confirmation and create one verified local ZIP."""
+        from vcstudio.project.reproducibility_archive import (
+            RESULT_SCHEMA,
+            export_archive,
+        )
+
+        try:
+            identifier = str(project_id or '').strip()
+            record = self._report_insight_record(identifier)
+
+            def export_confirmed():
+                stored = self._archive_confirmation_registry().consume(
+                    confirmation_token)
+                if (stored.get('project_id') != identifier
+                        or stored.get('revision_id') != str(revision_id or '')):
+                    raise ValueError('archive confirmation binding mismatch')
+                destination = self._archive_destination_registry().consume(
+                    destination_token,
+                    expected_binding=str(confirmation_token or ''))
+                return export_archive(
+                    self._reports(), record['path'], revision_id, destination,
+                    expected_plan_sha256=stored['plan_sha256'],
+                    attachment_providers=self._archive_attachment_providers)
+
+            return self._call_with_project_bindings([record], export_confirmed)
+        except Exception as exc:                         # noqa: BLE001 public seam
+            return self._report_insight_failure(
+                RESULT_SCHEMA, exc, revision=None, file=None,
+                verification=None, readiness=None)
 
     # ── Phase D:分析配置工作台 API ───────────────────────────────────────
     _ANALYSIS_BOOTSTRAP_SCHEMA = 'vcstudio.analysis-workbench-bootstrap/v1'
