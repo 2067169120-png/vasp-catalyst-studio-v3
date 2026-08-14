@@ -358,8 +358,24 @@ def _safe_graph_text(value: Any, *, fallback: str) -> str:
     return str(safe or fallback)
 
 
-def evidence_graph(service: Any, path: str, revision_id: str) -> dict[str, Any]:
-    bundle = load_frozen_revision(service, path, revision_id)
+def evidence_graph(
+    service: Any,
+    path: str,
+    revision_id: str,
+    *,
+    frozen_bundle: FrozenRevision | None = None,
+) -> dict[str, Any]:
+    """Build the graph from a revalidated revision or a stricter recapture.
+
+    ``frozen_bundle`` is an internal extension seam for consumers such as the
+    reproducibility archive that recapture every hash-bound JSON member through
+    a single regular-file descriptor before graph construction.  Public callers
+    omit it and retain the original authoritative ``ReportService`` journey.
+    """
+
+    bundle = frozen_bundle or load_frozen_revision(service, path, revision_id)
+    if bundle.revision_id != str(revision_id or ""):
+        raise StaleRevisionError("frozen evidence graph revision binding mismatch")
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
