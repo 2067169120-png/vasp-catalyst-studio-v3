@@ -24,6 +24,7 @@ _SECRET_RE = re.compile(
     r"(?i)(?:github_pat_|gh[opusr]_|sk-)[A-Za-z0-9_-]{8,}"
     r"|\b(?:password|passwd|secret|token|api[_-]?key)\s*[:=]\s*\S+"
 )
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _FORBIDDEN_KEYS = frozenset({
     "path", "dir", "directory", "job_dir", "project_path", "root",
     "source_job", "peer_dir", "vacuum_dir", "solvent_dir", "report_file",
@@ -222,6 +223,35 @@ def source_identity(
             (item["sha256"] for item in files if item["name"] == "job.yaml"), None),
         "files": files,
     }, missing
+
+
+def value_provenance(
+    source_id: Any,
+    files: Sequence[Mapping[str, Any]],
+    parser: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the path-free provenance required by one quantitative value.
+
+    The caller supplies already resolved file records.  Invalid or absent hashes
+    are not upgraded into evidence, and parser identity fields remain explicit
+    even when unavailable so downstream views can fail closed.
+    """
+    evidence = []
+    for item in files or ():
+        digest = str(item.get("sha256") or "").lower()
+        if not _SHA256_RE.fullmatch(digest):
+            continue
+        evidence.append({
+            "name": _safe_text(item.get("name")),
+            "sha256": digest,
+        })
+    return {
+        "source_id": _safe_text(source_id),
+        "file_hashes": evidence,
+        "parser_module": _safe_text(parser.get("module")),
+        "parser_callable": _safe_text(parser.get("callable")),
+        "parser_version": _safe_text(parser.get("version")),
+    }
 
 
 _ANALYSIS_TASKS = {
@@ -533,5 +563,5 @@ def build_property_view(
 
 __all__ = [
     "VIEW_SCHEMA", "build_property_view", "build_task_analysis_view",
-    "resolve_project_targets", "source_identity",
+    "resolve_project_targets", "source_identity", "value_provenance",
 ]

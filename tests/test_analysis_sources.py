@@ -8,6 +8,7 @@ from vcstudio.project.analysis_sources import (
     build_property_view,
     build_task_analysis_view,
     resolve_project_targets,
+    value_provenance,
 )
 
 
@@ -196,3 +197,22 @@ def test_property_view_keeps_calculator_operands_opaque_and_numbers_server_final
     assert row["values"][0]["value"] == -0.3456789
     assert row["values"][0]["display"] == "-0.34568"
     assert view["denominator"]["available_results"] == 1
+
+
+def test_value_provenance_keeps_only_hashed_files_and_explicit_parser_identity():
+    value = value_provenance(
+        "job-opaque",
+        [
+            {"name": "OSZICAR", "sha256": "A" * 64},
+            {"name": "OUTCAR", "sha256": "not-a-hash"},
+        ],
+        {"module": "parser.module", "callable": "parse", "version": "4.1"},
+    )
+
+    assert value == {
+        "source_id": "job-opaque",
+        "file_hashes": [{"name": "OSZICAR", "sha256": "a" * 64}],
+        "parser_module": "parser.module",
+        "parser_callable": "parse",
+        "parser_version": "4.1",
+    }

@@ -25,7 +25,7 @@ from vcstudio.generate.incar_builder import parse_incar
 from vcstudio.generate.poscar import parse_poscar_species
 from vcstudio.generate.structure_view import parse_positions
 from vcstudio.project.analysis_registry import AnalysisSpec, get_analysis
-from vcstudio.project.analysis_sources import source_identity
+from vcstudio.project.analysis_sources import source_identity, value_provenance
 
 
 VIEW_SCHEMA = "vcstudio.analysis-view/v1"
@@ -92,14 +92,7 @@ def _quantity(
     reason: str = "",
 ) -> dict[str, Any]:
     safe_value = _finite(value)
-    evidence = [
-        {
-            "name": str(item.get("name") or ""),
-            "sha256": str(item.get("sha256") or ""),
-        }
-        for item in files
-        if _SHA256_RE.fullmatch(str(item.get("sha256") or "").lower())
-    ]
+    provenance = value_provenance(source_id, files, parser)
     return {
         "key": key,
         "label": label,
@@ -107,11 +100,7 @@ def _quantity(
         "display": _display(safe_value, precision),
         "unit": unit,
         "denominator": denominator,
-        "source_id": source_id,
-        "file_hashes": evidence,
-        "parser_module": str(parser.get("module") or ""),
-        "parser_callable": str(parser.get("callable") or ""),
-        "parser_version": str(parser.get("version") or ""),
+        **provenance,
         "status": "available" if safe_value is not None else "unavailable",
         "reason": str(reason or ""),
     }
@@ -329,7 +318,7 @@ def _neb_method_gate(
             issues.append(f"{role} endpoint method fingerprint is unavailable")
         elif root_hash and endpoint_hash != root_hash:
             issues.append(f"{role} endpoint method differs from the NEB method")
-        if record.get("source_state") not in (None, "DONE"):
+        if record.get("source_state") != "DONE":
             issues.append(f"{role} endpoint source state is not DONE")
     return not issues, issues
 
@@ -636,6 +625,9 @@ def _series_group_key(target: Mapping[str, Any], kind: str) -> str:
     manifest = target.get("manifest") or {}
     inputs = manifest.get("inputs") or {}
     parent = str(manifest.get("parent_job") or inputs.get("parent_job") or "")
+    if not parent:
+        # Missing lineage never authorizes unrelated scan points to be combined.
+        parent = f'isolated-source:{target.get("source_id") or "unknown"}'
     return _canonical_hash({"kind": kind, "parent": os.path.normcase(parent)})[:20]
 
 

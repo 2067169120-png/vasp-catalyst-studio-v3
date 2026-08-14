@@ -79,7 +79,7 @@ def _assert_quantities_have_provenance(value):
 
 def _neb_target(tmp_path: Path) -> dict:
     root = tmp_path / "neb"
-    root.mkdir()
+    root.mkdir(parents=True)
     (root / "INCAR").write_text(
         "EDIFFG = -0.05\nLCLIMB = .TRUE.\nIMAGES = 1\n",
         encoding="utf-8",
@@ -141,6 +141,13 @@ def test_neb_view_only_releases_barriers_after_all_evidence_gates(tmp_path):
     assert any("endpoint method fingerprint" in item
                for item in blocked_path["barriers"]["blocking"])
 
+    target = _neb_target(tmp_path / "second")
+    target["manifest"]["inputs"]["neb_endpoints"]["start"].pop("source_state")
+    no_endpoint_state = build_neb_analysis_view(spec, [target], method_evidence=_method)
+    assert no_endpoint_state["paths"][0]["barriers"]["status"] == "unavailable"
+    assert any("source state is not DONE" in item for item in
+               no_endpoint_state["paths"][0]["barriers"]["blocking"])
+
 
 def _convergence_targets(tmp_path: Path) -> list[dict]:
     targets = []
@@ -197,6 +204,23 @@ def test_convergence_view_exposes_raw_points_platform_and_threshold_sensitivity(
         spec, targets, method_evidence=lambda target: target["method"])
     assert missing["series"][0]["platform"]["status"] == "unavailable"
     assert missing["series"][0]["platform"]["recommendation"]["value"] is None
+
+
+def test_convergence_points_without_lineage_are_never_combined(tmp_path):
+    targets = _convergence_targets(tmp_path)[:2]
+    for target in targets:
+        target["manifest"].pop("parent_job", None)
+        target["manifest"]["inputs"].pop("parent_job", None)
+    spec = normalize_analysis_request(
+        {"analysis_id": "convergence-scan"}, project_id=PROJECT)
+
+    view = build_convergence_analysis_view(
+        spec, targets, method_evidence=lambda target: target["method"])
+
+    assert len(view["series"]) == 2
+    assert all(len(series["points"]) == 1 for series in view["series"])
+    assert all(series["platform"]["status"] == "unavailable"
+               for series in view["series"])
 
 
 def _xdatcar() -> str:
