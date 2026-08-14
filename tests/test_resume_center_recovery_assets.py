@@ -171,3 +171,43 @@ def test_resume_buttons_and_form_entry_points_are_wired():
     assert 'id="cl-cancel"' in html
     assert "wire('cl-cancel', discardClusterDraft)" in cluster
     assert "event.detail.source === 'resume-center'" in cluster
+
+
+def test_research_notebook_resume_row_uses_only_safe_opaque_marker():
+    _run_node(
+        r"""
+const projectId = 'project-' + 'a'.repeat(32);
+const draftId = 'research-notebook-' + projectId;
+const marker = JSON.stringify({
+  schema: 'vcstudio.safe-draft-ref/v1', kind: 'research-notebook', project_id: projectId,
+});
+VCS.workspace = {
+  state: { draft_refs: { [draftId]: {
+    dirty: true, route: '#/projects/current/overview', project_id: projectId,
+    updated_at_ms: 50,
+  } } },
+  projects: [{ id: projectId, name: 'Project A' }],
+  drafts: { load(id) { return id === draftId ? {
+    schema: 'vcstudio.unverified-draft/v1', text: marker,
+  } : null; } },
+  parseRoute(route) { return route === '#/projects/current/overview'
+    ? { def: { page: 'project' }, query: {} } : null; },
+};
+VCS.unsaved = { scopes() { return []; } };
+VCS.canActivatePage = () => true;
+element('db-resume');
+loadAsset(process.argv[1]);
+const seam = window.Dashboard.__test;
+const rows = seam.collectResumeRows();
+assert.strictEqual(rows.length, 1);
+assert.strictEqual(rows[0].label, 'Research Notebook 待续录引用');
+assert.strictEqual(rows[0].available, true);
+seam.renderResumeCenter();
+const markup = document.getElementById('db-resume').innerHTML;
+assert.ok(markup.includes('Research Notebook 待续录引用'));
+assert.ok(!markup.includes('note body'));
+assert.ok(!markup.includes('attachment'));
+assert.ok(!markup.includes('password'));
+""",
+        str(ASSETS / "dashboard.js"),
+    )

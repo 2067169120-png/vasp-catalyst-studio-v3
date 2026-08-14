@@ -597,7 +597,8 @@ def _references_bib(model: Mapping[str, Any]) -> str:
     return "\n\n".join(chunks) + ("\n" if chunks else "")
 
 
-def capsule_members(bundle: FrozenRevision) -> dict[str, bytes]:
+def capsule_members(bundle: FrozenRevision, *,
+                    notebook_payload: Mapping[str, Any] | None = None) -> dict[str, bytes]:
     methods = {
         key: bundle.model.get(key)
         for key in ("methods", "methodology", "calculation_details", "method_consistency")
@@ -627,6 +628,14 @@ def capsule_members(bundle: FrozenRevision) -> dict[str, bytes]:
         "methods/methods.json": methods,
         "environment/environment.json": environment,
     }
+    if notebook_payload is not None:
+        payloads["research-notebook/ledger.json"] = notebook_payload
+        payloads["research-notebook/limitations.json"] = {
+            "schema": "vcstudio.research-notebook-limitations/v1",
+            "project_id": bundle.project_id,
+            "bound_report_revision_id": bundle.revision_id,
+            "limitations": list(notebook_payload.get("limitations") or []),
+        }
     members = {
         name: _canonical_bytes(redact(value)) + b"\n"
         for name, value in sorted(payloads.items())
@@ -656,10 +665,12 @@ def capsule_members(bundle: FrozenRevision) -> dict[str, bytes]:
     return members
 
 
-def build_capsule_bytes(bundle: FrozenRevision) -> bytes:
+def build_capsule_bytes(bundle: FrozenRevision, *,
+                        notebook_payload: Mapping[str, Any] | None = None) -> bytes:
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED, strict_timestamps=True) as archive:
-        for name, data in sorted(capsule_members(bundle).items()):
+        for name, data in sorted(capsule_members(
+                bundle, notebook_payload=notebook_payload).items()):
             info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_STORED
             info.create_system = 3
@@ -761,9 +772,39 @@ class CapsuleDestinations(OpaqueDestinationRegistry):
 def export_capsule(service: Any, path: str, revision_id: str,
                    destination_dir: str) -> dict[str, Any]:
     bundle = load_frozen_revision(service, path, revision_id)
+    from vcstudio.project.research_notebook import (
+        ARCHIVE_SCHEMA,
+        notebook_limitations,
+        redact_public_text,
+    )
+
+    notebook_payload: Mapping[str, Any] = {
+        "schema": ARCHIVE_SCHEMA,
+        "project_id": bundle.project_id,
+        "bound_report_revision_id": bundle.revision_id,
+        "ledger_revision": 0,
+        "ledger_head_digest": None,
+        "integrity_status": "unavailable",
+        "records": [],
+        "denominator": {"records": 0, "active": 0, "review_todo": 0},
+        "limitations": notebook_limitations(),
+    }
+    provider = getattr(getattr(service, "_host", None),
+                       "_research_notebook_archive_payload", None)
+    if callable(provider):
+        try:
+            supplied = provider(path, bundle.project_id, bundle.revision_id)
+            if isinstance(supplied, Mapping):
+                notebook_payload = supplied
+        except Exception as exc:  # noqa: BLE001 archive remains honest and exportable
+            notebook_payload = {
+                **dict(notebook_payload),
+                "integrity_status": "unavailable",
+                "error": redact_public_text(str(exc)),
+            }
     safe_revision = re.sub(r"[^A-Za-z0-9._-]", "-", bundle.revision_id)
     target = Path(destination_dir) / f"{safe_revision}-si-capsule.zip"
-    data = build_capsule_bytes(bundle)
+    data = build_capsule_bytes(bundle, notebook_payload=notebook_payload)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     descriptor = os.open(target, flags, 0o600)
     try:

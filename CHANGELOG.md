@@ -17,6 +17,14 @@ V4.0.0 is not released, and the `v4.0.0` tag has not been created. This section 
   HTML / DOCX / PDF 格式能力纳入同一流程，并保留诊断报告与最终报告的边界。
 - 新增 analysis workbench、preferences 与 batch adapters；旧项目页、批次入口和分析入口
   通过适配器进入统一合同，不旁路现有科学门禁、格式能力检查或项目身份约束。
+- 新增项目级本地优先 Research Notebook 与 Human Review Ledger：journal 采用跨进程锁、revision
+  CAS、链式 digest、append-only supersedes/tombstone；关联的 project/job/source/report revision
+  在读取时重新校验并显示 current/stale/missing。正文和附件不进入 workspace localStorage；Resume
+  Center 只保存 opaque marker。人工 reviewer attribution 是本地自声明，不是认证或密码学签名，
+  且不会提升 ValidationResult、claims、final、accepted 或 `human_scientific_reviewed`。
+  Project-local Research Notebook and Human Review Ledger records are append-only, CAS-bound, digest-chained,
+  evidence-revalidated, and excluded from workspace body storage. Human attribution remains self-asserted and
+  cannot bypass or elevate the existing scientific/report gates.
 
 ### 密度、键盘、双语与可访问性边界（Phase E）
 - 提供舒展、标准、紧凑三档界面密度，补齐键盘导航、焦点可见性、动态 ARIA / title /

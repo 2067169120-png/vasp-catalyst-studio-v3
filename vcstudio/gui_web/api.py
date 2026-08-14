@@ -379,6 +379,10 @@ class Api:
         # Insight export destinations remain server-side behind opaque,
         # single-use tokens; browser callers never submit filesystem paths.
         self._report_insight_destinations = None
+        # Research Notebook attachment selections are server-held, opaque,
+        # project-bound and single-use.  Note/review bodies never enter the
+        # workspace/localStorage state axis.
+        self._research_notebook_attachments = None
         # Phase B 可恢复工作区状态只保存 UI 偏好/草稿引用，与 project.yaml 科学事实分离。
         # 测试可注入内存/临时目录 store；生产首次调用时再创建用户级 JSON store。
         self._workspace_state_store = workspace_state_store
@@ -7080,6 +7084,291 @@ class Api:
         if not os.path.isfile(canonical):
             raise ValueError('registered project is unavailable')
         return record
+
+    def _research_notebook_attachment_registry(self):
+        if self._research_notebook_attachments is None:
+            from vcstudio.project.research_notebook import AttachmentSelections
+
+            self._research_notebook_attachments = AttachmentSelections()
+        return self._research_notebook_attachments
+
+    def _research_notebook_evidence_resolver(self, record):
+        """Return one request-scoped resolver for opaque notebook links.
+
+        Every lookup reloads authoritative project/report state.  The small
+        cache is valid only for the duration of one public API request.
+        """
+        from vcstudio.project.research_notebook import digest_json
+
+        cache = {}
+
+        def resolve(link):
+            kind = str((link or {}).get('kind') or '')
+            identifier = str((link or {}).get('id') or '')
+            revision_id = str((link or {}).get('report_revision_id') or '')
+            key = (kind, identifier, revision_id)
+            if key in cache:
+                return copy.deepcopy(cache[key])
+
+            resolved = {'status': 'missing', 'digest': None, 'route': None}
+            if kind == 'project' and identifier == record['project_id']:
+                loaded = self._rebind_project_record(record)
+                resolved = {
+                    'status': 'current',
+                    'digest': self._project_identity_fingerprint(record['path'], loaded),
+                    'route': {'id': 'project-overview',
+                              'project_id': record['project_id']},
+                }
+            elif kind == 'job':
+                loaded = self._rebind_project_record(record)
+                matches = []
+                for member_dir in self._project_member_dirs(loaded):
+                    manifest = self._manifest.load_manifest(member_dir) or {}
+                    if self._workspace_job_id(member_dir, manifest) == identifier:
+                        matches.append(manifest)
+                if len(matches) == 1:
+                    resolved = {
+                        'status': 'current', 'digest': digest_json(matches[0]),
+                        'route': {'id': 'run-jobs', 'project_id': record['project_id'],
+                                  'job_id': identifier},
+                    }
+            elif kind in {'report_revision', 'source'}:
+                from vcstudio.project.report_insights import (
+                    StaleRevisionError,
+                    load_frozen_revision,
+                )
+
+                wanted_revision = identifier if kind == 'report_revision' else revision_id
+                try:
+                    bundle = load_frozen_revision(
+                        self._reports(), record['path'], wanted_revision)
+                except StaleRevisionError:
+                    bundle = None
+                    resolved = {'status': 'stale', 'digest': None, 'route': None}
+                except Exception:                       # noqa: BLE001 stale/missing evidence
+                    bundle = None
+                if bundle is not None and kind == 'report_revision':
+                    resolved = {
+                        'status': 'current',
+                        'digest': str(bundle.entry.get('manifest_sha256') or ''),
+                        'route': {'id': 'publish-versions',
+                                  'project_id': record['project_id'],
+                                  'revision_id': identifier},
+                    }
+                elif bundle is not None:
+                    matches = [
+                        source for source in bundle.snapshot.get('sources') or []
+                        if isinstance(source, dict)
+                        and str(source.get('source_id') or '') == identifier
+                    ]
+                    if len(matches) == 1:
+                        source = matches[0]
+                        locator = str(source.get('locator') or '')
+                        declared = str(source.get('sha256') or '')
+                        source_digest = declared or digest_json({
+                            key: value for key, value in source.items()
+                            if key != 'locator' and not str(key).endswith('_locator')
+                        })
+                        status = 'current'
+                        if locator and declared:
+                            candidate = (locator if os.path.isabs(locator) else os.path.join(
+                                os.path.dirname(record['path']), locator))
+                            try:
+                                current_digest = _sha256_file(candidate)
+                            except OSError:
+                                status = 'missing'
+                            else:
+                                source_digest = current_digest
+                                if current_digest != declared:
+                                    status = 'stale'
+                        resolved = {
+                            'status': status,
+                            'digest': source_digest,
+                            'route': {'id': 'publish-versions',
+                                      'project_id': record['project_id'],
+                                      'revision_id': revision_id,
+                                      'source_id': identifier},
+                        }
+            cache[key] = copy.deepcopy(resolved)
+            return resolved
+
+        return resolve
+
+    def _research_notebook_view(self, record):
+        from vcstudio.project.research_notebook import (
+            LINK_KINDS,
+            NOTE_CATEGORIES,
+            REVIEW_DECISIONS,
+            ResearchNotebook,
+        )
+
+        ledger = ResearchNotebook(record['path'], record['project_id'])
+        view = ledger.read(resolver=self._research_notebook_evidence_resolver(record))
+        view['catalog'] = {
+            'record_types': ['note', 'decision', 'review'],
+            'note_categories': list(NOTE_CATEGORIES),
+            'review_decisions': list(REVIEW_DECISIONS),
+            'link_kinds': list(LINK_KINDS),
+        }
+        return view
+
+    @staticmethod
+    def _research_notebook_failure(exc, *, conflict_revision=None):
+        from vcstudio.project.research_notebook import PUBLIC_SCHEMA, redact_public_text
+
+        return {
+            'schema': PUBLIC_SCHEMA,
+            'ok': False,
+            'project_id': None,
+            'revision': conflict_revision,
+            'integrity_status': 'unknown',
+            'records': [], 'active_records': [], 'review_todo': [],
+            'denominator': {'records': 0, 'active': 0, 'review_todo': 0},
+            'error_code': ('revision_conflict' if conflict_revision is not None
+                           else 'notebook_error'),
+            'error': redact_public_text(str(exc)),
+        }
+
+    def research_notebook_bootstrap(self, project_id):
+        """Read the project notebook and revalidate every evidence link."""
+        try:
+            record = self._report_workbench_project_record(project_id)
+            return self._call_with_project_bindings(
+                [record], lambda: self._research_notebook_view(record))
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return self._research_notebook_failure(exc)
+
+    def research_notebook_pick_attachments(self, project_id):
+        """Select local attachments and return only a project-bound token."""
+        schema = 'vcstudio.research-notebook-attachment-selection/v1'
+        try:
+            record = self._report_workbench_project_record(project_id)
+
+            def select():
+                if self._dialog_fn is not None:
+                    selected = self._dialog_fn('files')
+                else:
+                    import webview
+
+                    window = webview.windows[0] if webview.windows else None
+                    selected = (window.create_file_dialog(
+                        webview.OPEN_DIALOG, allow_multiple=True) if window else None)
+                if not selected:
+                    return {
+                        'schema': schema, 'ok': True, 'cancelled': True,
+                        'selection_token': None, 'files': [], 'error': None,
+                    }
+                paths = [selected] if isinstance(selected, str) else list(selected)
+                value = self._research_notebook_attachment_registry().register(
+                    paths, project_id=record['project_id'])
+                return {'schema': schema, 'ok': True, 'cancelled': False,
+                        'error': None, **value}
+
+            return self._call_with_project_bindings([record], select)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return {
+                'schema': schema, 'ok': False, 'cancelled': False,
+                'selection_token': None, 'files': [],
+                'error': self._report_workbench_error(exc),
+            }
+
+    def research_notebook_append(self, project_id, request, expected_revision):
+        """Append a note/decision/local human review under revision CAS."""
+        from vcstudio.project.research_notebook import (
+            NotebookRevisionConflict,
+            ResearchNotebook,
+            bind_links,
+        )
+
+        try:
+            record = self._report_workbench_project_record(project_id)
+
+            def append():
+                if not isinstance(request, dict):
+                    raise TypeError('notebook request must be an object')
+                allowed = {
+                    'record_type', 'category', 'body', 'actor', 'links',
+                    'supersedes', 'review', 'ai_proposal',
+                    'attachment_selection_token',
+                }
+                unknown = sorted(set(request) - allowed)
+                if unknown:
+                    raise ValueError(
+                        'notebook request contains unsupported fields: '
+                        + ', '.join(unknown))
+                resolver = self._research_notebook_evidence_resolver(record)
+                links = bind_links(request.get('links') or [], resolver)
+                attachments = []
+                selection_token = str(
+                    request.get('attachment_selection_token') or '').strip()
+                if selection_token:
+                    if self._research_notebook_attachments is None:
+                        raise ValueError('attachment selection is unavailable or expired')
+                    attachments = self._research_notebook_attachments.consume(
+                        selection_token, project_id=record['project_id'])
+                ledger = ResearchNotebook(record['path'], record['project_id'])
+                created = ledger.append(
+                    record_type=str(request.get('record_type') or ''),
+                    category=str(request.get('category') or ''),
+                    body=request.get('body'),
+                    actor=request.get('actor'),
+                    expected_revision=expected_revision,
+                    links=links,
+                    supersedes=request.get('supersedes'),
+                    review=request.get('review'),
+                    ai_proposal=request.get('ai_proposal') is True,
+                    attachments=attachments,
+                )
+                view = ledger.read(resolver=resolver)
+                view['created_record_id'] = created['record_id']
+                return view
+
+            return self._call_with_project_bindings([record], append)
+        except NotebookRevisionConflict as exc:
+            return self._research_notebook_failure(
+                exc, conflict_revision=exc.current_revision)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return self._research_notebook_failure(exc)
+
+    def research_notebook_tombstone(self, project_id, record_id, reason,
+                                    actor, expected_revision):
+        from vcstudio.project.research_notebook import (
+            NotebookRevisionConflict,
+            ResearchNotebook,
+        )
+
+        try:
+            record = self._report_workbench_project_record(project_id)
+
+            def tombstone():
+                ledger = ResearchNotebook(record['path'], record['project_id'])
+                deleted = ledger.tombstone(
+                    record_id=record_id, reason=reason, actor=actor,
+                    expected_revision=expected_revision)
+                view = ledger.read(
+                    resolver=self._research_notebook_evidence_resolver(record))
+                view['created_record_id'] = deleted['record_id']
+                return view
+
+            return self._call_with_project_bindings([record], tombstone)
+        except NotebookRevisionConflict as exc:
+            return self._research_notebook_failure(
+                exc, conflict_revision=exc.current_revision)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return self._research_notebook_failure(exc)
+
+    def _research_notebook_archive_payload(self, path, project_id,
+                                            report_revision_id=None):
+        """Internal capsule seam; never grants report or review authority."""
+        from vcstudio.project.research_notebook import ResearchNotebook
+
+        record = self._resolve_project_id(project_id)
+        if self._workspace_path_key(record['path']) != self._workspace_path_key(path):
+            raise ValueError('notebook archive project binding mismatch')
+        return ResearchNotebook(path, project_id).archive_payload(
+            report_revision_id=report_revision_id,
+            resolver=self._research_notebook_evidence_resolver(record),
+        )
 
     def _workbench_destination_registry(self):
         if self._report_workbench_destinations is None:

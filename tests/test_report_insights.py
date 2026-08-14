@@ -232,6 +232,41 @@ def test_capsule_is_deterministic_redacted_and_self_checksummed(tmp_path):
             assert digest == hashlib.sha256(archive.read(name)).hexdigest()
 
 
+def test_capsule_can_bind_research_notebook_ledger_and_explicit_limitations(tmp_path):
+    _host, service, first, _second = _two_revisions(tmp_path)
+    bundle = load_frozen_revision(
+        service, "project.yaml", first["revision"]["revision_id"])
+    notebook_payload = {
+        "schema": "vcstudio.research-notebook-archive/v1",
+        "project_id": bundle.project_id,
+        "bound_report_revision_id": bundle.revision_id,
+        "ledger_revision": 2,
+        "ledger_head_digest": "a" * 64,
+        "integrity_status": "current",
+        "records": [{
+            "record_id": "rn-review", "record_type": "review",
+            "body": r"Reviewed under C:\private\project",
+            "review": {"decision": "approved", "cryptographic_signature": False},
+        }],
+        "denominator": {"records": 1, "active": 1, "review_todo": 0},
+        "limitations": [{
+            "code": "report_gate_unchanged",
+            "en": "Notebook review does not elevate ValidationResult.",
+        }],
+    }
+
+    data = build_capsule_bytes(bundle, notebook_payload=notebook_payload)
+
+    with zipfile.ZipFile(BytesIO(data)) as archive:
+        ledger = json.loads(archive.read("research-notebook/ledger.json"))
+        limitations = json.loads(
+            archive.read("research-notebook/limitations.json"))
+        assert ledger["bound_report_revision_id"] == bundle.revision_id
+        assert ledger["ledger_head_digest"] == "a" * 64
+        assert ledger["records"][0]["body"] == "[redacted-sensitive-value]"
+        assert limitations["limitations"][0]["code"] == "report_gate_unchanged"
+
+
 def test_capsule_export_never_overwrites_existing_file(tmp_path):
     _host, service, first, _second = _two_revisions(tmp_path)
     revision_id = first["revision"]["revision_id"]
@@ -245,6 +280,38 @@ def test_capsule_export_never_overwrites_existing_file(tmp_path):
     with pytest.raises(FileExistsError):
         export_capsule(service, "project.yaml", revision_id, str(destination))
     assert target.read_bytes() == original
+
+
+def test_capsule_export_reads_project_notebook_provider_and_binds_revision(tmp_path):
+    host, service, first, _second = _two_revisions(tmp_path)
+    revision_id = first["revision"]["revision_id"]
+    calls = []
+
+    def notebook_payload(path, project_id, bound_revision_id):
+        calls.append((path, project_id, bound_revision_id))
+        return {
+            "schema": "vcstudio.research-notebook-archive/v1",
+            "project_id": project_id,
+            "bound_report_revision_id": bound_revision_id,
+            "ledger_revision": 1,
+            "ledger_head_digest": "b" * 64,
+            "integrity_status": "current",
+            "records": [],
+            "denominator": {"records": 0, "active": 0, "review_todo": 0},
+            "limitations": [{"code": "report_gate_unchanged"}],
+        }
+
+    host._research_notebook_archive_payload = notebook_payload
+    destination = tmp_path / "with-notebook"
+    destination.mkdir()
+
+    exported = export_capsule(service, "project.yaml", revision_id, str(destination))
+
+    assert calls == [("project.yaml", host.project_id, revision_id)]
+    with zipfile.ZipFile(destination / exported["file"]["name"]) as archive:
+        ledger = json.loads(archive.read("research-notebook/ledger.json"))
+        assert ledger["bound_report_revision_id"] == revision_id
+        assert ledger["ledger_head_digest"] == "b" * 64
 
 
 def test_capsule_destination_tokens_expire_and_never_disclose_paths(

@@ -8,7 +8,7 @@ The deterministic core runs locally and over user-configured SSH connections. Ex
 >
 > 工程地图：[STRUCTURE.md](STRUCTURE.md) · 历史发布记录：[CHANGELOG.md](CHANGELOG.md)
 >
-> 科学边界：[验证说明](docs/validation.md) · [失败分类](docs/failure-taxonomy.md) · [报告状态与证据合同](docs/report-state-contract.md)
+> 科学边界：[验证说明](docs/validation.md) · [失败分类](docs/failure-taxonomy.md) · [报告状态与证据合同](docs/report-state-contract.md) · [Research Notebook 合同](docs/research-notebook-contract.md)
 
 ## 当前工作台
 
@@ -37,6 +37,7 @@ The deterministic core runs locally and over user-configured SSH connections. Ex
 | Analyze | capability cards；Task Results；DOS/PDOS、Bands、功函数、Bader、差分电荷、ELF 分布摘要；Property calculators | 只显示服务端解析器给出的数值、来源 hash 和分母。ELF 解析严格校验 ELFCAR 主网格并仅给分布统计，不据此宣称成键、盆、临界点或拓扑结论 |
 | Analyze / Governance | 下一步计算建议与确认后的只读 draft intent | 只从绑定当前数据指纹、经人工科学复核的 ValidationResult 和冻结分析信号派生；不含命令，不授权或自动提交作业 |
 | Publish | revision scientific diff、Evidence/Claim Graph、确定性 SI capsule | 每次从权威历史重新校验冻结 revision；缺失证据边显式标记。capsule 去除密钥/绝对路径、不覆盖已有文件；生成 diagnostic capsule 不等于科学 final |
+| Project / Publish | 本地优先 Research Notebook、append-only 决策时间线与 Human Review Ledger | 正文/附件不进入 workspace localStorage；编辑追加 supersedes、删除追加 tombstone；actor 是本地自声明而非认证/电子签名，审阅记录不提升 ValidationResult、claims、final 或 accepted |
 | Home / Resume Center | 恢复当前会话的设置、导入流程和报告配置草稿入口 | 恢复的是有界草稿引用和权威持久状态，不把浏览器草稿提升为项目事实或已发布报告 |
 | Environment / Jobs | 实验室策略模板和基于台账/manifest 的资源预测 | 都是建议；策略必须显式确认且不改写旧作业，预测缺证据时保持 unavailable/低置信度，二者都不能旁路提交确认和幂等门禁 |
 
@@ -124,7 +125,9 @@ Publish → Versions 还提供三种只读/导出工具：
 
 - **Scientific diff**：选择两个权威 history revision，分别重新校验 bundle，再比较 ReportSpec scope、输入/快照 hash、validation 状态与 checks、科学资格、模型数值、图表以及文件/manifest hash；不会用日期差异冒充科学差异；
 - **Evidence/Claim Graph**：只从冻结 spec、snapshot、validation、model 和 claim 记录构建 conclusion/table/figure/check/source/job/file-hash 关系；缺边明确显示为 missing，不读取可变 live 文件，也不公开本地路径；
-- **SI capsule**：通过服务端目录选择生成确定性 ZIP，包含规范化合同、输入 manifest、模型/图表元数据、Methods、BibTeX、环境/版本、validation 记录、capsule manifest 和 `SHA256SUMS`；排除秘密、绝对路径、缓存和可变 live 文件，且绝不覆盖同名文件。
+- **SI capsule**：通过服务端目录选择生成确定性 ZIP，包含规范化合同、输入 manifest、模型/图表元数据、Methods、BibTeX、环境/版本、validation 记录、Research Notebook ledger/限制、capsule manifest 和 `SHA256SUMS`；排除秘密、绝对路径、附件正文、缓存和可变 live 文件，且绝不覆盖同名文件。
+
+Project 与 Publish 还提供项目级 Research Notebook。journal 使用跨进程锁、revision CAS、链式 record digest、append-only supersedes/tombstone；每次读取重新验证 opaque project/job/source/report revision 关联并显示 `current`、`stale` 或 `missing`。人工审阅只记录本机明确输入的自声明 actor、角色、决定、requested changes 与署名说明，不是认证或密码学签名，也不会自动产生 `human_scientific_reviewed`。完整边界见 [Research Notebook 合同](docs/research-notebook-contract.md)。
 
 格式边界：
 

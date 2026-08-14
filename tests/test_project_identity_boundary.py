@@ -170,6 +170,9 @@ def test_all_public_project_bridges_reject_raw_absolute_locator(tmp_path):
         lambda: api.proj_batch_report(
             [raw, raw + ".other"], str(tmp_path / "batch")),
         lambda: api.proj_compare_figures([raw, raw + ".other"]),
+        lambda: api.research_notebook_bootstrap(raw),
+        lambda: api.research_notebook_append(raw, {}, 0),
+        lambda: api.research_notebook_tombstone(raw, "rn-x", "reason", {}, 0),
     ]
 
     for invoke in calls:
@@ -177,6 +180,85 @@ def test_all_public_project_bridges_reject_raw_absolute_locator(tmp_path):
         assert result["ok"] is False
         _assert_no_registered_locator(
             result, locators, forbid_project_keys=False)
+
+
+def test_research_notebook_api_uses_opaque_project_identity_revision_cas_and_safe_dto(
+    tmp_path,
+):
+    api, locators, _projects = _api(tmp_path)
+    project_id = api.proj_list()["projects"][0]["project_id"]
+    actor = {"id": "reviewer-a", "display_name": "Reviewer A", "role": "PI"}
+
+    empty = api.research_notebook_bootstrap(project_id)
+    assert empty["ok"] is True
+    assert empty["revision"] == 0
+    created = api.research_notebook_append(project_id, {
+        "record_type": "note",
+        "category": "observation",
+        "body": r"Observed under C:\private\project\OUTCAR",
+        "actor": actor,
+        "links": [{"kind": "project", "id": project_id}],
+    }, 0)
+
+    assert created["ok"] is True
+    assert created["revision"] == 1
+    assert created["records"][0]["body"] == "Observed under <local-path>"
+    assert created["records"][0]["links"][0]["status"] == "current"
+    _assert_no_registered_locator(created, locators, forbid_project_keys=False)
+
+    conflict = api.research_notebook_append(project_id, {
+        "record_type": "decision", "category": "decision", "body": "Keep baseline",
+        "actor": actor,
+    }, 0)
+    assert conflict["ok"] is False
+    assert conflict["error_code"] == "revision_conflict"
+    assert conflict["revision"] == 1
+
+
+def test_research_notebook_api_rejects_actor_spoof_and_gate_fields(tmp_path):
+    api, locators, _projects = _api(tmp_path)
+    project_id = api.proj_list()["projects"][0]["project_id"]
+    spoofed = api.research_notebook_append(project_id, {
+        "record_type": "review", "category": "review", "body": "Approved",
+        "actor": {
+            "id": "assistant", "display_name": "Assistant", "role": "reviewer",
+            "reviewer_type": "human",
+        },
+        "review": {"decision": "approved", "local_human_attestation": True},
+    }, 0)
+    gate_spoof = api.research_notebook_append(project_id, {
+        "record_type": "note", "category": "observation", "body": "Claim",
+        "actor": {"id": "alice", "display_name": "Alice", "role": "reviewer"},
+        "scientific_qualification": "human_scientific_reviewed",
+    }, 0)
+
+    assert spoofed["ok"] is False
+    assert "server-controlled" in spoofed["error"]
+    assert gate_spoof["ok"] is False
+    assert "unsupported fields" in gate_spoof["error"]
+    for payload in (spoofed, gate_spoof):
+        _assert_no_registered_locator(payload, locators, forbid_project_keys=False)
+
+
+def test_research_notebook_attachment_picker_returns_only_opaque_selection(tmp_path):
+    api, locators, _projects = _api(tmp_path)
+    project_id = api.proj_list()["projects"][0]["project_id"]
+    attachment = tmp_path / "private-evidence.txt"
+    attachment.write_text("evidence", encoding="utf-8")
+    api._dialog_fn = lambda kind: [str(attachment)] if kind == "files" else None
+
+    selected = api.research_notebook_pick_attachments(project_id)
+
+    assert selected["ok"] is True
+    assert selected["selection_token"].startswith("notebook-attachment.")
+    assert selected["files"] == [{
+        "name": "private-evidence.txt",
+        "size": len(b"evidence"),
+        "sha256": __import__("hashlib").sha256(b"evidence").hexdigest(),
+        "media_type": "text/plain",
+    }]
+    _assert_no_registered_locator(selected, locators, forbid_project_keys=False)
+    assert str(attachment) not in json.dumps(selected)
 
 
 def test_unknown_and_duplicate_project_ids_fail_closed(tmp_path):
