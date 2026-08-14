@@ -16,6 +16,11 @@ from typing import Any, Mapping, Sequence
 
 from vcstudio.project.analysis_registry import AnalysisSpec
 from vcstudio.project import comparison
+from vcstudio.project.analysis_scientific import (
+    build_aimd_analysis_view,
+    build_convergence_analysis_view,
+    build_neb_analysis_view,
+)
 
 
 VIEW_SCHEMA = "vcstudio.analysis-view/v1"
@@ -703,6 +708,7 @@ def build_comparison_view(items: Sequence[Mapping[str, Any]],
 
 
 __all__ = [
-    "VIEW_SCHEMA", "build_adsorption_view", "build_free_energy_view",
-    "build_comparison_view",
+    "VIEW_SCHEMA", "build_adsorption_view", "build_aimd_analysis_view",
+    "build_comparison_view", "build_convergence_analysis_view",
+    "build_free_energy_view", "build_neb_analysis_view",
 ]

@@ -29,6 +29,9 @@ def test_catalog_unifies_analysis_and_task_capabilities_without_builder_locators
     assert [item["id"] for item in catalog["analyses"]] == [
         "adsorption-energy",
         "free-energy-path",
+        "neb-path",
+        "convergence-scan",
+        "aimd-diagnostics",
         "task-results",
         "electronic-structure",
         "charge-wavefunction",
@@ -152,6 +155,9 @@ def test_semantic_hash_changes_with_scientifically_visible_options():
 
 @pytest.mark.parametrize("analysis_id", [
     "free-energy-path",
+    "neb-path",
+    "convergence-scan",
+    "aimd-diagnostics",
     "task-results",
     "electronic-structure",
     "charge-wavefunction",

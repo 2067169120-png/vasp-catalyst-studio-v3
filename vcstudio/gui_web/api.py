@@ -7736,6 +7736,14 @@ class Api:
                 'available' if self._project_member_dirs(project) else 'missing_prerequisite'),
             'free-energy-path': (
                 'available' if mode == 'lis' else 'mode_mismatch'),
+            'neb-path': (
+                'available' if 'neb' in task_types else 'missing_prerequisite'),
+            'convergence-scan': (
+                'available' if task_types & {
+                    'conv_scan', 'conv_encut', 'conv_kmesh',
+                    'conv_vacuum', 'conv_thickness'} else 'missing_prerequisite'),
+            'aimd-diagnostics': (
+                'available' if 'aimd' in task_types else 'missing_prerequisite'),
             'task-results': ('available' if targets else 'missing_prerequisite'),
             'electronic-structure': (
                 'available' if task_types & {'dos_pdos', 'bands', 'workfunction'}
@@ -7769,14 +7777,16 @@ class Api:
         from vcstudio.project.analysis_registry import normalize_analysis_request
         from vcstudio.project.analysis_views import (
             build_adsorption_view,
+            build_aimd_analysis_view,
             build_comparison_view,
+            build_convergence_analysis_view,
             build_free_energy_view,
+            build_neb_analysis_view,
         )
         from vcstudio.project.analysis_sources import (
             build_property_view,
             build_task_analysis_view,
         )
-
         context = self._report_workbench_project_context(path)
         prepared = {} if request is None else copy.deepcopy(request)
         if not isinstance(prepared, dict):
@@ -7861,6 +7871,18 @@ class Api:
                 runner=lambda target_path, kind: self.analyze_task(
                     target_path, kind=kind),
                 parser_identities=self._analysis_workbench_parser_identities(),
+                method_evidence=self._analysis_workbench_method_evidence,
+            )
+        elif spec.analysis_id in {
+                'neb-path', 'convergence-scan', 'aimd-diagnostics'}:
+            targets = self._analysis_workbench_targets(context)
+            builders = {
+                'neb-path': build_neb_analysis_view,
+                'convergence-scan': build_convergence_analysis_view,
+                'aimd-diagnostics': build_aimd_analysis_view,
+            }
+            view = builders[spec.analysis_id](
+                spec, targets,
                 method_evidence=self._analysis_workbench_method_evidence,
             )
         elif spec.analysis_id == 'property-calculators':

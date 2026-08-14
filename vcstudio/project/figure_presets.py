@@ -25,6 +25,8 @@ _RENDERER_TARGETS = {
     'free_energy_ladder':  ('vcstudio.external.native_charts', 'free_energy_ladder'),
     'pdos_plot':           ('vcstudio.external.native_charts', 'pdos_plot'),
     'charge_profile_plot': ('vcstudio.external.native_charts', 'charge_profile_plot'),
+    'convergence_plot':    ('vcstudio.generate.conv_scan', 'conv_plot'),
+    'energy_time_plot':    ('vcstudio.external.native_charts', 'energy_time_plot'),
     'cohp_plot':           ('vcstudio.external.lobster', 'cohp_plot'),
     'neb_profile_plot':    ('vcstudio.project.neb', 'neb_profile_plot'),
 }
@@ -118,6 +120,25 @@ def _a_charge(fn, data, out_path, params):
     return fn(data['z'], data['rho'], out_path, regions=data.get('regions'), **params)
 
 
+def _a_convergence(fn, data, out_path, params):
+    _need(data, ['points'], '收敛测试曲线')
+    kw = dict(params)
+    for key in ('converged_at', 'threshold_mev', 'natoms', 'xlabel'):
+        if data.get(key) is not None:
+            kw.setdefault(key, data[key])
+    return fn(data['points'], out_path, **kw)
+
+
+def _a_aimd(fn, data, out_path, params):
+    _need(data, ['steps'], 'AIMD 能量-温度诊断图')
+    # A frozen server view may already carry an explicit time coordinate.  In
+    # that case dt_fs is provenance, not another scaling instruction.
+    has_time = any(isinstance(item, dict) and item.get('time') is not None
+                   for item in data['steps'])
+    dt_fs = None if has_time else data.get('dt_fs')
+    return fn(data['steps'], out_path, dt_fs=dt_fs, **params)
+
+
 _ADAPTERS = {
     'adsorption_bar': _a_adsorption_bar,
     'heatmap_matrix': _a_heatmap,
@@ -129,6 +150,8 @@ _ADAPTERS = {
     'cohp_plot': _a_cohp,
     'neb_profile_plot': _a_neb,
     'charge_profile_plot': _a_charge,
+    'convergence_plot': _a_convergence,
+    'energy_time_plot': _a_aimd,
 }
 
 
@@ -238,7 +261,15 @@ _SVG_CONVERGE = ('<svg xmlns="http://www.w3.org/2000/svg" width="80" height="60"
                  '<line x1="12" y1="24" x2="70" y2="24" stroke="#bbb" stroke-dasharray="3,2"/>'
                  '<polyline points="16,12 24,34 32,20 40,28 48,23 56,25 64,24 70,24" '
                  'fill="none" stroke="#4477AA" stroke-width="1.3"/>'
-                 '<text x="44" y="46" font-size="8" fill="#bbb" text-anchor="middle">TODO</text></svg>')
+                 '<circle cx="48" cy="23" r="3" fill="#DDAA33" stroke="#333"/>'
+                 '</svg>')
+
+_SVG_AIMD = ('<svg xmlns="http://www.w3.org/2000/svg" width="80" height="60" viewBox="0 0 80 60">'
+             '<line x1="10" y1="50" x2="72" y2="50" stroke="#888"/>'
+             '<path d="M12,31 L18,27 L24,34 L30,25 L36,29 L42,26 L48,31 L54,27 L60,30 L68,28" '
+             'fill="none" stroke="#4477AA" stroke-width="1.3"/>'
+             '<path d="M12,40 L18,38 L24,42 L30,35 L36,39 L42,34 L48,37 L54,33 L60,36 L68,32" '
+             'fill="none" stroke="#EE6677" stroke-width="1.1"/></svg>')
 
 
 # ── 预设注册表(≥12;renderer 名须为 _RENDERER_TARGETS 键或 'todo')──────────────
@@ -328,10 +359,17 @@ PRESETS = [
     },
     {
         'key': 'convergence_curve', 'name': '收敛测试曲线', 'category': '结构',
-        'description': '截断能/K 点/离子步收敛曲线(能量或力对参数收敛)。该图型将在后续版本提供。',
-        'required_data': "各测试点的真实参数与对应能量/力(如 ENCUT 序列 vs E0);零编造,须真实历史值。",
-        'thumbnail_svg': _SVG_CONVERGE, 'renderer': 'todo',
-        'params_schema': {'metric': 'energy', 'xlabel': 'ENCUT (eV)', 'title': ''},
+        'description': '截断能/K 点/真空/层厚的服务器冻结收敛点、阈值带与推荐点。',
+        'required_data': "points=[{x,energy}] + 显式 threshold_mev/natoms/converged_at;仅绑定真实扫描历史。",
+        'thumbnail_svg': _SVG_CONVERGE, 'renderer': 'convergence_plot',
+        'params_schema': {'xlabel': 'parameter', 'title': ''},
+    },
+    {
+        'key': 'aimd_diagnostic', 'name': 'AIMD 能量-温度诊断图', 'category': '结构',
+        'description': '服务器冻结的总能与温度时间线；仅作轨迹诊断，不宣称长期热稳定。',
+        'required_data': "steps=[{time,energy,temperature}]，可附 dt_fs；数值须来自权威 AIMD 解析视图。",
+        'thumbnail_svg': _SVG_AIMD, 'renderer': 'energy_time_plot',
+        'params_schema': {'title': ''},
     },
 ]
 
@@ -447,11 +485,20 @@ _PRESET_EN = {
     'convergence_curve': {
         'name_en': 'Convergence-test curve',
         'description_en': (
-            'Cutoff-energy, k-point, or ionic-step convergence of energy or force. '
-            'This plot type is planned for a later release.'),
+            'Server-frozen cutoff-energy, k-point, vacuum, or slab-thickness '
+            'points with an explicit threshold band and recommended point.'),
         'required_data_en': (
-            'Real parameter values and their measured energies or forces, such as '
-            'an ENCUT series versus E0; no synthetic values are allowed.'),
+            'points=[{x, energy}] plus explicit threshold_mev, natoms, and '
+            'converged_at values bound to real scan history.'),
+    },
+    'aimd_diagnostic': {
+        'name_en': 'AIMD energy-temperature diagnostic',
+        'description_en': (
+            'Server-frozen total-energy and temperature timeline for trajectory '
+            'diagnostics only; it is not a long-time thermal-stability claim.'),
+        'required_data_en': (
+            'steps=[{time, energy, temperature}] with optional dt_fs, produced by '
+            'the authoritative AIMD analysis view.'),
     },
 }
 

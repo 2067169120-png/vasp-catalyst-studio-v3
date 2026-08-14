@@ -81,6 +81,7 @@ JOURNEY_HIDDEN_IMPORTS = (
     'vcstudio.project.adsorption',
     'vcstudio.project.analysis_sources',
     'vcstudio.project.analysis_registry',
+    'vcstudio.project.analysis_scientific',
     'vcstudio.project.analysis_views',
     'vcstudio.project.elf',
     'vcstudio.project.lab_policies',
