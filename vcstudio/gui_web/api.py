@@ -2421,6 +2421,165 @@ class Api:
                 'error': self._workspace_public_text(exc),
             }
 
+    # ── Strict scientific fingerprint / explainable reuse advisory ────────
+    def _calculation_reuse_index(self, *, selected_job_ids=()):
+        """Rebuild the bounded derivative index from current authoritative jobs."""
+        from vcstudio.project.calculation_reuse import CalculationReuseIndex
+
+        entries = list(self._ledger.load_all())
+        pmap = self._project_role_map()
+
+        def opaque_job_id(directory, manifest):
+            return self._workspace_job_id(directory, manifest)
+
+        def opaque_project_id(directory, _manifest):
+            group = pmap.get(os.path.normcase(os.path.normpath(directory)))
+            return str(group.get('project_id') or '') or None if group else None
+
+        # Keep explicitly selected targets inside the bounded window even when
+        # a very large ledger truncates older advisory candidates.
+        selected = {str(item or '').strip() for item in selected_job_ids}
+        ordinary, targets = [], []
+        for entry in entries:
+            directory, manifest = entry
+            identifier = (self._workspace_job_id(directory, manifest)
+                          if isinstance(manifest, dict) else '')
+            (targets if identifier in selected else ordinary).append(entry)
+        ordered = ordinary + targets
+        return CalculationReuseIndex().rebuild(
+            ordered, job_id=opaque_job_id, project_id=opaque_project_id)
+
+    @staticmethod
+    def _reuse_job_ids(value):
+        if (not isinstance(value, list) or not 1 <= len(value) <= 512
+                or any(not isinstance(item, str) or not item.strip() for item in value)):
+            raise ValueError('job_ids must contain between 1 and 512 opaque IDs')
+        requested = [item.strip() for item in value]
+        if len(set(requested)) != len(requested):
+            raise ValueError('job_ids must be unique')
+        return requested
+
+    def jobs_reuse_advisory(self, job_ids):
+        """Return path-free exact/near/outcome matches; never reuse automatically."""
+        from vcstudio.project.calculation_reuse import ADVISORY_SCHEMA
+
+        try:
+            requested = self._reuse_job_ids(job_ids)
+            result = self._calculation_reuse_index(
+                selected_job_ids=requested).advisory(requested)
+            return self._analysis_workbench_public_value(result)
+        except Exception as exc:                         # noqa: BLE001 public seam
+            return {
+                'schema': ADVISORY_SCHEMA, 'ok': False, 'advisory_only': True,
+                'automatic_reuse': False, 'equivalence_claim': False,
+                'authorizes_submission': False, 'requires_user_confirmation': True,
+                'targets': [], 'index': None,
+                'error': self._workspace_public_text(exc),
+            }
+
+    def _calculation_reuse_records(self, requested_ids):
+        index = self._calculation_reuse_index(selected_job_ids=requested_ids)
+        records = {}
+        duplicates = set()
+        for record in index.records:
+            if record.job_id in records:
+                duplicates.add(record.job_id)
+            records[record.job_id] = record
+        if duplicates:
+            raise ValueError('ledger contains duplicate opaque job IDs')
+        missing = set(requested_ids) - set(records)
+        if missing:
+            raise ValueError('one or more job IDs are not present in the authoritative ledger')
+        return records
+
+    def jobs_reference_existing_result(self, target_job_id, source_job_id,
+                                       decision_id, reason=''):
+        """Consume one explicit user choice and persist new target provenance."""
+        from vcstudio.project.calculation_reuse import record_reuse_reference
+
+        try:
+            target_id = str(target_job_id or '').strip()
+            source_id = str(source_job_id or '').strip()
+            records = self._calculation_reuse_records([target_id, source_id])
+            target = records[target_id]
+            source = records[source_id]
+            result = record_reuse_reference(
+                target.job_dir, source.job_dir, decision_id=decision_id,
+                reason=reason, target_project_id=target.project_id,
+                source_project_id=source.project_id)
+            return self._analysis_workbench_public_value(result)
+        except Exception as exc:                         # noqa: BLE001 public seam
+            return {
+                'ok': False, 'target_job_id': None, 'source_job_id': None,
+                'accepted_inherited': False, 'final_inherited': False,
+                'error': self._workspace_public_text(exc),
+            }
+
+    def jobs_force_recalculation(self, job_ids, decision_id, reason):
+        """Persist a reason for deliberately recalculating exact-match targets."""
+        from vcstudio.project.calculation_reuse import record_force_recalculation
+
+        try:
+            requested = self._reuse_job_ids(job_ids)
+            records = self._calculation_reuse_records(requested)
+            results = []
+            for job_id in requested:
+                recorded = record_force_recalculation(
+                    records[job_id].job_dir, decision_id=decision_id, reason=reason)
+                results.append({
+                    'job_id': job_id, 'replayed': bool(recorded.get('replayed')),
+                    'decision_id': (recorded.get('decision') or {}).get('decision_id'),
+                })
+            return self._analysis_workbench_public_value({
+                'ok': True, 'reason_retained': True, 'results': results,
+            })
+        except Exception as exc:                         # noqa: BLE001 public seam
+            return {'ok': False, 'reason_retained': False, 'results': [],
+                    'error': self._workspace_public_text(exc)}
+
+    def _reuse_submission_guard(self, dirs):
+        """Require an explicit choice before submitting a reusable exact match."""
+        from vcstudio.project.calculation_reuse import has_current_force_recalculation
+
+        entries = list(self._ledger.load_all())
+        by_path = {
+            os.path.normcase(os.path.realpath(os.path.abspath(str(directory)))):
+                (directory, manifest)
+            for directory, manifest in entries if isinstance(manifest, dict)
+        }
+        requested_ids = []
+        requested_manifests = {}
+        for raw_dir in dirs or []:
+            key = os.path.normcase(os.path.realpath(os.path.abspath(str(raw_dir))))
+            entry = by_path.get(key)
+            if entry is None:
+                continue
+            directory, manifest = entry
+            job_id = self._workspace_job_id(directory, manifest)
+            requested_ids.append(job_id)
+            requested_manifests[job_id] = manifest
+        if not requested_ids:
+            return None
+        index = self._calculation_reuse_index(selected_job_ids=requested_ids)
+        advisory = index.advisory(requested_ids)
+        record_by_id = {record.job_id: record for record in index.records}
+        blocked = []
+        for target in advisory.get('targets') or []:
+            if not target.get('requires_explicit_choice'):
+                continue
+            record = record_by_id.get(target.get('target_job_id'))
+            manifest = requested_manifests.get(target.get('target_job_id'))
+            if (record is None or manifest is None
+                    or not has_current_force_recalculation(manifest, record.fingerprint)):
+                blocked.append(target.get('target_job_id'))
+        if not blocked:
+            return None
+        return self._analysis_workbench_public_value({
+            'ok': False, 'code': 'reuse_decision_required',
+            'error': '发现可重验的严格 exact match；请先显式引用既有结果，或填写理由后强制重算。',
+            'blocked_job_ids': blocked, 'advisory': advisory,
+        })
+
     # ── 任务:远程动作(一律先 _resolve 再委托 batch_ops 同名函数) ─────────
     def _delegate(self, name, password, fn):
         """五个远程方法的公共壳:解析集群+密码 → 委托 batch_ops;任何异常兜成 error dict。
@@ -2565,6 +2724,12 @@ class Api:
                 for key in ('fingerprint', 'algorithm', 'host')}
 
     def submit_jobs(self, dirs, name, password, trust_new=False, idempotency_key=None):
+        try:
+            guarded = self._reuse_submission_guard(dirs)
+        except Exception as exc:                         # noqa: BLE001 public seam
+            return {'ok': False, 'error': self._workspace_public_text(exc)}
+        if guarded is not None:
+            return guarded
         return self._delegate(name, password,
                               lambda prof, pw: self._run_job_operation_once(
                                   idempotency_key, action='submit', profile=prof.name,
@@ -4393,7 +4558,8 @@ class Api:
             return {**empty, 'error': str(e)}
 
     def submit_project_with_resources(self, project_id, profile_name, cores,
-                                      walltime, password=None, trust_new=False):
+                                      walltime, password=None, trust_new=False,
+                                      idempotency_key=None):
         """Submit one registered project selected by opaque identity."""
         try:
             record = self._resolve_project_id(project_id)
@@ -4405,7 +4571,8 @@ class Api:
             [record],
             lambda: self._submit_project_with_resources_for_path(
                 record['path'], profile_name, cores, walltime,
-                password=password, trust_new=trust_new),
+                password=password, trust_new=trust_new,
+                idempotency_key=idempotency_key),
             failure={
                 'results': [], 'submitted': [], 'skipped': [],
                 'resources': {}, 'needs_trust': False,
@@ -4414,7 +4581,7 @@ class Api:
 
     def _submit_project_with_resources_for_path(
             self, project_path, profile_name, cores,
-            walltime, password=None, trust_new=False):
+            walltime, password=None, trust_new=False, idempotency_key=None):
         """按本次选择的核数/墙时提交项目，不改集群 profile 的持久配置。"""
         base = {'ok': False, 'results': [], 'submitted': [], 'skipped': [],
                 'resources': {}, 'needs_trust': False}
@@ -4614,10 +4781,22 @@ class Api:
                         'error': ('；'.join(persistence_errors) if persistence_errors else
                                   ('没有可提交作业；' + '；'.join(
                                       f'{self._base(row["dir"])}:{row["reason"]}'
-                                      for row in unsafe) if unsafe else None))}
+                                  for row in unsafe) if unsafe else None))}
 
-            response = self._bo().submit_batch(
-                launch_profile, pw, eligible, trust_new)
+            guarded = self._reuse_submission_guard(eligible)
+            if guarded is not None:
+                return {**base, 'skipped': skipped, 'resources': resources,
+                        'code': guarded.get('code'),
+                        'blocked_job_ids': guarded.get('blocked_job_ids') or [],
+                        'reuse_advisory': guarded.get('advisory'),
+                        'error': guarded.get('error')}
+
+            response = self._run_job_operation_once(
+                idempotency_key,
+                action=f'project-submit:{ncores}:{wall}', profile=prof.name,
+                dirs=eligible, invoke=lambda: self._submit_batch_with_idempotency(
+                    self._bo().submit_batch, launch_profile, pw, eligible,
+                    trust_new, idempotency_key))
             if response.get('needs_trust'):
                 return {**base, 'skipped': skipped, 'resources': resources,
                         'needs_trust': True,

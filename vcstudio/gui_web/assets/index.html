@@ -2666,11 +2666,23 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
         <button class="btn" id="jb-tray-cancel" data-i18n="jobs.selection.cancel">取消作业</button>
         <button class="btn quiet" id="jb-tray-remove" data-i18n="jobs.selection.remove">移出台账</button>
         <button class="btn quiet" id="jb-tray-forecast" data-i18n="jobs.forecast.action">估算资源</button>
+        <button class="btn quiet" id="jb-tray-reuse-scan" data-i18n="jobs.reuse.action">检查重复计算</button>
       </div>
       <section class="jobs-resource-forecast" id="jobs-resource-forecast"
                aria-labelledby="jobs-resource-forecast-heading" aria-live="polite" hidden>
         <h3 id="jobs-resource-forecast-heading" data-i18n="jobs.forecast.title">只读资源估算</h3>
         <div id="jobs-resource-forecast-out"></div>
+      </section>
+      <section class="jobs-reuse-advisory" id="jobs-reuse-advisory"
+               aria-labelledby="jobs-reuse-advisory-heading" aria-live="polite" hidden>
+        <h3 id="jobs-reuse-advisory-heading" data-i18n="jobs.reuse.title">严格科学指纹与重复计算提示</h3>
+        <div id="jobs-reuse-advisory-out"></div>
+        <label class="jobs-reuse-reason" id="jobs-reuse-reason-wrap" hidden>
+          <span data-i18n="jobs.reuse.force_reason_label">仍要重算的理由（发现可复用 exact match 时必填）</span>
+          <textarea id="jobs-reuse-reason" class="ipt" rows="2" maxlength="1000"
+                    placeholder="例如：独立复现、不同随机种子或审计要求"
+                    data-i18n-placeholder="jobs.reuse.force_reason_placeholder"></textarea>
+        </label>
       </section>
       <ul class="jobs-selection-list" id="jobs-selection-list"></ul>
     </section>
