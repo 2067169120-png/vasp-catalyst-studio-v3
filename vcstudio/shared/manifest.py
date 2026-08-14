@@ -208,7 +208,8 @@ def create_from_build(job_dir: str | os.PathLike, build_result: dict, *,
                       validate: bool = True,
                       task_type: str | None = None,
                       system: str = '',
-                      method_recipe_ref: dict | None = None) -> dict:
+                      method_recipe_ref: dict | None = None,
+                      job_id: str | None = None) -> dict:
     """在 build_job_dir 成功后落一份 job.yaml。返回 manifest dict。
 
     build_result 即 build_job_dir 的返回值({'ok','out_dir','warnings','kpoints',
@@ -257,7 +258,8 @@ def create_from_build(job_dir: str | os.PathLike, build_result: dict, *,
     if potcar_file.is_file():
         inputs['potcar_sha256'] = sha256_file(potcar_file)
     m = new_manifest(
-        job_id=f'{job_dir.resolve().name}-{time.strftime("%Y%m%d-%H%M%S")}',
+        job_id=(str(job_id) if job_id is not None
+                else f'{job_dir.resolve().name}-{time.strftime("%Y%m%d-%H%M%S")}'),
         system=system or _poscar_system_name(poscar_path),
         task_type=task_type,
         calc_type=str(build_result.get('calc_type') or ''),

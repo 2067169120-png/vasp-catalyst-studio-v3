@@ -67,6 +67,7 @@ def _request(tmp_path: Path, *, existing: str | None = None, draft=None,
         "draft": copy.deepcopy(draft or _draft(policy_id=policy_id)),
         "policy_id": policy_id,
         "project_id": None,
+        "client_intent_id": "test-method-recipe-intent",
     }, out
 
 
@@ -75,6 +76,7 @@ def _confirmation(preview, *, resolutions=None, key="recipe-confirm-1"):
         "token": preview["token"],
         "preview_sha256": preview["preview_sha256"],
         "target_id": preview["target_id"],
+        "client_intent_id": preview["client_intent_id"],
         "confirmed": True,
         "idempotency_key": key,
         "resolutions": resolutions or {},
@@ -157,6 +159,10 @@ def test_preview_token_is_single_use_tamper_bound_and_idempotent(tmp_path):
     forged_target["target_id"] = "0" * 64
     with pytest.raises(method_recipes.MethodRecipeTokenError, match="target identity"):
         service.confirm(forged_target, lambda plan: {"ok": True})
+    forged_intent = _confirmation(preview)
+    forged_intent["client_intent_id"] = "different-browser-intent"
+    with pytest.raises(method_recipes.MethodRecipeTokenError, match="client intent"):
+        service.confirm(forged_intent, lambda plan: {"ok": True})
     forged_token = _confirmation(preview)
     forged_token["token"] += "tampered"
     with pytest.raises(method_recipes.MethodRecipeTokenError, match="unknown"):
@@ -275,6 +281,118 @@ def test_keep_existing_cannot_bypass_fail_closed_functional_mapping(tmp_path):
             _confirmation(preview, resolutions={"GGA": "existing"}),
             lambda plan: {"ok": True},
         )
+
+
+@pytest.mark.parametrize(
+    "tag, value",
+    [
+        ("LUSE_VDW", ".TRUE."),
+        ("LNONCOLLINEAR", ".TRUE."),
+        ("LSORBIT", ".TRUE."),
+        ("SAXIS", "0 0 1"),
+        ("AEXX", 0.25),
+        ("MYSTERY_SCIENCE_CONTROL", 1),
+    ],
+)
+def test_existing_method_significant_or_unknown_tags_cannot_pass_through(
+        tmp_path, tag, value):
+    request, _out = _request(tmp_path, existing=f"{tag} = {value}\n")
+    service = method_recipes.MethodRecipeService()
+    preview = service.preview(request)
+
+    item = next(entry for entry in preview["diff"] if entry["key"] == tag)
+    assert item["status"] == "remove_conflict"
+    assert item["proposed"] is None
+    assert item["requires_resolution"] is True
+    assert preview["recipe"]["final"]["INCAR"][tag]["risk"] == "blocking"
+
+    with pytest.raises(method_recipes.MethodRecipeError, match="method-significant"):
+        service.confirm(
+            _confirmation(preview, resolutions={tag: "existing"}),
+            lambda plan: {"ok": True},
+        )
+
+    captured = {}
+    result = service.confirm(
+        _confirmation(preview, resolutions={tag: "recipe"}, key=f"remove-{tag}"),
+        lambda plan: captured.update(plan) or {"ok": True},
+    )
+    assert result["ok"] is True
+    assert tag not in parse_incar(captured["final_incar"])
+
+
+def test_explicit_false_toggles_and_bounded_neutral_tags_are_hashed_passthrough(tmp_path):
+    request, _out = _request(
+        tmp_path, existing="LSORBIT = .FALSE.\nLUSE_VDW = .FALSE.\nNCORE = 4\nSYSTEM = retained\n")
+    service = method_recipes.MethodRecipeService()
+    preview = service.preview(request)
+
+    assert preview["conflicts"] == []
+    captured = {}
+    service.confirm(
+        _confirmation(preview), lambda plan: captured.update(plan) or {"ok": True})
+    parsed = parse_incar(captured["final_incar"])
+    assert parsed["LSORBIT"] is False and parsed["LUSE_VDW"] is False
+    assert parsed["NCORE"] == 4 and parsed["SYSTEM"] == "retained"
+    for key in ("LSORBIT", "LUSE_VDW", "NCORE", "SYSTEM"):
+        entry = captured["recipe"]["final"]["INCAR"][key]
+        assert entry["value"] == parsed[key]
+        assert entry["source"] == "user"
+        assert len(entry["semantic_sha256"]) == 64
+
+
+def test_unsupported_ldautype_99_requires_removal_and_cannot_be_retained(tmp_path):
+    request, _out = _request(tmp_path, existing="LDAUTYPE = 99\n")
+    service = method_recipes.MethodRecipeService()
+    preview = service.preview(request)
+    assert preview["conflicts"] == ["LDAUTYPE"]
+    with pytest.raises(method_recipes.MethodRecipeError, match=r"DFT\+U parameters"):
+        service.confirm(
+            _confirmation(preview, resolutions={"LDAUTYPE": "existing"}),
+            lambda plan: {"ok": True},
+        )
+
+
+@pytest.mark.parametrize(
+    "tag, value, message",
+    [
+        ("MAGMOM", "2*1", "nonspin"),
+        ("IDIPOL", 3, "dipole"),
+        ("DIPOL", "0.5 0.5 0.5", "dipole"),
+        ("EB_K", 78.4, "VASPsol"),
+    ],
+)
+def test_inactive_method_parameters_are_not_compatible_passthrough(
+        tmp_path, tag, value, message):
+    request, _out = _request(tmp_path, existing=f"{tag} = {value}\n")
+    service = method_recipes.MethodRecipeService()
+    preview = service.preview(request)
+    assert preview["conflicts"] == [tag]
+
+    with pytest.raises(method_recipes.MethodRecipeError, match=message):
+        service.confirm(
+            _confirmation(preview, resolutions={tag: "existing"}),
+            lambda plan: {"ok": True},
+        )
+
+
+@pytest.mark.parametrize(
+    "system_type, task", [("molecule", "cellopt"), ("bulk", "workfunction")],
+)
+def test_system_task_compatibility_matrix_rejects_unsupported_pairs(
+        tmp_path, system_type, task):
+    with pytest.raises(method_recipes.MethodRecipeError, match="incompatible"):
+        method_recipes.suggested_draft(system_type, task)
+
+    draft = _draft()
+    draft.update(system_type=system_type, task=task)
+    request, _out = _request(tmp_path, draft=draft)
+    with pytest.raises(method_recipes.MethodRecipeError, match="incompatible"):
+        method_recipes.MethodRecipeService().preview(request)
+
+    catalog = method_recipes.catalog()
+    task_record = next(item for item in catalog["tasks"] if item["key"] == task)
+    assert system_type not in task_record["systems"]
 
 
 def test_confirm_writes_sidecar_manifest_and_registers_without_submission(tmp_path):

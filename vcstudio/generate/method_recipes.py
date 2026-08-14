@@ -32,7 +32,7 @@ from vcstudio.generate.incar_builder import (
     parse_incar,
     vaspsol_keys,
 )
-from vcstudio.generate.kpoints import recommend_kpoints
+from vcstudio.generate.kpoints import kpoints_str, recommend_kpoints
 from vcstudio.generate.poscar import parse_poscar_species, read_cell_vectors
 from vcstudio.generate.potcar import potcar_provenance
 from vcstudio.project import lab_policies, method_policy
@@ -51,6 +51,7 @@ SYSTEM_TYPES = ("molecule", "slab", "bulk")
 SUPPORTED_XC = {"PBE": {"potcar_family": "PAW_PBE", "incar": "PE"}}
 DISPERSION = {"none": None, "d3-zero": 11, "d3-bj": 12}
 PRECISION = {"normal": "Normal", "accurate": "Accurate"}
+SUPPORTED_LDAUTYPES = frozenset({2})
 
 # These task profiles are intentionally finite.  Complex builders (NEB, AIMD, adsorption
 # projects, convergence series, and so on) keep using their dedicated workflows rather than being
@@ -66,6 +67,17 @@ _TASK_PROFILES: dict[str, dict[str, Any]] = {
     "freq": {"IBRION": 5, "NSW": 1, "POTIM": 0.015},
     "vaspsol": {"IBRION": -1, "NSW": 0},
 }
+_TASK_SYSTEMS: dict[str, frozenset[str]] = {
+    "relax": frozenset({"molecule", "slab", "bulk"}),
+    "cellopt": frozenset({"bulk"}),
+    "static": frozenset({"molecule", "slab", "bulk"}),
+    "dos_pdos": frozenset({"molecule", "slab", "bulk"}),
+    "bader": frozenset({"molecule", "slab", "bulk"}),
+    "elf": frozenset({"molecule", "slab", "bulk"}),
+    "workfunction": frozenset({"slab"}),
+    "freq": frozenset({"molecule", "slab", "bulk"}),
+    "vaspsol": frozenset({"molecule", "slab"}),
+}
 _IONIC_TASKS = frozenset({"relax", "cellopt", "freq"})
 _CONVERGENCE_TASKS = ("conv_encut", "conv_kmesh", "conv_vacuum", "conv_thickness")
 _MANAGED_TARGETS = ("INCAR", "POSCAR", "KPOINTS", "POTCAR", "job.yaml", SIDECAR_NAME)
@@ -78,11 +90,11 @@ _DRAFT_FIELDS = frozenset({
 })
 _PREVIEW_REQUEST_FIELDS = frozenset({
     "poscar_path", "incar_path", "out_dir", "lib_root", "draft", "policy_id",
-    "project_id",
+    "project_id", "client_intent_id",
 })
 _CONFIRM_REQUEST_FIELDS = frozenset({
     "token", "preview_sha256", "target_id", "confirmed", "idempotency_key",
-    "resolutions",
+    "resolutions", "client_intent_id",
 })
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _SECRETISH = re.compile(
@@ -94,6 +106,29 @@ _SECRET_VALUE = re.compile(
 )
 _ABSOLUTE_PATH = re.compile(r"(?i)(?:[A-Z]:[\\/]|^/[^\s]+|^\\\\|file://)")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+# Existing INCAR keys are classified exhaustively: a key is either already owned by the recipe,
+# proven method-neutral under this contract, a known disabled-only toggle, a known method tag that
+# must be absent, or unknown-and-denied.  There is no permissive fallback for scientific tags.
+_METHOD_NEUTRAL_PASSTHROUGH = frozenset({
+    "SYSTEM", "NWRITE", "LWAVE", "LCHARG", "LVTOT", "LVHAR", "LELF", "LAECHG",
+    "LORBIT", "NEDOS", "EMIN", "EMAX", "KPAR", "NCORE", "NPAR", "LPLANE", "NSIM",
+    "LSCALU", "LASYNC",
+})
+_METHOD_FALSE_COMPATIBLE = frozenset({
+    "LNONCOLLINEAR", "LSORBIT", "LUSE_VDW", "LSPIRAL",
+})
+_METHOD_MUST_BE_ABSENT = frozenset({
+    # XC / hybrid / vdW-DF combinations unsupported by the bounded PBE recipe.
+    "AEXX", "HFSCREEN", "HFALPHA", "ALDAC", "AGGAC", "AGGAX", "PARAM1", "PARAM2",
+    "ZAB_VDW", "BPARAM", "CPARAM", "VDW_S6", "VDW_S8", "VDW_A1", "VDW_A2",
+    "VDW_SR", "VDW_RADIUS", "VDW_SCALING", "VDW_D", "VDW_CNRADIUS",
+    # Charge, constrained occupations, non-collinear/SOC/spin-constraint controls.
+    "NELECT", "NUPDOWN", "FERWE", "FERDO", "SAXIS", "QSPIRAL", "M_CONSTR",
+    "I_CONSTRAINED_M", "LAMBDA", "RWIGS",
+    # Additional VASPsol controls are not represented by the recipe DTO.
+    "TAU", "LAMBDA_D_K", "NC_K", "SIGMA_K", "C_MOLAR", "R_SOLV",
+})
 
 
 class MethodRecipeError(ValueError):
@@ -155,12 +190,13 @@ def _read_text(path_value: Any, *, field: str, optional: bool = False) -> tuple[
     try:
         if not path.is_file():
             raise MethodRecipeError(f"{field} must name a readable file")
-        raw = path.read_text(encoding="utf-8")
+        raw_bytes = path.read_bytes()
+        raw = raw_bytes.decode("utf-8")
     except MethodRecipeError:
         raise
     except (OSError, UnicodeError) as exc:
         raise MethodRecipeError(f"{field} could not be read") from exc
-    return raw, hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return raw, hashlib.sha256(raw_bytes).hexdigest()
 
 
 def _reason(zh: str, en: str) -> dict[str, str]:
@@ -372,6 +408,8 @@ def _normalize_draft(value: Any, *, elements: list[str], counts: list[int],
         raise MethodRecipeError("task is not present in the task catalog") from exc
     if draft["task"] not in _TASK_PROFILES:
         raise MethodRecipeError("this task requires its dedicated workflow, not a single recipe")
+    if draft["system_type"] not in _TASK_SYSTEMS[draft["task"]]:
+        raise MethodRecipeError("task is incompatible with the selected system_type")
 
     draft["xc"] = str(draft["xc"] or "").strip().upper()
     if draft["xc"] not in SUPPORTED_XC:
@@ -463,6 +501,8 @@ def suggested_draft(system_type: Any, task: Any, policy_id: Any = None) -> dict[
         raise MethodRecipeError("task is not present in the task catalog") from exc
     if selected_task not in _TASK_PROFILES:
         raise MethodRecipeError("this task requires its dedicated workflow, not a single recipe")
+    if system not in _TASK_SYSTEMS[selected_task]:
+        raise MethodRecipeError("task is incompatible with the selected system_type")
     policy = _safe_identifier(policy_id, field="policy_id", optional=True)
     seed, evidence = _policy_seed(policy, system)
     draft = _default_draft()
@@ -491,6 +531,7 @@ def catalog() -> dict[str, Any]:
         tasks.append({
             "key": key, "name_zh": item["name_zh"], "name_en": item["name_en"],
             "category": item["category"], "category_en": item["category_en"],
+            "systems": sorted(_TASK_SYSTEMS[key]),
         })
     return {
         "schema": RECIPE_SCHEMA,
@@ -514,13 +555,21 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _potcar_evidence(elements: list[str], lib_root: str, xc: str) -> tuple[list[dict], str]:
+def _native_text_sha256(value: str) -> str:
+    """Hash bytes produced by the existing text-mode job builder on this platform."""
+    rendered = value if os.linesep == "\n" else value.replace("\n", os.linesep)
+    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+
+def _potcar_evidence(elements: list[str], lib_root: str,
+                     xc: str) -> tuple[list[dict], str, str]:
     try:
         provenance = potcar_provenance(elements, lib_root)
     except Exception as exc:  # POTCAR errors may contain local absolute paths; replace them.
         raise MethodRecipeError("pseudopotential library is incomplete or unreadable") from exc
     expected = SUPPORTED_XC[xc]["potcar_family"]
     evidence = []
+    rendered_chunks = []
     for item in provenance:
         title = str(item.get("titel") or "").strip()
         if not title.upper().startswith(expected.upper()):
@@ -531,6 +580,9 @@ def _potcar_evidence(elements: list[str], lib_root: str, xc: str) -> tuple[list[
         variant = str(item["variant"])
         try:
             content_hash = _file_sha256(Path(lib_root) / variant / "POTCAR")
+            rendered_chunks.append(
+                (Path(lib_root) / variant / "POTCAR").read_text(
+                    encoding="utf-8", errors="replace"))
         except OSError as exc:
             raise MethodRecipeError("pseudopotential library is incomplete or unreadable") from exc
         evidence.append({
@@ -538,7 +590,8 @@ def _potcar_evidence(elements: list[str], lib_root: str, xc: str) -> tuple[list[
             "titel": title, "enmax_eV": float(item["enmax"]),
             "content_sha256": content_hash,
         })
-    return evidence, semantic_sha256(evidence)
+    rendered_sha256 = _native_text_sha256("".join(rendered_chunks))
+    return evidence, semantic_sha256(evidence), rendered_sha256
 
 
 def _origin_entry(field: str, value: Any, *, origins: dict[str, str], reason_zh: str,
@@ -558,9 +611,11 @@ def _origin_entry(field: str, value: Any, *, origins: dict[str, str], reason_zh:
 
 def _build_recipe(draft: dict[str, Any], origins: dict[str, str], *, poscar_text: str,
                   poscar_sha256: str, elements: list[str], counts: list[int],
-                  lib_root: str, policy_evidence: dict | None) -> tuple[dict, list[int], str]:
+                  lib_root: str, policy_evidence: dict | None,
+                  ) -> tuple[dict, list[int], str, str]:
     cell = read_cell_vectors(poscar_text)
-    potcar_evidence, potcar_fingerprint = _potcar_evidence(elements, lib_root, draft["xc"])
+    potcar_evidence, potcar_fingerprint, potcar_sha256 = _potcar_evidence(
+        elements, lib_root, draft["xc"])
     task_ev = _task_evidence(draft["task"])
     common = [task_ev, {"kind": "poscar", "sha256": poscar_sha256}]
     if policy_evidence:
@@ -782,13 +837,14 @@ def _build_recipe(draft: dict[str, Any], origins: dict[str, str], *, poscar_text
         "dimensions": dimensions,
         "final": {"INCAR": final_incar, "KPOINTS": final_kpoints},
         "potcar_fingerprint": potcar_fingerprint,
+        "potcar_sha256": potcar_sha256,
         "convergence_dry_run": dry_run,
         "scientific_status": "candidate",
         "scientifically_validated": False,
         "authorizes_submission": False,
     }
     recipe = {**semantic, "semantic_sha256": semantic_sha256(semantic)}
-    return recipe, kpoints, potcar_fingerprint
+    return recipe, kpoints, potcar_fingerprint, potcar_sha256
 
 
 def _vasp_equal(left: Any, right: Any) -> bool:
@@ -881,6 +937,58 @@ def _logical(value: Any) -> bool | None:
     return None
 
 
+def _existing_tag_entry(value: Any, *, key: str, classification: str,
+                        compatible: bool) -> dict[str, Any]:
+    evidence = [{
+        "kind": "method_tag_policy", "key": key, "classification": classification,
+        "policy_version": 1,
+    }]
+    if compatible:
+        return _entry(
+            value=value, source="user",
+            reason_zh="现有标签经明确策略判定不改变本 recipe 声明的方法，可保留并纳入哈希。",
+            reason_en="The explicit tag policy found this existing value compatible with the "
+                      "declared recipe; it is retained and hashed.",
+            risk="low", evidence=evidence, user_override=True)
+    return _entry(
+        value=None, source="user",
+        reason_zh="现有标签会改变或无法证明不改变声明方法，必须显式移除；不能选择保留。",
+        reason_en="This existing tag changes, or cannot be proven not to change, the declared "
+                  "method. It must be explicitly removed and cannot be retained.",
+        risk="blocking", evidence=evidence, user_override=True)
+
+
+def _apply_existing_method_tag_policy(existing: Mapping[str, Any], recipe: dict) -> dict:
+    """Make every existing INCAR key part of the hashed allow/deny contract."""
+    governed = copy.deepcopy(recipe)
+    final = governed["final"]["INCAR"]
+    for raw_key, value in existing.items():
+        key = str(raw_key).upper()
+        if key in final:
+            continue
+        safe_value = _public_diff_value(value) != "[redacted]"
+        if key in _METHOD_NEUTRAL_PASSTHROUGH and safe_value:
+            final[key] = _existing_tag_entry(
+                value, key=key, classification="method_neutral_passthrough", compatible=True)
+        elif key in _METHOD_FALSE_COMPATIBLE and _logical(value) is False and safe_value:
+            final[key] = _existing_tag_entry(
+                value, key=key, classification="disabled_only", compatible=True)
+        elif key in _METHOD_FALSE_COMPATIBLE:
+            final[key] = _existing_tag_entry(
+                value, key=key, classification="disabled_only", compatible=False)
+        elif key in _METHOD_MUST_BE_ABSENT:
+            final[key] = _existing_tag_entry(
+                value, key=key, classification="must_be_absent", compatible=False)
+        else:
+            # Unknown is deny-by-default.  This is intentionally stricter than VASP accepting a
+            # tag: acceptance by the executable is not evidence of compatibility with this recipe.
+            final[key] = _existing_tag_entry(
+                value, key=key, classification="unknown_method_significant", compatible=False)
+    semantic = {key: value for key, value in governed.items() if key != "semantic_sha256"}
+    governed["semantic_sha256"] = semantic_sha256(semantic)
+    return governed
+
+
 def _validate_merged_incar(merged: Mapping[str, Any], recipe: Mapping[str, Any], *,
                            elements: list[str], counts: list[int]) -> None:
     """Reject existing-key choices that would contradict a fail-closed recipe dimension."""
@@ -892,6 +1000,17 @@ def _validate_merged_incar(merged: Mapping[str, Any], recipe: Mapping[str, Any],
         if (_SECRET_VALUE.search(text) or _ABSOLUTE_PATH.search(text.strip())
                 or len(text) > 4096):
             raise MethodRecipeError("final recipe-managed INCAR value is unsafe")
+    for key, entry in recipe["final"]["INCAR"].items():
+        policy = next((item for item in entry.get("evidence", [])
+                       if item.get("kind") == "method_tag_policy"), None)
+        if not policy:
+            continue
+        classification = policy.get("classification")
+        if classification in {"must_be_absent", "unknown_method_significant"} and key in values:
+            raise MethodRecipeError("final INCAR retains a denied method-significant tag")
+        if (classification == "disabled_only" and key in values
+                and _logical(values[key]) is not False):
+            raise MethodRecipeError("final INCAR enables an incompatible method-significant tag")
     xc = recipe["dimensions"]["xc"]["value"]["functional"]
     if xc != "PBE" or not _vasp_equal(values.get("GGA"), "PE"):
         raise MethodRecipeError("final XC to pseudopotential mapping is not PBE/PAW_PBE")
@@ -921,12 +1040,24 @@ def _validate_merged_incar(merged: Mapping[str, Any], recipe: Mapping[str, Any],
         magmom = str(values.get("MAGMOM") or "").strip()
         if not magmom or not counts or _magmom_count(magmom) != sum(counts):
             raise MethodRecipeError("final MAGMOM does not cover every POSCAR atom")
+    elif "MAGMOM" in values:
+        raise MethodRecipeError("final INCAR retains MAGMOM for the explicit nonspin state")
 
     hubbard = recipe["dimensions"]["hubbard_u"]["value"]
     if hubbard["mode"] == "off":
         if _logical(values.get("LDAU", False)) is not False:
             raise MethodRecipeError("final INCAR conflicts with the explicit DFT+U off choice")
+        if any(key in values for key in ("LDAUTYPE", "LDAUL", "LDAUU", "LDAUJ")):
+            raise MethodRecipeError("final INCAR retains inactive or unsupported DFT+U parameters")
     else:
+        try:
+            u_type = int(float(values.get("LDAUTYPE")))
+        except (TypeError, ValueError) as exc:
+            raise MethodRecipeError("final LDAUTYPE is invalid") from exc
+        if u_type not in SUPPORTED_LDAUTYPES:
+            supported = ", ".join(str(item) for item in sorted(SUPPORTED_LDAUTYPES))
+            raise MethodRecipeError(
+                f"final LDAUTYPE is unsupported; allowed values: {supported}")
         plan = {
             "ldau": values.get("LDAU"), "ldautype": values.get("LDAUTYPE"),
             "ldaul": values.get("LDAUL"), "ldauu": values.get("LDAUU"),
@@ -938,14 +1069,16 @@ def _validate_merged_incar(merged: Mapping[str, Any], recipe: Mapping[str, Any],
     dipole = recipe["dimensions"]["dipole"]["value"]
     if dipole == "off" and _logical(values.get("LDIPOL", False)) is not False:
         raise MethodRecipeError("final INCAR conflicts with the explicit dipole-off choice")
+    if dipole == "off" and any(key in values for key in ("IDIPOL", "DIPOL")):
+        raise MethodRecipeError("final INCAR retains inactive dipole parameters")
     if dipole == "slab-z":
         if _logical(values.get("LDIPOL")) is not True or not _vasp_equal(
                 values.get("IDIPOL"), 3):
             raise MethodRecipeError("final INCAR does not match slab-z dipole correction")
 
     solvent = recipe["dimensions"]["solvent"]["value"]["mode"]
-    if solvent == "off" and "LSOL" in values:
-        raise MethodRecipeError("final INCAR still contains a VASPsol-only LSOL tag")
+    if solvent == "off" and any(key in values for key in ("LSOL", "EB_K")):
+        raise MethodRecipeError("final INCAR still contains inactive VASPsol parameters")
     if solvent == "vaspsol" and _logical(values.get("LSOL")) is not True:
         raise MethodRecipeError("final INCAR does not match the selected VASPsol mode")
 
@@ -1016,7 +1149,7 @@ def _merge_incar(existing: Mapping[str, Any], recipe: dict, diff: list[dict],
 
 
 def _dry_public_preview(recipe: dict, diff: list[dict], *, token: str, target_id: str,
-                        expires_at: float) -> dict[str, Any]:
+                        expires_at: float, client_intent_id: str) -> dict[str, Any]:
     conflicts = [item["key"] for item in diff if item["requires_resolution"]]
     return {
         "schema": PREVIEW_SCHEMA,
@@ -1024,6 +1157,7 @@ def _dry_public_preview(recipe: dict, diff: list[dict], *, token: str, target_id
         "token": token,
         "preview_sha256": recipe["semantic_sha256"],
         "target_id": target_id,
+        "client_intent_id": client_intent_id,
         "expires_at_unix": int(expires_at),
         "recipe": copy.deepcopy(recipe),
         "diff": [
@@ -1082,13 +1216,16 @@ class MethodRecipeService:
             raise MethodRecipeError("pseudopotential library is required")
         policy_id = _safe_identifier(prepared.get("policy_id"), field="policy_id", optional=True)
         project_id = _safe_identifier(prepared.get("project_id"), field="project_id", optional=True)
+        client_intent_id = _safe_identifier(
+            prepared.get("client_intent_id"), field="client_intent_id")
         draft, origins, policy_evidence = _normalize_draft(
             prepared.get("draft"), elements=elements, counts=counts, policy_id=policy_id,
             project_defaults=project_defaults)
-        recipe, kpoints, potcar_fingerprint = _build_recipe(
+        recipe, kpoints, potcar_fingerprint, potcar_sha256 = _build_recipe(
             draft, origins, poscar_text=poscar_text, poscar_sha256=poscar_hash,
             elements=elements, counts=counts, lib_root=lib_root,
             policy_evidence=policy_evidence)
+        recipe = _apply_existing_method_tag_policy(existing, recipe)
         diff = semantic_diff(existing, recipe)
         target, target_id, _managed = _target_snapshot(prepared.get("out_dir"))
         now = float(self._clock())
@@ -1096,30 +1233,29 @@ class MethodRecipeService:
         record = {
             "created_at": now, "expires_at": now + self._ttl,
             "target": target, "target_id": target_id, "project_id": project_id,
+            "client_intent_id": client_intent_id,
             "poscar_path": Path(str(prepared["poscar_path"])), "poscar_hash": poscar_hash,
             "incar_path": (Path(str(prepared["incar_path"])) if prepared.get("incar_path") else None),
             "incar_hash": incar_hash, "existing": existing, "lib_root": lib_root,
             "recipe": recipe, "diff": diff, "kpoints": kpoints,
             "potcar_fingerprint": potcar_fingerprint, "used": False,
+            "potcar_sha256": potcar_sha256,
             "elements": list(elements), "counts": list(counts),
         }
         with self._lock:
             self._prune(now)
             self._records[token] = record
         return _dry_public_preview(
-            recipe, diff, token=token, target_id=target_id, expires_at=record["expires_at"])
+            recipe, diff, token=token, target_id=target_id, expires_at=record["expires_at"],
+            client_intent_id=client_intent_id)
 
     def _revalidate(self, record: dict[str, Any]) -> None:
         try:
-            current_poscar = record["poscar_path"].read_text(encoding="utf-8")
-            current_poscar_hash = hashlib.sha256(current_poscar.encode("utf-8")).hexdigest()
-            if current_poscar_hash != record["poscar_hash"]:
+            if _file_sha256(record["poscar_path"]) != record["poscar_hash"]:
                 raise MethodRecipeTokenError("POSCAR changed after preview; request a new preview")
             incar_path = record["incar_path"]
             if incar_path is not None:
-                current_incar = incar_path.read_text(encoding="utf-8")
-                current_incar_hash = hashlib.sha256(current_incar.encode("utf-8")).hexdigest()
-                if current_incar_hash != record["incar_hash"]:
+                if _file_sha256(incar_path) != record["incar_hash"]:
                     raise MethodRecipeTokenError(
                         "existing INCAR changed after preview; request a new preview")
             _target, target_id, _managed = _target_snapshot(record["target"])
@@ -1127,12 +1263,15 @@ class MethodRecipeService:
                 raise MethodRecipeTokenError("target identity changed after preview")
             elements = [item["element"] for item in record["recipe"]["dimensions"]["xc"]
                         ["evidence"] if item.get("kind") == "potcar"]
-            _evidence, fingerprint = _potcar_evidence(
+            _evidence, fingerprint, rendered_sha256 = _potcar_evidence(
                 elements, record["lib_root"],
                 record["recipe"]["dimensions"]["xc"]["value"]["functional"])
             if fingerprint != record["potcar_fingerprint"]:
                 raise MethodRecipeTokenError(
                     "pseudopotential evidence changed after preview; request a new preview")
+            if rendered_sha256 != record["potcar_sha256"]:
+                raise MethodRecipeTokenError(
+                    "pseudopotential content changed after preview; request a new preview")
         except MethodRecipeTokenError:
             raise
         except (OSError, MethodRecipeError) as exc:
@@ -1145,6 +1284,8 @@ class MethodRecipeService:
         target_id = str(prepared.get("target_id") or "").strip().lower()
         idempotency_key = _safe_identifier(
             prepared.get("idempotency_key"), field="idempotency_key")
+        client_intent_id = _safe_identifier(
+            prepared.get("client_intent_id"), field="client_intent_id")
         if not token or not _HEX64.fullmatch(preview_hash) or not _HEX64.fullmatch(target_id):
             raise MethodRecipeTokenError("preview binding is invalid")
         if prepared.get("confirmed") is not True:
@@ -1157,6 +1298,7 @@ class MethodRecipeService:
         fingerprint = semantic_sha256({
             "token": token, "preview_sha256": preview_hash, "target_id": target_id,
             "idempotency_key": idempotency_key, "resolutions": resolutions,
+            "client_intent_id": client_intent_id,
         })
         now = float(self._clock())
         with self._lock:
@@ -1175,11 +1317,19 @@ class MethodRecipeService:
                 raise MethodRecipeTokenError("preview hash does not match the token")
             if target_id != record["target_id"]:
                 raise MethodRecipeTokenError("target identity does not match the token")
+            if client_intent_id != record["client_intent_id"]:
+                raise MethodRecipeTokenError("client intent does not match the token")
             self._revalidate(record)
             merged, final_recipe = _merge_incar(
                 record["existing"], record["recipe"], record["diff"], resolutions,
                 elements=record["elements"], counts=record["counts"])
             final_incar = incar_dict_to_str(merged)
+            expected_hashes = {
+                "INCAR": _native_text_sha256(final_incar),
+                "POSCAR": record["poscar_hash"],
+                "KPOINTS": _native_text_sha256(kpoints_str(record["kpoints"])),
+                "POTCAR": record["potcar_sha256"],
+            }
             plan = {
                 "target": record["target"], "target_id": record["target_id"],
                 "project_id": record["project_id"], "poscar_path": record["poscar_path"],
@@ -1189,12 +1339,20 @@ class MethodRecipeService:
                 "calc_type": final_recipe["dimensions"]["system"]["value"],
                 "task": final_recipe["dimensions"]["task"]["value"],
                 "confirmed_at_unix": int(now),
+                "expected_hashes": expected_hashes,
+                # The publisher calls this again only after acquiring the stable target OS lock.
+                "revalidate": lambda: self._revalidate(record),
             }
             # The desktop bridge is synchronous.  Keeping the lock across the write closes the
             # two-click race and gives this in-memory capability exactly-once behavior.
             result = writer(plan)
             if not isinstance(result, dict):
                 raise MethodRecipeError("recipe writer returned an invalid result")
+            if result.get("ok") is not True:
+                # A failed recoverable publication never burns the one-use capability.  The same
+                # bound intent may retry after rollback/recovery, or the user may request a new
+                # preview.  Only a fully published and registered bundle consumes the token.
+                return copy.deepcopy(result)
             record["used"] = True
             record["confirm_fingerprint"] = fingerprint
             record["result"] = copy.deepcopy(result)

@@ -22,7 +22,12 @@
     previewKey: null,
     previewView: { kind: 'waiting', error: '' },
     solvationPreview: null,
-    methodRecipe: { catalog: null, preview: null, confirmKey: null },
+    methodRecipe: {
+      catalog: null, preview: null, confirmKey: null,
+      intentGeneration: 0, previewSequence: 0, previewOwner: null,
+      suggestSequence: 0, suggestOwner: null, confirmSequence: 0, confirmOwner: null,
+      previewGeneration: null, clientIntentId: null, draftFingerprint: null,
+    },
   };   // 预览去重 + 防旧响应覆盖
 
   function renderPreviewLanguage() {
@@ -277,6 +282,24 @@
     };
   }
 
+  function methodRecipeDraftFingerprint(draft) {
+    const payload = {
+      draft: draft || collectMethodRecipeDraft(),
+      policy_id: val('mr-policy') || null,
+      poscar_path: val('gen-poscar'), incar_path: val('gen-incar'),
+      out_dir: val('gen-out'), lib_root: val('gen-lib'),
+    };
+    return JSON.stringify(payload);
+  }
+
+  function isCurrentMethodRecipePreview() {
+    const state = State.methodRecipe;
+    if (!state.preview || state.previewGeneration !== state.intentGeneration
+        || state.preview.client_intent_id !== state.clientIntentId) return false;
+    try { return methodRecipeDraftFingerprint() === state.draftFingerprint; }
+    catch (_error) { return false; }
+  }
+
   function setMethodRecipeDraft(draft) {
     if (!draft) return;
     const values = {
@@ -303,8 +326,12 @@
   }
 
   function invalidateMethodRecipePreview() {
+    State.methodRecipe.intentGeneration += 1;
     State.methodRecipe.preview = null;
     State.methodRecipe.confirmKey = null;
+    State.methodRecipe.previewGeneration = null;
+    State.methodRecipe.clientIntentId = null;
+    State.methodRecipe.draftFingerprint = null;
     if ($('mr-ack')) $('mr-ack').checked = false;
     const status = $('mr-preview-status');
     if (status) {
@@ -325,7 +352,8 @@
     const selectedTask = task ? task.value : '';
     if (task) {
       task.replaceChildren();
-      (catalog.tasks || []).forEach(item => {
+      const system = val('mr-system');
+      (catalog.tasks || []).filter(item => (item.systems || []).indexOf(system) >= 0).forEach(item => {
         const option = document.createElement('option');
         option.value = item.key;
         option.textContent = mrEnglish() ? item.name_en : item.name_zh;
@@ -343,7 +371,6 @@
       none.value = '';
       none.textContent = tr('generate.recipe.policy.none', {}, '不套用策略', 'No policy seed');
       policy.appendChild(none);
-      const system = val('mr-system');
       const records = ((catalog.lab_policies || {}).policies || []);
       records.filter(item => (item.applicability || []).indexOf(system) >= 0).forEach(item => {
         const option = document.createElement('option');
@@ -375,8 +402,17 @@
   }
 
   async function suggestMethodRecipe() {
-    const result = await VCS.call(
-      'method_recipe_suggest', val('mr-system'), val('mr-task'), val('mr-policy') || null);
+    const generation = State.methodRecipe.intentGeneration;
+    const owner = ++State.methodRecipe.suggestSequence;
+    State.methodRecipe.suggestOwner = owner;
+    let result;
+    try {
+      result = await VCS.call(
+        'method_recipe_suggest', val('mr-system'), val('mr-task'), val('mr-policy') || null);
+    } catch (error) { result = { ok: false, error: error.message || String(error) }; }
+    if (State.methodRecipe.suggestOwner !== owner) return;
+    State.methodRecipe.suggestOwner = null;
+    if (State.methodRecipe.intentGeneration !== generation) return;
     if (!result || result.ok === false || result.error) {
       VCS.log(tr('runtime.generate.recipe.suggest_failed', {
         error: (result && result.error) || tr(
@@ -471,8 +507,8 @@
     const button = $('mr-confirm');
     if (!button) return;
     const choices = collectMethodRecipeResolutions();
-    button.disabled = !(State.methodRecipe.preview && choices.complete
-      && $('mr-ack') && $('mr-ack').checked);
+    button.disabled = !(isCurrentMethodRecipePreview() && choices.complete
+      && $('mr-ack') && $('mr-ack').checked && !State.methodRecipe.confirmOwner);
   }
 
   async function previewMethodRecipe() {
@@ -481,6 +517,11 @@
     catch (error) {
       VCS.log(error.message || String(error), 'failc'); return;
     }
+    const generation = State.methodRecipe.intentGeneration;
+    const owner = ++State.methodRecipe.previewSequence;
+    const clientIntentId = `method-recipe-intent-${generation}-${owner}-${Date.now()}`;
+    const draftFingerprint = methodRecipeDraftFingerprint(draft);
+    State.methodRecipe.previewOwner = owner;
     const status = $('mr-preview-status');
     if (status) {
       status.className = 'mr-status';
@@ -492,8 +533,15 @@
       poscar_path: val('gen-poscar'), incar_path: val('gen-incar'),
       out_dir: val('gen-out'), lib_root: val('gen-lib'), draft,
       policy_id: val('mr-policy') || null, project_id: null,
+      client_intent_id: clientIntentId,
     };
-    const result = await VCS.call('method_recipe_preview', request);
+    let result;
+    try { result = await VCS.call('method_recipe_preview', request); }
+    catch (error) { result = { ok: false, error: error.message || String(error) }; }
+    if (State.methodRecipe.previewOwner !== owner) return;
+    State.methodRecipe.previewOwner = null;
+    if (State.methodRecipe.intentGeneration !== generation
+        || methodRecipeDraftFingerprint() !== draftFingerprint) return;
     if (!result || result.ok === false || result.error) {
       State.methodRecipe.preview = null;
       if (status) {
@@ -506,7 +554,15 @@
       updateMethodRecipeConfirmState();
       return;
     }
+    if (result.client_intent_id !== clientIntentId) {
+      State.methodRecipe.preview = null;
+      updateMethodRecipeConfirmState();
+      return;
+    }
     State.methodRecipe.preview = result;
+    State.methodRecipe.previewGeneration = generation;
+    State.methodRecipe.clientIntentId = clientIntentId;
+    State.methodRecipe.draftFingerprint = draftFingerprint;
     State.methodRecipe.confirmKey = `method-recipe-${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
     if ($('mr-ack')) $('mr-ack').checked = false;
     renderMethodRecipePreview();
@@ -515,19 +571,61 @@
   async function confirmMethodRecipe() {
     const preview = State.methodRecipe.preview;
     const choices = collectMethodRecipeResolutions();
-    if (!preview || !choices.complete || !$('mr-ack') || !$('mr-ack').checked) return;
-    const approved = await VCS.confirm(tr('runtime.generate.recipe.confirm_prompt', {},
-      '确认只写候选输入并登记 CREATED 作业？这不会自动提交，也不代表科学 validated。',
-      'Write candidate inputs and register a CREATED job? This will not submit automatically or imply scientific validation.'));
-    if (!approved) return;
+    if (!isCurrentMethodRecipePreview() || !choices.complete
+        || !$('mr-ack') || !$('mr-ack').checked) return;
+    const generation = State.methodRecipe.intentGeneration;
+    const draftFingerprint = State.methodRecipe.draftFingerprint;
+    const clientIntentId = State.methodRecipe.clientIntentId;
+    const owner = `${preview.token}:${++State.methodRecipe.confirmSequence}`;
+    State.methodRecipe.confirmOwner = owner;
+    updateMethodRecipeConfirmState();
+    let approved;
+    try {
+      approved = await VCS.confirm(tr('runtime.generate.recipe.confirm_prompt', {},
+        '确认只写候选输入并登记 CREATED 作业？这不会自动提交，也不代表科学 validated。',
+        'Write candidate inputs and register a CREATED job? This will not submit automatically or imply scientific validation.'));
+    } catch (error) {
+      if (State.methodRecipe.confirmOwner !== owner) return;
+      State.methodRecipe.confirmOwner = null;
+      updateMethodRecipeConfirmState();
+      VCS.log(tr('runtime.generate.recipe.write_failed', {
+        error: error.message || String(error),
+      }, '确认写入失败：{error}', 'Confirmed write failed: {error}'), 'failc');
+      return;
+    }
+    if (State.methodRecipe.confirmOwner !== owner) return;
+    if (State.methodRecipe.intentGeneration !== generation
+        || State.methodRecipe.draftFingerprint !== draftFingerprint
+        || !isCurrentMethodRecipePreview()) {
+      State.methodRecipe.confirmOwner = null;
+      updateMethodRecipeConfirmState();
+      return;
+    }
+    if (!approved) {
+      State.methodRecipe.confirmOwner = null;
+      updateMethodRecipeConfirmState();
+      return;
+    }
     const button = $('mr-confirm'); if (button) button.disabled = true;
     const request = {
       token: preview.token, preview_sha256: preview.preview_sha256,
       target_id: preview.target_id, confirmed: true,
       idempotency_key: State.methodRecipe.confirmKey,
       resolutions: choices.resolutions,
+      client_intent_id: clientIntentId,
     };
-    const result = await VCS.call('method_recipe_confirm', request);
+    let result;
+    try { result = await VCS.call('method_recipe_confirm', request); }
+    catch (error) { result = { ok: false, error: error.message || String(error) }; }
+    if (State.methodRecipe.confirmOwner !== owner) return;
+    if (State.methodRecipe.intentGeneration !== generation
+        || State.methodRecipe.draftFingerprint !== draftFingerprint
+        || State.methodRecipe.preview !== preview) {
+      State.methodRecipe.confirmOwner = null;
+      updateMethodRecipeConfirmState();
+      return;
+    }
+    State.methodRecipe.confirmOwner = null;
     if (!result || result.ok === false || result.error) {
       VCS.log(tr('runtime.generate.recipe.write_failed', {
         error: (result && result.error) || tr(

@@ -108,22 +108,19 @@ global.document = {
 global.window = global;
 
 const calls = [];
+const pendingPreviews = [];
 global.VCS = {
   i18n: { lang: 'en' },
   t: (_key, _params, fallback) => fallback,
-  call: async (name, payload) => {
+  call: (name, payload) => {
     calls.push([name, payload]);
-    if (name === 'method_recipe_preview') return {
-      ok: true, token: 'opaque-preview-token', preview_sha256: 'a'.repeat(64),
-      target_id: 'b'.repeat(64), conflicts: ['ENCUT'],
-      recipe: { dimensions: { encut: { risk: 'high', reason: { zh: '风险', en: 'Risk' } } } },
-      diff: [{ key: 'ENCUT', status: 'conflict', existing: 450, proposed: 520,
-        requires_resolution: true, risk: 'high', reason: { zh: '原因', en: 'Reason' } }],
-    };
-    if (name === 'method_recipe_confirm') return {
+    if (name === 'method_recipe_preview') return new Promise(resolve => {
+      pendingPreviews.push({ payload, resolve });
+    });
+    if (name === 'method_recipe_confirm') return Promise.resolve({
       ok: true, job_id: 'job-opaque', recipe_semantic_sha256: 'c'.repeat(64), warnings: [],
-    };
-    throw new Error(`unexpected call ${name}`);
+    });
+    return Promise.reject(new Error(`unexpected call ${name}`));
   },
   log: () => {}, toast: () => {}, confirm: async () => true,
 };
@@ -139,8 +136,26 @@ vm.runInThisContext(fs.readFileSync(process.env.GENERATE_SOURCE, 'utf8'), {
   assert.equal(draft.kpoints_grid, null);
   assert.equal(draft.encut_multiplier, 1.3);
 
-  await window.Generate.methodRecipe.preview();
-  const previewCall = calls.find(item => item[0] === 'method_recipe_preview');
+  const firstPreview = window.Generate.methodRecipe.preview();
+  ids['mr-encut-multiplier'].value = '1.4';
+  const secondPreview = window.Generate.methodRecipe.preview();
+  assert.equal(pendingPreviews.length, 2);
+  const response = (pending, token, hashLetter) => ({
+    ok: true, token, preview_sha256: hashLetter.repeat(64), target_id: 'b'.repeat(64),
+    client_intent_id: pending.payload.client_intent_id, conflicts: ['ENCUT'],
+    recipe: { dimensions: { encut: { risk: 'high', reason: { zh: '风险', en: 'Risk' } } } },
+    diff: [{ key: 'ENCUT', status: 'conflict', existing: 450, proposed: 520,
+      requires_resolution: true, risk: 'high', reason: { zh: '原因', en: 'Reason' } }],
+  });
+  pendingPreviews[1].resolve(response(pendingPreviews[1], 'newest-preview-token', 'd'));
+  await secondPreview;
+  pendingPreviews[0].resolve(response(pendingPreviews[0], 'stale-preview-token', 'a'));
+  await firstPreview;
+
+  const previewCalls = calls.filter(item => item[0] === 'method_recipe_preview');
+  const previewCall = previewCalls[1];
+  assert.equal(previewCalls[0][1].draft.encut_multiplier, 1.3);
+  assert.equal(previewCall[1].draft.encut_multiplier, 1.4);
   assert.equal(previewCall[1].draft.encut_value, null);
   assert.equal(previewCall[1].draft.kpoints_grid, null);
   assert.equal(previewCall[1].poscar_path, 'C:/private/POSCAR');
@@ -149,9 +164,10 @@ vm.runInThisContext(fs.readFileSync(process.env.GENERATE_SOURCE, 'utf8'), {
   assert.ok(resolution); resolution.value = 'existing'; ids['mr-ack'].checked = true;
   await window.Generate.methodRecipe.confirm();
   const confirmCall = calls.find(item => item[0] === 'method_recipe_confirm');
-  assert.equal(confirmCall[1].token, 'opaque-preview-token');
-  assert.equal(confirmCall[1].preview_sha256, 'a'.repeat(64));
+  assert.equal(confirmCall[1].token, 'newest-preview-token');
+  assert.equal(confirmCall[1].preview_sha256, 'd'.repeat(64));
   assert.equal(confirmCall[1].target_id, 'b'.repeat(64));
+  assert.equal(confirmCall[1].client_intent_id, previewCall[1].client_intent_id);
   assert.deepEqual(confirmCall[1].resolutions, { ENCUT: 'existing' });
   assert.equal(confirmCall[1].confirmed, true);
   assert.ok(!calls.some(item => /submit|continue/.test(item[0])));

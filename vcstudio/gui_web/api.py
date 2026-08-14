@@ -262,7 +262,8 @@ class Api:
                  paper_report_mod=None, workspace_state_store=None,
                  report_service=None, analysis_preferences_store=None,
                  project_lifecycle_service=None, lab_policy_store=None,
-                 workspace_context_store=None, method_recipe_service=None):
+                 workspace_context_store=None, method_recipe_service=None,
+                 method_recipe_publisher=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -396,6 +397,11 @@ class Api:
         # opaque token/target hash, never the authority-bearing resolved target or POTCAR path.
         self._method_recipe_service = method_recipe_service
         self._method_recipe_service_lock = threading.Lock()
+        self._method_recipe_publisher = method_recipe_publisher
+        self._method_recipe_publisher_lock = threading.Lock()
+        self._method_recipe_recovery_state = {
+            'finalized': 0, 'rolled_back': 0, 'blocked': 0,
+        }
         # Phase 3 project location/identity mutations are isolated behind a
         # hash-bound lifecycle service. Browser callers receive opaque server
         # selections and plans, never an authority-bearing filesystem path.
@@ -499,6 +505,13 @@ class Api:
     def start_background_services(self):
         """启动唯一后台调度线程；由桌面入口调用，重复调用安全。"""
         try:
+            try:
+                self._method_recipe_recovery_state = (
+                    self._method_recipe_publisher_instance().recover_all())
+            except Exception:                             # noqa: BLE001 recovery remains fail-closed
+                self._method_recipe_recovery_state = {
+                    'finalized': 0, 'rolled_back': 0, 'blocked': 1,
+                }
             if self._pipeline_supervisor is None:
                 cls = self._pipeline_supervisor_cls
                 if cls is None:
@@ -2873,6 +2886,17 @@ class Api:
                     self._method_recipe_service = self._method_recipe_backend().MethodRecipeService()
         return self._method_recipe_service
 
+    def _method_recipe_publisher_instance(self):
+        if self._method_recipe_publisher is None:
+            with self._method_recipe_publisher_lock:
+                if self._method_recipe_publisher is None:
+                    from vcstudio.generate.method_recipe_publish import MethodRecipePublisher
+
+                    self._method_recipe_publisher = MethodRecipePublisher(
+                        job_builder_mod=self._job_builder, manifest_mod=self._manifest,
+                        ledger_mod=self._ledger)
+        return self._method_recipe_publisher
+
     @staticmethod
     def _method_recipe_failure(exc):
         """Return a bounded failure without reflecting request paths or secret-like values."""
@@ -2912,40 +2936,34 @@ class Api:
 
     def _write_method_recipe(self, plan):
         """Write one confirmed input set through the existing build→manifest→ledger chain."""
-        backend = self._method_recipe_backend()
-        target = str(plan['target'])
         try:
-            payload = self._job_builder.build_job_dir(
-                str(plan['poscar_path']), plan['final_incar'], target,
-                calc_type=plan['calc_type'], kpoints=plan['kpoints'],
-                validate=False, lib_root=plan['lib_root'])
-            incar_hash = self._manifest.sha256_file(os.path.join(target, 'INCAR'))
-            record = backend.sidecar_record(plan, incar_sha256=incar_hash)
-            _sidecar, sidecar_hash = backend.write_sidecar(target, record)
-            reference = backend.manifest_reference(record, sidecar_sha256=sidecar_hash)
-            written = self._manifest.create_from_build(
-                target, payload, poscar_path=str(plan['poscar_path']), validate=False,
-                task_type=plan['task'], method_recipe_ref=reference)
-            self._ledger.register(target)
-            input_hashes = dict((written.get('inputs') or {}).get('sha256') or {})
+            published = self._method_recipe_publisher_instance().publish(plan)
+            payload = published['payload']
+            written = published['manifest']
+            record = published['record']
             return {
                 'ok': True, 'error': None, 'target_id': plan['target_id'],
                 'job_id': self._analysis_workbench_public_value(written.get('job_id')),
                 'state': written.get('state', 'CREATED'),
                 'recipe_semantic_sha256': record['recipe_semantic_sha256'],
-                'sidecar_sha256': sidecar_hash, 'input_hashes': input_hashes,
+                'sidecar_sha256': published['sidecar_sha256'],
+                'input_hashes': dict(published['input_hashes']),
                 'warnings': self._analysis_workbench_public_value(
                     list(payload.get('warnings') or [])),
                 'authorizes_submission': False, 'scientifically_validated': False,
                 'scientific_status': 'candidate', 'submitted': False,
+                'retryable': False, 'recovery_required': False,
             }
-        except Exception:                                 # noqa: BLE001
+        except Exception as exc:                          # noqa: BLE001
             # POTCAR/build exceptions commonly contain local absolute paths.  The recipe endpoint
             # intentionally does not reflect them across the browser bridge.
+            recovery_required = bool(getattr(exc, 'recovery_required', False))
             return {
                 'ok': False, 'error': 'confirmed input write failed',
                 'target_id': plan['target_id'], 'authorizes_submission': False,
                 'scientifically_validated': False, 'submitted': False,
+                'retryable': not recovery_required,
+                'recovery_required': recovery_required,
             }
 
     def method_recipe_confirm(self, request):
