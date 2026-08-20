@@ -40,7 +40,6 @@ def test_analysis_api_consumes_protocol_projection_and_returns_stable_schemas(tm
     preview = api.analysis_workbench_preview(project_id, {
         "schema": "vcstudio.analysis-spec/v1", "analysis_id": "free-energy-path",
         "project_id": project_id, "data_mode": "stable", "precision": 5,
-        "near_degenerate_eV": 0.15, "missing_policy": "show_missing",
         "conditions": {
             "temperature_k": 320.0, "pressure_pa": 200000.0,
             "ph": 1.0, "electrode_potential_v": 0.2, "coverage": 0.5,

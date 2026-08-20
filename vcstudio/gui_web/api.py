@@ -292,7 +292,7 @@ class Api:
                  method_recipe_publisher=None, structure_sources_mod=None,
                  structure_source_session=None, external_structure_gateway=None,
                  surface_workbench_mod=None, external_reference_gateway=None,
-                 reaction_domain_source=None):
+                 reaction_domain_source=None, kinetics_projection_provider=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -425,6 +425,9 @@ class Api:
         # Read-only adapter to the separately owned canonical catalysis DTOs.
         # This API never stores a second reaction-domain fact source.
         self._reaction_domain_source = reaction_domain_source
+        # Kinetics consumes a server-owned frozen Reaction Map/Catalysis Model
+        # projection.  Browser requests never carry reaction facts.
+        self._kinetics_projection_provider = kinetics_projection_provider
         # Confirmed laboratory recommendations are user-level state.  They do
         # not mutate job manifests or grant submission authority.
         self._lab_policy_store = lab_policy_store
@@ -9003,6 +9006,107 @@ class Api:
         return build_recommendations(
             view, validation, validation_error=reason)
 
+    def _kinetics_projection(self, context):
+        """Load one server-owned frozen projection; never use browser facts."""
+        provider = self._kinetics_projection_provider
+        if provider is None:
+            return None
+        private_context = {
+            'project_id': context['project_id'],
+            'project_path': context['project_path'],
+            'project_root': context['project_root'],
+            'project': copy.deepcopy(context['project']),
+        }
+        resolver = getattr(provider, 'for_project', None)
+        value = resolver(private_context) if callable(resolver) else provider(private_context)
+        if value is None:
+            return None
+        from vcstudio.project import kinetics
+
+        # Materialize one deep-copied, evidence-resolved snapshot.  This is an
+        # ephemeral Protocol value, never a second persistent reaction DTO.
+        return kinetics.canonicalize_kinetics_input(value)
+
+    def _kinetics_tool(self):
+        from vcstudio.external import catmap_adapter
+
+        paths = self._tool_paths()
+        return catmap_adapter.inspect_tool_path(
+            paths.get('catmap'), version=(paths.get('catmap_version') or None))
+
+    @staticmethod
+    def _kinetics_expected_adapter(manifest):
+        tool = manifest.get('tool') or {}
+        digest = tool.get('sha256')
+        if not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest):
+            raise ValueError('confirmed CatMAP export has no frozen tool hash')
+        adapter = manifest.get('adapter') or {}
+        return {
+            'id': adapter.get('id'), 'version': adapter.get('version'),
+            'tool_version': tool.get('version'),
+            'tool_sha256': digest,
+        }
+
+    @staticmethod
+    def _kinetics_tool_matches(manifest, configured_tool):
+        frozen = manifest.get('tool') or {}
+        return bool(
+            configured_tool.get('available') is True
+            and frozen.get('available') is True
+            and configured_tool.get('sha256') == frozen.get('sha256')
+            and configured_tool.get('version') == frozen.get('version'))
+
+    def _kinetics_view(self, context, spec, network):
+        from vcstudio.external import catmap_adapter
+        from vcstudio.project import kinetics, kinetics_store
+        from vcstudio.project.analysis_views import build_kinetic_view
+
+        audit = kinetics.audit_network(network)
+        configured_tool = self._kinetics_tool()
+        frozen_tool = configured_tool
+        tool_identity_matches = None
+        stored = None
+        result_error = None
+        if audit.get('input_sha256'):
+            try:
+                manifest = catmap_adapter.load_confirmed_manifest(
+                    context['project_root'], audit['input_sha256'])
+                frozen_tool = copy.deepcopy(manifest.get('tool') or {})
+                tool_identity_matches = self._kinetics_tool_matches(
+                    manifest, configured_tool)
+                if not tool_identity_matches:
+                    result_error = (
+                        'Configured CatMAP identity does not match the confirmed '
+                        'export; create and confirm a new preview.')
+                else:
+                    stored = kinetics_store.load_result(
+                        context['project_root'], network,
+                        expected_adapter=self._kinetics_expected_adapter(manifest),
+                        confirmed_export_sha256=manifest[
+                            'selected_export_sha256'])
+            except catmap_adapter.CatmapAdapterError as exc:
+                # A missing export is expected before the first confirmation;
+                # a tampered export remains unavailable and visible as a warning.
+                if 'unavailable' not in str(exc).lower():
+                    result_error = str(exc)
+            except Exception as exc:                    # noqa: BLE001 fail closed
+                result_error = str(exc)
+        normalized = stored.get('normalized') if isinstance(stored, dict) else None
+        view = build_kinetic_view(
+            network, audit, normalized, frozen_tool, spec,
+            configured_tool=configured_tool,
+            tool_identity_matches=tool_identity_matches)
+        if result_error:
+            view['warnings'] = list(view.get('warnings') or []) + [
+                f'Imported kinetic result could not be revalidated: {result_error}']
+            view['available'] = False
+            view['reason_codes'] = list(dict.fromkeys([
+                *(view.get('reason_codes') or []),
+                *(['CONFIGURED_TOOL_CHANGED']
+                  if tool_identity_matches is False else []),
+                'RESULT_REVALIDATION_FAILED']))
+        return view
+
     def _analysis_workbench_capability_cards(self, context, projects, selected_view):
         """Project-specific activation states for every registry card."""
         targets = self._analysis_workbench_targets(context)
@@ -9044,6 +9148,17 @@ class Api:
                     else 'missing_prerequisite')
             except Exception:                           # noqa: BLE001 capability is fail closed
                 free_energy_status = 'unavailable'
+        if selected_id == 'kinetic-dashboard' and selected_status:
+            # The selected view already consumed and audited the provider.
+            # Preserve read-once/stateful providers and avoid a second snapshot.
+            kinetics_status = selected_status
+        else:
+            try:
+                kinetics_status = (
+                    'available' if self._kinetics_projection(context) is not None
+                    else 'missing_prerequisite')
+            except Exception:                           # noqa: BLE001 fail closed
+                kinetics_status = 'unavailable'
         states = {
             'adsorption-energy': (
                 'available' if self._project_member_dirs(project) else 'missing_prerequisite'),
@@ -9056,6 +9171,7 @@ class Api:
                     'conv_vacuum', 'conv_thickness'} else 'missing_prerequisite'),
             'aimd-diagnostics': (
                 'available' if 'aimd' in task_types else 'missing_prerequisite'),
+            'kinetic-dashboard': kinetics_status,
             'task-results': ('available' if targets else 'missing_prerequisite'),
             'electronic-structure': (
                 'available' if task_types & {'dos_pdos', 'bands', 'workfunction'}
@@ -9187,6 +9303,18 @@ class Api:
                             (summary or {}).get('method_consistency') or {}),
                     }
                     view = build_free_energy_view(frozen, spec)
+        elif spec.analysis_id == 'kinetic-dashboard':
+            network = self._kinetics_projection(context)
+            if network is None:
+                view = self._analysis_workbench_unavailable_view(
+                    spec,
+                    'No server-owned frozen reaction/thermochemistry projection is available.',
+                    capability_status='missing_prerequisite',
+                    next_action=(
+                        'Freeze the canonical Reaction Map/Catalysis Model projection, '
+                        'then refresh the dashboard.'))
+            else:
+                view = self._kinetics_view(context, spec, network)
         elif spec.analysis_id in {
                 'electronic-structure', 'charge-wavefunction', 'task-results'}:
             targets = self._analysis_workbench_targets(context)
@@ -9285,6 +9413,261 @@ class Api:
             return {
                 'ok': False, 'schema': self._ANALYSIS_PREVIEW_SCHEMA,
                 'project_id': None, 'spec': None, 'view': None,
+                'error': self._analysis_workbench_public_value(str(exc)),
+            }
+
+    def kinetics_export_preview(self, project_id):
+        """Preview a fixed project-local CatMAP bundle without writing it."""
+        try:
+            record = self._analysis_workbench_project_record(project_id)
+
+            def build():
+                from vcstudio.external import catmap_adapter
+
+                context = self._report_workbench_project_context(record['path'])
+                network = self._kinetics_projection(context)
+                if network is None:
+                    raise ValueError(
+                        'No server-owned frozen kinetics projection is available.')
+                paths = self._tool_paths()
+                preview = catmap_adapter.preview_export(
+                    network, tool_path=paths.get('catmap'),
+                    tool_version=(paths.get('catmap_version') or None))
+                preview_sha256 = preview.pop('preview_token')
+                selection = catmap_adapter.export_selection_snapshot(
+                    context['project_root'], preview['input_sha256'])
+                return self._analysis_workbench_public_value({
+                    'ok': True, **preview,
+                    'preview_sha256': preview_sha256,
+                    'selection_revision': selection['revision'],
+                    'selected_export_sha256': selection[
+                        'selected_export_sha256'],
+                    'project_id': context['project_id'], 'error': None,
+                })
+
+            return self._call_with_project_bindings([record], build)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return {
+                'ok': False, 'schema': 'vcstudio.catmap-export-preview/v3',
+                'project_id': None, 'preview_sha256': None,
+                'scientific_status': 'unavailable', 'eligible_final': False,
+                'error': self._analysis_workbench_public_value(str(exc)),
+            }
+
+    def kinetics_export_confirm(
+            self, project_id, preview_sha256, expected_selection_revision,
+            expected_selected_export_sha256=None, confirmed=False):
+        """Confirm one exact preview; output location is server-controlled."""
+        try:
+            record = self._analysis_workbench_project_record(project_id)
+
+            def build():
+                from vcstudio.external import catmap_adapter
+
+                context = self._report_workbench_project_context(record['path'])
+                network = self._kinetics_projection(context)
+                if network is None:
+                    raise ValueError(
+                        'No server-owned frozen kinetics projection is available.')
+                paths = self._tool_paths()
+                result = catmap_adapter.confirm_export(
+                    network, context['project_root'], preview_sha256,
+                    expected_selection_revision=expected_selection_revision,
+                    expected_selected_export_sha256=(
+                        expected_selected_export_sha256 or None),
+                    confirmed=confirmed is True,
+                    tool_path=paths.get('catmap'),
+                    tool_version=(paths.get('catmap_version') or None))
+                return self._analysis_workbench_public_value({
+                    **result, 'project_id': context['project_id'], 'error': None,
+                })
+
+            return self._call_with_project_bindings([record], build)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return {
+                'ok': False, 'schema': 'vcstudio.catmap-export-manifest/v3',
+                'project_id': None, 'scientific_status': 'unavailable',
+                'eligible_final': False,
+                'error': self._analysis_workbench_public_value(str(exc)),
+            }
+
+    def kinetics_audit_export_preview(self, project_id):
+        """Preview an audit-only artifact under a schema distinct from models."""
+        try:
+            record = self._analysis_workbench_project_record(project_id)
+
+            def build():
+                from vcstudio.external import catmap_adapter
+
+                context = self._report_workbench_project_context(record['path'])
+                network = self._kinetics_projection(context)
+                if network is None:
+                    raise ValueError(
+                        'No server-owned frozen kinetics projection is available.')
+                paths = self._tool_paths()
+                preview = catmap_adapter.preview_audit_export(
+                    network, tool_path=paths.get('catmap'),
+                    tool_version=(paths.get('catmap_version') or None))
+                preview_sha256 = preview.pop('preview_token')
+                return self._analysis_workbench_public_value({
+                    'ok': True, **preview, 'preview_sha256': preview_sha256,
+                    'project_id': context['project_id'], 'error': None,
+                })
+
+            return self._call_with_project_bindings([record], build)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return {
+                'ok': False,
+                'schema': 'vcstudio.kinetics-audit-export-preview/v1',
+                'project_id': None, 'preview_sha256': None,
+                'model_published': False, 'scientific_status': 'unavailable',
+                'eligible_final': False,
+                'error': self._analysis_workbench_public_value(str(exc)),
+            }
+
+    def kinetics_audit_export_confirm(
+            self, project_id, preview_sha256, confirmed=False):
+        """Publish only the audit report; never report a model publication."""
+        try:
+            record = self._analysis_workbench_project_record(project_id)
+
+            def build():
+                from vcstudio.external import catmap_adapter
+
+                context = self._report_workbench_project_context(record['path'])
+                network = self._kinetics_projection(context)
+                if network is None:
+                    raise ValueError(
+                        'No server-owned frozen kinetics projection is available.')
+                paths = self._tool_paths()
+                result = catmap_adapter.confirm_audit_export(
+                    network, context['project_root'], preview_sha256,
+                    confirmed=confirmed is True,
+                    tool_path=paths.get('catmap'),
+                    tool_version=(paths.get('catmap_version') or None))
+                return self._analysis_workbench_public_value({
+                    **result, 'project_id': context['project_id'], 'error': None,
+                })
+
+            return self._call_with_project_bindings([record], build)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return {
+                'ok': False,
+                'schema': 'vcstudio.kinetics-audit-export-manifest/v1',
+                'project_id': None, 'model_published': False,
+                'scientific_status': 'unavailable', 'eligible_final': False,
+                'error': self._analysis_workbench_public_value(str(exc)),
+            }
+
+    def kinetics_result_import(self, project_id, result):
+        """Validate/upload a data object; uploading never selects it."""
+        try:
+            record = self._analysis_workbench_project_record(project_id)
+
+            def build():
+                from vcstudio.external import catmap_adapter
+                from vcstudio.project import kinetics, kinetics_store
+
+                context = self._report_workbench_project_context(record['path'])
+                network = self._kinetics_projection(context)
+                if network is None:
+                    raise ValueError(
+                        'No server-owned frozen kinetics projection is available.')
+                audit = kinetics.audit_network(network)
+                if audit.get('export_ready') is not True:
+                    raise ValueError('Frozen kinetics projection failed its input audit.')
+                manifest = catmap_adapter.load_confirmed_manifest(
+                    context['project_root'], audit['input_sha256'])
+                if not self._kinetics_tool_matches(manifest, self._kinetics_tool()):
+                    raise ValueError(
+                        'Configured CatMAP identity does not match the confirmed export.')
+                stored = kinetics_store.store_result(
+                    context['project_root'], result, network,
+                    expected_adapter=self._kinetics_expected_adapter(manifest),
+                    confirmed_export_sha256=manifest[
+                        'selected_export_sha256'])
+                selection = kinetics_store.selection_snapshot(
+                    context['project_root'], network)
+                normalized = stored['normalized']
+                return self._analysis_workbench_public_value({
+                    'ok': True,
+                    'schema': stored['schema'],
+                    'project_id': context['project_id'],
+                    'input_sha256': stored['input_sha256'],
+                    'result_sha256': stored['result_sha256'],
+                    'confirmed_export_sha256': stored[
+                        'confirmed_export_sha256'],
+                    'selected': False,
+                    'selection_revision': selection['revision'],
+                    'latest_result_sha256': selection['latest_result_sha256'],
+                    'scientific_status': 'diagnostic',
+                    'eligible_final': False,
+                    'available': normalized.get('available') is True,
+                    'reason_codes': list(normalized.get('reason_codes') or []),
+                    'denominator': copy.deepcopy(normalized.get('denominator') or {}),
+                    'error': None,
+                })
+
+            return self._call_with_project_bindings([record], build)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return {
+                'ok': False, 'schema': 'vcstudio.kinetics-result-receipt/v2',
+                'project_id': None, 'input_sha256': None, 'result_sha256': None,
+                'scientific_status': 'unavailable', 'eligible_final': False,
+                'error': self._analysis_workbench_public_value(str(exc)),
+            }
+
+    def kinetics_result_select(
+            self, project_id, result_sha256, confirmed_export_sha256,
+            expected_latest_sha256, expected_revision, confirmed=False):
+        """Explicitly select one uploaded result using revision+hash CAS."""
+        try:
+            record = self._analysis_workbench_project_record(project_id)
+
+            def build():
+                from vcstudio.external import catmap_adapter
+                from vcstudio.project import kinetics, kinetics_store
+
+                context = self._report_workbench_project_context(record['path'])
+                network = self._kinetics_projection(context)
+                if network is None:
+                    raise ValueError(
+                        'No server-owned frozen kinetics projection is available.')
+                audit = kinetics.audit_network(network)
+                manifest = catmap_adapter.load_confirmed_manifest(
+                    context['project_root'], audit['input_sha256'])
+                if manifest['selected_export_sha256'] != confirmed_export_sha256:
+                    raise ValueError('Confirmed export selection changed.')
+                if not self._kinetics_tool_matches(manifest, self._kinetics_tool()):
+                    raise ValueError(
+                        'Configured CatMAP identity does not match the confirmed export.')
+                selected = kinetics_store.select_result(
+                    context['project_root'], result_sha256, network,
+                    confirmed_export_sha256=confirmed_export_sha256,
+                    expected_latest_sha256=(expected_latest_sha256 or None),
+                    expected_revision=expected_revision,
+                    confirmed=confirmed is True,
+                    expected_adapter=self._kinetics_expected_adapter(manifest))
+                return self._analysis_workbench_public_value({
+                    'ok': True, 'schema': kinetics_store.SELECTION_SCHEMA,
+                    'project_id': context['project_id'],
+                    'input_sha256': selected['input_sha256'],
+                    'result_sha256': selected['result_sha256'],
+                    'confirmed_export_sha256': confirmed_export_sha256,
+                    'selected': True,
+                    'selection_revision': selected['selection_revision'],
+                    'latest_result_sha256': selected['latest_result_sha256'],
+                    'scientific_status': 'diagnostic', 'eligible_final': False,
+                    'error': None,
+                })
+
+            return self._call_with_project_bindings([record], build)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return {
+                'ok': False,
+                'schema': 'vcstudio.kinetics-result-selection/v2',
+                'project_id': None, 'selected': False,
+                'scientific_status': 'unavailable', 'eligible_final': False,
                 'error': self._analysis_workbench_public_value(str(exc)),
             }
 

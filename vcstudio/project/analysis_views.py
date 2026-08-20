@@ -707,8 +707,260 @@ def build_comparison_view(items: Sequence[Mapping[str, Any]],
     return payload
 
 
+def build_kinetic_view(
+        network: Mapping[str, Any], audit: Mapping[str, Any],
+        normalized_result: Mapping[str, Any] | None,
+        tool: Mapping[str, Any], spec: AnalysisSpec, *,
+        configured_tool: Mapping[str, Any] | None = None,
+        tool_identity_matches: bool | None = None) -> dict[str, Any]:
+    """Project one server-validated microkinetic result for display only."""
+    if spec.analysis_id != "kinetic-dashboard":
+        raise ValueError(
+            "kinetic dashboard requires analysis_id=kinetic-dashboard")
+    if not isinstance(network, Mapping) or not isinstance(audit, Mapping):
+        raise TypeError("kinetic dashboard requires frozen network and audit objects")
+    if normalized_result is not None and not isinstance(normalized_result, Mapping):
+        raise TypeError("normalized kinetic result must be an object or None")
+    precision = int(spec.precision)
+
+    def display(value: Any) -> str:
+        number = _finite(value)
+        return "—" if number is None else f"{number:.{precision}f}"
+
+    def metric(records: Any, identifier: str, *, extras: Sequence[str] = ()) -> list[dict]:
+        projected = []
+        for raw in records if isinstance(records, Sequence) else []:
+            if not isinstance(raw, Mapping):
+                continue
+            record = {
+                identifier: _safe_public_text(raw.get(identifier)),
+                "value": _finite(raw.get("value")),
+                "display": display(raw.get("value")),
+            }
+            for key in extras:
+                record[key] = _safe_public_text(raw.get(key))
+            projected.append(record)
+        return projected
+
+    points = []
+    result_points = ((normalized_result or {}).get("points") or [])
+    for index, raw in enumerate(result_points):
+        if not isinstance(raw, Mapping):
+            continue
+        conditions = raw.get("conditions") or {}
+        temperature = _finite(conditions.get("temperature"))
+        pressure = _finite(conditions.get("pressure"))
+        potential = _finite(conditions.get("potential"))
+        condition_parts = [
+            f"T={display(temperature)} K", f"p={display(pressure)} bar",
+        ]
+        if potential is not None:
+            condition_parts.append(f"U={display(potential)} V")
+        convergence = raw.get("convergence") or {}
+        converged = convergence.get("converged") is True
+        residual = _finite(convergence.get("residual"))
+        points.append({
+            "point_index": index,
+            "condition_display": " · ".join(condition_parts),
+            "conditions": {
+                "temperature": temperature,
+                "temperature_display": display(temperature),
+                "pressure": pressure,
+                "pressure_display": display(pressure),
+                "potential": potential,
+                "potential_display": display(potential),
+            },
+            "tof": metric(raw.get("tof"), "species_id"),
+            "coverage": metric(
+                raw.get("coverage"), "species_id", extras=("site_type",)),
+            "selectivity": metric(raw.get("selectivity"), "species_id"),
+            "drc": metric(
+                raw.get("drc"), "step_id", extras=("target_species_id",)),
+            "dsc": metric(
+                raw.get("dsc"), "step_id", extras=("target_species_id",)),
+            "reaction_order": metric(
+                raw.get("reaction_order"), "species_id",
+                extras=("target_species_id",)),
+            "apparent_activation_energy": metric(
+                raw.get("apparent_activation_energy"), "species_id"),
+            "free_energy_diagram": metric(
+                raw.get("free_energy_diagram"), "state_id"),
+            "completeness": copy.deepcopy(raw.get("completeness") or {}),
+            "convergence": {
+                "status": "converged" if converged else "unconverged",
+                "converged": converged,
+                "residual": residual,
+                "residual_display": (
+                    "—" if residual is None else f"{residual:.{precision}e}"),
+                "iterations": (
+                    int(convergence["iterations"])
+                    if isinstance(convergence.get("iterations"), int)
+                    and not isinstance(convergence.get("iterations"), bool) else None),
+                "solver": _safe_public_text(convergence.get("solver")),
+            },
+        })
+
+    sensitivity = (normalized_result or {}).get("sensitivity") or {}
+    sensitivity_analyses = []
+    for raw in sensitivity.get("analyses") or []:
+        if not isinstance(raw, Mapping):
+            continue
+        value = _finite(raw.get("max_relative_change"))
+        sensitivity_analyses.append({
+            "kind": _safe_public_text(raw.get("kind")),
+            "max_relative_change": value,
+            "max_relative_change_display": display(value),
+        })
+
+    issues = audit.get("issues") or []
+    blocking = [
+        _safe_public_text(item.get("message")) for item in issues
+        if isinstance(item, Mapping) and item.get("severity") == "error"
+    ]
+    warnings = [
+        _safe_public_text(item.get("message")) for item in issues
+        if isinstance(item, Mapping) and item.get("severity") == "warning"
+    ]
+    warnings.extend(
+        _safe_public_text(item) for item in sensitivity.get("warnings") or [])
+    configured = configured_tool if isinstance(configured_tool, Mapping) else tool
+    tool_available = (
+        configured.get("available") is True and tool_identity_matches is not False)
+    result_available = normalized_result is not None
+    result_ready = bool(result_available and normalized_result.get("available") is True)
+    reason_codes = list((normalized_result or {}).get("reason_codes") or [])
+    if not tool_available:
+        reason_codes.append("CATMAP_UNAVAILABLE")
+    if not result_available:
+        reason_codes.append("RESULT_NOT_IMPORTED")
+    reason_codes = list(dict.fromkeys(
+        _safe_public_text(value) for value in reason_codes if value))
+    if reason_codes:
+        blocking.extend(reason_codes)
+    assumptions = network.get("assumptions") or {}
+    methodology = network.get("methodology") or {}
+    limitations = {
+        "mean_field": assumptions.get("mean_field") is True,
+        "steady_state": assumptions.get("steady_state") is True,
+        "uniform_sites": assumptions.get("site_uniformity") == "uniform",
+        "lateral_interactions": _safe_public_text(
+            assumptions.get("lateral_interactions")),
+        "mechanism_completeness": _safe_public_text(
+            assumptions.get("mechanism_completeness")),
+        "mechanism_completeness_is_asserted_not_proven": True,
+        "browser_solves": False,
+        "diagnostic_only": True,
+        "may_enter_accepted_or_final": False,
+    }
+    denominator = {
+        "condition_points": len(points),
+        "converged_points": sum(
+            1 for point in points if point["convergence"]["converged"]),
+        "elementary_steps": int(
+            (audit.get("denominator") or {}).get("elementary_steps") or 0),
+        "species": int((audit.get("denominator") or {}).get("species") or 0),
+        "visible_rows": len(points),
+    }
+    fingerprint_payload = {
+        "input_sha256": audit.get("input_sha256"),
+        "spec_sha256": spec.semantic_sha256,
+        "tool_sha256": tool.get("sha256"),
+        "configured_tool_sha256": configured.get("sha256"),
+        "tool_identity_matches": tool_identity_matches,
+        "result": normalized_result,
+    }
+    payload = {
+        "schema": VIEW_SCHEMA,
+        "analysis_id": spec.analysis_id,
+        "spec": spec.to_dict(),
+        "spec_sha256": spec.semantic_sha256,
+        "scientific_status": "diagnostic" if result_available else "unavailable",
+        # The audit/export workbench remains open even when the external solver
+        # or numerical result is unavailable.
+        "capability_status": "available",
+        "available": bool(tool_available and result_ready),
+        "solver_status": "available" if tool_available else "unavailable",
+        "input_audit_status": (
+            "machine_pass" if audit.get("machine_pass") is True else "failed"),
+        "result_status": (
+            "available" if result_ready else
+            "diagnostic_unavailable" if result_available else "not_imported"),
+        "reason_codes": reason_codes,
+        "units": {
+            str(key): _safe_public_text(value)
+            for key, value in ((normalized_result or {}).get("units") or {}).items()
+        },
+        "points": points,
+        "rows": points,
+        "audit": {
+            "schema": _safe_public_text(audit.get("schema")),
+            "input_sha256": _safe_public_text(audit.get("input_sha256")),
+            "source_projection_sha256": _safe_public_text(
+                audit.get("source_projection_sha256")),
+            "machine_pass": audit.get("machine_pass") is True,
+            "export_ready": audit.get("export_ready") is True,
+            "error_count": int(audit.get("error_count") or 0),
+            "warning_count": int(audit.get("warning_count") or 0),
+            "issues": [
+                {
+                    "severity": _safe_public_text(item.get("severity")),
+                    "code": _safe_public_text(item.get("code")),
+                    "field": _safe_public_text(item.get("path")),
+                    "message": _safe_public_text(item.get("message")),
+                }
+                for item in issues if isinstance(item, Mapping)
+            ],
+        },
+        "adapter": {
+            "available": tool.get("available") is True,
+            "name": _safe_public_text(tool.get("name")),
+            "version": _safe_public_text(tool.get("version")),
+            "sha256": _safe_public_text(tool.get("sha256")),
+            "size": (int(tool["size"])
+                     if isinstance(tool.get("size"), int) else None),
+            "bundled": False,
+            "auto_install": False,
+            "executes_in_app": False,
+        },
+        "configured_adapter": {
+            "available": configured.get("available") is True,
+            "name": _safe_public_text(configured.get("name")),
+            "version": _safe_public_text(configured.get("version")),
+            "sha256": _safe_public_text(configured.get("sha256")),
+            "size": (int(configured["size"])
+                     if isinstance(configured.get("size"), int) else None),
+            "matches_confirmed_export": tool_identity_matches,
+        },
+        "method_matrix": [{
+            "name": _safe_public_text(methodology.get("method_id")),
+            "status": _safe_public_text(methodology.get("compatibility_status")),
+            "energy_basis": _safe_public_text(methodology.get("energy_basis")),
+            "thermochemistry": _safe_public_text(methodology.get("thermochemistry")),
+            "solvation": _safe_public_text(methodology.get("solvation")),
+            "potential_model": _safe_public_text(methodology.get("potential_model")),
+        }],
+        "kinetic_sensitivity": {
+            "status": _safe_public_text(sensitivity.get("status")) or "unavailable",
+            "analyses": sensitivity_analyses,
+            "warnings": [
+                _safe_public_text(item) for item in sensitivity.get("warnings") or []],
+        },
+        "blocking": list(dict.fromkeys(value for value in blocking if value)),
+        "warnings": list(dict.fromkeys(value for value in warnings if value)),
+        "limitations": limitations,
+        "report_limitation": {
+            "result_kind": "diagnostic",
+            "may_enter_accepted_or_final": False,
+            "human_review_not_replaced": True,
+        },
+        "denominator": denominator,
+        "data_fingerprint": _canonical_hash(fingerprint_payload),
+    }
+    return payload
+
+
 __all__ = [
     "VIEW_SCHEMA", "build_adsorption_view", "build_aimd_analysis_view",
     "build_comparison_view", "build_convergence_analysis_view",
-    "build_free_energy_view", "build_neb_analysis_view",
+    "build_free_energy_view", "build_kinetic_view", "build_neb_analysis_view",
 ]

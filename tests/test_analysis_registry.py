@@ -32,6 +32,7 @@ def test_catalog_unifies_analysis_and_task_capabilities_without_builder_locators
         "neb-path",
         "convergence-scan",
         "aimd-diagnostics",
+        "kinetic-dashboard",
         "task-results",
         "electronic-structure",
         "charge-wavefunction",
@@ -91,14 +92,11 @@ def test_default_adsorption_spec_is_canonical_and_semantically_hashed():
         "schema": SPEC_SCHEMA,
         "analysis_id": "adsorption-energy",
         "project_id": PROJECT,
-        "comparison_project_ids": [],
         "data_mode": "stable",
         "near_degenerate_eV": 0.15,
         "precision": 4,
-        "baseline_project_id": None,
         "missing_policy": "show_missing",
         "sort": {"key": "species", "direction": "asc"},
-        "sensitivity_deadbands_eV": [0.1, 0.15, 0.2],
         "view_id": None,
     }
     assert len(first.semantic_sha256) == 64
@@ -157,11 +155,40 @@ def test_semantic_hash_changes_with_scientifically_visible_options():
     assert sensitivity.semantic_sha256 != comparison.semantic_sha256
 
 
+def test_view_template_identity_never_changes_semantic_hash():
+    baseline = normalize_analysis_request({
+        "analysis_id": "kinetic-dashboard", "precision": 6,
+    }, project_id=PROJECT)
+    named = normalize_analysis_request({
+        "analysis_id": "kinetic-dashboard", "precision": 6,
+        "view_id": "operator-layout-a",
+    }, project_id=PROJECT)
+
+    assert named.view_id == "operator-layout-a"
+    assert named.semantic_sha256 == baseline.semantic_sha256
+
+
+@pytest.mark.parametrize("analysis_id", [
+    item["id"] for item in analysis_catalog()["analyses"]
+])
+def test_every_canonical_spec_is_strictly_replayable(analysis_id):
+    request = {"analysis_id": analysis_id}
+    if analysis_id == "multi-project-comparison":
+        request["comparison_project_ids"] = [PROJECT, "project-b"]
+    first = normalize_analysis_request(request, project_id=PROJECT)
+
+    replayed = normalize_analysis_request(first.to_dict(), project_id=PROJECT)
+
+    assert replayed == first
+    assert replayed.semantic_sha256 == first.semantic_sha256
+
+
 @pytest.mark.parametrize("analysis_id", [
     "free-energy-path",
     "neb-path",
     "convergence-scan",
     "aimd-diagnostics",
+    "kinetic-dashboard",
     "task-results",
     "electronic-structure",
     "charge-wavefunction",

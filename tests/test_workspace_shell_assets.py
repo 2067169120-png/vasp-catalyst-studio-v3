@@ -337,7 +337,8 @@ def test_semantic_routes_select_the_registry_driven_analysis_workbench():
     assert "focus: '#aw-title'" in comparison
     for analysis_id in (
         'adsorption-energy', 'free-energy-path', 'electronic-structure',
-        'charge-wavefunction', 'multi-project-comparison', 'task-results',
+        'kinetic-dashboard', 'charge-wavefunction', 'multi-project-comparison',
+        'task-results',
     ):
         assert f"analysisId: '{analysis_id}'" in routes
     assert "page: 'report-workbench'" in report and "focus: '#rw-title'" in report

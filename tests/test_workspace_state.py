@@ -27,11 +27,13 @@ def _route(area="analyze", view="analyze-energy",
         analysis_path = {
             "analyze-energy": "adsorption",
             "analyze-thermo": "thermo",
+            "analyze-kinetics": "kinetics",
             "analyze-electronic": "electronic",
             "analyze-charge": "charge",
             "analyze-comparison": "comparison",
             "analyze-custom": "custom",
             "analyze-properties": "properties",
+            "analyze-references": "references",
         }[view]
         route_hash = f"#/projects/{project_id}/analysis/{analysis_path}"
     elif area == "run":
@@ -366,6 +368,10 @@ def test_draft_reference_metadata_is_fail_closed(tmp_path, ref, message):
      "view": "project-members"},
     {"hash": "#/projects/project-abc/analysis/adsorption", "area": "analyze",
      "view": "analyze-energy"},
+    {"hash": "#/projects/project-abc/analysis/kinetics", "area": "analyze",
+     "view": "analyze-kinetics"},
+    {"hash": "#/projects/project-abc/analysis/references", "area": "analyze",
+     "view": "analyze-references"},
     {"hash": "#/prepare/preflight", "area": "prepare", "view": "prepare-preflight"},
     {"hash": "#/jobs?status=need", "area": "run", "view": "run-jobs"},
     {"hash": "#/jobs?status=need&cluster=gpu-a", "area": "run", "view": "run-jobs"},
