@@ -1726,8 +1726,8 @@
     return withExclusiveOperation('continue', actionLabel, dirs, name, async op => {
       const ok = await VCS.confirm(tr('runtime.jobs.continue.confirm', {
         count: dirs.length, server: name, targets: operationTargetText(dirs),
-      }, '将从 CONTCAR 续算并重投以下 {count} 个作业到「{server}」：\n{targets}\n\nINCAR 冻结；每作业上限 3 轮。不可续算的会被后端跳过。\n\n继续?',
-      'Continue and resubmit these {count} jobs from CONTCAR to "{server}":\n{targets}\n\nINCAR is frozen and each job is limited to 3 rounds. The backend will skip jobs that cannot be continued.\n\nContinue?'));
+      }, '将从 CONTCAR 续算并重投以下 {count} 个作业到「{server}」：\n{targets}\n\nINCAR 冻结。自动托管最多续算 3 轮；这是人工确认，超过 3 轮仍可继续，请自行判断机时与方法合理性。其他不可续算作业仍会被后端跳过。\n\n继续?',
+      'Continue and resubmit these {count} jobs from CONTCAR to "{server}":\n{targets}\n\nINCAR is frozen. Automatic management stops after 3 continuation rounds; this explicit manual action may continue beyond that limit, so review compute cost and method validity. Other ineligible jobs are still skipped by the backend.\n\nContinue?'));
       if (!ok) return { status: 'cancelled' };
       updateOperation(op, 'running');
       VCS.log(tr('runtime.jobs.continue.connecting', { count: dirs.length },

@@ -464,20 +464,24 @@ class JobsTab(ttk.Frame):
         prof = self._profile()
         if prof is None:
             return
-        dirs, skipped = batch_ops.filter_continuable(sel)
+        dirs, skipped = batch_ops.filter_continuable(
+            sel, allow_round_limit_override=True)
         if not dirs:
-            self.log.write('❌ 选中作业均不可续算(需:已结束 + 诊断标可续算 + 未达 3 轮上限)')
+            self.log.write('❌ 选中作业均不可续算(需:已结束 + 诊断标可续算)')
             return
         tail = f'(跳过 {skipped} 个不可续算/仍在跑)' if skipped else ''
         if not trust_new and not messagebox.askyesno(
                 '确认续算',
                 f'将对 {len(dirs)} 个可续算作业从 CONTCAR 续算并重投到「{prof.name}」{tail}\n'
-                f'INCAR 冻结;每作业上限 3 轮。\n\n继续?'):
+                f'INCAR 冻结。自动托管最多 3 轮；这是人工确认，超过 3 轮仍可继续，'
+                f'请自行判断机时与方法合理性。\n\n继续?'):
             return
         pw = self._password_for(prof)
         self.continue_btn.configure(state='disabled')
         self.log.write(f'⏳ 连接并续算 {len(dirs)} 个作业…')
-        q = runner.submit(batch_ops.continue_batch, prof, pw, dirs, trust_new)
+        q = runner.submit(
+            batch_ops.continue_batch, prof, pw, dirs, trust_new,
+            allow_round_limit_override=True)
         self.after(200, lambda: self._poll_continue(q))
 
     def _poll_continue(self, q):
@@ -634,7 +638,8 @@ class JobsTab(ttk.Frame):
         ttk.Label(win, foreground='#64748B', wraplength=520, text=(
             '白名单(非方法学旋钮):' + ', '.join(sorted(submitter.INCAR_TUNE_WHITELIST)) +
             '。ENCUT/泛函/IVDW/ISPIN 不可改(保 ΔE 可比性)。'
-            '修改以追加块写入 INCAR 文末(原文保留,VASP 取末次出现值),并计入续算轮次(上限 3)。')).pack(
+            '修改以追加块写入 INCAR 文末(原文保留,VASP 取末次出现值),并计入续算轮次。'
+            '自动续算上限为 3 轮；人工确认的改参续算可超过该上限。')).pack(
             anchor='w', padx=10, pady=4)
         from_contcar = tk.BooleanVar(value=True)
         ttk.Checkbutton(win, text='同时从 CONTCAR 续算结构(推荐;取消则保持原 POSCAR 重跑)',

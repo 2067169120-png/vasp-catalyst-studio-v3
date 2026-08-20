@@ -2551,7 +2551,7 @@
   "runtime.jobs.common.unknown_error": "Unknown error",
   "runtime.jobs.confirm.target_row": "{index}. {name} | Project: {project} | Status: {state} | Cluster: {cluster}",
   "runtime.jobs.continue.action_name": "Continue",
-  "runtime.jobs.continue.confirm": "Continue and resubmit these {count} jobs from CONTCAR to \"{server}\":\n{targets}\n\nINCAR is frozen and each job is limited to 3 rounds. The backend will skip jobs that cannot be continued.\n\nContinue?",
+  "runtime.jobs.continue.confirm": "Continue and resubmit these {count} jobs from CONTCAR to \"{server}\":\n{targets}\n\nINCAR is frozen. Automatic management stops after 3 continuation rounds; this explicit manual action may continue beyond that limit, so review compute cost and method validity. Other ineligible jobs are still skipped by the backend.\n\nContinue?",
   "runtime.jobs.continue.connecting": "Connecting and continuing {count} jobs…",
   "runtime.jobs.continue.failed": "Continuation failed: {error}",
   "runtime.jobs.continue.selection_required": "Select jobs to continue (only unconverged, wall-time, ZBRENT, and similar recoverable jobs)",

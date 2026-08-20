@@ -846,6 +846,18 @@ def test_continue_refuses_at_round_cap(tmp_path):
         submitter.continue_from_contcar(FakeClient(), _profile(), d, max_rounds=3)
 
 
+def test_explicit_manual_continue_can_exceed_automatic_round_cap(tmp_path):
+    d = _restartable_job(tmp_path, rounds=submitter.CONTINUE_MAX_ROUNDS)
+    client = FakeClient(script=[('cat', _VALID_CONTCAR), ('qsub', '204.c\n')])
+
+    updated = submitter.continue_from_contcar(
+        client, _profile(), d, max_rounds=None)
+
+    assert updated['results']['continue_rounds'] == submitter.CONTINUE_MAX_ROUNDS + 1
+    assert updated['attempts'][-1]['round_limit_override'] == 'manual-explicit'
+    assert '人工确认超出自动上限' in updated['state_history'][-1]['note']
+
+
 def test_continue_refuses_invalid_contcar(tmp_path):
     d = _restartable_job(tmp_path)
     client = FakeClient(script=[('cat', 'garbage\nshort\n')])   # CONTCAR 不完整

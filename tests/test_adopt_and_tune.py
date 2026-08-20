@@ -263,6 +263,21 @@ def test_tune_continue_respects_round_cap(tmp_path):
             FakeClient(), FakeSFTP(), _profile(), d, {'ALGO': 'Normal'})
 
 
+def test_explicit_manual_tune_can_exceed_automatic_round_cap(tmp_path):
+    d = _terminal_job(tmp_path)
+    m = manifest.load_manifest(d)
+    m['results']['continue_rounds'] = submitter.CONTINUE_MAX_ROUNDS
+    manifest.save_manifest(d, m)
+    client = FakeClient(script=[('cat', _CONTCAR), ('qsub', '904.cluster\n')])
+
+    updated = submitter.continue_with_incar_changes(
+        client, FakeSFTP(), _profile(), d, {'ALGO': 'Normal'}, max_rounds=None)
+
+    assert updated['results']['continue_rounds'] == submitter.CONTINUE_MAX_ROUNDS + 1
+    assert updated['attempts'][-1]['round_limit_override'] == 'manual-explicit'
+    assert '人工确认超出自动上限' in updated['state_history'][-1]['note']
+
+
 def test_tune_continue_empty_changes_rejected(tmp_path):
     d = _terminal_job(tmp_path)
     with pytest.raises(ValueError):

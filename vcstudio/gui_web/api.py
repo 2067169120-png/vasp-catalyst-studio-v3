@@ -2449,21 +2449,28 @@ class Api:
 
     @staticmethod
     def _job_batch_with_idempotency(function, *args, idempotency_key=None, **kwargs):
-        """Pass an operation id exactly once when an injected adapter supports it."""
+        """Pass supported optional batch keywords without retrying a mutation.
+
+        Production adapters accept the durable operation id and, for manual
+        continuation, a server-owned round-limit override.  Older extensions
+        and lightweight tests may expose the historical positional signature;
+        unsupported optional keywords are filtered before the single call.
+        """
         try:
-            parameters = inspect.signature(function).parameters.values()
+            parameters = inspect.signature(function).parameters
         except (TypeError, ValueError):
-            parameters = ()
-        supports_key = any(
-            parameter.name == 'idempotency_key'
-            or parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters
-        )
+            parameters = {}
+        supports_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values())
+        call_kwargs = {
+            name: value for name, value in kwargs.items()
+            if supports_kwargs or name in parameters
+        }
+        supports_key = supports_kwargs or 'idempotency_key' in parameters
         if supports_key:
-            call_kwargs = dict(kwargs)
             call_kwargs['idempotency_key'] = idempotency_key
-            return function(*args, **call_kwargs)
-        return function(*args, **kwargs)
+        return function(*args, **call_kwargs)
 
     @staticmethod
     def _submit_batch_with_idempotency(submit_batch, profile, password, dirs,
@@ -2586,7 +2593,8 @@ class Api:
                                   dirs=dirs, invoke=lambda: self._job_batch_with_idempotency(
                                       self._bo().continue_batch,
                                       prof, pw, list(dirs), trust_new,
-                                      idempotency_key=idempotency_key)))
+                                      idempotency_key=idempotency_key,
+                                      allow_round_limit_override=True)))
 
     def refresh_status(self, name, password, trust_new=False):
         """Refresh one profile without racing the background supervisor."""

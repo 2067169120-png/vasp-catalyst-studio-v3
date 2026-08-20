@@ -2551,7 +2551,7 @@
   "runtime.jobs.common.unknown_error": "未知错误",
   "runtime.jobs.confirm.target_row": "{index}. {name}｜项目：{project}｜状态：{state}｜集群：{cluster}",
   "runtime.jobs.continue.action_name": "续算",
-  "runtime.jobs.continue.confirm": "将从 CONTCAR 续算并重投以下 {count} 个作业到「{server}」：\n{targets}\n\nINCAR 冻结；每作业上限 3 轮。不可续算的会被后端跳过。\n\n继续?",
+  "runtime.jobs.continue.confirm": "将从 CONTCAR 续算并重投以下 {count} 个作业到「{server}」：\n{targets}\n\nINCAR 冻结。自动托管最多续算 3 轮；这是人工确认，超过 3 轮仍可继续，请自行判断机时与方法合理性。其他不可续算作业仍会被后端跳过。\n\n继续?",
   "runtime.jobs.continue.connecting": "连接并续算 {count} 个作业…",
   "runtime.jobs.continue.failed": "续算异常:{error}",
   "runtime.jobs.continue.selection_required": "请先选中要续算的作业(仅未收敛/墙钟/ZBRENT 等可续算)",

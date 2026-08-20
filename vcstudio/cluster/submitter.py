@@ -2706,7 +2706,7 @@ def _restore_local_restart_file(path: str, round_number: int,
 
 @_serialized_job_argument(2, '续算')
 def continue_from_contcar(client, profile, job_dir: str,
-                          max_rounds: int = CONTINUE_MAX_ROUNDS, *,
+                          max_rounds: int | None = CONTINUE_MAX_ROUNDS, *,
                           idempotency_key: str | None = None) -> dict:
     """把一个可续算作业从 CONTCAR 接着跑(cp CONTCAR POSCAR + 冻结 INCAR 重投同一脚本)。
 
@@ -2714,7 +2714,8 @@ def continue_from_contcar(client, profile, job_dir: str,
     - 只对 diagnose 标 restartable 的分类(未收敛/墙钟/ZBRENT)出手,否则拒绝;
     - CONTCAR 必须通过 valid_poscar 校验(防拿半个结构续出垃圾);
     - **INCAR 逐字冻结**(方法学主权,无可比性护栏前的安全默认);
-    - continue_rounds 硬上限(默认 3),到顶停机交人工(防死循环);
+    - 自动恢复的 continue_rounds 硬上限为 3,到顶停机交人工(防死循环);
+    - ``max_rounds=None`` 只供服务端已确认的人工入口使用,仅放宽轮次门;
     - 清远端 WAVECAR/CHGCAR 去混合历史；bands 因 ICHARG=11 必须保留 CHGCAR；
       记 prev_job_id 溯源。
     失败抛 ValueError/RuntimeError(中文)。成功返回更新后的 manifest(state=SUBMITTED)。
@@ -2747,8 +2748,9 @@ def continue_from_contcar(client, profile, job_dir: str,
             f"该作业不可自动续算(分类 {diag.get('failure_class', '?')});"
             f'仅 未收敛/墙钟/ZBRENT 等可从 CONTCAR 续算,硬崩/缺输出需人工')
     rounds = int((m.get('results') or {}).get('continue_rounds', 0))
-    if rounds >= max_rounds:
+    if max_rounds is not None and rounds >= max_rounds:
         raise RuntimeError(f'已续算 {rounds} 次达上限 {max_rounds},停机交人工(防死循环)')
+    manual_round_override = max_rounds is None and rounds >= CONTINUE_MAX_ROUNDS
     remote = m.get('remote_dir')
     if not remote:
         raise ValueError('该作业无 remote_dir(未提交过),无法续算')
@@ -2843,11 +2845,16 @@ def continue_from_contcar(client, profile, job_dir: str,
         'round': rounds + 1,
         'operation_transaction_id': record['transaction_id'],
     }
+    if manual_round_override:
+        attempt['round_limit_override'] = 'manual-explicit'
     if operation_key:
         attempt['idempotency_key'] = operation_key
     m.setdefault('attempts', []).append(attempt)
-    manifest_mod.set_state(m, 'SUBMITTED',
-                           note=f'CONTCAR 续算 第{rounds + 1}轮(prev {prev} → {job_id},INCAR 冻结)')
+    override_note = ',人工确认超出自动上限' if manual_round_override else ''
+    manifest_mod.set_state(
+        m, 'SUBMITTED',
+        note=(f'CONTCAR 续算 第{rounds + 1}轮(prev {prev} → {job_id},'
+              f'INCAR 冻结{override_note})'))
     try:
         manifest_mod.save_manifest(job_dir, m)
     except Exception as exc:  # noqa: BLE001 - remote_accepted journal is authoritative gate
@@ -2880,12 +2887,13 @@ _TUNE_BANNER = '# --- vcstudio 改参续算 第{round}轮 {at} ---'
 @_serialized_job_argument(3, '改参续算')
 def continue_with_incar_changes(client, sftp, profile, job_dir: str,
                                 changes: dict,
-                                max_rounds: int = CONTINUE_MAX_ROUNDS,
+                                max_rounds: int | None = CONTINUE_MAX_ROUNDS,
                                 restart_from_contcar: bool = True) -> dict:
     """诊断建议 → 受控改参重投:白名单键追加覆盖到 INCAR 文末(原文一字不删),
     可选 CONTCAR→POSCAR,清 WAVECAR/CHGCAR（bands 保留 CHGCAR）,重投同一脚本。
 
-    与冻结续算共用状态门/轮次上限;差异:
+    与冻结续算共用状态门；默认调用仍有三轮上限，而服务端确认的人工入口可传
+    ``max_rounds=None`` 仅放宽轮次。其余差异:
     - changes 仅允许 INCAR_TUNE_WHITELIST 键(违例 ValueError 点名,绝不静默丢弃);
     - 放宽 restartable 限制:SCF_SLOSHING/EDDDAV 等 NEEDS_HUMAN 类正是改参对象,
       故只要求终态(不在队/不在跑),不要求 diagnose.restartable;
@@ -2914,8 +2922,9 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
     if m.get('state') in ('UPLOADED', 'SUBMITTED', 'QUEUED', 'RUNNING'):
         raise ValueError(f"该作业仍在队列/运行中(状态 {m['state']}),不能改参重投")
     rounds = int((m.get('results') or {}).get('continue_rounds', 0))
-    if rounds >= max_rounds:
+    if max_rounds is not None and rounds >= max_rounds:
         raise RuntimeError(f'已续算 {rounds} 次达上限 {max_rounds},停机交人工(防死循环)')
+    manual_round_override = max_rounds is None and rounds >= CONTINUE_MAX_ROUNDS
     remote = m.get('remote_dir')
     if not remote:
         raise ValueError('该作业无 remote_dir(未提交过),无法改参续算')
@@ -2993,7 +3002,7 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
         'round': rounds + 1,
         'files': ['OUTCAR', 'OSZICAR', 'vasprun.xml', 'CONTCAR', 'XDATCAR'],
     }
-    m.setdefault('attempts', []).append({
+    attempt = {
         'n': len(m.get('attempts') or []) + 1,
         'at': at,
         'result': 'continued',
@@ -3003,11 +3012,15 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
         'prev_job_id': prev,
         'job_id': job_id,
         'round': rounds + 1,
-    })
+    }
+    if manual_round_override:
+        attempt['round_limit_override'] = 'manual-explicit'
+    m.setdefault('attempts', []).append(attempt)
+    override_note = ',人工确认超出自动上限' if manual_round_override else ''
     manifest_mod.set_state(
         m, 'SUBMITTED',
         note=f'改参续算 第{rounds + 1}轮({", ".join(f"{str(k).upper()}={v}" for k, v in changes.items())};'
-             f'prev {prev} → {job_id})')
+             f'prev {prev} → {job_id}{override_note})')
     manifest_mod.save_manifest(job_dir, m)
     return m
 

@@ -157,11 +157,13 @@ def fetch_batch(prof, pw, dirs, trust_new, files=None):
     return {'needs_trust': False, 'results': results}
 
 
-def filter_continuable(dirs):
-    """本地预筛(证据都在 job.yaml):终态 + diagnosis.restartable + 未达轮次上限。
+def filter_continuable(dirs, *, allow_round_limit_override=False):
+    """本地预筛(证据都在 job.yaml):终态 + diagnosis.restartable。
 
     返回 (可续算 dirs, 跳过数)。避免把整批原样送去连接后逐个失败刷屏,且不对仍在跑的
-    作业出手(与 submitter.continue_from_contcar 的状态门一致)。纯函数,可离线测。
+    作业出手(与 submitter.continue_from_contcar 的状态门一致)。自动托管保持三轮硬上限；
+    只有已经经过本地显式确认的人工入口才可把 ``allow_round_limit_override`` 设为 True。
+    这只放宽轮次，不绕过终态、诊断、CONTCAR、几何、profile 或幂等门禁。
     """
     eligible, skipped = [], 0
     for d in dirs:
@@ -173,15 +175,20 @@ def filter_continuable(dirs):
                 and m.get('state') not in ('UPLOADED', 'SUBMITTED', 'QUEUED', 'RUNNING')
                 and str(m.get('task_type') or '') != 'neb'
                 and dgn.get('restartable')
-                and rounds < submitter.CONTINUE_MAX_ROUNDS):
+                and (allow_round_limit_override
+                     or rounds < submitter.CONTINUE_MAX_ROUNDS)):
             eligible.append(d)
         else:
             skipped += 1
     return eligible, skipped
 
 
-def continue_batch(prof, pw, dirs, trust_new, *, idempotency_key=None):
-    """CONTCAR 续算批量线程体:每作业调 submitter.continue_from_contcar(不可续算的自失败)。"""
+def continue_batch(prof, pw, dirs, trust_new, *, idempotency_key=None,
+                   allow_round_limit_override=False):
+    """CONTCAR 续算批量线程体。
+
+    自动调用保留三轮上限；显式人工确认入口可仅放宽该上限，其他科学/状态门不变。
+    """
     try:
         client, jump = open_client(prof, pw, trust_new=trust_new)
     except ConnectError as e:
@@ -197,10 +204,17 @@ def continue_batch(prof, pw, dirs, trust_new, *, idempotency_key=None):
             try:
                 if idempotency_key:
                     m = submitter.continue_from_contcar(
-                        client, prof, d, idempotency_key=idempotency_key)
+                        client, prof, d,
+                        max_rounds=(None if allow_round_limit_override
+                                    else submitter.CONTINUE_MAX_ROUNDS),
+                        idempotency_key=idempotency_key)
                 else:
                     # Preserve the historical injectable three-argument seam.
-                    m = submitter.continue_from_contcar(client, prof, d)
+                    if allow_round_limit_override:
+                        m = submitter.continue_from_contcar(
+                            client, prof, d, max_rounds=None)
+                    else:
+                        m = submitter.continue_from_contcar(client, prof, d)
                 verb = '已确认续算' if m.get('_continue_replayed') else '已续算重投'
                 results.append((d, True, f"{verb},新作业号 {m['scheduler_job_id']}"))
             except submitter.JobOperationBusy as e:
@@ -357,7 +371,7 @@ def adopt_scan(prof, pw, trust_new, known_ids, local_root):
 
 
 def tune_batch(prof, pw, job_dir, changes, trust_new, from_contcar=True):
-    """改参续算线程体(单作业)。"""
+    """人工改参续算线程体(单作业；不受自动三轮上限约束)。"""
     try:
         client, jump = open_client(prof, pw, trust_new=trust_new)
     except ConnectError as e:
@@ -370,6 +384,7 @@ def tune_batch(prof, pw, job_dir, changes, trust_new, from_contcar=True):
         try:
             m = submitter.continue_with_incar_changes(
                 client, sftp, prof, job_dir, changes,
+                max_rounds=None,
                 restart_from_contcar=from_contcar)
             results.append((job_dir, True, f"已改参重投,新作业号 {m['scheduler_job_id']}"))
         except _job_errors() as e:

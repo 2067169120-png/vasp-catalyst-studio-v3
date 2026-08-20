@@ -31,6 +31,24 @@ def test_filter_continuable_partitions_selection(tmp_path):
     assert eligible == [ok] and skipped == 4
 
 
+def test_filter_continuable_manual_override_keeps_other_guards(tmp_path):
+    capped = _mk_job(
+        tmp_path, 'cap', 'UNCONVERGED', restartable=True,
+        rounds=batch_ops.submitter.CONTINUE_MAX_ROUNDS)
+    running = _mk_job(
+        tmp_path, 'run', 'RUNNING', restartable=True,
+        rounds=batch_ops.submitter.CONTINUE_MAX_ROUNDS)
+    hardfail = _mk_job(
+        tmp_path, 'hard', 'FAILED', restartable=False,
+        rounds=batch_ops.submitter.CONTINUE_MAX_ROUNDS)
+
+    eligible, skipped = batch_ops.filter_continuable(
+        [capped, running, hardfail], allow_round_limit_override=True)
+
+    assert eligible == [capped]
+    assert skipped == 2
+
+
 def test_filter_continuable_excludes_neb_from_generic_restart(tmp_path):
     d = _mk_job(tmp_path, 'neb', 'UNCONVERGED', restartable=True)
     data = mm.load_manifest(d)
@@ -286,4 +304,22 @@ def test_continue_batch_survives_error(monkeypatch):
     monkeypatch.setattr(batch_ops.submitter, 'continue_from_contcar', flaky)
     payload = batch_ops.continue_batch(object(), None, ['bad', 'good'], False)
     assert [r[1] for r in payload['results']] == [False, True]
+    assert client.closed and jump.closed
+
+
+def test_manual_continue_batch_disables_only_the_round_cap(monkeypatch):
+    client, jump = _patch_open(monkeypatch)
+    calls = []
+
+    def continued(c, p, d, *, max_rounds=batch_ops.submitter.CONTINUE_MAX_ROUNDS):
+        calls.append((d, max_rounds))
+        return {'scheduler_job_id': '10'}
+
+    monkeypatch.setattr(batch_ops.submitter, 'continue_from_contcar', continued)
+    payload = batch_ops.continue_batch(
+        object(), None, ['capped'], False,
+        allow_round_limit_override=True)
+
+    assert payload['results'][0][1] is True
+    assert calls == [('capped', None)]
     assert client.closed and jump.closed

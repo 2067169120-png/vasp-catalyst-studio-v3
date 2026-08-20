@@ -605,8 +605,11 @@ def test_continue_jobs_delegates():
 def test_continue_jobs_sinks_operation_id_into_durable_batch_seam():
     calls = {}
 
-    def _continue(_prof, _pw, dirs, _trust, *, idempotency_key=None):
-        calls.update(dirs=list(dirs), idempotency_key=idempotency_key)
+    def _continue(_prof, _pw, dirs, _trust, *, idempotency_key=None,
+                  allow_round_limit_override=False):
+        calls.update(
+            dirs=list(dirs), idempotency_key=idempotency_key,
+            allow_round_limit_override=allow_round_limit_override)
         return {'needs_trust': False, 'results': []}
 
     store = {'c1': ClusterProfile(name='c1', auth='key', key_path='/k')}
@@ -616,7 +619,10 @@ def test_continue_jobs_sinks_operation_id_into_durable_batch_seam():
 
     api.continue_jobs(['/a'], 'c1', None, False, key)
 
-    assert calls == {'dirs': ['/a'], 'idempotency_key': key}
+    assert calls == {
+        'dirs': ['/a'], 'idempotency_key': key,
+        'allow_round_limit_override': True,
+    }
 
 
 def test_continue_jobs_unknown_profile_error():
