@@ -1,12 +1,13 @@
 """Structure Source Hub browser-boundary and candidate-creation contracts."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import copy
 import json
 import os
 from pathlib import Path
 import shutil
-import types
+import threading
 
 import pytest
 import yaml
@@ -214,24 +215,94 @@ class _TwoCandidateSurface(_FakeSurface):
         return [first, second]
 
 
-class _FlakyLedger:
-    def __init__(self):
+class _OwnedLedger:
+    def __init__(self, registrations=None):
+        self.registrations = registrations if registrations is not None else []
+        self.owners = {}
         self.calls = []
-        self.failed_once = False
+        self.rollback_calls = []
+        self.release_calls = []
+        self.lock = threading.Lock()
 
     @staticmethod
     def load_all():
         return []
 
-    def register(self, path):
+    def register_owned(self, path, transaction_id):
+        value = str(Path(path).resolve())
         name = Path(path).name
-        self.calls.append(name)
+        with self.lock:
+            self.calls.append(name)
+            current = self.owners.get(value)
+            if current not in {None, transaction_id}:
+                raise RuntimeError("owned by another transaction")
+            if value not in self.registrations:
+                self.registrations.append(value)
+                self.owners[value] = transaction_id
+                return True
+            return False
+
+    def unregister_owned(self, path, transaction_id):
+        value = str(Path(path).resolve())
+        with self.lock:
+            self.rollback_calls.append(Path(path).name)
+            if self.owners.get(value) != transaction_id:
+                return False
+            self.owners.pop(value, None)
+            self.registrations.remove(value)
+            return True
+
+    def release_owner(self, path, transaction_id):
+        value = str(Path(path).resolve())
+        with self.lock:
+            self.release_calls.append(Path(path).name)
+            if self.owners.get(value) != transaction_id:
+                return False
+            self.owners.pop(value, None)
+            return True
+
+
+class _FlakyLedger(_OwnedLedger):
+    def __init__(self):
+        super().__init__()
+        self.failed_once = False
+
+    def register_owned(self, path, transaction_id):
+        name = Path(path).name
         if "term-02" in name and not self.failed_once:
+            self.calls.append(name)
             self.failed_once = True
             raise OSError(
                 r"registration C:\ledger-private\jobs failed; "
                 "password=top-secret-value"
             )
+        return super().register_owned(path, transaction_id)
+
+
+class _MutatingAfterOwnedLedger(_FlakyLedger):
+    def register_owned(self, path, transaction_id):
+        added = super().register_owned(path, transaction_id)
+        if "term-02" in Path(path).name:
+            with (Path(path) / "POSCAR").open("a", encoding="utf-8") as handle:
+                handle.write("post-register mutation\n")
+        return added
+
+
+class _SimulatedProcessCrash(BaseException):
+    pass
+
+
+class _CrashAfterOwnedLedger(_OwnedLedger):
+    def __init__(self):
+        super().__init__()
+        self.crashed = False
+
+    def register_owned(self, path, transaction_id):
+        added = super().register_owned(path, transaction_id)
+        if not self.crashed:
+            self.crashed = True
+            raise _SimulatedProcessCrash("crash after durable owned registration")
+        return added
 
 
 class _MaliciousSources(_FakeSources):
@@ -306,8 +377,7 @@ def _api(tmp_path: Path, *, sources=None, dialog_kind=None, ledger=None, surface
         return str(chosen_output if kind == "dir" else chosen_source)
 
     registrations = []
-    ledger = ledger or types.SimpleNamespace(
-        register=lambda path: registrations.append(str(path)), load_all=lambda: [])
+    ledger = ledger or _OwnedLedger(registrations)
     api = Api(
         dialog_fn=dialog, ledger_mod=ledger,
         structure_source_session=sources,
@@ -753,6 +823,132 @@ def test_registration_recovery_rejects_manifest_operation_binding_tamper(tmp_pat
         "registration_pending"] is True
 
 
+def test_registration_recovery_rejects_nonregistration_manifest_mutation(tmp_path):
+    ledger = _FlakyLedger()
+    api, _sources, _registrations, _source, output = _api(
+        tmp_path, ledger=ledger, surface=_TwoCandidateSurface)
+    confirmed = api.structure_source_confirm("1" * 32)["source_token"]
+    dry_run = api.surface_dry_run(confirmed, {"miller": [1, 0, 0]}, {})
+    destination = api.structure_output_select()
+    partial = api.surface_create_candidates(
+        dry_run["operation_token"], destination["output_token"])
+    batch = next(path for path in output.iterdir() if path.is_dir())
+    authority = json.loads(
+        (batch / ".vcstudio-structure-recovery.json").read_text(encoding="utf-8"))
+    pending_id = partial["registration_pending"][0]
+    member = next(item for item in authority["members"] if item["job_id"] == pending_id)
+    manifest_path = batch / member["job_name"] / "job.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    manifest.update({
+        "state": "RUNNING",
+        "scientific_status": "verified",
+        "submission_ready": True,
+        "scheduler_job_id": "attacker-job-42",
+        "remote_dir": "/attacker/remote",
+        "cluster": {"name": "attacker-cluster"},
+    })
+    manifest_path.write_text(
+        yaml.safe_dump(manifest, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    result = api.surface_create_candidates(
+        dry_run["operation_token"], destination["output_token"])
+
+    assert result["ok"] is False and result["corruption"] is True
+    assert {item["code"] for item in result["corruptions"]} == {
+        "manifest_immutable_sha256_mismatch"
+    }
+    assert len(ledger.calls) == 2
+    assert pending_id in result["registration_pending"]
+
+
+def test_post_register_mutation_is_revalidated_and_owned_entry_is_rolled_back(tmp_path):
+    ledger = _MutatingAfterOwnedLedger()
+    api, _sources, _registrations, _source, output = _api(
+        tmp_path, ledger=ledger, surface=_TwoCandidateSurface)
+    confirmed = api.structure_source_confirm("1" * 32)["source_token"]
+    dry_run = api.surface_dry_run(confirmed, {"miller": [1, 0, 0]}, {})
+    destination = api.structure_output_select()
+    partial = api.surface_create_candidates(
+        dry_run["operation_token"], destination["output_token"])
+    assert partial["ok"] is False
+
+    result = api.surface_create_candidates(
+        dry_run["operation_token"], destination["output_token"])
+
+    assert result["ok"] is False and result["corruption"] is True
+    assert any(
+        item["code"] in {"poscar_size_mismatch", "poscar_sha256_mismatch"}
+        for item in result["corruptions"]
+    )
+    assert any("term-02" in value for value in ledger.rollback_calls)
+    assert not any("term-02" in Path(value).name for value in ledger.registrations)
+    assert not any("term-02" in Path(value).name for value in ledger.owners)
+
+
+def test_owned_registration_survives_crash_and_restart_then_releases_owner(tmp_path):
+    ledger = _CrashAfterOwnedLedger()
+    api, _sources, _registrations, _source, output = _api(
+        tmp_path, ledger=ledger, surface=_TwoCandidateSurface)
+    confirmed = api.structure_source_confirm("1" * 32)["source_token"]
+    dry_run = api.surface_dry_run(confirmed, {"miller": [1, 0, 0]}, {})
+    destination = api.structure_output_select()
+
+    with pytest.raises(_SimulatedProcessCrash):
+        api.surface_create_candidates(
+            dry_run["operation_token"], destination["output_token"])
+    assert len(ledger.registrations) == 1 and len(ledger.owners) == 1
+
+    restarted, _sources2, _registrations2, _source2, _output2 = _api(
+        tmp_path, ledger=ledger, surface=_TwoCandidateSurface)
+    restarted_destination = restarted.structure_output_select()
+    recovered = restarted.surface_recover_candidates(
+        dry_run["operation_token"], restarted_destination["output_token"])
+
+    assert recovered["ok"] is True
+    assert len(ledger.registrations) == 2
+    assert ledger.owners == {}
+    batch = next(path for path in output.iterdir() if path.is_dir())
+    authority = json.loads(
+        (batch / ".vcstudio-structure-recovery.json").read_text(encoding="utf-8"))
+    assert authority["status"] == "complete"
+    assert authority["owner_release_pending"] == []
+
+
+def test_two_api_instances_share_stable_batch_lock_and_register_pending_once(tmp_path):
+    ledger = _FlakyLedger()
+    api, _sources, _registrations, _source, output = _api(
+        tmp_path, ledger=ledger, surface=_TwoCandidateSurface)
+    confirmed = api.structure_source_confirm("1" * 32)["source_token"]
+    dry_run = api.surface_dry_run(confirmed, {"miller": [1, 0, 0]}, {})
+    destination = api.structure_output_select()
+    partial = api.surface_create_candidates(
+        dry_run["operation_token"], destination["output_token"])
+    assert partial["ok"] is False
+
+    first, *_ = _api(tmp_path, ledger=ledger, surface=_TwoCandidateSurface)
+    second, *_ = _api(tmp_path, ledger=ledger, surface=_TwoCandidateSurface)
+    first_destination = first.structure_output_select()["output_token"]
+    second_destination = second.structure_output_select()["output_token"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(first.surface_recover_candidates,
+                        dry_run["operation_token"], first_destination),
+            pool.submit(second.surface_recover_candidates,
+                        dry_run["operation_token"], second_destination),
+        ]
+        results = [future.result(timeout=15) for future in futures]
+
+    assert all(result["ok"] is True for result in results)
+    assert sum("term-01" in name for name in ledger.calls) == 1
+    assert sum("term-02" in name for name in ledger.calls) == 2
+    assert ledger.owners == {}
+    batch = next(path for path in output.iterdir() if path.is_dir())
+    authority = json.loads(
+        (batch / ".vcstudio-structure-recovery.json").read_text(encoding="utf-8"))
+    assert authority["batch_lock_file_identity"]
+    assert (batch / ".vcstudio-structure-recovery.lock").is_file()
+
+
 def test_success_dtos_and_manifest_provenance_are_recursively_sanitized(tmp_path):
     api, _sources, _registrations, _source, output = _api(
         tmp_path, sources=_MaliciousSources(), surface=_MaliciousSurface)
@@ -803,8 +999,7 @@ def test_real_local_provider_surface_core_and_api_complete_offline_closure(tmp_p
 
     api = Api(
         dialog_fn=dialog,
-        ledger_mod=types.SimpleNamespace(
-            register=lambda path: registrations.append(str(path)), load_all=lambda: []),
+        ledger_mod=_OwnedLedger(registrations),
     )
 
     capabilities = api.structure_source_capabilities()
@@ -865,8 +1060,7 @@ def test_real_adsorbate_source_generates_site_bound_candidates_offline(tmp_path)
 
     api = Api(
         dialog_fn=dialog,
-        ledger_mod=types.SimpleNamespace(
-            register=lambda path: registrations.append(str(path)), load_all=lambda: []),
+        ledger_mod=_OwnedLedger(registrations),
     )
     bulk_result = api.structure_source_select_local()["results"][0]
     assert api.structure_source_preview(bulk_result["token"])["ok"]

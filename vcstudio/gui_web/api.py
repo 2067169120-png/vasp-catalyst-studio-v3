@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 import copy
+import errno
 import hashlib
 import inspect
 import json
@@ -37,9 +39,13 @@ from datetime import datetime, timezone
 # 合法计算类型(决定 KPOINTS 网格);前端下拉与后端都以此为准
 _CALC_TYPES = ('slab', 'bulk', 'molecule')
 _STRUCTURE_RECOVERY_NAME = '.vcstudio-structure-recovery.json'
+_STRUCTURE_RECOVERY_LOCK_NAME = '.vcstudio-structure-recovery.lock'
 _STRUCTURE_RECOVERY_SCHEMA = 'vcstudio.structure-recovery/v1'
 _STRUCTURE_RECOVERY_BINDING_SCHEMA = 'vcstudio.structure-recovery-binding/v1'
 _STRUCTURE_RECOVERY_MAX_BYTES = 64 * 1024 * 1024
+_STRUCTURE_MANIFEST_REGISTRATION_FIELDS = frozenset({
+    'registration_pending', 'registration', 'registration_recovery',
+})
 
 # 主题/视觉密度白名单；二者都只影响 UI，不参与任何科学数据或计算参数。
 _THEMES = ('classic', 'paper', 'deep')
@@ -13625,8 +13631,154 @@ class Api:
     def _structure_binding_hash(binding):
         encoded = json.dumps(
             binding, ensure_ascii=False, sort_keys=True,
-            separators=(',', ':')).encode('utf-8')
+            separators=(',', ':'), allow_nan=False).encode('utf-8')
         return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _structure_manifest_immutable_hash(manifest):
+        """Hash every manifest field except the three server registration namespaces."""
+        if not isinstance(manifest, dict):
+            raise ValueError('Candidate manifest must be an object')
+        immutable = {
+            key: copy.deepcopy(value)
+            for key, value in manifest.items()
+            if key not in _STRUCTURE_MANIFEST_REGISTRATION_FIELDS
+        }
+        try:
+            encoded = json.dumps(
+                immutable, ensure_ascii=False, sort_keys=True,
+                separators=(',', ':'), allow_nan=False).encode('utf-8')
+        except (TypeError, ValueError) as exc:
+            raise ValueError('Candidate manifest immutable fields are not canonical') from exc
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _structure_create_batch_lock(batch_dir):
+        """Create the never-unlinked batch lock before publishing its identity."""
+        lock_path = os.path.join(batch_dir, _STRUCTURE_RECOVERY_LOCK_NAME)
+        flags = (os.O_RDWR | os.O_CREAT | os.O_EXCL
+                 | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0))
+        descriptor = os.open(lock_path, flags, 0o600)
+        try:
+            os.write(descriptor, b'\0')
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return Api._structure_file_evidence(lock_path)['identity']
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _structure_batch_guard(batch_dir):
+        """Hold one stable OS byte lock for the complete validation/register transaction."""
+        expected_batch_identity = Api._structure_directory_identity(batch_dir)
+        lock_path = os.path.join(batch_dir, _STRUCTURE_RECOVERY_LOCK_NAME)
+        lock_identity = None
+        if os.name == 'nt':
+            import ctypes
+            import msvcrt
+            from ctypes import wintypes
+
+            class _ByHandleFileInformation(ctypes.Structure):
+                _fields_ = [
+                    ('dwFileAttributes', wintypes.DWORD),
+                    ('ftCreationTime', wintypes.FILETIME),
+                    ('ftLastAccessTime', wintypes.FILETIME),
+                    ('ftLastWriteTime', wintypes.FILETIME),
+                    ('dwVolumeSerialNumber', wintypes.DWORD),
+                    ('nFileSizeHigh', wintypes.DWORD),
+                    ('nFileSizeLow', wintypes.DWORD),
+                    ('nNumberOfLinks', wintypes.DWORD),
+                    ('nFileIndexHigh', wintypes.DWORD),
+                    ('nFileIndexLow', wintypes.DWORD),
+                ]
+
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            create_file = kernel32.CreateFileW
+            create_file.argtypes = [
+                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+            ]
+            create_file.restype = wintypes.HANDLE
+            get_info = kernel32.GetFileInformationByHandle
+            get_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ByHandleFileInformation)]
+            get_info.restype = wintypes.BOOL
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = [wintypes.HANDLE]
+            close_handle.restype = wintypes.BOOL
+            handle = create_file(
+                lock_path, 0xC0000000, 0x0003, None, 3,
+                0x00200000 | 0x08000000, None)
+            invalid = ctypes.c_void_p(-1).value
+            handle_value = handle if isinstance(handle, int) else getattr(handle, 'value', None)
+            if handle_value in (None, invalid):
+                raise OSError(ctypes.get_last_error(), 'Unable to open candidate batch lock')
+            transferred = False
+            try:
+                info = _ByHandleFileInformation()
+                if not get_info(handle, ctypes.byref(info)):
+                    raise OSError(ctypes.get_last_error(), 'Unable to identify batch lock')
+                if int(info.dwFileAttributes) & (0x400 | 0x10):
+                    raise ValueError('Candidate batch lock must be a regular non-reparse file')
+                lock_identity = {
+                    'kind': 'windows-file-id',
+                    'volume_serial': int(info.dwVolumeSerialNumber),
+                    'file_id': ((int(info.nFileIndexHigh) << 32)
+                                | int(info.nFileIndexLow)),
+                }
+                descriptor = msvcrt.open_osfhandle(
+                    int(handle_value), os.O_RDWR | getattr(os, 'O_BINARY', 0))
+                transferred = True
+            finally:
+                if not transferred:
+                    close_handle(handle)
+        else:
+            descriptor = os.open(
+                lock_path, os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0))
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                os.close(descriptor)
+                raise ValueError('Candidate batch lock must be a regular file')
+            lock_identity = {
+                'kind': 'posix-inode', 'device': int(opened.st_dev),
+                'inode': int(opened.st_ino),
+            }
+        locked = False
+        try:
+            if os.name == 'nt':
+                import msvcrt
+
+                while True:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    try:
+                        msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                        locked = True
+                        break
+                    except OSError as exc:
+                        if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                            raise
+                        time.sleep(0.025)
+            else:  # pragma: no cover - exercised by Linux CI
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                locked = True
+            if Api._structure_directory_identity(batch_dir) != expected_batch_identity:
+                raise ValueError('Candidate batch directory changed while acquiring its lock')
+            yield lock_identity
+        finally:
+            try:
+                if locked:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    if os.name == 'nt':
+                        import msvcrt
+
+                        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                    else:  # pragma: no cover - exercised by Linux CI
+                        import fcntl
+
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
 
     @staticmethod
     def _structure_write_recovery_authority(batch_dir, authority, expected_identity):
@@ -13678,8 +13830,10 @@ class Api:
         keys = (
             'schema', 'operation_id', 'batch_id', 'job_id', 'job_name',
             'structure_hash', 'poscar_size', 'poscar_sha256',
+            'manifest_immutable_sha256', 'registration_transaction_id',
             'destination_directory_identity', 'batch_directory_identity',
-            'job_directory_identity', 'poscar_file_identity',
+            'batch_lock_file_identity', 'job_directory_identity',
+            'poscar_file_identity',
         )
         return {key: copy.deepcopy(member.get(key)) for key in keys}
 
@@ -13697,7 +13851,9 @@ class Api:
     def _structure_freeze_recovery_authority(
             self, stage, destination_identity, operation_id, batch_id, staged_records):
         """在 batch 发布前冻结目录实体、POSCAR 内容和 manifest 绑定。"""
+        lock_identity = self._structure_create_batch_lock(stage)
         batch_identity = self._structure_directory_identity(stage)
+        transaction_id = uuid.uuid4().hex
         members = []
         for record in staged_records:
             job_dir = os.path.join(stage, record['job_name'])
@@ -13706,6 +13862,9 @@ class Api:
             if (poscar['sha256'] != record['poscar_sha256']
                     or poscar['size'] != record['poscar_size']):
                 raise ValueError('Staged POSCAR does not match its frozen candidate')
+            manifest = self._manifest.load_manifest(job_dir)
+            if not isinstance(manifest, dict):
+                raise ValueError('Staged candidate manifest is unreadable')
             member = {
                 'schema': _STRUCTURE_RECOVERY_BINDING_SCHEMA,
                 'operation_id': operation_id,
@@ -13715,16 +13874,17 @@ class Api:
                 'structure_hash': record['structure_hash'],
                 'poscar_size': poscar['size'],
                 'poscar_sha256': poscar['sha256'],
+                'manifest_immutable_sha256': (
+                    self._structure_manifest_immutable_hash(manifest)),
+                'registration_transaction_id': transaction_id,
                 'destination_directory_identity': copy.deepcopy(destination_identity),
                 'batch_directory_identity': copy.deepcopy(batch_identity),
+                'batch_lock_file_identity': copy.deepcopy(lock_identity),
                 'job_directory_identity': copy.deepcopy(job_identity),
                 'poscar_file_identity': copy.deepcopy(poscar['identity']),
             }
             member['binding_sha256'] = self._structure_binding_hash(
                 self._structure_recovery_binding(member))
-            manifest = self._manifest.load_manifest(job_dir)
-            if not isinstance(manifest, dict):
-                raise ValueError('Staged candidate manifest is unreadable')
             manifest['registration_recovery'] = copy.deepcopy(member)
             manifest['registration_recovery'].pop('public', None)
             self._manifest.save_manifest(job_dir, manifest)
@@ -13734,13 +13894,16 @@ class Api:
             'schema': _STRUCTURE_RECOVERY_SCHEMA,
             'operation_id': operation_id,
             'batch_id': batch_id,
+            'registration_transaction_id': transaction_id,
             'destination_directory_identity': copy.deepcopy(destination_identity),
             'batch_directory_identity': copy.deepcopy(batch_identity),
+            'batch_lock_file_identity': copy.deepcopy(lock_identity),
             'created_at': now,
             'updated_at': now,
             'status': 'registration_pending',
             'members': members,
             'registration_pending': [member['job_id'] for member in members],
+            'owner_release_pending': [],
             'corruptions': [],
             'result': None,
         }
@@ -13769,6 +13932,11 @@ class Api:
             raise ValueError('Candidate batch directory identity changed after creation')
         if not isinstance(authority.get('destination_directory_identity'), dict):
             raise ValueError('Candidate recovery destination identity is invalid')
+        if not re.fullmatch(
+                r'[a-f0-9]{32}', str(authority.get('registration_transaction_id') or '')):
+            raise ValueError('Candidate recovery registration transaction is invalid')
+        if not isinstance(authority.get('batch_lock_file_identity'), dict):
+            raise ValueError('Candidate batch lock identity is invalid')
         members = authority.get('members')
         if not isinstance(members, list) or not members or len(members) > 256:
             raise ValueError('Candidate batch recovery authority has invalid members')
@@ -13786,11 +13954,17 @@ class Api:
                 or len(set(pending)) != len(pending)
                 or not set(pending).issubset(set(job_ids))):
             raise ValueError('Candidate batch recovery authority has invalid pending members')
+        owner_release_pending = authority.get('owner_release_pending')
+        if (not isinstance(owner_release_pending, list)
+                or any(not isinstance(value, str) for value in owner_release_pending)
+                or len(set(owner_release_pending)) != len(owner_release_pending)
+                or not set(owner_release_pending).issubset(set(job_ids))):
+            raise ValueError('Candidate batch recovery authority has invalid owner releases')
         status = authority.get('status')
         if status not in {'registration_pending', 'complete', 'corrupt'}:
             raise ValueError('Candidate batch recovery authority has an invalid status')
-        if status == 'complete' and pending:
-            raise ValueError('Completed candidate recovery authority still has pending members')
+        if status == 'complete' and (pending or owner_release_pending):
+            raise ValueError('Completed candidate recovery authority has unfinished members')
         return authority
 
     def _structure_operation_from_authority(self, batch_dir, authority, destination_id):
@@ -13868,7 +14042,11 @@ class Api:
                 or binding.get('destination_directory_identity')
                 != authority.get('destination_directory_identity')
                 or binding.get('batch_directory_identity')
-                != authority.get('batch_directory_identity')):
+                != authority.get('batch_directory_identity')
+                or binding.get('batch_lock_file_identity')
+                != authority.get('batch_lock_file_identity')
+                or binding.get('registration_transaction_id')
+                != authority.get('registration_transaction_id')):
             corrupt('candidate_binding_mismatch')
         if member.get('binding_sha256') != self._structure_binding_hash(binding):
             corrupt('candidate_binding_hash_mismatch')
@@ -13911,6 +14089,12 @@ class Api:
         expected_manifest_binding.pop('public', None)
         if manifest_binding != expected_manifest_binding:
             corrupt('manifest_recovery_binding_mismatch')
+        try:
+            immutable_hash = self._structure_manifest_immutable_hash(manifest)
+        except ValueError as exc:
+            raise ValueError('manifest_immutable_fields_invalid') from exc
+        if immutable_hash != member.get('manifest_immutable_sha256'):
+            corrupt('manifest_immutable_sha256_mismatch')
         registration = manifest.get('registration')
         if not isinstance(registration, dict):
             corrupt('manifest_registration_state_invalid')
@@ -13925,9 +14109,12 @@ class Api:
             'public': self._structure_recovery_public(member),
         }
 
-    def _structure_validate_recovery(self, operation):
+    def _structure_validate_recovery(self, operation, lock_identity=None):
         authority = self._structure_read_recovery_authority(
             operation['final_batch'], operation['operation_id'])
+        if (lock_identity is not None
+                and authority.get('batch_lock_file_identity') != lock_identity):
+            raise ValueError('batch_lock_file_identity_mismatch')
         root = os.path.dirname(operation['final_batch'])
         if authority.get('destination_directory_identity') != (
                 self._structure_directory_identity(root)):
@@ -13977,7 +14164,8 @@ class Api:
             'jobs': [], 'registration_pending': all_ids,
             'discoverability': 'partial', 'corruptions': corruptions,
             'warnings': [
-                'Candidate recovery integrity failed; ledger registration was not attempted.'
+                'Candidate recovery integrity failed; registration did not complete and any '
+                'transaction-owned addition was rolled back.'
             ],
             'submission': 'not_performed', 'promotion': 'not_performed',
             'error': 'Candidate batch corruption detected; registration remains pending.',
@@ -13987,9 +14175,11 @@ class Api:
         return result
 
     def _structure_resume_registration(self, operation, *, replayed):
-        """从持久 authority 预检后只补 pending；任何篡改都禁止 ledger 调用。"""
+        """Run recovery under one stable OS lock and an owned ledger transaction."""
         try:
-            authority, validated, corruptions = self._structure_validate_recovery(operation)
+            with self._structure_batch_guard(operation['final_batch']) as lock_identity:
+                return self._structure_resume_registration_locked(
+                    operation, replayed=replayed, lock_identity=lock_identity)
         except Exception as exc:                          # noqa: BLE001 mapped to public code
             fallback = {
                 'schema': _STRUCTURE_RECOVERY_SCHEMA,
@@ -14000,43 +14190,54 @@ class Api:
                 operation, fallback,
                 [{'job_id': 'unknown', 'code': str(exc) or 'authority_invalid'}],
                 replayed=replayed)
+
+    def _structure_resume_registration_locked(
+            self, operation, *, replayed, lock_identity):
+        """Validate, own, revalidate and durably commit each pending registration."""
+        authority, validated, corruptions = self._structure_validate_recovery(
+            operation, lock_identity)
         if corruptions:
             return self._structure_corruption_result(
                 operation, authority, corruptions, replayed=replayed)
-        pending = []
+        transaction_id = authority['registration_transaction_id']
         warnings = []
-        jobs = []
+        jobs_by_id = {}
         now = datetime.now(timezone.utc).isoformat()
-        authority_pending = {
-            str(value) for value in authority.get('registration_pending') or []
-        }
-        for item in validated:
-            public = item['public']
-            job_dir = item['job_dir']
-            manifest = item['manifest']
-            registration = dict(manifest.get('registration') or {})
-            already_registered = (
-                manifest.get('registration_pending') is False
-                and registration.get('status') == 'registered'
-                and public.get('job_id') not in authority_pending
-            )
-            if already_registered:
-                public['registration_pending'] = False
-                jobs.append(public)
-                continue
+
+        # A crash may occur after durable authority commit but before owner release.
+        # Releasing the same persisted transaction is safe and never removes the entry.
+        for job_id in list(authority.get('owner_release_pending') or []):
+            item = next(value for value in validated
+                        if value['public']['job_id'] == job_id)
             try:
-                current = self._structure_validate_recovery_member(
-                    operation, authority, item['member'])
-            except ValueError as exc:
-                return self._structure_corruption_result(
-                    operation, authority,
-                    [{'job_id': public['job_id'], 'code': str(exc)}],
-                    replayed=replayed)
+                self._ledger.release_owner(item['job_dir'], transaction_id)
+            except Exception as exc:                      # noqa: BLE001 durable replay remains
+                warnings.append(
+                    'Candidate ledger owner release remains pending: '
+                    + self._structure_sanitize(str(exc)))
+                continue
+            authority['owner_release_pending'].remove(job_id)
+            authority['updated_at'] = now
+            self._structure_write_recovery_authority(
+                operation['final_batch'], authority,
+                authority['batch_directory_identity'])
+
+        for original in validated:
+            job_id = original['public']['job_id']
+            public = self._structure_recovery_public(original['member'])
+            current = self._structure_validate_recovery_member(
+                operation, authority, original['member'])
             manifest = current['manifest']
+            job_dir = current['job_dir']
+            authority_pending = set(authority.get('registration_pending') or [])
+            if job_id not in authority_pending:
+                public['registration_pending'] = False
+                jobs_by_id[job_id] = public
+                continue
             registration = dict(manifest.get('registration') or {})
             attempts = int(registration.get('attempts') or 0) + 1
             try:
-                self._ledger.register(job_dir)
+                self._ledger.register_owned(job_dir, transaction_id)
             except Exception as exc:                      # noqa: BLE001 durable pending evidence
                 safe_error = self._structure_sanitize(str(exc))
                 manifest['registration_pending'] = True
@@ -14046,15 +14247,36 @@ class Api:
                 }
                 try:
                     self._manifest.save_manifest(job_dir, manifest)
-                except Exception:                         # noqa: BLE001 original pending flag persists
+                except Exception:                         # noqa: BLE001 original pending is durable
                     warnings.append(
                         'Ledger registration failed and its latest error could not be persisted; '
                         'the original registration_pending marker remains authoritative.')
-                pending.append(public['job_id'])
                 public['registration_pending'] = True
+                jobs_by_id[job_id] = public
                 warnings.append('Candidate ledger registration remains pending: ' + safe_error)
-                jobs.append(public)
                 continue
+
+            # The ledger entry is now transaction-owned. Reopen and verify the entire
+            # batch authority plus every immutable member before trusting that entry.
+            try:
+                refreshed_authority, refreshed, post_corruptions = (
+                    self._structure_validate_recovery(operation, lock_identity))
+            except Exception as exc:                      # noqa: BLE001 owned rollback boundary
+                self._ledger.unregister_owned(job_dir, transaction_id)
+                return self._structure_corruption_result(
+                    operation, authority,
+                    [{'job_id': job_id,
+                      'code': str(exc) or 'post_registration_authority_invalid'}],
+                    replayed=replayed)
+            if post_corruptions:
+                self._ledger.unregister_owned(job_dir, transaction_id)
+                return self._structure_corruption_result(
+                    operation, refreshed_authority, post_corruptions,
+                    replayed=replayed)
+            authority = refreshed_authority
+            current = next(value for value in refreshed
+                           if value['public']['job_id'] == job_id)
+            manifest = current['manifest']
             manifest['registration_pending'] = False
             manifest['registration'] = {
                 'status': 'registered', 'attempts': attempts,
@@ -14062,31 +14284,151 @@ class Api:
             }
             try:
                 self._manifest.save_manifest(job_dir, manifest)
-            except Exception as exc:                       # noqa: BLE001 replay may safely re-register
-                pending.append(public['job_id'])
+                after_manifest_authority, _after_manifest, after_manifest_corruptions = (
+                    self._structure_validate_recovery(operation, lock_identity))
+                if after_manifest_corruptions:
+                    raise ValueError(after_manifest_corruptions[0]['code'])
+            except Exception as exc:                      # noqa: BLE001 owned rollback only
+                try:
+                    self._ledger.unregister_owned(job_dir, transaction_id)
+                except Exception as rollback_exc:         # noqa: BLE001 explicit pending warning
+                    warnings.append(
+                        'Owned ledger rollback requires recovery: '
+                        + self._structure_sanitize(str(rollback_exc)))
+                manifest['registration_pending'] = True
+                manifest['registration'] = {
+                    'status': 'pending', 'attempts': attempts,
+                    'last_attempt_at': now,
+                    'last_error': self._structure_sanitize(str(exc)),
+                }
+                try:
+                    self._manifest.save_manifest(job_dir, manifest)
+                except Exception:                         # noqa: BLE001 authority still says pending
+                    pass
                 public['registration_pending'] = True
+                jobs_by_id[job_id] = public
                 warnings.append(
-                    'Ledger accepted a candidate but the registered marker was not durable; '
-                    'registration remains pending for an idempotent replay: '
+                    'Owned candidate registration was rolled back because durable '
+                    'post-registration verification failed: '
+                    + self._structure_sanitize(str(exc)))
+                continue
+
+            authority = after_manifest_authority
+            authority['registration_pending'] = [
+                value for value in authority['registration_pending'] if value != job_id
+            ]
+            if job_id not in authority['owner_release_pending']:
+                authority['owner_release_pending'].append(job_id)
+            authority.update({
+                'status': 'registration_pending', 'updated_at': now,
+                'corruptions': [], 'result': None,
+            })
+            try:
+                self._structure_write_recovery_authority(
+                    operation['final_batch'], authority,
+                    authority['batch_directory_identity'])
+            except Exception as exc:                      # noqa: BLE001 roll back only owned entry
+                self._ledger.unregister_owned(job_dir, transaction_id)
+                manifest['registration_pending'] = True
+                manifest['registration'] = {
+                    'status': 'pending', 'attempts': attempts,
+                    'last_attempt_at': now,
+                    'last_error': self._structure_sanitize(str(exc)),
+                }
+                try:
+                    self._manifest.save_manifest(job_dir, manifest)
+                except Exception:                         # noqa: BLE001 disk authority remains pending
+                    pass
+                authority, validated, _ = self._structure_validate_recovery(
+                    operation, lock_identity)
+                public['registration_pending'] = True
+                jobs_by_id[job_id] = public
+                warnings.append(
+                    'Owned candidate registration was rolled back because the batch '
+                    'authority was not durable: ' + self._structure_sanitize(str(exc)))
+                continue
+
+            try:
+                committed_authority, _committed, commit_corruptions = (
+                    self._structure_validate_recovery(operation, lock_identity))
+            except Exception as exc:                      # noqa: BLE001 owned rollback boundary
+                commit_corruptions = [{
+                    'job_id': job_id,
+                    'code': str(exc) or 'post_commit_authority_invalid',
+                }]
+                committed_authority = authority
+            if commit_corruptions:
+                self._ledger.unregister_owned(job_dir, transaction_id)
+                manifest['registration_pending'] = True
+                manifest['registration'] = {
+                    'status': 'pending', 'attempts': attempts,
+                    'last_attempt_at': now,
+                    'last_error': 'post_registration_integrity_failure',
+                }
+                try:
+                    self._manifest.save_manifest(job_dir, manifest)
+                except Exception:                         # noqa: BLE001 corruption stays explicit
+                    pass
+                if job_id not in committed_authority['registration_pending']:
+                    committed_authority['registration_pending'].append(job_id)
+                committed_authority['owner_release_pending'] = [
+                    value for value in committed_authority['owner_release_pending']
+                    if value != job_id
+                ]
+                return self._structure_corruption_result(
+                    operation, committed_authority, commit_corruptions,
+                    replayed=replayed)
+            authority = committed_authority
+
+            try:
+                self._ledger.release_owner(job_dir, transaction_id)
+            except Exception as exc:                      # noqa: BLE001 owner remains durable
+                warnings.append(
+                    'Candidate ledger owner release remains pending: '
                     + self._structure_sanitize(str(exc)))
             else:
-                public['registration_pending'] = False
-            jobs.append(public)
+                authority['owner_release_pending'].remove(job_id)
+                authority['updated_at'] = now
+                try:
+                    self._structure_write_recovery_authority(
+                        operation['final_batch'], authority,
+                        authority['batch_directory_identity'])
+                except Exception as exc:                  # noqa: BLE001 replay clears marker
+                    warnings.append(
+                        'Released ledger owner marker remains pending in batch authority: '
+                        + self._structure_sanitize(str(exc)))
+            public['registration_pending'] = False
+            jobs_by_id[job_id] = public
 
-        if pending:
+        # Re-read under the same stable batch lock: response state is never inferred
+        # from stale in-memory flags.
+        authority, validated, final_corruptions = self._structure_validate_recovery(
+            operation, lock_identity)
+        if final_corruptions:
+            return self._structure_corruption_result(
+                operation, authority, final_corruptions, replayed=replayed)
+        pending = list(authority.get('registration_pending') or [])
+        owner_pending = list(authority.get('owner_release_pending') or [])
+        for item in validated:
+            job_id = item['public']['job_id']
+            public = jobs_by_id.get(job_id) or self._structure_recovery_public(item['member'])
+            public['registration_pending'] = job_id in pending
+            jobs_by_id[job_id] = public
+        jobs = [jobs_by_id[item['public']['job_id']] for item in validated]
+        if pending or owner_pending:
             result = self._structure_sanitize({
                 'ok': False, 'partial': True, 'replayed': bool(replayed),
                 'operation_id': operation['operation_id'],
                 'scientific_status': 'candidate', 'batch_id': operation['batch_id'],
                 'jobs': jobs, 'registration_pending': pending,
+                'owner_release_pending': owner_pending,
                 'discoverability': 'partial', 'warnings': list(dict.fromkeys(warnings)),
                 'submission': 'not_performed', 'promotion': 'not_performed',
-                'error': 'Candidate files exist, but ledger registration is incomplete.',
+                'error': 'Candidate ledger registration recovery is incomplete.',
             })
             authority.update({
                 'status': 'registration_pending', 'updated_at': now,
-                'registration_pending': list(pending), 'corruptions': [],
-                'result': None,
+                'corruptions': [], 'result': None,
             })
             try:
                 self._structure_write_recovery_authority(
@@ -14099,19 +14441,20 @@ class Api:
             operation['status'] = 'registration_pending'
             operation['last_result'] = copy.deepcopy(result)
             return result
+
         result = self._structure_sanitize({
             'ok': True, 'partial': False, 'replayed': bool(replayed),
             'operation_id': operation['operation_id'],
             'scientific_status': 'candidate', 'batch_id': operation['batch_id'],
-            'jobs': jobs, 'registration_pending': [], 'discoverability': 'complete',
-            'warnings': list(dict.fromkeys(warnings)),
+            'jobs': jobs, 'registration_pending': [], 'owner_release_pending': [],
+            'discoverability': 'complete', 'warnings': list(dict.fromkeys(warnings)),
             'submission': 'not_performed', 'promotion': 'not_performed',
             'error': None,
         })
         authority.update({
             'status': 'complete', 'updated_at': now,
-            'registration_pending': [], 'corruptions': [],
-            'result': copy.deepcopy(result),
+            'registration_pending': [], 'owner_release_pending': [],
+            'corruptions': [], 'result': copy.deepcopy(result),
         })
         try:
             self._structure_write_recovery_authority(
@@ -14121,8 +14464,7 @@ class Api:
             operation['status'] = 'registration_pending'
             return self._structure_sanitize({
                 **result, 'ok': False, 'partial': True,
-                'registration_pending': [], 'recovery_pending': True,
-                'discoverability': 'partial',
+                'recovery_pending': True, 'discoverability': 'partial',
                 'warnings': result['warnings'] + [
                     'Ledger markers are complete but batch recovery authority is not durable.'
                 ],

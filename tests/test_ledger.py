@@ -1,4 +1,8 @@
 """任务登记表测试:登记/去重/移除/载入(路径注入 tmp,不碰真实 %APPDATA%)。"""
+import json
+
+import pytest
+
 from vcstudio.cluster import ledger
 from vcstudio.shared import manifest
 
@@ -43,3 +47,35 @@ def test_corrupt_ledger_degrades_to_empty(tmp_path):
     lp.write_text('{not json', encoding='utf-8')
     assert ledger.list_dirs(path=lp) == []
     assert ledger.register(tmp_path, path=lp) is True      # 可自愈重建
+
+
+def test_owned_registration_only_its_transaction_can_rollback(tmp_path):
+    lp = tmp_path / 'jobs.json'
+    job = tmp_path / 'owned-job'
+    job.mkdir()
+    owner = 'a' * 32
+
+    assert ledger.register_owned(job, owner, path=lp) is True
+    assert ledger.register_owned(job, owner, path=lp) is False
+    with pytest.raises(RuntimeError, match='another registration transaction'):
+        ledger.register_owned(job, 'b' * 32, path=lp)
+    assert ledger.unregister_owned(job, 'b' * 32, path=lp) is False
+    assert ledger.list_dirs(path=lp) == [str(job.resolve())]
+    assert ledger.unregister(job, path=lp) is False
+    assert ledger.unregister_owned(job, owner, path=lp) is True
+    assert ledger.list_dirs(path=lp) == []
+
+
+def test_release_owner_is_durable_and_never_removes_registered_job(tmp_path):
+    lp = tmp_path / 'jobs.json'
+    job = tmp_path / 'released-job'
+    job.mkdir()
+    owner = 'c' * 32
+
+    ledger.register_owned(job, owner, path=lp)
+    assert ledger.release_owner(job, owner, path=lp) is True
+    assert ledger.release_owner(job, owner, path=lp) is False
+    assert ledger.unregister_owned(job, owner, path=lp) is False
+    assert ledger.list_dirs(path=lp) == [str(job.resolve())]
+    payload = json.loads(lp.read_text(encoding='utf-8'))
+    assert payload == {'job_dirs': [str(job.resolve())]}
