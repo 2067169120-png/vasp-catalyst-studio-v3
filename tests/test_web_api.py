@@ -32,6 +32,13 @@ def _fake_profiles(store):
     return m
 
 
+def _isolate_submit_reuse_gate(api):
+    """Keep legacy adapter/resource tests focused on their original seam."""
+    api._bind_reuse_execution_environment = lambda _dirs, _profile: None
+    api._reuse_submission_guard = lambda _dirs: None
+    return api
+
+
 def _fake_ledger(entries, removed):
     """entries: [(job_dir, manifest|None)];removed 收集 unregister 调用。"""
     m = types.SimpleNamespace()
@@ -404,6 +411,7 @@ def test_submit_jobs_delegates_to_batch_ops():
                                     'results': [(d, True, 'ok') for d in dirs]})
     store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key', key_path='/k')}
     api = Api(profiles_mod=_fake_profiles(store), batch_ops_mod=bo)
+    _isolate_submit_reuse_gate(api)
     out = api.submit_jobs(['/a', '/b'], 'c1', None, False)
     assert calls['dirs'] == ['/a', '/b'] and out['results'][0][1] is True
 
@@ -415,6 +423,7 @@ def test_submit_jobs_passes_exact_host_pin_without_boolean_coercion():
         seen.update(trust=trust) or {'needs_trust': False, 'results': []})
     store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
     api = Api(profiles_mod=_fake_profiles(store), batch_ops_mod=bo)
+    _isolate_submit_reuse_gate(api)
 
     api.submit_jobs(['/a'], 'c1', None, pin)
 
@@ -442,6 +451,7 @@ def test_submit_jobs_uses_saved_password():
     secrets = types.SimpleNamespace(get_password=lambda n: 'kr-pw', set_password=lambda n, pw: None)
     store = {'c1': ClusterProfile(name='c1', hostname='h', auth='password')}
     api = Api(profiles_mod=_fake_profiles(store), secrets_mod=secrets, batch_ops_mod=bo)
+    _isolate_submit_reuse_gate(api)
     out = api.submit_jobs(['/a'], 'c1', None, False)
     assert got['pw'] == 'kr-pw' and 'error' not in out
 
@@ -460,6 +470,7 @@ def test_submit_jobs_batch_ops_exception_caught():
         submit_batch=lambda prof, pw, dirs, tn: (_ for _ in ()).throw(RuntimeError('连不上')))
     store = {'c1': ClusterProfile(name='c1', auth='key', key_path='/k')}
     api = Api(profiles_mod=_fake_profiles(store), batch_ops_mod=bo)
+    _isolate_submit_reuse_gate(api)
     out = api.submit_jobs(['/a'], 'c1', None, False)
     assert '连不上' in out['error']
 
@@ -471,6 +482,7 @@ def test_submit_jobs_idempotency_key_replays_without_second_remote_mutation():
                                      'results': [(dirs[0], True, 'ok')]})
     store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
     api = Api(profiles_mod=_fake_profiles(store), batch_ops_mod=bo)
+    _isolate_submit_reuse_gate(api)
     key = 'jobop-fixed-submit-001'
 
     first = api.submit_jobs(['/a'], 'c1', None, False, key)
@@ -496,6 +508,7 @@ def test_submit_jobs_idempotency_blocks_inflight_duplicate_and_payload_reuse():
     store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
     api = Api(profiles_mod=_fake_profiles(store),
               batch_ops_mod=types.SimpleNamespace(submit_batch=_submit))
+    _isolate_submit_reuse_gate(api)
     key = 'jobop-inflight-submit-001'
     result = {}
     worker = threading.Thread(target=lambda: result.update(
@@ -527,6 +540,7 @@ def test_submit_jobs_host_trust_challenge_does_not_consume_idempotency_key():
     store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
     api = Api(profiles_mod=_fake_profiles(store),
               batch_ops_mod=types.SimpleNamespace(submit_batch=_submit))
+    _isolate_submit_reuse_gate(api)
     key = 'jobop-trust-submit-001'
 
     challenge = api.submit_jobs(['/a'], 'c1', None, False, key)
@@ -554,6 +568,7 @@ def test_submit_jobs_cross_process_busy_does_not_consume_idempotency_key():
     store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
     api = Api(profiles_mod=_fake_profiles(store),
               batch_ops_mod=types.SimpleNamespace(submit_batch=_submit))
+    _isolate_submit_reuse_gate(api)
     key = 'jobop-cross-process-busy-001'
 
     first = api.submit_jobs(['/a'], 'c1', None, False, key)
@@ -9401,6 +9416,7 @@ def test_submit_project_resources_are_ephemeral_retry_safe_and_enable_autopilot(
               manifest_mod=manifests,
               batch_ops_mod=types.SimpleNamespace(submit_batch=submit_batch),
               config_mod=_fake_config_rw(config_backing), secrets_mod=secrets)
+    _isolate_submit_reuse_gate(api)
 
     first = api._submit_project_with_resources_for_path(
         '/p/project.yaml', 'hpc', 32, '48:00:00', password='cluster-secret')
@@ -9444,6 +9460,7 @@ def test_submit_project_same_basename_members_are_not_rejected(tmp_path):
               adsorption_mod=adsorption,
               manifest_mod=types.SimpleNamespace(load_manifest=lambda path: states[path]),
               batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+    _isolate_submit_reuse_gate(api)
 
     out = api._submit_project_with_resources_for_path('/p/project.yaml', 'hpc', 16, '10:00:00')
 
@@ -9480,6 +9497,7 @@ def test_submit_project_includes_created_species_refs_and_skips_done_refs(tmp_pa
               adsorption_mod=adsorption,
               manifest_mod=types.SimpleNamespace(load_manifest=lambda path: states[path]),
               batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+    _isolate_submit_reuse_gate(api)
 
     out = api._submit_project_with_resources_for_path('/p/project.yaml', 'hpc', 16, '10:00:00')
 
@@ -9507,6 +9525,7 @@ def test_submit_project_rejects_switching_managed_project_to_other_profile(tmp_p
         adsorption_mod=types.SimpleNamespace(load_project=lambda _path: project),
         manifest_mod=types.SimpleNamespace(load_manifest=lambda _path: manifest),
         batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+    _isolate_submit_reuse_gate(api)
 
     out = api._submit_project_with_resources_for_path(
         '/p/project.yaml', 'server-b', 16, '10:00:00')
@@ -9550,6 +9569,7 @@ def test_submit_project_retry_repairs_launch_after_persistence_failure(tmp_path)
         adsorption_mod=types.SimpleNamespace(load_project=_load, save_project=_save),
         manifest_mod=types.SimpleNamespace(load_manifest=lambda _path: manifest),
         batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+    _isolate_submit_reuse_gate(api)
 
     first = api._submit_project_with_resources_for_path('/p/project.yaml', 'hpc', 16, '10:00:00')
     second = api._submit_project_with_resources_for_path('/p/project.yaml', 'hpc', 16, '10:00:00')
@@ -9585,6 +9605,7 @@ def test_submit_project_round_trips_host_key_evidence_and_exact_pin(tmp_path):
             'state': 'CREATED', 'scheduler_job_id': None}),
         batch_ops_mod=types.SimpleNamespace(submit_batch=_submit),
         config_mod=_fake_config_rw({}))
+    _isolate_submit_reuse_gate(api)
 
     out = api._submit_project_with_resources_for_path(
         '/p/project.yaml', 'hpc', 32, '24:00:00', trust_new=pin)
@@ -9624,6 +9645,7 @@ def test_submit_blocks_literal_mpi_count_and_renders_cores_placeholder(tmp_path)
     api = Api(profiles_mod=_fake_profiles({'hpc': template}), adsorption_mod=adsorption,
               manifest_mod=manifests, batch_ops_mod=batch,
               config_mod=_fake_config_rw({}))
+    _isolate_submit_reuse_gate(api)
     submitted = api._submit_project_with_resources_for_path('/p/project.yaml', 'hpc', 32, '24:00:00')
     assert submitted['ok'] and captured[0][0] == 'mpirun -np 32 vasp_std'
 
@@ -9648,6 +9670,7 @@ def test_submit_project_renders_mapped_vasp_command_without_mutating_profile(tmp
     api = Api(profiles_mod=_fake_profiles({'hpc': original}),
               adsorption_mod=adsorption, manifest_mod=manifests,
               batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+    _isolate_submit_reuse_gate(api)
 
     out = api._submit_project_with_resources_for_path('/p/project.yaml', 'hpc', 24, '12:00:00')
 
@@ -9679,6 +9702,7 @@ def test_submit_template_requires_effective_resource_placeholders_and_no_conflic
         api = Api(profiles_mod=_fake_profiles({'hpc': profile}),
                   adsorption_mod=adsorption, manifest_mod=manifests,
                   batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+        _isolate_submit_reuse_gate(api)
         return api._submit_project_with_resources_for_path(
             '/p/project.yaml', 'hpc', 32, '24:00:00')
 
@@ -9729,6 +9753,7 @@ def test_submit_reports_keyring_setter_success_without_readback_as_failure(tmp_p
               adsorption_mod=adsorption, manifest_mod=manifests,
               batch_ops_mod=batch, secrets_mod=secrets,
               config_mod=_fake_config_rw({}))
+    _isolate_submit_reuse_gate(api)
 
     out = api._submit_project_with_resources_for_path(
         '/p/project.yaml', 'hpc', 32, '24:00:00', password='secret')

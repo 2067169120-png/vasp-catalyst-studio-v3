@@ -6,6 +6,49 @@ V4.0.0 尚未发布，`v4.0.0` 标签也尚未创建。本节汇总当前 Unrele
 
 V4.0.0 is not released, and the `v4.0.0` tag has not been created. This section records implemented work in the current Unreleased tree. The final local gates ran on 2026-08-13: cache-free full pytest completed with **3658 passed and 5 skipped** (330.80 s; 15 upstream ASE/NumPy deprecation warnings); full-repository Ruff, actionlint, and `node --check` for 23 first-party JavaScript files passed; and the PyInstaller `--full` one-file build succeeded. The final EXE is **113,586,017 bytes (108.32 MiB)**, SHA-256 `bcadc9046685c62cf1a9157d0ceba49b131190184dbe30073ce4189ec6817e2d`.
 
+2026-08-15 在隔离 worktree 对下述严格指纹/复用变更重新执行了免缓存完整 pytest：
+**3693 passed、5 skipped**（226.23 秒；15 条 ASE/NumPy 上游弃用警告）；全仓 Ruff、
+25 个第一方 JavaScript 文件的 `node --check`、变更 Python 文件的 `py_compile` 和
+`git diff --check` 通过。本轮没有重建 PyInstaller EXE 或重跑 actionlint，因此上面的
+2026-08-13 冻结产物哈希仍是历史产物证据，不能被本轮软件测试自动升级。
+
+On 2026-08-15 the strict-fingerprint/reuse change below was revalidated in an isolated worktree:
+cache-free full pytest completed with **3693 passed and 5 skipped** (226.23 s; 15 upstream ASE/NumPy
+deprecation warnings); full-repository Ruff, `node --check` for 25 first-party JavaScript files,
+`py_compile` for the changed Python files, and `git diff --check` passed. PyInstaller and actionlint
+were not rerun, so the 2026-08-13 frozen binary hash above remains historical artifact evidence and
+is not upgraded by this software-only validation.
+
+2026-08-20 在隔离 worktree 完成严格复用 P1 加固后，全量 pytest 为 **3735 passed、5 skipped**
+（199.15 秒；15 条 ASE/NumPy 上游弃用警告）；全仓 Ruff、25 个第一方 JavaScript 文件的
+`node --check`、25 个变更 Python 文件的 `py_compile` 与 `git diff --check` 通过。未连接真实
+集群执行 VASP，也未重建发行包，因此这些门只证明软件合同，不升级科学结论或冻结发行资格。
+
+After the P1 strict-reuse hardening on 2026-08-20, the isolated worktree passed the full test suite:
+**3735 passed and 5 skipped** in 199.15 s, with 15 upstream ASE/NumPy deprecation warnings. Full-repository
+Ruff, `node --check` for 25 first-party JavaScript files, `py_compile` for 25 changed Python files, and
+`git diff --check` also passed. No real-cluster VASP run or release rebuild was performed, so these gates
+prove software contracts only and do not upgrade scientific or frozen-release qualification.
+
+2026-08-21 继续闭合严格复用复核发现的 4 组 P1：source fingerprint 每次从同一权威快照重建；
+输出哈希、解析和 VASP 版本使用同一 no-follow 文件实体；复用事务以持久目录 handle/file-id 锚定，
+根目录漂移时恢复到 prepared；EOS、spin scan 等派生 builder 在最终输入落定后重签 recipe/closure，
+且运行环境只允许服务端可信 profile 绑定。聚焦回归为 **182 passed、1 skipped**，builder/manifest/
+submit 接缝为 **341 passed**；免缓存全量 pytest 为 **3748 passed、6 skipped**（332.37 秒；15 条
+ASE/NumPy 上游弃用警告）。全仓 Ruff、全部第一方 JavaScript 的 `node --check`、变更 Python 文件的
+`py_compile` 与 `git diff --check` 通过。未运行真实集群 VASP、未重建发行包，也未执行远端 CI。
+
+On 2026-08-21 four additional strict-reuse P1 groups were closed: source fingerprints are rebuilt from
+the same authoritative snapshot; output hashing, parsing, and VASP-version evidence share one no-follow
+file entity; reuse transactions are anchored to persistent directory handles/file identities and roll back
+to prepared on root drift; and derived builders such as EOS and spin scan rebind recipe/input closure only
+after final input bytes exist, while execution environments remain server-bound from trusted profiles.
+Focused tests passed with **182 passed and 1 skipped**, builder/manifest/submission seams passed with
+**341 passed**, and cache-free full pytest completed with **3748 passed and 6 skipped** in 332.37 s, with
+15 upstream ASE/NumPy deprecation warnings. Full-repository Ruff, all first-party JavaScript `node --check`,
+changed-file `py_compile`, and `git diff --check` passed. No real-cluster VASP run, release rebuild, or remote
+CI was performed.
+
 ### 报告、状态与项目工作区（Phase A–B）
 - 建立报告与状态合同，明确稳定项目身份、服务端快照、门禁结论、产物状态和 revision
   之间的绑定关系；未通过门禁或缺少证据时保留诊断状态，不冒充最终发布结果。
@@ -47,6 +90,25 @@ V4.0.0 is not released, and the `v4.0.0` tag has not been created. This section 
   Jobs now includes a Selection Tray and Batch Review, including filter-hidden selections. Server
   idempotency and a UI mutex prevent duplicate remote effects. Long Project/Jobs/Analysis/Publish operations
   share one Operation Queue, while Resume Center restores bounded draft references without promoting them.
+- Jobs 新增版本化 strict scientific fingerprint 和提交前重复计算提示。只有规范化结构、完整
+  INCAR/KPOINTS、POTCAR 内容身份、Method Recipe 语义哈希、任务/版本和 VASP 构建环境均完整时，
+  才可能显示 exact match；near match 只列差异且不声明等价。索引从权威 manifest/文件重建、容量
+  有界且不是事实源。复用默认关闭；显式引用会新建 provenance/decision，重验并物化 hash-bound
+  结果，支持 prepared→succeeded 崩溃恢复，且从不继承 accepted/final。旧 Recipe 缺失作业保持
+  `incomplete / explicit_legacy`。Jobs 与 Project 一键提交共用联网前门禁和幂等操作标识。
+  Jobs now provides a versioned strict scientific fingerprint and pre-submission duplicate advisory. Exact
+  matches require complete canonical inputs, recipe semantics, task/version, and VASP build evidence; near
+  matches report differences only. The bounded index is rebuildable and non-authoritative. Reuse remains
+  opt-in, creates fresh provenance and a durable decision, revalidates hash-bound results, recovers from a
+  prepared transaction, and never inherits accepted/final qualification. Legacy recipe-less jobs remain
+  explicitly incomplete, and both Jobs and Project submission apply the same pre-network guard.
+- 严格复用门进一步绑定 VASP 实际输入闭包（包括 restart/VDW/ICONST/ML/KPOINTS_OPT 与 NEB 全 image）、
+  当前输出重新解析的 task-aware 收敛证据、registry/manifest 双重项目身份和物化事务 CAS。浏览器提示继续
+  使用有界非权威索引，而提交放行只接受完整权威扫描；任何超限、篡改、未知身份或显式失败证据均失败闭合。
+  The strict reuse gate now binds VASP's actual input closure, task-aware convergence reparsed from current
+  hash-bound outputs, cross-checked project identity, and materialization CAS. Browser advice remains bounded
+  and non-authoritative; submission relies on a complete authoritative scan and fails closed on limits,
+  tampering, unknown identity, or explicit contradictory result evidence.
 
 ### 分析、资源与治理 / Analysis, resources, and governance
 - Analysis capability cards 以服务端证据区分 available、missing prerequisite、mode mismatch、

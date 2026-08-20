@@ -240,6 +240,7 @@ def _save_aimd_manifest(out_dir, src_dir, poscar_text, source_name, changes, war
     system = poscar_text.splitlines()[0].strip() if poscar_text.strip() else Path(out_dir).name
     parent = str(Path(src_dir).resolve())
     inputs = {
+        'engine': 'vasp',
         'parent_job': parent,
         'derived_from': source_name,                 # CONTCAR / POSCAR
         'ensemble': ens,
@@ -250,10 +251,23 @@ def _save_aimd_manifest(out_dir, src_dir, poscar_text, source_name, changes, war
         'incar_changes': changes,
         'elements': list(syms),
     }
+    from vcstudio.generate.method_recipe import builder_recipe
+    inputs['method_recipe'] = builder_recipe(
+        builder='vcstudio.generate.aimd_builder/v1', task_type='aimd',
+        calc_type='aimd', validate=True,
+        completions={'incar_changes': changes}, kpoints_source='gamma-1x1x1',
+        extra={
+            'ensemble': ens, 'temp_k': float(temp_k),
+            'temp_end_k': (float(temp_end_k) if temp_end_k is not None
+                           else float(temp_k)),
+            'steps': int(steps), 'potim_fs': float(potim_fs),
+        })
     m = manifest_mod.new_manifest(
         job_id=f'{Path(out_dir).name}-aimd', system=system, task_type='aimd',
         calc_type='aimd', inputs=inputs, warnings=warnings)
     m['parent_job'] = parent                         # 顶层冗余一份,便于快速溯源
+    from vcstudio.shared.scientific_inputs import record_input_closure
+    record_input_closure(out_dir, m)
     manifest_mod.save_manifest(out_dir, m)
     return m
 

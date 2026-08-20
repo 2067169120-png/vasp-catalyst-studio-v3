@@ -230,6 +230,7 @@ def create_from_build(job_dir: str | os.PathLike, build_result: dict, *,
     completions = dict(build_result.get('completions') or {})
     job_dir = Path(job_dir)
     inputs = {
+        'engine': 'vasp',
         'poscar': str(Path(poscar_path).resolve()),
         'poscar_sha256': sha256_file(poscar_path),
         'incar_source': incar_source_label(validate, completions),
@@ -239,6 +240,19 @@ def create_from_build(job_dir: str | os.PathLike, build_result: dict, *,
         # 赝势身份(发刊级溯源):哪套 POTCAR 算的,结果永远可答
         'potcar': list(build_result.get('potcar') or []),
     }
+    recipe = build_result.get('method_recipe')
+    if recipe:
+        from vcstudio.generate.method_recipe import validate_method_recipe
+        inputs['method_recipe'] = validate_method_recipe(recipe)
+    else:
+        # Old/imported build results remain usable, but strict equivalence must
+        # identify them explicitly as legacy/incomplete rather than inventing a
+        # recipe decision after the fact.
+        inputs['method_recipe_status'] = 'legacy_missing'
+    if build_result.get('execution_environment') is not None:
+        raise ValueError(
+            'execution_environment 只能由服务端在选定可核验集群 profile '
+            '后绑定；create_from_build 拒绝 builder 传入的环境证据')
     if incar_path is not None:
         source_incar = Path(incar_path).resolve()
         inputs['source_incar_path'] = str(source_incar)
@@ -266,5 +280,7 @@ def create_from_build(job_dir: str | os.PathLike, build_result: dict, *,
         inputs=inputs,
         warnings=build_result.get('warnings'),
     )
+    from vcstudio.shared.scientific_inputs import record_input_closure
+    record_input_closure(job_dir, m)
     save_manifest(job_dir, m)
     return m

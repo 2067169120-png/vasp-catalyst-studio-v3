@@ -237,6 +237,10 @@ def build_static_job(relax_dir, out_dir, *, purpose: str = 'pdos',
     hashes = {name: manifest_mod.sha256_file(os.path.join(out_path, name))
               for name in files}
     derived_meta = dict(extra_meta or {})
+    # Inherit the parent's actual calculation class before issuing the recipe
+    # identity; the recipe must describe the final job, not a placeholder.
+    parent_manifest = manifest_mod.load_manifest(relax_dir)
+    calc_type = str((parent_manifest or {}).get('calc_type') or 'slab')
     inputs = {
         'engine': 'vasp',
         'files': files,
@@ -249,13 +253,19 @@ def build_static_job(relax_dir, out_dir, *, purpose: str = 'pdos',
         'kpoints': list(new_grid),
         'incar_changes': list(changes),
     }
+    from vcstudio.generate.method_recipe import builder_recipe
+    inputs['method_recipe'] = builder_recipe(
+        builder='vcstudio.generate.estatic/v1',
+        task_type=_PURPOSE_TASK_TYPES[purpose], calc_type=calc_type,
+        validate=True, completions={'incar_changes': list(changes)},
+        kpoints_source='parent-density-multiplier',
+        extra={'purpose': purpose, 'kpts_multiplier': float(kpts_multiplier),
+               'kpoints': list(new_grid)})
     if derived_meta:
         inputs['derived_metadata'] = derived_meta
 
     # 继承母作业的 calc_type（分子/体相/表面）；无母 manifest 时按本
     # 生成器的 slab KPOINTS 口径明确降级。
-    parent_manifest = manifest_mod.load_manifest(relax_dir)
-    calc_type = str((parent_manifest or {}).get('calc_type') or 'slab')
     system = (poscar_text.splitlines()[0].strip()
               if poscar_text.strip() else os.path.basename(out_path))
     manifest = manifest_mod.new_manifest(
@@ -287,6 +297,8 @@ def build_static_job(relax_dir, out_dir, *, purpose: str = 'pdos',
     for key, value in {**legacy, **derived_meta}.items():
         if key not in manifest:
             manifest[key] = value
+    from vcstudio.shared.scientific_inputs import record_input_closure
+    record_input_closure(out_path, manifest)
     manifest_mod.save_manifest(out_path, manifest)
 
     return {'out_dir': str(out_dir), 'changes': changes, 'warnings': warnings}

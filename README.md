@@ -35,7 +35,7 @@ The deterministic core runs locally and over user-configured SSH connections. Ex
 | 区域 | 已实现能力 | 必须保留的边界 |
 |---|---|---|
 | Project | Clone、Move、Adopt Copy；操作前预检、显式确认、注册表/台账更新和失败回滚 | Clone 铸造新项目身份；Move 保留原身份；Adopt Copy 默认重新铸造身份。目标已存在时不覆盖；部分回滚会留下明确恢复证据，不报告假成功 |
-| Run / Jobs | Selection Tray、包含筛选后隐藏项的 Batch Review、统一 Operation Queue、提交/续算/取消幂等键 | 一次只运行一个互斥批操作；重复请求不会再次执行远程副作用；资源预测只读且不授权提交 |
+| Run / Jobs | Selection Tray、Batch Review、严格科学指纹重复计算提示、统一 Operation Queue、提交/续算/取消幂等键 | exact 只在完整版本化指纹一致时出现；near 只显示差异且不称等价；默认不复用，显式引用产生新 provenance，强制重算保留理由 |
 | Analyze | capability cards；Task Results；DOS/PDOS、Bands、功函数、Bader、差分电荷、ELF 分布摘要；Property calculators | 只显示服务端解析器给出的数值、来源 hash 和分母。ELF 解析严格校验 ELFCAR 主网格并仅给分布统计，不据此宣称成键、盆、临界点或拓扑结论 |
 | Analyze / Governance | 下一步计算建议与确认后的只读 draft intent | 只从绑定当前数据指纹、经人工科学复核的 ValidationResult 和冻结分析信号派生；不含命令，不授权或自动提交作业 |
 | Publish | revision scientific diff、Evidence/Claim Graph、确定性 SI capsule | 每次从权威历史重新校验冻结 revision；缺失证据边显式标记。capsule 去除密钥/绝对路径、不覆盖已有文件；生成 diagnostic capsule 不等于科学 final |
@@ -73,6 +73,14 @@ POTCAR/PAW 数据受许可证约束，本仓库不分发。无集群、无 VASP 
 ## 证据与状态模型
 
 每个作业目录中的 `job.yaml` 是作业事实源。九态生命周期用于记录 CREATED、SUBMITTED、RUNNING 等运行过程；终态诊断是另一条轴，不能混为一谈。
+
+提交前的重复计算提示使用版本化 strict scientific fingerprint，覆盖规范化结构、完整
+INCAR/KPOINTS、POTCAR 内容 SHA-256、Method Recipe semantic hash、任务类型与可得的
+VASP/build 环境。缺少任一必需证据时保持 `incomplete`；旧作业缺 Recipe 时明确为
+`explicit_legacy`，不会产生 exact/等价或复用资格。本地索引容量有界、可重建且不是事实源。
+引用既有结果必须由用户显式选择，并在新作业中写新的 decision/provenance node/link；来源
+会在提交时再次重验，accepted/final 从不继承。完整合同见
+[docs/calculation-reuse.md](docs/calculation-reuse.md)。
 
 当前诊断实现包含：
 
@@ -155,6 +163,12 @@ python -m pytest
 ```
 
 2026-08-13 的本地最终门禁已实际运行：免缓存完整 `python -m pytest` 为 **3658 passed、5 skipped**，330.80 秒内出现 **15 条 ASE/NumPy 上游弃用警告**；全仓 Ruff、actionlint 与 23 个第一方 JavaScript 文件的 `node --check` 均通过。PyInstaller `--full` 单文件构建成功，最终 EXE 为 **113,586,017 bytes（108.32 MiB）**，SHA-256 为 `bcadc9046685c62cf1a9157d0ceba49b131190184dbe30073ce4189ec6817e2d`。
+
+2026-08-15 的严格科学指纹/复用变更在隔离 worktree 重新运行免缓存全量测试，结果为
+**3693 passed、5 skipped**（226.23 秒，15 条同类上游弃用警告）；全仓 Ruff、25 个第一方
+JavaScript 文件的 `node --check`、变更 Python 文件的 `py_compile` 与 `git diff --check`
+通过。本轮未重建 EXE、未重跑 actionlint，也未执行真实集群/VASP 作业；上段冻结二进制
+哈希仍仅对应 2026-08-13 产物。
 
 该最终冻结 EXE 内的 `full` 和 `journey` healthcheck 都以退出码 0 完成，并各自报告 `ok=true`、`frozen=true`。`journey` 完成 10/10 个阶段，网络尝试为 0、集群操作为 0，且服务重建后的重启持久化检查通过。上述新增工作流也保留聚焦 Python 合同测试和/或真实 Node 生产 IIFE 回归；冻结 journey 保持 `blocked`/`diagnostic` 科学状态的诚实边界。
 

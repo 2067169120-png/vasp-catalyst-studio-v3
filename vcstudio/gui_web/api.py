@@ -51,6 +51,14 @@ _REPORT_QUALIFICATIONS = frozenset({
     'human_scientific_reviewed',
 })
 
+# Browser-facing duplicate-calculation queries are deliberately much smaller
+# than the local ledger.  The derivative index is advisory only; submission is
+# gated by a separate full authoritative digest lookup below.
+_REUSE_TARGET_LIMIT = 32
+_REUSE_CANDIDATE_LIMIT = 128
+_REUSE_PAGE_LIMIT = 128
+_REUSE_SORT_ORDERS = frozenset({'job_id_asc', 'job_id_desc'})
+
 
 class _ReportInputChanged(RuntimeError):
     """Raised when report inputs change between snapshot and marker commit."""
@@ -1897,6 +1905,46 @@ class Api:
                     for key, value in raw_commands.items() if str(key).strip()
                 }
             allp = self._profiles.load_profiles()
+            environment_fields = (
+                'vasp_version', 'vasp_build_identity',
+                'vasp_build_evidence_sha256',
+            )
+            supplied_environment = {
+                key: str(fields.get(key) or '').strip()
+                for key in environment_fields if key in fields
+            }
+            # Older clients do not know these fields.  Preserve the complete
+            # authority tuple in that case instead of silently erasing it.
+            if not supplied_environment and name in allp:
+                for key in environment_fields:
+                    fields[key] = str(getattr(allp[name], key, '') or '')
+            elif supplied_environment:
+                for key in environment_fields:
+                    fields[key] = str(fields.get(key) or '').strip()
+                populated = [bool(fields[key]) for key in environment_fields]
+                if any(populated) and not all(populated):
+                    return {
+                        'ok': False,
+                        'error': ('VASP 版本、build identity 与证据 SHA-256 '
+                                  '必须同时填写或同时清空'),
+                    }
+                if all(populated):
+                    if not re.fullmatch(
+                            r'[A-Za-z0-9][A-Za-z0-9._+:-]{0,127}',
+                            fields['vasp_version']):
+                        return {'ok': False, 'error': 'VASP 版本格式无效'}
+                    if not re.fullmatch(
+                            r'[A-Za-z0-9][A-Za-z0-9._+:@-]{0,255}',
+                            fields['vasp_build_identity']):
+                        return {
+                            'ok': False,
+                            'error': ('VASP build identity 必须是无路径、无空格的'
+                                      '不透明标识'),
+                        }
+                    evidence = fields['vasp_build_evidence_sha256'].lower()
+                    if not re.fullmatch(r'[a-f0-9]{64}', evidence):
+                        return {'ok': False, 'error': 'VASP build 证据必须是 64 位 SHA-256'}
+                    fields['vasp_build_evidence_sha256'] = evidence
             # 旧前端还不认识该字段时不会随表单回传；保存其它
             # 集群参数不应悄悄清空已配置的多引擎命令。
             if 'engine_commands' not in fields and name in allp:
@@ -2449,6 +2497,306 @@ class Api:
                 'error': self._workspace_public_text(exc),
             }
 
+    # ── Strict scientific fingerprint / explainable reuse advisory ────────
+    def _calculation_reuse_index(self, *, selected_job_ids=(),
+                                 candidate_limit=_REUSE_CANDIDATE_LIMIT):
+        """Rebuild the bounded derivative index from current authoritative jobs."""
+        from vcstudio.project.calculation_reuse import CalculationReuseIndex
+
+        if (not isinstance(candidate_limit, int) or isinstance(candidate_limit, bool)
+                or not 1 <= candidate_limit <= _REUSE_CANDIDATE_LIMIT):
+            raise ValueError('candidate_limit must be between 1 and 128')
+
+        entries = list(self._ledger.load_all())
+        pmap = self._project_role_map()
+
+        def opaque_job_id(directory, manifest):
+            return self._workspace_job_id(directory, manifest)
+
+        def opaque_project_id(directory, _manifest):
+            group = pmap.get(os.path.normcase(os.path.normpath(directory)))
+            return str(group.get('project_id') or '') or None if group else None
+
+        # Keep explicitly selected targets inside the bounded window even when
+        # a very large ledger truncates older advisory candidates.
+        selected = {str(item or '').strip() for item in selected_job_ids}
+        ordinary, targets = [], []
+        for entry in entries:
+            directory, manifest = entry
+            identifier = (self._workspace_job_id(directory, manifest)
+                          if isinstance(manifest, dict) else '')
+            (targets if identifier in selected else ordinary).append(entry)
+        if len(targets) > candidate_limit:
+            raise ValueError('candidate_limit cannot be smaller than the target set')
+        # Stable ID ordering makes bounded membership deterministic across
+        # registry reloads.  Targets remain at the end so truncation cannot
+        # evict an explicitly requested target.
+        order_key = lambda entry: self._workspace_job_id(  # noqa: E731
+            entry[0], entry[1] if isinstance(entry[1], dict) else {})
+        ordered = sorted(ordinary, key=order_key) + sorted(targets, key=order_key)
+        return CalculationReuseIndex(limit=candidate_limit).rebuild(
+            ordered, job_id=opaque_job_id, project_id=opaque_project_id)
+
+    @staticmethod
+    def _reuse_job_ids(value, *, limit=_REUSE_TARGET_LIMIT):
+        if (not isinstance(limit, int) or isinstance(limit, bool) or limit < 1
+                or not isinstance(value, list) or not 1 <= len(value) <= limit
+                or any(not isinstance(item, str) or not item.strip() for item in value)):
+            raise ValueError(f'job_ids must contain between 1 and {limit} opaque IDs')
+        requested = [item.strip() for item in value]
+        if len(set(requested)) != len(requested):
+            raise ValueError('job_ids must be unique')
+        return requested
+
+    def jobs_reuse_advisory(self, job_ids, cursor=0, page_size=64,
+                            candidate_limit=_REUSE_CANDIDATE_LIMIT,
+                            sort_order='job_id_asc', profile_name=None):
+        """Return path-free exact/near/outcome matches; never reuse automatically."""
+        from vcstudio.project.calculation_reuse import ADVISORY_SCHEMA
+
+        try:
+            requested = self._reuse_job_ids(job_ids)
+            if (not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0):
+                raise ValueError('cursor must be a non-negative integer')
+            if (not isinstance(page_size, int) or isinstance(page_size, bool)
+                    or not 1 <= page_size <= _REUSE_PAGE_LIMIT):
+                raise ValueError('page_size must be between 1 and 128')
+            if (not isinstance(candidate_limit, int) or isinstance(candidate_limit, bool)
+                    or not len(requested) <= candidate_limit <= _REUSE_CANDIDATE_LIMIT):
+                raise ValueError(
+                    'candidate_limit must include all targets and be at most 128')
+            if sort_order not in _REUSE_SORT_ORDERS:
+                raise ValueError('sort_order must be job_id_asc or job_id_desc')
+            if profile_name is not None:
+                profile_key = str(profile_name or '').strip()
+                profile = self._profiles.load_profiles().get(profile_key)
+                if profile is None:
+                    raise ValueError('selected cluster profile is unavailable')
+                records = self._calculation_reuse_records(requested)
+                self._bind_reuse_execution_environment(
+                    [records[item].job_dir for item in requested], profile)
+            index = self._calculation_reuse_index(
+                selected_job_ids=requested, candidate_limit=candidate_limit)
+            target_set = set(requested)
+            record_by_id = {record.job_id: record for record in index.records}
+            if len(record_by_id) != len(index.records):
+                raise ValueError('ledger contains duplicate opaque job IDs')
+            missing = target_set - set(record_by_id)
+            if missing:
+                raise ValueError('one or more job IDs are not present in the authoritative ledger')
+            reverse = sort_order == 'job_id_desc'
+            candidates = sorted(
+                (record for record in index.records if record.job_id not in target_set),
+                key=lambda record: record.job_id, reverse=reverse)
+            if cursor > len(candidates):
+                raise ValueError('cursor is beyond the bounded candidate set')
+            page = candidates[cursor:cursor + page_size]
+            view = copy.copy(index)
+            view.records = [record_by_id[item] for item in requested] + page
+            result = view.advisory(requested)
+            for target in result.get('targets') or []:
+                for key in ('exact_matches', 'near_matches'):
+                    target[key] = sorted(
+                        target.get(key) or [],
+                        key=lambda item: str(item.get('source_job_id') or ''),
+                        reverse=reverse)
+                for values in (target.get('source_statuses') or {}).values():
+                    values.sort(reverse=reverse)
+            next_cursor = cursor + len(page)
+            has_more = next_cursor < len(candidates)
+            source_truncated = bool(index.truncated)
+            result['truncated'] = source_truncated or has_more
+            result['absence_authoritative'] = False
+            result['pagination'] = {
+                'cursor': cursor,
+                'page_size': page_size,
+                'returned_candidates': len(page),
+                'bounded_candidates': len(candidates),
+                'next_cursor': next_cursor if has_more else None,
+                'has_more': has_more,
+                'sort_order': sort_order,
+            }
+            result['limits'] = {
+                'targets': _REUSE_TARGET_LIMIT,
+                'candidates': _REUSE_CANDIDATE_LIMIT,
+                'page_size': _REUSE_PAGE_LIMIT,
+            }
+            result['index'].update({
+                'indexed': len(index.records),
+                'page_indexed': len(view.records),
+                'source_truncated': source_truncated,
+                'page_truncated': has_more,
+                'truncated': source_truncated or has_more,
+            })
+            return self._analysis_workbench_public_value(result)
+        except Exception as exc:                         # noqa: BLE001 public seam
+            return {
+                'schema': ADVISORY_SCHEMA, 'ok': False, 'advisory_only': True,
+                'automatic_reuse': False, 'equivalence_claim': False,
+                'authorizes_submission': False, 'requires_user_confirmation': True,
+                'absence_authoritative': False,
+                'targets': [], 'index': None,
+                'truncated': False, 'pagination': None,
+                'error': self._workspace_public_text(exc),
+            }
+
+    def _calculation_reuse_records(self, requested_ids):
+        """Resolve opaque IDs from the full ledger, never from the bounded index."""
+        pmap = self._project_role_map()
+        records = {}
+        duplicates = set()
+        wanted = set(requested_ids)
+        for directory, manifest in self._ledger.load_all():
+            if not isinstance(manifest, dict):
+                continue
+            identifier = self._workspace_job_id(directory, manifest)
+            if identifier not in wanted:
+                continue
+            if identifier in records:
+                duplicates.add(identifier)
+                continue
+            group = pmap.get(os.path.normcase(os.path.normpath(directory)))
+            records[identifier] = types.SimpleNamespace(
+                job_id=identifier, job_dir=str(directory), manifest=manifest,
+                project_id=(str(group.get('project_id') or '') or None
+                            if group else None),
+            )
+        if duplicates:
+            raise ValueError('ledger contains duplicate opaque job IDs')
+        missing = set(requested_ids) - set(records)
+        if missing:
+            raise ValueError('one or more job IDs are not present in the authoritative ledger')
+        return records
+
+    def jobs_reference_existing_result(self, target_job_id, source_job_id,
+                                       decision_id, reason=''):
+        """Consume one explicit user choice and persist new target provenance."""
+        from vcstudio.project.calculation_reuse import record_reuse_reference
+
+        try:
+            target_id = str(target_job_id or '').strip()
+            source_id = str(source_job_id or '').strip()
+            records = self._calculation_reuse_records([target_id, source_id])
+            target = records[target_id]
+            source = records[source_id]
+            result = record_reuse_reference(
+                target.job_dir, source.job_dir, decision_id=decision_id,
+                reason=reason, target_project_id=target.project_id,
+                source_project_id=source.project_id)
+            return self._analysis_workbench_public_value(result)
+        except Exception as exc:                         # noqa: BLE001 public seam
+            return {
+                'ok': False, 'target_job_id': None, 'source_job_id': None,
+                'accepted_inherited': False, 'final_inherited': False,
+                'error': self._workspace_public_text(exc),
+            }
+
+    def jobs_force_recalculation(self, job_ids, decision_id, reason):
+        """Persist a reason for deliberately recalculating exact-match targets."""
+        from vcstudio.project.calculation_reuse import record_force_recalculation
+
+        try:
+            requested = self._reuse_job_ids(job_ids)
+            records = self._calculation_reuse_records(requested)
+            results = []
+            for job_id in requested:
+                recorded = record_force_recalculation(
+                    records[job_id].job_dir, decision_id=decision_id, reason=reason)
+                results.append({
+                    'job_id': job_id, 'replayed': bool(recorded.get('replayed')),
+                    'decision_id': (recorded.get('decision') or {}).get('decision_id'),
+                })
+            return self._analysis_workbench_public_value({
+                'ok': True, 'reason_retained': True, 'results': results,
+            })
+        except Exception as exc:                         # noqa: BLE001 public seam
+            return {'ok': False, 'reason_retained': False, 'results': [],
+                    'error': self._workspace_public_text(exc)}
+
+    @staticmethod
+    def _bind_reuse_execution_environment(dirs, profile):
+        """Bind a trusted profile attestation server-side before fingerprinting."""
+        from vcstudio.cluster.submitter import bind_execution_environment
+
+        seen = set()
+        for directory in dirs or []:
+            key = os.path.normcase(os.path.realpath(os.path.abspath(str(directory))))
+            if key in seen:
+                continue
+            seen.add(key)
+            bind_execution_environment(str(directory), profile)
+
+    def _reuse_submission_guard(self, dirs):
+        """Require an explicit choice before submitting a reusable exact match."""
+        from vcstudio.project.calculation_reuse import (
+            authoritative_reuse_lookup,
+            build_scientific_fingerprint,
+            has_current_force_recalculation,
+        )
+
+        entries = list(self._ledger.load_all())
+        by_path = {
+            os.path.normcase(os.path.realpath(os.path.abspath(str(directory)))):
+                (directory, manifest)
+            for directory, manifest in entries if isinstance(manifest, dict)
+        }
+        requested_ids = []
+        requested_dirs = {}
+        requested_manifests = {}
+        missing_targets = []
+        for raw_dir in dirs or []:
+            key = os.path.normcase(os.path.realpath(os.path.abspath(str(raw_dir))))
+            entry = by_path.get(key)
+            if entry is None:
+                missing_targets.append(raw_dir)
+                continue
+            directory, manifest = entry
+            job_id = self._workspace_job_id(directory, manifest)
+            requested_ids.append(job_id)
+            requested_dirs[job_id] = directory
+            requested_manifests[job_id] = manifest
+        if missing_targets:
+            raise ValueError('one or more submission targets are absent from the authoritative ledger')
+        if not requested_ids:
+            return None
+        if len(set(requested_ids)) != len(requested_ids):
+            raise ValueError('submission targets contain duplicate opaque job IDs')
+        pmap = self._project_role_map()
+
+        def opaque_job_id(directory, manifest):
+            return self._workspace_job_id(directory, manifest)
+
+        def opaque_project_id(directory, _manifest):
+            group = pmap.get(os.path.normcase(os.path.normpath(directory)))
+            return str(group.get('project_id') or '') or None if group else None
+
+        advisory = authoritative_reuse_lookup(
+            entries, requested_ids, job_id=opaque_job_id,
+            project_id=opaque_project_id)
+        if not isinstance(advisory, dict) or advisory.get('authoritative') is not True:
+            raise RuntimeError('authoritative reuse lookup returned an invalid result')
+        if advisory.get('complete') is not True:
+            raise RuntimeError('authoritative reuse lookup is incomplete; submission is not authorized')
+        blocked = []
+        for target in advisory.get('targets') or []:
+            if not target.get('requires_explicit_choice'):
+                continue
+            manifest = requested_manifests.get(target.get('target_job_id'))
+            directory = requested_dirs.get(target.get('target_job_id'))
+            fingerprint = (
+                build_scientific_fingerprint(directory) if directory else None
+            )
+            if (manifest is None or not isinstance(fingerprint, dict)
+                    or not has_current_force_recalculation(manifest, fingerprint)):
+                blocked.append(target.get('target_job_id'))
+        if not blocked:
+            return None
+        return self._analysis_workbench_public_value({
+            'ok': False, 'code': 'reuse_decision_required',
+            'error': '发现可重验的严格 exact match；请先显式引用既有结果，或填写理由后强制重算。',
+            'blocked_job_ids': blocked, 'advisory': advisory,
+        })
+
     # ── 任务:远程动作(一律先 _resolve 再委托 batch_ops 同名函数) ─────────
     def _delegate(self, name, password, fn):
         """五个远程方法的公共壳:解析集群+密码 → 委托 batch_ops;任何异常兜成 error dict。
@@ -2600,12 +2948,21 @@ class Api:
                 for key in ('fingerprint', 'algorithm', 'host')}
 
     def submit_jobs(self, dirs, name, password, trust_new=False, idempotency_key=None):
-        return self._delegate(name, password,
-                              lambda prof, pw: self._run_job_operation_once(
-                                  idempotency_key, action='submit', profile=prof.name,
-                                  dirs=dirs, invoke=lambda: self._submit_batch_with_idempotency(
-                                      self._bo().submit_batch, prof, pw, dirs, trust_new,
-                                      idempotency_key)))
+        def submit(prof, pw):
+            try:
+                self._bind_reuse_execution_environment(dirs, prof)
+                guarded = self._reuse_submission_guard(dirs)
+            except Exception as exc:                     # noqa: BLE001 public seam
+                return {'ok': False, 'error': self._workspace_public_text(exc)}
+            if guarded is not None:
+                return guarded
+            return self._run_job_operation_once(
+                idempotency_key, action='submit', profile=prof.name,
+                dirs=dirs, invoke=lambda: self._submit_batch_with_idempotency(
+                    self._bo().submit_batch, prof, pw, dirs, trust_new,
+                    idempotency_key))
+
+        return self._delegate(name, password, submit)
 
     def fetch_jobs(self, dirs, name, password, trust_new=False, files=None):
         def _fetch(prof, pw):
@@ -4531,7 +4888,8 @@ class Api:
             return {**empty, 'error': str(e)}
 
     def submit_project_with_resources(self, project_id, profile_name, cores,
-                                      walltime, password=None, trust_new=False):
+                                      walltime, password=None, trust_new=False,
+                                      idempotency_key=None):
         """Submit one registered project selected by opaque identity."""
         try:
             record = self._resolve_project_id(project_id)
@@ -4543,7 +4901,8 @@ class Api:
             [record],
             lambda: self._submit_project_with_resources_for_path(
                 record['path'], profile_name, cores, walltime,
-                password=password, trust_new=trust_new),
+                password=password, trust_new=trust_new,
+                idempotency_key=idempotency_key),
             failure={
                 'results': [], 'submitted': [], 'skipped': [],
                 'resources': {}, 'needs_trust': False,
@@ -4552,7 +4911,7 @@ class Api:
 
     def _submit_project_with_resources_for_path(
             self, project_path, profile_name, cores,
-            walltime, password=None, trust_new=False):
+            walltime, password=None, trust_new=False, idempotency_key=None):
         """按本次选择的核数/墙时提交项目，不改集群 profile 的持久配置。"""
         base = {'ok': False, 'results': [], 'submitted': [], 'skipped': [],
                 'resources': {}, 'needs_trust': False}
@@ -4752,10 +5111,27 @@ class Api:
                         'error': ('；'.join(persistence_errors) if persistence_errors else
                                   ('没有可提交作业；' + '；'.join(
                                       f'{self._base(row["dir"])}:{row["reason"]}'
-                                      for row in unsafe) if unsafe else None))}
+                                  for row in unsafe) if unsafe else None))}
 
-            response = self._bo().submit_batch(
-                launch_profile, pw, eligible, trust_new)
+            try:
+                self._bind_reuse_execution_environment(eligible, prof)
+                guarded = self._reuse_submission_guard(eligible)
+            except Exception as exc:                     # noqa: BLE001 public seam
+                return {**base, 'skipped': skipped, 'resources': resources,
+                        'error': self._workspace_public_text(exc)}
+            if guarded is not None:
+                return {**base, 'skipped': skipped, 'resources': resources,
+                        'code': guarded.get('code'),
+                        'blocked_job_ids': guarded.get('blocked_job_ids') or [],
+                        'reuse_advisory': guarded.get('advisory'),
+                        'error': guarded.get('error')}
+
+            response = self._run_job_operation_once(
+                idempotency_key,
+                action=f'project-submit:{ncores}:{wall}', profile=prof.name,
+                dirs=eligible, invoke=lambda: self._submit_batch_with_idempotency(
+                    self._bo().submit_batch, launch_profile, pw, eligible,
+                    trust_new, idempotency_key))
             if response.get('needs_trust'):
                 return {**base, 'skipped': skipped, 'resources': resources,
                         'needs_trust': True,

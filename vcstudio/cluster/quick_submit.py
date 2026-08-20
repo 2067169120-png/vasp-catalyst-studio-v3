@@ -487,6 +487,14 @@ def _write_quick_manifest(job_dir: str, *, name: str, source: str,
         # INCAR 错记成共享来源。
         if source_incar_origin == 'shared':
             inputs['shared_incar'] = inputs.get('source_incar', 'inline')
+        recipe = build_result.get('method_recipe')
+        if recipe:
+            from vcstudio.generate.method_recipe import validate_method_recipe
+            inputs['method_recipe'] = validate_method_recipe(recipe)
+        else:
+            inputs['method_recipe_status'] = 'legacy_missing'
+    elif engine == 'vasp':
+        inputs['method_recipe_status'] = 'legacy_copy_missing'
     task_type = (str(build_result.get('task_type') or '')
                  if build_result else _manifest_task_type(engine, job_dir))
     if not task_type:
@@ -508,6 +516,8 @@ def _write_quick_manifest(job_dir: str, *, name: str, source: str,
         inputs=inputs,
         warnings=warnings,
     )
+    from vcstudio.shared.scientific_inputs import record_input_closure
+    record_input_closure(job_dir, manifest)
     manifest_mod.save_manifest(job_dir, manifest)
 
 

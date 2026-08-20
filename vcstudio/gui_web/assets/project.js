@@ -2641,9 +2641,11 @@
   async function submitLiSProject(projectIdValue, gate) {
     let password = null;
     let trust = false;
+    const operationId = 'project-submit-' + Date.now().toString(36) + '-' +
+      String(projectIdValue || '').replace(/[^A-Za-z0-9_.-]/g, '-').slice(-32);
     for (let attempt = 0; attempt < 6; attempt++) {
       const r = await VCS.call('submit_project_with_resources', projectIdValue,
-        val('lis-profile'), gate.cores, gate.walltime, password, trust);
+        val('lis-profile'), gate.cores, gate.walltime, password, trust, operationId);
       if (!r || r.cancelled) return null;
       if (r.needPassword) { password = r.password; continue; }
       if (r.error === 'NEED_PASSWORD') {

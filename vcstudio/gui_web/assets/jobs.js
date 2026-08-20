@@ -40,6 +40,10 @@
     resourceForecastResult: null,
     resourceForecastGeneration: 0,
     resourceForecastSelection: '',
+    reuseAdvisoryStatus: 'idle',
+    reuseAdvisoryResult: null,
+    reuseAdvisoryGeneration: 0,
+    reuseAdvisorySelection: '',
   };
 
   // 目录 → 末段名(本地日志用,兼容 \ 与 /)
@@ -564,6 +568,221 @@
       ? resourceForecastSelectionKey(selectedRows()) : selectionKey;
   }
 
+  function invalidateReuseAdvisory(selectionKey) {
+    State.reuseAdvisoryGeneration += 1;
+    State.reuseAdvisoryStatus = 'idle';
+    State.reuseAdvisoryResult = null;
+    State.reuseAdvisorySelection = selectionKey === undefined
+      ? resourceForecastSelectionKey(selectedRows()) : selectionKey;
+    const reason = $('#jobs-reuse-reason');
+    if (reason) reason.value = '';
+  }
+
+  function reuseStatusLabel(value) {
+    const labels = {
+      verified: ['jobs.reuse.status_verified', '已重验', 'Verified'],
+      failed: ['jobs.reuse.status_failed', '失败', 'Failed'],
+      unconverged: ['jobs.reuse.status_unconverged', '未收敛', 'Unconverged'],
+      incomplete: ['jobs.reuse.status_incomplete', '证据不完整', 'Incomplete'],
+    };
+    const label = labels[value];
+    return label ? tr(label[0], {}, label[1], label[2]) : String(value || 'unknown');
+  }
+
+  function reuseSavingsText(saved) {
+    const value = saved || {};
+    if (value.core_hours === null || value.core_hours === undefined) {
+      return tr('jobs.reuse.savings_unknown', {}, '节省估算未知', 'Savings estimate unavailable');
+    }
+    const prefix = value.status === 'measured'
+      ? tr('jobs.reuse.savings_measured', {}, '实测核时', 'Measured core-hours')
+      : tr('jobs.reuse.savings_upper', {}, '请求上界', 'Requested upper bound');
+    return `${prefix}: ${String(value.core_hours)}`;
+  }
+
+  function fingerprintFieldHtml(field) {
+    const summary = field && field.summary;
+    const summaryText = summary === null || summary === undefined
+      ? '—' : JSON.stringify(summary);
+    return `<li><b>${VCS.esc(String(field && field.field || 'unknown'))}</b> ` +
+      `<span class="mono">${VCS.esc(String(field && field.digest || 'incomplete'))}</span>` +
+      `<div class="sub">${VCS.esc(summaryText)}</div></li>`;
+  }
+
+  function reuseMatchHtml(targetId, match, exact) {
+    const verification = match && match.verification || {};
+    const status = reuseStatusLabel(verification.status);
+    const saved = reuseSavingsText(match && match.saved_estimate);
+    const relation = String(match && match.project_relation || 'unknown');
+    const relationLabels = {
+      same: tr('jobs.reuse.same_project', {}, '同项目来源', 'Same-project source'),
+      different: tr('jobs.reuse.cross_project', {}, '跨项目来源', 'Cross-project source'),
+      unknown: tr('jobs.reuse.project_unknown', {}, '项目关系未知', 'Project relation unknown'),
+    };
+    const projectRelation = relationLabels[relation] || relationLabels.unknown;
+    const diffs = exact ? '' : (match && match.differences || []).map(diff =>
+      `<li>${VCS.esc(String(diff.field || 'unknown'))}: ` +
+      `${VCS.esc(String(diff.target_digest || 'incomplete'))} → ` +
+      `${VCS.esc(String(diff.source_digest || 'incomplete'))}</li>`).join('');
+    const canReuse = exact && verification.reusable === true && relation !== 'unknown';
+    return `<li class="jobs-reuse-match ${exact ? (canReuse ? 'exact' : 'bad') : 'near'}">` +
+      `<b>${VCS.esc(String(match && match.source_job_id || 'unknown'))}</b> · ` +
+      `${VCS.esc(status)} · ${VCS.esc(saved)} · ${VCS.esc(projectRelation)}` +
+      (exact && verification.issues && verification.issues.length
+        ? `<div class="sub">${VCS.esc(verification.issues.join('；'))}</div>` : '') +
+      (diffs ? `<div class="sub">${VCS.esc(tr('jobs.reuse.near_boundary', {},
+        '仅显示差异；near match 不代表等价',
+        'Differences only; a near match is not an equivalence claim'))}</div>` +
+        `<ul class="jobs-reuse-diffs">${diffs}</ul>` : '') +
+      (canReuse ? `<div class="actions"><button type="button" class="btn jobs-reuse-use" ` +
+        `data-target-job-id="${VCS.esc(targetId)}" ` +
+        `data-source-job-id="${VCS.esc(String(match.source_job_id))}">` +
+        `${VCS.esc(tr('jobs.reuse.reference', {}, '引用既有结果', 'Reference existing result'))}` +
+        `</button></div>` : '') + '</li>';
+  }
+
+  function renderReuseAdvisory() {
+    const panel = $('#jobs-reuse-advisory');
+    const output = $('#jobs-reuse-advisory-out');
+    const reasonWrap = $('#jobs-reuse-reason-wrap');
+    const button = $('#jb-tray-reuse-scan');
+    if (!panel || !output || !reasonWrap || !button) return;
+    const key = resourceForecastSelectionKey(selectedRows());
+    if (key !== State.reuseAdvisorySelection) invalidateReuseAdvisory(key);
+    button.disabled = !key || State.reuseAdvisoryStatus === 'loading';
+    panel.hidden = State.reuseAdvisoryStatus === 'idle';
+    panel.className = `jobs-reuse-advisory ${State.reuseAdvisoryStatus}`;
+    panel.setAttribute('aria-busy', State.reuseAdvisoryStatus === 'loading' ? 'true' : 'false');
+    if (State.reuseAdvisoryStatus === 'idle') {
+      output.replaceChildren(); reasonWrap.hidden = true; return;
+    }
+    if (State.reuseAdvisoryStatus === 'loading') {
+      output.textContent = tr('jobs.reuse.loading', {},
+        '正在从服务端 job.yaml 与文件哈希重建有界索引…',
+        'Rebuilding the bounded index from server job manifests and file hashes…');
+      reasonWrap.hidden = true; return;
+    }
+    const result = State.reuseAdvisoryResult || {};
+    if (!result.ok) {
+      output.textContent = result.error || tr('jobs.reuse.unavailable', {},
+        '重复计算提示不可用；不会猜测缺失证据',
+        'Duplicate-calculation advisory unavailable; missing evidence is not guessed');
+      reasonWrap.hidden = true; return;
+    }
+    let requiresReason = false;
+    const targets = (result.targets || []).map(target => {
+      const fingerprint = target.fingerprint || {};
+      const exact = target.exact_matches || [];
+      const near = target.near_matches || [];
+      const sourceStatuses = target.source_statuses || {};
+      const statusSummary = Object.entries(sourceStatuses).filter(
+        entry => Array.isArray(entry[1]) && entry[1].length).map(
+        entry => `${reuseStatusLabel(entry[0])}: ${entry[1].join(', ')}`);
+      if (target.requires_explicit_choice) requiresReason = true;
+      const missing = (fingerprint.missing || []).concat(fingerprint.integrity_issues || []);
+      return `<section class="jobs-reuse-target"><div class="jobs-reuse-meta">` +
+        `<b>${VCS.esc(String(target.target_job_id || 'unknown'))}</b>` +
+        `<span>${VCS.esc(String(fingerprint.schema || 'unknown'))}</span>` +
+        `<span>${VCS.esc(String(fingerprint.status || 'incomplete'))}</span>` +
+        `<span>${VCS.esc(String(fingerprint.recipe_status || 'explicit_legacy'))}</span></div>` +
+        (fingerprint.digest ? `<div class="sub mono">${VCS.esc(fingerprint.digest)}</div>` : '') +
+        (missing.length ? `<div class="sub">${VCS.esc(missing.join('；'))}</div>` : '') +
+        (statusSummary.length ? `<div class="sub">${VCS.esc(statusSummary.join('；'))}</div>` : '') +
+        `<ul class="jobs-reuse-fields">${(fingerprint.fields || []).map(fingerprintFieldHtml).join('')}</ul>` +
+        (exact.length ? `<h4>${VCS.esc(tr('jobs.reuse.exact', {}, 'Exact match', 'Exact matches'))}</h4>` +
+          `<ul class="jobs-reuse-matches">${exact.map(match => reuseMatchHtml(
+            String(target.target_job_id || ''), match, true)).join('')}</ul>` : '') +
+        (near.length ? `<h4>${VCS.esc(tr('jobs.reuse.near', {}, 'Near match（非等价）',
+          'Near matches (not equivalent)'))}</h4><ul class="jobs-reuse-matches">` +
+          `${near.map(match => reuseMatchHtml(String(target.target_job_id || ''), match, false)).join('')}</ul>` : '') +
+        `</section>`;
+    }).join('');
+    const index = result.index || {};
+    const pagination = result.pagination || {};
+    const truncation = result.truncated
+      ? tr('jobs.reuse.truncated', {}, '结果已按资源上限截断；可通过服务端分页继续检查。',
+        'Results are truncated by resource limits; continue through server pagination.') : '';
+    output.innerHTML = targets + `<p class="jobs-reuse-boundary">${VCS.esc(tr(
+      'jobs.reuse.boundary', {},
+      `索引 ${index.indexed || 0}/${index.observed || 0}，容量 ${index.capacity || 0}；` +
+      `本页候选 ${pagination.returned_candidates || 0}。` +
+      '索引可重建且不是事实源。默认不自动复用；accepted/final 不继承。' +
+      (truncation ? ` ${truncation}` : ''),
+      `Index ${index.indexed || 0}/${index.observed || 0}, capacity ${index.capacity || 0}. ` +
+      `This page has ${pagination.returned_candidates || 0} candidates. ` +
+      'The rebuildable index is not authoritative. Reuse is never automatic; accepted/final are not inherited.' +
+      (truncation ? ` ${truncation}` : '')))}</p>`;
+    reasonWrap.hidden = !requiresReason;
+  }
+
+  async function inspectSelectedReuse(forceRefresh = true, profileName = '') {
+    const rows = selectedRows();
+    const key = resourceForecastSelectionKey(rows);
+    const ids = rows.map(stableJobId);
+    if (!key || ids.length !== rows.length) {
+      State.reuseAdvisoryStatus = 'unavailable';
+      State.reuseAdvisoryResult = { ok: false, error: tr('jobs.reuse.missing_ids', {},
+        '所选作业缺少稳定服务端标识，无法检查严格指纹',
+        'A selected job lacks a stable server identity') };
+      renderReuseAdvisory(); return null;
+    }
+    if (!forceRefresh && State.reuseAdvisoryResult && State.reuseAdvisorySelection === key) {
+      return State.reuseAdvisoryResult;
+    }
+    const generation = ++State.reuseAdvisoryGeneration;
+    State.reuseAdvisorySelection = key;
+    State.reuseAdvisoryStatus = 'loading';
+    State.reuseAdvisoryResult = null;
+    renderReuseAdvisory();
+    try {
+      // Only the opaque profile name crosses this seam.  The server binds the
+      // trusted execution attestation and computes every scientific value.
+      const result = profileName
+        ? await VCS.call('jobs_reuse_advisory', ids, 0, 64, 128, 'job_id_asc', profileName)
+        : await VCS.call('jobs_reuse_advisory', ids);
+      if (generation !== State.reuseAdvisoryGeneration ||
+          key !== resourceForecastSelectionKey(selectedRows())) return null;
+      State.reuseAdvisoryResult = result || { ok: false };
+      const attention = !!(result && result.ok && (result.targets || []).some(
+        target => target.requires_explicit_choice));
+      State.reuseAdvisoryStatus = result && result.ok
+        ? (attention ? 'attention' : 'ready') : 'unavailable';
+      renderReuseAdvisory(); return State.reuseAdvisoryResult;
+    } catch (error) {
+      if (generation !== State.reuseAdvisoryGeneration) return null;
+      State.reuseAdvisoryResult = { ok: false, error: String(error && error.message || error) };
+      State.reuseAdvisoryStatus = 'unavailable';
+      renderReuseAdvisory(); return State.reuseAdvisoryResult;
+    }
+  }
+
+  async function referenceExistingResult(button) {
+    const targetId = String(button && button.dataset.targetJobId || '');
+    const sourceId = String(button && button.dataset.sourceJobId || '');
+    if (!targetId || !sourceId) return;
+    const reason = String($('#jobs-reuse-reason') && $('#jobs-reuse-reason').value || '').trim();
+    const confirmed = await VCS.confirm(tr('jobs.reuse.confirm_reference', {
+      target: targetId, source: sourceId,
+    }, '为 {target} 新建 provenance 节点并引用 {source}？来源将再次重验；不会继承 accepted/final。',
+    'Create a new provenance node for {target} referencing {source}? The source will be revalidated; accepted/final are not inherited.'));
+    if (!confirmed) return;
+    button.disabled = true;
+    const result = await VCS.call('jobs_reference_existing_result', targetId, sourceId,
+      operationId('reuse-reference'), reason);
+    if (!result || !result.ok) {
+      button.disabled = false;
+      VCS.log(tr('jobs.reuse.reference_failed', { error: result && result.error || 'unknown' },
+        '引用既有结果失败：{error}', 'Failed to reference existing result: {error}'), 'failc');
+      await inspectSelectedReuse(true); return;
+    }
+    const row = State.rows.find(item => stableJobId(item) === targetId);
+    if (row) State.selected.delete(row.dir);
+    VCS.log(tr('jobs.reuse.reference_succeeded', { target: targetId, source: sourceId },
+      '{target} 已建立对 {source} 的可重验引用；未继承 accepted/final',
+      '{target} now has a verifiable reference to {source}; accepted/final were not inherited'), 'okc');
+    await reload();
+  }
+
   function resourceRiskLabel(value) {
     const labels = {
       no_matching_history: ['jobs.forecast.risk.no_history', '无匹配历史', 'No matching history'],
@@ -711,11 +930,13 @@
     const rows = selectedRows();
     const selectionKey = resourceForecastSelectionKey(rows);
     if (selectionKey !== State.resourceForecastSelection) invalidateResourceForecast(selectionKey);
+    if (selectionKey !== State.reuseAdvisorySelection) invalidateReuseAdvisory(selectionKey);
     tray.hidden = rows.length === 0;
     if (!rows.length) {
       list.innerHTML = '';
       summary.textContent = '';
       renderResourceForecast();
+      renderReuseAdvisory();
       return;
     }
     const visible = new Set(visibleRows().map(row => row.dir));
@@ -742,6 +963,7 @@
         `${VCS.pill(row.state || 'CREATED')}</li>`;
     }).join('');
     renderResourceForecast();
+    renderReuseAdvisory();
   }
 
   const OPERATION_BUTTONS = [
@@ -1483,6 +1705,36 @@
         '请先在列表中选中要提交的作业(可多选)',
         'Select one or more jobs to submit from the list'), 'failc');
       return;
+    }
+    let reuseResult;
+    if (name) reuseResult = await inspectSelectedReuse(true, name);
+    else reuseResult = await inspectSelectedReuse(true);
+    if (!reuseResult || !reuseResult.ok) {
+      VCS.log(tr('jobs.reuse.submit_advisory_required', {},
+        '提交前严格指纹查询失败；请检查提示后重试。不会在证据未知时自动复用。',
+        'The strict fingerprint query failed before submission. Review the advisory and retry; reuse is never inferred from unknown evidence.'), 'failc');
+      return;
+    }
+    const requiresReason = (reuseResult.targets || []).some(
+      target => target.requires_explicit_choice);
+    if (requiresReason) {
+      const reason = String($('#jobs-reuse-reason') && $('#jobs-reuse-reason').value || '').trim();
+      if (!reason) {
+        VCS.log(tr('jobs.reuse.force_reason_required', {},
+          '发现可重验 exact match。请选择“引用既有结果”，或填写仍要重算的理由后再次提交。',
+          'A verifiable exact match exists. Reference it, or enter a reason for recalculation and submit again.'), 'failc');
+        const field = $('#jobs-reuse-reason'); if (field) field.focus();
+        return;
+      }
+      const ids = (reuseResult.targets || []).filter(
+        target => target.requires_explicit_choice).map(target => target.target_job_id);
+      const recorded = await VCS.call('jobs_force_recalculation', ids,
+        operationId('force-recalculate'), reason);
+      if (!recorded || !recorded.ok) {
+        VCS.log(tr('jobs.reuse.force_record_failed', { error: recorded && recorded.error || 'unknown' },
+          '未能保存强制重算理由：{error}', 'Could not retain the recalculation reason: {error}'), 'failc');
+        return;
+      }
     }
     return withExclusiveOperation('submit', actionLabel, dirs, name, async op => {
       const prof = State.profiles[name];
@@ -2611,11 +2863,18 @@
     wire('jb-tray-cancel', batchCancel);
     wire('jb-tray-remove', doRemove);
     wire('jb-tray-forecast', estimateSelectedResources);
+    wire('jb-tray-reuse-scan', () => inspectSelectedReuse(true));
     wire('jobs-selection-clear', clearSelection);
     wire('jobs-selection-review', () => {
       State.selectionTrayExpanded = !State.selectionTrayExpanded;
       renderSelectionTray();
     });
+    { const output = $('#jobs-reuse-advisory-out');
+      if (output) output.addEventListener('click', event => {
+        const button = event.target && event.target.closest
+          ? event.target.closest('.jobs-reuse-use') : null;
+        if (button) referenceExistingResult(button);
+      }); }
     // 实时能量曲线面板(v3.3.0)
     wire('jl-refresh', () => livePoll());
     wire('jl-close', () => liveStop(true));

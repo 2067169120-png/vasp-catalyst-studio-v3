@@ -137,6 +137,16 @@ The nine-state `job.yaml` lifecycle records operational progress such as CREATED
 
 After selecting multiple jobs, the **Selection Tray** lists the entire selection. Jobs hidden by current status, cluster, or project filters remain counted and are called out explicitly. Expand **Batch Review** before Submit, Fetch, Continue, Cancel, or Remove. The page acquires an exclusive operation lock before confirmation can race with a second click. Submission, continuation, and cancellation also use server idempotency keys: retrying the same payload replays the recorded result, while an in-flight duplicate remains busy and cannot repeat the remote side effect. Long operations from Jobs, Project lifecycle, Analysis, and Publish share the global **Operation Queue**, with confirming/running/succeeded/failed states.
 
+Select **Check duplicate calculations**, or begin submission, to rebuild a bounded advisory index
+from the server ledger, authoritative `job.yaml` manifests, and current file hashes. The panel shows
+versioned fingerprint fields, exact matches, field-level differences for near matches, failed,
+unconverged, or incomplete sources, savings estimates, and source-verification status. A near match
+is never an equivalence claim. Missing Method Recipe semantics, VASP/build identity, or any required
+input leaves a legacy job `incomplete / explicit_legacy`. Reuse is off by default. **Reference
+existing result** revalidates the source and creates a fresh provenance node/link and decision without
+inheriting accepted/final qualification; choosing to recalculate an exact match requires a retained
+reason. The browser sends opaque job IDs and does not parse or fingerprint VASP inputs.
+
 The Selection Tray's **read-only resource forecast** reconstructs evidence from the server ledger, manifests, and matching historical task records. It reports a core-hour point estimate and range, confidence, failure rate, and budget risk; batch budget checks use the high end of the interval. Sparse history or incomplete inputs remain low-confidence/unavailable rather than guessed. A forecast always has `recommendation_only=true` and `authorizes_submission=false`; it cannot bypass confirmation, host trust, or idempotency gates.
 
 ### Diagnose and recover
@@ -278,6 +288,13 @@ python -m pytest
 ```
 
 The final local gates were actually run on 2026-08-13: cache-free full `python -m pytest` completed with **3658 passed and 5 skipped**, plus **15 upstream ASE/NumPy deprecation warnings**, in 330.80 s; full-repository Ruff and actionlint passed; and `node --check` passed for 23 first-party JavaScript files. The PyInstaller `--full` one-file build succeeded. The final EXE is **113,586,017 bytes (108.32 MiB)** with SHA-256 `bcadc9046685c62cf1a9157d0ceba49b131190184dbe30073ce4189ec6817e2d`.
+
+The strict scientific-fingerprint/reuse change was revalidated in an isolated worktree on
+2026-08-15. Cache-free full pytest completed with **3693 passed and 5 skipped** in 226.23 seconds,
+with 15 upstream ASE/NumPy deprecation warnings. Full-repository Ruff, `node --check` for 25
+first-party JavaScript files, `py_compile` for the changed Python files, and `git diff --check`
+passed. This run did not rebuild the executable, rerun actionlint, or execute a real cluster/VASP
+job; the frozen binary hash above remains evidence only for the 2026-08-13 artifact.
 
 Inside that final frozen EXE, both `full` and `journey` healthchecks exited 0 and each reported `ok=true` and `frozen=true`. `journey` completed all 10/10 phases, recorded 0 network attempts and 0 cluster operations, and passed the restart-persistence check after service reconstruction. Project lifecycle, the Jobs state machine, Analysis source/capability handling, report insights, Resume Center, resource forecasting, laboratory policies, and next-calculation governance also retain focused Python and/or executable-Node production-script regressions; the frozen journey preserves honest `blocked`/`diagnostic` scientific states.
 
