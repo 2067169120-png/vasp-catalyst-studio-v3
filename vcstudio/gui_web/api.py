@@ -6189,7 +6189,10 @@ class Api:
         if not english:
             reaction_table_labels = {
                 'reaction-map-edges': (
-                    '反应图边', ['步骤', '反应物', '产物', '过渡态', 'ΔG / eV', '状态']),
+                    '反应图边', [
+                        '步骤', '反应物', '产物', '过渡态', '反应 ΔG / eV',
+                        '观测 ΔE‡ / eV', '热修正 ΔG‡ / eV', '状态',
+                    ]),
                 'thermochemistry-ledger': (
                     '热化学账本', [
                         '对象', '标签', 'E0', 'ZPE', 'ΔH', '-TΔS',

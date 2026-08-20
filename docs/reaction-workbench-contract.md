@@ -16,8 +16,11 @@ The provider must return one explicit opaque `project_id`; a projection cannot
 be silently rebound to another project.
 
 The workbench validates canonical envelope object identity and semantic hashes
-before deriving public DTOs. It never infers reaction objects from filenames,
-directories, legacy CHE presets, or browser values.
+before deriving public DTOs. A narrowly supported raw-payload migration input
+is schema-closed and always rehashed by the server; a caller-supplied digest is
+ignored, and raw input can never authorize a formal report/frozen-network
+handoff. It never infers reaction objects from filenames, directories, legacy
+CHE presets, or browser values.
 
 ## Input projection
 
@@ -48,7 +51,11 @@ Contains opaque nodes and elementary-step edges with:
 
 - canonical object and projection hashes;
 - structure, method, and evidence hashes;
-- explicit reactant/product/TS IDs and unit stoichiometric coefficients;
+- explicit reactant/product/TS IDs and normalized exact rational
+  stoichiometric coefficients;
+- element, total-charge, surface/site-occupancy, and site-membership
+  conservation results;
+- separately bound edge and NEB method/reference/evidence/endpoint/TS hashes;
 - canonical condition-set ID/hash;
 - separate thermodynamic and kinetic readiness;
 - forward/reverse reaction and activation free energies only when compatible;
@@ -78,7 +85,10 @@ Each entity row shows, independently:
 - TS frequency/mode qualification.
 
 No missing term is replaced by zero. Every participating term requires an
-explicit model and evidence hash. Arithmetic is denied when method, reference
+explicit role-compatible model, `eV` unit, provenance, and evidence hash.
+Temperature/pressure and standard-state definitions are bounded and
+dimension-checked, ZPE is non-negative, and unknown fields are rejected.
+Arithmetic is denied when method, reference
 state, standard state, canonical condition set, T/P/pH/potential, coverage,
 component models, solvent model, coverage model, or low-frequency treatment is
 missing or different.
@@ -105,16 +115,21 @@ evidence, unsupported interactions, or out-of-range values are unavailable.
 This is the only supported handoff to the Microkinetics package. It freezes:
 
 - source projection, graph, and condition-revision hashes;
-- explicit reactants, products, TS, and stoichiometry;
+- explicit reactants, products, TS, and exact rational stoichiometry;
+- explicit conservation and edge/NEB compatibility results;
 - condition-set and method/evidence hashes;
 - condition-derived reaction free energies;
-- forward and reverse activation free energies;
+- observed NEB electronic barriers (`Delta E‡`) separately from
+  thermochemistry-derived forward/reverse free-energy barriers (`Delta G‡`);
 - independent thermodynamic and kinetic statuses;
 - missing reasons and `microkinetics_ready`.
 
 Downstream code must reject `readiness=blocked`, must not infer missing barriers
 or stoichiometry, and must not treat this DTO as a rate-law or reactor-model
 selection. `authorizes_execution` is always false.
+Only a fully canonical-envelope projection with an observed provenance chain
+can be `microkinetics_ready`; imported/inferred origins cap status and cannot be
+promoted by a binding label.
 
 ### `vcstudio.reaction-report-binding/v1`
 

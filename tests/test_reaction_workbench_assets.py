@@ -56,7 +56,8 @@ def test_browser_sends_only_condition_parameters_and_renders_server_values():
     ):
         assert forbidden not in request
     for server_display in (
-        "reaction_delta_g_display", "activation_delta_g_display",
+        "reaction_delta_g_display", "observed_activation_delta_e_display",
+        "thermal_activation_delta_g_display",
         "final_delta_g_display", "base_delta_g_display",
         "condition_delta_g_display", "derived_delta_g_display",
     ):
@@ -98,7 +99,8 @@ seam.renderReactionWorkbench({
     edges: [{ edge_id: 'step-1', artifact_status: 'available', missing: [],
       display: { reactants: 'R*', products: 'P*', transition_state: 'TS*' },
       thermochemistry: { reaction_delta_g_display: '-0.5000',
-        activation_delta_g_display: '1.0000' } }],
+        observed_activation_delta_e_display: '0.8000',
+        thermal_activation_delta_g_display: '1.0000' } }],
     missing_edges: [],
   },
   ledger: { rows: [{ entity_id: 'state-r', entity_type: 'adsorbate_state', label: 'R*',

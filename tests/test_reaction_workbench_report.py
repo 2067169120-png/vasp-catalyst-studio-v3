@@ -4,7 +4,7 @@ import copy
 import json
 from pathlib import Path
 
-from tests.test_reaction_workbench import projection
+from tests.test_reaction_workbench import _rehash, projection
 from tests.test_reaction_workbench_api import _DomainSource
 from tests.test_report_workbench import (
     _html_request,
@@ -115,6 +115,32 @@ def test_verified_ts_evidence_can_raise_only_bounded_kinetic_qualification(tmp_p
     assert "不证明机理完整" in claims["claim.kinetic.bound-steps"]["text"]
     graph = preview["public_snapshot"]["payload"]["reaction_workbench"]["graph"]
     assert graph["mechanism_complete"] is False
+
+
+def test_imported_domain_origin_cannot_be_promoted_to_kinetic_report_claim(tmp_path):
+    api, project_path, _state, _manifests = _workbench_api(tmp_path)
+    value = projection()
+    for binding in value["bindings"].values():
+        binding["scientific_status"] = "verified"
+    value["steps"][0]["payload"]["provenance"] = "imported"
+    _rehash(value["steps"][0])
+    api._reaction_domain_source = _DomainSource(value)
+    project_id = _project_id(api, project_path)
+    boot = api.report_workbench_bootstrap(project_id, "scientific-review")
+    preview = api.report_workbench_preview(project_id, _html_request(
+        boot["project_id"], preset_id="scientific-review", requested_kind="final",
+        outline=[
+            "executive_summary", "reaction_map_table", "thermochemistry_table",
+            "figures", "methods", "limitations",
+        ],
+    ))
+
+    assert preview["ok"] is True
+    assert preview["scientific_qualification"] != "kinetic_evidence_verified"
+    reaction = preview["public_snapshot"]["payload"]["reaction_workbench"]
+    assert reaction["graph"]["scientific_status"] == "machine_pass"
+    assert reaction["graph"]["kinetic_ready"] is False
+    assert reaction["frozen_network"]["readiness"] == "blocked"
 
 
 def test_untyped_condition_response_fields_never_enter_frozen_snapshot(tmp_path):

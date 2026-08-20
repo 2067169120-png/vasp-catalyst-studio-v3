@@ -502,14 +502,16 @@
       { label: tr('analysis.reaction.reactants', '反应物') },
       { label: tr('analysis.reaction.products', '产物') },
       { label: 'TS' }, { label: 'ΔG / eV', numeric: true },
-      { label: 'ΔG‡ / eV', numeric: true },
+      { label: 'Observed ΔE‡ / eV', numeric: true },
+      { label: 'Thermal ΔG‡ / eV', numeric: true },
       { label: tr('analysis.reaction.status', '状态') },
       { label: tr('analysis.reaction.missing', '缺失') },
     ], edges.map(edge => {
       const display = plain(edge.display); const thermo = plain(edge.thermochemistry);
       return { cells: [edge.edge_id, display.reactants, display.products,
         display.transition_state, thermo.reaction_delta_g_display,
-        thermo.activation_delta_g_display, edge.artifact_status,
+        thermo.observed_activation_delta_e_display,
+        thermo.thermal_activation_delta_g_display, edge.artifact_status,
         (edge.missing || []).join(', ') || '—'] };
     }));
     const edgeCaption = document.createElement('caption');
