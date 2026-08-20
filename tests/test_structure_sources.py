@@ -171,6 +171,34 @@ def test_restricted_cif_parser_rejects_duplicate_fractional_coordinate_columns()
         parse_structure_content(scalar_and_loop_x, "cif")
 
 
+def test_cif_blocks_cannot_merge_cell_and_atom_loop_into_a_fictional_structure():
+    split = CIF.replace(
+        "loop_\n_atom_site_label",
+        "data_atoms_only\n_space_group_IT_number 1\nloop_\n_atom_site_label",
+    )
+
+    with pytest.raises(StructureSourceValidationError, match="multiple data_ blocks"):
+        parse_structure_content(split, "cif")
+    with pytest.raises(StructureSourceValidationError, match="atom fractional"):
+        parse_structure_content(split, "cif", cif_block="offline_fixture")
+    with pytest.raises(StructureSourceValidationError, match="cell is incomplete"):
+        parse_structure_content(split, "cif", cif_block="data_atoms_only")
+
+
+def test_cif_multiblock_requires_explicit_selection_of_one_complete_p1_block():
+    multiple = CIF + "\ndata_reference_only\n_space_group_IT_number 1\n_reference_note fixture\n"
+
+    with pytest.raises(StructureSourceValidationError, match="explicit cif_block selection"):
+        parse_structure_content(multiple, "cif")
+    selected = parse_structure_content(
+        multiple, "cif", cif_block="data_offline_fixture")
+
+    assert selected.formula == "SiO2"
+    assert selected.cell == ((3.0, 0.0, 0.0), (0.0, 4.0, 0.0), (0.0, 0.0, 5.0))
+    with pytest.raises(StructureSourceValidationError, match="does not exist"):
+        parse_structure_content(multiple, "cif", cif_block="missing")
+
+
 def test_local_source_hash_change_fails_closed_at_preview_and_confirm(tmp_path: Path):
     source = tmp_path / "POSCAR"
     source.write_text(POSCAR, encoding="utf-8")

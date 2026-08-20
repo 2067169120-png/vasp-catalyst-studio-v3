@@ -28,12 +28,18 @@ import time
 import types
 import uuid
 
+import yaml
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, fields as dc_fields
 from datetime import datetime, timezone
 
 # 合法计算类型(决定 KPOINTS 网格);前端下拉与后端都以此为准
 _CALC_TYPES = ('slab', 'bulk', 'molecule')
+_STRUCTURE_RECOVERY_NAME = '.vcstudio-structure-recovery.json'
+_STRUCTURE_RECOVERY_SCHEMA = 'vcstudio.structure-recovery/v1'
+_STRUCTURE_RECOVERY_BINDING_SCHEMA = 'vcstudio.structure-recovery-binding/v1'
+_STRUCTURE_RECOVERY_MAX_BYTES = 64 * 1024 * 1024
 
 # 主题/视觉密度白名单；二者都只影响 UI，不参与任何科学数据或计算参数。
 _THEMES = ('classic', 'paper', 'deep')
@@ -13409,6 +13415,7 @@ class Api:
                     'created_at': time.monotonic(), 'path': canonical, 'label': label,
                     'identity': identity,
                 }
+                self._structure_scan_recovery_authorities(canonical, token)
             return {'ok': True, 'cancelled': False, 'output_token': token,
                     'selection': {'label': label}, 'error': None}
         except Exception as e:                            # noqa: BLE001 browser boundary
@@ -13502,6 +13509,162 @@ class Api:
             os.close(descriptor)
 
     @staticmethod
+    def _structure_file_evidence(path, *, include_bytes=False):
+        """用 no-follow/reparse-safe handle 读取文件并返回实体、大小与 SHA-256。"""
+        target = os.path.abspath(os.path.expanduser(str(path or '')))
+        parent = os.path.dirname(target)
+        name = os.path.basename(target)
+        if not parent or name in {'', '.', '..'}:
+            raise ValueError('Recovery member file is invalid')
+        Api._structure_directory_identity(parent)
+
+        identity = None
+        if os.name == 'nt':
+            import ctypes
+            import msvcrt
+            from ctypes import wintypes
+
+            class _ByHandleFileInformation(ctypes.Structure):
+                _fields_ = [
+                    ('dwFileAttributes', wintypes.DWORD),
+                    ('ftCreationTime', wintypes.FILETIME),
+                    ('ftLastAccessTime', wintypes.FILETIME),
+                    ('ftLastWriteTime', wintypes.FILETIME),
+                    ('dwVolumeSerialNumber', wintypes.DWORD),
+                    ('nFileSizeHigh', wintypes.DWORD),
+                    ('nFileSizeLow', wintypes.DWORD),
+                    ('nNumberOfLinks', wintypes.DWORD),
+                    ('nFileIndexHigh', wintypes.DWORD),
+                    ('nFileIndexLow', wintypes.DWORD),
+                ]
+
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            create_file = kernel32.CreateFileW
+            create_file.argtypes = [
+                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+            ]
+            create_file.restype = wintypes.HANDLE
+            get_info = kernel32.GetFileInformationByHandle
+            get_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ByHandleFileInformation)]
+            get_info.restype = wintypes.BOOL
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = [wintypes.HANDLE]
+            close_handle.restype = wintypes.BOOL
+            handle = create_file(
+                target,
+                0x80000000 | 0x0080,  # GENERIC_READ | FILE_READ_ATTRIBUTES
+                0x0001,               # FILE_SHARE_READ; blocks replacement while open
+                None, 3,              # OPEN_EXISTING
+                0x00200000 | 0x08000000,  # OPEN_REPARSE_POINT | SEQUENTIAL_SCAN
+                None,
+            )
+            invalid = ctypes.c_void_p(-1).value
+            handle_value = handle if isinstance(handle, int) else getattr(handle, 'value', None)
+            if handle_value in (None, invalid):
+                raise OSError(ctypes.get_last_error(), 'Unable to reopen recovery member')
+            transferred = False
+            try:
+                info = _ByHandleFileInformation()
+                if not get_info(handle, ctypes.byref(info)):
+                    raise OSError(ctypes.get_last_error(), 'Unable to identify recovery member')
+                if int(info.dwFileAttributes) & (0x400 | 0x10):
+                    raise ValueError('Recovery member must be a regular non-reparse file')
+                identity = {
+                    'kind': 'windows-file-id',
+                    'volume_serial': int(info.dwVolumeSerialNumber),
+                    'file_id': ((int(info.nFileIndexHigh) << 32)
+                                | int(info.nFileIndexLow)),
+                }
+                descriptor = msvcrt.open_osfhandle(
+                    int(handle_value), os.O_RDONLY | getattr(os, 'O_BINARY', 0))
+                transferred = True
+            finally:
+                if not transferred:
+                    close_handle(handle)
+        else:
+            dir_flags = (os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
+                         | getattr(os, 'O_NOFOLLOW', 0))
+            parent_fd = os.open(parent, dir_flags)
+            try:
+                descriptor = os.open(
+                    name, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0), dir_fd=parent_fd)
+            finally:
+                os.close(parent_fd)
+
+        digest = hashlib.sha256()
+        chunks = [] if include_bytes else None
+        total = 0
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise ValueError('Recovery member must be a regular file')
+            if identity is None:
+                identity = {
+                    'kind': 'posix-inode', 'device': int(opened.st_dev),
+                    'inode': int(opened.st_ino),
+                }
+            while True:
+                chunk = os.read(descriptor, 65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _STRUCTURE_RECOVERY_MAX_BYTES:
+                    raise ValueError('Recovery member exceeds the safe size limit')
+                digest.update(chunk)
+                if chunks is not None:
+                    chunks.append(chunk)
+        finally:
+            os.close(descriptor)
+        result = {'identity': identity, 'size': total, 'sha256': digest.hexdigest()}
+        if chunks is not None:
+            result['bytes'] = b''.join(chunks)
+        return result
+
+    @staticmethod
+    def _structure_binding_hash(binding):
+        encoded = json.dumps(
+            binding, ensure_ascii=False, sort_keys=True,
+            separators=(',', ':')).encode('utf-8')
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _structure_write_recovery_authority(batch_dir, authority, expected_identity):
+        """原子持久化 batch authority，写入前后都核对 batch 目录实体。"""
+        if Api._structure_directory_identity(batch_dir) != expected_identity:
+            raise ValueError('Candidate batch directory identity changed')
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f'{_STRUCTURE_RECOVERY_NAME}.', suffix='.tmp', dir=batch_dir)
+        try:
+            with os.fdopen(descriptor, 'w', encoding='utf-8', newline='\n') as handle:
+                json.dump(authority, handle, ensure_ascii=False, sort_keys=True, indent=2)
+                handle.write('\n')
+                handle.flush()
+                os.fsync(handle.fileno())
+            if Api._structure_directory_identity(batch_dir) != expected_identity:
+                raise ValueError('Candidate batch directory identity changed during recovery save')
+            os.replace(temporary, os.path.join(batch_dir, _STRUCTURE_RECOVERY_NAME))
+            temporary = None
+            try:
+                flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
+                directory_fd = os.open(batch_dir, flags)
+            except OSError:
+                pass
+            else:
+                try:
+                    os.fsync(directory_fd)
+                except OSError:
+                    pass
+                finally:
+                    os.close(directory_fd)
+        finally:
+            if temporary:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+
+    @staticmethod
     def _structure_candidate_stem(candidate, index):
         site = candidate.get('site') if isinstance(candidate.get('site'), dict) else {}
         term = (candidate.get('termination')
@@ -13510,31 +13673,367 @@ class Api:
         safe = re.sub(r'[^A-Za-z0-9_.-]+', '-', hint).strip('-.')[:48]
         return f'{index + 1:03d}-{safe or "candidate"}-{candidate["structure_hash"][:10]}'
 
+    @staticmethod
+    def _structure_recovery_binding(member):
+        keys = (
+            'schema', 'operation_id', 'batch_id', 'job_id', 'job_name',
+            'structure_hash', 'poscar_size', 'poscar_sha256',
+            'destination_directory_identity', 'batch_directory_identity',
+            'job_directory_identity', 'poscar_file_identity',
+        )
+        return {key: copy.deepcopy(member.get(key)) for key in keys}
+
+    @staticmethod
+    def _structure_recovery_public(member):
+        """Derive the browser projection only from immutable recovery fields."""
+        return {
+            'job_id': str(member.get('job_id') or ''),
+            'structure_hash': str(member.get('structure_hash') or ''),
+            'scientific_status': 'candidate',
+            'state': 'CREATED',
+            'submission_ready': False,
+        }
+
+    def _structure_freeze_recovery_authority(
+            self, stage, destination_identity, operation_id, batch_id, staged_records):
+        """在 batch 发布前冻结目录实体、POSCAR 内容和 manifest 绑定。"""
+        batch_identity = self._structure_directory_identity(stage)
+        members = []
+        for record in staged_records:
+            job_dir = os.path.join(stage, record['job_name'])
+            job_identity = self._structure_directory_identity(job_dir)
+            poscar = self._structure_file_evidence(os.path.join(job_dir, 'POSCAR'))
+            if (poscar['sha256'] != record['poscar_sha256']
+                    or poscar['size'] != record['poscar_size']):
+                raise ValueError('Staged POSCAR does not match its frozen candidate')
+            member = {
+                'schema': _STRUCTURE_RECOVERY_BINDING_SCHEMA,
+                'operation_id': operation_id,
+                'batch_id': batch_id,
+                'job_id': record['job_id'],
+                'job_name': record['job_name'],
+                'structure_hash': record['structure_hash'],
+                'poscar_size': poscar['size'],
+                'poscar_sha256': poscar['sha256'],
+                'destination_directory_identity': copy.deepcopy(destination_identity),
+                'batch_directory_identity': copy.deepcopy(batch_identity),
+                'job_directory_identity': copy.deepcopy(job_identity),
+                'poscar_file_identity': copy.deepcopy(poscar['identity']),
+            }
+            member['binding_sha256'] = self._structure_binding_hash(
+                self._structure_recovery_binding(member))
+            manifest = self._manifest.load_manifest(job_dir)
+            if not isinstance(manifest, dict):
+                raise ValueError('Staged candidate manifest is unreadable')
+            manifest['registration_recovery'] = copy.deepcopy(member)
+            manifest['registration_recovery'].pop('public', None)
+            self._manifest.save_manifest(job_dir, manifest)
+            members.append(member)
+        now = datetime.now(timezone.utc).isoformat()
+        authority = {
+            'schema': _STRUCTURE_RECOVERY_SCHEMA,
+            'operation_id': operation_id,
+            'batch_id': batch_id,
+            'destination_directory_identity': copy.deepcopy(destination_identity),
+            'batch_directory_identity': copy.deepcopy(batch_identity),
+            'created_at': now,
+            'updated_at': now,
+            'status': 'registration_pending',
+            'members': members,
+            'registration_pending': [member['job_id'] for member in members],
+            'corruptions': [],
+            'result': None,
+        }
+        self._structure_write_recovery_authority(stage, authority, batch_identity)
+        return authority
+
+    def _structure_read_recovery_authority(self, batch_dir, expected_operation_id=None):
+        batch_identity = self._structure_directory_identity(batch_dir)
+        evidence = self._structure_file_evidence(
+            os.path.join(batch_dir, _STRUCTURE_RECOVERY_NAME), include_bytes=True)
+        try:
+            authority = json.loads(evidence['bytes'].decode('utf-8'))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError('Candidate batch recovery authority is unreadable') from exc
+        if not isinstance(authority, dict) or authority.get('schema') != _STRUCTURE_RECOVERY_SCHEMA:
+            raise ValueError('Candidate batch recovery authority has an invalid schema')
+        operation_id = str(authority.get('operation_id') or '').lower()
+        batch_id = str(authority.get('batch_id') or '')
+        if not re.fullmatch(r'[a-f0-9]{32}', operation_id):
+            raise ValueError('Candidate batch recovery authority has an invalid operation id')
+        if expected_operation_id and operation_id != expected_operation_id:
+            raise ValueError('Candidate batch recovery authority belongs to another operation')
+        if batch_id != os.path.basename(os.path.normpath(batch_dir)):
+            raise ValueError('Candidate batch recovery authority has an invalid batch id')
+        if authority.get('batch_directory_identity') != batch_identity:
+            raise ValueError('Candidate batch directory identity changed after creation')
+        if not isinstance(authority.get('destination_directory_identity'), dict):
+            raise ValueError('Candidate recovery destination identity is invalid')
+        members = authority.get('members')
+        if not isinstance(members, list) or not members or len(members) > 256:
+            raise ValueError('Candidate batch recovery authority has invalid members')
+        job_ids = [str(member.get('job_id') or '') for member in members
+                   if isinstance(member, dict)]
+        job_names = [str(member.get('job_name') or '') for member in members
+                     if isinstance(member, dict)]
+        if (len(job_ids) != len(members)
+                or len(set(job_ids)) != len(job_ids)
+                or len(set(job_names)) != len(job_names)):
+            raise ValueError('Candidate batch recovery authority has duplicate members')
+        pending = authority.get('registration_pending')
+        if (not isinstance(pending, list)
+                or any(not isinstance(value, str) for value in pending)
+                or len(set(pending)) != len(pending)
+                or not set(pending).issubset(set(job_ids))):
+            raise ValueError('Candidate batch recovery authority has invalid pending members')
+        status = authority.get('status')
+        if status not in {'registration_pending', 'complete', 'corrupt'}:
+            raise ValueError('Candidate batch recovery authority has an invalid status')
+        if status == 'complete' and pending:
+            raise ValueError('Completed candidate recovery authority still has pending members')
+        return authority
+
+    def _structure_operation_from_authority(self, batch_dir, authority, destination_id):
+        status = 'complete' if authority.get('status') == 'complete' else 'registration_pending'
+        return {
+            'created_at': time.monotonic(),
+            'status': status,
+            'operation_id': authority['operation_id'],
+            'batch_id': authority['batch_id'],
+            'final_batch': batch_dir,
+            'destination_id': destination_id,
+            'job_records': [
+                {'job_name': member.get('job_name'),
+                 'public': self._structure_recovery_public(member)}
+                for member in authority['members']
+            ],
+            'result': copy.deepcopy(authority.get('result')),
+        }
+
+    def _structure_load_recovery_operation(self, root, operation_id, destination_id):
+        batch_id = f'structure-candidates-{operation_id[:12]}'
+        batch_dir = os.path.join(root, batch_id)
+        authority = self._structure_read_recovery_authority(batch_dir, operation_id)
+        if authority.get('destination_directory_identity') != self._structure_directory_identity(root):
+            raise ValueError('Candidate recovery destination directory identity changed')
+        operation = self._structure_operation_from_authority(
+            batch_dir, authority, destination_id)
+        self._structure_operations[operation_id] = operation
+        return operation
+
+    def _structure_scan_recovery_authorities(self, root, destination_id):
+        """选择输出目录时扫描持久 authority，使进程重启后仍可显式恢复。"""
+        try:
+            entries = list(os.scandir(root))
+        except OSError:
+            return
+        candidates = [
+            entry for entry in entries
+            if entry.name.startswith('structure-candidates-')
+            and entry.is_dir(follow_symlinks=False)
+        ]
+        for entry in sorted(candidates, key=lambda item: item.name)[:256]:
+            try:
+                authority = self._structure_read_recovery_authority(entry.path)
+                if authority.get('destination_directory_identity') != (
+                        self._structure_directory_identity(root)):
+                    continue
+                operation = self._structure_operation_from_authority(
+                    entry.path, authority, destination_id)
+            except Exception:                             # noqa: BLE001 untrusted sibling ignored
+                continue
+            existing = self._structure_operations.get(authority['operation_id'])
+            if not existing or existing.get('status') in {
+                    'registration_pending', 'corrupt', 'complete'}:
+                self._structure_operations[authority['operation_id']] = operation
+
+    def _structure_validate_recovery_member(self, operation, authority, member):
+        def corrupt(code):
+            raise ValueError(code)
+
+        if not isinstance(member, dict):
+            corrupt('invalid_member_record')
+        job_name = str(member.get('job_name') or '')
+        job_id = str(member.get('job_id') or '')
+        if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', job_name)
+                or os.path.basename(job_name) != job_name):
+            corrupt('invalid_job_name')
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', job_id):
+            corrupt('invalid_job_id')
+        binding = self._structure_recovery_binding(member)
+        if binding.get('schema') != _STRUCTURE_RECOVERY_BINDING_SCHEMA:
+            corrupt('invalid_binding_schema')
+        if (binding.get('operation_id') != operation['operation_id']
+                or binding.get('batch_id') != operation['batch_id']
+                or binding.get('destination_directory_identity')
+                != authority.get('destination_directory_identity')
+                or binding.get('batch_directory_identity')
+                != authority.get('batch_directory_identity')):
+            corrupt('candidate_binding_mismatch')
+        if member.get('binding_sha256') != self._structure_binding_hash(binding):
+            corrupt('candidate_binding_hash_mismatch')
+        job_dir = os.path.join(operation['final_batch'], job_name)
+        try:
+            job_identity = self._structure_directory_identity(job_dir)
+        except Exception as exc:                          # noqa: BLE001 mapped to public code
+            raise ValueError('job_directory_unavailable') from exc
+        if job_identity != member.get('job_directory_identity'):
+            corrupt('job_directory_identity_mismatch')
+        try:
+            poscar = self._structure_file_evidence(os.path.join(job_dir, 'POSCAR'))
+        except Exception as exc:                          # noqa: BLE001 mapped to public code
+            raise ValueError('poscar_unreadable_or_reparse') from exc
+        if poscar['identity'] != member.get('poscar_file_identity'):
+            corrupt('poscar_file_identity_mismatch')
+        if poscar['size'] != member.get('poscar_size'):
+            corrupt('poscar_size_mismatch')
+        if poscar['sha256'] != member.get('poscar_sha256'):
+            corrupt('poscar_sha256_mismatch')
+        try:
+            manifest_evidence = self._structure_file_evidence(
+                os.path.join(job_dir, 'job.yaml'), include_bytes=True)
+            manifest = yaml.safe_load(manifest_evidence['bytes'].decode('utf-8'))
+        except Exception as exc:                          # noqa: BLE001 mapped to public code
+            raise ValueError('manifest_unreadable_or_reparse') from exc
+        if not isinstance(manifest, dict):
+            corrupt('manifest_unreadable_or_reparse')
+        if manifest.get('job_id') != job_id or manifest.get('job_uuid') != job_id:
+            corrupt('manifest_job_id_mismatch')
+        inputs = manifest.get('inputs') if isinstance(manifest.get('inputs'), dict) else {}
+        hub = (inputs.get('structure_hub')
+               if isinstance(inputs.get('structure_hub'), dict) else {})
+        if (hub.get('operation_id') != operation['operation_id']
+                or hub.get('structure_hash') != member.get('structure_hash')
+                or inputs.get('poscar_sha256') != member.get('poscar_sha256')):
+            corrupt('manifest_candidate_binding_mismatch')
+        manifest_binding = manifest.get('registration_recovery')
+        expected_manifest_binding = copy.deepcopy(member)
+        expected_manifest_binding.pop('public', None)
+        if manifest_binding != expected_manifest_binding:
+            corrupt('manifest_recovery_binding_mismatch')
+        registration = manifest.get('registration')
+        if not isinstance(registration, dict):
+            corrupt('manifest_registration_state_invalid')
+        registration_pending = manifest.get('registration_pending')
+        if not isinstance(registration_pending, bool):
+            corrupt('manifest_registration_state_invalid')
+        expected_status = 'pending' if registration_pending else 'registered'
+        if registration.get('status') != expected_status:
+            corrupt('manifest_registration_state_invalid')
+        return {
+            'member': member, 'manifest': manifest, 'job_dir': job_dir,
+            'public': self._structure_recovery_public(member),
+        }
+
+    def _structure_validate_recovery(self, operation):
+        authority = self._structure_read_recovery_authority(
+            operation['final_batch'], operation['operation_id'])
+        root = os.path.dirname(operation['final_batch'])
+        if authority.get('destination_directory_identity') != (
+                self._structure_directory_identity(root)):
+            raise ValueError('destination_directory_identity_mismatch')
+        validated = []
+        corruptions = []
+        for member in authority['members']:
+            try:
+                validated.append(
+                    self._structure_validate_recovery_member(operation, authority, member))
+            except Exception as exc:                      # noqa: BLE001 mapped to public code
+                corruptions.append({
+                    'job_id': str((member or {}).get('job_id') or 'unknown'),
+                    'code': str(exc) or 'recovery_integrity_failure',
+                })
+        return authority, validated, corruptions
+
+    def _structure_corruption_result(self, operation, authority, corruptions, *, replayed):
+        member_ids = [
+            str(member.get('job_id') or 'unknown')
+            for member in authority['members']
+        ]
+        all_ids = list(dict.fromkeys([
+            *[str(value) for value in authority.get('registration_pending') or []],
+            *[str(item.get('job_id') or 'unknown') for item in corruptions],
+        ])) or member_ids
+        authority.update({
+            'status': 'corrupt',
+            'updated_at': datetime.now(timezone.utc).isoformat(),
+            'registration_pending': all_ids,
+            'corruptions': copy.deepcopy(corruptions),
+            'result': None,
+        })
+        if (authority.get('operation_id') == operation.get('operation_id')
+                and authority.get('batch_id') == operation.get('batch_id')):
+            try:
+                self._structure_write_recovery_authority(
+                    operation['final_batch'], authority,
+                    authority['batch_directory_identity'])
+            except Exception:                             # noqa: BLE001 corruption remains fail-closed
+                pass
+        result = self._structure_sanitize({
+            'ok': False, 'partial': True, 'replayed': bool(replayed),
+            'corruption': True, 'recovery_status': 'corrupt',
+            'operation_id': operation['operation_id'],
+            'scientific_status': 'candidate', 'batch_id': operation['batch_id'],
+            'jobs': [], 'registration_pending': all_ids,
+            'discoverability': 'partial', 'corruptions': corruptions,
+            'warnings': [
+                'Candidate recovery integrity failed; ledger registration was not attempted.'
+            ],
+            'submission': 'not_performed', 'promotion': 'not_performed',
+            'error': 'Candidate batch corruption detected; registration remains pending.',
+        })
+        operation['status'] = 'registration_pending'
+        operation['last_result'] = copy.deepcopy(result)
+        return result
+
     def _structure_resume_registration(self, operation, *, replayed):
-        """只补 registration_pending 作业；全部入账前绝不标 complete。"""
+        """从持久 authority 预检后只补 pending；任何篡改都禁止 ledger 调用。"""
+        try:
+            authority, validated, corruptions = self._structure_validate_recovery(operation)
+        except Exception as exc:                          # noqa: BLE001 mapped to public code
+            fallback = {
+                'schema': _STRUCTURE_RECOVERY_SCHEMA,
+                'members': operation.get('job_records') or [],
+                'batch_directory_identity': {},
+            }
+            return self._structure_corruption_result(
+                operation, fallback,
+                [{'job_id': 'unknown', 'code': str(exc) or 'authority_invalid'}],
+                replayed=replayed)
+        if corruptions:
+            return self._structure_corruption_result(
+                operation, authority, corruptions, replayed=replayed)
         pending = []
         warnings = []
         jobs = []
         now = datetime.now(timezone.utc).isoformat()
-        for record in operation.get('job_records') or []:
-            public = copy.deepcopy(record['public'])
-            job_dir = os.path.join(operation['final_batch'], record['job_name'])
-            manifest = self._manifest.load_manifest(job_dir)
-            if not isinstance(manifest, dict):
-                public['registration_pending'] = True
-                pending.append(public['job_id'])
-                warnings.append('A candidate manifest is unreadable; ledger registration remains pending.')
-                jobs.append(public)
-                continue
+        authority_pending = {
+            str(value) for value in authority.get('registration_pending') or []
+        }
+        for item in validated:
+            public = item['public']
+            job_dir = item['job_dir']
+            manifest = item['manifest']
             registration = dict(manifest.get('registration') or {})
             already_registered = (
                 manifest.get('registration_pending') is False
                 and registration.get('status') == 'registered'
+                and public.get('job_id') not in authority_pending
             )
             if already_registered:
                 public['registration_pending'] = False
                 jobs.append(public)
                 continue
+            try:
+                current = self._structure_validate_recovery_member(
+                    operation, authority, item['member'])
+            except ValueError as exc:
+                return self._structure_corruption_result(
+                    operation, authority,
+                    [{'job_id': public['job_id'], 'code': str(exc)}],
+                    replayed=replayed)
+            manifest = current['manifest']
+            registration = dict(manifest.get('registration') or {})
             attempts = int(registration.get('attempts') or 0) + 1
             try:
                 self._ledger.register(job_dir)
@@ -13584,6 +14083,19 @@ class Api:
                 'submission': 'not_performed', 'promotion': 'not_performed',
                 'error': 'Candidate files exist, but ledger registration is incomplete.',
             })
+            authority.update({
+                'status': 'registration_pending', 'updated_at': now,
+                'registration_pending': list(pending), 'corruptions': [],
+                'result': None,
+            })
+            try:
+                self._structure_write_recovery_authority(
+                    operation['final_batch'], authority,
+                    authority['batch_directory_identity'])
+            except Exception as exc:                      # noqa: BLE001 remain pending
+                result['warnings'].append(
+                    'Batch recovery authority update remains pending: '
+                    + self._structure_sanitize(str(exc)))
             operation['status'] = 'registration_pending'
             operation['last_result'] = copy.deepcopy(result)
             return result
@@ -13596,6 +14108,26 @@ class Api:
             'submission': 'not_performed', 'promotion': 'not_performed',
             'error': None,
         })
+        authority.update({
+            'status': 'complete', 'updated_at': now,
+            'registration_pending': [], 'corruptions': [],
+            'result': copy.deepcopy(result),
+        })
+        try:
+            self._structure_write_recovery_authority(
+                operation['final_batch'], authority,
+                authority['batch_directory_identity'])
+        except Exception as exc:                          # noqa: BLE001 completion must be durable
+            operation['status'] = 'registration_pending'
+            return self._structure_sanitize({
+                **result, 'ok': False, 'partial': True,
+                'registration_pending': [], 'recovery_pending': True,
+                'discoverability': 'partial',
+                'warnings': result['warnings'] + [
+                    'Ledger markers are complete but batch recovery authority is not durable.'
+                ],
+                'error': self._structure_sanitize(str(exc)),
+            })
         operation['status'] = 'complete'
         operation['result'] = copy.deepcopy(result)
         return result
@@ -13616,14 +14148,23 @@ class Api:
             self._structure_hub_prune()
             operation = self._structure_operations.get(operation_id)
             destination = self._structure_output_selections.get(destination_id)
-            if not operation or not destination:
+            if not destination:
                 failure['error'] = 'Candidate operation or output selection is missing or expired'
                 return failure
+            if not operation:
+                try:
+                    operation = self._structure_load_recovery_operation(
+                        destination['path'], operation_id, destination_id)
+                except Exception:                         # noqa: BLE001 path-free recovery miss
+                    failure['error'] = (
+                        'Candidate operation is expired and no valid persistent recovery '
+                        'authority was found')
+                    return failure
             if operation.get('status') == 'complete':
                 if operation.get('destination_id') != destination_id:
                     failure['error'] = 'Candidate operation is bound to a different output selection'
                     return failure
-                return {**copy.deepcopy(operation['result']), 'replayed': True}
+                return self._structure_resume_registration(operation, replayed=True)
             try:
                 current_identity = self._structure_directory_identity(destination['path'])
             except Exception as exc:                       # noqa: BLE001 fail closed at entity boundary
@@ -13654,8 +14195,7 @@ class Api:
                     raise FileExistsError(
                         'A candidate batch with this operation identity already exists')
                 stage = tempfile.mkdtemp(prefix='.vcstudio-structure-', dir=root)
-                public_jobs = []
-                staged_dirs = []
+                staged_records = []
                 for index, candidate in enumerate(operation['candidates']):
                     job_id = ('structure-' + candidate['structure_hash'][:20]
                               + f'-{index + 1:03d}')
@@ -13714,22 +14254,34 @@ class Api:
                         'last_attempt_at': None, 'last_error': None,
                     }
                     self._manifest.save_manifest(job_dir, manifest)
-                    staged_dirs.append((job_dir, job_name))
-                    public_jobs.append({
+                    public = {
                         'job_id': job_id, 'structure_hash': candidate['structure_hash'],
                         'scientific_status': 'candidate', 'state': 'CREATED',
                         'submission_ready': False, 'registration_pending': True,
+                    }
+                    staged_records.append({
+                        'job_name': job_name, 'job_id': job_id,
+                        'structure_hash': candidate['structure_hash'],
+                        'poscar_sha256': candidate['poscar_sha256'],
+                        'poscar_size': len(candidate['poscar'].encode('utf-8')),
+                        'public': public,
                     })
+                authority = self._structure_freeze_recovery_authority(
+                    stage, destination['identity'], operation_id, batch_id,
+                    staged_records)
                 if self._structure_directory_identity(root) != destination['identity']:
                     raise RuntimeError('The selected output directory entity changed during creation')
                 os.replace(stage, final_batch)
                 stage = None
+                if self._structure_directory_identity(final_batch) != (
+                        authority['batch_directory_identity']):
+                    raise RuntimeError('The candidate batch identity changed during publication')
                 operation.update({
                     'status': 'registration_pending', 'operation_id': operation_id,
                     'batch_id': batch_id, 'final_batch': final_batch,
                     'job_records': [
-                        {'job_name': job_name, 'public': public}
-                        for (_old_dir, job_name), public in zip(staged_dirs, public_jobs)
+                        {'job_name': record['job_name'], 'public': record['public']}
+                        for record in staged_records
                     ],
                 })
                 return self._structure_resume_registration(operation, replayed=False)
@@ -13741,6 +14293,40 @@ class Api:
             finally:
                 if stage:
                     shutil.rmtree(stage, ignore_errors=True)
+
+    def surface_recover_candidates(self, operation_token, output_token):
+        """显式扫描 batch authority，供 operation TTL 或进程重启后幂等补登记。"""
+        operation_id = str(operation_token or '').strip().lower()
+        destination_id = str(output_token or '').strip().lower()
+        failure = {
+            'ok': False, 'partial': True, 'replayed': True,
+            'operation_id': operation_id or None,
+            'scientific_status': 'candidate', 'batch_id': None,
+            'jobs': [], 'registration_pending': [], 'warnings': [],
+            'discoverability': 'partial', 'error': None,
+        }
+        if (not re.fullmatch(r'[a-f0-9]{32}', operation_id)
+                or not re.fullmatch(r'[a-f0-9]{32}', destination_id)):
+            failure['error'] = 'Candidate recovery operation or output selection is invalid'
+            return failure
+        with self._structure_hub_lock:
+            self._structure_hub_prune()
+            destination = self._structure_output_selections.get(destination_id)
+            if not destination:
+                failure['error'] = 'Candidate recovery output selection is missing or expired'
+                return failure
+            try:
+                if self._structure_directory_identity(destination['path']) != (
+                        destination['identity']):
+                    raise ValueError('destination_directory_identity_mismatch')
+                operation = self._structure_load_recovery_operation(
+                    destination['path'], operation_id, destination_id)
+            except Exception as exc:                      # noqa: BLE001 explicit structured failure
+                failure['error'] = (
+                    'Persistent candidate recovery authority is unavailable or invalid: '
+                    + self._structure_sanitize(str(exc)))
+                return failure
+            return self._structure_resume_registration(operation, replayed=True)
 
     # ── 金属 slab 建模(兼容入口;新向导不再向此处扩硬编码) ────────────────────────
     def metal_slab_catalog(self):

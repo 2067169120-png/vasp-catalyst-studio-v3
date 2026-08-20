@@ -5,6 +5,7 @@ import copy
 import json
 import os
 from pathlib import Path
+import shutil
 import types
 
 import pytest
@@ -593,6 +594,163 @@ def test_registration_partial_failure_persists_and_replays_only_missing_job(tmp_
         dry_run["operation_token"], destination["output_token"])
     assert stable == {**completed, "replayed": True}
     assert len(ledger.calls) == 3
+
+
+def test_registration_recovery_rejects_tampered_poscar_same_process_and_restart(tmp_path):
+    ledger = _FlakyLedger()
+    api, _sources, _registrations, _source, output = _api(
+        tmp_path, ledger=ledger, surface=_TwoCandidateSurface)
+    confirmed = api.structure_source_confirm("1" * 32)["source_token"]
+    dry_run = api.surface_dry_run(confirmed, {"miller": [1, 0, 0]}, {})
+    destination = api.structure_output_select()
+    partial = api.surface_create_candidates(
+        dry_run["operation_token"], destination["output_token"])
+    assert partial["ok"] is False and len(ledger.calls) == 2
+
+    batch = next(path for path in output.iterdir() if path.is_dir())
+    authority_path = batch / ".vcstudio-structure-recovery.json"
+    authority = json.loads(authority_path.read_text(encoding="utf-8"))
+    assert authority["schema"] == "vcstudio.structure-recovery/v1"
+    assert authority["batch_directory_identity"]
+    assert all(member["job_directory_identity"] for member in authority["members"])
+    assert all(member["binding_sha256"] for member in authority["members"])
+    pending_id = partial["registration_pending"][0]
+    pending_member = next(
+        member for member in authority["members"] if member["job_id"] == pending_id)
+    pending_dir = batch / pending_member["job_name"]
+    pending_manifest_path = pending_dir / "job.yaml"
+    pending_manifest = yaml.safe_load(pending_manifest_path.read_text(encoding="utf-8"))
+    assert pending_manifest["registration_recovery"]["binding_sha256"] == (
+        pending_member["binding_sha256"])
+    with (pending_dir / "POSCAR").open("a", encoding="utf-8") as handle:
+        handle.write("tampered\n")
+
+    same_process = api.surface_create_candidates(
+        dry_run["operation_token"], destination["output_token"])
+    assert same_process["ok"] is False
+    assert same_process["corruption"] is True
+    assert same_process["recovery_status"] == "corrupt"
+    assert any(
+        item["code"] in {"poscar_size_mismatch", "poscar_sha256_mismatch"}
+        for item in same_process["corruptions"]
+    )
+    assert len(ledger.calls) == 2
+    still_pending = yaml.safe_load(pending_manifest_path.read_text(encoding="utf-8"))
+    assert still_pending["registration_pending"] is True
+
+    restarted, _sources2, _registrations2, _source2, _output2 = _api(
+        tmp_path, ledger=ledger, surface=_TwoCandidateSurface)
+    restarted_destination = restarted.structure_output_select()
+    after_restart = restarted.surface_recover_candidates(
+        dry_run["operation_token"], restarted_destination["output_token"])
+    assert after_restart["ok"] is False
+    assert after_restart["corruption"] is True
+    assert len(ledger.calls) == 2
+    assert yaml.safe_load(pending_manifest_path.read_text(encoding="utf-8"))[
+        "registration_pending"] is True
+
+
+def test_registration_recovery_after_restart_only_registers_pending_member(tmp_path):
+    ledger = _FlakyLedger()
+    api, _sources, _registrations, _source, output = _api(
+        tmp_path, ledger=ledger, surface=_TwoCandidateSurface)
+    confirmed = api.structure_source_confirm("1" * 32)["source_token"]
+    dry_run = api.surface_dry_run(confirmed, {"miller": [1, 0, 0]}, {})
+    destination = api.structure_output_select()
+    partial = api.surface_create_candidates(
+        dry_run["operation_token"], destination["output_token"])
+    assert partial["ok"] is False and len(ledger.calls) == 2
+
+    restarted, _sources2, _registrations2, _source2, _output2 = _api(
+        tmp_path, ledger=ledger, surface=_TwoCandidateSurface)
+    restarted_destination = restarted.structure_output_select()
+    completed = restarted.surface_recover_candidates(
+        dry_run["operation_token"], restarted_destination["output_token"])
+
+    assert completed["ok"] is True
+    assert completed["replayed"] is True
+    assert completed["registration_pending"] == []
+    assert len(ledger.calls) == 3
+    assert sum("term-01" in name for name in ledger.calls) == 1
+    assert sum("term-02" in name for name in ledger.calls) == 2
+    batch = next(path for path in output.iterdir() if path.is_dir())
+    authority = json.loads(
+        (batch / ".vcstudio-structure-recovery.json").read_text(encoding="utf-8"))
+    assert authority["status"] == "complete"
+    assert authority["registration_pending"] == []
+    manifests = [
+        yaml.safe_load(path.read_text(encoding="utf-8"))
+        for path in batch.glob("*/job.yaml")
+    ]
+    assert manifests and all(item["registration_pending"] is False for item in manifests)
+
+    stable = restarted.surface_recover_candidates(
+        dry_run["operation_token"], restarted_destination["output_token"])
+    assert stable["ok"] is True and stable["replayed"] is True
+    assert len(ledger.calls) == 3
+
+
+def test_registration_recovery_rejects_replaced_job_directory_with_same_files(tmp_path):
+    ledger = _FlakyLedger()
+    api, _sources, _registrations, _source, output = _api(
+        tmp_path, ledger=ledger, surface=_TwoCandidateSurface)
+    confirmed = api.structure_source_confirm("1" * 32)["source_token"]
+    dry_run = api.surface_dry_run(confirmed, {"miller": [1, 0, 0]}, {})
+    destination = api.structure_output_select()
+    partial = api.surface_create_candidates(
+        dry_run["operation_token"], destination["output_token"])
+    batch = next(path for path in output.iterdir() if path.is_dir())
+    authority = json.loads(
+        (batch / ".vcstudio-structure-recovery.json").read_text(encoding="utf-8"))
+    pending_id = partial["registration_pending"][0]
+    member = next(item for item in authority["members"] if item["job_id"] == pending_id)
+    original = batch / member["job_name"]
+    displaced = batch / f"{member['job_name']}.displaced"
+    original.rename(displaced)
+    shutil.copytree(displaced, original)
+
+    result = api.surface_create_candidates(
+        dry_run["operation_token"], destination["output_token"])
+
+    assert result["ok"] is False and result["corruption"] is True
+    assert {item["code"] for item in result["corruptions"]} == {
+        "job_directory_identity_mismatch"
+    }
+    assert len(ledger.calls) == 2
+    assert yaml.safe_load((original / "job.yaml").read_text(encoding="utf-8"))[
+        "registration_pending"] is True
+
+
+def test_registration_recovery_rejects_manifest_operation_binding_tamper(tmp_path):
+    ledger = _FlakyLedger()
+    api, _sources, _registrations, _source, output = _api(
+        tmp_path, ledger=ledger, surface=_TwoCandidateSurface)
+    confirmed = api.structure_source_confirm("1" * 32)["source_token"]
+    dry_run = api.surface_dry_run(confirmed, {"miller": [1, 0, 0]}, {})
+    destination = api.structure_output_select()
+    partial = api.surface_create_candidates(
+        dry_run["operation_token"], destination["output_token"])
+    batch = next(path for path in output.iterdir() if path.is_dir())
+    authority = json.loads(
+        (batch / ".vcstudio-structure-recovery.json").read_text(encoding="utf-8"))
+    pending_id = partial["registration_pending"][0]
+    member = next(item for item in authority["members"] if item["job_id"] == pending_id)
+    manifest_path = batch / member["job_name"] / "job.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    manifest["inputs"]["structure_hub"]["operation_id"] = "0" * 32
+    manifest_path.write_text(
+        yaml.safe_dump(manifest, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    result = api.surface_create_candidates(
+        dry_run["operation_token"], destination["output_token"])
+
+    assert result["ok"] is False and result["corruption"] is True
+    assert {item["code"] for item in result["corruptions"]} == {
+        "manifest_candidate_binding_mismatch"
+    }
+    assert len(ledger.calls) == 2
+    assert yaml.safe_load(manifest_path.read_text(encoding="utf-8"))[
+        "registration_pending"] is True
 
 
 def test_success_dtos_and_manifest_provenance_are_recursively_sanitized(tmp_path):

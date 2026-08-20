@@ -352,14 +352,33 @@ def _is_cif_control(token: str) -> bool:
     )
 
 
-def _parse_cif_tables(content: str) -> tuple[dict[str, str], list[tuple[list[str], list[str]]]]:
+def _parse_cif_blocks(
+    content: str,
+) -> list[tuple[str, dict[str, str], list[tuple[list[str], list[str]]]]]:
+    """保留 ``data_`` 边界；字段和 loop 绝不跨 block 合并。"""
     tokens = _tokenize_cif(content)
-    scalars: dict[str, str] = {}
-    loops: list[tuple[list[str], list[str]]] = []
+    blocks: list[tuple[str, dict[str, str], list[tuple[list[str], list[str]]]]] = []
+    current: tuple[str, dict[str, str], list[tuple[list[str], list[str]]]] | None = None
+    names: set[str] = set()
     index = 0
     while index < len(tokens):
         token = tokens[index]
         lower = token.lower()
+        if lower.startswith("data_"):
+            name = token[5:].strip()
+            normalized_name = name.lower()
+            if not name or normalized_name in names:
+                raise StructureSourceValidationError(
+                    "CIF data_ block names must be non-empty and unique")
+            names.add(normalized_name)
+            current = (name, {}, [])
+            blocks.append(current)
+            index += 1
+            continue
+        if current is None:
+            raise StructureSourceValidationError(
+                "CIF fields must belong to an explicit data_ block")
+        _name, scalars, loops = current
         if lower == "loop_":
             index += 1
             headers: list[str] = []
@@ -399,14 +418,36 @@ def _parse_cif_tables(content: str) -> tuple[dict[str, str], list[tuple[list[str
             scalars[key] = value
             index += 2
             continue
-        if (
-            lower.startswith("data_") or lower.startswith("save_")
-            or lower in {"stop_", "global_"}
-        ):
+        if lower == "stop_":
             index += 1
             continue
+        if lower.startswith("save_") or lower == "global_":
+            raise StructureSourceValidationError(
+                "CIF save_/global_ scopes are unsupported; use one explicit data_ block")
         raise StructureSourceValidationError(f"unsupported CIF token outside a field: {token!r}")
-    return scalars, loops
+    if not blocks:
+        raise StructureSourceValidationError("CIF must contain an explicit data_ block")
+    return blocks
+
+
+def _parse_cif_tables(
+    content: str, cif_block: str | None = None,
+) -> tuple[dict[str, str], list[tuple[list[str], list[str]]]]:
+    blocks = _parse_cif_blocks(content)
+    if cif_block is None:
+        if len(blocks) != 1:
+            raise StructureSourceValidationError(
+                "CIF contains multiple data_ blocks; explicit cif_block selection is required")
+        return blocks[0][1], blocks[0][2]
+    selected = str(cif_block or "").strip()
+    if selected.lower().startswith("data_"):
+        selected = selected[5:]
+    if not selected or re.search(r"\s", selected):
+        raise StructureSourceValidationError("cif_block must name one explicit data_ block")
+    matches = [block for block in blocks if block[0].lower() == selected.lower()]
+    if len(matches) != 1:
+        raise StructureSourceValidationError("selected CIF data_ block does not exist")
+    return matches[0][1], matches[0][2]
 
 
 def _cif_number(value: str, *, field: str) -> float:
@@ -505,8 +546,8 @@ def _validate_cif_symmetry(
                 "CIF non-P1 symmetry requires expansion and is unsupported")
 
 
-def _parse_cif(content: str) -> ParsedStructure:
-    scalars, loops = _parse_cif_tables(content)
+def _parse_cif(content: str, cif_block: str | None = None) -> ParsedStructure:
+    scalars, loops = _parse_cif_tables(content, cif_block)
     _validate_cif_symmetry(scalars, loops)
     cell = _cif_cell(scalars)
     coordinate_tags = {
@@ -573,15 +614,19 @@ def _parse_cif(content: str) -> ParsedStructure:
     return _build_parsed_structure(atom_elements, cartesian, cell)
 
 
-def parse_structure_content(content: str, source_format: str) -> ParsedStructure:
+def parse_structure_content(
+    content: str, source_format: str, *, cif_block: str | None = None,
+) -> ParsedStructure:
     """解析本地结构内容并返回规范化结构；不执行 IO。"""
     if not isinstance(content, str) or not content.strip():
         raise StructureSourceValidationError("structure content must be non-empty text")
     normalized_format = str(source_format or "").strip().lower()
     if normalized_format == "poscar":
+        if cif_block is not None:
+            raise StructureSourceValidationError("cif_block is only valid for CIF content")
         return _parse_poscar(content)
     if normalized_format == "cif":
-        return _parse_cif(content)
+        return _parse_cif(content, cif_block)
     raise StructureSourceValidationError("source_format must be 'poscar' or 'cif'")
 
 
