@@ -79,6 +79,7 @@ def _build(tmp_path, *, failures=(), max_age_seconds=300, monotonic=None):
         species = next(iter(project["config_species"].values()))
         return {"reference_mode": "species", "rows": [{
             "name": "config", "species": next(iter(project["config_species"].values())),
+            "configuration_id": f"job-{records.index(record) + 1}",
             "delta_e": record["summary_energy"], "reference_valid": True,
             "reference_species": species, "reference_source": "OSZICAR:E0",
             "method_check": {"status": "verified"},

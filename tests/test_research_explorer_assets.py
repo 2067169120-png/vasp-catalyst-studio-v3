@@ -90,7 +90,7 @@ const absolute = 'C:\\private\\project\\project.yaml';
 const result = {
   ok: true, status: 'ready', error: null,
   freshness: { status: 'ready', age_seconds: 0.25, indexed_projects: 2,
-    indexed_jobs: 3, registry_total: 2 },
+    indexed_jobs: 3, registry_total: 2, registry_state: 'ready' },
   method_compatibility: { enabled: true, status: 'compatible',
     selected_method_fingerprint: 'method-safe', input_rows: 3,
     compatible_rows: 2, excluded_rows: 1 },
@@ -127,6 +127,7 @@ assert.match(host.innerHTML, /method-safe/);
 assert.match(host.innerHTML, /energy-single-gas-safe/);
 assert.match(host.innerHTML, /adsorption_energy · verified/);
 assert.match(host.innerHTML, /server-finalized DTO/);
+assert.match(host.innerHTML, /Registry state/);
 assert.match(host.innerHTML, /width:100%/);
 assert.match(host.innerHTML, /left:50%;top:50%/);
 assert.ok(!host.innerHTML.includes(absolute));

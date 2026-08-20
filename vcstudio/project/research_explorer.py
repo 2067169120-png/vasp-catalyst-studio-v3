@@ -19,7 +19,6 @@ import threading
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from vcstudio.project.research_views import (
@@ -46,9 +45,9 @@ MAX_TOTAL_ENTRIES = 8192
 MAX_NESTING_DEPTH = 32
 MAX_SCATTER_POINTS = 2000
 MAX_PROVENANCE_ATTEMPTS = 128
-MAX_SOURCE_FILES = 100_000
-MAX_SOURCE_FILE_BYTES = 256 * 1024 * 1024
-MAX_SOURCE_TOTAL_BYTES = 1024 * 1024 * 1024
+MAX_SOURCE_FILES = 50_000
+MAX_SOURCE_FILE_BYTES = 128 * 1024 * 1024
+MAX_SOURCE_TOTAL_BYTES = 256 * 1024 * 1024
 MAX_PUBLIC_FAILURES = 64
 
 _OPAQUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
@@ -396,25 +395,24 @@ def _summary_rows(summary: Any) -> dict[str, Mapping[str, Any]]:
     for row in summary.get("rows") or []:
         if not isinstance(row, Mapping):
             continue
-        for raw in (
-                row.get("job"), row.get("path"), row.get("source_job"),
-                row.get("name"), row.get("job_id"), row.get("configuration_id")):
-            if not raw:
-                continue
-            text = str(raw)
-            result[text.casefold()] = row
-            result[Path(text).name.casefold()] = row
-            if _PATH_RE.search(text) or os.path.sep in text:
-                result[_path_key(text)] = row
+        raw = row.get("configuration_id") or row.get("job_id")
+        identity = str(raw or "").strip()
+        if (not _OPAQUE_RE.fullmatch(identity) or _PATH_RE.search(identity)
+                or _SECRET_RE.search(identity)):
+            raise ResearchExplorerError(
+                "summary row lacks one unique opaque configuration identity")
+        if identity in result:
+            raise ResearchExplorerError(
+                "summary contains duplicate configuration identities")
+        result[identity] = row
     return result
 
 
 def _matching_summary_row(member: Mapping[str, str], manifest: Mapping[str, Any],
                           rows: Mapping[str, Mapping[str, Any]]) -> Mapping[str, Any]:
     candidates = (
-        member.get("path_key"), Path(member.get("path") or "").name.casefold(),
-        str(manifest.get("job_id") or "").casefold(),
-        str(manifest.get("system") or "").casefold(),
+        str(manifest.get("job_id") or ""),
+        str(manifest.get("job_uuid") or ""),
     )
     return next((rows[key] for key in candidates if key and key in rows), {})
 
@@ -729,6 +727,7 @@ class ResearchIndexService:
                 report_binding_resolver: Callable[[Mapping[str, Any]], Mapping[str, Any]
                                                   ] | None = None,
                 registry_total: int | None = None,
+                registry_state: str = "unknown",
                 registry_failures: Sequence[Mapping[str, Any]] = (),
                 source_version: Any = None) -> dict[str, Any]:
         # Authority reads and publication of the replacement snapshot are one
@@ -744,6 +743,7 @@ class ResearchIndexService:
                 validation_resolver=validation_resolver,
                 report_binding_resolver=report_binding_resolver,
                 registry_total=registry_total,
+                registry_state=registry_state,
                 registry_failures=registry_failures,
                 source_version=source_version,
             )
@@ -758,6 +758,7 @@ class ResearchIndexService:
                         report_binding_resolver: Callable[[Mapping[str, Any]], Mapping[str, Any]
                                                           ] | None,
                         registry_total: int | None,
+                        registry_state: str,
                         registry_failures: Sequence[Mapping[str, Any]],
                         source_version: Any) -> dict[str, Any]:
         entries: list[dict[str, Any]] = []
@@ -1070,6 +1071,8 @@ class ResearchIndexService:
             "built_monotonic": self._monotonic(),
             "status": status,
             "registry_total": registry_total,
+            "registry_state": _safe_label(
+                registry_state, fallback="unknown", maximum=32),
             "indexed_projects": indexed_projects,
             "indexed_jobs": len(entries),
             "failed_sources": failure_total,
@@ -1083,6 +1086,7 @@ class ResearchIndexService:
         return self._status_from_snapshot(self._snapshot, now=self._monotonic())
 
     def fail_closed(self, *, source_fingerprint: str, registry_total: int | None,
+                    registry_state: str = "unknown",
                     failures: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         """Publish a bounded non-scientific snapshot after an unstable read."""
         with self._lock:
@@ -1102,6 +1106,8 @@ class ResearchIndexService:
                 "built_monotonic": self._monotonic(),
                 "status": "partial",
                 "registry_total": registry_total,
+                "registry_state": _safe_label(
+                    registry_state, fallback="unknown", maximum=32),
                 "indexed_projects": 0,
                 "indexed_jobs": 0,
                 "failed_sources": len(safe_failures),
@@ -1312,6 +1318,7 @@ class ResearchIndexService:
                 "built_at": None, "age_seconds": None,
                 "max_age_seconds": self.max_age_seconds,
                 "registry_total": None, "indexed_projects": 0, "indexed_jobs": 0,
+                "registry_state": "unknown",
                 "failed_sources": None, "failures": [], "rebuildable": True,
             }
         age = max(0.0, now - float(snapshot["built_monotonic"]))
@@ -1320,6 +1327,7 @@ class ResearchIndexService:
             key: copy.deepcopy(snapshot[key])
             for key in (
                 "schema", "snapshot_id", "built_at", "registry_total",
+                "registry_state",
                 "indexed_projects", "indexed_jobs", "failed_sources", "failures",
                 "source_fingerprint")
         } | {

@@ -102,6 +102,7 @@ def _adsorption_summaries(records, values=(-2.1, -1.9), species=("Li2S8", "Li2S8
             "reference_mode": "species",
             "rows": [{
                 "name": "config",
+                "configuration_id": f"job-{record['project_id'].rsplit('-', 1)[-1]}",
                 "species": "Li2S8",
                 "delta_e": value,
                 "reference_valid": True,
@@ -182,6 +183,7 @@ def test_fingerprint_without_explicit_verified_status_stays_unverified(tmp_path)
             "reference_mode": "species",
             "rows": [{
                 "name": "config", "species": "Li2S8", "delta_e": -1.9,
+                "configuration_id": "job-2",
                 "reference_valid": True, "reference_species": "S8",
                 "reference_source": "OSZICAR:E0",
                 "method_check": {"status": "verified"},
@@ -280,6 +282,7 @@ def test_adsorption_provenance_lists_all_operands_and_requires_revalidated_repor
         "reference_mode": "species", "slab": (str(clean), -100.0),
         "rows": [{
             "name": "config", "job": str(config), "species": "Li2S8",
+            "configuration_id": "job-config",
             "delta_e": -2.0, "reference_valid": True,
             "reference_species": "Li2S8", "reference_job": str(reference),
             "reference_source": "OSZICAR:E0", "method_check": {"status": "verified"},
@@ -392,6 +395,7 @@ def test_single_gas_reference_contract_binds_identity_formula_and_three_operands
         "reference_mode": "single",
         "rows": [{
             "job": str(config), "name": "config", "species": "Li2S8",
+            "configuration_id": "job-config",
             "delta_e": -5.0, "reference_valid": True,
             "reference_job": str(gas), "reference_source": "OSZICAR:E0",
             "method_check": {"status": "verified"},
@@ -523,3 +527,43 @@ def test_registry_summary_manifest_and_total_entry_hard_budgets(monkeypatch, tmp
     _rebuild(entry_service, records, manifests)
     assert entry_service.query()["status"] == "partial"
     assert entry_service.index_status()["indexed_jobs"] == 1
+
+
+def test_summary_basename_alias_collision_fails_closed_without_opaque_identity(tmp_path):
+    paths = [tmp_path / side / "config" for side in ("left", "right")]
+    manifests = {}
+    for index, path in enumerate(paths, start=1):
+        path.mkdir(parents=True)
+        manifests[str(path)] = {
+            "job_id": f"job-{index}", "state": "DONE", "task_type": "static",
+            "inputs": {"engine": "vasp", "formula": "Pt4S",
+                       "source_id": f"source-{index}",
+                       "sha256": {"POSCAR": f"input-{index}"}},
+            "results": {"energy_e0_eV": -100.0 - index,
+                        "hashes": {"OUTCAR": f"output-{index}"}},
+        }
+    record = {
+        "project_id": "project-alias", "identity_fingerprint": "identity-alias",
+        "engine": "vasp", "method_status": "verified",
+        "project": {
+            "name": "Alias collision", "members": {
+                "clean_slab": None, "gas_ref": None,
+                "configs": [str(path) for path in paths]},
+            "config_species": {str(path): "Li2S8" for path in paths},
+        },
+    }
+    summaries = {"project-alias": {
+        "reference_mode": "none",
+        "rows": [{
+            "name": "config", "delta_e": value,
+            "reference_valid": True, "reference_source": "OSZICAR:E0",
+            "method_check": {"status": "verified"},
+        } for value in (-1.0, -2.0)],
+    }}
+    service = ResearchIndexService()
+    _rebuild(service, [record], manifests, summaries=summaries)
+
+    result = service.query({"limit": 1})
+    assert result["ok"] is False
+    assert result["status"] == "partial"
+    assert result["table"]["rows"] == []

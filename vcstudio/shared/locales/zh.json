@@ -3609,6 +3609,7 @@
   "research.subtitle": "可重建索引只读派生自 registry / project.yaml / job.yaml / manifest / validation；它不是事实源。",
   "research.rebuild": "重建索引",
   "research.index_freshness": "索引 freshness",
+  "research.registry_state": "注册表状态",
   "research.table": "研究表格",
   "research.table_region": "跨项目研究结果",
   "research.method": "方法指纹",

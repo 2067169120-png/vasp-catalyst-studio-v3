@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from types import SimpleNamespace
+
+import pytest
 
 from vcstudio.gui_web.api import Api
 from vcstudio.project import adsorption
@@ -164,8 +167,11 @@ def test_vasp_method_adapter_emits_an_engine_versioned_schema(monkeypatch):
     monkeypatch.setattr(energy_gate, "method_record", lambda *_args: {
         "known": {key: True for key in (
             "functional", "dispersion", "encut", "spin",
-            "u_values", "u_by_element", "kpoints_scheme", "potcar_ids")},
+            "u_values", "u_by_element", "element_order",
+            "kpoints_scheme", "potcar_ids")},
         "fingerprint": {"functional": "PBE", "encut": 520},
+        "element_order": ["Fe", "O"],
+        "u_by_element": {"Fe": {"enabled": False}, "O": {"enabled": False}},
         "evidence_warnings": [],
     })
 
@@ -178,6 +184,44 @@ def test_vasp_method_adapter_emits_an_engine_versioned_schema(monkeypatch):
     assert evidence["schema"] == "vcstudio.method-fingerprint/vasp/v1"
     assert evidence["fingerprint"]["schema"] == evidence["schema"]
     assert evidence["adapter"].endswith("/vasp/v1")
+
+
+def test_vasp_method_fingerprint_binds_element_order_to_ldau_mapping(monkeypatch):
+    api = Api()
+    order = ["Fe", "O"]
+
+    def method_record(*_args):
+        mapping = ({"Fe": {"L": 2, "U": 4.0, "J": 0.0},
+                    "O": {"L": -1, "U": 0.0, "J": 0.0}}
+                   if order == ["Fe", "O"] else
+                   {"O": {"L": 2, "U": 4.0, "J": 0.0},
+                    "Fe": {"L": -1, "U": 0.0, "J": 0.0}})
+        return {
+            "known": {key: True for key in (
+                "functional", "dispersion", "encut", "spin", "u_values",
+                "u_by_element", "element_order", "kpoints_scheme", "potcar_ids")},
+            "fingerprint": {
+                "functional": "PBE", "encut": 520,
+                "u_values": {"LDAU": True, "LDAUU": "4 0"},
+            },
+            "u_by_element": mapping,
+            "element_order": list(order),
+            "evidence_warnings": [],
+        }
+
+    monkeypatch.setattr(energy_gate, "method_record", method_record)
+    target = {
+        "path": "unused", "source_id": "source-vasp",
+        "manifest": {"inputs": {"engine": "vasp"}},
+    }
+    first = api._analysis_workbench_method_evidence(target)
+    order[:] = ["O", "Fe"]
+    second = api._analysis_workbench_method_evidence(target)
+
+    assert first["status"] == second["status"] == "verified"
+    assert first["fingerprint"] != second["fingerprint"]
+    assert first["fingerprint"]["identity"]["element_order"] == ["Fe", "O"]
+    assert second["fingerprint"]["identity"]["element_order"] == ["O", "Fe"]
 
 
 def test_source_hash_detects_equal_size_equal_mtime_replacement_and_retries_toctou(
@@ -201,18 +245,19 @@ def test_source_hash_detects_equal_size_equal_mtime_replacement_and_retries_toct
     os.utime(job_yaml, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
 
     second = api.research_explorer_query()
+    assert second["ok"] is True, json.dumps(second.get("freshness"), ensure_ascii=False)
     assert second["table"]["rows"][0]["energy_eV"] == -223.4
     assert second["freshness"]["snapshot_id"] != first_snapshot
 
     # Mutate after the pre-build hash and after manifest read.  Post-build
     # revalidation must reject that publication and retry against new bytes.
-    original_loader = api._manifest.load_manifest
+    original_factory = api._research_snapshot_loaders
     mutated = False
 
-    def drifting_loader(path):
+    def drifting_factory(records, authority, temp_root):
         nonlocal mutated
-        value = original_loader(path)
-        if not mutated and os.path.normcase(str(path)) == os.path.normcase(str(job_yaml.parent)):
+        loaders = original_factory(records, authority, temp_root)
+        if not mutated:
             before = job_yaml.stat()
             current = job_yaml.read_bytes()
             changed = current.replace(b"-223.4", b"-923.4")
@@ -220,10 +265,9 @@ def test_source_hash_detects_equal_size_equal_mtime_replacement_and_retries_toct
             job_yaml.write_bytes(changed)
             os.utime(job_yaml, ns=(before.st_atime_ns, before.st_mtime_ns))
             mutated = True
-        return value
+        return loaders
 
-    monkeypatch.setattr(api._adsorption, "delta_e_rows", lambda _project: {"rows": []})
-    monkeypatch.setattr(api._manifest, "load_manifest", drifting_loader)
+    monkeypatch.setattr(api, "_research_snapshot_loaders", drifting_factory)
     final = api.research_explorer_rebuild()
 
     assert final["ok"] is True
@@ -266,3 +310,135 @@ def test_api_rejects_20000_member_project_before_manifest_or_summary_expansion(t
     assert manifest_calls == 0
     assert summary_calls == 0
     assert result["table"]["rows"] == []
+
+
+def test_trusted_snapshot_rejects_reparse_components_before_open(tmp_path, monkeypatch):
+    source = tmp_path / "member" / "job.yaml"
+    source.parent.mkdir()
+    source.write_text("state: DONE\n", encoding="utf-8")
+    real_lstat = os.lstat
+    opened = False
+
+    class ReparseStat:
+        def __init__(self, value):
+            for name in dir(value):
+                if name.startswith("st_"):
+                    try:
+                        setattr(self, name, getattr(value, name))
+                    except AttributeError:
+                        pass
+            self.st_file_attributes = 0x400
+
+    def lstat(path):
+        value = real_lstat(path)
+        if os.path.normcase(str(path)) == os.path.normcase(str(source.parent)):
+            return ReparseStat(value)
+        return value
+
+    real_open = os.open
+
+    def guarded_open(*args, **kwargs):
+        nonlocal opened
+        opened = True
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    monkeypatch.setattr(os, "open", guarded_open)
+    with pytest.raises(OSError, match="reparse|symlink"):
+        Api._research_source_file_snapshot(source)
+    assert opened is False
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory-share contract")
+def test_windows_snapshot_guard_blocks_parent_a_to_b_to_a_swap(tmp_path, monkeypatch):
+    parent = tmp_path / "A"
+    parent.mkdir()
+    source = parent / "job.yaml"
+    source.write_bytes(b"trusted-A")
+    displaced = tmp_path / "A-old"
+    original_impl = Api._research_source_file_snapshot_impl
+    swap_blocked = False
+
+    def guarded_impl(path):
+        nonlocal swap_blocked
+        try:
+            os.replace(parent, displaced)
+        except OSError:
+            swap_blocked = True
+        else:  # pragma: no cover - a merge-blocking Windows share regression
+            os.replace(displaced, parent)
+        return original_impl(path)
+
+    monkeypatch.setattr(Api, "_research_source_file_snapshot_impl", guarded_impl)
+    snapshot = Api._research_source_file_snapshot(source)
+
+    assert swap_blocked is True
+    assert snapshot["bytes"] == b"trusted-A"
+
+
+def test_arbitrary_fetched_file_and_frozen_revision_bytes_drive_freshness(
+        tmp_path, monkeypatch):
+    _registered_project(tmp_path)
+    api = Api()
+    api._analysis_workbench_method_evidence = lambda _target: {
+        "status": "verified", "engine": "vasp",
+        "schema": "vcstudio.method-fingerprint/vasp/v1",
+        "fingerprint": {"functional": "PBE", "dispersion": "D3"},
+        "missing": [],
+    }
+    job = tmp_path / "project" / "config"
+    fetched = job / "nested" / "evidence.bin"
+    fetched.parent.mkdir()
+    fetched.write_bytes(b"authority-A")
+    loaded = manifest.load_manifest(job)
+    loaded["results"]["fetched_sha256"] = {
+        "nested/evidence.bin": hashlib.sha256(fetched.read_bytes()).hexdigest()}
+    manifest.save_manifest(job, loaded)
+    first = api.research_explorer_query()
+    first_id = first["freshness"]["snapshot_id"]
+    stat = fetched.stat()
+    fetched.write_bytes(b"authority-B")
+    os.utime(fetched, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+    second = api.research_explorer_query()
+    assert second["freshness"]["snapshot_id"] != first_id
+    assert second["ok"] is False
+    assert second["status"] in {"partial", "unavailable"}
+    assert second["table"]["rows"] == []
+
+
+def test_corrupt_registry_is_not_projected_as_a_complete_empty_authority(
+        tmp_path, monkeypatch):
+    registry = tmp_path / "projects.json"
+    registry.write_bytes(b'{"projects": [')
+    monkeypatch.setattr(adsorption, "default_registry_path", lambda: registry)
+    api = Api()
+
+    result = api.research_explorer_query()
+
+    assert result["ok"] is False
+    assert result["status"] in {"partial", "unavailable"}
+    assert result["freshness"]["registry_state"] == "corrupt"
+    assert any(item["code"] == "registry_corrupt"
+               for item in result["freshness"]["failures"])
+    assert str(registry) not in json.dumps(result, ensure_ascii=False)
+
+
+def test_registry_authority_distinguishes_missing_from_explicit_empty(
+        tmp_path, monkeypatch):
+    registry = tmp_path / "projects.json"
+    monkeypatch.setattr(adsorption, "default_registry_path", lambda: registry)
+    missing = Api().research_explorer_query()
+    assert missing["ok"] is False
+    assert missing["freshness"]["registry_state"] == "missing"
+    assert missing["freshness"]["failures"] == [{
+        "project_ref": "registry", "code": "registry_missing"}]
+
+    registry.write_text('{"projects": []}\n', encoding="utf-8")
+    empty = Api().research_explorer_query()
+    assert empty["ok"] is True
+    assert empty["freshness"]["registry_state"] == "empty"
+    assert empty["freshness"]["failures"] == []
+    assert empty["table"]["rows"] == []
+    encoded = json.dumps({"missing": missing, "empty": empty}, ensure_ascii=False)
+    assert str(registry) not in encoded

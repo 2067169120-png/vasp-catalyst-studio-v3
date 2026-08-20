@@ -315,6 +315,8 @@
       <div class="rex-meta" aria-live="polite">${methodMarkup(result)}${energyMarkup(result)}
         <span><b>${esc(t('research.index_freshness', '索引 freshness', 'Index freshness'))}：</b>` +
           `${esc(freshness.age_seconds == null ? '—' : freshness.age_seconds)} s</span>
+        <span><b>${esc(t('research.registry_state', '注册表状态', 'Registry state'))}：</b>` +
+          `${esc(freshness.registry_state || 'unknown')}</span>
         <span><b>${esc(t('research.denominator', '分母', 'Denominator'))}：</b>` +
           `${esc(table.visible_count)} / ${esc(table.sample_count)} · ` +
           `${esc(freshness.indexed_projects || 0)} ${esc(t('research.projects', '项目', 'projects'))}</span>

@@ -249,6 +249,8 @@ def method_record(job_dir, manifest, label):
             for index, titel in enumerate(titels)
         ]
 
+    element_order = [str(row.get('element') or '') for row in provenance]
+
     fp = fingerprint_mod.extract_from_inputs(incar, kpoints, provenance)
     if fp.get('encut') is None and potcar_text:
         enmax_values = []
@@ -279,6 +281,11 @@ def method_record(job_dir, manifest, label):
         # evidence, not a known pseudopotential identity.  Treating it as known
         # invents a hard conflict against a fully identified reference job.
         'potcar_ids': potcar_identity_complete,
+        'element_order': (bool(element_order)
+                          and all(element_order)
+                          and len(element_order) == len(set(element_order))
+                          and not any(element.startswith('#')
+                                      for element in element_order)),
     }
     if incar:
         # 标准 VASP + PAW_PBE 下，未显式写 GGA 与 GGA=PE 同为 PBE，
@@ -385,7 +392,7 @@ def method_record(job_dir, manifest, label):
             # An omitted INCAR ENCUT was inferred from the now-drifted POTCAR.
             known['encut'] = False
     return {'label': label, 'fingerprint': fp, 'known': known,
-            'u_by_element': u_by_element,
+            'u_by_element': u_by_element, 'element_order': element_order,
             'evidence_warnings': evidence_warnings}
 
 

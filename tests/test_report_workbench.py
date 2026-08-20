@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -78,6 +79,7 @@ def _workbench_api(tmp_path):
             },
             "rows": [{
                 "name": "demo_ads_Li2S8",
+                "configuration_id": "job-config",
                 "species": "Li2S8",
                 "job": config,
                 "state": "DONE",
@@ -305,6 +307,28 @@ def test_research_live_report_edge_requires_revalidated_frozen_analysis_binding(
     assert report["origin_status"] == "observed"
     assert report["record"]["revision_id"] == published["revision"]["revision_id"]
 
+    history = json.loads((tmp_path / ".vcstudio" / "reports" / "history.json")
+                         .read_text(encoding="utf-8"))
+    revision_entry = next(
+        entry for lineage in history["reports"].values()
+        for entry in lineage["revisions"]
+        if entry["revision_id"] == published["revision"]["revision_id"])
+    frozen_snapshot = Path(revision_entry["contract_files"]["snapshot"])
+    frozen_bytes = frozen_snapshot.read_bytes()
+    frozen_stat = frozen_snapshot.stat()
+    frozen_snapshot.write_bytes(frozen_bytes + b" ")
+    os.utime(
+        frozen_snapshot,
+        ns=(frozen_stat.st_atime_ns, frozen_stat.st_mtime_ns))
+    damaged = api.research_explorer_query({"limit": 200})
+    assert damaged["ok"] is False
+    assert damaged["status"] in {"partial", "unavailable"}
+    assert damaged["table"]["rows"] == []
+    frozen_snapshot.write_bytes(frozen_bytes)
+    os.utime(
+        frozen_snapshot,
+        ns=(frozen_stat.st_atime_ns, frozen_stat.st_mtime_ns))
+
     config_path = state["project"]["members"]["configs"][0]
     manifests[config_path]["results"]["barrier_eV"] = 0.72
     mixed = api.research_explorer_rebuild({"limit": 200})
@@ -328,20 +352,19 @@ def test_research_live_report_edge_requires_revalidated_frozen_analysis_binding(
     (Path(config_path) / "OUTCAR").write_bytes(b"tampered output\n")
     stale_output = api.research_explorer_provenance(
         project_id, config["job_id"], config["source_id"])
+    assert stale_output["ok"] is False
+    assert stale_output["status"] in {"partial", "unavailable"}
     assert not any(edge["type"] == "reported_in" for edge in stale_output["edges"])
-    validation = next(
-        node for node in stale_output["nodes"]
-        if node["type"] == "validation" and node["id"] == "validation:job-config")
-    assert validation["record"]["evidence_level"] == "unverified"
+    assert stale_output["nodes"] == []
 
     (Path(config_path) / "OUTCAR").write_bytes(output_payloads[config_path])
     state["project"]["autopilot_report"]["revision"]["revision_id"] = "not-real"
     unbound = api.research_explorer_provenance(
         project_id, config["job_id"], config["source_id"])
+    assert unbound["ok"] is False
+    assert unbound["status"] in {"partial", "unavailable"}
     assert not any(edge["type"] == "reported_in" for edge in unbound["edges"])
-    unbound_report = next(
-        node for node in unbound["nodes"] if node["type"] == "report")
-    assert unbound_report["origin_status"] == "missing"
+    assert unbound["nodes"] == []
 
 
 def test_workbench_publish_rejects_source_change_after_preview(tmp_path):
@@ -579,6 +602,7 @@ def test_scoped_workbench_marker_replays_frozen_scope_for_current_status(tmp_pat
     }
     state["summary"]["rows"].append({
         "name": "demo_ads_Li2S6",
+        "configuration_id": "job-config-second",
         "species": "Li2S6",
         "job": second,
         "state": "DONE",

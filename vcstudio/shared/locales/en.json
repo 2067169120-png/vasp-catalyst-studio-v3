@@ -3609,6 +3609,7 @@
   "research.subtitle": "A rebuildable read-only index is derived from registry, project.yaml, job.yaml, manifests and validation; it is not a fact source.",
   "research.rebuild": "Rebuild index",
   "research.index_freshness": "Index freshness",
+  "research.registry_state": "Registry state",
   "research.table": "Research table",
   "research.table_region": "Cross-project research results",
   "research.method": "Method fingerprint",
