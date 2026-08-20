@@ -13,6 +13,7 @@ reuse-eligible conclusion.
 """
 from __future__ import annotations
 
+from collections import deque
 from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import dataclass
@@ -27,15 +28,44 @@ import shutil
 import time
 from typing import Any, Callable, Iterable, Mapping
 
+import yaml
+
+from vcstudio.generate.method_recipe import (
+    METHOD_RECIPE_AUTHORITY,
+    METHOD_RECIPE_SCHEMA,
+)
+from vcstudio.project.reuse_verification import verify_outputs
 from vcstudio.shared import manifest as manifest_mod
+from vcstudio.shared.execution_environment import (
+    validate_execution_environment,
+)
+from vcstudio.shared.scientific_inputs import (
+    INPUT_CLOSURE_SCHEMA,
+    closure_record_matches,
+    recorded_closure,
+    required_input_names,
+    resolve_input_closure,
+)
 
 
 FINGERPRINT_SCHEMA = "vcstudio.scientific-fingerprint/v1"
 INDEX_SCHEMA = "vcstudio.calculation-reuse-index/v1"
 ADVISORY_SCHEMA = "vcstudio.calculation-reuse-advisory/v1"
 REUSE_DECISION_SCHEMA = "vcstudio.calculation-reuse-decision/v1"
+FORCE_DECISION_SCHEMA = "vcstudio.force-recalculation-decision/v1"
 PROVENANCE_SCHEMA = "vcstudio.job-provenance/v1"
+AUTHORITATIVE_LOOKUP_SCHEMA = "vcstudio.authoritative-reuse-lookup/v1"
 INDEX_LIMIT = 512
+MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+MAX_MANIFEST_NODES = 100_000
+MAX_CANONICAL_TEXT_BYTES = 32 * 1024 * 1024
+MAX_POTCAR_BYTES = 512 * 1024 * 1024
+MAX_INPUT_FILE_BYTES = 128 * 1024 * 1024 * 1024
+MAX_AUTHORITATIVE_SCAN = 100_000
+MAX_AUTHORITATIVE_MATCHES = 128
+MAX_AUTHORITATIVE_VERIFICATIONS = 4096
+MAX_ADVISORY_TARGETS = 32
+MAX_ADVISORY_NEAR = 32
 
 _INPUT_FILES = ("POSCAR", "INCAR", "KPOINTS", "POTCAR")
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -265,75 +295,117 @@ def _recipe_binding(manifest: Mapping[str, Any]) -> tuple[dict[str, Any], list[s
     # not acquire authority merely because they contain hash-shaped text.
     digest = str(recipe.get("semantic_sha256") or "").strip().lower()
     schema = str(recipe.get("schema") or "").strip()
+    authority = str(recipe.get("authority") or "").strip()
     missing = []
     if not digest:
         missing.append("method_recipe.semantic_sha256")
     elif not _HEX64_RE.fullmatch(digest):
         missing.append("method_recipe.semantic_sha256_invalid")
-    if not schema:
-        missing.append("method_recipe.schema")
-    return {"schema": schema or None, "semantic_sha256": digest or None}, missing, not digest
+    if schema != METHOD_RECIPE_SCHEMA:
+        missing.append("method_recipe.schema_authority")
+    if authority != METHOD_RECIPE_AUTHORITY:
+        missing.append("method_recipe.authority")
+    return {
+        "schema": schema or None,
+        "authority": authority or None,
+        "semantic_sha256": digest or None,
+    }, missing, not digest
 
 
 def _environment_binding(manifest: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
     inputs = manifest.get("inputs") if isinstance(manifest.get("inputs"), Mapping) else {}
-    results = manifest.get("results") if isinstance(manifest.get("results"), Mapping) else {}
     environment = inputs.get("execution_environment")
     if not isinstance(environment, Mapping):
-        environment = inputs.get("environment")
-    if not isinstance(environment, Mapping):
-        environment = results.get("execution_environment")
-    if not isinstance(environment, Mapping):
-        environment = {}
-    vasp_version = str(
-        environment.get("vasp_version") or inputs.get("vasp_version") or ""
-    ).strip()
-    build_identity = str(
-        environment.get("build_identity")
-        or environment.get("vasp_build_sha256")
-        or environment.get("compiler_identity")
-        or inputs.get("vasp_build_identity")
-        or ""
-    ).strip()
-    creator = str(manifest.get("created_by") or "").strip()
-    value = {
-        "vasp_version": vasp_version or None,
-        "build_identity": build_identity or None,
-        "vcstudio_creator": creator or None,
-    }
-    missing = []
-    if not vasp_version:
-        missing.append("execution_environment.vasp_version")
-    if not build_identity:
-        missing.append("execution_environment.build_identity")
-    if not creator:
-        missing.append("created_by")
-    return value, missing
+        return {
+            "schema": None, "authority": None, "engine": None,
+            "vasp_version": None, "build_identity": None, "evidence": None,
+        }, ["execution_environment.authoritative_binding"]
+    try:
+        return validate_execution_environment(environment), []
+    except ValueError as exc:
+        return {
+            "schema": environment.get("schema"),
+            "authority": environment.get("authority"),
+            "engine": environment.get("engine"),
+            "vasp_version": environment.get("vasp_version"),
+            "build_identity": environment.get("build_identity"),
+            "evidence": deepcopy(environment.get("evidence")),
+        }, [f"execution_environment.invalid:{exc}"]
+
+
+def _normalise_project_identity(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    lowered = raw.lower()
+    if re.fullmatch(r"[0-9a-f]{32}", lowered):
+        return f"project-{lowered}"
+    if re.fullmatch(r"project-[0-9a-f]{32}", lowered):
+        return lowered
+    remote = re.search(r"-([0-9a-f]{32})$", lowered)
+    if remote:
+        return f"project-{remote.group(1)}"
+    return raw
 
 
 def _manifest_project_identity(manifest: Mapping[str, Any]) -> str | None:
     inputs = manifest.get("inputs") if isinstance(manifest.get("inputs"), Mapping) else {}
-    value = str(
+    return _normalise_project_identity(
         manifest.get("project_uuid") or inputs.get("project_uuid")
         or inputs.get("remote_namespace") or ""
-    ).strip()
-    return value or None
+    )
 
 
-def _recorded_input_hash(manifest: Mapping[str, Any], name: str) -> str:
-    inputs = manifest.get("inputs") if isinstance(manifest.get("inputs"), Mapping) else {}
-    hashes = inputs.get("sha256") if isinstance(inputs.get("sha256"), Mapping) else {}
-    value = str(hashes.get(name) or "").strip().lower()
-    if name == "POTCAR" and not value:
-        value = str(inputs.get("potcar_sha256") or "").strip().lower()
-    return value
+def _bounded_yaml_nodes(value: Any) -> None:
+    pending = [value]
+    seen: set[int] = set()
+    count = 0
+    while pending:
+        item = pending.pop()
+        if isinstance(item, (dict, list)):
+            identity = id(item)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            count += len(item) + 1
+            if count > MAX_MANIFEST_NODES:
+                raise ScientificFingerprintError("authoritative job.yaml exceeds node limit")
+            if isinstance(item, dict):
+                pending.extend(item.keys())
+                pending.extend(item.values())
+            else:
+                pending.extend(item)
 
 
-def _titel_identities(text: str) -> list[str]:
-    identities = []
-    for line in str(text or "").splitlines():
-        if "TITEL" in line.upper():
-            identities.append(_sha256_bytes(line.strip().encode("utf-8")))
+def _read_bounded(path: Path, limit: int, label: str) -> bytes:
+    try:
+        size = path.stat().st_size
+        if size > limit:
+            raise ScientificFingerprintError(f"{label} exceeds byte limit")
+        with path.open("rb") as handle:
+            payload = handle.read(limit + 1)
+    except OSError as exc:
+        raise ScientificFingerprintError(f"{label} is unavailable") from exc
+    if len(payload) > limit:
+        raise ScientificFingerprintError(f"{label} exceeds byte limit")
+    return payload
+
+
+def _potcar_titel_identities(path: Path) -> list[str]:
+    identities: list[str] = []
+    try:
+        if path.stat().st_size > MAX_POTCAR_BYTES:
+            raise ScientificFingerprintError("POTCAR exceeds byte limit")
+        with path.open("rb") as handle:
+            for raw_line in handle:
+                if len(raw_line) > 1024 * 1024:
+                    raise ScientificFingerprintError("POTCAR line exceeds byte limit")
+                if b"TITEL" in raw_line.upper():
+                    identities.append(_sha256_bytes(raw_line.strip()))
+                if len(identities) > 256:
+                    raise ScientificFingerprintError("POTCAR TITEL count exceeds limit")
+    except OSError as exc:
+        raise ScientificFingerprintError("POTCAR is unavailable") from exc
     return identities
 
 
@@ -341,54 +413,84 @@ def _load_authoritative_snapshot(job_dir: str | os.PathLike[str]) -> dict[str, A
     root = Path(job_dir).expanduser().resolve()
     manifest_path = root / manifest_mod.MANIFEST_NAME
     try:
-        manifest_bytes = manifest_path.read_bytes()
-        manifest = manifest_mod.load_manifest(root)
-    except OSError as exc:
-        raise ScientificFingerprintError("authoritative job.yaml is unavailable") from exc
+        manifest_bytes = _read_bounded(manifest_path, MAX_MANIFEST_BYTES, "authoritative job.yaml")
+        manifest = yaml.safe_load(manifest_bytes.decode("utf-8"))
+    except (UnicodeError, yaml.YAMLError) as exc:
+        raise ScientificFingerprintError("authoritative job.yaml is invalid") from exc
     if not isinstance(manifest, dict):
         raise ScientificFingerprintError("authoritative job.yaml is invalid")
-    files: dict[str, bytes] = {}
-    for name in _INPUT_FILES:
+    _bounded_yaml_nodes(manifest)
+    names, _, invalid = required_input_names(root, manifest)
+    if invalid:
+        input_size_issues = list(invalid)
+    else:
+        input_size_issues = []
+    for name in names:
+        path = root.joinpath(*name.split("/"))
         try:
-            files[name] = (root / name).read_bytes()
+            limit = MAX_POTCAR_BYTES if name == "POTCAR" else MAX_INPUT_FILE_BYTES
+            if path.stat().st_size > limit:
+                input_size_issues.append(f"input exceeds byte limit:{name}")
         except OSError:
+            continue
+    current_closure = resolve_input_closure(root, manifest)
+    record = recorded_closure(manifest)
+    files: dict[str, bytes] = {}
+    task = str(manifest.get("task_type") or "").strip().lower()
+    text_names = ["INCAR", "KPOINTS"]
+    text_names.extend(
+        sorted(name for name in current_closure.get("files", {}) if name.endswith("/POSCAR"))
+        if task == "neb" else ["POSCAR"]
+    )
+    for name in text_names:
+        try:
+            files[name] = _read_bounded(
+                root.joinpath(*name.split("/")), MAX_CANONICAL_TEXT_BYTES, name
+            )
+        except ScientificFingerprintError:
             continue
     return {
         "root": root, "manifest": manifest, "manifest_bytes": manifest_bytes,
         "manifest_sha256": _sha256_bytes(manifest_bytes), "files": files,
         "file_sha256": {name: _sha256_bytes(payload) for name, payload in files.items()},
+        "current_closure": current_closure, "recorded_closure": record,
+        "closure_matches": closure_record_matches(record, current_closure),
+        "input_size_issues": input_size_issues,
     }
 
 
-def build_scientific_fingerprint(job_dir: str | os.PathLike[str]) -> dict[str, Any]:
-    """Build one fail-closed strict fingerprint from current authoritative bytes."""
-    try:
-        snapshot = _load_authoritative_snapshot(job_dir)
-    except ScientificFingerprintError as exc:
-        return {
-            "schema": FINGERPRINT_SCHEMA, "status": "incomplete", "digest": None,
-            "legacy_recipe": True, "missing": ["job.yaml"],
-            "recipe_status": "explicit_legacy",
-            "integrity_issues": [str(exc)], "components": {},
-            "manifest_sha256": None, "project_identity": None,
-        }
+def _fingerprint_from_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     manifest = snapshot["manifest"]
     files = snapshot["files"]
     missing: list[str] = []
-    integrity: list[str] = []
+    integrity: list[str] = list(snapshot.get("input_size_issues") or [])
     components: dict[str, Any] = {}
-
-    for name in _INPUT_FILES:
-        if name not in files:
-            missing.append(name)
-            continue
-        expected = _recorded_input_hash(manifest, name)
-        if not expected:
-            missing.append(f"inputs.sha256.{name}")
-        elif not _HEX64_RE.fullmatch(expected):
-            integrity.append(f"inputs.sha256.{name} is invalid")
-        elif expected != snapshot["file_sha256"][name]:
-            integrity.append(f"{name} no longer matches job.yaml")
+    current_closure = snapshot.get("current_closure") or {}
+    record = snapshot.get("recorded_closure") or {}
+    if record.get("schema") != INPUT_CLOSURE_SCHEMA:
+        missing.append("inputs.input_closure.authority")
+    if current_closure.get("status") != "complete":
+        missing.extend(f"input_closure:{name}" for name in current_closure.get("missing") or [])
+    if record.get("status") != "complete":
+        missing.append("inputs.input_closure.complete")
+    if not snapshot.get("closure_matches"):
+        integrity.append("current scientific input closure no longer matches job.yaml")
+    closure_files = current_closure.get("files") if isinstance(
+        current_closure.get("files"), Mapping
+    ) else {}
+    closure_semantic = {
+        "required_files": sorted(closure_files),
+        "content_identities": {
+            name: digest for name, digest in sorted(closure_files.items())
+            if name not in {"INCAR", "KPOINTS", "POSCAR"}
+            and not name.endswith("/POSCAR")
+        },
+    }
+    components["input_closure"] = {
+        "sha256": _json_digest(closure_semantic),
+        "file_count": len(closure_files),
+        "files": sorted(closure_files),
+    }
 
     incar: dict[str, str] = {}
     if "INCAR" in files:
@@ -414,27 +516,45 @@ def build_scientific_fingerprint(job_dir: str | os.PathLike[str]) -> dict[str, A
             missing.append("KPOINTS.canonical")
             integrity.append(str(exc))
 
-    if "POSCAR" in files:
+    task_type = str(manifest.get("task_type") or "").strip().lower()
+    structure_names = (
+        sorted(name for name in closure_files if name.endswith("/POSCAR"))
+        if task_type == "neb" else ["POSCAR"]
+    )
+    structures: list[dict[str, Any]] = []
+    structure_summaries: list[dict[str, Any]] = []
+    for name in structure_names:
+        if name not in files:
+            missing.append(f"{name}.canonical")
+            continue
         try:
-            structure, summary = canonical_poscar(files["POSCAR"].decode("utf-8"))
-            components["structure"] = {
-                "sha256": _json_digest(structure), "summary": summary,
-            }
+            structure, summary = canonical_poscar(files[name].decode("utf-8"))
+            structures.append({"name": name, "structure": structure})
+            structure_summaries.append({"name": name, **summary})
         except (UnicodeError, ValueError) as exc:
-            missing.append("POSCAR.canonical")
+            missing.append(f"{name}.canonical")
             integrity.append(str(exc))
+    if structures:
+        components["structure"] = {
+            "sha256": _json_digest(structures),
+            "summary": (
+                {"neb_images": structure_summaries, "image_count": len(structures)}
+                if task_type == "neb" else structure_summaries[0]
+            ),
+        }
 
-    if "POTCAR" in files:
+    potcar_digest = str(closure_files.get("POTCAR") or "").strip().lower()
+    if not _HEX64_RE.fullmatch(potcar_digest):
+        missing.append("input_closure.POTCAR")
+    else:
         try:
-            potcar_text = files["POTCAR"].decode("utf-8", errors="replace")
-            titel_hashes = _titel_identities(potcar_text)
+            titel_hashes = _potcar_titel_identities(Path(snapshot["root"]) / "POTCAR")
             if not titel_hashes:
                 missing.append("POTCAR.TITEL")
             components["potcar"] = {
-                "content_sha256": snapshot["file_sha256"]["POTCAR"],
-                "titel_sha256": titel_hashes,
+                "content_sha256": potcar_digest, "titel_sha256": titel_hashes,
             }
-        except (UnicodeError, ValueError) as exc:
+        except ScientificFingerprintError as exc:
             missing.append("POTCAR.identity")
             integrity.append(str(exc))
 
@@ -449,7 +569,7 @@ def build_scientific_fingerprint(job_dir: str | os.PathLike[str]) -> dict[str, A
         missing.append("job_identity")
     task = {
         "engine": str(inputs.get("engine") or "vasp").strip().lower() or None,
-        "task_type": str(manifest.get("task_type") or "").strip().lower() or None,
+        "task_type": task_type or None,
         "calc_type": str(manifest.get("calc_type") or "").strip().lower() or None,
         "method_recipe": recipe,
     }
@@ -465,10 +585,19 @@ def build_scientific_fingerprint(job_dir: str | os.PathLike[str]) -> dict[str, A
         for name, keys in _CONTROL_GROUPS.items()
     }
     structure_summary = (components.get("structure") or {}).get("summary") or {}
-    controls["constraints"]["selective_dynamics"] = bool(
-        structure_summary.get("selective_dynamics"))
-    controls["constraints"]["constrained_atoms"] = int(
-        structure_summary.get("constrained_atoms") or 0)
+    if task_type == "neb":
+        images = structure_summary.get("neb_images") or []
+        controls["constraints"]["selective_dynamics"] = any(
+            bool(item.get("selective_dynamics")) for item in images
+        )
+        controls["constraints"]["constrained_atoms"] = sum(
+            int(item.get("constrained_atoms") or 0) for item in images
+        )
+    else:
+        controls["constraints"]["selective_dynamics"] = bool(
+            structure_summary.get("selective_dynamics"))
+        controls["constraints"]["constrained_atoms"] = int(
+            structure_summary.get("constrained_atoms") or 0)
     components["scientific_controls"] = {
         "sha256": _json_digest(controls), "values": controls,
     }
@@ -485,6 +614,7 @@ def build_scientific_fingerprint(job_dir: str | os.PathLike[str]) -> dict[str, A
         "task": task,
         "environment": environment,
         "scientific_controls": controls,
+        "input_closure_sha256": components["input_closure"]["sha256"],
     }
     return {
         "schema": FINGERPRINT_SCHEMA, "status": status,
@@ -494,69 +624,34 @@ def build_scientific_fingerprint(job_dir: str | os.PathLike[str]) -> dict[str, A
         "integrity_issues": integrity, "components": components,
         "manifest_sha256": snapshot["manifest_sha256"],
         "project_identity": _manifest_project_identity(manifest),
+        "input_closure_digest": current_closure.get("digest"),
     }
 
 
-def _convergence_evidence(manifest: Mapping[str, Any]) -> bool:
-    results = manifest.get("results") if isinstance(manifest.get("results"), Mapping) else {}
-    diagnosis = results.get("diagnosis") if isinstance(results.get("diagnosis"), Mapping) else {}
-    failure_class = str(diagnosis.get("failure_class") or "").strip().upper()
-    return bool(
-        failure_class == "CONVERGED"
-        or diagnosis.get("task_converged") is True
-        or results.get("converged") is True
-    )
+def build_scientific_fingerprint(job_dir: str | os.PathLike[str]) -> dict[str, Any]:
+    """Build one fail-closed strict fingerprint from one manifest snapshot."""
+    try:
+        snapshot = _load_authoritative_snapshot(job_dir)
+        return _fingerprint_from_snapshot(snapshot)
+    except ScientificFingerprintError as exc:
+        return {
+            "schema": FINGERPRINT_SCHEMA, "status": "incomplete", "digest": None,
+            "legacy_recipe": True, "missing": ["job.yaml"],
+            "recipe_status": "explicit_legacy",
+            "integrity_issues": [str(exc)], "components": {},
+            "manifest_sha256": None, "project_identity": None,
+            "input_closure_digest": None,
+        }
 
 
-def _result_hashes(job_dir: Path, manifest: Mapping[str, Any]) -> tuple[dict[str, str], list[str]]:
-    results = manifest.get("results") if isinstance(manifest.get("results"), Mapping) else {}
-    declared = results.get("fetched_sha256")
-    if not isinstance(declared, Mapping):
-        declared = results.get("output_sha256")
-    if not isinstance(declared, Mapping) or not declared:
-        return {}, ["results.fetched_sha256"]
-    verified: dict[str, str] = {}
-    issues = []
-    for raw_name, raw_digest in sorted(declared.items(), key=lambda item: str(item[0])):
-        name = str(raw_name)
-        digest = str(raw_digest or "").strip().lower()
-        if (not name or Path(name).name != name or name.startswith(".")
-                or name in {*_INPUT_FILES, manifest_mod.MANIFEST_NAME}
-                or not _HEX64_RE.fullmatch(digest)):
-            issues.append(f"invalid result hash declaration:{name or '?'}")
-            continue
-        path = job_dir / name
-        try:
-            current = manifest_mod.sha256_file(path)
-        except OSError:
-            issues.append(f"result file unavailable:{name}")
-            continue
-        if current != digest:
-            issues.append(f"result file changed:{name}")
-            continue
-        verified[name] = current
-    if not verified:
-        issues.append("no result file remains verifiable")
-    inputs = manifest.get("inputs") if isinstance(manifest.get("inputs"), Mapping) else {}
-    if str(inputs.get("engine") or "vasp").strip().lower() == "vasp":
-        if "OSZICAR" not in verified:
-            issues.append("OSZICAR is not hash-bound and verifiable")
-        if not {"OUTCAR", "vasprun.xml"}.intersection(verified):
-            issues.append("OUTCAR or vasprun.xml is not hash-bound and verifiable")
-    return verified, issues
-
-
-def source_verification(job_dir: str | os.PathLike[str],
-                        fingerprint: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Verify source completeness, convergence and still-present result bytes."""
-    root = Path(job_dir).expanduser().resolve()
-    manifest = manifest_mod.load_manifest(root)
-    fp = dict(fingerprint or build_scientific_fingerprint(root))
-    if not isinstance(manifest, dict):
-        return {"status": "incomplete", "reusable": False,
-                "issues": ["job.yaml is unavailable"], "result_files": {}}
+def _source_verification_from_snapshot(
+    snapshot: Mapping[str, Any], fingerprint: Mapping[str, Any]
+) -> dict[str, Any]:
+    root = Path(snapshot["root"])
+    manifest = snapshot["manifest"]
+    fp = dict(fingerprint)
     state = str(manifest.get("state") or "").strip().upper()
-    if state in {"FAILED", "NEEDS_HUMAN"}:
+    if state == "FAILED":
         return {"status": "failed", "reusable": False, "issues": [], "result_files": {}}
     if state == "UNCONVERGED":
         return {"status": "unconverged", "reusable": False,
@@ -567,24 +662,34 @@ def source_verification(job_dir: str | os.PathLike[str],
         issues.extend(fp.get("integrity_issues") or [])
     if state != "DONE":
         issues.append(f"source state is {state or 'unknown'}, not DONE")
-    if not _convergence_evidence(manifest):
-        issues.append("convergence evidence is missing")
-    verified_energy = None
-    try:
-        from vcstudio.project.energy_gate import validate_done_energy
-        verified_energy = validate_done_energy(
-            root, "reuse source", manifest_mod, require_oszicar=True)[0]
-    except ValueError as exc:
-        issues.append(str(exc))
-    result_files, result_issues = _result_hashes(root, manifest)
-    issues.extend(result_issues)
-    status = "verified" if not issues else "incomplete"
+    parsed = verify_outputs(root, manifest)
+    issues.extend(parsed.get("issues") or [])
+    result_files = parsed.get("result_files") or {}
+    status = parsed.get("contradiction_status") or (
+        "verified" if not issues else "incomplete"
+    )
     return {
         "status": status, "reusable": status == "verified", "issues": sorted(set(issues)),
         "result_files": result_files,
         "result_bundle_sha256": _json_digest(result_files) if result_files else None,
-        "energy_e0_eV": verified_energy if status == "verified" else None,
+        "energy_e0_eV": parsed.get("energy_e0_eV") if status == "verified" else None,
+        "parser": deepcopy(parsed.get("parser")),
+        "neb_energies_eV": deepcopy(parsed.get("neb_energies_eV")),
     }
+
+
+def source_verification(job_dir: str | os.PathLike[str],
+                        fingerprint: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Verify convergence from the same hash-bound authoritative snapshot."""
+    try:
+        snapshot = _load_authoritative_snapshot(job_dir)
+    except ScientificFingerprintError as exc:
+        return {"status": "incomplete", "reusable": False,
+                "issues": [str(exc)], "result_files": {}}
+    fp = dict(fingerprint or _fingerprint_from_snapshot(snapshot))
+    if fp.get("manifest_sha256") != snapshot.get("manifest_sha256"):
+        fp = _fingerprint_from_snapshot(snapshot)
+    return _source_verification_from_snapshot(snapshot, fp)
 
 
 def _component_summary(component: Mapping[str, Any] | None) -> Any:
@@ -593,8 +698,16 @@ def _component_summary(component: Mapping[str, Any] | None) -> Any:
         return deepcopy(component.get("summary"))
     values = component.get("values")
     if isinstance(values, Mapping):
-        if set(values) <= {"vasp_version", "build_identity", "vcstudio_creator"}:
-            return deepcopy(dict(values))
+        if "vasp_version" in values or "build_identity" in values:
+            evidence = values.get("evidence") if isinstance(values.get("evidence"), Mapping) else {}
+            return {
+                "vasp_version": values.get("vasp_version"),
+                "build_identity_sha256": _sha256_bytes(
+                    str(values.get("build_identity") or "").encode("utf-8")
+                ) if values.get("build_identity") else None,
+                "evidence_kind": evidence.get("kind"),
+                "evidence_sha256": evidence.get("sha256"),
+            }
         if "method_recipe" in values:
             return {
                 "engine": values.get("engine"), "task_type": values.get("task_type"),
@@ -602,11 +715,29 @@ def _component_summary(component: Mapping[str, Any] | None) -> Any:
                 "method_recipe": deepcopy(values.get("method_recipe")),
             }
         if "field_count" not in component:
-            return deepcopy(dict(values))
+            groups = []
+            total_fields = 0
+            for group, group_value in list(sorted(values.items()))[:32]:
+                if isinstance(group_value, Mapping):
+                    names = sorted(str(name) for name in group_value)[:64]
+                    total_fields += len(group_value)
+                    groups.append({
+                        "group": str(group)[:64], "field_count": len(group_value),
+                        "fields": names, "truncated": len(group_value) > len(names),
+                    })
+                else:
+                    total_fields += 1
+                    groups.append({"group": str(group)[:64], "field_count": 1})
+            return {
+                "group_count": len(values), "field_count": total_fields,
+                "groups": groups, "truncated": len(values) > len(groups),
+            }
     if "field_count" in component:
         return {"field_count": component.get("field_count")}
     if "line_count" in component:
         return {"line_count": component.get("line_count")}
+    if "file_count" in component:
+        return {"file_count": component.get("file_count")}
     if "content_sha256" in component:
         return {"content_sha256": component.get("content_sha256"),
                 "titel_sha256": deepcopy(component.get("titel_sha256") or [])}
@@ -617,7 +748,7 @@ def public_fingerprint(fingerprint: Mapping[str, Any]) -> dict[str, Any]:
     """Return a path-free, secret-free display projection."""
     fields = []
     for name in (
-        "structure", "incar", "kpoints", "potcar", "task", "environment",
+        "structure", "incar", "kpoints", "potcar", "input_closure", "task", "environment",
         "scientific_controls",
     ):
         component = fingerprint.get("components", {}).get(name, {})
@@ -639,7 +770,7 @@ def fingerprint_differences(target: Mapping[str, Any], source: Mapping[str, Any]
     """Return component-level differences only; never an equivalence claim."""
     differences = []
     names = (
-        "structure", "incar", "kpoints", "potcar", "task", "environment",
+        "structure", "incar", "kpoints", "potcar", "input_closure", "task", "environment",
         "scientific_controls",
     )
     target_components = target.get("components") or {}
@@ -688,10 +819,33 @@ def estimate_saved_core_hours(manifest: Mapping[str, Any]) -> dict[str, Any]:
 class _IndexRecord:
     job_id: str
     project_id: str | None
+    manifest_project_id: str | None
+    project_identity_status: str
     job_dir: str
     manifest: dict[str, Any]
     fingerprint: dict[str, Any]
     verification: dict[str, Any]
+
+
+def _project_identity_binding(
+    manifest: Mapping[str, Any], registry_identity: Any
+) -> tuple[str | None, str | None, str]:
+    manifest_id = _manifest_project_identity(manifest)
+    registry_id = _normalise_project_identity(registry_identity)
+    if manifest_id and registry_id:
+        return registry_id, manifest_id, "verified" if manifest_id == registry_id else "conflict"
+    return registry_id, manifest_id, "unknown"
+
+
+def _project_relation(left: _IndexRecord, right: _IndexRecord) -> str:
+    if (
+        left.project_identity_status != "verified"
+        or right.project_identity_status != "verified"
+        or not left.project_id
+        or not right.project_id
+    ):
+        return "unknown"
+    return "same" if left.project_id == right.project_id else "different"
 
 
 class CalculationReuseIndex:
@@ -704,16 +858,24 @@ class CalculationReuseIndex:
         self.records: list[_IndexRecord] = []
         self.total_entries = 0
         self.truncated = False
+        self.resource_limit_reached = False
 
     def rebuild(self, entries: Iterable[tuple[str, Mapping[str, Any] | None]], *,
                 job_id: Callable[[str, Mapping[str, Any]], str],
                 project_id: Callable[[str, Mapping[str, Any]], str | None] | None = None
                 ) -> "CalculationReuseIndex":
-        source = list(entries)
-        self.total_entries = len(source)
-        self.truncated = len(source) > self.limit
+        source: deque[tuple[str, Mapping[str, Any] | None]] = deque(maxlen=self.limit)
+        self.total_entries = 0
+        self.resource_limit_reached = False
+        for entry in entries:
+            if self.total_entries >= MAX_AUTHORITATIVE_SCAN:
+                self.resource_limit_reached = True
+                break
+            source.append(entry)
+            self.total_entries += 1
+        self.truncated = self.total_entries > self.limit or self.resource_limit_reached
         self.records = []
-        for directory, listed_manifest in source[-self.limit:]:
+        for directory, listed_manifest in source:
             manifest = manifest_mod.load_manifest(directory)
             if not isinstance(manifest, dict):
                 # A ledger copy is not promoted to fact when job.yaml disappeared
@@ -727,9 +889,14 @@ class CalculationReuseIndex:
             identifier = job_id(directory, manifest)
             if not _ID_RE.fullmatch(identifier):
                 continue
+            registry_id = project_id(directory, manifest) if project_id else None
+            bound_id, manifest_id, identity_status = _project_identity_binding(
+                manifest, registry_id
+            )
             self.records.append(_IndexRecord(
                 job_id=identifier,
-                project_id=(project_id(directory, manifest) if project_id else None),
+                project_id=bound_id, manifest_project_id=manifest_id,
+                project_identity_status=identity_status,
                 job_dir=str(Path(directory).resolve()), manifest=manifest,
                 fingerprint=fingerprint, verification=verification,
             ))
@@ -737,6 +904,10 @@ class CalculationReuseIndex:
 
     def advisory(self, target_job_ids: Iterable[str], *, near_limit: int = 5) -> dict[str, Any]:
         requested = list(target_job_ids)
+        if len(requested) > MAX_ADVISORY_TARGETS:
+            raise ValueError(f"at most {MAX_ADVISORY_TARGETS} advisory targets are allowed")
+        if not isinstance(near_limit, int) or not 0 <= near_limit <= MAX_ADVISORY_NEAR:
+            raise ValueError(f"near_limit must be 0..{MAX_ADVISORY_NEAR}")
         by_id: dict[str, _IndexRecord] = {}
         duplicates = set()
         for record in self.records:
@@ -767,9 +938,11 @@ class CalculationReuseIndex:
                 common = {
                     "source_job_id": candidate.job_id,
                     "source_project_id": candidate.project_id,
-                    "cross_project": bool(
-                        target.project_id and candidate.project_id
-                        and target.project_id != candidate.project_id),
+                    "project_relation": _project_relation(target, candidate),
+                    "cross_project": (
+                        _project_relation(target, candidate) == "different"
+                        if _project_relation(target, candidate) != "unknown" else None
+                    ),
                     "verification": {
                         "status": candidate_status,
                         "reusable": bool(candidate.verification.get("reusable")),
@@ -798,6 +971,7 @@ class CalculationReuseIndex:
             exact.sort(key=lambda item: item["source_job_id"])
             targets.append({
                 "target_job_id": target.job_id, "target_project_id": target.project_id,
+                "project_identity_status": target.project_identity_status,
                 "fingerprint": public_fingerprint(target.fingerprint),
                 "exact_matches": exact, "near_matches": near[:near_limit],
                 "source_statuses": statuses,
@@ -817,6 +991,130 @@ class CalculationReuseIndex:
                 "authoritative": False,
             },
         }
+
+
+def authoritative_reuse_lookup(
+    entries: Iterable[tuple[str, Mapping[str, Any] | None]],
+    target_job_ids: Iterable[str], *,
+    job_id: Callable[[str, Mapping[str, Any]], str],
+    project_id: Callable[[str, Mapping[str, Any]], str | None] | None = None,
+) -> dict[str, Any]:
+    """Full authoritative digest lookup/CAS, independent of the bounded advisory.
+
+    ``complete=False`` means absence has no meaning and callers must fail closed.
+    Exact-match presence remains reported even if its display list is truncated.
+    """
+    requested = list(target_job_ids)
+    errors: list[str] = []
+    if not requested or len(requested) > MAX_ADVISORY_TARGETS or len(set(requested)) != len(requested):
+        return {
+            "schema": AUTHORITATIVE_LOOKUP_SCHEMA, "authoritative": True,
+            "complete": False, "authorizes_submission": False,
+            "errors": ["target job IDs are empty, duplicated, or over limit"], "targets": [],
+        }
+    records: list[_IndexRecord] = []
+    seen_ids: set[str] = set()
+    complete = True
+    for offset, (directory, _listed_manifest) in enumerate(entries):
+        if offset >= MAX_AUTHORITATIVE_SCAN:
+            complete = False
+            errors.append("authoritative ledger scan limit reached")
+            break
+        try:
+            snapshot = _load_authoritative_snapshot(directory)
+            manifest = snapshot["manifest"]
+            identifier = str(job_id(directory, manifest) or "")
+            if not _ID_RE.fullmatch(identifier):
+                raise ScientificFingerprintError("invalid authoritative job ID")
+            if identifier in seen_ids:
+                raise ScientificFingerprintError(f"duplicate authoritative job ID:{identifier}")
+            seen_ids.add(identifier)
+            registry_id = project_id(directory, manifest) if project_id else None
+            bound_id, manifest_id, identity_status = _project_identity_binding(
+                manifest, registry_id
+            )
+            records.append(_IndexRecord(
+                job_id=identifier, project_id=bound_id,
+                manifest_project_id=manifest_id,
+                project_identity_status=identity_status,
+                job_dir=str(Path(directory).resolve()), manifest=manifest,
+                fingerprint=_fingerprint_from_snapshot(snapshot), verification={},
+            ))
+        except Exception as exc:  # authoritative scan failure must not prove absence
+            complete = False
+            errors.append(str(exc))
+    by_id = {record.job_id: record for record in records}
+    missing_targets = [identifier for identifier in requested if identifier not in by_id]
+    if missing_targets:
+        complete = False
+        errors.append("one or more targets are absent from authoritative ledger")
+    digest_buckets: dict[str, list[_IndexRecord]] = {}
+    for record in records:
+        digest = record.fingerprint.get("digest")
+        if record.fingerprint.get("status") == "complete" and isinstance(digest, str):
+            digest_buckets.setdefault(digest, []).append(record)
+    targets = []
+    verification_cache: dict[str, dict[str, Any]] = {}
+    for target_id in requested:
+        target = by_id.get(target_id)
+        if target is None:
+            continue
+        matches = []
+        match_count = 0
+        for candidate in digest_buckets.get(str(target.fingerprint.get("digest")), []):
+            if candidate.job_id == target_id:
+                continue
+            if candidate.job_id not in verification_cache:
+                if len(verification_cache) >= MAX_AUTHORITATIVE_VERIFICATIONS:
+                    complete = False
+                    errors.append("authoritative source verification limit reached")
+                    break
+                verification_cache[candidate.job_id] = source_verification(
+                    candidate.job_dir, candidate.fingerprint
+                )
+            verification = verification_cache[candidate.job_id]
+            relation = _project_relation(target, candidate)
+            if not verification.get("reusable"):
+                continue
+            match_count += 1
+            if len(matches) < MAX_AUTHORITATIVE_MATCHES:
+                matches.append({
+                    "source_job_id": candidate.job_id,
+                    "source_project_id": candidate.project_id,
+                    "project_relation": relation,
+                    "cross_project": (
+                        relation == "different" if relation != "unknown" else None
+                    ),
+                    "verification": verification,
+                    "fingerprint": public_fingerprint(candidate.fingerprint),
+                    "cas": {
+                        "fingerprint": candidate.fingerprint.get("digest"),
+                        "manifest_sha256": candidate.fingerprint.get("manifest_sha256"),
+                        "result_bundle_sha256": verification.get("result_bundle_sha256"),
+                    },
+                })
+        matches.sort(key=lambda item: item["source_job_id"])
+        targets.append({
+            "target_job_id": target_id,
+            "fingerprint": public_fingerprint(target.fingerprint),
+            "project_identity_status": target.project_identity_status,
+            "exact_matches": matches, "match_count": match_count,
+            "matches_truncated": match_count > len(matches),
+            "requires_explicit_choice": match_count > 0,
+            "absence_authoritative": False,
+        })
+    for target in targets:
+        target["absence_authoritative"] = bool(
+            complete
+            and target["fingerprint"].get("status") == "complete"
+            and target["match_count"] == 0
+        )
+    return {
+        "schema": AUTHORITATIVE_LOOKUP_SCHEMA, "authoritative": True,
+        "complete": complete, "authorizes_submission": False,
+        "errors": sorted(set(errors))[:128], "targets": targets,
+        "scanned": len(records), "scan_limit": MAX_AUTHORITATIVE_SCAN,
+    }
 
 
 def _decision_key(value: str) -> str:
@@ -855,6 +1153,60 @@ def _operation_locks(paths: Iterable[str | os.PathLike[str]], action: str):
     return stack
 
 
+def _reuse_journal_path(target_dir: str | os.PathLike[str], decision_id: str) -> Path:
+    suffix = _sha256_bytes(decision_id.encode("utf-8"))[:20]
+    return Path(target_dir).resolve() / f".reuse-journal-{suffix}.json"
+
+
+def _write_reuse_journal(path: Path, value: Mapping[str, Any]) -> None:
+    payload = (_canonical_json(dict(value)) + "\n").encode("utf-8")
+    if len(payload) > 1024 * 1024:
+        raise ScientificFingerprintError("reuse journal exceeds byte limit")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            parent_fd = os.open(str(path.parent), flags)
+        except OSError:
+            pass
+        else:
+            try:
+                os.fsync(parent_fd)
+            except OSError:
+                pass
+            finally:
+                os.close(parent_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+
+
+def _load_reuse_journal(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        payload = _read_bounded(path, 1024 * 1024, "reuse journal")
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ReuseConflictError("reuse journal is invalid") from exc
+    if not isinstance(value, dict):
+        raise ReuseConflictError("reuse journal is invalid")
+    return value
+
+
+def _manifest_payload(manifest: Mapping[str, Any]) -> bytes:
+    return yaml.safe_dump(
+        dict(manifest), allow_unicode=True, sort_keys=False
+    ).encode("utf-8")
+
+
 def record_reuse_reference(target_dir: str | os.PathLike[str],
                            source_dir: str | os.PathLike[str], *,
                            decision_id: str, reason: str,
@@ -863,12 +1215,14 @@ def record_reuse_reference(target_dir: str | os.PathLike[str],
                            before_commit: Callable[[], None] | None = None,
                            after_materialize: Callable[[str, int], None] | None = None,
                            ) -> dict[str, Any]:
-    """Explicitly reference one exact verified result with TOCTOU revalidation."""
+    """Reference one verified source through a durable prepared/CAS boundary."""
     key = _decision_key(decision_id)
     reason = str(reason or "").strip()
+    if not reason:
+        raise ValueError("reuse reason is required")
     if len(reason) > 1000:
         raise ValueError("reuse reason is too long")
-    with _operation_locks((target_dir, source_dir), "引用既有结果"):
+    with _operation_locks((target_dir, source_dir), "reference existing result"):
         target_before = _load_authoritative_snapshot(target_dir)
         source_before = _load_authoritative_snapshot(source_dir)
         target_manifest = target_before["manifest"]
@@ -877,50 +1231,85 @@ def record_reuse_reference(target_dir: str | os.PathLike[str],
         source_id = _job_identity(source_manifest)
         if target_id == source_id:
             raise ScientificFingerprintError("a job cannot reuse itself")
-        target_fp = build_scientific_fingerprint(target_dir)
-        source_fp = build_scientific_fingerprint(source_dir)
+        target_fp = _fingerprint_from_snapshot(target_before)
+        source_fp = _fingerprint_from_snapshot(source_before)
+        target_registry, target_manifest_project, target_identity_status = \
+            _project_identity_binding(target_manifest, target_project_id)
+        source_registry, source_manifest_project, source_identity_status = \
+            _project_identity_binding(source_manifest, source_project_id)
+        if target_identity_status != "verified" or source_identity_status != "verified":
+            raise ScientificFingerprintError(
+                "project identity is unknown or conflicts with authoritative manifest"
+            )
+        project_relation = (
+            "same" if target_registry == source_registry else "different"
+        )
         request = {
             "action": "reference_existing_result", "target_job_id": target_id,
             "source_job_id": source_id, "target_fingerprint": target_fp.get("digest"),
             "source_fingerprint": source_fp.get("digest"), "reason": reason,
+            "target_project_id": target_registry, "source_project_id": source_registry,
         }
         request_sha256 = _json_digest(request)
         if (target_fp.get("status") != "complete" or source_fp.get("status") != "complete"
                 or target_fp.get("digest") != source_fp.get("digest")):
             raise ScientificFingerprintError("strict complete fingerprints do not match")
-        verification = source_verification(source_dir, source_fp)
+        verification = _source_verification_from_snapshot(source_before, source_fp)
         if not verification.get("reusable"):
             raise ScientificFingerprintError("source result is not complete, converged and verifiable")
         replay = _decision_replay(target_manifest, key, request_sha256)
-        source_current = source_before
-        verification_after = verification
+        journal_path = _reuse_journal_path(target_dir, key)
+        journal = _load_reuse_journal(journal_path)
+        if replay is None and journal is not None:
+            if journal.get("request_sha256") != request_sha256:
+                raise ReuseConflictError("decision journal already binds different input")
+            if (
+                journal.get("status") != "preparing"
+                or journal.get("target_base_manifest_sha256")
+                != target_before["manifest_sha256"]
+            ):
+                raise ReuseConflictError("orphaned reuse journal conflicts with target generation")
         if replay is not None:
-            if (replay.get("source_manifest_sha256") != source_current["manifest_sha256"]
+            if (not journal or journal.get("request_sha256") != request_sha256
+                    or replay.get("source_manifest_sha256") != source_before["manifest_sha256"]
                     or replay.get("source_result_bundle_sha256")
-                    != verification_after.get("result_bundle_sha256")
+                    != verification.get("result_bundle_sha256")
                     or replay.get("scientific_fingerprint") != target_fp.get("digest")
                     or replay.get("source_fingerprint") != source_fp.get("digest")):
-                raise ScientificFingerprintError(
-                    "previous reuse decision is stale because its source changed")
+                raise ReuseConflictError("prepared reuse generation/source CAS changed")
             if replay.get("status") == "succeeded":
+                if journal.get("status") == "succeeded":
+                    if journal.get("done_manifest_sha256") != target_before["manifest_sha256"]:
+                        raise ReuseConflictError("completed reuse target generation changed")
+                elif journal.get("status") not in {"preparing", "prepared"}:
+                    raise ReuseConflictError("completed reuse journal state is invalid")
                 target_verification = source_verification(target_dir, target_fp)
                 if (not target_verification.get("reusable")
                         or target_verification.get("result_bundle_sha256")
                         != replay.get("source_result_bundle_sha256")):
                     raise ScientificFingerprintError(
                         "materialised reuse result no longer verifies")
+                # Recover the narrow crash window after the authoritative DONE
+                # manifest commit and before the journal's succeeded marker.
+                if journal.get("status") != "succeeded":
+                    journal["status"] = "succeeded"
+                    journal["done_manifest_sha256"] = target_before["manifest_sha256"]
+                    _write_reuse_journal(journal_path, journal)
                 return {"ok": True, "replayed": True, "decision": replay,
                         "target_job_id": target_id, "source_job_id": source_id,
                         "state": target_manifest.get("state"),
                         "accepted_inherited": False, "final_inherited": False}
             if replay.get("status") != "prepared":
                 raise ScientificFingerprintError("reuse decision has an unknown recovery status")
+            if journal.get("prepared_manifest_sha256") != target_before["manifest_sha256"]:
+                raise ReuseConflictError("prepared reuse target generation changed")
             if str(target_manifest.get("state") or "").upper() != "CREATED":
                 raise ScientificFingerprintError("prepared reuse decision has invalid target state")
             updated = deepcopy(target_manifest)
             decision = next(
                 item for item in updated.get("reuse_decisions") or []
-                if isinstance(item, dict) and item.get("decision_id") == key)
+                if isinstance(item, dict) and item.get("decision_id") == key
+            )
         else:
             if str(target_manifest.get("state") or "").upper() != "CREATED":
                 raise ScientificFingerprintError(
@@ -929,13 +1318,13 @@ def record_reuse_reference(target_dir: str | os.PathLike[str],
                 raise ScientificFingerprintError("target job is already bound to a remote submission")
             if before_commit is not None:
                 before_commit()
-            # Re-read every authority after the user choice and immediately
-            # before writing the recoverable prepared record.
             target_after = _load_authoritative_snapshot(target_dir)
             source_after = _load_authoritative_snapshot(source_dir)
-            target_fp_after = build_scientific_fingerprint(target_dir)
-            source_fp_after = build_scientific_fingerprint(source_dir)
-            verification_after = source_verification(source_dir, source_fp_after)
+            target_fp_after = _fingerprint_from_snapshot(target_after)
+            source_fp_after = _fingerprint_from_snapshot(source_after)
+            verification_after = _source_verification_from_snapshot(
+                source_after, source_fp_after
+            )
             if (target_after["manifest_sha256"] != target_before["manifest_sha256"]
                     or source_after["manifest_sha256"] != source_before["manifest_sha256"]
                     or target_fp_after.get("digest") != target_fp.get("digest")
@@ -944,26 +1333,27 @@ def record_reuse_reference(target_dir: str | os.PathLike[str],
                     != verification.get("result_bundle_sha256")
                     or not verification_after.get("reusable")):
                 raise ScientificFingerprintError("source or target changed during reuse validation")
-            source_current = source_after
             now = _now()
-            cross_project = bool(
-                target_project_id and source_project_id
-                and target_project_id != source_project_id)
             decision = {
                 "schema": REUSE_DECISION_SCHEMA, "decision_id": key,
                 "request_sha256": request_sha256, "action": "reference_existing_result",
                 "status": "prepared", "decided_at": now,
                 "actor": "manual-local-user", "reason": reason,
                 "target_job_id": target_id, "source_job_id": source_id,
-                "target_project_id": target_project_id,
-                "source_project_id": source_project_id,
-                "cross_project": cross_project,
+                "target_project_id": target_registry,
+                "source_project_id": source_registry,
+                "target_manifest_project_id": target_manifest_project,
+                "source_manifest_project_id": source_manifest_project,
+                "project_relation": project_relation,
+                "cross_project": project_relation == "different",
                 "scientific_fingerprint": target_fp["digest"],
                 "source_fingerprint": source_fp["digest"],
                 "source_manifest_sha256": source_after["manifest_sha256"],
                 "source_result_bundle_sha256": verification_after["result_bundle_sha256"],
                 "source_result_files": deepcopy(verification_after["result_files"]),
                 "source_verification_status": "verified",
+                "source_parser": deepcopy(verification_after.get("parser")),
+                "target_base_manifest_sha256": target_after["manifest_sha256"],
                 "accepted_inherited": False, "final_inherited": False,
                 "remote_effect": False,
             }
@@ -980,74 +1370,97 @@ def record_reuse_reference(target_dir: str | os.PathLike[str],
             nodes.extend([
                 {
                     "id": target_id, "kind": "calculation_reference",
-                    "project_id": target_project_id,
+                    "project_id": target_registry,
                     "scientific_fingerprint": target_fp["digest"], "created_at": now,
                 },
                 {
                     "id": source_id, "kind": "source_calculation",
-                    "project_id": source_project_id,
+                    "project_id": source_registry,
                     "scientific_fingerprint": source_fp["digest"],
                     "verification": "verified",
                 },
             ])
             links.append({
                 "id": key, "type": "reuses", "from": target_id, "to": source_id,
-                "decision_id": key, "cross_project": cross_project,
+                "decision_id": key, "project_relation": project_relation,
+                "cross_project": project_relation == "different",
             })
-        source_results = source_current["manifest"].get("results") \
-            if isinstance(source_current["manifest"].get("results"), Mapping) else {}
-        results = updated.setdefault("results", {})
-        if not isinstance(results, dict):
-            raise ScientificFingerprintError("target results section is invalid")
-        energy = verification_after.get("energy_e0_eV")
-        if (isinstance(energy, (int, float)) and not isinstance(energy, bool)
-                and math.isfinite(float(energy))):
-            results["energy_e0_eV"] = float(energy)
-        results["reuse_reference"] = {
-            "decision_id": key, "source_job_id": source_id,
-            "scientific_fingerprint": source_fp["digest"],
-            "result_bundle_sha256": verification_after["result_bundle_sha256"],
-            "verification_status": "verified",
-        }
-        source_diagnosis = source_results.get("diagnosis")
-        if not isinstance(source_diagnosis, Mapping):
-            raise ScientificFingerprintError("source convergence diagnosis is unavailable")
-        results["diagnosis"] = {
-            field: deepcopy(source_diagnosis[field])
-            for field in _REUSE_DIAGNOSIS_FIELDS if field in source_diagnosis
-        }
-        results["diagnosis"]["evidence_source"] = "verified_reuse_reference"
-        results["fetched_sha256"] = deepcopy(verification_after["result_files"])
-        results["fetched"] = sorted(verification_after["result_files"])
-        results["fetched_missing"] = []
-        results["fetch_contract"] = {
-            "schema": 1, "mode": "verified_reuse_reference", "state": "DONE",
-            "source_job_id": source_id, "decision_id": key,
-        }
-        if replay is None:
+            source_results = source_after["manifest"].get("results") \
+                if isinstance(source_after["manifest"].get("results"), Mapping) else {}
+            results = updated.setdefault("results", {})
+            if not isinstance(results, dict):
+                raise ScientificFingerprintError("target results section is invalid")
+            energy = verification_after.get("energy_e0_eV")
+            if (isinstance(energy, (int, float)) and not isinstance(energy, bool)
+                    and math.isfinite(float(energy))):
+                results["energy_e0_eV"] = float(energy)
+            results["reuse_reference"] = {
+                "decision_id": key, "source_job_id": source_id,
+                "scientific_fingerprint": source_fp["digest"],
+                "result_bundle_sha256": verification_after["result_bundle_sha256"],
+                "verification_status": "verified",
+                "parser": deepcopy(verification_after.get("parser")),
+            }
+            source_diagnosis = source_results.get("diagnosis")
+            results["diagnosis"] = {
+                field: deepcopy(source_diagnosis[field])
+                for field in _REUSE_DIAGNOSIS_FIELDS
+                if isinstance(source_diagnosis, Mapping) and field in source_diagnosis
+            }
+            results["diagnosis"]["evidence_source"] = "verified_reuse_reference"
+            results["fetched_sha256"] = deepcopy(verification_after["result_files"])
+            results["fetched"] = sorted(verification_after["result_files"])
+            results["fetched_missing"] = []
+            results["fetch_contract"] = {
+                "schema": 1, "mode": "verified_reuse_reference", "state": "DONE",
+                "source_job_id": source_id, "decision_id": key,
+            }
             updated.setdefault("attempts", []).append({
                 "n": len(updated.get("attempts") or []) + 1, "at": now,
-                "result": "reuse_prepared", "decision_id": key, "remote_effect": False,
+                "result": "reuse_prepared", "decision_id": key,
+                "remote_effect": False,
             })
-            # Durable two-phase boundary: a restart sees status=prepared and
-            # reconciles already-copied files instead of inventing a new node.
+            prepared_payload = _manifest_payload(updated)
+            prepared_sha256 = _sha256_bytes(prepared_payload)
+            journal = {
+                "schema": "vcstudio.reuse-materialization-journal/v1",
+                "decision_id": key, "request_sha256": request_sha256,
+                "target_base_manifest_sha256": target_after["manifest_sha256"],
+                "prepared_manifest_sha256": prepared_sha256,
+                "target_fingerprint": target_fp["digest"],
+                "source_manifest_sha256": source_after["manifest_sha256"],
+                "source_result_files": deepcopy(verification_after["result_files"]),
+                "source_result_bundle_sha256": verification_after["result_bundle_sha256"],
+                "status": "preparing", "decided_at": now,
+            }
+            _write_reuse_journal(journal_path, journal)
             manifest_mod.save_manifest(target_dir, updated)
-        # Materialise only hash-bound result bytes into the new provenance node.
-        # This gives existing deterministic analysis gates local files to
-        # re-check without pretending the target ran a second calculation.
+            persisted_prepared = _load_authoritative_snapshot(target_dir)
+            if persisted_prepared["manifest_sha256"] != prepared_sha256:
+                raise ReuseConflictError("prepared target manifest generation mismatch")
+            journal["status"] = "prepared"
+            _write_reuse_journal(journal_path, journal)
+
+        verification_after = {
+            "result_files": deepcopy(decision["source_result_files"]),
+            "result_bundle_sha256": decision["source_result_bundle_sha256"],
+        }
         target_root = Path(target_dir).resolve()
         source_root = Path(source_dir).resolve()
         recovery_suffix = _sha256_bytes(key.encode("utf-8"))[:12]
         for materialized_count, (name, digest) in enumerate(
                 sorted(verification_after["result_files"].items()), start=1):
-            destination = target_root / name
+            destination = target_root.joinpath(*name.split("/"))
+            destination.parent.mkdir(parents=True, exist_ok=True)
             if destination.exists():
                 if manifest_mod.sha256_file(destination) == digest:
                     continue
                 raise ScientificFingerprintError(
                     f"prepared reuse destination has conflicting bytes:{name}")
-            temporary = target_root / f".{name}.{recovery_suffix}.reuse-tmp"
-            with open(source_root / name, "rb") as source_handle, \
+            temporary = destination.with_name(
+                f".{destination.name}.{recovery_suffix}.reuse-tmp"
+            )
+            with open(source_root.joinpath(*name.split("/")), "rb") as source_handle, \
                     open(temporary, "wb") as target_handle:
                 shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
                 target_handle.flush()
@@ -1057,12 +1470,11 @@ def record_reuse_reference(target_dir: str | os.PathLike[str],
             os.replace(temporary, destination)
             if after_materialize is not None:
                 after_materialize(name, materialized_count)
-        # A non-cooperating writer can ignore the operation lock.  Re-read the
-        # complete source authority after materialisation so a file changed
-        # after its own copy cannot be blessed by the earlier verification.
         source_final = _load_authoritative_snapshot(source_dir)
-        source_fp_final = build_scientific_fingerprint(source_dir)
-        verification_final = source_verification(source_dir, source_fp_final)
+        source_fp_final = _fingerprint_from_snapshot(source_final)
+        verification_final = _source_verification_from_snapshot(
+            source_final, source_fp_final
+        )
         if (source_final["manifest_sha256"] != decision["source_manifest_sha256"]
                 or source_fp_final.get("digest") != decision["source_fingerprint"]
                 or not verification_final.get("reusable")
@@ -1070,6 +1482,24 @@ def record_reuse_reference(target_dir: str | os.PathLike[str],
                 != decision["source_result_bundle_sha256"]):
             raise ScientificFingerprintError(
                 "source changed while verified result bytes were materialised")
+        target_final = _load_authoritative_snapshot(target_dir)
+        if target_final["manifest_sha256"] != journal.get("prepared_manifest_sha256"):
+            raise ReuseConflictError("target manifest drifted after prepared materialization")
+        target_fp_final = _fingerprint_from_snapshot(target_final)
+        if (
+            target_fp_final.get("status") != "complete"
+            or target_fp_final.get("digest") != decision["scientific_fingerprint"]
+        ):
+            raise ReuseConflictError("target fingerprint drifted after prepared materialization")
+        target_outputs = verify_outputs(target_root, target_final["manifest"])
+        if (
+            target_outputs.get("issues")
+            or _json_digest(target_outputs.get("result_files") or {})
+            != decision["source_result_bundle_sha256"]
+            or dict(target_outputs.get("result_files") or {})
+            != dict(decision["source_result_files"])
+        ):
+            raise ReuseConflictError("target materialized result hashes failed revalidation")
         decision["status"] = "succeeded"
         decision["completed_at"] = _now()
         reuse_attempt = next((
@@ -1081,9 +1511,13 @@ def record_reuse_reference(target_dir: str | os.PathLike[str],
         reuse_attempt["result"] = "reused"
         manifest_mod.set_state(updated, "DONE", note=f"reused result decision={key}")
         manifest_mod.save_manifest(target_dir, updated)
-        persisted = manifest_mod.load_manifest(target_dir)
-        if not isinstance(persisted, dict):
-            raise ScientificFingerprintError("reuse decision could not be re-read")
+        journal["status"] = "succeeded"
+        journal["done_manifest_sha256"] = manifest_mod.sha256_file(
+            Path(target_dir) / manifest_mod.MANIFEST_NAME
+        )
+        _write_reuse_journal(journal_path, journal)
+        persisted_snapshot = _load_authoritative_snapshot(target_dir)
+        persisted = persisted_snapshot["manifest"]
         stored = _decision_replay(persisted, key, request_sha256)
         if stored is None:
             raise ScientificFingerprintError("reuse decision was not persisted")
@@ -1104,28 +1538,35 @@ def record_force_recalculation(job_dir: str | os.PathLike[str], *, decision_id: 
         raise ValueError("force recalculation requires a reason")
     if len(reason) > 1000:
         raise ValueError("force recalculation reason is too long")
-    with _operation_locks((job_dir,), "记录强制重算理由"):
-        manifest = manifest_mod.load_manifest(job_dir)
-        if not isinstance(manifest, dict):
-            raise ScientificFingerprintError("authoritative job.yaml is unavailable")
+    with _operation_locks((job_dir,), "record force recalculation"):
+        snapshot = _load_authoritative_snapshot(job_dir)
+        manifest = snapshot["manifest"]
         if str(manifest.get("state") or "").upper() != "CREATED":
             raise ScientificFingerprintError("only an unsubmitted CREATED job can be recalculated")
-        fingerprint = build_scientific_fingerprint(job_dir)
+        fingerprint = _fingerprint_from_snapshot(snapshot)
         request = {
             "action": "force_recalculate", "job_id": _job_identity(manifest),
-            "fingerprint": fingerprint.get("digest"), "reason": reason,
+            "fingerprint_schema": fingerprint.get("schema"),
+            "fingerprint_status": fingerprint.get("status"),
+            "fingerprint": fingerprint.get("digest"),
+            "input_closure_digest": fingerprint.get("input_closure_digest"),
+            "reason": reason,
         }
         request_sha256 = _json_digest(request)
         replay = _decision_replay(manifest, key, request_sha256)
         if replay is not None:
             return {"ok": True, "replayed": True, "decision": replay}
         decision = {
-            "schema": REUSE_DECISION_SCHEMA, "decision_id": key,
+            "schema": FORCE_DECISION_SCHEMA, "decision_id": key,
             "request_sha256": request_sha256, "action": "force_recalculate",
+            "status": "succeeded",
             "decided_at": _now(), "actor": "manual-local-user", "reason": reason,
             "target_job_id": request["job_id"],
             "scientific_fingerprint": fingerprint.get("digest"),
+            "fingerprint_schema": fingerprint.get("schema"),
             "fingerprint_status": fingerprint.get("status"),
+            "input_closure_digest": fingerprint.get("input_closure_digest"),
+            "target_manifest_generation_sha256": snapshot["manifest_sha256"],
             "remote_effect": False,
         }
         updated = deepcopy(manifest)
@@ -1138,18 +1579,25 @@ def has_current_force_recalculation(manifest: Mapping[str, Any],
                                     fingerprint: Mapping[str, Any]) -> bool:
     """Return whether a retained force decision binds the current target input."""
     digest = fingerprint.get("digest")
+    closure = fingerprint.get("input_closure_digest")
     for decision in reversed(manifest.get("reuse_decisions") or []):
         if (isinstance(decision, Mapping)
+                and decision.get("schema") == FORCE_DECISION_SCHEMA
                 and decision.get("action") == "force_recalculate"
-                and decision.get("scientific_fingerprint") == digest):
+                and decision.get("status") == "succeeded"
+                and decision.get("target_job_id") == _job_identity(manifest)
+                and decision.get("fingerprint_schema") == FINGERPRINT_SCHEMA
+                and decision.get("scientific_fingerprint") == digest
+                and decision.get("input_closure_digest") == closure):
             return True
     return False
 
 
 __all__ = [
-    "ADVISORY_SCHEMA", "CalculationReuseIndex", "FINGERPRINT_SCHEMA", "INDEX_LIMIT",
-    "PROVENANCE_SCHEMA", "REUSE_DECISION_SCHEMA", "ReuseConflictError",
-    "ScientificFingerprintError", "build_scientific_fingerprint", "canonical_incar",
+    "ADVISORY_SCHEMA", "AUTHORITATIVE_LOOKUP_SCHEMA", "CalculationReuseIndex",
+    "FINGERPRINT_SCHEMA", "FORCE_DECISION_SCHEMA", "INDEX_LIMIT", "PROVENANCE_SCHEMA",
+    "REUSE_DECISION_SCHEMA", "ReuseConflictError", "ScientificFingerprintError",
+    "authoritative_reuse_lookup", "build_scientific_fingerprint", "canonical_incar",
     "canonical_kpoints", "canonical_poscar", "estimate_saved_core_hours",
     "fingerprint_differences", "has_current_force_recalculation", "public_fingerprint",
     "record_force_recalculation", "record_reuse_reference", "source_verification",

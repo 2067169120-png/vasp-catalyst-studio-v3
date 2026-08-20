@@ -2818,6 +2818,15 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
       </label>
       <label class="fld span2" style="margin-top:12px">VASP 命令<input id="cl-vaspcmd" class="ipt" autocomplete="off" placeholder="mpirun -np 24 -machinefile $PBS_NODEFILE .../vasp_std &gt; log 2&gt;&amp;1"></label>
       <details class="span2" style="margin-top:10px">
+        <summary class="sub" style="cursor:pointer" data-i18n="cluster.vasp_environment.summary">VASP 运行环境身份（严格复用需要）</summary>
+        <div class="hint" style="margin:6px 0" data-i18n="cluster.vasp_environment.hint">三个字段须同时填写或同时清空。浏览器只保存这组服务端声明，不读取可执行文件，也不计算科学指纹。build identity 必须是无路径、无秘密的不透明标识。</div>
+        <div class="cl-grid" style="margin-top:8px">
+          <label class="fld"><span data-i18n="cluster.vasp_environment.version">VASP 版本</span><input id="cl-vaspversion" class="ipt" autocomplete="off" placeholder="6.4.3"></label>
+          <label class="fld"><span data-i18n="cluster.vasp_environment.build_identity">Build identity</span><input id="cl-vaspbuild" class="ipt" autocomplete="off" placeholder="vasp_std-linux-x86_64-gcc12-openmpi4"></label>
+        </div>
+        <label class="fld span2" style="margin-top:8px"><span data-i18n="cluster.vasp_environment.evidence">Build 证据 SHA-256</span><input id="cl-vaspevidence" class="ipt" autocomplete="off" maxlength="64" spellcheck="false" placeholder="64 位十六进制 SHA-256" data-i18n-ph="cluster.vasp_environment.evidence_placeholder"></label>
+      </details>
+      <details class="span2" style="margin-top:10px">
         <summary class="sub" style="cursor:pointer">其它计算引擎命令（仅使用对应引擎时填写）</summary>
         <div class="hint" style="margin:6px 0">不同引擎必须各自配置；缺命令时软件会在联网前阻止提交，绝不会改用 VASP。可用占位符：{input} {stem} {cores} {nodes} {ppn}。</div>
         <label class="fld" style="margin-top:8px">CP2K 命令<input id="cl-cp2kcmd" class="ipt" autocomplete="off" placeholder="srun -n {cores} cp2k.psmp -i {input} -o {stem}.out"></label>

@@ -227,6 +227,7 @@ def create_from_build(job_dir: str | os.PathLike, build_result: dict, *,
     completions = dict(build_result.get('completions') or {})
     job_dir = Path(job_dir)
     inputs = {
+        'engine': 'vasp',
         'poscar': str(Path(poscar_path).resolve()),
         'poscar_sha256': sha256_file(poscar_path),
         'incar_source': incar_source_label(validate, completions),
@@ -236,18 +237,23 @@ def create_from_build(job_dir: str | os.PathLike, build_result: dict, *,
         # 赝势身份(发刊级溯源):哪套 POTCAR 算的,结果永远可答
         'potcar': list(build_result.get('potcar') or []),
     }
+    recipe = build_result.get('method_recipe')
+    if recipe:
+        from vcstudio.generate.method_recipe import validate_method_recipe
+        inputs['method_recipe'] = validate_method_recipe(recipe)
+    else:
+        # Old/imported build results remain usable, but strict equivalence must
+        # identify them explicitly as legacy/incomplete rather than inventing a
+        # recipe decision after the fact.
+        inputs['method_recipe_status'] = 'legacy_missing'
+    if build_result.get('execution_environment') is not None:
+        from vcstudio.shared.execution_environment import validate_execution_environment
+        inputs['execution_environment'] = validate_execution_environment(
+            build_result['execution_environment'])
     if incar_path is not None:
         source_incar = Path(incar_path).resolve()
         inputs['source_incar_path'] = str(source_incar)
         inputs['source_incar_sha256'] = sha256_file(source_incar)
-    inputs['sha256'] = {
-        name: sha256_file(job_dir / name)
-        for name in _MANAGED_VASP_INPUTS
-        if (job_dir / name).is_file()
-    }
-    potcar_file = job_dir / 'POTCAR'
-    if potcar_file.is_file():
-        inputs['potcar_sha256'] = sha256_file(potcar_file)
     m = new_manifest(
         job_id=f'{job_dir.resolve().name}-{time.strftime("%Y%m%d-%H%M%S")}',
         system=system or _poscar_system_name(poscar_path),
@@ -256,5 +262,7 @@ def create_from_build(job_dir: str | os.PathLike, build_result: dict, *,
         inputs=inputs,
         warnings=build_result.get('warnings'),
     )
+    from vcstudio.shared.scientific_inputs import record_input_closure
+    record_input_closure(job_dir, m)
     save_manifest(job_dir, m)
     return m

@@ -19,6 +19,17 @@ deprecation warnings); full-repository Ruff, `node --check` for 25 first-party J
 were not rerun, so the 2026-08-13 frozen binary hash above remains historical artifact evidence and
 is not upgraded by this software-only validation.
 
+2026-08-20 在隔离 worktree 完成严格复用 P1 加固后，全量 pytest 为 **3735 passed、5 skipped**
+（199.15 秒；15 条 ASE/NumPy 上游弃用警告）；全仓 Ruff、25 个第一方 JavaScript 文件的
+`node --check`、25 个变更 Python 文件的 `py_compile` 与 `git diff --check` 通过。未连接真实
+集群执行 VASP，也未重建发行包，因此这些门只证明软件合同，不升级科学结论或冻结发行资格。
+
+After the P1 strict-reuse hardening on 2026-08-20, the isolated worktree passed the full test suite:
+**3735 passed and 5 skipped** in 199.15 s, with 15 upstream ASE/NumPy deprecation warnings. Full-repository
+Ruff, `node --check` for 25 first-party JavaScript files, `py_compile` for 25 changed Python files, and
+`git diff --check` also passed. No real-cluster VASP run or release rebuild was performed, so these gates
+prove software contracts only and do not upgrade scientific or frozen-release qualification.
+
 ### 报告、状态与项目工作区（Phase A–B）
 - 建立报告与状态合同，明确稳定项目身份、服务端快照、门禁结论、产物状态和 revision
   之间的绑定关系；未通过门禁或缺少证据时保留诊断状态，不冒充最终发布结果。
@@ -64,6 +75,13 @@ is not upgraded by this software-only validation.
   opt-in, creates fresh provenance and a durable decision, revalidates hash-bound results, recovers from a
   prepared transaction, and never inherits accepted/final qualification. Legacy recipe-less jobs remain
   explicitly incomplete, and both Jobs and Project submission apply the same pre-network guard.
+- 严格复用门进一步绑定 VASP 实际输入闭包（包括 restart/VDW/ICONST/ML/KPOINTS_OPT 与 NEB 全 image）、
+  当前输出重新解析的 task-aware 收敛证据、registry/manifest 双重项目身份和物化事务 CAS。浏览器提示继续
+  使用有界非权威索引，而提交放行只接受完整权威扫描；任何超限、篡改、未知身份或显式失败证据均失败闭合。
+  The strict reuse gate now binds VASP's actual input closure, task-aware convergence reparsed from current
+  hash-bound outputs, cross-checked project identity, and materialization CAS. Browser advice remains bounded
+  and non-authoritative; submission relies on a complete authoritative scan and fails closed on limits,
+  tampering, unknown identity, or explicit contradictory result evidence.
 
 ### 分析、资源与治理 / Analysis, resources, and governance
 - Analysis capability cards 以服务端证据区分 available、missing prerequisite、mode mismatch、

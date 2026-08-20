@@ -41,6 +41,11 @@ class ClusterProfile:
     # 否则 CP2K/Gaussian/CASTEP 作业会在集群上误跑 vasp_std。
     vasp_cmd: str = ''           # 完整 VASP 执行行(mpirun/srun …)
     engine_commands: dict = field(default_factory=dict)
+    # Admin/user-attested VASP binary identity.  All three fields are required
+    # before strict reuse may treat a planned execution environment as complete.
+    vasp_version: str = ''
+    vasp_build_identity: str = ''
+    vasp_build_evidence_sha256: str = ''
     # 按引擎分开的运行命令，如 {'cp2k': 'cp2k.psmp -i {input} -o {stem}.out'}
     # ── S2 提交脚本双轨 ──
     script_mode: str = 'auto'    # 'auto'(参数生成) | 'template'(用户模板透传)
@@ -87,6 +92,15 @@ def save_profiles(profiles: dict, path: str | os.PathLike | None = None) -> Path
     target = Path(path) if path is not None else default_clusters_path()
     out = {'clusters': {}}
     for name, p in profiles.items():
+        # All-empty is the supported legacy/incomplete state.  Once any build
+        # identity field is supplied, require a complete authority tuple so a
+        # half-edited profile can never be persisted and later mistaken for
+        # scientific execution evidence.
+        from vcstudio.shared.execution_environment import from_cluster_profile
+        try:
+            from_cluster_profile(p)
+        except ValueError as exc:
+            raise ValueError(f'集群「{name}」VASP 执行环境证据无效：{exc}') from exc
         d = asdict(p)
         d.pop('name', None)
         out['clusters'][name] = d

@@ -155,14 +155,24 @@ def build_dimer_job(src_dir, out_root, *, displaced_poscar=None, seed: int = 0,
     syms, _counts = parse_poscar_species(poscar_text)
     system = poscar_text.splitlines()[0].strip() if poscar_text.strip() else Path(out_root).name
     parent = str(Path(src_dir).resolve())
+    from vcstudio.generate.method_recipe import builder_recipe
+    inputs = {
+        'engine': 'vasp', 'parent_job': parent, 'derived_from': source_name,
+        'modecar_method': method, 'incar_changes': changes,
+        'elements': list(syms),
+        'method_recipe': builder_recipe(
+            builder='vcstudio.generate.dimer_builder/v1', task_type='dimer',
+            calc_type='slab', validate=True,
+            completions={'incar_changes': changes}, kpoints_source='parent-copy',
+            extra={'modecar_method': method, 'seed': int(seed),
+                   'amplitude': float(amplitude)}),
+    }
     m = manifest_mod.new_manifest(
         job_id=f'{Path(out_root).name}-dimer', system=system, task_type='dimer',
-        calc_type='slab',
-        inputs={'parent_job': parent, 'derived_from': source_name,
-                'modecar_method': method, 'incar_changes': changes,
-                'elements': list(syms)},
-        warnings=warnings)
+        calc_type='slab', inputs=inputs, warnings=warnings)
     m['parent_job'] = parent
+    from vcstudio.shared.scientific_inputs import record_input_closure
+    record_input_closure(out_root, m)
     manifest_mod.save_manifest(out_root, m)
     return {'out_dir': str(out_root), 'changes': changes, 'warnings': warnings,
             'modecar_method': method}

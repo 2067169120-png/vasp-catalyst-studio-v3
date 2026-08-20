@@ -340,7 +340,8 @@ _README = """NEB 作业目录(vcstudio 生成)
 def build_neb_dir(out_dir, poscar_ini: str, poscar_fin: str, incar_text: str, *,
                   n_images: int = DEFAULT_N_IMAGES, climbing: bool = True,
                   spring: float = DEFAULT_SPRING, kpoints=None,
-                  potcar_fn=None) -> dict:
+                  potcar_fn=None, execution_environment: dict | None = None,
+                  method_recipe: dict | None = None) -> dict:
     """生成标准 VASP NEB 目录树 + 根 INCAR/POTCAR/KPOINTS + job.yaml。
 
     布局:``00/POSCAR``(初)、``01..N/POSCAR``(插值)、``(N+1)/POSCAR``(末),根目录
@@ -398,6 +399,7 @@ def build_neb_dir(out_dir, poscar_ini: str, poscar_fin: str, incar_text: str, *,
 
     # job.yaml(task_type='neb';记 n_images/climbing/两端来源哈希 溯源)
     inputs = {
+        'engine': 'vasp',
         'n_images': n_images,
         'climbing': bool(climbing),
         'spring': spring,
@@ -407,10 +409,27 @@ def build_neb_dir(out_dir, poscar_ini: str, poscar_fin: str, incar_text: str, *,
         'poscar_fin_sha256': _sha256_text(poscar_fin),
         'incar_source': 'user+neb_completion' if completion_block else 'user_verbatim',
     }
+    from vcstudio.generate.method_recipe import builder_recipe, validate_method_recipe
+    inputs['method_recipe'] = (
+        validate_method_recipe(method_recipe) if method_recipe is not None else
+        builder_recipe(
+            builder='vcstudio.generate.neb_builder/v1', task_type='neb',
+            calc_type='slab', validate=True,
+            completions={
+                'IMAGES': n_images, 'SPRING': spring, 'LCLIMB': bool(climbing)},
+            kpoints_source=('explicit' if kpoints is not None else 'recommended'),
+            extra={'n_images': n_images, 'climbing': bool(climbing), 'spring': spring},
+        ))
+    if execution_environment is not None:
+        from vcstudio.shared.execution_environment import validate_execution_environment
+        inputs['execution_environment'] = validate_execution_environment(
+            execution_environment)
     system = ini_ep['header'][0].strip() or out_dir.name
     m = manifest_mod.new_manifest(
         job_id=f'{out_dir.resolve().name}-neb', system=system, task_type='neb',
         calc_type='slab', inputs=inputs, warnings=warnings)
+    from vcstudio.shared.scientific_inputs import record_input_closure
+    record_input_closure(out_dir, m)
     manifest_mod.save_manifest(out_dir, m)
 
     return {'job_dir': str(out_dir), 'n_images': n_images, 'warnings': warnings}

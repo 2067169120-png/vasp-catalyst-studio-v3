@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import os
 from pathlib import Path
 import types
 
@@ -13,6 +14,15 @@ from vcstudio.cluster.profiles import ClusterProfile
 from vcstudio.gui_web.api import Api
 from vcstudio.project import calculation_reuse as reuse
 from vcstudio.shared import manifest as manifest_mod
+from vcstudio.generate.method_recipe import (
+    METHOD_RECIPE_AUTHORITY,
+    METHOD_RECIPE_SCHEMA,
+)
+from vcstudio.shared.execution_environment import (
+    EXECUTION_ENVIRONMENT_AUTHORITY,
+    EXECUTION_ENVIRONMENT_SCHEMA,
+)
+from vcstudio.shared.scientific_inputs import record_input_closure
 
 
 POSCAR = """strict structure
@@ -73,6 +83,10 @@ def _write_job(
     if state == "DONE":
         (root / "OUTCAR").write_text(
             result_content
+            + "\n NELM = 60 ; NSW = 100 ; EDIFFG = -0.05\n"
+            + " aborting loop because EDIFF is reached\n"
+            + " reached required accuracy - stopping structural energy minimisation\n"
+            + " energy(sigma->0) = -12.50000000\n"
             + "\nGeneral timing and accounting informations for this job\n",
             encoding="utf-8")
         (root / "OSZICAR").write_text(
@@ -94,11 +108,20 @@ def _write_job(
         "sha256": {name: _sha(root / name) for name in reuse._INPUT_FILES},
         "potcar_sha256": _sha(root / "POTCAR"),
         "method_recipe": {
-            "schema": "vcstudio.method-recipe/v1",
+            "schema": METHOD_RECIPE_SCHEMA,
+            "authority": METHOD_RECIPE_AUTHORITY,
             "semantic_sha256": recipe_hash,
         } if recipe_hash is not None else None,
         "execution_environment": {
-            "vasp_version": vasp_version, "build_identity": build_identity,
+            "schema": EXECUTION_ENVIRONMENT_SCHEMA,
+            "authority": EXECUTION_ENVIRONMENT_AUTHORITY,
+            "engine": "vasp",
+            "vasp_version": vasp_version,
+            "build_identity": build_identity,
+            "evidence": {
+                "kind": "test-build-attestation",
+                "sha256": "e" * 64,
+            },
         },
     }
     if inputs["method_recipe"] is None:
@@ -113,8 +136,40 @@ def _write_job(
         "attempts": [{"n": 1, "cores": 24, "walltime": "02:00:00"}],
         "results": results, "warnings": [],
     }
+    record_input_closure(root, manifest)
     manifest_mod.save_manifest(root, manifest)
     return manifest
+
+
+def _record_reuse(target, source, **kwargs):
+    target_manifest = manifest_mod.load_manifest(target) or {}
+    source_manifest = manifest_mod.load_manifest(source) or {}
+    return reuse.record_reuse_reference(
+        target, source,
+        target_project_id=target_manifest.get("project_uuid"),
+        source_project_id=source_manifest.get("project_uuid"),
+        **kwargs,
+    )
+
+
+def _project_role_map(*paths):
+    result = {}
+    for path in paths:
+        manifest = manifest_mod.load_manifest(path) or {}
+        result[os.path.normcase(os.path.normpath(str(path)))] = {
+            "project_id": manifest.get("project_uuid"),
+        }
+    return result
+
+
+def _attested_profile(name="hpc", **kwargs):
+    return ClusterProfile(
+        name=name, hostname="cluster", auth="key",
+        vasp_version="6.4.3",
+        vasp_build_identity="linux-x86_64-oneapi-2025",
+        vasp_build_evidence_sha256="e" * 64,
+        **kwargs,
+    )
 
 
 def test_canonical_fingerprint_normalises_float_spelling_and_comments(tmp_path):
@@ -200,7 +255,8 @@ def test_legacy_recipe_or_missing_version_is_incomplete_not_exact(tmp_path):
     assert legacy_fp["recipe_status"] == "explicit_legacy"
     assert "method_recipe.semantic_sha256" in legacy_fp["missing"]
     assert version_fp["status"] == "incomplete" and version_fp["digest"] is None
-    assert "execution_environment.vasp_version" in version_fp["missing"]
+    assert any(item.startswith("execution_environment.invalid:")
+               for item in version_fp["missing"])
 
 
 def test_manifest_input_tamper_fails_closed(tmp_path):
@@ -211,7 +267,8 @@ def test_manifest_input_tamper_fails_closed(tmp_path):
     fingerprint = reuse.build_scientific_fingerprint(job)
 
     assert fingerprint["status"] == "incomplete" and fingerprint["digest"] is None
-    assert "INCAR no longer matches job.yaml" in fingerprint["integrity_issues"]
+    assert "current scientific input closure no longer matches job.yaml" in \
+        fingerprint["integrity_issues"]
 
 
 def _index(paths, *, limit=512):
@@ -274,9 +331,9 @@ def test_explicit_cross_project_reuse_creates_new_lineage_without_final_inherita
     _write_job(target, "job-target", project_uuid="project-a")
     _write_job(source, "job-source", state="DONE", project_uuid="project-b")
 
-    result = reuse.record_reuse_reference(
+    result = _record_reuse(
         target, source, decision_id="reuse-decision-001", reason="same strict method",
-        target_project_id="project-a", source_project_id="project-b")
+    )
     manifest = manifest_mod.load_manifest(target)
 
     assert result["ok"] is True and result["state"] == "DONE"
@@ -290,7 +347,8 @@ def test_explicit_cross_project_reuse_creates_new_lineage_without_final_inherita
     assert manifest["provenance"]["schema"] == reuse.PROVENANCE_SCHEMA
     assert manifest["provenance"]["links"] == [{
         "id": "reuse-decision-001", "type": "reuses", "from": "job-target",
-        "to": "job-source", "decision_id": "reuse-decision-001", "cross_project": True,
+        "to": "job-source", "decision_id": "reuse-decision-001",
+        "project_relation": "different", "cross_project": True,
     }]
     assert "accepted" not in manifest and "final" not in manifest
 
@@ -311,7 +369,7 @@ def test_source_accepted_and_final_like_authority_is_never_copied(tmp_path):
     })
     manifest_mod.save_manifest(source, source_manifest)
 
-    reuse.record_reuse_reference(
+    _record_reuse(
         target, source, decision_id="reuse-no-authority", reason="same calculation")
     persisted = manifest_mod.load_manifest(target)
 
@@ -341,15 +399,20 @@ def test_full_kpoints_line_mode_and_weights_affect_strict_identity(tmp_path):
     assert left["digest"] != right["digest"]
 
 
-@pytest.mark.parametrize("state", ["FAILED", "UNCONVERGED", "NEEDS_HUMAN"])
-def test_bad_results_cannot_be_reused(tmp_path, state):
+@pytest.mark.parametrize(
+    ("state", "expected_status"),
+    [("FAILED", "failed"), ("UNCONVERGED", "unconverged"),
+     ("NEEDS_HUMAN", "incomplete")],
+)
+def test_bad_results_cannot_be_reused(tmp_path, state, expected_status):
     target = tmp_path / "target"
     source = tmp_path / "source"
     _write_job(target, "job-target")
     _write_job(source, "job-source", state=state)
 
+    assert reuse.source_verification(source)["status"] == expected_status
     with pytest.raises(reuse.ScientificFingerprintError, match="not complete"):
-        reuse.record_reuse_reference(
+        _record_reuse(
             target, source, decision_id=f"reuse-{state.lower()}", reason="try")
     assert manifest_mod.load_manifest(target)["state"] == "CREATED"
 
@@ -364,7 +427,7 @@ def test_reuse_revalidates_result_bytes_at_commit_to_close_toctou(tmp_path):
         (source / "OUTCAR").write_text("tampered after choice\n", encoding="utf-8")
 
     with pytest.raises(reuse.ScientificFingerprintError, match="changed during"):
-        reuse.record_reuse_reference(
+        _record_reuse(
             target, source, decision_id="reuse-toctou", reason="same", before_commit=tamper)
     assert manifest_mod.load_manifest(target)["state"] == "CREATED"
     assert not manifest_mod.load_manifest(target).get("reuse_decisions")
@@ -376,15 +439,15 @@ def test_reuse_decision_is_restart_idempotent_and_conflicts_fail(tmp_path):
     _write_job(target, "job-target")
     _write_job(source, "job-source", state="DONE")
 
-    first = reuse.record_reuse_reference(
+    first = _record_reuse(
         target, source, decision_id="reuse-idempotent", reason="same")
-    replay = reuse.record_reuse_reference(
+    replay = _record_reuse(
         target, source, decision_id="reuse-idempotent", reason="same")
 
     assert first["replayed"] is False and replay["replayed"] is True
     assert len(manifest_mod.load_manifest(target)["reuse_decisions"]) == 1
     with pytest.raises((reuse.ReuseConflictError, reuse.ScientificFingerprintError)):
-        reuse.record_reuse_reference(
+        _record_reuse(
             target, source, decision_id="reuse-idempotent", reason="different")
 
 
@@ -393,12 +456,12 @@ def test_replay_revalidates_source_instead_of_trusting_old_success(tmp_path):
     source = tmp_path / "source"
     _write_job(target, "job-target")
     _write_job(source, "job-source", state="DONE")
-    reuse.record_reuse_reference(
+    _record_reuse(
         target, source, decision_id="reuse-stale-replay", reason="same")
     (source / "OUTCAR").write_text("source changed later\n", encoding="utf-8")
 
     with pytest.raises(reuse.ScientificFingerprintError, match="not complete"):
-        reuse.record_reuse_reference(
+        _record_reuse(
             target, source, decision_id="reuse-stale-replay", reason="same")
     assert manifest_mod.load_manifest(target)["state"] == "DONE"
 
@@ -414,7 +477,7 @@ def test_prepared_reuse_recovers_after_restart_between_file_and_manifest_commit(
             raise RuntimeError("simulated process interruption")
 
     with pytest.raises(RuntimeError, match="simulated process interruption"):
-        reuse.record_reuse_reference(
+        _record_reuse(
             target, source, decision_id="reuse-recover-001", reason="same",
             after_materialize=crash_after_first)
     prepared = manifest_mod.load_manifest(target)
@@ -422,7 +485,7 @@ def test_prepared_reuse_recovers_after_restart_between_file_and_manifest_commit(
     assert prepared["reuse_decisions"][0]["status"] == "prepared"
     assert len([name for name in ("OUTCAR", "OSZICAR") if (target / name).exists()]) == 1
 
-    recovered = reuse.record_reuse_reference(
+    recovered = _record_reuse(
         target, source, decision_id="reuse-recover-001", reason="same")
     persisted = manifest_mod.load_manifest(target)
 
@@ -445,7 +508,7 @@ def test_reuse_rechecks_source_after_result_materialization(tmp_path):
             oszicar.write_bytes(b"tampered after its verified copy\n")
 
     with pytest.raises(reuse.ScientificFingerprintError, match="source changed"):
-        reuse.record_reuse_reference(
+        _record_reuse(
             target, source, decision_id="reuse-final-toctou-001",
             reason="duplicate", after_materialize=tamper_after_first_copy)
 
@@ -454,7 +517,7 @@ def test_reuse_rechecks_source_after_result_materialization(tmp_path):
     assert prepared["reuse_decisions"][0]["status"] == "prepared"
 
     oszicar.write_bytes(original)
-    recovered = reuse.record_reuse_reference(
+    recovered = _record_reuse(
         target, source, decision_id="reuse-final-toctou-001", reason="duplicate")
     assert recovered["ok"] is True
     assert manifest_mod.load_manifest(target)["state"] == "DONE"
@@ -468,7 +531,7 @@ def test_concurrent_reuse_never_creates_two_decisions(tmp_path):
 
     def invoke():
         try:
-            return reuse.record_reuse_reference(
+            return _record_reuse(
                 target, source, decision_id="reuse-concurrent", reason="same")
         except JobOperationBusy:
             return {"busy": True}
@@ -508,7 +571,7 @@ def test_public_projection_contains_no_paths_secrets_or_potcar_content(tmp_path)
     assert str(tmp_path) not in serialized
     assert "payload-C" not in serialized and "PAW data bytes" not in serialized
     assert "password" not in serialized.lower() and "secret" not in serialized.lower()
-    assert public["status"] == "complete" and len(public["fields"]) == 7
+    assert public["status"] == "complete" and len(public["fields"]) == 8
 
 
 class _LiveLedger:
@@ -530,7 +593,7 @@ def test_api_advisory_accepts_only_opaque_ids_and_redacts_locators(tmp_path):
     _write_job(target, "opaque-target")
     _write_job(source, "opaque-source", state="DONE")
     api = Api(ledger_mod=_LiveLedger([target, source]))
-    api._project_role_map = lambda: {}
+    api._project_role_map = lambda: _project_role_map(target, source)
 
     result = api.jobs_reuse_advisory(["opaque-target"])
     rejected = api.jobs_reuse_advisory([str(target)])
@@ -548,7 +611,7 @@ def test_api_explicit_reference_resolves_ids_server_side(tmp_path):
     _write_job(target, "opaque-target")
     _write_job(source, "opaque-source", state="DONE")
     api = Api(ledger_mod=_LiveLedger([target, source]))
-    api._project_role_map = lambda: {}
+    api._project_role_map = lambda: _project_role_map(target, source)
 
     result = api.jobs_reference_existing_result(
         "opaque-target", "opaque-source", "api-reuse-001", "verified duplicate")
@@ -567,11 +630,11 @@ def test_submit_api_requires_force_reason_for_reusable_exact_match(tmp_path):
     batch = types.SimpleNamespace(submit_batch=lambda _profile, _password, dirs, _trust:
                                   calls.append(list(dirs)) or {
                                       "needs_trust": False, "results": []})
-    profile = ClusterProfile(name="hpc", hostname="cluster", auth="key")
+    profile = _attested_profile()
     api = Api(
         ledger_mod=_LiveLedger([target, source]),
         profiles_mod=_profiles({"hpc": profile}), batch_ops_mod=batch)
-    api._project_role_map = lambda: {}
+    api._project_role_map = lambda: _project_role_map(target, source)
 
     blocked = api.submit_jobs([str(target)], "hpc", None, False, "submit-guard-001")
     forced = api.jobs_force_recalculation(
@@ -592,8 +655,8 @@ def test_api_force_recalculation_rejects_missing_reason_and_is_restart_idempoten
     ledger = _LiveLedger([target])
     first_api = Api(ledger_mod=ledger)
     second_api = Api(ledger_mod=ledger)
-    first_api._project_role_map = lambda: {}
-    second_api._project_role_map = lambda: {}
+    first_api._project_role_map = lambda: _project_role_map(target)
+    second_api._project_role_map = lambda: _project_role_map(target)
 
     missing = first_api.jobs_force_recalculation(["opaque-target"], "force-api-002", "")
     first = first_api.jobs_force_recalculation(
@@ -617,14 +680,14 @@ def test_project_submission_uses_same_guard_and_request_idempotency(tmp_path):
                                       "needs_trust": False,
                                       "results": [(str(target), True, "job-42")],
                                   })
-    profile = ClusterProfile(name="hpc", hostname="cluster", auth="key")
+    profile = _attested_profile()
     project = {"name": "strict-project", "launch": {}, "root": str(tmp_path)}
     adsorption = types.SimpleNamespace(save_project=lambda _root, _project: None)
     config = types.SimpleNamespace(set_ui_state=lambda **_kwargs: None)
     api = Api(
         ledger_mod=_LiveLedger([target, source]), profiles_mod=_profiles({"hpc": profile}),
         batch_ops_mod=batch, adsorption_mod=adsorption, config_mod=config)
-    api._project_role_map = lambda: {}
+    api._project_role_map = lambda: _project_role_map(target, source)
     api._load_project_for_path = lambda _path: project
     api._project_member_dirs = lambda _project: [str(target)]
 

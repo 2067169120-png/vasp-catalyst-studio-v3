@@ -20,7 +20,8 @@
     'cl-usejump', 'cl-jumphost', 'cl-jumpuser', 'cl-jumpport',
     'cl-remoteroot', 'cl-scheduler', 'cl-schedbin', 'cl-queue', 'cl-nodes',
     'cl-ppn', 'cl-walltime', 'cl-env', 'cl-vaspcmd', 'cl-cp2kcmd',
-    'cl-gaussiancmd', 'cl-castepcmd', 'cl-template',
+    'cl-gaussiancmd', 'cl-castepcmd', 'cl-vaspversion', 'cl-vaspbuild',
+    'cl-vaspevidence', 'cl-template',
   ]);
 
   // ── 表单读写 ────────────────────────────────────────────────────────────────
@@ -60,6 +61,9 @@
       env_lines: ($('cl-env') && $('cl-env').value || '')
         .split(/\r?\n/).map(s => s.trim()).filter(Boolean),
       vasp_cmd: ($('cl-vaspcmd') && $('cl-vaspcmd').value || '').trim(),
+      vasp_version: trimval('cl-vaspversion'),
+      vasp_build_identity: trimval('cl-vaspbuild'),
+      vasp_build_evidence_sha256: trimval('cl-vaspevidence').toLowerCase(),
       script_mode: radio('cl-mode') || 'auto',
       template_path: trimval('cl-template'),
     };
@@ -97,6 +101,9 @@
     set('cl-walltime', p.walltime || '24:00:00');
     set('cl-env', (p.env_lines || []).join('\n'));
     set('cl-vaspcmd', p.vasp_cmd || '');
+    set('cl-vaspversion', p.vasp_version || '');
+    set('cl-vaspbuild', p.vasp_build_identity || '');
+    set('cl-vaspevidence', p.vasp_build_evidence_sha256 || '');
     const commands = p.engine_commands || {};
     set('cl-cp2kcmd', commands.cp2k || '');
     set('cl-gaussiancmd', commands.gaussian || '');

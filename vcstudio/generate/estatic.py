@@ -249,6 +249,14 @@ def build_static_job(relax_dir, out_dir, *, purpose: str = 'pdos',
         'kpoints': list(new_grid),
         'incar_changes': list(changes),
     }
+    from vcstudio.generate.method_recipe import builder_recipe
+    inputs['method_recipe'] = builder_recipe(
+        builder='vcstudio.generate.estatic/v1',
+        task_type=_PURPOSE_TASK_TYPES[purpose], calc_type='derived-parent',
+        validate=True, completions={'incar_changes': list(changes)},
+        kpoints_source='parent-density-multiplier',
+        extra={'purpose': purpose, 'kpts_multiplier': float(kpts_multiplier),
+               'kpoints': list(new_grid), 'derived_metadata': derived_meta})
     if derived_meta:
         inputs['derived_metadata'] = derived_meta
 
@@ -287,6 +295,8 @@ def build_static_job(relax_dir, out_dir, *, purpose: str = 'pdos',
     for key, value in {**legacy, **derived_meta}.items():
         if key not in manifest:
             manifest[key] = value
+    from vcstudio.shared.scientific_inputs import record_input_closure
+    record_input_closure(out_path, manifest)
     manifest_mod.save_manifest(out_path, manifest)
 
     return {'out_dir': str(out_dir), 'changes': changes, 'warnings': warnings}

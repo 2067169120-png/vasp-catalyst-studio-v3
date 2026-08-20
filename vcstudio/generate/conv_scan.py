@@ -210,15 +210,25 @@ def _save_conv_manifest(out_dir, src_dir, poscar_text, series, series_value,
     system = poscar_text.splitlines()[0].strip() if poscar_text.strip() else Path(out_dir).name
     parent = str(Path(src_dir).resolve())
     inputs = {
-        'parent_job': parent, 'series': series,
+        'engine': 'vasp', 'parent_job': parent, 'series': series,
         'series_value': series_value, 'series_label': series_label,
         'natoms': int(sum(counts)) if counts else None,
         'incar_changes': changes, 'elements': list(syms),
     }
+    from vcstudio.generate.method_recipe import builder_recipe
+    inputs['method_recipe'] = builder_recipe(
+        builder='vcstudio.generate.conv_scan/v1', task_type='conv_scan',
+        calc_type='slab', validate=True,
+        completions={'incar_changes': changes},
+        kpoints_source=('generated-series' if series == 'kmesh' else 'parent-copy'),
+        extra={'series': series, 'series_value': series_value,
+               'series_label': series_label})
     m = manifest_mod.new_manifest(
         job_id=f'{Path(out_dir).name}-conv', system=system, task_type='conv_scan',
         calc_type='slab', inputs=inputs, warnings=warnings)
     m['parent_job'] = parent
+    from vcstudio.shared.scientific_inputs import record_input_closure
+    record_input_closure(out_dir, m)
     manifest_mod.save_manifest(out_dir, m)
     return m
 

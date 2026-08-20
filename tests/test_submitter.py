@@ -9,6 +9,7 @@ from vcstudio.cluster.profiles import ClusterProfile
 from vcstudio.cluster import submitter
 from vcstudio.generate.job_builder import build_job_dir
 from vcstudio.shared import manifest
+from vcstudio.shared.scientific_inputs import record_input_closure
 
 
 # ── 假件:模仿 paramiko 的最小表面 ──
@@ -239,6 +240,7 @@ def test_batch_members_upload_their_own_distinct_incars(tmp_path):
         item = manifest.load_manifest(job_dir)
         item.setdefault('inputs', {}).setdefault('sha256', {})['INCAR'] = \
             manifest.sha256_file(incar)
+        record_input_closure(job_dir, item)
         manifest.save_manifest(job_dir, item)
 
     sftp = FakeSFTP()
@@ -317,6 +319,7 @@ def test_vasp_task_specific_inputs_are_required_and_uploaded(
     d = _job_dir(tmp_path)
     data = manifest.load_manifest(d)
     data['task_type'] = task_type
+    record_input_closure(d, data)
     manifest.save_manifest(d, data)
 
     errs = submitter.preflight(_profile(), d)
@@ -324,6 +327,9 @@ def test_vasp_task_specific_inputs_are_required_and_uploaded(
 
     with open(os.path.join(d, extra), 'w', encoding='utf-8') as handle:
         handle.write('required task input\n')
+    data = manifest.load_manifest(d)
+    record_input_closure(d, data)
+    manifest.save_manifest(d, data)
     assert submitter.preflight(_profile(), d) == []
     client = FakeClient(script=[('qsub', '711.cluster\n')])
     sftp = FakeSFTP()
@@ -339,12 +345,16 @@ def test_vasp_icharg_hard_input_is_required_independent_of_task_name(tmp_path):
     # keep its immutable-input evidence in sync before testing CHGCAR gating.
     item = manifest.load_manifest(d)
     item['inputs']['sha256']['INCAR'] = manifest.sha256_file(os.path.join(d, 'INCAR'))
+    record_input_closure(d, item)
     manifest.save_manifest(d, item)
     errs = submitter.preflight(_profile(), d)
     assert any('CHGCAR' in issue and 'ICHARG=11' in issue for issue in errs)
 
     with open(os.path.join(d, 'CHGCAR'), 'w', encoding='utf-8') as handle:
         handle.write('required fixed charge density\n')
+    item = manifest.load_manifest(d)
+    record_input_closure(d, item)
+    manifest.save_manifest(d, item)
     assert submitter.preflight(_profile(), d) == []
     sftp = FakeSFTP()
     m = submitter.submit_job(
@@ -1216,6 +1226,7 @@ def test_refresh_job_running_live_health(tmp_path):
     d = _job_dir(tmp_path)
     current = manifest.load_manifest(d)
     current['task_type'] = 'relax'
+    record_input_closure(d, current)
     manifest.save_manifest(d, current)
     submitter.submit_job(FakeClient(script=[('qsub', '61.c\n')]), FakeSFTP(), _profile(), d)
     live_out = ('4\n___VCSLIVE___\n  FORCES: max atom, RMS   0.031456   0.0122\n'

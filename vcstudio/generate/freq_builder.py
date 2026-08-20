@@ -449,6 +449,7 @@ def _save_freq_manifest(out_dir, relax_dir, poscar_text, source_name,
     system = poscar_text.splitlines()[0].strip() if poscar_text.strip() else Path(out_dir).name
     parent = str(Path(relax_dir).resolve())
     inputs = {
+        'engine': 'vasp',
         'parent_job': parent,
         'derived_from': source_name,               # CONTCAR / POSCAR
         'free_indices': list(free),
@@ -456,10 +457,19 @@ def _save_freq_manifest(out_dir, relax_dir, poscar_text, source_name,
         'incar_changes': changes,
         'elements': list(syms),
     }
+    from vcstudio.generate.method_recipe import builder_recipe
+    inputs['method_recipe'] = builder_recipe(
+        builder='vcstudio.generate.freq_builder/v1', task_type='freq',
+        calc_type=calc_type, validate=True,
+        completions={'incar_changes': changes},
+        kpoints_source='derived-frequency-policy',
+        extra={'free_indices': list(free), 'n_free': len(free)})
     m = manifest_mod.new_manifest(
         job_id=f'{Path(out_dir).name}-freq', system=system, task_type='freq',
         calc_type=calc_type, inputs=inputs, warnings=warnings)
     m['parent_job'] = parent                        # 顶层冗余一份,便于快速溯源
+    from vcstudio.shared.scientific_inputs import record_input_closure
+    record_input_closure(out_dir, m)
     manifest_mod.save_manifest(out_dir, m)
     return m
 

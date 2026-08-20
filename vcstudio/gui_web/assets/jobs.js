@@ -613,16 +613,21 @@
     const verification = match && match.verification || {};
     const status = reuseStatusLabel(verification.status);
     const saved = reuseSavingsText(match && match.saved_estimate);
-    const cross = match && match.cross_project
-      ? tr('jobs.reuse.cross_project', {}, '跨项目来源', 'Cross-project source') : '';
+    const relation = String(match && match.project_relation || 'unknown');
+    const relationLabels = {
+      same: tr('jobs.reuse.same_project', {}, '同项目来源', 'Same-project source'),
+      different: tr('jobs.reuse.cross_project', {}, '跨项目来源', 'Cross-project source'),
+      unknown: tr('jobs.reuse.project_unknown', {}, '项目关系未知', 'Project relation unknown'),
+    };
+    const projectRelation = relationLabels[relation] || relationLabels.unknown;
     const diffs = exact ? '' : (match && match.differences || []).map(diff =>
       `<li>${VCS.esc(String(diff.field || 'unknown'))}: ` +
       `${VCS.esc(String(diff.target_digest || 'incomplete'))} → ` +
       `${VCS.esc(String(diff.source_digest || 'incomplete'))}</li>`).join('');
-    const canReuse = exact && verification.reusable === true;
+    const canReuse = exact && verification.reusable === true && relation !== 'unknown';
     return `<li class="jobs-reuse-match ${exact ? (canReuse ? 'exact' : 'bad') : 'near'}">` +
       `<b>${VCS.esc(String(match && match.source_job_id || 'unknown'))}</b> · ` +
-      `${VCS.esc(status)} · ${VCS.esc(saved)}${cross ? ` · ${VCS.esc(cross)}` : ''}` +
+      `${VCS.esc(status)} · ${VCS.esc(saved)} · ${VCS.esc(projectRelation)}` +
       (exact && verification.issues && verification.issues.length
         ? `<div class="sub">${VCS.esc(verification.issues.join('；'))}</div>` : '') +
       (diffs ? `<div class="sub">${VCS.esc(tr('jobs.reuse.near_boundary', {},
@@ -693,16 +698,24 @@
         `</section>`;
     }).join('');
     const index = result.index || {};
+    const pagination = result.pagination || {};
+    const truncation = result.truncated
+      ? tr('jobs.reuse.truncated', {}, '结果已按资源上限截断；可通过服务端分页继续检查。',
+        'Results are truncated by resource limits; continue through server pagination.') : '';
     output.innerHTML = targets + `<p class="jobs-reuse-boundary">${VCS.esc(tr(
       'jobs.reuse.boundary', {},
       `索引 ${index.indexed || 0}/${index.observed || 0}，容量 ${index.capacity || 0}；` +
-      '索引可重建且不是事实源。默认不自动复用；accepted/final 不继承。',
+      `本页候选 ${pagination.returned_candidates || 0}。` +
+      '索引可重建且不是事实源。默认不自动复用；accepted/final 不继承。' +
+      (truncation ? ` ${truncation}` : ''),
       `Index ${index.indexed || 0}/${index.observed || 0}, capacity ${index.capacity || 0}. ` +
-      'The rebuildable index is not authoritative. Reuse is never automatic; accepted/final are not inherited.'))}</p>`;
+      `This page has ${pagination.returned_candidates || 0} candidates. ` +
+      'The rebuildable index is not authoritative. Reuse is never automatic; accepted/final are not inherited.' +
+      (truncation ? ` ${truncation}` : '')))}</p>`;
     reasonWrap.hidden = !requiresReason;
   }
 
-  async function inspectSelectedReuse(forceRefresh = true) {
+  async function inspectSelectedReuse(forceRefresh = true, profileName = '') {
     const rows = selectedRows();
     const key = resourceForecastSelectionKey(rows);
     const ids = rows.map(stableJobId);
@@ -722,7 +735,11 @@
     State.reuseAdvisoryResult = null;
     renderReuseAdvisory();
     try {
-      const result = await VCS.call('jobs_reuse_advisory', ids);
+      // Only the opaque profile name crosses this seam.  The server binds the
+      // trusted execution attestation and computes every scientific value.
+      const result = profileName
+        ? await VCS.call('jobs_reuse_advisory', ids, 0, 64, 128, 'job_id_asc', profileName)
+        : await VCS.call('jobs_reuse_advisory', ids);
       if (generation !== State.reuseAdvisoryGeneration ||
           key !== resourceForecastSelectionKey(selectedRows())) return null;
       State.reuseAdvisoryResult = result || { ok: false };
@@ -1689,7 +1706,9 @@
         'Select one or more jobs to submit from the list'), 'failc');
       return;
     }
-    const reuseResult = await inspectSelectedReuse(true);
+    let reuseResult;
+    if (name) reuseResult = await inspectSelectedReuse(true, name);
+    else reuseResult = await inspectSelectedReuse(true);
     if (!reuseResult || !reuseResult.ok) {
       VCS.log(tr('jobs.reuse.submit_advisory_required', {},
         '提交前严格指纹查询失败；请检查提示后重试。不会在证据未知时自动复用。',

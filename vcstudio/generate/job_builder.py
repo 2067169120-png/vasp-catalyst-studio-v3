@@ -51,7 +51,9 @@ def _render_incar(original_text, incar_dict, completions, system_name):
 def build_job_dir(poscar_path, incar, out_dir, *,
                   calc_type: str = 'slab', kpoints=None, validate: bool = True,
                   lib_root: str | None = None, system_name: str = '',
-                  force_encut: int | None = None) -> dict:
+                  force_encut: int | None = None,
+                  execution_environment: dict | None = None,
+                  method_recipe: dict | None = None) -> dict:
     """生成 VASP 输入四件套到 out_dir。
 
     Args:
@@ -122,12 +124,26 @@ def build_job_dir(poscar_path, incar, out_dir, *,
         f.write(kpoints_str(kpts))
     shutil.copyfile(poscar_path, os.path.join(out_dir, 'POSCAR'))
 
+    from vcstudio.generate.method_recipe import builder_recipe, validate_method_recipe
+    recipe = (validate_method_recipe(method_recipe) if method_recipe is not None else
+              builder_recipe(
+                  builder='vcstudio.generate.job_builder/v1', task_type=task_type,
+                  calc_type=calc_type, validate=validate, completions=completions,
+                  kpoints_source=('explicit' if kpoints is not None else 'recommended'),
+                  extra={'force_encut': force_encut},
+              ))
+    environment = None
+    if execution_environment is not None:
+        from vcstudio.shared.execution_environment import validate_execution_environment
+        environment = validate_execution_environment(execution_environment)
+
     return {'ok': True, 'out_dir': str(out_dir), 'warnings': warnings,
             'kpoints': kpts, 'elements': elements,
             # 附加回传(向后兼容的新增键):manifest/预览用
             'completions': dict(completions), 'calc_type': calc_type,
             # 任务类型按 INCAR 推断(NSW=0→static 等):收敛判定按类型分流的前提
-            'task_type': task_type,
+            'task_type': task_type, 'method_recipe': recipe,
+            'execution_environment': environment,
             # 赝势身份溯源(审查#2):variant/TITEL/ENMAX 供 manifest 落档
             'potcar': potcar_provenance(elements, lib_root)}
 

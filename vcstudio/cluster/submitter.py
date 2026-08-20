@@ -28,6 +28,12 @@ from vcstudio.cluster.schedulers import (
 )
 from vcstudio.engines.calcspec import ENGINE_RUN_CONTRACTS, get_run_contract
 from vcstudio.shared import manifest as manifest_mod
+from vcstudio.shared.execution_environment import (
+    from_cluster_profile, validate_execution_environment,
+)
+from vcstudio.shared.scientific_inputs import (
+    closure_record_matches, recorded_closure, resolve_input_closure,
+)
 
 SCRIPT_NAME = 'vcs_job.sh'
 _INPUT_FILES = ('INCAR', 'POTCAR', 'KPOINTS', 'POSCAR')
@@ -664,6 +670,88 @@ def assert_profile_binding(profile, job_dir: str, action: str,
     return m
 
 
+def _environment_identity(value: dict) -> tuple[str, str, str, str]:
+    evidence = value.get('evidence') or {}
+    return (
+        str(value.get('engine') or '').strip().lower(),
+        str(value.get('vasp_version') or '').strip(),
+        str(value.get('build_identity') or '').strip(),
+        str(evidence.get('sha256') or '').strip().lower(),
+    )
+
+
+def _planned_execution_environment(profile) -> dict | None:
+    """Validate the profile's separate scientific build attestation.
+
+    Endpoint identity remains in ``cluster_binding`` and is deliberately not
+    folded into the scientific build identity.
+    """
+    return from_cluster_profile(profile)
+
+
+def _execution_environment_issues(profile, manifest: dict | None) -> list[str]:
+    if _job_engine(manifest) != 'vasp':
+        return []
+    try:
+        planned = _planned_execution_environment(profile)
+    except ValueError as exc:
+        return [f'集群 VASP 版本/编译环境证据不完整：{exc}']
+    inputs = (manifest or {}).get('inputs') or {}
+    current = inputs.get('execution_environment') if isinstance(inputs, dict) else None
+    if current is None:
+        return []
+    try:
+        authoritative = validate_execution_environment(current)
+    except ValueError as exc:
+        return [f'job.yaml 的 VASP 执行环境证据无效：{exc}']
+    if planned is None:
+        return [
+            'job.yaml 已绑定 VASP 版本/编译身份，但当前集群 profile 没有可核验的'
+            '对应环境证据；为防止方法漂移，已拒绝提交']
+    if _environment_identity(authoritative) != _environment_identity(planned):
+        return [
+            'job.yaml 已绑定的 VASP 版本/编译身份与当前集群 profile 证据冲突；'
+            '为防止方法漂移，已拒绝提交']
+    return []
+
+
+def _bind_execution_environment_locked(job_dir: str, profile,
+                                       manifest: dict | None = None) -> dict:
+    """Bind trusted profile evidence while the caller owns the job lock."""
+    item = manifest if manifest is not None else manifest_mod.load_manifest(job_dir)
+    if item is None:
+        raise ValueError('作业目录缺可读 job.yaml，无法绑定执行环境')
+    if _job_engine(item) != 'vasp':
+        return item
+    issues = _execution_environment_issues(profile, item)
+    if issues:
+        raise ValueError('；'.join(issues))
+    planned = _planned_execution_environment(profile)
+    if planned is None:
+        return item
+    inputs = item.setdefault('inputs', {})
+    current = inputs.get('execution_environment')
+    if current is not None:
+        # Validation and equality were checked above.  Preserve the original
+        # authoritative record byte-for-byte on an idempotent replay.
+        return item
+    inputs['execution_environment'] = planned
+    manifest_mod.save_manifest(job_dir, item)
+    return item
+
+
+def bind_execution_environment(job_dir: str, profile) -> dict:
+    """Atomically bind a profile's VASP build evidence before reuse advice.
+
+    This public entry point owns the per-job lock.  ``submit_job`` already owns
+    that lock and therefore calls the private ``*_locked`` helper instead.
+    Rebinding the same identity is idempotent; conflicting authority fails
+    closed without changing ``job.yaml``.
+    """
+    with job_operation(job_dir, '绑定 VASP 执行环境'):
+        return _bind_execution_environment_locked(job_dir, profile)
+
+
 def current_attempt_token(m: dict | None) -> str:
     """Return a stable token for the manifest's current scheduler attempt.
 
@@ -731,63 +819,32 @@ def _missing_command_message(profile, engine: str) -> str:
 def _declared_input_files(job_dir: str, m: dict | None) -> tuple[list[str], list[str]]:
     """Resolve and validate the files uploaded for one manifest.
 
-    VASP uses the four common files plus task-specific hard inputs (currently
-    CHGCAR for bands and MODECAR for Dimer).  Other engines use the explicit
-    ``inputs.files`` list.  The manifest is user-editable, so only files
-    directly inside ``job_dir`` are accepted; this prevents ``../`` or an
-    absolute path from uploading an unrelated local file under the user's SSH
-    credentials.
+    VASP consumes the shared task/INCAR-aware scientific closure; NEB image
+    paths are the only supported nested names.  Other engines consume their
+    explicit ``inputs.files`` closure.  Escapes, links and reserved journal
+    files are rejected before any SSH operation.
     """
     engine = _job_engine(m)
-    vasp_requirements: dict[str, str] = {}
-    if engine == 'vasp':
-        task = str((m or {}).get('task_type') or '').strip().lower()
-        for name in _VASP_TASK_INPUTS.get(task, ()):
-            vasp_requirements[name] = (
-                '能带 ICHARG=11' if name == 'CHGCAR'
-                else 'Dimer 初始模式' if name == 'MODECAR' else '该任务')
-        icharg = _local_vasp_icharg(job_dir)
-        if icharg in (1, 11):
-            vasp_requirements['CHGCAR'] = f'INCAR ICHARG={icharg}'
-        raw = list(_INPUT_FILES) + list(vasp_requirements)
-    else:
-        inputs = (m or {}).get('inputs') or {}
-        raw = inputs.get('files') if isinstance(inputs, dict) else None
-        if not isinstance(raw, list) or not raw:
-            return [], [
-                f'{_ENGINE_LABELS.get(engine, engine)} 作业清单缺 inputs.files；'
-                '请从「快速提交」重新导入输入文件。']
-    names: list[str] = []
+    if m is None:
+        # Preserve the established diagnostics for a directory with no
+        # manifest; preflight will separately report the missing job.yaml.
+        return [], ['作业目录缺 INCAR/POSCAR/KPOINTS/POTCAR(先在生成页产出四件套)']
+    closure = resolve_input_closure(job_dir, m)
+    names = list(closure.get('requirements') or {})
+    reasons = closure.get('requirements') or {}
     errs: list[str] = []
-    for item in raw:
-        name = str(item or '').strip()
-        if (not name or os.path.isabs(name) or os.path.basename(name) != name
-                or '/' in name or '\\' in name
-                or name in (manifest_mod.MANIFEST_NAME, SCRIPT_NAME)):
-            errs.append(f'作业清单输入文件名非法:{name!r}（只允许作业目录内的单个文件名）')
+    for name in closure.get('missing') or []:
+        reason = str(reasons.get(name) or '清单声明/闭包校验')
+        if str(name).startswith(('invalid input declaration:',
+                                 'invalid required input:')):
+            errs.append(f'作业清单输入文件名非法：{name}')
             continue
-        if name in names:
-            continue
-        local_path = os.path.join(job_dir, name)
-        if not os.path.isfile(local_path):
-            if engine == 'vasp' and name in vasp_requirements:
-                errs.append(
-                    f'作业目录缺 {name}（{vasp_requirements[name]} 的必需输入，提交前请补齐）')
-            elif engine == 'vasp':
-                errs.append(f'作业目录缺 {name}(先在生成页产出四件套)')
-            else:
-                errs.append(f'作业目录缺 {name}（清单 inputs.files 已声明）')
-            continue
-        root = os.path.realpath(job_dir)
-        resolved = os.path.realpath(local_path)
-        try:
-            inside = os.path.commonpath([root, resolved]) == root
-        except ValueError:
-            inside = False
-        if not inside:
-            errs.append(f'输入文件 {name} 指向作业目录之外，拒绝上传')
-            continue
-        names.append(name)
+        if engine == 'vasp':
+            errs.append(f'作业目录缺或无法安全读取 {name}（{reason} 的必需输入）')
+        else:
+            errs.append(
+                f'{_ENGINE_LABELS.get(engine, engine)} 输入闭包不完整：{name}（{reason}）')
+    names = [name for name in names if name in (closure.get('files') or {})]
     if not names and not errs:
         errs.append('作业清单没有可上传的输入文件')
     return names, errs
@@ -947,24 +1004,24 @@ def _neb_input_check(job_dir: str, m: dict) -> list:
     return errs
 
 
-def _upload_neb_tree(client, sftp, job_dir: str, remote_dir: str) -> int:
-    """整棵 NEB 目录树上传(根共享文件 + 各 image 子目录 POSCAR)。返回上传文件数。
-
-    递归 os.walk:逐子目录远端 mkdir -p,逐文件 sftp.put;跳过 job.yaml/脚本/*.bak/figs。
-    """
-    skip_names = {manifest_mod.MANIFEST_NAME, SCRIPT_NAME}
+def _upload_neb_tree(client, sftp, job_dir: str, remote_dir: str,
+                     manifest: dict | None = None) -> int:
+    """Upload exactly the task-aware NEB input closure, never local outputs."""
+    item = manifest if manifest is not None else manifest_mod.load_manifest(job_dir)
+    names, issues = _declared_input_files(job_dir, item)
+    if issues:
+        raise ValueError('；'.join(issues))
     count = 0
-    for root, dirs, files in os.walk(job_dir):
-        dirs[:] = [d for d in dirs if d != 'figs']       # 结构图缓存不上传
-        rel = os.path.relpath(root, job_dir)
-        rdir = remote_dir if rel == '.' else posixpath.join(remote_dir, rel.replace(os.sep, '/'))
-        if rel != '.':
-            run_cmd(client, f'mkdir -p {shlex.quote(rdir)}', check=True)
-        for fn in sorted(files):
-            if fn in skip_names or '.bak' in fn:
-                continue
-            sftp.put(os.path.join(root, fn), posixpath.join(rdir, fn))
-            count += 1
+    made_dirs: set[str] = set()
+    for name in names:
+        relative_dir = posixpath.dirname(name)
+        if relative_dir and relative_dir not in made_dirs:
+            target_dir = posixpath.join(remote_dir, relative_dir)
+            run_cmd(client, f'mkdir -p {shlex.quote(target_dir)}', check=True)
+            made_dirs.add(relative_dir)
+        local = os.path.join(job_dir, *name.split('/'))
+        sftp.put(local, posixpath.join(remote_dir, name))
+        count += 1
     return count
 
 
@@ -1033,6 +1090,7 @@ def preflight(profile, job_dir: str) -> list:
         # POTCAR TITEL 闸(原版提交前防线):截断/拼错的 POTCAR 会给出"收敛但静默错"
         # 的能量——TITEL 段数必须等于 POSCAR 物种数,不等拒绝提交
         if engine == 'vasp':
+            errs += _execution_environment_issues(profile, m0)
             errs += _managed_vasp_input_hash_gate(job_dir, m0)
             errs += _potcar_gate(job_dir, m0)
     if not profile.remote_root:
@@ -1109,8 +1167,37 @@ def _managed_vasp_input_hash_gate(job_dir: str, manifest: dict) -> list[str]:
             '请重新准备该作业后再提交']
 
     errors: list[str] = []
-    for name in _INPUT_FILES:
-        if name not in recorded:
+    authoritative_closure = recorded_closure(manifest)
+    if authoritative_closure:
+        current = resolve_input_closure(job_dir, manifest)
+        if not closure_record_matches(authoritative_closure, current):
+            prior_files = authoritative_closure.get('files') or {}
+            now_files = current.get('files') or {}
+            changed = sorted(
+                name for name in set(prior_files) | set(now_files)
+                if prior_files.get(name) != now_files.get(name))
+            if changed:
+                return [
+                    f'受管科学输入 {name} 在准备后已变化或缺失，与 job.yaml 记录的 '
+                    'SHA256 不一致；请重新准备该作业后再提交'
+                    for name in changed
+                ]
+            return [
+                '科学输入闭包与 job.yaml 准备时记录不一致（任务依赖集合或资源边界变化）；'
+                '请重新准备该作业后再提交']
+        if current.get('status') != 'complete':
+            return [
+                '科学输入闭包不完整：' + '、'.join(current.get('missing') or [])
+                + '；请补齐依赖并重新准备作业']
+        return []
+    if len(recorded) > 256:
+        return ['作业清单 inputs.sha256 条目过多；请重新准备该作业后再提交']
+    for name in recorded:
+        relative = str(name or '').replace('\\', '/')
+        parts = relative.split('/')
+        if (not relative or any(part in {'', '.', '..'} for part in parts)
+                or len(parts) > 2):
+            errors.append(f'作业清单输入哈希文件名非法：{name!r}')
             continue
         expected = str(recorded.get(name) or '').strip().lower()
         if not re.fullmatch(r'[0-9a-f]{64}', expected):
@@ -1118,7 +1205,7 @@ def _managed_vasp_input_hash_gate(job_dir: str, manifest: dict) -> list[str]:
                 f'作业清单中 {name} 的 SHA256 无效；'
                 '请重新准备该作业后再提交')
             continue
-        path = os.path.join(job_dir, name)
+        path = os.path.join(job_dir, *relative.split('/'))
         if not os.path.isfile(path):
             errors.append(
                 f'受管输入 {name} 不存在，无法核对准备时哈希；'
@@ -1277,7 +1364,7 @@ def submit_job(client, sftp, profile, job_dir: str, *,
     errs = preflight(profile, job_dir)
     if errs:
         raise ValueError('；'.join(errs))
-    m = manifest_mod.load_manifest(job_dir)
+    m = _bind_execution_environment_locked(job_dir, profile, authoritative)
     spec = _spec_for(profile, job_dir, m)
     dialect = get_dialect(profile.scheduler)
     script_text = build_script_text(profile, job_dir)
@@ -1286,7 +1373,7 @@ def submit_job(client, sftp, profile, job_dir: str, *,
     run_cmd(client, f'mkdir -p {shlex.quote(spec.remote_dir)}', check=True)
     if _is_neb(m):
         # NEB:整棵目录树(根共享 INCAR/POTCAR/KPOINTS + 各 image 子目录 POSCAR)
-        n_up = _upload_neb_tree(client, sftp, job_dir, spec.remote_dir)
+        n_up = _upload_neb_tree(client, sftp, job_dir, spec.remote_dir, m)
         upload_note = f'NEB 目录树 {n_up} 文件 + {SCRIPT_NAME}'
     else:
         engine = _job_engine(m)
