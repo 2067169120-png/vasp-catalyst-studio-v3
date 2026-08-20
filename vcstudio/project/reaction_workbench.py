@@ -38,6 +38,14 @@ FREQUENCY_EVIDENCE_SCHEMA = "vcstudio.frequency-evidence/v1"
 EDGE_EVIDENCE_SCHEMA = "vcstudio.edge-evidence/v1"
 NEB_EVIDENCE_SCHEMA = "vcstudio.neb-evidence/v1"
 ENERGY_OBSERVATION_SCHEMA = "vcstudio.energy-observation/v1"
+APPLICABILITY_RANGE_SCHEMA = "vcstudio.condition-applicability-range/v1"
+CONDITION_RESPONSE_SCHEMA = "vcstudio.condition-response/v1"
+JOINT_RESPONSE_MODEL_SCHEMA = "vcstudio.condition-joint-response-model/v1"
+PARAMETER_RESPONSE_MODEL_SCHEMA = "vcstudio.condition-parameter-response-model/v1"
+
+FREQUENCY_NOISE_THRESHOLD_CM1 = 50.0
+FREQUENCY_NOISE_SCIENTIFIC_MAXIMUM_CM1 = 100.0
+FREQUENCY_NOISE_POLICY_ID = "vcstudio.fixed-imaginary-frequency-noise/v1"
 
 _OPAQUE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~:-]{0,159}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -240,6 +248,16 @@ def _canonical_bytes(value: Any) -> bytes:
 def semantic_sha256(value: Any) -> str:
     """Return a deterministic digest for one path-free public value."""
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def _frequency_noise_policy() -> dict[str, Any]:
+    policy = {
+        "policy_id": FREQUENCY_NOISE_POLICY_ID,
+        "threshold_cm1": FREQUENCY_NOISE_THRESHOLD_CM1,
+        "scientific_maximum_cm1": FREQUENCY_NOISE_SCIENTIFIC_MAXIMUM_CM1,
+        "authority": "server_fixed_policy",
+    }
+    return {**policy, "policy_sha256": semantic_sha256(policy)}
 
 
 def _finite(value: Any, *, field: str) -> float:
@@ -567,18 +585,31 @@ def _normalise_applicability(value: Any) -> dict[str, dict[str, Any]]:
             raise ReactionWorkbenchError(f"applicability.{key} is unsupported")
         item = _strict_mapping(
             raw, field=f"applicability.{key}",
-            allowed=frozenset({"minimum", "maximum", "evidence_sha256"}),
-            required=frozenset({"evidence_sha256"}))
+            allowed=frozenset({
+                "schema", "minimum", "maximum", "evidence_sha256", "origin",
+            }),
+            required=frozenset({"schema", "evidence_sha256", "origin"}))
+        if item.get("schema") != APPLICABILITY_RANGE_SCHEMA:
+            raise ReactionWorkbenchError(f"applicability.{key}.schema is unsupported")
         lower = _optional_finite(item.get("minimum"), field=f"applicability.{key}.minimum")
         upper = _optional_finite(item.get("maximum"), field=f"applicability.{key}.maximum")
         if lower is not None and upper is not None and lower > upper:
             raise ReactionWorkbenchError(f"applicability.{key} minimum exceeds maximum")
+        scientific_lower, scientific_upper = CONDITION_RANGES[key]
+        if ((lower is not None and lower < scientific_lower)
+                or (upper is not None and upper > scientific_upper)):
+            raise ReactionWorkbenchError(
+                f"applicability.{key} exceeds the supported scientific range")
         evidence_hash = _digest(
             item.get("evidence_sha256"),
             field=f"applicability.{key}.evidence_sha256")
+        origin = _origin(item.get("origin"), field=f"applicability.{key}.origin")
         result[key] = {
+            "schema": APPLICABILITY_RANGE_SCHEMA,
             "minimum": lower, "maximum": upper,
-            "evidence_sha256": evidence_hash,
+            "evidence_sha256": evidence_hash, "origin": origin,
+            "scientific_status": _ORIGIN_STATUS_CEILINGS[origin],
+            "observed_origin_chain": origin == "observed",
         }
     return result
 
@@ -589,14 +620,15 @@ def _normalise_low_frequency(value: Any) -> dict[str, Any]:
             "status": "not_applied", "original_frequencies_cm1": [],
             "original_frequencies_display": "unavailable",
             "rule": "none", "cutoff_cm1": None, "reason": "",
-            "evidence_sha256": None, "origin": "unknown",
+            "evidence_sha256": None, "policy_evidence_sha256": None,
+            "treatment_sha256": None, "origin": "unknown",
             "scientific_status": "unknown", "sensitivity": [],
         }
     data = _strict_mapping(
         value, field="low_frequency",
         allowed=frozenset({
             "schema", "original_frequencies_cm1", "rule", "cutoff_cm1", "reason",
-            "evidence_sha256", "origin", "sensitivity",
+            "evidence_sha256", "policy_evidence_sha256", "origin", "sensitivity",
         }), required=frozenset({"schema", "rule", "origin"}))
     if data.get("schema") != LOW_FREQUENCY_SCHEMA:
         raise ReactionWorkbenchError("low_frequency.schema is unsupported")
@@ -620,9 +652,12 @@ def _normalise_low_frequency(value: Any) -> dict[str, Any]:
             cutoff is None or cutoff <= 0):
         raise ReactionWorkbenchError(
             "this low-frequency rule requires a positive cutoff_cm1")
-    treatment_hash = _digest(
+    treatment_evidence_hash = _digest(
         data.get("evidence_sha256"), field="low_frequency.evidence_sha256",
         optional=rule == "none")
+    policy_evidence_hash = _digest(
+        data.get("policy_evidence_sha256"),
+        field="low_frequency.policy_evidence_sha256", optional=rule == "none")
     origin = _origin(data.get("origin"), field="low_frequency.origin")
     sensitivity = []
     for index, raw in enumerate(_sequence(
@@ -650,6 +685,11 @@ def _normalise_low_frequency(value: Any) -> dict[str, Any]:
             "origin": _origin(
                 item.get("origin"), field="low_frequency.sensitivity.origin"),
         })
+    treatment_body = {
+        "original_frequencies_cm1": frequencies,
+        "reason": reason, "evidence_sha256": treatment_evidence_hash,
+        "origin": origin, "sensitivity": sensitivity,
+    }
     return {
         "status": "applied" if rule != "none" else "not_applied",
         "original_frequencies_cm1": frequencies,
@@ -657,7 +697,9 @@ def _normalise_low_frequency(value: Any) -> dict[str, Any]:
             ", ".join(f"{item:g}" for item in frequencies) + " cm-1"
             if frequencies else "unavailable"),
         "rule": rule, "cutoff_cm1": cutoff, "reason": reason,
-        "evidence_sha256": treatment_hash,
+        "evidence_sha256": treatment_evidence_hash,
+        "policy_evidence_sha256": policy_evidence_hash,
+        "treatment_sha256": semantic_sha256(treatment_body),
         "origin": origin,
         "scientific_status": _combined_status([
             _ORIGIN_STATUS_CEILINGS[origin],
@@ -670,12 +712,16 @@ def _normalise_low_frequency(value: Any) -> dict[str, Any]:
 def _frequency_qualification(
     value: Any, *, is_ts: bool, node: Mapping[str, Any],
 ) -> dict[str, Any]:
+    threshold_policy = _frequency_noise_policy()
     if value in (None, {}):
         return {
             "status": "unavailable", "context": "ts" if is_ts else "minimum",
             "original_imaginary_frequencies_cm1": [],
             "imaginary_magnitudes_cm1": [], "imaginary_frequencies_cm1": [],
-            "sign_convention": "unavailable", "noise_threshold_cm1": None,
+            "sign_convention": "unavailable",
+            "noise_threshold_cm1": FREQUENCY_NOISE_THRESHOLD_CM1,
+            "threshold_policy": threshold_policy,
+            "threshold_policy_sha256": threshold_policy["policy_sha256"],
             "frequency_evidence_sha256": None, "mode_evidence_sha256": None,
             "method_sha256": None, "structure_sha256": None, "origin": "unknown",
             "scientific_status": "unknown", "binding_status": "unavailable",
@@ -731,8 +777,14 @@ def _frequency_qualification(
         raise ReactionWorkbenchError("frequency_evidence.sign_convention is unsupported")
     threshold = _finite(
         data.get("noise_threshold_cm1"), field="frequency_evidence.noise_threshold_cm1")
-    if threshold <= 0:
-        raise ReactionWorkbenchError("frequency_evidence.noise_threshold_cm1 must be positive")
+    if (threshold <= 0
+            or threshold > FREQUENCY_NOISE_SCIENTIFIC_MAXIMUM_CM1
+            or not math.isclose(
+                threshold, FREQUENCY_NOISE_THRESHOLD_CM1,
+                rel_tol=0.0, abs_tol=1e-12)):
+        raise ReactionWorkbenchError(
+            "frequency_evidence.noise_threshold_cm1 must equal the server-fixed "
+            f"{FREQUENCY_NOISE_THRESHOLD_CM1:g} cm-1 policy")
     frequency_hash = _digest(
         data.get("evidence_sha256"), field="frequency_evidence.evidence_sha256",
         optional=True)
@@ -779,6 +831,8 @@ def _frequency_qualification(
         "imaginary_frequencies_cm1": original_frequencies,
         "sign_convention": sign_convention,
         "noise_threshold_cm1": threshold,
+        "threshold_policy": threshold_policy,
+        "threshold_policy_sha256": threshold_policy["policy_sha256"],
         "frequency_evidence_sha256": frequency_hash,
         "mode_evidence_sha256": mode_hash,
         "mode_alignment_status": alignment,
@@ -877,62 +931,172 @@ def _normalise_standard_state(value: Any) -> dict[str, Any]:
     }
 
 
-def _normalise_condition_response(value: Any) -> dict[str, Any]:
-    """Project only typed response-model fields into derived/report DTOs."""
-    source = dict(value) if isinstance(value, Mapping) else {}
-    result: dict[str, Any] = {}
-    raw_base = source.get("base_conditions")
-    if isinstance(raw_base, Mapping):
-        base_conditions = {}
-        for parameter in CONDITION_RANGES:
-            number = _optional_finite(
-                raw_base.get(parameter),
-                field=f"condition_response.base_conditions.{parameter}")
-            if number is not None:
-                base_conditions[parameter] = number
-        if base_conditions:
-            result["base_conditions"] = base_conditions
-    raw_joint = source.get("joint_model")
-    if isinstance(raw_joint, Mapping):
-        result["joint_model"] = {
-            "model": (
-                "additive" if str(raw_joint.get("model") or "").strip()
-                == "additive" else ""),
-            "evidence_sha256": _digest(
-                raw_joint.get("evidence_sha256"),
-                field="condition_response.joint_model.evidence_sha256",
-                optional=True),
+def _normalise_condition_response(
+    value: Any, *, expected_base: Mapping[str, float | None],
+    condition_set_id: str | None, condition_set_sha256: str | None,
+    canonical_condition: Mapping[str, Any] | None,
+    canonical_condition_sha256: str | None,
+) -> dict[str, Any]:
+    """Project typed response models and bind their base to the ledger."""
+    if not isinstance(value, Mapping):
+        return {
+            "schema": CONDITION_RESPONSE_SCHEMA, "status": "unavailable",
+            "scientific_status": "unknown", "observed_origin_chain": False,
+            "origin": "unknown", "evidence_sha256": None,
+            "base_conditions": {}, "base_binding_status": "unavailable",
+            "base_condition_binding_sha256": None,
+            "condition_set_id": condition_set_id,
+            "condition_set_sha256": condition_set_sha256,
+            "missing": ["condition_response"],
         }
+    # Whitelist reconstruction deliberately drops private/untyped adapter data.
+    allowed_top = {
+        "schema", "origin", "evidence_sha256", "base_conditions", "joint_model",
+        *CONDITION_RANGES,
+    }
+    source = _strict_mapping(
+        {key: copy.deepcopy(raw) for key, raw in value.items() if key in allowed_top},
+        field="condition_response", allowed=allowed_top,
+        required=frozenset({"schema", "origin", "evidence_sha256", "base_conditions"}))
+    if source.get("schema") != CONDITION_RESPONSE_SCHEMA:
+        raise ReactionWorkbenchError("condition_response.schema is unsupported")
+    origin = _origin(source.get("origin"), field="condition_response.origin")
+    evidence_hash = _digest(
+        source.get("evidence_sha256"), field="condition_response.evidence_sha256")
+    raw_base = _mapping(
+        source.get("base_conditions"), field="condition_response.base_conditions")
+    base_conditions = {}
+    for parameter in CONDITION_RANGES:
+        if raw_base.get(parameter) is not None:
+            base_conditions[parameter] = _bounded_condition(
+                raw_base.get(parameter),
+                key=f"condition_response.base_conditions.{parameter}")
+
+    items = {}
+    model_origins = []
+    missing = []
     for parameter in CONDITION_RANGES:
         raw_item = source.get(parameter)
         if not isinstance(raw_item, Mapping):
             continue
-        model = str(raw_item.get("model") or "").strip()
+        item = _strict_mapping(
+            raw_item, field=f"condition_response.{parameter}",
+            allowed=frozenset({
+                "schema", "model", "slope_eV_per_unit", "coefficient_eV",
+                "evidence_sha256", "origin",
+            }), required=frozenset({
+                "schema", "model", "evidence_sha256", "origin",
+            }))
+        if item.get("schema") != PARAMETER_RESPONSE_MODEL_SCHEMA:
+            raise ReactionWorkbenchError(
+                f"condition_response.{parameter}.schema is unsupported")
+        model = str(item.get("model") or "").strip()
         allowed_models = (
             {"local_linear", "ideal_gas_log"}
             if parameter == "pressure_pa" else {"local_linear"})
-        item: dict[str, Any] = {
-            "model": model if model in allowed_models else "",
-            "evidence_sha256": _digest(
-                raw_item.get("evidence_sha256"),
-                field=f"condition_response.{parameter}.evidence_sha256",
-                optional=True),
-        }
+        if model not in allowed_models:
+            raise ReactionWorkbenchError(
+                f"condition_response.{parameter}.model is unsupported")
         numeric_field = (
             "coefficient_eV" if model == "ideal_gas_log"
             else "slope_eV_per_unit")
-        number = _optional_finite(
-            raw_item.get(numeric_field),
-            field=f"condition_response.{parameter}.{numeric_field}")
-        if number is not None:
-            item[numeric_field] = number
-        result[parameter] = item
+        if item.get(numeric_field) is None:
+            raise ReactionWorkbenchError(
+                f"condition_response.{parameter}.{numeric_field} is required")
+        item_origin = _origin(
+            item.get("origin"), field=f"condition_response.{parameter}.origin")
+        items[parameter] = {
+            "schema": PARAMETER_RESPONSE_MODEL_SCHEMA, "model": model,
+            numeric_field: _finite(
+                item.get(numeric_field),
+                field=f"condition_response.{parameter}.{numeric_field}"),
+            "evidence_sha256": _digest(
+                item.get("evidence_sha256"),
+                field=f"condition_response.{parameter}.evidence_sha256"),
+            "origin": item_origin,
+            "scientific_status": _ORIGIN_STATUS_CEILINGS[item_origin],
+            "observed_origin_chain": item_origin == "observed",
+        }
+        model_origins.append(item_origin)
+        base = base_conditions.get(parameter)
+        expected = expected_base.get(parameter)
+        if base is None:
+            missing.append(f"{parameter} response base condition is unavailable")
+        elif expected is None or not math.isclose(
+                base, float(expected), rel_tol=0.0, abs_tol=1e-12):
+            missing.append(f"{parameter} response base does not match ledger condition")
+        canonical_value = (
+            canonical_condition.get(parameter)
+            if isinstance(canonical_condition, Mapping) else None)
+        if (base is not None and (canonical_value is None or not math.isclose(
+                base, float(canonical_value), rel_tol=0.0, abs_tol=1e-12))):
+            missing.append(
+                f"{parameter} response base does not match canonical condition set")
+
+    joint = None
+    raw_joint = source.get("joint_model")
+    if isinstance(raw_joint, Mapping):
+        joint_item = _strict_mapping(
+            raw_joint, field="condition_response.joint_model",
+            allowed=frozenset({
+                "schema", "model", "evidence_sha256", "origin",
+            }), required=frozenset({
+                "schema", "model", "evidence_sha256", "origin",
+            }))
+        if joint_item.get("schema") != JOINT_RESPONSE_MODEL_SCHEMA:
+            raise ReactionWorkbenchError("condition_response.joint_model.schema is unsupported")
+        if str(joint_item.get("model") or "").strip() != "additive":
+            raise ReactionWorkbenchError("condition_response.joint_model.model is unsupported")
+        joint_origin = _origin(
+            joint_item.get("origin"), field="condition_response.joint_model.origin")
+        joint = {
+            "schema": JOINT_RESPONSE_MODEL_SCHEMA, "model": "additive",
+            "evidence_sha256": _digest(
+                joint_item.get("evidence_sha256"),
+                field="condition_response.joint_model.evidence_sha256"),
+            "origin": joint_origin,
+            "scientific_status": _ORIGIN_STATUS_CEILINGS[joint_origin],
+            "observed_origin_chain": joint_origin == "observed",
+        }
+        model_origins.append(joint_origin)
+    if items and (condition_set_id is None or condition_set_sha256 is None):
+        missing.append("condition-response canonical condition-set binding")
+    if items and condition_set_sha256 != canonical_condition_sha256:
+        missing.append("condition-response canonical condition-set hash binding")
+    base_binding = {
+        "base_conditions": base_conditions,
+        "condition_set_id": condition_set_id,
+        "condition_set_sha256": condition_set_sha256,
+    }
+    observed = bool(
+        origin == "observed" and model_origins and not missing
+        and all(item == "observed" for item in model_origins))
+    result = {
+        "schema": CONDITION_RESPONSE_SCHEMA,
+        "status": "available" if items and not missing else "unavailable",
+        "origin": origin, "evidence_sha256": evidence_hash,
+        "scientific_status": _combined_status([
+            _ORIGIN_STATUS_CEILINGS[origin],
+            *(_ORIGIN_STATUS_CEILINGS[item] for item in model_origins),
+        ]),
+        "observed_origin_chain": observed,
+        "base_conditions": base_conditions,
+        "base_binding_status": "available" if not missing else "unavailable",
+        "base_condition_binding_sha256": semantic_sha256(base_binding),
+        "condition_set_id": condition_set_id,
+        "condition_set_sha256": condition_set_sha256,
+        "missing": list(dict.fromkeys(missing)),
+        **items,
+    }
+    if joint is not None:
+        result["joint_model"] = joint
     return result
 
 
 def _ledger_row(
     node: Mapping[str, Any], binding: Mapping[str, Any], *, is_ts: bool,
     precision: int,
+    condition_sets: Mapping[str, tuple[Mapping[str, Any], str, bool]],
 ) -> dict[str, Any]:
     raw = binding.get("thermochemistry")
     if isinstance(raw, Mapping):
@@ -1020,6 +1184,7 @@ def _ledger_row(
             else low_frequency_rule != "none")
         if (low_frequency.get("status") != "applied"
                 or not low_frequency.get("evidence_sha256")
+                or not low_frequency.get("policy_evidence_sha256")
                 or not compatible_rule):
             missing.append("low_frequency_model_evidence")
     elif low_frequency.get("status") == "applied":
@@ -1035,6 +1200,17 @@ def _ledger_row(
     final = sum(available_terms) if len(available_terms) == len(terms) else None
     available = final is not None and not [
         item for item in missing if item != "ts_frequency_mode_evidence"]
+    condition_set_id = (
+        _opaque(thermo.get("condition_set_id"), field="thermochemistry.condition_set_id")
+        if thermo.get("condition_set_id") else None)
+    condition_set_hash = _digest(
+        thermo.get("condition_set_sha256"),
+        field="thermochemistry.condition_set_sha256", optional=True)
+    low_frequency_policy = {
+        "model": low_frequency_model, "rule": low_frequency_rule,
+        "cutoff_cm1": low_frequency.get("cutoff_cm1"),
+        "policy_evidence_sha256": low_frequency.get("policy_evidence_sha256"),
+    }
     compatibility = {
         "method_sha256": node.get("method_sha256"),
         "reference_state_sha256": _digest(
@@ -1048,12 +1224,8 @@ def _ledger_row(
         "coverage_model_sha256": _digest(
             thermo.get("coverage_model_sha256"),
             field="thermochemistry.coverage_model_sha256", optional=True),
-        "condition_set_id": (
-            _opaque(thermo.get("condition_set_id"), field="thermochemistry.condition_set_id")
-            if thermo.get("condition_set_id") else None),
-        "condition_set_sha256": _digest(
-            thermo.get("condition_set_sha256"),
-            field="thermochemistry.condition_set_sha256", optional=True),
+        "condition_set_id": condition_set_id,
+        "condition_set_sha256": condition_set_hash,
         "temperature_k": temperature,
         "pressure_pa": pressure,
         "ph": ph, "electrode_potential_v": potential, "coverage": coverage,
@@ -1063,12 +1235,30 @@ def _ledger_row(
                       for item in terms],
             "roles": models,
         }) if models else None,
-        "low_frequency_sha256": semantic_sha256(low_frequency),
+        "low_frequency_policy": low_frequency_policy,
+        "low_frequency_policy_sha256": semantic_sha256(low_frequency_policy),
+        "low_frequency_treatment_sha256": low_frequency.get("treatment_sha256"),
+        "frequency_threshold_policy_sha256": frequency.get(
+            "threshold_policy_sha256"),
     }
+    condition_response = _normalise_condition_response(
+        thermo.get("condition_response"),
+        expected_base={
+            "temperature_k": temperature, "pressure_pa": pressure, "ph": ph,
+            "electrode_potential_v": potential, "coverage": coverage,
+        },
+        condition_set_id=condition_set_id,
+        condition_set_sha256=condition_set_hash,
+        canonical_condition=(
+            condition_sets[condition_set_id][0]
+            if condition_set_id in condition_sets else None),
+        canonical_condition_sha256=(
+            condition_sets[condition_set_id][1]
+            if condition_set_id in condition_sets else None))
     row_scientific_status = _combined_status([
         node["scientific_status"], _ORIGIN_STATUS_CEILINGS[thermo_origin],
         standard_state["scientific_status"], low_frequency["scientific_status"],
-        frequency["scientific_status"],
+        frequency["scientific_status"], condition_response["scientific_status"],
         *(item["scientific_status"] for item in terms),
     ])
     observed_origin_chain = bool(
@@ -1079,6 +1269,7 @@ def _ledger_row(
         and all(item.get("origin") == "observed"
                 for item in low_frequency.get("sensitivity") or [])
         and frequency.get("origin") == "observed"
+        and condition_response.get("observed_origin_chain") is True
         and all(item.get("origin") == "observed" for item in terms))
     return {
         "entity_id": node["node_id"], "entity_type": node["entity_type"],
@@ -1103,8 +1294,7 @@ def _ledger_row(
             f"{key}={value}" for key, value in models.items()) or "unavailable",
         "low_frequency": low_frequency, "frequency_qualification": frequency,
         "compatibility": compatibility,
-        "condition_response": _normalise_condition_response(
-            thermo.get("condition_response")),
+        "condition_response": condition_response,
         "missing": list(dict.fromkeys(missing)),
     }
 
@@ -1287,6 +1477,15 @@ def _fraction_map_dto(value: Mapping[str, Fraction]) -> dict[str, dict[str, int]
     }
 
 
+def _site_occupancy_map_dto(
+    value: Mapping[tuple[str, str], Fraction],
+) -> list[dict[str, Any]]:
+    return [{
+        "surface_id": surface_id, "site_id": site_id,
+        "count": _rational_dto(number),
+    } for (surface_id, site_id), number in sorted(value.items()) if number != 0]
+
+
 def _reaction_conservation(
     *, reactants: Sequence[Mapping[str, Any]], products: Sequence[Mapping[str, Any]],
     transition_state_id: str | None, node_by_id: Mapping[str, Mapping[str, Any]],
@@ -1296,7 +1495,7 @@ def _reaction_conservation(
     def accumulate(items, side):
         elements: dict[str, Fraction] = {}
         charge = Fraction(0)
-        surface_occupancy: dict[str, Fraction] = {}
+        surface_occupancy: dict[tuple[str, str], Fraction] = {}
         for index, participant in enumerate(items):
             state_id = str(participant.get("state_id") or "")
             coefficient = _fraction_from_dto(
@@ -1314,13 +1513,15 @@ def _reaction_conservation(
                 elements[element] = elements.get(element, Fraction(0)) + coefficient * int(count)
             charge += coefficient * int(chemistry["charge"])
             surface_id = str(chemistry.get("surface_id") or "")
-            occupied = sum(
-                (_fraction_from_dto(
-                    item.get("count") or {}, field=f"{side}.{state_id}.site_occupancy")
-                 for item in chemistry.get("site_occupancy") or []),
-                Fraction(0))
-            surface_occupancy[surface_id] = (
-                surface_occupancy.get(surface_id, Fraction(0)) + coefficient * occupied)
+            for occupancy in chemistry.get("site_occupancy") or []:
+                site_id = str(occupancy.get("site_id") or "")
+                occupied = _fraction_from_dto(
+                    occupancy.get("count") or {},
+                    field=f"{side}.{state_id}.site_occupancy.{site_id}")
+                site_key = (surface_id, site_id)
+                surface_occupancy[site_key] = (
+                    surface_occupancy.get(site_key, Fraction(0))
+                    + coefficient * occupied)
         return elements, charge, surface_occupancy
 
     left_elements, left_charge, left_surface = accumulate(reactants, "reactants")
@@ -1344,13 +1545,10 @@ def _reaction_conservation(
                 for key, value in (chemistry.get("elemental_composition") or {}).items()}
             ts_charge = Fraction(int(chemistry["charge"]))
             ts_surface_id = str(chemistry.get("surface_id") or "")
-            ts_occupied = sum(
-                (_fraction_from_dto(
-                    item.get("count") or {},
-                    field="transition_state.site_occupancy")
-                 for item in chemistry.get("site_occupancy") or []),
-                Fraction(0))
-            ts_surface = {ts_surface_id: ts_occupied}
+            ts_surface = {
+                (ts_surface_id, str(item.get("site_id") or "")): _fraction_from_dto(
+                    item.get("count") or {}, field="transition_state.site_occupancy")
+                for item in chemistry.get("site_occupancy") or []}
             if ts_elements != left_elements or ts_elements != right_elements:
                 ts_checks.append("transition_state_elemental_composition")
             if ts_charge != left_charge or ts_charge != right_charge:
@@ -1374,8 +1572,9 @@ def _reaction_conservation(
             else "unavailable" if missing else "failed",
         },
         "surface_site_occupancy": {
-            "reactants": _fraction_map_dto(left_surface),
-            "products": _fraction_map_dto(right_surface),
+            "key_schema": "(surface_id, site_id)",
+            "reactants": _site_occupancy_map_dto(left_surface),
+            "products": _site_occupancy_map_dto(right_surface),
             "status": "available" if not missing and left_surface == right_surface
             else "unavailable" if missing else "failed",
         },
@@ -1439,6 +1638,7 @@ def _normalise_edge_evidence(
     value: Any, *, edge_method_sha256: str | None, binding_evidence_sha256: str | None,
     reactant_ids: Sequence[str], product_ids: Sequence[str],
     transition_state_id: str | None, node_by_id: Mapping[str, Mapping[str, Any]],
+    edge_source_observed: bool,
 ) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         return {
@@ -1446,6 +1646,7 @@ def _normalise_edge_evidence(
             "reference_state_sha256": None, "evidence_sha256": None,
             "origin": "unknown", "scientific_status": "unknown", "neb": None,
             "observed_origin_chain": False,
+            "observed_values_available": False,
             "edge_compatibility_status": "unavailable",
             "neb_compatibility_status": "unavailable",
             "edge_missing": ["edge_evidence"],
@@ -1558,27 +1759,45 @@ def _normalise_edge_evidence(
         observed_forward.get("scientific_status", "unknown"),
         observed_reverse.get("scientific_status", "release") if observed_reverse else "release",
     ])
+    observed_origin_chain = bool(
+        edge_source_observed and origin == "observed" and neb_origin == "observed"
+        and observed_forward.get("origin") == "observed"
+        and (not observed_reverse or observed_reverse.get("origin") == "observed")
+        and all((node_by_id.get(state_id) or {}).get("observed_origin_chain") is True
+                for state_id in [*reactant_ids, *product_ids])
+        and ts_node is not None and ts_node.get("observed_origin_chain") is True)
+    neb_compatible = not edge_missing and not neb_missing
+    observed_values_available = bool(neb_compatible and observed_origin_chain)
+
+    def public_observation(item: Mapping[str, Any] | None) -> dict[str, Any] | None:
+        if not item:
+            return None
+        public = copy.deepcopy(dict(item))
+        if not observed_values_available:
+            public.update({
+                "status": "unavailable", "value_eV": None,
+                "display": "unavailable",
+            })
+        return public
+
     neb = {
         "method_sha256": neb_method, "reference_state_sha256": neb_reference,
         "evidence_sha256": neb_evidence, "origin": neb_origin,
         "reactant_structure_sha256": neb_reactant_structures,
         "product_structure_sha256": neb_product_structures,
         "transition_state_structure_sha256": neb_ts_structure,
-        "observed_forward_delta_e_barrier": observed_forward,
-        "observed_reverse_delta_e_barrier": observed_reverse or None,
+        "observed_forward_delta_e_barrier": public_observation(observed_forward),
+        "observed_reverse_delta_e_barrier": public_observation(observed_reverse),
     }
     normalized = {
         "status": "available" if not edge_missing and not neb_missing else "unavailable",
         "edge_compatibility_status": "available" if not edge_missing else "unavailable",
-        "neb_compatibility_status": "available" if not neb_missing else "unavailable",
+        "neb_compatibility_status": "available" if neb_compatible else "unavailable",
         "method_sha256": method_hash, "reference_state_sha256": reference_hash,
         "evidence_sha256": evidence_hash, "origin": origin,
         "scientific_status": scientific_status,
-        "observed_origin_chain": bool(
-            origin == "observed" and neb_origin == "observed"
-            and observed_forward.get("origin") == "observed"
-            and (not observed_reverse
-                 or observed_reverse.get("origin") == "observed")),
+        "observed_origin_chain": observed_origin_chain,
+        "observed_values_available": observed_values_available,
         "reactant_structure_sha256": reactant_structures,
         "product_structure_sha256": product_structures,
         "transition_state_structure_sha256": ts_structure,
@@ -1604,7 +1823,8 @@ def _compatibility_signature(row: Mapping[str, Any]) -> tuple[Any, ...] | None:
         "method_sha256", "reference_state_sha256",
         "standard_state_definition_sha256", "standard_state_evidence_sha256",
         "condition_set_id", "condition_set_sha256", "temperature_k",
-        "models_sha256", "low_frequency_sha256",
+        "models_sha256", "low_frequency_policy_sha256",
+        "frequency_threshold_policy_sha256",
         "component_models_sha256",
     )
     if any(not compatibility.get(key) for key in required):
@@ -1615,7 +1835,8 @@ def _compatibility_signature(row: Mapping[str, Any]) -> tuple[Any, ...] | None:
         "solvent_model_sha256", "coverage_model_sha256",
         "condition_set_id", "condition_set_sha256", "temperature_k", "pressure_pa",
         "ph", "electrode_potential_v", "coverage", "models_sha256",
-        "component_models_sha256", "low_frequency_sha256",
+        "component_models_sha256", "low_frequency_policy_sha256",
+        "frequency_threshold_policy_sha256",
     ))
 
 
@@ -1834,12 +2055,18 @@ def _condition_response_delta(
     if not isinstance(raw, Mapping):
         return None, f"{parameter} response evidence is unavailable"
     item = dict(raw)
+    if item.get("schema") != PARAMETER_RESPONSE_MODEL_SCHEMA:
+        return None, f"{parameter} response schema is unavailable"
     evidence_hash = _digest(
         item.get("evidence_sha256"), field=f"condition_response.{parameter}.evidence_sha256",
         optional=True,
     )
     if evidence_hash is None:
         return None, f"{parameter} response evidence hash is unavailable"
+    if _origin(
+            item.get("origin"), field=f"condition_response.{parameter}.origin",
+            optional=True) != "observed":
+        return None, f"{parameter} response provenance is not observed"
     model = str(item.get("model") or "").strip()
     if model == "local_linear":
         slope = _finite(
@@ -1861,18 +2088,34 @@ def _derived_revision(
     conditions: Mapping[str, float], applicability: Mapping[str, Any],
     precision: int,
 ) -> dict[str, Any]:
-    outside = []
+    applicability_statuses = [
+        str(item.get("scientific_status") or "unknown")
+        for item in applicability.values() if isinstance(item, Mapping)]
+    outside = [
+        f"{parameter} applicability provenance is not observed"
+        for parameter, item in applicability.items()
+        if not isinstance(item, Mapping)
+        or item.get("schema") != APPLICABILITY_RANGE_SCHEMA
+        or not item.get("evidence_sha256")
+        or item.get("origin") != "observed"
+    ]
     for parameter, target in conditions.items():
         limits = applicability.get(parameter)
         if not isinstance(limits, Mapping) or not limits.get("evidence_sha256"):
             outside.append(
                 f"{parameter} has no evidence-bound applicability range")
             continue
+        if limits.get("schema") != APPLICABILITY_RANGE_SCHEMA:
+            outside.append(f"{parameter} applicability schema is unavailable")
+        if limits.get("origin") != "observed":
+            outside.append(
+                f"{parameter} applicability provenance is not observed")
         lower, upper = limits.get("minimum"), limits.get("maximum")
         if lower is not None and target < lower:
             outside.append(f"{parameter} is below the evidence-bound applicability range")
         if upper is not None and target > upper:
             outside.append(f"{parameter} is above the evidence-bound applicability range")
+    outside = list(dict.fromkeys(outside))
     derived_rows = []
     for row in ledger.get("rows") or []:
         base_g = row.get("final_delta_g_eV")
@@ -1881,13 +2124,27 @@ def _derived_revision(
             dict(response.get("base_conditions"))
             if isinstance(response, Mapping)
             and isinstance(response.get("base_conditions"), Mapping) else {})
-        base_conditions.setdefault("temperature_k", row.get("temperature_k"))
-        base_conditions.setdefault("pressure_pa", row.get("pressure_pa"))
         row_missing = list(outside)
         delta = 0.0
         response_hashes = []
+        dependency_statuses = [str(row.get("scientific_status") or "unknown")]
+        dependency_observed = [row.get("observed_origin_chain") is True]
         if base_g is None:
             row_missing.append("base thermochemistry is unavailable")
+        if conditions:
+            if response.get("base_binding_status") != "available":
+                row_missing.extend(
+                    response.get("missing") or ["condition response base is unavailable"])
+            if response.get("origin") != "observed":
+                row_missing.append("condition response provenance is not observed")
+            if response.get("observed_origin_chain") is not True:
+                row_missing.append("condition response observed provenance chain is unavailable")
+            dependency_statuses.append(
+                str(response.get("scientific_status") or "unknown"))
+            dependency_observed.append(
+                response.get("observed_origin_chain") is True)
+            if response.get("evidence_sha256"):
+                response_hashes.append(str(response["evidence_sha256"]))
         changed = []
         for parameter, target in conditions.items():
             base = _optional_finite(
@@ -1895,20 +2152,46 @@ def _derived_revision(
             if base is None:
                 row_missing.append(f"{parameter} base condition is unavailable")
                 continue
+            limits = applicability.get(parameter) or {}
+            lower, upper = limits.get("minimum"), limits.get("maximum")
+            if lower is not None and base < lower:
+                row_missing.append(
+                    f"{parameter} response base is below the applicability range")
+            if upper is not None and base > upper:
+                row_missing.append(
+                    f"{parameter} response base is above the applicability range")
+            dependency_statuses.append(
+                str(limits.get("scientific_status") or "unknown"))
+            dependency_observed.append(limits.get("origin") == "observed")
+            if limits.get("evidence_sha256"):
+                response_hashes.append(str(limits["evidence_sha256"]))
             if abs(target - base) <= 1e-15:
                 continue
             changed.append((parameter, base, target))
         if len(changed) > 1:
             joint = response.get("joint_model") if isinstance(response, Mapping) else None
-            if (not isinstance(joint, Mapping) or joint.get("model") != "additive"
+            if (not isinstance(joint, Mapping)
+                    or joint.get("schema") != JOINT_RESPONSE_MODEL_SCHEMA
+                    or joint.get("model") != "additive"
                     or _digest(
                         joint.get("evidence_sha256") if isinstance(joint, Mapping) else None,
                         field="condition_response.joint_model.evidence_sha256",
-                        optional=True) is None):
+                        optional=True) is None
+                    or joint.get("origin") != "observed"):
                 row_missing.append(
-                    "multi-parameter derivation requires evidence-bound additive joint_model")
+                    "multi-parameter derivation requires an observed, evidence-bound "
+                    "additive joint_model")
+            else:
+                dependency_statuses.append(
+                    str(joint.get("scientific_status") or "unknown"))
+                dependency_observed.append(joint.get("origin") == "observed")
+                response_hashes.append(str(joint.get("evidence_sha256")))
         for parameter, base, target in changed:
             item = response.get(parameter) if isinstance(response, Mapping) else None
+            if isinstance(item, Mapping):
+                dependency_statuses.append(
+                    str(item.get("scientific_status") or "unknown"))
+                dependency_observed.append(item.get("origin") == "observed")
             row_delta, reason = _condition_response_delta(
                 response if isinstance(response, Mapping) else {},
                 parameter=parameter, base=base, target=target)
@@ -1921,7 +2204,8 @@ def _derived_revision(
         final = float(base_g) + delta if available else None
         derived_rows.append({
             "entity_id": row.get("entity_id"), "label": row.get("label"),
-            "scientific_status": row.get("scientific_status", "unknown"),
+            "scientific_status": _combined_status(dependency_statuses),
+            "observed_origin_chain": all(dependency_observed),
             "base_delta_g_eV": base_g,
             "base_delta_g_display": _display(base_g, precision),
             "condition_delta_g_eV": delta if available else None,
@@ -2015,7 +2299,10 @@ def _derived_revision(
         "rows": derived_rows,
         "edges": derived_edges,
         "scientific_status": _combined_status([
-            str(row.get("scientific_status") or "unknown") for row in derived_rows]),
+            *(str(row.get("scientific_status") or "unknown")
+              for row in derived_rows),
+            *applicability_statuses,
+        ]),
         "artifact_status": (
             "available" if derived_rows
             and all(row["status"] == "available" for row in derived_rows)
@@ -2500,11 +2787,14 @@ def build_reaction_workbench_view(
                 for item in products
             },
         }
+        step_source_observed = _source_origins_observed(
+            payload, binding, field=step_id)
         edge_evidence = _normalise_edge_evidence(
             binding.get("edge_evidence"), edge_method_sha256=method_hash,
             binding_evidence_sha256=evidence_hash,
             reactant_ids=reactant_ids, product_ids=product_ids,
-            transition_state_id=ts_id, node_by_id=node_by_id)
+            transition_state_id=ts_id, node_by_id=node_by_id,
+            edge_source_observed=step_source_observed)
         conservation = _reaction_conservation(
             reactants=reactants, products=products,
             transition_state_id=ts_id, node_by_id=node_by_id)
@@ -2527,7 +2817,7 @@ def build_reaction_workbench_view(
             "edge_evidence": edge_evidence,
             "conservation": conservation,
             "observed_origin_chain": bool(
-                _source_origins_observed(payload, binding, field=step_id)
+                step_source_observed
                 and edge_evidence.get("observed_origin_chain") is True),
             "condition_observed_origin_chain": condition_observed_origin_chain,
             "scientific_status": _combined_status([
@@ -2569,7 +2859,8 @@ def build_reaction_workbench_view(
             continue
         ledger_rows.append(_ledger_row(
             node, _binding_for(bindings, node["node_id"]),
-            is_ts=node["entity_type"] == "transition_state", precision=precision))
+            is_ts=node["entity_type"] == "transition_state", precision=precision,
+            condition_sets=condition_sets))
     ledger_by_id = {row["entity_id"]: row for row in ledger_rows}
     for edge in edges:
         edge["thermochemistry"] = _edge_thermochemistry(
@@ -2752,10 +3043,12 @@ def unavailable_reaction_workbench_view(
 
 
 __all__ = [
+    "APPLICABILITY_RANGE_SCHEMA", "CONDITION_RESPONSE_SCHEMA",
     "DERIVED_REVISION_SCHEMA", "DOMAIN_ENVELOPE_SCHEMA", "EDGE_EVIDENCE_SCHEMA",
     "ENERGY_OBSERVATION_SCHEMA", "FREQUENCY_EVIDENCE_SCHEMA",
     "FROZEN_NETWORK_SCHEMA", "GRAPH_SCHEMA", "LEDGER_SCHEMA",
-    "LOW_FREQUENCY_SCHEMA", "NEB_EVIDENCE_SCHEMA", "PROJECTION_SCHEMA",
+    "JOINT_RESPONSE_MODEL_SCHEMA", "LOW_FREQUENCY_SCHEMA", "NEB_EVIDENCE_SCHEMA",
+    "PARAMETER_RESPONSE_MODEL_SCHEMA", "PROJECTION_SCHEMA",
     "REPORT_BINDING_SCHEMA", "STANDARD_STATE_SCHEMA",
     "THERMOCHEMISTRY_BINDING_SCHEMA", "THERMOCHEMISTRY_TERM_SCHEMA", "VIEW_SCHEMA",
     "ObjectBinding", "RationalDTO", "ReactionDomainProjection",

@@ -53,8 +53,9 @@ Contains opaque nodes and elementary-step edges with:
 - structure, method, and evidence hashes;
 - explicit reactant/product/TS IDs and normalized exact rational
   stoichiometric coefficients;
-- element, total-charge, surface/site-occupancy, and site-membership
-  conservation results;
+- element and total-charge conservation plus exact rational occupancy maps
+  keyed by `(surface_id, site_id)`; changing `top` to `bridge` is not treated
+  as conserved merely because the total occupied-site count is unchanged;
 - separately bound edge and NEB method/reference/evidence/endpoint/TS hashes;
 - canonical condition-set ID/hash;
 - separate thermodynamic and kinetic readiness;
@@ -82,7 +83,9 @@ Each entity row shows, independently:
 - every term's evidence hash;
 - original low frequencies, treatment rule, cutoff, reason, and sensitivity;
 - original signed imaginary frequencies plus interpreted magnitudes;
-- TS frequency/mode qualification.
+- TS frequency/mode qualification under a server-fixed, hash-bound 50 cm-1
+  noise policy (100 cm-1 scientific ceiling); input data cannot select a
+  threshold that makes its own spectrum pass.
 
 No missing term is replaced by zero. Every participating term requires an
 explicit role-compatible model, `eV` unit, provenance, and evidence hash.
@@ -92,6 +95,11 @@ Arithmetic is denied when method, reference
 state, standard state, canonical condition set, T/P/pH/potential, coverage,
 component models, solvent model, coverage model, or low-frequency treatment is
 missing or different.
+
+Low-frequency compatibility compares only the shared policy signature
+(`model`, `rule`, `cutoff`, and policy-evidence hash). Original spectra,
+entity-specific treatment evidence/reasons, and sensitivities remain frozen in
+separate treatment hashes and are not required to be identical across species.
 
 Supported model vocabulary is explicit and does not import or copy CatMAP.
 
@@ -105,6 +113,13 @@ and coverage parameters. The server produces a deterministic revision bound to:
 - evidence-bound applicability ranges;
 - per-parameter response evidence;
 - an evidence-bound joint/additive model when multiple parameters change.
+
+Applicability ranges, the response envelope, each parameter model, and the
+joint model have typed schemas, evidence hashes, and origins. Their weakest
+origin caps the derived status; a non-observed dependency blocks derived
+readiness. Response base conditions must exactly match both the ledger and its
+canonical condition-set digest, and both base and target must fall inside the
+evidence-bound applicability range.
 
 The revision includes derived node and edge values. It always declares
 `source_evidence_mutated=false`. Missing applicability, missing response
@@ -130,6 +145,10 @@ selection. `authorizes_execution` is always false.
 Only a fully canonical-envelope projection with an observed provenance chain
 can be `microkinetics_ready`; imported/inferred origins cap status and cannot be
 promoted by a binding label.
+Observed NEB barrier values are public only when edge/NEB method, reference,
+endpoint/TS structure, evidence hashes, and the observed provenance chain are
+all compatible. Otherwise graph, derived revision, report, and frozen-network
+DTOs expose `null`/`unavailable`, while retaining non-numeric missing reasons.
 
 ### `vcstudio.reaction-report-binding/v1`
 

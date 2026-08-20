@@ -141,12 +141,16 @@ def _term(value, model):
 
 def _thermo(e0, *, ts=False):
     response = {
+        "schema": rw.CONDITION_RESPONSE_SCHEMA,
+        "origin": "observed", "evidence_sha256": H["response"],
         "base_conditions": {
             "temperature_k": 300.0, "pressure_pa": 100000.0, "ph": 0.0,
             "electrode_potential_v": 0.0, "coverage": 0.25,
         },
         "joint_model": {
+            "schema": rw.JOINT_RESPONSE_MODEL_SCHEMA,
             "model": "additive", "evidence_sha256": H["response"],
+            "origin": "observed",
         },
     }
     for parameter, slope in (
@@ -154,12 +158,16 @@ def _thermo(e0, *, ts=False):
         ("electrode_potential_v", -1.0), ("coverage", 0.4),
     ):
         response[parameter] = {
+            "schema": rw.PARAMETER_RESPONSE_MODEL_SCHEMA,
             "model": "local_linear", "slope_eV_per_unit": slope,
             "evidence_sha256": H["response"],
+            "origin": "observed",
         }
     response["pressure_pa"] = {
+        "schema": rw.PARAMETER_RESPONSE_MODEL_SCHEMA,
         "model": "ideal_gas_log", "coefficient_eV": 0.025,
         "evidence_sha256": H["response"],
+        "origin": "observed",
     }
     return {
         "schema": rw.THERMOCHEMISTRY_BINDING_SCHEMA,
@@ -192,6 +200,7 @@ def _thermo(e0, *, ts=False):
             "rule": "quasi_harmonic", "cutoff_cm1": 50.0,
             "reason": "bounded entropy sensitivity audit",
             "evidence_sha256": H["term"],
+            "policy_evidence_sha256": H["standard"],
             "origin": "observed",
             "sensitivity": [{
                 "parameter": "cutoff", "value": 50.0, "unit": "cm-1",
@@ -274,16 +283,26 @@ def projection():
         "transition_states": [_transition_state()],
         "steps": [_step()], "conditions": [_condition()], "bindings": bindings,
         "applicability": {
-            "temperature_k": {"minimum": 250.0, "maximum": 500.0,
-                              "evidence_sha256": H["response"]},
-            "pressure_pa": {"minimum": 1000.0, "maximum": 1e7,
-                            "evidence_sha256": H["response"]},
-            "ph": {"minimum": 0.0, "maximum": 14.0,
-                   "evidence_sha256": H["response"]},
-            "electrode_potential_v": {"minimum": -2.0, "maximum": 2.0,
-                                      "evidence_sha256": H["response"]},
-            "coverage": {"minimum": 0.0, "maximum": 1.0,
-                         "evidence_sha256": H["response"]},
+            "temperature_k": {
+                "schema": rw.APPLICABILITY_RANGE_SCHEMA,
+                "minimum": 250.0, "maximum": 500.0,
+                "evidence_sha256": H["response"], "origin": "observed"},
+            "pressure_pa": {
+                "schema": rw.APPLICABILITY_RANGE_SCHEMA,
+                "minimum": 1000.0, "maximum": 1e7,
+                "evidence_sha256": H["response"], "origin": "observed"},
+            "ph": {
+                "schema": rw.APPLICABILITY_RANGE_SCHEMA,
+                "minimum": 0.0, "maximum": 14.0,
+                "evidence_sha256": H["response"], "origin": "observed"},
+            "electrode_potential_v": {
+                "schema": rw.APPLICABILITY_RANGE_SCHEMA,
+                "minimum": -2.0, "maximum": 2.0,
+                "evidence_sha256": H["response"], "origin": "observed"},
+            "coverage": {
+                "schema": rw.APPLICABILITY_RANGE_SCHEMA,
+                "minimum": 0.0, "maximum": 1.0,
+                "evidence_sha256": H["response"], "origin": "observed"},
         },
     }
 
@@ -578,6 +597,32 @@ def test_failed_or_unknown_reaction_conservation_blocks_all_qualification(
     assert view["report_binding"]["artifact_status"] == "incomplete"
 
 
+def test_site_occupancy_conservation_is_resolved_by_surface_and_site_id():
+    source = projection()
+    surface = source["surfaces"][0]
+    surface["payload"]["geometric_site_ids"].append("bridge")
+    _rehash(surface)
+    product = source["states"][1]
+    product["payload"]["site_occupancy"][0]["site_id"] = "bridge"
+    _rehash(product)
+
+    view = rw.build_reaction_workbench_view(source, project_id="project-1")
+    conservation = view["graph"]["edges"][0]["conservation"]
+    assert conservation["status"] == "failed"
+    occupancy = conservation["surface_site_occupancy"]
+    assert occupancy["key_schema"] == "(surface_id, site_id)"
+    assert occupancy["reactants"] == [{
+        "surface_id": "surface-1", "site_id": "top",
+        "count": {"numerator": 1, "denominator": 1},
+    }]
+    assert occupancy["products"] == [{
+        "surface_id": "surface-1", "site_id": "bridge",
+        "count": {"numerator": 1, "denominator": 1},
+    }]
+    assert view["frozen_network"]["edges"][0]["conservation"] == conservation
+    assert view["frozen_network"]["readiness"] == "blocked"
+
+
 @pytest.mark.parametrize("mutation", ["duplicate", "both_sides"])
 def test_ambiguous_reaction_participants_are_rejected(mutation):
     source = projection()
@@ -659,9 +704,36 @@ def test_frequency_sign_convention_and_ts_bindings_are_strict():
             "kinetic_status"] == "unavailable"
 
 
+@pytest.mark.parametrize(("entity_id", "frequencies"), [
+    ("state-ts", [-420.0, -350.0]),
+    ("state-r", [-350.0]),
+])
+def test_frequency_noise_threshold_is_server_fixed_not_data_selected(
+    entity_id, frequencies,
+):
+    source = projection()
+    evidence = source["bindings"][entity_id]["thermochemistry"][
+        "frequency_evidence"]
+    evidence["imaginary_frequencies_cm1"] = frequencies
+    evidence["noise_threshold_cm1"] = 400.0
+    with pytest.raises(rw.ReactionWorkbenchError, match="server-fixed 50"):
+        rw.build_reaction_workbench_view(source, project_id="project-1")
+
+    baseline = rw.build_reaction_workbench_view(
+        projection(), project_id="project-1")
+    row = next(item for item in baseline["ledger"]["rows"]
+               if item["entity_id"] == entity_id)
+    policy = row["frequency_qualification"]["threshold_policy"]
+    assert policy["authority"] == "server_fixed_policy"
+    assert policy["threshold_cm1"] == 50.0
+    assert policy["scientific_maximum_cm1"] == 100.0
+    assert row["compatibility"]["frequency_threshold_policy_sha256"] == policy[
+        "policy_sha256"]
+
+
 @pytest.mark.parametrize("mutation", [
     "edge_method", "edge_endpoint", "edge_evidence", "neb_method",
-    "neb_reference", "neb_ts", "neb_observation_evidence",
+    "neb_reference", "neb_ts", "neb_observation_evidence", "neb_origin",
 ])
 def test_edge_and_neb_compatibility_bind_every_scientific_hash(mutation):
     source = projection()
@@ -679,12 +751,25 @@ def test_edge_and_neb_compatibility_bind_every_scientific_hash(mutation):
         neb["reference_state_sha256"] = "f" * 64
     elif mutation == "neb_ts":
         neb["transition_state_structure_sha256"] = "f" * 64
+    elif mutation == "neb_origin":
+        neb["origin"] = "imported"
     else:
         neb["observed_forward_delta_e_barrier"]["evidence_sha256"] = "f" * 64
 
     view = rw.build_reaction_workbench_view(source, project_id="project-1")
     thermo = view["graph"]["edges"][0]["thermochemistry"]
     assert thermo["kinetic_status"] == "unavailable"
+    assert thermo["observed_activation_delta_e_eV"] is None
+    assert thermo["observed_activation_delta_e_display"] == "unavailable"
+    edge_evidence = view["graph"]["edges"][0]["edge_evidence"]
+    assert edge_evidence["observed_values_available"] is False
+    assert edge_evidence["neb"]["observed_forward_delta_e_barrier"][
+        "value_eV"] is None
+    assert view["condition_revision"]["edges"][0][
+        "observed_activation_delta_e_eV"] is None
+    assert view["report_binding"]["tables"][0]["rows"][0][5] == "unavailable"
+    assert view["frozen_network"]["edges"][0][
+        "observed_activation_delta_e_eV"] is None
     assert view["frozen_network"]["readiness"] == "blocked"
 
 
@@ -695,6 +780,143 @@ def test_observed_neb_delta_e_and_thermal_delta_g_barriers_are_distinct():
     assert thermo["thermal_activation_delta_g_eV"] == 1.0
     assert thermo["barrier_sources"] == {
         "delta_e": "observed_neb", "delta_g": "thermochemistry_ledger"}
+
+
+def test_condition_response_base_must_match_ledger_and_canonical_condition_set():
+    source = projection()
+    response = source["bindings"]["state-r"]["thermochemistry"][
+        "condition_response"]
+    response["base_conditions"]["temperature_k"] = 1000.0
+    view = rw.build_reaction_workbench_view(
+        source, project_id="project-1", conditions={"temperature_k": 301.0})
+    ledger_row = next(row for row in view["ledger"]["rows"]
+                      if row["entity_id"] == "state-r")
+    assert ledger_row["condition_response"]["base_binding_status"] == "unavailable"
+    assert any("ledger condition" in item
+               for item in ledger_row["condition_response"]["missing"])
+    assert any("canonical condition set" in item
+               for item in ledger_row["condition_response"]["missing"])
+    derived = next(row for row in view["condition_revision"]["rows"]
+                   if row["entity_id"] == "state-r")
+    assert derived["status"] == "unavailable"
+    assert derived["derived_delta_g_eV"] is None
+    assert view["condition_revision"]["edges"][0]["reaction_delta_g_eV"] is None
+
+
+def test_condition_response_base_must_be_inside_evidence_applicability():
+    source = projection()
+    condition = source["conditions"][0]
+    condition["payload"]["temperature_k"] = 600.0
+    _rehash(condition)
+    for object_id in ("state-r", "state-ts", "state-p"):
+        thermo = source["bindings"][object_id]["thermochemistry"]
+        thermo["temperature_k"] = 600.0
+        thermo["condition_set_sha256"] = condition["semantic_sha256"]
+        thermo["condition_response"]["base_conditions"]["temperature_k"] = 600.0
+    view = rw.build_reaction_workbench_view(
+        source, project_id="project-1", conditions={"temperature_k": 500.0})
+    assert view["graph"]["thermodynamic_ready"] is True
+    assert view["condition_revision"]["artifact_status"] == "unavailable"
+    assert all(any("base is above" in item for item in row["missing"])
+               for row in view["condition_revision"]["rows"])
+
+
+@pytest.mark.parametrize(("target", "origin", "ceiling"), [
+    ("applicability", "inferred", "candidate"),
+    ("parameter", "imported", "machine_pass"),
+    ("joint", "inferred", "candidate"),
+])
+def test_condition_derivation_provenance_caps_status_and_readiness(
+    target, origin, ceiling,
+):
+    source = projection()
+    if target == "applicability":
+        source["applicability"]["temperature_k"]["origin"] = origin
+        conditions = {"temperature_k": 301.0}
+    else:
+        for object_id in ("state-r", "state-ts", "state-p"):
+            response = source["bindings"][object_id]["thermochemistry"][
+                "condition_response"]
+            if target == "parameter":
+                response["temperature_k"]["origin"] = origin
+            else:
+                response["joint_model"]["origin"] = origin
+        conditions = (
+            {"temperature_k": 301.0} if target == "parameter"
+            else {"temperature_k": 301.0, "coverage": 0.3})
+    view = rw.build_reaction_workbench_view(
+        source, project_id="project-1", conditions=conditions)
+    assert view["condition_revision"]["scientific_status"] == ceiling
+    assert view["condition_revision"]["artifact_status"] == "unavailable"
+    assert view["frozen_network"]["readiness"] == "blocked"
+
+
+@pytest.mark.parametrize(("target", "ceiling"), [
+    ("applicability", "candidate"),
+    ("parameter", "machine_pass"),
+])
+def test_condition_dependency_provenance_caps_base_revision_without_a_request(
+    target, ceiling,
+):
+    source = projection()
+    for binding in source["bindings"].values():
+        binding["scientific_status"] = "verified"
+    if target == "applicability":
+        source["applicability"]["temperature_k"]["origin"] = "inferred"
+    else:
+        for object_id in ("state-r", "state-ts", "state-p"):
+            source["bindings"][object_id]["thermochemistry"][
+                "condition_response"]["temperature_k"]["origin"] = "imported"
+
+    view = rw.build_reaction_workbench_view(source, project_id="project-1")
+    assert view["condition_revision"]["scientific_status"] == ceiling
+    assert view["condition_revision"]["artifact_status"] == "unavailable"
+    assert view["scientific_status"] == ceiling
+    assert view["frozen_network"]["readiness"] == "blocked"
+    if target == "parameter":
+        assert view["graph"]["kinetic_ready"] is False
+
+
+@pytest.mark.parametrize(("target", "field"), [
+    ("applicability", "origin"), ("applicability", "evidence_sha256"),
+    ("parameter", "origin"), ("parameter", "evidence_sha256"),
+    ("joint", "origin"), ("joint", "evidence_sha256"),
+])
+def test_condition_models_require_typed_origin_and_evidence(target, field):
+    source = projection()
+    if target == "applicability":
+        source["applicability"]["temperature_k"].pop(field)
+    else:
+        response = source["bindings"]["state-r"]["thermochemistry"][
+            "condition_response"]
+        response["temperature_k" if target == "parameter" else "joint_model"].pop(
+            field)
+    with pytest.raises(rw.ReactionWorkbenchError, match="required fields"):
+        rw.build_reaction_workbench_view(source, project_id="project-1")
+
+
+def test_low_frequency_policy_compatibility_ignores_entity_treatment_hashes():
+    source = projection()
+    treatment = source["bindings"]["state-p"]["thermochemistry"]["low_frequency"]
+    treatment["original_frequencies_cm1"] = [21.0, 47.0, 133.0]
+    treatment["reason"] = "entity-specific spectrum and sensitivity audit"
+    treatment["evidence_sha256"] = "f" * 64
+    treatment["sensitivity"][0]["delta_g_eV"] = 0.02
+    treatment["sensitivity"][0]["evidence_sha256"] = "f" * 64
+
+    view = rw.build_reaction_workbench_view(source, project_id="project-1")
+    rows = {row["entity_id"]: row for row in view["ledger"]["rows"]}
+    assert rows["state-r"]["compatibility"]["low_frequency_policy_sha256"] == (
+        rows["state-p"]["compatibility"]["low_frequency_policy_sha256"])
+    assert rows["state-r"]["compatibility"]["low_frequency_treatment_sha256"] != (
+        rows["state-p"]["compatibility"]["low_frequency_treatment_sha256"])
+    assert view["graph"]["thermodynamic_ready"] is True
+    assert view["graph"]["kinetic_ready"] is True
+
+    source["bindings"]["state-p"]["thermochemistry"]["low_frequency"][
+        "cutoff_cm1"] = 60.0
+    blocked = rw.build_reaction_workbench_view(source, project_id="project-1")
+    assert blocked["graph"]["thermodynamic_ready"] is False
 
 
 @pytest.mark.parametrize(("target", "origin", "ceiling"), [
