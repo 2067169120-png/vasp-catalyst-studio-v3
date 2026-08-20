@@ -27,6 +27,7 @@
       intentGeneration: 0, previewSequence: 0, previewOwner: null,
       suggestSequence: 0, suggestOwner: null, confirmSequence: 0, confirmOwner: null,
       previewGeneration: null, clientIntentId: null, draftFingerprint: null,
+      confirmLocked: false,
     },
   };   // 预览去重 + 防旧响应覆盖
 
@@ -235,6 +236,11 @@
     'mr-encut-multiplier', 'mr-encut-value', 'mr-kpoints-mode', 'mr-kpoints-grid',
     'mr-dry-run',
   ];
+  const MR_CONFIRM_LOCK_FIELDS = [
+    ...MR_FIELDS, 'gen-poscar', 'gen-incar', 'gen-out', 'gen-lib', 'mr-ack',
+    'mr-suggest', 'mr-preview', 'gen-poscar-btn', 'gen-incar-btn', 'gen-out-btn',
+    'gen-lib-btn', 'gen-run',
+  ];
 
   function mrEnglish() { return !!(VCS.i18n && VCS.i18n.lang === 'en'); }
 
@@ -290,6 +296,96 @@
       out_dir: val('gen-out'), lib_root: val('gen-lib'),
     };
     return JSON.stringify(payload);
+  }
+
+  function methodRecipeResolutionFingerprint(resolutions) {
+    const canonical = {};
+    Object.keys(resolutions || {}).sort().forEach(key => {
+      canonical[key] = String(resolutions[key]);
+    });
+    return JSON.stringify(canonical);
+  }
+
+  function methodRecipeConfirmBindingFingerprint(owner) {
+    return JSON.stringify({
+      token: owner.preview.token,
+      preview_sha256: owner.preview.preview_sha256,
+      target_id: owner.preview.target_id,
+      client_intent_id: owner.clientIntentId,
+      draft_fingerprint: owner.draftFingerprint,
+      idempotency_key: owner.confirmKey,
+      resolution_fingerprint: owner.resolutionFingerprint,
+      acknowledged: true,
+    });
+  }
+
+  function setMethodRecipeConfirmLocked(locked) {
+    const state = State.methodRecipe;
+    if (state.confirmLocked === locked) return;
+    state.confirmLocked = locked;
+    const elements = MR_CONFIRM_LOCK_FIELDS.map(id => $(id)).filter(Boolean);
+    document.querySelectorAll('#mr-diff .mr-resolution').forEach(el => elements.push(el));
+    elements.forEach(el => {
+      if (locked) {
+        el.dataset.mrConfirmWasDisabled = el.disabled ? '1' : '0';
+        el.disabled = true;
+      } else if (Object.prototype.hasOwnProperty.call(el.dataset, 'mrConfirmWasDisabled')) {
+        el.disabled = el.dataset.mrConfirmWasDisabled === '1';
+        delete el.dataset.mrConfirmWasDisabled;
+      }
+    });
+  }
+
+  function isCurrentMethodRecipeConfirmBinding(owner) {
+    const state = State.methodRecipe;
+    if (!owner || state.confirmOwner !== owner || state.preview !== owner.preview
+        || state.intentGeneration !== owner.generation
+        || state.previewGeneration !== owner.generation
+        || state.clientIntentId !== owner.clientIntentId
+        || state.confirmKey !== owner.confirmKey
+        || !isCurrentMethodRecipePreview()
+        || !$('mr-ack') || !$('mr-ack').checked) return false;
+    const choices = collectMethodRecipeResolutions();
+    if (!choices.complete
+        || methodRecipeResolutionFingerprint(choices.resolutions)
+          !== owner.resolutionFingerprint) return false;
+    return methodRecipeConfirmBindingFingerprint(owner) === owner.bindingFingerprint;
+  }
+
+  function releaseMethodRecipeConfirm(owner) {
+    if (State.methodRecipe.confirmOwner !== owner) return false;
+    State.methodRecipe.confirmOwner = null;
+    setMethodRecipeConfirmLocked(false);
+    updateMethodRecipeConfirmState();
+    return true;
+  }
+
+  function rejectChangedMethodRecipeConfirm(owner, result) {
+    if (!releaseMethodRecipeConfirm(owner)) return;
+    invalidateMethodRecipePreview();
+    const written = result && result.ok !== false && !result.error;
+    const status = $('mr-preview-status');
+    if (status) {
+      status.className = 'mr-status fail';
+      status.textContent = written
+        ? tr('runtime.generate.recipe.confirm_binding_written_stale', {},
+          '冻结的确认已完成，但当前选择已变化；旧结果不代表当前意图。请在任务页核对候选输入，并重新生成预览。',
+          'The frozen confirmation completed, but the current choices changed. The old result does not represent the current intent. Review the candidate inputs in Jobs and generate a new preview.')
+        : tr('runtime.generate.recipe.confirm_binding_stale', {},
+          '确认期间草稿、冲突选择或风险确认发生变化；未继续写入，请重新生成预览。',
+          'The draft, conflict resolutions, or risk acknowledgement changed during confirmation. Nothing further was written; generate a new preview.');
+    }
+    VCS.log(written
+      ? tr('runtime.generate.recipe.confirm_binding_written_stale_log', {},
+        '冻结确认的后端结果未作为当前 UI 意图接受；请在任务页核对已登记的 CREATED 候选作业。',
+        'The frozen backend result was not accepted as the current UI intent; review the registered CREATED candidate job in Jobs.')
+      : tr('runtime.generate.recipe.confirm_binding_stale_log', {},
+        '确认绑定已变化，旧确认被丢弃；请重新生成预览。',
+        'The confirmation binding changed, so the old confirmation was discarded; generate a new preview.'),
+    'failc');
+    if (written && window.Jobs && typeof window.Jobs.reload === 'function') {
+      window.Jobs.reload();
+    }
   }
 
   function isCurrentMethodRecipePreview() {
@@ -402,6 +498,7 @@
   }
 
   async function suggestMethodRecipe() {
+    if (State.methodRecipe.confirmOwner) return;
     const generation = State.methodRecipe.intentGeneration;
     const owner = ++State.methodRecipe.suggestSequence;
     State.methodRecipe.suggestOwner = owner;
@@ -512,6 +609,7 @@
   }
 
   async function previewMethodRecipe() {
+    if (State.methodRecipe.confirmOwner) return;
     let draft;
     try { draft = collectMethodRecipeDraft(); }
     catch (error) {
@@ -569,6 +667,7 @@
   }
 
   async function confirmMethodRecipe() {
+    if (State.methodRecipe.confirmOwner) return;
     const preview = State.methodRecipe.preview;
     const choices = collectMethodRecipeResolutions();
     if (!isCurrentMethodRecipePreview() || !choices.complete
@@ -576,8 +675,16 @@
     const generation = State.methodRecipe.intentGeneration;
     const draftFingerprint = State.methodRecipe.draftFingerprint;
     const clientIntentId = State.methodRecipe.clientIntentId;
-    const owner = `${preview.token}:${++State.methodRecipe.confirmSequence}`;
+    const resolutionFingerprint = methodRecipeResolutionFingerprint(choices.resolutions);
+    const owner = {
+      id: `${preview.token}:${resolutionFingerprint}:${++State.methodRecipe.confirmSequence}`,
+      preview, generation, draftFingerprint, clientIntentId,
+      confirmKey: State.methodRecipe.confirmKey,
+      resolutions: JSON.parse(resolutionFingerprint), resolutionFingerprint,
+    };
+    owner.bindingFingerprint = methodRecipeConfirmBindingFingerprint(owner);
     State.methodRecipe.confirmOwner = owner;
+    setMethodRecipeConfirmLocked(true);
     updateMethodRecipeConfirmState();
     let approved;
     try {
@@ -586,46 +693,39 @@
         'Write candidate inputs and register a CREATED job? This will not submit automatically or imply scientific validation.'));
     } catch (error) {
       if (State.methodRecipe.confirmOwner !== owner) return;
-      State.methodRecipe.confirmOwner = null;
-      updateMethodRecipeConfirmState();
+      if (!isCurrentMethodRecipeConfirmBinding(owner)) {
+        rejectChangedMethodRecipeConfirm(owner, null); return;
+      }
+      releaseMethodRecipeConfirm(owner);
       VCS.log(tr('runtime.generate.recipe.write_failed', {
         error: error.message || String(error),
       }, '确认写入失败：{error}', 'Confirmed write failed: {error}'), 'failc');
       return;
     }
     if (State.methodRecipe.confirmOwner !== owner) return;
-    if (State.methodRecipe.intentGeneration !== generation
-        || State.methodRecipe.draftFingerprint !== draftFingerprint
-        || !isCurrentMethodRecipePreview()) {
-      State.methodRecipe.confirmOwner = null;
-      updateMethodRecipeConfirmState();
-      return;
+    if (!isCurrentMethodRecipeConfirmBinding(owner)) {
+      rejectChangedMethodRecipeConfirm(owner, null); return;
     }
     if (!approved) {
-      State.methodRecipe.confirmOwner = null;
-      updateMethodRecipeConfirmState();
+      releaseMethodRecipeConfirm(owner);
       return;
     }
     const button = $('mr-confirm'); if (button) button.disabled = true;
     const request = {
       token: preview.token, preview_sha256: preview.preview_sha256,
       target_id: preview.target_id, confirmed: true,
-      idempotency_key: State.methodRecipe.confirmKey,
-      resolutions: choices.resolutions,
+      idempotency_key: owner.confirmKey,
+      resolutions: owner.resolutions,
       client_intent_id: clientIntentId,
     };
     let result;
     try { result = await VCS.call('method_recipe_confirm', request); }
     catch (error) { result = { ok: false, error: error.message || String(error) }; }
     if (State.methodRecipe.confirmOwner !== owner) return;
-    if (State.methodRecipe.intentGeneration !== generation
-        || State.methodRecipe.draftFingerprint !== draftFingerprint
-        || State.methodRecipe.preview !== preview) {
-      State.methodRecipe.confirmOwner = null;
-      updateMethodRecipeConfirmState();
-      return;
+    if (!isCurrentMethodRecipeConfirmBinding(owner)) {
+      rejectChangedMethodRecipeConfirm(owner, result); return;
     }
-    State.methodRecipe.confirmOwner = null;
+    releaseMethodRecipeConfirm(owner);
     if (!result || result.ok === false || result.error) {
       VCS.log(tr('runtime.generate.recipe.write_failed', {
         error: (result && result.error) || tr(

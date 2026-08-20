@@ -2,7 +2,8 @@
 
 状态真相仍在各目录的 ``job.yaml``；ledger 只存路径。所有 read-modify-write 都在同一
 稳定锁文件下执行，使用唯一临时文件、文件 fsync、原子替换和目录 durability。Method
-Recipe 事务可为自己新增的 entry 写内部 owner；普通调用方仍看到原有 list/bool API。
+Recipe 与 lifecycle 事务可为自己新增的 entry 写内部 owner；普通调用方仍看到原有
+list/bool API。
 """
 from __future__ import annotations
 
@@ -24,7 +25,9 @@ from vcstudio.shared.config import user_config_dir
 
 LEDGER_NAME = 'jobs.json'
 _OWNERS_KEY = '_transaction_owners'
+_RECEIPTS_KEY = '_lifecycle_undo_receipts'
 _HEX64 = re.compile(r'^[0-9a-f]{64}$')
+_HEX32 = re.compile(r'^[0-9a-f]{32}$')
 _PROCESS_LOCKS: dict[str, threading.RLock] = {}
 _PROCESS_LOCKS_GUARD = threading.Lock()
 
@@ -119,6 +122,36 @@ def _projection_payload(raw: bytes) -> tuple[dict[str, object], list[str], dict[
            or not isinstance(owner, str) or not _HEX64.fullmatch(owner)
            for entry, owner in raw_owners.items()):
         raise LedgerProjectionError('jobs ledger has invalid transaction owners')
+    receipts = value.get(_RECEIPTS_KEY, {})
+    if not isinstance(receipts, dict):
+        raise LedgerProjectionError('jobs ledger has invalid lifecycle receipts')
+    for transaction_id, receipt in receipts.items():
+        if (not isinstance(transaction_id, str) or not _HEX32.fullmatch(transaction_id)
+                or not isinstance(receipt, dict)
+                or set(receipt) != {
+                    'schema', 'transaction_id', 'actual_added', 'actual_removed',
+                    'result_sha256', 'applied',
+                }
+                or receipt.get('schema') != 1 or receipt.get('transaction_id') != transaction_id
+                or receipt.get('applied') is not True
+                or not _HEX64.fullmatch(str(receipt.get('result_sha256') or ''))
+                or not isinstance(receipt.get('actual_added'), list)
+                or not isinstance(receipt.get('actual_removed'), list)):
+            raise LedgerProjectionError('jobs ledger has invalid lifecycle receipts')
+        added = receipt['actual_added']
+        removed = receipt['actual_removed']
+        if (any(not isinstance(item, dict)
+                or set(item) != {'entry', 'expected_owner'}
+                or not isinstance(item.get('entry'), str) or not item['entry'].strip()
+                or not isinstance(item.get('expected_owner'), str)
+                or not _HEX64.fullmatch(item['expected_owner']) for item in added)
+                or any(not isinstance(item, dict)
+                       or set(item) != {'entry', 'original_owner'}
+                       or not isinstance(item.get('entry'), str) or not item['entry'].strip()
+                       or (item.get('original_owner') is not None
+                           and not _HEX64.fullmatch(str(item['original_owner'])))
+                       for item in removed)):
+            raise LedgerProjectionError('jobs ledger has invalid lifecycle receipts')
     return copy.deepcopy(value), list(dirs), dict(raw_owners)
 
 
@@ -188,6 +221,32 @@ def _merge_entry_delta(current_payload: dict[str, object], from_entries: list[st
     else:
         updated.pop(_OWNERS_KEY, None)
     return updated
+
+
+def _payload_semantic_sha256(payload: dict[str, object]) -> str:
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+        allow_nan=False).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _lifecycle_owner_id(transaction_id: str) -> str:
+    return hashlib.sha256(
+        f'vcstudio:lifecycle-ledger:{transaction_id}'.encode('ascii')).hexdigest()
+
+
+def _prune_receipt_additions(payload: dict[str, object], entries: list[str]) -> None:
+    """An unregister relinquishes rollback authority over that exact added entry."""
+    receipts = payload.get(_RECEIPTS_KEY)
+    if not isinstance(receipts, dict):
+        return
+    present = set(entries)
+    for receipt in receipts.values():
+        if isinstance(receipt, dict) and isinstance(receipt.get('actual_added'), list):
+            receipt['actual_added'] = [
+                item for item in receipt['actual_added']
+                if isinstance(item, dict) and item.get('entry') in present
+            ]
 
 
 def render_projection(payload: dict[str, object], entries) -> bytes:
@@ -277,10 +336,19 @@ def _save_payload(path: Path, payload: dict[str, object]) -> None:
 
 
 def _save_state(path: Path, dirs: list[str], owners: dict[str, str]) -> None:
-    payload: dict[str, object] = {'job_dirs': dirs}
+    try:
+        payload = _snapshot_unlocked(path)['payload']
+    except LedgerProjectionError:
+        # Preserve the longstanding self-heal behavior for malformed user ledgers.  Strict
+        # lifecycle projection APIs never take this recovery path.
+        payload = {'job_dirs': []}
+    payload['job_dirs'] = dirs
     retained = {entry: owner for entry, owner in owners.items() if entry in dirs}
     if retained:
         payload[_OWNERS_KEY] = retained
+    else:
+        payload.pop(_OWNERS_KEY, None)
+    _prune_receipt_additions(payload, dirs)
     _save_payload(path, payload)
 
 
@@ -296,9 +364,12 @@ def projection_snapshot(path: str | os.PathLike | None = None) -> dict[str, obje
         return _snapshot_unlocked(target)
 
 
-def merge_projection(*, base_sha256: str, base_entries, projected_entries,
+def merge_projection(*, transaction_id: str, base_sha256: str,
+                     base_entries, projected_entries,
                      path: str | os.PathLike | None = None) -> dict[str, object]:
-    """CAS-or-merge a lifecycle list delta without erasing concurrent entries or owners."""
+    """CAS-or-merge a delta and atomically persist its actual undo receipt."""
+    if not _HEX32.fullmatch(str(transaction_id)):
+        raise LedgerProjectionError('lifecycle transaction id is invalid')
     if not _HEX64.fullmatch(str(base_sha256)):
         raise LedgerProjectionError('base ledger hash is invalid')
     base = _validated_entries(base_entries, field='base projection')
@@ -306,43 +377,136 @@ def merge_projection(*, base_sha256: str, base_entries, projected_entries,
     target = _ledger_path(path)
     with _mutation_lock(target):
         current = _snapshot_unlocked(target)
+        existing_receipts = current['payload'].get(_RECEIPTS_KEY, {})
+        if transaction_id in existing_receipts:
+            result = dict(current)
+            result['cas_matched'] = current['sha256'] == str(base_sha256)
+            result['undo_receipt'] = copy.deepcopy(existing_receipts[transaction_id])
+            return result
         removed = {_entry_key(item) for item in base} - {
             _entry_key(item) for item in projected}
         if any(_entry_key(entry) in removed for entry in current['owners']):
             raise LedgerProjectionError(
                 'lifecycle projection cannot remove a transaction-owned ledger entry')
+        current_dirs = list(current['job_dirs'])
+        current_keys = {_entry_key(item) for item in current_dirs}
+        owners = dict(current['owners'])
+        lifecycle_owner = _lifecycle_owner_id(transaction_id)
+        actual_added = [
+            {'entry': item, 'expected_owner': lifecycle_owner}
+            for item in projected
+            if _entry_key(item) not in {_entry_key(value) for value in base}
+            and _entry_key(item) not in current_keys
+        ]
+        actual_removed = [
+            {'entry': item, 'original_owner': owners.get(item)}
+            for item in current_dirs if _entry_key(item) in removed
+        ]
         updated = _merge_entry_delta(current['payload'], base, projected)
-        if updated != current['payload']:
-            _save_payload(target, updated)
+        updated_owners = dict(updated.get(_OWNERS_KEY, {}))
+        for item in actual_added:
+            updated_owners[item['entry']] = lifecycle_owner
+        if updated_owners:
+            updated[_OWNERS_KEY] = updated_owners
+        else:
+            updated.pop(_OWNERS_KEY, None)
+        receipt = {
+            'schema': 1, 'transaction_id': transaction_id,
+            'actual_added': actual_added, 'actual_removed': actual_removed,
+            'result_sha256': _payload_semantic_sha256(updated), 'applied': True,
+        }
+        receipts = copy.deepcopy(updated.get(_RECEIPTS_KEY, {}))
+        receipts[transaction_id] = receipt
+        updated[_RECEIPTS_KEY] = receipts
+        # Even a semantic no-op gets a durable applied marker.  Without it rollback has no
+        # authority to infer that the planned projection reached the ledger.
+        _save_payload(target, updated)
         result = _snapshot_unlocked(target)
         result['cas_matched'] = current['sha256'] == str(base_sha256)
+        result['undo_receipt'] = copy.deepcopy(receipt)
         return result
 
 
-def rollback_projection(*, original: bytes, projected: bytes,
+def rollback_projection(*, transaction_id: str,
                         path: str | os.PathLike | None = None) -> dict[str, object]:
-    """Inverse-merge one lifecycle delta while preserving later writers and their owners."""
-    original_payload, original_entries, original_owners = _projection_payload(original)
-    _projected_payload, projected_entries, _projected_owners = _projection_payload(projected)
+    """Undo only the durable actual receipt; absence of an applied receipt is a strict no-op."""
+    if not _HEX32.fullmatch(str(transaction_id)):
+        raise LedgerProjectionError('lifecycle transaction id is invalid')
     target = _ledger_path(path)
     with _mutation_lock(target):
         current = _snapshot_unlocked(target)
-        if current['raw'] == original:
-            return current
-        updated = _merge_entry_delta(
-            current['payload'], projected_entries, original_entries,
-            restored_owners=original_owners,
-        )
-        if (not original and updated == {'job_dirs': []}
-                and current['payload'].keys() <= {'job_dirs', _OWNERS_KEY}):
-            try:
-                target.unlink(missing_ok=True)
-                _fsync_directory(target.parent)
-            except OSError as exc:
-                raise LedgerProjectionError('jobs ledger rollback could not be published') from exc
-        elif updated != current['payload']:
-            _save_payload(target, updated)
-        return _snapshot_unlocked(target)
+        payload = copy.deepcopy(current['payload'])
+        receipts = copy.deepcopy(payload.get(_RECEIPTS_KEY, {}))
+        receipt = receipts.get(transaction_id)
+        if not isinstance(receipt, dict) or receipt.get('applied') is not True:
+            result = dict(current)
+            result['rolled_back'] = False
+            return result
+
+        dirs = list(current['job_dirs'])
+        owners = dict(current['owners'])
+        for item in receipt['actual_added']:
+            entry = item['entry']
+            if entry in dirs and owners.get(entry) == item['expected_owner']:
+                dirs = [value for value in dirs if value != entry]
+                owners.pop(entry, None)
+        current_keys = {_entry_key(item) for item in dirs}
+        for item in receipt['actual_removed']:
+            entry = item['entry']
+            key = _entry_key(entry)
+            if key in current_keys:
+                continue
+            dirs.append(entry)
+            current_keys.add(key)
+            original_owner = item['original_owner']
+            if original_owner is not None:
+                owners[entry] = original_owner
+
+        payload['job_dirs'] = dirs
+        if owners:
+            payload[_OWNERS_KEY] = owners
+        else:
+            payload.pop(_OWNERS_KEY, None)
+        receipts.pop(transaction_id, None)
+        if receipts:
+            payload[_RECEIPTS_KEY] = receipts
+        else:
+            payload.pop(_RECEIPTS_KEY, None)
+        _save_payload(target, payload)
+        result = _snapshot_unlocked(target)
+        result['rolled_back'] = True
+        result['undo_receipt'] = copy.deepcopy(receipt)
+        return result
+
+
+def release_projection_receipt(*, transaction_id: str,
+                               path: str | os.PathLike | None = None) -> bool:
+    """Drop rollback authority after the lifecycle journal is durably committed."""
+    if not _HEX32.fullmatch(str(transaction_id)):
+        raise LedgerProjectionError('lifecycle transaction id is invalid')
+    target = _ledger_path(path)
+    with _mutation_lock(target):
+        current = _snapshot_unlocked(target)
+        payload = copy.deepcopy(current['payload'])
+        receipts = copy.deepcopy(payload.get(_RECEIPTS_KEY, {}))
+        receipt = receipts.get(transaction_id)
+        if not isinstance(receipt, dict):
+            return False
+        owners = dict(current['owners'])
+        for item in receipt['actual_added']:
+            if owners.get(item['entry']) == item['expected_owner']:
+                owners.pop(item['entry'], None)
+        if owners:
+            payload[_OWNERS_KEY] = owners
+        else:
+            payload.pop(_OWNERS_KEY, None)
+        receipts.pop(transaction_id)
+        if receipts:
+            payload[_RECEIPTS_KEY] = receipts
+        else:
+            payload.pop(_RECEIPTS_KEY, None)
+        _save_payload(target, payload)
+        return True
 
 
 def list_dirs(path: str | os.PathLike | None = None) -> list:

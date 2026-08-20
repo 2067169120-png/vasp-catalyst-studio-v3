@@ -3626,6 +3626,10 @@
   "runtime.generate.recipe.previewing": "后端正在解析结构、赝势证据与已有 INCAR…",
   "runtime.generate.recipe.preview_failed": "Recipe 预览被拒绝：{error}",
   "runtime.generate.recipe.confirm_prompt": "确认只写候选输入并登记 CREATED 作业？这不会自动提交，也不代表科学 validated。",
+  "runtime.generate.recipe.confirm_binding_stale": "确认期间草稿、冲突选择或风险确认发生变化；未继续写入，请重新生成预览。",
+  "runtime.generate.recipe.confirm_binding_stale_log": "确认绑定已变化，旧确认被丢弃；请重新生成预览。",
+  "runtime.generate.recipe.confirm_binding_written_stale": "冻结的确认已完成，但当前选择已变化；旧结果不代表当前意图。请在任务页核对候选输入，并重新生成预览。",
+  "runtime.generate.recipe.confirm_binding_written_stale_log": "冻结确认的后端结果未作为当前 UI 意图接受；请在任务页核对已登记的 CREATED 候选作业。",
   "runtime.generate.recipe.write_failed": "确认写入失败：{error}",
   "runtime.generate.recipe.created": "候选输入已写入并登记 CREATED 作业 {job}（recipe {hash}）；未提交、未科学验证。",
   "runtime.generate.recipe.created_toast": "候选输入已生成（未提交）"

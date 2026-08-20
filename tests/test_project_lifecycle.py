@@ -380,10 +380,29 @@ def test_lifecycle_ledger_rollback_removes_only_its_delta_and_preserves_owner(
     destination = tmp_path / "clone"
     service = ProjectLifecycleService(registry)
     plan = service.preflight_clone(source, destination)
+    overlapping = Path(plan.job_changes[0].target_path)
+    overlapping_owner = "1" * 64
+    rebound_evidence = {}
     real_commit = service._commit_ledger
 
     def commit_then_fail(*args, **kwargs):
-        real_commit(*args, **kwargs)
+        assert cluster_ledger.register_owned(
+            overlapping, overlapping_owner, path=ledger_path)["added"] is True
+        result = real_commit(*args, **kwargs)
+        receipt = result["undo_receipt"]
+        assert overlapping.as_posix() not in {
+            Path(item["entry"]).as_posix() for item in receipt["actual_added"]
+        }
+        assert receipt["applied"] is True and receipt["result_sha256"]
+        rebound = Path(receipt["actual_added"][0]["entry"])
+        lifecycle_owner = receipt["actual_added"][0]["expected_owner"]
+        assert cluster_ledger.registration_state(
+            rebound, lifecycle_owner, path=ledger_path)["owned"] is True
+        # A later writer removes and re-registers the same locator.  Receipt pruning must
+        # prevent rollback from mistaking that new unowned registration for our delta.
+        assert cluster_ledger.unregister(rebound, path=ledger_path) is True
+        assert cluster_ledger.register(rebound, path=ledger_path) is True
+        rebound_evidence.update(path=rebound, owner=lifecycle_owner)
         assert cluster_ledger.register(concurrent, path=ledger_path) is True
         raise OSError("failure after lifecycle ledger publication")
 
@@ -395,10 +414,120 @@ def test_lifecycle_ledger_rollback_removes_only_its_delta_and_preserves_owner(
     assert not destination.exists()
     assert set(cluster_ledger.list_dirs(path=ledger_path)) == {
         *(str(path.resolve()) for path in source_jobs),
-        str(owned_job.resolve()), str(concurrent.resolve()),
+        str(owned_job.resolve()), str(concurrent.resolve()), str(overlapping.resolve()),
+        str(rebound_evidence["path"].resolve()),
     }
     assert cluster_ledger.registration_state(
         owned_job, owner_id, path=ledger_path)["owned"] is True
+    assert cluster_ledger.registration_state(
+        overlapping, overlapping_owner, path=ledger_path)["owned"] is True
+    assert cluster_ledger.registration_state(
+        rebound_evidence["path"], rebound_evidence["owner"], path=ledger_path) == {
+            "present": True, "owned": False, "preexisting": True,
+        }
+    assert "_lifecycle_undo_receipts" not in json.loads(
+        ledger_path.read_text(encoding="utf-8"))
+
+
+def test_ledger_write_failure_before_applied_receipt_never_inverts_planned_target(
+        tmp_path, monkeypatch):
+    source = _project(tmp_path / "source")
+    registry = _registry(tmp_path / "projects.json", [source])
+    ledger_path = _ledger(tmp_path / "jobs.json", [source.parent / "clean"])
+    destination = tmp_path / "clone"
+    service = ProjectLifecycleService(registry)
+    plan = service.preflight_clone(source, destination)
+    overlapping = Path(plan.job_changes[0].target_path)
+    owner_id = "2" * 64
+
+    def overlap_then_fail(**_kwargs):
+        assert cluster_ledger.register_owned(
+            overlapping, owner_id, path=ledger_path)["added"] is True
+        raise OSError("ledger failed before lifecycle applied marker")
+
+    monkeypatch.setattr(service, "_write_ledger", overlap_then_fail)
+    with pytest.raises(ProjectLifecycleError, match="failed safely"):
+        service.apply(plan)
+
+    assert cluster_ledger.registration_state(
+        overlapping, owner_id, path=ledger_path) == {
+            "present": True, "owned": True, "preexisting": False,
+        }
+    payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert "_lifecycle_undo_receipts" not in payload
+    assert not destination.exists() and not service.journal_path.exists()
+
+
+def test_lifecycle_success_releases_receipt_and_transient_added_owners(tmp_path):
+    source = _project(tmp_path / "source")
+    registry = _registry(tmp_path / "projects.json", [source])
+    ledger_path = _ledger(tmp_path / "jobs.json", [source.parent / "clean"])
+    destination = tmp_path / "clone"
+    service = ProjectLifecycleService(registry)
+    plan = service.preflight_clone(source, destination)
+
+    result = service.apply(plan)
+
+    assert result["ok"] is True
+    payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert "_lifecycle_undo_receipts" not in payload
+    assert "_transaction_owners" not in payload
+    assert set(payload["job_dirs"]) == {
+        str(source.parent / "clean"),
+        *(change.target_path for change in plan.job_changes),
+    }
+
+
+def test_restart_recovers_durable_ledger_receipt_after_writer_raises(
+        tmp_path, monkeypatch):
+    source = _project(tmp_path / "source")
+    registry = _registry(tmp_path / "projects.json", [source])
+    ledger_path = _ledger(tmp_path / "jobs.json", [source.parent / "clean"])
+    destination = tmp_path / "clone"
+    service = ProjectLifecycleService(registry)
+    plan = service.preflight_clone(source, destination)
+    overlapping = Path(plan.job_changes[0].target_path)
+    overlapping_owner = "3" * 64
+    original_write = service._write_ledger
+    original_save = cluster_ledger._save_payload
+    armed = True
+
+    def write_with_overlap(**kwargs):
+        assert cluster_ledger.register_owned(
+            overlapping, overlapping_owner, path=ledger_path)["added"] is True
+        return original_write(**kwargs)
+
+    def durable_save_then_crash(path, payload):
+        nonlocal armed
+        original_save(path, payload)
+        if armed and payload.get("_lifecycle_undo_receipts"):
+            armed = False
+            raise _SimulatedCrash()
+
+    monkeypatch.setattr(service, "_write_ledger", write_with_overlap)
+    monkeypatch.setattr(cluster_ledger, "_save_payload", durable_save_then_crash)
+
+    with pytest.raises(_SimulatedCrash):
+        service.apply(plan)
+
+    crashed_payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+    receipts = crashed_payload["_lifecycle_undo_receipts"]
+    transaction_id, receipt = next(iter(receipts.items()))
+    assert len(receipts) == 1 and receipt["transaction_id"] == transaction_id
+    assert receipt["applied"] is True
+    assert overlapping.as_posix() not in {
+        Path(item["entry"]).as_posix() for item in receipt["actual_added"]
+    }
+    assert service.journal_path.is_file() and destination.is_dir()
+
+    recovered_service = ProjectLifecycleService(registry)
+
+    assert not recovered_service.journal_path.exists() and not destination.exists()
+    assert _read_registry(registry) == [str(source)]
+    assert cluster_ledger.registration_state(
+        overlapping, overlapping_owner, path=ledger_path)["owned"] is True
+    recovered_payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert "_lifecycle_undo_receipts" not in recovered_payload
 
 
 def test_clone_never_overwrites_destination_that_appears_during_copy(

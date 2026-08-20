@@ -3626,6 +3626,10 @@
   "runtime.generate.recipe.previewing": "The backend is parsing structure, pseudopotential evidence, and the existing INCAR…",
   "runtime.generate.recipe.preview_failed": "Recipe preview rejected: {error}",
   "runtime.generate.recipe.confirm_prompt": "Write candidate inputs and register a CREATED job? This will not submit automatically or imply scientific validation.",
+  "runtime.generate.recipe.confirm_binding_stale": "The draft, conflict resolutions, or risk acknowledgement changed during confirmation. Nothing further was written; generate a new preview.",
+  "runtime.generate.recipe.confirm_binding_stale_log": "The confirmation binding changed, so the old confirmation was discarded; generate a new preview.",
+  "runtime.generate.recipe.confirm_binding_written_stale": "The frozen confirmation completed, but the current choices changed. The old result does not represent the current intent. Review the candidate inputs in Jobs and generate a new preview.",
+  "runtime.generate.recipe.confirm_binding_written_stale_log": "The frozen backend result was not accepted as the current UI intent; review the registered CREATED candidate job in Jobs.",
   "runtime.generate.recipe.write_failed": "Confirmed write failed: {error}",
   "runtime.generate.recipe.created": "Candidate inputs were written and registered as CREATED job {job} (recipe {hash}); not submitted or scientifically validated.",
   "runtime.generate.recipe.created_toast": "Candidate inputs generated (not submitted)"

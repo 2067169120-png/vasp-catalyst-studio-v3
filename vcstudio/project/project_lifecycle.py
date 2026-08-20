@@ -726,10 +726,12 @@ class ProjectLifecycleService:
         return (copy.deepcopy(snapshot["payload"]), list(snapshot["job_dirs"]),
                 str(snapshot["sha256"]))
 
-    def _write_ledger(self, *, base_sha256: str, base_entries: list[str],
+    def _write_ledger(self, *, transaction_id: str, base_sha256: str,
+                      base_entries: list[str],
                       entries: list[str]) -> dict[str, object]:
         return cluster_ledger.merge_projection(
-            base_sha256=base_sha256, base_entries=base_entries,
+            transaction_id=transaction_id, base_sha256=base_sha256,
+            base_entries=base_entries,
             projected_entries=entries, path=self.ledger_path)
 
     @staticmethod
@@ -755,7 +757,8 @@ class ProjectLifecycleService:
     def _restore_authority_snapshot(cls, snapshot: dict[str, Any],
                                     written_sha256: str | None,
                                     projection_b64: str | None,
-                                    list_key: str) -> None:
+                                    list_key: str,
+                                    transaction_id: str | None = None) -> None:
         """Undo only this transaction's projection, preserving other writers.
 
         A CAS failure can mean a non-lifecycle writer legitimately changed the
@@ -770,16 +773,13 @@ class ProjectLifecycleService:
                 "journal_invalid", "A recovery snapshot path is invalid."
             )
         if list_key == "job_dirs":
-            original = cls._snapshot_payload(snapshot)
-            if not projection_b64:
-                # The transaction never prepared a ledger delta.  Any current value belongs to a
-                # different writer and is left untouched.
-                return
+            if not transaction_id:
+                raise ProjectLifecycleError(
+                    "journal_invalid", "A lifecycle ledger transaction id is missing.")
             try:
-                projected = base64.b64decode(str(projection_b64), validate=True)
                 cluster_ledger.rollback_projection(
-                    original=original, projected=projected, path=path)
-            except (ValueError, binascii.Error, cluster_ledger.LedgerProjectionError) as exc:
+                    transaction_id=transaction_id, path=path)
+            except cluster_ledger.LedgerProjectionError as exc:
                 raise ProjectLifecycleError(
                     "journal_recovery_failed",
                     "A concurrently changed jobs ledger could not be merged safely.",
@@ -868,12 +868,16 @@ class ProjectLifecycleService:
             )
         self._write_registry(payload, entries)
 
-    def _commit_ledger(self, plan: LifecyclePlan, payload: dict[str, Any],
+    def _commit_ledger(self, record: dict[str, Any], plan: LifecyclePlan,
+                       payload: dict[str, Any],
                        entries: list[str]) -> dict[str, object]:
         try:
-            return self._write_ledger(
+            result = self._write_ledger(
+                transaction_id=str(record["transaction_id"]),
                 base_sha256=plan.ledger_sha256,
                 base_entries=list(payload.get("job_dirs") or []), entries=entries)
+            record["ledger_undo_receipt"] = copy.deepcopy(result.get("undo_receipt"))
+            return result
         except cluster_ledger.LedgerProjectionError as exc:
             raise ProjectLifecycleError(
                 "ledger_merge_failed",
@@ -1011,6 +1015,7 @@ class ProjectLifecycleService:
             "ledger_written_sha256": None,
             "registry_projection_b64": None,
             "ledger_projection_b64": None,
+            "ledger_undo_receipt": None,
             "move_source_evidence": move_source_evidence,
             "backups": [
                 {
@@ -1129,6 +1134,18 @@ class ProjectLifecycleService:
             and _project_uuid(current_project) == expected_uuid
 
     def _cleanup_committed_journal(self, record: dict[str, Any]) -> None:
+        ledger_snapshot = record.get("ledger") or {}
+        ledger_path = Path(str(ledger_snapshot.get("path") or ""))
+        transaction_id = str(record.get("transaction_id") or "")
+        if ledger_path.name and transaction_id:
+            try:
+                cluster_ledger.release_projection_receipt(
+                    transaction_id=transaction_id, path=ledger_path)
+            except cluster_ledger.LedgerProjectionError as exc:
+                raise ProjectLifecyclePartialRollbackError(
+                    "ledger_receipt_release_failed",
+                    "Committed lifecycle ledger authority still requires recovery.",
+                ) from exc
         for raw in (record.get("stage_root"), record.get("destination_root")):
             root = Path(str(raw or ""))
             if root.name and self._owner_matches(root, record):
@@ -1194,7 +1211,8 @@ class ProjectLifecycleService:
                 self._restore_authority_snapshot(
                     record.get(key) or {}, record.get(f"{key}_written_sha256"),
                     record.get(f"{key}_projection_b64"),
-                    "job_dirs" if key == "ledger" else "projects")
+                    "job_dirs" if key == "ledger" else "projects",
+                    str(record.get("transaction_id") or "") if key == "ledger" else None)
             except Exception as exc:  # noqa: BLE001
                 errors.append(str(exc))
         if errors:
@@ -1806,7 +1824,7 @@ class ProjectLifecycleService:
             self._prepare_authority_projection(
                 record, authority="ledger", payload=ledger_payload,
                 list_key="job_dirs", entries=projected_ledger)
-            self._commit_ledger(plan, ledger_payload, projected_ledger)
+            self._commit_ledger(record, plan, ledger_payload, projected_ledger)
             self._journal_phase(record, "ledger_written")
             self._journal_phase(record, "committed")
             try:
@@ -1927,7 +1945,7 @@ class ProjectLifecycleService:
             self._prepare_authority_projection(
                 record, authority="ledger", payload=ledger_payload,
                 list_key="job_dirs", entries=projected_ledger)
-            self._commit_ledger(plan, ledger_payload, projected_ledger)
+            self._commit_ledger(record, plan, ledger_payload, projected_ledger)
             self._journal_phase(record, "ledger_written")
             self._journal_phase(record, "committed")
             try:
@@ -1995,7 +2013,7 @@ class ProjectLifecycleService:
             self._prepare_authority_projection(
                 record, authority="ledger", payload=ledger_payload,
                 list_key="job_dirs", entries=projected_ledger)
-            self._commit_ledger(plan, ledger_payload, projected_ledger)
+            self._commit_ledger(record, plan, ledger_payload, projected_ledger)
             self._journal_phase(record, "ledger_written")
             self._journal_phase(record, "committed")
             try:

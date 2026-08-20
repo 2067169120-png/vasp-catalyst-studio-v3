@@ -109,6 +109,10 @@ global.window = global;
 
 const calls = [];
 const pendingPreviews = [];
+const pendingConfirms = [];
+const logs = [];
+const toasts = [];
+let reloads = 0;
 global.VCS = {
   i18n: { lang: 'en' },
   t: (_key, _params, fallback) => fallback,
@@ -117,14 +121,21 @@ global.VCS = {
     if (name === 'method_recipe_preview') return new Promise(resolve => {
       pendingPreviews.push({ payload, resolve });
     });
-    if (name === 'method_recipe_confirm') return Promise.resolve({
-      ok: true, job_id: 'job-opaque', recipe_semantic_sha256: 'c'.repeat(64), warnings: [],
-    });
+    if (name === 'method_recipe_confirm') {
+      const result = {
+        ok: true, job_id: 'job-opaque', recipe_semantic_sha256: 'c'.repeat(64), warnings: [],
+      };
+      if (calls.filter(item => item[0] === 'method_recipe_confirm').length === 1) {
+        return Promise.resolve(result);
+      }
+      return new Promise(resolve => pendingConfirms.push({ payload, result, resolve }));
+    }
     return Promise.reject(new Error(`unexpected call ${name}`));
   },
-  log: () => {}, toast: () => {}, confirm: async () => true,
+  log: (message, level) => logs.push([message, level]),
+  toast: message => toasts.push(message), confirm: async () => true,
 };
-global.Jobs = { reload: () => {} };
+global.Jobs = { reload: () => { reloads += 1; } };
 
 vm.runInThisContext(fs.readFileSync(process.env.GENERATE_SOURCE, 'utf8'), {
   filename: process.env.GENERATE_SOURCE,
@@ -171,6 +182,45 @@ vm.runInThisContext(fs.readFileSync(process.env.GENERATE_SOURCE, 'utf8'), {
   assert.deepEqual(confirmCall[1].resolutions, { ENCUT: 'existing' });
   assert.equal(confirmCall[1].confirmed, true);
   assert.ok(!calls.some(item => /submit|continue/.test(item[0])));
+
+  const racePreview = window.Generate.methodRecipe.preview();
+  assert.equal(pendingPreviews.length, 3);
+  pendingPreviews[2].resolve(response(pendingPreviews[2], 'race-preview-token', 'e'));
+  await racePreview;
+  const raceResolution = document.querySelectorAll('#mr-diff .mr-resolution')[0];
+  raceResolution.value = 'existing'; ids['mr-ack'].checked = true;
+  const successfulLogs = logs.filter(item => item[0].includes('Candidate inputs were written')).length;
+  const successfulToasts = toasts.length;
+  const raceConfirm = window.Generate.methodRecipe.confirm();
+  for (let turn = 0; turn < 4 && pendingConfirms.length === 0; turn += 1) {
+    await Promise.resolve();
+  }
+  assert.equal(pendingConfirms.length, 1);
+  assert.equal(raceResolution.disabled, true);
+  assert.equal(ids['mr-ack'].disabled, true);
+  assert.equal(ids['mr-encut-multiplier'].disabled, true);
+  assert.equal(ids['gen-poscar'].disabled, true);
+
+  // Programmatic mutation models a stale callback/extensions despite disabled controls.
+  raceResolution.value = 'recipe';
+  ids['mr-ack'].checked = false;
+  ids['mr-encut-multiplier'].value = '1.7';
+  pendingConfirms[0].resolve(pendingConfirms[0].result);
+  await raceConfirm;
+
+  const confirmCalls = calls.filter(item => item[0] === 'method_recipe_confirm');
+  assert.equal(confirmCalls.length, 2);
+  assert.deepEqual(confirmCalls[1][1].resolutions, { ENCUT: 'existing' });
+  assert.equal(logs.filter(item => item[0].includes('Candidate inputs were written')).length,
+    successfulLogs);
+  assert.equal(toasts.length, successfulToasts);
+  assert.match(ids['mr-preview-status'].textContent, /does not represent the current intent/);
+  assert.equal(ids['mr-preview-status'].className, 'mr-status fail');
+  assert.equal(ids['mr-confirm'].disabled, true);
+  assert.equal(raceResolution.disabled, false);
+  assert.equal(ids['mr-ack'].disabled, false);
+  assert.equal(ids['mr-encut-multiplier'].disabled, false);
+  assert.equal(reloads, 2);
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """,
         encoding="utf-8",
