@@ -182,6 +182,72 @@ def frozen_network():
     return _freeze(network)
 
 
+def catmap_ready_network():
+    """A small adsorption mechanism with participating, independent gas reservoirs."""
+    base = frozen_network()
+    records = {record["id"]: copy.deepcopy(record) for record in base["species"]}
+    o2_adsorbed = copy.deepcopy(records["O_s"])
+    o2_adsorbed.update({
+        "id": "O2_s", "composition": {"O": 2},
+        "formation_energy": _energy(-0.5), "frequencies_cm1": [450.0, 750.0],
+    })
+    co_transition = copy.deepcopy(records["COO_ts"])
+    co_transition.update({
+        "id": "CO_ads_ts", "composition": {"C": 1, "O": 1},
+        "formation_energy": _energy(0.2),
+        "frequencies_cm1": [-300.0, 250.0, 600.0],
+    })
+    o2_transition = copy.deepcopy(records["COO_ts"])
+    o2_transition.update({
+        "id": "O2_ads_ts", "composition": {"O": 2},
+        "formation_energy": _energy(0.3),
+        "frequencies_cm1": [-250.0, 300.0, 650.0],
+    })
+
+    def step(step_id, gas_id, transition_id, product_id, delta_g,
+             forward_barrier, reverse_barrier):
+        return {
+            "id": step_id,
+            "reactants": {gas_id: 1, "star_s": 1},
+            "transition_state": {transition_id: 1},
+            "products": {product_id: 1},
+            "reversible": True,
+            "delta_g": _energy(delta_g),
+            "forward_barrier": _energy(forward_barrier),
+            "reverse_barrier": _energy(reverse_barrier),
+            "prefactors": {
+                "forward": {
+                    "value": 1.0e13, "unit": "s^-1", "source": _source("tst"),
+                },
+                "reverse": {
+                    "value": 1.0e13, "unit": "s^-1", "source": _source("tst"),
+                },
+            },
+            "bep": {"used": False, "source": None, "parameters_sha256": None},
+            "scaling": {
+                "used": False, "source": None, "parameters_sha256": None,
+            },
+            "uncertainty_eV": 0.10,
+        }
+
+    network = FrozenNetwork(copy.deepcopy(dict(base)))
+    network.update({
+        "input_sha256": "", "network_id": "catmap-ready-adsorption",
+        "revision": "rev-catmap-1",
+        "feed_species": ["CO_g", "O2_g", "star_s"],
+        "target_products": ["CO_s", "O2_s"],
+        "species": [
+            records["CO_g"], records["O2_g"], records["star_s"],
+            records["CO_s"], o2_adsorbed, co_transition, o2_transition,
+        ],
+        "elementary_steps": [
+            step("co_adsorption", "CO_g", "CO_ads_ts", "CO_s", -1.0, 0.2, 1.2),
+            step("o2_adsorption", "O2_g", "O2_ads_ts", "O2_s", -0.5, 0.3, 0.8),
+        ],
+    })
+    return _freeze(network)
+
+
 def valid_result(network=None):
     network = network or frozen_network()
     result = {
@@ -189,7 +255,7 @@ def valid_result(network=None):
         "input_sha256": network["input_sha256"],
         "adapter": {
             "id": "vcstudio.catmap-process-adapter",
-            "version": "2",
+            "version": "3",
             "tool_version": "0.4.0",
             "tool_sha256": "4" * 64,
         },
@@ -231,8 +297,40 @@ def valid_result(network=None):
             "warnings": [],
         },
     }
-    result["sensitivity"]["analyses"][0]["condition_sha256"] = (
-        kinetics.compute_condition_sha256(result["points"][0]["conditions"]))
+    if network.get("network_id") == "catmap-ready-adsorption":
+        point = result["points"][0]
+        point.update({
+            "tof": [{"species_id": "CO_s", "value": 2.5}],
+            "coverage": [
+                {"species_id": "CO_s", "site_type": "s", "value": 0.35},
+                {"species_id": "O2_s", "site_type": "s", "value": 0.25},
+            ],
+            "selectivity": [{"species_id": "CO_s", "value": 1.0}],
+            "drc": [{"step_id": "co_adsorption", "value": 0.9}],
+            "dsc": [{"step_id": "co_adsorption", "value": 0.1}],
+            "reaction_order": [{"species_id": "CO_g", "value": 0.8}],
+            "apparent_activation_energy": [
+                {"species_id": "CO_s", "value": 0.7},
+            ],
+            "free_energy_diagram": [
+                {"state_id": "reactants", "value": 0.0},
+                {"state_id": "CO_ads_ts", "value": 0.2},
+                {"state_id": "products", "value": -1.0},
+            ],
+        })
+        result["sensitivity"]["analyses"] = [
+            {
+                "kind": "energy_uncertainty", "point_index": 0,
+                "condition_sha256": "", "step_id": step_record["id"],
+                "perturbation_eV": step_record["uncertainty_eV"],
+                "max_relative_change": 0.12,
+            }
+            for step_record in network["elementary_steps"]
+        ]
+    condition_sha256 = kinetics.compute_condition_sha256(
+        result["points"][0]["conditions"])
+    for analysis in result["sensitivity"]["analyses"]:
+        analysis["condition_sha256"] = condition_sha256
     return result
 
 
@@ -375,7 +473,7 @@ def test_result_import_is_strict_server_normalized_and_always_diagnostic():
     normalized = kinetics.import_result(
         valid_result(network), network,
         expected_adapter={
-            "id": "vcstudio.catmap-process-adapter", "version": "2",
+            "id": "vcstudio.catmap-process-adapter", "version": "3",
             "tool_sha256": "4" * 64,
         },
     )
@@ -417,7 +515,7 @@ def test_malicious_or_mismatched_results_are_rejected(mutate, match):
         kinetics.import_result(
             result, network,
             expected_adapter={
-                "id": "vcstudio.catmap-process-adapter", "version": "2",
+                "id": "vcstudio.catmap-process-adapter", "version": "3",
                 "tool_sha256": "4" * 64,
             },
         )
@@ -431,7 +529,7 @@ def test_reported_converged_flag_is_ignored_and_server_residual_controls_status(
     normalized = kinetics.import_result(
         result, network,
         expected_adapter={
-            "id": "vcstudio.catmap-process-adapter", "version": "2",
+            "id": "vcstudio.catmap-process-adapter", "version": "3",
             "tool_sha256": "4" * 64,
         },
     )
@@ -444,7 +542,7 @@ def test_reported_converged_flag_is_ignored_and_server_residual_controls_status(
     normalized = kinetics.import_result(
         result, network,
         expected_adapter={
-            "id": "vcstudio.catmap-process-adapter", "version": "2",
+            "id": "vcstudio.catmap-process-adapter", "version": "3",
             "tool_sha256": "4" * 64,
         },
     )
@@ -463,7 +561,7 @@ def test_empty_or_self_reported_sensitivity_is_rejected():
         kinetics.import_result(
             result, network,
             expected_adapter={
-                "id": "vcstudio.catmap-process-adapter", "version": "2",
+                "id": "vcstudio.catmap-process-adapter", "version": "3",
                 "tool_sha256": "4" * 64,
             },
         )
@@ -491,7 +589,7 @@ def test_result_availability_evidence_is_complete_bounded_and_frozen(mutate, mat
         kinetics.import_result(
             result, network,
             expected_adapter={
-                "id": "vcstudio.catmap-process-adapter", "version": "2",
+                "id": "vcstudio.catmap-process-adapter", "version": "3",
                 "tool_sha256": "4" * 64,
             },
         )
@@ -504,7 +602,7 @@ def test_sensitivity_status_is_server_derived_from_complete_analysis():
     normalized = kinetics.import_result(
         result, network,
         expected_adapter={
-            "id": "vcstudio.catmap-process-adapter", "version": "2",
+            "id": "vcstudio.catmap-process-adapter", "version": "3",
             "tool_sha256": "4" * 64,
         },
     )

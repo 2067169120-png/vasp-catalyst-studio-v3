@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_kinetics import _freeze, frozen_network
+from tests.test_kinetics import _freeze, catmap_ready_network, frozen_network
 from vcstudio.external import catmap_adapter
 from vcstudio.project import kinetics
 
@@ -28,9 +28,9 @@ def _confirm(network, project, preview, tool):
 
 
 def test_missing_catmap_is_unavailable_but_audit_report_is_exportable():
-    preview = catmap_adapter.preview_export(frozen_network(), tool_path=None)
+    preview = catmap_adapter.preview_export(catmap_ready_network(), tool_path=None)
     audit_preview = catmap_adapter.preview_audit_export(
-        frozen_network(), tool_path=None)
+        catmap_ready_network(), tool_path=None)
 
     assert preview["schema"] == catmap_adapter.PREVIEW_SCHEMA
     assert preview["audit"]["machine_pass"] is True
@@ -49,7 +49,8 @@ def test_missing_catmap_is_unavailable_but_audit_report_is_exportable():
 
 
 def test_catmap_table_and_mkm_follow_fixed_data_only_contract():
-    bundle = catmap_adapter.build_export_bundle(frozen_network(), tool_path=None)
+    bundle = catmap_adapter.build_export_bundle(
+        catmap_ready_network(), tool_path=None)
     table = bundle["files"]["energetics.tsv"]
     model = bundle["files"]["model.mkm"]
     process = json.loads(bundle["files"]["process-contract.json"])
@@ -59,7 +60,9 @@ def test_catmap_table_and_mkm_follow_fixed_data_only_contract():
         "frequencies", "reference",
     ]
     assert "rxn_expressions" in model
-    assert "a0_s0 + a1_s0 <-> t0_s0 + *_s0 -> g2_g + *_s0 + *_s0" in model
+    assert "g0_g + *_s0 <-> ts-0_s0 -> a0_s0" in model
+    assert "g1_g + *_s0 <-> ts-1_s0 -> a1_s0" in model
+    assert "gas_names = ['g0_g', 'g1_g']" in model
     assert "input_file = 'energetics.tsv'" in model
     assert "output_variables" in model
     assert "scaler = 'ThermodynamicScaler'" in model
@@ -69,7 +72,10 @@ def test_catmap_table_and_mkm_follow_fixed_data_only_contract():
     assert "model-scan.mkm" in bundle["files"]
     assert "descriptor_ranges" in bundle["files"]["model-scan.mkm"]
     assert "resolution = [5, 5]" in bundle["files"]["model-scan.mkm"]
-    assert "prefactor_list = ['10000000000000']" in model
+    assert "prefactor_list = ['10000000000000', '10000000000000']" in model
+    gas_contract = json.loads(bundle["files"]["catmap-gas-contract.json"])
+    assert gas_contract["reference_set_complete"] is True
+    assert gas_contract["composition_rank"] == len(gas_contract["elements"]) == 2
     assert all(token not in model for token in (
         "import ", "subprocess", "os.system", "eval(", "exec(", "__import__",
     ))
@@ -88,7 +94,7 @@ def test_tool_identity_is_hash_frozen_without_executing_or_leaking_path(tmp_path
     exe.write_bytes(b"user-installed-catmap-adapter")
 
     preview = catmap_adapter.preview_export(
-        frozen_network(), tool_path=str(exe), tool_version="0.4.0")
+        catmap_ready_network(), tool_path=str(exe), tool_version="0.4.0")
 
     assert preview["tool"] == {
         "available": True,
@@ -111,7 +117,7 @@ def test_unsafe_or_nonabsolute_tool_paths_are_unavailable_not_executed(path):
 def test_confirm_writes_frozen_bundle_only_after_matching_preview(tmp_path):
     project = tmp_path / "project"
     project.mkdir()
-    network = frozen_network()
+    network = catmap_ready_network()
     tool = _tool(tmp_path)
     preview = catmap_adapter.preview_export(
         network, tool_path=tool, tool_version="0.4.0")
@@ -141,7 +147,7 @@ def test_confirm_writes_frozen_bundle_only_after_matching_preview(tmp_path):
 
 
 def test_preview_token_binds_network_adapter_tool_and_artifact_hashes(tmp_path):
-    network = frozen_network()
+    network = catmap_ready_network()
     tool = _tool(tmp_path)
     preview = catmap_adapter.preview_export(network, tool_path=tool)
     changed = copy.deepcopy(network)
@@ -157,7 +163,7 @@ def test_preview_token_binds_network_adapter_tool_and_artifact_hashes(tmp_path):
 
 
 def test_failed_audit_still_exports_audit_report_but_not_catmap_inputs():
-    network = frozen_network()
+    network = catmap_ready_network()
     network["elementary_steps"][0]["reverse_barrier"]["value"] = 1.0
     _freeze(network)
 
@@ -169,7 +175,7 @@ def test_failed_audit_still_exports_audit_report_but_not_catmap_inputs():
 
 
 def test_audit_only_cannot_be_confirmed_as_model_and_has_separate_manifest(tmp_path):
-    network = frozen_network()
+    network = catmap_ready_network()
     network["elementary_steps"][0]["reverse_barrier"]["value"] = 1.0
     _freeze(network)
     tool = _tool(tmp_path)
@@ -196,7 +202,7 @@ def test_audit_only_cannot_be_confirmed_as_model_and_has_separate_manifest(tmp_p
 
 
 def test_tool_drift_publishes_immutable_versions_with_selection_cas(tmp_path):
-    network = frozen_network()
+    network = catmap_ready_network()
     tool = _tool(tmp_path)
     first_preview = catmap_adapter.preview_export(network, tool_path=tool)
     first = _confirm(network, tmp_path, first_preview, tool)
@@ -228,10 +234,56 @@ def test_tool_drift_publishes_immutable_versions_with_selection_cas(tmp_path):
 
 
 def test_name_map_rejects_ambiguous_multisite_species():
-    network = frozen_network()
+    network = catmap_ready_network()
     network["species"][4]["sites"] = {"s": 1, "bridge": 1}
     with pytest.raises(catmap_adapter.CatmapAdapterError, match="exactly one"):
         catmap_adapter._catmap_name_map(network)
+
+
+def test_missing_positive_gas_participants_is_audit_only_not_export_ready(tmp_path):
+    network = frozen_network()
+    tool = _tool(tmp_path)
+    bundle = catmap_adapter.build_export_bundle(network, tool_path=tool)
+
+    assert bundle["audit"]["machine_pass"] is True
+    assert bundle["contract_ready"] is False
+    assert bundle["export_ready"] is False
+    assert "positive-pressure gas reservoirs" in bundle["adapter_issues"][0][
+        "message"]
+    assert set(bundle["files"]) == {
+        "kinetics-audit.json", "catmap-adapter-audit.json",
+    }
+    preview = catmap_adapter.preview_export(network, tool_path=tool)
+    assert preview["preview_token"] is None
+    with pytest.raises(catmap_adapter.CatmapAdapterError, match="not ready"):
+        catmap_adapter.confirm_export(
+            network, tmp_path, bundle["preview_token"],
+            expected_selection_revision=0,
+            expected_selected_export_sha256=None, confirmed=True,
+            tool_path=tool)
+    assert not (tmp_path / ".vcstudio").exists()
+
+
+def test_rank_deficient_participating_gases_cannot_claim_catmap_reference_set():
+    network = catmap_ready_network()
+    compositions = {
+        "CO_g": {"C": 1, "O": 2}, "CO_s": {"C": 1, "O": 2},
+        "CO_ads_ts": {"C": 1, "O": 2},
+        "O2_g": {"C": 2, "O": 4}, "O2_s": {"C": 2, "O": 4},
+        "O2_ads_ts": {"C": 2, "O": 4},
+    }
+    for record in network["species"]:
+        if record["id"] in compositions:
+            record["composition"] = compositions[record["id"]]
+    _freeze(network)
+    assert kinetics.audit_network(network)["machine_pass"] is True
+
+    bundle = catmap_adapter.build_export_bundle(network, tool_path=None)
+    assert bundle["contract_ready"] is False
+    assert bundle["export_ready"] is False
+    assert "independent atomic reference set" in bundle["adapter_issues"][0][
+        "message"]
+    assert "model.mkm" not in bundle["files"]
 
 
 @pytest.mark.parametrize("mutate,reason", [
@@ -259,7 +311,7 @@ def test_name_map_rejects_ambiguous_multisite_species():
 ])
 def test_valid_but_unencoded_catmap_features_fail_closed_to_audit_only(
         mutate, reason):
-    network = frozen_network()
+    network = catmap_ready_network()
     mutate(network)
     _freeze(network)
     assert kinetics.audit_network(network)["machine_pass"] is True
@@ -276,7 +328,7 @@ def test_valid_but_unencoded_catmap_features_fail_closed_to_audit_only(
 
 
 def test_export_identifiers_cannot_inject_python_or_tsv_rows():
-    network = frozen_network()
+    network = catmap_ready_network()
     network["species"][0]["id"] = "CO_g\n__import__('os').system('whoami')"
     _freeze(network)
 
@@ -287,7 +339,7 @@ def test_export_identifiers_cannot_inject_python_or_tsv_rows():
 
 
 def test_confirmed_manifest_rejects_artifact_tampering(tmp_path):
-    network = frozen_network()
+    network = catmap_ready_network()
     tool = _tool(tmp_path)
     preview = catmap_adapter.preview_export(network, tool_path=tool)
     confirmed = _confirm(network, tmp_path, preview, tool)
@@ -299,7 +351,7 @@ def test_confirmed_manifest_rejects_artifact_tampering(tmp_path):
 
 
 def test_export_selection_pointer_tampering_fails_closed(tmp_path):
-    network = frozen_network()
+    network = catmap_ready_network()
     tool = _tool(tmp_path)
     preview = catmap_adapter.preview_export(network, tool_path=tool)
     _confirm(network, tmp_path, preview, tool)
@@ -320,7 +372,7 @@ def test_export_rejects_symlinked_directory_chain(tmp_path):
         link.symlink_to(outside, target_is_directory=True)
     except OSError as exc:
         pytest.skip(f"directory symlinks unavailable: {exc}")
-    network = frozen_network()
+    network = catmap_ready_network()
     tool = _tool(tmp_path)
     preview = catmap_adapter.preview_export(network, tool_path=tool)
 
@@ -338,7 +390,7 @@ def test_confirmed_export_rejects_directory_swap_to_external_symlink(tmp_path):
     outside = tmp_path / "outside"
     project.mkdir()
     outside.mkdir()
-    network = frozen_network()
+    network = catmap_ready_network()
     tool = _tool(tmp_path)
     preview = catmap_adapter.preview_export(network, tool_path=tool)
     confirmed = _confirm(network, project, preview, tool)
@@ -356,7 +408,7 @@ def test_confirmed_export_rejects_directory_swap_to_external_symlink(tmp_path):
 
 
 def test_confirmed_manifest_and_artifacts_have_hard_size_limits(tmp_path):
-    network = frozen_network()
+    network = catmap_ready_network()
     tool = _tool(tmp_path)
     preview = catmap_adapter.preview_export(network, tool_path=tool)
     confirmed = _confirm(network, tmp_path, preview, tool)

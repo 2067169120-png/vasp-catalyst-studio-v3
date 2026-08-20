@@ -14,7 +14,7 @@ from vcstudio.project import kinetics_store
 
 EXPECTED_ADAPTER = {
     "id": "vcstudio.catmap-process-adapter",
-    "version": "2",
+    "version": "3",
     "tool_sha256": "4" * 64,
 }
 EXPORT_SHA256 = "e" * 64
@@ -161,15 +161,28 @@ def test_upload_and_selection_are_split_and_stale_cas_cannot_last_win(tmp_path):
         _select(tmp_path, network, second)
     snapshot = kinetics_store.selection_snapshot(tmp_path, network)
     assert snapshot["latest_result_sha256"] == first["result_sha256"]
+    assert snapshot["anchor_event_sha256"] == first_selected[
+        "selection_event_sha256"]
 
     second_selected = _select(
         tmp_path, network, second, revision=snapshot["revision"],
         latest=snapshot["latest_result_sha256"])
     assert second_selected["selection_revision"] == 2
+    assert kinetics_store.selection_snapshot(tmp_path, network)[
+        "anchor_event_sha256"] == first_selected["selection_event_sha256"]
     history = (tmp_path / ".vcstudio" / "kinetics" / "results" /
                network["input_sha256"] / "selection-history")
     assert len(list(history.glob("*.json"))) == 2
     assert first_selected["selection_event_sha256"] != second_selected[
+        "selection_event_sha256"]
+    first_event = json.loads(next(history.glob(
+        f"00000001-{first_selected['selection_event_sha256']}.json")).read_text(
+            encoding="utf-8"))
+    second_event = json.loads(next(history.glob(
+        f"00000002-{second_selected['selection_event_sha256']}.json")).read_text(
+            encoding="utf-8"))
+    assert first_event["previous_event_sha256"] is None
+    assert second_event["previous_event_sha256"] == first_selected[
         "selection_event_sha256"]
 
 
@@ -224,3 +237,29 @@ def test_selection_history_tampering_fails_closed(tmp_path):
         kinetics_store.load_result(
             tmp_path, network, expected_adapter=EXPECTED_ADAPTER,
             confirmed_export_sha256=EXPORT_SHA256)
+
+
+def test_tampering_old_first_event_breaks_the_complete_history_chain(tmp_path):
+    network = frozen_network()
+    first = _upload(tmp_path, network)
+    changed = copy.deepcopy(valid_result(network))
+    changed["points"][0]["tof"][0]["value"] = 9.0
+    second = _upload(tmp_path, network, changed)
+    first_selected = _select(tmp_path, network, first)
+    second_selected = _select(
+        tmp_path, network, second,
+        revision=first_selected["selection_revision"],
+        latest=first_selected["latest_result_sha256"])
+    history = (tmp_path / ".vcstudio" / "kinetics" / "results" /
+               network["input_sha256"] / "selection-history")
+    old_event = history / (
+        f"00000001-{first_selected['selection_event_sha256']}.json")
+    old_event.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(kinetics_store.KineticsStoreError, match="chain"):
+        kinetics_store.load_result(
+            tmp_path, network, expected_adapter=EXPECTED_ADAPTER,
+            confirmed_export_sha256=EXPORT_SHA256)
+    with pytest.raises(kinetics_store.KineticsStoreError, match="chain"):
+        kinetics_store.selection_snapshot(tmp_path, network)
+    assert second_selected["selection_revision"] == 2

@@ -457,7 +457,7 @@ VCS.workspace = {
 VCS.call = async method => {
   trace.calls.push(method);
   return {
-    ok: true, schema: 'vcstudio.catmap-export-preview/v2',
+    ok: true, schema: 'vcstudio.catmap-export-preview/v3',
     project_id: 'project-a', export_kind: 'model', export_ready: false,
     preview_sha256: null, model_published: false,
   };

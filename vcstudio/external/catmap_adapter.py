@@ -26,11 +26,11 @@ from vcstudio.project import kinetics
 
 
 ADAPTER_ID = "vcstudio.catmap-process-adapter"
-ADAPTER_VERSION = "2"
-PREVIEW_SCHEMA = "vcstudio.catmap-export-preview/v2"
-BUNDLE_SCHEMA = "vcstudio.catmap-export-bundle/v2"
-MANIFEST_SCHEMA = "vcstudio.catmap-export-manifest/v2"
-PROCESS_SCHEMA = "vcstudio.external-process-contract/v2"
+ADAPTER_VERSION = "3"
+PREVIEW_SCHEMA = "vcstudio.catmap-export-preview/v3"
+BUNDLE_SCHEMA = "vcstudio.catmap-export-bundle/v3"
+MANIFEST_SCHEMA = "vcstudio.catmap-export-manifest/v3"
+PROCESS_SCHEMA = "vcstudio.external-process-contract/v3"
 AUDIT_PREVIEW_SCHEMA = "vcstudio.kinetics-audit-export-preview/v1"
 AUDIT_MANIFEST_SCHEMA = "vcstudio.kinetics-audit-export-manifest/v1"
 EXPORT_SELECTION_SCHEMA = "vcstudio.catmap-export-selection/v1"
@@ -181,8 +181,9 @@ def _catmap_name_map(network: Mapping[str, Any]) -> dict[str, Any]:
                 "phase": phase,
             }
         else:
-            prefix = "a" if phase == "adsorbate" else "t"
-            base = f"{prefix}{phase_counters[phase]}"
+            base = (
+                f"a{phase_counters[phase]}" if phase == "adsorbate"
+                else f"ts-{phase_counters[phase]}")
             phase_counters[phase] += 1
             species[species_id] = {
                 "key": f"{base}_{mapped_site}", "name": base,
@@ -205,6 +206,113 @@ def _species_names(network: Mapping[str, Any]) -> dict[str, str]:
     return {
         key: value["key"]
         for key, value in _catmap_name_map(network)["species"].items()
+    }
+
+
+def _matrix_rank(rows: list[list[float]], columns: int) -> int:
+    """Return a deterministic numeric rank for small composition matrices."""
+    matrix = [list(map(float, row)) for row in rows]
+    rank = 0
+    for column in range(columns):
+        pivot = next(
+            (index for index in range(rank, len(matrix))
+             if abs(matrix[index][column]) > 1.0e-12),
+            None,
+        )
+        if pivot is None:
+            continue
+        matrix[rank], matrix[pivot] = matrix[pivot], matrix[rank]
+        divisor = matrix[rank][column]
+        matrix[rank] = [value / divisor for value in matrix[rank]]
+        for index, row in enumerate(matrix):
+            if index == rank:
+                continue
+            factor = row[column]
+            if abs(factor) > 1.0e-12:
+                matrix[index] = [
+                    value - factor * reference
+                    for value, reference in zip(row, matrix[rank])
+                ]
+        rank += 1
+        if rank == len(matrix):
+            break
+    return rank
+
+
+def _catmap_gas_contract(
+        network: Mapping[str, Any], name_map: Mapping[str, Any]) -> dict[str, Any]:
+    """Prove gas participation and an independent CatMAP atomic reservoir."""
+    species = {
+        str(record["id"]): record for record in network.get("species") or []
+    }
+    participants = set()
+    participating_species = set()
+    for step in network.get("elementary_steps") or []:
+        for state_name in ("reactants", "transition_state", "products"):
+            state = step.get(state_name) or {}
+            participating_species.update(str(species_id) for species_id in state)
+    for species_id in participating_species:
+        if (species.get(species_id) or {}).get("phase") == "gas":
+            participants.add(species_id)
+    if not participants:
+        raise CatmapAdapterError(
+            "CatMAP setup requires at least one gas-phase reaction participant")
+
+    positive = {
+        species_id for species_id, record in species.items()
+        if record.get("phase") == "gas"
+        and float((record.get("activity") or {}).get("value", 0.0)) > 0.0
+    }
+    omitted_positive = sorted(positive - participants)
+    if omitted_positive:
+        raise CatmapAdapterError(
+            "positive-pressure gas reservoirs are absent from every elementary "
+            f"reaction: {', '.join(omitted_positive)}")
+    feed_gases = {
+        str(species_id) for species_id in network.get("feed_species") or []
+        if (species.get(str(species_id)) or {}).get("phase") == "gas"
+    }
+    if not feed_gases <= participants:
+        raise CatmapAdapterError(
+            "gas-phase feed species must participate in an elementary reaction")
+
+    elements = sorted({
+        str(element)
+        for species_id in participating_species
+        for element in (species.get(species_id) or {}).get("composition") or {}
+        if str(element) != "e-"
+    })
+    if not elements:
+        raise CatmapAdapterError(
+            "CatMAP gas reservoir has no conserved atomic elements")
+    gas_ids = sorted(participants)
+    rows = [
+        [float((species[species_id].get("composition") or {}).get(element, 0.0))
+         for element in elements]
+        for species_id in gas_ids
+    ]
+    rank = _matrix_rank(rows, len(elements))
+    if rank != len(elements):
+        raise CatmapAdapterError(
+            "gas-phase reaction participants cannot form an independent atomic "
+            "reference set for CatMAP")
+    total_pressure = float(network["standard_state"]["pressure"]["value"])
+    concentration_sum = sum(
+        float(species[species_id]["activity"]["value"]) / total_pressure
+        for species_id in gas_ids
+    )
+    if not math.isclose(concentration_sum, 1.0, rel_tol=0.0, abs_tol=1.0e-8):
+        raise CatmapAdapterError(
+            "participating CatMAP gas concentrations must sum to one")
+    return {
+        "schema": "vcstudio.catmap-gas-contract/v1",
+        "canonical_gas_ids": gas_ids,
+        "gas_names": [name_map["species"][species_id]["key"] for species_id in gas_ids],
+        "positive_pressure_gas_ids": sorted(positive),
+        "elements": elements,
+        "composition_rank": rank,
+        "reference_set_complete": True,
+        "all_positive_reservoirs_participate": True,
     }
 
 
@@ -271,8 +379,8 @@ def _expanded_state(state: Mapping[str, Any], names: Mapping[str, str]) -> str:
     return " + ".join(output)
 
 
-def _model_text(network: Mapping[str, Any], name_map: Mapping[str, Any], *,
-                scan: bool) -> str:
+def _model_text(network: Mapping[str, Any], name_map: Mapping[str, Any],
+                gas_contract: Mapping[str, Any], *, scan: bool) -> str:
     methodology = network.get("methodology") or {}
     if methodology.get("energy_basis") != "gibbs_free_energy":
         raise CatmapAdapterError(
@@ -330,15 +438,28 @@ def _model_text(network: Mapping[str, Any], name_map: Mapping[str, Any], *,
     temperature = float(network["standard_state"]["temperature"]["value"])
     pressure = float(network["standard_state"]["pressure"]["value"])
     operating = network.get("operating_range") or {}
+    if scan:
+        descriptor_ranges = [
+            list(operating["temperature_K"]),
+            list(operating["pressure_bar"]),
+        ]
+        condition_lines = [
+            f"descriptor_ranges = {descriptor_ranges!r}",
+            f"resolution = {_SCAN_RESOLUTION!r}",
+        ]
+    else:
+        condition_lines = [f"descriptors = {[temperature, pressure]!r}"]
     lines = [
         "# Independently generated CatMAP setup data; CatMAP is not bundled.",
         "# All formation energies are frozen Gibbs values in eV; no extra thermal correction.",
         "input_file = 'energetics.tsv'",
         f"rxn_expressions = {reactions!r}",
         f"surface_names = [{name_map['surface']!r}]",
+        f"gas_names = {list(gas_contract['gas_names'])!r}",
         f"species_definitions = {species_definitions!r}",
         "scaler = 'ThermodynamicScaler'",
         "descriptor_names = ['temperature', 'pressure']",
+        *condition_lines,
         f"prefactor_list = {prefactors!r}",
         "gas_thermo_mode = 'frozen_gas'",
         "adsorbate_thermo_mode = 'frozen_adsorbate'",
@@ -348,17 +469,6 @@ def _model_text(network: Mapping[str, Any], name_map: Mapping[str, Any], *,
         f"data_file = {'catmap-scan-output.pkl' if scan else 'catmap-output.pkl'!r}",
         "",
     ]
-    if scan:
-        descriptor_ranges = [
-            list(operating["temperature_K"]),
-            list(operating["pressure_bar"]),
-        ]
-        lines[8:8] = [
-            f"descriptor_ranges = {descriptor_ranges!r}",
-            f"resolution = {_SCAN_RESOLUTION!r}",
-        ]
-    else:
-        lines[8:8] = [f"descriptors = {[temperature, pressure]!r}"]
     return "\n".join(lines)
 
 
@@ -440,14 +550,18 @@ def build_export_bundle(network_source, *, tool_path=None,
     if audit["export_ready"] is True:
         try:
             name_map = _catmap_name_map(network)
+            gas_contract = _catmap_gas_contract(network, name_map)
             files.update({
                 "kinetics-input.json": _json_text(network),
                 "catmap-name-map.json": _json_text(name_map),
+                "catmap-gas-contract.json": _json_text(gas_contract),
                 "catmap-descriptors.json": _json_text(
                     _descriptor_contract(network)),
                 "energetics.tsv": _table_text(network, name_map),
-                "model.mkm": _model_text(network, name_map, scan=False),
-                "model-scan.mkm": _model_text(network, name_map, scan=True),
+                "model.mkm": _model_text(
+                    network, name_map, gas_contract, scan=False),
+                "model-scan.mkm": _model_text(
+                    network, name_map, gas_contract, scan=True),
                 "process-contract.json": _json_text(
                     _process_contract(tool, audit["input_sha256"])),
             })

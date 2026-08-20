@@ -828,7 +828,7 @@
         'analysis.kinetic.preview_failed', 'CatMAP 导出预览失败。'));
       if (safeId(result.project_id) !== projectId) throw new Error(tr(
         'analysis.error.project_mismatch', '分析结果项目身份与当前项目不一致'));
-      if (result.schema !== 'vcstudio.catmap-export-preview/v2' ||
+      if (result.schema !== 'vcstudio.catmap-export-preview/v3' ||
           result.export_kind !== 'model' || result.export_ready !== true) {
         kineticsOperation(tr('analysis.kinetic.model_unavailable',
           '模型导出不可用；可独立预览并导出审计报告。'), 'bad');

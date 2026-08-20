@@ -18,7 +18,7 @@ def _normalized(network):
     return kinetics.import_result(
         valid_result(network), network,
         expected_adapter={
-            "id": "vcstudio.catmap-process-adapter", "version": "2",
+            "id": "vcstudio.catmap-process-adapter", "version": "3",
             "tool_sha256": "4" * 64,
         },
     )
@@ -102,7 +102,7 @@ def test_unconverged_server_result_keeps_rows_but_marks_dashboard_unavailable():
     normalized = kinetics.import_result(
         result, network,
         expected_adapter={
-            "id": "vcstudio.catmap-process-adapter", "version": "2",
+            "id": "vcstudio.catmap-process-adapter", "version": "3",
             "tool_sha256": "4" * 64,
         },
     )

@@ -8096,7 +8096,7 @@ class Api:
             return self._call_with_project_bindings([record], build)
         except Exception as exc:                         # noqa: BLE001 public bridge
             return {
-                'ok': False, 'schema': 'vcstudio.catmap-export-preview/v2',
+                'ok': False, 'schema': 'vcstudio.catmap-export-preview/v3',
                 'project_id': None, 'preview_sha256': None,
                 'scientific_status': 'unavailable', 'eligible_final': False,
                 'error': self._analysis_workbench_public_value(str(exc)),
@@ -8133,7 +8133,7 @@ class Api:
             return self._call_with_project_bindings([record], build)
         except Exception as exc:                         # noqa: BLE001 public bridge
             return {
-                'ok': False, 'schema': 'vcstudio.catmap-export-manifest/v2',
+                'ok': False, 'schema': 'vcstudio.catmap-export-manifest/v3',
                 'project_id': None, 'scientific_status': 'unavailable',
                 'eligible_final': False,
                 'error': self._analysis_workbench_public_value(str(exc)),
@@ -8313,7 +8313,7 @@ class Api:
         except Exception as exc:                         # noqa: BLE001 public bridge
             return {
                 'ok': False,
-                'schema': 'vcstudio.kinetics-result-selection/v1',
+                'schema': 'vcstudio.kinetics-result-selection/v2',
                 'project_id': None, 'selected': False,
                 'scientific_status': 'unavailable', 'eligible_final': False,
                 'error': self._analysis_workbench_public_value(str(exc)),

@@ -6,11 +6,12 @@ import hashlib
 import json
 from types import SimpleNamespace
 
-from tests.test_kinetics import frozen_network, valid_result
+from tests.test_kinetics import catmap_ready_network, frozen_network, valid_result
 from vcstudio.gui_web.api import Api
 
 
-def _api(tmp_path, *, with_projection=True, with_tool=True):
+def _api(tmp_path, *, with_projection=True, with_tool=True,
+         projection_factory=catmap_ready_network):
     root = tmp_path / "project"
     root.mkdir()
     project_file = root / "project.yaml"
@@ -37,7 +38,7 @@ def _api(tmp_path, *, with_projection=True, with_tool=True):
 
     def provider(context):
         calls.append(copy.deepcopy(context))
-        return frozen_network() if with_projection else None
+        return projection_factory() if with_projection else None
 
     api = Api(
         adsorption_mod=adsorption, manifest_mod=manifest, config_mod=config,
@@ -111,7 +112,7 @@ def test_preview_confirm_import_and_dashboard_round_trip(tmp_path):
             "manifest.json").is_file()
     _assert_public(confirmed, tmp_path)
 
-    network = frozen_network()
+    network = catmap_ready_network()
     result = valid_result(network)
     result["adapter"]["tool_sha256"] = hashlib.sha256(tool.read_bytes()).hexdigest()
     imported = api.kinetics_result_import(project_id, result)
@@ -149,7 +150,7 @@ def test_preview_confirm_import_and_dashboard_round_trip(tmp_path):
 
 def test_result_import_requires_confirmed_hash_bound_export(tmp_path):
     api, project_id, root, tool, _calls = _api(tmp_path)
-    result = valid_result(frozen_network())
+    result = valid_result(catmap_ready_network())
     result["adapter"]["tool_sha256"] = hashlib.sha256(tool.read_bytes()).hexdigest()
 
     missing_manifest = api.kinetics_result_import(project_id, result)
@@ -208,11 +209,35 @@ def test_tool_missing_keeps_audit_visible_but_solver_unavailable(tmp_path):
     assert not list((root / ".vcstudio" / "kinetics" / "audits").rglob("model.mkm"))
 
 
+def test_unrepresentable_gas_reservoir_is_audit_only_even_with_tool(tmp_path):
+    api, project_id, root, _tool, _calls = _api(
+        tmp_path, projection_factory=frozen_network)
+
+    preview = api.kinetics_export_preview(project_id)
+    assert preview["ok"] is True
+    assert preview["audit"]["machine_pass"] is True
+    assert preview["export_ready"] is False
+    assert preview["preview_sha256"] is None
+    assert "positive-pressure gas reservoirs" in preview["adapter_issues"][0][
+        "message"]
+    refused = api.kinetics_export_confirm(
+        project_id, None, preview["selection_revision"],
+        preview["selected_export_sha256"], confirmed=True)
+    assert refused["ok"] is False
+    assert not (root / ".vcstudio").exists()
+
+    audit_preview = api.kinetics_audit_export_preview(project_id)
+    audit_confirmed = api.kinetics_audit_export_confirm(
+        project_id, audit_preview["preview_sha256"], confirmed=True)
+    assert audit_confirmed["ok"] is True
+    assert audit_confirmed["model_published"] is False
+
+
 def test_tool_drift_after_confirm_hides_old_result_until_new_preview(tmp_path):
     api, project_id, _root, tool, _calls = _api(tmp_path)
     preview = api.kinetics_export_preview(project_id)
     _confirm(api, project_id, preview)
-    result = valid_result(frozen_network())
+    result = valid_result(catmap_ready_network())
     result["adapter"]["tool_sha256"] = hashlib.sha256(tool.read_bytes()).hexdigest()
     uploaded = api.kinetics_result_import(project_id, result)
     assert uploaded["ok"] is True
@@ -248,7 +273,7 @@ def test_result_selection_api_rejects_stale_revision_without_last_win(tmp_path):
     api, project_id, _root, tool, _calls = _api(tmp_path)
     preview = api.kinetics_export_preview(project_id)
     _confirm(api, project_id, preview)
-    first_result = valid_result(frozen_network())
+    first_result = valid_result(catmap_ready_network())
     first_result["adapter"]["tool_sha256"] = hashlib.sha256(
         tool.read_bytes()).hexdigest()
     second_result = copy.deepcopy(first_result)

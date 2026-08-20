@@ -17,11 +17,18 @@ from vcstudio.project import kinetics
 
 
 RECEIPT_SCHEMA = "vcstudio.kinetics-result-receipt/v2"
-SELECTION_SCHEMA = "vcstudio.kinetics-result-selection/v1"
-SELECTION_EVENT_SCHEMA = "vcstudio.kinetics-result-selection-event/v1"
+SELECTION_SCHEMA = "vcstudio.kinetics-result-selection/v2"
+SELECTION_EVENT_SCHEMA = "vcstudio.kinetics-result-selection-event/v2"
 _HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_RESULT_BYTES = 20 * 1024 * 1024
+_MAX_SELECTION_REVISION = 100_000
 _SELECTION_LOCK = threading.RLock()
+_SELECTION_EVENT_KEYS = frozenset({
+    "schema", "input_sha256", "confirmed_export_sha256",
+    "previous_event_sha256", "previous_result_sha256",
+    "selected_result_sha256", "previous_revision", "revision", "selected_at",
+    "source", "scientific_status", "eligible_final",
+})
 
 
 class KineticsStoreError(ValueError):
@@ -229,6 +236,7 @@ def _selection_default(input_sha256: str) -> dict[str, Any]:
         "schema": SELECTION_SCHEMA, "input_sha256": input_sha256,
         "revision": 0, "latest_result_sha256": None,
         "confirmed_export_sha256": None, "selection_event_sha256": None,
+        "anchor_event_sha256": None,
     }
 
 
@@ -240,18 +248,84 @@ def _read_selection(input_dir: Path, input_sha256: str) -> dict[str, Any]:
     if (not isinstance(pointer, Mapping)
             or set(pointer) != {
                 "schema", "input_sha256", "revision", "latest_result_sha256",
-                "confirmed_export_sha256", "selection_event_sha256"}
+                "confirmed_export_sha256", "selection_event_sha256",
+                "anchor_event_sha256"}
             or pointer.get("schema") != SELECTION_SCHEMA
             or pointer.get("input_sha256") != input_sha256
             or isinstance(pointer.get("revision"), bool)
             or not isinstance(pointer.get("revision"), int)
-            or pointer["revision"] < 1
+            or not 1 <= pointer["revision"] <= _MAX_SELECTION_REVISION
             or any(not isinstance(pointer.get(key), str)
                    or not _HEX_RE.fullmatch(pointer[key]) for key in (
                        "latest_result_sha256", "confirmed_export_sha256",
-                       "selection_event_sha256"))):
+                       "selection_event_sha256", "anchor_event_sha256"))):
         raise KineticsStoreError("kinetics latest pointer is invalid")
     return dict(pointer)
+
+
+def _validate_selection_chain(
+        input_dir: Path, root: Path, pointer: Mapping[str, Any]) -> dict[str, Any]:
+    """Verify every selected event from the latest pointer back to revision one."""
+    revision = int(pointer["revision"])
+    if revision == 0:
+        return {"length": 0, "anchor_event_sha256": None}
+    history = _existing_child(input_dir, "selection-history", root)
+    if history is None:
+        raise KineticsStoreError("kinetics selection history is unavailable")
+    expected_event_sha256 = str(pointer["selection_event_sha256"])
+    expected_result_sha256 = str(pointer["latest_result_sha256"])
+    latest_event = None
+    anchor_event_sha256 = None
+    while revision > 0:
+        event_path = history / f"{revision:08d}-{expected_event_sha256}.json"
+        event = _read_json(event_path, maximum=65536)
+        if (not isinstance(event, Mapping)
+                or set(event) != _SELECTION_EVENT_KEYS
+                or event.get("schema") != SELECTION_EVENT_SCHEMA
+                or hashlib.sha256(_canonical_bytes(event)).hexdigest()
+                != expected_event_sha256
+                or event.get("input_sha256") != pointer["input_sha256"]
+                or event.get("revision") != revision
+                or event.get("previous_revision") != revision - 1
+                or event.get("selected_result_sha256") != expected_result_sha256
+                or not isinstance(event.get("confirmed_export_sha256"), str)
+                or not _HEX_RE.fullmatch(event["confirmed_export_sha256"])
+                or event.get("source") != "explicit_local_selection"
+                or event.get("scientific_status") != "diagnostic"
+                or event.get("eligible_final") is not False
+                or not isinstance(event.get("selected_at"), str)
+                or not 1 <= len(event["selected_at"]) <= 64):
+            raise KineticsStoreError("kinetics selection history chain is invalid")
+        if latest_event is None:
+            latest_event = dict(event)
+            if event["confirmed_export_sha256"] != pointer[
+                    "confirmed_export_sha256"]:
+                raise KineticsStoreError(
+                    "kinetics selection history chain is invalid")
+        previous_event_sha256 = event.get("previous_event_sha256")
+        previous_result_sha256 = event.get("previous_result_sha256")
+        if revision == 1:
+            if previous_event_sha256 is not None or previous_result_sha256 is not None:
+                raise KineticsStoreError(
+                    "kinetics selection history anchor is invalid")
+            anchor_event_sha256 = expected_event_sha256
+        else:
+            if (not isinstance(previous_event_sha256, str)
+                    or not _HEX_RE.fullmatch(previous_event_sha256)
+                    or not isinstance(previous_result_sha256, str)
+                    or not _HEX_RE.fullmatch(previous_result_sha256)):
+                raise KineticsStoreError(
+                    "kinetics selection history chain link is invalid")
+        expected_event_sha256 = previous_event_sha256
+        expected_result_sha256 = previous_result_sha256
+        revision -= 1
+    if anchor_event_sha256 != pointer["anchor_event_sha256"]:
+        raise KineticsStoreError("kinetics selection history anchor is invalid")
+    return {
+        "length": int(pointer["revision"]),
+        "anchor_event_sha256": anchor_event_sha256,
+        "latest_event": latest_event,
+    }
 
 
 def selection_snapshot(project_root, network_source) -> dict[str, Any]:
@@ -261,7 +335,10 @@ def selection_snapshot(project_root, network_source) -> dict[str, Any]:
         project_root, input_sha256, create=False)
     if input_dir is None:
         return _selection_default(input_sha256)
-    return _read_selection(input_dir, input_sha256)
+    pointer = _read_selection(input_dir, input_sha256)
+    if pointer["revision"] > 0:
+        _validate_selection_chain(input_dir, _root_path, pointer)
+    return pointer
 
 
 def _load_uploaded(input_dir: Path, root: Path, result_sha256: str,
@@ -325,6 +402,8 @@ def select_result(project_root, result_sha256: str, network_source, *,
         expected_export_sha256=confirmed_export_sha256)
     with _SELECTION_LOCK, _advisory_lock(input_dir / ".selection.lock"):
         current = _read_selection(input_dir, input_sha256)
+        if current["revision"] > 0:
+            _validate_selection_chain(input_dir, root, current)
         if (current["revision"] != expected_revision
                 or current["latest_result_sha256"] != expected_latest_sha256):
             raise KineticsStoreError("kinetics result selection conflict")
@@ -333,6 +412,7 @@ def select_result(project_root, result_sha256: str, network_source, *,
             "schema": SELECTION_EVENT_SCHEMA,
             "input_sha256": input_sha256,
             "confirmed_export_sha256": confirmed_export_sha256,
+            "previous_event_sha256": current["selection_event_sha256"],
             "previous_result_sha256": current["latest_result_sha256"],
             "selected_result_sha256": result_sha256,
             "previous_revision": current["revision"],
@@ -342,6 +422,9 @@ def select_result(project_root, result_sha256: str, network_source, *,
             "scientific_status": "diagnostic", "eligible_final": False,
         }
         event_sha256 = hashlib.sha256(_canonical_bytes(event)).hexdigest()
+        anchor_event_sha256 = (
+            current["anchor_event_sha256"]
+            if current["revision"] > 0 else event_sha256)
         history = _ensure_directory(input_dir / "selection-history", root)
         event_name = f"{revision:08d}-{event_sha256}.json"
         _atomic_write(history / event_name, _json_bytes(event), replace=False)
@@ -350,6 +433,7 @@ def select_result(project_root, result_sha256: str, network_source, *,
             "revision": revision, "latest_result_sha256": result_sha256,
             "confirmed_export_sha256": confirmed_export_sha256,
             "selection_event_sha256": event_sha256,
+            "anchor_event_sha256": anchor_event_sha256,
         }
         _atomic_write(input_dir / "latest.json", _json_bytes(pointer), replace=True)
     return {
@@ -372,26 +456,7 @@ def load_result(project_root, network_source, *,
         return None
     if pointer["confirmed_export_sha256"] != confirmed_export_sha256:
         raise KineticsStoreError("selected result belongs to a different export")
-    history = _existing_child(input_dir, "selection-history", root)
-    if history is None:
-        raise KineticsStoreError("kinetics selection history is unavailable")
-    matches = list(history.glob(
-        f"{pointer['revision']:08d}-{pointer['selection_event_sha256']}.json"))
-    if len(matches) != 1:
-        raise KineticsStoreError("kinetics selection history is unavailable")
-    event = _read_json(matches[0], maximum=65536)
-    if (not isinstance(event, Mapping)
-            or event.get("schema") != SELECTION_EVENT_SCHEMA
-            or hashlib.sha256(_canonical_bytes(event)).hexdigest()
-            != pointer["selection_event_sha256"]
-            or event.get("input_sha256") != input_sha256
-            or event.get("confirmed_export_sha256") != confirmed_export_sha256
-            or event.get("selected_result_sha256")
-            != pointer["latest_result_sha256"]
-            or event.get("revision") != pointer["revision"]
-            or event.get("scientific_status") != "diagnostic"
-            or event.get("eligible_final") is not False):
-        raise KineticsStoreError("kinetics selection history is invalid")
+    _validate_selection_chain(input_dir, root, pointer)
     return _load_uploaded(
         input_dir, root, pointer["latest_result_sha256"], network_source,
         expected_adapter, expected_export_sha256=confirmed_export_sha256)
