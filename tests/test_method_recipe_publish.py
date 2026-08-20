@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -224,6 +225,94 @@ def test_writer_false_does_not_consume_token_and_ledger_failure_is_retryable(tmp
     assert second["ok"] is True and second["state"] == "CREATED"
     assert ledger.entries == [str(target.resolve())]
     assert ledger.register_calls == 2
+
+
+def test_failed_publish_freezes_first_confirmation_and_rejects_changed_encut_retry(tmp_path):
+    source = tmp_path / "source-binding"
+    source.mkdir()
+    poscar = source / "POSCAR"
+    poscar.write_text(POSCAR, encoding="utf-8")
+    incar = source / "INCAR"
+    incar.write_text("ENCUT = 520\n", encoding="utf-8")
+    library = source / "potentials"
+    for element, enmax in (("Fe", 300.0), ("O", 400.0)):
+        potential = library / element
+        potential.mkdir(parents=True)
+        (potential / "POTCAR").write_text(
+            f"TITEL = PAW_PBE {element} test\nENMAX = {enmax}; ENMIN = 1\n",
+            encoding="utf-8",
+        )
+    draft = method_recipes.suggested_draft("slab", "relax")["draft"]
+    draft.update({
+        "dispersion": "none", "spin_mode": "nonspin", "hubbard_mode": "off",
+        "dipole_mode": "off", "encut_mode": "explicit", "encut_value": 500,
+    })
+    target = tmp_path / "bound-job"
+    service = method_recipes.MethodRecipeService()
+    ledger = FakeLedger(fail_registers=1)
+    api = Api(
+        method_recipe_service=service,
+        method_recipe_publisher=_publisher(tmp_path, ledger),
+    )
+    preview = api.method_recipe_preview({
+        "poscar_path": str(poscar), "incar_path": str(incar),
+        "out_dir": str(target), "lib_root": str(library), "draft": draft,
+        "policy_id": None, "project_id": None, "client_intent_id": "bound-intent",
+    })
+    first = {
+        "token": preview["token"], "preview_sha256": preview["preview_sha256"],
+        "target_id": preview["target_id"], "client_intent_id": preview["client_intent_id"],
+        "confirmed": True, "idempotency_key": "bound-confirm",
+        "resolutions": {"ENCUT": "recipe"},
+    }
+
+    failed = api.method_recipe_confirm(first)
+    assert failed["ok"] is False and failed["recovery_required"] is True
+    assert "ENCUT = 500" in (target / "INCAR").read_text(encoding="utf-8")
+
+    changed = copy.deepcopy(first)
+    changed["resolutions"] = {"ENCUT": "existing"}
+    rejected = api.method_recipe_confirm(changed)
+    assert rejected["ok"] is False
+    assert "first write attempt" in rejected["error"]
+    assert ledger.register_calls == 1
+
+    recovered = api.method_recipe_confirm(first)
+    assert recovered["ok"] is True
+    assert recovered["input_hashes"]["INCAR"] == _sha256(target / "INCAR")
+    record = json.loads((target / method_recipes.SIDECAR_NAME).read_text(encoding="utf-8"))
+    assert record["confirmation_binding"]["resolutions"] == {"ENCUT": "recipe"}
+    assert record["confirmation_sha256"] == method_recipes.confirmation_binding_sha256(
+        record["confirmation_binding"])
+
+
+def test_recovery_journal_rejects_rehashed_but_different_confirmation_binding(tmp_path):
+    _service, _preview, _confirmation, plan, target, _poscar = _recipe_context(tmp_path)
+    ledger = FakeLedger(fail_registers=1)
+    publisher = _publisher(tmp_path, ledger)
+    with pytest.raises(MethodRecipePublishError):
+        publisher.publish(plan)
+    journal_path = next((tmp_path / "transactions").glob("*.json"))
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert journal["confirmation_sha256"] == method_recipes.confirmation_binding_sha256(
+        journal["confirmation_binding"])
+    assert journal["confirmation_binding"]["expected_target_hashes"] == {
+        key: journal["files"][key] for key in ("INCAR", "POSCAR", "KPOINTS", "POTCAR")
+    }
+
+    changed = copy.deepcopy(plan)
+    changed["confirmation_binding"]["idempotency_key"] = "different-confirmation"
+    changed["confirmation_sha256"] = method_recipes.confirmation_binding_sha256(
+        changed["confirmation_binding"])
+    with pytest.raises(MethodRecipePublishError, match="another confirmation") as failure:
+        publisher.publish(changed)
+    assert failure.value.recovery_required is True
+    assert ledger.entries == []
+    assert (target / "INCAR").is_file() and journal_path.is_file()
+
+    recovered = publisher.publish(plan)
+    assert recovered["record"]["confirmation_binding"] == plan["confirmation_binding"]
+    assert ledger.entries == [str(target.resolve())]
 
 
 def test_source_replacement_after_locked_revalidation_is_detected_before_publish(tmp_path):

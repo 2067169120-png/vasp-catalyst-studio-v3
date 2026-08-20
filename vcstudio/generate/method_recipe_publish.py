@@ -6,6 +6,7 @@ the same directory entity and every file hash are rechecked before and after led
 """
 from __future__ import annotations
 
+import copy
 import ctypes
 import errno
 import hashlib
@@ -24,7 +25,7 @@ from vcstudio.generate import method_recipes
 from vcstudio.shared.config import user_config_dir
 
 
-TRANSACTION_SCHEMA = "vcstudio.method-recipe-publish-transaction/v2"
+TRANSACTION_SCHEMA = "vcstudio.method-recipe-publish-transaction/v3"
 TRANSACTION_DIR = "method-recipe-transactions"
 _BUNDLE_FILES = (
     "INCAR", "POSCAR", "KPOINTS", "POTCAR", method_recipes.SIDECAR_NAME, "job.yaml",
@@ -360,8 +361,64 @@ class MethodRecipePublisher:
                 or inputs.get("potcar_sha256") != expected["POTCAR"]
                 or reference.get("sidecar_sha256") != sidecar_hash
                 or reference.get("incar_sha256") != expected["INCAR"]
-                or record["incar_sha256"] != expected["INCAR"]):
+                or reference.get("confirmation_sha256") != record["confirmation_sha256"]
+                or record["incar_sha256"] != expected["INCAR"]
+                or method_recipes.confirmation_binding_sha256(
+                    record["confirmation_binding"]) != record["confirmation_sha256"]):
             raise MethodRecipePublishError("staged manifest lineage mismatch")
+
+    @staticmethod
+    def _validated_plan_binding(plan: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
+        binding = plan.get("confirmation_binding")
+        claimed = str(plan.get("confirmation_sha256") or "")
+        try:
+            calculated = method_recipes.confirmation_binding_sha256(binding)
+        except method_recipes.MethodRecipeError as exc:
+            raise MethodRecipePublishError("confirmation binding is invalid") from exc
+        expected = dict(plan.get("expected_hashes") or {})
+        if (claimed != calculated or not isinstance(binding, Mapping)
+                or dict(binding.get("expected_target_hashes") or {}) != expected
+                or binding.get("target_id") != plan.get("target_id")
+                or binding.get("preview_sha256") != plan.get("preview_sha256")
+                or binding.get("recipe_semantic_sha256")
+                != (plan.get("recipe") or {}).get("semantic_sha256")
+                or dict(binding.get("resolutions") or {}) != dict(plan.get("resolutions") or {})):
+            raise MethodRecipePublishError("confirmation binding differs from the write plan")
+        return copy.deepcopy(dict(binding)), calculated
+
+    @classmethod
+    def _assert_plan_binding(cls, plan: Mapping[str, Any], journal: Mapping[str, Any]) -> None:
+        binding, binding_hash = cls._validated_plan_binding(plan)
+        if (binding != journal.get("confirmation_binding")
+                or binding_hash != journal.get("confirmation_sha256")):
+            raise MethodRecipePublishError(
+                "recovery journal belongs to another confirmation", recovery_required=True)
+
+    def _assert_persisted_binding(self, root: Path, journal: Mapping[str, Any]) -> None:
+        try:
+            record = json.loads(
+                (root / method_recipes.SIDECAR_NAME).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise MethodRecipePublishError("recipe confirmation record is unavailable") from exc
+        written = self.manifest.load_manifest(root)
+        reference = ((written or {}).get("inputs") or {}).get("method_recipe") or {}
+        binding = journal["confirmation_binding"]
+        binding_hash = journal["confirmation_sha256"]
+        if (not isinstance(record, dict) or record.get("confirmation_binding") != binding
+                or record.get("confirmation_sha256") != binding_hash
+                or method_recipes.confirmation_binding_sha256(
+                    record.get("confirmation_binding")) != binding_hash
+                or record.get("target_id") != binding.get("target_id")
+                or record.get("preview_sha256") != binding.get("preview_sha256")
+                or record.get("recipe_semantic_sha256")
+                != binding.get("recipe_semantic_sha256")
+                or record.get("conflict_resolutions") != binding.get("resolutions")
+                or record.get("incar_sha256")
+                != binding.get("expected_target_hashes", {}).get("INCAR")
+                or reference.get("confirmation_sha256") != binding_hash
+                or reference.get("sidecar_sha256")
+                != journal["files"][method_recipes.SIDECAR_NAME]):
+            raise MethodRecipePublishError("persisted confirmation binding differs")
 
     def _write_journal(self, journal_path: Path, payload: dict[str, Any]) -> None:
         serializable = dict(payload)
@@ -381,6 +438,7 @@ class MethodRecipePublisher:
             "schema", "path_id", "transaction_id", "target", "stage", "state", "files",
             "target_id", "parent_identity", "stage_identity", "target_identity",
             "ledger_preexisting", "ledger_added", "registration_attempted", "created_at_unix",
+            "confirmation_binding", "confirmation_sha256",
         }
         if not isinstance(value, dict) or set(value) != required:
             raise MethodRecipePublishError(
@@ -392,6 +450,14 @@ class MethodRecipePublisher:
         target_identity = value["target_identity"]
         ledger_preexisting = value["ledger_preexisting"]
         ledger_added = value["ledger_added"]
+        confirmation_binding = value["confirmation_binding"]
+        confirmation_sha256 = str(value["confirmation_sha256"])
+        try:
+            calculated_confirmation = method_recipes.confirmation_binding_sha256(
+                confirmation_binding)
+        except method_recipes.MethodRecipeError as exc:
+            raise MethodRecipePublishError(
+                "method recipe recovery journal is invalid", recovery_required=True) from exc
         if (value["schema"] != TRANSACTION_SCHEMA or not _HEX64.fullmatch(path_id)
                 or not _HEX64.fullmatch(str(value["transaction_id"]))
                 or journal_path.name != f"{path_id}.json" or _path_id(target) != path_id
@@ -407,6 +473,10 @@ class MethodRecipePublisher:
                 or ledger_added not in {None, False, True}
                 or (ledger_preexisting is True and ledger_added is True)
                 or not isinstance(value["registration_attempted"], bool)
+                or confirmation_sha256 != calculated_confirmation
+                or confirmation_binding.get("target_id") != value["target_id"]
+                or any(confirmation_binding["expected_target_hashes"].get(key) != files[key]
+                       for key in ("INCAR", "POSCAR", "KPOINTS", "POTCAR"))
                 or stage.parent != target.parent
                 or not stage.name.startswith(f".vcstudio-method-recipe-{path_id[:16]}-")):
             raise MethodRecipePublishError(
@@ -420,8 +490,7 @@ class MethodRecipePublisher:
         if journal_path.parent.is_dir():
             _fsync_directory(journal_path.parent)
 
-    @staticmethod
-    def _assert_bound_bundle(journal: Mapping[str, Any], parent: _DirectoryBinding,
+    def _assert_bound_bundle(self, journal: Mapping[str, Any], parent: _DirectoryBinding,
                              target: _DirectoryBinding) -> None:
         target_path = Path(journal["target"])
         if parent.identity != journal["parent_identity"]:
@@ -430,7 +499,8 @@ class MethodRecipePublisher:
         if target.identity != journal["stage_identity"]:
             raise MethodRecipePublishError("published directory is not the staged entity")
         _assert_path_identity(target_path, target.identity)
-        MethodRecipePublisher._assert_bundle(target_path, journal["files"])
+        self._assert_bundle(target_path, journal["files"])
+        self._assert_persisted_binding(target_path, journal)
 
     def _withdraw_owned_registration(self, journal: dict[str, Any]) -> None:
         # Rollback authority is deliberately narrower than registration authority.  A matching
@@ -618,8 +688,18 @@ class MethodRecipePublisher:
             record = json.loads((target / method_recipes.SIDECAR_NAME).read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise MethodRecipePublishError("published recipe sidecar is unavailable") from exc
-        if record.get("target_id") != plan["target_id"]:
-            raise MethodRecipePublishError("published recipe target binding differs")
+        binding, binding_hash = self._validated_plan_binding(plan)
+        reference = ((written.get("inputs") or {}).get("method_recipe") or {})
+        if (record.get("target_id") != plan["target_id"]
+                or record.get("confirmation_binding") != binding
+                or record.get("confirmation_sha256") != binding_hash
+                or reference.get("confirmation_sha256") != binding_hash
+                or record.get("recipe_semantic_sha256")
+                != binding["recipe_semantic_sha256"]
+                or record.get("preview_sha256") != binding["preview_sha256"]
+                or record.get("conflict_resolutions") != binding["resolutions"]
+                or record.get("incar_sha256") != binding["expected_target_hashes"]["INCAR"]):
+            raise MethodRecipePublishError("published recipe confirmation binding differs")
         return {
             "payload": {"warnings": list(written.get("warnings") or [])},
             "manifest": written, "record": record,
@@ -632,6 +712,7 @@ class MethodRecipePublisher:
 
     def publish(self, plan: Mapping[str, Any]) -> dict[str, Any]:
         self._require_ledger_contract(self.ledger)
+        confirmation_binding, confirmation_sha256 = self._validated_plan_binding(plan)
         target = Path(plan["target"]).resolve(strict=False)
         path_id = _path_id(target)
         journal_path = self._journal_path(path_id)
@@ -640,9 +721,7 @@ class MethodRecipePublisher:
         with _advisory_lock(self._lock_path(path_id), timeout=self.lock_timeout):
             if journal_path.is_file():
                 journal = self._read_journal(journal_path)
-                if journal["target_id"] != plan["target_id"]:
-                    raise MethodRecipePublishError(
-                        "recovery journal belongs to another recipe", recovery_required=True)
+                self._assert_plan_binding(plan, journal)
                 plan["revalidate"]()
                 self._recover_locked(journal_path)
                 return self._published_result(plan)
@@ -690,6 +769,8 @@ class MethodRecipePublisher:
                             "stage_identity": dict(stage_binding.identity),
                             "target_identity": None, "ledger_preexisting": None,
                             "ledger_added": None, "registration_attempted": False,
+                            "confirmation_binding": confirmation_binding,
+                            "confirmation_sha256": confirmation_sha256,
                             "created_at_unix": int(time.time()),
                         }
                         self._write_journal(journal_path, journal)

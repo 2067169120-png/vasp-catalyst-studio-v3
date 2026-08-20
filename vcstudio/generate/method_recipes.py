@@ -41,7 +41,8 @@ from vcstudio.project import lab_policies, method_policy
 RECIPE_SCHEMA = "vcstudio.method-recipe/v1"
 DRAFT_SCHEMA = "vcstudio.method-recipe-draft/v1"
 PREVIEW_SCHEMA = "vcstudio.method-recipe-preview/v1"
-RECORD_SCHEMA = "vcstudio.method-recipe-record/v1"
+RECORD_SCHEMA = "vcstudio.method-recipe-record/v2"
+CONFIRMATION_SCHEMA = "vcstudio.method-recipe-confirmation/v1"
 SIDECAR_NAME = "method-recipe.json"
 RECIPE_VERSION = 1
 
@@ -147,6 +148,47 @@ def _canonical(value: Any) -> bytes:
 def semantic_sha256(value: Any) -> str:
     """Hash JSON-compatible semantic content with stable ordering."""
     return hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def confirmation_binding_sha256(value: Any) -> str:
+    """Validate and hash the path-free authority frozen by the first write attempt."""
+    if not isinstance(value, Mapping):
+        raise MethodRecipeError("confirmation binding must be an object")
+    binding = dict(value)
+    required = {
+        "schema", "token_sha256", "preview_sha256", "recipe_semantic_sha256",
+        "resolutions", "expected_source_hashes", "expected_target_hashes", "target_id",
+        "project_id", "client_intent_id", "idempotency_key",
+    }
+    source_fields = {"POSCAR", "INCAR", "POTCAR", "POTCAR_EVIDENCE"}
+    target_fields = {"INCAR", "POSCAR", "KPOINTS", "POTCAR"}
+    source_hashes = binding.get("expected_source_hashes")
+    target_hashes = binding.get("expected_target_hashes")
+    resolutions = binding.get("resolutions")
+    identifiers = ("client_intent_id", "idempotency_key")
+    if (set(binding) != required or binding.get("schema") != CONFIRMATION_SCHEMA
+            or any(not _HEX64.fullmatch(str(binding.get(key) or "")) for key in (
+                "token_sha256", "preview_sha256", "recipe_semantic_sha256", "target_id"))
+            or not isinstance(source_hashes, Mapping) or set(source_hashes) != source_fields
+            or not isinstance(target_hashes, Mapping) or set(target_hashes) != target_fields
+            or any(not _HEX64.fullmatch(str(target_hashes.get(key) or ""))
+                   for key in target_fields)
+            or any(not _HEX64.fullmatch(str(source_hashes.get(key) or ""))
+                   for key in source_fields - {"INCAR"})
+            or (source_hashes.get("INCAR") is not None
+                and not _HEX64.fullmatch(str(source_hashes.get("INCAR"))))
+            or not isinstance(resolutions, Mapping)
+            or any(not isinstance(key, str) or value not in {"existing", "recipe"}
+                   for key, value in resolutions.items())
+            or any(not _SAFE_ID.fullmatch(str(binding.get(key) or ""))
+                   or _SECRETISH.search(str(binding.get(key)))
+                   or _SECRET_VALUE.search(str(binding.get(key))) for key in identifiers)
+            or (binding.get("project_id") is not None
+                and (not _SAFE_ID.fullmatch(str(binding.get("project_id")))
+                     or _SECRETISH.search(str(binding.get("project_id")))
+                     or _SECRET_VALUE.search(str(binding.get("project_id")))))):
+        raise MethodRecipeError("confirmation binding is invalid")
+    return semantic_sha256(binding)
 
 
 def _strict_object(value: Any, allowed: frozenset[str], *, field: str) -> dict[str, Any]:
@@ -1288,22 +1330,14 @@ class MethodRecipeService:
             raise MethodRecipeError("resolutions must be an object")
         resolutions = {str(key).upper(): str(value).strip().lower()
                        for key, value in resolutions.items()}
-        fingerprint = semantic_sha256({
-            "token": token, "preview_sha256": preview_hash, "target_id": target_id,
-            "idempotency_key": idempotency_key, "resolutions": resolutions,
-            "client_intent_id": client_intent_id,
-        })
         now = float(self._clock())
         with self._lock:
             self._prune(now)
             record = self._records.get(token)
             if record is None:
                 raise MethodRecipeTokenError("preview token is unknown or expired")
-            if record.get("used"):
-                if record.get("confirm_fingerprint") == fingerprint:
-                    return copy.deepcopy(record["result"])
-                raise MethodRecipeTokenError("preview token has already been used")
-            if record["expires_at"] < now:
+            used = bool(record.get("used"))
+            if not used and record["expires_at"] < now:
                 self._records.pop(token, None)
                 raise MethodRecipeTokenError("preview token has expired")
             if preview_hash != record["recipe"]["semantic_sha256"]:
@@ -1312,8 +1346,9 @@ class MethodRecipeService:
                 raise MethodRecipeTokenError("target identity does not match the token")
             if client_intent_id != record["client_intent_id"]:
                 raise MethodRecipeTokenError("client intent does not match the token")
-            self._revalidate(
-                record, allow_transaction_target=bool(record.get("write_attempted")))
+            if not used:
+                self._revalidate(
+                    record, allow_transaction_target=bool(record.get("write_attempted")))
             merged, final_recipe = _merge_incar(
                 record["existing"], record["recipe"], record["diff"], resolutions,
                 elements=record["elements"], counts=record["counts"])
@@ -1324,6 +1359,37 @@ class MethodRecipeService:
                 "KPOINTS": _native_text_sha256(kpoints_str(record["kpoints"])),
                 "POTCAR": record["potcar_sha256"],
             }
+            confirmation_binding = {
+                "schema": CONFIRMATION_SCHEMA,
+                "token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                "preview_sha256": preview_hash,
+                "recipe_semantic_sha256": final_recipe["semantic_sha256"],
+                "resolutions": dict(resolutions),
+                "expected_source_hashes": {
+                    "POSCAR": record["poscar_hash"],
+                    "INCAR": record["incar_hash"],
+                    "POTCAR": record["potcar_sha256"],
+                    "POTCAR_EVIDENCE": record["potcar_fingerprint"],
+                },
+                "expected_target_hashes": dict(expected_hashes),
+                "target_id": record["target_id"],
+                "project_id": record["project_id"],
+                "client_intent_id": client_intent_id,
+                "idempotency_key": idempotency_key,
+            }
+            fingerprint = confirmation_binding_sha256(confirmation_binding)
+            frozen_binding = record.get("confirmation_binding")
+            frozen_fingerprint = record.get("confirm_fingerprint")
+            if frozen_binding is not None:
+                if frozen_binding != confirmation_binding or frozen_fingerprint != fingerprint:
+                    message = ("preview token has already been used" if used else
+                               "confirmation intent differs from the first write attempt")
+                    raise MethodRecipeTokenError(message)
+            elif used:
+                raise MethodRecipeTokenError("used preview lacks a confirmation binding")
+            if used:
+                return copy.deepcopy(record["result"])
+
             plan = {
                 "target": record["target"], "target_id": record["target_id"],
                 "project_id": record["project_id"], "poscar_path": record["poscar_path"],
@@ -1334,12 +1400,20 @@ class MethodRecipeService:
                 "task": final_recipe["dimensions"]["task"]["value"],
                 "confirmed_at_unix": int(now),
                 "expected_hashes": expected_hashes,
+                "confirmation_binding": copy.deepcopy(confirmation_binding),
+                "confirmation_sha256": fingerprint,
                 # The publisher calls this again only after acquiring the stable target OS lock.
                 "revalidate": lambda: self._revalidate(
                     record, allow_transaction_target=bool(record.get("write_attempted"))),
             }
             # The desktop bridge is synchronous.  Keeping the lock across the write closes the
             # two-click race and gives this in-memory capability exactly-once behavior.
+            if frozen_binding is None:
+                record["confirmation_binding"] = copy.deepcopy(confirmation_binding)
+                record["confirm_fingerprint"] = fingerprint
+            # Freeze before invoking any writer code, including code that raises or never returns a
+            # structured result.  Every later retry must reproduce the same semantic authority.
+            record["write_attempted"] = True
             result = writer(plan)
             if not isinstance(result, dict):
                 raise MethodRecipeError("recipe writer returned an invalid result")
@@ -1347,10 +1421,8 @@ class MethodRecipeService:
                 # A failed recoverable publication never burns the one-use capability.  The same
                 # bound intent may retry after rollback/recovery, or the user may request a new
                 # preview.  Only a fully published and registered bundle consumes the token.
-                record["write_attempted"] = True
                 return copy.deepcopy(result)
             record["used"] = True
-            record["confirm_fingerprint"] = fingerprint
             record["result"] = copy.deepcopy(result)
             return copy.deepcopy(result)
 
@@ -1389,6 +1461,8 @@ def sidecar_record(plan: Mapping[str, Any], *, incar_sha256: str) -> dict[str, A
         "target_id": plan["target_id"],
         "project_id": plan.get("project_id"),
         "conflict_resolutions": dict(plan["resolutions"]),
+        "confirmation_binding": copy.deepcopy(plan["confirmation_binding"]),
+        "confirmation_sha256": plan["confirmation_sha256"],
         "incar_sha256": incar_sha256,
         "confirmed_at_unix": int(plan["confirmed_at_unix"]),
         "scientific_status": "candidate",
@@ -1417,6 +1491,7 @@ def manifest_reference(record: Mapping[str, Any], *, sidecar_sha256: str) -> dic
         "sources": sources,
         "user_overrides": sorted(overrides),
         "conflict_resolutions": dict(record["conflict_resolutions"]),
+        "confirmation_sha256": record["confirmation_sha256"],
         "scientific_status": "candidate",
         "scientifically_validated": False,
         "authorizes_submission": False,
@@ -1426,6 +1501,6 @@ def manifest_reference(record: Mapping[str, Any], *, sidecar_sha256: str) -> dic
 __all__ = [
     "DRAFT_SCHEMA", "MethodRecipeError", "MethodRecipeService", "MethodRecipeTokenError",
     "PREVIEW_SCHEMA", "RECIPE_SCHEMA", "RECIPE_VERSION", "RECORD_SCHEMA", "SIDECAR_NAME",
-    "catalog", "manifest_reference", "semantic_diff", "semantic_sha256", "sidecar_record",
-    "suggested_draft", "write_sidecar",
+    "CONFIRMATION_SCHEMA", "catalog", "confirmation_binding_sha256", "manifest_reference",
+    "semantic_diff", "semantic_sha256", "sidecar_record", "suggested_draft", "write_sidecar",
 ]

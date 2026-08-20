@@ -6,7 +6,9 @@ Recipe 事务可为自己新增的 entry 写内部 owner；普通调用方仍看
 """
 from __future__ import annotations
 
+import copy
 import errno
+import hashlib
 import json
 import os
 import re
@@ -25,6 +27,10 @@ _OWNERS_KEY = '_transaction_owners'
 _HEX64 = re.compile(r'^[0-9a-f]{64}$')
 _PROCESS_LOCKS: dict[str, threading.RLock] = {}
 _PROCESS_LOCKS_GUARD = threading.Lock()
+
+
+class LedgerProjectionError(RuntimeError):
+    """A strict lifecycle projection could not safely read or merge the ledger."""
 
 
 def default_ledger_path() -> Path:
@@ -93,6 +99,115 @@ def _mutation_lock(path: Path):
             yield
 
 
+def _projection_payload(raw: bytes) -> tuple[dict[str, object], list[str], dict[str, str]]:
+    """Strictly decode a lifecycle authority snapshot without repairing or discarding metadata."""
+    if not raw:
+        return {'job_dirs': []}, [], {}
+    try:
+        value = json.loads(raw.decode('utf-8'))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise LedgerProjectionError('jobs ledger is not valid UTF-8 JSON') from exc
+    if not isinstance(value, dict) or not isinstance(value.get('job_dirs'), list):
+        raise LedgerProjectionError('jobs ledger has an invalid schema')
+    dirs = value['job_dirs']
+    if any(not isinstance(item, str) or not item.strip() for item in dirs):
+        raise LedgerProjectionError('jobs ledger contains an invalid locator')
+    raw_owners = value.get(_OWNERS_KEY, {})
+    if not isinstance(raw_owners, dict):
+        raise LedgerProjectionError('jobs ledger has invalid transaction owners')
+    if any(not isinstance(entry, str) or entry not in dirs
+           or not isinstance(owner, str) or not _HEX64.fullmatch(owner)
+           for entry, owner in raw_owners.items()):
+        raise LedgerProjectionError('jobs ledger has invalid transaction owners')
+    return copy.deepcopy(value), list(dirs), dict(raw_owners)
+
+
+def _snapshot_unlocked(path: Path) -> dict[str, object]:
+    try:
+        exists = path.is_file()
+        raw = path.read_bytes() if exists else b''
+    except OSError as exc:
+        raise LedgerProjectionError('jobs ledger could not be read') from exc
+    payload, dirs, owners = _projection_payload(raw)
+    return {
+        'path': str(path.resolve(strict=False)), 'exists': exists, 'raw': raw,
+        'payload': payload, 'job_dirs': dirs, 'owners': owners,
+        'sha256': hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def _entry_key(value: str | os.PathLike) -> str:
+    expanded = os.path.expanduser(os.fspath(value))
+    return os.path.normcase(os.path.realpath(os.path.abspath(expanded)))
+
+
+def _validated_entries(values, *, field: str) -> list[str]:
+    if not isinstance(values, (list, tuple)) or any(
+            not isinstance(item, str) or not item.strip() for item in values):
+        raise LedgerProjectionError(f'{field} contains an invalid locator')
+    keys: set[str] = set()
+    result = []
+    for item in values:
+        key = _entry_key(item)
+        if key in keys:
+            raise LedgerProjectionError(f'{field} contains duplicate locators')
+        keys.add(key)
+        result.append(item)
+    return result
+
+
+def _merge_entry_delta(current_payload: dict[str, object], from_entries: list[str],
+                       to_entries: list[str], *, restored_owners: dict[str, str] | None = None
+                       ) -> dict[str, object]:
+    """Apply one list delta to current authority while preserving unrelated paths and metadata."""
+    current = _validated_entries(current_payload.get('job_dirs'), field='current ledger')
+    from_by_key = {_entry_key(item): item for item in from_entries}
+    to_by_key = {_entry_key(item): item for item in to_entries}
+    removed = set(from_by_key) - set(to_by_key)
+    added = [item for item in to_entries if _entry_key(item) not in from_by_key]
+    merged = [item for item in current if _entry_key(item) not in removed]
+    merged_keys = {_entry_key(item) for item in merged}
+    for item in added:
+        key = _entry_key(item)
+        if key not in merged_keys:
+            merged.append(item)
+            merged_keys.add(key)
+
+    raw_owners = current_payload.get(_OWNERS_KEY, {})
+    owners = dict(raw_owners) if isinstance(raw_owners, dict) else {}
+    exact_entries = set(merged)
+    owners = {entry: owner for entry, owner in owners.items() if entry in exact_entries}
+    for entry, owner in (restored_owners or {}).items():
+        if entry in exact_entries and entry not in owners:
+            owners[entry] = owner
+
+    updated = copy.deepcopy(current_payload)
+    updated['job_dirs'] = merged
+    if owners:
+        updated[_OWNERS_KEY] = owners
+    else:
+        updated.pop(_OWNERS_KEY, None)
+    return updated
+
+
+def render_projection(payload: dict[str, object], entries) -> bytes:
+    """Render a journal projection while retaining only owners whose entries remain present."""
+    if not isinstance(payload, dict):
+        raise LedgerProjectionError('base ledger payload is invalid')
+    projected = _validated_entries(entries, field='projected ledger')
+    # Reuse the strict decoder so malformed owner metadata can never be normalized away.
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode('utf-8')
+    current_payload, _dirs, owners = _projection_payload(encoded)
+    current_payload['job_dirs'] = projected
+    retained = {entry: owner for entry, owner in owners.items() if entry in projected}
+    if retained:
+        current_payload[_OWNERS_KEY] = retained
+    else:
+        current_payload.pop(_OWNERS_KEY, None)
+    return (json.dumps(
+        current_payload, ensure_ascii=False, indent=2, sort_keys=True) + '\n').encode('utf-8')
+
+
 def _load_state(path: Path) -> tuple[list[str], dict[str, str]]:
     if not path.is_file():
         return [], {}
@@ -144,12 +259,8 @@ def _replace_durable(source: Path, target: Path) -> None:
         os.replace(source, target)
 
 
-def _save_state(path: Path, dirs: list[str], owners: dict[str, str]) -> None:
+def _save_payload(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload: dict[str, object] = {'job_dirs': dirs}
-    retained = {entry: owner for entry, owner in owners.items() if entry in dirs}
-    if retained:
-        payload[_OWNERS_KEY] = retained
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f'.{path.name}.', suffix='.tmp', dir=str(path.parent))
     temporary = Path(temporary_name)
@@ -165,9 +276,73 @@ def _save_state(path: Path, dirs: list[str], owners: dict[str, str]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _save_state(path: Path, dirs: list[str], owners: dict[str, str]) -> None:
+    payload: dict[str, object] = {'job_dirs': dirs}
+    retained = {entry: owner for entry, owner in owners.items() if entry in dirs}
+    if retained:
+        payload[_OWNERS_KEY] = retained
+    _save_payload(path, payload)
+
+
 def _save_raw(path: Path, dirs: list) -> None:
     """Backward-compatible helper; production mutations call it only while locked."""
     _save_state(path, [str(item) for item in dirs], {})
+
+
+def projection_snapshot(path: str | os.PathLike | None = None) -> dict[str, object]:
+    """Return a strict byte/hash/payload snapshot under the shared ledger OS lock."""
+    target = _ledger_path(path)
+    with _mutation_lock(target):
+        return _snapshot_unlocked(target)
+
+
+def merge_projection(*, base_sha256: str, base_entries, projected_entries,
+                     path: str | os.PathLike | None = None) -> dict[str, object]:
+    """CAS-or-merge a lifecycle list delta without erasing concurrent entries or owners."""
+    if not _HEX64.fullmatch(str(base_sha256)):
+        raise LedgerProjectionError('base ledger hash is invalid')
+    base = _validated_entries(base_entries, field='base projection')
+    projected = _validated_entries(projected_entries, field='projected ledger')
+    target = _ledger_path(path)
+    with _mutation_lock(target):
+        current = _snapshot_unlocked(target)
+        removed = {_entry_key(item) for item in base} - {
+            _entry_key(item) for item in projected}
+        if any(_entry_key(entry) in removed for entry in current['owners']):
+            raise LedgerProjectionError(
+                'lifecycle projection cannot remove a transaction-owned ledger entry')
+        updated = _merge_entry_delta(current['payload'], base, projected)
+        if updated != current['payload']:
+            _save_payload(target, updated)
+        result = _snapshot_unlocked(target)
+        result['cas_matched'] = current['sha256'] == str(base_sha256)
+        return result
+
+
+def rollback_projection(*, original: bytes, projected: bytes,
+                        path: str | os.PathLike | None = None) -> dict[str, object]:
+    """Inverse-merge one lifecycle delta while preserving later writers and their owners."""
+    original_payload, original_entries, original_owners = _projection_payload(original)
+    _projected_payload, projected_entries, _projected_owners = _projection_payload(projected)
+    target = _ledger_path(path)
+    with _mutation_lock(target):
+        current = _snapshot_unlocked(target)
+        if current['raw'] == original:
+            return current
+        updated = _merge_entry_delta(
+            current['payload'], projected_entries, original_entries,
+            restored_owners=original_owners,
+        )
+        if (not original and updated == {'job_dirs': []}
+                and current['payload'].keys() <= {'job_dirs', _OWNERS_KEY}):
+            try:
+                target.unlink(missing_ok=True)
+                _fsync_directory(target.parent)
+            except OSError as exc:
+                raise LedgerProjectionError('jobs ledger rollback could not be published') from exc
+        elif updated != current['payload']:
+            _save_payload(target, updated)
+        return _snapshot_unlocked(target)
 
 
 def list_dirs(path: str | os.PathLike | None = None) -> list:

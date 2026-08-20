@@ -26,6 +26,8 @@ from typing import Any, Iterable
 
 import yaml
 
+from vcstudio.cluster import ledger as cluster_ledger
+
 
 PROJECT_FILE = "project.yaml"
 _OWNER_FILE = ".vcstudio-lifecycle-owner.json"
@@ -715,29 +717,20 @@ class ProjectLifecycleService:
             payload, "projects", entries))
 
     def _read_ledger(self) -> tuple[dict[str, Any], list[str], str]:
-        target = self.ledger_path
-        if not target.exists():
-            return {"job_dirs": []}, [], _sha256_bytes(b"")
         try:
-            raw = target.read_bytes()
-            payload = json.loads(raw.decode("utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            snapshot = cluster_ledger.projection_snapshot(path=self.ledger_path)
+        except cluster_ledger.LedgerProjectionError as exc:
             raise ProjectLifecycleError(
                 "ledger_invalid", "The jobs ledger could not be read safely."
             ) from exc
-        if not isinstance(payload, dict) or not isinstance(payload.get("job_dirs"), list):
-            raise ProjectLifecycleError(
-                "ledger_invalid", "The jobs ledger has an invalid schema."
-            )
-        if not all(isinstance(item, str) and item.strip() for item in payload["job_dirs"]):
-            raise ProjectLifecycleError(
-                "ledger_invalid", "The jobs ledger contains an invalid locator."
-            )
-        return payload, list(payload["job_dirs"]), _sha256_bytes(raw)
+        return (copy.deepcopy(snapshot["payload"]), list(snapshot["job_dirs"]),
+                str(snapshot["sha256"]))
 
-    def _write_ledger(self, payload: dict[str, Any], entries: list[str]) -> None:
-        _atomic_write(self.ledger_path, self._authority_projection(
-            payload, "job_dirs", entries))
+    def _write_ledger(self, *, base_sha256: str, base_entries: list[str],
+                      entries: list[str]) -> dict[str, object]:
+        return cluster_ledger.merge_projection(
+            base_sha256=base_sha256, base_entries=base_entries,
+            projected_entries=entries, path=self.ledger_path)
 
     @staticmethod
     def _authority_projection(payload: dict[str, Any], key: str,
@@ -776,6 +769,22 @@ class ProjectLifecycleService:
             raise ProjectLifecycleError(
                 "journal_invalid", "A recovery snapshot path is invalid."
             )
+        if list_key == "job_dirs":
+            original = cls._snapshot_payload(snapshot)
+            if not projection_b64:
+                # The transaction never prepared a ledger delta.  Any current value belongs to a
+                # different writer and is left untouched.
+                return
+            try:
+                projected = base64.b64decode(str(projection_b64), validate=True)
+                cluster_ledger.rollback_projection(
+                    original=original, projected=projected, path=path)
+            except (ValueError, binascii.Error, cluster_ledger.LedgerProjectionError) as exc:
+                raise ProjectLifecycleError(
+                    "journal_recovery_failed",
+                    "A concurrently changed jobs ledger could not be merged safely.",
+                ) from exc
+            return
         current = path.read_bytes() if path.is_file() else b""
         original = cls._snapshot_payload(snapshot)
         current_sha = _sha256_bytes(current)
@@ -835,7 +844,14 @@ class ProjectLifecycleService:
     def _prepare_authority_projection(self, record: dict[str, Any], *,
                                       authority: str, payload: dict[str, Any],
                                       list_key: str, entries: list[str]) -> None:
-        projected = self._authority_projection(payload, list_key, entries)
+        try:
+            projected = (cluster_ledger.render_projection(payload, entries)
+                         if list_key == "job_dirs"
+                         else self._authority_projection(payload, list_key, entries))
+        except cluster_ledger.LedgerProjectionError as exc:
+            raise ProjectLifecycleError(
+                "ledger_invalid", "The jobs ledger projection could not be prepared safely."
+            ) from exc
         record[f"{authority}_written_sha256"] = _sha256_bytes(projected)
         record[f"{authority}_projection_b64"] = base64.b64encode(
             projected).decode("ascii")
@@ -853,14 +869,28 @@ class ProjectLifecycleService:
         self._write_registry(payload, entries)
 
     def _commit_ledger(self, plan: LifecyclePlan, payload: dict[str, Any],
-                       entries: list[str]) -> None:
-        _current_payload, _current_entries, current_sha = self._read_ledger()
-        if current_sha != plan.ledger_sha256:
+                       entries: list[str]) -> dict[str, object]:
+        try:
+            return self._write_ledger(
+                base_sha256=plan.ledger_sha256,
+                base_entries=list(payload.get("job_dirs") or []), entries=entries)
+        except cluster_ledger.LedgerProjectionError as exc:
             raise ProjectLifecycleError(
-                "preflight_stale",
-                "The jobs ledger changed during the operation; all projections were rolled back.",
-            )
-        self._write_ledger(payload, entries)
+                "ledger_merge_failed",
+                "The jobs ledger could not be merged safely; all projections were rolled back.",
+            ) from exc
+
+    def _ledger_journal_snapshot(self) -> dict[str, Any]:
+        try:
+            snapshot = cluster_ledger.projection_snapshot(path=self.ledger_path)
+        except cluster_ledger.LedgerProjectionError as exc:
+            raise ProjectLifecycleError(
+                "ledger_invalid", "The jobs ledger could not be snapshotted safely."
+            ) from exc
+        return {
+            "path": str(snapshot["path"]), "exists": bool(snapshot["exists"]),
+            "data_b64": base64.b64encode(snapshot["raw"]).decode("ascii"),
+        }
 
     @staticmethod
     def _snapshot(path: Path) -> dict[str, Any]:
@@ -976,7 +1006,7 @@ class ProjectLifecycleService:
             "destination_root": plan.destination_root,
             "stage_root": str(stage),
             "registry": self._snapshot(self.registry_path),
-            "ledger": self._snapshot(self.ledger_path),
+            "ledger": self._ledger_journal_snapshot(),
             "registry_written_sha256": None,
             "ledger_written_sha256": None,
             "registry_projection_b64": None,

@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from vcstudio.cluster import ledger as cluster_ledger
 import vcstudio.project.project_lifecycle as lifecycle
 from vcstudio.project.project_lifecycle import (
     ProjectLifecycleError,
@@ -43,6 +44,32 @@ def _process_apply(registry: str, plan, held, release, slow: bool, outcomes) -> 
         outcomes.put(("ok", result["action"]))
     except BaseException as exc:  # child must report lock errors and test crashes
         outcomes.put(("error", getattr(exc, "code", type(exc).__name__)))
+
+
+def _process_apply_at_ledger_barrier(registry: str, plan, entered, release, outcomes) -> None:
+    """Pause a real lifecycle projection while it owns cluster.ledger's shared OS lock."""
+    original = cluster_ledger._save_payload
+
+    def held_save(path, payload):
+        entered.set()
+        if not release.wait(20):
+            raise RuntimeError("ledger release gate timed out")
+        return original(path, payload)
+
+    cluster_ledger._save_payload = held_save
+    try:
+        result = ProjectLifecycleService(registry).apply(plan)
+        outcomes.put(("lifecycle", result["ok"]))
+    except BaseException as exc:
+        outcomes.put(("lifecycle-error", getattr(exc, "code", type(exc).__name__)))
+
+
+def _process_ordinary_ledger_register(ledger_path: str, job_dir: str, ready, outcomes) -> None:
+    ready.set()
+    try:
+        outcomes.put(("ordinary", cluster_ledger.register(job_dir, path=ledger_path)))
+    except BaseException as exc:
+        outcomes.put(("ordinary-error", type(exc).__name__))
 
 
 def _write_yaml(path: Path, value: dict) -> None:
@@ -311,7 +338,7 @@ def test_clone_commit_time_registry_cas_preserves_concurrent_registration(
     assert _read_registry(registry) == [str(source), str(concurrent)]
 
 
-def test_clone_commit_time_ledger_cas_preserves_concurrent_job_registration(
+def test_clone_commit_time_ledger_merge_preserves_concurrent_job_registration(
         tmp_path, monkeypatch):
     source = _project(tmp_path / "source")
     registry = _registry(tmp_path / "projects.json", [source])
@@ -332,13 +359,46 @@ def test_clone_commit_time_ledger_cas_preserves_concurrent_job_registration(
 
     monkeypatch.setattr(service, "_copytree", copy_then_register)
 
-    with pytest.raises(ProjectLifecycleError) as failure:
+    result = service.apply(plan)
+
+    assert result["ok"] is True and destination.is_dir()
+    final = _read_ledger(ledger)
+    assert str(concurrent) in final
+    assert all(change.target_path in final for change in plan.job_changes)
+
+
+def test_lifecycle_ledger_rollback_removes_only_its_delta_and_preserves_owner(
+        tmp_path, monkeypatch):
+    source = _project(tmp_path / "source")
+    registry = _registry(tmp_path / "projects.json", [source])
+    source_jobs = [source.parent / "clean", source.parent / "configs" / "site-1"]
+    ledger_path = _ledger(tmp_path / "jobs.json", source_jobs)
+    owned_job = tmp_path / "owned-method-job"
+    owner_id = "f" * 64
+    cluster_ledger.register_owned(owned_job, owner_id, path=ledger_path)
+    concurrent = tmp_path / "concurrent-after-lifecycle"
+    destination = tmp_path / "clone"
+    service = ProjectLifecycleService(registry)
+    plan = service.preflight_clone(source, destination)
+    real_commit = service._commit_ledger
+
+    def commit_then_fail(*args, **kwargs):
+        real_commit(*args, **kwargs)
+        assert cluster_ledger.register(concurrent, path=ledger_path) is True
+        raise OSError("failure after lifecycle ledger publication")
+
+    monkeypatch.setattr(service, "_commit_ledger", commit_then_fail)
+
+    with pytest.raises(ProjectLifecycleError, match="failed safely"):
         service.apply(plan)
 
-    assert failure.value.code == "preflight_stale"
     assert not destination.exists()
-    assert _read_registry(registry) == [str(source)]
-    assert _read_ledger(ledger) == [*(str(path) for path in source_jobs), str(concurrent)]
+    assert set(cluster_ledger.list_dirs(path=ledger_path)) == {
+        *(str(path.resolve()) for path in source_jobs),
+        str(owned_job.resolve()), str(concurrent.resolve()),
+    }
+    assert cluster_ledger.registration_state(
+        owned_job, owner_id, path=ledger_path)["owned"] is True
 
 
 def test_clone_never_overwrites_destination_that_appears_during_copy(
@@ -491,7 +551,7 @@ def test_ledger_write_failure_rolls_back_filesystem_registry_and_ledger(
     plan = service.preflight_clone(source, destination)
     monkeypatch.setattr(
         service, "_write_ledger",
-        lambda _payload, _entries: (_ for _ in ()).throw(OSError("ledger unavailable")),
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("ledger unavailable")),
     )
 
     with pytest.raises(ProjectLifecycleError, match="failed safely"):
@@ -753,3 +813,62 @@ def test_two_processes_share_one_global_lifecycle_lock_and_only_one_wins(tmp_pat
     yaml.safe_load((tmp_path / "winner" / "project.yaml").read_text(encoding="utf-8"))
     yaml.safe_load((tmp_path / "winner" / "clean" / "job.yaml").read_text(
         encoding="utf-8"))
+
+
+def test_lifecycle_and_ordinary_writer_share_ledger_lock_and_preserve_owner(tmp_path):
+    source = _project(tmp_path / "source")
+    registry = _registry(tmp_path / "projects.json", [source])
+    source_jobs = [
+        source.parent / "clean", source.parent / "configs" / "site-1",
+        source.parent / "molecules" / "Li2S8",
+    ]
+    ledger_path = _ledger(tmp_path / "jobs.json", source_jobs)
+    owned_job = tmp_path / "owned-method-job"
+    owner_id = "e" * 64
+    assert cluster_ledger.register_owned(owned_job, owner_id, path=ledger_path)["added"] is True
+    destination = tmp_path / "clone"
+    plan = ProjectLifecycleService(registry).preflight_clone(source, destination)
+    ordinary_job = tmp_path / "ordinary-job"
+    context = multiprocessing.get_context("spawn")
+    entered = context.Event()
+    release = context.Event()
+    ordinary_ready = context.Event()
+    outcomes = context.Queue()
+    lifecycle_process = context.Process(
+        target=_process_apply_at_ledger_barrier,
+        args=(str(registry), plan, entered, release, outcomes),
+    )
+    ordinary_process = context.Process(
+        target=_process_ordinary_ledger_register,
+        args=(str(ledger_path), str(ordinary_job), ordinary_ready, outcomes),
+    )
+
+    lifecycle_process.start()
+    try:
+        assert entered.wait(20), "lifecycle never reached the locked ledger publication"
+        ordinary_process.start()
+        assert ordinary_ready.wait(20), "ordinary writer never attempted registration"
+    finally:
+        release.set()
+        lifecycle_process.join(30)
+        ordinary_process.join(30)
+        for process in (lifecycle_process, ordinary_process):
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+
+    assert lifecycle_process.exitcode == ordinary_process.exitcode == 0
+    assert dict(outcomes.get(timeout=5) for _ in range(2)) == {
+        "lifecycle": True, "ordinary": True,
+    }
+    final = cluster_ledger.list_dirs(path=ledger_path)
+    expected = {
+        *(str(path.resolve()) for path in source_jobs), str(owned_job.resolve()),
+        *(str(Path(change.target_path).resolve()) for change in plan.job_changes),
+        str(ordinary_job.resolve()),
+    }
+    assert set(final) == expected and len(final) == len(expected)
+    assert cluster_ledger.registration_state(
+        owned_job, owner_id, path=ledger_path) == {
+            "present": True, "owned": True, "preexisting": False,
+        }
