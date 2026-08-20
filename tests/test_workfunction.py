@@ -81,7 +81,7 @@ def _locpot(z_slices, ng_xy=(2, 2), cell=((3.0, 0, 0), (0, 3.0, 0), (0, 0, 8.0))
 def test_build_wf_job_sets_lvtot(tmp_path):
     src = _make_src(tmp_path)
     res = wf.build_workfunction_job(str(src), str(tmp_path / 'wf'))
-    d = parse_incar((tmp_path / 'wf' / 'INCAR').read_text())
+    d = parse_incar((tmp_path / 'wf' / 'INCAR').read_text(encoding='utf-8'))
     assert d['LVTOT'] is True
     assert res['dipole'] is False                        # 对称 slab 不加偶极
     m = manifest_mod.load_manifest(tmp_path / 'wf')
@@ -94,7 +94,7 @@ def test_build_wf_job_sets_lvtot(tmp_path):
 def test_build_wf_job_asymmetric_adds_dipole(tmp_path):
     src = _make_src(tmp_path, contcar=_SLAB_ASYM)
     res = wf.build_workfunction_job(str(src), str(tmp_path / 'wf'))
-    d = parse_incar((tmp_path / 'wf' / 'INCAR').read_text())
+    d = parse_incar((tmp_path / 'wf' / 'INCAR').read_text(encoding='utf-8'))
     assert res['dipole'] is True and d.get('LDIPOL') is True
     assert any('偶极' in w for w in res['warnings'])
 

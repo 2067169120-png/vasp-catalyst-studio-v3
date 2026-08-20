@@ -493,8 +493,7 @@ def test_electronic_bootstrap_uses_only_manifest_descendant_and_opaque_source_id
         "inputs": {"engine": "vasp"},
     }
     (derived / "job.yaml").write_text(
-        "schema: 1\njob_uuid: opaque-bands-child\ntask_type: bands\nstate: DONE\n",
-        encoding="utf-8")
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True), encoding="utf-8")
     (derived / "EIGENVAL").write_text("server evidence", encoding="utf-8")
     unrelated = tmp_path / "private-ledger" / "unrelated"
     unrelated.mkdir()
@@ -508,12 +507,18 @@ def test_electronic_bootstrap_uses_only_manifest_descendant_and_opaque_source_id
     ])
     api._analysis_workbench_method_evidence = lambda _target: {
         "status": "verified", "fingerprint": "method-bound"}
-    api.analyze_task = lambda path, kind=None: {
-        "ok": path == str(derived) and kind == "bands",
-        "kind": kind, "result": {
-            "gap": {"value": 1.25, "direct": False, "metal": False}},
-        "summary": "server finalized", "error": None,
-    }
+    def analyze_snapshot(path, kind=None):
+        parser_root = Path(path)
+        assert parser_root != derived
+        assert (parser_root / "EIGENVAL").read_text(
+            encoding="utf-8") == "server evidence"
+        return {
+            "ok": kind == "bands", "kind": kind, "result": {
+                "gap": {"value": 1.25, "direct": False, "metal": False}},
+            "summary": "server finalized", "error": None,
+        }
+
+    api.analyze_task = analyze_snapshot
 
     response = api.analysis_workbench_bootstrap(
         project_id, "electronic-structure")

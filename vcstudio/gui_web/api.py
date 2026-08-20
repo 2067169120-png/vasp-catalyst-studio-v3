@@ -8267,8 +8267,9 @@ class Api:
         }
 
     @staticmethod
-    def _analysis_workbench_method_evidence(target):
+    def _analysis_workbench_method_evidence(target, source_snapshot=None):
         """Require a complete, non-drifted method identity before parsing."""
+        from vcstudio.project.calculation_reuse import build_scientific_fingerprint
         from vcstudio.project import energy_gate
 
         manifest = target.get('manifest') or {}
@@ -8282,15 +8283,83 @@ class Api:
             return {'status': 'unverified', 'engine': engine,
                     'missing': ['non-VASP manifest lacks method identity']}
         record = energy_gate.method_record(
-            target['path'], manifest, str(target.get('source_id') or 'job'))
+            target['path'], manifest, str(target.get('source_id') or 'job'),
+            source_snapshot=source_snapshot)
         required = ('functional', 'dispersion', 'encut', 'spin',
                     'kpoints_scheme', 'potcar_ids')
         missing = [key for key in required if not record['known'].get(key)]
         warnings = list(record.get('evidence_warnings') or [])
+        strict = build_scientific_fingerprint(target['path'])
+        components = strict.get('components') or {}
+        strict_missing = list(strict.get('missing') or [])
+        strict_integrity = list(strict.get('integrity_issues') or [])
+        closure_record = inputs.get('input_closure') or {}
+        binding_issues = []
+        if source_snapshot is None:
+            binding_issues.append('analysis source snapshot binding is unavailable')
+        else:
+            manifest_file = source_snapshot.file('job.yaml') or {}
+            if strict.get('manifest_sha256') != manifest_file.get('sha256'):
+                binding_issues.append('strict fingerprint manifest binding differs from analysis snapshot')
+            closure_files = (closure_record.get('files')
+                             if isinstance(closure_record, dict) else {})
+            if not isinstance(closure_files, dict) or not closure_files:
+                binding_issues.append('recorded scientific input closure is unavailable')
+            else:
+                for name, expected in closure_files.items():
+                    current = source_snapshot.file(str(name)) or {}
+                    if current.get('sha256') != str(expected or '').strip().lower():
+                        binding_issues.append(
+                            'strict fingerprint closure binding differs from analysis snapshot')
+                        break
+        task_values = ((components.get('task') or {}).get('values') or {})
+        recipe = task_values.get('method_recipe') or {}
+        environment_component = components.get('environment') or {}
+        environment = environment_component.get('values') or {}
+        evidence = environment.get('evidence') or {}
+        build_identity = str(environment.get('build_identity') or '')
+        strict_status = (
+            'complete' if strict.get('status') == 'complete'
+            and not binding_issues else 'incomplete')
+        strict_authority = {
+            'schema': strict.get('schema'),
+            'status': strict_status,
+            'fingerprint_sha256': strict.get('digest'),
+            'input_closure': {
+                'schema': closure_record.get('schema'),
+                'status': closure_record.get('status'),
+                'component_sha256': (
+                    (components.get('input_closure') or {}).get('sha256')),
+            },
+            'method_recipe': {
+                key: recipe.get(key) for key in (
+                    'schema', 'authority', 'semantic_sha256')
+            },
+            'execution_environment': {
+                'schema': environment.get('schema'),
+                'authority': environment.get('authority'),
+                'engine': environment.get('engine'),
+                'vasp_version': environment.get('vasp_version'),
+                'build_identity_sha256': (
+                    hashlib.sha256(build_identity.encode('utf-8')).hexdigest()
+                    if build_identity else None),
+                'evidence_kind': evidence.get('kind'),
+                'evidence_sha256': evidence.get('sha256'),
+                'component_sha256': environment_component.get('sha256'),
+            },
+            'missing': (
+                ['strict fingerprint requirements are incomplete']
+                if strict_missing else []),
+            'integrity_issues': (
+                ['strict fingerprint integrity validation failed']
+                if strict_integrity else []),
+            'binding_issues': binding_issues,
+        }
         return {
             'status': 'verified' if not missing and not warnings else 'unverified',
             'fingerprint': copy.deepcopy(record.get('fingerprint') or {}),
             'missing': missing, 'warnings': warnings,
+            'strict_authority': strict_authority,
         }
 
     def _analysis_workbench_property_results(self, kind, targets):
@@ -8485,6 +8554,14 @@ class Api:
                 'available' if self._project_member_dirs(project) else 'missing_prerequisite'),
             'free-energy-path': (
                 'available' if mode == 'lis' else 'mode_mismatch'),
+            'neb-path': (
+                'available' if 'neb' in task_types else 'missing_prerequisite'),
+            'convergence-scan': (
+                'available' if task_types & {
+                    'conv_scan', 'conv_encut', 'conv_kmesh',
+                    'conv_vacuum', 'conv_thickness'} else 'missing_prerequisite'),
+            'aimd-diagnostics': (
+                'available' if 'aimd' in task_types else 'missing_prerequisite'),
             'task-results': ('available' if targets else 'missing_prerequisite'),
             'electronic-structure': (
                 'available' if task_types & {'dos_pdos', 'bands', 'workfunction'}
@@ -8518,14 +8595,16 @@ class Api:
         from vcstudio.project.analysis_registry import normalize_analysis_request
         from vcstudio.project.analysis_views import (
             build_adsorption_view,
+            build_aimd_analysis_view,
             build_comparison_view,
+            build_convergence_analysis_view,
             build_free_energy_view,
+            build_neb_analysis_view,
         )
         from vcstudio.project.analysis_sources import (
             build_property_view,
             build_task_analysis_view,
         )
-
         context = self._report_workbench_project_context(path)
         prepared = {} if request is None else copy.deepcopy(request)
         if not isinstance(prepared, dict):
@@ -8610,6 +8689,18 @@ class Api:
                 runner=lambda target_path, kind: self.analyze_task(
                     target_path, kind=kind),
                 parser_identities=self._analysis_workbench_parser_identities(),
+                method_evidence=self._analysis_workbench_method_evidence,
+            )
+        elif spec.analysis_id in {
+                'neb-path', 'convergence-scan', 'aimd-diagnostics'}:
+            targets = self._analysis_workbench_targets(context)
+            builders = {
+                'neb-path': build_neb_analysis_view,
+                'convergence-scan': build_convergence_analysis_view,
+                'aimd-diagnostics': build_aimd_analysis_view,
+            }
+            view = builders[spec.analysis_id](
+                spec, targets,
                 method_evidence=self._analysis_workbench_method_evidence,
             )
         elif spec.analysis_id == 'property-calculators':
@@ -18055,6 +18146,32 @@ class Api:
                 warnings.append(f'NEB {frame} image 目录不存在，无法写入端点证据。')
                 records[role] = record
                 continue
+            # build_neb_dir writes the selected source CONTCAR/POSCAR bytes to
+            # frame/POSCAR. Bind that exact structure to the endpoint energy.
+            source_structure = next((
+                (name, os.path.join(source, name))
+                for name in ('CONTCAR', 'POSCAR')
+                if os.path.isfile(os.path.join(source, name))
+                and os.path.getsize(os.path.join(source, name)) > 0
+            ), None)
+            frame_poscar = os.path.join(destination, 'POSCAR')
+            if source_structure and os.path.isfile(frame_poscar):
+                structure_name, structure_path = source_structure
+                try:
+                    structure_hash = _sha256_file(structure_path)
+                    if structure_hash == _sha256_file(frame_poscar):
+                        record['files'].append({
+                            'name': structure_name, 'copied_name': 'POSCAR',
+                            'sha256': structure_hash,
+                            'size': os.path.getsize(frame_poscar),
+                        })
+                    else:
+                        warnings.append(
+                            f'{frame}/POSCAR 与端点源 {structure_name} 不一致；'
+                            'Analysis Workbench 将拒绝端点能量。')
+                except OSError:
+                    warnings.append(
+                        f'{frame}/POSCAR 结构哈希失败；Analysis Workbench 将拒绝端点能量。')
             for name in ('OSZICAR', 'OUTCAR', 'vasprun.xml'):
                 src = os.path.join(source, name)
                 dst = os.path.join(destination, name)
@@ -18089,6 +18206,11 @@ class Api:
                 source_manifest = {}
             if not isinstance(source_manifest, dict):
                 source_manifest = {}
+            # Analysis Workbench resolves this opaque identity back through the
+            # current ledger. It never treats source_dir or manifest trust hints
+            # as authority.
+            record['source_job_id'] = self._workspace_job_id(
+                source, source_manifest)
             record['source_state'] = source_manifest.get('state')
             if energy is not None:
                 record['energy_e0_eV'] = energy
@@ -18107,7 +18229,6 @@ class Api:
                         and math.isfinite(float(value))):
                     record['energy_e0_eV'] = float(value)
                     record['energy_source'] = f'source_manifest:{declared_source}'
-                    record['source_job_id'] = source_manifest.get('job_id')
                     record['trusted'] = bool(record['source_job_id'])
             if record['energy_e0_eV'] is None:
                 label = '始态' if role == 'start' else '末态'

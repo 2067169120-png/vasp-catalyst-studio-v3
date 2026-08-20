@@ -255,7 +255,8 @@ def test_engine_generate_creates_standard_manifest_and_ledger_for_all_file_engin
         assert registered[-1] == str(out_dir)
 
 
-def test_derive_neb_copies_endpoint_evidence_and_parser_merges_manifest_fallback(tmp_path):
+def test_derive_neb_copies_verifiable_endpoint_identity_and_never_uses_manifest_fallback(
+        tmp_path):
     start, end = tmp_path / 'start', tmp_path / 'end'
     start.mkdir()
     end.mkdir()
@@ -285,21 +286,24 @@ def test_derive_neb_copies_endpoint_evidence_and_parser_merges_manifest_fallback
     assert endpoints['start']['energy_e0_eV'] == -10.0
     assert endpoints['end']['energy_e0_eV'] == -9.8
     assert endpoints['start']['trusted'] is True
+    assert endpoints['start']['source_job_id'].startswith('job-')
+    assert endpoints['end']['source_job_id'].startswith('job-')
     assert len(endpoints['start']['files'][0]['sha256']) == 64
+    assert any(item.get('name') == 'CONTCAR'
+               and item.get('copied_name') == 'POSCAR'
+               for item in endpoints['start']['files'])
 
     for frame, energy in zip(('01', '02', '03'), (-9.7, -9.4, -9.65)):
         (root / frame / 'OSZICAR').write_text(_oszicar([energy]), encoding='utf-8')
-    # 模拟回收时远端未返回端点输出：只允许用生成阶段已哈希的 manifest 证据。
+    # 端点输出消失后，即使 manifest 自报缓存能量/可信状态也必须 fail closed。
     os.unlink(root / '00' / 'OSZICAR')
     os.unlink(root / '00' / 'OUTCAR')
     os.unlink(root / '04' / 'OSZICAR')
     os.unlink(root / '04' / 'OUTCAR')
     analyzed = Api().analyze_task(str(root), kind='neb')
-    assert analyzed['ok'] is True
-    assert analyzed['result']['energies'] == [-10.0, -9.7, -9.4, -9.65, -9.8]
-    assert analyzed['result']['barrier_f'] == pytest.approx(0.6)
-    assert analyzed['result']['energy_sources'][0].startswith('copied:')
-    assert any('job.yaml' in warning for warning in analyzed['result']['warnings'])
+    assert analyzed['ok'] is False
+    assert analyzed['result'] is None
+    assert '初态' in analyzed['error']
 
 
 def test_neb_parser_rejects_untrusted_manifest_energy(tmp_path):

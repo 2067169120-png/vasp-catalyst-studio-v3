@@ -50,7 +50,7 @@ DAV:   1    -0.114E+03   -0.12E+00    0.90E-02   130   0.20E+00
 
 
 def _make_src_dir(tmp_path, *, contcar=_SLAB, poscar=None, incar=_RELAX_INCAR,
-                  potcar='PAW_PBE Cu\nPAW_PBE O\n'):
+                  potcar='PAW_PBE Cu\nPAW_PBE O\n', extra_files=None):
     d = tmp_path / 'relax'
     d.mkdir()
     if contcar is not None:
@@ -61,6 +61,8 @@ def _make_src_dir(tmp_path, *, contcar=_SLAB, poscar=None, incar=_RELAX_INCAR,
         (d / 'INCAR').write_text(incar, encoding='utf-8')
     if potcar is not None:
         (d / 'POTCAR').write_text(potcar, encoding='utf-8')
+    for name, content in (extra_files or {}).items():
+        (d / name).write_text(content, encoding='utf-8')
     return d
 
 
@@ -78,6 +80,15 @@ def test_build_aimd_incar_preserves_electronic_keys():
     d = parse_incar(ab.build_aimd_incar(_RELAX_INCAR))
     assert d['ENCUT'] == 500 and d['GGA'] == 'PE' and d['ISPIN'] == 2
     assert d['MAGMOM'] == '4*0 1*0' and d['IVDW'] == 12 and d['LDAUU'] == '4 0'
+
+
+def test_build_aimd_incar_forces_dependency_free_electronic_start():
+    source = _RELAX_INCAR + 'ISTART = 1\nICHARG = 1\n'
+
+    d = parse_incar(ab.build_aimd_incar(source))
+
+    assert d['ISTART'] == 0
+    assert d['ICHARG'] == 2
 
 
 def test_build_aimd_incar_strips_ediffg_and_isif():
@@ -159,15 +170,175 @@ def test_build_aimd_job_end_to_end(tmp_path):
     out = tmp_path / 'aimd'
     for name in ('POSCAR', 'INCAR', 'KPOINTS', 'POTCAR', 'job.yaml'):
         assert (out / name).is_file()
-    d = parse_incar((out / 'INCAR').read_text())
+    d = parse_incar((out / 'INCAR').read_text(encoding='utf-8'))
     assert d['IBRION'] == 0 and d['MDALGO'] == 2 and 'EDIFFG' not in d
     assert res['job_dir'] == str(out) and res['changes']
+
+
+def test_build_aimd_job_rewrites_restart_keys_before_recording_closure(tmp_path):
+    src = _make_src_dir(tmp_path, incar=_RELAX_INCAR + 'ISTART = 1\nICHARG = 1\n')
+
+    res = ab.build_aimd_job(str(src), str(tmp_path / 'aimd'))
+
+    assert res['ok'] is True
+    out = tmp_path / 'aimd'
+    incar = parse_incar((out / 'INCAR').read_text(encoding='utf-8'))
+    assert incar['ISTART'] == 0
+    assert incar['ICHARG'] == 2
+    assert not (out / 'WAVECAR').exists()
+    assert not (out / 'CHGCAR').exists()
+    manifest = manifest_mod.load_manifest(out)
+    closure = manifest['inputs']['input_closure']
+    assert closure['status'] == 'complete'
+    assert 'WAVECAR' not in closure['requirements']
+    assert 'CHGCAR' not in closure['requirements']
+    changes = manifest['inputs']['method_recipe']['decisions']['completions'][
+        'incar_changes']
+    by_key = {change['key']: change for change in changes}
+    assert by_key['ISTART']['new'] == '0'
+    assert by_key['ICHARG']['new'] == '2'
+
+
+@pytest.mark.parametrize(('incar_suffix', 'dependency', 'content'), [
+    ('LUSE_VDW = .TRUE.\n', 'vdw_kernel.bindat', 'vdw-kernel\n'),
+    ('SHAKEMAXITER = 100\n', 'ICONST', 'R 1 2 0\n'),
+    ('ML_MODE = run\n', 'ML_FF', 'machine-learning force field\n'),
+])
+def test_build_aimd_job_copies_required_auxiliary_inputs_into_closure(
+        tmp_path, incar_suffix, dependency, content):
+    src = _make_src_dir(
+        tmp_path, incar=_RELAX_INCAR + incar_suffix,
+        extra_files={dependency: content},
+    )
+
+    res = ab.build_aimd_job(str(src), str(tmp_path / 'aimd'))
+
+    assert res['ok'] is True
+    out = tmp_path / 'aimd'
+    assert (out / dependency).read_text(encoding='utf-8') == content
+    manifest = manifest_mod.load_manifest(out)
+    closure = manifest['inputs']['input_closure']
+    assert closure['status'] == 'complete'
+    assert dependency in closure['files']
+    assert dependency in closure['requirements']
+
+
+@pytest.mark.parametrize(('incar_suffix', 'dependency'), [
+    ('LUSE_VDW = .TRUE.\n', 'vdw_kernel.bindat'),
+    ('SHAKEMAXITER = 100\n', 'ICONST'),
+    ('ML_MODE = run\n', 'ML_FF'),
+])
+def test_build_aimd_job_fails_before_output_when_auxiliary_input_is_missing(
+        tmp_path, incar_suffix, dependency):
+    src = _make_src_dir(tmp_path, incar=_RELAX_INCAR + incar_suffix)
+    out = tmp_path / 'aimd'
+
+    res = ab.build_aimd_job(str(src), str(out))
+
+    assert res['ok'] is False
+    assert dependency in res['error']
+    assert res['job_dir'] is None
+    assert not out.exists()
+
+
+def test_build_aimd_job_does_not_inherit_unmanaged_source_kpoints_opt(tmp_path):
+    src = _make_src_dir(
+        tmp_path, extra_files={'KPOINTS_OPT': 'optional k-points\n'})
+
+    res = ab.build_aimd_job(str(src), str(tmp_path / 'aimd'))
+
+    assert res['ok'] is True
+    manifest = manifest_mod.load_manifest(tmp_path / 'aimd')
+    closure = manifest['inputs']['input_closure']
+    assert not (tmp_path / 'aimd' / 'KPOINTS_OPT').exists()
+    assert 'KPOINTS_OPT' not in closure['files']
+    assert 'KPOINTS_OPT' not in closure['requirements']
+
+
+def test_build_aimd_job_rejects_symlinked_vdw_kernel_without_following(tmp_path):
+    src = _make_src_dir(tmp_path, incar=_RELAX_INCAR + 'LUSE_VDW = .TRUE.\n')
+    secret = tmp_path / 'outside-secret'
+    secret.write_text('must-not-be-copied\n', encoding='utf-8')
+    try:
+        (src / 'vdw_kernel.bindat').symlink_to(secret)
+    except OSError:
+        pytest.skip('symlink creation is unavailable')
+    out = tmp_path / 'aimd'
+
+    res = ab.build_aimd_job(str(src), str(out))
+
+    assert res['ok'] is False
+    assert 'no-follow' in res['error']
+    assert res['job_dir'] is None
+    assert not out.exists()
+
+
+def test_build_aimd_job_preserves_manifest_declared_iconst_constraint(tmp_path):
+    src = _make_src_dir(
+        tmp_path, extra_files={'ICONST': 'R 1 2 0\n'})
+    (src / 'job.yaml').write_text(
+        'state: DONE\ninputs:\n  uses_iconst: true\n', encoding='utf-8')
+
+    res = ab.build_aimd_job(str(src), str(tmp_path / 'aimd'))
+
+    assert res['ok'] is True
+    out = tmp_path / 'aimd'
+    assert (out / 'ICONST').read_text(encoding='utf-8') == 'R 1 2 0\n'
+    manifest = manifest_mod.load_manifest(out)
+    assert manifest['inputs']['uses_iconst'] is True
+    assert manifest['inputs']['method_recipe']['decisions']['extra'][
+        'uses_iconst'] is True
+    closure = manifest['inputs']['input_closure']
+    assert closure['status'] == 'complete'
+    assert closure['requirements']['ICONST'] == 'SHAKE/declared constrained dynamics'
+    assert 'ICONST' in closure['files']
+
+
+@pytest.mark.parametrize('manifest_text', [
+    'state: DONE\ninputs: {}\n',
+    'state: DONE\ninputs:\n  uses_iconst: false\n',
+])
+def test_build_aimd_job_does_not_copy_incidental_iconst_without_true_declaration(
+        tmp_path, manifest_text):
+    src = _make_src_dir(
+        tmp_path, extra_files={'ICONST': 'incidental constraint\n'})
+    (src / 'job.yaml').write_text(manifest_text, encoding='utf-8')
+
+    res = ab.build_aimd_job(str(src), str(tmp_path / 'aimd'))
+
+    assert res['ok'] is True
+    out = tmp_path / 'aimd'
+    assert not (out / 'ICONST').exists()
+    manifest = manifest_mod.load_manifest(out)
+    assert 'uses_iconst' not in manifest['inputs']
+    assert 'ICONST' not in manifest['inputs']['input_closure']['requirements']
+
+
+@pytest.mark.parametrize('invalid_yaml', [
+    'inputs:\n  uses_iconst: 1\n',
+    'inputs:\n  uses_iconst: [true]\n',
+    'inputs:\n  uses_iconst: maybe\n',
+    'inputs: []\n',
+    '- not\n- a\n- mapping\n',
+])
+def test_build_aimd_job_rejects_invalid_manifest_uses_iconst_type(
+        tmp_path, invalid_yaml):
+    src = _make_src_dir(tmp_path, extra_files={'ICONST': 'R 1 2 0\n'})
+    (src / 'job.yaml').write_text(invalid_yaml, encoding='utf-8')
+    out = tmp_path / 'aimd'
+
+    res = ab.build_aimd_job(str(src), str(out))
+
+    assert res['ok'] is False
+    assert 'job.yaml' in res['error']
+    assert res['job_dir'] is None
+    assert not out.exists()
 
 
 def test_build_aimd_job_kpoints_gamma(tmp_path):
     src = _make_src_dir(tmp_path)
     ab.build_aimd_job(str(src), str(tmp_path / 'aimd'))
-    kp = (tmp_path / 'aimd' / 'KPOINTS').read_text()
+    kp = (tmp_path / 'aimd' / 'KPOINTS').read_text(encoding='utf-8')
     assert '1 1 1' in kp and 'Gamma' in kp
 
 
@@ -182,7 +353,7 @@ def test_build_aimd_job_nve_warns_and_sets_keys(tmp_path):
     src = _make_src_dir(tmp_path)
     res = ab.build_aimd_job(str(src), str(tmp_path / 'aimd'), ensemble='nve')
     assert any('NVE' in w for w in res['warnings'])
-    d = parse_incar((tmp_path / 'aimd' / 'INCAR').read_text())
+    d = parse_incar((tmp_path / 'aimd' / 'INCAR').read_text(encoding='utf-8'))
     assert d['MDALGO'] == 1 and d['ANDERSEN_PROB'] == pytest.approx(0.0)
 
 
@@ -239,6 +410,7 @@ def test_parse_aimd_energy_fixture():
     res = ab.parse_aimd_energy(_OSZICAR)
     assert res['n'] == 3                                # 3 条 MD 行(电子子行被跳过)
     s0 = res['steps'][0]
+    assert s0['step'] == 1
     assert s0['t_fs'] == pytest.approx(1.0)             # 步号1 × potim 1fs
     assert s0['e_tot'] == pytest.approx(-114.53958)
     assert s0['temp_k'] == pytest.approx(300.0)

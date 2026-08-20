@@ -1,6 +1,6 @@
 """figure_presets 图表预设注册表测试:12+ 预设 schema 完备/renderer 有效/SVG 良构、
 list 过滤与轻量化、get_preset 完整版、render_preset 分发(假 renderer + 真 matplotlib)、
-数据契约校验、todo 路径、参数覆盖、preset_provenance 溯源工件。
+数据契约校验、收敛/AIMD 实装路径、参数覆盖、preset_provenance 溯源工件。
 """
 from __future__ import annotations
 
@@ -66,10 +66,12 @@ def test_categories_cover_four_domains():
         assert k in keys, k
 
 
-def test_has_todo_placeholder_preset():
-    todo = [p for p in fp.PRESETS if p['renderer'] == 'todo']
-    assert len(todo) >= 1
-    assert todo[0]['key'] == 'convergence_curve'
+def test_neb_convergence_and_aimd_presets_have_real_renderers():
+    records = {preset['key']: preset for preset in fp.PRESETS}
+    assert records['neb_profile']['renderer'] == 'neb_profile_plot'
+    assert records['convergence_curve']['renderer'] == 'convergence_plot'
+    assert records['aimd_diagnostic']['renderer'] == 'energy_time_plot'
+    assert not [preset for preset in fp.PRESETS if preset['renderer'] == 'todo']
 
 
 # ── list_presets / get_preset ────────────────────────────────────────────────
@@ -184,11 +186,53 @@ def test_contract_non_dict_raises(tmp_path):
                          renderer_fn=_Spy())
 
 
-# ── todo 路径 ─────────────────────────────────────────────────────────────────
+# ── 新实装路径 ───────────────────────────────────────────────────────────────
 
-def test_todo_renderer_raises_not_implemented(tmp_path):
-    with pytest.raises(NotImplementedError, match='后续版本提供'):
-        fp.render_preset('convergence_curve', {'anything': 1}, tmp_path / 'x')
+def test_convergence_and_aimd_dispatch_frozen_server_data(tmp_path):
+    convergence = _Spy()
+    fp.render_preset(
+        'convergence_curve',
+        {'points': [{'x': 400, 'energy': -1.0}, {'x': 500, 'energy': -1.1}],
+         'threshold_mev': 1.0, 'natoms': 1, 'converged_at': 500},
+        tmp_path / 'conv', renderer_fn=convergence)
+    assert convergence.args[0][1]['x'] == 500
+    assert convergence.kw['threshold_mev'] == 1.0
+    assert convergence.kw['converged_at'] == 500
+
+    aimd = _Spy()
+    fp.render_preset(
+        'aimd_diagnostic',
+        {'steps': [{'time': 1.0, 'energy': -1.0, 'temperature': 300.0},
+                   {'time': 2.0, 'energy': -0.9, 'temperature': 310.0}],
+         'dt_fs': 1.0},
+        tmp_path / 'aimd', renderer_fn=aimd)
+    assert aimd.args[0][0]['temperature'] == 300.0
+    assert aimd.kw['dt_fs'] is None
+
+
+@pytest.mark.parametrize(('key', 'data'), [
+    ('neb_profile', {'rel': [0.0, None, float('nan')]}),
+    ('convergence_curve', {
+        'points': [{'x': 400, 'energy': -1.0}, {'x': None, 'energy': -1.1}],
+    }),
+    ('aimd_diagnostic', {
+        'steps': [{'step': 1, 'energy': -1.0, 'temperature': 300.0}],
+    }),
+])
+def test_scientific_figure_presets_reject_fewer_than_two_finite_points(
+        tmp_path, key, data):
+    spy = _Spy()
+    with pytest.raises(ValueError, match='至少需要 2 个有限'):
+        fp.render_preset(key, data, tmp_path / key, renderer_fn=spy)
+    assert spy.args is None
+
+
+def test_neb_preset_accepts_two_finite_points_with_missing_images(tmp_path):
+    spy = _Spy()
+    fp.render_preset(
+        'neb_profile', {'rel': [0.0, None, 0.2]}, tmp_path / 'neb',
+        renderer_fn=spy)
+    assert spy.args[0]['rel'] == [0.0, None, 0.2]
 
 
 # ── 溯源工件 ──────────────────────────────────────────────────────────────────
@@ -237,3 +281,25 @@ def test_render_real_ladder_dispatches_to_native_charts(tmp_path):
                             'pds_index': 1}, tmp_path / 'fed')
     import os
     assert len(out) == 2 and all(os.path.isfile(p) for p in out)
+
+
+def test_render_real_convergence_and_aimd_presets_create_files(tmp_path):
+    convergence = fp.render_preset(
+        'convergence_curve',
+        {'points': [{'x': 400, 'energy': -1.004},
+                    {'x': 450, 'energy': -1.001},
+                    {'x': 500, 'energy': -1.000}],
+         'threshold_mev': 1.0, 'natoms': 1, 'converged_at': 450,
+         'xlabel': 'ENCUT (eV)'},
+        tmp_path / 'conv')
+    aimd = fp.render_preset(
+        'aimd_diagnostic',
+        {'steps': [{'step': 1, 'energy': -10.0, 'temperature': 300.0},
+                   {'step': 2, 'energy': -9.99, 'temperature': 305.0},
+                   {'step': 3, 'energy': -9.98, 'temperature': 295.0}],
+         'dt_fs': 1.0},
+        tmp_path / 'aimd')
+
+    import os
+    assert len(convergence) == 2 and all(os.path.isfile(path) for path in convergence)
+    assert len(aimd) == 2 and all(os.path.isfile(path) for path in aimd)

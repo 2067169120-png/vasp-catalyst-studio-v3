@@ -21,8 +21,12 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 from collections import OrderedDict
+from collections.abc import Mapping
 from pathlib import Path
+
+import yaml
 
 from vcstudio.cluster.convergence import parse_oszicar
 from vcstudio.generate.incar_builder import parse_incar
@@ -34,6 +38,8 @@ from vcstudio.shared import manifest as manifest_mod
 
 DEFAULT_ENCUT_VALUES = (400, 450, 500, 550, 600, 650)
 DEFAULT_THRESHOLD_MEV = 1.0        # 相邻收敛判据:1 meV/atom
+_MAX_SOURCE_MANIFEST_BYTES = 4 * 1024 * 1024
+_WINDOWS_REPARSE_POINT = 0x400
 
 _CONV_STATIC_SET = OrderedDict([
     ('ISTART', 0), ('ICHARG', 2), ('IBRION', -1), ('NSW', 0),
@@ -195,16 +201,128 @@ def set_vacuum(poscar_text: str, vacuum: float) -> tuple:
 
 # ── 系列派生(逐作业只改单一目标参数) ──────────────────────────────────────────
 def _copy_if(src_dir, out_dir, name):
-    """存在则复制 src_dir/name 到 out_dir/name,返回是否复制。"""
-    src = os.path.join(src_dir, name)
-    if os.path.isfile(src):
-        shutil.copyfile(src, os.path.join(out_dir, name))
+    """存在则复制一个已知受管文件；拒绝链接和目录逃逸。"""
+    source_root = Path(src_dir).resolve()
+    src = source_root / name
+    if src.exists():
+        if src.is_symlink() or not src.is_file() or src.resolve().parent != source_root:
+            raise ValueError(f'源科学输入不是安全的普通文件:{name}')
+        destination_root = Path(out_dir).resolve()
+        destination = destination_root / name
+        if destination.is_symlink():
+            raise ValueError(f'目标科学输入不能是链接:{name}')
+        shutil.copyfile(src, destination)
         return True
     return False
 
 
+def _truthy(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or '').strip().strip('.').upper() in {'T', 'TRUE', '1', 'YES'}
+
+
+def _manifest_flag(inputs: Mapping, key: str) -> bool:
+    if key not in inputs:
+        return False
+    value = inputs.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().strip('.').upper()
+        if normalized in {'T', 'TRUE', 'YES'}:
+            return True
+        if normalized in {'F', 'FALSE', 'NO'}:
+            return False
+    raise ValueError(f'源 job.yaml inputs.{key} 必须是布尔值')
+
+
+def _source_manifest_inputs(src_dir) -> Mapping:
+    source_root = Path(src_dir).resolve()
+    path = source_root / 'job.yaml'
+    try:
+        before = path.lstat()
+    except OSError:
+        return {}
+    if (not stat.S_ISREG(before.st_mode)
+            or int(getattr(before, 'st_file_attributes', 0))
+            & _WINDOWS_REPARSE_POINT
+            or path.resolve().parent != source_root):
+        raise ValueError('源 job.yaml 必须是源目录内的 no-follow 普通文件')
+    if before.st_size < 0 or before.st_size > _MAX_SOURCE_MANIFEST_BYTES:
+        raise ValueError('源 job.yaml 超过有界读取上限')
+    text = path.read_text(encoding='utf-8', errors='replace')
+    after = path.stat()
+    if (before.st_size, before.st_mtime_ns, getattr(before, 'st_ino', None)) != (
+            after.st_size, after.st_mtime_ns, getattr(after, 'st_ino', None)):
+        raise ValueError('源 job.yaml 在有界读取期间发生变化')
+    try:
+        manifest = yaml.safe_load(text) or {}
+    except yaml.YAMLError as exc:
+        raise ValueError('源 job.yaml 不是可读的安全 YAML mapping') from exc
+    if not isinstance(manifest, Mapping):
+        raise ValueError('源 job.yaml 必须是 mapping')
+    inputs = manifest.get('inputs', {})
+    if inputs is None:
+        inputs = {}
+    if not isinstance(inputs, Mapping):
+        raise ValueError('源 job.yaml inputs 必须是 mapping')
+    return inputs
+
+
+def _positive_integer(value):
+    try:
+        if isinstance(value, bool):
+            return None
+        number = int(float(value))
+        return number if number == float(value) and number > 0 else None
+    except (OverflowError, TypeError, ValueError):
+        return None
+
+
+def _copy_managed_dependencies(
+        src_dir, out_dir, incar_text, *, allow_iconst=True) -> dict:
+    """复制最终 INCAR 实际启用的受管附加输入，缺失时明确失败。"""
+    incar = {str(key).upper(): value for key, value in parse_incar(incar_text).items()}
+    source_inputs = _source_manifest_inputs(src_dir)
+    uses_iconst = _manifest_flag(source_inputs, 'uses_iconst')
+    uses_kpoints_opt = _manifest_flag(source_inputs, 'uses_kpoints_opt')
+    copied = []
+    if _truthy(incar.get('LUSE_VDW')):
+        vdw_name = next((name for name in ('vdw_kernel.bindat', 'vdw_kernel')
+                         if (Path(src_dir) / name).is_file()), None)
+        if vdw_name is None:
+            raise ValueError('最终 INCAR 启用 LUSE_VDW,但源目录缺 vdw_kernel.bindat/vdw_kernel')
+        _copy_if(src_dir, out_dir, vdw_name)
+        copied.append(vdw_name)
+    needs_iconst = uses_iconst or any(
+        key in incar for key in ('SHAKEMAXITER', 'SHAKETOL'))
+    if needs_iconst and not allow_iconst:
+        raise ValueError('层厚扫描会改变原子集，不支持继承 ICONST 约束')
+    if needs_iconst:
+        if not _copy_if(src_dir, out_dir, 'ICONST'):
+            raise ValueError('最终 INCAR/源作业声明启用约束,但源目录缺 ICONST')
+        copied.append('ICONST')
+    ml_mode = str(incar.get('ML_MODE') or '').strip().lower()
+    ml_start = _positive_integer(incar.get('ML_ISTART'))
+    if ml_start is not None or ml_mode in {'run', 'select', 'refit'}:
+        if not _copy_if(src_dir, out_dir, 'ML_FF'):
+            raise ValueError('最终 INCAR 启用 VASP ML 模式,但源目录缺 ML_FF')
+        copied.append('ML_FF')
+
+    if uses_kpoints_opt:
+        if not _copy_if(src_dir, out_dir, 'KPOINTS_OPT'):
+            raise ValueError('源作业声明 uses_kpoints_opt,但源目录缺 KPOINTS_OPT')
+        copied.append('KPOINTS_OPT')
+    return {
+        'copied': copied,
+        'uses_iconst': uses_iconst,
+        'uses_kpoints_opt': uses_kpoints_opt,
+    }
+
+
 def _save_conv_manifest(out_dir, src_dir, poscar_text, series, series_value,
-                        series_label, changes, warnings):
+                        series_label, changes, warnings, dependency_inputs=None):
     """写 job.yaml:task_type='conv_scan',记 parent_job / 系列名·值·标签 / changes 溯源。"""
     syms, counts = parse_poscar_species(poscar_text)
     system = poscar_text.splitlines()[0].strip() if poscar_text.strip() else Path(out_dir).name
@@ -215,6 +333,10 @@ def _save_conv_manifest(out_dir, src_dir, poscar_text, series, series_value,
         'natoms': int(sum(counts)) if counts else None,
         'incar_changes': changes, 'elements': list(syms),
     }
+    if (dependency_inputs or {}).get('uses_kpoints_opt'):
+        inputs['uses_kpoints_opt'] = True
+    if (dependency_inputs or {}).get('uses_iconst'):
+        inputs['uses_iconst'] = True
     from vcstudio.generate.method_recipe import builder_recipe
     inputs['method_recipe'] = builder_recipe(
         builder='vcstudio.generate.conv_scan/v1', task_type='conv_scan',
@@ -222,14 +344,18 @@ def _save_conv_manifest(out_dir, src_dir, poscar_text, series, series_value,
         completions={'incar_changes': changes},
         kpoints_source=('generated-series' if series == 'kmesh' else 'parent-copy'),
         extra={'series': series, 'series_value': series_value,
-               'series_label': series_label})
+               'series_label': series_label,
+               'uses_iconst': bool((dependency_inputs or {}).get('uses_iconst'))})
     m = manifest_mod.new_manifest(
         job_id=f'{Path(out_dir).name}-conv', system=system, task_type='conv_scan',
         calc_type='slab', inputs=inputs, warnings=warnings)
     m['parent_job'] = parent
     from vcstudio.shared.scientific_inputs import record_input_closure
-    record_input_closure(out_dir, m)
+    closure = record_input_closure(out_dir, m)
     manifest_mod.save_manifest(out_dir, m)
+    if closure.get('status') != 'complete':
+        missing = ', '.join(str(item) for item in closure.get('missing') or [])
+        raise ValueError(f'收敛扫描科学输入闭包不完整:{missing or "unknown"}')
     return m
 
 
@@ -270,8 +396,10 @@ def build_encut_series(src_dir, out_root, values=DEFAULT_ENCUT_VALUES) -> dict:
             warnings.append('源目录缺 KPOINTS,未复制;收敛系列须各作业同一 k 网格,请补齐。')
         if not _copy_if(src_dir, out_dir, 'POTCAR'):
             warnings.append('源目录缺 POTCAR,未复制;提交前须补齐同一套赝势。')
+        dependency_inputs = _copy_managed_dependencies(
+            src_dir, out_dir, new_incar)
         _save_conv_manifest(out_dir, src_dir, poscar_text, 'encut', v, f'{v} eV',
-                            changes, warnings)
+                            changes, warnings, dependency_inputs)
         dirs[v] = out_dir
         series.append({'value': v, 'label': f'{v} eV', 'dir': out_dir})
         results[v] = {'dir': out_dir, 'changes': changes, 'warnings': warnings}
@@ -306,10 +434,12 @@ def build_kmesh_series(src_dir, out_root, meshes) -> dict:
             f.write(kpoints_str([kx, ky, kz]))
         if not _copy_if(src_dir, out_dir, 'POTCAR'):
             warnings.append('源目录缺 POTCAR,未复制;提交前须补齐同一套赝势。')
+        dependency_inputs = _copy_managed_dependencies(
+            src_dir, out_dir, new_incar)
         changes = list(incar_changes)
         changes.append(f'KPOINTS: → {label}(Gamma-centered;k 网格收敛扫描目标)')
         _save_conv_manifest(out_dir, src_dir, poscar_text, 'kmesh', nk, label,
-                            changes, warnings)
+                            changes, warnings, dependency_inputs)
         dirs[nk] = out_dir
         series.append({'value': nk, 'label': label, 'dir': out_dir, 'mesh': [kx, ky, kz]})
         results[nk] = {'dir': out_dir, 'changes': changes, 'warnings': warnings}
@@ -347,12 +477,14 @@ def build_vacuum_series(src_dir, out_root, vacuums) -> dict:
             warnings.append('源目录缺 KPOINTS,未复制;收敛系列须各作业同一 k 网格,请补齐。')
         if not _copy_if(src_dir, out_dir, 'POTCAR'):
             warnings.append('源目录缺 POTCAR,未复制;提交前须补齐同一套赝势。')
+        dependency_inputs = _copy_managed_dependencies(
+            src_dir, out_dir, new_incar)
         old_txt = f'{old_vac:.2f}' if old_vac is not None else '?'
         changes = list(incar_changes)
         changes.append(
             f'POSCAR c 真空层: {old_txt} → {vac:g} Å(真空收敛扫描目标;slab 沿 z 居中)')
         _save_conv_manifest(out_dir, src_dir, new_poscar, 'vacuum', vac, f'{vac:g} Å',
-                            changes, warnings)
+                            changes, warnings, dependency_inputs)
         dirs[vac] = out_dir
         series.append({'value': vac, 'label': f'{vac:g} Å', 'dir': out_dir})
         results[vac] = {'dir': out_dir, 'changes': changes, 'warnings': warnings}
@@ -397,10 +529,12 @@ def build_slab_thickness_series(src_dir, out_root, layers, *, slab_builder_fn=No
             warnings.append('源目录缺 KPOINTS,未复制;层厚系列面内 k 网格须一致,请补齐。')
         if not _copy_if(src_dir, out_dir, 'POTCAR'):
             warnings.append('源目录缺 POTCAR,未复制;提交前须补齐同一套赝势。')
+        dependency_inputs = _copy_managed_dependencies(
+            src_dir, out_dir, new_incar, allow_iconst=False)
         changes = list(incar_changes)
         changes.append(f'POSCAR: 重建为 {n} 层 slab(层厚收敛扫描目标)')
         _save_conv_manifest(out_dir, src_dir, poscar_text, 'slab_thickness', n,
-                            f'{n} 层', changes, warnings)
+                            f'{n} 层', changes, warnings, dependency_inputs)
         dirs[n] = out_dir
         series.append({'value': n, 'label': f'{n} 层', 'dir': out_dir})
         results[n] = {'dir': out_dir, 'changes': changes, 'warnings': warnings}

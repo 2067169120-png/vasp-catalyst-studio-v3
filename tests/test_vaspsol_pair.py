@@ -55,8 +55,10 @@ def test_build_pair_creates_two_bound_standard_jobs(tmp_path):
     assert vac['state'] == sol['state'] == 'CREATED'
     assert vac['vaspsol']['pair_id'] == sol['vaspsol']['pair_id'] == result['pair_id']
     assert vac['vaspsol']['role'] == 'vacuum' and sol['vaspsol']['role'] == 'solvent'
-    assert 'LSOL = .FALSE.' in (Path(result['vacuum_dir']) / 'INCAR').read_text()
-    solvent_incar = (Path(result['solvent_dir']) / 'INCAR').read_text()
+    assert 'LSOL = .FALSE.' in (Path(result['vacuum_dir']) / 'INCAR').read_text(
+        encoding='utf-8')
+    solvent_incar = (Path(result['solvent_dir']) / 'INCAR').read_text(
+        encoding='utf-8')
     assert 'LSOL = .TRUE.' in solvent_incar and 'EB_K = 37.5' in solvent_incar
 
 

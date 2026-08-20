@@ -29,6 +29,9 @@ def test_catalog_unifies_analysis_and_task_capabilities_without_builder_locators
     assert [item["id"] for item in catalog["analyses"]] == [
         "adsorption-energy",
         "free-energy-path",
+        "neb-path",
+        "convergence-scan",
+        "aimd-diagnostics",
         "task-results",
         "electronic-structure",
         "charge-wavefunction",
@@ -62,6 +65,10 @@ def test_catalog_and_analysis_records_are_detached():
 
     assert "forged" not in analysis_catalog()["analyses"][0]["outputs"]
     assert "forged" not in get_analysis("adsorption-energy")["sort_keys"]
+
+
+def test_convergence_registry_includes_the_production_series_task_type():
+    assert "conv_scan" in get_analysis("convergence-scan")["task_keys"]
 
 
 def test_catalog_only_advertises_sorting_for_the_implemented_adsorption_view():
@@ -152,6 +159,9 @@ def test_semantic_hash_changes_with_scientifically_visible_options():
 
 @pytest.mark.parametrize("analysis_id", [
     "free-energy-path",
+    "neb-path",
+    "convergence-scan",
+    "aimd-diagnostics",
     "task-results",
     "electronic-structure",
     "charge-wavefunction",
