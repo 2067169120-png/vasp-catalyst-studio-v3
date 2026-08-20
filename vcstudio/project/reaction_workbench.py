@@ -60,6 +60,9 @@ SCIENTIFIC_STATUSES = (
     "unknown", "unavailable", "blocked", "candidate", "machine_pass",
     "human_review", "verified", "release",
 )
+KINETIC_DISQUALIFYING_STATUSES = frozenset({
+    "unknown", "unavailable", "blocked",
+})
 THERMOCHEMISTRY_MODELS = frozenset({
     "electronic_energy", "ideal_gas", "rigid_rotor", "harmonic",
     "hindered_translator", "hindered_rotor", "quasi_harmonic", "explicit",
@@ -455,6 +458,10 @@ def _status(value: Any) -> str:
     return text if text in SCIENTIFIC_STATUSES else "unknown"
 
 
+def _kinetic_binding_status_eligible(value: Any) -> bool:
+    return _status(value) not in KINETIC_DISQUALIFYING_STATUSES
+
+
 def _combined_status(values: Sequence[str]) -> str:
     """Return the weakest declared status; never infer a higher status."""
     statuses = [_status(item) for item in values]
@@ -775,16 +782,18 @@ def _frequency_qualification(
         original_frequencies = []
     else:
         raise ReactionWorkbenchError("frequency_evidence.sign_convention is unsupported")
-    threshold = _finite(
-        data.get("noise_threshold_cm1"), field="frequency_evidence.noise_threshold_cm1")
-    if (threshold <= 0
-            or threshold > FREQUENCY_NOISE_SCIENTIFIC_MAXIMUM_CM1
-            or not math.isclose(
-                threshold, FREQUENCY_NOISE_THRESHOLD_CM1,
-                rel_tol=0.0, abs_tol=1e-12)):
+    raw_threshold = data.get("noise_threshold_cm1")
+    if isinstance(raw_threshold, bool) or not isinstance(raw_threshold, (int, float)):
+        raise ReactionWorkbenchError(
+            "frequency_evidence.noise_threshold_cm1 must be a canonical JSON number")
+    declared_threshold = _finite(
+        raw_threshold, field="frequency_evidence.noise_threshold_cm1")
+    if declared_threshold != FREQUENCY_NOISE_THRESHOLD_CM1:
         raise ReactionWorkbenchError(
             "frequency_evidence.noise_threshold_cm1 must equal the server-fixed "
             f"{FREQUENCY_NOISE_THRESHOLD_CM1:g} cm-1 policy")
+    # Classification always uses the server constant, never caller storage.
+    threshold = FREQUENCY_NOISE_THRESHOLD_CM1
     frequency_hash = _digest(
         data.get("evidence_sha256"), field="frequency_evidence.evidence_sha256",
         optional=True)
@@ -1022,14 +1031,13 @@ def _normalise_condition_response(
         expected = expected_base.get(parameter)
         if base is None:
             missing.append(f"{parameter} response base condition is unavailable")
-        elif expected is None or not math.isclose(
-                base, float(expected), rel_tol=0.0, abs_tol=1e-12):
+        elif expected is None or base != float(expected):
             missing.append(f"{parameter} response base does not match ledger condition")
         canonical_value = (
             canonical_condition.get(parameter)
             if isinstance(canonical_condition, Mapping) else None)
-        if (base is not None and (canonical_value is None or not math.isclose(
-                base, float(canonical_value), rel_tol=0.0, abs_tol=1e-12))):
+        if (base is not None
+                and (canonical_value is None or base != float(canonical_value))):
             missing.append(
                 f"{parameter} response base does not match canonical condition set")
 
@@ -1327,6 +1335,7 @@ def _node(
         missing.append("evidence_sha256")
     if not canonical_envelope:
         missing.append("canonical_domain_envelope")
+    binding_scientific_status = _status(binding.get("scientific_status"))
     return {
         "node_id": object_id, "object_id": object_id,
         "entity_type": entity_type, "label": label,
@@ -1342,6 +1351,9 @@ def _node(
             binding.get("origin"), field=f"bindings.{object_id}.origin", optional=True),
         "scientific_status": _source_status(
             payload, binding, field=object_id),
+        "binding_scientific_status": binding_scientific_status,
+        "kinetic_binding_status_eligible": _kinetic_binding_status_eligible(
+            binding_scientific_status),
         "observed_origin_chain": _source_origins_observed(
             payload, binding, field=object_id),
         "artifact_status": "available" if not missing else "missing",
@@ -1806,13 +1818,57 @@ def _normalise_edge_evidence(
         "neb_missing": list(dict.fromkeys(neb_missing)),
         "missing": list(dict.fromkeys([*edge_missing, *neb_missing])),
     }
-    normalized["compatibility_sha256"] = semantic_sha256({
-        key: normalized[key] for key in (
+    normalized["compatibility_sha256"] = _edge_evidence_compatibility_sha256(
+        normalized)
+    return normalized
+
+
+def _edge_evidence_compatibility_sha256(value: Mapping[str, Any]) -> str:
+    return semantic_sha256({
+        key: value.get(key) for key in (
             "method_sha256", "reference_state_sha256", "evidence_sha256",
             "reactant_structure_sha256", "product_structure_sha256",
             "transition_state_structure_sha256", "neb",
         )})
-    return normalized
+
+
+def _withhold_observed_barriers_for_ledger_reference(
+    value: Mapping[str, Any], *, participant_reference_compatible: bool,
+    transition_state_reference_compatible: bool,
+) -> dict[str, Any]:
+    public = copy.deepcopy(dict(value))
+    neb = public.get("neb")
+    if isinstance(neb, Mapping):
+        neb = copy.deepcopy(dict(neb))
+        for key in (
+            "observed_forward_delta_e_barrier",
+            "observed_reverse_delta_e_barrier",
+        ):
+            observation = neb.get(key)
+            if isinstance(observation, Mapping):
+                observation = copy.deepcopy(dict(observation))
+                observation.update({
+                    "status": "unavailable", "value_eV": None,
+                    "display": "unavailable",
+                })
+                neb[key] = observation
+        public["neb"] = neb
+    edge_missing = list(public.get("edge_missing") or [])
+    neb_missing = list(public.get("neb_missing") or [])
+    if not participant_reference_compatible:
+        edge_missing.append("participant_ledger_reference_state_binding")
+        public["edge_compatibility_status"] = "unavailable"
+    if not transition_state_reference_compatible:
+        neb_missing.append("transition_state_ledger_reference_state_binding")
+    public["neb_compatibility_status"] = "unavailable"
+    public["status"] = "unavailable"
+    public["observed_values_available"] = False
+    public["ledger_reference_compatibility_status"] = "unavailable"
+    public["edge_missing"] = list(dict.fromkeys(edge_missing))
+    public["neb_missing"] = list(dict.fromkeys(neb_missing))
+    public["missing"] = list(dict.fromkeys([*edge_missing, *neb_missing]))
+    public["compatibility_sha256"] = _edge_evidence_compatibility_sha256(public)
+    return public
 
 
 def _compatibility_signature(row: Mapping[str, Any]) -> tuple[Any, ...] | None:
@@ -1877,9 +1933,11 @@ def _edge_thermochemistry(
         thermodynamic_missing.extend(
             edge_evidence.get("edge_missing") or ["edge_evidence_compatibility"])
     edge_reference = edge_evidence.get("reference_state_sha256")
+    participant_reference_compatible = len(available_rows) == len(participants)
     for row in available_rows:
         if (row.get("compatibility") or {}).get(
                 "reference_state_sha256") != edge_reference:
+            participant_reference_compatible = False
             thermodynamic_missing.append(
                 f"edge_reference_state_binding:{row.get('entity_id')}")
     if edge.get("observed_origin_chain") is not True:
@@ -1923,6 +1981,7 @@ def _edge_thermochemistry(
     ts_qualification = "unavailable" if ts is None else str(
         (ts.get("frequency_qualification") or {}).get(
             "kinetic_qualification") or "unavailable")
+    transition_state_reference_compatible = False
     if ts is None:
         kinetic_missing.extend([
             "transition_state_binding", "transition_state_frequency_mode_evidence"])
@@ -1935,8 +1994,10 @@ def _edge_thermochemistry(
             kinetic_missing.append("observed_transition_state_provenance")
         if ts_signature is None or ts_signature != participant_signature:
             kinetic_missing.append("transition_state_compatibility")
-        if (ts.get("compatibility") or {}).get(
-                "reference_state_sha256") != edge_reference:
+        transition_state_reference_compatible = (
+            (ts.get("compatibility") or {}).get(
+                "reference_state_sha256") == edge_reference)
+        if not transition_state_reference_compatible:
             kinetic_missing.append("transition_state_reference_state_binding")
         if ts_qualification != "frequency_mode_supported":
             kinetic_missing.append("transition_state_frequency_mode_evidence")
@@ -1953,10 +2014,22 @@ def _edge_thermochemistry(
             barrier = float(ts["final_delta_g_eV"]) - reactant_g
             reverse_barrier = float(ts["final_delta_g_eV"]) - product_g
     neb = edge_evidence.get("neb") or {}
-    observed_forward = (neb.get("observed_forward_delta_e_barrier") or {}).get(
-        "value_eV")
-    observed_reverse = (neb.get("observed_reverse_delta_e_barrier") or {}).get(
-        "value_eV")
+    observed_reference_compatible = bool(
+        participant_reference_compatible and transition_state_reference_compatible)
+    observed_barrier_available = bool(
+        edge_evidence.get("observed_values_available") is True
+        and observed_reference_compatible)
+    observed_forward = (
+        (neb.get("observed_forward_delta_e_barrier") or {}).get("value_eV")
+        if observed_barrier_available else None)
+    observed_reverse = (
+        (neb.get("observed_reverse_delta_e_barrier") or {}).get("value_eV")
+        if observed_barrier_available else None)
+    observed_barrier_missing = []
+    if not observed_reference_compatible:
+        observed_barrier_missing.append("observed_barrier_reference_state_binding")
+    if edge_evidence.get("observed_values_available") is not True:
+        observed_barrier_missing.append("observed_barrier_edge_neb_compatibility")
     thermodynamic_status = "available" if reaction_delta is not None else "unavailable"
     kinetic_status = "available" if barrier is not None else "unavailable"
     return {
@@ -1972,6 +2045,13 @@ def _edge_thermochemistry(
         "observed_reverse_activation_delta_e_eV": observed_reverse,
         "observed_reverse_activation_delta_e_display": _display(
             observed_reverse, precision),
+        "observed_barrier_status": (
+            "available" if observed_barrier_available else "unavailable"),
+        "observed_barrier_missing": observed_barrier_missing,
+        "participant_reference_compatibility_status": (
+            "available" if participant_reference_compatible else "unavailable"),
+        "transition_state_reference_compatibility_status": (
+            "available" if transition_state_reference_compatible else "unavailable"),
         "thermal_activation_delta_g_eV": barrier,
         "thermal_activation_delta_g_display": _display(barrier, precision),
         "activation_delta_g_eV": barrier,
@@ -2165,7 +2245,7 @@ def _derived_revision(
             dependency_observed.append(limits.get("origin") == "observed")
             if limits.get("evidence_sha256"):
                 response_hashes.append(str(limits["evidence_sha256"]))
-            if abs(target - base) <= 1e-15:
+            if target == base:
                 continue
             changed.append((parameter, base, target))
         if len(changed) > 1:
@@ -2453,6 +2533,8 @@ def _frozen_network(
         "conditions": copy.deepcopy(revision.get("conditions") or {}),
         "edges": edges,
         "canonical_envelope_authority": graph.get("canonical_envelope_authority") is True,
+        "binding_status_gate": copy.deepcopy(
+            graph.get("binding_status_gate") or {}),
         "scientific_status": graph.get("scientific_status", "unknown"),
         "readiness": "ready" if ready else "blocked",
         "microkinetics_ready": ready,
@@ -2825,6 +2907,10 @@ def build_reaction_workbench_view(
                 edge_evidence["scientific_status"],
                 condition_source_status,
             ]),
+            "binding_scientific_status": _status(
+                binding.get("scientific_status")),
+            "kinetic_binding_status_eligible": _kinetic_binding_status_eligible(
+                binding.get("scientific_status")),
             "artifact_status": "available" if not missing else "missing",
             "missing": list(dict.fromkeys(missing)),
             "display": {
@@ -2868,6 +2954,19 @@ def build_reaction_workbench_view(
             condition_record=(condition_sets.get(edge.get("condition_set_id"))
                               if edge.get("condition_set_id") else None),
             precision=precision)
+        if (edge["thermochemistry"].get(
+                "participant_reference_compatibility_status") != "available"
+                or edge["thermochemistry"].get(
+                    "transition_state_reference_compatibility_status") != "available"):
+            edge["edge_evidence"] = _withhold_observed_barriers_for_ledger_reference(
+                edge.get("edge_evidence") or {},
+                participant_reference_compatible=edge["thermochemistry"].get(
+                    "participant_reference_compatibility_status") == "available",
+                transition_state_reference_compatible=edge["thermochemistry"].get(
+                    "transition_state_reference_compatibility_status") == "available")
+        else:
+            edge["edge_evidence"][
+                "ledger_reference_compatibility_status"] = "available"
         if edge["thermochemistry"]["status"] != "available":
             edge["artifact_status"] = "missing"
         edge["missing"] = list(dict.fromkeys([
@@ -2892,6 +2991,33 @@ def build_reaction_workbench_view(
                 condition_sets[condition_id][0],
                 _binding_for(bindings, condition_id), field=condition_id)
             for condition_id in network_condition_ids))
+    binding_status_entries = [{
+        "object_id": network_id, "entity_type": "reaction_network",
+        "scientific_status": _status(
+            _binding_for(bindings, network_id).get("scientific_status")),
+    }, *[{
+        "object_id": node["node_id"], "entity_type": node["entity_type"],
+        "scientific_status": node["binding_scientific_status"],
+    } for node in nodes], *[{
+        "object_id": edge["edge_id"], "entity_type": "elementary_step",
+        "scientific_status": edge["binding_scientific_status"],
+    } for edge in edges], *[{
+        "object_id": condition_id, "entity_type": "condition_set",
+        "scientific_status": _status(
+            _binding_for(bindings, condition_id).get("scientific_status")),
+    } for condition_id in network_condition_ids]]
+    for entry in binding_status_entries:
+        entry["kinetic_eligible"] = _kinetic_binding_status_eligible(
+            entry["scientific_status"])
+    binding_status_blockers = [
+        f"{item['entity_type']}:{item['object_id']}:{item['scientific_status']}"
+        for item in binding_status_entries if not item["kinetic_eligible"]]
+    binding_status_gate = {
+        "status": "available" if not binding_status_blockers else "blocked",
+        "eligible": not binding_status_blockers,
+        "entries": binding_status_entries,
+        "blocking": binding_status_blockers,
+    }
 
     graph_body = {
         "schema": GRAPH_SCHEMA, "network_id": network_id,
@@ -2899,6 +3025,7 @@ def build_reaction_workbench_view(
         "source_projection_sha256": projection_hash,
         "canonical_envelope_authority": canonical_envelope_authority,
         "observed_origin_chain": projection_observed_origin_chain,
+        "binding_status_gate": binding_status_gate,
         "nodes": nodes, "edges": edges,
         "condition_set_ids": network_condition_ids,
         "missing_nodes": missing_nodes, "missing_edges": missing_edges,
@@ -2923,10 +3050,12 @@ def build_reaction_workbench_view(
                 "thermodynamic_status") == "available" for edge in edges)),
         "kinetic_ready": bool(
             edges and projection_observed_origin_chain
+            and binding_status_gate["eligible"]
             and all((edge.get("thermochemistry") or {}).get(
                 "kinetic_status") == "available" for edge in edges)),
         "microkinetics_ready": bool(
             edges and canonical_envelope_authority and projection_observed_origin_chain
+            and binding_status_gate["eligible"]
             and not missing_nodes and not missing_edges
             and all((edge.get("thermochemistry") or {}).get("status") == "available"
                     for edge in edges)),

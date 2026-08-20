@@ -68,6 +68,11 @@ Contains opaque nodes and elementary-step edges with:
 thermodynamically and kinetically ready. Rendering never changes
 `scientific_status`.
 
+Microkinetics readiness also has an explicit binding-status gate. A declared
+`unknown`, `unavailable`, or `blocked` status on any bound state/TS, elementary
+step, condition set, or reaction network denies `kinetic_ready` and
+`microkinetics_ready`, even when hashes and origins are otherwise complete.
+
 ### `vcstudio.thermochemistry-ledger/v1`
 
 Each entity row shows, independently:
@@ -86,6 +91,11 @@ Each entity row shows, independently:
 - TS frequency/mode qualification under a server-fixed, hash-bound 50 cm-1
   noise policy (100 cm-1 scientific ceiling); input data cannot select a
   threshold that makes its own spectrum pass.
+
+The declared threshold must be the exact canonical JSON number `50`; all
+classification uses the server constant `50.0`, never the caller-provided
+storage value. In particular, the `-50 cm-1` boundary cannot be flipped by an
+approximately equal threshold.
 
 No missing term is replaced by zero. Every participating term requires an
 explicit role-compatible model, `eV` unit, provenance, and evidence hash.
@@ -121,6 +131,10 @@ readiness. Response base conditions must exactly match both the ledger and its
 canonical condition-set digest, and both base and target must fall inside the
 evidence-bound applicability range.
 
+Condition-set, ledger, and response-base values are normalized to the same
+canonical numeric representation and compared exactly. No absolute tolerance
+is used, so `1e-12 Pa` and `2e-12 Pa` remain scientifically distinct.
+
 The revision includes derived node and edge values. It always declares
 `source_evidence_mutated=false`. Missing applicability, missing response
 evidence, unsupported interactions, or out-of-range values are unavailable.
@@ -149,6 +163,8 @@ Observed NEB barrier values are public only when edge/NEB method, reference,
 endpoint/TS structure, evidence hashes, and the observed provenance chain are
 all compatible. Otherwise graph, derived revision, report, and frozen-network
 DTOs expose `null`/`unavailable`, while retaining non-numeric missing reasons.
+Edge and NEB reference hashes must additionally equal every participant and TS
+ledger reference; agreeing only with each other is insufficient.
 
 ### `vcstudio.reaction-report-binding/v1`
 

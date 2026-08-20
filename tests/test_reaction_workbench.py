@@ -731,6 +731,34 @@ def test_frequency_noise_threshold_is_server_fixed_not_data_selected(
         "policy_sha256"]
 
 
+def test_frequency_boundary_always_uses_exact_server_threshold_constant():
+    source = projection()
+    evidence = source["bindings"]["state-r"]["thermochemistry"][
+        "frequency_evidence"]
+    evidence["imaginary_frequencies_cm1"] = [-50.0]
+    evidence["noise_threshold_cm1"] = 50.0 + 5e-13
+    with pytest.raises(rw.ReactionWorkbenchError, match="server-fixed 50"):
+        rw.build_reaction_workbench_view(source, project_id="project-1")
+
+    source = projection()
+    evidence = source["bindings"]["state-r"]["thermochemistry"][
+        "frequency_evidence"]
+    evidence["imaginary_frequencies_cm1"] = [-50.0]
+    evidence["noise_threshold_cm1"] = 50.0
+    view = rw.build_reaction_workbench_view(source, project_id="project-1")
+    row = next(item for item in view["ledger"]["rows"]
+               if item["entity_id"] == "state-r")
+    assert row["frequency_qualification"]["noise_threshold_cm1"] == 50.0
+    assert row["frequency_qualification"]["minimum_qualification"] == "unavailable"
+    assert "minimum_has_significant_imaginary_mode" in row["missing"]
+
+    source = projection()
+    source["bindings"]["state-r"]["thermochemistry"]["frequency_evidence"][
+        "noise_threshold_cm1"] = "50.0"
+    with pytest.raises(rw.ReactionWorkbenchError, match="canonical JSON number"):
+        rw.build_reaction_workbench_view(source, project_id="project-1")
+
+
 @pytest.mark.parametrize("mutation", [
     "edge_method", "edge_endpoint", "edge_evidence", "neb_method",
     "neb_reference", "neb_ts", "neb_observation_evidence", "neb_origin",
@@ -801,6 +829,32 @@ def test_condition_response_base_must_match_ledger_and_canonical_condition_set()
     assert derived["status"] == "unavailable"
     assert derived["derived_delta_g_eV"] is None
     assert view["condition_revision"]["edges"][0]["reaction_delta_g_eV"] is None
+
+
+def test_low_pressure_condition_base_comparison_is_exact_after_normalization():
+    source = projection()
+    condition = source["conditions"][0]
+    condition["payload"]["pressure_pa"] = 1e-12
+    _rehash(condition)
+    for object_id in ("state-r", "state-ts", "state-p"):
+        thermo = source["bindings"][object_id]["thermochemistry"]
+        thermo["pressure_pa"] = 1e-12
+        thermo["condition_set_sha256"] = condition["semantic_sha256"]
+        thermo["condition_response"]["base_conditions"]["pressure_pa"] = 1e-12
+    source["bindings"]["state-r"]["thermochemistry"]["condition_response"][
+        "base_conditions"]["pressure_pa"] = 2e-12
+
+    view = rw.build_reaction_workbench_view(source, project_id="project-1")
+    row = next(item for item in view["ledger"]["rows"]
+               if item["entity_id"] == "state-r")
+    response = row["condition_response"]
+    assert response["base_binding_status"] == "unavailable"
+    assert any("pressure_pa response base does not match ledger" in item
+               for item in response["missing"])
+    assert any("pressure_pa response base does not match canonical" in item
+               for item in response["missing"])
+    assert view["graph"]["microkinetics_ready"] is False
+    assert view["frozen_network"]["readiness"] == "blocked"
 
 
 def test_condition_response_base_must_be_inside_evidence_applicability():
@@ -917,6 +971,57 @@ def test_low_frequency_policy_compatibility_ignores_entity_treatment_hashes():
         "cutoff_cm1"] = 60.0
     blocked = rw.build_reaction_workbench_view(source, project_id="project-1")
     assert blocked["graph"]["thermodynamic_ready"] is False
+
+
+@pytest.mark.parametrize("object_id", [
+    "state-r", "state-ts", "step-1", "condition-1", "network-1",
+])
+@pytest.mark.parametrize("scientific_status", [
+    "blocked", "unavailable", "unknown",
+])
+def test_disqualifying_binding_status_blocks_microkinetics_and_frozen_readiness(
+    object_id, scientific_status,
+):
+    source = projection()
+    source["bindings"][object_id]["scientific_status"] = scientific_status
+    view = rw.build_reaction_workbench_view(source, project_id="project-1")
+    gate = view["graph"]["binding_status_gate"]
+    assert gate["status"] == "blocked"
+    assert gate["eligible"] is False
+    assert any(object_id in item and scientific_status in item
+               for item in gate["blocking"])
+    assert view["graph"]["kinetic_ready"] is False
+    assert view["graph"]["microkinetics_ready"] is False
+    assert view["frozen_network"]["binding_status_gate"] == gate
+    assert view["frozen_network"]["readiness"] == "blocked"
+
+
+@pytest.mark.parametrize("entity_id", ["state-p", "state-ts"])
+def test_ledger_reference_mismatch_withholds_observed_barrier_from_all_outputs(
+    entity_id,
+):
+    source = projection()
+    source["bindings"][entity_id]["thermochemistry"][
+        "reference_state_sha256"] = "f" * 64
+    view = rw.build_reaction_workbench_view(source, project_id="project-1")
+    edge = view["graph"]["edges"][0]
+    thermo = edge["thermochemistry"]
+    assert thermo["observed_barrier_status"] == "unavailable"
+    assert thermo["observed_activation_delta_e_eV"] is None
+    assert thermo["observed_activation_delta_e_display"] == "unavailable"
+    assert "observed_barrier_reference_state_binding" in thermo[
+        "observed_barrier_missing"]
+    assert edge["edge_evidence"]["observed_values_available"] is False
+    assert edge["edge_evidence"]["neb"]["observed_forward_delta_e_barrier"][
+        "value_eV"] is None
+    assert edge["edge_evidence"]["neb"]["observed_reverse_delta_e_barrier"][
+        "value_eV"] is None
+    assert view["condition_revision"]["edges"][0][
+        "observed_activation_delta_e_eV"] is None
+    assert view["report_binding"]["tables"][0]["rows"][0][5] == "unavailable"
+    assert view["frozen_network"]["edges"][0][
+        "observed_activation_delta_e_eV"] is None
+    assert view["frozen_network"]["readiness"] == "blocked"
 
 
 @pytest.mark.parametrize(("target", "origin", "ceiling"), [
