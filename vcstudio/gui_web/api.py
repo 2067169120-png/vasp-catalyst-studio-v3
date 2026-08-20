@@ -7431,9 +7431,149 @@ class Api:
             self._research_view_store = ResearchViewStore()
         return self._research_view_store
 
+    def _research_registry_snapshot(self):
+        """Load the research authority without expanding or opening members."""
+        from vcstudio.project.research_explorer import (
+            MAX_PROJECT_BYTES,
+            MAX_REGISTRY_BYTES,
+            MAX_REGISTRY_RECORDS,
+            _bounded_payload_size,
+            authority_budget_failures,
+        )
+
+        locators = list(self._adsorption.list_projects())
+        if len(locators) > MAX_REGISTRY_RECORDS:
+            return {
+                'registered_total': len(locators), 'records': [],
+                'duplicate_ids': set(),
+                'failures': [{
+                    'project_ref': 'registry',
+                    'code': 'registry_limit_exceeded',
+                    'message': 'Research registry exceeds its hard resource budget.',
+                }],
+            }
+        records = []
+        failures = []
+        registry_bytes = 2
+        for index, raw_locator in enumerate(locators, start=1):
+            try:
+                path = self._canonical_project_path(raw_locator)
+                try:
+                    if os.path.isfile(path) and os.path.getsize(path) > MAX_PROJECT_BYTES:
+                        failures.append({
+                            'project_ref': f'registered-project-{index}',
+                            'code': 'project_limit_exceeded',
+                            'message': 'Registered project exceeds its byte budget.',
+                        })
+                        continue
+                except OSError:
+                    raise ValueError('registered project is unavailable') from None
+                project = self._adsorption.load_project(raw_locator)
+                if not isinstance(project, dict):
+                    raise ValueError('registered project is unreadable')
+                project_id = self._workspace_project_id(path, project)
+                record = {
+                    'project_id': project_id,
+                    'request_project_id': project_id,
+                    'path': path,
+                    'project': project,
+                    'identity_fingerprint': self._project_identity_fingerprint(
+                        path, project),
+                }
+                limit_failures = authority_budget_failures(
+                    [record], registry_total=1)
+                if limit_failures:
+                    failures.extend(limit_failures)
+                    continue
+                registry_bytes += _bounded_payload_size(
+                    record, label='registry record', maximum=MAX_REGISTRY_BYTES)
+                if registry_bytes > MAX_REGISTRY_BYTES:
+                    failures.append({
+                        'project_ref': 'registry',
+                        'code': 'registry_limit_exceeded',
+                        'message': 'Research registry exceeds its byte budget.',
+                    })
+                    break
+                records.append(record)
+            except Exception:                             # noqa: BLE001 safe registry read
+                failures.append({
+                    'project_ref': f'registered-project-{index}',
+                    'code': 'project_unreadable',
+                    'message': 'Registered project could not be read.',
+                })
+        aggregate_failures = authority_budget_failures(
+            records, registry_total=len(locators))
+        known = {
+            (str(item.get('project_ref') or ''), str(item.get('code') or ''))
+            for item in failures
+        }
+        failures.extend(
+            item for item in aggregate_failures
+            if (item['project_ref'], item['code']) not in known)
+        by_id = {}
+        for record in records:
+            by_id.setdefault(record['project_id'], []).append(record)
+        return {
+            'registered_total': len(locators), 'records': records,
+            'duplicate_ids': {
+                project_id for project_id, matches in by_id.items()
+                if len(matches) != 1
+            },
+            'failures': failures,
+        }
+
+    @staticmethod
+    def _research_source_file_version(path):
+        """Hash one current file while proving a stable file identity/read."""
+        from vcstudio.project.research_explorer import MAX_SOURCE_FILE_BYTES
+
+        def signature(stat):
+            return (
+                int(stat.st_dev), int(stat.st_ino), int(stat.st_size),
+                int(stat.st_mtime_ns),
+            )
+
+        before_path = os.stat(path)
+        if int(before_path.st_size) > MAX_SOURCE_FILE_BYTES:
+            raise ValueError('source_file_limit_exceeded')
+        digest = hashlib.sha256()
+        with open(path, 'rb') as handle:
+            before_open = os.fstat(handle.fileno())
+            if signature(before_path) != signature(before_open):
+                raise OSError('source_changed_during_hash')
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            after_open = os.fstat(handle.fileno())
+        after_path = os.stat(path)
+        if (signature(before_open) != signature(after_open)
+                or signature(after_open) != signature(after_path)):
+            raise OSError('source_changed_during_hash')
+        return {
+            'device': int(after_open.st_dev),
+            'inode': int(after_open.st_ino),
+            'size': int(after_open.st_size),
+            'mtime_ns': int(after_open.st_mtime_ns),
+            'sha256': digest.hexdigest(),
+        }
+
     def _research_source_version(self, records):
         """Fingerprint source-file versions without returning their locators."""
+        from vcstudio.project.research_explorer import (
+            MAX_SOURCE_FILES,
+            MAX_SOURCE_TOTAL_BYTES,
+            authority_budget_failures,
+        )
+
         rows = []
+        failures = []
+        if authority_budget_failures(records, registry_total=len(records)):
+            return rows, [{
+                'project_ref': 'registry', 'code': 'source_budget_unavailable',
+            }]
+        total_bytes = 0
         for record in records:
             project_id = str(record.get('project_id') or '')
             project = record.get('project') or {}
@@ -7464,23 +7604,53 @@ class Api:
                     continue
                 seen.add(key)
                 member_index += 1
+                if len(rows) >= MAX_SOURCE_FILES:
+                    failures.append({
+                        'project_ref': project_id, 'code': 'source_file_limit_exceeded',
+                    })
+                    return rows, failures
                 try:
-                    stat = os.stat(path)
+                    version = self._research_source_file_version(path)
+                    total_bytes += version['size']
+                    if total_bytes > MAX_SOURCE_TOTAL_BYTES:
+                        failures.append({
+                            'project_ref': project_id,
+                            'code': 'source_byte_limit_exceeded',
+                        })
+                        return rows, failures
                     rows.append({
                         'project_id': project_id, 'source_index': member_index,
-                        'kind': kind, 'size': int(stat.st_size),
-                        'mtime_ns': int(stat.st_mtime_ns), 'available': True,
+                        'kind': kind, **version, 'available': True,
+                    })
+                except FileNotFoundError:
+                    rows.append({
+                        'project_id': project_id, 'source_index': member_index,
+                        'kind': kind, 'device': None, 'inode': None,
+                        'size': None, 'mtime_ns': None, 'sha256': None,
+                        'available': False,
                     })
                 except OSError:
                     rows.append({
                         'project_id': project_id, 'source_index': member_index,
-                        'kind': kind, 'size': None, 'mtime_ns': None,
+                        'kind': kind, 'device': None, 'inode': None,
+                        'size': None, 'mtime_ns': None, 'sha256': None,
                         'available': False,
                     })
-        return rows
+                    failures.append({
+                        'project_ref': project_id,
+                        'code': 'source_changed_or_unavailable',
+                    })
+                except ValueError:
+                    failures.append({
+                        'project_ref': project_id, 'code': 'source_file_limit_exceeded',
+                    })
+                    return rows, failures
+        return rows, failures
 
     def _research_authority(self):
-        snapshot = self._project_registry_snapshot()
+        from vcstudio.project.research_explorer import MAX_PUBLIC_FAILURES
+
+        snapshot = self._research_registry_snapshot()
         failures = copy.deepcopy(snapshot['failures'])
         failures.extend({
             'project_ref': f'ambiguous-project-{index}',
@@ -7492,7 +7662,20 @@ class Api:
             record for record in snapshot['records']
             if record['project_id'] not in snapshot['duplicate_ids']
         ]
-        return snapshot, records, failures, self._research_source_version(records)
+        source_version, source_failures = self._research_source_version(records)
+        failures.extend(source_failures)
+        bounded = []
+        seen = set()
+        for item in failures:
+            key = (str(item.get('project_ref') or 'registry'),
+                   str(item.get('code') or 'unavailable'))
+            if key in seen:
+                continue
+            seen.add(key)
+            bounded.append(item)
+            if len(bounded) >= MAX_PUBLIC_FAILURES:
+                break
+        return snapshot, records, bounded, source_version
 
     @staticmethod
     def _research_report_revision_id(project):
@@ -7724,14 +7907,21 @@ class Api:
 
     def _research_prepare(self, *, force=False):
         with self._research_index_lock:
-            snapshot, records, failures, source_version = self._research_authority()
             service = self._research_index()
-            fingerprint = service.source_fingerprint(
-                records, registry_total=snapshot['registered_total'],
-                registry_failures=failures, source_version=source_version)
-            current = service.index_status()
-            if (force or current.get('status') in {'unavailable', 'stale'}
-                    or current.get('source_fingerprint') != fingerprint):
+            last = None
+            for attempt in range(3):
+                snapshot, records, failures, source_version = self._research_authority()
+                fingerprint = service.source_fingerprint(
+                    records, registry_total=snapshot['registered_total'],
+                    registry_failures=failures, source_version=source_version)
+                last = (snapshot, failures, fingerprint)
+                current = service.index_status()
+                needs_rebuild = (
+                    force or attempt > 0
+                    or current.get('status') in {'unavailable', 'stale'}
+                    or current.get('source_fingerprint') != fingerprint)
+                if not needs_rebuild:
+                    return service
                 frozen_cache = {}
                 service.rebuild(
                     records,
@@ -7747,6 +7937,28 @@ class Api:
                     registry_failures=failures,
                     source_version=source_version,
                 )
+                # Re-read registry + every current source after the build.  A
+                # just-published snapshot is never returned through the API if
+                # an equal-size/equal-mtime replacement or any TOCTOU occurred.
+                after, after_records, after_failures, after_version = (
+                    self._research_authority())
+                after_fingerprint = service.source_fingerprint(
+                    after_records, registry_total=after['registered_total'],
+                    registry_failures=after_failures, source_version=after_version)
+                last = (after, after_failures, after_fingerprint)
+                if (fingerprint == after_fingerprint
+                        and service.index_status().get('source_fingerprint') == fingerprint):
+                    return service
+                force = True
+            snapshot, failures, fingerprint = last
+            service.fail_closed(
+                source_fingerprint=fingerprint,
+                registry_total=snapshot['registered_total'],
+                failures=[*failures, {
+                    'project_ref': 'registry',
+                    'code': 'source_changed_during_rebuild',
+                }],
+            )
             return service
 
     @classmethod
@@ -7939,30 +8151,39 @@ class Api:
             for key, (module, callable_name) in routes.items()
         }
 
-    @staticmethod
-    def _analysis_workbench_method_evidence(target):
-        """Require a complete, non-drifted method identity before parsing."""
+    def _analysis_workbench_method_evidence(self, target):
+        """Dispatch only to versioned server adapters that rebuild identity."""
         from vcstudio.project import energy_gate
 
         manifest = target.get('manifest') or {}
         inputs = manifest.get('inputs') or {}
         engine = str(inputs.get('engine') or 'vasp').strip().lower()
         if engine != 'vasp':
-            method = inputs.get('method') or inputs.get('method_fingerprint')
-            if method:
-                return {'status': 'verified', 'engine': engine,
-                        'identity': copy.deepcopy(method), 'missing': []}
-            return {'status': 'unverified', 'engine': engine,
-                    'missing': ['non-VASP manifest lacks method identity']}
+            # inputs.method and inputs.method_fingerprint are user-editable
+            # descriptions, not independently reconstructed evidence.  Until
+            # an engine-specific adapter is registered, they cannot create a
+            # verified scientific cohort.
+            return {
+                'status': 'unverified', 'engine': engine, 'schema': '',
+                'fingerprint': {}, 'adapter': None,
+                'missing': [
+                    f'no versioned server method adapter is registered for {engine}'],
+            }
         record = energy_gate.method_record(
             target['path'], manifest, str(target.get('source_id') or 'job'))
         required = ('functional', 'dispersion', 'encut', 'spin',
-                    'kpoints_scheme', 'potcar_ids')
+                    'u_values', 'u_by_element', 'kpoints_scheme', 'potcar_ids')
         missing = [key for key in required if not record['known'].get(key)]
         warnings = list(record.get('evidence_warnings') or [])
+        schema = 'vcstudio.method-fingerprint/vasp/v1'
         return {
             'status': 'verified' if not missing and not warnings else 'unverified',
-            'fingerprint': copy.deepcopy(record.get('fingerprint') or {}),
+            'engine': 'vasp', 'schema': schema,
+            'fingerprint': {
+                'schema': schema,
+                'identity': copy.deepcopy(record.get('fingerprint') or {}),
+            },
+            'adapter': 'vcstudio.energy_gate.method_record/vasp/v1',
             'missing': missing, 'warnings': warnings,
         }
 

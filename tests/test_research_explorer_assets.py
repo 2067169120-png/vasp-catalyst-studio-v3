@@ -94,10 +94,16 @@ const result = {
   method_compatibility: { enabled: true, status: 'compatible',
     selected_method_fingerprint: 'method-safe', input_rows: 3,
     compatible_rows: 2, excluded_rows: 1 },
+  energy_compatibility: { status: 'compatible',
+    selected_energy_contract_id: 'energy-single-gas-safe', numeric_rows: 2,
+    unverified_contract_rows: 0 },
   table: { sample_count: 2, visible_count: 1, next_cursor: 'opaque-cursor', rows: [{
     project_id: 'project-safe', project_name: 'Catalyst A', job_id: 'job-safe',
     source_id: 'source-safe', formula: 'Pt4S', facet: '111', adsorbate: 'Li2S8',
     task_type: 'static', state: 'DONE', method_fingerprint: 'method-safe',
+    method_fingerprint_schema: 'vcstudio.method-fingerprint/vasp/v1',
+    energy_quantity: 'adsorption_energy', energy_contract_status: 'verified',
+    energy_reference_mode: 'single', energy_contract_id: 'energy-single-gas-safe',
     evidence_level: 'verified', provenance_status: 'observed',
     display: { energy_eV: '-2.2', barrier_eV: '0.45' },
   }] },
@@ -118,6 +124,8 @@ assert.match(host.innerHTML, /Pt4S/);
 assert.match(host.innerHTML, /-2\.2/);
 assert.match(host.innerHTML, /0\.45/);
 assert.match(host.innerHTML, /method-safe/);
+assert.match(host.innerHTML, /energy-single-gas-safe/);
+assert.match(host.innerHTML, /adsorption_energy · verified/);
 assert.match(host.innerHTML, /server-finalized DTO/);
 assert.match(host.innerHTML, /width:100%/);
 assert.match(host.innerHTML, /left:50%;top:50%/);

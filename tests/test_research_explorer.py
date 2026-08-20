@@ -90,6 +90,7 @@ def _build(tmp_path, *, failures=(), max_age_seconds=300, monotonic=None):
             if str(target["path"]) in item["project"]["config_species"])
         return {
             "status": "verified", "engine": "vasp",
+            "schema": "vcstudio.method-fingerprint/vasp/v1",
             "fingerprint": {"recipe": record["method"]}, "missing": [],
         }
 

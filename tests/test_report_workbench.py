@@ -88,6 +88,9 @@ def _workbench_api(tmp_path):
                 "dd_e": 0.0,
                 "reference_valid": True,
                 "reference_state": "DONE",
+                "reference_job": reference,
+                "reference_source": "OSZICAR:E0",
+                "method_check": {"status": "verified"},
                 "method_status": "verified",
                 "note": "",
             }],
@@ -98,18 +101,25 @@ def _workbench_api(tmp_path):
         clean: {
             "job_uuid": "job-clean",
             "state": "DONE",
+            "inputs": {"engine": "vasp", "formula": "Pt4S",
+                       "source_id": "source-clean", "sha256": {"POSCAR": "a" * 64}},
             "attempts": [{"n": 1, "attempt_token": "clean-a1"}],
             "results": {"energy_e0_eV": -100.0, "fetched_sha256": {"OUTCAR": "a" * 64}},
         },
         reference: {
             "job_uuid": "job-reference",
             "state": "DONE",
+            "inputs": {"engine": "vasp", "formula": "Li2S8",
+                       "source_id": "source-reference",
+                       "sha256": {"POSCAR": "b" * 64}},
             "attempts": [{"n": 1, "attempt_token": "ref-a1"}],
             "results": {"energy_e0_eV": -10.0, "fetched_sha256": {"OUTCAR": "b" * 64}},
         },
         config: {
             "job_uuid": "job-config",
             "state": "DONE",
+            "inputs": {"engine": "vasp", "formula": "Pt4SLi2S8",
+                       "source_id": "source-config", "sha256": {"POSCAR": "c" * 64}},
             "attempts": [{"n": 1, "attempt_token": "config-a1"}],
             "results": {"energy_e0_eV": -115.0, "fetched_sha256": {"OUTCAR": "c" * 64}},
         },
@@ -271,6 +281,7 @@ def test_research_live_report_edge_requires_revalidated_frozen_analysis_binding(
     project_id = _project_id(api, project_path)
     api._analysis_workbench_method_evidence = lambda _target: {
         "status": "verified", "engine": "vasp",
+        "schema": "vcstudio.method-fingerprint/vasp/v1",
         "fingerprint": {"functional": "PBE", "dispersion": "D3"},
         "missing": [],
     }

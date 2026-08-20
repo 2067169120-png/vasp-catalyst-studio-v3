@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from vcstudio.project import research_explorer as explorer_mod
 from vcstudio.project.research_explorer import (
     ResearchExplorerError,
     ResearchIndexService,
@@ -77,6 +78,7 @@ def _rebuild(service, records, manifests, *, summaries=None, validation_resolver
         return {
             "status": record["method_status"],
             "engine": record["engine"],
+            "schema": f"vcstudio.method-fingerprint/{record['engine']}/v1",
             "fingerprint": {"functional": "PBE", "dispersion": "D3"},
             "missing": [],
         }
@@ -355,3 +357,169 @@ def test_rebuild_query_freshness_and_cursor_are_one_locked_immutable_snapshot(tm
 
     changed[next(iter(changed))]["results"]["energy_e0_eV"] = -7.0
     assert service.query()["table"]["rows"][0]["energy_eV"] == -999.0
+
+
+def test_single_gas_reference_contract_binds_identity_formula_and_three_operands(tmp_path):
+    root = tmp_path / "single"
+    clean, gas, config = (root / name for name in ("clean", "gas", "config"))
+    for path in (clean, gas, config):
+        path.mkdir(parents=True)
+    manifests = {}
+    specifications = (
+        (clean, "job-clean", "source-clean", "Pt4S", -100.0, "static"),
+        (gas, "job-gas", "source-gas", "Li2S8", -10.0, "static"),
+        (config, "job-config", "source-config", "Pt4SLi2S8", -115.0, "adsorption"),
+    )
+    for path, job_id, source_id, formula, energy, task_type in specifications:
+        manifests[str(path)] = {
+            "job_id": job_id, "state": "DONE", "task_type": task_type,
+            "inputs": {"engine": "vasp", "formula": formula,
+                       "source_id": source_id, "sha256": {"POSCAR": job_id}},
+            "results": {"energy_e0_eV": energy,
+                        "hashes": {"OUTCAR": f"output-{job_id}"}},
+        }
+    record = {
+        "project_id": "project-single", "identity_fingerprint": "identity-single",
+        "engine": "vasp", "method_status": "verified",
+        "project": {
+            "name": "Single reference", "formula": "Pt4S",
+            "members": {"clean_slab": str(clean), "gas_ref": str(gas),
+                        "configs": [str(config)]},
+            "config_species": {str(config): "Li2S8"},
+        },
+    }
+    summary = {"project-single": {
+        "reference_mode": "single",
+        "rows": [{
+            "job": str(config), "name": "config", "species": "Li2S8",
+            "delta_e": -5.0, "reference_valid": True,
+            "reference_job": str(gas), "reference_source": "OSZICAR:E0",
+            "method_check": {"status": "verified"},
+        }],
+    }}
+    service = ResearchIndexService()
+    _rebuild(service, [record], manifests, summaries=summary)
+
+    result = service.query({"filters": {"task_types": ["adsorption"]}})
+    row = result["table"]["rows"][0]
+    assert row["energy_quantity"] == "adsorption_energy"
+    assert row["energy_reference_mode"] == "single"
+    assert row["energy_contract_status"] == "verified"
+    assert result["energy_compatibility"]["status"] == "compatible"
+    assert result["histogram"]["status"] == "ready"
+    first_contract = row["energy_contract_id"]
+
+    # The reference source identity is a contract field, not a display label.
+    manifests[str(gas)]["inputs"]["source_id"] = "source-gas-replaced"
+    _rebuild(service, [record], manifests, summaries=summary)
+    rebound = service.query({"filters": {"task_types": ["adsorption"]}})
+    assert rebound["table"]["rows"][0]["energy_contract_id"] != first_contract
+
+    # A formula mismatch means the gas quantity cannot be proven to be the
+    # single Li2S8 operand and all energy aggregation fails closed.
+    manifests[str(gas)]["inputs"]["formula"] = "S8"
+    _rebuild(service, [record], manifests, summaries=summary)
+    blocked = service.query({"filters": {"task_types": ["adsorption"]}})
+    assert blocked["table"]["rows"][0]["energy_contract_status"] == "unverified"
+    assert blocked["energy_compatibility"]["status"] == (
+        "unavailable_incompatible_energy_contract")
+    assert blocked["histogram"]["bins"] == []
+
+
+def test_member_budget_rejects_20000_configs_before_any_manifest_load(tmp_path):
+    configs = [str(tmp_path / "huge" / f"config-{index:05d}") for index in range(20_000)]
+    record = {
+        "project_id": "project-huge", "identity_fingerprint": "identity-huge",
+        "project": {
+            "name": "Huge", "members": {
+                "clean_slab": None, "gas_ref": None, "configs": configs},
+        },
+    }
+    calls = 0
+
+    def loader(_path):
+        nonlocal calls
+        calls += 1
+        return {}
+
+    service = ResearchIndexService()
+    service.rebuild(
+        [record], manifest_loader=loader, summary_loader=lambda _project: {"rows": []},
+        job_id_resolver=lambda _path, _manifest: "job",
+        method_resolver=lambda _target: {}, registry_total=1)
+    result = service.query({"limit": 1})
+
+    assert calls == 0
+    assert result["ok"] is False
+    assert result["status"] == "partial"
+    assert result["table"]["rows"] == []
+    assert result["freshness"]["failures"] == [{
+        "project_ref": "project-huge", "code": "project_limit_exceeded"}]
+
+
+def test_nested_manifest_budget_fails_closed_and_query_never_deepcopies_private_rows(
+        tmp_path):
+    records, manifests = _records(tmp_path, engines=("vasp",), statuses=("verified",))
+    manifest = manifests[next(iter(manifests))]
+    nested = "leaf"
+    for _index in range(40):
+        nested = {"child": nested}
+    manifest["untrusted_nested"] = nested
+    service = ResearchIndexService()
+    _rebuild(service, records, manifests)
+    assert service.query()["status"] == "partial"
+
+    manifests[next(iter(manifests))].pop("untrusted_nested")
+    _rebuild(service, records, manifests)
+    assert "_manifest" not in service._snapshot["entries"][0]
+
+    class NoDeepCopy:
+        def __deepcopy__(self, _memo):
+            raise AssertionError("query copied a private full-snapshot value")
+
+    service._snapshot["entries"][0]["_private_probe"] = NoDeepCopy()
+    assert service.query({"limit": 1})["ok"] is True
+
+
+def test_registry_summary_manifest_and_total_entry_hard_budgets(monkeypatch, tmp_path):
+    records, manifests = _records(
+        tmp_path / "limits", engines=("vasp", "vasp"),
+        statuses=("verified", "verified"))
+
+    monkeypatch.setattr(explorer_mod, "MAX_REGISTRY_RECORDS", 1)
+    registry_service = ResearchIndexService()
+    summary_calls = 0
+
+    def summary_loader(_project):
+        nonlocal summary_calls
+        summary_calls += 1
+        return {"rows": []}
+
+    registry_service.rebuild(
+        records, manifest_loader=lambda _path: {}, summary_loader=summary_loader,
+        job_id_resolver=lambda _path, _manifest: "job",
+        method_resolver=lambda _target: {}, registry_total=2)
+    assert summary_calls == 0
+    assert registry_service.query()["freshness"]["failures"][0]["code"] == (
+        "registry_limit_exceeded")
+
+    monkeypatch.setattr(explorer_mod, "MAX_REGISTRY_RECORDS", 512)
+    monkeypatch.setattr(explorer_mod, "MAX_SUMMARY_BYTES", 64)
+    summary_service = ResearchIndexService()
+    _rebuild(
+        summary_service, records[:1], manifests,
+        summaries={"project-1": {"blob": "x" * 128, "rows": []}})
+    assert summary_service.query()["status"] == "partial"
+
+    monkeypatch.setattr(explorer_mod, "MAX_SUMMARY_BYTES", 8 * 1024 * 1024)
+    monkeypatch.setattr(explorer_mod, "MAX_MANIFEST_BYTES", 64)
+    manifest_service = ResearchIndexService()
+    _rebuild(manifest_service, records[:1], manifests)
+    assert manifest_service.query()["status"] == "partial"
+
+    monkeypatch.setattr(explorer_mod, "MAX_MANIFEST_BYTES", 2 * 1024 * 1024)
+    monkeypatch.setattr(explorer_mod, "MAX_TOTAL_ENTRIES", 1)
+    entry_service = ResearchIndexService()
+    _rebuild(entry_service, records, manifests)
+    assert entry_service.query()["status"] == "partial"
+    assert entry_service.index_status()["indexed_jobs"] == 1

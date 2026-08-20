@@ -35,6 +35,21 @@ QUERY_SCHEMA = "vcstudio.research-query/v1"
 PROVENANCE_SCHEMA = "vcstudio.live-provenance/v1"
 MAX_PAGE_SIZE = 200
 DEFAULT_PAGE_SIZE = 50
+MAX_REGISTRY_RECORDS = 512
+MAX_REGISTRY_BYTES = 8 * 1024 * 1024
+MAX_PROJECT_BYTES = 2 * 1024 * 1024
+MAX_PROJECT_MEMBERS = 4096
+MAX_MEMBER_BYTES = 16 * 1024
+MAX_MANIFEST_BYTES = 2 * 1024 * 1024
+MAX_SUMMARY_BYTES = 8 * 1024 * 1024
+MAX_TOTAL_ENTRIES = 8192
+MAX_NESTING_DEPTH = 32
+MAX_SCATTER_POINTS = 2000
+MAX_PROVENANCE_ATTEMPTS = 128
+MAX_SOURCE_FILES = 100_000
+MAX_SOURCE_FILE_BYTES = 256 * 1024 * 1024
+MAX_SOURCE_TOTAL_BYTES = 1024 * 1024 * 1024
+MAX_PUBLIC_FAILURES = 64
 
 _OPAQUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
 _FORMULA_TOKEN_RE = re.compile(r"([A-Z][a-z]?)(?:\d+(?:\.\d+)?)?")
@@ -101,6 +116,125 @@ _PERIODIC_POSITION = {
 
 class ResearchExplorerError(ValueError):
     """A derived-index request violates the bounded public contract."""
+
+
+class ResearchIndexLimitError(ResearchExplorerError):
+    """An authority payload exceeds a hard read-model resource budget."""
+
+
+def _bounded_payload_size(value: Any, *, label: str, maximum: int,
+                          max_depth: int = MAX_NESTING_DEPTH) -> int:
+    """Measure an authority payload without serialising an unbounded tree."""
+    total = 0
+    nodes = 0
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > max_depth:
+            raise ResearchIndexLimitError(
+                f"{label} exceeds the nesting-depth limit")
+        nodes += 1
+        if nodes > maximum:
+            raise ResearchIndexLimitError(f"{label} exceeds the byte limit")
+        if isinstance(current, Mapping):
+            total += 2
+            for key, item in current.items():
+                total += len(str(key).encode("utf-8", errors="replace")) + 2
+                stack.append((item, depth + 1))
+        elif isinstance(current, (list, tuple)):
+            total += 2
+            stack.extend((item, depth + 1) for item in current)
+        elif current is None:
+            total += 4
+        elif isinstance(current, bool):
+            total += 5
+        elif isinstance(current, (int, float)):
+            total += len(str(current))
+        else:
+            total += len(str(current).encode("utf-8", errors="replace")) + 2
+        if total > maximum:
+            raise ResearchIndexLimitError(f"{label} exceeds the byte limit")
+    return total
+
+
+def _raw_project_member_count(project: Mapping[str, Any]) -> int:
+    """Count member declarations before path normalisation or manifest I/O."""
+    members = project.get("members")
+    members = members if isinstance(members, Mapping) else {}
+    count = int(bool(members.get("clean_slab"))) + int(bool(members.get("gas_ref")))
+    for key in ("configs", "submitted_job_dirs"):
+        values = members.get(key) if key == "configs" else (
+            (project.get("launch") or {}).get(key)
+            if isinstance(project.get("launch"), Mapping) else None)
+        if isinstance(values, (list, tuple)):
+            count += len(values)
+        elif values:
+            count += 1
+    for values in (members.get("molecules"), project.get("species_ref_jobs")):
+        if isinstance(values, Mapping):
+            count += len(values)
+        elif isinstance(values, (list, tuple)):
+            count += len(values)
+        elif values:
+            count += 1
+    return count
+
+
+def _raw_project_members(project: Mapping[str, Any]) -> list[Any]:
+    members = project.get("members")
+    members = members if isinstance(members, Mapping) else {}
+    values: list[Any] = [members.get("clean_slab"), members.get("gas_ref")]
+    for candidate in (members.get("configs"), members.get("molecules"),
+                      project.get("species_ref_jobs")):
+        if isinstance(candidate, Mapping):
+            values.extend(candidate.values())
+        elif isinstance(candidate, (list, tuple)):
+            values.extend(candidate)
+        elif candidate:
+            values.append(candidate)
+    launch = project.get("launch")
+    launch = launch if isinstance(launch, Mapping) else {}
+    submitted = launch.get("submitted_job_dirs")
+    if isinstance(submitted, (list, tuple)):
+        values.extend(submitted)
+    elif submitted:
+        values.append(submitted)
+    return [value for value in values if value]
+
+
+def authority_budget_failures(records: Sequence[Mapping[str, Any]], *,
+                              registry_total: int | None = None
+                              ) -> list[dict[str, str]]:
+    """Preflight registry/project/member budgets before expanding any members."""
+    failures: list[dict[str, str]] = []
+    if (len(records) > MAX_REGISTRY_RECORDS
+            or (registry_total is not None and registry_total > MAX_REGISTRY_RECORDS)):
+        return [{"project_ref": "registry", "code": "registry_limit_exceeded"}]
+    try:
+        _bounded_payload_size(
+            records, label="registry", maximum=MAX_REGISTRY_BYTES)
+    except ResearchIndexLimitError:
+        return [{"project_ref": "registry", "code": "registry_limit_exceeded"}]
+    for record in records:
+        project_id = _safe_opaque(
+            record.get("project_id"), prefix="project", seed=record.get("project_id"))
+        project = record.get("project")
+        if not isinstance(project, Mapping):
+            continue
+        try:
+            _bounded_payload_size(
+                project, label="project", maximum=MAX_PROJECT_BYTES)
+            if _raw_project_member_count(project) > MAX_PROJECT_MEMBERS:
+                raise ResearchIndexLimitError("project exceeds the member limit")
+            for member in _raw_project_members(project):
+                _bounded_payload_size(
+                    member, label="member", maximum=MAX_MEMBER_BYTES)
+        except ResearchIndexLimitError:
+            failures.append({
+                "project_ref": project_id,
+                "code": "project_limit_exceeded",
+            })
+    return failures
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -226,6 +360,12 @@ def _method_projection(method: Any, manifest: Mapping[str, Any]) -> dict[str, An
     engine = _safe_label(
         method.get("engine") or inputs.get("engine") or "unknown",
         fallback="unknown", maximum=32).lower()
+    schema = str(method.get("schema") or "").strip()
+    if len(schema) > 96 or any(ord(char) < 32 or ord(char) == 127 for char in schema):
+        schema = ""
+    schema_match = re.fullmatch(
+        r"vcstudio\.method-fingerprint/([a-z0-9_.+-]+)/v([1-9][0-9]*)", schema)
+    schema_verified = bool(schema_match and schema_match.group(1) == engine)
     fingerprint = ""
     if identity:
         # Engine semantics are part of a computational-method identity.  The
@@ -234,13 +374,14 @@ def _method_projection(method: Any, manifest: Mapping[str, Any]) -> dict[str, An
     # A fingerprint identifies a cohort; it is not itself verification that
     # the cohort evidence is complete.
     status = str(method.get("status") or "unverified").lower()
-    if engine == "unknown" or not fingerprint:
+    if engine == "unknown" or not fingerprint or not schema_verified:
         status = "unverified"
     return {
         "fingerprint": fingerprint,
         "status": status if status in {"verified", "unverified", "incompatible"}
         else "unverified",
         "engine": engine,
+        "schema": schema if schema_verified else "",
         "missing": [
             _safe_label(item, fallback="method evidence", maximum=96)
             for item in method.get("missing") or []
@@ -358,6 +499,20 @@ def _energy_projection(manifest: Mapping[str, Any], summary_row: Mapping[str, An
     }
 
 
+def _manifest_total_energy(manifest: Mapping[str, Any]) -> tuple[float | None, str]:
+    results = manifest.get("results")
+    results = results if isinstance(results, Mapping) else {}
+    for label, field_path in (
+            ("energy_e0_eV", ("energy_e0_eV",)),
+            ("energy_eV", ("energy_eV",)),
+            ("final_energy_eV", ("final_energy_eV",)),
+            ("energy.value_eV", ("energy", "value_eV"))):
+        energy = _finite(_nested(results, field_path))
+        if energy is not None:
+            return energy, label
+    return None, ""
+
+
 def _barrier(manifest: Mapping[str, Any]) -> float | None:
     results = manifest.get("results")
     results = results if isinstance(results, Mapping) else {}
@@ -392,6 +547,30 @@ def _provenance_status(manifest: Mapping[str, Any], *, has_numeric: bool) -> str
     if has_numeric:
         return "inferred"
     return "observed"
+
+
+def _provenance_projection(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    inputs = manifest.get("inputs")
+    inputs = inputs if isinstance(inputs, Mapping) else {}
+    attempts = manifest.get("attempts")
+    attempts = attempts if isinstance(attempts, list) else []
+    if len(attempts) > MAX_PROVENANCE_ATTEMPTS:
+        raise ResearchIndexLimitError("manifest exceeds the provenance-attempt limit")
+    return {
+        "input_hash_bound": bool(inputs.get("sha256")),
+        "attempts": [
+            {
+                "kind": _safe_label(
+                    (attempt if isinstance(attempt, Mapping) else {}).get("kind")
+                    or (attempt if isinstance(attempt, Mapping) else {}).get("action"),
+                    fallback="resume", maximum=48),
+            }
+            for attempt in attempts
+        ],
+        "parser": _safe_label(_nested(
+            manifest, ("results", "parser"), ("results", "parsed_by")),
+            maximum=96),
+    }
 
 
 def _authority_projection(value: Any, *, job_id: str, source_id: str,
@@ -470,6 +649,7 @@ def _public_row(entry: Mapping[str, Any]) -> dict[str, Any]:
         "project_id", "project_name", "job_id", "source_id", "role", "formula",
         "elements", "facet", "adsorbate", "task_type", "state",
         "method_fingerprint", "method_status", "engine", "evidence_level",
+        "method_fingerprint_schema",
         "quantity_evidence",
         "provenance_status", "validation_status", "energy_eV", "energy_quantity",
         "energy_contract_id", "energy_contract_status", "energy_reference_mode",
@@ -511,13 +691,23 @@ class ResearchIndexService:
                            registry_total: int | None,
                            registry_failures: Sequence[Mapping[str, Any]],
                            source_version: Any = None) -> str:
+        def project_digest(project: Any) -> str:
+            if not isinstance(project, Mapping):
+                return "unreadable"
+            try:
+                _bounded_payload_size(
+                    project, label="project", maximum=MAX_PROJECT_BYTES)
+                return hashlib.sha256(_canonical_bytes(project)).hexdigest()
+            except (ResearchIndexLimitError, TypeError, ValueError, RecursionError):
+                return "limit-exceeded"
+
         payload = {
             "registry_total": registry_total,
             "records": [
                 {
                     "project_id": record.get("project_id"),
                     "identity": record.get("identity_fingerprint"),
-                    "project": record.get("project"),
+                    "project_sha256": project_digest(record.get("project")),
                 }
                 for record in records
             ],
@@ -578,15 +768,39 @@ class ResearchIndexService:
             }
             for item in registry_failures
         ]
+        existing_failure_keys = {
+            (str(item.get("project_ref") or ""), str(item.get("code") or ""))
+            for item in registry_failures
+        }
+        budget_candidates = authority_budget_failures(
+            records, registry_total=registry_total)
+        budget_failures = [
+            item for item in budget_candidates
+            if (item["project_ref"], item["code"]) not in existing_failure_keys
+        ]
+        failures.extend(budget_failures)
+        registry_blocked = any(
+            item["code"] == "registry_limit_exceeded" for item in budget_candidates)
+        registry_blocked = registry_blocked or any(
+            str(item.get("code") or "").startswith("source_")
+            for item in registry_failures)
+        blocked_projects = {
+            item["project_ref"] for item in budget_candidates
+            if item["code"] == "project_limit_exceeded"
+        }
         indexed_projects = 0
-        for record in records:
+        for record in (() if registry_blocked else records):
             project_id = _safe_opaque(
                 record.get("project_id"), prefix="project", seed=record.get("project_id"))
+            if project_id in blocked_projects:
+                continue
             try:
                 project = record.get("project")
                 if not isinstance(project, Mapping):
                     raise ValueError("project authority is unreadable")
                 summary = summary_loader(project)
+                _bounded_payload_size(
+                    summary, label="summary", maximum=MAX_SUMMARY_BYTES)
                 rows = _summary_rows(summary)
                 project_name = _safe_label(
                     project.get("name"), fallback=project_id, maximum=96)
@@ -599,8 +813,17 @@ class ResearchIndexService:
                 project_entries: list[dict[str, Any]] = []
                 member_count = 0
                 for member in _member_records(project):
+                    if len(entries) + len(project_entries) >= MAX_TOTAL_ENTRIES:
+                        raise ResearchIndexLimitError("index exceeds the entry limit")
+                    _bounded_payload_size(
+                        member, label="member", maximum=MAX_MEMBER_BYTES)
                     manifest = manifest_loader(member["path"])
-                    manifest = copy.deepcopy(manifest) if isinstance(manifest, Mapping) else {}
+                    if isinstance(manifest, Mapping):
+                        _bounded_payload_size(
+                            manifest, label="manifest", maximum=MAX_MANIFEST_BYTES)
+                        manifest = copy.deepcopy(manifest)
+                    else:
+                        manifest = {}
                     job_id = _safe_opaque(
                         job_id_resolver(member["path"], manifest), prefix="job",
                         seed={"project": project_id, "member": member["role"],
@@ -631,58 +854,9 @@ class ResearchIndexService:
                         elements = ads_elements
                     has_numeric = energy["energy_eV"] is not None or barrier is not None
                     provenance = _provenance_status(manifest, has_numeric=has_numeric)
-                    quantity_sha256: dict[str, str] = {}
-                    if energy["energy_eV"] is not None:
-                        quantity_sha256["energy_eV"] = hashlib.sha256(
-                            _canonical_bytes({
-                                "quantity": energy["energy_quantity"],
-                                "value": energy["energy_eV"],
-                                "unit": "eV",
-                                "energy_contract_id": energy["energy_contract_id"],
-                                "method_fingerprint": method["fingerprint"],
-                                "engine": method["engine"],
-                            })).hexdigest()
-                    if barrier is not None:
-                        quantity_sha256["barrier_eV"] = hashlib.sha256(
-                            _canonical_bytes({
-                                "quantity": "activation_barrier",
-                                "value": barrier,
-                                "unit": "eV",
-                                "method_fingerprint": method["fingerprint"],
-                                "engine": method["engine"],
-                                "task_type": manifest.get("task_type"),
-                            })).hexdigest()
-                    authority_raw: Mapping[str, Any] = {}
-                    if validation_resolver is not None and manifest:
-                        try:
-                            authority_raw = validation_resolver({
-                                "project_id": project_id,
-                                "project": project,
-                                "record": record,
-                                "path": member["path"],
-                                "manifest": manifest,
-                                "job_id": job_id,
-                                "source_id": source_id,
-                                "summary": summary,
-                                "summary_row": summary_row,
-                                "energy": energy,
-                                "barrier_eV": barrier,
-                                "quantity_sha256": copy.deepcopy(quantity_sha256),
-                            })
-                        except Exception:  # noqa: BLE001 authority absence is unverified
-                            authority_raw = {}
-                    authority = _authority_projection(
-                        authority_raw, job_id=job_id, source_id=source_id,
-                        quantity_sha256=quantity_sha256)
-                    quantity_evidence = {
-                        quantity: (
-                            "verified" if quantity in authority["verified_quantities"] else
-                            "unverified" if provenance == "observed" else "diagnostic"
-                        )
-                        for quantity in quantity_sha256
-                    }
                     attempts = manifest.get("attempts")
                     attempts = attempts if isinstance(attempts, list) else []
+                    operand_energy, operand_energy_source = _manifest_total_energy(manifest)
                     entry = {
                         "project_id": project_id,
                         "project_name": project_name,
@@ -702,20 +876,20 @@ class ResearchIndexService:
                             manifest.get("state"), fallback="MISSING", maximum=32).upper(),
                         "method_fingerprint": method["fingerprint"],
                         "method_status": method["status"],
+                        "method_fingerprint_schema": method["schema"],
                         "engine": method["engine"],
-                        "evidence_level": _evidence_level(
-                            manifest, method, provenance, authority,
-                            numeric_quantities=tuple(quantity_sha256)),
-                        "quantity_evidence": quantity_evidence,
+                        "evidence_level": "missing",
+                        "quantity_evidence": {},
                         "provenance_status": provenance,
                         "validation_status": _validation_status(manifest),
                         **energy,
                         "barrier_eV": barrier,
                         "attempt_count": len(attempts),
-                        "_quantity_sha256": quantity_sha256,
+                        "_quantity_sha256": {},
                         "_manifest": manifest,
+                        "_path": member["path"],
                         "_method": method,
-                        "_validation_authority": authority,
+                        "_validation_authority": {},
                         "_report": report,
                         "_report_binding": {},
                         "_path_key": member["path_key"],
@@ -725,11 +899,15 @@ class ResearchIndexService:
                             or (summary.get("reference_mode")
                                 if isinstance(summary, Mapping) else ""),
                             maximum=32).lower(),
+                        "_operand_energy_eV": operand_energy,
+                        "_operand_energy_source": operand_energy_source,
                     }
                     project_entries.append(entry)
                     member_count += 1
                 if member_count == 0:
                     # Empty projects are still indexed explicitly as missing evidence.
+                    if len(entries) >= MAX_TOTAL_ENTRIES:
+                        raise ResearchIndexLimitError("index exceeds the entry limit")
                     entries.append({
                         "project_id": project_id, "project_name": project_name,
                         "job_id": f"job-{_digest([project_id, 'missing'])}",
@@ -738,7 +916,8 @@ class ResearchIndexService:
                         "elements": _formula_elements(project_formula)[1],
                         "facet": project_facet, "adsorbate": "", "task_type": "unknown",
                         "state": "MISSING", "method_fingerprint": "",
-                        "method_status": "unverified", "engine": "unknown",
+                        "method_status": "unverified",
+                        "method_fingerprint_schema": "", "engine": "unknown",
                         "evidence_level": "missing", "provenance_status": "missing",
                         "quantity_evidence": {},
                         "validation_status": "missing", "energy_eV": None,
@@ -747,13 +926,84 @@ class ResearchIndexService:
                         "energy_reference_mode": "missing",
                         "barrier_eV": None, "attempt_count": 0,
                         "_quantity_sha256": {},
-                        "_manifest": {}, "_method": {},
-                        "_validation_authority": {}, "_report": report,
+                        "_method": {}, "_provenance": {
+                            "input_hash_bound": False, "attempts": [], "parser": ""},
+                        "_validation_authority": {},
                         "_report_binding": {}, "_path_key": "",
                         "_summary_row": {}, "_reference_mode": "",
+                        "_operand_energy_eV": None, "_operand_energy_source": "",
                     })
                 else:
                     self._bind_project_operands(project_entries)
+                    self._finalize_energy_contracts(project_entries)
+                    for entry in project_entries:
+                        manifest = entry["_manifest"]
+                        quantity_sha256: dict[str, str] = {}
+                        if entry["energy_eV"] is not None:
+                            quantity_sha256["energy_eV"] = hashlib.sha256(
+                                _canonical_bytes({
+                                    "quantity": entry["energy_quantity"],
+                                    "value": entry["energy_eV"],
+                                    "unit": "eV",
+                                    "energy_contract_id": entry["energy_contract_id"],
+                                    "method_fingerprint": entry["method_fingerprint"],
+                                    "engine": entry["engine"],
+                                })).hexdigest()
+                        if entry["barrier_eV"] is not None:
+                            quantity_sha256["barrier_eV"] = hashlib.sha256(
+                                _canonical_bytes({
+                                    "quantity": "activation_barrier",
+                                    "value": entry["barrier_eV"],
+                                    "unit": "eV",
+                                    "method_fingerprint": entry["method_fingerprint"],
+                                    "engine": entry["engine"],
+                                    "task_type": entry["task_type"],
+                                })).hexdigest()
+                        authority_raw: Mapping[str, Any] = {}
+                        if validation_resolver is not None and manifest:
+                            try:
+                                authority_raw = validation_resolver({
+                                    "project_id": project_id,
+                                    "project": project,
+                                    "record": record,
+                                    "path": entry["_path"],
+                                    "manifest": manifest,
+                                    "job_id": entry["job_id"],
+                                    "source_id": entry["source_id"],
+                                    "summary": summary,
+                                    "summary_row": entry["_summary_row"],
+                                    "energy": {
+                                        key: entry[key] for key in (
+                                            "energy_eV", "energy_quantity",
+                                            "energy_origin", "energy_contract_id",
+                                            "energy_contract_status",
+                                            "energy_reference_mode")
+                                    },
+                                    "barrier_eV": entry["barrier_eV"],
+                                    "quantity_sha256": copy.deepcopy(quantity_sha256),
+                                })
+                            except Exception:  # noqa: BLE001 authority is unavailable
+                                authority_raw = {}
+                        authority = _authority_projection(
+                            authority_raw, job_id=entry["job_id"],
+                            source_id=entry["source_id"],
+                            quantity_sha256=quantity_sha256)
+                        entry["_quantity_sha256"] = quantity_sha256
+                        entry["_validation_authority"] = authority
+                        entry["quantity_evidence"] = {
+                            quantity: (
+                                "verified"
+                                if quantity in authority["verified_quantities"] else
+                                "unverified"
+                                if entry["provenance_status"] == "observed" else
+                                "diagnostic"
+                            )
+                            for quantity in quantity_sha256
+                        }
+                        entry["evidence_level"] = _evidence_level(
+                            manifest, entry["_method"], entry["provenance_status"],
+                            authority, numeric_quantities=tuple(quantity_sha256))
+                        entry["_provenance"] = _provenance_projection(manifest)
                     if report_binding_resolver is not None:
                         try:
                             raw_binding = report_binding_resolver({
@@ -770,8 +1020,17 @@ class ResearchIndexService:
                             raw_binding, project_entries)
                         for entry in project_entries:
                             entry["_report_binding"] = binding
+                    for entry in project_entries:
+                        entry.pop("_manifest", None)
+                        entry.pop("_path", None)
+                        entry.pop("_report", None)
                     entries.extend(project_entries)
                 indexed_projects += 1
+            except ResearchIndexLimitError:
+                failures.append({
+                    "project_ref": project_id,
+                    "code": "project_limit_exceeded",
+                })
             except Exception:  # noqa: BLE001 one project makes completeness partial
                 failures.append({
                     "project_ref": project_id,
@@ -781,7 +1040,8 @@ class ResearchIndexService:
         entries.sort(key=lambda item: (
             item["project_id"], item["job_id"], item["source_id"]))
         source_fingerprint = self.source_fingerprint(
-            records, registry_total=registry_total, registry_failures=registry_failures,
+            records, registry_total=registry_total,
+            registry_failures=[*registry_failures, *budget_failures],
             source_version=source_version)
         snapshot_identity = {
             'source': source_fingerprint,
@@ -790,6 +1050,18 @@ class ResearchIndexService:
         }
         snapshot_id = f"index-{_digest(snapshot_identity)}"
         status = "partial" if failures else "ready"
+        failure_total = len(failures)
+        bounded_failures = []
+        seen_failures = set()
+        for item in failures:
+            key = (str(item.get("project_ref") or "registry"),
+                   str(item.get("code") or "unavailable"))
+            if key in seen_failures:
+                continue
+            seen_failures.add(key)
+            bounded_failures.append(item)
+            if len(bounded_failures) >= MAX_PUBLIC_FAILURES:
+                break
         snapshot = {
             "schema": INDEX_SCHEMA,
             "snapshot_id": snapshot_id,
@@ -800,14 +1072,44 @@ class ResearchIndexService:
             "registry_total": registry_total,
             "indexed_projects": indexed_projects,
             "indexed_jobs": len(entries),
-            "failed_sources": len(failures),
-            "failures": failures,
+            "failed_sources": failure_total,
+            "failures": bounded_failures,
             "entries": entries,
         }
-        # A private deep copy prevents later caller mutation from changing the
-        # immutable read snapshot behind an already issued cursor.
-        self._snapshot = copy.deepcopy(snapshot)
+        # Every authority mapping was copied or projected while building.  The
+        # snapshot is private and never handed to callers, so publishing this
+        # immutable replacement does not duplicate the entire index.
+        self._snapshot = snapshot
         return self._status_from_snapshot(self._snapshot, now=self._monotonic())
+
+    def fail_closed(self, *, source_fingerprint: str, registry_total: int | None,
+                    failures: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        """Publish a bounded non-scientific snapshot after an unstable read."""
+        with self._lock:
+            safe_failures = [{
+                "project_ref": _safe_label(
+                    item.get("project_ref"), fallback="registry", maximum=96),
+                "code": _safe_label(
+                    item.get("code"), fallback="source_unavailable", maximum=96),
+            } for item in failures[:64]]
+            snapshot_identity = {
+                "source": source_fingerprint, "failures": safe_failures}
+            snapshot = {
+                "schema": INDEX_SCHEMA,
+                "snapshot_id": f"index-{_digest(snapshot_identity)}",
+                "source_fingerprint": source_fingerprint,
+                "built_at": self._clock(),
+                "built_monotonic": self._monotonic(),
+                "status": "partial",
+                "registry_total": registry_total,
+                "indexed_projects": 0,
+                "indexed_jobs": 0,
+                "failed_sources": len(safe_failures),
+                "failures": safe_failures,
+                "entries": [],
+            }
+            self._snapshot = snapshot
+            return self._status_from_snapshot(snapshot, now=self._monotonic())
 
     @staticmethod
     def _bind_project_operands(entries: list[dict[str, Any]]) -> None:
@@ -854,6 +1156,88 @@ class ResearchIndexService:
                 operand("clean_slab", clean),
                 operand("reference", reference),
             ]
+
+    @staticmethod
+    def _finalize_energy_contracts(entries: list[dict[str, Any]]) -> None:
+        """Prove single-reference arithmetic only after all operands are bound."""
+        by_identity = {
+            (str(entry.get("job_id") or ""), str(entry.get("source_id") or "")): entry
+            for entry in entries
+        }
+        for config in entries:
+            if (config.get("role") != "configuration"
+                    or config.get("energy_origin") != "analysis"
+                    or config.get("_reference_mode") != "single"):
+                continue
+            config["energy_contract_id"] = ""
+            config["energy_contract_status"] = "unverified"
+            row = config.get("_summary_row")
+            row = row if isinstance(row, Mapping) else {}
+            method_check = row.get("method_check")
+            method_check = method_check if isinstance(method_check, Mapping) else {}
+            operands = config.get("_operands")
+            operands = operands if isinstance(operands, list) else []
+            if (row.get("reference_valid") is not True
+                    or method_check.get("status") != "verified"
+                    or len(operands) != 3):
+                continue
+            roles = {str(item.get("role") or ""): item for item in operands}
+            if set(roles) != {"configuration", "clean_slab", "reference"}:
+                continue
+            resolved: dict[str, Mapping[str, Any]] = {}
+            valid = True
+            for role, operand in roles.items():
+                identity = (
+                    str(operand.get("job_id") or ""),
+                    str(operand.get("source_id") or ""),
+                )
+                entry = by_identity.get(identity)
+                if (entry is None or entry.get("state") != "DONE"
+                        or entry.get("method_status") != "verified"
+                        or entry.get("provenance_status") != "observed"
+                        or _finite(entry.get("_operand_energy_eV")) is None):
+                    valid = False
+                    break
+                resolved[role] = entry
+            if not valid or len({item["job_id"] for item in resolved.values()}) != 3:
+                continue
+            reference = resolved["reference"]
+            reference_formula, _elements = _formula_elements(reference.get("formula"))
+            adsorbate_formula, _ads_elements = _formula_elements(config.get("adsorbate"))
+            reference_source = _safe_label(row.get("reference_source"), maximum=96)
+            if (not reference_formula or not adsorbate_formula
+                    or reference_formula != adsorbate_formula or not reference_source):
+                continue
+            expected = (
+                float(resolved["configuration"]["_operand_energy_eV"])
+                - float(resolved["clean_slab"]["_operand_energy_eV"])
+                - float(reference["_operand_energy_eV"])
+            )
+            if not math.isclose(
+                    expected, float(config["energy_eV"]), rel_tol=0.0, abs_tol=1e-8):
+                continue
+            reference_job = _path_key(row.get("reference_job")) \
+                if row.get("reference_job") else ""
+            if reference_job and reference_job != str(reference.get("_path_key") or ""):
+                continue
+            contract = {
+                "schema": "vcstudio.energy-contract/single-gas/v1",
+                "quantity": "adsorption_energy",
+                "unit": "eV",
+                "reference_mode": "single",
+                "reference": {
+                    "project_id": reference["project_id"],
+                    "job_id": reference["job_id"],
+                    "source_id": reference["source_id"],
+                    "energy_quantity": "total_energy",
+                    "source": reference_source,
+                    "formula": reference_formula,
+                    "coefficient": 1,
+                },
+                "formula": "E(config)-E(clean)-1*E(gas_reference)",
+            }
+            config["energy_contract_id"] = f"energy-{_digest(contract, 20)}"
+            config["energy_contract_status"] = "verified"
 
     @staticmethod
     def _report_binding_projection(value: Any,
@@ -988,7 +1372,7 @@ class ResearchIndexService:
 
     @staticmethod
     def _filter_entries(entries: Sequence[Mapping[str, Any]],
-                        filters: Mapping[str, Any]) -> list[dict[str, Any]]:
+                        filters: Mapping[str, Any]) -> list[Mapping[str, Any]]:
         def allowed(entry: Mapping[str, Any]) -> bool:
             for key, field in (
                     ("project_ids", "project_id"), ("task_types", "task_type"),
@@ -1016,17 +1400,17 @@ class ResearchIndexService:
                     return False
             return True
 
-        return [dict(entry) for entry in entries if allowed(entry)]
+        return [entry for entry in entries if allowed(entry)]
 
     @staticmethod
     def _method_cohort(entries: Sequence[Mapping[str, Any]], *, enabled: bool
-                       ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+                       ) -> tuple[list[Mapping[str, Any]], dict[str, Any]]:
         counts = Counter(
             str(entry.get("method_fingerprint") or "") for entry in entries
             if (entry.get("method_fingerprint")
                 and entry.get("method_status") == "verified"))
         selected = None
-        output = [dict(entry) for entry in entries]
+        output = list(entries)
         missing_fingerprints = sum(
             1 for entry in entries if not entry.get("method_fingerprint"))
         nonverified = sum(
@@ -1035,7 +1419,7 @@ class ResearchIndexService:
             if counts:
                 selected = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
                 output = [
-                    dict(entry) for entry in entries
+                    entry for entry in entries
                     if (entry.get("method_fingerprint") == selected
                         and entry.get("method_status") == "verified")
                 ]
@@ -1092,10 +1476,10 @@ class ResearchIndexService:
 
     @staticmethod
     def _sort(entries: Sequence[Mapping[str, Any]], sort: Mapping[str, str]
-              ) -> list[dict[str, Any]]:
+              ) -> list[Mapping[str, Any]]:
         field = _SORT_FIELDS[sort["key"]]
-        present = [dict(item) for item in entries if item.get(field) not in (None, "")]
-        missing = [dict(item) for item in entries if item.get(field) in (None, "")]
+        present = [item for item in entries if item.get(field) not in (None, "")]
+        missing = [item for item in entries if item.get(field) in (None, "")]
         def identity(item: Mapping[str, Any]):
             return item["project_id"], item["job_id"], item["source_id"]
         missing.sort(key=identity)
@@ -1234,6 +1618,7 @@ class ResearchIndexService:
         def percent(value: float, low: float, high: float) -> float:
             return 50.0 if high == low else (value - low) * 100.0 / (high - low)
 
+        projected = complete[:MAX_SCATTER_POINTS]
         points = [{
             "project_id": item[0]["project_id"], "job_id": item[0]["job_id"],
             "source_id": item[0]["source_id"], "label": item[0]["project_name"],
@@ -1243,10 +1628,13 @@ class ResearchIndexService:
             "y_percent": percent(item[2], y_min, y_max),
             "top_percent": 100.0 - percent(item[2], y_min, y_max),
             "method_fingerprint": item[0].get("method_fingerprint") or "",
-        } for item in complete]
+        } for item in projected]
         return {
             "status": "ready", "axes": copy.deepcopy(dict(axes)), "points": points,
-            "sample_count": len(points), "missing_count": len(entries) - len(points),
+            "sample_count": len(complete), "visible_count": len(points),
+            "truncated": len(complete) > len(points),
+            "point_limit": MAX_SCATTER_POINTS,
+            "missing_count": len(entries) - len(complete),
             "units": {x_axis: _NUMERIC_FIELDS[x_axis]["unit"],
                       y_axis: _NUMERIC_FIELDS[y_axis]["unit"]},
             "ranges": {x_axis: {"min": x_min, "max": x_max},
@@ -1296,7 +1684,7 @@ class ResearchIndexService:
     def query(self, request: Any = None) -> dict[str, Any]:
         normalized = self._normalize_request(request)
         with self._lock:
-            snapshot = copy.deepcopy(self._snapshot)
+            snapshot = self._snapshot
             freshness = self._status_from_snapshot(
                 self._snapshot, now=self._monotonic())
         if snapshot is None or freshness["status"] in {"stale", "partial", "unavailable"}:
@@ -1402,7 +1790,7 @@ class ResearchIndexService:
     def live_provenance(self, project_id: Any, *, job_id: Any = None,
                         source_id: Any = None) -> dict[str, Any]:
         with self._lock:
-            snapshot = copy.deepcopy(self._snapshot)
+            snapshot = self._snapshot
             freshness = self._status_from_snapshot(
                 self._snapshot, now=self._monotonic())
         if snapshot is None or freshness["status"] != "ready":
@@ -1454,13 +1842,14 @@ class ResearchIndexService:
             project_node, "project", "data", "observed",
             selected[0]["project_name"], {"project_id": project}))
         for entry in graph_entries:
-            manifest = entry["_manifest"]
+            provenance = entry.get("_provenance")
+            provenance = provenance if isinstance(provenance, Mapping) else {}
             input_node = f"input:{entry['source_id']}"
-            input_hashes = _nested(manifest, ("inputs", "sha256"))
-            input_status = entry["provenance_status"] if input_hashes else "missing"
+            input_hash_bound = provenance.get("input_hash_bound") is True
+            input_status = entry["provenance_status"] if input_hash_bound else "missing"
             nodes.append(self._node(
                 input_node, "input", "data", input_status, entry["source_id"],
-                {"source_id": entry["source_id"], "hash_bound": bool(input_hashes)}))
+                {"source_id": entry["source_id"], "hash_bound": input_hash_bound}))
             job_node = f"job:{entry['job_id']}"
             nodes.append(self._node(
                 job_node, "job", "data", entry["provenance_status"], entry["job_id"],
@@ -1474,7 +1863,7 @@ class ResearchIndexService:
                     "reason": "job input hash evidence is missing",
                 })
 
-            attempts = manifest.get("attempts")
+            attempts = provenance.get("attempts")
             attempts = attempts if isinstance(attempts, list) else []
             previous = job_node
             for index, attempt in enumerate(attempts):
@@ -1490,12 +1879,10 @@ class ResearchIndexService:
                 previous = repair_id
 
             parser_id = f"parser:{entry['job_id']}"
-            parser_name = _safe_label(_nested(manifest,
-                ("results", "parser"), ("results", "parsed_by")),
-                fallback="registered parser", maximum=96)
+            parser_name = _safe_label(
+                provenance.get("parser"), fallback="registered parser", maximum=96)
             parser_status = (
-                "observed" if _nested(manifest,
-                    ("results", "parser"), ("results", "parsed_by")) else
+                "observed" if provenance.get("parser") else
                 "inferred" if entry["energy_eV"] is not None
                 or entry["barrier_eV"] is not None else "missing")
             nodes.append(self._node(
