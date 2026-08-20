@@ -29,6 +29,7 @@ from vcstudio.project.report_service import (
     _read_history,
     _validated_history_bundle,
 )
+from vcstudio.shared.credential_classifier import is_sensitive_key, looks_like_credential
 
 
 DIFF_SCHEMA = "vcstudio.report-scientific-diff/v1"
@@ -41,13 +42,6 @@ _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _ABS_WINDOWS = re.compile(r"(?i)(?:^|[\s\"'])(?:[a-z]:[\\/]|\\\\)")
 _ABS_POSIX = re.compile(r"(?:^|[\s\"'])/(?!/)")
 _FILE_URI = re.compile(r"(?i)\bfile:(?:/{0,3}|\\)")
-_SECRET_VALUE = re.compile(
-    r"(?i)(?:\b(?:github_pat_|gh[opusr]_|sk-)[A-Za-z0-9_-]{12,}"
-    r"|\bAKIA[0-9A-Z]{16}\b|\bBearer\s+\S+"
-    r"|\b(?:token|secret|password|api[_-]?key|authorization)\s*[:=]\s*[\"']?[^\s,\"'}]+"
-    r"|-----BEGIN[^\r\n]{0,40}PRIVATE KEY-----"
-    r"|https?://[^\s/:]+:[^\s/@]+@)"
-)
 _SENSITIVE_KEYS = frozenset({
     "password", "passwd", "secret", "token", "credential", "credentials",
     "authorization", "cookie", "cookies", "private_key", "api_key",
@@ -86,7 +80,7 @@ def _is_path_or_secret(value: str) -> bool:
         _ABS_WINDOWS.search(value)
         or _ABS_POSIX.search(value)
         or _FILE_URI.search(value)
-        or _SECRET_VALUE.search(value)
+        or looks_like_credential(value)
     )
 
 
@@ -94,12 +88,14 @@ def redact(value: Any, *, key: str = "") -> Any:
     """Return a JSON-safe, deterministic value with paths/secrets removed."""
 
     normalized_key = str(key).strip().lower().replace("-", "_")
-    if normalized_key in _SENSITIVE_KEYS:
+    if normalized_key in _SENSITIVE_KEYS or is_sensitive_key(key):
         return "[redacted-secret]"
     if isinstance(value, Mapping):
         return {
             str(item_key): redact(item_value, key=str(item_key))
             for item_key, item_value in sorted(value.items(), key=lambda item: str(item[0]))
+            if not (is_sensitive_key(item_key)
+                    or _is_path_or_secret(str(item_key)))
         }
     if isinstance(value, (list, tuple)):
         return [redact(item) for item in value]

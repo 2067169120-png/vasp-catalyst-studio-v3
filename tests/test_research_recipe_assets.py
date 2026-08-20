@@ -44,8 +44,12 @@ def test_recipe_browser_has_no_instantiation_or_remote_operation_path():
         assert forbidden not in script
     assert "const OPAQUE_ID" in script
     assert "authorizes_execution" not in script
-    assert "if (State.busy && options.force !== true) return false" in script
-    assert "State.selectionGeneration !== generation" in script
+    assert "button.dataset.recipeVersion = recipe.recipe_version" in script
+    assert "button.dataset.recipeKey = key" in script
+    assert "recipeByKey(selectedKey)" in script
+    assert "State.selectedKey === selectedKey" in script
+    assert "State.previewRequestGeneration === requestGeneration" in script
+    assert "recipeKey(result.preview.recipe_id, result.preview.recipe_version)" in script
     assert "if (previewPane) previewPane.hidden = true" in script
 
 
@@ -98,8 +102,8 @@ const recipe = {
   }],
 };
 const secondRecipe = Object.assign({}, recipe, {
-  recipe_id: 'adsorption_energy',
-  label_zh: '吸附能', label_en: 'Adsorption energy',
+  recipe_version: '2.0.0',
+  label_zh: 'NEB 路径 v2', label_en: 'NEB pathway v2',
 });
 const preview = {
   recipe_id: 'neb_path', recipe_version: '1.0.0', status: 'preview_ready',
@@ -128,9 +132,15 @@ await waitFor(() => bridgeCalls.some(call => call.method === 'research_recipe_ca
 const seam = window.__VCS_RESEARCH_RECIPES_TEST__;
 assert.ok(seam, 'guarded research recipe seam was not exposed');
 await waitFor(() => seam.State.parameterControls.length === 2);
-await waitFor(() => seam.State.busy === false);
+await waitFor(() => seam.State.catalogBusy === false);
 assert.strictEqual(elements.get('rr-list').children.length, 2);
 assert.strictEqual(elements.get('rr-list').children[0].getAttribute('aria-pressed'), 'true');
+assert.strictEqual(elements.get('rr-list').children[0].dataset.recipeId, 'neb_path');
+assert.strictEqual(elements.get('rr-list').children[1].dataset.recipeId, 'neb_path');
+assert.strictEqual(elements.get('rr-list').children[0].dataset.recipeVersion, '1.0.0');
+assert.strictEqual(elements.get('rr-list').children[1].dataset.recipeVersion, '2.0.0');
+assert.notStrictEqual(elements.get('rr-list').children[0].id,
+  elements.get('rr-list').children[1].id);
 assert.strictEqual(seam.State.parameterControls[1].input.tagName, 'SELECT');
 
 const parameter = seam.State.parameterControls[0];
@@ -171,9 +181,85 @@ assert.ok(!JSON.stringify(bridgeCalls).includes('C:\\private'));
 
 elements.get('rr-list').children[1].click();
 assert.strictEqual(elements.get('rr-preview').hidden, true,
-  'changing recipe selection must clear the old DAG');
-assert.ok(trace.focus.includes('rr-recipe-adsorption_energy'),
-  'the replacement recipe button must recover keyboard focus');
+  'changing recipe version must clear the old DAG');
+assert.deepStrictEqual(seam.snapshot().selected_recipe, {
+  recipe_id: 'neb_path', recipe_version: '2.0.0',
+});
+assert.ok(trace.focus.includes(seam.recipeDomId('neb_path', '2.0.0')),
+  'the replacement recipe version button must recover keyboard focus');
+""",
+        str(ASSETS / "research-recipes.js"),
+    )
+
+
+def test_same_recipe_versions_ignore_preview_responses_completed_out_of_order():
+    _run_node(
+        r"""
+[
+  'research-recipes-card', 'rr-list', 'rr-selection', 'rr-form', 'rr-parameters',
+  'rr-evidence', 'rr-preview-button', 'rr-status', 'rr-preview', 'rr-preview-meta',
+  'rr-node-list', 'rr-missing-list', 'rr-limits-list', 'rr-reference-list',
+  'rr-source-list', 'rr-preview-hash',
+].forEach(id => element(id));
+
+const base = {
+  recipe_id: 'neb_path',
+  label_zh: 'NEB 路径', label_en: 'NEB pathway',
+  summary_zh: '只读依赖图', summary_en: 'Read-only dependency graph',
+  parameters: [], inputs: [],
+};
+const version1 = Object.assign({}, base, { recipe_version: '1.0.0' });
+const version2 = Object.assign({}, base, { recipe_version: '2.0.0' });
+const pending = {
+  '1.0.0': deferred(),
+  '2.0.0': deferred(),
+};
+const previewFor = version => ({
+  recipe_id: 'neb_path', recipe_version: version, status: 'preview_ready',
+  nodes: [], missing_prerequisites: [], parameter_overrides: [],
+  scientific_limits: [], official_reference_urls: [],
+  preview_semantic_sha256: (version === '1.0.0' ? '1' : '2').repeat(64),
+});
+VCS.call = async (method, ...args) => {
+  if (method === 'research_recipe_catalog') return {
+    ok: true, recipes: [version1, version2], read_only: true,
+    authorizes_execution: false,
+  };
+  if (method === 'research_recipe_preview') return pending[args[1]].promise;
+  return {};
+};
+
+loadAsset(process.argv[1]);
+const seam = window.__VCS_RESEARCH_RECIPES_TEST__;
+await waitFor(() => seam && seam.State.catalogBusy === false
+  && elements.get('rr-list').children.length === 2);
+
+const firstRequest = seam.requestPreview({ preventDefault() {} });
+await Promise.resolve();
+assert.strictEqual(elements.get('rr-list').children[1].disabled, false,
+  'another recipe version remains selectable while a preview is pending');
+elements.get('rr-list').children[1].click();
+assert.deepStrictEqual(seam.snapshot().selected_recipe, {
+  recipe_id: 'neb_path', recipe_version: '2.0.0',
+});
+const secondRequest = seam.requestPreview({ preventDefault() {} });
+await Promise.resolve();
+
+pending['2.0.0'].resolve({ ok: true, preview: previewFor('2.0.0') });
+assert.strictEqual(await secondRequest, true);
+assert.deepStrictEqual(seam.snapshot().preview_recipe, {
+  recipe_id: 'neb_path', recipe_version: '2.0.0',
+});
+assert.strictEqual(seam.snapshot().preview_hash, '2'.repeat(64));
+
+pending['1.0.0'].resolve({ ok: true, preview: previewFor('1.0.0') });
+assert.strictEqual(await firstRequest, false,
+  'the stale response from the old recipe version must be ignored');
+assert.deepStrictEqual(seam.snapshot().preview_recipe, {
+  recipe_id: 'neb_path', recipe_version: '2.0.0',
+});
+assert.strictEqual(seam.snapshot().preview_hash, '2'.repeat(64),
+  'out-of-order completion must not replace the selected version preview');
 """,
         str(ASSETS / "research-recipes.js"),
     )

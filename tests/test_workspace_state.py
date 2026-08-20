@@ -296,7 +296,15 @@ def test_validation_rejects_unknown_unsafe_or_path_bearing_state(tmp_path, patch
     "ftp://alice:hunter2@example.test/private",
     "postgresql://alice:hunter2@example.test/private",
     "AKIAIOSFODNN7EXAMPLE",
+    "ASIAIOSFODNN7EXAMPLE",
+    "aws_secret_access_key=example-secret",
     "github_pat_abcdefghijklmnopqrstuvwx",
+    "glpat-abcdefghijklmnopqrstuvwx",
+    "hf_abcdefghijklmnopqrstuvwx",
+    "sk_live_abcdefghijklmnopqrstuvwx",
+    "pk_live_abcdefghijklmnopqrstuvwx",
+    "x://alice:hunter2@example.test/private",
+    f"{'a' * 80}://alice:hunter2@example.test/private",
     "/srv/private/research/job-a",
 ])
 def test_recursive_secret_gate_preserves_existing_state_bytes(tmp_path, unsafe_value):

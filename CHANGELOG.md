@@ -15,6 +15,10 @@ V4.0.0 is not released, and the `v4.0.0` tag has not been created. This section 
   和显式参数覆盖生成零副作用 DAG 预览及 semantic hash。配方 ready 不代表科学 validated/accepted，
   `job.yaml` 仍是作业事实源。Versioned catalysis DTOs and five built-in research recipes now provide
   typed-evidence, parameter-source-aware, side-effect-free DAG previews without granting execution authority.
+- 催化 DTO 进一步分离 schema version 与不可变 object revision，并新增独立 create-only/CAS envelope
+  store；ElementaryStep v2 以带系数、phase、charge、site count 的 participant 表达反应，并可通过
+  authoritative resolver 检查元素、电荷和表面位点守恒。配方 UI 以 ID+version 复合身份隔离逆序响应，
+  API 输入拒绝与输出脱敏统一使用全项目凭据分类器。
 
 ### Revisioned 工作台与适配器（Phase C–D）
 - 新增 revisioned report workbench，将配置草稿、绑定预览、发布 revision、产物清单及

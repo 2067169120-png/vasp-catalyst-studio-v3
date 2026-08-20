@@ -12,13 +12,15 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
+from vcstudio.shared.credential_classifier import is_sensitive_key, looks_like_credential
+
 
 MODEL_VERSION = "1.0.0"
-DOMAIN_ENVELOPE_SCHEMA = "vcstudio.catalysis-domain-envelope/v1"
+DOMAIN_ENVELOPE_SCHEMA = "vcstudio.catalysis-domain-envelope/v2"
 WORKFLOW_RUN_SCHEMA = "vcstudio.workflow-run-snapshot/v1"
 
 PROVENANCE_KINDS = ("observed", "imported", "inferred")
@@ -33,6 +35,9 @@ EVIDENCE_TYPES = (
     "method_record",
 )
 PARAMETER_SOURCES = ("recipe_default", "user_override")
+PARTICIPANT_PHASES = (
+    "gas", "liquid", "aqueous", "solid", "adsorbed", "surface", "electron",
+)
 
 _OPAQUE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~:-]{0,159}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -43,12 +48,6 @@ _ABS_WINDOWS_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9])(?:[a-z]:[\\/]|\\\\[^\\/\s]+[\\/])")
 _ABS_POSIX_RE = re.compile(r"(?<![\w:/])/(?!/)[^\s,;，；]+")
 _FILE_URI_RE = re.compile(r"(?i)\bfile:(?:/{0,3}|\\)")
-_SECRET_VALUE_RE = re.compile(
-    r"(?i)(?:\b(?:github_pat_|gh[opusr]_|sk-)[A-Za-z0-9_-]{8,}"
-    r"|\bBearer\s+\S+|-----BEGIN[^\r\n]{0,40}PRIVATE KEY-----"
-    r"|\b(?:password|passwd|secret|token|api[_-]?key|authorization)"
-    r"\s*[:=]\s*[\"']?[^\s,\"'}]+|https?://[^\s/:]+:[^\s/@]+@)"
-)
 _PRIVATE_KEYS = frozenset({
     "path", "paths", "root", "roots", "dir", "dirs", "directory",
     "directories", "locator", "locators", "destination", "destinations",
@@ -143,7 +142,7 @@ def _is_private_key(value: Any) -> bool:
     if key in _PUBLIC_BOUNDARY_KEYS:
         return False
     collapsed = key.replace("_", "")
-    return bool(
+    return bool(is_sensitive_key(value) or
         key in _PRIVATE_KEYS
         or key.endswith(_PRIVATE_KEY_SUFFIXES)
         or collapsed.endswith(_PRIVATE_COLLAPSED_SUFFIXES)
@@ -155,7 +154,7 @@ def _contains_path_or_secret(value: str) -> bool:
         _ABS_WINDOWS_RE.search(value)
         or _ABS_POSIX_RE.search(value)
         or _FILE_URI_RE.search(value)
-        or _SECRET_VALUE_RE.search(value)
+        or looks_like_credential(value)
         or "../" in value
         or "..\\" in value
     )
@@ -173,7 +172,7 @@ def reject_sensitive(value: Any, *, field: str = "value") -> None:
         for raw_key, item in value.items():
             if not isinstance(raw_key, str):
                 raise CatalysisContractError(f"{field} keys must be strings")
-            if _is_private_key(raw_key):
+            if _is_private_key(raw_key) or _contains_path_or_secret(raw_key):
                 raise CatalysisContractError(f"{field} contains a private field")
             reject_sensitive(item, field=f"{field}.{raw_key}")
         return
@@ -203,6 +202,8 @@ def redact_sensitive(value: Any, *, key: str = "") -> Any:
         return {
             str(item_key): redact_sensitive(item, key=str(item_key))
             for item_key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if not (_is_private_key(item_key)
+                    or _contains_path_or_secret(str(item_key)))
         }
     if isinstance(value, (list, tuple)):
         return [redact_sensitive(item) for item in value]
@@ -423,7 +424,6 @@ class MethodFingerprint:
 
 class _DomainDTO:
     schema: ClassVar[str]
-    model_version: str
     provenance: str
     evidence_refs: tuple[EvidenceRef, ...]
     method_fingerprint: MethodFingerprint
@@ -432,8 +432,6 @@ class _DomainDTO:
         return semantic_hash(self.to_dict())
 
     def _validate_common(self) -> None:
-        if self.model_version != MODEL_VERSION:
-            raise CatalysisContractError("domain model version is unsupported")
         refs = _evidence_refs(self.evidence_refs, "evidence_refs")
         object.__setattr__(self, "evidence_refs", refs)
         object.__setattr__(self, "provenance", _validate_provenance(
@@ -450,16 +448,51 @@ class _DomainDTO:
     def _common_dict(self) -> dict[str, Any]:
         return {
             "schema": self.schema,
-            "model_version": self.model_version,
             "provenance": self.provenance,
             "evidence_refs": [item.to_dict() for item in self.evidence_refs],
             "method_fingerprint": self.method_fingerprint.to_dict(),
         }
 
 
+class _RevisionedDomainDTO(_DomainDTO):
+    dto_schema_version: ClassVar[str]
+    schema_version: str
+    object_revision_id: str
+    parent_revision: str | None
+    expected_current_hash: str | None
+
+    def _validate_common(self) -> None:
+        if self.schema_version != self.dto_schema_version:
+            raise CatalysisContractError("domain DTO schema version is unsupported")
+        object.__setattr__(self, "object_revision_id", _opaque_id(
+            self.object_revision_id, "object_revision_id"))
+        object.__setattr__(self, "parent_revision", _opaque_id(
+            self.parent_revision, "parent_revision", optional=True))
+        expected = self.expected_current_hash
+        if expected is not None:
+            expected = _sha256(expected, "expected_current_hash")
+        if (self.parent_revision is None) != (expected is None):
+            raise CatalysisContractError(
+                "parent_revision and expected_current_hash must be provided together")
+        if self.parent_revision == self.object_revision_id:
+            raise CatalysisContractError("a revision cannot be its own parent")
+        object.__setattr__(self, "expected_current_hash", expected)
+        super()._validate_common()
+
+    def _common_dict(self) -> dict[str, Any]:
+        return {
+            **super()._common_dict(),
+            "schema_version": self.schema_version,
+            "object_revision_id": self.object_revision_id,
+            "parent_revision": self.parent_revision,
+            "expected_current_hash": self.expected_current_hash,
+        }
+
+
 @dataclass(frozen=True)
-class CatalystSurface(_DomainDTO):
+class CatalystSurface(_RevisionedDomainDTO):
     schema: ClassVar[str] = "vcstudio.catalyst-surface/v1"
+    dto_schema_version: ClassVar[str] = "1.0.0"
     surface_id: str
     composition: str
     miller_indices: tuple[int, int, int]
@@ -468,7 +501,10 @@ class CatalystSurface(_DomainDTO):
     provenance: str
     evidence_refs: tuple[EvidenceRef, ...]
     method_fingerprint: MethodFingerprint
-    model_version: str = MODEL_VERSION
+    object_revision_id: str
+    parent_revision: str | None = None
+    expected_current_hash: str | None = None
+    schema_version: str = "1.0.0"
 
     def __post_init__(self) -> None:
         self._validate_common()
@@ -476,6 +512,7 @@ class CatalystSurface(_DomainDTO):
         composition = str(self.composition or "").strip()
         if not _FORMULA_RE.fullmatch(composition):
             raise CatalysisContractError("composition is invalid")
+        reject_sensitive(composition, field="composition")
         object.__setattr__(self, "composition", composition)
         miller = tuple(self.miller_indices)
         if len(miller) != 3 or any(isinstance(item, bool) or not isinstance(item, int)
@@ -496,7 +533,8 @@ class CatalystSurface(_DomainDTO):
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> CatalystSurface:
-        allowed = {"schema", "model_version", "surface_id", "composition",
+        allowed = {"schema", "schema_version", "object_revision_id",
+                   "parent_revision", "expected_current_hash", "surface_id", "composition",
                    "miller_indices", "termination_id", "geometric_site_ids",
                    "provenance", "evidence_refs", "method_fingerprint"}
         _strict_fields(value, allowed, label="catalyst_surface")
@@ -510,13 +548,17 @@ class CatalystSurface(_DomainDTO):
             provenance=value["provenance"],
             evidence_refs=_evidence_refs(value["evidence_refs"], "evidence_refs"),
             method_fingerprint=MethodFingerprint.from_dict(value["method_fingerprint"]),
-            model_version=value["model_version"],
+            object_revision_id=value["object_revision_id"],
+            parent_revision=value["parent_revision"],
+            expected_current_hash=value["expected_current_hash"],
+            schema_version=value["schema_version"],
         )
 
 
 @dataclass(frozen=True)
-class AdsorbateState(_DomainDTO):
+class AdsorbateState(_RevisionedDomainDTO):
     schema: ClassVar[str] = "vcstudio.adsorbate-state/v1"
+    dto_schema_version: ClassVar[str] = "1.0.0"
     state_id: str
     surface_id: str
     adsorbate_id: str
@@ -527,7 +569,10 @@ class AdsorbateState(_DomainDTO):
     provenance: str
     evidence_refs: tuple[EvidenceRef, ...]
     method_fingerprint: MethodFingerprint
-    model_version: str = MODEL_VERSION
+    object_revision_id: str
+    parent_revision: str | None = None
+    expected_current_hash: str | None = None
+    schema_version: str = "1.0.0"
 
     def __post_init__(self) -> None:
         self._validate_common()
@@ -536,6 +581,7 @@ class AdsorbateState(_DomainDTO):
         formula = str(self.chemical_formula or "").strip()
         if not _FORMULA_RE.fullmatch(formula):
             raise CatalysisContractError("chemical_formula is invalid")
+        reject_sensitive(formula, field="chemical_formula")
         object.__setattr__(self, "chemical_formula", formula)
         object.__setattr__(self, "geometric_site_id", _opaque_id(
             self.geometric_site_id, "geometric_site_id", optional=True))
@@ -557,7 +603,8 @@ class AdsorbateState(_DomainDTO):
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> AdsorbateState:
-        allowed = {"schema", "model_version", "state_id", "surface_id",
+        allowed = {"schema", "schema_version", "object_revision_id",
+                   "parent_revision", "expected_current_hash", "state_id", "surface_id",
                    "adsorbate_id", "chemical_formula", "geometric_site_id",
                    "charge", "multiplicity", "provenance", "evidence_refs",
                    "method_fingerprint"}
@@ -571,31 +618,94 @@ class AdsorbateState(_DomainDTO):
             multiplicity=value["multiplicity"], provenance=value["provenance"],
             evidence_refs=_evidence_refs(value["evidence_refs"], "evidence_refs"),
             method_fingerprint=MethodFingerprint.from_dict(value["method_fingerprint"]),
-            model_version=value["model_version"],
+            object_revision_id=value["object_revision_id"],
+            parent_revision=value["parent_revision"],
+            expected_current_hash=value["expected_current_hash"],
+            schema_version=value["schema_version"],
         )
 
 
 @dataclass(frozen=True)
-class ElementaryStep(_DomainDTO):
-    schema: ClassVar[str] = "vcstudio.elementary-step/v1"
+class ReactionParticipant:
+    """One stoichiometric side participant; identity resolves outside the DTO."""
+
+    state_id: str
+    coefficient: int
+    phase: str
+    charge: int
+    site_count: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "state_id", _opaque_id(self.state_id, "participant.state_id"))
+        if (isinstance(self.coefficient, bool) or not isinstance(self.coefficient, int)
+                or not 1 <= self.coefficient <= 1_000_000):
+            raise CatalysisContractError("participant.coefficient must be a positive integer")
+        object.__setattr__(self, "phase", _enum(
+            self.phase, "participant.phase", PARTICIPANT_PHASES))
+        if (isinstance(self.charge, bool) or not isinstance(self.charge, int)
+                or not -1000 <= self.charge <= 1000):
+            raise CatalysisContractError("participant.charge must be a bounded integer")
+        if (isinstance(self.site_count, bool) or not isinstance(self.site_count, int)
+                or not 0 <= self.site_count <= 1000):
+            raise CatalysisContractError("participant.site_count must be a non-negative integer")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "state_id": self.state_id,
+            "coefficient": self.coefficient,
+            "phase": self.phase,
+            "charge": self.charge,
+            "site_count": self.site_count,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> ReactionParticipant:
+        _strict_fields(
+            value, {"state_id", "coefficient", "phase", "charge", "site_count"},
+            label="reaction_participant",
+        )
+        return cls(**dict(value))
+
+
+def _participants(value: Any, field: str) -> tuple[ReactionParticipant, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise CatalysisContractError(f"{field} must be an array of participants")
+    result = tuple(
+        item if isinstance(item, ReactionParticipant) else ReactionParticipant.from_dict(item)
+        for item in value
+    )
+    if not result:
+        raise CatalysisContractError(f"{field} must not be empty")
+    if len({item.state_id for item in result}) != len(result):
+        raise CatalysisContractError(f"{field} must combine duplicate states into coefficients")
+    return result
+
+
+@dataclass(frozen=True)
+class ElementaryStep(_RevisionedDomainDTO):
+    """A v2 step whose coefficients and conserved quantities are explicit."""
+
+    schema: ClassVar[str] = "vcstudio.elementary-step/v2"
+    dto_schema_version: ClassVar[str] = "2.0.0"
     step_id: str
-    reactant_state_ids: tuple[str, ...]
-    product_state_ids: tuple[str, ...]
+    reactants: tuple[ReactionParticipant, ...]
+    products: tuple[ReactionParticipant, ...]
     transition_state_id: str | None
     condition_set_id: str | None
     reversible: bool
     provenance: str
     evidence_refs: tuple[EvidenceRef, ...]
     method_fingerprint: MethodFingerprint
-    model_version: str = MODEL_VERSION
+    object_revision_id: str
+    parent_revision: str | None = None
+    expected_current_hash: str | None = None
+    schema_version: str = "2.0.0"
 
     def __post_init__(self) -> None:
         self._validate_common()
         object.__setattr__(self, "step_id", _opaque_id(self.step_id, "step_id"))
-        object.__setattr__(self, "reactant_state_ids", _opaque_ids(
-            self.reactant_state_ids, "reactant_state_ids"))
-        object.__setattr__(self, "product_state_ids", _opaque_ids(
-            self.product_state_ids, "product_state_ids"))
+        object.__setattr__(self, "reactants", _participants(self.reactants, "reactants"))
+        object.__setattr__(self, "products", _participants(self.products, "products"))
         object.__setattr__(self, "transition_state_id", _opaque_id(
             self.transition_state_id, "transition_state_id", optional=True))
         object.__setattr__(self, "condition_set_id", _opaque_id(
@@ -605,35 +715,156 @@ class ElementaryStep(_DomainDTO):
 
     def to_dict(self) -> dict[str, Any]:
         return {**self._common_dict(), "step_id": self.step_id,
-                "reactant_state_ids": list(self.reactant_state_ids),
-                "product_state_ids": list(self.product_state_ids),
+                "reactants": [item.to_dict() for item in self.reactants],
+                "products": [item.to_dict() for item in self.products],
                 "transition_state_id": self.transition_state_id,
                 "condition_set_id": self.condition_set_id,
                 "reversible": self.reversible}
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ElementaryStep:
-        allowed = {"schema", "model_version", "step_id", "reactant_state_ids",
-                   "product_state_ids", "transition_state_id", "condition_set_id",
-                   "reversible", "provenance", "evidence_refs", "method_fingerprint"}
+        allowed = {"schema", "schema_version", "object_revision_id",
+                   "parent_revision", "expected_current_hash", "step_id", "reactants",
+                   "products", "transition_state_id", "condition_set_id", "reversible",
+                   "provenance", "evidence_refs", "method_fingerprint"}
         _strict_fields(value, allowed, label="elementary_step")
         if value["schema"] != cls.schema:
             raise CatalysisContractError("elementary step schema is unsupported")
         return cls(
-            step_id=value["step_id"], reactant_state_ids=tuple(value["reactant_state_ids"]),
-            product_state_ids=tuple(value["product_state_ids"]),
+            step_id=value["step_id"],
+            reactants=tuple(ReactionParticipant.from_dict(item) for item in value["reactants"]),
+            products=tuple(ReactionParticipant.from_dict(item) for item in value["products"]),
             transition_state_id=value["transition_state_id"],
             condition_set_id=value["condition_set_id"], reversible=value["reversible"],
             provenance=value["provenance"],
             evidence_refs=_evidence_refs(value["evidence_refs"], "evidence_refs"),
             method_fingerprint=MethodFingerprint.from_dict(value["method_fingerprint"]),
-            model_version=value["model_version"],
+            object_revision_id=value["object_revision_id"],
+            parent_revision=value["parent_revision"],
+            expected_current_hash=value["expected_current_hash"],
+            schema_version=value["schema_version"],
         )
 
 
 @dataclass(frozen=True)
-class ConditionSet(_DomainDTO):
+class AuthoritativeParticipantState:
+    """Resolver-owned state used to verify, never infer, step conservation."""
+
+    state_id: str
+    chemical_formula: str
+    phase: str
+    charge: int
+    site_count: int
+
+    def __post_init__(self) -> None:
+        participant = ReactionParticipant(
+            state_id=self.state_id, coefficient=1, phase=self.phase,
+            charge=self.charge, site_count=self.site_count,
+        )
+        object.__setattr__(self, "state_id", participant.state_id)
+        object.__setattr__(self, "phase", participant.phase)
+        formula = str(self.chemical_formula or "").strip()
+        if not formula or not _FORMULA_RE.fullmatch(formula):
+            raise CatalysisContractError("authoritative chemical_formula is invalid")
+        reject_sensitive(formula, field="authoritative chemical_formula")
+        object.__setattr__(self, "chemical_formula", formula)
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> AuthoritativeParticipantState:
+        _strict_fields(
+            value, {"state_id", "chemical_formula", "phase", "charge", "site_count"},
+            label="authoritative_participant_state",
+        )
+        return cls(**dict(value))
+
+
+_ELEMENT_TOKEN_RE = re.compile(r"([A-Z][a-z]?)([1-9]\d*)?")
+
+
+def _element_counts(formula: str) -> dict[str, int]:
+    material = formula.replace("*", "")
+    if not material:
+        return {}
+    tokens = list(_ELEMENT_TOKEN_RE.finditer(material))
+    if not tokens or "".join(match.group(0) for match in tokens) != material:
+        raise CatalysisContractError(
+            "authoritative chemical_formula is not an exact elemental formula")
+    result: dict[str, int] = {}
+    for match in tokens:
+        element = match.group(1)
+        result[element] = result.get(element, 0) + int(match.group(2) or "1")
+    return result
+
+
+def validate_elementary_step_conservation(
+    step: ElementaryStep,
+    resolver: Mapping[str, AuthoritativeParticipantState | Mapping[str, Any]]
+    | Callable[[str], AuthoritativeParticipantState | Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    """Resolve every state authoritatively and verify element/charge/site balance.
+
+    Participant declarations are checked against the resolved record before any
+    balance is computed.  The function is validation-only and never authorizes
+    or instantiates a workflow.
+    """
+
+    if not isinstance(step, ElementaryStep):
+        raise CatalysisContractError("step must be an ElementaryStep")
+
+    def resolved(state_id: str) -> AuthoritativeParticipantState:
+        try:
+            value = resolver(state_id) if callable(resolver) else resolver[state_id]
+        except (KeyError, LookupError) as exc:
+            raise CatalysisContractError(
+                f"authoritative resolver has no state {state_id}") from exc
+        if isinstance(value, AuthoritativeParticipantState):
+            record = value
+        elif isinstance(value, Mapping):
+            record = AuthoritativeParticipantState.from_dict(value)
+        else:
+            raise CatalysisContractError("authoritative resolver returned an invalid state")
+        if record.state_id != state_id:
+            raise CatalysisContractError("authoritative resolver identity mismatch")
+        return record
+
+    def totals(side: tuple[ReactionParticipant, ...]) -> tuple[dict[str, int], int, int]:
+        elements: dict[str, int] = {}
+        charge = 0
+        sites = 0
+        for participant in side:
+            state = resolved(participant.state_id)
+            if (state.phase != participant.phase or state.charge != participant.charge
+                    or state.site_count != participant.site_count):
+                raise CatalysisContractError(
+                    "participant declaration disagrees with authoritative state")
+            for element, count in _element_counts(state.chemical_formula).items():
+                elements[element] = elements.get(element, 0) + participant.coefficient * count
+            charge += participant.coefficient * participant.charge
+            sites += participant.coefficient * participant.site_count
+        return elements, charge, sites
+
+    reactant_elements, reactant_charge, reactant_sites = totals(step.reactants)
+    product_elements, product_charge, product_sites = totals(step.products)
+    if reactant_elements != product_elements:
+        raise CatalysisContractError("elementary step violates elemental conservation")
+    if reactant_charge != product_charge:
+        raise CatalysisContractError("elementary step violates charge conservation")
+    if reactant_sites != product_sites:
+        raise CatalysisContractError("elementary step violates surface-site conservation")
+    return _FrozenDict({
+        "schema": "vcstudio.elementary-step-conservation/v1",
+        "step_id": step.step_id,
+        "elements": _FrozenDict(reactant_elements),
+        "charge": reactant_charge,
+        "site_count": reactant_sites,
+        "authorizes_execution": False,
+    })
+
+
+@dataclass(frozen=True)
+class ConditionSet(_RevisionedDomainDTO):
     schema: ClassVar[str] = "vcstudio.condition-set/v1"
+    dto_schema_version: ClassVar[str] = "1.0.0"
     condition_set_id: str
     temperature_k: float | None
     pressure_pa: float | None
@@ -642,7 +873,10 @@ class ConditionSet(_DomainDTO):
     provenance: str
     evidence_refs: tuple[EvidenceRef, ...]
     method_fingerprint: MethodFingerprint
-    model_version: str = MODEL_VERSION
+    object_revision_id: str
+    parent_revision: str | None = None
+    expected_current_hash: str | None = None
+    schema_version: str = "1.0.0"
 
     def __post_init__(self) -> None:
         self._validate_common()
@@ -668,7 +902,8 @@ class ConditionSet(_DomainDTO):
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ConditionSet:
-        allowed = {"schema", "model_version", "condition_set_id", "temperature_k",
+        allowed = {"schema", "schema_version", "object_revision_id",
+                   "parent_revision", "expected_current_hash", "condition_set_id", "temperature_k",
                    "pressure_pa", "ph", "electrode_potential_v", "provenance",
                    "evidence_refs", "method_fingerprint"}
         _strict_fields(value, allowed, label="condition_set")
@@ -681,13 +916,17 @@ class ConditionSet(_DomainDTO):
             provenance=value["provenance"],
             evidence_refs=_evidence_refs(value["evidence_refs"], "evidence_refs"),
             method_fingerprint=MethodFingerprint.from_dict(value["method_fingerprint"]),
-            model_version=value["model_version"],
+            object_revision_id=value["object_revision_id"],
+            parent_revision=value["parent_revision"],
+            expected_current_hash=value["expected_current_hash"],
+            schema_version=value["schema_version"],
         )
 
 
 @dataclass(frozen=True)
-class ReactionNetwork(_DomainDTO):
+class ReactionNetwork(_RevisionedDomainDTO):
     schema: ClassVar[str] = "vcstudio.reaction-network/v1"
+    dto_schema_version: ClassVar[str] = "1.0.0"
     network_id: str
     surface_ids: tuple[str, ...]
     state_ids: tuple[str, ...]
@@ -696,7 +935,10 @@ class ReactionNetwork(_DomainDTO):
     provenance: str
     evidence_refs: tuple[EvidenceRef, ...]
     method_fingerprint: MethodFingerprint
-    model_version: str = MODEL_VERSION
+    object_revision_id: str
+    parent_revision: str | None = None
+    expected_current_hash: str | None = None
+    schema_version: str = "1.0.0"
 
     def __post_init__(self) -> None:
         self._validate_common()
@@ -714,7 +956,8 @@ class ReactionNetwork(_DomainDTO):
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ReactionNetwork:
-        allowed = {"schema", "model_version", "network_id", "surface_ids", "state_ids",
+        allowed = {"schema", "schema_version", "object_revision_id",
+                   "parent_revision", "expected_current_hash", "network_id", "surface_ids", "state_ids",
                    "step_ids", "condition_set_ids", "provenance", "evidence_refs",
                    "method_fingerprint"}
         _strict_fields(value, allowed, label="reaction_network")
@@ -727,7 +970,10 @@ class ReactionNetwork(_DomainDTO):
             provenance=value["provenance"],
             evidence_refs=_evidence_refs(value["evidence_refs"], "evidence_refs"),
             method_fingerprint=MethodFingerprint.from_dict(value["method_fingerprint"]),
-            model_version=value["model_version"],
+            object_revision_id=value["object_revision_id"],
+            parent_revision=value["parent_revision"],
+            expected_current_hash=value["expected_current_hash"],
+            schema_version=value["schema_version"],
         )
 
 
@@ -933,6 +1179,8 @@ class WorkflowRecipe(_DomainDTO):
     model_version: str = MODEL_VERSION
 
     def __post_init__(self) -> None:
+        if self.model_version != MODEL_VERSION:
+            raise CatalysisContractError("workflow recipe model version is unsupported")
         self._validate_common()
         object.__setattr__(self, "recipe_id", _opaque_id(self.recipe_id, "recipe_id"))
         object.__setattr__(self, "recipe_version", _version(
@@ -977,7 +1225,7 @@ class WorkflowRecipe(_DomainDTO):
         urls = tuple(str(item or "").strip() for item in self.official_reference_urls)
         if not urls or len(set(urls)) != len(urls) or any(
                 not re.fullmatch(r"https://[A-Za-z0-9.-]+(?::\d+)?(?:/[^\s]*)?", item)
-                or _SECRET_VALUE_RE.search(item) for item in urls):
+                or looks_like_credential(item) for item in urls):
             raise CatalysisContractError("official references must be unique public HTTPS URLs")
         object.__setattr__(self, "inputs", inputs)
         object.__setattr__(self, "parameters", parameters)
@@ -986,7 +1234,8 @@ class WorkflowRecipe(_DomainDTO):
         object.__setattr__(self, "official_reference_urls", urls)
 
     def to_dict(self) -> dict[str, Any]:
-        return {**self._common_dict(), "recipe_id": self.recipe_id,
+        return {**self._common_dict(), "model_version": self.model_version,
+                "recipe_id": self.recipe_id,
                 "recipe_version": self.recipe_version, "label_zh": self.label_zh,
                 "label_en": self.label_en, "summary_zh": self.summary_zh,
                 "summary_en": self.summary_en,
@@ -1040,10 +1289,20 @@ def _object_identity(value: _DomainDTO) -> str:
     raise CatalysisContractError("domain object has no identity")
 
 
-def _object_version(value: _DomainDTO) -> str:
-    """Use the scientific recipe version when present, otherwise the DTO version."""
+def _object_schema_version(value: _DomainDTO) -> str:
+    if isinstance(value, WorkflowRecipe):
+        return value.model_version
+    return value.schema_version
 
-    return str(getattr(value, "recipe_version", value.model_version))
+
+def _object_revision(value: _DomainDTO) -> tuple[str, str | None, str | None]:
+    if isinstance(value, WorkflowRecipe):
+        return value.recipe_version, None, None
+    return (
+        value.object_revision_id,
+        value.parent_revision,
+        value.expected_current_hash,
+    )
 
 
 @dataclass(frozen=True)
@@ -1052,7 +1311,10 @@ class DomainEnvelope:
 
     object_type: str
     object_id: str
-    object_version: str
+    schema_version: str
+    object_revision_id: str
+    parent_revision: str | None
+    expected_current_hash: str | None
     payload: Mapping[str, Any]
     semantic_sha256: str
     schema: str = DOMAIN_ENVELOPE_SCHEMA
@@ -1065,15 +1327,30 @@ class DomainEnvelope:
         if self.object_type not in DOMAIN_TYPES:
             raise CatalysisContractError("domain envelope object type is unsupported")
         object.__setattr__(self, "object_id", _opaque_id(self.object_id, "object_id"))
-        object.__setattr__(self, "object_version", _version(
-            self.object_version, "object_version"))
+        object.__setattr__(self, "schema_version", _version(
+            self.schema_version, "schema_version"))
+        object.__setattr__(self, "object_revision_id", _opaque_id(
+            self.object_revision_id, "object_revision_id"))
+        object.__setattr__(self, "parent_revision", _opaque_id(
+            self.parent_revision, "parent_revision", optional=True))
+        expected = self.expected_current_hash
+        if expected is not None:
+            expected = _sha256(expected, "expected_current_hash")
+        if (self.parent_revision is None) != (expected is None):
+            raise CatalysisContractError(
+                "envelope parent revision and expected hash must be provided together")
+        object.__setattr__(self, "expected_current_hash", expected)
         if self.job_source_of_truth != "job.yaml" or self.authorizes_execution is not False:
             raise CatalysisContractError("domain envelope authority boundary is invalid")
         parsed = DOMAIN_TYPES[self.object_type].from_dict(self.payload)
         if _object_identity(parsed) != self.object_id:
             raise CatalysisContractError("domain envelope identity mismatch")
-        if _object_version(parsed) != self.object_version:
-            raise CatalysisContractError("domain envelope version mismatch")
+        if _object_schema_version(parsed) != self.schema_version:
+            raise CatalysisContractError("domain envelope schema version mismatch")
+        revision_id, parent_id, parsed_expected = _object_revision(parsed)
+        if (revision_id != self.object_revision_id or parent_id != self.parent_revision
+                or parsed_expected != self.expected_current_hash):
+            raise CatalysisContractError("domain envelope revision identity mismatch")
         digest = _sha256(self.semantic_sha256, "semantic_sha256")
         if parsed.semantic_hash() != digest:
             raise CatalysisContractError("domain envelope semantic hash mismatch")
@@ -1084,23 +1361,31 @@ class DomainEnvelope:
     def wrap(cls, value: _DomainDTO) -> DomainEnvelope:
         if not isinstance(value, tuple(DOMAIN_TYPES.values())):
             raise CatalysisContractError("unsupported domain object")
+        revision_id, parent_id, expected = _object_revision(value)
         return cls(
             object_type=type(value).__name__, object_id=_object_identity(value),
-            object_version=_object_version(value), payload=value.to_dict(),
+            schema_version=_object_schema_version(value),
+            object_revision_id=revision_id, parent_revision=parent_id,
+            expected_current_hash=expected, payload=value.to_dict(),
             semantic_sha256=value.semantic_hash(),
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {"schema": self.schema, "object_type": self.object_type,
-                "object_id": self.object_id, "object_version": self.object_version,
+                "object_id": self.object_id, "schema_version": self.schema_version,
+                "object_revision_id": self.object_revision_id,
+                "parent_revision": self.parent_revision,
+                "expected_current_hash": self.expected_current_hash,
                 "payload": _json_value(self.payload), "semantic_sha256": self.semantic_sha256,
                 "job_source_of_truth": self.job_source_of_truth,
                 "authorizes_execution": self.authorizes_execution}
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> DomainEnvelope:
-        allowed = {"schema", "object_type", "object_id", "object_version", "payload",
-                   "semantic_sha256", "job_source_of_truth", "authorizes_execution"}
+        allowed = {"schema", "object_type", "object_id", "schema_version",
+                   "object_revision_id", "parent_revision", "expected_current_hash",
+                   "payload", "semantic_sha256", "job_source_of_truth",
+                   "authorizes_execution"}
         _strict_fields(value, allowed, label="domain_envelope")
         return cls(**dict(value))
 
@@ -1215,10 +1500,13 @@ class WorkflowRunSnapshot:
 
 
 __all__ = [
-    "AdsorbateState", "CatalystSurface", "CatalysisContractError", "ConditionSet",
+    "AdsorbateState", "AuthoritativeParticipantState", "CatalystSurface",
+    "CatalysisContractError", "ConditionSet",
     "DOMAIN_ENVELOPE_SCHEMA", "DomainEnvelope", "EVIDENCE_TYPES", "ElementaryStep",
-    "EvidenceRef", "MODEL_VERSION", "MethodFingerprint", "PROVENANCE_KINDS",
-    "ReactionNetwork", "RecipeInput", "RecipeParameter", "ScientificLimit",
+    "EvidenceRef", "MODEL_VERSION", "MethodFingerprint", "PARTICIPANT_PHASES",
+    "PROVENANCE_KINDS", "ReactionNetwork", "ReactionParticipant", "RecipeInput",
+    "RecipeParameter", "ScientificLimit",
     "WORKFLOW_RUN_SCHEMA", "WorkflowNode", "WorkflowRecipe", "WorkflowRunSnapshot",
     "canonical_json_bytes", "redact_sensitive", "reject_sensitive", "semantic_hash",
+    "validate_elementary_step_conservation",
 ]

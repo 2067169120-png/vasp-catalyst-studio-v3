@@ -7,8 +7,10 @@
 
   const OPAQUE_ID = /^[A-Za-z0-9][A-Za-z0-9._~:-]{0,159}$/;
   const State = {
-    catalog: [], selectedId: '', busy: false, loaded: false, preview: null,
-    parameterControls: [], evidenceControls: [], recipeButtons: [], selectionGeneration: 0,
+    catalog: [], selectedKey: '', catalogBusy: false, loaded: false,
+    preview: null, previewKey: '', pendingPreviewKeys: new Set(),
+    parameterControls: [], evidenceControls: [], recipeButtons: [],
+    selectionGeneration: 0, previewRequestGeneration: 0,
   };
 
   const el = id => document.getElementById(id);
@@ -18,6 +20,12 @@
   );
   const localized = (row, stem) => String(
     row && row[`${stem}_${english() ? 'en' : 'zh'}`] || ''
+  );
+  const recipeKey = (recipeId, recipeVersion) => JSON.stringify([
+    String(recipeId || ''), String(recipeVersion || ''),
+  ]);
+  const recipeDomId = (recipeId, recipeVersion) => (
+    `rr-recipe-${encodeURIComponent(recipeKey(recipeId, recipeVersion))}`
   );
 
   function clear(node) {
@@ -49,17 +57,24 @@
     node.classList.toggle('fail', !!failed);
   }
 
-  function setBusy(value) {
-    State.busy = !!value;
+  function refreshBusyState() {
+    const selectedPreviewBusy = State.pendingPreviewKeys.has(State.selectedKey);
     const button = el('rr-preview-button');
-    if (button) button.disabled = State.busy || !State.selectedId;
-    State.recipeButtons.forEach(item => { item.disabled = State.busy; });
+    if (button) button.disabled = State.catalogBusy || selectedPreviewBusy || !State.selectedKey;
+    State.recipeButtons.forEach(item => { item.disabled = State.catalogBusy; });
     const list = el('rr-list');
-    if (list) list.setAttribute('aria-busy', State.busy ? 'true' : 'false');
+    if (list) list.setAttribute('aria-busy', State.catalogBusy ? 'true' : 'false');
   }
 
-  function recipeById(recipeId) {
-    return State.catalog.find(item => item.recipe_id === recipeId) || null;
+  function setCatalogBusy(value) {
+    State.catalogBusy = !!value;
+    refreshBusyState();
+  }
+
+  function recipeByKey(key) {
+    return State.catalog.find(item => recipeKey(
+      item.recipe_id, item.recipe_version,
+    ) === key) || null;
   }
 
   function renderGallery() {
@@ -68,20 +83,25 @@
     clear(host);
     State.recipeButtons = [];
     State.catalog.forEach(recipe => {
+      const key = recipeKey(recipe.recipe_id, recipe.recipe_version);
       const button = document.createElement('button');
       button.type = 'button';
-      button.id = `rr-recipe-${recipe.recipe_id}`;
+      button.id = recipeDomId(recipe.recipe_id, recipe.recipe_version);
       button.className = 'rr-recipe';
       button.dataset.recipeId = recipe.recipe_id;
-      button.setAttribute('aria-pressed', recipe.recipe_id === State.selectedId ? 'true' : 'false');
-      button.disabled = State.busy;
+      button.dataset.recipeVersion = recipe.recipe_version;
+      button.dataset.recipeKey = key;
+      button.setAttribute('aria-pressed', key === State.selectedKey ? 'true' : 'false');
+      button.disabled = State.catalogBusy;
       button.append(
         textNode('b', localized(recipe, 'label') || recipe.recipe_id),
         textNode('span', localized(recipe, 'summary')),
         textNode('span', `${tr('research_recipes.version', '版本', {})} ${recipe.recipe_version}`,
           'rr-version'),
       );
-      button.addEventListener('click', () => selectRecipe(recipe.recipe_id, { focus: true }));
+      button.addEventListener('click', () => selectRecipe(
+        recipe.recipe_id, recipe.recipe_version, { focus: true },
+      ));
       host.appendChild(button);
       State.recipeButtons.push(button);
     });
@@ -197,21 +217,23 @@
     });
   }
 
-  function selectRecipe(recipeId, options = {}) {
-    if (State.busy && options.force !== true) return false;
-    const recipe = recipeById(recipeId);
+  function selectRecipe(recipeId, recipeVersion, options = {}) {
+    if (State.catalogBusy && options.force !== true) return false;
+    const key = recipeKey(recipeId, recipeVersion);
+    const recipe = recipeByKey(key);
     if (!recipe) return false;
-    if (recipe.recipe_id === State.selectedId && options.focus && options.force !== true) {
+    if (key === State.selectedKey && options.focus && options.force !== true) {
       const currentButton = State.recipeButtons.find(
-        item => item.dataset.recipeId === recipe.recipe_id,
+        item => item.dataset.recipeKey === key,
       );
       if (currentButton) currentButton.focus();
       return true;
     }
     State.selectionGeneration += 1;
-    State.selectedId = recipe.recipe_id;
+    State.selectedKey = key;
     if (!options.preservePreview) {
       State.preview = null;
+      State.previewKey = '';
       const previewPane = el('rr-preview');
       if (previewPane) previewPane.hidden = true;
     }
@@ -228,12 +250,11 @@
     renderGallery();
     if (options.focus) {
       const selectedButton = State.recipeButtons.find(
-        item => item.dataset.recipeId === recipe.recipe_id,
+        item => item.dataset.recipeKey === key,
       );
       if (selectedButton) selectedButton.focus();
     }
-    const previewButton = el('rr-preview-button');
-    if (previewButton) previewButton.disabled = State.busy || !State.selectedId;
+    refreshBusyState();
     return true;
   }
 
@@ -277,6 +298,8 @@
 
   function renderPreview(preview) {
     State.preview = preview || null;
+    State.previewKey = preview
+      ? recipeKey(preview.recipe_id, preview.recipe_version) : '';
     const pane = el('rr-preview');
     if (!pane || !preview) return;
     pane.hidden = false;
@@ -333,10 +356,11 @@
 
   async function requestPreview(event) {
     if (event && typeof event.preventDefault === 'function') event.preventDefault();
-    const recipe = recipeById(State.selectedId);
-    if (!recipe || State.busy) return false;
-    const selectedId = recipe.recipe_id;
+    const selectedKey = State.selectedKey;
+    const recipe = recipeByKey(selectedKey);
+    if (!recipe || State.catalogBusy || State.pendingPreviewKeys.has(selectedKey)) return false;
     const generation = State.selectionGeneration;
+    const requestGeneration = ++State.previewRequestGeneration;
     let request;
     try {
       request = readRequest();
@@ -344,17 +368,22 @@
       setStatus(tr('research_recipes.invalid_opaque', '证据 ID 必须是 opaque ID，不能使用路径。'), true);
       return false;
     }
-    setBusy(true);
+    State.pendingPreviewKeys.add(selectedKey);
+    refreshBusyState();
     setStatus(tr('research_recipes.loading_preview', '正在解析版本与依赖…'));
     try {
       const result = await VCS.call(
         'research_recipe_preview', recipe.recipe_id, recipe.recipe_version, request,
       );
-      if (!result || result.ok !== true || !result.preview) {
+      const stillCurrent = () => (
+        State.selectedKey === selectedKey
+        && State.selectionGeneration === generation
+        && State.previewRequestGeneration === requestGeneration
+      );
+      if (!stillCurrent()) return false;
+      if (!result || result.ok !== true || !result.preview
+          || recipeKey(result.preview.recipe_id, result.preview.recipe_version) !== selectedKey) {
         setStatus(tr('research_recipes.preview_failed', 'DAG 预览失败。'), true);
-        return false;
-      }
-      if (State.selectedId !== selectedId || State.selectionGeneration !== generation) {
         return false;
       }
       renderPreview(result.preview);
@@ -363,16 +392,21 @@
         : tr('research_recipes.blocked', '预览已生成；缺失前置已标出。'));
       return true;
     } catch (_error) {
-      setStatus(tr('research_recipes.preview_failed', 'DAG 预览失败。'), true);
+      if (State.selectedKey === selectedKey
+          && State.selectionGeneration === generation
+          && State.previewRequestGeneration === requestGeneration) {
+        setStatus(tr('research_recipes.preview_failed', 'DAG 预览失败。'), true);
+      }
       return false;
     } finally {
-      setBusy(false);
+      State.pendingPreviewKeys.delete(selectedKey);
+      refreshBusyState();
     }
   }
 
   async function load() {
-    if (!el('rr-list') || State.busy) return false;
-    setBusy(true);
+    if (!el('rr-list') || State.catalogBusy) return false;
+    setCatalogBusy(true);
     setStatus(tr('research_recipes.loading_catalog', '正在加载版本化配方…'));
     try {
       const result = await VCS.call('research_recipe_catalog');
@@ -383,8 +417,10 @@
       State.catalog = result.recipes;
       State.loaded = true;
       renderGallery();
-      if (!State.selectedId && State.catalog.length) {
-        selectRecipe(State.catalog[0].recipe_id, { force: true });
+      if (!State.selectedKey && State.catalog.length) {
+        selectRecipe(
+          State.catalog[0].recipe_id, State.catalog[0].recipe_version, { force: true },
+        );
       }
       setStatus(tr('research_recipes.catalog_ready', '配方目录已加载；尚未创建任何作业。'));
       return true;
@@ -392,16 +428,18 @@
       setStatus(tr('research_recipes.catalog_failed', '研究配方目录不可用。'), true);
       return false;
     } finally {
-      setBusy(false);
+      setCatalogBusy(false);
     }
   }
 
   function redrawLanguage() {
-    const draft = State.selectedId ? readRequest() : null;
+    const draft = State.selectedKey ? readRequest() : null;
+    const selectedRecipe = recipeByKey(State.selectedKey);
     renderGallery();
-    if (State.selectedId) selectRecipe(State.selectedId, {
-      draft, force: true, preservePreview: true,
-    });
+    if (selectedRecipe) selectRecipe(
+      selectedRecipe.recipe_id, selectedRecipe.recipe_version,
+      { draft, force: true, preservePreview: true },
+    );
     if (State.preview) renderPreview(State.preview);
   }
 
@@ -419,17 +457,27 @@
   if (window.__VCS_TEST__) {
     window.__VCS_RESEARCH_RECIPES_TEST__ = {
       State, load, selectRecipe, readRequest, renderGallery, renderPreview,
-      requestPreview,
+      requestPreview, recipeKey, recipeDomId,
       configure(value = {}) {
         if (Array.isArray(value.catalog)) State.catalog = value.catalog;
-        if (value.selectedId) State.selectedId = value.selectedId;
+        if (value.selectedRecipe) State.selectedKey = recipeKey(
+          value.selectedRecipe.recipe_id, value.selectedRecipe.recipe_version,
+        );
       },
       snapshot() {
+        const selectedRecipe = recipeByKey(State.selectedKey);
         return {
-          selected_id: State.selectedId,
+          selected_recipe: selectedRecipe ? {
+            recipe_id: selectedRecipe.recipe_id,
+            recipe_version: selectedRecipe.recipe_version,
+          } : null,
           catalog_count: State.catalog.length,
           preview_hash: State.preview && State.preview.preview_semantic_sha256 || '',
-          request: State.selectedId ? readRequest() : { overrides: {}, evidence: {} },
+          preview_recipe: State.preview ? {
+            recipe_id: State.preview.recipe_id,
+            recipe_version: State.preview.recipe_version,
+          } : null,
+          request: State.selectedKey ? readRequest() : { overrides: {}, evidence: {} },
         };
       },
     };

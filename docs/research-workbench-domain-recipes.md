@@ -1,6 +1,6 @@
 # 催化领域合同、研究配方与执行前 DAG
 
-状态：实现合同 v1（2026-08-15）。本文描述逻辑研究层，不改变作业执行事实源、远程提交门禁或报告发布门禁。
+状态：实现合同 v2（2026-08-15）。本文描述逻辑研究层，不改变作业执行事实源、远程提交门禁或报告发布门禁。
 
 ## 1. 分层与事实边界
 
@@ -8,7 +8,7 @@
 
 | 层 | 记录内容 | 权威边界 |
 |---|---|---|
-| 催化领域 DTO | surface、adsorbate state、elementary step、conditions、reaction network | 科学对象和逻辑关系；不记录浏览器路径、命令、主机或密钥 |
+| 催化领域 DTO | surface、adsorbate state、elementary step、conditions、reaction network | 科学对象、不可变 revision 和逻辑关系；不记录浏览器路径、命令、主机或密钥 |
 | WorkflowRecipe | 有版本的节点、依赖、输入证据、参数、输出、科学限制、官方参考 | 研究意图；`ready` 只表示预览前置齐全 |
 | WorkflowRunSnapshot | 固定 recipe ID/version/hash、完整 resolved parameters、每项参数来源和 preview hash | 可能运行的冻结计划；`authorizes_execution=false` |
 | `job.yaml` | 已创建/已执行作业的输入、状态和尝试 | **唯一作业事实源**；本包不覆盖、不旁路 |
@@ -21,21 +21,28 @@
 
 - `CatalystSurface`：composition、Miller index、termination opaque ID、`geometric_site_ids`。合同故意没有可由几何位点自动推出的 active-site 字段。
 - `AdsorbateState`：surface/adsorbate/state opaque IDs、formula、几何位点、charge/multiplicity。
-- `ElementaryStep`：反应物/产物 state IDs、可选 transition-state 与 condition IDs。
+- `ElementaryStep` v2：反应物/产物均为 participant，显式携带 `state_id`、整数系数、phase、charge 和 `site_count`；可选 transition-state 与 condition IDs。旧的两个 state-ID 数组不是可接受的 v2 形状。
 - `ConditionSet`：temperature、pressure、pH、电极电势；至少一项有定义。
 - `ReactionNetwork`：仅以 opaque IDs 连接 surfaces、states、steps 和 conditions。
 - `WorkflowRecipe`：版本、双语元数据、输入槽、参数、拓扑有序节点、科学限制和 HTTPS 官方参考。
 
-所有领域对象都必须携带：
+除另有独立 recipe version 的 `WorkflowRecipe` 外，所有领域对象都必须携带：
 
-1. `model_version`；
-2. 显式 `provenance ∈ {observed, imported, inferred}`；
-3. `EvidenceRef[]`，每条含 evidence type、opaque ID、origin 和可选 revision ID；
-4. `MethodFingerprint`，含 method opaque ID、scope、SHA-256 和方法证据引用。
+1. DTO 形状的 `schema_version`；
+2. 不可变 `object_revision_id`；后续 revision 同时携带 `parent_revision` 与 `expected_current_hash`；
+3. 显式 `provenance ∈ {observed, imported, inferred}`；
+4. `EvidenceRef[]`，每条含 evidence type、opaque ID、origin 和可选 revision ID；
+5. `MethodFingerprint`，含 method opaque ID、scope、SHA-256 和方法证据引用。
 
-观测对象只能引用 `origin=observed` 的证据；推断对象必须至少有一条 `origin=inferred` 证据。合同会拒绝同一 DTO 内部 top-level provenance 与 evidence/method origin 的不一致，也会拒绝把 `publication_record` / `imported_record` 标成 observed。origin 本身仍是调用方声明，当前没有 authoritative evidence resolver 或签名，因此该一致性检查不能证明来源真实性。`DomainEnvelope` 对 DTO 重解析、校验 identity/version、重算 semantic hash，并固定 `job_source_of_truth=job.yaml`、`authorizes_execution=false`。
+观测对象只能引用 `origin=observed` 的证据；推断对象必须至少有一条 `origin=inferred` 证据。合同会拒绝同一 DTO 内部 top-level provenance 与 evidence/method origin 的不一致，也会拒绝把 `publication_record` / `imported_record` 标成 observed。origin 本身仍是调用方声明，当前没有 authoritative evidence resolver 或签名，因此该一致性检查不能证明来源真实性。`DomainEnvelope` v2 对 DTO 重解析，逐项绑定 object type/ID、schema version、revision/parent/expected hash 并重算 semantic hash；其无歧义身份是 `(object_type, object_id, object_revision_id)`，同时固定 `job_source_of_truth=job.yaml`、`authorizes_execution=false`。
 
-Canonical JSON 使用 UTF-8、键排序、紧凑分隔符、禁止 NaN/Infinity；semantic hash 为其 SHA-256。它是内容身份/完整性校验，不是数字签名，也不证明科学真实性。调用方拥有的 mapping 会先递归检查，拒绝 path/dir/root/locator、复合凭据字段、绝对路径（包括嵌入文本）、文件 URI、目录穿越和 secret-shaped value。
+Canonical JSON 使用 UTF-8、键排序、紧凑分隔符、禁止 NaN/Infinity；semantic hash 为其 SHA-256。非 recipe DTO 的 revision/parent/CAS 元数据属于 canonical payload，因此同一科学内容的新 revision 也有不同 hash。该 hash 是内容身份/完整性校验，不是数字签名，也不证明科学真实性。
+
+`vcstudio.project.catalysis_domain_store.DomainEnvelopeStore` 是独立的单文件逻辑 authority：revision 以三元身份 create-only 保存，同三元身份同 hash 只能幂等 replay、不同 hash 必须冲突；head 前进在同一跨进程锁和原子 JSON 事务内同时比较 `parent_revision` 与当前 semantic hash。损坏的既有 authority 不会被覆盖，stale writer 不会改写 head。它不复用或修改 workspace CAS，也不创建或更新 `job.yaml`。
+
+`ElementaryStep` 的守恒检查只接受 resolver 返回的 authoritative state record；participant 声明必须与解析出的 phase/charge/site count 完全一致，然后才按系数核对元素、电荷和表面位点守恒。因此 `H2 → H2O` 会被拒绝，`2 H → H2` 可表达并通过。该 resolver 只证明所给状态记录下的守恒，不证明路径、势垒或机理科学成立，也不会推断几何位点具有活性。
+
+调用方拥有的 mapping 会先递归检查，拒绝 path/dir/root/locator、绝对路径（包括嵌入文本）、文件 URI、目录穿越和 secret-shaped value。凭据形状由全项目共享的 `vcstudio.shared.credential_classifier` 统一识别，覆盖 AWS access key/secret assignment、GitHub/OpenAI、GitLab、Hugging Face、Stripe、Bearer、常见 token/secret key 及任意协议 userinfo URL；输入拒绝和输出脱敏使用同一分类口径，路径策略仍由各领域边界负责。
 
 ## 3. 内置研究配方
 
@@ -91,12 +98,14 @@ Preview 固定返回：
 
 `Prepare → Templates` 深链焦点现在落在 `#research-recipes-card`。界面提供：
 
-- 真正的 `<button>` 配方卡和 `aria-pressed` 选择状态；
+- 真正的 `<button>` 配方卡和 `aria-pressed` 选择状态；所有 DOM/state/request identity 均使用 `recipe_id + recipe_version` 复合键；
 - native form controls、explicit override checkbox、显式 provenance select；
 - `role=status`、可聚焦 hash、具名 DAG list；
 - 760 px 和 480 px 两级窄屏布局；
 - 中英 locale keys，语言切换时保留当前科学 draft；
 - 只读 DAG、缺失证据、参数来源、限制和官方链接。
+
+同一 recipe ID 的多个版本可以同时显示并独立选择。逆序返回的旧版本 preview 会经复合 response identity、selection generation 和 request generation 检查丢弃，不能覆盖当前版本的表单、状态或 DAG。
 
 服务端输入合同负责拒绝路径/密钥，API 输出再经过递归脱敏。错误响应是固定 error code/message，不回显用户输入或异常中的路径、token、password。
 
@@ -109,5 +118,6 @@ Preview 固定返回：
 - 没有直接嵌入 AiiDA、NOMAD、atomate2、CatMAP 或 Catalysis-Hub client。
 - 没有下载在线数据。
 - 没有修改远程提交、报告门禁、workspace CAS 或旧 campaign 实例化逻辑。
+- 守恒 resolver 是调用侧指定的权威记录入口；本包不提供跨项目材料数据库或来源真实性签名。
 
-当前 snapshot 只提供严格合同，未新增持久化 store 或执行 adapter。Snapshot 构造/反序列化会以保留的 recipe version 重新解析参数、证据、状态和 preview hash；旧版本因此必须继续保留在目录索引中。这样保留了事实源单一性，并把未来写操作留在现有显式门禁后。
+当前新增的领域 store 只持久化不可变逻辑 envelope 与 head CAS，不是执行 adapter。WorkflowRunSnapshot 构造/反序列化会以保留的 recipe version 重新解析参数、证据、状态和 preview hash；旧版本因此必须继续保留在目录索引中。这样保留了事实源单一性，并把未来写操作留在现有显式门禁后。

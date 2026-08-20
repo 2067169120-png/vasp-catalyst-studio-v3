@@ -54,7 +54,8 @@ def test_catalog_has_five_versioned_bilingual_detached_recipes():
     indexed = research_recipes._index_recipes((research_recipes.get("neb_path"), future))
     assert set(indexed["neb_path"]) == {"1.0.0", "1.1.0"}
     envelope = DomainEnvelope.wrap(future)
-    assert envelope.object_version == "1.1.0"
+    assert envelope.schema_version == "1.0.0"
+    assert envelope.object_revision_id == "1.1.0"
     assert DomainEnvelope.from_dict(envelope.to_dict()) == envelope
 
 
