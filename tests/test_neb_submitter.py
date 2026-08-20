@@ -152,6 +152,17 @@ def test_neb_preflight_images_count_mismatch(tmp_path):
     assert any('n_images=9' in e for e in errs)
 
 
+def test_neb_preflight_rejects_image_poscar_changed_after_generation(tmp_path):
+    jd = _neb_job(tmp_path)
+    image = os.path.join(jd, '01', 'POSCAR')
+    with open(image, 'a', encoding='utf-8') as handle:
+        handle.write('# changed after frozen generation\n')
+
+    errs = submitter.preflight(_profile(), jd)
+
+    assert any('01/POSCAR' in error and '已变化' in error for error in errs)
+
+
 # ── 递归上传 ──
 def test_neb_submit_uploads_tree(tmp_path):
     jd = _neb_job(tmp_path)
@@ -169,6 +180,40 @@ def test_neb_submit_uploads_tree(tmp_path):
     assert posixpath.join(remote, 'job.yaml') not in sftp.uploaded   # 台账不上传
     assert posixpath.join(remote, 'vcs_job.sh') in sftp.written
     assert m['state'] == 'SUBMITTED' and m['scheduler_job_id'] == '900'
+    frozen = m['inputs']['image_poscar_sha256']
+    assert m['attempts'][-1]['neb_image_poscar_sha256'] == frozen
+    assert m['execution_authority']['neb_image_poscar_sha256'] == frozen
+    command = next(item for item in client.commands if 'qsub' in item)
+    for frame, digest in frozen.items():
+        assert f'{frame}/POSCAR' in command
+        assert digest in command
+
+
+def test_neb_image_changed_during_upload_fails_remote_hash_gate(tmp_path):
+    jd = _neb_job(tmp_path)
+
+    class MutatingImageSFTP(FakeSFTP):
+        def put(self, local, remote):
+            result = super().put(local, remote)
+            if remote.endswith('/01/POSCAR'):
+                with open(local, 'a', encoding='utf-8') as handle:
+                    handle.write('# changed during upload\n')
+            return result
+
+    client = FakeClient(
+        script=[('qsub', 'must-not-accept.cluster\n')],
+        exit_codes={'01/POSCAR': 1})
+    with pytest.raises(submitter.UnknownRemoteSubmission):
+        submitter.submit_job(client, MutatingImageSFTP(), _profile(), jd)
+
+    failed = manifest.load_manifest(jd)
+    assert failed['state'] == 'UPLOADED'
+    assert not failed.get('scheduler_job_id')
+    assert not failed.get('execution_authority')
+    recovery = submitter._read_submission_recovery(jd)
+    assert recovery['status'] == 'unknown_remote_submission'
+    assert recovery['neb_image_poscar_sha256'] == \
+        manifest.load_manifest(jd)['inputs']['image_poscar_sha256']
 
 
 # ── 刷新:排队/运行/收敛/未收敛 ──

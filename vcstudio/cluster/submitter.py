@@ -248,6 +248,15 @@ def _read_submission_recovery(job_dir) -> dict | None:
         'preparing', 'submitting', 'remote_accepted',
         'unknown_remote_submission',
     }
+    neb_hashes = payload.get('neb_image_poscar_sha256') \
+        if isinstance(payload, dict) else None
+    neb_hashes_valid = (
+        neb_hashes is None
+        or (isinstance(neb_hashes, dict) and 3 <= len(neb_hashes) <= 1000
+            and all(re.fullmatch(r'[0-9]{2,4}', str(key or ''))
+                    and re.fullmatch(r'[0-9a-f]{64}', str(value or ''))
+                    for key, value in neb_hashes.items()))
+    )
     if (not isinstance(payload, dict)
             or payload.get('schema') != _SUBMISSION_RECOVERY_SCHEMA
             or payload.get('status') not in valid_statuses
@@ -255,7 +264,8 @@ def _read_submission_recovery(job_dir) -> dict | None:
             or (payload.get('incar_sha256') is not None
                 and re.fullmatch(
                     r'[0-9a-f]{64}', str(payload.get('incar_sha256') or ''))
-                is None)):
+                is None)
+            or not neb_hashes_valid):
         raise UnknownRemoteSubmission(
             '提交恢复记录无效；为避免重复提交，必须人工核对调度器后再处理。',
             recovery_status='invalid_recovery_journal')
@@ -605,11 +615,12 @@ def _reconcile_submission_recovery(job_dir, manifest: dict | None,
     recovery_job_id = str(recovery.get('scheduler_job_id') or '')
     current_job_id = str((manifest or {}).get('scheduler_job_id') or '')
     attempts = (manifest or {}).get('attempts') or []
-    recorded = any(
-        isinstance(attempt, dict)
+    matching_attempt = next((
+        attempt for attempt in reversed(attempts)
+        if isinstance(attempt, dict)
         and str(attempt.get('job_id') or '') == recovery_job_id
-        for attempt in attempts
-    )
+    ), None)
+    recorded = matching_attempt is not None
     recovered_incar_sha256 = _valid_sha256(recovery.get('incar_sha256'))
     authority = (manifest or {}).get('execution_authority') or {}
     authority_matches = (
@@ -619,9 +630,18 @@ def _reconcile_submission_recovery(job_dir, manifest: dict | None,
             and _valid_sha256(authority.get('current_incar_sha256'))
             == recovered_incar_sha256)
     )
+    recovered_neb_hashes = recovery.get('neb_image_poscar_sha256') or {}
+    neb_authority_matches = (
+        not recovered_neb_hashes
+        or (isinstance(authority, dict)
+            and authority.get('neb_image_poscar_sha256')
+            == recovered_neb_hashes
+            and (matching_attempt or {}).get('neb_image_poscar_sha256')
+            == recovered_neb_hashes)
+    )
     if (recovery.get('status') == 'remote_accepted' and recovery_job_id
             and current_job_id == recovery_job_id and recorded
-            and authority_matches):
+            and authority_matches and neb_authority_matches):
         # Crash/cleanup failure after the manifest replacement: the canonical
         # manifest already carries the exact remote identity, so cleanup and
         # replay are safe without another scheduler call.
@@ -1029,6 +1049,29 @@ def _neb_input_check(job_dir: str, m: dict) -> list:
         errs.append(
             f'NEB image 子目录数 {len(frames)}(含端点 → {len(frames) - 2} 中间 image)'
             f'与 manifest n_images={n} 不符')
+    recorded = (m.get('inputs') or {}).get('image_poscar_sha256')
+    if not isinstance(recorded, dict):
+        errs.append('NEB 清单缺 image_poscar_sha256；请重新生成目录树后再提交')
+    elif set(recorded) != set(frames):
+        errs.append(
+            'NEB 清单的 image POSCAR 摘要集合与数字 image 目录不一致；'
+            '请重新生成目录树')
+    else:
+        for frame in frames:
+            expected = str(recorded.get(frame) or '').strip().lower()
+            if re.fullmatch(r'[0-9a-f]{64}', expected) is None:
+                errs.append(f'NEB image {frame}/POSCAR 的清单 SHA256 无效')
+                continue
+            try:
+                actual = manifest_mod.sha256_file(
+                    os.path.join(job_dir, frame, 'POSCAR')).lower()
+            except OSError as exc:
+                errs.append(f'NEB image {frame}/POSCAR 无法核对摘要：{exc}')
+                continue
+            if actual != expected:
+                errs.append(
+                    f'NEB image {frame}/POSCAR 在生成后已变化；'
+                    '拒绝提交不再匹配清单的反应路径')
     return errs
 
 
@@ -1369,6 +1412,7 @@ def submit_job(client, sftp, profile, job_dir: str, *,
 
     engine = _job_engine(m)
     incar_authority_sha256 = ''
+    neb_image_authority: dict[str, str] = {}
     if engine == 'vasp':
         incar_authority_sha256 = _valid_sha256(
             ((m.get('inputs') or {}).get('sha256') or {}).get('INCAR'))
@@ -1380,6 +1424,13 @@ def submit_job(client, sftp, profile, job_dir: str, *,
         if current_incar_sha256 != incar_authority_sha256:
             raise ValueError(
                 '本地 INCAR 已偏离准备期权威摘要；请重新准备后再提交')
+        if _is_neb(m):
+            neb_image_authority = {
+                str(key): str(value).lower()
+                for key, value in sorted(
+                    ((m.get('inputs') or {}).get(
+                        'image_poscar_sha256') or {}).items())
+            }
 
     recovery = {
         'schema': _SUBMISSION_RECOVERY_SCHEMA,
@@ -1393,6 +1444,7 @@ def submit_job(client, sftp, profile, job_dir: str, *,
         'idempotency_key': operation_key or None,
         'scheduler_job_id': None,
         'incar_sha256': incar_authority_sha256 or None,
+        'neb_image_poscar_sha256': neb_image_authority or None,
     }
     # Freeze the exact generation authority before even the first upload.  A
     # crash in ``preparing`` is known not to have contacted the scheduler.
@@ -1433,11 +1485,15 @@ def submit_job(client, sftp, profile, job_dir: str, *,
             posixpath.join(spec.remote_dir, SCRIPT_NAME),
             getattr(profile, 'scheduler_bin', ''))
         if engine == 'vasp':
-            submit_command = ' && '.join((
+            guards = [
                 f'cd {shlex.quote(spec.remote_dir)}',
                 _remote_sha256_guard('INCAR', incar_authority_sha256),
-                submit_command,
-            ))
+            ]
+            guards.extend(
+                _remote_sha256_guard(f'{frame}/POSCAR', digest)
+                for frame, digest in neb_image_authority.items())
+            guards.append(submit_command)
+            submit_command = ' && '.join(guards)
         out, err = run_cmd(client, submit_command, check=True)
     except Exception as exc:  # noqa: BLE001 - remote acceptance may be unknowable
         recovery['status'] = 'unknown_remote_submission'
@@ -1499,10 +1555,15 @@ def submit_job(client, sftp, profile, job_dir: str, *,
         }
         if engine == 'vasp':
             attempt['incar_sha256'] = incar_authority_sha256
+            if neb_image_authority:
+                attempt['neb_image_poscar_sha256'] = dict(
+                    neb_image_authority)
             _set_incar_authority(
                 m, scheduler_job_id=str(job_id),
                 incar_sha256=incar_authority_sha256,
-                transaction_id=recovery['transaction_id'])
+                transaction_id=recovery['transaction_id'],
+                neb_image_poscar_sha256=(
+                    neb_image_authority or None))
         if operation_key:
             attempt['idempotency_key'] = operation_key
         # The token is part of the immutable attempt audit record and later binds
@@ -2758,7 +2819,8 @@ def _remote_sha256_guard(name: str, expected_sha256: str) -> str:
     if re.fullmatch(r'[0-9a-f]{64}', digest) is None:
         raise ValueError('远端输入 SHA-256 绑定无效')
     filename = str(name or '')
-    if filename not in {'INCAR', 'POSCAR', 'CONTCAR'}:
+    if (filename not in {'INCAR', 'POSCAR', 'CONTCAR'}
+            and re.fullmatch(r'[0-9]{2,4}/POSCAR', filename) is None):
         raise ValueError('远端输入文件名不在续算白名单')
     return (
         f"printf '%s  %s\\n' {shlex.quote(digest)} {shlex.quote(filename)} "
@@ -2866,7 +2928,8 @@ def _current_incar_authority(manifest: dict, source_job_id: str) -> str:
 
 
 def _set_incar_authority(manifest: dict, *, scheduler_job_id: str,
-                         incar_sha256: str, transaction_id: str) -> None:
+                         incar_sha256: str, transaction_id: str,
+                         neb_image_poscar_sha256: dict | None = None) -> None:
     digest = _valid_sha256(incar_sha256)
     if not valid_scheduler_job_id(scheduler_job_id) or not digest:
         raise ValueError('无法持久化无效的执行代次 INCAR 权威绑定')
@@ -2876,6 +2939,17 @@ def _set_incar_authority(manifest: dict, *, scheduler_job_id: str,
         'current_incar_sha256': digest,
         'transaction_id': str(transaction_id or ''),
     }
+    if neb_image_poscar_sha256 is not None:
+        canonical = {
+            str(key): _valid_sha256(value)
+            for key, value in sorted(neb_image_poscar_sha256.items())
+        }
+        if (len(canonical) < 3
+                or any(re.fullmatch(r'[0-9]{2,4}', key) is None or not digest
+                       for key, digest in canonical.items())):
+            raise ValueError('无法持久化无效的 NEB image POSCAR 权威摘要')
+        manifest['execution_authority'][
+            'neb_image_poscar_sha256'] = canonical
 
 
 def _restart_cleanup_command(m: dict, job_dir: str | None = None) -> str:
