@@ -6,6 +6,8 @@ keyring 不可用(未装/无后端)时全部安全降级:set 返回 False、get 
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 try:
     import keyring  # type: ignore
@@ -30,12 +32,22 @@ _CREDENTIAL_PATTERNS = (
         r'\b(?:(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{8,}|whsec_[A-Za-z0-9]{8,})')),
     ('Slack token', re.compile(r'\bxox[baprs]-[A-Za-z0-9-]{8,}', re.I)),
     ('AWS access key', re.compile(r'\b(?:AKIA|ASIA)[0-9A-Z]{16}\b')),
+    ('Google API key', re.compile(r'\bAIza[0-9A-Za-z_-]{35}\b')),
+    ('Google OAuth token', re.compile(r'\bya29\.[0-9A-Za-z_-]{16,}\b')),
+    ('JSON Web Token', re.compile(
+        r'\beyJ[0-9A-Za-z_-]{8,}\.[0-9A-Za-z_-]{8,}\.[0-9A-Za-z_-]{8,}\b')),
+    ('SendGrid token', re.compile(
+        r'\bSG\.[0-9A-Za-z_-]{12,}\.[0-9A-Za-z_-]{12,}\b')),
+    ('npm token', re.compile(r'\bnpm_[0-9A-Za-z]{16,}\b')),
+    ('PyPI token', re.compile(r'\bpypi-[0-9A-Za-z_-]{16,}\b')),
     ('Bearer credential', re.compile(r'\bBearer\s+[^\s,;]+', re.I)),
     ('private key', re.compile(
         r'-----BEGIN[^\r\n]{0,40}PRIVATE KEY-----', re.I)),
     ('credential assignment', re.compile(
         r'\b(?:password|passwd|pwd|secret|token|credential|authorization|'
-        r'api[_ -]?key|access[_ -]?key)\s*[:=]\s*[\"\']?[^\s,;\"\'}]+',
+        r'api[_ -]?key|access[_ -]?key|account[_ -]?key|shared[_ -]?access[_ -]?key|'
+        r'client[_ -]?secret|connection[_ -]?string|sas[_ -]?token)'
+        r'\s*[:=]\s*[\"\']?[^\s,;\"\'}]+',
         re.I)),
     # Userinfo is credential-shaped even without a colon and regardless of the
     # URI scheme (ssh, ftp, postgres, custom transports, and so on).
@@ -44,7 +56,9 @@ _CREDENTIAL_PATTERNS = (
 )
 _SENSITIVE_FIELD = re.compile(
     r'(?i)(?:pass(?:word|wd|phrase)|secret|credential|authorization|cookie|'
-    r'api[_ -]?key|access[_ -]?key|private[_ -]?key|(?<![A-Za-z0-9_])'
+    r'api[_ -]?key|access[_ -]?key|account[_ -]?key|shared[_ -]?access[_ -]?key|'
+    r'private[_ -]?key|client[_ -]?secret|connection[_ -]?string|sas[_ -]?token|'
+    r'(?<![A-Za-z0-9_])'
     r'token(?![A-Za-z0-9_]))')
 
 
@@ -72,6 +86,59 @@ def redact_credentials(text: str, *, replacement: str = '[redacted-secret]') -> 
     value = str(text or '')
     for _description, pattern in _CREDENTIAL_PATTERNS:
         value = pattern.sub(replacement, value)
+    return value
+
+
+def classify_credential_structure(value: Any) -> str | None:
+    """Classify credentials in nested public/persisted data, including field names.
+
+    Binary attachment bodies are deliberately not decoded.  Callers must keep
+    those bytes local and separately bound by their content digest.
+    """
+
+    if isinstance(value, str):
+        return classify_credential(value)
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if isinstance(key, str):
+                hit = classify_credential(key, include_field_names=True)
+                if hit:
+                    return hit
+            hit = classify_credential_structure(child)
+            if hit:
+                return hit
+        return None
+    if isinstance(value, Sequence) and not isinstance(
+            value, (str, bytes, bytearray, memoryview)):
+        for child in value:
+            hit = classify_credential_structure(child)
+            if hit:
+                return hit
+    return None
+
+
+def redact_credential_structure(value: Any, *,
+                                replacement: str = '[redacted-secret]') -> Any:
+    """Recursively redact credential values and values under sensitive keys."""
+
+    if isinstance(value, str):
+        return redact_credentials(value, replacement=replacement)
+    if isinstance(value, Mapping):
+        public = {}
+        for key, child in value.items():
+            public_key = str(key)
+            if classify_credential(public_key, include_field_names=True):
+                public[public_key] = replacement
+            else:
+                public[public_key] = redact_credential_structure(
+                    child, replacement=replacement)
+        return public
+    if isinstance(value, Sequence) and not isinstance(
+            value, (str, bytes, bytearray, memoryview)):
+        return [
+            redact_credential_structure(child, replacement=replacement)
+            for child in value
+        ]
     return value
 
 

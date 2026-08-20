@@ -9,13 +9,16 @@ from pathlib import Path
 
 import pytest
 
+import vcstudio.project.research_notebook as notebook_mod
 from vcstudio.project.research_notebook import (
     AttachmentSelections,
     NotebookError,
     NotebookRevisionConflict,
     ResearchNotebook,
+    authoritative_job_manifest_evidence,
     bind_links,
     digest_json,
+    public_job_manifest_projection,
     redact_public_text,
 )
 from vcstudio.campaign.ledger import is_sensitive
@@ -164,6 +167,76 @@ def test_external_anchor_rejects_truncated_or_deleted_journal(tmp_path, damage):
     view = notebook.read()
     assert view["ok"] is False
     assert view["integrity_status"] == "tampered"
+
+
+def test_anchor_transaction_recovers_exact_successor_after_publish_crash(
+    tmp_path, monkeypatch,
+):
+    notebook = ResearchNotebook(tmp_path, PROJECT_ID)
+    first = notebook.append(
+        record_type="note", category="observation", body="first",
+        actor=_human_actor(), **_cas(notebook))
+
+    def crash_before_anchor(_row):
+        raise OSError("injected anchor publish failure")
+
+    monkeypatch.setattr(notebook, "_write_anchor_locked", crash_before_anchor)
+    with pytest.raises(OSError, match="injected"):
+        notebook.append(
+            record_type="note", category="next_step", body="recover me",
+            actor=_human_actor(), **_cas(notebook, 1, first["record_digest"]))
+
+    old_anchor = json.loads(notebook.anchor_path.read_text(encoding="utf-8"))
+    assert old_anchor["sequence"] == 1
+    assert notebook.pending_path.is_file()
+    fresh = ResearchNotebook(tmp_path, PROJECT_ID)
+    recovered = fresh.read()
+    assert recovered["ok"] is True
+    assert recovered["revision"] == 2
+    assert recovered["records"][-1]["body"] == "recover me"
+    assert not fresh.pending_path.exists()
+    assert json.loads(fresh.anchor_path.read_text(encoding="utf-8"))["sequence"] == 2
+
+
+@pytest.mark.parametrize("damage", ["delete_pending", "forge_pending"])
+def test_anchor_transaction_deletion_or_forgery_fails_closed(
+    tmp_path, monkeypatch, damage,
+):
+    notebook = ResearchNotebook(tmp_path, PROJECT_ID)
+    first = notebook.append(
+        record_type="note", category="observation", body="first",
+        actor=_human_actor(), **_cas(notebook))
+    monkeypatch.setattr(
+        notebook, "_write_anchor_locked",
+        lambda _row: (_ for _ in ()).throw(OSError("crash")),
+    )
+    with pytest.raises(OSError, match="crash"):
+        notebook.append(
+            record_type="note", category="next_step", body="pending",
+            actor=_human_actor(), **_cas(notebook, 1, first["record_digest"]))
+    if damage == "delete_pending":
+        notebook.pending_path.unlink()
+    else:
+        pending = json.loads(notebook.pending_path.read_text(encoding="utf-8"))
+        pending["new_head_digest"] = "f" * 64
+        pending["pending_digest"] = digest_json({
+            key: value for key, value in pending.items()
+            if key != "pending_digest"
+        })
+        notebook.pending_path.write_text(
+            json.dumps(pending, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8", newline="",
+        )
+    assert ResearchNotebook(tmp_path, PROJECT_ID).read()["integrity_status"] == "tampered"
+
+
+def test_deleted_anchor_is_not_rebuilt_without_pending_transaction(tmp_path):
+    notebook = ResearchNotebook(tmp_path, PROJECT_ID)
+    notebook.append(
+        record_type="note", category="observation", body="anchored",
+        actor=_human_actor(), **_cas(notebook))
+    notebook.anchor_path.unlink()
+    assert ResearchNotebook(tmp_path, PROJECT_ID).read()["integrity_status"] == "tampered"
 
 
 @pytest.mark.parametrize(
@@ -391,6 +464,47 @@ def test_public_dto_redacts_paths_rejects_secrets_and_never_exposes_attachment_p
         )
 
 
+def test_complete_manifest_projection_binds_scheduler_attempt_and_state_chain():
+    manifest = {
+        "job_uuid": "job-a",
+        "scheduler_job_id": "202",
+        "cluster": {"profile_id": "cluster-opaque-a", "hostname": "private.local"},
+        "state": "DONE",
+        "state_history": [
+            {"state": "SUBMITTED", "at": "2026-08-20T00:00:00+00:00"},
+            {"state": "DONE", "at": "2026-08-20T01:00:00+00:00"},
+        ],
+        "attempts": [{
+            "n": 2, "action": "contcar_restart", "job_id": "202",
+            "operation_transaction_id": "txn-b",
+            "idempotency_key": "operation-b",
+            "remote_dir": "/private/restart-202",
+        }],
+        "remote_dir": "/private/current",
+        "connection_string": "AccountKey=do-not-publish",
+    }
+    projected = public_job_manifest_projection(manifest)
+    assert projected["scheduler_job_id"] == "202"
+    assert projected["cluster"] == {"profile_id": "cluster-opaque-a"}
+    assert projected["attempts"][0]["action"] == "contcar_restart"
+    assert projected["attempts"][0]["operation_transaction_id"] == "txn-b"
+    assert projected["attempts"][0]["idempotency_key"] == "operation-b"
+    assert len(projected["state_history"]) == 2
+    encoded = json.dumps(projected)
+    assert "private" not in encoded and "AccountKey" not in encoded
+
+
+def test_authoritative_manifest_reader_rejects_linked_job_yaml(tmp_path):
+    project = tmp_path / "project"
+    member = project / "member"
+    member.mkdir(parents=True)
+    real = tmp_path / "real-job.yaml"
+    real.write_text("job_uuid: job-a\nstate: DONE\n", encoding="utf-8")
+    _symlink_or_skip(real, member / "job.yaml")
+    with pytest.raises(Exception, match="reparse|symlink|regular"):
+        authoritative_job_manifest_evidence(project, member)
+
+
 def test_attachment_selection_is_opaque_project_bound_single_use_and_tamper_checked(
     tmp_path,
 ):
@@ -507,12 +621,94 @@ def test_read_and_archive_reverify_attachment_blob_hash(tmp_path, damage):
     assert archive["records"] == []
 
 
+def test_each_replay_hashes_one_shared_blob_only_once(tmp_path, monkeypatch):
+    notebook = ResearchNotebook(tmp_path, PROJECT_ID)
+    content = b"shared immutable evidence"
+    first = notebook.append(
+        record_type="note", category="observation", body="first reference",
+        actor=_human_actor(), attachments=[{"name": "a.bin", "data": content}],
+        **_cas(notebook))
+    notebook.append(
+        record_type="note", category="next_step", body="second reference",
+        actor=_human_actor(), attachments=[{"name": "b.bin", "data": content}],
+        **_cas(notebook, 1, first["record_digest"]))
+    blob_reads = 0
+    original = notebook_mod._read_regular_bytes
+
+    def counted(path, *, maximum=None):
+        nonlocal blob_reads
+        if Path(path).parent == notebook.attachments_path:
+            blob_reads += 1
+        return original(path, maximum=maximum)
+
+    monkeypatch.setattr(notebook_mod, "_read_regular_bytes", counted)
+    assert notebook.read()["ok"] is True
+    assert blob_reads == 1
+    assert notebook.archive_payload()["integrity_status"] == "current"
+    assert blob_reads == 2
+
+
+@pytest.mark.parametrize("quota", ["unique", "bytes"])
+def test_notebook_blob_quota_is_checked_before_writing_new_blob(
+    tmp_path, monkeypatch, quota,
+):
+    first_content = b"first unique blob"
+    second_content = b"second unique blob"
+    if quota == "unique":
+        monkeypatch.setattr(notebook_mod, "MAX_NOTEBOOK_UNIQUE_BLOBS", 1)
+    else:
+        monkeypatch.setattr(
+            notebook_mod, "MAX_NOTEBOOK_BLOB_BYTES",
+            len(first_content) + len(second_content) - 1,
+        )
+    notebook = ResearchNotebook(tmp_path, PROJECT_ID)
+    first = notebook.append(
+        record_type="note", category="observation", body="first",
+        actor=_human_actor(), attachments=[{
+            "name": "first.bin", "data": first_content,
+        }], **_cas(notebook))
+    second_digest = hashlib.sha256(second_content).hexdigest()
+    with pytest.raises(NotebookError, match="notebook blob quota"):
+        notebook.append(
+            record_type="note", category="observation", body="second",
+            actor=_human_actor(), attachments=[{
+                "name": "second.bin", "data": second_content,
+            }], **_cas(notebook, 1, first["record_digest"]))
+    assert not (notebook.attachments_path / f"{second_digest}.bin").exists()
+    assert notebook.read()["revision"] == 1
+
+
+def test_orphan_blob_from_interrupted_append_still_consumes_hard_quota(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(notebook_mod, "MAX_NOTEBOOK_UNIQUE_BLOBS", 1)
+    notebook = ResearchNotebook(tmp_path, PROJECT_ID)
+    orphan = b"durable orphan from interrupted append"
+    orphan_digest = hashlib.sha256(orphan).hexdigest()
+    notebook.attachments_path.mkdir(parents=True)
+    (notebook.attachments_path / f"{orphan_digest}.bin").write_bytes(orphan)
+    new_content = b"new evidence"
+    new_digest = hashlib.sha256(new_content).hexdigest()
+
+    with pytest.raises(NotebookError, match="notebook blob quota"):
+        notebook.append(
+            record_type="note", category="observation", body="must not write",
+            actor=_human_actor(), attachments=[{
+                "name": "new.bin", "data": new_content,
+            }], **_cas(notebook))
+    assert not (notebook.attachments_path / f"{new_digest}.bin").exists()
+    assert notebook.read()["revision"] == 0
+
+
 @pytest.mark.parametrize("secret", [
     "glpat-abcdefgh123456",
     "hf_abcdefgh1234567890",
     "sk_live_abcdefgh123456",
     "xoxb-12345678-abcdefgh",
     "postgresql://alice:supersecret@db.example/research",
+    "AIza" + "A" * 35,
+    "eyJabcdefghijk.abcdefghijklmnop.abcdefghijklmnop",
+    "DefaultEndpointsProtocol=https;AccountKey=super-secret-account-key",
 ])
 def test_shared_credential_classifier_covers_notebook_public_dto_and_si_capsule(
     tmp_path, secret,
@@ -538,3 +734,40 @@ def test_shared_credential_classifier_covers_notebook_public_dto_and_si_capsule(
     }, resolver=None, active=True)
     assert secret not in json.dumps(public)
     assert secret not in json.dumps(redact({"body": f"value {secret}"}))
+
+
+def test_legacy_google_key_fails_closed_for_read_and_archive(tmp_path):
+    secret = "AIza" + "B" * 35
+    notebook = ResearchNotebook(tmp_path, PROJECT_ID)
+    notebook.append(
+        record_type="note", category="observation", body="safe legacy row",
+        actor=_human_actor(), **_cas(notebook))
+    _rewrite_valid_digests(
+        notebook, lambda rows: rows[0].update({"body": f"legacy {secret}"}))
+    view = notebook.read()
+    archive = notebook.archive_payload(report_revision_id="report-r0001")
+    assert view["integrity_status"] == "tampered" and view["records"] == []
+    assert archive["integrity_status"] == "tampered" and archive["records"] == []
+    assert secret not in json.dumps(view)
+    assert secret not in json.dumps(archive)
+
+
+def test_archive_recursively_redacts_structured_sensitive_fields(tmp_path, monkeypatch):
+    google_key = "AIza" + "C" * 35
+    connection = "Server=db;Password=do-not-publish"
+    notebook = ResearchNotebook(tmp_path, PROJECT_ID)
+    monkeypatch.setattr(notebook, "read", lambda **_kwargs: {
+        "revision": 1,
+        "head_digest": "a" * 64,
+        "integrity_status": "current",
+        "records": [{
+            "body": f"legacy {google_key}",
+            "nested": {"connection_string": connection},
+        }],
+        "denominator": {"records": 1, "active": 1, "review_todo": 0},
+    })
+    archive = notebook.archive_payload()
+    encoded = json.dumps(archive)
+    assert google_key not in encoded and connection not in encoded
+    assert archive["records"][0]["nested"]["connection_string"] \
+        == "[redacted-secret]"

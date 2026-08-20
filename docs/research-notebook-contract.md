@@ -33,6 +33,14 @@ anchor exists is therefore reported as `tampered`, not as an empty current
 notebook. This is a local rollback detector, not a remote witness, TPM-backed
 attestation, authentication mechanism, or cryptographic signature.
 
+Append uses an external pending transaction before touching the journal. The
+pending record binds the exact old anchor, old journal byte length/hash, one
+canonical successor row, and the proposed new anchor. After a crash, a fresh
+process may advance the anchor only when the journal is exactly that one valid
+successor, or discard the pending record when the journal is still exactly the
+old anchored prefix. A missing/forged pending record never authorizes general
+anchor reconstruction.
+
 Each JSONL record contains a monotonically increasing `revision`,
 `previous_digest`, and `record_digest`. The digest is SHA-256 over canonical JSON
 excluding only `record_digest`. Writers:
@@ -41,11 +49,15 @@ excluding only `record_digest`. Writers:
 2. read and verify the complete chain and external head/sequence anchor;
 3. compare the caller's `expected_revision`, `expected_head_digest`, and
    project identity with the same current snapshot;
-4. write attachment bytes to content-addressed project storage, rehashing an
+4. enforce notebook-wide hard quotas for unique blob count and total unique
+   bytes, then write attachment bytes to content-addressed project storage,
+   rehashing an
    existing blob and durably publishing a replacement directory entry before
    the journal may reference it;
-5. append one complete UTF-8 JSON line with one `O_APPEND` write and `fsync`;
-6. atomically and durably advance the external anchor before returning.
+5. durably publish the exact external pending anchor transaction;
+6. append one complete UTF-8 JSON line with one `O_APPEND` write and `fsync`;
+7. atomically and durably advance the external anchor, then clear the pending
+   transaction before returning.
 
 A malformed line, partial final line, revision gap, duplicate ID, extra/missing
 field, project mismatch, invalid actor/review/attachment schema, invalid
@@ -53,6 +65,9 @@ supersedes/tombstone transition, missing/corrupt attachment blob, digest
 mismatch, or journal/anchor rollback makes the journal `tampered` and blocks
 further writes. The reader replays the complete active-record state machine; it
 does not skip a damaged row and pretend that the remaining history is current.
+Within each replay, a referenced blob is opened and hashed only once per
+`sha256+size`, even when many records reference it; metadata on every reference
+is still validated independently.
 
 The canonical project, notebook, attachment, anchor, and lock chains reject
 symlinks, junctions, and other reparse points. Regular files are opened
@@ -101,7 +116,7 @@ was created. The browser never supplies an authority-bearing local path.
 | Link | Binding and revalidation |
 |---|---|
 | project | Registered opaque project identity and current server identity fingerprint |
-| job | Opaque job ID and a bounded summary of a currently readable authoritative `job.yaml`; missing or corrupt manifests are `missing` |
+| job | Opaque job ID and the canonical hash of the complete strict public projection of authoritative `job.yaml`; locator/credential material alone is removed, while scheduler generation, opaque cluster identity, attempts (including transaction/idempotency/action chain), and `state_history` remain bound |
 | report revision | Authoritative history revision reloaded through the frozen revision validator; manifest digest |
 | source | Source ID plus exact report revision ID; frozen source record and, when available, current source-file hash |
 
@@ -109,6 +124,10 @@ Each read resolves the link again. A matching digest is `current`, a different
 digest is `stale`, and an unavailable/ambiguous/tampered target is `missing`.
 The route returned to the browser is a semantic workspace route, never a
 filesystem locator.
+
+The job manifest is read from a contained non-reparse regular-file handle under
+the canonical project handle. Missing, malformed, linked, junction-backed, or
+otherwise non-authoritative `job.yaml` evidence is `missing`, not current.
 
 Append responses use a fresh evidence resolver after the commit. Browser save,
 tombstone, and attachment-picker responses are accepted only while their
@@ -166,8 +185,11 @@ attachment names, sizes, media types, and hashes, but not project-local attachme
 bytes. The limitations member always states the self-attributed actor, no
 cryptographic signature, unchanged report gate, and local attachment boundaries.
 Notebook public DTOs and SI capsule members share the same credential classifier
-for GitHub/GitLab/Hugging Face/Stripe/Slack/AWS/Bearer/private-key values,
-credential assignments, and URI userinfo across arbitrary schemes.
+for GitHub/GitLab/Hugging Face/Google/Stripe/Slack/AWS/SendGrid/npm/PyPI tokens,
+JWTs, Bearer/private-key values, connection-string assignments, and URI userinfo
+across arbitrary schemes. Public/archive projections also classify nested field
+names, so a sensitive structured field is redacted even when its value does not
+match a provider prefix.
 
 ## Acceptance limits
 

@@ -4,6 +4,8 @@ import json
 from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 
+import yaml
+
 from vcstudio.gui_web.api import Api
 
 
@@ -16,6 +18,13 @@ def _manifest(state="DONE"):
         "inputs": {"engine": "vasp"},
         "results": {},
     }
+
+
+def _write_job_manifest(member, value):
+    Path(member, "job.yaml").write_text(
+        yaml.safe_dump(value, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
 
 
 def _api(tmp_path, *, duplicate=False):
@@ -44,6 +53,7 @@ def _api(tmp_path, *, duplicate=False):
         locators.append(locator)
         projects[locator] = project
         manifests[member] = _manifest()
+        _write_job_manifest(member, manifests[member])
 
     def load_project(path):
         wanted = str(Path(path).resolve())
@@ -272,31 +282,94 @@ def test_research_notebook_attachment_picker_returns_only_opaque_selection(tmp_p
     assert str(attachment) not in json.dumps(selected)
 
 
-def test_notebook_job_evidence_requires_fresh_authoritative_manifest_summary(tmp_path):
+def test_notebook_job_evidence_binds_complete_authoritative_manifest_and_aba(tmp_path):
     api, locators, projects = _api(tmp_path)
     project_id = api.proj_list()["projects"][0]["project_id"]
     record = api._report_workbench_project_record(project_id)
     member = projects[locators[0]]["members"]["clean_slab"]
-    current = _manifest()
-    api._manifest.load_manifest = (
-        lambda path: current if str(path) == str(member) else None)
+    current = {
+        **_manifest(),
+        "scheduler_job_id": "101",
+        "cluster": "cluster-opaque-a",
+        "attempts": [{
+            "n": 1, "action": "submit", "job_id": "101",
+            "operation_transaction_id": "txn-a",
+            "idempotency_key": "operation-a",
+        }],
+        "state_history": [
+            {"state": "SUBMITTED", "at": "2026-08-20T00:00:00+00:00"},
+            {"state": "DONE", "at": "2026-08-20T01:00:00+00:00"},
+        ],
+        "remote_dir": r"C:\private\generation-101",
+    }
+    _write_job_manifest(member, current)
     resolver = api._research_notebook_evidence_resolver(record)
     link = {"kind": "job", "id": "job-a", "report_revision_id": None}
 
     first = resolver(link)
-    current["remote_dir"] = r"C:\private\not-authoritative"
+    current["remote_dir"] = r"C:\private\generation-101-moved"
+    _write_job_manifest(member, current)
     assert resolver(link)["digest"] == first["digest"]
-    current["state"] = "RUNNING"
-    assert resolver(link)["digest"] != first["digest"]
+    current["scheduler_job_id"] = "202"
+    current["attempts"].append({
+        "n": 2, "action": "contcar_restart", "prev_job_id": "101",
+        "job_id": "202", "operation_transaction_id": "txn-b",
+        "idempotency_key": "operation-b",
+    })
+    current["state_history"].extend([
+        {"state": "FAILED", "at": "2026-08-20T02:00:00+00:00"},
+        {"state": "DONE", "at": "2026-08-20T03:00:00+00:00"},
+    ])
+    _write_job_manifest(member, current)
+    restarted = resolver(link)
+    assert restarted["status"] == "current"
+    assert restarted["digest"] != first["digest"]
 
-    api._manifest.load_manifest = lambda _path: None
+    Path(member, "job.yaml").unlink()
+    assert resolver(link)["status"] == "missing"
+    Path(member, "job.yaml").write_text("not: [valid", encoding="utf-8")
     assert resolver(link)["status"] == "missing"
 
-    def corrupt(_path):
-        raise ValueError("corrupt yaml")
 
-    api._manifest.load_manifest = corrupt
-    assert resolver(link)["status"] == "missing"
+def test_notebook_archive_marks_job_link_stale_after_scheduler_aba(tmp_path):
+    api, locators, projects = _api(tmp_path)
+    project_id = api.proj_list()["projects"][0]["project_id"]
+    member = projects[locators[0]]["members"]["clean_slab"]
+    manifest = {
+        **_manifest(),
+        "scheduler_job_id": "101",
+        "cluster": "cluster-opaque-a",
+        "attempts": [{"n": 1, "action": "submit", "job_id": "101"}],
+        "state_history": [
+            {"state": "DONE", "at": "2026-08-20T01:00:00+00:00"},
+        ],
+    }
+    _write_job_manifest(member, manifest)
+    empty = api.research_notebook_bootstrap(project_id)
+    created = api.research_notebook_append(project_id, {
+        "record_type": "note", "category": "observation",
+        "body": "job generation evidence",
+        "actor": {"id": "alice", "display_name": "Alice", "role": "PI"},
+        "links": [{"kind": "job", "id": "job-a"}],
+    }, _notebook_guard(empty))
+    assert created["records"][0]["links"][0]["status"] == "current"
+
+    manifest["scheduler_job_id"] = "202"
+    manifest["attempts"].append({
+        "n": 2, "action": "contcar_restart", "prev_job_id": "101",
+        "job_id": "202", "operation_transaction_id": "txn-b",
+        "idempotency_key": "operation-b",
+    })
+    manifest["state_history"].extend([
+        {"state": "FAILED", "at": "2026-08-20T02:00:00+00:00"},
+        {"state": "DONE", "at": "2026-08-20T03:00:00+00:00"},
+    ])
+    _write_job_manifest(member, manifest)
+    archive = api._research_notebook_archive_payload(
+        locators[0], project_id, "report-r0001")
+    assert archive["records"][0]["links"][0]["status"] == "stale"
+    assert archive["records"][0]["links"][0]["current_digest"] \
+        != archive["records"][0]["links"][0]["bound_digest"]
 
 
 def test_append_uses_a_fresh_evidence_resolver_for_returned_view(tmp_path):

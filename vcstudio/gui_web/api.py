@@ -7094,36 +7094,10 @@ class Api:
 
     @staticmethod
     def _research_notebook_manifest_summary(manifest):
-        """Bound the evidence digest to authoritative ``job.yaml`` fields only."""
-        if not isinstance(manifest, dict):
-            return None
-        keys = (
-            'schema', 'job_uuid', 'job_id', 'system', 'task_type', 'calc_type',
-            'state', 'created_at', 'updated_at', 'parent_job',
-        )
-        summary = {key: manifest[key] for key in keys if key in manifest}
-        inputs = manifest.get('inputs')
-        if isinstance(inputs, dict):
-            selected = {
-                key: inputs[key] for key in (
-                    'engine', 'task', 'gaussian_task', 'functional', 'periodic',
-                    'files', 'output_files', 'sha256', 'source_sha256',
-                    'neb_endpoints',
-                ) if key in inputs
-            }
-            if selected:
-                summary['inputs'] = selected
-        results = manifest.get('results')
-        if isinstance(results, dict):
-            selected = {
-                key: results[key] for key in (
-                    'energy_e0_eV', 'energy_source', 'diagnosis', 'fetched',
-                    'fetched_missing', 'fetched_at',
-                ) if key in results
-            }
-            if selected:
-                summary['results'] = selected
-        return summary
+        """Return the complete strict public projection used by job evidence."""
+        from vcstudio.project.research_notebook import public_job_manifest_projection
+
+        return public_job_manifest_projection(manifest)
 
     @staticmethod
     def _research_notebook_expected(value):
@@ -7174,7 +7148,10 @@ class Api:
         Every lookup reloads authoritative project/report state.  Results are
         deliberately not cached across link binding and post-append projection.
         """
-        from vcstudio.project.research_notebook import digest_json
+        from vcstudio.project.research_notebook import (
+            authoritative_job_manifest_evidence,
+            digest_json,
+        )
 
         def resolve(link):
             kind = str((link or {}).get('kind') or '')
@@ -7194,15 +7171,12 @@ class Api:
                 matches = []
                 for member_dir in self._project_member_dirs(loaded):
                     try:
-                        manifest = self._manifest.load_manifest(member_dir)
+                        manifest, summary = authoritative_job_manifest_evidence(
+                            record['path'], member_dir)
                     except Exception:                    # noqa: BLE001 corrupt = missing
-                        manifest = None
-                    if not isinstance(manifest, dict):
                         continue
                     if self._workspace_job_id(member_dir, manifest) == identifier:
-                        summary = self._research_notebook_manifest_summary(manifest)
-                        if summary is not None:
-                            matches.append(summary)
+                        matches.append(summary)
                 if len(matches) == 1:
                     resolved = {
                         'status': 'current', 'digest': digest_json(matches[0]),
