@@ -173,6 +173,7 @@ def filter_continuable(dirs, *, allow_round_limit_override=False):
         rounds = int(res.get('continue_rounds', 0))
         if (m is not None
                 and m.get('state') in submitter.CONTINUE_TERMINAL_STATES
+                and submitter.valid_scheduler_job_id(m.get('scheduler_job_id'))
                 and str(m.get('task_type') or '') != 'neb'
                 and dgn.get('restartable')
                 and (allow_round_limit_override

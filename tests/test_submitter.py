@@ -861,6 +861,48 @@ def test_explicit_manual_continue_can_exceed_automatic_round_cap(tmp_path):
     assert updated['results']['continue_rounds'] == submitter.CONTINUE_MAX_ROUNDS + 1
     assert updated['attempts'][-1]['round_limit_override'] == 'manual-explicit'
     assert '人工确认超出自动上限' in updated['state_history'][-1]['note']
+    journal = submitter._read_job_action_journal(d)
+    request = journal['operations'][-1]['request']
+    assert request['round_limit_override'] == 'manual-explicit'
+    assert request['source_scheduler_job_id'] == '100'
+    assert request['source_round'] == submitter.CONTINUE_MAX_ROUNDS
+    assert request['intent']['round_policy'] == 'manual-unbounded'
+    assert request['contcar_source_sha256']
+    assert request['incar_source_sha256']
+
+
+def test_manual_continue_manifest_failure_retains_durable_authorization(
+        tmp_path, monkeypatch):
+    d = _restartable_job(tmp_path, rounds=submitter.CONTINUE_MAX_ROUNDS)
+    key = 'manual-continue-crash-001'
+    real_save = submitter.manifest_mod.save_manifest
+
+    def fail_final(path, payload):
+        if (payload.get('state') == 'SUBMITTED'
+                and str(payload.get('scheduler_job_id') or '') == '501'):
+            raise OSError('disk full')
+        return real_save(path, payload)
+
+    monkeypatch.setattr(submitter.manifest_mod, 'save_manifest', fail_final)
+    with pytest.raises(submitter.UnknownRemoteJobOperation, match='job.yaml'):
+        submitter.continue_from_contcar(
+            FakeClient(script=[('cat', _VALID_CONTCAR), ('qsub', '501.c\n')]),
+            _profile(), d, max_rounds=None, idempotency_key=key)
+
+    record = submitter._read_job_action_journal(d)['operations'][-1]
+    assert record['status'] == 'remote_accepted'
+    assert record['request']['round_limit_override'] == 'manual-explicit'
+    assert record['request']['source_scheduler_job_id'] == '100'
+    assert record['request']['intent']['round_policy'] == 'manual-unbounded'
+    assert record['request_sha256']
+    assert record['intent_sha256']
+
+    monkeypatch.setattr(submitter.manifest_mod, 'save_manifest', real_save)
+    retry = FakeClient()
+    with pytest.raises(submitter.UnknownRemoteJobOperation):
+        submitter.continue_from_contcar(
+            retry, _profile(), d, max_rounds=None, idempotency_key=key)
+    assert retry.commands == []
 
 
 def test_continue_refuses_invalid_contcar(tmp_path):
@@ -868,6 +910,43 @@ def test_continue_refuses_invalid_contcar(tmp_path):
     client = FakeClient(script=[('cat', 'garbage\nshort\n')])   # CONTCAR 不完整
     with pytest.raises(RuntimeError, match='CONTCAR'):
         submitter.continue_from_contcar(client, _profile(), d)
+
+
+@pytest.mark.parametrize('contcar', [
+    ('singular\n1.0\n1 0 0\n2 0 0\n0 0 10\nC\n2\nDirect\n'
+     '0 0 0\n0.5 0.5 0.5\n'),
+    ('nonfinite\n1.0\n10 0 0\n0 10 0\n0 0 10\nC\n2\nDirect\n'
+     '0 0 0\nnan 0.5 0.5\n'),
+])
+def test_continue_refuses_unverifiable_contcar_geometry(tmp_path, contcar):
+    d = _restartable_job(tmp_path, rounds=submitter.CONTINUE_MAX_ROUNDS)
+    client = FakeClient(script=[('cat', contcar), ('qsub', 'must-not-run\n')])
+
+    with pytest.raises(RuntimeError, match='有限|非奇异'):
+        submitter.continue_from_contcar(
+            client, _profile(), d, max_rounds=None,
+            idempotency_key='manual-geometry-reject-001')
+
+    assert not any('qsub' in command for command in client.commands)
+    assert not os.path.exists(os.path.join(d, '.vcstudio-job-actions.json'))
+
+
+def test_continue_and_tune_require_source_scheduler_generation(tmp_path):
+    d = _restartable_job(tmp_path)
+    data = manifest.load_manifest(d)
+    data['scheduler_job_id'] = None
+    manifest.save_manifest(d, data)
+
+    standard = FakeClient()
+    with pytest.raises(ValueError, match='scheduler_job_id'):
+        submitter.continue_from_contcar(standard, _profile(), d)
+    tuned = FakeClient()
+    with pytest.raises(ValueError, match='scheduler_job_id'):
+        submitter.continue_with_incar_changes(
+            tuned, FakeSFTP(), _profile(), d, {'NELM': '120'},
+            max_rounds=None, restart_from_contcar=False)
+    assert standard.commands == []
+    assert tuned.commands == []
 
 
 # CONTCAR 通过 valid_poscar 但存在原子重叠(C-C 0.3 Å < 0.7 Å)

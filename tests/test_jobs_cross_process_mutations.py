@@ -31,6 +31,7 @@ def _job(root: Path, action: str) -> Path:
     job = root / action
     job.mkdir()
     (job / "POSCAR").write_text(_CONTCAR, encoding="utf-8")
+    (job / "INCAR").write_text("ENCUT = 400\n", encoding="utf-8")
     data = manifest.new_manifest(
         job_id=f"{action}-local", system=action, task_type="relax",
         calc_type="", inputs={},

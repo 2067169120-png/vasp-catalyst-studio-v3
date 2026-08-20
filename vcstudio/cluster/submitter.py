@@ -384,7 +384,7 @@ def _job_action_generation_matches(manifest: dict, record: dict,
                                    evidence: dict | None) -> bool:
     if not evidence:
         return False
-    if record.get('action') == 'tune_continue':
+    if record.get('action') in {'continue', 'tune_continue'}:
         if (str(record.get('request_sha256') or '') !=
                 str(evidence.get('operation_request_sha256') or '')):
             return False
@@ -452,7 +452,9 @@ def _reconcile_job_action(job_dir, manifest: dict, action: str,
                 raise ValueError('同一作业操作请求标识不能用于不同的远端动作')
             stored_intent = str(record.get('intent_sha256') or '')
             if intent_sha256 and stored_intent != intent_sha256:
-                raise ValueError('同一作业操作请求标识不能用于不同的改参续算内容')
+                subject = ('改参续算内容' if action == 'tune_continue'
+                           else '续算授权内容')
+                raise ValueError(f'同一作业操作请求标识不能用于不同的{subject}')
             status = record.get('status')
             if status == 'failed':
                 raise ReplayedJobOperationFailure(
@@ -475,9 +477,15 @@ def _reconcile_job_action(job_dir, manifest: dict, action: str,
         if evidence:
             evidence_intent = str(evidence.get('operation_intent_sha256') or '')
             if intent_sha256 and evidence_intent != intent_sha256:
-                raise ValueError('同一作业操作请求标识不能用于不同的改参续算内容')
+                subject = ('改参续算内容' if action == 'tune_continue'
+                           else '续算授权内容')
+                raise ValueError(f'同一作业操作请求标识不能用于不同的{subject}')
             fallback_record = {
                 'action': action,
+                'request_sha256': str(
+                    evidence.get('operation_request_sha256') or ''),
+                'intent_sha256': str(
+                    evidence.get('operation_intent_sha256') or ''),
                 'source_job_id': str(
                     evidence.get('prev_job_id') if action in {
                         'continue', 'tune_continue'}
@@ -2679,10 +2687,28 @@ def _read_remote_text(client, path: str) -> str:
 
 
 def _contcar_min_distance(text: str):
-    """CONTCAR 文本 → 周期最小原子间距(Å);解析失败 → None(不因此拦续算,valid_poscar 已把关)。"""
+    """CONTCAR → 周期最小间距；非有限数值/奇异晶胞/解析失败均返回 None。"""
     try:
         from vcstudio.generate.slab_builder import min_interatomic_distance
-        return min_interatomic_distance(text)
+        from vcstudio.generate.structure_view import parse_positions
+
+        parsed = parse_positions(text)
+        cell = parsed['cell']
+        coords = parsed['coords']
+        values = [float(value) for row in (*cell, *coords) for value in row]
+        if not values or not all(math.isfinite(value) for value in values):
+            return None
+        determinant = (
+            cell[0][0] * (cell[1][1] * cell[2][2] - cell[1][2] * cell[2][1])
+            - cell[0][1] * (cell[1][0] * cell[2][2] - cell[1][2] * cell[2][0])
+            + cell[0][2] * (cell[1][0] * cell[2][1] - cell[1][1] * cell[2][0])
+        )
+        if not math.isfinite(determinant) or abs(determinant) <= 1e-12:
+            return None
+        distance = float(min_interatomic_distance(text))
+        if math.isinf(distance) and len(coords) == 1:
+            return distance
+        return distance if math.isfinite(distance) else None
     except Exception:                                    # noqa: BLE001
         return None
 
@@ -2698,6 +2724,24 @@ def _require_continue_terminal_state(manifest: dict, action: str) -> None:
     raise ValueError(
         f'该作业状态 {state or "<缺失>"} 不是可{action}的终态；'
         '仅 DONE/FAILED/UNCONVERGED/NEEDS_HUMAN 可由用户明确重投')
+
+
+def valid_scheduler_job_id(value) -> bool:
+    """Return whether one persisted source scheduler generation is usable."""
+    raw = str(value or '')
+    normalized = raw.strip()
+    return (raw == normalized
+            and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', normalized)
+            is not None)
+
+
+def _require_source_scheduler_job_id(manifest: dict, action: str) -> str:
+    job_id = str(manifest.get('scheduler_job_id') or '')
+    if not valid_scheduler_job_id(job_id):
+        raise ValueError(
+            f'缺少可核验的源 scheduler_job_id，不能{action}；'
+            '请先刷新或认领旧调度器作业，避免与未知在途代次并发')
+    return job_id
 
 
 def _restart_cleanup_command(m: dict, job_dir: str | None = None) -> str:
@@ -2799,7 +2843,17 @@ def continue_from_contcar(client, profile, job_dir: str,
             f'{_ENGINE_LABELS.get(_job_engine(m), _job_engine(m))} 不能走 VASP CONTCAR 续算；'
             f'{contract.restart_note}')
     assert_profile_binding(profile, job_dir, '续算', manifest=m)
-    replay = _reconcile_job_action(job_dir, m, 'continue', operation_key)
+    source_job_id = _require_source_scheduler_job_id(m, '续算')
+    intent = {
+        'restart_from_contcar': True,
+        'incar_policy': 'frozen',
+        'round_policy': ('manual-unbounded' if max_rounds is None
+                         else f'bounded-{int(max_rounds)}'),
+    }
+    intent_sha256 = _job_action_request_sha256(intent)
+    replay = _reconcile_job_action(
+        job_dir, m, 'continue', operation_key,
+        intent_sha256=intent_sha256)
     if replay is not None:
         return replay
     if _is_neb(m):
@@ -2830,7 +2884,10 @@ def continue_from_contcar(client, profile, job_dir: str,
     # 几何健全:CONTCAR 原子重叠(周期最小间距 < 阈值)→ 不续算,转人工。病态几何续算只会
     # 反复崩(ZPOTRF/发散),盲目重投浪费机时;显式转 NEEDS_HUMAN 让人先修结构。
     min_d = _contcar_min_distance(contcar)
-    if min_d is not None and min_d < MIN_INTERATOMIC_OK:
+    if min_d is None:
+        raise RuntimeError(
+            'CONTCAR 晶格或坐标不是有限、非奇异的可核验几何，不能续算；请人工检查')
+    if min_d < MIN_INTERATOMIC_OK:
         msg = f'CONTCAR 存在原子重叠(最小间距 {min_d:.2f} Å),疑似几何病态,请人工检查'
         manifest_mod.set_state(m, 'NEEDS_HUMAN', note=msg)
         manifest_mod.save_manifest(job_dir, m)
@@ -2839,11 +2896,31 @@ def continue_from_contcar(client, profile, job_dir: str,
     # 续算沉降基线:重投前记下上一轮 OUTCAR 的 mtime(此刻新作业尚未启动,仍是旧文件)
     _o0, _z0, _base_outcar_mtime = _stat_outcar_full(client, remote)
 
+    local_incar = os.path.join(job_dir, 'INCAR')
+    if not os.path.isfile(local_incar):
+        raise ValueError('本地作业目录缺 INCAR，无法证明冻结输入，不能续算')
+    request = {
+        'schema': 'vcstudio.continuation-request/v1',
+        'manifest_job_id': str(m.get('job_id') or ''),
+        'source_scheduler_job_id': source_job_id,
+        'source_state': str(m.get('state') or ''),
+        'source_round': rounds,
+        'profile_fingerprint': str(profile_binding(profile)['fingerprint']),
+        'intent': intent,
+        'round_limit_override': (
+            'manual-explicit' if manual_round_override else None),
+        'contcar_source_sha256': hashlib.sha256(
+            contcar.encode('utf-8')).hexdigest(),
+        'incar_source_sha256': manifest_mod.sha256_file(local_incar),
+    }
+    request_sha256 = _job_action_request_sha256(request)
+
     # 从第一个本地/远端变更开始，持久 journal 必须先落盘。若进程在重投响应前
     # 退出，下一实例只能 fail closed，绝不能再发第二次 qsub/sbatch。
     record = _start_job_action(
         job_dir, 'continue', operation_key,
-        str(m.get('scheduler_job_id') or ''))
+        source_job_id, request=request, request_sha256=request_sha256,
+        intent_sha256=intent_sha256)
 
     # 本地也留证:备份旧 POSCAR,用 CONTCAR 覆盖(保持本地目录与远端一致)
     local_poscar = os.path.join(job_dir, 'POSCAR')
@@ -2912,6 +2989,8 @@ def continue_from_contcar(client, profile, job_dir: str,
         'job_id': job_id,
         'round': rounds + 1,
         'operation_transaction_id': record['transaction_id'],
+        'operation_request_sha256': request_sha256,
+        'operation_intent_sha256': intent_sha256,
     }
     if manual_round_override:
         attempt['round_limit_override'] = 'manual-explicit'
@@ -2979,9 +3058,11 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
             raise ValueError(f'重复的 INCAR 修改键:{canonical_key}')
         canonical_value = str(value)
         if (not canonical_value.strip() or len(canonical_value) > 256
-                or any(marker in canonical_value for marker in ('\r', '\n', '\x00'))):
+                or any(marker in canonical_value
+                       for marker in ('\r', '\n', '\x00', ';', '#', '!'))):
             raise ValueError(
-                f'INCAR 修改值 {canonical_key} 必须是非空单行文本且不超过 256 字符')
+                f'INCAR 修改值 {canonical_key} 必须是非空单值文本、不得含标签分隔符或注释符，'
+                '且不超过 256 字符')
         canonical_changes[canonical_key] = canonical_value
     bad = [key for key in canonical_changes if key not in INCAR_TUNE_WHITELIST]
     if bad:
@@ -3001,6 +3082,7 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
         raise ValueError(
             'NEB 不能使用通用改参/CONTCAR 续算；请使用 NEB 专用 image 级重提流程')
     rounds = int((m.get('results') or {}).get('continue_rounds', 0))
+    source_job_id = _require_source_scheduler_job_id(m, '改参重投')
     manual_round_override = max_rounds is None and rounds >= CONTINUE_MAX_ROUNDS
 
     # The request is path-free but binds every user decision and the exact source
@@ -3017,7 +3099,7 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
     request = {
         'schema': 'vcstudio.tune-continuation-request/v1',
         'manifest_job_id': str(m.get('job_id') or ''),
-        'source_scheduler_job_id': str(m.get('scheduler_job_id') or ''),
+        'source_scheduler_job_id': source_job_id,
         'source_state': str(m.get('state') or ''),
         'source_round': rounds,
         'profile_fingerprint': str(profile_binding(profile)['fingerprint']),
@@ -3084,7 +3166,7 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
     request_sha256 = _job_action_request_sha256(request)
     record = _start_job_action(
         job_dir, 'tune_continue', operation_key,
-        str(m.get('scheduler_job_id') or ''), request=request,
+        source_job_id, request=request,
         request_sha256=request_sha256, intent_sha256=intent_sha256)
 
     try:

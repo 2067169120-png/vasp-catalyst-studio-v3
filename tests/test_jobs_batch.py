@@ -9,6 +9,7 @@ def _mk_job(tmp_path, name, state, *, restartable=None, rounds=0):
     d = tmp_path / name
     d.mkdir()
     m = mm.new_manifest(job_id=name, system='s', task_type='relax', calc_type='slab', inputs={})
+    m['scheduler_job_id'] = '100'
     if state != 'CREATED':
         mm.set_state(m, state)
     res = {}
@@ -56,6 +57,16 @@ def test_filter_continuable_rejects_created_even_with_restartable_diagnosis(tmp_
 
     assert batch_ops.filter_continuable(
         [created], allow_round_limit_override=True) == ([], 1)
+
+
+def test_filter_continuable_rejects_missing_source_scheduler_generation(tmp_path):
+    job = _mk_job(tmp_path, 'missing-source', 'UNCONVERGED', restartable=True)
+    data = mm.load_manifest(job)
+    data['scheduler_job_id'] = None
+    mm.save_manifest(job, data)
+
+    assert batch_ops.filter_continuable(
+        [job], allow_round_limit_override=True) == ([], 1)
 
 
 def test_filter_continuable_excludes_neb_from_generic_restart(tmp_path):

@@ -387,7 +387,7 @@ def test_tune_rejects_multiline_value_before_any_mutation(tmp_path):
     d = _terminal_job(tmp_path)
     client = FakeClient()
 
-    with pytest.raises(ValueError, match='非空单行文本'):
+    with pytest.raises(ValueError, match='非空单值文本'):
         submitter.continue_with_incar_changes(
             client, FakeSFTP(), _profile(), d,
             {'NELM': '120\nISPIN = 2'}, max_rounds=None,
@@ -398,6 +398,25 @@ def test_tune_rejects_multiline_value_before_any_mutation(tmp_path):
     assert not os.path.exists(os.path.join(d, '.vcstudio-job-actions.json'))
     with open(os.path.join(d, 'INCAR'), encoding='utf-8') as handle:
         assert 'ISPIN = 2' not in handle.read()
+
+
+@pytest.mark.parametrize('value', [
+    '120 ; ISPIN = 2',
+    '120 # ISPIN = 2',
+    '120 ! ISPIN = 2',
+])
+def test_tune_rejects_single_line_tag_or_comment_injection(tmp_path, value):
+    d = _terminal_job(tmp_path)
+    client = FakeClient()
+
+    with pytest.raises(ValueError, match='标签分隔符|注释符'):
+        submitter.continue_with_incar_changes(
+            client, FakeSFTP(), _profile(), d, {'NELM': value},
+            max_rounds=None, restart_from_contcar=False,
+            idempotency_key='tune-separator-injection-001')
+
+    assert client.commands == []
+    assert not os.path.exists(os.path.join(d, '.vcstudio-job-actions.json'))
 
 
 def test_tune_continue_empty_changes_rejected(tmp_path):
