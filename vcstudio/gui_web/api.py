@@ -2962,7 +2962,9 @@ class Api:
                 'ok': False, 'error': 'confirmed input write failed',
                 'target_id': plan['target_id'], 'authorizes_submission': False,
                 'scientifically_validated': False, 'submitted': False,
-                'retryable': not recovery_required,
+                # A durable journal makes retries idempotent.  ``recovery_required`` means the
+                # retry may need external interference removed first, not that the token is burnt.
+                'retryable': True,
                 'recovery_required': recovery_required,
             }
 

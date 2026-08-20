@@ -1,18 +1,19 @@
-"""Recoverable publication transaction for confirmed Method Recipe input bundles.
+"""No-clobber, recoverable publication for confirmed Method Recipe bundles.
 
-The VASP inputs and recipe sidecar are prepared in a sibling staging directory.  A durable journal
-is written before the first target mutation, ``job.yaml`` is the final bundle commit marker, and
-ledger registration happens only after every published hash is rechecked.  A stable OS-level lock
-serializes the same target across processes.
+The complete six-file bundle is built in a sibling directory and committed with one atomic
+no-replace directory rename.  A durable journal binds the parent and staged directory identities;
+the same directory entity and every file hash are rechecked before and after ledger registration.
 """
 from __future__ import annotations
 
+import ctypes
 import errno
 import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 import time
 from contextlib import contextmanager
@@ -23,21 +24,20 @@ from vcstudio.generate import method_recipes
 from vcstudio.shared.config import user_config_dir
 
 
-TRANSACTION_SCHEMA = "vcstudio.method-recipe-publish-transaction/v1"
+TRANSACTION_SCHEMA = "vcstudio.method-recipe-publish-transaction/v2"
 TRANSACTION_DIR = "method-recipe-transactions"
 _BUNDLE_FILES = (
     "INCAR", "POSCAR", "KPOINTS", "POTCAR", method_recipes.SIDECAR_NAME, "job.yaml",
 )
-_PRE_MANIFEST_FILES = tuple(name for name in _BUNDLE_FILES if name != "job.yaml")
 _STATES = frozenset({
-    "prepared", "publishing", "manifest_published", "ledger_registered",
+    "prepared", "bundle_published", "registering", "ledger_registered",
     "recovery_required",
 })
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class MethodRecipePublishError(RuntimeError):
-    """A safe publication failure; paths and injected exception text are never reflected."""
+    """A bounded publication failure that never reflects local paths or injected text."""
 
     def __init__(self, message: str, *, recovery_required: bool = False):
         super().__init__(message)
@@ -61,6 +61,33 @@ def _path_id(target: Path) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _lexists(path: Path) -> bool:
+    return os.path.lexists(str(path))
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _replace_durable(source: Path, target: Path) -> None:
+    if os.name == "nt":
+        from ctypes import wintypes
+
+        move = ctypes.WinDLL("kernel32", use_last_error=True).MoveFileExW
+        move.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+        move.restype = wintypes.BOOL
+        if not move(str(source), str(target), 0x1 | 0x8):
+            raise ctypes.WinError(ctypes.get_last_error())
+    else:
+        os.replace(source, target)
+
+
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -72,20 +99,22 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        _replace_durable(temporary, path)
+        _fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
 
 @contextmanager
 def _advisory_lock(path: Path, *, timeout: float):
-    """Cross-process lock retaining one stable inode on Windows and POSIX."""
+    """Cross-process target-operation lock retaining one stable inode."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b") as handle:
         handle.seek(0, os.SEEK_END)
         if handle.tell() == 0:
             handle.write(b"\0")
             handle.flush()
+            os.fsync(handle.fileno())
         deadline = time.monotonic() + max(0.0, float(timeout))
         if os.name == "nt":
             import msvcrt
@@ -123,8 +152,153 @@ def _advisory_lock(path: Path, *, timeout: float):
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+class _DirectoryBinding:
+    """Open directory handle plus stable volume/device and file identity."""
+
+    def __init__(self, path: Path, *, share_delete: bool):
+        self.path = path
+        self._handle: int | None = None
+        self._descriptor: int | None = None
+        if os.name == "nt":
+            self._open_windows(share_delete=share_delete)
+        else:
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            self._descriptor = os.open(path, flags)
+            loaded = os.fstat(self._descriptor)
+            if not stat.S_ISDIR(loaded.st_mode):
+                self.close()
+                raise NotADirectoryError
+            self.identity = {
+                "kind": "posix_inode", "device": int(loaded.st_dev),
+                "file_id": int(loaded.st_ino),
+            }
+
+    def _open_windows(self, *, share_delete: bool) -> None:
+        from ctypes import wintypes
+
+        class FileTime(ctypes.Structure):
+            _fields_ = [("low", wintypes.DWORD), ("high", wintypes.DWORD)]
+
+        class FileInformation(ctypes.Structure):
+            _fields_ = [
+                ("attributes", wintypes.DWORD), ("creation", FileTime),
+                ("access", FileTime), ("write", FileTime),
+                ("volume_serial", wintypes.DWORD), ("size_high", wintypes.DWORD),
+                ("size_low", wintypes.DWORD), ("links", wintypes.DWORD),
+                ("file_index_high", wintypes.DWORD), ("file_index_low", wintypes.DWORD),
+            ]
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        create = kernel.CreateFileW
+        create.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        ]
+        create.restype = wintypes.HANDLE
+        shares = 0x1 | 0x2 | (0x4 if share_delete else 0)
+        handle = create(str(self.path), 0x80, shares, None, 3, 0x02000000, None)
+        invalid = ctypes.c_void_p(-1).value
+        if handle == invalid:
+            raise ctypes.WinError(ctypes.get_last_error())
+        self._handle = int(handle)
+        info = FileInformation()
+        query = kernel.GetFileInformationByHandle
+        query.argtypes = [wintypes.HANDLE, ctypes.POINTER(FileInformation)]
+        query.restype = wintypes.BOOL
+        if not query(handle, ctypes.byref(info)):
+            error = ctypes.get_last_error()
+            self.close()
+            raise ctypes.WinError(error)
+        if not info.attributes & 0x10:
+            self.close()
+            raise NotADirectoryError
+        self.identity = {
+            "kind": "windows_file_id", "volume_serial": int(info.volume_serial),
+            "file_id": int((info.file_index_high << 32) | info.file_index_low),
+        }
+
+    def close(self) -> None:
+        if self._handle is not None:
+            from ctypes import wintypes
+
+            close = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
+            close.argtypes = [wintypes.HANDLE]
+            close.restype = wintypes.BOOL
+            close(self._handle)
+            self._handle = None
+        if self._descriptor is not None:
+            os.close(self._descriptor)
+            self._descriptor = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        self.close()
+
+
+def _identity_valid(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if value.get("kind") == "windows_file_id":
+        return (set(value) == {"kind", "volume_serial", "file_id"}
+                and all(isinstance(value[key], int) and value[key] >= 0
+                        for key in ("volume_serial", "file_id")))
+    if value.get("kind") == "posix_inode":
+        return (set(value) == {"kind", "device", "file_id"}
+                and all(isinstance(value[key], int) and value[key] >= 0
+                        for key in ("device", "file_id")))
+    return False
+
+
+def _identity_at_path(path: Path) -> dict[str, Any]:
+    with _DirectoryBinding(path, share_delete=True) as binding:
+        return dict(binding.identity)
+
+
+def _assert_path_identity(path: Path, expected: Mapping[str, Any]) -> None:
+    try:
+        actual = _identity_at_path(path)
+    except OSError as exc:
+        raise MethodRecipePublishError("published directory identity is unavailable") from exc
+    if actual != dict(expected):
+        raise MethodRecipePublishError("published directory identity changed")
+
+
+def _rename_directory_no_replace(source: Path, target: Path) -> None:
+    """Atomically rename one sibling directory and fail if the destination exists."""
+    if os.name == "nt":
+        from ctypes import wintypes
+
+        move = ctypes.WinDLL("kernel32", use_last_error=True).MoveFileExW
+        move.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+        move.restype = wintypes.BOOL
+        # WRITE_THROUGH only: deliberately omit REPLACE_EXISTING.
+        if not move(str(source), str(target), 0x8):
+            error = ctypes.get_last_error()
+            if error in {80, 183}:
+                raise FileExistsError(error, "target exists")
+            raise ctypes.WinError(error)
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise MethodRecipePublishError("atomic no-replace directory publish is unsupported")
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+                          ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    encoded_source = os.fsencode(source)
+    encoded_target = os.fsencode(target)
+    if renameat2(-100, encoded_source, -100, encoded_target, 1) != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(error, "target exists")
+        raise OSError(error, os.strerror(error))
+    _fsync_directory(target.parent)
+
+
 class MethodRecipePublisher:
-    """Stage, verify, journal, publish, register, and recover one confirmed input bundle."""
+    """Stage, journal, no-clobber publish, identity-check, register, and recover."""
 
     def __init__(self, *, job_builder_mod, manifest_mod, ledger_mod,
                  registry_dir: str | os.PathLike | None = None,
@@ -148,32 +322,52 @@ class MethodRecipePublisher:
     def _lock_path(self, path_id: str) -> Path:
         return self.registry_dir / f"{path_id}.lock"
 
-    def _ledger_lock(self) -> Path:
-        return self.registry_dir / ".ledger.lock"
-
-    def _ledger_register(self, target: Path) -> None:
-        with _advisory_lock(self._ledger_lock(), timeout=self.lock_timeout):
-            self.ledger.register(str(target))
-
-    def _ledger_unregister(self, target: Path) -> None:
-        if not hasattr(self.ledger, "unregister"):
-            raise MethodRecipePublishError("job ledger cannot roll back recipe publication")
-        with _advisory_lock(self._ledger_lock(), timeout=self.lock_timeout):
-            self.ledger.unregister(str(target))
+    @staticmethod
+    def _require_ledger_contract(ledger) -> None:
+        required = {
+            "register_owned", "registration_state", "unregister_owned",
+            "release_registration_owner",
+        }
+        if not all(callable(getattr(ledger, name, None)) for name in required):
+            raise MethodRecipePublishError("job ledger lacks transactional registration support")
 
     @staticmethod
-    def _target_has_managed_files(target: Path) -> bool:
-        return any((target / name).exists() for name in _BUNDLE_FILES) if target.is_dir() else False
-
-    @staticmethod
-    def _assert_hashes(root: Path, expected: Mapping[str, str], names) -> None:
-        for name in names:
+    def _assert_bundle(root: Path, expected: Mapping[str, str]) -> None:
+        try:
+            entries = {item.name for item in root.iterdir()}
+        except OSError as exc:
+            raise MethodRecipePublishError("recipe bundle directory is unavailable") from exc
+        if entries != set(_BUNDLE_FILES):
+            raise MethodRecipePublishError("recipe bundle contains unexpected or missing files")
+        for name in _BUNDLE_FILES:
             path = root / name
-            if not path.is_file() or _sha256_file(path) != expected[name]:
-                raise MethodRecipePublishError("staged or published recipe hash mismatch")
+            try:
+                loaded = path.lstat()
+            except OSError as exc:
+                raise MethodRecipePublishError("recipe bundle file is unavailable") from exc
+            if (not stat.S_ISREG(loaded.st_mode) or path.is_symlink()
+                    or _sha256_file(path) != expected[name]):
+                raise MethodRecipePublishError("recipe bundle hash or file type mismatch")
+
+    @staticmethod
+    def _assert_manifest_lineage(written: Mapping[str, Any], expected: Mapping[str, str],
+                                 sidecar_hash: str, record: Mapping[str, Any]) -> None:
+        inputs = written.get("inputs") or {}
+        reference = inputs.get("method_recipe") or {}
+        if (dict(inputs.get("sha256") or {}) != {
+                key: expected[key] for key in ("INCAR", "POSCAR", "KPOINTS", "POTCAR")}
+                or inputs.get("poscar_sha256") != expected["POSCAR"]
+                or inputs.get("potcar_sha256") != expected["POTCAR"]
+                or reference.get("sidecar_sha256") != sidecar_hash
+                or reference.get("incar_sha256") != expected["INCAR"]
+                or record["incar_sha256"] != expected["INCAR"]):
+            raise MethodRecipePublishError("staged manifest lineage mismatch")
 
     def _write_journal(self, journal_path: Path, payload: dict[str, Any]) -> None:
-        _atomic_json(journal_path, payload)
+        serializable = dict(payload)
+        serializable["target"] = str(serializable["target"])
+        serializable["stage"] = str(serializable["stage"])
+        _atomic_json(journal_path, serializable)
 
     def _read_journal(self, journal_path: Path) -> dict[str, Any]:
         try:
@@ -184,8 +378,9 @@ class MethodRecipePublisher:
             raise MethodRecipePublishError(
                 "method recipe recovery journal is unreadable", recovery_required=True) from exc
         required = {
-            "schema", "path_id", "target", "stage", "state", "files", "published",
-            "target_id", "target_preexisted", "created_at_unix",
+            "schema", "path_id", "transaction_id", "target", "stage", "state", "files",
+            "target_id", "parent_identity", "stage_identity", "target_identity",
+            "ledger_preexisting", "ledger_added", "registration_attempted", "created_at_unix",
         }
         if not isinstance(value, dict) or set(value) != required:
             raise MethodRecipePublishError(
@@ -194,14 +389,24 @@ class MethodRecipePublisher:
         stage = Path(str(value["stage"])).resolve(strict=False)
         path_id = str(value["path_id"])
         files = value["files"]
+        target_identity = value["target_identity"]
+        ledger_preexisting = value["ledger_preexisting"]
+        ledger_added = value["ledger_added"]
         if (value["schema"] != TRANSACTION_SCHEMA or not _HEX64.fullmatch(path_id)
+                or not _HEX64.fullmatch(str(value["transaction_id"]))
                 or journal_path.name != f"{path_id}.json" or _path_id(target) != path_id
                 or value["state"] not in _STATES or not isinstance(files, dict)
                 or set(files) != set(_BUNDLE_FILES)
                 or any(not _HEX64.fullmatch(str(item)) for item in files.values())
-                or not isinstance(value["published"], list)
-                or not set(value["published"]).issubset(_BUNDLE_FILES)
-                or not isinstance(value["target_preexisted"], bool)
+                or not _HEX64.fullmatch(str(value["target_id"]))
+                or not _identity_valid(value["parent_identity"])
+                or not _identity_valid(value["stage_identity"])
+                or (target_identity is not None and not _identity_valid(target_identity))
+                or (target_identity is not None and target_identity != value["stage_identity"])
+                or ledger_preexisting not in {None, False, True}
+                or ledger_added not in {None, False, True}
+                or (ledger_preexisting is True and ledger_added is True)
+                or not isinstance(value["registration_attempted"], bool)
                 or stage.parent != target.parent
                 or not stage.name.startswith(f".vcstudio-method-recipe-{path_id[:16]}-")):
             raise MethodRecipePublishError(
@@ -210,78 +415,184 @@ class MethodRecipePublisher:
         value["stage"] = stage
         return value
 
-    def _cleanup_journal(self, journal_path: Path, stage: Path) -> None:
-        if stage.exists():
-            shutil.rmtree(stage)
+    def _remove_journal(self, journal_path: Path) -> None:
         journal_path.unlink(missing_ok=True)
+        if journal_path.parent.is_dir():
+            _fsync_directory(journal_path.parent)
 
-    def _rollback_locked(self, journal_path: Path, journal: dict[str, Any]) -> bool:
-        """Withdraw commit marker first, unregister, then remove only hash-bound members."""
-        target: Path = journal["target"]
-        stage: Path = journal["stage"]
-        expected = journal["files"]
-        errors = []
+    @staticmethod
+    def _assert_bound_bundle(journal: Mapping[str, Any], parent: _DirectoryBinding,
+                             target: _DirectoryBinding) -> None:
+        target_path = Path(journal["target"])
+        if parent.identity != journal["parent_identity"]:
+            raise MethodRecipePublishError("recipe target parent identity changed")
+        _assert_path_identity(target_path.parent, parent.identity)
+        if target.identity != journal["stage_identity"]:
+            raise MethodRecipePublishError("published directory is not the staged entity")
+        _assert_path_identity(target_path, target.identity)
+        MethodRecipePublisher._assert_bundle(target_path, journal["files"])
+
+    def _withdraw_owned_registration(self, journal: dict[str, Any]) -> None:
+        # Rollback authority is deliberately narrower than registration authority.  A matching
+        # ledger owner is necessary but not sufficient: the journal must also prove that this
+        # transaction reached registration and durably observed that it added (rather than found)
+        # the entry.  If register_owned committed and then failed before returning, recovery will
+        # first observe the same owner idempotently and persist these flags before any withdrawal.
+        if (journal.get("registration_attempted") is not True
+                or journal.get("ledger_added") is not True
+                or journal.get("ledger_preexisting") is not False):
+            return
+        state = self.ledger.registration_state(
+            str(journal["target"]), journal["transaction_id"])
+        if state.get("owned"):
+            self.ledger.unregister_owned(
+                str(journal["target"]), journal["transaction_id"])
+
+    def _register_and_finalize(self, journal_path: Path, journal: dict[str, Any],
+                               parent: _DirectoryBinding,
+                               target_binding: _DirectoryBinding) -> None:
+        self._assert_bound_bundle(journal, parent, target_binding)
+        journal["registration_attempted"] = True
+        journal["state"] = "registering"
+        self._write_journal(journal_path, journal)
         try:
-            self._ledger_unregister(target)
-        except Exception:  # noqa: BLE001 - journal remains the recovery authority
-            errors.append("ledger")
-        ordered = ("job.yaml",) + tuple(reversed(_PRE_MANIFEST_FILES))
-        for name in ordered:
-            path = target / name
-            if not path.exists():
-                continue
-            try:
-                if not path.is_file() or _sha256_file(path) != expected[name]:
-                    errors.append(name)
-                    continue
-                path.unlink()
-            except OSError:
-                errors.append(name)
-        try:
-            if stage.exists():
-                shutil.rmtree(stage)
-        except OSError:
-            errors.append("stage")
-        if not journal["target_preexisted"] and target.is_dir():
-            try:
-                target.rmdir()
-            except OSError:
-                # Preserve an externally created or non-empty directory.  Its changed target
-                # identity will force a fresh preview instead of deleting unrelated content.
-                if not any(target.iterdir()):
-                    errors.append("target")
-        if errors:
+            result = self.ledger.register_owned(
+                str(journal["target"]), journal["transaction_id"])
+        except Exception as exc:  # noqa: BLE001 - complete bundle remains journaled for retry
             journal["state"] = "recovery_required"
             self._write_journal(journal_path, journal)
-            return False
-        journal_path.unlink(missing_ok=True)
-        return True
+            raise MethodRecipePublishError(
+                "valid recipe bundle awaits ledger recovery", recovery_required=True) from exc
+        allowed_registration_results = {
+            (True, False, True),
+            (False, True, False),
+        }
+        if (not isinstance(result, Mapping)
+                or set(result) != {"added", "preexisting", "owned"}
+                or any(type(result[key]) is not bool for key in result)
+                or (result["added"], result["preexisting"], result["owned"])
+                not in allowed_registration_results):
+            journal["state"] = "recovery_required"
+            self._write_journal(journal_path, journal)
+            raise MethodRecipePublishError(
+                "job ledger returned invalid registration state", recovery_required=True)
+        journal["ledger_added"] = bool(result["added"])
+        journal["ledger_preexisting"] = bool(result["preexisting"])
+        journal["state"] = "ledger_registered"
+        self._write_journal(journal_path, journal)
+        self._fault("after_ledger_register")
+        try:
+            self._assert_bound_bundle(journal, parent, target_binding)
+            registered = self.ledger.registration_state(
+                str(journal["target"]), journal["transaction_id"])
+            if not registered.get("present"):
+                raise MethodRecipePublishError("job ledger lost the registered recipe bundle")
+            if journal["ledger_added"] and not registered.get("owned"):
+                raise MethodRecipePublishError("recipe ledger ownership changed")
+        except Exception:
+            self._withdraw_owned_registration(journal)
+            journal["state"] = "recovery_required"
+            self._write_journal(journal_path, journal)
+            raise
+        if journal["ledger_added"]:
+            try:
+                released = self.ledger.release_registration_owner(
+                    str(journal["target"]), journal["transaction_id"])
+            except Exception as exc:  # noqa: BLE001 - recovery can idempotently finish
+                journal["state"] = "recovery_required"
+                self._write_journal(journal_path, journal)
+                raise MethodRecipePublishError(
+                    "recipe ledger ownership release awaits recovery",
+                    recovery_required=True) from exc
+            if not released:
+                journal["state"] = "recovery_required"
+                self._write_journal(journal_path, journal)
+                raise MethodRecipePublishError(
+                    "recipe ledger ownership release was not confirmed",
+                    recovery_required=True)
+        self._assert_bound_bundle(journal, parent, target_binding)
+        final_registration = self.ledger.registration_state(
+            str(journal["target"]), journal["transaction_id"])
+        if not final_registration.get("present") or final_registration.get("owned"):
+            journal["state"] = "recovery_required"
+            self._write_journal(journal_path, journal)
+            raise MethodRecipePublishError(
+                "final recipe ledger registration was not stable",
+                recovery_required=True)
+        self._remove_journal(journal_path)
+
+    def _ensure_published(self, journal_path: Path, journal: dict[str, Any],
+                          parent: _DirectoryBinding) -> _DirectoryBinding:
+        target = Path(journal["target"])
+        stage = Path(journal["stage"])
+        if parent.identity != journal["parent_identity"]:
+            raise MethodRecipePublishError(
+                "recipe target parent identity changed", recovery_required=True)
+        _assert_path_identity(target.parent, parent.identity)
+        if _lexists(target):
+            if _lexists(stage):
+                raise MethodRecipePublishError(
+                    "target and staged recipe both exist", recovery_required=True)
+            target_binding = _DirectoryBinding(target, share_delete=False)
+            if target_binding.identity != journal["stage_identity"]:
+                target_binding.close()
+                raise MethodRecipePublishError(
+                    "recipe target was replaced by another directory", recovery_required=True)
+        else:
+            if not _lexists(stage):
+                raise MethodRecipePublishError(
+                    "staged recipe directory is missing", recovery_required=True)
+            with _DirectoryBinding(stage, share_delete=True) as stage_binding:
+                if stage_binding.identity != journal["stage_identity"]:
+                    raise MethodRecipePublishError(
+                        "staged recipe directory identity changed", recovery_required=True)
+                self._assert_bundle(stage, journal["files"])
+                self._fault("before_bundle_publish")
+                _rename_directory_no_replace(stage, target)
+                self._fault("after_bundle_rename_before_bind")
+                target_binding = _DirectoryBinding(target, share_delete=False)
+                if target_binding.identity != stage_binding.identity:
+                    target_binding.close()
+                    raise MethodRecipePublishError(
+                        "published directory is not the staged entity", recovery_required=True)
+        journal["target_identity"] = dict(target_binding.identity)
+        journal["state"] = "bundle_published"
+        self._write_journal(journal_path, journal)
+        self._assert_bound_bundle(journal, parent, target_binding)
+        self._fault("after_bundle_publish")
+        self._assert_bound_bundle(journal, parent, target_binding)
+        return target_binding
 
     def _recover_locked(self, journal_path: Path) -> str:
         journal = self._read_journal(journal_path)
-        target: Path = journal["target"]
-        expected = journal["files"]
-        complete = target.is_dir() and all(
-            (target / name).is_file() and _sha256_file(target / name) == expected[name]
-            for name in _BUNDLE_FILES
-        )
-        if complete:
-            try:
-                self._ledger_register(target)
-            except Exception as exc:  # noqa: BLE001 - retain journal for next startup
-                journal["state"] = "manifest_published"
-                self._write_journal(journal_path, journal)
-                raise MethodRecipePublishError(
-                    "valid recipe bundle awaits ledger recovery", recovery_required=True) from exc
-            self._cleanup_journal(journal_path, journal["stage"])
+        try:
+            with _DirectoryBinding(journal["target"].parent, share_delete=False) as parent:
+                target_binding = self._ensure_published(journal_path, journal, parent)
+                try:
+                    self._register_and_finalize(journal_path, journal, parent, target_binding)
+                finally:
+                    target_binding.close()
             return "finalized"
-        if self._rollback_locked(journal_path, journal):
-            return "rolled_back"
-        raise MethodRecipePublishError(
-            "method recipe transaction requires manual recovery", recovery_required=True)
+        except MethodRecipePublishError:
+            try:
+                self._withdraw_owned_registration(journal)
+            except Exception:  # noqa: BLE001 - never remove an unproven/preexisting entry
+                pass
+            journal["state"] = "recovery_required"
+            self._write_journal(journal_path, journal)
+            raise
+        except Exception as exc:  # noqa: BLE001 - retain durable recovery authority
+            try:
+                self._withdraw_owned_registration(journal)
+            except Exception:  # noqa: BLE001
+                pass
+            journal["state"] = "recovery_required"
+            self._write_journal(journal_path, journal)
+            raise MethodRecipePublishError(
+                "method recipe transaction requires recovery", recovery_required=True) from exc
 
     def recover_all(self) -> dict[str, int]:
-        """Recover every durable transaction after process restart; no directory scan is needed."""
+        """Resume journals after restart; foreign/replaced entities remain blocked and untouched."""
         result = {"finalized": 0, "rolled_back": 0, "blocked": 0}
         if not self.registry_dir.is_dir():
             return result
@@ -298,7 +609,29 @@ class MethodRecipePublisher:
                 result["blocked"] += 1
         return result
 
+    def _published_result(self, plan: Mapping[str, Any]) -> dict[str, Any]:
+        target = Path(plan["target"])
+        written = self.manifest.load_manifest(target)
+        if not isinstance(written, dict):
+            raise MethodRecipePublishError("published recipe manifest is unavailable")
+        try:
+            record = json.loads((target / method_recipes.SIDECAR_NAME).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise MethodRecipePublishError("published recipe sidecar is unavailable") from exc
+        if record.get("target_id") != plan["target_id"]:
+            raise MethodRecipePublishError("published recipe target binding differs")
+        return {
+            "payload": {"warnings": list(written.get("warnings") or [])},
+            "manifest": written, "record": record,
+            "sidecar_sha256": _sha256_file(target / method_recipes.SIDECAR_NAME),
+            "input_hashes": {
+                key: _sha256_file(target / key)
+                for key in ("INCAR", "POSCAR", "KPOINTS", "POTCAR")
+            },
+        }
+
     def publish(self, plan: Mapping[str, Any]) -> dict[str, Any]:
+        self._require_ledger_contract(self.ledger)
         target = Path(plan["target"]).resolve(strict=False)
         path_id = _path_id(target)
         journal_path = self._journal_path(path_id)
@@ -306,106 +639,106 @@ class MethodRecipePublisher:
         journal_written = False
         with _advisory_lock(self._lock_path(path_id), timeout=self.lock_timeout):
             if journal_path.is_file():
+                journal = self._read_journal(journal_path)
+                if journal["target_id"] != plan["target_id"]:
+                    raise MethodRecipePublishError(
+                        "recovery journal belongs to another recipe", recovery_required=True)
+                plan["revalidate"]()
                 self._recover_locked(journal_path)
-            # This is the required second evidence validation, now inside the stable target lock.
+                return self._published_result(plan)
             plan["revalidate"]()
-            if self._target_has_managed_files(target):
-                raise MethodRecipePublishError("method recipe target is no longer empty")
-            target_preexisted = target.exists()
             target.parent.mkdir(parents=True, exist_ok=True)
-            stage = Path(tempfile.mkdtemp(
-                prefix=f".vcstudio-method-recipe-{path_id[:16]}-", dir=str(target.parent)))
-            try:
-                payload = self.job_builder.build_job_dir(
-                    str(plan["poscar_path"]), plan["final_incar"], str(stage),
-                    calc_type=plan["calc_type"], kpoints=plan["kpoints"],
-                    validate=False, lib_root=plan["lib_root"])
-                expected = dict(plan["expected_hashes"])
-                self._assert_hashes(stage, expected, ("INCAR", "POSCAR", "KPOINTS", "POTCAR"))
-                self._fault("after_build")
-
-                incar_hash = expected["INCAR"]
-                record = method_recipes.sidecar_record(plan, incar_sha256=incar_hash)
-                _sidecar, sidecar_hash = method_recipes.write_sidecar(stage, record)
-                expected[method_recipes.SIDECAR_NAME] = sidecar_hash
-                self._fault("after_sidecar")
-                reference = method_recipes.manifest_reference(
-                    record, sidecar_sha256=sidecar_hash)
-                written = self.manifest.create_from_build(
-                    stage, payload, poscar_path=str(plan["poscar_path"]), validate=False,
-                    task_type=plan["task"], method_recipe_ref=reference,
-                    job_id=f"method-recipe-{plan['target_id'][:24]}")
-                expected["job.yaml"] = _sha256_file(stage / "job.yaml")
-                self._assert_hashes(stage, expected, _BUNDLE_FILES)
-                manifest_inputs = written.get("inputs") or {}
-                if (dict(manifest_inputs.get("sha256") or {}) != {
-                        key: expected[key] for key in ("INCAR", "POSCAR", "KPOINTS", "POTCAR")}
-                        or manifest_inputs.get("poscar_sha256") != expected["POSCAR"]
-                        or manifest_inputs.get("potcar_sha256") != expected["POTCAR"]
-                        or (manifest_inputs.get("method_recipe") or {}).get("sidecar_sha256")
-                        != sidecar_hash
-                        or (manifest_inputs.get("method_recipe") or {}).get("incar_sha256")
-                        != expected["INCAR"]
-                        or record["incar_sha256"] != expected["INCAR"]):
-                    raise MethodRecipePublishError("staged manifest lineage mismatch")
-                self._fault("after_manifest_stage")
-
-                # Recheck the target immediately before journaling the first mutation.  Another
-                # recipe publisher is excluded by the OS lock; unrelated external mutations abort.
-                if self._target_has_managed_files(target):
-                    raise MethodRecipePublishError("method recipe target changed during staging")
-                journal = {
-                    "schema": TRANSACTION_SCHEMA, "path_id": path_id,
-                    "target": str(target), "stage": str(stage), "state": "prepared",
-                    "files": expected, "published": [], "target_id": plan["target_id"],
-                    "target_preexisted": target_preexisted,
-                    "created_at_unix": int(time.time()),
-                }
-                self._write_journal(journal_path, journal)
-                journal_written = True
-                self._fault("after_journal")
-                target.mkdir(parents=True, exist_ok=True)
-                journal["state"] = "publishing"
-                for name in _PRE_MANIFEST_FILES:
-                    os.replace(stage / name, target / name)
-                    journal["published"].append(name)
-                    self._write_journal(journal_path, journal)
-                    self._fault(f"after_publish_{name.lower()}")
-                self._assert_hashes(target, expected, _PRE_MANIFEST_FILES)
-                os.replace(stage / "job.yaml", target / "job.yaml")
-                journal["published"].append("job.yaml")
-                journal["state"] = "manifest_published"
-                self._write_journal(journal_path, journal)
-                self._fault("after_manifest_publish")
-                self._assert_hashes(target, expected, _BUNDLE_FILES)
-                self._ledger_register(target)
-                journal["state"] = "ledger_registered"
-                self._write_journal(journal_path, journal)
-                self._fault("after_ledger_register")
-                self._cleanup_journal(journal_path, stage)
-                journal_written = False
-                return {
-                    "payload": payload, "manifest": written, "record": record,
-                    "sidecar_sha256": sidecar_hash,
-                    "input_hashes": {
-                        key: expected[key] for key in ("INCAR", "POSCAR", "KPOINTS", "POTCAR")
-                    },
-                }
-            except Exception as exc:  # noqa: BLE001 - transaction owns rollback and recovery
-                recovery_required = False
-                if journal_written and journal_path.is_file():
+            if _lexists(target):
+                raise MethodRecipePublishError("method recipe target must not already exist")
+            with _DirectoryBinding(target.parent, share_delete=False) as parent:
+                stage = Path(tempfile.mkdtemp(
+                    prefix=f".vcstudio-method-recipe-{path_id[:16]}-", dir=str(target.parent)))
+                try:
+                    payload = self.job_builder.build_job_dir(
+                        str(plan["poscar_path"]), plan["final_incar"], str(stage),
+                        calc_type=plan["calc_type"], kpoints=plan["kpoints"],
+                        validate=False, lib_root=plan["lib_root"])
+                    expected = dict(plan["expected_hashes"])
+                    self._fault("after_build")
+                    record = method_recipes.sidecar_record(
+                        plan, incar_sha256=expected["INCAR"])
+                    _sidecar, sidecar_hash = method_recipes.write_sidecar(stage, record)
+                    expected[method_recipes.SIDECAR_NAME] = sidecar_hash
+                    self._fault("after_sidecar")
+                    reference = method_recipes.manifest_reference(
+                        record, sidecar_sha256=sidecar_hash)
+                    written = self.manifest.create_from_build(
+                        stage, payload, poscar_path=str(plan["poscar_path"]), validate=False,
+                        task_type=plan["task"], method_recipe_ref=reference,
+                        job_id=f"method-recipe-{plan['target_id'][:24]}")
+                    expected["job.yaml"] = _sha256_file(stage / "job.yaml")
+                    self._assert_bundle(stage, expected)
+                    self._assert_manifest_lineage(written, expected, sidecar_hash, record)
+                    self._fault("after_manifest_stage")
+                    plan["revalidate"]()
+                    if parent.identity != _identity_at_path(target.parent) or _lexists(target):
+                        raise MethodRecipePublishError("method recipe target changed during staging")
+                    with _DirectoryBinding(stage, share_delete=True) as stage_binding:
+                        self._assert_bundle(stage, expected)
+                        transaction_id = hashlib.sha256(os.urandom(32)).hexdigest()
+                        journal = {
+                            "schema": TRANSACTION_SCHEMA, "path_id": path_id,
+                            "transaction_id": transaction_id, "target": str(target),
+                            "stage": str(stage), "state": "prepared", "files": expected,
+                            "target_id": plan["target_id"],
+                            "parent_identity": dict(parent.identity),
+                            "stage_identity": dict(stage_binding.identity),
+                            "target_identity": None, "ledger_preexisting": None,
+                            "ledger_added": None, "registration_attempted": False,
+                            "created_at_unix": int(time.time()),
+                        }
+                        self._write_journal(journal_path, journal)
+                        journal_written = True
+                        self._fault("after_journal")
+                    target_binding = self._ensure_published(journal_path, journal, parent)
                     try:
+                        self._register_and_finalize(
+                            journal_path, journal, parent, target_binding)
+                    finally:
+                        target_binding.close()
+                    journal_written = False
+                    return {
+                        "payload": payload, "manifest": written, "record": record,
+                        "sidecar_sha256": sidecar_hash,
+                        "input_hashes": {
+                            key: expected[key]
+                            for key in ("INCAR", "POSCAR", "KPOINTS", "POTCAR")
+                        },
+                    }
+                except MethodRecipePublishError as exc:
+                    if journal_written and journal_path.is_file():
                         journal = self._read_journal(journal_path)
-                        recovery_required = not self._rollback_locked(journal_path, journal)
-                        journal_written = recovery_required
-                    except Exception:  # noqa: BLE001 - durable journal remains for startup recovery
-                        recovery_required = True
-                raise MethodRecipePublishError(
-                    "confirmed recipe publication failed",
-                    recovery_required=recovery_required) from exc
-            finally:
-                if stage is not None and stage.exists() and not journal_written:
-                    shutil.rmtree(stage, ignore_errors=True)
+                        journal["state"] = "recovery_required"
+                        self._write_journal(journal_path, journal)
+                        raise MethodRecipePublishError(
+                            "confirmed recipe publication requires recovery",
+                            recovery_required=True) from exc
+                    raise
+                except Exception as exc:  # noqa: BLE001 - preserve journal after first authority
+                    if journal_written and journal_path.is_file():
+                        try:
+                            journal = self._read_journal(journal_path)
+                            try:
+                                self._withdraw_owned_registration(journal)
+                            except Exception:  # noqa: BLE001 - fail closed, journal remains
+                                pass
+                            journal["state"] = "recovery_required"
+                            self._write_journal(journal_path, journal)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        raise MethodRecipePublishError(
+                            "confirmed recipe publication requires recovery",
+                            recovery_required=True) from exc
+                    raise MethodRecipePublishError(
+                        "confirmed recipe publication failed") from exc
+                finally:
+                    if stage is not None and stage.exists() and not journal_written:
+                        shutil.rmtree(stage, ignore_errors=True)
 
 
 __all__ = [

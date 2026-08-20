@@ -80,7 +80,6 @@ _TASK_SYSTEMS: dict[str, frozenset[str]] = {
 }
 _IONIC_TASKS = frozenset({"relax", "cellopt", "freq"})
 _CONVERGENCE_TASKS = ("conv_encut", "conv_kmesh", "conv_vacuum", "conv_thickness")
-_MANAGED_TARGETS = ("INCAR", "POSCAR", "KPOINTS", "POTCAR", "job.yaml", SIDECAR_NAME)
 
 _DRAFT_FIELDS = frozenset({
     "schema", "system_type", "task", "xc", "dispersion", "precision", "ediff",
@@ -908,22 +907,15 @@ def _target_snapshot(path_value: Any) -> tuple[Path, str, dict[str, str]]:
         target = Path(raw).expanduser().resolve(strict=False)
     except (OSError, RuntimeError) as exc:
         raise MethodRecipeError("out_dir is invalid") from exc
-    if target.exists() and not target.is_dir():
-        raise MethodRecipeError("out_dir must be a directory target")
-    managed: dict[str, str] = {}
-    if target.is_dir():
-        for name in _MANAGED_TARGETS:
-            candidate = target / name
-            if candidate.is_file():
-                managed[name] = _file_sha256(candidate)
-    if managed:
-        raise MethodRecipeError("target already contains managed VASP inputs; choose a new target")
+    # Directory publication uses one no-replace rename.  Even an empty directory, broken link, or
+    # junction at the requested name is an existing authority and must never be merged/overwritten.
+    if os.path.lexists(str(target)):
+        raise MethodRecipeError("out_dir must name a target that does not already exist")
     semantic = {
         # The canonical path is hashed into server-side authority and is never returned.
-        "canonical_path": os.path.normcase(str(target)),
-        "exists": target.exists(), "managed": managed,
+        "canonical_path": os.path.normcase(str(target)), "exists": False, "managed": {},
     }
-    return target, semantic_sha256(semantic), managed
+    return target, semantic_sha256(semantic), {}
 
 
 def _logical(value: Any) -> bool | None:
@@ -1249,7 +1241,7 @@ class MethodRecipeService:
             recipe, diff, token=token, target_id=target_id, expires_at=record["expires_at"],
             client_intent_id=client_intent_id)
 
-    def _revalidate(self, record: dict[str, Any]) -> None:
+    def _revalidate(self, record: dict[str, Any], *, allow_transaction_target: bool = False) -> None:
         try:
             if _file_sha256(record["poscar_path"]) != record["poscar_hash"]:
                 raise MethodRecipeTokenError("POSCAR changed after preview; request a new preview")
@@ -1258,9 +1250,10 @@ class MethodRecipeService:
                 if _file_sha256(incar_path) != record["incar_hash"]:
                     raise MethodRecipeTokenError(
                         "existing INCAR changed after preview; request a new preview")
-            _target, target_id, _managed = _target_snapshot(record["target"])
-            if target_id != record["target_id"]:
-                raise MethodRecipeTokenError("target identity changed after preview")
+            if not allow_transaction_target:
+                _target, target_id, _managed = _target_snapshot(record["target"])
+                if target_id != record["target_id"]:
+                    raise MethodRecipeTokenError("target identity changed after preview")
             elements = [item["element"] for item in record["recipe"]["dimensions"]["xc"]
                         ["evidence"] if item.get("kind") == "potcar"]
             _evidence, fingerprint, rendered_sha256 = _potcar_evidence(
@@ -1319,7 +1312,8 @@ class MethodRecipeService:
                 raise MethodRecipeTokenError("target identity does not match the token")
             if client_intent_id != record["client_intent_id"]:
                 raise MethodRecipeTokenError("client intent does not match the token")
-            self._revalidate(record)
+            self._revalidate(
+                record, allow_transaction_target=bool(record.get("write_attempted")))
             merged, final_recipe = _merge_incar(
                 record["existing"], record["recipe"], record["diff"], resolutions,
                 elements=record["elements"], counts=record["counts"])
@@ -1341,7 +1335,8 @@ class MethodRecipeService:
                 "confirmed_at_unix": int(now),
                 "expected_hashes": expected_hashes,
                 # The publisher calls this again only after acquiring the stable target OS lock.
-                "revalidate": lambda: self._revalidate(record),
+                "revalidate": lambda: self._revalidate(
+                    record, allow_transaction_target=bool(record.get("write_attempted"))),
             }
             # The desktop bridge is synchronous.  Keeping the lock across the write closes the
             # two-click race and gives this in-memory capability exactly-once behavior.
@@ -1352,6 +1347,7 @@ class MethodRecipeService:
                 # A failed recoverable publication never burns the one-use capability.  The same
                 # bound intent may retry after rollback/recovery, or the user may request a new
                 # preview.  Only a fully published and registered bundle consumes the token.
+                record["write_attempted"] = True
                 return copy.deepcopy(result)
             record["used"] = True
             record["confirm_fingerprint"] = fingerprint

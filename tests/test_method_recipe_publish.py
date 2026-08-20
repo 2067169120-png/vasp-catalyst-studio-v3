@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -40,24 +41,50 @@ class FakeLedger:
         self.register_calls = 0
         self.unregister_calls = 0
         self.fail_registers = fail_registers
+        self.owners: dict[str, str] = {}
         self._lock = threading.Lock()
 
     def register(self, path: str):
+        with self._lock:
+            if path in self.entries:
+                return False
+            self.entries.append(path)
+            return True
+
+    def register_owned(self, path: str, transaction_id: str):
         with self._lock:
             self.register_calls += 1
             if self.fail_registers:
                 self.fail_registers -= 1
                 raise OSError("injected ledger failure with a private path")
-            if path not in self.entries:
-                self.entries.append(path)
-        return True
+            if path in self.entries:
+                owned = self.owners.get(path) == transaction_id
+                return {"added": owned, "preexisting": not owned, "owned": owned}
+            self.entries.append(path)
+            self.owners[path] = transaction_id
+            return {"added": True, "preexisting": False, "owned": True}
 
-    def unregister(self, path: str):
+    def registration_state(self, path: str, transaction_id: str):
+        with self._lock:
+            present = path in self.entries
+            owned = present and self.owners.get(path) == transaction_id
+            return {"present": present, "owned": owned, "preexisting": present and not owned}
+
+    def unregister_owned(self, path: str, transaction_id: str):
         with self._lock:
             self.unregister_calls += 1
-            if path in self.entries:
-                self.entries.remove(path)
-        return True
+            if path not in self.entries or self.owners.get(path) != transaction_id:
+                return False
+            self.entries.remove(path)
+            self.owners.pop(path, None)
+            return True
+
+    def release_registration_owner(self, path: str, transaction_id: str):
+        with self._lock:
+            if path not in self.entries or self.owners.get(path) != transaction_id:
+                return False
+            self.owners.pop(path, None)
+            return True
 
 
 def _recipe_context(tmp_path: Path, *, out: Path | None = None, intent: str = "publish-intent"):
@@ -133,13 +160,13 @@ def test_publish_asserts_full_lineage_before_registration(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "fault_point",
-    [
-        "after_sidecar", "after_manifest_stage", "after_publish_method-recipe.json",
-        "after_manifest_publish", "after_ledger_register",
-    ],
+    "fault_point, journal_expected",
+    [("after_sidecar", False), ("after_manifest_stage", False),
+     ("after_journal", True), ("after_bundle_publish", True),
+     ("after_ledger_register", True)],
 )
-def test_every_publish_write_failure_rolls_back_and_allows_safe_retry(tmp_path, fault_point):
+def test_every_publish_failure_is_clean_or_journaled_and_allows_safe_retry(
+        tmp_path, fault_point, journal_expected):
     _service, _preview, _confirmation, plan, target, _poscar = _recipe_context(tmp_path)
     ledger = FakeLedger()
 
@@ -149,10 +176,28 @@ def test_every_publish_write_failure_rolls_back_and_allows_safe_retry(tmp_path, 
 
     with pytest.raises(MethodRecipePublishError) as exc:
         _publisher(tmp_path, ledger, fault_hook=fail).publish(plan)
-    assert exc.value.recovery_required is False
-    _assert_no_managed_bundle(target)
-    assert ledger.entries == []
-    assert not list((tmp_path / "transactions").glob("*.json"))
+    assert exc.value.recovery_required is journal_expected
+    journals = list((tmp_path / "transactions").glob("*.json"))
+    assert bool(journals) is journal_expected
+    if not journal_expected:
+        assert not target.exists()
+    if fault_point == "after_ledger_register":
+        assert ledger.entries == [], "only this transaction's newly added entry is withdrawn"
+        journal = json.loads(journals[0].read_text(encoding="utf-8"))
+        assert journal["ledger_added"] is True
+        assert journal["ledger_preexisting"] is False
+        assert ledger.unregister_calls == 1
+    else:
+        assert ledger.unregister_calls == 0, "no pre-registration failure may unregister"
+    if fault_point == "after_journal":
+        journal = json.loads(journals[0].read_text(encoding="utf-8"))
+        expected_kind = "windows_file_id" if os.name == "nt" else "posix_inode"
+        assert journal["parent_identity"]["kind"] == expected_kind
+        assert journal["stage_identity"]["kind"] == expected_kind
+        assert journal["target_identity"] is None
+    if fault_point == "after_bundle_publish":
+        journal = json.loads(journals[0].read_text(encoding="utf-8"))
+        assert journal["target_identity"] == journal["stage_identity"]
 
     result = _publisher(tmp_path, ledger).publish(plan)
     assert result["manifest"]["state"] == "CREATED"
@@ -167,10 +212,11 @@ def test_writer_false_does_not_consume_token_and_ledger_failure_is_retryable(tmp
 
     first = api.method_recipe_confirm(confirmation)
     assert first["ok"] is False
-    assert first["retryable"] is True and first["recovery_required"] is False
+    assert first["retryable"] is True and first["recovery_required"] is True
     assert str(tmp_path) not in json.dumps(first)
-    _assert_no_managed_bundle(target)
+    assert (target / "job.yaml").is_file()
     assert ledger.entries == []
+    assert list((tmp_path / "transactions").glob("*.json"))
 
     second = api.method_recipe_confirm(confirmation)
     third = api.method_recipe_confirm(confirmation)
@@ -190,7 +236,7 @@ def test_source_replacement_after_locked_revalidation_is_detected_before_publish
             poscar.write_text(POSCAR.replace("FeO slab", "swapped source"), encoding="utf-8")
             return job_builder.build_job_dir(*args, **kwargs)
 
-    with pytest.raises(MethodRecipePublishError, match="publication failed"):
+    with pytest.raises(MethodRecipePublishError):
         _publisher(tmp_path, ledger, builder=SwappingBuilder).publish(plan)
     _assert_no_managed_bundle(target)
     assert ledger.entries == []
@@ -207,7 +253,7 @@ def test_source_replacement_after_staging_cannot_fork_manifest_lineage(tmp_path)
             poscar.write_text(POSCAR.replace("FeO slab", "late swapped source"), encoding="utf-8")
             return result
 
-    with pytest.raises(MethodRecipePublishError, match="publication failed"):
+    with pytest.raises(MethodRecipePublishError):
         _publisher(tmp_path, ledger, builder=LateSwappingBuilder).publish(plan)
     _assert_no_managed_bundle(target)
     assert ledger.entries == []
@@ -218,11 +264,10 @@ class SimulatedCrash(BaseException):
 
 
 @pytest.mark.parametrize(
-    "fault_point, expected_outcome",
-    [("after_publish_incar", "rolled_back"), ("after_manifest_publish", "finalized")],
+    "fault_point",
+    ["after_journal", "after_bundle_publish"],
 )
-def test_restart_recovery_withdraws_partial_or_finalizes_complete_bundle(
-        tmp_path, fault_point, expected_outcome):
+def test_restart_recovery_resumes_precommit_or_complete_atomic_bundle(tmp_path, fault_point):
     _service, _preview, _confirmation, plan, target, _poscar = _recipe_context(tmp_path)
     ledger = FakeLedger()
 
@@ -235,15 +280,110 @@ def test_restart_recovery_withdraws_partial_or_finalizes_complete_bundle(
     assert list((tmp_path / "transactions").glob("*.json"))
 
     recovery = _publisher(tmp_path, ledger).recover_all()
-    assert recovery[expected_outcome] == 1
+    assert recovery["finalized"] == 1
     assert recovery["blocked"] == 0
     assert not list((tmp_path / "transactions").glob("*.json"))
-    if expected_outcome == "rolled_back":
-        _assert_no_managed_bundle(target)
-        assert ledger.entries == []
-    else:
-        assert (target / "job.yaml").is_file()
-        assert ledger.entries == [str(target.resolve())]
+    assert (target / "job.yaml").is_file()
+    assert ledger.entries == [str(target.resolve())]
+
+
+def test_atomic_publish_never_clobbers_external_target_or_sentinel(tmp_path):
+    _service, _preview, _confirmation, plan, target, _poscar = _recipe_context(tmp_path)
+    ledger = FakeLedger()
+
+    def insert_target(point):
+        if point == "before_bundle_publish":
+            target.mkdir()
+            (target / "SENTINEL.txt").write_text("external authority", encoding="utf-8")
+
+    with pytest.raises(MethodRecipePublishError) as exc:
+        _publisher(tmp_path, ledger, fault_hook=insert_target).publish(plan)
+    assert exc.value.recovery_required is True
+    assert (target / "SENTINEL.txt").read_text(encoding="utf-8") == "external authority"
+    assert not (target / "job.yaml").exists()
+    assert ledger.entries == []
+    assert list((tmp_path / "transactions").glob("*.json"))
+    recovery = _publisher(tmp_path, ledger).recover_all()
+    assert recovery["blocked"] == 1
+    assert (target / "SENTINEL.txt").is_file()
+
+
+def test_external_file_inserted_into_published_entity_blocks_registration(tmp_path):
+    _service, _preview, _confirmation, plan, target, _poscar = _recipe_context(tmp_path)
+    ledger = FakeLedger()
+
+    def insert_sentinel(point):
+        if point == "after_bundle_publish":
+            (target / "SENTINEL.txt").write_text("do not remove", encoding="utf-8")
+
+    with pytest.raises(MethodRecipePublishError) as exc:
+        _publisher(tmp_path, ledger, fault_hook=insert_sentinel).publish(plan)
+    assert exc.value.recovery_required is True
+    assert (target / "SENTINEL.txt").read_text(encoding="utf-8") == "do not remove"
+    assert ledger.entries == []
+    assert list((tmp_path / "transactions").glob("*.json"))
+
+
+def test_directory_exchange_between_rename_and_handle_binding_is_rejected(tmp_path):
+    _service, _preview, _confirmation, plan, target, _poscar = _recipe_context(tmp_path)
+    ledger = FakeLedger()
+    displaced = tmp_path / "displaced-original"
+
+    def exchange(point):
+        if point == "after_bundle_rename_before_bind":
+            target.rename(displaced)
+            target.mkdir()
+            (target / "SENTINEL.txt").write_text("replacement", encoding="utf-8")
+
+    with pytest.raises(MethodRecipePublishError) as exc:
+        _publisher(tmp_path, ledger, fault_hook=exchange).publish(plan)
+    assert exc.value.recovery_required is True
+    assert (displaced / "job.yaml").is_file()
+    assert (target / "SENTINEL.txt").is_file()
+    assert ledger.entries == []
+    assert list((tmp_path / "transactions").glob("*.json"))
+
+
+def test_preexisting_ledger_entry_is_never_unregistered_by_transaction_rollback(tmp_path):
+    _service, _preview, _confirmation, plan, target, _poscar = _recipe_context(tmp_path)
+    ledger = FakeLedger()
+    assert ledger.register(str(target.resolve())) is True
+
+    def fail_after_registration(point):
+        if point == "after_ledger_register":
+            raise RuntimeError("force post-registration rollback")
+
+    with pytest.raises(MethodRecipePublishError):
+        _publisher(tmp_path, ledger, fault_hook=fail_after_registration).publish(plan)
+    journal_path = next((tmp_path / "transactions").glob("*.json"))
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert journal["ledger_preexisting"] is True
+    assert journal["ledger_added"] is False
+    assert ledger.unregister_calls == 0
+    assert ledger.entries == [str(target.resolve())]
+
+    recovery = _publisher(tmp_path, ledger).recover_all()
+    assert recovery["finalized"] == 1
+    assert ledger.entries == [str(target.resolve())]
+
+
+def test_post_registration_bundle_mutation_is_detected_and_owned_entry_withdrawn(tmp_path):
+    _service, _preview, _confirmation, plan, target, _poscar = _recipe_context(tmp_path)
+
+    class MutatingLedger(FakeLedger):
+        def register_owned(self, path: str, transaction_id: str):
+            result = super().register_owned(path, transaction_id)
+            (target / "SENTINEL.txt").write_text("inserted during register", encoding="utf-8")
+            return result
+
+    ledger = MutatingLedger()
+    with pytest.raises(MethodRecipePublishError) as exc:
+        _publisher(tmp_path, ledger).publish(plan)
+    assert exc.value.recovery_required is True
+    assert ledger.entries == []
+    assert ledger.unregister_calls == 1
+    assert (target / "SENTINEL.txt").is_file()
+    assert list((tmp_path / "transactions").glob("*.json"))
 
 
 def test_concurrent_publishers_serialize_same_target_and_only_one_registers(tmp_path):

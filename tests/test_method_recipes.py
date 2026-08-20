@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import json
-import types
 from pathlib import Path
 
 import pytest
@@ -10,6 +9,7 @@ import yaml
 
 from vcstudio.generate import method_recipes
 from vcstudio.generate.incar_builder import parse_incar
+from vcstudio.cluster import ledger as cluster_ledger
 from vcstudio.gui_web.api import Api
 
 
@@ -210,6 +210,17 @@ def test_preview_token_expires_and_source_tamper_requires_new_preview(tmp_path):
         service.confirm(_confirmation(preview4), lambda plan: {"ok": True})
 
 
+@pytest.mark.parametrize("kind", ["empty-directory", "sentinel-directory"])
+def test_preview_requires_target_name_to_be_completely_absent(tmp_path, kind):
+    request, target = _request(tmp_path)
+    target.mkdir()
+    if kind == "sentinel-directory":
+        (target / "SENTINEL.txt").write_text("external", encoding="utf-8")
+
+    with pytest.raises(method_recipes.MethodRecipeError, match="does not already exist"):
+        method_recipes.MethodRecipeService().preview(request)
+
+
 @pytest.mark.parametrize(
     "mutate, message",
     [
@@ -397,10 +408,9 @@ def test_system_task_compatibility_matrix_rejects_unsupported_pairs(
 
 def test_confirm_writes_sidecar_manifest_and_registers_without_submission(tmp_path):
     request, out = _request(tmp_path)
-    registered = []
     api = Api(
         method_recipe_service=method_recipes.MethodRecipeService(),
-        ledger_mod=types.SimpleNamespace(register=lambda path: registered.append(path) or True),
+        ledger_mod=cluster_ledger,
     )
     preview = api.method_recipe_preview(request)
     result = api.method_recipe_confirm(_confirmation(preview))
@@ -411,7 +421,7 @@ def test_confirm_writes_sidecar_manifest_and_registers_without_submission(tmp_pa
     assert result["authorizes_submission"] is False
     assert result["scientifically_validated"] is False
     assert str(out) not in json.dumps(result)
-    assert registered == [str(out)]
+    assert cluster_ledger.list_dirs() == [str(out.resolve())]
 
     sidecar = json.loads((out / method_recipes.SIDECAR_NAME).read_text(encoding="utf-8"))
     manifest = yaml.safe_load((out / "job.yaml").read_text(encoding="utf-8"))
