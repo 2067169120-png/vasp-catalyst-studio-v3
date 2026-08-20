@@ -3,7 +3,11 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
+import threading
 import time
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
@@ -12,6 +16,7 @@ import pytest
 
 from vcstudio.gui_web.api import Api
 from vcstudio.project.external_references import (
+    AdapterResult,
     BoundedHttpTransport,
     CatalysisHubAdapter,
     ExternalReferenceCache,
@@ -171,7 +176,10 @@ def _gateway(tmp_path, transport, *, clock=lambda: 1_700_000_000.0,
         max_entries=max_entries, clock=clock)
     return ExternalReferenceGateway(
         transport=transport, cache=cache,
-        secrets_store=secrets or FakeSecrets({"materials_project": "k" * 32}),
+        secrets_store=secrets or FakeSecrets({
+            "materials_project": "a" * 32,
+            "catalysis_hub": "c" * 32,
+        }),
         network_enabled=network_enabled, token_ttl_seconds=token_ttl_seconds,
         token_max_records=token_max_records,
         token_capacity_bytes=token_capacity_bytes,
@@ -202,11 +210,13 @@ def test_gateway_implements_narrow_protocol_and_defaults_to_offline(tmp_path):
     enabled = gateway.set_network_enabled(
         True, "enable-external-reference-network")
     assert denied["error"]["code"] == "network_confirmation_required"
-    assert enabled == {
-        "schema": "vcstudio.external-reference-network/v1",
-        "ok": True, "network_enabled": True,
-        "persisted": False, "scope": "current_process",
-    }
+    assert enabled["schema"] == "vcstudio.external-reference-network/v1"
+    assert enabled["ok"] is True
+    assert enabled["network_enabled"] is True
+    assert enabled["network_state"] == "enabled"
+    assert enabled["draining_requests"] == 0
+    assert enabled["persisted"] is False
+    assert enabled["scope"] == "current_process"
 
 
 @pytest.mark.parametrize("bad_filters", [
@@ -303,8 +313,77 @@ def test_bounded_transport_enforces_wall_clock_deadline():
     assert time.monotonic() - started < 1.2
 
 
+def test_transport_sets_stable_application_user_agent():
+    captured = []
+
+    class Response:
+        status = 200
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size):
+            return b"{}"
+
+    def open_request(request, **_kwargs):
+        captured.append(request)
+        return Response()
+
+    transport = BoundedHttpTransport(
+        opener=SimpleNamespace(open=open_request), timeout_seconds=2)
+    response = transport.request(OutboundRequest(
+        "GET", "https://example.com/v1/structures",
+        {"User-Agent": "browser-controlled-value"}))
+
+    assert response.status == 200
+    assert captured[0].get_header("User-agent").startswith(
+        "VASP-Catalyst-Studio/4 ExternalReferenceGateway/1")
+    assert "browser-controlled-value" not in captured[0].get_header("User-agent")
+
+
+def test_network_disable_closes_epoch_before_new_requests_and_drains_inflight(
+        tmp_path):
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingTransport(FakeTransport):
+        def request(self, outbound):
+            self.requests.append(outbound)
+            started.set()
+            assert release.wait(2)
+            return _response(_optimade_payload())
+
+    transport = BlockingTransport()
+    gateway = _gateway(tmp_path, transport)
+    outcome = {}
+
+    worker = threading.Thread(
+        target=lambda: outcome.setdefault(
+            "first", gateway.search("optimade", {"formula": "Si"})))
+    worker.start()
+    assert started.wait(1)
+
+    disabled = gateway.set_network_enabled(False)
+    second = gateway.search("optimade", {"formula": "Si"})
+    draining_catalog = gateway.catalog()
+    release.set()
+    worker.join(timeout=2)
+
+    assert disabled["network_state"] == "draining"
+    assert disabled["draining_requests"] == 1
+    assert draining_catalog["network_state"] == "draining"
+    assert second["error"]["code"] == "network_disabled"
+    assert outcome["first"]["error"]["code"] == "network_session_changed"
+    assert len(transport.requests) == 1
+    assert not list((tmp_path / "cache").glob("external-*.*"))
+
+
 def test_materials_project_fixed_fields_keyring_and_cache_provenance(tmp_path):
-    api_key = "mp-key-" + "x" * 32
+    api_key = "b" * 32
     secrets = FakeSecrets({"materials_project": api_key})
     transport = FakeTransport(_response(_mp_payload()))
     gateway = _gateway(tmp_path, transport, secrets=secrets)
@@ -333,7 +412,14 @@ def test_materials_project_fixed_fields_keyring_and_cache_provenance(tmp_path):
     assert len(manifests) == len(raw_files) == 1
     manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
     raw = raw_files[0].read_bytes()
-    assert manifest["raw_response_sha256"] == hashlib.sha256(raw).hexdigest()
+    provider_bytes = json.dumps(
+        _mp_payload(), ensure_ascii=False).encode("utf-8")
+    assert raw != provider_bytes
+    assert manifest["raw_response_sha256"] == hashlib.sha256(
+        provider_bytes).hexdigest()
+    assert manifest["cached_response_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert manifest["cache_representation"] == "credential-scrubbed-json"
+    assert b"server-secret" not in raw and b"private" not in raw
     assert manifest["query"] == {"formula": "Si", "page": 1, "limit": 5}
     assert manifest["provider_version"] == "2025.09.25"
     assert manifest["endpoint_identity"] == "materials-project:materials-summary"
@@ -345,7 +431,7 @@ def test_materials_project_fixed_fields_keyring_and_cache_provenance(tmp_path):
 
 
 def test_provider_credential_echo_is_not_cached_or_returned(tmp_path):
-    api_key = "mp-key-" + "z" * 32
+    api_key = "d" * 32
     payload = _mp_payload()
     payload["debug_echo"] = api_key
     gateway = _gateway(
@@ -357,6 +443,81 @@ def test_provider_credential_echo_is_not_cached_or_returned(tmp_path):
     assert result["error"]["code"] == "credential_echo_detected"
     assert api_key not in _encoded(result)
     assert not list((tmp_path / "cache").glob("external-*.*"))
+
+
+@pytest.mark.parametrize("echo_location", ["escaped_json", "response_header"])
+def test_credential_echo_detection_decodes_json_and_checks_headers(
+        tmp_path, echo_location):
+    api_key = "b" * 32
+    payload = _mp_payload()
+    headers = {}
+    if echo_location == "escaped_json":
+        raw = json.dumps(payload, ensure_ascii=True).encode("utf-8")[:-1]
+        escaped = "".join(f"\\u{ord(character):04x}" for character in api_key)
+        response = _response(raw + f',"echo":"{escaped}"}}'.encode("ascii"))
+    else:
+        headers["x-api-version"] = api_key
+        response = _response(payload, headers=headers)
+    gateway = _gateway(
+        tmp_path, FakeTransport(response),
+        secrets=FakeSecrets({"materials_project": api_key}))
+
+    result = gateway.search("materials_project", {"formula": "Si"})
+
+    assert result["error"]["code"] == "credential_echo_detected"
+    assert api_key not in _encoded(result)
+    assert not list((tmp_path / "cache").glob("external-*.*"))
+
+
+def test_credential_echo_in_adapter_dto_or_manifest_is_rejected(tmp_path):
+    api_key = "b" * 32
+    gateway = _gateway(
+        tmp_path, FakeTransport(_response(_mp_payload())),
+        secrets=FakeSecrets({"materials_project": api_key}))
+    normal = gateway._adapters["materials-project-rest"]
+
+    class LeakingAdapter:
+        def build_request(self, spec, query, key):
+            return normal.build_request(spec, query, key)
+
+        def parse_response(self, _spec, _query, _response):
+            return AdapterResult(
+                items=({"item_id": "materials_project:fixture",
+                        "title": api_key, "citation": {"dois": []},
+                        "method": {}},),
+                provider_version="fixture", total_count=1,
+                more_available=False,
+                response_metadata={"version": api_key})
+
+    gateway._adapters["materials-project-rest"] = LeakingAdapter()
+
+    result = gateway.search("materials_project", {"formula": "Si"})
+
+    assert result["error"]["code"] == "credential_echo_detected"
+    assert api_key not in _encoded(result)
+    assert not list((tmp_path / "cache").glob("external-*.*"))
+
+
+@pytest.mark.parametrize(("provider", "bad_key"), [
+    ("materials_project", "g" * 32),
+    ("materials_project", "a" * 31),
+    ("catalysis_hub", "with spaces" * 4),
+    ("catalysis_hub", "x" * 129),
+])
+def test_provider_api_keys_have_strict_provider_specific_shapes(
+        tmp_path, provider, bad_key):
+    transport = FakeTransport()
+    gateway = _gateway(
+        tmp_path, transport, secrets=FakeSecrets({provider: bad_key}))
+
+    stored = gateway.store_api_key(provider, bad_key)
+    searched = gateway.search(
+        provider, {"formula": "Si"} if provider == "materials_project"
+        else {"reactants": "COstar"})
+
+    assert stored["error"]["code"] == "invalid_credential"
+    assert searched["error"]["code"] == "credential_required"
+    assert transport.requests == []
 
 
 def test_optimade_filter_is_generated_and_response_fields_are_fixed(tmp_path):
@@ -410,7 +571,7 @@ def test_provider_cannot_exceed_requested_page_cardinality(tmp_path, provider):
         second = json.loads(json.dumps(payload["data"][0]))
         second["material_id"] = "mp-2"
         payload["data"].append(second)
-        secrets = FakeSecrets({"materials_project": "k" * 32})
+        secrets = FakeSecrets({"materials_project": "a" * 32})
         filters = {"formula": "Si", "limit": 1}
     else:
         payload = _optimade_payload()
@@ -438,8 +599,13 @@ def test_catalysis_hub_uses_fixed_graphql_variables_and_preserves_attribution(tm
     })
 
     assert result["ok"] is True
+    provider = next(item for item in gateway.catalog()["providers"]
+                    if item["id"] == "catalysis_hub")
+    assert provider["requires_api_key"] is True
+    assert provider["credential_available"] is True
     outbound = transport.requests[0]
     body = json.loads(outbound.body.decode("utf-8"))
+    assert outbound.headers["X-API-Key"] == "c" * 32
     assert body["query"] == CatalysisHubAdapter._QUERY
     assert "COstar+Ostar" not in body["query"]
     assert body["variables"]["reactants"] == "COstar+Ostar"
@@ -455,6 +621,35 @@ def test_catalysis_hub_uses_fixed_graphql_variables_and_preserves_attribution(tm
     assert injection["ok"] is False
     assert injection["error"]["code"] == "invalid_query"
     assert len(transport.requests) == 1
+
+    missing_key = _gateway(
+        tmp_path / "missing", FakeTransport(),
+        secrets=FakeSecrets({"materials_project": "a" * 32}))
+    unavailable = missing_key.search("catalysis_hub", {"reactants": "COstar"})
+    assert unavailable["error"]["code"] == "credential_required"
+
+
+@pytest.mark.parametrize("mutation", ["total_type", "page_info", "publication_type"])
+def test_catalysis_hub_authenticated_response_schema_is_strict(
+        tmp_path, mutation):
+    payload = _catalysis_payload()
+    connection = payload["data"]["reactions"]
+    if mutation == "total_type":
+        connection["totalCount"] = "1"
+        expected = "schema_drift"
+    elif mutation == "page_info":
+        connection["pageInfo"]["hasNextPage"] = 0
+        expected = "schema_drift"
+    else:
+        connection["edges"][0]["node"]["publication"]["authors"] = ["unsafe"]
+        expected = "partial_data"
+    gateway = _gateway(tmp_path, FakeTransport(_response(payload)))
+
+    result = gateway.search("catalysis_hub", {"reactants": "COstar"})
+
+    assert result["status"] == "unavailable"
+    assert result["error"]["code"] == expected
+    assert result["items"] == []
 
 
 @pytest.mark.parametrize(("payload", "code"), [
@@ -507,13 +702,19 @@ def test_structure_claim_requires_confirmation_and_token_is_single_use(tmp_path)
 
     project = tmp_path / "project"
     project.mkdir()
+    prepared = gateway.prepare_candidate_import(
+        token, item_id, project_id="project-" + "a" * 32)
     imported = gateway.import_candidate(
-        token, item_id, project_root=project,
+        prepared["preview_token"], project_root=project,
         project_id="project-" + "a" * 32, confirmed=True)
     replayed = gateway.import_candidate(
-        token, item_id, project_root=project,
+        prepared["preview_token"], project_root=project,
         project_id="project-" + "a" * 32, confirmed=True)
 
+    assert prepared["status"] == "preview"
+    assert prepared["formula"] == "Si"
+    assert prepared["site_count"] == 1
+    assert len(prepared["content_sha256"]) == 64
     assert imported["ok"] is True
     assert imported["status"] == "candidate_only"
     assert "path" not in _encoded(imported).lower()
@@ -534,6 +735,119 @@ def test_structure_claim_requires_confirmation_and_token_is_single_use(tmp_path)
     assert replayed["error"]["code"] == "token_replayed"
 
 
+def _prepared_import(gateway, *, project_id="project-" + "a" * 32):
+    search = gateway.search("materials_project", {"formula": "Si"})
+    preview = gateway.prepare_candidate_import(
+        search["result_token"], search["items"][0]["item_id"],
+        project_id=project_id)
+    return search, preview
+
+
+def test_import_preflight_rejects_candidate_directory_file_without_consuming_token(
+        tmp_path):
+    gateway = _gateway(tmp_path / "gateway", FakeTransport(_response(_mp_payload())))
+    _search, preview = _prepared_import(gateway)
+    project = tmp_path / "project"
+    state = project / ".vcstudio"
+    state.mkdir(parents=True)
+    blocked = state / "external_reference_candidates"
+    blocked.write_text("not-a-directory", encoding="utf-8")
+
+    failed = gateway.import_candidate(
+        preview["preview_token"], project_root=project,
+        project_id="project-" + "a" * 32, confirmed=True)
+    blocked.unlink()
+    retried = gateway.import_candidate(
+        preview["preview_token"], project_root=project,
+        project_id="project-" + "a" * 32, confirmed=True)
+
+    assert failed["error"]["code"] == "candidate_import_failed"
+    assert retried["ok"] is True
+    assert len(list(
+        (state / "external_reference_candidates").glob("*.json"))) == 1
+
+
+def test_import_identity_change_after_atomic_stage_rolls_back_and_releases_token(
+        tmp_path):
+    gateway = _gateway(tmp_path / "gateway", FakeTransport(_response(_mp_payload())))
+    _search, preview = _prepared_import(gateway)
+    project = tmp_path / "project"
+    project.mkdir()
+    calls = []
+
+    def changed_after_replace():
+        calls.append(len(calls) + 1)
+        return len(calls) < 5
+
+    failed = gateway.import_candidate(
+        preview["preview_token"], project_root=project,
+        project_id="project-" + "a" * 32, confirmed=True,
+        identity_validator=changed_after_replace)
+    retried = gateway.import_candidate(
+        preview["preview_token"], project_root=project,
+        project_id="project-" + "a" * 32, confirmed=True,
+        identity_validator=lambda: True)
+
+    assert failed["error"]["code"] == "identity_mismatch"
+    assert retried["ok"] is True
+    candidates = list(
+        (project / ".vcstudio" / "external_reference_candidates").glob("*.json"))
+    assert len(candidates) == 1
+
+
+def test_candidate_import_lock_is_cross_process(tmp_path):
+    from vcstudio.project.external_references import _project_import_lock
+
+    project = tmp_path / "project"
+    project.mkdir()
+    ready = tmp_path / "ready"
+    script = (
+        "import sys,time; from pathlib import Path; "
+        "from vcstudio.project.external_references import _project_import_lock; "
+        "root=Path(sys.argv[1]); ready=Path(sys.argv[2]); "
+        "guard=_project_import_lock(root,timeout_seconds=2); guard.__enter__(); "
+        "ready.write_text('ready',encoding='utf-8'); time.sleep(0.8); "
+        "guard.__exit__(None,None,None)")
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, str(project.resolve()), str(ready.resolve())],
+        cwd=Path(__file__).resolve().parents[1])
+    try:
+        deadline = time.monotonic() + 2
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ready.exists()
+        with pytest.raises(ExternalReferenceError) as busy:
+            with _project_import_lock(project.resolve(), timeout_seconds=0.1):
+                pass
+        assert busy.value.code == "candidate_import_busy"
+    finally:
+        process.wait(timeout=3)
+    assert process.returncode == 0
+
+
+def test_import_preview_token_is_bound_to_project_and_structure_content(tmp_path):
+    gateway = _gateway(tmp_path / "gateway", FakeTransport(_response(_mp_payload())))
+    search, preview = _prepared_import(gateway)
+    wrong_project = tmp_path / "wrong"
+    wrong_project.mkdir()
+
+    rejected = gateway.import_candidate(
+        preview["preview_token"], project_root=wrong_project,
+        project_id="project-" + "b" * 32, confirmed=True)
+
+    assert rejected["error"]["code"] == "invalid_token"
+    assert not (wrong_project / ".vcstudio").exists()
+    internal = gateway._tokens.resolve(search["result_token"])
+    internal.items[0]["_structure_payload"]["sites"][0]["abc"] = [0.1, 0, 0]
+    project = tmp_path / "project"
+    project.mkdir()
+    changed = gateway.import_candidate(
+        preview["preview_token"], project_root=project,
+        project_id="project-" + "a" * 32, confirmed=True)
+    assert changed["error"]["code"] == "structure_changed"
+    assert not (project / ".vcstudio").exists()
+
+
 def test_candidate_claim_rejects_sensitive_structure_payload(tmp_path):
     payload = _mp_payload()
     payload["data"][0]["structure"]["path"] = "C:\\private\\POSCAR"
@@ -542,6 +856,48 @@ def test_candidate_claim_rejects_sensitive_structure_payload(tmp_path):
 
     assert result["status"] == "unavailable"
     assert result["error"]["code"] == "partial_data"
+
+
+@pytest.mark.parametrize("provider", ["materials_project", "optimade"])
+def test_structure_site_composition_cross_validates_provider_formula(
+        tmp_path, provider):
+    if provider == "materials_project":
+        payload = _mp_payload()
+        payload["data"][0]["formula_pretty"] = "SiO2"
+        secrets = FakeSecrets({"materials_project": "a" * 32})
+    else:
+        payload = _optimade_payload()
+        payload["data"][0]["attributes"]["chemical_formula_reduced"] = "SiO2"
+        secrets = FakeSecrets()
+    gateway = _gateway(
+        tmp_path, FakeTransport(_response(payload)), secrets=secrets)
+
+    result = gateway.search(provider, {"formula": "SiO2"})
+
+    assert result["status"] == "unavailable"
+    assert result["error"]["code"] == "partial_data"
+    assert result["result_token"] is None
+
+
+def test_structure_formula_is_reduced_from_sites_and_content_bound(tmp_path):
+    payload = _mp_payload()
+    second_site = json.loads(json.dumps(payload["data"][0]["structure"]["sites"][0]))
+    second_site["abc"] = [0.5, 0.5, 0.5]
+    second_site["xyz"] = [2.5, 2.5, 2.5]
+    payload["data"][0]["structure"]["sites"].append(second_site)
+    gateway = _gateway(tmp_path, FakeTransport(_response(payload)))
+
+    search = gateway.search("materials_project", {"formula": "Si"})
+    preview = gateway.prepare_candidate_import(
+        search["result_token"], search["items"][0]["item_id"],
+        project_id="project-" + "a" * 32)
+
+    assert search["items"][0]["formula"] == "Si"
+    assert preview["formula"] == "Si"
+    assert preview["site_count"] == 2
+    record = gateway._import_previews.resolve(
+        preview["preview_token"], project_id="project-" + "a" * 32)
+    assert record.content_sha256 == preview["content_sha256"]
 
 
 def test_result_token_expiry_and_cache_ttl_capacity_cleanup(tmp_path):
@@ -610,7 +966,7 @@ def test_operation_failures_keep_operation_specific_schemas(tmp_path):
 
     assert gateway.compare("bad", ["x"])["schema"].endswith("comparison/v1")
     assert gateway.import_candidate(
-        "bad", "x", project_root=tmp_path, project_id="project-x",
+        "bad", project_root=tmp_path, project_id="project-" + "a" * 32,
         confirmed=True)["schema"].endswith("candidate/v1")
     assert gateway.store_api_key(
         "optimade", "x" * 32)["schema"].endswith("credential/v1")
@@ -653,6 +1009,11 @@ def test_compare_is_side_by_side_only_and_never_builds_external_aggregate(tmp_pa
 def test_api_bridge_is_narrow_opaque_and_project_bound(tmp_path):
     assert list(inspect.signature(Api.external_reference_search).parameters) == [
         "self", "provider", "filters"]
+    assert list(inspect.signature(
+        Api.external_reference_import_preview).parameters) == [
+            "self", "project_id", "result_token", "item_id"]
+    assert list(inspect.signature(Api.external_reference_import).parameters) == [
+        "self", "project_id", "preview_token", "confirmation"]
 
     root = tmp_path / "project"
     root.mkdir()
@@ -689,8 +1050,10 @@ def test_api_bridge_is_narrow_opaque_and_project_bound(tmp_path):
         project_id, search["result_token"], [search["items"][0]["item_id"]])
     rejected = api.external_reference_compare(
         locator, search["result_token"], [search["items"][0]["item_id"]])
+    preview = api.external_reference_import_preview(
+        project_id, search["result_token"], search["items"][0]["item_id"])
     imported = api.external_reference_import(
-        project_id, search["result_token"], search["items"][0]["item_id"],
+        project_id, preview["preview_token"],
         {"confirmed": True, "scope": "candidate_provenance"})
 
     assert compared["ok"] is True
@@ -699,8 +1062,53 @@ def test_api_bridge_is_narrow_opaque_and_project_bound(tmp_path):
     assert str(root) not in _encoded(compared)
     assert rejected["ok"] is False
     assert str(root) not in _encoded(rejected)
+    assert preview["ok"] is True
+    assert str(root) not in _encoded(preview)
     assert imported["ok"] is True
     assert str(root) not in _encoded(imported)
+
+
+def test_api_import_project_uuid_change_during_stage_leaves_no_side_effect(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    locator = root / "project.yaml"
+    locator.write_text("schema: vcstudio.project/v1\n", encoding="utf-8")
+    project = {
+        "name": "fixture", "project_uuid": "a" * 32,
+        "members": {"clean_slab": None, "gas_ref": None, "configs": []},
+    }
+    mutate_on_stage = [False]
+
+    def load_project(path):
+        assert Path(path).resolve() == locator.resolve()
+        candidate_dir = root / ".vcstudio" / "external_reference_candidates"
+        if mutate_on_stage[0] and candidate_dir.is_dir() and list(
+                candidate_dir.glob(".*.tmp")):
+            project["project_uuid"] = "b" * 32
+        return project
+
+    adsorption = SimpleNamespace(
+        list_projects=lambda: [str(locator)],
+        load_project=load_project,
+    )
+    gateway = _gateway(
+        tmp_path / "gateway", FakeTransport(_response(_mp_payload())))
+    api = Api(
+        adsorption_mod=adsorption,
+        manifest_mod=SimpleNamespace(load_manifest=lambda _path: None),
+        external_reference_gateway=gateway)
+    project_id = api._workspace_project_id(str(locator), project)
+    search = api.external_reference_search("materials_project", {"formula": "Si"})
+    preview = api.external_reference_import_preview(
+        project_id, search["result_token"], search["items"][0]["item_id"])
+    mutate_on_stage[0] = True
+
+    imported = api.external_reference_import(
+        project_id, preview["preview_token"],
+        {"confirmed": True, "scope": "candidate_provenance"})
+
+    assert imported["ok"] is False
+    assert not (root / ".vcstudio").exists()
 
 
 def test_external_reference_api_key_uses_dedicated_keyring_namespace(monkeypatch):
@@ -821,3 +1229,31 @@ def test_structure_source_adapter_tokens_expire_and_evict_oldest(tmp_path):
     with pytest.raises(ExternalReferenceError) as expired:
         adapter.preview(second["token"])
     assert expired.value.code == "expired_token"
+
+
+@pytest.mark.skipif(
+    os.environ.get("VCSTUDIO_EXTERNAL_REFERENCE_LIVE_SMOKE") != "1",
+    reason="set VCSTUDIO_EXTERNAL_REFERENCE_LIVE_SMOKE=1 for real endpoint smoke",
+)
+@pytest.mark.parametrize(("provider", "filters"), [
+    ("materials_project", {"formula": "Si", "limit": 1}),
+    ("optimade", {"formula": "Si", "limit": 1}),
+])
+def test_conditional_real_provider_endpoint_smoke(tmp_path, provider, filters):
+    """Operational smoke only: a network failure is a failure, never a science pass."""
+    from vcstudio.shared import secrets
+
+    if provider == "materials_project":
+        key = secrets.get_external_reference_api_key(provider)
+        assert key is not None, (
+            "live Materials Project smoke requires its API key in the system keyring")
+    gateway = ExternalReferenceGateway(
+        transport=BoundedHttpTransport(timeout_seconds=10),
+        cache=ExternalReferenceCache(tmp_path / provider),
+        secrets_store=secrets, network_enabled=True)
+
+    result = gateway.search(provider, filters)
+
+    assert result["ok"] is True, result.get("error")
+    assert result["provider"] == provider
+    assert result["items"]

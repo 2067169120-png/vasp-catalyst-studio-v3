@@ -104,6 +104,8 @@ def test_api_key_never_enters_ui_state_and_is_cleared_after_bridge_call():
     assert "input.value = ''" in save_key
     assert "State." not in save_key.split("const key", 1)[1].split(
         "external_reference_store_api_key", 1)[0]
+    assert "rb-key-label" in script
+    assert "reference.key.provider_label" in script
 
 
 def test_import_and_compare_keep_external_evidence_outside_claim_authority():
@@ -115,6 +117,12 @@ def test_import_and_compare_keep_external_evidence_outside_claim_authority():
         "async function importCandidate", 1)[0]
 
     assert "window.confirm" in imported
+    assert "external_reference_import_preview" in imported
+    assert imported.index("external_reference_import_preview") < imported.index("window.confirm")
+    assert "generation !== State.generation" in imported
+    assert "projectId !== State.projectId" in imported
+    assert "content_sha256" in imported
+    assert "preview.preview_token" in imported
     assert "{ confirmed: true, scope: 'candidate_provenance' }" in imported
     assert "result.status !== 'candidate_only'" in imported
     assert "external_reference_import" in imported

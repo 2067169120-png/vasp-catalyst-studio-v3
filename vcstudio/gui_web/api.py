@@ -7417,7 +7417,26 @@ class Api:
             return self._project_identity_failure(
                 schema='vcstudio.external-reference-comparison/v1')
 
-    def external_reference_import(self, project_id, result_token, item_id,
+    def external_reference_import_preview(self, project_id, result_token, item_id):
+        """Bind one structure preview to the current project before confirmation."""
+        try:
+            record = self._resolve_project_id(project_id)
+
+            def preview():
+                self._load_project_for_path(record['path'])
+                return self._external_references().prepare_candidate_import(
+                    result_token, item_id,
+                    project_id=record['request_project_id'])
+
+            return self._call_with_project_bindings(
+                [record], preview,
+                failure={
+                    'schema': 'vcstudio.external-reference-import-preview/v1'})
+        except Exception:                                 # noqa: BLE001 public boundary
+            return self._project_identity_failure(
+                schema='vcstudio.external-reference-import-preview/v1')
+
+    def external_reference_import(self, project_id, preview_token,
                                   confirmation=None):
         """Persist one explicitly confirmed structure as candidate provenance."""
         try:
@@ -7434,9 +7453,11 @@ class Api:
                 # a mutable ``project.root`` field must not redirect imports.
                 root = os.path.dirname(record['path'])
                 return self._external_references().import_candidate(
-                    result_token, item_id, project_root=root,
+                    preview_token, project_root=root,
                     project_id=record['request_project_id'],
-                    confirmed=confirmed)
+                    confirmed=confirmed,
+                    identity_validator=lambda: (
+                        self._rebind_project_record(record) is not None))
 
             return self._call_with_project_bindings(
                 [record], import_candidate,

@@ -141,12 +141,17 @@
   function renderCredential() {
     const provider = providerRecord(); const group = $('rb-key-group');
     if (!group) return; group.hidden = !(provider && provider.requires_api_key === true);
+    const label = $('rb-key-label'); if (label && provider) label.textContent = tr(
+      'reference.key.provider_label', '{provider} API key', {
+        provider: localized(provider, 'label', safeId(provider.id)),
+      });
     const remove = $('rb-key-delete'); if (remove) remove.disabled = State.busy || !(provider && provider.credential_available === true);
   }
 
   function resetSearchState() {
+    State.generation += 1;
     State.result = null; State.comparison = null; State.selected.clear(); State.importConsumed = false;
-    renderResults(); renderComparison();
+    setBusy(false); renderResults(); renderComparison();
   }
 
   function renderFilterFields({ clearValues = false } = {}) {
@@ -371,15 +376,34 @@
 
   async function importCandidate(itemId) {
     if (State.busy || State.importConsumed || !State.result || !State.projectId) return false;
-    if (!window.confirm(tr('reference.import.confirm',
-      '仅以 candidate provenance 导入此结构？它不会成为 accepted member，也不会进入报告结论。'))) return false;
-    const generation = ++State.generation; setBusy(true); showAlert('');
-    operation(tr('reference.operation.importing', '正在写入 candidate-only provenance…'), 'busy');
+    const generation = ++State.generation; const projectId = State.projectId;
+    const resultToken = safeId(State.result.result_token); const selectedItem = safeId(itemId);
+    setBusy(true); showAlert('');
+    operation(tr('reference.operation.previewing', '正在生成项目绑定的结构预览…'), 'busy');
     try {
-      const result = await VCS.call('external_reference_import', State.projectId,
-        State.result.result_token, itemId,
+      const preview = await VCS.call('external_reference_import_preview', projectId,
+        resultToken, selectedItem);
+      if (generation !== State.generation || projectId !== State.projectId
+        || resultToken !== safeId(plain(State.result).result_token)) return false;
+      if (!preview || preview.ok === false || preview.status !== 'preview'
+        || safeId(preview.project_id) !== projectId || !safeId(preview.preview_token)
+        || !/^[a-f0-9]{64}$/.test(String(preview.content_sha256 || ''))) throw new Error(errorMessage(
+        preview, tr('reference.error.preview', '结构预览不可用。')));
+      const confirmed = window.confirm(tr('reference.import.confirm_preview',
+        '确认导入 {formula}（{sites} sites，内容 {hash}…）为 candidate provenance？它不会成为 accepted member 或报告结论。', {
+          formula: String(preview.formula || '—'), sites: Number(preview.site_count || 0),
+          hash: String(preview.content_sha256).slice(0, 12),
+        }));
+      if (!confirmed) {
+        operation(tr('reference.operation.preview_cancelled', '结构预览已取消；未写入项目。'));
+        return false;
+      }
+      if (generation !== State.generation || projectId !== State.projectId) return false;
+      operation(tr('reference.operation.importing', '正在写入 candidate-only provenance…'), 'busy');
+      const result = await VCS.call('external_reference_import', projectId,
+        preview.preview_token,
         { confirmed: true, scope: 'candidate_provenance' });
-      if (generation !== State.generation) return false;
+      if (generation !== State.generation || projectId !== State.projectId) return false;
       if (!result || result.ok === false || result.status !== 'candidate_only') throw new Error(errorMessage(
         result, tr('reference.error.import', '候选 provenance 导入失败。')));
       State.importConsumed = true; renderResults(); operation(tr(

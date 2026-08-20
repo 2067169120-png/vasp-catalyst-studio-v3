@@ -10,6 +10,7 @@ publication contracts.
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 import hashlib
 import ipaddress
 import json
@@ -20,9 +21,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 import re
 import secrets as token_secrets
+import tempfile
 import threading
 import time
-from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence, runtime_checkable
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
@@ -36,6 +38,7 @@ CANDIDATE_SCHEMA = "vcstudio.external-reference-candidate/v1"
 PROVIDER_SCHEMA = "vcstudio.external-reference-provider/v1"
 NETWORK_SCHEMA = "vcstudio.external-reference-network/v1"
 CREDENTIAL_SCHEMA = "vcstudio.external-reference-credential/v1"
+IMPORT_PREVIEW_SCHEMA = "vcstudio.external-reference-import-preview/v1"
 
 DEFAULT_TIMEOUT_SECONDS = 8.0
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -47,10 +50,17 @@ DEFAULT_TOKEN_CAPACITY_BYTES = 16 * 1024 * 1024
 DEFAULT_TOKEN_RECORDS = 64
 DEFAULT_CACHE_CAPACITY_BYTES = 50 * 1024 * 1024
 DEFAULT_CACHE_ENTRIES = 128
+APPLICATION_USER_AGENT = (
+    "VASP-Catalyst-Studio/4 ExternalReferenceGateway/1 "
+    "(+https://github.com/2067169120-png/vasp-catalyst-studio-v3)")
 
 _PROVIDER_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")
 _TOKEN_RE = re.compile(r"^external-reference\.[A-Za-z0-9_-]{32,96}$")
+_IMPORT_PREVIEW_TOKEN_RE = re.compile(
+    r"^external-import-preview\.[A-Za-z0-9_-]{32,96}$")
 _ITEM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
+_PROJECT_ID_RE = re.compile(
+    r"^(?:project-[a-f0-9]{32}|registry-[a-f0-9]{24})$")
 _MATERIAL_ID_RE = re.compile(r"^(?:mp|mvc)-[0-9]{1,12}$")
 _ELEMENT_RE = re.compile(r"^[A-Z][a-z]?$", re.ASCII)
 _FORMULA_RE = re.compile(r"^[A-Za-z0-9*().+\-]{1,64}$", re.ASCII)
@@ -68,6 +78,16 @@ _FORBIDDEN_QUERY_KEYS = frozenset({
     "headers", "authorization", "api_key", "token", "timeout",
     "max_bytes", "cache_path", "destination", "out_dir",
 })
+
+_CREDENTIAL_PATTERNS = {
+    # Current Materials Project keys are fixed-width hexadecimal values.  A
+    # wider generic "non-control text" contract would make response-echo
+    # detection ambiguous after JSON escaping.
+    "materials_project": re.compile(r"^[A-Fa-f0-9]{32}$", re.ASCII),
+    # Catalysis-Hub keys are opaque URL-safe bearer identifiers.  Keep the
+    # accepted alphabet deliberately narrower than HTTP/JSON syntax.
+    "catalysis_hub": re.compile(r"^[A-Za-z0-9_-]{32,128}$", re.ASCII),
+}
 
 _ELEMENTS = frozenset(
     "H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni Cu "
@@ -211,7 +231,7 @@ def _default_provider_specs() -> tuple[ProviderSpec, ...]:
             label_en="Catalysis-Hub",
             description_zh="催化反应能、能垒、表面与文献元数据。",
             description_en="Catalytic reaction energies, barriers, surfaces and publication metadata.",
-            requires_api_key=False,
+            requires_api_key=True,
             query_fields=("reactants", "products", "chemical_composition", "surface", "facet", "page", "limit"),
             capabilities=("reaction_energy", "activation_energy", "method_metadata", "publication"),
             license_id="CC-BY-4.0",
@@ -435,9 +455,14 @@ class BoundedHttpTransport:
         return response
 
     def _request_once(self, outbound: OutboundRequest) -> TransportResponse:
+        headers = {str(key): str(value) for key, value in outbound.headers.items()}
+        for key in tuple(headers):
+            if key.casefold() == "user-agent":
+                headers.pop(key, None)
+        headers["User-Agent"] = APPLICATION_USER_AGENT
         req = urllib_request.Request(
             outbound.url, data=outbound.body,
-            headers={str(key): str(value) for key, value in outbound.headers.items()},
+            headers=headers,
             method=outbound.method)
         try:
             with self._opener.open(req, timeout=self.timeout_seconds) as response:
@@ -512,6 +537,132 @@ def _json_object(body: bytes) -> Mapping[str, Any]:
     return value
 
 
+def _credential_pattern(provider_id: str) -> re.Pattern[str] | None:
+    return _CREDENTIAL_PATTERNS.get(str(provider_id))
+
+
+def _valid_credential(provider_id: str, value: Any) -> str | None:
+    """Return one provider-shaped key without coercing arbitrary input."""
+    if not isinstance(value, str):
+        return None
+    pattern = _credential_pattern(provider_id)
+    return value if pattern is not None and pattern.fullmatch(value) else None
+
+
+def _json_strings(value: Any) -> Iterator[str]:
+    """Yield every decoded JSON key and value string, recursively."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, Mapping):
+        for key, item in value.items():
+            if isinstance(key, str):
+                yield key
+            yield from _json_strings(item)
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for item in value:
+            yield from _json_strings(item)
+
+
+def _credential_echoed(api_key: str | None, response: TransportResponse,
+                       decoded: Mapping[str, Any] | None = None, *extra: Any) -> bool:
+    """Detect a key in raw bytes, headers, decoded JSON, DTOs and manifests."""
+    if not api_key:
+        return False
+    encoded = api_key.encode("utf-8")
+    if encoded in response.body:
+        return True
+    if any(api_key in str(key) or api_key in str(value)
+           for key, value in response.headers.items()):
+        return True
+    values: list[Any] = []
+    if decoded is not None:
+        values.append(decoded)
+    values.extend(extra)
+    return any(api_key in text for value in values for text in _json_strings(value))
+
+
+def _scrub_credentialed_cache_json(value: Any) -> Any:
+    """Build a cache-safe JSON snapshot; credentialed bytes are never stored raw."""
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, str):
+        if (_SECRET_RE.search(value) or _LOCAL_PATH_RE.search(value)
+                or len(value) > 16_384 or _CONTROL_RE.search(value)):
+            return "[redacted-external-text]"
+        return value
+    if isinstance(value, Mapping):
+        result = {}
+        for raw_key, item in value.items():
+            key = str(raw_key)
+            if (_SECRET_RE.search(key) or _LOCAL_PATH_RE.search(key)
+                    or _CONTROL_RE.search(key) or len(key) > 256):
+                key = "redacted_field_" + hashlib.sha256(
+                    key.encode("utf-8", errors="replace")).hexdigest()[:12]
+            if re.search(
+                    r"(?i)(?:authorization|api[_-]?key|credential|password|secret|token)",
+                    key):
+                result[key] = "[redacted-external-value]"
+            else:
+                result[key] = _scrub_credentialed_cache_json(item)
+        return result
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_scrub_credentialed_cache_json(item) for item in value]
+    return "[redacted-external-value]"
+
+
+def _plain_formula_composition(formula: Any) -> dict[str, int] | None:
+    if not isinstance(formula, str):
+        return None
+    value = formula.strip()
+    parts = re.findall(r"([A-Z][a-z]?)([0-9]*)", value)
+    if not parts or "".join(element + count for element, count in parts) != value:
+        return None
+    result: dict[str, int] = {}
+    for element, raw_count in parts:
+        if element not in _ELEMENTS:
+            return None
+        count = int(raw_count or 1)
+        if count < 1:
+            return None
+        result[element] = result.get(element, 0) + count
+    return result
+
+
+def _reduced_composition(composition: Mapping[str, int]) -> dict[str, int]:
+    values = {str(element): int(count) for element, count in composition.items()
+              if str(element) in _ELEMENTS and int(count) > 0}
+    if not values or len(values) != len(composition):
+        raise ExternalReferenceError(
+            "partial_data", "external structure composition is invalid")
+    divisor = math.gcd(*values.values())
+    return {element: count // divisor for element, count in values.items()}
+
+
+def _canonical_formula(composition: Mapping[str, int]) -> str:
+    reduced = _reduced_composition(composition)
+    if "C" in reduced:
+        order = ["C"] + (["H"] if "H" in reduced else [])
+        order.extend(sorted(
+            element for element in reduced if element not in {"C", "H"}))
+    else:
+        order = sorted(reduced)
+    return "".join(
+        element + (str(reduced[element]) if reduced[element] != 1 else "")
+        for element in order)
+
+
+def _cross_validate_formula(provider_formula: Any,
+                            structure_composition: Mapping[str, int]) -> str:
+    declared = _plain_formula_composition(provider_formula)
+    actual = _reduced_composition(structure_composition)
+    if declared is None or _reduced_composition(declared) != actual:
+        raise ExternalReferenceError(
+            "partial_data", "provider formula does not match structure sites")
+    return _canonical_formula(actual)
+
+
 def _finite_number(value: Any) -> float | None:
     if isinstance(value, bool) or value is None:
         return None
@@ -541,6 +692,15 @@ def _safe_doi(value: Any) -> str:
 def _item_identity(provider_id: str, source_id: str) -> str:
     digest = hashlib.sha256(str(source_id).encode("utf-8")).hexdigest()[:24]
     return f"{provider_id}:{digest}"
+
+
+def _structure_content_sha256(formula: str, structure_format: str,
+                              payload: Mapping[str, Any]) -> str:
+    return hashlib.sha256(_canonical_json({
+        "formula": str(formula),
+        "structure_format": str(structure_format),
+        "structure": payload,
+    })).hexdigest()
 
 
 def _sanitize_structure_payload(value: Any, *, depth: int = 0) -> Any:
@@ -629,6 +789,34 @@ def _materials_project_structure(value: Any) -> Mapping[str, Any]:
             "partial_data", "Materials Project structure contains unsafe data") from exc
 
 
+def _materials_project_composition(value: Mapping[str, Any]) -> dict[str, int]:
+    composition: dict[str, int] = {}
+    for site in value.get("sites") or []:
+        if not isinstance(site, Mapping):
+            raise ExternalReferenceError(
+                "partial_data", "Materials Project site is incomplete")
+        species = site.get("species")
+        element = ""
+        if isinstance(species, list):
+            if len(species) != 1 or not isinstance(species[0], Mapping):
+                raise ExternalReferenceError(
+                    "partial_data", "Materials Project structure is disordered")
+            element = species[0].get("element")
+            occupancy = _finite_number(species[0].get("occu"))
+            if (not isinstance(element, str) or element not in _ELEMENTS
+                    or occupancy is None or abs(occupancy - 1.0) > 1e-9):
+                raise ExternalReferenceError(
+                    "partial_data", "Materials Project site occupancy is invalid")
+        else:
+            label = site.get("label")
+            element = label if isinstance(label, str) and label in _ELEMENTS else ""
+        if element not in _ELEMENTS:
+            raise ExternalReferenceError(
+                "partial_data", "Materials Project site species is ambiguous")
+        composition[element] = composition.get(element, 0) + 1
+    return composition
+
+
 def _optimade_structure(attrs: Mapping[str, Any]) -> Mapping[str, Any]:
     nsites = attrs.get("nsites")
     nelements = attrs.get("nelements")
@@ -677,6 +865,39 @@ def _optimade_structure(attrs: Mapping[str, Any]) -> Mapping[str, Any]:
             "partial_data", "OPTIMADE structure contains unsafe data") from exc
 
 
+def _optimade_composition(attrs: Mapping[str, Any]) -> dict[str, int]:
+    definitions: dict[str, str] = {}
+    raw_definitions = attrs.get("species")
+    if raw_definitions is not None and not isinstance(raw_definitions, list):
+        raise ExternalReferenceError("partial_data", "OPTIMADE species are invalid")
+    for definition in raw_definitions or []:
+        if not isinstance(definition, Mapping):
+            raise ExternalReferenceError("partial_data", "OPTIMADE species are invalid")
+        name = definition.get("name")
+        symbols = definition.get("chemical_symbols")
+        concentrations = definition.get("concentration")
+        if (not isinstance(name, str) or not name
+                or not isinstance(symbols, list) or len(symbols) != 1
+                or symbols[0] not in _ELEMENTS
+                or not isinstance(concentrations, list) or len(concentrations) != 1
+                or _finite_number(concentrations[0]) is None
+                or abs(float(concentrations[0]) - 1.0) > 1e-9):
+            raise ExternalReferenceError(
+                "partial_data", "OPTIMADE disordered species are unsupported")
+        definitions[name] = str(symbols[0])
+    composition: dict[str, int] = {}
+    for raw in attrs.get("species_at_sites") or []:
+        if not isinstance(raw, str):
+            raise ExternalReferenceError(
+                "partial_data", "OPTIMADE site species is invalid")
+        element = raw if raw in _ELEMENTS else definitions.get(raw, "")
+        if element not in _ELEMENTS:
+            raise ExternalReferenceError(
+                "partial_data", "OPTIMADE site species is ambiguous")
+        composition[element] = composition.get(element, 0) + 1
+    return composition
+
+
 def _evidence_policy() -> dict[str, Any]:
     return {
         "role": "external_reference",
@@ -723,9 +944,9 @@ class MaterialsProjectAdapter(ProviderAdapter):
 
     def build_request(self, spec: ProviderSpec, query: Mapping[str, Any],
                       api_key: str | None) -> OutboundRequest:
-        if not str(api_key or "").strip():
+        if _valid_credential(spec.provider_id, api_key) is None:
             raise ExternalReferenceError(
-                "credential_required", "provider API key is not available")
+                "invalid_credential", "provider API key is invalid")
         params: dict[str, Any] = {
             "_fields": ",".join(self._FIELDS),
             "_limit": int(query["limit"]),
@@ -760,8 +981,8 @@ class MaterialsProjectAdapter(ProviderAdapter):
                 raise ExternalReferenceError(
                     "partial_data", "Materials Project returned a non-object item")
             source_id = _safe_external_text(row.get("material_id"), maximum=80)
-            formula = _safe_external_text(row.get("formula_pretty"), maximum=80)
-            if not source_id or not formula:
+            declared_formula = row.get("formula_pretty")
+            if not source_id or not isinstance(declared_formula, str):
                 raise ExternalReferenceError(
                     "partial_data", "Materials Project item lacks identity fields")
             if source_id in source_ids:
@@ -769,6 +990,10 @@ class MaterialsProjectAdapter(ProviderAdapter):
                     "partial_data", "Materials Project returned duplicate identities")
             source_ids.add(source_id)
             structure_payload = _materials_project_structure(row.get("structure"))
+            formula = _cross_validate_formula(
+                declared_formula, _materials_project_composition(structure_payload))
+            content_sha256 = _structure_content_sha256(
+                formula, "materials-project-structure-json", structure_payload)
             properties = []
             for record in (
                     _property("energy_above_hull", _finite_number(row.get("energy_above_hull")),
@@ -812,6 +1037,7 @@ class MaterialsProjectAdapter(ProviderAdapter):
                 },
                 "structure_available": True,
                 "structure_format": "materials-project-structure-json",
+                "_structure_content_sha256": content_sha256,
                 "citation": {
                     "dois": [], "url": spec.citation_url,
                     "attribution": spec.attribution,
@@ -883,10 +1109,10 @@ class OptimadeAdapter(ProviderAdapter):
                     "partial_data", "OPTIMADE returned an incomplete resource")
             attrs = row["attributes"]
             source_id = _safe_external_text(row.get("id"), maximum=160)
-            formula = _safe_external_text(
-                attrs.get("chemical_formula_reduced") or attrs.get("chemical_formula_hill"),
-                maximum=80)
-            if not source_id or not formula:
+            declared_formula = (
+                attrs.get("chemical_formula_reduced")
+                or attrs.get("chemical_formula_hill"))
+            if not source_id or not isinstance(declared_formula, str):
                 raise ExternalReferenceError(
                     "partial_data", "OPTIMADE structure lacks mandatory fields")
             if source_id in source_ids:
@@ -894,6 +1120,10 @@ class OptimadeAdapter(ProviderAdapter):
                     "partial_data", "OPTIMADE returned duplicate identities")
             source_ids.add(source_id)
             structure_payload = _optimade_structure(attrs)
+            formula = _cross_validate_formula(
+                declared_formula, _optimade_composition(structure_payload))
+            content_sha256 = _structure_content_sha256(
+                formula, "optimade-structure-json", structure_payload)
             items.append({
                 "item_id": _item_identity(spec.provider_id, source_id),
                 "kind": "material_structure",
@@ -911,6 +1141,7 @@ class OptimadeAdapter(ProviderAdapter):
                            "references": []},
                 "structure_available": True,
                 "structure_format": "optimade-structure-json",
+                "_structure_content_sha256": content_sha256,
                 "citation": {"dois": [], "url": spec.citation_url,
                              "attribution": spec.attribution},
                 "license": {"id": spec.license_id, "url": spec.license_url},
@@ -965,6 +1196,9 @@ class CatalysisHubAdapter(ProviderAdapter):
 
     def build_request(self, spec: ProviderSpec, query: Mapping[str, Any],
                       api_key: str | None) -> OutboundRequest:
+        if _valid_credential(spec.provider_id, api_key) is None:
+            raise ExternalReferenceError(
+                "invalid_credential", "provider API key is invalid")
         variables: dict[str, Any] = {"first": int(query["limit"]) * int(query["page"])}
         mapping = {
             "reactants": "reactants", "products": "products",
@@ -978,7 +1212,8 @@ class CatalysisHubAdapter(ProviderAdapter):
             ensure_ascii=True, separators=(",", ":")).encode("utf-8")
         return OutboundRequest(
             "POST", spec.endpoint,
-            {"Accept": "application/json", "Content-Type": "application/json"},
+            {"Accept": "application/json", "Content-Type": "application/json",
+             "X-API-Key": api_key},
             body)
 
     def parse_response(self, spec: ProviderSpec, query: Mapping[str, Any],
@@ -987,14 +1222,30 @@ class CatalysisHubAdapter(ProviderAdapter):
         if root.get("errors"):
             raise ExternalReferenceError(
                 "schema_drift", "Catalysis-Hub GraphQL response contains errors")
-        data = root.get("data") if isinstance(root.get("data"), Mapping) else {}
-        connection = data.get("reactions") if isinstance(data.get("reactions"), Mapping) else None
-        if connection is None or not isinstance(connection.get("edges"), list):
+        data = root.get("data")
+        if not isinstance(data, Mapping):
+            raise ExternalReferenceError(
+                "schema_drift", "Catalysis-Hub response has no data object")
+        connection = data.get("reactions")
+        if not isinstance(connection, Mapping):
             raise ExternalReferenceError(
                 "schema_drift", "Catalysis-Hub response has no reactions connection")
-        all_edges = connection["edges"]
+        all_edges = connection.get("edges")
+        total = connection.get("totalCount")
+        page_info = connection.get("pageInfo")
+        if (not isinstance(all_edges, list)
+                or isinstance(total, bool) or not isinstance(total, int) or total < 0
+                or not isinstance(page_info, Mapping)
+                or not isinstance(page_info.get("hasNextPage"), bool)
+                or (page_info.get("endCursor") is not None
+                    and not isinstance(page_info.get("endCursor"), str))):
+            raise ExternalReferenceError(
+                "schema_drift", "Catalysis-Hub connection schema is invalid")
         limit = int(query["limit"])
         offset = (int(query["page"]) - 1) * limit
+        if len(all_edges) > offset + limit:
+            raise ExternalReferenceError(
+                "partial_data", "Catalysis-Hub exceeded the bounded query size")
         selected = all_edges[offset:offset + limit]
         items = []
         source_ids = set()
@@ -1003,6 +1254,17 @@ class CatalysisHubAdapter(ProviderAdapter):
             if not isinstance(row, Mapping):
                 raise ExternalReferenceError(
                     "partial_data", "Catalysis-Hub returned an incomplete edge")
+            string_fields = (
+                "id", "chemicalComposition", "surfaceComposition", "facet",
+                "reactants", "products", "dftCode", "dftFunctional", "pubId")
+            if any(row.get(key) is not None and not isinstance(row.get(key), str)
+                   for key in string_fields):
+                raise ExternalReferenceError(
+                    "partial_data", "Catalysis-Hub returned invalid text fields")
+            if any(row.get(key) is not None and _finite_number(row.get(key)) is None
+                   for key in ("reactionEnergy", "activationEnergy")):
+                raise ExternalReferenceError(
+                    "partial_data", "Catalysis-Hub returned invalid energy fields")
             source_id = _safe_external_text(row.get("id"), maximum=80)
             reactants = _safe_external_text(row.get("reactants"), maximum=160)
             products = _safe_external_text(row.get("products"), maximum=160)
@@ -1013,7 +1275,19 @@ class CatalysisHubAdapter(ProviderAdapter):
                 raise ExternalReferenceError(
                     "partial_data", "Catalysis-Hub returned duplicate identities")
             source_ids.add(source_id)
-            publication = row.get("publication") if isinstance(row.get("publication"), Mapping) else {}
+            publication_raw = row.get("publication")
+            if publication_raw is not None and not isinstance(publication_raw, Mapping):
+                raise ExternalReferenceError(
+                    "partial_data", "Catalysis-Hub publication schema is invalid")
+            publication = publication_raw or {}
+            if (any(publication.get(key) is not None
+                    and not isinstance(publication.get(key), str)
+                    for key in ("title", "authors", "doi", "publisher"))
+                    or (publication.get("year") is not None
+                        and (isinstance(publication.get("year"), bool)
+                             or not isinstance(publication.get("year"), int)))):
+                raise ExternalReferenceError(
+                    "partial_data", "Catalysis-Hub publication schema is invalid")
             doi = _safe_doi(publication.get("doi") or row.get("pubId"))
             properties = []
             for record in (
@@ -1064,9 +1338,7 @@ class CatalysisHubAdapter(ProviderAdapter):
                 "evidence_policy": _evidence_policy(),
                 "_structure_payload": None,
             })
-        total = connection.get("totalCount")
-        total_count = int(total) if isinstance(total, int) and total >= 0 else None
-        page_info = connection.get("pageInfo") if isinstance(connection.get("pageInfo"), Mapping) else {}
+        total_count = total
         more = bool(total_count is not None and offset + len(selected) < total_count)
         if not more:
             more = bool(page_info.get("hasNextPage"))
@@ -1094,7 +1366,7 @@ def _default_cache_root() -> Path:
 
 
 class ExternalReferenceCache:
-    """Bounded raw-response cache with detached provenance manifests."""
+    """Bounded response-snapshot cache with detached provenance manifests."""
 
     _ENTRY_RE = re.compile(r"^external-[a-f0-9]{32}$")
 
@@ -1137,9 +1409,16 @@ class ExternalReferenceCache:
         if len(raw) > MAX_RESPONSE_BYTES:
             raise ValueError("raw response exceeds cache limit")
         now = float(self._clock())
-        raw_sha256 = hashlib.sha256(raw).hexdigest()
+        cached_sha256 = hashlib.sha256(raw).hexdigest()
+        source_sha256 = str(
+            metadata.get("source_response_sha256") or cached_sha256)
+        source_size = metadata.get("source_response_size")
+        if (not re.fullmatch(r"[a-f0-9]{64}", source_sha256)
+                or isinstance(source_size, bool)
+                or (source_size is not None and not isinstance(source_size, int))):
+            raise ValueError("invalid source-response metadata")
         entry_id = "external-" + hashlib.sha256(
-            token_secrets.token_bytes(24) + raw_sha256.encode("ascii")
+            token_secrets.token_bytes(24) + cached_sha256.encode("ascii")
         ).hexdigest()[:32]
         manifest = {
             "schema": "vcstudio.external-reference-cache-entry/v1",
@@ -1148,9 +1427,11 @@ class ExternalReferenceCache:
             "retrieved_at_epoch": now,
             "expires_at": _utc_now(now + self.ttl_seconds),
             "expires_at_epoch": now + self.ttl_seconds,
-            "raw_response_sha256": raw_sha256,
-            "raw_response_size": len(raw),
             **copy.deepcopy(dict(metadata)),
+            "raw_response_sha256": source_sha256,
+            "raw_response_size": int(source_size) if source_size is not None else len(raw),
+            "cached_response_sha256": cached_sha256,
+            "cached_response_size": len(raw),
         }
         encoded = _canonical_json(manifest)
         with self._lock:
@@ -1277,7 +1558,8 @@ class _TokenRecord:
     cache_metadata: Mapping[str, Any]
     items: tuple[dict[str, Any], ...]
     size_bytes: int
-    import_consumed: bool = False
+    import_state: str = "available"
+    import_reservation: str | None = None
 
 
 class _ResultTokenStore:
@@ -1352,16 +1634,131 @@ class _ResultTokenStore:
             if record.expires_at_epoch <= float(self._clock()):
                 self._records.pop(text, None)
                 raise ExternalReferenceError("expired_token", "result token has expired")
-            if for_import and record.import_consumed:
-                raise ExternalReferenceError(
-                    "token_replayed", "result token was already consumed for import")
+            if for_import and record.import_state != "available":
+                code = ("token_replayed" if record.import_state == "committed"
+                        else "token_reserved")
+                message = ("result token was already consumed for import"
+                           if record.import_state == "committed"
+                           else "result token is reserved by another import")
+                raise ExternalReferenceError(code, message)
             return record
 
-    def consume_import(self, token: Any) -> None:
+    def reserve_import(self, token: Any) -> str:
         text = str(token or "")
         with self._lock:
             record = self.resolve(text, for_import=True)
-            record.import_consumed = True
+            reservation = token_secrets.token_urlsafe(24)
+            record.import_state = "reserved"
+            record.import_reservation = reservation
+            return reservation
+
+    def release_import(self, token: Any, reservation: str) -> None:
+        text = str(token or "")
+        with self._lock:
+            record = self._records.get(text)
+            if (record is not None and record.import_state == "reserved"
+                    and token_secrets.compare_digest(
+                        str(record.import_reservation or ""), str(reservation))):
+                record.import_state = "available"
+                record.import_reservation = None
+
+    def commit_import(self, token: Any, reservation: str) -> None:
+        text = str(token or "")
+        with self._lock:
+            record = self._records.get(text)
+            if (record is None or record.expires_at_epoch <= float(self._clock())):
+                self._records.pop(text, None)
+                raise ExternalReferenceError("expired_token", "result token has expired")
+            if (record.import_state != "reserved"
+                    or not token_secrets.compare_digest(
+                        str(record.import_reservation or ""), str(reservation))):
+                raise ExternalReferenceError(
+                    "invalid_token", "result token reservation is invalid")
+            record.import_state = "committed"
+            record.import_reservation = None
+
+    def consume_import(self, token: Any) -> None:
+        reservation = self.reserve_import(token)
+        self.commit_import(token, reservation)
+
+
+@dataclass(frozen=True)
+class _ImportPreviewRecord:
+    project_id: str
+    result_token: str
+    item_id: str
+    content_sha256: str
+    expires_at_epoch: float
+
+
+class _ImportPreviewTokenStore:
+    """Short-lived opaque binding of project/result/item/structure content."""
+
+    def __init__(self, *, ttl_seconds: int, max_records: int = 64,
+                 clock=time.time):
+        self.ttl_seconds = max(30, int(ttl_seconds))
+        self.max_records = max(1, min(int(max_records), 128))
+        self._clock = clock
+        self._records: dict[str, _ImportPreviewRecord] = {}
+        self._consumed: dict[str, float] = {}
+        self._lock = threading.RLock()
+
+    def _cleanup(self) -> None:
+        now = float(self._clock())
+        for token, record in list(self._records.items()):
+            if record.expires_at_epoch <= now:
+                self._records.pop(token, None)
+        for token, expires in list(self._consumed.items()):
+            if expires <= now:
+                self._consumed.pop(token, None)
+
+    def issue(self, *, project_id: str, result_token: str, item_id: str,
+              content_sha256: str) -> tuple[str, float]:
+        with self._lock:
+            self._cleanup()
+            while len(self._records) >= self.max_records:
+                oldest = min(
+                    self._records,
+                    key=lambda key: (self._records[key].expires_at_epoch, key))
+                self._records.pop(oldest, None)
+            token = "external-import-preview." + token_secrets.token_urlsafe(32)
+            expires = float(self._clock()) + self.ttl_seconds
+            self._records[token] = _ImportPreviewRecord(
+                project_id=project_id, result_token=result_token,
+                item_id=item_id, content_sha256=content_sha256,
+                expires_at_epoch=expires)
+            return token, expires
+
+    def resolve(self, token: Any, *, project_id: str) -> _ImportPreviewRecord:
+        text = str(token or "")
+        if not _IMPORT_PREVIEW_TOKEN_RE.fullmatch(text):
+            raise ExternalReferenceError(
+                "invalid_token", "import preview token is invalid")
+        with self._lock:
+            self._cleanup()
+            record = self._records.get(text)
+            if record is None:
+                if text in self._consumed:
+                    raise ExternalReferenceError(
+                        "token_replayed", "import preview token was already consumed")
+                raise ExternalReferenceError(
+                    "expired_token", "import preview token is invalid or expired")
+            if not token_secrets.compare_digest(record.project_id, project_id):
+                raise ExternalReferenceError(
+                    "invalid_token", "import preview token project binding is invalid")
+            return record
+
+    def consume(self, token: Any) -> None:
+        with self._lock:
+            text = str(token or "")
+            record = self._records.pop(text, None)
+            if record is not None:
+                self._consumed[text] = record.expires_at_epoch
+                while len(self._consumed) > self.max_records:
+                    oldest = min(
+                        self._consumed,
+                        key=lambda key: (self._consumed[key], key))
+                    self._consumed.pop(oldest, None)
 
 
 def _public_item(item: Mapping[str, Any]) -> dict[str, Any]:
@@ -1372,6 +1769,64 @@ def _public_item(item: Mapping[str, Any]) -> dict[str, Any]:
         "license", "evidence_policy",
     )
     return {key: copy.deepcopy(item[key]) for key in allowed if key in item}
+
+
+_PROJECT_IMPORT_LOCKS: dict[str, threading.Lock] = {}
+_PROJECT_IMPORT_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def _project_import_lock(project_root: Path, *, timeout_seconds: float = 10.0):
+    """Serialize candidate commits across threads and cooperating processes."""
+    canonical_root = os.path.normcase(os.path.normpath(str(project_root)))
+    key = hashlib.sha256(canonical_root.encode("utf-8")).hexdigest()
+    with _PROJECT_IMPORT_LOCKS_GUARD:
+        local_lock = _PROJECT_IMPORT_LOCKS.setdefault(key, threading.Lock())
+    if not local_lock.acquire(timeout=max(0.1, float(timeout_seconds))):
+        raise ExternalReferenceError(
+            "candidate_import_busy", "candidate import lock is busy")
+    lock_root = Path(tempfile.gettempdir()) / "vcstudio-external-reference-locks"
+    handle = None
+    locked = False
+    try:
+        lock_root.mkdir(parents=True, exist_ok=True)
+        handle = (lock_root / f"{key}.lock").open("a+b")
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+        while not locked:
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:  # pragma: no cover - exercised on non-Windows CI only
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    raise ExternalReferenceError(
+                        "candidate_import_busy", "candidate import lock is busy") from exc
+                time.sleep(0.05)
+        yield
+    finally:
+        if handle is not None:
+            if locked:
+                try:
+                    handle.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:  # pragma: no cover - exercised on non-Windows CI only
+                        import fcntl
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            handle.close()
+        local_lock.release()
 
 
 class ExternalReferenceGateway:
@@ -1399,6 +1854,12 @@ class ExternalReferenceGateway:
             capacity_bytes=token_capacity_bytes,
             clock=clock)
         self._lock = threading.RLock()
+        self._network_condition = threading.Condition(self._lock)
+        self._network_epoch = 1
+        self._network_in_flight = 0
+        self._import_previews = _ImportPreviewTokenStore(
+            ttl_seconds=token_ttl_seconds, max_records=token_max_records,
+            clock=clock)
         self._adapters: dict[str, ProviderAdapter] = {
             "materials-project-rest": MaterialsProjectAdapter(),
             "optimade": OptimadeAdapter(),
@@ -1418,19 +1879,47 @@ class ExternalReferenceGateway:
                 spec.provider_id)
         except Exception:
             return None
-        return str(value) if value else None
+        return _valid_credential(spec.provider_id, value)
+
+    def _acquire_network_lease(self) -> int:
+        """Atomically check the switch and register one outbound operation."""
+        with self._network_condition:
+            if not self._network_enabled:
+                raise ExternalReferenceError(
+                    "network_disabled", "external reference networking is disabled")
+            epoch = self._network_epoch
+            self._network_in_flight += 1
+            return epoch
+
+    def _release_network_lease(self) -> None:
+        with self._network_condition:
+            self._network_in_flight = max(0, self._network_in_flight - 1)
+            self._network_condition.notify_all()
+
+    def _assert_network_lease_current(self, epoch: int) -> None:
+        if not self._network_enabled or int(epoch) != self._network_epoch:
+            raise ExternalReferenceError(
+                "network_session_changed",
+                "external network session changed while the request was in flight")
 
     def catalog(self) -> dict[str, Any]:
+        with self._network_condition:
+            network_enabled = self._network_enabled
+            network_in_flight = self._network_in_flight
         providers = []
         for spec in self.registry.providers():
             providers.append(spec.public(
-                network_enabled=self.network_enabled,
+                network_enabled=network_enabled,
                 credential_available=bool(self._credential(spec))))
         return {
             "schema": CATALOG_SCHEMA,
             "ok": True,
-            "network_enabled": self.network_enabled,
+            "network_enabled": network_enabled,
             "network_default": "disabled",
+            "network_state": (
+                "enabled" if network_enabled else
+                ("draining" if network_in_flight else "disabled")),
+            "draining_requests": network_in_flight if not network_enabled else 0,
             "providers": providers,
             "request_contract": {
                 "schema": SEARCH_SCHEMA,
@@ -1450,14 +1939,20 @@ class ExternalReferenceGateway:
             return self._unavailable(
                 "network_confirmation_required", "explicit network confirmation is required",
                 schema=NETWORK_SCHEMA)
-        with self._lock:
+        with self._network_condition:
+            if self._network_enabled != wanted:
+                self._network_epoch += 1
             self._network_enabled = wanted
+            draining = self._network_in_flight if not wanted else 0
         return {
             "schema": NETWORK_SCHEMA,
             "ok": True,
             "network_enabled": wanted,
             "persisted": False,
             "scope": "current_process",
+            "network_state": (
+                "enabled" if wanted else ("draining" if draining else "disabled")),
+            "draining_requests": draining,
         }
 
     def store_api_key(self, provider_id: Any, api_key: Any) -> dict[str, Any]:
@@ -1466,8 +1961,8 @@ class ExternalReferenceGateway:
             if not spec.requires_api_key:
                 raise ExternalReferenceError(
                     "credential_not_supported", "provider does not use an API key")
-            key = str(api_key or "")
-            if len(key) < 16 or len(key) > 512 or _CONTROL_RE.search(key):
+            key = _valid_credential(spec.provider_id, api_key)
+            if key is None:
                 raise ExternalReferenceError(
                     "invalid_credential", "API key does not satisfy the key contract")
             saved = bool(self.secrets_store.set_external_reference_api_key(
@@ -1573,30 +2068,45 @@ class ExternalReferenceGateway:
             query = normalize_query(spec, filters)
         except ExternalReferenceError as exc:
             return self._unavailable(exc.code, str(exc))
-        if not self.network_enabled:
-            return self._unavailable(
-                "network_disabled", "external reference networking is disabled",
-                provider_id=spec.provider_id, query=query)
-        api_key = self._credential(spec)
-        if spec.requires_api_key and not api_key:
-            return self._unavailable(
-                "credential_required", "provider API key is not available",
-                provider_id=spec.provider_id, query=query)
         adapter = self._adapters[spec.protocol]
         try:
+            lease_epoch = self._acquire_network_lease()
+        except ExternalReferenceError as exc:
+            return self._unavailable(
+                exc.code, str(exc), provider_id=spec.provider_id, query=query)
+        try:
+            api_key = self._credential(spec)
+            if spec.requires_api_key and not api_key:
+                return self._unavailable(
+                    "credential_required", "provider API key is not available",
+                    provider_id=spec.provider_id, query=query)
             outbound = adapter.build_request(spec, query, api_key)
             response = self.transport.request(outbound)
+            try:
+                decoded = _json_object(response.body)
+            except ExternalReferenceError:
+                decoded = None
+            if _credential_echoed(api_key, response, decoded):
+                return self._unavailable(
+                    "credential_echo_detected",
+                    "external provider response echoed a credential",
+                    provider_id=spec.provider_id, query=query)
             http_failure = self._http_failure(response)
             if http_failure:
                 code, message, retryable = http_failure
                 return self._unavailable(
                     code, message, provider_id=spec.provider_id,
                     query=query, retryable=retryable)
-            if api_key and str(api_key).encode("utf-8") in response.body:
-                return self._unavailable(
-                    "credential_echo_detected",
-                    "external provider response echoed a credential",
-                    provider_id=spec.provider_id, query=query)
+            source_metadata = {
+                "source_response_sha256": hashlib.sha256(response.body).hexdigest(),
+                "source_response_size": len(response.body),
+                "cache_representation": (
+                    "credential-scrubbed-json" if api_key else "provider-response-bytes"),
+            }
+            cache_payload = (
+                _canonical_json(_scrub_credentialed_cache_json(decoded))
+                if api_key and decoded is not None else
+                (None if api_key else response.body))
             try:
                 parsed = adapter.parse_response(spec, query, response)
             except ExternalReferenceError as exc:
@@ -1604,8 +2114,14 @@ class ExternalReferenceGateway:
                     spec, query, status="unavailable",
                     provider_version=spec.adapter_version, items=(),
                     error_code=exc.code)
+                metadata.update(source_metadata)
                 try:
-                    self.cache.write(response.body, metadata)
+                    if (cache_payload is not None
+                            and not _credential_echoed(
+                                api_key, response, decoded, metadata)):
+                        with self._network_condition:
+                            self._assert_network_lease_current(lease_epoch)
+                            self.cache.write(cache_payload, metadata)
                 except Exception:
                     pass
                 return self._unavailable(
@@ -1615,12 +2131,27 @@ class ExternalReferenceGateway:
                 provider_version=parsed.provider_version,
                 items=parsed.items,
                 response_metadata=parsed.response_metadata)
-            cache_manifest = self.cache.write(response.body, metadata)
-            token, expires_epoch = self._tokens.issue(
-                provider_id=spec.provider_id,
-                cache_entry_id=str(cache_manifest["entry_id"]),
-                query=query, cache_metadata=cache_manifest,
-                items=parsed.items)
+            metadata.update(source_metadata)
+            if _credential_echoed(
+                    api_key, response, decoded, parsed.items,
+                    parsed.response_metadata, metadata):
+                return self._unavailable(
+                    "credential_echo_detected",
+                    "external provider response echoed a credential",
+                    provider_id=spec.provider_id, query=query)
+            with self._network_condition:
+                self._assert_network_lease_current(lease_epoch)
+                cache_manifest = self.cache.write(cache_payload, metadata)
+                if _credential_echoed(api_key, response, None, cache_manifest):
+                    self.cache._remove_entry(str(cache_manifest["entry_id"]))
+                    raise ExternalReferenceError(
+                        "credential_echo_detected",
+                        "external provider response echoed a credential")
+                token, expires_epoch = self._tokens.issue(
+                    provider_id=spec.provider_id,
+                    cache_entry_id=str(cache_manifest["entry_id"]),
+                    query=query, cache_metadata=cache_manifest,
+                    items=parsed.items)
             return {
                 "schema": RESULT_SCHEMA,
                 "ok": True,
@@ -1654,6 +2185,8 @@ class ExternalReferenceGateway:
             return self._unavailable(
                 "provider_unavailable", "external provider operation failed",
                 provider_id=spec.provider_id, query=query, retryable=True)
+        finally:
+            self._release_network_lease()
 
     @staticmethod
     def _select_item(record: _TokenRecord, item_id: Any) -> dict[str, Any]:
@@ -1674,8 +2207,18 @@ class ExternalReferenceGateway:
         if not item.get("structure_available") or item.get("_structure_payload") is None:
             raise ExternalReferenceError(
                 "structure_unavailable", "selected external result has no importable structure")
+        formula = str(item.get("formula") or "")
+        structure_format = str(item.get("structure_format") or "external-json")
+        structure_payload = _sanitize_structure_payload(
+            copy.deepcopy(item["_structure_payload"]))
+        content_sha256 = _structure_content_sha256(
+            formula, structure_format, structure_payload)
+        if not token_secrets.compare_digest(
+                content_sha256, str(item.get("_structure_content_sha256") or "")):
+            raise ExternalReferenceError(
+                "structure_changed", "external structure content binding is invalid")
         preview_id = "external-preview-" + hashlib.sha256(
-            f"{result_token}:{item.get('item_id')}".encode("utf-8")
+            f"{result_token}:{item.get('item_id')}:{content_sha256}".encode("utf-8")
         ).hexdigest()[:24]
         cache_meta = record.cache_metadata
         provenance = {
@@ -1684,7 +2227,8 @@ class ExternalReferenceGateway:
             "provider": record.provider_id,
             "source_id": item.get("source_id"),
             "item_id": item.get("item_id"),
-            "formula": item.get("formula"),
+            "formula": formula,
+            "structure_content_sha256": content_sha256,
             "query": copy.deepcopy(dict(record.query)),
             "endpoint_identity": cache_meta.get("endpoint_identity"),
             "provider_version": cache_meta.get("provider_version"),
@@ -1700,9 +2244,8 @@ class ExternalReferenceGateway:
             candidate_id=preview_id,
             provider_id=record.provider_id,
             source_id=str(item.get("source_id") or ""),
-            structure_format=str(item.get("structure_format") or "external-json"),
-            structure_payload=_sanitize_structure_payload(
-                copy.deepcopy(item["_structure_payload"])),
+            structure_format=structure_format,
+            structure_payload=structure_payload,
             provenance=provenance,
             evidence_policy=_evidence_policy(),
         )
@@ -1713,9 +2256,19 @@ class ExternalReferenceGateway:
         if confirmed is not True:
             raise ExternalReferenceError(
                 "confirmation_required", "candidate import requires explicit confirmation")
-        self._tokens.resolve(result_token, for_import=True)
-        preview = self.preview_structure_candidate(result_token, item_id)
-        self._tokens.consume_import(result_token)
+        reservation = self._tokens.reserve_import(result_token)
+        try:
+            candidate = self._candidate_from_preview(
+                self.preview_structure_candidate(result_token, item_id))
+            self._tokens.commit_import(result_token, reservation)
+            return candidate
+        except Exception:
+            self._tokens.release_import(result_token, reservation)
+            raise
+
+    @staticmethod
+    def _candidate_from_preview(
+            preview: ExternalStructureCandidate) -> ExternalStructureCandidate:
         candidate_id = "external-candidate-" + token_secrets.token_hex(12)
         provenance = copy.deepcopy(dict(preview.provenance))
         provenance["candidate_id"] = candidate_id
@@ -1729,65 +2282,207 @@ class ExternalReferenceGateway:
             evidence_policy=copy.deepcopy(dict(preview.evidence_policy)),
         )
 
-    def import_candidate(self, result_token: Any, item_id: Any, *,
-                         project_root: str | os.PathLike[str], project_id: str,
-                         confirmed: bool) -> dict[str, Any]:
+    def prepare_candidate_import(self, result_token: Any, item_id: Any, *,
+                                 project_id: Any) -> dict[str, Any]:
+        """Issue a path-free, project/content-bound preview before confirmation."""
         try:
+            identifier = str(project_id or "").strip().lower()
+            if not _PROJECT_ID_RE.fullmatch(identifier):
+                raise ExternalReferenceError(
+                    "invalid_project_identity", "project identity is invalid")
+            self._tokens.resolve(result_token, for_import=True)
+            preview = self.preview_structure_candidate(result_token, item_id)
+            content_sha256 = str(
+                preview.provenance.get("structure_content_sha256") or "")
+            if not re.fullmatch(r"[a-f0-9]{64}", content_sha256):
+                raise ExternalReferenceError(
+                    "structure_changed", "external structure content binding is invalid")
+            token, expires = self._import_previews.issue(
+                project_id=identifier, result_token=str(result_token),
+                item_id=str(preview.provenance.get("item_id") or ""),
+                content_sha256=content_sha256)
+            sites = 0
+            if isinstance(preview.structure_payload, Mapping):
+                if preview.provider_id == "materials_project":
+                    raw_sites = preview.structure_payload.get("sites")
+                else:
+                    raw_sites = preview.structure_payload.get("species_at_sites")
+                sites = len(raw_sites) if isinstance(raw_sites, list) else 0
+            return {
+                "schema": IMPORT_PREVIEW_SCHEMA,
+                "ok": True,
+                "status": "preview",
+                "project_id": identifier,
+                "preview_token": token,
+                "expires_at": _utc_now(expires),
+                "provider": preview.provider_id,
+                "source_id": preview.source_id,
+                "formula": preview.provenance.get("formula"),
+                "structure_format": preview.structure_format,
+                "site_count": sites,
+                "content_sha256": content_sha256,
+                "evidence_policy": copy.deepcopy(dict(preview.evidence_policy)),
+                "error": None,
+            }
+        except ExternalReferenceError as exc:
+            return self._unavailable(
+                exc.code, str(exc), schema=IMPORT_PREVIEW_SCHEMA)
+
+    @staticmethod
+    def _validate_import_identity(
+            validator: Callable[[], bool] | None) -> None:
+        if validator is None:
+            return
+        try:
+            valid = validator()
+        except Exception as exc:
+            raise ExternalReferenceError(
+                "identity_mismatch", "project identity changed during import") from exc
+        if valid is not True:
+            raise ExternalReferenceError(
+                "identity_mismatch", "project identity changed during import")
+
+    @staticmethod
+    def _preflight_import_paths(root: Path) -> tuple[Path, Path]:
+        state_root = root / ".vcstudio"
+        destination = state_root / "external_reference_candidates"
+        for path in (state_root, destination):
+            if path.is_symlink():
+                raise ExternalReferenceError(
+                    "candidate_import_failed",
+                    "candidate provenance destination is not trusted")
+            if path.exists() and not path.is_dir():
+                raise ExternalReferenceError(
+                    "candidate_import_failed",
+                    "candidate provenance destination is not a directory")
+        for path in (state_root, destination):
+            if not path.resolve().is_relative_to(root):
+                raise ExternalReferenceError(
+                    "candidate_import_failed",
+                    "candidate provenance destination is not trusted")
+        return state_root, destination
+
+    def import_candidate(self, preview_token: Any, *,
+                         project_root: str | os.PathLike[str], project_id: str,
+                         confirmed: bool,
+                         identity_validator: Callable[[], bool] | None = None) -> dict[str, Any]:
+        try:
+            if confirmed is not True:
+                raise ExternalReferenceError(
+                    "confirmation_required", "candidate import requires explicit confirmation")
+            identifier = str(project_id or "").strip().lower()
+            if not _PROJECT_ID_RE.fullmatch(identifier):
+                raise ExternalReferenceError(
+                    "invalid_project_identity", "project identity is invalid")
             root = Path(project_root).expanduser().resolve()
             if root.parent == root or not root.is_dir():
                 raise ExternalReferenceError(
                     "project_unavailable", "project root is unavailable")
-            candidate = self.claim_structure_candidate(
-                result_token, item_id, confirmed=confirmed)
-            state_root = root / ".vcstudio"
-            destination = state_root / "external_reference_candidates"
-            for candidate_path in (state_root, destination):
-                if candidate_path.exists() and candidate_path.is_symlink():
-                    raise ExternalReferenceError(
-                        "candidate_import_failed",
-                        "candidate provenance destination is not trusted")
-            destination.mkdir(parents=True, exist_ok=True)
-            if not destination.resolve().is_relative_to(root):
-                raise ExternalReferenceError(
-                    "candidate_import_failed",
-                    "candidate provenance destination is not trusted")
-            target = destination / f"{candidate.candidate_id}.json"
-            temp = destination / (
-                f".{candidate.candidate_id}.{token_secrets.token_hex(8)}.tmp")
-            payload = {
-                "schema": CANDIDATE_SCHEMA,
-                "candidate_id": candidate.candidate_id,
-                "project_id": str(project_id),
-                "status": "candidate_only",
-                "source": {
-                    "provider": candidate.provider_id,
-                    "source_id": candidate.source_id,
-                },
-                "structure": {
-                    "format": candidate.structure_format,
-                    "payload": candidate.structure_payload,
-                },
-                "provenance": copy.deepcopy(dict(candidate.provenance)),
-                "evidence_policy": copy.deepcopy(dict(candidate.evidence_policy)),
-                "imported_at": _utc_now(float(self._clock())),
-            }
+            self._validate_import_identity(identity_validator)
+            self._preflight_import_paths(root)
+            binding = self._import_previews.resolve(
+                preview_token, project_id=identifier)
+            reservation = None
+            temp: Path | None = None
+            target: Path | None = None
+            created_state = False
+            created_destination = False
+            committed_file = False
+            token_committed = False
             try:
-                with temp.open("xb") as handle:
-                    handle.write(_canonical_json(payload))
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temp, target)
+                with _project_import_lock(root):
+                    self._validate_import_identity(identity_validator)
+                    state_root, destination = self._preflight_import_paths(root)
+                    preview = self.preview_structure_candidate(
+                        binding.result_token, binding.item_id)
+                    content_sha256 = str(
+                        preview.provenance.get("structure_content_sha256") or "")
+                    if not token_secrets.compare_digest(
+                            binding.content_sha256, content_sha256):
+                        raise ExternalReferenceError(
+                            "structure_changed", "external structure changed after preview")
+                    reservation = self._tokens.reserve_import(binding.result_token)
+                    candidate = self._candidate_from_preview(preview)
+                    self._validate_import_identity(identity_validator)
+                    self._preflight_import_paths(root)
+                    if not state_root.exists():
+                        state_root.mkdir()
+                        created_state = True
+                    if not destination.exists():
+                        destination.mkdir()
+                        created_destination = True
+                    self._preflight_import_paths(root)
+                    target = destination / f"{candidate.candidate_id}.json"
+                    temp = destination / (
+                        f".{candidate.candidate_id}.{token_secrets.token_hex(8)}.tmp")
+                    if target.exists() or target.is_symlink():
+                        raise ExternalReferenceError(
+                            "candidate_import_failed", "candidate identity already exists")
+                    payload = {
+                        "schema": CANDIDATE_SCHEMA,
+                        "candidate_id": candidate.candidate_id,
+                        "project_id": identifier,
+                        "status": "candidate_only",
+                        "source": {
+                            "provider": candidate.provider_id,
+                            "source_id": candidate.source_id,
+                        },
+                        "structure": {
+                            "format": candidate.structure_format,
+                            "payload": candidate.structure_payload,
+                        },
+                        "provenance": copy.deepcopy(dict(candidate.provenance)),
+                        "evidence_policy": copy.deepcopy(dict(candidate.evidence_policy)),
+                        "imported_at": _utc_now(float(self._clock())),
+                    }
+                    with temp.open("xb") as handle:
+                        handle.write(_canonical_json(payload))
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    self._validate_import_identity(identity_validator)
+                    self._preflight_import_paths(root)
+                    if target.exists() or target.is_symlink():
+                        raise ExternalReferenceError(
+                            "candidate_import_failed", "candidate identity already exists")
+                    os.replace(temp, target)
+                    temp = None
+                    committed_file = True
+                    self._validate_import_identity(identity_validator)
+                    self._tokens.commit_import(binding.result_token, reservation)
+                    token_committed = True
+                    self._import_previews.consume(preview_token)
+            except Exception:
+                if committed_file and target is not None and not token_committed:
+                    try:
+                        target.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                if reservation is not None and not token_committed:
+                    self._tokens.release_import(binding.result_token, reservation)
+                raise
             finally:
-                try:
-                    temp.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                if temp is not None:
+                    try:
+                        temp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                if not token_committed:
+                    if created_destination:
+                        try:
+                            destination.rmdir()
+                        except OSError:
+                            pass
+                    if created_state:
+                        try:
+                            state_root.rmdir()
+                        except OSError:
+                            pass
             return {
                 "schema": CANDIDATE_SCHEMA,
                 "ok": True,
                 "status": "candidate_only",
                 "candidate_id": candidate.candidate_id,
-                "project_id": str(project_id),
+                "project_id": identifier,
                 "provider": candidate.provider_id,
                 "source_id": candidate.source_id,
                 "structure_format": candidate.structure_format,
@@ -2172,13 +2867,13 @@ class StructureSourceGatewayAdapter:
 
 
 __all__ = [
-    "AdapterResult", "BoundedHttpTransport", "CATALOG_SCHEMA",
+    "APPLICATION_USER_AGENT", "AdapterResult", "BoundedHttpTransport", "CATALOG_SCHEMA",
     "CANDIDATE_SCHEMA", "COMPARE_SCHEMA", "CatalysisHubAdapter",
     "ExternalReferenceCache", "ExternalReferenceError",
     "ExternalReferenceGateway", "ExternalReferenceProtocol",
     "ExternalStructureCandidate", "MaterialsProjectAdapter",
     "OptimadeAdapter", "OutboundRequest", "ProviderRegistry",
-    "ProviderSpec", "RESULT_SCHEMA", "SEARCH_SCHEMA",
+    "IMPORT_PREVIEW_SCHEMA", "ProviderSpec", "RESULT_SCHEMA", "SEARCH_SCHEMA",
     "StructureSourceGatewayAdapter", "TransportFailure",
     "TransportResponse", "normalize_query",
 ]

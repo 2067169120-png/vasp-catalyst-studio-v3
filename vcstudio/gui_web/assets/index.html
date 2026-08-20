@@ -1888,7 +1888,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
           <li data-i18n="reference.loading">正在读取…</li>
         </ul>
         <div class="rb-credential" id="rb-key-group" hidden>
-          <label for="rb-api-key" data-i18n="reference.key.label">Materials Project API key</label>
+          <label for="rb-api-key" id="rb-key-label" data-i18n="reference.key.label">Provider API key</label>
           <input class="ipt" id="rb-api-key" type="password" autocomplete="off"
             spellcheck="false" data-i18n-ph="reference.key.placeholder"
             placeholder="仅写入系统凭据库">
@@ -1933,7 +1933,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
           <span id="rb-results-summary" aria-live="polite" data-i18n="reference.results.empty">尚未搜索。</span>
         </div>
         <div id="rb-results" class="rb-results" role="region" tabindex="0"
-          aria-label="外部参考搜索结果"><div class="rb-empty" data-i18n="reference.results.empty">尚未搜索。</div></div>
+          aria-label="外部参考搜索结果" data-i18n-aria-label="reference.results.aria_label"><div class="rb-empty" data-i18n="reference.results.empty">尚未搜索。</div></div>
         <p id="rb-operation" class="rb-operation" aria-live="polite" data-i18n="reference.operation.ready">等待受限搜索。</p>
       </div>
     </div>
