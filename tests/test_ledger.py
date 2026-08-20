@@ -2,6 +2,8 @@
 import json
 import multiprocessing
 
+import pytest
+
 from vcstudio.cluster import ledger
 from vcstudio.shared import manifest
 
@@ -129,3 +131,62 @@ def test_method_and_ordinary_writers_in_two_processes_preserve_exactly_two_entri
     payload = json.loads(lp.read_text(encoding='utf-8'))
     assert payload['_transaction_owners'] == {str(method_job.resolve()): transaction_id}
     assert not list(tmp_path.glob('.jobs.json.*.tmp'))
+
+
+def test_owned_registration_only_its_transaction_can_rollback(tmp_path):
+    lp = tmp_path / 'jobs.json'
+    job = tmp_path / 'owned-job'
+    job.mkdir()
+    owner = 'a' * 32
+
+    first = ledger.register_owned(job, owner, path=lp)
+    assert first == {'added': True, 'preexisting': False, 'owned': True}
+    assert ledger.register_owned(job, owner, path=lp) == first
+    payload = json.loads(lp.read_text(encoding='utf-8'))
+    stored_owner = payload['_transaction_owners'][str(job.resolve())]
+    assert len(stored_owner) == 64 and stored_owner != owner
+    with pytest.raises(RuntimeError, match='another registration transaction'):
+        ledger.register_owned(job, 'b' * 32, path=lp)
+    assert ledger.unregister_owned(job, 'b' * 32, path=lp) is False
+    assert ledger.list_dirs(path=lp) == [str(job.resolve())]
+    assert ledger.unregister_owned(job, owner, path=lp) is True
+    assert ledger.list_dirs(path=lp) == []
+
+
+def test_release_owner_is_durable_and_never_removes_registered_job(tmp_path):
+    lp = tmp_path / 'jobs.json'
+    job = tmp_path / 'released-job'
+    job.mkdir()
+    owner = 'c' * 32
+
+    ledger.register_owned(job, owner, path=lp)
+    assert ledger.release_registration_owner(job, owner, path=lp) is True
+    assert ledger.release_registration_owner(job, owner, path=lp) is False
+    assert ledger.unregister_owned(job, owner, path=lp) is False
+    assert ledger.list_dirs(path=lp) == [str(job.resolve())]
+    payload = json.loads(lp.read_text(encoding='utf-8'))
+    assert payload == {'job_dirs': [str(job.resolve())]}
+
+
+def test_ensure_registration_released_is_atomic_and_rejects_another_owner(tmp_path):
+    lp = tmp_path / 'jobs.json'
+    job = tmp_path / 'candidate'
+    job.mkdir()
+    owner = 'd' * 32
+
+    assert ledger.register_owned(job, owner, path=lp)['owned'] is True
+    assert ledger.ensure_registration_released(job, owner, path=lp) == {
+        'present': True, 'owned': False, 'added': False,
+        'preexisting': False, 'released': True,
+    }
+    assert ledger.ensure_registration_released(job, owner, path=lp) == {
+        'present': True, 'owned': False, 'added': False,
+        'preexisting': True, 'released': False,
+    }
+
+    other = tmp_path / 'other-candidate'
+    other.mkdir()
+    ledger.register_owned(other, 'e' * 64, path=lp)
+    with pytest.raises(RuntimeError, match='another registration transaction'):
+        ledger.ensure_registration_released(other, 'f' * 32, path=lp)
+    assert ledger.registration_state(other, 'e' * 64, path=lp)['owned'] is True

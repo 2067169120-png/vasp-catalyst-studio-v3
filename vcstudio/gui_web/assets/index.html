@@ -555,6 +555,146 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
       </div>
     </div>
 
+    <!-- 通用结构来源与表面候选闭环：只消费 opaque token，不接收路径或凭据。 -->
+    <div class="card acc source-hub" id="structure-source-hub"
+      data-acc="structure:source-hub" data-sum="来源预览确认 → 通用 slab / 几何位点 dry-run → 显式创建 candidate"
+      data-i18n-sum="accordion.summary.structure.source_hub" data-acc-default="1"
+      data-src="periodic file" data-task="relax cellopt static adsorption_project spin_scan surface_energy formation_binding vaspsol conv_vacuum conv_thickness">
+      <h2 class="gen-h acc-h"><button type="button" class="acc-toggle" data-i18n="structure.hub.title">Structure Source Hub 与通用表面向导</button></h2>
+      <p class="source-hub-boundary" data-i18n="structure.hub.boundary">来源先预览、再确认；dry-run 后还要单独确认才创建 candidate 作业。不会自动提交，也不会提升科学状态。</p>
+
+      <div class="source-hub-grid">
+        <section class="source-role" aria-labelledby="src-bulk-title">
+          <div class="source-role-head">
+            <h3 id="src-bulk-title" data-i18n="structure.hub.bulk.title">1. 体相/基底结构（必选）</h3>
+            <button type="button" class="btn" id="src-bulk-local" data-i18n="structure.hub.local.select">从本机选择 CIF / POSCAR</button>
+          </div>
+          <p class="sub" data-i18n="structure.hub.local.picker_note">文件由系统选择器读取；页面不接收或显示本地路径。</p>
+          <div class="source-results" id="src-bulk-results" role="list" aria-live="polite" aria-label="基底来源结果" data-i18n-aria-label="structure.hub.bulk.results_aria"></div>
+          <div class="source-preview" id="src-bulk-preview" hidden>
+            <div class="source-preview-meta" id="src-bulk-meta"></div>
+            <div class="source-view-grid">
+              <div class="source-view-panel">
+                <b data-i18n="structure.hub.preview.3d">3D 预览</b>
+                <div class="source-view3d" id="src-bulk-view3d" role="img" aria-label="基底结构 3D 预览" data-i18n-aria-label="structure.hub.bulk.view3d_aria"></div>
+              </div>
+              <div class="source-view-panel">
+                <b data-i18n="structure.hub.preview.top">俯视图</b>
+                <div class="source-top-view" id="src-bulk-top" role="img" aria-label="基底结构俯视图" data-i18n-aria-label="structure.hub.bulk.top_aria"></div>
+              </div>
+            </div>
+            <dl class="source-provenance" id="src-bulk-provenance"></dl>
+            <button type="button" class="btn primary" id="src-bulk-confirm" disabled data-i18n="structure.hub.bulk.confirm">确认此源结构</button>
+          </div>
+          <div class="source-status" id="src-bulk-status" role="status" aria-live="polite" aria-atomic="true"></div>
+        </section>
+
+        <section class="source-role" aria-labelledby="src-ads-title">
+          <div class="source-role-head">
+            <h3 id="src-ads-title" data-i18n="structure.hub.ads.title">2. 吸附质结构（可选）</h3>
+            <div class="source-role-actions">
+              <button type="button" class="btn" id="src-ads-local" data-i18n="structure.hub.local.select">从本机选择 CIF / POSCAR</button>
+              <button type="button" class="btn quiet" id="src-ads-clear" data-i18n="structure.hub.ads.clear">清除吸附质</button>
+            </div>
+          </div>
+          <p class="sub" data-i18n="structure.hub.ads.optional_note">留空时只枚举几何位点并创建 clean slab candidate；确认吸附质后才生成吸附构型 candidate。</p>
+          <div class="source-results" id="src-ads-results" role="list" aria-live="polite" aria-label="吸附质来源结果" data-i18n-aria-label="structure.hub.ads.results_aria"></div>
+          <div class="source-preview" id="src-ads-preview" hidden>
+            <div class="source-preview-meta" id="src-ads-meta"></div>
+            <div class="source-view-grid">
+              <div class="source-view-panel">
+                <b data-i18n="structure.hub.preview.3d">3D 预览</b>
+                <div class="source-view3d" id="src-ads-view3d" role="img" aria-label="吸附质结构 3D 预览" data-i18n-aria-label="structure.hub.ads.view3d_aria"></div>
+              </div>
+              <div class="source-view-panel">
+                <b data-i18n="structure.hub.preview.top">俯视图</b>
+                <div class="source-top-view" id="src-ads-top" role="img" aria-label="吸附质结构俯视图" data-i18n-aria-label="structure.hub.ads.top_aria"></div>
+              </div>
+            </div>
+            <dl class="source-provenance" id="src-ads-provenance"></dl>
+            <button type="button" class="btn primary" id="src-ads-confirm" disabled data-i18n="structure.hub.ads.confirm">确认此吸附质结构</button>
+          </div>
+          <div class="source-status" id="src-ads-status" role="status" aria-live="polite" aria-atomic="true"></div>
+        </section>
+      </div>
+
+      <section class="source-gateway" aria-labelledby="source-gateway-title">
+        <div class="source-role-head">
+          <h3 id="source-gateway-title" data-i18n="structure.hub.gateway.title">可选外部参考网关</h3>
+          <span class="source-capability" id="source-capability-status" role="status" aria-live="polite"></span>
+        </div>
+        <div class="source-gateway-controls">
+          <label><span data-i18n="structure.hub.gateway.provider">来源</span>
+            <select class="ipt" id="source-provider"></select>
+          </label>
+          <label><span data-i18n="structure.hub.gateway.query">检索词</span>
+            <input class="ipt" id="source-query" autocomplete="off" data-i18n-ph="structure.hub.gateway.query_ph" placeholder="化学式、数据库编号或关键词">
+          </label>
+          <label><span data-i18n="structure.hub.gateway.target">用作</span>
+            <select class="ipt" id="source-target">
+              <option value="bulk" data-i18n="structure.hub.gateway.target_bulk">体相/基底</option>
+              <option value="ads" data-i18n="structure.hub.gateway.target_ads">吸附质</option>
+            </select>
+          </label>
+          <button type="button" class="btn" id="source-search" data-i18n="structure.hub.gateway.search">检索</button>
+        </div>
+        <p class="sub" data-i18n="structure.hub.gateway.boundary">远程功能由可选外部参考网关提供；网关未安装或失败时，本地选择仍可使用。</p>
+        <div class="source-remote-status" id="source-remote-status" role="status" aria-live="polite" aria-atomic="true"></div>
+      </section>
+
+      <section class="surface-wizard" id="surface-wizard" aria-labelledby="surface-wizard-title">
+        <div class="source-role-head">
+          <h3 id="surface-wizard-title" data-i18n="structure.hub.surface.title">3. 通用 slab 与几何位点向导</h3>
+          <span class="candidate-pill" data-i18n="structure.hub.surface.status">科学状态：candidate</span>
+        </div>
+        <div class="site-boundary" role="note" data-i18n="structure.hub.site.boundary">几何位点，不等于活性位点。碰撞或不合理最小距离必须 fail-closed。</div>
+
+        <fieldset class="surface-fieldset">
+          <legend data-i18n="structure.hub.slab.legend">Slab 参数</legend>
+          <div class="surface-fields">
+            <label class="miller-field"><span data-i18n="structure.hub.slab.miller">Miller 指数 (h k l)</span>
+              <span class="miller-inputs"><input class="ipt" id="surface-h" type="number" step="1" value="1" aria-label="Miller h" data-i18n-aria-label="structure.hub.slab.h_aria"><input class="ipt" id="surface-k" type="number" step="1" value="1" aria-label="Miller k" data-i18n-aria-label="structure.hub.slab.k_aria"><input class="ipt" id="surface-l" type="number" step="1" value="1" aria-label="Miller l" data-i18n-aria-label="structure.hub.slab.l_aria"></span>
+            </label>
+            <label><span data-i18n="structure.hub.slab.termination">Termination</span><input class="ipt" id="surface-termination" autocomplete="off" data-i18n-ph="structure.hub.slab.termination_ph" placeholder="auto 或服务端提供的 termination ID"></label>
+            <label><span data-i18n="structure.hub.slab.layers">层数</span><input class="ipt" id="surface-layers" type="number" min="1" step="1" value="4"></label>
+            <label><span data-i18n="structure.hub.slab.vacuum">真空 (Å)</span><input class="ipt" id="surface-vacuum" type="number" min="5" step="0.5" value="15"></label>
+            <label><span data-i18n="structure.hub.slab.fixed">固定底层数</span><input class="ipt" id="surface-fixed" type="number" min="0" step="1" value="0"></label>
+            <label class="surface-check"><input id="surface-dedup" type="checkbox" checked disabled><span data-i18n="structure.hub.slab.dedup">按对称性去重（强制）</span></label>
+          </div>
+        </fieldset>
+
+        <fieldset class="surface-fieldset">
+          <legend data-i18n="structure.hub.site.legend">几何位点参数</legend>
+          <div class="site-family-group" role="group" aria-label="几何位点类别" data-i18n-aria-label="structure.hub.site.types_aria">
+            <label><input type="checkbox" name="surface-site-family" value="ontop" checked><span data-i18n="structure.hub.site.ontop">ontop 顶位</span></label>
+            <label><input type="checkbox" name="surface-site-family" value="bridge" checked><span data-i18n="structure.hub.site.bridge">bridge 桥位</span></label>
+            <label><input type="checkbox" name="surface-site-family" value="hollow" checked><span data-i18n="structure.hub.site.hollow">hollow 空位</span></label>
+            <label><input type="checkbox" name="surface-site-family" value="other" checked><span data-i18n="structure.hub.site.other">其他几何候选</span></label>
+          </div>
+          <div class="surface-fields">
+            <label><span data-i18n="structure.hub.site.binding_atom">结合原子序号（可选）</span><input class="ipt" id="surface-binding-atom" type="number" min="0" step="1" data-i18n-ph="structure.hub.site.binding_atom_ph" placeholder="吸附质中的 0 基序号"></label>
+            <label><span data-i18n="structure.hub.site.orientation">法向取向</span><select class="ipt" id="surface-orientation"><option value="normal" data-i18n="structure.hub.site.orientation_normal">结合原子朝向表面</option><option value="inverted" data-i18n="structure.hub.site.orientation_inverted">反向</option></select></label>
+            <label><span data-i18n="structure.hub.site.rotations">面内旋转采样</span><select class="ipt" id="surface-rotations"><option value="0" data-i18n="structure.hub.site.rotations_1">1 个取向 (0°)</option><option value="0,180" data-i18n="structure.hub.site.rotations_2">2 个取向 (0° / 180°)</option><option value="0,90,180,270" data-i18n="structure.hub.site.rotations_4">4 个取向 (每 90°)</option></select></label>
+            <label><span data-i18n="structure.hub.site.coverage">覆盖度 (ML)</span><input class="ipt" id="surface-coverage" type="number" min="0.01" max="1" step="0.01" value="0.25"></label>
+            <label><span data-i18n="structure.hub.site.sides">表面侧</span><select class="ipt" id="surface-sides"><option value="top" data-i18n="structure.hub.site.side_top">仅上表面</option><option value="bottom" data-i18n="structure.hub.site.side_bottom">仅下表面</option><option value="both" data-i18n="structure.hub.site.side_both">双面</option></select></label>
+            <label><span data-i18n="structure.hub.site.min_distance">最小允许距离 (Å)</span><input class="ipt" id="surface-min-distance" type="number" min="1" step="0.05" value="1.5"></label>
+          </div>
+        </fieldset>
+
+        <div class="surface-actions">
+          <button type="button" class="btn primary" id="surface-dry-run" disabled data-i18n="structure.hub.dry_run">批量生成 dry-run</button>
+          <button type="button" class="btn" id="surface-output-select" disabled data-i18n="structure.hub.output.select">选择 candidate 保存位置</button>
+          <span class="surface-output-name" id="surface-output-name"></span>
+        </div>
+        <div class="surface-dry-result" id="surface-dry-result" tabindex="-1" aria-live="polite" aria-atomic="true"></div>
+        <div class="surface-confirm">
+          <label><input type="checkbox" id="surface-candidate-ack" disabled><span data-i18n="structure.hub.confirm.ack">我已检查 dry-run；仅创建 candidate，不提交计算。</span></label>
+          <button type="button" class="btn primary" id="surface-create-candidates" disabled data-i18n="structure.hub.confirm.create">显式确认并创建 candidate 作业</button>
+        </div>
+        <div class="source-status" id="surface-create-status" role="status" aria-live="polite" aria-atomic="true"></div>
+      </section>
+    </div>
+
     <!-- 分子建模分区(图片识别 → SMILES → 3D 建模 → 外部编辑器往返;分子化学 / 全功能场景显示) -->
     <div data-scene="cards.structure.molecular" data-src="molecular" data-task="relax static freq aimd formation_binding vaspsol">
     <div class="molzone-grid">

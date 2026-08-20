@@ -36,6 +36,18 @@ class LedgerProjectionError(RuntimeError):
     """A strict lifecycle projection could not safely read or merge the ledger."""
 
 
+def _registration_owner_id(value: str) -> str:
+    """Canonicalize public recovery transaction IDs to the 64-hex ledger schema."""
+    transaction_id = str(value or '').strip().lower()
+    if _HEX64.fullmatch(transaction_id):
+        return transaction_id
+    if _HEX32.fullmatch(transaction_id):
+        return hashlib.sha256(
+            b'vcstudio:structure-registration:v1\0' + transaction_id.encode('ascii')
+        ).hexdigest()
+    raise ValueError('transaction_id must be 32 or 64 lowercase hexadecimal characters')
+
+
 def default_ledger_path() -> Path:
     return user_config_dir() / LEDGER_NAME
 
@@ -543,15 +555,16 @@ def unregister(job_dir: str | os.PathLike, path: str | os.PathLike | None = None
 def register_owned(job_dir: str | os.PathLike, transaction_id: str,
                    path: str | os.PathLike | None = None) -> dict[str, bool]:
     """Idempotently register and durably attribute a newly added entry to one transaction."""
-    if not _HEX64.fullmatch(str(transaction_id)):
-        raise ValueError('transaction_id must be a lowercase sha256')
     target = _ledger_path(path)
     entry = _canonical_entry(job_dir)
-    owner_id = str(transaction_id)
+    owner_id = _registration_owner_id(transaction_id)
     with _mutation_lock(target):
         dirs, owners = _load_state(target)
         if entry in dirs:
-            owned = owners.get(entry) == owner_id
+            current_owner = owners.get(entry)
+            if current_owner not in {None, owner_id}:
+                raise RuntimeError('ledger entry is owned by another registration transaction')
+            owned = current_owner == owner_id
             return {'added': owned, 'preexisting': not owned, 'owned': owned}
         dirs.append(entry)
         owners[entry] = owner_id
@@ -564,10 +577,11 @@ def registration_state(job_dir: str | os.PathLike, transaction_id: str,
     """Read entry/owner state under the same lock used by every mutation."""
     target = _ledger_path(path)
     entry = _canonical_entry(job_dir)
+    owner_id = _registration_owner_id(transaction_id)
     with _mutation_lock(target):
         dirs, owners = _load_state(target)
         present = entry in dirs
-        owned = present and owners.get(entry) == str(transaction_id)
+        owned = present and owners.get(entry) == owner_id
         return {'present': present, 'owned': owned, 'preexisting': present and not owned}
 
 
@@ -576,9 +590,10 @@ def unregister_owned(job_dir: str | os.PathLike, transaction_id: str,
     """Remove only an entry whose durable owner is exactly this transaction."""
     target = _ledger_path(path)
     entry = _canonical_entry(job_dir)
+    owner_id = _registration_owner_id(transaction_id)
     with _mutation_lock(target):
         dirs, owners = _load_state(target)
-        if entry not in dirs or owners.get(entry) != str(transaction_id):
+        if entry not in dirs or owners.get(entry) != owner_id:
             return False
         dirs = [item for item in dirs if item != entry]
         owners.pop(entry, None)
@@ -591,13 +606,43 @@ def release_registration_owner(job_dir: str | os.PathLike, transaction_id: str,
     """Keep the entry but remove transient rollback authority after final verification."""
     target = _ledger_path(path)
     entry = _canonical_entry(job_dir)
+    owner_id = _registration_owner_id(transaction_id)
     with _mutation_lock(target):
         dirs, owners = _load_state(target)
-        if entry not in dirs or owners.get(entry) != str(transaction_id):
+        if entry not in dirs or owners.get(entry) != owner_id:
             return False
         owners.pop(entry, None)
         _save_state(target, dirs, owners)
         return True
+
+
+def ensure_registration_released(job_dir: str | os.PathLike, transaction_id: str,
+                                 path: str | os.PathLike | None = None
+                                 ) -> dict[str, bool]:
+    """Atomically ensure one entry exists without another transaction's owner."""
+    target = _ledger_path(path)
+    entry = _canonical_entry(job_dir)
+    owner_id = _registration_owner_id(transaction_id)
+    with _mutation_lock(target):
+        dirs, owners = _load_state(target)
+        current_owner = owners.get(entry)
+        if current_owner not in {None, owner_id}:
+            raise RuntimeError('ledger entry is owned by another registration transaction')
+        was_present = entry in dirs
+        was_owned = current_owner == owner_id
+        if not was_present:
+            dirs.append(entry)
+        if was_owned:
+            owners.pop(entry, None)
+        if not was_present or was_owned:
+            _save_state(target, dirs, owners)
+        return {
+            'present': True,
+            'owned': False,
+            'added': not was_present,
+            'preexisting': was_present and not was_owned,
+            'released': was_owned,
+        }
 
 
 def load_all(path: str | os.PathLike | None = None) -> list:
