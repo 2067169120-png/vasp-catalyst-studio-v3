@@ -214,7 +214,7 @@ def test_submit_job_happy_path_pbs(tmp_path):
     assert '#PBS -q batch' in script and 'source /opt/intel.sh' in script
     assert '\r' not in script                                  # CRLF 消毒
     # 命令:mkdir + qsub(带 scheduler_bin 全路径)
-    assert any(c.startswith(f'mkdir -p {remote}') for c in client.commands)
+    assert any(f'mkdir {remote}' in c for c in client.commands)
     assert any('/opt/torque-6.1.2/bin/qsub' in c for c in client.commands)
     # manifest 回写
     assert m['state'] == 'SUBMITTED'
@@ -525,7 +525,13 @@ def test_adopt_external_job_exact_binding_is_idempotent_and_profile_scoped(
 
     assert same['scheduler_job_id'] == '777'
     assert registered == [str(d)]
-    assert same.get('attempts') == data.get('attempts')
+    assert same['cluster_binding']['fingerprint'] == \
+        submitter.profile_binding(_profile())['fingerprint']
+    assert same['attempts'][-1]['action'] == 'cluster_binding_claim'
+    attempt_count = len(same['attempts'])
+    again = submitter.adopt_external_job(
+        str(d), _profile(), '777', '/work/adopted')
+    assert len(again['attempts']) == attempt_count
     with pytest.raises(ValueError, match='与本次.*不同'):
         submitter.adopt_external_job(
             str(d), _profile(name='other'), '777', '/work/adopted')
@@ -577,6 +583,12 @@ def test_submit_job_stops_when_mkdir_fails(tmp_path):
         submitter.submit_job(client, sftp, _profile(), d)
     assert sftp.uploaded == {}                         # 一个文件都没上传
     assert manifest.load_manifest(d)['state'] == 'CREATED'
+    assert submitter._read_submission_recovery(d)['status'] == 'preparing'
+    retry = FakeClient()
+    with pytest.raises(submitter.UnknownRemoteSubmission,
+                       match='远端目录准备阶段'):
+        submitter.submit_job(retry, FakeSFTP(), _profile(), d)
+    assert retry.commands == []
 
 
 def test_submit_and_refresh_quote_spaced_remote_dir(tmp_path):
@@ -590,7 +602,7 @@ def test_submit_and_refresh_quote_spaced_remote_dir(tmp_path):
     remote = m['remote_dir']
     assert remote.startswith('/work/my jobs/zn_job--')
     assert m['remote_dir'] == remote
-    assert f"mkdir -p '{remote}'" in client.commands
+    assert any(f"mkdir '{remote}'" in command for command in client.commands)
     assert any(f"'{remote}/vcs_job.sh'" in c for c in client.commands)
     assert posixpath.join(remote, 'INCAR') in sftp.uploaded
     # 自动脚本里的 cd 同样要引号
@@ -732,6 +744,23 @@ def test_continue_refuses_wrong_cluster_before_remote_mutation(tmp_path):
     with pytest.raises(ValueError, match='属于服务器「1w」'):
         submitter.continue_from_contcar(client, _profile(name='other'), d)
     assert client.commands == []
+
+
+def test_continue_refuses_legacy_name_only_cluster_binding(tmp_path):
+    d = _restartable_job(tmp_path)
+    data = manifest.load_manifest(d)
+    data.pop('cluster_binding', None)
+    manifest.save_manifest(d, data)
+    client = FakeClient()
+
+    with pytest.raises(ValueError, match='缺服务器端点绑定'):
+        submitter.continue_from_contcar(
+            client, _profile(hostname='other.example'), d,
+            max_rounds=None,
+            idempotency_key='legacy-profile-binding-001')
+
+    assert client.commands == []
+    assert not os.path.exists(os.path.join(d, '.vcstudio-job-actions.json'))
 
 
 def test_bands_continue_preserves_required_chgcar(tmp_path):
@@ -967,6 +996,43 @@ def test_explicit_manual_continue_can_exceed_automatic_round_cap(tmp_path):
     assert request['intent']['round_policy'] == 'manual-unbounded'
     assert request['contcar_source_sha256']
     assert request['incar_source_sha256']
+
+
+def test_old_continue_key_cannot_replay_after_scheduler_id_reuse(tmp_path):
+    d = _restartable_job(tmp_path, rounds=submitter.CONTINUE_MAX_ROUNDS)
+    key = 'manual-scheduler-generation-reuse-001'
+    first = submitter.continue_from_contcar(
+        FakeClient(script=[('cat', _VALID_CONTCAR), ('qsub', '204.c\n')]),
+        _profile(), d, max_rounds=None, idempotency_key=key)
+    old_transaction = first['attempts'][-1]['operation_transaction_id']
+
+    # A later scheduler generation reuses the same visible job id.  The old
+    # journal key must not be replayable merely because the numeric id matches.
+    current = manifest.load_manifest(d)
+    current['attempts'].append({
+        'n': len(current['attempts']) + 1,
+        'at': '2026-08-21T12:00:00',
+        'action': 'external_generation',
+        'job_id': '204',
+        'attempt_token': 'new-generation-token',
+        'incar_sha256': current['execution_authority'][
+            'current_incar_sha256'],
+    })
+    current['execution_authority']['transaction_id'] = 'new-generation-tx'
+    manifest.set_state(current, 'UNCONVERGED')
+    current.setdefault('results', {})['diagnosis'] = {
+        'failure_class': 'NONCONVERGED', 'restartable': True}
+    manifest.save_manifest(d, current)
+
+    retry = FakeClient()
+    with pytest.raises(submitter.UnknownRemoteJobOperation,
+                       match='当前作业代次不一致'):
+        submitter.continue_from_contcar(
+            retry, _profile(), d, max_rounds=None,
+            idempotency_key=key)
+
+    assert retry.commands == []
+    assert old_transaction != current['execution_authority']['transaction_id']
 
 
 def test_manual_continue_manifest_failure_retains_durable_authorization(

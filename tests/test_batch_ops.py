@@ -226,7 +226,7 @@ def _prof(scheduler='Slurm'):
                                  scheduler_bin='', username='u')
 
 
-def _make_job(tmp_path, name, job_id, state='RUNNING'):
+def _make_job(tmp_path, name, job_id, state='RUNNING', scheduler='Slurm'):
     """建一个带 scheduler_job_id 的作业目录(job.yaml),返回目录路径。"""
     d = tmp_path / name
     d.mkdir()
@@ -234,6 +234,8 @@ def _make_job(tmp_path, name, job_id, state='RUNNING'):
                                   task_type='relax', calc_type='', inputs={})
     m['scheduler_job_id'] = job_id
     m['cluster'] = 'c1'
+    m['cluster_binding'] = batch_ops.submitter.profile_binding(
+        _prof(scheduler))
     manifest_mod.set_state(m, state)
     manifest_mod.save_manifest(str(d), m)
     return str(d)
@@ -310,7 +312,7 @@ def test_cancel_batch_pbs_uses_qdel(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(batch_ops.submitter, 'run_cmd',
                         lambda client, cmd, check=False: calls.append(cmd) or ('', ''))
-    d1 = _make_job(tmp_path, 'j1', '888')
+    d1 = _make_job(tmp_path, 'j1', '888', scheduler='PBS')
     out = batch_ops.cancel_batch(_prof('PBS'), [d1], password='pw')
     assert out['cancelled'] == ['888']
     assert any('qdel' in c and '888' in c for c in calls)

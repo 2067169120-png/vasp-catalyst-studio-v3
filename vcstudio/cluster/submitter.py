@@ -255,8 +255,9 @@ def _read_submission_recovery(job_dir) -> dict | None:
         or (isinstance(neb_hashes, dict) and 3 <= len(neb_hashes) <= 1000
             and all(re.fullmatch(r'[0-9]{2,4}', str(key or ''))
                     and re.fullmatch(r'[0-9a-f]{64}', str(value or ''))
-                    for key, value in neb_hashes.items()))
-    )
+                    for key, value in neb_hashes.items())
+            and list(neb_hashes) == [
+                f'{index:02d}' for index in range(len(neb_hashes))]))
     if (not isinstance(payload, dict)
             or payload.get('schema') != _SUBMISSION_RECOVERY_SCHEMA
             or payload.get('status') not in valid_statuses
@@ -388,6 +389,19 @@ def _job_action_attempt(manifest: dict | None, *, action: str,
     return None
 
 
+def _current_scheduler_attempt(manifest: dict | None) -> dict | None:
+    """Return the newest attempt that owns the manifest's current scheduler id."""
+    current_job_id = str((manifest or {}).get('scheduler_job_id') or '')
+    attempts = (manifest or {}).get('attempts') if isinstance(manifest, dict) else None
+    if not current_job_id or not isinstance(attempts, list):
+        return None
+    return next((
+        attempt for attempt in reversed(attempts)
+        if isinstance(attempt, dict)
+        and str(attempt.get('job_id') or '') == current_job_id
+    ), None)
+
+
 def _job_action_replay(manifest: dict, action: str, evidence: dict) -> dict:
     replay = dict(manifest)
     replay[f'_{action}_replayed'] = True
@@ -411,6 +425,53 @@ def _job_action_generation_matches(manifest: dict, record: dict,
     current = str(manifest.get('scheduler_job_id') or '')
     if record.get('action') in {'continue', 'tune_continue'}:
         expected = str(record.get('result_job_id') or evidence.get('job_id') or '')
+        current_attempt = _current_scheduler_attempt(manifest)
+        record_transaction = str(record.get('transaction_id') or '')
+        evidence_transaction = str(
+            evidence.get('operation_transaction_id') or '')
+        authority = manifest.get('execution_authority')
+        authority_transaction = (
+            str(authority.get('transaction_id') or '')
+            if isinstance(authority, dict) else '')
+        authority_incar = (
+            _valid_sha256(authority.get('current_incar_sha256'))
+            if isinstance(authority, dict) else '')
+        evidence_incar = _valid_sha256(evidence.get('incar_sha256'))
+        authority_job_id = (
+            str(authority.get('scheduler_job_id') or '')
+            if isinstance(authority, dict) else '')
+        current_attempt_token = str(
+            (current_attempt or {}).get('attempt_token') or '')
+        evidence_attempt_token = str(evidence.get('attempt_token') or '')
+        if (not current_attempt or current_attempt is not evidence
+                or not record_transaction
+                or record_transaction != evidence_transaction
+                or authority_transaction != record_transaction
+                or authority_job_id != current
+                or not authority_incar
+                or authority_incar != evidence_incar
+                or not current_attempt_token
+                or current_attempt_token != evidence_attempt_token):
+            return False
+        request = record.get('request')
+        binding = manifest.get('cluster_binding')
+        cluster_fingerprint = (
+            str(binding.get('fingerprint') or '')
+            if isinstance(binding, dict) else '')
+        expected_profile = ''
+        expected_remote = ''
+        if isinstance(request, dict):
+            expected_profile = str(request.get('profile_fingerprint') or '')
+            expected_remote = str(request.get('remote_dir_sha256') or '')
+        expected_profile = expected_profile or str(
+            evidence.get('profile_fingerprint') or '')
+        expected_remote = expected_remote or str(
+            evidence.get('remote_dir_sha256') or '')
+        actual_remote = hashlib.sha256(
+            str(manifest.get('remote_dir') or '').encode('utf-8')).hexdigest()
+        if (not expected_profile or cluster_fingerprint != expected_profile
+                or not expected_remote or actual_remote != expected_remote):
+            return False
     else:
         expected = str(record.get('source_job_id') or
                        evidence.get('target_job_id') or '')
@@ -499,6 +560,8 @@ def _reconcile_job_action(job_dir, manifest: dict, action: str,
                 raise ValueError(f'同一作业操作请求标识不能用于不同的{subject}')
             fallback_record = {
                 'action': action,
+                'transaction_id': str(
+                    evidence.get('operation_transaction_id') or ''),
                 'request_sha256': str(
                     evidence.get('operation_request_sha256') or ''),
                 'intent_sha256': str(
@@ -606,11 +669,13 @@ def _reconcile_submission_recovery(job_dir, manifest: dict | None,
         return None
 
     if recovery.get('status') == 'preparing':
-        # The fsynced state transition to ``submitting`` occurs immediately
-        # before the sole command that can contact the scheduler.  A crash in
-        # ``preparing`` may leave partial uploads, but cannot have submitted.
-        _clear_submission_recovery(job_dir)
-        return None
+        # The scheduler is unreachable in this phase, but the remote leaf may
+        # already contain a partial upload.  Silent retry would reuse that
+        # unverified directory, so require explicit operator cleanup/recovery.
+        raise UnknownRemoteSubmission(
+            '上次提交停在远端目录准备阶段；调度器尚未确认接收，但远端可能有半成品。'
+            '请人工核对并清理后再显式恢复。',
+            recovery_status='preparing')
 
     recovery_job_id = str(recovery.get('scheduler_job_id') or '')
     current_job_id = str((manifest or {}).get('scheduler_job_id') or '')
@@ -631,9 +696,13 @@ def _reconcile_submission_recovery(job_dir, manifest: dict | None,
             == recovered_incar_sha256)
     )
     recovered_neb_hashes = recovery.get('neb_image_poscar_sha256') or {}
+    manifest_neb_hashes = (
+        ((manifest or {}).get('inputs') or {}).get(
+            'image_poscar_sha256') or {})
     neb_authority_matches = (
         not recovered_neb_hashes
-        or (isinstance(authority, dict)
+        or (recovered_neb_hashes == manifest_neb_hashes
+            and isinstance(authority, dict)
             and authority.get('neb_image_poscar_sha256')
             == recovered_neb_hashes
             and (matching_attempt or {}).get('neb_image_poscar_sha256')
@@ -734,7 +803,8 @@ def profile_binding(profile) -> dict:
 
 
 def assert_profile_binding(profile, job_dir: str, action: str,
-                           manifest: dict | None = None) -> dict:
+                           manifest: dict | None = None, *,
+                           allow_legacy_read: bool = False) -> dict:
     """Fail closed when a remote action targets a job owned by another server.
 
     Scheduler job ids and remote paths are only meaningful inside the cluster
@@ -754,18 +824,20 @@ def assert_profile_binding(profile, job_dir: str, action: str,
             f'{action}失败：作业属于服务器「{actual}」，当前选择的是「{expected}」；'
             '为防止操作错误服务器，已阻止本次操作')
     stored = m.get('cluster_binding')
-    if stored is not None:
-        stored_fingerprint = (str(stored.get('fingerprint') or '').strip()
-                              if isinstance(stored, dict) else '')
-        current = profile_binding(profile)
-        if (not stored_fingerprint
-                or stored_fingerprint != current['fingerprint']):
-            raise ValueError(
-                f'{action}失败：服务器「{expected}」的连接端点已与作业提交时不同'
-                '（主机/端口/用户/调度器/跳板机/远程根目录之一已改变）；'
-                '为防止误操作同名的另一台服务器，已阻止本次操作')
-    # Legacy manifests have no cluster_binding.  Keep their historical
-    # name-only behaviour so an upgrade does not strand existing calculations.
+    stored_fingerprint = (str(stored.get('fingerprint') or '').strip()
+                          if isinstance(stored, dict) else '')
+    if not stored_fingerprint:
+        if allow_legacy_read and stored is None:
+            return m
+        raise ValueError(
+            f'{action}失败：旧作业缺服务器端点绑定，不能仅凭同名 profile 执行远程操作；'
+            '请先通过显式认领/重新绑定流程核验服务器后再操作')
+    current = profile_binding(profile)
+    if stored_fingerprint != current['fingerprint']:
+        raise ValueError(
+            f'{action}失败：服务器「{expected}」的连接端点已与作业提交时不同'
+            '（主机/端口/用户/调度器/跳板机/远程根目录之一已改变）；'
+            '为防止误操作同名的另一台服务器，已阻止本次操作')
     return m
 
 
@@ -1021,6 +1093,14 @@ def _neb_local_frames(job_dir: str) -> list:
     return sorted(names, key=lambda s: int(s))
 
 
+def _neb_expected_frames(m: dict | None) -> list[str]:
+    """Return the one canonical ``00..N+1`` frame set declared by the manifest."""
+    n_images = _neb_n_images(m)
+    if n_images is None or n_images < 1 or n_images > 998:
+        return []
+    return [f'{index:02d}' for index in range(n_images + 2)]
+
+
 def _read_incar_images(job_dir: str) -> int | None:
     """本地根 INCAR 的 IMAGES 值(缺/读不到 → None)。"""
     try:
@@ -1039,16 +1119,19 @@ def _neb_input_check(job_dir: str, m: dict) -> list:
         if not os.path.isfile(os.path.join(job_dir, f)):
             errs.append(f'NEB 作业根目录缺 {f}(先在生成页产出 NEB 目录树)')
     frames = _neb_local_frames(job_dir)
+    expected_frames = _neb_expected_frames(m)
     if len(frames) < 3:
         errs.append(f'NEB 作业 image 子目录不足(找到 {len(frames)} 个,至少需 00/01/02)')
     for fr in frames:
         if not os.path.isfile(os.path.join(job_dir, fr, 'POSCAR')):
             errs.append(f'NEB image 子目录 {fr} 缺 POSCAR')
     n = _neb_n_images(m)
-    if frames and n is not None and (len(frames) - 2) != n:
+    if not expected_frames:
+        errs.append('NEB manifest n_images 必须是 1..998 的整数')
+    elif frames != expected_frames:
         errs.append(
-            f'NEB image 子目录数 {len(frames)}(含端点 → {len(frames) - 2} 中间 image)'
-            f'与 manifest n_images={n} 不符')
+            f'NEB image 子目录必须严格为 00..{expected_frames[-1]}'
+            f'（manifest n_images={n}），当前为 {", ".join(frames) or "空"}')
     recorded = (m.get('inputs') or {}).get('image_poscar_sha256')
     if not isinstance(recorded, dict):
         errs.append('NEB 清单缺 image_poscar_sha256；请重新生成目录树后再提交')
@@ -1075,25 +1158,68 @@ def _neb_input_check(job_dir: str, m: dict) -> list:
     return errs
 
 
-def _upload_neb_tree(client, sftp, job_dir: str, remote_dir: str) -> int:
-    """整棵 NEB 目录树上传(根共享文件 + 各 image 子目录 POSCAR)。返回上传文件数。
+def _freeze_neb_image_authority(job_dir: str, m: dict) -> dict[str, str]:
+    """Re-open and freeze the exact canonical local NEB image set."""
+    errors = _neb_input_check(job_dir, m)
+    if errors:
+        raise ValueError('；'.join(errors))
+    recorded = (m.get('inputs') or {}).get('image_poscar_sha256') or {}
+    return {
+        frame: str(recorded[frame]).strip().lower()
+        for frame in _neb_expected_frames(m)
+    }
 
-    递归 os.walk:逐子目录远端 mkdir -p,逐文件 sftp.put;跳过 job.yaml/脚本/*.bak/figs。
-    """
-    skip_names = {manifest_mod.MANIFEST_NAME, SCRIPT_NAME}
+
+def _assert_neb_image_authority(job_dir: str,
+                                authority: dict[str, str]) -> None:
+    """Ensure no image was added, removed, or changed while upload was running."""
+    frames = _neb_local_frames(job_dir)
+    if frames != list(authority):
+        raise ValueError(
+            'NEB image 集合在提交准备期间发生变化；已在联系调度器前停止')
+    for frame, expected in authority.items():
+        actual = manifest_mod.sha256_file(
+            os.path.join(job_dir, frame, 'POSCAR')).lower()
+        if actual != expected:
+            raise ValueError(
+                f'NEB image {frame}/POSCAR 在上传期间发生变化；'
+                '已在联系调度器前停止')
+
+
+def _upload_neb_tree(client, sftp, job_dir: str, remote_dir: str,
+                     image_authority: dict[str, str]) -> int:
+    """Upload only frozen NEB root inputs and canonical image POSCAR files."""
     count = 0
-    for root, dirs, files in os.walk(job_dir):
-        dirs[:] = [d for d in dirs if d != 'figs']       # 结构图缓存不上传
-        rel = os.path.relpath(root, job_dir)
-        rdir = remote_dir if rel == '.' else posixpath.join(remote_dir, rel.replace(os.sep, '/'))
-        if rel != '.':
-            run_cmd(client, f'mkdir -p {shlex.quote(rdir)}', check=True)
-        for fn in sorted(files):
-            if fn in skip_names or '.bak' in fn:
-                continue
-            sftp.put(os.path.join(root, fn), posixpath.join(rdir, fn))
-            count += 1
+    for filename in _NEB_ROOT_FILES:
+        sftp.put(os.path.join(job_dir, filename),
+                 posixpath.join(remote_dir, filename))
+        count += 1
+    for frame, expected in image_authority.items():
+        local = os.path.join(job_dir, frame, 'POSCAR')
+        if manifest_mod.sha256_file(local).lower() != expected:
+            raise ValueError(
+                f'NEB image {frame}/POSCAR 在上传前发生变化；拒绝上传')
+        remote_frame = posixpath.join(remote_dir, frame)
+        run_cmd(client, f'mkdir -p {shlex.quote(remote_frame)}', check=True)
+        sftp.put(local, posixpath.join(remote_frame, 'POSCAR'))
+        count += 1
     return count
+
+
+def _remote_neb_frame_set_guard(frames) -> str:
+    """POSIX-shell guard requiring exactly the frozen numeric frame directories."""
+    canonical = [str(frame) for frame in frames]
+    if (not canonical or len(set(canonical)) != len(canonical)
+            or any(re.fullmatch(r'[0-9]{2,4}', frame) is None
+                   for frame in canonical)):
+        raise ValueError('远端 NEB image 集合绑定无效')
+    expected = ' '.join(sorted(canonical))
+    return (
+        "vcs_frames=''; for vcs_dir in [0-9]*; do "
+        '[ -d "$vcs_dir" ] || continue; '
+        'case "$vcs_dir" in *[!0-9]*) continue ;; esac; '
+        'vcs_frames="${vcs_frames}${vcs_frames:+ }${vcs_dir}"; done; '
+        f'[ "$vcs_frames" = {shlex.quote(expected)} ]')
 
 
 def run_cmd(client, cmd: str, timeout: int = 30, check: bool = False):
@@ -1425,12 +1551,9 @@ def submit_job(client, sftp, profile, job_dir: str, *,
             raise ValueError(
                 '本地 INCAR 已偏离准备期权威摘要；请重新准备后再提交')
         if _is_neb(m):
-            neb_image_authority = {
-                str(key): str(value).lower()
-                for key, value in sorted(
-                    ((m.get('inputs') or {}).get(
-                        'image_poscar_sha256') or {}).items())
-            }
+            # Preflight is advisory; freeze again immediately before the durable
+            # recovery record so a directory added in between cannot enter upload.
+            neb_image_authority = _freeze_neb_image_authority(job_dir, m)
 
     recovery = {
         'schema': _SUBMISSION_RECOVERY_SCHEMA,
@@ -1452,10 +1575,19 @@ def submit_job(client, sftp, profile, job_dir: str, *,
 
     # 远程目录 + 上传(脚本统一 LF,防 Windows CRLF 毒害 shell)
     try:
-        run_cmd(client, f'mkdir -p {shlex.quote(spec.remote_dir)}', check=True)
+        remote_parent = posixpath.dirname(spec.remote_dir.rstrip('/')) or '/'
+        run_cmd(
+            client,
+            f'mkdir -p {shlex.quote(remote_parent)} && '
+            f'mkdir {shlex.quote(spec.remote_dir)}',
+            check=True)
         if _is_neb(m):
-            # NEB:整棵目录树(根共享 INCAR/POTCAR/KPOINTS + 各 image 子目录 POSCAR)
-            n_up = _upload_neb_tree(client, sftp, job_dir, spec.remote_dir)
+            # Upload only the frozen run inputs.  A fresh os.walk here would let
+            # a concurrently-created numeric image escape the authority map.
+            n_up = _upload_neb_tree(
+                client, sftp, job_dir, spec.remote_dir,
+                neb_image_authority)
+            _assert_neb_image_authority(job_dir, neb_image_authority)
             upload_note = f'NEB 目录树 {n_up} 文件 + {SCRIPT_NAME}'
         else:
             input_files = _declared_input_files(job_dir, m)[0]
@@ -1467,11 +1599,9 @@ def submit_job(client, sftp, profile, job_dir: str, *,
         with sftp.file(posixpath.join(spec.remote_dir, SCRIPT_NAME), 'w') as f:
             f.write(script_text.replace('\r\n', '\n'))
     except Exception:
-        # No scheduler command is reachable before ``submitting`` is fsynced.
-        try:
-            _clear_submission_recovery(job_dir)
-        except OSError:
-            pass
+        # Preserve the fsynced ``preparing`` record.  Although qsub is not yet
+        # reachable, the remote leaf may contain a partial upload and must not
+        # be silently reused by a retry.
         raise
     m['cluster'] = profile.name
     m['cluster_binding'] = profile_binding(profile)
@@ -1489,6 +1619,9 @@ def submit_job(client, sftp, profile, job_dir: str, *,
                 f'cd {shlex.quote(spec.remote_dir)}',
                 _remote_sha256_guard('INCAR', incar_authority_sha256),
             ]
+            if neb_image_authority:
+                guards.append(_remote_neb_frame_set_guard(
+                    neb_image_authority))
             guards.extend(
                 _remote_sha256_guard(f'{frame}/POSCAR', digest)
                 for frame, digest in neb_image_authority.items())
@@ -1796,8 +1929,26 @@ def _adopt_external_job_locked(local_dir: str, profile, job_id: str, remote_dir:
             and posixpath.normpath(str(existing.get('remote_dir') or ''))
             == posixpath.normpath(str(remote_dir)))
         if exact_binding:
-            assert_profile_binding(
-                profile, local_dir, '认领外部作业', manifest=existing)
+            stored = existing.get('cluster_binding')
+            if not (isinstance(stored, dict)
+                    and str(stored.get('fingerprint') or '').strip()):
+                # This explicit adopt call is the only name-only legacy migration.
+                # Normal remote actions never acquire endpoint authority silently.
+                binding = profile_binding(profile)
+                existing['cluster_binding'] = binding
+                existing.setdefault('attempts', []).append({
+                    'n': len(existing.get('attempts') or []) + 1,
+                    'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                    'action': 'cluster_binding_claim',
+                    'claimed_scheduler_job_id': existing_job_id,
+                    'cluster_fingerprint': binding['fingerprint'],
+                    'remote_dir_sha256': hashlib.sha256(
+                        str(remote_dir).encode('utf-8')).hexdigest(),
+                })
+                manifest_mod.save_manifest(local_dir, existing)
+            else:
+                assert_profile_binding(
+                    profile, local_dir, '认领外部作业', manifest=existing)
             # 认领响应可能在前端收到前中断；同一 job/profile/remote 的重试只修复
             # 台账登记，不重复追加 attempts，也不改状态。
             from vcstudio.cluster import ledger
@@ -2066,7 +2217,9 @@ def refresh_job(client, profile, job_dir: str, live_states: dict | None = None,
     m = manifest_mod.load_manifest(job_dir)
     if m is None or not m.get('scheduler_job_id'):
         return m
-    assert_profile_binding(profile, job_dir, '刷新状态', manifest=m)
+    assert_profile_binding(
+        profile, job_dir, '刷新状态', manifest=m,
+        allow_legacy_read=True)
     states = live_states if live_states is not None else query_states(client, profile)
     jid = str(m['scheduler_job_id'])
     u = states.get(jid, GONE)
@@ -2688,7 +2841,9 @@ def fetch_results(client, sftp, job_dir: str, files=None, *, profile=None,
     if m is None:
         raise ValueError('作业目录缺 job.yaml,无法定位远程目录')
     if profile is not None:
-        assert_profile_binding(profile, job_dir, '拉回结果', manifest=m)
+        assert_profile_binding(
+            profile, job_dir, '拉回结果', manifest=m,
+            allow_legacy_read=True)
     remote = m.get('remote_dir')
     if not remote:
         raise ValueError('该作业尚未提交过(manifest 无 remote_dir)')
@@ -2909,6 +3064,15 @@ def _current_incar_authority(manifest: dict, source_job_id: str) -> str:
         if attempt_digest != authority_digest:
             raise ValueError(
                 'job.yaml 的执行代次与 attempt INCAR 摘要不一致；不能续算')
+        if (matching_attempt or {}).get('action') in {
+                'contcar_restart', 'incar_tuned_restart'}:
+            authority_transaction = str(authority.get('transaction_id') or '')
+            attempt_transaction = str(
+                (matching_attempt or {}).get('operation_transaction_id') or '')
+            if (not authority_transaction
+                    or authority_transaction != attempt_transaction):
+                raise ValueError(
+                    'job.yaml 的执行代次与 attempt 事务绑定不一致；不能续算')
         return authority_digest
 
     # A legacy baseline is reconstructable only before any continuation changed
@@ -2946,7 +3110,9 @@ def _set_incar_authority(manifest: dict, *, scheduler_job_id: str,
         }
         if (len(canonical) < 3
                 or any(re.fullmatch(r'[0-9]{2,4}', key) is None or not digest
-                       for key, digest in canonical.items())):
+                       for key, digest in canonical.items())
+                or list(canonical) != [
+                    f'{index:02d}' for index in range(len(canonical))]):
             raise ValueError('无法持久化无效的 NEB image POSCAR 权威摘要')
         manifest['execution_authority'][
             'neb_image_poscar_sha256'] = canonical
@@ -3117,9 +3283,14 @@ def continue_from_contcar(client, profile, job_dir: str,
         'schema': 'vcstudio.continuation-request/v1',
         'manifest_job_id': str(m.get('job_id') or ''),
         'source_scheduler_job_id': source_job_id,
+        'source_attempt_token': current_attempt_token(m),
+        'source_authority_transaction_id': str(
+            (m.get('execution_authority') or {}).get('transaction_id') or ''),
         'source_state': str(m.get('state') or ''),
         'source_round': rounds,
         'profile_fingerprint': str(profile_binding(profile)['fingerprint']),
+        'remote_dir_sha256': hashlib.sha256(
+            str(remote).encode('utf-8')).hexdigest(),
         'intent': intent,
         'round_limit_override': (
             'manual-explicit' if manual_round_override else None),
@@ -3216,6 +3387,11 @@ def continue_from_contcar(client, profile, job_dir: str,
         'operation_request_sha256': request_sha256,
         'operation_intent_sha256': intent_sha256,
         'incar_sha256': authorized_incar_sha256,
+        'source_attempt_token': request['source_attempt_token'],
+        'source_authority_transaction_id': request[
+            'source_authority_transaction_id'],
+        'profile_fingerprint': request['profile_fingerprint'],
+        'remote_dir_sha256': request['remote_dir_sha256'],
     }
     if manual_round_override:
         attempt['round_limit_override'] = 'manual-explicit'
@@ -3225,6 +3401,9 @@ def continue_from_contcar(client, profile, job_dir: str,
         m, scheduler_job_id=str(job_id),
         incar_sha256=authorized_incar_sha256,
         transaction_id=record['transaction_id'])
+    token_manifest = dict(m)
+    token_manifest['attempts'] = list(m.get('attempts') or []) + [attempt]
+    attempt['attempt_token'] = current_attempt_token(token_manifest)
     m.setdefault('attempts', []).append(attempt)
     override_note = ',人工确认超出自动上限' if manual_round_override else ''
     manifest_mod.set_state(
@@ -3349,6 +3528,11 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
     remote = m.get('remote_dir')
     if not remote:
         raise ValueError('该作业无 remote_dir(未提交过),无法改参续算')
+    request['source_attempt_token'] = current_attempt_token(m)
+    request['source_authority_transaction_id'] = str(
+        (m.get('execution_authority') or {}).get('transaction_id') or '')
+    request['remote_dir_sha256'] = hashlib.sha256(
+        str(remote).encode('utf-8')).hexdigest()
 
     # Requested CONTCAR promotion is mandatory, not best-effort.  Validate both
     # syntax and geometry before the durable transaction or any local/remote file
@@ -3505,6 +3689,11 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
         'operation_request_sha256': request_sha256,
         'operation_intent_sha256': intent_sha256,
         'incar_sha256': incar_target_sha256,
+        'source_attempt_token': request['source_attempt_token'],
+        'source_authority_transaction_id': request[
+            'source_authority_transaction_id'],
+        'profile_fingerprint': request['profile_fingerprint'],
+        'remote_dir_sha256': request['remote_dir_sha256'],
     }
     if manual_round_override:
         attempt['round_limit_override'] = 'manual-explicit'
@@ -3514,6 +3703,9 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
         m, scheduler_job_id=str(job_id),
         incar_sha256=incar_target_sha256,
         transaction_id=record['transaction_id'])
+    token_manifest = dict(m)
+    token_manifest['attempts'] = list(m.get('attempts') or []) + [attempt]
+    attempt['attempt_token'] = current_attempt_token(token_manifest)
     m.setdefault('attempts', []).append(attempt)
     override_note = ',人工确认超出自动上限' if manual_round_override else ''
     manifest_mod.set_state(

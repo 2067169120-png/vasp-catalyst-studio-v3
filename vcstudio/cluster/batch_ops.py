@@ -132,7 +132,8 @@ def fetch_batch(prof, pw, dirs, trust_new, files=None):
         sftp = client.open_sftp()
         for d in dirs:
             try:
-                submitter.assert_profile_binding(prof, d, '拉回结果')
+                submitter.assert_profile_binding(
+                    prof, d, '拉回结果', allow_legacy_read=True)
                 # fetch_results 内再用同一 profile 对读到的 manifest 做硬校验，
                 # 避免外层检查与真正 SFTP 下载之间 job.yaml 被换代的 TOCTOU。
                 fetched, missing = submitter.fetch_results(
@@ -412,7 +413,8 @@ def refresh_batch(prof, pw, dirs, trust_new):
         scheduler_states, reasons = submitter.query_scheduler(client, prof)
         for d in dirs:
             try:
-                submitter.assert_profile_binding(prof, d, '刷新状态')
+                submitter.assert_profile_binding(
+                    prof, d, '刷新状态', allow_legacy_read=True)
                 m = submitter.refresh_job(client, prof, d, live_states=scheduler_states,
                                           terminal_reasons=reasons)
                 note = m['state']

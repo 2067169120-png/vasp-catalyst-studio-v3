@@ -9535,7 +9535,9 @@ def test_submit_project_retry_repairs_launch_after_persistence_failure(tmp_path)
     def _submit(profile, _pw, dirs, _trust):
         assert dirs == [job]
         manifest.update({'state': 'SUBMITTED', 'scheduler_job_id': '900',
-                         'cluster': profile.name, 'remote_dir': '/work/clean'})
+                         'cluster': profile.name, 'remote_dir': '/work/clean',
+                         'cluster_binding': cluster_submitter.profile_binding(
+                             profile)})
         return {'needs_trust': False, 'results': [(job, True, 'ok')]}
 
     submissions = []

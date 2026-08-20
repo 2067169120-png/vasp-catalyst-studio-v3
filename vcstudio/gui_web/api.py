@@ -2758,7 +2758,8 @@ class Api:
                     return {**empty, 'state': state, 'error': err.get('error') or str(err)}
                 try:
                     self._sub().assert_profile_binding(
-                        prof, d, '读取实时能量', manifest=m)
+                        prof, d, '读取实时能量', manifest=m,
+                        allow_legacy_read=True)
                 except Exception as e:                    # noqa: BLE001 连网前失败即停
                     return {**empty, 'state': state, 'error': str(e)}
                 conn = self._conn()

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from vcstudio.cluster.profiles import ClusterProfile
+from vcstudio.cluster import submitter as submitter_mod
 from vcstudio.shared import manifest
 
 
@@ -42,6 +43,7 @@ def _job(root: Path, action: str) -> Path:
         "cluster": "cluster-a", "remote_dir": f"/work/jobs/{action}",
         "scheduler_job_id": "100", "state": "RUNNING" if action == "cancel"
         else "UNCONVERGED",
+        "cluster_binding": submitter_mod.profile_binding(_profile()),
     })
     data["state_history"] = [{"state": data["state"], "at": "before"}]
     if action == "continue":

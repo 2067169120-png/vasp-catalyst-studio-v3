@@ -152,6 +152,20 @@ def test_neb_preflight_images_count_mismatch(tmp_path):
     assert any('n_images=9' in e for e in errs)
 
 
+def test_neb_preflight_rejects_noncanonical_frame_names_even_when_count_matches(
+        tmp_path):
+    jd = _neb_job(tmp_path)
+    os.rename(os.path.join(jd, '04'), os.path.join(jd, '99'))
+    data = manifest.load_manifest(jd)
+    data['inputs']['image_poscar_sha256']['99'] = \
+        data['inputs']['image_poscar_sha256'].pop('04')
+    manifest.save_manifest(jd, data)
+
+    errs = submitter.preflight(_profile(), jd)
+
+    assert any('必须严格为 00..04' in error for error in errs)
+
+
 def test_neb_preflight_rejects_image_poscar_changed_after_generation(tmp_path):
     jd = _neb_job(tmp_path)
     image = os.path.join(jd, '01', 'POSCAR')
@@ -184,6 +198,8 @@ def test_neb_submit_uploads_tree(tmp_path):
     assert m['attempts'][-1]['neb_image_poscar_sha256'] == frozen
     assert m['execution_authority']['neb_image_poscar_sha256'] == frozen
     command = next(item for item in client.commands if 'qsub' in item)
+    assert 'vcs_frames' in command
+    assert '00 01 02 03 04' in command
     for frame, digest in frozen.items():
         assert f'{frame}/POSCAR' in command
         assert digest in command
@@ -203,17 +219,57 @@ def test_neb_image_changed_during_upload_fails_remote_hash_gate(tmp_path):
     client = FakeClient(
         script=[('qsub', 'must-not-accept.cluster\n')],
         exit_codes={'01/POSCAR': 1})
-    with pytest.raises(submitter.UnknownRemoteSubmission):
+    with pytest.raises(ValueError, match='上传期间发生变化'):
         submitter.submit_job(client, MutatingImageSFTP(), _profile(), jd)
 
     failed = manifest.load_manifest(jd)
-    assert failed['state'] == 'UPLOADED'
+    assert failed['state'] == 'CREATED'
     assert not failed.get('scheduler_job_id')
     assert not failed.get('execution_authority')
-    recovery = submitter._read_submission_recovery(jd)
-    assert recovery['status'] == 'unknown_remote_submission'
-    assert recovery['neb_image_poscar_sha256'] == \
-        manifest.load_manifest(jd)['inputs']['image_poscar_sha256']
+    assert submitter._read_submission_recovery(jd)['status'] == 'preparing'
+    assert not any('qsub' in command for command in client.commands)
+
+
+def test_neb_new_numeric_directory_during_upload_is_not_uploaded_or_submitted(
+        tmp_path):
+    jd = _neb_job(tmp_path)
+
+    class AddingImageSFTP(FakeSFTP):
+        added = False
+
+        def put(self, local, remote):
+            result = super().put(local, remote)
+            if not self.added:
+                self.added = True
+                extra = os.path.join(jd, '99')
+                os.makedirs(extra)
+                with open(os.path.join(extra, 'POSCAR'), 'w', encoding='utf-8') as handle:
+                    handle.write(_INI)
+            return result
+
+    client = FakeClient(script=[('qsub', 'must-not-accept.cluster\n')])
+    sftp = AddingImageSFTP()
+
+    with pytest.raises(ValueError, match='image 集合.*发生变化'):
+        submitter.submit_job(client, sftp, _profile(), jd)
+
+    assert not any(remote.endswith('/99/POSCAR') for remote in sftp.uploaded)
+    assert not any('qsub' in command for command in client.commands)
+    assert submitter._read_submission_recovery(jd)['status'] == 'preparing'
+
+
+def test_neb_remote_extra_numeric_directory_blocks_scheduler_submission(tmp_path):
+    jd = _neb_job(tmp_path)
+    client = FakeClient(
+        script=[('qsub', 'must-not-accept.cluster\n')],
+        exit_codes={'vcs_frames': 1})
+
+    with pytest.raises(submitter.UnknownRemoteSubmission):
+        submitter.submit_job(client, FakeSFTP(), _profile(), jd)
+
+    command = next(item for item in client.commands if 'qsub' in item)
+    assert 'vcs_frames' in command
+    assert command.index('vcs_frames') < command.index('qsub')
 
 
 # ── 刷新:排队/运行/收敛/未收敛 ──

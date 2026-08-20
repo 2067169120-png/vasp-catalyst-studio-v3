@@ -200,6 +200,7 @@ def _terminal_job(tmp_path, state='NEEDS_HUMAN', fclass='SCF_SLOSHING'):
     d = _job_dir(tmp_path)
     m = manifest.load_manifest(d)
     m['cluster'] = '1w'
+    m['cluster_binding'] = submitter.profile_binding(_profile())
     m['remote_dir'] = '/work/sk2067/jobs/zn_job'
     m['scheduler_job_id'] = '900'
     m.setdefault('results', {})['diagnosis'] = {
