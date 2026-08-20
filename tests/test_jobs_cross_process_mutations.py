@@ -34,7 +34,9 @@ def _job(root: Path, action: str) -> Path:
     (job / "INCAR").write_text("ENCUT = 400\n", encoding="utf-8")
     data = manifest.new_manifest(
         job_id=f"{action}-local", system=action, task_type="relax",
-        calc_type="", inputs={},
+        calc_type="", inputs={
+            "sha256": {"INCAR": manifest.sha256_file(job / "INCAR")},
+        },
     )
     data.update({
         "cluster": "cluster-a", "remote_dir": f"/work/jobs/{action}",

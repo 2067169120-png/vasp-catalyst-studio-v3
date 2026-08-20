@@ -385,6 +385,34 @@ def test_tune_submit_is_guarded_by_frozen_incar_and_promoted_poscar_hashes(
     assert submit_command.rindex('sha256sum -c -') < submit_command.index('qsub')
 
 
+def test_authorized_tune_advances_incar_generation_for_later_plain_continue(
+        tmp_path):
+    d = _terminal_job(tmp_path)
+    tuned = submitter.continue_with_incar_changes(
+        FakeClient(script=[('cat', _CONTCAR), ('qsub', '908.cluster\n')]),
+        FakeSFTP(), _profile(), d, {'ALGO': 'Normal'}, max_rounds=None,
+        idempotency_key='tune-authority-advance-001')
+    authority = tuned['execution_authority']
+    assert authority['scheduler_job_id'] == '908'
+    assert authority['current_incar_sha256'] == tuned['attempts'][-1]['incar_sha256']
+
+    manifest.set_state(tuned, 'UNCONVERGED')
+    tuned.setdefault('results', {})['diagnosis'] = {
+        'failure_class': 'NONCONVERGED', 'restartable': True,
+    }
+    manifest.save_manifest(d, tuned)
+    continued = submitter.continue_from_contcar(
+        FakeClient(script=[('cat', _CONTCAR), ('qsub', '909.cluster\n')]),
+        _profile(), d, max_rounds=None,
+        idempotency_key='plain-after-tune-authority-001')
+
+    assert continued['scheduler_job_id'] == '909'
+    assert continued['execution_authority']['current_incar_sha256'] == \
+        authority['current_incar_sha256']
+    assert continued['attempts'][-1]['incar_sha256'] == \
+        authority['current_incar_sha256']
+
+
 def test_continue_and_tune_require_explicit_terminal_state(tmp_path):
     d = _terminal_job(tmp_path)
     data = manifest.load_manifest(d)

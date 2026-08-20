@@ -223,6 +223,11 @@ def test_submit_job_happy_path_pbs(tmp_path):
     assert [h['state'] for h in m['state_history']] == ['CREATED', 'UPLOADED', 'SUBMITTED']
     assert m['attempts'][0]['job_id'] == '8812345'
     assert m['attempts'][0]['cores'] == 12                     # v3.3.0 记核数(nodes×ppn)供实耗核时
+    assert m['attempts'][0]['incar_sha256'] == manifest.sha256_file(
+        os.path.join(d, 'INCAR'))
+    assert m['execution_authority']['scheduler_job_id'] == '8812345'
+    assert m['execution_authority']['current_incar_sha256'] == \
+        m['attempts'][0]['incar_sha256']
     assert manifest.load_manifest(d)['state'] == 'SUBMITTED'   # 已落盘
 
 
@@ -692,6 +697,14 @@ def test_generic_icharg_restart_preserves_required_chgcar(tmp_path):
     d = _restartable_job(tmp_path)
     with open(os.path.join(d, 'INCAR'), 'a', encoding='utf-8') as handle:
         handle.write('ICHARG = 1\n')
+    # This fixture models a generation that was originally submitted with
+    # ICHARG=1; update all three authority copies instead of mutating it in flight.
+    digest = manifest.sha256_file(os.path.join(d, 'INCAR'))
+    data = manifest.load_manifest(d)
+    data['inputs']['sha256']['INCAR'] = digest
+    data['attempts'][-1]['incar_sha256'] = digest
+    data['execution_authority']['current_incar_sha256'] = digest
+    manifest.save_manifest(d, data)
     client = FakeClient(script=[('cat', _VALID_CONTCAR), ('qsub', '205.c\n')])
     submitter.continue_from_contcar(client, _profile(), d)
     commands = ' '.join(client.commands)
@@ -849,6 +862,38 @@ def test_continue_refuses_at_round_cap(tmp_path):
     d = _restartable_job(tmp_path, rounds=3)
     with pytest.raises(RuntimeError, match='上限'):
         submitter.continue_from_contcar(FakeClient(), _profile(), d, max_rounds=3)
+
+
+def test_continue_rejects_local_incar_drift_from_authorized_generation(tmp_path):
+    d = _restartable_job(tmp_path, rounds=submitter.CONTINUE_MAX_ROUNDS)
+    with open(os.path.join(d, 'INCAR'), 'a', encoding='utf-8') as handle:
+        handle.write('ENCUT = 999\nISPIN = 2\n')
+    client = FakeClient(script=[('cat', _VALID_CONTCAR), ('qsub', 'must-not-run\n')])
+
+    with pytest.raises(ValueError, match='权威摘要'):
+        submitter.continue_from_contcar(
+            client, _profile(), d, max_rounds=None,
+            idempotency_key='manual-authority-drift-001')
+
+    assert client.commands == []
+    assert not os.path.exists(os.path.join(d, '.vcstudio-job-actions.json'))
+
+
+def test_legacy_continuation_without_reconstructable_incar_authority_fails_closed(
+        tmp_path):
+    d = _restartable_job(tmp_path)
+    data = manifest.load_manifest(d)
+    data.pop('execution_authority', None)
+    data['attempts'].append({
+        'action': 'contcar_restart', 'job_id': data['scheduler_job_id'],
+        'prev_job_id': '99', 'round': 1,
+    })
+    manifest.save_manifest(d, data)
+    client = FakeClient()
+
+    with pytest.raises(ValueError, match='缺执行代次 INCAR 权威摘要'):
+        submitter.continue_from_contcar(client, _profile(), d)
+    assert client.commands == []
 
 
 def test_explicit_manual_continue_can_exceed_automatic_round_cap(tmp_path):

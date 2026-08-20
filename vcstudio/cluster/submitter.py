@@ -1437,6 +1437,14 @@ def submit_job(client, sftp, profile, job_dir: str, *,
             # v3.3.0 实际核时统计:提交时点核数(nodes×ppn;ppn 未配 → None,usage 端不编数)
             'cores': (spec.nodes * spec.ppn) if spec.ppn else None,
         }
+        if _job_engine(m) == 'vasp':
+            incar_sha256 = manifest_mod.sha256_file(
+                os.path.join(job_dir, 'INCAR'))
+            attempt['incar_sha256'] = incar_sha256
+            _set_incar_authority(
+                m, scheduler_job_id=str(job_id),
+                incar_sha256=incar_sha256,
+                transaction_id=recovery['transaction_id'])
         if operation_key:
             attempt['idempotency_key'] = operation_key
         # The token is part of the immutable attempt audit record and later binds
@@ -2757,6 +2765,61 @@ def _require_source_scheduler_job_id(manifest: dict, action: str) -> str:
     return job_id
 
 
+def _valid_sha256(value) -> str:
+    digest = str(value or '').strip().lower()
+    return digest if re.fullmatch(r'[0-9a-f]{64}', digest) else ''
+
+
+def _current_incar_authority(manifest: dict, source_job_id: str) -> str:
+    """Resolve the INCAR digest authorized for the current scheduler generation."""
+    authority = manifest.get('execution_authority')
+    if isinstance(authority, dict):
+        authority_job_id = str(authority.get('scheduler_job_id') or '')
+        authority_digest = _valid_sha256(authority.get('current_incar_sha256'))
+        if authority_job_id != source_job_id or not authority_digest:
+            raise ValueError(
+                'job.yaml 的执行代次 INCAR 权威绑定无效；请人工恢复或重新准备作业')
+        matching_attempt = next((
+            item for item in reversed(manifest.get('attempts') or [])
+            if isinstance(item, dict)
+            and str(item.get('job_id') or '') == source_job_id
+        ), None)
+        attempt_digest = _valid_sha256(
+            (matching_attempt or {}).get('incar_sha256'))
+        if attempt_digest != authority_digest:
+            raise ValueError(
+                'job.yaml 的执行代次与 attempt INCAR 摘要不一致；不能续算')
+        return authority_digest
+
+    # A legacy baseline is reconstructable only before any continuation changed
+    # INCAR: the preparation-time managed-input digest remains authoritative.
+    attempts = [item for item in manifest.get('attempts') or []
+                if isinstance(item, dict)]
+    if any(item.get('action') in {'contcar_restart', 'incar_tuned_restart'}
+           for item in attempts):
+        raise ValueError(
+            '旧作业已有续算历史但缺执行代次 INCAR 权威摘要；不能从现场文件重建，请人工恢复')
+    prepared = _valid_sha256(
+        ((manifest.get('inputs') or {}).get('sha256') or {}).get('INCAR'))
+    if not prepared:
+        raise ValueError(
+            '旧作业缺可重建的准备期 INCAR 摘要；请重新准备或人工迁移后再续算')
+    return prepared
+
+
+def _set_incar_authority(manifest: dict, *, scheduler_job_id: str,
+                         incar_sha256: str, transaction_id: str) -> None:
+    digest = _valid_sha256(incar_sha256)
+    if not valid_scheduler_job_id(scheduler_job_id) or not digest:
+        raise ValueError('无法持久化无效的执行代次 INCAR 权威绑定')
+    manifest['execution_authority'] = {
+        'schema': 'vcstudio.execution-input-authority/v1',
+        'scheduler_job_id': str(scheduler_job_id),
+        'current_incar_sha256': digest,
+        'transaction_id': str(transaction_id or ''),
+    }
+
+
 def _restart_cleanup_command(m: dict, job_dir: str | None = None) -> str:
     """Return safe wavefunction-history cleanup for one VASP restart.
 
@@ -2857,6 +2920,7 @@ def continue_from_contcar(client, profile, job_dir: str,
             f'{contract.restart_note}')
     assert_profile_binding(profile, job_dir, '续算', manifest=m)
     source_job_id = _require_source_scheduler_job_id(m, '续算')
+    authorized_incar_sha256 = _current_incar_authority(m, source_job_id)
     intent = {
         'restart_from_contcar': True,
         'incar_policy': 'frozen',
@@ -2869,6 +2933,14 @@ def continue_from_contcar(client, profile, job_dir: str,
         intent_sha256=intent_sha256)
     if replay is not None:
         return replay
+    local_incar = os.path.join(job_dir, 'INCAR')
+    if not os.path.isfile(local_incar):
+        raise ValueError('本地作业目录缺 INCAR，无法证明冻结输入，不能续算')
+    incar_source_sha256 = manifest_mod.sha256_file(local_incar)
+    if incar_source_sha256 != authorized_incar_sha256:
+        raise ValueError(
+            '本地 INCAR 已偏离上一调度器代次的权威摘要；'
+            '普通续算不能建立新方法基线，请使用受控改参流程或重新准备')
     if _is_neb(m):
         raise ValueError(
             'NEB 不能使用通用 CONTCAR 续算：NEB 根目录没有单一 CONTCAR，'
@@ -2909,10 +2981,6 @@ def continue_from_contcar(client, profile, job_dir: str,
     # 续算沉降基线:重投前记下上一轮 OUTCAR 的 mtime(此刻新作业尚未启动,仍是旧文件)
     _o0, _z0, _base_outcar_mtime = _stat_outcar_full(client, remote)
 
-    local_incar = os.path.join(job_dir, 'INCAR')
-    if not os.path.isfile(local_incar):
-        raise ValueError('本地作业目录缺 INCAR，无法证明冻结输入，不能续算')
-    incar_source_sha256 = manifest_mod.sha256_file(local_incar)
     request = {
         'schema': 'vcstudio.continuation-request/v1',
         'manifest_job_id': str(m.get('job_id') or ''),
@@ -2926,6 +2994,7 @@ def continue_from_contcar(client, profile, job_dir: str,
         'contcar_source_sha256': hashlib.sha256(
             contcar.encode('utf-8')).hexdigest(),
         'incar_source_sha256': incar_source_sha256,
+        'authorized_incar_sha256': authorized_incar_sha256,
     }
     request_sha256 = _job_action_request_sha256(request)
 
@@ -3014,11 +3083,16 @@ def continue_from_contcar(client, profile, job_dir: str,
         'operation_transaction_id': record['transaction_id'],
         'operation_request_sha256': request_sha256,
         'operation_intent_sha256': intent_sha256,
+        'incar_sha256': authorized_incar_sha256,
     }
     if manual_round_override:
         attempt['round_limit_override'] = 'manual-explicit'
     if operation_key:
         attempt['idempotency_key'] = operation_key
+    _set_incar_authority(
+        m, scheduler_job_id=str(job_id),
+        incar_sha256=authorized_incar_sha256,
+        transaction_id=record['transaction_id'])
     m.setdefault('attempts', []).append(attempt)
     override_note = ',人工确认超出自动上限' if manual_round_override else ''
     manifest_mod.set_state(
@@ -3106,6 +3180,7 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
             'NEB 不能使用通用改参/CONTCAR 续算；请使用 NEB 专用 image 级重提流程')
     rounds = int((m.get('results') or {}).get('continue_rounds', 0))
     source_job_id = _require_source_scheduler_job_id(m, '改参重投')
+    authorized_incar_sha256 = _current_incar_authority(m, source_job_id)
     manual_round_override = max_rounds is None and rounds >= CONTINUE_MAX_ROUNDS
 
     # The request is path-free but binds every user decision and the exact source
@@ -3170,6 +3245,11 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
         raise ValueError('本地作业目录缺 INCAR')
     with open(local_incar, 'r', encoding='utf-8', errors='replace') as f:
         incar_text = f.read()
+    local_incar_sha256 = manifest_mod.sha256_file(local_incar)
+    if local_incar_sha256 != authorized_incar_sha256:
+        raise ValueError(
+            '本地 INCAR 已偏离上一调度器代次的权威摘要；'
+            '不能在未知方法基线上改参续算，请先恢复或重新准备')
     at = time.strftime('%Y-%m-%dT%H:%M:%S')
     block = '\n' + _TUNE_BANNER.format(round=rounds + 1, at=at) + '\n'
     block += ''.join(f'{key} = {value}\n'
@@ -3190,8 +3270,8 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
     # 续算沉降基线:重投前记下上一轮 OUTCAR 的 mtime(此刻新作业尚未启动,仍是旧文件)
     _o0, _z0, _base_outcar_mtime = _stat_outcar_full(client, remote)
 
-    request['incar_source_sha256'] = hashlib.sha256(
-        incar_text.encode('utf-8')).hexdigest()
+    request['incar_source_sha256'] = local_incar_sha256
+    request['authorized_incar_sha256'] = authorized_incar_sha256
     request['incar_target_sha256'] = incar_target_sha256
     request['poscar_target_sha256'] = poscar_target_sha256
     if promoted_contcar:
@@ -3292,11 +3372,16 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
         'operation_transaction_id': record['transaction_id'],
         'operation_request_sha256': request_sha256,
         'operation_intent_sha256': intent_sha256,
+        'incar_sha256': incar_target_sha256,
     }
     if manual_round_override:
         attempt['round_limit_override'] = 'manual-explicit'
     if operation_key:
         attempt['idempotency_key'] = operation_key
+    _set_incar_authority(
+        m, scheduler_job_id=str(job_id),
+        incar_sha256=incar_target_sha256,
+        transaction_id=record['transaction_id'])
     m.setdefault('attempts', []).append(attempt)
     override_note = ',人工确认超出自动上限' if manual_round_override else ''
     manifest_mod.set_state(
