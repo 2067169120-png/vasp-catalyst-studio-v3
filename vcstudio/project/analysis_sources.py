@@ -483,8 +483,18 @@ def verify_neb_endpoint_record(
     ])
     source_snapshot.assert_manifest_matches(source_target.get("manifest") or {})
     source_manifest = source_snapshot.manifest()
-    if str(source_manifest.get("state") or "").upper() != "DONE":
-        issues.append(f"{role} endpoint ledger source is not DONE")
+    from vcstudio.project.energy_gate import validate_done_completion_evidence
+    try:
+        validate_done_completion_evidence(
+            source_manifest, f"{role} endpoint ledger source",
+            outcar_text=source_snapshot.text("OUTCAR"),
+            vasprun_text=source_snapshot.text("vasprun.xml"),
+            require_current_completion=True,
+            require_explicit_diagnosis=True,
+            reject_explicit_unclean=True,
+        )
+    except ValueError as exc:
+        issues.append(str(exc))
 
     declared_files = record.get("files") or []
     if not isinstance(declared_files, (list, tuple)) or not declared_files:

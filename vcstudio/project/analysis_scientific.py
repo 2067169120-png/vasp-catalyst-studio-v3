@@ -24,7 +24,7 @@ from vcstudio import __version__
 from vcstudio.generate.incar_builder import parse_incar
 from vcstudio.generate.methods_text import parse_kpoints_scheme
 from vcstudio.generate.poscar import parse_poscar_species
-from vcstudio.generate.slab_builder import count_layers, vacuum_thickness
+from vcstudio.generate.slab_builder import LAYER_TOL, count_layers, vacuum_thickness
 from vcstudio.generate.structure_view import parse_positions
 from vcstudio.project.analysis_registry import AnalysisSpec, get_analysis
 from vcstudio.project.analysis_sources import (
@@ -34,8 +34,12 @@ from vcstudio.project.analysis_sources import (
     value_provenance,
     verify_neb_endpoint_record,
 )
-from vcstudio.project.energy_gate import validate_done_energy_evidence
+from vcstudio.project.energy_gate import (
+    validate_done_completion_evidence,
+    validate_done_energy_evidence,
+)
 from vcstudio.project.neb import parse_final_neb_image_event
+from vcstudio.shared.vasp_identity import canonical_kpoints_effective_text
 
 
 VIEW_SCHEMA = "vcstudio.analysis-view/v1"
@@ -310,11 +314,26 @@ def _neb_path(
         for name in ("POSCAR", "CONTCAR", "OSZICAR", "OUTCAR")
     ]
     snapshot, manifest = _capture(target, [
-        "INCAR", "KPOINTS", "POTCAR", "POSCAR", "CONTCAR", *evidence_names,
+        "INCAR", "KPOINTS", "POTCAR", "POSCAR", "CONTCAR",
+        "OUTCAR", "vasprun.xml", *evidence_names,
     ])
     source = snapshot.identity()
     issues: list[str] = []
     warnings: list[str] = []
+    completion_issues = []
+    try:
+        _manifest, _completion_source, _completion_notes = (
+            validate_done_completion_evidence(
+                manifest, source["source_id"],
+                outcar_text=snapshot.text("OUTCAR"),
+                vasprun_text=snapshot.text("vasprun.xml"),
+                require_current_completion=True,
+                require_explicit_diagnosis=True,
+                reject_explicit_unclean=True,
+            ))
+    except ValueError as exc:
+        completion_issues.append(str(exc))
+        issues.append(str(exc))
     if len(frames) < 3:
         issues.append("NEB requires at least three ordered image directories")
     coordinates, coordinate_reason = (
@@ -458,8 +477,6 @@ def _neb_path(
             reason="initial or image energy is unavailable" if relative is None else "",
         )
 
-    if manifest.get("state") != "DONE":
-        issues.append("NEB manifest state is not DONE")
     if any(value is None for value in energies):
         issues.append("one or more NEB image energies are unavailable")
     if any(status != "converged" for status in electronic_statuses[1:-1]):
@@ -526,6 +543,11 @@ def _neb_path(
         "source": source,
         "parser": parser,
         "method": method,
+        "completion_evidence": {
+            "status": "verified" if not completion_issues else "unavailable",
+            "file_hashes": snapshot.files(["job.yaml", "OUTCAR", "vasprun.xml"]),
+            "issues": completion_issues,
+        },
         "endpoint_evidence": endpoint_evidence,
         "status": "available" if points else "missing_prerequisite",
         "available": bool(points),
@@ -697,6 +719,218 @@ def _coordinate_matches(kind: str, declared: float, actual: float) -> bool:
     return math.isclose(declared, actual, rel_tol=1e-9, abs_tol=1e-6)
 
 
+def _rounded_geometry(value: float) -> float:
+    rounded = round(float(value), 8)
+    return 0.0 if rounded == 0 else rounded
+
+
+def _poscar_selective_flags(poscar_text: str, natoms: int) -> list[list[str]]:
+    lines = str(poscar_text or "").splitlines()
+    if len(lines) < 8:
+        raise ValueError("POSCAR coordinate header is incomplete")
+    index = 7
+    selective = lines[index].strip()[:1].lower() == "s"
+    if selective:
+        index += 1
+    index += 1
+    if index + natoms > len(lines):
+        raise ValueError("POSCAR coordinate rows are incomplete")
+    flags = []
+    for offset in range(natoms):
+        tokens = lines[index + offset].split()
+        if len(tokens) < 3:
+            raise ValueError("POSCAR coordinate row is incomplete")
+        if selective:
+            if len(tokens) < 6:
+                raise ValueError("POSCAR selective-dynamics flags are incomplete")
+            flags.append([str(token).upper() for token in tokens[3:6]])
+        else:
+            flags.append(["T", "T", "T"])
+    return flags
+
+
+def _poscar_geometry(poscar_text: str) -> dict[str, Any]:
+    parsed = parse_positions(poscar_text)
+    elements = list(parsed.get("elements") or [])
+    coordinates = list(parsed.get("coords") or [])
+    cell = list(parsed.get("cell") or [])
+    if not elements or len(elements) != len(coordinates) or len(cell) != 3:
+        raise ValueError("POSCAR structure evidence is incomplete")
+    inverse = _matrix_inverse(cell)
+    if inverse is None:
+        raise ValueError("POSCAR cell is singular")
+    c_length = math.sqrt(sum(float(value) ** 2 for value in cell[2]))
+    if not math.isfinite(c_length) or c_length <= 0:
+        raise ValueError("POSCAR c vector is unavailable")
+    c_direction = [float(value) / c_length for value in cell[2]]
+    flags = _poscar_selective_flags(poscar_text, len(elements))
+    fractional = [_row_vector(coordinate, inverse) for coordinate in coordinates]
+    return {
+        "elements": elements,
+        "coordinates": coordinates,
+        "fractional": fractional,
+        "flags": flags,
+        "cell": cell,
+        "c_direction": c_direction,
+    }
+
+
+def _vacuum_normalized_structure(poscar_text: str) -> dict[str, Any]:
+    geometry = _poscar_geometry(poscar_text)
+    cell = geometry["cell"]
+    c_direction = geometry["c_direction"]
+    if math.sqrt(float(cell[2][0]) ** 2 + float(cell[2][1]) ** 2) > (
+            0.05 * math.sqrt(sum(float(value) ** 2 for value in cell[2]))):
+        raise ValueError("vacuum normalization requires a slab c vector along z")
+    projections = [
+        sum(float(coordinate[index]) * c_direction[index] for index in range(3))
+        for coordinate in geometry["coordinates"]
+    ]
+    origin = min(projections)
+    atoms = []
+    for element, coordinate, projection, flags in zip(
+            geometry["elements"], geometry["coordinates"], projections,
+            geometry["flags"]):
+        perpendicular = [
+            float(coordinate[index]) - projection * c_direction[index]
+            for index in range(3)
+        ]
+        atoms.append({
+            "element": element,
+            "perpendicular_a": [_rounded_geometry(value) for value in perpendicular],
+            "relative_c_a": _rounded_geometry(projection - origin),
+            "selective": flags,
+        })
+    return {
+        "cell_ab_a": [
+            [_rounded_geometry(value) for value in vector]
+            for vector in cell[:2]
+        ],
+        "c_direction": [_rounded_geometry(value) for value in c_direction],
+        "atoms": atoms,
+    }
+
+
+def _canonical_layer_motif(
+    indexes: Sequence[int], geometry: Mapping[str, Any],
+) -> list[list[Any]]:
+    fractional = geometry["fractional"]
+    candidates = []
+    for anchor in indexes:
+        anchor_x = float(fractional[anchor][0])
+        anchor_y = float(fractional[anchor][1])
+        records = sorted([
+            [
+                geometry["elements"][index],
+                _rounded_geometry((float(fractional[index][0]) - anchor_x) % 1.0),
+                _rounded_geometry((float(fractional[index][1]) - anchor_y) % 1.0),
+                geometry["flags"][index],
+            ]
+            for index in indexes
+        ], key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True))
+        candidates.append(records)
+    return min(
+        candidates,
+        key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True),
+    )
+
+
+def _slab_thickness_normalized_structure(poscar_text: str) -> dict[str, Any]:
+    geometry = _poscar_geometry(poscar_text)
+    cell = geometry["cell"]
+    c_direction = geometry["c_direction"]
+    c_length = math.sqrt(sum(float(value) ** 2 for value in cell[2]))
+    if math.sqrt(float(cell[2][0]) ** 2 + float(cell[2][1]) ** 2) > 0.05 * c_length:
+        raise ValueError("slab-thickness normalization requires a slab c vector along z")
+    projections = [
+        sum(float(coordinate[index]) * c_direction[index] for index in range(3))
+        for coordinate in geometry["coordinates"]
+    ]
+    order = sorted(range(len(projections)), key=projections.__getitem__)
+    layers: list[list[int]] = []
+    centers: list[float] = []
+    for index in order:
+        if not layers or projections[index] - projections[layers[-1][-1]] > LAYER_TOL:
+            layers.append([index])
+        else:
+            layers[-1].append(index)
+    for indexes in layers:
+        centers.append(sum(projections[index] for index in indexes) / len(indexes))
+    motifs = {
+        _canonical_hash(_canonical_layer_motif(indexes, geometry))
+        for indexes in layers
+    }
+    spacings = {
+        _rounded_geometry(right - left)
+        for left, right in zip(centers, centers[1:])
+    }
+    return {
+        "cell_ab_a": [
+            [_rounded_geometry(value) for value in vector]
+            for vector in cell[:2]
+        ],
+        "c_direction": [_rounded_geometry(value) for value in c_direction],
+        "vacuum_a": _rounded_geometry(vacuum_thickness(poscar_text)),
+        "unique_layer_motif_sha256": sorted(motifs),
+        "unique_interlayer_spacing_a": sorted(spacings),
+    }
+
+
+def _scan_frozen_input_invariant(
+    snapshot: SourceSnapshot, kind: str,
+) -> tuple[str, list[str], list[dict[str, Any]]]:
+    names = ["INCAR", "KPOINTS", "POTCAR", "POSCAR"]
+    files = snapshot.files(names)
+    present = {str(item.get("name") or "") for item in files}
+    issues = [f"current {name} evidence is unavailable" for name in names
+              if name not in present]
+    if issues:
+        return "", issues, files
+    incar_text = snapshot.text("INCAR")
+    kpoints_text = snapshot.text("KPOINTS")
+    if not incar_text.strip() or not kpoints_text.strip():
+        return "", ["current INCAR/KPOINTS evidence is empty"], files
+    incar = dict(parse_incar(incar_text))
+    if kind == "encut":
+        incar.pop("ENCUT", None)
+    record: dict[str, Any] = {
+        "kind": kind,
+        "incar_except_target": incar,
+        "potcar_sha256": str(
+            (snapshot.file("POTCAR") or {}).get("sha256") or ""),
+    }
+    if kind == "kmesh":
+        kpoints = parse_kpoints_scheme(kpoints_text) or {}
+        shift = kpoints.get("shift")
+        if (kpoints.get("scheme") not in {"Gamma", "Monkhorst-Pack"}
+                or not isinstance(shift, list) or len(shift) != 3
+                or any(_finite(value) is None for value in shift)):
+            return "", ["current KPOINTS center/shift evidence is unavailable"], files
+        record["kpoints_except_grid"] = {
+            "scheme": kpoints["scheme"],
+            "shift": [_rounded_geometry(value) for value in shift],
+        }
+    else:
+        effective_kpoints = canonical_kpoints_effective_text(kpoints_text)
+        if not effective_kpoints:
+            return "", ["current effective KPOINTS evidence is unavailable"], files
+        record["kpoints_effective"] = effective_kpoints
+    poscar_file = snapshot.file("POSCAR") or {}
+    try:
+        if kind in {"encut", "kmesh"}:
+            record["poscar_sha256"] = str(poscar_file.get("sha256") or "")
+        elif kind == "vacuum":
+            record["poscar_except_vacuum"] = _vacuum_normalized_structure(
+                snapshot.text("POSCAR"))
+        else:
+            record["poscar_except_layer_count"] = _slab_thickness_normalized_structure(
+                snapshot.text("POSCAR"))
+        invariant = _canonical_hash(record)
+    except (IndexError, TypeError, ValueError, ZeroDivisionError) as exc:
+        return "", [f"current frozen-input invariant is unavailable: {exc}"], files
+    return invariant, [], files
+
+
 def _method_invariant(
     method: Mapping[str, Any], kind: str, *, coordinate_verified: bool,
 ) -> str:
@@ -811,6 +1045,7 @@ def _convergence_series(
     raw = []
     issues = []
     method_invariants = set()
+    frozen_input_invariants = set()
     snapshots = []
     for target in targets:
         snapshot, manifest = _capture(target, [
@@ -822,6 +1057,12 @@ def _convergence_series(
         declared_x = _finite(inputs.get("series_value"))
         label = str(inputs.get("series_label") or "")
         source = snapshot.identity()
+        frozen_input_invariant, frozen_issues, frozen_files = (
+            _scan_frozen_input_invariant(snapshot, kind))
+        issues.extend(
+            f'{source["source_id"]}: {issue}' for issue in frozen_issues)
+        if frozen_input_invariant:
+            frozen_input_invariants.add(frozen_input_invariant)
         x, coordinate_files, coordinate_issue = _series_coordinate(snapshot, kind)
         coordinate_verified = bool(
             declared_x is not None and x is not None
@@ -855,6 +1096,7 @@ def _convergence_series(
                 outcar_text=snapshot.text("OUTCAR"),
                 vasprun_text=snapshot.text("vasprun.xml"),
                 require_oszicar=True, require_current_completion=True,
+                require_outcar_ionic_event=True,
             )
         except ValueError as exc:
             energy = None
@@ -865,6 +1107,8 @@ def _convergence_series(
             "declared_x": declared_x,
             "coordinate_verified": coordinate_verified,
             "coordinate_files": coordinate_files,
+            "frozen_input_invariant": frozen_input_invariant,
+            "frozen_input_files": frozen_files,
             "label": label or (str(x) if x is not None else "—"),
             "source": source,
             "method": method,
@@ -883,6 +1127,13 @@ def _convergence_series(
         issues.append("duplicate series coordinates are present")
     if len(method_invariants) > 1:
         issues.append("non-target method settings differ across convergence points")
+    if len(frozen_input_invariants) > 1:
+        issues.append(
+            "non-target frozen inputs/structure differ across convergence points")
+    if raw and (not all(item["frozen_input_invariant"] for item in raw)
+                or len(frozen_input_invariants) != 1):
+        issues.append(
+            "every convergence point must share one verified frozen-input invariant")
     if raw and not all(item["method_verified"] for item in raw):
         issues.append("every convergence point must have a complete verified method invariant")
     reference = (
@@ -917,6 +1168,12 @@ def _convergence_series(
             "method": item["method"],
             "method_verified": item["method_verified"],
             "coordinate_verified": item["coordinate_verified"],
+            "frozen_input_evidence": {
+                "status": ("verified" if item["frozen_input_invariant"]
+                           else "unavailable"),
+                "invariant_sha256": item["frozen_input_invariant"],
+                "file_hashes": copy.deepcopy(item["frozen_input_files"]),
+            },
             "parameter": _quantity(
                 key="parameter", label="Scan parameter", value=item["x"],
                 unit=_SERIES_UNITS[kind], precision=spec.precision,
@@ -980,6 +1237,8 @@ def _convergence_series(
     primary_index = None
     series_evidence_ready = bool(
         not duplicates and len(method_invariants) == 1
+        and len(frozen_input_invariants) == 1
+        and all(item["frozen_input_invariant"] for item in raw)
         and all(item["method_verified"] for item in raw)
         and all(point["parameter"]["value"] is not None
                 and point["absolute_energy"]["value"] is not None
@@ -1166,7 +1425,8 @@ def build_convergence_analysis_view(
     )
 
 
-_XDATCAR_CONFIG_RE = re.compile(r"^\s*(?:Direct|Cartesian)\s+configuration\s*=", re.I)
+_XDATCAR_CONFIG_RE = re.compile(
+    r"^\s*(?:Direct|Cartesian)\s+configuration\s*=\s*(\d+)\s*$", re.I)
 
 
 def _cell_volume(cell: Sequence[Sequence[float]]) -> float:
@@ -1187,31 +1447,45 @@ def _parse_xdatcar(text: str) -> dict[str, Any]:
         scale = float(lines[1].split()[0])
         cell = [[float(value) * scale for value in lines[index].split()[:3]]
                 for index in range(2, 5)]
+        symbols = lines[5].split()
         counts = [int(value) for value in lines[6].split()]
     except (IndexError, TypeError, ValueError):
-        return {"frames": [], "natoms": None, "cell": None,
+        return {"frames": [], "frame_steps": [], "elements": [],
+                "natoms": None, "cell": None,
                 "error": "XDATCAR cell or atom counts are invalid"}
+    if not symbols or len(symbols) != len(counts):
+        return {"frames": [], "frame_steps": [], "elements": [],
+                "natoms": None, "cell": None,
+                "error": "XDATCAR elements or atom counts are invalid"}
     natoms = sum(counts)
     if natoms <= 0 or _matrix_inverse(cell) is None:
-        return {"frames": [], "natoms": None, "cell": None,
+        return {"frames": [], "frame_steps": [], "elements": [],
+                "natoms": None, "cell": None,
                 "error": "XDATCAR atom count or cell is invalid"}
+    elements = [symbol for symbol, count in zip(symbols, counts)
+                for _index in range(count)]
     frames = []
+    frame_steps = []
     index = 7
     while index < len(lines):
-        if not _XDATCAR_CONFIG_RE.match(lines[index]):
+        config_match = _XDATCAR_CONFIG_RE.match(lines[index])
+        if not config_match:
             index += 1
             continue
         mode = lines[index].strip().lower()
+        frame_step = int(config_match.group(1))
         index += 1
         coords = []
         for _atom in range(natoms):
             if index >= len(lines):
-                return {"frames": frames, "natoms": natoms, "cell": cell,
+                return {"frames": frames, "frame_steps": frame_steps,
+                        "elements": elements, "natoms": natoms, "cell": cell,
                         "error": "XDATCAR final frame is truncated"}
             try:
                 coords.append([float(value) for value in lines[index].split()[:3]])
             except (TypeError, ValueError):
-                return {"frames": frames, "natoms": natoms, "cell": cell,
+                return {"frames": frames, "frame_steps": frame_steps,
+                        "elements": elements, "natoms": natoms, "cell": cell,
                         "error": "XDATCAR coordinate is invalid"}
             index += 1
         if mode.startswith("cartesian"):
@@ -1221,7 +1495,11 @@ def _parse_xdatcar(text: str) -> dict[str, Any]:
                 for coord in coords
             ]
         frames.append(coords)
-    return {"frames": frames, "natoms": natoms, "cell": cell, "error": ""}
+        frame_steps.append(frame_step)
+    return {
+        "frames": frames, "frame_steps": frame_steps, "elements": elements,
+        "natoms": natoms, "cell": cell, "error": "",
+    }
 
 
 def _trajectory_metrics(text: str) -> dict[str, Any]:
@@ -1231,10 +1509,19 @@ def _trajectory_metrics(text: str) -> dict[str, Any]:
     cell = parsed["cell"]
     if not frames or not natoms or not cell:
         return {
-            "frame_count": len(frames), "natoms": natoms,
+            "frame_count": len(frames), "frame_steps": parsed.get("frame_steps") or [],
+            "elements": parsed.get("elements") or [], "cell": cell, "natoms": natoms,
             "max_step_displacement_a": None, "final_rmsd_a": None,
             "max_rmsd_a": None, "cell_volume_a3": None,
             "error": parsed["error"] or "XDATCAR contains no complete trajectory frames",
+        }
+    if len(frames) < 2:
+        return {
+            "frame_count": len(frames), "frame_steps": parsed["frame_steps"],
+            "elements": parsed["elements"], "cell": cell, "natoms": natoms,
+            "max_step_displacement_a": None, "final_rmsd_a": None,
+            "max_rmsd_a": None, "cell_volume_a3": _cell_volume(cell),
+            "error": "XDATCAR requires at least two bound frames for structure metrics",
         }
     unwrapped = [[list(atom) for atom in frames[0]]]
     max_step = 0.0
@@ -1266,7 +1553,8 @@ def _trajectory_metrics(text: str) -> dict[str, Any]:
         )
         rmsds.append(math.sqrt(squared / natoms))
     return {
-        "frame_count": len(frames), "natoms": natoms,
+        "frame_count": len(frames), "frame_steps": parsed["frame_steps"],
+        "elements": parsed["elements"], "cell": cell, "natoms": natoms,
         "max_step_displacement_a": max_step if len(frames) > 1 else 0.0,
         "final_rmsd_a": rmsds[-1], "max_rmsd_a": max(rmsds),
         "cell_volume_a3": _cell_volume(cell), "error": parsed["error"],
@@ -1330,6 +1618,12 @@ def _aimd_trajectory(
         int(declared_steps) if declared_steps is not None
         and declared_steps == int(declared_steps) else None
     )
+    raw_nblock = incar.get("NBLOCK", 1)
+    finite_nblock = _finite(raw_nblock)
+    nblock = (
+        int(finite_nblock) if finite_nblock is not None
+        and finite_nblock == int(finite_nblock) and finite_nblock > 0 else None
+    )
     declared_temperature = _finite(incar.get("TEBEG"))
     issues = []
     warnings = []
@@ -1337,6 +1631,8 @@ def _aimd_trajectory(
         issues.append("AIMD requires an explicit positive POTIM in INCAR")
     if declared_steps_int is None or declared_steps_int <= 0:
         issues.append("AIMD requires an explicit positive NSW in INCAR")
+    if nblock is None:
+        issues.append("AIMD requires a positive integer NBLOCK (default 1)")
     for key, actual in (
         ("potim_fs", potim), ("steps", declared_steps),
         ("temp_k", declared_temperature),
@@ -1391,15 +1687,42 @@ def _aimd_trajectory(
         [float(item["step"]) * potim / 1000.0 for item in raw_steps], energies,
     ) if aggregate_ready and potim is not None and potim > 0 else None
     structure = _trajectory_metrics(snapshot.text("XDATCAR"))
+    structure_issues = []
     if structure["error"]:
-        warnings.append(str(structure["error"]))
+        structure_issues.append(str(structure["error"]))
+    expected_frame_steps = (
+        [int(item["step"]) for item in raw_steps if item["step"] % nblock == 0]
+        if valid_steps and nblock is not None else []
+    )
+    if list(structure.get("frame_steps") or []) != expected_frame_steps:
+        structure_issues.append(
+            "XDATCAR configuration sequence does not match OSZICAR steps selected by "
+            f"NBLOCK={nblock if nblock is not None else 'unavailable'}")
+    try:
+        poscar = parse_positions(snapshot.text("POSCAR"))
+    except (IndexError, TypeError, ValueError) as exc:
+        structure_issues.append(f"POSCAR structure evidence is unavailable: {exc}")
+        poscar = {"elements": [], "coords": [], "cell": []}
+    if (structure.get("natoms") != len(poscar.get("elements") or [])
+            or list(structure.get("elements") or [])
+            != list(poscar.get("elements") or [])):
+        structure_issues.append(
+            "XDATCAR atom count/elements do not match the frozen POSCAR")
+    if (not structure.get("cell") or not poscar.get("cell")
+            or not _same_cell(structure["cell"], poscar["cell"])):
+        structure_issues.append("XDATCAR cell does not match the frozen POSCAR")
     if segmented:
+        structure_issues.append(
+            "XDATCAR frames cannot be mapped across restart/gap segments")
+    if state_done and not coverage_ok:
+        structure_issues.append(
+            "DONE OSZICAR/NSW coverage is incomplete, so XDATCAR cannot be qualified")
+    structure_ready = not structure_issues
+    if not structure_ready:
         structure["max_step_displacement_a"] = None
         structure["final_rmsd_a"] = None
         structure["max_rmsd_a"] = None
-        warnings.append(
-            "XDATCAR restart boundaries are not explicit; cross-boundary displacement "
-            "and RMSD metrics are unavailable")
+    issues.extend(structure_issues)
     method = _method_evidence(method_evidence, target, snapshot)
     if not _verified_method(method):
         issues.append("AIMD method identity is not verified")
@@ -1508,7 +1831,8 @@ def _aimd_trajectory(
          "last minus first sample of one strictly increasing segment", osz_files),
         ("energy_drift_slope", "Linear total-energy drift", slope_ev_ps, "eV/ps",
          f"least-squares slope over one {len(energies)}-sample segment", osz_files),
-        ("trajectory_frames", "Structure frames", structure["frame_count"], "frames",
+        ("trajectory_frames", "Structure frames",
+         structure["frame_count"] if structure_ready else None, "frames",
          f'XDATCAR; {structure["natoms"] or "unavailable"} atoms', xdat_files),
         ("max_step_displacement", "Maximum per-step atom displacement",
          structure["max_step_displacement_a"], "Å",
@@ -1529,6 +1853,9 @@ def _aimd_trajectory(
                 if value is None and not aggregate_ready and key in {
                     "sampling_length", "energy_drift_total", "energy_drift_slope",
                     "temperature_mean", "temperature_std",
+                } else "XDATCAR/POSCAR/NBLOCK binding is unavailable"
+                if value is None and key in {
+                    "trajectory_frames", "max_step_displacement", "final_rmsd", "max_rmsd",
                 } else "required evidence is unavailable" if value is None else ""
             ),
         )
@@ -1544,8 +1871,13 @@ def _aimd_trajectory(
         "segments": segment_rows,
         "metrics": metrics,
         "structure_diagnostics": {
-            "status": "available" if structure["frame_count"] else "unavailable",
+            "status": "available" if structure_ready else "unavailable",
+            "nblock": nblock,
+            "expected_frame_steps": expected_frame_steps,
+            "observed_frame_steps": list(structure.get("frame_steps") or []),
+            "observed_frame_count": structure["frame_count"],
             "parser_error": structure["error"],
+            "issues": list(dict.fromkeys(structure_issues)),
         },
         "issues": list(dict.fromkeys(issues)),
         "warnings": list(dict.fromkeys(warnings)),

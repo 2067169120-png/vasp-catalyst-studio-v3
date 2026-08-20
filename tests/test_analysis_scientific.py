@@ -53,6 +53,7 @@ def _outcar(energy: float, force: float) -> str:
         " -------------------------------------------------------------------\n"
         f" 0.0 0.0 0.0 {force:.8f} 0.0 0.0\n"
         " -------------------------------------------------------------------\n"
+        " General timing and accounting informations for this job:\n"
     )
 
 
@@ -91,6 +92,10 @@ def _neb_target(tmp_path: Path) -> dict:
         "EDIFFG = -0.05\nLCLIMB = .TRUE.\nIMAGES = 1\n",
         encoding="utf-8",
     )
+    (root / "OUTCAR").write_text(
+        " General timing and accounting informations for this job:\n",
+        encoding="utf-8",
+    )
     energies = (-10.0, -9.5, -10.2)
     endpoint_targets = []
     endpoint_records = {}
@@ -108,7 +113,13 @@ def _neb_target(tmp_path: Path) -> dict:
         source_root.mkdir()
         for name in ("POSCAR", "OSZICAR", "OUTCAR"):
             (source_root / name).write_bytes((root / frame / name).read_bytes())
-        source_manifest = {"state": "DONE", "task_type": "relax", "inputs": {}}
+        source_manifest = {
+            "state": "DONE", "task_type": "relax", "inputs": {},
+            "results": {"diagnosis": {
+                "failure_class": "CONVERGED", "exit_code": 0,
+                "clean_exit": True,
+            }},
+        }
         _write_manifest(source_root, source_manifest)
         source_id = f"{role}-endpoint-source"
         endpoint_targets.append(
@@ -126,6 +137,10 @@ def _neb_target(tmp_path: Path) -> dict:
     manifest = {
         "state": "DONE", "task_type": "neb",
         "inputs": {"n_images": 1, "neb_endpoints": endpoint_records},
+        "results": {"diagnosis": {
+            "failure_class": "CONVERGED", "exit_code": 0,
+            "clean_exit": True,
+        }},
     }
     _write_manifest(root, manifest)
     target = _target(root, "neb-source", "neb", manifest)
@@ -204,6 +219,70 @@ def test_neb_rejects_oszicar_energy_from_a_different_final_ionic_event(tmp_path)
     assert any("energy disagree" in issue for issue in path["barriers"]["blocking"])
 
 
+def test_neb_main_and_endpoint_require_consistent_done_diagnosis(tmp_path):
+    spec = normalize_analysis_request(
+        {"analysis_id": "neb-path"}, project_id=PROJECT)
+    main_target = _neb_target(tmp_path / "main")
+    main_target["manifest"]["results"]["diagnosis"] = {
+        "failure_class": "NEB_IMAGE_MISSING", "exit_code": 137,
+        "clean_exit": False,
+    }
+    _write_manifest(Path(main_target["path"]), main_target["manifest"])
+
+    main_view = build_neb_analysis_view(
+        spec, _neb_targets(main_target), method_evidence=_method)
+
+    main_path = main_view["paths"][0]
+    assert main_path["completion_evidence"]["status"] == "unavailable"
+    assert main_path["barriers"]["status"] == "unavailable"
+    assert any("CONVERGED" in issue for issue in main_path["barriers"]["blocking"])
+
+    endpoint_target = _neb_target(tmp_path / "endpoint")
+    endpoint = endpoint_target["_endpoint_targets"][0]
+    endpoint["manifest"]["results"]["diagnosis"] = {
+        "failure_class": "NEB_IMAGE_MISSING", "exit_code": 137,
+        "clean_exit": False,
+    }
+    _write_manifest(Path(endpoint["path"]), endpoint["manifest"])
+
+    endpoint_view = build_neb_analysis_view(
+        spec, _neb_targets(endpoint_target), method_evidence=_method)
+
+    endpoint_path = endpoint_view["paths"][0]
+    assert endpoint_path["endpoint_evidence"]["start"]["status"] == "unavailable"
+    assert endpoint_path["barriers"]["status"] == "unavailable"
+    assert any("CONVERGED" in issue
+               for issue in endpoint_path["endpoint_evidence"]["start"]["issues"])
+
+
+@pytest.mark.parametrize(("diagnosis", "keep_footer", "message"), [
+    ({"failure_class": "CONVERGED", "exit_code": 137, "clean_exit": True},
+     True, "退出码"),
+    ({"failure_class": "CONVERGED", "exit_code": 0, "clean_exit": False},
+     True, "clean_exit=false"),
+    ({"failure_class": "CONVERGED", "exit_code": 0, "clean_exit": True},
+     False, "OUTCAR timing"),
+])
+def test_neb_main_completion_gate_fails_closed(
+        tmp_path, diagnosis, keep_footer, message):
+    target = _neb_target(tmp_path)
+    target["manifest"]["results"]["diagnosis"] = diagnosis
+    root = Path(target["path"])
+    _write_manifest(root, target["manifest"])
+    if not keep_footer:
+        (root / "OUTCAR").write_text("incomplete run\n", encoding="utf-8")
+    spec = normalize_analysis_request(
+        {"analysis_id": "neb-path"}, project_id=PROJECT)
+
+    view = build_neb_analysis_view(
+        spec, _neb_targets(target), method_evidence=_method)
+
+    path = view["paths"][0]
+    assert path["completion_evidence"]["status"] == "unavailable"
+    assert path["barriers"]["status"] == "unavailable"
+    assert any(message in issue for issue in path["barriers"]["blocking"])
+
+
 def _convergence_targets(tmp_path: Path) -> list[dict]:
     targets = []
     for index, (encut, energy) in enumerate((
@@ -211,12 +290,13 @@ def _convergence_targets(tmp_path: Path) -> list[dict]:
         root = tmp_path / f"encut-{encut}"
         root.mkdir(parents=True)
         (root / "INCAR").write_text(f"ENCUT={encut}\n", encoding="utf-8")
+        (root / "KPOINTS").write_text(
+            "mesh\n0\nGamma\n3 3 1\n0 0 0\n", encoding="utf-8")
+        (root / "POTCAR").write_text(
+            "TITEL = PAW_PBE H\n", encoding="utf-8")
         (root / "POSCAR").write_text(_poscar(0.0), encoding="utf-8")
         (root / "OUTCAR").write_text(
-            " NIONS = 1 ions\n"
-            " General timing and accounting informations for this job:\n",
-            encoding="utf-8",
-        )
+            _convergence_outcar(energy), encoding="utf-8")
         (root / "OSZICAR").write_text(
             f" 1 F= {energy:.8f} E0= {energy:.8f} d E =0\n",
             encoding="utf-8",
@@ -243,6 +323,19 @@ def _convergence_targets(tmp_path: Path) -> list[dict]:
         target["method"] = {"status": "verified", "fingerprint": method}
         targets.append(target)
     return targets
+
+
+def _convergence_outcar(
+    *energies: float, clean: bool = True, nions: int = 1,
+) -> str:
+    lines = [f" NIONS = {nions} ions"]
+    lines.extend(
+        f" energy without entropy= {energy:.8f} energy(sigma->0) = {energy:.8f}"
+        for energy in energies
+    )
+    if clean:
+        lines.append(" General timing and accounting informations for this job:")
+    return "\n".join(lines) + "\n"
 
 
 def test_convergence_view_exposes_raw_points_platform_and_threshold_sensitivity(tmp_path):
@@ -333,10 +426,36 @@ def test_convergence_coordinate_must_match_current_input_bytes(tmp_path):
                for issue in series["issues"])
 
 
+def test_convergence_rejects_geometry_drift_between_otherwise_valid_points(tmp_path):
+    targets = _convergence_targets(tmp_path)
+    for target, coordinate in zip(targets, (0.0, 0.2, 0.4, 0.6)):
+        root = Path(target["path"])
+        (root / "POSCAR").write_text(_poscar(coordinate), encoding="utf-8")
+        target["manifest"]["inputs"]["sha256"]["POSCAR"] = _sha(root / "POSCAR")
+        _write_manifest(root, target["manifest"])
+    spec = normalize_analysis_request(
+        {"analysis_id": "convergence-scan"}, project_id=PROJECT)
+
+    view = build_convergence_analysis_view(
+        spec, targets, method_evidence=lambda target: target["method"])
+
+    series = view["series"][0]
+    assert all(point["absolute_energy"]["value"] is not None
+               for point in series["points"])
+    assert all(point["frozen_input_evidence"]["status"] == "verified"
+               for point in series["points"])
+    assert series["platform"]["status"] == "unavailable"
+    assert series["platform"]["recommendation"]["value"] is None
+    assert any("frozen inputs/structure differ" in issue
+               for issue in series["issues"])
+
+
 def test_convergence_requires_current_clean_completion_and_matching_energy(tmp_path):
     targets = _convergence_targets(tmp_path)
     root = Path(targets[1]["path"])
-    (root / "OUTCAR").write_text(" NIONS = 1 ions\n", encoding="utf-8")
+    energy = targets[1]["manifest"]["results"]["energy_e0_eV"]
+    (root / "OUTCAR").write_text(
+        _convergence_outcar(energy, clean=False), encoding="utf-8")
     spec = normalize_analysis_request(
         {"analysis_id": "convergence-scan"}, project_id=PROJECT)
 
@@ -349,9 +468,7 @@ def test_convergence_requires_current_clean_completion_and_matching_energy(tmp_p
     assert any("OUTCAR timing" in issue for issue in series["issues"])
 
     (root / "OUTCAR").write_text(
-        " NIONS = 1 ions\n"
-        " General timing and accounting informations for this job:\n",
-        encoding="utf-8",
+        _convergence_outcar(energy), encoding="utf-8",
     )
     targets[1]["manifest"]["results"]["diagnosis"]["exit_code"] = 7
     _write_manifest(root, targets[1]["manifest"])
@@ -367,6 +484,46 @@ def test_convergence_requires_current_clean_completion_and_matching_energy(tmp_p
         spec, targets, method_evidence=lambda target: target["method"])
     assert mismatch["series"][0]["points"][1]["absolute_energy"]["value"] is None
     assert any("不一致" in issue for issue in mismatch["series"][0]["issues"])
+
+
+def test_convergence_fake_plateau_rejects_foreign_outcar_energy_events(tmp_path):
+    targets = _convergence_targets(tmp_path)
+    first_energy = targets[0]["manifest"]["results"]["energy_e0_eV"]
+    first_root = Path(targets[0]["path"])
+    (first_root / "OSZICAR").write_text(
+        f" 2 F= {first_energy:.8f} E0= {first_energy:.8f} d E =0\n",
+        encoding="utf-8",
+    )
+
+    second_energy = targets[1]["manifest"]["results"]["energy_e0_eV"]
+    (Path(targets[1]["path"]) / "OUTCAR").write_text(
+        _convergence_outcar(-99.0, second_energy), encoding="utf-8")
+    third_energy = targets[2]["manifest"]["results"]["energy_e0_eV"]
+    (Path(targets[2]["path"]) / "OUTCAR").write_text(
+        _convergence_outcar(third_energy - 5.0), encoding="utf-8")
+    fourth_energy = targets[3]["manifest"]["results"]["energy_e0_eV"]
+    (Path(targets[3]["path"]) / "OUTCAR").write_text(
+        " NIONS = 1 ions\n"
+        " General timing and accounting informations for this job:\n"
+        f" energy(sigma->0) = {fourth_energy:.8f}\n",
+        encoding="utf-8",
+    )
+    spec = normalize_analysis_request(
+        {"analysis_id": "convergence-scan"}, project_id=PROJECT)
+
+    view = build_convergence_analysis_view(
+        spec, targets, method_evidence=lambda target: target["method"])
+
+    series = view["series"][0]
+    assert all(point["absolute_energy"]["value"] is None
+               for point in series["points"])
+    assert series["platform"]["status"] == "unavailable"
+    assert series["platform"]["recommendation"]["value"] is None
+    assert view["denominator"]["available_recommendations"] == 0
+    assert any("序列/终态不连续" in issue for issue in series["issues"])
+    assert any("事件计数不一致" in issue for issue in series["issues"])
+    assert any("最终离子事件能量不一致" in issue for issue in series["issues"])
+    assert any("页脚不在最终离子能量事件之后" in issue for issue in series["issues"])
 
 
 def test_convergence_fails_whole_projection_if_source_changes_mid_parse(tmp_path):
@@ -454,6 +611,86 @@ def test_aimd_view_is_diagnostic_and_never_promotes_short_trajectory(tmp_path):
     assert view["report_binding"]["final_allowed"] is False
     assert view["figure_data"]["aimd_diagnostic"]["steps"][0]["temperature"] == 300.0
     _assert_quantities_have_provenance(view)
+
+
+def test_aimd_done_rejects_incomplete_or_unbound_xdatcar(tmp_path):
+    root = tmp_path / "aimd-incomplete-xdatcar"
+    root.mkdir()
+    (root / "INCAR").write_text(
+        "IBRION=0\nNSW=3\nPOTIM=1.0\nTEBEG=300\n", encoding="utf-8")
+    (root / "POSCAR").write_text(_poscar(0.0), encoding="utf-8")
+    (root / "OSZICAR").write_text(
+        " 1 T= 300 E= -10.000 F= -10 E0= -10 EK= 0.1\n"
+        " 2 T= 301 E= -9.990 F= -10 E0= -10 EK= 0.1\n"
+        " 3 T= 302 E= -9.980 F= -10 E0= -10 EK= 0.1\n",
+        encoding="utf-8",
+    )
+    one_frame = "\n".join(_xdatcar().splitlines()[:9]) + "\n"
+    (root / "XDATCAR").write_text(one_frame, encoding="utf-8")
+    manifest = {
+        "state": "DONE", "task_type": "aimd",
+        "inputs": {"potim_fs": 1.0, "steps": 3, "temp_k": 300.0},
+    }
+    _write_manifest(root, manifest)
+    target = _target(root, "aimd-incomplete-xdatcar", "aimd", manifest)
+    spec = normalize_analysis_request(
+        {"analysis_id": "aimd-diagnostics"}, project_id=PROJECT)
+
+    view = build_aimd_analysis_view(spec, [target], method_evidence=_method)
+
+    trajectory = view["trajectories"][0]
+    assert trajectory["structure_diagnostics"]["status"] == "unavailable"
+    assert trajectory["structure_diagnostics"]["nblock"] == 1
+    assert trajectory["structure_diagnostics"]["observed_frame_count"] == 1
+    for key in ("trajectory_frames", "max_step_displacement", "final_rmsd", "max_rmsd"):
+        assert trajectory["metrics"][key]["value"] is None
+    assert any("configuration sequence" in issue for issue in trajectory["issues"])
+    assert any("at least two bound frames" in issue for issue in trajectory["issues"])
+
+    mismatched = _xdatcar().replace("\nH\n1\n", "\nHe\n1\n").replace(
+        "10 0 0", "9 0 0", 1)
+    (root / "XDATCAR").write_text(mismatched, encoding="utf-8")
+    rebound = build_aimd_analysis_view(spec, [target], method_evidence=_method)
+    rebound_trajectory = rebound["trajectories"][0]
+    assert rebound_trajectory["structure_diagnostics"]["status"] == "unavailable"
+    assert any("atom count/elements" in issue for issue in rebound_trajectory["issues"])
+    assert any("cell does not match" in issue for issue in rebound_trajectory["issues"])
+
+
+def test_aimd_xdatcar_sequence_honors_explicit_nblock(tmp_path):
+    root = tmp_path / "aimd-nblock"
+    root.mkdir()
+    (root / "INCAR").write_text(
+        "IBRION=0\nNSW=4\nNBLOCK=2\nPOTIM=1.0\nTEBEG=300\n", encoding="utf-8")
+    (root / "POSCAR").write_text(_poscar(0.0), encoding="utf-8")
+    (root / "OSZICAR").write_text("".join(
+        f" {step} T= 300 E= {-10 + step / 1000:.6f} F= -10 E0= -10 EK= 0.1\n"
+        for step in range(1, 5)
+    ), encoding="utf-8")
+    header = "\n".join(_xdatcar().splitlines()[:7])
+    (root / "XDATCAR").write_text(
+        header + "\n"
+        "Direct configuration=     2\n0.0000 0 0\n"
+        "Direct configuration=     4\n0.0200 0 0\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        "state": "DONE", "task_type": "aimd",
+        "inputs": {"potim_fs": 1.0, "steps": 4, "temp_k": 300.0},
+    }
+    _write_manifest(root, manifest)
+    target = _target(root, "aimd-nblock", "aimd", manifest)
+    spec = normalize_analysis_request(
+        {"analysis_id": "aimd-diagnostics"}, project_id=PROJECT)
+
+    view = build_aimd_analysis_view(spec, [target], method_evidence=_method)
+
+    trajectory = view["trajectories"][0]
+    assert trajectory["structure_diagnostics"]["status"] == "available"
+    assert trajectory["structure_diagnostics"]["expected_frame_steps"] == [2, 4]
+    assert trajectory["structure_diagnostics"]["observed_frame_steps"] == [2, 4]
+    assert trajectory["metrics"]["trajectory_frames"]["value"] == 2
+    assert trajectory["metrics"]["max_step_displacement"]["value"] == pytest.approx(0.2)
 
 
 def test_aimd_restart_is_segmented_without_cross_segment_duration_or_drift(tmp_path):

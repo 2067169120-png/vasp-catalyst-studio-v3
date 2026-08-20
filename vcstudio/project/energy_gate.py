@@ -8,6 +8,7 @@ evidence so old imported results are never silently presented as comparable.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 import json
 import hashlib
 import math
@@ -18,6 +19,11 @@ import re
 _CLEAN_RE = re.compile(
     r'General\s+timing\s+and\s+accounting\s+information(?:s)?\s+for\s+this\s+job'
     r'|Total\s+CPU\s+time\s+used|Voluntary\s+context\s+switches', re.I)
+_FINITE_NUMBER = r'[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][-+]?\d+)?'
+_OSZICAR_STEP_RE = re.compile(r'^\s*(\d+)\s+F=', re.I)
+_OSZICAR_E0_RE = re.compile(rf'\bE0\s*=\s*({_FINITE_NUMBER})', re.I)
+_OUTCAR_SIGMA0_RE = re.compile(
+    rf'energy\(sigma->0\)\s*=\s*({_FINITE_NUMBER})', re.I)
 
 
 def _read_named(job_dir, name):
@@ -105,6 +111,37 @@ def parse_oszicar_energy_text(text):
     return energy
 
 
+def parse_oszicar_energy_events(text):
+    """Return finite ``(ionic_step, E0)`` events from one OSZICAR snapshot."""
+    events = []
+    for line in str(text or '').splitlines():
+        step_match = _OSZICAR_STEP_RE.match(line)
+        energy_match = _OSZICAR_E0_RE.search(line)
+        if not step_match or not energy_match:
+            continue
+        try:
+            step = int(step_match.group(1))
+            energy = float(energy_match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if step > 0 and math.isfinite(energy):
+            events.append((step, energy))
+    return events
+
+
+def parse_outcar_energy_events(text):
+    """Return finite OUTCAR ``energy(sigma->0)`` events in file order."""
+    events = []
+    for match in _OUTCAR_SIGMA0_RE.finditer(str(text or '')):
+        try:
+            energy = float(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(energy):
+            events.append(energy)
+    return events
+
+
 def parse_oszicar_energy(job_dir):
     """Return the last finite OSZICAR E0, or ``None``."""
     return parse_oszicar_energy_text(_read_named(job_dir, 'OSZICAR'))
@@ -145,16 +182,12 @@ def clean_completion_from_files(job_dir):
     return False, ''
 
 
-def validate_done_energy_evidence(
-        manifest, label, *, oszicar_text='', outcar_text='', vasprun_text='',
-        require_oszicar=False, require_current_completion=False):
-    """Validate DONE energy against already captured authoritative bytes.
-
-    ``require_current_completion`` deliberately ignores cached completion flags:
-    callers at an immutable analysis boundary must see an OUTCAR timing footer or
-    a closed vasprun.xml in the same byte snapshot used for energy parsing.
-    """
-    if manifest is None:
+def validate_done_completion_evidence(
+        manifest, label, *, outcar_text='', vasprun_text='',
+        require_current_completion=False, require_explicit_diagnosis=False,
+        reject_explicit_unclean=False):
+    """Validate DONE state, diagnosis, exit code, and completion evidence."""
+    if not isinstance(manifest, Mapping):
         raise ValueError(
             f'{label}缺少可读 job.yaml；请先通过「导入已算结果」建立可追溯作业')
     state = str(manifest.get('state') or '')
@@ -162,21 +195,38 @@ def validate_done_energy_evidence(
         raise ValueError(
             f'{label}未通过 DONE 门（当前 {state or "未知"}），拒绝使用未收敛能量')
     results = manifest.get('results') or {}
+    if not isinstance(results, Mapping):
+        raise ValueError(f'{label}的 job.yaml results 证据格式无效')
     diagnosis = results.get('diagnosis') or {}
+    if not isinstance(diagnosis, Mapping):
+        raise ValueError(f'{label}的 job.yaml diagnosis 证据格式无效')
     failure_class = diagnosis.get('failure_class')
-    if failure_class and failure_class != 'CONVERGED':
+    if require_explicit_diagnosis and failure_class != 'CONVERGED':
+        raise ValueError(
+            f'{label}缺少显式 CONVERGED 诊断或诊断为 {failure_class or "未知"}')
+    if not require_explicit_diagnosis and failure_class and failure_class != 'CONVERGED':
         raise ValueError(f'{label}诊断为 {failure_class}，与 DONE 矛盾，拒绝计算')
     exit_code = diagnosis.get('exit_code')
+    if require_explicit_diagnosis and exit_code is None:
+        raise ValueError(f'{label}缺少显式零退出码证据')
     try:
         nonzero_exit = exit_code is not None and int(exit_code) != 0
     except (TypeError, ValueError):
         nonzero_exit = True
     if nonzero_exit:
         raise ValueError(f'{label}记录非零退出码 {exit_code}，不得作为已完成能量')
+    if reject_explicit_unclean and diagnosis.get('clean_exit') is False:
+        raise ValueError(f'{label}显式记录 clean_exit=false，与 DONE 矛盾')
 
     current_clean, current_source = clean_completion_from_text(
         outcar_text=outcar_text, vasprun_text=vasprun_text)
-    completion = (results.get('convergence_evidence') or {}).get('completion') or {}
+    convergence_evidence = results.get('convergence_evidence') or {}
+    completion = (
+        convergence_evidence.get('completion') or {}
+        if isinstance(convergence_evidence, Mapping) else {}
+    )
+    if not isinstance(completion, Mapping):
+        completion = {}
     cached_clean = (diagnosis.get('clean_exit') is True
                     or completion.get('outcar_footer') is True
                     or completion.get('vasprun_complete') is True)
@@ -189,6 +239,52 @@ def validate_done_energy_evidence(
         raise ValueError(
             f'{label}无当前 OUTCAR timing 页脚/完整 vasprun.xml；'
             '旧收敛串不能证明完整完成')
+    return manifest, clean_source, [f'{label}完成证据：{clean_source}']
+
+
+def validate_done_energy_evidence(
+        manifest, label, *, oszicar_text='', outcar_text='', vasprun_text='',
+        require_oszicar=False, require_current_completion=False,
+        require_outcar_ionic_event=False):
+    """Validate DONE energy against already captured authoritative bytes.
+
+    ``require_current_completion`` deliberately ignores cached completion flags:
+    callers at an immutable analysis boundary must see an OUTCAR timing footer or
+    a closed vasprun.xml in the same byte snapshot used for energy parsing.
+    """
+    manifest, clean_source, evidence = validate_done_completion_evidence(
+        manifest, label, outcar_text=outcar_text, vasprun_text=vasprun_text,
+        require_current_completion=require_current_completion,
+    )
+    results = manifest.get('results') or {}
+    if not isinstance(results, Mapping):
+        raise ValueError(f'{label}的 job.yaml results 证据格式无效')
+
+    oszicar_events = parse_oszicar_energy_events(oszicar_text)
+    outcar_events = parse_outcar_energy_events(outcar_text)
+    if require_outcar_ionic_event:
+        if not oszicar_events:
+            raise ValueError(f'{label}缺少可解析的 OSZICAR 最终离子能量事件')
+        oszicar_steps = [step for step, _energy in oszicar_events]
+        expected_steps = list(range(1, len(oszicar_events) + 1))
+        if oszicar_steps != expected_steps:
+            raise ValueError(
+                f'{label}的 OSZICAR 离子事件序列/终态不连续：'
+                f'{oszicar_steps!r}，期望 {expected_steps!r}')
+        if not outcar_events:
+            raise ValueError(
+                f'{label}缺少当前 OUTCAR:energy(sigma->0) 最终离子能量事件')
+        if len(outcar_events) != len(oszicar_events):
+            raise ValueError(
+                f'{label}的 OUTCAR/OSZICAR 离子能量事件计数不一致：'
+                f'{len(outcar_events)} != {len(oszicar_events)}')
+        if clean_source == 'OUTCAR timing 页脚':
+            last_energy = list(_OUTCAR_SIGMA0_RE.finditer(str(outcar_text or '')))[-1]
+            completion_events = list(_CLEAN_RE.finditer(str(outcar_text or '')))
+            if (not completion_events
+                    or completion_events[-1].start() <= last_energy.end()):
+                raise ValueError(
+                    f'{label}的 OUTCAR timing 页脚不在最终离子能量事件之后')
 
     try:
         energy = float(results.get('energy_e0_eV'))
@@ -196,17 +292,41 @@ def validate_done_energy_evidence(
         raise ValueError(f'{label}的 DONE job.yaml 未记录可用 energy_e0_eV') from None
     if not math.isfinite(energy):
         raise ValueError(f'{label}的 energy_e0_eV 非有限数')
-    parsed = parse_oszicar_energy_text(oszicar_text)
+    parsed = (
+        oszicar_events[-1][1]
+        if require_outcar_ionic_event and oszicar_events
+        else parse_oszicar_energy_text(oszicar_text)
+    )
     if require_oszicar and parsed is None:
         raise ValueError(
             f'{label}缺少可解析的当前轮 OSZICAR:E0；拒绝仅凭 job.yaml 缓存能量计算')
-    if parsed is not None and abs(parsed - energy) > 1e-3:
+    if (not require_outcar_ionic_event and parsed is not None
+            and abs(parsed - energy) > 1e-3):
         raise ValueError(
             f'{label}的 job.yaml 能量 {energy:.8f} eV 与 OSZICAR '
             f'{parsed:.8f} eV 不一致，疑混入不同轮结果')
-    evidence = [f'{label}完成证据：{clean_source}']
+    mismatches = []
+    if (require_outcar_ionic_event and parsed is not None
+            and abs(parsed - energy) > 1e-3):
+        mismatches.append(
+            f'job.yaml={energy:.8f} eV 与 OSZICAR={parsed:.8f} eV')
+    outcar_energy = outcar_events[-1] if outcar_events else None
+    if require_outcar_ionic_event and outcar_energy is not None:
+        if parsed is not None and abs(outcar_energy - parsed) > 1e-3:
+            mismatches.append(
+                f'OUTCAR={outcar_energy:.8f} eV 与 OSZICAR={parsed:.8f} eV')
+        if abs(outcar_energy - energy) > 1e-3:
+            mismatches.append(
+                f'OUTCAR={outcar_energy:.8f} eV 与 job.yaml={energy:.8f} eV')
+    if mismatches:
+        raise ValueError(
+            f'{label}的最终离子事件能量不一致，疑混入不同轮结果：'
+            + '；'.join(mismatches))
     if parsed is not None:
         evidence.append(f'{label}能量证据：OSZICAR:E0={parsed:.8f} eV')
+    if require_outcar_ionic_event and outcar_energy is not None:
+        evidence.append(
+            f'{label}能量证据：OUTCAR:energy(sigma->0)={outcar_energy:.8f} eV')
     return energy, manifest, evidence
 
 
@@ -539,6 +659,8 @@ def compare_methods(records, *, require_same_kpoints):
 __all__ = [
     'clean_completion_from_files', 'clean_completion_from_text',
     'compare_methods', 'method_record', 'parse_oszicar_energy',
-    'parse_oszicar_energy_text', 'validate_done_energy',
+    'parse_oszicar_energy_events', 'parse_oszicar_energy_text',
+    'parse_outcar_energy_events', 'validate_done_completion_evidence',
+    'validate_done_energy',
     'validate_done_energy_evidence',
 ]
