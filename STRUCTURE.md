@@ -2,7 +2,8 @@
 
 > 当前目录地图。产品和科学边界见 [README.md](README.md)，操作流程见
 > [使用说明.md](使用说明.md)，报告状态合同见
-> [docs/report-state-contract.md](docs/report-state-contract.md)。
+> [docs/report-state-contract.md](docs/report-state-contract.md)，催化领域合同、研究配方与
+> dry-run DAG 见 [docs/research-workbench-domain-recipes.md](docs/research-workbench-domain-recipes.md)。
 
 ## 顶层目录
 

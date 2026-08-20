@@ -28,6 +28,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl
 
+from vcstudio.shared.credential_classifier import is_sensitive_key, looks_like_credential
+
 
 SCHEMA = "vcstudio.workspace-state/v1"
 FILENAME = "workspace-state.json"
@@ -58,30 +60,7 @@ _UNC_PATH_RE = re.compile(
 _POSIX_PATH_RE = re.compile(r"(?<![#/A-Za-z0-9_])/(?!/)[^\s]+")
 _TILDE_PATH_RE = re.compile(r"(?<![A-Za-z0-9_])~[\\/]")
 _FILE_URI_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])file:(?:/{0,3}|\\)")
-_CREDENTIAL_VALUE_RE = re.compile(
-    r"(?i)(?:\b(?:github_pat_|gh[opusr]_|sk-)[A-Za-z0-9_-]{12,}"
-    r"|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"
-    r"|\bBearer\s+\S+|-----BEGIN[^\r\n]{0,40}PRIVATE KEY-----)")
-_CREDENTIAL_ASSIGNMENT_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9_])(?:password|passwd|pwd|secret|token|credential|"
-    r"credentials|auth|authorization|cookie|api[-_ ]?key|access[-_ ]?key|"
-    r"private[-_ ]?key|client[-_ ]?secret|access[-_ ]?token|"
-    r"refresh[-_ ]?token|aws[-_ ]?(?:access[-_ ]?key[-_ ]?id|"
-    r"secret[-_ ]?access[-_ ]?key))\s*[:=]\s*[^\s,;&]+")
-_URL_USERINFO_RE = re.compile(
-    r"(?i)\b[A-Z][A-Z0-9+.-]{1,31}://[^\s/@]+(?::[^\s/@]*)?@[^\s/]+")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
-
-_SENSITIVE_KEY_WORDS = frozenset({
-    "password", "passwd", "secret", "token", "credential", "credentials",
-    "auth", "authorization", "cookie", "cookies", "pwd",
-})
-_SENSITIVE_KEY_NAMES = frozenset({
-    "key", "apikey", "api_key", "accesskey", "access_key", "privatekey",
-    "private_key", "secretkey", "secret_key", "clientsecret", "client_secret",
-    "accesstoken", "access_token", "refreshtoken", "refresh_token", "sshkey",
-    "ssh_key", "signingkey", "signing_key", "encryptionkey", "encryption_key",
-})
 
 _DEFAULT_PREFERENCES = {
     "route": None,
@@ -133,32 +112,11 @@ def _looks_like_path(value: str) -> bool:
 
 
 def _looks_like_credential(value: str) -> bool:
-    text = str(value or "")
-    return bool(
-        _CREDENTIAL_VALUE_RE.search(text)
-        or _CREDENTIAL_ASSIGNMENT_RE.search(text)
-        or _URL_USERINFO_RE.search(text)
-    )
+    return looks_like_credential(value)
 
 
 def _is_sensitive_key(value: str) -> bool:
-    camel_split = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(value or ""))
-    normalised = re.sub(r"[^a-z0-9]+", "_", camel_split.lower()).strip("_")
-    if normalised in _SENSITIVE_KEY_NAMES:
-        return True
-    if set(normalised.split("_")) & _SENSITIVE_KEY_WORDS:
-        return True
-    compact = normalised.replace("_", "")
-    if any(compound in compact for compound in (
-        "apikey", "accesskey", "secretkey", "privatekey", "clientsecret",
-        "accesstoken", "refreshtoken", "sshkey", "signingkey",
-        "encryptionkey",
-    )):
-        return True
-    return any(compact.endswith(word) for word in (
-        "password", "passwd", "secret", "token", "credential", "credentials",
-        "authorization", "cookie", "auth",
-    ))
+    return is_sensitive_key(value)
 
 
 def _validate_string(value: Any, *, field: str, max_length: int = MAX_STRING_LENGTH,

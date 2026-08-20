@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>VASP Catalyst Studio</title>
 <link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="research-recipes.css">
 <link rel="stylesheet" href="analysis-workbench.css">
 <link rel="stylesheet" href="report-workbench.css">
 <script>/* 外观先粉刷防闪烁；只接受固定白名单，桥就绪后 app.js 再从 config 校准。 */
@@ -907,6 +908,62 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
       <span class="ana-lbl" data-i18n="generate.engine.label">计算引擎</span>
       <select id="engine-select" class="ipt" aria-label="计算引擎"></select>
       <span class="engine-note" id="engine-note">VASP 为默认完整工作流；其它引擎只显示已接通的任务与专属字段</span>
+    </div>
+
+    <div class="card research-recipes-card" id="research-recipes-card"
+      data-scene="cards.generate.task_catalog" data-engine="vasp" tabindex="-1"
+      aria-labelledby="rr-title" style="padding:12px;margin-bottom:10px">
+      <div>
+        <h2 class="gen-h" id="rr-title" data-i18n="research_recipes.title">研究工作流配方</h2>
+        <p class="rr-intro" data-i18n="research_recipes.intro">选择版本化配方，填写 opaque 证据 ID 和参数覆盖，再生成只读 DAG 预览。</p>
+      </div>
+      <div class="rr-boundary" role="note" data-i18n="research_recipes.boundary">预览不会创建目录、作业或远程操作。配方 ready 不代表科学上 validated/accepted；job.yaml 仍是执行作业的事实源。</div>
+      <div class="rr-layout">
+        <section class="rr-pane" aria-labelledby="rr-gallery-title">
+          <h3 id="rr-gallery-title" data-i18n="research_recipes.gallery">内置配方</h3>
+          <div class="rr-list" id="rr-list" aria-busy="true"></div>
+        </section>
+        <section class="rr-pane" aria-labelledby="rr-editor-title">
+          <h3 id="rr-editor-title" data-i18n="research_recipes.configure">证据与参数</h3>
+          <div class="rr-selection" id="rr-selection"></div>
+          <form id="rr-form">
+            <fieldset class="rr-fields" id="rr-parameters">
+              <legend data-i18n="research_recipes.parameters">解析参数</legend>
+            </fieldset>
+            <fieldset class="rr-fields" id="rr-evidence">
+              <legend data-i18n="research_recipes.evidence">输入证据（仅 opaque ID）</legend>
+            </fieldset>
+            <button class="btn primary" type="submit" id="rr-preview-button"
+              data-i18n="research_recipes.preview">生成只读 DAG 预览</button>
+          </form>
+          <div class="rr-status" id="rr-status" role="status" aria-live="polite"></div>
+        </section>
+      </div>
+      <section class="rr-preview" id="rr-preview" aria-labelledby="rr-preview-title" hidden>
+        <h3 id="rr-preview-title" data-i18n="research_recipes.preview_title">执行前 DAG</h3>
+        <div class="rr-preview-meta" id="rr-preview-meta"></div>
+        <ol class="rr-node-list" id="rr-node-list" aria-label="DAG nodes"
+          data-i18n-aria-label="research_recipes.nodes"></ol>
+        <div class="rr-preview-grid">
+          <section aria-labelledby="rr-missing-title">
+            <h4 id="rr-missing-title" data-i18n="research_recipes.missing">缺失前置</h4>
+            <ul id="rr-missing-list"></ul>
+          </section>
+          <section aria-labelledby="rr-limits-title">
+            <h4 id="rr-limits-title" data-i18n="research_recipes.limits">科学限制</h4>
+            <ul id="rr-limits-list"></ul>
+          </section>
+          <section aria-labelledby="rr-refs-title">
+            <h4 id="rr-refs-title" data-i18n="research_recipes.references">官方参考</h4>
+            <ul id="rr-reference-list"></ul>
+          </section>
+          <section aria-labelledby="rr-sources-title">
+            <h4 id="rr-sources-title" data-i18n="research_recipes.sources">参数来源</h4>
+            <ul id="rr-source-list"></ul>
+          </section>
+        </div>
+        <code class="rr-preview-hash" id="rr-preview-hash" tabindex="0"></code>
+      </section>
     </div>
 
     <!-- 计算类型目录:VASP 23 类分类 optgroup 下拉 → 参数表单 → 派生作业 -->
@@ -3120,6 +3177,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
 <script src="jobs.js"></script>
 <script src="cluster.js"></script>
 <script src="generate.js"></script>
+<script src="research-recipes.js"></script>
 <script src="project.js"></script>
 <script src="analysis-workbench.js"></script>
 <script src="report-workbench.js"></script>
