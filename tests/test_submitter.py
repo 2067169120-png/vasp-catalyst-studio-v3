@@ -231,6 +231,59 @@ def test_submit_job_happy_path_pbs(tmp_path):
     assert manifest.load_manifest(d)['state'] == 'SUBMITTED'   # 已落盘
 
 
+def test_submit_authority_uses_preupload_incar_digest_not_later_local_bytes(
+        tmp_path):
+    d = _job_dir(tmp_path)
+    uploaded = {}
+
+    class MutatingSFTP(FakeSFTP):
+        def put(self, local, remote):
+            if posixpath.basename(remote) == 'INCAR':
+                uploaded['incar_sha256'] = manifest.sha256_file(local)
+                result = super().put(local, remote)
+                with open(local, 'w', encoding='utf-8', newline='') as handle:
+                    handle.write('ENCUT = 999\nISPIN = 2\n')
+                return result
+            return super().put(local, remote)
+
+    client = FakeClient(script=[('qsub', '8812346.cluster.hpc\n')])
+    result = submitter.submit_job(client, MutatingSFTP(), _profile(), d)
+
+    assert uploaded['incar_sha256'] != manifest.sha256_file(
+        os.path.join(d, 'INCAR'))
+    assert result['attempts'][-1]['incar_sha256'] == uploaded['incar_sha256']
+    assert result['execution_authority']['current_incar_sha256'] == \
+        uploaded['incar_sha256']
+    command = next(item for item in client.commands if 'qsub' in item)
+    assert uploaded['incar_sha256'] in command
+    assert command.index('sha256sum -c -') < command.index('qsub')
+
+
+def test_vasp_submit_recovery_freezes_incar_digest_before_remote_accept(
+        tmp_path, monkeypatch):
+    d = _job_dir(tmp_path)
+    expected = manifest.load_manifest(d)['inputs']['sha256']['INCAR']
+    real_save = submitter.manifest_mod.save_manifest
+
+    def fail_submitted(path, payload):
+        if payload.get('state') == 'SUBMITTED':
+            raise OSError('disk full')
+        return real_save(path, payload)
+
+    monkeypatch.setattr(submitter.manifest_mod, 'save_manifest', fail_submitted)
+    with pytest.raises(submitter.UnknownRemoteSubmission):
+        submitter.submit_job(
+            FakeClient(script=[('qsub', '8812347.cluster.hpc\n')]),
+            FakeSFTP(), _profile(), d,
+            idempotency_key='initial-submit-authority-001')
+
+    recovery = submitter._read_submission_recovery(d)
+    assert recovery['status'] == 'remote_accepted'
+    assert recovery['scheduler_job_id'] == '8812347'
+    assert recovery['incar_sha256'] == expected
+    assert manifest.load_manifest(d)['state'] == 'CREATED'
+
+
 def test_batch_members_upload_their_own_distinct_incars(tmp_path):
     """同组成员的上传源必须是各自受管目录，不能回退到首个/共享 INCAR。"""
     first = _job_dir(tmp_path / 'first')

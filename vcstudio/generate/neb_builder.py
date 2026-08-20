@@ -407,6 +407,16 @@ def build_neb_dir(out_dir, poscar_ini: str, poscar_fin: str, incar_text: str, *,
         'poscar_fin_sha256': _sha256_text(poscar_fin),
         'incar_source': 'user+neb_completion' if completion_block else 'user_verbatim',
     }
+    inputs['sha256'] = {
+        name: manifest_mod.sha256_file(out_dir / name)
+        for name in ('INCAR', 'KPOINTS', 'POTCAR')
+        if (out_dir / name).is_file()
+    }
+    inputs['image_poscar_sha256'] = {
+        _frame_name(i): manifest_mod.sha256_file(
+            out_dir / _frame_name(i) / 'POSCAR')
+        for i in range(len(frames_text))
+    }
     system = ini_ep['header'][0].strip() or out_dir.name
     m = manifest_mod.new_manifest(
         job_id=f'{out_dir.resolve().name}-neb', system=system, task_type='neb',

@@ -184,6 +184,7 @@ def test_remote_accept_then_manifest_failure_blocks_automatic_retry(tmp_path, mo
     assert recovery["status"] == "remote_accepted"
     assert recovery["scheduler_job_id"] == "991"
     assert recovery["idempotency_key"] == _OPERATION_ID
+    assert recovery["incar_sha256"] is None  # CP2K has no INCAR authority field.
     assert manifest.load_manifest(job)["state"] == "CREATED"
 
     monkeypatch.setattr(submitter.manifest_mod, "save_manifest", real_save)

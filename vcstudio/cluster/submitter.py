@@ -244,11 +244,18 @@ def _read_submission_recovery(job_dir) -> dict | None:
         raise UnknownRemoteSubmission(
             '提交恢复记录不可读；为避免重复提交，必须人工核对调度器后再处理。',
             recovery_status='invalid_recovery_journal') from exc
-    valid_statuses = {'submitting', 'remote_accepted', 'unknown_remote_submission'}
+    valid_statuses = {
+        'preparing', 'submitting', 'remote_accepted',
+        'unknown_remote_submission',
+    }
     if (not isinstance(payload, dict)
             or payload.get('schema') != _SUBMISSION_RECOVERY_SCHEMA
             or payload.get('status') not in valid_statuses
-            or not isinstance(payload.get('transaction_id'), str)):
+            or not isinstance(payload.get('transaction_id'), str)
+            or (payload.get('incar_sha256') is not None
+                and re.fullmatch(
+                    r'[0-9a-f]{64}', str(payload.get('incar_sha256') or ''))
+                is None)):
         raise UnknownRemoteSubmission(
             '提交恢复记录无效；为避免重复提交，必须人工核对调度器后再处理。',
             recovery_status='invalid_recovery_journal')
@@ -588,6 +595,13 @@ def _reconcile_submission_recovery(job_dir, manifest: dict | None,
             return replay
         return None
 
+    if recovery.get('status') == 'preparing':
+        # The fsynced state transition to ``submitting`` occurs immediately
+        # before the sole command that can contact the scheduler.  A crash in
+        # ``preparing`` may leave partial uploads, but cannot have submitted.
+        _clear_submission_recovery(job_dir)
+        return None
+
     recovery_job_id = str(recovery.get('scheduler_job_id') or '')
     current_job_id = str((manifest or {}).get('scheduler_job_id') or '')
     attempts = (manifest or {}).get('attempts') or []
@@ -596,8 +610,18 @@ def _reconcile_submission_recovery(job_dir, manifest: dict | None,
         and str(attempt.get('job_id') or '') == recovery_job_id
         for attempt in attempts
     )
+    recovered_incar_sha256 = _valid_sha256(recovery.get('incar_sha256'))
+    authority = (manifest or {}).get('execution_authority') or {}
+    authority_matches = (
+        not recovered_incar_sha256
+        or (isinstance(authority, dict)
+            and str(authority.get('scheduler_job_id') or '') == recovery_job_id
+            and _valid_sha256(authority.get('current_incar_sha256'))
+            == recovered_incar_sha256)
+    )
     if (recovery.get('status') == 'remote_accepted' and recovery_job_id
-            and current_job_id == recovery_job_id and recorded):
+            and current_job_id == recovery_job_id and recorded
+            and authority_matches):
         # Crash/cleanup failure after the manifest replacement: the canonical
         # manifest already carries the exact remote identity, so cleanup and
         # replay are safe without another scheduler call.
@@ -1343,42 +1367,78 @@ def submit_job(client, sftp, profile, job_dir: str, *,
     dialect = get_dialect(profile.scheduler)
     script_text = build_script_text(profile, job_dir)
 
+    engine = _job_engine(m)
+    incar_authority_sha256 = ''
+    if engine == 'vasp':
+        incar_authority_sha256 = _valid_sha256(
+            ((m.get('inputs') or {}).get('sha256') or {}).get('INCAR'))
+        if not incar_authority_sha256:
+            raise ValueError(
+                'VASP 作业缺准备期受管 INCAR 摘要；请重新准备后再提交')
+        current_incar_sha256 = manifest_mod.sha256_file(
+            os.path.join(job_dir, 'INCAR'))
+        if current_incar_sha256 != incar_authority_sha256:
+            raise ValueError(
+                '本地 INCAR 已偏离准备期权威摘要；请重新准备后再提交')
+
+    recovery = {
+        'schema': _SUBMISSION_RECOVERY_SCHEMA,
+        'transaction_id': os.urandom(16).hex(),
+        'status': 'preparing',
+        'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'manifest_job_id': str(m.get('job_id') or ''),
+        'engine': engine,
+        'cluster': str(profile.name or ''),
+        'remote_dir': str(spec.remote_dir or ''),
+        'idempotency_key': operation_key or None,
+        'scheduler_job_id': None,
+        'incar_sha256': incar_authority_sha256 or None,
+    }
+    # Freeze the exact generation authority before even the first upload.  A
+    # crash in ``preparing`` is known not to have contacted the scheduler.
+    _write_submission_recovery(job_dir, recovery)
+
     # 远程目录 + 上传(脚本统一 LF,防 Windows CRLF 毒害 shell)
-    run_cmd(client, f'mkdir -p {shlex.quote(spec.remote_dir)}', check=True)
-    if _is_neb(m):
-        # NEB:整棵目录树(根共享 INCAR/POTCAR/KPOINTS + 各 image 子目录 POSCAR)
-        n_up = _upload_neb_tree(client, sftp, job_dir, spec.remote_dir)
-        upload_note = f'NEB 目录树 {n_up} 文件 + {SCRIPT_NAME}'
-    else:
-        engine = _job_engine(m)
-        input_files = _declared_input_files(job_dir, m)[0]
-        for fname in input_files:
-            sftp.put(os.path.join(job_dir, fname), posixpath.join(spec.remote_dir, fname))
-        upload_note = (
-            f'{_ENGINE_LABELS.get(engine, engine)} {len(input_files)} 输入 + {SCRIPT_NAME}')
-    with sftp.file(posixpath.join(spec.remote_dir, SCRIPT_NAME), 'w') as f:
-        f.write(script_text.replace('\r\n', '\n'))
+    try:
+        run_cmd(client, f'mkdir -p {shlex.quote(spec.remote_dir)}', check=True)
+        if _is_neb(m):
+            # NEB:整棵目录树(根共享 INCAR/POTCAR/KPOINTS + 各 image 子目录 POSCAR)
+            n_up = _upload_neb_tree(client, sftp, job_dir, spec.remote_dir)
+            upload_note = f'NEB 目录树 {n_up} 文件 + {SCRIPT_NAME}'
+        else:
+            input_files = _declared_input_files(job_dir, m)[0]
+            for fname in input_files:
+                sftp.put(os.path.join(job_dir, fname),
+                         posixpath.join(spec.remote_dir, fname))
+            upload_note = (
+                f'{_ENGINE_LABELS.get(engine, engine)} {len(input_files)} 输入 + {SCRIPT_NAME}')
+        with sftp.file(posixpath.join(spec.remote_dir, SCRIPT_NAME), 'w') as f:
+            f.write(script_text.replace('\r\n', '\n'))
+    except Exception:
+        # No scheduler command is reachable before ``submitting`` is fsynced.
+        try:
+            _clear_submission_recovery(job_dir)
+        except OSError:
+            pass
+        raise
     m['cluster'] = profile.name
     m['cluster_binding'] = profile_binding(profile)
     m['remote_dir'] = spec.remote_dir
     manifest_mod.set_state(m, 'UPLOADED', note=upload_note)
 
-    recovery = {
-        'schema': _SUBMISSION_RECOVERY_SCHEMA,
-        'transaction_id': os.urandom(16).hex(),
-        'status': 'submitting',
-        'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
-        'manifest_job_id': str(m.get('job_id') or ''),
-        'cluster': str(profile.name or ''),
-        'remote_dir': str(spec.remote_dir or ''),
-        'idempotency_key': operation_key or None,
-        'scheduler_job_id': None,
-    }
+    recovery['status'] = 'submitting'
     _write_submission_recovery(job_dir, recovery)
     try:
-        out, err = run_cmd(client, dialect.submit_cmd(
+        submit_command = dialect.submit_cmd(
             posixpath.join(spec.remote_dir, SCRIPT_NAME),
-            getattr(profile, 'scheduler_bin', '')))
+            getattr(profile, 'scheduler_bin', ''))
+        if engine == 'vasp':
+            submit_command = ' && '.join((
+                f'cd {shlex.quote(spec.remote_dir)}',
+                _remote_sha256_guard('INCAR', incar_authority_sha256),
+                submit_command,
+            ))
+        out, err = run_cmd(client, submit_command, check=True)
     except Exception as exc:  # noqa: BLE001 - remote acceptance may be unknowable
         recovery['status'] = 'unknown_remote_submission'
         try:
@@ -1437,13 +1497,11 @@ def submit_job(client, sftp, profile, job_dir: str, *,
             # v3.3.0 实际核时统计:提交时点核数(nodes×ppn;ppn 未配 → None,usage 端不编数)
             'cores': (spec.nodes * spec.ppn) if spec.ppn else None,
         }
-        if _job_engine(m) == 'vasp':
-            incar_sha256 = manifest_mod.sha256_file(
-                os.path.join(job_dir, 'INCAR'))
-            attempt['incar_sha256'] = incar_sha256
+        if engine == 'vasp':
+            attempt['incar_sha256'] = incar_authority_sha256
             _set_incar_authority(
                 m, scheduler_job_id=str(job_id),
-                incar_sha256=incar_sha256,
+                incar_sha256=incar_authority_sha256,
                 transaction_id=recovery['transaction_id'])
         if operation_key:
             attempt['idempotency_key'] = operation_key

@@ -128,6 +128,12 @@ def _submit(tmp_path, jid='900.c\n', n_images=3):
 def test_neb_preflight_passes(tmp_path):
     jd = _neb_job(tmp_path)
     assert submitter.preflight(_profile(), jd) == []
+    data = manifest.load_manifest(jd)
+    assert data['inputs']['sha256']['INCAR'] == manifest.sha256_file(
+        os.path.join(jd, 'INCAR'))
+    assert set(data['inputs']['image_poscar_sha256']) == {
+        '00', '01', '02', '03', '04',
+    }
 
 
 def test_neb_preflight_missing_image_poscar(tmp_path):
