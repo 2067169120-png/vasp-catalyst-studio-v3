@@ -39,7 +39,8 @@ import yaml
 # 导航页(与 gui_web/assets/index.html 的 data-page 清单严格一致;顺序为默认导航序)
 PAGES = (
     'dashboard', 'structure', 'generate', 'jobs', 'project', 'analysis-workbench',
-    'report-workbench', 'wavefunction', 'figures', 'ai', 'cluster', 'settings',
+    'reference-browser', 'report-workbench', 'wavefunction', 'figures', 'ai',
+    'cluster', 'settings',
 )
 
 # 图型 key(对齐 external/native_charts.py 出图函数:bar=adsorption_bar、table=energy_matrix_table、
@@ -155,6 +156,7 @@ _LIS = {
         'free-energy ladders, and SAC batch screening.'),
     'primary': True,
     'pages': ['dashboard', 'structure', 'jobs', 'project', 'analysis-workbench',
+              'reference-browser',
               'report-workbench', 'figures',
               'cluster', 'settings'],
     'cards': {
@@ -197,6 +199,7 @@ _VASP = {
         'submission, and result tools.'),
     'primary': True,
     'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project', 'analysis-workbench',
+              'reference-browser',
               'report-workbench', 'figures', 'cluster', 'settings'],
     'cards': {
         'structure': {'molecular': False},
@@ -235,6 +238,7 @@ _ELECTROCAT = {
         'reaction presets.'),
     'primary': False,
     'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project', 'analysis-workbench',
+              'reference-browser',
               'report-workbench', 'figures', 'cluster', 'settings'],
     'cards': {},
     # 火山图(Sabatier 峰顶)是电催化筛选的招牌图,置最前;标度关系次之
@@ -272,6 +276,7 @@ _THERMOCAT = {
         'potential-dependent plots are de-emphasized.'),
     'primary': False,
     'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project', 'analysis-workbench',
+              'reference-browser',
               'report-workbench', 'figures', 'cluster', 'settings'],
     # 热催化非电化学:隐藏项目页的反应(台阶图)预设卡片
     'cards': {'project': {'reactions': False}},
@@ -311,6 +316,7 @@ _BATTERY_BULK = {
         'method checks tailored to calculations without vacuum or dipole terms.'),
     'primary': False,
     'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project', 'analysis-workbench',
+              'reference-browser',
               'report-workbench', 'figures', 'cluster', 'settings'],
     # 吸附卡片弱化:隐藏 SAC 表面批量建模;隐藏火山图/标度(吸附质筛选专用)
     'cards': {

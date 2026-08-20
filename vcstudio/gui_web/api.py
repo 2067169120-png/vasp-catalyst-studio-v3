@@ -7420,18 +7420,22 @@ class Api:
     def external_reference_import_preview(self, project_id, result_token, item_id):
         """Bind one structure preview to the current project before confirmation."""
         try:
+            from vcstudio.project.external_references import BoundProjectEntity
+
             record = self._resolve_project_id(project_id)
+            with BoundProjectEntity.open(record['path']) as entity:
+                def preview():
+                    self._load_project_for_path(record['path'])
+                    entity.verify()
+                    return self._external_references().prepare_candidate_import(
+                        result_token, item_id,
+                        project_id=record['request_project_id'],
+                        project_entity_sha256=entity.identity_sha256)
 
-            def preview():
-                self._load_project_for_path(record['path'])
-                return self._external_references().prepare_candidate_import(
-                    result_token, item_id,
-                    project_id=record['request_project_id'])
-
-            return self._call_with_project_bindings(
-                [record], preview,
-                failure={
-                    'schema': 'vcstudio.external-reference-import-preview/v1'})
+                return self._call_with_project_bindings(
+                    [record], preview,
+                    failure={
+                        'schema': 'vcstudio.external-reference-import-preview/v1'})
         except Exception:                                 # noqa: BLE001 public boundary
             return self._project_identity_failure(
                 schema='vcstudio.external-reference-import-preview/v1')
@@ -7440,6 +7444,8 @@ class Api:
                                   confirmation=None):
         """Persist one explicitly confirmed structure as candidate provenance."""
         try:
+            from vcstudio.project.external_references import BoundProjectEntity
+
             record = self._resolve_project_id(project_id)
             confirmation = confirmation if isinstance(confirmation, dict) else {}
             confirmed = (
@@ -7447,21 +7453,18 @@ class Api:
                 and confirmation.get('confirmed') is True
                 and confirmation.get('scope') == 'candidate_provenance')
 
-            def import_candidate():
-                self._load_project_for_path(record['path'])
-                # The registered project locator is the filesystem authority;
-                # a mutable ``project.root`` field must not redirect imports.
-                root = os.path.dirname(record['path'])
-                return self._external_references().import_candidate(
-                    preview_token, project_root=root,
-                    project_id=record['request_project_id'],
-                    confirmed=confirmed,
-                    identity_validator=lambda: (
-                        self._rebind_project_record(record) is not None))
+            with BoundProjectEntity.open(record['path']) as entity:
+                def import_candidate():
+                    self._load_project_for_path(record['path'])
+                    entity.verify()
+                    return self._external_references().import_candidate(
+                        preview_token, project_entity=entity,
+                        project_id=record['request_project_id'],
+                        confirmed=confirmed)
 
-            return self._call_with_project_bindings(
-                [record], import_candidate,
-                failure={'schema': 'vcstudio.external-reference-candidate/v1'})
+                return self._call_with_project_bindings(
+                    [record], import_candidate,
+                    failure={'schema': 'vcstudio.external-reference-candidate/v1'})
         except Exception:                                 # noqa: BLE001 public boundary
             return self._project_identity_failure(
                 schema='vcstudio.external-reference-candidate/v1')

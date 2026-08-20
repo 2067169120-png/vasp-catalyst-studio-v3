@@ -17,6 +17,7 @@ import pytest
 from vcstudio.gui_web.api import Api
 from vcstudio.project.external_references import (
     AdapterResult,
+    BoundProjectEntity,
     BoundedHttpTransport,
     CatalysisHubAdapter,
     ExternalReferenceCache,
@@ -701,15 +702,12 @@ def test_structure_claim_requires_confirmation_and_token_is_single_use(tmp_path)
     assert not_confirmed.value.code == "confirmation_required"
 
     project = tmp_path / "project"
-    project.mkdir()
-    prepared = gateway.prepare_candidate_import(
-        token, item_id, project_id="project-" + "a" * 32)
-    imported = gateway.import_candidate(
-        prepared["preview_token"], project_root=project,
-        project_id="project-" + "a" * 32, confirmed=True)
-    replayed = gateway.import_candidate(
-        prepared["preview_token"], project_root=project,
-        project_id="project-" + "a" * 32, confirmed=True)
+    with BoundProjectEntity.open(_project_manifest(project)) as entity:
+        prepared = gateway.prepare_candidate_import(
+            token, item_id, project_id="project-" + "a" * 32,
+            project_entity_sha256=entity.identity_sha256)
+    imported = _import_prepared(gateway, project, prepared["preview_token"])
+    replayed = _import_prepared(gateway, project, prepared["preview_token"])
 
     assert prepared["status"] == "preview"
     assert prepared["formula"] == "Si"
@@ -735,31 +733,46 @@ def test_structure_claim_requires_confirmation_and_token_is_single_use(tmp_path)
     assert replayed["error"]["code"] == "token_replayed"
 
 
-def _prepared_import(gateway, *, project_id="project-" + "a" * 32):
+def _project_manifest(project: Path) -> Path:
+    project.mkdir(parents=True, exist_ok=True)
+    manifest = project / "project.yaml"
+    if not manifest.exists():
+        manifest.write_text("schema: vcstudio.project/v1\n", encoding="utf-8")
+    return manifest
+
+
+def _prepared_import(gateway, project: Path, *,
+                     project_id="project-" + "a" * 32):
     search = gateway.search("materials_project", {"formula": "Si"})
-    preview = gateway.prepare_candidate_import(
-        search["result_token"], search["items"][0]["item_id"],
-        project_id=project_id)
+    with BoundProjectEntity.open(_project_manifest(project)) as entity:
+        preview = gateway.prepare_candidate_import(
+            search["result_token"], search["items"][0]["item_id"],
+            project_id=project_id,
+            project_entity_sha256=entity.identity_sha256)
     return search, preview
+
+
+def _import_prepared(gateway, project: Path, preview_token: str, *,
+                     project_id="project-" + "a" * 32):
+    with BoundProjectEntity.open(_project_manifest(project)) as entity:
+        return gateway.import_candidate(
+            preview_token, project_entity=entity,
+            project_id=project_id, confirmed=True)
 
 
 def test_import_preflight_rejects_candidate_directory_file_without_consuming_token(
         tmp_path):
     gateway = _gateway(tmp_path / "gateway", FakeTransport(_response(_mp_payload())))
-    _search, preview = _prepared_import(gateway)
     project = tmp_path / "project"
+    _search, preview = _prepared_import(gateway, project)
     state = project / ".vcstudio"
     state.mkdir(parents=True)
     blocked = state / "external_reference_candidates"
     blocked.write_text("not-a-directory", encoding="utf-8")
 
-    failed = gateway.import_candidate(
-        preview["preview_token"], project_root=project,
-        project_id="project-" + "a" * 32, confirmed=True)
+    failed = _import_prepared(gateway, project, preview["preview_token"])
     blocked.unlink()
-    retried = gateway.import_candidate(
-        preview["preview_token"], project_root=project,
-        project_id="project-" + "a" * 32, confirmed=True)
+    retried = _import_prepared(gateway, project, preview["preview_token"])
 
     assert failed["error"]["code"] == "candidate_import_failed"
     assert retried["ok"] is True
@@ -767,26 +780,20 @@ def test_import_preflight_rejects_candidate_directory_file_without_consuming_tok
         (state / "external_reference_candidates").glob("*.json"))) == 1
 
 
-def test_import_identity_change_after_atomic_stage_rolls_back_and_releases_token(
+def test_import_manifest_same_content_replacement_is_rejected_without_consuming_token(
         tmp_path):
     gateway = _gateway(tmp_path / "gateway", FakeTransport(_response(_mp_payload())))
-    _search, preview = _prepared_import(gateway)
     project = tmp_path / "project"
-    project.mkdir()
-    calls = []
+    _search, preview = _prepared_import(gateway, project)
+    manifest = project / "project.yaml"
+    original = project / "project.original.yaml"
+    manifest.replace(original)
+    manifest.write_bytes(original.read_bytes())
 
-    def changed_after_replace():
-        calls.append(len(calls) + 1)
-        return len(calls) < 5
-
-    failed = gateway.import_candidate(
-        preview["preview_token"], project_root=project,
-        project_id="project-" + "a" * 32, confirmed=True,
-        identity_validator=changed_after_replace)
-    retried = gateway.import_candidate(
-        preview["preview_token"], project_root=project,
-        project_id="project-" + "a" * 32, confirmed=True,
-        identity_validator=lambda: True)
+    failed = _import_prepared(gateway, project, preview["preview_token"])
+    manifest.unlink()
+    original.replace(manifest)
+    retried = _import_prepared(gateway, project, preview["preview_token"])
 
     assert failed["error"]["code"] == "identity_mismatch"
     assert retried["ok"] is True
@@ -827,23 +834,20 @@ def test_candidate_import_lock_is_cross_process(tmp_path):
 
 def test_import_preview_token_is_bound_to_project_and_structure_content(tmp_path):
     gateway = _gateway(tmp_path / "gateway", FakeTransport(_response(_mp_payload())))
-    search, preview = _prepared_import(gateway)
+    project = tmp_path / "project"
+    search, preview = _prepared_import(gateway, project)
     wrong_project = tmp_path / "wrong"
-    wrong_project.mkdir()
+    _project_manifest(wrong_project)
 
-    rejected = gateway.import_candidate(
-        preview["preview_token"], project_root=wrong_project,
-        project_id="project-" + "b" * 32, confirmed=True)
+    rejected = _import_prepared(
+        gateway, wrong_project, preview["preview_token"],
+        project_id="project-" + "b" * 32)
 
     assert rejected["error"]["code"] == "invalid_token"
     assert not (wrong_project / ".vcstudio").exists()
     internal = gateway._tokens.resolve(search["result_token"])
     internal.items[0]["_structure_payload"]["sites"][0]["abc"] = [0.1, 0, 0]
-    project = tmp_path / "project"
-    project.mkdir()
-    changed = gateway.import_candidate(
-        preview["preview_token"], project_root=project,
-        project_id="project-" + "a" * 32, confirmed=True)
+    changed = _import_prepared(gateway, project, preview["preview_token"])
     assert changed["error"]["code"] == "structure_changed"
     assert not (project / ".vcstudio").exists()
 
@@ -886,11 +890,14 @@ def test_structure_formula_is_reduced_from_sites_and_content_bound(tmp_path):
     second_site["xyz"] = [2.5, 2.5, 2.5]
     payload["data"][0]["structure"]["sites"].append(second_site)
     gateway = _gateway(tmp_path, FakeTransport(_response(payload)))
+    project = tmp_path / "project"
 
     search = gateway.search("materials_project", {"formula": "Si"})
-    preview = gateway.prepare_candidate_import(
-        search["result_token"], search["items"][0]["item_id"],
-        project_id="project-" + "a" * 32)
+    with BoundProjectEntity.open(_project_manifest(project)) as entity:
+        preview = gateway.prepare_candidate_import(
+            search["result_token"], search["items"][0]["item_id"],
+            project_id="project-" + "a" * 32,
+            project_entity_sha256=entity.identity_sha256)
 
     assert search["items"][0]["formula"] == "Si"
     assert preview["formula"] == "Si"
@@ -961,13 +968,129 @@ def test_cache_startup_removes_orphan_and_malformed_entries(tmp_path):
     assert not list(root.glob("external-*.*"))
 
 
+@pytest.mark.parametrize("kind", ["deep", "oversize"])
+def test_cache_manifest_bounded_read_isolates_deep_and_oversize_json(
+        tmp_path, kind):
+    root = tmp_path / "cache"
+    root.mkdir()
+    entry_id = "external-" + "d" * 32
+    (root / f"{entry_id}.raw").write_bytes(b"{}")
+    if kind == "deep":
+        payload = b'{"nested":' + b"[" * 1500 + b"0" + b"]" * 1500 + b"}"
+    else:
+        payload = b'{"padding":"' + b"x" * (600 * 1024) + b'"}'
+    (root / f"{entry_id}.json").write_bytes(payload)
+
+    cache = ExternalReferenceCache(root, clock=lambda: 1_700_000_000.0)
+
+    assert cache.cleanup()["retained"] == 0
+    assert not list(root.glob("external-*.*"))
+
+
+def test_cache_manifest_memory_error_is_isolated_and_removed(tmp_path, monkeypatch):
+    root = tmp_path / "cache"
+    root.mkdir()
+    entry_id = "external-" + "e" * 32
+    (root / f"{entry_id}.raw").write_bytes(b"{}")
+    (root / f"{entry_id}.json").write_bytes(b"{}")
+    real_loads = json.loads
+
+    def exhausted(_payload):
+        raise MemoryError("fixture")
+
+    monkeypatch.setattr(
+        __import__("vcstudio.project.external_references", fromlist=["json"]).json,
+        "loads", exhausted)
+    ExternalReferenceCache(root, clock=lambda: 1_700_000_000.0)
+    monkeypatch.setattr(
+        __import__("vcstudio.project.external_references", fromlist=["json"]).json,
+        "loads", real_loads)
+
+    assert not list(root.glob("external-*.*"))
+
+
+def test_cache_cleanup_rejects_raw_size_or_hash_mismatch(tmp_path):
+    root = tmp_path / "cache"
+    cache = ExternalReferenceCache(root, clock=lambda: 1_700_000_000.0)
+    manifest = cache.write(b"original", {
+        "provider": "fixture", "provider_version": "1",
+        "endpoint_identity": "fixture:1", "query": {"id": 1},
+        "license": {}, "attribution": "fixture", "dois": [],
+        "method_metadata": [],
+    })
+    raw_path = root / f"{manifest['entry_id']}.raw"
+    raw_path.write_bytes(b"tampered")
+
+    cleaned = cache.cleanup()
+
+    assert cleaned["orphan_removed"] == 1
+    assert not list(root.glob("external-*.*"))
+
+
+def test_cache_cleanup_parses_each_valid_manifest_once(tmp_path, monkeypatch):
+    root = tmp_path / "cache"
+    cache = ExternalReferenceCache(root, clock=lambda: 1_700_000_000.0)
+    cache.write(b"{}", {
+        "provider": "fixture", "provider_version": "1",
+        "endpoint_identity": "fixture:1", "query": {"id": 1},
+        "license": {}, "attribution": "fixture", "dois": [],
+        "method_metadata": [],
+    })
+    module_json = __import__(
+        "vcstudio.project.external_references", fromlist=["json"]).json
+    real_loads = module_json.loads
+    calls = []
+
+    def counted(payload):
+        calls.append(len(payload))
+        return real_loads(payload)
+
+    monkeypatch.setattr(module_json, "loads", counted)
+    cleaned = cache.cleanup()
+
+    assert cleaned["retained"] == 1
+    assert len(calls) == 1
+
+
+def test_cache_manifest_symlink_or_reparse_is_removed_without_following(tmp_path):
+    root = tmp_path / "cache"
+    target = tmp_path / "outside"
+    root.mkdir()
+    target.mkdir()
+    sentinel = target / "sentinel"
+    sentinel.write_text("keep", encoding="utf-8")
+    entry_id = "external-" + "f" * 32
+    link = root / f"{entry_id}.json"
+    raw = root / f"{entry_id}.raw"
+    raw.write_bytes(b"{}")
+    try:
+        if os.name == "nt":
+            created = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                check=False, capture_output=True, text=True)
+            if created.returncode != 0:
+                pytest.skip("Windows junction creation is unavailable")
+        else:
+            link.symlink_to(target, target_is_directory=True)
+        ExternalReferenceCache(root, clock=lambda: 1_700_000_000.0)
+        assert sentinel.read_text(encoding="utf-8") == "keep"
+        assert not link.exists()
+        assert not raw.exists()
+    finally:
+        try:
+            link.rmdir() if link.is_dir() else link.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def test_operation_failures_keep_operation_specific_schemas(tmp_path):
     gateway = _gateway(tmp_path, FakeTransport())
 
     assert gateway.compare("bad", ["x"])["schema"].endswith("comparison/v1")
-    assert gateway.import_candidate(
-        "bad", project_root=tmp_path, project_id="project-" + "a" * 32,
-        confirmed=True)["schema"].endswith("candidate/v1")
+    with BoundProjectEntity.open(_project_manifest(tmp_path)) as entity:
+        assert gateway.import_candidate(
+            "bad", project_entity=entity, project_id="project-" + "a" * 32,
+            confirmed=True)["schema"].endswith("candidate/v1")
     assert gateway.store_api_key(
         "optimade", "x" * 32)["schema"].endswith("credential/v1")
 
@@ -1068,28 +1191,21 @@ def test_api_bridge_is_narrow_opaque_and_project_bound(tmp_path):
     assert str(root) not in _encoded(imported)
 
 
-def test_api_import_project_uuid_change_during_stage_leaves_no_side_effect(tmp_path):
-    root = tmp_path / "project"
-    root.mkdir()
-    locator = root / "project.yaml"
-    locator.write_text("schema: vcstudio.project/v1\n", encoding="utf-8")
+@pytest.mark.skipif(os.name != "nt", reason="Windows file-ID regression")
+def test_api_import_windows_bound_root_blocks_same_uuid_rename_swap(
+        tmp_path, monkeypatch):
+    root = tmp_path / "project-a"
+    replacement = tmp_path / "project-b"
+    holding = tmp_path / "project-hold"
+    locator = _project_manifest(root)
+    _project_manifest(replacement).write_bytes(locator.read_bytes())
     project = {
         "name": "fixture", "project_uuid": "a" * 32,
         "members": {"clean_slab": None, "gas_ref": None, "configs": []},
     }
-    mutate_on_stage = [False]
-
-    def load_project(path):
-        assert Path(path).resolve() == locator.resolve()
-        candidate_dir = root / ".vcstudio" / "external_reference_candidates"
-        if mutate_on_stage[0] and candidate_dir.is_dir() and list(
-                candidate_dir.glob(".*.tmp")):
-            project["project_uuid"] = "b" * 32
-        return project
-
     adsorption = SimpleNamespace(
         list_projects=lambda: [str(locator)],
-        load_project=load_project,
+        load_project=lambda path: project if Path(path) == locator else None,
     )
     gateway = _gateway(
         tmp_path / "gateway", FakeTransport(_response(_mp_payload())))
@@ -1101,14 +1217,108 @@ def test_api_import_project_uuid_change_during_stage_leaves_no_side_effect(tmp_p
     search = api.external_reference_search("materials_project", {"formula": "Si"})
     preview = api.external_reference_import_preview(
         project_id, search["result_token"], search["items"][0]["item_id"])
-    mutate_on_stage[0] = True
+    original_stage = BoundProjectEntity.stage_payload
+    stage_ready = threading.Event()
+    attack_done = threading.Event()
+    attack = {"attempted": False, "swapped": False, "error": None}
+
+    def paused_stage(self, name, payload):
+        original_stage(self, name, payload)
+        stage_ready.set()
+        assert attack_done.wait(2)
+
+    def rename_swap():
+        assert stage_ready.wait(2)
+        attack["attempted"] = True
+        try:
+            root.replace(holding)
+            replacement.replace(root)
+            attack["swapped"] = True
+        except OSError as exc:
+            attack["error"] = exc
+        finally:
+            attack_done.set()
+
+    monkeypatch.setattr(BoundProjectEntity, "stage_payload", paused_stage)
+    attacker = threading.Thread(target=rename_swap)
+    attacker.start()
 
     imported = api.external_reference_import(
         project_id, preview["preview_token"],
         {"confirmed": True, "scope": "candidate_provenance"})
+    attacker.join(timeout=3)
 
-    assert imported["ok"] is False
-    assert not (root / ".vcstudio").exists()
+    assert attack["attempted"] is True
+    assert attack["swapped"] is False
+    assert isinstance(attack["error"], OSError)
+    assert imported["ok"] is True
+    assert len(list((
+        root / ".vcstudio" / "external_reference_candidates").glob("*.json"))) == 1
+    assert not (replacement / ".vcstudio").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor-relative regression")
+def test_posix_bound_root_detects_rename_swap_and_rolls_back(tmp_path, monkeypatch):
+    gateway = _gateway(
+        tmp_path / "gateway", FakeTransport(_response(_mp_payload())))
+    root = tmp_path / "project-a"
+    replacement = tmp_path / "project-b"
+    holding = tmp_path / "project-hold"
+    _project_manifest(root)
+    _project_manifest(replacement).write_bytes(
+        (root / "project.yaml").read_bytes())
+    _search, preview = _prepared_import(gateway, root)
+    original_stage = BoundProjectEntity.stage_payload
+
+    def swap_after_stage(self, name, payload):
+        original_stage(self, name, payload)
+        root.replace(holding)
+        replacement.replace(root)
+
+    monkeypatch.setattr(BoundProjectEntity, "stage_payload", swap_after_stage)
+    try:
+        with BoundProjectEntity.open(root / "project.yaml") as entity:
+            result = gateway.import_candidate(
+                preview["preview_token"], project_entity=entity,
+                project_id="project-" + "a" * 32, confirmed=True)
+        assert result["error"]["code"] == "identity_mismatch"
+        assert not (root / ".vcstudio").exists()
+        assert not (holding / ".vcstudio").exists()
+    finally:
+        if root.exists() and holding.exists():
+            root.replace(replacement)
+            holding.replace(root)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX no-follow regression")
+def test_posix_project_root_symlink_is_rejected(tmp_path):
+    target = tmp_path / "project"
+    _project_manifest(target)
+    link = tmp_path / "project-link"
+    link.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ExternalReferenceError) as rejected:
+        BoundProjectEntity.open(link / "project.yaml")
+
+    assert rejected.value.code == "project_unavailable"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse-point regression")
+def test_windows_project_root_junction_is_rejected(tmp_path):
+    target = tmp_path / "project"
+    _project_manifest(target)
+    junction = tmp_path / "project-junction"
+    created = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(target)],
+        check=False, capture_output=True, text=True)
+    if created.returncode != 0:
+        pytest.skip("Windows junction creation is unavailable")
+    try:
+        with pytest.raises(ExternalReferenceError) as rejected:
+            BoundProjectEntity.open(junction / "project.yaml")
+        assert rejected.value.code == "project_unavailable"
+    finally:
+        junction.rmdir()
 
 
 def test_external_reference_api_key_uses_dedicated_keyring_namespace(monkeypatch):

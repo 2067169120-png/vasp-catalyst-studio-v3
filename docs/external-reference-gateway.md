@@ -92,6 +92,13 @@ never stored verbatim: JSON is decoded, sensitive/path-like fields are scrubbed
 and the result is canonicalized.  The manifest separately records the source
 response hash and the cached-snapshot hash.
 
+Cache discovery never performs an unbounded `read_text/json.loads`.  Each
+manifest and raw snapshot is opened no-follow (Windows reparse points included),
+read once under a hard byte cap, and validated for schema, JSON depth/node/string
+budgets, current byte size and SHA-256.  `RecursionError`, `MemoryError`,
+oversize/deep JSON, symlink/reparse entries and raw mismatches remove only the
+bad cache pair; startup and cleanup continue without reparsing valid manifests.
+
 Successful searches return a process-local opaque result token.  Tokens expire
 after 15 minutes by default.  A token can be used for read-only side-by-side
 comparison, but can authorize at most one structure-candidate claim/import;
@@ -99,9 +106,15 @@ replay and expired tokens fail closed.  The token store is independently bound
 to 64 records and 16 MiB by default and evicts oldest entries first.
 
 Candidate persistence reserves rather than consumes the result token, performs
-path/type/symlink and opaque-identity preflight, takes a cooperating
-cross-process project lock, stages and fsyncs the sidecar, rechecks project
-identity/content/path CAS, then atomically replaces the target.  Only a
+path/type/symlink and opaque-identity preflight, then binds `project.yaml` and
+its root no-follow.  Windows retains non-delete/non-write-sharing handles and
+binds volume + file IDs while rejecting every symlink/junction/reparse point;
+POSIX retains root/file descriptors bound by `dev + ino` and uses descriptor-
+relative directory, stage, replace and rollback operations.  The preview token
+also binds this entity fingerprint, so a same-UUID/same-content directory swap
+cannot redirect a later import.  A cooperating cross-process lock is keyed by
+the bound entity, and root/project.yaml identity plus manifest-content CAS are
+rechecked before and after stage, replace and token commit.  Only a
 successful commit changes the token to `committed`.  Any failure releases the
 reservation, removes staged/committed artifacts and removes directories created
 by the failed attempt when they are empty.

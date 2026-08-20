@@ -21,10 +21,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 import re
 import secrets as token_secrets
+import stat
 import tempfile
 import threading
 import time
-from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Iterator, Mapping, Protocol, Sequence, runtime_checkable
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
@@ -1365,6 +1366,85 @@ def _default_cache_root() -> Path:
     return Path.home() / ".vcstudio" / "external_reference_cache"
 
 
+_CACHE_MANIFEST_MAX_BYTES = 512 * 1024
+_CACHE_MANIFEST_MAX_DEPTH = 20
+_CACHE_MANIFEST_MAX_NODES = 10_000
+_CACHE_MANIFEST_MAX_STRING_BYTES = 256 * 1024
+
+
+def _bounded_regular_file(path: Path, *, maximum: int) -> bytes:
+    """Read one regular file through a no-follow handle under a hard byte cap."""
+    if _path_is_linklike(path):
+        raise ValueError("bounded file is a link or reparse point")
+    if os.name == "nt":
+        handle = None
+        try:
+            handle, _identity, _attributes = _win_open_entity_handle(
+                path, directory=False)
+            return _win_read_handle(handle, maximum=maximum)
+        finally:
+            _win_close_handle(handle)
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        details = os.fstat(fd)
+        if not stat.S_ISREG(details.st_mode) or details.st_size > int(maximum):
+            raise ValueError("bounded file is not regular or exceeds its limit")
+        chunks = []
+        remaining = int(maximum) + 1
+        while remaining > 0:
+            block = os.read(fd, min(64 * 1024, remaining))
+            if not block:
+                break
+            chunks.append(block)
+            remaining -= len(block)
+        payload = b"".join(chunks)
+        after = os.fstat(fd)
+        if (len(payload) > int(maximum) or len(payload) != details.st_size
+                or (after.st_dev, after.st_ino, after.st_size,
+                    after.st_mtime_ns, after.st_ctime_ns)
+                != (details.st_dev, details.st_ino, details.st_size,
+                    details.st_mtime_ns, details.st_ctime_ns)):
+            raise ValueError("bounded file changed or exceeds its limit")
+        return payload
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _validate_manifest_shape(value: Any) -> None:
+    """Bound decoded JSON without recursively walking attacker-controlled depth."""
+    nodes = 0
+    string_bytes = 0
+    stack = [(value, 0)]
+    while stack:
+        item, depth = stack.pop()
+        nodes += 1
+        if nodes > _CACHE_MANIFEST_MAX_NODES or depth > _CACHE_MANIFEST_MAX_DEPTH:
+            raise ValueError("cache manifest structure exceeds its limit")
+        if isinstance(item, str):
+            string_bytes += len(item.encode("utf-8", errors="replace"))
+        elif isinstance(item, Mapping):
+            for key, child in item.items():
+                if not isinstance(key, str):
+                    raise ValueError("cache manifest key is not text")
+                string_bytes += len(key.encode("utf-8", errors="replace"))
+                stack.append((child, depth + 1))
+        elif isinstance(item, list):
+            stack.extend((child, depth + 1) for child in item)
+        elif item is not None and not isinstance(item, (bool, int, float)):
+            raise ValueError("cache manifest contains an unsupported value")
+        if string_bytes > _CACHE_MANIFEST_MAX_STRING_BYTES:
+            raise ValueError("cache manifest strings exceed their limit")
+
+
+@dataclass(frozen=True)
+class _ValidatedCacheEntry:
+    retrieved_at_epoch: float
+    entry_id: str
+    total_size: int
+
+
 class ExternalReferenceCache:
     """Bounded response-snapshot cache with detached provenance manifests."""
 
@@ -1387,6 +1467,15 @@ class ExternalReferenceCache:
         if not self._ENTRY_RE.fullmatch(str(entry_id)):
             raise ValueError("invalid cache entry identity")
         return self.root / f"{entry_id}.raw", self.root / f"{entry_id}.json"
+
+    def _ensure_root(self) -> None:
+        if self.root.exists():
+            if _path_is_linklike(self.root) or not self.root.is_dir():
+                raise ValueError("cache root is not a trusted directory")
+        else:
+            self.root.mkdir(parents=True, exist_ok=True)
+            if _path_is_linklike(self.root) or not self.root.is_dir():
+                raise ValueError("cache root is not a trusted directory")
 
     @staticmethod
     def _atomic_write(path: Path, payload: bytes) -> None:
@@ -1413,29 +1502,40 @@ class ExternalReferenceCache:
         source_sha256 = str(
             metadata.get("source_response_sha256") or cached_sha256)
         source_size = metadata.get("source_response_size")
+        representation = str(
+            metadata.get("cache_representation") or "provider-response-bytes")
         if (not re.fullmatch(r"[a-f0-9]{64}", source_sha256)
                 or isinstance(source_size, bool)
-                or (source_size is not None and not isinstance(source_size, int))):
+                or (source_size is not None and (
+                    not isinstance(source_size, int)
+                    or source_size < 0 or source_size > MAX_RESPONSE_BYTES))):
             raise ValueError("invalid source-response metadata")
+        if representation not in {
+                "provider-response-bytes", "credential-scrubbed-json"}:
+            raise ValueError("invalid cache representation")
         entry_id = "external-" + hashlib.sha256(
             token_secrets.token_bytes(24) + cached_sha256.encode("ascii")
         ).hexdigest()[:32]
         manifest = {
+            **copy.deepcopy(dict(metadata)),
             "schema": "vcstudio.external-reference-cache-entry/v1",
             "entry_id": entry_id,
             "retrieved_at": _utc_now(now),
             "retrieved_at_epoch": now,
             "expires_at": _utc_now(now + self.ttl_seconds),
             "expires_at_epoch": now + self.ttl_seconds,
-            **copy.deepcopy(dict(metadata)),
+            "cache_representation": representation,
             "raw_response_sha256": source_sha256,
             "raw_response_size": int(source_size) if source_size is not None else len(raw),
             "cached_response_sha256": cached_sha256,
             "cached_response_size": len(raw),
         }
         encoded = _canonical_json(manifest)
+        if len(encoded) > _CACHE_MANIFEST_MAX_BYTES:
+            raise ValueError("cache manifest exceeds the byte limit")
+        _validate_manifest_shape(manifest)
         with self._lock:
-            self.root.mkdir(parents=True, exist_ok=True)
+            self._ensure_root()
             raw_path, manifest_path = self._paths(entry_id)
             self._atomic_write(raw_path, raw)
             try:
@@ -1449,35 +1549,79 @@ class ExternalReferenceCache:
             self.cleanup()
         return copy.deepcopy(manifest)
 
+    def _load_entry(self, entry_id: str) -> _ValidatedCacheEntry:
+        raw_path, manifest_path = self._paths(entry_id)
+        manifest_bytes = _bounded_regular_file(
+            manifest_path, maximum=_CACHE_MANIFEST_MAX_BYTES)
+        try:
+            data = json.loads(manifest_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError,
+                MemoryError) as exc:
+            raise ValueError("cache manifest is not bounded JSON") from exc
+        _validate_manifest_shape(data)
+        if not isinstance(data, Mapping):
+            raise ValueError("cache manifest root is not an object")
+        retrieved = data.get("retrieved_at_epoch")
+        raw_size = data.get("raw_response_size")
+        cached_size = data.get("cached_response_size")
+        raw_sha = data.get("raw_response_sha256")
+        cached_sha = data.get("cached_response_sha256")
+        representation = data.get("cache_representation")
+        if (data.get("schema") != "vcstudio.external-reference-cache-entry/v1"
+                or data.get("entry_id") != entry_id
+                or isinstance(retrieved, bool)
+                or not isinstance(retrieved, (int, float))
+                or not math.isfinite(float(retrieved))
+                or isinstance(raw_size, bool) or not isinstance(raw_size, int)
+                or raw_size < 0 or raw_size > MAX_RESPONSE_BYTES
+                or isinstance(cached_size, bool) or not isinstance(cached_size, int)
+                or cached_size < 0 or cached_size > MAX_RESPONSE_BYTES
+                or not isinstance(raw_sha, str)
+                or not re.fullmatch(r"[a-f0-9]{64}", raw_sha)
+                or not isinstance(cached_sha, str)
+                or not re.fullmatch(r"[a-f0-9]{64}", cached_sha)
+                or representation not in {
+                    "provider-response-bytes", "credential-scrubbed-json"}
+                or (representation == "provider-response-bytes"
+                    and (raw_size != cached_size or raw_sha != cached_sha))):
+            raise ValueError("cache manifest schema or raw binding is invalid")
+        raw_bytes = _bounded_regular_file(raw_path, maximum=MAX_RESPONSE_BYTES)
+        if (len(raw_bytes) != cached_size
+                or hashlib.sha256(raw_bytes).hexdigest() != cached_sha):
+            raise ValueError("cache raw bytes do not match the manifest")
+        return _ValidatedCacheEntry(
+            retrieved_at_epoch=float(retrieved), entry_id=entry_id,
+            total_size=len(manifest_bytes) + len(raw_bytes))
+
     def _entries(self) -> list[tuple[float, str, int]]:
-        records = []
-        if not self.root.is_dir():
+        records: list[tuple[float, str, int]] = []
+        if (_path_is_linklike(self.root) or not self.root.is_dir()):
             return records
         for manifest_path in self.root.glob("external-*.json"):
             entry_id = manifest_path.stem
-            if (not self._ENTRY_RE.fullmatch(entry_id)
-                    or manifest_path.is_symlink() or not manifest_path.is_file()):
+            if not self._ENTRY_RE.fullmatch(entry_id):
                 continue
             try:
-                data = json.loads(manifest_path.read_text(encoding="utf-8"))
-                if not isinstance(data, Mapping) or data.get("entry_id") != entry_id:
-                    continue
-                raw_path, _ = self._paths(entry_id)
-                size = manifest_path.stat().st_size
-                if raw_path.is_file() and not raw_path.is_symlink():
-                    size += raw_path.stat().st_size
-                records.append((float(data.get("retrieved_at_epoch") or 0), entry_id, size))
-            except (OSError, ValueError, json.JSONDecodeError):
+                loaded = self._load_entry(entry_id)
+                records.append((
+                    loaded.retrieved_at_epoch, loaded.entry_id,
+                    loaded.total_size))
+            except (OSError, ValueError, RecursionError, MemoryError):
                 continue
         return records
 
     def _remove_entry(self, entry_id: str) -> None:
         raw_path, manifest_path = self._paths(entry_id)
         for path in (raw_path, manifest_path):
-            if path.is_symlink():
-                continue
             try:
-                path.unlink(missing_ok=True)
+                details = os.lstat(path)
+                if stat.S_ISDIR(details.st_mode):
+                    if _path_is_linklike(path):
+                        path.rmdir()
+                else:
+                    path.unlink(missing_ok=True)
+            except FileNotFoundError:
+                pass
             except OSError:
                 pass
 
@@ -1485,31 +1629,27 @@ class ExternalReferenceCache:
         with self._lock:
             orphan_removed = 0
             now = float(self._clock())
-            if self.root.is_dir():
+            validated: list[_ValidatedCacheEntry] = []
+            trusted_root = (
+                not _path_is_linklike(self.root) and self.root.is_dir())
+            if trusted_root:
                 for manifest_path in self.root.glob("external-*.json"):
                     entry_id = manifest_path.stem
-                    if (not self._ENTRY_RE.fullmatch(entry_id)
-                            or manifest_path.is_symlink()):
+                    if not self._ENTRY_RE.fullmatch(entry_id):
                         continue
-                    raw_path, _ = self._paths(entry_id)
                     try:
-                        data = json.loads(manifest_path.read_text(encoding="utf-8"))
-                        valid = (
-                            isinstance(data, Mapping)
-                            and data.get("entry_id") == entry_id
-                            and raw_path.is_file() and not raw_path.is_symlink())
-                    except (OSError, json.JSONDecodeError):
-                        valid = False
-                    if not valid:
+                        validated.append(self._load_entry(entry_id))
+                    except (OSError, ValueError, RecursionError, MemoryError):
                         self._remove_entry(entry_id)
                         orphan_removed += 1
                 for raw_path in self.root.glob("external-*.raw"):
                     entry_id = raw_path.stem
-                    if (not self._ENTRY_RE.fullmatch(entry_id)
-                            or raw_path.is_symlink()):
+                    if not self._ENTRY_RE.fullmatch(entry_id):
                         continue
                     _raw, manifest_path = self._paths(entry_id)
-                    if not manifest_path.is_file() or manifest_path.is_symlink():
+                    if (not manifest_path.exists()
+                            or _path_is_linklike(manifest_path)
+                            or not manifest_path.is_file()):
                         self._remove_entry(entry_id)
                         orphan_removed += 1
                 for temp_path in self.root.glob(".external-*.tmp"):
@@ -1521,10 +1661,12 @@ class ExternalReferenceCache:
                             orphan_removed += 1
                     except OSError:
                         pass
-            entries = self._entries()
             expired = 0
             retained = []
-            for retrieved, entry_id, size in entries:
+            for loaded in validated:
+                retrieved = loaded.retrieved_at_epoch
+                entry_id = loaded.entry_id
+                size = loaded.total_size
                 if retrieved + self.ttl_seconds <= now:
                     self._remove_entry(entry_id)
                     expired += 1
@@ -1675,7 +1817,18 @@ class _ResultTokenStore:
                 raise ExternalReferenceError(
                     "invalid_token", "result token reservation is invalid")
             record.import_state = "committed"
-            record.import_reservation = None
+            record.import_reservation = reservation
+
+    def rollback_committed_import(self, token: Any, reservation: str) -> None:
+        """Undo only this transaction's just-committed in-memory authority."""
+        text = str(token or "")
+        with self._lock:
+            record = self._records.get(text)
+            if (record is not None and record.import_state == "committed"
+                    and token_secrets.compare_digest(
+                        str(record.import_reservation or ""), str(reservation))):
+                record.import_state = "available"
+                record.import_reservation = None
 
     def consume_import(self, token: Any) -> None:
         reservation = self.reserve_import(token)
@@ -1685,6 +1838,7 @@ class _ResultTokenStore:
 @dataclass(frozen=True)
 class _ImportPreviewRecord:
     project_id: str
+    project_entity_sha256: str
     result_token: str
     item_id: str
     content_sha256: str
@@ -1712,7 +1866,8 @@ class _ImportPreviewTokenStore:
             if expires <= now:
                 self._consumed.pop(token, None)
 
-    def issue(self, *, project_id: str, result_token: str, item_id: str,
+    def issue(self, *, project_id: str, project_entity_sha256: str,
+              result_token: str, item_id: str,
               content_sha256: str) -> tuple[str, float]:
         with self._lock:
             self._cleanup()
@@ -1724,7 +1879,9 @@ class _ImportPreviewTokenStore:
             token = "external-import-preview." + token_secrets.token_urlsafe(32)
             expires = float(self._clock()) + self.ttl_seconds
             self._records[token] = _ImportPreviewRecord(
-                project_id=project_id, result_token=result_token,
+                project_id=project_id,
+                project_entity_sha256=project_entity_sha256,
+                result_token=result_token,
                 item_id=item_id, content_sha256=content_sha256,
                 expires_at_epoch=expires)
             return token, expires
@@ -1769,6 +1926,501 @@ def _public_item(item: Mapping[str, Any]) -> dict[str, Any]:
         "license", "evidence_policy",
     )
     return {key: copy.deepcopy(item[key]) for key in allowed if key in item}
+
+
+_PROJECT_MANIFEST_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _path_is_linklike(path: Path) -> bool:
+    """Reject final-component symlinks and Windows reparse-point directories."""
+    try:
+        details = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(details.st_mode):
+        return True
+    return bool(
+        os.name == "nt"
+        and int(getattr(details, "st_file_attributes", 0))
+        & int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)))
+
+
+def _win_open_entity_handle(path: Path, *, directory: bool) -> tuple[int, tuple[int, int], int]:
+    """Open a final Windows path without following reparse points or sharing delete/write."""
+    import ctypes
+    from ctypes import wintypes
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", wintypes.FILETIME),
+            ("ftLastAccessTime", wintypes.FILETIME),
+            ("ftLastWriteTime", wintypes.FILETIME),
+            ("dwVolumeSerialNumber", wintypes.DWORD),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+            ("nNumberOfLinks", wintypes.DWORD),
+            ("nFileIndexHigh", wintypes.DWORD),
+            ("nFileIndexLow", wintypes.DWORD),
+        ]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    create_file.restype = wintypes.HANDLE
+    get_info = kernel.GetFileInformationByHandle
+    get_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(ByHandleFileInformation)]
+    get_info.restype = wintypes.BOOL
+    desired_access = 0x00000080 if directory else 0x80000000
+    flags = 0x00200000 | (0x02000000 if directory else 0)
+    handle = create_file(
+        str(path), desired_access,
+        0x00000001,  # FILE_SHARE_READ only: pin identity against write/delete/rename.
+        None, 3, flags, None)
+    invalid = ctypes.c_void_p(-1).value
+    value = int(handle) if handle is not None else invalid
+    if value == invalid:
+        raise OSError(ctypes.get_last_error(), "unable to bind project entity")
+    info = ByHandleFileInformation()
+    if not get_info(handle, ctypes.byref(info)):
+        error = ctypes.get_last_error()
+        kernel.CloseHandle(handle)
+        raise OSError(error, "unable to inspect project entity")
+    attributes = int(info.dwFileAttributes)
+    is_directory = bool(attributes & 0x10)
+    if bool(attributes & 0x400) or is_directory != bool(directory):
+        kernel.CloseHandle(handle)
+        raise ExternalReferenceError(
+            "project_unavailable", "project entity is a link or reparse point")
+    identity = (
+        int(info.dwVolumeSerialNumber),
+        (int(info.nFileIndexHigh) << 32) | int(info.nFileIndexLow))
+    return value, identity, attributes
+
+
+def _win_close_handle(handle: int | None) -> None:
+    if handle is None:
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    kernel.CloseHandle(wintypes.HANDLE(handle))
+
+
+def _win_read_handle(handle: int, *, maximum: int) -> bytes:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetFileSizeEx.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_longlong)]
+    kernel.GetFileSizeEx.restype = wintypes.BOOL
+    kernel.SetFilePointerEx.argtypes = [
+        wintypes.HANDLE, ctypes.c_longlong,
+        ctypes.POINTER(ctypes.c_longlong), wintypes.DWORD]
+    kernel.SetFilePointerEx.restype = wintypes.BOOL
+    kernel.ReadFile.argtypes = [
+        wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+    kernel.ReadFile.restype = wintypes.BOOL
+    size = ctypes.c_longlong()
+    if not kernel.GetFileSizeEx(wintypes.HANDLE(handle), ctypes.byref(size)):
+        raise OSError(ctypes.get_last_error(), "unable to size project manifest")
+    if size.value < 0 or size.value > int(maximum):
+        raise ExternalReferenceError(
+            "project_unavailable", "project manifest exceeds the byte limit")
+    position = ctypes.c_longlong()
+    if not kernel.SetFilePointerEx(
+            wintypes.HANDLE(handle), ctypes.c_longlong(0),
+            ctypes.byref(position), 0):
+        raise OSError(ctypes.get_last_error(), "unable to seek project manifest")
+    chunks = []
+    remaining = int(size.value)
+    while remaining:
+        count = min(remaining, 64 * 1024)
+        buffer = ctypes.create_string_buffer(count)
+        read = wintypes.DWORD()
+        if not kernel.ReadFile(
+                wintypes.HANDLE(handle), buffer, count,
+                ctypes.byref(read), None):
+            raise OSError(ctypes.get_last_error(), "unable to read project manifest")
+        if not read.value:
+            break
+        chunks.append(buffer.raw[:read.value])
+        remaining -= int(read.value)
+    payload = b"".join(chunks)
+    if len(payload) != int(size.value):
+        raise ExternalReferenceError(
+            "identity_mismatch", "project manifest changed while it was read")
+    return payload
+
+
+def _read_posix_fd(fd: int, *, maximum: int) -> bytes:
+    details = os.fstat(fd)
+    if details.st_size < 0 or details.st_size > int(maximum):
+        raise ExternalReferenceError(
+            "project_unavailable", "project manifest exceeds the byte limit")
+    chunks = []
+    offset = 0
+    while offset < details.st_size:
+        block = os.pread(fd, min(64 * 1024, details.st_size - offset), offset)
+        if not block:
+            break
+        chunks.append(block)
+        offset += len(block)
+    payload = b"".join(chunks)
+    after = os.fstat(fd)
+    if (len(payload) != details.st_size
+            or (after.st_dev, after.st_ino, after.st_size,
+                after.st_mtime_ns, after.st_ctime_ns)
+            != (details.st_dev, details.st_ino, details.st_size,
+                details.st_mtime_ns, details.st_ctime_ns)):
+        raise ExternalReferenceError(
+            "identity_mismatch", "project manifest changed while it was read")
+    return payload
+
+
+class BoundProjectEntity:
+    """Pinned project root and project.yaml identity used by one import request.
+
+    Windows pins volume/file IDs with non-delete/non-write-sharing handles.
+    POSIX pins ``dev+ino`` directory/file descriptors and performs every
+    candidate mutation relative to those descriptors.
+    """
+
+    def __init__(self, *, canonical_root: Path, manifest_name: str,
+                 root_identity: tuple[int, int],
+                 manifest_identity: tuple[int, int], manifest_sha256: str,
+                 root_handle: int, manifest_handle: int, windows: bool):
+        self.canonical_root = canonical_root
+        self.manifest_name = manifest_name
+        self.root_identity = root_identity
+        self.manifest_identity = manifest_identity
+        self.manifest_sha256 = manifest_sha256
+        self._root_handle = root_handle
+        self._manifest_handle = manifest_handle
+        self._windows = windows
+        self._state_handle: int | None = None
+        self._destination_handle: int | None = None
+        self._created_state = False
+        self._created_destination = False
+        self._closed = False
+        self.identity_sha256 = hashlib.sha256(_canonical_json({
+            "platform": "windows-file-id" if windows else "posix-dev-ino",
+            "canonical_root": os.path.normcase(os.path.normpath(str(canonical_root))),
+            "root_identity": list(root_identity),
+            "manifest_identity": list(manifest_identity),
+            "manifest_sha256": manifest_sha256,
+        })).hexdigest()
+
+    @classmethod
+    def open(cls, manifest_path: str | os.PathLike[str]) -> "BoundProjectEntity":
+        authored = Path(os.path.abspath(os.path.expanduser(str(manifest_path))))
+        if authored.name.casefold() != "project.yaml" or not authored.parent.is_absolute():
+            raise ExternalReferenceError(
+                "project_unavailable", "project manifest locator is invalid")
+        root_authored = authored.parent
+        if (_path_is_linklike(root_authored) or _path_is_linklike(authored)
+                or not root_authored.is_dir() or not authored.is_file()):
+            raise ExternalReferenceError(
+                "project_unavailable", "project root or manifest is not a regular entity")
+        canonical_root = Path(os.path.realpath(root_authored))
+        canonical_manifest = canonical_root / authored.name
+        if os.name == "nt":
+            root_handle = manifest_handle = None
+            try:
+                root_handle, root_identity, _ = _win_open_entity_handle(
+                    canonical_root, directory=True)
+                manifest_handle, manifest_identity, _ = _win_open_entity_handle(
+                    canonical_manifest, directory=False)
+                manifest_payload = _win_read_handle(
+                    manifest_handle, maximum=_PROJECT_MANIFEST_MAX_BYTES)
+                result = cls(
+                    canonical_root=canonical_root, manifest_name=authored.name,
+                    root_identity=root_identity,
+                    manifest_identity=manifest_identity,
+                    manifest_sha256=hashlib.sha256(manifest_payload).hexdigest(),
+                    root_handle=root_handle, manifest_handle=manifest_handle,
+                    windows=True)
+                result.verify()
+                return result
+            except Exception:
+                _win_close_handle(manifest_handle)
+                _win_close_handle(root_handle)
+                raise
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        root_fd = manifest_fd = None
+        try:
+            root_fd = os.open(canonical_root, flags)
+            manifest_fd = os.open(
+                authored.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
+            root_stat = os.fstat(root_fd)
+            manifest_stat = os.fstat(manifest_fd)
+            if not stat.S_ISDIR(root_stat.st_mode) or not stat.S_ISREG(manifest_stat.st_mode):
+                raise ExternalReferenceError(
+                    "project_unavailable", "project root or manifest type is invalid")
+            manifest_payload = _read_posix_fd(
+                manifest_fd, maximum=_PROJECT_MANIFEST_MAX_BYTES)
+            result = cls(
+                canonical_root=canonical_root, manifest_name=authored.name,
+                root_identity=(int(root_stat.st_dev), int(root_stat.st_ino)),
+                manifest_identity=(int(manifest_stat.st_dev), int(manifest_stat.st_ino)),
+                manifest_sha256=hashlib.sha256(manifest_payload).hexdigest(),
+                root_handle=root_fd, manifest_handle=manifest_fd,
+                windows=False)
+            result.verify()
+            return result
+        except Exception:
+            if manifest_fd is not None:
+                os.close(manifest_fd)
+            if root_fd is not None:
+                os.close(root_fd)
+            raise
+
+    def _manifest_payload(self) -> bytes:
+        return (_win_read_handle(
+            self._manifest_handle, maximum=_PROJECT_MANIFEST_MAX_BYTES)
+            if self._windows else _read_posix_fd(
+                self._manifest_handle, maximum=_PROJECT_MANIFEST_MAX_BYTES))
+
+    def verify(self) -> None:
+        if self._closed:
+            raise ExternalReferenceError(
+                "identity_mismatch", "project entity binding is closed")
+        try:
+            if (_path_is_linklike(self.canonical_root)
+                    or _path_is_linklike(self.canonical_root / self.manifest_name)):
+                raise ExternalReferenceError(
+                    "identity_mismatch", "project entity became a link or reparse point")
+            if self._windows:
+                root_check = manifest_check = None
+                try:
+                    root_check, root_identity, _ = _win_open_entity_handle(
+                        self.canonical_root, directory=True)
+                    manifest_check, manifest_identity, _ = _win_open_entity_handle(
+                        self.canonical_root / self.manifest_name, directory=False)
+                finally:
+                    _win_close_handle(manifest_check)
+                    _win_close_handle(root_check)
+            else:
+                root_stat = os.lstat(self.canonical_root)
+                manifest_stat = os.stat(
+                    self.manifest_name, dir_fd=self._root_handle,
+                    follow_symlinks=False)
+                root_identity = (int(root_stat.st_dev), int(root_stat.st_ino))
+                manifest_identity = (
+                    int(manifest_stat.st_dev), int(manifest_stat.st_ino))
+            if (root_identity != self.root_identity
+                    or manifest_identity != self.manifest_identity
+                    or hashlib.sha256(self._manifest_payload()).hexdigest()
+                    != self.manifest_sha256):
+                raise ExternalReferenceError(
+                    "identity_mismatch", "project entity changed during import")
+        except ExternalReferenceError:
+            raise
+        except (OSError, ValueError) as exc:
+            raise ExternalReferenceError(
+                "identity_mismatch", "project entity changed during import") from exc
+
+    def prepare_candidate_destination(self) -> None:
+        self.verify()
+        if self._destination_handle is not None:
+            return
+        if self._windows:
+            state_path = self.canonical_root / ".vcstudio"
+            destination_path = state_path / "external_reference_candidates"
+            try:
+                if not state_path.exists():
+                    state_path.mkdir()
+                    self._created_state = True
+                if _path_is_linklike(state_path) or not state_path.is_dir():
+                    raise ExternalReferenceError(
+                        "candidate_import_failed", "candidate state directory is not trusted")
+                self._state_handle, state_identity, _ = _win_open_entity_handle(
+                    state_path, directory=True)
+                if state_identity[0] != self.root_identity[0]:
+                    raise ExternalReferenceError(
+                        "candidate_import_failed", "candidate state volume is not trusted")
+                if not destination_path.exists():
+                    destination_path.mkdir()
+                    self._created_destination = True
+                if _path_is_linklike(destination_path) or not destination_path.is_dir():
+                    raise ExternalReferenceError(
+                        "candidate_import_failed", "candidate destination is not trusted")
+                self._destination_handle, destination_identity, _ = _win_open_entity_handle(
+                    destination_path, directory=True)
+                if destination_identity[0] != self.root_identity[0]:
+                    raise ExternalReferenceError(
+                        "candidate_import_failed", "candidate destination volume is not trusted")
+            except Exception:
+                self.cleanup_created_directories()
+                raise
+            self.verify()
+            return
+        try:
+            try:
+                os.mkdir(".vcstudio", dir_fd=self._root_handle)
+                self._created_state = True
+            except FileExistsError:
+                pass
+            self._state_handle = os.open(
+                ".vcstudio", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=self._root_handle)
+            state_stat = os.fstat(self._state_handle)
+            if (not stat.S_ISDIR(state_stat.st_mode)
+                    or int(state_stat.st_dev) != self.root_identity[0]):
+                raise ExternalReferenceError(
+                    "candidate_import_failed", "candidate state directory is not trusted")
+            try:
+                os.mkdir("external_reference_candidates", dir_fd=self._state_handle)
+                self._created_destination = True
+            except FileExistsError:
+                pass
+            self._destination_handle = os.open(
+                "external_reference_candidates",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=self._state_handle)
+            destination_stat = os.fstat(self._destination_handle)
+            if (not stat.S_ISDIR(destination_stat.st_mode)
+                    or int(destination_stat.st_dev) != self.root_identity[0]):
+                raise ExternalReferenceError(
+                    "candidate_import_failed", "candidate destination is not trusted")
+        except Exception:
+            self.cleanup_created_directories()
+            raise
+        self.verify()
+
+    def _destination_path(self, name: str) -> Path:
+        if not re.fullmatch(r"\.?[A-Za-z0-9_.-]{1,160}", str(name)):
+            raise ExternalReferenceError(
+                "candidate_import_failed", "candidate filename is invalid")
+        return (self.canonical_root / ".vcstudio"
+                / "external_reference_candidates" / str(name))
+
+    def name_exists(self, name: str) -> bool:
+        if self._destination_handle is None:
+            raise ExternalReferenceError(
+                "candidate_import_failed", "candidate destination is unavailable")
+        if self._windows:
+            path = self._destination_path(name)
+            return path.exists() or path.is_symlink() or _path_is_linklike(path)
+        try:
+            os.stat(name, dir_fd=self._destination_handle, follow_symlinks=False)
+            return True
+        except FileNotFoundError:
+            return False
+
+    def stage_payload(self, name: str, payload: bytes) -> None:
+        if self._destination_handle is None:
+            raise ExternalReferenceError(
+                "candidate_import_failed", "candidate destination is unavailable")
+        self.verify()
+        if self._windows:
+            with self._destination_path(name).open("xb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        else:
+            fd = os.open(
+                name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600, dir_fd=self._destination_handle)
+            try:
+                view = memoryview(payload)
+                written = 0
+                while written < len(view):
+                    written += os.write(fd, view[written:])
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        self.verify()
+
+    def replace_stage(self, stage_name: str, target_name: str) -> None:
+        self.verify()
+        if self.name_exists(target_name):
+            raise ExternalReferenceError(
+                "candidate_import_failed", "candidate identity already exists")
+        if self._windows:
+            os.replace(
+                self._destination_path(stage_name),
+                self._destination_path(target_name))
+        else:
+            os.replace(
+                stage_name, target_name,
+                src_dir_fd=self._destination_handle,
+                dst_dir_fd=self._destination_handle)
+        self.verify()
+
+    def remove_name(self, name: str) -> None:
+        try:
+            if self._windows:
+                self._destination_path(name).unlink(missing_ok=True)
+            else:
+                os.unlink(name, dir_fd=self._destination_handle)
+        except FileNotFoundError:
+            pass
+
+    def cleanup_created_directories(self) -> None:
+        if self._windows:
+            _win_close_handle(self._destination_handle)
+            _win_close_handle(self._state_handle)
+            self._destination_handle = None
+            self._state_handle = None
+            if self._created_destination:
+                try:
+                    (self.canonical_root / ".vcstudio"
+                     / "external_reference_candidates").rmdir()
+                except OSError:
+                    pass
+            if self._created_state:
+                try:
+                    (self.canonical_root / ".vcstudio").rmdir()
+                except OSError:
+                    pass
+            return
+        if self._destination_handle is not None:
+            os.close(self._destination_handle)
+            self._destination_handle = None
+        if self._created_destination and self._state_handle is not None:
+            try:
+                os.rmdir("external_reference_candidates", dir_fd=self._state_handle)
+            except OSError:
+                pass
+        if self._state_handle is not None:
+            os.close(self._state_handle)
+            self._state_handle = None
+        if self._created_state:
+            try:
+                os.rmdir(".vcstudio", dir_fd=self._root_handle)
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        if self._windows:
+            _win_close_handle(self._destination_handle)
+            _win_close_handle(self._state_handle)
+            _win_close_handle(self._manifest_handle)
+            _win_close_handle(self._root_handle)
+        else:
+            for fd in (
+                    self._destination_handle, self._state_handle,
+                    self._manifest_handle, self._root_handle):
+                if fd is not None:
+                    os.close(fd)
+        self._destination_handle = None
+        self._state_handle = None
+        self._closed = True
+
+    def __enter__(self) -> "BoundProjectEntity":
+        return self
+
+    def __exit__(self, *_args) -> None:
+        self.close()
 
 
 _PROJECT_IMPORT_LOCKS: dict[str, threading.Lock] = {}
@@ -2283,13 +2935,18 @@ class ExternalReferenceGateway:
         )
 
     def prepare_candidate_import(self, result_token: Any, item_id: Any, *,
-                                 project_id: Any) -> dict[str, Any]:
+                                 project_id: Any,
+                                 project_entity_sha256: Any) -> dict[str, Any]:
         """Issue a path-free, project/content-bound preview before confirmation."""
         try:
             identifier = str(project_id or "").strip().lower()
             if not _PROJECT_ID_RE.fullmatch(identifier):
                 raise ExternalReferenceError(
                     "invalid_project_identity", "project identity is invalid")
+            entity_sha256 = str(project_entity_sha256 or "")
+            if not re.fullmatch(r"[a-f0-9]{64}", entity_sha256):
+                raise ExternalReferenceError(
+                    "invalid_project_identity", "project entity binding is invalid")
             self._tokens.resolve(result_token, for_import=True)
             preview = self.preview_structure_candidate(result_token, item_id)
             content_sha256 = str(
@@ -2298,7 +2955,9 @@ class ExternalReferenceGateway:
                 raise ExternalReferenceError(
                     "structure_changed", "external structure content binding is invalid")
             token, expires = self._import_previews.issue(
-                project_id=identifier, result_token=str(result_token),
+                project_id=identifier,
+                project_entity_sha256=entity_sha256,
+                result_token=str(result_token),
                 item_id=str(preview.provenance.get("item_id") or ""),
                 content_sha256=content_sha256)
             sites = 0
@@ -2328,44 +2987,9 @@ class ExternalReferenceGateway:
             return self._unavailable(
                 exc.code, str(exc), schema=IMPORT_PREVIEW_SCHEMA)
 
-    @staticmethod
-    def _validate_import_identity(
-            validator: Callable[[], bool] | None) -> None:
-        if validator is None:
-            return
-        try:
-            valid = validator()
-        except Exception as exc:
-            raise ExternalReferenceError(
-                "identity_mismatch", "project identity changed during import") from exc
-        if valid is not True:
-            raise ExternalReferenceError(
-                "identity_mismatch", "project identity changed during import")
-
-    @staticmethod
-    def _preflight_import_paths(root: Path) -> tuple[Path, Path]:
-        state_root = root / ".vcstudio"
-        destination = state_root / "external_reference_candidates"
-        for path in (state_root, destination):
-            if path.is_symlink():
-                raise ExternalReferenceError(
-                    "candidate_import_failed",
-                    "candidate provenance destination is not trusted")
-            if path.exists() and not path.is_dir():
-                raise ExternalReferenceError(
-                    "candidate_import_failed",
-                    "candidate provenance destination is not a directory")
-        for path in (state_root, destination):
-            if not path.resolve().is_relative_to(root):
-                raise ExternalReferenceError(
-                    "candidate_import_failed",
-                    "candidate provenance destination is not trusted")
-        return state_root, destination
-
     def import_candidate(self, preview_token: Any, *,
-                         project_root: str | os.PathLike[str], project_id: str,
-                         confirmed: bool,
-                         identity_validator: Callable[[], bool] | None = None) -> dict[str, Any]:
+                         project_entity: BoundProjectEntity, project_id: str,
+                         confirmed: bool) -> dict[str, Any]:
         try:
             if confirmed is not True:
                 raise ExternalReferenceError(
@@ -2374,25 +2998,25 @@ class ExternalReferenceGateway:
             if not _PROJECT_ID_RE.fullmatch(identifier):
                 raise ExternalReferenceError(
                     "invalid_project_identity", "project identity is invalid")
-            root = Path(project_root).expanduser().resolve()
-            if root.parent == root or not root.is_dir():
+            if not isinstance(project_entity, BoundProjectEntity):
                 raise ExternalReferenceError(
-                    "project_unavailable", "project root is unavailable")
-            self._validate_import_identity(identity_validator)
-            self._preflight_import_paths(root)
+                    "project_unavailable", "project entity binding is required")
+            project_entity.verify()
             binding = self._import_previews.resolve(
                 preview_token, project_id=identifier)
+            if not token_secrets.compare_digest(
+                    binding.project_entity_sha256,
+                    project_entity.identity_sha256):
+                raise ExternalReferenceError(
+                    "identity_mismatch", "project entity differs from the preview")
             reservation = None
-            temp: Path | None = None
-            target: Path | None = None
-            created_state = False
-            created_destination = False
+            stage_name: str | None = None
+            target_name: str | None = None
             committed_file = False
             token_committed = False
             try:
-                with _project_import_lock(root):
-                    self._validate_import_identity(identity_validator)
-                    state_root, destination = self._preflight_import_paths(root)
+                with _project_import_lock(project_entity.identity_sha256):
+                    project_entity.verify()
                     preview = self.preview_structure_candidate(
                         binding.result_token, binding.item_id)
                     content_sha256 = str(
@@ -2403,19 +3027,12 @@ class ExternalReferenceGateway:
                             "structure_changed", "external structure changed after preview")
                     reservation = self._tokens.reserve_import(binding.result_token)
                     candidate = self._candidate_from_preview(preview)
-                    self._validate_import_identity(identity_validator)
-                    self._preflight_import_paths(root)
-                    if not state_root.exists():
-                        state_root.mkdir()
-                        created_state = True
-                    if not destination.exists():
-                        destination.mkdir()
-                        created_destination = True
-                    self._preflight_import_paths(root)
-                    target = destination / f"{candidate.candidate_id}.json"
-                    temp = destination / (
+                    project_entity.verify()
+                    project_entity.prepare_candidate_destination()
+                    target_name = f"{candidate.candidate_id}.json"
+                    stage_name = (
                         f".{candidate.candidate_id}.{token_secrets.token_hex(8)}.tmp")
-                    if target.exists() or target.is_symlink():
+                    if project_entity.name_exists(target_name):
                         raise ExternalReferenceError(
                             "candidate_import_failed", "candidate identity already exists")
                     payload = {
@@ -2435,48 +3052,33 @@ class ExternalReferenceGateway:
                         "evidence_policy": copy.deepcopy(dict(candidate.evidence_policy)),
                         "imported_at": _utc_now(float(self._clock())),
                     }
-                    with temp.open("xb") as handle:
-                        handle.write(_canonical_json(payload))
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    self._validate_import_identity(identity_validator)
-                    self._preflight_import_paths(root)
-                    if target.exists() or target.is_symlink():
-                        raise ExternalReferenceError(
-                            "candidate_import_failed", "candidate identity already exists")
-                    os.replace(temp, target)
-                    temp = None
+                    project_entity.stage_payload(stage_name, _canonical_json(payload))
+                    project_entity.verify()
+                    project_entity.replace_stage(stage_name, target_name)
+                    stage_name = None
                     committed_file = True
-                    self._validate_import_identity(identity_validator)
+                    project_entity.verify()
                     self._tokens.commit_import(binding.result_token, reservation)
                     token_committed = True
+                    try:
+                        project_entity.verify()
+                    except Exception:
+                        self._tokens.rollback_committed_import(
+                            binding.result_token, reservation)
+                        token_committed = False
+                        raise
                     self._import_previews.consume(preview_token)
             except Exception:
-                if committed_file and target is not None and not token_committed:
-                    try:
-                        target.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+                if committed_file and target_name is not None and not token_committed:
+                    project_entity.remove_name(target_name)
                 if reservation is not None and not token_committed:
                     self._tokens.release_import(binding.result_token, reservation)
                 raise
             finally:
-                if temp is not None:
-                    try:
-                        temp.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+                if stage_name is not None:
+                    project_entity.remove_name(stage_name)
                 if not token_committed:
-                    if created_destination:
-                        try:
-                            destination.rmdir()
-                        except OSError:
-                            pass
-                    if created_state:
-                        try:
-                            state_root.rmdir()
-                        except OSError:
-                            pass
+                    project_entity.cleanup_created_directories()
             return {
                 "schema": CANDIDATE_SCHEMA,
                 "ok": True,
@@ -2868,7 +3470,7 @@ class StructureSourceGatewayAdapter:
 
 __all__ = [
     "APPLICATION_USER_AGENT", "AdapterResult", "BoundedHttpTransport", "CATALOG_SCHEMA",
-    "CANDIDATE_SCHEMA", "COMPARE_SCHEMA", "CatalysisHubAdapter",
+    "BoundProjectEntity", "CANDIDATE_SCHEMA", "COMPARE_SCHEMA", "CatalysisHubAdapter",
     "ExternalReferenceCache", "ExternalReferenceError",
     "ExternalReferenceGateway", "ExternalReferenceProtocol",
     "ExternalStructureCandidate", "MaterialsProjectAdapter",
