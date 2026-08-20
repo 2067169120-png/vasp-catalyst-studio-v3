@@ -2686,6 +2686,19 @@ def _read_remote_text(client, path: str) -> str:
     return out
 
 
+def _remote_sha256_guard(name: str, expected_sha256: str) -> str:
+    """Shell precondition for one fixed-name remote input (fails if tool/file differs)."""
+    digest = str(expected_sha256 or '').lower()
+    if re.fullmatch(r'[0-9a-f]{64}', digest) is None:
+        raise ValueError('远端输入 SHA-256 绑定无效')
+    filename = str(name or '')
+    if filename not in {'INCAR', 'POSCAR', 'CONTCAR'}:
+        raise ValueError('远端输入文件名不在续算白名单')
+    return (
+        f"printf '%s  %s\\n' {shlex.quote(digest)} {shlex.quote(filename)} "
+        '| sha256sum -c - >/dev/null')
+
+
 def _contcar_min_distance(text: str):
     """CONTCAR → 周期最小间距；非有限数值/奇异晶胞/解析失败均返回 None。"""
     try:
@@ -2899,6 +2912,7 @@ def continue_from_contcar(client, profile, job_dir: str,
     local_incar = os.path.join(job_dir, 'INCAR')
     if not os.path.isfile(local_incar):
         raise ValueError('本地作业目录缺 INCAR，无法证明冻结输入，不能续算')
+    incar_source_sha256 = manifest_mod.sha256_file(local_incar)
     request = {
         'schema': 'vcstudio.continuation-request/v1',
         'manifest_job_id': str(m.get('job_id') or ''),
@@ -2911,7 +2925,7 @@ def continue_from_contcar(client, profile, job_dir: str,
             'manual-explicit' if manual_round_override else None),
         'contcar_source_sha256': hashlib.sha256(
             contcar.encode('utf-8')).hexdigest(),
-        'incar_source_sha256': manifest_mod.sha256_file(local_incar),
+        'incar_source_sha256': incar_source_sha256,
     }
     request_sha256 = _job_action_request_sha256(request)
 
@@ -2935,13 +2949,22 @@ def continue_from_contcar(client, profile, job_dir: str,
         cleanup = _restart_cleanup_command(m, job_dir)
         archive_command, archive_dir = _restart_archive_command(
             rounds + 1, backup_inputs=('POSCAR',), promote_contcar=True)
-        run_cmd(
-            client,
-            f'cd {shlex.quote(remote)} && {archive_command} && {cleanup}',
-            check=True)
         dialect = get_dialect(profile.scheduler)
-        out, err = run_cmd(client, dialect.submit_cmd(
-            posixpath.join(remote, SCRIPT_NAME), getattr(profile, 'scheduler_bin', '')))
+        submit_command = dialect.submit_cmd(
+            posixpath.join(remote, SCRIPT_NAME),
+            getattr(profile, 'scheduler_bin', ''))
+        contcar_sha256 = request['contcar_source_sha256']
+        command = ' && '.join((
+            f'cd {shlex.quote(remote)}',
+            _remote_sha256_guard('INCAR', incar_source_sha256),
+            _remote_sha256_guard('CONTCAR', contcar_sha256),
+            archive_command,
+            cleanup,
+            _remote_sha256_guard('INCAR', incar_source_sha256),
+            _remote_sha256_guard('POSCAR', contcar_sha256),
+            submit_command,
+        ))
+        out, err = run_cmd(client, command, check=True)
     except Exception as exc:  # noqa: BLE001 - remote mutation may be partial
         _mark_job_action_unknown(job_dir, record, str(exc))
         raise UnknownRemoteJobOperation(
@@ -3154,12 +3177,23 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
     new_text = (incar_text if incar_text.endswith('\n') else incar_text + '\n') + block
     local_poscar = os.path.join(job_dir, 'POSCAR')
     local_poscar_existed = os.path.isfile(local_poscar)
+    if not promoted_contcar and not local_poscar_existed:
+        raise ValueError(
+            '本地作业目录缺 POSCAR，无法绑定未提升结构的实际输入，不能改参续算')
+
+    incar_target_sha256 = hashlib.sha256(
+        new_text.encode('utf-8')).hexdigest()
+    poscar_target_sha256 = (
+        hashlib.sha256(contcar.encode('utf-8')).hexdigest()
+        if promoted_contcar else manifest_mod.sha256_file(local_poscar))
 
     # 续算沉降基线:重投前记下上一轮 OUTCAR 的 mtime(此刻新作业尚未启动,仍是旧文件)
     _o0, _z0, _base_outcar_mtime = _stat_outcar_full(client, remote)
 
     request['incar_source_sha256'] = hashlib.sha256(
         incar_text.encode('utf-8')).hexdigest()
+    request['incar_target_sha256'] = incar_target_sha256
+    request['poscar_target_sha256'] = poscar_target_sha256
     if promoted_contcar:
         request['contcar_source_sha256'] = hashlib.sha256(
             contcar.encode('utf-8')).hexdigest()
@@ -3182,16 +3216,27 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
         archive_command, archive_dir = _restart_archive_command(
             rounds + 1, backup_inputs=('INCAR', 'POSCAR'),
             promote_contcar=promoted_contcar)
+        pre_archive_guard = _remote_sha256_guard(
+            'CONTCAR' if promoted_contcar else 'POSCAR',
+            request.get('contcar_source_sha256') if promoted_contcar
+            else poscar_target_sha256)
         run_cmd(
             client,
-            f'cd {shlex.quote(remote)} && {archive_command} && '
-            f'{_restart_cleanup_command(m, job_dir)}',
+            f'cd {shlex.quote(remote)} && {pre_archive_guard} && '
+            f'{archive_command} && {_restart_cleanup_command(m, job_dir)}',
             check=True)
         sftp.put(local_incar, posixpath.join(remote, 'INCAR'))
         dialect = get_dialect(profile.scheduler)
-        out, err = run_cmd(client, dialect.submit_cmd(
+        submit_command = dialect.submit_cmd(
             posixpath.join(remote, SCRIPT_NAME),
-            getattr(profile, 'scheduler_bin', '')))
+            getattr(profile, 'scheduler_bin', ''))
+        out, err = run_cmd(
+            client, ' && '.join((
+                f'cd {shlex.quote(remote)}',
+                _remote_sha256_guard('INCAR', incar_target_sha256),
+                _remote_sha256_guard('POSCAR', poscar_target_sha256),
+                submit_command,
+            )), check=True)
     except Exception as exc:  # noqa: BLE001 - remote mutation may be partial
         _mark_job_action_unknown(job_dir, record, str(exc))
         raise UnknownRemoteJobOperation(

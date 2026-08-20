@@ -905,6 +905,50 @@ def test_manual_continue_manifest_failure_retains_durable_authorization(
     assert retry.commands == []
 
 
+def test_manual_continue_hash_guards_are_in_the_submit_transaction(tmp_path):
+    d = _restartable_job(tmp_path, rounds=submitter.CONTINUE_MAX_ROUNDS)
+    client = FakeClient(script=[('cat', _VALID_CONTCAR), ('qsub', '502.c\n')])
+
+    submitter.continue_from_contcar(
+        client, _profile(), d, max_rounds=None,
+        idempotency_key='manual-continue-hash-001')
+
+    record = submitter._read_job_action_journal(d)['operations'][-1]
+    request = record['request']
+    command = next(item for item in client.commands if 'qsub' in item)
+    assert command.count('sha256sum -c -') == 4
+    assert request['incar_source_sha256'] in command
+    assert command.count(request['contcar_source_sha256']) == 2
+    assert command.index('sha256sum -c -') < command.index('cp CONTCAR POSCAR')
+    assert command.rindex('sha256sum -c -') < command.index('qsub')
+
+
+def test_manual_continue_hash_precondition_failure_blocks_replay(tmp_path):
+    d = _restartable_job(tmp_path, rounds=submitter.CONTINUE_MAX_ROUNDS)
+    before = manifest.load_manifest(d)
+    client = FakeClient(
+        script=[('cat', _VALID_CONTCAR), ('qsub', 'must-not-accept.c\n')],
+        exit_codes={'sha256sum -c -': 1})
+
+    with pytest.raises(submitter.UnknownRemoteJobOperation, match='事务中断'):
+        submitter.continue_from_contcar(
+            client, _profile(), d, max_rounds=None,
+            idempotency_key='manual-continue-hash-fail-001')
+
+    assert manifest.load_manifest(d) == before
+    record = submitter._read_job_action_journal(d)['operations'][-1]
+    assert record['status'] == 'unknown_remote_outcome'
+    assert 'sha256sum -c -' in next(
+        item for item in client.commands if 'qsub' in item)
+
+    retry = FakeClient()
+    with pytest.raises(submitter.UnknownRemoteJobOperation):
+        submitter.continue_from_contcar(
+            retry, _profile(), d, max_rounds=None,
+            idempotency_key='manual-continue-hash-fail-001')
+    assert retry.commands == []
+
+
 def test_continue_refuses_invalid_contcar(tmp_path):
     d = _restartable_job(tmp_path)
     client = FakeClient(script=[('cat', 'garbage\nshort\n')])   # CONTCAR 不完整

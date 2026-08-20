@@ -364,6 +364,27 @@ def test_tune_manifest_failure_retains_durable_manual_gate(tmp_path, monkeypatch
     assert restarted.commands == []
 
 
+def test_tune_submit_is_guarded_by_frozen_incar_and_promoted_poscar_hashes(
+        tmp_path):
+    d = _terminal_job(tmp_path)
+    key = 'manual-tune-hash-guard-001'
+    client = FakeClient(script=[('cat', _CONTCAR), ('qsub', '907.cluster\n')])
+
+    submitter.continue_with_incar_changes(
+        client, FakeSFTP(), _profile(), d, {'ALGO': 'Normal'},
+        max_rounds=None, idempotency_key=key)
+
+    request = submitter._read_job_action_journal(d)['operations'][-1]['request']
+    pre_archive = next(item for item in client.commands
+                       if 'sha256sum -c -' in item and 'qsub' not in item)
+    submit_command = next(item for item in client.commands if 'qsub' in item)
+    assert request['contcar_source_sha256'] in pre_archive
+    assert request['incar_target_sha256'] in submit_command
+    assert request['poscar_target_sha256'] in submit_command
+    assert submit_command.count('sha256sum -c -') == 2
+    assert submit_command.rindex('sha256sum -c -') < submit_command.index('qsub')
+
+
 def test_continue_and_tune_require_explicit_terminal_state(tmp_path):
     d = _terminal_job(tmp_path)
     data = manifest.load_manifest(d)
