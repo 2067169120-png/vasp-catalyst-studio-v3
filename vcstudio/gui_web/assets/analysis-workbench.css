@@ -314,6 +314,31 @@
   grid-column: span 2;
 }
 
+.aw-condition-fields {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(5, minmax(100px, 1fr));
+  gap: 7px;
+  padding: 8px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--surface-soft);
+}
+
+.aw-condition-fields > strong,
+.aw-condition-fields > small {
+  grid-column: 1 / -1;
+}
+
+.aw-condition-fields > strong {
+  font-size: 10px;
+}
+
+.aw-condition-fields > small {
+  color: var(--muted);
+  font-size: 8.5px;
+}
+
 .aw-sensitivity {
   display: flex;
   flex-wrap: wrap;
@@ -708,6 +733,64 @@
   overflow-wrap: anywhere;
 }
 
+.aw-reaction-section {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.aw-reaction-section:last-child {
+  border-bottom: 0;
+}
+
+.aw-reaction-section > h3 {
+  margin: 0;
+  font-size: 12px;
+}
+
+.aw-reaction-note {
+  margin: -4px 0 0;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.aw-reaction-section .aw-table {
+  border: 1px solid var(--rule);
+}
+
+.aw-reaction-evidence-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.aw-reaction-evidence-card {
+  min-width: 0;
+  padding: 7px;
+  border: 1px solid var(--rule);
+  border-radius: 5px;
+  background: var(--th-bg);
+}
+
+.aw-reaction-evidence-card h4,
+.aw-reaction-evidence-card p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.aw-reaction-evidence-card h4 {
+  margin-bottom: 4px;
+  font-size: 9.5px;
+}
+
+.aw-reaction-evidence-card p {
+  color: var(--muted);
+  font-size: 8.5px;
+  line-height: 1.45;
+}
+
 @media (max-width: 1180px) {
   .aw-layout {
     grid-template-columns: minmax(200px, 230px) minmax(0, 1fr);
@@ -728,6 +811,10 @@
   }
 
   .aw-controls {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .aw-condition-fields {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
@@ -776,6 +863,10 @@
     grid-template-columns: 1fr;
   }
 
+  .aw-reaction-evidence-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .aw-table-scroll {
     max-height: 430px;
   }
@@ -802,6 +893,10 @@
 
   .aw-field-wide {
     grid-column: auto;
+  }
+
+  .aw-condition-fields {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .aw-table {

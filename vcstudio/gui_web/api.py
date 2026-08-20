@@ -32,6 +32,7 @@ import uuid
 
 import yaml
 
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, fields as dc_fields
 from datetime import datetime, timezone
@@ -64,6 +65,8 @@ _REPORT_QUALIFICATIONS = frozenset({
     'publication_package_verified',
     'human_scientific_reviewed',
 })
+_REACTION_PROJECTION_BINDING_SCHEMA = (
+    'vcstudio.reaction-projection-binding/v1')
 
 # Browser-facing duplicate-calculation queries are deliberately much smaller
 # than the local ledger.  The derivative index is advisory only; submission is
@@ -288,7 +291,8 @@ class Api:
                  workspace_context_store=None, method_recipe_service=None,
                  method_recipe_publisher=None, structure_sources_mod=None,
                  structure_source_session=None, external_structure_gateway=None,
-                 surface_workbench_mod=None, external_reference_gateway=None):
+                 surface_workbench_mod=None, external_reference_gateway=None,
+                 reaction_domain_source=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -418,6 +422,9 @@ class Api:
         # Phase D reusable analysis templates/favourites are user-level state,
         # never project.yaml fields.  Keep the store lazy for normal job paths.
         self._analysis_preferences_store = analysis_preferences_store
+        # Read-only adapter to the separately owned canonical catalysis DTOs.
+        # This API never stores a second reaction-domain fact source.
+        self._reaction_domain_source = reaction_domain_source
         # Confirmed laboratory recommendations are user-level state.  They do
         # not mutate job manifests or grant submission authority.
         self._lab_policy_store = lab_policy_store
@@ -6268,7 +6275,9 @@ class Api:
     def _project_report_contracts(self, proj, project_path, summary, fed, *,
                                   requested_kind, report_kind, formats,
                                   eligible_final, gate_reason,
-                                  report_model_sha256, report_spec=None):
+                                  report_model_sha256, report_spec=None,
+                                  reaction_view=None,
+                                  reaction_projection_binding=None):
         """Freeze the report request, scientific snapshot and gate decision."""
         from vcstudio.project.report_contracts import (
             ClaimRecord,
@@ -6280,7 +6289,17 @@ class Api:
         )
 
         generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-        input_fingerprint = self._report_scientific_fingerprint(proj, summary)
+        project_fingerprint = self._report_scientific_fingerprint(proj, summary)
+        reaction_binding = (
+            self._validated_reaction_projection_binding(
+                reaction_projection_binding)
+            if reaction_projection_binding is not None else None)
+        reaction_binding_sha256 = str(
+            (reaction_binding or {}).get('sha256') or '')
+        reaction_projection_sha256 = str(
+            (reaction_binding or {}).get('source_projection_sha256') or '')
+        input_fingerprint = self._bind_reaction_projection_fingerprint(
+            project_fingerprint, reaction_binding_sha256)
         member_dirs = self._project_member_dirs(proj)
         project_root = os.path.abspath(os.path.normpath(str(
             proj.get('root') or os.path.dirname(str(project_path)))))
@@ -6351,8 +6370,25 @@ class Api:
             'locator': project_locator,
             # Bind the path-independent scientific projection, not raw
             # project.yaml, which also contains report/runtime state.
-            'sha256': input_fingerprint,
+            'sha256': project_fingerprint,
         }
+        sources = [source]
+        if reaction_binding is not None:
+            sources.append({
+                'source_id': f'reaction-projection-binding:{project_id}',
+                'kind': 'canonical_reaction_domain_projection_binding',
+                'schema': reaction_binding['schema'],
+                'state': reaction_binding['state'],
+                'sha256': reaction_binding['sha256'],
+            })
+        if reaction_projection_sha256:
+            sources.append({
+                'source_id': f'reaction-projection:{project_id}',
+                'kind': 'canonical_reaction_domain_projection',
+                'schema': str((reaction_view or {}).get(
+                    'source_projection_schema') or ''),
+                'sha256': reaction_projection_sha256,
+            })
         scope_state = ((summary or {}).get('_report_scope')
                        if isinstance(summary, dict) else {}) or {}
         if report_spec is not None:
@@ -6411,7 +6447,7 @@ class Api:
             input_fingerprint=input_fingerprint,
             created_at_utc=generated_at,
             resolved_scope=resolved_scope,
-            sources=(source,),
+            sources=tuple(sources),
             payload={
                 'project': {
                     'project_id': project_id,
@@ -6419,6 +6455,14 @@ class Api:
                 },
                 'adsorption_summary': scientific_payload,
                 'free_energy_path': self._json_safe_report_result(fed or {}),
+                'reaction_workbench': self._json_safe_report_result({
+                    'graph': (reaction_view or {}).get('graph'),
+                    'ledger': (reaction_view or {}).get('ledger'),
+                    'condition_revision': (reaction_view or {}).get(
+                        'condition_revision'),
+                    'frozen_network': (reaction_view or {}).get('frozen_network'),
+                    'report_binding': (reaction_view or {}).get('report_binding'),
+                } if reaction_view else {}),
             },
             evidence={
                 'final_report_gate': {
@@ -6429,6 +6473,23 @@ class Api:
                     (summary or {}).get('method_consistency') or {}),
                 'method_confirmation': self._json_safe_report_result(
                     self._method_confirmation(proj)),
+                'reaction_binding': self._json_safe_report_result({
+                    'projection_binding': reaction_binding,
+                    'source_projection_sha256': reaction_projection_sha256 or None,
+                    'graph_sha256': ((reaction_view or {}).get('graph') or {}).get(
+                        'graph_sha256'),
+                    'ledger_sha256': ((reaction_view or {}).get('ledger') or {}).get(
+                        'ledger_sha256'),
+                    'condition_revision_sha256': (
+                        ((reaction_view or {}).get('condition_revision') or {}).get(
+                            'revision_sha256')),
+                    'frozen_network_sha256': (
+                        ((reaction_view or {}).get('frozen_network') or {}).get(
+                            'frozen_network_sha256')),
+                    'artifact_status': (reaction_view or {}).get('artifact_status'),
+                    'scientific_status': (reaction_view or {}).get(
+                        'scientific_status'),
+                }),
             },
         )
         english = spec.locale == 'en-US'
@@ -6453,7 +6514,9 @@ class Api:
                           if english else
                           '补齐参考态、有效 ΔE 与方法一致性证据后重新验证。')),
         )
-        has_path = bool(fed and fed.get('steps'))
+        reaction_graph = (reaction_view or {}).get('graph') or {}
+        has_path = bool(
+            (fed and fed.get('steps')) or reaction_graph.get('thermodynamic_ready'))
         path_check = ValidationCheck(
             id='thermodynamic-path-coverage',
             status='pass' if has_path else 'warn',
@@ -6466,12 +6529,59 @@ class Api:
                 ('A complete free-energy pathway is absent; no kinetic or '
                  'complete thermodynamic claim is supported.' if english else
                  '未包含完整自由能台阶；不得据此声称动力学或完整热力学结论。')),
-            evidence_refs=('snapshot:payload/free_energy_path',),
+            evidence_refs=(
+                ('snapshot:payload/reaction_workbench',)
+                if reaction_graph.get('thermodynamic_ready') else
+                ('snapshot:payload/free_energy_path',)),
         )
-        qualification = ('adsorption_result_verified'
-                         if report_kind == 'final' else 'diagnostic')
+        reaction_checks = []
+        if reaction_view:
+            reaction_complete = bool(
+                reaction_graph.get('artifact_status') == 'available'
+                and ((reaction_view.get('ledger') or {}).get('artifact_status')
+                     == 'available'))
+            reaction_checks.append(ValidationCheck(
+                id='canonical-reaction-binding',
+                status='pass' if reaction_complete else 'warn',
+                severity='warning', required=False,
+                message=(
+                    'Canonical reaction graph and thermochemistry ledger are fully bound.'
+                    if english and reaction_complete else
+                    'Canonical reaction graph or thermochemistry ledger is incomplete.'
+                    if english else
+                    'canonical 反应图与热化学账本已完整绑定。'
+                    if reaction_complete else
+                    'canonical 反应图或热化学账本不完整；缺项保持 missing。'),
+                evidence_refs=('snapshot:evidence/reaction_binding',),
+            ))
+            kinetic_ready = reaction_graph.get('kinetic_ready') is True
+            reaction_checks.append(ValidationCheck(
+                id='reaction-kinetic-readiness',
+                status='pass' if kinetic_ready else 'warn',
+                severity='warning', required=False,
+                message=(
+                    'Every bound elementary step has compatible TS frequency and mode evidence.'
+                    if english and kinetic_ready else
+                    'Kinetic readiness is incomplete; no complete-mechanism claim is supported.'
+                    if english else
+                    '所有已绑定基元步骤均具有兼容的 TS 频率与模式证据。'
+                    if kinetic_ready else
+                    '动力学资格不完整；不得据此声称完整机理。'),
+                evidence_refs=('snapshot:payload/reaction_workbench',),
+            ))
+        reaction_source_status = str(
+            (reaction_view or {}).get('scientific_status') or 'unknown')
+        kinetic_qualification_allowed = bool(
+            report_kind == 'final'
+            and reaction_graph.get('kinetic_ready') is True
+            and reaction_source_status in {'verified', 'release'})
+        qualification = (
+            'kinetic_evidence_verified' if kinetic_qualification_allowed else
+            'adsorption_result_verified' if report_kind == 'final' else 'diagnostic')
+        has_nonblocking_warning = (
+            not has_path or any(check.status == 'warn' for check in reaction_checks))
         validation_status = ('passed_with_warnings'
-                             if eligible_final and not has_path
+                             if eligible_final and has_nonblocking_warning
                              else 'passed' if eligible_final else 'blocked')
         claim = ClaimRecord(
             id='claim.adsorption.delivery',
@@ -6483,10 +6593,26 @@ class Api:
                 ('This report records available data and blocking evidence only; '
                  'it is not a final scientific conclusion.' if english else
                  '当前报告仅记录可用数据与阻断原因，不构成最终科学结论。')),
-            qualification=qualification,
+            qualification=(
+                'adsorption_result_verified' if report_kind == 'final'
+                else 'diagnostic'),
             status='supported' if report_kind == 'final' else 'limited',
             evidence_refs=('check:adsorption-result-delivery-gate',),
         )
+        claims = [claim]
+        if kinetic_qualification_allowed:
+            claims.append(ClaimRecord(
+                id='claim.kinetic.bound-steps',
+                text=(
+                    'The bound elementary steps have compatible TS frequency and mode '
+                    'and activation-free-energy evidence; this does not establish '
+                    'mechanism completeness.' if english else
+                    '已绑定基元步骤具有兼容的 TS 频率与模式及活化自由能证据；'
+                    '该资格不证明机理完整。'),
+                qualification='kinetic_evidence_verified',
+                status='supported',
+                evidence_refs=('check:reaction-kinetic-readiness',),
+            ))
         validation = ValidationResult(
             spec_sha256=spec.semantic_sha256,
             snapshot_sha256=snapshot.semantic_sha256,
@@ -6499,10 +6625,13 @@ class Api:
             effective_kind=report_kind,
             final_allowed=bool(report_kind == 'final' and eligible_final),
             scientific_qualification=qualification,
-            claim_ceiling='electronic_adsorption_screen',
+            claim_ceiling=(
+                'bound_elementary_step_kinetics_not_complete_mechanism'
+                if kinetic_qualification_allowed else
+                'electronic_adsorption_screen'),
             report_model_sha256=report_model_sha256,
-            checks=(gate_check, path_check),
-            claims=(claim,),
+            checks=(gate_check, path_check, *reaction_checks),
+            claims=tuple(claims),
         )
         validate_bindings(spec, snapshot, validation)
         return {
@@ -6534,7 +6663,8 @@ class Api:
 
     def _project_report_model(self, proj, summary, fed, *, report_kind='final',
                               figures=None, comparison_context=None,
-                              report_contracts=None, report_spec=None):
+                              report_contracts=None, report_spec=None,
+                              reaction_report_binding=None):
         """Build the single source of truth consumed by HTML/DOCX/PDF renderers."""
         from vcstudio.project.report_contracts import ReportSpec
 
@@ -6645,6 +6775,35 @@ class Api:
                     f'U_L={f"{u_l:.{precision}f}" if u_l is not None else "—"} V，'
                     f'PDS={pds if pds is not None else "—"}。')
         limitations = []
+        reaction_binding = (
+            copy.deepcopy(dict(reaction_report_binding))
+            if isinstance(reaction_report_binding, Mapping) else None)
+        reaction_tables = {
+            str(item.get('table_id') or ''): copy.deepcopy(dict(item))
+            for item in (reaction_binding or {}).get('tables') or []
+            if isinstance(item, Mapping) and item.get('table_id')
+        }
+        if not english:
+            reaction_table_labels = {
+                'reaction-map-edges': (
+                    '反应图边', [
+                        '步骤', '反应物', '产物', '过渡态', '反应 ΔG / eV',
+                        '观测 ΔE‡ / eV', '热修正 ΔG‡ / eV', '状态',
+                    ]),
+                'thermochemistry-ledger': (
+                    '热化学账本', [
+                        '对象', '标签', 'E0', 'ZPE', 'ΔH', '-TΔS',
+                        '标准态修正', '标准态', 'T', 'P', '模型', 'ΔG', '状态',
+                    ]),
+            }
+            for table_id, (title, columns) in reaction_table_labels.items():
+                table = reaction_tables.get(table_id)
+                if table is not None:
+                    table['title'] = title
+                    table['columns'] = columns
+        if reaction_binding:
+            limitations.extend(str(value) for value in
+                               reaction_binding.get('limitations') or [])
         for missing in (evidence.get('coverage') or {}).get('missing_species') or []:
             limitations.append(
                 f'Missing species evidence: {missing}.' if english
@@ -6810,12 +6969,17 @@ class Api:
                 'rows': rows,
                 'caption': table_caption,
             },
+            'reaction_map_table': reaction_tables.get('reaction-map-edges'),
+            'thermochemistry_table': reaction_tables.get('thermochemistry-ledger'),
             'figures': list(figures or []),
             'methods': methods,
             'limitations': list(dict.fromkeys(limitations)),
             'recommendations': self._recommendation_blocks(
                 [evaluation], locale=locale),
             'comparison_context': comparison_context or {},
+            'extensions': ({
+                'reaction_report_binding': reaction_binding,
+            } if reaction_binding else {}),
         }
         if report_contracts:
             model.update(self._json_safe_report_result(report_contracts))
@@ -6897,6 +7061,92 @@ class Api:
         return figures, files
 
     # ── Phase C:统一报告工作台服务接线 ─────────────────────────────────────
+    @staticmethod
+    def _reaction_projection_binding(reaction_view=None):
+        """Return one versioned digest for both projection presence and absence."""
+        state = 'present' if reaction_view is not None else 'absent'
+        semantic = {
+            'schema': _REACTION_PROJECTION_BINDING_SCHEMA,
+            'state': state,
+        }
+        if state == 'present':
+            source_hash = str(
+                (reaction_view or {}).get('source_projection_sha256') or ''
+            ).strip().lower()
+            if not re.fullmatch(r'[0-9a-f]{64}', source_hash):
+                raise ValueError(
+                    'canonical reaction projection 缺少有效 source_projection_sha256')
+            semantic['source_projection_sha256'] = source_hash
+        binding_hash = hashlib.sha256(json.dumps(
+            semantic, sort_keys=True, separators=(',', ':'),
+        ).encode('utf-8')).hexdigest()
+        return {**semantic, 'sha256': binding_hash}
+
+    @staticmethod
+    def _validated_reaction_projection_binding(value):
+        if not isinstance(value, Mapping):
+            raise ValueError('reaction projection binding 必须为对象')
+        schema = str(value.get('schema') or '')
+        state = str(value.get('state') or '').strip().lower()
+        if schema != _REACTION_PROJECTION_BINDING_SCHEMA:
+            raise ValueError('reaction projection binding schema 无效')
+        if state not in {'present', 'absent'}:
+            raise ValueError('reaction projection binding state 无效')
+        semantic = {'schema': schema, 'state': state}
+        source_hash = str(
+            value.get('source_projection_sha256') or '').strip().lower()
+        if state == 'present':
+            if not re.fullmatch(r'[0-9a-f]{64}', source_hash):
+                raise ValueError('reaction projection binding source hash 无效')
+            semantic['source_projection_sha256'] = source_hash
+        elif source_hash or 'source_projection_sha256' in value:
+            raise ValueError('缺席 reaction projection binding 不得声明 source hash')
+        expected_hash = hashlib.sha256(json.dumps(
+            semantic, sort_keys=True, separators=(',', ':'),
+        ).encode('utf-8')).hexdigest()
+        declared_hash = str(value.get('sha256') or '').strip().lower()
+        if declared_hash != expected_hash:
+            raise ValueError('reaction projection binding 语义哈希无效')
+        return {**semantic, 'sha256': expected_hash}
+
+    @staticmethod
+    def _bind_reaction_projection_fingerprint(
+            base, reaction_projection_binding_sha256, *, legacy_present=False):
+        reaction_hash = str(
+            reaction_projection_binding_sha256 or '').strip().lower()
+        if not reaction_hash:
+            return base
+        if not re.fullmatch(r'[0-9a-f]{64}', reaction_hash):
+            raise ValueError('reaction projection binding hash 无效')
+        binding_key = (
+            'reaction_projection_sha256' if legacy_present else
+            'reaction_projection_binding_sha256')
+        return hashlib.sha256(json.dumps({
+            'project_fingerprint': base,
+            binding_key: reaction_hash,
+        }, sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
+
+    def _current_reaction_projection_binding(self, project, workspace_project_id):
+        project_id = str(workspace_project_id or '').strip()
+        if not project_id:
+            raise ValueError('reaction projection binding 缺少工作台项目身份')
+        projection = self._analysis_workbench_reaction_projection({
+            'project': project, 'project_id': project_id,
+        })
+        if projection is None:
+            return self._reaction_projection_binding()
+        from vcstudio.project.reaction_workbench import build_reaction_workbench_view
+
+        view = build_reaction_workbench_view(
+            projection, project_id=project_id, conditions={}, precision=4)
+        return self._reaction_projection_binding(view)
+
+    def _current_reaction_projection_sha256(self, project, workspace_project_id):
+        """Compatibility reader for callers that need only a present source hash."""
+        binding = self._current_reaction_projection_binding(
+            project, workspace_project_id)
+        return str(binding.get('source_projection_sha256') or '')
+
     def _report_workbench_project_context(self, path):
         """Resolve one project without exposing its registry path to the browser."""
         project_path = str(path or '').strip()
@@ -7117,19 +7367,77 @@ class Api:
             fed, fed_reason = self._proj_fed(project, summary)
         else:
             fed, fed_reason = None, '当前 ReportSpec 未请求热化学校正或反应路径'
-        input_fingerprint = self._report_input_fingerprint(project, summary)
-        scientific_fingerprint = self._report_scientific_fingerprint(project, summary)
+        reaction_view = None
+        projection = self._analysis_workbench_reaction_projection(context)
+        if projection is not None:
+            from vcstudio.project.reaction_workbench import (
+                build_reaction_workbench_view,
+            )
+
+            reaction_view = build_reaction_workbench_view(
+                projection, project_id=context['project_id'],
+                conditions={}, precision=int(spec.options.get('precision', 4)))
+        reaction_projection_binding = self._reaction_projection_binding(
+            reaction_view)
+        reaction_projection_binding_sha256 = reaction_projection_binding['sha256']
+
+        input_fingerprint = self._bind_reaction_projection_fingerprint(
+            self._report_input_fingerprint(project, summary),
+            reaction_projection_binding_sha256)
+        scientific_fingerprint = self._bind_reaction_projection_fingerprint(
+            self._report_scientific_fingerprint(project, summary),
+            reaction_projection_binding_sha256)
         figure_dir = os.path.join(str(work_dir), 'figures')
         figures, figure_files = self._project_report_figures(
             project, summary, fed, figure_dir, report_spec=spec)
+        reaction_figure_error = ''
+        if reaction_view is not None:
+            try:
+                from vcstudio.project.reaction_workbench import render_reaction_map_png
+
+                rendered = render_reaction_map_png(
+                    reaction_view['graph'], os.path.join(
+                        figure_dir, 'reaction_map.png'))
+                figure_files.append(rendered['path'])
+                figures.append({
+                    'path': rendered['path'],
+                    'title': ('Evidence-bound reaction map' if spec.locale == 'en-US'
+                              else '证据绑定反应图'),
+                    'caption': (
+                        'Missing edges remain explicit; rendering does not establish '
+                        'mechanism completeness.' if spec.locale == 'en-US' else
+                        '缺边保持显式；渲染成功不证明机理完整。'),
+                    'alt': (
+                        'Reaction-network nodes and directed elementary-step edges, '
+                        'with missing or blocked bindings highlighted.'
+                        if spec.locale == 'en-US' else
+                        '反应网络节点与有向基元步骤边；缺失或阻断绑定被明确标示。'),
+                    'figure_id': 'reaction-map',
+                    'data_sha256': reaction_view['graph']['graph_sha256'],
+                    'evidence_refs': ['snapshot:evidence/reaction_binding'],
+                })
+            except Exception as exc:                    # noqa: BLE001 optional chart
+                reaction_figure_error = self._workspace_public_text(
+                    str(exc), limit=1000)
         model = self._project_report_model(
             project, summary, fed, report_kind=report_kind, figures=figures,
-            report_spec=spec)
-        qualification = ('adsorption_result_verified'
-                         if report_kind == 'final' else 'diagnostic')
+            report_spec=spec,
+            reaction_report_binding=(
+                (reaction_view or {}).get('report_binding')))
+        kinetic_qualification_allowed = bool(
+            report_kind == 'final' and reaction_view
+            and (reaction_view.get('graph') or {}).get('kinetic_ready') is True
+            and reaction_view.get('scientific_status') in {'verified', 'release'})
+        qualification = (
+            'kinetic_evidence_verified' if kinetic_qualification_allowed else
+            'adsorption_result_verified' if report_kind == 'final' else 'diagnostic')
         model.update({
             'scientific_qualification': qualification,
-            'claim_ceiling': 'electronic_adsorption_screen',
+            'claim_ceiling': (
+                'bound_elementary_step_kinetics_not_complete_mechanism'
+                if kinetic_qualification_allowed else
+                'electronic_adsorption_screen'),
+            'reaction_projection_binding': reaction_projection_binding,
         })
         english = spec.locale == 'en-US'
         if gate_reason and report_kind == 'diagnostic':
@@ -7144,6 +7452,13 @@ class Api:
                 ('The free-energy pathway was not generated for the selected '
                  'scope; no pathway-derived claim is made.'
                  if english else f'自由能台阶未生成：{fed_reason}'),
+                *model.get('limitations', []),
+            ]
+        if reaction_figure_error:
+            model['limitations'] = [
+                ('The reaction-map table remains bound, but its figure could not '
+                 f'be rendered: {reaction_figure_error}' if english else
+                 f'反应图表格仍已绑定，但图像渲染不可用：{reaction_figure_error}'),
                 *model.get('limitations', []),
             ]
         content_hasher = getattr(self._paper(), 'report_content_sha256', None)
@@ -7165,6 +7480,8 @@ class Api:
             gate_reason=gate_reason,
             report_model_sha256=report_model_sha256,
             report_spec=spec,
+            reaction_view=reaction_view,
+            reaction_projection_binding=reaction_projection_binding,
         )
         model.update(self._json_safe_report_result(contracts))
         canonical_spec = contracts['report_spec']
@@ -7189,11 +7506,18 @@ class Api:
             'fed_reason': str(fed_reason or ''),
             'input_fingerprint': input_fingerprint,
             'scientific_fingerprint': scientific_fingerprint,
+            'reaction_projection_binding': reaction_projection_binding,
+            'reaction_projection_binding_sha256': (
+                reaction_projection_binding_sha256),
+            # Compatibility name retained as a non-empty hash of the complete
+            # versioned presence/absence binding, never as an absence bypass.
+            'reaction_projection_sha256': reaction_projection_binding_sha256,
             'report_model_sha256': report_model_sha256,
             'contracts': contracts,
             'model': model,
             'figure_dir': figure_dir,
             'figure_files': figure_files,
+            'reaction_view': reaction_view,
             'default_stem': self._safe_report_stem(
                 f'{project.get("name") or "project"}_{spec.preset_id}'),
         }
@@ -7221,11 +7545,38 @@ class Api:
             summary = self._report_workbench_scope_summary(
                 context, summary, report_spec)
         eligible, reason = self._final_report_gate(project, summary)
+        projection = self._analysis_workbench_reaction_projection(context)
+        reaction_view = None
+        if projection is not None:
+            from vcstudio.project.reaction_workbench import (
+                build_reaction_workbench_view,
+            )
+
+            precision = 4
+            if report_spec is not None:
+                try:
+                    precision = int(report_spec.options.get('precision', 4))
+                except (AttributeError, TypeError, ValueError):
+                    precision = 4
+            reaction_view = build_reaction_workbench_view(
+                projection, project_id=context['project_id'],
+                conditions={}, precision=max(2, min(8, precision)))
+        reaction_projection_binding = self._reaction_projection_binding(
+            reaction_view)
+        reaction_projection_binding_sha256 = reaction_projection_binding['sha256']
+
         return {
             'project_id': context['project_id'],
-            'input_fingerprint': self._report_input_fingerprint(project, summary),
-            'scientific_fingerprint': self._report_scientific_fingerprint(
-                project, summary),
+            'input_fingerprint': self._bind_reaction_projection_fingerprint(
+                self._report_input_fingerprint(project, summary),
+                reaction_projection_binding_sha256),
+            'scientific_fingerprint': self._bind_reaction_projection_fingerprint(
+                self._report_scientific_fingerprint(project, summary),
+                reaction_projection_binding_sha256),
+            'reaction_projection_binding': reaction_projection_binding,
+            'reaction_projection_binding_sha256': (
+                reaction_projection_binding_sha256),
+            'reaction_projection_sha256': reaction_projection_binding_sha256,
             'eligible_final': bool(eligible),
             'gate_reason': str(reason or ''),
         }
@@ -7369,6 +7720,104 @@ class Api:
             validation = ValidationResult.from_mapping(
                 payloads['validation'], spec=spec, snapshot=snapshot)
             validate_bindings(spec, snapshot, validation)
+            snapshot_payload = snapshot.to_dict()
+            if str(spec.scope.get('kind') or '') != 'comparison':
+                evidence_payload = snapshot_payload.get('evidence') or {}
+                reaction_evidence = (
+                    evidence_payload.get('reaction_binding') or {}
+                    if isinstance(evidence_payload, dict) else {})
+                if not isinstance(reaction_evidence, dict):
+                    raise RuntimeError(
+                        '历史报告 snapshot reaction projection 绑定无效')
+                project_payload = (
+                    (snapshot_payload.get('payload') or {}).get('project') or {})
+                snapshot_project_id = str(
+                    project_payload.get('project_id') or '').strip()
+                if not snapshot_project_id:
+                    raise RuntimeError(
+                        '历史报告 snapshot 缺少 reaction projection 项目身份')
+                record = self._report_workbench_project_record(snapshot_project_id)
+                context = self._report_workbench_project_context(record['path'])
+                current_summary = self._adsorption.delta_e_rows(context['project'])
+                current_summary = self._report_workbench_scope_summary(
+                    context, current_summary, spec)
+                current_project_fingerprint = self._report_scientific_fingerprint(
+                    context['project'], current_summary)
+                current_reaction_binding = (
+                    self._current_reaction_projection_binding(
+                        context['project'], snapshot_project_id))
+                frozen_reaction_binding = reaction_evidence.get(
+                    'projection_binding')
+                sources = snapshot_payload.get('sources') or []
+                if frozen_reaction_binding is not None:
+                    expected_reaction_binding = (
+                        self._validated_reaction_projection_binding(
+                            frozen_reaction_binding))
+                    binding_sources = [
+                        item for item in sources
+                        if isinstance(item, dict)
+                        and item.get('kind')
+                        == 'canonical_reaction_domain_projection_binding'
+                    ]
+                    if (len(binding_sources) != 1
+                            or binding_sources[0].get('schema')
+                            != expected_reaction_binding['schema']
+                            or binding_sources[0].get('state')
+                            != expected_reaction_binding['state']
+                            or binding_sources[0].get('sha256')
+                            != expected_reaction_binding['sha256']):
+                        raise RuntimeError(
+                            '历史报告 snapshot versioned reaction source 无效')
+                    if current_reaction_binding != expected_reaction_binding:
+                        raise RuntimeError(
+                            '历史报告 canonical reaction projection 已失效')
+                    snapshot_reaction_state = {
+                        'algorithm': 'versioned',
+                        'sha256': expected_reaction_binding['sha256'],
+                    }
+                    current_snapshot_fingerprint = (
+                        self._bind_reaction_projection_fingerprint(
+                            current_project_fingerprint,
+                            current_reaction_binding['sha256']))
+                else:
+                    legacy_hash = str(reaction_evidence.get(
+                        'source_projection_sha256') or '').strip().lower()
+                    legacy_sources = [
+                        item for item in sources
+                        if isinstance(item, dict)
+                        and item.get('kind')
+                        == 'canonical_reaction_domain_projection'
+                    ]
+                    if (not re.fullmatch(r'[0-9a-f]{64}', legacy_hash)
+                            or len(legacy_sources) != 1
+                            or str(legacy_sources[0].get('sha256') or '').lower()
+                            != legacy_hash):
+                        raise RuntimeError(
+                            '历史报告 snapshot 缺少合法旧 reaction projection 绑定')
+                    if (current_reaction_binding.get('state') != 'present'
+                            or current_reaction_binding.get(
+                                'source_projection_sha256') != legacy_hash):
+                        raise RuntimeError(
+                            '历史报告 canonical reaction projection 已失效')
+                    snapshot_reaction_state = {
+                        'algorithm': 'legacy_present',
+                        'sha256': legacy_hash,
+                    }
+                    current_snapshot_fingerprint = (
+                        self._bind_reaction_projection_fingerprint(
+                            current_project_fingerprint, legacy_hash,
+                            legacy_present=True))
+                if snapshot.input_fingerprint != current_snapshot_fingerprint:
+                    raise RuntimeError('历史报告 snapshot 科学输入指纹已失效')
+                marker = context['project'].get('autopilot_report')
+                if not isinstance(marker, dict):
+                    raise RuntimeError('历史报告缺少 canonical marker，不能恢复 current')
+                marker_reaction_state = (
+                    self._report_marker_current_reaction_state(
+                        context['project'], marker))
+                if marker_reaction_state != snapshot_reaction_state:
+                    raise RuntimeError(
+                        '历史报告 marker 与 snapshot reaction projection 绑定不一致')
             derived_kind = validation.effective_kind
             derived_qualification = validation.scientific_qualification
             if raw_kind != derived_kind:
@@ -7635,6 +8084,11 @@ class Api:
             project_path=build['project_path'],
             expected_input_fingerprint=build['input_fingerprint'],
             expected_scientific_fingerprint=build['scientific_fingerprint'],
+            expected_reaction_projection_binding=build.get(
+                'reaction_projection_binding'),
+            expected_reaction_projection_sha256=(
+                build.get('reaction_projection_sha256')
+                if build.get('reaction_projection_binding') is None else None),
             expected_project_id=(build['project'].get('project_uuid')
                                  or build['project'].get('name') or ''),
             workspace_project_id=build['project_id'],
@@ -8362,6 +8816,29 @@ class Api:
             'strict_authority': strict_authority,
         }
 
+    def _analysis_workbench_reaction_projection(self, context):
+        """Read one immutable projection through the canonical-domain adapter."""
+        source = self._reaction_domain_source
+        if source is None:
+            return None
+        if isinstance(source, Mapping):
+            projection = source
+        elif hasattr(source, 'load_reaction_projection'):
+            projection = source.load_reaction_projection(
+                project_id=context['project_id'], project=context['project'])
+        elif callable(source):
+            projection = source(
+                project_id=context['project_id'], project=context['project'])
+        else:
+            raise TypeError(
+                'reaction_domain_source must be a Mapping, callable, or '
+                'ReactionDomainSource')
+        if projection is None:
+            return None
+        if not isinstance(projection, Mapping):
+            raise TypeError('canonical reaction projection must be an object')
+        return copy.deepcopy(dict(projection))
+
     def _analysis_workbench_property_results(self, kind, targets):
         """Run calculators from manifest-bound server operands only."""
         by_key = {target['path_key']: target for target in targets}
@@ -8549,11 +9026,28 @@ class Api:
                         self._analysis_workbench_method_evidence(target).get('status') ==
                         'verified' for target in elf_ready)
                     else 'unavailable')
+        selected_id = str((selected_view or {}).get('analysis_id') or '')
+        selected_status = str((selected_view or {}).get('capability_status') or '')
+        if mode == 'lis':
+            free_energy_status = 'available'
+        elif selected_id == 'free-energy-path' and selected_status:
+            # The selected view has already consumed and validated the provider.
+            # Reuse that result so stateful/read-once adapters are not invoked twice.
+            free_energy_status = selected_status
+        elif self._reaction_domain_source is None:
+            free_energy_status = 'mode_mismatch'
+        else:
+            try:
+                free_energy_status = (
+                    'available'
+                    if self._analysis_workbench_reaction_projection(context) is not None
+                    else 'missing_prerequisite')
+            except Exception:                           # noqa: BLE001 capability is fail closed
+                free_energy_status = 'unavailable'
         states = {
             'adsorption-energy': (
                 'available' if self._project_member_dirs(project) else 'missing_prerequisite'),
-            'free-energy-path': (
-                'available' if mode == 'lis' else 'mode_mismatch'),
+            'free-energy-path': free_energy_status,
             'neb-path': (
                 'available' if 'neb' in task_types else 'missing_prerequisite'),
             'convergence-scan': (
@@ -8573,8 +9067,6 @@ class Api:
                 'available' if task_types & {'surface_energy', 'formation_binding', 'vaspsol'}
                 else 'missing_prerequisite'),
         }
-        selected_id = str((selected_view or {}).get('analysis_id') or '')
-        selected_status = str((selected_view or {}).get('capability_status') or '')
         if selected_id and selected_status:
             states[selected_id] = selected_status
         actions = {
@@ -8661,26 +9153,40 @@ class Api:
             view = build_comparison_view(resolved_items, spec)
         elif spec.analysis_id == 'free-energy-path':
             project = context['project']
-            preparation = project.get('preparation')
-            declared_mode = str(
-                project.get('work_mode') or
-                (preparation.get('work_mode')
-                 if isinstance(preparation, dict) else '') or '').strip().lower()
-            if declared_mode != 'lis':
-                view = self._analysis_workbench_unavailable_view(
-                    spec, '该自由能分析只适用于显式 Li-S 工作模式',
-                    capability_status='mode_mismatch',
-                    next_action='将项目工作模式显式设为 Li-S，并完成反应路径证据。')
+            projection = self._analysis_workbench_reaction_projection(context)
+            if projection is not None:
+                from vcstudio.project.reaction_workbench import (
+                    build_reaction_workbench_view,
+                )
+
+                view = build_reaction_workbench_view(
+                    projection, project_id=context['project_id'],
+                    conditions=dict(spec.conditions), precision=spec.precision)
+                view['spec'] = spec.to_dict()
+                view['spec_sha256'] = spec.semantic_sha256
+                view['capability_status'] = 'available'
             else:
-                summary = self._adsorption.delta_e_rows(project)
-                fed, fed_reason = self._proj_fed(project, summary)
-                frozen = {
-                    'result': copy.deepcopy(fed),
-                    'missing': ([str(fed_reason)] if fed_reason else []),
-                    'method_consistency': copy.deepcopy(
-                        (summary or {}).get('method_consistency') or {}),
-                }
-                view = build_free_energy_view(frozen, spec)
+                preparation = project.get('preparation')
+                declared_mode = str(
+                    project.get('work_mode') or
+                    (preparation.get('work_mode')
+                     if isinstance(preparation, dict) else '') or '').strip().lower()
+                if declared_mode != 'lis':
+                    view = self._analysis_workbench_unavailable_view(
+                        spec,
+                        '没有 canonical reaction-domain projection；不会从目录名或旧预设推断反应网络',
+                        capability_status='missing_prerequisite',
+                        next_action='绑定 canonical Surface/State/ElementaryStep/evidence projection 后刷新。')
+                else:
+                    summary = self._adsorption.delta_e_rows(project)
+                    fed, fed_reason = self._proj_fed(project, summary)
+                    frozen = {
+                        'result': copy.deepcopy(fed),
+                        'missing': ([str(fed_reason)] if fed_reason else []),
+                        'method_consistency': copy.deepcopy(
+                            (summary or {}).get('method_consistency') or {}),
+                    }
+                    view = build_free_energy_view(frozen, spec)
         elif spec.analysis_id in {
                 'electronic-structure', 'charge-wavefunction', 'task-results'}:
             targets = self._analysis_workbench_targets(context)
@@ -12323,6 +12829,8 @@ class Api:
                                manifest=None, project_path=None,
                                expected_input_fingerprint=None,
                                expected_scientific_fingerprint=None,
+                               expected_reaction_projection_binding=None,
+                               expected_reaction_projection_sha256=None,
                                expected_project_id=None,
                                workspace_project_id=None, report_spec=None,
                                revision=None):
@@ -12377,10 +12885,72 @@ class Api:
                 except Exception as exc:                 # noqa: BLE001 scope CAS boundary
                     raise _ReportInputChanged(
                         f'报告生成期间冻结范围无法重放，产物未登记：{exc}') from exc
-            current_input_fingerprint = self._report_input_fingerprint(
-                current_project, current_summary)
-            current_scientific_fingerprint = self._report_scientific_fingerprint(
-                current_project, current_summary)
+            current_reaction_projection_binding = None
+            legacy_reaction_projection_sha256 = ''
+            reaction_binding_sha256 = ''
+            legacy_reaction_fingerprint = False
+            if expected_reaction_projection_binding is not None:
+                if not str(workspace_project_id or '').strip():
+                    raise _ReportInputChanged(
+                        '报告已生成但缺少 reaction projection 项目身份，未登记产物')
+                try:
+                    expected_reaction_binding = (
+                        self._validated_reaction_projection_binding(
+                            expected_reaction_projection_binding))
+                    current_reaction_projection_binding = (
+                        self._current_reaction_projection_binding(
+                            current_project, workspace_project_id))
+                except Exception as exc:                 # noqa: BLE001 CAS fail closed
+                    raise _ReportInputChanged(
+                        '报告生成期间 canonical reaction projection 无法重放，'
+                        f'产物未登记：{exc}') from exc
+                if current_reaction_projection_binding != expected_reaction_binding:
+                    raise _ReportInputChanged(
+                        '报告生成期间 canonical reaction projection 已变化，产物未登记')
+                reaction_binding_sha256 = current_reaction_projection_binding[
+                    'sha256']
+                if expected_reaction_projection_sha256 is not None:
+                    redundant_hash = str(
+                        expected_reaction_projection_sha256 or '').strip().lower()
+                    if redundant_hash != reaction_binding_sha256:
+                        raise _ReportInputChanged(
+                            '报告 reaction projection 兼容绑定与版本化绑定不一致')
+            elif expected_reaction_projection_sha256 is not None:
+                expected_reaction_hash = str(
+                    expected_reaction_projection_sha256 or '').strip().lower()
+                if not re.fullmatch(r'[0-9a-f]{64}', expected_reaction_hash):
+                    raise _ReportInputChanged(
+                        '报告 reaction projection 绑定为空或无效，产物未登记')
+                if not str(workspace_project_id or '').strip():
+                    raise _ReportInputChanged(
+                        '报告已生成但缺少 reaction projection 项目身份，未登记产物')
+                current_binding = self._current_reaction_projection_binding(
+                    current_project, workspace_project_id)
+                if expected_reaction_hash == current_binding['sha256']:
+                    current_reaction_projection_binding = current_binding
+                    reaction_binding_sha256 = current_binding['sha256']
+                elif (current_binding.get('state') == 'present'
+                      and expected_reaction_hash
+                      == current_binding.get('source_projection_sha256')):
+                    # Read compatibility for the short-lived present-only marker
+                    # shape.  Empty values are rejected above and can never mean
+                    # a bound absence state.
+                    legacy_reaction_projection_sha256 = expected_reaction_hash
+                    reaction_binding_sha256 = expected_reaction_hash
+                    legacy_reaction_fingerprint = True
+                else:
+                    raise _ReportInputChanged(
+                        '报告生成期间 canonical reaction projection 已变化，产物未登记')
+            current_input_fingerprint = self._bind_reaction_projection_fingerprint(
+                self._report_input_fingerprint(current_project, current_summary),
+                reaction_binding_sha256,
+                legacy_present=legacy_reaction_fingerprint)
+            current_scientific_fingerprint = (
+                self._bind_reaction_projection_fingerprint(
+                    self._report_scientific_fingerprint(
+                        current_project, current_summary),
+                    reaction_binding_sha256,
+                    legacy_present=legacy_reaction_fingerprint))
             if (expected_input_fingerprint
                     and current_input_fingerprint != expected_input_fingerprint):
                 raise _ReportInputChanged('报告生成期间作业或结果已变化，产物未登记；请重新生成')
@@ -12472,6 +13042,14 @@ class Api:
                 'workspace_project_id': str(workspace_project_id or ''),
                 'revision': self._json_safe_report_result(revision or {}),
             }
+            if current_reaction_projection_binding is not None:
+                marker['reaction_projection_binding'] = (
+                    current_reaction_projection_binding)
+                marker['reaction_projection_sha256'] = (
+                    current_reaction_projection_binding['sha256'])
+            elif legacy_reaction_projection_sha256:
+                marker['reaction_projection_sha256'] = (
+                    legacy_reaction_projection_sha256)
             root = current_project.get('root') or os.path.dirname(primary)
             persisted = dict(current_project)
             persisted['autopilot_report'] = marker
@@ -12644,6 +13222,55 @@ class Api:
         except Exception as exc:                          # noqa: BLE001 fail closed
             return stale(f'比较报告验证记录无效：{exc}')
 
+    def _report_marker_current_reaction_state(self, project, marker):
+        marker = marker if isinstance(marker, dict) else {}
+        if 'reaction_projection_binding' in marker:
+            expected_binding = self._validated_reaction_projection_binding(
+                marker.get('reaction_projection_binding'))
+            if ('reaction_projection_sha256' in marker
+                    and str(marker.get('reaction_projection_sha256') or '').strip().lower()
+                    != expected_binding['sha256']):
+                raise ValueError('报告 marker 包含冲突的 reaction projection 绑定')
+            workspace_project_id = str(
+                marker.get('workspace_project_id') or '').strip()
+            if not workspace_project_id:
+                raise ValueError('报告 marker 缺少 reaction projection 项目身份')
+            current_binding = self._current_reaction_projection_binding(
+                project, workspace_project_id)
+            if current_binding != expected_binding:
+                raise ValueError('报告 marker 的 canonical reaction projection 已失效')
+            return {
+                'algorithm': 'versioned',
+                'sha256': current_binding['sha256'],
+            }
+
+        # The first reaction-aware marker shape stored only a raw source hash.
+        # An explicitly empty value was never a bound absence state and must not
+        # silently fall back to legacy unbound semantics.
+        if 'reaction_projection_sha256' not in marker:
+            if marker.get('workspace_project_id') or marker.get('revision'):
+                raise ValueError('工作台报告 marker 缺少 reaction projection 绑定')
+            return {'algorithm': 'unbound', 'sha256': ''}
+        expected = str(
+            marker.get('reaction_projection_sha256') or '').strip().lower()
+        if not re.fullmatch(r'[0-9a-f]{64}', expected):
+            raise ValueError('报告 marker 的 reaction projection 绑定为空或无效')
+        workspace_project_id = str(
+            marker.get('workspace_project_id') or '').strip()
+        if not workspace_project_id:
+            raise ValueError('报告 marker 缺少 reaction projection 项目身份')
+        current_binding = self._current_reaction_projection_binding(
+            project, workspace_project_id)
+        if (current_binding.get('state') != 'present'
+                or current_binding.get('source_projection_sha256') != expected):
+            raise ValueError('报告 marker 的 canonical reaction projection 已失效')
+        return {'algorithm': 'legacy_present', 'sha256': expected}
+
+    def _report_marker_current_reaction_hash(self, project, marker):
+        """Compatibility projection of the validated marker binding state."""
+        return self._report_marker_current_reaction_state(
+            project, marker)['sha256']
+
     def _report_marker_current(self, project, summary=None) -> bool:
         marker = (project or {}).get('autopilot_report')
         if not isinstance(marker, dict):
@@ -12672,14 +13299,25 @@ class Api:
                 project, marker, current)
             if scope_error:
                 return False
+            reaction_state = self._report_marker_current_reaction_state(
+                project, marker)
+            reaction_hash = reaction_state['sha256']
             scientific = str(marker.get('scientific_fingerprint') or '').strip().lower()
             if scientific:
+                current_scientific = self._bind_reaction_projection_fingerprint(
+                    self._report_scientific_fingerprint(project, current),
+                    reaction_hash,
+                    legacy_present=(
+                        reaction_state['algorithm'] == 'legacy_present'))
                 if (not re.fullmatch(r'[0-9a-f]{64}', scientific)
-                        or scientific != self._report_scientific_fingerprint(
-                            project, current)):
+                        or scientific != current_scientific):
                     return False
-            elif marker.get('input_fingerprint') != self._report_input_fingerprint(
-                    project, current):
+            elif marker.get('input_fingerprint') != (
+                    self._bind_reaction_projection_fingerprint(
+                        self._report_input_fingerprint(project, current),
+                        reaction_hash,
+                        legacy_present=(
+                            reaction_state['algorithm'] == 'legacy_present'))):
                 return False
             declared = marker.get('files')
             hashes = marker.get('sha256') or marker.get('report_hashes')
@@ -12790,9 +13428,22 @@ class Api:
 
         scientific_fingerprint = str(
             marker.get('scientific_fingerprint') or '').strip().lower()
+        try:
+            reaction_state = self._report_marker_current_reaction_state(
+                project, marker)
+            reaction_hash = reaction_state['sha256']
+            current_scientific_fingerprint = (
+                self._bind_reaction_projection_fingerprint(
+                    self._report_scientific_fingerprint(project, current),
+                    reaction_hash,
+                    legacy_present=(
+                        reaction_state['algorithm'] == 'legacy_present')))
+        except Exception as exc:                          # noqa: BLE001 fail closed
+            return _stale(str(exc), kind=raw_kind,
+                          qualification=qualification)
         if (not re.fullmatch(r'[0-9a-f]{64}', scientific_fingerprint)
                 or scientific_fingerprint
-                != self._report_scientific_fingerprint(project, current)):
+                != current_scientific_fingerprint):
             return _stale('报告 marker 科学输入指纹已失效', kind=raw_kind,
                           qualification=qualification)
 

@@ -48,6 +48,8 @@ DEFAULT_OUTLINE = (
     "candidate_evaluations",
     "adsorption_table",
     "comparison_table",
+    "reaction_map_table",
+    "thermochemistry_table",
     "figures",
     "methods",
     "limitations",

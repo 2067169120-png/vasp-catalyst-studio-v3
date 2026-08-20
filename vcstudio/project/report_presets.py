@@ -157,6 +157,8 @@ _SECTION_LABELS = {
     "candidate_evaluations": ("候选评价", "Candidate evaluation"),
     "adsorption_table": ("吸附能结果", "Adsorption-energy results"),
     "comparison_table": ("多项目比较", "Cross-project comparison"),
+    "reaction_map_table": ("反应图边", "Reaction-map edges"),
+    "thermochemistry_table": ("热化学账本", "Thermochemistry ledger"),
     "figures": ("图表", "Figures"),
     "methods": ("计算方法", "Methods"),
     "limitations": ("局限性与未验证项", "Limitations"),
@@ -189,10 +191,12 @@ _SUMMARY_OR_CONCLUSION_SECTIONS = frozenset({
     "executive_summary", "key_findings",
 })
 _RESULT_OR_EVIDENCE_SECTIONS = frozenset({
-    "candidate_evaluations", "adsorption_table", "comparison_table", "figures",
+    "candidate_evaluations", "adsorption_table", "comparison_table",
+    "reaction_map_table", "thermochemistry_table", "figures",
 })
 _BOUND_FIGURE_OR_TABLE_SECTIONS = frozenset({
-    "candidate_evaluations", "adsorption_table", "comparison_table", "figures",
+    "candidate_evaluations", "adsorption_table", "comparison_table",
+    "reaction_map_table", "thermochemistry_table", "figures",
 })
 
 
@@ -262,6 +266,8 @@ _PRESETS = (
             "key_findings",
             "adsorption_table",
             "comparison_table",
+            "reaction_map_table",
+            "thermochemistry_table",
             "figures",
             "methods",
             "limitations",
@@ -290,6 +296,8 @@ _PRESETS = (
             "candidate_evaluations",
             "adsorption_table",
             "comparison_table",
+            "reaction_map_table",
+            "thermochemistry_table",
             "figures",
             "methods",
             "limitations",

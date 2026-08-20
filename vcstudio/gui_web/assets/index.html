@@ -2182,6 +2182,15 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
             <div class="aw-field"><label for="aw-sort-key">排序字段</label><select class="ipt" id="aw-sort-key"></select></div>
             <div class="aw-field"><label for="aw-sort-direction">排序方向</label><select class="ipt" id="aw-sort-direction"><option value="asc">升序</option><option value="desc">降序</option></select></div>
             <div class="aw-field aw-field-wide"><span id="aw-sensitivity-label">敏感性 deadband / eV</span><div class="aw-sensitivity" id="aw-sensitivity" role="group" aria-labelledby="aw-sensitivity-label"></div></div>
+            <div class="aw-condition-fields" id="aw-condition-fields" role="group" aria-labelledby="aw-condition-title">
+              <strong id="aw-condition-title" data-i18n="analysis.reaction.conditions.title">Condition Explorer（仅生成派生修订）</strong>
+              <div class="aw-field"><label for="aw-temperature" data-i18n="analysis.reaction.conditions.temperature">温度 / K</label><input class="ipt" id="aw-temperature" type="number" min="1" max="5000" step="1" inputmode="decimal"></div>
+              <div class="aw-field"><label for="aw-pressure" data-i18n="analysis.reaction.conditions.pressure">压力 / Pa</label><input class="ipt" id="aw-pressure" type="number" min="0.000000000001" max="1000000000000" step="any" inputmode="decimal"></div>
+              <div class="aw-field"><label for="aw-ph" data-i18n="analysis.reaction.conditions.ph">pH</label><input class="ipt" id="aw-ph" type="number" min="-5" max="20" step="0.1" inputmode="decimal"></div>
+              <div class="aw-field"><label for="aw-potential" data-i18n="analysis.reaction.conditions.potential">电位 / V</label><input class="ipt" id="aw-potential" type="number" min="-20" max="20" step="0.01" inputmode="decimal"></div>
+              <div class="aw-field"><label for="aw-coverage" data-i18n="analysis.reaction.conditions.coverage">覆盖度 / ML</label><input class="ipt" id="aw-coverage" type="number" min="0" max="1" step="0.01" inputmode="decimal"></div>
+              <small data-i18n="analysis.reaction.conditions.boundary">只发送参数；ΔG、适用范围和 revision hash 均由服务器确定，原始证据不变。</small>
+            </div>
           </fieldset>
         </form>
         <div class="aw-denominator" id="aw-denominator" aria-label="分析分母"></div>

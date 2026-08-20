@@ -86,7 +86,8 @@ _CONTENT_FINGERPRINT_KEYS = (
     "template_ref",
     "locale", "outline", "title", "subtitle", "kicker", "metadata",
     "executive_summary", "key_findings", "candidate_evaluations",
-    "adsorption_table", "comparison_table", "figures", "methods",
+    "adsorption_table", "comparison_table", "reaction_map_table",
+    "thermochemistry_table", "figures", "methods",
     "limitations", "recommendations", "comparison_context",
 )
 _REPORT_THEMES = {
@@ -217,6 +218,8 @@ _SECTION_LABELS = {
         "candidate_evaluations": "Candidate Evaluation",
         "adsorption_table": "Adsorption-Energy Results",
         "comparison_table": "Cross-Project Comparison",
+        "reaction_map_table": "Reaction-Map Edges",
+        "thermochemistry_table": "Thermochemistry Ledger",
         "figures": "Figures",
         "methods": "Methods",
         "limitations": "Limitations",
@@ -228,6 +231,8 @@ _SECTION_LABELS = {
         "candidate_evaluations": "候选评价",
         "adsorption_table": "吸附能结果",
         "comparison_table": "多项目比较",
+        "reaction_map_table": "反应图边",
+        "thermochemistry_table": "热化学账本",
         "figures": "图表",
         "methods": "计算方法",
         "limitations": "局限性",
@@ -747,6 +752,10 @@ def _normalize_content_fields(model: Mapping[str, Any], *, locale: str,
             model.get("adsorption_table"), "Adsorption-energy results"),
         "comparison_table": _normalize_table(
             model.get("comparison_table"), "Cross-project comparison"),
+        "reaction_map_table": _normalize_table(
+            model.get("reaction_map_table"), "Reaction-map edges"),
+        "thermochemistry_table": _normalize_table(
+            model.get("thermochemistry_table"), "Thermochemistry ledger"),
         "figures": [
             _normalize_figure(item, index) for index, item in enumerate(figures, 1)
         ],
@@ -1821,7 +1830,9 @@ def _html_document(model: dict) -> str:
             body.append(_html_blocks(model[key], ordered=False))
         elif key == "key_findings":
             body.append(_html_blocks(model[key], ordered=True))
-        elif key in {"candidate_evaluations", "adsorption_table", "comparison_table"}:
+        elif key in {
+                "candidate_evaluations", "adsorption_table", "comparison_table",
+                "reaction_map_table", "thermochemistry_table"}:
             table_number += 1
             body.append(_html_table(model[key], table_number, model["locale"]))
         elif key == "figures":
@@ -2151,7 +2162,9 @@ def _render_docx(model: dict, output: Path) -> None:
             _docx_add_blocks(doc, model[key], set_font, ordered=False)
         elif key == "key_findings":
             _docx_add_blocks(doc, model[key], set_font, ordered=True)
-        elif key in {"candidate_evaluations", "adsorption_table", "comparison_table"}:
+        elif key in {
+                "candidate_evaluations", "adsorption_table", "comparison_table",
+                "reaction_map_table", "thermochemistry_table"}:
             table_number += 1
             _docx_add_table(
                 doc,
@@ -2871,7 +2884,9 @@ def _render_pdf(model: dict, output: Path) -> None:
             _pdf_add_blocks(story, model[key], styles, ordered=False)
         elif key == "key_findings":
             _pdf_add_blocks(story, model[key], styles, ordered=True)
-        elif key in {"candidate_evaluations", "adsorption_table", "comparison_table"}:
+        elif key in {
+                "candidate_evaluations", "adsorption_table", "comparison_table",
+                "reaction_map_table", "thermochemistry_table"}:
             table_number += 1
             story.extend(
                 _pdf_table(
