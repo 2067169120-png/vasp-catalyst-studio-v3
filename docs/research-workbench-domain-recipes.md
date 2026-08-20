@@ -21,7 +21,7 @@
 
 - `CatalystSurface`：composition、Miller index、termination opaque ID、`geometric_site_ids`。合同故意没有可由几何位点自动推出的 active-site 字段。
 - `AdsorbateState`：surface/adsorbate/state opaque IDs、formula、几何位点、charge/multiplicity。
-- `ElementaryStep` v2：反应物/产物均为 participant，显式携带 `state_id`、整数系数、phase、charge 和 `site_count`；可选 transition-state 与 condition IDs。旧的两个 state-ID 数组不是可接受的 v2 形状。
+- `ElementaryStep` v3：reactants、非空 transition-state、products 三侧均为 participant tuple。每个 participant 显式携带 `state_id`、规范 `{numerator, denominator}` 精确有理系数、phase、charge，以及按 site type 分解的有理 `site_stoichiometry`。v1 的 state-ID 数组和 v2 的整数系数、标量 `site_count`、裸 `transition_state_id` 都会 fail closed；缺失权威信息时不做无证据迁移。
 - `ConditionSet`：temperature、pressure、pH、电极电势；至少一项有定义。
 - `ReactionNetwork`：仅以 opaque IDs 连接 surfaces、states、steps 和 conditions。
 - `WorkflowRecipe`：版本、双语元数据、输入槽、参数、拓扑有序节点、科学限制和 HTTPS 官方参考。
@@ -40,7 +40,7 @@ Canonical JSON 使用 UTF-8、键排序、紧凑分隔符、禁止 NaN/Infinity�
 
 `vcstudio.project.catalysis_domain_store.DomainEnvelopeStore` 是独立的单文件逻辑 authority：revision 以三元身份 create-only 保存，同三元身份同 hash 只能幂等 replay、不同 hash 必须冲突；head 前进在同一跨进程锁和原子 JSON 事务内同时比较 `parent_revision` 与当前 semantic hash。损坏的既有 authority 不会被覆盖，stale writer 不会改写 head。它不复用或修改 workspace CAS，也不创建或更新 `job.yaml`。
 
-`ElementaryStep` 的守恒检查只接受 resolver 返回的 authoritative state record；participant 声明必须与解析出的 phase/charge/site count 完全一致，然后才按系数核对元素、电荷和表面位点守恒。因此 `H2 → H2O` 会被拒绝，`2 H → H2` 可表达并通过。该 resolver 只证明所给状态记录下的守恒，不证明路径、势垒或机理科学成立，也不会推断几何位点具有活性。
+`ElementaryStep` 的守恒检查只接受 resolver 返回的 authoritative state record；同一 `state_id` 在一次检查中固定为同一解析快照。participant 声明必须与解析出的 phase、charge、逐类型 site stoichiometry 完全一致，然后以 `Fraction` 精确累计并分别核对 reactants = transition state、transition state = products 的元素、电荷和每一种表面位点。任何 TS participant 缺少 resolver 记录都会 fail closed；`1/2 O2 → O` 可无浮点误差表达，`H2 → H2O` 和 `A-site → B-site` 会被拒绝。该 resolver 只证明所列权威状态记录之间守恒，不能证明没有三侧共同遗漏 spectator，也不证明路径、势垒或机理科学成立。
 
 调用方拥有的 mapping 会先递归检查，拒绝 path/dir/root/locator、绝对路径（包括嵌入文本）、文件 URI、目录穿越和 secret-shaped value。凭据形状由全项目共享的 `vcstudio.shared.credential_classifier` 统一识别，覆盖 AWS access key/secret assignment、GitHub/OpenAI、GitLab、Hugging Face、Stripe、Bearer、常见 token/secret key 及任意协议 userinfo URL；输入拒绝和输出脱敏使用同一分类口径，路径策略仍由各领域边界负责。
 

@@ -14,6 +14,7 @@ import math
 import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Any, ClassVar
 
 from vcstudio.shared.credential_classifier import is_sensitive_key, looks_like_credential
@@ -626,45 +627,132 @@ class AdsorbateState(_RevisionedDomainDTO):
 
 
 @dataclass(frozen=True)
+class ExactRational:
+    """A bounded canonical non-negative rational encoded as numerator/denominator."""
+
+    numerator: int
+    denominator: int = 1
+
+    def __post_init__(self) -> None:
+        if (isinstance(self.numerator, bool) or not isinstance(self.numerator, int)
+                or isinstance(self.denominator, bool)
+                or not isinstance(self.denominator, int)):
+            raise CatalysisContractError("rational numerator and denominator must be integers")
+        if self.numerator < 0 or self.denominator <= 0:
+            raise CatalysisContractError(
+                "rational numerator must be non-negative and denominator positive")
+        if abs(self.numerator) > 1_000_000_000 or self.denominator > 1_000_000_000:
+            raise CatalysisContractError("rational value is outside the supported range")
+        normalized = Fraction(self.numerator, self.denominator)
+        object.__setattr__(self, "numerator", normalized.numerator)
+        object.__setattr__(self, "denominator", normalized.denominator)
+
+    def to_fraction(self) -> Fraction:
+        return Fraction(self.numerator, self.denominator)
+
+    def to_dict(self) -> dict[str, int]:
+        return {"numerator": self.numerator, "denominator": self.denominator}
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> ExactRational:
+        _strict_fields(value, {"numerator", "denominator"}, label="exact_rational")
+        return cls(numerator=value["numerator"], denominator=value["denominator"])
+
+
+def _exact_rational(value: Any, field: str, *, allow_zero: bool) -> ExactRational:
+    if isinstance(value, ExactRational):
+        result = value
+    elif isinstance(value, int) and not isinstance(value, bool):
+        result = ExactRational(value, 1)
+    elif isinstance(value, Mapping):
+        result = ExactRational.from_dict(value)
+    else:
+        raise CatalysisContractError(
+            f"{field} must be an exact rational, never a floating-point number")
+    if not allow_zero and result.numerator == 0:
+        raise CatalysisContractError(f"{field} must be positive")
+    return result
+
+
+def _site_stoichiometry(value: Any, field: str) -> Mapping[str, ExactRational]:
+    if not isinstance(value, Mapping) or len(value) > 64:
+        raise CatalysisContractError(f"{field} must be a bounded site-type mapping")
+    result: dict[str, ExactRational] = {}
+    for raw_site_type, raw_amount in value.items():
+        if _is_private_key(raw_site_type):
+            raise CatalysisContractError(f"{field} contains a sensitive site type")
+        site_type = _opaque_id(raw_site_type, f"{field} site type")
+        if site_type in result:
+            raise CatalysisContractError(f"{field} contains duplicate normalized site types")
+        result[site_type] = _exact_rational(
+            raw_amount, f"{field}.{site_type}", allow_zero=False)
+    return _FrozenDict(result)
+
+
+def _site_stoichiometry_from_dict(
+        value: Any, field: str) -> Mapping[str, ExactRational]:
+    if not isinstance(value, Mapping):
+        raise CatalysisContractError(f"{field} must be a site-type mapping")
+    parsed: dict[str, ExactRational] = {}
+    for site_type, amount in value.items():
+        if not isinstance(amount, Mapping):
+            raise CatalysisContractError(
+                f"{field}.{site_type} must use numerator/denominator wire form")
+        parsed[site_type] = ExactRational.from_dict(amount)
+    return parsed
+
+
+@dataclass(frozen=True)
 class ReactionParticipant:
-    """One stoichiometric side participant; identity resolves outside the DTO."""
+    """One exact stoichiometric participant resolved outside the DTO."""
 
     state_id: str
-    coefficient: int
+    coefficient: ExactRational
     phase: str
     charge: int
-    site_count: int
+    site_stoichiometry: Mapping[str, ExactRational]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "state_id", _opaque_id(self.state_id, "participant.state_id"))
-        if (isinstance(self.coefficient, bool) or not isinstance(self.coefficient, int)
-                or not 1 <= self.coefficient <= 1_000_000):
-            raise CatalysisContractError("participant.coefficient must be a positive integer")
+        object.__setattr__(self, "coefficient", _exact_rational(
+            self.coefficient, "participant.coefficient", allow_zero=False))
         object.__setattr__(self, "phase", _enum(
             self.phase, "participant.phase", PARTICIPANT_PHASES))
         if (isinstance(self.charge, bool) or not isinstance(self.charge, int)
                 or not -1000 <= self.charge <= 1000):
             raise CatalysisContractError("participant.charge must be a bounded integer")
-        if (isinstance(self.site_count, bool) or not isinstance(self.site_count, int)
-                or not 0 <= self.site_count <= 1000):
-            raise CatalysisContractError("participant.site_count must be a non-negative integer")
+        object.__setattr__(self, "site_stoichiometry", _site_stoichiometry(
+            self.site_stoichiometry, "participant.site_stoichiometry"))
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "state_id": self.state_id,
-            "coefficient": self.coefficient,
+            "coefficient": self.coefficient.to_dict(),
             "phase": self.phase,
             "charge": self.charge,
-            "site_count": self.site_count,
+            "site_stoichiometry": {
+                key: amount.to_dict()
+                for key, amount in sorted(self.site_stoichiometry.items())
+            },
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ReactionParticipant:
         _strict_fields(
-            value, {"state_id", "coefficient", "phase", "charge", "site_count"},
+            value, {"state_id", "coefficient", "phase", "charge",
+                    "site_stoichiometry"},
             label="reaction_participant",
         )
-        return cls(**dict(value))
+        if not isinstance(value["coefficient"], Mapping):
+            raise CatalysisContractError(
+                "participant.coefficient must use numerator/denominator wire form")
+        return cls(
+            state_id=value["state_id"],
+            coefficient=ExactRational.from_dict(value["coefficient"]),
+            phase=value["phase"], charge=value["charge"],
+            site_stoichiometry=_site_stoichiometry_from_dict(
+                value["site_stoichiometry"], "participant.site_stoichiometry"),
+        )
 
 
 def _participants(value: Any, field: str) -> tuple[ReactionParticipant, ...]:
@@ -683,14 +771,14 @@ def _participants(value: Any, field: str) -> tuple[ReactionParticipant, ...]:
 
 @dataclass(frozen=True)
 class ElementaryStep(_RevisionedDomainDTO):
-    """A v2 step whose coefficients and conserved quantities are explicit."""
+    """A v3 step with exact coefficients and a complete transition-state side."""
 
-    schema: ClassVar[str] = "vcstudio.elementary-step/v2"
-    dto_schema_version: ClassVar[str] = "2.0.0"
+    schema: ClassVar[str] = "vcstudio.elementary-step/v3"
+    dto_schema_version: ClassVar[str] = "3.0.0"
     step_id: str
     reactants: tuple[ReactionParticipant, ...]
+    transition_state: tuple[ReactionParticipant, ...]
     products: tuple[ReactionParticipant, ...]
-    transition_state_id: str | None
     condition_set_id: str | None
     reversible: bool
     provenance: str
@@ -699,15 +787,15 @@ class ElementaryStep(_RevisionedDomainDTO):
     object_revision_id: str
     parent_revision: str | None = None
     expected_current_hash: str | None = None
-    schema_version: str = "2.0.0"
+    schema_version: str = "3.0.0"
 
     def __post_init__(self) -> None:
         self._validate_common()
         object.__setattr__(self, "step_id", _opaque_id(self.step_id, "step_id"))
         object.__setattr__(self, "reactants", _participants(self.reactants, "reactants"))
+        object.__setattr__(self, "transition_state", _participants(
+            self.transition_state, "transition_state"))
         object.__setattr__(self, "products", _participants(self.products, "products"))
-        object.__setattr__(self, "transition_state_id", _opaque_id(
-            self.transition_state_id, "transition_state_id", optional=True))
         object.__setattr__(self, "condition_set_id", _opaque_id(
             self.condition_set_id, "condition_set_id", optional=True))
         if not isinstance(self.reversible, bool):
@@ -716,16 +804,20 @@ class ElementaryStep(_RevisionedDomainDTO):
     def to_dict(self) -> dict[str, Any]:
         return {**self._common_dict(), "step_id": self.step_id,
                 "reactants": [item.to_dict() for item in self.reactants],
+                "transition_state": [item.to_dict() for item in self.transition_state],
                 "products": [item.to_dict() for item in self.products],
-                "transition_state_id": self.transition_state_id,
                 "condition_set_id": self.condition_set_id,
                 "reversible": self.reversible}
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ElementaryStep:
+        if isinstance(value, Mapping) and value.get("schema") in {
+                "vcstudio.elementary-step/v1", "vcstudio.elementary-step/v2"}:
+            raise CatalysisContractError(
+                "elementary step v1/v2 must be migrated to the v3 participant contract")
         allowed = {"schema", "schema_version", "object_revision_id",
                    "parent_revision", "expected_current_hash", "step_id", "reactants",
-                   "products", "transition_state_id", "condition_set_id", "reversible",
+                   "transition_state", "products", "condition_set_id", "reversible",
                    "provenance", "evidence_refs", "method_fingerprint"}
         _strict_fields(value, allowed, label="elementary_step")
         if value["schema"] != cls.schema:
@@ -733,8 +825,9 @@ class ElementaryStep(_RevisionedDomainDTO):
         return cls(
             step_id=value["step_id"],
             reactants=tuple(ReactionParticipant.from_dict(item) for item in value["reactants"]),
+            transition_state=tuple(
+                ReactionParticipant.from_dict(item) for item in value["transition_state"]),
             products=tuple(ReactionParticipant.from_dict(item) for item in value["products"]),
-            transition_state_id=value["transition_state_id"],
             condition_set_id=value["condition_set_id"], reversible=value["reversible"],
             provenance=value["provenance"],
             evidence_refs=_evidence_refs(value["evidence_refs"], "evidence_refs"),
@@ -754,28 +847,48 @@ class AuthoritativeParticipantState:
     chemical_formula: str
     phase: str
     charge: int
-    site_count: int
+    site_stoichiometry: Mapping[str, ExactRational]
 
     def __post_init__(self) -> None:
         participant = ReactionParticipant(
             state_id=self.state_id, coefficient=1, phase=self.phase,
-            charge=self.charge, site_count=self.site_count,
+            charge=self.charge, site_stoichiometry=self.site_stoichiometry,
         )
         object.__setattr__(self, "state_id", participant.state_id)
         object.__setattr__(self, "phase", participant.phase)
+        object.__setattr__(self, "charge", participant.charge)
+        object.__setattr__(self, "site_stoichiometry", participant.site_stoichiometry)
         formula = str(self.chemical_formula or "").strip()
         if not formula or not _FORMULA_RE.fullmatch(formula):
             raise CatalysisContractError("authoritative chemical_formula is invalid")
         reject_sensitive(formula, field="authoritative chemical_formula")
         object.__setattr__(self, "chemical_formula", formula)
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "state_id": self.state_id,
+            "chemical_formula": self.chemical_formula,
+            "phase": self.phase,
+            "charge": self.charge,
+            "site_stoichiometry": {
+                key: amount.to_dict()
+                for key, amount in sorted(self.site_stoichiometry.items())
+            },
+        }
+
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> AuthoritativeParticipantState:
         _strict_fields(
-            value, {"state_id", "chemical_formula", "phase", "charge", "site_count"},
+            value, {"state_id", "chemical_formula", "phase", "charge",
+                    "site_stoichiometry"},
             label="authoritative_participant_state",
         )
-        return cls(**dict(value))
+        return cls(
+            state_id=value["state_id"], chemical_formula=value["chemical_formula"],
+            phase=value["phase"], charge=value["charge"],
+            site_stoichiometry=_site_stoichiometry_from_dict(
+                value["site_stoichiometry"], "authoritative.site_stoichiometry"),
+        )
 
 
 _ELEMENT_TOKEN_RE = re.compile(r"([A-Z][a-z]?)([1-9]\d*)?")
@@ -811,7 +924,11 @@ def validate_elementary_step_conservation(
     if not isinstance(step, ElementaryStep):
         raise CatalysisContractError("step must be an ElementaryStep")
 
+    resolved_cache: dict[str, AuthoritativeParticipantState] = {}
+
     def resolved(state_id: str) -> AuthoritativeParticipantState:
+        if state_id in resolved_cache:
+            return resolved_cache[state_id]
         try:
             value = resolver(state_id) if callable(resolver) else resolver[state_id]
         except (KeyError, LookupError) as exc:
@@ -825,38 +942,73 @@ def validate_elementary_step_conservation(
             raise CatalysisContractError("authoritative resolver returned an invalid state")
         if record.state_id != state_id:
             raise CatalysisContractError("authoritative resolver identity mismatch")
+        resolved_cache[state_id] = record
         return record
 
-    def totals(side: tuple[ReactionParticipant, ...]) -> tuple[dict[str, int], int, int]:
-        elements: dict[str, int] = {}
-        charge = 0
-        sites = 0
+    def totals(side: tuple[ReactionParticipant, ...]) -> tuple[
+            dict[str, Fraction], Fraction, dict[str, Fraction]]:
+        elements: dict[str, Fraction] = {}
+        charge = Fraction(0)
+        sites: dict[str, Fraction] = {}
         for participant in side:
             state = resolved(participant.state_id)
             if (state.phase != participant.phase or state.charge != participant.charge
-                    or state.site_count != participant.site_count):
+                    or state.site_stoichiometry != participant.site_stoichiometry):
                 raise CatalysisContractError(
                     "participant declaration disagrees with authoritative state")
+            coefficient = participant.coefficient.to_fraction()
             for element, count in _element_counts(state.chemical_formula).items():
-                elements[element] = elements.get(element, 0) + participant.coefficient * count
-            charge += participant.coefficient * participant.charge
-            sites += participant.coefficient * participant.site_count
+                elements[element] = (
+                    elements.get(element, Fraction(0)) + coefficient * count)
+            charge += coefficient * participant.charge
+            for site_type, amount in participant.site_stoichiometry.items():
+                sites[site_type] = (
+                    sites.get(site_type, Fraction(0))
+                    + coefficient * amount.to_fraction())
         return elements, charge, sites
 
     reactant_elements, reactant_charge, reactant_sites = totals(step.reactants)
+    transition_elements, transition_charge, transition_sites = totals(
+        step.transition_state)
     product_elements, product_charge, product_sites = totals(step.products)
-    if reactant_elements != product_elements:
-        raise CatalysisContractError("elementary step violates elemental conservation")
-    if reactant_charge != product_charge:
-        raise CatalysisContractError("elementary step violates charge conservation")
-    if reactant_sites != product_sites:
-        raise CatalysisContractError("elementary step violates surface-site conservation")
+
+    for left_name, left, right_name, right in (
+        ("reactants", reactant_elements, "transition_state", transition_elements),
+        ("transition_state", transition_elements, "products", product_elements),
+    ):
+        if left != right:
+            raise CatalysisContractError(
+                f"{left_name}/{right_name} violates elemental conservation")
+    for left_name, left, right_name, right in (
+        ("reactants", reactant_charge, "transition_state", transition_charge),
+        ("transition_state", transition_charge, "products", product_charge),
+    ):
+        if left != right:
+            raise CatalysisContractError(
+                f"{left_name}/{right_name} violates charge conservation")
+    for left_name, left, right_name, right in (
+        ("reactants", reactant_sites, "transition_state", transition_sites),
+        ("transition_state", transition_sites, "products", product_sites),
+    ):
+        if left != right:
+            raise CatalysisContractError(
+                f"{left_name}/{right_name} violates site-type conservation")
+
+    def rational_wire(value: Fraction) -> dict[str, int]:
+        return {"numerator": value.numerator, "denominator": value.denominator}
+
     return _FrozenDict({
-        "schema": "vcstudio.elementary-step-conservation/v1",
+        "schema": "vcstudio.elementary-step-conservation/v2",
         "step_id": step.step_id,
-        "elements": _FrozenDict(reactant_elements),
-        "charge": reactant_charge,
-        "site_count": reactant_sites,
+        "elements": _FrozenDict({
+            key: _FrozenDict(rational_wire(amount))
+            for key, amount in sorted(reactant_elements.items())
+        }),
+        "charge": _FrozenDict(rational_wire(reactant_charge)),
+        "site_stoichiometry": _FrozenDict({
+            key: _FrozenDict(rational_wire(amount))
+            for key, amount in sorted(reactant_sites.items())
+        }),
         "authorizes_execution": False,
     })
 
@@ -1503,7 +1655,8 @@ __all__ = [
     "AdsorbateState", "AuthoritativeParticipantState", "CatalystSurface",
     "CatalysisContractError", "ConditionSet",
     "DOMAIN_ENVELOPE_SCHEMA", "DomainEnvelope", "EVIDENCE_TYPES", "ElementaryStep",
-    "EvidenceRef", "MODEL_VERSION", "MethodFingerprint", "PARTICIPANT_PHASES",
+    "EvidenceRef", "ExactRational", "MODEL_VERSION", "MethodFingerprint",
+    "PARTICIPANT_PHASES",
     "PROVENANCE_KINDS", "ReactionNetwork", "ReactionParticipant", "RecipeInput",
     "RecipeParameter", "ScientificLimit",
     "WORKFLOW_RUN_SCHEMA", "WorkflowNode", "WorkflowRecipe", "WorkflowRunSnapshot",

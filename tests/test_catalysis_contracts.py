@@ -12,6 +12,7 @@ from vcstudio.project.catalysis_contracts import (
     DomainEnvelope,
     ElementaryStep,
     EvidenceRef,
+    ExactRational,
     MethodFingerprint,
     AuthoritativeParticipantState,
     ReactionParticipant,
@@ -41,6 +42,30 @@ def _method(origin="observed"):
     )
 
 
+def _participant(state_id, coefficient=1, phase="gas", charge=0, sites=None):
+    return ReactionParticipant(
+        state_id=state_id, coefficient=coefficient, phase=phase, charge=charge,
+        site_stoichiometry={} if sites is None else sites,
+    )
+
+
+def _state(state_id, formula, phase="gas", charge=0, sites=None):
+    return AuthoritativeParticipantState(
+        state_id=state_id, chemical_formula=formula, phase=phase, charge=charge,
+        site_stoichiometry={} if sites is None else sites,
+    )
+
+
+def _step(reactants, transition_state, products, step_id="step-conservation"):
+    return ElementaryStep(
+        step_id=step_id, reactants=tuple(reactants),
+        transition_state=tuple(transition_state), products=tuple(products),
+        condition_set_id=None, reversible=False, provenance="observed",
+        evidence_refs=_refs(), method_fingerprint=_method(),
+        object_revision_id="revision-1",
+    )
+
+
 def _objects():
     common = {"provenance": "observed", "evidence_refs": _refs(),
               "method_fingerprint": _method(), "object_revision_id": "revision-1"}
@@ -57,9 +82,9 @@ def _objects():
         ),
         ElementaryStep(
             step_id="step-001",
-            reactants=(ReactionParticipant("state-a", 2, "gas", 0, 0),),
-            products=(ReactionParticipant("state-b", 1, "gas", 0, 0),),
-            transition_state_id="state-ts",
+            reactants=(_participant("state-a", 2),),
+            transition_state=(_participant("state-ts-a"), _participant("state-ts-b")),
+            products=(_participant("state-b"),),
             condition_set_id="conditions-298k", reversible=True, **common,
         ),
         ConditionSet(
@@ -83,7 +108,7 @@ def test_domain_dtos_are_strict_versioned_canonical_and_round_trip():
         assert len(value.semantic_hash()) == 64
         assert canonical_json_bytes(payload) == canonical_json_bytes(
             dict(reversed(list(payload.items()))))
-        assert payload["schema_version"] in {"1.0.0", "2.0.0"}
+        assert payload["schema_version"] in {"1.0.0", "3.0.0"}
         assert payload["object_revision_id"] == "revision-1"
         assert payload["provenance"] == "observed"
         assert payload["evidence_refs"][0]["origin"] == "observed"
@@ -252,90 +277,232 @@ def test_direct_domain_constructor_rejects_secret_shaped_scientific_strings(fiel
                 **common,
             )
         with pytest.raises(CatalysisContractError, match="path or secret"):
-            AuthoritativeParticipantState("state-1", secret, "gas", 0, 0)
+            AuthoritativeParticipantState("state-1", secret, "gas", 0, {})
 
 
-def test_elementary_step_v2_expresses_coefficients_and_rejects_old_v1_shape():
+def test_elementary_step_v3_is_canonical_and_explicitly_rejects_v1_v2_shapes():
     step = _objects()[2]
-    assert step.to_dict()["reactants"][0]["coefficient"] == 2
-    old = step.to_dict()
-    old["schema"] = "vcstudio.elementary-step/v1"
-    old["schema_version"] = "1.0.0"
-    old["reactant_state_ids"] = ["state-a", "state-a"]
-    old["product_state_ids"] = ["state-b"]
-    old.pop("reactants")
-    old.pop("products")
+    wire = step.to_dict()
+    assert wire["schema"] == "vcstudio.elementary-step/v3"
+    assert wire["schema_version"] == "3.0.0"
+    assert wire["reactants"][0]["coefficient"] == {
+        "numerator": 2, "denominator": 1,
+    }
+    assert len(wire["transition_state"]) == 2
+    assert "transition_state_id" not in wire
+
+    v1 = {"schema": "vcstudio.elementary-step/v1"}
+    v2 = {"schema": "vcstudio.elementary-step/v2"}
+    for legacy in (v1, v2):
+        with pytest.raises(CatalysisContractError, match="migrated to the v3"):
+            ElementaryStep.from_dict(legacy)
+
+    legacy_field = copy.deepcopy(wire)
+    legacy_field["transition_state_id"] = "state-ts"
+    legacy_field.pop("transition_state")
     with pytest.raises(CatalysisContractError):
-        ElementaryStep.from_dict(old)
+        ElementaryStep.from_dict(legacy_field)
+
+    with pytest.raises(CatalysisContractError, match="transition_state must not be empty"):
+        _step([_participant("reactant")], [], [_participant("product")])
 
 
-def test_authoritative_resolver_enforces_elements_charge_and_surface_sites():
+def test_exact_rational_normalizes_and_rejects_float_or_nonpositive_amounts():
+    assert ExactRational(2, 4) == ExactRational(1, 2)
+    assert ExactRational.from_dict({"numerator": 2, "denominator": 4}) == (
+        ExactRational(1, 2))
+    participant = _participant(
+        "state-a", ExactRational(2, 4), "adsorbed", sites={
+            "top": ExactRational(2, 4),
+        },
+    )
+    assert participant.to_dict()["coefficient"] == {
+        "numerator": 1, "denominator": 2,
+    }
+    assert participant.to_dict()["site_stoichiometry"]["top"] == {
+        "numerator": 1, "denominator": 2,
+    }
+    canonical_participant = _participant(
+        "state-a", ExactRational(1, 2), "adsorbed", sites={
+            "top": ExactRational(1, 2),
+        },
+    )
+    assert participant.to_dict() == canonical_participant.to_dict()
+    state = _state("state-a", "H", "adsorbed", sites={
+        "top": ExactRational(1, 2),
+    })
+    assert AuthoritativeParticipantState.from_dict(state.to_dict()) == state
+
+    with pytest.raises(CatalysisContractError, match="never a floating-point"):
+        _participant("state-a", 0.5)
+    with pytest.raises(CatalysisContractError, match="never a floating-point"):
+        _participant("state-a", sites={"top": 0.5})
+    with pytest.raises(CatalysisContractError, match="must be positive"):
+        _participant("state-a", 0)
+    with pytest.raises(CatalysisContractError, match="must be positive"):
+        _participant("state-a", sites={"top": 0})
+    with pytest.raises(CatalysisContractError):
+        ExactRational(1, 0)
+    with pytest.raises(CatalysisContractError):
+        ExactRational(-1, 2)
+    with pytest.raises(CatalysisContractError):
+        ExactRational(0.5, 1)
+    with pytest.raises(CatalysisContractError):
+        ExactRational(1, 2.0)
+    with pytest.raises(CatalysisContractError, match="outside the supported range"):
+        ExactRational(1_000_000_001, 1)
+    with pytest.raises(CatalysisContractError):
+        _participant("state-a", sites={"github_api_key": 1})
+
+    old_v2_participant = participant.to_dict()
+    old_v2_participant["coefficient"] = 1
+    with pytest.raises(CatalysisContractError):
+        ReactionParticipant.from_dict(old_v2_participant)
+
+
+def test_half_o2_uses_fraction_exactly_across_reactants_ts_and_products():
+    sites_reactant = {"bridge": 2}
+    sites_single = {"bridge": 1}
+    step = _step(
+        [_participant("o2", ExactRational(1, 2), "adsorbed", 2, sites_reactant)],
+        [_participant("ts-o", 1, "adsorbed", 1, sites_single)],
+        [_participant("o", 1, "adsorbed", 1, sites_single)],
+        "step-half-o2",
+    )
+    result = validate_elementary_step_conservation(step, {
+        "o2": _state("o2", "O2", "adsorbed", 2, sites_reactant),
+        "ts-o": _state("ts-o", "O", "adsorbed", 1, sites_single),
+        "o": _state("o", "O", "adsorbed", 1, sites_single),
+    })
+    assert result["elements"] == {"O": {"numerator": 1, "denominator": 1}}
+    assert result["charge"] == {"numerator": 1, "denominator": 1}
+    assert result["site_stoichiometry"] == {
+        "bridge": {"numerator": 1, "denominator": 1},
+    }
+    assert result["authorizes_execution"] is False
+    assert canonical_json_bytes(result)
+
+
+def test_multi_participant_ts_is_complete_and_missing_ts_record_fails_closed():
     step = _objects()[2]
     states = {
-        "state-a": AuthoritativeParticipantState("state-a", "H", "gas", 0, 0),
-        "state-b": AuthoritativeParticipantState("state-b", "H2", "gas", 0, 0),
+        "state-a": _state("state-a", "H"),
+        "state-ts-a": _state("state-ts-a", "H"),
+        "state-ts-b": _state("state-ts-b", "H"),
+        "state-b": _state("state-b", "H2"),
     }
     result = validate_elementary_step_conservation(step, states)
-    assert result["elements"] == {"H": 2}
-    assert result["authorizes_execution"] is False
+    assert result["elements"] == {"H": {"numerator": 2, "denominator": 1}}
 
-    h2_to_water = ElementaryStep(
-        step_id="step-unbalanced",
-        reactants=(ReactionParticipant("h2", 1, "gas", 0, 0),),
-        products=(ReactionParticipant("water", 1, "gas", 0, 0),),
-        transition_state_id=None, condition_set_id=None, reversible=False,
-        provenance="observed", evidence_refs=_refs(), method_fingerprint=_method(),
-        object_revision_id="revision-1",
+    states.pop("state-ts-b")
+    with pytest.raises(CatalysisContractError, match="has no state state-ts-b"):
+        validate_elementary_step_conservation(step, states)
+
+
+def test_h2_to_h2o_is_rejected_even_when_ts_matches_reactants():
+    step = _step(
+        [_participant("h2")], [_participant("ts-h2")], [_participant("water")],
+        "step-unbalanced",
     )
-    with pytest.raises(CatalysisContractError, match="elemental conservation"):
-        validate_elementary_step_conservation(h2_to_water, {
-            "h2": AuthoritativeParticipantState("h2", "H2", "gas", 0, 0),
-            "water": AuthoritativeParticipantState("water", "H2O", "gas", 0, 0),
+    with pytest.raises(
+            CatalysisContractError,
+            match="transition_state/products violates elemental conservation"):
+        validate_elementary_step_conservation(step, {
+            "h2": _state("h2", "H2"),
+            "ts-h2": _state("ts-h2", "H2"),
+            "water": _state("water", "H2O"),
         })
 
 
-@pytest.mark.parametrize(("products", "records", "message"), [
+def test_a_site_to_b_site_is_rejected_per_site_type_not_scalar_total():
+    step = _step(
+        [_participant("reactant", 1, "adsorbed", sites={"A-site": 1})],
+        [_participant("ts", 1, "adsorbed", sites={"A-site": 1})],
+        [_participant("product", 1, "adsorbed", sites={"B-site": 1})],
+    )
+    with pytest.raises(
+            CatalysisContractError,
+            match="transition_state/products violates site-type conservation"):
+        validate_elementary_step_conservation(step, {
+            "reactant": _state("reactant", "H", "adsorbed", sites={"A-site": 1}),
+            "ts": _state("ts", "H", "adsorbed", sites={"A-site": 1}),
+            "product": _state("product", "H", "adsorbed", sites={"B-site": 1}),
+        })
+
+
+@pytest.mark.parametrize(("ts_participant", "states", "message"), [
     (
-        (ReactionParticipant("product", 1, "adsorbed", 1, 1),),
+        _participant("ts-element"),
         {
-            "reactant": AuthoritativeParticipantState("reactant", "H", "adsorbed", 0, 1),
-            "product": AuthoritativeParticipantState("product", "H", "adsorbed", 1, 1),
+            "reactant": _state("reactant", "H2"),
+            "ts-element": _state("ts-element", "H"),
+            "product": _state("product", "H2"),
         },
-        "charge conservation",
+        "reactants/transition_state violates elemental conservation",
     ),
     (
-        (ReactionParticipant("product", 1, "adsorbed", 0, 2),),
+        _participant("ts-charge", charge=1),
         {
-            "reactant": AuthoritativeParticipantState("reactant", "H", "adsorbed", 0, 1),
-            "product": AuthoritativeParticipantState("product", "H", "adsorbed", 0, 2),
+            "reactant": _state("reactant", "H"),
+            "ts-charge": _state("ts-charge", "H", charge=1),
+            "product": _state("product", "H"),
         },
-        "surface-site conservation",
+        "reactants/transition_state violates charge conservation",
+    ),
+    (
+        _participant("ts-site", phase="adsorbed", sites={"top": 2}),
+        {
+            "reactant": _state("reactant", "H", "adsorbed", sites={"top": 1}),
+            "ts-site": _state("ts-site", "H", "adsorbed", sites={"top": 2}),
+            "product": _state("product", "H", "adsorbed", sites={"top": 1}),
+        },
+        "reactants/transition_state violates site-type conservation",
     ),
 ])
-def test_authoritative_resolver_rejects_charge_and_site_imbalance(products, records, message):
-    step = ElementaryStep(
-        step_id="step-conservation",
-        reactants=(ReactionParticipant("reactant", 1, "adsorbed", 0, 1),),
-        products=products, transition_state_id=None, condition_set_id=None,
-        reversible=False, provenance="observed", evidence_refs=_refs(),
-        method_fingerprint=_method(), object_revision_id="revision-1",
+def test_transition_state_elements_charge_and_sites_are_each_authoritative(
+        ts_participant, states, message):
+    reactant = next(item for key, item in states.items() if key == "reactant")
+    product = next(item for key, item in states.items() if key == "product")
+    step = _step(
+        [_participant(
+            "reactant", phase=reactant.phase, charge=reactant.charge,
+            sites=reactant.site_stoichiometry,
+        )],
+        [ts_participant],
+        [_participant(
+            "product", phase=product.phase, charge=product.charge,
+            sites=product.site_stoichiometry,
+        )],
     )
     with pytest.raises(CatalysisContractError, match=message):
-        validate_elementary_step_conservation(step, records)
+        validate_elementary_step_conservation(step, states)
 
 
-def test_participant_declaration_cannot_override_authoritative_state_metadata():
-    step = ElementaryStep(
-        step_id="step-metadata",
-        reactants=(ReactionParticipant("reactant", 1, "gas", 0, 0),),
-        products=(ReactionParticipant("product", 1, "gas", 0, 0),),
-        transition_state_id=None, condition_set_id=None, reversible=False,
-        provenance="observed", evidence_refs=_refs(), method_fingerprint=_method(),
-        object_revision_id="revision-1",
+def test_participant_declaration_cannot_override_authoritative_ts_metadata():
+    step = _step(
+        [_participant("reactant")], [_participant("ts")], [_participant("product")],
+        "step-metadata",
     )
     records = {
-        "reactant": AuthoritativeParticipantState("reactant", "H2", "gas", 0, 0),
-        "product": AuthoritativeParticipantState("product", "H2", "adsorbed", 0, 1),
+        "reactant": _state("reactant", "H2"),
+        "ts": _state("ts", "H2", "adsorbed", sites={"top": 1}),
+        "product": _state("product", "H2"),
     }
     with pytest.raises(CatalysisContractError, match="disagrees with authoritative"):
         validate_elementary_step_conservation(step, records)
+
+
+def test_callable_resolver_is_snapshotted_once_per_state_id():
+    step = _step(
+        [_participant("shared")], [_participant("shared")], [_participant("shared")],
+        "step-shared-state",
+    )
+    calls = 0
+
+    def resolver(state_id):
+        nonlocal calls
+        calls += 1
+        return _state(state_id, "H" if calls == 1 else "H2")
+
+    validate_elementary_step_conservation(step, resolver)
+    assert calls == 1
