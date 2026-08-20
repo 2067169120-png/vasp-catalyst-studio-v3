@@ -33,7 +33,7 @@ def _make_relax(tmp_path):
 def test_elf_kind_sets_lelf(tmp_path):
     relax = _make_relax(tmp_path)
     estatic.build_static_job(str(relax), str(tmp_path / 'elf'), purpose='elf')
-    inc = parse_incar((tmp_path / 'elf' / 'INCAR').read_text())
+    inc = parse_incar((tmp_path / 'elf' / 'INCAR').read_text(encoding='utf-8'))
     assert inc['LELF'] is True
     assert inc['NSW'] == 0 and inc['IBRION'] == -1          # 仍是静态单点
 
@@ -51,7 +51,7 @@ def test_elf_in_purposes():
 def test_other_purposes_no_lelf(tmp_path):
     relax = _make_relax(tmp_path)
     estatic.build_static_job(str(relax), str(tmp_path / 'pdos'), purpose='pdos')
-    inc = parse_incar((tmp_path / 'pdos' / 'INCAR').read_text())
+    inc = parse_incar((tmp_path / 'pdos' / 'INCAR').read_text(encoding='utf-8'))
     assert 'LELF' not in inc                                # 只有 elf kind 才加
 
 

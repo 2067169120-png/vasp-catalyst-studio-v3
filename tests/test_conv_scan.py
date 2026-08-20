@@ -64,14 +64,16 @@ def test_encut_series_uses_fixed_geometry_static_baseline(tmp_path):
     src = _make_src(tmp_path)
     res = cs.build_encut_series(str(src), str(tmp_path / 'enc'), values=[400, 500, 600])
     assert set(res['dirs']) == {400, 500, 600}
-    inc = parse_incar((tmp_path / 'enc' / 'encut_400' / 'INCAR').read_text())
+    inc = parse_incar(
+        (tmp_path / 'enc' / 'encut_400' / 'INCAR').read_text(encoding='utf-8'))
     assert inc['ENCUT'] == 400
     assert inc['GGA'] == 'PE'
     assert inc['IBRION'] == -1 and inc['NSW'] == 0
     assert inc['ISTART'] == 0 and inc['ICHARG'] == 2
     assert 'ISIF' not in inc and 'EDIFFG' not in inc
     # KPOINTS/POTCAR 逐字复制
-    assert (tmp_path / 'enc' / 'encut_400' / 'KPOINTS').read_text() == _KP
+    assert (tmp_path / 'enc' / 'encut_400' / 'KPOINTS').read_text(
+        encoding='utf-8') == _KP
 
 
 def test_encut_series_manifest_and_changes(tmp_path):
@@ -91,9 +93,11 @@ def test_kmesh_series_changes_kpoints_on_fixed_static_baseline(tmp_path):
     src = _make_src(tmp_path)
     res = cs.build_kmesh_series(str(src), str(tmp_path / 'km'), meshes=[[3, 3, 1], [7, 7, 1]])
     assert set(res['dirs']) == {9, 49}                       # series_value = k 点积
-    kp = (tmp_path / 'km' / 'kmesh_7x7x1' / 'KPOINTS').read_text()
+    kp = (tmp_path / 'km' / 'kmesh_7x7x1' / 'KPOINTS').read_text(
+        encoding='utf-8')
     assert '7 7 1' in kp and 'Gamma' in kp
-    inc = parse_incar((tmp_path / 'km' / 'kmesh_7x7x1' / 'INCAR').read_text())
+    inc = parse_incar(
+        (tmp_path / 'km' / 'kmesh_7x7x1' / 'INCAR').read_text(encoding='utf-8'))
     assert inc['IBRION'] == -1 and inc['NSW'] == 0 and inc['ICHARG'] == 2
 
 
@@ -109,12 +113,13 @@ def test_kmesh_series_manifest(tmp_path):
 def test_vacuum_series_rebuilds_poscar(tmp_path):
     src = _make_src(tmp_path)
     cs.build_vacuum_series(str(src), str(tmp_path / 'vac'), vacuums=[12, 18])
-    txt = (tmp_path / 'vac' / 'vac_12' / 'POSCAR').read_text()
+    txt = (tmp_path / 'vac' / 'vac_12' / 'POSCAR').read_text(encoding='utf-8')
     # slab z 跨度 = 2 Å(8→10),真空 12 → |c| = 14
     c_line = txt.splitlines()[4].split()
     assert float(c_line[2]) == pytest.approx(14.0)
     # 所有点共享固定几何静态 INCAR；KPOINTS 复制
-    inc = parse_incar((tmp_path / 'vac' / 'vac_12' / 'INCAR').read_text())
+    inc = parse_incar(
+        (tmp_path / 'vac' / 'vac_12' / 'INCAR').read_text(encoding='utf-8'))
     assert inc['IBRION'] == -1 and inc['NSW'] == 0 and inc['ICHARG'] == 2
 
 
@@ -151,8 +156,10 @@ def test_slab_thickness_with_builder_fn(tmp_path):
     res = cs.build_slab_thickness_series(str(src), str(tmp_path / 'th'),
                                          layers=[3, 4], slab_builder_fn=_fake_slab)
     assert set(res['dirs']) == {3, 4}
-    assert '3 layers' in (tmp_path / 'th' / 'nlayers_3' / 'POSCAR').read_text()
-    inc = parse_incar((tmp_path / 'th' / 'nlayers_3' / 'INCAR').read_text())
+    assert '3 layers' in (tmp_path / 'th' / 'nlayers_3' / 'POSCAR').read_text(
+        encoding='utf-8')
+    inc = parse_incar(
+        (tmp_path / 'th' / 'nlayers_3' / 'INCAR').read_text(encoding='utf-8'))
     assert inc['IBRION'] == -1 and inc['NSW'] == 0 and inc['ICHARG'] == 2
     m = manifest_mod.load_manifest(tmp_path / 'th' / 'nlayers_4')
     assert m['inputs']['series'] == 'slab_thickness' and m['inputs']['series_value'] == 4

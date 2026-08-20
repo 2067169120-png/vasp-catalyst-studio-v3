@@ -276,12 +276,13 @@ def test_build_freq_job_end_to_end(tmp_path):
     for name in ('POSCAR', 'INCAR', 'KPOINTS', 'POTCAR', 'job.yaml'):
         assert (out / name).is_file()
     # 频率 POSCAR 冻结 slab、放开吸附质
-    assert (out / 'POSCAR').read_text().splitlines().count('Selective dynamics') == 1
+    assert (out / 'POSCAR').read_text(
+        encoding='utf-8').splitlines().count('Selective dynamics') == 1
     # 派生 INCAR 生效
-    d = parse_incar((out / 'INCAR').read_text())
+    d = parse_incar((out / 'INCAR').read_text(encoding='utf-8'))
     assert d['IBRION'] == 5 and 'ISIF' not in d
     # KPOINTS 复制原网格
-    assert '3 3 1' in (out / 'KPOINTS').read_text()
+    assert '3 3 1' in (out / 'KPOINTS').read_text(encoding='utf-8')
     # manifest 溯源
     m = manifest_mod.load_manifest(out)
     assert m['task_type'] == 'freq'
@@ -294,7 +295,7 @@ def test_build_freq_job_gamma_kpoints(tmp_path):
     relax = _make_relax_dir(tmp_path)
     out = tmp_path / 'freqG'
     fb.build_freq_job(str(relax), str(out), kpoints='gamma')
-    kp = (out / 'KPOINTS').read_text()
+    kp = (out / 'KPOINTS').read_text(encoding='utf-8')
     assert '1 1 1' in kp                                 # Γ 单点覆盖原 3×3×1
 
 
@@ -311,11 +312,11 @@ def test_build_molecule_freq_job_all_free_gamma(tmp_path):
     out = tmp_path / 'freqmol'
     res = fb.build_molecule_freq_job(str(relax), str(out))
     assert res['free_atoms'] == [0, 1, 2, 3, 4]          # 全原子放开
-    assert '1 1 1' in (out / 'KPOINTS').read_text()      # 气相默认 Γ
+    assert '1 1 1' in (out / 'KPOINTS').read_text(encoding='utf-8')  # 气相默认 Γ
     m = manifest_mod.load_manifest(out)
     assert m['calc_type'] == 'molecule'
     # 全 T T T
-    fl = _flag_lines((out / 'POSCAR').read_text())
+    fl = _flag_lines((out / 'POSCAR').read_text(encoding='utf-8'))
     assert all(ln.endswith('T T T') for ln in fl)
 
 

@@ -184,6 +184,26 @@ def test_neb_view_only_releases_barriers_after_all_evidence_gates(tmp_path):
                changed_source["paths"][0]["barriers"]["blocking"])
 
 
+def test_neb_rejects_oszicar_energy_from_a_different_final_ionic_event(tmp_path):
+    target = _neb_target(tmp_path)
+    root = Path(target["path"])
+    (root / "01" / "OSZICAR").write_text(
+        " 1 F= -1.00000000 E0= -1.00000000 d E =0\n",
+        encoding="utf-8",
+    )
+    spec = normalize_analysis_request(
+        {"analysis_id": "neb-path"}, project_id=PROJECT)
+
+    view = build_neb_analysis_view(
+        spec, _neb_targets(target), method_evidence=_method)
+
+    path = view["paths"][0]
+    assert path["points"][1]["absolute_energy"]["value"] is None
+    assert path["points"][1]["max_force"]["value"] is None
+    assert path["barriers"]["status"] == "unavailable"
+    assert any("energy disagree" in issue for issue in path["barriers"]["blocking"])
+
+
 def _convergence_targets(tmp_path: Path) -> list[dict]:
     targets = []
     for index, (encut, energy) in enumerate((
@@ -192,7 +212,11 @@ def _convergence_targets(tmp_path: Path) -> list[dict]:
         root.mkdir(parents=True)
         (root / "INCAR").write_text(f"ENCUT={encut}\n", encoding="utf-8")
         (root / "POSCAR").write_text(_poscar(0.0), encoding="utf-8")
-        (root / "OUTCAR").write_text(" NIONS = 1 ions\n", encoding="utf-8")
+        (root / "OUTCAR").write_text(
+            " NIONS = 1 ions\n"
+            " General timing and accounting informations for this job:\n",
+            encoding="utf-8",
+        )
         (root / "OSZICAR").write_text(
             f" 1 F= {energy:.8f} E0= {energy:.8f} d E =0\n",
             encoding="utf-8",
@@ -205,6 +229,13 @@ def _convergence_targets(tmp_path: Path) -> list[dict]:
                 "parent_job": "parent", "series": "encut",
                 "series_value": encut, "series_label": f"{encut} eV", "natoms": 1,
                 "sha256": {"POSCAR": _sha(root / "POSCAR")},
+            },
+            "results": {
+                "energy_e0_eV": energy,
+                "diagnosis": {
+                    "failure_class": "CONVERGED", "exit_code": 0,
+                    "clean_exit": True,
+                },
             },
         }
         _write_manifest(root, manifest)
@@ -279,6 +310,63 @@ def test_convergence_any_method_issue_or_natoms_mismatch_blocks_recommendation(t
     assert denominator_blocked["series"][0]["platform"]["status"] == "unavailable"
     assert any("atom counts disagree" in issue
                for issue in denominator_blocked["series"][0]["issues"])
+
+
+def test_convergence_coordinate_must_match_current_input_bytes(tmp_path):
+    targets = _convergence_targets(tmp_path)
+    for target in targets:
+        (Path(target["path"]) / "INCAR").write_text(
+            "ENCUT=400\n", encoding="utf-8")
+    spec = normalize_analysis_request(
+        {"analysis_id": "convergence-scan"}, project_id=PROJECT)
+
+    view = build_convergence_analysis_view(
+        spec, targets, method_evidence=lambda target: target["method"])
+
+    series = view["series"][0]
+    assert [point["parameter"]["value"] for point in series["points"]] == [
+        400.0, 400.0, 400.0, 400.0]
+    assert sum(point["coordinate_verified"] for point in series["points"]) == 1
+    assert series["platform"]["status"] == "unavailable"
+    assert series["platform"]["recommendation"]["value"] is None
+    assert any("does not match the current input value" in issue
+               for issue in series["issues"])
+
+
+def test_convergence_requires_current_clean_completion_and_matching_energy(tmp_path):
+    targets = _convergence_targets(tmp_path)
+    root = Path(targets[1]["path"])
+    (root / "OUTCAR").write_text(" NIONS = 1 ions\n", encoding="utf-8")
+    spec = normalize_analysis_request(
+        {"analysis_id": "convergence-scan"}, project_id=PROJECT)
+
+    no_footer = build_convergence_analysis_view(
+        spec, targets, method_evidence=lambda target: target["method"])
+
+    series = no_footer["series"][0]
+    assert series["points"][1]["absolute_energy"]["value"] is None
+    assert series["platform"]["status"] == "unavailable"
+    assert any("OUTCAR timing" in issue for issue in series["issues"])
+
+    (root / "OUTCAR").write_text(
+        " NIONS = 1 ions\n"
+        " General timing and accounting informations for this job:\n",
+        encoding="utf-8",
+    )
+    targets[1]["manifest"]["results"]["diagnosis"]["exit_code"] = 7
+    _write_manifest(root, targets[1]["manifest"])
+    bad_exit = build_convergence_analysis_view(
+        spec, targets, method_evidence=lambda target: target["method"])
+    assert bad_exit["series"][0]["points"][1]["absolute_energy"]["value"] is None
+    assert any("退出码" in issue for issue in bad_exit["series"][0]["issues"])
+
+    targets[1]["manifest"]["results"]["diagnosis"]["exit_code"] = 0
+    targets[1]["manifest"]["results"]["energy_e0_eV"] = -99.0
+    _write_manifest(root, targets[1]["manifest"])
+    mismatch = build_convergence_analysis_view(
+        spec, targets, method_evidence=lambda target: target["method"])
+    assert mismatch["series"][0]["points"][1]["absolute_energy"]["value"] is None
+    assert any("不一致" in issue for issue in mismatch["series"][0]["issues"])
 
 
 def test_convergence_fails_whole_projection_if_source_changes_mid_parse(tmp_path):
@@ -403,7 +491,42 @@ def test_aimd_restart_is_segmented_without_cross_segment_duration_or_drift(tmp_p
     assert [sample["time"]["value"] for sample in trajectory["samples"]] == [
         0.001, 0.002, 0.001, 0.002]
     assert view["figure_data"] == {}
-    assert any("restarted or regressed" in issue for issue in trajectory["issues"])
+    assert any("restart, regression, or gap" in issue for issue in trajectory["issues"])
+
+
+def test_aimd_step_gap_splits_segments_and_blocks_done_aggregates(tmp_path):
+    root = tmp_path / "aimd-gap"
+    root.mkdir()
+    (root / "INCAR").write_text(
+        "IBRION=0\nNSW=100\nPOTIM=1.0\nTEBEG=300\n", encoding="utf-8")
+    (root / "POSCAR").write_text(_poscar(0.0), encoding="utf-8")
+    (root / "OSZICAR").write_text(
+        " 1 T= 300 E= -10.000 F= -10 E0= -10 EK= 0.1\n"
+        " 2 T= 301 E= -9.990 F= -10 E0= -10 EK= 0.1\n"
+        " 100 T= 302 E= -9.500 F= -10 E0= -10 EK= 0.1\n",
+        encoding="utf-8",
+    )
+    (root / "XDATCAR").write_text(_xdatcar(), encoding="utf-8")
+    manifest = {
+        "state": "DONE", "task_type": "aimd",
+        "inputs": {"potim_fs": 1.0, "steps": 100, "temp_k": 300.0},
+    }
+    _write_manifest(root, manifest)
+    target = _target(root, "aimd-gap", "aimd", manifest)
+    spec = normalize_analysis_request(
+        {"analysis_id": "aimd-diagnostics", "precision": 6}, project_id=PROJECT)
+
+    view = build_aimd_analysis_view(spec, [target], method_evidence=_method)
+
+    trajectory = view["trajectories"][0]
+    assert len(trajectory["segments"]) == 2
+    assert [sample["segment_index"] for sample in trajectory["samples"]] == [0, 0, 1]
+    for key in ("sampling_length", "temperature_mean", "temperature_std",
+                "energy_drift_total", "energy_drift_slope"):
+        assert trajectory["metrics"][key]["value"] is None
+    assert view["figure_data"] == {}
+    assert any("does not cover every declared NSW step" in issue
+               for issue in trajectory["issues"])
 
 
 def test_report_binding_uses_registry_sections_and_frozen_view_hashes(tmp_path):

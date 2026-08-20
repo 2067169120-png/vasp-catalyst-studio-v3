@@ -98,6 +98,7 @@ def parse_last_complete_image_step(outcar_text: str, expected_natoms: int) -> di
 
     electronic = 'unavailable'
     pending_scf_after_force = False
+    outcar_energies = []
     events = []
     for index, line in enumerate(lines):
         lowered = line.lower()
@@ -109,6 +110,14 @@ def parse_last_complete_image_step(outcar_text: str, expected_natoms: int) -> di
             electronic = 'not_converged'
             if events:
                 pending_scf_after_force = True
+        energy_match = _SIGMA0_RE.search(line)
+        if energy_match:
+            try:
+                candidate = float(energy_match.group(1))
+            except ValueError:
+                candidate = None
+            if candidate is not None and math.isfinite(candidate):
+                outcar_energies.append(candidate)
         if 'TOTAL-FORCE' not in line:
             continue
         cursor = index + 1
@@ -153,6 +162,7 @@ def parse_last_complete_image_step(outcar_text: str, expected_natoms: int) -> di
             'status': 'complete' if not block_issues else 'unavailable',
             'fmax': max(row_forces) if not block_issues else None,
             'electronic_status': electronic,
+            'ionic_event_index': len(events) + 1,
             'issues': block_issues,
         })
         electronic = 'unavailable'
@@ -163,6 +173,9 @@ def parse_last_complete_image_step(outcar_text: str, expected_natoms: int) -> di
         return {'status': 'unavailable', 'fmax': None,
                 'electronic_status': 'unavailable', 'issues': issues}
     final = dict(events[-1])
+    final['outcar_energy'] = (
+        outcar_energies[-1] if len(outcar_energies) == len(events) else None)
+    final['outcar_energy_event_count'] = len(outcar_energies)
     issues.extend(final.get('issues') or [])
     if pending_scf_after_force:
         issues.append('OUTCAR ends with an SCF step that has no complete final force block')
@@ -173,6 +186,54 @@ def parse_last_complete_image_step(outcar_text: str, expected_natoms: int) -> di
     if final['status'] != 'complete':
         final['fmax'] = None
     return final
+
+
+def parse_final_neb_image_event(
+        oszicar_text: str, outcar_text: str, expected_natoms: int,
+        *, energy_tolerance: float = 1e-3) -> dict:
+    """Bind final OSZICAR energy and OUTCAR force/EDIFF to one ionic event.
+
+    Sequence length, final ionic index and energy must agree.  This prevents an
+    early or foreign OSZICAR ``E0`` from being combined with a later complete
+    OUTCAR force block merely because both files are independently parseable.
+    """
+    final = parse_last_complete_image_step(outcar_text, expected_natoms)
+    issues = list(final.get('issues') or [])
+    oszicar_steps = convergence.parse_oszicar(oszicar_text or '')
+    event_count = int(final.get('ionic_event_index') or 0)
+    if not oszicar_steps:
+        issues.append('OSZICAR contains no complete ionic energy event')
+    elif len(oszicar_steps) != event_count:
+        issues.append('OSZICAR and OUTCAR ionic event counts differ')
+    else:
+        final_index = oszicar_steps[-1].get('step')
+        if final_index != event_count:
+            issues.append('OSZICAR final ionic index does not match the OUTCAR event')
+    oszicar_energy = (
+        float(oszicar_steps[-1]['E0'])
+        if oszicar_steps and isinstance(oszicar_steps[-1].get('E0'), (int, float))
+        and not isinstance(oszicar_steps[-1].get('E0'), bool)
+        and math.isfinite(float(oszicar_steps[-1]['E0'])) else None
+    )
+    outcar_energy = final.get('outcar_energy')
+    if final.get('outcar_energy_event_count') != event_count:
+        issues.append('OUTCAR energy and force event counts differ')
+    if outcar_energy is None:
+        issues.append('final OUTCAR force event lacks a finite energy(sigma->0)')
+    if (oszicar_energy is not None and outcar_energy is not None
+            and abs(oszicar_energy - outcar_energy) > energy_tolerance):
+        issues.append('OSZICAR E0 and OUTCAR final-event energy disagree')
+    issues = list(dict.fromkeys(issues))
+    complete = final.get('status') == 'complete' and not issues
+    return {
+        'status': 'complete' if complete else 'unavailable',
+        'energy': oszicar_energy if complete else None,
+        'fmax': final.get('fmax') if complete else None,
+        'electronic_status': final.get('electronic_status') or 'unavailable',
+        'ionic_event_index': event_count or None,
+        'outcar_energy': outcar_energy,
+        'issues': issues,
+    }
 
 
 def _frame_expected_natoms(frame_dir) -> int | None:

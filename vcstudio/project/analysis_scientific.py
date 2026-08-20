@@ -21,9 +21,10 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from vcstudio import __version__
-from vcstudio.cluster import convergence
 from vcstudio.generate.incar_builder import parse_incar
+from vcstudio.generate.methods_text import parse_kpoints_scheme
 from vcstudio.generate.poscar import parse_poscar_species
+from vcstudio.generate.slab_builder import count_layers, vacuum_thickness
 from vcstudio.generate.structure_view import parse_positions
 from vcstudio.project.analysis_registry import AnalysisSpec, get_analysis
 from vcstudio.project.analysis_sources import (
@@ -33,7 +34,8 @@ from vcstudio.project.analysis_sources import (
     value_provenance,
     verify_neb_endpoint_record,
 )
-from vcstudio.project.neb import parse_last_complete_image_step
+from vcstudio.project.energy_gate import validate_done_energy_evidence
+from vcstudio.project.neb import parse_final_neb_image_event
 
 
 VIEW_SCHEMA = "vcstudio.analysis-view/v1"
@@ -46,7 +48,6 @@ CONVERGENCE_MIN_PLATFORM_POINTS = 3
 AIMD_SHORT_TRAJECTORY_PS = 10.0
 
 _FRAME_RE = re.compile(r"^\d+$")
-_SIGMA0_RE = re.compile(r"energy\(sigma->0\)\s*=\s*([-+0-9.Ee]+)")
 _NIONS_RE = re.compile(r"\bNIONS\s*=\s*(\d+)")
 _VASPRUN_ATOMS_RE = re.compile(r"<atoms>\s*(\d+)\s*</atoms>", re.I)
 
@@ -267,19 +268,6 @@ def _neb_coordinates(
     return cumulative, ""
 
 
-def _frame_energy(snapshot: SourceSnapshot, frame: str) -> tuple[float | None, str]:
-    oszicar = snapshot.text(f"{frame}/OSZICAR")
-    steps = convergence.parse_oszicar(oszicar)
-    if steps and _finite(steps[-1].get("E0")) is not None:
-        return float(steps[-1]["E0"]), "OSZICAR"
-    outcar = snapshot.text(f"{frame}/OUTCAR")
-    matches = _SIGMA0_RE.findall(outcar)
-    try:
-        return (float(matches[-1]), "OUTCAR") if matches else (None, "")
-    except ValueError:
-        return None, ""
-
-
 def _frame_natoms(snapshot: SourceSnapshot, frame: str) -> tuple[int | None, str]:
     for name in (f"{frame}/CONTCAR", f"{frame}/POSCAR"):
         text = snapshot.text(name)
@@ -391,16 +379,19 @@ def _neb_path(
     ionic_statuses = []
     for index, frame in enumerate(frames):
         role = "start" if index == 0 else "end" if index == len(frames) - 1 else "image"
-        energy, energy_file = _frame_energy(snapshot, frame)
+        expected_natoms, structure_name = _frame_natoms(snapshot, frame)
+        final_step = parse_final_neb_image_event(
+            snapshot.text(f"{frame}/OSZICAR"),
+            snapshot.text(f"{frame}/OUTCAR"), expected_natoms,
+        )
+        energy = final_step.get("energy") if final_step.get("status") == "complete" else None
         endpoint_verification = endpoint_verifications.get(role)
         if endpoint_verification is not None and (
                 not endpoint_verification.get("ok")
-                or energy_file not in endpoint_verification.get("verified_files", [])):
-            energy, energy_file = None, ""
+                or not {"OSZICAR", "OUTCAR"}.issubset(
+                    set(endpoint_verification.get("verified_files", [])))):
+            energy = None
         energies.append(energy)
-        expected_natoms, structure_name = _frame_natoms(snapshot, frame)
-        final_step = parse_last_complete_image_step(
-            snapshot.text(f"{frame}/OUTCAR"), expected_natoms)
         fmax = final_step.get("fmax") if final_step.get("status") == "complete" else None
         electronic = str(final_step.get("electronic_status") or "unavailable")
         if role != "image":
@@ -419,7 +410,7 @@ def _neb_path(
         ]
         energy_files = [
             item for item in frame_files
-            if str(item.get("name") or "").endswith(f"/{energy_file}")
+            if str(item.get("name") or "").endswith(("/OSZICAR", "/OUTCAR"))
         ]
         coordinate = coordinates[index] if index < len(coordinates) else None
         points.append({
@@ -437,7 +428,8 @@ def _neb_path(
                 unit="eV", precision=spec.precision,
                 denominator="per NEB image", source_id=source["source_id"],
                 files=energy_files, parser=parser,
-                reason="image energy evidence is unavailable" if energy is None else "",
+                reason=("OSZICAR energy is not bound to the final complete OUTCAR "
+                        "ionic event" if energy is None else ""),
             ),
             "relative_energy": None,
             "max_force": _quantity(
@@ -445,7 +437,8 @@ def _neb_path(
                 unit="eV/Å", precision=spec.precision,
                 denominator="maximum over atoms in the final ionic step",
                 source_id=source["source_id"], files=frame_files, parser=parser,
-                reason="OUTCAR force block is unavailable" if fmax is None else "",
+                reason=("final ionic energy/force/EDIFF event is unavailable"
+                        if fmax is None else ""),
             ),
             "electronic_convergence": electronic,
             "ionic_convergence": ionic,
@@ -670,7 +663,43 @@ def _series_group_key(target: Mapping[str, Any], kind: str) -> str:
     return _canonical_hash({"kind": kind, "parent": os.path.normcase(parent)})[:20]
 
 
-def _method_invariant(method: Mapping[str, Any], kind: str) -> str:
+def _series_coordinate(
+    snapshot: SourceSnapshot, kind: str,
+) -> tuple[float | None, list[dict[str, Any]], str]:
+    """Read the scan coordinate from the current immutable input bytes."""
+    if kind == "encut":
+        files = snapshot.files(["job.yaml", "INCAR"])
+        value = _finite(parse_incar(snapshot.text("INCAR")).get("ENCUT"))
+        return value, files, "current INCAR ENCUT is unavailable" if value is None else ""
+    if kind == "kmesh":
+        files = snapshot.files(["job.yaml", "KPOINTS"])
+        parsed = parse_kpoints_scheme(snapshot.text("KPOINTS")) or {}
+        grid = parsed.get("grid")
+        if (not isinstance(grid, list) or len(grid) != 3
+                or any(isinstance(value, bool) or not isinstance(value, int)
+                       or value <= 0 for value in grid)):
+            return None, files, "current KPOINTS automatic mesh is unavailable"
+        return float(math.prod(grid)), files, ""
+    files = snapshot.files(["job.yaml", "POSCAR"])
+    try:
+        value = (vacuum_thickness(snapshot.text("POSCAR"))
+                 if kind == "vacuum" else count_layers(snapshot.text("POSCAR")))
+    except (IndexError, TypeError, ValueError, ZeroDivisionError):
+        value = None
+    finite = _finite(value)
+    label = "vacuum thickness" if kind == "vacuum" else "slab layer count"
+    return finite, files, f"current POSCAR {label} is unavailable" if finite is None else ""
+
+
+def _coordinate_matches(kind: str, declared: float, actual: float) -> bool:
+    if kind in {"kmesh", "slab_thickness"}:
+        return declared == int(declared) and actual == int(actual) and declared == actual
+    return math.isclose(declared, actual, rel_tol=1e-9, abs_tol=1e-6)
+
+
+def _method_invariant(
+    method: Mapping[str, Any], kind: str, *, coordinate_verified: bool,
+) -> str:
     fingerprint = copy.deepcopy(method.get("fingerprint") or {})
     if not _verified_method(method) or not isinstance(fingerprint, Mapping):
         return ""
@@ -679,10 +708,10 @@ def _method_invariant(method: Mapping[str, Any], kind: str) -> str:
         "functional", "dispersion", "encut", "spin",
         "kpoints_scheme", "potcar_ids",
     }
-    if kind == "encut":
+    if kind == "encut" and coordinate_verified:
         fingerprint.pop("encut", None)
         required.remove("encut")
-    elif kind == "kmesh":
+    elif kind == "kmesh" and coordinate_verified:
         fingerprint.pop("kpoints_scheme", None)
         required.remove("kpoints_scheme")
     if any(key not in fingerprint or fingerprint[key] in (None, "", {}, [])
@@ -790,31 +819,52 @@ def _convergence_series(
         ])
         snapshots.append(snapshot)
         inputs = manifest.get("inputs") or {}
-        x = _finite(inputs.get("series_value"))
+        declared_x = _finite(inputs.get("series_value"))
         label = str(inputs.get("series_label") or "")
         source = snapshot.identity()
+        x, coordinate_files, coordinate_issue = _series_coordinate(snapshot, kind)
+        coordinate_verified = bool(
+            declared_x is not None and x is not None
+            and _coordinate_matches(kind, declared_x, x)
+        )
+        if coordinate_issue:
+            issues.append(f'{source["source_id"]}: {coordinate_issue}')
+        elif declared_x is None:
+            issues.append(
+                f'{source["source_id"]}: explicit series_value is unavailable')
+        elif not coordinate_verified:
+            issues.append(
+                f'{source["source_id"]}: manifest series_value {declared_x:g} does not '
+                f'match the current input value {x:g}')
         method = _method_evidence(method_evidence, target, snapshot)
-        invariant = _method_invariant(method, kind)
-        if method.get("status") != "verified" or not invariant:
+        invariant = _method_invariant(
+            method, kind, coordinate_verified=coordinate_verified)
+        point_method_verified = bool(
+            _verified_method(method) and invariant and coordinate_verified)
+        if not point_method_verified:
             issues.append(
                 f'{source["source_id"]}: method evidence/invariant is incomplete')
         else:
             method_invariants.add(invariant)
         natoms, natom_issues, denominator_files = _runtime_natoms(snapshot, manifest)
         issues.extend(f'{source["source_id"]}: {issue}' for issue in natom_issues)
-        oszicar = snapshot.text("OSZICAR")
-        steps = convergence.parse_oszicar(oszicar)
-        energy = (
-            _finite(steps[-1].get("E0"))
-            if manifest.get("state") == "DONE" and steps else None
-        )
-        if x is None:
-            issues.append(f'{source["source_id"]}: explicit series_value is unavailable')
-        if energy is None:
-            issues.append(f'{source["source_id"]}: DONE OSZICAR:E0 evidence is unavailable')
-        energy_files = snapshot.files(["OSZICAR"])
+        try:
+            energy, _validated_manifest, _energy_evidence = validate_done_energy_evidence(
+                manifest, source["source_id"],
+                oszicar_text=snapshot.text("OSZICAR"),
+                outcar_text=snapshot.text("OUTCAR"),
+                vasprun_text=snapshot.text("vasprun.xml"),
+                require_oszicar=True, require_current_completion=True,
+            )
+        except ValueError as exc:
+            energy = None
+            issues.append(f'{source["source_id"]}: {exc}')
+        energy_files = snapshot.files(["job.yaml", "OSZICAR", "OUTCAR", "vasprun.xml"])
         raw.append({
             "x": x,
+            "declared_x": declared_x,
+            "coordinate_verified": coordinate_verified,
+            "coordinate_files": coordinate_files,
             "label": label or (str(x) if x is not None else "—"),
             "source": source,
             "method": method,
@@ -822,8 +872,7 @@ def _convergence_series(
             "energy": energy,
             "energy_files": energy_files,
             "denominator_files": denominator_files,
-            "method_verified": bool(
-                _verified_method(method) and invariant),
+            "method_verified": point_method_verified,
         })
     raw.sort(key=lambda item: (item["x"] is None, item["x"] or 0.0, item["label"]))
     duplicates = {
@@ -867,12 +916,24 @@ def _convergence_series(
             "source": source,
             "method": item["method"],
             "method_verified": item["method_verified"],
+            "coordinate_verified": item["coordinate_verified"],
             "parameter": _quantity(
                 key="parameter", label="Scan parameter", value=item["x"],
                 unit=_SERIES_UNITS[kind], precision=spec.precision,
-                denominator="one declared scan coordinate",
-                source_id=source["source_id"], files=source["files"], parser=parser,
-                reason="series_value is unavailable" if item["x"] is None else "",
+                denominator="current input field matched to manifest series_value",
+                source_id=source["source_id"], files=item["coordinate_files"], parser=parser,
+                reason="current scan coordinate is unavailable" if item["x"] is None else "",
+            ),
+            "declared_parameter": _quantity(
+                key="declared_parameter", label="Declared scan parameter",
+                value=item["declared_x"], unit=_SERIES_UNITS[kind],
+                precision=spec.precision, denominator="job.yaml inputs.series_value",
+                source_id=source["source_id"],
+                files=[file for file in item["coordinate_files"]
+                       if file.get("name") == "job.yaml"],
+                parser=parser,
+                reason="manifest series_value is unavailable"
+                if item["declared_x"] is None else "",
             ),
             "absolute_energy": _quantity(
                 key="absolute_energy", label="Absolute energy", value=item["energy"],
@@ -909,6 +970,8 @@ def _convergence_series(
                 if delta is None else "",
             ),
             "anomalies": (["duplicate coordinate"] if item["x"] in duplicates else [])
+            + (["declared coordinate does not match current input"]
+               if not item["coordinate_verified"] else [])
             + (["missing energy"] if item["energy"] is None else []),
         })
 
@@ -1228,13 +1291,23 @@ def _aimd_segments(raw_steps: Sequence[Mapping[str, Any]]) -> list[list[Mapping[
         step = item.get("step")
         if (not isinstance(step, int) or isinstance(step, bool) or step <= 0):
             return []
-        if current and step <= current[-1]["step"]:
+        if current and step != current[-1]["step"] + 1:
             segments.append(current)
             current = []
         current.append(item)
     if current:
         segments.append(current)
     return segments
+
+
+def _explicit_restart_lineage(inputs: Mapping[str, Any]) -> bool:
+    lineage = inputs.get("restart_lineage")
+    if isinstance(lineage, (list, tuple)) and lineage:
+        return all(isinstance(item, Mapping) and item.get("source_job_id")
+                   for item in lineage)
+    return any(str(inputs.get(key) or "").strip() for key in (
+        "restart_from_job_id", "restart_parent_job_id",
+    ))
 
 
 def _aimd_trajectory(
@@ -1253,12 +1326,16 @@ def _aimd_trajectory(
     incar = parse_incar(snapshot.text("INCAR"))
     potim = _finite(incar.get("POTIM"))
     declared_steps = _finite(incar.get("NSW"))
+    declared_steps_int = (
+        int(declared_steps) if declared_steps is not None
+        and declared_steps == int(declared_steps) else None
+    )
     declared_temperature = _finite(incar.get("TEBEG"))
     issues = []
     warnings = []
     if potim is None or potim <= 0:
         issues.append("AIMD requires an explicit positive POTIM in INCAR")
-    if declared_steps is None or declared_steps <= 0:
+    if declared_steps_int is None or declared_steps_int <= 0:
         issues.append("AIMD requires an explicit positive NSW in INCAR")
     for key, actual in (
         ("potim_fs", potim), ("steps", declared_steps),
@@ -1274,17 +1351,32 @@ def _aimd_trajectory(
         issues.append("OSZICAR contains no parseable AIMD total-energy/temperature steps")
     segments = _aimd_segments(raw_steps)
     valid_steps = bool(raw_steps and segments)
-    restarted = len(segments) > 1
+    segmented = len(segments) > 1
     if raw_steps and not valid_steps:
         issues.append("AIMD step identifiers must be positive integers")
-    if restarted:
+    if segmented:
+        lineage = _explicit_restart_lineage(inputs)
         issues.append(
-            "AIMD step sequence restarted or regressed; aggregate duration and drift are unavailable")
+            "AIMD step sequence has a restart, regression, or gap; aggregate diagnostics "
+            + ("remain unavailable because this parser does not stitch restart snapshots"
+               if lineage else "are unavailable without explicit restart lineage"))
+    state_done = manifest.get("state") == "DONE"
+    coverage_ok = bool(
+        valid_steps and not segmented and declared_steps_int is not None
+        and raw_steps[0]["step"] == 1
+        and raw_steps[-1]["step"] == declared_steps_int
+        and len(raw_steps) == declared_steps_int
+    )
+    if state_done and not coverage_ok:
+        issues.append(
+            "DONE AIMD evidence does not cover every declared NSW step from 1 through NSW")
+    aggregate_ready = bool(
+        valid_steps and not segmented and (not state_done or coverage_ok))
     energies = [float(item["e_tot"]) for item in raw_steps]
     temperatures = [float(item["temp_k"]) for item in raw_steps]
     sampling_length_ps = (
-        (raw_steps[-1]["step"] - raw_steps[0]["step"] + 1) * potim / 1000.0
-        if valid_steps and not restarted and potim is not None and potim > 0 else None
+        len(raw_steps) * potim / 1000.0
+        if aggregate_ready and potim is not None and potim > 0 else None
     )
     if sampling_length_ps is not None and sampling_length_ps < AIMD_SHORT_TRAJECTORY_PS:
         warnings.append(
@@ -1293,15 +1385,15 @@ def _aimd_trajectory(
         )
     drift_total = (
         energies[-1] - energies[0]
-        if energies and valid_steps and not restarted else None
+        if energies and aggregate_ready else None
     )
     slope_ev_ps = _linear_slope(
         [float(item["step"]) * potim / 1000.0 for item in raw_steps], energies,
-    ) if valid_steps and not restarted and potim is not None and potim > 0 else None
+    ) if aggregate_ready and potim is not None and potim > 0 else None
     structure = _trajectory_metrics(snapshot.text("XDATCAR"))
     if structure["error"]:
         warnings.append(str(structure["error"]))
-    if restarted:
+    if segmented:
         structure["max_step_displacement_a"] = None
         structure["final_rmsd_a"] = None
         structure["max_rmsd_a"] = None
@@ -1311,7 +1403,7 @@ def _aimd_trajectory(
     method = _method_evidence(method_evidence, target, snapshot)
     if not _verified_method(method):
         issues.append("AIMD method identity is not verified")
-    if manifest.get("state") != "DONE":
+    if not state_done:
         warnings.append("AIMD manifest state is not DONE; the trajectory is partial")
     file_by_name = {item["name"]: item for item in source["files"]}
     osz_files = [file_by_name["OSZICAR"]] if "OSZICAR" in file_by_name else []
@@ -1359,10 +1451,14 @@ def _aimd_trajectory(
                 source_id=source_id, files=osz_files, parser=parser,
             ),
         })
-    temperature_mean = sum(temperatures) / len(temperatures) if temperatures else None
+    temperature_mean = (
+        sum(temperatures) / len(temperatures)
+        if temperatures and aggregate_ready else None
+    )
     temperature_std = (
         math.sqrt(sum((value - temperature_mean) ** 2 for value in temperatures)
-                  / len(temperatures)) if temperatures else None
+                  / len(temperatures))
+        if temperatures and temperature_mean is not None and aggregate_ready else None
     )
     segment_rows = []
     for segment_index, segment in enumerate(segments):
@@ -1429,10 +1525,10 @@ def _aimd_trajectory(
             precision=spec.precision, denominator=denominator,
             source_id=source_id, files=files, parser=parser,
             reason=(
-                "restart/regression prevents one aggregate value"
-                if value is None and restarted and key in {
+                "step gap/restart or incomplete DONE coverage prevents one aggregate value"
+                if value is None and not aggregate_ready and key in {
                     "sampling_length", "energy_drift_total", "energy_drift_slope",
-                    "max_step_displacement", "final_rmsd", "max_rmsd",
+                    "temperature_mean", "temperature_std",
                 } else "required evidence is unavailable" if value is None else ""
             ),
         )
@@ -1466,7 +1562,7 @@ def _aimd_trajectory(
                     "temperature": sample["temperature"]["value"],
                 }
                 for sample in samples
-            ] if not restarted else [],
+            ] if aggregate_ready else [],
             "dt_fs": potim,
             "provenance": {
                 "parser_module": PARSER_MODULE,

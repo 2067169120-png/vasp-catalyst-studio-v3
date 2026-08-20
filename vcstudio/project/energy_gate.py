@@ -88,10 +88,10 @@ def _element_u_map(incar_text, signature, provenance):
     return effective_u_by_element(plan)
 
 
-def parse_oszicar_energy(job_dir):
-    """Return the last finite OSZICAR E0, or ``None``."""
+def parse_oszicar_energy_text(text):
+    """Return the last finite ``E0`` from one already captured OSZICAR."""
     energy = None
-    for line in _read_named(job_dir, 'OSZICAR').splitlines():
+    for line in str(text or '').splitlines():
         match = re.search(
             r'\bE0\s*=\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][-+]?\d+)?)',
             line, re.I)
@@ -105,6 +105,22 @@ def parse_oszicar_energy(job_dir):
     return energy
 
 
+def parse_oszicar_energy(job_dir):
+    """Return the last finite OSZICAR E0, or ``None``."""
+    return parse_oszicar_energy_text(_read_named(job_dir, 'OSZICAR'))
+
+
+def clean_completion_from_text(outcar_text='', vasprun_text=''):
+    """Return clean-completion evidence from one immutable text snapshot."""
+    outcar_tail = str(outcar_text or '')[-2 * 1024 * 1024:]
+    if _CLEAN_RE.search(outcar_tail):
+        return True, 'OUTCAR timing 页脚'
+    vasprun_tail = str(vasprun_text or '')[-128 * 1024:]
+    if '</modeling>' in vasprun_tail:
+        return True, 'vasprun.xml 完整闭合'
+    return False, ''
+
+
 def clean_completion_from_files(job_dir):
     """Read bounded file tails and return ``(clean, evidence_label)``."""
     try:
@@ -113,30 +129,31 @@ def clean_completion_from_files(job_dir):
             with open(outcar, 'rb') as handle:
                 handle.seek(max(os.path.getsize(outcar) - 2 * 1024 * 1024, 0))
                 tail = handle.read().decode('utf-8', errors='replace')
-            if _CLEAN_RE.search(tail):
-                return True, 'OUTCAR timing 页脚'
+            clean, evidence = clean_completion_from_text(outcar_text=tail)
+            if clean:
+                return clean, evidence
         vasprun = os.path.join(str(job_dir), 'vasprun.xml')
         if os.path.isfile(vasprun):
             with open(vasprun, 'rb') as handle:
                 handle.seek(max(os.path.getsize(vasprun) - 128 * 1024, 0))
                 tail = handle.read().decode('utf-8', errors='replace')
-            if '</modeling>' in tail:
-                return True, 'vasprun.xml 完整闭合'
+            clean, evidence = clean_completion_from_text(vasprun_text=tail)
+            if clean:
+                return clean, evidence
     except OSError:
         pass
     return False, ''
 
 
-def validate_done_energy(job_dir, label, manifest_mod, *, require_oszicar=False):
-    """Return ``(energy, manifest, evidence_messages)`` after hard validation.
+def validate_done_energy_evidence(
+        manifest, label, *, oszicar_text='', outcar_text='', vasprun_text='',
+        require_oszicar=False, require_current_completion=False):
+    """Validate DONE energy against already captured authoritative bytes.
 
-    ``require_oszicar`` is used by final total-energy subtraction workflows.
-    A manifest value alone is then insufficient: the downloaded/current
-    OSZICAR must contain the same final ``E0``.  Other callers retain the
-    legacy compatibility path because some imported calculations only carry a
-    complete vasprun.xml plus an audited manifest energy.
+    ``require_current_completion`` deliberately ignores cached completion flags:
+    callers at an immutable analysis boundary must see an OUTCAR timing footer or
+    a closed vasprun.xml in the same byte snapshot used for energy parsing.
     """
-    manifest = manifest_mod.load_manifest(job_dir)
     if manifest is None:
         raise ValueError(
             f'{label}缺少可读 job.yaml；请先通过「导入已算结果」建立可追溯作业')
@@ -157,16 +174,21 @@ def validate_done_energy(job_dir, label, manifest_mod, *, require_oszicar=False)
     if nonzero_exit:
         raise ValueError(f'{label}记录非零退出码 {exit_code}，不得作为已完成能量')
 
+    current_clean, current_source = clean_completion_from_text(
+        outcar_text=outcar_text, vasprun_text=vasprun_text)
     completion = (results.get('convergence_evidence') or {}).get('completion') or {}
-    clean = (diagnosis.get('clean_exit') is True
-             or completion.get('outcar_footer') is True
-             or completion.get('vasprun_complete') is True)
-    clean_source = 'job.yaml 完整性证据' if clean else ''
-    if not clean:
-        clean, clean_source = clean_completion_from_files(job_dir)
+    cached_clean = (diagnosis.get('clean_exit') is True
+                    or completion.get('outcar_footer') is True
+                    or completion.get('vasprun_complete') is True)
+    if require_current_completion:
+        clean, clean_source = current_clean, current_source
+    else:
+        clean = bool(cached_clean or current_clean)
+        clean_source = ('job.yaml 完整性证据' if cached_clean else current_source)
     if not clean:
         raise ValueError(
-            f'{label}无 OUTCAR timing 页脚/完整 vasprun.xml；旧收敛串不能证明完整完成')
+            f'{label}无当前 OUTCAR timing 页脚/完整 vasprun.xml；'
+            '旧收敛串不能证明完整完成')
 
     try:
         energy = float(results.get('energy_e0_eV'))
@@ -174,7 +196,7 @@ def validate_done_energy(job_dir, label, manifest_mod, *, require_oszicar=False)
         raise ValueError(f'{label}的 DONE job.yaml 未记录可用 energy_e0_eV') from None
     if not math.isfinite(energy):
         raise ValueError(f'{label}的 energy_e0_eV 非有限数')
-    parsed = parse_oszicar_energy(job_dir)
+    parsed = parse_oszicar_energy_text(oszicar_text)
     if require_oszicar and parsed is None:
         raise ValueError(
             f'{label}缺少可解析的当前轮 OSZICAR:E0；拒绝仅凭 job.yaml 缓存能量计算')
@@ -186,6 +208,25 @@ def validate_done_energy(job_dir, label, manifest_mod, *, require_oszicar=False)
     if parsed is not None:
         evidence.append(f'{label}能量证据：OSZICAR:E0={parsed:.8f} eV')
     return energy, manifest, evidence
+
+
+def validate_done_energy(job_dir, label, manifest_mod, *, require_oszicar=False):
+    """Return ``(energy, manifest, evidence_messages)`` after hard validation.
+
+    ``require_oszicar`` is used by final total-energy subtraction workflows.
+    A manifest value alone is then insufficient: the downloaded/current
+    OSZICAR must contain the same final ``E0``.  Other callers retain the
+    legacy compatibility path because some imported calculations only carry a
+    complete vasprun.xml plus an audited manifest energy.
+    """
+    manifest = manifest_mod.load_manifest(job_dir)
+    return validate_done_energy_evidence(
+        manifest, label,
+        oszicar_text=_read_named(job_dir, 'OSZICAR'),
+        outcar_text=_read_named(job_dir, 'OUTCAR'),
+        vasprun_text=_read_named(job_dir, 'vasprun.xml'),
+        require_oszicar=require_oszicar,
+    )
 
 
 def method_record(job_dir, manifest, label, *, source_snapshot=None):
@@ -496,6 +537,8 @@ def compare_methods(records, *, require_same_kpoints):
 
 
 __all__ = [
-    'clean_completion_from_files', 'compare_methods', 'method_record',
-    'parse_oszicar_energy', 'validate_done_energy',
+    'clean_completion_from_files', 'clean_completion_from_text',
+    'compare_methods', 'method_record', 'parse_oszicar_energy',
+    'parse_oszicar_energy_text', 'validate_done_energy',
+    'validate_done_energy_evidence',
 ]

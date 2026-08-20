@@ -14,7 +14,7 @@ def test_demo_potcar_lib_script_builds_fake_library(tmp_path):
     r = subprocess.run(
         [sys.executable, '-X', 'utf8',
          os.path.join(ROOT, 'examples', 'make_demo_potcar_lib.py'),
-         str(lib)], capture_output=True, text=True)
+         str(lib)], capture_output=True, text=True, encoding='utf-8')
     assert r.returncode == 0, r.stderr
     text = (lib / 'C' / 'POTCAR').read_text(encoding='utf-8')
     assert 'fake PAW_PBE C' in text and 'ENMAX' in text

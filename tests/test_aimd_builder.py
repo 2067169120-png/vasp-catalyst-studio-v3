@@ -159,7 +159,7 @@ def test_build_aimd_job_end_to_end(tmp_path):
     out = tmp_path / 'aimd'
     for name in ('POSCAR', 'INCAR', 'KPOINTS', 'POTCAR', 'job.yaml'):
         assert (out / name).is_file()
-    d = parse_incar((out / 'INCAR').read_text())
+    d = parse_incar((out / 'INCAR').read_text(encoding='utf-8'))
     assert d['IBRION'] == 0 and d['MDALGO'] == 2 and 'EDIFFG' not in d
     assert res['job_dir'] == str(out) and res['changes']
 
@@ -167,7 +167,7 @@ def test_build_aimd_job_end_to_end(tmp_path):
 def test_build_aimd_job_kpoints_gamma(tmp_path):
     src = _make_src_dir(tmp_path)
     ab.build_aimd_job(str(src), str(tmp_path / 'aimd'))
-    kp = (tmp_path / 'aimd' / 'KPOINTS').read_text()
+    kp = (tmp_path / 'aimd' / 'KPOINTS').read_text(encoding='utf-8')
     assert '1 1 1' in kp and 'Gamma' in kp
 
 
@@ -182,7 +182,7 @@ def test_build_aimd_job_nve_warns_and_sets_keys(tmp_path):
     src = _make_src_dir(tmp_path)
     res = ab.build_aimd_job(str(src), str(tmp_path / 'aimd'), ensemble='nve')
     assert any('NVE' in w for w in res['warnings'])
-    d = parse_incar((tmp_path / 'aimd' / 'INCAR').read_text())
+    d = parse_incar((tmp_path / 'aimd' / 'INCAR').read_text(encoding='utf-8'))
     assert d['MDALGO'] == 1 and d['ANDERSEN_PROB'] == pytest.approx(0.0)
 
 

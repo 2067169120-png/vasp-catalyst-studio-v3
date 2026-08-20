@@ -163,6 +163,17 @@ def test_last_complete_step_rejects_starred_force_row():
     assert any('fully numeric' in issue for issue in parsed['issues'])
 
 
+def test_final_neb_event_binds_energy_by_ionic_ordinal_even_after_force():
+    outcar = _force_block(0.02) + ' energy(sigma->0) = -9.50000000\n'
+
+    parsed = pneb.parse_final_neb_image_event(
+        _osz(-9.5), outcar, expected_natoms=1)
+
+    assert parsed['status'] == 'complete'
+    assert parsed['energy'] == pytest.approx(-9.5)
+    assert parsed['fmax'] == pytest.approx(0.02)
+
+
 # ── 质量闸各分支 ──
 def _data(rel, *, converged=True, barrier_f=None, ts_index=None, n_frames=None):
     n = n_frames if n_frames is not None else len(rel)

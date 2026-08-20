@@ -48,7 +48,8 @@ def test_read_e0_matches_ase_outcar_energy(name):
     d = os.path.join(FIXTURE_ROOT, name)
     ours = freeenergy.read_e0(d)
     assert ours is not None, f'{name}:read_e0 未从 OSZICAR 取到 E0'
-    atoms = ase_io.read(os.path.join(d, 'OUTCAR'), format='vasp-out', index=-1)
+    with open(os.path.join(d, 'OUTCAR'), encoding='utf-8') as outcar:
+        atoms = ase_io.read(outcar, format='vasp-out', index=-1)
     ase_energy = atoms.get_potential_energy()
     assert ours == pytest.approx(ase_energy, abs=1e-6), (
         f'{name}:本项目 read_e0={ours} 与 ASE OUTCAR E={ase_energy} 不一致')
@@ -60,6 +61,7 @@ def test_oszicar_ionic_steps_match_ase_images(name):
     d = os.path.join(FIXTURE_ROOT, name)
     with open(os.path.join(d, 'OSZICAR'), encoding='utf-8') as f:
         steps = convergence.parse_oszicar(f.read())
-    images = ase_io.read(os.path.join(d, 'OUTCAR'), format='vasp-out', index=':')
+    with open(os.path.join(d, 'OUTCAR'), encoding='utf-8') as outcar:
+        images = ase_io.read(outcar, format='vasp-out', index=':')
     assert len(steps) == len(images), (
         f'{name}:OSZICAR 离子步 {len(steps)} ≠ ASE 构型数 {len(images)}')
