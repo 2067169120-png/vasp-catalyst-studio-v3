@@ -13,6 +13,7 @@ import hashlib
 import os
 import tempfile
 import time
+import copy
 from pathlib import Path
 
 import yaml
@@ -206,7 +207,9 @@ def create_from_build(job_dir: str | os.PathLike, build_result: dict, *,
                       incar_path: str | os.PathLike | None = None,
                       validate: bool = True,
                       task_type: str | None = None,
-                      system: str = '') -> dict:
+                      system: str = '',
+                      method_recipe_ref: dict | None = None,
+                      job_id: str | None = None) -> dict:
     """在 build_job_dir 成功后落一份 job.yaml。返回 manifest dict。
 
     build_result 即 build_job_dir 的返回值({'ok','out_dir','warnings','kpoints',
@@ -240,6 +243,12 @@ def create_from_build(job_dir: str | os.PathLike, build_result: dict, *,
         source_incar = Path(incar_path).resolve()
         inputs['source_incar_path'] = str(source_incar)
         inputs['source_incar_sha256'] = sha256_file(source_incar)
+    if method_recipe_ref is not None:
+        if not isinstance(method_recipe_ref, dict):
+            raise ValueError('method_recipe_ref 必须是 dict')
+        # Recipe sidecar/reference has already crossed its own strict schema gate.  Keep a detached
+        # copy in the existing registration chain so later caller mutation cannot rewrite lineage.
+        inputs['method_recipe'] = copy.deepcopy(method_recipe_ref)
     inputs['sha256'] = {
         name: sha256_file(job_dir / name)
         for name in _MANAGED_VASP_INPUTS
@@ -249,7 +258,8 @@ def create_from_build(job_dir: str | os.PathLike, build_result: dict, *,
     if potcar_file.is_file():
         inputs['potcar_sha256'] = sha256_file(potcar_file)
     m = new_manifest(
-        job_id=f'{job_dir.resolve().name}-{time.strftime("%Y%m%d-%H%M%S")}',
+        job_id=(str(job_id) if job_id is not None
+                else f'{job_dir.resolve().name}-{time.strftime("%Y%m%d-%H%M%S")}'),
         system=system or _poscar_system_name(poscar_path),
         task_type=task_type,
         calc_type=str(build_result.get('calc_type') or ''),

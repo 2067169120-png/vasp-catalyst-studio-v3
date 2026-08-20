@@ -22,6 +22,13 @@
     previewKey: null,
     previewView: { kind: 'waiting', error: '' },
     solvationPreview: null,
+    methodRecipe: {
+      catalog: null, preview: null, confirmKey: null,
+      intentGeneration: 0, previewSequence: 0, previewOwner: null,
+      suggestSequence: 0, suggestOwner: null, confirmSequence: 0, confirmOwner: null,
+      previewGeneration: null, clientIntentId: null, draftFingerprint: null,
+      confirmLocked: false,
+    },
   };   // 预览去重 + 防旧响应覆盖
 
   function renderPreviewLanguage() {
@@ -111,7 +118,11 @@
         '选择文件失败:{error}', 'Failed to select file: {error}'), 'failc');
       return;
     }
-    if (r && r.path) { setVal(id, r.path); refreshPreview(); }
+    if (r && r.path) {
+      setVal(id, r.path);
+      refreshPreview();
+      if (id === 'gen-poscar' || id === 'gen-incar') invalidateMethodRecipePreview();
+    }
   }
   async function pickDir(id) {
     const r = await VCS.call('pick_dir');
@@ -120,7 +131,10 @@
         '选择目录失败:{error}', 'Failed to select directory: {error}'), 'failc');
       return;
     }
-    if (r && r.path) setVal(id, r.path);
+    if (r && r.path) {
+      setVal(id, r.path);
+      if (id === 'gen-out' || id === 'gen-lib') invalidateMethodRecipePreview();
+    }
   }
 
   // ── 一键生成:gen_run → 成功落台账 + 逐条 warnings + 提示去任务页;失败 log 错误 ──
@@ -210,6 +224,525 @@
     } finally {
       if (btn) btn.disabled = false;
     }
+  }
+
+  // ── Method Recipe / INCAR 向导 ─────────────────────────────────────────────
+  // 浏览器只收集声明性草稿、展示后端结果并回传 opaque capability。ENCUT、KPOINTS、
+  // +U 映射、INCAR 解析/合并与哈希全部留在 Python seam。
+  const MR_FIELDS = [
+    'mr-system', 'mr-task', 'mr-policy', 'mr-xc', 'mr-dispersion', 'mr-precision',
+    'mr-ediff', 'mr-ediffg', 'mr-spin', 'mr-magmom', 'mr-u-mode', 'mr-u-json',
+    'mr-dipole', 'mr-solvent', 'mr-dielectric', 'mr-encut-mode',
+    'mr-encut-multiplier', 'mr-encut-value', 'mr-kpoints-mode', 'mr-kpoints-grid',
+    'mr-dry-run',
+  ];
+  const MR_CONFIRM_LOCK_FIELDS = [
+    ...MR_FIELDS, 'gen-poscar', 'gen-incar', 'gen-out', 'gen-lib', 'mr-ack',
+    'mr-suggest', 'mr-preview', 'gen-poscar-btn', 'gen-incar-btn', 'gen-out-btn',
+    'gen-lib-btn', 'gen-run',
+  ];
+
+  function mrEnglish() { return !!(VCS.i18n && VCS.i18n.lang === 'en'); }
+
+  function mrNumber(id, nullable) {
+    const raw = val(id);
+    if (!raw && nullable) return null;
+    return Number(raw);
+  }
+
+  function collectMethodRecipeDraft() {
+    let hubbard = {};
+    if (val('mr-u-mode') === 'manual') {
+      const raw = val('mr-u-json');
+      if (!raw) throw new Error(tr('runtime.generate.recipe.u_required', {},
+        'manual +U 必须填写完整元素映射 JSON',
+        'Manual +U requires a complete element-mapping JSON object'));
+      try { hubbard = JSON.parse(raw); }
+      catch (_error) {
+        throw new Error(tr('runtime.generate.recipe.u_invalid', {},
+          '+U 元素映射不是合法 JSON', 'The +U element mapping is not valid JSON'));
+      }
+    }
+    return {
+      schema: 'vcstudio.method-recipe-draft/v1',
+      system_type: val('mr-system'),
+      task: val('mr-task'),
+      xc: val('mr-xc'),
+      dispersion: val('mr-dispersion'),
+      precision: val('mr-precision'),
+      ediff: mrNumber('mr-ediff', false),
+      ediffg: mrNumber('mr-ediffg', false),
+      spin_mode: val('mr-spin'),
+      magmom: val('mr-magmom'),
+      hubbard_mode: val('mr-u-mode'),
+      hubbard_u: hubbard,
+      dipole_mode: val('mr-dipole'),
+      solvent_mode: val('mr-solvent'),
+      solvent_dielectric: mrNumber('mr-dielectric', false),
+      encut_mode: val('mr-encut-mode'),
+      encut_value: mrNumber('mr-encut-value', true),
+      encut_multiplier: mrNumber('mr-encut-multiplier', false),
+      kpoints_mode: val('mr-kpoints-mode'),
+      kpoints_grid: val('mr-kpoints-grid') || null,
+      include_convergence_dry_run: !!($('mr-dry-run') && $('mr-dry-run').checked),
+    };
+  }
+
+  function methodRecipeDraftFingerprint(draft) {
+    const payload = {
+      draft: draft || collectMethodRecipeDraft(),
+      policy_id: val('mr-policy') || null,
+      poscar_path: val('gen-poscar'), incar_path: val('gen-incar'),
+      out_dir: val('gen-out'), lib_root: val('gen-lib'),
+    };
+    return JSON.stringify(payload);
+  }
+
+  function methodRecipeResolutionFingerprint(resolutions) {
+    const canonical = {};
+    Object.keys(resolutions || {}).sort().forEach(key => {
+      canonical[key] = String(resolutions[key]);
+    });
+    return JSON.stringify(canonical);
+  }
+
+  function methodRecipeConfirmBindingFingerprint(owner) {
+    return JSON.stringify({
+      token: owner.preview.token,
+      preview_sha256: owner.preview.preview_sha256,
+      target_id: owner.preview.target_id,
+      client_intent_id: owner.clientIntentId,
+      draft_fingerprint: owner.draftFingerprint,
+      idempotency_key: owner.confirmKey,
+      resolution_fingerprint: owner.resolutionFingerprint,
+      acknowledged: true,
+    });
+  }
+
+  function setMethodRecipeConfirmLocked(locked) {
+    const state = State.methodRecipe;
+    if (state.confirmLocked === locked) return;
+    state.confirmLocked = locked;
+    const elements = MR_CONFIRM_LOCK_FIELDS.map(id => $(id)).filter(Boolean);
+    document.querySelectorAll('#mr-diff .mr-resolution').forEach(el => elements.push(el));
+    elements.forEach(el => {
+      if (locked) {
+        el.dataset.mrConfirmWasDisabled = el.disabled ? '1' : '0';
+        el.disabled = true;
+      } else if (Object.prototype.hasOwnProperty.call(el.dataset, 'mrConfirmWasDisabled')) {
+        el.disabled = el.dataset.mrConfirmWasDisabled === '1';
+        delete el.dataset.mrConfirmWasDisabled;
+      }
+    });
+  }
+
+  function isCurrentMethodRecipeConfirmBinding(owner) {
+    const state = State.methodRecipe;
+    if (!owner || state.confirmOwner !== owner || state.preview !== owner.preview
+        || state.intentGeneration !== owner.generation
+        || state.previewGeneration !== owner.generation
+        || state.clientIntentId !== owner.clientIntentId
+        || state.confirmKey !== owner.confirmKey
+        || !isCurrentMethodRecipePreview()
+        || !$('mr-ack') || !$('mr-ack').checked) return false;
+    const choices = collectMethodRecipeResolutions();
+    if (!choices.complete
+        || methodRecipeResolutionFingerprint(choices.resolutions)
+          !== owner.resolutionFingerprint) return false;
+    return methodRecipeConfirmBindingFingerprint(owner) === owner.bindingFingerprint;
+  }
+
+  function releaseMethodRecipeConfirm(owner) {
+    if (State.methodRecipe.confirmOwner !== owner) return false;
+    State.methodRecipe.confirmOwner = null;
+    setMethodRecipeConfirmLocked(false);
+    updateMethodRecipeConfirmState();
+    return true;
+  }
+
+  function rejectChangedMethodRecipeConfirm(owner, result) {
+    if (!releaseMethodRecipeConfirm(owner)) return;
+    invalidateMethodRecipePreview();
+    const written = result && result.ok !== false && !result.error;
+    const status = $('mr-preview-status');
+    if (status) {
+      status.className = 'mr-status fail';
+      status.textContent = written
+        ? tr('runtime.generate.recipe.confirm_binding_written_stale', {},
+          '冻结的确认已完成，但当前选择已变化；旧结果不代表当前意图。请在任务页核对候选输入，并重新生成预览。',
+          'The frozen confirmation completed, but the current choices changed. The old result does not represent the current intent. Review the candidate inputs in Jobs and generate a new preview.')
+        : tr('runtime.generate.recipe.confirm_binding_stale', {},
+          '确认期间草稿、冲突选择或风险确认发生变化；未继续写入，请重新生成预览。',
+          'The draft, conflict resolutions, or risk acknowledgement changed during confirmation. Nothing further was written; generate a new preview.');
+    }
+    VCS.log(written
+      ? tr('runtime.generate.recipe.confirm_binding_written_stale_log', {},
+        '冻结确认的后端结果未作为当前 UI 意图接受；请在任务页核对已登记的 CREATED 候选作业。',
+        'The frozen backend result was not accepted as the current UI intent; review the registered CREATED candidate job in Jobs.')
+      : tr('runtime.generate.recipe.confirm_binding_stale_log', {},
+        '确认绑定已变化，旧确认被丢弃；请重新生成预览。',
+        'The confirmation binding changed, so the old confirmation was discarded; generate a new preview.'),
+    'failc');
+    if (written && window.Jobs && typeof window.Jobs.reload === 'function') {
+      window.Jobs.reload();
+    }
+  }
+
+  function isCurrentMethodRecipePreview() {
+    const state = State.methodRecipe;
+    if (!state.preview || state.previewGeneration !== state.intentGeneration
+        || state.preview.client_intent_id !== state.clientIntentId) return false;
+    try { return methodRecipeDraftFingerprint() === state.draftFingerprint; }
+    catch (_error) { return false; }
+  }
+
+  function setMethodRecipeDraft(draft) {
+    if (!draft) return;
+    const values = {
+      'mr-system': draft.system_type, 'mr-task': draft.task, 'mr-xc': draft.xc,
+      'mr-dispersion': draft.dispersion, 'mr-precision': draft.precision,
+      'mr-ediff': draft.ediff, 'mr-ediffg': draft.ediffg,
+      'mr-spin': draft.spin_mode, 'mr-magmom': draft.magmom,
+      'mr-u-mode': draft.hubbard_mode,
+      'mr-u-json': draft.hubbard_u && Object.keys(draft.hubbard_u).length
+        ? JSON.stringify(draft.hubbard_u) : '',
+      'mr-dipole': draft.dipole_mode, 'mr-solvent': draft.solvent_mode,
+      'mr-dielectric': draft.solvent_dielectric,
+      'mr-encut-mode': draft.encut_mode,
+      'mr-encut-multiplier': draft.encut_multiplier,
+      'mr-encut-value': draft.encut_value == null ? '' : draft.encut_value,
+      'mr-kpoints-mode': draft.kpoints_mode,
+      'mr-kpoints-grid': draft.kpoints_grid == null
+        ? '' : (Array.isArray(draft.kpoints_grid) ? draft.kpoints_grid.join(' ') : draft.kpoints_grid),
+    };
+    Object.keys(values).forEach(id => {
+      const el = $(id); if (el) el.value = values[id] == null ? '' : String(values[id]);
+    });
+    if ($('mr-dry-run')) $('mr-dry-run').checked = !!draft.include_convergence_dry_run;
+  }
+
+  function invalidateMethodRecipePreview() {
+    State.methodRecipe.intentGeneration += 1;
+    State.methodRecipe.preview = null;
+    State.methodRecipe.confirmKey = null;
+    State.methodRecipe.previewGeneration = null;
+    State.methodRecipe.clientIntentId = null;
+    State.methodRecipe.draftFingerprint = null;
+    if ($('mr-ack')) $('mr-ack').checked = false;
+    const status = $('mr-preview-status');
+    if (status) {
+      status.className = 'mr-status';
+      status.textContent = tr('runtime.generate.recipe.preview_stale', {},
+        '草稿已变化，请重新生成只读预览。',
+        'The draft changed; generate a new read-only preview.');
+    }
+    if ($('mr-risk-list')) $('mr-risk-list').replaceChildren();
+    if ($('mr-diff')) $('mr-diff').replaceChildren();
+    updateMethodRecipeConfirmState();
+  }
+
+  function renderMethodRecipeCatalog() {
+    const catalog = State.methodRecipe.catalog;
+    if (!catalog) return;
+    const task = $('mr-task');
+    const selectedTask = task ? task.value : '';
+    if (task) {
+      task.replaceChildren();
+      const system = val('mr-system');
+      (catalog.tasks || []).filter(item => (item.systems || []).indexOf(system) >= 0).forEach(item => {
+        const option = document.createElement('option');
+        option.value = item.key;
+        option.textContent = mrEnglish() ? item.name_en : item.name_zh;
+        task.appendChild(option);
+      });
+      if (Array.from(task.options).some(option => option.value === selectedTask)) {
+        task.value = selectedTask;
+      }
+    }
+    const policy = $('mr-policy');
+    const selectedPolicy = policy ? policy.value : '';
+    if (policy) {
+      policy.replaceChildren();
+      const none = document.createElement('option');
+      none.value = '';
+      none.textContent = tr('generate.recipe.policy.none', {}, '不套用策略', 'No policy seed');
+      policy.appendChild(none);
+      const records = ((catalog.lab_policies || {}).policies || []);
+      records.filter(item => (item.applicability || []).indexOf(system) >= 0).forEach(item => {
+        const option = document.createElement('option');
+        option.value = item.id;
+        option.textContent = mrEnglish() ? item.label_en : item.label_zh;
+        policy.appendChild(option);
+      });
+      if (Array.from(policy.options).some(option => option.value === selectedPolicy)) {
+        policy.value = selectedPolicy;
+      }
+    }
+  }
+
+  async function loadMethodRecipeCatalog() {
+    const result = await VCS.call('method_recipe_catalog');
+    if (!result || result.ok === false || result.error) {
+      const status = $('mr-preview-status');
+      if (status) {
+        status.className = 'mr-status fail';
+        status.textContent = tr('runtime.generate.recipe.catalog_failed', {
+          error: (result && result.error) || tr(
+            'runtime.generate.common.unknown_error', {}, '未知错误', 'Unknown error'),
+        }, 'Method Recipe 目录读取失败：{error}', 'Failed to load Method Recipe catalog: {error}');
+      }
+      return;
+    }
+    State.methodRecipe.catalog = result.catalog;
+    renderMethodRecipeCatalog();
+  }
+
+  async function suggestMethodRecipe() {
+    if (State.methodRecipe.confirmOwner) return;
+    const generation = State.methodRecipe.intentGeneration;
+    const owner = ++State.methodRecipe.suggestSequence;
+    State.methodRecipe.suggestOwner = owner;
+    let result;
+    try {
+      result = await VCS.call(
+        'method_recipe_suggest', val('mr-system'), val('mr-task'), val('mr-policy') || null);
+    } catch (error) { result = { ok: false, error: error.message || String(error) }; }
+    if (State.methodRecipe.suggestOwner !== owner) return;
+    State.methodRecipe.suggestOwner = null;
+    if (State.methodRecipe.intentGeneration !== generation) return;
+    if (!result || result.ok === false || result.error) {
+      VCS.log(tr('runtime.generate.recipe.suggest_failed', {
+        error: (result && result.error) || tr(
+          'runtime.generate.common.unknown_error', {}, '未知错误', 'Unknown error'),
+      }, '建议草稿生成失败：{error}', 'Failed to create the suggested draft: {error}'), 'failc');
+      return;
+    }
+    setMethodRecipeDraft(result.draft);
+    invalidateMethodRecipePreview();
+    VCS.log(tr('runtime.generate.recipe.suggested', {},
+      '建议草稿已载入；色散、磁态、+U 与偶极仍需明确选择。',
+      'Suggested draft loaded; dispersion, magnetic state, +U, and dipole still require explicit choices.'));
+  }
+
+  function mrValue(value) {
+    if (value == null) return tr('runtime.generate.recipe.omit', {}, '（不写入）', '(omit)');
+    if (typeof value === 'object') return JSON.stringify(value);
+    return String(value);
+  }
+
+  function renderMethodRecipePreview() {
+    const preview = State.methodRecipe.preview;
+    const status = $('mr-preview-status');
+    const risks = $('mr-risk-list');
+    const diff = $('mr-diff');
+    if (!preview || !status || !risks || !diff) return;
+    status.className = 'mr-status ok';
+    status.textContent = tr('runtime.generate.recipe.preview_ready', {
+      hash: String(preview.preview_sha256 || '').slice(0, 12),
+      count: (preview.conflicts || []).length,
+    }, '预览已绑定（hash {hash}）；有 {count} 个冲突必须逐项选择。',
+    'Preview bound (hash {hash}); {count} conflicts require per-key choices.');
+    risks.replaceChildren();
+    const dimensions = (preview.recipe && preview.recipe.dimensions) || {};
+    Object.keys(dimensions).forEach(name => {
+      const item = dimensions[name];
+      if (item.risk !== 'high' && item.risk !== 'blocking') return;
+      const row = document.createElement('div');
+      row.className = 'mr-risk';
+      const reason = item.reason || {};
+      row.textContent = `${name} · ${item.risk}: ${mrEnglish() ? reason.en : reason.zh}`;
+      risks.appendChild(row);
+    });
+    diff.replaceChildren();
+    (preview.diff || []).filter(item => item.status !== 'unchanged_absent').forEach(item => {
+      const row = document.createElement('div');
+      row.className = `mr-diff-row${item.requires_resolution ? ' conflict' : ''}`;
+      const key = document.createElement('div'); key.className = 'mr-diff-key'; key.textContent = item.key;
+      const current = document.createElement('div'); current.className = 'mr-diff-value';
+      current.textContent = tr('runtime.generate.recipe.existing', { value: mrValue(item.existing) },
+        '已有：{value}', 'Existing: {value}');
+      const proposed = document.createElement('div'); proposed.className = 'mr-diff-value';
+      proposed.textContent = tr('runtime.generate.recipe.proposed', { value: mrValue(item.proposed) },
+        '建议：{value}', 'Proposed: {value}');
+      const decision = document.createElement('div'); decision.className = 'mr-diff-resolution';
+      if (item.requires_resolution) {
+        const label = document.createElement('label');
+        label.textContent = tr('runtime.generate.recipe.resolve', {}, '明确选择：', 'Explicit choice:');
+        const select = document.createElement('select'); select.className = 'ipt mr-resolution';
+        select.dataset.key = item.key;
+        [
+          ['', tr('runtime.generate.recipe.choose', {}, '请选择', 'Choose')],
+          ['existing', tr('runtime.generate.recipe.keep_existing', {}, '保留已有（默认不覆盖）', 'Keep existing (no overwrite)')],
+          ['recipe', tr('runtime.generate.recipe.use_recipe', {}, '采用 recipe', 'Use recipe')],
+        ].forEach(pair => {
+          const option = document.createElement('option'); option.value = pair[0];
+          option.textContent = pair[1]; select.appendChild(option);
+        });
+        select.addEventListener('change', updateMethodRecipeConfirmState);
+        label.appendChild(select); decision.appendChild(label);
+      } else {
+        decision.textContent = tr(`runtime.generate.recipe.diff.${item.status}`, {},
+          item.status, item.status);
+      }
+      row.append(key, current, proposed, decision);
+      diff.appendChild(row);
+    });
+    updateMethodRecipeConfirmState();
+  }
+
+  function collectMethodRecipeResolutions() {
+    const resolutions = {};
+    let complete = true;
+    document.querySelectorAll('#mr-diff .mr-resolution').forEach(select => {
+      if (!select.value) complete = false;
+      else resolutions[select.dataset.key] = select.value;
+    });
+    return { complete, resolutions };
+  }
+
+  function updateMethodRecipeConfirmState() {
+    const button = $('mr-confirm');
+    if (!button) return;
+    const choices = collectMethodRecipeResolutions();
+    button.disabled = !(isCurrentMethodRecipePreview() && choices.complete
+      && $('mr-ack') && $('mr-ack').checked && !State.methodRecipe.confirmOwner);
+  }
+
+  async function previewMethodRecipe() {
+    if (State.methodRecipe.confirmOwner) return;
+    let draft;
+    try { draft = collectMethodRecipeDraft(); }
+    catch (error) {
+      VCS.log(error.message || String(error), 'failc'); return;
+    }
+    const generation = State.methodRecipe.intentGeneration;
+    const owner = ++State.methodRecipe.previewSequence;
+    const clientIntentId = `method-recipe-intent-${generation}-${owner}-${Date.now()}`;
+    const draftFingerprint = methodRecipeDraftFingerprint(draft);
+    State.methodRecipe.previewOwner = owner;
+    const status = $('mr-preview-status');
+    if (status) {
+      status.className = 'mr-status';
+      status.textContent = tr('runtime.generate.recipe.previewing', {},
+        '后端正在解析结构、赝势证据与已有 INCAR…',
+        'The backend is parsing structure, pseudopotential evidence, and the existing INCAR…');
+    }
+    const request = {
+      poscar_path: val('gen-poscar'), incar_path: val('gen-incar'),
+      out_dir: val('gen-out'), lib_root: val('gen-lib'), draft,
+      policy_id: val('mr-policy') || null, project_id: null,
+      client_intent_id: clientIntentId,
+    };
+    let result;
+    try { result = await VCS.call('method_recipe_preview', request); }
+    catch (error) { result = { ok: false, error: error.message || String(error) }; }
+    if (State.methodRecipe.previewOwner !== owner) return;
+    State.methodRecipe.previewOwner = null;
+    if (State.methodRecipe.intentGeneration !== generation
+        || methodRecipeDraftFingerprint() !== draftFingerprint) return;
+    if (!result || result.ok === false || result.error) {
+      State.methodRecipe.preview = null;
+      if (status) {
+        status.className = 'mr-status fail';
+        status.textContent = tr('runtime.generate.recipe.preview_failed', {
+          error: (result && result.error) || tr(
+            'runtime.generate.common.unknown_error', {}, '未知错误', 'Unknown error'),
+        }, 'Recipe 预览被拒绝：{error}', 'Recipe preview rejected: {error}');
+      }
+      updateMethodRecipeConfirmState();
+      return;
+    }
+    if (result.client_intent_id !== clientIntentId) {
+      State.methodRecipe.preview = null;
+      updateMethodRecipeConfirmState();
+      return;
+    }
+    State.methodRecipe.preview = result;
+    State.methodRecipe.previewGeneration = generation;
+    State.methodRecipe.clientIntentId = clientIntentId;
+    State.methodRecipe.draftFingerprint = draftFingerprint;
+    State.methodRecipe.confirmKey = `method-recipe-${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
+    if ($('mr-ack')) $('mr-ack').checked = false;
+    renderMethodRecipePreview();
+  }
+
+  async function confirmMethodRecipe() {
+    if (State.methodRecipe.confirmOwner) return;
+    const preview = State.methodRecipe.preview;
+    const choices = collectMethodRecipeResolutions();
+    if (!isCurrentMethodRecipePreview() || !choices.complete
+        || !$('mr-ack') || !$('mr-ack').checked) return;
+    const generation = State.methodRecipe.intentGeneration;
+    const draftFingerprint = State.methodRecipe.draftFingerprint;
+    const clientIntentId = State.methodRecipe.clientIntentId;
+    const resolutionFingerprint = methodRecipeResolutionFingerprint(choices.resolutions);
+    const owner = {
+      id: `${preview.token}:${resolutionFingerprint}:${++State.methodRecipe.confirmSequence}`,
+      preview, generation, draftFingerprint, clientIntentId,
+      confirmKey: State.methodRecipe.confirmKey,
+      resolutions: JSON.parse(resolutionFingerprint), resolutionFingerprint,
+    };
+    owner.bindingFingerprint = methodRecipeConfirmBindingFingerprint(owner);
+    State.methodRecipe.confirmOwner = owner;
+    setMethodRecipeConfirmLocked(true);
+    updateMethodRecipeConfirmState();
+    let approved;
+    try {
+      approved = await VCS.confirm(tr('runtime.generate.recipe.confirm_prompt', {},
+        '确认只写候选输入并登记 CREATED 作业？这不会自动提交，也不代表科学 validated。',
+        'Write candidate inputs and register a CREATED job? This will not submit automatically or imply scientific validation.'));
+    } catch (error) {
+      if (State.methodRecipe.confirmOwner !== owner) return;
+      if (!isCurrentMethodRecipeConfirmBinding(owner)) {
+        rejectChangedMethodRecipeConfirm(owner, null); return;
+      }
+      releaseMethodRecipeConfirm(owner);
+      VCS.log(tr('runtime.generate.recipe.write_failed', {
+        error: error.message || String(error),
+      }, '确认写入失败：{error}', 'Confirmed write failed: {error}'), 'failc');
+      return;
+    }
+    if (State.methodRecipe.confirmOwner !== owner) return;
+    if (!isCurrentMethodRecipeConfirmBinding(owner)) {
+      rejectChangedMethodRecipeConfirm(owner, null); return;
+    }
+    if (!approved) {
+      releaseMethodRecipeConfirm(owner);
+      return;
+    }
+    const button = $('mr-confirm'); if (button) button.disabled = true;
+    const request = {
+      token: preview.token, preview_sha256: preview.preview_sha256,
+      target_id: preview.target_id, confirmed: true,
+      idempotency_key: owner.confirmKey,
+      resolutions: owner.resolutions,
+      client_intent_id: clientIntentId,
+    };
+    let result;
+    try { result = await VCS.call('method_recipe_confirm', request); }
+    catch (error) { result = { ok: false, error: error.message || String(error) }; }
+    if (State.methodRecipe.confirmOwner !== owner) return;
+    if (!isCurrentMethodRecipeConfirmBinding(owner)) {
+      rejectChangedMethodRecipeConfirm(owner, result); return;
+    }
+    releaseMethodRecipeConfirm(owner);
+    if (!result || result.ok === false || result.error) {
+      VCS.log(tr('runtime.generate.recipe.write_failed', {
+        error: (result && result.error) || tr(
+          'runtime.generate.common.unknown_error', {}, '未知错误', 'Unknown error'),
+      }, '确认写入失败：{error}', 'Confirmed write failed: {error}'), 'failc');
+      updateMethodRecipeConfirmState();
+      return;
+    }
+    VCS.log(tr('runtime.generate.recipe.created', {
+      job: result.job_id || '', hash: String(result.recipe_semantic_sha256 || '').slice(0, 12),
+    }, '候选输入已写入并登记 CREATED 作业 {job}（recipe {hash}）；未提交、未科学验证。',
+    'Candidate inputs were written and registered as CREATED job {job} (recipe {hash}); not submitted or scientifically validated.'), 'okc');
+    (result.warnings || []).forEach(warning => VCS.log(warning));
+    VCS.toast(tr('runtime.generate.recipe.created_toast', {},
+      '候选输入已生成（未提交）', 'Candidate inputs generated (not submitted)'));
+    if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
+    if (button) button.disabled = true;
   }
 
   // ── SAC 批量建模:chips 多选 + 预览矩阵 + 生成矩阵(生成前弹确认显示预估) ──
@@ -900,10 +1433,29 @@
     wire('gen-out-btn', () => pickDir('gen-out'));
     wire('gen-lib-btn', () => pickDir('gen-lib'));
     wire('gen-run', run);
+    wire('mr-suggest', suggestMethodRecipe);
+    wire('mr-preview', previewMethodRecipe);
+    wire('mr-confirm', confirmMethodRecipe);
+    MR_FIELDS.forEach(id => {
+      const el = $(id);
+      if (!el) return;
+      const eventName = (el.tagName === 'INPUT' && el.type !== 'checkbox') || el.tagName === 'TEXTAREA'
+        ? 'input' : 'change';
+      el.addEventListener(eventName, invalidateMethodRecipePreview);
+    });
+    { const el = $('mr-system'); if (el) el.addEventListener('change', renderMethodRecipeCatalog); }
+    { const el = $('mr-ack'); if (el) el.addEventListener('change', updateMethodRecipeConfirmState); }
     // POSCAR/INCAR 手动改路径(change/blur)也触发预览
     ['gen-poscar', 'gen-incar'].forEach(id => {
       const el = $(id);
-      if (el) { el.addEventListener('change', refreshPreview); el.addEventListener('blur', refreshPreview); }
+      if (el) {
+        el.addEventListener('change', refreshPreview);
+        el.addEventListener('blur', refreshPreview);
+        el.addEventListener('input', invalidateMethodRecipePreview);
+      }
+    });
+    ['gen-out', 'gen-lib'].forEach(id => {
+      const el = $(id); if (el) el.addEventListener('input', invalidateMethodRecipePreview);
     });
     // 切换计算类型即刷新预览(KPOINTS 随之变化)
     { const el = $('gen-calc'); if (el) el.addEventListener('change', refreshPreview); }
@@ -946,6 +1498,7 @@
     wire('engine-gen-btn', engineGenerate);
     { const task = $('eng-task'); if (task) task.addEventListener('change', saveEngineTask); }
 
+    await loadMethodRecipeCatalog();
     const st = await VCS.call('gen_state');
     if (st) {
       setVal('gen-poscar', st.poscar);
@@ -982,6 +1535,8 @@
     syncEngineTask();
     onMslabChange();
     onCampTplChange();
+    renderMethodRecipeCatalog();
+    if (State.methodRecipe.preview) renderMethodRecipePreview();
   });
   document.addEventListener('vcs:engine', e => {
     const engine = e.detail && e.detail.engine;
@@ -998,5 +1553,10 @@
   }
 
   window.Generate = { reload: () => refreshPreview(), useMolecule,
-    selectEngine: async key => { await loadEngines(); return selectEngine(key); } };
+    selectEngine: async key => { await loadEngines(); return selectEngine(key); },
+    methodRecipe: {
+      collectDraft: collectMethodRecipeDraft,
+      preview: previewMethodRecipe,
+      confirm: confirmMethodRecipe,
+    } };
 })();

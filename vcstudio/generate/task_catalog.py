@@ -38,8 +38,9 @@ CATALOG = [
      'description_en': ('Relax the ions at fixed cell parameters until the force criterion is met; '
                         'the first step in catalyst modeling.'),
      'builder_ref': 'vcstudio.generate.job_builder:build_job_dir',
-     'requires': 'POSCAR + 用户 INCAR', 'outputs': 'CONTCAR/OUTCAR/OSZICAR',
-     'requires_en': 'POSCAR + user-supplied INCAR',
+     'requires': 'POSCAR + 已确认 Method Recipe 或用户 INCAR',
+     'outputs': 'CONTCAR/OUTCAR/OSZICAR',
+     'requires_en': 'POSCAR + confirmed Method Recipe or user-supplied INCAR',
      'outputs_en': 'CONTCAR/OUTCAR/OSZICAR',
      'next_action_en': ('Inspect the final-step energy, forces, and ionic steps; after convergence, '
                         'derive a static calculation.'),
