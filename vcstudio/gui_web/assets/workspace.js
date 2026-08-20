@@ -84,6 +84,9 @@
     'analyze-properties': { area: 'analyze', page: 'analysis-workbench', label: '性质计算器', labelKey: 'workspace.route.analyze_properties',
       path: c => `/projects/${projectToken(c)}/analysis/properties`,
       analysisId: 'property-calculators', scenePage: 'project', focus: '#aw-title' },
+    'analyze-references': { area: 'analyze', page: 'reference-browser', label: '外部参考', labelKey: 'workspace.route.analyze_references',
+      path: c => `/projects/${projectToken(c)}/analysis/references`,
+      scenePage: 'project', focus: '#rb-title' },
 
     'publish-figures': { area: 'publish', page: 'figures', label: '图表', labelKey: 'workspace.route.publish_figures',
       path: c => `/publish/figures?project=${encodeURIComponent(projectToken(c))}` },
@@ -152,6 +155,7 @@
       { route: 'analyze-charge', label: '电荷与波函数' },
       { route: 'analyze-comparison', label: '比较' },
       { route: 'analyze-custom', label: '自定义' },
+      { route: 'analyze-references', label: '外部参考', labelKey: 'workspace.route.analyze_references' },
     ],
     publish: [
       { route: 'publish-figures', label: '图表' },
@@ -516,12 +520,12 @@
       const projectId = safeToken(decodeURIComponentSafe(match[1]), PROJECT_TOKEN);
       return projectId ? result(byView[match[2]], { projectId }) : null;
     }
-    match = path.match(/^\/projects\/([^/]+)\/analysis\/(adsorption|thermo|electronic|charge|comparison|custom|properties)$/);
+    match = path.match(/^\/projects\/([^/]+)\/analysis\/(adsorption|thermo|electronic|charge|comparison|custom|properties|references)$/);
     if (match) {
       const byAnalysis = { adsorption: 'analyze-energy', thermo: 'analyze-thermo',
         electronic: 'analyze-electronic', charge: 'analyze-charge',
         comparison: 'analyze-comparison', custom: 'analyze-custom',
-        properties: 'analyze-properties' };
+        properties: 'analyze-properties', references: 'analyze-references' };
       const projectId = safeToken(decodeURIComponentSafe(match[1]), PROJECT_TOKEN);
       return projectId ? result(byAnalysis[match[2]], { projectId }) : null;
     }

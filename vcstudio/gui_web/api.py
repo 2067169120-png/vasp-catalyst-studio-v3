@@ -288,7 +288,7 @@ class Api:
                  workspace_context_store=None, method_recipe_service=None,
                  method_recipe_publisher=None, structure_sources_mod=None,
                  structure_source_session=None, external_structure_gateway=None,
-                 surface_workbench_mod=None):
+                 surface_workbench_mod=None, external_reference_gateway=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -434,6 +434,12 @@ class Api:
         # hash-bound lifecycle service. Browser callers receive opaque server
         # selections and plans, never an authority-bearing filesystem path.
         self._project_lifecycle_service = project_lifecycle_service
+        # External providers are isolated behind a narrow read-only gateway.
+        # Network access is disabled by the gateway unless this process receives
+        # an explicit session confirmation; cache paths and credentials never
+        # cross the pywebview bridge.
+        self._external_reference_gateway_instance = external_reference_gateway
+        self._external_reference_lock = threading.RLock()
         self._project_lifecycle_lock = threading.RLock()
         self._project_lifecycle_selections = {}
         self._project_lifecycle_plans = {}
@@ -1737,11 +1743,25 @@ class Api:
     def _structure_sources(self):
         """本地 provider + 外部 gateway 消费会话；本模块自身不发网络请求。"""
         if self._structure_source_session is None:
-            if self._structure_sources_mod is None:
-                from vcstudio.generate import structure_sources
-                self._structure_sources_mod = structure_sources
-            self._structure_source_session = self._structure_sources_mod.StructureSourceSession(
-                gateway=self._external_structure_gateway)
+            with self._structure_hub_lock:
+                if self._structure_source_session is None:
+                    if self._structure_sources_mod is None:
+                        from vcstudio.generate import structure_sources
+                        self._structure_sources_mod = structure_sources
+                    gateway = self._external_structure_gateway
+                    if gateway is None:
+                        try:
+                            from vcstudio.project.external_references import (
+                                StructureSourceGatewayAdapter,
+                            )
+                            gateway = StructureSourceGatewayAdapter(
+                                self._external_references())
+                        except Exception:                 # noqa: BLE001 local source stays available
+                            gateway = None
+                        self._external_structure_gateway = gateway
+                    self._structure_source_session = (
+                        self._structure_sources_mod.StructureSourceSession(
+                            gateway=gateway))
         return self._structure_source_session
 
     def _surface_wb(self):
@@ -7853,6 +7873,177 @@ class Api:
             return self._report_insight_failure(
                 CAPSULE_SCHEMA, exc, revision=None, file=None)
 
+    # ── External Reference Gateway:只读外部参考，不进入本地验证/报告权威 ────
+    def _external_references(self):
+        if self._external_reference_gateway_instance is None:
+            with self._external_reference_lock:
+                if self._external_reference_gateway_instance is None:
+                    from vcstudio.project.external_references import ExternalReferenceGateway
+                    self._external_reference_gateway_instance = ExternalReferenceGateway()
+        return self._external_reference_gateway_instance
+
+    @staticmethod
+    def _external_reference_failure(
+            code='gateway_unavailable',
+            schema='vcstudio.external-reference-result/v1'):
+        return {
+            'schema': schema,
+            'ok': False, 'status': 'unavailable', 'provider': None,
+            'query': None, 'items': [], 'result_token': None,
+            'expires_at': None,
+            'error': {
+                'code': str(code),
+                'message': 'External reference gateway is unavailable.',
+                'retryable': False,
+            },
+        }
+
+    def external_reference_catalog(self):
+        try:
+            return self._external_references().catalog()
+        except Exception:                                 # noqa: BLE001 public boundary
+            return self._external_reference_failure(
+                schema='vcstudio.external-reference-catalog/v1')
+
+    def external_reference_set_network(self, enabled, confirmation=None):
+        try:
+            return self._external_references().set_network_enabled(
+                enabled, confirmation)
+        except Exception:                                 # noqa: BLE001 public boundary
+            return self._external_reference_failure(
+                schema='vcstudio.external-reference-network/v1')
+
+    def external_reference_store_api_key(self, provider, api_key):
+        """Write one API key to OS keyring; the response never echoes it."""
+        try:
+            return self._external_references().store_api_key(provider, api_key)
+        except Exception:                                 # noqa: BLE001 public boundary
+            return self._external_reference_failure(
+                'keyring_unavailable',
+                schema='vcstudio.external-reference-credential/v1')
+
+    def external_reference_delete_api_key(self, provider):
+        try:
+            return self._external_references().delete_api_key(provider)
+        except Exception:                                 # noqa: BLE001 public boundary
+            return self._external_reference_failure(
+                'keyring_unavailable',
+                schema='vcstudio.external-reference-credential/v1')
+
+    def external_reference_search(self, provider, filters=None):
+        """Browser search seam: provider id plus bounded filters, and nothing else."""
+        try:
+            return self._external_references().search(provider, filters or {})
+        except Exception:                                 # noqa: BLE001 public boundary
+            return self._external_reference_failure()
+
+    @classmethod
+    def _external_reference_local_rows(cls, summary):
+        """Project-side comparison projection; deliberately excludes locators."""
+        result = []
+        source = summary if isinstance(summary, dict) else {}
+        for row in source.get('rows') or []:
+            if not isinstance(row, dict):
+                continue
+            energy = row.get('delta_e')
+            if isinstance(energy, bool) or not isinstance(energy, (int, float)):
+                energy = None
+            elif not math.isfinite(float(energy)):
+                energy = None
+            method = row.get('method_check') if isinstance(
+                row.get('method_check'), dict) else {}
+            result.append({
+                'source_role': 'local_result',
+                'name': cls._structure_sanitize(str(row.get('name') or ''))[:160],
+                'species': cls._structure_sanitize(str(row.get('species') or ''))[:80],
+                'state': cls._structure_sanitize(str(row.get('state') or ''))[:32],
+                'quantity': 'adsorption_energy',
+                'value': float(energy) if energy is not None else None,
+                'unit': 'eV',
+                'reference_valid': row.get('reference_valid') is True,
+                'method_status': cls._structure_sanitize(str(
+                    method.get('status') or 'unknown'))[:40],
+            })
+        return result
+
+    def external_reference_compare(self, project_id, result_token, item_ids):
+        """Return local/external values side by side with no aggregate."""
+        try:
+            record = self._resolve_project_id(project_id)
+
+            def compare():
+                external = self._external_references().compare(
+                    result_token, item_ids)
+                if not external.get('ok'):
+                    return external
+                project = self._load_project_for_path(record['path'])
+                summary = self._adsorption.delta_e_rows(project)
+                return {
+                    **external,
+                    'project_id': record['request_project_id'],
+                    'local_items': self._external_reference_local_rows(summary),
+                    'aggregate': None,
+                }
+
+            return self._call_with_project_bindings(
+                [record], compare,
+                failure={'schema': 'vcstudio.external-reference-comparison/v1'})
+        except Exception:                                 # noqa: BLE001 public boundary
+            return self._project_identity_failure(
+                schema='vcstudio.external-reference-comparison/v1')
+
+    def external_reference_import_preview(self, project_id, result_token, item_id):
+        """Bind one structure preview to the current project before confirmation."""
+        try:
+            from vcstudio.project.external_references import BoundProjectEntity
+
+            record = self._resolve_project_id(project_id)
+            with BoundProjectEntity.open(record['path']) as entity:
+                def preview():
+                    self._load_project_for_path(record['path'])
+                    entity.verify()
+                    return self._external_references().prepare_candidate_import(
+                        result_token, item_id,
+                        project_id=record['request_project_id'],
+                        project_entity_sha256=entity.identity_sha256)
+
+                return self._call_with_project_bindings(
+                    [record], preview,
+                    failure={
+                        'schema': 'vcstudio.external-reference-import-preview/v1'})
+        except Exception:                                 # noqa: BLE001 public boundary
+            return self._project_identity_failure(
+                schema='vcstudio.external-reference-import-preview/v1')
+
+    def external_reference_import(self, project_id, preview_token,
+                                  confirmation=None):
+        """Persist one explicitly confirmed structure as candidate provenance."""
+        try:
+            from vcstudio.project.external_references import BoundProjectEntity
+
+            record = self._resolve_project_id(project_id)
+            confirmation = confirmation if isinstance(confirmation, dict) else {}
+            confirmed = (
+                set(confirmation) == {'confirmed', 'scope'}
+                and confirmation.get('confirmed') is True
+                and confirmation.get('scope') == 'candidate_provenance')
+
+            with BoundProjectEntity.open(record['path']) as entity:
+                def import_candidate():
+                    self._load_project_for_path(record['path'])
+                    entity.verify()
+                    return self._external_references().import_candidate(
+                        preview_token, project_entity=entity,
+                        project_id=record['request_project_id'],
+                        confirmed=confirmed)
+
+                return self._call_with_project_bindings(
+                    [record], import_candidate,
+                    failure={'schema': 'vcstudio.external-reference-candidate/v1'})
+        except Exception:                                 # noqa: BLE001 public boundary
+            return self._project_identity_failure(
+                schema='vcstudio.external-reference-candidate/v1')
+
     # ── Phase D:分析配置工作台 API ───────────────────────────────────────
     _ANALYSIS_BOOTSTRAP_SCHEMA = 'vcstudio.analysis-workbench-bootstrap/v1'
     _ANALYSIS_PREVIEW_SCHEMA = 'vcstudio.analysis-workbench-preview/v1'
@@ -13386,11 +13577,12 @@ class Api:
         if isinstance(value, str):
             text = cls._workspace_public_text(value, limit=max(len(value), 400))
             patterns = (
-                r'(?i)\b((?:https?|s3)://)[^/\s:@]+:[^@\s/]+@',
+                r'(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]+:[^@\s/]+@',
                 r'(?i)\bBearer\s+[^\s,;]+',
                 r'(?i)\bBasic\s+[A-Za-z0-9+/=]{8,}',
-                r'(?i)\b(?:password|passwd|pwd|secret|credential|api[-_ ]?key|'
-                r'access[-_ ]?token|refresh[-_ ]?token|private[-_ ]?key)'
+                r'(?i)\b(?:password|passwd|pwd|secret|client[-_ ]?secret|credential|'
+                r'api[-_ ]?key|token|access[-_ ]?token|refresh[-_ ]?token|'
+                r'private[-_ ]?key)'
                 r'\s*[:=]\s*[^\s,;&]+',
                 r'(?i)\b(?:github_pat_|gh[opusr]_|sk-)[A-Za-z0-9_-]{12,}',
                 r'\b(?:AKIA|ASIA)[A-Z0-9]{16}\b',
