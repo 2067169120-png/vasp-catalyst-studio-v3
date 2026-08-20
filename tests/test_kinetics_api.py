@@ -55,6 +55,20 @@ def _assert_public(value, tmp_path):
     assert "export_dir" not in encoded
 
 
+def _confirm(api, project_id, preview, *, confirmed=True):
+    return api.kinetics_export_confirm(
+        project_id, preview["preview_sha256"], preview["selection_revision"],
+        preview["selected_export_sha256"], confirmed=confirmed)
+
+
+def _select(api, project_id, uploaded):
+    return api.kinetics_result_select(
+        project_id, uploaded["result_sha256"],
+        uploaded["confirmed_export_sha256"],
+        uploaded["latest_result_sha256"], uploaded["selection_revision"],
+        confirmed=True)
+
+
 def test_bootstrap_consumes_server_projection_and_keeps_missing_result_unavailable(tmp_path):
     api, project_id, _root, _tool, calls = _api(tmp_path)
 
@@ -85,29 +99,36 @@ def test_preview_confirm_import_and_dashboard_round_trip(tmp_path):
     assert not (root / ".vcstudio").exists()
     _assert_public(preview, tmp_path)
 
-    refused = api.kinetics_export_confirm(
-        project_id, preview["preview_sha256"], confirmed=False)
+    refused = _confirm(api, project_id, preview, confirmed=False)
     assert refused["ok"] is False
     assert not (root / ".vcstudio").exists()
 
-    confirmed = api.kinetics_export_confirm(
-        project_id, preview["preview_sha256"], confirmed=True)
+    confirmed = _confirm(api, project_id, preview)
     assert confirmed["ok"] is True
     assert confirmed["eligible_final"] is False
     assert (root / ".vcstudio" / "kinetics" / "exports" /
-            preview["input_sha256"] / "manifest.json").is_file()
+            preview["input_sha256"] / preview["preview_sha256"] /
+            "manifest.json").is_file()
     _assert_public(confirmed, tmp_path)
 
     network = frozen_network()
     result = valid_result(network)
     result["adapter"]["tool_sha256"] = hashlib.sha256(tool.read_bytes()).hexdigest()
     imported = api.kinetics_result_import(project_id, result)
+    before_select = api.analysis_workbench_preview(project_id, {
+        "analysis_id": "kinetic-dashboard", "project_id": project_id,
+        "precision": 4,
+    })
+    selected = _select(api, project_id, imported)
     dashboard = api.analysis_workbench_preview(project_id, {
         "analysis_id": "kinetic-dashboard", "project_id": project_id,
         "precision": 4,
     })
 
     assert imported["ok"] is True
+    assert imported["selected"] is False
+    assert before_select["view"]["available"] is False
+    assert selected["ok"] is True and selected["selected"] is True
     assert imported["scientific_status"] == "diagnostic"
     assert imported["eligible_final"] is False
     assert dashboard["ok"] is True
@@ -136,7 +157,7 @@ def test_result_import_requires_confirmed_hash_bound_export(tmp_path):
     assert "manifest" in missing_manifest["error"].lower()
 
     preview = api.kinetics_export_preview(project_id)
-    api.kinetics_export_confirm(project_id, preview["preview_sha256"], confirmed=True)
+    _confirm(api, project_id, preview)
     result["units"]["tof"] = "mol/s"
     rejected = api.kinetics_result_import(project_id, result)
 
@@ -163,7 +184,7 @@ def test_missing_projection_is_fail_closed_and_never_accepts_browser_network(tmp
 
 
 def test_tool_missing_keeps_audit_visible_but_solver_unavailable(tmp_path):
-    api, project_id, _root, _tool, _calls = _api(tmp_path, with_tool=False)
+    api, project_id, root, _tool, _calls = _api(tmp_path, with_tool=False)
 
     response = api.analysis_workbench_bootstrap(project_id, "kinetic-dashboard")
     preview = api.kinetics_export_preview(project_id)
@@ -174,17 +195,28 @@ def test_tool_missing_keeps_audit_visible_but_solver_unavailable(tmp_path):
     assert "CATMAP_UNAVAILABLE" in response["view"]["reason_codes"]
     assert preview["ok"] is True
     assert preview["capability_status"] == "unavailable"
+    assert preview["export_ready"] is False
+    assert preview["preview_sha256"] is None
     assert preview["limitations"]["audit_report_available"] is True
+    audit_preview = api.kinetics_audit_export_preview(project_id)
+    assert audit_preview["schema"] == "vcstudio.kinetics-audit-export-preview/v1"
+    assert audit_preview["model_published"] is False
+    audit_confirmed = api.kinetics_audit_export_confirm(
+        project_id, audit_preview["preview_sha256"], confirmed=True)
+    assert audit_confirmed["ok"] is True
+    assert audit_confirmed["model_published"] is False
+    assert not list((root / ".vcstudio" / "kinetics" / "audits").rglob("model.mkm"))
 
 
 def test_tool_drift_after_confirm_hides_old_result_until_new_preview(tmp_path):
     api, project_id, _root, tool, _calls = _api(tmp_path)
     preview = api.kinetics_export_preview(project_id)
-    api.kinetics_export_confirm(
-        project_id, preview["preview_sha256"], confirmed=True)
+    _confirm(api, project_id, preview)
     result = valid_result(frozen_network())
     result["adapter"]["tool_sha256"] = hashlib.sha256(tool.read_bytes()).hexdigest()
-    assert api.kinetics_result_import(project_id, result)["ok"] is True
+    uploaded = api.kinetics_result_import(project_id, result)
+    assert uploaded["ok"] is True
+    assert _select(api, project_id, uploaded)["ok"] is True
 
     tool.write_bytes(b"different-catmap-adapter-version")
     dashboard = api.analysis_workbench_preview(project_id, {
@@ -204,6 +236,30 @@ def test_tool_drift_after_confirm_hides_old_result_until_new_preview(tmp_path):
     assert "RESULT_REVALIDATION_FAILED" in dashboard["view"]["reason_codes"]
     assert rejected["ok"] is False
     assert "does not match" in rejected["error"]
+
+    new_preview = api.kinetics_export_preview(project_id)
+    assert new_preview["preview_sha256"] != preview["preview_sha256"]
+    newly_confirmed = _confirm(api, project_id, new_preview)
+    assert newly_confirmed["ok"] is True
+    assert newly_confirmed["selection_revision"] == 2
+
+
+def test_result_selection_api_rejects_stale_revision_without_last_win(tmp_path):
+    api, project_id, _root, tool, _calls = _api(tmp_path)
+    preview = api.kinetics_export_preview(project_id)
+    _confirm(api, project_id, preview)
+    first_result = valid_result(frozen_network())
+    first_result["adapter"]["tool_sha256"] = hashlib.sha256(
+        tool.read_bytes()).hexdigest()
+    second_result = copy.deepcopy(first_result)
+    second_result["points"][0]["tof"][0]["value"] = 3.5
+    first = api.kinetics_result_import(project_id, first_result)
+    second = api.kinetics_result_import(project_id, second_result)
+    assert first["selected"] is False and second["selected"] is False
+    assert _select(api, project_id, first)["ok"] is True
+    stale = _select(api, project_id, second)
+    assert stale["ok"] is False
+    assert "conflict" in stale["error"].lower()
 
 
 def test_kinetic_analysis_rejects_irrelevant_or_scientific_browser_fields(tmp_path):

@@ -18,7 +18,7 @@ def _normalized(network):
     return kinetics.import_result(
         valid_result(network), network,
         expected_adapter={
-            "id": "vcstudio.catmap-process-adapter", "version": "1",
+            "id": "vcstudio.catmap-process-adapter", "version": "2",
             "tool_sha256": "4" * 64,
         },
     )
@@ -96,11 +96,13 @@ def test_kinetic_view_never_projects_local_paths_or_credentials():
 def test_unconverged_server_result_keeps_rows_but_marks_dashboard_unavailable():
     network = frozen_network()
     result = valid_result(network)
-    result["points"][0]["convergence"]["converged"] = False
+    result["points"][0]["convergence"].update({
+        "converged": True, "residual": 1.0e-4,
+    })
     normalized = kinetics.import_result(
         result, network,
         expected_adapter={
-            "id": "vcstudio.catmap-process-adapter", "version": "1",
+            "id": "vcstudio.catmap-process-adapter", "version": "2",
             "tool_sha256": "4" * 64,
         },
     )

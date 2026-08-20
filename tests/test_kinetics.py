@@ -2,17 +2,61 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 
 import pytest
 
 from vcstudio.project import kinetics
 
 
+_EVIDENCE = {
+    "reaction-map:rev-7": b"canonical frozen reaction network revision 7",
+    "neb:co-o-ts": b"NEB transition-state artifact",
+    "manifest:job-1": b"project job manifest evidence",
+}
+
+
+class FrozenNetwork(dict):
+    """Test-only stand-in for the server-injected canonical provider DTO."""
+
+    def kinetics_input(self):
+        return copy.deepcopy(dict(self))
+
+    def kinetics_evidence(self, reference):
+        return _EVIDENCE[reference]
+
+    def canonical_source_projection(self):
+        value = copy.deepcopy(dict(self))
+        value.pop("input_sha256", None)
+        metadata = value.pop("source_projection")
+        value["schema"] = metadata["schema"]
+        value["version"] = metadata["version"]
+        value["evidence_refs"] = copy.deepcopy(metadata["evidence_refs"])
+        hash_field = (
+            "frozen_network_sha256"
+            if metadata["schema"] == "vcstudio.frozen-reaction-network/v1"
+            else "projection_sha256")
+        value[hash_field] = ""
+        if (metadata["schema"], metadata["version"]) in (
+                kinetics.SOURCE_PROJECTION_PROTOCOLS):
+            value[hash_field] = kinetics.compute_source_projection_sha256(value)
+        else:
+            value[hash_field] = "f" * 64
+        return value
+
+
+def _freeze(network):
+    network["source_projection"]["projection_sha256"] = (
+        kinetics.compute_projection_sha256(network))
+    network["input_sha256"] = kinetics.compute_input_sha256(network)
+    return network
+
+
 def _source(kind="dft", reference="manifest:job-1"):
     return {
         "kind": kind,
         "reference": reference,
-        "evidence_sha256": "1" * 64,
+        "evidence_sha256": hashlib.sha256(_EVIDENCE[reference]).hexdigest(),
     }
 
 
@@ -27,16 +71,22 @@ def _energy(value, *, method_id="rpbe-d3", uncertainty_eV=0.05):
 
 
 def frozen_network():
-    network = {
+    network = FrozenNetwork({
         "schema": kinetics.NETWORK_SCHEMA,
         "input_sha256": "",
         "network_id": "co-oxidation-111",
         "revision": "rev-7",
         "source_projection": {
-            "schema": "vcstudio.reaction-map-projection/v1",
+            "schema": "vcstudio.frozen-reaction-network/v1",
             "version": "1",
-            "projection_sha256": "2" * 64,
-            "evidence_refs": ["reaction-map:rev-7", "neb:co-o-ts"],
+            "projection_sha256": "",
+            "evidence_refs": [
+                {
+                    "reference": reference,
+                    "artifact_sha256": hashlib.sha256(data).hexdigest(),
+                }
+                for reference, data in _EVIDENCE.items()
+            ],
         },
         "assumptions": {
             "mean_field": True,
@@ -128,19 +178,18 @@ def frozen_network():
             },
         ],
         "extensions": {},
-    }
-    network["input_sha256"] = kinetics.compute_input_sha256(network)
-    return network
+    })
+    return _freeze(network)
 
 
 def valid_result(network=None):
     network = network or frozen_network()
-    return {
+    result = {
         "schema": kinetics.RESULT_SCHEMA,
         "input_sha256": network["input_sha256"],
         "adapter": {
             "id": "vcstudio.catmap-process-adapter",
-            "version": "1",
+            "version": "2",
             "tool_version": "0.4.0",
             "tool_sha256": "4" * 64,
         },
@@ -172,13 +221,19 @@ def valid_result(network=None):
             },
         ],
         "sensitivity": {
-            "status": "passed",
             "analyses": [
-                {"kind": "energy_uncertainty", "max_relative_change": 0.12},
+                {
+                    "kind": "energy_uncertainty", "point_index": 0,
+                    "condition_sha256": "", "step_id": "co_oxidation",
+                    "perturbation_eV": 0.10, "max_relative_change": 0.12,
+                },
             ],
             "warnings": [],
         },
     }
+    result["sensitivity"]["analyses"][0]["condition_sha256"] = (
+        kinetics.compute_condition_sha256(result["points"][0]["conditions"]))
+    return result
 
 
 def _codes(audit):
@@ -204,7 +259,52 @@ def test_protocol_provider_is_consumed_without_owning_upstream_dto():
         def kinetics_input(self):
             return frozen_network()
 
+        def kinetics_evidence(self, reference):
+            return _EVIDENCE[reference]
+
+        def canonical_source_projection(self):
+            return frozen_network().canonical_source_projection()
+
     assert kinetics.audit_network(Provider())["machine_pass"] is True
+
+
+def test_raw_mapping_fabricated_projection_and_evidence_are_never_trusted():
+    network = frozen_network()
+    raw_audit = kinetics.audit_network(dict(network))
+    assert raw_audit["machine_pass"] is False
+    assert "INVALID_INPUT" in _codes(raw_audit)
+
+    network["source_projection"]["projection_sha256"] = "f" * 64
+    network["input_sha256"] = kinetics.compute_input_sha256(network)
+    fabricated = kinetics.audit_network(network)
+    assert fabricated["machine_pass"] is False
+    assert "INVALID_INPUT" in _codes(fabricated)
+
+
+def test_projection_schema_and_real_artifact_hash_are_provider_verified():
+    network = frozen_network()
+    network["source_projection"]["schema"] = "caller.fabricated/v9"
+    network["input_sha256"] = kinetics.compute_input_sha256(network)
+    assert "INVALID_INPUT" in _codes(kinetics.audit_network(network))
+
+    class BadEvidence(FrozenNetwork):
+        def kinetics_evidence(self, reference):
+            if reference == "manifest:job-1":
+                return b"different artifact bytes"
+            return super().kinetics_evidence(reference)
+
+    network = BadEvidence(frozen_network())
+    assert "INVALID_INPUT" in _codes(kinetics.audit_network(network))
+
+
+def test_nested_energy_source_cannot_fabricate_artifact_sha():
+    network = frozen_network()
+    network["species"][0]["formation_energy"]["source"][
+        "evidence_sha256"] = "f" * 64
+    _freeze(network)
+    audit = kinetics.audit_network(network)
+    assert audit["machine_pass"] is False
+    assert "INVALID_INPUT" in _codes(audit)
 
 
 @pytest.mark.parametrize(
@@ -236,7 +336,7 @@ def test_protocol_provider_is_consumed_without_owning_upstream_dto():
 def test_scientific_input_failures_are_explicit_and_block_export(mutate, code):
     network = frozen_network()
     mutate(network)
-    network["input_sha256"] = kinetics.compute_input_sha256(network)
+    _freeze(network)
 
     audit = kinetics.audit_network(network)
 
@@ -252,10 +352,11 @@ def test_hash_duplicates_missing_species_and_missing_path_are_rejected():
     network["elementary_steps"].append(copy.deepcopy(network["elementary_steps"][0]))
     network["elementary_steps"][1]["id"] = "duplicate-id"
     network["target_products"] = ["missing_product"]
+    _freeze(network)
 
     audit = kinetics.audit_network(network)
 
-    assert {"INPUT_HASH_MISMATCH", "DUPLICATE_STEP", "UNKNOWN_TARGET_SPECIES"} <= _codes(audit)
+    assert {"DUPLICATE_STEP", "UNKNOWN_TARGET_SPECIES"} <= _codes(audit)
 
 
 def test_unknown_fields_paths_commands_and_nonfinite_values_fail_closed():
@@ -266,7 +367,7 @@ def test_unknown_fields_paths_commands_and_nonfinite_values_fail_closed():
 
     audit = kinetics.audit_network(network)
 
-    assert {"UNKNOWN_FIELD", "UNSAFE_IDENTIFIER", "NONFINITE_NUMBER"} <= _codes(audit)
+    assert "INVALID_INPUT" in _codes(audit)
 
 
 def test_result_import_is_strict_server_normalized_and_always_diagnostic():
@@ -274,7 +375,7 @@ def test_result_import_is_strict_server_normalized_and_always_diagnostic():
     normalized = kinetics.import_result(
         valid_result(network), network,
         expected_adapter={
-            "id": "vcstudio.catmap-process-adapter", "version": "1",
+            "id": "vcstudio.catmap-process-adapter", "version": "2",
             "tool_sha256": "4" * 64,
         },
     )
@@ -316,13 +417,13 @@ def test_malicious_or_mismatched_results_are_rejected(mutate, match):
         kinetics.import_result(
             result, network,
             expected_adapter={
-                "id": "vcstudio.catmap-process-adapter", "version": "1",
+                "id": "vcstudio.catmap-process-adapter", "version": "2",
                 "tool_sha256": "4" * 64,
             },
         )
 
 
-def test_unconverged_result_remains_visible_but_unavailable():
+def test_reported_converged_flag_is_ignored_and_server_residual_controls_status():
     network = frozen_network()
     result = valid_result(network)
     result["points"][0]["convergence"]["converged"] = False
@@ -330,30 +431,84 @@ def test_unconverged_result_remains_visible_but_unavailable():
     normalized = kinetics.import_result(
         result, network,
         expected_adapter={
-            "id": "vcstudio.catmap-process-adapter", "version": "1",
+            "id": "vcstudio.catmap-process-adapter", "version": "2",
             "tool_sha256": "4" * 64,
         },
     )
 
+    assert normalized["available"] is True
+    assert normalized["points"][0]["convergence"]["reported_converged"] is False
+    result["points"][0]["convergence"].update({
+        "converged": True, "residual": 1.0e-4,
+    })
+    normalized = kinetics.import_result(
+        result, network,
+        expected_adapter={
+            "id": "vcstudio.catmap-process-adapter", "version": "2",
+            "tool_sha256": "4" * 64,
+        },
+    )
     assert normalized["available"] is False
     assert "NUMERICAL_NOT_CONVERGED" in normalized["reason_codes"]
-    assert normalized["points"]
 
 
-def test_missing_sensitivity_evidence_makes_result_unavailable():
+def test_empty_or_self_reported_sensitivity_is_rejected():
     network = frozen_network()
     result = valid_result(network)
     result["sensitivity"] = {
         "status": "unavailable", "analyses": [], "warnings": ["not computed"],
     }
 
+    with pytest.raises(kinetics.KineticsContractError, match="unknown fields"):
+        kinetics.import_result(
+            result, network,
+            expected_adapter={
+                "id": "vcstudio.catmap-process-adapter", "version": "2",
+                "tool_sha256": "4" * 64,
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (lambda r: r["sensitivity"].update({"analyses": []}), "non-empty"),
+        (lambda r: r["sensitivity"]["analyses"][0].update(
+            {"condition_sha256": "0" * 64}), "condition_sha256"),
+        (lambda r: r["sensitivity"]["analyses"][0].update(
+            {"step_id": "invented"}), "frozen steps/points"),
+        (lambda r: r["sensitivity"]["analyses"][0].update(
+            {"perturbation_eV": 0.2}), "frozen step uncertainty"),
+        (lambda r: r["points"][0]["convergence"].update(
+            {"iterations": kinetics.CONVERGENCE_ITERATIONS_MAX + 1}), "iterations"),
+    ],
+)
+def test_result_availability_evidence_is_complete_bounded_and_frozen(mutate, match):
+    network = frozen_network()
+    result = valid_result(network)
+    mutate(result)
+    with pytest.raises(kinetics.KineticsContractError, match=match):
+        kinetics.import_result(
+            result, network,
+            expected_adapter={
+                "id": "vcstudio.catmap-process-adapter", "version": "2",
+                "tool_sha256": "4" * 64,
+            },
+        )
+
+
+def test_sensitivity_status_is_server_derived_from_complete_analysis():
+    network = frozen_network()
+    result = valid_result(network)
+    result["sensitivity"]["analyses"][0]["max_relative_change"] = 1.5
     normalized = kinetics.import_result(
         result, network,
         expected_adapter={
-            "id": "vcstudio.catmap-process-adapter", "version": "1",
+            "id": "vcstudio.catmap-process-adapter", "version": "2",
             "tool_sha256": "4" * 64,
         },
     )
-
-    assert normalized["available"] is False
-    assert "SENSITIVITY_UNAVAILABLE" in normalized["reason_codes"]
+    assert normalized["sensitivity"]["status"] == "warning"
+    assert normalized["sensitivity"]["coverage"] == {
+        "required": 1, "observed": 1, "complete": True,
+    }

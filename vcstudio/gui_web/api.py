@@ -7728,10 +7728,9 @@ class Api:
             return None
         from vcstudio.project import kinetics
 
-        # This call proves the object implements the strict Mapping/Protocol
-        # seam without persisting a second reaction-network DTO.
-        kinetics.compute_input_sha256(value)
-        return value
+        # Materialize one deep-copied, evidence-resolved snapshot.  This is an
+        # ephemeral Protocol value, never a second persistent reaction DTO.
+        return kinetics.canonicalize_kinetics_input(value)
 
     def _kinetics_tool(self):
         from vcstudio.external import catmap_adapter
@@ -7786,7 +7785,9 @@ class Api:
                 else:
                     stored = kinetics_store.load_result(
                         context['project_root'], network,
-                        expected_adapter=self._kinetics_expected_adapter(manifest))
+                        expected_adapter=self._kinetics_expected_adapter(manifest),
+                        confirmed_export_sha256=manifest[
+                            'selected_export_sha256'])
             except catmap_adapter.CatmapAdapterError as exc:
                 # A missing export is expected before the first confirmation;
                 # a tampered export remains unavailable and visible as a warning.
@@ -8081,22 +8082,29 @@ class Api:
                     network, tool_path=paths.get('catmap'),
                     tool_version=(paths.get('catmap_version') or None))
                 preview_sha256 = preview.pop('preview_token')
+                selection = catmap_adapter.export_selection_snapshot(
+                    context['project_root'], preview['input_sha256'])
                 return self._analysis_workbench_public_value({
                     'ok': True, **preview,
                     'preview_sha256': preview_sha256,
+                    'selection_revision': selection['revision'],
+                    'selected_export_sha256': selection[
+                        'selected_export_sha256'],
                     'project_id': context['project_id'], 'error': None,
                 })
 
             return self._call_with_project_bindings([record], build)
         except Exception as exc:                         # noqa: BLE001 public bridge
             return {
-                'ok': False, 'schema': 'vcstudio.catmap-export-preview/v1',
+                'ok': False, 'schema': 'vcstudio.catmap-export-preview/v2',
                 'project_id': None, 'preview_sha256': None,
                 'scientific_status': 'unavailable', 'eligible_final': False,
                 'error': self._analysis_workbench_public_value(str(exc)),
             }
 
-    def kinetics_export_confirm(self, project_id, preview_sha256, confirmed=False):
+    def kinetics_export_confirm(
+            self, project_id, preview_sha256, expected_selection_revision,
+            expected_selected_export_sha256=None, confirmed=False):
         """Confirm one exact preview; output location is server-controlled."""
         try:
             record = self._analysis_workbench_project_record(project_id)
@@ -8112,6 +8120,9 @@ class Api:
                 paths = self._tool_paths()
                 result = catmap_adapter.confirm_export(
                     network, context['project_root'], preview_sha256,
+                    expected_selection_revision=expected_selection_revision,
+                    expected_selected_export_sha256=(
+                        expected_selected_export_sha256 or None),
                     confirmed=confirmed is True,
                     tool_path=paths.get('catmap'),
                     tool_version=(paths.get('catmap_version') or None))
@@ -8122,14 +8133,82 @@ class Api:
             return self._call_with_project_bindings([record], build)
         except Exception as exc:                         # noqa: BLE001 public bridge
             return {
-                'ok': False, 'schema': 'vcstudio.catmap-export-manifest/v1',
+                'ok': False, 'schema': 'vcstudio.catmap-export-manifest/v2',
                 'project_id': None, 'scientific_status': 'unavailable',
                 'eligible_final': False,
                 'error': self._analysis_workbench_public_value(str(exc)),
             }
 
+    def kinetics_audit_export_preview(self, project_id):
+        """Preview an audit-only artifact under a schema distinct from models."""
+        try:
+            record = self._analysis_workbench_project_record(project_id)
+
+            def build():
+                from vcstudio.external import catmap_adapter
+
+                context = self._report_workbench_project_context(record['path'])
+                network = self._kinetics_projection(context)
+                if network is None:
+                    raise ValueError(
+                        'No server-owned frozen kinetics projection is available.')
+                paths = self._tool_paths()
+                preview = catmap_adapter.preview_audit_export(
+                    network, tool_path=paths.get('catmap'),
+                    tool_version=(paths.get('catmap_version') or None))
+                preview_sha256 = preview.pop('preview_token')
+                return self._analysis_workbench_public_value({
+                    'ok': True, **preview, 'preview_sha256': preview_sha256,
+                    'project_id': context['project_id'], 'error': None,
+                })
+
+            return self._call_with_project_bindings([record], build)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return {
+                'ok': False,
+                'schema': 'vcstudio.kinetics-audit-export-preview/v1',
+                'project_id': None, 'preview_sha256': None,
+                'model_published': False, 'scientific_status': 'unavailable',
+                'eligible_final': False,
+                'error': self._analysis_workbench_public_value(str(exc)),
+            }
+
+    def kinetics_audit_export_confirm(
+            self, project_id, preview_sha256, confirmed=False):
+        """Publish only the audit report; never report a model publication."""
+        try:
+            record = self._analysis_workbench_project_record(project_id)
+
+            def build():
+                from vcstudio.external import catmap_adapter
+
+                context = self._report_workbench_project_context(record['path'])
+                network = self._kinetics_projection(context)
+                if network is None:
+                    raise ValueError(
+                        'No server-owned frozen kinetics projection is available.')
+                paths = self._tool_paths()
+                result = catmap_adapter.confirm_audit_export(
+                    network, context['project_root'], preview_sha256,
+                    confirmed=confirmed is True,
+                    tool_path=paths.get('catmap'),
+                    tool_version=(paths.get('catmap_version') or None))
+                return self._analysis_workbench_public_value({
+                    **result, 'project_id': context['project_id'], 'error': None,
+                })
+
+            return self._call_with_project_bindings([record], build)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return {
+                'ok': False,
+                'schema': 'vcstudio.kinetics-audit-export-manifest/v1',
+                'project_id': None, 'model_published': False,
+                'scientific_status': 'unavailable', 'eligible_final': False,
+                'error': self._analysis_workbench_public_value(str(exc)),
+            }
+
     def kinetics_result_import(self, project_id, result):
-        """Validate a data object; paths and commands are never accepted."""
+        """Validate/upload a data object; uploading never selects it."""
         try:
             record = self._analysis_workbench_project_record(project_id)
 
@@ -8152,7 +8231,11 @@ class Api:
                         'Configured CatMAP identity does not match the confirmed export.')
                 stored = kinetics_store.store_result(
                     context['project_root'], result, network,
-                    expected_adapter=self._kinetics_expected_adapter(manifest))
+                    expected_adapter=self._kinetics_expected_adapter(manifest),
+                    confirmed_export_sha256=manifest[
+                        'selected_export_sha256'])
+                selection = kinetics_store.selection_snapshot(
+                    context['project_root'], network)
                 normalized = stored['normalized']
                 return self._analysis_workbench_public_value({
                     'ok': True,
@@ -8160,6 +8243,11 @@ class Api:
                     'project_id': context['project_id'],
                     'input_sha256': stored['input_sha256'],
                     'result_sha256': stored['result_sha256'],
+                    'confirmed_export_sha256': stored[
+                        'confirmed_export_sha256'],
+                    'selected': False,
+                    'selection_revision': selection['revision'],
+                    'latest_result_sha256': selection['latest_result_sha256'],
                     'scientific_status': 'diagnostic',
                     'eligible_final': False,
                     'available': normalized.get('available') is True,
@@ -8171,8 +8259,62 @@ class Api:
             return self._call_with_project_bindings([record], build)
         except Exception as exc:                         # noqa: BLE001 public bridge
             return {
-                'ok': False, 'schema': 'vcstudio.kinetics-result-receipt/v1',
+                'ok': False, 'schema': 'vcstudio.kinetics-result-receipt/v2',
                 'project_id': None, 'input_sha256': None, 'result_sha256': None,
+                'scientific_status': 'unavailable', 'eligible_final': False,
+                'error': self._analysis_workbench_public_value(str(exc)),
+            }
+
+    def kinetics_result_select(
+            self, project_id, result_sha256, confirmed_export_sha256,
+            expected_latest_sha256, expected_revision, confirmed=False):
+        """Explicitly select one uploaded result using revision+hash CAS."""
+        try:
+            record = self._analysis_workbench_project_record(project_id)
+
+            def build():
+                from vcstudio.external import catmap_adapter
+                from vcstudio.project import kinetics, kinetics_store
+
+                context = self._report_workbench_project_context(record['path'])
+                network = self._kinetics_projection(context)
+                if network is None:
+                    raise ValueError(
+                        'No server-owned frozen kinetics projection is available.')
+                audit = kinetics.audit_network(network)
+                manifest = catmap_adapter.load_confirmed_manifest(
+                    context['project_root'], audit['input_sha256'])
+                if manifest['selected_export_sha256'] != confirmed_export_sha256:
+                    raise ValueError('Confirmed export selection changed.')
+                if not self._kinetics_tool_matches(manifest, self._kinetics_tool()):
+                    raise ValueError(
+                        'Configured CatMAP identity does not match the confirmed export.')
+                selected = kinetics_store.select_result(
+                    context['project_root'], result_sha256, network,
+                    confirmed_export_sha256=confirmed_export_sha256,
+                    expected_latest_sha256=(expected_latest_sha256 or None),
+                    expected_revision=expected_revision,
+                    confirmed=confirmed is True,
+                    expected_adapter=self._kinetics_expected_adapter(manifest))
+                return self._analysis_workbench_public_value({
+                    'ok': True, 'schema': kinetics_store.SELECTION_SCHEMA,
+                    'project_id': context['project_id'],
+                    'input_sha256': selected['input_sha256'],
+                    'result_sha256': selected['result_sha256'],
+                    'confirmed_export_sha256': confirmed_export_sha256,
+                    'selected': True,
+                    'selection_revision': selected['selection_revision'],
+                    'latest_result_sha256': selected['latest_result_sha256'],
+                    'scientific_status': 'diagnostic', 'eligible_final': False,
+                    'error': None,
+                })
+
+            return self._call_with_project_bindings([record], build)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return {
+                'ok': False,
+                'schema': 'vcstudio.kinetics-result-selection/v1',
+                'project_id': None, 'selected': False,
                 'scientific_status': 'unavailable', 'eligible_final': False,
                 'error': self._analysis_workbench_public_value(str(exc)),
             }

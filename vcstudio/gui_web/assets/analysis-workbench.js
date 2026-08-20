@@ -37,7 +37,9 @@
     busy: false, dirty: false, busyToken: 0, intentGeneration: 0,
     bootstrapGeneration: 0, previewGeneration: 0,
     preferenceRevision: null, preferences: null,
-    kineticsPreviewSha: '',
+    kineticsPreviewSha: '', kineticsSelectionRevision: null,
+    kineticsSelectedExportSha: '', kineticsAuditPreviewSha: '',
+    kineticsUploadedResult: null,
   };
 
   function plain(value) {
@@ -745,12 +747,21 @@
   function renderKineticsActions() {
     const box = $('aw-kinetics-actions'); if (!box) return;
     const active = State.analysisId === 'kinetic-dashboard'; box.hidden = !active;
-    if (!active) State.kineticsPreviewSha = '';
+    if (!active) {
+      State.kineticsPreviewSha = ''; State.kineticsAuditPreviewSha = '';
+      State.kineticsUploadedResult = null;
+    }
     const preview = $('aw-kinetics-preview-export');
     const confirm = $('aw-kinetics-confirm-export');
+    const auditPreview = $('aw-kinetics-preview-audit');
+    const auditConfirm = $('aw-kinetics-confirm-audit');
+    const resultSelect = $('aw-kinetics-select-result');
     const file = $('aw-kinetics-result-file');
     if (preview) preview.disabled = !active || State.busy || !State.projectId;
     if (confirm) confirm.disabled = !active || State.busy || !State.kineticsPreviewSha;
+    if (auditPreview) auditPreview.disabled = !active || State.busy || !State.projectId;
+    if (auditConfirm) auditConfirm.disabled = !active || State.busy || !State.kineticsAuditPreviewSha;
+    if (resultSelect) resultSelect.disabled = !active || State.busy || !State.kineticsUploadedResult;
     if (file) file.disabled = !active || State.busy || !State.projectId;
   }
 
@@ -807,6 +818,7 @@
         !sameProject(State.projectId)) return false;
     const projectId = State.projectId; const intent = ++State.intentGeneration;
     const busyToken = beginBusy(); State.kineticsPreviewSha = '';
+    State.kineticsSelectionRevision = null; State.kineticsSelectedExportSha = '';
     kineticsOperation(tr('analysis.kinetic.preview_loading',
       '正在审计并生成固定导出预览…'), 'busy'); renderAll();
     try {
@@ -816,10 +828,25 @@
         'analysis.kinetic.preview_failed', 'CatMAP 导出预览失败。'));
       if (safeId(result.project_id) !== projectId) throw new Error(tr(
         'analysis.error.project_mismatch', '分析结果项目身份与当前项目不一致'));
+      if (result.schema !== 'vcstudio.catmap-export-preview/v2' ||
+          result.export_kind !== 'model' || result.export_ready !== true) {
+        kineticsOperation(tr('analysis.kinetic.model_unavailable',
+          '模型导出不可用；可独立预览并导出审计报告。'), 'bad');
+        return false;
+      }
       const previewSha = String(result.preview_sha256 || '');
       if (!/^[a-f0-9]{64}$/.test(previewSha)) throw new Error(tr(
         'analysis.kinetic.preview_hash_invalid', '服务端未返回有效的固定预览哈希。'));
       State.kineticsPreviewSha = previewSha;
+      State.kineticsSelectionRevision = Number(result.selection_revision);
+      State.kineticsSelectedExportSha = String(result.selected_export_sha256 || '');
+      if (!Number.isInteger(State.kineticsSelectionRevision) ||
+          State.kineticsSelectionRevision < 0 ||
+          (State.kineticsSelectedExportSha &&
+           !/^[a-f0-9]{64}$/.test(State.kineticsSelectedExportSha))) {
+        throw new Error(tr('analysis.kinetic.selection_invalid',
+          '服务端未返回有效的导出选择版本。'));
+      }
       const names = (Array.isArray(result.artifacts) ? result.artifacts : [])
         .map(item => String(item && item.name || '')).filter(Boolean).join(', ');
       kineticsOperation(`${tr('analysis.kinetic.preview_ready',
@@ -828,6 +855,7 @@
     } catch (error) {
       if (intent !== State.intentGeneration) return false;
       State.kineticsPreviewSha = '';
+      State.kineticsSelectionRevision = null; State.kineticsSelectedExportSha = '';
       kineticsOperation(error && error.message || String(error), 'bad'); return false;
     } finally { endBusy(busyToken); }
   }
@@ -846,19 +874,83 @@
     renderAll();
     try {
       const result = await VCS.call(
-        'kinetics_export_confirm', projectId, previewSha, true);
+        'kinetics_export_confirm', projectId, previewSha,
+        State.kineticsSelectionRevision, State.kineticsSelectedExportSha || null, true);
       if (intent !== State.intentGeneration || !sameProject(projectId)) return false;
       if (!result || result.ok === false || result.error) throw new Error(result && result.error || tr(
         'analysis.kinetic.confirm_failed', '固定导出包发布失败。'));
       if (safeId(result.project_id) !== projectId) throw new Error(tr(
         'analysis.error.project_mismatch', '分析结果项目身份与当前项目不一致'));
       State.kineticsPreviewSha = '';
+      State.kineticsSelectionRevision = null; State.kineticsSelectedExportSha = '';
       kineticsOperation(tr('analysis.kinetic.confirmed',
         '已发布固定导出包；应用未执行 CatMAP。'), 'ok');
       return true;
     } catch (error) {
       if (intent !== State.intentGeneration) return false;
       kineticsOperation(error && error.message || String(error), 'bad'); return false;
+    } finally { endBusy(busyToken); }
+  }
+
+  async function previewKineticsAudit() {
+    if (State.busy || State.analysisId !== 'kinetic-dashboard' ||
+        !sameProject(State.projectId)) return false;
+    const projectId = State.projectId; const intent = ++State.intentGeneration;
+    const busyToken = beginBusy(); State.kineticsAuditPreviewSha = '';
+    kineticsOperation(tr('analysis.kinetic.audit_preview_loading',
+      '正在生成独立审计报告预览…'), 'busy'); renderAll();
+    try {
+      const result = await VCS.call('kinetics_audit_export_preview', projectId);
+      if (intent !== State.intentGeneration || !sameProject(projectId)) return false;
+      if (!result || result.ok === false || result.error ||
+          result.schema !== 'vcstudio.kinetics-audit-export-preview/v1' ||
+          result.export_kind !== 'audit_report' || result.model_published !== false) {
+        throw new Error(result && result.error || tr(
+          'analysis.kinetic.audit_preview_failed', '审计报告预览失败。'));
+      }
+      const sha = String(result.preview_sha256 || '');
+      if (!/^[a-f0-9]{64}$/.test(sha)) throw new Error(tr(
+        'analysis.kinetic.preview_hash_invalid', '服务端未返回有效的固定预览哈希。'));
+      State.kineticsAuditPreviewSha = sha;
+      kineticsOperation(tr('analysis.kinetic.audit_preview_ready',
+        '审计报告预览已冻结；它不会发布模型。'), 'ok');
+      renderAll(); return true;
+    } catch (error) {
+      if (intent === State.intentGeneration) {
+        State.kineticsAuditPreviewSha = '';
+        kineticsOperation(error && error.message || String(error), 'bad');
+      }
+      return false;
+    } finally { endBusy(busyToken); }
+  }
+
+  async function confirmKineticsAudit() {
+    const sha = State.kineticsAuditPreviewSha;
+    if (State.busy || !/^[a-f0-9]{64}$/.test(sha) ||
+        !sameProject(State.projectId)) return false;
+    if (!window.confirm(tr('analysis.kinetic.audit_confirm_prompt',
+      '确认只导出审计报告（不会发布 CatMAP 模型）？'))) return false;
+    const projectId = State.projectId; const intent = ++State.intentGeneration;
+    const busyToken = beginBusy(); renderAll();
+    try {
+      const result = await VCS.call(
+        'kinetics_audit_export_confirm', projectId, sha, true);
+      if (intent !== State.intentGeneration || !sameProject(projectId)) return false;
+      if (!result || result.ok === false || result.error ||
+          result.model_published !== false ||
+          result.audit_export_status !== 'published') {
+        throw new Error(result && result.error || tr(
+          'analysis.kinetic.audit_confirm_failed', '审计报告导出失败。'));
+      }
+      State.kineticsAuditPreviewSha = '';
+      kineticsOperation(tr('analysis.kinetic.audit_confirmed',
+        '审计报告已导出；没有模型被发布。'), 'ok');
+      return true;
+    } catch (error) {
+      if (intent === State.intentGeneration) {
+        kineticsOperation(error && error.message || String(error), 'bad');
+      }
+      return false;
     } finally { endBusy(busyToken); }
   }
 
@@ -872,7 +964,7 @@
         '结果 JSON 必须非空且不超过 20 MiB。'), 'bad'); input.value = ''; return false;
     }
     const projectId = State.projectId; const intent = ++State.intentGeneration;
-    const busyToken = beginBusy(); let imported = false;
+    const busyToken = beginBusy(); State.kineticsUploadedResult = null;
     kineticsOperation(tr('analysis.kinetic.import_loading',
       '正在由服务端校验 schema、单位与冻结输入哈希…'), 'busy'); renderAll();
     try {
@@ -887,9 +979,23 @@
         'analysis.kinetic.import_failed', '动力学结果导入失败。'));
       if (safeId(result.project_id) !== projectId) throw new Error(tr(
         'analysis.error.project_mismatch', '分析结果项目身份与当前项目不一致'));
+      if (result.selected !== false) throw new Error(tr(
+        'analysis.kinetic.upload_selection_invalid', '上传接口错误地选择了结果。'));
+      State.kineticsUploadedResult = {
+        resultSha: String(result.result_sha256 || ''),
+        exportSha: String(result.confirmed_export_sha256 || ''),
+        latestSha: String(result.latest_result_sha256 || ''),
+        revision: Number(result.selection_revision),
+      };
+      if (!/^[a-f0-9]{64}$/.test(State.kineticsUploadedResult.resultSha) ||
+          !/^[a-f0-9]{64}$/.test(State.kineticsUploadedResult.exportSha) ||
+          !Number.isInteger(State.kineticsUploadedResult.revision)) {
+        throw new Error(tr('analysis.kinetic.upload_receipt_invalid',
+          '服务端上传回执无效。'));
+      }
       kineticsOperation(tr('analysis.kinetic.imported',
-        '结果已校验并保存为 diagnostic；正在刷新 Dashboard。'), 'ok');
-      imported = true;
+        '结果已校验并上传，但尚未选择为当前 diagnostic 结果。'), 'ok');
+      renderAll();
     } catch (error) {
       if (intent === State.intentGeneration) {
         kineticsOperation(error && error.message || String(error), 'bad');
@@ -897,8 +1003,35 @@
     } finally {
       input.value = ''; endBusy(busyToken);
     }
-    if (imported) return previewCurrent();
-    return false;
+    return !!State.kineticsUploadedResult;
+  }
+
+  async function selectKineticsResult() {
+    const uploaded = State.kineticsUploadedResult;
+    if (!uploaded || State.busy || !sameProject(State.projectId)) return false;
+    if (!window.confirm(tr('analysis.kinetic.result_select_prompt',
+      '将这份已上传结果选择为当前 diagnostic Dashboard 结果？'))) return false;
+    const projectId = State.projectId; const intent = ++State.intentGeneration;
+    const busyToken = beginBusy(); renderAll();
+    try {
+      const result = await VCS.call(
+        'kinetics_result_select', projectId, uploaded.resultSha, uploaded.exportSha,
+        uploaded.latestSha || null, uploaded.revision, true);
+      if (intent !== State.intentGeneration || !sameProject(projectId)) return false;
+      if (!result || result.ok === false || result.error || result.selected !== true) {
+        throw new Error(result && result.error || tr(
+          'analysis.kinetic.result_select_failed', '结果选择失败。'));
+      }
+      State.kineticsUploadedResult = null;
+      kineticsOperation(tr('analysis.kinetic.result_selected',
+        '结果已通过 CAS 选择；正在刷新 Dashboard。'), 'ok');
+    } catch (error) {
+      if (intent === State.intentGeneration) {
+        kineticsOperation(error && error.message || String(error), 'bad');
+      }
+      return false;
+    } finally { endBusy(busyToken); }
+    return previewCurrent();
   }
 
   async function loadBootstrap(analysisId) {
@@ -907,7 +1040,8 @@
       operation(tr('analysis.bootstrap.waiting_context', '等待项目上下文。'), 'bad'); return false; }
     const intent = ++State.intentGeneration; const generation = ++State.bootstrapGeneration;
     State.previewGeneration += 1; const busyToken = beginBusy();
-    State.kineticsPreviewSha = '';
+    State.kineticsPreviewSha = ''; State.kineticsAuditPreviewSha = '';
+    State.kineticsUploadedResult = null;
     State.projectId = id;
     State.analysisId = safeId(analysisId) || 'adsorption-energy'; showAlert('');
     operation(tr('analysis.bootstrap.loading', '正在读取分析注册表与项目证据…'), 'busy'); renderAll();
@@ -1024,6 +1158,15 @@
     if ($('aw-kinetics-confirm-export')) {
       $('aw-kinetics-confirm-export').addEventListener('click', confirmKineticsExport);
     }
+    if ($('aw-kinetics-preview-audit')) {
+      $('aw-kinetics-preview-audit').addEventListener('click', previewKineticsAudit);
+    }
+    if ($('aw-kinetics-confirm-audit')) {
+      $('aw-kinetics-confirm-audit').addEventListener('click', confirmKineticsAudit);
+    }
+    if ($('aw-kinetics-select-result')) {
+      $('aw-kinetics-select-result').addEventListener('click', selectKineticsResult);
+    }
     if ($('aw-kinetics-result-file')) {
       $('aw-kinetics-result-file').addEventListener('change', importKineticsResult);
     }
@@ -1046,16 +1189,21 @@
       renderRegistry,
       renderKineticDashboard,
       renderSensitivity,
-      configure({ catalog = null, preferences = null, analysisId = '', busy = false } = {}) {
+      previewKineticsExport,
+      configure({ catalog = null, preferences = null, analysisId = '',
+        projectId = '', busy = false } = {}) {
         State.catalog = clone(catalog);
         State.preferences = clone(preferences) || {};
         State.analysisId = String(analysisId || '');
+        State.projectId = String(projectId || '');
         State.busy = busy === true;
       },
       snapshot() {
         return {
           analysis_id: State.analysisId,
+          project_id: State.projectId,
           busy: State.busy,
+          kinetics_preview_sha256: State.kineticsPreviewSha,
           catalog: clone(State.catalog),
         };
       },

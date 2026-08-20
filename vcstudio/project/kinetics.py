@@ -2,8 +2,8 @@
 
 This module deliberately does not define or persist a reaction-network domain
 model.  The Reaction Map/Catalysis Model layers remain authoritative.  Kinetics
-consumes either a read-only mapping or a structural ``KineticsInputProvider``
-and audits one frozen projection before an external adapter may use it.
+accepts only a server-injected structural ``KineticsInputProvider`` and audits
+one evidence-resolved frozen projection before an external adapter may use it.
 
 No solver is imported here.  Imported results remain diagnostic and can never
 open an accepted/final publication gate.
@@ -16,14 +16,24 @@ import json
 import math
 import re
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
 
-NETWORK_SCHEMA = "vcstudio.kinetics-network/v1"
-AUDIT_SCHEMA = "vcstudio.kinetics-audit/v1"
-RESULT_SCHEMA = "vcstudio.kinetics-result/v1"
-NORMALIZED_RESULT_SCHEMA = "vcstudio.kinetics-normalized-result/v1"
+NETWORK_SCHEMA = "vcstudio.kinetics-network/v2"
+AUDIT_SCHEMA = "vcstudio.kinetics-audit/v2"
+RESULT_SCHEMA = "vcstudio.kinetics-result/v2"
+NORMALIZED_RESULT_SCHEMA = "vcstudio.kinetics-normalized-result/v2"
+SOURCE_PROJECTION_PROTOCOLS = frozenset({
+    ("vcstudio.frozen-reaction-network/v1", "1"),
+    ("vcstudio.reaction-domain-projection/v1", "1"),
+})
+_SOURCE_PROJECTION_HASH_FIELDS = {
+    ("vcstudio.frozen-reaction-network/v1", "1"): "frozen_network_sha256",
+    ("vcstudio.reaction-domain-projection/v1", "1"): "projection_sha256",
+}
+CONVERGENCE_RESIDUAL_MAX = 1.0e-8
+CONVERGENCE_ITERATIONS_MAX = 1_000_000
 
 RESULT_UNITS = {
     "temperature": "K",
@@ -69,6 +79,8 @@ _SECRET_RE = re.compile(
 _PATH_RE = re.compile(r"(?i)(?:^[A-Z]:[\\/]|^\\\\|^/|^~[\\/]|\.\.[\\/]|file:)")
 _BARRIER_TOL_EV = 1.0e-3
 _BALANCE_TOL = 1.0e-8
+_MAX_EVIDENCE_BYTES = 64 * 1024 * 1024
+_CANONICAL_INPUT_SEAL = object()
 
 
 class KineticsContractError(ValueError):
@@ -82,19 +94,37 @@ class KineticsInputProvider(Protocol):
     def kinetics_input(self) -> Mapping[str, Any]:
         """Return one immutable-by-convention kinetics projection mapping."""
 
+    def kinetics_evidence(self, reference: str) -> bytes:
+        """Resolve an opaque evidence reference to the authoritative bytes."""
 
-def _as_mapping(source: Mapping[str, Any] | KineticsInputProvider) -> dict[str, Any]:
-    if isinstance(source, Mapping):
-        value = source
-    else:
-        provider = getattr(source, "kinetics_input", None)
-        if not callable(provider):
+    def canonical_source_projection(self) -> Mapping[str, Any]:
+        """Return the authoritative upstream frozen projection before adaptation."""
+
+
+class CanonicalKineticsInput(Mapping[str, Any]):
+    """Ephemeral verified projection; never a second persistent domain DTO."""
+
+    def __init__(self, value: Mapping[str, Any], *, _seal=None):
+        if _seal is not _CANONICAL_INPUT_SEAL:
             raise KineticsContractError(
-                "kinetics input must be a mapping or KineticsInputProvider")
-        value = provider()
-    if not isinstance(value, Mapping):
-        raise KineticsContractError("KineticsInputProvider must return a mapping")
-    return copy.deepcopy(dict(value))
+                "canonical kinetics inputs may only be created by a trusted provider")
+        self._value = copy.deepcopy(dict(value))
+
+    def __getitem__(self, key: str) -> Any:
+        return copy.deepcopy(self._value[key])
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._value)
+
+    def __len__(self) -> int:
+        return len(self._value)
+
+    def to_mapping(self) -> dict[str, Any]:
+        return copy.deepcopy(self._value)
+
+
+def _as_mapping(source: CanonicalKineticsInput | KineticsInputProvider) -> dict[str, Any]:
+    return canonicalize_kinetics_input(source).to_mapping()
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -107,9 +137,188 @@ def _canonical_bytes(value: Any) -> bytes:
 def compute_input_sha256(
         source: Mapping[str, Any] | KineticsInputProvider) -> str:
     """Hash an exact adapter projection, excluding its self-declared hash."""
-    value = _as_mapping(source)
+    if isinstance(source, CanonicalKineticsInput):
+        value = source.to_mapping()
+    elif isinstance(source, Mapping):
+        value = copy.deepcopy(dict(source))
+    else:
+        value = canonicalize_kinetics_input(source).to_mapping()
     value.pop("input_sha256", None)
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def compute_source_projection_sha256(source: Mapping[str, Any]) -> str:
+    """Hash an authoritative upstream projection under its whitelisted policy."""
+    if not isinstance(source, Mapping):
+        raise KineticsContractError("source projection hash input must be a mapping")
+    value = copy.deepcopy(dict(source))
+    identity = (value.get("schema"), value.get("version"))
+    hash_field = _SOURCE_PROJECTION_HASH_FIELDS.get(identity)
+    if hash_field is None:
+        raise KineticsContractError("source projection schema/version is not trusted")
+    value.pop(hash_field, None)
+    try:
+        return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+    except (TypeError, ValueError) as exc:
+        raise KineticsContractError(
+            "projection must be canonical JSON without non-finite numbers") from exc
+
+
+def compute_projection_sha256(source: KineticsInputProvider) -> str:
+    """Compatibility name for hashing a provider's authoritative projection."""
+    loader = getattr(source, "canonical_source_projection", None)
+    if not callable(loader):
+        raise KineticsContractError(
+            "projection hash requires a trusted KineticsInputProvider")
+    return compute_source_projection_sha256(loader())
+
+
+def compute_condition_sha256(conditions: Mapping[str, Any]) -> str:
+    """Bind a sensitivity record to one exact normalized condition point."""
+    if not isinstance(conditions, Mapping):
+        raise KineticsContractError("conditions must be a mapping")
+    try:
+        return hashlib.sha256(_canonical_bytes(dict(conditions))).hexdigest()
+    except (TypeError, ValueError) as exc:
+        raise KineticsContractError(
+            "conditions must be canonical JSON without non-finite numbers") from exc
+
+
+def canonicalize_kinetics_input(
+        source: CanonicalKineticsInput | KineticsInputProvider,
+        ) -> CanonicalKineticsInput:
+    """Rebuild hashes and evidence bindings through a trusted provider seam."""
+    if isinstance(source, CanonicalKineticsInput):
+        return source
+    input_loader = getattr(source, "kinetics_input", None)
+    evidence_loader = getattr(source, "kinetics_evidence", None)
+    source_loader = getattr(source, "canonical_source_projection", None)
+    if (not callable(input_loader) or not callable(evidence_loader)
+            or not callable(source_loader)):
+        if isinstance(source, Mapping):
+            raise KineticsContractError(
+                "raw kinetics mappings are untrusted; a KineticsInputProvider is required")
+        raise KineticsContractError(
+            "trusted KineticsInputProvider must supply source, input, and evidence resolvers")
+    try:
+        upstream_raw = source_loader()
+    except Exception as exc:  # noqa: BLE001 trusted seam must fail closed
+        raise KineticsContractError(
+            "canonical source projection could not be resolved") from exc
+    if not isinstance(upstream_raw, Mapping):
+        raise KineticsContractError(
+            "canonical_source_projection must return a mapping")
+    upstream = copy.deepcopy(dict(upstream_raw))
+    upstream_identity = (upstream.get("schema"), upstream.get("version"))
+    upstream_hash_field = _SOURCE_PROJECTION_HASH_FIELDS.get(upstream_identity)
+    if upstream_hash_field is None:
+        raise KineticsContractError("source projection schema/version is not trusted")
+    upstream_declared_hash = upstream.get(upstream_hash_field)
+    upstream_computed_hash = compute_source_projection_sha256(upstream)
+    if upstream_declared_hash != upstream_computed_hash:
+        raise KineticsContractError(
+            "authoritative source projection hash does not match its canonical bytes")
+    try:
+        raw = input_loader()
+    except Exception as exc:  # noqa: BLE001 trusted seam must fail closed
+        raise KineticsContractError("kinetics projection could not be resolved") from exc
+    if not isinstance(raw, Mapping):
+        raise KineticsContractError("KineticsInputProvider must return a mapping")
+    value = copy.deepcopy(dict(raw))
+    projection = value.get("source_projection")
+    if not isinstance(projection, Mapping):
+        raise KineticsContractError("source_projection must be an object")
+    projection = dict(projection)
+    if set(projection) != {
+            "schema", "version", "projection_sha256", "evidence_refs"}:
+        raise KineticsContractError("source_projection fields do not match the protocol")
+    identity = (projection.get("schema"), projection.get("version"))
+    if identity not in SOURCE_PROJECTION_PROTOCOLS:
+        raise KineticsContractError("source projection schema/version is not trusted")
+    if identity != upstream_identity:
+        raise KineticsContractError(
+            "adapted source projection identity does not match the provider source")
+    refs = projection.get("evidence_refs")
+    if (isinstance(refs, (str, bytes)) or not isinstance(refs, Sequence)
+            or not 1 <= len(refs) <= 256):
+        raise KineticsContractError(
+            "source projection requires bounded artifact evidence references")
+    seen = set()
+    resolved_artifacts: dict[str, str] = {}
+
+    def resolve(reference: str, digest: str) -> None:
+        prior = resolved_artifacts.get(reference)
+        if prior is not None:
+            if prior != digest:
+                raise KineticsContractError(
+                    f"conflicting artifact hashes for evidence reference {reference}")
+            return
+        try:
+            artifact = evidence_loader(reference)
+        except Exception as exc:  # noqa: BLE001 opaque evidence boundary
+            raise KineticsContractError(
+                f"evidence reference {reference} could not be resolved") from exc
+        if not isinstance(artifact, (bytes, bytearray, memoryview)):
+            raise KineticsContractError(
+                "trusted evidence resolver must return artifact bytes")
+        artifact_bytes = bytes(artifact)
+        if not artifact_bytes or len(artifact_bytes) > _MAX_EVIDENCE_BYTES:
+            raise KineticsContractError("resolved evidence artifact has an invalid size")
+        actual = hashlib.sha256(artifact_bytes).hexdigest()
+        if actual != digest:
+            raise KineticsContractError(
+                f"resolved evidence artifact hash mismatch for {reference}")
+        resolved_artifacts[reference] = actual
+
+    for index, item in enumerate(refs):
+        if not isinstance(item, Mapping) or set(item) != {
+                "reference", "artifact_sha256"}:
+            raise KineticsContractError(
+                f"source_projection.evidence_refs[{index}] is invalid")
+        reference = item.get("reference")
+        digest = item.get("artifact_sha256")
+        local_issues: list[dict[str, str]] = []
+        if _safe_text(reference, f"source_projection.evidence_refs[{index}].reference",
+                      local_issues) is None:
+            raise KineticsContractError(
+                f"source_projection.evidence_refs[{index}].reference is unsafe")
+        if reference in seen:
+            raise KineticsContractError("source projection evidence references must be unique")
+        seen.add(reference)
+        if not isinstance(digest, str) or not _HEX_RE.fullmatch(digest):
+            raise KineticsContractError(
+                f"source_projection.evidence_refs[{index}].artifact_sha256 is invalid")
+        resolve(reference, digest)
+
+    def verify_source_records(node: Any, path: str = "$") -> None:
+        if isinstance(node, Mapping):
+            if set(node) == _SOURCE_KEYS:
+                reference = node.get("reference")
+                digest = node.get("evidence_sha256")
+                if not isinstance(reference, str) or reference not in seen:
+                    raise KineticsContractError(
+                        f"{path}.reference is not declared by source_projection")
+                if not isinstance(digest, str) or not _HEX_RE.fullmatch(digest):
+                    raise KineticsContractError(f"{path}.evidence_sha256 is invalid")
+                resolve(reference, digest)
+            for key, item in node.items():
+                verify_source_records(item, f"{path}.{key}")
+        elif isinstance(node, Sequence) and not isinstance(node, (str, bytes)):
+            for index, item in enumerate(node):
+                verify_source_records(item, f"{path}[{index}]")
+
+    verify_source_records(value)
+    if projection.get("projection_sha256") != upstream_computed_hash:
+        raise KineticsContractError(
+            "source projection hash does not match the canonical provider projection")
+    if copy.deepcopy(list(refs)) != copy.deepcopy(upstream.get("evidence_refs")):
+        raise KineticsContractError(
+            "adapted evidence references do not match the provider source projection")
+    computed_input = compute_input_sha256(value)
+    if value.get("input_sha256") != computed_input:
+        raise KineticsContractError(
+            "input hash does not match the canonical provider projection")
+    return CanonicalKineticsInput(value, _seal=_CANONICAL_INPUT_SEAL)
 
 
 def _issue(issues: list[dict[str, str]], code: str, path: str, message: str,
@@ -709,7 +918,7 @@ def _audit_connectivity(feeds: Sequence[str], targets: Sequence[str],
 
 
 def audit_network(
-        source: Mapping[str, Any] | KineticsInputProvider) -> dict[str, Any]:
+        source: CanonicalKineticsInput | KineticsInputProvider) -> dict[str, Any]:
     """Audit a frozen reaction/thermochemistry projection without solving it."""
     issues: list[dict[str, str]] = []
     try:
@@ -740,11 +949,16 @@ def audit_network(
         "schema", "version", "projection_sha256", "evidence_refs",
     })
     if _unknown_fields(projection, projection_keys, "source_projection", issues):
-        _safe_text(projection.get("schema"), "source_projection.schema", issues)
+        schema = _safe_text(
+            projection.get("schema"), "source_projection.schema", issues)
         version = projection.get("version")
         if not isinstance(version, str) or not _VERSION_RE.fullmatch(version):
             _issue(issues, "UNSAFE_IDENTIFIER", "source_projection.version",
                    "source_projection.version must be a safe version token")
+        elif (schema, version) not in SOURCE_PROJECTION_PROTOCOLS:
+            _issue(issues, "UNSUPPORTED_SOURCE_PROJECTION",
+                   "source_projection",
+                   "source projection schema/version is not trusted")
         _sha(projection.get("projection_sha256"),
              "source_projection.projection_sha256", issues)
         refs = projection.get("evidence_refs")
@@ -754,7 +968,13 @@ def audit_network(
                    "source projection requires bounded evidence references")
         else:
             for index, reference in enumerate(refs):
-                _safe_text(reference, f"source_projection.evidence_refs[{index}]", issues)
+                path = f"source_projection.evidence_refs[{index}]"
+                if _unknown_fields(
+                        reference, frozenset({"reference", "artifact_sha256"}),
+                        path, issues):
+                    _safe_text(reference.get("reference"), f"{path}.reference", issues)
+                    _sha(reference.get("artifact_sha256"),
+                         f"{path}.artifact_sha256", issues)
 
     _audit_assumptions(network.get("assumptions"), issues)
     _audit_standard_state(network.get("standard_state"), issues)
@@ -1031,9 +1251,11 @@ def _normalize_point(raw: Any, index: int, network: Mapping[str, Any]) -> dict[s
     residual = _result_number(
         convergence.get("residual"), f"{path}.convergence.residual", minimum=0.0)
     iterations = convergence.get("iterations")
-    if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations < 0:
+    if (isinstance(iterations, bool) or not isinstance(iterations, int)
+            or not 0 <= iterations <= CONVERGENCE_ITERATIONS_MAX):
         raise KineticsContractError(
-            f"{path}.convergence.iterations must be a non-negative integer")
+            f"{path}.convergence.iterations must be between 0 and "
+            f"{CONVERGENCE_ITERATIONS_MAX}")
     solver = _result_identifier(
         convergence.get("solver"), f"{path}.convergence.solver")
     return {
@@ -1045,31 +1267,86 @@ def _normalize_point(raw: Any, index: int, network: Mapping[str, Any]) -> dict[s
         "apparent_activation_energy": apparent,
         "free_energy_diagram": free_energy,
         "convergence": {
-            "converged": convergence["converged"], "residual": residual,
+            "converged": residual <= CONVERGENCE_RESIDUAL_MAX,
+            "reported_converged": convergence["converged"], "residual": residual,
+            "residual_threshold": CONVERGENCE_RESIDUAL_MAX,
+            "iteration_threshold": CONVERGENCE_ITERATIONS_MAX,
             "iterations": iterations, "solver": solver,
         },
     }
 
 
-def _normalize_sensitivity(value: Any) -> dict[str, Any]:
-    result = _strict_object(value, {"status", "analyses", "warnings"}, "sensitivity")
-    status = result.get("status")
-    if status not in {"passed", "warning", "unavailable"}:
-        raise KineticsContractError("sensitivity.status is unsupported")
+def _normalize_sensitivity(
+        value: Any, points: Sequence[Mapping[str, Any]],
+        network: Mapping[str, Any]) -> dict[str, Any]:
+    result = _strict_object(value, {"analyses", "warnings"}, "sensitivity")
     analyses = result.get("analyses")
-    if isinstance(analyses, (str, bytes)) or not isinstance(analyses, Sequence):
-        raise KineticsContractError("sensitivity.analyses must be an array")
+    if (isinstance(analyses, (str, bytes)) or not isinstance(analyses, Sequence)
+            or not analyses or len(analyses) > 10000):
+        raise KineticsContractError(
+            "sensitivity.analyses must be a non-empty bounded array")
+    step_uncertainties = {
+        str(step["id"]): float(step["uncertainty_eV"])
+        for step in network.get("elementary_steps") or []
+        if isinstance(step, Mapping) and isinstance(step.get("id"), str)
+    }
+    expected = {
+        (point_index, step_id)
+        for point_index in range(len(points)) for step_id in step_uncertainties
+    }
+    observed = set()
     normalized = []
     for index, raw in enumerate(analyses):
         item = _strict_object(
-            raw, {"kind", "max_relative_change"}, f"sensitivity.analyses[{index}]")
+            raw, {
+                "kind", "point_index", "condition_sha256", "step_id",
+                "perturbation_eV", "max_relative_change",
+            }, f"sensitivity.analyses[{index}]")
+        if item.get("kind") != "energy_uncertainty":
+            raise KineticsContractError(
+                f"sensitivity.analyses[{index}].kind is unsupported")
+        point_index = item.get("point_index")
+        if (isinstance(point_index, bool) or not isinstance(point_index, int)
+                or not 0 <= point_index < len(points)):
+            raise KineticsContractError(
+                f"sensitivity.analyses[{index}].point_index is invalid")
+        step_id = _result_identifier(
+            item.get("step_id"), f"sensitivity.analyses[{index}].step_id")
+        key = (point_index, step_id)
+        if key not in expected:
+            raise KineticsContractError(
+                f"sensitivity.analyses[{index}] is outside the frozen steps/points")
+        if key in observed:
+            raise KineticsContractError("sensitivity coverage contains a duplicate")
+        observed.add(key)
+        condition_sha256 = item.get("condition_sha256")
+        expected_condition_sha256 = compute_condition_sha256(
+            points[point_index]["conditions"])
+        if condition_sha256 != expected_condition_sha256:
+            raise KineticsContractError(
+                f"sensitivity.analyses[{index}].condition_sha256 mismatch")
+        perturbation = _result_number(
+            item.get("perturbation_eV"),
+            f"sensitivity.analyses[{index}].perturbation_eV",
+            minimum=0.0, maximum=10.0)
+        if not math.isclose(
+                perturbation, step_uncertainties[step_id],
+                rel_tol=0.0, abs_tol=1.0e-12):
+            raise KineticsContractError(
+                f"sensitivity.analyses[{index}].perturbation_eV does not match "
+                "the frozen step uncertainty")
         normalized.append({
-            "kind": _result_identifier(
-                item.get("kind"), f"sensitivity.analyses[{index}].kind"),
+            "kind": "energy_uncertainty", "point_index": point_index,
+            "condition_sha256": condition_sha256, "step_id": step_id,
+            "perturbation_eV": perturbation,
             "max_relative_change": _result_number(
                 item.get("max_relative_change"),
-                f"sensitivity.analyses[{index}].max_relative_change", minimum=0.0),
+                f"sensitivity.analyses[{index}].max_relative_change",
+                minimum=0.0, maximum=1.0e12),
         })
+    if observed != expected:
+        raise KineticsContractError(
+            "sensitivity analyses do not cover every frozen point and step")
     warnings = result.get("warnings")
     if isinstance(warnings, (str, bytes)) or not isinstance(warnings, Sequence):
         raise KineticsContractError("sensitivity.warnings must be an array")
@@ -1081,16 +1358,27 @@ def _normalize_sensitivity(value: Any) -> dict[str, Any]:
             raise KineticsContractError(
                 f"sensitivity.warnings[{index}] must be bounded safe text")
         safe_warnings.append(text)
-    return {"status": status, "analyses": normalized, "warnings": safe_warnings}
+    maximum_change = max(item["max_relative_change"] for item in normalized)
+    return {
+        "status": "warning" if maximum_change > 1.0 else "passed",
+        "available": True,
+        "analyses": normalized,
+        "warnings": safe_warnings,
+        "coverage": {
+            "required": len(expected), "observed": len(observed),
+            "complete": observed == expected,
+        },
+    }
 
 
 def import_result(
         result: Mapping[str, Any],
-        network_source: Mapping[str, Any] | KineticsInputProvider, *,
+        network_source: CanonicalKineticsInput | KineticsInputProvider, *,
         expected_adapter: Mapping[str, Any]) -> dict[str, Any]:
     """Validate and normalize an external result; never trust browser numerics."""
-    network = _as_mapping(network_source)
-    audit = audit_network(network)
+    canonical = canonicalize_kinetics_input(network_source)
+    network = canonical.to_mapping()
+    audit = audit_network(canonical)
     if audit["export_ready"] is not True:
         raise KineticsContractError("frozen network failed the kinetics input audit")
     payload = _strict_object(result, {
@@ -1127,10 +1415,11 @@ def import_result(
     normalized_points = [
         _normalize_point(point, index, network) for index, point in enumerate(points)
     ]
-    sensitivity = _normalize_sensitivity(payload.get("sensitivity"))
+    sensitivity = _normalize_sensitivity(
+        payload.get("sensitivity"), normalized_points, network)
     converged = all(
         point["convergence"]["converged"] for point in normalized_points)
-    sensitivity_available = sensitivity["status"] != "unavailable"
+    sensitivity_available = sensitivity["available"] is True
     reason_codes = []
     if not converged:
         reason_codes.append("NUMERICAL_NOT_CONVERGED")
@@ -1169,7 +1458,10 @@ def import_result(
 
 
 __all__ = [
-    "AUDIT_SCHEMA", "KineticsContractError", "KineticsInputProvider",
+    "AUDIT_SCHEMA", "CanonicalKineticsInput", "CONVERGENCE_ITERATIONS_MAX",
+    "CONVERGENCE_RESIDUAL_MAX", "KineticsContractError", "KineticsInputProvider",
     "NETWORK_SCHEMA", "NORMALIZED_RESULT_SCHEMA", "RESULT_SCHEMA", "RESULT_UNITS",
-    "audit_network", "compute_input_sha256", "import_result",
+    "SOURCE_PROJECTION_PROTOCOLS", "audit_network", "canonicalize_kinetics_input",
+    "compute_condition_sha256", "compute_input_sha256", "compute_projection_sha256",
+    "compute_source_projection_sha256", "import_result",
 ]

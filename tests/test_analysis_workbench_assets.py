@@ -430,8 +430,11 @@ def test_kinetic_adapter_controls_require_preview_and_explicit_confirmation():
     assert 'type="file" accept="application/json,.json"' in html
     assert "window.confirm(" in script
     assert "kinetics_export_preview', projectId" in script
-    assert "kinetics_export_confirm', projectId, previewSha, true" in script
+    assert "'kinetics_export_confirm', projectId, previewSha" in script
+    assert "kinetics_audit_export_preview', projectId" in script
+    assert "kinetics_audit_export_confirm', projectId, sha, true" in script
     assert "kinetics_result_import', projectId, resultObject" in script
+    assert "'kinetics_result_select', projectId" in script
     assert "20 * 1024 * 1024" in script
     assert "JSON.parse(await file.text())" in script
     for forbidden in (
@@ -439,6 +442,38 @@ def test_kinetic_adapter_controls_require_preview_and_explicit_confirmation():
         "command:", "argv:", "subprocess", "child_process", "eval(",
     ):
         assert forbidden not in html + script
+
+
+def test_fake_dom_audit_only_preview_never_enables_or_reports_model_publish():
+    _run_node(
+        r"""
+const confirm = element('aw-kinetics-confirm-export', { disabled: true });
+element('aw-kinetics-preview-export');
+const status = element('aw-kinetics-adapter-status');
+VCS.workspace = {
+  state: { project_id: 'project-a' },
+  projects: [{ project_id: 'project-a', name: 'A' }],
+};
+VCS.call = async method => {
+  trace.calls.push(method);
+  return {
+    ok: true, schema: 'vcstudio.catmap-export-preview/v2',
+    project_id: 'project-a', export_kind: 'model', export_ready: false,
+    preview_sha256: null, model_published: false,
+  };
+};
+loadAsset(process.argv[1]);
+const seam = window.__VCS_ANALYSIS_TEST__;
+seam.configure({ analysisId: 'kinetic-dashboard', projectId: 'project-a' });
+const outcome = await seam.previewKineticsExport();
+assert.strictEqual(outcome, false);
+assert.strictEqual(seam.snapshot().kinetics_preview_sha256, '');
+assert.strictEqual(confirm.disabled, true);
+assert.ok(!String(status.textContent).includes('模型已发布'));
+assert.deepStrictEqual(trace.calls, ['kinetics_export_preview']);
+""",
+        str(ASSETS / "analysis-workbench.js"),
+    )
 
 
 def test_async_results_are_project_bound_and_last_request_wins():

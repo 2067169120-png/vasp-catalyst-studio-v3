@@ -8,23 +8,44 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_kinetics import frozen_network
+from tests.test_kinetics import _freeze, frozen_network
 from vcstudio.external import catmap_adapter
 from vcstudio.project import kinetics
 
 
-def test_missing_catmap_is_unavailable_but_audit_and_inputs_are_exportable():
+def _tool(tmp_path):
+    path = tmp_path / "catmap.exe"
+    path.write_bytes(b"user-installed-catmap-process-adapter")
+    return path
+
+
+def _confirm(network, project, preview, tool):
+    return catmap_adapter.confirm_export(
+        network, project, preview["preview_token"],
+        expected_selection_revision=0,
+        expected_selected_export_sha256=None, confirmed=True,
+        tool_path=tool, tool_version=preview["tool"]["version"])
+
+
+def test_missing_catmap_is_unavailable_but_audit_report_is_exportable():
     preview = catmap_adapter.preview_export(frozen_network(), tool_path=None)
+    audit_preview = catmap_adapter.preview_audit_export(
+        frozen_network(), tool_path=None)
 
     assert preview["schema"] == catmap_adapter.PREVIEW_SCHEMA
     assert preview["audit"]["machine_pass"] is True
     assert preview["tool"]["available"] is False
     assert preview["capability_status"] == "unavailable"
+    assert preview["export_ready"] is False
+    assert preview["preview_token"] is None
     assert preview["explicit_confirmation_required"] is True
     assert {"kinetics-audit.json", "kinetics-input.json", "energetics.tsv", "model.mkm"} <= {
         item["name"] for item in preview["artifacts"]
     }
     assert "contents" not in preview
+    assert audit_preview["export_kind"] == "audit_report"
+    assert audit_preview["model_published"] is False
+    assert audit_preview["preview_token"]
 
 
 def test_catmap_table_and_mkm_follow_fixed_data_only_contract():
@@ -38,9 +59,16 @@ def test_catmap_table_and_mkm_follow_fixed_data_only_contract():
         "frequencies", "reference",
     ]
     assert "rxn_expressions" in model
-    assert "CO_s + O_s <-> COO_ts_s + *_s -> CO2_g + *_s + *_s" in model
+    assert "a0_s0 + a1_s0 <-> t0_s0 + *_s0 -> g2_g + *_s0 + *_s0" in model
     assert "input_file = 'energetics.tsv'" in model
     assert "output_variables" in model
+    assert "scaler = 'ThermodynamicScaler'" in model
+    assert "descriptor_names = ['temperature', 'pressure']" in model
+    assert "descriptors = [500.0, 1.0]" in model
+    assert "concentration" in model
+    assert "model-scan.mkm" in bundle["files"]
+    assert "descriptor_ranges" in bundle["files"]["model-scan.mkm"]
+    assert "resolution = [5, 5]" in bundle["files"]["model-scan.mkm"]
     assert "prefactor_list = ['10000000000000']" in model
     assert all(token not in model for token in (
         "import ", "subprocess", "os.system", "eval(", "exec(", "__import__",
@@ -84,18 +112,22 @@ def test_confirm_writes_frozen_bundle_only_after_matching_preview(tmp_path):
     project = tmp_path / "project"
     project.mkdir()
     network = frozen_network()
-    preview = catmap_adapter.preview_export(network, tool_path=None)
+    tool = _tool(tmp_path)
+    preview = catmap_adapter.preview_export(
+        network, tool_path=tool, tool_version="0.4.0")
 
     with pytest.raises(catmap_adapter.CatmapAdapterError, match="explicit confirmation"):
         catmap_adapter.confirm_export(
-            network, project, preview["preview_token"], confirmed=False)
+            network, project, preview["preview_token"],
+            expected_selection_revision=0,
+            expected_selected_export_sha256=None, confirmed=False,
+            tool_path=tool, tool_version="0.4.0")
 
-    confirmed = catmap_adapter.confirm_export(
-        network, project, preview["preview_token"], confirmed=True)
+    confirmed = _confirm(network, project, preview, tool)
     export_dir = Path(confirmed["export_dir"])
     manifest = json.loads((export_dir / "manifest.json").read_text(encoding="utf-8"))
 
-    assert export_dir.parent == project / ".vcstudio" / "kinetics" / "exports"
+    assert export_dir.parent.parent == project / ".vcstudio" / "kinetics" / "exports"
     assert confirmed["input_sha256"] == network["input_sha256"]
     assert manifest["input_sha256"] == network["input_sha256"]
     assert manifest["adapter"]["id"] == catmap_adapter.ADAPTER_ID
@@ -105,31 +137,101 @@ def test_confirm_writes_frozen_bundle_only_after_matching_preview(tmp_path):
     verified = catmap_adapter.load_confirmed_manifest(
         project, network["input_sha256"])
     assert verified["adapter"]["id"] == catmap_adapter.ADAPTER_ID
-    assert verified["tool"]["sha256"] is None
+    assert verified["tool"]["sha256"] == hashlib.sha256(tool.read_bytes()).hexdigest()
 
 
 def test_preview_token_binds_network_adapter_tool_and_artifact_hashes(tmp_path):
     network = frozen_network()
-    preview = catmap_adapter.preview_export(network, tool_path=None)
+    tool = _tool(tmp_path)
+    preview = catmap_adapter.preview_export(network, tool_path=tool)
     changed = copy.deepcopy(network)
     changed["standard_state"]["temperature"]["value"] = 550.0
-    changed["input_sha256"] = kinetics.compute_input_sha256(changed)
+    _freeze(changed)
 
     with pytest.raises(catmap_adapter.CatmapAdapterError, match="preview token"):
         catmap_adapter.confirm_export(
-            changed, tmp_path, preview["preview_token"], confirmed=True)
+            changed, tmp_path, preview["preview_token"],
+            expected_selection_revision=0,
+            expected_selected_export_sha256=None, confirmed=True,
+            tool_path=tool)
 
 
 def test_failed_audit_still_exports_audit_report_but_not_catmap_inputs():
     network = frozen_network()
     network["elementary_steps"][0]["reverse_barrier"]["value"] = 1.0
-    network["input_sha256"] = kinetics.compute_input_sha256(network)
+    _freeze(network)
 
     bundle = catmap_adapter.build_export_bundle(network, tool_path=None)
 
     assert bundle["audit"]["export_ready"] is False
     assert set(bundle["files"]) == {"kinetics-audit.json"}
     assert bundle["preview_token"]
+
+
+def test_audit_only_cannot_be_confirmed_as_model_and_has_separate_manifest(tmp_path):
+    network = frozen_network()
+    network["elementary_steps"][0]["reverse_barrier"]["value"] = 1.0
+    _freeze(network)
+    tool = _tool(tmp_path)
+    bundle = catmap_adapter.build_export_bundle(network, tool_path=tool)
+    with pytest.raises(catmap_adapter.CatmapAdapterError, match="not ready"):
+        catmap_adapter.confirm_export(
+            network, tmp_path, bundle["preview_token"],
+            expected_selection_revision=0,
+            expected_selected_export_sha256=None, confirmed=True,
+            tool_path=tool)
+    assert not (tmp_path / ".vcstudio").exists()
+
+    preview = catmap_adapter.preview_audit_export(network, tool_path=tool)
+    confirmed = catmap_adapter.confirm_audit_export(
+        network, tmp_path, preview["preview_token"], confirmed=True,
+        tool_path=tool)
+    export_dir = Path(confirmed["export_dir"])
+    assert confirmed["schema"] == catmap_adapter.AUDIT_MANIFEST_SCHEMA
+    assert confirmed["model_published"] is False
+    assert set(confirmed["files"]) == {
+        "audit-manifest.json", "kinetics-audit.json",
+    }
+    assert not (export_dir / "model.mkm").exists()
+
+
+def test_tool_drift_publishes_immutable_versions_with_selection_cas(tmp_path):
+    network = frozen_network()
+    tool = _tool(tmp_path)
+    first_preview = catmap_adapter.preview_export(network, tool_path=tool)
+    first = _confirm(network, tmp_path, first_preview, tool)
+
+    tool.write_bytes(b"different-user-installed-catmap-adapter")
+    second_preview = catmap_adapter.preview_export(network, tool_path=tool)
+    assert second_preview["preview_token"] != first_preview["preview_token"]
+    second = catmap_adapter.confirm_export(
+        network, tmp_path, second_preview["preview_token"],
+        expected_selection_revision=first["selection_revision"],
+        expected_selected_export_sha256=first["selected_export_sha256"],
+        confirmed=True, tool_path=tool)
+
+    root = (tmp_path / ".vcstudio" / "kinetics" / "exports" /
+            network["input_sha256"])
+    assert (root / first_preview["preview_token"] / "manifest.json").is_file()
+    assert (root / second_preview["preview_token"] / "manifest.json").is_file()
+    assert second["selection_revision"] == 2
+    loaded = catmap_adapter.load_confirmed_manifest(
+        tmp_path, network["input_sha256"])
+    assert loaded["selected_export_sha256"] == second_preview["preview_token"]
+
+    with pytest.raises(catmap_adapter.CatmapAdapterError, match="conflict"):
+        catmap_adapter.confirm_export(
+            network, tmp_path, second_preview["preview_token"],
+            expected_selection_revision=0,
+            expected_selected_export_sha256=None, confirmed=True,
+            tool_path=tool)
+
+
+def test_name_map_rejects_ambiguous_multisite_species():
+    network = frozen_network()
+    network["species"][4]["sites"] = {"s": 1, "bridge": 1}
+    with pytest.raises(catmap_adapter.CatmapAdapterError, match="exactly one"):
+        catmap_adapter._catmap_name_map(network)
 
 
 @pytest.mark.parametrize("mutate,reason", [
@@ -159,7 +261,7 @@ def test_valid_but_unencoded_catmap_features_fail_closed_to_audit_only(
         mutate, reason):
     network = frozen_network()
     mutate(network)
-    network["input_sha256"] = kinetics.compute_input_sha256(network)
+    _freeze(network)
     assert kinetics.audit_network(network)["machine_pass"] is True
 
     bundle = catmap_adapter.build_export_bundle(network, tool_path=None)
@@ -176,7 +278,7 @@ def test_valid_but_unencoded_catmap_features_fail_closed_to_audit_only(
 def test_export_identifiers_cannot_inject_python_or_tsv_rows():
     network = frozen_network()
     network["species"][0]["id"] = "CO_g\n__import__('os').system('whoami')"
-    network["input_sha256"] = kinetics.compute_input_sha256(network)
+    _freeze(network)
 
     bundle = catmap_adapter.build_export_bundle(network, tool_path=None)
 
@@ -186,13 +288,25 @@ def test_export_identifiers_cannot_inject_python_or_tsv_rows():
 
 def test_confirmed_manifest_rejects_artifact_tampering(tmp_path):
     network = frozen_network()
-    preview = catmap_adapter.preview_export(network, tool_path=None)
-    confirmed = catmap_adapter.confirm_export(
-        network, tmp_path, preview["preview_token"], confirmed=True)
+    tool = _tool(tmp_path)
+    preview = catmap_adapter.preview_export(network, tool_path=tool)
+    confirmed = _confirm(network, tmp_path, preview, tool)
     export_dir = Path(confirmed["export_dir"])
     (export_dir / "model.mkm").write_text("tampered", encoding="utf-8")
 
     with pytest.raises(catmap_adapter.CatmapAdapterError, match="artifact (size|hash)"):
+        catmap_adapter.load_confirmed_manifest(tmp_path, network["input_sha256"])
+
+
+def test_export_selection_pointer_tampering_fails_closed(tmp_path):
+    network = frozen_network()
+    tool = _tool(tmp_path)
+    preview = catmap_adapter.preview_export(network, tool_path=tool)
+    _confirm(network, tmp_path, preview, tool)
+    pointer = (tmp_path / ".vcstudio" / "kinetics" / "exports" /
+               network["input_sha256"] / "current.json")
+    pointer.write_text('{"selected_export_sha256":"../../escape"}', encoding="utf-8")
+    with pytest.raises(catmap_adapter.CatmapAdapterError, match="selection"):
         catmap_adapter.load_confirmed_manifest(tmp_path, network["input_sha256"])
 
 
@@ -207,11 +321,15 @@ def test_export_rejects_symlinked_directory_chain(tmp_path):
     except OSError as exc:
         pytest.skip(f"directory symlinks unavailable: {exc}")
     network = frozen_network()
-    preview = catmap_adapter.preview_export(network, tool_path=None)
+    tool = _tool(tmp_path)
+    preview = catmap_adapter.preview_export(network, tool_path=tool)
 
     with pytest.raises(catmap_adapter.CatmapAdapterError, match="symlink"):
         catmap_adapter.confirm_export(
-            network, project, preview["preview_token"], confirmed=True)
+            network, project, preview["preview_token"],
+            expected_selection_revision=0,
+            expected_selected_export_sha256=None, confirmed=True,
+            tool_path=tool)
     assert not any(outside.iterdir())
 
 
@@ -221,9 +339,9 @@ def test_confirmed_export_rejects_directory_swap_to_external_symlink(tmp_path):
     project.mkdir()
     outside.mkdir()
     network = frozen_network()
-    preview = catmap_adapter.preview_export(network, tool_path=None)
-    confirmed = catmap_adapter.confirm_export(
-        network, project, preview["preview_token"], confirmed=True)
+    tool = _tool(tmp_path)
+    preview = catmap_adapter.preview_export(network, tool_path=tool)
+    confirmed = _confirm(network, project, preview, tool)
     export_dir = Path(confirmed["export_dir"])
     moved = outside / export_dir.name
     export_dir.rename(moved)
@@ -239,9 +357,9 @@ def test_confirmed_export_rejects_directory_swap_to_external_symlink(tmp_path):
 
 def test_confirmed_manifest_and_artifacts_have_hard_size_limits(tmp_path):
     network = frozen_network()
-    preview = catmap_adapter.preview_export(network, tool_path=None)
-    confirmed = catmap_adapter.confirm_export(
-        network, tmp_path, preview["preview_token"], confirmed=True)
+    tool = _tool(tmp_path)
+    preview = catmap_adapter.preview_export(network, tool_path=tool)
+    confirmed = _confirm(network, tmp_path, preview, tool)
     manifest = Path(confirmed["export_dir"]) / "manifest.json"
     manifest.write_bytes(b"{" + b" " * (1024 * 1024) + b"}")
 

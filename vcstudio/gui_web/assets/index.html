@@ -1838,9 +1838,15 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
               data-i18n="analysis.kinetic.preview_export">预览导出</button>
             <button class="btn primary" id="aw-kinetics-confirm-export" type="button"
               data-i18n="analysis.kinetic.confirm_export" disabled>明确确认并导出</button>
+            <button class="btn" id="aw-kinetics-preview-audit" type="button"
+              data-i18n="analysis.kinetic.preview_audit">预览审计报告</button>
+            <button class="btn" id="aw-kinetics-confirm-audit" type="button"
+              data-i18n="analysis.kinetic.confirm_audit" disabled>确认只导出审计报告</button>
             <label class="btn" for="aw-kinetics-result-file"
               data-i18n="analysis.kinetic.select_result">选择结果 JSON</label>
             <input id="aw-kinetics-result-file" type="file" accept="application/json,.json" hidden>
+            <button class="btn primary" id="aw-kinetics-select-result" type="button"
+              data-i18n="analysis.kinetic.select_uploaded_result" disabled>选择已上传结果</button>
           </div>
           <p class="aw-operation" id="aw-kinetics-adapter-status" aria-live="polite"
             data-i18n="analysis.kinetic.adapter_waiting">等待服务端输入审计。</p>
