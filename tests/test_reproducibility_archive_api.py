@@ -144,3 +144,42 @@ def test_archive_api_stale_revision_after_plan_writes_no_final_file(tmp_path):
     assert result["status"] == "stale"
     assert result["file"] is None
     assert not list(destination.glob("*.zip"))
+
+
+def test_archive_api_rejects_destination_rename_and_replacement(tmp_path):
+    host, service, revision_id, _published = _published_revision(tmp_path, assets=False)
+    destination = tmp_path / "archives"
+    moved = tmp_path / "archives-moved"
+    destination.mkdir()
+    api = _api_for_revision(tmp_path, service, host.project_id)
+    plan = api.report_archive_dry_run(host.project_id, revision_id)
+    selected = api.report_archive_pick_destination(
+        host.project_id, revision_id, plan["confirmation_token"])
+    destination.rename(moved)
+    destination.mkdir()
+
+    result = api.report_archive_export(
+        host.project_id, revision_id, plan["confirmation_token"],
+        selected["destination_token"],
+    )
+
+    assert result["ok"] is False
+    assert result["file"] is None
+    assert not list(destination.iterdir())
+    assert not list(moved.iterdir())
+    encoded = json.dumps(result, ensure_ascii=False)
+    assert str(destination) not in encoded
+    assert str(moved) not in encoded
+
+
+def test_archive_api_failure_dto_uses_archive_credential_scanner():
+    secret = "client_secret=" + ("c" * 28)
+
+    result = Api._report_insight_failure(
+        "vcstudio.vcs-archive-result/v1", ValueError(f"provider rejected {secret}"),
+        revision=None, file=None,
+    )
+
+    assert result["ok"] is False
+    assert secret not in json.dumps(result, ensure_ascii=False)
+    assert result["error"] == "[redacted-secret]"

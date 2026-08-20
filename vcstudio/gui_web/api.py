@@ -7210,13 +7210,15 @@ class Api:
     @staticmethod
     def _report_insight_failure(schema, exc, **extra):
         from vcstudio.project.report_insights import StaleRevisionError, redact
+        from vcstudio.project.reproducibility_archive import _public_safe_value
 
         status = ('stale' if isinstance(exc, StaleRevisionError) else
                   'blocked' if isinstance(exc, FileExistsError) else
                   'unavailable')
         result = {
             'schema': schema, 'ok': False, 'status': status,
-            'project_id': None, 'error': redact(str(exc)),
+            'project_id': None,
+            'error': _public_safe_value(redact(str(exc))),
         }
         result.update(extra)
         return result
@@ -7413,7 +7415,7 @@ class Api:
                 if (stored.get('project_id') != identifier
                         or stored.get('revision_id') != str(revision_id or '')):
                     raise ValueError('archive confirmation binding mismatch')
-                destination = self._archive_destination_registry().consume(
+                destination = self._archive_destination_registry().consume_trusted(
                     destination_token,
                     expected_binding=str(confirmation_token or ''))
                 return export_archive(

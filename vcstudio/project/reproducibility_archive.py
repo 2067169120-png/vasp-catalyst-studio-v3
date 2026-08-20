@@ -42,8 +42,12 @@ from vcstudio import __version__
 from vcstudio.project.report_insights import (
     FrozenRevision,
     StaleRevisionError,
+    TrustedDirectoryHandle,
+    TrustedDirectorySelection,
+    capture_trusted_directory,
     evidence_graph,
     load_frozen_revision,
+    open_trusted_directory,
     redact,
 )
 from vcstudio.project.report_service import _exclusive_file_lock
@@ -58,15 +62,24 @@ ARCHIVE_VERSION = 1
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _WINDOWS_PATH = re.compile(r"(?i)(?:^|[\s\"'(=])(?:[a-z]:[\\/]|\\\\)")
-_POSIX_PRIVATE_PATH = re.compile(
-    r"(?:^|[\s\"'(=])/(?:Users|home|root|tmp|var/tmp|private|mnt|opt|srv)(?:/|\b)"
+_POSIX_ABSOLUTE_PATH = re.compile(
+    r"(?:^|[\s\"'(=])(?:~/|/+)(?=[A-Za-z0-9._~-])"
 )
 _FILE_URI = re.compile(r"(?i)\bfile:(?:/{1,3}|\\)")
 _SECRET_LITERAL = re.compile(
-    r"(?i)(?:\b(?:github_pat_|gh[opusr]_|sk-)[A-Za-z0-9_-]{12,}"
-    r"|\bAKIA[0-9A-Z]{16}\b|\bBearer\s+(?!\[redacted)[^\s<]+"
-    r"|-----BEGIN[^\r\n]{0,40}PRIVATE KEY-----"
-    r"|https?://[^\s/:]+:[^\s/@]+@)"
+    r"(?ix)(?:"
+    r"\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[opusr]_[A-Za-z0-9]{20,}"
+    r"|glpat-[A-Za-z0-9_-]{12,}|hf_[A-Za-z0-9]{20,}"
+    r"|sk-(?:proj-)?[A-Za-z0-9_-]{16,})"
+    r"|\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"
+    r"|\bBearer\s+(?!\[redacted)[^\s<]+"
+    r"|-----BEGIN[^\r\n]{0,40}PRIVATE\s+KEY-----"
+    r"|https?://[^\s/@]+(?::[^\s/@]*)?@)"
+)
+_ASSIGNMENT = re.compile(
+    r"(?ix)(?<![A-Za-z0-9_.-])[\"']?"
+    r"(?P<key>[A-Za-z][A-Za-z0-9_.-]{1,96})[\"']?\s*[=:]\s*[\"']?"
+    r"(?P<value>[^\s,;\"'}]*)"
 )
 _POTCAR_RAW = re.compile(
     r"(?is)(?:parameters\s+from\s+PSCTR\s+are:|End\s+of\s+Dataset)"
@@ -86,6 +99,25 @@ _RESERVED_WINDOWS = frozenset({
 _TEXT_SUFFIXES = frozenset({
     ".bib", ".cff", ".csv", ".html", ".json", ".md", ".svg", ".txt", ".xml", ".yaml", ".yml",
 })
+_NESTED_ARCHIVE_SUFFIXES = (
+    ".zip", ".tar", ".tgz", ".tar.gz", ".tbz", ".tbz2", ".tar.bz2",
+    ".txz", ".tar.xz", ".gz", ".bz2", ".xz", ".7z", ".rar",
+)
+_SENSITIVE_KEY_EXACT = frozenset({
+    "password", "passwd", "secret", "token", "client_secret", "access_token",
+    "refresh_token", "auth", "cookie", "cookies",
+    "id_token", "api_key", "aws_secret_access_key", "secret_access_key",
+    "private_key", "authorization", "credential", "credentials",
+})
+_SENSITIVE_KEY_SUFFIXES = (
+    "_password", "_secret", "_token", "_api_key", "_access_key",
+    "_access_key_id", "_private_key", "_authorization", "_credential",
+    "_credentials",
+)
+_SENSITIVE_KEY_COMPACT_SUFFIXES = (
+    "password", "secret", "secretkey", "token", "apikey", "accesskey", "accesskeyid",
+    "privatekey", "authorization", "credential", "credentials",
+)
 
 
 class ArchiveVerificationError(RuntimeError):
@@ -178,7 +210,7 @@ class ArchivePlan:
     def public_summary(self) -> dict[str, Any]:
         included = sum(1 for item in self.decisions if item.get("decision") == "include")
         excluded = len(self.decisions) - included
-        return {
+        summary = {
             "schema": PLAN_SCHEMA,
             "ok": True,
             "status": "dry_run_ready",
@@ -211,6 +243,7 @@ class ArchivePlan:
             },
             "error": None,
         }
+        return _public_safe_value(summary)
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -227,11 +260,139 @@ def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _normalized_key(value: Any) -> str:
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(value or ""))
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+
+
+def _sensitive_key(value: Any) -> bool:
+    normalized = _normalized_key(value)
+    compact = normalized.replace("_", "")
+    return (
+        normalized in _SENSITIVE_KEY_EXACT
+        or normalized.endswith(_SENSITIVE_KEY_SUFFIXES)
+        or compact.endswith(_SENSITIVE_KEY_COMPACT_SUFFIXES)
+    )
+
+
+def _text_safety_risks(value: Any, *, include_paths: bool = True) -> list[str]:
+    text = str(value or "")
+    risks: list[str] = []
+    if _SECRET_LITERAL.search(text):
+        risks.append("secret_literal")
+    for assignment in _ASSIGNMENT.finditer(text):
+        if (
+            _sensitive_key(assignment.group("key"))
+            and assignment.group("value").casefold() != "[redacted-secret]"
+        ):
+            risks.append("secret_literal")
+            break
+    if include_paths and (
+        _WINDOWS_PATH.search(text) or _FILE_URI.search(text)
+        or _POSIX_ABSOLUTE_PATH.search(text)
+    ):
+        risks.append("absolute_path")
+    return sorted(set(risks))
+
+
+def _decoded_text_values(data: bytes) -> set[str]:
+    values = {data.decode("utf-8", errors="ignore")}
+    sample = data[: min(len(data), 8192)]
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")) or (
+        sample and sample.count(b"\x00") * 4 >= len(sample)
+    ):
+        values.add(data.decode("utf-16-le", errors="ignore"))
+        values.add(data.decode("utf-16-be", errors="ignore"))
+    return values
+
+
+def _structured_safety_risks(
+    value: Any, *, max_depth: int = 8, max_nodes: int = 1024,
+) -> list[str]:
+    """Bounded provider-metadata scan over keys, values, and nested paths."""
+
+    risks: set[str] = set()
+    seen: set[int] = set()
+    nodes = 0
+
+    def visit(item: Any, depth: int, key: str = "") -> None:
+        nonlocal nodes
+        nodes += 1
+        if nodes > max_nodes or depth > max_depth:
+            risks.add("metadata_structure_unbounded")
+            return
+        if key and _sensitive_key(key):
+            risks.add("secret_key")
+        if isinstance(item, Mapping):
+            marker = id(item)
+            if marker in seen:
+                risks.add("metadata_cycle")
+                return
+            seen.add(marker)
+            for child_key, child in item.items():
+                key_text = str(child_key)
+                risks.update(_text_safety_risks(key_text))
+                visit(child, depth + 1, key_text)
+            seen.remove(marker)
+            return
+        if isinstance(item, (list, tuple, set, frozenset)):
+            marker = id(item)
+            if marker in seen:
+                risks.add("metadata_cycle")
+                return
+            seen.add(marker)
+            for child in item:
+                visit(child, depth + 1, key)
+            seen.remove(marker)
+            return
+        if isinstance(item, os.PathLike):
+            risks.update(_text_safety_risks(os.fspath(item)))
+            return
+        if isinstance(item, str):
+            risks.update(_text_safety_risks(item))
+            return
+        if isinstance(item, (bytes, bytearray, memoryview)):
+            for decoded in _decoded_text_values(bytes(item)):
+                risks.update(_text_safety_risks(decoded))
+            return
+        if item is not None and not isinstance(item, (bool, int, float)):
+            risks.add("metadata_value_unsupported")
+
+    visit(value, 0)
+    return sorted(risks)
+
+
+def _nested_archive(name: str, data: bytes) -> bool:
+    lowered = str(name or "").lower()
+    if lowered.endswith(_NESTED_ARCHIVE_SUFFIXES):
+        return True
+    if data.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08", b"\x1f\x8b", b"BZh", b"\xfd7zXZ\x00", b"7z\xbc\xaf\x27\x1c", b"Rar!\x1a\x07")):
+        return True
+    if len(data) >= 262 and data[257:262] == b"ustar":
+        return True
+    if len(data) >= 512:
+        checksum_field = data[148:156].strip(b" \x00")
+        try:
+            expected_checksum = int(checksum_field, 8)
+        except ValueError:
+            expected_checksum = -1
+        if expected_checksum >= 0:
+            header = data[:148] + (b" " * 8) + data[156:512]
+            if sum(header) == expected_checksum:
+                return True
+    try:
+        return zipfile.is_zipfile(io.BytesIO(data))
+    except Exception:  # pragma: no cover - is_zipfile is deliberately best-effort
+        return False
+
+
 def _archive_safe_value(value: Any, *, key: str = "", parent_key: str = "") -> Any:
     """Redact public risks and replace any embedded raw POTCAR payload."""
 
-    normalized = str(key).strip().lower().replace("-", "_")
-    parent = str(parent_key).strip().lower().replace("-", "_")
+    normalized = _normalized_key(key)
+    parent = _normalized_key(parent_key)
+    if _sensitive_key(normalized):
+        return "[redacted-secret]"
     if normalized in _POTCAR_KEYS:
         return "[excluded-potcar-content]"
     if isinstance(value, Mapping):
@@ -271,11 +432,36 @@ def _archive_safe_value(value: Any, *, key: str = "", parent_key: str = "") -> A
         ]
     safe = redact(value, key=key)
     if isinstance(safe, str):
+        if "secret_literal" in _text_safety_risks(safe, include_paths=False):
+            return "[redacted-secret]"
         if ("potcar" in normalized or "potcar" in parent) and _POTCAR_RAW.search(safe):
             return "[excluded-potcar-content]"
         if _POTCAR_RAW.search(safe):
             return "[excluded-potcar-content]"
     return safe
+
+
+def _public_safe_value(value: Any, *, key: str = "") -> Any:
+    """Final DTO defense that preserves safe relative archive member names."""
+
+    if _sensitive_key(key):
+        return "[redacted-secret]"
+    if isinstance(value, Mapping):
+        return {
+            str(item_key): _public_safe_value(item_value, key=str(item_key))
+            for item_key, item_value in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_public_safe_value(item) for item in value]
+    if isinstance(value, str):
+        risks = _text_safety_risks(value)
+        if "secret_literal" in risks:
+            return "[redacted-secret]"
+        if "absolute_path" in risks:
+            return "[redacted-local-path]"
+        if _POTCAR_RAW.search(value):
+            return "[excluded-potcar-content]"
+    return copy.deepcopy(value)
 
 
 def _safe_archive_path(value: str) -> str:
@@ -301,15 +487,17 @@ def _payload_risks(name: str, data: bytes) -> list[str]:
     basename = PurePosixPath(name).name.upper()
     if basename == "POTCAR" or basename.startswith("POTCAR."):
         risks.append("potcar_raw_filename")
-    decoded = data.decode("utf-8", errors="ignore")
-    if _POTCAR_RAW.search(decoded):
-        risks.append("potcar_raw_content")
-    if _SECRET_LITERAL.search(decoded):
-        risks.append("secret_literal")
-    if _WINDOWS_PATH.search(decoded) or _FILE_URI.search(decoded):
+    name_risks = _text_safety_risks(name)
+    if "secret_literal" in name_risks:
+        risks.append("secret_in_path")
+    if "absolute_path" in name_risks:
         risks.append("absolute_path")
-    if PurePosixPath(name).suffix.lower() in _TEXT_SUFFIXES and _POSIX_PRIVATE_PATH.search(decoded):
-        risks.append("absolute_path")
+    if _nested_archive(name, data):
+        risks.append("nested_archive_forbidden")
+    for decoded in _decoded_text_values(data):
+        if _POTCAR_RAW.search(decoded):
+            risks.append("potcar_raw_content")
+        risks.extend(_text_safety_risks(decoded, include_paths=True))
     return sorted(set(risks))
 
 
@@ -443,16 +631,26 @@ def _recapture_frozen_revision(bundle: FrozenRevision) -> FrozenRevision:
 
 
 def _license_record(value: Any) -> tuple[str, str]:
+    def normalize(candidate: Any) -> tuple[str, str] | None:
+        raw_identifier = str(candidate).strip()
+        if _text_safety_risks(raw_identifier):
+            return None
+        identifier = str(redact(raw_identifier)).strip()
+        if not identifier or "redacted" in identifier.lower():
+            return None
+        if identifier.casefold() in {"noassertion", "none", "unknown", "unspecified"}:
+            return "NOASSERTION", "missing"
+        return identifier, "declared"
+
     if isinstance(value, str):
-        identifier = str(redact(value)).strip()
-        return (identifier or "NOASSERTION", "declared" if identifier else "missing")
+        return normalize(value) or ("NOASSERTION", "missing")
     if isinstance(value, Mapping):
         for key in ("spdx", "spdx_id", "license_id", "id", "name", "url"):
             candidate = value.get(key)
             if candidate:
-                identifier = str(redact(candidate, key=key)).strip()
-                if identifier and "redacted" not in identifier:
-                    return identifier, "declared"
+                result = normalize(candidate)
+                if result is not None:
+                    return result
     return "NOASSERTION", "missing"
 
 
@@ -477,6 +675,8 @@ def _citation_sources(bundle: FrozenRevision) -> list[Mapping[str, Any]]:
 
 def _attribution_text(value: Any) -> str:
     if isinstance(value, str):
+        if _text_safety_risks(value):
+            return ""
         safe = str(redact(value)).strip()
         return "" if "redacted" in safe else safe
     if isinstance(value, Mapping):
@@ -650,26 +850,170 @@ def _manifest_record_path(bundle: FrozenRevision, record: Mapping[str, Any]) -> 
     return candidate
 
 
-def _matching_figure(bundle: FrozenRevision, digest: str) -> Mapping[str, Any]:
-    for figure in bundle.model.get("figures") or []:
+def _matching_figures(bundle: FrozenRevision, digest: str) -> list[Mapping[str, Any]]:
+    return [
+        figure for figure in bundle.model.get("figures") or []
         if isinstance(figure, Mapping) and str(
             figure.get("asset_sha256") or figure.get("sha256") or ""
-        ).lower() == digest:
-            return figure
-    return {}
+        ).lower() == digest
+    ]
 
 
-def _third_party_rights(record: Mapping[str, Any]) -> tuple[bool, bool, str, str, str]:
-    source_kind = str(record.get("source_kind") or record.get("origin") or "").lower()
-    third_party = bool(record.get("third_party")) or source_kind in {
-        "external", "published", "third_party", "third-party",
-    }
-    redistributable = record.get("redistributable") is True
-    license_id, license_status = _license_record(
-        _first_mapping_value([record], _LICENSE_KEYS)
+def _rights_sources(record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    sources: list[Mapping[str, Any]] = []
+    extensions = record.get("extensions")
+    candidates = (
+        record.get("rights"), record,
+        extensions.get("rights") if isinstance(extensions, Mapping) else None,
+        extensions,
     )
-    attribution = _attribution_text(_first_mapping_value([record], _ATTRIBUTION_KEYS))
-    return third_party, redistributable, license_id, license_status, attribution
+    for candidate in candidates:
+        if isinstance(candidate, Mapping) and candidate not in sources:
+            sources.append(candidate)
+    return sources
+
+
+def _figure_rights_signature(record: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Normalize one model figure's provenance declarations for conflict checks."""
+
+    origins: list[bool] = []
+    redistributable: list[bool] = []
+    licenses: set[tuple[str, str]] = set()
+    attributions: set[str] = set()
+    invalid = False
+    sensitive = False
+    external = {"external", "published", "third_party", "third-party"}
+    internal = {"first_party", "first-party", "project", "original", "local"}
+    for source in _rights_sources(record):
+        for key in (*_LICENSE_KEYS, *_ATTRIBUTION_KEYS, "source_kind", "origin"):
+            if key in source and _structured_safety_risks(source.get(key)):
+                sensitive = True
+        if "third_party" in source:
+            value = source.get("third_party")
+            if isinstance(value, bool):
+                origins.append(value)
+            else:
+                invalid = True
+        source_kind = str(source.get("source_kind") or source.get("origin") or "").strip().lower()
+        if source_kind in external:
+            origins.append(True)
+        elif source_kind in internal:
+            origins.append(False)
+        elif source_kind:
+            invalid = True
+        if "redistributable" in source:
+            value = source.get("redistributable")
+            if isinstance(value, bool):
+                redistributable.append(value)
+            else:
+                invalid = True
+        for key in _LICENSE_KEYS:
+            if key not in source or source.get(key) in (None, "", [], {}):
+                continue
+            if key == "rights" and isinstance(source.get(key), Mapping):
+                continue
+            licenses.add(_license_record(source.get(key)))
+        attribution = _attribution_text(_first_mapping_value([source], _ATTRIBUTION_KEYS))
+        if attribution:
+            attributions.add(attribution)
+    origin = "third_party" if True in origins else "first_party" if origins else "missing"
+    redistribution = (
+        "false" if False in redistributable
+        else "true" if True in redistributable else "missing"
+    )
+    return (
+        origin, redistribution, tuple(sorted(licenses)), tuple(sorted(attributions)),
+        invalid, sensitive,
+    )
+
+
+def _merged_asset_rights(
+    manifest_record: Mapping[str, Any], model_figure: Mapping[str, Any],
+) -> tuple[bool, str | None, tuple[str, str, str]]:
+    """Merge two frozen rights declarations with deny/missing precedence."""
+
+    sources = [*_rights_sources(manifest_record), *_rights_sources(model_figure)]
+    origins: list[bool] = []
+    redistributable: list[bool] = []
+    licenses: set[str] = set()
+    explicit_missing_license = False
+    attributions: set[str] = set()
+    invalid_boolean = False
+    sensitive_rights = False
+    external = {"external", "published", "third_party", "third-party"}
+    internal = {"first_party", "first-party", "project", "original", "local"}
+    for source in sources:
+        for key in (*_LICENSE_KEYS, *_ATTRIBUTION_KEYS, "source_kind", "origin"):
+            if key in source and _structured_safety_risks(source.get(key)):
+                sensitive_rights = True
+        if "third_party" in source:
+            value = source.get("third_party")
+            if isinstance(value, bool):
+                origins.append(value)
+            else:
+                invalid_boolean = True
+        source_kind = str(source.get("source_kind") or source.get("origin") or "").strip().lower()
+        if source_kind in external:
+            origins.append(True)
+        elif source_kind in internal:
+            origins.append(False)
+        elif source_kind:
+            invalid_boolean = True
+        if "redistributable" in source:
+            value = source.get("redistributable")
+            if isinstance(value, bool):
+                redistributable.append(value)
+            else:
+                invalid_boolean = True
+        for key in _LICENSE_KEYS:
+            if key not in source or source.get(key) in (None, "", [], {}):
+                continue
+            if key == "rights" and isinstance(source.get(key), Mapping):
+                continue
+            license_id, license_status = _license_record(source.get(key))
+            if license_status != "declared":
+                explicit_missing_license = True
+            else:
+                licenses.add(license_id)
+        attribution = _attribution_text(_first_mapping_value([source], _ATTRIBUTION_KEYS))
+        if attribution:
+            attributions.add(attribution)
+    if sensitive_rights:
+        return False, "asset_rights_sensitive", ("NOASSERTION", "missing", "")
+    if invalid_boolean:
+        return False, "asset_rights_conflict", ("NOASSERTION", "missing", "")
+    if not origins:
+        return False, "asset_rights_binding_missing", ("NOASSERTION", "missing", "")
+    third_party = any(origins)
+    if False in redistributable:
+        return False, "asset_not_redistributable", ("NOASSERTION", "missing", "")
+    if not redistributable or True not in redistributable:
+        return False, "asset_rights_binding_missing", ("NOASSERTION", "missing", "")
+    if explicit_missing_license or not licenses:
+        return False, "asset_license_missing", ("NOASSERTION", "missing", "")
+    if len(licenses) != 1:
+        return False, "asset_rights_conflict", ("NOASSERTION", "missing", "")
+    attribution = "; ".join(sorted(attributions))
+    license_id = next(iter(licenses))
+    if third_party and not attribution:
+        return False, "third_party_license_or_attribution_missing", (
+            license_id, "declared", "",
+        )
+    return True, None, (license_id, "declared", attribution)
+
+
+def _asset_rights(
+    bundle: FrozenRevision, manifest_record: Mapping[str, Any], digest: str,
+) -> tuple[bool, str | None, tuple[str, str, str]]:
+    figures = _matching_figures(bundle, digest)
+    if not figures:
+        return False, "asset_model_binding_missing", ("NOASSERTION", "missing", "")
+    if len({_figure_rights_signature(figure) for figure in figures}) != 1:
+        return False, "asset_rights_conflict", ("NOASSERTION", "missing", "")
+    resolved = [_merged_asset_rights(manifest_record, figure) for figure in figures]
+    if len(set(resolved)) != 1:
+        return False, "asset_rights_conflict", ("NOASSERTION", "missing", "")
+    return resolved[0]
 
 
 def _excluded_decision(
@@ -742,10 +1086,10 @@ def _provider_members(
 ) -> None:
     for provider in providers:
         provider_id = str(getattr(provider, "provider_id", "") or "").strip()
-        if not _TOKEN.fullmatch(provider_id):
+        if not _TOKEN.fullmatch(provider_id) or _text_safety_risks(provider_id):
             exclusions.append(_excluded_decision(
                 archive_path=None, logical_role="extension_attachment",
-                reason="provider_id_invalid", sensitive_risk="high",
+                reason="provider_id_invalid_or_sensitive", sensitive_risk="high",
                 authority="extension_provider",
             ))
             continue
@@ -766,13 +1110,43 @@ def _provider_members(
                     authority="extension_provider", provider_id=provider_id,
                 ))
                 continue
+            try:
+                descriptor_risks: set[str] = set()
+                for field_value in (
+                    raw.archive_path, raw.logical_role, raw.license_id,
+                    raw.attribution, raw.sensitive_risk,
+                ):
+                    descriptor_risks.update(_text_safety_risks(field_value))
+                metadata_risks = _structured_safety_risks(raw.metadata)
+            except Exception:
+                descriptor_risks = {"descriptor_scan_failed"}
+                metadata_risks = {"metadata_scan_failed"}
+            if descriptor_risks or metadata_risks:
+                exclusions.append(_excluded_decision(
+                    archive_path=None, logical_role="extension_attachment",
+                    reason=(
+                        "provider_metadata_secret_or_path"
+                        if metadata_risks else "provider_descriptor_secret_or_path"
+                    ),
+                    sensitive_risk="high",
+                    size=(raw.size if isinstance(raw.size, int) and not isinstance(raw.size, bool) else None),
+                    sha256=(
+                        raw.sha256.lower()
+                        if isinstance(raw.sha256, str) and _HASH.fullmatch(raw.sha256.lower())
+                        else None
+                    ),
+                    authority="extension_provider", provider_id=provider_id,
+                ))
+                continue
             path = None
             try:
                 path = _safe_archive_path(raw.archive_path)
-                if not _HASH.fullmatch(str(raw.sha256).lower()):
+                if not isinstance(raw.sha256, str) or not _HASH.fullmatch(raw.sha256.lower()):
                     raise ValueError("attachment hash invalid")
                 if isinstance(raw.size, bool) or not isinstance(raw.size, int) or raw.size < 0:
                     raise ValueError("attachment size invalid")
+                if not isinstance(raw.redistributable, bool) or not isinstance(raw.third_party, bool):
+                    raise ValueError("attachment rights booleans are invalid")
                 if (raw.data is None) == (raw.source_path is None):
                     raise ValueError("attachment must use exactly one payload source")
                 if raw.data is not None:
@@ -789,18 +1163,21 @@ def _provider_members(
                     "symlink" in str(exc).lower() or "changed" in str(exc).lower()
                 ) else "attachment_contract_invalid"
                 exclusions.append(_excluded_decision(
-                    archive_path=path, logical_role=raw.logical_role,
-                    reason=reason, sensitive_risk="high", size=raw.size,
-                    sha256=(raw.sha256 if _HASH.fullmatch(str(raw.sha256).lower()) else None),
-                    license_id=str(raw.license_id or "NOASSERTION"),
-                    license_status=("declared" if raw.license_id and raw.license_id != "NOASSERTION" else "missing"),
-                    attribution=str(redact(raw.attribution)), authority="extension_provider",
+                    archive_path=path, logical_role="extension_attachment",
+                    reason=reason, sensitive_risk="high",
+                    size=(raw.size if isinstance(raw.size, int) and not isinstance(raw.size, bool) else None),
+                    sha256=(
+                        raw.sha256.lower()
+                        if isinstance(raw.sha256, str) and _HASH.fullmatch(raw.sha256.lower())
+                        else None
+                    ),
+                    license_id="NOASSERTION", license_status="missing",
+                    attribution="", authority="extension_provider",
                     provider_id=provider_id,
                 ))
                 continue
-            license_id = str(raw.license_id or "NOASSERTION").strip() or "NOASSERTION"
+            license_id, license_status = _license_record(raw.license_id)
             attribution = str(redact(raw.attribution)).strip()
-            license_status = "declared" if license_id != "NOASSERTION" else "missing"
             if raw.third_party and (
                 not raw.redistributable or license_status != "declared" or not attribution
             ):
@@ -1067,15 +1444,15 @@ def build_archive_plan(
             raise StaleRevisionError("report manifest asset record is invalid")
         expected_hash = str(record.get("sha256") or "").lower()
         expected_size = record.get("size")
-        figure = _matching_figure(bundle, expected_hash)
-        third_party, redistributable, license_id, license_status, attribution = (
-            _third_party_rights(figure)
+        eligible, exclusion_reason, asset_rights = _asset_rights(
+            bundle, record, expected_hash,
         )
+        license_id, license_status, attribution = asset_rights
         archive_path = f"artifacts/figures/{PurePosixPath(str(record.get('path') or '')).name}"
-        if third_party and (not redistributable or license_status != "declared" or not attribution):
+        if not eligible:
             exclusions.append(_excluded_decision(
                 archive_path=archive_path, logical_role="report_figure",
-                reason="third_party_license_or_attribution_missing",
+                reason=str(exclusion_reason or "asset_rights_binding_missing"),
                 sensitive_risk="high", size=expected_size, sha256=expected_hash,
                 license_id=license_id, license_status=license_status,
                 attribution=attribution, authority="frozen_report_revision",
@@ -1084,10 +1461,6 @@ def build_archive_plan(
         source = _manifest_record_path(bundle, record)
         payload = _safe_read_bound_file(
             source, expected_sha256=expected_hash, expected_size=expected_size,
-        )
-        asset_rights = (
-            (license_id, license_status, attribution)
-            if license_status == "declared" else rights
         )
         _append_member(members, exclusions, _core_member(
             archive_path, "report_figure", payload, asset_rights,
@@ -1297,9 +1670,7 @@ def verify_archive_bytes(data: bytes, *, expected_sha256: str | None = None) -> 
             for name in names:
                 risks = _payload_risks(name, archive.read(name))
                 if risks:
-                    raise ArchiveVerificationError(
-                        f"archive member violates public safety policy: {name}: {','.join(risks)}"
-                    )
+                    raise ArchiveVerificationError("archive member violates public safety policy")
         return {
             "schema": RESULT_SCHEMA,
             "ok": True,
@@ -1321,7 +1692,7 @@ def verify_archive_bytes(data: bytes, *, expected_sha256: str | None = None) -> 
             "member_count": None,
             "checksums": "fail",
             "determinism_metadata": "fail",
-            "error": str(redact(str(exc))),
+            "error": str(_public_safe_value(str(exc))),
         }
 
 
@@ -1340,29 +1711,126 @@ def verify_archive_file(
     return verify_archive_bytes(Path(candidate).read_bytes(), expected_sha256=expected_sha256)
 
 
-def _write_recovery_record(directory: Path, archive_name: str, reason: str, temp_name: str) -> Path:
+def _trusted_child_path(directory: TrustedDirectoryHandle, name: str) -> Path:
+    return Path(directory.path) / name
+
+
+def _trusted_exists(directory: TrustedDirectoryHandle, name: str) -> bool:
+    if directory.dir_fd is not None:
+        try:
+            os.stat(name, dir_fd=directory.dir_fd, follow_symlinks=False)
+            return True
+        except FileNotFoundError:
+            return False
+    directory.verify_path()
+    try:
+        os.lstat(_trusted_child_path(directory, name))
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _trusted_open_exclusive(directory: TrustedDirectoryHandle, name: str) -> int:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    if directory.dir_fd is not None:
+        return os.open(name, flags, 0o600, dir_fd=directory.dir_fd)
+    directory.verify_path()
+    return os.open(_trusted_child_path(directory, name), flags, 0o600)
+
+
+def _trusted_unlink(directory: TrustedDirectoryHandle, name: str) -> None:
+    if directory.dir_fd is not None:
+        os.unlink(name, dir_fd=directory.dir_fd)
+        return
+    directory.verify_path()
+    os.unlink(_trusted_child_path(directory, name))
+
+
+def _trusted_link(directory: TrustedDirectoryHandle, source: str, target: str) -> None:
+    directory.verify_path()
+    if directory.dir_fd is not None:
+        os.link(
+            source, target, src_dir_fd=directory.dir_fd,
+            dst_dir_fd=directory.dir_fd, follow_symlinks=False,
+        )
+        return
+    os.link(_trusted_child_path(directory, source), _trusted_child_path(directory, target))
+
+
+def _trusted_read_regular(directory: TrustedDirectoryHandle, name: str) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    if directory.dir_fd is not None:
+        named_before = os.stat(name, dir_fd=directory.dir_fd, follow_symlinks=False)
+    else:
+        directory.verify_path()
+        named_before = os.lstat(_trusted_child_path(directory, name))
+    if _is_symlink_or_reparse(named_before) or not stat.S_ISREG(named_before.st_mode):
+        raise ArchiveVerificationError("archive stage is not a regular file")
+    if directory.dir_fd is not None:
+        descriptor = os.open(name, flags, dir_fd=directory.dir_fd)
+    else:
+        descriptor = os.open(_trusted_child_path(directory, name), flags)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ArchiveVerificationError("archive stage is not a regular file")
+        if directory.dir_fd is not None:
+            named_after = os.stat(name, dir_fd=directory.dir_fd, follow_symlinks=False)
+        else:
+            directory.verify_path()
+            named_after = os.lstat(_trusted_child_path(directory, name))
+        identity = (int(opened.st_dev), int(opened.st_ino))
+        if (
+            _is_symlink_or_reparse(named_after)
+            or not stat.S_ISREG(named_after.st_mode)
+            or (int(named_before.st_dev), int(named_before.st_ino)) != identity
+            or (int(named_after.st_dev), int(named_after.st_ino)) != identity
+        ):
+            raise ArchiveVerificationError("archive stage changed during no-follow open")
+        chunks: list[bytes] = []
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            chunks.append(block)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _trusted_verify_archive(
+    directory: TrustedDirectoryHandle, name: str, *, expected_sha256: str,
+) -> dict[str, Any]:
+    return verify_archive_bytes(
+        _trusted_read_regular(directory, name), expected_sha256=expected_sha256,
+    )
+
+
+def _write_recovery_record(
+    directory: TrustedDirectoryHandle, archive_name: str, reason: str, temp_name: str,
+) -> str:
     record = {
         "schema": "vcstudio.vcs-archive-recovery/v1",
         "archive_name": archive_name,
         "temporary_name": temp_name,
-        "reason": str(redact(reason)),
+        "reason": str(_public_safe_value(str(reason))),
         "action": "Inspect and remove the named temporary file after verifying no final archive exists.",
     }
-    recovery = directory / f".{archive_name}.recovery.json"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-    descriptor = os.open(recovery, flags, 0o600)
+    recovery_name = f".{archive_name}.recovery.json"
+    descriptor = _trusted_open_exclusive(directory, recovery_name)
     with os.fdopen(descriptor, "wb") as handle:
         handle.write(_canonical_bytes(record) + b"\n")
         handle.flush()
         os.fsync(handle.fileno())
-    return recovery
+    return recovery_name
 
 
 def export_archive(
     service: Any,
     path: str,
     revision_id: str,
-    destination_dir: str | os.PathLike[str],
+    destination_dir: str | os.PathLike[str] | TrustedDirectorySelection,
     *,
     expected_plan_sha256: str,
     attachment_providers: Sequence[ArchiveAttachmentProvider] = (),
@@ -1372,68 +1840,79 @@ def export_archive(
     expected_plan = str(expected_plan_sha256 or "").lower()
     if not _HASH.fullmatch(expected_plan):
         raise ValueError("confirmed archive plan hash is invalid")
-    plan = build_archive_plan(
-        service, path, revision_id, attachment_providers=attachment_providers,
+    selection = (
+        destination_dir if isinstance(destination_dir, TrustedDirectorySelection)
+        else capture_trusted_directory(destination_dir)
     )
-    if plan.plan_sha256 != expected_plan:
-        raise StaleRevisionError("archive dry-run changed; review and confirm a new plan")
-    destination = Path(destination_dir)
-    if not destination.is_dir():
-        raise ValueError("archive destination directory is invalid")
-    destination_stat = os.lstat(destination)
-    if _is_symlink_or_reparse(destination_stat) or not stat.S_ISDIR(destination_stat.st_mode):
-        raise ValueError("archive destination must be a regular non-symlink directory")
-    target = destination / plan.archive_name
-    lock_path = destination / f".{plan.archive_name}.lock"
-    temp = destination / f".{plan.archive_name}.tmp-{uuid.uuid4().hex}"
-    final_created = False
-    with _exclusive_file_lock(lock_path):
-        if target.exists() or target.is_symlink():
-            raise FileExistsError("archive filename already exists and will not be overwritten")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-        descriptor = os.open(temp, flags, 0o600)
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                descriptor = -1
-                handle.write(plan._archive_bytes)
-                handle.flush()
-                os.fsync(handle.fileno())
-            staged = verify_archive_file(temp, expected_sha256=plan.archive_sha256)
-            if staged.get("ok") is not True:
-                raise ArchiveVerificationError(
-                    str(staged.get("error") or "staged archive verification failed")
+    with open_trusted_directory(selection) as destination:
+        plan = build_archive_plan(
+            service, path, revision_id, attachment_providers=attachment_providers,
+        )
+        if plan.plan_sha256 != expected_plan:
+            raise StaleRevisionError("archive dry-run changed; review and confirm a new plan")
+        destination.verify_path()
+        target_name = plan.archive_name
+        lock_name = f".{plan.archive_name}.lock"
+        temp_name = f".{plan.archive_name}.tmp-{uuid.uuid4().hex}"
+        lock_path = (
+            Path(lock_name) if destination.dir_fd is not None
+            else _trusted_child_path(destination, lock_name)
+        )
+        final_created = False
+        with _exclusive_file_lock(lock_path, dir_fd=destination.dir_fd):
+            destination.verify_path()
+            if _trusted_exists(destination, target_name):
+                raise FileExistsError("archive filename already exists and will not be overwritten")
+            descriptor = _trusted_open_exclusive(destination, temp_name)
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    descriptor = -1
+                    handle.write(plan._archive_bytes)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                staged = _trusted_verify_archive(
+                    destination, temp_name, expected_sha256=plan.archive_sha256,
                 )
-            # A hard link makes the complete staged inode visible under the final
-            # name atomically and fails if another process created that name.
-            os.link(temp, target)
-            final_created = True
-            temp.unlink()
-            final = verify_archive_file(target, expected_sha256=plan.archive_sha256)
-            if final.get("ok") is not True:
-                raise ArchiveVerificationError(
-                    str(final.get("error") or "published archive verification failed")
+                if staged.get("ok") is not True:
+                    raise ArchiveVerificationError(
+                        str(staged.get("error") or "staged archive verification failed")
+                    )
+                destination.verify_path()
+                # Publish relative to the pinned directory inode.  The link is
+                # atomic and fails if another process already owns the name.
+                _trusted_link(destination, temp_name, target_name)
+                final_created = True
+                _trusted_unlink(destination, temp_name)
+                destination.verify_path()
+                final = _trusted_verify_archive(
+                    destination, target_name, expected_sha256=plan.archive_sha256,
                 )
-        except Exception as exc:
-            if descriptor >= 0:
-                os.close(descriptor)
-            cleanup_errors: list[str] = []
-            if final_created:
+                if final.get("ok") is not True:
+                    raise ArchiveVerificationError(
+                        str(final.get("error") or "published archive verification failed")
+                    )
+                destination.verify_path()
+            except Exception as exc:
+                if descriptor >= 0:
+                    os.close(descriptor)
+                cleanup_errors: list[str] = []
+                if final_created:
+                    try:
+                        _trusted_unlink(destination, target_name)
+                    except Exception as cleanup_exc:  # noqa: BLE001 - retain recovery evidence
+                        cleanup_errors.append(str(cleanup_exc))
                 try:
-                    target.unlink()
+                    _trusted_unlink(destination, temp_name)
+                except FileNotFoundError:
+                    pass
                 except Exception as cleanup_exc:  # noqa: BLE001 - retain recovery evidence
                     cleanup_errors.append(str(cleanup_exc))
-            try:
-                temp.unlink()
-            except FileNotFoundError:
-                pass
-            except Exception as cleanup_exc:  # noqa: BLE001 - retain recovery evidence
-                cleanup_errors.append(str(cleanup_exc))
-            if cleanup_errors:
-                _write_recovery_record(
-                    destination, plan.archive_name,
-                    f"{exc}; cleanup: {'; '.join(cleanup_errors)}", temp.name,
-                )
-            raise
+                if cleanup_errors:
+                    _write_recovery_record(
+                        destination, plan.archive_name,
+                        f"{exc}; cleanup: {'; '.join(cleanup_errors)}", temp_name,
+                    )
+                raise
     return {
         "schema": RESULT_SCHEMA,
         "ok": True,

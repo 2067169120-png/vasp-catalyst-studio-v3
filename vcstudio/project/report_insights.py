@@ -8,6 +8,7 @@ frozen contracts/model/manifest.  Public projections deliberately omit paths.
 from __future__ import annotations
 
 import copy
+import contextlib
 import hashlib
 import io
 import json
@@ -15,6 +16,7 @@ import math
 import os
 import re
 import secrets
+import stat
 import threading
 import time
 import zipfile
@@ -684,6 +686,234 @@ def build_capsule_bytes(bundle: FrozenRevision) -> bytes:
     return output.getvalue()
 
 
+@dataclass(frozen=True)
+class TrustedDirectorySelection:
+    """Private path plus the OS identity captured by a destination token."""
+
+    path: str
+    identity: tuple[str, int, int]
+
+    def __fspath__(self) -> str:
+        return self.path
+
+
+@dataclass
+class TrustedDirectoryHandle:
+    """Pinned directory capability used for relative archive filesystem calls."""
+
+    selection: TrustedDirectorySelection
+    dir_fd: int | None = None
+    windows_handle: Any = None
+    windows_guard_handle: Any = None
+
+    @property
+    def path(self) -> str:
+        return self.selection.path
+
+    def verify_path(self) -> None:
+        current = capture_trusted_directory(self.selection.path)
+        if current.identity != self.selection.identity:
+            raise ValueError("destination directory entity changed")
+
+
+def _is_symlink_or_reparse(value: os.stat_result) -> bool:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return stat.S_ISLNK(value.st_mode) or bool(
+        getattr(value, "st_file_attributes", 0) & reparse_flag
+    )
+
+
+def _windows_directory_handle(path: str) -> tuple[Any, tuple[str, int, int]]:
+    import ctypes
+    from ctypes import wintypes
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", wintypes.FILETIME),
+            ("ftLastAccessTime", wintypes.FILETIME),
+            ("ftLastWriteTime", wintypes.FILETIME),
+            ("dwVolumeSerialNumber", wintypes.DWORD),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+            ("nNumberOfLinks", wintypes.DWORD),
+            ("nFileIndexHigh", wintypes.DWORD),
+            ("nFileIndexLow", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    get_info = kernel32.GetFileInformationByHandle
+    get_info.argtypes = (wintypes.HANDLE, ctypes.POINTER(_ByHandleFileInformation))
+    get_info.restype = wintypes.BOOL
+    handle = create_file(
+        path, 0, 0x1 | 0x2, None, 3, 0x02000000 | 0x00200000, None,
+    )
+    invalid = wintypes.HANDLE(-1).value
+    if handle == invalid:
+        raise OSError(ctypes.get_last_error(), "unable to open destination directory safely")
+    info = _ByHandleFileInformation()
+    try:
+        if not get_info(handle, ctypes.byref(info)):
+            raise OSError(ctypes.get_last_error(), "unable to inspect destination directory")
+        if info.dwFileAttributes & 0x400 or not info.dwFileAttributes & 0x10:
+            raise ValueError("destination must be a non-reparse directory")
+        file_id = (int(info.nFileIndexHigh) << 32) | int(info.nFileIndexLow)
+        identity = ("windows", int(info.dwVolumeSerialNumber), file_id)
+        return handle, identity
+    except Exception:
+        kernel32.CloseHandle(handle)
+        raise
+
+
+def _close_windows_handle(handle: Any) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    close_handle(handle)
+
+
+def _windows_handle_final_path(handle: Any) -> str:
+    """Return one normalized DOS path for an already-open Windows handle."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    get_final_path = ctypes.WinDLL(
+        "kernel32", use_last_error=True,
+    ).GetFinalPathNameByHandleW
+    get_final_path.argtypes = (
+        wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD,
+    )
+    get_final_path.restype = wintypes.DWORD
+    size = 512
+    while True:
+        buffer = ctypes.create_unicode_buffer(size)
+        length = get_final_path(handle, buffer, size, 0)
+        if length == 0:
+            raise OSError(ctypes.get_last_error(), "unable to resolve trusted handle path")
+        if length < size:
+            value = buffer.value
+            break
+        size = int(length) + 1
+    if value.startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    return os.path.normcase(os.path.normpath(value))
+
+
+def _windows_directory_guard(path: str) -> Any:
+    """Pin a Windows directory namespace with an unshared delete-on-close child."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    create_file = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    guard_path = os.path.join(path, f".vcs-directory-guard-{secrets.token_hex(16)}")
+    handle = create_file(
+        guard_path,
+        0x80000000 | 0x40000000 | 0x00010000,
+        0x1 | 0x2,
+        None,
+        1,
+        0x2 | 0x100 | 0x04000000 | 0x00200000,
+        None,
+    )
+    invalid = wintypes.HANDLE(-1).value
+    if handle == invalid:
+        raise OSError(ctypes.get_last_error(), "unable to pin destination directory")
+    return handle
+
+
+def capture_trusted_directory(directory: str | os.PathLike[str]) -> TrustedDirectorySelection:
+    """Capture a non-symlink directory's stable volume/file identity."""
+
+    requested = os.path.abspath(os.fspath(directory))
+    before = os.lstat(requested)
+    if _is_symlink_or_reparse(before) or not stat.S_ISDIR(before.st_mode):
+        raise ValueError("destination must be a regular non-symlink directory")
+    # Open the exact selected namespace entry with no-follow semantics.  Calling
+    # realpath here would introduce a second path-resolution race before the
+    # entity identity is captured.
+    target = requested
+    if os.name == "nt":
+        handle, identity = _windows_directory_handle(target)
+        _close_windows_handle(handle)
+    else:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(target, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISDIR(opened.st_mode):
+                raise ValueError("destination is not a directory")
+            identity = ("posix", int(opened.st_dev), int(opened.st_ino))
+        finally:
+            os.close(descriptor)
+    return TrustedDirectorySelection(target, identity)
+
+
+@contextlib.contextmanager
+def open_trusted_directory(selection: TrustedDirectorySelection):
+    """Open and pin exactly the directory entity captured by ``selection``."""
+
+    if not isinstance(selection, TrustedDirectorySelection):
+        raise TypeError("trusted destination selection is required")
+    if os.name == "nt":
+        handle, identity = _windows_directory_handle(selection.path)
+        if identity != selection.identity:
+            _close_windows_handle(handle)
+            raise ValueError("destination directory entity changed")
+        guard_handle = None
+        try:
+            guard_handle = _windows_directory_guard(selection.path)
+            trusted_path = _windows_handle_final_path(handle)
+            guard_parent = os.path.dirname(_windows_handle_final_path(guard_handle))
+            if guard_parent != trusted_path:
+                raise ValueError("destination directory guard escaped trusted entity")
+            checked_handle, checked_identity = _windows_directory_handle(selection.path)
+            _close_windows_handle(checked_handle)
+            if checked_identity != selection.identity:
+                raise ValueError("destination directory entity changed")
+            trusted = TrustedDirectoryHandle(
+                selection=selection, windows_handle=handle,
+                windows_guard_handle=guard_handle,
+            )
+            trusted.verify_path()
+            yield trusted
+        finally:
+            if guard_handle is not None:
+                _close_windows_handle(guard_handle)
+            _close_windows_handle(handle)
+    else:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(selection.path, flags)
+        opened = os.fstat(descriptor)
+        identity = ("posix", int(opened.st_dev), int(opened.st_ino))
+        if identity != selection.identity or not stat.S_ISDIR(opened.st_mode):
+            os.close(descriptor)
+            raise ValueError("destination directory entity changed")
+        trusted = TrustedDirectoryHandle(selection=selection, dir_fd=descriptor)
+        try:
+            trusted.verify_path()
+            yield trusted
+        finally:
+            os.close(descriptor)
+
+
 class OpaqueDestinationRegistry:
     """Bounded process-local destination selections with optional purpose binding."""
 
@@ -709,21 +939,22 @@ class OpaqueDestinationRegistry:
         self._schema = str(schema)
         self._purpose = str(purpose)
         self._token_prefix = str(token_prefix)
-        self._items: dict[str, tuple[str, float, str | None]] = {}
+        self._items: dict[str, tuple[TrustedDirectorySelection, float, str | None]] = {}
 
     def _prune_expired_locked(self, now: float) -> None:
         expired = [
             token
-            for token, (_target, created_at, _binding) in self._items.items()
+            for token, (_selection, created_at, _binding) in self._items.items()
             if now - created_at >= self._ttl_seconds
         ]
         for token in expired:
             self._items.pop(token, None)
 
     def register(self, directory: str, *, binding: str | None = None) -> dict[str, Any]:
-        target = os.path.realpath(os.path.abspath(str(directory or "")))
-        if not os.path.isdir(target):
-            raise ValueError(f"{self._purpose} destination directory is invalid")
+        try:
+            selection = capture_trusted_directory(str(directory or ""))
+        except Exception as exc:
+            raise ValueError(f"{self._purpose} destination directory is invalid") from exc
         with self._lock:
             now = float(self._clock())
             self._prune_expired_locked(now)
@@ -736,12 +967,19 @@ class OpaqueDestinationRegistry:
             token = self._token_prefix + secrets.token_urlsafe(24)
             while token in self._items:
                 token = self._token_prefix + secrets.token_urlsafe(24)
-            self._items[token] = (target, now, None if binding is None else str(binding))
-        display_name = redact(os.path.basename(target) or "selected directory")
+            self._items[token] = (selection, now, None if binding is None else str(binding))
+        display_name = redact(os.path.basename(selection.path) or "selected directory")
         return {"schema": self._schema, "destination_token": token,
                 "display_name": str(display_name)}
 
     def consume(self, token: str, *, expected_binding: str | None = None) -> str:
+        return self.consume_trusted(
+            token, expected_binding=expected_binding,
+        ).path
+
+    def consume_trusted(
+        self, token: str, *, expected_binding: str | None = None,
+    ) -> TrustedDirectorySelection:
         with self._lock:
             now = float(self._clock())
             self._prune_expired_locked(now)
@@ -751,7 +989,13 @@ class OpaqueDestinationRegistry:
         binding = selected[2]
         if expected_binding is not None and binding != str(expected_binding):
             raise ValueError(f"{self._purpose} destination token binding mismatch")
-        return selected[0]
+        selection = selected[0]
+        try:
+            with open_trusted_directory(selection):
+                pass
+        except Exception as exc:
+            raise ValueError(f"{self._purpose} destination directory changed") from exc
+        return selection
 
 
 class CapsuleDestinations(OpaqueDestinationRegistry):
@@ -807,6 +1051,7 @@ def export_capsule(service: Any, path: str, revision_id: str,
 __all__ = [
     "CAPSULE_SCHEMA", "DESTINATION_SCHEMA", "DIFF_SCHEMA", "GRAPH_SCHEMA",
     "CapsuleDestinations", "OpaqueDestinationRegistry", "build_capsule_bytes", "capsule_members",
+    "TrustedDirectoryHandle", "TrustedDirectorySelection", "capture_trusted_directory",
     "evidence_graph", "export_capsule", "load_frozen_revision", "redact",
-    "scientific_diff", "StaleRevisionError",
+    "open_trusted_directory", "scientific_diff", "StaleRevisionError",
 ]
