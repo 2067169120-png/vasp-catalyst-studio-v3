@@ -2704,10 +2704,67 @@ def _restore_local_restart_file(path: str, round_number: int,
         os.remove(path)
 
 
+def _assert_expected_repair_cas(job_dir: str, manifest: dict,
+                                expected: dict | None) -> None:
+    """Re-check a trajectory repair content CAS under the local job lock."""
+    if expected is None:
+        return
+    if not isinstance(expected, dict) or expected.get('schema') != 'vcstudio.repair-cas/v1':
+        raise ValueError('续算修复 CAS 格式无效，未执行远程操作')
+    root = _canonical_job_dir(job_dir)
+    expected_files = expected.get('files')
+    if not isinstance(expected_files, dict):
+        raise ValueError('续算修复 CAS 缺少文件证据，未执行远程操作')
+    if not {'job.yaml', 'INCAR', 'CONTCAR'}.issubset(expected_files):
+        raise ValueError('续算修复 CAS 缺少关键文件证据，未执行远程操作')
+    files = {}
+    for raw_name, digest in expected_files.items():
+        name = str(raw_name or '').replace('\\', '/')
+        candidate = os.path.realpath(os.path.join(root, *name.split('/')))
+        try:
+            common = os.path.commonpath([root, candidate])
+        except ValueError as exc:
+            raise ValueError('续算修复 CAS 文件名无效，未执行远程操作') from exc
+        if (not name or name.startswith('/') or '..' in name.split('/')
+                or common != root or not os.path.isfile(candidate)):
+            raise ValueError('续算修复 CAS 文件证据无效，未执行远程操作')
+        current_digest, _size = _file_sha256_size(candidate)
+        files[name] = current_digest
+        if current_digest != str(digest or ''):
+            raise ValueError('续算修复证据内容已变化，未执行远程操作')
+    diagnosis = ((manifest.get('results') or {}).get('diagnosis') or {})
+    diagnosis_raw = json.dumps(
+        diagnosis, ensure_ascii=False, sort_keys=True,
+        separators=(',', ':')).encode('utf-8')
+    current = {
+        'schema': 'vcstudio.repair-cas/v1',
+        'ledger_job_id': expected.get('ledger_job_id'),
+        'manifest_job_id': str(manifest.get('job_id')
+                               or expected.get('ledger_job_id') or ''),
+        'manifest_state': str(manifest.get('state') or ''),
+        'scheduler_job_id': str(manifest.get('scheduler_job_id') or ''),
+        'diagnosis_sha256': hashlib.sha256(diagnosis_raw).hexdigest(),
+        'diagnosis_evidence_file': expected.get('diagnosis_evidence_file'),
+        'source_hash': expected.get('source_hash'),
+        'files': files,
+    }
+    if current != expected:
+        raise ValueError('续算修复 CAS 绑定已变化，未执行远程操作')
+
+
+def assert_repair_content_cas(job_dir: str, expected: dict | None) -> None:
+    """Public local-only preflight used before the connection seam."""
+    value = manifest_mod.load_manifest(job_dir)
+    if value is None:
+        raise ValueError('作业目录缺 job.yaml，续算修复 CAS 无法复证')
+    _assert_expected_repair_cas(job_dir, value, expected)
+
+
 @_serialized_job_argument(2, '续算')
 def continue_from_contcar(client, profile, job_dir: str,
                           max_rounds: int = CONTINUE_MAX_ROUNDS, *,
-                          idempotency_key: str | None = None) -> dict:
+                          idempotency_key: str | None = None,
+                          expected_cas: dict | None = None) -> dict:
     """把一个可续算作业从 CONTCAR 接着跑(cp CONTCAR POSCAR + 冻结 INCAR 重投同一脚本)。
 
     有界恢复(论文核心 + 交接三不变式):
@@ -2723,6 +2780,7 @@ def continue_from_contcar(client, profile, job_dir: str,
     m = manifest_mod.load_manifest(job_dir)
     if m is None:
         raise ValueError('作业目录缺 job.yaml,无法续算')
+    _assert_expected_repair_cas(job_dir, m, expected_cas)
     if _job_engine(m) != 'vasp':
         contract = get_run_contract(_job_engine(m))
         raise ValueError(

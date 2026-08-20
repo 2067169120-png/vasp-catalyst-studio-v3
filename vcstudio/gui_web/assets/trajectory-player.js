@@ -213,10 +213,20 @@
     if (button) button.addEventListener('click', () => onConfirm(preview, button));
   }
 
+  function createIntentGate() {
+    let generation = 0;
+    return {
+      begin: () => { generation += 1; return generation; },
+      valid: intent => intent === generation,
+      invalidate: () => { generation += 1; },
+    };
+  }
+
   async function openPlayer(jobId, title) {
     const root = buildShell(title);
     let chart = null, viewer = null, closed = false;
     let overview = null, page = null, offset = 0, stride = 1;
+    const intentGate = createIntentGate();
     const modal = VCS.modal({
       title: tr('trajectory.title', { title }, '轨迹与诊断 — {title}', 'Trajectory and diagnostics — {title}'),
       body: root,
@@ -227,6 +237,7 @@
     const close = modal.close;
     modal.close = function () {
       closed = true;
+      intentGate.invalidate();
       if (chart) chart.dispose();
       if (viewer) { try { viewer.clear(); } catch (_) { /* no-op */ } }
       close();
@@ -239,11 +250,13 @@
     const next = root.querySelector('.tp-next');
     const strideSelect = root.querySelector('.tp-stride');
 
-    async function showFrame(token) {
+    async function showFrame(token, inheritedIntent) {
       if (!token || closed) return;
+      const intent = inheritedIntent === undefined
+        ? intentGate.begin() : inheritedIntent;
       status.textContent = tr('trajectory.frame_loading', {}, '正在读取结构帧…', 'Loading structure frame…');
       const frame = await VCS.call('trajectory_frame', token);
-      if (closed) return;
+      if (closed || !intentGate.valid(intent)) return;
       if (!frame || frame.ok === false) {
         status.textContent = (frame && frame.error) || tr('trajectory.frame_failed', {},
           '结构帧读取失败。', 'Failed to load the structure frame.');
@@ -264,10 +277,11 @@
     }
 
     async function loadPage(wantedOffset) {
+      const intent = intentGate.begin();
       status.textContent = tr('trajectory.page_loading', {}, '正在读取分页步骤…', 'Loading paged steps…');
       const response = await VCS.call('trajectory_steps', overview.session_token,
         wantedOffset, 50, stride);
-      if (closed) return;
+      if (closed || !intentGate.valid(intent)) return;
       if (!response || response.ok === false) {
         status.textContent = (response && response.error) || tr('trajectory.page_failed', {},
           '步骤页读取失败。', 'Failed to load the step page.');
@@ -289,7 +303,7 @@
           'Sources are still being written; only complete steps are shown. Refresh for a new snapshot.')
         : tr('trajectory.ready', {}, '只读快照已就绪。', 'Read-only snapshot ready.');
       if (response.rows.length && response.rows[0].frame_token) {
-        await showFrame(response.rows[0].frame_token);
+        await showFrame(response.rows[0].frame_token, intent);
       }
     }
 
@@ -346,6 +360,7 @@
   if (window.__VCS_TEST__) {
     window.__VCS_TRAJECTORY_TEST__ = {
       rowsHtml, methodDiffHtml, buildShell, renderRepair, stepLabel, anomalyText,
+      createIntentGate,
     };
   }
 })();

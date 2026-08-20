@@ -153,6 +153,33 @@ assert.strictEqual(confirmed, 1);
     _run_node(script, str(ASSETS / 'trajectory-player.js'))
 
 
+def test_page_and_frame_share_one_intent_generation_gate():
+    player = _source('trajectory-player.js')
+    assert 'const intentGate = createIntentGate();' in player
+    assert 'const intent = intentGate.begin();' in player
+    assert 'if (closed || !intentGate.valid(intent)) return;' in player
+    assert 'await showFrame(response.rows[0].frame_token, intent);' in player
+    script = r"""
+const fs = require('fs');
+const vm = require('vm');
+const assert = require('assert');
+global.window = { __VCS_TEST__: true };
+global.document = { createElement: () => ({}) };
+global.VCS = { i18n: { lang: 'en' }, t: (_k, _p, fallback) => fallback,
+  esc: value => String(value == null ? '' : value) };
+vm.runInThisContext(fs.readFileSync(process.argv[1], 'utf8'));
+const gate = window.__VCS_TRAJECTORY_TEST__.createIntentGate();
+const oldPage = gate.begin();
+assert.strictEqual(gate.valid(oldPage), true);
+const newerFrame = gate.begin();
+assert.strictEqual(gate.valid(oldPage), false);
+assert.strictEqual(gate.valid(newerFrame), true);
+gate.invalidate();
+assert.strictEqual(gate.valid(newerFrame), false);
+"""
+    _run_node(script, str(ASSETS / 'trajectory-player.js'))
+
+
 def test_node_syntax_and_index_references_have_no_missing_local_asset():
     node = shutil.which('node')
     if not node:

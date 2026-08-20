@@ -287,3 +287,22 @@ def test_continue_batch_survives_error(monkeypatch):
     payload = batch_ops.continue_batch(object(), None, ['bad', 'good'], False)
     assert [r[1] for r in payload['results']] == [False, True]
     assert client.closed and jump.closed
+
+
+def test_continue_batch_rejects_cas_before_opening_connection(monkeypatch):
+    opened = []
+    monkeypatch.setattr(
+        batch_ops, 'open_client',
+        lambda *_args, **_kwargs: opened.append(True) or (_ for _ in ()).throw(
+            AssertionError('connection seam must not be reached')))
+    monkeypatch.setattr(
+        batch_ops.submitter, 'assert_repair_content_cas',
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError('same-size replacement')))
+    payload = batch_ops.continue_batch(
+        object(), None, ['d1'], False,
+        idempotency_key='trajectory-repair:cas-preflight',
+        expected_cas_by_job={'d1': {'schema': 'vcstudio.repair-cas/v1'}})
+    assert payload['ok'] is False
+    assert '未建立远程连接' in payload['error']
+    assert opened == []

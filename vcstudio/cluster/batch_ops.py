@@ -180,8 +180,24 @@ def filter_continuable(dirs):
     return eligible, skipped
 
 
-def continue_batch(prof, pw, dirs, trust_new, *, idempotency_key=None):
+def continue_batch(prof, pw, dirs, trust_new, *, idempotency_key=None,
+                   expected_cas_by_job=None):
     """CONTCAR 续算批量线程体:每作业调 submitter.continue_from_contcar(不可续算的自失败)。"""
+    if expected_cas_by_job is not None:
+        rejected = []
+        for d in dirs:
+            expected = (expected_cas_by_job.get(os.path.realpath(d))
+                        or expected_cas_by_job.get(str(d))
+                        if isinstance(expected_cas_by_job, dict) else None)
+            try:
+                if expected is None:
+                    raise ValueError('续算修复 CAS 未绑定当前作业，未建立远程连接')
+                submitter.assert_repair_content_cas(d, expected)
+            except (OSError, ValueError, RuntimeError) as exc:
+                rejected.append((d, False, str(exc)))
+        if rejected:
+            return {'ok': False, 'needs_trust': False, 'results': rejected,
+                    'error': '续算修复 CAS 预检失败，未建立远程连接'}
     try:
         client, jump = open_client(prof, pw, trust_new=trust_new)
     except ConnectError as e:
@@ -195,9 +211,14 @@ def continue_batch(prof, pw, dirs, trust_new, *, idempotency_key=None):
     try:
         for d in dirs:
             try:
-                if idempotency_key:
+                expected_cas = None
+                if isinstance(expected_cas_by_job, dict):
+                    expected_cas = (expected_cas_by_job.get(os.path.realpath(d))
+                                    or expected_cas_by_job.get(str(d)))
+                if idempotency_key or expected_cas is not None:
                     m = submitter.continue_from_contcar(
-                        client, prof, d, idempotency_key=idempotency_key)
+                        client, prof, d, idempotency_key=idempotency_key,
+                        expected_cas=expected_cas)
                 else:
                     # Preserve the historical injectable three-argument seam.
                     m = submitter.continue_from_contcar(client, prof, d)

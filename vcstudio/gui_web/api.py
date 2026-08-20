@@ -2464,11 +2464,12 @@ class Api:
             return {'error': str(e)}
 
     @staticmethod
-    def _job_operation_fingerprint(action, profile, dirs):
+    def _job_operation_fingerprint(action, profile, dirs, binding=None):
         payload = {
             'action': str(action or ''),
             'profile': str(profile or ''),
             'dirs': sorted({str(item) for item in (dirs or [])}),
+            'binding': copy.deepcopy(binding) if binding else None,
         }
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True,
                          separators=(',', ':')).encode('utf-8')
@@ -2478,19 +2479,19 @@ class Api:
     def _job_batch_with_idempotency(function, *args, idempotency_key=None, **kwargs):
         """Pass an operation id exactly once when an injected adapter supports it."""
         try:
-            parameters = inspect.signature(function).parameters.values()
+            parameters = inspect.signature(function).parameters
         except (TypeError, ValueError):
-            parameters = ()
-        supports_key = any(
-            parameter.name == 'idempotency_key'
-            or parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters
-        )
-        if supports_key:
-            call_kwargs = dict(kwargs)
+            parameters = {}
+        supports_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values())
+        call_kwargs = {
+            name: value for name, value in kwargs.items()
+            if supports_kwargs or name in parameters
+        }
+        if supports_kwargs or 'idempotency_key' in parameters:
             call_kwargs['idempotency_key'] = idempotency_key
-            return function(*args, **call_kwargs)
-        return function(*args, **kwargs)
+        return function(*args, **call_kwargs)
 
     @staticmethod
     def _submit_batch_with_idempotency(submit_batch, profile, password, dirs,
@@ -2506,7 +2507,8 @@ class Api:
             submit_batch, profile, password, list(dirs), trust_new,
             idempotency_key=idempotency_key)
 
-    def _run_job_operation_once(self, idempotency_key, *, action, profile, dirs, invoke):
+    def _run_job_operation_once(self, idempotency_key, *, action, profile, dirs, invoke,
+                                binding=None):
         """Run one mutating remote batch exactly once per client operation key.
 
         Password discovery and host-key confirmation deliberately happen before this seam.  Their
@@ -2520,7 +2522,7 @@ class Api:
         if len(key) > 128 or not re.fullmatch(r'[A-Za-z0-9_.:-]{12,128}', key):
             return {'ok': False, 'busy': False, 'duplicate': False,
                     'error': '无效的作业操作请求标识'}
-        fingerprint = self._job_operation_fingerprint(action, profile, dirs)
+        fingerprint = self._job_operation_fingerprint(action, profile, dirs, binding)
         now = time.monotonic()
         with self._job_operation_lock:
             # 有界缓存避免长期开机时无限增长；正在执行的记录绝不逐出。
@@ -2606,14 +2608,17 @@ class Api:
             return self._bo().fetch_batch(prof, pw, list(dirs), trust_new, files)
         return self._delegate(name, password, _fetch)
 
-    def continue_jobs(self, dirs, name, password, trust_new=False, idempotency_key=None):
+    def continue_jobs(self, dirs, name, password, trust_new=False, idempotency_key=None,
+                      expected_cas_by_job=None):
         return self._delegate(name, password,
                               lambda prof, pw: self._run_job_operation_once(
                                   idempotency_key, action='continue', profile=prof.name,
-                                  dirs=dirs, invoke=lambda: self._job_batch_with_idempotency(
+                                  dirs=dirs, binding=expected_cas_by_job,
+                                  invoke=lambda: self._job_batch_with_idempotency(
                                       self._bo().continue_batch,
                                       prof, pw, list(dirs), trust_new,
-                                      idempotency_key=idempotency_key)))
+                                      idempotency_key=idempotency_key,
+                                      expected_cas_by_job=expected_cas_by_job)))
 
     def refresh_status(self, name, password, trust_new=False):
         """Refresh one profile without racing the background supervisor."""
@@ -15952,33 +15957,76 @@ class Api:
         return out
 
     # ── 结构—轨迹—诊断播放器（opaque job/frame token only）──────────────
+    @classmethod
+    def _trajectory_public_value(cls, value, *, field=''):
+        """Recursively project every trajectory success DTO to public data."""
+        if isinstance(value, dict):
+            denied = {
+                'path', 'local_path', 'source_path', 'job_dir', 'remote_dir',
+                'command', 'command_line', 'shell_command', 'argv', 'stdout',
+                'stderr', 'password', 'secret', 'authorization', 'api_key',
+                'access_key', 'environment',
+            }
+            return {
+                str(key): cls._trajectory_public_value(item, field=str(key))
+                for key, item in value.items() if str(key).lower() not in denied
+            }
+        if isinstance(value, (list, tuple)):
+            return [cls._trajectory_public_value(item, field=field) for item in value]
+        if not isinstance(value, str):
+            return copy.deepcopy(value)
+        if field == 'xyz':
+            # XYZ is generated from a server-selected allow-listed frame, never
+            # copied from a diagnostic message or path-bearing source field.
+            return value
+        text = cls._workspace_public_text(value, limit=8000)
+        text = re.sub(
+            r'(?i)\b(?:bearer\s+|sk-|ghp_|github_pat_)[A-Za-z0-9._~+\-/=]+',
+            '<redacted-secret>', text)
+        text = re.sub(
+            r'(?i)\b(?:password|passwd|secret|authorization|api[_-]?key)\s*[:=]\s*\S+',
+            '<redacted-secret>', text)
+        contextual = field.lower() in {
+            'warning', 'warnings', 'evidence', 'detected_evidence', 'error',
+            'message', 'notes', 'issues', 'summary',
+        }
+        if contextual and re.search(
+                r'(?i)(?:^|\s)(?:qsub|sbatch|srun|ssh|scp|mpirun|vasp_std|'
+                r'vasp_gam|vasp_ncl|rm|cp|mv|cd)\s+', text):
+            return '<redacted-command>'
+        return text
+
     def trajectory_open(self, job_id, kind=None):
         try:
             record = self._resolve_workspace_job_id(job_id)
-            return self._trj().open(
+            result = self._trj().open(
                 record['job_dir'], record['job_id'], kind=(str(kind).strip() if kind else None))
+            return self._trajectory_public_value(result)
         except Exception as exc:                          # noqa: BLE001 public boundary
             return {'ok': False, 'stale': False,
                     'error': self._workspace_public_text(exc)}
 
     def trajectory_steps(self, session_token, offset=0, limit=50, stride=1):
         try:
-            return self._trj().steps(
+            result = self._trj().steps(
                 str(session_token or ''), offset=offset, limit=limit, stride=stride)
+            return self._trajectory_public_value(result)
         except Exception as exc:                          # noqa: BLE001 public boundary
             return {'ok': False, 'stale': False,
                     'error': self._workspace_public_text(exc)}
 
     def trajectory_frame(self, frame_token):
         try:
-            return self._trj().frame(str(frame_token or ''))
+            return self._trajectory_public_value(
+                self._trj().frame(str(frame_token or '')))
         except Exception as exc:                          # noqa: BLE001 public boundary
             return {'ok': False, 'stale': False,
                     'error': self._workspace_public_text(exc)}
 
     def trajectory_repair_preview(self, session_token):
         try:
-            return self._trj().repair_preview(str(session_token or ''))
+            return self._trajectory_public_value(
+                self._trj().repair_preview(str(session_token or '')))
         except Exception as exc:                          # noqa: BLE001 public boundary
             return {'ok': False, 'stale': False,
                     'error': self._workspace_public_text(exc)}
@@ -16013,9 +16061,21 @@ class Api:
             if (os.path.realpath(current['job_dir'])
                     != os.path.realpath(str(prepared['job_dir']))):
                 raise RuntimeError('job registry binding changed; repair remains paused')
+            expected_cas = self._trj().assert_repair_cas(
+                prepared, ledger_job_id=current['job_id'], manifest=current['manifest'])
+            continue_kwargs = {'idempotency_key': prepared['operation_key']}
+            try:
+                continue_parameters = inspect.signature(self.continue_jobs).parameters
+            except (TypeError, ValueError):
+                continue_parameters = {}
+            if ('expected_cas_by_job' in continue_parameters
+                    or any(item.kind == inspect.Parameter.VAR_KEYWORD
+                           for item in continue_parameters.values())):
+                continue_kwargs['expected_cas_by_job'] = {
+                    os.path.realpath(current['job_dir']): expected_cas,
+                }
             result = self.continue_jobs(
-                [current['job_dir']], name, password, trust_new,
-                idempotency_key=prepared['operation_key'])
+                [current['job_dir']], name, password, trust_new, **continue_kwargs)
             public = self._public_repair_operation(result, prepared['job_id'])
             provisional = (bool(result.get('needs_trust'))
                            or result.get('error') == 'NEED_PASSWORD'
@@ -16027,7 +16087,7 @@ class Api:
             if not provisional:
                 public['correction_outcome'] = self._trj().record_repair_outcome(
                     prepared, result)
-            return public
+            return self._trajectory_public_value(public)
         except Exception as exc:                          # noqa: BLE001 public boundary
             return {'ok': False, 'stale': False,
                     'error': self._workspace_public_text(exc)}

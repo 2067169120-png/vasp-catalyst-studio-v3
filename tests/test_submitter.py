@@ -1,4 +1,6 @@
 """提交编排测试:注入假 client/sftp,验证 preflight/上传/提交/状态刷新与 manifest 回写。"""
+import hashlib
+import json
 import os
 import posixpath
 import threading
@@ -633,6 +635,43 @@ def test_continue_from_contcar_happy(tmp_path):
                 'fetched_job_id', 'fetched_remote_dir'):
         assert key not in m['results']                           # 新轮尚未下载，旧证据清零
     assert os.path.isfile(os.path.join(d, 'OUTCAR'))             # 旧文件保留作审计，不算新轮证据
+
+
+def test_continue_rechecks_content_cas_before_any_remote_command(tmp_path):
+    d = _restartable_job(tmp_path)
+    value = manifest.load_manifest(d)
+    incar = os.path.join(d, 'INCAR')
+    contcar = os.path.join(d, 'CONTCAR')
+    with open(contcar, 'w', encoding='utf-8') as handle:
+        handle.write(_VALID_CONTCAR)
+    files = {}
+    for name in ('job.yaml', 'INCAR', 'CONTCAR'):
+        files[name], _size = submitter._file_sha256_size(os.path.join(d, name))
+    diagnosis = (value.get('results') or {}).get('diagnosis') or {}
+    diagnosis_digest = hashlib.sha256(json.dumps(
+        diagnosis, ensure_ascii=False, sort_keys=True,
+        separators=(',', ':')).encode('utf-8')).hexdigest()
+    expected = {
+        'schema': 'vcstudio.repair-cas/v1', 'ledger_job_id': value['job_id'],
+        'manifest_job_id': value['job_id'], 'manifest_state': value['state'],
+        'scheduler_job_id': value['scheduler_job_id'],
+        'diagnosis_sha256': diagnosis_digest,
+        'diagnosis_evidence_file': None, 'source_hash': 's' * 64,
+        'files': files,
+    }
+    before = os.stat(incar)
+    data = open(incar, 'rb').read()
+    assert b'400' in data
+    with open(incar, 'wb') as handle:
+        handle.write(data.replace(b'400', b'401', 1))
+    os.utime(incar, ns=(before.st_atime_ns, before.st_mtime_ns))
+    client = FakeClient()
+
+    with pytest.raises(ValueError, match='内容已变化'):
+        submitter.continue_from_contcar(
+            client, _profile(), d, idempotency_key='trajectory-repair:cas',
+            expected_cas=expected)
+    assert client.commands == []
 
 
 def test_continue_from_contcar_qsub_without_job_id_fails_closed(tmp_path):
