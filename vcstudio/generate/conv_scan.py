@@ -215,6 +215,11 @@ def _save_conv_manifest(out_dir, src_dir, poscar_text, series, series_value,
         'natoms': int(sum(counts)) if counts else None,
         'incar_changes': changes, 'elements': list(syms),
     }
+    inputs['sha256'] = {
+        name: manifest_mod.sha256_file(Path(out_dir) / name)
+        for name in ('POSCAR', 'INCAR', 'KPOINTS', 'POTCAR')
+        if (Path(out_dir) / name).is_file()
+    }
     m = manifest_mod.new_manifest(
         job_id=f'{Path(out_dir).name}-conv', system=system, task_type='conv_scan',
         calc_type='slab', inputs=inputs, warnings=warnings)

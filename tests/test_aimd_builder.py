@@ -239,6 +239,7 @@ def test_parse_aimd_energy_fixture():
     res = ab.parse_aimd_energy(_OSZICAR)
     assert res['n'] == 3                                # 3 条 MD 行(电子子行被跳过)
     s0 = res['steps'][0]
+    assert s0['step'] == 1
     assert s0['t_fs'] == pytest.approx(1.0)             # 步号1 × potim 1fs
     assert s0['e_tot'] == pytest.approx(-114.53958)
     assert s0['temp_k'] == pytest.approx(300.0)

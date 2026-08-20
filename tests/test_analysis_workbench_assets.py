@@ -279,13 +279,15 @@ seam.renderConvergenceView({ series: [{
     recommended_parameter: q('SERVER-SENS', 'eV') }],
   points: [{ label: '450 eV', source: source('conv-source'),
     parameter: q('SERVER-X'), absolute_energy: q('SERVER-E', 'eV', -10),
+    atom_count: q('SERVER-NATOMS'),
     energy_per_atom: q('SERVER-EPA'), delta_per_atom: q('SERVER-DELTA'),
     platform_member: true, anomalies: ['server anomaly'] }],
 }] }, convergenceBox);
 const convergenceCard = convergenceBox.children[0];
 const convergenceRow = convergenceCard.children[3].children[1].children[0];
 assert.deepStrictEqual(convergenceRow.children.map(cell => cell.textContent),
-  ['450 eV', 'SERVER-X', 'SERVER-E', 'SERVER-EPA', 'SERVER-DELTA', 'yes', 'server anomaly']);
+  ['450 eV', 'SERVER-X', 'SERVER-E', 'SERVER-NATOMS', 'SERVER-EPA', 'SERVER-DELTA',
+    'yes', 'server anomaly']);
 const sensitivityRow = convergenceCard.children[4].children[1].children[0];
 assert.strictEqual(sensitivityRow.children[0].textContent, 'SERVER-THR');
 assert.strictEqual(sensitivityRow.children[1].textContent, 'SERVER-SENS');
@@ -295,15 +297,22 @@ seam.renderAimdView({ trajectories: [{
   status: 'available', source: source('aimd-source'), parser: parser(),
   scientific_boundary: 'Short AIMD is diagnostic only', issues: [], warnings: ['short'],
   metrics: { drift: Object.assign(q('SERVER-DRIFT', 'eV'), { label: 'Drift' }) },
-  samples: [{ sample_index: 0, time: q('SERVER-TIME'),
+  segments: [{ segment_index: 0, start_step: q('SERVER-START'),
+    end_step: q('SERVER-END'), sample_count: q('SERVER-COUNT'),
+    duration: q('SERVER-DURATION') }],
+  samples: [{ sample_index: 0, step: q('SERVER-STEP'), segment_index: 0,
+    time: q('SERVER-TIME'),
     total_energy: q('SERVER-ENERGY'), temperature: q('SERVER-TEMP') }],
 }] }, aimdBox);
 const aimdCard = aimdBox.children[0];
 const metricRow = aimdCard.children[2].children[1].children[0];
 assert.strictEqual(metricRow.children[1].textContent, 'SERVER-DRIFT');
-const sampleRow = aimdCard.children[3].children[1].children[0];
+const segmentRow = aimdCard.children[3].children[1].children[0];
+assert.deepStrictEqual(segmentRow.children.map(cell => cell.textContent),
+  ['0', 'SERVER-START', 'SERVER-END', 'SERVER-COUNT', 'SERVER-DURATION']);
+const sampleRow = aimdCard.children[4].children[1].children[0];
 assert.deepStrictEqual(sampleRow.children.map(cell => cell.textContent),
-  ['0', 'SERVER-TIME', 'SERVER-ENERGY', 'SERVER-TEMP']);
+  ['0', 'SERVER-STEP', '0', 'SERVER-TIME', 'SERVER-ENERGY', 'SERVER-TEMP']);
 assert.strictEqual(aimdCard.children[1].textContent, 'Short AIMD is diagnostic only');
 """,
         str(ASSETS / "analysis-workbench.js"),

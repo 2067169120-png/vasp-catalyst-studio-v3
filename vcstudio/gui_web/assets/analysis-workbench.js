@@ -501,7 +501,12 @@
       }
       appendEvidenceList(card, 'Path-quality diagnostics', quality.issues);
       appendEvidenceList(card, 'Path warnings', quality.warnings);
-      appendSourceDetails(card, source, path.parser); box.appendChild(card);
+      appendSourceDetails(card, source, path.parser);
+      Object.values(plain(path.endpoint_evidence)).forEach(endpoint => {
+        const endpointSource = plain(endpoint.source);
+        if (endpointSource.source_id) appendSourceDetails(card, endpointSource, path.parser);
+      });
+      box.appendChild(card);
     });
   }
 
@@ -527,12 +532,14 @@
       if (points.length) {
         const table = tableElement([
           { label: 'Point' }, { label: 'Parameter', numeric: true },
-          { label: 'E / eV', numeric: true }, { label: 'E / atom', numeric: true },
+          { label: 'E / eV', numeric: true }, { label: 'Atoms', numeric: true },
+          { label: 'E / atom', numeric: true },
           { label: 'Δ terminal / meV/atom', numeric: true },
           { label: 'Platform' }, { label: 'Missing / anomaly' },
         ], points.map(point => ({
           missing: plain(point.absolute_energy).value == null,
           cells: [point.label, quantityText(point.parameter), quantityText(point.absolute_energy),
+            quantityText(point.atom_count),
             quantityText(point.energy_per_atom), quantityText(point.delta_per_atom),
             point.platform_member === true ? 'yes' : 'no', (point.anomalies || []).join('; ')],
         })));
@@ -570,6 +577,7 @@
       const trajectory = plain(trajectoryValue); const source = plain(trajectory.source);
       const metrics = Object.values(plain(trajectory.metrics));
       const samples = Array.isArray(trajectory.samples) ? trajectory.samples : [];
+      const segments = Array.isArray(trajectory.segments) ? trajectory.segments : [];
       const card = document.createElement('section'); card.className = 'aw-specialized-card aw-aimd-card';
       appendSpecializedHeader(card, 'AIMD diagnostics', trajectory.status, source.source_id);
       appendDiagnosticStrip(card, trajectory.scientific_boundary, 'diagnostic');
@@ -583,14 +591,29 @@
         ] })));
         table.setAttribute('aria-label', 'Server-finalized AIMD diagnostic metrics'); card.appendChild(table);
       }
+      if (segments.length) {
+        const table = tableElement([
+          { label: 'Segment', numeric: true }, { label: 'Start step', numeric: true },
+          { label: 'End step', numeric: true }, { label: 'Samples', numeric: true },
+          { label: 'Duration / ps', numeric: true },
+        ], segments.map(segment => ({ cells: [
+          segment.segment_index, quantityText(segment.start_step),
+          quantityText(segment.end_step), quantityText(segment.sample_count),
+          quantityText(segment.duration),
+        ] })));
+        table.setAttribute('aria-label', 'Server-finalized AIMD monotonic step segments');
+        card.appendChild(table);
+      }
       if (samples.length) {
         const table = tableElement([
-          { label: 'Sample', numeric: true }, { label: 'Time / ps', numeric: true },
+          { label: 'Sample', numeric: true }, { label: 'Step', numeric: true },
+          { label: 'Segment', numeric: true }, { label: 'Time / ps', numeric: true },
           { label: 'Total energy / eV', numeric: true },
           { label: 'Temperature / K', numeric: true },
         ], samples.map(sample => ({ cells: [
-          sample.sample_index, quantityText(sample.time), quantityText(sample.total_energy),
-          quantityText(sample.temperature),
+          sample.sample_index, quantityText(sample.step), sample.segment_index,
+          quantityText(sample.time),
+          quantityText(sample.total_energy), quantityText(sample.temperature),
         ] })));
         table.setAttribute('aria-label', 'Server-finalized AIMD curve data'); card.appendChild(table);
       }

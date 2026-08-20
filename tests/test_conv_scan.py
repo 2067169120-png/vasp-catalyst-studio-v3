@@ -81,6 +81,8 @@ def test_encut_series_manifest_and_changes(tmp_path):
     assert m['task_type'] == 'conv_scan'
     assert m['inputs']['series'] == 'encut' and m['inputs']['series_value'] == 450
     assert m['inputs']['natoms'] == 2
+    assert m['inputs']['sha256']['POSCAR'] == manifest_mod.sha256_file(
+        tmp_path / 'enc' / 'encut_450' / 'POSCAR')
     assert any(c['key'] == 'ENCUT' and c['new'] == 450 for c in m['inputs']['incar_changes'])
 
 

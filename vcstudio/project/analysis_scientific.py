@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -25,7 +26,14 @@ from vcstudio.generate.incar_builder import parse_incar
 from vcstudio.generate.poscar import parse_poscar_species
 from vcstudio.generate.structure_view import parse_positions
 from vcstudio.project.analysis_registry import AnalysisSpec, get_analysis
-from vcstudio.project.analysis_sources import source_identity, value_provenance
+from vcstudio.project.analysis_sources import (
+    SourceSnapshot,
+    SourceSnapshotChanged,
+    capture_source_snapshot,
+    value_provenance,
+    verify_neb_endpoint_record,
+)
+from vcstudio.project.neb import parse_last_complete_image_step
 
 
 VIEW_SCHEMA = "vcstudio.analysis-view/v1"
@@ -39,7 +47,8 @@ AIMD_SHORT_TRAJECTORY_PS = 10.0
 
 _FRAME_RE = re.compile(r"^\d+$")
 _SIGMA0_RE = re.compile(r"energy\(sigma->0\)\s*=\s*([-+0-9.Ee]+)")
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_NIONS_RE = re.compile(r"\bNIONS\s*=\s*(\d+)")
+_VASPRUN_ATOMS_RE = re.compile(r"<atoms>\s*(\d+)\s*</atoms>", re.I)
 
 
 def _canonical_hash(value: Any) -> str:
@@ -57,18 +66,33 @@ def _finite(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _read_text(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
+def _capture(
+    target: Mapping[str, Any], evidence_names: Sequence[Any],
+) -> tuple[SourceSnapshot, dict[str, Any]]:
+    snapshot = capture_source_snapshot(target, evidence_names)
+    snapshot.assert_manifest_matches(target.get("manifest") or {})
+    return snapshot, snapshot.manifest()
 
 
-def _source(
-    target: Mapping[str, Any], evidence_names: Sequence[str],
+def _method_evidence(
+    resolver: Callable[..., Mapping[str, Any]], target: Mapping[str, Any],
+    snapshot: SourceSnapshot,
 ) -> dict[str, Any]:
-    identity, _missing = source_identity(target, evidence_names)
-    return identity
+    try:
+        signature = inspect.signature(resolver)
+        signature.bind(target, snapshot)
+    except (TypeError, ValueError):
+        return dict(resolver(target) or {})
+    return dict(resolver(target, snapshot) or {})
+
+
+def _verified_method(method: Mapping[str, Any]) -> bool:
+    return bool(
+        method.get("status") == "verified" and method.get("fingerprint")
+        and not any(method.get(key) for key in (
+            "missing", "warnings", "errors", "issues",
+        ))
+    )
 
 
 def _parser(callable_name: str) -> dict[str, str]:
@@ -204,14 +228,16 @@ def _same_cell(left: Sequence[Sequence[float]], right: Sequence[Sequence[float]]
         return False
 
 
-def _neb_coordinates(root: Path, frames: Sequence[str]) -> tuple[list[float | None], str]:
+def _neb_coordinates(
+    snapshot: SourceSnapshot, frames: Sequence[str],
+) -> tuple[list[float | None], str]:
     structures = []
     for frame in frames:
-        directory = root / frame
-        path = directory / "CONTCAR"
-        if not path.is_file() or not _read_text(path).strip():
-            path = directory / "POSCAR"
-        text = _read_text(path)
+        contcar = f"{frame}/CONTCAR"
+        poscar = f"{frame}/POSCAR"
+        text = snapshot.text(contcar)
+        if not text.strip():
+            text = snapshot.text(poscar)
         if not text.strip():
             return [None] * len(frames), f"{frame} lacks POSCAR/CONTCAR structure evidence"
         try:
@@ -241,12 +267,12 @@ def _neb_coordinates(root: Path, frames: Sequence[str]) -> tuple[list[float | No
     return cumulative, ""
 
 
-def _frame_energy(frame_dir: Path) -> tuple[float | None, str]:
-    oszicar = _read_text(frame_dir / "OSZICAR")
+def _frame_energy(snapshot: SourceSnapshot, frame: str) -> tuple[float | None, str]:
+    oszicar = snapshot.text(f"{frame}/OSZICAR")
     steps = convergence.parse_oszicar(oszicar)
     if steps and _finite(steps[-1].get("E0")) is not None:
         return float(steps[-1]["E0"]), "OSZICAR"
-    outcar = _read_text(frame_dir / "OUTCAR")
+    outcar = snapshot.text(f"{frame}/OUTCAR")
     matches = _SIGMA0_RE.findall(outcar)
     try:
         return (float(matches[-1]), "OUTCAR") if matches else (None, "")
@@ -254,82 +280,38 @@ def _frame_energy(frame_dir: Path) -> tuple[float | None, str]:
         return None, ""
 
 
-def _endpoint_energy(
-    root: Path, manifest: Mapping[str, Any], frame: str, role: str,
-) -> tuple[float | None, str]:
-    value, source = _frame_energy(root / frame)
-    if value is not None:
-        return value, source
-    inputs = manifest.get("inputs") or {}
-    endpoints = inputs.get("neb_endpoints") or {}
-    record = endpoints.get(role) or {}
-    if not isinstance(record, Mapping) or record.get("trusted") is not True:
-        return None, ""
-    if str(record.get("target_frame") or "") != frame:
-        return None, ""
-    energy = _finite(record.get("energy_e0_eV"))
-    source = str(record.get("energy_source") or "")
-    if energy is None or not source:
-        return None, ""
-    return energy, "job.yaml"
-
-
-def _explicit_electronic_status(outcar: str) -> str:
-    lowered = outcar.lower()
-    if "aborting loop because ediff is reached" in lowered:
-        return "converged"
-    if "electronic convergence not reached" in lowered:
-        return "not_converged"
-    return "unavailable"
-
-
-def _method_fingerprint_hash(value: Any) -> str:
-    if isinstance(value, str) and _SHA256_RE.fullmatch(value.lower()):
-        return value.lower()
-    if isinstance(value, Mapping) and value:
-        return _canonical_hash(value)
-    return ""
-
-
-def _neb_method_gate(
-    target: Mapping[str, Any], method: Mapping[str, Any],
-) -> tuple[bool, list[str]]:
-    issues = []
-    if method.get("status") != "verified":
-        issues.append("NEB method identity is not verified")
-    fingerprint = method.get("fingerprint")
-    root_hash = _method_fingerprint_hash(fingerprint)
-    if not root_hash:
-        issues.append("NEB method fingerprint is unavailable")
-    manifest = target.get("manifest") or {}
-    inputs = manifest.get("inputs") or {}
-    endpoints = inputs.get("neb_endpoints") or {}
-    if not isinstance(endpoints, Mapping):
-        endpoints = {}
-    for role in ("start", "end"):
-        record = endpoints.get(role) or {}
-        if not isinstance(record, Mapping) or record.get("trusted") is not True:
-            issues.append(f"{role} endpoint is not trusted")
+def _frame_natoms(snapshot: SourceSnapshot, frame: str) -> tuple[int | None, str]:
+    for name in (f"{frame}/CONTCAR", f"{frame}/POSCAR"):
+        text = snapshot.text(name)
+        if not text.strip():
             continue
-        endpoint_hash = _method_fingerprint_hash(
-            record.get("method_fingerprint_sha256") or
-            record.get("method_fingerprint"))
-        if not endpoint_hash:
-            issues.append(f"{role} endpoint method fingerprint is unavailable")
-        elif root_hash and endpoint_hash != root_hash:
-            issues.append(f"{role} endpoint method differs from the NEB method")
-        if record.get("source_state") != "DONE":
-            issues.append(f"{role} endpoint source state is not DONE")
-    return not issues, issues
+        try:
+            _symbols, counts = parse_poscar_species(text)
+        except (IndexError, TypeError, ValueError):
+            continue
+        if counts and sum(counts) > 0:
+            return int(sum(counts)), name
+    return None, ""
+
+
+def _assert_neb_frame_set(root: Path, expected: Sequence[str]) -> None:
+    current = sorted(
+        (item.name for item in root.iterdir()
+         if item.is_dir() and _FRAME_RE.fullmatch(item.name)),
+        key=int,
+    ) if root.is_dir() else []
+    if list(expected) != current:
+        raise SourceSnapshotChanged(
+            "NEB image-directory set changed during analysis; retry")
 
 
 def _neb_path(
     spec: AnalysisSpec, target: Mapping[str, Any],
-    method_evidence: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+    method_evidence: Callable[..., Mapping[str, Any]],
+    targets_by_source_id: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
     root = Path(str(target.get("path") or ""))
     parser = _parser("build_neb_analysis_view")
-    manifest = target.get("manifest") or {}
     frames = sorted(
         (item.name for item in root.iterdir()
          if item.is_dir() and _FRAME_RE.fullmatch(item.name)),
@@ -339,17 +321,22 @@ def _neb_path(
         f"{frame}/{name}" for frame in frames
         for name in ("POSCAR", "CONTCAR", "OSZICAR", "OUTCAR")
     ]
-    source = _source(target, ["INCAR", *evidence_names])
+    snapshot, manifest = _capture(target, [
+        "INCAR", "KPOINTS", "POTCAR", "POSCAR", "CONTCAR", *evidence_names,
+    ])
+    source = snapshot.identity()
     issues: list[str] = []
     warnings: list[str] = []
     if len(frames) < 3:
         issues.append("NEB requires at least three ordered image directories")
-    coordinates, coordinate_reason = _neb_coordinates(root, frames) if frames else ([], "")
+    coordinates, coordinate_reason = (
+        _neb_coordinates(snapshot, frames) if frames else ([], "")
+    )
     if coordinate_reason:
         issues.append(coordinate_reason)
 
     inputs = manifest.get("inputs") or {}
-    incar = parse_incar(_read_text(root / "INCAR"))
+    incar = parse_incar(snapshot.text("INCAR"))
     ediffg = _finite(incar.get("EDIFFG"))
     force_threshold = abs(ediffg) if ediffg is not None and ediffg < 0 else None
     if force_threshold is None:
@@ -363,21 +350,59 @@ def _neb_path(
     if isinstance(declared_images, int) and declared_images + 2 != len(frames):
         issues.append("manifest n_images does not match the image-directory count")
 
+    method = _method_evidence(method_evidence, target, snapshot)
+    method_ok = _verified_method(method)
+    if not method_ok:
+        issues.append("NEB method identity is not verified")
+    endpoints = inputs.get("neb_endpoints") or {}
+    if not isinstance(endpoints, Mapping):
+        endpoints = {}
+    endpoint_verifications: dict[str, dict[str, Any]] = {}
+    endpoint_evidence: dict[str, dict[str, Any]] = {}
+    endpoint_snapshots: list[SourceSnapshot] = []
+    for role, frame in (("start", frames[0] if frames else "00"),
+                        ("end", frames[-1] if frames else "")):
+        verification = verify_neb_endpoint_record(
+            record=endpoints.get(role) or {}, role=role, frame=frame,
+            neb_snapshot=snapshot, targets_by_source_id=targets_by_source_id,
+            method_resolver=lambda endpoint, endpoint_snapshot: _method_evidence(
+                method_evidence, endpoint, endpoint_snapshot),
+            neb_method_fingerprint=method.get("fingerprint"),
+        )
+        endpoint_verifications[role] = verification
+        issues.extend(verification.get("issues") or [])
+        source_snapshot = verification.get("source_snapshot")
+        if isinstance(source_snapshot, SourceSnapshot):
+            endpoint_snapshots.append(source_snapshot)
+        endpoint_evidence[role] = {
+            "status": "verified" if verification.get("ok") else "unavailable",
+            "source": (
+                source_snapshot.identity() if isinstance(source_snapshot, SourceSnapshot)
+                else {"source_id": verification.get("source_id") or "", "files": []}
+            ),
+            "verified_files": list(verification.get("verified_files") or []),
+            "method": copy.deepcopy(verification.get("method") or {}),
+            "issues": list(verification.get("issues") or []),
+        }
+
     points = []
     energies: list[float | None] = []
     electronic_statuses = []
     ionic_statuses = []
     for index, frame in enumerate(frames):
         role = "start" if index == 0 else "end" if index == len(frames) - 1 else "image"
-        energy, energy_file = (
-            _endpoint_energy(root, manifest, frame, role)
-            if role in {"start", "end"} else _frame_energy(root / frame)
-        )
+        energy, energy_file = _frame_energy(snapshot, frame)
+        endpoint_verification = endpoint_verifications.get(role)
+        if endpoint_verification is not None and (
+                not endpoint_verification.get("ok")
+                or energy_file not in endpoint_verification.get("verified_files", [])):
+            energy, energy_file = None, ""
         energies.append(energy)
-        outcar_text = _read_text(root / frame / "OUTCAR")
-        forces = convergence.parse_outcar_fmax(outcar_text)
-        fmax = forces[-1] if forces else None
-        electronic = _explicit_electronic_status(outcar_text)
+        expected_natoms, structure_name = _frame_natoms(snapshot, frame)
+        final_step = parse_last_complete_image_step(
+            snapshot.text(f"{frame}/OUTCAR"), expected_natoms)
+        fmax = final_step.get("fmax") if final_step.get("status") == "complete" else None
+        electronic = str(final_step.get("electronic_status") or "unavailable")
         if role != "image":
             ionic = "endpoint"
         elif fmax is None or force_threshold is None:
@@ -386,6 +411,8 @@ def _neb_path(
             ionic = "converged" if fmax <= force_threshold else "not_converged"
         electronic_statuses.append(electronic)
         ionic_statuses.append(ionic)
+        for item in final_step.get("issues") or []:
+            issues.append(f"{frame}: {item}")
         frame_files = [
             item for item in source["files"]
             if str(item.get("name") or "").startswith(f"{frame}/")
@@ -394,10 +421,6 @@ def _neb_path(
             item for item in frame_files
             if str(item.get("name") or "").endswith(f"/{energy_file}")
         ]
-        if energy_file == "job.yaml":
-            energy_files = [
-                item for item in source["files"] if item.get("name") == "job.yaml"
-            ]
         coordinate = coordinates[index] if index < len(coordinates) else None
         points.append({
             "image_index": index,
@@ -426,10 +449,7 @@ def _neb_path(
             ),
             "electronic_convergence": electronic,
             "ionic_convergence": ionic,
-            "structure_evidence": [
-                item for item in frame_files
-                if str(item.get("name") or "").endswith(("/POSCAR", "/CONTCAR"))
-            ],
+            "structure_evidence": snapshot.files([structure_name]) if structure_name else [],
             "file_evidence": frame_files,
         })
 
@@ -445,10 +465,7 @@ def _neb_path(
             reason="initial or image energy is unavailable" if relative is None else "",
         )
 
-    method = dict(method_evidence(target) or {})
-    method_ok, method_issues = _neb_method_gate(target, method)
-    issues.extend(method_issues)
-    if target.get("state") != "DONE":
+    if manifest.get("state") != "DONE":
         issues.append("NEB manifest state is not DONE")
     if any(value is None for value in energies):
         issues.append("one or more NEB image energies are unavailable")
@@ -489,7 +506,10 @@ def _neb_path(
         finite_relative[ts_index] - finite_relative[-1]
         if barrier_ok and ts_index is not None else None
     )
-    barrier_files = source["files"]
+    barrier_files = _merge_files(
+        source["files"],
+        *(item["source"].get("files") or [] for item in endpoint_evidence.values()),
+    )
     barriers = {
         "status": "available" if barrier_ok else "unavailable",
         "forward": _quantity(
@@ -513,6 +533,7 @@ def _neb_path(
         "source": source,
         "parser": parser,
         "method": method,
+        "endpoint_evidence": endpoint_evidence,
         "status": "available" if points else "missing_prerequisite",
         "available": bool(points),
         "points": points,
@@ -528,17 +549,31 @@ def _neb_path(
             "frequency evidence require independent review. Γ-point frequencies are not "
             "a phonon dispersion."
         ),
+        "_snapshots": [snapshot, *endpoint_snapshots],
+        "_frame_root": root,
+        "_frames": list(frames),
     }
 
 
 def build_neb_analysis_view(
     spec: AnalysisSpec, targets: Sequence[Mapping[str, Any]], *,
-    method_evidence: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+    method_evidence: Callable[..., Mapping[str, Any]],
 ) -> dict[str, Any]:
     if spec.analysis_id != "neb-path":
         raise ValueError("NEB analysis view requires analysis_id=neb-path")
+    targets_by_source_id = {
+        str(target.get("source_id") or ""): target for target in targets
+        if target.get("source_id")
+    }
     selected = [target for target in targets if target.get("task_type") == "neb"]
-    paths = [_neb_path(spec, target, method_evidence) for target in selected]
+    paths = [
+        _neb_path(spec, target, method_evidence, targets_by_source_id)
+        for target in selected
+    ]
+    for path in paths:
+        for snapshot in path.pop("_snapshots", []):
+            snapshot.assert_unchanged()
+        _assert_neb_frame_set(path.pop("_frame_root"), path.pop("_frames"))
     blocking = [
         issue for path in paths for issue in path["path_quality"]["issues"]
     ]
@@ -560,7 +595,11 @@ def build_neb_analysis_view(
             "provenance": {
                 "parser_module": PARSER_MODULE,
                 "parser_version": PARSER_VERSION,
-                "source_ids": [paths[0]["source"]["source_id"]],
+                "source_ids": [paths[0]["source"]["source_id"], *[
+                    item["source"].get("source_id")
+                    for item in paths[0]["endpoint_evidence"].values()
+                    if item["source"].get("source_id")
+                ]],
                 "file_hashes": copy.deepcopy(paths[0]["source"]["files"]),
                 "denominator": "complete ordered NEB image path",
             },
@@ -633,14 +672,88 @@ def _series_group_key(target: Mapping[str, Any], kind: str) -> str:
 
 def _method_invariant(method: Mapping[str, Any], kind: str) -> str:
     fingerprint = copy.deepcopy(method.get("fingerprint") or {})
-    if not isinstance(fingerprint, Mapping):
+    if not _verified_method(method) or not isinstance(fingerprint, Mapping):
         return ""
     fingerprint = dict(fingerprint)
+    required = {
+        "functional", "dispersion", "encut", "spin",
+        "kpoints_scheme", "potcar_ids",
+    }
     if kind == "encut":
         fingerprint.pop("encut", None)
+        required.remove("encut")
     elif kind == "kmesh":
         fingerprint.pop("kpoints_scheme", None)
-    return _canonical_hash(fingerprint) if fingerprint else ""
+        required.remove("kpoints_scheme")
+    if any(key not in fingerprint or fingerprint[key] in (None, "", {}, [])
+           for key in required):
+        return ""
+    return _canonical_hash(fingerprint)
+
+
+def _merge_files(*groups: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    merged = {}
+    for group in groups:
+        for item in group:
+            key = (str(item.get("name") or ""), str(item.get("sha256") or ""))
+            merged[key] = dict(item)
+    return list(merged.values())
+
+
+def _runtime_natoms(
+    snapshot: SourceSnapshot, manifest: Mapping[str, Any],
+) -> tuple[int | None, list[str], list[dict[str, Any]]]:
+    """Cross-check runtime, frozen POSCAR, manifest count, and frozen hash."""
+    issues = []
+    runtime_values: dict[str, int] = {}
+    nions = {int(value) for value in _NIONS_RE.findall(snapshot.text("OUTCAR"))}
+    if len(nions) == 1:
+        runtime_values["OUTCAR:NIONS"] = next(iter(nions))
+    elif len(nions) > 1:
+        issues.append("OUTCAR contains inconsistent NIONS values")
+    atoms = {int(value) for value in _VASPRUN_ATOMS_RE.findall(
+        snapshot.text("vasprun.xml"))}
+    if len(atoms) == 1:
+        runtime_values["vasprun.xml:atoms"] = next(iter(atoms))
+    elif len(atoms) > 1:
+        issues.append("vasprun.xml contains inconsistent atom counts")
+    if not runtime_values:
+        issues.append("runtime atom count is absent from OUTCAR/vasprun.xml")
+    elif len(set(runtime_values.values())) != 1:
+        issues.append("OUTCAR and vasprun.xml atom counts disagree")
+
+    poscar_natoms = None
+    try:
+        _symbols, counts = parse_poscar_species(snapshot.text("POSCAR"))
+        if counts and sum(counts) > 0:
+            poscar_natoms = int(sum(counts))
+    except (IndexError, TypeError, ValueError):
+        pass
+    if poscar_natoms is None:
+        issues.append("frozen POSCAR atom count is unavailable")
+
+    inputs = manifest.get("inputs") or {}
+    manifest_natoms = inputs.get("natoms")
+    if (isinstance(manifest_natoms, bool)
+            or not isinstance(manifest_natoms, int) or manifest_natoms <= 0):
+        issues.append("manifest inputs.natoms is unavailable")
+        manifest_natoms = None
+    recorded_hashes = inputs.get("sha256") or {}
+    recorded_poscar = str(
+        recorded_hashes.get("POSCAR") if isinstance(recorded_hashes, Mapping) else ""
+    ).lower()
+    poscar_file = snapshot.file("POSCAR")
+    if (not re.fullmatch(r"[0-9a-f]{64}", recorded_poscar)
+            or not poscar_file or poscar_file.get("sha256") != recorded_poscar):
+        issues.append("frozen POSCAR hash does not match manifest inputs.sha256")
+
+    runtime_natoms = next(iter(runtime_values.values()), None)
+    values = [runtime_natoms, poscar_natoms, manifest_natoms]
+    if all(value is not None for value in values) and len(set(values)) != 1:
+        issues.append("runtime, POSCAR, and manifest atom counts disagree")
+    files = snapshot.files(["job.yaml", "POSCAR", "OUTCAR", "vasprun.xml"])
+    return (int(runtime_natoms) if not issues and runtime_natoms is not None else None,
+            issues, files)
 
 
 def _platform(
@@ -663,48 +776,43 @@ def _platform(
 
 def _convergence_series(
     spec: AnalysisSpec, kind: str, targets: Sequence[Mapping[str, Any]],
-    method_evidence: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+    method_evidence: Callable[..., Mapping[str, Any]],
 ) -> dict[str, Any]:
     parser = _parser("build_convergence_analysis_view")
     raw = []
     issues = []
     method_invariants = set()
+    snapshots = []
     for target in targets:
-        manifest = target.get("manifest") or {}
+        snapshot, manifest = _capture(target, [
+            "OSZICAR", "OUTCAR", "vasprun.xml", "INCAR", "KPOINTS",
+            "POSCAR", "CONTCAR", "POTCAR",
+        ])
+        snapshots.append(snapshot)
         inputs = manifest.get("inputs") or {}
         x = _finite(inputs.get("series_value"))
         label = str(inputs.get("series_label") or "")
-        source = _source(
-            target, ["OSZICAR", "INCAR", "KPOINTS", "POSCAR", "CONTCAR", "POTCAR"],
-        )
-        method = dict(method_evidence(target) or {})
+        source = snapshot.identity()
+        method = _method_evidence(method_evidence, target, snapshot)
         invariant = _method_invariant(method, kind)
         if method.get("status") != "verified" or not invariant:
-            issues.append(f'{source["source_id"]}: method evidence is unavailable')
+            issues.append(
+                f'{source["source_id"]}: method evidence/invariant is incomplete')
         else:
             method_invariants.add(invariant)
-        natoms = _finite(inputs.get("natoms"))
-        if natoms is None:
-            text = _read_text(Path(str(target.get("path") or "")) / "POSCAR")
-            try:
-                _symbols, counts = parse_poscar_species(text)
-                natoms = float(sum(counts)) if counts else None
-            except (IndexError, TypeError, ValueError):
-                natoms = None
-        oszicar = _read_text(Path(str(target.get("path") or "")) / "OSZICAR")
+        natoms, natom_issues, denominator_files = _runtime_natoms(snapshot, manifest)
+        issues.extend(f'{source["source_id"]}: {issue}' for issue in natom_issues)
+        oszicar = snapshot.text("OSZICAR")
         steps = convergence.parse_oszicar(oszicar)
         energy = (
             _finite(steps[-1].get("E0"))
-            if target.get("state") == "DONE" and steps else None
+            if manifest.get("state") == "DONE" and steps else None
         )
         if x is None:
             issues.append(f'{source["source_id"]}: explicit series_value is unavailable')
-        if natoms is None or natoms <= 0:
-            issues.append(f'{source["source_id"]}: atom-count denominator is unavailable')
-            natoms = None
         if energy is None:
             issues.append(f'{source["source_id"]}: DONE OSZICAR:E0 evidence is unavailable')
-        energy_files = [item for item in source["files"] if item.get("name") == "OSZICAR"]
+        energy_files = snapshot.files(["OSZICAR"])
         raw.append({
             "x": x,
             "label": label or (str(x) if x is not None else "—"),
@@ -713,6 +821,9 @@ def _convergence_series(
             "natoms": natoms,
             "energy": energy,
             "energy_files": energy_files,
+            "denominator_files": denominator_files,
+            "method_verified": bool(
+                _verified_method(method) and invariant),
         })
     raw.sort(key=lambda item: (item["x"] is None, item["x"] or 0.0, item["label"]))
     duplicates = {
@@ -723,9 +834,11 @@ def _convergence_series(
         issues.append("duplicate series coordinates are present")
     if len(method_invariants) > 1:
         issues.append("non-target method settings differ across convergence points")
-    reference = next(
-        (item for item in reversed(raw)
-         if item["energy"] is not None and item["natoms"] is not None), None,
+    if raw and not all(item["method_verified"] for item in raw):
+        issues.append("every convergence point must have a complete verified method invariant")
+    reference = (
+        raw[-1] if raw and raw[-1]["energy"] is not None
+        and raw[-1]["natoms"] is not None else None
     )
     points = []
     for item in raw:
@@ -742,10 +855,18 @@ def _convergence_series(
         )
         source = item["source"]
         files = item["energy_files"]
+        denominator_files = item["denominator_files"]
+        normalized_files = _merge_files(files, denominator_files)
+        delta_files = _merge_files(
+            normalized_files,
+            reference["energy_files"] if reference else [],
+            reference["denominator_files"] if reference else [],
+        )
         points.append({
             "label": item["label"],
             "source": source,
             "method": item["method"],
+            "method_verified": item["method_verified"],
             "parameter": _quantity(
                 key="parameter", label="Scan parameter", value=item["x"],
                 unit=_SERIES_UNITS[kind], precision=spec.precision,
@@ -760,11 +881,20 @@ def _convergence_series(
                 reason="DONE OSZICAR:E0 evidence is unavailable"
                 if item["energy"] is None else "",
             ),
+            "atom_count": _quantity(
+                key="atom_count", label="Verified atom denominator",
+                value=item["natoms"], unit="atoms", precision=0,
+                denominator="OUTCAR/vasprun runtime = frozen POSCAR = manifest",
+                source_id=source["source_id"], files=denominator_files,
+                parser=parser,
+                reason="atom-count evidence is unavailable"
+                if item["natoms"] is None else "",
+            ),
             "energy_per_atom": _quantity(
                 key="energy_per_atom", label="Energy per atom", value=per_atom,
                 unit="eV/atom", precision=spec.precision,
                 denominator=f'{int(item["natoms"])} atoms' if item["natoms"] else "unavailable",
-                source_id=source["source_id"], files=files, parser=parser,
+                source_id=source["source_id"], files=normalized_files, parser=parser,
                 reason="atom-count denominator is unavailable" if per_atom is None else "",
             ),
             "delta_per_atom": _quantity(
@@ -774,7 +904,7 @@ def _convergence_series(
                     f'{int(item["natoms"])} atoms; reference={reference["label"]}'
                     if item["natoms"] and reference else "unavailable"
                 ),
-                source_id=source["source_id"], files=files, parser=parser,
+                source_id=source["source_id"], files=delta_files, parser=parser,
                 reason="terminal reference or atom denominator is unavailable"
                 if delta is None else "",
             ),
@@ -787,6 +917,7 @@ def _convergence_series(
     primary_index = None
     series_evidence_ready = bool(
         not duplicates and len(method_invariants) == 1
+        and all(item["method_verified"] for item in raw)
         and all(point["parameter"]["value"] is not None
                 and point["absolute_energy"]["value"] is not None
                 and point["energy_per_atom"]["value"] is not None
@@ -794,8 +925,10 @@ def _convergence_series(
     )
     for threshold in CONVERGENCE_THRESHOLDS_MEV_PER_ATOM:
         suffix, recommended = _platform(points, threshold)
+        qualified_suffix = suffix if series_evidence_ready else []
+        qualified_recommended = recommended if series_evidence_ready else None
         if threshold == CONVERGENCE_PRIMARY_THRESHOLD_MEV_PER_ATOM:
-            primary_suffix, primary_index = suffix, recommended
+            primary_suffix, primary_index = qualified_suffix, qualified_recommended
         sensitivity.append({
             "threshold": _quantity(
                 key="threshold", label="Platform threshold", value=threshold,
@@ -806,7 +939,7 @@ def _convergence_series(
             ),
             "recommended_parameter": (
                 copy.deepcopy(points[recommended]["parameter"])
-                if recommended is not None and series_evidence_ready else _quantity(
+                if qualified_recommended is not None else _quantity(
                     key="recommended_parameter", label="Recommended parameter",
                     value=None, unit=_SERIES_UNITS[kind], precision=spec.precision,
                     denominator=f"threshold={threshold:g} meV/atom",
@@ -816,7 +949,7 @@ def _convergence_series(
                             "insufficient contiguous terminal platform evidence"),
                 )
             ),
-            "platform_point_indexes": suffix,
+            "platform_point_indexes": qualified_suffix,
         })
     recommendation_available = bool(
         primary_index is not None and series_evidence_ready
@@ -894,12 +1027,13 @@ def _convergence_series(
             "a slab-thickness per-atom plateau does not replace a bulk-referenced surface-"
             "energy analysis."
         ),
+        "_snapshots": snapshots,
     }
 
 
 def build_convergence_analysis_view(
     spec: AnalysisSpec, targets: Sequence[Mapping[str, Any]], *,
-    method_evidence: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+    method_evidence: Callable[..., Mapping[str, Any]],
 ) -> dict[str, Any]:
     if spec.analysis_id != "convergence-scan":
         raise ValueError(
@@ -918,6 +1052,9 @@ def build_convergence_analysis_view(
         _convergence_series(spec, kind, members, method_evidence)
         for (kind, _group), members in sorted(groups.items())
     ]
+    for item in series:
+        for snapshot in item.pop("_snapshots", []):
+            snapshot.assert_unchanged()
     blocking = [issue for item in series for issue in item["issues"]]
     if unsupported:
         blocking.append(
@@ -1084,18 +1221,36 @@ def _linear_slope(xs: Sequence[float], ys: Sequence[float]) -> float | None:
     return sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denominator
 
 
+def _aimd_segments(raw_steps: Sequence[Mapping[str, Any]]) -> list[list[Mapping[str, Any]]]:
+    segments: list[list[Mapping[str, Any]]] = []
+    current: list[Mapping[str, Any]] = []
+    for item in raw_steps:
+        step = item.get("step")
+        if (not isinstance(step, int) or isinstance(step, bool) or step <= 0):
+            return []
+        if current and step <= current[-1]["step"]:
+            segments.append(current)
+            current = []
+        current.append(item)
+    if current:
+        segments.append(current)
+    return segments
+
+
 def _aimd_trajectory(
     spec: AnalysisSpec, target: Mapping[str, Any],
-    method_evidence: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+    method_evidence: Callable[..., Mapping[str, Any]],
 ) -> dict[str, Any]:
     from vcstudio.generate.aimd_builder import parse_aimd_energy
 
-    root = Path(str(target.get("path") or ""))
     parser = _parser("build_aimd_analysis_view")
-    source = _source(target, ["INCAR", "POSCAR", "OSZICAR", "XDATCAR"])
-    manifest = target.get("manifest") or {}
+    snapshot, manifest = _capture(target, [
+        "INCAR", "KPOINTS", "POTCAR", "POSCAR", "CONTCAR",
+        "OSZICAR", "XDATCAR",
+    ])
+    source = snapshot.identity()
     inputs = manifest.get("inputs") or {}
-    incar = parse_incar(_read_text(root / "INCAR"))
+    incar = parse_incar(snapshot.text("INCAR"))
     potim = _finite(incar.get("POTIM"))
     declared_steps = _finite(incar.get("NSW"))
     declared_temperature = _finite(incar.get("TEBEG"))
@@ -1113,49 +1268,82 @@ def _aimd_trajectory(
         if recorded is not None and actual is not None and abs(recorded - actual) > 1e-9:
             issues.append(f"manifest {key} differs from the current INCAR evidence")
     parsed = parse_aimd_energy(
-        _read_text(root / "OSZICAR"), potim_fs=potim if potim else 1.0)
+        snapshot.text("OSZICAR"), potim_fs=potim if potim else 1.0)
     raw_steps = list(parsed.get("steps") or [])
     if not raw_steps:
         issues.append("OSZICAR contains no parseable AIMD total-energy/temperature steps")
-    times_fs = ([float(item["t_fs"]) for item in raw_steps]
-                if potim is not None and potim > 0 else [])
+    segments = _aimd_segments(raw_steps)
+    valid_steps = bool(raw_steps and segments)
+    restarted = len(segments) > 1
+    if raw_steps and not valid_steps:
+        issues.append("AIMD step identifiers must be positive integers")
+    if restarted:
+        issues.append(
+            "AIMD step sequence restarted or regressed; aggregate duration and drift are unavailable")
     energies = [float(item["e_tot"]) for item in raw_steps]
     temperatures = [float(item["temp_k"]) for item in raw_steps]
     sampling_length_ps = (
-        (times_fs[-1] - times_fs[0] + (potim or 0.0)) / 1000.0
-        if times_fs else None
+        (raw_steps[-1]["step"] - raw_steps[0]["step"] + 1) * potim / 1000.0
+        if valid_steps and not restarted and potim is not None and potim > 0 else None
     )
     if sampling_length_ps is not None and sampling_length_ps < AIMD_SHORT_TRAJECTORY_PS:
         warnings.append(
             f"trajectory length {sampling_length_ps:.6g} ps is below the explicit "
             f"{AIMD_SHORT_TRAJECTORY_PS:g} ps short-trajectory diagnostic threshold"
         )
-    drift_total = energies[-1] - energies[0] if energies else None
+    drift_total = (
+        energies[-1] - energies[0]
+        if energies and valid_steps and not restarted else None
+    )
     slope_ev_ps = _linear_slope(
-        [value / 1000.0 for value in times_fs], energies)
-    structure = _trajectory_metrics(_read_text(root / "XDATCAR"))
+        [float(item["step"]) * potim / 1000.0 for item in raw_steps], energies,
+    ) if valid_steps and not restarted and potim is not None and potim > 0 else None
+    structure = _trajectory_metrics(snapshot.text("XDATCAR"))
     if structure["error"]:
         warnings.append(str(structure["error"]))
-    method = dict(method_evidence(target) or {})
-    if method.get("status") != "verified":
+    if restarted:
+        structure["max_step_displacement_a"] = None
+        structure["final_rmsd_a"] = None
+        structure["max_rmsd_a"] = None
+        warnings.append(
+            "XDATCAR restart boundaries are not explicit; cross-boundary displacement "
+            "and RMSD metrics are unavailable")
+    method = _method_evidence(method_evidence, target, snapshot)
+    if not _verified_method(method):
         issues.append("AIMD method identity is not verified")
-    if target.get("state") != "DONE":
+    if manifest.get("state") != "DONE":
         warnings.append("AIMD manifest state is not DONE; the trajectory is partial")
     file_by_name = {item["name"]: item for item in source["files"]}
     osz_files = [file_by_name["OSZICAR"]] if "OSZICAR" in file_by_name else []
     xdat_files = [file_by_name["XDATCAR"]] if "XDATCAR" in file_by_name else []
     incar_files = [file_by_name["INCAR"]] if "INCAR" in file_by_name else []
     source_id = source["source_id"]
+    segment_by_item = {
+        id(item): (segment_index, segment[0]["step"])
+        for segment_index, segment in enumerate(segments)
+        for item in segment
+    }
     samples = []
     for index, item in enumerate(raw_steps):
-        time_ps = (float(item["t_fs"]) / 1000.0
-                   if potim is not None and potim > 0 else None)
+        segment_index, segment_start = segment_by_item.get(id(item), (None, None))
+        time_ps = (
+            (item["step"] - segment_start + 1) * potim / 1000.0
+            if segment_start is not None and potim is not None and potim > 0 else None
+        )
         samples.append({
             "sample_index": index,
+            "step": _quantity(
+                key="step", label="MD step", value=item.get("step"),
+                unit="MD step", precision=0, denominator="OSZICAR step identifier",
+                source_id=source_id, files=osz_files, parser=parser,
+            ),
+            "segment_index": segment_index,
             "time": _quantity(
                 key="time", label="Time", value=time_ps,
                 unit="ps", precision=spec.precision,
-                denominator=f"POTIM={potim:g} fs" if potim else "POTIM unavailable",
+                denominator=(
+                    f"segment-local elapsed time; POTIM={potim:g} fs"
+                    if potim else "POTIM unavailable"),
                 source_id=source_id, files=osz_files + incar_files, parser=parser,
             ),
             "total_energy": _quantity(
@@ -1176,10 +1364,44 @@ def _aimd_trajectory(
         math.sqrt(sum((value - temperature_mean) ** 2 for value in temperatures)
                   / len(temperatures)) if temperatures else None
     )
+    segment_rows = []
+    for segment_index, segment in enumerate(segments):
+        start_step = segment[0]["step"]
+        end_step = segment[-1]["step"]
+        duration = (
+            (end_step - start_step + 1) * potim / 1000.0
+            if potim is not None and potim > 0 else None
+        )
+        segment_rows.append({
+            "segment_index": segment_index,
+            "start_step": _quantity(
+                key="start_step", label="Segment start step", value=start_step,
+                unit="MD step", precision=0, denominator="OSZICAR step identifier",
+                source_id=source_id, files=osz_files, parser=parser,
+            ),
+            "end_step": _quantity(
+                key="end_step", label="Segment end step", value=end_step,
+                unit="MD step", precision=0, denominator="OSZICAR step identifier",
+                source_id=source_id, files=osz_files, parser=parser,
+            ),
+            "sample_count": _quantity(
+                key="segment_sample_count", label="Segment samples", value=len(segment),
+                unit="samples", precision=0, denominator="strictly increasing segment",
+                source_id=source_id, files=osz_files, parser=parser,
+            ),
+            "duration": _quantity(
+                key="segment_duration", label="Segment duration", value=duration,
+                unit="ps", precision=spec.precision,
+                denominator=f"inclusive segment steps; POTIM={potim:g} fs"
+                if potim else "POTIM unavailable",
+                source_id=source_id, files=osz_files + incar_files, parser=parser,
+                reason="POTIM is unavailable" if duration is None else "",
+            ),
+        })
     metric_specs = (
         ("time_step", "Time step", potim, "fs", "INCAR POTIM", incar_files),
         ("sampling_length", "Sampling length", sampling_length_ps, "ps",
-         "first through last parsed MD sample", osz_files + incar_files),
+         "single strictly increasing step segment", osz_files + incar_files),
         ("sample_count", "Parsed samples", len(samples) if samples else None, "samples",
          f"declared NSW={int(declared_steps) if declared_steps else 'unavailable'}", osz_files),
         ("temperature_mean", "Mean temperature", temperature_mean, "K",
@@ -1187,9 +1409,9 @@ def _aimd_trajectory(
         ("temperature_std", "Temperature standard deviation", temperature_std, "K",
          f"population standard deviation over {len(temperatures)} samples", osz_files),
         ("energy_drift_total", "Endpoint total-energy drift", drift_total, "eV",
-         "last minus first total-energy sample", osz_files),
+         "last minus first sample of one strictly increasing segment", osz_files),
         ("energy_drift_slope", "Linear total-energy drift", slope_ev_ps, "eV/ps",
-         f"least-squares slope over {len(energies)} samples", osz_files),
+         f"least-squares slope over one {len(energies)}-sample segment", osz_files),
         ("trajectory_frames", "Structure frames", structure["frame_count"], "frames",
          f'XDATCAR; {structure["natoms"] or "unavailable"} atoms', xdat_files),
         ("max_step_displacement", "Maximum per-step atom displacement",
@@ -1206,7 +1428,13 @@ def _aimd_trajectory(
             key=key, label=label, value=value, unit=unit,
             precision=spec.precision, denominator=denominator,
             source_id=source_id, files=files, parser=parser,
-            reason="required evidence is unavailable" if value is None else "",
+            reason=(
+                "restart/regression prevents one aggregate value"
+                if value is None and restarted and key in {
+                    "sampling_length", "energy_drift_total", "energy_drift_slope",
+                    "max_step_displacement", "final_rmsd", "max_rmsd",
+                } else "required evidence is unavailable" if value is None else ""
+            ),
         )
         for key, label, value, unit, denominator, files in metric_specs
     }
@@ -1217,6 +1445,7 @@ def _aimd_trajectory(
         "status": "available" if samples else "missing_prerequisite",
         "available": bool(samples),
         "samples": samples,
+        "segments": segment_rows,
         "metrics": metrics,
         "structure_diagnostics": {
             "status": "available" if structure["frame_count"] else "unavailable",
@@ -1232,12 +1461,12 @@ def _aimd_trajectory(
         "figure_data": {
             "steps": [
                 {
-                    "step": sample["sample_index"] + 1,
+                    "step": sample["step"]["value"],
                     "energy": sample["total_energy"]["value"],
                     "temperature": sample["temperature"]["value"],
                 }
                 for sample in samples
-            ],
+            ] if not restarted else [],
             "dt_fs": potim,
             "provenance": {
                 "parser_module": PARSER_MODULE,
@@ -1247,24 +1476,29 @@ def _aimd_trajectory(
                 "denominator": f"{len(samples)} parsed OSZICAR MD samples",
             },
         },
+        "_snapshots": [snapshot],
     }
 
 
 def build_aimd_analysis_view(
     spec: AnalysisSpec, targets: Sequence[Mapping[str, Any]], *,
-    method_evidence: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+    method_evidence: Callable[..., Mapping[str, Any]],
 ) -> dict[str, Any]:
     if spec.analysis_id != "aimd-diagnostics":
         raise ValueError("AIMD analysis view requires analysis_id=aimd-diagnostics")
     selected = [target for target in targets if target.get("task_type") == "aimd"]
     trajectories = [_aimd_trajectory(spec, target, method_evidence) for target in selected]
+    for trajectory in trajectories:
+        for snapshot in trajectory.pop("_snapshots", []):
+            snapshot.assert_unchanged()
     blocking = [issue for item in trajectories for issue in item["issues"]]
     warnings = [warning for item in trajectories for warning in item["warnings"]]
     if not selected:
         blocking.append("No registered AIMD project member or descendant was resolved")
     available = sum(item["available"] is True for item in trajectories)
     figure_data = {}
-    if len(trajectories) == 1 and trajectories[0]["samples"]:
+    if (len(trajectories) == 1
+            and trajectories[0]["figure_data"].get("steps")):
         figure_data["aimd_diagnostic"] = copy.deepcopy(
             trajectories[0]["figure_data"])
     payload = {

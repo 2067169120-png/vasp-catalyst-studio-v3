@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
 from vcstudio.project.analysis_registry import normalize_analysis_request
 from vcstudio.project.analysis_sources import (
+    SourceSnapshotChanged,
     build_property_view,
     build_task_analysis_view,
+    capture_source_snapshot,
     resolve_project_targets,
     value_provenance,
 )
@@ -216,3 +221,24 @@ def test_value_provenance_keeps_only_hashed_files_and_explicit_parser_identity()
         "parser_callable": "parse",
         "parser_version": "4.1",
     }
+
+
+def test_source_snapshot_hashes_and_parses_one_copy_then_detects_replacement(tmp_path):
+    job = tmp_path / "immutable"
+    manifest = _manifest(job, "aimd")
+    original = b" 1 T= 300 E= -10.0\n"
+    (job / "OSZICAR").write_bytes(original)
+    target = {
+        "path": str(job), "source_id": "job-immutable", "relation": "member",
+        "task_type": "aimd", "state": "DONE", "manifest": manifest,
+    }
+
+    snapshot = capture_source_snapshot(target, ["OSZICAR"])
+    evidence = snapshot.file("OSZICAR")
+
+    assert snapshot.bytes("OSZICAR") == original
+    assert evidence["sha256"] == hashlib.sha256(original).hexdigest()
+    (job / "OSZICAR").write_bytes(b" 1 T= 999 E= -99.0\n")
+    assert snapshot.bytes("OSZICAR") == original
+    with pytest.raises(SourceSnapshotChanged, match="changed during analysis"):
+        snapshot.assert_unchanged()

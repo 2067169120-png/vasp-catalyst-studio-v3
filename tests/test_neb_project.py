@@ -26,7 +26,9 @@ def _osz(e0):
 
 def _force_block(fmax):
     """合成 OUTCAR 力块(单原子,|F|=fmax);TOTAL-FORCE 6 列格式。"""
-    return ('  POSITION          TOTAL-FORCE (eV/Angst)\n'
+    return (' NIONS =      1 ions\n'
+            ' aborting loop because EDIFF is reached\n'
+            '  POSITION          TOTAL-FORCE (eV/Angst)\n'
             ' -----------------------------------\n'
             f'  0.0 0.0 0.0   {fmax:.6f} 0.0 0.0\n'
             ' -----------------------------------\n')
@@ -39,6 +41,8 @@ def _make_neb(tmp_path, energies, forces=None):
     for i, e in enumerate(energies):
         sub = os.path.join(jd, f'{i:02d}')
         os.makedirs(sub, exist_ok=True)
+        open(os.path.join(sub, 'POSCAR'), 'w').write(
+            'H\n1\n1 0 0\n0 1 0\n0 0 1\nH\n1\nDirect\n0 0 0\n')
         if e is not None:
             open(os.path.join(sub, 'OSZICAR'), 'w').write(_osz(e))
         if forces is not None and forces[i] is not None:
@@ -124,6 +128,39 @@ def test_climbing_not_converged_when_no_forces(tmp_path):
     jd = _make_neb(tmp_path, _BARRIER)                         # 无 OUTCAR
     d = pneb.parse_neb_energies(jd)
     assert d['climbing_converged'] is False
+
+
+def test_last_complete_step_does_not_reuse_earlier_ediff_success():
+    text = (
+        _force_block(0.01)
+        + ' electronic convergence not reached\n'
+        + '  POSITION          TOTAL-FORCE (eV/Angst)\n'
+        + ' -----------------------------------\n'
+        + '  0.0 0.0 0.0   0.010000 0.0 0.0\n'
+        + ' -----------------------------------\n'
+    )
+
+    parsed = pneb.parse_last_complete_image_step(text, 1)
+
+    assert parsed['status'] == 'unavailable'
+    assert parsed['fmax'] is None
+    assert any('EDIFF' in issue for issue in parsed['issues'])
+
+
+def test_last_complete_step_rejects_starred_force_row():
+    text = (
+        ' NIONS = 1 ions\n'
+        ' aborting loop because EDIFF is reached\n'
+        ' POSITION TOTAL-FORCE (eV/Angst)\n'
+        ' -----------------------------------\n'
+        ' 0.0 0.0 0.0 ******** 0.0 0.0\n'
+    )
+
+    parsed = pneb.parse_last_complete_image_step(text, 1)
+
+    assert parsed['status'] == 'unavailable'
+    assert parsed['fmax'] is None
+    assert any('fully numeric' in issue for issue in parsed['issues'])
 
 
 # ── 质量闸各分支 ──

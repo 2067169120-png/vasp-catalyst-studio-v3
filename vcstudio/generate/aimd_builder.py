@@ -338,7 +338,7 @@ _OSZ_MD_RE = re.compile(rf'^\s*(\d+)\s+T=\s*({_NUM})\s+E=\s*({_NUM})')
 
 
 def parse_aimd_energy(oszicar_text, *, potim_fs: float = 1.0) -> dict:
-    """解析 OSZICAR 的 MD 步行 → ``{'steps':[{'t_fs','e_tot','temp_k'}, ...], 'n'}``。
+    """解析 OSZICAR 的 MD 步行 → ``{'steps':[{'step','t_fs',...}], 'n'}``。
 
     每步取:步号(×potim_fs → 时间 t_fs)、T=温度(K)、E=总能(eV,含动能)。供能量-时间/
     温度-时间曲线(出图接线后续)。potim_fs 默认 1.0(论文口径),即 t_fs=步号;传入实际步长
@@ -350,7 +350,7 @@ def parse_aimd_energy(oszicar_text, *, potim_fs: float = 1.0) -> dict:
         if not m:
             continue
         n = int(m.group(1))
-        steps.append({'t_fs': n * float(potim_fs),
+        steps.append({'step': n, 't_fs': n * float(potim_fs),
                       'e_tot': float(m.group(3)),
                       'temp_k': float(m.group(2))})
     return {'steps': steps, 'n': len(steps)}

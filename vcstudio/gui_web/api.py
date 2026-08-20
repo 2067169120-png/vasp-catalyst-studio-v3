@@ -7518,7 +7518,7 @@ class Api:
         }
 
     @staticmethod
-    def _analysis_workbench_method_evidence(target):
+    def _analysis_workbench_method_evidence(target, source_snapshot=None):
         """Require a complete, non-drifted method identity before parsing."""
         from vcstudio.project import energy_gate
 
@@ -7533,7 +7533,8 @@ class Api:
             return {'status': 'unverified', 'engine': engine,
                     'missing': ['non-VASP manifest lacks method identity']}
         record = energy_gate.method_record(
-            target['path'], manifest, str(target.get('source_id') or 'job'))
+            target['path'], manifest, str(target.get('source_id') or 'job'),
+            source_snapshot=source_snapshot)
         required = ('functional', 'dispersion', 'encut', 'spin',
                     'kpoints_scheme', 'potcar_ids')
         missing = [key for key in required if not record['known'].get(key)]
@@ -15450,6 +15451,32 @@ class Api:
                 warnings.append(f'NEB {frame} image 目录不存在，无法写入端点证据。')
                 records[role] = record
                 continue
+            # build_neb_dir writes the selected source CONTCAR/POSCAR bytes to
+            # frame/POSCAR. Bind that exact structure to the endpoint energy.
+            source_structure = next((
+                (name, os.path.join(source, name))
+                for name in ('CONTCAR', 'POSCAR')
+                if os.path.isfile(os.path.join(source, name))
+                and os.path.getsize(os.path.join(source, name)) > 0
+            ), None)
+            frame_poscar = os.path.join(destination, 'POSCAR')
+            if source_structure and os.path.isfile(frame_poscar):
+                structure_name, structure_path = source_structure
+                try:
+                    structure_hash = _sha256_file(structure_path)
+                    if structure_hash == _sha256_file(frame_poscar):
+                        record['files'].append({
+                            'name': structure_name, 'copied_name': 'POSCAR',
+                            'sha256': structure_hash,
+                            'size': os.path.getsize(frame_poscar),
+                        })
+                    else:
+                        warnings.append(
+                            f'{frame}/POSCAR 与端点源 {structure_name} 不一致；'
+                            'Analysis Workbench 将拒绝端点能量。')
+                except OSError:
+                    warnings.append(
+                        f'{frame}/POSCAR 结构哈希失败；Analysis Workbench 将拒绝端点能量。')
             for name in ('OSZICAR', 'OUTCAR', 'vasprun.xml'):
                 src = os.path.join(source, name)
                 dst = os.path.join(destination, name)
@@ -15484,6 +15511,11 @@ class Api:
                 source_manifest = {}
             if not isinstance(source_manifest, dict):
                 source_manifest = {}
+            # Analysis Workbench resolves this opaque identity back through the
+            # current ledger. It never treats source_dir or manifest trust hints
+            # as authority.
+            record['source_job_id'] = self._workspace_job_id(
+                source, source_manifest)
             record['source_state'] = source_manifest.get('state')
             if energy is not None:
                 record['energy_e0_eV'] = energy
@@ -15502,7 +15534,6 @@ class Api:
                         and math.isfinite(float(value))):
                     record['energy_e0_eV'] = float(value)
                     record['energy_source'] = f'source_manifest:{declared_source}'
-                    record['source_job_id'] = source_manifest.get('job_id')
                     record['trusted'] = bool(record['source_job_id'])
             if record['energy_e0_eV'] is None:
                 label = '始态' if role == 'start' else '末态'

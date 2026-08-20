@@ -188,18 +188,30 @@ def validate_done_energy(job_dir, label, manifest_mod, *, require_oszicar=False)
     return energy, manifest, evidence
 
 
-def method_record(job_dir, manifest, label):
-    """Extract a comparable method record from files with manifest fallbacks."""
+def method_record(job_dir, manifest, label, *, source_snapshot=None):
+    """Extract a comparable method record from one immutable file snapshot.
+
+    ``source_snapshot`` is optional for legacy callers. Analysis Workbench
+    callers provide it so method parsing and evidence hashes consume identical
+    bytes instead of reopening mutable files.
+    """
     from vcstudio.campaign import fingerprint as fingerprint_mod
 
-    incar = _read_named(job_dir, 'INCAR')
-    kpoints = _read_named(job_dir, 'KPOINTS')
-    potcar_text = _read_named(job_dir, 'POTCAR')
+    def _text(name):
+        return (source_snapshot.text(name) if source_snapshot is not None
+                else _read_named(job_dir, name))
+
+    incar = _text('INCAR')
+    kpoints = _text('KPOINTS')
+    potcar_text = _text('POTCAR')
     inputs = (manifest or {}).get('inputs') or {}
     results = (manifest or {}).get('results') or {}
     expected_hashes = inputs.get('sha256') or inputs.get('source_sha256') or {}
 
     def _current_hash(name):
+        if source_snapshot is not None:
+            item = source_snapshot.file(name)
+            return str((item or {}).get('sha256') or '')
         path = os.path.join(str(job_dir), name)
         try:
             with open(path, 'rb') as handle:
@@ -233,7 +245,7 @@ def method_record(job_dir, manifest, label):
         titels = [match.group(1).strip() for match in re.finditer(
             r'^\s*TITEL\s*=\s*(.+?)\s*$', potcar_text, re.I | re.M)]
         elements = []
-        structure = _read_structure(job_dir)
+        structure = (_text('CONTCAR') or _text('POSCAR'))
         if structure:
             try:
                 from vcstudio.generate.poscar import parse_poscar_species

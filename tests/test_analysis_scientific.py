@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,11 @@ def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _write_manifest(root: Path, value: dict) -> None:
+    (root / "job.yaml").write_text(
+        json.dumps(value, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+
+
 def _poscar(x: float) -> str:
     return (
         "H path\n1.0\n10 0 0\n0 10 0\n0 0 10\n"
@@ -40,6 +46,7 @@ def _poscar(x: float) -> str:
 
 def _outcar(energy: float, force: float) -> str:
     return (
+        " NIONS =      1 ions\n"
         "aborting loop because EDIFF is reached\n"
         f" energy(sigma->0) = {energy:.8f}\n"
         " POSITION                                       TOTAL-FORCE (eV/Angst)\n"
@@ -85,6 +92,8 @@ def _neb_target(tmp_path: Path) -> dict:
         encoding="utf-8",
     )
     energies = (-10.0, -9.5, -10.2)
+    endpoint_targets = []
+    endpoint_records = {}
     for index, (energy, coordinate) in enumerate(zip(energies, (0.0, 0.1, 0.2))):
         frame = root / f"{index:02d}"
         frame.mkdir()
@@ -94,19 +103,38 @@ def _neb_target(tmp_path: Path) -> dict:
             encoding="utf-8",
         )
         (frame / "OUTCAR").write_text(_outcar(energy, 0.02), encoding="utf-8")
-    (root / "job.yaml").write_text("state: DONE\n", encoding="utf-8")
-    endpoints = {
-        role: {
-            "trusted": True, "target_frame": frame, "source_state": "DONE",
-            "method_fingerprint": copy.deepcopy(METHOD),
+    for role, frame in (("start", "00"), ("end", "02")):
+        source_root = tmp_path / f"{role}-source"
+        source_root.mkdir()
+        for name in ("POSCAR", "OSZICAR", "OUTCAR"):
+            (source_root / name).write_bytes((root / frame / name).read_bytes())
+        source_manifest = {"state": "DONE", "task_type": "relax", "inputs": {}}
+        _write_manifest(source_root, source_manifest)
+        source_id = f"{role}-endpoint-source"
+        endpoint_targets.append(
+            _target(source_root, source_id, "relax", source_manifest))
+        endpoint_records[role] = {
+            # These deliberately forged hints must not participate in authority.
+            "trusted": False, "source_state": "FAILED",
+            "method_fingerprint": {"forged": True},
+            "target_frame": frame, "source_job_id": source_id,
+            "files": [
+                {"name": name, "sha256": _sha(root / frame / name)}
+                for name in ("POSCAR", "OSZICAR", "OUTCAR")
+            ],
         }
-        for role, frame in (("start", "00"), ("end", "02"))
-    }
     manifest = {
         "state": "DONE", "task_type": "neb",
-        "inputs": {"n_images": 1, "neb_endpoints": endpoints},
+        "inputs": {"n_images": 1, "neb_endpoints": endpoint_records},
     }
-    return _target(root, "neb-source", "neb", manifest)
+    _write_manifest(root, manifest)
+    target = _target(root, "neb-source", "neb", manifest)
+    target["_endpoint_targets"] = endpoint_targets
+    return target
+
+
+def _neb_targets(target: dict) -> list[dict]:
+    return [target, *target["_endpoint_targets"]]
 
 
 def test_neb_view_only_releases_barriers_after_all_evidence_gates(tmp_path):
@@ -114,7 +142,7 @@ def test_neb_view_only_releases_barriers_after_all_evidence_gates(tmp_path):
     spec = normalize_analysis_request(
         {"analysis_id": "neb-path", "precision": 5}, project_id=PROJECT)
 
-    view = build_neb_analysis_view(spec, [target], method_evidence=_method)
+    view = build_neb_analysis_view(spec, _neb_targets(target), method_evidence=_method)
 
     assert view["scientific_status"] == "diagnostic"
     assert view["denominator"]["barrier_qualified_paths"] == 1
@@ -126,27 +154,34 @@ def test_neb_view_only_releases_barriers_after_all_evidence_gates(tmp_path):
     assert all(point["electronic_convergence"] == "converged"
                for point in path["points"])
     assert path["points"][1]["ionic_convergence"] == "converged"
+    assert path["endpoint_evidence"]["start"]["status"] == "verified"
+    assert path["endpoint_evidence"]["start"]["source"]["source_id"] == (
+        "start-endpoint-source")
     assert "does not establish a complete mechanism" in path["scientific_boundary"]
     assert "Γ-point frequencies are not a phonon dispersion" in path["scientific_boundary"]
     assert view["figure_data"]["neb_profile"]["barrier_f"] == 0.5
     _assert_quantities_have_provenance(view)
 
-    target["manifest"]["inputs"]["neb_endpoints"]["end"].pop(
-        "method_fingerprint")
-    withheld = build_neb_analysis_view(spec, [target], method_evidence=_method)
+    target["manifest"]["inputs"]["neb_endpoints"]["end"].pop("source_job_id")
+    _write_manifest(Path(target["path"]), target["manifest"])
+    withheld = build_neb_analysis_view(
+        spec, _neb_targets(target), method_evidence=_method)
     blocked_path = withheld["paths"][0]
     assert blocked_path["barriers"]["status"] == "unavailable"
     assert blocked_path["barriers"]["forward"]["value"] is None
     assert blocked_path["points"][1]["relative_energy"]["value"] == 0.5
-    assert any("endpoint method fingerprint" in item
+    assert any("source_job_id" in item
                for item in blocked_path["barriers"]["blocking"])
 
     target = _neb_target(tmp_path / "second")
-    target["manifest"]["inputs"]["neb_endpoints"]["start"].pop("source_state")
-    no_endpoint_state = build_neb_analysis_view(spec, [target], method_evidence=_method)
-    assert no_endpoint_state["paths"][0]["barriers"]["status"] == "unavailable"
-    assert any("source state is not DONE" in item for item in
-               no_endpoint_state["paths"][0]["barriers"]["blocking"])
+    source = Path(target["_endpoint_targets"][0]["path"])
+    (source / "OSZICAR").write_text(
+        " 1 F= -99 E0= -99 d E =0\n", encoding="utf-8")
+    changed_source = build_neb_analysis_view(
+        spec, _neb_targets(target), method_evidence=_method)
+    assert changed_source["paths"][0]["barriers"]["status"] == "unavailable"
+    assert any("no longer matches" in item for item in
+               changed_source["paths"][0]["barriers"]["blocking"])
 
 
 def _convergence_targets(tmp_path: Path) -> list[dict]:
@@ -154,23 +189,26 @@ def _convergence_targets(tmp_path: Path) -> list[dict]:
     for index, (encut, energy) in enumerate((
             (400, -1.0040), (450, -1.0008), (500, -1.0003), (550, -1.0000))):
         root = tmp_path / f"encut-{encut}"
-        root.mkdir()
-        (root / "job.yaml").write_text("state: DONE\n", encoding="utf-8")
+        root.mkdir(parents=True)
         (root / "INCAR").write_text(f"ENCUT={encut}\n", encoding="utf-8")
         (root / "POSCAR").write_text(_poscar(0.0), encoding="utf-8")
+        (root / "OUTCAR").write_text(" NIONS = 1 ions\n", encoding="utf-8")
         (root / "OSZICAR").write_text(
             f" 1 F= {energy:.8f} E0= {energy:.8f} d E =0\n",
             encoding="utf-8",
         )
         method = copy.deepcopy(METHOD)
         method["encut"] = float(encut)
-        target = _target(root, f"conv-{index}", "conv_scan", {
+        manifest = {
             "state": "DONE", "task_type": "conv_scan", "parent_job": "parent",
             "inputs": {
                 "parent_job": "parent", "series": "encut",
                 "series_value": encut, "series_label": f"{encut} eV", "natoms": 1,
+                "sha256": {"POSCAR": _sha(root / "POSCAR")},
             },
-        })
+        }
+        _write_manifest(root, manifest)
+        target = _target(root, f"conv-{index}", "conv_scan", manifest)
         target["method"] = {"status": "verified", "fingerprint": method}
         targets.append(target)
     return targets
@@ -196,14 +234,72 @@ def test_convergence_view_exposes_raw_points_platform_and_threshold_sensitivity(
     assert series["sensitivity"][0]["recommended_parameter"]["value"] is None
     assert view["denominator"]["available_recommendations"] == 1
     assert view["figure_data"]["convergence_curve"]["points"][-1]["energy"] == -1.0
+    assert {item["name"] for item in
+            series["points"][0]["energy_per_atom"]["file_hashes"]} >= {
+                "job.yaml", "POSCAR", "OUTCAR", "OSZICAR"}
     _assert_quantities_have_provenance(view)
 
     targets[2]["state"] = "RUNNING"
     targets[2]["manifest"]["state"] = "RUNNING"
+    _write_manifest(Path(targets[2]["path"]), targets[2]["manifest"])
     missing = build_convergence_analysis_view(
         spec, targets, method_evidence=lambda target: target["method"])
     assert missing["series"][0]["platform"]["status"] == "unavailable"
     assert missing["series"][0]["platform"]["recommendation"]["value"] is None
+
+
+def test_convergence_any_method_issue_or_natoms_mismatch_blocks_recommendation(tmp_path):
+    spec = normalize_analysis_request(
+        {"analysis_id": "convergence-scan"}, project_id=PROJECT)
+    targets = _convergence_targets(tmp_path / "method")
+    targets[1]["method"] = {
+        "status": "verified", "fingerprint": copy.deepcopy(METHOD),
+        "warnings": ["input drift"],
+    }
+
+    method_blocked = build_convergence_analysis_view(
+        spec, targets, method_evidence=lambda target: target["method"])
+
+    assert method_blocked["series"][0]["platform"]["status"] == "unavailable"
+    assert method_blocked["series"][0]["platform"]["point_indexes"] == []
+    assert any("every convergence point" in issue
+               for issue in method_blocked["series"][0]["issues"])
+
+    targets = _convergence_targets(tmp_path / "natoms")
+    bad = targets[2]
+    (Path(bad["path"]) / "OUTCAR").write_text(
+        " NIONS = 2 ions\n", encoding="utf-8")
+
+    denominator_blocked = build_convergence_analysis_view(
+        spec, targets, method_evidence=lambda target: target["method"])
+
+    point = denominator_blocked["series"][0]["points"][2]
+    assert point["atom_count"]["value"] is None
+    assert point["energy_per_atom"]["value"] is None
+    assert denominator_blocked["series"][0]["platform"]["status"] == "unavailable"
+    assert any("atom counts disagree" in issue
+               for issue in denominator_blocked["series"][0]["issues"])
+
+
+def test_convergence_fails_whole_projection_if_source_changes_mid_parse(tmp_path):
+    from vcstudio.project.analysis_sources import SourceSnapshotChanged
+
+    targets = _convergence_targets(tmp_path)
+    spec = normalize_analysis_request(
+        {"analysis_id": "convergence-scan"}, project_id=PROJECT)
+    changed = False
+
+    def mutate_after_capture(target, _snapshot):
+        nonlocal changed
+        if not changed:
+            changed = True
+            (Path(target["path"]) / "OSZICAR").write_text(
+                " 1 F= -99 E0= -99 d E =0\n", encoding="utf-8")
+        return target["method"]
+
+    with pytest.raises(SourceSnapshotChanged, match="changed during analysis"):
+        build_convergence_analysis_view(
+            spec, targets, method_evidence=mutate_after_capture)
 
 
 def test_convergence_points_without_lineage_are_never_combined(tmp_path):
@@ -211,6 +307,7 @@ def test_convergence_points_without_lineage_are_never_combined(tmp_path):
     for target in targets:
         target["manifest"].pop("parent_job", None)
         target["manifest"]["inputs"].pop("parent_job", None)
+        _write_manifest(Path(target["path"]), target["manifest"])
     spec = normalize_analysis_request(
         {"analysis_id": "convergence-scan"}, project_id=PROJECT)
 
@@ -235,7 +332,6 @@ def _xdatcar() -> str:
 def test_aimd_view_is_diagnostic_and_never_promotes_short_trajectory(tmp_path):
     root = tmp_path / "aimd"
     root.mkdir()
-    (root / "job.yaml").write_text("state: DONE\n", encoding="utf-8")
     (root / "INCAR").write_text(
         "IBRION=0\nNSW=3\nPOTIM=1.0\nTEBEG=300\n", encoding="utf-8")
     (root / "POSCAR").write_text(_poscar(0.0), encoding="utf-8")
@@ -246,10 +342,12 @@ def test_aimd_view_is_diagnostic_and_never_promotes_short_trajectory(tmp_path):
         encoding="utf-8",
     )
     (root / "XDATCAR").write_text(_xdatcar(), encoding="utf-8")
-    target = _target(root, "aimd-source", "aimd", {
+    manifest = {
         "state": "DONE", "task_type": "aimd",
         "inputs": {"potim_fs": 1.0, "steps": 3, "temp_k": 300.0},
-    })
+    }
+    _write_manifest(root, manifest)
+    target = _target(root, "aimd-source", "aimd", manifest)
     spec = normalize_analysis_request(
         {"analysis_id": "aimd-diagnostics", "precision": 6}, project_id=PROJECT)
 
@@ -270,11 +368,49 @@ def test_aimd_view_is_diagnostic_and_never_promotes_short_trajectory(tmp_path):
     _assert_quantities_have_provenance(view)
 
 
+def test_aimd_restart_is_segmented_without_cross_segment_duration_or_drift(tmp_path):
+    root = tmp_path / "aimd-restart"
+    root.mkdir()
+    (root / "INCAR").write_text(
+        "IBRION=0\nNSW=4\nPOTIM=1.0\nTEBEG=300\n", encoding="utf-8")
+    (root / "POSCAR").write_text(_poscar(0.0), encoding="utf-8")
+    (root / "OSZICAR").write_text(
+        " 1 T= 300 E= -10.000 F= -10 E0= -10 EK= 0.1\n"
+        " 2 T= 301 E= -9.990 F= -10 E0= -10 EK= 0.1\n"
+        " 1 T= 302 E= -9.800 F= -10 E0= -10 EK= 0.1\n"
+        " 2 T= 303 E= -9.790 F= -10 E0= -10 EK= 0.1\n",
+        encoding="utf-8",
+    )
+    (root / "XDATCAR").write_text(_xdatcar(), encoding="utf-8")
+    manifest = {
+        "state": "DONE", "task_type": "aimd",
+        "inputs": {"potim_fs": 1.0, "steps": 4, "temp_k": 300.0},
+    }
+    _write_manifest(root, manifest)
+    target = _target(root, "aimd-restart", "aimd", manifest)
+    spec = normalize_analysis_request(
+        {"analysis_id": "aimd-diagnostics", "precision": 6}, project_id=PROJECT)
+
+    view = build_aimd_analysis_view(spec, [target], method_evidence=_method)
+
+    trajectory = view["trajectories"][0]
+    assert len(trajectory["segments"]) == 2
+    assert trajectory["metrics"]["sampling_length"]["value"] is None
+    assert trajectory["metrics"]["energy_drift_total"]["value"] is None
+    assert trajectory["metrics"]["energy_drift_slope"]["value"] is None
+    assert [sample["step"]["value"] for sample in trajectory["samples"]] == [1, 2, 1, 2]
+    assert [sample["segment_index"] for sample in trajectory["samples"]] == [0, 0, 1, 1]
+    assert [sample["time"]["value"] for sample in trajectory["samples"]] == [
+        0.001, 0.002, 0.001, 0.002]
+    assert view["figure_data"] == {}
+    assert any("restarted or regressed" in issue for issue in trajectory["issues"])
+
+
 def test_report_binding_uses_registry_sections_and_frozen_view_hashes(tmp_path):
     target = _neb_target(tmp_path)
     spec = normalize_analysis_request(
         {"analysis_id": "neb-path"}, project_id=PROJECT)
-    view = build_neb_analysis_view(spec, [target], method_evidence=_method)
+    view = build_neb_analysis_view(spec, _neb_targets(target), method_evidence=_method)
     binding = view["report_binding"]
 
     assert binding["schema"] == REPORT_BINDING_SCHEMA
@@ -294,7 +430,7 @@ def test_api_bootstrap_dispatches_registered_neb_capability_without_paths(tmp_pa
     project_id = api._workspace_project_id(
         project_paths[0], projects[project_paths[0]])
     target = _neb_target(tmp_path)
-    api._analysis_workbench_targets = lambda _context: [target]
+    api._analysis_workbench_targets = lambda _context: _neb_targets(target)
     api._analysis_workbench_method_evidence = _method
 
     response = api.analysis_workbench_bootstrap(project_id, "neb-path")

@@ -70,49 +70,135 @@ def _frame_energy(frame_dir) -> float | None:
     return _frame_energy_evidence(frame_dir)[0]
 
 
-def _manifest_endpoint_energy(job_dir, frame: str, role: str):
-    """仅接受 derive_neb 写入且带来源证据的端点能量。"""
-    try:
-        from vcstudio.shared import manifest as manifest_mod
-        value = manifest_mod.load_manifest(job_dir) or {}
-    except Exception:
-        return None, None
-    inputs = value.get('inputs') or {}
-    endpoints = inputs.get('neb_endpoints') or {}
-    if not isinstance(endpoints, dict):
-        return None, None
-    record = endpoints.get(role) or {}
-    if not isinstance(record, dict) or record.get('target_frame') != frame \
-            or record.get('trusted') is not True:
-        return None, None
-    energy = record.get('energy_e0_eV')
-    if (isinstance(energy, bool) or not isinstance(energy, (int, float))
-            or not math.isfinite(float(energy))):
-        return None, None
-    source = str(record.get('energy_source') or '').strip()
-    if source.startswith('copied:'):
-        evidence_file = source[len('copied:'):].split(':', 1)[0]
-        files = record.get('files') or []
-        has_hash = any(isinstance(item, dict)
-                       and item.get('name') == evidence_file and item.get('sha256')
-                       for item in files)
-        if not has_hash:
-            return None, None
-    elif source.startswith('source_manifest:'):
-        if record.get('source_state') != 'DONE' or not record.get('source_job_id'):
-            return None, None
-    else:
-        return None, None
-    return float(energy), source
+_NIONS_RE = re.compile(r'\bNIONS\s*=\s*(\d+)')
+_ELECTRONIC_NOT_REACHED = (
+    'electronic convergence not reached',
+    'ediff was not reached',
+    'did not converge',
+)
+
+
+def parse_last_complete_image_step(outcar_text: str, expected_natoms: int) -> dict:
+    """Return the final complete force/SCF step, failing closed on bad rows.
+
+    The last ``TOTAL-FORCE`` occurrence is authoritative. Earlier EDIFF success
+    cannot cover a later non-converged step, and any starred, missing, extra or
+    non-numeric force row makes the final force unavailable.
+    """
+    if isinstance(expected_natoms, bool) or not isinstance(expected_natoms, int) \
+            or expected_natoms <= 0:
+        return {'status': 'unavailable', 'fmax': None,
+                'electronic_status': 'unavailable',
+                'issues': ['expected atom count is unavailable']}
+    lines = str(outcar_text or '').splitlines()
+    nions_values = {int(value) for value in _NIONS_RE.findall(outcar_text or '')}
+    issues = []
+    if len(nions_values) != 1 or next(iter(nions_values), None) != expected_natoms:
+        issues.append('OUTCAR NIONS does not match the frozen structure atom count')
+
+    electronic = 'unavailable'
+    pending_scf_after_force = False
+    events = []
+    for index, line in enumerate(lines):
+        lowered = line.lower()
+        if 'aborting loop because ediff is reached' in lowered:
+            electronic = 'converged'
+            if events:
+                pending_scf_after_force = True
+        elif any(marker in lowered for marker in _ELECTRONIC_NOT_REACHED):
+            electronic = 'not_converged'
+            if events:
+                pending_scf_after_force = True
+        if 'TOTAL-FORCE' not in line:
+            continue
+        cursor = index + 1
+        while cursor < len(lines) and (
+                not lines[cursor].strip()
+                or set(lines[cursor].strip()) <= {'-'}):
+            cursor += 1
+        row_forces = []
+        block_issues = []
+        for atom_index in range(expected_natoms):
+            if cursor >= len(lines):
+                block_issues.append(
+                    f'force block ended before atom {atom_index + 1}/{expected_natoms}')
+                break
+            tokens = lines[cursor].split()
+            if len(tokens) != 6 or any('*' in token for token in tokens):
+                block_issues.append(
+                    f'force row {atom_index + 1}/{expected_natoms} is not fully numeric')
+                break
+            try:
+                fx, fy, fz = (float(tokens[3]), float(tokens[4]), float(tokens[5]))
+            except ValueError:
+                block_issues.append(
+                    f'force row {atom_index + 1}/{expected_natoms} is not parseable')
+                break
+            if not all(math.isfinite(value) for value in (fx, fy, fz)):
+                block_issues.append(
+                    f'force row {atom_index + 1}/{expected_natoms} is not finite')
+                break
+            row_forces.append(math.sqrt(fx * fx + fy * fy + fz * fz))
+            cursor += 1
+        if len(row_forces) == expected_natoms and cursor < len(lines):
+            extra = lines[cursor].split()
+            if len(extra) == 6:
+                try:
+                    [float(value) for value in extra]
+                except ValueError:
+                    pass
+                else:
+                    block_issues.append('force block contains more rows than expected')
+        events.append({
+            'status': 'complete' if not block_issues else 'unavailable',
+            'fmax': max(row_forces) if not block_issues else None,
+            'electronic_status': electronic,
+            'issues': block_issues,
+        })
+        electronic = 'unavailable'
+        pending_scf_after_force = False
+
+    if not events:
+        issues.append('OUTCAR contains no force block')
+        return {'status': 'unavailable', 'fmax': None,
+                'electronic_status': 'unavailable', 'issues': issues}
+    final = dict(events[-1])
+    issues.extend(final.get('issues') or [])
+    if pending_scf_after_force:
+        issues.append('OUTCAR ends with an SCF step that has no complete final force block')
+    if final.get('electronic_status') != 'converged':
+        issues.append('final complete ionic step lacks EDIFF convergence evidence')
+    final['issues'] = list(dict.fromkeys(issues))
+    final['status'] = 'complete' if not final['issues'] else 'unavailable'
+    if final['status'] != 'complete':
+        final['fmax'] = None
+    return final
+
+
+def _frame_expected_natoms(frame_dir) -> int | None:
+    from vcstudio.generate.poscar import parse_poscar_species
+
+    for name in ('CONTCAR', 'POSCAR'):
+        text = _read_text(os.path.join(frame_dir, name))
+        if not text:
+            continue
+        try:
+            _symbols, counts = parse_poscar_species(text)
+        except (IndexError, TypeError, ValueError):
+            continue
+        if counts:
+            return int(sum(counts))
+    return None
 
 
 def _frame_fmax(frame_dir) -> float | None:
-    """单 image 末离子步 |F|max(eV/Å);缺 OUTCAR/无力块 → None。"""
+    """单 image 最后完整收敛步 |F|max；任何坏力行均 fail closed。"""
     out = _read_text(os.path.join(frame_dir, 'OUTCAR'))
     if not out:
         return None
-    f = convergence.parse_outcar_fmax(out)
-    return f[-1] if f else None
+    expected = _frame_expected_natoms(frame_dir)
+    result = parse_last_complete_image_step(out, expected)
+    return result.get('fmax') if result.get('status') == 'complete' else None
 
 
 def parse_neb_energies(job_dir) -> dict:
@@ -145,19 +231,6 @@ def parse_neb_energies(job_dir) -> dict:
     energy_sources = [item[1] for item in pairs]
     forces = [_frame_fmax(root / fr) for fr in frames]
 
-    # VASP NEB 只计算中间 image。端点能量来自生成时带入的已算证据；
-    # 当回收时远端没有端点 OSZICAR/OUTCAR，才使用经哈希/源清单认证的值。
-    fallback_notes = []
-    for idx, role in ((0, 'start'), (len(frames) - 1, 'end')):
-        if energies[idx] is not None:
-            continue
-        value, source = _manifest_endpoint_energy(root, frames[idx], role)
-        if value is not None:
-            energies[idx] = value
-            energy_sources[idx] = source
-            fallback_notes.append(
-                f'{frames[idx]} 端点使用 job.yaml 中的可追溯能量({source})。')
-
     if energies[0] is None:
         raise ValueError(
             '无法读取初态(00)能量(缺 OSZICAR/OUTCAR 或解析失败);NEB 能垒需以初态为基线。')
@@ -177,7 +250,7 @@ def parse_neb_energies(job_dir) -> dict:
     climbing_converged = bool(inter_forces) and all(
         f is not None and f < FORCE_TOL for f in inter_forces)
 
-    warnings: list = list(fallback_notes)
+    warnings: list = []
     n_frames = len(frames)
     if ts_index == 0 or ts_index == n_frames - 1:
         warnings.append(
