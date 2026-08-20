@@ -735,8 +735,8 @@ def test_continue_with_incar_changes_clears_fetch_evidence(tmp_path):
         assert key not in m['results']
 
 
-def test_tuned_continue_qsub_without_job_id_restores_inputs_and_archive(tmp_path):
-    """改参重投未取得作业号时，本地和远端 INCAR/POSCAR/旧输出全部回滚。"""
+def test_tuned_continue_without_job_id_retains_unknown_gate(tmp_path):
+    """未取得作业号时不能假定拒绝并重试；持久 journal 必须阻断第二次 qsub。"""
     d = _restartable_job(tmp_path)
     local_incar = os.path.join(d, 'INCAR')
     local_poscar = os.path.join(d, 'POSCAR')
@@ -750,12 +750,13 @@ def test_tuned_continue_qsub_without_job_id_restores_inputs_and_archive(tmp_path
     ])
     sftp = FakeSFTP()
 
-    with pytest.raises(RuntimeError, match='submission rejected'):
+    with pytest.raises(submitter.UnknownRemoteJobOperation,
+                       match='submission rejected'):
         submitter.continue_with_incar_changes(
             client, sftp, _profile(), d, {'ALGO': 'Normal'})
 
-    assert open(local_incar, encoding='utf-8').read() == before_incar
-    assert open(local_poscar, encoding='utf-8').read() == before_poscar
+    assert open(local_incar, encoding='utf-8').read() != before_incar
+    assert open(local_poscar, encoding='utf-8').read() != before_poscar
     assert os.path.isfile(f'{local_incar}.bak1')
     assert os.path.isfile(f'{local_poscar}.bak1')
     assert manifest.load_manifest(d) == before_manifest
@@ -764,11 +765,15 @@ def test_tuned_continue_qsub_without_job_id_restores_inputs_and_archive(tmp_path
                    if '.vcstudio_previous_INCAR' in command and 'for f in' in command)
     assert '.vcstudio_previous_POSCAR' in archive
     assert 'cp CONTCAR POSCAR' in archive
-    rollback = client.commands[-1]
-    for name in ('OUTCAR', 'OSZICAR', 'vasprun.xml', 'CONTCAR', 'XDATCAR'):
-        assert f'.vcstudio_history/round_01/{name}' in rollback
-    assert '.vcstudio_previous_INCAR' in rollback
-    assert '.vcstudio_previous_POSCAR' in rollback
+    journal = submitter._read_job_action_journal(d)
+    assert journal['operations'][-1]['action'] == 'tune_continue'
+    assert journal['operations'][-1]['status'] == 'unknown_remote_outcome'
+
+    restarted = FakeClient()
+    with pytest.raises(submitter.UnknownRemoteJobOperation):
+        submitter.continue_with_incar_changes(
+            restarted, FakeSFTP(), _profile(), d, {'ALGO': 'Normal'})
+    assert restarted.commands == []
 
 
 def test_bands_tuned_restart_also_preserves_chgcar(tmp_path):

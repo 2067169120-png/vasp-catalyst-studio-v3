@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import copy
 import os
 import sys
 import time
@@ -456,38 +457,51 @@ class JobsTab(ttk.Frame):
         self.reload()
 
     # ── 续算(有界恢复) ──
-    def _on_continue(self, trust_new=False):
-        sel = self._selected()
-        if not sel:
-            self.log.write('❌ 请先选中要续算的作业(仅未收敛/墙钟/ZBRENT 等可续算)')
-            return
-        prof = self._profile()
-        if prof is None:
-            return
-        dirs, skipped = batch_ops.filter_continuable(
-            sel, allow_round_limit_override=True)
-        if not dirs:
-            self.log.write('❌ 选中作业均不可续算(需:已结束 + 诊断标可续算)')
-            return
-        tail = f'(跳过 {skipped} 个不可续算/仍在跑)' if skipped else ''
-        if not trust_new and not messagebox.askyesno(
-                '确认续算',
-                f'将对 {len(dirs)} 个可续算作业从 CONTCAR 续算并重投到「{prof.name}」{tail}\n'
-                f'INCAR 冻结。自动托管最多 3 轮；这是人工确认，超过 3 轮仍可继续，'
-                f'请自行判断机时与方法合理性。\n\n继续?'):
-            return
-        pw = self._password_for(prof)
+    def _on_continue(self, trust_new=False, frozen=None):
+        if frozen is None:
+            if trust_new:
+                self.log.write('❌ 主机信任重试缺少已确认目标，请重新发起续算')
+                return
+            sel = self._selected()
+            if not sel:
+                self.log.write('❌ 请先选中要续算的作业(仅未收敛/墙钟/ZBRENT 等可续算)')
+                return
+            prof = self._profile()
+            if prof is None:
+                return
+            dirs, skipped = batch_ops.filter_continuable(
+                sel, allow_round_limit_override=True)
+            if not dirs:
+                self.log.write('❌ 选中作业均不可续算(需:已结束 + 诊断标可续算)')
+                return
+            tail = f'(跳过 {skipped} 个不可续算/仍在跑)' if skipped else ''
+            if not messagebox.askyesno(
+                    '确认续算',
+                    f'将对 {len(dirs)} 个可续算作业从 CONTCAR 续算并重投到「{prof.name}」{tail}\n'
+                    f'INCAR 冻结。自动托管最多 3 轮；这是人工确认，超过 3 轮仍可继续，'
+                    f'请自行判断机时与方法合理性。\n\n继续?'):
+                return
+            frozen = {
+                'dirs': tuple(dirs),
+                'profile': copy.deepcopy(prof),
+                'password': self._password_for(prof),
+                'idempotency_key': f'tk-continue-{os.urandom(16).hex()}',
+            }
+        prof = frozen['profile']
+        dirs = list(frozen['dirs'])
+        pw = frozen['password']
         self.continue_btn.configure(state='disabled')
         self.log.write(f'⏳ 连接并续算 {len(dirs)} 个作业…')
         q = runner.submit(
             batch_ops.continue_batch, prof, pw, dirs, trust_new,
+            idempotency_key=frozen['idempotency_key'],
             allow_round_limit_override=True)
-        self.after(200, lambda: self._poll_continue(q))
+        self.after(200, lambda: self._poll_continue(q, frozen))
 
-    def _poll_continue(self, q):
+    def _poll_continue(self, q, frozen):
         item = runner.poll(q)
         if item is None:
-            self.after(200, lambda: self._poll_continue(q))
+            self.after(200, lambda: self._poll_continue(q, frozen))
             return
         kind, payload = item
         self.continue_btn.configure(state='normal')
@@ -496,7 +510,7 @@ class JobsTab(ttk.Frame):
             return
         if payload.get('needs_trust'):
             if messagebox.askyesno('未知主机', f"{payload['message']}\n\n是否信任该主机并重试?"):
-                self._on_continue(trust_new=True)
+                self._on_continue(trust_new=True, frozen=frozen)
             return
         for dir_, ok, msg in payload['results']:
             self.log.write(('✅' if ok else '❌') + f' {os.path.basename(dir_)}:{msg}')
@@ -591,36 +605,53 @@ class JobsTab(ttk.Frame):
             messagebox.showerror('认领失败', str(e), parent=win)
 
     # ── 改参续算(S6:诊断建议 → 白名单键受控修改重投) ──
-    def _on_tune_continue(self, trust_new=False):
-        sel = self._selected()
-        if len(sel) != 1:
-            self.log.write('❌ 改参续算一次处理一个作业:请只选中一个已结束的作业')
-            return
-        d = sel[0]
-        m = manifest_mod.load_manifest(d)
-        if m is None:
-            self.log.write('❌ 该条目缺 job.yaml')
-            return
-        if m.get('state') in ('UPLOADED', 'SUBMITTED', 'QUEUED', 'RUNNING'):
-            self.log.write(f"❌ 该作业仍在队列/运行中(状态 {m['state']}),不能改参重投")
-            return
-        prof = self._profile()
-        if prof is None:
-            return
-        dgn = (m.get('results') or {}).get('diagnosis') or {}
-        hint = ''
-        if dgn.get('failure_class'):
-            hint = f"诊断:{dgn['failure_class']} — {dgn.get('evidence', '')}"
-        changes = self._ask_incar_changes(os.path.basename(d), hint)
-        if not changes:
-            return
-        pw = self._password_for(prof)
+    def _on_tune_continue(self, trust_new=False, frozen=None):
+        if frozen is None:
+            if trust_new:
+                self.log.write('❌ 主机信任重试缺少已确认目标，请重新发起改参续算')
+                return
+            sel = self._selected()
+            if len(sel) != 1:
+                self.log.write('❌ 改参续算一次处理一个作业:请只选中一个已结束的作业')
+                return
+            d = sel[0]
+            m = manifest_mod.load_manifest(d)
+            if m is None:
+                self.log.write('❌ 该条目缺 job.yaml')
+                return
+            if m.get('state') not in submitter.CONTINUE_TERMINAL_STATES:
+                self.log.write(
+                    f"❌ 该作业不在可改参重投终态(状态 {m.get('state') or '<缺失>'})")
+                return
+            prof = self._profile()
+            if prof is None:
+                return
+            dgn = (m.get('results') or {}).get('diagnosis') or {}
+            hint = ''
+            if dgn.get('failure_class'):
+                hint = f"诊断:{dgn['failure_class']} — {dgn.get('evidence', '')}"
+            changes = self._ask_incar_changes(os.path.basename(d), hint)
+            if not changes:
+                return
+            frozen = {
+                'job_dir': d,
+                'changes': dict(changes),
+                'from_contcar': bool(getattr(self, '_tune_from_contcar', True)),
+                'profile': copy.deepcopy(prof),
+                'password': self._password_for(prof),
+                'idempotency_key': f'tk-tune-{os.urandom(16).hex()}',
+            }
+        d = frozen['job_dir']
+        changes = dict(frozen['changes'])
+        prof = frozen['profile']
+        pw = frozen['password']
         self.tune_btn.configure(state='disabled')
         self.log.write(f'⏳ 改参续算 {os.path.basename(d)}:' +
                        ', '.join(f'{k}={v}' for k, v in changes.items()))
         q = runner.submit(batch_ops.tune_batch, prof, pw, d, changes, trust_new,
-                          getattr(self, '_tune_from_contcar', True))
-        self.after(200, lambda: self._poll_tune(q))
+                          frozen['from_contcar'],
+                          idempotency_key=frozen['idempotency_key'])
+        self.after(200, lambda: self._poll_tune(q, frozen))
 
     def _ask_incar_changes(self, job_name, hint):
         """弹窗收集白名单 INCAR 修改(每行 KEY = VALUE)。返回 dict 或 None(取消)。"""
@@ -677,10 +708,10 @@ class JobsTab(ttk.Frame):
         self._tune_from_contcar = result['from_contcar']
         return result['changes']
 
-    def _poll_tune(self, q):
+    def _poll_tune(self, q, frozen):
         item = runner.poll(q)
         if item is None:
-            self.after(200, lambda: self._poll_tune(q))
+            self.after(200, lambda: self._poll_tune(q, frozen))
             return
         kind, payload = item
         self.tune_btn.configure(state='normal')
@@ -689,7 +720,7 @@ class JobsTab(ttk.Frame):
             return
         if payload.get('needs_trust'):
             if messagebox.askyesno('未知主机', f"{payload['message']}\n\n是否信任该主机并重试?"):
-                self._on_tune_continue(trust_new=True)
+                self._on_tune_continue(trust_new=True, frozen=frozen)
             return
         for dir_, ok, msg in payload['results']:
             self.log.write(('✅' if ok else '❌') + f' {os.path.basename(dir_)}:{msg}')

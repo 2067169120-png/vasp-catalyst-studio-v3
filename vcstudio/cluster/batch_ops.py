@@ -172,7 +172,7 @@ def filter_continuable(dirs, *, allow_round_limit_override=False):
         dgn = res.get('diagnosis') or {}
         rounds = int(res.get('continue_rounds', 0))
         if (m is not None
-                and m.get('state') not in ('UPLOADED', 'SUBMITTED', 'QUEUED', 'RUNNING')
+                and m.get('state') in submitter.CONTINUE_TERMINAL_STATES
                 and str(m.get('task_type') or '') != 'neb'
                 and dgn.get('restartable')
                 and (allow_round_limit_override
@@ -370,7 +370,8 @@ def adopt_scan(prof, pw, trust_new, known_ids, local_root):
     return {'needs_trust': False, 'results': results}
 
 
-def tune_batch(prof, pw, job_dir, changes, trust_new, from_contcar=True):
+def tune_batch(prof, pw, job_dir, changes, trust_new, from_contcar=True, *,
+               idempotency_key=None):
     """人工改参续算线程体(单作业；不受自动三轮上限约束)。"""
     try:
         client, jump = open_client(prof, pw, trust_new=trust_new)
@@ -385,8 +386,11 @@ def tune_batch(prof, pw, job_dir, changes, trust_new, from_contcar=True):
             m = submitter.continue_with_incar_changes(
                 client, sftp, prof, job_dir, changes,
                 max_rounds=None,
-                restart_from_contcar=from_contcar)
-            results.append((job_dir, True, f"已改参重投,新作业号 {m['scheduler_job_id']}"))
+                restart_from_contcar=from_contcar,
+                idempotency_key=idempotency_key)
+            verb = ('已确认改参续算' if m.get('_tune_continue_replayed')
+                    else '已改参重投')
+            results.append((job_dir, True, f"{verb},新作业号 {m['scheduler_job_id']}"))
         except _job_errors() as e:
             results.append((job_dir, False, str(e)))
         sftp.close()

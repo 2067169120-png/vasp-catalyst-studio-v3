@@ -49,6 +49,15 @@ def test_filter_continuable_manual_override_keeps_other_guards(tmp_path):
     assert skipped == 2
 
 
+def test_filter_continuable_rejects_created_even_with_restartable_diagnosis(tmp_path):
+    created = _mk_job(
+        tmp_path, 'created', 'CREATED', restartable=True,
+        rounds=batch_ops.submitter.CONTINUE_MAX_ROUNDS)
+
+    assert batch_ops.filter_continuable(
+        [created], allow_round_limit_override=True) == ([], 1)
+
+
 def test_filter_continuable_excludes_neb_from_generic_restart(tmp_path):
     d = _mk_job(tmp_path, 'neb', 'UNCONVERGED', restartable=True)
     data = mm.load_manifest(d)

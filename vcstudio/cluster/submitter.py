@@ -284,6 +284,13 @@ def _empty_job_action_journal() -> dict:
     return {'schema': _JOB_ACTION_JOURNAL_SCHEMA, 'operations': []}
 
 
+def _job_action_request_sha256(payload: dict) -> str:
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True,
+        separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _read_job_action_journal(job_dir) -> dict:
     """Read and validate the durable continue/cancel operation ledger.
 
@@ -309,11 +316,28 @@ def _read_job_action_journal(job_dir) -> dict:
             if (not isinstance(record, dict)
                     or not isinstance(record.get('transaction_id'), str)
                     or not record.get('transaction_id')
-                    or record.get('action') not in {'continue', 'cancel'}
+                    or record.get('action') not in {
+                        'continue', 'tune_continue', 'cancel'}
                     or record.get('status') not in _JOB_ACTION_STATUSES
                     or not isinstance(record.get('source_job_id'), str)
                     or record.get('idempotency_key') is not None
-                    and not isinstance(record.get('idempotency_key'), str)):
+                    and not isinstance(record.get('idempotency_key'), str)
+                    or record.get('request_sha256') is not None
+                    and (not isinstance(record.get('request_sha256'), str)
+                         or not re.fullmatch(
+                             r'[0-9a-f]{64}', record['request_sha256']))
+                    or record.get('intent_sha256') is not None
+                    and (not isinstance(record.get('intent_sha256'), str)
+                         or not re.fullmatch(
+                             r'[0-9a-f]{64}', record['intent_sha256']))
+                    or record.get('request') is not None
+                    and not isinstance(record.get('request'), dict)):
+                valid = False
+                break
+            request = record.get('request')
+            request_digest = str(record.get('request_sha256') or '')
+            if (request is not None
+                    and _job_action_request_sha256(request) != request_digest):
                 valid = False
                 break
     if not valid:
@@ -332,7 +356,11 @@ def _job_action_attempt(manifest: dict | None, *, action: str,
     attempts = (manifest or {}).get('attempts') if isinstance(manifest, dict) else None
     if not isinstance(attempts, list):
         return None
-    expected_action = 'contcar_restart' if action == 'continue' else 'cancel'
+    expected_action = {
+        'continue': 'contcar_restart',
+        'tune_continue': 'incar_tuned_restart',
+        'cancel': 'cancel',
+    }.get(action, '')
     for attempt in reversed(attempts):
         if not isinstance(attempt, dict) or attempt.get('action') != expected_action:
             continue
@@ -356,8 +384,15 @@ def _job_action_generation_matches(manifest: dict, record: dict,
                                    evidence: dict | None) -> bool:
     if not evidence:
         return False
+    if record.get('action') == 'tune_continue':
+        if (str(record.get('request_sha256') or '') !=
+                str(evidence.get('operation_request_sha256') or '')):
+            return False
+        if (str(record.get('intent_sha256') or '') !=
+                str(evidence.get('operation_intent_sha256') or '')):
+            return False
     current = str(manifest.get('scheduler_job_id') or '')
-    if record.get('action') == 'continue':
+    if record.get('action') in {'continue', 'tune_continue'}:
         expected = str(record.get('result_job_id') or evidence.get('job_id') or '')
     else:
         expected = str(record.get('source_job_id') or
@@ -367,7 +402,11 @@ def _job_action_generation_matches(manifest: dict, record: dict,
 
 def _job_action_unknown(record: dict, *, message: str | None = None):
     action = str(record.get('action') or '')
-    label = '续算' if action == 'continue' else '取消'
+    label = {
+        'continue': '续算',
+        'tune_continue': '改参续算',
+        'cancel': '取消',
+    }.get(action, '远端操作')
     status = str(record.get('status') or 'unknown_remote_outcome')
     job_id = str(record.get('result_job_id') or record.get('source_job_id') or '')
     raise UnknownRemoteJobOperation(
@@ -376,7 +415,8 @@ def _job_action_unknown(record: dict, *, message: str | None = None):
 
 
 def _reconcile_job_action(job_dir, manifest: dict, action: str,
-                          idempotency_key: str) -> dict | None:
+                          idempotency_key: str, *,
+                          intent_sha256: str = '') -> dict | None:
     """Replay one completed key or reject every unresolved remote outcome."""
     journal = _read_job_action_journal(job_dir)
     changed = False
@@ -410,6 +450,9 @@ def _reconcile_job_action(job_dir, manifest: dict, action: str,
             record = matches[-1]
             if record.get('action') != action:
                 raise ValueError('同一作业操作请求标识不能用于不同的远端动作')
+            stored_intent = str(record.get('intent_sha256') or '')
+            if intent_sha256 and stored_intent != intent_sha256:
+                raise ValueError('同一作业操作请求标识不能用于不同的改参续算内容')
             status = record.get('status')
             if status == 'failed':
                 raise ReplayedJobOperationFailure(
@@ -430,13 +473,18 @@ def _reconcile_job_action(job_dir, manifest: dict, action: str,
         evidence = _job_action_attempt(
             manifest, action=action, idempotency_key=idempotency_key)
         if evidence:
+            evidence_intent = str(evidence.get('operation_intent_sha256') or '')
+            if intent_sha256 and evidence_intent != intent_sha256:
+                raise ValueError('同一作业操作请求标识不能用于不同的改参续算内容')
             fallback_record = {
                 'action': action,
                 'source_job_id': str(
-                    evidence.get('prev_job_id') if action == 'continue'
+                    evidence.get('prev_job_id') if action in {
+                        'continue', 'tune_continue'}
                     else evidence.get('target_job_id') or ''),
                 'result_job_id': str(
-                    evidence.get('job_id') if action == 'continue'
+                    evidence.get('job_id') if action in {
+                        'continue', 'tune_continue'}
                     else evidence.get('target_job_id') or ''),
             }
             if _job_action_generation_matches(manifest, fallback_record, evidence):
@@ -448,7 +496,8 @@ def _reconcile_job_action(job_dir, manifest: dict, action: str,
 
 
 def _start_job_action(job_dir, action: str, idempotency_key: str,
-                      source_job_id: str) -> dict:
+                      source_job_id: str, *, request: dict | None = None,
+                      request_sha256: str = '', intent_sha256: str = '') -> dict:
     journal = _read_job_action_journal(job_dir)
     # Reconciliation should have rejected every unresolved record.  Re-check
     # before writing so this helper is safe if used by a future caller directly.
@@ -471,6 +520,10 @@ def _start_job_action(job_dir, action: str, idempotency_key: str,
         'updated_at': now,
         'message': None,
     }
+    if request is not None:
+        record['request'] = request
+        record['request_sha256'] = request_sha256
+        record['intent_sha256'] = intent_sha256
     journal['operations'].append(record)
     _write_job_action_journal(job_dir, journal)
     return record
@@ -2613,6 +2666,9 @@ def _fetch_neb_results(client, sftp, job_dir: str, remote: str, files):
 
 # ── 有界恢复:CONTCAR 续算(对齐论文 bounded recovery;人工触发,冻结 INCAR) ──────
 CONTINUE_MAX_ROUNDS = 3
+CONTINUE_TERMINAL_STATES = frozenset({
+    'DONE', 'FAILED', 'UNCONVERGED', 'NEEDS_HUMAN',
+})
 # 续算前几何健全阈值(Å):周期最小原子间距低于此值判原子重叠(< 最短化学键 H-H 0.74)。
 MIN_INTERATOMIC_OK = 0.7
 
@@ -2629,6 +2685,19 @@ def _contcar_min_distance(text: str):
         return min_interatomic_distance(text)
     except Exception:                                    # noqa: BLE001
         return None
+
+
+def _require_continue_terminal_state(manifest: dict, action: str) -> None:
+    state = str(manifest.get('state') or '')
+    if state in CONTINUE_TERMINAL_STATES:
+        return
+    if state in {'UPLOADED', 'SUBMITTED', 'QUEUED', 'RUNNING'}:
+        raise ValueError(
+            f'该作业仍在队列/运行中(状态 {state}),不能{action};'
+            '请先查询状态确认已结束')
+    raise ValueError(
+        f'该作业状态 {state or "<缺失>"} 不是可{action}的终态；'
+        '仅 DONE/FAILED/UNCONVERGED/NEEDS_HUMAN 可由用户明确重投')
 
 
 def _restart_cleanup_command(m: dict, job_dir: str | None = None) -> str:
@@ -2740,8 +2809,7 @@ def continue_from_contcar(client, profile, job_dir: str,
     # 状态门(严重 bug 防护):仍在队列/运行中的作业绝不续算——否则会往活作业目录里
     # cp CONTCAR POSCAR + 重投第二个实例,两个 VASP 同写 OUTCAR 冲垮结果,且旧作业号被
     # 覆盖成孤儿。restartable 诊断是上一轮终态留下的,重投后必须消费掉(见函数尾)。
-    if m.get('state') in ('UPLOADED', 'SUBMITTED', 'QUEUED', 'RUNNING'):
-        raise ValueError(f"该作业仍在队列/运行中(状态 {m['state']}),不能续算;请先查询状态确认已结束")
+    _require_continue_terminal_state(m, '续算')
     diag = (m.get('results') or {}).get('diagnosis') or {}
     if not diag.get('restartable'):
         raise ValueError(
@@ -2888,7 +2956,8 @@ _TUNE_BANNER = '# --- vcstudio 改参续算 第{round}轮 {at} ---'
 def continue_with_incar_changes(client, sftp, profile, job_dir: str,
                                 changes: dict,
                                 max_rounds: int | None = CONTINUE_MAX_ROUNDS,
-                                restart_from_contcar: bool = True) -> dict:
+                                restart_from_contcar: bool = True, *,
+                                idempotency_key: str | None = None) -> dict:
     """诊断建议 → 受控改参重投:白名单键追加覆盖到 INCAR 文末(原文一字不删),
     可选 CONTCAR→POSCAR,清 WAVECAR/CHGCAR（bands 保留 CHGCAR）,重投同一脚本。
 
@@ -2900,9 +2969,21 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
     - INCAR 修改以"追加覆盖块"落地(VASP 取同键末次出现值;原文保留可审计),
       同步上传远端;attempts 记录完整 changes。
     """
+    operation_key = _validate_job_action_key(idempotency_key)
     if not changes:
         raise ValueError('未提供任何 INCAR 修改项')
-    bad = [k for k in changes if str(k).upper() not in INCAR_TUNE_WHITELIST]
+    canonical_changes: dict[str, str] = {}
+    for key, value in changes.items():
+        canonical_key = str(key).upper()
+        if canonical_key in canonical_changes:
+            raise ValueError(f'重复的 INCAR 修改键:{canonical_key}')
+        canonical_value = str(value)
+        if (not canonical_value.strip() or len(canonical_value) > 256
+                or any(marker in canonical_value for marker in ('\r', '\n', '\x00'))):
+            raise ValueError(
+                f'INCAR 修改值 {canonical_key} 必须是非空单行文本且不超过 256 字符')
+        canonical_changes[canonical_key] = canonical_value
+    bad = [key for key in canonical_changes if key not in INCAR_TUNE_WHITELIST]
     if bad:
         raise ValueError(
             f'以下键不在改参白名单,拒绝修改:{", ".join(bad)}。'
@@ -2919,76 +3000,144 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
     if _is_neb(m):
         raise ValueError(
             'NEB 不能使用通用改参/CONTCAR 续算；请使用 NEB 专用 image 级重提流程')
-    if m.get('state') in ('UPLOADED', 'SUBMITTED', 'QUEUED', 'RUNNING'):
-        raise ValueError(f"该作业仍在队列/运行中(状态 {m['state']}),不能改参重投")
     rounds = int((m.get('results') or {}).get('continue_rounds', 0))
+    manual_round_override = max_rounds is None and rounds >= CONTINUE_MAX_ROUNDS
+
+    # The request is path-free but binds every user decision and the exact source
+    # scheduler generation.  It is fsynced before INCAR/POSCAR or remote state is
+    # changed, so a restarted client cannot reuse the operation id for a different
+    # set of tuning choices.
+    intent = {
+        'changes': dict(sorted(canonical_changes.items())),
+        'restart_from_contcar': bool(restart_from_contcar),
+        'round_policy': ('manual-unbounded' if max_rounds is None
+                         else f'bounded-{int(max_rounds)}'),
+    }
+    intent_sha256 = _job_action_request_sha256(intent)
+    request = {
+        'schema': 'vcstudio.tune-continuation-request/v1',
+        'manifest_job_id': str(m.get('job_id') or ''),
+        'source_scheduler_job_id': str(m.get('scheduler_job_id') or ''),
+        'source_state': str(m.get('state') or ''),
+        'source_round': rounds,
+        'profile_fingerprint': str(profile_binding(profile)['fingerprint']),
+        'intent': intent,
+        'round_limit_override': (
+            'manual-explicit' if manual_round_override else None),
+    }
+    replay = _reconcile_job_action(
+        job_dir, m, 'tune_continue', operation_key,
+        intent_sha256=intent_sha256)
+    if replay is not None:
+        return replay
+
+    _require_continue_terminal_state(m, '改参重投')
     if max_rounds is not None and rounds >= max_rounds:
         raise RuntimeError(f'已续算 {rounds} 次达上限 {max_rounds},停机交人工(防死循环)')
-    manual_round_override = max_rounds is None and rounds >= CONTINUE_MAX_ROUNDS
     remote = m.get('remote_dir')
     if not remote:
         raise ValueError('该作业无 remote_dir(未提交过),无法改参续算')
 
-    # 1) 本地 INCAR:备份 + 追加覆盖块(原文保留)
+    # Requested CONTCAR promotion is mandatory, not best-effort.  Validate both
+    # syntax and geometry before the durable transaction or any local/remote file
+    # is changed; otherwise an audit row could falsely claim a CONTCAR restart.
+    contcar = ''
+    promoted_contcar = False
+    if restart_from_contcar:
+        contcar = _read_remote_text(client, posixpath.join(remote, 'CONTCAR'))
+        if not diagnose.valid_poscar(contcar):
+            raise RuntimeError(
+                '远端 CONTCAR 缺失或不完整,不能按请求改参续算；'
+                '如需保留原 POSCAR，请取消“从 CONTCAR 续算结构”后重新确认')
+        min_d = _contcar_min_distance(contcar)
+        if min_d is None:
+            raise RuntimeError('远端 CONTCAR 几何无法可靠解析,不能改参续算')
+        if min_d < MIN_INTERATOMIC_OK:
+            raise RuntimeError(
+                f'CONTCAR 存在原子重叠(最小间距 {min_d:.2f} Å),'
+                '疑似几何病态,请人工检查')
+        promoted_contcar = True
+
+    # Read every local source before the fsynced transaction, but do not mutate it.
     local_incar = os.path.join(job_dir, 'INCAR')
     local_incar_existed = os.path.isfile(local_incar)
     if not local_incar_existed:
         raise ValueError('本地作业目录缺 INCAR')
     with open(local_incar, 'r', encoding='utf-8', errors='replace') as f:
         incar_text = f.read()
-    shutil.copyfile(local_incar, f'{local_incar}.bak{rounds + 1}')
     at = time.strftime('%Y-%m-%dT%H:%M:%S')
     block = '\n' + _TUNE_BANNER.format(round=rounds + 1, at=at) + '\n'
-    block += ''.join(f'{str(k).upper()} = {v}\n' for k, v in changes.items())
+    block += ''.join(f'{key} = {value}\n'
+                     for key, value in canonical_changes.items())
     new_text = (incar_text if incar_text.endswith('\n') else incar_text + '\n') + block
-    with open(local_incar, 'w', encoding='utf-8', newline='') as f:
-        f.write(new_text)
-
-    # 2) 可选 CONTCAR 续结构(结构没跑几步/硬崩时也允许保持原 POSCAR 重跑)
     local_poscar = os.path.join(job_dir, 'POSCAR')
     local_poscar_existed = os.path.isfile(local_poscar)
-    promoted_contcar = False
-    if restart_from_contcar:
-        contcar = _read_remote_text(client, posixpath.join(remote, 'CONTCAR'))
-        if diagnose.valid_poscar(contcar):
-            promoted_contcar = True
+
+    # 续算沉降基线:重投前记下上一轮 OUTCAR 的 mtime(此刻新作业尚未启动,仍是旧文件)
+    _o0, _z0, _base_outcar_mtime = _stat_outcar_full(client, remote)
+
+    request['incar_source_sha256'] = hashlib.sha256(
+        incar_text.encode('utf-8')).hexdigest()
+    if promoted_contcar:
+        request['contcar_source_sha256'] = hashlib.sha256(
+            contcar.encode('utf-8')).hexdigest()
+    request_sha256 = _job_action_request_sha256(request)
+    record = _start_job_action(
+        job_dir, 'tune_continue', operation_key,
+        str(m.get('scheduler_job_id') or ''), request=request,
+        request_sha256=request_sha256, intent_sha256=intent_sha256)
+
+    try:
+        shutil.copyfile(local_incar, f'{local_incar}.bak{rounds + 1}')
+        with open(local_incar, 'w', encoding='utf-8', newline='') as f:
+            f.write(new_text)
+        if promoted_contcar:
             if local_poscar_existed:
                 shutil.copyfile(local_poscar, f'{local_poscar}.bak{rounds + 1}')
             with open(local_poscar, 'w', encoding='utf-8', newline='') as f:
                 f.write(contcar)
 
-    # 续算沉降基线:重投前记下上一轮 OUTCAR 的 mtime(此刻新作业尚未启动,仍是旧文件)
-    _o0, _z0, _base_outcar_mtime = _stat_outcar_full(client, remote)
+        archive_command, archive_dir = _restart_archive_command(
+            rounds + 1, backup_inputs=('INCAR', 'POSCAR'),
+            promote_contcar=promoted_contcar)
+        run_cmd(
+            client,
+            f'cd {shlex.quote(remote)} && {archive_command} && '
+            f'{_restart_cleanup_command(m, job_dir)}',
+            check=True)
+        sftp.put(local_incar, posixpath.join(remote, 'INCAR'))
+        dialect = get_dialect(profile.scheduler)
+        out, err = run_cmd(client, dialect.submit_cmd(
+            posixpath.join(remote, SCRIPT_NAME),
+            getattr(profile, 'scheduler_bin', '')))
+    except Exception as exc:  # noqa: BLE001 - remote mutation may be partial
+        _mark_job_action_unknown(job_dir, record, str(exc))
+        raise UnknownRemoteJobOperation(
+            '改参续算远端事务中断，输入目录或调度器结果未知；'
+            '已禁止自动重试，请人工核对。',
+            action='tune_continue',
+            recovery_status=record.get('status') or 'prepared',
+            scheduler_job_id=str(m.get('scheduler_job_id') or '')) from exc
 
-    # 3) 上传新 INCAR，归档旧轮终态输出 + 清混合历史，重投同一脚本
-    archive_command, archive_dir = _restart_archive_command(
-        rounds + 1, backup_inputs=('INCAR', 'POSCAR'),
-        promote_contcar=promoted_contcar)
-    run_cmd(
-        client,
-        f'cd {shlex.quote(remote)} && {archive_command} && '
-        f'{_restart_cleanup_command(m, job_dir)}',
-        check=True)
-    sftp.put(local_incar, posixpath.join(remote, 'INCAR'))
-    dialect = get_dialect(profile.scheduler)
-    out, err = run_cmd(client, dialect.submit_cmd(
-        posixpath.join(remote, SCRIPT_NAME), getattr(profile, 'scheduler_bin', '')))
     job_id = dialect.parse_job_id(out)
     if not job_id:
-        rollback_error = ''
-        try:
-            run_cmd(
-                client,
-                f'cd {shlex.quote(remote)} && '
-                f'{_restart_restore_command(archive_dir, restore_inputs=("INCAR", "POSCAR"))}',
-                check=True)
-        except Exception as exc:                         # noqa: BLE001 保留原始提交错误
-            rollback_error = f'；且远端输入/输出回滚失败:{exc}'
-        _restore_local_restart_file(local_incar, rounds + 1, local_incar_existed)
-        _restore_local_restart_file(local_poscar, rounds + 1, local_poscar_existed)
-        raise RuntimeError(
-            f'改参重投失败,{dialect.name} 返回:{(out or err).strip()[:300]}'
-            f'{rollback_error}')
+        detail = (out or err).strip()[:300]
+        _mark_job_action_unknown(job_dir, record, detail)
+        raise UnknownRemoteJobOperation(
+            f'改参续算未返回可核验作业号（{dialect.name}：{detail}）；'
+            '远端是否受理未知，已禁止自动重试，请人工核对。',
+            action='tune_continue',
+            recovery_status=record.get('status') or 'prepared')
+
+    try:
+        _update_job_action(
+            job_dir, record, 'remote_accepted', result_job_id=str(job_id))
+    except Exception as exc:  # noqa: BLE001 - prepared record still blocks retry
+        raise UnknownRemoteJobOperation(
+            '改参续算已返回新作业号，但 journal 未能推进；'
+            '已禁止自动重试，请人工核对。',
+            action='tune_continue', recovery_status='prepared',
+            scheduler_job_id=str(job_id)) from exc
 
     prev = m.get('scheduler_job_id')
     m['scheduler_job_id'] = job_id
@@ -3007,21 +3156,39 @@ def continue_with_incar_changes(client, sftp, profile, job_dir: str,
         'at': at,
         'result': 'continued',
         'action': 'incar_tuned_restart',
-        'incar_changes': {str(k).upper(): str(v) for k, v in changes.items()},
-        'from_contcar': bool(restart_from_contcar),
+        'incar_changes': canonical_changes,
+        'from_contcar_requested': bool(restart_from_contcar),
+        'from_contcar': promoted_contcar,
         'prev_job_id': prev,
         'job_id': job_id,
         'round': rounds + 1,
+        'operation_transaction_id': record['transaction_id'],
+        'operation_request_sha256': request_sha256,
+        'operation_intent_sha256': intent_sha256,
     }
     if manual_round_override:
         attempt['round_limit_override'] = 'manual-explicit'
+    if operation_key:
+        attempt['idempotency_key'] = operation_key
     m.setdefault('attempts', []).append(attempt)
     override_note = ',人工确认超出自动上限' if manual_round_override else ''
     manifest_mod.set_state(
         m, 'SUBMITTED',
-        note=f'改参续算 第{rounds + 1}轮({", ".join(f"{str(k).upper()}={v}" for k, v in changes.items())};'
+        note=f'改参续算 第{rounds + 1}轮({", ".join(f"{k}={v}" for k, v in canonical_changes.items())};'
              f'prev {prev} → {job_id}{override_note})')
-    manifest_mod.save_manifest(job_dir, m)
+    try:
+        manifest_mod.save_manifest(job_dir, m)
+    except Exception as exc:  # noqa: BLE001 - remote_accepted journal blocks retry
+        raise UnknownRemoteJobOperation(
+            '改参续算已被调度器受理，但本地 job.yaml 未能安全持久化；'
+            '已禁止自动重试，请人工恢复。',
+            action='tune_continue', recovery_status='remote_accepted',
+            scheduler_job_id=str(job_id)) from exc
+    try:
+        _update_job_action(
+            job_dir, record, 'succeeded', result_job_id=str(job_id), message='')
+    except OSError:
+        pass
     return m
 
 

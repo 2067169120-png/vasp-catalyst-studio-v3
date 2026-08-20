@@ -9,7 +9,7 @@ from vcstudio.generate.job_builder import build_job_dir, _infer_task_type
 from vcstudio.shared import manifest
 
 from tests.test_submitter import (          # 复用假件与工装
-    FakeClient, FakeSFTP, _profile, _job_dir,
+    FakeClient, FakeSFTP, _profile, _job_dir, _OVERLAP_CONTCAR,
 )
 
 
@@ -276,6 +276,128 @@ def test_explicit_manual_tune_can_exceed_automatic_round_cap(tmp_path):
     assert updated['results']['continue_rounds'] == submitter.CONTINUE_MAX_ROUNDS + 1
     assert updated['attempts'][-1]['round_limit_override'] == 'manual-explicit'
     assert '人工确认超出自动上限' in updated['state_history'][-1]['note']
+
+
+@pytest.mark.parametrize('contcar', ['garbage\n', _OVERLAP_CONTCAR])
+def test_tune_requested_contcar_is_validated_before_any_mutation(tmp_path, contcar):
+    d = _terminal_job(tmp_path)
+    incar = os.path.join(d, 'INCAR')
+    poscar = os.path.join(d, 'POSCAR')
+    before = (open(incar, encoding='utf-8').read(),
+              open(poscar, encoding='utf-8').read(),
+              manifest.load_manifest(d))
+    client = FakeClient(script=[('cat', contcar), ('qsub', 'must-not-run\n')])
+
+    with pytest.raises(RuntimeError, match='CONTCAR|原子重叠'):
+        submitter.continue_with_incar_changes(
+            client, FakeSFTP(), _profile(), d, {'ALGO': 'Normal'},
+            max_rounds=None, restart_from_contcar=True,
+            idempotency_key='manual-tune-geometry-001')
+
+    assert open(incar, encoding='utf-8').read() == before[0]
+    assert open(poscar, encoding='utf-8').read() == before[1]
+    assert manifest.load_manifest(d) == before[2]
+    assert not os.path.exists(os.path.join(d, '.vcstudio-job-actions.json'))
+    assert not any('qsub' in command for command in client.commands)
+
+
+def test_tune_operation_key_replays_exact_request_and_rejects_changed_request(tmp_path):
+    d = _terminal_job(tmp_path)
+    key = 'manual-tune-replay-001'
+    first = submitter.continue_with_incar_changes(
+        FakeClient(script=[('cat', _CONTCAR), ('qsub', '905.cluster\n')]),
+        FakeSFTP(), _profile(), d, {'ALGO': 'Normal'}, max_rounds=None,
+        idempotency_key=key)
+    assert first['scheduler_job_id'] == '905'
+
+    replay_client = FakeClient()
+    replay = submitter.continue_with_incar_changes(
+        replay_client, FakeSFTP(), _profile(), d, {'ALGO': 'Normal'},
+        max_rounds=None, idempotency_key=key)
+    assert replay['_tune_continue_replayed'] is True
+    assert replay_client.commands == []
+
+    changed_client = FakeClient()
+    with pytest.raises(ValueError, match='不同的改参续算内容'):
+        submitter.continue_with_incar_changes(
+            changed_client, FakeSFTP(), _profile(), d, {'ALGO': 'Fast'},
+            max_rounds=None, idempotency_key=key)
+    assert changed_client.commands == []
+
+
+def test_tune_manifest_failure_retains_durable_manual_gate(tmp_path, monkeypatch):
+    d = _terminal_job(tmp_path)
+    data = manifest.load_manifest(d)
+    data['results']['continue_rounds'] = submitter.CONTINUE_MAX_ROUNDS
+    manifest.save_manifest(d, data)
+    key = 'manual-tune-crash-001'
+    real_save = submitter.manifest_mod.save_manifest
+
+    def fail_final(path, payload):
+        if (payload.get('state') == 'SUBMITTED'
+                and str(payload.get('scheduler_job_id') or '') == '906'):
+            raise OSError('disk full')
+        return real_save(path, payload)
+
+    monkeypatch.setattr(submitter.manifest_mod, 'save_manifest', fail_final)
+    with pytest.raises(submitter.UnknownRemoteJobOperation,
+                       match='job.yaml') as failure:
+        submitter.continue_with_incar_changes(
+            FakeClient(script=[('cat', _CONTCAR), ('qsub', '906.cluster\n')]),
+            FakeSFTP(), _profile(), d, {'ALGO': 'Normal'}, max_rounds=None,
+            idempotency_key=key)
+    assert failure.value.scheduler_job_id == '906'
+
+    journal = submitter._read_job_action_journal(d)
+    record = journal['operations'][-1]
+    assert record['status'] == 'remote_accepted'
+    assert record['request']['round_limit_override'] == 'manual-explicit'
+    assert record['request']['intent']['changes'] == {'ALGO': 'Normal'}
+    assert record['request']['source_scheduler_job_id'] == '900'
+
+    monkeypatch.setattr(submitter.manifest_mod, 'save_manifest', real_save)
+    restarted = FakeClient()
+    with pytest.raises(submitter.UnknownRemoteJobOperation):
+        submitter.continue_with_incar_changes(
+            restarted, FakeSFTP(), _profile(), d, {'ALGO': 'Normal'},
+            max_rounds=None, idempotency_key=key)
+    assert restarted.commands == []
+
+
+def test_continue_and_tune_require_explicit_terminal_state(tmp_path):
+    d = _terminal_job(tmp_path)
+    data = manifest.load_manifest(d)
+    data['state'] = 'CREATED'
+    data['results']['diagnosis']['restartable'] = True
+    manifest.save_manifest(d, data)
+
+    continue_client = FakeClient()
+    with pytest.raises(ValueError, match='不是可续算的终态'):
+        submitter.continue_from_contcar(continue_client, _profile(), d)
+    tune_client = FakeClient()
+    with pytest.raises(ValueError, match='不是可改参重投的终态'):
+        submitter.continue_with_incar_changes(
+            tune_client, FakeSFTP(), _profile(), d, {'ALGO': 'Normal'},
+            max_rounds=None)
+    assert continue_client.commands == []
+    assert tune_client.commands == []
+
+
+def test_tune_rejects_multiline_value_before_any_mutation(tmp_path):
+    d = _terminal_job(tmp_path)
+    client = FakeClient()
+
+    with pytest.raises(ValueError, match='非空单行文本'):
+        submitter.continue_with_incar_changes(
+            client, FakeSFTP(), _profile(), d,
+            {'NELM': '120\nISPIN = 2'}, max_rounds=None,
+            restart_from_contcar=False,
+            idempotency_key='tune-value-injection-0001')
+
+    assert client.commands == []
+    assert not os.path.exists(os.path.join(d, '.vcstudio-job-actions.json'))
+    with open(os.path.join(d, 'INCAR'), encoding='utf-8') as handle:
+        assert 'ISPIN = 2' not in handle.read()
 
 
 def test_tune_continue_empty_changes_rejected(tmp_path):

@@ -360,6 +360,83 @@ def test_jobs_tab_auto_report_logs_both_statuses_and_gate(monkeypatch):
     assert any(msg.startswith("⚠ 项目「demo」报告产物已生成") for msg in messages)
 
 
+def test_jobs_tab_manual_continue_trust_retry_uses_frozen_targets(monkeypatch):
+    submitted = {}
+    frozen = {
+        "dirs": ("A-confirmed",),
+        "profile": SimpleNamespace(name="cluster-a"),
+        "password": "pw",
+        "idempotency_key": "tk-continue-frozen-001",
+    }
+    dummy = SimpleNamespace(
+        continue_btn=SimpleNamespace(configure=lambda **_kwargs: None),
+        log=SimpleNamespace(write=lambda _message: None),
+        after=lambda *_args, **_kwargs: None,
+        _selected=lambda: (_ for _ in ()).throw(AssertionError("selection reread")),
+        _profile=lambda: (_ for _ in ()).throw(AssertionError("profile reread")),
+    )
+
+    def capture(function, *args, **kwargs):
+        submitted.update(function=function, args=args, kwargs=kwargs)
+        return object()
+
+    monkeypatch.setattr(jobs_tab.runner, "submit", capture)
+    jobs_tab.JobsTab._on_continue(dummy, trust_new=True, frozen=frozen)
+
+    assert submitted["args"][2] == ["A-confirmed"]
+    assert submitted["kwargs"]["idempotency_key"] == "tk-continue-frozen-001"
+    assert submitted["kwargs"]["allow_round_limit_override"] is True
+
+    retried = []
+    dummy._on_continue = lambda **kwargs: retried.append(kwargs)
+    monkeypatch.setattr(
+        jobs_tab.runner, "poll",
+        lambda _queue: ("ok", {"needs_trust": True, "message": "new host"}))
+    monkeypatch.setattr(jobs_tab.messagebox, "askyesno", lambda *_args, **_kwargs: True)
+    jobs_tab.JobsTab._poll_continue(dummy, object(), frozen)
+    assert retried == [{"trust_new": True, "frozen": frozen}]
+
+
+def test_jobs_tab_manual_tune_trust_retry_uses_frozen_request(monkeypatch):
+    submitted = {}
+    frozen = {
+        "job_dir": "A-confirmed",
+        "changes": {"ALGO": "Normal"},
+        "from_contcar": True,
+        "profile": SimpleNamespace(name="cluster-a"),
+        "password": "pw",
+        "idempotency_key": "tk-tune-frozen-001",
+    }
+    dummy = SimpleNamespace(
+        tune_btn=SimpleNamespace(configure=lambda **_kwargs: None),
+        log=SimpleNamespace(write=lambda _message: None),
+        after=lambda *_args, **_kwargs: None,
+        _selected=lambda: (_ for _ in ()).throw(AssertionError("selection reread")),
+        _profile=lambda: (_ for _ in ()).throw(AssertionError("profile reread")),
+    )
+
+    def capture(function, *args, **kwargs):
+        submitted.update(function=function, args=args, kwargs=kwargs)
+        return object()
+
+    monkeypatch.setattr(jobs_tab.runner, "submit", capture)
+    jobs_tab.JobsTab._on_tune_continue(dummy, trust_new=True, frozen=frozen)
+
+    assert submitted["args"][2:4] == (
+        "A-confirmed", {"ALGO": "Normal"})
+    assert submitted["args"][4:] == (True, True)
+    assert submitted["kwargs"]["idempotency_key"] == "tk-tune-frozen-001"
+
+    retried = []
+    dummy._on_tune_continue = lambda **kwargs: retried.append(kwargs)
+    monkeypatch.setattr(
+        jobs_tab.runner, "poll",
+        lambda _queue: ("ok", {"needs_trust": True, "message": "new host"}))
+    monkeypatch.setattr(jobs_tab.messagebox, "askyesno", lambda *_args, **_kwargs: True)
+    jobs_tab.JobsTab._poll_tune(dummy, object(), frozen)
+    assert retried == [{"trust_new": True, "frozen": frozen}]
+
+
 def test_legacy_project_entry_points_delegate_to_bridge_only():
     root = Path(__file__).resolve().parents[1]
     project_source = (root / "vcstudio/gui/project_tab.py").read_text(encoding="utf-8")
