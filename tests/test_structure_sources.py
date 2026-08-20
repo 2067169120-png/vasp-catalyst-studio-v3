@@ -28,6 +28,7 @@ Direct
 """
 
 CIF = """data_offline_fixture
+_space_group_IT_number 1
 _cell_length_a 3.0
 _cell_length_b 4.0
 _cell_length_c 5.0
@@ -64,9 +65,13 @@ def test_local_poscar_result_is_minimal_and_preview_is_canonical(tmp_path: Path)
     result = results[0]
     assert set(result) == {
         "token", "source_id", "formula", "license", "citation",
-        "method", "raw_structure_sha256",
+        "method", "raw_structure_sha256", "declared_formula",
+        "declared_raw_structure_sha256", "computed_formula",
+        "computed_structure_sha256",
     }
     assert result["formula"] == "CuO"
+    assert result["declared_formula"] == "CuO"
+    assert result["computed_formula"] == "CuO"
     assert result["method"] == {
         "provider": "local",
         "format": "poscar",
@@ -82,6 +87,9 @@ def test_local_poscar_result_is_minimal_and_preview_is_canonical(tmp_path: Path)
     assert preview["view"]["natoms"] == 2
     assert preview["raw_structure_sha256"] == result["raw_structure_sha256"]
     assert len(preview["structure_sha256"]) == 64
+    assert preview["computed_structure_sha256"] == result["computed_structure_sha256"]
+    assert preview["provenance"]["declared_raw_structure_sha256"] == result[
+        "raw_structure_sha256"]
     _assert_path_free(preview, str(tmp_path))
 
 
@@ -121,12 +129,46 @@ def test_restricted_cif_parser_fails_closed(content: str, message: str):
 
 def test_restricted_cif_parser_rejects_unexpanded_non_p1_symmetry():
     non_p1 = CIF.replace(
-        "_cell_length_a 3.0",
-        "_space_group_IT_number 225\n_cell_length_a 3.0",
+        "_space_group_IT_number 1",
+        "_space_group_IT_number 225",
     )
 
     with pytest.raises(StructureSourceValidationError, match="non-P1 symmetry"):
         parse_structure_content(non_p1, "cif")
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        CIF.replace("_space_group_IT_number 1\n", ""),
+        CIF.replace(
+            "_space_group_IT_number 1",
+            "_space_group_symop_operation_xyz 'x,y,z'",
+        ),
+    ],
+)
+def test_restricted_cif_parser_does_not_assume_p1_from_missing_or_identity_symop(
+    content: str,
+):
+    with pytest.raises(StructureSourceValidationError, match="space group is unknown"):
+        parse_structure_content(content, "cif")
+
+
+def test_restricted_cif_parser_rejects_duplicate_fractional_coordinate_columns():
+    duplicate_x = CIF.replace(
+        "_atom_site_fract_x\n",
+        "_atom_site_fract_x\n_atom_site_fract_x\n",
+    )
+
+    with pytest.raises(StructureSourceValidationError, match="columns must be unique"):
+        parse_structure_content(duplicate_x, "cif")
+
+    scalar_and_loop_x = CIF.replace(
+        "_cell_length_a 3.0",
+        "_atom_site_fract_x 0.125\n_cell_length_a 3.0",
+    )
+    with pytest.raises(StructureSourceValidationError, match="exactly once"):
+        parse_structure_content(scalar_and_loop_x, "cif")
 
 
 def test_local_source_hash_change_fails_closed_at_preview_and_confirm(tmp_path: Path):
@@ -157,7 +199,8 @@ def test_confirmation_is_idempotent_until_private_resolution_and_consumes_once(t
     assert first["source"] == result
     _assert_path_free(first, str(tmp_path))
     private = session.resolve_confirmed(first["confirmation_token"])
-    assert private["raw_source"] == source.read_bytes().decode("utf-8")
+    assert private["raw_source"] == private["poscar"]
+    assert r"C:\private\sample\POSCAR" not in private["raw_source"]
     assert private["poscar"].startswith("vcstudio structure source")
     assert private["provenance"]["provider"] == "local"
     assert "path" not in private
@@ -205,11 +248,14 @@ class _FakeGateway:
             raise OSError("network unavailable")
         assert token == "gateway.opaque-token-0001"
         path_free_poscar = POSCAR.replace("C:\\private\\sample\\POSCAR", "gateway fixture")
+        canonical_digest = parse_structure_content(
+            path_free_poscar, "poscar").structure_sha256
         return {
             "token": token,
             "source_id": "fixture-42",
             "formula": "CuO",
             "raw_structure_sha256": "a" * 64,
+            "canonical_structure_sha256": canonical_digest,
             "poscar": path_free_poscar,
         }
 
@@ -224,17 +270,103 @@ def test_fake_gateway_token_is_preserved_and_response_is_validated():
     assert result["token"] == "gateway.opaque-token-0001"
     assert set(result) == {
         "token", "source_id", "formula", "license", "citation",
-        "method", "raw_structure_sha256",
+        "method", "raw_structure_sha256", "declared_formula",
+        "declared_raw_structure_sha256", "computed_formula",
+        "computed_structure_sha256",
     }
+    assert result["computed_formula"] is None
+    assert result["computed_structure_sha256"] is None
     preview = session.preview(result["token"])
     assert preview["formula"] == "CuO"
+    assert preview["declared_formula"] == "CuO"
+    assert preview["computed_formula"] == "CuO"
+    assert preview["computed_structure_sha256"] == preview["structure_sha256"]
     assert "\\private\\" not in preview["structure"]["poscar"]
 
     confirmation = session.confirm(result["token"])
     private = session.resolve_confirmed(confirmation["confirmation_token"])
     assert private["provenance"]["database_id"] == "fixture-42"
     assert private["provenance"]["query"] == "CuO"
+    assert private["provenance"]["declared_raw_structure_sha256"] == "a" * 64
+    assert private["provenance"]["computed_structure_sha256"] == private[
+        "structure_sha256"]
     assert private["raw_source"] == private["poscar"]
+
+
+@pytest.mark.parametrize("mutation, message", [
+    ("missing-canonical-hash", "canonical structure SHA-256 is required"),
+    ("wrong-canonical-hash", "does not match server computation"),
+    ("content-formula-mismatch", "computed composition"),
+])
+def test_gateway_preview_requires_server_verifiable_content_identity(mutation, message):
+    gateway = _FakeGateway()
+    original_search = gateway.search
+    original_preview = gateway.preview
+
+    if mutation == "content-formula-mismatch":
+        def mismatched_search(provider, query):
+            result = deepcopy(original_search(provider, query)[0])
+            result["formula"] = "FeO"
+            return [result]
+
+        gateway.search = mismatched_search
+
+    def adversarial_preview(token):
+        result = deepcopy(original_preview(token))
+        if mutation == "missing-canonical-hash":
+            result.pop("canonical_structure_sha256")
+        elif mutation == "wrong-canonical-hash":
+            result["canonical_structure_sha256"] = "b" * 64
+        elif mutation == "content-formula-mismatch":
+            result["formula"] = "FeO"
+        return result
+
+    gateway.preview = adversarial_preview
+    session = StructureSourceSession(gateway=gateway)
+    result = session.search("fixture-db", "CuO")[0]
+
+    with pytest.raises(StructureSourceValidationError, match=message):
+        session.preview(result["token"])
+
+
+@pytest.mark.parametrize(
+    "field, malicious",
+    [
+        ("license", {"name": "terms copied from /home/alice/private/license.txt"}),
+        ("license", {"name": "terms copied from /workspace"}),
+        ("citation", {"text": r"citation mirror at \\server\share\paper.txt"}),
+        ("citation", {"text": "cached as file:///etc/passwd"}),
+        ("method", {"provider": "fixture-db", "nested": {
+            "note": r"source cache C:\private\record.cif"}}),
+        ("method", {"provider": "fixture-db", "nested": {
+            "note": r"prefixC:\private\record.cif"}}),
+        ("method", {"provider": "fixture-db", "nested": [
+            "endpoint https://alice:secret@example.invalid/api"]}),
+        ("method", {"provider": "fixture-db", "nested": {
+            "note": "Authorization Bearer abcdefghijklmnop"}}),
+        ("method", {"provider": "fixture-db", "nested": {
+            "note": "password is abcdefghijklmnop"}}),
+    ],
+)
+def test_gateway_search_recursively_rejects_embedded_paths_and_credentials(
+    field, malicious,
+):
+    gateway = _FakeGateway()
+    original = gateway.search
+
+    def poisoned(provider, query):
+        result = deepcopy(original(provider, query)[0])
+        result[field] = malicious
+        return [result]
+
+    gateway.search = poisoned
+    session = StructureSourceSession(gateway=gateway)
+
+    with pytest.raises(
+        StructureSourceValidationError,
+        match="filesystem path|credential",
+    ):
+        session.search("fixture-db", "CuO")
 
 
 def test_gateway_malformed_or_path_bearing_dto_is_rejected():

@@ -4,8 +4,9 @@
 ``ExternalStructureGateway``（或同名 callable 映射）；因此 Materials Project、
 OPTIMADE 等具体 provider 的网络与许可策略仍由 External Reference Gateway 独占。
 
-公开搜索结果只包含 opaque token、来源 ID、化学式、许可/引用、方法元数据和
-原始结构 SHA-256。文件路径与原始结构只保留在进程内；用户进入 ``preview`` 后才
+公开搜索结果只包含 opaque token、来源 ID、声明化学式、许可/引用、方法元数据和
+声明的原始结构 SHA-256。这两个搜索字段只是 provider 声明，不是内容证据。文件路径与
+原始结构只保留在进程内；用户进入 ``preview`` 后才
 得到固定标题的规范化 POSCAR，显式 ``confirm`` 后再以单次 confirmation token
 交给服务器侧 ``resolve_confirmed`` 消费。
 """
@@ -36,12 +37,25 @@ MAX_SOURCE_BYTES = 8 * 1024 * 1024
 MAX_ATOMS = 20_000
 MAX_GATEWAY_RESULTS = 100
 
-_RESULT_FIELDS = frozenset({
+_RESULT_COMMON_FIELDS = frozenset({
+    "token", "source_id", "license", "citation", "method",
+})
+_RESULT_DECLARATION_FIELDS = frozenset({
     "token", "source_id", "formula", "license", "citation", "method",
     "raw_structure_sha256",
 })
-_GATEWAY_PREVIEW_FIELDS = frozenset({
-    "token", "source_id", "formula", "raw_structure_sha256", "poscar",
+_RESULT_ALLOWED_FIELDS = frozenset({
+    *_RESULT_DECLARATION_FIELDS,
+    "declared_formula", "declared_raw_structure_sha256",
+})
+_GATEWAY_PREVIEW_COMMON_FIELDS = frozenset({
+    "token", "source_id", "poscar",
+})
+_GATEWAY_PREVIEW_ALLOWED_FIELDS = frozenset({
+    *_GATEWAY_PREVIEW_COMMON_FIELDS,
+    "formula", "raw_structure_sha256",
+    "declared_formula", "declared_raw_structure_sha256",
+    "canonical_structure_sha256", "structure_sha256",
 })
 _CAPABILITY_FIELDS = frozenset({
     "provider", "label", "modes", "formats", "network", "enabled",
@@ -52,16 +66,41 @@ _SAFE_METADATA_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
 _FORMULA_RE = re.compile(r"[A-Za-z0-9().+\-\s\u00b7]{1,128}\Z")
 _HEX_SHA256_RE = re.compile(r"[0-9a-fA-F]{64}\Z")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-_FILESYSTEM_PATH_RE = re.compile(
-    r"(?i)(?:^[A-Z]:[\\/]|^\\\\|^/|^~[\\/]|^\.\.?[\\/]|^file:)")
+_WINDOWS_PATH_RE = re.compile(r"(?i)[A-Z]:[\\/]")
+_UNC_PATH_RE = re.compile(r"(?:\\\\|(?<!:)//)[^\\/\s]+[\\/][^\\/\s]+")
+_FILE_URI_RE = re.compile(r"(?i)\bfile\s*:(?:/{0,3}|\\{1,3})")
+_RELATIVE_PATH_RE = re.compile(r"(?<![A-Za-z0-9.])(?:~[\\/]|\.\.?[\\/])")
+_WEB_URL_RE = re.compile(r"(?i)\b(?:https?|ftp)://[^\s<>'\"]+")
+_POSIX_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9.])/(?!/)[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~@%+=,-]+)+")
+_POSIX_SINGLE_COMPONENT_RE = re.compile(
+    r"(?<![A-Za-z0-9.])/(?!/)[A-Za-z0-9._~-]+(?=$|[\s,;:)'\"])")
+_COMMON_POSIX_ROOT_RE = re.compile(
+    r"(?<![A-Za-z0-9.])/(?:etc|home|root|tmp|usr|var|opt|srv|mnt|media|run|private|Users)"
+    r"(?=$|[\s,;:)'\"])")
 _CREDENTIAL_RE = re.compile(
-    r"(?i)(?:password|passwd|secret|credential|api[_ -]?key|access[_ -]?token)\s*[:=]")
+    r"(?i)(?:password|passwd|pwd|secret|credential|api[_ -]?key|access[_ -]?token|"
+    r"refresh[_ -]?token|private[_ -]?key)\s*(?::|=|\bis\b|\bwas\b)")
+_AUTH_CREDENTIAL_RE = re.compile(
+    r"(?i)(?:\bBearer\s+[^\s,;]+|\bBasic\s+[A-Za-z0-9+/=]{8,}|"
+    r"\b[a-z][a-z0-9+.-]*://[^/@\s:]+:[^/@\s]+@|"
+    r"\b(?:github_pat_|gh[opusr]_|sk-)[A-Za-z0-9_-]{12,}|"
+    r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|"
+    r"-----BEGIN[^\r\n]{0,40}PRIVATE KEY-----)")
 _CIF_NUMBER_RE = re.compile(
     r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?(?:\(\d+\))?\Z")
 _BAD_METADATA_KEYS = frozenset({
     "path", "paths", "filepath", "file_path", "directory", "dir",
+    "root", "locator", "uri", "file_uri", "url_with_credentials",
     "token", "password", "passwd", "secret", "credential", "credentials",
-    "api_key", "apikey", "access_token", "refresh_token", "raw_structure",
+    "authorization", "cookie", "api_key", "apikey", "access_token",
+    "refresh_token", "private_key", "raw_structure",
+})
+_BAD_PUBLIC_KEYS = frozenset({
+    "path", "paths", "filepath", "file_path", "directory", "dir", "root",
+    "locator", "file_uri", "url_with_credentials", "password", "passwd",
+    "secret", "credential", "credentials", "authorization", "cookie", "api_key",
+    "apikey", "access_token", "refresh_token", "private_key", "raw_structure",
 })
 
 # 元素符号只用于拒绝拼写错误和伪标签，不包含任何第三方数据。
@@ -329,6 +368,11 @@ def _parse_cif_tables(content: str) -> tuple[dict[str, str], list[tuple[list[str
                 index += 1
             if not headers:
                 raise StructureSourceValidationError("CIF loop_ must declare column names")
+            duplicate_headers = sorted({header for header in headers if headers.count(header) > 1})
+            if duplicate_headers:
+                raise StructureSourceValidationError(
+                    "CIF loop columns must be unique; duplicate columns: "
+                    + ", ".join(duplicate_headers))
             atom_fractional = {
                 "_atom_site_fract_x", "_atom_site_fract_y", "_atom_site_fract_z",
             }.intersection(headers)
@@ -416,19 +460,30 @@ def _cif_cell(scalars: Mapping[str, str]) -> tuple[tuple[float, float, float], .
 def _validate_cif_symmetry(
     scalars: Mapping[str, str], loops: Sequence[tuple[list[str], list[str]]],
 ) -> None:
-    """受限 parser 不展开对称性，因此只接受显式 P1/恒等操作。"""
+    """受限 parser 不展开对称性，因此只接受显式 P1。
+
+    单纯没有对称字段不能证明 asymmetric unit 已是完整晶胞；本 parser
+    不默认 P1。操作表若存在，也必须只包含唯一恒等操作。
+    """
     number_tags = ("_space_group_it_number", "_symmetry_int_tables_number")
+    explicit_p1 = False
     for tag in number_tags:
-        if tag in scalars and _cif_number(scalars[tag], field=tag) != 1.0:
-            raise StructureSourceValidationError(
-                "CIF non-P1 symmetry requires expansion and is unsupported")
+        if tag in scalars:
+            explicit_p1 = True
+            if _cif_number(scalars[tag], field=tag) != 1.0:
+                raise StructureSourceValidationError(
+                    "CIF non-P1 symmetry requires expansion and is unsupported")
     name_tags = ("_space_group_name_h-m_alt", "_symmetry_space_group_name_h-m")
     for tag in name_tags:
         if tag in scalars:
+            explicit_p1 = True
             normalized = re.sub(r"[\s_]", "", scalars[tag]).upper()
             if normalized != "P1":
                 raise StructureSourceValidationError(
                     "CIF non-P1 symmetry requires expansion and is unsupported")
+    if not explicit_p1:
+        raise StructureSourceValidationError(
+            "CIF space group is unknown; explicit P1 or IT number 1 is required")
 
     operation_tags = {
         "_space_group_symop_operation_xyz", "_symmetry_equiv_pos_as_xyz",
@@ -457,6 +512,9 @@ def _parse_cif(content: str) -> ParsedStructure:
     coordinate_tags = {
         "_atom_site_fract_x", "_atom_site_fract_y", "_atom_site_fract_z",
     }
+    if coordinate_tags.intersection(scalars):
+        raise StructureSourceValidationError(
+            "CIF fractional x, y, z must each occur exactly once as atom loop columns")
     complete: list[tuple[list[str], list[str]]] = []
     for headers, values in loops:
         header_set = set(headers)
@@ -591,15 +649,32 @@ class LocalStructureProvider:
         )
 
 
+def _contains_filesystem_path(text: str) -> bool:
+    """检测任意位置的本地 locator，而不把 HTTPS URL 的 path 误当本地路径。"""
+    if (
+        _UNC_PATH_RE.search(text)
+        or _FILE_URI_RE.search(text)
+        or _RELATIVE_PATH_RE.search(text)
+    ):
+        return True
+    without_web_urls = _WEB_URL_RE.sub("", text)
+    return bool(
+        _WINDOWS_PATH_RE.search(without_web_urls)
+        or _POSIX_PATH_RE.search(without_web_urls)
+        or _POSIX_SINGLE_COMPONENT_RE.search(without_web_urls)
+        or _COMMON_POSIX_ROOT_RE.search(without_web_urls)
+    )
+
+
 def _safe_text(value: Any, *, field: str, maximum: int = 2048) -> str:
     if not isinstance(value, str):
         raise StructureSourceValidationError(f"{field} must be text")
     text = value.strip()
     if not text or len(text) > maximum or _CONTROL_RE.search(text):
         raise StructureSourceValidationError(f"{field} is empty, too long, or contains controls")
-    if _FILESYSTEM_PATH_RE.search(text):
+    if _contains_filesystem_path(text):
         raise StructureSourceValidationError(f"{field} must not contain a filesystem path")
-    if _CREDENTIAL_RE.search(text):
+    if _CREDENTIAL_RE.search(text) or _AUTH_CREDENTIAL_RE.search(text):
         raise StructureSourceValidationError(f"{field} must not contain a credential")
     return text
 
@@ -704,18 +779,79 @@ def _metadata(value: Any, *, field: str = "method", depth: int = 0) -> Any:
     raise StructureSourceValidationError(f"{field} contains an unsupported metadata value")
 
 
+def _public_payload(value: Any, *, field: str = "payload", depth: int = 0) -> Any:
+    """递归验证成功 DTO/provenance 不夹带路径、locator 或凭据。
+
+    上游恶意字段不做静默截断：在 provider 边界 fail-closed，避免将被改写的
+    许可或引用元数据误写入 provenance。
+    """
+    if depth > 12:
+        raise StructureSourceValidationError(f"{field} exceeds the public payload depth limit")
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise StructureSourceValidationError(f"{field} must contain finite numbers")
+        return value
+    if isinstance(value, str):
+        # POSCAR 与 XYZ 可以较大；仍对整个字符串做嵌入式敏感内容检查。
+        return _safe_text(value, field=field, maximum=MAX_SOURCE_BYTES)
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for raw_key, item in value.items():
+            if not isinstance(raw_key, str):
+                raise StructureSourceValidationError(f"{field} contains a non-text key")
+            normalized = re.sub(r"[^a-z0-9]+", "_", raw_key.lower()).strip("_")
+            if (
+                normalized in _BAD_PUBLIC_KEYS
+                or normalized.endswith("_path")
+                or normalized.endswith("_file")
+            ):
+                raise StructureSourceValidationError(
+                    f"{field}.{raw_key} is not allowed at the public boundary")
+            result[raw_key] = _public_payload(
+                item, field=f"{field}.{raw_key}", depth=depth + 1)
+        return result
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        return [
+            _public_payload(item, field=f"{field}[]", depth=depth + 1)
+            for item in value
+        ]
+    raise StructureSourceValidationError(f"{field} contains an unsupported value")
+
+
 def validate_source_result(
     value: Mapping[str, Any], *, expected_provider: str | None = None,
 ) -> dict[str, Any]:
-    """验证并复制外部网关搜索结果；未知字段一律拒绝。"""
+    """验证并复制外部网关搜索结果；未知字段一律拒绝。
+
+    旧 gateway 字段 ``formula/raw_structure_sha256`` 只作为声明别名。
+    ``computed_*`` 只能由本服务在解析 preview 内容后填入。
+    """
     if not isinstance(value, Mapping):
         raise StructureSourceValidationError("source result must be an object")
     fields = set(value)
-    if fields != _RESULT_FIELDS:
-        unexpected = sorted(fields - _RESULT_FIELDS)
-        missing = sorted(_RESULT_FIELDS - fields)
+    unexpected = sorted(fields - _RESULT_ALLOWED_FIELDS)
+    missing = sorted(_RESULT_COMMON_FIELDS - fields)
+    formula_fields = [name for name in ("formula", "declared_formula") if name in fields]
+    digest_fields = [
+        name for name in ("raw_structure_sha256", "declared_raw_structure_sha256")
+        if name in fields
+    ]
+    if unexpected or missing or not formula_fields or not digest_fields:
         raise StructureSourceValidationError(
-            f"source result has unexpected fields {unexpected} or missing fields {missing}")
+            "source result has unexpected fields "
+            f"{unexpected} or missing fields {missing}; declared formula/hash are required")
+    declared_formula = _safe_formula(value[formula_fields[0]])
+    if any(_safe_formula(value[name]) != declared_formula for name in formula_fields[1:]):
+        raise StructureSourceValidationError("source result formula declarations disagree")
+    declared_digest = _safe_sha256(
+        value[digest_fields[0]], field="declared_raw_structure_sha256")
+    if any(
+        _safe_sha256(value[name], field="declared_raw_structure_sha256") != declared_digest
+        for name in digest_fields[1:]
+    ):
+        raise StructureSourceValidationError("source result raw hash declarations disagree")
     method = _metadata(value["method"])
     if not isinstance(method, dict):
         raise StructureSourceValidationError("method must be an object")
@@ -723,15 +859,21 @@ def validate_source_result(
     if expected_provider is not None and provider != expected_provider:
         raise StructureSourceValidationError("method.provider does not match the selected provider")
     method["provider"] = provider
-    return {
+    result = {
         "token": _safe_token(value["token"]),
         "source_id": _safe_identifier(value["source_id"], field="source_id"),
-        "formula": _safe_formula(value["formula"]),
+        # 两个旧字段仅是向后兼容别名；不表示服务器已验证内容。
+        "formula": declared_formula,
+        "declared_formula": declared_formula,
+        "computed_formula": None,
         "license": _license(value["license"]),
         "citation": _citation(value["citation"]),
         "method": method,
-        "raw_structure_sha256": _safe_sha256(value["raw_structure_sha256"]),
+        "raw_structure_sha256": declared_digest,
+        "declared_raw_structure_sha256": declared_digest,
+        "computed_structure_sha256": None,
     }
+    return _public_payload(result, field="source_result")
 
 
 def _capability(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -864,7 +1006,7 @@ class StructureSourceSession:
     def capabilities(self) -> list[dict[str, Any]]:
         local = _capability(self._local.capability())
         if self._gateway is None:
-            return [local]
+            return _public_payload([local], field="capabilities")
         try:
             raw = self._gateway_method("capabilities")()
             if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
@@ -876,8 +1018,8 @@ class StructureSourceSession:
             if len(set(providers)) != len(providers):
                 raise StructureSourceValidationError("gateway provider capabilities must be unique")
         except Exception:  # noqa: BLE001 - 外部故障不得破坏本地文件流程
-            return [local]
-        return [local, *external]
+            return _public_payload([local], field="capabilities")
+        return _public_payload([local, *external], field="capabilities")
 
     def select_local(self, path: str | os.PathLike[str]) -> list[dict[str, Any]]:
         selected = self._local.select(path)
@@ -904,6 +1046,8 @@ class StructureSourceSession:
                 },
                 "raw_structure_sha256": selected.raw_structure_sha256,
             }, expected_provider="local")
+            result["computed_formula"] = selected.parsed.formula
+            result["computed_structure_sha256"] = selected.parsed.structure_sha256
             provenance = {
                 "provider": "local",
                 "database_id": result["source_id"],
@@ -911,9 +1055,17 @@ class StructureSourceSession:
                 "retrieved_at_utc": _utc_timestamp(self._utc_now),
                 "license": deepcopy(result["license"]),
                 "citation": deepcopy(result["citation"]),
+                "declared_formula": result["declared_formula"],
+                "computed_formula": result["computed_formula"],
+                "declared_raw_structure_sha256": result[
+                    "declared_raw_structure_sha256"],
+                "computed_structure_sha256": result["computed_structure_sha256"],
+                # 向后兼容别名；语义仍是原始字节散列。
                 "raw_structure_sha256": result["raw_structure_sha256"],
                 "method": deepcopy(result["method"]),
             }
+            result = _public_payload(result, field="source_result")
+            provenance = _public_payload(provenance, field="provenance")
             self._sources[token] = _SourceRecord(
                 token=token,
                 result=result,
@@ -964,9 +1116,15 @@ class StructureSourceSession:
                     "retrieved_at_utc": retrieved_at,
                     "license": deepcopy(result["license"]),
                     "citation": deepcopy(result["citation"]),
+                    "declared_formula": result["declared_formula"],
+                    "computed_formula": None,
+                    "declared_raw_structure_sha256": result[
+                        "declared_raw_structure_sha256"],
+                    "computed_structure_sha256": None,
                     "raw_structure_sha256": result["raw_structure_sha256"],
                     "method": deepcopy(method),
                 }
+                provenance = _public_payload(provenance, field="provenance")
                 self._sources[result["token"]] = _SourceRecord(
                     token=result["token"],
                     result=result,
@@ -1004,23 +1162,82 @@ class StructureSourceSession:
             raise
         except Exception as exc:  # noqa: BLE001 - 不传播外部 URL/凭据
             raise StructureSourceError("external structure gateway is unavailable") from exc
-        if not isinstance(raw, Mapping) or set(raw) != _GATEWAY_PREVIEW_FIELDS:
+        if not isinstance(raw, Mapping):
             raise StructureSourceValidationError(
                 "gateway preview has unexpected or missing fields")
+        fields = set(raw)
+        unexpected = fields - _GATEWAY_PREVIEW_ALLOWED_FIELDS
+        missing = _GATEWAY_PREVIEW_COMMON_FIELDS - fields
+        formula_fields = [
+            name for name in ("formula", "declared_formula") if name in fields
+        ]
+        raw_digest_fields = [
+            name for name in ("raw_structure_sha256", "declared_raw_structure_sha256")
+            if name in fields
+        ]
+        canonical_digest_fields = [
+            name for name in ("canonical_structure_sha256", "structure_sha256")
+            if name in fields
+        ]
+        if (
+            unexpected or missing or not formula_fields or not raw_digest_fields
+            or not canonical_digest_fields
+        ):
+            raise StructureSourceValidationError(
+                "gateway preview has unexpected or missing fields; a declared canonical "
+                "structure SHA-256 is required")
         token = _safe_token(raw["token"])
         source_id = _safe_identifier(raw["source_id"], field="source_id")
-        formula = _safe_formula(raw["formula"])
-        digest = _safe_sha256(raw["raw_structure_sha256"])
+        formula = _safe_formula(raw[formula_fields[0]])
+        if any(_safe_formula(raw[name]) != formula for name in formula_fields[1:]):
+            raise StructureSourceValidationError("gateway preview formula declarations disagree")
+        raw_digest = _safe_sha256(
+            raw[raw_digest_fields[0]], field="declared_raw_structure_sha256")
+        if any(
+            _safe_sha256(raw[name], field="declared_raw_structure_sha256") != raw_digest
+            for name in raw_digest_fields[1:]
+        ):
+            raise StructureSourceValidationError(
+                "gateway preview raw hash declarations disagree")
+        declared_canonical_digest = _safe_sha256(
+            raw[canonical_digest_fields[0]], field="canonical_structure_sha256")
+        if any(
+            _safe_sha256(raw[name], field="canonical_structure_sha256")
+            != declared_canonical_digest
+            for name in canonical_digest_fields[1:]
+        ):
+            raise StructureSourceValidationError(
+                "gateway preview canonical hash declarations disagree")
         if (
             token != record.token
             or source_id != record.result["source_id"]
-            or formula != record.result["formula"]
-            or digest != record.result["raw_structure_sha256"]
+            or formula != record.result["declared_formula"]
+            or raw_digest != record.result["declared_raw_structure_sha256"]
         ):
             raise StructureSourceValidationError(
                 "gateway preview identity does not match its search result")
         poscar = _safe_text(raw["poscar"], field="gateway preview POSCAR", maximum=MAX_SOURCE_BYTES)
         parsed = parse_structure_content(poscar, "poscar")
+        if parsed.formula != record.result["declared_formula"]:
+            raise StructureSourceValidationError(
+                "gateway preview computed composition does not match its declared formula")
+        if parsed.structure_sha256 != declared_canonical_digest:
+            raise StructureSourceValidationError(
+                "gateway preview canonical structure hash does not match server computation")
+        with self._lock:
+            current = self._sources.get(record.token)
+            if current is not record:
+                raise StructureSourceTokenError("source token is invalid or expired")
+            current.result["computed_formula"] = parsed.formula
+            current.result["computed_structure_sha256"] = parsed.structure_sha256
+            current.provenance.update({
+                "declared_canonical_structure_sha256": declared_canonical_digest,
+                "computed_formula": parsed.formula,
+                "computed_structure_sha256": parsed.structure_sha256,
+            })
+            current.result = _public_payload(current.result, field="source_result")
+            current.provenance = _public_payload(
+                current.provenance, field="provenance")
         return _ResolvedStructure(
             # 外部 preview 只接收 path-free POSCAR；不把未知远端原件冒充为已保存原件。
             raw_source=parsed.canonical_poscar,
@@ -1047,17 +1264,24 @@ class StructureSourceSession:
     @staticmethod
     def _preview_payload(record: _SourceRecord, resolved: _ResolvedStructure) -> dict[str, Any]:
         parsed = resolved.parsed
-        return {
+        payload = {
             "schema": "vcstudio.structure-source-preview/v1",
             "token": record.token,
             "source_id": record.result["source_id"],
+            # 兼容别名；preview 已经验证声明与服务器计算结果一致。
             "formula": record.result["formula"],
             "raw_structure_sha256": record.result["raw_structure_sha256"],
+            "declared_formula": record.result["declared_formula"],
+            "declared_raw_structure_sha256": record.result[
+                "declared_raw_structure_sha256"],
+            "computed_formula": parsed.formula,
+            "computed_structure_sha256": parsed.structure_sha256,
             "structure_sha256": parsed.structure_sha256,
             "structure": parsed.public_structure(),
             "view": structure_view(parsed.canonical_poscar),
             "provenance": deepcopy(record.provenance),
         }
+        return _public_payload(payload, field="preview")
 
     def preview(self, token: str) -> dict[str, Any]:
         record = self._record(token)
@@ -1068,7 +1292,8 @@ class StructureSourceSession:
     def _confirmation_payload(record: _SourceRecord, confirmation_token: str) -> dict[str, Any]:
         if record.resolved is None:
             raise StructureSourceError("confirmed source has no resolved structure")
-        return {
+        parsed = record.resolved.parsed
+        payload = {
             "schema": "vcstudio.structure-source-confirmation/v1",
             "confirmed": True,
             "confirmation_token": confirmation_token,
@@ -1077,8 +1302,14 @@ class StructureSourceSession:
             "source_id": record.result["source_id"],
             "formula": record.result["formula"],
             "raw_structure_sha256": record.result["raw_structure_sha256"],
-            "structure_sha256": record.resolved.parsed.structure_sha256,
+            "declared_formula": record.result["declared_formula"],
+            "declared_raw_structure_sha256": record.result[
+                "declared_raw_structure_sha256"],
+            "computed_formula": parsed.formula,
+            "computed_structure_sha256": parsed.structure_sha256,
+            "structure_sha256": parsed.structure_sha256,
         }
+        return _public_payload(payload, field="confirmation")
 
     def confirm(self, token: str) -> dict[str, Any]:
         record = self._record(token)
@@ -1144,20 +1375,27 @@ class StructureSourceSession:
             if self._sources.get(record.token) is record:
                 self._sources.pop(record.token, None)
         parsed = resolved.parsed
-        return {
+        payload = {
             "schema": "vcstudio.structure-source-resolved/v1",
             "confirmation_token": token,
             "source_token": record.token,
             "source_id": record.result["source_id"],
             "formula": record.result["formula"],
+            "declared_formula": record.result["declared_formula"],
+            "declared_raw_structure_sha256": record.result[
+                "declared_raw_structure_sha256"],
+            "computed_formula": parsed.formula,
+            "computed_structure_sha256": parsed.structure_sha256,
             "source_format": resolved.source_format,
-            "raw_source": resolved.raw_source,
+            # 原始 POSCAR 注释可能包含路径/凭据；成功 DTO 只携带规范化内容。
+            "raw_source": parsed.canonical_poscar,
             "poscar": parsed.canonical_poscar,
             "raw_structure_sha256": record.result["raw_structure_sha256"],
             "structure_sha256": parsed.structure_sha256,
             "structure": parsed.public_structure(),
             "provenance": deepcopy(record.provenance),
         }
+        return _public_payload(payload, field="resolved")
 
 
 __all__ = [

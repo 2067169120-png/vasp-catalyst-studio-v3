@@ -1,12 +1,16 @@
 """Structure Source Hub browser-boundary and candidate-creation contracts."""
 from __future__ import annotations
 
+import copy
 import json
+import os
 from pathlib import Path
 import types
 
+import pytest
 import yaml
 
+from vcstudio.generate.structure_sources import parse_structure_content
 from vcstudio.gui_web.api import Api
 
 
@@ -44,17 +48,24 @@ Cartesian
 5 5 5
 """
 
+_PARSED_BULK = parse_structure_content(BULK_POSCAR, "poscar")
+BULK_COMPUTED_SHA256 = _PARSED_BULK.structure_sha256
+BULK_CANONICAL_POSCAR = _PARSED_BULK.canonical_poscar
+
 
 def _result(token: str, *, source_id: str = "local-POSCAR") -> dict:
     return {
         "token": token,
-        "provider": "local",
         "source_id": source_id,
         "formula": "Pt",
+        "declared_formula": "Pt",
+        "computed_formula": "Pt",
         "license": "user-supplied",
         "citation": "User supplied local structure",
-        "method": {"format": "POSCAR"},
-        "structure_hash": "a" * 64,
+        "method": {"provider": "local", "format": "POSCAR"},
+        "raw_structure_sha256": "a" * 64,
+        "declared_raw_structure_sha256": "a" * 64,
+        "computed_structure_sha256": BULK_COMPUTED_SHA256,
     }
 
 
@@ -93,6 +104,9 @@ class _FakeSources:
                 "provider": "local", "database_id": "local-POSCAR", "query": None,
                 "retrieved_at": "2026-08-15T00:00:00+00:00",
                 "license": "user-supplied", "raw_structure_hash": "a" * 64,
+                "declared_formula": "Pt", "computed_formula": "Pt",
+                "declared_raw_structure_sha256": "a" * 64,
+                "computed_structure_sha256": BULK_COMPUTED_SHA256,
             },
         }
 
@@ -116,6 +130,9 @@ class _FakeSources:
                 "provider": "local", "database_id": "local-POSCAR", "query": None,
                 "retrieved_at": "2026-08-15T00:00:00+00:00",
                 "license": "user-supplied", "raw_structure_hash": "a" * 64,
+                "declared_formula": "Pt", "computed_formula": "Pt",
+                "declared_raw_structure_sha256": "a" * 64,
+                "computed_structure_sha256": BULK_COMPUTED_SHA256,
             },
         }
 
@@ -125,7 +142,7 @@ class _FakeSurface:
 
     @staticmethod
     def build_slabs(bulk_poscar, request):
-        assert bulk_poscar == BULK_POSCAR
+        assert bulk_poscar == BULK_CANONICAL_POSCAR
         if request.get("miller") == [0, 0, 0]:
             raise ValueError("Miller indices cannot all be zero")
         return [{
@@ -185,7 +202,96 @@ class _FakeSurface:
         }
 
 
-def _api(tmp_path: Path, *, sources=None, dialog_kind=None):
+class _TwoCandidateSurface(_FakeSurface):
+    @staticmethod
+    def build_slabs(bulk_poscar, request):
+        first = _FakeSurface.build_slabs(bulk_poscar, request)[0]
+        second = copy.deepcopy(first)
+        second["termination"]["termination_id"] = "term-02"
+        second["termination"]["index"] = 1
+        second["structure_hash"] = "4" * 64
+        return [first, second]
+
+
+class _FlakyLedger:
+    def __init__(self):
+        self.calls = []
+        self.failed_once = False
+
+    @staticmethod
+    def load_all():
+        return []
+
+    def register(self, path):
+        name = Path(path).name
+        self.calls.append(name)
+        if "term-02" in name and not self.failed_once:
+            self.failed_once = True
+            raise OSError(
+                r"registration C:\ledger-private\jobs failed; "
+                "password=top-secret-value"
+            )
+
+
+class _MaliciousSources(_FakeSources):
+    @staticmethod
+    def _tainted_provenance():
+        return {
+            "provider": "local",
+            "database_id": "local-POSCAR",
+            "query": None,
+            "retrieved_at": "2026-08-15T00:00:00+00:00",
+            "license": r"user-supplied C:\hub-private\license",
+            "raw_structure_hash": "a" * 64,
+            "declared_formula": "Pt",
+            "computed_formula": "Pt",
+            "declared_raw_structure_sha256": "a" * 64,
+            "computed_structure_sha256": BULK_COMPUTED_SHA256,
+            "method": {
+                "note": (
+                    r"from \\unc-secret-host\source and /srv/leak-posix/source "
+                    "Bearer bearer-secret-value "
+                    "https://url-user:url-password-secret@example.invalid/reference"
+                ),
+                "api_key": "api-key-secret-value",
+            },
+        }
+
+    def preview(self, token):
+        result = super().preview(token)
+        result["provenance"] = self._tainted_provenance()
+        result["view"]["notes"] = [
+            r"embedded C:\preview-private\POSCAR password=preview-secret"
+        ]
+        return result
+
+    def resolve_confirmed(self, token):
+        result = super().resolve_confirmed(token)
+        result["provenance"] = self._tainted_provenance()
+        return result
+
+
+class _MaliciousSurface(_FakeSurface):
+    @staticmethod
+    def build_slabs(bulk_poscar, request):
+        rows = _FakeSurface.build_slabs(bulk_poscar, request)
+        rows[0]["provenance"]["diagnostic"] = {
+            "text": "/srv/leak-posix/builder secret=builder-secret-value",
+            "credential": "credential-secret-value",
+        }
+        return rows
+
+
+class _MismatchedComputedEvidenceSources(_FakeSources):
+    def resolve_confirmed(self, token):
+        result = super().resolve_confirmed(token)
+        result["computed_structure_sha256"] = "0" * 64
+        result["provenance"]["computed_structure_sha256"] = "0" * 64
+        result["source"]["computed_structure_sha256"] = "0" * 64
+        return result
+
+
+def _api(tmp_path: Path, *, sources=None, dialog_kind=None, ledger=None, surface=None):
     sources = sources or _FakeSources()
     chosen_source = tmp_path / "private" / "POSCAR"
     chosen_output = tmp_path / "private-output"
@@ -199,14 +305,12 @@ def _api(tmp_path: Path, *, sources=None, dialog_kind=None):
         return str(chosen_output if kind == "dir" else chosen_source)
 
     registrations = []
-    ledger = types.SimpleNamespace(
-        register=lambda path: registrations.append(str(path)),
-        load_all=lambda: [],
-    )
+    ledger = ledger or types.SimpleNamespace(
+        register=lambda path: registrations.append(str(path)), load_all=lambda: [])
     api = Api(
         dialog_fn=dialog, ledger_mod=ledger,
         structure_source_session=sources,
-        surface_workbench_mod=_FakeSurface,
+        surface_workbench_mod=surface or _FakeSurface,
     )
     return api, sources, registrations, chosen_source, chosen_output
 
@@ -218,6 +322,37 @@ def _assert_path_free(value):
     def inspect(item):
         if isinstance(item, dict):
             assert not ({"path", "project_path", "raw_source", "local_path"} & set(item))
+            for nested in item.values():
+                inspect(nested)
+        elif isinstance(item, list):
+            for nested in item:
+                inspect(nested)
+
+    inspect(value)
+
+
+def _assert_sensitive_free(value):
+    encoded = json.dumps(value, ensure_ascii=False)
+    for forbidden in (
+        "hub-private",
+        "preview-private",
+        "unc-secret-host",
+        "leak-posix",
+        "top-secret-value",
+        "preview-secret",
+        "bearer-secret-value",
+        "api-key-secret-value",
+        "builder-secret-value",
+        "credential-secret-value",
+        "url-user",
+        "url-password-secret",
+    ):
+        assert forbidden not in encoded
+
+    def inspect(item):
+        if isinstance(item, dict):
+            lowered = {str(key).lower() for key in item}
+            assert not ({"api_key", "credential", "password", "secret"} & lowered)
             for nested in item.values():
                 inspect(nested)
         elif isinstance(item, list):
@@ -297,6 +432,18 @@ def test_confirm_import_is_idempotent_and_survives_failed_dry_run(tmp_path):
     assert retried["ok"] is True and retried["operation_token"]
 
 
+def test_confirm_recomputes_canonical_content_and_rejects_forged_computed_hash(tmp_path):
+    api, _sources, _registrations, _source, _output = _api(
+        tmp_path, sources=_MismatchedComputedEvidenceSources())
+
+    result = api.structure_source_confirm("1" * 32)
+
+    assert result["ok"] is False
+    assert result["confirmed"] is False
+    assert result["source_token"] is None
+    assert "recomputation" in result["error"]
+
+
 def test_adsorbate_collision_fails_closed_without_operation_token(tmp_path):
     api, _sources, _registrations, _source, _output = _api(tmp_path)
     bulk = api.structure_source_confirm("1" * 32)["source_token"]
@@ -320,6 +467,44 @@ def test_output_selection_is_opaque_and_does_not_expose_directory(tmp_path):
     assert result["ok"] is True and len(result["output_token"]) == 32
     assert result["selection"]["label"] == output.name
     _assert_path_free(result)
+
+
+def test_output_selection_rejects_reparse_or_symlink_directory(tmp_path):
+    target = tmp_path / "real-output"
+    linked = tmp_path / "linked-output"
+    target.mkdir()
+    try:
+        os.symlink(target, linked, target_is_directory=True)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"directory symlink creation is unavailable: {exc}")
+
+    api = Api(dialog_fn=lambda _kind: str(linked))
+    result = api.structure_output_select()
+
+    assert result["ok"] is False
+    assert result["output_token"] is None
+    assert "reparse" in result["error"].lower() or "symbolic" in result["error"].lower()
+    _assert_path_free(result)
+
+
+def test_create_rejects_directory_entity_replaced_after_selection(tmp_path):
+    api, _sources, _registrations, _source, output = _api(tmp_path)
+    confirmed = api.structure_source_confirm("1" * 32)["source_token"]
+    dry_run = api.surface_dry_run(confirmed, {"miller": [1, 0, 0]}, {})
+    destination = api.structure_output_select()
+    displaced = tmp_path / "displaced-output"
+    output.rename(displaced)
+    output.mkdir()
+
+    created = api.surface_create_candidates(
+        dry_run["operation_token"], destination["output_token"])
+
+    assert created["ok"] is False
+    assert created["jobs"] == []
+    assert "changed" in created["error"].lower()
+    assert not any(output.iterdir())
+    assert not any(displaced.iterdir())
+    _assert_path_free(created)
 
 
 def test_confirmed_candidate_creation_is_idempotent_and_stays_candidate(tmp_path):
@@ -349,12 +534,88 @@ def test_confirmed_candidate_creation_is_idempotent_and_stays_candidate(tmp_path
     manifest = yaml.safe_load((job_dirs[0] / "job.yaml").read_text(encoding="utf-8"))
     assert manifest["state"] == "CREATED"
     assert manifest["scientific_status"] == "candidate"
-    assert manifest["inputs"]["structure_hub"]["source"]["provider"] == "local"
-    assert manifest["inputs"]["structure_hub"]["source"]["raw_structure_hash"] == "a" * 64
+    source_evidence = manifest["inputs"]["structure_hub"]["source"]
+    assert source_evidence["provider"] == "local"
+    assert source_evidence["declared_formula"] == "Pt"
+    assert source_evidence["computed_formula"] == "Pt"
+    assert source_evidence["declared_raw_structure_sha256"] == "a" * 64
+    assert source_evidence["raw_structure_hash"] == "a" * 64
+    assert source_evidence["computed_structure_sha256"] == BULK_COMPUTED_SHA256
     assert manifest["inputs"]["structure_hub"]["builder"]["builder_version"] == "test-1"
     assert manifest["inputs"]["structure_hub"]["operation_id"] == dry_run["operation_token"]
+    assert manifest["registration_pending"] is False
+    assert manifest["registration"]["status"] == "registered"
     assert manifest["results"] == {}
     _assert_path_free(first)
+
+
+def test_registration_partial_failure_persists_and_replays_only_missing_job(tmp_path):
+    ledger = _FlakyLedger()
+    api, _sources, _registrations, _source, output = _api(
+        tmp_path, ledger=ledger, surface=_TwoCandidateSurface)
+    confirmed = api.structure_source_confirm("1" * 32)["source_token"]
+    dry_run = api.surface_dry_run(confirmed, {"miller": [1, 0, 0]}, {})
+    destination = api.structure_output_select()
+
+    partial = api.surface_create_candidates(
+        dry_run["operation_token"], destination["output_token"])
+
+    assert partial["ok"] is False
+    assert partial["partial"] is True
+    assert partial["discoverability"] == "partial"
+    assert len(partial["registration_pending"]) == 1
+    assert len(ledger.calls) == 2
+    batch = next(path for path in output.iterdir() if path.is_dir())
+    manifests = {
+        job.name: yaml.safe_load((job / "job.yaml").read_text(encoding="utf-8"))
+        for job in batch.iterdir()
+        if job.is_dir()
+    }
+    assert len(manifests) == 2
+    pending = [item for item in manifests.values() if item["registration_pending"]]
+    registered = [item for item in manifests.values() if not item["registration_pending"]]
+    assert len(pending) == len(registered) == 1
+    assert pending[0]["registration"]["status"] == "pending"
+    assert registered[0]["registration"]["status"] == "registered"
+    _assert_sensitive_free(pending[0])
+
+    completed = api.surface_create_candidates(
+        dry_run["operation_token"], destination["output_token"])
+    assert completed["ok"] is True
+    assert completed["replayed"] is True
+    assert completed["registration_pending"] == []
+    assert completed["discoverability"] == "complete"
+    assert len(ledger.calls) == 3
+    assert ledger.calls.count(next(name for name in ledger.calls if "term-01" in name)) == 1
+    assert ledger.calls.count(next(name for name in ledger.calls if "term-02" in name)) == 2
+
+    stable = api.surface_create_candidates(
+        dry_run["operation_token"], destination["output_token"])
+    assert stable == {**completed, "replayed": True}
+    assert len(ledger.calls) == 3
+
+
+def test_success_dtos_and_manifest_provenance_are_recursively_sanitized(tmp_path):
+    api, _sources, _registrations, _source, output = _api(
+        tmp_path, sources=_MaliciousSources(), surface=_MaliciousSurface)
+    selected = api.structure_source_select_local()
+    preview = api.structure_source_preview(selected["results"][0]["token"])
+    confirmed = api.structure_source_confirm(selected["results"][0]["token"])
+    dry_run = api.surface_dry_run(
+        confirmed["source_token"], {"miller": [1, 0, 0]}, {})
+    destination = api.structure_output_select()
+    created = api.surface_create_candidates(
+        dry_run["operation_token"], destination["output_token"])
+
+    assert preview["ok"] and dry_run["ok"] and created["ok"]
+    for dto in (selected, preview, confirmed, dry_run, destination, created):
+        _assert_sensitive_free(dto)
+        _assert_path_free(dto)
+    batch = next(path for path in output.iterdir() if path.is_dir())
+    manifest_path = next(path for path in batch.rglob("job.yaml"))
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    _assert_sensitive_free(manifest["inputs"]["structure_hub"])
+    _assert_path_free(manifest["inputs"]["structure_hub"])
 
 
 def test_creation_rejects_browser_path_and_unknown_output_token(tmp_path):
@@ -407,8 +668,11 @@ def test_real_local_provider_surface_core_and_api_complete_offline_closure(tmp_p
     assert capabilities["providers"][0]["available"] is True
     assert set(selected["results"][0]) == {
         "token", "source_id", "formula", "license", "citation",
-        "method", "structure_hash",
+        "method", "raw_structure_sha256", "declared_formula",
+        "declared_raw_structure_sha256", "computed_formula",
+        "computed_structure_sha256",
     }
+    assert selected["results"][0]["computed_structure_sha256"]
     assert preview["ok"] and preview["preview"]["view"]["natoms"] == 1
     assert preview["preview"]["top_view"]["projection"] == "xy"
     assert confirmed["ok"] and confirmed["confirmed"] is True

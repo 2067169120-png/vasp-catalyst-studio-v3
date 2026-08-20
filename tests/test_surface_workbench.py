@@ -6,6 +6,7 @@ import sys
 import numpy as np
 import pytest
 
+import vcstudio.generate.surface_workbench as surface_workbench
 from vcstudio.generate.structure_view import parse_positions
 from vcstudio.generate.surface_workbench import (
     build_slabs,
@@ -54,6 +55,18 @@ Na Cl
 Direct
 0.0 0.0 0.0
 0.5 0.5 0.5
+"""
+
+_TWO_IDENTICAL_LAYER_REGISTRIES = """two identical Cu layer registries
+1.0
+4.0 0.0 0.0
+0.0 4.0 0.0
+0.0 0.0 4.0
+Cu
+2
+Direct
+0.0 0.0 0.0
+0.0 0.0 0.5
 """
 
 _NON_ORTHOGONAL = """skew bulk
@@ -123,7 +136,7 @@ def test_structure_hash_and_builder_are_deterministic():
     assert first["poscar_sha256"] == second["poscar_sha256"]
     assert first["structure_hash"] == structure_hash(first["poscar"])
     assert first["provenance"]["builder"] == "vcstudio.surface_workbench"
-    assert first["provenance"]["builder_version"] == "1.0.0"
+    assert first["provenance"]["builder_version"] == "1.1.0"
     assert first["provenance"]["raw_structure_hash"]
     assert first["scientific_status"] == "geometric_candidate"
 
@@ -144,7 +157,7 @@ Direct
     assert structure_hash(first) == structure_hash(second)
 
 
-def test_termination_enumeration_deduplicates_translation_equivalent_layers():
+def test_termination_enumeration_keeps_each_layer_registry():
     simple = enumerate_terminations(_SIMPLE_CUBIC, [0, 0, 1])
     binary = enumerate_terminations(_TWO_TERMINATIONS, [0, 0, 1])
     assert len(simple) == 1
@@ -157,6 +170,67 @@ def test_termination_enumeration_deduplicates_translation_equivalent_layers():
     assert [item["termination_id"] for item in binary] == [
         item["termination_id"] for item in enumerate_terminations(_TWO_TERMINATIONS, [0, 0, 1])
     ]
+
+
+def test_geometrically_matching_layers_are_hints_not_deleted_terminations():
+    records = enumerate_terminations(_TWO_IDENTICAL_LAYER_REGISTRIES, [0, 0, 1])
+    candidates = build_slabs(
+        _TWO_IDENTICAL_LAYER_REGISTRIES,
+        {"miller": [0, 0, 1], "layers": 2},
+    )
+
+    assert len(records) == 2
+    assert len({record["termination_id"] for record in records}) == 2
+    assert len({record["geometric_signature"] for record in records}) == 1
+    assert len({record["approximate_equivalence_group_id"] for record in records}) == 1
+    assert [record["representative_offset"] for record in records] == [0.0, 0.5]
+    assert [record["equivalent_offsets"] for record in records] == [[0.0], [0.5]]
+    assert all(record["approximate_equivalent_offsets"] == [0.0, 0.5] for record in records)
+    assert all(record["validated_crystallographic_symmetry"] is False for record in records)
+    assert all(record["symmetry_mapping_evidence"] is None for record in records)
+    assert all(record["registry_entry_preserved"] is True for record in records)
+    assert {candidate["bottom_termination_id"] for candidate in candidates} == {
+        record["termination_id"] for record in records
+    }
+    assert {candidate["top_termination_id"] for candidate in candidates} == {
+        record["termination_id"] for record in records
+    }
+
+
+def test_opposite_signed_miller_surfaces_keep_distinct_identity_and_provenance():
+    positive_terms = enumerate_terminations(_SIMPLE_CUBIC, [0, 0, 2])
+    negative_terms = enumerate_terminations(_SIMPLE_CUBIC, [0, 0, -2])
+    positive = build_slabs(_SIMPLE_CUBIC, {"miller": [0, 0, 2], "layers": 3})[0]
+    negative = build_slabs(_SIMPLE_CUBIC, {"miller": [0, 0, -2], "layers": 3})[0]
+
+    assert positive_terms[0]["miller"] == [0, 0, 1]
+    assert negative_terms[0]["miller"] == [0, 0, -1]
+    assert positive_terms[0]["termination_id"] != negative_terms[0]["termination_id"]
+    assert positive_terms[0]["opposite_miller"] == negative_terms[0]["miller"]
+    assert positive["parameters"]["miller"] == [0, 0, 1]
+    assert negative["parameters"]["miller"] == [0, 0, -1]
+    assert positive["construction_hash"] != negative["construction_hash"]
+    assert positive["provenance"]["construction_hash"] == positive["construction_hash"]
+    assert negative["provenance"]["construction_hash"] == negative["construction_hash"]
+    # structure_hash remains a geometry-only hash and may coincide for a centrosymmetric one-atom slab.
+    assert positive["poscar_sha256"] != negative["poscar_sha256"]
+
+
+def test_strict_cvp_finds_high_shear_image_outside_original_plus_minus_one_box():
+    a_vec = np.array([1.0, 0.0, 0.0])
+    b_vec = np.array([100.49, 1.0, 0.0])
+    expected = np.hypot(0.245, 0.5)
+
+    planar = surface_workbench._pbc_xy_distance((0.0, 0.0), (0.0, 0.5), a_vec, b_vec)
+    cell = np.array([a_vec, b_vec, [0.0, 0.0, 12.0]])
+    periodic = surface_workbench._periodic_cross_distance(
+        np.array([[0.0, 0.0, 6.0]]),
+        np.array([[50.245, 0.5, 6.0]]),
+        cell,
+    )
+
+    assert planar == pytest.approx(expected, abs=1.0e-12)
+    assert periodic == pytest.approx(expected, abs=1.0e-12)
 
 
 def test_general_cubic_111_build_has_requested_layers_vacuum_and_fixed_bottom():

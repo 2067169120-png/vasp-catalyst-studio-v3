@@ -2,13 +2,16 @@
 
 本模块刻意只实现一个可审计的最小安全子集：右手、非退化的正交 VASP5 体相
 晶胞，以及绝对值不超过 :data:`MAX_MILLER_INDEX` 的三指标 Miller 面。超出该
-范围时显式拒绝，不用经验常数猜结构。表面 ``termination`` 和吸附位点都只是
-几何候选；这里不宣称催化活性、热力学稳定性或科学有效性。
+范围时显式拒绝，不用经验常数猜结构。Miller 指数仅按 gcd 约化，整体反号表示
+相反的有向极性面，绝不自动合并。表面 ``termination`` 和吸附位点都只是几何
+候选；这里不宣称催化活性、热力学稳定性或科学有效性。
 
 公开门面：
 
 ``build_slabs(bulk_poscar, request)``
-    枚举并去重 termination，构造带确定性 hash/provenance 的 slab 候选。
+    保留每个原子层 registry 的 termination 候选，构造带确定性
+    hash/provenance 的 slab 候选。近似几何签名只作为候选分组提示；没有显式
+    晶体对称映射证据时不据此删除任何 registry 条目。
 
 ``explore_sites(slab_poscar, request, adsorbate_poscar=None)``
     枚举 ontop/bridge/hollow/other 几何位点和近似等价组；可把传入的分子
@@ -21,6 +24,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import math
 from collections.abc import Mapping, Sequence
@@ -37,7 +41,7 @@ from vcstudio.generate.slab_builder import (
 from vcstudio.generate.structure_view import parse_positions
 
 BUILDER_NAME = "vcstudio.surface_workbench"
-BUILDER_VERSION = "1.0.0"
+BUILDER_VERSION = "1.1.0"
 MAX_MILLER_INDEX = 4
 DEFAULT_VACUUM = 15.0
 DEFAULT_LAYER_TOLERANCE = 0.35
@@ -51,6 +55,7 @@ _MAX_ADSORBATE_ATOMS = 200
 _MAX_SLAB_ATOMS_FOR_PLACEMENT = 2000
 _MAX_OCCUPIED_SITES = 32
 _MAX_PLACED_ADSORBATE_ATOMS = 1000
+_MAX_CVP_CANDIDATES = 250_000
 
 
 def _norm(vector: Sequence[float]) -> float:
@@ -150,9 +155,6 @@ def _normalize_miller(value: Any) -> tuple[int, int, int]:
             f"安全实现只支持约化后 |h|,|k|,|l| ≤ {MAX_MILLER_INDEX} 的低指数面；"
             "更高指数面需要独立晶体学库复核，已拒绝"
         )
-    first = next(component for component in values if component)
-    if first < 0:
-        values = [-component for component in values]
     return values[0], values[1], values[2]
 
 
@@ -179,11 +181,11 @@ def _integer_surface_basis(
     """构造整数 ``p,q,w``：``p×q=hkl`` 且 ``hkl·w=1``。"""
     h, k, ell = miller
     if h == 0 and k == 0:
-        # 约化和符号规范化后 l 必为 1。
+        # 约化后 l 为 ±1；保留整体反号，令 p×q 始终等于有向 Miller 法向。
         return (
             np.array([1, 0, 0], dtype=int),
-            np.array([0, 1, 0], dtype=int),
-            np.array([0, 0, 1], dtype=int),
+            np.array([0, ell, 0], dtype=int),
+            np.array([0, 0, ell], dtype=int),
         )
     gcd_hk, x0, y0 = _bezout_two(h, k)
     p = np.array([k // gcd_hk, -h // gcd_hk, 0], dtype=int)
@@ -282,7 +284,9 @@ def _surface_context(bulk_poscar: str, miller_value: Any) -> dict[str, Any]:
     return {
         "parsed": parsed,
         "cell": cell,
+        "input_structure_hash": structure_hash(bulk_poscar),
         "miller": miller,
+        "opposite_miller": tuple(-component for component in miller),
         "p": p,
         "q": q,
         "w": w,
@@ -334,18 +338,112 @@ def _layer_points(context: Mapping[str, Any], group_index: int, period: int) -> 
     )
 
 
+def _gauss_reduce_2d_basis(first: Sequence[float], second: Sequence[float]) -> np.ndarray:
+    """返回与输入生成同一二维格的 Gauss 约化基。
+
+    约化只执行整数交换和 ``b <- b - m*a``，因此不会改变格点集合。后续 CVP
+    仍使用奇异值给出的严格有限搜索界；约化的作用是让这个有证明的搜索界在
+    高度剪切、未约化的输入基上仍保持可审计规模，而不是把 ``±1`` 当作假设。
+    """
+    basis = np.asarray([first, second], dtype=float)
+    if basis.shape != (2, 3) or not np.isfinite(basis).all():
+        raise ValueError("二维周期格基必须是有限的 2×3 矩阵")
+    original_area = _norm(np.cross(basis[0], basis[1]))
+    if original_area <= 1.0e-12:
+        raise ValueError("二维周期格基退化，无法证明 minimum-image 完备性")
+    reduced = basis.copy()
+    for _iteration in range(256):
+        first_norm_sq = float(np.dot(reduced[0], reduced[0]))
+        second_norm_sq = float(np.dot(reduced[1], reduced[1]))
+        if second_norm_sq + 1.0e-14 < first_norm_sq:
+            reduced[[0, 1]] = reduced[[1, 0]]
+            continue
+        multiplier = math.floor(float(np.dot(reduced[1], reduced[0])) / first_norm_sq + 0.5)
+        if multiplier:
+            reduced[1] -= multiplier * reduced[0]
+            continue
+        reduced_area = _norm(np.cross(reduced[0], reduced[1]))
+        if not math.isclose(reduced_area, original_area, rel_tol=1.0e-10, abs_tol=1.0e-12):
+            raise ValueError("二维格基约化未保持晶格，已失败关闭")
+        return reduced
+    raise ValueError("二维格基约化未在安全迭代上限内收敛，已失败关闭")
+
+
+def _prepare_cvp_basis(basis: Sequence[Sequence[float]]) -> tuple[np.ndarray, float]:
+    matrix = np.asarray(basis, dtype=float)
+    if matrix.ndim != 2 or matrix.shape[1] != 3 or not np.isfinite(matrix).all():
+        raise ValueError("周期格基必须是有限的 N×3 矩阵")
+    singular_values = np.linalg.svd(matrix, compute_uv=False)
+    if len(singular_values) != len(matrix):
+        raise ValueError("周期格基秩不足，无法证明 closest-lattice-point 完备性")
+    sigma_min = float(singular_values[-1])
+    threshold = max(1.0e-12, float(singular_values[0]) * 1.0e-12)
+    if not math.isfinite(sigma_min) or sigma_min <= threshold:
+        raise ValueError("周期格基病态或退化，无法证明 closest-lattice-point 完备性")
+    return matrix, sigma_min
+
+
+def _closest_lattice_distance(
+    delta: Sequence[float],
+    prepared_basis: tuple[np.ndarray, float],
+    *,
+    exclude_zero: bool = False,
+) -> float:
+    """严格求 ``min_n ||delta - n B||``，其中 ``n`` 为整数向量。
+
+    先用一个允许的 Babai 候选得到上界 ``R``。若某整数候选可能更优，则由
+    ``||(n-c)B|| >= sigma_min*||n-c||`` 可知它必在以实数最小二乘中心 ``c``
+    为中心、半径 ``R/sigma_min`` 的系数球内。枚举包围该球的有限整数盒即为
+    完备搜索；盒子过大时明确拒绝，绝不退回原始基 ``±1`` 猜测。
+    """
+    basis, sigma_min = prepared_basis
+    vector = np.asarray(delta, dtype=float)
+    if vector.shape != (3,) or not np.isfinite(vector).all():
+        raise ValueError("minimum-image 位移必须是有限三维向量")
+    center, _residuals, _rank, _singular = np.linalg.lstsq(basis.T, vector, rcond=None)
+    rounded = np.floor(center + 0.5).astype(int)
+    seeds = [rounded]
+    for index in range(len(basis)):
+        for direction in (-1, 1):
+            candidate = rounded.copy()
+            candidate[index] += direction
+            seeds.append(candidate)
+    allowed_seeds = [seed for seed in seeds if not (exclude_zero and not np.any(seed))]
+    if not allowed_seeds:
+        raise ValueError("无法构造非零周期像候选，已失败关闭")
+    incumbent = min(_norm(vector - seed @ basis) for seed in allowed_seeds)
+    coefficient_radius = incumbent / sigma_min + 1.0e-12
+    bounds = []
+    candidate_count = 1
+    for value in center:
+        lower = math.ceil(float(value) - coefficient_radius - 1.0e-12)
+        upper = math.floor(float(value) + coefficient_radius + 1.0e-12)
+        if upper < lower:
+            lower = upper = math.floor(float(value) + 0.5)
+        candidate_count *= upper - lower + 1
+        if candidate_count > _MAX_CVP_CANDIDATES:
+            raise ValueError(
+                "closest-lattice-point 完备搜索超过安全候选上限，已失败关闭"
+            )
+        bounds.append(range(lower, upper + 1))
+    best = incumbent
+    for coefficients in itertools.product(*bounds):
+        if exclude_zero and not any(coefficients):
+            continue
+        best = min(best, _norm(vector - np.asarray(coefficients, dtype=float) @ basis))
+    return best
+
+
 def _pbc_xy_distance(
     first: Sequence[float], second: Sequence[float], a_vec: np.ndarray, b_vec: np.ndarray
 ) -> float:
-    best = math.inf
-    for ia in (-1, 0, 1):
-        for ib in (-1, 0, 1):
-            delta = (
-                (float(first[0]) - float(second[0]) + ia) * a_vec
-                + (float(first[1]) - float(second[1]) + ib) * b_vec
-            )
-            best = min(best, _norm(delta))
-    return best
+    reduced = _gauss_reduce_2d_basis(a_vec, b_vec)
+    prepared = _prepare_cvp_basis(reduced)
+    delta = (
+        (float(first[0]) - float(second[0])) * np.asarray(a_vec, dtype=float)
+        + (float(first[1]) - float(second[1])) * np.asarray(b_vec, dtype=float)
+    )
+    return _closest_lattice_distance(delta, prepared)
 
 
 def _layer_signature(context: Mapping[str, Any], group_index: int) -> dict[str, Any]:
@@ -379,9 +477,10 @@ def _layer_signature(context: Mapping[str, Any], group_index: int) -> dict[str, 
 
 
 def _termination_records(context: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """为每个原子层 registry 返回一个 termination，绝不按近似签名删层。"""
     groups = context["groups"]
     layer_signatures = [_layer_signature(context, index) for index in range(len(groups))]
-    by_signature: dict[str, dict[str, Any]] = {}
+    signatures: list[str] = []
     for start in range(len(groups)):
         sequence = []
         for offset in range(len(groups)):
@@ -390,33 +489,60 @@ def _termination_records(context: Mapping[str, Any]) -> list[dict[str, Any]]:
             next_phase = groups[next_index]["phase"] + (1.0 if next_index == 0 else 0.0)
             gap = (next_phase - groups[index]["phase"]) * context["plane_spacing"]
             sequence.append({"layer": layer_signatures[index], "next_gap": round(gap, 7)})
-        signature = _hash_payload(sequence)
-        record = by_signature.get(signature)
-        if record is None:
-            record = {
-                "termination_id": f"term-{signature[:20]}",
+        signatures.append(_hash_payload(sequence))
+    offsets_by_signature: dict[str, list[float]] = {}
+    for start, signature in enumerate(signatures):
+        offsets_by_signature.setdefault(signature, []).append(round(groups[start]["phase"], 10))
+
+    records = []
+    for start, signature in enumerate(signatures):
+        offset = round(groups[start]["phase"], 10)
+        approximate_group_payload = {
+            "schema": "vcstudio.termination-geometric-hint/v1",
+            "input_structure_hash": context["input_structure_hash"],
+            "miller": list(context["miller"]),
+            "geometric_signature": signature,
+        }
+        identity_payload = {
+            "schema": "vcstudio.termination-registry/v1",
+            "input_structure_hash": context["input_structure_hash"],
+            "miller": list(context["miller"]),
+            "registry_group": start,
+            "registry_offset": offset,
+            "geometric_signature": signature,
+        }
+        records.append(
+            {
+                "termination_id": f"term-{_hash_payload(identity_payload)[:20]}",
                 "geometric_signature": signature,
+                "approximate_equivalence_group_id": (
+                    f"geomtermgrp-{_hash_payload(approximate_group_payload)[:20]}"
+                ),
                 "representative_group": start,
-                "representative_offset": round(groups[start]["phase"], 10),
-                "equivalent_offsets": [],
+                "representative_offset": offset,
+                # 只有显式晶体对称映射才可向此字段添加其他 offset；当前最小
+                # 实现没有对称引擎，因此 registry 只声明自身。
+                "equivalent_offsets": [offset],
+                "approximate_equivalent_offsets": sorted(offsets_by_signature[signature]),
                 "surface_composition": dict(layer_signatures[start]["composition"]),
                 "classification": "geometric_termination_candidate",
-                "equivalence_kind": "deterministic_geometric_signature_approximation",
+                "equivalence_kind": "unvalidated_geometric_signature_candidate_only",
+                "validated_crystallographic_symmetry": False,
+                "symmetry_mapping_evidence": None,
+                "registry_entry_preserved": True,
+                "miller": list(context["miller"]),
+                "opposite_miller": list(context["opposite_miller"]),
+                "polarity_relation": "opposite_oriented_surface_not_deduplicated",
             }
-            by_signature[signature] = record
-        record["equivalent_offsets"].append(round(groups[start]["phase"], 10))
-    records = sorted(
-        by_signature.values(),
-        key=lambda item: (item["representative_offset"], item["termination_id"]),
-    )
+        )
+    records.sort(key=lambda item: (item["representative_offset"], item["termination_id"]))
     for index, record in enumerate(records):
         record["index"] = index
-        record["equivalent_offsets"] = sorted(set(record["equivalent_offsets"]))
     return records
 
 
 def enumerate_terminations(bulk_poscar: str, miller: Sequence[int]) -> list[dict[str, Any]]:
-    """枚举确定性 termination 候选并按几何签名近似去重。"""
+    """枚举所有原子层 registry；近似签名仅作未验证的候选分组提示。"""
     context = _surface_context(bulk_poscar, miller)
     return _termination_records(context)
 
@@ -446,7 +572,7 @@ def _select_terminations(
 
 
 def build_slabs(bulk_poscar: str, request: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """从正交体相 POSCAR 构造一个或全部去重后的 slab 候选。
+    """从正交体相 POSCAR 构造一个或全部原子层 registry 的 slab 候选。
 
     ``request`` 必需 ``miller``；可选 ``layers``、``vacuum``、``fixed_layers``、
     ``surface_sides`` 和 ``termination``/``termination_id``。``surface_sides`` 是
@@ -490,18 +616,17 @@ def build_slabs(bulk_poscar: str, request: Mapping[str, Any]) -> list[dict[str, 
     records = _termination_records(context)
     selection = request.get("termination_id", request.get("termination"))
     selected = _select_terminations(records, selection)
-    group_to_termination: dict[int, str] = {}
-    for record in records:
-        signature = record["geometric_signature"]
-        for group_index in range(len(context["groups"])):
-            probe = _termination_records_for_group(context, group_index)
-            if probe == signature:
-                group_to_termination[group_index] = record["termination_id"]
+    group_to_termination = {
+        int(record["representative_group"]): str(record["termination_id"])
+        for record in records
+    }
 
     requested_miller = [int(component) for component in request["miller"]]
     parameters = {
         "miller_requested": requested_miller,
         "miller": list(context["miller"]),
+        "opposite_miller": list(context["opposite_miller"]),
+        "miller_orientation": "signed_polar_surface_normal",
         "layers": layers,
         "vacuum": vacuum,
         "fixed_layers": fixed_layers,
@@ -557,16 +682,26 @@ def build_slabs(bulk_poscar: str, request: Mapping[str, Any]) -> list[dict[str, 
             poscar = fix_bottom_layers(poscar, fixed_layers)
         top_group = (start + layers - 1) % len(groups)
         candidate_parameters = {**parameters, "termination_id": termination["termination_id"]}
+        construction_hash = _hash_payload(
+            {
+                "schema": "vcstudio.surface-construction/v1",
+                "input_structure_hash": input_hash,
+                "parameters": candidate_parameters,
+            }
+        )
         provenance = {
             "schema": "vcstudio.surface-builder-provenance/v1",
             "builder": BUILDER_NAME,
             "builder_version": BUILDER_VERSION,
             "raw_structure_hash": raw_hash,
             "input_structure_hash": input_hash,
+            "construction_hash": construction_hash,
             "parameters": candidate_parameters,
             "capability": "orthogonal_bulk_low_index_deterministic_minimum",
             "limitations": [
-                "termination_equivalence_is_a_deterministic_geometric_signature_approximation",
+                "termination_geometric_signatures_are_unvalidated_grouping_hints_only",
+                "termination_registry_entries_are_not_removed_without_explicit_symmetry_mapping",
+                "opposite_signed_miller_surfaces_are_distinct_polarity_orientations",
                 "no_surface_energy_or_reconstruction_ranking",
                 "surface_sides_selects_workflow_faces_and_does_not_assert_slab_symmetry",
             ],
@@ -575,6 +710,7 @@ def build_slabs(bulk_poscar: str, request: Mapping[str, Any]) -> list[dict[str, 
             "poscar": poscar,
             "poscar_sha256": _sha256_text(poscar),
             "structure_hash": structure_hash(poscar),
+            "construction_hash": construction_hash,
             "natoms": len(elements),
             "termination": {
                 key: value
@@ -589,20 +725,6 @@ def build_slabs(bulk_poscar: str, request: Mapping[str, Any]) -> list[dict[str, 
         }
         candidates.append(candidate)
     return sorted(candidates, key=lambda item: item["termination"]["termination_id"])
-
-
-def _termination_records_for_group(context: Mapping[str, Any], start: int) -> str:
-    """重算一个 group 的循环签名，供 top/bottom termination 映射。"""
-    groups = context["groups"]
-    layer_signatures = [_layer_signature(context, index) for index in range(len(groups))]
-    sequence = []
-    for offset in range(len(groups)):
-        index = (start + offset) % len(groups)
-        next_index = (index + 1) % len(groups)
-        next_phase = groups[next_index]["phase"] + (1.0 if next_index == 0 else 0.0)
-        gap = (next_phase - groups[index]["phase"]) * context["plane_spacing"]
-        sequence.append({"layer": layer_signatures[index], "next_gap": round(gap, 7)})
-    return _hash_payload(sequence)
 
 
 def _surface_fractional_xy(cart: Sequence[float], cell: np.ndarray) -> tuple[float, float]:
@@ -656,15 +778,26 @@ def _surface_xy_basis(cell: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndar
     return normal, e1, e2
 
 
+def _wrap_xy_in_basis(point: Sequence[float], basis: np.ndarray) -> np.ndarray:
+    coefficients = np.linalg.solve(basis.T, np.asarray(point, dtype=float))
+    coefficients -= np.floor(coefficients)
+    return coefficients @ basis
+
+
 def _surface_atom_cloud(
     surface_atoms: Sequence[Mapping[str, Any]], cell: np.ndarray
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], np.ndarray]:
     _normal, e1, e2 = _surface_xy_basis(cell)
-    a_xy = np.array([float(np.dot(cell[0], e1)), float(np.dot(cell[0], e2))])
-    b_xy = np.array([float(np.dot(cell[1], e1)), float(np.dot(cell[1], e2))])
+    reduced = _gauss_reduce_2d_basis(cell[0], cell[1])
+    xy_basis = np.array(
+        [
+            [float(np.dot(vector, e1)), float(np.dot(vector, e2))]
+            for vector in reduced
+        ]
+    )
     cloud = []
     for atom in surface_atoms:
-        base = atom["xy"]
+        base = _wrap_xy_in_basis(atom["xy"], xy_basis)
         for ia in (-1, 0, 1):
             for ib in (-1, 0, 1):
                 cloud.append(
@@ -672,10 +805,10 @@ def _surface_atom_cloud(
                         "atom_index": atom["atom_index"],
                         "element": atom["element"],
                         "shift": (ia, ib),
-                        "xy": base + ia * a_xy + ib * b_xy,
+                        "xy": base + ia * xy_basis[0] + ib * xy_basis[1],
                     }
                 )
-    return cloud
+    return cloud, xy_basis
 
 
 def _nearest_shell(point: np.ndarray, cloud: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -736,7 +869,9 @@ def _enumerate_side_sites(
             atom["atom_index"],
         )
     )
-    cloud = _surface_atom_cloud(surface_atoms, cell)
+    cloud, reduced_xy_basis = _surface_atom_cloud(surface_atoms, cell)
+    for atom in surface_atoms:
+        atom["xy"] = _wrap_xy_in_basis(atom["xy"], reduced_xy_basis)
     candidates: dict[tuple[str, tuple[float, float]], dict[str, Any]] = {}
 
     def add(kind: str, frac_xy: Sequence[float], contributors: Sequence[int], coordination: int):
@@ -810,6 +945,7 @@ def _enumerate_side_sites(
         center_xy = np.array(
             [float(np.dot(center_xy_cart, e1)), float(np.dot(center_xy_cart, e2))]
         )
+        center_xy = _wrap_xy_in_basis(center_xy, reduced_xy_basis)
         shell = _nearest_shell(center_xy, cloud)
         add(
             "other",
@@ -995,16 +1131,19 @@ def _periodic_cross_distance(
     *,
     exclude_zero_shift: bool = False,
 ) -> float:
+    planar_basis = _gauss_reduce_2d_basis(cell[0], cell[1])
+    prepared = _prepare_cvp_basis(np.vstack([planar_basis, np.asarray(cell[2], dtype=float)]))
     best = math.inf
-    for ia in (-1, 0, 1):
-        for ib in (-1, 0, 1):
-            for ic in (-1, 0, 1):
-                if exclude_zero_shift and (ia, ib, ic) == (0, 0, 0):
-                    continue
-                shift = ia * cell[0] + ib * cell[1] + ic * cell[2]
-                for first_atom in first:
-                    for second_atom in second:
-                        best = min(best, _norm(first_atom - (second_atom + shift)))
+    for first_atom in first:
+        for second_atom in second:
+            best = min(
+                best,
+                _closest_lattice_distance(
+                    np.asarray(first_atom, dtype=float) - np.asarray(second_atom, dtype=float),
+                    prepared,
+                    exclude_zero=exclude_zero_shift,
+                ),
+            )
     return best
 
 

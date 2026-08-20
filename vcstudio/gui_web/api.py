@@ -20,6 +20,7 @@ import os
 import posixpath
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import threading
@@ -12837,9 +12838,50 @@ class Api:
             pass
 
     # ── Structure Source Hub + 通用 surface/site 向导 ───────────────────────
+    @classmethod
+    def _structure_sanitize(cls, value):
+        """递归移除 locator/凭据键并净化任意深度的嵌入式敏感文本。"""
+        if isinstance(value, dict):
+            out = {}
+            for raw_key, item in value.items():
+                key = str(raw_key)
+                normalized = re.sub(r'[^a-z0-9]+', '_', key.lower()).strip('_')
+                if (normalized in {
+                        'path', 'local_path', 'project_path', 'locator', 'root',
+                        'password', 'passwd', 'secret', 'credential', 'credentials',
+                        'authorization', 'cookie', 'api_key', 'apikey', 'access_token',
+                        'refresh_token', 'private_key'}
+                        or normalized.endswith(('_path', '_file'))):
+                    continue
+                out[key] = cls._structure_sanitize(item)
+            return out
+        if isinstance(value, (list, tuple)):
+            return [cls._structure_sanitize(item) for item in value]
+        if isinstance(value, str):
+            text = cls._workspace_public_text(value, limit=max(len(value), 400))
+            patterns = (
+                r'(?i)\b((?:https?|s3)://)[^/\s:@]+:[^@\s/]+@',
+                r'(?i)\bBearer\s+[^\s,;]+',
+                r'(?i)\bBasic\s+[A-Za-z0-9+/=]{8,}',
+                r'(?i)\b(?:password|passwd|pwd|secret|credential|api[-_ ]?key|'
+                r'access[-_ ]?token|refresh[-_ ]?token|private[-_ ]?key)'
+                r'\s*[:=]\s*[^\s,;&]+',
+                r'(?i)\b(?:github_pat_|gh[opusr]_|sk-)[A-Za-z0-9_-]{12,}',
+                r'\b(?:AKIA|ASIA)[A-Z0-9]{16}\b',
+                r'-----BEGIN[^\r\n]{0,40}PRIVATE KEY-----',
+            )
+            for index, pattern in enumerate(patterns):
+                replacement = (r'\1<credential-redacted>@'
+                               if index == 0 else '<credential-redacted>')
+                text = re.sub(pattern, replacement, text)
+            return text
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        return cls._structure_sanitize(str(value))
+
     @staticmethod
     def _structure_result_public(value):
-        """只投影搜索合同允许的字段，避免 gateway/local locator 意外外泄。"""
+        """投影声明身份与服务端内容证据；两类 hash 绝不互相冒充。"""
         raw = dict(value or {})
         token = str(raw.get('token') or raw.get('source_token') or '').strip()
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}', token):
@@ -12847,21 +12889,47 @@ class Api:
         provenance = raw.get('provenance') if isinstance(raw.get('provenance'), dict) else {}
         method = (raw.get('method') or raw.get('method_metadata')
                   or provenance.get('method') or {})
-        structure_hash = str(
-            raw.get('structure_hash') or raw.get('raw_structure_sha256')
-            or raw.get('structure_sha256') or provenance.get('raw_structure_sha256')
-            or '').strip().lower()
-        if not re.fullmatch(r'[a-f0-9]{64}', structure_hash):
-            raise ValueError('Structure source returned an invalid structure hash')
-        return {
+        declared_formula = str(
+            raw.get('declared_formula') or raw.get('formula')
+            or provenance.get('declared_formula') or '').strip()
+        declared_raw_hash = str(
+            raw.get('declared_raw_structure_sha256')
+            or raw.get('raw_structure_sha256') or raw.get('structure_hash')
+            or provenance.get('declared_raw_structure_sha256')
+            or provenance.get('raw_structure_sha256') or '').strip().lower()
+        if not declared_formula:
+            raise ValueError('Structure source returned no declared formula')
+        if not re.fullmatch(r'[a-f0-9]{64}', declared_raw_hash):
+            raise ValueError('Structure source returned an invalid declared raw SHA-256')
+        computed_formula_value = (
+            raw.get('computed_formula')
+            if raw.get('computed_formula') is not None
+            else provenance.get('computed_formula'))
+        computed_formula = (str(computed_formula_value).strip()
+                            if computed_formula_value is not None else None)
+        computed_hash_value = (
+            raw.get('computed_structure_sha256') or raw.get('structure_sha256')
+            or provenance.get('computed_structure_sha256'))
+        computed_hash = (str(computed_hash_value).strip().lower()
+                         if computed_hash_value is not None else None)
+        if (computed_formula is None) != (computed_hash is None):
+            raise ValueError('Computed structure formula and SHA-256 evidence must be paired')
+        if computed_hash is not None and not re.fullmatch(r'[a-f0-9]{64}', computed_hash):
+            raise ValueError('Structure source returned an invalid computed structure SHA-256')
+        return Api._structure_sanitize({
             'token': token,
             'source_id': str(raw.get('source_id') or raw.get('database_id') or '').strip(),
-            'formula': str(raw.get('formula') or '').strip(),
+            # Compatibility aliases retain their declared semantics.
+            'formula': declared_formula,
+            'raw_structure_sha256': declared_raw_hash,
+            'declared_formula': declared_formula,
+            'declared_raw_structure_sha256': declared_raw_hash,
+            'computed_formula': computed_formula,
+            'computed_structure_sha256': computed_hash,
             'license': copy.deepcopy(raw.get('license') or provenance.get('license')),
             'citation': copy.deepcopy(raw.get('citation') or provenance.get('citation')),
             'method': copy.deepcopy(method),
-            'structure_hash': structure_hash,
-        }
+        })
 
     @staticmethod
     def _structure_source_provenance(source):
@@ -12872,12 +12940,23 @@ class Api:
         provenance = result.get('provenance')
         if isinstance(provenance, dict):
             result = {**result, **provenance}
-        structure_hash = str(
-            result.get('raw_structure_hash') or result.get('raw_structure_sha256')
-            or result.get('structure_hash') or result.get('structure_sha256') or '').lower()
-        if not re.fullmatch(r'[a-f0-9]{64}', structure_hash):
+        declared_formula = str(
+            result.get('declared_formula') or result.get('formula') or '').strip()
+        computed_formula = str(result.get('computed_formula') or '').strip()
+        declared_raw_hash = str(
+            result.get('declared_raw_structure_sha256')
+            or result.get('raw_structure_hash') or result.get('raw_structure_sha256')
+            or result.get('structure_hash') or '').strip().lower()
+        computed_hash = str(
+            result.get('computed_structure_sha256')
+            or result.get('structure_sha256') or '').strip().lower()
+        if not declared_formula or not computed_formula:
+            raise ValueError('Confirmed structure is missing formula evidence')
+        if not re.fullmatch(r'[a-f0-9]{64}', declared_raw_hash):
             raise ValueError('Confirmed structure is missing its raw SHA-256 identity')
-        return {
+        if not re.fullmatch(r'[a-f0-9]{64}', computed_hash):
+            raise ValueError('Confirmed structure is missing its computed canonical SHA-256')
+        return Api._structure_sanitize({
             'provider': str(result.get('provider') or '').strip(),
             'database_id': str(
                 result.get('database_id') or result.get('source_id') or '').strip(),
@@ -12889,8 +12968,48 @@ class Api:
             'citation': copy.deepcopy(result.get('citation')),
             'method': copy.deepcopy(
                 result.get('method') or result.get('method_metadata') or {}),
-            'raw_structure_hash': structure_hash,
-        }
+            'declared_formula': declared_formula,
+            'computed_formula': computed_formula,
+            'declared_raw_structure_sha256': declared_raw_hash,
+            'computed_structure_sha256': computed_hash,
+            # Compatibility alias is explicitly the source's raw-byte identity.
+            'raw_structure_hash': declared_raw_hash,
+        })
+
+    @staticmethod
+    def _structure_verify_resolved(resolved):
+        """独立重算 canonical POSCAR 组成/hash，并绑定 provider 声明。"""
+        from vcstudio.generate.structure_sources import parse_structure_content
+
+        value = dict(resolved or {})
+        poscar = str(value.get('poscar') or value.get('raw_source') or '')
+        if not poscar:
+            raise ValueError('Confirmed source did not include structure content')
+        parsed = parse_structure_content(poscar, 'poscar')
+        combined = dict(value)
+        provenance = value.get('provenance')
+        if isinstance(provenance, dict):
+            combined = {**provenance, **combined}
+        declared_formula = str(
+            combined.get('declared_formula') or combined.get('formula') or '').strip()
+        computed_formula = str(combined.get('computed_formula') or '').strip()
+        computed_hash = str(
+            combined.get('computed_structure_sha256')
+            or combined.get('structure_sha256') or '').strip().lower()
+        if declared_formula != parsed.formula:
+            raise ValueError(
+                'Declared formula does not match the server-computed POSCAR composition')
+        if computed_formula != parsed.formula:
+            raise ValueError('Provider computed formula does not match server recomputation')
+        if computed_hash != parsed.structure_sha256:
+            raise ValueError('Provider canonical SHA-256 does not match server recomputation')
+        value['poscar'] = parsed.canonical_poscar
+        value['raw_source'] = parsed.canonical_poscar
+        value['declared_formula'] = declared_formula
+        value['computed_formula'] = parsed.formula
+        value['computed_structure_sha256'] = parsed.structure_sha256
+        value['structure_sha256'] = parsed.structure_sha256
+        return value
 
     @staticmethod
     def _structure_request(value, *, allowed, label):
@@ -12970,7 +13089,7 @@ class Api:
                     'network': bool(item.get('network')),
                     'reason': self._workspace_public_text(item.get('reason') or '') or None,
                 })
-            return {'ok': True, 'providers': public, 'error': None}
+            return {'ok': True, 'providers': self._structure_sanitize(public), 'error': None}
         except Exception as e:                            # noqa: BLE001 browser boundary
             return {'ok': False, 'providers': [],
                     'error': self._workspace_public_text(e)}
@@ -13030,14 +13149,14 @@ class Api:
                     raise ValueError('Structure preview did not include top-view data')
                 top_view = self._structure_top_view(poscar)
             provenance = self._structure_source_provenance(preview)
-            return {
+            return self._structure_sanitize({
                 'ok': True,
                 'preview': {**public, 'natoms': int(preview.get('natoms') or
                                                    view.get('natoms') or 0),
                             'view': view, 'top_view': top_view,
                             'provenance': provenance},
                 'error': None,
-            }
+            })
         except Exception as e:                            # noqa: BLE001 browser boundary
             return {'ok': False, 'preview': None,
                     'error': self._workspace_public_text(e)}
@@ -13065,10 +13184,15 @@ class Api:
                 raise ValueError('Structure confirmation returned an invalid token')
             resolved = dict(
                 self._structure_sources().resolve_confirmed(confirmation_token) or {})
-            if not (resolved.get('poscar') or resolved.get('raw_source')):
-                raise ValueError('Confirmed source did not include structure content')
+            resolved = self._structure_verify_resolved(resolved)
             source = confirmed.get('source') or resolved
             public = self._structure_result_public(source)
+            if (public['declared_formula'] != resolved['declared_formula']
+                    or public['computed_formula'] != resolved['computed_formula']
+                    or public['computed_structure_sha256']
+                    != resolved['computed_structure_sha256']):
+                raise ValueError(
+                    'Confirmed source identity does not match its resolved structure evidence')
             imported_token = uuid.uuid4().hex
             with self._structure_hub_lock:
                 self._structure_hub_prune()
@@ -13234,7 +13358,7 @@ class Api:
             if adsorbate_poscar is not None and not ready:
                 message = ('All adsorption candidates were rejected by collision/minimum-distance '
                            'checks; no candidate operation was created')
-                return {
+                return self._structure_sanitize({
                     'ok': False, 'ready': False, 'operation_token': None,
                     'dry_run': {
                         'scientific_status': 'candidate', 'source': source_provenance,
@@ -13243,16 +13367,16 @@ class Api:
                         'warnings': list(dict.fromkeys(all_warnings)),
                     },
                     'error': message,
-                }
+                })
             operation_token = uuid.uuid4().hex
-            public_dry_run = {
+            public_dry_run = self._structure_sanitize({
                 'scientific_status': 'candidate', 'source': source_provenance,
                 'adsorbate_source': adsorbate_provenance, 'slabs': public_slabs,
                 'candidate_count': len(private_candidates),
                 'rejections': all_rejections,
                 'warnings': list(dict.fromkeys(all_warnings)),
                 'submission': 'not_performed', 'promotion': 'not_performed',
-            }
+            })
             with self._structure_hub_lock:
                 self._structure_hub_prune()
                 self._structure_operations[operation_token] = {
@@ -13273,22 +13397,109 @@ class Api:
             if not path:
                 return {'ok': False, 'cancelled': True, 'output_token': None,
                         'selection': None, 'error': None}
-            canonical = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
-            if not os.path.isdir(canonical):
-                raise ValueError('Selected output folder is unavailable')
+            canonical = os.path.abspath(os.path.expanduser(path))
+            identity = self._structure_directory_identity(canonical)
             token = uuid.uuid4().hex
             label = os.path.basename(os.path.normpath(canonical)) or 'Selected folder'
-            label = re.sub(r'[\x00-\x1f]+', '', label)[:80] or 'Selected folder'
+            label = self._structure_sanitize(
+                re.sub(r'[\x00-\x1f]+', '', label)[:80] or 'Selected folder')
             with self._structure_hub_lock:
                 self._structure_hub_prune()
                 self._structure_output_selections[token] = {
                     'created_at': time.monotonic(), 'path': canonical, 'label': label,
+                    'identity': identity,
                 }
             return {'ok': True, 'cancelled': False, 'output_token': token,
                     'selection': {'label': label}, 'error': None}
         except Exception as e:                            # noqa: BLE001 browser boundary
             return {'ok': False, 'cancelled': False, 'output_token': None,
                     'selection': None, 'error': self._workspace_public_text(e)}
+
+    @staticmethod
+    def _structure_directory_identity(path):
+        """重开目录并取得不可由路径字符串替代的实体 identity。"""
+        canonical = os.path.abspath(os.path.expanduser(str(path or '')))
+        if not canonical or not os.path.isdir(canonical):
+            raise ValueError('Selected output folder is unavailable')
+        # 逐级拒绝 symlink/junction/reparse，避免 leaf 本身正常但祖先重定向。
+        probe = canonical
+        while True:
+            info = os.lstat(probe)
+            attributes = int(getattr(info, 'st_file_attributes', 0) or 0)
+            if stat.S_ISLNK(info.st_mode) or attributes & 0x400:
+                raise ValueError('Output folder must not traverse a reparse point or symlink')
+            parent = os.path.dirname(probe)
+            if not parent or parent == probe:
+                break
+            probe = parent
+
+        if os.name == 'nt':
+            import ctypes
+            from ctypes import wintypes
+
+            class _ByHandleFileInformation(ctypes.Structure):
+                _fields_ = [
+                    ('dwFileAttributes', wintypes.DWORD),
+                    ('ftCreationTime', wintypes.FILETIME),
+                    ('ftLastAccessTime', wintypes.FILETIME),
+                    ('ftLastWriteTime', wintypes.FILETIME),
+                    ('dwVolumeSerialNumber', wintypes.DWORD),
+                    ('nFileSizeHigh', wintypes.DWORD),
+                    ('nFileSizeLow', wintypes.DWORD),
+                    ('nNumberOfLinks', wintypes.DWORD),
+                    ('nFileIndexHigh', wintypes.DWORD),
+                    ('nFileIndexLow', wintypes.DWORD),
+                ]
+
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            create_file = kernel32.CreateFileW
+            create_file.argtypes = [
+                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+            ]
+            create_file.restype = wintypes.HANDLE
+            get_info = kernel32.GetFileInformationByHandle
+            get_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ByHandleFileInformation)]
+            get_info.restype = wintypes.BOOL
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = [wintypes.HANDLE]
+            close_handle.restype = wintypes.BOOL
+            handle = create_file(
+                canonical,
+                0x0080,          # FILE_READ_ATTRIBUTES
+                0x0007,          # FILE_SHARE_READ | WRITE | DELETE
+                None, 3,         # OPEN_EXISTING
+                0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+                None,
+            )
+            invalid = ctypes.c_void_p(-1).value
+            if handle in (None, invalid):
+                raise OSError(ctypes.get_last_error(), 'Unable to reopen output folder')
+            try:
+                identity = _ByHandleFileInformation()
+                if not get_info(handle, ctypes.byref(identity)):
+                    raise OSError(ctypes.get_last_error(), 'Unable to identify output folder')
+                if int(identity.dwFileAttributes) & 0x400:
+                    raise ValueError('Output folder must not be a reparse point')
+                return {
+                    'kind': 'windows-file-id',
+                    'volume_serial': int(identity.dwVolumeSerialNumber),
+                    'file_id': ((int(identity.nFileIndexHigh) << 32)
+                                | int(identity.nFileIndexLow)),
+                }
+            finally:
+                close_handle(handle)
+
+        flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+        descriptor = os.open(canonical, flags)
+        try:
+            reopened = os.fstat(descriptor)
+            if not stat.S_ISDIR(reopened.st_mode):
+                raise ValueError('Selected output is not a directory')
+            return {'kind': 'posix-inode', 'device': int(reopened.st_dev),
+                    'inode': int(reopened.st_ino)}
+        finally:
+            os.close(descriptor)
 
     @staticmethod
     def _structure_candidate_stem(candidate, index):
@@ -13298,6 +13509,96 @@ class Api:
         hint = str(site.get('site_id') or term.get('termination_id') or f'candidate-{index + 1}')
         safe = re.sub(r'[^A-Za-z0-9_.-]+', '-', hint).strip('-.')[:48]
         return f'{index + 1:03d}-{safe or "candidate"}-{candidate["structure_hash"][:10]}'
+
+    def _structure_resume_registration(self, operation, *, replayed):
+        """只补 registration_pending 作业；全部入账前绝不标 complete。"""
+        pending = []
+        warnings = []
+        jobs = []
+        now = datetime.now(timezone.utc).isoformat()
+        for record in operation.get('job_records') or []:
+            public = copy.deepcopy(record['public'])
+            job_dir = os.path.join(operation['final_batch'], record['job_name'])
+            manifest = self._manifest.load_manifest(job_dir)
+            if not isinstance(manifest, dict):
+                public['registration_pending'] = True
+                pending.append(public['job_id'])
+                warnings.append('A candidate manifest is unreadable; ledger registration remains pending.')
+                jobs.append(public)
+                continue
+            registration = dict(manifest.get('registration') or {})
+            already_registered = (
+                manifest.get('registration_pending') is False
+                and registration.get('status') == 'registered'
+            )
+            if already_registered:
+                public['registration_pending'] = False
+                jobs.append(public)
+                continue
+            attempts = int(registration.get('attempts') or 0) + 1
+            try:
+                self._ledger.register(job_dir)
+            except Exception as exc:                      # noqa: BLE001 durable pending evidence
+                safe_error = self._structure_sanitize(str(exc))
+                manifest['registration_pending'] = True
+                manifest['registration'] = {
+                    'status': 'pending', 'attempts': attempts,
+                    'last_attempt_at': now, 'last_error': safe_error,
+                }
+                try:
+                    self._manifest.save_manifest(job_dir, manifest)
+                except Exception:                         # noqa: BLE001 original pending flag persists
+                    warnings.append(
+                        'Ledger registration failed and its latest error could not be persisted; '
+                        'the original registration_pending marker remains authoritative.')
+                pending.append(public['job_id'])
+                public['registration_pending'] = True
+                warnings.append('Candidate ledger registration remains pending: ' + safe_error)
+                jobs.append(public)
+                continue
+            manifest['registration_pending'] = False
+            manifest['registration'] = {
+                'status': 'registered', 'attempts': attempts,
+                'last_attempt_at': now, 'registered_at': now, 'last_error': None,
+            }
+            try:
+                self._manifest.save_manifest(job_dir, manifest)
+            except Exception as exc:                       # noqa: BLE001 replay may safely re-register
+                pending.append(public['job_id'])
+                public['registration_pending'] = True
+                warnings.append(
+                    'Ledger accepted a candidate but the registered marker was not durable; '
+                    'registration remains pending for an idempotent replay: '
+                    + self._structure_sanitize(str(exc)))
+            else:
+                public['registration_pending'] = False
+            jobs.append(public)
+
+        if pending:
+            result = self._structure_sanitize({
+                'ok': False, 'partial': True, 'replayed': bool(replayed),
+                'operation_id': operation['operation_id'],
+                'scientific_status': 'candidate', 'batch_id': operation['batch_id'],
+                'jobs': jobs, 'registration_pending': pending,
+                'discoverability': 'partial', 'warnings': list(dict.fromkeys(warnings)),
+                'submission': 'not_performed', 'promotion': 'not_performed',
+                'error': 'Candidate files exist, but ledger registration is incomplete.',
+            })
+            operation['status'] = 'registration_pending'
+            operation['last_result'] = copy.deepcopy(result)
+            return result
+        result = self._structure_sanitize({
+            'ok': True, 'partial': False, 'replayed': bool(replayed),
+            'operation_id': operation['operation_id'],
+            'scientific_status': 'candidate', 'batch_id': operation['batch_id'],
+            'jobs': jobs, 'registration_pending': [], 'discoverability': 'complete',
+            'warnings': list(dict.fromkeys(warnings)),
+            'submission': 'not_performed', 'promotion': 'not_performed',
+            'error': None,
+        })
+        operation['status'] = 'complete'
+        operation['result'] = copy.deepcopy(result)
+        return result
 
     def surface_create_candidates(self, operation_token, output_token):
         """显式确认后原子创建 candidate 批次；相同 operation token 幂等重放。"""
@@ -13323,6 +13624,19 @@ class Api:
                     failure['error'] = 'Candidate operation is bound to a different output selection'
                     return failure
                 return {**copy.deepcopy(operation['result']), 'replayed': True}
+            try:
+                current_identity = self._structure_directory_identity(destination['path'])
+            except Exception as exc:                       # noqa: BLE001 fail closed at entity boundary
+                failure['error'] = self._structure_sanitize(str(exc))
+                return failure
+            if current_identity != destination.get('identity'):
+                failure['error'] = 'The selected output directory entity changed after selection.'
+                return failure
+            if operation.get('status') == 'registration_pending':
+                if operation.get('destination_id') != destination_id:
+                    failure['error'] = 'Candidate operation is bound to a different output selection'
+                    return failure
+                return self._structure_resume_registration(operation, replayed=True)
             if operation.get('status') == 'creating':
                 failure['error'] = 'Candidate operation is already being created'
                 return failure
@@ -13351,7 +13665,7 @@ class Api:
                     poscar_path = os.path.join(job_dir, 'POSCAR')
                     with open(poscar_path, 'w', encoding='utf-8', newline='\n') as handle:
                         handle.write(candidate['poscar'])
-                    hub = {
+                    hub = self._structure_sanitize({
                         'schema': 'vcstudio.structure-hub/v1',
                         'operation_id': operation_id,
                         'scientific_status': 'candidate',
@@ -13364,7 +13678,7 @@ class Api:
                         'site': copy.deepcopy(candidate.get('site')),
                         'structure_hash': candidate['structure_hash'],
                         'limitations': copy.deepcopy(candidate.get('limitations') or []),
-                    }
+                    })
                     warnings = [
                         'Candidate geometry only: no calculation was submitted and no scientific '
                         'state was promoted.',
@@ -13374,15 +13688,17 @@ class Api:
                             'Geometric adsorption site candidate; this is not an active-site claim.')
                     manifest = self._manifest.new_manifest(
                         job_id=job_id,
-                        system=candidate['poscar'].splitlines()[0].strip() or job_id,
+                        system=self._structure_sanitize(
+                            candidate['poscar'].splitlines()[0].strip() or job_id),
                         task_type='relax', calc_type='slab',
                         inputs={
                             'natoms': int(candidate.get('natoms') or 0),
                             'poscar_sha256': candidate['poscar_sha256'],
                             'recipe': {
                                 'kind': 'surface_workbench',
-                                'builder': copy.deepcopy(candidate.get('builder') or {}),
-                                'parameters': copy.deepcopy(
+                                'builder': self._structure_sanitize(
+                                    candidate.get('builder') or {}),
+                                'parameters': self._structure_sanitize(
                                     candidate.get('slab_parameters') or {}),
                             },
                             'structure_hub': hub,
@@ -13392,33 +13708,31 @@ class Api:
                     manifest['job_uuid'] = job_id
                     manifest['scientific_status'] = 'candidate'
                     manifest['submission_ready'] = False
+                    manifest['registration_pending'] = True
+                    manifest['registration'] = {
+                        'status': 'pending', 'attempts': 0,
+                        'last_attempt_at': None, 'last_error': None,
+                    }
                     self._manifest.save_manifest(job_dir, manifest)
                     staged_dirs.append((job_dir, job_name))
                     public_jobs.append({
                         'job_id': job_id, 'structure_hash': candidate['structure_hash'],
                         'scientific_status': 'candidate', 'state': 'CREATED',
-                        'submission_ready': False,
+                        'submission_ready': False, 'registration_pending': True,
                     })
+                if self._structure_directory_identity(root) != destination['identity']:
+                    raise RuntimeError('The selected output directory entity changed during creation')
                 os.replace(stage, final_batch)
                 stage = None
-                warnings = []
-                for _old_dir, job_name in staged_dirs:
-                    try:
-                        self._ledger.register(os.path.join(final_batch, job_name))
-                    except Exception as exc:               # noqa: BLE001 files remain authoritative
-                        warnings.append(
-                            'Candidate files were created but ledger registration failed: '
-                            + self._workspace_public_text(exc))
-                result = {
-                    'ok': True, 'replayed': False, 'operation_id': operation_id,
-                    'scientific_status': 'candidate',
-                    'batch_id': batch_id, 'jobs': public_jobs, 'warnings': warnings,
-                    'submission': 'not_performed', 'promotion': 'not_performed',
-                    'error': None,
-                }
-                operation['status'] = 'complete'
-                operation['result'] = copy.deepcopy(result)
-                return result
+                operation.update({
+                    'status': 'registration_pending', 'operation_id': operation_id,
+                    'batch_id': batch_id, 'final_batch': final_batch,
+                    'job_records': [
+                        {'job_name': job_name, 'public': public}
+                        for (_old_dir, job_name), public in zip(staged_dirs, public_jobs)
+                    ],
+                })
+                return self._structure_resume_registration(operation, replayed=False)
             except Exception as e:                        # noqa: BLE001 atomic stage is recoverable
                 operation['status'] = 'prepared'
                 operation.pop('destination_id', None)

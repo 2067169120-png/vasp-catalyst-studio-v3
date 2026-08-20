@@ -555,7 +555,105 @@
     outputSelectionToken: null,
     outputDisplayName: '',
     created: false,
+    // Every asynchronous bridge request receives one monotonically increasing generation.
+    // The active slot, stable request fingerprint, and explicit role/token owner must all
+    // still match before a response is allowed to mutate UI state.
+    intentGeneration: 0,
+    activeRequests: {
+      search: null, local: { bulk: null, ads: null },
+      preview: { bulk: null, ads: null }, confirm: { bulk: null, ads: null },
+      dryRun: null, output: null, create: null,
+    },
+    previewOwners: { bulk: null, ads: null },
+    sourceTokenOwners: { bulk: null, ads: null },
+    resultOwners: { bulk: null, ads: null },
+    sourceIntentOwners: { bulk: null, ads: null },
+    operationOwner: null,
+    outputTokenOwner: null,
   };
+
+  function stableIntentValue(value) {
+    if (Array.isArray(value)) return value.map(stableIntentValue);
+    if (!value || typeof value !== 'object') return value;
+    return Object.keys(value).sort().reduce((result, key) => {
+      result[key] = stableIntentValue(value[key]);
+      return result;
+    }, {});
+  }
+
+  function requestFingerprint(kind, role, payload) {
+    return `${kind}|${role || '-'}|${JSON.stringify(stableIntentValue(payload || {}))}`;
+  }
+
+  const roleRequestKinds = new Set(['local', 'preview', 'confirm']);
+
+  function requestSlot(kind, role) {
+    const slots = SourceHubState.activeRequests[kind];
+    return roleRequestKinds.has(kind) ? slots[role] : slots;
+  }
+
+  function setRequestSlot(kind, role, value) {
+    const slots = SourceHubState.activeRequests[kind];
+    if (roleRequestKinds.has(kind)) slots[role] = value;
+    else SourceHubState.activeRequests[kind] = value;
+  }
+
+  function beginIntentRequest(kind, role, payload) {
+    const request = {
+      kind, role: role || '', payload: stableIntentValue(payload || {}),
+      generation: ++SourceHubState.intentGeneration,
+      fingerprint: requestFingerprint(kind, role, payload),
+    };
+    setRequestSlot(kind, role, request);
+    return request;
+  }
+
+  function beginSourceIntentRequest(kind, role, payload) {
+    const request = beginIntentRequest(kind, role, payload);
+    SourceHubState.sourceIntentOwners[role] = request;
+    if (kind === 'search' || kind === 'local') SourceHubState.resultOwners[role] = null;
+    return request;
+  }
+
+  function invalidateIntentRequest(kind, role) {
+    if (requestSlot(kind, role)) {
+      ++SourceHubState.intentGeneration;
+      setRequestSlot(kind, role, null);
+    }
+  }
+
+  function requestIsCurrent(request, payload) {
+    return !!request && requestSlot(request.kind, request.role) === request &&
+      request.fingerprint === requestFingerprint(request.kind, request.role, payload);
+  }
+
+  function sourceRequestIsCurrent(request, payload) {
+    return requestIsCurrent(request, payload) &&
+      SourceHubState.sourceIntentOwners[request.role] === request;
+  }
+
+  function ownedSourceToken(role) {
+    const owner = SourceHubState.sourceTokenOwners[role];
+    return owner && owner.role === role && owner.token === SourceHubState.sourceTokens[role]
+      ? owner : null;
+  }
+
+  function currentOperationOwner() {
+    const owner = SourceHubState.operationOwner;
+    const bulkOwner = ownedSourceToken('bulk');
+    const adsOwner = ownedSourceToken('ads');
+    if ((SourceHubState.sourceTokens.bulk && !bulkOwner) ||
+        (SourceHubState.sourceTokens.ads && !adsOwner)) return null;
+    return owner && owner.token === SourceHubState.operationToken &&
+      owner.bulkOwner === bulkOwner && owner.adsOwner === adsOwner ? owner : null;
+  }
+
+  function currentOutputOwner() {
+    const owner = SourceHubState.outputTokenOwner;
+    const operation = currentOperationOwner();
+    return owner && operation && owner.token === SourceHubState.outputSelectionToken &&
+      owner.operationOwner === operation ? owner : null;
+  }
 
   const sourceRoleIds = role => ({
     results: `src-${role}-results`, preview: `src-${role}-preview`,
@@ -682,16 +780,20 @@
       token,
       provider: publicText(method && typeof method === 'object' ? method.provider : ''),
       sourceId: publicText(row.source_id || row.sourceId || row.database_id || row.material_id || ''),
-      formula: publicText(row.formula || ''),
+      declaredFormula: publicText(row.declared_formula || row.formula || ''),
+      computedFormula: publicText(row.computed_formula || ''),
       license: metadataSummary(row.license, ['name', 'spdx_id', 'url']),
       citation: metadataSummary(row.citation, ['text', 'doi', 'url']),
       method: publicText(methodSummary(row)),
-      structureHash: publicText(row.structure_hash || row.structureHash || row.raw_structure_hash || ''),
+      declaredRawHash: publicText(row.declared_raw_structure_sha256 ||
+        row.raw_structure_sha256 || row.raw_structure_hash || ''),
+      computedHash: publicText(row.computed_structure_sha256 || row.structure_sha256 ||
+        row.structure_hash || row.structureHash || ''),
     };
   }
 
   function sourceResultHtml(row, role) {
-    const pieces = [row.provider, row.sourceId, row.formula].filter(Boolean);
+    const pieces = [row.provider, row.sourceId, row.declaredFormula].filter(Boolean);
     const evidence = [];
     if (row.license) evidence.push(i18n('structure.hub.result.license', 'License: {value}', {
       value: row.license,
@@ -702,8 +804,13 @@
     if (row.method) evidence.push(i18n('structure.hub.result.method', 'Method: {value}', {
       value: row.method,
     }));
-    if (row.structureHash) evidence.push(i18n('structure.hub.result.hash', 'Structure hash: {value}', {
-      value: row.structureHash,
+    if (row.computedFormula) evidence.push(i18n('structure.hub.result.computed_formula',
+      'Server-computed formula: {value}', { value: row.computedFormula }));
+    if (row.declaredRawHash) evidence.push(i18n('structure.hub.result.declared_raw_hash',
+      'Declared raw-source SHA-256: {value}', { value: row.declaredRawHash }));
+    if (row.computedHash) evidence.push(i18n('structure.hub.result.computed_hash',
+      'Server-computed canonical SHA-256: {value}', {
+      value: row.computedHash,
     }));
     return '<article class="source-result" role="listitem">' +
       `<div><b>${VCS.esc(pieces.join(' · ') || i18n('structure.hub.result.unnamed', 'Structure result'))}</b>` +
@@ -713,9 +820,20 @@
         'structure.hub.result.preview', 'Preview'))}</button></article>`;
   }
 
-  function showSourceResults(role, rows) {
+  function showSourceResults(role, rows, owner) {
     const normalized = (Array.isArray(rows) ? rows : []).map(normalizeSourceResult).filter(Boolean);
     SourceHubState.results[role] = normalized;
+    const tokens = normalized.map(row => row.token);
+    const existingOwner = SourceHubState.resultOwners[role];
+    if (owner && owner.role === role) {
+      SourceHubState.resultOwners[role] = {
+        role, generation: owner.generation, requestFingerprint: owner.fingerprint, tokens,
+      };
+    } else if (!existingOwner ||
+        requestFingerprint('results', role, existingOwner.tokens) !==
+          requestFingerprint('results', role, tokens)) {
+      SourceHubState.resultOwners[role] = null;
+    }
     const box = $(sourceRoleIds(role).results);
     if (!box) return normalized;
     box.innerHTML = normalized.length
@@ -724,27 +842,38 @@
     return normalized;
   }
 
-  function invalidateDryRun(message) {
-    SourceHubState.dryRun = null;
-    SourceHubState.operationToken = null;
+  function invalidateOutputSelection() {
     SourceHubState.outputSelectionToken = null;
+    SourceHubState.outputTokenOwner = null;
     SourceHubState.outputDisplayName = '';
     SourceHubState.created = false;
-    const result = $('surface-dry-result');
-    if (result) result.textContent = message || '';
-    const output = $('surface-output-select');
+    invalidateIntentRequest('output', '');
+    invalidateIntentRequest('create', '');
     const outputName = $('surface-output-name');
     const ack = $('surface-candidate-ack');
     const create = $('surface-create-candidates');
-    if (output) output.disabled = true;
     if (outputName) outputName.textContent = '';
     if (ack) { ack.checked = false; ack.disabled = true; }
     if (create) create.disabled = true;
+  }
+
+  function invalidateDryRun(message) {
+    SourceHubState.dryRun = null;
+    SourceHubState.operationToken = null;
+    SourceHubState.operationOwner = null;
+    invalidateIntentRequest('dryRun', '');
+    invalidateOutputSelection();
+    const result = $('surface-dry-result');
+    if (result) result.textContent = message || '';
+    const output = $('surface-output-select');
+    if (output) output.disabled = true;
     setCreateStatus('');
   }
 
   function resetSourceConfirmation(role) {
     SourceHubState.sourceTokens[role] = null;
+    SourceHubState.sourceTokenOwners[role] = null;
+    invalidateIntentRequest('confirm', role);
     const confirm = $(sourceRoleIds(role).confirm);
     if (confirm) confirm.disabled = !SourceHubState.previews[role];
     if (role === 'bulk') {
@@ -796,43 +925,100 @@
     }).filter(point => point && Number.isFinite(point.x) && Number.isFinite(point.y));
   }
 
-  function topViewPoints(preview) {
+  function topViewGeometry(preview) {
     const top = (preview && preview.top_view) || {};
-    const raw = Array.isArray(top.points) ? top.points : (Array.isArray(top.atoms) ? top.atoms : []);
+    if (top.projection != null && top.projection !== 'xy') {
+      return { points: [], cell: null, truncated: top.truncated === true };
+    }
+    const cell = Array.isArray(top.cell) ? top.cell : [];
+    const a = Array.isArray(cell[0]) ? cell[0].slice(0, 2).map(Number) : [];
+    const b = Array.isArray(cell[1]) ? cell[1].slice(0, 2).map(Number) : [];
+    if (a.length !== 2 || b.length !== 2 || !a.concat(b).every(Number.isFinite)) {
+      return { points: [], cell: null, truncated: top.truncated === true };
+    }
+    const determinant = a[0] * b[1] - a[1] * b[0];
+    const scale = Math.max(1, Math.hypot(a[0], a[1]) * Math.hypot(b[0], b[1]));
+    if (!Number.isFinite(determinant) || Math.abs(determinant) <= 1e-10 * scale) {
+      return { points: [], cell: null, truncated: top.truncated === true };
+    }
+    let raw = Array.isArray(top.points) ? top.points : (Array.isArray(top.atoms) ? top.atoms : []);
+    if (!raw.length) raw = xyzTopPoints(top.xyz || (preview && preview.view && preview.view.xyz));
     const points = raw.map(point => {
       const coords = point.coords || point.position || [];
+      const fractional = point.fractional || point.fractional_coords || point.frac || [];
+      let u = +(point.u != null ? point.u : fractional[0]);
+      let v = +(point.v != null ? point.v : fractional[1]);
+      if (!Number.isFinite(u) || !Number.isFinite(v)) {
+        const x = +(point.x != null ? point.x : coords[0]);
+        const y = +(point.y != null ? point.y : coords[1]);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+        u = (x * b[1] - y * b[0]) / determinant;
+        v = (a[0] * y - a[1] * x) / determinant;
+      }
+      // Draw the periodic representative inside the exact projected a/b unit cell.
+      u -= Math.floor(u);
+      v -= Math.floor(v);
       return {
         element: publicText(point.element || point.symbol || point.label || ''),
-        x: +(point.x != null ? point.x : coords[0]),
-        y: +(point.y != null ? point.y : coords[1]),
+        u, v, x: u * a[0] + v * b[0], y: u * a[1] + v * b[1],
         group: publicText(point.equivalence_group || point.group || ''),
       };
     }).filter(point => Number.isFinite(point.x) && Number.isFinite(point.y));
-    if (points.length) return points;
-    return xyzTopPoints(top.xyz || (preview && preview.view && preview.view.xyz));
+    return { points, cell: { a, b }, truncated: top.truncated === true };
   }
 
   function renderTopView(role, preview) {
     const box = $(sourceRoleIds(role).top);
     if (!box) return;
     box.textContent = '';
-    const points = topViewPoints(preview);
-    if (!points.length || typeof document.createElementNS !== 'function') {
-      box.textContent = i18n('structure.hub.preview.no_top', 'No top-view coordinates');
+    const geometry = topViewGeometry(preview);
+    if (geometry.truncated) {
+      const warning = document.createElement('p');
+      warning.className = 'source-warning';
+      warning.setAttribute('role', 'status');
+      warning.textContent = i18n('structure.hub.preview.top_truncated',
+        'Top view is truncated; not all atoms are shown.');
+      box.appendChild(warning);
+    }
+    if (!geometry.cell || !geometry.points.length || typeof document.createElementNS !== 'function') {
+      const unavailable = document.createElement('p');
+      unavailable.textContent = i18n('structure.hub.preview.top_cell_required',
+        'Exact top view unavailable: a non-degenerate projected unit cell and coordinates are required.');
+      box.appendChild(unavailable);
       return;
     }
-    const xs = points.map(point => point.x), ys = points.map(point => point.y);
+    const a = geometry.cell.a, b = geometry.cell.b;
+    const corners = [
+      { x: 0, y: 0 }, { x: a[0], y: a[1] },
+      { x: a[0] + b[0], y: a[1] + b[1] }, { x: b[0], y: b[1] },
+    ];
+    const xs = corners.map(point => point.x), ys = corners.map(point => point.y);
     const minX = Math.min.apply(null, xs), maxX = Math.max.apply(null, xs);
     const minY = Math.min.apply(null, ys), maxY = Math.max.apply(null, ys);
-    const dx = Math.max(maxX - minX, 1), dy = Math.max(maxY - minY, 1);
+    const dx = maxX - minX, dy = maxY - minY;
+    const scale = Math.min(276 / dx, 176 / dy);
+    const centerX = (minX + maxX) / 2, centerY = (minY + maxY) / 2;
+    // A single scale factor preserves lengths/angles in the xy projection.
+    const projectX = x => 160 + (x - centerX) * scale;
+    const projectY = y => 110 - (y - centerY) * scale;
     const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     svg.setAttribute('viewBox', '0 0 320 220');
     svg.setAttribute('aria-hidden', 'true');
-    points.forEach((point, index) => {
+    svg.setAttribute('data-top-view-projection', 'exact-cell-fractional');
+    const polygon = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
+    polygon.setAttribute('points', corners.map(point =>
+      `${projectX(point.x)},${projectY(point.y)}`).join(' '));
+    polygon.setAttribute('fill', 'none');
+    polygon.setAttribute('stroke', 'currentColor');
+    polygon.setAttribute('data-projected-unit-cell', 'true');
+    svg.appendChild(polygon);
+    geometry.points.forEach((point, index) => {
       const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-      circle.setAttribute('cx', String(22 + ((point.x - minX) / dx) * 276));
-      circle.setAttribute('cy', String(198 - ((point.y - minY) / dy) * 176));
+      circle.setAttribute('cx', String(projectX(point.x)));
+      circle.setAttribute('cy', String(projectY(point.y)));
       circle.setAttribute('r', '7');
+      circle.setAttribute('data-fractional-u', String(point.u));
+      circle.setAttribute('data-fractional-v', String(point.v));
       circle.setAttribute('data-equivalence-group', point.group || '');
       const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
       title.textContent = `${point.element || '?'} ${index}`;
@@ -870,8 +1056,16 @@
       ['structure.hub.prov.method', 'Method metadata', methodSummary({
         method: provenance.method || preview.method,
       })],
-      ['structure.hub.prov.raw_hash', 'Raw structure hash',
-        provenance.raw_structure_hash || preview.raw_structure_hash || preview.structure_hash],
+      ['structure.hub.prov.declared_formula', 'Declared formula',
+        provenance.declared_formula || preview.declared_formula || preview.formula],
+      ['structure.hub.prov.computed_formula', 'Server-computed formula',
+        provenance.computed_formula || preview.computed_formula],
+      ['structure.hub.prov.declared_raw_hash', 'Declared raw-source SHA-256',
+        provenance.declared_raw_structure_sha256 || provenance.raw_structure_hash ||
+          preview.declared_raw_structure_sha256 || preview.raw_structure_sha256],
+      ['structure.hub.prov.computed_hash', 'Server-computed canonical SHA-256',
+        provenance.computed_structure_sha256 || preview.computed_structure_sha256 ||
+          preview.structure_sha256],
       ['structure.hub.prov.builder', 'Builder / version',
         [builder.name || provenance.builder_name, builder.version || provenance.builder_version]
           .filter(Boolean).join(' · ')],
@@ -894,9 +1088,10 @@
     if (panel) panel.hidden = false;
     if (meta) meta.textContent = i18n('structure.hub.preview.summary',
       '{formula} · {count} atoms · hash {hash}', {
-        formula: publicText(preview.formula || '—'),
+        formula: publicText(preview.computed_formula || preview.declared_formula ||
+          preview.formula || '—'),
         count: preview.natoms == null ? '—' : preview.natoms,
-        hash: publicText(preview.structure_hash || preview.raw_structure_hash || '—'),
+        hash: publicText(preview.computed_structure_sha256 || preview.structure_sha256 || '—'),
       });
     render3DPreview(role, preview);
     renderTopView(role, preview);
@@ -906,11 +1101,15 @@
   }
 
   async function previewSource(role, token) {
-    if (role !== 'bulk' && role !== 'ads') return false;
+    if ((role !== 'bulk' && role !== 'ads') || typeof token !== 'string' || !token) return false;
+    const payload = { role, token };
+    const request = beginSourceIntentRequest('preview', role, payload);
     setSourceStatus(role, i18n('structure.hub.preview.loading', 'Loading source preview…'), false);
     SourceHubState.previews[role] = null;
+    SourceHubState.previewOwners[role] = null;
     resetSourceConfirmation(role);
     const out = await VCS.call('structure_source_preview', token);
+    if (!sourceRequestIsCurrent(request, payload)) return false;
     const preview = out && out.preview;
     if (!out || out.error || out.ok === false || !preview || typeof preview !== 'object') {
       setSourceStatus(role, i18n('structure.hub.preview.failed', 'Preview failed: {error}', {
@@ -918,9 +1117,21 @@
       }), true);
       return false;
     }
+    if (preview.token != null && preview.token !== token) {
+      setSourceStatus(role, i18n('structure.hub.preview.failed', 'Preview failed: {error}', {
+        error: i18n('structure.hub.preview.invalid_token',
+          'server returned a preview token owned by another request'),
+      }), true);
+      return false;
+    }
     SourceHubState.previews[role] = Object.assign({}, preview, {
       token: preview.token || token,
     });
+    SourceHubState.previewOwners[role] = {
+      role, token: SourceHubState.previews[role].token,
+      requestToken: token, generation: request.generation,
+      requestFingerprint: request.fingerprint,
+    };
     renderSourcePreview(role, SourceHubState.previews[role]);
     setSourceStatus(role, i18n('structure.hub.preview.ready',
       'Preview ready. Confirm this source before using it.'), false);
@@ -931,10 +1142,21 @@
 
   async function confirmSource(role) {
     const preview = SourceHubState.previews[role];
-    if (!preview || typeof preview.token !== 'string') return false;
+    const previewOwner = SourceHubState.previewOwners[role];
+    if (!preview || typeof preview.token !== 'string' || !previewOwner ||
+        previewOwner.role !== role || previewOwner.token !== preview.token) return false;
+    const payload = {
+      role, previewToken: preview.token,
+      previewGeneration: previewOwner.generation,
+      previewFingerprint: previewOwner.requestFingerprint,
+    };
+    const request = beginIntentRequest('confirm', role, payload);
     const button = $(sourceRoleIds(role).confirm);
     if (button) button.disabled = true;
     const out = await VCS.call('structure_source_confirm', preview.token);
+    if (!requestIsCurrent(request, payload) ||
+        SourceHubState.previewOwners[role] !== previewOwner ||
+        SourceHubState.previews[role] !== preview) return false;
     if (!out || out.error || out.ok === false || out.confirmed !== true ||
         typeof out.source_token !== 'string' || !out.source_token) {
       if (button) button.disabled = false;
@@ -946,6 +1168,11 @@
       return false;
     }
     SourceHubState.sourceTokens[role] = out.source_token;
+    SourceHubState.sourceTokenOwners[role] = {
+      role, token: out.source_token, previewToken: preview.token,
+      previewOwner, generation: request.generation,
+      requestFingerprint: request.fingerprint,
+    };
     invalidateDryRun('');
     if (role === 'bulk') {
       const dry = $('surface-dry-run');
@@ -958,8 +1185,12 @@
   }
 
   async function selectLocalSource(role) {
+    if (role !== 'bulk' && role !== 'ads') return false;
+    const payload = { role, picker: 'system' };
+    const request = beginSourceIntentRequest('local', role, payload);
     setSourceStatus(role, i18n('structure.hub.local.selecting', 'Waiting for system file picker…'), false);
     const out = await VCS.call('structure_source_select_local');
+    if (!sourceRequestIsCurrent(request, payload)) return false;
     if (!out || out.cancelled) {
       setSourceStatus(role, i18n('structure.hub.local.cancelled', 'Selection cancelled.'), false);
       return false;
@@ -970,7 +1201,7 @@
       }), true);
       return false;
     }
-    const rows = showSourceResults(role, out.results || []);
+    const rows = showSourceResults(role, out.results || [], request);
     setSourceStatus(role, rows.length
       ? i18n('structure.hub.result.count', '{count} result(s); preview one to continue.', {
         count: rows.length,
@@ -987,13 +1218,22 @@
     const providerId = provider ? provider.value : '';
     const queryText = query ? query.value.trim() : '';
     const role = target && target.value === 'ads' ? 'ads' : 'bulk';
+    const payload = { providerId, queryText, role };
     if (!providerId || !queryText) {
+      invalidateIntentRequest('search', '');
       setRemoteStatus(i18n('structure.hub.gateway.query_required',
         'Choose an available provider and enter a query.'), true);
       return false;
     }
+    const request = beginSourceIntentRequest('search', role, payload);
     setRemoteStatus(i18n('structure.hub.gateway.searching', 'Searching external reference gateway…'), false);
     const out = await VCS.call('structure_source_search', providerId, queryText);
+    const currentPayload = {
+      providerId: provider ? provider.value : '',
+      queryText: query ? query.value.trim() : '',
+      role: target && target.value === 'ads' ? 'ads' : 'bulk',
+    };
+    if (!sourceRequestIsCurrent(request, currentPayload)) return false;
     if (!out || out.error || out.ok === false) {
       setRemoteStatus(i18n('structure.hub.gateway.search_failed',
         'External reference gateway unavailable: {error}', {
@@ -1001,7 +1241,7 @@
         }), true);
       return false;
     }
-    const rows = showSourceResults(role, out.results || []);
+    const rows = showSourceResults(role, out.results || [], request);
     setRemoteStatus(rows.length
       ? i18n('structure.hub.gateway.result_count', '{count} result(s) sent to {target}.', {
         count: rows.length,
@@ -1012,9 +1252,21 @@
   }
 
   function clearAdsorbateSource() {
+    invalidateIntentRequest('local', 'ads');
+    invalidateIntentRequest('preview', 'ads');
+    invalidateIntentRequest('confirm', 'ads');
+    const search = requestSlot('search', '');
+    if (search && search.role === 'ads') invalidateIntentRequest('search', '');
+    SourceHubState.sourceIntentOwners.ads = {
+      kind: 'clear', role: 'ads', generation: ++SourceHubState.intentGeneration,
+      fingerprint: requestFingerprint('clear', 'ads', {}),
+    };
     SourceHubState.previews.ads = null;
+    SourceHubState.previewOwners.ads = null;
     SourceHubState.sourceTokens.ads = null;
+    SourceHubState.sourceTokenOwners.ads = null;
     SourceHubState.results.ads = [];
+    SourceHubState.resultOwners.ads = null;
     const ids = sourceRoleIds('ads');
     if ($(ids.results)) $(ids.results).textContent = '';
     if ($(ids.preview)) $(ids.preview).hidden = true;
@@ -1094,10 +1346,27 @@
       min_distance: finiteNumber('surface-min-distance',
         i18n('structure.hub.site.min_distance', 'Minimum allowed distance'), { min: 1 }),
     };
-    if (SourceHubState.sourceTokens.ads) {
+    if (ownedSourceToken('ads')) {
       siteRequest.adsorbate_source_token = SourceHubState.sourceTokens.ads;
     }
     return { slabRequest, siteRequest };
+  }
+
+  function surfaceIntentPayload(requests) {
+    const bulkOwner = ownedSourceToken('bulk');
+    const adsOwner = ownedSourceToken('ads');
+    return {
+      bulk: bulkOwner ? {
+        role: bulkOwner.role, token: bulkOwner.token,
+        generation: bulkOwner.generation, fingerprint: bulkOwner.requestFingerprint,
+      } : null,
+      ads: adsOwner ? {
+        role: adsOwner.role, token: adsOwner.token,
+        generation: adsOwner.generation, fingerprint: adsOwner.requestFingerprint,
+      } : null,
+      slabRequest: requests.slabRequest,
+      siteRequest: requests.siteRequest,
+    };
   }
 
   function dryCandidateHtml(row, index) {
@@ -1173,7 +1442,8 @@
   }
 
   async function runSurfaceDryRun() {
-    if (!SourceHubState.sourceTokens.bulk) {
+    const bulkOwner = ownedSourceToken('bulk');
+    if (!bulkOwner) {
       setCreateStatus(i18n('structure.hub.dry.bulk_required',
         'Preview and confirm a bulk/substrate source first.'), true);
       return false;
@@ -1183,9 +1453,21 @@
       setCreateStatus(error.message || String(error), true);
       return false;
     }
+    const adsOwner = ownedSourceToken('ads');
+    if (SourceHubState.sourceTokens.ads && !adsOwner) {
+      setCreateStatus(i18n('structure.hub.dry.source_owner_invalid',
+        'A selected source token is not owned by the current source role.'), true);
+      return false;
+    }
+    const payload = surfaceIntentPayload(requests);
     invalidateDryRun(i18n('structure.hub.dry.running', 'Generating dry-run…'));
+    const request = beginIntentRequest('dryRun', '', payload);
     const out = await VCS.call('surface_dry_run', SourceHubState.sourceTokens.bulk,
       requests.slabRequest, requests.siteRequest);
+    let currentPayload = null;
+    try { currentPayload = surfaceIntentPayload(buildSurfaceRequests()); } catch (error) { /* stale */ }
+    if (!currentPayload || !requestIsCurrent(request, currentPayload) ||
+        ownedSourceToken('bulk') !== bulkOwner || ownedSourceToken('ads') !== adsOwner) return false;
     const dryRun = out && out.dry_run;
     const operationToken = dryRun && dryRun.operation_token
       ? dryRun.operation_token : (out && out.operation_token);
@@ -1201,6 +1483,11 @@
     }
     SourceHubState.dryRun = dryRun;
     SourceHubState.operationToken = operationToken;
+    SourceHubState.operationOwner = {
+      token: operationToken, generation: request.generation,
+      requestFingerprint: request.fingerprint,
+      bulkOwner, adsOwner,
+    };
     renderDryRun(dryRun);
     const output = $('surface-output-select');
     if (output) output.disabled = false;
@@ -1210,8 +1497,17 @@
   }
 
   async function selectSurfaceOutput() {
-    if (!SourceHubState.operationToken) return false;
+    const operationOwner = currentOperationOwner();
+    if (!operationOwner) return false;
+    const payload = {
+      operationToken: operationOwner.token,
+      operationGeneration: operationOwner.generation,
+      operationFingerprint: operationOwner.requestFingerprint,
+    };
+    invalidateOutputSelection();
+    const request = beginIntentRequest('output', '', payload);
     const out = await VCS.call('structure_output_select');
+    if (!requestIsCurrent(request, payload) || currentOperationOwner() !== operationOwner) return false;
     const token = out && (out.output_selection_token || out.output_token || out.token);
     if (!out || out.cancelled) return false;
     if (out.error || out.ok === false || typeof token !== 'string' || !token) {
@@ -1223,6 +1519,10 @@
       return false;
     }
     SourceHubState.outputSelectionToken = token;
+    SourceHubState.outputTokenOwner = {
+      token, operationOwner, generation: request.generation,
+      requestFingerprint: request.fingerprint,
+    };
     SourceHubState.outputDisplayName = publicText(out.display_name ||
       (out.selection && out.selection.label) ||
       i18n('structure.hub.output.selected', 'Destination selected'));
@@ -1238,18 +1538,31 @@
   function syncCandidateCreateButton() {
     const ack = $('surface-candidate-ack');
     const create = $('surface-create-candidates');
-    if (create) create.disabled = !(ack && ack.checked && SourceHubState.operationToken &&
-      SourceHubState.outputSelectionToken && !SourceHubState.created);
+    if (create) create.disabled = !(ack && ack.checked && currentOperationOwner() &&
+      currentOutputOwner() && !SourceHubState.created);
   }
 
   async function createSurfaceCandidates() {
     const ack = $('surface-candidate-ack');
-    if (!SourceHubState.operationToken || !SourceHubState.outputSelectionToken ||
+    const operationOwner = currentOperationOwner();
+    const outputOwner = currentOutputOwner();
+    if (!operationOwner || !outputOwner ||
         !ack || !ack.checked || SourceHubState.created) return false;
+    const payload = {
+      operationToken: operationOwner.token,
+      operationGeneration: operationOwner.generation,
+      operationFingerprint: operationOwner.requestFingerprint,
+      outputToken: outputOwner.token,
+      outputGeneration: outputOwner.generation,
+      outputFingerprint: outputOwner.requestFingerprint,
+    };
+    const request = beginIntentRequest('create', '', payload);
     const button = $('surface-create-candidates');
     if (button) button.disabled = true;
     const out = await VCS.call('surface_create_candidates', SourceHubState.operationToken,
       SourceHubState.outputSelectionToken);
+    if (!requestIsCurrent(request, payload) || currentOperationOwner() !== operationOwner ||
+        currentOutputOwner() !== outputOwner || !ack.checked) return false;
     if (!out || out.error || out.ok === false ||
         (out.scientific_status && out.scientific_status !== 'candidate')) {
       syncCandidateCreateButton();
@@ -1275,7 +1588,11 @@
   function onSourceResultClick(event) {
     const button = event.target.closest('[data-source-preview][data-source-token]');
     if (!button) return;
-    previewSource(button.dataset.sourcePreview, button.dataset.sourceToken);
+    const role = button.dataset.sourcePreview;
+    const token = button.dataset.sourceToken;
+    const owner = SourceHubState.resultOwners[role];
+    if (!owner || owner.role !== role || !owner.tokens.includes(token)) return;
+    previewSource(role, token);
   }
 
   function initSourceHub() {
@@ -1290,7 +1607,17 @@
     wire('surface-output-select', selectSurfaceOutput);
     wire('surface-create-candidates', createSurfaceCandidates);
     const ack = $('surface-candidate-ack');
-    if (ack) ack.addEventListener('change', syncCandidateCreateButton);
+    if (ack) ack.addEventListener('change', () => {
+      invalidateIntentRequest('create', '');
+      syncCandidateCreateButton();
+    });
+    ['source-provider', 'source-query', 'source-target'].forEach(id => {
+      const control = $(id);
+      if (!control) return;
+      const invalidateSearch = () => invalidateIntentRequest('search', '');
+      control.addEventListener('change', invalidateSearch);
+      if (id === 'source-query') control.addEventListener('input', invalidateSearch);
+    });
     ['bulk', 'ads'].forEach(role => {
       const box = $(sourceRoleIds(role).results);
       if (box) box.addEventListener('click', onSourceResultClick);
@@ -1298,7 +1625,7 @@
     document.querySelectorAll('#surface-wizard input, #surface-wizard select').forEach(control => {
       if (control.id === 'surface-candidate-ack') return;
       control.addEventListener('change', () => {
-        if (SourceHubState.operationToken) invalidateDryRun(i18n(
+        if (SourceHubState.operationToken || requestSlot('dryRun', '')) invalidateDryRun(i18n(
           'structure.hub.dry.stale', 'Parameters changed; generate a new dry-run.'));
       });
     });
@@ -1371,6 +1698,9 @@
       state: SourceHubState,
       normalizeProviders,
       showSourceResults,
+      requestFingerprint,
+      topViewGeometry,
+      renderTopView,
       previewSource,
       confirmSource,
       selectLocalSource,
