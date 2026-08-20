@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+import stat
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -29,6 +30,7 @@ from vcstudio.generate.structure_view import parse_positions
 from vcstudio.project.analysis_registry import AnalysisSpec, get_analysis
 from vcstudio.project.analysis_sources import (
     SourceSnapshot,
+    SourceSnapshotBudget,
     SourceSnapshotChanged,
     capture_source_snapshot,
     value_provenance,
@@ -50,6 +52,7 @@ CONVERGENCE_THRESHOLDS_MEV_PER_ATOM = (0.5, 1.0, 2.0)
 CONVERGENCE_PRIMARY_THRESHOLD_MEV_PER_ATOM = 1.0
 CONVERGENCE_MIN_PLATFORM_POINTS = 3
 AIMD_SHORT_TRAJECTORY_PS = 10.0
+MAX_NEB_FRAMES = 100
 
 _FRAME_RE = re.compile(r"^\d+$")
 _NIONS_RE = re.compile(r"\bNIONS\s*=\s*(\d+)")
@@ -72,11 +75,14 @@ def _finite(value: Any) -> float | None:
 
 
 def _capture(
-    target: Mapping[str, Any], evidence_names: Sequence[Any],
+    target: Mapping[str, Any], evidence_names: Sequence[Any], *,
+    budget: SourceSnapshotBudget | None = None,
 ) -> tuple[SourceSnapshot, dict[str, Any]]:
-    snapshot = capture_source_snapshot(target, evidence_names)
-    snapshot.assert_manifest_matches(target.get("manifest") or {})
-    return snapshot, snapshot.manifest()
+    snapshot = capture_source_snapshot(target, evidence_names, budget=budget)
+    manifest = snapshot.manifest()
+    if snapshot.has("job.yaml"):
+        snapshot.assert_manifest_matches(target.get("manifest") or {})
+    return snapshot, manifest
 
 
 def _method_evidence(
@@ -286,13 +292,40 @@ def _frame_natoms(snapshot: SourceSnapshot, frame: str) -> tuple[int | None, str
     return None, ""
 
 
-def _assert_neb_frame_set(root: Path, expected: Sequence[str]) -> None:
-    current = sorted(
-        (item.name for item in root.iterdir()
-         if item.is_dir() and _FRAME_RE.fullmatch(item.name)),
-        key=int,
-    ) if root.is_dir() else []
-    if list(expected) != current:
+def _discover_neb_frames(root: Path) -> tuple[list[str], bool, bool]:
+    frames = []
+    overflow = False
+    unsafe = False
+    try:
+        for item in root.iterdir():
+            if not _FRAME_RE.fullmatch(item.name):
+                continue
+            try:
+                metadata = item.lstat()
+            except OSError:
+                unsafe = True
+                continue
+            if (not stat.S_ISDIR(metadata.st_mode)
+                    or int(getattr(metadata, "st_file_attributes", 0)) & 0x400):
+                unsafe = True
+                continue
+            if len(frames) >= MAX_NEB_FRAMES:
+                overflow = True
+                continue
+            frames.append(item.name)
+    except OSError:
+        unsafe = True
+    frames.sort(key=int)
+    return frames, overflow, unsafe
+
+
+def _assert_neb_frame_set(
+    root: Path, expected: Sequence[str], *, overflow: bool, unsafe: bool,
+) -> None:
+    if overflow or unsafe:
+        return
+    current, current_overflow, current_unsafe = _discover_neb_frames(root)
+    if list(expected) != current or current_overflow or current_unsafe:
         raise SourceSnapshotChanged(
             "NEB image-directory set changed during analysis; retry")
 
@@ -301,14 +334,11 @@ def _neb_path(
     spec: AnalysisSpec, target: Mapping[str, Any],
     method_evidence: Callable[..., Mapping[str, Any]],
     targets_by_source_id: Mapping[str, Mapping[str, Any]],
+    snapshot_budget: SourceSnapshotBudget,
 ) -> dict[str, Any]:
     root = Path(str(target.get("path") or ""))
     parser = _parser("build_neb_analysis_view")
-    frames = sorted(
-        (item.name for item in root.iterdir()
-         if item.is_dir() and _FRAME_RE.fullmatch(item.name)),
-        key=int,
-    ) if root.is_dir() else []
+    frames, frame_overflow, unsafe_frame_directory = _discover_neb_frames(root)
     evidence_names = [
         f"{frame}/{name}" for frame in frames
         for name in ("POSCAR", "CONTCAR", "OSZICAR", "OUTCAR")
@@ -316,11 +346,20 @@ def _neb_path(
     snapshot, manifest = _capture(target, [
         "INCAR", "KPOINTS", "POTCAR", "POSCAR", "CONTCAR",
         "OUTCAR", "vasprun.xml", *evidence_names,
-    ])
+    ], budget=snapshot_budget)
     source = snapshot.identity()
     issues: list[str] = []
     warnings: list[str] = []
+    evidence_blocked = bool(
+        snapshot.rejected or frame_overflow or unsafe_frame_directory)
+    issues.extend(
+        f'{source["source_id"]}: {issue}' for issue in snapshot.evidence_issues())
     completion_issues = []
+    if frame_overflow:
+        issues.append(
+            f"NEB image count exceeds the hard limit of {MAX_NEB_FRAMES}")
+    if unsafe_frame_directory:
+        issues.append("NEB numeric image entries must be no-follow regular directories")
     try:
         _manifest, _completion_source, _completion_notes = (
             validate_done_completion_evidence(
@@ -343,7 +382,40 @@ def _neb_path(
         issues.append(coordinate_reason)
 
     inputs = manifest.get("inputs") or {}
+    declared_images = inputs.get("n_images")
+    declared_images_valid = bool(
+        isinstance(declared_images, int) and not isinstance(declared_images, bool)
+        and declared_images >= 1)
     incar = parse_incar(snapshot.text("INCAR"))
+    incar_images_value = _finite(incar.get("IMAGES"))
+    incar_images = (
+        int(incar_images_value) if incar_images_value is not None
+        and incar_images_value == int(incar_images_value)
+        and incar_images_value >= 1 else None)
+    if not declared_images_valid:
+        issues.append("NEB manifest requires an explicit positive integer n_images")
+    if incar_images is None:
+        issues.append("current NEB INCAR requires an explicit positive integer IMAGES")
+    if (declared_images_valid and incar_images is not None
+            and declared_images != incar_images):
+        issues.append(
+            f"manifest n_images={declared_images} does not match current "
+            f"INCAR IMAGES={incar_images}")
+    authoritative_images = (
+        declared_images if declared_images_valid and declared_images == incar_images
+        else None)
+    expected_count = (
+        authoritative_images + 2 if authoritative_images is not None else 0)
+    expected_frames = (
+        [f"{index:02d}" for index in range(expected_count)]
+        if 3 <= expected_count <= MAX_NEB_FRAMES else [])
+    if frame_overflow or expected_count > MAX_NEB_FRAMES:
+        issues.append(
+            f"NEB image count exceeds the hard limit of {MAX_NEB_FRAMES}")
+    if frames != expected_frames:
+        issues.append(
+            "NEB image directories must be the exact continuous set "
+            f"00..N+1; observed={frames!r}, expected={expected_frames!r}")
     ediffg = _finite(incar.get("EDIFFG"))
     force_threshold = abs(ediffg) if ediffg is not None and ediffg < 0 else None
     if force_threshold is None:
@@ -353,10 +425,6 @@ def _neb_path(
     }
     if not climb:
         issues.append("LCLIMB evidence is absent; a climbing-image barrier is unavailable")
-    declared_images = inputs.get("n_images")
-    if isinstance(declared_images, int) and declared_images + 2 != len(frames):
-        issues.append("manifest n_images does not match the image-directory count")
-
     method = _method_evidence(method_evidence, target, snapshot)
     method_ok = _verified_method(method)
     if not method_ok:
@@ -367,14 +435,17 @@ def _neb_path(
     endpoint_verifications: dict[str, dict[str, Any]] = {}
     endpoint_evidence: dict[str, dict[str, Any]] = {}
     endpoint_snapshots: list[SourceSnapshot] = []
-    for role, frame in (("start", frames[0] if frames else "00"),
-                        ("end", frames[-1] if frames else "")):
+    expected_start = "00"
+    expected_end = (
+        f"{expected_count - 1:02d}" if expected_count >= 3 else "unavailable")
+    for role, frame in (("start", expected_start), ("end", expected_end)):
         verification = verify_neb_endpoint_record(
             record=endpoints.get(role) or {}, role=role, frame=frame,
             neb_snapshot=snapshot, targets_by_source_id=targets_by_source_id,
             method_resolver=lambda endpoint, endpoint_snapshot: _method_evidence(
                 method_evidence, endpoint, endpoint_snapshot),
             neb_method_fingerprint=method.get("fingerprint"),
+            snapshot_budget=snapshot_budget,
         )
         endpoint_verifications[role] = verification
         issues.extend(verification.get("issues") or [])
@@ -404,6 +475,8 @@ def _neb_path(
             snapshot.text(f"{frame}/OUTCAR"), expected_natoms,
         )
         energy = final_step.get("energy") if final_step.get("status") == "complete" else None
+        if evidence_blocked:
+            energy = None
         endpoint_verification = endpoint_verifications.get(role)
         if endpoint_verification is not None and (
                 not endpoint_verification.get("ok")
@@ -411,8 +484,12 @@ def _neb_path(
                     set(endpoint_verification.get("verified_files", [])))):
             energy = None
         energies.append(energy)
-        fmax = final_step.get("fmax") if final_step.get("status") == "complete" else None
-        electronic = str(final_step.get("electronic_status") or "unavailable")
+        fmax = (final_step.get("fmax")
+                if final_step.get("status") == "complete" and not evidence_blocked
+                else None)
+        electronic = (
+            str(final_step.get("electronic_status") or "unavailable")
+            if not evidence_blocked else "unavailable")
         if role != "image":
             ionic = "endpoint"
         elif fmax is None or force_threshold is None:
@@ -549,8 +626,9 @@ def _neb_path(
             "issues": completion_issues,
         },
         "endpoint_evidence": endpoint_evidence,
-        "status": "available" if points else "missing_prerequisite",
-        "available": bool(points),
+        "status": ("unavailable" if evidence_blocked else
+                   "available" if points else "missing_prerequisite"),
+        "available": bool(points and not evidence_blocked),
         "points": points,
         "barriers": barriers,
         "path_quality": {
@@ -567,6 +645,8 @@ def _neb_path(
         "_snapshots": [snapshot, *endpoint_snapshots],
         "_frame_root": root,
         "_frames": list(frames),
+        "_frame_overflow": frame_overflow,
+        "_unsafe_frame_directory": unsafe_frame_directory,
     }
 
 
@@ -581,14 +661,20 @@ def build_neb_analysis_view(
         if target.get("source_id")
     }
     selected = [target for target in targets if target.get("task_type") == "neb"]
+    snapshot_budget = SourceSnapshotBudget()
     paths = [
-        _neb_path(spec, target, method_evidence, targets_by_source_id)
+        _neb_path(
+            spec, target, method_evidence, targets_by_source_id, snapshot_budget)
         for target in selected
     ]
     for path in paths:
         for snapshot in path.pop("_snapshots", []):
             snapshot.assert_unchanged()
-        _assert_neb_frame_set(path.pop("_frame_root"), path.pop("_frames"))
+        _assert_neb_frame_set(
+            path.pop("_frame_root"), path.pop("_frames"),
+            overflow=path.pop("_frame_overflow"),
+            unsafe=path.pop("_unsafe_frame_directory"),
+        )
     blocking = [
         issue for path in paths for issue in path["path_quality"]["issues"]
     ]
@@ -811,28 +897,55 @@ def _vacuum_normalized_structure(poscar_text: str) -> dict[str, Any]:
     }
 
 
-def _canonical_layer_motif(
-    indexes: Sequence[int], geometry: Mapping[str, Any],
-) -> list[list[Any]]:
+def _canonical_ordered_layers(
+    layers: Sequence[Sequence[int]], geometry: Mapping[str, Any],
+) -> list[list[list[Any]]]:
+    """Normalize the whole slab with one anchor, retaining layer registration."""
     fractional = geometry["fractional"]
+    c_direction = geometry["c_direction"]
+    projections = [
+        sum(float(coordinate[index]) * c_direction[index] for index in range(3))
+        for coordinate in geometry["coordinates"]
+    ]
+    centers = [
+        sum(projections[index] for index in indexes) / len(indexes)
+        for indexes in layers
+    ]
     candidates = []
-    for anchor in indexes:
+    for anchor in layers[0]:
         anchor_x = float(fractional[anchor][0])
         anchor_y = float(fractional[anchor][1])
-        records = sorted([
-            [
-                geometry["elements"][index],
-                _rounded_geometry((float(fractional[index][0]) - anchor_x) % 1.0),
-                _rounded_geometry((float(fractional[index][1]) - anchor_y) % 1.0),
-                geometry["flags"][index],
-            ]
-            for index in indexes
-        ], key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True))
-        candidates.append(records)
+        ordered = []
+        for layer_index, indexes in enumerate(layers):
+            records = sorted([
+                [
+                    geometry["elements"][index],
+                    _rounded_geometry(
+                        (float(fractional[index][0]) - anchor_x) % 1.0),
+                    _rounded_geometry(
+                        (float(fractional[index][1]) - anchor_y) % 1.0),
+                    _rounded_geometry(
+                        projections[index] - centers[layer_index]),
+                    geometry["flags"][index],
+                ]
+                for index in indexes
+            ], key=lambda item: json.dumps(
+                item, ensure_ascii=False, sort_keys=True))
+            ordered.append(records)
+        candidates.append(ordered)
     return min(
         candidates,
         key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True),
     )
+
+
+def _minimal_ordered_prefix_period(values: Sequence[Any]) -> list[Any]:
+    sequence = list(values)
+    for period in range(1, len(sequence) + 1):
+        if all(sequence[index] == sequence[index % period]
+               for index in range(len(sequence))):
+            return copy.deepcopy(sequence[:period])
+    return copy.deepcopy(sequence)
 
 
 def _slab_thickness_normalized_structure(poscar_text: str) -> dict[str, Any]:
@@ -856,14 +969,17 @@ def _slab_thickness_normalized_structure(poscar_text: str) -> dict[str, Any]:
             layers[-1].append(index)
     for indexes in layers:
         centers.append(sum(projections[index] for index in indexes) / len(indexes))
-    motifs = {
-        _canonical_hash(_canonical_layer_motif(indexes, geometry))
-        for indexes in layers
-    }
-    spacings = {
+    if len(layers) < 2:
+        raise ValueError(
+            "slab-thickness normalization requires at least two ordered layers")
+    ordered_layers = _canonical_ordered_layers(layers, geometry)
+    ordered_layer_hashes = [
+        _canonical_hash(layer) for layer in ordered_layers
+    ]
+    spacings = [
         _rounded_geometry(right - left)
         for left, right in zip(centers, centers[1:])
-    }
+    ]
     return {
         "cell_ab_a": [
             [_rounded_geometry(value) for value in vector]
@@ -871,8 +987,10 @@ def _slab_thickness_normalized_structure(poscar_text: str) -> dict[str, Any]:
         ],
         "c_direction": [_rounded_geometry(value) for value in c_direction],
         "vacuum_a": _rounded_geometry(vacuum_thickness(poscar_text)),
-        "unique_layer_motif_sha256": sorted(motifs),
-        "unique_interlayer_spacing_a": sorted(spacings),
+        "ordered_layer_pattern_sha256": _minimal_ordered_prefix_period(
+            ordered_layer_hashes),
+        "ordered_interlayer_spacing_pattern_a": _minimal_ordered_prefix_period(
+            spacings),
     }
 
 
@@ -1040,6 +1158,7 @@ def _platform(
 def _convergence_series(
     spec: AnalysisSpec, kind: str, targets: Sequence[Mapping[str, Any]],
     method_evidence: Callable[..., Mapping[str, Any]],
+    snapshot_budget: SourceSnapshotBudget,
 ) -> dict[str, Any]:
     parser = _parser("build_convergence_analysis_view")
     raw = []
@@ -1051,12 +1170,15 @@ def _convergence_series(
         snapshot, manifest = _capture(target, [
             "OSZICAR", "OUTCAR", "vasprun.xml", "INCAR", "KPOINTS",
             "POSCAR", "CONTCAR", "POTCAR",
-        ])
+        ], budget=snapshot_budget)
         snapshots.append(snapshot)
         inputs = manifest.get("inputs") or {}
         declared_x = _finite(inputs.get("series_value"))
         label = str(inputs.get("series_label") or "")
         source = snapshot.identity()
+        snapshot_issues = snapshot.evidence_issues()
+        issues.extend(
+            f'{source["source_id"]}: {issue}' for issue in snapshot_issues)
         frozen_input_invariant, frozen_issues, frozen_files = (
             _scan_frozen_input_invariant(snapshot, kind))
         issues.extend(
@@ -1090,13 +1212,15 @@ def _convergence_series(
         natoms, natom_issues, denominator_files = _runtime_natoms(snapshot, manifest)
         issues.extend(f'{source["source_id"]}: {issue}' for issue in natom_issues)
         try:
+            if snapshot.rejected:
+                raise ValueError("bounded source evidence is unavailable")
             energy, _validated_manifest, _energy_evidence = validate_done_energy_evidence(
                 manifest, source["source_id"],
                 oszicar_text=snapshot.text("OSZICAR"),
                 outcar_text=snapshot.text("OUTCAR"),
                 vasprun_text=snapshot.text("vasprun.xml"),
                 require_oszicar=True, require_current_completion=True,
-                require_outcar_ionic_event=True,
+                require_outcar_ionic_event=True, reject_explicit_unclean=True,
             )
         except ValueError as exc:
             energy = None
@@ -1238,6 +1362,7 @@ def _convergence_series(
     series_evidence_ready = bool(
         not duplicates and len(method_invariants) == 1
         and len(frozen_input_invariants) == 1
+        and not any(snapshot.rejected for snapshot in snapshots)
         and all(item["frozen_input_invariant"] for item in raw)
         and all(item["method_verified"] for item in raw)
         and all(point["parameter"]["value"] is not None
@@ -1312,8 +1437,11 @@ def _convergence_series(
             "source_ids": [point["source"]["source_id"] for point in points],
         })[:24],
         "kind": kind,
-        "status": "available" if points else "missing_prerequisite",
-        "available": bool(points),
+        "status": (
+            "unavailable" if any(snapshot.rejected for snapshot in snapshots)
+            else "available" if points else "missing_prerequisite"),
+        "available": bool(points and not any(
+            snapshot.rejected for snapshot in snapshots)),
         "parser": parser,
         "points": points,
         "platform": {
@@ -1370,8 +1498,10 @@ def build_convergence_analysis_view(
             continue
         key = (kind, _series_group_key(target, kind))
         groups.setdefault(key, []).append(target)
+    snapshot_budget = SourceSnapshotBudget()
     series = [
-        _convergence_series(spec, kind, members, method_evidence)
+        _convergence_series(
+            spec, kind, members, method_evidence, snapshot_budget)
         for (kind, _group), members in sorted(groups.items())
     ]
     for item in series:
@@ -1468,10 +1598,19 @@ def _parse_xdatcar(text: str) -> dict[str, Any]:
     frame_steps = []
     index = 7
     while index < len(lines):
+        while index < len(lines) and not lines[index].strip():
+            index += 1
+        if index >= len(lines):
+            break
         config_match = _XDATCAR_CONFIG_RE.match(lines[index])
         if not config_match:
-            index += 1
-            continue
+            return {
+                "frames": frames, "frame_steps": frame_steps,
+                "elements": elements, "natoms": natoms, "cell": cell,
+                "error": (
+                    "XDATCAR contains a repeated/variable-cell header or unexpected "
+                    "content; fixed-cell structure metrics are unavailable"),
+            }
         mode = lines[index].strip().lower()
         frame_step = int(config_match.group(1))
         index += 1
@@ -1521,7 +1660,8 @@ def _trajectory_metrics(text: str) -> dict[str, Any]:
             "elements": parsed["elements"], "cell": cell, "natoms": natoms,
             "max_step_displacement_a": None, "final_rmsd_a": None,
             "max_rmsd_a": None, "cell_volume_a3": _cell_volume(cell),
-            "error": "XDATCAR requires at least two bound frames for structure metrics",
+            "error": (parsed["error"] or
+                      "XDATCAR requires at least two bound frames for structure metrics"),
         }
     unwrapped = [[list(atom) for atom in frames[0]]]
     max_step = 0.0
@@ -1601,6 +1741,7 @@ def _explicit_restart_lineage(inputs: Mapping[str, Any]) -> bool:
 def _aimd_trajectory(
     spec: AnalysisSpec, target: Mapping[str, Any],
     method_evidence: Callable[..., Mapping[str, Any]],
+    snapshot_budget: SourceSnapshotBudget,
 ) -> dict[str, Any]:
     from vcstudio.generate.aimd_builder import parse_aimd_energy
 
@@ -1608,7 +1749,7 @@ def _aimd_trajectory(
     snapshot, manifest = _capture(target, [
         "INCAR", "KPOINTS", "POTCAR", "POSCAR", "CONTCAR",
         "OSZICAR", "XDATCAR",
-    ])
+    ], budget=snapshot_budget)
     source = snapshot.identity()
     inputs = manifest.get("inputs") or {}
     incar = parse_incar(snapshot.text("INCAR"))
@@ -1627,6 +1768,9 @@ def _aimd_trajectory(
     declared_temperature = _finite(incar.get("TEBEG"))
     issues = []
     warnings = []
+    evidence_blocked = bool(snapshot.rejected)
+    issues.extend(
+        f'{source["source_id"]}: {issue}' for issue in snapshot.evidence_issues())
     if potim is None or potim <= 0:
         issues.append("AIMD requires an explicit positive POTIM in INCAR")
     if declared_steps_int is None or declared_steps_int <= 0:
@@ -1642,7 +1786,8 @@ def _aimd_trajectory(
             issues.append(f"manifest {key} differs from the current INCAR evidence")
     parsed = parse_aimd_energy(
         snapshot.text("OSZICAR"), potim_fs=potim if potim else 1.0)
-    raw_steps = list(parsed.get("steps") or [])
+    raw_steps = (
+        list(parsed.get("steps") or []) if not evidence_blocked else [])
     if not raw_steps:
         issues.append("OSZICAR contains no parseable AIMD total-energy/temperature steps")
     segments = _aimd_segments(raw_steps)
@@ -1686,7 +1831,8 @@ def _aimd_trajectory(
     slope_ev_ps = _linear_slope(
         [float(item["step"]) * potim / 1000.0 for item in raw_steps], energies,
     ) if aggregate_ready and potim is not None and potim > 0 else None
-    structure = _trajectory_metrics(snapshot.text("XDATCAR"))
+    structure = _trajectory_metrics(
+        snapshot.text("XDATCAR") if not evidence_blocked else "")
     structure_issues = []
     if structure["error"]:
         structure_issues.append(str(structure["error"]))
@@ -1717,7 +1863,7 @@ def _aimd_trajectory(
     if state_done and not coverage_ok:
         structure_issues.append(
             "DONE OSZICAR/NSW coverage is incomplete, so XDATCAR cannot be qualified")
-    structure_ready = not structure_issues
+    structure_ready = bool(not evidence_blocked and not structure_issues)
     if not structure_ready:
         structure["max_step_displacement_a"] = None
         structure["final_rmsd_a"] = None
@@ -1818,7 +1964,8 @@ def _aimd_trajectory(
             ),
         })
     metric_specs = (
-        ("time_step", "Time step", potim, "fs", "INCAR POTIM", incar_files),
+        ("time_step", "Time step", potim if not evidence_blocked else None,
+         "fs", "INCAR POTIM", incar_files),
         ("sampling_length", "Sampling length", sampling_length_ps, "ps",
          "single strictly increasing step segment", osz_files + incar_files),
         ("sample_count", "Parsed samples", len(samples) if samples else None, "samples",
@@ -1865,8 +2012,9 @@ def _aimd_trajectory(
         "source": source,
         "parser": parser,
         "method": method,
-        "status": "available" if samples else "missing_prerequisite",
-        "available": bool(samples),
+        "status": ("unavailable" if evidence_blocked else
+                   "available" if samples else "missing_prerequisite"),
+        "available": bool(samples and not evidence_blocked),
         "samples": samples,
         "segments": segment_rows,
         "metrics": metrics,
@@ -1915,7 +2063,11 @@ def build_aimd_analysis_view(
     if spec.analysis_id != "aimd-diagnostics":
         raise ValueError("AIMD analysis view requires analysis_id=aimd-diagnostics")
     selected = [target for target in targets if target.get("task_type") == "aimd"]
-    trajectories = [_aimd_trajectory(spec, target, method_evidence) for target in selected]
+    snapshot_budget = SourceSnapshotBudget()
+    trajectories = [
+        _aimd_trajectory(spec, target, method_evidence, snapshot_budget)
+        for target in selected
+    ]
     for trajectory in trajectories:
         for snapshot in trajectory.pop("_snapshots", []):
             snapshot.assert_unchanged()

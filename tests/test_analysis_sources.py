@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
 
+import vcstudio.project.analysis_sources as analysis_sources
 from vcstudio.project.analysis_registry import normalize_analysis_request
 from vcstudio.project.analysis_sources import (
     SourceSnapshotChanged,
@@ -170,6 +172,38 @@ def test_elf_missing_file_and_non_done_are_missing_prerequisites(tmp_path):
     assert view["rows"][0]["status"] == "missing_prerequisite"
 
 
+def test_task_analysis_rejects_over_limit_evidence_before_runner(
+        tmp_path, monkeypatch):
+    job = tmp_path / "elf-over-limit"
+    manifest = _manifest(job, "elf")
+    manifest_size = (job / "job.yaml").stat().st_size
+    limit = manifest_size + 8
+    (job / "ELFCAR").write_bytes(b"x" * (limit + 1))
+    target = {
+        "path": str(job), "path_key": str(job).lower(),
+        "source_id": "job-elf-over-limit", "relation": "descendant",
+        "task_type": "elf", "state": "DONE", "manifest": manifest,
+    }
+    spec = normalize_analysis_request(
+        {"analysis_id": "charge-wavefunction"}, project_id="project-opaque")
+    monkeypatch.setattr(analysis_sources, "MAX_EVIDENCE_FILE_BYTES", limit)
+
+    view = build_task_analysis_view(
+        spec, [target],
+        runner=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("rejected evidence must not reach the runner")),
+        parser_identities={"elf": {
+            "module": "vcstudio.project.elf", "callable": "summarize_elfcar",
+            "version": "4.0-test", "version_source": "test-release"}},
+        method_evidence=lambda _target: {"status": "verified"},
+    )
+
+    assert view["available"] is False
+    assert view["capability_status"] == "unavailable"
+    assert view["rows"][0]["status"] == "unavailable"
+    assert "bounded evidence rejected" in view["rows"][0]["summary"]
+
+
 def test_property_view_keeps_calculator_operands_opaque_and_numbers_server_finalized(
         tmp_path):
     spec = normalize_analysis_request(
@@ -204,6 +238,40 @@ def test_property_view_keeps_calculator_operands_opaque_and_numbers_server_final
     assert view["denominator"]["available_results"] == 1
 
 
+def test_property_runner_uses_materialized_operands_and_retries_source_mutation(tmp_path):
+    root = tmp_path / "property-source"
+    manifest = _manifest(root, "vaspsol")
+    (root / "OSZICAR").write_text(
+        " 1 F= -1 E0= -1 d E=0\n", encoding="utf-8")
+    target = {
+        "path": str(root), "path_key": str(root).lower(),
+        "source_id": "job-property-source", "relation": "descendant",
+        "task_type": "vaspsol", "state": "DONE", "manifest": manifest,
+    }
+    spec = normalize_analysis_request(
+        {"analysis_id": "property-calculators"}, project_id="project-opaque")
+
+    def runner(kind, materialized_targets):
+        if kind != "vaspsol":
+            return []
+        parser_root = Path(materialized_targets[0]["path"])
+        assert parser_root != root
+        assert (parser_root / "OSZICAR").read_text(
+            encoding="utf-8") == " 1 F= -1 E0= -1 d E=0\n"
+        (root / "OSZICAR").write_text(
+            " 1 F= -99 E0= -99 d E=0\n", encoding="utf-8")
+        return [{
+            "ok": True, "source_ids": ["job-property-source"],
+            "solvation_energy_eV": 98.0,
+            "parser_module": "vcstudio.project.vaspsol",
+            "parser_callable": "analyze_pair",
+        }]
+
+    with pytest.raises(SourceSnapshotChanged, match="changed during analysis"):
+        build_property_view(
+            spec, [target], runner=runner, parser_version="4.0-test")
+
+
 def test_value_provenance_keeps_only_hashed_files_and_explicit_parser_identity():
     value = value_provenance(
         "job-opaque",
@@ -235,10 +303,177 @@ def test_source_snapshot_hashes_and_parses_one_copy_then_detects_replacement(tmp
 
     snapshot = capture_source_snapshot(target, ["OSZICAR"])
     evidence = snapshot.file("OSZICAR")
+    captured_stat = (job / "OSZICAR").stat()
 
     assert snapshot.bytes("OSZICAR") == original
+    assert snapshot.text("OSZICAR") is snapshot.text("OSZICAR")
     assert evidence["sha256"] == hashlib.sha256(original).hexdigest()
-    (job / "OSZICAR").write_bytes(b" 1 T= 999 E= -99.0\n")
+    replacement = b" 1 T= 999 E= -99.0\n"
+    assert len(replacement) == len(original)
+    (job / "OSZICAR").write_bytes(replacement)
+    os.utime(
+        job / "OSZICAR",
+        ns=(captured_stat.st_atime_ns, captured_stat.st_mtime_ns),
+    )
     assert snapshot.bytes("OSZICAR") == original
     with pytest.raises(SourceSnapshotChanged, match="changed during analysis"):
         snapshot.assert_unchanged()
+
+
+def test_task_parser_consumes_materialized_snapshot_and_retries_source_mutation(tmp_path):
+    job = tmp_path / "bands-snapshot"
+    manifest = _manifest(job, "bands")
+    (job / "vasprun.xml").write_text("OLD", encoding="utf-8")
+    target = {
+        "path": str(job), "path_key": str(job).lower(),
+        "source_id": "job-bands-snapshot", "relation": "descendant",
+        "task_type": "bands", "state": "DONE", "manifest": manifest,
+    }
+    spec = normalize_analysis_request(
+        {"analysis_id": "electronic-structure"}, project_id="project-opaque")
+
+    def runner(snapshot_root, _kind):
+        assert (Path(snapshot_root) / "vasprun.xml").read_text(
+            encoding="utf-8") == "OLD"
+        (job / "vasprun.xml").write_text("NEW", encoding="utf-8")
+        return {
+            "ok": True, "result": {
+                "gap": {"value": 99.0, "direct": True, "metal": False}},
+            "summary": "must be retried",
+        }
+
+    with pytest.raises(SourceSnapshotChanged, match="changed during analysis"):
+        build_task_analysis_view(
+            spec, [target], runner=runner,
+            parser_identities={"bands": {
+                "module": "vcstudio.project.bands", "callable": "parse_bands",
+                "version": "4.0-test", "version_source": "test-release"}},
+            method_evidence=lambda _target, snapshot: {
+                "status": "verified",
+                "snapshot_sha256": snapshot.file("vasprun.xml")["sha256"],
+            },
+        )
+
+
+def test_task_and_property_views_retry_ledger_job_yaml_divergence(tmp_path):
+    task_root = tmp_path / "task-manifest-mismatch"
+    task_manifest = _manifest(task_root, "bands")
+    (task_root / "vasprun.xml").write_text("bands", encoding="utf-8")
+    (task_root / "job.yaml").write_text(
+        json.dumps({**task_manifest, "state": "FAILED"}), encoding="utf-8")
+    task_target = {
+        "path": str(task_root), "path_key": str(task_root).lower(),
+        "source_id": "task-manifest-mismatch", "relation": "descendant",
+        "task_type": "bands", "state": "DONE", "manifest": task_manifest,
+    }
+    task_spec = normalize_analysis_request(
+        {"analysis_id": "electronic-structure"}, project_id="project-opaque")
+    with pytest.raises(SourceSnapshotChanged, match="ledger manifest"):
+        build_task_analysis_view(
+            task_spec, [task_target],
+            runner=lambda *_args: (_ for _ in ()).throw(
+                AssertionError("mismatched manifest must not reach task runner")),
+            parser_identities={"bands": {
+                "module": "vcstudio.project.bands", "callable": "parse_bands",
+                "version": "4.0-test", "version_source": "test-release"}},
+            method_evidence=lambda _target: {"status": "verified"},
+        )
+
+    property_root = tmp_path / "property-manifest-mismatch"
+    property_manifest = _manifest(property_root, "vaspsol")
+    (property_root / "job.yaml").write_text(
+        json.dumps({**property_manifest, "state": "FAILED"}), encoding="utf-8")
+    property_target = {
+        "path": str(property_root), "path_key": str(property_root).lower(),
+        "source_id": "property-manifest-mismatch", "relation": "descendant",
+        "task_type": "vaspsol", "state": "DONE", "manifest": property_manifest,
+    }
+    property_spec = normalize_analysis_request(
+        {"analysis_id": "property-calculators"}, project_id="project-opaque")
+    with pytest.raises(SourceSnapshotChanged, match="ledger manifest"):
+        build_property_view(
+            property_spec, [property_target],
+            runner=lambda *_args: (_ for _ in ()).throw(
+                AssertionError("mismatched manifest must not reach property runner")),
+            parser_version="4.0-test",
+        )
+
+
+def test_source_snapshot_rejects_nonregular_and_symlink_evidence(tmp_path):
+    job = tmp_path / "unsafe-evidence"
+    manifest = _manifest(job, "aimd")
+    (job / "OUTCAR").mkdir()
+    outside = tmp_path / "outside-OSZICAR"
+    outside.write_text(" 1 T= 300 E= -10\n", encoding="utf-8")
+    symlink_supported = True
+    try:
+        (job / "OSZICAR").symlink_to(outside)
+    except OSError:
+        symlink_supported = False
+    target = {
+        "path": str(job), "source_id": "job-unsafe", "relation": "member",
+        "task_type": "aimd", "state": "DONE", "manifest": manifest,
+    }
+
+    evidence = ["OUTCAR"]
+    if symlink_supported:
+        evidence.append("OSZICAR")
+    snapshot = capture_source_snapshot(target, evidence)
+
+    assert snapshot.bytes("OUTCAR") == b""
+    expected = {"OUTCAR", "OSZICAR"} if symlink_supported else {"OUTCAR"}
+    assert {item["name"] for item in snapshot.rejected} == expected
+    if symlink_supported:
+        assert snapshot.bytes("OSZICAR") == b""
+    assert all("no-follow regular file" in item["reason"]
+               for item in snapshot.rejected)
+
+
+def test_source_snapshot_enforces_per_file_total_line_and_frame_limits(
+        tmp_path, monkeypatch):
+    def target_for(name: str) -> tuple[Path, dict]:
+        job = tmp_path / name
+        manifest = _manifest(job, "aimd")
+        return job, {
+            "path": str(job), "source_id": f"job-{name}", "relation": "member",
+            "task_type": "aimd", "state": "DONE", "manifest": manifest,
+        }
+
+    job, target = target_for("per-file")
+    manifest_size = (job / "job.yaml").stat().st_size
+    per_file_limit = manifest_size + 8
+    (job / "OUTCAR").write_bytes(b"x" * (per_file_limit + 1))
+    with monkeypatch.context() as scoped:
+        scoped.setattr(analysis_sources, "MAX_EVIDENCE_FILE_BYTES", per_file_limit)
+        snapshot = capture_source_snapshot(target, ["OUTCAR"])
+    assert any("per-file byte limit" in item["reason"]
+               for item in snapshot.rejected)
+
+    job, target = target_for("total")
+    manifest_size = (job / "job.yaml").stat().st_size
+    (job / "OSZICAR").write_bytes(b"1234567890")
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            analysis_sources, "MAX_EVIDENCE_TOTAL_BYTES", manifest_size + 2)
+        snapshot = capture_source_snapshot(target, ["OSZICAR"])
+    assert any("remaining total byte limit" in item["reason"]
+               for item in snapshot.rejected)
+
+    job, target = target_for("lines")
+    (job / "OSZICAR").write_text("one\ntwo\n", encoding="utf-8")
+    with monkeypatch.context() as scoped:
+        scoped.setattr(analysis_sources, "MAX_EVIDENCE_LINES", 1)
+        snapshot = capture_source_snapshot(target, ["OSZICAR"])
+    assert any("line limit" in item["reason"] for item in snapshot.rejected)
+
+    job, target = target_for("frames")
+    (job / "XDATCAR").write_text(
+        "H trajectory\n1\n1 0 0\n0 1 0\n0 0 1\nH\n1\n"
+        "Direct configuration= 1\n0 0 0\n"
+        "Direct configuration= 2\n0 0 0\n",
+        encoding="utf-8",
+    )
+    with monkeypatch.context() as scoped:
+        scoped.setattr(analysis_sources, "MAX_XDATCAR_FRAMES", 1)
+        snapshot = capture_source_snapshot(target, ["XDATCAR"])
+    assert any("frame limit" in item["reason"] for item in snapshot.rejected)

@@ -44,6 +44,37 @@ def _poscar(x: float) -> str:
     )
 
 
+def _slab_poscar(
+    layers: int, stacking: str = "ABC", *, inner_buckle_a: float = 0.02,
+) -> str:
+    spacing = 2.0
+    vacuum = 10.0
+    c_length = vacuum + spacing * (layers - 1)
+    shifts = {
+        "AA": ((0.0, 0.0),),
+        "ABC": ((0.0, 0.0), (1.0 / 3.0, 1.0 / 3.0),
+                (2.0 / 3.0, 2.0 / 3.0)),
+    }[stacking]
+    rows = []
+    for index in range(layers):
+        x, y = shifts[index % len(shifts)]
+        center = vacuum / 2.0 + spacing * index
+        atoms = (
+            (x, y, center - 0.10),
+            ((x + 0.25) % 1.0, y, center - inner_buckle_a),
+            (x, (y + 0.25) % 1.0, center + inner_buckle_a),
+            ((x + 0.25) % 1.0, (y + 0.25) % 1.0, center + 0.10),
+        )
+        rows.extend(
+            f"{atom_x:.10f} {atom_y:.10f} {atom_z / c_length:.10f}"
+            for atom_x, atom_y, atom_z in atoms
+        )
+    return (
+        f"H {stacking} slab\n1.0\n10 0 0\n0 10 0\n0 0 {c_length:.10f}\n"
+        f"H\n{layers * 4}\nDirect\n" + "\n".join(rows) + "\n"
+    )
+
+
 def _outcar(energy: float, force: float) -> str:
     return (
         " NIONS =      1 ions\n"
@@ -217,6 +248,60 @@ def test_neb_rejects_oszicar_energy_from_a_different_final_ionic_event(tmp_path)
     assert path["points"][1]["max_force"]["value"] is None
     assert path["barriers"]["status"] == "unavailable"
     assert any("energy disagree" in issue for issue in path["barriers"]["blocking"])
+
+
+def test_neb_requires_exact_continuous_image_names_and_expected_endpoint_frame(
+        tmp_path, monkeypatch):
+    target = _neb_target(tmp_path)
+    root = Path(target["path"])
+    (root / "02").rename(root / "03")
+    target["manifest"]["inputs"]["neb_endpoints"]["end"]["target_frame"] = "03"
+    _write_manifest(root, target["manifest"])
+    spec = normalize_analysis_request(
+        {"analysis_id": "neb-path"}, project_id=PROJECT)
+
+    view = build_neb_analysis_view(
+        spec, _neb_targets(target), method_evidence=_method)
+
+    path = view["paths"][0]
+    assert path["barriers"]["status"] == "unavailable"
+    assert path["endpoint_evidence"]["end"]["status"] == "unavailable"
+    assert any("exact continuous set" in issue
+               for issue in path["barriers"]["blocking"])
+    assert any("target_frame does not match 02" in issue
+               for issue in path["endpoint_evidence"]["end"]["issues"])
+
+    input_mismatch = _neb_target(tmp_path / "input-mismatch")
+    (Path(input_mismatch["path"]) / "INCAR").write_text(
+        "EDIFFG = -0.05\nLCLIMB = .TRUE.\nIMAGES = 2\n",
+        encoding="utf-8",
+    )
+    mismatched = build_neb_analysis_view(
+        spec, _neb_targets(input_mismatch), method_evidence=_method)
+    assert mismatched["paths"][0]["barriers"]["status"] == "unavailable"
+    assert any("does not match current INCAR IMAGES" in issue
+               for issue in mismatched["paths"][0]["barriers"]["blocking"])
+
+    missing_manifest_n = _neb_target(tmp_path / "missing-manifest-n")
+    missing_manifest_n["manifest"]["inputs"].pop("n_images")
+    _write_manifest(
+        Path(missing_manifest_n["path"]), missing_manifest_n["manifest"])
+    missing_n = build_neb_analysis_view(
+        spec, _neb_targets(missing_manifest_n), method_evidence=_method)
+    assert missing_n["paths"][0]["barriers"]["status"] == "unavailable"
+    assert any("positive integer n_images" in issue
+               for issue in missing_n["paths"][0]["barriers"]["blocking"])
+
+    import vcstudio.project.analysis_scientific as analysis_scientific
+    bounded_target = _neb_target(tmp_path / "bounded")
+    monkeypatch.setattr(analysis_scientific, "MAX_NEB_FRAMES", 2)
+    bounded = build_neb_analysis_view(
+        spec, _neb_targets(bounded_target), method_evidence=_method)
+    bounded_path = bounded["paths"][0]
+    assert bounded_path["status"] == "unavailable"
+    assert bounded_path["available"] is False
+    assert any("hard limit" in issue
+               for issue in bounded_path["barriers"]["blocking"])
 
 
 def test_neb_main_and_endpoint_require_consistent_done_diagnosis(tmp_path):
@@ -450,6 +535,74 @@ def test_convergence_rejects_geometry_drift_between_otherwise_valid_points(tmp_p
                for issue in series["issues"])
 
 
+def test_slab_thickness_invariant_retains_ordered_stacking_registration(tmp_path):
+    targets = _convergence_targets(tmp_path)
+    per_atom_energies = (-1.0040, -1.0008, -1.0003, -1.0000)
+    for target, layers, per_atom in zip(targets, range(3, 7), per_atom_energies):
+        root = Path(target["path"])
+        natoms = layers * 4
+        energy = natoms * per_atom
+        (root / "INCAR").write_text("ENCUT=500\n", encoding="utf-8")
+        (root / "POSCAR").write_text(
+            _slab_poscar(layers, "ABC"), encoding="utf-8")
+        (root / "OUTCAR").write_text(
+            _convergence_outcar(energy, nions=natoms), encoding="utf-8")
+        (root / "OSZICAR").write_text(
+            f" 1 F= {energy:.8f} E0= {energy:.8f} d E =0\n",
+            encoding="utf-8",
+        )
+        target["manifest"]["inputs"].update({
+            "series": "slab_thickness", "series_value": layers,
+            "series_label": f"{layers} layers", "natoms": natoms,
+            "sha256": {"POSCAR": _sha(root / "POSCAR")},
+        })
+        target["manifest"]["results"]["energy_e0_eV"] = energy
+        target["method"] = {
+            "status": "verified", "fingerprint": copy.deepcopy(METHOD)}
+        _write_manifest(root, target["manifest"])
+    spec = normalize_analysis_request(
+        {"analysis_id": "convergence-scan"}, project_id=PROJECT)
+
+    consistent = build_convergence_analysis_view(
+        spec, targets, method_evidence=lambda target: target["method"])
+    series = consistent["series"][0]
+    assert [point["parameter"]["value"] for point in series["points"]] == [
+        3.0, 4.0, 5.0, 6.0]
+    assert series["platform"]["status"] == "available"
+    assert series["platform"]["recommendation"]["value"] == 4.0
+    assert len({point["frozen_input_evidence"]["invariant_sha256"]
+                for point in series["points"]}) == 1
+
+    drifted = targets[2]
+    drifted_root = Path(drifted["path"])
+    (drifted_root / "POSCAR").write_text(
+        _slab_poscar(5, "ABC", inner_buckle_a=0.05), encoding="utf-8")
+    drifted["manifest"]["inputs"]["sha256"]["POSCAR"] = _sha(
+        drifted_root / "POSCAR")
+    _write_manifest(drifted_root, drifted["manifest"])
+
+    mixed = build_convergence_analysis_view(
+        spec, targets, method_evidence=lambda target: target["method"])
+    mixed_series = mixed["series"][0]
+    assert all(point["absolute_energy"]["value"] is not None
+               for point in mixed_series["points"])
+    assert mixed_series["platform"]["status"] == "unavailable"
+    assert mixed_series["platform"]["recommendation"]["value"] is None
+    assert any("frozen inputs/structure differ" in issue
+               for issue in mixed_series["issues"])
+
+    (drifted_root / "POSCAR").write_text(
+        _slab_poscar(5, "AA"), encoding="utf-8")
+    drifted["manifest"]["inputs"]["sha256"]["POSCAR"] = _sha(
+        drifted_root / "POSCAR")
+    _write_manifest(drifted_root, drifted["manifest"])
+    stacking_mixed = build_convergence_analysis_view(
+        spec, targets, method_evidence=lambda target: target["method"])
+    assert stacking_mixed["series"][0]["platform"]["status"] == "unavailable"
+    assert any("frozen inputs/structure differ" in issue
+               for issue in stacking_mixed["series"][0]["issues"])
+
+
 def test_convergence_requires_current_clean_completion_and_matching_energy(tmp_path):
     targets = _convergence_targets(tmp_path)
     root = Path(targets[1]["path"])
@@ -478,6 +631,17 @@ def test_convergence_requires_current_clean_completion_and_matching_energy(tmp_p
     assert any("退出码" in issue for issue in bad_exit["series"][0]["issues"])
 
     targets[1]["manifest"]["results"]["diagnosis"]["exit_code"] = 0
+    targets[1]["manifest"]["results"]["diagnosis"]["clean_exit"] = False
+    _write_manifest(root, targets[1]["manifest"])
+    explicitly_unclean = build_convergence_analysis_view(
+        spec, targets, method_evidence=lambda target: target["method"])
+    assert explicitly_unclean["series"][0]["points"][1][
+        "absolute_energy"]["value"] is None
+    assert explicitly_unclean["series"][0]["platform"]["status"] == "unavailable"
+    assert any("clean_exit=false" in issue
+               for issue in explicitly_unclean["series"][0]["issues"])
+
+    targets[1]["manifest"]["results"]["diagnosis"]["clean_exit"] = True
     targets[1]["manifest"]["results"]["energy_e0_eV"] = -99.0
     _write_manifest(root, targets[1]["manifest"])
     mismatch = build_convergence_analysis_view(
@@ -547,6 +711,29 @@ def test_convergence_fails_whole_projection_if_source_changes_mid_parse(tmp_path
             spec, targets, method_evidence=mutate_after_capture)
 
 
+def test_convergence_enforces_one_total_snapshot_budget_for_the_whole_view(
+        tmp_path, monkeypatch):
+    import vcstudio.project.analysis_sources as analysis_sources
+
+    targets = _convergence_targets(tmp_path)
+    first_root = Path(targets[0]["path"])
+    first_total = sum(
+        path.stat().st_size for path in first_root.iterdir() if path.is_file())
+    monkeypatch.setattr(
+        analysis_sources, "MAX_EVIDENCE_TOTAL_BYTES", first_total + 8)
+    spec = normalize_analysis_request(
+        {"analysis_id": "convergence-scan"}, project_id=PROJECT)
+
+    view = build_convergence_analysis_view(
+        spec, targets, method_evidence=lambda target: target["method"])
+
+    series = view["series"][0]
+    assert series["status"] == "unavailable"
+    assert series["available"] is False
+    assert series["platform"]["status"] == "unavailable"
+    assert any("remaining total byte limit" in issue for issue in series["issues"])
+
+
 def test_convergence_points_without_lineage_are_never_combined(tmp_path):
     targets = _convergence_targets(tmp_path)[:2]
     for target in targets:
@@ -574,7 +761,8 @@ def _xdatcar() -> str:
     )
 
 
-def test_aimd_view_is_diagnostic_and_never_promotes_short_trajectory(tmp_path):
+def test_aimd_view_is_diagnostic_and_never_promotes_short_trajectory(
+        tmp_path, monkeypatch):
     root = tmp_path / "aimd"
     root.mkdir()
     (root / "INCAR").write_text(
@@ -611,6 +799,17 @@ def test_aimd_view_is_diagnostic_and_never_promotes_short_trajectory(tmp_path):
     assert view["report_binding"]["final_allowed"] is False
     assert view["figure_data"]["aimd_diagnostic"]["steps"][0]["temperature"] == 300.0
     _assert_quantities_have_provenance(view)
+
+    import vcstudio.project.analysis_sources as analysis_sources
+    monkeypatch.setattr(analysis_sources, "MAX_XDATCAR_FRAMES", 2)
+    over_limit = build_aimd_analysis_view(
+        spec, [target], method_evidence=_method)
+    rejected = over_limit["trajectories"][0]
+    assert rejected["status"] == "unavailable"
+    assert rejected["available"] is False
+    assert all(rejected["metrics"][key]["value"] is None for key in (
+        "trajectory_frames", "max_step_displacement", "final_rmsd", "max_rmsd"))
+    assert any("frame limit" in issue for issue in rejected["issues"])
 
 
 def test_aimd_done_rejects_incomplete_or_unbound_xdatcar(tmp_path):
@@ -655,6 +854,46 @@ def test_aimd_done_rejects_incomplete_or_unbound_xdatcar(tmp_path):
     assert rebound_trajectory["structure_diagnostics"]["status"] == "unavailable"
     assert any("atom count/elements" in issue for issue in rebound_trajectory["issues"])
     assert any("cell does not match" in issue for issue in rebound_trajectory["issues"])
+
+
+def test_aimd_variable_cell_repeated_header_blocks_all_structure_metrics(tmp_path):
+    root = tmp_path / "aimd-variable-cell"
+    root.mkdir()
+    (root / "INCAR").write_text(
+        "IBRION=0\nNSW=3\nPOTIM=1.0\nTEBEG=300\n", encoding="utf-8")
+    (root / "POSCAR").write_text(_poscar(0.0), encoding="utf-8")
+    (root / "OSZICAR").write_text("".join(
+        f" {step} T= 300 E= -10.0 F= -10 E0= -10 EK= 0.1\n"
+        for step in range(1, 4)
+    ), encoding="utf-8")
+    first_header = "H trajectory\n1.0\n10 0 0\n0 10 0\n0 0 10\nH\n1\n"
+    changed_header = "H trajectory\n1.0\n11 0 0\n0 11 0\n0 0 11\nH\n1\n"
+    (root / "XDATCAR").write_text(
+        first_header
+        + "Direct configuration=     1\n0.0000 0 0\n"
+        + changed_header
+        + "Direct configuration=     2\n0.0000 0 0\n"
+        + changed_header
+        + "Direct configuration=     3\n0.0000 0 0\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        "state": "DONE", "task_type": "aimd",
+        "inputs": {"potim_fs": 1.0, "steps": 3, "temp_k": 300.0},
+    }
+    _write_manifest(root, manifest)
+    target = _target(root, "aimd-variable-cell", "aimd", manifest)
+    spec = normalize_analysis_request(
+        {"analysis_id": "aimd-diagnostics"}, project_id=PROJECT)
+
+    view = build_aimd_analysis_view(spec, [target], method_evidence=_method)
+
+    trajectory = view["trajectories"][0]
+    assert trajectory["structure_diagnostics"]["status"] == "unavailable"
+    assert "variable-cell" in trajectory["structure_diagnostics"]["parser_error"]
+    for key in ("trajectory_frames", "max_step_displacement", "final_rmsd", "max_rmsd"):
+        assert trajectory["metrics"][key]["value"] is None
+    assert any("variable-cell" in issue for issue in trajectory["issues"])
 
 
 def test_aimd_xdatcar_sequence_honors_explicit_nblock(tmp_path):

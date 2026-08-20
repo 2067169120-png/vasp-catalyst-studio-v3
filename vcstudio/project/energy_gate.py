@@ -245,7 +245,7 @@ def validate_done_completion_evidence(
 def validate_done_energy_evidence(
         manifest, label, *, oszicar_text='', outcar_text='', vasprun_text='',
         require_oszicar=False, require_current_completion=False,
-        require_outcar_ionic_event=False):
+        require_outcar_ionic_event=False, reject_explicit_unclean=False):
     """Validate DONE energy against already captured authoritative bytes.
 
     ``require_current_completion`` deliberately ignores cached completion flags:
@@ -255,6 +255,7 @@ def validate_done_energy_evidence(
     manifest, clean_source, evidence = validate_done_completion_evidence(
         manifest, label, outcar_text=outcar_text, vasprun_text=vasprun_text,
         require_current_completion=require_current_completion,
+        reject_explicit_unclean=reject_explicit_unclean,
     )
     results = manifest.get('results') or {}
     if not isinstance(results, Mapping):
