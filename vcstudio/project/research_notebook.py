@@ -5,11 +5,12 @@ plain research notes, decisions, and self-attributed local human review records,
 but it never creates or upgrades :class:`ValidationResult` and it never grants a
 ``human_scientific_reviewed`` qualification.
 
-Records are an append-only hash chain.  A stable project-scoped OS lock protects
-revision compare-and-swap across processes, and each JSONL append is one
-``O_APPEND`` write followed by ``fsync``.  Edits append a ``supersedes`` record;
-deletions append a tombstone.  Attachment bytes remain on the project filesystem
-and browser-facing values contain metadata only.
+Records are an append-only hash chain.  A stable external project-identity lock
+protects revision/head/project compare-and-swap across processes, and a separate
+durable head/sequence anchor exposes journal truncation or deletion.  Each JSONL
+append is one ``O_APPEND`` write followed by ``fsync``.  Edits append a
+``supersedes`` record; deletions append a tombstone.  Attachment bytes remain on
+the project filesystem and browser-facing values contain metadata only.
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ import json
 import mimetypes
 import os
 import re
+import stat
 import tempfile
 import threading
 import time
@@ -28,10 +30,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+from vcstudio.shared.secrets import contains_credential, redact_credentials
+
 
 NOTEBOOK_SCHEMA = "vcstudio.research-notebook/v1"
 PUBLIC_SCHEMA = "vcstudio.research-notebook-public/v1"
 ARCHIVE_SCHEMA = "vcstudio.research-notebook-archive/v1"
+ANCHOR_SCHEMA = "vcstudio.research-notebook-anchor/v1"
 JOURNAL_NAME = "ledger.jsonl"
 LOCK_NAME = ".ledger.lock"
 ATTACHMENTS_DIR = "attachments"
@@ -56,6 +61,7 @@ MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 MAX_ATTACHMENTS_TOTAL_BYTES = 50 * 1024 * 1024
 
 _PROJECT_ID_RE = re.compile(r"(?:project-[a-f0-9]{32}|registry-[a-f0-9]{24})")
+_RECORD_ID_RE = re.compile(r"rn-[a-f0-9]{32}")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _ABS_WINDOWS_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])(?:[a-z]:[\\/]|\\\\)[^\s,;，；]+")
@@ -64,17 +70,33 @@ _REMOTE_URL_RE = re.compile(r"(?i)\b(?:https?|s3)://[^\s,;，；]+")
 _ABS_POSIX_RE = re.compile(
     r"(?<![:A-Za-z0-9])/(?!/)(?:[^/\s,;，；]+/)+[^\s,;，；]+"
 )
-_SECRET_VALUE_RE = re.compile(
-    r"(?i)(?:\b(?:github_pat_|gh[opusr]_|sk-)[A-Za-z0-9_-]{12,}"
-    r"|\bAKIA[0-9A-Z]{16}\b|\bBearer\s+\S+"
-    r"|\b(?:password|passwd|secret|token|api[_-]?key|authorization)"
-    r"\s*[:=]\s*[\"']?[^\s,\"'}]+"
-    r"|-----BEGIN[^\r\n]{0,40}PRIVATE KEY-----"
-    r"|https?://[^\s/:]+:[^\s/@]+@)"
-)
 _RESERVED_ACTOR_FIELDS = frozenset({
     "actor_type", "reviewer_type", "made_by", "identity_assurance",
     "entry_method", "cryptographic_signature", "signature_verified",
+})
+_RECORD_FIELDS = frozenset({
+    "schema", "revision", "record_id", "record_type", "category",
+    "project_id", "created_at_utc", "body", "actor", "review", "links",
+    "attachments", "supersedes", "tombstones", "previous_digest",
+    "record_digest",
+})
+_ACTOR_FIELDS = frozenset({
+    "id", "display_name", "role", "actor_type", "entry_method",
+    "identity_assurance",
+})
+_REVIEW_FIELDS = frozenset({
+    "decision", "requested_changes", "signature_attribution",
+    "signature_kind", "cryptographic_signature", "identity_assurance",
+})
+_LINK_FIELDS = frozenset({
+    "kind", "id", "report_revision_id", "bound_digest",
+})
+_ATTACHMENT_FIELDS = frozenset({
+    "attachment_id", "name", "sha256", "size", "media_type",
+})
+_ANCHOR_FIELDS = frozenset({
+    "schema", "project_id", "project_identity_digest", "sequence",
+    "head_digest", "anchor_digest",
 })
 
 _PROCESS_LOCK = threading.RLock()
@@ -87,9 +109,10 @@ class NotebookError(ValueError):
 class NotebookRevisionConflict(NotebookError):
     """Optimistic revision compare-and-swap failed."""
 
-    def __init__(self, current_revision: int):
+    def __init__(self, current_revision: int, current_head_digest: str | None = None):
         super().__init__("research notebook revision conflict")
         self.current_revision = int(current_revision)
+        self.current_head_digest = current_head_digest
 
 
 class NotebookIntegrityError(NotebookError):
@@ -127,7 +150,7 @@ def _validate_text(value: Any, field: str, *, required: bool = False,
         raise NotebookError(f"{field} must not be empty")
     if len(text) > limit:
         raise NotebookError(f"{field} is too long")
-    if _SECRET_VALUE_RE.search(text):
+    if contains_credential(text):
         raise NotebookError(f"{field} contains credential-like material")
     return text
 
@@ -156,8 +179,8 @@ def redact_public_text(value: Any) -> str:
         remote_urls.append(match.group(0))
         return f"<research-notebook-remote-url-{len(remote_urls) - 1}>"
 
+    text = redact_credentials(text)
     text = _REMOTE_URL_RE.sub(preserve_remote_url, text)
-    text = _SECRET_VALUE_RE.sub("[redacted-secret]", text)
     text = _FILE_URI_RE.sub("<local-path>", text)
     text = _ABS_WINDOWS_RE.sub("<local-path>", text)
     text = _ABS_POSIX_RE.sub("<local-path>", text)
@@ -302,46 +325,366 @@ def _validate_bound_links(value: Any, *, project_id: str | None = None) \
         -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise NotebookIntegrityError("record links must be a list")
+    if len(value) > MAX_LINKS:
+        raise NotebookIntegrityError("record links exceed the safety limit")
     links = []
+    seen: set[tuple[str, str, str]] = set()
     for raw in value:
         if not isinstance(raw, Mapping):
             raise NotebookIntegrityError("record link is not an object")
-        kind = str(raw.get("kind") or "")
-        identifier = str(raw.get("id") or "")
+        if set(raw) != _LINK_FIELDS:
+            raise NotebookIntegrityError("record link fields are invalid")
+        kind = raw.get("kind")
+        identifier = raw.get("id")
         revision = raw.get("report_revision_id")
-        digest = str(raw.get("bound_digest") or "")
-        if (kind not in LINK_KINDS or not _TOKEN_RE.fullmatch(identifier)
-                or (revision is not None and not _TOKEN_RE.fullmatch(str(revision)))
+        digest = raw.get("bound_digest")
+        if (not isinstance(kind, str) or kind not in LINK_KINDS
+                or not isinstance(identifier, str) or not _TOKEN_RE.fullmatch(identifier)
+                or (revision is not None and (
+                    not isinstance(revision, str) or not _TOKEN_RE.fullmatch(revision)))
+                or not isinstance(digest, str)
                 or not _SHA256_RE.fullmatch(digest)):
             raise NotebookIntegrityError("record link contract is invalid")
         if (kind == "source") != (revision is not None):
             raise NotebookIntegrityError("record source revision binding is invalid")
         if kind == "project" and project_id is not None and identifier != project_id:
             raise NotebookIntegrityError("record project link binding is invalid")
+        key = (kind, identifier, revision or "")
+        if key in seen:
+            raise NotebookIntegrityError("record links contain a duplicate binding")
+        seen.add(key)
         links.append({
             "kind": kind,
             "id": identifier,
-            "report_revision_id": None if revision is None else str(revision),
+            "report_revision_id": revision,
             "bound_digest": digest,
         })
     return links
 
 
-def _notebook_root(project_locator: str | os.PathLike[str]) -> Path:
-    locator = Path(project_locator).expanduser()
+def _stored_text(value: Any, field: str, *, required: bool = False,
+                 limit: int = 2_000) -> str:
+    try:
+        return _validate_text(value, field, required=required, limit=limit)
+    except NotebookError as exc:
+        raise NotebookIntegrityError(f"stored {field} is invalid") from exc
+
+
+def _validate_stored_actor(value: Any, *, human_required: bool = False) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != _ACTOR_FIELDS:
+        raise NotebookIntegrityError("stored actor fields are invalid")
+    actor_id = value.get("id")
+    if (not isinstance(actor_id, str) or not _TOKEN_RE.fullmatch(actor_id)
+            or contains_credential(actor_id)):
+        raise NotebookIntegrityError("stored actor id is invalid")
+    display_name = _stored_text(
+        value.get("display_name"), "actor.display_name", required=True, limit=160)
+    role = _stored_text(value.get("role"), "actor.role", required=True, limit=120)
+    actor_type = value.get("actor_type")
+    if actor_type == "human":
+        expected = ("local-explicit", "self-asserted-local")
+    elif actor_type == "ai" and not human_required:
+        expected = ("ai-proposal", "declared-software-agent")
+    else:
+        raise NotebookIntegrityError("stored actor type is invalid")
+    if (value.get("entry_method"), value.get("identity_assurance")) != expected:
+        raise NotebookIntegrityError("stored actor assurance is invalid")
+    return {
+        "id": actor_id, "display_name": display_name, "role": role,
+        "actor_type": actor_type, "entry_method": expected[0],
+        "identity_assurance": expected[1],
+    }
+
+
+def _validate_stored_review(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != _REVIEW_FIELDS:
+        raise NotebookIntegrityError("stored review fields are invalid")
+    decision = value.get("decision")
+    if decision not in REVIEW_DECISIONS:
+        raise NotebookIntegrityError("stored review decision is invalid")
+    requested = value.get("requested_changes")
+    if not isinstance(requested, list) or len(requested) > 64:
+        raise NotebookIntegrityError("stored requested changes are invalid")
+    changes = [
+        _stored_text(item, "review.requested_changes", required=True, limit=2_000)
+        for item in requested
+    ]
+    if decision == "request_changes" and not changes:
+        raise NotebookIntegrityError("stored request_changes review has no changes")
+    attribution = value.get("signature_attribution")
+    if attribution is not None:
+        attribution = _stored_text(
+            attribution, "review.signature_attribution", required=True, limit=500)
+    expected_kind = "typed-attribution" if attribution else "none"
+    if (value.get("signature_kind") != expected_kind
+            or value.get("cryptographic_signature") is not False
+            or value.get("identity_assurance") != "self-asserted-local"):
+        raise NotebookIntegrityError("stored review assurance is invalid")
+    return {
+        "decision": decision, "requested_changes": changes,
+        "signature_attribution": attribution, "signature_kind": expected_kind,
+        "cryptographic_signature": False,
+        "identity_assurance": "self-asserted-local",
+    }
+
+
+def _is_reparse(st: os.stat_result) -> bool:
+    attributes = int(getattr(st, "st_file_attributes", 0) or 0)
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return stat.S_ISLNK(st.st_mode) or bool(attributes & reparse_flag)
+
+
+def _absolute_path(value: str | os.PathLike[str]) -> Path:
+    return Path(os.path.abspath(os.path.expanduser(str(value))))
+
+
+def _assert_secure_chain(path: Path, *, require_exists: bool = True,
+                         expected: str | None = None) -> None:
+    """Reject symlinks/junctions/reparse points in every existing component."""
+
+    absolute = _absolute_path(path)
+    current = Path(absolute.anchor)
+    parts = absolute.parts[1:] if absolute.anchor else absolute.parts
+    missing = False
+    for part in parts:
+        current = current / part
+        try:
+            item_stat = os.lstat(current)
+        except FileNotFoundError:
+            missing = True
+            continue
+        except OSError as exc:
+            raise NotebookIntegrityError("secure notebook path is unreadable") from exc
+        if missing:
+            raise NotebookIntegrityError("secure notebook path changed during validation")
+        if _is_reparse(item_stat):
+            raise NotebookIntegrityError(
+                "notebook path must not contain a symlink, junction, or reparse point")
+    if require_exists and missing:
+        raise NotebookIntegrityError("secure notebook path is missing")
+    if not missing and expected:
+        final_stat = os.lstat(absolute)
+        if expected == "directory" and not stat.S_ISDIR(final_stat.st_mode):
+            raise NotebookIntegrityError("secure notebook path is not a directory")
+        if expected == "file" and not stat.S_ISREG(final_stat.st_mode):
+            raise NotebookIntegrityError("secure notebook path is not a regular file")
+
+
+def _ensure_secure_directory(path: Path) -> None:
+    absolute = _absolute_path(path)
+    current = Path(absolute.anchor)
+    for part in (absolute.parts[1:] if absolute.anchor else absolute.parts):
+        current = current / part
+        try:
+            item_stat = os.lstat(current)
+        except FileNotFoundError:
+            try:
+                os.mkdir(current, 0o700)
+            except FileExistsError:
+                pass
+            item_stat = os.lstat(current)
+        if _is_reparse(item_stat) or not stat.S_ISDIR(item_stat.st_mode):
+            raise NotebookIntegrityError(
+                "notebook directory chain must contain only real directories")
+    if os.path.normcase(os.path.realpath(absolute)) != os.path.normcase(str(absolute)):
+        raise NotebookIntegrityError("notebook directory chain changed during validation")
+
+
+def _assert_contained(root: Path, path: Path) -> None:
+    root_text = os.path.normcase(str(_absolute_path(root)))
+    path_text = os.path.normcase(str(_absolute_path(path)))
+    try:
+        contained = os.path.commonpath([root_text, path_text]) == root_text
+    except ValueError:
+        contained = False
+    if not contained:
+        raise NotebookIntegrityError("notebook path escaped its canonical project root")
+
+
+def _normalize_handle_path(value: str) -> str:
+    path = str(value)
+    if path.startswith("\\\\?\\UNC\\"):
+        path = "\\\\" + path[8:]
+    elif path.startswith("\\\\?\\"):
+        path = path[4:]
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _windows_handle_path(handle: int) -> str:  # pragma: no cover - Windows-only helper
+    import ctypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    final_name = kernel.GetFinalPathNameByHandleW
+    final_name.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                           ctypes.c_uint, ctypes.c_uint]
+    final_name.restype = ctypes.c_uint
+    buffer = ctypes.create_unicode_buffer(32_768)
+    length = final_name(ctypes.c_void_p(handle), buffer, len(buffer), 0)
+    if not length or length >= len(buffer):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return _normalize_handle_path(buffer.value)
+
+
+def _opened_file_path(descriptor: int) -> str | None:
+    if os.name == "nt":
+        import msvcrt
+
+        return _windows_handle_path(msvcrt.get_osfhandle(descriptor))
+    proc_path = f"/proc/self/fd/{descriptor}"
+    try:
+        return _normalize_handle_path(os.readlink(proc_path))
+    except OSError:  # pragma: no cover - non-Linux POSIX fallback
+        return None
+
+
+def _directory_handle_path(path: Path) -> str:
+    """Resolve an existing directory from its no-follow OS handle."""
+
+    path = _absolute_path(path)
+    if os.name == "nt":
+        import ctypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        create = kernel.CreateFileW
+        create.argtypes = [ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_uint,
+                           ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint,
+                           ctypes.c_void_p]
+        create.restype = ctypes.c_void_p
+        handle = create(
+            str(path), 0x80, 0x1 | 0x2 | 0x4, None, 3,
+            0x02000000 | 0x00200000, None)
+        invalid = ctypes.c_void_p(-1).value
+        if handle == invalid:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            return _windows_handle_path(handle)
+        finally:
+            kernel.CloseHandle(ctypes.c_void_p(handle))
+    descriptor = os.open(
+        str(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        return _opened_file_path(descriptor) or _normalize_handle_path(str(path))
+    finally:
+        os.close(descriptor)
+
+
+def _secure_open(path: Path, flags: int, mode: int = 0o600) -> int:
+    """Open a regular file without following a final link and verify the inode."""
+
+    path = _absolute_path(path)
+    _assert_secure_chain(path.parent, expected="directory")
+    try:
+        before = os.lstat(path)
+    except FileNotFoundError:
+        before = None
+    if before is not None and (_is_reparse(before) or not stat.S_ISREG(before.st_mode)):
+        raise NotebookIntegrityError("notebook file must be a non-reparse regular file")
+    descriptor = os.open(
+        str(path), flags | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0), mode)
+    try:
+        opened = os.fstat(descriptor)
+        after = os.lstat(path)
+        opened_path = _opened_file_path(descriptor)
+        if (_is_reparse(after) or not stat.S_ISREG(opened.st_mode)
+                or not stat.S_ISREG(after.st_mode)
+                or (opened.st_dev, opened.st_ino) != (after.st_dev, after.st_ino)
+                or (opened_path is not None
+                    and opened_path != _normalize_handle_path(str(path)))):
+            raise NotebookIntegrityError("notebook file changed during no-follow open")
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _read_regular_bytes(path: Path, *, maximum: int | None = None) -> bytes:
+    descriptor = _secure_open(path, os.O_RDONLY)
+    try:
+        size = os.fstat(descriptor).st_size
+        if maximum is not None and size > maximum:
+            raise NotebookIntegrityError("notebook file exceeds the safety limit")
+        chunks = []
+        remaining = size
+        while remaining:
+            block = os.read(descriptor, min(1024 * 1024, remaining))
+            if not block:
+                raise NotebookIntegrityError("notebook file changed during read")
+            chunks.append(block)
+            remaining -= len(block)
+        if os.read(descriptor, 1):
+            raise NotebookIntegrityError("notebook file grew during read")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _durable_replace(source: Path, target: Path) -> None:
+    """Replace a regular file and durably publish its directory entry."""
+
+    _assert_secure_chain(source, expected="file")
+    _assert_secure_chain(target.parent, expected="directory")
+    try:
+        target_stat = os.lstat(target)
+    except FileNotFoundError:
+        target_stat = None
+    if target_stat is not None and (
+            _is_reparse(target_stat) or not stat.S_ISREG(target_stat.st_mode)):
+        raise NotebookIntegrityError("replace target is not a regular file")
+    if os.name == "nt":
+        import ctypes
+
+        move = ctypes.windll.kernel32.MoveFileExW
+        move.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint]
+        move.restype = ctypes.c_int
+        # REPLACE_EXISTING | WRITE_THROUGH makes the metadata replacement
+        # durable before the ledger can reference it.
+        if not move(str(source), str(target), 0x1 | 0x8):
+            raise ctypes.WinError()
+    else:
+        os.replace(source, target)
+        _fsync_directory(target.parent)
+    _assert_secure_chain(target, expected="file")
+
+
+def _canonical_project_root(project_locator: str | os.PathLike[str]) -> Path:
+    locator = _absolute_path(project_locator)
     if locator.name.lower() in {"project.yaml", "project.yml"} or locator.suffix.lower() in {
             ".yaml", ".yml"}:
+        if locator.exists():
+            _assert_secure_chain(locator, expected="file")
         project_root = locator.parent
     else:
         project_root = locator
-    return project_root.resolve() / ".vcstudio" / "research-notebook"
+    _assert_secure_chain(project_root, expected="directory")
+    canonical = Path(_directory_handle_path(project_root))
+    if _normalize_handle_path(str(canonical)) != _normalize_handle_path(str(project_root)):
+        raise NotebookIntegrityError("canonical project root traverses a link or reparse point")
+    return canonical
+
+
+def _default_anchor_root() -> Path:
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    return _absolute_path(base) / "VASP Catalyst Studio" / "research-notebook-anchors"
 
 
 @contextmanager
 def _exclusive_lock(lock_path: Path, *, timeout: float = 10.0):
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_secure_directory(lock_path.parent)
     deadline = time.monotonic() + max(0.1, float(timeout))
-    with _PROCESS_LOCK, lock_path.open("a+b") as handle:
+    descriptor = _secure_open(lock_path, os.O_CREAT | os.O_RDWR)
+    with _PROCESS_LOCK, os.fdopen(descriptor, "r+b") as handle:
         handle.seek(0, os.SEEK_END)
         if handle.tell() == 0:
             handle.write(b"\0")
@@ -418,6 +761,11 @@ def notebook_limitations() -> list[dict[str, str]]:
             "zh": "附件正文保留在项目本地；共享归档只含安全元数据与哈希。",
             "en": "Attachment bytes remain project-local; shared archives include safe metadata and hashes.",
         },
+        {
+            "code": "local_rollback_anchor",
+            "zh": "journal head/sequence 由项目外本机锚点检测回滚；它不是远程见证或硬件证明。",
+            "en": "A machine-local external head/sequence anchor detects rollback; it is not a remote witness or hardware attestation.",
+        },
     ]
 
 
@@ -425,86 +773,291 @@ class ResearchNotebook:
     """One project-local append-only notebook journal."""
 
     def __init__(self, project_locator: str | os.PathLike[str], project_id: str,
-                 *, lock_timeout: float = 10.0):
+                 *, lock_timeout: float = 10.0,
+                 anchor_root: str | os.PathLike[str] | None = None,
+                 project_identity_digest: str | None = None):
         self.project_id = _validate_project_id(project_id)
-        self.root = _notebook_root(project_locator)
+        self.project_root = _canonical_project_root(project_locator)
+        self.root = self.project_root / ".vcstudio" / "research-notebook"
+        _assert_contained(self.project_root, self.root)
         self.journal_path = self.root / JOURNAL_NAME
-        self.lock_path = self.root / LOCK_NAME
         self.attachments_path = self.root / ATTACHMENTS_DIR
+        derived_identity = digest_json({
+            "project_id": self.project_id,
+            "canonical_project_root": os.path.normcase(str(self.project_root)),
+        })
+        if project_identity_digest is not None and (
+                not isinstance(project_identity_digest, str)
+                or not _SHA256_RE.fullmatch(project_identity_digest)):
+            raise NotebookError("project_identity_digest must be a SHA-256 digest")
+        self.project_identity_digest = project_identity_digest or derived_identity
+        self.anchor_root = _absolute_path(anchor_root or _default_anchor_root())
+        anchor_key = hashlib.sha256(
+            self.project_identity_digest.encode("ascii")).hexdigest()
+        self.anchor_path = self.anchor_root / f"{anchor_key}.json"
+        self.lock_path = self.anchor_root / f"{anchor_key}{LOCK_NAME}"
         self.lock_timeout = float(lock_timeout)
 
-    def _read_locked(self) -> list[dict[str, Any]]:
-        if not self.journal_path.exists():
-            return []
+    @staticmethod
+    def _anchor_digest(anchor: Mapping[str, Any]) -> str:
+        payload = dict(anchor)
+        payload.pop("anchor_digest", None)
+        return digest_json(payload)
+
+    def _read_anchor_locked(self) -> dict[str, Any] | None:
         try:
-            size = self.journal_path.stat().st_size
-        except OSError as exc:
-            raise NotebookIntegrityError("notebook journal is unreadable") from exc
-        if size > 512 * 1024 * 1024:
-            raise NotebookIntegrityError("notebook journal exceeds the safety limit")
+            os.lstat(self.anchor_path)
+        except FileNotFoundError:
+            return None
+        raw = _read_regular_bytes(self.anchor_path, maximum=64 * 1024)
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise NotebookIntegrityError("notebook head anchor is invalid") from exc
+        if not isinstance(value, dict) or set(value) != _ANCHOR_FIELDS:
+            raise NotebookIntegrityError("notebook head anchor fields are invalid")
+        if (value.get("schema") != ANCHOR_SCHEMA
+                or value.get("project_id") != self.project_id
+                or value.get("project_identity_digest") != self.project_identity_digest
+                or isinstance(value.get("sequence"), bool)
+                or not isinstance(value.get("sequence"), int)
+                or value.get("sequence") < 1
+                or not isinstance(value.get("head_digest"), str)
+                or not _SHA256_RE.fullmatch(value.get("head_digest"))
+                or value.get("anchor_digest") != self._anchor_digest(value)):
+            raise NotebookIntegrityError("notebook head anchor contract is invalid")
+        return value
+
+    def _write_anchor_locked(self, row: Mapping[str, Any]) -> None:
+        previous = self._read_anchor_locked()
+        revision = int(row["revision"])
+        expected_previous = str(row["previous_digest"])
+        if previous is None:
+            if revision != 1 or expected_previous:
+                raise NotebookIntegrityError("notebook head anchor is missing")
+        elif (previous["sequence"] != revision - 1
+              or previous["head_digest"] != expected_previous):
+            raise NotebookIntegrityError("notebook head anchor cannot be rolled back")
+        anchor = {
+            "schema": ANCHOR_SCHEMA,
+            "project_id": self.project_id,
+            "project_identity_digest": self.project_identity_digest,
+            "sequence": revision,
+            "head_digest": str(row["record_digest"]),
+        }
+        anchor["anchor_digest"] = self._anchor_digest(anchor)
+        _ensure_secure_directory(self.anchor_root)
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{self.anchor_path.name}.", suffix=".tmp",
+            dir=str(self.anchor_root))
+        temporary_path = Path(temporary)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = -1
+                handle.write(_canonical_bytes(anchor) + b"\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            _durable_replace(temporary_path, self.anchor_path)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _verify_attachment_locked(self, raw: Any) -> dict[str, Any]:
+        if not isinstance(raw, Mapping) or set(raw) != _ATTACHMENT_FIELDS:
+            raise NotebookIntegrityError("stored attachment fields are invalid")
+        digest = raw.get("sha256")
+        size = raw.get("size")
+        attachment_id = raw.get("attachment_id")
+        if (not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest)
+                or isinstance(size, bool) or not isinstance(size, int)
+                or size <= 0 or size > MAX_ATTACHMENT_BYTES
+                or attachment_id != f"attachment-{digest[:24]}"):
+            raise NotebookIntegrityError("stored attachment contract is invalid")
+        try:
+            name = _safe_attachment_name(raw.get("name"))
+            media_type = _validate_text(
+                raw.get("media_type"), "attachment.media_type", required=True, limit=100)
+        except NotebookError as exc:
+            raise NotebookIntegrityError("stored attachment metadata is invalid") from exc
+        target = self.attachments_path / f"{digest}.bin"
+        _assert_contained(self.root, target)
+        try:
+            content = _read_regular_bytes(target, maximum=MAX_ATTACHMENT_BYTES)
+        except (OSError, NotebookIntegrityError) as exc:
+            raise NotebookIntegrityError("stored attachment blob is missing or invalid") from exc
+        if len(content) != size or hashlib.sha256(content).hexdigest() != digest:
+            raise NotebookIntegrityError("stored attachment blob digest mismatch")
+        return {
+            "attachment_id": attachment_id, "name": name, "sha256": digest,
+            "size": size, "media_type": media_type,
+        }
+
+    def _read_locked(self) -> list[dict[str, Any]]:
+        _assert_secure_chain(self.root, require_exists=False)
+        try:
+            os.lstat(self.journal_path)
+        except FileNotFoundError:
+            journal = None
+        else:
+            journal = _read_regular_bytes(
+                self.journal_path, maximum=512 * 1024 * 1024)
         rows: list[dict[str, Any]] = []
         previous_digest = ""
-        try:
-            with self.journal_path.open("r", encoding="utf-8") as handle:
-                for line_number, raw_line in enumerate(handle, start=1):
-                    if not raw_line.endswith("\n"):
+        active: dict[str, dict[str, Any]] = {}
+        seen: set[str] = set()
+        if journal is not None:
+            try:
+                text = journal.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise NotebookIntegrityError("notebook journal is not valid UTF-8") from exc
+            raw_lines = text.splitlines(keepends=True)
+            for line_number, raw_line in enumerate(raw_lines, start=1):
+                if not raw_line.endswith("\n"):
+                    raise NotebookIntegrityError(
+                        "notebook journal has a partial final record",
+                        line_number=line_number)
+                try:
+                    row = json.loads(raw_line)
+                except json.JSONDecodeError as exc:
+                    raise NotebookIntegrityError(
+                        "notebook journal contains invalid JSON",
+                        line_number=line_number) from exc
+                if not isinstance(row, dict) or set(row) != _RECORD_FIELDS:
+                    raise NotebookIntegrityError(
+                        "notebook journal record fields are invalid",
+                        line_number=line_number)
+                expected_revision = len(rows) + 1
+                checks = {
+                    "schema": NOTEBOOK_SCHEMA, "project_id": self.project_id,
+                    "revision": expected_revision, "previous_digest": previous_digest,
+                }
+                for key, expected in checks.items():
+                    if row.get(key) != expected or (
+                            key == "revision" and isinstance(row.get(key), bool)):
                         raise NotebookIntegrityError(
-                            "notebook journal has a partial final record",
-                            line_number=line_number,
-                        )
-                    try:
-                        row = json.loads(raw_line)
-                    except json.JSONDecodeError as exc:
+                            f"notebook journal {key} binding mismatch",
+                            line_number=line_number)
+                record_id = row.get("record_id")
+                if (not isinstance(record_id, str)
+                        or not _RECORD_ID_RE.fullmatch(record_id) or record_id in seen):
+                    raise NotebookIntegrityError(
+                        "notebook record_id is invalid or duplicated",
+                        line_number=line_number)
+                seen.add(record_id)
+                record_type = row.get("record_type")
+                category = row.get("category")
+                if record_type not in RECORD_TYPES or not isinstance(category, str):
+                    raise NotebookIntegrityError(
+                        "notebook record type/category is invalid",
+                        line_number=line_number)
+                _stored_text(row.get("body"), "body", required=True,
+                             limit=MAX_BODY_CHARS)
+                timestamp = row.get("created_at_utc")
+                try:
+                    parsed = datetime.fromisoformat(timestamp)
+                except (TypeError, ValueError) as exc:
+                    raise NotebookIntegrityError(
+                        "notebook record timestamp is invalid",
+                        line_number=line_number) from exc
+                if parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+                    raise NotebookIntegrityError(
+                        "notebook record timestamp must be UTC",
+                        line_number=line_number)
+                human_required = record_type in {"review", "tombstone"}
+                _validate_stored_actor(row.get("actor"), human_required=human_required)
+                links = _validate_bound_links(
+                    row.get("links"), project_id=self.project_id)
+                attachments_value = row.get("attachments")
+                if not isinstance(attachments_value, list) \
+                        or len(attachments_value) > MAX_ATTACHMENTS:
+                    raise NotebookIntegrityError("stored attachments are invalid")
+                attachment_ids: set[str] = set()
+                attachment_total = 0
+                for attachment in attachments_value:
+                    verified = self._verify_attachment_locked(attachment)
+                    if verified["attachment_id"] in attachment_ids:
+                        raise NotebookIntegrityError("stored attachments contain duplicates")
+                    attachment_ids.add(verified["attachment_id"])
+                    attachment_total += verified["size"]
+                if attachment_total > MAX_ATTACHMENTS_TOTAL_BYTES:
+                    raise NotebookIntegrityError(
+                        "stored attachments exceed the total safety limit")
+                supersedes = row.get("supersedes")
+                tombstones = row.get("tombstones")
+                if supersedes is not None and (
+                        not isinstance(supersedes, str)
+                        or not _TOKEN_RE.fullmatch(supersedes)):
+                    raise NotebookIntegrityError("stored supersedes target is invalid")
+                if tombstones is not None and (
+                        not isinstance(tombstones, str)
+                        or not _TOKEN_RE.fullmatch(tombstones)):
+                    raise NotebookIntegrityError("stored tombstone target is invalid")
+                if record_type == "tombstone":
+                    if (category != "tombstone" or supersedes is not None
+                            or not tombstones or row.get("review") is not None
+                            or links or attachments_value or tombstones not in active):
                         raise NotebookIntegrityError(
-                            "notebook journal contains invalid JSON",
-                            line_number=line_number,
-                        ) from exc
-                    if not isinstance(row, dict):
+                            "tombstone state transition is invalid",
+                            line_number=line_number)
+                    active.pop(tombstones)
+                else:
+                    expected_category = (
+                        category in NOTE_CATEGORIES if record_type == "note"
+                        else category == record_type)
+                    if not expected_category or tombstones is not None:
                         raise NotebookIntegrityError(
-                            "notebook journal record is not an object",
-                            line_number=line_number,
-                        )
-                    expected_revision = len(rows) + 1
-                    checks = {
-                        "schema": NOTEBOOK_SCHEMA,
-                        "project_id": self.project_id,
-                        "revision": expected_revision,
-                        "previous_digest": previous_digest,
-                    }
-                    for key, expected in checks.items():
-                        if row.get(key) != expected:
+                            "record category/state is invalid", line_number=line_number)
+                    if record_type == "review":
+                        _validate_stored_review(row.get("review"))
+                    elif row.get("review") is not None:
+                        raise NotebookIntegrityError(
+                            "non-review record contains review fields",
+                            line_number=line_number)
+                    if supersedes is not None:
+                        target = active.get(supersedes)
+                        if target is None or target.get("record_type") != record_type:
                             raise NotebookIntegrityError(
-                                f"notebook journal {key} binding mismatch",
-                                line_number=line_number,
-                            )
-                    if row.get("record_type") not in RECORD_TYPES:
-                        raise NotebookIntegrityError(
-                            "notebook record_type is invalid", line_number=line_number
-                        )
-                    if not _TOKEN_RE.fullmatch(str(row.get("record_id") or "")):
-                        raise NotebookIntegrityError(
-                            "notebook record_id is invalid", line_number=line_number
-                        )
-                    _validate_bound_links(row.get("links"), project_id=self.project_id)
-                    actual_digest = str(row.get("record_digest") or "")
-                    if actual_digest != _record_digest(row):
-                        raise NotebookIntegrityError(
-                            "notebook record digest mismatch", line_number=line_number
-                        )
-                    previous_digest = actual_digest
-                    rows.append(row)
-                    if len(rows) > MAX_RECORDS:
-                        raise NotebookIntegrityError("notebook contains too many records")
-        except UnicodeDecodeError as exc:
-            raise NotebookIntegrityError("notebook journal is not valid UTF-8") from exc
+                                "supersedes state transition is invalid",
+                                line_number=line_number)
+                        active.pop(supersedes)
+                    active[record_id] = row
+                actual_digest = row.get("record_digest")
+                if (not isinstance(actual_digest, str)
+                        or not _SHA256_RE.fullmatch(actual_digest)
+                        or actual_digest != _record_digest(row)):
+                    raise NotebookIntegrityError(
+                        "notebook record digest mismatch", line_number=line_number)
+                previous_digest = actual_digest
+                rows.append(row)
+                if len(rows) > MAX_RECORDS:
+                    raise NotebookIntegrityError("notebook contains too many records")
+        anchor = self._read_anchor_locked()
+        if rows:
+            if (anchor is None or anchor["sequence"] != len(rows)
+                    or anchor["head_digest"] != previous_digest):
+                raise NotebookIntegrityError(
+                    "notebook journal is truncated, deleted, or rolled back")
+        elif anchor is not None:
+            raise NotebookIntegrityError(
+                "notebook journal is missing behind its durable head anchor")
         return rows
 
     def _append_locked(self, row: dict[str, Any]) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
+        _ensure_secure_directory(self.root)
+        _assert_contained(self.project_root, self.journal_path)
         payload = _canonical_bytes(row) + b"\n"
-        descriptor = os.open(
-            str(self.journal_path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600
-        )
+        try:
+            os.lstat(self.journal_path)
+        except FileNotFoundError:
+            created = True
+        else:
+            created = False
+        descriptor = _secure_open(
+            self.journal_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY)
         try:
             written = os.write(descriptor, payload)
             if written != len(payload):
@@ -512,6 +1065,9 @@ class ResearchNotebook:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+        if created:
+            _fsync_directory(self.root)
+        self._write_anchor_locked(row)
 
     def _store_attachments_locked(self, attachments: Iterable[Mapping[str, Any]]) \
             -> list[dict[str, Any]]:
@@ -534,11 +1090,20 @@ class ResearchNotebook:
             if total > MAX_ATTACHMENTS_TOTAL_BYTES:
                 raise NotebookError("attachments exceed the total size limit")
             sha256 = hashlib.sha256(content).hexdigest()
-            self.attachments_path.mkdir(parents=True, exist_ok=True)
+            _ensure_secure_directory(self.attachments_path)
             target = self.attachments_path / f"{sha256}.bin"
-            if target.exists():
-                if target.stat().st_size != len(content):
-                    raise NotebookIntegrityError("content-addressed attachment size mismatch")
+            _assert_contained(self.root, target)
+            try:
+                os.lstat(target)
+            except FileNotFoundError:
+                existing = None
+            else:
+                existing = _read_regular_bytes(target, maximum=MAX_ATTACHMENT_BYTES)
+            if existing is not None:
+                if (len(existing) != len(content)
+                        or hashlib.sha256(existing).hexdigest() != sha256):
+                    raise NotebookIntegrityError(
+                        "content-addressed attachment digest mismatch")
             else:
                 descriptor, temporary = tempfile.mkstemp(
                     prefix=f".{sha256}.", suffix=".tmp", dir=str(self.attachments_path)
@@ -550,7 +1115,7 @@ class ResearchNotebook:
                         handle.write(content)
                         handle.flush()
                         os.fsync(handle.fileno())
-                    os.replace(temporary_path, target)
+                    _durable_replace(temporary_path, target)
                 finally:
                     if descriptor >= 0:
                         os.close(descriptor)
@@ -558,6 +1123,9 @@ class ResearchNotebook:
                         temporary_path.unlink()
                     except FileNotFoundError:
                         pass
+            stored = _read_regular_bytes(target, maximum=MAX_ATTACHMENT_BYTES)
+            if len(stored) != len(content) or hashlib.sha256(stored).hexdigest() != sha256:
+                raise NotebookIntegrityError("stored attachment failed post-replace verification")
             media_type = _validate_text(
                 raw.get("media_type", ""), "attachment.media_type", limit=100
             ) or mimetypes.guess_type(name)[0] or "application/octet-stream"
@@ -572,21 +1140,38 @@ class ResearchNotebook:
 
     @staticmethod
     def _active_ids(rows: list[dict[str, Any]]) -> set[str]:
-        superseded = {
-            str(row.get("supersedes")) for row in rows if row.get("supersedes")
-        }
-        tombstoned = {
-            str(row.get("tombstones")) for row in rows if row.get("tombstones")
-        }
-        return {
-            str(row["record_id"]) for row in rows
-            if row.get("record_type") != "tombstone"
-            and row.get("record_id") not in superseded
-            and row.get("record_id") not in tombstoned
-        }
+        active: set[str] = set()
+        for row in rows:
+            if row["record_type"] == "tombstone":
+                active.remove(row["tombstones"])
+                continue
+            if row["supersedes"] is not None:
+                active.remove(row["supersedes"])
+            active.add(row["record_id"])
+        return active
+
+    def _assert_cas(self, rows: list[dict[str, Any]], *, expected_revision: int,
+                    expected_head_digest: str | None,
+                    expected_project_identity: str) -> None:
+        if (isinstance(expected_revision, bool)
+                or not isinstance(expected_revision, int) or expected_revision < 0):
+            raise NotebookError("expected_revision must be a non-negative integer")
+        if (not isinstance(expected_project_identity, str)
+                or not _SHA256_RE.fullmatch(expected_project_identity)):
+            raise NotebookError("expected_project_identity must be a SHA-256 digest")
+        if expected_head_digest is not None and (
+                not isinstance(expected_head_digest, str)
+                or not _SHA256_RE.fullmatch(expected_head_digest)):
+            raise NotebookError("expected_head_digest must be null or a SHA-256 digest")
+        current_head = str(rows[-1]["record_digest"]) if rows else None
+        if (len(rows) != expected_revision or current_head != expected_head_digest
+                or self.project_identity_digest != expected_project_identity):
+            raise NotebookRevisionConflict(len(rows), current_head)
 
     def append(self, *, record_type: str, category: str, body: str,
                actor: Mapping[str, Any], expected_revision: int,
+               expected_head_digest: str | None,
+               expected_project_identity: str,
                links: list[dict[str, Any]] | None = None,
                supersedes: str | None = None,
                review: Mapping[str, Any] | None = None,
@@ -609,9 +1194,6 @@ class ResearchNotebook:
         review_value = _review(review) if record_type == "review" else None
         if record_type != "review" and review is not None:
             raise NotebookError("review payload is only valid for review records")
-        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) \
-                or expected_revision < 0:
-            raise NotebookError("expected_revision must be a non-negative integer")
         supersedes_id = None if supersedes is None else _validate_token(
             supersedes, "supersedes"
         )
@@ -624,8 +1206,10 @@ class ResearchNotebook:
         with _exclusive_lock(self.lock_path, timeout=self.lock_timeout):
             rows = self._read_locked()
             current_revision = len(rows)
-            if current_revision != expected_revision:
-                raise NotebookRevisionConflict(current_revision)
+            self._assert_cas(
+                rows, expected_revision=expected_revision,
+                expected_head_digest=expected_head_digest,
+                expected_project_identity=expected_project_identity)
             if supersedes_id:
                 by_id = {str(item["record_id"]): item for item in rows}
                 target = by_id.get(supersedes_id)
@@ -657,17 +1241,17 @@ class ResearchNotebook:
             return self.public_record(row, resolver=None, active=True)
 
     def tombstone(self, *, record_id: str, reason: str, actor: Mapping[str, Any],
-                  expected_revision: int) -> dict[str, Any]:
+                  expected_revision: int, expected_head_digest: str | None,
+                  expected_project_identity: str) -> dict[str, Any]:
         target_id = _validate_token(record_id, "record_id")
         reason_text = _validate_text(reason, "reason", required=True, limit=2_000)
         actor_value = _actor(actor)
-        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) \
-                or expected_revision < 0:
-            raise NotebookError("expected_revision must be a non-negative integer")
         with _exclusive_lock(self.lock_path, timeout=self.lock_timeout):
             rows = self._read_locked()
-            if len(rows) != expected_revision:
-                raise NotebookRevisionConflict(len(rows))
+            self._assert_cas(
+                rows, expected_revision=expected_revision,
+                expected_head_digest=expected_head_digest,
+                expected_project_identity=expected_project_identity)
             if target_id not in self._active_ids(rows):
                 raise NotebookError("tombstone must reference an active record")
             previous_digest = str(rows[-1]["record_digest"]) if rows else ""
@@ -801,6 +1385,7 @@ class ResearchNotebook:
                 "schema": PUBLIC_SCHEMA,
                 "ok": False,
                 "project_id": self.project_id,
+                "project_identity_digest": self.project_identity_digest,
                 "revision": 0,
                 "head_digest": None,
                 "integrity_status": "tampered",
@@ -831,6 +1416,7 @@ class ResearchNotebook:
             "schema": PUBLIC_SCHEMA,
             "ok": True,
             "project_id": self.project_id,
+            "project_identity_digest": self.project_identity_digest,
             "revision": len(rows),
             "head_digest": rows[-1]["record_digest"] if rows else None,
             "integrity_status": "current",
@@ -854,6 +1440,7 @@ class ResearchNotebook:
         return {
             "schema": ARCHIVE_SCHEMA,
             "project_id": self.project_id,
+            "project_identity_digest": self.project_identity_digest,
             "bound_report_revision_id": report_revision_id,
             "ledger_revision": snapshot["revision"],
             "ledger_head_digest": snapshot["head_digest"],
@@ -873,7 +1460,9 @@ class AttachmentSelections:
         self._ttl = float(ttl_seconds)
         self._max_items = int(max_items)
         self._lock = threading.RLock()
-        self._items: dict[str, tuple[float, str, list[dict[str, Any]]]] = {}
+        self._items: dict[
+            str, tuple[float, str, str, list[dict[str, Any]]]
+        ] = {}
 
     def _prune(self, now: float) -> None:
         expired = [key for key, value in self._items.items() if now - value[0] > self._ttl]
@@ -883,18 +1472,25 @@ class AttachmentSelections:
             oldest = min(self._items, key=lambda key: self._items[key][0])
             self._items.pop(oldest, None)
 
-    def register(self, paths: Iterable[str | os.PathLike[str]], *, project_id: str) \
+    def register(self, paths: Iterable[str | os.PathLike[str]], *, project_id: str,
+                 project_identity_digest: str) \
             -> dict[str, Any]:
         identifier = _validate_project_id(project_id)
+        if (not isinstance(project_identity_digest, str)
+                or not _SHA256_RE.fullmatch(project_identity_digest)):
+            raise NotebookError("attachment selection project identity is invalid")
         selected = []
         for raw in list(paths or [])[:MAX_ATTACHMENTS]:
-            path = Path(raw).expanduser().resolve()
-            if not path.is_file():
-                raise NotebookError("selected attachment is not a readable file")
-            size = path.stat().st_size
+            path = _absolute_path(raw)
+            try:
+                data = _read_regular_bytes(path, maximum=MAX_ATTACHMENT_BYTES)
+            except (OSError, NotebookIntegrityError) as exc:
+                raise NotebookError(
+                    "selected attachment must be a non-reparse regular file") from exc
+            size = len(data)
             if size <= 0 or size > MAX_ATTACHMENT_BYTES:
                 raise NotebookError("selected attachment size is outside the allowed range")
-            sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+            sha256 = hashlib.sha256(data).hexdigest()
             selected.append({
                 "path": str(path),
                 "name": _safe_attachment_name(path.name),
@@ -910,7 +1506,8 @@ class AttachmentSelections:
         now = float(self._clock())
         with self._lock:
             self._prune(now)
-            self._items[token] = (now, identifier, selected)
+            self._items[token] = (
+                now, identifier, project_identity_digest, selected)
         return {
             "selection_token": token,
             "files": [
@@ -919,7 +1516,8 @@ class AttachmentSelections:
             ],
         }
 
-    def consume(self, token: str, *, project_id: str) -> list[dict[str, Any]]:
+    def consume(self, token: str, *, project_id: str,
+                project_identity_digest: str) -> list[dict[str, Any]]:
         now = float(self._clock())
         with self._lock:
             self._prune(now)
@@ -928,12 +1526,14 @@ class AttachmentSelections:
             raise NotebookError("attachment selection token is invalid or expired")
         if selected[1] != _validate_project_id(project_id):
             raise NotebookError("attachment selection project binding mismatch")
+        if selected[2] != project_identity_digest:
+            raise NotebookError("attachment selection project identity mismatch")
         attachments = []
-        for metadata in selected[2]:
+        for metadata in selected[3]:
             path = Path(metadata["path"])
             try:
-                data = path.read_bytes()
-            except OSError as exc:
+                data = _read_regular_bytes(path, maximum=MAX_ATTACHMENT_BYTES)
+            except (OSError, NotebookIntegrityError) as exc:
                 raise NotebookError("selected attachment is no longer available") from exc
             if (len(data) != metadata["size"]
                     or hashlib.sha256(data).hexdigest() != metadata["sha256"]):
@@ -948,6 +1548,7 @@ class AttachmentSelections:
 
 __all__ = [
     "ARCHIVE_SCHEMA",
+    "ANCHOR_SCHEMA",
     "AttachmentSelections",
     "LINK_KINDS",
     "NOTEBOOK_SCHEMA",

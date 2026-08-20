@@ -128,6 +128,14 @@ def _assert_no_registered_locator(value, locators, *, forbid_project_keys=True):
     visit(value)
 
 
+def _notebook_guard(view):
+    return {
+        "revision": view["revision"],
+        "head_digest": view["head_digest"],
+        "project_identity_digest": view["project_identity_digest"],
+    }
+
+
 def test_four_public_project_dtos_are_recursively_locator_free(tmp_path):
     api, locators, _projects = _api(tmp_path)
 
@@ -198,7 +206,7 @@ def test_research_notebook_api_uses_opaque_project_identity_revision_cas_and_saf
         "body": r"Observed under C:\private\project\OUTCAR",
         "actor": actor,
         "links": [{"kind": "project", "id": project_id}],
-    }, 0)
+    }, _notebook_guard(empty))
 
     assert created["ok"] is True
     assert created["revision"] == 1
@@ -209,7 +217,7 @@ def test_research_notebook_api_uses_opaque_project_identity_revision_cas_and_saf
     conflict = api.research_notebook_append(project_id, {
         "record_type": "decision", "category": "decision", "body": "Keep baseline",
         "actor": actor,
-    }, 0)
+    }, _notebook_guard(empty))
     assert conflict["ok"] is False
     assert conflict["error_code"] == "revision_conflict"
     assert conflict["revision"] == 1
@@ -218,6 +226,7 @@ def test_research_notebook_api_uses_opaque_project_identity_revision_cas_and_saf
 def test_research_notebook_api_rejects_actor_spoof_and_gate_fields(tmp_path):
     api, locators, _projects = _api(tmp_path)
     project_id = api.proj_list()["projects"][0]["project_id"]
+    empty = api.research_notebook_bootstrap(project_id)
     spoofed = api.research_notebook_append(project_id, {
         "record_type": "review", "category": "review", "body": "Approved",
         "actor": {
@@ -225,12 +234,12 @@ def test_research_notebook_api_rejects_actor_spoof_and_gate_fields(tmp_path):
             "reviewer_type": "human",
         },
         "review": {"decision": "approved", "local_human_attestation": True},
-    }, 0)
+    }, _notebook_guard(empty))
     gate_spoof = api.research_notebook_append(project_id, {
         "record_type": "note", "category": "observation", "body": "Claim",
         "actor": {"id": "alice", "display_name": "Alice", "role": "reviewer"},
         "scientific_qualification": "human_scientific_reviewed",
-    }, 0)
+    }, _notebook_guard(empty))
 
     assert spoofed["ok"] is False
     assert "server-controlled" in spoofed["error"]
@@ -243,11 +252,13 @@ def test_research_notebook_api_rejects_actor_spoof_and_gate_fields(tmp_path):
 def test_research_notebook_attachment_picker_returns_only_opaque_selection(tmp_path):
     api, locators, _projects = _api(tmp_path)
     project_id = api.proj_list()["projects"][0]["project_id"]
+    empty = api.research_notebook_bootstrap(project_id)
     attachment = tmp_path / "private-evidence.txt"
     attachment.write_text("evidence", encoding="utf-8")
     api._dialog_fn = lambda kind: [str(attachment)] if kind == "files" else None
 
-    selected = api.research_notebook_pick_attachments(project_id)
+    selected = api.research_notebook_pick_attachments(
+        project_id, _notebook_guard(empty))
 
     assert selected["ok"] is True
     assert selected["selection_token"].startswith("notebook-attachment.")
@@ -259,6 +270,59 @@ def test_research_notebook_attachment_picker_returns_only_opaque_selection(tmp_p
     }]
     _assert_no_registered_locator(selected, locators, forbid_project_keys=False)
     assert str(attachment) not in json.dumps(selected)
+
+
+def test_notebook_job_evidence_requires_fresh_authoritative_manifest_summary(tmp_path):
+    api, locators, projects = _api(tmp_path)
+    project_id = api.proj_list()["projects"][0]["project_id"]
+    record = api._report_workbench_project_record(project_id)
+    member = projects[locators[0]]["members"]["clean_slab"]
+    current = _manifest()
+    api._manifest.load_manifest = (
+        lambda path: current if str(path) == str(member) else None)
+    resolver = api._research_notebook_evidence_resolver(record)
+    link = {"kind": "job", "id": "job-a", "report_revision_id": None}
+
+    first = resolver(link)
+    current["remote_dir"] = r"C:\private\not-authoritative"
+    assert resolver(link)["digest"] == first["digest"]
+    current["state"] = "RUNNING"
+    assert resolver(link)["digest"] != first["digest"]
+
+    api._manifest.load_manifest = lambda _path: None
+    assert resolver(link)["status"] == "missing"
+
+    def corrupt(_path):
+        raise ValueError("corrupt yaml")
+
+    api._manifest.load_manifest = corrupt
+    assert resolver(link)["status"] == "missing"
+
+
+def test_append_uses_a_fresh_evidence_resolver_for_returned_view(tmp_path):
+    api, _locators, _projects = _api(tmp_path)
+    project_id = api.proj_list()["projects"][0]["project_id"]
+    empty = api.research_notebook_bootstrap(project_id)
+    factories = 0
+
+    def resolver_factory(_record):
+        nonlocal factories
+        factories += 1
+        digest = ("1" if factories == 1 else "2") * 64
+        return lambda _link: {
+            "status": "current", "digest": digest,
+            "route": {"id": "project-overview", "project_id": project_id},
+        }
+
+    api._research_notebook_evidence_resolver = resolver_factory
+    created = api.research_notebook_append(project_id, {
+        "record_type": "note", "category": "observation", "body": "fresh",
+        "actor": {"id": "alice", "display_name": "Alice", "role": "PI"},
+        "links": [{"kind": "project", "id": project_id}],
+    }, _notebook_guard(empty))
+
+    assert factories == 2
+    assert created["records"][0]["links"][0]["status"] == "stale"
 
 
 def test_unknown_and_duplicate_project_ids_fail_closed(tmp_path):

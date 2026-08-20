@@ -16,12 +16,13 @@ import hashlib
 import errno
 import json
 import os
-import re
 import threading
 import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
+
+from vcstudio.shared.secrets import classify_credential
 
 DECISIONS_NAME = 'decisions.jsonl'
 EVENTS_NAME = 'events.jsonl'
@@ -36,20 +37,6 @@ COORDINATION_LOCK_NAME = '.ledger-acceptance.lock'
 # prevents separate thread-owned file handles from bypassing each other on platforms where byte
 # lock semantics are process-oriented.
 _COORDINATION_THREAD_LOCK = threading.Lock()
-
-# 敏感串正则:命中即拒写。宁可误伤(deny-by-default)也不让密钥进入可分享的账本。
-_SECRET_PATTERNS = (
-    ('口令字段', re.compile(r'pass(word|wd|phrase)', re.I)),
-    ('密钥字段', re.compile(r'secret', re.I)),
-    ('令牌字段', re.compile(r'\btoken\b', re.I)),
-    ('API Key', re.compile(r'api[_-]?key', re.I)),
-    ('GitHub PAT', re.compile(r'gh[pousr]_[A-Za-z0-9]{16,}')),
-    ('AWS AccessKey', re.compile(r'AKIA[0-9A-Z]{16}')),
-    ('Slack Token', re.compile(r'xox[baprs]-[A-Za-z0-9-]+')),
-    ('私钥 PEM', re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----')),
-    ('Bearer 凭据', re.compile(r'\bbearer\s+[A-Za-z0-9._\-]{8,}', re.I)),
-)
-
 
 def _now() -> str:
     return time.strftime('%Y-%m-%dT%H:%M:%S')
@@ -71,10 +58,7 @@ def _iter_strings(obj):
 
 def is_sensitive(text: str):
     """返回命中的敏感类别描述;无命中返回 None。"""
-    for desc, pat in _SECRET_PATTERNS:
-        if pat.search(text or ''):
-            return desc
-    return None
+    return classify_credential(text, include_field_names=True)
 
 
 def sanitize(record: dict) -> dict:

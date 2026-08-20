@@ -127,7 +127,7 @@ Publish → Versions 还提供三种只读/导出工具：
 - **Evidence/Claim Graph**：只从冻结 spec、snapshot、validation、model 和 claim 记录构建 conclusion/table/figure/check/source/job/file-hash 关系；缺边明确显示为 missing，不读取可变 live 文件，也不公开本地路径；
 - **SI capsule**：通过服务端目录选择生成确定性 ZIP，包含规范化合同、输入 manifest、模型/图表元数据、Methods、BibTeX、环境/版本、validation 记录、Research Notebook ledger/限制、capsule manifest 和 `SHA256SUMS`；排除秘密、绝对路径、附件正文、缓存和可变 live 文件，且绝不覆盖同名文件。
 
-Project 与 Publish 还提供项目级 Research Notebook。journal 使用跨进程锁、revision CAS、链式 record digest、append-only supersedes/tombstone；每次读取重新验证 opaque project/job/source/report revision 关联并显示 `current`、`stale` 或 `missing`。人工审阅只记录本机明确输入的自声明 actor、角色、决定、requested changes 与署名说明，不是认证或密码学签名，也不会自动产生 `human_scientific_reviewed`。完整边界见 [Research Notebook 合同](docs/research-notebook-contract.md)。
+Project 与 Publish 还提供项目级 Research Notebook。journal 使用项目身份绑定的外部 head/sequence anchor 与跨进程锁、revision+head+project CAS、链式 record digest、append-only supersedes/tombstone；完整状态机与附件 blob 在读取/归档时重验，symlink/junction/reparse 路径 fail-closed。关联证据只从当前权威源重验并显示 `current`、`stale` 或 `missing`；缺失/损坏 `job.yaml` 不会靠目录推断为当前。人工审阅只记录本机明确输入的自声明 actor、角色、决定、requested changes 与署名说明，不是认证或密码学签名，也不会自动产生 `human_scientific_reviewed`。完整边界见 [Research Notebook 合同](docs/research-notebook-contract.md)。
 
 格式边界：
 

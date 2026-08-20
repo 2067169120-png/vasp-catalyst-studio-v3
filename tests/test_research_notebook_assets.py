@@ -128,24 +128,103 @@ VCS.call = async (...args) => {
   calls.push(args);
   return { schema: 'vcstudio.research-notebook-public/v1', ok: true,
     project_id: 'project-' + 'a'.repeat(32), revision: 8, integrity_status: 'current',
+    head_digest: 'b'.repeat(64), project_identity_digest: 'c'.repeat(64),
     records: [], active_records: [], review_todo: [], limitations: [],
     denominator: { records: 0, active: 0, review_todo: 0 } };
 };
 loadAsset(process.argv[1]);
 const seam = window.ResearchNotebook.__test;
 seam.State.projectId = 'project-' + 'a'.repeat(32);
-seam.State.view = { revision: 7, records: [], review_todo: [], limitations: [],
+seam.State.view = { revision: 7, head_digest: 'a'.repeat(64),
+  project_identity_digest: 'c'.repeat(64), records: [], review_todo: [], limitations: [],
   denominator: { records: 0, active: 0, review_todo: 0 }, integrity_status: 'current' };
 assert.strictEqual(await seam.saveEntry(root, false), true);
 assert.strictEqual(calls.length, 1);
 assert.strictEqual(calls[0][0], 'research_notebook_append');
-assert.strictEqual(calls[0][3], 7);
+assert.deepStrictEqual(calls[0][3], {
+  revision: 7, head_digest: 'a'.repeat(64), project_identity_digest: 'c'.repeat(64),
+});
 const request = calls[0][2];
 assert.deepStrictEqual(request.actor, { id: 'alice', display_name: 'Alice', role: 'researcher' });
 for (const forbidden of ['scientific_qualification', 'human_scientific_reviewed',
   'reviewer_type', 'cryptographic_signature']) {
   assert.ok(!Object.prototype.hasOwnProperty.call(request, forbidden));
 }
+""",
+        str(ASSETS / "research-notebook.js"),
+    )
+
+
+def test_save_picker_and_tombstone_ignore_stale_project_responses_last_wins():
+    _run_node(
+        r"""
+const root = element('rn-project-panel', { dataset: { surface: 'project' } });
+const parts = new Map();
+function add(name, props = {}) { const value = element('rn-' + name, props); parts.set(name, value); return value; }
+add('record-type', { value: 'note' }); add('category', { value: 'observation' });
+const body = add('body', { value: 'must remain' }); add('actor-id', { value: 'alice' });
+add('actor-name', { value: 'Alice' }); add('actor-role', { value: 'PI' });
+add('status'); add('summary'); add('timeline'); add('todo'); add('limitations');
+add('attachment-summary'); add('staged-links');
+root.querySelector = selector => {
+  const match = selector.match(/^\[data-rn="([^"]+)"\]$/); return match ? parts.get(match[1]) || null : null;
+};
+root.querySelectorAll = () => [];
+const A = 'project-' + 'a'.repeat(32); const B = 'project-' + 'b'.repeat(32);
+const identityA = 'c'.repeat(64); const identityB = 'd'.repeat(64);
+function view(projectId, revision, head, identity) {
+  return { schema: 'vcstudio.research-notebook-public/v1', ok: true, project_id: projectId,
+    revision, head_digest: head, project_identity_digest: identity,
+    integrity_status: 'current', records: [], active_records: [], review_todo: [],
+    limitations: [], denominator: { records: 0, active: 0, review_todo: 0 } };
+}
+let resolveCall = null; const calls = [];
+VCS.workspace = { state: { project_id: A }, drafts: { remove() {}, save() {} } };
+VCS.call = (...args) => { calls.push(args); return new Promise(resolve => { resolveCall = resolve; }); };
+VCS.confirm = async () => true;
+loadAsset(process.argv[1]);
+const seam = window.ResearchNotebook.__test;
+function setA(generation) {
+  seam.State.generation = generation; seam.State.projectId = A;
+  seam.State.view = view(A, 1, '1'.repeat(64), identityA);
+  seam.State.busy = false; VCS.workspace.state.project_id = A;
+}
+function switchToB(generation) {
+  seam.State.generation = generation; seam.State.projectId = B;
+  seam.State.view = view(B, 9, '9'.repeat(64), identityB);
+  seam.State.busy = false; VCS.workspace.state.project_id = B;
+}
+
+setA(1);
+const savePending = seam.saveEntry(root, false);
+assert.deepStrictEqual(calls[0][3], {
+  revision: 1, head_digest: '1'.repeat(64), project_identity_digest: identityA });
+switchToB(2);
+resolveCall(view(A, 2, '2'.repeat(64), identityA));
+assert.strictEqual(await savePending, false);
+assert.strictEqual(seam.State.projectId, B); assert.strictEqual(seam.State.view.revision, 9);
+assert.strictEqual(body.value, 'must remain');
+
+setA(3); root.__rnAttachmentToken = '';
+const pickPending = seam.pickAttachments(root);
+assert.deepStrictEqual(calls[1][2], {
+  revision: 1, head_digest: '1'.repeat(64), project_identity_digest: identityA });
+switchToB(4);
+resolveCall({ ok: true, project_id: A, revision: 1, head_digest: '1'.repeat(64),
+  project_identity_digest: identityA, cancelled: false,
+  selection_token: 'notebook-attachment.stale', files: [{ name: 'x', size: 1 }] });
+assert.strictEqual(await pickPending, false);
+assert.strictEqual(root.__rnAttachmentToken, ''); assert.strictEqual(seam.State.projectId, B);
+
+setA(5);
+const tombstonePending = seam.tombstoneRecord(root, 'rn-old');
+await Promise.resolve();
+assert.deepStrictEqual(calls[2][5], {
+  revision: 1, head_digest: '1'.repeat(64), project_identity_digest: identityA });
+switchToB(6);
+resolveCall(view(A, 2, '2'.repeat(64), identityA));
+assert.strictEqual(await tombstonePending, false);
+assert.strictEqual(seam.State.projectId, B); assert.strictEqual(seam.State.view.revision, 9);
 """,
         str(ASSETS / "research-notebook.js"),
     )

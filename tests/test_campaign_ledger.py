@@ -59,6 +59,7 @@ def test_sanitize_scans_nested_and_keys(tmp_path):
 def test_is_sensitive_direct():
     assert ledger.is_sensitive('my password is x')
     assert ledger.is_sensitive('ghp_ABCDEFGHIJKLMNOPQRST0000') is not None
+    assert ledger.is_sensitive('confirm_token') is None
     assert ledger.is_sensitive('普通中文描述') is None
 
 

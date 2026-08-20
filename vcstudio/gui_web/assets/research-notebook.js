@@ -58,6 +58,39 @@
     return safeId(workspace.state && workspace.state.project_id);
   }
 
+  function mutationGuard() {
+    if (!State.view || !State.projectId) return null;
+    return {
+      generation: State.generation,
+      projectId: State.projectId,
+      revision: Number(State.view.revision || 0),
+      headDigest: State.view.head_digest == null ? null : String(State.view.head_digest),
+      projectIdentityDigest: String(State.view.project_identity_digest || ''),
+    };
+  }
+
+  function guardProjectCurrent(guard) {
+    if (!guard || guard.generation !== State.generation
+        || guard.projectId !== State.projectId) return false;
+    const selected = currentProjectId();
+    return !selected || selected === guard.projectId;
+  }
+
+  function guardCurrent(guard) {
+    if (!guardProjectCurrent(guard) || !State.view
+        || Number(State.view.revision || 0) !== guard.revision
+        || (State.view.head_digest == null ? null : String(State.view.head_digest)) !== guard.headDigest
+        || String(State.view.project_identity_digest || '') !== guard.projectIdentityDigest) return false;
+    return true;
+  }
+
+  function expectedGuard(guard) {
+    return {
+      revision: guard.revision, head_digest: guard.headDigest,
+      project_identity_digest: guard.projectIdentityDigest,
+    };
+  }
+
   function roots() {
     return ['rn-project-panel', 'rn-publish-panel']
       .map(id => document.getElementById(id)).filter(Boolean);
@@ -325,7 +358,8 @@
     renderStagedLinks(root); textPart(root, 'attachment-summary', ''); clearDraftReference();
   }
 
-  function applyView(result, root, successMessage) {
+  function applyView(result, root, successMessage, guard) {
+    if (!guardCurrent(guard)) return false;
     if (!result || result.ok !== true) {
       if (result && result.error_code === 'revision_conflict') {
         setStatus(root, tr('research_notebook.runtime.conflict'), 'warning'); load(root); return false;
@@ -333,12 +367,16 @@
       setStatus(root, String(result && result.error || 'Notebook unavailable'), 'error');
       return false;
     }
-    State.view = result; State.projectId = safeId(result.project_id) || State.projectId;
+    if (safeId(result.project_id) !== guard.projectId
+        || String(result.project_identity_digest || '') !== guard.projectIdentityDigest
+        || Number(result.revision) !== guard.revision + 1) return false;
+    State.view = result;
     clearCompose(root); renderAll(); setStatus(root, successMessage, 'success'); return true;
   }
 
   async function saveEntry(root, reviewMode = false) {
     if (State.busy || !State.view || !State.projectId) return false;
+    const guard = mutationGuard(); if (!guard) return false;
     const recordType = reviewMode ? 'review'
       : String(part(root, 'record-type') && part(root, 'record-type').value || 'note');
     const category = reviewMode ? 'review'
@@ -362,28 +400,41 @@
     setBusy(true); setStatus(root, tr('research_notebook.runtime.loading'));
     try {
       const result = await VCS.call('research_notebook_append',
-        State.projectId, request, State.view.revision);
-      return applyView(result, root, tr('research_notebook.runtime.saved'));
+        guard.projectId, request, expectedGuard(guard));
+      return applyView(result, root, tr('research_notebook.runtime.saved'), guard);
     } catch (error) {
-      setStatus(root, error && error.message || String(error), 'error'); return false;
-    } finally { setBusy(false); }
+      if (guardProjectCurrent(guard)) {
+        setStatus(root, error && error.message || String(error), 'error');
+      }
+      return false;
+    } finally { if (guardProjectCurrent(guard)) setBusy(false); }
   }
 
   async function pickAttachments(root) {
     if (!State.projectId || State.busy) return false;
+    const guard = mutationGuard(); if (!guard) return false;
     setBusy(true);
     try {
-      const result = await VCS.call('research_notebook_pick_attachments', State.projectId);
+      const result = await VCS.call(
+        'research_notebook_pick_attachments', guard.projectId, expectedGuard(guard));
+      if (!guardCurrent(guard)) return false;
       if (!result || result.ok !== true) throw new Error(result && result.error || 'Attachment selection failed');
       if (result.cancelled) return false;
+      if (safeId(result.project_id) !== guard.projectId
+          || Number(result.revision) !== guard.revision
+          || (result.head_digest == null ? null : String(result.head_digest)) !== guard.headDigest
+          || String(result.project_identity_digest || '') !== guard.projectIdentityDigest) return false;
       root.__rnAttachmentToken = String(result.selection_token || '');
       textPart(root, 'attachment-summary', (result.files || [])
         .map(file => `${file.name} · ${file.size} B`).join('；'));
       setStatus(root, tr('research_notebook.runtime.attachment_ready'), 'success');
       persistDraftReference(root); return true;
     } catch (error) {
-      setStatus(root, error && error.message || String(error), 'error'); return false;
-    } finally { setBusy(false); }
+      if (guardProjectCurrent(guard)) {
+        setStatus(root, error && error.message || String(error), 'error');
+      }
+      return false;
+    } finally { if (guardProjectCurrent(guard)) setBusy(false); }
   }
 
   function findRecord(recordId) {
@@ -413,20 +464,25 @@
 
   async function tombstoneRecord(root, recordId) {
     if (!State.view || State.busy) return false;
+    const guard = mutationGuard(); if (!guard) return false;
     const confirmed = typeof VCS.confirm === 'function'
       ? await VCS.confirm(tr('research_notebook.runtime.confirm_delete'))
         : window.confirm(tr('research_notebook.runtime.confirm_delete'));
     if (!confirmed) return false;
+    if (!guardCurrent(guard)) return false;
     const reason = 'Removed from active notebook by explicit local action.';
     const actor = readActor(root, false);
     setBusy(true);
     try {
       const result = await VCS.call('research_notebook_tombstone',
-        State.projectId, recordId, reason, actor, State.view.revision);
-      return applyView(result, root, tr('research_notebook.runtime.deleted'));
+        guard.projectId, recordId, reason, actor, expectedGuard(guard));
+      return applyView(result, root, tr('research_notebook.runtime.deleted'), guard);
     } catch (error) {
-      setStatus(root, error && error.message || String(error), 'error'); return false;
-    } finally { setBusy(false); }
+      if (guardProjectCurrent(guard)) {
+        setStatus(root, error && error.message || String(error), 'error');
+      }
+      return false;
+    } finally { if (guardProjectCurrent(guard)) setBusy(false); }
   }
 
   async function citeRecord(recordId) {
@@ -530,6 +586,7 @@
   async function load(root) {
     const projectId = currentProjectId();
     if (!projectId) {
+      State.generation += 1;
       State.projectId = ''; State.view = null; renderAll();
       roots().forEach(item => setStatus(
         item, tr('research_notebook.runtime.no_project'))); return false;
@@ -540,6 +597,7 @@
     try {
       const result = await VCS.call('research_notebook_bootstrap', projectId);
       if (generation !== State.generation || currentProjectId() !== projectId) return false;
+      if (result && result.ok === true && safeId(result.project_id) !== projectId) return false;
       State.view = result; renderAll();
       roots().forEach(item => setStatus(item,
         result && result.ok === true ? `revision ${result.revision}`
@@ -547,8 +605,13 @@
         result && result.ok === true ? 'success' : 'error'));
       return !!(result && result.ok === true);
     } catch (error) {
-      setStatus(root, error && error.message || String(error), 'error'); return false;
-    } finally { setBusy(false); }
+      if (generation === State.generation && State.projectId === projectId) {
+        setStatus(root, error && error.message || String(error), 'error');
+      }
+      return false;
+    } finally {
+      if (generation === State.generation && State.projectId === projectId) setBusy(false);
+    }
   }
 
   function init() {
@@ -580,7 +643,9 @@
       State, tr, draftKey, persistDraftReference, clearDraftReference,
       renderRecord, renderTimeline, renderTodo, renderLimitations,
       addStagedLink, saveEntry, editRecord, jumpLink, citeRecord, wireRoot,
-      applyView, load,
+      applyView, load, mutationGuard, guardProjectCurrent, guardCurrent,
+      expectedGuard, pickAttachments,
+      tombstoneRecord,
     };
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);

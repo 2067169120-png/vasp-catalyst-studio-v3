@@ -7092,24 +7092,94 @@ class Api:
             self._research_notebook_attachments = AttachmentSelections()
         return self._research_notebook_attachments
 
+    @staticmethod
+    def _research_notebook_manifest_summary(manifest):
+        """Bound the evidence digest to authoritative ``job.yaml`` fields only."""
+        if not isinstance(manifest, dict):
+            return None
+        keys = (
+            'schema', 'job_uuid', 'job_id', 'system', 'task_type', 'calc_type',
+            'state', 'created_at', 'updated_at', 'parent_job',
+        )
+        summary = {key: manifest[key] for key in keys if key in manifest}
+        inputs = manifest.get('inputs')
+        if isinstance(inputs, dict):
+            selected = {
+                key: inputs[key] for key in (
+                    'engine', 'task', 'gaussian_task', 'functional', 'periodic',
+                    'files', 'output_files', 'sha256', 'source_sha256',
+                    'neb_endpoints',
+                ) if key in inputs
+            }
+            if selected:
+                summary['inputs'] = selected
+        results = manifest.get('results')
+        if isinstance(results, dict):
+            selected = {
+                key: results[key] for key in (
+                    'energy_e0_eV', 'energy_source', 'diagnosis', 'fetched',
+                    'fetched_missing', 'fetched_at',
+                ) if key in results
+            }
+            if selected:
+                summary['results'] = selected
+        return summary
+
+    @staticmethod
+    def _research_notebook_expected(value):
+        if not isinstance(value, dict) or set(value) != {
+                'revision', 'head_digest', 'project_identity_digest'}:
+            raise ValueError('notebook expected guard fields are invalid')
+        revision = value.get('revision')
+        head = value.get('head_digest')
+        identity = value.get('project_identity_digest')
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            raise ValueError('notebook expected revision is invalid')
+        if (head is not None and (
+                not isinstance(head, str)
+                or not re.fullmatch(r'[0-9a-f]{64}', head))):
+            raise ValueError('notebook expected head digest is invalid')
+        if (not isinstance(identity, str)
+                or not re.fullmatch(r'[0-9a-f]{64}', identity)):
+            raise ValueError('notebook expected project identity is invalid')
+        return {
+            'revision': revision, 'head_digest': head,
+            'project_identity_digest': identity,
+        }
+
+    @staticmethod
+    def _research_notebook_assert_view_guard(view, expected):
+        from vcstudio.project.research_notebook import NotebookRevisionConflict
+
+        if not isinstance(view, dict) or view.get('ok') is not True:
+            raise ValueError('notebook integrity is not current')
+        if (view.get('revision') != expected['revision']
+                or view.get('head_digest') != expected['head_digest']
+                or view.get('project_identity_digest')
+                != expected['project_identity_digest']):
+            raise NotebookRevisionConflict(
+                int(view.get('revision') or 0), view.get('head_digest'))
+
+    @staticmethod
+    def _research_notebook_ledger(record):
+        from vcstudio.project.research_notebook import ResearchNotebook
+
+        return ResearchNotebook(
+            record['path'], record['project_id'],
+            project_identity_digest=record['identity_fingerprint'])
+
     def _research_notebook_evidence_resolver(self, record):
         """Return one request-scoped resolver for opaque notebook links.
 
-        Every lookup reloads authoritative project/report state.  The small
-        cache is valid only for the duration of one public API request.
+        Every lookup reloads authoritative project/report state.  Results are
+        deliberately not cached across link binding and post-append projection.
         """
         from vcstudio.project.research_notebook import digest_json
-
-        cache = {}
 
         def resolve(link):
             kind = str((link or {}).get('kind') or '')
             identifier = str((link or {}).get('id') or '')
             revision_id = str((link or {}).get('report_revision_id') or '')
-            key = (kind, identifier, revision_id)
-            if key in cache:
-                return copy.deepcopy(cache[key])
-
             resolved = {'status': 'missing', 'digest': None, 'route': None}
             if kind == 'project' and identifier == record['project_id']:
                 loaded = self._rebind_project_record(record)
@@ -7123,9 +7193,16 @@ class Api:
                 loaded = self._rebind_project_record(record)
                 matches = []
                 for member_dir in self._project_member_dirs(loaded):
-                    manifest = self._manifest.load_manifest(member_dir) or {}
+                    try:
+                        manifest = self._manifest.load_manifest(member_dir)
+                    except Exception:                    # noqa: BLE001 corrupt = missing
+                        manifest = None
+                    if not isinstance(manifest, dict):
+                        continue
                     if self._workspace_job_id(member_dir, manifest) == identifier:
-                        matches.append(manifest)
+                        summary = self._research_notebook_manifest_summary(manifest)
+                        if summary is not None:
+                            matches.append(summary)
                 if len(matches) == 1:
                     resolved = {
                         'status': 'current', 'digest': digest_json(matches[0]),
@@ -7189,7 +7266,6 @@ class Api:
                                       'revision_id': revision_id,
                                       'source_id': identifier},
                         }
-            cache[key] = copy.deepcopy(resolved)
             return resolved
 
         return resolve
@@ -7199,10 +7275,9 @@ class Api:
             LINK_KINDS,
             NOTE_CATEGORIES,
             REVIEW_DECISIONS,
-            ResearchNotebook,
         )
 
-        ledger = ResearchNotebook(record['path'], record['project_id'])
+        ledger = self._research_notebook_ledger(record)
         view = ledger.read(resolver=self._research_notebook_evidence_resolver(record))
         view['catalog'] = {
             'record_types': ['note', 'decision', 'review'],
@@ -7213,7 +7288,8 @@ class Api:
         return view
 
     @staticmethod
-    def _research_notebook_failure(exc, *, conflict_revision=None):
+    def _research_notebook_failure(exc, *, conflict_revision=None,
+                                   conflict_head_digest=None):
         from vcstudio.project.research_notebook import PUBLIC_SCHEMA, redact_public_text
 
         return {
@@ -7221,6 +7297,8 @@ class Api:
             'ok': False,
             'project_id': None,
             'revision': conflict_revision,
+            'head_digest': conflict_head_digest,
+            'project_identity_digest': None,
             'integrity_status': 'unknown',
             'records': [], 'active_records': [], 'review_todo': [],
             'denominator': {'records': 0, 'active': 0, 'review_todo': 0},
@@ -7238,13 +7316,18 @@ class Api:
         except Exception as exc:                         # noqa: BLE001 public bridge
             return self._research_notebook_failure(exc)
 
-    def research_notebook_pick_attachments(self, project_id):
+    def research_notebook_pick_attachments(self, project_id, expected):
         """Select local attachments and return only a project-bound token."""
         schema = 'vcstudio.research-notebook-attachment-selection/v1'
         try:
             record = self._report_workbench_project_record(project_id)
+            expected_guard = self._research_notebook_expected(expected)
 
             def select():
+                ledger = self._research_notebook_ledger(record)
+                before = ledger.read(
+                    resolver=self._research_notebook_evidence_resolver(record))
+                self._research_notebook_assert_view_guard(before, expected_guard)
                 if self._dialog_fn is not None:
                     selected = self._dialog_fn('files')
                 else:
@@ -7257,12 +7340,18 @@ class Api:
                     return {
                         'schema': schema, 'ok': True, 'cancelled': True,
                         'selection_token': None, 'files': [], 'error': None,
+                        'project_id': record['project_id'], **expected_guard,
                     }
                 paths = [selected] if isinstance(selected, str) else list(selected)
+                after = ledger.read(
+                    resolver=self._research_notebook_evidence_resolver(record))
+                self._research_notebook_assert_view_guard(after, expected_guard)
                 value = self._research_notebook_attachment_registry().register(
-                    paths, project_id=record['project_id'])
+                    paths, project_id=record['project_id'],
+                    project_identity_digest=expected_guard['project_identity_digest'])
                 return {'schema': schema, 'ok': True, 'cancelled': False,
-                        'error': None, **value}
+                        'error': None, 'project_id': record['project_id'],
+                        **expected_guard, **value}
 
             return self._call_with_project_bindings([record], select)
         except Exception as exc:                         # noqa: BLE001 public bridge
@@ -7272,16 +7361,16 @@ class Api:
                 'error': self._report_workbench_error(exc),
             }
 
-    def research_notebook_append(self, project_id, request, expected_revision):
-        """Append a note/decision/local human review under revision CAS."""
+    def research_notebook_append(self, project_id, request, expected):
+        """Append under revision, head-digest, and project-identity CAS."""
         from vcstudio.project.research_notebook import (
             NotebookRevisionConflict,
-            ResearchNotebook,
             bind_links,
         )
 
         try:
             record = self._report_workbench_project_record(project_id)
+            expected_guard = self._research_notebook_expected(expected)
 
             def append():
                 if not isinstance(request, dict):
@@ -7305,46 +7394,56 @@ class Api:
                     if self._research_notebook_attachments is None:
                         raise ValueError('attachment selection is unavailable or expired')
                     attachments = self._research_notebook_attachments.consume(
-                        selection_token, project_id=record['project_id'])
-                ledger = ResearchNotebook(record['path'], record['project_id'])
+                        selection_token, project_id=record['project_id'],
+                        project_identity_digest=expected_guard[
+                            'project_identity_digest'])
+                ledger = self._research_notebook_ledger(record)
                 created = ledger.append(
                     record_type=str(request.get('record_type') or ''),
                     category=str(request.get('category') or ''),
                     body=request.get('body'),
                     actor=request.get('actor'),
-                    expected_revision=expected_revision,
+                    expected_revision=expected_guard['revision'],
+                    expected_head_digest=expected_guard['head_digest'],
+                    expected_project_identity=expected_guard[
+                        'project_identity_digest'],
                     links=links,
                     supersedes=request.get('supersedes'),
                     review=request.get('review'),
                     ai_proposal=request.get('ai_proposal') is True,
                     attachments=attachments,
                 )
-                view = ledger.read(resolver=resolver)
+                view = ledger.read(
+                    resolver=self._research_notebook_evidence_resolver(record))
                 view['created_record_id'] = created['record_id']
                 return view
 
             return self._call_with_project_bindings([record], append)
         except NotebookRevisionConflict as exc:
             return self._research_notebook_failure(
-                exc, conflict_revision=exc.current_revision)
+                exc, conflict_revision=exc.current_revision,
+                conflict_head_digest=exc.current_head_digest)
         except Exception as exc:                         # noqa: BLE001 public bridge
             return self._research_notebook_failure(exc)
 
     def research_notebook_tombstone(self, project_id, record_id, reason,
-                                    actor, expected_revision):
+                                    actor, expected):
         from vcstudio.project.research_notebook import (
             NotebookRevisionConflict,
-            ResearchNotebook,
         )
 
         try:
             record = self._report_workbench_project_record(project_id)
+            expected_guard = self._research_notebook_expected(expected)
 
             def tombstone():
-                ledger = ResearchNotebook(record['path'], record['project_id'])
+                ledger = self._research_notebook_ledger(record)
                 deleted = ledger.tombstone(
                     record_id=record_id, reason=reason, actor=actor,
-                    expected_revision=expected_revision)
+                    expected_revision=expected_guard['revision'],
+                    expected_head_digest=expected_guard['head_digest'],
+                    expected_project_identity=expected_guard[
+                        'project_identity_digest'])
                 view = ledger.read(
                     resolver=self._research_notebook_evidence_resolver(record))
                 view['created_record_id'] = deleted['record_id']
@@ -7353,19 +7452,18 @@ class Api:
             return self._call_with_project_bindings([record], tombstone)
         except NotebookRevisionConflict as exc:
             return self._research_notebook_failure(
-                exc, conflict_revision=exc.current_revision)
+                exc, conflict_revision=exc.current_revision,
+                conflict_head_digest=exc.current_head_digest)
         except Exception as exc:                         # noqa: BLE001 public bridge
             return self._research_notebook_failure(exc)
 
     def _research_notebook_archive_payload(self, path, project_id,
                                             report_revision_id=None):
         """Internal capsule seam; never grants report or review authority."""
-        from vcstudio.project.research_notebook import ResearchNotebook
-
         record = self._resolve_project_id(project_id)
         if self._workspace_path_key(record['path']) != self._workspace_path_key(path):
             raise ValueError('notebook archive project binding mismatch')
-        return ResearchNotebook(path, project_id).archive_payload(
+        return self._research_notebook_ledger(record).archive_payload(
             report_revision_id=report_revision_id,
             resolver=self._research_notebook_evidence_resolver(record),
         )

@@ -114,9 +114,9 @@ All three flows use a server-selected source/destination and a dry-run preflight
 Project also provides a **Research Notebook + Human Review Ledger**:
 
 - Notes are categorized as problems, hypotheses, observations, interpretations, limitations, or next steps; decisions and human reviews are separate records.
-- Every save appends a journal revision. An edit uses `supersedes`; deletion appends a tombstone and preserves history.
-- Links use opaque project/job/source/report-revision IDs. The server revalidates every link on read, displays current/stale/missing, and returns semantic navigation routes rather than filesystem paths.
-- Attachment bytes enter project-local content-addressed storage through the native picker. Browser DTOs expose only name, size, media type, and hash.
+- Every save appends a journal revision under revision+head+project CAS. An external machine-local head/sequence anchor detects a missing, truncated, or rolled-back journal. An edit uses `supersedes`; deletion appends a tombstone and preserves history.
+- Links use opaque project/job/source/report-revision IDs. The server revalidates every link on read, displays current/stale/missing, and returns semantic navigation routes rather than filesystem paths. A missing or corrupt `job.yaml` is missing evidence, never a path-derived current fact.
+- Attachment bytes enter project-local content-addressed storage through the native picker. Browser DTOs expose only name, size, media type, and hash. Notebook, attachment, anchor, and lock paths reject symlinks, junctions, and reparse points; blob hashes are rechecked on read and archive.
 - A human locally enters their reviewer ID, display name, role, decision, requested changes, and optional signature attribution. This is self-attribution, not authentication or a cryptographic electronic signature.
 - An AI proposal cannot be recorded as human review. Notebook review never changes `ValidationResult`, claims, final status, campaign accepted status, or `human_scientific_reviewed`.
 
