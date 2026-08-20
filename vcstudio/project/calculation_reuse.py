@@ -25,6 +25,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import time
 from typing import Any, Callable, Iterable, Mapping
 
@@ -409,8 +410,196 @@ def _potcar_titel_identities(path: Path) -> list[str]:
     return identities
 
 
+def _is_reparse_stat(value: os.stat_result) -> bool:
+    return bool(
+        stat.S_ISLNK(value.st_mode)
+        or (
+            os.name == "nt"
+            and int(getattr(value, "st_file_attributes", 0)) & 0x400
+        )
+    )
+
+
+def _canonical_job_root(job_dir: str | os.PathLike[str]) -> Path:
+    """Resolve a real directory while refusing symlink/reparse aliases."""
+    raw = Path(os.path.abspath(os.fspath(Path(job_dir).expanduser())))
+    current = Path(raw.anchor)
+    try:
+        for part in raw.parts[1:]:
+            current /= part
+            if _is_reparse_stat(os.lstat(current)):
+                raise ScientificFingerprintError(
+                    "job root aliases through a symlink or reparse point"
+                )
+        resolved = raw.resolve(strict=True)
+        root_stat = os.stat(resolved, follow_symlinks=False)
+    except ScientificFingerprintError:
+        raise
+    except OSError as exc:
+        raise ScientificFingerprintError("job root is unavailable") from exc
+    if _is_reparse_stat(root_stat) or not stat.S_ISDIR(root_stat.st_mode):
+        raise ScientificFingerprintError("job root is not a real directory")
+    return resolved
+
+
+def _open_windows_root_handle(
+    root: Path, *, share_delete: bool
+) -> tuple[int, tuple[str, int, int]]:
+    import ctypes
+    from ctypes import wintypes
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    get_information = kernel32.GetFileInformationByHandle
+    get_information.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(_ByHandleFileInformation),
+    ]
+    get_information.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    share_mode = 0x1 | 0x2 | (0x4 if share_delete else 0)
+    handle = create_file(
+        str(root), 0, share_mode, None, 3,
+        0x02000000 | 0x00200000, None,
+    )
+    invalid = ctypes.c_void_p(-1).value
+    if handle == invalid:
+        raise ScientificFingerprintError("job root identity is unavailable")
+    information = _ByHandleFileInformation()
+    if not get_information(handle, ctypes.byref(information)):
+        close_handle(handle)
+        raise ScientificFingerprintError("job root identity is unavailable")
+    if int(information.file_attributes) & 0x400:
+        close_handle(handle)
+        raise ScientificFingerprintError(
+            "job root aliases through a symlink or reparse point"
+        )
+    file_id = (
+        (int(information.file_index_high) << 32)
+        | int(information.file_index_low)
+    )
+    identity = "windows", int(information.volume_serial_number), file_id
+    return int(handle), identity
+
+
+def _close_windows_handle(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    close_handle(handle)
+
+
+def _windows_root_identity(root: Path) -> tuple[str, int, int]:
+    handle, identity = _open_windows_root_handle(root, share_delete=True)
+    _close_windows_handle(handle)
+    return identity
+
+
+def _root_identity(root: Path) -> tuple[str, int, int]:
+    if os.name == "nt":
+        return _windows_root_identity(root)
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(root, flags)
+    except OSError as exc:
+        raise ScientificFingerprintError("job root identity is unavailable") from exc
+    try:
+        value = os.fstat(descriptor)
+        if not stat.S_ISDIR(value.st_mode):
+            raise ScientificFingerprintError("job root is not a real directory")
+        return "posix", int(value.st_dev), int(value.st_ino)
+    finally:
+        os.close(descriptor)
+
+
+@dataclass
+class _RootBinding:
+    root: Path
+    identity: tuple[str, int, int]
+    directory_fd: int | None = None
+    windows_handle: int | None = None
+
+    def close(self) -> None:
+        if self.directory_fd is not None:
+            os.close(self.directory_fd)
+            self.directory_fd = None
+        if self.windows_handle is not None:
+            _close_windows_handle(self.windows_handle)
+            self.windows_handle = None
+
+
+def _bind_root(root: Path) -> _RootBinding:
+    canonical = _canonical_job_root(root)
+    if os.name == "nt":
+        handle, identity = _open_windows_root_handle(
+            canonical, share_delete=False
+        )
+        return _RootBinding(
+            root=canonical, identity=identity, windows_handle=handle
+        )
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(canonical, flags)
+        value = os.fstat(descriptor)
+    except OSError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise ScientificFingerprintError("job root identity is unavailable") from exc
+    return _RootBinding(
+        root=canonical,
+        identity=("posix", int(value.st_dev), int(value.st_ino)),
+        directory_fd=descriptor,
+    )
+
+
+def _assert_root_binding(binding: _RootBinding) -> None:
+    try:
+        current = _root_identity(binding.root)
+    except ScientificFingerprintError as exc:
+        raise ReuseConflictError("job root identity changed during reuse") from exc
+    if current != binding.identity:
+        raise ReuseConflictError("job root identity changed during reuse")
+
+
+def _load_bound_snapshot(binding: _RootBinding) -> dict[str, Any]:
+    _assert_root_binding(binding)
+    snapshot = _load_authoritative_snapshot(binding.root)
+    _assert_root_binding(binding)
+    return snapshot
+
+
 def _load_authoritative_snapshot(job_dir: str | os.PathLike[str]) -> dict[str, Any]:
-    root = Path(job_dir).expanduser().resolve()
+    root = _canonical_job_root(job_dir)
     manifest_path = root / manifest_mod.MANIFEST_NAME
     try:
         manifest_bytes = _read_bounded(manifest_path, MAX_MANIFEST_BYTES, "authoritative job.yaml")
@@ -644,36 +833,95 @@ def build_scientific_fingerprint(job_dir: str | os.PathLike[str]) -> dict[str, A
         }
 
 
+def _fingerprint_snapshot_binding(fingerprint: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the strict CAS fields tying a fingerprint to one input snapshot."""
+    document = dict(fingerprint)
+    return {
+        "fingerprint_schema": document.get("schema"),
+        "fingerprint_status": document.get("status"),
+        "fingerprint_digest": document.get("digest"),
+        "fingerprint_document_sha256": _json_digest(document),
+        "input_closure_digest": document.get("input_closure_digest"),
+        "manifest_sha256": document.get("manifest_sha256"),
+    }
+
+
+def _provided_fingerprint_matches(
+    provided: Mapping[str, Any] | None, current: Mapping[str, Any]
+) -> bool:
+    if provided is None:
+        return True
+    try:
+        return (
+            _fingerprint_snapshot_binding(provided)
+            == _fingerprint_snapshot_binding(current)
+            and _canonical_json(dict(provided)) == _canonical_json(dict(current))
+        )
+    except (TypeError, ValueError):
+        return False
+
+
 def _source_verification_from_snapshot(
-    snapshot: Mapping[str, Any], fingerprint: Mapping[str, Any]
+    snapshot: Mapping[str, Any], fingerprint: Mapping[str, Any] | None = None
 ) -> dict[str, Any]:
+    # A caller-provided/indexed fingerprint is only an expected CAS value.  It
+    # is never promoted to current evidence: rebuild from this exact manifest
+    # and input snapshot on every verification.
+    current_fingerprint = _fingerprint_from_snapshot(snapshot)
+    fingerprint_matches = _provided_fingerprint_matches(
+        fingerprint, current_fingerprint
+    )
     root = Path(snapshot["root"])
     manifest = snapshot["manifest"]
-    fp = dict(fingerprint)
     state = str(manifest.get("state") or "").strip().upper()
+    bindings = _fingerprint_snapshot_binding(current_fingerprint)
     if state == "FAILED":
-        return {"status": "failed", "reusable": False, "issues": [], "result_files": {}}
+        return {
+            "status": "failed", "reusable": False, "issues": [],
+            "result_files": {}, "result_bundle_sha256": None,
+            "bindings": {
+                **bindings, "result_bundle_sha256": None,
+                "result_parser_sha256": None,
+            },
+        }
     if state == "UNCONVERGED":
-        return {"status": "unconverged", "reusable": False,
-                "issues": [], "result_files": {}}
+        return {
+            "status": "unconverged", "reusable": False,
+            "issues": [], "result_files": {}, "result_bundle_sha256": None,
+            "bindings": {
+                **bindings, "result_bundle_sha256": None,
+                "result_parser_sha256": None,
+            },
+        }
     issues = []
-    if fp.get("status") != "complete":
-        issues.extend(fp.get("missing") or [])
-        issues.extend(fp.get("integrity_issues") or [])
+    if current_fingerprint.get("status") != "complete":
+        issues.extend(current_fingerprint.get("missing") or [])
+        issues.extend(current_fingerprint.get("integrity_issues") or [])
+    if not fingerprint_matches:
+        issues.append(
+            "provided scientific fingerprint does not match current authoritative snapshot"
+        )
     if state != "DONE":
         issues.append(f"source state is {state or 'unknown'}, not DONE")
     parsed = verify_outputs(root, manifest)
     issues.extend(parsed.get("issues") or [])
     result_files = parsed.get("result_files") or {}
+    result_bundle_sha256 = _json_digest(result_files) if result_files else None
+    parser = deepcopy(parsed.get("parser"))
+    parser_sha256 = _json_digest(parser) if isinstance(parser, Mapping) else None
     status = parsed.get("contradiction_status") or (
         "verified" if not issues else "incomplete"
     )
     return {
         "status": status, "reusable": status == "verified", "issues": sorted(set(issues)),
         "result_files": result_files,
-        "result_bundle_sha256": _json_digest(result_files) if result_files else None,
+        "result_bundle_sha256": result_bundle_sha256,
+        "bindings": {
+            **bindings, "result_bundle_sha256": result_bundle_sha256,
+            "result_parser_sha256": parser_sha256,
+        },
         "energy_e0_eV": parsed.get("energy_e0_eV") if status == "verified" else None,
-        "parser": deepcopy(parsed.get("parser")),
+        "parser": parser,
         "neb_energies_eV": deepcopy(parsed.get("neb_energies_eV")),
     }
 
@@ -686,10 +934,7 @@ def source_verification(job_dir: str | os.PathLike[str],
     except ScientificFingerprintError as exc:
         return {"status": "incomplete", "reusable": False,
                 "issues": [str(exc)], "result_files": {}}
-    fp = dict(fingerprint or _fingerprint_from_snapshot(snapshot))
-    if fp.get("manifest_sha256") != snapshot.get("manifest_sha256"):
-        fp = _fingerprint_from_snapshot(snapshot)
-    return _source_verification_from_snapshot(snapshot, fp)
+    return _source_verification_from_snapshot(snapshot, fingerprint)
 
 
 def _component_summary(component: Mapping[str, Any] | None) -> Any:
@@ -876,16 +1121,18 @@ class CalculationReuseIndex:
         self.truncated = self.total_entries > self.limit or self.resource_limit_reached
         self.records = []
         for directory, listed_manifest in source:
-            manifest = manifest_mod.load_manifest(directory)
-            if not isinstance(manifest, dict):
+            try:
+                snapshot = _load_authoritative_snapshot(directory)
+            except ScientificFingerprintError:
                 # A ledger copy is not promoted to fact when job.yaml disappeared
-                # or changed between listing and rebuild.
+                # or became invalid between listing and rebuild.
                 continue
+            manifest = snapshot["manifest"]
             if isinstance(listed_manifest, Mapping) and dict(listed_manifest) != manifest:
                 # Rebuild from the current authoritative bytes, not the stale row.
                 listed_manifest = manifest
-            fingerprint = build_scientific_fingerprint(directory)
-            verification = source_verification(directory, fingerprint)
+            fingerprint = _fingerprint_from_snapshot(snapshot)
+            verification = _source_verification_from_snapshot(snapshot, fingerprint)
             identifier = job_id(directory, manifest)
             if not _ID_RE.fullmatch(identifier):
                 continue
@@ -897,7 +1144,7 @@ class CalculationReuseIndex:
                 job_id=identifier,
                 project_id=bound_id, manifest_project_id=manifest_id,
                 project_identity_status=identity_status,
-                job_dir=str(Path(directory).resolve()), manifest=manifest,
+                job_dir=str(snapshot["root"]), manifest=manifest,
                 fingerprint=fingerprint, verification=verification,
             ))
         return self
@@ -1037,7 +1284,7 @@ def authoritative_reuse_lookup(
                 job_id=identifier, project_id=bound_id,
                 manifest_project_id=manifest_id,
                 project_identity_status=identity_status,
-                job_dir=str(Path(directory).resolve()), manifest=manifest,
+                job_dir=str(snapshot["root"]), manifest=manifest,
                 fingerprint=_fingerprint_from_snapshot(snapshot), verification={},
             ))
         except Exception as exc:  # authoritative scan failure must not prove absence
@@ -1054,7 +1301,7 @@ def authoritative_reuse_lookup(
         if record.fingerprint.get("status") == "complete" and isinstance(digest, str):
             digest_buckets.setdefault(digest, []).append(record)
     targets = []
-    verification_cache: dict[str, dict[str, Any]] = {}
+    verification_cache: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
     for target_id in requested:
         target = by_id.get(target_id)
         if target is None:
@@ -1069,10 +1316,28 @@ def authoritative_reuse_lookup(
                     complete = False
                     errors.append("authoritative source verification limit reached")
                     break
-                verification_cache[candidate.job_id] = source_verification(
-                    candidate.job_dir, candidate.fingerprint
+                try:
+                    current_snapshot = _load_authoritative_snapshot(candidate.job_dir)
+                    current_fingerprint = _fingerprint_from_snapshot(current_snapshot)
+                    verification = _source_verification_from_snapshot(
+                        current_snapshot, candidate.fingerprint
+                    )
+                except ScientificFingerprintError as exc:
+                    complete = False
+                    errors.append(str(exc))
+                    continue
+                verification_cache[candidate.job_id] = (
+                    current_fingerprint, verification
                 )
-            verification = verification_cache[candidate.job_id]
+            current_fingerprint, verification = verification_cache[candidate.job_id]
+            if not _provided_fingerprint_matches(
+                candidate.fingerprint, current_fingerprint
+            ):
+                complete = False
+                errors.append(
+                    f"authoritative source changed during lookup:{candidate.job_id}"
+                )
+                continue
             relation = _project_relation(target, candidate)
             if not verification.get("reusable"):
                 continue
@@ -1086,10 +1351,16 @@ def authoritative_reuse_lookup(
                         relation == "different" if relation != "unknown" else None
                     ),
                     "verification": verification,
-                    "fingerprint": public_fingerprint(candidate.fingerprint),
+                    "fingerprint": public_fingerprint(current_fingerprint),
                     "cas": {
-                        "fingerprint": candidate.fingerprint.get("digest"),
-                        "manifest_sha256": candidate.fingerprint.get("manifest_sha256"),
+                        "fingerprint": current_fingerprint.get("digest"),
+                        "fingerprint_document_sha256": verification.get(
+                            "bindings", {}
+                        ).get("fingerprint_document_sha256"),
+                        "input_closure_digest": current_fingerprint.get(
+                            "input_closure_digest"
+                        ),
+                        "manifest_sha256": current_fingerprint.get("manifest_sha256"),
                         "result_bundle_sha256": verification.get("result_bundle_sha256"),
                     },
                 })
@@ -1103,6 +1374,20 @@ def authoritative_reuse_lookup(
             "requires_explicit_choice": match_count > 0,
             "absence_authoritative": False,
         })
+    for identifier in requested:
+        target = by_id.get(identifier)
+        if target is None:
+            continue
+        try:
+            current_snapshot = _load_authoritative_snapshot(target.job_dir)
+            current_fingerprint = _fingerprint_from_snapshot(current_snapshot)
+        except ScientificFingerprintError as exc:
+            complete = False
+            errors.append(str(exc))
+            continue
+        if not _provided_fingerprint_matches(target.fingerprint, current_fingerprint):
+            complete = False
+            errors.append(f"authoritative target changed during lookup:{identifier}")
     for target in targets:
         target["absence_authoritative"] = bool(
             complete
@@ -1207,6 +1492,243 @@ def _manifest_payload(manifest: Mapping[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
+def _write_bound_bytes(binding: _RootBinding, name: str, payload: bytes) -> None:
+    """Atomically write a root-level file without resolving the root path."""
+    if "/" in name or "\\" in name or name in {"", ".", ".."}:
+        raise ScientificFingerprintError("invalid root-relative write target")
+    if binding.directory_fd is None:
+        _assert_root_binding(binding)
+        target = binding.root / name
+        temporary = target.with_name(
+            f".{target.name}.{os.getpid()}.{os.urandom(8).hex()}.tmp"
+        )
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+        finally:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+        _assert_root_binding(binding)
+        return
+    root_fd = binding.directory_fd
+    temporary_name = f".{name}.{os.getpid()}.{os.urandom(8).hex()}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(temporary_name, flags, 0o600, dir_fd=root_fd)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = None
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(
+            temporary_name, name, src_dir_fd=root_fd, dst_dir_fd=root_fd
+        )
+        os.fsync(root_fd)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=root_fd)
+        except FileNotFoundError:
+            pass
+
+
+def _parse_reuse_journal(payload: bytes) -> dict[str, Any]:
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ReuseConflictError("reuse journal is invalid") from exc
+    if not isinstance(value, dict):
+        raise ReuseConflictError("reuse journal is invalid")
+    return value
+
+
+def _load_bound_reuse_journal(
+    binding: _RootBinding, name: str
+) -> dict[str, Any] | None:
+    if binding.directory_fd is None:
+        _assert_root_binding(binding)
+        value = _load_reuse_journal(binding.root / name)
+        _assert_root_binding(binding)
+        return value
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=binding.directory_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ReuseConflictError("reuse journal is unavailable") from exc
+    try:
+        value = os.fstat(descriptor)
+        if not stat.S_ISREG(value.st_mode) or value.st_size > 1024 * 1024:
+            raise ReuseConflictError("reuse journal is invalid")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            payload = handle.read(1024 * 1024 + 1)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(payload) > 1024 * 1024:
+        raise ReuseConflictError("reuse journal is invalid")
+    return _parse_reuse_journal(payload)
+
+
+def _write_bound_reuse_journal(
+    binding: _RootBinding, name: str, value: Mapping[str, Any]
+) -> None:
+    if binding.directory_fd is None:
+        _assert_root_binding(binding)
+        _write_reuse_journal(binding.root / name, value)
+        _assert_root_binding(binding)
+        return
+    payload = (_canonical_json(dict(value)) + "\n").encode("utf-8")
+    if len(payload) > 1024 * 1024:
+        raise ScientificFingerprintError("reuse journal exceeds byte limit")
+    _write_bound_bytes(binding, name, payload)
+
+
+def _save_bound_manifest(binding: _RootBinding, manifest: Mapping[str, Any]) -> str:
+    payload = _manifest_payload(manifest)
+    if binding.directory_fd is None:
+        _assert_root_binding(binding)
+        manifest_mod.save_manifest(binding.root, dict(manifest))
+        _assert_root_binding(binding)
+        return _sha256_bytes(payload)
+    _write_bound_bytes(binding, manifest_mod.MANIFEST_NAME, payload)
+    return _sha256_bytes(payload)
+
+
+def _open_bound_parent(
+    binding: _RootBinding, name: str, *, create: bool
+) -> tuple[int, str]:
+    if binding.directory_fd is None:
+        raise ScientificFingerprintError("fd-anchored path is unavailable")
+    parts = name.split("/")
+    if (
+        not parts
+        or any(part in {"", ".", ".."} or "\\" in part for part in parts)
+    ):
+        raise ScientificFingerprintError("invalid result path")
+    descriptor = os.dup(binding.directory_fd)
+    directory_flags = os.O_RDONLY
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        for part in parts[:-1]:
+            if create:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+            child = os.open(part, directory_flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor, parts[-1]
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _sha256_descriptor(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _materialize_bound_result(
+    source: _RootBinding, target: _RootBinding, name: str, expected_sha256: str
+) -> None:
+    """Copy one result via held directory fds, never via a replaceable root path."""
+    source_parent, source_name = _open_bound_parent(source, name, create=False)
+    target_parent, target_name = _open_bound_parent(target, name, create=True)
+    temporary_name = (
+        f".{target_name}.{os.getpid()}.{os.urandom(8).hex()}.reuse-tmp"
+    )
+    source_descriptor: int | None = None
+    target_descriptor: int | None = None
+    try:
+        read_flags = os.O_RDONLY
+        read_flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            existing = os.open(target_name, read_flags, dir_fd=target_parent)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            try:
+                if not stat.S_ISREG(os.fstat(existing).st_mode):
+                    raise ScientificFingerprintError(
+                        f"prepared reuse destination is not regular:{name}"
+                    )
+                if _sha256_descriptor(existing) == expected_sha256:
+                    return
+            finally:
+                os.close(existing)
+            raise ScientificFingerprintError(
+                f"prepared reuse destination has conflicting bytes:{name}"
+            )
+        source_descriptor = os.open(source_name, read_flags, dir_fd=source_parent)
+        source_stat = os.fstat(source_descriptor)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise ScientificFingerprintError(f"source result is not regular:{name}")
+        write_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        write_flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        target_descriptor = os.open(
+            temporary_name, write_flags, 0o600, dir_fd=target_parent
+        )
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(source_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(target_descriptor, view)
+                view = view[written:]
+        os.fsync(target_descriptor)
+        source_after = os.fstat(source_descriptor)
+        if (
+            (source_stat.st_dev, source_stat.st_ino, source_stat.st_size,
+             source_stat.st_mtime_ns)
+            != (source_after.st_dev, source_after.st_ino, source_after.st_size,
+                source_after.st_mtime_ns)
+            or digest.hexdigest() != expected_sha256
+        ):
+            raise ScientificFingerprintError(f"copied result hash mismatch:{name}")
+        os.close(target_descriptor)
+        target_descriptor = None
+        os.replace(
+            temporary_name, target_name,
+            src_dir_fd=target_parent, dst_dir_fd=target_parent,
+        )
+        os.fsync(target_parent)
+    finally:
+        if source_descriptor is not None:
+            os.close(source_descriptor)
+        if target_descriptor is not None:
+            os.close(target_descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=target_parent)
+        except FileNotFoundError:
+            pass
+        os.close(source_parent)
+        os.close(target_parent)
+
+
 def record_reuse_reference(target_dir: str | os.PathLike[str],
                            source_dir: str | os.PathLike[str], *,
                            decision_id: str, reason: str,
@@ -1222,9 +1744,21 @@ def record_reuse_reference(target_dir: str | os.PathLike[str],
         raise ValueError("reuse reason is required")
     if len(reason) > 1000:
         raise ValueError("reuse reason is too long")
-    with _operation_locks((target_dir, source_dir), "reference existing result"):
-        target_before = _load_authoritative_snapshot(target_dir)
-        source_before = _load_authoritative_snapshot(source_dir)
+    target_entry = _canonical_job_root(target_dir)
+    source_entry = _canonical_job_root(source_dir)
+    with _operation_locks(
+        (target_entry, source_entry), "reference existing result"
+    ) as operation_stack:
+        # Bind only after both canonical operation locks are held, then never
+        # follow the caller's original alias again during this transaction.
+        target_binding = _bind_root(target_entry)
+        operation_stack.callback(target_binding.close)
+        source_binding = _bind_root(source_entry)
+        operation_stack.callback(source_binding.close)
+        target_root = target_binding.root
+        source_root = source_binding.root
+        target_before = _load_bound_snapshot(target_binding)
+        source_before = _load_bound_snapshot(source_binding)
         target_manifest = target_before["manifest"]
         source_manifest = source_before["manifest"]
         target_id = _job_identity(target_manifest)
@@ -1258,8 +1792,8 @@ def record_reuse_reference(target_dir: str | os.PathLike[str],
         if not verification.get("reusable"):
             raise ScientificFingerprintError("source result is not complete, converged and verifiable")
         replay = _decision_replay(target_manifest, key, request_sha256)
-        journal_path = _reuse_journal_path(target_dir, key)
-        journal = _load_reuse_journal(journal_path)
+        journal_path = _reuse_journal_path(target_root, key)
+        journal = _load_bound_reuse_journal(target_binding, journal_path.name)
         if replay is None and journal is not None:
             if journal.get("request_sha256") != request_sha256:
                 raise ReuseConflictError("decision journal already binds different input")
@@ -1274,6 +1808,10 @@ def record_reuse_reference(target_dir: str | os.PathLike[str],
                     or replay.get("source_manifest_sha256") != source_before["manifest_sha256"]
                     or replay.get("source_result_bundle_sha256")
                     != verification.get("result_bundle_sha256")
+                    or replay.get("source_verification_bindings")
+                    != verification.get("bindings")
+                    or journal.get("source_verification_bindings")
+                    != verification.get("bindings")
                     or replay.get("scientific_fingerprint") != target_fp.get("digest")
                     or replay.get("source_fingerprint") != source_fp.get("digest")):
                 raise ReuseConflictError("prepared reuse generation/source CAS changed")
@@ -1283,7 +1821,9 @@ def record_reuse_reference(target_dir: str | os.PathLike[str],
                         raise ReuseConflictError("completed reuse target generation changed")
                 elif journal.get("status") not in {"preparing", "prepared"}:
                     raise ReuseConflictError("completed reuse journal state is invalid")
-                target_verification = source_verification(target_dir, target_fp)
+                target_verification = _source_verification_from_snapshot(
+                    target_before, target_fp
+                )
                 if (not target_verification.get("reusable")
                         or target_verification.get("result_bundle_sha256")
                         != replay.get("source_result_bundle_sha256")):
@@ -1294,7 +1834,9 @@ def record_reuse_reference(target_dir: str | os.PathLike[str],
                 if journal.get("status") != "succeeded":
                     journal["status"] = "succeeded"
                     journal["done_manifest_sha256"] = target_before["manifest_sha256"]
-                    _write_reuse_journal(journal_path, journal)
+                    _write_bound_reuse_journal(
+                        target_binding, journal_path.name, journal
+                    )
                 return {"ok": True, "replayed": True, "decision": replay,
                         "target_job_id": target_id, "source_job_id": source_id,
                         "state": target_manifest.get("state"),
@@ -1318,8 +1860,8 @@ def record_reuse_reference(target_dir: str | os.PathLike[str],
                 raise ScientificFingerprintError("target job is already bound to a remote submission")
             if before_commit is not None:
                 before_commit()
-            target_after = _load_authoritative_snapshot(target_dir)
-            source_after = _load_authoritative_snapshot(source_dir)
+            target_after = _load_bound_snapshot(target_binding)
+            source_after = _load_bound_snapshot(source_binding)
             target_fp_after = _fingerprint_from_snapshot(target_after)
             source_fp_after = _fingerprint_from_snapshot(source_after)
             verification_after = _source_verification_from_snapshot(
@@ -1329,8 +1871,8 @@ def record_reuse_reference(target_dir: str | os.PathLike[str],
                     or source_after["manifest_sha256"] != source_before["manifest_sha256"]
                     or target_fp_after.get("digest") != target_fp.get("digest")
                     or source_fp_after.get("digest") != source_fp.get("digest")
-                    or verification_after.get("result_bundle_sha256")
-                    != verification.get("result_bundle_sha256")
+                    or verification_after.get("bindings")
+                    != verification.get("bindings")
                     or not verification_after.get("reusable")):
                 raise ScientificFingerprintError("source or target changed during reuse validation")
             now = _now()
@@ -1351,6 +1893,9 @@ def record_reuse_reference(target_dir: str | os.PathLike[str],
                 "source_manifest_sha256": source_after["manifest_sha256"],
                 "source_result_bundle_sha256": verification_after["result_bundle_sha256"],
                 "source_result_files": deepcopy(verification_after["result_files"]),
+                "source_verification_bindings": deepcopy(
+                    verification_after["bindings"]
+                ),
                 "source_verification_status": "verified",
                 "source_parser": deepcopy(verification_after.get("parser")),
                 "target_base_manifest_sha256": target_after["manifest_sha256"],
@@ -1431,29 +1976,43 @@ def record_reuse_reference(target_dir: str | os.PathLike[str],
                 "source_manifest_sha256": source_after["manifest_sha256"],
                 "source_result_files": deepcopy(verification_after["result_files"]),
                 "source_result_bundle_sha256": verification_after["result_bundle_sha256"],
+                "source_verification_bindings": deepcopy(
+                    verification_after["bindings"]
+                ),
                 "status": "preparing", "decided_at": now,
             }
-            _write_reuse_journal(journal_path, journal)
-            manifest_mod.save_manifest(target_dir, updated)
-            persisted_prepared = _load_authoritative_snapshot(target_dir)
+            _write_bound_reuse_journal(target_binding, journal_path.name, journal)
+            _save_bound_manifest(target_binding, updated)
+            persisted_prepared = _load_bound_snapshot(target_binding)
             if persisted_prepared["manifest_sha256"] != prepared_sha256:
                 raise ReuseConflictError("prepared target manifest generation mismatch")
             journal["status"] = "prepared"
-            _write_reuse_journal(journal_path, journal)
+            _write_bound_reuse_journal(target_binding, journal_path.name, journal)
 
         verification_after = {
             "result_files": deepcopy(decision["source_result_files"]),
             "result_bundle_sha256": decision["source_result_bundle_sha256"],
         }
-        target_root = Path(target_dir).resolve()
-        source_root = Path(source_dir).resolve()
         recovery_suffix = _sha256_bytes(key.encode("utf-8"))[:12]
         for materialized_count, (name, digest) in enumerate(
                 sorted(verification_after["result_files"].items()), start=1):
+            _assert_root_binding(target_binding)
+            _assert_root_binding(source_binding)
+            if target_binding.directory_fd is not None:
+                _materialize_bound_result(
+                    source_binding, target_binding, name, digest
+                )
+                if after_materialize is not None:
+                    after_materialize(name, materialized_count)
+                _assert_root_binding(target_binding)
+                _assert_root_binding(source_binding)
+                continue
             destination = target_root.joinpath(*name.split("/"))
             destination.parent.mkdir(parents=True, exist_ok=True)
+            _assert_root_binding(target_binding)
             if destination.exists():
                 if manifest_mod.sha256_file(destination) == digest:
+                    _assert_root_binding(target_binding)
                     continue
                 raise ScientificFingerprintError(
                     f"prepared reuse destination has conflicting bytes:{name}")
@@ -1465,12 +2024,18 @@ def record_reuse_reference(target_dir: str | os.PathLike[str],
                 shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
                 target_handle.flush()
                 os.fsync(target_handle.fileno())
+            _assert_root_binding(target_binding)
+            _assert_root_binding(source_binding)
             if manifest_mod.sha256_file(temporary) != digest:
                 raise ScientificFingerprintError(f"copied result hash mismatch:{name}")
+            _assert_root_binding(target_binding)
             os.replace(temporary, destination)
+            _assert_root_binding(target_binding)
             if after_materialize is not None:
                 after_materialize(name, materialized_count)
-        source_final = _load_authoritative_snapshot(source_dir)
+            _assert_root_binding(target_binding)
+            _assert_root_binding(source_binding)
+        source_final = _load_bound_snapshot(source_binding)
         source_fp_final = _fingerprint_from_snapshot(source_final)
         verification_final = _source_verification_from_snapshot(
             source_final, source_fp_final
@@ -1478,11 +2043,11 @@ def record_reuse_reference(target_dir: str | os.PathLike[str],
         if (source_final["manifest_sha256"] != decision["source_manifest_sha256"]
                 or source_fp_final.get("digest") != decision["source_fingerprint"]
                 or not verification_final.get("reusable")
-                or verification_final.get("result_bundle_sha256")
-                != decision["source_result_bundle_sha256"]):
+                or verification_final.get("bindings")
+                != decision["source_verification_bindings"]):
             raise ScientificFingerprintError(
                 "source changed while verified result bytes were materialised")
-        target_final = _load_authoritative_snapshot(target_dir)
+        target_final = _load_bound_snapshot(target_binding)
         if target_final["manifest_sha256"] != journal.get("prepared_manifest_sha256"):
             raise ReuseConflictError("target manifest drifted after prepared materialization")
         target_fp_final = _fingerprint_from_snapshot(target_final)
@@ -1508,15 +2073,32 @@ def record_reuse_reference(target_dir: str | os.PathLike[str],
         ), None)
         if reuse_attempt is None:
             raise ScientificFingerprintError("prepared reuse attempt record is missing")
+        rollback_manifest = deepcopy(target_final["manifest"])
+        rollback_journal = deepcopy(journal)
+        rollback_journal["status"] = "prepared"
+        rollback_journal.pop("done_manifest_sha256", None)
         reuse_attempt["result"] = "reused"
         manifest_mod.set_state(updated, "DONE", note=f"reused result decision={key}")
-        manifest_mod.save_manifest(target_dir, updated)
-        journal["status"] = "succeeded"
-        journal["done_manifest_sha256"] = manifest_mod.sha256_file(
-            Path(target_dir) / manifest_mod.MANIFEST_NAME
-        )
-        _write_reuse_journal(journal_path, journal)
-        persisted_snapshot = _load_authoritative_snapshot(target_dir)
+        try:
+            _assert_root_binding(target_binding)
+            done_manifest_sha256 = _save_bound_manifest(target_binding, updated)
+            journal["status"] = "succeeded"
+            journal["done_manifest_sha256"] = done_manifest_sha256
+            _write_bound_reuse_journal(target_binding, journal_path.name, journal)
+            persisted_snapshot = _load_bound_snapshot(target_binding)
+            if persisted_snapshot["manifest_sha256"] != done_manifest_sha256:
+                raise ReuseConflictError(
+                    "DONE target manifest generation mismatch"
+                )
+        except ReuseConflictError:
+            # POSIX permits renaming an open directory.  Anchored writes never
+            # touch replacement B, and this compensating write keeps detached
+            # entity A at the durable prepared recovery point.
+            _save_bound_manifest(target_binding, rollback_manifest)
+            _write_bound_reuse_journal(
+                target_binding, journal_path.name, rollback_journal
+            )
+            raise
         persisted = persisted_snapshot["manifest"]
         stored = _decision_replay(persisted, key, request_sha256)
         if stored is None:

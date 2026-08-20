@@ -30,6 +30,25 @@ Ruff, `node --check` for 25 first-party JavaScript files, `py_compile` for 25 ch
 `git diff --check` also passed. No real-cluster VASP run or release rebuild was performed, so these gates
 prove software contracts only and do not upgrade scientific or frozen-release qualification.
 
+2026-08-21 继续闭合严格复用复核发现的 4 组 P1：source fingerprint 每次从同一权威快照重建；
+输出哈希、解析和 VASP 版本使用同一 no-follow 文件实体；复用事务以持久目录 handle/file-id 锚定，
+根目录漂移时恢复到 prepared；EOS、spin scan 等派生 builder 在最终输入落定后重签 recipe/closure，
+且运行环境只允许服务端可信 profile 绑定。聚焦回归为 **182 passed、1 skipped**，builder/manifest/
+submit 接缝为 **341 passed**；免缓存全量 pytest 为 **3748 passed、6 skipped**（332.37 秒；15 条
+ASE/NumPy 上游弃用警告）。全仓 Ruff、全部第一方 JavaScript 的 `node --check`、变更 Python 文件的
+`py_compile` 与 `git diff --check` 通过。未运行真实集群 VASP、未重建发行包，也未执行远端 CI。
+
+On 2026-08-21 four additional strict-reuse P1 groups were closed: source fingerprints are rebuilt from
+the same authoritative snapshot; output hashing, parsing, and VASP-version evidence share one no-follow
+file entity; reuse transactions are anchored to persistent directory handles/file identities and roll back
+to prepared on root drift; and derived builders such as EOS and spin scan rebind recipe/input closure only
+after final input bytes exist, while execution environments remain server-bound from trusted profiles.
+Focused tests passed with **182 passed and 1 skipped**, builder/manifest/submission seams passed with
+**341 passed**, and cache-free full pytest completed with **3748 passed and 6 skipped** in 332.37 s, with
+15 upstream ASE/NumPy deprecation warnings. Full-repository Ruff, all first-party JavaScript `node --check`,
+changed-file `py_compile`, and `git diff --check` passed. No real-cluster VASP run, release rebuild, or remote
+CI was performed.
+
 ### 报告、状态与项目工作区（Phase A–B）
 - 建立报告与状态合同，明确稳定项目身份、服务端快照、门禁结论、产物状态和 revision
   之间的绑定关系；未通过门禁或缺少证据时保留诊断状态，不冒充最终发布结果。

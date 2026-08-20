@@ -138,13 +138,23 @@ def build_eos_series(src_dir, out_root, scales=DEFAULT_SCALES) -> dict:
 
         system = poscar_text.splitlines()[0].strip() if poscar_text.strip() else Path(out_dir).name
         parent = str(Path(src_dir).resolve())
+        from vcstudio.generate.method_recipe import builder_recipe
+        inputs = {
+            'engine': 'vasp', 'parent_job': parent, 'scale': s, 'volume': vol,
+            'incar_changes': changes,
+            'method_recipe': builder_recipe(
+                builder='vcstudio.project.eos/v1', task_type='eos',
+                calc_type='bulk', validate=True,
+                completions={'incar_changes': changes},
+                kpoints_source='parent-copy',
+                extra={'linear_scale': s, 'volume_angstrom3': vol}),
+        }
         m = manifest_mod.new_manifest(
             job_id=f'{Path(out_dir).name}-eos', system=system, task_type='eos',
-            calc_type='bulk',
-            inputs={'parent_job': parent, 'scale': s, 'volume': vol,
-                    'incar_changes': changes},
-            warnings=warnings)
+            calc_type='bulk', inputs=inputs, warnings=warnings)
         m['parent_job'] = parent
+        from vcstudio.shared.scientific_inputs import record_input_closure
+        record_input_closure(out_dir, m)
         manifest_mod.save_manifest(out_dir, m)
 
         dirs[s] = out_dir

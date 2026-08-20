@@ -81,11 +81,20 @@ def build_workfunction_job(src_dir, out_root, *, add_dipole: str = 'auto') -> di
         'parent_job': parent, 'derived_from': source_name, 'purpose': 'esp',
         'dipole': bool(dipole), 'incar_changes': res['changes'],
     })
+    from vcstudio.generate.method_recipe import builder_recipe
+    m['inputs']['method_recipe'] = builder_recipe(
+        builder='vcstudio.project.workfunction/v1', task_type='workfunction',
+        calc_type='slab', validate=True,
+        completions={'incar_changes': res['changes']},
+        kpoints_source='parent-density-multiplier',
+        extra={'purpose': 'workfunction', 'dipole_correction': bool(dipole)})
     m['parent_job'] = parent
     m.setdefault('derivation', {}).update({
         'purpose': 'workfunction', 'derived_from': source_name,
         'dipole': bool(dipole), 'changes': list(res['changes']),
     })
+    from vcstudio.shared.scientific_inputs import record_input_closure
+    record_input_closure(out_root, m)
     manifest_mod.save_manifest(out_root, m)
     return {'out_dir': str(out_root), 'changes': res['changes'], 'warnings': warnings,
             'dipole': bool(dipole)}

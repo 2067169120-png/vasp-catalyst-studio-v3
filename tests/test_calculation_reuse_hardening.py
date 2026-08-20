@@ -12,6 +12,7 @@ import pytest
 
 from vcstudio.generate.method_recipe import bind_method_recipe
 from vcstudio.project import calculation_reuse as reuse
+from vcstudio.project import result_import, reuse_verification
 from vcstudio.shared import manifest as manifest_mod
 from vcstudio.shared.execution_environment import (
     EXECUTION_ENVIRONMENT_AUTHORITY,
@@ -356,3 +357,104 @@ def test_restart_repairs_journal_after_done_manifest_commit(tmp_path):
     assert repaired["status"] == "succeeded"
     assert repaired["done_manifest_sha256"] == manifest_mod.sha256_file(
         target / manifest_mod.MANIFEST_NAME)
+
+
+def test_output_symlink_or_reparse_point_is_never_reusable(tmp_path):
+    job = tmp_path / "job"
+    manifest = _write_job(job, "job-linked-output", state="DONE")
+    outside = tmp_path / "outside-OUTCAR"
+    outside.write_text(OUTCAR, encoding="utf-8")
+    (job / "OUTCAR").unlink()
+    try:
+        (job / "OUTCAR").symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable on this platform: {exc}")
+    manifest["results"]["fetched_sha256"]["OUTCAR"] = _sha(outside)
+    manifest_mod.save_manifest(job, manifest)
+
+    verification = reuse.source_verification(job)
+
+    assert verification["reusable"] is False
+    assert "OUTCAR" not in verification["result_files"]
+    assert any("unavailable/unsafe:OUTCAR" in issue
+               for issue in verification["issues"])
+
+
+def test_output_hash_and_parser_share_one_open_entity_during_replace(
+    tmp_path, monkeypatch,
+):
+    job = tmp_path / "job"
+    manifest = _write_job(job, "job-output-replace", state="DONE")
+    bad_outcar = b"incomplete output from the declared run\n"
+    (job / "OUTCAR").write_bytes(bad_outcar)
+    bad_digest = hashlib.sha256(bad_outcar).hexdigest()
+    manifest["results"]["fetched_sha256"]["OUTCAR"] = bad_digest
+    manifest_mod.save_manifest(job, manifest)
+    replacement = tmp_path / "replacement-OUTCAR"
+    replacement.write_text(OUTCAR, encoding="utf-8")
+    original_parser = result_import._parse_outcar_handle
+    replaced = False
+
+    def replace_path_then_parse(handle, size):
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            try:
+                os.replace(replacement, job / "OUTCAR")
+            except PermissionError:
+                # Windows may deny rename-over-open without delete sharing.  An
+                # in-place rewrite is the same TOCTOU class and must also fail.
+                (job / "OUTCAR").write_text(OUTCAR, encoding="utf-8")
+        return original_parser(handle, size)
+
+    monkeypatch.setattr(
+        result_import, "_parse_outcar_handle", replace_path_then_parse
+    )
+
+    verification = reuse.source_verification(job)
+
+    assert replaced is True
+    assert verification["reusable"] is False
+    assert verification["result_files"]["OUTCAR"] == bad_digest
+    assert verification["parser"]["source_sha256"]["OUTCAR"] == bad_digest
+    assert any("during verification:OUTCAR" in issue
+               for issue in verification["issues"])
+
+
+def test_oversized_declared_output_fails_before_hash_or_parse(tmp_path, monkeypatch):
+    job = tmp_path / "job"
+    manifest = _write_job(job, "job-oversized-output", state="DONE")
+    manifest["results"]["fetched_sha256"] = {
+        "OUTCAR": manifest["results"]["fetched_sha256"]["OUTCAR"]
+    }
+    monkeypatch.setattr(reuse_verification, "MAX_RESULT_FILE_BYTES", 128)
+
+    def fail_resource_bypass(*_args, **_kwargs):
+        pytest.fail("oversized output must be rejected before hashing or parsing")
+
+    monkeypatch.setattr(reuse_verification.hashlib, "sha256", fail_resource_bypass)
+    monkeypatch.setattr(
+        result_import, "_parse_outcar_handle", fail_resource_bypass
+    )
+
+    verification = reuse_verification.verify_outputs(job, manifest)
+
+    assert "OUTCAR" not in verification["result_files"]
+    assert any("result file exceeds resource limit:OUTCAR" in issue
+               for issue in verification["issues"])
+
+
+def test_reuse_output_verification_never_reopens_parser_paths(tmp_path, monkeypatch):
+    job = tmp_path / "job"
+    _write_job(job, "job-one-output-entity", state="DONE")
+
+    def fail_path_reopen(*_args, **_kwargs):
+        pytest.fail("reuse verification must parse its already-open file entity")
+
+    monkeypatch.setattr(result_import, "_parse_outcar", fail_path_reopen)
+    monkeypatch.setattr(result_import, "_parse_oszicar", fail_path_reopen)
+    monkeypatch.setattr(manifest_mod, "sha256_file", fail_path_reopen)
+
+    verification = reuse.source_verification(job)
+
+    assert verification["reusable"] is True

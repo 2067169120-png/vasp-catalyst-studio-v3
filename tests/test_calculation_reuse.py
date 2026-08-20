@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import os
 from pathlib import Path
+import subprocess
 import types
 
 import pytest
@@ -271,6 +272,99 @@ def test_manifest_input_tamper_fails_closed(tmp_path):
         fingerprint["integrity_issues"]
 
 
+def test_source_verification_rejects_stale_external_fingerprint_when_only_input_changes(
+        tmp_path):
+    source = tmp_path / "source"
+    _write_job(source, "job-source", state="DONE")
+    stale = reuse.build_scientific_fingerprint(source)
+    manifest_before = (source / manifest_mod.MANIFEST_NAME).read_bytes()
+
+    (source / "INCAR").write_text(INCAR + "\nNELM = 200\n", encoding="utf-8")
+
+    assert (source / manifest_mod.MANIFEST_NAME).read_bytes() == manifest_before
+    verification = reuse.source_verification(source, stale)
+    assert verification["status"] == "incomplete"
+    assert verification["reusable"] is False
+    assert "provided scientific fingerprint does not match current authoritative snapshot" \
+        in verification["issues"]
+    assert verification["bindings"]["manifest_sha256"] == stale["manifest_sha256"]
+    assert verification["bindings"]["input_closure_digest"] \
+        != stale["input_closure_digest"]
+
+
+def test_indexes_do_not_promote_source_with_stale_input_bytes(tmp_path):
+    target = tmp_path / "target"
+    source = tmp_path / "source"
+    _write_job(target, "job-target")
+    _write_job(source, "job-source", state="DONE")
+    listed = [
+        (str(target), manifest_mod.load_manifest(target)),
+        (str(source), manifest_mod.load_manifest(source)),
+    ]
+    (source / "INCAR").write_text(INCAR + "\nNELM = 200\n", encoding="utf-8")
+
+    index = reuse.CalculationReuseIndex().rebuild(
+        listed,
+        job_id=lambda _path, manifest: manifest["job_uuid"],
+        project_id=lambda _path, manifest: manifest.get("project_uuid"),
+    )
+    advisory = index.advisory(["job-target"])["targets"][0]
+    assert advisory["exact_matches"] == []
+
+    authoritative = reuse.authoritative_reuse_lookup(
+        listed, ["job-target"],
+        job_id=lambda _path, manifest: manifest["job_uuid"],
+        project_id=lambda _path, manifest: manifest.get("project_uuid"),
+    )
+    assert authoritative["complete"] is True
+    assert authoritative["targets"][0]["exact_matches"] == []
+    assert authoritative["targets"][0]["absence_authoritative"] is True
+
+
+def test_job_root_symlink_is_rejected_without_following_it(tmp_path):
+    source = tmp_path / "source"
+    alias = tmp_path / "source-alias"
+    _write_job(source, "job-source", state="DONE")
+    try:
+        alias.symlink_to(source, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlink unavailable: {exc}")
+    try:
+        fingerprint = reuse.build_scientific_fingerprint(alias)
+        verification = reuse.source_verification(alias)
+    finally:
+        alias.unlink()
+
+    assert fingerprint["status"] == "incomplete"
+    assert "job root aliases through a symlink or reparse point" in \
+        fingerprint["integrity_issues"]
+    assert verification["reusable"] is False
+    assert verification["issues"] == [
+        "job root aliases through a symlink or reparse point"
+    ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction contract")
+def test_windows_job_root_junction_is_rejected(tmp_path):
+    source = tmp_path / "source"
+    alias = tmp_path / "source-junction"
+    _write_job(source, "job-source", state="DONE")
+    created = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(alias), str(source)],
+        check=False, capture_output=True, text=True,
+    )
+    if created.returncode != 0:
+        pytest.skip("junction creation is unavailable")
+    try:
+        fingerprint = reuse.build_scientific_fingerprint(alias)
+    finally:
+        alias.rmdir()
+
+    assert fingerprint["status"] == "incomplete"
+    assert "job root aliases through a symlink or reparse point" in \
+        fingerprint["integrity_issues"]
+
+
 def _index(paths, *, limit=512):
     entries = [(str(path), manifest_mod.load_manifest(path)) for path in paths]
     return reuse.CalculationReuseIndex(limit=limit).rebuild(
@@ -521,6 +615,93 @@ def test_reuse_rechecks_source_after_result_materialization(tmp_path):
         target, source, decision_id="reuse-final-toctou-001", reason="duplicate")
     assert recovered["ok"] is True
     assert manifest_mod.load_manifest(target)["state"] == "DONE"
+
+
+def test_target_root_identity_drift_after_materialization_stays_prepared(
+        tmp_path, monkeypatch):
+    target = tmp_path / "target"
+    displaced = tmp_path / "target-original"
+    source = tmp_path / "source"
+    _write_job(target, "job-target")
+    _write_job(source, "job-source", state="DONE")
+    original_identity = reuse._root_identity
+    simulated_drift = False
+
+    def identity(path):
+        value = original_identity(path)
+        if simulated_drift and Path(path) == target:
+            return value[0], value[1], value[2] + 1
+        return value
+
+    monkeypatch.setattr(reuse, "_root_identity", identity)
+
+    def replace_root_after_first_copy(_name, count):
+        nonlocal simulated_drift
+        if count != 1:
+            return
+        try:
+            target.rename(displaced)
+            target.mkdir()
+        except OSError:
+            # Windows commonly prevents renaming a directory containing the
+            # held operation-lock file.  Simulate the same volume/file-id
+            # change to exercise the cross-platform commit boundary.
+            simulated_drift = True
+
+    with pytest.raises(reuse.ReuseConflictError, match="root identity changed"):
+        _record_reuse(
+            target, source, decision_id="reuse-target-root-drift",
+            reason="duplicate", after_materialize=replace_root_after_first_copy,
+        )
+
+    prepared_root = displaced if displaced.exists() else target
+    prepared = manifest_mod.load_manifest(prepared_root)
+    assert prepared["state"] == "CREATED"
+    assert prepared["reuse_decisions"][0]["status"] == "prepared"
+    if displaced.exists():
+        # POSIX can rename an open directory; all anchored writes must remain
+        # on A, while replacement B stays completely untouched.
+        assert list(target.iterdir()) == []
+    else:
+        # Windows' non-delete-sharing directory handle blocks creation of B.
+        assert prepared_root == target
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows root handle prevents replacement")
+def test_done_commit_root_drift_rolls_bound_entity_back_to_prepared(
+        tmp_path, monkeypatch):
+    target = tmp_path / "target"
+    displaced = tmp_path / "target-original"
+    source = tmp_path / "source"
+    _write_job(target, "job-target")
+    _write_job(source, "job-source", state="DONE")
+    original_save = reuse._save_bound_manifest
+    swapped = False
+
+    def save_then_replace_root(binding, manifest):
+        nonlocal swapped
+        digest = original_save(binding, manifest)
+        if manifest.get("state") == "DONE" and not swapped:
+            target.rename(displaced)
+            target.mkdir()
+            swapped = True
+        return digest
+
+    monkeypatch.setattr(reuse, "_save_bound_manifest", save_then_replace_root)
+
+    with pytest.raises(reuse.ReuseConflictError, match="root identity changed"):
+        _record_reuse(
+            target, source, decision_id="reuse-done-root-drift",
+            reason="duplicate",
+        )
+
+    prepared = manifest_mod.load_manifest(displaced)
+    assert prepared["state"] == "CREATED"
+    assert prepared["reuse_decisions"][0]["status"] == "prepared"
+    journals = list(displaced.glob(".reuse-journal-*.json"))
+    assert len(journals) == 1
+    assert reuse._load_reuse_journal(journals[0])["status"] == "prepared"
+    assert list(target.iterdir()) == []
 
 
 def test_concurrent_reuse_never_creates_two_decisions(tmp_path):

@@ -247,9 +247,9 @@ def create_from_build(job_dir: str | os.PathLike, build_result: dict, *,
         # recipe decision after the fact.
         inputs['method_recipe_status'] = 'legacy_missing'
     if build_result.get('execution_environment') is not None:
-        from vcstudio.shared.execution_environment import validate_execution_environment
-        inputs['execution_environment'] = validate_execution_environment(
-            build_result['execution_environment'])
+        raise ValueError(
+            'execution_environment 只能由服务端在选定可核验集群 profile '
+            '后绑定；create_from_build 拒绝 builder 传入的环境证据')
     if incar_path is not None:
         source_incar = Path(incar_path).resolve()
         inputs['source_incar_path'] = str(source_incar)

@@ -16,6 +16,7 @@ from vcstudio.generate.method_recipe import (
 from vcstudio.project.calculation_reuse import (
     CalculationReuseIndex, build_scientific_fingerprint, record_reuse_reference,
 )
+from vcstudio.project import eos, spin_scan
 from vcstudio.shared import manifest as manifest_mod
 from vcstudio.shared.execution_environment import (
     EXECUTION_ENVIRONMENT_AUTHORITY, EXECUTION_ENVIRONMENT_SCHEMA,
@@ -125,13 +126,16 @@ def test_generic_builder_manifest_and_pre_submit_fingerprint_are_authoritative(t
     result = build_job_dir(
         source, "ENCUT = 400\n", out, calc_type="slab",
         lib_root=str(_potlib(tmp_path / "potlib")),
-        execution_environment=_environment(), method_recipe=recipe,
+        method_recipe=recipe,
     )
     manifest_mod.create_from_build(out, result, poscar_path=source)
 
     loaded = manifest_mod.load_manifest(out)
     assert loaded["inputs"]["method_recipe"] == recipe
     assert loaded["inputs"]["input_closure"]["status"] == "complete"
+    assert "execution_environment" not in loaded["inputs"]
+    assert build_scientific_fingerprint(out)["status"] == "incomplete"
+    submitter.bind_execution_environment(str(out), _profile())
     fingerprint = build_scientific_fingerprint(out)
     assert fingerprint["status"] == "complete"
     assert not any(item.startswith("method_recipe") for item in fingerprint["missing"])
@@ -152,7 +156,6 @@ def test_production_builder_to_advisory_to_explicit_reuse(tmp_path):
             directory,
             calc_type="slab",
             lib_root=str(potlib),
-            execution_environment=_environment(),
             method_recipe=recipe,
         )
         manifest = manifest_mod.create_from_build(
@@ -161,6 +164,7 @@ def test_production_builder_to_advisory_to_explicit_reuse(tmp_path):
         manifest["project_uuid"] = "production-project"
         manifest["inputs"]["project_uuid"] = "production-project"
         manifest_mod.save_manifest(directory, manifest)
+        submitter.bind_execution_environment(str(directory), _profile())
 
     source, target = directories
     (source / "OUTCAR").write_text(
@@ -225,7 +229,6 @@ def test_neb_closure_binds_every_ordered_image_and_excludes_outputs(tmp_path):
     neb_builder.build_neb_dir(
         out, initial, final, "ENCUT=400\nISYM=0\nNSW=100\n",
         n_images=2, kpoints=[1, 1, 1], potcar_fn=lambda _elements: POTCAR,
-        execution_environment=_environment(),
     )
     (out / "01" / "OUTCAR").write_text("old output\n", encoding="utf-8")
     loaded = manifest_mod.load_manifest(out)
@@ -239,6 +242,22 @@ def test_neb_closure_binds_every_ordered_image_and_excludes_outputs(tmp_path):
     assert issues == [] and "01/OUTCAR" not in names
 
 
+def test_builders_reject_untrusted_execution_environment_injection(tmp_path):
+    source = tmp_path / "reject-POSCAR"
+    source.write_text(POSCAR, encoding="utf-8")
+    with pytest.raises(ValueError, match="只能由服务端"):
+        build_job_dir(
+            source, "ENCUT=400\n", tmp_path / "reject-job",
+            lib_root=str(_potlib(tmp_path / "reject-potlib")),
+            execution_environment=_environment(),
+        )
+    with pytest.raises(ValueError, match="只能由服务端"):
+        neb_builder.build_neb_dir(
+            tmp_path / "reject-neb", POSCAR, POSCAR,
+            "ENCUT=400\nISYM=0\nNSW=100\n", n_images=1,
+            kpoints=[1, 1, 1], potcar_fn=lambda _elements: POTCAR,
+            execution_environment=_environment(),
+        )
 def test_neb_restart_dependencies_are_bound_per_intermediate_image(tmp_path):
     job = tmp_path / "neb-restart"
     job.mkdir()
@@ -341,3 +360,86 @@ def test_large_dependency_is_rejected_before_hashing_beyond_cap(tmp_path, monkey
     assert closure["status"] == "incomplete"
     assert closure["missing"] == ["WAVECAR"]
     assert closure["resource_limits"]
+
+
+def _derived_source(tmp_path: Path, name: str) -> Path:
+    source = tmp_path / name
+    source.mkdir()
+    for filename, text in {
+            "POSCAR": POSCAR, "CONTCAR": POSCAR,
+            "INCAR": "ENCUT=400\nNSW=20\nIBRION=2\n",
+            "KPOINTS": KPOINTS, "POTCAR": POTCAR}.items():
+        (source / filename).write_text(text, encoding="utf-8")
+    manifest_mod.save_manifest(source, manifest_mod.new_manifest(
+        job_id=f"{name}-parent", system="C", task_type="relax",
+        calc_type="bulk", inputs={"engine": "vasp"}))
+    return source
+
+
+def test_eos_production_builder_rebinds_final_recipe_and_closure(tmp_path):
+    source = _derived_source(tmp_path, "eos-parent")
+    result = eos.build_eos_series(source, tmp_path / "eos", scales=[1.0])
+    job = Path(result["dirs"][1.0])
+    built = manifest_mod.load_manifest(job)
+
+    assert "execution_environment" not in built["inputs"]
+    assert built["inputs"]["method_recipe"]["authority"] == METHOD_RECIPE_AUTHORITY
+    assert built["inputs"]["input_closure"]["status"] == "complete"
+
+    submitter.bind_execution_environment(str(job), _profile())
+    fingerprint = build_scientific_fingerprint(job)
+    assert fingerprint["status"] == "complete"
+    assert fingerprint["missing"] == []
+
+
+def test_spin_scan_production_builder_resets_parent_and_resigns_final_incar(tmp_path):
+    source = _derived_source(tmp_path, "spin-parent")
+    parent = manifest_mod.load_manifest(source)
+    parent["inputs"]["execution_environment"] = _environment()
+    parent["state"] = "DONE"
+    parent["results"] = {"energy_e0_eV": -1.0}
+    manifest_mod.save_manifest(source, parent)
+
+    variants = spin_scan.build_spin_variants(
+        source, tmp_path / "spin",
+        candidates=[{"name": "nupdown0", "magmom_overrides": None, "nupdown": 0}],
+    )
+    job = Path(variants[0]["out_dir"])
+    built = manifest_mod.load_manifest(job)
+
+    assert built["state"] == "CREATED" and built["results"] == {}
+    assert built["task_type"] == "spin_scan"
+    assert "execution_environment" not in built["inputs"]
+    assert built["inputs"]["method_recipe"]["authority"] == METHOD_RECIPE_AUTHORITY
+    assert built["inputs"]["input_closure"]["status"] == "complete"
+
+    submitter.bind_execution_environment(str(job), _profile())
+    fingerprint = build_scientific_fingerprint(job)
+    assert fingerprint["status"] == "complete"
+    assert fingerprint["missing"] == []
+
+
+def test_spin_scan_copies_triggered_restart_inputs_but_not_parent_outputs(tmp_path):
+    source = _derived_source(tmp_path, "spin-restart-parent")
+    (source / "INCAR").write_text(
+        "ENCUT=400\nNSW=0\nISTART=1\nICHARG=11\n", encoding="utf-8")
+    for filename in ("WAVECAR", "CHGCAR", "KPOINTS_OPT"):
+        (source / filename).write_text(f"{filename} input\n", encoding="utf-8")
+    (source / "OUTCAR").write_text("parent result\n", encoding="utf-8")
+    (source / ".vcstudio-submit-recovery.json").write_text(
+        "{}\n", encoding="utf-8")
+
+    variants = spin_scan.build_spin_variants(
+        source, tmp_path / "spin-restart",
+        candidates=[{"name": "nupdown0", "magmom_overrides": None, "nupdown": 0}],
+    )
+    job = Path(variants[0]["out_dir"])
+    built = manifest_mod.load_manifest(job)
+
+    assert all((job / name).is_file()
+               for name in ("WAVECAR", "CHGCAR", "KPOINTS_OPT"))
+    assert not (job / "OUTCAR").exists()
+    assert not (job / ".vcstudio-submit-recovery.json").exists()
+    assert built["inputs"]["input_closure"]["status"] == "complete"
+    assert {"WAVECAR", "CHGCAR", "KPOINTS_OPT"}.issubset(
+        built["inputs"]["input_closure"]["files"])

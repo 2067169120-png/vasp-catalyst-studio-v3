@@ -360,6 +360,10 @@ def build_neb_dir(out_dir, poscar_ini: str, poscar_fin: str, incar_text: str, *,
     Returns:
         ``{'job_dir','n_images','warnings'}``。端点不一致/插值重叠 → ValueError(冒泡)。
     """
+    if execution_environment is not None:
+        raise ValueError(
+            'execution_environment 只能由服务端在选定可核验集群 profile '
+            '后绑定；builder 不接受计划运行环境')
     out_dir = Path(out_dir)
     # 插值(顺带完成端点一致性 + 重叠校验,失败在此冒泡)
     images = interpolate_images(poscar_ini, poscar_fin, n_images)
@@ -420,10 +424,6 @@ def build_neb_dir(out_dir, poscar_ini: str, poscar_fin: str, incar_text: str, *,
             kpoints_source=('explicit' if kpoints is not None else 'recommended'),
             extra={'n_images': n_images, 'climbing': bool(climbing), 'spring': spring},
         ))
-    if execution_environment is not None:
-        from vcstudio.shared.execution_environment import validate_execution_environment
-        inputs['execution_environment'] = validate_execution_environment(
-            execution_environment)
     system = ini_ep['header'][0].strip() or out_dir.name
     m = manifest_mod.new_manifest(
         job_id=f'{out_dir.resolve().name}-neb', system=system, task_type='neb',

@@ -71,6 +71,10 @@ def build_job_dir(poscar_path, incar, out_dir, *,
         {'ok','out_dir','warnings','kpoints','elements','completions','calc_type'}。
         VASP4/畸形 POSCAR → ValueError;ENMAX>ENCUT/库缺失 → PotcarError(冒泡)。
     """
+    if execution_environment is not None:
+        raise ValueError(
+            'execution_environment 只能由服务端在选定可核验集群 profile '
+            '后绑定；builder 不接受计划运行环境')
     content = read_poscar(poscar_path)
     elements, counts = parse_poscar_species(content)
     if not elements:
@@ -132,18 +136,12 @@ def build_job_dir(poscar_path, incar, out_dir, *,
                   kpoints_source=('explicit' if kpoints is not None else 'recommended'),
                   extra={'force_encut': force_encut},
               ))
-    environment = None
-    if execution_environment is not None:
-        from vcstudio.shared.execution_environment import validate_execution_environment
-        environment = validate_execution_environment(execution_environment)
-
     return {'ok': True, 'out_dir': str(out_dir), 'warnings': warnings,
             'kpoints': kpts, 'elements': elements,
             # 附加回传(向后兼容的新增键):manifest/预览用
             'completions': dict(completions), 'calc_type': calc_type,
             # 任务类型按 INCAR 推断(NSW=0→static 等):收敛判定按类型分流的前提
             'task_type': task_type, 'method_recipe': recipe,
-            'execution_environment': environment,
             # 赝势身份溯源(审查#2):variant/TITEL/ENMAX 供 manifest 落档
             'potcar': potcar_provenance(elements, lib_root)}
 

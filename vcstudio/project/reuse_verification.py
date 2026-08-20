@@ -7,10 +7,15 @@ that decision.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager, ExitStack
+from dataclasses import dataclass
+import hashlib
 import math
+import os
 from pathlib import Path
 import re
-from typing import Any, Mapping
+import stat
+from typing import Any, BinaryIO, Iterator, Mapping
 
 from vcstudio.project import result_import
 from vcstudio.shared import manifest as manifest_mod
@@ -58,13 +63,192 @@ _STATIC_LIKE_TASKS = frozenset({
 _IONIC_TASKS = frozenset({"relax", "cellopt", "dimer"})
 
 
-def _observed_vasp_version(path: Path | None) -> str | None:
-    if path is None:
+@dataclass(frozen=True)
+class _ResultSnapshot:
+    """One declared output bound to one open regular-file entity."""
+
+    name: str
+    path: Path
+    handle: BinaryIO
+    opened_stat: os.stat_result
+    component_stats: tuple[tuple[Path, os.stat_result], ...]
+    sha256: str
+
+    @property
+    def size(self) -> int:
+        return int(self.opened_stat.st_size)
+
+
+def _mtime_ns(value: os.stat_result) -> int:
+    return int(getattr(value, "st_mtime_ns", int(value.st_mtime * 1_000_000_000)))
+
+
+def _same_entity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        int(left.st_dev), int(left.st_ino), stat.S_IFMT(left.st_mode)
+    ) == (
+        int(right.st_dev), int(right.st_ino), stat.S_IFMT(right.st_mode)
+    )
+
+
+def _same_immutable_stat(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        _same_entity(left, right)
+        and int(left.st_size) == int(right.st_size)
+        and _mtime_ns(left) == _mtime_ns(right)
+    )
+
+
+def _is_reparse(value: os.stat_result) -> bool:
+    attributes = int(getattr(value, "st_file_attributes", 0))
+    marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return bool(attributes & marker)
+
+
+def _snapshot_components(root: Path, path: Path) -> tuple[tuple[Path, os.stat_result], ...]:
+    """Capture every path entity without following links or reparse points."""
+    components: list[tuple[Path, os.stat_result]] = []
+    root_stat = root.lstat()
+    if not stat.S_ISDIR(root_stat.st_mode) or _is_reparse(root_stat):
+        raise OSError("unsafe result root")
+    components.append((root, root_stat))
+    current = root
+    relative = path.relative_to(root)
+    for index, part in enumerate(relative.parts):
+        current = current / part
+        current_stat = current.lstat()
+        final = index == len(relative.parts) - 1
+        expected = stat.S_ISREG if final else stat.S_ISDIR
+        if not expected(current_stat.st_mode) or _is_reparse(current_stat):
+            raise OSError("unsafe linked/non-regular result path")
+        components.append((current, current_stat))
+    return tuple(components)
+
+
+def _open_result_snapshot(
+    stack: ExitStack, root: Path, name: str, *, remaining_bytes: int,
+) -> _ResultSnapshot:
+    path = root.joinpath(*name.split("/"))
+    components = _snapshot_components(root, path)
+    root_resolved = root.resolve(strict=True)
+    resolved = path.resolve(strict=True)
+    if resolved == root_resolved or root_resolved not in resolved.parents:
+        raise OSError("result path escapes job root")
+    path_stat = components[-1][1]
+    if int(path_stat.st_size) > MAX_RESULT_FILE_BYTES:
+        raise ValueError(f"result file exceeds resource limit:{name}")
+    if int(path_stat.st_size) > remaining_bytes:
+        raise ValueError("result bundle exceeds resource limit")
+
+    flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+    flags |= int(getattr(os, "O_NOFOLLOW", 0))
+    descriptor = os.open(path, flags)
+    try:
+        handle = os.fdopen(descriptor, "rb", closefd=True)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    stack.callback(handle.close)
+    opened = os.fstat(handle.fileno())
+    if not stat.S_ISREG(opened.st_mode) or not _same_immutable_stat(path_stat, opened):
+        raise OSError("result entity changed while opening")
+
+    digest = hashlib.sha256()
+    bytes_read = 0
+    while True:
+        chunk = handle.read(1024 * 1024)
+        if not chunk:
+            break
+        bytes_read += len(chunk)
+        if bytes_read > opened.st_size:
+            raise OSError("result size changed while hashing")
+        digest.update(chunk)
+    hashed = os.fstat(handle.fileno())
+    if bytes_read != opened.st_size or not _same_immutable_stat(opened, hashed):
+        raise OSError("result changed while hashing")
+    handle.seek(0)
+    return _ResultSnapshot(
+        name=name,
+        path=path,
+        handle=handle,
+        opened_stat=opened,
+        component_stats=components,
+        sha256=digest.hexdigest(),
+    )
+
+
+def _snapshot_integrity_issue(snapshot: _ResultSnapshot) -> str | None:
+    """Revalidate both the open entity and its reachable path after parsing."""
+    try:
+        current_fd = os.fstat(snapshot.handle.fileno())
+        if not _same_immutable_stat(snapshot.opened_stat, current_fd):
+            return f"result file changed during verification:{snapshot.name}"
+        for path, original in snapshot.component_stats:
+            current = path.lstat()
+            if _is_reparse(current) or not _same_immutable_stat(original, current):
+                return f"result path changed during verification:{snapshot.name}"
+    except (OSError, ValueError):
+        return f"result file unavailable after verification:{snapshot.name}"
+    return None
+
+
+@contextmanager
+def _verified_result_snapshots(
+    root: Path, manifest: Mapping[str, Any]
+) -> Iterator[tuple[dict[str, _ResultSnapshot], list[str]]]:
+    declared = _declared_hashes(manifest)
+    if not declared:
+        yield {}, ["results.fetched_sha256"]
+        return
+    if len(declared) > MAX_RESULT_FILES:
+        yield {}, [f"result declaration exceeds {MAX_RESULT_FILES} files"]
+        return
+    task = str(manifest.get("task_type") or "").strip().lower()
+    try:
+        task = manifest_mod.normalize_task_type(task)
+    except ValueError:
+        yield {}, [f"unknown result task type:{task or '?'}"]
+        return
+
+    root = Path(root)
+    snapshots: dict[str, _ResultSnapshot] = {}
+    issues: list[str] = []
+    total_bytes = 0
+    with ExitStack() as stack:
+        for raw_name, raw_digest in sorted(declared.items(), key=lambda item: str(item[0])):
+            name = str(raw_name or "").strip().replace("\\", "/")
+            digest = str(raw_digest or "").strip().lower()
+            if not _allowed_result(name, task) or not _HEX64_RE.fullmatch(digest):
+                issues.append(f"result file is not allowlisted/hash-valid:{name or '?'}")
+                continue
+            try:
+                snapshot = _open_result_snapshot(
+                    stack, root, name,
+                    remaining_bytes=MAX_RESULT_TOTAL_BYTES - total_bytes,
+                )
+            except ValueError as exc:
+                issues.append(str(exc))
+                continue
+            except OSError:
+                issues.append(f"result file unavailable/unsafe:{name}")
+                continue
+            total_bytes += snapshot.size
+            if snapshot.sha256 != digest:
+                issues.append(f"result file changed:{name}")
+                continue
+            snapshots[name] = snapshot
+        if not snapshots:
+            issues.append("no result file remains verifiable")
+        yield snapshots, issues
+
+
+def _observed_vasp_version(snapshot: _ResultSnapshot | None) -> str | None:
+    if snapshot is None:
         return None
     try:
-        with path.open("rb") as handle:
-            payload = handle.read(256 * 1024)
-    except OSError:
+        snapshot.handle.seek(0)
+        payload = snapshot.handle.read(256 * 1024)
+    except (OSError, ValueError):
         return None
     match = _VASP_VERSION_RE.search(payload)
     return match.group(1).decode("ascii") if match else None
@@ -109,54 +293,13 @@ def verified_result_hashes(
     root: Path, manifest: Mapping[str, Any]
 ) -> tuple[dict[str, str], list[str]]:
     """Return current allowlisted output hashes and all integrity failures."""
-    declared = _declared_hashes(manifest)
-    if not declared:
-        return {}, ["results.fetched_sha256"]
-    if len(declared) > MAX_RESULT_FILES:
-        return {}, [f"result declaration exceeds {MAX_RESULT_FILES} files"]
-    task = str(manifest.get("task_type") or "").strip().lower()
-    try:
-        task = manifest_mod.normalize_task_type(task)
-    except ValueError:
-        return {}, [f"unknown result task type:{task or '?'}"]
-    verified: dict[str, str] = {}
-    issues: list[str] = []
-    total_bytes = 0
-    for raw_name, raw_digest in sorted(declared.items(), key=lambda item: str(item[0])):
-        name = str(raw_name or "").strip().replace("\\", "/")
-        digest = str(raw_digest or "").strip().lower()
-        if not _allowed_result(name, task) or not _HEX64_RE.fullmatch(digest):
-            issues.append(f"result file is not allowlisted/hash-valid:{name or '?'}")
-            continue
-        path = root.joinpath(*name.split("/"))
-        try:
-            resolved = path.resolve(strict=True)
-            if (
-                path.is_symlink()
-                or not path.is_file()
-                or resolved == root
-                or root not in resolved.parents
-            ):
-                raise OSError("unsafe result path")
-            size = path.stat().st_size
-            if size > MAX_RESULT_FILE_BYTES:
-                issues.append(f"result file exceeds resource limit:{name}")
-                continue
-            total_bytes += size
-            if total_bytes > MAX_RESULT_TOTAL_BYTES:
-                issues.append("result bundle exceeds resource limit")
-                continue
-            current = manifest_mod.sha256_file(path)
-        except OSError:
-            issues.append(f"result file unavailable:{name}")
-            continue
-        if current != digest:
-            issues.append(f"result file changed:{name}")
-            continue
-        verified[name] = current
-    if not verified:
-        issues.append("no result file remains verifiable")
-    return verified, issues
+    with _verified_result_snapshots(Path(root), manifest) as (snapshots, issues):
+        verified = {name: snapshot.sha256 for name, snapshot in snapshots.items()}
+        for snapshot in snapshots.values():
+            issue = _snapshot_integrity_issue(snapshot)
+            if issue:
+                issues.append(issue)
+        return verified, sorted(set(issues))
 
 
 def _explicit_contradictions(manifest: Mapping[str, Any], task: str) -> list[str]:
@@ -247,21 +390,31 @@ def _energy_consistency(values: list[tuple[str, Any]]) -> tuple[float | None, li
     return reference, issues
 
 
-def _verify_single(root: Path, manifest: Mapping[str, Any], hashes: Mapping[str, str]) -> dict:
+def _verify_single(
+    manifest: Mapping[str, Any], snapshots: Mapping[str, _ResultSnapshot]
+) -> dict:
     task = str(manifest.get("task_type") or "").strip().lower()
     issues = _explicit_contradictions(manifest, task)
-    if "OSZICAR" not in hashes:
+    if "OSZICAR" not in snapshots:
         issues.append("OSZICAR is not hash-bound and verifiable")
-    if not {"OUTCAR", "vasprun.xml"}.intersection(hashes):
+    if not {"OUTCAR", "vasprun.xml"}.intersection(snapshots):
         issues.append("OUTCAR or vasprun.xml is not hash-bound and verifiable")
-    osz = result_import._parse_oszicar(root / "OSZICAR" if "OSZICAR" in hashes else None)
-    out = result_import._parse_outcar(root / "OUTCAR" if "OUTCAR" in hashes else None)
-    xml = result_import._parse_vasprun(
-        root / "vasprun.xml" if "vasprun.xml" in hashes else None
+    osz_snapshot = snapshots.get("OSZICAR")
+    out_snapshot = snapshots.get("OUTCAR")
+    xml_snapshot = snapshots.get("vasprun.xml")
+    osz = (
+        result_import._parse_oszicar_handle(osz_snapshot.handle, osz_snapshot.size)
+        if osz_snapshot else result_import._parse_oszicar(None)
     )
-    observed_version = _observed_vasp_version(
-        root / "OUTCAR" if "OUTCAR" in hashes else None
+    out = (
+        result_import._parse_outcar_handle(out_snapshot.handle, out_snapshot.size)
+        if out_snapshot else result_import._parse_outcar(None)
     )
+    xml = (
+        result_import._parse_vasprun_handle(xml_snapshot.handle)
+        if xml_snapshot else result_import._parse_vasprun(None)
+    )
+    observed_version = _observed_vasp_version(out_snapshot)
     planned_version = _planned_vasp_version(manifest)
     if observed_version and planned_version and observed_version != planned_version:
         issues.append(
@@ -314,9 +467,9 @@ def _verify_single(root: Path, manifest: Mapping[str, Any], hashes: Mapping[str,
         "version": OUTPUT_PARSER_VERSION,
         "task_type": task,
         "source_sha256": {
-            name: hashes[name]
+            name: snapshots[name].sha256
             for name in ("OUTCAR", "OSZICAR", "vasprun.xml")
-            if name in hashes
+            if name in snapshots
         },
         "observed_vasp_version": observed_version,
         "matrix": "ionic" if task in _IONIC_TASKS else "completed-run",
@@ -324,7 +477,9 @@ def _verify_single(root: Path, manifest: Mapping[str, Any], hashes: Mapping[str,
     return {"issues": issues, "energy_e0_eV": energy, "parser": parser}
 
 
-def _verify_neb(root: Path, manifest: Mapping[str, Any], hashes: Mapping[str, str]) -> dict:
+def _verify_neb(
+    root: Path, manifest: Mapping[str, Any], snapshots: Mapping[str, _ResultSnapshot]
+) -> dict:
     issues = _explicit_contradictions(manifest, "neb")
     inputs = manifest.get("inputs") if isinstance(manifest.get("inputs"), Mapping) else {}
     try:
@@ -343,16 +498,26 @@ def _verify_neb(root: Path, manifest: Mapping[str, Any], hashes: Mapping[str, st
         osz_name = f"{frame}/OSZICAR"
         out_name = f"{frame}/OUTCAR"
         xml_name = f"{frame}/vasprun.xml"
-        if osz_name not in hashes:
+        if osz_name not in snapshots:
             issues.append(f"NEB {frame} OSZICAR is not hash-bound")
-        if out_name not in hashes and xml_name not in hashes:
+        if out_name not in snapshots and xml_name not in snapshots:
             issues.append(f"NEB {frame} OUTCAR/vasprun.xml is not hash-bound")
-        osz = result_import._parse_oszicar(root / osz_name if osz_name in hashes else None)
-        out = result_import._parse_outcar(root / out_name if out_name in hashes else None)
-        xml = result_import._parse_vasprun(root / xml_name if xml_name in hashes else None)
-        observed_version = _observed_vasp_version(
-            root / out_name if out_name in hashes else None
+        osz_snapshot = snapshots.get(osz_name)
+        out_snapshot = snapshots.get(out_name)
+        xml_snapshot = snapshots.get(xml_name)
+        osz = (
+            result_import._parse_oszicar_handle(osz_snapshot.handle, osz_snapshot.size)
+            if osz_snapshot else result_import._parse_oszicar(None)
         )
+        out = (
+            result_import._parse_outcar_handle(out_snapshot.handle, out_snapshot.size)
+            if out_snapshot else result_import._parse_outcar(None)
+        )
+        xml = (
+            result_import._parse_vasprun_handle(xml_snapshot.handle)
+            if xml_snapshot else result_import._parse_vasprun(None)
+        )
+        observed_version = _observed_vasp_version(out_snapshot)
         if observed_version:
             image_versions[frame] = observed_version
             if planned_version and observed_version != planned_version:
@@ -361,7 +526,8 @@ def _verify_neb(root: Path, manifest: Mapping[str, Any], hashes: Mapping[str, st
                     f"planned {planned_version}"
                 )
         parser_sources.update({
-            name: hashes[name] for name in (osz_name, out_name, xml_name) if name in hashes
+            name: snapshots[name].sha256
+            for name in (osz_name, out_name, xml_name) if name in snapshots
         })
         if osz.get("trailing_incomplete_scf"):
             issues.append(f"NEB {frame} has an incomplete electronic step")
@@ -429,32 +595,45 @@ def _verify_neb(root: Path, manifest: Mapping[str, Any], hashes: Mapping[str, st
 
 
 def verify_outputs(root: Path, manifest: Mapping[str, Any]) -> dict[str, Any]:
-    hashes, hash_issues = verified_result_hashes(root, manifest)
-    task = str(manifest.get("task_type") or "").strip().lower()
-    try:
-        task = manifest_mod.normalize_task_type(task)
-    except ValueError:
+    root = Path(root)
+    with _verified_result_snapshots(root, manifest) as (snapshots, hash_issues):
+        hashes = {name: snapshot.sha256 for name, snapshot in snapshots.items()}
+        task = str(manifest.get("task_type") or "").strip().lower()
+        try:
+            task = manifest_mod.normalize_task_type(task)
+        except ValueError:
+            for snapshot in snapshots.values():
+                issue = _snapshot_integrity_issue(snapshot)
+                if issue:
+                    hash_issues.append(issue)
+            return {
+                "issues": sorted(set([
+                    *hash_issues, f"unknown result task type:{task or '?'}"
+                ])),
+                "result_files": hashes, "energy_e0_eV": None,
+                "parser": {
+                    "schema": OUTPUT_PARSER_SCHEMA, "name": OUTPUT_PARSER_NAME,
+                    "version": OUTPUT_PARSER_VERSION, "task_type": task,
+                    "source_sha256": {}, "matrix": "unknown-fail-closed",
+                },
+            }
+        if task in _STATIC_LIKE_TASKS:
+            _TASK_RESULTS.setdefault(task, frozenset())
+        parsed = (
+            _verify_neb(root, manifest, snapshots)
+            if task == "neb" else _verify_single(manifest, snapshots)
+        )
+        for snapshot in snapshots.values():
+            issue = _snapshot_integrity_issue(snapshot)
+            if issue:
+                hash_issues.append(issue)
+        issues = sorted(set([*hash_issues, *parsed.pop("issues")]))
         return {
-            "issues": sorted(set([*hash_issues, f"unknown result task type:{task or '?'}"])),
-            "result_files": hashes, "energy_e0_eV": None,
-            "parser": {
-                "schema": OUTPUT_PARSER_SCHEMA, "name": OUTPUT_PARSER_NAME,
-                "version": OUTPUT_PARSER_VERSION, "task_type": task,
-                "source_sha256": {}, "matrix": "unknown-fail-closed",
-            },
+            "issues": issues,
+            "result_files": hashes,
+            "contradiction_status": _contradiction_status(manifest, task),
+            **parsed,
         }
-    if task in _STATIC_LIKE_TASKS:
-        _TASK_RESULTS.setdefault(task, frozenset())
-    parsed = _verify_neb(root, manifest, hashes) if task == "neb" else _verify_single(
-        root, manifest, hashes
-    )
-    issues = sorted(set([*hash_issues, *parsed.pop("issues")]))
-    return {
-        "issues": issues,
-        "result_files": hashes,
-        "contradiction_status": _contradiction_status(manifest, task),
-        **parsed,
-    }
 
 
 __all__ = [

@@ -64,7 +64,19 @@ def build_pair(source_dir: str, out_root: str | None = None, *, eb_k: float = 78
                 'eb_k': dielectric, 'source_job': source,
             }
             manifest.setdefault('inputs', {})['vaspsol'] = dict(manifest['vaspsol'])
+            from vcstudio.generate.method_recipe import builder_recipe
+            completions = {'LSOL': role == 'solvent'}
+            if role == 'solvent':
+                completions['EB_K'] = dielectric
+            manifest['inputs']['method_recipe'] = builder_recipe(
+                builder='vcstudio.generate.vaspsol_pair/v1', task_type='vaspsol',
+                calc_type=str(manifest.get('calc_type') or 'slab'), validate=True,
+                completions=completions,
+                kpoints_source='parent-copy',
+                extra={'role': role})
             manifest.setdefault('warnings', []).append(VASPSOL_ADVISORY)
+            from vcstudio.shared.scientific_inputs import record_input_closure
+            record_input_closure(path, manifest)
             manifest_mod.save_manifest(path, manifest)
     except Exception:
         # 这两个目录在入口已证明不存在，只回滚本次新建目标，绝不碰用户源目录。

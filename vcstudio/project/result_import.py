@@ -110,6 +110,25 @@ def _read_edges(path: Path, head_bytes: int, tail_bytes: int) -> tuple[str, bool
         return '', False
 
 
+def _read_edges_handle(handle, size: int, head_bytes: int,
+                       tail_bytes: int) -> tuple[str, bool]:
+    """Read the same bounded view from an already-open, seekable binary file."""
+    try:
+        handle.seek(0)
+        if size <= head_bytes + tail_bytes:
+            raw = handle.read(size + 1)
+            omitted = False
+        else:
+            raw = handle.read(head_bytes)
+            handle.seek(max(size - tail_bytes, 0))
+            raw += b'\n... vcstudio omitted middle of large file ...\n'
+            raw += handle.read(tail_bytes + 1)
+            omitted = True
+        return raw.decode('utf-8', errors='replace'), omitted
+    except (OSError, ValueError):
+        return '', False
+
+
 def _files_by_canonical(folder: Path) -> dict[str, Path]:
     """Return known files case-insensitively, preferring the canonical spelling."""
     found: dict[str, Path] = {}
@@ -429,16 +448,14 @@ def _now_iso() -> str:
     return time.strftime('%Y-%m-%dT%H:%M:%S')
 
 
-def _parse_oszicar(path: Path | None) -> dict:
+def _parse_oszicar_text(text: str, *, present: bool, omitted: bool) -> dict:
     facts = {
-        'present': bool(path and path.is_file()), 'energy_e0_eV': None,
+        'present': present, 'energy_e0_eV': None,
         'ionic_steps': 0, 'final_scf_steps': None, 'final_ionic_dE_eV': None,
-        'trailing_incomplete_scf': False, 'read_truncated': False,
+        'trailing_incomplete_scf': False, 'read_truncated': omitted,
     }
     if not facts['present']:
         return facts
-    text, omitted = _read_edges(path, 0, _MAX_OSZICAR_TAIL)
-    facts['read_truncated'] = omitted
     current_scf = 0
     summaries: list[tuple[float, int, float | None]] = []
     last_step_no = 0
@@ -484,9 +501,21 @@ def _parse_oszicar(path: Path | None) -> dict:
     return facts
 
 
-def _parse_outcar(path: Path | None) -> dict:
+def _parse_oszicar(path: Path | None) -> dict:
+    present = bool(path and path.is_file())
+    text, omitted = _read_edges(path, 0, _MAX_OSZICAR_TAIL) if present else ('', False)
+    return _parse_oszicar_text(text, present=present, omitted=omitted)
+
+
+def _parse_oszicar_handle(handle, size: int) -> dict:
+    """Parse OSZICAR evidence from a caller-owned immutable file handle."""
+    text, omitted = _read_edges_handle(handle, size, 0, _MAX_OSZICAR_TAIL)
+    return _parse_oszicar_text(text, present=True, omitted=omitted)
+
+
+def _parse_outcar_text(text: str, *, present: bool, omitted: bool) -> dict:
     facts = {
-        'present': bool(path and path.is_file()), 'read_truncated': False,
+        'present': present, 'read_truncated': omitted,
         'ionic_converged_marker': False, 'electronic_converged_marker': False,
         'normal_footer': False, 'soft_stopped': False, 'fatal_error': None,
         'final_force_max_eV_A': None, 'energy_e0_eV': None,
@@ -495,8 +524,6 @@ def _parse_outcar(path: Path | None) -> dict:
     }
     if not facts['present']:
         return facts
-    text, omitted = _read_edges(path, _MAX_OUTCAR_HEAD, _MAX_OUTCAR_TAIL)
-    facts['read_truncated'] = omitted
     terminal_basis = (text.rsplit('... vcstudio omitted middle of large file ...', 1)[-1]
                       if omitted else text)
     starts = list(_VASP_START_RE.finditer(terminal_basis))
@@ -587,6 +614,23 @@ def _parse_outcar(path: Path | None) -> dict:
     return facts
 
 
+def _parse_outcar(path: Path | None) -> dict:
+    present = bool(path and path.is_file())
+    text, omitted = (
+        _read_edges(path, _MAX_OUTCAR_HEAD, _MAX_OUTCAR_TAIL)
+        if present else ('', False)
+    )
+    return _parse_outcar_text(text, present=present, omitted=omitted)
+
+
+def _parse_outcar_handle(handle, size: int) -> dict:
+    """Parse OUTCAR evidence from a caller-owned immutable file handle."""
+    text, omitted = _read_edges_handle(
+        handle, size, _MAX_OUTCAR_HEAD, _MAX_OUTCAR_TAIL
+    )
+    return _parse_outcar_text(text, present=True, omitted=omitted)
+
+
 def _parse_incar(path: Path | None) -> dict:
     if not path or not path.is_file():
         return {}
@@ -608,7 +652,7 @@ def _parse_incar(path: Path | None) -> dict:
     return {k: v for k, v in out.items() if v is not None}
 
 
-def _parse_vasprun(path: Path | None) -> dict:
+def _parse_vasprun_source(source, *, present: bool) -> dict:
     """Stream the XML and prove it is well-formed through ``</modeling>``.
 
     VASP variants exist where the final ionic ``e_0_energy`` is zero although
@@ -616,7 +660,7 @@ def _parse_vasprun(path: Path | None) -> dict:
     and never let it replace a reasonable OSZICAR value.
     """
     facts = {
-        'present': bool(path and path.is_file()), 'checked': False, 'complete': False,
+        'present': present, 'checked': False, 'complete': False,
         'parse_error': None, 'calculations': 0, 'final_scf_steps': None,
         'energy_e0_eV': None, 'energy_source': None,
         'observed_energy_eV': None, 'observed_energy_source': None,
@@ -640,7 +684,7 @@ def _parse_vasprun(path: Path | None) -> dict:
     }
     method_vectors = {'LDAUL', 'LDAUU', 'LDAUJ'}
     try:
-        for event, elem in ET.iterparse(path, events=('start', 'end')):
+        for event, elem in ET.iterparse(source, events=('start', 'end')):
             tag = elem.tag.rsplit('}', 1)[-1]
             if event == 'start':
                 if root_tag is None:
@@ -740,6 +784,20 @@ def _parse_vasprun(path: Path | None) -> dict:
                     facts['observed_energy_source'] = f'vasprun.xml:{name}'
                     break
     return facts
+
+
+def _parse_vasprun(path: Path | None) -> dict:
+    present = bool(path and path.is_file())
+    return _parse_vasprun_source(path, present=present)
+
+
+def _parse_vasprun_handle(handle) -> dict:
+    """Parse vasprun.xml from a caller-owned immutable file handle."""
+    try:
+        handle.seek(0)
+    except (OSError, ValueError):
+        return _parse_vasprun_source(handle, present=False)
+    return _parse_vasprun_source(handle, present=True)
 
 
 def _infer_task_type(parameters: dict) -> str:
