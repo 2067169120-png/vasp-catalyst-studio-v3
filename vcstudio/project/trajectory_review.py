@@ -50,18 +50,27 @@ _SESSION_TTL_SECONDS = 30 * 60
 _PAGE_DISTANCE_MAX_ATOMS = 200
 _MAX_FRAME_RENDER_ATOMS = 5000
 _MAX_OSZICAR_BYTES = 128 * 1024 * 1024
-_MAX_OUTCAR_BYTES = 4 * 1024 * 1024 * 1024
+_MAX_OUTCAR_BYTES = 512 * 1024 * 1024
 _MAX_XDATCAR_BYTES = 4 * 1024 * 1024 * 1024
+_MAX_XDATCAR_ATOMS = _MAX_FRAME_RENDER_ATOMS
+_MAX_XDATCAR_HEADER_LINE_BYTES = 64 * 1024
+_MAX_XDATCAR_COORDINATE_LINE_BYTES = 4096
+_MAX_XDATCAR_FRAME_BYTES = 32 * 1024 * 1024
 _MAX_STRUCTURE_BYTES = 64 * 1024 * 1024
 _MAX_SESSION_SOURCE_BYTES = 8 * 1024 * 1024 * 1024
 _MAX_SESSION_STEPS = 200_000
 _MAX_SESSION_FRAMES = 200_000
+_MAX_CORRECTION_RECORDS = 512
 _CORRECTION_DIR = '.vcstudio-corrections'
 _CAS_BASE_NAMES = frozenset({'job.yaml', 'INCAR', 'CONTCAR'})
 
 
 class TrajectoryLimitError(ValueError):
     """Raised before reading or expanding an over-limit trajectory source."""
+
+
+class StaleFrameSourceError(RuntimeError):
+    """Raised when an opaque frame token no longer names immutable bytes."""
 
 
 def _utc_now() -> str:
@@ -208,63 +217,59 @@ def _parse_outcar_fmax(path: Path, convergence_mod) -> tuple[list[float], bool]:
         size = path.stat().st_size
         if size > _MAX_OUTCAR_BYTES:
             raise TrajectoryLimitError('OUTCAR exceeds the byte limit')
-        with path.open('rb') as raw:
-            if size:
-                raw.seek(-1, os.SEEK_END)
-                complete_line = raw.read(1) in (b'\n', b'\r')
-            else:
-                complete_line = True
-        trailing_force_open = False
-        trailing_force_rows = False
+        complete_line = True
+
+        def tracked_lines(handle):
+            nonlocal complete_line
+            for line in handle:
+                complete_line = line.endswith(('\n', '\r'))
+                yield line
+
         with path.open('r', encoding='utf-8', errors='replace') as handle:
-            # The numerical parser remains the single source of force semantics.
-            values = list(convergence_mod.parse_outcar_fmax_lines(handle))
-        # The shared parser intentionally accepts a force block at EOF.  A live
-        # snapshot must be stricter: detect the parser's terminal block without
-        # recomputing any force value, and withhold it until a delimiter arrives.
-        with path.open('r', encoding='utf-8', errors='replace') as handle:
-            separator_pending = False
-            for raw_line in handle:
-                line = raw_line.rstrip('\r\n')
-                if 'TOTAL-FORCE' in line:
-                    trailing_force_open = True
-                    trailing_force_rows = False
-                    separator_pending = True
-                    continue
-                if not trailing_force_open:
-                    continue
-                if separator_pending:
-                    separator_pending = False
-                    stripped = line.strip()
-                    if stripped and set(stripped) <= {'-'}:
-                        continue
-                fields = line.split()
-                if len(fields) != 6:
-                    if trailing_force_rows:
-                        trailing_force_open = False
-                    continue
-                try:
-                    float(fields[3])
-                    float(fields[4])
-                    float(fields[5])
-                except ValueError:
-                    continue
-                trailing_force_rows = True
-        if trailing_force_open and trailing_force_rows and values:
-            values.pop()
-        return values, complete_line and not trailing_force_open
+            parsed = convergence_mod.parse_outcar_fmax_lines(
+                tracked_lines(handle), max_blocks=_MAX_SESSION_STEPS,
+                require_terminated=True, with_status=True)
+        return (parsed['values'], complete_line
+                and bool(parsed['trailing_block_complete']))
     except OSError:
         return [], False
+
+
+def _read_bounded_binary_line(handle, limit: int, label: str) -> bytes:
+    line = handle.readline(limit + 1)
+    if len(line) > limit:
+        raise TrajectoryLimitError(f'{label} exceeds the line-byte limit')
+    return line
+
+
+def _hash_binary_handle(handle, *, max_bytes: int) -> str:
+    handle.seek(0)
+    digest = hashlib.sha256()
+    consumed = 0
+    while True:
+        block = handle.read(min(1024 * 1024, max_bytes - consumed + 1))
+        if not block:
+            break
+        consumed += len(block)
+        if consumed > max_bytes:
+            raise TrajectoryLimitError('frame source exceeds its immutable byte budget')
+        digest.update(block)
+    return digest.hexdigest()
 
 
 def _xdatcar_index(path: Path) -> tuple[dict | None, list[dict], bool, list[str]]:
     """Index complete XDATCAR frames by byte offset; coordinates stay on disk."""
     warnings = []
     try:
-        if path.stat().st_size > _MAX_XDATCAR_BYTES:
+        source_size = path.stat().st_size
+        if source_size > min(_MAX_XDATCAR_BYTES, _MAX_SESSION_SOURCE_BYTES):
             raise TrajectoryLimitError('XDATCAR exceeds the byte limit')
         with path.open('rb') as handle:
-            header_lines = [handle.readline() for _ in range(7)]
+            header_lines = [
+                _read_bounded_binary_line(
+                    handle, _MAX_XDATCAR_HEADER_LINE_BYTES, 'XDATCAR header')
+                for _ in range(7)
+            ]
             if any(not line for line in header_lines):
                 return None, [], False, ['XDATCAR 头部不完整。']
             header_text = b''.join(header_lines).decode('utf-8', errors='replace')
@@ -273,12 +278,21 @@ def _xdatcar_index(path: Path) -> tuple[dict | None, list[dict], bool, list[str]
             elements, counts = parse_poscar_species(header_text)
             if not elements or not counts:
                 return None, [], False, ['XDATCAR 物种/原子计数不可解析。']
+            if (any(isinstance(count, bool) or not isinstance(count, int)
+                    or count < 1 for count in counts)):
+                return None, [], False, ['XDATCAR 原子计数无效。']
             natoms = sum(counts)
+            # Trust no declared atom count far enough to read a coordinate.  This
+            # gate precedes all per-frame allocation and line traversal.
+            if natoms < 1 or natoms > _MAX_XDATCAR_ATOMS:
+                raise TrajectoryLimitError('XDATCAR exceeds the atom render limit')
             frames = []
             complete = True
             while True:
                 offset = handle.tell()
-                marker = handle.readline()
+                marker = _read_bounded_binary_line(
+                    handle, _MAX_XDATCAR_HEADER_LINE_BYTES,
+                    'XDATCAR configuration marker')
                 if not marker:
                     break
                 if not marker.endswith((b'\n', b'\r')):
@@ -290,24 +304,48 @@ def _xdatcar_index(path: Path) -> tuple[dict | None, list[dict], bool, list[str]
                         complete = False
                         warnings.append('XDATCAR 帧标记异常，后续帧未纳入索引。')
                     break
-                coordinate_lines = []
+                frame_digest = hashlib.sha256()
+                frame_digest.update(marker)
+                frame_bytes = len(marker)
+                coordinate_count = 0
                 for _ in range(natoms):
-                    line = handle.readline()
+                    line = _read_bounded_binary_line(
+                        handle, _MAX_XDATCAR_COORDINATE_LINE_BYTES,
+                        'XDATCAR coordinate')
                     if not line or not line.endswith((b'\n', b'\r')):
                         complete = False
                         break
-                    coordinate_lines.append(line)
-                if len(coordinate_lines) != natoms:
+                    frame_bytes += len(line)
+                    if frame_bytes > _MAX_XDATCAR_FRAME_BYTES:
+                        raise TrajectoryLimitError(
+                            'XDATCAR frame exceeds the byte limit')
+                    fields = line.split()
+                    if len(fields) < 3:
+                        complete = False
+                        break
+                    try:
+                        values = tuple(float(value) for value in fields[:3])
+                    except ValueError:
+                        complete = False
+                        break
+                    if not all(math.isfinite(value) for value in values):
+                        complete = False
+                        break
+                    frame_digest.update(line)
+                    coordinate_count += 1
+                if coordinate_count != natoms:
                     warnings.append('XDATCAR 末帧仍在写入，已只暴露此前完整帧。')
                     break
+                if len(frames) >= _MAX_SESSION_FRAMES:
+                    raise TrajectoryLimitError('XDATCAR exceeds the frame limit')
                 frames.append({
                     'kind': 'xdatcar', 'path': path, 'offset': offset,
+                    'end_offset': handle.tell(), 'frame_bytes': frame_bytes,
+                    'frame_sha256': frame_digest.hexdigest(),
                     'mode': match.group(1).decode('ascii').title(),
                     'configuration': int(match.group(2)), 'natoms': natoms,
                     'header': header_text,
                 })
-                if len(frames) > _MAX_SESSION_FRAMES:
-                    raise TrajectoryLimitError('XDATCAR exceeds the frame limit')
             return {
                 'elements': elements, 'counts': counts, 'natoms': natoms,
             }, frames, complete, warnings
@@ -317,15 +355,73 @@ def _xdatcar_index(path: Path) -> tuple[dict | None, list[dict], bool, list[str]
 
 def _load_xdatcar_frame(source: dict) -> str:
     path, natoms = source['path'], int(source['natoms'])
+    if natoms < 1 or natoms > _MAX_XDATCAR_ATOMS:
+        raise TrajectoryLimitError('selected frame exceeds the atom render limit')
+    expected_source = str(source.get('source_sha256') or '')
+    expected_frame = str(source.get('frame_sha256') or '')
+    expected_size = int(source.get('source_size') or -1)
+    if (not _SHA256_RE.fullmatch(expected_source)
+            or not _SHA256_RE.fullmatch(expected_frame)
+            or expected_size < 1
+            or expected_size > min(_MAX_XDATCAR_BYTES, _MAX_SESSION_SOURCE_BYTES)):
+        raise StaleFrameSourceError('frame token lacks immutable content binding')
     with path.open('rb') as handle:
+        opened_before = os.fstat(handle.fileno())
+        try:
+            path_before = path.stat()
+        except OSError as exc:
+            raise StaleFrameSourceError('XDATCAR source is unavailable') from exc
+        if (opened_before.st_size != expected_size
+                or path_before.st_size != expected_size):
+            raise StaleFrameSourceError('XDATCAR source size changed')
+        if _hash_binary_handle(handle, max_bytes=expected_size) != expected_source:
+            raise StaleFrameSourceError('XDATCAR content changed; refresh the player snapshot')
         handle.seek(int(source['offset']))
-        marker = handle.readline()
+        marker = _read_bounded_binary_line(
+            handle, _MAX_XDATCAR_HEADER_LINE_BYTES,
+            'XDATCAR configuration marker')
         match = _XDAT_MARKER_RE.match(marker.strip())
         if not match:
-            raise ValueError('XDATCAR 帧标记已变化，请刷新播放器快照')
-        coordinates = [handle.readline() for _ in range(natoms)]
-    if len(coordinates) != natoms or any(not line for line in coordinates):
-        raise ValueError('XDATCAR 帧不完整，请等待写入完成后刷新')
+            raise StaleFrameSourceError('XDATCAR frame marker changed')
+        digest = hashlib.sha256()
+        digest.update(marker)
+        frame_bytes = len(marker)
+        coordinates = []
+        for _ in range(natoms):
+            line = _read_bounded_binary_line(
+                handle, _MAX_XDATCAR_COORDINATE_LINE_BYTES,
+                'XDATCAR coordinate')
+            if not line or not line.endswith((b'\n', b'\r')):
+                raise StaleFrameSourceError('XDATCAR frame is incomplete')
+            frame_bytes += len(line)
+            if frame_bytes > _MAX_XDATCAR_FRAME_BYTES:
+                raise TrajectoryLimitError('XDATCAR frame exceeds the byte limit')
+            fields = line.split()
+            try:
+                values = tuple(float(value) for value in fields[:3])
+            except ValueError as exc:
+                raise StaleFrameSourceError('XDATCAR frame coordinates changed') from exc
+            if len(fields) < 3 or not all(math.isfinite(value) for value in values):
+                raise StaleFrameSourceError('XDATCAR frame coordinates changed')
+            digest.update(line)
+            coordinates.append(line)
+        if (handle.tell() != int(source['end_offset'])
+                or frame_bytes != int(source['frame_bytes'])
+                or digest.hexdigest() != expected_frame):
+            raise StaleFrameSourceError('XDATCAR frame content changed')
+        if _hash_binary_handle(handle, max_bytes=expected_size) != expected_source:
+            raise StaleFrameSourceError('XDATCAR changed while reading the frame')
+        opened_after = os.fstat(handle.fileno())
+        try:
+            path_after = path.stat()
+        except OSError as exc:
+            raise StaleFrameSourceError('XDATCAR source changed while reading') from exc
+    def identity(value):
+        return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
+    if (identity(opened_before) != identity(opened_after)
+            or identity(opened_before) != identity(path_before)
+            or identity(opened_after) != identity(path_after)):
+        raise StaleFrameSourceError('XDATCAR source generation changed while reading')
     mode = match.group(1).decode('ascii').title()
     coordinate_text = b''.join(coordinates).decode('utf-8', errors='replace')
     return source['header'].rstrip('\r\n') + f'\n{mode}\n' + coordinate_text
@@ -433,6 +529,7 @@ def _validated_correction_record(path: Path) -> dict:
         'created_at', 'job_id', 'ledger_job_id', 'manifest_job_id', 'plan_id',
         'action', 'idempotency_key', 'cas_anchor_sha256', 'source_hash',
         'cas_manifest_sha256', 'cas_diagnosis_sha256', 'method_compatibility',
+        'plan_token_sha256',
     )
     for key in required_strings:
         if not isinstance(payload.get(key), str) or not payload[key]:
@@ -443,7 +540,7 @@ def _validated_correction_record(path: Path) -> dict:
         raise ValueError('idempotency_key is invalid')
     for key in (
             'plan_id', 'cas_anchor_sha256', 'source_hash', 'record_hash',
-            'cas_manifest_sha256', 'cas_diagnosis_sha256'):
+            'cas_manifest_sha256', 'cas_diagnosis_sha256', 'plan_token_sha256'):
         if not _SHA256_RE.fullmatch(str(payload.get(key) or '')):
             raise ValueError(f'{key} is invalid')
     cas_files = payload.get('cas_files_sha256')
@@ -455,6 +552,16 @@ def _validated_correction_record(path: Path) -> dict:
         raise ValueError('cas_files_sha256 is invalid')
     if cas_files['job.yaml'] != payload['cas_manifest_sha256']:
         raise ValueError('manifest hash is not bound to the CAS file map')
+    cas_contract = payload.get('cas_contract')
+    if (not isinstance(cas_contract, dict)
+            or _json_hash(cas_contract) != payload['cas_anchor_sha256']
+            or cas_contract.get('files') != cas_files
+            or cas_contract.get('ledger_job_id') != payload['ledger_job_id']
+            or cas_contract.get('manifest_job_id') != payload['manifest_job_id']
+            or cas_contract.get('diagnosis_sha256')
+            != payload['cas_diagnosis_sha256']
+            or cas_contract.get('source_hash') != payload['source_hash']):
+        raise ValueError('cas_contract is not bound to the correction record')
     derived_id = hashlib.sha256(
         f'{payload["plan_id"]}|{payload["idempotency_key"]}'.encode('utf-8'),
     ).hexdigest()[:24]
@@ -506,7 +613,7 @@ def correction_method_compatibility(job_dir) -> dict:
                 'plan_id', 'failure_class', 'action', 'idempotency_key',
                 'cas_anchor_sha256', 'cas_manifest_sha256',
                 'cas_diagnosis_sha256', 'cas_files_sha256', 'source_hash',
-                'incar_sha256_before'):
+                'incar_sha256_before', 'plan_token_sha256', 'cas_contract'):
             if outcome.get(key) != intent.get(key):
                 issues.append(f'correction pair {record_id} disagrees on {key}')
         if outcome.get('intent_record_hash') != intent.get('record_hash'):
@@ -551,7 +658,7 @@ class TrajectoryReviewService:
         self._token_factory = token_factory or (lambda: secrets.token_urlsafe(24))
         self._lock = threading.RLock()
         self._sessions: OrderedDict[str, dict] = OrderedDict()
-        self._frame_tokens: OrderedDict[str, tuple[str, int]] = OrderedDict()
+        self._frame_tokens: OrderedDict[str, dict] = OrderedDict()
         self._repair_tokens: OrderedDict[str, dict] = OrderedDict()
 
     def _cleanup(self) -> None:
@@ -564,7 +671,7 @@ class TrajectoryReviewService:
             expired_set = set(expired)
             self._frame_tokens = OrderedDict(
                 (token, value) for token, value in self._frame_tokens.items()
-                if value[0] not in expired_set)
+                if value['session_token'] not in expired_set)
             self._repair_tokens = OrderedDict(
                 (token, value) for token, value in self._repair_tokens.items()
                 if value['session_token'] not in expired_set)
@@ -572,7 +679,7 @@ class TrajectoryReviewService:
             token, _session = self._sessions.popitem(last=False)
             self._frame_tokens = OrderedDict(
                 (key, value) for key, value in self._frame_tokens.items()
-                if value[0] != token)
+                if value['session_token'] != token)
         while len(self._frame_tokens) > _MAX_FRAME_TOKENS:
             self._frame_tokens.popitem(last=False)
 
@@ -752,6 +859,18 @@ class TrajectoryReviewService:
             rows, frames, partial, warnings, analysis = self._build_series(root, task_kind)
         if len(rows) > _MAX_SESSION_STEPS or len(frames) > _MAX_SESSION_FRAMES:
             raise TrajectoryLimitError('trajectory exceeds the session row/frame limit')
+        sources_by_path = {row['path'].resolve(): row for row in sources}
+        for frame_source in frames:
+            source_row = sources_by_path.get(frame_source['path'].resolve())
+            if source_row is None:
+                partial = True
+                warnings.append('结构帧来源未包含在内容快照中。')
+                continue
+            frame_source['source_sha256'] = source_row['sha256']
+            frame_source['source_size'] = source_row['size']
+            frame_source['session_source_hash'] = source_row['source_hash']
+            if frame_source.get('kind') != 'xdatcar':
+                frame_source['frame_sha256'] = source_row['sha256']
         current_value = self._manifest.load_manifest(root) or {}
         current_paths = {
             path.resolve() for path in self._source_paths(root, task_kind, current_value)}
@@ -889,9 +1008,17 @@ class TrajectoryReviewService:
         }
 
     def _issue_frame_token(self, session: dict, frame_source: int) -> str:
+        source = session['frames'][frame_source]
         token = f'frame-{self._token_factory()}'
         with self._lock:
-            self._frame_tokens[token] = (session['token'], int(frame_source))
+            self._frame_tokens[token] = {
+                'session_token': session['token'],
+                'frame_source': int(frame_source),
+                'session_source_hash': session['source_hash'],
+                'source_sha256': source.get('source_sha256'),
+                'source_size': source.get('source_size'),
+                'frame_sha256': source.get('frame_sha256'),
+            }
             self._frame_tokens.move_to_end(token)
             self._cleanup()
         return token
@@ -953,7 +1080,10 @@ class TrajectoryReviewService:
                         'distance_status': 'unavailable', 'notes': []})
             if isinstance(frame_source, int) and 0 <= frame_source < len(session['frames']):
                 row['frame_token'] = self._issue_frame_token(session, frame_source)
-                row.update(self._frame_metric(session, frame_source))
+                try:
+                    row.update(self._frame_metric(session, frame_source))
+                except StaleFrameSourceError:
+                    return self._stale_payload(session, STEP_PAGE_SCHEMA)
             public_rows.append(row)
         next_offset = start + len(page_indexes)
         return {
@@ -1001,17 +1131,25 @@ class TrajectoryReviewService:
             binding = self._frame_tokens.get(str(frame_token or ''))
         if binding is None:
             raise LookupError('frame token expired or is unknown')
-        session = self._session(binding[0])
+        session = self._session(binding['session_token'])
         if self._is_stale(session):
             return self._stale_payload(session, FRAME_SCHEMA)
-        frame_source = binding[1]
+        frame_source = binding['frame_source']
         if not 0 <= frame_source < len(session['frames']):
             raise LookupError('frame token no longer resolves')
         source = session['frames'][frame_source]
+        if (binding.get('session_source_hash') != session['source_hash']
+                or binding.get('source_sha256') != source.get('source_sha256')
+                or binding.get('source_size') != source.get('source_size')
+                or binding.get('frame_sha256') != source.get('frame_sha256')):
+            return self._stale_payload(session, FRAME_SCHEMA)
         natoms = int(source.get('natoms') or 0)
         if natoms > _MAX_FRAME_RENDER_ATOMS:
             raise TrajectoryLimitError('selected frame exceeds the atom render limit')
-        content = _load_structure_text(source)
+        try:
+            content = _load_structure_text(source)
+        except StaleFrameSourceError:
+            return self._stale_payload(session, FRAME_SCHEMA)
         view = self._bounded_structure_view(content, natoms)
         metric = self._frame_metric(session, frame_source)
         return {
@@ -1284,7 +1422,10 @@ class TrajectoryReviewService:
                 'cas_manifest_sha256': plan['cas_contract']['files']['job.yaml'],
                 'cas_diagnosis_sha256': plan['cas_contract']['diagnosis_sha256'],
                 'cas_files_sha256': plan['cas_contract']['files'],
+                'cas_contract': plan['cas_contract'],
                 'plan_id': plan['plan_id'], 'failure_class': plan['failure_class'],
+                'plan_token_sha256': hashlib.sha256(
+                    plan['plan_token'].encode('utf-8')).hexdigest(),
                 'action': 'continue_frozen_incar', 'idempotency_key': key,
                 'detected_evidence': plan['detected_evidence'],
                 'suggested_change': plan['suggested_change'],
@@ -1306,9 +1447,26 @@ class TrajectoryReviewService:
             'cas_diagnosis_sha256': plan['cas_contract']['diagnosis_sha256'],
             'cas_files_sha256': plan['cas_contract']['files'],
             'cas_contract': plan['cas_contract'],
+            'plan_token_sha256': record['plan_token_sha256'],
             'record_created_at': plan['created_at'],
             'failure_class': plan['failure_class'],
             'session_token': session['token'],
+            'journal_binding': self._journal_binding(record),
+        }
+
+    @staticmethod
+    def _journal_binding(intent: dict) -> dict:
+        return {
+            'schema': 'vcstudio.correction-journal-link/v1',
+            'correction_id': intent['record_id'],
+            'intent_record_hash': intent['record_hash'],
+            'plan_id': intent['plan_id'],
+            'plan_token_sha256': intent['plan_token_sha256'],
+            'job_id': intent['job_id'],
+            'ledger_job_id': intent['ledger_job_id'],
+            'manifest_job_id': intent['manifest_job_id'],
+            'cas_anchor_sha256': intent['cas_anchor_sha256'],
+            'idempotency_key': intent['idempotency_key'],
         }
 
     def assert_repair_cas(self, prepared: dict, *, ledger_job_id: str,
@@ -1326,7 +1484,87 @@ class TrajectoryReviewService:
             raise RuntimeError('repair terminal/output evidence is no longer complete')
         return prepared['cas_contract']
 
+    @staticmethod
+    def _prepared_from_intent(root: Path, intent: dict) -> dict:
+        return {
+            'job_id': intent['job_id'], 'job_dir': root,
+            'operation_key': intent['idempotency_key'],
+            'plan_id': intent['plan_id'], 'correction_id': intent['record_id'],
+            'intent_record_hash': intent['record_hash'],
+            'incar_sha256_before': intent.get('incar_sha256_before'),
+            'source_hash': intent['source_hash'],
+            'ledger_job_id': intent['ledger_job_id'],
+            'manifest_job_id': intent['manifest_job_id'],
+            'cas_anchor_sha256': intent['cas_anchor_sha256'],
+            'cas_manifest_sha256': intent['cas_manifest_sha256'],
+            'cas_diagnosis_sha256': intent['cas_diagnosis_sha256'],
+            'cas_files_sha256': intent['cas_files_sha256'],
+            'cas_contract': intent['cas_contract'],
+            'plan_token_sha256': intent['plan_token_sha256'],
+            'record_created_at': intent['created_at'],
+            'failure_class': intent.get('failure_class'),
+            'journal_binding': TrajectoryReviewService._journal_binding(intent),
+        }
+
+    def _durable_intent(self, root: Path, job_id: str, plan_token: str,
+                        operation_key: str) -> dict | None:
+        directory = root / _CORRECTION_DIR
+        if not directory.is_dir():
+            return None
+        paths = sorted(directory.glob('intent-*.json'))
+        if len(paths) > _MAX_CORRECTION_RECORDS:
+            raise TrajectoryLimitError('correction journal exceeds the record limit')
+        token_hash = hashlib.sha256(str(plan_token or '').encode('utf-8')).hexdigest()
+        matches = []
+        for path in paths:
+            intent = _validated_correction_record(path)
+            if (intent['job_id'] == job_id
+                    and intent['idempotency_key'] == operation_key
+                    and intent['plan_token_sha256'] == token_hash):
+                matches.append(intent)
+        if len(matches) > 1:
+            raise RuntimeError('correction intent identity is ambiguous')
+        return matches[0] if matches else None
+
+    def reconcile_repair_outcome(self, job_dir, job_id: str, plan_token: str,
+                                 operation_key: str) -> dict | None:
+        """Fill a missing outcome from exact durable local submit evidence only."""
+        identifier = str(job_id or '').strip()
+        key = str(operation_key or '').strip()
+        if not _JOB_ID_RE.fullmatch(identifier) or not _OPERATION_KEY_RE.fullmatch(key):
+            raise ValueError('durable correction replay identity is invalid')
+        root = Path(job_dir).resolve()
+        intent = self._durable_intent(root, identifier, plan_token, key)
+        if intent is None:
+            return None
+        prepared = self._prepared_from_intent(root, intent)
+        from vcstudio.cluster import submitter
+
+        with submitter.job_operation(root, '修复审计重放'):
+            replay = submitter.replay_repair_continuation_locked(
+                root, key, prepared['journal_binding'])
+            if replay is None:
+                return None
+            operation = {
+                'ok': True, 'replayed': True, 'idempotency_key': key,
+                'results': [[root, True,
+                             f'已确认续算，新作业号 {replay["scheduler_job_id"]}']],
+            }
+            correction = self._record_repair_outcome_unlocked(prepared, operation)
+        return {
+            'prepared': prepared, 'operation': operation,
+            'correction_outcome': correction,
+        }
+
     def record_repair_outcome(self, prepared: dict, outcome: dict) -> dict:
+        from vcstudio.cluster import submitter
+
+        root = Path(prepared['job_dir']).resolve()
+        with submitter.job_operation(root, '修复审计落盘'):
+            return self._record_repair_outcome_unlocked(prepared, outcome)
+
+    def _record_repair_outcome_unlocked(self, prepared: dict,
+                                        outcome: dict) -> dict:
         root = Path(prepared['job_dir']).resolve()
         correction_id = str(prepared.get('correction_id') or '')
         if not _CORRECTION_ID_RE.fullmatch(correction_id):
@@ -1340,6 +1578,8 @@ class TrajectoryReviewService:
             'idempotency_key': 'operation_key',
             'cas_anchor_sha256': 'cas_anchor_sha256',
             'source_hash': 'source_hash',
+            'plan_token_sha256': 'plan_token_sha256',
+            'cas_contract': 'cas_contract',
         }
         if any(intent.get(intent_key) != prepared.get(prepared_key)
                for intent_key, prepared_key in bindings.items()):
@@ -1381,7 +1621,9 @@ class TrajectoryReviewService:
                 'cas_manifest_sha256': prepared['cas_manifest_sha256'],
                 'cas_diagnosis_sha256': prepared['cas_diagnosis_sha256'],
                 'cas_files_sha256': prepared['cas_files_sha256'],
+                'cas_contract': prepared['cas_contract'],
                 'plan_id': prepared['plan_id'],
+                'plan_token_sha256': prepared['plan_token_sha256'],
                 'failure_class': prepared.get('failure_class'),
                 'action': 'continue_frozen_incar',
                 'idempotency_key': prepared['operation_key'],
@@ -1394,8 +1636,6 @@ class TrajectoryReviewService:
                     operation.get('requires_manual_recovery')),
                 'result_ok': successful,
                 'result_row_count': len(results),
-                'manifest_sha256_after': (_file_hash(root / 'job.yaml')
-                                          if (root / 'job.yaml').is_file() else None),
             })
         return {
             'record_id': record['record_id'], 'record_hash': record['record_hash'],

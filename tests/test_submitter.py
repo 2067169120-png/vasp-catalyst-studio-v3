@@ -674,6 +674,61 @@ def test_continue_rechecks_content_cas_before_any_remote_command(tmp_path):
     assert client.commands == []
 
 
+def test_correction_linked_continue_replays_before_preview_cas_after_crash(tmp_path):
+    d = _restartable_job(tmp_path)
+    value = manifest.load_manifest(d)
+    contcar = os.path.join(d, 'CONTCAR')
+    with open(contcar, 'w', encoding='utf-8') as handle:
+        handle.write(_VALID_CONTCAR)
+    files = {}
+    for name in ('job.yaml', 'INCAR', 'CONTCAR'):
+        files[name], _size = submitter._file_sha256_size(os.path.join(d, name))
+    diagnosis = (value.get('results') or {}).get('diagnosis') or {}
+    diagnosis_digest = hashlib.sha256(json.dumps(
+        diagnosis, ensure_ascii=False, sort_keys=True,
+        separators=(',', ':')).encode('utf-8')).hexdigest()
+    expected = {
+        'schema': 'vcstudio.repair-cas/v1', 'ledger_job_id': value['job_id'],
+        'manifest_job_id': value['job_id'], 'manifest_state': value['state'],
+        'scheduler_job_id': value['scheduler_job_id'],
+        'diagnosis_sha256': diagnosis_digest,
+        'diagnosis_evidence_file': None, 'source_hash': 's' * 64,
+        'files': files,
+    }
+    operation_key = 'trajectory-repair:journal-replay'
+    correction = {
+        'schema': 'vcstudio.correction-journal-link/v1',
+        'correction_id': 'a' * 24, 'intent_record_hash': 'b' * 64,
+        'plan_id': 'c' * 64, 'plan_token_sha256': 'd' * 64,
+        'job_id': value['job_id'], 'ledger_job_id': value['job_id'],
+        'manifest_job_id': value['job_id'],
+        'cas_anchor_sha256': 'e' * 64, 'idempotency_key': operation_key,
+    }
+    first = FakeClient(script=[('cat', _VALID_CONTCAR), ('qsub', '201.c\n')])
+    submitted = submitter.continue_from_contcar(
+        first, _profile(), d, idempotency_key=operation_key,
+        expected_cas=expected, correction_binding=correction)
+    assert submitted['scheduler_job_id'] == '201'
+    assert submitted['attempts'][-1]['correction'] == correction
+
+    restarted = FakeClient()
+    replay = submitter.continue_from_contcar(
+        restarted, _profile(), d, idempotency_key=operation_key,
+        expected_cas=expected, correction_binding=correction)
+    assert replay['_continue_replayed'] is True
+    assert replay['scheduler_job_id'] == '201'
+    assert restarted.commands == []
+
+    mismatched = dict(correction, intent_record_hash='f' * 64)
+    rejected = FakeClient()
+    with pytest.raises(submitter.UnknownRemoteJobOperation,
+                       match='correction intent'):
+        submitter.continue_from_contcar(
+            rejected, _profile(), d, idempotency_key=operation_key,
+            expected_cas=expected, correction_binding=mismatched)
+    assert rejected.commands == []
+
+
 def test_continue_from_contcar_qsub_without_job_id_fails_closed(tmp_path):
     """qsub 未返回可核验号时保留恢复证据，重启后不得自动再发一次。"""
     d = _restartable_job(tmp_path)

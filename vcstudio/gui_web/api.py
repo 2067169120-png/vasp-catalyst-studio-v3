@@ -2609,16 +2609,22 @@ class Api:
         return self._delegate(name, password, _fetch)
 
     def continue_jobs(self, dirs, name, password, trust_new=False, idempotency_key=None,
-                      expected_cas_by_job=None):
+                      expected_cas_by_job=None, expected_correction_by_job=None):
+        operation_binding = {
+            'cas': expected_cas_by_job,
+            'correction': expected_correction_by_job,
+        }
         return self._delegate(name, password,
                               lambda prof, pw: self._run_job_operation_once(
                                   idempotency_key, action='continue', profile=prof.name,
-                                  dirs=dirs, binding=expected_cas_by_job,
+                                  dirs=dirs, binding=operation_binding,
                                   invoke=lambda: self._job_batch_with_idempotency(
                                       self._bo().continue_batch,
                                       prof, pw, list(dirs), trust_new,
                                       idempotency_key=idempotency_key,
-                                      expected_cas_by_job=expected_cas_by_job)))
+                                      expected_cas_by_job=expected_cas_by_job,
+                                      expected_correction_by_job=(
+                                          expected_correction_by_job))))
 
     def refresh_status(self, name, password, trust_new=False):
         """Refresh one profile without racing the background supervisor."""
@@ -16052,12 +16058,37 @@ class Api:
         return public
 
     def trajectory_confirm_repair(self, plan_token, decision, name, password,
-                                  trust_new=False, idempotency_key=None):
+                                  trust_new=False, idempotency_key=None,
+                                  job_id=None):
         """Confirm only the existing bounded, idempotent, INCAR-frozen recovery seam."""
         try:
+            decision_value = str(decision or '')
+            operation_key = str(idempotency_key or '')
+            current = None
+            if job_id is not None:
+                if decision_value != 'continue_frozen_incar':
+                    raise ValueError('repair remains paused; replay decision is invalid')
+                current = self._resolve_workspace_job_id(str(job_id or ''))
+                reconcile = getattr(self._trj(), 'reconcile_repair_outcome', None)
+                if callable(reconcile):
+                    durable = reconcile(
+                        current['job_dir'], current['job_id'],
+                        str(plan_token or ''), operation_key)
+                    if durable is not None:
+                        prepared = durable['prepared']
+                        public = self._public_repair_operation(
+                            durable['operation'], prepared['job_id'])
+                        public['correction_intent'] = {
+                            'record_hash': prepared['intent_record_hash'],
+                            'status': 'prepared',
+                        }
+                        public['correction_outcome'] = durable['correction_outcome']
+                        return self._trajectory_public_value(public)
             prepared = self._trj().prepare_repair(
-                str(plan_token or ''), str(decision or ''), str(idempotency_key or ''))
-            current = self._resolve_workspace_job_id(prepared['job_id'])
+                str(plan_token or ''), decision_value, operation_key)
+            current = current or self._resolve_workspace_job_id(prepared['job_id'])
+            if current['job_id'] != prepared['job_id']:
+                raise RuntimeError('job registry identity changed; repair remains paused')
             if (os.path.realpath(current['job_dir'])
                     != os.path.realpath(str(prepared['job_dir']))):
                 raise RuntimeError('job registry binding changed; repair remains paused')
@@ -16073,6 +16104,13 @@ class Api:
                            for item in continue_parameters.values())):
                 continue_kwargs['expected_cas_by_job'] = {
                     os.path.realpath(current['job_dir']): expected_cas,
+                }
+            if (prepared.get('journal_binding') is not None
+                    and ('expected_correction_by_job' in continue_parameters
+                         or any(item.kind == inspect.Parameter.VAR_KEYWORD
+                                for item in continue_parameters.values()))):
+                continue_kwargs['expected_correction_by_job'] = {
+                    os.path.realpath(current['job_dir']): prepared['journal_binding'],
                 }
             result = self.continue_jobs(
                 [current['job_dir']], name, password, trust_new, **continue_kwargs)

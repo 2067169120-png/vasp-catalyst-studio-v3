@@ -1790,7 +1790,7 @@
       updateOperation(op, 'running');
       const response = await remote(name, (pw, trust) => VCS.call(
         'trajectory_confirm_repair', planToken, 'continue_frozen_incar',
-        name, pw, trust, op.id));
+        name, pw, trust, op.id, jobId));
       if (!response) return { status: 'cancelled' };
       (response.results || []).forEach(item => VCS.log(
         tr('runtime.jobs.common.job_message', {

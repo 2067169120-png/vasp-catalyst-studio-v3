@@ -18,6 +18,10 @@ _STEP_NO_RE = re.compile(r'^\s*(\d+)\s+F=')
 _E0_RE = re.compile(r'E0=\s*([-+]?[.\d]+(?:[eE][-+]?\d+)?)')
 
 
+class ForceBlockLimitError(ValueError):
+    """OUTCAR force blocks exceeded the caller's bounded service budget."""
+
+
 def parse_oszicar(text: str) -> list[dict]:
     """OSZICAR 文本 → 逐离子步 ``[{step,E0,dE,scf_iters}, ...]``。
 
@@ -53,22 +57,35 @@ def parse_oszicar(text: str) -> list[dict]:
     return steps
 
 
-def parse_outcar_fmax_lines(lines) -> list[float]:
+def parse_outcar_fmax_lines(lines, *, max_blocks: int | None = None,
+                            require_terminated: bool = False,
+                            with_status: bool = False):
     """OUTCAR 行迭代器 → 逐离子步 |F|max(eV/Å)。
 
     这是 ``parse_outcar_fmax`` 的流式同源入口，供大型 OUTCAR 调用方直接传文件
     句柄；力范数与块终止语义保持一致，不形成第二套数值口径。
     """
+    if max_blocks is not None and (
+            isinstance(max_blocks, bool)
+            or not isinstance(max_blocks, int)
+            or max_blocks < 1):
+        raise ValueError('max_blocks must be a positive integer')
     fmax: list[float] = []
     in_block = False
     found = False
     cur_max = 0.0
     start_separator_pending = False
+
+    def commit(value: float) -> None:
+        if max_blocks is not None and len(fmax) >= max_blocks:
+            raise ForceBlockLimitError('OUTCAR exceeds the force-block limit')
+        fmax.append(value)
+
     for raw_line in lines:
         line = str(raw_line).rstrip('\r\n')
         if 'TOTAL-FORCE' in line:
             if in_block and found:
-                fmax.append(cur_max)
+                commit(cur_max)
             in_block = True
             found = False
             cur_max = 0.0
@@ -85,7 +102,7 @@ def parse_outcar_fmax_lines(lines) -> list[float]:
         if len(row) != 6:
             # 有原子力后遇到终止虚线/total drift 才提交该块。
             if found:
-                fmax.append(cur_max)
+                commit(cur_max)
             in_block = False
             found = False
             cur_max = 0.0
@@ -100,8 +117,14 @@ def parse_outcar_fmax_lines(lines) -> list[float]:
         if mag > cur_max:
             cur_max = mag
         found = True
-    if in_block and found:
-        fmax.append(cur_max)
+    trailing_block_complete = not in_block
+    if in_block and found and not require_terminated:
+        commit(cur_max)
+    if with_status:
+        return {
+            'values': fmax,
+            'trailing_block_complete': trailing_block_complete,
+        }
     return fmax
 
 

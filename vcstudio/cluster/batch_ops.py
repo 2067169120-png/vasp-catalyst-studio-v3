@@ -181,7 +181,7 @@ def filter_continuable(dirs):
 
 
 def continue_batch(prof, pw, dirs, trust_new, *, idempotency_key=None,
-                   expected_cas_by_job=None):
+                   expected_cas_by_job=None, expected_correction_by_job=None):
     """CONTCAR 续算批量线程体:每作业调 submitter.continue_from_contcar(不可续算的自失败)。"""
     if expected_cas_by_job is not None:
         rejected = []
@@ -198,6 +198,20 @@ def continue_batch(prof, pw, dirs, trust_new, *, idempotency_key=None,
         if rejected:
             return {'ok': False, 'needs_trust': False, 'results': rejected,
                     'error': '续算修复 CAS 预检失败，未建立远程连接'}
+    if expected_correction_by_job is not None:
+        rejected = []
+        for d in dirs:
+            expected = (expected_correction_by_job.get(os.path.realpath(d))
+                        or expected_correction_by_job.get(str(d))
+                        if isinstance(expected_correction_by_job, dict) else None)
+            try:
+                submitter.assert_repair_correction_binding(
+                    expected, idempotency_key)
+            except (OSError, ValueError, RuntimeError) as exc:
+                rejected.append((d, False, str(exc)))
+        if rejected:
+            return {'ok': False, 'needs_trust': False, 'results': rejected,
+                    'error': '续算 correction 预检失败，未建立远程连接'}
     try:
         client, jump = open_client(prof, pw, trust_new=trust_new)
     except ConnectError as e:
@@ -215,10 +229,21 @@ def continue_batch(prof, pw, dirs, trust_new, *, idempotency_key=None,
                 if isinstance(expected_cas_by_job, dict):
                     expected_cas = (expected_cas_by_job.get(os.path.realpath(d))
                                     or expected_cas_by_job.get(str(d)))
-                if idempotency_key or expected_cas is not None:
+                correction_binding = None
+                if isinstance(expected_correction_by_job, dict):
+                    correction_binding = (
+                        expected_correction_by_job.get(os.path.realpath(d))
+                        or expected_correction_by_job.get(str(d)))
+                if (expected_correction_by_job is not None
+                        and correction_binding is None):
+                    raise ValueError(
+                        '续算 correction intent 未绑定当前作业，未执行远程操作')
+                if (idempotency_key or expected_cas is not None
+                        or correction_binding is not None):
                     m = submitter.continue_from_contcar(
                         client, prof, d, idempotency_key=idempotency_key,
-                        expected_cas=expected_cas)
+                        expected_cas=expected_cas,
+                        correction_binding=correction_binding)
                 else:
                     # Preserve the historical injectable three-argument seam.
                     m = submitter.continue_from_contcar(client, prof, d)

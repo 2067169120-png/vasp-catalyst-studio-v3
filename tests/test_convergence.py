@@ -62,6 +62,36 @@ def test_streaming_outcar_fmax_matches_text_parser():
     assert streamed == pytest.approx(convergence.parse_outcar_fmax(OUTCAR_2STEP))
 
 
+def test_streaming_outcar_force_blocks_fail_closed_at_caller_limit():
+    with pytest.raises(convergence.ForceBlockLimitError, match='force-block limit'):
+        convergence.parse_outcar_fmax_lines(
+            iter(OUTCAR_2STEP.splitlines(keepends=True)), max_blocks=1)
+
+
+def test_streaming_outcar_drops_unterminated_tail_in_same_bounded_pass():
+    first, second = OUTCAR_2STEP.split(' intermediate stuff\n', 1)
+    unterminated = second.rsplit(
+        ' -----------------------------------------------------------------------------------\n', 1)[0]
+
+    class OnePass:
+        def __init__(self, lines):
+            self.lines = lines
+            self.iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            if self.iterations > 1:
+                raise AssertionError('force source traversed more than once')
+            return iter(self.lines)
+
+    source = OnePass((first + ' intermediate stuff\n' + unterminated).splitlines(True))
+    parsed = convergence.parse_outcar_fmax_lines(
+        source, max_blocks=2, require_terminated=True, with_status=True)
+    assert parsed['values'] == pytest.approx([0.5])
+    assert parsed['trailing_block_complete'] is False
+    assert source.iterations == 1
+
+
 def test_convergence_series_full():
     s = convergence.convergence_series(OSZICAR_2STEP, OUTCAR_2STEP)
     assert s['steps'] == [1, 2]

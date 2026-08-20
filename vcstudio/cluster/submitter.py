@@ -68,6 +68,7 @@ _JOB_ACTION_STATUSES = {
     'prepared', 'remote_accepted', 'succeeded', 'failed', 'unknown_remote_outcome',
 }
 _JOB_ACTION_UNRESOLVED = {'prepared', 'remote_accepted', 'unknown_remote_outcome'}
+_CORRECTION_JOURNAL_SCHEMA = 'vcstudio.correction-journal-link/v1'
 
 
 class JobOperationBusy(RuntimeError):
@@ -280,6 +281,36 @@ def _validate_job_action_key(value) -> str:
     return key
 
 
+def _validate_correction_binding(value, *, idempotency_key='') -> dict | None:
+    if value is None:
+        return None
+    required = {
+        'schema', 'correction_id', 'intent_record_hash', 'plan_id',
+        'plan_token_sha256', 'job_id', 'ledger_job_id', 'manifest_job_id',
+        'cas_anchor_sha256', 'idempotency_key',
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError('续算 correction journal 绑定无效')
+    if value.get('schema') != _CORRECTION_JOURNAL_SCHEMA:
+        raise ValueError('续算 correction journal schema 无效')
+    if not re.fullmatch(r'[0-9a-f]{24}', str(value.get('correction_id') or '')):
+        raise ValueError('续算 correction id 无效')
+    for name in ('intent_record_hash', 'plan_id', 'plan_token_sha256',
+                 'cas_anchor_sha256'):
+        if not re.fullmatch(r'[0-9a-f]{64}', str(value.get(name) or '')):
+            raise ValueError(f'续算 correction {name} 无效')
+    for name in ('job_id', 'ledger_job_id', 'manifest_job_id'):
+        if (not isinstance(value.get(name), str) or not value[name]
+                or len(value[name]) > 160):
+            raise ValueError(f'续算 correction {name} 无效')
+    key = _validate_job_action_key(value.get('idempotency_key'))
+    if not key or idempotency_key and key != idempotency_key:
+        raise ValueError('续算 correction 与操作请求标识不一致')
+    if value['job_id'] != value['ledger_job_id']:
+        raise ValueError('续算 correction 与台账身份不一致')
+    return dict(value)
+
+
 def _empty_job_action_journal() -> dict:
     return {'schema': _JOB_ACTION_JOURNAL_SCHEMA, 'operations': []}
 
@@ -314,6 +345,13 @@ def _read_job_action_journal(job_dir) -> dict:
                     or not isinstance(record.get('source_job_id'), str)
                     or record.get('idempotency_key') is not None
                     and not isinstance(record.get('idempotency_key'), str)):
+                valid = False
+                break
+            try:
+                _validate_correction_binding(
+                    record.get('correction'),
+                    idempotency_key=str(record.get('idempotency_key') or ''))
+            except ValueError:
                 valid = False
                 break
     if not valid:
@@ -376,13 +414,21 @@ def _job_action_unknown(record: dict, *, message: str | None = None):
 
 
 def _reconcile_job_action(job_dir, manifest: dict, action: str,
-                          idempotency_key: str) -> dict | None:
+                          idempotency_key: str,
+                          correction_binding: dict | None = None) -> dict | None:
     """Replay one completed key or reject every unresolved remote outcome."""
+    expected_correction = _validate_correction_binding(
+        correction_binding, idempotency_key=idempotency_key)
     journal = _read_job_action_journal(job_dir)
     changed = False
     for record in journal['operations']:
         if record.get('status') not in _JOB_ACTION_UNRESOLVED:
             continue
+        if record.get('correction') != expected_correction:
+            _job_action_unknown(
+                record,
+                message='未完成的远端操作与 correction intent 不一致；'
+                '已禁止重放或再次提交。')
         evidence = _job_action_attempt(
             manifest, action=str(record.get('action') or ''),
             transaction_id=str(record.get('transaction_id') or ''))
@@ -410,6 +456,11 @@ def _reconcile_job_action(job_dir, manifest: dict, action: str,
             record = matches[-1]
             if record.get('action') != action:
                 raise ValueError('同一作业操作请求标识不能用于不同的远端动作')
+            if record.get('correction') != expected_correction:
+                _job_action_unknown(
+                    record,
+                    message='远端操作 journal 与 correction intent 不一致；'
+                    '已禁止重放或再次提交。')
             status = record.get('status')
             if status == 'failed':
                 raise ReplayedJobOperationFailure(
@@ -430,6 +481,10 @@ def _reconcile_job_action(job_dir, manifest: dict, action: str,
         evidence = _job_action_attempt(
             manifest, action=action, idempotency_key=idempotency_key)
         if evidence:
+            if evidence.get('correction') != expected_correction:
+                raise UnknownRemoteJobOperation(
+                    '作业 attempt 与 correction intent 不一致；已禁止重放或再次提交。',
+                    action=action, recovery_status='correction_binding_mismatch')
             fallback_record = {
                 'action': action,
                 'source_job_id': str(
@@ -448,7 +503,10 @@ def _reconcile_job_action(job_dir, manifest: dict, action: str,
 
 
 def _start_job_action(job_dir, action: str, idempotency_key: str,
-                      source_job_id: str) -> dict:
+                      source_job_id: str,
+                      correction_binding: dict | None = None) -> dict:
+    correction = _validate_correction_binding(
+        correction_binding, idempotency_key=idempotency_key)
     journal = _read_job_action_journal(job_dir)
     # Reconciliation should have rejected every unresolved record.  Re-check
     # before writing so this helper is safe if used by a future caller directly.
@@ -470,10 +528,37 @@ def _start_job_action(job_dir, action: str, idempotency_key: str,
         'created_at': now,
         'updated_at': now,
         'message': None,
+        'correction': correction,
     }
     journal['operations'].append(record)
     _write_job_action_journal(job_dir, journal)
     return record
+
+
+def replay_repair_continuation_locked(job_dir, idempotency_key: str,
+                                      correction_binding: dict) -> dict | None:
+    """Replay exact durable continuation evidence without any remote seam.
+
+    The caller must hold :func:`job_operation` until its correction outcome is
+    durable, so the submitter journal and immutable audit pair form one local
+    crash-recovery critical section.
+    """
+    operation_key = _validate_job_action_key(idempotency_key)
+    binding = _validate_correction_binding(
+        correction_binding, idempotency_key=operation_key)
+    manifest = manifest_mod.load_manifest(job_dir)
+    if manifest is None:
+        raise ValueError('作业目录缺 job.yaml，无法重放修复审计')
+    if str(binding.get('manifest_job_id') or '') != str(
+            manifest.get('job_id') or binding.get('ledger_job_id') or ''):
+        raise UnknownRemoteJobOperation(
+            'job.yaml 与 correction intent 身份不一致；已禁止重放。',
+            action='continue', recovery_status='correction_binding_mismatch')
+    replay = _reconcile_job_action(
+        job_dir, manifest, 'continue', operation_key, binding)
+    if replay is None or not replay.get('_continue_replayed'):
+        return None
+    return replay
 
 
 def _update_job_action(job_dir, record: dict, status: str, **fields) -> None:
@@ -2760,11 +2845,20 @@ def assert_repair_content_cas(job_dir: str, expected: dict | None) -> None:
     _assert_expected_repair_cas(job_dir, value, expected)
 
 
+def assert_repair_correction_binding(expected: dict | None,
+                                     idempotency_key: str | None) -> None:
+    """Public local-only correction-link validation before any connection seam."""
+    key = _validate_job_action_key(idempotency_key)
+    if _validate_correction_binding(expected, idempotency_key=key) is None:
+        raise ValueError('续算 correction intent 未绑定当前作业')
+
+
 @_serialized_job_argument(2, '续算')
 def continue_from_contcar(client, profile, job_dir: str,
                           max_rounds: int = CONTINUE_MAX_ROUNDS, *,
                           idempotency_key: str | None = None,
-                          expected_cas: dict | None = None) -> dict:
+                          expected_cas: dict | None = None,
+                          correction_binding: dict | None = None) -> dict:
     """把一个可续算作业从 CONTCAR 接着跑(cp CONTCAR POSCAR + 冻结 INCAR 重投同一脚本)。
 
     有界恢复(论文核心 + 交接三不变式):
@@ -2780,6 +2874,16 @@ def continue_from_contcar(client, profile, job_dir: str,
     m = manifest_mod.load_manifest(job_dir)
     if m is None:
         raise ValueError('作业目录缺 job.yaml,无法续算')
+    correction = _validate_correction_binding(
+        correction_binding, idempotency_key=operation_key)
+    # A successful remote continuation makes the preview-era CAS stale by
+    # design.  Exact correction-linked journal replay must therefore happen
+    # before that old CAS check and remains entirely local/read-only.
+    if correction is not None:
+        replay = _reconcile_job_action(
+            job_dir, m, 'continue', operation_key, correction)
+        if replay is not None:
+            return replay
     _assert_expected_repair_cas(job_dir, m, expected_cas)
     if _job_engine(m) != 'vasp':
         contract = get_run_contract(_job_engine(m))
@@ -2787,7 +2891,8 @@ def continue_from_contcar(client, profile, job_dir: str,
             f'{_ENGINE_LABELS.get(_job_engine(m), _job_engine(m))} 不能走 VASP CONTCAR 续算；'
             f'{contract.restart_note}')
     assert_profile_binding(profile, job_dir, '续算', manifest=m)
-    replay = _reconcile_job_action(job_dir, m, 'continue', operation_key)
+    replay = _reconcile_job_action(
+        job_dir, m, 'continue', operation_key, correction)
     if replay is not None:
         return replay
     if _is_neb(m):
@@ -2831,7 +2936,7 @@ def continue_from_contcar(client, profile, job_dir: str,
     # 退出，下一实例只能 fail closed，绝不能再发第二次 qsub/sbatch。
     record = _start_job_action(
         job_dir, 'continue', operation_key,
-        str(m.get('scheduler_job_id') or ''))
+        str(m.get('scheduler_job_id') or ''), correction)
 
     # 本地也留证:备份旧 POSCAR,用 CONTCAR 覆盖(保持本地目录与远端一致)
     local_poscar = os.path.join(job_dir, 'POSCAR')
@@ -2903,6 +3008,8 @@ def continue_from_contcar(client, profile, job_dir: str,
     }
     if operation_key:
         attempt['idempotency_key'] = operation_key
+    if correction is not None:
+        attempt['correction'] = correction
     m.setdefault('attempts', []).append(attempt)
     manifest_mod.set_state(m, 'SUBMITTED',
                            note=f'CONTCAR 续算 第{rounds + 1}轮(prev {prev} → {job_id},INCAR 冻结)')

@@ -61,7 +61,7 @@ def test_repair_confirmation_publishes_to_shared_operation_queue_and_reuses_key(
     assert "withExclusiveOperation('trajectory-repair'" in block
     assert "updateOperation(op, 'running')" in block
     assert "VCS.call(\n        'trajectory_confirm_repair'" in block
-    assert "name, pw, trust, op.id" in block
+    assert "name, pw, trust, op.id, jobId" in block
     assert 'INCAR 逐字冻结' in block
     assert 'unknown 保持暂停' in block
 

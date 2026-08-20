@@ -145,6 +145,71 @@ def test_partial_write_withholds_incomplete_frame_and_stale_is_explicit(tmp_path
     assert stale['source_hash'] == opened['source_hash']
 
 
+def test_frame_token_rejects_same_size_same_mtime_xdatcar_replacement(tmp_path):
+    root = _job(tmp_path)
+    service = TrajectoryReviewService()
+    opened = service.open(root, 'aimd-job')
+    token = service.steps(opened['session_token'], limit=1)['rows'][0]['frame_token']
+    path = root / 'XDATCAR'
+    before = path.stat()
+    data = path.read_bytes()
+    assert b'0.201000' in data
+    path.write_bytes(data.replace(b'0.201000', b'0.301000', 1))
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert path.stat().st_size == before.st_size
+    assert path.stat().st_mtime_ns == before.st_mtime_ns
+
+    frame = service.frame(token)
+    assert frame['ok'] is False and frame['stale'] is True
+    assert '0.301000' not in json.dumps(frame)
+
+
+def test_xdatcar_change_during_frame_read_is_detected(tmp_path, monkeypatch):
+    root = _job(tmp_path)
+    service = TrajectoryReviewService()
+    opened = service.open(root, 'aimd-job')
+    token = service.steps(opened['session_token'], limit=1)['rows'][0]['frame_token']
+    path = root / 'XDATCAR'
+    before = path.stat()
+    original = trajectory_review._hash_binary_handle
+    calls = 0
+
+    def racing_hash(handle, *, max_bytes):
+        nonlocal calls
+        digest = original(handle, max_bytes=max_bytes)
+        calls += 1
+        if calls == 1:
+            data = path.read_bytes()
+            path.write_bytes(data.replace(b'0.201000', b'0.301000', 1))
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        return digest
+
+    monkeypatch.setattr(trajectory_review, '_hash_binary_handle', racing_hash)
+    frame = service.frame(token)
+    assert frame['ok'] is False and frame['stale'] is True
+    assert calls >= 1
+
+
+def test_xdatcar_declared_atoms_are_gated_before_any_coordinate_read(tmp_path):
+    path = tmp_path / 'XDATCAR'
+    path.write_text(
+        'huge\n1.0\n1 0 0\n0 1 0\n0 0 1\nH\n1000000\n'
+        'Direct configuration= 1\n' + ('9' * 5000), encoding='utf-8')
+    with pytest.raises(trajectory_review.TrajectoryLimitError,
+                       match='atom render limit'):
+        trajectory_review._xdatcar_index(path)
+
+
+def test_xdatcar_index_keeps_only_bounded_offsets_and_digests(tmp_path):
+    path = tmp_path / 'XDATCAR'
+    path.write_text(_xdatcar(2), encoding='utf-8')
+    _meta, frames, complete, warnings = trajectory_review._xdatcar_index(path)
+    assert complete is True and warnings == []
+    assert len(frames) == 2
+    assert all(len(frame['frame_sha256']) == 64 for frame in frames)
+    assert all('coordinate_lines' not in frame for frame in frames)
+
+
 def test_neb_navigation_consumes_existing_parser_without_second_barrier_formula(tmp_path):
     root = tmp_path / 'neb'
     root.mkdir()
@@ -406,6 +471,16 @@ def test_orphan_or_mismatched_correction_outcome_is_invalid(tmp_path):
     operation_key = 'trajectory-repair:orphan'
     record_id = hashlib.sha256(
         f'{plan_id}|{operation_key}'.encode('utf-8')).hexdigest()[:24]
+    cas_files = {
+        'job.yaml': '6' * 64, 'INCAR': '8' * 64, 'CONTCAR': '9' * 64,
+    }
+    cas_contract = {
+        'schema': 'vcstudio.repair-cas/v1', 'ledger_job_id': 'relax-job',
+        'manifest_job_id': 'relax-job', 'manifest_state': 'UNCONVERGED',
+        'scheduler_job_id': '100', 'diagnosis_sha256': '7' * 64,
+        'diagnosis_evidence_file': None, 'source_hash': '4' * 64,
+        'files': cas_files,
+    }
     payload = {
         'schema': trajectory_review.CORRECTION_SCHEMA,
         'record_id': record_id, 'record_type': 'repair_outcome',
@@ -414,12 +489,12 @@ def test_orphan_or_mismatched_correction_outcome_is_invalid(tmp_path):
         'manifest_job_id': 'relax-job', 'plan_id': plan_id,
         'action': 'continue_frozen_incar',
         'idempotency_key': operation_key,
-        'cas_anchor_sha256': '3' * 64, 'source_hash': '4' * 64,
+        'cas_anchor_sha256': trajectory_review._json_hash(cas_contract),
+        'source_hash': '4' * 64,
         'cas_manifest_sha256': '6' * 64,
         'cas_diagnosis_sha256': '7' * 64,
-        'cas_files_sha256': {
-            'job.yaml': '6' * 64, 'INCAR': '8' * 64, 'CONTCAR': '9' * 64,
-        },
+        'cas_files_sha256': cas_files, 'cas_contract': cas_contract,
+        'plan_token_sha256': 'a' * 64,
         'method_compatibility': 'unchanged', 'intent_record_hash': '5' * 64,
         'result_ok': True,
     }
@@ -429,6 +504,67 @@ def test_orphan_or_mismatched_correction_outcome_is_invalid(tmp_path):
     compatibility = correction_method_compatibility(root)
     assert compatibility['status'] == 'unknown_invalid_record'
     assert any('no matching intent' in issue for issue in compatibility['issues'])
+
+
+def test_missing_correction_outcome_replays_exact_submitter_journal_locally(
+        tmp_path, monkeypatch):
+    from vcstudio.cluster import submitter
+
+    root = _job(tmp_path, task='relax')
+    manifest.save_manifest(root, _terminal_diagnosis(manifest.load_manifest(root)))
+    service = TrajectoryReviewService()
+    opened = service.open(root, 'relax-job')
+    preview = service.repair_preview(opened['session_token'])
+    operation_key = 'trajectory-repair:crash-replay'
+    prepared = service.prepare_repair(
+        preview['plan_token'], 'continue_frozen_incar', operation_key)
+
+    value = manifest.load_manifest(root)
+    transaction_id = 'f' * 32
+    previous_job_id = value['scheduler_job_id']
+    value['scheduler_job_id'] = '101'
+    value.setdefault('results', {}).pop('diagnosis', None)
+    value['results']['continue_rounds'] = 1
+    value.setdefault('attempts', []).append({
+        'n': len(value.get('attempts') or []) + 1,
+        'at': '2026-08-20T00:00:00', 'result': 'continued',
+        'action': 'contcar_restart', 'prev_job_id': previous_job_id,
+        'job_id': '101', 'round': 1,
+        'operation_transaction_id': transaction_id,
+        'idempotency_key': operation_key,
+        'correction': prepared['journal_binding'],
+    })
+    manifest.set_state(value, 'SUBMITTED', note='simulated accepted continuation')
+    manifest.save_manifest(root, value)
+    submitter._write_job_action_journal(root, {
+        'schema': submitter._JOB_ACTION_JOURNAL_SCHEMA,
+        'operations': [{
+            'transaction_id': transaction_id, 'action': 'continue',
+            'status': 'remote_accepted', 'idempotency_key': operation_key,
+            'source_job_id': previous_job_id, 'result_job_id': '101',
+            'created_at': '2026-08-20T00:00:00',
+            'updated_at': '2026-08-20T00:00:01', 'message': None,
+            'correction': prepared['journal_binding'],
+        }],
+    })
+    assert not list((root / '.vcstudio-corrections').glob('outcome-*.json'))
+    monkeypatch.setattr(
+        submitter, 'run_cmd',
+        lambda *_args, **_kwargs: pytest.fail('durable replay contacted remote seam'))
+
+    restarted = TrajectoryReviewService()
+    replay = restarted.reconcile_repair_outcome(
+        root, 'relax-job', preview['plan_token'], operation_key)
+    assert replay['operation']['replayed'] is True
+    assert replay['correction_outcome']['status'] == 'applied'
+    assert manifest.load_manifest(root)['scheduler_job_id'] == '101'
+    assert submitter._read_job_action_journal(root)['operations'][-1][
+        'status'] == 'succeeded'
+    assert correction_method_compatibility(root)['status'] == 'verified_unchanged'
+
+    repeated = restarted.reconcile_repair_outcome(
+        root, 'relax-job', preview['plan_token'], operation_key)
+    assert repeated['correction_outcome'] == replay['correction_outcome']
 
 
 def test_limits_fail_before_expansion_and_large_frame_skips_distance_call(

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import types
 
+import pytest
+
 from vcstudio.gui_web.api import Api
 
 
@@ -48,6 +50,7 @@ class _Trajectory:
             'operation_key': key, 'plan_id': 'p' * 64,
             'correction_id': 'correction-id', 'intent_record_hash': 'i' * 64,
             'incar_sha256_before': 'a' * 64,
+            'journal_binding': {'schema': 'correction-link'},
         }
 
     def record_repair_outcome(self, prepared, outcome):
@@ -120,9 +123,11 @@ def test_confirmed_repair_uses_existing_idempotent_continue_and_redacts_path(tmp
     api = Api(ledger_mod=_ledger(job), trajectory_review_service=service)
     captured = {}
 
-    def _continue(dirs, name, password, trust_new=False, idempotency_key=None):
+    def _continue(dirs, name, password, trust_new=False, idempotency_key=None,
+                  expected_correction_by_job=None):
         captured.update(dirs=dirs, name=name, password=password,
-                        trust_new=trust_new, idempotency_key=idempotency_key)
+                        trust_new=trust_new, idempotency_key=idempotency_key,
+                        expected_correction_by_job=expected_correction_by_job)
         return {
             'ok': True, 'idempotency_key': idempotency_key,
             'results': [(str(job), True, '已续算重投，新作业号 101')],
@@ -135,6 +140,8 @@ def test_confirmed_repair_uses_existing_idempotent_continue_and_redacts_path(tmp
 
     assert captured['dirs'] == [str(job)]
     assert captured['idempotency_key'] == 'trajectory-repair:123456'
+    assert list(captured['expected_correction_by_job'].values()) == [
+        {'schema': 'correction-link'}]
     assert result['results'] == [
         {'job_id': 'opaque-job', 'ok': True,
          'message': '已续算重投，新作业号 101'}]
@@ -180,6 +187,43 @@ def test_confirm_rejects_changed_cas_before_continue_seam(tmp_path):
     assert result['ok'] is False
     assert 'replacement detected' in result['error']
     assert called == []
+
+
+def test_confirm_reconciles_durable_outcome_before_credentials_or_remote_seam(tmp_path):
+    job = tmp_path / 'job'
+    job.mkdir()
+
+    class ReplayingTrajectory(_Trajectory):
+        def reconcile_repair_outcome(self, job_dir, job_id, token, key):
+            self.calls.append(('reconcile', job_dir, job_id, token, key))
+            return {
+                'prepared': {
+                    'job_id': job_id, 'intent_record_hash': 'i' * 64,
+                },
+                'operation': {
+                    'ok': True, 'replayed': True,
+                    'results': [[job_dir, True, '已确认续算，新作业号 101']],
+                },
+                'correction_outcome': {
+                    'record_id': 'a' * 24, 'record_hash': 'o' * 64,
+                    'status': 'applied', 'method_compatibility': 'unchanged',
+                },
+            }
+
+        def prepare_repair(self, *_args):
+            raise AssertionError('durable replay must precede live plan/CAS')
+
+    service = ReplayingTrajectory(str(job))
+    api = Api(ledger_mod=_ledger(job), trajectory_review_service=service)
+    api.continue_jobs = lambda *_args, **_kwargs: pytest.fail(
+        'durable replay must not reach remote continuation')
+    result = api.trajectory_confirm_repair(
+        'repair-token', 'continue_frozen_incar', 'cluster-a', 'secret', False,
+        'trajectory-repair:123456', 'opaque-job')
+    assert result['replayed'] is True
+    assert result['correction_outcome']['status'] == 'applied'
+    assert result['results'][0]['job_id'] == 'opaque-job'
+    assert str(job) not in json.dumps(result, ensure_ascii=False)
 
 
 def test_every_success_dto_is_recursively_public_projected(tmp_path):

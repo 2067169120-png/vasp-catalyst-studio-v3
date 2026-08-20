@@ -306,3 +306,44 @@ def test_continue_batch_rejects_cas_before_opening_connection(monkeypatch):
     assert payload['ok'] is False
     assert '未建立远程连接' in payload['error']
     assert opened == []
+
+
+def test_continue_batch_forwards_exact_correction_journal_binding(monkeypatch):
+    client, jump = _patch_open(monkeypatch)
+    monkeypatch.setattr(
+        batch_ops.submitter, 'assert_repair_content_cas', lambda *_args: None)
+    monkeypatch.setattr(
+        batch_ops.submitter, 'assert_repair_correction_binding',
+        lambda *_args: None)
+    captured = {}
+
+    def continued(_client, _profile, directory, **kwargs):
+        captured.update(directory=directory, **kwargs)
+        return {'scheduler_job_id': '101', '_continue_replayed': True}
+
+    monkeypatch.setattr(batch_ops.submitter, 'continue_from_contcar', continued)
+    correction = {'schema': 'vcstudio.correction-journal-link/v1'}
+    payload = batch_ops.continue_batch(
+        object(), None, ['d1'], False,
+        idempotency_key='trajectory-repair:batch-binding',
+        expected_cas_by_job={'d1': {'schema': 'vcstudio.repair-cas/v1'}},
+        expected_correction_by_job={'d1': correction})
+    assert payload['results'] == [('d1', True, '已确认续算,新作业号 101')]
+    assert captured['correction_binding'] is correction
+    assert captured['idempotency_key'] == 'trajectory-repair:batch-binding'
+    assert client.closed and jump.closed
+
+
+def test_continue_batch_rejects_correction_binding_before_connection(monkeypatch):
+    opened = []
+    monkeypatch.setattr(
+        batch_ops, 'open_client',
+        lambda *_args, **_kwargs: opened.append(True) or (_ for _ in ()).throw(
+            AssertionError('connection seam must not be reached')))
+    payload = batch_ops.continue_batch(
+        object(), None, ['d1'], False,
+        idempotency_key='trajectory-repair:bad-binding',
+        expected_correction_by_job={'d1': {'schema': 'invalid'}})
+    assert payload['ok'] is False
+    assert '未建立远程连接' in payload['error']
+    assert opened == []
