@@ -195,12 +195,12 @@ JavaScript 文件的 `node --check`、变更 Python 文件的 `py_compile` 与 `
 哈希仍仅对应 2026-08-13 产物。
 
 2026-08-21 的整合树再次完成最终本地门禁：免缓存全量 pytest 为
-**5185 passed、12 skipped**（540.97 秒；15 条上游弃用警告）；全仓 Ruff、28 个第一方
+**5189 passed、12 skipped**（368.58 秒；15 条上游弃用警告）；全仓 Ruff、28 个第一方
 JavaScript 文件的 `node --check`、`pip check` 与 `git diff --check` 通过。本机未安装
 actionlint，工作流静态检查仍等待推送后的远端 CI。`vcstudio-4.0.0` wheel 构建成功并包含
-52 个 Web 资源和中英文 locale。基于整合提交 `6cfe082` 的 `--full` 单文件 EXE 为
-**115,177,760 bytes（109.84 MiB）**，SHA-256 为
-`17b8d1927dfb1f99a1bd41249574113edb6dc680eb78d0e9239c67eb1408e874`。
+52 个 Web 资源和中英文 locale。基于跨平台收口提交 `9758829` 的 `--full` 单文件 EXE 为
+**115,182,610 bytes（109.85 MiB）**，SHA-256 为
+`414c1091766f74d13a5e68858bef60b2c3049d07a27111709b7ef8bd0bd45a7d`。
 
 2026-08-21 冻结 EXE 内的 `full` 和 `journey` healthcheck 都以退出码 0 完成，并各自报告
 `ok=true`、`frozen=true`。`full` 为 6/6，`journey` 完成 10/10 个阶段，网络尝试为 0、

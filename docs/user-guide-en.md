@@ -309,12 +309,12 @@ passed. This run did not rebuild the executable, rerun actionlint, or execute a 
 job; the frozen binary hash above remains evidence only for the 2026-08-13 artifact.
 
 On 2026-08-21 the integrated tree completed the final local gates again: cache-free full pytest passed
-with **5185 passed and 12 skipped** in 540.97 seconds, with 15 upstream warnings; full-repository Ruff,
+with **5189 passed and 12 skipped** in 368.58 seconds, with 15 upstream warnings; full-repository Ruff,
 `node --check` for 28 first-party JavaScript files, `pip check`, and `git diff --check` passed. Actionlint
 was not installed locally and remains a hosted-CI gate. The `vcstudio-4.0.0` wheel contains 52 Web assets
-and both locales. The PyInstaller `--full` EXE built from integration commit `6cfe082` is
-**115,177,760 bytes (109.84 MiB)** with SHA-256
-`17b8d1927dfb1f99a1bd41249574113edb6dc680eb78d0e9239c67eb1408e874`.
+and both locales. The PyInstaller `--full` EXE built from cross-platform closure commit `9758829` is
+**115,182,610 bytes (109.85 MiB)** with SHA-256
+`414c1091766f74d13a5e68858bef60b2c3049d07a27111709b7ef8bd0bd45a7d`.
 
 Inside that 2026-08-21 frozen EXE, both `full` and `journey` healthchecks exited 0 and each reported
 `ok=true` and `frozen=true`. The `full` profile passed 6/6 checks; `journey` completed all 10/10 phases,
