@@ -8299,6 +8299,10 @@ def test_derive_conv_thickness_regenerates_from_recipe(tmp_path):
     src.mkdir()
     (src / 'CONTCAR').write_text('x\n', encoding='utf-8')
     (src / 'INCAR').write_text('ENCUT = 500\n', encoding='utf-8')
+    (src / 'KPOINTS').write_text(
+        'mesh\n0\nGamma\n3 3 1\n0 0 0\n', encoding='utf-8')
+    (src / 'POTCAR').write_text(
+        'TITEL = PAW_PBE Pt\nENMAX = 230.000 eV\n', encoding='utf-8')
     man = real_manifest.new_manifest(
         job_id='base', system='Pt slab', task_type='relax', calc_type='slab',
         inputs={'recipe': {'kind': 'metal_slab', 'element': 'Pt', 'structure': 'fcc',
