@@ -1,3 +1,5 @@
+import json
+
 from vcstudio.project import comparison
 
 
@@ -43,6 +45,19 @@ def test_canonical_species_and_stable_config_deadband():
     assert rows[0]["delta_e"] == -1.04
     assert [row["delta_e"] for row in rows[0]["co_minima"]] == [-0.98]
     assert rows[0]["near_degenerate"] is True
+
+
+def test_stable_species_rows_never_projects_job_locators():
+    summary = _summary("Fe", {"Li2S8": [-1.04, -0.98]})
+    summary["rows"][0]["job"] = r"C:\\Users\\private\\job-a"
+    summary["rows"][0]["path"] = "/scratch/private/job-a"
+    summary["rows"][1]["configuration_id"] = "job-opaque-b"
+
+    rows = comparison.stable_species_rows(summary, deadband_eV=0.15)
+
+    assert rows[0]["job"] == ""
+    assert rows[0]["co_minima"][0]["job"] == "job-opaque-b"
+    assert "private" not in json.dumps(rows)
 
 
 def test_snapshot_preserves_missing_and_deduplicates_paths():

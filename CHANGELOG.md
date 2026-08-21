@@ -111,6 +111,11 @@ CI was performed.
   tampering, unknown identity, or explicit contradictory result evidence.
 
 ### 分析、资源与治理 / Analysis, resources, and governance
+- Home 与 Project 新增共享的跨项目 Research Explorer：从 registry/project/job/manifest/validation
+  派生可重建只读索引，支持方法兼容默认过滤、稳定分页、服务端表格/histogram/scatter/元素周期表
+  DTO、opaque ID drill-down 和 data/logical live provenance。保存视图只含 filters/sort/axes，并以
+  authority_id + revision CAS 更新；partial/stale/unavailable 时 fail closed，且 frozen report graph
+  保持独立。没有引入数据库、远程副作用或 accepted/publication gate 旁路。
 - Analysis capability cards 以服务端证据区分 available、missing prerequisite、mode mismatch、
   not implemented 与 unavailable。Task Results、DOS/PDOS、Bands/带隙、功函数、Bader、差分电荷和
   Property calculators 使用真实 parser、来源 hash、opaque ID 与分母；浏览器不复算数值。

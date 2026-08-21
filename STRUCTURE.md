@@ -58,6 +58,12 @@
 ReportModel/manifest 为核心；生成工件、科学资格和发布门禁是三个相关但不等价
 的事实。`external/` 不是报告或科学状态的权威存储位置。
 
+跨项目研究浏览器由 `project/research_explorer.py` 生成可重建内存索引、分页查询、服务端
+聚合和独立的 live provenance；`project/research_views.py` 只保存受
+`authority_id + revision` CAS 保护的 filters/sort/axes。Web 组件位于
+`gui_web/assets/research-explorer.js` 与 `.css`，同时挂载在 Home/Project，不改变 32 个语义路由。
+这些文件都不是项目、作业、验证或冻结报告的事实源。
+
 ## 默认 Web 信息架构
 
 - 7 个一级区域：Home、Project、Prepare、Run、Analyze、Publish、Environment。

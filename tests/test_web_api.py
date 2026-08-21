@@ -1369,13 +1369,16 @@ def test_proj_create_exception_is_caught(tmp_path):
 
 
 # ── proj_delta ───────────────────────────────────────────────────────────────
-def test_proj_delta_passes_through_rows_and_gating():
+def test_proj_delta_passes_through_rows_and_gating(tmp_path):
     proj = {'name': 'demo', 'members': {}}
+    reference_job = tmp_path / 'private-reference-job'
+    reference_job.mkdir()
     delta_ret = {
         'slab': ('DONE', -12.5), 'ref': ('无', None), 'has_ref': False,
         'rows': [
             {'name': 'demo_ads_a', 'state': 'DONE', 'e_config': -20.0,
              'delta_e': -2.5, 'note': '', 'reference_state': 'DONE',
+             'reference_job': str(reference_job),
              'reference_valid': True, 'reference_note': '清单与作业能量一致'},
             {'name': 'demo_ads_b', 'state': 'RUNNING', 'e_config': None,
              'delta_e': None, 'note': '构型未完成'},
@@ -1388,6 +1391,8 @@ def test_proj_delta_passes_through_rows_and_gating():
     assert out['rows'][0]['delta_e'] == -2.5
     assert out['rows'][0]['reference_state'] == 'DONE'
     assert out['rows'][0]['reference_valid'] is True
+    assert out['rows'][0]['reference_job'].startswith('job-')
+    assert str(tmp_path) not in json.dumps(out)
     assert '一致' in out['rows'][0]['reference_note']
     assert out['rows'][1]['delta_e'] is None and '构型未完成' in out['rows'][1]['note']
     assert '清洁表面' in out['note']

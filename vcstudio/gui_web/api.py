@@ -23,6 +23,7 @@ import posixpath
 import re
 import shutil
 import stat
+import stat as stat_mod
 import sys
 import tempfile
 import threading
@@ -292,6 +293,7 @@ class Api:
                  comparison_mod=None, candidate_evaluation_mod=None,
                  paper_report_mod=None, workspace_state_store=None,
                  report_service=None, analysis_preferences_store=None,
+                 research_index_service=None, research_view_store=None,
                  project_lifecycle_service=None, lab_policy_store=None,
                  workspace_context_store=None, method_recipe_service=None,
                  method_recipe_publisher=None, structure_sources_mod=None,
@@ -441,6 +443,12 @@ class Api:
             catalysis_authoring_service_factory)
         self._kinetics_authoring_service_factory = (
             kinetics_authoring_service_factory)
+        # Cross-project research discovery is a rebuildable in-memory read
+        # model; saved filters live in their own authority_id + revision CAS
+        # store.  Neither is a project/job/report fact source.
+        self._research_index_service = research_index_service
+        self._research_view_store = research_view_store
+        self._research_index_lock = threading.RLock()
         # Confirmed laboratory recommendations are user-level state.  They do
         # not mutate job manifests or grant submission authority.
         self._lab_policy_store = lab_policy_store
@@ -5681,12 +5689,22 @@ class Api:
             s = self._adsorption.delta_e_rows(proj)
             slab_state, e_slab = s['slab']
             ref_state, e_ref = s['ref']
+            def public_reference_job(raw_job):
+                if not isinstance(raw_job, str) or not raw_job.strip():
+                    return None
+                try:
+                    manifest = self._manifest.load_manifest(raw_job) or {}
+                except Exception:                       # noqa: BLE001 opaque fallback
+                    manifest = {}
+                return self._workspace_job_id(raw_job, manifest)
+
             rows = [{'name': r['name'], 'state': r['state'],
                      'e_config': r['e_config'], 'delta_e': r['delta_e'],
                      'note': r['note'], 'species': r.get('species'),
                      'reference_species': r.get('reference_species'),
                      'e_ref': r.get('e_ref'),
-                     'reference_job': r.get('reference_job'),
+                     'reference_job': public_reference_job(
+                         r.get('reference_job')),
                      'reference_source': r.get('reference_source'),
                      'reference_state': r.get('reference_state'),
                      'reference_valid': r.get('reference_valid'),
@@ -8658,6 +8676,1318 @@ class Api:
         except Exception as exc:                         # noqa: BLE001 public bridge
             return self._analysis_preferences_failure(exc)
 
+    def _research_index(self):
+        if self._research_index_service is None:
+            from vcstudio.project.research_explorer import ResearchIndexService
+
+            self._research_index_service = ResearchIndexService()
+        return self._research_index_service
+
+    def _research_views(self):
+        if self._research_view_store is None:
+            from vcstudio.project.research_views import ResearchViewStore
+
+            self._research_view_store = ResearchViewStore()
+        return self._research_view_store
+
+    def _research_registry_snapshot(self):
+        """Load registry/project authority from strict no-follow byte snapshots."""
+        import yaml
+
+        from vcstudio.project.research_explorer import (
+            MAX_PROJECT_BYTES,
+            MAX_REGISTRY_BYTES,
+            MAX_REGISTRY_RECORDS,
+            _bounded_payload_size,
+            authority_budget_failures,
+        )
+
+        failures = []
+        source_files = {}
+        source_rows = []
+        registry_state = 'adapter'
+        registry_path_fn = getattr(self._adsorption, 'default_registry_path', None)
+        if callable(registry_path_fn):
+            registry_path = os.path.abspath(os.path.expanduser(str(registry_path_fn())))
+            try:
+                captured = self._research_source_file_snapshot(registry_path)
+                source_files[self._workspace_path_key(registry_path)] = captured
+                source_rows.append({
+                    'project_id': 'registry', 'kind': 'projects.json',
+                    **captured['version'], 'available': True,
+                })
+                if len(captured['bytes']) > MAX_REGISTRY_BYTES:
+                    raise ValueError('registry byte limit exceeded')
+                data = json.loads(captured['bytes'].decode('utf-8'))
+                items = data.get('projects') if isinstance(data, dict) else None
+                if not isinstance(items, list) or any(not isinstance(item, str) for item in items):
+                    raise ValueError('registry shape is invalid')
+                locators = list(items)
+                registry_state = 'empty' if not locators else 'ready'
+            except FileNotFoundError:
+                locators = []
+                registry_state = 'missing'
+                failures.append({
+                    'project_ref': 'registry', 'code': 'registry_missing',
+                    'message': 'Research project registry is missing.',
+                })
+            except Exception:                            # noqa: BLE001 corrupt authority
+                locators = []
+                registry_state = 'corrupt'
+                failures.append({
+                    'project_ref': 'registry', 'code': 'registry_corrupt',
+                    'message': 'Research project registry is corrupt.',
+                })
+        else:
+            locators = list(self._adsorption.list_projects())
+        if len(locators) > MAX_REGISTRY_RECORDS:
+            return {
+                'registered_total': len(locators), 'records': [],
+                'duplicate_ids': set(), 'registry_state': 'over_limit',
+                '_source_files': source_files, '_source_rows': source_rows,
+                'failures': [*failures, {
+                    'project_ref': 'registry',
+                    'code': 'registry_limit_exceeded',
+                    'message': 'Research registry exceeds its hard resource budget.',
+                }],
+            }
+        records = []
+        registry_bytes = 2
+        for index, raw_locator in enumerate(locators, start=1):
+            try:
+                locator = os.path.abspath(os.path.expanduser(str(raw_locator)))
+                locator_stat = os.lstat(locator)
+                attributes = int(getattr(locator_stat, 'st_file_attributes', 0))
+                reparse_marker = int(getattr(
+                    stat_mod, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400))
+                if (stat_mod.S_ISLNK(locator_stat.st_mode)
+                        or attributes & reparse_marker):
+                    raise OSError('project locator is a symlink or reparse point')
+                path = (os.path.join(locator, 'project.yaml')
+                        if stat_mod.S_ISDIR(locator_stat.st_mode) else locator)
+                captured = self._research_source_file_snapshot(path)
+                source_files[self._workspace_path_key(path)] = captured
+                source_row = {
+                    'project_id': f'registered-project-{index}',
+                    'kind': 'project.yaml',
+                    **captured['version'], 'available': True,
+                }
+                source_rows.append(source_row)
+                if len(captured['bytes']) > MAX_PROJECT_BYTES:
+                    failures.append({
+                        'project_ref': f'registered-project-{index}',
+                        'code': 'project_limit_exceeded',
+                        'message': 'Registered project exceeds its byte budget.',
+                    })
+                    continue
+                project = (self._adsorption.load_project(raw_locator)
+                           if registry_state == 'adapter' else
+                           yaml.safe_load(captured['bytes'].decode('utf-8')))
+                if not isinstance(project, dict) or not project.get('members'):
+                    raise ValueError('registered project is unreadable')
+                project_id = self._workspace_project_id(path, project)
+                source_row['project_id'] = project_id
+                record = {
+                    'project_id': project_id,
+                    'request_project_id': project_id,
+                    'path': path,
+                    'project': project,
+                    'identity_fingerprint': self._project_identity_fingerprint(
+                        path, project),
+                }
+                limit_failures = authority_budget_failures(
+                    [record], registry_total=1)
+                if limit_failures:
+                    failures.extend(limit_failures)
+                    continue
+                registry_bytes += _bounded_payload_size(
+                    record, label='registry record', maximum=MAX_REGISTRY_BYTES)
+                if registry_bytes > MAX_REGISTRY_BYTES:
+                    failures.append({
+                        'project_ref': 'registry',
+                        'code': 'registry_limit_exceeded',
+                        'message': 'Research registry exceeds its byte budget.',
+                    })
+                    break
+                records.append(record)
+            except Exception:                             # noqa: BLE001 safe registry read
+                failures.append({
+                    'project_ref': f'registered-project-{index}',
+                    'code': 'project_unreadable',
+                    'message': 'Registered project could not be read.',
+                })
+        aggregate_failures = authority_budget_failures(
+            records, registry_total=len(locators))
+        known = {
+            (str(item.get('project_ref') or ''), str(item.get('code') or ''))
+            for item in failures
+        }
+        failures.extend(
+            item for item in aggregate_failures
+            if (item['project_ref'], item['code']) not in known)
+        by_id = {}
+        for record in records:
+            by_id.setdefault(record['project_id'], []).append(record)
+        return {
+            'registered_total': len(locators), 'records': records,
+            'registry_state': registry_state,
+            '_source_files': source_files, '_source_rows': source_rows,
+            'duplicate_ids': {
+                project_id for project_id, matches in by_id.items()
+                if len(matches) != 1
+            },
+            'failures': failures,
+        }
+
+    @staticmethod
+    def _research_windows_guard_chain(path):
+        """Hold Windows no-delete handles so directory names cannot A→B→A."""
+        if os.name != 'nt':
+            return []
+        import ctypes
+        from ctypes import wintypes
+
+        file_read_attributes = 0x0080
+        generic_read = 0x80000000
+        share_read_write = 0x00000001 | 0x00000002
+        open_existing = 3
+        backup_semantics = 0x02000000
+        open_reparse_point = 0x00200000
+        directory_attribute = 0x10
+        reparse_attribute = 0x400
+        invalid_handle = ctypes.c_void_p(-1).value
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+            wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+        create_file.restype = wintypes.HANDLE
+        get_attributes = kernel32.GetFileAttributesW
+        get_attributes.argtypes = (wintypes.LPCWSTR,)
+        get_attributes.restype = wintypes.DWORD
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+
+        absolute = os.path.abspath(os.path.expanduser(str(path)))
+        drive, tail = os.path.splitdrive(absolute)
+        current = drive + os.path.sep if drive else os.path.sep
+        components = [item for item in tail.split(os.path.sep) if item]
+        handles = []
+        try:
+            for index, component in enumerate(components):
+                current = os.path.join(current, component)
+                attributes = int(get_attributes(current))
+                if attributes == 0xFFFFFFFF:
+                    error = ctypes.get_last_error()
+                    if error in {2, 3}:
+                        raise FileNotFoundError('source entity is missing')
+                    raise OSError('source entity attributes are unavailable')
+                is_directory = bool(attributes & directory_attribute)
+                if attributes & reparse_attribute:
+                    raise OSError('source path contains a symlink or reparse point')
+                final = index == len(components) - 1
+                if final and is_directory:
+                    raise OSError('source entity is not a regular file')
+                if not final and not is_directory:
+                    raise OSError('source parent entity is not a directory')
+                handle = create_file(
+                    current,
+                    generic_read if final else file_read_attributes,
+                    share_read_write,
+                    None,
+                    open_existing,
+                    open_reparse_point | (backup_semantics if is_directory else 0),
+                    None,
+                )
+                if handle == invalid_handle:
+                    error = ctypes.get_last_error()
+                    if error in {2, 3}:
+                        raise FileNotFoundError('source entity is missing')
+                    raise OSError('source entity handle is unavailable')
+                handles.append(handle)
+            return handles
+        except Exception:
+            for handle in reversed(handles):
+                close_handle(handle)
+            raise
+
+    @staticmethod
+    def _research_close_windows_guards(handles):
+        if os.name != 'nt':
+            return
+        import ctypes
+        from ctypes import wintypes
+
+        close_handle = ctypes.WinDLL(
+            'kernel32', use_last_error=True).CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        for handle in reversed(handles):
+            close_handle(handle)
+
+    @staticmethod
+    def _research_posix_file_snapshot(path):
+        """Open a file relative to trusted directory descriptors without following."""
+        from vcstudio.project.research_explorer import MAX_SOURCE_FILE_BYTES
+
+        absolute = os.path.abspath(os.path.expanduser(str(path)))
+        components = [item for item in absolute.split(os.path.sep) if item]
+        directory_flags = (
+            os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
+            | getattr(os, 'O_NOFOLLOW', 0))
+        descriptors = [os.open(os.path.sep, directory_flags)]
+        try:
+            for component in components[:-1]:
+                descriptor = os.open(
+                    component, directory_flags, dir_fd=descriptors[-1])
+                info = os.fstat(descriptor)
+                if not stat_mod.S_ISDIR(info.st_mode):
+                    os.close(descriptor)
+                    raise OSError('source parent entity is not a directory')
+                descriptors.append(descriptor)
+            file_descriptor = os.open(
+                components[-1], os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0),
+                dir_fd=descriptors[-1])
+            descriptors.append(file_descriptor)
+            before = os.fstat(file_descriptor)
+            if (not stat_mod.S_ISREG(before.st_mode)
+                    or int(before.st_size) > MAX_SOURCE_FILE_BYTES):
+                raise ValueError('source_file_limit_exceeded')
+            chunks = []
+            digest = hashlib.sha256()
+            total = 0
+            while True:
+                chunk = os.read(file_descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_SOURCE_FILE_BYTES:
+                    raise ValueError('source_file_limit_exceeded')
+                chunks.append(chunk)
+                digest.update(chunk)
+            after = os.fstat(file_descriptor)
+            if (int(before.st_dev), int(before.st_ino), int(before.st_size),
+                    int(before.st_mtime_ns)) != (
+                    int(after.st_dev), int(after.st_ino), int(after.st_size),
+                    int(after.st_mtime_ns)):
+                raise OSError('source_changed_during_hash')
+            data = b''.join(chunks)
+            return {'bytes': data, 'version': {
+                'device': int(after.st_dev), 'inode': int(after.st_ino),
+                'size': len(data), 'mtime_ns': int(after.st_mtime_ns),
+                'sha256': digest.hexdigest(),
+            }}
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    @staticmethod
+    def _research_source_file_snapshot(path):
+        """Read immutable bytes from one no-follow file/directory entity chain."""
+        if os.name != 'nt':
+            return Api._research_posix_file_snapshot(path)
+        guards = Api._research_windows_guard_chain(path)
+        try:
+            return Api._research_source_file_snapshot_impl(path)
+        finally:
+            Api._research_close_windows_guards(guards)
+
+    @staticmethod
+    def _research_source_file_snapshot_impl(path):
+        from vcstudio.project.research_explorer import MAX_SOURCE_FILE_BYTES
+
+        def reparse(stat):
+            attributes = int(getattr(stat, 'st_file_attributes', 0))
+            marker = int(getattr(stat_mod, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400))
+            return stat_mod.S_ISLNK(stat.st_mode) or bool(attributes & marker)
+
+        def entity_signature(stat):
+            return (
+                int(stat.st_dev), int(stat.st_ino),
+                int(stat_mod.S_IFMT(stat.st_mode)),
+            )
+
+        absolute = os.path.abspath(os.path.expanduser(str(path)))
+        drive, tail = os.path.splitdrive(absolute)
+        current = drive + os.path.sep if drive else os.path.sep
+        components = [item for item in tail.split(os.path.sep) if item]
+        parents = []
+        for component in components[:-1]:
+            current = os.path.join(current, component)
+            parent_stat = os.lstat(current)
+            if reparse(parent_stat):
+                raise OSError('source path contains a symlink or reparse point')
+            if not stat_mod.S_ISDIR(parent_stat.st_mode):
+                raise OSError('source parent entity is not a directory')
+            parents.append((current, entity_signature(parent_stat)))
+
+        before_path = os.lstat(absolute)
+        if reparse(before_path):
+            raise OSError('source file is a symlink or reparse point')
+        if not stat_mod.S_ISREG(before_path.st_mode):
+            raise OSError('source entity is not a regular file')
+        if int(before_path.st_size) > MAX_SOURCE_FILE_BYTES:
+            raise ValueError('source_file_limit_exceeded')
+        flags = os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+        descriptor = os.open(absolute, flags)
+        digest = hashlib.sha256()
+        chunks = []
+        try:
+            before_open = os.fstat(descriptor)
+            if entity_signature(before_path) != entity_signature(before_open):
+                raise OSError('source_changed_during_hash')
+            total = 0
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_SOURCE_FILE_BYTES:
+                    raise ValueError('source_file_limit_exceeded')
+                chunks.append(chunk)
+                digest.update(chunk)
+            after_open = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        after_path = os.lstat(absolute)
+        if (entity_signature(before_open) != entity_signature(after_open)
+                or entity_signature(after_open) != entity_signature(after_path)
+                or int(before_open.st_size) != int(after_open.st_size)
+                or int(after_open.st_size) != int(after_path.st_size)
+                or int(before_open.st_mtime_ns) != int(after_open.st_mtime_ns)
+                or int(after_open.st_mtime_ns) != int(after_path.st_mtime_ns)):
+            raise OSError('source_changed_during_hash')
+        for parent_path, expected in parents:
+            parent_stat = os.lstat(parent_path)
+            if reparse(parent_stat) or entity_signature(parent_stat) != expected:
+                raise OSError('source directory entity changed during read')
+        data = b''.join(chunks)
+        return {
+            'bytes': data,
+            'version': {
+                'device': int(after_open.st_dev),
+                'inode': int(after_open.st_ino),
+                'size': len(data),
+                'mtime_ns': int(after_open.st_mtime_ns),
+                'sha256': digest.hexdigest(),
+            },
+        }
+
+    @staticmethod
+    def _research_source_file_version(path):
+        """Compatibility projection of a trusted byte snapshot."""
+        return Api._research_source_file_snapshot(path)['version']
+
+    def _research_source_version(self, records, registry_snapshot=None):
+        """Capture every builder/evidence source into one immutable byte snapshot."""
+        import yaml
+
+        from vcstudio.project.research_explorer import (
+            MAX_MANIFEST_BYTES,
+            MAX_MANIFEST_ENTRIES,
+            MAX_NESTING_DEPTH,
+            MAX_SOURCE_FILES,
+            MAX_SOURCE_TOTAL_BYTES,
+            ResearchIndexLimitError,
+            _bounded_payload_size,
+            authority_budget_failures,
+        )
+
+        registry_snapshot = registry_snapshot or {}
+        rows = copy.deepcopy(registry_snapshot.get('_source_rows') or [])
+        failures = []
+        authority = {
+            'files': dict(registry_snapshot.get('_source_files') or {}),
+            'manifests': {},
+            'member_files': {},
+            'actual_fetched': {},
+            'report_entries': {},
+            'adapter_mode': registry_snapshot.get('registry_state') == 'adapter',
+        }
+        if authority_budget_failures(records, registry_total=len(records)):
+            return rows, [{
+                'project_ref': 'registry', 'code': 'source_budget_unavailable',
+            }], authority
+        total_bytes = sum(
+            len(item.get('bytes') or b'') for item in authority['files'].values())
+        def capture(project_id, kind, path, *, required=False,
+                    member_key=None, relative=None):
+            nonlocal total_bytes
+            identity = self._workspace_path_key(path)
+            existing = authority['files'].get(identity)
+            try:
+                if len(rows) >= MAX_SOURCE_FILES:
+                    raise ValueError('source_file_limit_exceeded')
+                item = existing or self._research_source_file_snapshot(path)
+                if existing is None:
+                    if len(authority['files']) >= MAX_SOURCE_FILES:
+                        raise ValueError('source_file_limit_exceeded')
+                    total_bytes += len(item['bytes'])
+                    if total_bytes > MAX_SOURCE_TOTAL_BYTES:
+                        raise ValueError('source_byte_limit_exceeded')
+                    authority['files'][identity] = item
+                row = {
+                    'project_id': project_id, 'kind': kind,
+                    **item['version'], 'available': True,
+                }
+                rows.append(row)
+                if member_key is not None and relative is not None:
+                    authority['member_files'].setdefault(member_key, {})[
+                        relative] = item['bytes']
+                return item
+            except FileNotFoundError:
+                rows.append({
+                    'project_id': project_id, 'kind': kind,
+                    'device': None, 'inode': None, 'size': None,
+                    'mtime_ns': None, 'sha256': None, 'available': False,
+                })
+                if required:
+                    failures.append({
+                        'project_ref': project_id, 'code': 'required_source_missing'})
+            except ValueError as exc:
+                failures.append({
+                    'project_ref': project_id,
+                    'code': ('source_byte_limit_exceeded'
+                             if 'byte' in str(exc) else 'source_file_limit_exceeded'),
+                })
+            except OSError:
+                rows.append({
+                    'project_id': project_id, 'kind': kind,
+                    'device': None, 'inode': None, 'size': None,
+                    'mtime_ns': None, 'sha256': None, 'available': False,
+                })
+                failures.append({
+                    'project_ref': project_id,
+                    'code': 'source_changed_or_unavailable',
+                })
+            return None
+
+        def safe_relative(value):
+            text = str(value or '').replace('\\', '/')
+            parts = text.split('/')
+            if (not text or text.startswith('/') or re.match(r'^[A-Za-z]:', text)
+                    or any(part in {'', '.', '..'} for part in parts)
+                    or len(parts) > 32 or len(text.encode('utf-8')) > 4096):
+                return None
+            return parts
+
+        for record in records:
+            project_id = str(record.get('project_id') or '')
+            project = record.get('project') or {}
+            for member in self._project_member_dirs(project):
+                member_path = os.path.abspath(os.path.expanduser(str(member)))
+                member_key = self._workspace_path_key(member_path)
+                authority['member_files'].setdefault(member_key, {})
+                job_item = capture(
+                    project_id, 'job.yaml', os.path.join(member_path, 'job.yaml'),
+                    member_key=member_key, relative='job.yaml')
+                manifest_value = {}
+                if job_item is not None:
+                    try:
+                        if len(job_item['bytes']) > MAX_MANIFEST_BYTES:
+                            raise ResearchIndexLimitError(
+                                'manifest exceeds the byte limit')
+                        loaded = yaml.safe_load(job_item['bytes'].decode('utf-8'))
+                        if not isinstance(loaded, dict):
+                            raise ValueError('manifest is not an object')
+                        _bounded_payload_size(
+                            loaded, label='manifest', maximum=MAX_MANIFEST_BYTES,
+                            max_depth=MAX_NESTING_DEPTH,
+                            max_entries=MAX_MANIFEST_ENTRIES)
+                        manifest_value = loaded
+                    except ResearchIndexLimitError:
+                        failures.append({
+                            'project_ref': project_id,
+                            'code': 'manifest_limit_exceeded',
+                        })
+                    except Exception:                    # noqa: BLE001 corrupt manifest
+                        failures.append({
+                            'project_ref': project_id, 'code': 'manifest_corrupt'})
+                elif authority['adapter_mode']:
+                    try:
+                        loaded = self._manifest.load_manifest(member_path)
+                        if isinstance(loaded, dict):
+                            _bounded_payload_size(
+                                loaded, label='manifest', maximum=MAX_MANIFEST_BYTES,
+                                max_depth=MAX_NESTING_DEPTH,
+                                max_entries=MAX_MANIFEST_ENTRIES)
+                            manifest_value = copy.deepcopy(loaded)
+                            raw = yaml.safe_dump(
+                                manifest_value, allow_unicode=True,
+                                sort_keys=False).encode('utf-8')
+                            if len(raw) > MAX_MANIFEST_BYTES:
+                                raise ResearchIndexLimitError(
+                                    'manifest exceeds the byte limit')
+                            authority['member_files'][member_key]['job.yaml'] = raw
+                            rows.append({
+                                'project_id': project_id, 'kind': 'adapter_manifest',
+                                'device': None, 'inode': None, 'size': len(raw),
+                                'mtime_ns': None,
+                                'sha256': hashlib.sha256(raw).hexdigest(),
+                                'available': True,
+                            })
+                    except ResearchIndexLimitError:
+                        manifest_value = {}
+                        failures.append({
+                            'project_ref': project_id,
+                            'code': 'manifest_limit_exceeded',
+                        })
+                    except Exception:                    # noqa: BLE001 corrupt adapter
+                        manifest_value = {}
+                        failures.append({
+                            'project_ref': project_id, 'code': 'manifest_corrupt'})
+                authority['manifests'][member_key] = manifest_value
+                for name in (
+                        'INCAR', 'POSCAR', 'KPOINTS', 'POTCAR', 'CONTCAR',
+                        'OSZICAR', 'OUTCAR', 'vasprun.xml', 'validation.json',
+                        'validation.yaml'):
+                    capture(
+                        project_id, name, os.path.join(member_path, name),
+                        member_key=member_key, relative=name)
+                results = manifest_value.get('results') or {}
+                fetched = results.get('fetched_sha256') or {}
+                fetched = fetched if isinstance(fetched, dict) else {}
+                actual = {}
+                fetched_valid = bool(fetched)
+                for raw_name, raw_digest in fetched.items():
+                    parts = safe_relative(raw_name)
+                    expected = str(raw_digest or '').strip().lower()
+                    if parts is None or not re.fullmatch(r'[0-9a-f]{64}', expected):
+                        fetched_valid = False
+                        failures.append({
+                            'project_ref': project_id,
+                            'code': 'fetched_evidence_invalid',
+                        })
+                        continue
+                    relative = '/'.join(parts)
+                    item = capture(
+                        project_id, 'fetched_output',
+                        os.path.join(member_path, *parts), required=True,
+                        member_key=member_key, relative=relative)
+                    if item is None or item['version']['sha256'] != expected:
+                        fetched_valid = False
+                        failures.append({
+                            'project_ref': project_id,
+                            'code': 'fetched_evidence_mismatch',
+                        })
+                    else:
+                        actual[relative] = expected
+                job_id = str(
+                    manifest_value.get('job_id') or manifest_value.get('job_uuid') or '')
+                if job_id:
+                    authority['actual_fetched'].setdefault(project_id, {})[job_id] = (
+                        actual if fetched_valid else {})
+
+            revision_id = self._research_report_revision_id(project)
+            if revision_id:
+                project_root = os.path.abspath(os.path.expanduser(str(
+                    project.get('root') or os.path.dirname(
+                        str(record.get('path') or '')))))
+                history_path = os.path.join(
+                    project_root, '.vcstudio', 'reports', 'history.json')
+                history_item = capture(
+                    project_id, 'report_history', history_path, required=True)
+                if history_item is not None:
+                    try:
+                        history = json.loads(history_item['bytes'].decode('utf-8'))
+                        from vcstudio.project.report_service import _validate_history
+
+                        history = _validate_history(history, project_id)
+                        selected = []
+                        for lineage in (history.get('reports') or {}).values():
+                            for entry in lineage.get('revisions') or []:
+                                if str(entry.get('revision_id') or '') == revision_id:
+                                    selected.append((entry, lineage))
+                        if len(selected) != 1:
+                            raise ValueError('revision identity is not unique')
+                        entry, lineage = selected[0]
+                        authority['report_entries'][project_id] = {
+                            'entry': copy.deepcopy(entry),
+                            'lineage': copy.deepcopy(lineage),
+                            'history': history,
+                        }
+                        report_paths = [
+                            ('report_manifest', entry.get('manifest')),
+                            ('report_model', entry.get('model_file')),
+                            *[(f'report_contract_{key}', value)
+                              for key, value in (entry.get('contract_files') or {}).items()],
+                            *[(f'report_artifact_{key}', value)
+                              for key, value in (entry.get('files') or {}).items()],
+                        ]
+                        for kind, path in report_paths:
+                            if not path or not os.path.isabs(str(path)):
+                                raise ValueError('report source path is invalid')
+                            capture(project_id, kind, str(path), required=True)
+                        if self._research_frozen_snapshot_context(
+                                {'project_id': project_id, 'project': project},
+                                authority) is None:
+                            raise ValueError('report revision validation failed')
+                    except Exception:                    # noqa: BLE001 frozen report invalid
+                        failures.append({
+                            'project_ref': project_id,
+                            'code': 'report_revision_unavailable',
+                        })
+
+        rows.sort(key=lambda item: (
+            str(item.get('project_id') or ''), str(item.get('kind') or ''),
+            str(item.get('sha256') or ''), int(item.get('inode') or 0)))
+        counters = {}
+        for row in rows:
+            project_id = str(row.get('project_id') or '')
+            counters[project_id] = counters.get(project_id, 0) + 1
+            row['source_index'] = counters[project_id]
+        return rows, failures, authority
+
+    def _research_authority(self):
+        from vcstudio.project.research_explorer import MAX_PUBLIC_FAILURES
+
+        snapshot = self._research_registry_snapshot()
+        failures = copy.deepcopy(snapshot['failures'])
+        failures.extend({
+            'project_ref': f'ambiguous-project-{index}',
+            'code': 'duplicate_project_id',
+            'message': 'Registered project identity is ambiguous.',
+        } for index, _project_id in enumerate(
+            sorted(snapshot['duplicate_ids']), start=1))
+        records = [
+            record for record in snapshot['records']
+            if record['project_id'] not in snapshot['duplicate_ids']
+        ]
+        source_rows, source_failures, authority_snapshot = (
+            self._research_source_version(records, snapshot))
+        failures.extend(source_failures)
+        bounded = []
+        seen = set()
+        for item in failures:
+            key = (str(item.get('project_ref') or 'registry'),
+                   str(item.get('code') or 'unavailable'))
+            if key in seen:
+                continue
+            seen.add(key)
+            bounded.append(item)
+            if len(bounded) >= MAX_PUBLIC_FAILURES:
+                break
+        source_version = {
+            'registry_state': snapshot.get('registry_state') or 'unknown',
+            'files': source_rows,
+        }
+        return snapshot, records, bounded, source_version, authority_snapshot
+
+    @staticmethod
+    def _research_report_revision_id(project):
+        marker = project.get('autopilot_report') if isinstance(project, dict) else None
+        if not isinstance(marker, dict):
+            return ''
+        revision = marker.get('revision')
+        revision = revision if isinstance(revision, dict) else {}
+        return str(marker.get('revision_id') or revision.get('revision_id') or '').strip()
+
+    def _research_frozen_snapshot_context(self, target, authority):
+        """Revalidate one frozen report exclusively from captured immutable bytes."""
+        from vcstudio.project.report_contracts import (
+            ReportSnapshot,
+            ReportSpec,
+            ValidationResult,
+            validate_bindings,
+        )
+        from vcstudio.project.report_insights import FrozenRevision
+        from vcstudio.project.report_service import _validated_history_bundle
+
+        project_id = str(target.get('project_id') or '')
+        frozen = authority.get('report_entries', {}).get(project_id)
+        if not isinstance(frozen, dict):
+            return None
+        entry = copy.deepcopy(frozen.get('entry') or {})
+        lineage = copy.deepcopy(frozen.get('lineage') or {})
+        _validated_history_bundle(entry, lineage)
+        marker = (target.get('project') or {}).get('autopilot_report') or {}
+        marker_revision = marker.get('revision') or {}
+        if (str(marker.get('revision_id') or marker_revision.get('revision_id') or '')
+                != str(entry.get('revision_id') or '')):
+            raise RuntimeError('frozen report marker revision mismatch')
+
+        def captured(path):
+            item = authority.get('files', {}).get(self._workspace_path_key(path))
+            if not isinstance(item, dict):
+                raise RuntimeError('frozen report source was not captured')
+            return item['bytes']
+
+        def json_payload(path):
+            value = json.loads(captured(path).decode('utf-8'))
+            if not isinstance(value, dict):
+                raise RuntimeError('frozen report member must be an object')
+            return value
+
+        manifest_bytes = captured(entry['manifest'])
+        if hashlib.sha256(manifest_bytes).hexdigest() != str(entry['manifest_sha256']):
+            raise RuntimeError('frozen report manifest hash mismatch')
+        manifest = json.loads(manifest_bytes.decode('utf-8'))
+        if not isinstance(manifest, dict):
+            raise RuntimeError('frozen report manifest is invalid')
+        if (str(manifest.get('schema') or '') != 'vcstudio.paper-report.bundle/v2'
+                or str(manifest.get('artifact_status') or '') != 'complete'):
+            raise RuntimeError('frozen report manifest state is invalid')
+        kind = str(manifest.get('report_kind') or '').strip().lower()
+        qualification = str(
+            manifest.get('scientific_qualification') or '').strip().lower()
+        scientific_fingerprint = str(
+            manifest.get('input_fingerprint') or '').strip().lower()
+        report_model_sha256 = str(
+            manifest.get('report_model_sha256') or '').strip().lower()
+        if report_model_sha256 != str(entry.get('report_model_sha256') or '').lower():
+            raise RuntimeError('frozen report model revision binding mismatch')
+        revision_fields = (
+            'schema', 'report_id', 'revision_id', 'sequence',
+            'parent_manifest_sha256', 'spec_sha256', 'snapshot_sha256',
+            'validation_sha256', 'report_model_sha256', 'created_at_utc',
+        )
+        expected_revision = {
+            key: entry.get(key) for key in revision_fields}
+        if (manifest.get('revision') != expected_revision
+                or marker_revision != expected_revision):
+            raise RuntimeError('frozen report revision projection mismatch')
+        contracts = self._validated_report_contract_refs(
+            manifest.get('contracts'), kind, require_sidecars=True)
+        payloads = {}
+        file_hashes = {'manifest': hashlib.sha256(manifest_bytes).hexdigest()}
+        for key, record in contracts.items():
+            path = (entry.get('contract_files') or {}).get(key)
+            raw = captured(path)
+            digest = hashlib.sha256(raw).hexdigest()
+            if (os.path.basename(str(path)) != str(record.get('path') or '')
+                    or digest != str(record.get('file_sha256') or '')
+                    or len(raw) != record.get('size')):
+                raise RuntimeError('frozen report contract byte binding mismatch')
+            payload = json.loads(raw.decode('utf-8'))
+            if not isinstance(payload, dict):
+                raise RuntimeError('frozen report contract is invalid')
+            payloads[key] = payload
+            file_hashes[f'contract:{key}'] = digest
+        spec = ReportSpec.from_mapping(payloads['spec'])
+        snapshot = ReportSnapshot.from_mapping(payloads['snapshot'], spec=spec)
+        validation = ValidationResult.from_mapping(
+            payloads['validation'], spec=spec, snapshot=snapshot)
+        validate_bindings(spec, snapshot, validation)
+        semantics = {
+            'spec': spec.semantic_sha256,
+            'snapshot': snapshot.semantic_sha256,
+            'validation': validation.semantic_sha256,
+        }
+        for key, digest in semantics.items():
+            if (digest != contracts[key]['sha256']
+                    or digest != str(entry.get(f'{key}_sha256') or '')):
+                raise RuntimeError('frozen report semantic hash mismatch')
+        if (snapshot.input_fingerprint != scientific_fingerprint
+                or str(marker.get('scientific_fingerprint') or '').lower()
+                != scientific_fingerprint
+                or validation.effective_kind != kind
+                or validation.scientific_qualification != qualification
+                or validation.report_model_sha256 != report_model_sha256
+                or str(entry.get('scientific_status') or '') != kind
+                or str(entry.get('scientific_qualification') or '') != qualification):
+            raise RuntimeError('frozen report semantic binding mismatch')
+
+        model_bytes = captured(entry['model_file'])
+        model_digest = hashlib.sha256(model_bytes).hexdigest()
+        if (model_digest != str(manifest.get('model_sha256') or '').lower()
+                or os.path.basename(str(entry['model_file']))
+                != str((manifest.get('model_file') or {}).get('path') or '')
+                or len(model_bytes) != (manifest.get('model_file') or {}).get('size')):
+            raise RuntimeError('frozen report model binding mismatch')
+        model = json.loads(model_bytes.decode('utf-8'))
+        if not isinstance(model, dict):
+            raise RuntimeError('frozen report model is invalid')
+        canonical_model = json.dumps(
+            model, ensure_ascii=False, sort_keys=True,
+            separators=(',', ':'), allow_nan=False).encode('utf-8')
+        if canonical_model != model_bytes:
+            raise RuntimeError('frozen report model is not canonical')
+        file_hashes['model'] = model_digest
+
+        declared_files = manifest.get('files') or {}
+        entry_files = entry.get('files') or {}
+        if (set(declared_files) != set(entry_files)
+                or set(map(str, manifest.get('formats') or [])) != set(entry_files)):
+            raise RuntimeError('frozen report artifact set mismatch')
+        for key, path in entry_files.items():
+            raw = captured(path)
+            digest = hashlib.sha256(raw).hexdigest()
+            record = declared_files.get(key) or {}
+            if (os.path.basename(str(path)) != str(record.get('path') or '')
+                    or digest != str(record.get('sha256') or '').lower()
+                    or len(raw) != record.get('size')):
+                raise RuntimeError('frozen report artifact binding mismatch')
+            file_hashes[f'artifact:{key}'] = digest
+
+        bundle = FrozenRevision(
+            project_id=project_id,
+            revision_id=str(entry['revision_id']),
+            entry=entry,
+            manifest=manifest,
+            spec=payloads['spec'],
+            snapshot=payloads['snapshot'],
+            validation=payloads['validation'],
+            model=model,
+            file_hashes=file_hashes,
+        )
+        adsorption = ((bundle.snapshot.get('payload') or {})
+                      .get('adsorption_summary') or {})
+        graph = {
+            'ok': True,
+            'nodes': [{
+                'type': 'snapshot_record',
+                'record': {'pointer': 'snapshot:payload/adsorption_summary'},
+            }, *[{
+                'type': 'job', 'record': {'job_id': str(item.get('member_id') or '')},
+            } for item in adsorption.get('members') or [] if isinstance(item, dict)]],
+        }
+        return {'bundle': bundle, 'validation': validation, 'graph': graph}
+
+    def _research_frozen_context(self, target, cache, authority=None):
+        """Revalidate one current frozen revision and its separate evidence graph."""
+        project = target.get('project') or {}
+        record = target.get('record') or {}
+        revision_id = self._research_report_revision_id(project)
+        key = (str(record.get('path') or ''), revision_id)
+        if key in cache:
+            return cache[key]
+        cache[key] = None
+        if (not revision_id
+                or (authority is None
+                    and not self._report_marker_current(
+                        project, target.get('summary')))):
+            return None
+        try:
+            if authority is not None:
+                context = self._research_frozen_snapshot_context(target, authority)
+                if context is None:
+                    return None
+                validation = context['validation']
+                if (validation.status not in {'passed', 'passed_with_warnings'}
+                        or validation.scientific_qualification == 'diagnostic'):
+                    return None
+                cache[key] = context
+                return context
+            from vcstudio.project.report_contracts import (
+                ReportSnapshot,
+                ReportSpec,
+                ValidationResult,
+                validate_bindings,
+            )
+            from vcstudio.project.report_insights import (
+                evidence_graph,
+                load_frozen_revision,
+            )
+
+            reports = self._reports()
+            bundle = load_frozen_revision(reports, record['path'], revision_id)
+            spec = ReportSpec.from_mapping(bundle.spec)
+            snapshot = ReportSnapshot.from_mapping(bundle.snapshot, spec=spec)
+            validation = ValidationResult.from_mapping(
+                bundle.validation, spec=spec, snapshot=snapshot)
+            validate_bindings(spec, snapshot, validation)
+            if (validation.status not in {'passed', 'passed_with_warnings'}
+                    or validation.scientific_qualification == 'diagnostic'):
+                return None
+            graph = evidence_graph(reports, record['path'], revision_id)
+            if not isinstance(graph, dict) or graph.get('ok') is not True:
+                return None
+            cache[key] = {
+                'bundle': bundle,
+                'validation': validation,
+                'graph': graph,
+            }
+            return cache[key]
+        except Exception:                               # noqa: BLE001 fail closed
+            return None
+
+    @staticmethod
+    def _research_frozen_members(context):
+        summary = ((context['bundle'].snapshot.get('payload') or {})
+                   .get('adsorption_summary') or {})
+        members = {}
+        for item in summary.get('members') or []:
+            if isinstance(item, dict) and item.get('member_id'):
+                members[str(item['member_id'])] = item
+        return summary, members
+
+    @staticmethod
+    def _research_graph_job_ids(context):
+        return {
+            str((node.get('record') or {}).get('job_id') or '')
+            for node in context['graph'].get('nodes') or []
+            if isinstance(node, dict) and node.get('type') == 'job'
+        }
+
+    def _research_current_member_hashes(self, target, authority=None):
+        if authority is not None:
+            return copy.deepcopy(
+                (authority.get('actual_fetched') or {}).get(
+                    str(target.get('project_id') or ''), {}))
+        current = {}
+        for path in self._project_member_dirs(target.get('project') or {}):
+            manifest = self._manifest.load_manifest(path) or {}
+            job_id = self._workspace_job_id(path, manifest)
+            results = manifest.get('results') or {}
+            hashes = results.get('fetched_sha256') or {}
+            if not isinstance(hashes, dict) or not hashes:
+                current[job_id] = {}
+                continue
+            root = os.path.realpath(os.path.abspath(str(path)))
+            verified = {}
+            for name, expected in hashes.items():
+                filename = str(name or '').replace('\\', '/')
+                parts = filename.split('/')
+                digest = str(expected or '').lower()
+                if (not filename or any(part in {'', '.', '..'} for part in parts)
+                        or not re.fullmatch(r'[0-9a-f]{64}', digest)):
+                    verified = {}
+                    break
+                output = os.path.realpath(os.path.join(root, *parts))
+                try:
+                    if (os.path.commonpath((root, output)) != root
+                            or not os.path.isfile(output)
+                            or _sha256_file(output) != digest):
+                        verified = {}
+                        break
+                except (OSError, ValueError):
+                    verified = {}
+                    break
+                verified[filename] = digest
+            current[job_id] = verified
+        return current
+
+    def _research_validation_evidence(self, target, cache, authority=None):
+        context = self._research_frozen_context(target, cache, authority)
+        if context is None:
+            return {}
+        job_id = str(target.get('job_id') or '')
+        summary, members = self._research_frozen_members(context)
+        member = members.get(job_id) or {}
+        current_members = self._research_current_member_hashes(target, authority)
+        output_hash_bound = bool(members) and all(
+            bool(current_members.get(member_id))
+            and current_members[member_id] == (frozen.get('fetched_sha256') or {})
+            for member_id, frozen in members.items()
+        )
+        if (job_id not in self._research_graph_job_ids(context)
+                or not output_hash_bound):
+            return {}
+        current_row = target.get('summary_row') or {}
+        verified_quantities = {}
+        if current_row.get('delta_e') is not None:
+            frozen_row = next((
+                row for row in summary.get('rows') or []
+                if isinstance(row, dict)
+                and str(row.get('configuration_id') or row.get('job_id') or '')
+                == job_id
+            ), None)
+            if (not frozen_row or frozen_row.get('reference_valid') is not True
+                    or frozen_row.get('delta_e') != current_row.get('delta_e')):
+                return {}
+            verified_quantities['energy_eV'] = (
+                (target.get('quantity_sha256') or {}).get('energy_eV'))
+        else:
+            current_energy = (target.get('energy') or {}).get('energy_eV')
+            if (current_energy is not None
+                    and member.get('energy_e0_eV') == current_energy):
+                verified_quantities['energy_eV'] = (
+                    (target.get('quantity_sha256') or {}).get('energy_eV'))
+        if (target.get('barrier_eV') is not None
+                and 'barrier_eV' in member
+                and member.get('barrier_eV') == target.get('barrier_eV')):
+            verified_quantities['barrier_eV'] = (
+                (target.get('quantity_sha256') or {}).get('barrier_eV'))
+        verified_quantities = {
+            key: value for key, value in verified_quantities.items() if value
+        }
+        return {
+            'authority': 'validation_result',
+            'status': 'verified',
+            'hash_bound': True,
+            'current': True,
+            'output_hash_bound': True,
+            'job_id': job_id,
+            'source_id': str(target.get('source_id') or ''),
+            'reference_mode': summary.get('reference_mode'),
+            'verified_quantities': verified_quantities,
+        }
+
+    def _research_report_binding(self, target, cache, authority=None):
+        # Legacy report revisions freeze a report snapshot and a separate graph,
+        # but do not publish the exact analysis-binding envelope required by the
+        # live Research graph.  Do not infer ``reported_in`` from matching values,
+        # job labels, or current output hashes.  A future authoritative producer
+        # may supply vcstudio.frozen-analysis-binding/v1 through this resolver.
+        return {}
+
+    def _research_snapshot_loaders(self, records, authority, temp_root):
+        """Materialize immutable captured bytes and expose path-free builder seams."""
+        mirror_dirs = {}
+        original_dirs = {}
+        for index, member_key in enumerate(sorted(authority['member_files']), start=1):
+            basename = os.path.basename(member_key.rstrip('\\/')) or f'member-{index}'
+            safe_basename = re.sub(r'[^A-Za-z0-9_.-]+', '_', basename)[:64] or 'member'
+            mirror = os.path.join(temp_root, f'member-{index:05d}', safe_basename)
+            os.makedirs(mirror, exist_ok=True)
+            for relative, payload in authority['member_files'][member_key].items():
+                parts = str(relative).replace('\\', '/').split('/')
+                target = os.path.join(mirror, *parts)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with open(target, 'wb') as handle:
+                    handle.write(payload)
+            mirror_dirs[member_key] = mirror
+            original_dirs[self._workspace_path_key(mirror)] = member_key
+
+        def mapped_path(value):
+            if not value:
+                return value
+            return mirror_dirs.get(self._workspace_path_key(value), value)
+
+        def mirror_project(project):
+            value = copy.deepcopy(project)
+            members = value.get('members')
+            members = members if isinstance(members, dict) else {}
+            for key in ('clean_slab', 'gas_ref'):
+                members[key] = mapped_path(members.get(key))
+            for key in ('configs',):
+                members[key] = [mapped_path(item) for item in members.get(key) or []]
+            molecules = members.get('molecules')
+            if isinstance(molecules, dict):
+                members['molecules'] = {
+                    key: mapped_path(item) for key, item in molecules.items()}
+            elif isinstance(molecules, list):
+                members['molecules'] = [mapped_path(item) for item in molecules]
+            value['members'] = members
+            refs = value.get('species_ref_jobs')
+            if isinstance(refs, dict):
+                value['species_ref_jobs'] = {
+                    key: mapped_path(item) for key, item in refs.items()}
+            species = value.get('config_species')
+            if isinstance(species, dict):
+                value['config_species'] = {
+                    str(mapped_path(path)): item for path, item in species.items()}
+            launch = value.get('launch')
+            if isinstance(launch, dict):
+                launch['submitted_job_dirs'] = [
+                    mapped_path(item) for item in launch.get('submitted_job_dirs') or []]
+            value['root'] = temp_root
+            return value
+
+        project_by_identity = {id(record['project']): record for record in records}
+        summary_cache = {}
+
+        def manifest_loader(path):
+            return copy.deepcopy(
+                authority['manifests'].get(self._workspace_path_key(path)) or {})
+
+        def summary_loader(project):
+            record = project_by_identity.get(id(project))
+            if record is None:
+                raise RuntimeError('snapshot project identity is unavailable')
+            project_id = record['project_id']
+            if project_id in summary_cache:
+                return copy.deepcopy(summary_cache[project_id])
+            summary = self._adsorption.delta_e_rows(mirror_project(project))
+            if not isinstance(summary, dict):
+                raise RuntimeError('snapshot summary is unavailable')
+            summary = copy.deepcopy(summary)
+            for row in summary.get('rows') or []:
+                if not isinstance(row, dict):
+                    continue
+                raw_job = row.get('job') or row.get('path') or row.get('source_job')
+                original_key = None
+                if raw_job:
+                    raw_key = self._workspace_path_key(raw_job)
+                    original_key = original_dirs.get(raw_key, raw_key)
+                manifest_value = authority['manifests'].get(original_key or '') or {}
+                expected_id = str(
+                    manifest_value.get('job_id') or manifest_value.get('job_uuid') or '')
+                declared_id = str(
+                    row.get('configuration_id') or row.get('job_id') or '')
+                if expected_id and declared_id and expected_id != declared_id:
+                    raise RuntimeError('summary configuration identity mismatch')
+                if expected_id:
+                    row['configuration_id'] = expected_id
+                    row['job_id'] = expected_id
+                    row['job'] = next((
+                        path for path in self._project_member_dirs(project)
+                        if self._workspace_path_key(path) == original_key
+                    ), None)
+                reference_job = row.get('reference_job')
+                if reference_job:
+                    reference_key = self._workspace_path_key(reference_job)
+                    original_reference = original_dirs.get(reference_key, reference_key)
+                    row['reference_job'] = next((
+                        path for path in self._project_member_dirs(project)
+                        if self._workspace_path_key(path) == original_reference
+                    ), None)
+            summary_cache[project_id] = summary
+            return copy.deepcopy(summary)
+
+        def method_resolver(target):
+            member_key = self._workspace_path_key(target.get('path'))
+            mirror = mirror_dirs.get(member_key)
+            if not mirror:
+                return {
+                    'status': 'unverified', 'engine': 'unknown', 'schema': '',
+                    'missing': ['trusted snapshot member is unavailable'],
+                }
+            return self._analysis_workbench_method_evidence({
+                **target, 'path': mirror,
+                'manifest': copy.deepcopy(
+                    authority['manifests'].get(member_key) or {}),
+            })
+
+        return manifest_loader, summary_loader, method_resolver
+
+    def _research_prepare(self, *, force=False):
+        with self._research_index_lock:
+            service = self._research_index()
+            last = None
+            for attempt in range(3):
+                snapshot, records, failures, source_version, authority = (
+                    self._research_authority())
+                fingerprint = service.source_fingerprint(
+                    records, registry_total=snapshot['registered_total'],
+                    registry_failures=failures, source_version=source_version)
+                last = (snapshot, failures, fingerprint)
+                current = service.index_status()
+                needs_rebuild = (
+                    force or attempt > 0
+                    or current.get('status') in {'unavailable', 'stale'}
+                    or current.get('source_fingerprint') != fingerprint)
+                if not needs_rebuild:
+                    return service
+                frozen_cache = {}
+                with tempfile.TemporaryDirectory(
+                        prefix='vcstudio-research-snapshot-') as temp_root:
+                    manifest_loader, summary_loader, method_resolver = (
+                        self._research_snapshot_loaders(records, authority, temp_root))
+                    service.rebuild(
+                        records,
+                        manifest_loader=manifest_loader,
+                        summary_loader=summary_loader,
+                        job_id_resolver=self._workspace_job_id,
+                        method_resolver=method_resolver,
+                        validation_resolver=lambda target: (
+                            self._research_validation_evidence(
+                                target, frozen_cache, authority)),
+                        report_binding_resolver=lambda target: (
+                            self._research_report_binding(
+                                target, frozen_cache, authority)),
+                        registry_total=snapshot['registered_total'],
+                        registry_state=snapshot.get('registry_state') or 'unknown',
+                        registry_failures=failures,
+                        source_version=source_version,
+                    )
+                # Re-read registry + every current source after the build.  A
+                # just-published snapshot is never returned through the API if
+                # an equal-size/equal-mtime replacement or any TOCTOU occurred.
+                after, after_records, after_failures, after_version, _after_authority = (
+                    self._research_authority())
+                after_fingerprint = service.source_fingerprint(
+                    after_records, registry_total=after['registered_total'],
+                    registry_failures=after_failures, source_version=after_version)
+                last = (after, after_failures, after_fingerprint)
+                if (fingerprint == after_fingerprint
+                        and service.index_status().get('source_fingerprint') == fingerprint):
+                    return service
+                force = True
+            snapshot, failures, fingerprint = last
+            service.fail_closed(
+                source_fingerprint=fingerprint,
+                registry_total=snapshot['registered_total'],
+                registry_state=snapshot.get('registry_state') or 'unknown',
+                failures=[*failures, {
+                    'project_ref': 'registry',
+                    'code': 'source_changed_during_rebuild',
+                }],
+            )
+            return service
+
+    @classmethod
+    def _research_failure(cls, exc, *, schema='vcstudio.research-query/v1'):
+        return cls._analysis_workbench_public_value({
+            'ok': False, 'schema': schema, 'status': 'unavailable',
+            'error': str(exc),
+        })
+
+    def research_explorer_query(self, request=None):
+        try:
+            result = self._research_prepare().query(request)
+            return self._analysis_workbench_public_value(result)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return self._research_failure(exc)
+
+    def research_explorer_rebuild(self, request=None):
+        """Explicitly rebuild the derived index; never mutate scientific sources."""
+        try:
+            result = self._research_prepare(force=True).query(request)
+            result['rebuild'] = {
+                'performed': True, 'fact_source_changed': False,
+                'remote_side_effects': False,
+            }
+            return self._analysis_workbench_public_value(result)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return self._research_failure(exc)
+
+    def research_explorer_bootstrap(self):
+        try:
+            result = self._research_prepare().query()
+            result['saved_views'] = self._research_views().read()
+            result['contracts'] = {
+                'index_is_authority': False,
+                'scientific_values_server_finalized': True,
+                'default_method_compatible': True,
+                'live_graph_kind': 'live_derived',
+                'frozen_report_graph_separate': True,
+            }
+            return self._analysis_workbench_public_value(result)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return self._research_failure(exc)
+
+    def research_explorer_provenance(self, project_id, job_id=None, source_id=None):
+        try:
+            record = self._resolve_project_id(project_id)
+
+            def build():
+                return self._research_index().live_provenance(
+                    record['request_project_id'], job_id=job_id, source_id=source_id)
+
+            self._research_prepare()
+            result = self._call_with_project_bindings([record], build)
+            return self._analysis_workbench_public_value(result)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return self._research_failure(
+                exc, schema='vcstudio.live-provenance/v1')
+
+    def research_views_read(self):
+        try:
+            return self._analysis_workbench_public_value(self._research_views().read())
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return self._research_failure(
+                exc, schema='vcstudio.research-views/v1')
+
+    def research_view_save(self, view, authority_id, expected_revision):
+        try:
+            result = self._research_views().save(
+                view, authority_id=authority_id,
+                expected_revision=expected_revision)
+            return self._analysis_workbench_public_value(result)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return self._research_failure(
+                exc, schema='vcstudio.research-views/v1')
+
+    def research_view_delete(self, view_id, authority_id, expected_revision):
+        try:
+            result = self._research_views().delete(
+                view_id, authority_id=authority_id,
+                expected_revision=expected_revision)
+            return self._analysis_workbench_public_value(result)
+        except Exception as exc:                         # noqa: BLE001 public bridge
+            return self._research_failure(
+                exc, schema='vcstudio.research-views/v1')
+
     def _analysis_workbench_current_project(self, context):
         project = context['project']
         members = self._project_member_dirs(project)
@@ -8767,24 +10097,31 @@ class Api:
 
     @staticmethod
     def _analysis_workbench_method_evidence(target, source_snapshot=None):
-        """Require a complete, non-drifted method identity before parsing."""
+        """Dispatch to a versioned adapter and retain strict method authority."""
         from vcstudio.project.calculation_reuse import build_scientific_fingerprint
         from vcstudio.project import energy_gate
 
         manifest = target.get('manifest') or {}
         inputs = manifest.get('inputs') or {}
-        engine = str(inputs.get('engine') or 'vasp').strip().lower()
+        engine = str(inputs.get('engine') or 'unknown').strip().lower() or 'unknown'
         if engine != 'vasp':
-            method = inputs.get('method') or inputs.get('method_fingerprint')
-            if method:
-                return {'status': 'verified', 'engine': engine,
-                        'identity': copy.deepcopy(method), 'missing': []}
-            return {'status': 'unverified', 'engine': engine,
-                    'missing': ['non-VASP manifest lacks method identity']}
-        record = energy_gate.method_record(
-            target['path'], manifest, str(target.get('source_id') or 'job'),
-            source_snapshot=source_snapshot)
+            # inputs.method and inputs.method_fingerprint are user-editable
+            # descriptions, not independently reconstructed evidence.  Until
+            # an engine-specific adapter is registered, they cannot create a
+            # verified scientific cohort.
+            return {
+                'status': 'unverified', 'engine': engine, 'schema': '',
+                'fingerprint': {}, 'adapter': None,
+                'missing': [
+                    f'no versioned server method adapter is registered for {engine}'],
+            }
+        arguments = (
+            target['path'], manifest, str(target.get('source_id') or 'job'))
+        record = (energy_gate.method_record(*arguments, source_snapshot=source_snapshot)
+                  if source_snapshot is not None else
+                  energy_gate.method_record(*arguments))
         required = ('functional', 'dispersion', 'encut', 'spin',
+                    'u_values', 'u_by_element', 'element_order',
                     'kpoints_scheme', 'potcar_ids')
         missing = [key for key in required if not record['known'].get(key)]
         warnings = list(record.get('evidence_warnings') or [])
@@ -8854,9 +10191,21 @@ class Api:
                 if strict_integrity else []),
             'binding_issues': binding_issues,
         }
+        schema = 'vcstudio.method-fingerprint/vasp/v1'
+        u_by_element = record.get('u_by_element')
+        u_by_element = u_by_element if isinstance(u_by_element, dict) else {}
+        identity = copy.deepcopy(record.get('fingerprint') or {})
+        identity['element_order'] = [
+            str(element) for element in record.get('element_order') or []]
+        identity['u_by_element'] = copy.deepcopy(u_by_element)
         return {
             'status': 'verified' if not missing and not warnings else 'unverified',
-            'fingerprint': copy.deepcopy(record.get('fingerprint') or {}),
+            'engine': 'vasp', 'schema': schema,
+            'fingerprint': {
+                'schema': schema,
+                'identity': identity,
+            },
+            'adapter': 'vcstudio.energy_gate.method_record/vasp/v1',
             'missing': missing, 'warnings': warnings,
             'strict_authority': strict_authority,
         }

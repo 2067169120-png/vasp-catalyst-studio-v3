@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import os
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -77,6 +79,7 @@ def _workbench_api(tmp_path):
             },
             "rows": [{
                 "name": "demo_ads_Li2S8",
+                "configuration_id": "job-config",
                 "species": "Li2S8",
                 "job": config,
                 "state": "DONE",
@@ -87,6 +90,9 @@ def _workbench_api(tmp_path):
                 "dd_e": 0.0,
                 "reference_valid": True,
                 "reference_state": "DONE",
+                "reference_job": reference,
+                "reference_source": "OSZICAR:E0",
+                "method_check": {"status": "verified"},
                 "method_status": "verified",
                 "note": "",
             }],
@@ -97,18 +103,25 @@ def _workbench_api(tmp_path):
         clean: {
             "job_uuid": "job-clean",
             "state": "DONE",
+            "inputs": {"engine": "vasp", "formula": "Pt4S",
+                       "source_id": "source-clean", "sha256": {"POSCAR": "a" * 64}},
             "attempts": [{"n": 1, "attempt_token": "clean-a1"}],
             "results": {"energy_e0_eV": -100.0, "fetched_sha256": {"OUTCAR": "a" * 64}},
         },
         reference: {
             "job_uuid": "job-reference",
             "state": "DONE",
+            "inputs": {"engine": "vasp", "formula": "Li2S8",
+                       "source_id": "source-reference",
+                       "sha256": {"POSCAR": "b" * 64}},
             "attempts": [{"n": 1, "attempt_token": "ref-a1"}],
             "results": {"energy_e0_eV": -10.0, "fetched_sha256": {"OUTCAR": "b" * 64}},
         },
         config: {
             "job_uuid": "job-config",
             "state": "DONE",
+            "inputs": {"engine": "vasp", "formula": "Pt4SLi2S8",
+                       "source_id": "source-config", "sha256": {"POSCAR": "c" * 64}},
             "attempts": [{"n": 1, "attempt_token": "config-a1"}],
             "results": {"energy_e0_eV": -115.0, "fetched_sha256": {"OUTCAR": "c" * 64}},
         },
@@ -255,6 +268,104 @@ def test_workbench_final_request_is_gate_owned_and_publishes_bound_revision(tmp_
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["revision"] == published["revision"]
     assert manifest["report_model_sha256"] == preview["report_model_sha256"]
+
+
+def test_research_live_report_edge_requires_revalidated_frozen_analysis_binding(tmp_path):
+    api, project_path, state, manifests = _workbench_api(tmp_path)
+    output_payloads = {}
+    for path, manifest in manifests.items():
+        payload = f"current output for {manifest['job_uuid']}\n".encode()
+        output_payloads[path] = payload
+        (Path(path) / "OUTCAR").write_bytes(payload)
+        manifest["results"]["fetched_sha256"] = {
+            "OUTCAR": hashlib.sha256(payload).hexdigest(),
+        }
+    project_id = _project_id(api, project_path)
+    api._analysis_workbench_method_evidence = lambda _target: {
+        "status": "verified", "engine": "vasp",
+        "schema": "vcstudio.method-fingerprint/vasp/v1",
+        "fingerprint": {"functional": "PBE", "dispersion": "D3"},
+        "missing": [],
+    }
+    boot = api.report_workbench_bootstrap(project_id, "diagnostic-repair")
+    preview = api.report_workbench_preview(
+        project_id,
+        _html_request(boot["project_id"], requested_kind="final"),
+    )
+    published = _publish(api, project_path, tmp_path / "published", preview)
+    assert published["ok"] is True
+
+    research = api.research_explorer_rebuild({"limit": 200})
+    config = next(
+        row for row in research["table"]["rows"] if row["job_id"] == "job-config")
+    graph = api.research_explorer_provenance(
+        project_id, config["job_id"], config["source_id"])
+
+    assert config["evidence_level"] == "verified"
+    assert not any(edge["type"] == "reported_in" for edge in graph["edges"])
+    report = next(node for node in graph["nodes"] if node["type"] == "report")
+    assert report["origin_status"] == "missing"
+    assert report["record"]["revision_id"] is None
+    assert report["record"]["binding_status"] == "unverified"
+
+    history = json.loads((tmp_path / ".vcstudio" / "reports" / "history.json")
+                         .read_text(encoding="utf-8"))
+    revision_entry = next(
+        entry for lineage in history["reports"].values()
+        for entry in lineage["revisions"]
+        if entry["revision_id"] == published["revision"]["revision_id"])
+    frozen_snapshot = Path(revision_entry["contract_files"]["snapshot"])
+    frozen_bytes = frozen_snapshot.read_bytes()
+    frozen_stat = frozen_snapshot.stat()
+    frozen_snapshot.write_bytes(frozen_bytes + b" ")
+    os.utime(
+        frozen_snapshot,
+        ns=(frozen_stat.st_atime_ns, frozen_stat.st_mtime_ns))
+    damaged = api.research_explorer_query({"limit": 200})
+    assert damaged["ok"] is False
+    assert damaged["status"] in {"partial", "unavailable"}
+    assert damaged["table"]["rows"] == []
+    frozen_snapshot.write_bytes(frozen_bytes)
+    os.utime(
+        frozen_snapshot,
+        ns=(frozen_stat.st_atime_ns, frozen_stat.st_mtime_ns))
+
+    config_path = state["project"]["members"]["configs"][0]
+    manifests[config_path]["results"]["barrier_eV"] = 0.72
+    mixed = api.research_explorer_rebuild({"limit": 200})
+    mixed_config = next(
+        row for row in mixed["table"]["rows"] if row["job_id"] == "job-config")
+    assert mixed_config["evidence_level"] == "unverified"
+    assert mixed_config["quantity_evidence"] == {
+        "energy_eV": "verified", "barrier_eV": "unverified"}
+    quantity_graph = api.research_explorer_provenance(
+        project_id, config["job_id"], config["source_id"])
+    reported = [edge for edge in quantity_graph["edges"]
+                if edge["type"] == "reported_in"]
+    assert reported == []
+    barrier = next(
+        node for node in quantity_graph["nodes"]
+        if node["id"] == "analysis:job-config:barrier_eV")
+    assert barrier["record"]["evidence_level"] == "unverified"
+    assert any(item["from"] == "analysis:job-config:barrier_eV"
+               for item in quantity_graph["missing"])
+
+    (Path(config_path) / "OUTCAR").write_bytes(b"tampered output\n")
+    stale_output = api.research_explorer_provenance(
+        project_id, config["job_id"], config["source_id"])
+    assert stale_output["ok"] is False
+    assert stale_output["status"] in {"partial", "unavailable"}
+    assert not any(edge["type"] == "reported_in" for edge in stale_output["edges"])
+    assert stale_output["nodes"] == []
+
+    (Path(config_path) / "OUTCAR").write_bytes(output_payloads[config_path])
+    state["project"]["autopilot_report"]["revision"]["revision_id"] = "not-real"
+    unbound = api.research_explorer_provenance(
+        project_id, config["job_id"], config["source_id"])
+    assert unbound["ok"] is False
+    assert unbound["status"] in {"partial", "unavailable"}
+    assert not any(edge["type"] == "reported_in" for edge in unbound["edges"])
+    assert unbound["nodes"] == []
 
 
 def test_workbench_publish_rejects_source_change_after_preview(tmp_path):
@@ -492,6 +603,7 @@ def test_scoped_workbench_marker_replays_frozen_scope_for_current_status(tmp_pat
     }
     state["summary"]["rows"].append({
         "name": "demo_ads_Li2S6",
+        "configuration_id": "job-config-second",
         "species": "Li2S6",
         "job": second,
         "state": "DONE",

@@ -38,6 +38,9 @@ _FORMULA_RE = re.compile(
     r"(?<![A-Za-z0-9])(Li2S(?:\d+)?|LiS\d+|S\d+)(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
+_OPAQUE_CONFIGURATION_ID_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$"
+)
 
 
 def _finite(value) -> float | None:
@@ -90,10 +93,21 @@ def stable_species_rows(summary: dict, *, deadband_eV: float = 0.15) -> list[dic
                                     or raw.get("name"))
         if not species:
             continue
+        raw_identity = str(
+            raw.get("configuration_id") or raw.get("job_id") or ""
+        ).strip()
+        configuration_id = (
+            raw_identity
+            if _OPAQUE_CONFIGURATION_ID_RE.fullmatch(raw_identity)
+            else ""
+        )
         row = {
             "species": species,
             "name": str(raw.get("name") or ""),
-            "job": str(raw.get("job") or raw.get("path") or ""),
+            # Historical consumers call this field ``job``.  It is an opaque
+            # configuration identity only; filesystem locators are never
+            # projected into the comparison snapshot.
+            "job": configuration_id,
             "delta_e": value,
             "state": str(raw.get("state") or ""),
             "method_status": str((raw.get("method_check") or {}).get("status") or

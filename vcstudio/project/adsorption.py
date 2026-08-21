@@ -1757,6 +1757,9 @@ def delta_e_rows(project: dict) -> dict:
     for cdir in (members.get('configs') or []):
         name = os.path.basename(os.path.normpath(cdir))
         st, e_cfg, config_error = _member_info(cdir, f'吸附构型 {name}')
+        config_manifest = manifest_mod.load_manifest(cdir) or {}
+        configuration_id = str(
+            config_manifest.get('job_id') or config_manifest.get('job_uuid') or '').strip()
         delta, note = None, ''
         sp_ref = None
         sp = None
@@ -1842,7 +1845,9 @@ def delta_e_rows(project: dict) -> dict:
                     note = '未设气相参考:此值为 E(slab+ads)−E(slab)'
         else:
             note = '；'.join(blockers)
-        rows.append({'name': name, 'state': st, 'e_config': e_cfg,
+        rows.append({'name': name,
+                     'configuration_id': configuration_id or None,
+                     'state': st, 'e_config': e_cfg,
                      'delta_e': delta, 'note': note, 'species': row_species,
                      'reference_species': sp if reference_mode == 'species' else None,
                      'e_ref': actual_ref_energy,

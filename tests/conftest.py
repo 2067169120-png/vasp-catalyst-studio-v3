@@ -18,6 +18,7 @@ _USER_CONFIG_DIR_SEAMS = (
     'vcstudio.cluster.ledger',      # default_ledger_path() → jobs.json
     'vcstudio.cluster.profiles',    # default_clusters_path() → clusters.yaml
     'vcstudio.cluster.ssh_test',    # default_known_hosts_path() → known_hosts
+    'vcstudio.project.research_views',  # default_views_path() → research-views.json
 )
 
 
