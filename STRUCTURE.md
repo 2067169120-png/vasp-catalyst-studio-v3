@@ -11,15 +11,14 @@
 |---|---|
 | `vcstudio/` | 主 Python 包；计算准备、集群、项目、分析、报告与 GUI 适配都在此处 |
 | `tests/` | 跨模块 pytest 行为、合同、跨平台与前端资产测试；不承诺与包目录一一对应 |
-| `docs/` | 当前协议/指南、`planning/` 历史快照、`research/` 调研与 `superpowers/` 设计记录 |
+| `docs/` | 当前协议/指南、`planning/` 历史快照、`research/` 调研、`archive/` 历史过程材料与 `superpowers/` 设计记录 |
 | `paper/` | 软件论文草稿与参考文献；真实 benchmark/作者信息未补齐前不是投稿成稿 |
 | `examples/` | 可复现示例、配置和辅助演示脚本 |
-| `packaging/` | PyInstaller 打包和 release 辅助逻辑；默认 Web，`--legacy` 构建 Tk 版 |
-| `tools/` | 独立维护/转换/审计脚本，不是运行时业务事实源 |
+| `packaging/` | PyInstaller 打包和 release 辅助逻辑；`windows/build-exe.cmd` 是本地一键入口 |
+| `tools/` | 独立维护/转换/审计脚本；`windows/clean-generated.cmd` 只清可再生缓存 |
 | `results/` | 默认作业/项目输出根；计算结果通常被 gitignore |
 | `dist/` | 本地打包产物（gitignore，可能尚未存在） |
 | `tmp/` | 本地临时/QA 文件（gitignore，不得作为发布证据） |
-| `_待处理归档/` | 历史过程材料；不描述当前 V4 行为 |
 
 缓存目录（如 `__pycache__/`、`.pytest_cache/`、`.ruff_cache/`）是本地生成物，
 不属于源码结构或发布产物。
@@ -35,8 +34,10 @@
 | `CITATION.cff` | 引用元数据；`date-released` 只在真实 release 日期已知时填写 |
 | `pyproject.toml` | 包元数据、依赖、测试/lint 配置和 CLI 入口 |
 | `config.example.yaml` | 配置模板；真实凭据、内网地址和用户配置不入库 |
-| `重新打包EXE.bat` | Windows 一键打包入口 |
-| `清理临时文件.bat` | Windows 本地缓存清理辅助入口 |
+
+Windows 辅助入口已归位到职责目录：打包使用
+`packaging/windows/build-exe.cmd`，清理可再生缓存使用
+`tools/windows/clean-generated.cmd`。根目录不再放置平台专用脚本。
 
 ## `vcstudio/` 包
 

@@ -72,6 +72,17 @@ and both locales. The PyInstaller `--full` one-file EXE built from cross-platfor
 process, the 6/6 `full` checks and all 10/10 `journey` phases exited 0 with zero network attempts and
 zero cluster operations.
 
+同日完成仓库布局收口：原根目录 `_待处理归档/` 迁入 `docs/archive/legacy-process/`，Windows
+打包与清理入口分别归入 `packaging/windows/` 和 `tools/windows/`；根目录只保留标准项目入口。
+新增布局合同测试，防止平台脚本重新散落到根目录，并锁定清理入口不得删除 `dist/` 发布产物或
+`results/` 研究输出。本地生成目录统一由 `.gitignore` 管理，不进入版本库。
+
+The same-day repository-layout cleanup moved legacy process material under
+`docs/archive/legacy-process/` and placed Windows packaging/cleanup entry points under their owning
+`packaging/windows/` and `tools/windows/` directories. A repository-layout contract now prevents
+platform scripts from drifting back to the root and ensures generated cleanup preserves both `dist/`
+artifacts and `results/` research outputs.
+
 ### 报告、状态与项目工作区（Phase A–B）
 - 建立报告与状态合同，明确稳定项目身份、服务端快照、门禁结论、产物状态和 revision
   之间的绑定关系；未通过门禁或缺少证据时保留诊断状态，不冒充最终发布结果。
