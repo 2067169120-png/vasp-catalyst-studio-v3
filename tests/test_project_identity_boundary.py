@@ -4,6 +4,8 @@ import json
 from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 
+import yaml
+
 from vcstudio.gui_web.api import Api
 
 
@@ -16,6 +18,13 @@ def _manifest(state="DONE"):
         "inputs": {"engine": "vasp"},
         "results": {},
     }
+
+
+def _write_job_manifest(member, value):
+    Path(member, "job.yaml").write_text(
+        yaml.safe_dump(value, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
 
 
 def _api(tmp_path, *, duplicate=False):
@@ -44,6 +53,7 @@ def _api(tmp_path, *, duplicate=False):
         locators.append(locator)
         projects[locator] = project
         manifests[member] = _manifest()
+        _write_job_manifest(member, manifests[member])
 
     def load_project(path):
         wanted = str(Path(path).resolve())
@@ -128,6 +138,14 @@ def _assert_no_registered_locator(value, locators, *, forbid_project_keys=True):
     visit(value)
 
 
+def _notebook_guard(view):
+    return {
+        "revision": view["revision"],
+        "head_digest": view["head_digest"],
+        "project_identity_digest": view["project_identity_digest"],
+    }
+
+
 def test_four_public_project_dtos_are_recursively_locator_free(tmp_path):
     api, locators, _projects = _api(tmp_path)
 
@@ -170,6 +188,9 @@ def test_all_public_project_bridges_reject_raw_absolute_locator(tmp_path):
         lambda: api.proj_batch_report(
             [raw, raw + ".other"], str(tmp_path / "batch")),
         lambda: api.proj_compare_figures([raw, raw + ".other"]),
+        lambda: api.research_notebook_bootstrap(raw),
+        lambda: api.research_notebook_append(raw, {}, 0),
+        lambda: api.research_notebook_tombstone(raw, "rn-x", "reason", {}, 0),
     ]
 
     for invoke in calls:
@@ -177,6 +198,204 @@ def test_all_public_project_bridges_reject_raw_absolute_locator(tmp_path):
         assert result["ok"] is False
         _assert_no_registered_locator(
             result, locators, forbid_project_keys=False)
+
+
+def test_research_notebook_api_uses_opaque_project_identity_revision_cas_and_safe_dto(
+    tmp_path,
+):
+    api, locators, _projects = _api(tmp_path)
+    project_id = api.proj_list()["projects"][0]["project_id"]
+    actor = {"id": "reviewer-a", "display_name": "Reviewer A", "role": "PI"}
+
+    empty = api.research_notebook_bootstrap(project_id)
+    assert empty["ok"] is True
+    assert empty["revision"] == 0
+    created = api.research_notebook_append(project_id, {
+        "record_type": "note",
+        "category": "observation",
+        "body": r"Observed under C:\private\project\OUTCAR",
+        "actor": actor,
+        "links": [{"kind": "project", "id": project_id}],
+    }, _notebook_guard(empty), "notebook-operation.identity-boundary-create")
+
+    assert created["ok"] is True
+    assert created["revision"] == 1
+    assert created["records"][0]["body"] == "Observed under <local-path>"
+    assert created["records"][0]["links"][0]["status"] == "current"
+    _assert_no_registered_locator(created, locators, forbid_project_keys=False)
+
+    conflict = api.research_notebook_append(project_id, {
+        "record_type": "decision", "category": "decision", "body": "Keep baseline",
+        "actor": actor,
+    }, _notebook_guard(empty), "notebook-operation.identity-boundary-conflict")
+    assert conflict["ok"] is False
+    assert conflict["error_code"] == "revision_conflict"
+    assert conflict["revision"] == 1
+
+
+def test_research_notebook_api_rejects_actor_spoof_and_gate_fields(tmp_path):
+    api, locators, _projects = _api(tmp_path)
+    project_id = api.proj_list()["projects"][0]["project_id"]
+    empty = api.research_notebook_bootstrap(project_id)
+    spoofed = api.research_notebook_append(project_id, {
+        "record_type": "review", "category": "review", "body": "Approved",
+        "actor": {
+            "id": "assistant", "display_name": "Assistant", "role": "reviewer",
+            "reviewer_type": "human",
+        },
+        "review": {"decision": "approved", "local_human_attestation": True},
+    }, _notebook_guard(empty), "notebook-operation.actor-spoof")
+    gate_spoof = api.research_notebook_append(project_id, {
+        "record_type": "note", "category": "observation", "body": "Claim",
+        "actor": {"id": "alice", "display_name": "Alice", "role": "reviewer"},
+        "scientific_qualification": "human_scientific_reviewed",
+    }, _notebook_guard(empty), "notebook-operation.gate-spoof")
+
+    assert spoofed["ok"] is False
+    assert "server-controlled" in spoofed["error"]
+    assert gate_spoof["ok"] is False
+    assert "unsupported fields" in gate_spoof["error"]
+    for payload in (spoofed, gate_spoof):
+        _assert_no_registered_locator(payload, locators, forbid_project_keys=False)
+
+
+def test_research_notebook_attachment_picker_returns_only_opaque_selection(tmp_path):
+    api, locators, _projects = _api(tmp_path)
+    project_id = api.proj_list()["projects"][0]["project_id"]
+    empty = api.research_notebook_bootstrap(project_id)
+    attachment = tmp_path / "private-evidence.txt"
+    attachment.write_text("evidence", encoding="utf-8")
+    api._dialog_fn = lambda kind: [str(attachment)] if kind == "files" else None
+
+    selected = api.research_notebook_pick_attachments(
+        project_id, _notebook_guard(empty))
+
+    assert selected["ok"] is True
+    assert selected["selection_token"].startswith("notebook-attachment.")
+    assert selected["files"] == [{
+        "name": "private-evidence.txt",
+        "size": len(b"evidence"),
+        "sha256": __import__("hashlib").sha256(b"evidence").hexdigest(),
+        "media_type": "text/plain",
+    }]
+    _assert_no_registered_locator(selected, locators, forbid_project_keys=False)
+    assert str(attachment) not in json.dumps(selected)
+
+
+def test_notebook_job_evidence_binds_complete_authoritative_manifest_and_aba(tmp_path):
+    api, locators, projects = _api(tmp_path)
+    project_id = api.proj_list()["projects"][0]["project_id"]
+    record = api._report_workbench_project_record(project_id)
+    member = projects[locators[0]]["members"]["clean_slab"]
+    current = {
+        **_manifest(),
+        "scheduler_job_id": "101",
+        "cluster": "cluster-opaque-a",
+        "attempts": [{
+            "n": 1, "action": "submit", "job_id": "101",
+            "operation_transaction_id": "txn-a",
+            "idempotency_key": "operation-a",
+        }],
+        "state_history": [
+            {"state": "SUBMITTED", "at": "2026-08-20T00:00:00+00:00"},
+            {"state": "DONE", "at": "2026-08-20T01:00:00+00:00"},
+        ],
+        "remote_dir": r"C:\private\generation-101",
+    }
+    _write_job_manifest(member, current)
+    resolver = api._research_notebook_evidence_resolver(record)
+    link = {"kind": "job", "id": "job-a", "report_revision_id": None}
+
+    first = resolver(link)
+    current["remote_dir"] = r"C:\private\generation-101-moved"
+    _write_job_manifest(member, current)
+    assert resolver(link)["digest"] == first["digest"]
+    current["scheduler_job_id"] = "202"
+    current["attempts"].append({
+        "n": 2, "action": "contcar_restart", "prev_job_id": "101",
+        "job_id": "202", "operation_transaction_id": "txn-b",
+        "idempotency_key": "operation-b",
+    })
+    current["state_history"].extend([
+        {"state": "FAILED", "at": "2026-08-20T02:00:00+00:00"},
+        {"state": "DONE", "at": "2026-08-20T03:00:00+00:00"},
+    ])
+    _write_job_manifest(member, current)
+    restarted = resolver(link)
+    assert restarted["status"] == "current"
+    assert restarted["digest"] != first["digest"]
+
+    Path(member, "job.yaml").unlink()
+    assert resolver(link)["status"] == "missing"
+    Path(member, "job.yaml").write_text("not: [valid", encoding="utf-8")
+    assert resolver(link)["status"] == "missing"
+
+
+def test_notebook_archive_marks_job_link_stale_after_scheduler_aba(tmp_path):
+    api, locators, projects = _api(tmp_path)
+    project_id = api.proj_list()["projects"][0]["project_id"]
+    member = projects[locators[0]]["members"]["clean_slab"]
+    manifest = {
+        **_manifest(),
+        "scheduler_job_id": "101",
+        "cluster": "cluster-opaque-a",
+        "attempts": [{"n": 1, "action": "submit", "job_id": "101"}],
+        "state_history": [
+            {"state": "DONE", "at": "2026-08-20T01:00:00+00:00"},
+        ],
+    }
+    _write_job_manifest(member, manifest)
+    empty = api.research_notebook_bootstrap(project_id)
+    created = api.research_notebook_append(project_id, {
+        "record_type": "note", "category": "observation",
+        "body": "job generation evidence",
+        "actor": {"id": "alice", "display_name": "Alice", "role": "PI"},
+        "links": [{"kind": "job", "id": "job-a"}],
+    }, _notebook_guard(empty), "notebook-operation.job-generation")
+    assert created["records"][0]["links"][0]["status"] == "current"
+
+    manifest["scheduler_job_id"] = "202"
+    manifest["attempts"].append({
+        "n": 2, "action": "contcar_restart", "prev_job_id": "101",
+        "job_id": "202", "operation_transaction_id": "txn-b",
+        "idempotency_key": "operation-b",
+    })
+    manifest["state_history"].extend([
+        {"state": "FAILED", "at": "2026-08-20T02:00:00+00:00"},
+        {"state": "DONE", "at": "2026-08-20T03:00:00+00:00"},
+    ])
+    _write_job_manifest(member, manifest)
+    archive = api._research_notebook_archive_payload(
+        locators[0], project_id, "report-r0001")
+    assert archive["records"][0]["links"][0]["status"] == "stale"
+    assert archive["records"][0]["links"][0]["current_digest"] \
+        != archive["records"][0]["links"][0]["bound_digest"]
+
+
+def test_append_uses_a_fresh_evidence_resolver_for_returned_view(tmp_path):
+    api, _locators, _projects = _api(tmp_path)
+    project_id = api.proj_list()["projects"][0]["project_id"]
+    empty = api.research_notebook_bootstrap(project_id)
+    factories = 0
+
+    def resolver_factory(_record):
+        nonlocal factories
+        factories += 1
+        digest = ("1" if factories == 1 else "2") * 64
+        return lambda _link: {
+            "status": "current", "digest": digest,
+            "route": {"id": "project-overview", "project_id": project_id},
+        }
+
+    api._research_notebook_evidence_resolver = resolver_factory
+    created = api.research_notebook_append(project_id, {
+        "record_type": "note", "category": "observation", "body": "fresh",
+        "actor": {"id": "alice", "display_name": "Alice", "role": "PI"},
+        "links": [{"kind": "project", "id": project_id}],
+    }, _notebook_guard(empty), "notebook-operation.fresh-resolver")
+
+    assert factories == 2
+    assert created["records"][0]["links"][0]["status"] == "stale"
 
 
 def test_unknown_and_duplicate_project_ids_fail_closed(tmp_path):

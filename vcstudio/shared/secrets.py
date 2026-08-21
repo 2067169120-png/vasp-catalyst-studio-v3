@@ -5,6 +5,15 @@ keyring 不可用(未装/无后端)时全部安全降级:set 返回 False、get 
 """
 from __future__ import annotations
 
+from typing import Any
+
+from vcstudio.shared.credential_classifier import (
+    classify_credential as _classify_credential,
+    classify_credential_structure as _classify_credential_structure,
+    redact_credential_structure as _redact_credential_structure,
+    redact_credentials as _redact_credentials,
+)
+
 try:
     import keyring  # type: ignore
 except Exception:  # pragma: no cover - 环境相关
@@ -12,6 +21,37 @@ except Exception:  # pragma: no cover - 环境相关
 
 SERVICE = 'vcstudio-cluster'
 EXTERNAL_REFERENCE_SERVICE = 'vcstudio-external-reference'
+
+
+def classify_credential(text: str, *, include_field_names: bool = False) -> str | None:
+    """Compatibility adapter for the project-wide credential classifier."""
+
+    return _classify_credential(text, include_field_names=include_field_names)
+
+
+def contains_credential(text: str, *, include_field_names: bool = False) -> bool:
+    """Whether *text* contains credential-shaped material."""
+
+    return classify_credential(text, include_field_names=include_field_names) is not None
+
+
+def redact_credentials(text: str, *, replacement: str = '[redacted-secret]') -> str:
+    """Compatibility adapter for central credential redaction."""
+
+    return _redact_credentials(text, replacement=replacement)
+
+
+def classify_credential_structure(value: Any) -> str | None:
+    """Compatibility adapter for central structured classification."""
+
+    return _classify_credential_structure(value)
+
+
+def redact_credential_structure(value: Any, *,
+                                replacement: str = '[redacted-secret]') -> Any:
+    """Compatibility adapter for central structured redaction."""
+
+    return _redact_credential_structure(value, replacement=replacement)
 
 
 def available() -> bool:

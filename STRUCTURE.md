@@ -45,7 +45,7 @@
 | `generate/` | VASP 四件套、任务目录和派生输入；用户 INCAR 键不被静默覆盖 |
 | `engines/` | VASP、CP2K、Gaussian、CASTEP 的引擎合同；能力深度不对称 |
 | `cluster/` | SSH/PBS/Slurm、提交、监控、失败分类、有界恢复和本地运行器 |
-| `project/` | 项目事实、吸附能/自由能、分析视图、报告合同、revision/manifest 与偏好 |
+| `project/` | 项目事实、吸附能/自由能、分析视图、Research Notebook、报告合同、revision/manifest 与偏好 |
 | `campaign/` | 文件式 campaign task DAG、模板、三态验证门与审计账本 |
 | `molbuild/` | 分子/结构构建和受限转换适配 |
 | `external/` | 可选外部软件与渲染适配（Origin、POV-Ray、Multiwfn、VMD、LLM 等） |

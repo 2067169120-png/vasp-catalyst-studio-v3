@@ -111,6 +111,17 @@ Project lifecycle identity rules are explicit:
 
 All three flows use a server-selected source/destination and a dry-run preflight. No copy, move, or registry write occurs before explicit confirmation. Apply rechecks whether the project, registry, or ledger changed after preflight, and never overwrites an existing destination. Registry or ledger failure rolls back files, `project.yaml`, and registration projections. If the filesystem prevents complete rollback, the UI reports partial rollback and retains recovery evidence instead of reporting false success. Clone, Move, and Adopt also publish their lifecycle to the shared Operation Queue.
 
+Project also provides a **Research Notebook + Human Review Ledger**:
+
+- Notes are categorized as problems, hypotheses, observations, interpretations, limitations, or next steps; decisions and human reviews are separate records.
+- Every save appends a journal revision under revision+head+project CAS. An external machine-local head/sequence anchor detects a missing, truncated, or rolled-back journal. An edit uses `supersedes`; deletion appends a tombstone and preserves history.
+- Links use opaque project/job/source/report-revision IDs. The server revalidates every link on read, displays current/stale/missing, and returns semantic navigation routes rather than filesystem paths. A missing or corrupt `job.yaml` is missing evidence, never a path-derived current fact.
+- Attachment bytes enter project-local content-addressed storage through the native picker. Browser DTOs expose only name, size, media type, and hash. Notebook, attachment, anchor, and lock paths reject symlinks, junctions, and reparse points; blob hashes are rechecked on read and archive.
+- A human locally enters their reviewer ID, display name, role, decision, requested changes, and optional signature attribution. This is self-attribution, not authentication or a cryptographic electronic signature.
+- An AI proposal cannot be recorded as human review. Notebook review never changes `ValidationResult`, claims, final status, campaign accepted status, or `human_scientific_reviewed`.
+
+Unsaved body text and attachment bytes never enter workspace localStorage. Resume Center stores only a safe marker containing the opaque project ID; it can return to the owning project but cannot reconstruct an unsaved body.
+
 ### Prepare structures and inputs
 
 Prepare includes:
@@ -233,7 +244,7 @@ Publish → Versions also provides:
 
 - **Scientific diff** — select two authoritative history revisions. The server revalidates each complete bundle and compares ReportSpec scope, snapshot/input hashes, validation checks/status, scientific qualification, table/model numbers, figures, and manifest/file hashes. A date difference alone is not a scientific difference;
 - **Evidence/Claim Graph** — derives conclusion, table, figure, check, source, job, and file-hash nodes/edges only from frozen model/spec/snapshot/validation/claim records. Missing links are explicit; mutable live files are not used to fill gaps, and local paths are not returned to the browser;
-- **SI capsule** — obtains a single-use opaque server token from the directory picker and writes a deterministic ZIP containing canonical input manifests, contracts, model/figure metadata, Methods, BibTeX, environment/version, validation records, a capsule manifest, and `SHA256SUMS`. Secrets, absolute paths, caches, and mutable live files are excluded. Destination tokens expire after 15 minutes, at most 64 pending tokens are retained, and an existing ZIP is never overwritten.
+- **SI capsule** — obtains a single-use opaque server token from the directory picker and writes a deterministic ZIP containing canonical input manifests, contracts, model/figure metadata, Methods, BibTeX, environment/version, validation records, a Research Notebook ledger/limitations snapshot, a capsule manifest, and `SHA256SUMS`. Secrets, absolute paths, attachment bodies, caches, and mutable live files are excluded. Destination tokens expire after 15 minutes, at most 64 pending tokens are retained, and an existing ZIP is never overwritten.
 
 These tools accept only the current opaque project ID and a revision ID. A stale or tampered bundle, wrong project, or missing evidence becomes stale/blocked/unavailable. A successfully written capsule proves the archive and checksums, not scientific validation; a diagnostic/blocked revision remains diagnostic/blocked rather than becoming final publication.
 
@@ -245,7 +256,7 @@ These tools accept only the current opaque project ID and a revision ID. A stale
 | DOCX | Language, Heading/Caption styles, repeating table headers, and image-description foundation; accessibility is conditional and still requires Word Accessibility Checker and human review |
 | PDF | Visual, searchable ReportLab output; untagged, no structure tree or image alt text, `tagged=false`, `pdf_ua=false`, accessibility status partial |
 
-The current PDF must never be described as PDF/UA or as an accessible replacement for HTML/DOCX. See [report-state-contract.md](report-state-contract.md).
+The current PDF must never be described as PDF/UA or as an accessible replacement for HTML/DOCX. See [report-state-contract.md](report-state-contract.md) and [research-notebook-contract.md](research-notebook-contract.md).
 
 ## 8. Network, privacy, and optional AI
 

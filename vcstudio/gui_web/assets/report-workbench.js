@@ -9,6 +9,9 @@
 
   const $ = id => document.getElementById(id);
   const PROJECT_ID_RE = /^[A-Za-z0-9._~-]{1,160}$/;
+  const CAPSULE_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
+  const SHA256_RE = /^[a-f0-9]{64}$/;
+  let capsuleNonce = 0;
   const FORMAT_ORDER = Object.freeze(['html', 'docx', 'pdf']);
   const STEP_ORDER = Object.freeze([
     'scope', 'audience', 'gates', 'outline', 'content', 'language', 'export',
@@ -57,6 +60,12 @@
     insightGraph: null,
     capsuleDestinationToken: '',
     capsuleDestinationName: '',
+    capsuleProjectId: '',
+    capsuleRevisionId: '',
+    capsuleOperationKey: '',
+    capsuleReceipt: null,
+    capsuleReceiptFingerprint: '',
+    capsuleGeneration: 0,
   };
 
   function plain(value) {
@@ -1056,41 +1065,301 @@
     } finally { State.insightBusy = false; renderInsightControls(); }
   }
 
+  function capsuleToken(value) {
+    const text = String(value || '').trim();
+    return CAPSULE_TOKEN_RE.test(text) ? text : '';
+  }
+
+  function capsuleDisplayName(value) {
+    const text = String(value || '').trim();
+    return text && text.length <= 160 && !/[\\/\r\n]/.test(text)
+      && !/^file:/i.test(text) ? text : 'selected directory';
+  }
+
+  function capsuleArchiveName(value) {
+    const text = String(value || '').trim();
+    return text && text.length <= 180 && text.toLowerCase().endsWith('.zip')
+      && text !== '.' && text !== '..' && !/[\\/\r\n]/.test(text)
+      && !/^file:/i.test(text) ? text : '';
+  }
+
+  function newCapsuleOperationKey() {
+    const cryptoApi = window.crypto;
+    if (cryptoApi && typeof cryptoApi.randomUUID === 'function') {
+      return `capsule-operation.${cryptoApi.randomUUID()}`;
+    }
+    capsuleNonce += 1;
+    return `capsule-operation.${Date.now().toString(36)}-${capsuleNonce.toString(36)}`;
+  }
+
+  function capsuleNotebookBinding(value) {
+    const notebook = plain(value);
+    const revision = notebook.ledger_revision;
+    const head = notebook.ledger_head_digest == null
+      ? null : String(notebook.ledger_head_digest);
+    const snapshot = String(notebook.snapshot_sha256 || '');
+    if (!Number.isInteger(revision) || revision < 0
+        || notebook.integrity_status !== 'current'
+        || !SHA256_RE.test(snapshot)
+        || (revision === 0 && head !== null)
+        || (revision > 0 && !SHA256_RE.test(String(head || '')))) return null;
+    return {
+      ledgerRevision: revision, ledgerHeadDigest: head,
+      snapshotSha256: snapshot, integrityStatus: 'current',
+    };
+  }
+
+  function capsuleRevisionBinding(value, projectId, revisionId) {
+    const revision = plain(value);
+    const sequence = revision.sequence;
+    if (safeId(revision.project_id) !== projectId
+        || capsuleToken(revision.revision_id) !== revisionId
+        || !capsuleToken(revision.report_id)
+        || !Number.isInteger(sequence) || sequence < 1
+        || !SHA256_RE.test(String(revision.manifest_sha256 || ''))) return null;
+    return {
+      projectId, revisionId, reportId: String(revision.report_id), sequence,
+      manifestSha256: String(revision.manifest_sha256),
+    };
+  }
+
+  function freezeCapsuleReceipt(result, context) {
+    if (!result || result.ok !== true
+        || !['awaiting_confirmation', 'complete'].includes(String(result.status || ''))
+        || safeId(result.project_id) !== context.projectId
+        || typeof result.replayed !== 'boolean') return null;
+    const revision = capsuleRevisionBinding(
+      result.revision, context.projectId, context.revisionId);
+    const notebook = capsuleNotebookBinding(result.notebook);
+    const archive = plain(result.archive);
+    const archiveName = capsuleArchiveName(archive.name);
+    const receiptId = capsuleToken(result.receipt_id);
+    const receiptToken = capsuleToken(result.receipt_token);
+    const destinationBinding = String(result.destination_binding_sha256 || '');
+    if (!revision || !notebook || !archiveName || !receiptId || !receiptToken
+        || !SHA256_RE.test(String(archive.sha256 || ''))
+        || !Number.isInteger(archive.size) || archive.size <= 0
+        || !Number.isInteger(archive.member_count) || archive.member_count <= 0
+        || !SHA256_RE.test(destinationBinding)
+        || typeof result.ttl_seconds !== 'number'
+        || !Number.isFinite(result.ttl_seconds) || result.ttl_seconds <= 0) return null;
+    return Object.freeze({
+      receiptId, receiptToken, destinationBinding,
+      archiveName, archiveSha256: String(archive.sha256),
+      archiveSize: archive.size, memberCount: archive.member_count,
+      revision, notebook,
+    });
+  }
+
+  function capsuleReceiptFingerprint(receipt) {
+    if (!receipt) return '';
+    return [
+      receipt.receiptId, receipt.receiptToken, receipt.destinationBinding,
+      receipt.archiveName, receipt.archiveSha256, receipt.archiveSize,
+      receipt.memberCount, receipt.revision.projectId,
+      receipt.revision.revisionId, receipt.revision.reportId,
+      receipt.revision.sequence, receipt.revision.manifestSha256,
+      receipt.notebook.ledgerRevision, receipt.notebook.ledgerHeadDigest || '',
+      receipt.notebook.snapshotSha256,
+    ].join('|');
+  }
+
+  function clearCapsuleTransaction() {
+    State.capsuleDestinationToken = ''; State.capsuleDestinationName = '';
+    State.capsuleProjectId = ''; State.capsuleRevisionId = '';
+    State.capsuleOperationKey = ''; State.capsuleReceipt = null;
+    State.capsuleReceiptFingerprint = '';
+  }
+
+  function beginCapsuleTransaction(projectId, revisionId) {
+    const reusable = State.capsuleProjectId === projectId
+      && State.capsuleRevisionId === revisionId
+      && !!capsuleToken(State.capsuleOperationKey)
+      && (!State.capsuleDestinationToken
+        || !!capsuleToken(State.capsuleDestinationToken))
+      && (!State.capsuleReceipt
+        || State.capsuleReceiptFingerprint
+          === capsuleReceiptFingerprint(State.capsuleReceipt));
+    if (!reusable) {
+      clearCapsuleTransaction();
+      State.capsuleProjectId = projectId;
+      State.capsuleRevisionId = revisionId;
+      State.capsuleOperationKey = newCapsuleOperationKey();
+    }
+    const generation = ++State.capsuleGeneration;
+    return {
+      generation, projectId, revisionId,
+      idempotencyKey: State.capsuleOperationKey,
+      destinationToken: State.capsuleDestinationToken,
+      receiptFingerprint: State.capsuleReceiptFingerprint,
+    };
+  }
+
+  function capsuleContextCurrent(context, { receipt = false } = {}) {
+    if (!context || context.generation !== State.capsuleGeneration
+        || context.projectId !== State.projectId
+        || !sameProject(context.projectId)
+        || insightRevision(selectedInsightRow('rw-diff-right')) !== context.revisionId
+        || context.idempotencyKey !== State.capsuleOperationKey
+        || context.destinationToken !== State.capsuleDestinationToken) return false;
+    return !receipt || (context.receiptFingerprint
+      && context.receiptFingerprint === State.capsuleReceiptFingerprint
+      && context.receiptFingerprint === capsuleReceiptFingerprint(State.capsuleReceipt));
+  }
+
+  function capsuleResponseError(result, message) {
+    const error = new Error(message);
+    const status = String(result && result.status || 'blocked');
+    error.insightStatus = ['unavailable', 'stale', 'blocked'].includes(status)
+      ? status : 'blocked';
+    error.capsuleDefinitive = true;
+    return error;
+  }
+
+  function validatedCapsuleFile(result, context, receipt) {
+    const revision = capsuleRevisionBinding(
+      result && result.revision, context.projectId, context.revisionId);
+    if (!result || result.ok !== true || result.status !== 'ready'
+        || safeId(result.project_id) !== context.projectId
+        || capsuleToken(result.receipt_id) !== receipt.receiptId
+        || typeof result.replayed !== 'boolean'
+        || !revision
+        || revision.reportId !== receipt.revision.reportId
+        || revision.sequence !== receipt.revision.sequence
+        || revision.manifestSha256 !== receipt.revision.manifestSha256) return null;
+    const notebook = capsuleNotebookBinding(result.notebook);
+    const file = plain(result.file);
+    const name = capsuleArchiveName(file.name);
+    if (!notebook || capsuleReceiptFingerprint({
+      ...receipt, notebook,
+    }) !== capsuleReceiptFingerprint(receipt)
+        || name !== receipt.archiveName
+        || String(file.sha256 || '') !== receipt.archiveSha256
+        || file.size !== receipt.archiveSize) return null;
+    return { name, sha256: receipt.archiveSha256, size: receipt.archiveSize };
+  }
+
   async function exportInsightCapsule() {
     if (State.insightBusy) return false;
     const row = selectedInsightRow('rw-diff-right'); if (!revisionIsUsable(row)) return false;
-    const projectId = State.projectId; const operationId = `report-capsule-${Date.now()}`;
+    const projectId = State.projectId; const revisionId = insightRevision(row);
+    const context = beginCapsuleTransaction(projectId, revisionId);
+    const operationId = `report-capsule-${Date.now()}`;
+    let phase = context.receiptFingerprint ? 'confirm'
+      : context.destinationToken ? 'preview' : 'pick';
     publishInsightOperation(operationId, 'report-si-capsule', 'Reproducibility / SI capsule', 'pending', '', 'publish-export');
     State.insightBusy = true; setInsightState('loading'); renderInsightControls();
     try {
-      const selected = await VCS.call('report_capsule_pick_destination');
-      if (projectId !== State.projectId || !selected || selected.cancelled) {
+      if (!context.destinationToken) {
+        const selected = await VCS.call('report_capsule_pick_destination');
+        if (!capsuleContextCurrent(context)) {
+          publishInsightOperation(operationId, 'report-si-capsule', 'Reproducibility / SI capsule', 'cancelled', '', 'publish-export');
+          return false;
+        }
+        if (!selected || selected.cancelled) {
+          clearCapsuleTransaction();
+          publishInsightOperation(operationId, 'report-si-capsule', 'Reproducibility / SI capsule', 'cancelled', '', 'publish-export');
+          return false;
+        }
+        const destinationToken = selected.ok === true
+          ? capsuleToken(selected.destination_token) : '';
+        if (!destinationToken) throw capsuleResponseError(
+          selected, VCS.t('report.insights.capsule_destination_failed', {},
+            'Capsule destination selection failed.'));
+        State.capsuleDestinationToken = destinationToken;
+        State.capsuleDestinationName = capsuleDisplayName(selected.display_name);
+        context.destinationToken = destinationToken;
+      }
+
+      if (!context.receiptFingerprint) {
+        phase = 'preview';
+        publishInsightOperation(operationId, 'report-si-capsule', 'Reproducibility / SI capsule', 'running', '', 'publish-export');
+        const preview = await VCS.call(
+          'report_capsule_preview', projectId, revisionId,
+          context.destinationToken, context.idempotencyKey);
+        if (!capsuleContextCurrent(context)) {
+          publishInsightOperation(operationId, 'report-si-capsule', 'Reproducibility / SI capsule', 'cancelled', '', 'publish-export');
+          return false;
+        }
+        if (!preview || preview.ok !== true) throw capsuleResponseError(
+          preview, VCS.t('report.insights.capsule_preview_failed', {},
+            'Capsule preview failed; no archive was published.'));
+        const receipt = freezeCapsuleReceipt(preview, context);
+        if (!receipt) throw capsuleResponseError(
+          preview, VCS.t('report.insights.capsule_binding_changed', {},
+            'Capsule preview binding was invalid or changed; confirmation stopped.'));
+        State.capsuleReceipt = receipt;
+        State.capsuleReceiptFingerprint = capsuleReceiptFingerprint(receipt);
+        context.receiptFingerprint = State.capsuleReceiptFingerprint;
+        if (!capsuleContextCurrent(context, { receipt: true })) {
+          publishInsightOperation(operationId, 'report-si-capsule', 'Reproducibility / SI capsule', 'cancelled', '', 'publish-export');
+          return false;
+        }
+      }
+
+      phase = 'confirm';
+      const receipt = State.capsuleReceipt;
+      const confirm = typeof VCS.confirm === 'function' ? VCS.confirm : null;
+      if (!receipt || !confirm) throw capsuleResponseError(
+        null, VCS.t('report.insights.capsule_confirmation_unavailable', {},
+          'Explicit capsule confirmation is unavailable; export stopped.'));
+      const accepted = await confirm(VCS.t('report.insights.capsule_confirm_prompt', {
+        file: receipt.archiveName,
+        size: receipt.archiveSize,
+        hash: receipt.archiveSha256.slice(0, 16),
+        revision: context.revisionId,
+      }, 'Confirm export of frozen {file} ({size} bytes, SHA-256 {hash}…, revision {revision})?'));
+      if (!capsuleContextCurrent(context, { receipt: true })) {
         publishInsightOperation(operationId, 'report-si-capsule', 'Reproducibility / SI capsule', 'cancelled', '', 'publish-export');
         return false;
       }
-      if (selected.ok !== true || !selected.destination_token) throw new Error(selected && selected.error || 'capsule destination unavailable');
-      State.capsuleDestinationToken = String(selected.destination_token);
-      State.capsuleDestinationName = String(selected.display_name || 'selected directory');
-      publishInsightOperation(operationId, 'report-si-capsule', 'Reproducibility / SI capsule', 'running', '', 'publish-export');
-      const result = await VCS.call('report_capsule_export', projectId, insightRevision(row), State.capsuleDestinationToken);
-      State.capsuleDestinationToken = '';
-      if (projectId !== State.projectId) {
+      if (!accepted) {
+        clearCapsuleTransaction();
+        setInsightState('ready', VCS.t('report.insights.capsule_cancelled', {},
+          'Capsule confirmation was cancelled; no archive was published.'));
         publishInsightOperation(operationId, 'report-si-capsule', 'Reproducibility / SI capsule', 'cancelled', '', 'publish-export');
         return false;
       }
-      if (!result || result.ok !== true) throw insightResponseError(result, 'capsule export unavailable');
+      const result = await VCS.call(
+        'report_capsule_export', projectId, receipt.receiptId,
+        receipt.receiptToken, context.idempotencyKey);
+      if (!capsuleContextCurrent(context, { receipt: true })) {
+        publishInsightOperation(operationId, 'report-si-capsule', 'Reproducibility / SI capsule', 'cancelled', '', 'publish-export');
+        return false;
+      }
+      if (!result || result.ok !== true) throw capsuleResponseError(
+        result, VCS.t('report.insights.capsule_confirm_failed', {},
+          'Capsule confirmation failed; no result was adopted.'));
+      const file = validatedCapsuleFile(result, context, receipt);
+      if (!file) throw capsuleResponseError(
+        result, VCS.t('report.insights.capsule_binding_changed', {},
+          'Capsule confirmation binding was invalid or changed; the result was discarded.'));
       setInsightState('ready', VCS.t('report.insights.capsule_ready', {
-        file: plain(result.file).name || 'SI capsule', destination: State.capsuleDestinationName,
+        file: file.name, destination: State.capsuleDestinationName,
       }, '已导出 {file} 到 {destination}；不会覆盖同名文件。'));
+      clearCapsuleTransaction();
       publishInsightOperation(operationId, 'report-si-capsule', 'Reproducibility / SI capsule', 'succeeded', '', 'publish-export');
       return true;
     } catch (error) {
-      State.capsuleDestinationToken = '';
-      const message = error && error.message || String(error);
+      if (!capsuleContextCurrent(context, {
+        receipt: phase === 'confirm' && !!context.receiptFingerprint,
+      })) return false;
+      if (phase === 'pick' || error && error.capsuleDefinitive) {
+        clearCapsuleTransaction();
+      }
+      const message = error && error.capsuleDefinitive && error.message
+        ? error.message : VCS.t(
+          phase === 'confirm' ? 'report.insights.capsule_confirm_failed'
+            : 'report.insights.capsule_preview_failed', {},
+          'Capsule transaction failed; no result was adopted.');
       setInsightState(error && error.insightStatus || 'blocked', message);
       publishInsightOperation(operationId, 'report-si-capsule', 'Reproducibility / SI capsule', 'failed', message, 'publish-export');
       return false;
-    } finally { State.insightBusy = false; renderInsightControls(); }
+    } finally {
+      if (context.generation === State.capsuleGeneration) {
+        State.insightBusy = false; renderInsightControls();
+      }
+    }
   }
 
   function renderActions() {
@@ -1241,6 +1510,7 @@
       State.history = []; State.historyStatus = 'unavailable';
       State.historyError = '当前报告路由没有可解析的项目上下文';
       State.outputDestinationToken = ''; State.outputDisplayName = ''; State.outputProjectId = '';
+      State.capsuleGeneration += 1; clearCapsuleTransaction();
       const output = $('rw-output-path');
       if (output) output.textContent = '发布时尚未选择目录';
       showAlert(tr('legacy.dynamic.report_workbench.0012', '当前项目无法解析。'));
@@ -1262,7 +1532,7 @@
     State.formatStates = Object.create(null); State.dirty = true;
     State.insightBusy = false; State.insightStatus = 'empty';
     State.insightDiff = null; State.insightGraph = null;
-    State.capsuleDestinationToken = ''; State.capsuleDestinationName = '';
+    State.capsuleGeneration += 1; clearCapsuleTransaction();
     showAlert(''); setOperation('正在读取版本化预设、格式能力与报告状态…', 'busy');
     renderHistory(); renderActions();
     try {
@@ -1754,6 +2024,13 @@
       previewCurrentSpec,
       pickOutputDirectory,
       publishBoundPreview,
+      exportInsightCapsule,
+      beginCapsuleTransaction,
+      capsuleContextCurrent,
+      freezeCapsuleReceipt,
+      validatedCapsuleFile,
+      capsuleReceiptFingerprint,
+      clearCapsuleTransaction,
     };
   }
 

@@ -526,6 +526,7 @@
       'draft-project-import': tr('dashboard.resume.project_import', '项目导入流程草稿'),
       'cluster-profile': tr('dashboard.resume.cluster_profile', '集群配置草稿'),
       'draft-cluster-profile': tr('dashboard.resume.cluster_profile', '集群配置草稿'),
+      'research-notebook': tr('dashboard.resume.research_notebook', 'Research Notebook 待续录引用'),
     };
     return labels[scope] || String(scope || tr('dashboard.resume.unnamed', '未命名草稿'));
   }
@@ -590,6 +591,7 @@
       if (!ref || ref.dirty !== true) return;
       const route = resumeRoute(id, ref, workspace);
       const reportDraft = /^report-/.test(id) || route.includes('/publish/');
+      const notebookDraft = /^research-notebook-/.test(id);
       const specialDraft = id === PROJECT_IMPORT_DRAFT_ID || id === CLUSTER_PROFILE_DRAFT_ID;
       const projectId = specialDraft ? '' : String(ref.project_id || '');
       const available = localDraftAvailable(id, workspace) &&
@@ -600,6 +602,8 @@
           ? tr('dashboard.resume.project_import', '项目导入流程草稿')
           : id === CLUSTER_PROFILE_DRAFT_ID
             ? tr('dashboard.resume.cluster_profile', '集群配置草稿')
+            : notebookDraft
+              ? tr('dashboard.resume.research_notebook', 'Research Notebook 待续录引用')
             : reportDraft
               ? tr('dashboard.resume.report_draft', '报告配置草稿')
               : tr('dashboard.resume.workflow_draft', '工作流草稿'),

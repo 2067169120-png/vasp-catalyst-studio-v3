@@ -11,6 +11,7 @@
 <link rel="stylesheet" href="research-explorer.css">
 <link rel="stylesheet" href="report-workbench.css">
 <link rel="stylesheet" href="trajectory-player.css">
+<link rel="stylesheet" href="research-notebook.css">
 <script>/* 外观先粉刷防闪烁；只接受固定白名单，桥就绪后 app.js 再从 config 校准。 */
 try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].indexOf(_t)>=0)document.documentElement.dataset.theme=_t;var _d=localStorage.getItem('vcs.density');document.documentElement.dataset.density=['comfortable','standard','compact'].indexOf(_d)>=0?_d:'standard';}catch(e){document.documentElement.dataset.density='standard';}</script>
 <style>
@@ -2154,6 +2155,111 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
       <div id="pj-draft-out"></div>
     </div>
 
+    <section class="rn-panel" id="rn-project-panel" data-research-notebook
+      data-surface="project" aria-labelledby="rn-project-title" aria-busy="false">
+      <header class="rn-head">
+        <div>
+          <h2 id="rn-project-title">研究笔记 / Research Notebook</h2>
+          <p>项目级问题、假设、观察、解释、限制、下一步、决策与 Human Review Ledger。编辑追加 revision，删除追加 tombstone。</p>
+        </div>
+        <div class="rn-head-actions">
+          <span class="rn-summary" data-rn="summary">未加载 / Not loaded</span>
+          <button class="btn quiet" type="button" data-rn-action="refresh">刷新 / Refresh</button>
+        </div>
+      </header>
+      <p class="rn-status" data-rn="status" role="status" aria-live="polite">等待项目上下文。</p>
+      <p class="rn-boundary"><b>人审边界 / Human-review boundary:</b>
+        本账本只记录本机明确 actor 的自声明审阅；不是认证或密码学签名，也不会把任何 note/review 自动提升为
+        <code>human_scientific_reviewed</code>。Claims 与 final 仍只走现有 <code>ValidationResult</code> gate。</p>
+      <div class="rn-layout">
+        <div class="rn-column">
+          <div class="rn-toolbar" aria-label="Notebook filters">
+            <select class="ipt" data-rn="filter-type" data-rn-filter aria-label="记录类型 / Record type">
+              <option value="">全部类型 / All types</option><option value="note">Note</option>
+              <option value="decision">Decision</option><option value="review">Human review</option>
+              <option value="tombstone">Tombstone</option>
+            </select>
+            <select class="ipt" data-rn="filter-category" data-rn-filter aria-label="类别 / Category">
+              <option value="">全部类别 / All categories</option><option value="problem">问题 / Problem</option>
+              <option value="hypothesis">假设 / Hypothesis</option><option value="observation">观察 / Observation</option>
+              <option value="interpretation">解释 / Interpretation</option><option value="limitation">限制 / Limitation</option>
+              <option value="next_step">下一步 / Next step</option><option value="decision">决策 / Decision</option>
+              <option value="review">审阅 / Review</option>
+            </select>
+            <select class="ipt" data-rn="filter-status" data-rn-filter aria-label="证据状态 / Evidence status">
+              <option value="">全部关联 / All links</option><option value="current">Current</option>
+              <option value="stale">Stale</option><option value="missing">Missing</option>
+            </select>
+            <input class="ipt" data-rn="filter-search" data-rn-filter type="search"
+              aria-label="搜索笔记 / Search notebook" placeholder="筛选正文、actor 或 ID / Filter text, actor, or ID">
+          </div>
+          <div class="rn-timeline" data-rn="timeline" aria-live="polite">
+            <p class="rn-empty">尚未读取 / Not loaded</p>
+          </div>
+        </div>
+        <aside class="rn-column">
+          <section class="rn-compose" aria-labelledby="rn-project-compose-title">
+            <h3 id="rn-project-compose-title">新增或修订 / Add or revise</h3>
+            <div class="rn-grid">
+              <label class="rn-field">类型 / Type<select class="ipt" data-rn="record-type">
+                <option value="note">Note</option><option value="decision">Decision</option></select></label>
+              <label class="rn-field">类别 / Category<select class="ipt" data-rn="category">
+                <option value="problem">问题 / Problem</option><option value="hypothesis">假设 / Hypothesis</option>
+                <option value="observation" selected>观察 / Observation</option><option value="interpretation">解释 / Interpretation</option>
+                <option value="limitation">限制 / Limitation</option><option value="next_step">下一步 / Next step</option>
+              </select></label>
+              <label class="rn-field wide">正文（纯文本）/ Body (plain text)
+                <textarea class="ipt" data-rn="body" data-rn-draft-body rows="4" spellcheck="true"></textarea></label>
+              <label class="rn-field">Actor ID<input class="ipt" data-rn="actor-id" autocomplete="off" placeholder="alice"></label>
+              <label class="rn-field">姓名 / Display name<input class="ipt" data-rn="actor-name" autocomplete="name"></label>
+              <label class="rn-field wide">角色 / Role<input class="ipt" data-rn="actor-role" autocomplete="off" value="researcher"></label>
+              <div class="rn-link-builder wide" aria-label="Evidence links">
+                <label class="rn-field">关联类型 / Link<select class="ipt" data-rn="link-kind">
+                  <option value="project">Project</option><option value="job">Job</option>
+                  <option value="source">Source</option><option value="report_revision">Report revision</option>
+                </select></label>
+                <label class="rn-field">Opaque ID<input class="ipt" data-rn="link-id" autocomplete="off"></label>
+                <label class="rn-field">Source 所属 report revision<input class="ipt" data-rn="link-revision" autocomplete="off"></label>
+                <button class="btn" type="button" data-rn-action="add-link">关联 / Link</button>
+                <ul class="rn-staged-links" data-rn="staged-links"></ul>
+              </div>
+            </div>
+            <div class="rn-compose-actions">
+              <button class="btn" type="button" data-rn-action="pick-attachments">选择附件 / Attach</button>
+              <button class="btn primary" type="button" data-rn-action="save">追加 revision / Append</button>
+              <button class="btn quiet" type="button" data-rn-action="cancel-edit">取消修订 / Cancel edit</button>
+              <span class="rn-attachment-summary" data-rn="attachment-summary"></span>
+            </div>
+          </section>
+          <section class="rn-review-form" data-rn-review-form aria-labelledby="rn-project-review-title">
+            <h3 id="rn-project-review-title">Human Review Ledger</h3>
+            <div class="rn-grid">
+              <label class="rn-field wide">审阅正文 / Review body
+                <textarea class="ipt" data-rn="review-body" data-rn-draft-body rows="3"></textarea></label>
+              <label class="rn-field">Reviewer ID<input class="ipt" data-rn="reviewer-id" autocomplete="off"></label>
+              <label class="rn-field">姓名 / Display name<input class="ipt" data-rn="reviewer-name" autocomplete="name"></label>
+              <label class="rn-field">角色 / Role<input class="ipt" data-rn="reviewer-role" autocomplete="off" value="scientific reviewer"></label>
+              <label class="rn-field">决定 / Decision<select class="ipt" data-rn="review-decision">
+                <option value="comment">Comment</option><option value="request_changes">Request changes</option>
+                <option value="approved">Approved</option><option value="rejected">Rejected</option>
+              </select></label>
+              <label class="rn-field wide">Requested changes（每行一项 / one per line）
+                <textarea class="ipt" data-rn="requested-changes" rows="3"></textarea></label>
+              <label class="rn-field wide">Signature attribution（署名说明，不是电子签名）
+                <input class="ipt" data-rn="signature-attribution" autocomplete="off"></label>
+            </div>
+            <label class="rn-attestation"><input type="checkbox" data-rn="review-attestation">
+              我是正在本机录入自己审阅意见的真人；此项只是自声明归属 / I am a human locally entering my own review; this is self-attribution only.</label>
+            <div class="rn-compose-actions">
+              <button class="btn primary" type="button" data-rn-action="review-save">追加人工审阅 / Append human review</button>
+            </div>
+          </section>
+          <section class="rn-todo"><h3>审阅待办 / Review todo</h3><div class="rn-todo-list" data-rn="todo"></div></section>
+          <section class="rn-limitations"><h3>限制 / Limitations</h3><ul data-rn="limitations"></ul></section>
+        </aside>
+      </div>
+    </section>
+
     <div class="log" id="project-log" data-anchor><div class="head" data-i18n="project.log">项目日志</div></div>
   </section>
 
@@ -2707,6 +2813,55 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
         </div>
       </aside>
     </div>
+
+    <section class="rn-panel" id="rn-publish-panel" data-research-notebook
+      data-surface="publish" aria-labelledby="rn-publish-title" aria-busy="false">
+      <header class="rn-head">
+        <div>
+          <h2 id="rn-publish-title">报告引用笔记 / Research Notebook references</h2>
+          <p>这里读取同一项目的版本化 notes、decisions 与 Human Review Ledger。可复制稳定引用 ID；引用材料不会绕过 claims/final 的 ValidationResult gate。</p>
+        </div>
+        <div class="rn-head-actions">
+          <span class="rn-summary" data-rn="summary">未加载 / Not loaded</span>
+          <button class="btn quiet" type="button" data-rn-action="refresh">刷新 / Refresh</button>
+        </div>
+      </header>
+      <p class="rn-status" data-rn="status" role="status" aria-live="polite">等待项目上下文。</p>
+      <p class="rn-boundary"><b>引用边界 / Citation boundary:</b>
+        “复制引用 ID”只生成 <code>notebook:record@digest</code> 材料引用；不会生成 claim、改变 scientific qualification，
+        也不会把自声明 reviewer attribution 当作认证或密码学签名。</p>
+      <div class="rn-layout">
+        <div class="rn-column">
+          <div class="rn-toolbar" aria-label="Notebook filters">
+            <select class="ipt" data-rn="filter-type" data-rn-filter aria-label="记录类型 / Record type">
+              <option value="">全部类型 / All types</option><option value="note">Note</option>
+              <option value="decision">Decision</option><option value="review">Human review</option>
+              <option value="tombstone">Tombstone</option>
+            </select>
+            <select class="ipt" data-rn="filter-category" data-rn-filter aria-label="类别 / Category">
+              <option value="">全部类别 / All categories</option><option value="problem">Problem</option>
+              <option value="hypothesis">Hypothesis</option><option value="observation">Observation</option>
+              <option value="interpretation">Interpretation</option><option value="limitation">Limitation</option>
+              <option value="next_step">Next step</option><option value="decision">Decision</option>
+              <option value="review">Review</option>
+            </select>
+            <select class="ipt" data-rn="filter-status" data-rn-filter aria-label="证据状态 / Evidence status">
+              <option value="">全部关联 / All links</option><option value="current">Current</option>
+              <option value="stale">Stale</option><option value="missing">Missing</option>
+            </select>
+            <input class="ipt" data-rn="filter-search" data-rn-filter type="search"
+              aria-label="搜索笔记 / Search notebook" placeholder="筛选正文、actor 或 ID / Filter text, actor, or ID">
+          </div>
+          <div class="rn-timeline" data-rn="timeline" aria-live="polite">
+            <p class="rn-empty">尚未读取 / Not loaded</p>
+          </div>
+        </div>
+        <aside class="rn-column">
+          <section class="rn-todo"><h3>审阅待办 / Review todo</h3><div class="rn-todo-list" data-rn="todo"></div></section>
+          <section class="rn-limitations"><h3>限制 / Limitations</h3><ul data-rn="limitations"></ul></section>
+        </aside>
+      </div>
+    </section>
 
     <section class="rw-history" aria-labelledby="rw-history-heading">
       <header class="rw-pane-heading"><div><h2 id="rw-history-heading" tabindex="-1">版本历史</h2>
@@ -3793,6 +3948,7 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
 <script src="analysis-workbench.js"></script>
 <script src="reference-browser.js"></script>
 <script src="report-workbench.js"></script>
+<script src="research-notebook.js"></script>
 <script src="dashboard.js"></script>
 <script src="settings.js"></script>
 <script src="editor.js"></script>

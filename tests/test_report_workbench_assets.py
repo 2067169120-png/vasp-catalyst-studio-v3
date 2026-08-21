@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 import re
 
+from tests.test_workspace_runtime_assets import _run_node
+
 
 ASSETS = Path(__file__).resolve().parents[1] / "vcstudio" / "gui_web" / "assets"
 LOCALES = ASSETS.parents[1] / "shared" / "locales"
@@ -237,7 +239,8 @@ def test_history_has_explicit_empty_state_and_revision_list_renderer():
     assert "VCS.call('report_revision_scientific_diff'" in js
     assert "VCS.call('report_evidence_graph'" in js
     assert "VCS.call('report_capsule_pick_destination')" in js
-    assert "VCS.call('report_capsule_export'" in js
+    assert "'report_capsule_preview', projectId, revisionId" in js
+    assert "'report_capsule_export', projectId, receipt.receiptId" in js
     assert 'id="rw-diff-left"' in html
     assert 'id="rw-diff-right"' in html
     assert "created_at_utc" not in js[js.index("function insightRevisionLabel("):
@@ -249,6 +252,25 @@ def test_report_insights_expose_fail_closed_states_and_operation_lifecycle():
 
     assert "new Set(['loading', 'empty', 'unavailable', 'stale', 'blocked', 'ready'])" in js
     assert "report.insights.state.${State.insightStatus}" in js
+
+
+def test_capsule_export_is_strict_preview_confirm_without_legacy_fallback():
+    js = _source("report-workbench.js")
+    capsule = js[js.index("async function exportInsightCapsule()"):
+                 js.index("function renderActions()")]
+
+    assert "report_capsule_pick_destination" in capsule
+    assert "report_capsule_preview" in capsule
+    assert "await confirm(" in capsule
+    assert "receipt.receiptId" in capsule
+    assert "receipt.receiptToken" in capsule
+    assert "context.idempotencyKey" in capsule
+    assert capsule.count("report_capsule_export") == 1
+    assert "insightRevision(row), State.capsuleDestinationToken" not in capsule
+    assert "selected && selected.error" not in capsule
+    assert "result && result.error" not in capsule
+    assert "clearCapsuleTransaction()" in capsule
+    assert "capsuleContextCurrent(context, { receipt: true })" in capsule
 
 
 def test_scientific_diff_renders_method_matrix_and_evidence_nodes_are_navigable():
@@ -389,3 +411,229 @@ def test_language_theme_bilingual_and_precision_follow_catalog_capabilities():
         assert f'id="rw-{name}-capability"' in html
     assert '<option value="zh-en">' not in html
     assert "!specCapabilitiesSatisfied()" in js
+
+
+def test_capsule_runtime_previews_then_explicitly_confirms_with_one_frozen_key():
+    _run_node(
+        r"""
+const projectId = 'project-' + 'a'.repeat(32); const revisionId = 'report-r1';
+window.Project = { current() { return { project_id: projectId, name: 'Project A' }; } };
+element('rw-diff-right', { value: revisionId });
+const calls = []; const prompts = [];
+function revision() { return { project_id: projectId, report_id: 'report-1',
+  revision_id: revisionId, sequence: 1, manifest_sha256: 'a'.repeat(64) }; }
+function notebook() { return { ledger_revision: 1, ledger_head_digest: 'b'.repeat(64),
+  snapshot_sha256: 'c'.repeat(64), integrity_status: 'current' }; }
+function preview(args) { return { schema: 'vcstudio.report-si-capsule-preview/v1', ok: true,
+  status: 'awaiting_confirmation', project_id: projectId, revision: revision(),
+  notebook: notebook(), destination_binding_sha256: 'd'.repeat(64),
+  receipt_id: 'capsule-receipt.opaque', receipt_token: 'capsule-confirm.opaque',
+  archive: { name: 'report-r1-si-capsule.zip', sha256: 'e'.repeat(64), size: 321,
+    member_count: 9 }, ttl_seconds: 900, replayed: false, error: null }; }
+VCS.call = async (...args) => {
+  calls.push(args);
+  if (args[0] === 'report_capsule_pick_destination') return { ok: true, cancelled: false,
+    destination_token: 'capsule-destination.opaque', display_name: 'Capsules' };
+  if (args[0] === 'report_capsule_preview') return preview(args);
+  if (args[0] === 'report_capsule_export') return { schema: 'vcstudio.report-si-capsule/v1',
+    ok: true, status: 'ready', project_id: projectId, revision: revision(),
+    notebook: notebook(), receipt_id: 'capsule-receipt.opaque', replayed: false,
+    file: { name: 'report-r1-si-capsule.zip', sha256: 'e'.repeat(64), size: 321 } };
+  throw new Error('unexpected API method ' + args[0]);
+};
+VCS.confirm = async message => { prompts.push(message); return true; };
+loadAsset(process.argv[1]);
+const seam = window.__VCS_REPORT_WORKBENCH_TEST__;
+seam.state.projectId = projectId;
+seam.state.history = [{ revision_id: revisionId, current: true, artifact_status: 'ready' }];
+assert.strictEqual(await seam.exportInsightCapsule(), true);
+assert.deepStrictEqual(calls.map(call => call[0]), [
+  'report_capsule_pick_destination', 'report_capsule_preview', 'report_capsule_export']);
+const operationKey = calls[1][4];
+assert.match(operationKey, /^capsule-operation\.[A-Za-z0-9._:-]+$/);
+assert.deepStrictEqual(calls[1].slice(1), [projectId, revisionId,
+  'capsule-destination.opaque', operationKey]);
+assert.deepStrictEqual(calls[2].slice(1), [projectId, 'capsule-receipt.opaque',
+  'capsule-confirm.opaque', operationKey]);
+assert.strictEqual(prompts.length, 1);
+assert.ok(prompts[0].includes('report-r1-si-capsule.zip'));
+assert.strictEqual(seam.state.capsuleOperationKey, '');
+assert.strictEqual(seam.state.capsuleReceipt, null);
+""",
+        str(ASSETS / "report-workbench.js"),
+    )
+
+
+def test_capsule_context_discards_project_revision_destination_and_receipt_mutations():
+    _run_node(
+        r"""
+const projectId = 'project-' + 'a'.repeat(32); const revisionId = 'report-r1';
+let currentProjectId = projectId;
+window.Project = { current() { return { project_id: currentProjectId }; } };
+const select = element('rw-diff-right', { value: revisionId });
+loadAsset(process.argv[1]);
+const seam = window.__VCS_REPORT_WORKBENCH_TEST__;
+seam.state.projectId = projectId;
+seam.state.history = [{ revision_id: revisionId, current: true, artifact_status: 'ready' },
+  { revision_id: 'report-r2', current: true, artifact_status: 'ready' }];
+const context = seam.beginCapsuleTransaction(projectId, revisionId);
+seam.state.capsuleDestinationToken = 'capsule-destination.opaque';
+context.destinationToken = seam.state.capsuleDestinationToken;
+const preview = { ok: true, status: 'awaiting_confirmation', project_id: projectId,
+  revision: { project_id: projectId, report_id: 'report-1', revision_id: revisionId,
+    sequence: 1, manifest_sha256: 'a'.repeat(64) },
+  notebook: { ledger_revision: 0, ledger_head_digest: null,
+    snapshot_sha256: 'b'.repeat(64), integrity_status: 'current' },
+  destination_binding_sha256: 'c'.repeat(64), receipt_id: 'capsule-receipt.opaque',
+  receipt_token: 'capsule-confirm.opaque', archive: { name: 'capsule.zip',
+    sha256: 'd'.repeat(64), size: 10, member_count: 4 },
+  ttl_seconds: 900, replayed: false };
+const receipt = seam.freezeCapsuleReceipt(preview, context);
+assert.ok(receipt);
+seam.state.capsuleReceipt = receipt;
+seam.state.capsuleReceiptFingerprint = seam.capsuleReceiptFingerprint(receipt);
+context.receiptFingerprint = seam.state.capsuleReceiptFingerprint;
+assert.strictEqual(seam.capsuleContextCurrent(context, { receipt: true }), true);
+
+select.value = 'report-r2';
+assert.strictEqual(seam.capsuleContextCurrent(context, { receipt: true }), false);
+select.value = revisionId;
+seam.state.capsuleDestinationToken = 'capsule-destination.changed';
+assert.strictEqual(seam.capsuleContextCurrent(context, { receipt: true }), false);
+seam.state.capsuleDestinationToken = context.destinationToken;
+seam.state.capsuleReceipt = Object.freeze({ ...receipt, archiveSize: 11 });
+assert.strictEqual(seam.capsuleContextCurrent(context, { receipt: true }), false);
+seam.state.capsuleReceipt = receipt;
+currentProjectId = 'project-' + 'f'.repeat(32);
+assert.strictEqual(seam.capsuleContextCurrent(context, { receipt: true }), false);
+""",
+        str(ASSETS / "report-workbench.js"),
+    )
+
+
+def test_capsule_transport_retry_reuses_preview_key_and_redacts_failure_details():
+    _run_node(
+        r"""
+const projectId = 'project-' + 'a'.repeat(32); const revisionId = 'report-r1';
+window.Project = { current() { return { project_id: projectId }; } };
+element('rw-diff-right', { value: revisionId });
+const note = element('rw-insights-note'); const calls = []; let previewCount = 0;
+function revision() { return { project_id: projectId, report_id: 'report-1',
+  revision_id: revisionId, sequence: 1, manifest_sha256: 'a'.repeat(64) }; }
+function notebook() { return { ledger_revision: 0, ledger_head_digest: null,
+  snapshot_sha256: 'b'.repeat(64), integrity_status: 'current' }; }
+VCS.call = async (...args) => {
+  calls.push(args);
+  if (args[0] === 'report_capsule_pick_destination') return { ok: true, cancelled: false,
+    destination_token: 'capsule-destination.opaque', display_name: 'Capsules' };
+  if (args[0] === 'report_capsule_preview') {
+    previewCount += 1;
+    if (previewCount === 1) throw new Error(
+      'C:\\private\\capsule password=bridge-secret command=srun -n 96');
+    return { ok: true, status: 'awaiting_confirmation', project_id: projectId,
+      revision: revision(), notebook: notebook(), destination_binding_sha256: 'c'.repeat(64),
+      receipt_id: 'capsule-receipt.opaque', receipt_token: 'capsule-confirm.opaque',
+      archive: { name: 'capsule.zip', sha256: 'd'.repeat(64), size: 20, member_count: 4 },
+      ttl_seconds: 900, replayed: true };
+  }
+  if (args[0] === 'report_capsule_export') return { ok: true, status: 'ready',
+    project_id: projectId, revision: revision(), notebook: notebook(),
+    receipt_id: 'capsule-receipt.opaque', replayed: true,
+    file: { name: 'capsule.zip', sha256: 'd'.repeat(64), size: 20 } };
+  throw new Error('unexpected API method');
+};
+VCS.confirm = async () => true;
+loadAsset(process.argv[1]);
+const seam = window.__VCS_REPORT_WORKBENCH_TEST__;
+seam.state.projectId = projectId;
+seam.state.history = [{ revision_id: revisionId, current: true, artifact_status: 'ready' }];
+assert.strictEqual(await seam.exportInsightCapsule(), false);
+const retainedKey = seam.state.capsuleOperationKey;
+assert.ok(retainedKey);
+assert.ok(!note.textContent.includes('private'));
+assert.ok(!note.textContent.includes('bridge-secret'));
+assert.ok(!note.textContent.includes('srun'));
+assert.strictEqual(await seam.exportInsightCapsule(), true);
+const previews = calls.filter(call => call[0] === 'report_capsule_preview');
+assert.strictEqual(previews.length, 2);
+assert.strictEqual(previews[0][4], retainedKey);
+assert.strictEqual(previews[1][4], retainedKey);
+assert.strictEqual(calls.filter(call => call[0] === 'report_capsule_pick_destination').length, 1);
+assert.strictEqual(calls.filter(call => call[0] === 'report_capsule_export').length, 1);
+""",
+        str(ASSETS / "report-workbench.js"),
+    )
+
+
+def test_capsule_stale_conflict_stops_without_retry_and_hides_server_error():
+    _run_node(
+        r"""
+const projectId = 'project-' + 'a'.repeat(32); const revisionId = 'report-r1';
+window.Project = { current() { return { project_id: projectId }; } };
+element('rw-diff-right', { value: revisionId });
+const note = element('rw-insights-note'); const calls = [];
+VCS.call = async (...args) => {
+  calls.push(args);
+  if (args[0] === 'report_capsule_pick_destination') return { ok: true, cancelled: false,
+    destination_token: 'capsule-destination.opaque', display_name: 'Capsules' };
+  if (args[0] === 'report_capsule_preview') return { ok: false, status: 'stale',
+    error: 'C:\\private\\report password=bridge-secret command=srun -n 96' };
+  throw new Error('confirm must not be called');
+};
+let confirmations = 0; VCS.confirm = async () => { confirmations += 1; return true; };
+loadAsset(process.argv[1]);
+const seam = window.__VCS_REPORT_WORKBENCH_TEST__;
+seam.state.projectId = projectId;
+seam.state.history = [{ revision_id: revisionId, current: true, artifact_status: 'ready' }];
+assert.strictEqual(await seam.exportInsightCapsule(), false);
+assert.deepStrictEqual(calls.map(call => call[0]), [
+  'report_capsule_pick_destination', 'report_capsule_preview']);
+assert.strictEqual(confirmations, 0);
+assert.strictEqual(seam.state.capsuleOperationKey, '');
+assert.ok(!note.textContent.includes('private'));
+assert.ok(!note.textContent.includes('bridge-secret'));
+assert.ok(!note.textContent.includes('srun'));
+""",
+        str(ASSETS / "report-workbench.js"),
+    )
+
+
+def test_capsule_late_preview_response_is_not_adopted_after_revision_change():
+    _run_node(
+        r"""
+const projectId = 'project-' + 'a'.repeat(32); const revisionId = 'report-r1';
+window.Project = { current() { return { project_id: projectId }; } };
+const select = element('rw-diff-right', { value: revisionId }); const pending = deferred();
+const calls = []; let confirmations = 0;
+VCS.call = async (...args) => {
+  calls.push(args);
+  if (args[0] === 'report_capsule_pick_destination') return { ok: true, cancelled: false,
+    destination_token: 'capsule-destination.opaque', display_name: 'Capsules' };
+  if (args[0] === 'report_capsule_preview') return pending.promise;
+  throw new Error('late response must not reach confirm');
+};
+VCS.confirm = async () => { confirmations += 1; return true; };
+loadAsset(process.argv[1]);
+const seam = window.__VCS_REPORT_WORKBENCH_TEST__;
+seam.state.projectId = projectId;
+seam.state.history = [{ revision_id: revisionId, current: true, artifact_status: 'ready' },
+  { revision_id: 'report-r2', current: true, artifact_status: 'ready' }];
+const operation = seam.exportInsightCapsule();
+await waitFor(() => calls.some(call => call[0] === 'report_capsule_preview'));
+select.value = 'report-r2';
+pending.resolve({ ok: true, status: 'awaiting_confirmation', project_id: projectId,
+  revision: { project_id: projectId, report_id: 'report-1', revision_id: revisionId,
+    sequence: 1, manifest_sha256: 'a'.repeat(64) },
+  notebook: { ledger_revision: 0, ledger_head_digest: null,
+    snapshot_sha256: 'b'.repeat(64), integrity_status: 'current' },
+  destination_binding_sha256: 'c'.repeat(64), receipt_id: 'capsule-receipt.opaque',
+  receipt_token: 'capsule-confirm.opaque', archive: { name: 'capsule.zip',
+    sha256: 'd'.repeat(64), size: 10, member_count: 4 },
+  ttl_seconds: 900, replayed: false });
+assert.strictEqual(await operation, false);
+assert.strictEqual(confirmations, 0);
+assert.strictEqual(seam.state.capsuleReceipt, null);
+assert.strictEqual(calls.filter(call => call[0] === 'report_capsule_export').length, 0);
+""",
+        str(ASSETS / "report-workbench.js"),
+    )
