@@ -78,6 +78,9 @@ CI was performed.
   externally head-anchored, digest-chained, evidence/blob-revalidated, and excluded from workspace body storage.
   Human attribution remains self-asserted and
   cannot bypass or elevate the existing scientific/report gates.
+- Publish → Export 新增本地 DOI-ready `vcs-archive`：从重新校验的 report revision 生成
+  path-free dry-run、许可/风险/排除清单和 submission-readiness gaps，确认后原子写出绑定
+  revision/manifest/plan hash 的确定性 ZIP；不会上传、申请 DOI 或把 archive integrity 冒充科学发布。
 
 ### 密度、键盘、双语与可访问性边界（Phase E）
 - 提供舒展、标准、紧凑三档界面密度，补齐键盘导航、焦点可见性、动态 ARIA / title /

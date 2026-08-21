@@ -26,6 +26,7 @@ import threading
 import time
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from xml.sax.saxutils import escape as xml_escape
@@ -34,6 +35,7 @@ from xml.sax.saxutils import escape as xml_escape
 BUNDLE_SCHEMA = "vcstudio.paper-report.bundle/v2"
 MODEL_SCHEMA = "vcstudio.paper-report.model/v2"
 PREVIEW_SCHEMA = "vcstudio.paper-report.html-preview/v1"
+ARTIFACT_RIGHTS_SCHEMA = "vcstudio.report-artifact-rights/v1"
 _LEGACY_MODEL_SCHEMA = "vcstudio.paper-report.model/v1"
 _REPORT_KINDS = ("diagnostic", "final", "draft")
 _QUALIFICATION_LEVELS = (
@@ -45,6 +47,15 @@ _QUALIFICATION_LEVELS = (
     "human_scientific_reviewed",
 )
 _ALLOWED_FORMATS = ("html", "docx", "pdf")
+_FORMAT_MEDIA_TYPES = {
+    "html": "text/html; charset=utf-8",
+    "docx": (
+        "application/vnd.openxmlformats-officedocument."
+        "wordprocessingml.document"
+    ),
+    "pdf": "application/pdf",
+}
+_RIGHTS_LICENSE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+-]{0,95}\Z")
 _RASTER_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff"}
 _FIGURE_PATH_KEYS = ("path", "src", "image", "file")
 _A4_CONTENT_WIDTH_DXA = 9298  # 210 mm page - 23 mm left/right margins.
@@ -362,6 +373,8 @@ def render_report_bundle(
     if not isinstance(model, Mapping):
         raise TypeError("model must be a mapping")
     model = dict(model)
+    project_rights = _artifact_rights_record(
+        model, default_source_kind="project")
     safe_stem = _validate_stem(stem)
     requested = _normalize_formats(formats)
     _check_dependencies(requested)
@@ -429,10 +442,20 @@ def render_report_bundle(
             if fmt not in requested
         )
 
-        file_records = {
-            fmt: _file_record(path, relative_path=path.name)
-            for fmt, path in temp_outputs.items()
-        }
+        file_records = {}
+        for fmt, path in temp_outputs.items():
+            record = _file_record(path, relative_path=path.name)
+            record.update({
+                "logical_role": "rendered_report",
+                "format": fmt,
+                "media_type": _FORMAT_MEDIA_TYPES[fmt],
+                "authority": "report_service_frozen_revision",
+                "rights": copy.deepcopy(project_rights),
+            })
+            if fmt == "html":
+                record["relative_refs"] = _html_relative_refs(
+                    path, asset_records)
+            file_records[fmt] = record
         manifest = {
             "schema": BUNDLE_SCHEMA,
             "artifact_status": "complete",
@@ -1402,7 +1425,7 @@ def _normalize_figure(item: Any, index: int) -> dict:
     if raw_path is None:
         raise ValueError(f"figure {index} has no path")
     title = _text(item.get("title", item.get("name"))) or f"Figure {index}"
-    return {
+    result = {
         "title": title,
         "caption": _text(item.get("caption")),
         # Do not manufacture alternative text from a display title.  Renderers
@@ -1419,6 +1442,123 @@ def _normalize_figure(item: Any, index: int) -> dict:
         "denominator": _json_safe(item.get("denominator")),
         "extensions": _json_safe(item.get("extensions") or {}),
         "_source_path": Path(raw_path).expanduser(),
+    }
+    rights = item.get("rights")
+    if rights is not None:
+        if not isinstance(rights, Mapping):
+            raise TypeError(f"figure {index} rights must be a mapping")
+        result["rights"] = _json_safe(rights)
+    return result
+
+
+def _rights_source(value: Mapping[str, Any]) -> Mapping[str, Any]:
+    direct = value.get("rights")
+    if isinstance(direct, Mapping):
+        return direct
+    extensions = value.get("extensions")
+    if isinstance(extensions, Mapping):
+        nested = extensions.get("rights")
+        if isinstance(nested, Mapping):
+            return nested
+    if any(key in value for key in (
+        "license", "licence", "license_id", "license_status",
+        "attribution", "source_kind", "origin", "third_party",
+        "redistributable", "redistributable_status",
+    )):
+        return value
+    return {}
+
+
+def _rights_attribution(value: Any) -> str:
+    if value in (None, "", [], {}):
+        return ""
+    if isinstance(value, (list, tuple)):
+        parts = [_rights_attribution(item) for item in value]
+        return "; ".join(part for part in parts if part)
+    if isinstance(value, Mapping):
+        for key in ("name", "title", "family-names", "family_names"):
+            if value.get(key) not in (None, ""):
+                return _rights_attribution(value[key])
+        return ""
+    safe = _portable_metadata_display(value).strip()
+    return "" if safe.startswith("<") and safe.endswith("redacted>") else safe
+
+
+def _artifact_rights_record(
+    value: Mapping[str, Any],
+    *,
+    default_source_kind: str,
+) -> dict[str, Any]:
+    """Normalize one conservative, path-free artifact rights declaration."""
+
+    source = _rights_source(value)
+    raw_license = source.get("license", source.get("licence", source.get("license_id")))
+    if isinstance(raw_license, Mapping):
+        raw_license = raw_license.get("id", raw_license.get("spdx", raw_license.get("name")))
+    license_id = _text(raw_license)
+    license_safe = bool(_RIGHTS_LICENSE_RE.fullmatch(license_id))
+    if not license_safe or license_id.upper() == "NOASSERTION":
+        license_id = "NOASSERTION"
+    derived_license_status = "declared" if license_id != "NOASSERTION" else "missing"
+    declared_license_status = _text(source.get("license_status")).lower()
+    license_status = derived_license_status
+    if declared_license_status and declared_license_status != derived_license_status:
+        license_status = "conflict"
+
+    raw_kind = _text(source.get("source_kind", source.get("origin"))).lower()
+    aliases = {
+        "first_party": "project", "first-party": "project",
+        "original": "project", "local": "project",
+        "external": "third_party", "published": "third_party",
+        "third-party": "third_party",
+    }
+    source_kind = aliases.get(raw_kind, raw_kind) if raw_kind else default_source_kind
+    if source_kind not in {"project", "third_party", "unknown"}:
+        source_kind = "unknown"
+
+    result: dict[str, Any] = {
+        "schema": ARTIFACT_RIGHTS_SCHEMA,
+        "license": license_id,
+        "license_status": license_status,
+        "attribution": _rights_attribution(source.get("attribution")),
+        "source_kind": source_kind,
+    }
+    explicit_third_party = source.get("third_party")
+    if isinstance(explicit_third_party, bool):
+        result["third_party"] = explicit_third_party
+    elif source_kind in {"project", "third_party"}:
+        result["third_party"] = source_kind == "third_party"
+    if (
+        "third_party" in result
+        and source_kind in {"project", "third_party"}
+        and result["third_party"] != (source_kind == "third_party")
+    ):
+        result["license_status"] = "conflict"
+
+    redistributable = source.get("redistributable")
+    if isinstance(redistributable, bool):
+        result["redistributable"] = redistributable
+        result["redistributable_status"] = "declared"
+    else:
+        result["redistributable_status"] = "missing"
+    declared_redistributable_status = _text(
+        source.get("redistributable_status")).lower()
+    if (
+        declared_redistributable_status
+        and declared_redistributable_status != result["redistributable_status"]
+    ):
+        result["redistributable_status"] = "conflict"
+    return result
+
+
+def _conflicting_rights_record() -> dict[str, Any]:
+    return {
+        "schema": ARTIFACT_RIGHTS_SCHEMA,
+        "license": "NOASSERTION",
+        "license_status": "conflict",
+        "attribution": "",
+        "source_kind": "unknown",
+        "redistributable_status": "conflict",
     }
 
 
@@ -1486,6 +1626,8 @@ def _stage_figures(model: dict, assets_dir: Path, formats: Sequence[str]) -> tup
                 "DOCX/PDF reports require a raster image"
             )
         digest = _sha256_file(source)
+        rights = _artifact_rights_record(
+            figure, default_source_kind="unknown")
         record = records_by_digest.get(digest)
         if record is None:
             assets_dir.mkdir(parents=True, exist_ok=True)
@@ -1500,8 +1642,13 @@ def _stage_figures(model: dict, assets_dir: Path, formats: Sequence[str]) -> tup
                 "sha256": digest,
                 "size": target.stat().st_size,
                 "media_type": mimetypes.guess_type(asset_name)[0] or "application/octet-stream",
+                "logical_role": "report_figure",
+                "authority": "report_service_frozen_revision",
+                "rights": rights,
             }
             records_by_digest[digest] = record
+        elif record["rights"] != rights:
+            record["rights"] = _conflicting_rights_record()
 
         staged = {key: value for key, value in figure.items() if not key.startswith("_")}
         staged.update(
@@ -1514,6 +1661,47 @@ def _stage_figures(model: dict, assets_dir: Path, formats: Sequence[str]) -> tup
         )
         result["figures"].append(staged)
     return result, list(records_by_digest.values())
+
+
+class _HTMLAssetReferenceParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.sources: list[str] = []
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]],
+    ) -> None:
+        if tag.lower() != "img":
+            return
+        for key, value in attrs:
+            if key.lower() == "src" and value is not None:
+                self.sources.append(value)
+
+
+def _html_relative_refs(
+    html_path: Path,
+    asset_records: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Bind every generated HTML image URL to one frozen asset record."""
+
+    parser = _HTMLAssetReferenceParser()
+    parser.feed(html_path.read_text(encoding="utf-8"))
+    parser.close()
+    actual = parser.sources
+    expected = [str(record.get("path") or "") for record in asset_records]
+    if len(expected) != len(set(expected)) or not set(actual).issubset(expected):
+        raise ValueError(
+            "rendered HTML relative asset references do not match its bundle manifest")
+    by_path = {str(record["path"]): record for record in asset_records}
+    return [
+        {
+            "path": path,
+            "sha256": str(by_path[path]["sha256"]),
+            "size": int(by_path[path]["size"]),
+            "logical_role": "report_figure",
+        }
+        for path in sorted(set(actual))
+    ]
 
 
 def _inline_preview_figures(model: dict) -> dict:

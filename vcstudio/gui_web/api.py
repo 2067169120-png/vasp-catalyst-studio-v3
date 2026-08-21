@@ -302,7 +302,8 @@ class Api:
                  reaction_domain_source=None, kinetics_projection_provider=None,
                  catalysis_authoring_service_factory=None,
                  kinetics_authoring_service_factory=None,
-                 trajectory_review_service=None):
+                 trajectory_review_service=None,
+                 archive_attachment_providers=None, archive_clock=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -431,6 +432,16 @@ class Api:
         # project-bound and single-use.  Note/review bodies never enter the
         # workspace/localStorage state axis.
         self._research_notebook_attachments = None
+        # DOI-ready local archives use a separate dry-run confirmation and
+        # purpose-bound destination registry.  Optional notebook/ledger exports
+        # arrive only through the generic provider contract; this API never
+        # imports a notebook implementation.
+        self._report_archive_destinations = None
+        self._report_archive_confirmations = None
+        self._archive_attachment_providers = tuple(archive_attachment_providers or ())
+        self._report_archive_transactions = None
+        self._report_archive_transaction_lock = threading.RLock()
+        self._report_archive_clock = archive_clock or time.monotonic
         # Phase B 可恢复工作区状态只保存 UI 偏好/草稿引用，与 project.yaml 科学事实分离。
         # 测试可注入内存/临时目录 store；生产首次调用时再创建用户级 JSON store。
         self._workspace_state_store = workspace_state_store
@@ -8829,13 +8840,15 @@ class Api:
     @staticmethod
     def _report_insight_failure(schema, exc, **extra):
         from vcstudio.project.report_insights import StaleRevisionError, redact
+        from vcstudio.project.reproducibility_archive import _public_safe_value
 
         status = ('stale' if isinstance(exc, StaleRevisionError) else
                   'blocked' if isinstance(exc, FileExistsError) else
                   'unavailable')
         result = {
             'schema': schema, 'ok': False, 'status': status,
-            'project_id': None, 'error': redact(str(exc)),
+            'project_id': None,
+            'error': _public_safe_value(redact(str(exc))),
         }
         result.update(extra)
         return result
@@ -9132,6 +9145,445 @@ class Api:
         except Exception:                                 # noqa: BLE001 public boundary
             return self._project_identity_failure(
                 schema='vcstudio.external-reference-candidate/v1')
+
+    _ARCHIVE_DESTINATION_REQUEST_SCHEMA = (
+        'vcstudio.vcs-archive-destination-request/v1')
+    _ARCHIVE_DESTINATION_SCHEMA = 'vcstudio.vcs-archive-destination/v1'
+    _ARCHIVE_EXPORT_RECEIPT_SCHEMA = 'vcstudio.vcs-archive-export-receipt/v1'
+    _ARCHIVE_OPERATION_RE = re.compile(
+        r'archive-operation\.[A-Za-z0-9][A-Za-z0-9._:-]{0,126}\Z')
+    _ARCHIVE_CAPABILITY_RE = re.compile(
+        r'archive-(?:preview|confirm|destination)\.[A-Za-z0-9._~:-]{8,192}\Z')
+    _ARCHIVE_MAX_TRANSACTIONS = 32
+
+    @classmethod
+    def _archive_public_dto(cls, value):
+        """Recursively project every archive success/failure through one seam.
+
+        Opaque archive capabilities are intentionally preserved because the Web
+        bridge needs them for the next phase.  Filesystem locators and credential
+        fields are removed, and all scalar text still passes through the archive
+        path/secret scanner.
+        """
+        from vcstudio.project.reproducibility_archive import _public_safe_value
+
+        allowed_capabilities = {
+            'preview_token', 'confirmation_token', 'destination_token',
+        }
+        denied = {
+            'path', 'project_path', 'root', 'directory', 'destination_path',
+            'output_dir', 'manifest_path', 'source_path', 'locator',
+            'password', 'passwd', 'secret', 'api_key', 'private_key',
+            'credential', 'credentials', 'authorization', 'cookie', 'cookies',
+        }
+
+        def project(item, key=''):
+            normalized = re.sub(
+                r'[^a-z0-9]+', '_', str(key).lower()).strip('_')
+            if normalized in denied or (
+                    normalized.endswith(('_password', '_secret', '_api_key',
+                                         '_private_key', '_credential'))):
+                return None, False
+            if isinstance(item, Mapping):
+                public = {}
+                for raw_key, child in item.items():
+                    child_key = str(raw_key)
+                    child_value, keep = project(child, child_key)
+                    if keep:
+                        public[child_key] = child_value
+                return public, True
+            if isinstance(item, (list, tuple)):
+                return [project(child)[0] for child in item], True
+            if normalized in allowed_capabilities:
+                if item is None:
+                    return None, True
+                token = str(item or '').strip()
+                return (token if cls._ARCHIVE_CAPABILITY_RE.fullmatch(token)
+                        else None), bool(cls._ARCHIVE_CAPABILITY_RE.fullmatch(token))
+            return _public_safe_value(item), True
+
+        return project(value)[0]
+
+    @staticmethod
+    def _archive_payload_sha256(value):
+        encoded = json.dumps(
+            value, ensure_ascii=False, sort_keys=True,
+            separators=(',', ':'), allow_nan=False).encode('utf-8')
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _archive_confirmation_registry(self):
+        from vcstudio.project.reproducibility_archive import ArchiveConfirmations
+
+        lock = getattr(self, '_report_archive_transaction_lock', None)
+        if lock is None:
+            lock = threading.RLock()
+            self._report_archive_transaction_lock = lock
+        with lock:
+            if getattr(self, '_report_archive_confirmations', None) is None:
+                clock = getattr(self, '_report_archive_clock', time.monotonic)
+                self._report_archive_confirmations = ArchiveConfirmations(clock=clock)
+        return self._report_archive_confirmations
+
+    def _archive_transaction_state(self):
+        lock = getattr(self, '_report_archive_transaction_lock', None)
+        if lock is None:
+            lock = threading.RLock()
+            self._report_archive_transaction_lock = lock
+        with lock:
+            state = getattr(self, '_report_archive_transactions', None)
+            if state is None:
+                state = {'operations': {}, 'previews': {}}
+                self._report_archive_transactions = state
+            return state
+
+    def _archive_transaction_lock(self):
+        lock = getattr(self, '_report_archive_transaction_lock', None)
+        if lock is None:
+            lock = threading.RLock()
+            self._report_archive_transaction_lock = lock
+        return lock
+
+    def _archive_prune_transactions_locked(self):
+        state = self._archive_transaction_state()
+        clock = getattr(self, '_report_archive_clock', time.monotonic)
+        now = float(clock())
+        expired = [
+            key for key, transaction in state['operations'].items()
+            if now >= float(transaction.get('expires_at') or now)
+        ]
+        for key in expired:
+            transaction = state['operations'].pop(key, None)
+            if transaction is not None:
+                state['previews'].pop(transaction.get('preview_token'), None)
+        while len(state['operations']) >= self._ARCHIVE_MAX_TRANSACTIONS:
+            oldest_key = min(
+                state['operations'],
+                key=lambda item: state['operations'][item]['created_at'])
+            transaction = state['operations'].pop(oldest_key)
+            state['previews'].pop(transaction.get('preview_token'), None)
+
+    @classmethod
+    def _archive_operation_key(cls, value):
+        key = str(value or '').strip()
+        if not cls._ARCHIVE_OPERATION_RE.fullmatch(key):
+            raise ValueError('archive idempotency key is invalid')
+        return key
+
+    @staticmethod
+    def _archive_exact_mapping(value, required, label):
+        if not isinstance(value, Mapping) or set(value) != set(required):
+            raise ValueError(f'{label} envelope is invalid')
+        return dict(value)
+
+    @classmethod
+    def _archive_failure(cls, schema, exc, **extra):
+        from vcstudio.project.report_insights import StaleRevisionError, redact
+
+        status = ('stale' if isinstance(exc, StaleRevisionError) else
+                  'blocked' if isinstance(exc, (ValueError, FileExistsError)) else
+                  'unavailable')
+        result = {
+            'schema': schema, 'ok': False, 'status': status,
+            'project_id': None, 'error': redact(str(exc)), **extra,
+        }
+        return cls._archive_public_dto(result)
+
+    @staticmethod
+    def _archive_plan_request_binding(plan, operation_key):
+        revision = plan.get('revision') if isinstance(
+            plan.get('revision'), Mapping) else {}
+        archive = plan.get('archive') if isinstance(
+            plan.get('archive'), Mapping) else {}
+        return {
+            'schema': Api._ARCHIVE_DESTINATION_REQUEST_SCHEMA,
+            'preview_token': plan.get('preview_token'),
+            'project_id': plan.get('project_id'),
+            'revision': {
+                'report_id': revision.get('report_id'),
+                'revision_id': revision.get('revision_id'),
+                'manifest_sha256': revision.get('manifest_sha256'),
+            },
+            'plan_sha256': plan.get('plan_sha256'),
+            'rights_sha256': plan.get('rights_sha256'),
+            'inventory_sha256': plan.get('inventory_sha256'),
+            'archive': {
+                'name': archive.get('name'), 'sha256': archive.get('sha256'),
+                'size': archive.get('size'), 'version': archive.get('version'),
+            },
+            'idempotency_key': operation_key,
+        }
+
+    def report_archive_dry_run(self, project_id, revision_id,
+                               idempotency_key=None):
+        """Freeze a path-free plan receipt; this is not human confirmation."""
+        from vcstudio.project.reproducibility_archive import PLAN_SCHEMA, build_archive_plan
+
+        try:
+            identifier = str(project_id or '').strip()
+            revision_identifier = str(revision_id or '').strip()
+            operation_key = self._archive_operation_key(idempotency_key)
+            record = self._report_insight_record(identifier)
+
+            def plan_archive():
+                request_sha256 = self._archive_payload_sha256({
+                    'project_id': identifier, 'revision_id': revision_identifier,
+                    'idempotency_key': operation_key,
+                })
+                with self._archive_transaction_lock():
+                    self._archive_prune_transactions_locked()
+                    state = self._archive_transaction_state()
+                    replay = state['operations'].get(operation_key)
+                    if replay is not None:
+                        if replay['request_sha256'] != request_sha256:
+                            raise ValueError(
+                                'archive idempotency key was reused for different input')
+                        public = copy.deepcopy(replay['public_plan'])
+                        public['replayed'] = True
+                        return self._archive_public_dto(public)
+                    plan = build_archive_plan(
+                        self._reports(), record['path'], revision_identifier,
+                        attachment_providers=getattr(
+                            self, '_archive_attachment_providers', ()))
+                    public = plan.public_summary()
+                    receipt = self._archive_confirmation_registry().register_plan(plan)
+                    preview_token = str(receipt.get('preview_token') or '')
+                    if not self._ARCHIVE_CAPABILITY_RE.fullmatch(preview_token):
+                        raise ValueError('archive preview receipt is invalid')
+                    for field in ('plan_sha256', 'rights_sha256', 'inventory_sha256'):
+                        if not re.fullmatch(r'[0-9a-f]{64}', str(public.get(field) or '')):
+                            raise ValueError(f'archive plan is missing {field}')
+                    public.update({
+                        'preview_token': preview_token,
+                        'confirmation_token': None,
+                        'ttl_seconds': float(receipt.get('ttl_seconds') or 900),
+                        'replayed': False,
+                    })
+                    clock = getattr(self, '_report_archive_clock', time.monotonic)
+                    created_at = float(clock())
+                    ttl_seconds = float(public['ttl_seconds'])
+                    transaction = {
+                        'request_sha256': request_sha256,
+                        'operation_key': operation_key,
+                        'project_id': identifier,
+                        'revision_id': revision_identifier,
+                        'plan': plan,
+                        'public_plan': copy.deepcopy(public),
+                        'preview_token': preview_token,
+                        'created_at': created_at,
+                        'expires_at': created_at + ttl_seconds,
+                        'phase': 'planned',
+                        'destination': None,
+                        'destination_token': None,
+                        'destination_response': None,
+                        'challenge': None,
+                        'completed_request_sha256': None,
+                        'completed_result': None,
+                    }
+                    state['operations'][operation_key] = transaction
+                    state['previews'][preview_token] = transaction
+                    return self._archive_public_dto(public)
+
+            result = self._call_with_project_bindings([record], plan_archive)
+            return self._archive_public_dto(result)
+        except Exception as exc:                         # noqa: BLE001 public seam
+            return self._archive_failure(
+                PLAN_SCHEMA, exc, revision=None, archive=None,
+                plan_sha256=None, rights_sha256=None, inventory_sha256=None,
+                preview_token=None, confirmation_token=None, ttl_seconds=None,
+                readiness=None, decisions=[], replayed=False)
+
+    def report_archive_pick_destination(self, project_id, request=None, *legacy):
+        """Bind a selected directory identity to a strict, unconfirmed plan."""
+        schema = self._ARCHIVE_DESTINATION_SCHEMA
+        try:
+            if legacy:
+                raise ValueError('legacy archive destination API is closed')
+            identifier = str(project_id or '').strip()
+            request = self._archive_exact_mapping(request, {
+                'schema', 'preview_token', 'project_id', 'revision',
+                'plan_sha256', 'rights_sha256', 'inventory_sha256', 'archive',
+                'idempotency_key',
+            }, 'archive destination request')
+            if request['schema'] != self._ARCHIVE_DESTINATION_REQUEST_SCHEMA:
+                raise ValueError('archive destination request schema is invalid')
+            operation_key = self._archive_operation_key(request['idempotency_key'])
+            if request.get('project_id') != identifier:
+                raise ValueError('archive destination project binding mismatch')
+            record = self._report_insight_record(identifier)
+
+            def pick_destination():
+                from vcstudio.project.report_insights import capture_trusted_directory
+                from vcstudio.project.reproducibility_archive import (
+                    destination_identity_sha256,
+                )
+
+                with self._archive_transaction_lock():
+                    self._archive_prune_transactions_locked()
+                    transaction = self._archive_transaction_state()[
+                        'operations'].get(operation_key)
+                    if transaction is None:
+                        raise ValueError('archive preview is invalid or expired')
+                    expected = self._archive_plan_request_binding(
+                        transaction['public_plan'], operation_key)
+                    if request != expected:
+                        raise ValueError('archive destination request binding mismatch')
+                    if transaction['destination_response'] is not None:
+                        replay = copy.deepcopy(transaction['destination_response'])
+                        replay['replayed'] = True
+                        return self._archive_public_dto(replay)
+                    if getattr(self, '_dialog_fn', None) is not None:
+                        path = self._dialog_fn('dir')
+                    else:
+                        import webview                     # delayed optional dependency
+
+                        selected = webview.windows[0].create_file_dialog(
+                            webview.FOLDER_DIALOG)
+                        path = selected[0] if selected else None
+                    if not path:
+                        return self._archive_public_dto({
+                            'schema': schema, 'ok': True, 'cancelled': True,
+                            'destination_token': None,
+                            'destination_identity_sha256': None,
+                            'confirmation': None, 'replayed': False, 'error': None,
+                        })
+                    selection = capture_trusted_directory(path)
+                    identity_sha256 = destination_identity_sha256(selection)
+                    challenge = self._archive_confirmation_registry().bind_destination(
+                        transaction['preview_token'],
+                        destination_identity_sha256=identity_sha256)
+                    destination_token = 'archive-destination.' + uuid.uuid4().hex
+                    response = {
+                        'schema': schema, 'ok': True, 'cancelled': False,
+                        'destination_token': destination_token,
+                        'destination_identity_sha256': identity_sha256,
+                        'confirmation': copy.deepcopy(challenge),
+                        'replayed': False, 'error': None,
+                    }
+                    transaction.update({
+                        'phase': 'destination_bound', 'destination': selection,
+                        'destination_token': destination_token,
+                        'destination_response': copy.deepcopy(response),
+                        'challenge': copy.deepcopy(challenge),
+                    })
+                    return self._archive_public_dto(response)
+
+            result = self._call_with_project_bindings([record], pick_destination)
+            return self._archive_public_dto(result)
+        except Exception as exc:                         # noqa: BLE001 public seam
+            return self._archive_failure(
+                schema, exc, cancelled=False, destination_token=None,
+                destination_identity_sha256=None, confirmation=None,
+                replayed=False)
+
+    def report_archive_export(self, project_id, confirmation=None, *legacy):
+        """Validate and atomically consume one explicit browser confirmation."""
+        from vcstudio.project.reproducibility_archive import RESULT_SCHEMA, export_archive
+
+        try:
+            if legacy or not isinstance(confirmation, Mapping):
+                raise ValueError('legacy archive export API is closed')
+            identifier = str(project_id or '').strip()
+            operation_key = self._archive_operation_key(
+                confirmation.get('idempotency_key'))
+            record = self._report_insight_record(identifier)
+
+            def export_confirmed():
+                registry = self._archive_confirmation_registry()
+                with self._archive_transaction_lock():
+                    self._archive_prune_transactions_locked()
+                    transaction = self._archive_transaction_state()[
+                        'operations'].get(operation_key)
+                    if transaction is None:
+                        raise ValueError('archive confirmation is invalid or expired')
+                    challenge = transaction.get('challenge')
+                    required = set(challenge or {}) | {
+                        'confirmed', 'idempotency_key', 'destination_token',
+                    }
+                    envelope = self._archive_exact_mapping(
+                        confirmation, required, 'archive confirmation')
+                    expected = {
+                        **copy.deepcopy(challenge or {}),
+                        'confirmed': True,
+                        'idempotency_key': operation_key,
+                        'destination_token': transaction.get('destination_token'),
+                    }
+                    if envelope != expected or identifier != transaction['project_id']:
+                        raise ValueError('archive confirmation binding mismatch')
+                    request_sha256 = self._archive_payload_sha256(envelope)
+                    if transaction['completed_result'] is not None:
+                        if transaction['completed_request_sha256'] != request_sha256:
+                            raise ValueError(
+                                'archive idempotency key was reused for different input')
+                        replay = copy.deepcopy(transaction['completed_result'])
+                        replay['replayed'] = True
+                        return self._archive_public_dto(replay)
+                    core_envelope = {
+                        key: copy.deepcopy(value)
+                        for key, value in envelope.items()
+                        if key not in {'confirmed', 'idempotency_key',
+                                       'destination_token'}
+                    }
+                    claim = registry.claim_confirmed(
+                        core_envelope, confirmed=True,
+                        idempotency_key=operation_key)
+                    if claim.replayed:
+                        replay = dict(copy.deepcopy(claim.replay_result))
+                        replay['replayed'] = True
+                        public = self._archive_public_dto(replay)
+                        transaction.update({
+                            'phase': 'completed',
+                            'completed_request_sha256': request_sha256,
+                            'completed_result': copy.deepcopy(public),
+                        })
+                        return public
+                    plan = transaction['plan']
+                    try:
+                        result = export_archive(
+                            self._reports(), record['path'], plan.revision_id,
+                            transaction['destination'],
+                            expected_plan_sha256=plan.plan_sha256,
+                            expected_source_manifest_sha256=(
+                                plan.source_manifest_sha256),
+                            expected_archive_sha256=plan.archive_sha256,
+                            expected_inventory_sha256=plan.inventory_sha256,
+                            expected_rights_sha256=plan.rights_sha256,
+                            expected_destination_identity_sha256=(
+                                challenge['destination_identity_sha256']),
+                            attachment_providers=getattr(
+                                self, '_archive_attachment_providers', ()))
+                        result = dict(result)
+                        result.update({
+                            'replayed': False,
+                            'receipt': {
+                                'schema': self._ARCHIVE_EXPORT_RECEIPT_SCHEMA,
+                                'nonce': challenge.get('nonce'),
+                                'idempotency_key': operation_key,
+                                'confirmation_sha256': request_sha256,
+                            },
+                        })
+                        registry.complete_confirmed(claim, result)
+                    except Exception as exc:             # noqa: BLE001 cache exact failure
+                        failure = self._archive_failure(
+                            RESULT_SCHEMA, exc, revision=None, file=None,
+                            verification=None, readiness=None, receipt=None,
+                            replayed=False)
+                        registry.complete_confirmed(claim, failure)
+                        result = failure
+                    public = self._archive_public_dto(result)
+                    transaction.update({
+                        'phase': 'completed',
+                        'completed_request_sha256': request_sha256,
+                        'completed_result': copy.deepcopy(public),
+                    })
+                    return public
+
+            result = self._call_with_project_bindings([record], export_confirmed)
+            return self._archive_public_dto(result)
+        except Exception as exc:                         # noqa: BLE001 public seam
+            return self._archive_failure(
+                RESULT_SCHEMA, exc, revision=None, file=None,
+                verification=None, readiness=None, receipt=None,
+                replayed=False)
 
     # ── Phase D:分析配置工作台 API ───────────────────────────────────────
     _ANALYSIS_BOOTSTRAP_SCHEMA = 'vcstudio.analysis-workbench-bootstrap/v1'

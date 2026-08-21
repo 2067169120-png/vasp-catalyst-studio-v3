@@ -2783,6 +2783,45 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
               <button class="btn quiet" type="button" id="rw-discard-draft" disabled>丢弃当前草稿</button>
             </div>
             <output class="rw-output-path" id="rw-output-path">发布时尚未选择目录</output>
+
+            <section class="rw-archive" id="rw-archive" aria-labelledby="rw-archive-heading">
+              <header class="rw-archive-heading">
+                <div>
+                  <h4 id="rw-archive-heading" tabindex="-1"
+                    data-i18n="report.archive.title">DOI-ready 本地可复现归档</h4>
+                  <p data-i18n="report.archive.description">只从已冻结且重新校验的 revision 生成确定性 archive。</p>
+                </div>
+                <span id="rw-archive-state" data-state="idle" role="status"
+                  aria-live="polite" data-i18n="report.archive.state.idle">等待 dry-run</span>
+              </header>
+              <p class="rw-archive-boundary" data-i18n="report.archive.boundary">本地生成，不上传、不申请 DOI、不改变科学状态；POTCAR 原文始终排除。</p>
+              <div class="rw-field">
+                <label for="rw-archive-revision"
+                  data-i18n="report.archive.revision">权威 revision</label>
+                <select class="ipt" id="rw-archive-revision" disabled></select>
+              </div>
+              <div class="actions rw-archive-actions">
+                <button class="btn" type="button" id="rw-archive-plan" disabled
+                  data-i18n="report.archive.dry_run">生成归档清单 / Dry run</button>
+                <button class="btn primary" type="button" id="rw-archive-export" disabled
+                  data-i18n="report.archive.confirm_export">确认并生成本地 archive</button>
+              </div>
+              <div class="rw-archive-summary" id="rw-archive-summary" role="status"
+                aria-live="polite" data-i18n="report.archive.idle">选择一个 current revision 后先运行 dry-run。</div>
+              <div class="rw-archive-inventory" id="rw-archive-inventory" role="region"
+                aria-labelledby="rw-archive-inventory-heading" tabindex="0" hidden>
+                <h5 id="rw-archive-inventory-heading"
+                  data-i18n="report.archive.inventory">归档成员与排除清单</h5>
+                <div id="rw-archive-inventory-table"></div>
+              </div>
+              <div class="rw-archive-gaps" id="rw-archive-gaps" hidden></div>
+              <section class="rw-archive-result" id="rw-archive-result" hidden
+                aria-labelledby="rw-archive-result-heading">
+                <h5 id="rw-archive-result-heading" tabindex="-1"
+                  data-i18n="report.archive.result">归档结果与自动校验</h5>
+                <div id="rw-archive-result-body"></div>
+              </section>
+            </section>
           </section>
         </form>
       </aside>

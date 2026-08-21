@@ -637,3 +637,266 @@ assert.strictEqual(calls.filter(call => call[0] === 'report_capsule_export').len
 """,
         str(ASSETS / "report-workbench.js"),
     )
+def test_export_step_has_accessible_archive_dry_run_confirmation_and_result_regions():
+    html = _source("index.html")
+
+    assert 'id="rw-archive" aria-labelledby="rw-archive-heading"' in html
+    assert 'id="rw-archive-state" data-state="idle" role="status"' in html
+    assert 'id="rw-archive-revision" disabled' in html
+    assert 'id="rw-archive-plan" disabled' in html
+    assert 'id="rw-archive-export" disabled' in html
+    assert 'id="rw-archive-summary" role="status"' in html
+    assert 'id="rw-archive-inventory" role="region"' in html
+    assert 'aria-labelledby="rw-archive-inventory-heading" tabindex="0"' in html
+    assert 'id="rw-archive-result-heading" tabindex="-1"' in html
+    assert 'data-i18n="report.archive.boundary"' in html
+
+
+def test_archive_frontend_is_dry_run_first_last_wins_and_opaque_token_only():
+    js = _source("report-workbench.js")
+    plan = js[js.index("async function planReproducibilityArchive("):
+              js.index("async function exportReproducibilityArchive(")]
+    export = js[js.index("async function exportReproducibilityArchive("):
+                js.index("function renderActions(")]
+
+    assert "'report_archive_dry_run', projectId, revisionId, context.operationKey" in plan
+    assert "const context = beginArchiveContext(projectId, revisionId)" in plan
+    assert "archiveContextCurrent(context, { plan: false })" in plan
+    assert "result.preview_token" in js
+    assert "result.confirmation_token" in js
+    assert "result.plan_sha256" in js
+    assert "result.rights_sha256" in js
+    assert "result.inventory_sha256" in js
+    assert "const selected = await VCS.call" in export
+    assert "'report_archive_pick_destination', projectId, destinationRequest" in export
+    assert export.index("report_archive_pick_destination") < export.index("await confirm")
+    assert "const confirmation = {" in export
+    assert "confirmed: true" in export
+    assert "idempotency_key: context.operationKey" in export
+    assert "destination_token: context.destinationToken" in export
+    assert "VCS.call('report_archive_export', projectId, confirmation)" in export
+    assert "plain(result.verification).ok !== true" in export
+    assert "archiveContextCurrent(context, { destination: true, envelope: true })" in export
+    for forbidden in ("outputDir", "destination.path", "project_path", "manifest_path"):
+        assert forbidden not in export
+
+
+def test_archive_project_revision_switch_invalidation_and_keyboard_focus_are_explicit():
+    js = _source("report-workbench.js")
+    reset = js[js.index("function resetArchiveState("):
+               js.index("function selectedArchiveRow(")]
+    wire = js[js.index("function wire("):]
+
+    assert "State.archiveGeneration += 1" in reset
+    assert "State.archiveConfirmationToken = ''" in reset
+    assert "State.archiveDestinationToken = ''" in reset
+    assert "resetArchiveState();" in js[js.index("async function loadBootstrap("):
+                                          js.index("async function selectPreset(")]
+    assert "archiveRevision.addEventListener('change'" in wire
+    assert "resetArchiveState({ keepRevision: true })" in wire
+    assert "heading.focus({ preventScroll: true })" in js
+    assert "const accepted = await confirm" in js
+    assert "button:not([disabled])" in _source("app.js")
+
+
+def test_archive_fakedom_selects_destination_before_human_confirm_and_sends_strict_envelope():
+    _run_node(
+        r"""
+const projectId = 'project-' + 'a'.repeat(32); const revisionId = 'report-r1';
+const hash = char => char.repeat(64); const calls = []; const prompts = [];
+window.Project = { current() { return { project_id: projectId, name: 'Project A' }; } };
+element('rw-archive-revision', { value: revisionId });
+function revision() { return { report_id: 'report-1', revision_id: revisionId,
+  manifest_sha256: hash('a') }; }
+function archive() { return { name: 'report-r1-v1.zip', sha256: hash('b'), size: 321,
+  version: 1 }; }
+function plan() { return { schema: 'vcstudio.vcs-archive-plan/v1', ok: true,
+  status: 'dry_run_ready', project_id: projectId, revision: revision(), archive: archive(),
+  plan_sha256: hash('c'), rights_sha256: hash('d'), inventory_sha256: hash('e'),
+  preview_token: 'archive-preview.opaque-value', confirmation_token: null,
+  ttl_seconds: 900, replayed: false, readiness: { status: 'not_ready', gaps: [] },
+  denominator: { decisions: 1, included: 1, excluded: 0 },
+  decisions: [{ archive_path: 'README.md', logical_role: 'archive_readme', size: 10,
+    license: 'NOASSERTION', attribution: '', sensitive_risk: 'low', decision: 'include',
+    exclusion_reason: null }] }; }
+function challenge() { return { schema: 'vcstudio.vcs-archive-confirmation/v1',
+  phase: 'confirmation', confirmation_token: 'archive-confirm.opaque-value',
+  project_id: projectId, report_id: 'report-1', revision_id: revisionId,
+  source_manifest_sha256: hash('a'), plan_sha256: hash('c'), rights_sha256: hash('d'),
+  inventory_sha256: hash('e'), archive_name: archive().name,
+  archive_sha256: hash('b'), archive_size: 321, destination_identity_sha256: hash('f'),
+  nonce: 'archive-nonce.opaque-value', created_at: 1000, expires_at: 1900,
+  ttl_seconds: 900 }; }
+VCS.call = async (...args) => {
+  calls.push(args);
+  if (args[0] === 'report_archive_dry_run') return plan();
+  if (args[0] === 'report_archive_pick_destination') return {
+    schema: 'vcstudio.vcs-archive-destination/v1', ok: true, cancelled: false,
+    destination_token: 'archive-destination.opaque-value',
+    destination_identity_sha256: hash('f'), confirmation: challenge(),
+    replayed: false, error: null };
+  if (args[0] === 'report_archive_export') return {
+    schema: 'vcstudio.vcs-archive-result/v1', ok: true,
+    status: 'verified_local_archive', project_id: projectId, revision: revision(),
+    plan_sha256: hash('c'), rights_sha256: hash('d'), inventory_sha256: hash('e'),
+    file: { name: archive().name, sha256: hash('b'), size: 321 },
+    verification: { ok: true, status: 'verified', checksums: 'pass' },
+    readiness: { status: 'not_ready', gaps: [] }, replayed: false,
+    receipt: { schema: 'vcstudio.vcs-archive-export-receipt/v1',
+      nonce: 'archive-nonce.opaque-value', idempotency_key: args[2].idempotency_key,
+      confirmation_sha256: hash('9') } };
+  throw new Error('unexpected method ' + args[0]);
+};
+VCS.confirm = async message => { prompts.push(message); calls.push(['browser_confirm']); return true; };
+loadAsset(process.argv[1]);
+const seam = window.__VCS_REPORT_WORKBENCH_TEST__;
+seam.state.projectId = projectId; seam.state.historyStatus = 'ready';
+seam.state.history = [{ report_id: 'report-1', revision_id: revisionId,
+  manifest_sha256: hash('a'), current: true, artifact_status: 'ready' }];
+assert.strictEqual(await seam.planReproducibilityArchive(), true);
+assert.strictEqual(await seam.exportReproducibilityArchive(), true);
+assert.deepStrictEqual(calls.map(call => call[0]), [
+  'report_archive_dry_run', 'report_archive_pick_destination',
+  'browser_confirm', 'report_archive_export']);
+const operationKey = calls[0][3];
+assert.match(operationKey, /^archive-operation\.[A-Za-z0-9._:-]+$/);
+assert.deepStrictEqual(calls[0].slice(1), [projectId, revisionId, operationKey]);
+const destinationRequest = calls[1][2];
+assert.strictEqual(destinationRequest.idempotency_key, operationKey);
+assert.strictEqual(destinationRequest.preview_token, 'archive-preview.opaque-value');
+const envelope = calls[3][2];
+assert.strictEqual(envelope.confirmed, true);
+assert.strictEqual(envelope.idempotency_key, operationKey);
+assert.strictEqual(envelope.destination_token, 'archive-destination.opaque-value');
+assert.strictEqual(envelope.destination_identity_sha256, hash('f'));
+assert.strictEqual(prompts.length, 1);
+assert.ok(prompts[0].includes(hash('f').slice(0, 12)));
+""",
+        str(ASSETS / "report-workbench.js"),
+    )
+
+
+def test_archive_fakedom_late_context_mutations_and_conflict_are_discarded_without_retry():
+    _run_node(
+        r"""
+const projectId = 'project-' + 'a'.repeat(32); const revisionId = 'report-r1';
+let currentProjectId = projectId; const hash = char => char.repeat(64); const calls = [];
+window.Project = { current() { return { project_id: currentProjectId }; } };
+const select = element('rw-archive-revision', { value: revisionId });
+loadAsset(process.argv[1]);
+const seam = window.__VCS_REPORT_WORKBENCH_TEST__;
+seam.state.projectId = projectId; seam.state.historyStatus = 'ready';
+seam.state.history = [{ report_id: 'report-1', revision_id: revisionId,
+  manifest_sha256: hash('a'), current: true, artifact_status: 'ready' },
+  { report_id: 'report-1', revision_id: 'report-r2', manifest_sha256: hash('2'),
+    current: true, artifact_status: 'ready' }];
+seam.state.archiveRevisionId = revisionId;
+seam.state.archiveOperationKey = 'archive-operation.opaque-value';
+seam.state.archivePlan = { project_id: projectId, plan_sha256: hash('c'),
+  rights_sha256: hash('d'), inventory_sha256: hash('e'),
+  revision: { report_id: 'report-1', revision_id: revisionId, manifest_sha256: hash('a') },
+  archive: { name: 'archive.zip', sha256: hash('b'), size: 10, version: 1 } };
+let context = seam.beginArchiveContext(projectId, revisionId);
+assert.strictEqual(seam.archiveContextCurrent(context), true);
+select.value = 'report-r2';
+assert.strictEqual(seam.archiveContextCurrent(context), false);
+select.value = revisionId;
+seam.state.archivePlan = { ...seam.state.archivePlan, plan_sha256: hash('9') };
+assert.strictEqual(seam.archiveContextCurrent(context), false);
+seam.state.archivePlan.plan_sha256 = hash('c');
+context = seam.beginArchiveContext(projectId, revisionId);
+seam.state.archiveDestinationToken = 'archive-destination.opaque-value';
+seam.state.archiveDestinationBinding = hash('f');
+context.destinationToken = seam.state.archiveDestinationToken;
+context.destinationBinding = seam.state.archiveDestinationBinding;
+seam.state.archiveEnvelope = { nonce: 'archive-nonce.opaque-value' };
+seam.state.archiveEnvelopeFingerprint = seam.archiveFingerprint(seam.state.archiveEnvelope);
+context.envelopeFingerprint = seam.state.archiveEnvelopeFingerprint;
+assert.strictEqual(seam.archiveContextCurrent(context, { destination: true, envelope: true }), true);
+seam.state.archiveDestinationBinding = hash('8');
+assert.strictEqual(seam.archiveContextCurrent(context, { destination: true, envelope: true }), false);
+seam.state.archiveDestinationBinding = context.destinationBinding;
+seam.state.archiveEnvelope = { nonce: 'archive-nonce.changed' };
+assert.strictEqual(seam.archiveContextCurrent(context, { destination: true, envelope: true }), false);
+seam.state.archiveEnvelope = { nonce: 'archive-nonce.opaque-value' };
+currentProjectId = 'project-' + 'f'.repeat(32);
+assert.strictEqual(seam.archiveContextCurrent(context, { destination: true, envelope: true }), false);
+
+// A definitive server conflict is adopted once and never automatically retried.
+currentProjectId = projectId; select.value = revisionId;
+seam.resetArchiveState({ keepRevision: true }); seam.state.archiveRevisionId = revisionId;
+seam.state.history = seam.state.history.slice(0, 1);
+function plan() { return { schema: 'vcstudio.vcs-archive-plan/v1', ok: true,
+  status: 'dry_run_ready', project_id: projectId,
+  revision: { report_id: 'report-1', revision_id: revisionId, manifest_sha256: hash('a') },
+  archive: { name: 'archive.zip', sha256: hash('b'), size: 10, version: 1 },
+  plan_sha256: hash('c'), rights_sha256: hash('d'), inventory_sha256: hash('e'),
+  preview_token: 'archive-preview.opaque-value', confirmation_token: null,
+  ttl_seconds: 900, replayed: false, readiness: { status: 'ready', gaps: [] },
+  denominator: { decisions: 0, included: 0, excluded: 0 }, decisions: [] }; }
+function challenge() { return { schema: 'vcstudio.vcs-archive-confirmation/v1',
+  phase: 'confirmation', confirmation_token: 'archive-confirm.opaque-value',
+  project_id: projectId, report_id: 'report-1', revision_id: revisionId,
+  source_manifest_sha256: hash('a'), plan_sha256: hash('c'), rights_sha256: hash('d'),
+  inventory_sha256: hash('e'), archive_name: 'archive.zip',
+  archive_sha256: hash('b'), archive_size: 10,
+  destination_identity_sha256: hash('f'), nonce: 'archive-nonce.opaque-value',
+  created_at: 1, expires_at: 901, ttl_seconds: 900 }; }
+VCS.call = async (...args) => {
+  calls.push(args);
+  if (args[0] === 'report_archive_dry_run') return plan();
+  if (args[0] === 'report_archive_pick_destination') return { ok: true, cancelled: false,
+    destination_token: 'archive-destination.opaque-value',
+    destination_identity_sha256: hash('f'), confirmation: challenge(), replayed: false };
+  if (args[0] === 'report_archive_export') return { ok: false, status: 'stale',
+    error: 'safe conflict' };
+  throw new Error('unexpected');
+};
+VCS.confirm = async () => true;
+assert.strictEqual(await seam.planReproducibilityArchive(), true);
+assert.strictEqual(await seam.exportReproducibilityArchive(), false);
+assert.strictEqual(calls.filter(call => call[0] === 'report_archive_export').length, 1);
+assert.strictEqual(seam.state.archivePreviewToken, '');
+""",
+        str(ASSETS / "report-workbench.js"),
+    )
+
+
+def test_archive_inventory_uses_local_scroll_long_text_wrapping_and_narrow_actions():
+    css = _source("report-workbench.css")
+
+    assert ".rw-archive-inventory{max-width:100%" in css
+    assert "overflow-x:auto" in css
+    assert ".rw-archive-inventory table{width:100%;min-width:720px" in css
+    assert ".rw-archive-heading h4" in css and "overflow-wrap:anywhere" in css
+    assert ".rw-archive-result dd" in css and "overflow-wrap:anywhere" in css
+    compact = css.split("@media(max-width:520px){", 1)[1]
+    assert ".rw-archive-actions{flex-direction:column}" in compact
+    assert ".rw-archive-actions .btn{width:100%;flex-basis:auto}" in compact
+
+
+def test_archive_visible_and_dynamic_copy_is_complete_in_both_locales():
+    en = json.loads((LOCALES / "en.json").read_text(encoding="utf-8"))
+    zh = json.loads((LOCALES / "zh.json").read_text(encoding="utf-8"))
+    required = {
+        "report.archive.title", "report.archive.description", "report.archive.boundary",
+        "report.archive.revision", "report.archive.dry_run",
+        "report.archive.confirm_export", "report.archive.confirm_message",
+        "report.archive.inventory", "report.archive.plan_summary",
+        "report.archive.gaps", "report.archive.result", "report.archive.verification",
+        "report.archive.readiness", "report.archive.release_boundary",
+        "report.archive.state.idle", "report.archive.state.planning",
+        "report.archive.state.planned", "report.archive.state.exporting",
+        "report.archive.state.verified", "report.archive.state.blocked",
+        "report.archive.state.stale", "report.archive.state.failed",
+        "report.archive.plan_invalid", "report.archive.destination_invalid",
+        "report.archive.confirm_unavailable", "report.archive.export_failed",
+        "report.archive.result_invalid",
+    }
+
+    assert required.issubset(en)
+    assert required.issubset(zh)
+    assert "not uploaded" in en["report.archive.local_only"]
+    assert "no DOI requested" in en["report.archive.local_only"]
+    assert "未上传" in zh["report.archive.local_only"]
+    assert "未申请 DOI" in zh["report.archive.local_only"]

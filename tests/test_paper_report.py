@@ -218,6 +218,67 @@ def test_render_all_formats_from_one_model_and_write_manifest(tmp_path):
         manifest["report_model_sha256"]
     )
     assert set(result["contract_files"]) == {"spec", "snapshot", "validation"}
+
+
+def test_manifest_governs_real_archive_inputs_and_html_relative_assets(tmp_path):
+    rights = {
+        "source_kind": "project",
+        "third_party": False,
+        "redistributable": True,
+        "license": "CC-BY-4.0",
+        "attribution": "VCS paper report fixture",
+    }
+    model = _validated_model(tmp_path)
+    model["extensions"] = {"rights": copy.deepcopy(rights)}
+    model["figures"][0]["rights"] = copy.deepcopy(rights)
+    _rebind_report_content(model)
+
+    result = paper_report.render_report_bundle(
+        model, tmp_path / "governed-bundle", stem="governed")
+    manifest = json.loads(result["manifest"].read_text(encoding="utf-8"))
+
+    for fmt, media_type in {
+        "html": "text/html; charset=utf-8",
+        "docx": (
+            "application/vnd.openxmlformats-officedocument."
+            "wordprocessingml.document"
+        ),
+        "pdf": "application/pdf",
+    }.items():
+        record = manifest["files"][fmt]
+        artifact = result["files"][fmt]
+        assert record["logical_role"] == "rendered_report"
+        assert record["format"] == fmt
+        assert record["media_type"] == media_type
+        assert record["authority"] == "report_service_frozen_revision"
+        assert record["sha256"] == hashlib.sha256(artifact.read_bytes()).hexdigest()
+        assert record["size"] == artifact.stat().st_size
+        assert record["rights"] == {
+            "schema": paper_report.ARTIFACT_RIGHTS_SCHEMA,
+            "license": "CC-BY-4.0",
+            "license_status": "declared",
+            "attribution": "VCS paper report fixture",
+            "source_kind": "project",
+            "third_party": False,
+            "redistributable": True,
+            "redistributable_status": "declared",
+        }
+
+    asset = manifest["assets"][0]
+    assert asset["logical_role"] == "report_figure"
+    assert asset["authority"] == "report_service_frozen_revision"
+    assert asset["rights"] == manifest["files"]["html"]["rights"]
+    html_refs = manifest["files"]["html"]["relative_refs"]
+    assert html_refs == [{
+        "path": asset["path"],
+        "sha256": asset["sha256"],
+        "size": asset["size"],
+        "logical_role": "report_figure",
+    }]
+    referenced_asset = result["files"]["html"].parent / html_refs[0]["path"]
+    assert referenced_asset.read_bytes() == result["assets"][0].read_bytes()
+    assert result["files"]["docx"].read_bytes().startswith(b"PK")
+    assert result["files"]["pdf"].read_bytes().startswith(b"%PDF")
     assert manifest["model_sha256"] == result["model_sha256"]
     model_payload = json.loads(result["model_file"].read_text(encoding="utf-8"))
     assert paper_report._sha256_json(model_payload) == manifest["model_sha256"]

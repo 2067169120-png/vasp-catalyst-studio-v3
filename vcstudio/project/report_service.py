@@ -22,6 +22,7 @@ import os
 import posixpath
 import re
 import shutil
+import stat
 import tempfile
 import threading
 import time
@@ -155,21 +156,122 @@ def _atomic_transaction_json(path: Path, value: Mapping[str, Any]) -> None:
 
 
 @contextlib.contextmanager
-def _exclusive_file_lock(path: Path):
-    """Take one blocking, cross-process byte lock on ``path``."""
+def _exclusive_file_lock(path: Path, *, dir_fd: int | None = None):
+    """Take a no-follow, cross-process byte lock on one regular file.
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(path, "a+b")
+    ``dir_fd`` lets security-sensitive callers resolve the lock name relative
+    to an already authenticated directory inode.  Windows callers instead
+    open the path with ``FILE_FLAG_OPEN_REPARSE_POINT`` and without delete
+    sharing so a pre-positioned junction/symlink is never followed and the
+    containing directory cannot be renamed while the lock handle is live.
+    """
+
+    if dir_fd is None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        if dir_fd is not None:  # pragma: no cover - Windows has no dir_fd support
+            raise ValueError("directory-relative locks are unsupported on Windows")
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        class _ByHandleFileInformation(ctypes.Structure):
+            _fields_ = [
+                ("dwFileAttributes", wintypes.DWORD),
+                ("ftCreationTime", wintypes.FILETIME),
+                ("ftLastAccessTime", wintypes.FILETIME),
+                ("ftLastWriteTime", wintypes.FILETIME),
+                ("dwVolumeSerialNumber", wintypes.DWORD),
+                ("nFileSizeHigh", wintypes.DWORD),
+                ("nFileSizeLow", wintypes.DWORD),
+                ("nNumberOfLinks", wintypes.DWORD),
+                ("nFileIndexHigh", wintypes.DWORD),
+                ("nFileIndexLow", wintypes.DWORD),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        get_info = kernel32.GetFileInformationByHandle
+        get_info.argtypes = (wintypes.HANDLE, ctypes.POINTER(_ByHandleFileInformation))
+        get_info.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+        raw_handle = create_file(
+            str(path), 0x80000000 | 0x40000000, 0x1 | 0x2, None, 4,
+            0x80 | 0x00200000, None,
+        )
+        invalid_handle = wintypes.HANDLE(-1).value
+        if raw_handle == invalid_handle:
+            raise OSError(ctypes.get_last_error(), "unable to open lock without following reparse points")
+        info = _ByHandleFileInformation()
+        try:
+            if not get_info(raw_handle, ctypes.byref(info)):
+                raise OSError(ctypes.get_last_error(), "unable to inspect lock handle")
+            if info.dwFileAttributes & (0x400 | 0x10):
+                raise ValueError("lock path must be a regular non-reparse file")
+            descriptor = msvcrt.open_osfhandle(
+                int(raw_handle), os.O_RDWR | getattr(os, "O_BINARY", 0),
+            )
+            raw_handle = None
+        finally:
+            if raw_handle not in (None, invalid_handle):
+                close_handle(raw_handle)
+    else:
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(os.fspath(path), flags, 0o600, dir_fd=dir_fd)
+    try:
+        opened = os.fstat(descriptor)
+        named = (
+            os.lstat(path) if dir_fd is None
+            else os.stat(os.fspath(path), dir_fd=dir_fd, follow_symlinks=False)
+        )
+    except Exception:
+        os.close(descriptor)
+        raise
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(named.st_mode)
+        or (int(named.st_dev), int(named.st_ino))
+        != (int(opened.st_dev), int(opened.st_ino))
+    ):
+        os.close(descriptor)
+        raise ValueError("lock path changed during no-follow open")
+    handle = os.fdopen(descriptor, "r+b", buffering=0)
+    windows_overlap = None
+    windows_locked = False
     try:
         if os.name == "nt":
+            import ctypes
             import msvcrt
+            from ctypes import wintypes
 
-            handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
-                handle.write(b"\0")
-                handle.flush()
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            class _Overlapped(ctypes.Structure):
+                _fields_ = [
+                    ("Internal", ctypes.c_size_t),
+                    ("InternalHigh", ctypes.c_size_t),
+                    ("Offset", wintypes.DWORD),
+                    ("OffsetHigh", wintypes.DWORD),
+                    ("hEvent", wintypes.HANDLE),
+                ]
+
+            lock_file = ctypes.WinDLL("kernel32", use_last_error=True).LockFileEx
+            lock_file.argtypes = (
+                wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
+                wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(_Overlapped),
+            )
+            lock_file.restype = wintypes.BOOL
+            windows_overlap = _Overlapped()
+            os_handle = wintypes.HANDLE(msvcrt.get_osfhandle(handle.fileno()))
+            if not lock_file(os_handle, 0x2, 0, 1, 0, ctypes.byref(windows_overlap)):
+                raise OSError(ctypes.get_last_error(), "unable to acquire lock file")
+            windows_locked = True
         else:  # pragma: no cover - exercised by the Linux CI matrix
             import fcntl
 
@@ -177,11 +279,20 @@ def _exclusive_file_lock(path: Path):
         yield
     finally:
         try:
-            handle.seek(0)
             if os.name == "nt":
-                import msvcrt
+                if windows_locked:
+                    import ctypes
+                    import msvcrt
+                    from ctypes import wintypes
 
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    unlock_file = ctypes.WinDLL("kernel32", use_last_error=True).UnlockFileEx
+                    unlock_file.argtypes = (
+                        wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
+                        wintypes.DWORD, ctypes.c_void_p,
+                    )
+                    unlock_file.restype = wintypes.BOOL
+                    os_handle = wintypes.HANDLE(msvcrt.get_osfhandle(handle.fileno()))
+                    unlock_file(os_handle, 0, 1, 0, ctypes.byref(windows_overlap))
             else:  # pragma: no cover - exercised by the Linux CI matrix
                 import fcntl
 

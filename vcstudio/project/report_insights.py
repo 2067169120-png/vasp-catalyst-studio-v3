@@ -396,8 +396,24 @@ def _safe_graph_text(value: Any, *, fallback: str) -> str:
     return str(safe or fallback)
 
 
-def evidence_graph(service: Any, path: str, revision_id: str) -> dict[str, Any]:
-    bundle = load_frozen_revision(service, path, revision_id)
+def evidence_graph(
+    service: Any,
+    path: str,
+    revision_id: str,
+    *,
+    frozen_bundle: FrozenRevision | None = None,
+) -> dict[str, Any]:
+    """Build the graph from a revalidated revision or a stricter recapture.
+
+    ``frozen_bundle`` is an internal extension seam for consumers such as the
+    reproducibility archive that recapture every hash-bound JSON member through
+    a single regular-file descriptor before graph construction.  Public callers
+    omit it and retain the original authoritative ``ReportService`` journey.
+    """
+
+    bundle = frozen_bundle or load_frozen_revision(service, path, revision_id)
+    if bundle.revision_id != str(revision_id or ""):
+        raise StaleRevisionError("frozen evidence graph revision binding mismatch")
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
@@ -928,8 +944,17 @@ def _has_reparse_attribute(value: os.stat_result) -> bool:
     return bool(attributes & marker)
 
 
-def _windows_path_identity(path: Path) -> dict[str, Any]:
-    """Return the Windows volume serial and 128-bit file ID for *path*."""
+DirectoryEntityIdentity = tuple[str, int, int | str]
+DirectoryIdentityChain = tuple[DirectoryEntityIdentity, ...]
+
+
+def _windows_open_entity(
+    path: Path | str,
+    *,
+    expect_directory: bool,
+    share_delete: bool,
+) -> tuple[Any, dict[str, Any]]:
+    """Open one Windows namespace entry without following its final reparse point."""
 
     import ctypes
     from ctypes import wintypes
@@ -943,38 +968,68 @@ def _windows_path_identity(path: Path) -> dict[str, Any]:
             ("file_id", _FileId128),
         ]
 
-    create_file = ctypes.windll.kernel32.CreateFileW
+    class _FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("reparse_tag", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
     create_file.argtypes = (
         wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
         wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
     )
     create_file.restype = wintypes.HANDLE
-    get_information = ctypes.windll.kernel32.GetFileInformationByHandleEx
+    get_information = kernel32.GetFileInformationByHandleEx
     get_information.argtypes = (
         wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
     )
     get_information.restype = wintypes.BOOL
-    close_handle = ctypes.windll.kernel32.CloseHandle
+    close_handle = kernel32.CloseHandle
     close_handle.argtypes = (wintypes.HANDLE,)
     close_handle.restype = wintypes.BOOL
     handle = create_file(
-        str(path), 0, 0x1 | 0x2 | 0x4, None, 3,
+        str(path), 0, 0x1 | 0x2 | (0x4 if share_delete else 0), None, 3,
         0x02000000 | 0x00200000, None,
     )
-    invalid = ctypes.c_void_p(-1).value
+    invalid = wintypes.HANDLE(-1).value
     if handle in (None, invalid):
         raise OSError(ctypes.get_last_error(), "filesystem identity unavailable")
     try:
+        attributes = _FileAttributeTagInfo()
+        if not get_information(
+                handle, 9, ctypes.byref(attributes), ctypes.sizeof(attributes)):
+            raise OSError(ctypes.get_last_error(), "filesystem attributes unavailable")
+        is_directory = bool(int(attributes.file_attributes) & 0x10)
+        if int(attributes.file_attributes) & 0x400:
+            raise ValueError("filesystem entity must not be a reparse point")
+        if is_directory != expect_directory:
+            raise ValueError("filesystem entity type changed")
         information = _FileIdInfo()
         if not get_information(
                 handle, 18, ctypes.byref(information), ctypes.sizeof(information)):
             raise OSError(ctypes.get_last_error(), "filesystem identity unavailable")
-        return {
+        return handle, {
             "volume_serial": str(information.volume_serial_number),
             "file_id": bytes(information.file_id.identifier).hex(),
         }
-    finally:
+    except Exception:
         close_handle(handle)
+        raise
+
+
+def _windows_path_identity(
+    path: Path,
+    *,
+    expect_directory: bool,
+) -> dict[str, Any]:
+    """Return the Windows volume serial and 128-bit file ID for *path*."""
+
+    handle, identity = _windows_open_entity(
+        path, expect_directory=expect_directory, share_delete=True)
+    _close_windows_handle(handle)
+    return identity
 
 
 def _physical_identity(
@@ -991,7 +1046,8 @@ def _physical_identity(
     if not expected(current.st_mode):
         raise CapsuleExportError("capsule filesystem entity type changed")
     if os.name == "nt":
-        physical = _windows_path_identity(path)
+        physical = _windows_path_identity(
+            path, expect_directory=expect_directory)
         return {"platform": "windows", **physical}
     return {
         "platform": "posix",
@@ -1022,38 +1078,219 @@ def _absolute_no_follow_path(value: str | os.PathLike[str]) -> Path:
     return Path(os.path.abspath(os.fspath(value)))
 
 
-def _directory_identity(path: Path) -> dict[str, Any]:
-    """Bind every physical ancestor, rejecting symlinks and reparse points."""
-
+def _directory_ancestors(path: Path | str) -> tuple[Path, ...]:
     absolute = _absolute_no_follow_path(path)
-    ancestors: list[Path] = []
+    values: list[Path] = []
     cursor = absolute
     while True:
-        ancestors.append(cursor)
+        values.append(cursor)
         parent = cursor.parent
         if parent == cursor:
             break
         cursor = parent
-    identities = [
-        _physical_identity(item, expect_directory=True)
-        for item in reversed(ancestors)
-    ]
+    return tuple(reversed(values))
+
+
+def _posix_directory_chain(
+    path: Path | str,
+) -> tuple[DirectoryIdentityChain, tuple[int, ...]]:
+    """Open every POSIX component relative to its pinned parent."""
+
+    ancestors = _directory_ancestors(path)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptors: list[int] = []
+    identities: list[DirectoryEntityIdentity] = []
+    try:
+        for index, item in enumerate(ancestors):
+            if index == 0:
+                before = os.lstat(item)
+                descriptor = os.open(item, flags)
+                descriptors.append(descriptor)
+                after = os.lstat(item)
+            else:
+                name = item.name
+                parent_descriptor = descriptors[-1]
+                before = os.stat(
+                    name, dir_fd=parent_descriptor, follow_symlinks=False)
+                descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+                descriptors.append(descriptor)
+                after = os.stat(
+                    name, dir_fd=parent_descriptor, follow_symlinks=False)
+            opened = os.fstat(descriptor)
+            snapshots = (before, opened, after)
+            if any(
+                _has_reparse_attribute(value)
+                or stat.S_ISLNK(value.st_mode)
+                or not stat.S_ISDIR(value.st_mode)
+                for value in snapshots
+            ):
+                raise ValueError(
+                    "destination ancestors must be non-reparse directories")
+            entity = ("posix", int(opened.st_dev), int(opened.st_ino))
+            if any(
+                ("posix", int(value.st_dev), int(value.st_ino)) != entity
+                for value in (before, after)
+            ):
+                raise ValueError("destination ancestor changed during capture")
+            identities.append(entity)
+        return tuple(identities), tuple(descriptors)
+    except Exception:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        raise
+
+
+def _windows_directory_chain(
+    path: Path | str,
+) -> tuple[DirectoryIdentityChain, tuple[Any, ...]]:
+    """Open and pin every Windows ancestor while capturing FILE_ID_INFO."""
+
+    handles: list[Any] = []
+    identities: list[DirectoryEntityIdentity] = []
+    try:
+        for item in _directory_ancestors(path):
+            before = os.lstat(item)
+            if (
+                _has_reparse_attribute(before)
+                or stat.S_ISLNK(before.st_mode)
+                or not stat.S_ISDIR(before.st_mode)
+            ):
+                raise ValueError(
+                    "destination ancestors must be non-reparse directories")
+            handle, physical = _windows_open_entity(
+                item, expect_directory=True, share_delete=False)
+            handles.append(handle)
+            after = os.lstat(item)
+            if (
+                _has_reparse_attribute(after)
+                or stat.S_ISLNK(after.st_mode)
+                or not stat.S_ISDIR(after.st_mode)
+            ):
+                raise ValueError(
+                    "destination ancestors must be non-reparse directories")
+            checked_handle, checked = _windows_open_entity(
+                item, expect_directory=True, share_delete=False)
+            _close_windows_handle(checked_handle)
+            if checked != physical:
+                raise ValueError("destination ancestor changed during capture")
+            file_id = str(physical["file_id"])
+            if not re.fullmatch(r"[0-9a-f]{32}", file_id):
+                raise ValueError("destination ancestor identity is invalid")
+            identities.append((
+                "windows",
+                int(str(physical["volume_serial"])),
+                file_id,
+            ))
+        return tuple(identities), tuple(handles)
+    except Exception:
+        for handle in reversed(handles):
+            _close_windows_handle(handle)
+        raise
+
+
+def _open_directory_chain(
+    path: Path | str,
+) -> tuple[DirectoryIdentityChain, tuple[Any, ...]]:
+    if os.name == "nt":
+        return _windows_directory_chain(path)
+    return _posix_directory_chain(path)
+
+
+def _close_directory_chain(handles: Iterable[Any]) -> None:
+    for handle in reversed(tuple(handles)):
+        if os.name == "nt":
+            _close_windows_handle(handle)
+        else:
+            os.close(int(handle))
+
+
+def _identity_chain_payload(identity: DirectoryIdentityChain) -> dict[str, Any]:
+    ancestors = []
+    for platform, volume, entity in identity:
+        if platform == "windows":
+            ancestors.append({
+                "platform": "windows",
+                "volume_serial": str(volume),
+                "file_id": str(entity),
+            })
+        elif platform == "posix":
+            ancestors.append({
+                "platform": "posix",
+                "device": str(volume),
+                "inode": str(entity),
+            })
+        else:  # pragma: no cover - only internally constructed chains arrive here
+            raise ValueError("destination identity platform is invalid")
     return {
         "schema": DESTINATION_IDENTITY_SCHEMA,
         "platform": "windows" if os.name == "nt" else "posix",
-        "ancestors": identities,
+        "ancestors": ancestors,
     }
+
+
+def _identity_chain_from_payload(
+    value: Mapping[str, Any],
+) -> DirectoryIdentityChain:
+    expected_platform = "windows" if os.name == "nt" else "posix"
+    ancestors = value.get("ancestors")
+    if (
+        value.get("schema") != DESTINATION_IDENTITY_SCHEMA
+        or value.get("platform") != expected_platform
+        or not isinstance(ancestors, list)
+        or not ancestors
+        or len(ancestors) > 256
+    ):
+        raise CapsuleExportError("capsule destination identity is invalid")
+    result: list[DirectoryEntityIdentity] = []
+    for item in ancestors:
+        if not isinstance(item, Mapping) or item.get("platform") != expected_platform:
+            raise CapsuleExportError("capsule destination identity is invalid")
+        try:
+            if expected_platform == "windows":
+                volume = int(str(item["volume_serial"]))
+                entity: int | str = str(item["file_id"])
+                if volume < 0 or not re.fullmatch(r"[0-9a-f]{32}", entity):
+                    raise ValueError
+            else:
+                volume = int(str(item["device"]))
+                entity = int(str(item["inode"]))
+                if volume < 0 or entity < 0:
+                    raise ValueError
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CapsuleExportError(
+                "capsule destination identity is invalid") from exc
+        result.append((expected_platform, volume, entity))
+    return tuple(result)
+
+
+def _directory_identity(path: Path) -> dict[str, Any]:
+    """Bind every physical ancestor, rejecting symlinks and reparse points."""
+
+    identity, handles = _open_directory_chain(path)
+    try:
+        return _identity_chain_payload(identity)
+    finally:
+        _close_directory_chain(handles)
 
 
 def _assert_directory_identity(path: Path, expected: Mapping[str, Any]) -> None:
     try:
-        current = _directory_identity(path)
+        frozen = _identity_chain_from_payload(expected)
+        current, handles = _open_directory_chain(path)
     except Exception as exc:
         if isinstance(exc, CapsuleExportError):
             raise
         raise CapsuleExportError("capsule destination identity changed") from exc
-    if current != dict(expected):
-        raise CapsuleExportError("capsule destination identity changed")
+    try:
+        if current != frozen:
+            raise CapsuleExportError("capsule destination identity changed")
+    finally:
+        _close_directory_chain(handles)
 
 
 def _operation_lock_path(binding_sha256: str) -> Path:
@@ -1072,63 +1309,284 @@ def _capsule_destination_lock(
 ) -> Iterable[None]:
     """Lock a verified destination and recheck its ancestor chain on both sides."""
 
+    frozen = _identity_chain_from_payload(identity)
     _assert_directory_identity(destination, identity)
-    lock_path = destination / ".vcstudio-capsule.lock"
-    if os.path.lexists(lock_path):
-        lock_identity = _physical_identity(lock_path, expect_directory=False)
-    else:
-        lock_identity = None
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(lock_path, flags, 0o600)
-    except OSError as exc:
-        raise CapsuleExportError("capsule destination lock is unavailable") from exc
-    handle = os.fdopen(descriptor, "r+b", closefd=True)
-    locked = False
-    try:
-        opened = os.fstat(handle.fileno())
-        current_lock = _physical_identity(lock_path, expect_directory=False)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or not _stat_matches_identity(opened, current_lock)
-        ):
-            raise CapsuleExportError("capsule destination lock is unsafe")
-        if lock_identity is not None:
-            if current_lock != lock_identity:
-                raise CapsuleExportError("capsule destination lock changed")
-        if os.name == "nt":
-            import msvcrt
-
-            handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
-                handle.write(b"\0")
-                handle.flush()
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-            locked = True
-        else:  # pragma: no cover - exercised by the Linux CI matrix
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            locked = True
-        _assert_directory_identity(destination, identity)
-        yield
-        _assert_directory_identity(destination, identity)
-    finally:
+    selection = TrustedDirectorySelection(str(destination), frozen)
+    with open_trusted_directory(selection) as trusted:
+        lock_name = ".vcstudio-capsule.lock"
+        lock_path = destination / lock_name
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        if trusted.dir_fd is not None:
+            try:
+                before = os.stat(
+                    lock_name, dir_fd=trusted.dir_fd, follow_symlinks=False)
+                if _is_symlink_or_reparse(before) or not stat.S_ISREG(before.st_mode):
+                    raise CapsuleExportError("capsule destination lock is unsafe")
+                lock_identity: dict[str, Any] | None = {
+                    "platform": "posix",
+                    "device": str(before.st_dev),
+                    "inode": str(before.st_ino),
+                }
+            except FileNotFoundError:
+                lock_identity = None
+            try:
+                descriptor = os.open(
+                    lock_name, flags, 0o600, dir_fd=trusted.dir_fd)
+            except OSError as exc:
+                raise CapsuleExportError(
+                    "capsule destination lock is unavailable") from exc
+        else:
+            if os.path.lexists(lock_path):
+                lock_identity = _physical_identity(
+                    lock_path, expect_directory=False)
+            else:
+                lock_identity = None
+            try:
+                descriptor = os.open(lock_path, flags, 0o600)
+            except OSError as exc:
+                raise CapsuleExportError(
+                    "capsule destination lock is unavailable") from exc
+        handle = os.fdopen(descriptor, "r+b", closefd=True)
+        locked = False
         try:
-            if locked:
+            opened = os.fstat(handle.fileno())
+            if trusted.dir_fd is not None:
+                named = os.stat(
+                    lock_name, dir_fd=trusted.dir_fd, follow_symlinks=False)
+                current_lock = {
+                    "platform": "posix",
+                    "device": str(named.st_dev),
+                    "inode": str(named.st_ino),
+                }
+                opened_identity = {
+                    "platform": "posix",
+                    "device": str(opened.st_dev),
+                    "inode": str(opened.st_ino),
+                }
+                safe_lock = (
+                    not _is_symlink_or_reparse(named)
+                    and stat.S_ISREG(named.st_mode)
+                    and current_lock == opened_identity
+                )
+            else:
+                current_lock = _physical_identity(
+                    lock_path, expect_directory=False)
+                safe_lock = (
+                    stat.S_ISREG(opened.st_mode)
+                    and _stat_matches_identity(opened, current_lock)
+                )
+            if not safe_lock:
+                raise CapsuleExportError("capsule destination lock is unsafe")
+            if lock_identity is not None and current_lock != lock_identity:
+                raise CapsuleExportError("capsule destination lock changed")
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
                 handle.seek(0)
-                if os.name == "nt":
-                    import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                locked = True
+            else:  # pragma: no cover - exercised by the Linux CI matrix
+                import fcntl
 
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                else:  # pragma: no cover - exercised by the Linux CI matrix
-                    import fcntl
-
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                locked = True
+            trusted.verify_path()
+            yield
+            trusted.verify_path()
         finally:
-            handle.close()
+            try:
+                if locked:
+                    handle.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:  # pragma: no cover - exercised by the Linux CI matrix
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+
+
+@dataclass(frozen=True)
+class TrustedDirectorySelection:
+    """Private path plus the OS identity captured by a destination token."""
+
+    path: str
+    identity: DirectoryIdentityChain
+
+    def __fspath__(self) -> str:
+        return self.path
+
+
+@dataclass
+class TrustedDirectoryHandle:
+    """Pinned directory capability used for relative archive filesystem calls."""
+
+    selection: TrustedDirectorySelection
+    dir_fd: int | None = None
+    ancestor_fds: tuple[int, ...] = ()
+    windows_handle: Any = None
+    windows_ancestor_handles: tuple[Any, ...] = ()
+    windows_guard_handle: Any = None
+
+    @property
+    def path(self) -> str:
+        return self.selection.path
+
+    def verify_path(self) -> None:
+        current, handles = _open_directory_chain(self.selection.path)
+        try:
+            if current != self.selection.identity:
+                raise ValueError("destination directory ancestor chain changed")
+        finally:
+            _close_directory_chain(handles)
+
+
+def _is_symlink_or_reparse(value: os.stat_result) -> bool:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return stat.S_ISLNK(value.st_mode) or bool(
+        getattr(value, "st_file_attributes", 0) & reparse_flag
+    )
+
+
+def _close_windows_handle(handle: Any) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    close_handle(handle)
+
+
+def _windows_handle_final_path(handle: Any) -> str:
+    """Return one normalized DOS path for an already-open Windows handle."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    get_final_path = ctypes.WinDLL(
+        "kernel32", use_last_error=True,
+    ).GetFinalPathNameByHandleW
+    get_final_path.argtypes = (
+        wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD,
+    )
+    get_final_path.restype = wintypes.DWORD
+    size = 512
+    while True:
+        buffer = ctypes.create_unicode_buffer(size)
+        length = get_final_path(handle, buffer, size, 0)
+        if length == 0:
+            raise OSError(ctypes.get_last_error(), "unable to resolve trusted handle path")
+        if length < size:
+            value = buffer.value
+            break
+        size = int(length) + 1
+    if value.startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    return os.path.normcase(os.path.normpath(value))
+
+
+def _windows_directory_guard(path: str) -> Any:
+    """Pin a Windows directory namespace with an unshared delete-on-close child."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    create_file = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    guard_path = os.path.join(path, f".vcs-directory-guard-{secrets.token_hex(16)}")
+    handle = create_file(
+        guard_path,
+        0x80000000 | 0x40000000 | 0x00010000,
+        0x1 | 0x2,
+        None,
+        1,
+        0x2 | 0x100 | 0x04000000 | 0x00200000,
+        None,
+    )
+    invalid = wintypes.HANDLE(-1).value
+    if handle == invalid:
+        raise OSError(ctypes.get_last_error(), "unable to pin destination directory")
+    return handle
+
+
+def capture_trusted_directory(directory: str | os.PathLike[str]) -> TrustedDirectorySelection:
+    """Capture every non-reparse ancestor's stable physical identity."""
+
+    requested = os.path.abspath(os.fspath(directory))
+    identity, handles = _open_directory_chain(requested)
+    try:
+        if not identity:
+            raise ValueError("destination ancestor identity is unavailable")
+        return TrustedDirectorySelection(requested, identity)
+    finally:
+        _close_directory_chain(handles)
+
+
+@contextlib.contextmanager
+def open_trusted_directory(selection: TrustedDirectorySelection):
+    """Open and pin the complete ancestor chain captured by ``selection``."""
+
+    if not isinstance(selection, TrustedDirectorySelection):
+        raise TypeError("trusted destination selection is required")
+    identity, handles = _open_directory_chain(selection.path)
+    if identity != selection.identity:
+        _close_directory_chain(handles)
+        raise ValueError("destination directory ancestor chain changed")
+    if os.name == "nt":
+        handle = handles[-1]
+        ancestor_handles = tuple(handles[:-1])
+        guard_handle = None
+        try:
+            guard_handle = _windows_directory_guard(selection.path)
+            trusted_path = _windows_handle_final_path(handle)
+            guard_parent = os.path.dirname(_windows_handle_final_path(guard_handle))
+            if guard_parent != trusted_path:
+                raise ValueError("destination directory guard escaped trusted entity")
+            trusted = TrustedDirectoryHandle(
+                selection=selection, windows_handle=handle,
+                windows_ancestor_handles=ancestor_handles,
+                windows_guard_handle=guard_handle,
+            )
+            trusted.verify_path()
+            try:
+                yield trusted
+            finally:
+                trusted.verify_path()
+        finally:
+            if guard_handle is not None:
+                _close_windows_handle(guard_handle)
+            _close_directory_chain(handles)
+    else:
+        descriptor = int(handles[-1])
+        ancestor_fds = tuple(int(item) for item in handles[:-1])
+        trusted = TrustedDirectoryHandle(
+            selection=selection,
+            dir_fd=descriptor,
+            ancestor_fds=ancestor_fds,
+        )
+        try:
+            trusted.verify_path()
+            try:
+                yield trusted
+            finally:
+                trusted.verify_path()
+        finally:
+            _close_directory_chain(handles)
 
 
 class OpaqueDestinationRegistry:
@@ -1157,16 +1615,37 @@ class OpaqueDestinationRegistry:
         self._purpose = str(purpose)
         self._token_prefix = str(token_prefix)
         self._items: dict[
-            str, tuple[str, float, str | None, dict[str, Any]]
+            str,
+            tuple[
+                str,
+                float,
+                str | None,
+                dict[str, Any],
+                TrustedDirectorySelection,
+            ],
         ] = {}
         self._consumed: dict[
-            str, tuple[str, str, float, str | None, dict[str, Any]]
+            str,
+            tuple[
+                str,
+                str,
+                float,
+                str | None,
+                dict[str, Any],
+                TrustedDirectorySelection,
+            ],
         ] = {}
 
     def _prune_expired_locked(self, now: float) -> None:
         expired = [
             token
-            for token, (_target, created_at, _binding, _identity)
+            for token, (
+                _target,
+                created_at,
+                _binding,
+                _identity,
+                _selection,
+            )
             in self._items.items()
             if now - created_at >= self._ttl_seconds
         ]
@@ -1174,7 +1653,14 @@ class OpaqueDestinationRegistry:
             self._items.pop(token, None)
         expired_operations = [
             operation_key
-            for operation_key, (_token, _target, created_at, _binding, _identity)
+            for operation_key, (
+                _token,
+                _target,
+                created_at,
+                _binding,
+                _identity,
+                _selection,
+            )
             in self._consumed.items()
             if now - created_at >= self._ttl_seconds
         ]
@@ -1184,7 +1670,10 @@ class OpaqueDestinationRegistry:
     def register(self, directory: str, *, binding: str | None = None) -> dict[str, Any]:
         target = str(_absolute_no_follow_path(str(directory or "")))
         try:
-            identity = _directory_identity(Path(target))
+            selection = capture_trusted_directory(target)
+            identity = _identity_chain_payload(selection.identity)
+            with open_trusted_directory(selection):
+                _assert_directory_identity(Path(target), identity)
         except Exception as exc:
             raise ValueError(
                 f"{self._purpose} destination directory is invalid") from exc
@@ -1201,7 +1690,12 @@ class OpaqueDestinationRegistry:
             while token in self._items:
                 token = self._token_prefix + secrets.token_urlsafe(24)
             self._items[token] = (
-                target, now, None if binding is None else str(binding), identity)
+                target,
+                now,
+                None if binding is None else str(binding),
+                identity,
+                selection,
+            )
         display_name = redact(os.path.basename(target) or "selected directory")
         return {"schema": self._schema, "destination_token": token,
                 "display_name": str(display_name)}
@@ -1231,7 +1725,12 @@ class OpaqueDestinationRegistry:
                             f"{self._purpose} destination token binding mismatch")
                     try:
                         _assert_directory_identity(Path(replay[1]), replay[4])
+                        with open_trusted_directory(replay[5]):
+                            pass
                     except CapsuleExportError as exc:
+                        raise ValueError(
+                            f"{self._purpose} destination identity changed") from exc
+                    except Exception as exc:
                         raise ValueError(
                             f"{self._purpose} destination identity changed") from exc
                     return replay[1]
@@ -1245,7 +1744,12 @@ class OpaqueDestinationRegistry:
                 raise ValueError(f"{self._purpose} destination token binding mismatch")
             try:
                 _assert_directory_identity(Path(selected[0]), selected[3])
+                with open_trusted_directory(selected[4]):
+                    pass
             except CapsuleExportError as exc:
+                raise ValueError(
+                    f"{self._purpose} destination identity changed") from exc
+            except Exception as exc:
                 raise ValueError(
                     f"{self._purpose} destination identity changed") from exc
             if operation_key is not None:
@@ -1256,8 +1760,47 @@ class OpaqueDestinationRegistry:
                     )
                     self._consumed.pop(oldest, None)
                 self._consumed[operation_key] = (
-                    supplied_token, selected[0], now, binding, selected[3])
+                    supplied_token,
+                    selected[0],
+                    now,
+                    binding,
+                    selected[3],
+                    selected[4],
+                )
             return selected[0]
+
+    def consume_trusted(
+        self,
+        token: str,
+        *,
+        expected_binding: str | None = None,
+    ) -> TrustedDirectorySelection:
+        """Consume one token as a pinned archive directory capability.
+
+        This intentionally remains one-shot.  Capsule publication uses the
+        idempotent ``consume`` path above because its durable receipt owns
+        replay and crash recovery; archive dry-run confirmation instead passes
+        this immutable selection directly to its atomic exporter.
+        """
+
+        with self._lock:
+            now = float(self._clock())
+            self._prune_expired_locked(now)
+            selected = self._items.pop(str(token or ""), None)
+        if selected is None:
+            raise ValueError(
+                f"{self._purpose} destination token is invalid or expired")
+        binding = selected[2]
+        if expected_binding is not None and binding != str(expected_binding):
+            raise ValueError(f"{self._purpose} destination token binding mismatch")
+        try:
+            _assert_directory_identity(Path(selected[0]), selected[3])
+            with open_trusted_directory(selected[4]):
+                pass
+        except Exception as exc:
+            raise ValueError(
+                f"{self._purpose} destination directory changed") from exc
+        return selected[4]
 
     def destination_identity(
         self,
@@ -1655,6 +2198,91 @@ def _trusted_notebook_snapshot(
         "integrity_status": "current",
     }
     return safe_snapshot, plan, binding
+
+
+@dataclass(frozen=True)
+class ResearchNotebookArchiveProvider:
+    """Adapt the frozen notebook ledger to the governed archive provider seam.
+
+    The provider deliberately recaptures the selected ``ReportService``
+    revision before asking the host for a notebook snapshot.  It therefore
+    cannot turn a live notebook read into an attachment for a stale or merely
+    caller-constructed report bundle.
+    """
+
+    service: Any
+    project_path: str
+    license_id: str = "NOASSERTION"
+    attribution: str = ""
+    redistributable: bool = False
+    maximum_member_bytes: int = CAPSULE_MAX_MEMBER_BYTES
+
+    provider_id = "project-research-notebook"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.redistributable, bool):
+            raise TypeError("notebook redistributable declaration must be boolean")
+        if (
+            isinstance(self.maximum_member_bytes, bool)
+            or not isinstance(self.maximum_member_bytes, int)
+            or self.maximum_member_bytes <= 0
+        ):
+            raise ValueError("notebook attachment member limit is invalid")
+
+    def frozen_attachments(self, bundle: FrozenRevision) -> Iterable[Any]:
+        from vcstudio.project.reproducibility_archive import ArchiveAttachment
+
+        if not isinstance(bundle, FrozenRevision):
+            raise TypeError("frozen report revision is required")
+        current = load_frozen_revision(
+            self.service, self.project_path, bundle.revision_id)
+        if (
+            current.project_id != bundle.project_id
+            or _report_binding(current) != _report_binding(bundle)
+        ):
+            raise StaleRevisionError(
+                "notebook archive report revision binding changed")
+        notebook, provider_plan, notebook_binding = _trusted_notebook_snapshot(
+            self.service,
+            self.project_path,
+            current,
+            self.maximum_member_bytes,
+        )
+        payloads = {
+            "extensions/research-notebook/ledger.json": (
+                "research_notebook_ledger",
+                notebook,
+            ),
+            "extensions/research-notebook/limitations.json": (
+                "research_notebook_limitations",
+                {
+                    "schema": "vcstudio.research-notebook-limitations/v1",
+                    "project_id": current.project_id,
+                    "bound_report_revision_id": current.revision_id,
+                    "limitations": list(notebook.get("limitations") or []),
+                },
+            ),
+        }
+        for archive_path, (logical_role, payload) in sorted(payloads.items()):
+            data = _bounded_canonical_bytes(
+                redact(payload), self.maximum_member_bytes, newline=True)
+            yield ArchiveAttachment(
+                archive_path=archive_path,
+                logical_role=logical_role,
+                sha256=_sha256_bytes(data),
+                size=len(data),
+                license_id=str(redact(self.license_id)),
+                attribution=str(redact(self.attribution)),
+                redistributable=self.redistributable,
+                third_party=False,
+                sensitive_risk="low",
+                data=data,
+                metadata={
+                    "provider_plan": copy.deepcopy(provider_plan),
+                    "notebook_binding": copy.deepcopy(notebook_binding),
+                    "report_binding": _report_binding(current),
+                },
+            )
 
 
 @dataclass
@@ -2582,7 +3210,9 @@ __all__ = [
     "DESTINATION_SCHEMA", "DIFF_SCHEMA", "GRAPH_SCHEMA",
     "CapsuleDestinations", "CapsuleExportError", "CapsuleExportReceipts",
     "CapsuleLimits", "CapsuleQuotaError", "OpaqueDestinationRegistry",
+    "ResearchNotebookArchiveProvider",
     "build_capsule_bytes", "capsule_members",
+    "TrustedDirectoryHandle", "TrustedDirectorySelection", "capture_trusted_directory",
     "evidence_graph", "export_capsule", "load_frozen_revision", "redact",
-    "scientific_diff", "StaleRevisionError",
+    "open_trusted_directory", "scientific_diff", "StaleRevisionError",
 ]

@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
+import subprocess
 import sys
 import threading
 import zipfile
@@ -23,11 +25,15 @@ from vcstudio.project.report_insights import (  # noqa: E402
     CapsuleLimits,
     CapsuleQuotaError,
     FrozenRevision,
+    OpaqueDestinationRegistry,
+    ResearchNotebookArchiveProvider,
     build_capsule_bytes,
     capsule_members,
+    capture_trusted_directory,
     evidence_graph,
     export_capsule,
     load_frozen_revision,
+    open_trusted_directory,
     redact,
     scientific_diff,
 )
@@ -82,6 +88,73 @@ def _notebook_payload(project_id: str, revision_id: str, *,
         },
         "limitations": [{"code": "report_gate_unchanged"}],
     }
+
+
+def test_notebook_archive_provider_coexists_with_capsule_and_rechecks_report_gate(
+    tmp_path,
+):
+    from vcstudio.project.reproducibility_archive import build_archive_plan
+
+    host, service, first, _second = _two_revisions(tmp_path)
+    revision_id = first["revision"]["revision_id"]
+    notebook = _notebook_payload(
+        host.project_id,
+        revision_id,
+        ledger_revision=1,
+        head_digest="a" * 64,
+    )
+    host._research_notebook_archive_payload = (
+        lambda _path, project_id, bound_revision_id: (
+            copy.deepcopy(notebook)
+            if (project_id, bound_revision_id) == (host.project_id, revision_id)
+            else None
+        )
+    )
+    bundle = load_frozen_revision(service, "project.yaml", revision_id)
+    capsule = build_capsule_bytes(bundle, notebook_payload=notebook)
+    provider = ResearchNotebookArchiveProvider(
+        service,
+        "project.yaml",
+        license_id="CC-BY-4.0",
+        attribution="Project notebook fixture",
+        redistributable=True,
+    )
+
+    attachments = list(provider.frozen_attachments(bundle))
+    archive_plan = build_archive_plan(
+        service,
+        "project.yaml",
+        revision_id,
+        attachment_providers=[provider],
+    )
+
+    assert {item.logical_role for item in attachments} == {
+        "research_notebook_ledger", "research_notebook_limitations",
+    }
+    assert all(
+        item.sha256 == hashlib.sha256(item.data).hexdigest()
+        and item.size == len(item.data)
+        and item.third_party is False
+        and item.redistributable is True
+        for item in attachments
+    )
+    included_provider_roles = {
+        item["logical_role"]
+        for item in archive_plan.decisions
+        if item.get("provider_id") == provider.provider_id
+        and item.get("decision") == "include"
+    }
+    assert included_provider_roles == {
+        "research_notebook_ledger", "research_notebook_limitations",
+    }
+    with zipfile.ZipFile(BytesIO(capsule)) as archive:
+        assert json.loads(archive.read("research-notebook/ledger.json")) == notebook
+
+    manifest_path = Path(bundle.entry["manifest"])
+    manifest_path.write_text(
+        manifest_path.read_text(encoding="utf-8") + " ", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="manifest"):
+        list(provider.frozen_attachments(bundle))
 
 
 def test_scientific_diff_revalidates_bundles_and_compares_file_hashes(tmp_path):
@@ -623,6 +696,166 @@ def test_capsule_confirm_rejects_destination_directory_replacement(tmp_path):
 
     assert not list(destination.glob("*.zip"))
     assert not list(moved.glob("*.zip"))
+
+
+def _replace_ancestor_preserving_destination(destination: Path) -> Path:
+    """Change one ancestor while returning the same final directory entity."""
+
+    ancestor = destination.parent
+    moved = ancestor.with_name(ancestor.name + "-original")
+    ancestor.rename(moved)
+    ancestor.mkdir()
+    (moved / destination.name).rename(destination)
+    return moved
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse ancestor contract")
+@pytest.mark.parametrize("kind", ["symlink", "junction"])
+@pytest.mark.parametrize("location", ["ancestor", "destination"])
+def test_windows_trusted_directory_rejects_reparse_at_any_component(
+    tmp_path, kind, location,
+):
+    real_parent = tmp_path / f"real-{kind}-{location}"
+    real_parent.mkdir()
+    real_destination = real_parent / "destination"
+    real_destination.mkdir()
+    alias = tmp_path / f"alias-{kind}-{location}"
+    target = real_parent if location == "ancestor" else real_destination
+    if kind == "symlink":
+        try:
+            alias.symlink_to(target, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("Windows directory symbolic links are unavailable")
+    else:
+        created = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(alias), str(target)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if created.returncode != 0:
+            pytest.skip("Windows directory junctions are unavailable")
+    selected = alias / "destination" if location == "ancestor" else alias
+
+    try:
+        with pytest.raises(ValueError, match="ancestor|reparse"):
+            capture_trusted_directory(selected)
+    finally:
+        if os.path.lexists(alias):
+            if kind == "junction":
+                alias.rmdir()
+            else:
+                alias.unlink()
+
+    assert not list(real_destination.iterdir())
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX no-follow ancestor contract")
+def test_posix_trusted_directory_rejects_symlink_ancestor(tmp_path):
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    destination = real_parent / "destination"
+    destination.mkdir()
+    alias = tmp_path / "alias-parent"
+    alias.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises((OSError, ValueError), match="ancestor|symbolic|symlink"):
+        capture_trusted_directory(alias / destination.name)
+
+
+def test_trusted_directory_chain_rejects_ancestor_replacement_with_same_leaf(
+    tmp_path,
+):
+    ancestor = tmp_path / "selected-namespace"
+    ancestor.mkdir()
+    destination = ancestor / "destination"
+    destination.mkdir()
+    selection = capture_trusted_directory(destination)
+    registry = OpaqueDestinationRegistry(
+        purpose="archive", token_prefix="archive.")
+    token = registry.register(str(destination))["destination_token"]
+
+    moved = _replace_ancestor_preserving_destination(destination)
+    current = capture_trusted_directory(destination)
+
+    assert current.path == selection.path
+    assert current.identity[-1] == selection.identity[-1]
+    assert current.identity[-2] != selection.identity[-2]
+    with pytest.raises(ValueError, match="ancestor chain changed"):
+        with open_trusted_directory(selection):
+            pytest.fail("a replaced ancestor must never yield a trusted handle")
+    with pytest.raises(ValueError, match="identity changed"):
+        registry.consume(token)
+    assert not list(destination.iterdir())
+    assert not list(moved.iterdir())
+
+
+def test_capsule_preview_rejects_ancestor_replacement_with_same_leaf(tmp_path):
+    host, service, first, _second = _two_revisions(tmp_path)
+    revision_id = first["revision"]["revision_id"]
+    host._research_notebook_archive_payload = (
+        lambda _path, project_id, bound_revision_id:
+        _notebook_payload(project_id, bound_revision_id))
+    ancestor = tmp_path / "preview-namespace"
+    ancestor.mkdir()
+    destination = ancestor / "capsules"
+    destination.mkdir()
+    destinations = CapsuleDestinations()
+    selected = destinations.register(str(destination))
+    before = capture_trusted_directory(destination)
+
+    _replace_ancestor_preserving_destination(destination)
+    after = capture_trusted_directory(destination)
+    assert after.identity[-1] == before.identity[-1]
+    assert after.identity != before.identity
+
+    receipts = CapsuleExportReceipts(destinations)
+    with pytest.raises(ValueError, match="identity changed"):
+        receipts.preview(
+            service, "project.yaml", revision_id,
+            selected["destination_token"], "capsule-preview-ancestor-replaced",
+        )
+    assert not list(destination.glob("*.zip"))
+
+
+@pytest.mark.parametrize("fresh_process", [False, True])
+def test_capsule_confirm_and_recovery_reject_replaced_ancestor_same_leaf(
+    tmp_path, fresh_process,
+):
+    host, service, first, _second = _two_revisions(tmp_path)
+    revision_id = first["revision"]["revision_id"]
+    host._research_notebook_archive_payload = (
+        lambda _path, project_id, bound_revision_id:
+        _notebook_payload(project_id, bound_revision_id))
+    ancestor = tmp_path / f"confirm-namespace-{fresh_process}"
+    ancestor.mkdir()
+    destination = ancestor / "capsules"
+    destination.mkdir()
+    destinations = CapsuleDestinations()
+    selected = destinations.register(str(destination))
+    before = capture_trusted_directory(destination)
+    receipts = CapsuleExportReceipts(destinations)
+    operation = f"capsule-confirm-ancestor-replaced-{fresh_process}"
+    preview = receipts.preview(
+        service, "project.yaml", revision_id,
+        selected["destination_token"], operation,
+    )
+
+    _replace_ancestor_preserving_destination(destination)
+    after = capture_trusted_directory(destination)
+    assert after.identity[-1] == before.identity[-1]
+    assert after.identity != before.identity
+    selected_receipts = (
+        CapsuleExportReceipts(CapsuleDestinations())
+        if fresh_process else receipts
+    )
+
+    with pytest.raises(CapsuleExportError, match="identity changed"):
+        selected_receipts.confirm(
+            service, "project.yaml", preview["receipt_id"],
+            preview["receipt_token"], operation,
+        )
+    assert not list(destination.glob("*.zip"))
 
 
 @pytest.mark.parametrize("mutation", ["missing", "tampered"])

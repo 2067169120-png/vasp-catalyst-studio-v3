@@ -1069,6 +1069,16 @@ def _method_invariant(
     if not _verified_method(method) or not isinstance(fingerprint, Mapping):
         return ""
     fingerprint = dict(fingerprint)
+    if "identity" in fingerprint:
+        identity = fingerprint.get("identity")
+        fingerprint_schema = str(fingerprint.get("schema") or "")
+        if (
+            not isinstance(identity, Mapping)
+            or not fingerprint_schema
+            or fingerprint_schema != str(method.get("schema") or "")
+        ):
+            return ""
+        fingerprint = copy.deepcopy(dict(identity))
     required = {
         "functional", "dispersion", "encut", "spin",
         "kpoints_scheme", "potcar_ids",

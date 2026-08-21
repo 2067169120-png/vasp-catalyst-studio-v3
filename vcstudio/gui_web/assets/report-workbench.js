@@ -12,6 +12,7 @@
   const CAPSULE_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
   const SHA256_RE = /^[a-f0-9]{64}$/;
   let capsuleNonce = 0;
+  let archiveNonce = 0;
   const FORMAT_ORDER = Object.freeze(['html', 'docx', 'pdf']);
   const STEP_ORDER = Object.freeze([
     'scope', 'audience', 'gates', 'outline', 'content', 'language', 'export',
@@ -66,6 +67,19 @@
     capsuleReceipt: null,
     capsuleReceiptFingerprint: '',
     capsuleGeneration: 0,
+    archiveBusy: false,
+    archiveStatus: 'idle',
+    archiveRevisionId: '',
+    archivePlan: null,
+    archiveConfirmationToken: '',
+    archiveDestinationToken: '',
+    archiveResult: null,
+    archiveGeneration: 0,
+    archiveOperationKey: '',
+    archivePreviewToken: '',
+    archiveDestinationBinding: '',
+    archiveEnvelope: null,
+    archiveEnvelopeFingerprint: '',
   };
 
   function plain(value) {
@@ -861,7 +875,7 @@
         : State.history.length < 2 ? '至少需要两个 revision'
           : VCS.t('report.insights.compare_title', {}, 'Select two revisions and revalidate their scientific differences');
     }
-    renderInsightControls();
+    renderInsightControls(); renderArchiveControls();
   }
 
   function insightRevision(row) {
@@ -1362,6 +1376,499 @@
     }
   }
 
+  function archiveState(status, message) {
+    const allowed = new Set([
+      'idle', 'planning', 'planned', 'blocked', 'exporting', 'verified', 'stale', 'failed',
+    ]);
+    State.archiveStatus = allowed.has(status) ? status : 'failed';
+    const badge = $('rw-archive-state');
+    if (badge) {
+      badge.dataset.state = State.archiveStatus;
+      badge.textContent = VCS.t(`report.archive.state.${State.archiveStatus}`, {}, State.archiveStatus);
+    }
+    if (message !== undefined) {
+      const summary = $('rw-archive-summary'); if (summary) summary.textContent = String(message || '');
+    }
+  }
+
+  function resetArchiveState({ keepRevision = false } = {}) {
+    State.archiveGeneration += 1;
+    State.archiveBusy = false;
+    State.archiveStatus = 'idle';
+    if (!keepRevision) State.archiveRevisionId = '';
+    State.archivePlan = null;
+    State.archiveOperationKey = '';
+    State.archivePreviewToken = '';
+    State.archiveConfirmationToken = '';
+    State.archiveDestinationToken = '';
+    State.archiveDestinationBinding = '';
+    State.archiveEnvelope = null;
+    State.archiveEnvelopeFingerprint = '';
+    State.archiveResult = null;
+    const inventory = $('rw-archive-inventory'); if (inventory) inventory.hidden = true;
+    const table = $('rw-archive-inventory-table'); if (table) table.innerHTML = '';
+    const gaps = $('rw-archive-gaps'); if (gaps) { gaps.hidden = true; gaps.innerHTML = ''; }
+    const result = $('rw-archive-result'); if (result) result.hidden = true;
+    const resultBody = $('rw-archive-result-body'); if (resultBody) resultBody.innerHTML = '';
+    archiveState('idle', VCS.t('report.archive.idle', {},
+      '选择一个 current revision 后先运行 dry-run。'));
+  }
+
+  function selectedArchiveRow() {
+    const select = $('rw-archive-revision');
+    const revisionId = String(select && select.value || '');
+    return State.history.find(row => insightRevision(row) === revisionId) || null;
+  }
+
+  function archiveCapability(value, kind) {
+    const text = String(value || '').trim();
+    const prefix = `archive-${kind}.`;
+    return text.startsWith(prefix) && CAPSULE_TOKEN_RE.test(text) ? text : '';
+  }
+
+  function archiveName(value) {
+    const text = String(value || '').trim();
+    return text && text.length <= 180 && text.toLowerCase().endsWith('.zip')
+      && !/[\\/\r\n]/.test(text) && !/^file:/i.test(text) ? text : '';
+  }
+
+  function newArchiveOperationKey() {
+    const cryptoApi = window.crypto;
+    if (cryptoApi && typeof cryptoApi.randomUUID === 'function') {
+      return `archive-operation.${cryptoApi.randomUUID()}`;
+    }
+    archiveNonce += 1;
+    return `archive-operation.${Date.now().toString(36)}-${archiveNonce.toString(36)}`;
+  }
+
+  function archiveFingerprint(value) {
+    try { return JSON.stringify(value); } catch (_) { return ''; }
+  }
+
+  function freezeArchivePlan(result, context) {
+    const revision = plain(result && result.revision); const archive = plain(result && result.archive);
+    const denominator = plain(result && result.denominator);
+    const previewToken = archiveCapability(result && result.preview_token, 'preview');
+    if (!result || result.ok !== true || result.status !== 'dry_run_ready'
+        || result.project_id !== context.projectId || revision.revision_id !== context.revisionId
+        || !CAPSULE_TOKEN_RE.test(context.operationKey)
+        || !context.operationKey.startsWith('archive-operation.')
+        || !previewToken || result.confirmation_token
+        || !capsuleToken(revision.report_id) || !SHA256_RE.test(String(revision.manifest_sha256 || ''))
+        || !SHA256_RE.test(String(result.plan_sha256 || ''))
+        || !SHA256_RE.test(String(result.rights_sha256 || ''))
+        || !SHA256_RE.test(String(result.inventory_sha256 || ''))
+        || !archiveName(archive.name) || !SHA256_RE.test(String(archive.sha256 || ''))
+        || !Number.isInteger(archive.size) || archive.size <= 0
+        || !Number.isInteger(archive.version) || archive.version < 1
+        || !Number.isInteger(denominator.decisions) || denominator.decisions < 0
+        || !Number.isInteger(denominator.included) || denominator.included < 0
+        || !Number.isInteger(denominator.excluded) || denominator.excluded < 0
+        || denominator.included + denominator.excluded !== denominator.decisions
+        || !Array.isArray(result.decisions) || result.decisions.length !== denominator.decisions
+        || typeof result.replayed !== 'boolean'
+        || !Number.isFinite(Number(result.ttl_seconds)) || Number(result.ttl_seconds) <= 0) return null;
+    const frozen = clone(result);
+    if (!frozen) return null;
+    frozen.preview_token = previewToken;
+    return Object.freeze(frozen);
+  }
+
+  function archiveDestinationRequest(plan, operationKey) {
+    const revision = plain(plan.revision); const archive = plain(plan.archive);
+    return {
+      schema: 'vcstudio.vcs-archive-destination-request/v1',
+      preview_token: plan.preview_token,
+      project_id: plan.project_id,
+      revision: {
+        report_id: revision.report_id, revision_id: revision.revision_id,
+        manifest_sha256: revision.manifest_sha256,
+      },
+      plan_sha256: plan.plan_sha256,
+      rights_sha256: plan.rights_sha256,
+      inventory_sha256: plan.inventory_sha256,
+      archive: {
+        name: archive.name, sha256: archive.sha256,
+        size: archive.size, version: archive.version,
+      },
+      idempotency_key: operationKey,
+    };
+  }
+
+  function freezeArchiveEnvelope(selected, context) {
+    const challenge = plain(selected && selected.confirmation);
+    const plan = plain(State.archivePlan); const revision = plain(plan.revision);
+    const archive = plain(plan.archive);
+    const challengeKeys = [
+      'schema', 'phase', 'confirmation_token', 'project_id', 'report_id',
+      'revision_id', 'source_manifest_sha256', 'plan_sha256', 'rights_sha256',
+      'inventory_sha256', 'archive_name', 'archive_sha256', 'archive_size',
+      'destination_identity_sha256', 'nonce', 'created_at', 'expires_at', 'ttl_seconds',
+    ].sort();
+    const destinationToken = archiveCapability(
+      selected && selected.destination_token, 'destination');
+    const destinationBinding = String(
+      selected && selected.destination_identity_sha256 || '');
+    const confirmationToken = archiveCapability(
+      challenge.confirmation_token, 'confirm');
+    const nonce = String(challenge.nonce || '');
+    if (!selected || selected.ok !== true || selected.cancelled !== false
+        || typeof selected.replayed !== 'boolean' || !destinationToken
+        || !SHA256_RE.test(destinationBinding)
+        || challenge.schema !== 'vcstudio.vcs-archive-confirmation/v1'
+        || challenge.phase !== 'confirmation'
+        || Object.keys(challenge).sort().join('|') !== challengeKeys.join('|')
+        || !confirmationToken || challenge.project_id !== context.projectId
+        || challenge.report_id !== revision.report_id
+        || challenge.revision_id !== context.revisionId
+        || challenge.source_manifest_sha256 !== revision.manifest_sha256
+        || challenge.plan_sha256 !== plan.plan_sha256
+        || challenge.rights_sha256 !== plan.rights_sha256
+        || challenge.inventory_sha256 !== plan.inventory_sha256
+        || challenge.archive_name !== archive.name || challenge.archive_sha256 !== archive.sha256
+        || challenge.archive_size !== archive.size
+        || challenge.destination_identity_sha256 !== destinationBinding
+        || !capsuleToken(nonce) || !Number.isFinite(Number(challenge.ttl_seconds))
+        || Number(challenge.ttl_seconds) <= 0
+        || challenge.expires_at === undefined || challenge.created_at === undefined) return null;
+    return {
+      destinationToken, destinationBinding, confirmationToken,
+      envelope: Object.freeze(clone(challenge)),
+    };
+  }
+
+  function beginArchiveContext(projectId, revisionId) {
+    const generation = ++State.archiveGeneration;
+    return {
+      generation, projectId, revisionId,
+      operationKey: State.archiveOperationKey,
+      planFingerprint: archiveFingerprint(State.archivePlan),
+      destinationToken: State.archiveDestinationToken,
+      destinationBinding: State.archiveDestinationBinding,
+      envelopeFingerprint: State.archiveEnvelopeFingerprint,
+    };
+  }
+
+  function archiveContextCurrent(context, { plan = true, destination = false,
+    envelope = false } = {}) {
+    if (!context || context.generation !== State.archiveGeneration
+        || context.projectId !== State.projectId || !sameProject(context.projectId)
+        || insightRevision(selectedArchiveRow()) !== context.revisionId
+        || context.operationKey !== State.archiveOperationKey) return false;
+    if (plan && (!context.planFingerprint
+        || context.planFingerprint !== archiveFingerprint(State.archivePlan))) return false;
+    if (destination && (context.destinationToken !== State.archiveDestinationToken
+        || context.destinationBinding !== State.archiveDestinationBinding)) return false;
+    return !envelope || (context.envelopeFingerprint
+      && context.envelopeFingerprint === State.archiveEnvelopeFingerprint
+      && context.envelopeFingerprint === archiveFingerprint(State.archiveEnvelope));
+  }
+
+  function archiveResponseError(result, fallback) {
+    const error = new Error(fallback);
+    const status = String(result && result.status || 'blocked');
+    error.insightStatus = ['unavailable', 'stale', 'blocked'].includes(status)
+      ? status : 'blocked';
+    error.archiveDefinitive = !!result;
+    return error;
+  }
+
+  function archiveBytes(value) {
+    const size = Number(value);
+    if (!Number.isFinite(size) || size < 0) return '—';
+    if (size < 1024) return `${size} B`;
+    if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KiB`;
+    return `${(size / (1024 * 1024)).toFixed(2)} MiB`;
+  }
+
+  function appendArchiveCell(row, value, { code = false, className = '' } = {}) {
+    const cell = document.createElement('td');
+    const content = code ? document.createElement('code') : document.createElement('span');
+    content.textContent = safeText(value);
+    if (className) content.className = className;
+    cell.appendChild(content); row.appendChild(cell);
+  }
+
+  function renderArchivePlan() {
+    const plan = plain(State.archivePlan);
+    const decisions = Array.isArray(plan.decisions) ? plan.decisions : [];
+    const inventory = $('rw-archive-inventory'); const target = $('rw-archive-inventory-table');
+    if (inventory && target) {
+      target.innerHTML = '';
+      inventory.hidden = !decisions.length;
+      if (decisions.length) {
+        const table = document.createElement('table');
+        const head = document.createElement('thead'); const headRow = document.createElement('tr');
+        [
+          ['report.archive.file', '文件'], ['report.archive.role', '逻辑角色'],
+          ['report.archive.size', '大小'], ['report.archive.license', 'License / attribution'],
+          ['report.archive.risk', '敏感风险'], ['report.archive.decision', '决定'],
+          ['report.archive.reason', '排除理由'],
+        ].forEach(([key, fallback]) => {
+          const th = document.createElement('th'); th.scope = 'col';
+          th.textContent = VCS.t(key, {}, fallback); headRow.appendChild(th);
+        });
+        head.appendChild(headRow); table.appendChild(head);
+        const body = document.createElement('tbody');
+        decisions.forEach(raw => {
+          const item = plain(raw); const row = document.createElement('tr');
+          appendArchiveCell(row, item.archive_path, { code: true });
+          appendArchiveCell(row, item.logical_role);
+          appendArchiveCell(row, archiveBytes(item.size));
+          appendArchiveCell(row, `${safeText(item.license)} · ${safeText(item.attribution,
+            VCS.t('report.archive.attribution_missing', {}, 'attribution missing'))}`);
+          appendArchiveCell(row, item.sensitive_risk);
+          appendArchiveCell(row, item.decision, {
+            className: `rw-archive-decision-${String(item.decision || '')}`,
+          });
+          appendArchiveCell(row, item.exclusion_reason || '—');
+          body.appendChild(row);
+        });
+        table.appendChild(body); target.appendChild(table);
+      }
+    }
+    const readiness = plain(plan.readiness); const denominator = plain(plan.denominator);
+    const summary = $('rw-archive-summary');
+    if (summary && plan.ok === true) {
+      summary.textContent = VCS.t('report.archive.plan_summary', {
+        included: denominator.included || 0,
+        excluded: denominator.excluded || 0,
+        status: safeText(readiness.status, 'unknown'),
+        file: safeText(plain(plan.archive).name),
+      }, 'Dry-run：包含 {included}，排除 {excluded}；可提交准备度 {status}；目标 {file}。');
+    }
+    const gapsBox = $('rw-archive-gaps'); const gaps = Array.isArray(readiness.gaps)
+      ? readiness.gaps : [];
+    if (gapsBox) {
+      gapsBox.innerHTML = ''; gapsBox.hidden = false;
+      const title = document.createElement('b');
+      title.textContent = gaps.length
+        ? VCS.t('report.archive.gaps', {}, '可提交缺口')
+        : VCS.t('report.archive.no_gaps', {}, '未发现机器缺口；仍需人工提交者复核。');
+      gapsBox.appendChild(title);
+      if (gaps.length) {
+        const list = document.createElement('ul');
+        gaps.forEach(raw => {
+          const gap = plain(raw); const item = document.createElement('li');
+          item.textContent = `${safeText(gap.code)} · ${safeText(gap.message)}`;
+          list.appendChild(item);
+        });
+        gapsBox.appendChild(list);
+      }
+    }
+  }
+
+  function renderArchiveResult() {
+    const result = plain(State.archiveResult); const panel = $('rw-archive-result');
+    const target = $('rw-archive-result-body'); if (!panel || !target) return;
+    target.innerHTML = ''; panel.hidden = !result.ok;
+    if (!result.ok) return;
+    const file = plain(result.file); const verification = plain(result.verification);
+    const readiness = plain(result.readiness); const dl = document.createElement('dl');
+    [
+      [VCS.t('report.archive.file', {}, '文件'), file.name],
+      [VCS.t('report.archive.size', {}, '大小'), archiveBytes(file.size)],
+      ['SHA-256', file.sha256],
+      [VCS.t('report.archive.verification', {}, '自动校验'),
+        `${safeText(verification.status)} · ${safeText(verification.checksums)}`],
+      [VCS.t('report.archive.readiness', {}, '可提交准备度'), readiness.status],
+      [VCS.t('report.archive.release_boundary', {}, '发行边界'),
+        VCS.t('report.archive.local_only', {}, '仅本地；未上传、未申请 DOI、未发布')],
+    ].forEach(([label, value]) => {
+      const dt = document.createElement('dt'); dt.textContent = label;
+      const dd = document.createElement('dd'); dd.textContent = safeText(value);
+      dl.append(dt, dd);
+    });
+    target.appendChild(dl);
+  }
+
+  function renderArchiveControls() {
+    const select = $('rw-archive-revision'); if (!select) return;
+    const previous = select.value; select.innerHTML = '';
+    const rows = State.history.filter(revisionIsUsable);
+    rows.forEach(row => {
+      const option = document.createElement('option'); option.value = insightRevision(row);
+      option.textContent = insightRevisionLabel(row); select.appendChild(option);
+    });
+    const ids = rows.map(insightRevision);
+    const preferred = State.archiveRevisionId || previous;
+    select.value = ids.includes(preferred) ? preferred : (ids[0] || '');
+    select.disabled = State.archiveBusy || State.historyStatus !== 'ready' || !ids.length;
+    const planButton = $('rw-archive-plan'); const exportButton = $('rw-archive-export');
+    if (planButton) planButton.disabled = select.disabled || State.archiveBusy;
+    const planRevision = String(plain(State.archivePlan).revision &&
+      plain(State.archivePlan).revision.revision_id || '');
+    if (exportButton) exportButton.disabled = State.archiveBusy ||
+      !State.archivePreviewToken || !State.archiveOperationKey || !select.value
+      || planRevision !== select.value;
+    if (State.archivePlan) renderArchivePlan();
+    if (State.archiveResult) renderArchiveResult();
+  }
+
+  async function planReproducibilityArchive() {
+    if (State.archiveBusy) return false;
+    const row = selectedArchiveRow(); if (!revisionIsUsable(row)) return false;
+    const projectId = State.projectId; const revisionId = insightRevision(row);
+    resetArchiveState({ keepRevision: true }); State.archiveRevisionId = revisionId;
+    State.archiveOperationKey = newArchiveOperationKey();
+    const context = beginArchiveContext(projectId, revisionId); State.archiveBusy = true;
+    archiveState('planning', VCS.t('report.archive.planning', {},
+      '正在重新校验 revision 并生成文件、许可、风险与排除清单…'));
+    renderArchiveControls();
+    publishInsightOperation(`vcs-archive-plan-${Date.now()}`, 'vcs-archive-plan',
+      'VCS archive dry-run', 'running', '', 'publish-export');
+    try {
+      const result = await VCS.call(
+        'report_archive_dry_run', projectId, revisionId, context.operationKey);
+      if (!archiveContextCurrent(context, { plan: false })) return false;
+      const plan = freezeArchivePlan(result, context);
+      if (!plan) throw archiveResponseError(
+        result, VCS.t('report.archive.plan_invalid', {},
+          'Archive dry-run binding was invalid or changed; no confirmation was issued.'));
+      State.archivePlan = plan;
+      State.archivePreviewToken = plan.preview_token;
+      context.planFingerprint = archiveFingerprint(plan);
+      archiveState('planned'); renderArchivePlan(); renderArchiveControls();
+      const heading = $('rw-archive-heading'); if (heading) heading.focus({ preventScroll: true });
+      publishInsightOperation(`vcs-archive-plan-${context.generation}`, 'vcs-archive-plan',
+        'VCS archive dry-run', 'succeeded', '', 'publish-export');
+      return true;
+    } catch (error) {
+      if (!archiveContextCurrent(context, { plan: false })) return false;
+      State.archivePreviewToken = ''; State.archiveConfirmationToken = '';
+      const status = error && error.insightStatus === 'stale' ? 'stale' : 'failed';
+      archiveState(status, error && error.message || String(error));
+      publishInsightOperation(`vcs-archive-plan-${context.generation}`, 'vcs-archive-plan',
+        'VCS archive dry-run', 'failed', error && error.message || String(error), 'publish-export');
+      return false;
+    } finally {
+      if (context.generation === State.archiveGeneration) {
+        State.archiveBusy = false; renderArchiveControls();
+      }
+    }
+  }
+
+  async function exportReproducibilityArchive() {
+    if (State.archiveBusy || !State.archivePreviewToken || !State.archiveOperationKey
+        || !State.archivePlan) return false;
+    const row = selectedArchiveRow(); const revisionId = insightRevision(row);
+    const plan = plain(State.archivePlan); const archive = plain(plan.archive);
+    if (!revisionIsUsable(row) || revisionId !== plain(plan.revision).revision_id) return false;
+    const denominator = plain(plan.denominator); const projectId = State.projectId;
+    const context = beginArchiveContext(projectId, revisionId); State.archiveBusy = true;
+    archiveState('exporting', VCS.t('report.archive.selecting_destination', {},
+      '请先选择本地目录；其不可逆 identity digest 将进入随后显示的人工确认 envelope。'));
+    renderArchiveControls();
+    let phase = State.archiveEnvelope ? 'confirm' : 'destination';
+    try {
+      if (!State.archiveEnvelope) {
+        const destinationRequest = archiveDestinationRequest(plan, context.operationKey);
+        const selected = await VCS.call(
+          'report_archive_pick_destination', projectId, destinationRequest);
+        if (!archiveContextCurrent(context)) return false;
+        if (!selected || selected.cancelled) return false;
+        const frozen = freezeArchiveEnvelope(selected, context);
+        if (!frozen) throw archiveResponseError(
+          selected, VCS.t('report.archive.destination_invalid', {},
+            'Archive destination or confirmation challenge was invalid; export stopped.'));
+        State.archiveDestinationToken = frozen.destinationToken;
+        State.archiveDestinationBinding = frozen.destinationBinding;
+        State.archiveConfirmationToken = frozen.confirmationToken;
+        State.archiveEnvelope = frozen.envelope;
+        State.archiveEnvelopeFingerprint = archiveFingerprint(frozen.envelope);
+        context.destinationToken = State.archiveDestinationToken;
+        context.destinationBinding = State.archiveDestinationBinding;
+        context.envelopeFingerprint = State.archiveEnvelopeFingerprint;
+      }
+      phase = 'confirm';
+      const confirm = typeof VCS.confirm === 'function' ? VCS.confirm : null;
+      if (!confirm) throw archiveResponseError(
+        null, VCS.t('report.archive.confirm_unavailable', {},
+          'Explicit browser confirmation is unavailable; export stopped.'));
+      const accepted = await confirm(VCS.t('report.archive.confirm_message', {
+        revision: revisionId,
+        manifest: String(plain(plan.revision).manifest_sha256 || '').slice(0, 12),
+        plan: String(plan.plan_sha256 || '').slice(0, 12),
+        rights: String(plan.rights_sha256 || '').slice(0, 12),
+        inventory: String(plan.inventory_sha256 || '').slice(0, 12),
+        destination: State.archiveDestinationBinding.slice(0, 12),
+        included: denominator.included || 0,
+        excluded: denominator.excluded || 0,
+        file: safeText(archive.name),
+      }, '确认从 revision {revision} 生成 {file}？\nmanifest {manifest} · plan {plan}\n' +
+        'rights {rights} · inventory {inventory} · destination {destination}\n' +
+        '包含 {included}，排除 {excluded}。仅本地生成，不上传、不申请 DOI。'));
+      if (!archiveContextCurrent(context, { destination: true, envelope: true })) return false;
+      if (!accepted) {
+        resetArchiveState({ keepRevision: true }); State.archiveRevisionId = revisionId;
+        renderArchiveControls(); return false;
+      }
+      const confirmation = {
+        ...clone(State.archiveEnvelope), confirmed: true,
+        idempotency_key: context.operationKey,
+        destination_token: context.destinationToken,
+      };
+      archiveState('exporting', VCS.t('report.archive.exporting', {},
+        '正在生成并自动校验本地 archive…'));
+      const result = await VCS.call('report_archive_export', projectId, confirmation);
+      if (!archiveContextCurrent(context, { destination: true, envelope: true })) return false;
+      if (!result || result.ok !== true || plain(result.verification).ok !== true) {
+        throw archiveResponseError(result, VCS.t('report.archive.export_failed', {},
+          'Archive export or verification failed; no result was adopted.'));
+      }
+      const resultRevision = plain(result.revision); const file = plain(result.file);
+      const receipt = plain(result.receipt);
+      if (result.project_id !== projectId || result.plan_sha256 !== plan.plan_sha256
+          || result.rights_sha256 !== plan.rights_sha256
+          || result.inventory_sha256 !== plan.inventory_sha256
+          || resultRevision.report_id !== plain(plan.revision).report_id
+          || resultRevision.revision_id !== revisionId
+          || resultRevision.manifest_sha256 !== plain(plan.revision).manifest_sha256
+          || file.name !== archive.name || file.sha256 !== archive.sha256
+          || file.size !== archive.size
+          || receipt.schema !== 'vcstudio.vcs-archive-export-receipt/v1'
+          || receipt.nonce !== plain(State.archiveEnvelope).nonce
+          || receipt.idempotency_key !== context.operationKey
+          || !SHA256_RE.test(String(receipt.confirmation_sha256 || ''))
+          || typeof result.replayed !== 'boolean') {
+        throw archiveResponseError(result, VCS.t('report.archive.result_invalid', {},
+          'Archive result or receipt binding changed; the response was discarded.'));
+      }
+      State.archiveResult = result; archiveState('verified', VCS.t('report.archive.verified', {
+        file: safeText(plain(result.file).name),
+      }, '本地 archive {file} 已生成并通过 SHA256SUMS/manifest 自动校验；未上传、未申请 DOI。'));
+      renderArchiveResult();
+      const heading = $('rw-archive-result-heading'); if (heading) heading.focus({ preventScroll: true });
+      State.archivePreviewToken = ''; State.archiveConfirmationToken = '';
+      State.archiveDestinationToken = ''; State.archiveDestinationBinding = '';
+      State.archiveEnvelope = null; State.archiveEnvelopeFingerprint = '';
+      publishInsightOperation(`vcs-archive-export-${context.generation}`, 'vcs-archive-export',
+        'Verified local VCS archive', 'succeeded', '', 'publish-export');
+      return true;
+    } catch (error) {
+      if (!archiveContextCurrent(context, {
+        destination: phase === 'confirm', envelope: phase === 'confirm',
+      })) return false;
+      if (error && error.archiveDefinitive) {
+        State.archivePreviewToken = ''; State.archiveConfirmationToken = '';
+        State.archiveDestinationToken = ''; State.archiveDestinationBinding = '';
+        State.archiveEnvelope = null; State.archiveEnvelopeFingerprint = '';
+      }
+      const insightStatus = error && error.insightStatus;
+      const status = insightStatus === 'stale' ? 'stale'
+        : insightStatus === 'blocked' ? 'blocked' : 'failed';
+      archiveState(status, error && error.message || String(error));
+      publishInsightOperation(`vcs-archive-export-${context.generation}`, 'vcs-archive-export',
+        'Verified local VCS archive', 'failed', error && error.message || String(error),
+        'publish-export');
+      return false;
+    } finally {
+      if (context.generation === State.archiveGeneration) {
+        State.archiveBusy = false; renderArchiveControls();
+      }
+    }
+  }
+
   function renderActions() {
     const previewButton = $('rw-preview'); const publishButton = $('rw-publish');
     const pick = $('rw-pick-output'); const open = $('rw-open-output');
@@ -1511,6 +2018,7 @@
       State.historyError = '当前报告路由没有可解析的项目上下文';
       State.outputDestinationToken = ''; State.outputDisplayName = ''; State.outputProjectId = '';
       State.capsuleGeneration += 1; clearCapsuleTransaction();
+      resetArchiveState();
       const output = $('rw-output-path');
       if (output) output.textContent = '发布时尚未选择目录';
       showAlert(tr('legacy.dynamic.report_workbench.0012', '当前项目无法解析。'));
@@ -1533,6 +2041,7 @@
     State.insightBusy = false; State.insightStatus = 'empty';
     State.insightDiff = null; State.insightGraph = null;
     State.capsuleGeneration += 1; clearCapsuleTransaction();
+    resetArchiveState();
     showAlert(''); setOperation('正在读取版本化预设、格式能力与报告状态…', 'busy');
     renderHistory(); renderActions();
     try {
@@ -1959,6 +2468,16 @@
     const diffButton = $('rw-load-diff'); if (diffButton) diffButton.addEventListener('click', loadScientificDiff);
     const graphButton = $('rw-load-graph'); if (graphButton) graphButton.addEventListener('click', loadEvidenceGraph);
     const capsuleButton = $('rw-export-capsule'); if (capsuleButton) capsuleButton.addEventListener('click', exportInsightCapsule);
+    const archivePlanButton = $('rw-archive-plan');
+    if (archivePlanButton) archivePlanButton.addEventListener('click', planReproducibilityArchive);
+    const archiveExportButton = $('rw-archive-export');
+    if (archiveExportButton) archiveExportButton.addEventListener('click', exportReproducibilityArchive);
+    const archiveRevision = $('rw-archive-revision');
+    if (archiveRevision) archiveRevision.addEventListener('change', () => {
+      const revisionId = String(archiveRevision.value || '');
+      resetArchiveState({ keepRevision: true }); State.archiveRevisionId = revisionId;
+      renderArchiveControls();
+    });
     const insightResults = $('rw-insights-results');
     if (insightResults) insightResults.addEventListener('click', event => {
       const target = event.target.closest && event.target.closest('[data-insight-route]');
@@ -1986,7 +2505,8 @@
     });
     document.addEventListener('vcs:language', () => {
       if (State.spec) renderSpec();
-      renderPreview(State.preview); renderHistory(); renderFormatStates(); renderInsightControls();
+      renderPreview(State.preview); renderHistory(); renderFormatStates();
+      renderInsightControls(); renderArchiveControls();
     });
     document.addEventListener('vcs:report-workbench-discard-draft', event => {
       const detail = plain(event.detail);
@@ -2031,6 +2551,16 @@
       validatedCapsuleFile,
       capsuleReceiptFingerprint,
       clearCapsuleTransaction,
+      planReproducibilityArchive,
+      exportReproducibilityArchive,
+      resetArchiveState,
+      renderArchiveControls,
+      freezeArchivePlan,
+      archiveDestinationRequest,
+      freezeArchiveEnvelope,
+      beginArchiveContext,
+      archiveContextCurrent,
+      archiveFingerprint,
     };
   }
 

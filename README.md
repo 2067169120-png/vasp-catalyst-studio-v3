@@ -155,7 +155,8 @@ Publish → Versions 还提供三种只读/导出工具：
 
 - **Scientific diff**：选择两个权威 history revision，分别重新校验 bundle，再比较 ReportSpec scope、输入/快照 hash、validation 状态与 checks、科学资格、模型数值、图表以及文件/manifest hash；不会用日期差异冒充科学差异；
 - **Evidence/Claim Graph**：只从冻结 spec、snapshot、validation、model 和 claim 记录构建 conclusion/table/figure/check/source/job/file-hash 关系；缺边明确显示为 missing，不读取可变 live 文件，也不公开本地路径；
-- **SI capsule**：通过服务端目录选择生成确定性 ZIP，包含规范化合同、输入 manifest、模型/图表元数据、Methods、BibTeX、环境/版本、validation 记录、Research Notebook ledger/限制、capsule manifest 和 `SHA256SUMS`；排除秘密、绝对路径、附件正文、缓存和可变 live 文件，且绝不覆盖同名文件。
+- **SI capsule**：通过服务端目录选择与冻结 preview→confirm receipt 生成确定性 ZIP，包含规范化合同、输入 manifest、模型/图表元数据、Methods、BibTeX、环境/版本、validation 记录、Research Notebook ledger/限制、capsule manifest 和 `SHA256SUMS`；排除秘密、绝对路径、附件正文、缓存和可变 live 文件，且绝不覆盖同名文件；
+- **DOI-ready local archive**：在 Publish → Export 中先从一个 current、重新校验的 report revision 生成 path-free dry-run，逐项显示逻辑角色、大小、SHA-256、license/attribution、敏感风险、包含/排除决定和理由；服务端验证显式 confirmation 后生成绑定 revision、source manifest、plan 与目标目录实体的确定性 ZIP。归档包含实际报告和权威图表、冻结合同/model/input manifest、Methods、环境与 parser version、provenance graph、README/CITATION、archive manifest 和 `SHA256SUMS`。原始 POTCAR、密钥、绝对路径、缓存、临时/可变 live 文件及许可不完整的资源保持排除。成功结果仅表示本地 archive 自校验通过并给出可提交准备度/缺口；应用不会上传、申请 DOI 或宣称已发布。
 
 Project 与 Publish 还提供项目级 Research Notebook。journal 使用项目身份绑定的外部 head/sequence anchor 与跨进程锁、revision+head+project CAS、链式 record digest、append-only supersedes/tombstone；完整状态机与附件 blob 在读取/归档时重验，symlink/junction/reparse 路径 fail-closed。关联证据只从当前权威源重验并显示 `current`、`stale` 或 `missing`；缺失/损坏 `job.yaml` 不会靠目录推断为当前。人工审阅只记录本机明确输入的自声明 actor、角色、决定、requested changes 与署名说明，不是认证或密码学签名，也不会自动产生 `human_scientific_reviewed`。完整边界见 [Research Notebook 合同](docs/research-notebook-contract.md)。
 
