@@ -140,6 +140,72 @@ def _open_metadata_signature(
         os.close(descriptor)
 
 
+def _rehash_bounded_regular_file(
+    root: Path, path: Path, name: str, *, expected_size: int,
+    remaining_bytes: int,
+) -> str:
+    """Stream one captured file again under the original snapshot budget.
+
+    Windows file change times are finite-resolution metadata.  A same-size
+    overwrite followed by an mtime restore can therefore share the captured
+    metadata token when both operations land in one clock tick.  This final
+    content check reads at most the captured size plus one EOF sentinel, keeps
+    only one fixed-size chunk in memory, and repeats the no-follow/identity
+    checks around the read.
+    """
+    size = int(expected_size)
+    allowance = int(remaining_bytes)
+    if size < 0 or size + 1 > allowance:
+        raise ValueError("snapshot revalidation exceeds bounded byte budget")
+    parents_before = _parent_signatures(root, name)
+    try:
+        before_path = path.lstat()
+    except OSError as exc:
+        raise ValueError("file disappeared before snapshot revalidation") from exc
+    if not _is_regular_no_follow(before_path) or int(before_path.st_size) != size:
+        raise ValueError("evidence identity changed before snapshot revalidation")
+
+    flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+    flags |= int(getattr(os, "O_NOFOLLOW", 0))
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError(
+            "evidence could not be reopened without following links") from exc
+    digest = hashlib.sha256()
+    read_bytes = 0
+    with os.fdopen(descriptor, "rb", closefd=True) as handle:
+        before_fd = os.fstat(handle.fileno())
+        before_change = _fd_change_token(handle.fileno(), before_fd)
+        if (not _is_regular_no_follow(before_fd)
+                or _stat_signature(before_fd) != _stat_signature(before_path)):
+            raise ValueError(
+                "evidence identity changed before snapshot revalidation")
+        while read_bytes < size:
+            chunk = handle.read(min(_READ_CHUNK_BYTES, size - read_bytes))
+            if not chunk:
+                raise ValueError("evidence was truncated during snapshot revalidation")
+            read_bytes += len(chunk)
+            digest.update(chunk)
+        if handle.read(1):
+            raise ValueError("evidence grew during snapshot revalidation")
+        after_fd = os.fstat(handle.fileno())
+        after_change = _fd_change_token(handle.fileno(), after_fd)
+    try:
+        after_path = path.lstat()
+    except OSError as exc:
+        raise ValueError("file disappeared after snapshot revalidation") from exc
+    identity = _stat_signature(before_fd)
+    if (not _is_regular_no_follow(after_path)
+            or read_bytes != size
+            or identity != _stat_signature(after_fd)
+            or identity != _stat_signature(after_path)
+            or before_change != after_change
+            or _parent_signatures(root, name) != parents_before):
+        raise ValueError("evidence changed during snapshot revalidation")
+    return digest.hexdigest()
+
+
 def _is_regular_no_follow(value: os.stat_result) -> bool:
     return bool(
         stat.S_ISREG(value.st_mode)
@@ -311,8 +377,9 @@ class SourceSnapshot:
     """Immutable bytes plus public hashes for one server-resolved source.
 
     Parsers consume :meth:`text`/:meth:`bytes` from this object, never reopening
-    the scientific input. :meth:`assert_unchanged` checks the captured metadata
-    identity without rereading large artifacts after parsing.
+    the scientific input. :meth:`assert_unchanged` first checks metadata, then
+    streams a bounded digest revalidation so finite-resolution change tokens
+    cannot hide a same-size replacement.
     """
 
     root: Path
@@ -415,6 +482,14 @@ class SourceSnapshot:
 
     def assert_unchanged(self) -> None:
         rejected_names = {item["name"] for item in self.rejected}
+        evidence_by_name = {
+            str(item.get("name") or ""): item for item in self._files
+        }
+        # Each captured byte may be streamed once more, plus one EOF sentinel
+        # per bounded file.  Across snapshots in a view this stays within the
+        # original shared snapshot budget plus MAX_EVIDENCE_FILES bytes.
+        remaining_revalidation_bytes = sum(
+            int(item.get("size_bytes") or 0) + 1 for item in self._files)
         for name in self.requested_names:
             if name in rejected_names:
                 continue
@@ -442,13 +517,29 @@ class SourceSnapshot:
                     or current_signature != expected_signature):
                 raise SourceSnapshotChanged(
                     f"{self.source_id}:{name} changed during analysis; retry")
+            evidence = evidence_by_name.get(name)
+            if evidence is None:
+                raise SourceSnapshotChanged(
+                    f"{self.source_id}:{name} lost its snapshot hash; retry")
+            expected_size = int(evidence.get("size_bytes") or 0)
+            try:
+                current_sha256 = _rehash_bounded_regular_file(
+                    self.root, path, name, expected_size=expected_size,
+                    remaining_bytes=remaining_revalidation_bytes)
+            except (OSError, ValueError) as exc:
+                raise SourceSnapshotChanged(
+                    f"{self.source_id}:{name} changed during analysis; retry") from exc
+            remaining_revalidation_bytes -= expected_size + 1
+            if current_sha256 != str(evidence.get("sha256") or ""):
+                raise SourceSnapshotChanged(
+                    f"{self.source_id}:{name} changed during analysis; retry")
 
 
 def capture_source_snapshot(
     target: Mapping[str, Any], evidence_names: Sequence[Any], *,
     budget: SourceSnapshotBudget | None = None,
 ) -> SourceSnapshot:
-    """Read each requested file once and bind hashes/parsers to those bytes."""
+    """Capture each requested file once and bind hashes/parsers to those bytes."""
     view_budget = budget or SourceSnapshotBudget()
     root = Path(str(target["path"]))
     names = ["job.yaml"]

@@ -396,7 +396,12 @@ def run_bridge_journey(*, journey_root: Path | None = None) -> dict:
                         or status.get('artifact_current') is not True
                         or status.get('scientific_status') != 'diagnostic'):
                     raise RuntimeError(status.get('error') or 'report marker is not current')
-                html = Path(status['files']['html']).resolve()
+                html_record = (status.get('files') or {}).get('html') or {}
+                html_name = str(html_record.get('name') or '')
+                if (html_record.get('available') is not True
+                        or not html_name or Path(html_name).name != html_name):
+                    raise RuntimeError('published HTML projection is invalid')
+                html = (state['report_dir'] / html_name).resolve()
                 if not _inside(root, html) or not html.is_file():
                     raise RuntimeError('published HTML escaped journey isolation')
                 text = html.read_text(encoding='utf-8')

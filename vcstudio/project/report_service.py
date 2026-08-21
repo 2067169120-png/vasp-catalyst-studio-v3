@@ -32,6 +32,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Protocol, runtime_checkable
 
+from vcstudio.shared.credential_classifier import (
+    contains_local_path,
+    is_sensitive_key,
+    looks_like_credential,
+)
+
 if TYPE_CHECKING:
     from vcstudio.project.report_contracts import ReportSpec
 
@@ -50,26 +56,7 @@ _LOGGER = logging.getLogger(__name__)
 
 _OPERATION_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
-_DRIVE_PATH = re.compile(r"(?i)(?<![A-Za-z0-9])[A-Z]:[\\/]")
-_UNC_PATH = re.compile(r"(?<![:A-Za-z0-9])(?:\\\\|//)[^\\/\s]+[\\/][^\s]+")
 _TILDE_PATH = re.compile(r"(?<![A-Za-z0-9_])~[\\/]")
-_POSIX_PATH = re.compile(r"(?<![:A-Za-z0-9_])/(?!/)[^\s]+")
-_FILE_URI = re.compile(r"(?i)(?<![A-Za-z0-9_])file:(?:/{0,3}|\\)")
-_PUBLIC_URL = re.compile(r"(?i)\b(?:https?|s3)://[^\s]+")
-_CREDENTIAL_VALUE = re.compile(
-    r"(?i)(?:"
-    r"\b(?:github_pat_|gh[opusr]_|sk-)[A-Za-z0-9_-]{12,}"
-    r"|\bAKIA[0-9A-Z]{16}\b"
-    r"|\bBearer\s+\S+"
-    r"|\b(?:password|passwd|secret|token|api[_-]?key)\s*[:=]\s*\S+"
-    r"|-----BEGIN[^\r\n]{0,40}PRIVATE KEY-----"
-    r"|https?://[^\s/:]+:[^\s/@]+@"
-    r")"
-)
-_SENSITIVE_KEY_WORDS = frozenset({
-    "password", "passwd", "secret", "token", "credential", "credentials",
-    "auth", "authorization", "cookie", "cookies", "privatekey",
-})
 _PATH_KEYS = frozenset({
     "path", "root", "dir", "directory", "locator", "source_job",
     "destination", "out_dir", "temp_root", "figure_dir", "figures_dir",
@@ -485,16 +472,7 @@ def _normalized_key(value: Any) -> tuple[str, frozenset[str]]:
 
 
 def _sensitive_public_key(value: Any) -> bool:
-    normalized, words = _normalized_key(value)
-    compact = normalized.replace("_", "")
-    return bool(
-        words & _SENSITIVE_KEY_WORDS
-        or compact in {"apikey", "accesskey", "privatekey", "secretkey"}
-        or compact.endswith((
-            "password", "passwd", "secret", "token", "credential",
-            "authorization", "cookie", "privatekey",
-        ))
-    )
+    return is_sensitive_key(value)
 
 
 def _path_public_key(value: Any) -> bool:
@@ -507,14 +485,10 @@ def _path_public_key(value: Any) -> bool:
 
 def _unsafe_public_string(value: str) -> bool:
     text = str(value or "")
-    inspected = _PUBLIC_URL.sub("", text)
     return bool(
-        _DRIVE_PATH.search(inspected)
-        or _UNC_PATH.search(inspected)
-        or _TILDE_PATH.search(inspected)
-        or _POSIX_PATH.search(inspected)
-        or _FILE_URI.search(inspected)
-        or _CREDENTIAL_VALUE.search(text)
+        contains_local_path(text)
+        or _TILDE_PATH.search(text)
+        or looks_like_credential(text)
     )
 
 
@@ -538,7 +512,7 @@ def _public_value(value: Any) -> Any:
     if isinstance(value, os.PathLike):
         return "<local-path-redacted>"
     if isinstance(value, str):
-        return "<sensitive-value-redacted>" if _CREDENTIAL_VALUE.search(value) else (
+        return "<sensitive-value-redacted>" if looks_like_credential(value) else (
             "<local-path-redacted>" if _unsafe_public_string(value) else value
         )
     return value
@@ -556,6 +530,15 @@ def _public_files(files: Any) -> dict[str, Any]:
             "available": bool(path and os.path.isfile(path)),
         }
     return result
+
+
+def _public_status_result(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Project marker-backed status while retaining private audit locators."""
+
+    result = copy.deepcopy(dict(value))
+    result["files"] = _public_files(result.get("files"))
+    projected = _public_value(result)
+    return dict(projected) if isinstance(projected, Mapping) else {}
 
 
 def _public_publish_result(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -2382,7 +2365,7 @@ class ReportService:
                 )
             if not isinstance(result, Mapping):
                 raise RuntimeError("report status host returned an invalid result")
-            return copy.deepcopy(dict(result))
+            return _public_status_result(result)
         except Exception as exc:  # noqa: BLE001 - JSON-safe public adapter seam
             return {
                 "schema": "vcstudio.report-status/v1",

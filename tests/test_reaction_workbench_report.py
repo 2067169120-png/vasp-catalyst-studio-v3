@@ -21,6 +21,10 @@ from vcstudio.project.report_contracts import (
     ValidationResult,
     validate_bindings,
 )
+from vcstudio.project.report_service import (
+    _public_publish_result,
+    _public_status_result,
+)
 
 
 def _downgrade_preview_to_legacy_present(api, preview):
@@ -227,6 +231,11 @@ def test_reaction_projection_absence_is_explicit_stable_and_replayable(tmp_path)
     assert status["artifact_current"] is True
     assert len(history["revisions"]) == 1
     assert history["revisions"][0]["current"] is True
+    assert Path(marker["files"]["html"]).is_absolute()
+    assert status["files"]["html"] == {
+        "name": Path(marker["files"]["html"]).name,
+        "available": True,
+    }
     assert str(tmp_path) not in json.dumps(
         (preview, published, status, history), ensure_ascii=False)
 
@@ -264,6 +273,58 @@ def test_reaction_projection_absence_is_explicit_stable_and_replayable(tmp_path)
     assert stale_status["artifact_status"] == "stale"
     assert stale_history["revisions"][0]["current"] is False
     assert stale_history["revisions"][0]["artifact_status"] == "stale"
+
+
+def test_report_public_projection_redacts_exact_posix_publish_paths():
+    private_root = (
+        "/tmp/pytest-of-runner/pytest-91/"
+        "test_reaction_projection_absence0/absent"
+    )
+    names = {
+        "html": "reaction-report.html",
+        "manifest": "reaction-report.manifest.json",
+        "model": "reaction-report.model.json",
+        "spec": "reaction-report.spec.json",
+        "snapshot": "reaction-report.snapshot.json",
+        "validation": "reaction-report.validation.json",
+    }
+    private_files = {
+        key: f"{private_root}/{name}" for key, name in names.items()
+    }
+
+    projected = _public_publish_result({
+        "schema": "vcstudio.report-publish/v1",
+        "ok": True,
+        "files": private_files,
+        "contract_files": {
+            key: private_files[key]
+            for key in ("spec", "snapshot", "validation")
+        },
+        "model_file": private_files["model"],
+        "manifest": private_files["manifest"],
+        "diagnostics": {
+            "message": f"bundle rendered under {private_root}",
+        },
+    })
+
+    assert {
+        key: value["name"] for key, value in projected["files"].items()
+    } == names
+    assert projected["diagnostics"]["message"] == "<local-path-redacted>"
+    assert private_root not in json.dumps(projected, ensure_ascii=False)
+
+    projected_status = _public_status_result({
+        "schema": "vcstudio.report-status/v1",
+        "ok": True,
+        "artifact_current": True,
+        "files": private_files,
+        "report_reason": f"verified from {private_root}",
+    })
+    assert {
+        key: value["name"] for key, value in projected_status["files"].items()
+    } == names
+    assert projected_status["report_reason"] == "<local-path-redacted>"
+    assert private_root not in json.dumps(projected_status, ensure_ascii=False)
 
 
 @pytest.mark.parametrize("starts_present", [False, True])

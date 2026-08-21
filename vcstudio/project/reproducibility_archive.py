@@ -3520,7 +3520,9 @@ def _trusted_link(directory: TrustedDirectoryHandle, source: str, target: str) -
 
 def _trusted_read_regular(
     directory: TrustedDirectoryHandle, name: str,
-    *, max_bytes: int = DEFAULT_ARCHIVE_LIMITS.max_archive_bytes,
+    *,
+    expected_entity: tuple[int, int, int, int] | None = None,
+    max_bytes: int = DEFAULT_ARCHIVE_LIMITS.max_archive_bytes,
 ) -> bytes:
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     if directory.dir_fd is not None:
@@ -3547,6 +3549,7 @@ def _trusted_read_regular(
         if (
             _is_symlink_or_reparse(named_after)
             or not stat.S_ISREG(named_after.st_mode)
+            or (expected_entity is not None and identity != expected_entity)
             or _entity_identity(named_before) != identity
             or _entity_identity(named_after) != identity
         ):
@@ -3574,10 +3577,14 @@ def _trusted_read_regular(
 
 def _trusted_verify_archive(
     directory: TrustedDirectoryHandle, name: str, *, expected_sha256: str,
+    expected_entity: tuple[int, int, int, int] | None = None,
     limits: ArchiveLimits = DEFAULT_ARCHIVE_LIMITS,
 ) -> dict[str, Any]:
     return verify_archive_bytes(
-        _trusted_read_regular(directory, name, max_bytes=limits.max_archive_bytes),
+        _trusted_read_regular(
+            directory, name, expected_entity=expected_entity,
+            max_bytes=limits.max_archive_bytes,
+        ),
         expected_sha256=expected_sha256, limits=limits,
     )
 
@@ -3673,6 +3680,7 @@ def export_archive(
             if _trusted_exists(destination, target_name):
                 raise FileExistsError("archive filename already exists and will not be overwritten")
             descriptor = _trusted_open_exclusive(destination, temp_name)
+            staged_entity: tuple[int, int, int, int] | None = None
             try:
                 with os.fdopen(descriptor, "wb") as handle:
                     descriptor = -1
@@ -3681,9 +3689,10 @@ def export_archive(
                         handle.write(view[offset:offset + 1024 * 1024])
                     handle.flush()
                     os.fsync(handle.fileno())
+                    staged_entity = _entity_identity(os.fstat(handle.fileno()))
                 staged = _trusted_verify_archive(
                     destination, temp_name, expected_sha256=plan.archive_sha256,
-                    limits=limits,
+                    expected_entity=staged_entity, limits=limits,
                 )
                 if staged.get("ok") is not True:
                     raise ArchiveVerificationError(
@@ -3698,7 +3707,7 @@ def export_archive(
                 destination.verify_path()
                 final = _trusted_verify_archive(
                     destination, target_name, expected_sha256=plan.archive_sha256,
-                    limits=limits,
+                    expected_entity=staged_entity, limits=limits,
                 )
                 if final.get("ok") is not True:
                     raise ArchiveVerificationError(

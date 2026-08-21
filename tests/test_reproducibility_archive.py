@@ -648,13 +648,62 @@ def test_symlink_destination_is_rejected_before_any_archive_write(tmp_path):
     except (OSError, NotImplementedError):
         pytest.skip("filesystem directory symbolic links are unavailable")
 
-    with pytest.raises(ValueError, match="non-(?:symlink|reparse) director"):
+    expected = (
+        "destination ancestors must be non-reparse directories"
+        if os.name == "nt"
+        else "destination ancestors must be non-symlink directories"
+    )
+    with pytest.raises(ValueError, match=rf"\A{expected}\Z") as caught:
         export_archive(
             service, "project.yaml", revision_id, linked_destination,
             expected_plan_sha256=plan.plan_sha256,
         )
 
+    assert str(tmp_path) not in str(caught.value)
     assert not list(real_destination.iterdir())
+
+
+def test_staged_archive_entity_replacement_with_same_bytes_is_rejected(
+    tmp_path, monkeypatch,
+):
+    _host, service, revision_id, _published = _published_revision(
+        tmp_path, assets=False)
+    plan = build_archive_plan(service, "project.yaml", revision_id)
+    destination = tmp_path / "archive-stage-replacement"
+    destination.mkdir()
+    real_verify = archive_mod._trusted_verify_archive
+    original = [None]
+    replacement = [None]
+
+    def replace_stage(directory, name, *, expected_sha256, **kwargs):
+        if original[0] is None and name != plan.archive_name:
+            staged = destination / name
+            retained = staged.with_name(staged.name + ".original")
+            before = os.lstat(staged)
+            staged.rename(retained)
+            staged.write_bytes(retained.read_bytes())
+            after = os.lstat(staged)
+            assert (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            original[0] = retained
+            replacement[0] = staged
+        return real_verify(
+            directory, name, expected_sha256=expected_sha256, **kwargs)
+
+    monkeypatch.setattr(archive_mod, "_trusted_verify_archive", replace_stage)
+
+    with pytest.raises(
+        archive_mod.ArchiveVerificationError, match="archive stage changed",
+    ):
+        export_archive(
+            service, "project.yaml", revision_id, destination,
+            expected_plan_sha256=plan.plan_sha256,
+        )
+
+    assert original[0] is not None
+    assert replacement[0] is not None
+    assert not list(destination.glob("*.zip"))
+    assert not replacement[0].exists()
+    assert original[0].exists()
 
 
 def test_destination_token_rejects_directory_rename_and_replacement(tmp_path):

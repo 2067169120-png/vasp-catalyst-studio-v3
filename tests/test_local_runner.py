@@ -37,10 +37,15 @@ def test_status_not_started(tmp_path):
     assert st['state'] == 'NOT_STARTED' and st['pid'] is None and st['exit_code'] is None
 
 
-def _poll_done(cwd, timeout=20.0):
+def _poll_done(cwd, timeout=None):
     """轮询到终态(DONE/FAILED)或超时。"""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    # GitHub's covered Windows 3.10 job can need more than 20 seconds for the
+    # first cold PowerShell supervisor.  While that PID is alive and no atomic
+    # exit-code file exists, RUNNING is the correct production state.
+    if timeout is None:
+        timeout = 60.0 if lr._is_windows() else 20.0
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         st = lr.status(cwd)
         if st['state'] in ('DONE', 'FAILED'):
             return st

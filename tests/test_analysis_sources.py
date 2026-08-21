@@ -292,7 +292,8 @@ def test_value_provenance_keeps_only_hashed_files_and_explicit_parser_identity()
     }
 
 
-def test_source_snapshot_hashes_and_parses_one_copy_then_detects_replacement(tmp_path):
+def test_source_snapshot_hashes_and_parses_one_copy_then_detects_replacement(
+        tmp_path, monkeypatch):
     job = tmp_path / "immutable"
     manifest = _manifest(job, "aimd")
     original = b" 1 T= 300 E= -10.0\n"
@@ -305,6 +306,7 @@ def test_source_snapshot_hashes_and_parses_one_copy_then_detects_replacement(tmp
     snapshot = capture_source_snapshot(target, ["OSZICAR"])
     evidence = snapshot.file("OSZICAR")
     captured_stat = (job / "OSZICAR").stat()
+    real_metadata_signature = analysis_sources._open_metadata_signature
 
     assert snapshot.bytes("OSZICAR") == original
     assert snapshot.text("OSZICAR") is snapshot.text("OSZICAR")
@@ -316,9 +318,51 @@ def test_source_snapshot_hashes_and_parses_one_copy_then_detects_replacement(tmp
         job / "OSZICAR",
         ns=(captured_stat.st_atime_ns, captured_stat.st_mtime_ns),
     )
+    # Model a finite-resolution Windows change token: even if every metadata
+    # field aliases the captured value, content revalidation must detect drift.
+    monkeypatch.setattr(
+        analysis_sources,
+        "_open_metadata_signature",
+        lambda path: snapshot._signatures["OSZICAR"]
+        if Path(path).name == "OSZICAR" else real_metadata_signature(path),
+    )
     assert snapshot.bytes("OSZICAR") == original
     with pytest.raises(SourceSnapshotChanged, match="changed during analysis"):
         snapshot.assert_unchanged()
+
+
+def test_source_snapshot_rehash_stays_within_captured_total_budget(
+        tmp_path, monkeypatch):
+    job = tmp_path / "bounded-revalidation"
+    manifest = _manifest(job, "aimd")
+    (job / "OSZICAR").write_bytes(b"a" * 17)
+    (job / "OUTCAR").write_bytes(b"b" * 23)
+    target = {
+        "path": str(job), "source_id": "job-bounded", "relation": "member",
+        "task_type": "aimd", "state": "DONE", "manifest": manifest,
+    }
+    snapshot = capture_source_snapshot(target, ["OSZICAR", "OUTCAR"])
+    expected_budget = sum(
+        int(item["size_bytes"]) + 1 for item in snapshot.files())
+    real_rehash = analysis_sources._rehash_bounded_regular_file
+    remaining = []
+
+    def tracked_rehash(root, path, name, *, expected_size, remaining_bytes):
+        remaining.append((name, expected_size, remaining_bytes))
+        return real_rehash(
+            root, path, name, expected_size=expected_size,
+            remaining_bytes=remaining_bytes)
+
+    monkeypatch.setattr(
+        analysis_sources, "_rehash_bounded_regular_file", tracked_rehash)
+    snapshot.assert_unchanged()
+
+    assert remaining[0][2] == expected_budget
+    assert all(
+        later[2] == earlier[2] - earlier[1] - 1
+        for earlier, later in zip(remaining, remaining[1:])
+    )
+    assert sum(size + 1 for _name, size, _budget in remaining) == expected_budget
 
 
 def test_task_parser_consumes_materialized_snapshot_and_retries_source_mutation(tmp_path):

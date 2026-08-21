@@ -405,7 +405,9 @@ def test_api_rejects_20000_member_project_before_manifest_or_summary_expansion(t
     assert result["table"]["rows"] == []
 
 
-def test_trusted_snapshot_rejects_reparse_components_before_open(tmp_path, monkeypatch):
+@pytest.mark.parametrize("reparse_component", ("parent", "leaf"))
+def test_trusted_snapshot_rejects_reparse_components_before_open(
+        tmp_path, monkeypatch, reparse_component):
     source = tmp_path / "member" / "job.yaml"
     source.parent.mkdir()
     source.write_text("state: DONE\n", encoding="utf-8")
@@ -424,7 +426,8 @@ def test_trusted_snapshot_rejects_reparse_components_before_open(tmp_path, monke
 
     def lstat(path):
         value = real_lstat(path)
-        if os.path.normcase(str(path)) == os.path.normcase(str(source.parent)):
+        target = source.parent if reparse_component == "parent" else source
+        if os.path.normcase(str(path)) == os.path.normcase(str(target)):
             return ReparseStat(value)
         return value
 

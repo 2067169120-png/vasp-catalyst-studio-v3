@@ -73,6 +73,7 @@ _REACTION_PROJECTION_BINDING_SCHEMA = (
 # are newly constructed by ``_analysis_workbench_build`` and never reused
 # across public requests.
 _REACTION_REQUEST_SNAPSHOT_KEY = '_reaction_snapshot_token'
+_RESEARCH_SOURCE_PATH_COMPONENT_LIMIT = 1024
 
 # Browser-facing duplicate-calculation queries are deliberately much smaller
 # than the local ledger.  The derivative index is advisory only; submission is
@@ -9959,32 +9960,103 @@ class Api:
             close_handle(handle)
 
     @staticmethod
+    def _research_stat_is_reparse(info):
+        """Recognize symlinks and Windows-style reparse metadata uniformly."""
+        attributes = int(getattr(info, 'st_file_attributes', 0))
+        marker = int(getattr(
+            stat_mod, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400))
+        return stat_mod.S_ISLNK(info.st_mode) or bool(attributes & marker)
+
+    @classmethod
+    def _research_posix_path_preflight(cls, absolute):
+        """Bound and classify the complete root-to-leaf chain before opening."""
+        def lstat_entity(candidate):
+            try:
+                return os.lstat(candidate)
+            except FileNotFoundError:
+                raise FileNotFoundError('source entity is missing') from None
+            except OSError:
+                raise OSError('source entity metadata is unavailable') from None
+
+        components = [item for item in absolute.split(os.path.sep) if item]
+        if (not components
+                or len(components) > _RESEARCH_SOURCE_PATH_COMPONENT_LIMIT):
+            raise OSError('source path component limit exceeded')
+        current = os.path.sep
+        root_info = lstat_entity(current)
+        if cls._research_stat_is_reparse(root_info):
+            raise OSError('source path contains a symlink or reparse point')
+        if not stat_mod.S_ISDIR(root_info.st_mode):
+            raise OSError('source root entity is not a directory')
+        entities = [root_info]
+        for index, component in enumerate(components):
+            current = os.path.join(current, component)
+            info = lstat_entity(current)
+            if cls._research_stat_is_reparse(info):
+                raise OSError('source path contains a symlink or reparse point')
+            final = index == len(components) - 1
+            if final and not stat_mod.S_ISREG(info.st_mode):
+                raise OSError('source entity is not a regular file')
+            if not final and not stat_mod.S_ISDIR(info.st_mode):
+                raise OSError('source parent entity is not a directory')
+            entities.append(info)
+        return components, entities
+
+    @staticmethod
     def _research_posix_file_snapshot(path):
         """Open a file relative to trusted directory descriptors without following."""
         from vcstudio.project.research_explorer import MAX_SOURCE_FILE_BYTES
 
         absolute = os.path.abspath(os.path.expanduser(str(path)))
-        components = [item for item in absolute.split(os.path.sep) if item]
+        components, preflight = Api._research_posix_path_preflight(absolute)
+
+        def entity_signature(info):
+            return (
+                int(info.st_dev), int(info.st_ino),
+                int(stat_mod.S_IFMT(info.st_mode)),
+            )
+
         directory_flags = (
             os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
             | getattr(os, 'O_NOFOLLOW', 0))
-        descriptors = [os.open(os.path.sep, directory_flags)]
         try:
-            for component in components[:-1]:
-                descriptor = os.open(
-                    component, directory_flags, dir_fd=descriptors[-1])
+            root_descriptor = os.open(os.path.sep, directory_flags)
+        except OSError:
+            raise OSError('source root entity changed before open') from None
+        descriptors = [root_descriptor]
+        try:
+            if (entity_signature(os.fstat(descriptors[0]))
+                    != entity_signature(preflight[0])):
+                raise OSError('source root entity changed before open')
+            for index, component in enumerate(components[:-1]):
+                try:
+                    descriptor = os.open(
+                        component, directory_flags, dir_fd=descriptors[-1])
+                except OSError:
+                    raise OSError(
+                        'source directory entity changed before open') from None
                 info = os.fstat(descriptor)
-                if not stat_mod.S_ISDIR(info.st_mode):
+                if (not stat_mod.S_ISDIR(info.st_mode)
+                        or entity_signature(info)
+                        != entity_signature(preflight[index + 1])):
                     os.close(descriptor)
-                    raise OSError('source parent entity is not a directory')
+                    raise OSError('source directory entity changed before open')
                 descriptors.append(descriptor)
-            file_descriptor = os.open(
-                components[-1], os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0),
-                dir_fd=descriptors[-1])
+            try:
+                file_descriptor = os.open(
+                    components[-1],
+                    os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0),
+                    dir_fd=descriptors[-1])
+            except OSError:
+                raise OSError('source file entity changed before open') from None
             descriptors.append(file_descriptor)
             before = os.fstat(file_descriptor)
-            if (not stat_mod.S_ISREG(before.st_mode)
-                    or int(before.st_size) > MAX_SOURCE_FILE_BYTES):
+            if not stat_mod.S_ISREG(before.st_mode):
+                raise OSError('source entity is not a regular file')
+            if (entity_signature(before)
+                    != entity_signature(preflight[-1])):
+                raise OSError('source file entity changed before open')
+            if int(before.st_size) > MAX_SOURCE_FILE_BYTES:
                 raise ValueError('source_file_limit_exceeded')
             chunks = []
             digest = hashlib.sha256()
@@ -10029,11 +10101,6 @@ class Api:
     def _research_source_file_snapshot_impl(path):
         from vcstudio.project.research_explorer import MAX_SOURCE_FILE_BYTES
 
-        def reparse(stat):
-            attributes = int(getattr(stat, 'st_file_attributes', 0))
-            marker = int(getattr(stat_mod, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400))
-            return stat_mod.S_ISLNK(stat.st_mode) or bool(attributes & marker)
-
         def entity_signature(stat):
             return (
                 int(stat.st_dev), int(stat.st_ino),
@@ -10048,14 +10115,14 @@ class Api:
         for component in components[:-1]:
             current = os.path.join(current, component)
             parent_stat = os.lstat(current)
-            if reparse(parent_stat):
+            if Api._research_stat_is_reparse(parent_stat):
                 raise OSError('source path contains a symlink or reparse point')
             if not stat_mod.S_ISDIR(parent_stat.st_mode):
                 raise OSError('source parent entity is not a directory')
             parents.append((current, entity_signature(parent_stat)))
 
         before_path = os.lstat(absolute)
-        if reparse(before_path):
+        if Api._research_stat_is_reparse(before_path):
             raise OSError('source file is a symlink or reparse point')
         if not stat_mod.S_ISREG(before_path.st_mode):
             raise OSError('source entity is not a regular file')
@@ -10092,7 +10159,8 @@ class Api:
             raise OSError('source_changed_during_hash')
         for parent_path, expected in parents:
             parent_stat = os.lstat(parent_path)
-            if reparse(parent_stat) or entity_signature(parent_stat) != expected:
+            if (Api._research_stat_is_reparse(parent_stat)
+                    or entity_signature(parent_stat) != expected):
                 raise OSError('source directory entity changed during read')
         data = b''.join(chunks)
         return {

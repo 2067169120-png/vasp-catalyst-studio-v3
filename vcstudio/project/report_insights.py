@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import contextlib
+import errno
 import hashlib
 import json
 import math
@@ -1032,6 +1033,58 @@ def _windows_path_identity(
     return identity
 
 
+def _windows_descriptor_identity(descriptor: int) -> dict[str, Any]:
+    """Return FILE_ID_INFO for an already-open Python file descriptor.
+
+    Python 3.10 exposes the legacy 64-bit Windows file index through
+    ``stat_result.st_ino`` while FILE_ID_INFO is a 128-bit identity.  Comparing
+    those representations rejects the same entity on some filesystems, so all
+    Windows descriptor-to-path checks use the native handle representation on
+    both sides.
+    """
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class _FileId128(ctypes.Structure):
+        _fields_ = [("identifier", ctypes.c_ubyte * 16)]
+
+    class _FileIdInfo(ctypes.Structure):
+        _fields_ = [
+            ("volume_serial_number", ctypes.c_ulonglong),
+            ("file_id", _FileId128),
+        ]
+
+    get_information = ctypes.WinDLL(
+        "kernel32", use_last_error=True,
+    ).GetFileInformationByHandleEx
+    get_information.argtypes = (
+        wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
+    )
+    get_information.restype = wintypes.BOOL
+    handle = wintypes.HANDLE(msvcrt.get_osfhandle(descriptor))
+    information = _FileIdInfo()
+    if not get_information(
+            handle, 18, ctypes.byref(information), ctypes.sizeof(information)):
+        raise OSError(ctypes.get_last_error(), "filesystem identity unavailable")
+    return {
+        "platform": "windows",
+        "volume_serial": str(information.volume_serial_number),
+        "file_id": bytes(information.file_id.identifier).hex(),
+    }
+
+
+def _descriptor_matches_identity(
+    descriptor: int,
+    current: os.stat_result,
+    identity: Mapping[str, Any],
+) -> bool:
+    if identity.get("platform") == "windows":
+        return _windows_descriptor_identity(descriptor) == dict(identity)
+    return _stat_matches_identity(current, identity)
+
+
 def _physical_identity(
     path: Path,
     *,
@@ -1139,9 +1192,18 @@ def _posix_directory_chain(
                 raise ValueError("destination ancestor changed during capture")
             identities.append(entity)
         return tuple(identities), tuple(descriptors)
-    except Exception:
+    except Exception as exc:
         for descriptor in reversed(descriptors):
             os.close(descriptor)
+        if isinstance(exc, OSError) and exc.errno in {
+            errno.ELOOP, errno.ENOTDIR,
+        }:
+            # Linux commonly reports O_NOFOLLOW|O_DIRECTORY on a symlink as
+            # ENOTDIR rather than ELOOP.  Do not let that platform detail (or
+            # the path attached to the OSError) escape the trust boundary.
+            raise ValueError(
+                "destination ancestors must be non-symlink directories"
+            ) from None
         raise
 
 
@@ -1372,9 +1434,10 @@ def _capsule_destination_lock(
             else:
                 current_lock = _physical_identity(
                     lock_path, expect_directory=False)
+                opened_identity = _windows_descriptor_identity(handle.fileno())
                 safe_lock = (
                     stat.S_ISREG(opened.st_mode)
-                    and _stat_matches_identity(opened, current_lock)
+                    and opened_identity == current_lock
                 )
             if not safe_lock:
                 raise CapsuleExportError("capsule destination lock is unsafe")
@@ -1931,7 +1994,7 @@ def _read_bounded_regular_file(
         opened = os.fstat(descriptor)
         if (
             not stat.S_ISREG(opened.st_mode)
-            or not _stat_matches_identity(opened, before)
+            or not _descriptor_matches_identity(descriptor, opened, before)
         ):
             raise CapsuleExportError("capsule filesystem entity type changed")
         chunks = bytearray()
@@ -1993,7 +2056,7 @@ def _digest_bounded_regular_file(
         opened = os.fstat(descriptor)
         if (
             not stat.S_ISREG(opened.st_mode)
-            or not _stat_matches_identity(opened, before)
+            or not _descriptor_matches_identity(descriptor, opened, before)
         ):
             raise CapsuleExportError("capsule filesystem entity type changed")
         while True:

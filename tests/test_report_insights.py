@@ -759,8 +759,12 @@ def test_posix_trusted_directory_rejects_symlink_ancestor(tmp_path):
     alias = tmp_path / "alias-parent"
     alias.symlink_to(real_parent, target_is_directory=True)
 
-    with pytest.raises((OSError, ValueError), match="ancestor|symbolic|symlink"):
+    with pytest.raises(
+        ValueError,
+        match=r"\Adestination ancestors must be non-symlink directories\Z",
+    ) as caught:
         capture_trusted_directory(alias / destination.name)
+    assert str(tmp_path) not in str(caught.value)
 
 
 def test_trusted_directory_chain_rejects_ancestor_replacement_with_same_leaf(
@@ -944,8 +948,13 @@ def test_capsule_temp_entity_replacement_is_rejected_even_with_same_bytes(tmp_pa
         destination.glob(".vcstudio-capsule-*.json")).read_text(encoding="utf-8"))
     temporary = destination / transaction["temporary_name"]
     identical = temporary.read_bytes()
-    temporary.unlink()
+    original = temporary.with_name(temporary.name + ".original")
+    original_entity = os.lstat(temporary)
+    temporary.rename(original)
     temporary.write_bytes(identical)
+    replacement_entity = os.lstat(temporary)
+    assert (original_entity.st_dev, original_entity.st_ino) != (
+        replacement_entity.st_dev, replacement_entity.st_ino)
 
     with pytest.raises(CapsuleExportError, match="prepared archive"):
         receipts.confirm(
@@ -953,6 +962,7 @@ def test_capsule_temp_entity_replacement_is_rejected_even_with_same_bytes(tmp_pa
             preview["receipt_token"], "capsule-temp-replacement",
         )
     assert not list(destination.glob("*.zip"))
+    assert original.read_bytes() == identical
 
 
 def test_capsule_concurrent_fresh_confirms_publish_once_and_replay(tmp_path):
