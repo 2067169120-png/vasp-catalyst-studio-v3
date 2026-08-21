@@ -318,7 +318,8 @@ def test_same_reuse_decision_is_idempotent_across_processes_and_restart(tmp_path
     environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
     commands = [
         subprocess.Popen(
-            [sys.executable, "-c", code, str(target), str(source)],
+            [sys.executable, "-X", "utf8", "-c", code,
+             str(target), str(source)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment,
         ) for _ in range(2)
     ]
@@ -329,7 +330,8 @@ def test_same_reuse_decision_is_idempotent_across_processes_and_restart(tmp_path
     assert len(manifest_mod.load_manifest(target)["reuse_decisions"]) == 1
 
     restarted = subprocess.run(
-        [sys.executable, "-c", code, str(target), str(source)], check=True,
+        [sys.executable, "-X", "utf8", "-c", code,
+         str(target), str(source)], check=True,
         capture_output=True, text=True, env=environment, timeout=30,
     )
     assert json.loads(restarted.stdout.strip().splitlines()[-1])["replayed"] is True
