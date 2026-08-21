@@ -14,12 +14,13 @@ import json
 import math
 import os
 import re
-import shutil
+import secrets
 import stat
 import tempfile
 import threading
 from collections.abc import Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -35,13 +36,22 @@ PROCESS_SCHEMA = "vcstudio.external-process-contract/v3"
 AUDIT_PREVIEW_SCHEMA = "vcstudio.kinetics-audit-export-preview/v1"
 AUDIT_MANIFEST_SCHEMA = "vcstudio.kinetics-audit-export-manifest/v1"
 EXPORT_SELECTION_SCHEMA = "vcstudio.catmap-export-selection/v1"
+EXPORT_RESERVATION_SCHEMA = "vcstudio.catmap-export-reservation/v1"
+EXPORT_SELECTION_ANCHOR_SCHEMA = "vcstudio.catmap-selection-anchor-record/v1"
 CATMAP_LICENSE = "GPL-3.0"
 CATMAP_PROJECT = "https://github.com/SUNCAT-Center/catmap"
 _MAX_MANIFEST_BYTES = 1024 * 1024
 _MAX_ARTIFACT_BYTES = 20 * 1024 * 1024
 _MAX_ARTIFACT_COUNT = 64
 _MAX_TOTAL_ARTIFACT_BYTES = 64 * 1024 * 1024
+_MAX_BUNDLES_PER_INPUT = 32
+_MAX_INPUT_BUNDLE_BYTES = 512 * 1024 * 1024
+_RESERVATION_FILENAME = ".reservation.json"
+_SELECTION_ANCHOR_FILENAME = ".selection-anchor.wal"
+_MAX_SELECTION_ANCHOR_BYTES = 32 * 1024 * 1024
+_MAX_SELECTION_ANCHOR_RECORDS = 8192
 _READ_CHUNK_BYTES = 1024 * 1024
+_ZERO_SHA256 = "0" * 64
 
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _SAFE_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}$")
@@ -71,6 +81,24 @@ def _json_text(value: Any) -> str:
     return json.dumps(
         value, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False,
     ) + "\n"
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError:
+            pass
+    finally:
+        os.close(descriptor)
+
+
+def _selection_fault(_stage: str) -> None:
+    """Internal crash-injection seam; production never installs behavior."""
 
 
 def _source_mapping(source) -> kinetics.CanonicalKineticsInput:
@@ -134,6 +162,100 @@ def _lstat_directory(path: Path, *, label: str) -> os.stat_result:
             or not stat.S_ISDIR(metadata.st_mode)):
         raise CatmapAdapterError(f"{label} is unavailable")
     return metadata
+
+
+def _bounded_scandir(
+        path: Path, *, maximum: int, label: str) -> list[os.DirEntry[str]]:
+    """Collect at most ``maximum`` entries, stopping on the next item."""
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 0:
+        raise CatmapAdapterError(f"{label} entry limit is invalid")
+    entries: list[os.DirEntry[str]] = []
+    try:
+        with os.scandir(path) as iterator:
+            for entry in iterator:
+                if len(entries) >= maximum:
+                    raise CatmapAdapterError(
+                        f"{label} exceeds the entry limit")
+                entries.append(entry)
+    except CatmapAdapterError:
+        raise
+    except OSError as exc:
+        raise CatmapAdapterError(f"{label} could not be inspected") from exc
+    return entries
+
+
+class _ProjectBoundary:
+    """Pin the authored project and every adapter-created directory entity."""
+
+    def __init__(self, project_root: str | os.PathLike[str]):
+        root = Path(os.path.abspath(os.fspath(project_root)))
+        if not Path(project_root).is_absolute():
+            raise CatmapAdapterError("project root must be an absolute directory")
+        metadata = _lstat_directory(root, label="project root")
+        if (os.path.normcase(str(root)) != os.path.normcase(os.path.realpath(root))
+                or _is_link(root)):
+            raise CatmapAdapterError(
+                "project root must not be a symlink, junction, or reparse point")
+        self.root = root
+        self._pins: dict[Path, tuple[int, int, int]] = {
+            root: _entity_identity(metadata),
+        }
+        self.verify()
+
+    def verify(self) -> None:
+        for path, identity in tuple(self._pins.items()):
+            metadata = _lstat_directory(path, label="CatMAP project boundary")
+            if (_entity_identity(metadata) != identity
+                    or os.path.normcase(str(path))
+                    != os.path.normcase(os.path.realpath(path))):
+                raise CatmapAdapterError(
+                    "CatMAP project directory entity changed during the operation")
+
+    def pin_directory(self, path: Path, *, label: str) -> Path:
+        self.verify()
+        metadata = _lstat_directory(path, label=label)
+        authored = Path(os.path.abspath(path))
+        try:
+            if os.path.commonpath((str(self.root), str(authored))) != str(self.root):
+                raise ValueError
+        except ValueError as exc:
+            raise CatmapAdapterError(
+                "CatMAP directory escaped the project root") from exc
+        if (os.path.normcase(str(authored))
+                != os.path.normcase(os.path.realpath(authored))):
+            raise CatmapAdapterError(
+                "CatMAP directory must not use a link or reparse point")
+        identity = _entity_identity(metadata)
+        prior = self._pins.get(authored)
+        if prior is not None and prior != identity:
+            raise CatmapAdapterError(
+                "CatMAP project directory entity changed during the operation")
+        self._pins[authored] = identity
+        self.verify()
+        return authored
+
+    def child(self, parent: Path, name: str, *, create: bool = True) -> Path:
+        if (not isinstance(name, str) or not name or Path(name).name != name
+                or name in {".", ".."}):
+            raise CatmapAdapterError("CatMAP directory component is unsafe")
+        self.verify()
+        path = parent / name
+        if create:
+            try:
+                os.mkdir(path)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise CatmapAdapterError(
+                    "CatMAP project directory is unavailable") from exc
+        if _is_link(path):
+            raise CatmapAdapterError(
+                "CatMAP project directory is unavailable: symlink, junction, "
+                "or reparse point is forbidden")
+        return self.pin_directory(path, label="CatMAP project directory")
+
+    def unpin(self, path: Path) -> None:
+        self._pins.pop(Path(os.path.abspath(path)), None)
 
 
 def _read_bounded_regular_file(
@@ -245,19 +367,67 @@ def _catmap_base(species_id: str, phase: str) -> str:
 
 def _catmap_name_map(network: Mapping[str, Any]) -> dict[str, Any]:
     """Build one unambiguous mapping; CatMAP reserves one underscore for site."""
+    records = list(network.get("species") or [])
+    unsupported_phases = sorted({
+        str(record.get("phase")) for record in records
+        if record.get("phase") in {"liquid", "solution"}
+    })
+    if unsupported_phases:
+        raise CatmapAdapterError(
+            "CatMAP phase-1 export does not support liquid/solution species; "
+            "fluid phases are never coerced to gas")
+    for record in records:
+        if record.get("phase") != "gas":
+            continue
+        standard_state = record.get("standard_state")
+        # Legacy solver-ready v3 fixtures predate per-species FluidState
+        # ledgers and remain governed by the exact network-level 1-bar
+        # standard state.  When a canonical FluidState ledger is present it
+        # must agree with CatMAP phase-1's 1-bar reference.
+        if standard_state is None:
+            continue
+        value = (
+            standard_state.get("value")
+            if isinstance(standard_state, Mapping) else None
+        )
+        if (
+            not isinstance(standard_state, Mapping)
+            or set(standard_state)
+            != {"schema", "phase", "kind", "value", "unit"}
+            or standard_state.get("schema")
+            != "vcstudio.fluid-standard-state/v1"
+            or standard_state.get("phase") != "gas"
+            or standard_state.get("kind") != "1-bar"
+            or standard_state.get("unit") != "Pa"
+            or isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or abs(float(value) - 100000.0) > 1.0e-12
+        ):
+            raise CatmapAdapterError(
+                "CatMAP phase-1 export supports only the exact 1-bar gas "
+                "standard state; 1-atm requires an explicit chemical-potential "
+                "reference conversion and remains audit-only")
+    for record in records:
+        energy = record.get("formation_energy")
+        value = energy.get("value") if isinstance(energy, Mapping) else None
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))):
+            raise CatmapAdapterError(
+                "CatMAP phase-1 export requires an exact frozen formation energy "
+                "for every species")
     site_ids = sorted({
-        str(site) for record in network.get("species") or []
+        str(site) for record in records
         for site in (record.get("sites") or {})
     })
     if len(site_ids) != 1:
         raise CatmapAdapterError(
-            "CatMAP phase-1 export requires exactly one site type because "
-            "evidence-bound site totals are unavailable")
+            "phase-1 CatMAP export supports exactly one independent site type")
     sites = {site_id: f"s{index}" for index, site_id in enumerate(site_ids)}
     empty_by_site: dict[str, str] = {}
     species = {}
     phase_counters = {"gas": 0, "adsorbate": 0, "transition_state": 0}
-    for record in network.get("species") or []:
+    for record in records:
         species_id = str(record["id"])
         phase = str(record["phase"])
         occupations = record.get("sites") or {}
@@ -495,6 +665,23 @@ def _expanded_state(state: Mapping[str, Any], names: Mapping[str, str]) -> str:
 
 def _model_text(network: Mapping[str, Any], name_map: Mapping[str, Any],
                 gas_contract: Mapping[str, Any], *, scan: bool) -> str:
+    policy = network.get("rate_law_policy") or {}
+    required_policy = {
+        "activity": "ideal",
+        "reversibility": "explicit_reverse",
+        "detailed_balance": "enforced",
+        "prefactor": "explicit_per_step",
+        "electrochemical": "none",
+        "reactor": "mean_field_steady_state",
+    }
+    if policy.get("electrochemical") != "none":
+        raise CatmapAdapterError(
+            "phase-1 CatMAP export does not encode electrochemical potential dependence")
+    if policy != required_policy:
+        raise CatmapAdapterError(
+            "phase-1 CatMAP export requires the exact explicit ideal, reversible, "
+            "detailed-balance, per-step-prefactor, non-electrochemical, "
+            "mean-field steady-state rate-law policy")
     methodology = network.get("methodology") or {}
     if methodology.get("energy_basis") != "gibbs_free_energy":
         raise CatmapAdapterError(
@@ -526,10 +713,34 @@ def _model_text(network: Mapping[str, Any], name_map: Mapping[str, Any],
             raise CatmapAdapterError(
                 "phase-1 CatMAP export requires equal forward/reverse prefactors")
         prefactors.append(_format_number(forward_value))
-    site_types = sorted(name_map["sites"].values())
+    raw_totals = network.get("site_population_totals")
+    if not isinstance(raw_totals, list) or not raw_totals:
+        raise CatmapAdapterError(
+            "phase-1 CatMAP export requires evidence-bound site population totals")
+    totals = {}
+    for record in raw_totals:
+        if not isinstance(record, Mapping):
+            raise CatmapAdapterError("site population total must be an object")
+        canonical_site = str(record.get("site_type"))
+        if canonical_site not in name_map["sites"] or canonical_site in totals:
+            raise CatmapAdapterError(
+                "site population totals must cover CatMAP site types exactly once")
+        if (record.get("unit") not in {"sites", "dimensionless"}
+                or record.get("basis") not in {
+                    "surface_unit_cell", "normalized_site_population"}):
+            raise CatmapAdapterError(
+                "CatMAP site population total has an unsupported unit or basis")
+        total = float(record.get("value"))
+        if not math.isfinite(total) or total <= 0.0:
+            raise CatmapAdapterError(
+                "CatMAP site population totals must be finite and positive")
+        totals[canonical_site] = total
+    if set(totals) != set(name_map["sites"]):
+        raise CatmapAdapterError(
+            "site population totals must cover CatMAP site types exactly once")
     species_definitions = {
-        site: {"site_names": [site], "total": 1.0}
-        for site in site_types
+        mapped: {"site_names": [mapped], "total": totals[canonical]}
+        for canonical, mapped in sorted(name_map["sites"].items())
     }
     for record in network.get("species") or []:
         species_id = str(record["id"])
@@ -667,12 +878,43 @@ def _artifact_records(files: Mapping[str, str]) -> list[dict[str, Any]]:
     return records
 
 
+def _bundle_integrity_sha256(files: Mapping[str, str]) -> str:
+    if len(files) > _MAX_ARTIFACT_COUNT + 1:
+        raise CatmapAdapterError("CatMAP bundle exceeds the entry limit")
+    records = []
+    total = 0
+    for name, text in sorted(files.items()):
+        if not _SAFE_ARTIFACT_NAME_RE.fullmatch(name):
+            raise CatmapAdapterError("CatMAP bundle artifact name is unsafe")
+        encoded = text.encode("utf-8")
+        maximum = _MAX_MANIFEST_BYTES if name == "manifest.json" else _MAX_ARTIFACT_BYTES
+        if len(encoded) > maximum:
+            raise CatmapAdapterError("CatMAP bundle artifact exceeds the size limit")
+        total += len(encoded)
+        if total > _MAX_TOTAL_ARTIFACT_BYTES + _MAX_MANIFEST_BYTES:
+            raise CatmapAdapterError("CatMAP bundle exceeds the total size limit")
+        records.append({
+            "name": name,
+            "size": len(encoded),
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+        })
+    return hashlib.sha256(_canonical_bytes(records)).hexdigest()
+
+
 def build_export_bundle(network_source, *, tool_path=None,
                         tool_version: str | None = None) -> dict[str, Any]:
     """Build an in-memory frozen bundle.  This function never executes a tool."""
-    canonical = _source_mapping(network_source)
-    network = canonical.to_mapping()
-    audit = kinetics.audit_network(canonical)
+    try:
+        canonical = _source_mapping(network_source)
+    except CatmapAdapterError:
+        # A missing/invalid exact model-spec or evidence snapshot is still a
+        # useful diagnostic audit, but can never produce CatMAP model files.
+        canonical = None
+        network = {}
+        audit = kinetics.audit_network(network_source)
+    else:
+        network = canonical.to_mapping()
+        audit = kinetics.audit_network(canonical)
     tool = inspect_tool_path(tool_path, version=tool_version)
     files = {"kinetics-audit.json": _json_text(audit)}
     adapter_issues = []
@@ -785,22 +1027,34 @@ def preview_export(network_source, *, tool_path=None,
     }
 
 
-def _atomic_write(path: Path, content: str, *, replace: bool = False) -> None:
+def _atomic_write(path: Path, content: str, *, replace: bool = False,
+                  boundary: _ProjectBoundary | None = None) -> None:
     encoded = content.encode("utf-8")
-    if path.exists() and not replace:
-        if path.is_file() and path.read_bytes() == encoded:
+    if boundary is not None:
+        boundary.verify()
+    exists = os.path.lexists(path)
+    if exists and not replace:
+        metadata = _lstat_regular(path, label=f"export file {path.name}")
+        data, _, _ = _read_bounded_regular_file(
+            path, maximum=max(len(encoded), 1),
+            label=f"export file {path.name}", expected=metadata, collect=True)
+        if data == encoded:
             return
         raise CatmapAdapterError(f"refusing to overwrite changed export file {path.name}")
-    if path.exists() and _is_link(path):
-        raise CatmapAdapterError(f"export file {path.name} must not be a symlink")
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if exists:
+        _lstat_regular(path, label=f"export file {path.name}")
     fd, temp_name = tempfile.mkstemp(prefix=".vcs-kinetics-", dir=str(path.parent))
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        if boundary is not None:
+            boundary.verify()
         os.replace(temp_name, path)
+        _fsync_directory(path.parent)
+        if boundary is not None:
+            boundary.verify()
     finally:
         try:
             os.unlink(temp_name)
@@ -809,11 +1063,29 @@ def _atomic_write(path: Path, content: str, *, replace: bool = False) -> None:
 
 
 @contextmanager
-def _advisory_lock(path: Path):
-    if path.exists() and _is_link(path):
-        raise CatmapAdapterError("export selection lock must not be a symlink")
-    path.touch(exist_ok=True)
-    with path.open("a+b") as handle:
+def _advisory_lock(path: Path, boundary: _ProjectBoundary):
+    boundary.verify()
+    if _is_link(path):
+        raise CatmapAdapterError(
+            "export selection lock must not be a symlink or reparse point")
+    flags = os.O_RDWR | os.O_CREAT | int(getattr(os, "O_BINARY", 0))
+    flags |= int(getattr(os, "O_CLOEXEC", 0))
+    flags |= int(getattr(os, "O_NOFOLLOW", 0))
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise CatmapAdapterError("export selection lock is unavailable") from exc
+    with os.fdopen(descriptor, "a+b") as handle:
+        opened = os.fstat(handle.fileno())
+        if not stat.S_ISREG(opened.st_mode) or opened.st_size > 4096:
+            raise CatmapAdapterError("export selection lock is unsafe")
+        try:
+            current = os.lstat(path)
+        except OSError as exc:
+            raise CatmapAdapterError("export selection lock changed") from exc
+        if (_entity_identity(opened) != _entity_identity(current)
+                or _is_reparse(current)):
+            raise CatmapAdapterError("export selection lock changed")
         if os.name == "nt":
             import msvcrt
 
@@ -824,7 +1096,9 @@ def _advisory_lock(path: Path):
             handle.seek(0)
             msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
             try:
+                boundary.verify()
                 yield
+                boundary.verify()
             finally:
                 handle.seek(0)
                 msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
@@ -833,37 +1107,22 @@ def _advisory_lock(path: Path):
 
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
+                boundary.verify()
                 yield
+                boundary.verify()
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    boundary.verify()
 
 
-def _safe_child_directory(parent: Path, name: str, root: Path) -> Path:
-    path = parent / name
-    if path.exists() and _is_link(path):
-        raise CatmapAdapterError(f"export directory {name} must not be a symlink")
-    path.mkdir(exist_ok=True)
-    resolved = path.resolve(strict=True)
-    try:
-        resolved.relative_to(root)
-    except ValueError as exc:
-        raise CatmapAdapterError("export directory escaped the project root") from exc
-    if not resolved.is_dir():
-        raise CatmapAdapterError(f"export directory {name} is not a directory")
-    return resolved
+def _safe_child_directory(parent: Path, name: str, root: Path,
+                          boundary: _ProjectBoundary | None = None) -> Path:
+    binding = boundary or _ProjectBoundary(root)
+    return binding.child(parent, name)
 
 
 def _project_root(project_root) -> Path:
-    root = Path(project_root)
-    if not root.is_absolute():
-        root = root.resolve()
-    try:
-        root = root.resolve(strict=True)
-    except OSError as exc:
-        raise CatmapAdapterError("project root does not exist") from exc
-    if not root.is_dir():
-        raise CatmapAdapterError("project root must be a directory")
-    return root
+    return _ProjectBoundary(project_root).root
 
 
 def _read_json(path: Path, *, maximum: int) -> Any:
@@ -883,15 +1142,7 @@ def _selection_default(input_sha256: str) -> dict[str, Any]:
     }
 
 
-def _read_selection(input_dir: Path, input_sha256: str) -> dict[str, Any]:
-    path = input_dir / "current.json"
-    try:
-        path.lstat()
-    except FileNotFoundError:
-        return _selection_default(input_sha256)
-    except OSError as exc:
-        raise CatmapAdapterError("confirmed CatMAP export selection is invalid") from exc
-    value = _read_json(path, maximum=4096)
+def _validated_selection(value: Any, input_sha256: str) -> dict[str, Any]:
     if (not isinstance(value, Mapping)
             or set(value) != {
                 "schema", "input_sha256", "revision", "selected_export_sha256"}
@@ -906,25 +1157,756 @@ def _read_selection(input_dir: Path, input_sha256: str) -> dict[str, Any]:
     return dict(value)
 
 
+def _read_selection(input_dir: Path, input_sha256: str) -> dict[str, Any]:
+    path = input_dir / "current.json"
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return _selection_default(input_sha256)
+    except OSError as exc:
+        raise CatmapAdapterError("confirmed CatMAP export selection is invalid") from exc
+    return _validated_selection(_read_json(path, maximum=4096), input_sha256)
+
+
+_SELECTION_ANCHOR_DESCRIPTOR_FIELDS = frozenset({
+    "input_sha256", "revision", "selected_export_sha256",
+    "selection_sha256", "selection", "chain_sha256",
+})
+_SELECTION_ANCHOR_PREPARE_FIELDS = frozenset({
+    "schema", "kind", "sequence", "previous_record_sha256",
+    "transaction_id", "base", "target", "reservation_sha256",
+    "record_sha256",
+})
+_SELECTION_ANCHOR_COMMIT_FIELDS = frozenset({
+    "schema", "kind", "sequence", "previous_record_sha256",
+    "transaction_id", "prepare_record_sha256", "target",
+    "reservation_sha256", "record_sha256",
+})
+
+
+def _selection_sha256(selection: Mapping[str, Any]) -> str:
+    return hashlib.sha256(_canonical_bytes(selection)).hexdigest()
+
+
+def _selection_anchor_record_sha256(value: Mapping[str, Any]) -> str:
+    return hashlib.sha256(_canonical_bytes({
+        key: item for key, item in value.items() if key != "record_sha256"
+    })).hexdigest()
+
+
+def _seal_selection_anchor_record(value: Mapping[str, Any]) -> dict[str, Any]:
+    record = dict(value)
+    record["record_sha256"] = _selection_anchor_record_sha256(record)
+    return record
+
+
+def _selection_anchor_chain_sha256(
+        selection: Mapping[str, Any], previous_chain_sha256: str) -> str:
+    return hashlib.sha256(_canonical_bytes({
+        "previous_chain_sha256": previous_chain_sha256,
+        "input_sha256": selection["input_sha256"],
+        "revision": selection["revision"],
+        "selection_sha256": _selection_sha256(selection),
+    })).hexdigest()
+
+
+def _selection_anchor_descriptor(
+        selection: Mapping[str, Any], previous_chain_sha256: str) -> dict[str, Any]:
+    normalized = _validated_selection(selection, str(selection.get("input_sha256")))
+    return {
+        "input_sha256": normalized["input_sha256"],
+        "revision": normalized["revision"],
+        "selected_export_sha256": normalized["selected_export_sha256"],
+        "selection_sha256": _selection_sha256(normalized),
+        "selection": normalized,
+        "chain_sha256": _selection_anchor_chain_sha256(
+            normalized, previous_chain_sha256),
+    }
+
+
+def _validated_selection_anchor_descriptor(
+        value: Any, input_sha256: str) -> dict[str, Any]:
+    if (not isinstance(value, Mapping)
+            or set(value) != set(_SELECTION_ANCHOR_DESCRIPTOR_FIELDS)):
+        raise CatmapAdapterError("CatMAP selection anchor descriptor is invalid")
+    selection = _validated_selection(value.get("selection"), input_sha256)
+    selection_sha = _selection_sha256(selection)
+    if (value.get("input_sha256") != input_sha256
+            or value.get("revision") != selection["revision"]
+            or value.get("selected_export_sha256")
+            != selection["selected_export_sha256"]
+            or value.get("selection_sha256") != selection_sha
+            or not isinstance(value.get("chain_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", value["chain_sha256"])):
+        raise CatmapAdapterError("CatMAP selection anchor descriptor is inconsistent")
+    return {
+        "input_sha256": input_sha256,
+        "revision": selection["revision"],
+        "selected_export_sha256": selection["selected_export_sha256"],
+        "selection_sha256": selection_sha,
+        "selection": selection,
+        "chain_sha256": value["chain_sha256"],
+    }
+
+
+@dataclass(frozen=True)
+class _SelectionAnchorState:
+    records: tuple[Mapping[str, Any], ...]
+    committed: Mapping[str, Any] | None
+    pending: Mapping[str, Any] | None
+    last_record_sha256: str
+    committed_transaction_id: str | None = None
+    committed_reservation_sha256: str | None = None
+
+
+def _validated_selection_anchor_log(
+        payload: bytes, input_sha256: str) -> _SelectionAnchorState:
+    if payload and not payload.endswith(b"\n"):
+        raise CatmapAdapterError("CatMAP selection anchor WAL has an incomplete tail")
+    raw_lines = payload.splitlines()
+    if len(raw_lines) > _MAX_SELECTION_ANCHOR_RECORDS:
+        raise CatmapAdapterError("CatMAP selection anchor WAL exceeds its record limit")
+    records = []
+    committed = None
+    pending = None
+    previous_record_sha = _ZERO_SHA256
+    committed_transaction_id = None
+    committed_reservation_sha = None
+    for sequence, raw_line in enumerate(raw_lines, start=1):
+        try:
+            raw = json.loads(raw_line.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise CatmapAdapterError("CatMAP selection anchor WAL is invalid") from exc
+        kind = raw.get("kind") if isinstance(raw, Mapping) else None
+        fields = (
+            _SELECTION_ANCHOR_PREPARE_FIELDS if kind == "prepare"
+            else _SELECTION_ANCHOR_COMMIT_FIELDS if kind == "commit"
+            else frozenset())
+        if not fields or not isinstance(raw, Mapping) or set(raw) != set(fields):
+            raise CatmapAdapterError("CatMAP selection anchor WAL record is invalid")
+        transaction_id = raw.get("transaction_id")
+        reservation_sha = raw.get("reservation_sha256")
+        if (raw.get("schema") != EXPORT_SELECTION_ANCHOR_SCHEMA
+                or raw.get("sequence") != sequence
+                or raw.get("previous_record_sha256") != previous_record_sha
+                or not isinstance(transaction_id, str)
+                or not re.fullmatch(r"[0-9a-f]{32}", transaction_id)
+                or not isinstance(reservation_sha, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", reservation_sha)):
+            raise CatmapAdapterError("CatMAP selection anchor WAL chain is invalid")
+        declared_record_sha = raw.get("record_sha256")
+        if (not isinstance(declared_record_sha, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", declared_record_sha)
+                or _selection_anchor_record_sha256(raw) != declared_record_sha):
+            raise CatmapAdapterError("CatMAP selection anchor WAL seal is invalid")
+        target = _validated_selection_anchor_descriptor(
+            raw.get("target"), input_sha256)
+        if kind == "prepare":
+            if pending is not None:
+                raise CatmapAdapterError(
+                    "CatMAP selection anchor contains nested transactions")
+            if committed is None:
+                if raw.get("base") is not None or target["revision"] != 1:
+                    raise CatmapAdapterError(
+                        "CatMAP selection anchor initialization is invalid")
+                previous_chain = _ZERO_SHA256
+            else:
+                base = _validated_selection_anchor_descriptor(
+                    raw.get("base"), input_sha256)
+                if (base != committed
+                        or target["revision"] != committed["revision"] + 1):
+                    raise CatmapAdapterError(
+                        "CatMAP selection anchor transition is invalid")
+                previous_chain = committed["chain_sha256"]
+            if target["chain_sha256"] != _selection_anchor_chain_sha256(
+                    target["selection"], previous_chain):
+                raise CatmapAdapterError(
+                    "CatMAP selection anchor transition seal is invalid")
+            pending = {
+                "record": dict(raw),
+                "transaction_id": transaction_id,
+                "reservation_sha256": reservation_sha,
+                "base": None if committed is None else dict(committed),
+                "target": target,
+            }
+        else:
+            if (pending is None
+                    or raw.get("prepare_record_sha256")
+                    != pending["record"]["record_sha256"]
+                    or transaction_id != pending["transaction_id"]
+                    or reservation_sha != pending["reservation_sha256"]
+                    or target != pending["target"]):
+                raise CatmapAdapterError("CatMAP selection anchor commit is invalid")
+            committed = target
+            committed_transaction_id = transaction_id
+            committed_reservation_sha = reservation_sha
+            pending = None
+        normalized = dict(raw)
+        normalized["target"] = target
+        if normalized.get("base") is not None:
+            normalized["base"] = _validated_selection_anchor_descriptor(
+                normalized["base"], input_sha256)
+        records.append(normalized)
+        previous_record_sha = declared_record_sha
+    return _SelectionAnchorState(
+        records=tuple(records), committed=committed, pending=pending,
+        last_record_sha256=previous_record_sha,
+        committed_transaction_id=committed_transaction_id,
+        committed_reservation_sha256=committed_reservation_sha,
+    )
+
+
+def _truncate_selection_anchor_tail(
+        path: Path, length: int, boundary: _ProjectBoundary) -> None:
+    boundary.verify()
+    before = _lstat_regular(path, label="CatMAP selection anchor WAL")
+    if not 0 <= length <= before.st_size:
+        raise CatmapAdapterError("CatMAP selection anchor WAL is unsafe")
+    flags = os.O_RDWR
+    for flag_name in ("O_BINARY", "O_CLOEXEC", "O_NOFOLLOW"):
+        flags |= getattr(os, flag_name, 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise CatmapAdapterError("CatMAP selection anchor WAL is unavailable") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (_entity_identity(opened) != _entity_identity(before)
+                or int(opened.st_size) != int(before.st_size)):
+            raise CatmapAdapterError("CatMAP selection anchor WAL changed")
+        os.ftruncate(descriptor, length)
+        os.fsync(descriptor)
+        after = os.fstat(descriptor)
+    except OSError as exc:
+        raise CatmapAdapterError(
+            "CatMAP selection anchor WAL could not be recovered") from exc
+    finally:
+        os.close(descriptor)
+    current = _lstat_regular(path, label="CatMAP selection anchor WAL")
+    if (_entity_identity(after) != _entity_identity(current)
+            or int(current.st_size) != length):
+        raise CatmapAdapterError("CatMAP selection anchor WAL changed")
+    boundary.verify()
+
+
+class _SelectionAnchorFile:
+    def __init__(self, input_dir: Path, input_sha256: str,
+                 boundary: _ProjectBoundary):
+        self.path = input_dir / _SELECTION_ANCHOR_FILENAME
+        self.input_sha256 = input_sha256
+        self.boundary = boundary
+        self._identity: tuple[int, int, int] | None = None
+
+    def _verify_entity(self) -> None:
+        if self._identity is None:
+            return
+        metadata = _lstat_regular(
+            self.path, label="CatMAP selection anchor WAL")
+        if _entity_identity(metadata) != self._identity:
+            raise CatmapAdapterError("CatMAP selection anchor WAL entity changed")
+
+    def _pin_entity(self) -> None:
+        if not os.path.lexists(self.path):
+            return
+        metadata = _lstat_regular(
+            self.path, label="CatMAP selection anchor WAL")
+        identity = _entity_identity(metadata)
+        if self._identity is None:
+            self._identity = identity
+        elif self._identity != identity:
+            raise CatmapAdapterError("CatMAP selection anchor WAL entity changed")
+
+    def read(self) -> _SelectionAnchorState:
+        self._verify_entity()
+        if not os.path.lexists(self.path):
+            return _SelectionAnchorState((), None, None, _ZERO_SHA256)
+        payload, _size, _sha = _read_bounded_regular_file(
+            self.path, maximum=_MAX_SELECTION_ANCHOR_BYTES,
+            label="CatMAP selection anchor WAL", collect=True)
+        assert payload is not None
+        self._pin_entity()
+        self._verify_entity()
+        if payload and not payload.endswith(b"\n"):
+            complete_length = payload.rfind(b"\n") + 1
+            complete = payload[:complete_length]
+            state = _validated_selection_anchor_log(
+                complete, self.input_sha256)
+            _truncate_selection_anchor_tail(
+                self.path, complete_length, self.boundary)
+            return state
+        return _validated_selection_anchor_log(payload, self.input_sha256)
+
+    def append(self, record: Mapping[str, Any]) -> None:
+        payload = _canonical_bytes(record) + b"\n"
+        self.boundary.verify()
+        self._verify_entity()
+        try:
+            before = os.lstat(self.path)
+        except FileNotFoundError:
+            before = None
+        except OSError as exc:
+            raise CatmapAdapterError(
+                "CatMAP selection anchor WAL is unavailable") from exc
+        if before is not None and (stat.S_ISLNK(before.st_mode)
+                                   or _is_reparse(before)
+                                   or not stat.S_ISREG(before.st_mode)):
+            raise CatmapAdapterError("CatMAP selection anchor WAL is unsafe")
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+        for flag_name in ("O_BINARY", "O_CLOEXEC", "O_NOFOLLOW"):
+            flags |= getattr(os, flag_name, 0)
+        try:
+            descriptor = os.open(self.path, flags, 0o600)
+        except OSError as exc:
+            raise CatmapAdapterError(
+                "CatMAP selection anchor WAL is unavailable") from exc
+        try:
+            opened = os.fstat(descriptor)
+            if (not stat.S_ISREG(opened.st_mode)
+                    or (before is not None
+                        and _entity_identity(opened) != _entity_identity(before))
+                    or opened.st_size + len(payload) > _MAX_SELECTION_ANCHOR_BYTES):
+                raise CatmapAdapterError("CatMAP selection anchor WAL is unsafe")
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise CatmapAdapterError(
+                        "CatMAP selection anchor WAL append made no progress")
+                offset += written
+            os.fsync(descriptor)
+            after = os.fstat(descriptor)
+        except OSError as exc:
+            raise CatmapAdapterError(
+                "CatMAP selection anchor WAL append failed") from exc
+        finally:
+            os.close(descriptor)
+        current = _lstat_regular(
+            self.path, label="CatMAP selection anchor WAL")
+        if (_entity_identity(after) != _entity_identity(current)
+                or int(after.st_size) != int(current.st_size)):
+            raise CatmapAdapterError("CatMAP selection anchor WAL changed")
+        if before is None:
+            _fsync_directory(self.path.parent)
+        self._pin_entity()
+        self._verify_entity()
+        self.boundary.verify()
+
+
+def _selection_anchor_prepare_record(
+        state: _SelectionAnchorState, selection: Mapping[str, Any],
+        reservation: Mapping[str, Any]) -> dict[str, Any]:
+    if len(state.records) >= _MAX_SELECTION_ANCHOR_RECORDS:
+        raise CatmapAdapterError("CatMAP selection anchor WAL exceeds its record limit")
+    previous_chain = (
+        _ZERO_SHA256 if state.committed is None
+        else str(state.committed["chain_sha256"]))
+    return _seal_selection_anchor_record({
+        "schema": EXPORT_SELECTION_ANCHOR_SCHEMA,
+        "kind": "prepare",
+        "sequence": len(state.records) + 1,
+        "previous_record_sha256": state.last_record_sha256,
+        "transaction_id": reservation["transaction_id"],
+        "base": None if state.committed is None else dict(state.committed),
+        "target": _selection_anchor_descriptor(selection, previous_chain),
+        "reservation_sha256": hashlib.sha256(
+            _canonical_bytes(reservation)).hexdigest(),
+    })
+
+
+def _selection_anchor_commit_record(
+        state: _SelectionAnchorState, prepare: Mapping[str, Any]) -> dict[str, Any]:
+    if len(state.records) >= _MAX_SELECTION_ANCHOR_RECORDS:
+        raise CatmapAdapterError("CatMAP selection anchor WAL exceeds its record limit")
+    return _seal_selection_anchor_record({
+        "schema": EXPORT_SELECTION_ANCHOR_SCHEMA,
+        "kind": "commit",
+        "sequence": len(state.records) + 1,
+        "previous_record_sha256": state.last_record_sha256,
+        "transaction_id": prepare["transaction_id"],
+        "prepare_record_sha256": prepare["record_sha256"],
+        "target": dict(prepare["target"]),
+        "reservation_sha256": prepare["reservation_sha256"],
+    })
+
+
+def _read_reservation(input_dir: Path, input_sha256: str) -> dict[str, Any] | None:
+    path = input_dir / _RESERVATION_FILENAME
+    if not os.path.lexists(path):
+        return None
+    value = _read_json(path, maximum=8192)
+    if (not isinstance(value, Mapping)
+            or set(value) != {
+                "schema", "input_sha256", "preview_token",
+                "expected_selection_revision", "expected_selected_export_sha256",
+                "transaction_id", "created_by_transaction", "stage_name",
+                "bundle_integrity_sha256"}
+            or value.get("schema") != EXPORT_RESERVATION_SCHEMA
+            or value.get("input_sha256") != input_sha256
+            or not isinstance(value.get("preview_token"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", value["preview_token"])
+            or isinstance(value.get("expected_selection_revision"), bool)
+            or not isinstance(value.get("expected_selection_revision"), int)
+            or value["expected_selection_revision"] < 0
+            or (value.get("expected_selected_export_sha256") is not None
+                and (not isinstance(value["expected_selected_export_sha256"], str)
+                     or not re.fullmatch(
+                         r"[0-9a-f]{64}",
+                         value["expected_selected_export_sha256"])))
+            or not isinstance(value.get("transaction_id"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", value["transaction_id"])
+            or not isinstance(value.get("created_by_transaction"), bool)
+            or (value.get("stage_name") is not None
+                and (not isinstance(value["stage_name"], str)
+                     or not re.fullmatch(
+                         r"\.vcs-kinetics-stage-[0-9a-f]{32}",
+                         value["stage_name"])))
+            or ((value.get("stage_name") is None)
+                != (value.get("created_by_transaction") is False))
+            or not isinstance(value.get("bundle_integrity_sha256"), str)
+            or not re.fullmatch(
+                r"[0-9a-f]{64}", value["bundle_integrity_sha256"])):
+        raise CatmapAdapterError("CatMAP export reservation is invalid")
+    return dict(value)
+
+
+def _unlink_regular(path: Path, *, label: str,
+                    boundary: _ProjectBoundary) -> None:
+    if not os.path.lexists(path):
+        return
+    _lstat_regular(path, label=label)
+    boundary.verify()
+    try:
+        os.unlink(path)
+    except OSError as exc:
+        raise CatmapAdapterError(f"{label} could not be removed") from exc
+    _fsync_directory(path.parent)
+    boundary.verify()
+
+
+def _remove_safe_bundle_directory(
+        path: Path, input_dir: Path, boundary: _ProjectBoundary) -> None:
+    if not os.path.lexists(path):
+        return
+    boundary.pin_directory(path, label="CatMAP residual bundle")
+    if (Path(os.path.abspath(path)).parent != input_dir
+            or os.path.normcase(os.path.abspath(path))
+            != os.path.normcase(os.path.realpath(path))):
+        raise CatmapAdapterError("CatMAP residual bundle escaped its input directory")
+    entries = _bounded_scandir(
+        path, maximum=_MAX_ARTIFACT_COUNT + 1,
+        label="CatMAP residual bundle")
+    for entry in entries:
+        entry_path = path / entry.name
+        entry_metadata = os.lstat(entry_path)
+        if (stat.S_ISLNK(entry_metadata.st_mode) or _is_reparse(entry_metadata)
+                or not stat.S_ISREG(entry_metadata.st_mode)):
+            raise CatmapAdapterError("CatMAP residual bundle contains unsafe entries")
+    boundary.verify()
+    for entry in entries:
+        os.unlink(path / entry.name)
+    boundary.unpin(path)
+    try:
+        os.rmdir(path)
+    except OSError as exc:
+        raise CatmapAdapterError("CatMAP residual bundle could not be removed") from exc
+    _fsync_directory(input_dir)
+    boundary.verify()
+
+
+def _bundle_directory_integrity_sha256(
+        path: Path, input_dir: Path, boundary: _ProjectBoundary) -> str:
+    boundary.pin_directory(path, label="CatMAP reserved bundle")
+    if (Path(os.path.abspath(path)).parent != input_dir
+            or os.path.normcase(os.path.abspath(path))
+            != os.path.normcase(os.path.realpath(path))):
+        raise CatmapAdapterError("CatMAP reserved bundle escaped its input directory")
+    entries = sorted(
+        _bounded_scandir(
+            path, maximum=_MAX_ARTIFACT_COUNT + 1,
+            label="CatMAP reserved bundle"),
+        key=lambda entry: entry.name,
+    )
+    records = []
+    total = 0
+    for entry in entries:
+        if not _SAFE_ARTIFACT_NAME_RE.fullmatch(entry.name):
+            raise CatmapAdapterError("CatMAP reserved bundle contains unsafe entries")
+        maximum = (
+            _MAX_MANIFEST_BYTES
+            if entry.name == "manifest.json" else _MAX_ARTIFACT_BYTES)
+        _data, size, digest = _read_bounded_regular_file(
+            path / entry.name, maximum=maximum,
+            label=f"reserved CatMAP bundle file {entry.name}")
+        total += size
+        if total > _MAX_TOTAL_ARTIFACT_BYTES + _MAX_MANIFEST_BYTES:
+            raise CatmapAdapterError("CatMAP reserved bundle exceeds the total limit")
+        records.append({"name": entry.name, "size": size, "sha256": digest})
+        boundary.verify()
+    return hashlib.sha256(_canonical_bytes(records)).hexdigest()
+
+
+def _selection_matches_descriptor(
+        current: Mapping[str, Any], descriptor: Mapping[str, Any] | None) -> bool:
+    if descriptor is None:
+        return dict(current) == _selection_default(str(current["input_sha256"]))
+    return (
+        dict(current) == dict(descriptor["selection"])
+        and _selection_sha256(current) == descriptor["selection_sha256"])
+
+
+def _reservation_sha256(reservation: Mapping[str, Any]) -> str:
+    return hashlib.sha256(_canonical_bytes(reservation)).hexdigest()
+
+
+def _validate_reservation_for_transition(
+        reservation: Mapping[str, Any], base: Mapping[str, Any] | None,
+        target: Mapping[str, Any], input_dir: Path,
+        boundary: _ProjectBoundary) -> None:
+    base_selection = (
+        _selection_default(str(target["input_sha256"]))
+        if base is None else base["selection"])
+    target_selection = target["selection"]
+    if (reservation["input_sha256"] != target["input_sha256"]
+            or reservation["expected_selection_revision"]
+            != base_selection["revision"]
+            or reservation["expected_selected_export_sha256"]
+            != base_selection["selected_export_sha256"]
+            or reservation["preview_token"]
+            != target_selection["selected_export_sha256"]
+            or target_selection["revision"] != base_selection["revision"] + 1):
+        raise CatmapAdapterError(
+            "CatMAP export reservation does not match its selection transition")
+    stage_name = reservation["stage_name"]
+    if stage_name is not None and os.path.lexists(input_dir / stage_name):
+        raise CatmapAdapterError(
+            "prepared CatMAP selection still has a staged bundle")
+    final_dir = input_dir / reservation["preview_token"]
+    if not os.path.lexists(final_dir):
+        raise CatmapAdapterError(
+            "prepared CatMAP selection bundle is unavailable")
+    actual_integrity = _bundle_directory_integrity_sha256(
+        final_dir, input_dir, boundary)
+    if actual_integrity != reservation["bundle_integrity_sha256"]:
+        raise CatmapAdapterError(
+            "prepared CatMAP selection bundle changed")
+
+
+def _discard_unprepared_reservation(
+        input_dir: Path, current: Mapping[str, Any],
+        reservation: Mapping[str, Any], boundary: _ProjectBoundary) -> None:
+    if (reservation["expected_selection_revision"] != current["revision"]
+            or reservation["expected_selected_export_sha256"]
+            != current["selected_export_sha256"]):
+        raise CatmapAdapterError(
+            "unprepared CatMAP export reservation is not based on current selection")
+    token = reservation["preview_token"]
+    stage_name = reservation["stage_name"]
+    if stage_name is not None and os.path.lexists(input_dir / stage_name):
+        _remove_safe_bundle_directory(
+            input_dir / stage_name, input_dir, boundary)
+    final_dir = input_dir / token
+    if (reservation["created_by_transaction"]
+            and current.get("selected_export_sha256") != token
+            and os.path.lexists(final_dir)):
+        actual_integrity = _bundle_directory_integrity_sha256(
+            final_dir, input_dir, boundary)
+        if actual_integrity != reservation["bundle_integrity_sha256"]:
+            raise CatmapAdapterError(
+                "reserved CatMAP bundle changed; refusing recovery deletion")
+        _remove_safe_bundle_directory(final_dir, input_dir, boundary)
+    _unlink_regular(
+        input_dir / _RESERVATION_FILENAME,
+        label="CatMAP export reservation", boundary=boundary)
+
+
+def _read_consistent_selection(
+        input_dir: Path, input_sha256: str,
+        boundary: _ProjectBoundary) -> dict[str, Any]:
+    anchor = _SelectionAnchorFile(input_dir, input_sha256, boundary)
+    state = anchor.read()
+    current = _read_selection(input_dir, input_sha256)
+    if state.pending is not None:
+        raise CatmapAdapterError("CatMAP selection anchor transition is pending")
+    if state.committed is None:
+        if current["revision"] != 0:
+            raise CatmapAdapterError(
+                "CatMAP selection exists without its independent anchor")
+    elif not _selection_matches_descriptor(current, state.committed):
+        raise CatmapAdapterError(
+            "CatMAP selection does not match its independent anchor")
+    boundary.verify()
+    return current
+
+
+def _recover_selection_axis(
+        input_dir: Path, input_sha256: str, boundary: _ProjectBoundary,
+        anchor: _SelectionAnchorFile,
+) -> tuple[dict[str, Any], _SelectionAnchorState]:
+    state = anchor.read()
+    current = _read_selection(input_dir, input_sha256)
+    reservation = _read_reservation(input_dir, input_sha256)
+    if state.pending is not None:
+        pending = state.pending
+        if (reservation is None
+                or reservation["transaction_id"] != pending["transaction_id"]
+                or _reservation_sha256(reservation)
+                != pending["reservation_sha256"]):
+            raise CatmapAdapterError(
+                "prepared CatMAP selection reservation is unavailable or changed")
+        _validate_reservation_for_transition(
+            reservation, pending["base"], pending["target"],
+            input_dir, boundary)
+        if _selection_matches_descriptor(current, pending["base"]):
+            _atomic_write(
+                input_dir / "current.json",
+                _json_text(pending["target"]["selection"]),
+                replace=True, boundary=boundary)
+            current = _read_selection(input_dir, input_sha256)
+        if not _selection_matches_descriptor(current, pending["target"]):
+            raise CatmapAdapterError(
+                "CatMAP selection is neither the exact prepared base nor target")
+        commit = _selection_anchor_commit_record(state, pending["record"])
+        anchor.append(commit)
+        state = anchor.read()
+        if (state.pending is not None
+                or state.committed != pending["target"]):
+            raise CatmapAdapterError(
+                "CatMAP selection forward recovery did not commit exactly")
+        _unlink_regular(
+            input_dir / _RESERVATION_FILENAME,
+            label="CatMAP export reservation", boundary=boundary)
+        reservation = None
+    if state.committed is None:
+        if current["revision"] != 0:
+            raise CatmapAdapterError(
+                "CatMAP selection exists without its independent anchor")
+    elif not _selection_matches_descriptor(current, state.committed):
+        raise CatmapAdapterError(
+            "CatMAP selection does not match its independent anchor")
+    if reservation is not None:
+        if (state.committed_transaction_id == reservation["transaction_id"]
+                and state.committed_reservation_sha256
+                == _reservation_sha256(reservation)):
+            if len(state.records) < 2:
+                raise CatmapAdapterError(
+                    "CatMAP selection anchor commit has no prepare")
+            prepare = state.records[-2]
+            _validate_reservation_for_transition(
+                reservation, prepare.get("base"), state.committed,
+                input_dir, boundary)
+            _unlink_regular(
+                input_dir / _RESERVATION_FILENAME,
+                label="CatMAP export reservation", boundary=boundary)
+        else:
+            _discard_unprepared_reservation(
+                input_dir, current, reservation, boundary)
+    return current, state
+
+
+def _bundle_directory_size(
+        path: Path, input_dir: Path, boundary: _ProjectBoundary) -> int:
+    boundary.pin_directory(path, label="CatMAP retained bundle")
+    _lstat_directory(path, label="CatMAP retained bundle")
+    if (Path(os.path.abspath(path)).parent != input_dir
+            or os.path.normcase(os.path.abspath(path))
+            != os.path.normcase(os.path.realpath(path))):
+        raise CatmapAdapterError("CatMAP retained bundle escaped its input directory")
+    total = 0
+    entries = _bounded_scandir(
+        path, maximum=_MAX_ARTIFACT_COUNT + 1,
+        label="CatMAP retained bundle")
+    for entry in entries:
+        boundary.verify()
+        metadata = os.lstat(path / entry.name)
+        if (stat.S_ISLNK(metadata.st_mode) or _is_reparse(metadata)
+                or not stat.S_ISREG(metadata.st_mode)):
+            raise CatmapAdapterError("CatMAP retained bundle contains unsafe entries")
+        total += int(metadata.st_size)
+        if total > _MAX_INPUT_BUNDLE_BYTES:
+            raise CatmapAdapterError("CatMAP retained bundles exceed the input byte quota")
+    boundary.verify()
+    return total
+
+
+def _input_bundle_usage(
+        input_dir: Path, boundary: _ProjectBoundary) -> tuple[int, int]:
+    boundary.verify()
+    count = 0
+    total = 0
+    allowed_files = {
+        "current.json", ".selection.lock", _RESERVATION_FILENAME,
+        _SELECTION_ANCHOR_FILENAME,
+    }
+    entries = _bounded_scandir(
+        input_dir,
+        maximum=_MAX_BUNDLES_PER_INPUT + len(allowed_files),
+        label="CatMAP input directory",
+    )
+    for entry in entries:
+        path = input_dir / entry.name
+        metadata = os.lstat(path)
+        if re.fullmatch(r"[0-9a-f]{64}", entry.name):
+            if (stat.S_ISLNK(metadata.st_mode) or _is_reparse(metadata)
+                    or not stat.S_ISDIR(metadata.st_mode)):
+                raise CatmapAdapterError("CatMAP retained bundle is unsafe")
+            count += 1
+            total += _bundle_directory_size(path, input_dir, boundary)
+        elif entry.name in allowed_files:
+            if (stat.S_ISLNK(metadata.st_mode) or _is_reparse(metadata)
+                    or not stat.S_ISREG(metadata.st_mode)):
+                raise CatmapAdapterError("CatMAP input metadata is unsafe")
+        else:
+            raise CatmapAdapterError("CatMAP input directory contains unknown entries")
+        if count > _MAX_BUNDLES_PER_INPUT or total > _MAX_INPUT_BUNDLE_BYTES:
+            raise CatmapAdapterError("CatMAP retained bundles exceed the input quota")
+    return count, total
+
+
+def _verify_existing_export(
+        final_dir: Path, input_dir: Path, files: Mapping[str, str],
+        boundary: _ProjectBoundary) -> Path:
+    boundary.pin_directory(final_dir, label="existing CatMAP export")
+    if final_dir.parent != input_dir:
+        raise CatmapAdapterError("existing CatMAP export escaped its input directory")
+    entries = {
+        entry.name: entry
+        for entry in _bounded_scandir(
+            final_dir, maximum=_MAX_ARTIFACT_COUNT + 1,
+            label="existing CatMAP export")
+    }
+    if set(entries) != set(files):
+        raise CatmapAdapterError("existing export directory does not match the preview")
+    for name, content in files.items():
+        metadata = _lstat_regular(
+            final_dir / name, label=f"existing CatMAP export file {name}")
+        expected = content.encode("utf-8")
+        data, _, _ = _read_bounded_regular_file(
+            final_dir / name, maximum=max(len(expected), 1),
+            label=f"existing CatMAP export file {name}",
+            expected=metadata, collect=True)
+        if data != expected:
+            raise CatmapAdapterError(
+                f"refusing to overwrite changed export file {name}")
+    boundary.verify()
+    return final_dir
+
+
 def export_selection_snapshot(project_root, input_sha256: str) -> dict[str, Any]:
     """Read the current immutable export selection without creating directories."""
     if not isinstance(input_sha256, str) or not re.fullmatch(
             r"[0-9a-f]{64}", input_sha256):
         raise CatmapAdapterError("input_sha256 must be a SHA-256 value")
-    root = _project_root(project_root)
-    current = root
+    boundary = _ProjectBoundary(project_root)
+    current = boundary.root
     for name in (".vcstudio", "kinetics", "exports", input_sha256):
         candidate = current / name
-        if not candidate.exists():
+        if not os.path.lexists(candidate):
+            boundary.verify()
             return _selection_default(input_sha256)
-        if _is_link(candidate) or not candidate.is_dir():
-            raise CatmapAdapterError("confirmed CatMAP export selection is unavailable")
-        current = candidate.resolve(strict=True)
-        try:
-            current.relative_to(root)
-        except ValueError as exc:
-            raise CatmapAdapterError("export selection escaped project root") from exc
-    return _read_selection(current, input_sha256)
+        current = boundary.child(current, name, create=False)
+    value = _read_consistent_selection(current, input_sha256, boundary)
+    boundary.verify()
+    return value
 
 
 def confirm_export(network_source, project_root, preview_token: str, *,
@@ -954,64 +1936,148 @@ def confirm_export(network_source, project_root, preview_token: str, *,
                  or not re.fullmatch(
                      r"[0-9a-f]{64}", expected_selected_export_sha256))):
         raise CatmapAdapterError("expected selected export hash is invalid")
-    root = _project_root(project_root)
+    boundary = _ProjectBoundary(project_root)
+    root = boundary.root
     export_parent = root
     for name in (".vcstudio", "kinetics", "exports"):
-        export_parent = _safe_child_directory(export_parent, name, root)
-    input_dir = _safe_child_directory(
-        export_parent, str(bundle["input_sha256"]), root)
+        export_parent = boundary.child(export_parent, name)
+    input_dir = boundary.child(export_parent, str(bundle["input_sha256"]))
     final_dir = input_dir / bundle["preview_token"]
-    expected_files = set(bundle["files"])
-    if final_dir.exists():
-        if _is_link(final_dir) or not final_dir.is_dir():
-            raise CatmapAdapterError("final export directory is unsafe")
-        resolved_export = final_dir.resolve(strict=True)
-        try:
-            resolved_export.relative_to(root)
-        except ValueError as exc:
-            raise CatmapAdapterError("final export directory escaped project root") from exc
-        entries = list(resolved_export.iterdir())
-        if any(_is_link(item) or not item.is_file() for item in entries):
-            raise CatmapAdapterError("existing export directory contains unsafe entries")
-        actual = {item.name for item in entries}
-        if actual != expected_files:
-            raise CatmapAdapterError("existing export directory does not match the preview")
-        for name, content in bundle["files"].items():
-            if (resolved_export / name).read_bytes() != content.encode("utf-8"):
-                raise CatmapAdapterError(
-                    f"refusing to overwrite changed export file {name}")
-    else:
-        stage = Path(tempfile.mkdtemp(prefix=".vcs-kinetics-stage-", dir=input_dir))
-        try:
-            resolved_stage = stage.resolve(strict=True)
-            if resolved_stage.parent != input_dir:
-                raise CatmapAdapterError("staged export escaped project boundary")
-            for name, content in sorted(bundle["files"].items()):
-                if Path(name).name != name or name in {".", ".."}:
-                    raise CatmapAdapterError("export artifact name is unsafe")
-                _atomic_write(resolved_stage / name, content)
-            os.replace(resolved_stage, final_dir)
-            resolved_export = final_dir.resolve(strict=True)
-        finally:
-            if stage.exists():
-                resolved_stage = stage.resolve(strict=True)
-                if resolved_stage.parent != input_dir:
-                    raise CatmapAdapterError("refusing to clean unsafe staged export")
-                shutil.rmtree(resolved_stage)
-    with _SELECTION_LOCK, _advisory_lock(input_dir / ".selection.lock"):
-        current = _read_selection(input_dir, str(bundle["input_sha256"]))
+    resolved_export: Path | None = None
+    with _SELECTION_LOCK, _advisory_lock(
+            input_dir / ".selection.lock", boundary):
+        anchor = _SelectionAnchorFile(
+            input_dir, str(bundle["input_sha256"]), boundary)
+        current, anchor_state = _recover_selection_axis(
+            input_dir, str(bundle["input_sha256"]), boundary, anchor)
         if (current["revision"] != expected_selection_revision
                 or current["selected_export_sha256"]
                 != expected_selected_export_sha256):
             raise CatmapAdapterError("export selection conflict")
-        selection = {
-            "schema": EXPORT_SELECTION_SCHEMA,
+        count, retained_bytes = _input_bundle_usage(input_dir, boundary)
+        existed = os.path.lexists(final_dir)
+        if existed:
+            resolved_export = _verify_existing_export(
+                final_dir, input_dir, bundle["files"], boundary)
+        else:
+            candidate_bytes = sum(
+                len(content.encode("utf-8")) for content in bundle["files"].values())
+            if (count + 1 > _MAX_BUNDLES_PER_INPUT
+                    or retained_bytes + candidate_bytes > _MAX_INPUT_BUNDLE_BYTES):
+                raise CatmapAdapterError(
+                    "CatMAP retained bundles exceed the per-input quota")
+        transaction_id = secrets.token_hex(16)
+        stage_name = (
+            f".vcs-kinetics-stage-{transaction_id}" if not existed else None)
+        reservation = {
+            "schema": EXPORT_RESERVATION_SCHEMA,
             "input_sha256": bundle["input_sha256"],
-            "revision": current["revision"] + 1,
-            "selected_export_sha256": bundle["preview_token"],
+            "preview_token": bundle["preview_token"],
+            "expected_selection_revision": expected_selection_revision,
+            "expected_selected_export_sha256": expected_selected_export_sha256,
+            "transaction_id": transaction_id,
+            "created_by_transaction": not existed,
+            "stage_name": stage_name,
+            "bundle_integrity_sha256": _bundle_integrity_sha256(bundle["files"]),
         }
-        _atomic_write(
-            input_dir / "current.json", _json_text(selection), replace=True)
+        reservation_path = input_dir / _RESERVATION_FILENAME
+        published_new = False
+        anchor_started = False
+        anchor_committed = False
+        stage: Path | None = None
+        try:
+            _atomic_write(
+                reservation_path, _json_text(reservation),
+                replace=True, boundary=boundary)
+            if not existed:
+                assert stage_name is not None
+                stage = input_dir / stage_name
+                try:
+                    os.mkdir(stage)
+                except OSError as exc:
+                    raise CatmapAdapterError(
+                        "staged CatMAP export could not be created") from exc
+                stage_metadata = _lstat_directory(
+                    stage, label="staged CatMAP export")
+                if (stage.parent != input_dir or _is_reparse(stage_metadata)
+                        or os.path.normcase(os.path.abspath(stage))
+                        != os.path.normcase(os.path.realpath(stage))):
+                    raise CatmapAdapterError(
+                        "staged export escaped the project boundary")
+                stage = boundary.pin_directory(
+                    stage, label="staged CatMAP export")
+                for name, content in sorted(bundle["files"].items()):
+                    if Path(name).name != name or name in {".", ".."}:
+                        raise CatmapAdapterError("export artifact name is unsafe")
+                    _atomic_write(
+                        stage / name, content, boundary=boundary)
+                boundary.verify()
+                try:
+                    os.replace(stage, final_dir)
+                except OSError as exc:
+                    raise CatmapAdapterError(
+                        "CatMAP export could not be published") from exc
+                _fsync_directory(input_dir)
+                boundary.unpin(stage)
+                stage = None
+                published_new = True
+                resolved_export = boundary.pin_directory(
+                    final_dir, label="published CatMAP export")
+            assert resolved_export is not None
+            selection = {
+                "schema": EXPORT_SELECTION_SCHEMA,
+                "input_sha256": bundle["input_sha256"],
+                "revision": current["revision"] + 1,
+                "selected_export_sha256": bundle["preview_token"],
+            }
+            actual_integrity = _bundle_directory_integrity_sha256(
+                resolved_export, input_dir, boundary)
+            if actual_integrity != reservation["bundle_integrity_sha256"]:
+                raise CatmapAdapterError(
+                    "published CatMAP export does not match its reservation")
+            prepare = _selection_anchor_prepare_record(
+                anchor_state, selection, reservation)
+            anchor_started = True
+            anchor.append(prepare)
+            _selection_fault("after_selection_prepare")
+            _atomic_write(
+                input_dir / "current.json", _json_text(selection),
+                replace=True, boundary=boundary)
+            _selection_fault("after_selection_replace")
+            prepared_state = anchor.read()
+            if (prepared_state.pending is None
+                    or prepared_state.pending["record"]["record_sha256"]
+                    != prepare["record_sha256"]):
+                raise CatmapAdapterError(
+                    "CatMAP selection anchor prepare could not be revalidated")
+            committed_current = _read_selection(
+                input_dir, str(bundle["input_sha256"]))
+            if not _selection_matches_descriptor(
+                    committed_current, prepared_state.pending["target"]):
+                raise CatmapAdapterError(
+                    "CatMAP selection replacement does not match its prepared anchor")
+            commit = _selection_anchor_commit_record(prepared_state, prepare)
+            anchor.append(commit)
+            anchor_committed = True
+            _selection_fault("after_selection_commit")
+            _unlink_regular(
+                reservation_path, label="CatMAP export reservation",
+                boundary=boundary)
+        except Exception:
+            if not anchor_started:
+                if stage is not None and os.path.lexists(stage):
+                    _remove_safe_bundle_directory(stage, input_dir, boundary)
+                if published_new:
+                    _remove_safe_bundle_directory(final_dir, input_dir, boundary)
+                if os.path.lexists(reservation_path):
+                    _unlink_regular(
+                        reservation_path, label="CatMAP export reservation",
+                        boundary=boundary)
+            raise
+        if not anchor_committed:
+            raise CatmapAdapterError("CatMAP selection anchor did not commit")
+        boundary.verify()
+    assert resolved_export is not None
     return {
         "ok": True,
         "schema": MANIFEST_SCHEMA,
@@ -1033,56 +2099,52 @@ def load_confirmed_manifest(project_root, input_sha256: str, *,
     """Revalidate one fixed export manifest and every declared artifact hash."""
     if not isinstance(input_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", input_sha256):
         raise CatmapAdapterError("input_sha256 must be a SHA-256 value")
-    root = _project_root(project_root)
+    boundary = _ProjectBoundary(project_root)
+    root = boundary.root
     export_dir = root
     directory_chain: list[tuple[Path, tuple[int, int, int]]] = []
     for name in (".vcstudio", "kinetics", "exports", input_sha256):
         candidate = export_dir / name
-        metadata = _lstat_directory(
-            candidate, label="confirmed CatMAP export manifest")
-        export_dir = candidate.resolve(strict=True)
-        directory_chain.append((export_dir, _entity_identity(metadata)))
-        try:
-            export_dir.relative_to(root)
-        except ValueError as exc:
+        if not os.path.lexists(candidate):
+            boundary.verify()
             raise CatmapAdapterError(
-                "confirmed CatMAP export directory escaped project root") from exc
-    selection = _read_selection(export_dir, input_sha256)
+                "confirmed CatMAP export manifest is unavailable")
+        export_dir = boundary.child(export_dir, name, create=False)
+        metadata = _lstat_directory(
+            export_dir, label="confirmed CatMAP export manifest")
+        directory_chain.append((export_dir, _entity_identity(metadata)))
+    selection = _read_consistent_selection(
+        export_dir, input_sha256, boundary)
     selected_sha256 = export_sha256 or selection["selected_export_sha256"]
     if selected_sha256 is None:
         raise CatmapAdapterError("confirmed CatMAP export manifest is unavailable")
     if export_sha256 is not None and export_sha256 != selection["selected_export_sha256"]:
         raise CatmapAdapterError("requested CatMAP export is not the current selection")
     candidate = export_dir / selected_sha256
+    if not os.path.lexists(candidate):
+        boundary.verify()
+        raise CatmapAdapterError(
+            "confirmed CatMAP export manifest is unavailable")
+    export_dir = boundary.child(export_dir, selected_sha256, create=False)
     metadata = _lstat_directory(
-        candidate, label="confirmed CatMAP export manifest")
-    export_dir = candidate.resolve(strict=True)
+        export_dir, label="confirmed CatMAP export manifest")
     directory_chain.append((export_dir, _entity_identity(metadata)))
-    try:
-        export_dir.relative_to(root)
-    except ValueError as exc:
-        raise CatmapAdapterError(
-            "confirmed CatMAP export directory escaped project root") from exc
-    try:
-        entries: dict[str, os.stat_result] = {}
-        with os.scandir(export_dir) as iterator:
-            for entry in iterator:
-                entry_path = export_dir / entry.name
-                entry_metadata = entry_path.lstat()
-                if (stat.S_ISLNK(entry_metadata.st_mode)
-                        or _is_reparse(entry_metadata)
-                        or not stat.S_ISREG(entry_metadata.st_mode)):
-                    raise CatmapAdapterError(
-                        "confirmed CatMAP export directory contains unsafe entries")
-                entries[entry.name] = entry_metadata
-                if len(entries) > _MAX_ARTIFACT_COUNT + 1:
-                    raise CatmapAdapterError(
-                        "confirmed CatMAP export directory exceeds the entry limit")
-    except CatmapAdapterError:
-        raise
-    except OSError as exc:
-        raise CatmapAdapterError(
-            "confirmed CatMAP export directory could not be inspected") from exc
+    entries: dict[str, os.stat_result] = {}
+    for entry in _bounded_scandir(
+            export_dir, maximum=_MAX_ARTIFACT_COUNT + 1,
+            label="confirmed CatMAP export directory"):
+        entry_path = export_dir / entry.name
+        try:
+            entry_metadata = entry_path.lstat()
+        except OSError as exc:
+            raise CatmapAdapterError(
+                "confirmed CatMAP export directory could not be inspected") from exc
+        if (stat.S_ISLNK(entry_metadata.st_mode)
+                or _is_reparse(entry_metadata)
+                or not stat.S_ISREG(entry_metadata.st_mode)):
+            raise CatmapAdapterError(
+                "confirmed CatMAP export directory contains unsafe entries")
+        entries[entry.name] = entry_metadata
     manifest_metadata = entries.get("manifest.json")
     if manifest_metadata is None:
         raise CatmapAdapterError("confirmed CatMAP export manifest is unavailable")
@@ -1187,11 +2249,14 @@ def load_confirmed_manifest(project_root, input_sha256: str, *,
             expected=entries[name])
         if actual_size != size or actual_digest != digest:
             raise CatmapAdapterError(f"confirmed CatMAP export artifact hash mismatch: {name}")
+    final_entries: dict[str, os.stat_result] = {}
     try:
-        final_entries: dict[str, os.stat_result] = {}
-        with os.scandir(export_dir) as iterator:
-            for entry in iterator:
-                final_entries[entry.name] = (export_dir / entry.name).lstat()
+        for entry in _bounded_scandir(
+                export_dir, maximum=len(entries),
+                label="confirmed CatMAP export directory changed during validation"):
+            final_entries[entry.name] = (export_dir / entry.name).lstat()
+    except CatmapAdapterError:
+        raise
     except OSError as exc:
         raise CatmapAdapterError(
             "confirmed CatMAP export directory changed during validation") from exc
@@ -1208,6 +2273,7 @@ def load_confirmed_manifest(project_root, input_sha256: str, *,
         if _entity_identity(current) != identity:
             raise CatmapAdapterError(
                 "confirmed CatMAP export directory changed during validation")
+    boundary.verify()
     token_payload = {
         "schema": BUNDLE_SCHEMA,
         "input_sha256": input_sha256,
@@ -1293,40 +2359,55 @@ def confirm_audit_export(network_source, project_root, preview_token: str, *,
         network_source, tool_path=tool_path, tool_version=tool_version)
     if preview_token != bundle["preview_token"]:
         raise CatmapAdapterError("audit preview token mismatch")
-    root = _project_root(project_root)
-    parent = root
+    boundary = _ProjectBoundary(project_root)
+    parent = boundary.root
     for name in (".vcstudio", "kinetics", "audits", bundle["input_sha256"]):
-        parent = _safe_child_directory(parent, str(name), root)
+        parent = boundary.child(parent, str(name))
     final_dir = parent / preview_token
-    if final_dir.exists():
-        if _is_link(final_dir) or not final_dir.is_dir():
-            raise CatmapAdapterError("audit export directory is unsafe")
-        if {item.name for item in final_dir.iterdir()} != set(bundle["files"]):
-            raise CatmapAdapterError("existing audit export differs")
-        for name, content in bundle["files"].items():
-            if (final_dir / name).read_bytes() != content.encode("utf-8"):
-                raise CatmapAdapterError("existing audit export differs")
+    if os.path.lexists(final_dir):
+        try:
+            resolved_export = _verify_existing_export(
+                final_dir, parent, bundle["files"], boundary)
+        except CatmapAdapterError as exc:
+            raise CatmapAdapterError("existing audit export differs") from exc
     else:
         stage = Path(tempfile.mkdtemp(prefix=".vcs-audit-stage-", dir=parent))
+        published_new = False
         try:
-            resolved_stage = stage.resolve(strict=True)
-            if resolved_stage.parent != parent:
+            stage_metadata = _lstat_directory(
+                stage, label="staged CatMAP audit export")
+            if (stage.parent != parent or _is_reparse(stage_metadata)
+                    or os.path.normcase(os.path.abspath(stage))
+                    != os.path.normcase(os.path.realpath(stage))):
                 raise CatmapAdapterError("staged audit export escaped project boundary")
+            stage = boundary.pin_directory(
+                stage, label="staged CatMAP audit export")
             for name, content in sorted(bundle["files"].items()):
-                _atomic_write(resolved_stage / name, content)
-            os.replace(resolved_stage, final_dir)
-        finally:
-            if stage.exists():
-                resolved_stage = stage.resolve(strict=True)
-                if resolved_stage.parent != parent:
-                    raise CatmapAdapterError(
-                        "refusing to clean unsafe staged audit export")
-                shutil.rmtree(resolved_stage)
+                if Path(name).name != name or name in {".", ".."}:
+                    raise CatmapAdapterError("audit export artifact name is unsafe")
+                _atomic_write(stage / name, content, boundary=boundary)
+            boundary.verify()
+            try:
+                os.replace(stage, final_dir)
+            except OSError as exc:
+                raise CatmapAdapterError(
+                    "CatMAP audit export could not be published") from exc
+            boundary.unpin(stage)
+            published_new = True
+            resolved_export = boundary.pin_directory(
+                final_dir, label="published CatMAP audit export")
+        except Exception:
+            if os.path.lexists(stage):
+                _remove_safe_bundle_directory(stage, parent, boundary)
+            if published_new and os.path.lexists(final_dir):
+                _remove_safe_bundle_directory(final_dir, parent, boundary)
+            raise
+    boundary.verify()
     return {
         "ok": True, "schema": AUDIT_MANIFEST_SCHEMA,
         "input_sha256": bundle["input_sha256"], "files": sorted(bundle["files"]),
         "audit_export_status": "published", "model_published": False,
-        "export_dir": str(final_dir), "scientific_status": "diagnostic",
+        "export_dir": str(resolved_export), "scientific_status": "diagnostic",
         "eligible_final": False,
     }
 

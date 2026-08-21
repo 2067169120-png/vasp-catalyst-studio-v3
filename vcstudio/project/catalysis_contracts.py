@@ -23,6 +23,7 @@ from vcstudio.shared.credential_classifier import is_sensitive_key, looks_like_c
 MODEL_VERSION = "1.0.0"
 DOMAIN_ENVELOPE_SCHEMA = "vcstudio.catalysis-domain-envelope/v2"
 WORKFLOW_RUN_SCHEMA = "vcstudio.workflow-run-snapshot/v1"
+FLUID_STANDARD_STATE_SCHEMA = "vcstudio.fluid-standard-state/v1"
 
 PROVENANCE_KINDS = ("observed", "imported", "inferred")
 EVIDENCE_TYPES = (
@@ -627,6 +628,137 @@ class AdsorbateState(_RevisionedDomainDTO):
 
 
 @dataclass(frozen=True)
+class FluidStandardState:
+    """Exact conventional standard state permitted for one fluid phase."""
+
+    phase: str
+    kind: str
+    value: float
+    unit: str
+    schema: str = FLUID_STANDARD_STATE_SCHEMA
+
+    def __post_init__(self) -> None:
+        if self.schema != FLUID_STANDARD_STATE_SCHEMA:
+            raise CatalysisContractError("fluid standard-state schema is unsupported")
+        phase = _enum(self.phase, "fluid_standard_state.phase", (
+            "gas", "liquid", "aqueous"))
+        if isinstance(self.value, bool) or not isinstance(self.value, (int, float)):
+            raise CatalysisContractError("fluid standard-state value is invalid")
+        number = float(self.value)
+        if not math.isfinite(number):
+            raise CatalysisContractError("fluid standard-state value is invalid")
+        allowed = (
+            {("1-bar", 100000.0, "Pa"), ("1-atm", 101325.0, "Pa")}
+            if phase == "gas" else {("1-molar", 1.0, "mol/L")}
+        )
+        identity = (str(self.kind or "").strip(), number, str(self.unit or "").strip())
+        if identity not in allowed:
+            raise CatalysisContractError(
+                "fluid standard-state definition is incompatible with its phase")
+        object.__setattr__(self, "phase", phase)
+        object.__setattr__(self, "kind", identity[0])
+        object.__setattr__(self, "value", number)
+        object.__setattr__(self, "unit", identity[2])
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema, "phase": self.phase, "kind": self.kind,
+            "value": self.value, "unit": self.unit,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> FluidStandardState:
+        _strict_fields(
+            value, {"schema", "phase", "kind", "value", "unit"},
+            label="fluid_standard_state")
+        return cls(**dict(value))
+
+
+@dataclass(frozen=True)
+class FluidState(_RevisionedDomainDTO):
+    """One explicitly phased molecular fluid state without activity or energy."""
+
+    schema: ClassVar[str] = "vcstudio.fluid-state/v1"
+    dto_schema_version: ClassVar[str] = "1.0.0"
+    state_id: str
+    phase: str
+    chemical_formula: str
+    charge: int
+    multiplicity: int
+    standard_state: FluidStandardState
+    provenance: str
+    evidence_refs: tuple[EvidenceRef, ...]
+    method_fingerprint: MethodFingerprint
+    object_revision_id: str
+    parent_revision: str | None = None
+    expected_current_hash: str | None = None
+    schema_version: str = "1.0.0"
+
+    def __post_init__(self) -> None:
+        self._validate_common()
+        object.__setattr__(self, "state_id", _opaque_id(self.state_id, "state_id"))
+        phase = _enum(self.phase, "fluid_state.phase", ("gas", "liquid", "aqueous"))
+        formula = str(self.chemical_formula or "").strip()
+        if not _FORMULA_RE.fullmatch(formula):
+            raise CatalysisContractError("fluid chemical_formula is invalid")
+        reject_sensitive(formula, field="fluid chemical_formula")
+        from vcstudio.project.structure_identity import formula_composition
+
+        if formula_composition(formula) is None:
+            raise CatalysisContractError(
+                "fluid chemical_formula must be an exact plain elemental formula")
+        if (isinstance(self.charge, bool) or not isinstance(self.charge, int)
+                or not -20 <= self.charge <= 20):
+            raise CatalysisContractError("fluid charge is invalid")
+        if (isinstance(self.multiplicity, bool) or not isinstance(self.multiplicity, int)
+                or not 1 <= self.multiplicity <= 50):
+            raise CatalysisContractError("fluid multiplicity is invalid")
+        standard_state = (
+            self.standard_state
+            if isinstance(self.standard_state, FluidStandardState)
+            else FluidStandardState.from_dict(self.standard_state))
+        if standard_state.phase != phase:
+            raise CatalysisContractError(
+                "fluid standard-state phase does not match FluidState")
+        object.__setattr__(self, "phase", phase)
+        object.__setattr__(self, "chemical_formula", formula)
+        object.__setattr__(self, "standard_state", standard_state)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **self._common_dict(), "state_id": self.state_id,
+            "phase": self.phase, "chemical_formula": self.chemical_formula,
+            "charge": self.charge, "multiplicity": self.multiplicity,
+            "standard_state": self.standard_state.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> FluidState:
+        allowed = {
+            "schema", "schema_version", "object_revision_id", "parent_revision",
+            "expected_current_hash", "state_id", "phase", "chemical_formula",
+            "charge", "multiplicity", "standard_state", "provenance",
+            "evidence_refs", "method_fingerprint",
+        }
+        _strict_fields(value, allowed, label="fluid_state")
+        if value["schema"] != cls.schema:
+            raise CatalysisContractError("fluid state schema is unsupported")
+        return cls(
+            state_id=value["state_id"], phase=value["phase"],
+            chemical_formula=value["chemical_formula"], charge=value["charge"],
+            multiplicity=value["multiplicity"],
+            standard_state=FluidStandardState.from_dict(value["standard_state"]),
+            provenance=value["provenance"],
+            evidence_refs=_evidence_refs(value["evidence_refs"], "evidence_refs"),
+            method_fingerprint=MethodFingerprint.from_dict(value["method_fingerprint"]),
+            object_revision_id=value["object_revision_id"],
+            parent_revision=value["parent_revision"],
+            expected_current_hash=value["expected_current_hash"],
+            schema_version=value["schema_version"],
+        )
+
+
+@dataclass(frozen=True)
 class ExactRational:
     """A bounded canonical non-negative rational encoded as numerator/denominator."""
 
@@ -848,6 +980,7 @@ class AuthoritativeParticipantState:
     phase: str
     charge: int
     site_stoichiometry: Mapping[str, ExactRational]
+    surface_id: str | None = None
 
     def __post_init__(self) -> None:
         participant = ReactionParticipant(
@@ -858,6 +991,12 @@ class AuthoritativeParticipantState:
         object.__setattr__(self, "phase", participant.phase)
         object.__setattr__(self, "charge", participant.charge)
         object.__setattr__(self, "site_stoichiometry", participant.site_stoichiometry)
+        surface_id = _opaque_id(
+            self.surface_id, "authoritative.surface_id", optional=True)
+        if participant.site_stoichiometry and surface_id is None:
+            raise CatalysisContractError(
+                "authoritative surface_id is required for site stoichiometry")
+        object.__setattr__(self, "surface_id", surface_id)
         formula = str(self.chemical_formula or "").strip()
         if not formula or not _FORMULA_RE.fullmatch(formula):
             raise CatalysisContractError("authoritative chemical_formula is invalid")
@@ -870,6 +1009,7 @@ class AuthoritativeParticipantState:
             "chemical_formula": self.chemical_formula,
             "phase": self.phase,
             "charge": self.charge,
+            "surface_id": self.surface_id,
             "site_stoichiometry": {
                 key: amount.to_dict()
                 for key, amount in sorted(self.site_stoichiometry.items())
@@ -880,12 +1020,13 @@ class AuthoritativeParticipantState:
     def from_dict(cls, value: Mapping[str, Any]) -> AuthoritativeParticipantState:
         _strict_fields(
             value, {"state_id", "chemical_formula", "phase", "charge",
-                    "site_stoichiometry"},
+                    "surface_id", "site_stoichiometry"},
             label="authoritative_participant_state",
         )
         return cls(
             state_id=value["state_id"], chemical_formula=value["chemical_formula"],
             phase=value["phase"], charge=value["charge"],
+            surface_id=value["surface_id"],
             site_stoichiometry=_site_stoichiometry_from_dict(
                 value["site_stoichiometry"], "authoritative.site_stoichiometry"),
         )
@@ -946,10 +1087,10 @@ def validate_elementary_step_conservation(
         return record
 
     def totals(side: tuple[ReactionParticipant, ...]) -> tuple[
-            dict[str, Fraction], Fraction, dict[str, Fraction]]:
+            dict[str, Fraction], Fraction, dict[tuple[str, str], Fraction]]:
         elements: dict[str, Fraction] = {}
         charge = Fraction(0)
-        sites: dict[str, Fraction] = {}
+        sites: dict[tuple[str, str], Fraction] = {}
         for participant in side:
             state = resolved(participant.state_id)
             if (state.phase != participant.phase or state.charge != participant.charge
@@ -960,10 +1101,14 @@ def validate_elementary_step_conservation(
             for element, count in _element_counts(state.chemical_formula).items():
                 elements[element] = (
                     elements.get(element, Fraction(0)) + coefficient * count)
-            charge += coefficient * participant.charge
+            charge += coefficient * state.charge
             for site_type, amount in participant.site_stoichiometry.items():
-                sites[site_type] = (
-                    sites.get(site_type, Fraction(0))
+                if state.surface_id is None:
+                    raise CatalysisContractError(
+                        "authoritative surface_id is required for site conservation")
+                key = (state.surface_id, site_type)
+                sites[key] = (
+                    sites.get(key, Fraction(0))
                     + coefficient * amount.to_fraction())
         return elements, charge, sites
 
@@ -992,7 +1137,7 @@ def validate_elementary_step_conservation(
     ):
         if left != right:
             raise CatalysisContractError(
-                f"{left_name}/{right_name} violates site-type conservation")
+                f"{left_name}/{right_name} violates site-type conservation across surfaces")
 
     def rational_wire(value: Fraction) -> dict[str, int]:
         return {"numerator": value.numerator, "denominator": value.denominator}
@@ -1005,9 +1150,15 @@ def validate_elementary_step_conservation(
             for key, amount in sorted(reactant_elements.items())
         }),
         "charge": _FrozenDict(rational_wire(reactant_charge)),
+        "site_key_schema": "surface_id -> site_id",
         "site_stoichiometry": _FrozenDict({
-            key: _FrozenDict(rational_wire(amount))
-            for key, amount in sorted(reactant_sites.items())
+            surface_id: _FrozenDict({
+                site_id: _FrozenDict(rational_wire(amount))
+                for (item_surface_id, site_id), amount in sorted(
+                    reactant_sites.items())
+                if item_surface_id == surface_id
+            })
+            for surface_id in sorted({key[0] for key in reactant_sites})
         }),
         "authorizes_execution": False,
     })
@@ -1426,6 +1577,7 @@ class WorkflowRecipe(_DomainDTO):
 DOMAIN_TYPES: dict[str, type[_DomainDTO]] = {
     "CatalystSurface": CatalystSurface,
     "AdsorbateState": AdsorbateState,
+    "FluidState": FluidState,
     "ElementaryStep": ElementaryStep,
     "ConditionSet": ConditionSet,
     "ReactionNetwork": ReactionNetwork,
@@ -1434,11 +1586,19 @@ DOMAIN_TYPES: dict[str, type[_DomainDTO]] = {
 
 
 def _object_identity(value: _DomainDTO) -> str:
-    for field in ("surface_id", "state_id", "step_id", "condition_set_id",
-                  "network_id", "recipe_id"):
-        if hasattr(value, field):
-            return str(getattr(value, field))
-    raise CatalysisContractError("domain object has no identity")
+    identity_fields = {
+        CatalystSurface: "surface_id",
+        AdsorbateState: "state_id",
+        FluidState: "state_id",
+        ElementaryStep: "step_id",
+        ConditionSet: "condition_set_id",
+        ReactionNetwork: "network_id",
+        WorkflowRecipe: "recipe_id",
+    }
+    field = identity_fields.get(type(value))
+    if field is None:
+        raise CatalysisContractError("domain object has no identity")
+    return str(getattr(value, field))
 
 
 def _object_schema_version(value: _DomainDTO) -> str:
@@ -1655,7 +1815,8 @@ __all__ = [
     "AdsorbateState", "AuthoritativeParticipantState", "CatalystSurface",
     "CatalysisContractError", "ConditionSet",
     "DOMAIN_ENVELOPE_SCHEMA", "DomainEnvelope", "EVIDENCE_TYPES", "ElementaryStep",
-    "EvidenceRef", "ExactRational", "MODEL_VERSION", "MethodFingerprint",
+    "EvidenceRef", "ExactRational", "FLUID_STANDARD_STATE_SCHEMA", "FluidStandardState",
+    "FluidState", "MODEL_VERSION", "MethodFingerprint",
     "PARTICIPANT_PHASES",
     "PROVENANCE_KINDS", "ReactionNetwork", "ReactionParticipant", "RecipeInput",
     "RecipeParameter", "ScientificLimit",

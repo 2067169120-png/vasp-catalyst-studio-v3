@@ -46,6 +46,35 @@ def _confirm(network, project, preview, tool):
         tool_path=tool, tool_version=preview["tool"]["version"])
 
 
+def test_bounded_scandir_stops_exactly_at_limit_plus_one(
+        tmp_path, monkeypatch):
+    class EndlessScan:
+        def __init__(self):
+            self.count = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.count += 1
+            return object()
+
+    scan = EndlessScan()
+    monkeypatch.setattr(catmap_adapter.os, "scandir", lambda _path: scan)
+
+    with pytest.raises(catmap_adapter.CatmapAdapterError, match="entry limit"):
+        catmap_adapter._bounded_scandir(
+            tmp_path, maximum=3, label="bounded test directory")
+
+    assert scan.count == 4
+
+
 def test_missing_catmap_is_unavailable_but_audit_report_is_exportable():
     preview = catmap_adapter.preview_export(catmap_ready_network(), tool_path=None)
     audit_preview = catmap_adapter.preview_audit_export(
@@ -108,12 +137,12 @@ def test_catmap_table_and_mkm_follow_fixed_data_only_contract():
     ]
 
 
-def test_v2_schemas_and_complete_frozen_bundle_contract(tmp_path):
+def test_v3_input_schema_and_complete_frozen_bundle_contract(tmp_path):
     bundle = catmap_adapter.build_export_bundle(
         catmap_ready_network(), tool_path=_tool(tmp_path), tool_version="0.4.0")
     process = json.loads(bundle["files"]["process-contract.json"])
 
-    assert kinetics.NETWORK_SCHEMA == "vcstudio.kinetics-network/v2"
+    assert kinetics.NETWORK_SCHEMA == "vcstudio.kinetics-network/v3"
     assert kinetics.RESULT_SCHEMA == "vcstudio.kinetics-result/v2"
     assert kinetics.NORMALIZED_RESULT_SCHEMA == (
         "vcstudio.kinetics-normalized-result/v2")
@@ -290,6 +319,311 @@ def test_tool_drift_publishes_immutable_versions_with_selection_cas(tmp_path):
             tool_path=tool, tool_version="0.4.0")
 
 
+def test_stale_selection_loser_does_not_publish_or_grow_bundle_storage(tmp_path):
+    network = catmap_ready_network()
+    tool = _tool(tmp_path)
+    first_preview = _preview(network, tool)
+    _confirm(network, tmp_path, first_preview, tool)
+    input_dir = (tmp_path / ".vcstudio" / "kinetics" / "exports" /
+                 network["input_sha256"])
+
+    tool.write_bytes(b"new-catmap-identity-for-stale-selection")
+    stale_preview = _preview(network, tool)
+    before = sorted(
+        (str(path.relative_to(input_dir)), path.is_dir(), path.stat().st_size)
+        for path in input_dir.rglob("*")
+    )
+
+    with pytest.raises(catmap_adapter.CatmapAdapterError, match="conflict"):
+        catmap_adapter.confirm_export(
+            network, tmp_path, stale_preview["preview_token"],
+            expected_selection_revision=0,
+            expected_selected_export_sha256=None, confirmed=True,
+            tool_path=tool, tool_version="0.4.0")
+
+    after = sorted(
+        (str(path.relative_to(input_dir)), path.is_dir(), path.stat().st_size)
+        for path in input_dir.rglob("*")
+    )
+    assert after == before
+    assert not (input_dir / stale_preview["preview_token"]).exists()
+    assert not (input_dir / catmap_adapter._RESERVATION_FILENAME).exists()
+
+
+def test_publish_failure_rolls_back_reservation_and_staged_bundle(
+        tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    network = catmap_ready_network()
+    tool = _tool(tmp_path)
+    preview = _preview(network, tool)
+    input_dir = (project / ".vcstudio" / "kinetics" / "exports" /
+                 network["input_sha256"])
+    final_dir = input_dir / preview["preview_token"]
+    original_replace = catmap_adapter.os.replace
+
+    def fail_bundle_publish(source, destination):
+        if Path(destination) == final_dir:
+            raise OSError("simulated publish failure")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(catmap_adapter.os, "replace", fail_bundle_publish)
+
+    with pytest.raises(catmap_adapter.CatmapAdapterError, match="could not be published"):
+        _confirm(network, project, preview, tool)
+
+    assert not final_dir.exists()
+    assert not (input_dir / catmap_adapter._RESERVATION_FILENAME).exists()
+    assert not any(
+        path.name.startswith(".vcs-kinetics-stage-")
+        for path in input_dir.iterdir())
+    assert catmap_adapter.export_selection_snapshot(
+        project, network["input_sha256"])["revision"] == 0
+
+
+@pytest.mark.parametrize("quota", ["count", "bytes"])
+def test_per_input_bundle_quota_rejects_new_version_without_residue(
+        tmp_path, monkeypatch, quota):
+    network = catmap_ready_network()
+    tool = _tool(tmp_path)
+    first_preview = _preview(network, tool)
+    first = _confirm(network, tmp_path, first_preview, tool)
+    input_dir = (tmp_path / ".vcstudio" / "kinetics" / "exports" /
+                 network["input_sha256"])
+
+    tool.write_bytes(b"new-catmap-identity-for-quota")
+    second_preview = _preview(network, tool)
+    second_bundle = catmap_adapter.build_export_bundle(
+        network, tool_path=tool, tool_version="0.4.0")
+    if quota == "count":
+        monkeypatch.setattr(catmap_adapter, "_MAX_BUNDLES_PER_INPUT", 1)
+    else:
+        retained = sum(
+            path.stat().st_size
+            for path in (input_dir / first_preview["preview_token"]).iterdir())
+        candidate = sum(
+            len(content.encode("utf-8"))
+            for content in second_bundle["files"].values())
+        monkeypatch.setattr(
+            catmap_adapter, "_MAX_INPUT_BUNDLE_BYTES",
+            retained + candidate - 1)
+
+    with pytest.raises(catmap_adapter.CatmapAdapterError, match="quota"):
+        catmap_adapter.confirm_export(
+            network, tmp_path, second_preview["preview_token"],
+            expected_selection_revision=first["selection_revision"],
+            expected_selected_export_sha256=first["selected_export_sha256"],
+            confirmed=True, tool_path=tool, tool_version="0.4.0")
+
+    assert not (input_dir / second_preview["preview_token"]).exists()
+    assert not (input_dir / catmap_adapter._RESERVATION_FILENAME).exists()
+
+
+def test_next_confirmation_recovers_unselected_reserved_bundle_and_stage(tmp_path):
+    network = catmap_ready_network()
+    tool = _tool(tmp_path)
+    first_preview = _preview(network, tool)
+    first = _confirm(network, tmp_path, first_preview, tool)
+    input_dir = (tmp_path / ".vcstudio" / "kinetics" / "exports" /
+                 network["input_sha256"])
+
+    tool.write_bytes(b"new-catmap-identity-after-crash")
+    next_preview = _preview(network, tool)
+    next_bundle = catmap_adapter.build_export_bundle(
+        network, tool_path=tool, tool_version="0.4.0")
+    orphan_bundle = input_dir / next_preview["preview_token"]
+    orphan_bundle.mkdir()
+    for name, content in next_bundle["files"].items():
+        (orphan_bundle / name).write_bytes(content.encode("utf-8"))
+    transaction_id = "a" * 32
+    stage_name = f".vcs-kinetics-stage-{transaction_id}"
+    orphan_stage = input_dir / stage_name
+    orphan_stage.mkdir()
+    (orphan_stage / "partial.txt").write_text("partial", encoding="utf-8")
+    reservation = {
+        "schema": catmap_adapter.EXPORT_RESERVATION_SCHEMA,
+        "input_sha256": network["input_sha256"],
+        "preview_token": next_preview["preview_token"],
+        "expected_selection_revision": first["selection_revision"],
+        "expected_selected_export_sha256": first["selected_export_sha256"],
+        "transaction_id": transaction_id,
+        "created_by_transaction": True,
+        "stage_name": stage_name,
+        "bundle_integrity_sha256": catmap_adapter._bundle_integrity_sha256(
+            next_bundle["files"]),
+    }
+    (input_dir / catmap_adapter._RESERVATION_FILENAME).write_text(
+        json.dumps(reservation), encoding="utf-8")
+
+    confirmed = catmap_adapter.confirm_export(
+        network, tmp_path, next_preview["preview_token"],
+        expected_selection_revision=first["selection_revision"],
+        expected_selected_export_sha256=first["selected_export_sha256"],
+        confirmed=True, tool_path=tool, tool_version="0.4.0")
+
+    assert confirmed["selection_revision"] == 2
+    assert not orphan_stage.exists()
+    assert not (input_dir / catmap_adapter._RESERVATION_FILENAME).exists()
+    assert set(path.name for path in orphan_bundle.iterdir()) == _MODEL_BUNDLE_FILES
+
+
+def test_crashed_reselection_reservation_never_deletes_preexisting_bundle(
+        tmp_path, monkeypatch):
+    network = catmap_ready_network()
+    tool = _tool(tmp_path)
+    first_tool_bytes = tool.read_bytes()
+    preview_a = _preview(network, tool)
+    selected_a = _confirm(network, tmp_path, preview_a, tool)
+    input_dir = (tmp_path / ".vcstudio" / "kinetics" / "exports" /
+                 network["input_sha256"])
+
+    second_tool_bytes = b"catmap-identity-b-for-reselection"
+    tool.write_bytes(second_tool_bytes)
+    preview_b = _preview(network, tool)
+    selected_b = catmap_adapter.confirm_export(
+        network, tmp_path, preview_b["preview_token"],
+        expected_selection_revision=selected_a["selection_revision"],
+        expected_selected_export_sha256=selected_a["selected_export_sha256"],
+        confirmed=True, tool_path=tool, tool_version="0.4.0")
+
+    tool.write_bytes(first_tool_bytes)
+    assert _preview(network, tool)["preview_token"] == preview_a["preview_token"]
+    original_atomic_write = catmap_adapter._atomic_write
+
+    def crash_after_reservation(path, content, **kwargs):
+        if Path(path).name == "current.json":
+            raise KeyboardInterrupt("simulated process crash")
+        return original_atomic_write(path, content, **kwargs)
+
+    monkeypatch.setattr(catmap_adapter, "_atomic_write", crash_after_reservation)
+    with pytest.raises(KeyboardInterrupt, match="process crash"):
+        catmap_adapter.confirm_export(
+            network, tmp_path, preview_a["preview_token"],
+            expected_selection_revision=selected_b["selection_revision"],
+            expected_selected_export_sha256=selected_b["selected_export_sha256"],
+            confirmed=True, tool_path=tool, tool_version="0.4.0")
+    reservation = json.loads(
+        (input_dir / catmap_adapter._RESERVATION_FILENAME).read_text(
+            encoding="utf-8"))
+    assert reservation["created_by_transaction"] is False
+    assert reservation["stage_name"] is None
+
+    monkeypatch.setattr(catmap_adapter, "_atomic_write", original_atomic_write)
+    tool.write_bytes(second_tool_bytes)
+    with pytest.raises(catmap_adapter.CatmapAdapterError, match="conflict"):
+        catmap_adapter.confirm_export(
+            network, tmp_path, preview_b["preview_token"],
+            expected_selection_revision=selected_b["selection_revision"],
+            expected_selected_export_sha256=selected_b["selected_export_sha256"],
+            confirmed=True, tool_path=tool, tool_version="0.4.0")
+    recovered = catmap_adapter.export_selection_snapshot(
+        tmp_path, network["input_sha256"])
+
+    assert recovered["revision"] == 3
+    assert recovered["selected_export_sha256"] == preview_a["preview_token"]
+    assert (input_dir / preview_a["preview_token"]).is_dir()
+    assert (input_dir / preview_b["preview_token"]).is_dir()
+    assert not (input_dir / catmap_adapter._RESERVATION_FILENAME).exists()
+
+
+@pytest.mark.parametrize(
+    "stage", ["after_selection_prepare", "after_selection_replace"])
+def test_fresh_confirmation_forward_recovers_prepared_selection_crash(
+        tmp_path, monkeypatch, stage):
+    network = catmap_ready_network()
+    tool = _tool(tmp_path)
+    preview = _preview(network, tool)
+
+    def crash(selected):
+        if selected == stage:
+            raise KeyboardInterrupt(selected)
+
+    monkeypatch.setattr(catmap_adapter, "_selection_fault", crash)
+    with pytest.raises(KeyboardInterrupt, match=stage):
+        _confirm(network, tmp_path, preview, tool)
+
+    monkeypatch.setattr(catmap_adapter, "_selection_fault", lambda _stage: None)
+    with pytest.raises(catmap_adapter.CatmapAdapterError, match="conflict"):
+        _confirm(network, tmp_path, preview, tool)
+    selection = catmap_adapter.export_selection_snapshot(
+        tmp_path, network["input_sha256"])
+    input_dir = (tmp_path / ".vcstudio" / "kinetics" / "exports" /
+                 network["input_sha256"])
+    assert selection == {
+        "schema": catmap_adapter.EXPORT_SELECTION_SCHEMA,
+        "input_sha256": network["input_sha256"],
+        "revision": 1,
+        "selected_export_sha256": preview["preview_token"],
+    }
+    assert (input_dir / preview["preview_token"]).is_dir()
+    assert not (input_dir / catmap_adapter._RESERVATION_FILENAME).exists()
+
+
+def test_selection_anchor_rejects_old_pointer_missing_anchor_and_tamper(tmp_path):
+    network = catmap_ready_network()
+    tool = _tool(tmp_path)
+    first_preview = _preview(network, tool)
+    first = _confirm(network, tmp_path, first_preview, tool)
+    input_dir = (tmp_path / ".vcstudio" / "kinetics" / "exports" /
+                 network["input_sha256"])
+    pointer = input_dir / "current.json"
+    anchor = input_dir / catmap_adapter._SELECTION_ANCHOR_FILENAME
+    old_pointer = pointer.read_bytes()
+
+    tool.write_bytes(b"second-tool-for-selection-anchor")
+    second_preview = _preview(network, tool)
+    catmap_adapter.confirm_export(
+        network, tmp_path, second_preview["preview_token"],
+        expected_selection_revision=first["selection_revision"],
+        expected_selected_export_sha256=first["selected_export_sha256"],
+        confirmed=True, tool_path=tool, tool_version="0.4.0")
+    pointer.write_bytes(old_pointer)
+    with pytest.raises(catmap_adapter.CatmapAdapterError, match="independent anchor"):
+        catmap_adapter.export_selection_snapshot(
+            tmp_path, network["input_sha256"])
+
+    pointer.write_text(json.dumps({
+        "schema": catmap_adapter.EXPORT_SELECTION_SCHEMA,
+        "input_sha256": network["input_sha256"],
+        "revision": 2,
+        "selected_export_sha256": second_preview["preview_token"],
+    }), encoding="utf-8")
+    anchor_bytes = anchor.read_bytes()
+    anchor.unlink()
+    with pytest.raises(catmap_adapter.CatmapAdapterError, match="without its independent anchor"):
+        catmap_adapter.export_selection_snapshot(
+            tmp_path, network["input_sha256"])
+
+    anchor.write_bytes(anchor_bytes.replace(
+        b'"kind":"commit"', b'"kind":"tamper"', 1))
+    with pytest.raises(catmap_adapter.CatmapAdapterError, match="anchor"):
+        catmap_adapter.export_selection_snapshot(
+            tmp_path, network["input_sha256"])
+
+
+def test_selection_anchor_entity_replacement_during_commit_fails_closed(
+        tmp_path, monkeypatch):
+    network = catmap_ready_network()
+    tool = _tool(tmp_path)
+    preview = _preview(network, tool)
+    input_dir = (tmp_path / ".vcstudio" / "kinetics" / "exports" /
+                 network["input_sha256"])
+
+    def replace_anchor(stage):
+        if stage != "after_selection_prepare":
+            return
+        anchor = input_dir / catmap_adapter._SELECTION_ANCHOR_FILENAME
+        replacement = input_dir / ".replacement-anchor"
+        replacement.write_bytes(anchor.read_bytes())
+        replacement.replace(anchor)
+
+    monkeypatch.setattr(catmap_adapter, "_selection_fault", replace_anchor)
+    with pytest.raises(catmap_adapter.CatmapAdapterError, match="entity changed"):
+        _confirm(network, tmp_path, preview, tool)
+    assert (input_dir / preview["preview_token"]).is_dir()
+    assert (input_dir / catmap_adapter._RESERVATION_FILENAME).is_file()
+
+
 def test_name_map_rejects_ambiguous_multisite_species():
     network = catmap_ready_network()
     network["species"][4]["sites"] = {"s": 1, "bridge": 1}
@@ -365,6 +699,16 @@ def test_rank_deficient_participating_gases_cannot_claim_catmap_reference_set():
         }),
         "frozen Gibbs",
     ),
+    (
+        lambda network: [
+            (
+                record.update({"phase": "liquid"}),
+                record["activity"].update({"unit": "mol/L"}),
+            )
+            for record in network["species"] if record["phase"] == "gas"
+        ],
+        "liquid/solution",
+    ),
 ])
 def test_valid_but_unencoded_catmap_features_fail_closed_to_audit_only(
         mutate, reason):
@@ -430,7 +774,7 @@ def test_multiple_site_types_are_audit_only_without_site_totals(tmp_path):
 
     assert bundle["contract_ready"] is False
     assert bundle["export_ready"] is False
-    assert "exactly one site type" in bundle["adapter_issues"][0]["message"]
+    assert "exactly one independent site type" in bundle["adapter_issues"][0]["message"]
     assert set(bundle["files"]) == {
         "kinetics-audit.json", "catmap-adapter-audit.json",
     }
@@ -471,6 +815,14 @@ def test_export_selection_pointer_tampering_fails_closed(tmp_path):
         catmap_adapter.load_confirmed_manifest(tmp_path, network["input_sha256"])
 
 
+def test_missing_confirmed_tree_has_stable_manifest_unavailable_error(tmp_path):
+    with pytest.raises(catmap_adapter.CatmapAdapterError) as captured:
+        catmap_adapter.load_confirmed_manifest(tmp_path, "a" * 64)
+
+    assert str(captured.value) == (
+        "confirmed CatMAP export manifest is unavailable")
+
+
 def test_export_rejects_symlinked_directory_chain(tmp_path):
     project = tmp_path / "project"
     outside = tmp_path / "outside"
@@ -492,6 +844,24 @@ def test_export_rejects_symlinked_directory_chain(tmp_path):
             expected_selected_export_sha256=None, confirmed=True,
             tool_path=tool, tool_version="0.4.0")
     assert not any(outside.iterdir())
+
+
+def test_export_rejects_authored_project_root_symlink_before_writing(tmp_path):
+    project = tmp_path / "project"
+    alias = tmp_path / "project-alias"
+    project.mkdir()
+    try:
+        alias.symlink_to(project, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    network = catmap_ready_network()
+    tool = _tool(tmp_path)
+    preview = _preview(network, tool)
+
+    with pytest.raises(catmap_adapter.CatmapAdapterError, match="project root"):
+        _confirm(network, alias, preview, tool)
+
+    assert not (project / ".vcstudio").exists()
 
 
 def test_confirmed_export_rejects_directory_swap_to_external_symlink(tmp_path):

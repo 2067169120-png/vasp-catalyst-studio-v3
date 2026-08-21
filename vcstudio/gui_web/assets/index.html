@@ -2216,6 +2216,150 @@ try{var _t=localStorage.getItem('vcs.theme');if(['classic','paper','deep'].index
           <p class="aw-operation" id="aw-kinetics-adapter-status" aria-live="polite"
             data-i18n="analysis.kinetic.adapter_waiting">等待服务端输入审计。</p>
         </section>
+        <section class="aw-authoring-workspaces" id="aw-authoring-workspaces"
+          aria-labelledby="aw-authoring-title">
+          <header class="aw-authoring-heading">
+            <div>
+              <h3 id="aw-authoring-title" data-i18n="analysis.authoring.title">催化与动力学 Authoring</h3>
+              <p data-i18n="analysis.authoring.boundary">预览只冻结当前显式选择；不会授权执行，也不会补齐缺失科学事实。</p>
+            </div>
+            <span class="aw-authoring-epoch" id="aw-authoring-epoch" aria-hidden="true">—</span>
+          </header>
+          <div class="aw-authoring-grid">
+            <article class="aw-authoring-card" id="aw-network-authoring"
+              aria-labelledby="aw-network-authoring-title" aria-busy="false">
+              <header>
+                <div>
+                  <h4 id="aw-network-authoring-title" data-i18n="analysis.authoring.network.title">Active Reaction Network</h4>
+                  <p data-i18n="analysis.authoring.network.help">只从服务端候选中明确选择一个网络；不会按名称、顺序或唯一性猜测。</p>
+                </div>
+                <output class="aw-authoring-status" id="aw-network-authoring-status"
+                  data-status="missing" aria-live="polite" aria-atomic="true"
+                  tabindex="-1">missing</output>
+              </header>
+              <form id="aw-network-authoring-form" novalidate>
+                <fieldset id="aw-network-authoring-fields">
+                  <legend data-i18n="analysis.authoring.network.selection">显式网络选择</legend>
+                  <div class="aw-field aw-field-wide">
+                    <label for="aw-network-candidate" data-i18n="analysis.authoring.network.candidate">ReactionNetwork 候选</label>
+                    <select class="ipt" id="aw-network-candidate"
+                      aria-describedby="aw-network-candidate-help" required>
+                      <option value="" data-i18n="analysis.authoring.choose">请选择…</option>
+                    </select>
+                    <small id="aw-network-candidate-help" data-i18n="analysis.authoring.network.candidate_help">候选、head revision 与 closure 均来自同一个服务端 authority snapshot。</small>
+                  </div>
+                  <dl class="aw-authoring-summary" aria-label="Active network authority summary"
+                    data-i18n-aria-label="analysis.authoring.network.summary_aria">
+                    <div><dt data-i18n="analysis.authoring.network.active">当前 active network</dt><dd id="aw-network-active">—</dd></div>
+                    <div><dt data-i18n="analysis.authoring.network.authority">Domain authority</dt><dd id="aw-network-authority">—</dd></div>
+                    <div><dt data-i18n="analysis.authoring.network.generation">Generation</dt><dd id="aw-network-generation">—</dd></div>
+                    <div><dt data-i18n="analysis.authoring.network.closure">Closure</dt><dd id="aw-network-closure">—</dd></div>
+                  </dl>
+                  <div class="aw-authoring-gaps" aria-labelledby="aw-network-gaps-title">
+                    <strong id="aw-network-gaps-title" data-i18n="analysis.authoring.network.gaps">Closure / evidence gaps</strong>
+                    <ul id="aw-network-gaps"><li data-i18n="analysis.authoring.not_loaded">尚未读取。</li></ul>
+                  </div>
+                </fieldset>
+                <label class="aw-authoring-ack" for="aw-network-ack">
+                  <input id="aw-network-ack" type="checkbox">
+                  <span data-i18n="analysis.authoring.network.ack">我确认当前预览绑定的 project、network、authority 与 closure 正是我要提交的选择。</span>
+                </label>
+                <div class="actions aw-authoring-actions">
+                  <button class="btn" id="aw-network-preview" type="button"
+                    data-i18n="analysis.authoring.preview">生成只读预览</button>
+                  <button class="btn primary" id="aw-network-confirm" type="button"
+                    data-i18n="analysis.authoring.network.confirm" disabled>明确确认 active network</button>
+                </div>
+                <p class="aw-authoring-operation" id="aw-network-operation" role="status"
+                  aria-live="polite" aria-atomic="true" tabindex="-1"
+                  data-i18n="analysis.authoring.waiting">等待显式选择。</p>
+              </form>
+            </article>
+
+            <article class="aw-authoring-card" id="aw-model-authoring"
+              aria-labelledby="aw-model-authoring-title" aria-busy="false">
+              <header>
+                <div>
+                  <h4 id="aw-model-authoring-title" data-i18n="analysis.authoring.model.title">Kinetics Model Spec</h4>
+                  <p data-i18n="analysis.authoring.model.help">所有 rate-law、assumption、reservoir、prefactor 与 site-total 选择必须显式填写；前端不提供科学默认值。</p>
+                </div>
+                <output class="aw-authoring-status" id="aw-model-authoring-status"
+                  data-status="missing" aria-live="polite" aria-atomic="true"
+                  tabindex="-1">missing</output>
+              </header>
+              <form id="aw-model-authoring-form" novalidate>
+                <fieldset class="aw-model-fields" id="aw-model-identity-fields">
+                  <legend data-i18n="analysis.authoring.model.identity">Spec identity</legend>
+                  <div class="aw-field">
+                    <label for="aw-model-spec-id" data-i18n="analysis.authoring.model.spec_id">Opaque spec ID</label>
+                    <input class="ipt" id="aw-model-spec-id" type="text" maxlength="160"
+                      autocomplete="off" spellcheck="false" required
+                      data-i18n-ph="analysis.authoring.model.spec_id_placeholder"
+                      placeholder="输入新的或现有 spec ID">
+                  </div>
+                  <div class="aw-field">
+                    <label for="aw-model-mode" data-i18n="analysis.authoring.model.mode">Revision mode</label>
+                    <select class="ipt" id="aw-model-mode" required>
+                      <option value="" data-i18n="analysis.authoring.choose">请选择…</option>
+                      <option value="create" data-i18n="analysis.authoring.model.create">Create</option>
+                      <option value="advance" data-i18n="analysis.authoring.model.advance">Advance</option>
+                    </select>
+                  </div>
+                </fieldset>
+                <fieldset class="aw-model-fields" id="aw-model-rate-fields">
+                  <legend data-i18n="analysis.authoring.model.rate_policy">Rate-law policy（逐项显式选择）</legend>
+                  <div class="aw-model-choice-grid" id="aw-model-rate-policy"></div>
+                </fieldset>
+                <fieldset class="aw-model-fields" id="aw-model-assumption-fields">
+                  <legend data-i18n="analysis.authoring.model.assumptions">Scientific assumptions</legend>
+                  <div class="aw-model-choice-grid" id="aw-model-assumptions"></div>
+                </fieldset>
+                <fieldset class="aw-model-fields">
+                  <legend data-i18n="analysis.authoring.model.reservoirs">Feed reservoirs</legend>
+                  <div id="aw-model-reservoirs" class="aw-model-rows"></div>
+                </fieldset>
+                <fieldset class="aw-model-fields">
+                  <legend data-i18n="analysis.authoring.model.targets">Target products</legend>
+                  <div id="aw-model-targets" class="aw-model-checks"></div>
+                </fieldset>
+                <fieldset class="aw-model-fields">
+                  <legend data-i18n="analysis.authoring.model.steps">Elementary-step choices</legend>
+                  <div id="aw-model-steps" class="aw-model-rows"></div>
+                </fieldset>
+                <fieldset class="aw-model-fields">
+                  <legend data-i18n="analysis.authoring.model.sites">Site population totals</legend>
+                  <div id="aw-model-sites" class="aw-model-rows"></div>
+                </fieldset>
+                <fieldset class="aw-model-fields">
+                  <legend data-i18n="analysis.authoring.model.saddles">Explicit saddle selection</legend>
+                  <div id="aw-model-saddles" class="aw-model-rows"></div>
+                </fieldset>
+                <div class="aw-model-readiness" aria-label="Model save and solver readiness"
+                  data-i18n-aria-label="analysis.authoring.model.readiness_aria">
+                  <p><span data-i18n="analysis.authoring.model.save_eligibility">保存资格</span><b id="aw-model-save-status" data-status="missing">missing</b></p>
+                  <p><span data-i18n="analysis.authoring.model.solver_readiness">Solver readiness</span><b id="aw-model-solver-status" data-status="missing">missing</b></p>
+                </div>
+                <div class="aw-authoring-gaps" aria-labelledby="aw-model-issues-title">
+                  <strong id="aw-model-issues-title" data-i18n="analysis.authoring.model.issues">Validation issues / prerequisites</strong>
+                  <ul id="aw-model-issues"><li data-i18n="analysis.authoring.not_loaded">尚未读取。</li></ul>
+                </div>
+                <label class="aw-authoring-ack" for="aw-model-ack">
+                  <input id="aw-model-ack" type="checkbox">
+                  <span data-i18n="analysis.authoring.model.ack">我确认预览中的显式科学选择与 server receipt 正是我要保存并选择的 spec；solver-ready 是独立结论。</span>
+                </label>
+                <div class="actions aw-authoring-actions">
+                  <button class="btn" id="aw-model-preview" type="button"
+                    data-i18n="analysis.authoring.preview">生成只读预览</button>
+                  <button class="btn primary" id="aw-model-confirm" type="button"
+                    data-i18n="analysis.authoring.model.confirm" disabled>明确确认并保存 spec</button>
+                </div>
+                <p class="aw-authoring-operation" id="aw-model-operation" role="status"
+                  aria-live="polite" aria-atomic="true" tabindex="-1"
+                  data-i18n="analysis.authoring.waiting">等待显式选择。</p>
+              </form>
+            </article>
+          </div>
+        </section>
         <div class="aw-denominator" id="aw-denominator" aria-label="分析分母"></div>
         <div class="aw-table-scroll" id="aw-table-scroll" tabindex="0" aria-label="分析结果表，较宽时可局部滚动"><div class="aw-empty">尚未生成分析视图。</div></div>
         <section class="aw-chartless" aria-labelledby="aw-sensitivity-title">

@@ -24,9 +24,9 @@ _API_SINGLETON = None
 def _default_api_factory():
     # Deliberately local: importing report_bridge from a Tk tab must not import
     # gui_web.api or its optional report stack on the UI thread.
-    from vcstudio.gui_web.api import Api
+    from vcstudio.gui_web.composition import create_api
 
-    return Api()
+    return create_api()
 
 
 _api_factory = _default_api_factory

@@ -5,6 +5,20 @@ import copy
 import pytest
 
 from vcstudio.project import reaction_workbench as rw
+from vcstudio.project.catalysis_contracts import (
+    AdsorbateState,
+    CatalystSurface,
+    ConditionSet,
+    DomainEnvelope,
+    ElementaryStep,
+    EvidenceRef,
+    ExactRational,
+    FluidStandardState,
+    FluidState,
+    MethodFingerprint,
+    ReactionNetwork,
+    ReactionParticipant,
+)
 
 
 H = {
@@ -37,7 +51,7 @@ def _method():
     }
 
 
-def _envelope(object_type, object_id, payload):
+def _legacy_envelope(object_type, object_id, payload):
     return {
         "schema": "vcstudio.catalysis-domain-envelope/v1",
         "object_type": object_type, "object_id": object_id,
@@ -51,84 +65,116 @@ def _rehash(envelope):
     envelope["semantic_sha256"] = rw.semantic_sha256(envelope["payload"])
 
 
+def _rehash_step(source):
+    step = source["steps"][0]
+    _rehash(step)
+    saddle = source["bindings"]["step-1"]["saddle"]
+    saddle["step_semantic_sha256"] = step["semantic_sha256"]
+    saddle["transition_side_sha256"] = rw.semantic_sha256(
+        step["payload"]["transition_state"])
+
+
+def _set_domain_origin(envelope, origin):
+    envelope["payload"]["provenance"] = origin
+    for ref in envelope["payload"]["evidence_refs"]:
+        ref["origin"] = origin
+    for ref in envelope["payload"]["method_fingerprint"]["evidence_refs"]:
+        ref["origin"] = origin
+    _rehash(envelope)
+
+
+def _domain_refs(opaque_id):
+    return (EvidenceRef(
+        ref_type="calculation_result", opaque_id=opaque_id,
+        origin="observed", revision_id="revision-1",
+    ),)
+
+
+def _domain_method():
+    return MethodFingerprint(
+        method_id="pbe-d3", scope="periodic-dft", sha256=H["method"],
+        evidence_refs=(EvidenceRef(
+            ref_type="method_record", opaque_id="method-1",
+            origin="observed", revision_id="revision-1",
+        ),),
+    )
+
+
+def _domain_common(opaque_id):
+    return {
+        "provenance": "observed", "evidence_refs": _domain_refs(opaque_id),
+        "method_fingerprint": _domain_method(), "object_revision_id": "revision-1",
+    }
+
+
 def _surface():
-    return _envelope("CatalystSurface", "surface-1", {
-        "schema": "vcstudio.catalyst-surface/v1", "model_version": "1.0.0",
-        "surface_id": "surface-1", "composition": "Pt", "miller_indices": [1, 1, 1],
-        "termination_id": None, "geometric_site_ids": ["top"],
-        "provenance": "observed", "evidence_refs": _evidence("surface-evidence"),
-        "method_fingerprint": _method(),
-    })
+    return DomainEnvelope.wrap(CatalystSurface(
+        surface_id="surface-1", composition="Pt", miller_indices=(1, 1, 1),
+        termination_id=None, geometric_site_ids=("top",),
+        **_domain_common("surface-evidence"),
+    )).to_dict()
 
 
 def _state(state_id, formula):
-    return _envelope("AdsorbateState", state_id, {
-        "schema": "vcstudio.adsorbate-state/v1", "model_version": "1.0.0",
-        "state_id": state_id, "surface_id": "surface-1",
-        "adsorbate_id": f"ads-{state_id}", "chemical_formula": formula,
-        "geometric_site_id": "top",
-        "site_occupancy": [{
-            "site_id": "top", "count": {"numerator": 1, "denominator": 1},
-        }],
-        "charge": 0, "multiplicity": 1,
-        "provenance": "observed", "evidence_refs": _evidence(f"ev-{state_id}"),
-        "method_fingerprint": _method(),
-    })
+    return DomainEnvelope.wrap(AdsorbateState(
+        state_id=state_id, surface_id="surface-1",
+        adsorbate_id=f"ads-{state_id}", chemical_formula=formula,
+        geometric_site_id="top", charge=0, multiplicity=1,
+        **_domain_common(f"ev-{state_id}"),
+    )).to_dict()
+
+
+def _fluid_state(state_id, formula="H2", *, phase="gas", charge=0):
+    standard_state = (
+        FluidStandardState(
+            phase=phase, kind="1-bar", value=100000.0, unit="Pa")
+        if phase == "gas" else FluidStandardState(
+            phase=phase, kind="1-molar", value=1.0, unit="mol/L"))
+    return DomainEnvelope.wrap(FluidState(
+        state_id=state_id, phase=phase, chemical_formula=formula,
+        charge=charge, multiplicity=1, standard_state=standard_state,
+        **_domain_common(f"ev-{state_id}"),
+    )).to_dict()
 
 
 def _transition_state():
-    return _envelope("TransitionState", "state-ts", {
-        "schema": "vcstudio.transition-state/v1", "model_version": "1.0.0",
-        "transition_state_id": "state-ts", "surface_id": "surface-1",
-        "chemical_formula": "H", "charge": 0, "multiplicity": 1,
-        "site_occupancy": [{
-            "site_id": "top", "count": {"numerator": 1, "denominator": 1},
-        }],
-        "provenance": "observed",
-        "evidence_refs": _evidence("ev-state-ts"),
-        "method_fingerprint": _method(),
-    })
+    return _state("state-ts", "H")
 
 
 def _condition():
-    return _envelope("ConditionSet", "condition-1", {
-        "schema": "vcstudio.condition-set/v1", "model_version": "1.0.0",
-        "condition_set_id": "condition-1", "temperature_k": 300.0,
-        "pressure_pa": 100000.0, "ph": 0.0, "electrode_potential_v": 0.0,
-        "coverage": 0.25,
-        "provenance": "observed", "evidence_refs": _evidence("condition-evidence"),
-        "method_fingerprint": _method(),
-    })
+    return DomainEnvelope.wrap(ConditionSet(
+        condition_set_id="condition-1", temperature_k=300.0,
+        pressure_pa=100000.0, ph=0.0, electrode_potential_v=0.0,
+        **_domain_common("condition-evidence"),
+    )).to_dict()
+
+
+def _participant(state_id, coefficient=1, *, phase="adsorbed", charge=0, site="top"):
+    return ReactionParticipant(
+        state_id=state_id, coefficient=coefficient, phase=phase, charge=charge,
+        site_stoichiometry=(
+            {} if site is None else {site: ExactRational(1, 1)}),
+    )
 
 
 def _step():
-    return _envelope("ElementaryStep", "step-1", {
-        "schema": "vcstudio.elementary-step/v1", "model_version": "1.0.0",
-        "step_id": "step-1",
-        "reactants": [{
-            "state_id": "state-r",
-            "coefficient": {"numerator": 1, "denominator": 1},
-        }],
-        "products": [{
-            "state_id": "state-p",
-            "coefficient": {"numerator": 1, "denominator": 1},
-        }],
-        "transition_state_id": "state-ts",
-        "condition_set_id": "condition-1", "reversible": True,
-        "provenance": "observed", "evidence_refs": _evidence("step-evidence"),
-        "method_fingerprint": _method(),
-    })
+    return DomainEnvelope.wrap(ElementaryStep(
+        step_id="step-1",
+        reactants=(_participant("state-r"),),
+        transition_state=(_participant("state-ts"),),
+        products=(_participant("state-p"),),
+        condition_set_id="condition-1", reversible=True,
+        **_domain_common("step-evidence"),
+    )).to_dict()
 
 
 def _network():
-    return _envelope("ReactionNetwork", "network-1", {
-        "schema": "vcstudio.reaction-network/v1", "model_version": "1.0.0",
-        "network_id": "network-1", "surface_ids": ["surface-1"],
-        "state_ids": ["state-r", "state-p"],
-        "step_ids": ["step-1"], "condition_set_ids": ["condition-1"],
-        "provenance": "observed", "evidence_refs": _evidence("network-evidence"),
-        "method_fingerprint": _method(),
-    })
+    return DomainEnvelope.wrap(ReactionNetwork(
+        network_id="network-1", surface_ids=("surface-1",),
+        state_ids=("state-r", "state-ts", "state-p"), step_ids=("step-1",),
+        condition_set_ids=("condition-1",),
+        **_domain_common("network-evidence"),
+    )).to_dict()
 
 
 def _term(value, model):
@@ -246,8 +292,20 @@ def projection():
             "origin": "observed",
         }
     bindings["state-r"]["thermochemistry"] = _thermo(-10.0)
-    bindings["state-ts"]["thermochemistry"] = _thermo(-9.0, ts=True)
     bindings["state-p"]["thermochemistry"] = _thermo(-10.5)
+    step = _step()
+    network = _network()
+    bindings["step-1"]["saddle"] = {
+        "step_semantic_sha256": step["semantic_sha256"],
+        "transition_side_sha256": rw.semantic_sha256(
+            step["payload"]["transition_state"]),
+        "label": "TS*", "structure_sha256": H["structure"],
+        "evidence_sha256": H["evidence"],
+        "scientific_status": "machine_pass", "origin": "observed",
+        "thermochemistry": _thermo(-9.0, ts=True),
+    }
+
+
     bindings["step-1"]["edge_evidence"] = {
         "schema": rw.EDGE_EVIDENCE_SCHEMA,
         "method_sha256": H["method"],
@@ -278,10 +336,19 @@ def projection():
     }
     return {
         "schema": rw.PROJECTION_SCHEMA, "project_id": "project-1",
-        "network": _network(), "surfaces": [_surface()],
-        "states": [_state("state-r", "H"), _state("state-p", "H")],
-        "transition_states": [_transition_state()],
-        "steps": [_step()], "conditions": [_condition()], "bindings": bindings,
+        "authority": {
+            "domain_authority_id": "1" * 32,
+            "domain_generation": 7,
+            "domain_snapshot_sha256": "d" * 64,
+            "network_revision_id": network["object_revision_id"],
+            "network_semantic_sha256": network["semantic_sha256"],
+        },
+        "network": network, "surfaces": [_surface()],
+        "states": [
+            _state("state-r", "H"), _state("state-p", "H"),
+            _transition_state(),
+        ],
+        "steps": [step], "conditions": [_condition()], "bindings": bindings,
         "applicability": {
             "temperature_k": {
                 "schema": rw.APPLICABILITY_RANGE_SCHEMA,
@@ -307,6 +374,111 @@ def projection():
     }
 
 
+def _mixed_fluid_projection(*, phase="gas"):
+    source = projection()
+    states = [
+        _fluid_state("fluid-r", phase=phase),
+        _state("vacancy-r", "*"),
+        _fluid_state("fluid-ts", phase=phase),
+        _state("vacancy-ts", "*"),
+        _state("ads-h2", "H2"),
+    ]
+    step = DomainEnvelope.wrap(ElementaryStep(
+        step_id="step-1",
+        reactants=(
+            _participant("fluid-r", phase=phase, site=None),
+            _participant("vacancy-r"),
+        ),
+        transition_state=(
+            _participant("fluid-ts", phase=phase, site=None),
+            _participant("vacancy-ts"),
+        ),
+        products=(_participant("ads-h2"),),
+        condition_set_id="condition-1", reversible=True,
+        **_domain_common("step-evidence"),
+    )).to_dict()
+    network = DomainEnvelope.wrap(ReactionNetwork(
+        network_id="network-1", surface_ids=("surface-1",),
+        state_ids=tuple(item["object_id"] for item in states),
+        step_ids=("step-1",), condition_set_ids=("condition-1",),
+        **_domain_common("network-evidence"),
+    )).to_dict()
+    source["states"] = states
+    source["steps"] = [step]
+    source["network"] = network
+    source["authority"].update({
+        "network_revision_id": network["object_revision_id"],
+        "network_semantic_sha256": network["semantic_sha256"],
+    })
+    source["bindings"] = {
+        object_id: {
+            "label": object_id, "structure_sha256": H["structure"],
+            "evidence_sha256": H["evidence"],
+            "scientific_status": "machine_pass", "origin": "observed",
+        }
+        for object_id in (
+            "network-1", "surface-1", "condition-1", "step-1",
+            *(item["object_id"] for item in states),
+        )
+    }
+    source["bindings"]["step-1"]["saddle"] = {
+        "step_semantic_sha256": step["semantic_sha256"],
+        "transition_side_sha256": rw.semantic_sha256(
+            step["payload"]["transition_state"]),
+        "label": "mixed saddle", "structure_sha256": H["structure"],
+        "evidence_sha256": H["evidence"],
+        "scientific_status": "machine_pass", "origin": "observed",
+    }
+    return source
+
+
+def _all_thermochemistry_bindings(source):
+    result = []
+    for binding in source["bindings"].values():
+        if isinstance(binding.get("thermochemistry"), dict):
+            result.append(binding["thermochemistry"])
+        saddle = binding.get("saddle")
+        if isinstance(saddle, dict) and isinstance(saddle.get("thermochemistry"), dict):
+            result.append(saddle["thermochemistry"])
+    return result
+
+
+def _legacy_v1_projection():
+    source = projection()
+    source["schema"] = rw.LEGACY_PROJECTION_SCHEMA
+    for key in ("surfaces", "states", "steps", "conditions"):
+        migrated = []
+        for envelope in source[key]:
+            payload = copy.deepcopy(envelope["payload"])
+            identity_field = {
+                "CatalystSurface": "surface_id",
+                "AdsorbateState": "state_id",
+                "ElementaryStep": "step_id",
+                "ConditionSet": "condition_set_id",
+            }[envelope["object_type"]]
+            migrated.append(_legacy_envelope(
+                envelope["object_type"], payload[identity_field], payload))
+        source[key] = migrated
+    source["network"] = _legacy_envelope(
+        "ReactionNetwork", "network-1", copy.deepcopy(
+            source["network"]["payload"]))
+    source["transition_states"] = []
+    return source
+
+
+def test_real_domain_envelope_wrap_dtos_are_the_native_end_to_end_input():
+    source = projection()
+    envelopes = [
+        source["network"], *source["surfaces"], *source["states"],
+        *source["steps"], *source["conditions"],
+    ]
+    parsed = [DomainEnvelope.from_dict(item) for item in envelopes]
+    assert all(item.schema == rw.DOMAIN_ENVELOPE_SCHEMA for item in parsed)
+    step = ElementaryStep.from_dict(source["steps"][0]["payload"])
+    assert step.schema == "vcstudio.elementary-step/v3"
+    assert step.transition_state[0].phase == "adsorbed"
+
+
 def test_reaction_graph_ledger_condition_and_report_closed_loop():
     view = rw.build_reaction_workbench_view(
         projection(), project_id="project-1", precision=4,
@@ -325,7 +497,10 @@ def test_reaction_graph_ledger_condition_and_report_closed_loop():
     assert view["graph"]["edges"][0]["thermochemistry"]["activation_delta_g_eV"] == 1.0
     assert view["graph"]["edges"][0]["thermochemistry"][
         "observed_activation_delta_e_eV"] == 0.8
-    ts = next(row for row in view["ledger"]["rows"] if row["entity_id"] == "state-ts")
+    ts = next(
+        row for row in view["ledger"]["rows"]
+        if row["entity_type"] == "transition_state")
+    assert ts["entity_id"].startswith("saddle-")
     assert ts["frequency_qualification"]["kinetic_qualification"] == "frequency_mode_supported"
     assert ts["low_frequency"]["original_frequencies_cm1"] == [18.0, 42.0, 120.0]
     assert ts["low_frequency"]["rule"] == "quasi_harmonic"
@@ -337,12 +512,15 @@ def test_reaction_graph_ledger_condition_and_report_closed_loop():
     assert len(view["report_binding"]["tables"]) == 2
     assert view["report_binding"]["figures"][0]["kind"] == "reaction_map"
     assert view["frozen_network"]["schema"] == rw.FROZEN_NETWORK_SCHEMA
+    assert view["frozen_network"]["version"] == "2"
     assert view["frozen_network"]["microkinetics_ready"] is True
     frozen_edge = view["frozen_network"]["edges"][0]
     assert frozen_edge["stoichiometry"] == {
         "state-r": {"numerator": -1, "denominator": 1},
         "state-p": {"numerator": 1, "denominator": 1},
     }
+    assert frozen_edge["transition_state"] == _step()["payload"]["transition_state"]
+    assert frozen_edge["evidence_refs"]
     assert frozen_edge["reaction_delta_g_eV"] is not None
     assert frozen_edge["activation_delta_g_eV"] is not None
 
@@ -363,9 +541,14 @@ def test_missing_edge_and_thermochemistry_remain_explicit():
     source["network"]["payload"]["step_ids"].append("step-missing")
     source["network"]["semantic_sha256"] = rw.semantic_sha256(
         source["network"]["payload"])
+    source["authority"]["network_semantic_sha256"] = source["network"][
+        "semantic_sha256"]
+    with pytest.raises(rw.ReactionWorkbenchError, match="step closure"):
+        rw.build_reaction_workbench_view(source, project_id="project-1")
+
+    source = projection()
     source["bindings"]["state-p"].pop("thermochemistry")
     view = rw.build_reaction_workbench_view(source, project_id="project-1")
-    assert any(item["edge_id"] == "step-missing" for item in view["graph"]["missing_edges"])
     product = next(row for row in view["ledger"]["rows"] if row["entity_id"] == "state-p")
     assert product["artifact_status"] == "unavailable"
     assert product["final_delta_g_eV"] is None
@@ -392,7 +575,8 @@ def test_incompatible_reference_or_standard_state_is_never_mixed():
 
 def test_invalid_ts_frequency_keeps_barrier_unavailable_without_status_promotion():
     source = projection()
-    evidence = source["bindings"]["state-ts"]["thermochemistry"]["frequency_evidence"]
+    evidence = source["bindings"]["step-1"]["saddle"]["thermochemistry"][
+        "frequency_evidence"]
     evidence["imaginary_frequencies_cm1"] = [-420.0, -350.0]
     view = rw.build_reaction_workbench_view(source, project_id="project-1")
     edge_thermo = view["graph"]["edges"][0]["thermochemistry"]
@@ -435,16 +619,16 @@ def test_temperature_model_and_condition_mixing_is_blocked():
     assert any("temperature_k" in item for item in thermo["missing"])
 
 
-def test_condition_set_coverage_must_match_thermochemistry():
+def test_workbench_coverage_extension_must_match_across_thermochemistry():
     source = projection()
-    condition = source["conditions"][0]
-    condition["payload"]["coverage"] = 0.75
-    condition["semantic_sha256"] = rw.semantic_sha256(condition["payload"])
+    thermo_binding = source["bindings"]["state-p"]["thermochemistry"]
+    thermo_binding["coverage"] = 0.75
+    thermo_binding["condition_response"]["base_conditions"]["coverage"] = 0.75
     view = rw.build_reaction_workbench_view(source, project_id="project-1")
     thermo = view["graph"]["edges"][0]["thermochemistry"]
     assert thermo["thermodynamic_status"] == "unavailable"
     assert thermo["reaction_delta_g_eV"] is None
-    assert any("coverage" in item for item in thermo["missing"])
+    assert any("incompatible_method" in item for item in thermo["missing"])
     assert view["frozen_network"]["readiness"] == "blocked"
     assert view["frozen_network"]["edges"][0]["reaction_delta_g_eV"] is None
 
@@ -462,7 +646,7 @@ def test_term_models_and_typed_model_roles_cannot_be_empty_shells():
 def test_original_signed_imaginary_frequencies_and_treatment_hash_are_retained():
     view = rw.build_reaction_workbench_view(projection(), project_id="project-1")
     row = next(item for item in view["ledger"]["rows"]
-               if item["entity_id"] == "state-ts")
+               if item["entity_type"] == "transition_state")
     frequency = row["frequency_qualification"]
     assert frequency["original_imaginary_frequencies_cm1"] == [-420.0, -12.0]
     assert frequency["imaginary_magnitudes_cm1"] == [420.0, 12.0]
@@ -472,10 +656,8 @@ def test_original_signed_imaginary_frequencies_and_treatment_hash_are_retained()
 
 def test_declared_low_frequency_model_requires_matching_treatment_evidence():
     source = projection()
-    for binding in source["bindings"].values():
-        thermo = binding.get("thermochemistry")
-        if thermo:
-            thermo["low_frequency"] = {}
+    for thermo in _all_thermochemistry_bindings(source):
+        thermo["low_frequency"] = {}
     view = rw.build_reaction_workbench_view(source, project_id="project-1")
     assert all(row["artifact_status"] == "unavailable"
                for row in view["ledger"]["rows"])
@@ -527,10 +709,8 @@ def test_missing_applicability_and_missing_joint_response_are_unavailable():
         missing_range["condition_revision"]["outside_applicability"])
 
     source = projection()
-    for binding in source["bindings"].values():
-        thermo = binding.get("thermochemistry")
-        if thermo:
-            thermo["condition_response"].pop("joint_model")
+    for thermo in _all_thermochemistry_bindings(source):
+        thermo["condition_response"].pop("joint_model")
     missing_joint = rw.build_reaction_workbench_view(
         source, project_id="project-1",
         conditions={"ph": 1.0, "coverage": 0.5})
@@ -541,14 +721,13 @@ def test_missing_applicability_and_missing_joint_response_are_unavailable():
 
 def test_exact_rational_stoichiometry_and_conservation_are_frozen():
     source = projection()
-    reactant = source["states"][0]
-    reactant["payload"]["chemical_formula"] = "H2"
-    reactant["payload"]["site_occupancy"][0]["count"] = {
-        "numerator": 2, "denominator": 1}
-    _rehash(reactant)
-    source["steps"][0]["payload"]["reactants"][0]["coefficient"] = {
-        "numerator": 1, "denominator": 2}
-    _rehash(source["steps"][0])
+    for state in source["states"]:
+        state["payload"]["chemical_formula"] = "H2"
+        _rehash(state)
+    step = source["steps"][0]["payload"]
+    for side in ("reactants", "transition_state", "products"):
+        step[side][0]["coefficient"] = {"numerator": 1, "denominator": 2}
+    _rehash_step(source)
 
     view = rw.build_reaction_workbench_view(source, project_id="project-1")
     edge = view["graph"]["edges"][0]
@@ -559,12 +738,126 @@ def test_exact_rational_stoichiometry_and_conservation_are_frozen():
         "coefficient"] == {"numerator": 1, "denominator": 2}
 
 
+@pytest.mark.parametrize("phase", ["gas", "liquid", "aqueous"])
+def test_mixed_fluid_adsorbate_states_retain_type_authority_and_conservation(phase):
+    source = _mixed_fluid_projection(phase=phase)
+    view = rw.build_reaction_workbench_view(source, project_id="project-1")
+    edge = view["graph"]["edges"][0]
+    assert edge["conservation"]["status"] == "available"
+    assert all(
+        edge["conservation"][key]["status"] == "available"
+        for key in ("elemental", "charge", "surface_site_occupancy"))
+
+    fluid = next(
+        node for node in view["graph"]["nodes"]
+        if node["node_id"] == "fluid-r")
+    assert fluid["entity_type"] == "fluid_state"
+    assert fluid["object_type"] == "FluidState"
+    assert fluid["phase"] == phase
+    assert fluid["chemistry"]["standard_state"]["phase"] == phase
+
+    refs = edge["participant_evidence_refs"]
+    assert next(item for item in refs if item["object_id"] == "fluid-r")[
+        "object_type"] == "FluidState"
+    assert next(item for item in refs if item["object_id"] == "ads-h2")[
+        "object_type"] == "AdsorbateState"
+
+    frozen = view["frozen_network"]
+    assert frozen["schema"] == "vcstudio.frozen-reaction-network/v2"
+    assert frozen["version"] == "2"
+    assert frozen["domain_authority"] == {
+        "authority_id": "1" * 32, "generation": 7,
+        "snapshot_sha256": "d" * 64,
+    }
+    assert frozen["network_identity"] == {
+        "network_id": "network-1", "object_revision_id": "revision-1",
+        "semantic_sha256": source["network"]["semantic_sha256"],
+    }
+    catalog = {item["state_id"]: item for item in frozen["state_catalog"]}
+    assert catalog["fluid-r"]["object_type"] == "FluidState"
+    assert catalog["fluid-r"]["phase"] == phase
+    assert catalog["fluid-r"]["standard_state"]["phase"] == phase
+    assert catalog["ads-h2"]["object_type"] == "AdsorbateState"
+    assert catalog["ads-h2"]["site_stoichiometry"] == {
+        "top": {"numerator": 1, "denominator": 1}}
+
+
+@pytest.mark.parametrize(("mutation", "expected"), [
+    ("phase", "participant_fluid_phase_disagrees"),
+    ("site", "participant_fluid_site_stoichiometry_disagrees"),
+    ("charge", "participant_state_charge_disagrees"),
+])
+def test_fluid_participant_declarations_cannot_self_authorize(mutation, expected):
+    source = _mixed_fluid_projection()
+    participant = source["steps"][0]["payload"]["reactants"][0]
+    if mutation == "phase":
+        participant["phase"] = "aqueous"
+    elif mutation == "site":
+        participant["site_stoichiometry"] = {
+            "top": {"numerator": 1, "denominator": 1}}
+    else:
+        participant["charge"] = 1
+    _rehash_step(source)
+
+    view = rw.build_reaction_workbench_view(source, project_id="project-1")
+    conservation = view["graph"]["edges"][0]["conservation"]
+    assert conservation["status"] == "unavailable"
+    assert any(expected in item for item in conservation["missing"])
+    assert view["frozen_network"]["readiness"] == "blocked"
+
+
+def test_fluid_three_side_element_conservation_failure_is_exact_and_frozen_blocked():
+    source = _mixed_fluid_projection()
+    fluid_ts = next(
+        item for item in source["states"] if item["object_id"] == "fluid-ts")
+    fluid_ts["payload"]["chemical_formula"] = "He"
+    _rehash(fluid_ts)
+
+    view = rw.build_reaction_workbench_view(source, project_id="project-1")
+    conservation = view["graph"]["edges"][0]["conservation"]
+    assert conservation["status"] == "failed"
+    assert conservation["elemental"]["status"] == "failed"
+    assert conservation["charge"]["status"] == "available"
+    assert conservation["surface_site_occupancy"]["status"] == "available"
+    assert view["frozen_network"]["readiness"] == "blocked"
+
+
+def test_fluid_state_union_missing_wrong_type_and_cross_type_collision_fail_closed():
+    missing = _mixed_fluid_projection()
+    missing["states"] = [
+        item for item in missing["states"] if item["object_id"] != "fluid-r"]
+    with pytest.raises(rw.ReactionWorkbenchError, match="participant-state closure"):
+        rw.build_reaction_workbench_view(missing, project_id="project-1")
+
+    wrong_type = _mixed_fluid_projection()
+    wrong_type["states"][0] = _condition()
+    with pytest.raises(rw.ReactionWorkbenchError):
+        rw.build_reaction_workbench_view(wrong_type, project_id="project-1")
+
+    collision = _mixed_fluid_projection()
+    collision["states"].append(_state("fluid-r", "H2"))
+    with pytest.raises(rw.ReactionWorkbenchError, match="more than one authoritative state"):
+        rw.build_reaction_workbench_view(collision, project_id="project-1")
+
+
+def test_native_v2_projection_authority_is_required_and_network_bound():
+    missing = projection()
+    missing.pop("authority")
+    with pytest.raises(rw.ReactionWorkbenchError, match="requires authority identity facts"):
+        rw.build_reaction_workbench_view(missing, project_id="project-1")
+
+    stale = projection()
+    stale["authority"]["network_semantic_sha256"] = "f" * 64
+    with pytest.raises(rw.ReactionWorkbenchError, match="does not match"):
+        rw.build_reaction_workbench_view(stale, project_id="project-1")
+
+
 @pytest.mark.parametrize(("mutation", "expected"), [
     ("element", "elemental_conservation"),
     ("charge", "charge_conservation"),
-    ("site_occupancy", "surface_site_occupancy_conservation"),
-    ("site_membership", "site_membership:bridge"),
-    ("ts_site_occupancy", "transition_state_surface_site_occupancy"),
+    ("site_occupancy", "participant_state_site_stoichiometry_disagrees"),
+    ("site_membership", "surface_site_occupancy_conservation"),
+    ("ts_site_occupancy", "participant_state_site_stoichiometry_disagrees"),
 ])
 def test_failed_or_unknown_reaction_conservation_blocks_all_qualification(
     mutation, expected,
@@ -575,18 +868,23 @@ def test_failed_or_unknown_reaction_conservation_blocks_all_qualification(
         product["payload"]["chemical_formula"] = "He"
     elif mutation == "charge":
         product["payload"]["charge"] = 1
+        source["steps"][0]["payload"]["products"][0]["charge"] = 1
     elif mutation == "site_occupancy":
-        product["payload"]["site_occupancy"][0]["count"] = {
-            "numerator": 2, "denominator": 1}
+        source["steps"][0]["payload"]["products"][0]["site_stoichiometry"][
+            "top"] = {"numerator": 2, "denominator": 1}
     elif mutation == "site_membership":
-        product["payload"]["site_occupancy"][0]["site_id"] = "bridge"
+        source["surfaces"][0]["payload"]["geometric_site_ids"].append("bridge")
+        _rehash(source["surfaces"][0])
+        product["payload"]["geometric_site_id"] = "bridge"
+        participant = source["steps"][0]["payload"]["products"][0]
+        participant["site_stoichiometry"]["bridge"] = participant[
+            "site_stoichiometry"].pop("top")
     else:
-        transition_state = source["transition_states"][0]
-        transition_state["payload"]["site_occupancy"][0]["count"] = {
-            "numerator": 2, "denominator": 1}
-        _rehash(transition_state)
-    if mutation != "ts_site_occupancy":
-        _rehash(product)
+        source["steps"][0]["payload"]["transition_state"][0][
+            "site_stoichiometry"]["top"] = {"numerator": 2, "denominator": 1}
+    _rehash(product)
+    if mutation in {"charge", "site_occupancy", "site_membership", "ts_site_occupancy"}:
+        _rehash_step(source)
 
     view = rw.build_reaction_workbench_view(source, project_id="project-1")
     edge = view["graph"]["edges"][0]
@@ -603,8 +901,12 @@ def test_site_occupancy_conservation_is_resolved_by_surface_and_site_id():
     surface["payload"]["geometric_site_ids"].append("bridge")
     _rehash(surface)
     product = source["states"][1]
-    product["payload"]["site_occupancy"][0]["site_id"] = "bridge"
+    product["payload"]["geometric_site_id"] = "bridge"
     _rehash(product)
+    participant = source["steps"][0]["payload"]["products"][0]
+    participant["site_stoichiometry"]["bridge"] = participant[
+        "site_stoichiometry"].pop("top")
+    _rehash_step(source)
 
     view = rw.build_reaction_workbench_view(source, project_id="project-1")
     conservation = view["graph"]["edges"][0]["conservation"]
@@ -631,7 +933,7 @@ def test_ambiguous_reaction_participants_are_rejected(mutation):
         step["reactants"].append(copy.deepcopy(step["reactants"][0]))
     else:
         step["products"][0]["state_id"] = "state-r"
-    _rehash(source["steps"][0])
+    _rehash_step(source)
     with pytest.raises(rw.ReactionWorkbenchError, match="duplicate|both sides"):
         rw.build_reaction_workbench_view(source, project_id="project-1")
 
@@ -677,27 +979,27 @@ def test_normalized_standard_state_definition_is_in_compatibility_hash():
 
 def test_frequency_sign_convention_and_ts_bindings_are_strict():
     source = projection()
-    frequency = source["bindings"]["state-ts"]["thermochemistry"][
+    frequency = source["bindings"]["step-1"]["saddle"]["thermochemistry"][
         "frequency_evidence"]
     frequency["imaginary_frequencies_cm1"] = [420.0]
     with pytest.raises(rw.ReactionWorkbenchError, match="strictly negative"):
         rw.build_reaction_workbench_view(source, project_id="project-1")
 
     source = projection()
-    frequency = source["bindings"]["state-ts"]["thermochemistry"][
+    frequency = source["bindings"]["step-1"]["saddle"]["thermochemistry"][
         "frequency_evidence"]
     frequency["sign_convention"] = "positive_magnitude"
     frequency.pop("imaginary_frequencies_cm1")
     frequency["imaginary_frequency_magnitudes_cm1"] = [420.0, 12.0]
     supported = rw.build_reaction_workbench_view(source, project_id="project-1")
     ts = next(row for row in supported["ledger"]["rows"]
-              if row["entity_id"] == "state-ts")
+              if row["entity_type"] == "transition_state")
     assert ts["frequency_qualification"]["kinetic_qualification"] == (
         "frequency_mode_supported")
 
     for field in ("method_sha256", "structure_sha256"):
         source = projection()
-        source["bindings"]["state-ts"]["thermochemistry"][
+        source["bindings"]["step-1"]["saddle"]["thermochemistry"][
             "frequency_evidence"][field] = "f" * 64
         blocked = rw.build_reaction_workbench_view(source, project_id="project-1")
         assert blocked["graph"]["edges"][0]["thermochemistry"][
@@ -712,7 +1014,10 @@ def test_frequency_noise_threshold_is_server_fixed_not_data_selected(
     entity_id, frequencies,
 ):
     source = projection()
-    evidence = source["bindings"][entity_id]["thermochemistry"][
+    binding = (
+        source["bindings"]["step-1"]["saddle"]
+        if entity_id == "state-ts" else source["bindings"][entity_id])
+    evidence = binding["thermochemistry"][
         "frequency_evidence"]
     evidence["imaginary_frequencies_cm1"] = frequencies
     evidence["noise_threshold_cm1"] = 400.0
@@ -722,7 +1027,8 @@ def test_frequency_noise_threshold_is_server_fixed_not_data_selected(
     baseline = rw.build_reaction_workbench_view(
         projection(), project_id="project-1")
     row = next(item for item in baseline["ledger"]["rows"]
-               if item["entity_id"] == entity_id)
+               if (item["entity_type"] == "transition_state"
+                   if entity_id == "state-ts" else item["entity_id"] == entity_id))
     policy = row["frequency_qualification"]["threshold_policy"]
     assert policy["authority"] == "server_fixed_policy"
     assert policy["threshold_cm1"] == 50.0
@@ -836,8 +1142,7 @@ def test_low_pressure_condition_base_comparison_is_exact_after_normalization():
     condition = source["conditions"][0]
     condition["payload"]["pressure_pa"] = 1e-12
     _rehash(condition)
-    for object_id in ("state-r", "state-ts", "state-p"):
-        thermo = source["bindings"][object_id]["thermochemistry"]
+    for thermo in _all_thermochemistry_bindings(source):
         thermo["pressure_pa"] = 1e-12
         thermo["condition_set_sha256"] = condition["semantic_sha256"]
         thermo["condition_response"]["base_conditions"]["pressure_pa"] = 1e-12
@@ -862,8 +1167,7 @@ def test_condition_response_base_must_be_inside_evidence_applicability():
     condition = source["conditions"][0]
     condition["payload"]["temperature_k"] = 600.0
     _rehash(condition)
-    for object_id in ("state-r", "state-ts", "state-p"):
-        thermo = source["bindings"][object_id]["thermochemistry"]
+    for thermo in _all_thermochemistry_bindings(source):
         thermo["temperature_k"] = 600.0
         thermo["condition_set_sha256"] = condition["semantic_sha256"]
         thermo["condition_response"]["base_conditions"]["temperature_k"] = 600.0
@@ -888,9 +1192,8 @@ def test_condition_derivation_provenance_caps_status_and_readiness(
         source["applicability"]["temperature_k"]["origin"] = origin
         conditions = {"temperature_k": 301.0}
     else:
-        for object_id in ("state-r", "state-ts", "state-p"):
-            response = source["bindings"][object_id]["thermochemistry"][
-                "condition_response"]
+        for thermo in _all_thermochemistry_bindings(source):
+            response = thermo["condition_response"]
             if target == "parameter":
                 response["temperature_k"]["origin"] = origin
             else:
@@ -915,12 +1218,13 @@ def test_condition_dependency_provenance_caps_base_revision_without_a_request(
     source = projection()
     for binding in source["bindings"].values():
         binding["scientific_status"] = "verified"
+        if isinstance(binding.get("saddle"), dict):
+            binding["saddle"]["scientific_status"] = "verified"
     if target == "applicability":
         source["applicability"]["temperature_k"]["origin"] = "inferred"
     else:
-        for object_id in ("state-r", "state-ts", "state-p"):
-            source["bindings"][object_id]["thermochemistry"][
-                "condition_response"]["temperature_k"]["origin"] = "imported"
+        for thermo in _all_thermochemistry_bindings(source):
+            thermo["condition_response"]["temperature_k"]["origin"] = "imported"
 
     view = rw.build_reaction_workbench_view(source, project_id="project-1")
     assert view["condition_revision"]["scientific_status"] == ceiling
@@ -996,12 +1300,15 @@ def test_disqualifying_binding_status_blocks_microkinetics_and_frozen_readiness(
     assert view["frozen_network"]["readiness"] == "blocked"
 
 
-@pytest.mark.parametrize("entity_id", ["state-p", "state-ts"])
+@pytest.mark.parametrize("entity_id", ["state-p", "saddle"])
 def test_ledger_reference_mismatch_withholds_observed_barrier_from_all_outputs(
     entity_id,
 ):
     source = projection()
-    source["bindings"][entity_id]["thermochemistry"][
+    binding = (
+        source["bindings"]["step-1"]["saddle"]
+        if entity_id == "saddle" else source["bindings"][entity_id])
+    binding["thermochemistry"][
         "reference_state_sha256"] = "f" * 64
     view = rw.build_reaction_workbench_view(source, project_id="project-1")
     edge = view["graph"]["edges"][0]
@@ -1035,12 +1342,13 @@ def test_weakest_provenance_caps_status_and_blocks_kinetic_qualification(
     source = projection()
     for binding in source["bindings"].values():
         binding["scientific_status"] = "verified"
+        if isinstance(binding.get("saddle"), dict):
+            binding["saddle"]["scientific_status"] = "verified"
     if target == "step":
-        source["steps"][0]["payload"]["provenance"] = origin
-        _rehash(source["steps"][0])
+        _set_domain_origin(source["steps"][0], origin)
+        _rehash_step(source)
     elif target == "surface":
-        source["surfaces"][0]["payload"]["provenance"] = origin
-        _rehash(source["surfaces"][0])
+        _set_domain_origin(source["surfaces"][0], origin)
     else:
         source["bindings"]["state-r"]["thermochemistry"][
             "electronic_energy_e0_eV"]["origin"] = origin
@@ -1050,6 +1358,190 @@ def test_weakest_provenance_caps_status_and_blocks_kinetic_qualification(
     assert view["graph"]["kinetic_ready"] is False
     assert view["frozen_network"]["readiness"] == "blocked"
     assert view["report_binding"]["scientific_status"] == ceiling
+
+
+def test_frozen_status_uses_weakest_graph_ledger_and_revision_qualification():
+    source = projection()
+    for binding in source["bindings"].values():
+        binding["scientific_status"] = "verified"
+        if isinstance(binding.get("saddle"), dict):
+            binding["saddle"]["scientific_status"] = "verified"
+    source["bindings"]["state-r"]["thermochemistry"][
+        "electronic_energy_e0_eV"]["origin"] = "inferred"
+
+    view = rw.build_reaction_workbench_view(source, project_id="project-1")
+
+    assert view["graph"]["scientific_status"] == "verified"
+    assert view["ledger"]["scientific_status"] == "candidate"
+    assert view["condition_revision"]["scientific_status"] == "candidate"
+    assert view["scientific_status"] == "candidate"
+    assert view["frozen_network"]["scientific_status"] == "candidate"
+    assert view["frozen_network"]["readiness"] == "blocked"
+
+
+def test_native_v3_multi_participant_transition_side_round_trips_to_frozen_network():
+    source = projection()
+    source["states"].append(_state("state-ts-2", "H"))
+    source["bindings"]["state-ts-2"] = {
+        "label": "TS component 2", "structure_sha256": H["structure"],
+        "evidence_sha256": H["evidence"], "scientific_status": "machine_pass",
+        "origin": "observed",
+    }
+    transition_side = source["steps"][0]["payload"]["transition_state"]
+    transition_side[0]["coefficient"] = {"numerator": 1, "denominator": 2}
+    transition_side.append(_participant(
+        "state-ts-2", ExactRational(1, 2)).to_dict())
+    source["network"]["payload"]["state_ids"].append("state-ts-2")
+    _rehash(source["network"])
+    source["authority"]["network_semantic_sha256"] = source["network"][
+        "semantic_sha256"]
+    _rehash_step(source)
+
+    view = rw.build_reaction_workbench_view(source, project_id="project-1")
+    edge = view["graph"]["edges"][0]
+    assert edge["conservation"]["status"] == "available"
+    assert len(edge["transition_state"]) == 2
+    assert edge["transition_state"][1] == {
+        "state_id": "state-ts-2",
+        "coefficient": {"numerator": 1, "denominator": 2},
+        "phase": "adsorbed", "charge": 0,
+        "site_stoichiometry": {
+            "top": {"numerator": 1, "denominator": 1}},
+    }
+    frozen = view["frozen_network"]
+    assert frozen["microkinetics_ready"] is True
+    assert frozen["edges"][0]["transition_state"] == edge["transition_state"]
+
+
+def test_missing_or_mismatched_explicit_saddle_binding_blocks_or_rejects():
+    source = projection()
+    source["bindings"]["step-1"].pop("saddle")
+    view = rw.build_reaction_workbench_view(source, project_id="project-1")
+    assert view["graph"]["edges"][0]["thermochemistry"][
+        "kinetic_status"] == "unavailable"
+    assert "explicit_step_scoped_saddle_binding" in next(
+        node for node in view["graph"]["nodes"]
+        if node["entity_type"] == "transition_state")["missing"]
+    assert view["frozen_network"]["readiness"] == "blocked"
+
+    source = projection()
+    source["bindings"]["step-1"]["saddle"]["transition_side_sha256"] = "f" * 64
+    with pytest.raises(rw.ReactionWorkbenchError, match="transition side hash mismatch"):
+        rw.build_reaction_workbench_view(source, project_id="project-1")
+
+
+def test_legacy_v1_projection_and_envelopes_are_render_only_never_formal():
+    view = rw.build_reaction_workbench_view(
+        _legacy_v1_projection(), project_id="project-1")
+    assert view["source_projection_schema"] == rw.LEGACY_PROJECTION_SCHEMA
+    assert view["migration_only"] is True
+    assert view["available"] is True
+    assert view["graph"]["canonical_envelope_authority"] is False
+    assert view["graph"]["microkinetics_ready"] is False
+    assert view["frozen_network"]["schema"] == rw.FROZEN_NETWORK_SCHEMA
+    assert view["frozen_network"]["version"] == "2"
+    assert rw.FROZEN_NETWORK_SCHEMA != "vcstudio.frozen-reaction-network/v1"
+    assert view["frozen_network"]["readiness"] == "blocked"
+    assert view["report_binding"]["artifact_status"] == "incomplete"
+
+
+@pytest.mark.parametrize("field", ["semantic_sha256", "object_revision_id"])
+def test_canonical_envelope_hash_and_revision_tampering_are_rejected(field):
+    source = projection()
+    source["steps"][0][field] = "f" * 64 if field == "semantic_sha256" else "revision-x"
+    with pytest.raises(rw.ReactionWorkbenchError, match="canonical domain envelope"):
+        rw.build_reaction_workbench_view(source, project_id="project-1")
+
+
+@pytest.mark.parametrize(("mutation", "expected"), [
+    ("phase", "participant_state_phase_disagrees"),
+    ("site", "participant_state_site_stoichiometry_disagrees"),
+])
+def test_v3_participant_phase_and_site_tampering_is_unavailable(
+        mutation, expected):
+    source = projection()
+    participant = source["steps"][0]["payload"]["transition_state"][0]
+    if mutation == "phase":
+        participant["phase"] = "gas"
+    else:
+        participant["site_stoichiometry"] = {
+            "bridge": {"numerator": 1, "denominator": 1}}
+    _rehash_step(source)
+    view = rw.build_reaction_workbench_view(source, project_id="project-1")
+    conservation = view["graph"]["edges"][0]["conservation"]
+    assert conservation["status"] == "unavailable"
+    assert any(expected in item for item in conservation["missing"])
+    assert view["frozen_network"]["readiness"] == "blocked"
+    assert view["frozen_network"]["microkinetics_ready"] is False
+
+
+@pytest.mark.parametrize(("case", "expected"), [
+    ("top_two", "participant_state_site_stoichiometry_disagrees"),
+    ("top_half", "participant_state_site_stoichiometry_disagrees"),
+    ("multiple_sites", "participant_state_site_stoichiometry_disagrees"),
+    ("empty_sites", "participant_state_site_stoichiometry_disagrees"),
+    ("state_site_missing", "authoritative_state_site_unavailable"),
+])
+def test_v1_state_authorizes_exactly_one_geometric_site_and_never_self_certifies(
+        case, expected):
+    source = projection()
+    step = source["steps"][0]["payload"]
+    participants = [
+        step[side][0] for side in ("reactants", "transition_state", "products")]
+    if case == "top_two":
+        for participant in participants:
+            participant["site_stoichiometry"] = {
+                "top": {"numerator": 2, "denominator": 1}}
+    elif case == "top_half":
+        for participant in participants:
+            participant["site_stoichiometry"] = {
+                "top": {"numerator": 1, "denominator": 2}}
+    elif case == "multiple_sites":
+        source["surfaces"][0]["payload"]["geometric_site_ids"].append("bridge")
+        _rehash(source["surfaces"][0])
+        for participant in participants:
+            participant["site_stoichiometry"]["bridge"] = {
+                "numerator": 1, "denominator": 1}
+    elif case == "empty_sites":
+        for participant in participants:
+            participant["site_stoichiometry"] = {}
+    else:
+        for state in source["states"]:
+            state["payload"]["geometric_site_id"] = None
+            _rehash(state)
+    _rehash_step(source)
+
+    view = rw.build_reaction_workbench_view(source, project_id="project-1")
+    conservation = view["graph"]["edges"][0]["conservation"]
+    assert conservation["status"] == "unavailable"
+    assert any(expected in item for item in conservation["missing"])
+    assert view["frozen_network"]["edges"][0]["conservation"] == conservation
+    assert view["frozen_network"]["readiness"] == "blocked"
+    assert view["frozen_network"]["microkinetics_ready"] is False
+    if case == "top_two":
+        assert conservation["surface_site_occupancy"]["reactants"] == [{
+            "surface_id": "surface-1", "site_id": "top",
+            "count": {"numerator": 1, "denominator": 1},
+        }]
+
+
+def test_valid_partial_condition_and_unresolved_state_charge_block_without_parse_failure():
+    source = projection()
+    source["conditions"][0]["payload"]["pressure_pa"] = None
+    _rehash(source["conditions"][0])
+    condition_view = rw.build_reaction_workbench_view(
+        source, project_id="project-1")
+    assert condition_view["graph"]["thermodynamic_ready"] is False
+    assert condition_view["frozen_network"]["readiness"] == "blocked"
+
+    source = projection()
+    source["states"][0]["payload"]["charge"] = None
+    _rehash(source["states"][0])
+    state_view = rw.build_reaction_workbench_view(source, project_id="project-1")
+    conservation = state_view["graph"]["edges"][0]["conservation"]
+    assert conservation["status"] == "unavailable"
+    assert "authoritative_state_charge:state-r" in conservation["missing"]
+    assert state_view["frozen_network"]["readiness"] == "blocked"
 
 
 def test_raw_payload_digest_is_recomputed_and_never_formally_frozen():
@@ -1063,6 +1555,7 @@ def test_raw_payload_digest_is_recomputed_and_never_formally_frozen():
     right_view = rw.build_reaction_workbench_view(right, project_id="project-1")
     assert left_view["source_projection_sha256"] == right_view[
         "source_projection_sha256"]
+    assert left_view["migration_only"] is True
     assert left_view["graph"]["canonical_envelope_authority"] is False
     assert left_view["graph"]["artifact_status"] == "incomplete"
     assert left_view["frozen_network"]["readiness"] == "blocked"

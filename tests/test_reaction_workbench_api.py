@@ -30,9 +30,14 @@ def test_analysis_api_consumes_protocol_projection_and_returns_stable_schemas(tm
 
     assert boot["ok"] is True
     assert boot["view"]["schema"] == "vcstudio.reaction-workbench-view/v1"
+    assert boot["view"]["source_projection_schema"] == (
+        "vcstudio.reaction-domain-projection/v2")
+    assert boot["view"]["migration_only"] is False
     assert boot["view"]["graph"]["schema"] == "vcstudio.reaction-graph/v1"
     assert boot["view"]["ledger"]["schema"] == "vcstudio.thermochemistry-ledger/v1"
     assert boot["view"]["report_binding"]["schema"] == "vcstudio.reaction-report-binding/v1"
+    assert boot["view"]["frozen_network"]["version"] == "2"
+    assert boot["view"]["frozen_network"]["edges"][0]["transition_state"]
     assert boot["default_spec"]["conditions"] == {}
     assert source.calls and source.calls[0][0] == project_id
     _assert_public(boot, tmp_path)

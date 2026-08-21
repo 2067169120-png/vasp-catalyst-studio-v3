@@ -67,6 +67,11 @@ _REPORT_QUALIFICATIONS = frozenset({
 })
 _REACTION_PROJECTION_BINDING_SCHEMA = (
     'vcstudio.reaction-projection-binding/v1')
+# One server-private slot on the per-build context.  The ``_token`` suffix is
+# also denied by the generic public projector as defence in depth.  Contexts
+# are newly constructed by ``_analysis_workbench_build`` and never reused
+# across public requests.
+_REACTION_REQUEST_SNAPSHOT_KEY = '_reaction_snapshot_token'
 
 # Browser-facing duplicate-calculation queries are deliberately much smaller
 # than the local ledger.  The derivative index is advisory only; submission is
@@ -291,8 +296,10 @@ class Api:
                  workspace_context_store=None, method_recipe_service=None,
                  method_recipe_publisher=None, structure_sources_mod=None,
                  structure_source_session=None, external_structure_gateway=None,
-                 surface_workbench_mod=None, external_reference_gateway=None,
-                 reaction_domain_source=None, kinetics_projection_provider=None):
+                  surface_workbench_mod=None, external_reference_gateway=None,
+                  reaction_domain_source=None, kinetics_projection_provider=None,
+                  catalysis_authoring_service_factory=None,
+                  kinetics_authoring_service_factory=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -428,6 +435,12 @@ class Api:
         # Kinetics consumes a server-owned frozen Reaction Map/Catalysis Model
         # projection.  Browser requests never carry reaction facts.
         self._kinetics_projection_provider = kinetics_projection_provider
+        # Active-network and model-spec authoring are project-pinned server
+        # transactions.  The browser receives DTOs and opaque CAS only.
+        self._catalysis_authoring_service_factory = (
+            catalysis_authoring_service_factory)
+        self._kinetics_authoring_service_factory = (
+            kinetics_authoring_service_factory)
         # Confirmed laboratory recommendations are user-level state.  They do
         # not mutate job manifests or grant submission authority.
         self._lab_policy_store = lab_policy_store
@@ -7129,13 +7142,31 @@ class Api:
             binding_key: reaction_hash,
         }, sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
 
-    def _current_reaction_projection_binding(self, project, workspace_project_id):
+    def _current_reaction_projection_binding(
+            self, project, workspace_project_id, *, context=None):
         project_id = str(workspace_project_id or '').strip()
         if not project_id:
             raise ValueError('reaction projection binding 缺少工作台项目身份')
-        projection = self._analysis_workbench_reaction_projection({
+        private_context = context if isinstance(context, Mapping) else {
             'project': project, 'project_id': project_id,
-        })
+        }
+        if private_context.get('project_id') != project_id:
+            raise ValueError('reaction projection binding 项目身份不一致')
+        source = self._reaction_domain_source
+        needs_private_root = bool(
+            source is not None and (
+                callable(getattr(source, 'for_project', None))
+                or callable(getattr(source, 'validated_for_project', None))))
+        if needs_private_root and not private_context.get('project_root'):
+            try:
+                record = self._report_workbench_project_record(project_id)
+                private_context = self._report_workbench_project_context(
+                    record['path'])
+            except Exception:                            # noqa: BLE001 fail closed
+                private_context = {
+                    'project': project, 'project_id': project_id,
+                }
+        projection = self._analysis_workbench_reaction_projection(private_context)
         if projection is None:
             return self._reaction_projection_binding()
         from vcstudio.project.reaction_workbench import build_reaction_workbench_view
@@ -7748,7 +7779,8 @@ class Api:
                     context['project'], current_summary)
                 current_reaction_binding = (
                     self._current_reaction_projection_binding(
-                        context['project'], snapshot_project_id))
+                        context['project'], snapshot_project_id,
+                        context=context))
                 frozen_reaction_binding = reaction_evidence.get(
                     'projection_binding')
                 sources = snapshot_payload.get('sources') or []
@@ -8504,6 +8536,16 @@ class Api:
     # ── Phase D:分析配置工作台 API ───────────────────────────────────────
     _ANALYSIS_BOOTSTRAP_SCHEMA = 'vcstudio.analysis-workbench-bootstrap/v1'
     _ANALYSIS_PREVIEW_SCHEMA = 'vcstudio.analysis-workbench-preview/v1'
+    _CATALYSIS_AUTHORING_BOOTSTRAP_API_SCHEMA = (
+        'vcstudio.catalysis-authoring-bootstrap-api/v1')
+    _CATALYSIS_ACTIVE_PREVIEW_API_SCHEMA = (
+        'vcstudio.catalysis-active-network-preview-api/v1')
+    _CATALYSIS_ACTIVE_CONFIRM_API_SCHEMA = (
+        'vcstudio.catalysis-active-network-confirm-api/v1')
+    _KINETICS_SPEC_PREVIEW_API_SCHEMA = (
+        'vcstudio.kinetics-model-spec-preview-api/v1')
+    _KINETICS_SPEC_CONFIRM_API_SCHEMA = (
+        'vcstudio.kinetics-model-spec-confirm-api/v1')
 
     @classmethod
     def _analysis_workbench_public_value(cls, value):
@@ -8826,21 +8868,58 @@ class Api:
             return None
         if isinstance(source, Mapping):
             projection = source
-        elif hasattr(source, 'load_reaction_projection'):
-            projection = source.load_reaction_projection(
-                project_id=context['project_id'], project=context['project'])
-        elif callable(source):
-            projection = source(
-                project_id=context['project_id'], project=context['project'])
         else:
-            raise TypeError(
-                'reaction_domain_source must be a Mapping, callable, or '
-                'ReactionDomainSource')
+            supports_snapshot, validated = (
+                self._analysis_workbench_validated_reaction(context))
+            if supports_snapshot:
+                if validated is None:
+                    projection = None
+                else:
+                    detach = getattr(validated, 'detached_projection', None)
+                    projection = (detach() if callable(detach)
+                                  else getattr(validated, 'projection', None))
+            elif hasattr(source, 'for_project'):
+                projection = source.for_project(
+                    self._analysis_workbench_private_context(context))
+            elif hasattr(source, 'load_reaction_projection'):
+                projection = source.load_reaction_projection(
+                    project_id=context['project_id'], project=context['project'])
+            elif callable(source):
+                projection = source(
+                    project_id=context['project_id'], project=context['project'])
+            else:
+                raise TypeError(
+                    'reaction_domain_source must be a Mapping, callable, or '
+                    'ReactionDomainSource')
         if projection is None:
             return None
         if not isinstance(projection, Mapping):
             raise TypeError('canonical reaction projection must be an object')
         return copy.deepcopy(dict(projection))
+
+    @staticmethod
+    def _analysis_workbench_private_context(context):
+        """Detach only the private project fields accepted by server adapters."""
+        return {
+            key: copy.deepcopy(context[key])
+            for key in (
+                'project_id', 'project_path', 'project_root', 'project')
+            if key in context
+        }
+
+    def _analysis_workbench_validated_reaction(self, context):
+        """Freeze at most one validated reaction snapshot on this request context."""
+        if _REACTION_REQUEST_SNAPSHOT_KEY in context:
+            return True, context[_REACTION_REQUEST_SNAPSHOT_KEY]
+        source = self._reaction_domain_source
+        loader = getattr(source, 'validated_for_project', None)
+        if not callable(loader):
+            return False, None
+        validated = loader(self._analysis_workbench_private_context(context))
+        # ``None`` is deliberately cached: an unavailable authority must not be
+        # retried later in the same response and observed at another generation.
+        context[_REACTION_REQUEST_SNAPSHOT_KEY] = validated
+        return True, validated
 
     def _analysis_workbench_property_results(self, kind, targets):
         """Run calculators from manifest-bound server operands only."""
@@ -9011,14 +9090,17 @@ class Api:
         provider = self._kinetics_projection_provider
         if provider is None:
             return None
-        private_context = {
-            'project_id': context['project_id'],
-            'project_path': context['project_path'],
-            'project_root': context['project_root'],
-            'project': copy.deepcopy(context['project']),
-        }
+        private_context = self._analysis_workbench_private_context(context)
+        supports_snapshot, validated = (
+            self._analysis_workbench_validated_reaction(context))
+        shared_resolver = getattr(provider, 'for_project_with_reaction', None)
         resolver = getattr(provider, 'for_project', None)
-        value = resolver(private_context) if callable(resolver) else provider(private_context)
+        if supports_snapshot and callable(shared_resolver):
+            value = shared_resolver(
+                private_context, validated_reaction=validated)
+        else:
+            value = (resolver(private_context) if callable(resolver)
+                     else provider(private_context))
         if value is None:
             return None
         from vcstudio.project import kinetics
@@ -9373,6 +9455,438 @@ class Api:
 
     def _analysis_workbench_project_record(self, project_id):
         return self._resolve_project_id(project_id)
+
+    @staticmethod
+    def _authoring_to_dict(value):
+        loader = getattr(value, 'to_dict', None)
+        if callable(loader):
+            return loader()
+        return copy.deepcopy(dict(value)) if isinstance(value, Mapping) else None
+
+    def _authoring_service(self, factory, context):
+        if factory is None:
+            return None
+        private_context = self._analysis_workbench_private_context(context)
+        loader = getattr(factory, 'for_project', None)
+        return (loader(private_context) if callable(loader)
+                else factory(private_context))
+
+    @classmethod
+    def _authoring_failure(
+            cls, schema, payload_key, code, field=None, **extra):
+        return {
+            'ok': False,
+            'schema': schema,
+            'project_id': None,
+            payload_key: None,
+            **extra,
+            'error_code': code,
+            'error_field': field,
+            'error': code,
+        }
+
+    @staticmethod
+    def _kinetics_authoring_choice_catalog():
+        return {
+            'schema': 'vcstudio.kinetics-authoring-choice-catalog/v1',
+            'rate_law_policy': {
+                'activity': ['ideal'],
+                'reversibility': ['explicit_reverse'],
+                'detailed_balance': ['enforced'],
+                'prefactor': ['explicit_per_step'],
+                'electrochemical': ['none'],
+                'reactor': ['mean_field_steady_state'],
+            },
+            'assumptions': {
+                'mean_field': [True],
+                'steady_state': [True],
+                'site_uniformity': ['uniform'],
+                'lateral_interactions': ['neglected', 'parameterized'],
+                'mechanism_completeness': [
+                    'claimed_complete', 'partial', 'unknown'],
+            },
+            'feed_reservoir_units': ['bar', 'mol/L', 'dimensionless'],
+            'site_total_units': ['sites', 'dimensionless'],
+            'site_total_bases': [
+                'surface_unit_cell', 'normalized_site_population'],
+            'prefactor_units': [
+                's^-1', 'bar^-1 s^-1', 'mol^-1 L s^-1'],
+        }
+
+    @classmethod
+    def _kinetics_authoring_public_bootstrap(cls, value):
+        if not isinstance(value, Mapping):
+            return {
+                'status': 'unavailable',
+                'reason': 'authoring_service_unavailable',
+                'source': None,
+                'model_store': {'status': 'unavailable'},
+                'selector': {
+                    'status': 'unavailable', 'migration_state': 'none',
+                    'selected': None,
+                },
+                'choice_catalog': cls._kinetics_authoring_choice_catalog(),
+            }
+        source = value.get('source')
+        source_record = cls._authoring_to_dict(source)
+        if isinstance(source_record, Mapping):
+            source_summary = {
+                'status': 'available',
+                'required_feed_reservoir_ids': list(
+                    source_record.get('required_feed_reservoir_ids') or []),
+                'allowed_target_product_ids': list(
+                    source_record.get('allowed_target_product_ids') or []),
+                'required_step_ids': list(
+                    source_record.get('required_step_ids') or []),
+                'required_site_type_ids': list(
+                    source_record.get('required_site_type_ids') or []),
+                'saddle_candidates_by_step': copy.deepcopy(
+                    source_record.get('saddle_candidates_by_step') or {}),
+                'evidence_catalog': [
+                    {
+                        'reference_id': item.get('reference_id'),
+                        'kind': item.get('kind'),
+                    }
+                    for item in source_record.get('evidence_catalog') or []
+                    if isinstance(item, Mapping)
+                ],
+                'solver_ready': source_record.get('solver_ready') is True,
+                'solver_readiness_reasons': list(
+                    source_record.get('solver_readiness_reasons') or []),
+            }
+        else:
+            source_summary = None
+        selector = cls._authoring_to_dict(value.get('selector')) or {}
+        selection = selector.get('selection')
+        selected = None
+        if isinstance(selection, Mapping):
+            selected = {
+                key: selection.get(key)
+                for key in ('project_id', 'spec_id', 'spec_revision')
+            }
+        selector_status = (
+            'legacy_read_only'
+            if selector.get('migration_state') == 'legacy_v1_read_only'
+            else ('selected' if selected is not None else 'none'))
+        return {
+            'status': str(value.get('status') or 'unavailable'),
+            'reason': value.get('reason'),
+            'source': source_summary,
+            'model_store': {
+                'status': ('available' if value.get('model_store') is not None
+                           else 'unavailable'),
+            },
+            'selector': {
+                'status': selector_status,
+                'migration_state': str(
+                    selector.get('migration_state') or 'none'),
+                'selected': selected,
+            },
+            'choice_catalog': cls._kinetics_authoring_choice_catalog(),
+        }
+
+    def catalysis_authoring_bootstrap(self, project_id):
+        schema = self._CATALYSIS_AUTHORING_BOOTSTRAP_API_SCHEMA
+        try:
+            record = self._analysis_workbench_project_record(project_id)
+        except (LookupError, ValueError):
+            return self._authoring_failure(
+                schema, 'active_network', 'invalid_project_identity',
+                'project_id', kinetics_authoring=None,
+                bootstrap_status='unavailable',
+                reason='invalid_project_identity',
+                shared_authority=None)
+
+        def build():
+            context = self._report_workbench_project_context(record['path'])
+            private_context = self._analysis_workbench_private_context(context)
+            catalysis_factory = self._catalysis_authoring_service_factory
+            combined_loader = getattr(
+                catalysis_factory, 'combined_bootstrap', None)
+            combined = (
+                combined_loader(private_context)
+                if callable(combined_loader) else None)
+            if not isinstance(combined, Mapping):
+                return self._authoring_failure(
+                    schema, 'active_network',
+                    'authoring_service_unavailable',
+                    kinetics_authoring=None,
+                    bootstrap_status='unavailable', reason=(
+                        'authoring_service_unavailable'),
+                    shared_authority=None)
+            active = self._authoring_to_dict(combined.get('active_network'))
+            combined_status = str(combined.get('status') or 'unavailable')
+            combined_reason = combined.get('reason')
+            kinetics_factory = self._kinetics_authoring_service_factory
+            loader = getattr(kinetics_factory, 'bootstrap_from_validated', None)
+            kinetics = (
+                loader(
+                    private_context,
+                    combined.get('validated_reaction'),
+                    upstream_status=combined_status,
+                    upstream_reason=combined_reason,
+                )
+                if callable(loader) else None)
+            kinetics_public = self._kinetics_authoring_public_bootstrap(kinetics)
+            bootstrap_status = combined_status
+            bootstrap_reason = combined_reason
+            if combined_status == 'available':
+                kinetics_status = kinetics_public['status']
+                if kinetics_status != 'available':
+                    bootstrap_status = kinetics_status
+                    bootstrap_reason = kinetics_public.get('reason')
+            return self._analysis_workbench_public_value({
+                'ok': True,
+                'schema': schema,
+                'project_id': context['project_id'],
+                'bootstrap_status': bootstrap_status,
+                'reason': bootstrap_reason,
+                'shared_authority': combined.get('shared_authority'),
+                'active_network': active,
+                'kinetics_authoring': kinetics_public,
+                'error_code': None,
+                'error_field': None,
+                'error': None,
+            })
+
+        try:
+            return self._call_with_project_bindings(
+                [record], build,
+                failure={
+                    'schema': schema,
+                    'project_id': None,
+                    'bootstrap_status': 'unavailable',
+                    'reason': 'invalid_project_identity',
+                    'shared_authority': None,
+                    'active_network': None,
+                    'kinetics_authoring': None,
+                    'error_field': 'project_id',
+                })
+        except Exception:                                 # noqa: BLE001 public boundary
+            return self._authoring_failure(
+                schema, 'active_network',
+                'authoring_bootstrap_unavailable',
+                kinetics_authoring=None,
+                bootstrap_status='unavailable',
+                reason='authoring_bootstrap_unavailable',
+                shared_authority=None)
+
+    def catalysis_active_network_preview(self, project_id, request):
+        schema = self._CATALYSIS_ACTIVE_PREVIEW_API_SCHEMA
+        try:
+            record = self._analysis_workbench_project_record(project_id)
+        except (LookupError, ValueError):
+            return self._authoring_failure(
+                schema, 'preview', 'invalid_project_identity', 'project_id')
+        try:
+            from vcstudio.project.catalysis_authoring import (
+                CatalysisActiveNetworkPreviewRequest,
+            )
+
+            parsed = CatalysisActiveNetworkPreviewRequest.from_dict(request)
+        except Exception:                                 # noqa: BLE001 strict DTO boundary
+            return self._authoring_failure(
+                schema, 'preview', 'invalid_authoring_request', 'request')
+
+        def build():
+            context = self._report_workbench_project_context(record['path'])
+            service = self._authoring_service(
+                self._catalysis_authoring_service_factory, context)
+            if service is None:
+                return self._authoring_failure(
+                    schema, 'preview', 'authoring_service_unavailable')
+            return self._analysis_workbench_public_value({
+                'ok': True,
+                'schema': schema,
+                'project_id': context['project_id'],
+                'preview': self._authoring_to_dict(service.preview(parsed)),
+                'error_code': None,
+                'error_field': None,
+                'error': None,
+            })
+
+        try:
+            return self._call_with_project_bindings(
+                [record], build,
+                failure={
+                    'schema': schema, 'project_id': None, 'preview': None,
+                    'error_field': 'project_id',
+                })
+        except Exception:                                 # noqa: BLE001 public boundary
+            return self._authoring_failure(
+                schema, 'preview', 'authoring_preview_unavailable')
+
+    def catalysis_active_network_confirm(self, project_id, request):
+        schema = self._CATALYSIS_ACTIVE_CONFIRM_API_SCHEMA
+        try:
+            record = self._analysis_workbench_project_record(project_id)
+        except (LookupError, ValueError):
+            return self._authoring_failure(
+                schema, 'result', 'invalid_project_identity', 'project_id')
+        if not isinstance(request, Mapping) or set(request) != {
+                'request', 'confirmation'}:
+            return self._authoring_failure(
+                schema, 'result', 'invalid_authoring_request', 'request')
+        try:
+            from vcstudio.project.catalysis_authoring import (
+                CatalysisActiveNetworkPreviewRequest,
+            )
+
+            parsed_request = CatalysisActiveNetworkPreviewRequest.from_dict(
+                request['request'])
+        except Exception:                                 # noqa: BLE001 strict DTO boundary
+            return self._authoring_failure(
+                schema, 'result', 'invalid_authoring_request', 'request')
+        try:
+            from vcstudio.project.catalysis_authoring import (
+                CatalysisActiveNetworkConfirmation,
+            )
+
+            confirmation = CatalysisActiveNetworkConfirmation.from_dict(
+                request['confirmation'])
+        except Exception:                                 # noqa: BLE001 strict DTO boundary
+            return self._authoring_failure(
+                schema, 'result', 'invalid_confirmation', 'confirmation')
+
+        def build():
+            context = self._report_workbench_project_context(record['path'])
+            service = self._authoring_service(
+                self._catalysis_authoring_service_factory, context)
+            if service is None:
+                return self._authoring_failure(
+                    schema, 'result', 'authoring_service_unavailable')
+            result = service.confirm(parsed_request, confirmation)
+            return self._analysis_workbench_public_value({
+                'ok': True,
+                'schema': schema,
+                'project_id': context['project_id'],
+                'result': self._authoring_to_dict(result),
+                'error_code': None,
+                'error_field': None,
+                'error': None,
+            })
+
+        try:
+            return self._call_with_project_bindings(
+                [record], build,
+                failure={
+                    'schema': schema, 'project_id': None, 'result': None,
+                    'error_field': 'project_id',
+                })
+        except Exception:                                 # noqa: BLE001 public boundary
+            return self._authoring_failure(
+                schema, 'result', 'authoring_confirm_unavailable')
+
+    def kinetics_model_spec_preview(self, project_id, request):
+        schema = self._KINETICS_SPEC_PREVIEW_API_SCHEMA
+        try:
+            record = self._analysis_workbench_project_record(project_id)
+        except (LookupError, ValueError):
+            return self._authoring_failure(
+                schema, 'preview', 'invalid_project_identity', 'project_id')
+        if not isinstance(request, Mapping) or set(request) != {
+                'draft', 'intent_id'}:
+            return self._authoring_failure(
+                schema, 'preview', 'invalid_authoring_request', 'request')
+        try:
+            from vcstudio.project.kinetics_authoring import KineticsModelSpecDraft
+
+            draft = KineticsModelSpecDraft.from_dict(request['draft'])
+        except Exception:                                 # noqa: BLE001 strict DTO boundary
+            return self._authoring_failure(
+                schema, 'preview', 'invalid_authoring_request', 'draft')
+        intent_id = request['intent_id']
+        if not isinstance(intent_id, str):
+            return self._authoring_failure(
+                schema, 'preview', 'invalid_authoring_request', 'intent_id')
+
+        def build():
+            context = self._report_workbench_project_context(record['path'])
+            service = self._authoring_service(
+                self._kinetics_authoring_service_factory, context)
+            if service is None:
+                return self._authoring_failure(
+                    schema, 'preview', 'authoring_service_unavailable')
+            preview = service.preview(draft, intent_id=intent_id)
+            return self._analysis_workbench_public_value({
+                'ok': True,
+                'schema': schema,
+                'project_id': context['project_id'],
+                'preview': self._authoring_to_dict(preview),
+                'error_code': None,
+                'error_field': None,
+                'error': None,
+            })
+
+        try:
+            return self._call_with_project_bindings(
+                [record], build,
+                failure={
+                    'schema': schema, 'project_id': None, 'preview': None,
+                    'error_field': 'project_id',
+                })
+        except Exception:                                 # noqa: BLE001 public boundary
+            return self._authoring_failure(
+                schema, 'preview', 'authoring_preview_unavailable',
+                'intent_id')
+
+    def kinetics_model_spec_confirm(self, project_id, request):
+        schema = self._KINETICS_SPEC_CONFIRM_API_SCHEMA
+        try:
+            record = self._analysis_workbench_project_record(project_id)
+        except (LookupError, ValueError):
+            return self._authoring_failure(
+                schema, 'result', 'invalid_project_identity', 'project_id')
+        if not isinstance(request, Mapping) or set(request) != {
+                'draft', 'confirmation'}:
+            return self._authoring_failure(
+                schema, 'result', 'invalid_authoring_request', 'request')
+        try:
+            from vcstudio.project.kinetics_authoring import KineticsModelSpecDraft
+
+            draft = KineticsModelSpecDraft.from_dict(request['draft'])
+        except Exception:                                 # noqa: BLE001 strict DTO boundary
+            return self._authoring_failure(
+                schema, 'result', 'invalid_authoring_request', 'draft')
+        try:
+            from vcstudio.project.kinetics_authoring import (
+                KineticsAuthoringConfirmation,
+            )
+
+            confirmation = KineticsAuthoringConfirmation.from_dict(
+                request['confirmation'])
+        except Exception:                                 # noqa: BLE001 strict DTO boundary
+            return self._authoring_failure(
+                schema, 'result', 'invalid_confirmation', 'confirmation')
+
+        def build():
+            context = self._report_workbench_project_context(record['path'])
+            service = self._authoring_service(
+                self._kinetics_authoring_service_factory, context)
+            if service is None:
+                return self._authoring_failure(
+                    schema, 'result', 'authoring_service_unavailable')
+            result = service.confirm(draft, confirmation)
+            return self._analysis_workbench_public_value({
+                'ok': True,
+                'schema': schema,
+                'project_id': context['project_id'],
+                'result': self._authoring_to_dict(result),
+                'error_code': None,
+                'error_field': None,
+                'error': None,
+            })
+
+        try:
+            return self._call_with_project_bindings(
+                [record], build,
+                failure={
+                    'schema': schema, 'project_id': None, 'result': None,
+                    'error_field': 'project_id',
+                })
+        except Exception:                                 # noqa: BLE001 public boundary
+            return self._authoring_failure(
+                schema, 'result', 'authoring_confirm_unavailable')
 
     @classmethod
     def _analysis_workbench_identity_failure(cls, *, field):
@@ -9737,7 +10251,7 @@ class Api:
                     if key not in {'ok', 'error'}
                 }
                 cards = self._analysis_workbench_capability_cards(
-                    context, projects, view)
+                    built_context, projects, view)
                 for item in catalog.get('analyses') or []:
                     card = cards.get(str(item.get('id') or ''), {})
                     item['capability_status'] = card.get(
@@ -9749,7 +10263,8 @@ class Api:
                 return self._analysis_workbench_public_value({
                     'ok': True, 'schema': self._ANALYSIS_BOOTSTRAP_SCHEMA,
                     'project_id': built_context['project_id'],
-                    'project': self._analysis_workbench_current_project(context),
+                    'project': self._analysis_workbench_current_project(
+                        built_context),
                     'catalog': catalog, 'default_spec': spec.to_dict(),
                     'projects': projects, 'view': view, 'error': None,
                     'preferences': preferences,

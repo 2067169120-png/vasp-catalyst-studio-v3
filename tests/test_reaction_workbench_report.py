@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_reaction_workbench import _rehash, projection
+from tests.test_reaction_workbench import _rehash_step, _set_domain_origin, projection
 from tests.test_reaction_workbench_api import _DomainSource
 from tests.test_report_workbench import (
     _html_request,
@@ -126,7 +126,7 @@ def test_reaction_binding_enters_snapshot_validation_model_and_html(tmp_path):
     assert reaction["condition_revision"]["schema"] == (
         "vcstudio.condition-derived-revision/v1")
     assert reaction["frozen_network"]["schema"] == (
-        "vcstudio.frozen-reaction-network/v1")
+        "vcstudio.frozen-reaction-network/v2")
     assert reaction["report_binding"]["schema"] == (
         "vcstudio.reaction-report-binding/v1")
     assert any(source["kind"] == "canonical_reaction_domain_projection"
@@ -431,6 +431,8 @@ def test_verified_ts_evidence_can_raise_only_bounded_kinetic_qualification(tmp_p
     value = projection()
     for binding in value["bindings"].values():
         binding["scientific_status"] = "verified"
+        if isinstance(binding.get("saddle"), dict):
+            binding["saddle"]["scientific_status"] = "verified"
     api._reaction_domain_source = _DomainSource(value)
     project_id = _project_id(api, project_path)
     boot = api.report_workbench_bootstrap(project_id, "scientific-review")
@@ -458,8 +460,10 @@ def test_imported_domain_origin_cannot_be_promoted_to_kinetic_report_claim(tmp_p
     value = projection()
     for binding in value["bindings"].values():
         binding["scientific_status"] = "verified"
-    value["steps"][0]["payload"]["provenance"] = "imported"
-    _rehash(value["steps"][0])
+        if isinstance(binding.get("saddle"), dict):
+            binding["saddle"]["scientific_status"] = "verified"
+    _set_domain_origin(value["steps"][0], "imported")
+    _rehash_step(value)
     api._reaction_domain_source = _DomainSource(value)
     project_id = _project_id(api, project_path)
     boot = api.report_workbench_bootstrap(project_id, "scientific-review")

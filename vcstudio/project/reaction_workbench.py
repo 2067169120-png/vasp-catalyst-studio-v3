@@ -21,15 +21,26 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Protocol, TypedDict, runtime_checkable
 
+from vcstudio.project.catalysis_contracts import (
+    AuthoritativeParticipantState,
+    CatalysisContractError,
+    DomainEnvelope,
+    ElementaryStep,
+    FluidState,
+    ReactionParticipant as CanonicalReactionParticipant,
+    validate_elementary_step_conservation,
+)
 
-PROJECTION_SCHEMA = "vcstudio.reaction-domain-projection/v1"
+PROJECTION_SCHEMA = "vcstudio.reaction-domain-projection/v2"
+LEGACY_PROJECTION_SCHEMA = "vcstudio.reaction-domain-projection/v1"
 VIEW_SCHEMA = "vcstudio.reaction-workbench-view/v1"
 GRAPH_SCHEMA = "vcstudio.reaction-graph/v1"
 LEDGER_SCHEMA = "vcstudio.thermochemistry-ledger/v1"
 DERIVED_REVISION_SCHEMA = "vcstudio.condition-derived-revision/v1"
 REPORT_BINDING_SCHEMA = "vcstudio.reaction-report-binding/v1"
-FROZEN_NETWORK_SCHEMA = "vcstudio.frozen-reaction-network/v1"
-DOMAIN_ENVELOPE_SCHEMA = "vcstudio.catalysis-domain-envelope/v1"
+FROZEN_NETWORK_SCHEMA = "vcstudio.frozen-reaction-network/v2"
+DOMAIN_ENVELOPE_SCHEMA = "vcstudio.catalysis-domain-envelope/v2"
+LEGACY_DOMAIN_ENVELOPE_SCHEMA = "vcstudio.catalysis-domain-envelope/v1"
 THERMOCHEMISTRY_BINDING_SCHEMA = "vcstudio.thermochemistry-binding/v1"
 THERMOCHEMISTRY_TERM_SCHEMA = "vcstudio.thermochemistry-term/v1"
 STANDARD_STATE_SCHEMA = "vcstudio.standard-state/v1"
@@ -48,6 +59,7 @@ FREQUENCY_NOISE_SCIENTIFIC_MAXIMUM_CM1 = 100.0
 FREQUENCY_NOISE_POLICY_ID = "vcstudio.fixed-imaginary-frequency-noise/v1"
 
 _OPAQUE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~:-]{0,159}\Z")
+_AUTHORITY_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _PATH_RE = re.compile(
     r"(?i)(?:\b[A-Z]:[\\/]|(?:^|[\s\"'])(?:\\\\|//|/[^/\s]|~[\\/])|\bfile:)")
@@ -114,25 +126,35 @@ _ORIGIN_STATUS_CEILINGS = {
     "inferred": "candidate",
     "unknown": "unknown",
 }
-_PAYLOAD_SCHEMAS = {
-    "CatalystSurface": "vcstudio.catalyst-surface/v1",
-    "AdsorbateState": "vcstudio.adsorbate-state/v1",
-    "TransitionState": "vcstudio.transition-state/v1",
-    "ElementaryStep": "vcstudio.elementary-step/v1",
-    "ConditionSet": "vcstudio.condition-set/v1",
-    "ReactionNetwork": "vcstudio.reaction-network/v1",
+_PAYLOAD_TYPES_BY_SCHEMA = {
+    "vcstudio.catalyst-surface/v1": "CatalystSurface",
+    "vcstudio.adsorbate-state/v1": "AdsorbateState",
+    "vcstudio.fluid-state/v1": "FluidState",
+    "vcstudio.transition-state/v1": "TransitionState",
+    "vcstudio.elementary-step/v1": "ElementaryStep",
+    "vcstudio.elementary-step/v3": "ElementaryStep",
+    "vcstudio.condition-set/v1": "ConditionSet",
+    "vcstudio.reaction-network/v1": "ReactionNetwork",
 }
 _RAW_PAYLOAD_FIELDS = {
     "CatalystSurface": frozenset({
-        "schema", "model_version", "surface_id", "composition", "miller_indices",
+        "schema", "model_version", "schema_version", "object_revision_id",
+        "parent_revision", "expected_current_hash", "surface_id", "composition", "miller_indices",
         "termination_id", "geometric_site_ids", "provenance", "evidence_refs",
         "method_fingerprint",
     }),
     "AdsorbateState": frozenset({
-        "schema", "model_version", "state_id", "surface_id", "adsorbate_id",
+        "schema", "model_version", "schema_version", "object_revision_id",
+        "parent_revision", "expected_current_hash", "state_id", "surface_id", "adsorbate_id",
         "chemical_formula", "elemental_composition", "geometric_site_id",
         "site_occupancy", "charge", "multiplicity", "provenance", "evidence_refs",
         "method_fingerprint",
+    }),
+    "FluidState": frozenset({
+        "schema", "schema_version", "object_revision_id", "parent_revision",
+        "expected_current_hash", "state_id", "phase", "chemical_formula",
+        "charge", "multiplicity", "standard_state", "provenance",
+        "evidence_refs", "method_fingerprint",
     }),
     "TransitionState": frozenset({
         "schema", "model_version", "transition_state_id", "surface_id",
@@ -141,17 +163,20 @@ _RAW_PAYLOAD_FIELDS = {
         "method_fingerprint",
     }),
     "ElementaryStep": frozenset({
-        "schema", "model_version", "step_id", "reactants", "products",
-        "transition_state_id", "condition_set_id", "reversible", "provenance",
-        "evidence_refs", "method_fingerprint",
+        "schema", "model_version", "schema_version", "object_revision_id",
+        "parent_revision", "expected_current_hash", "step_id", "reactants", "products",
+        "transition_state", "transition_state_id", "condition_set_id", "reversible",
+        "provenance", "evidence_refs", "method_fingerprint",
     }),
     "ConditionSet": frozenset({
-        "schema", "model_version", "condition_set_id", "temperature_k", "pressure_pa",
+        "schema", "model_version", "schema_version", "object_revision_id",
+        "parent_revision", "expected_current_hash", "condition_set_id", "temperature_k", "pressure_pa",
         "ph", "electrode_potential_v", "coverage", "provenance", "evidence_refs",
         "method_fingerprint",
     }),
     "ReactionNetwork": frozenset({
-        "schema", "model_version", "network_id", "surface_ids", "state_ids",
+        "schema", "model_version", "schema_version", "object_revision_id",
+        "parent_revision", "expected_current_hash", "network_id", "surface_ids", "state_ids",
         "step_ids", "condition_set_ids", "provenance", "evidence_refs",
         "method_fingerprint",
     }),
@@ -174,6 +199,9 @@ class RationalDTO(TypedDict):
 class ReactionParticipant(TypedDict):
     state_id: str
     coefficient: RationalDTO
+    phase: str
+    charge: int
+    site_stoichiometry: Mapping[str, RationalDTO]
 
 
 class ThermochemistryBinding(TypedDict, total=False):
@@ -209,15 +237,16 @@ class ObjectBinding(TypedDict, total=False):
     origin: str
     thermochemistry: ThermochemistryBinding
     edge_evidence: Mapping[str, Any]
+    saddle: Mapping[str, Any]
 
 
 class ReactionDomainProjection(TypedDict, total=False):
     schema: str
     project_id: str
+    authority: Mapping[str, Any]
     network: Mapping[str, Any]
     surfaces: Sequence[Mapping[str, Any]]
     states: Sequence[Mapping[str, Any]]
-    transition_states: Sequence[Mapping[str, Any]]
     steps: Sequence[Mapping[str, Any]]
     conditions: Sequence[Mapping[str, Any]]
     bindings: Mapping[str, ObjectBinding]
@@ -292,6 +321,13 @@ def _digest(value: Any, *, field: str, optional: bool = False) -> str | None:
     text = str(value or "").strip().lower()
     if not _SHA256_RE.fullmatch(text):
         raise ReactionWorkbenchError(f"{field} must be a SHA-256 digest")
+    return text
+
+
+def _authority_id(value: Any, *, field: str) -> str:
+    text = str(value or "").strip().lower()
+    if not _AUTHORITY_ID_RE.fullmatch(text):
+        raise ReactionWorkbenchError(f"{field} must be an authority identifier")
     return text
 
 
@@ -371,17 +407,16 @@ def _coefficient_display(value: Mapping[str, Any]) -> str:
 
 def _payload_type_from_schema(schema: Any, *, field: str) -> str:
     text = _safe_text(schema, field=f"{field}.schema")
-    matches = [kind for kind, expected in _PAYLOAD_SCHEMAS.items() if text == expected]
-    if len(matches) != 1:
+    object_type = _PAYLOAD_TYPES_BY_SCHEMA.get(text)
+    if object_type is None:
         raise ReactionWorkbenchError(f"{field}.schema is not a supported domain payload")
-    return matches[0]
+    return object_type
 
 
 def _validate_payload_schema(
     payload: Mapping[str, Any], *, object_type: str, field: str, strict: bool,
 ) -> None:
-    expected = _PAYLOAD_SCHEMAS.get(object_type)
-    if expected is None or payload.get("schema") != expected:
+    if _PAYLOAD_TYPES_BY_SCHEMA.get(str(payload.get("schema") or "")) != object_type:
         raise ReactionWorkbenchError(
             f"{field}.schema must match canonical {object_type}")
     if strict:
@@ -395,14 +430,25 @@ def _validate_payload_schema(
 def _unwrap(
     value: Any, *, field: str,
 ) -> tuple[dict[str, Any], str, str, bool]:
-    """Validate an envelope, or recompute a compatibility payload digest.
+    """Validate a v2 envelope, or recompute a migration-only payload digest.
 
-    Raw payloads remain renderable for migration, but callers receive
-    ``canonical=False`` and must not authorize formal frozen/report outputs.
-    A raw ``semantic_sha256`` claim is deliberately discarded.
+    Only :class:`catalysis_contracts.DomainEnvelope` v2 is canonical.  Legacy
+    v1 envelopes and raw payloads remain renderable for explicit migration,
+    but callers receive ``canonical=False`` and cannot authorize formal
+    report/frozen/microkinetics outputs.  A raw digest claim is discarded.
     """
     record = _mapping(value, field=field)
     if isinstance(record.get("payload"), Mapping):
+        if record.get("schema") == DOMAIN_ENVELOPE_SCHEMA:
+            try:
+                envelope = DomainEnvelope.from_dict(record)
+            except CatalysisContractError as exc:
+                raise ReactionWorkbenchError(
+                    f"{field} canonical domain envelope is invalid: {exc}") from exc
+            return (
+                envelope.to_dict()["payload"], envelope.semantic_sha256,
+                envelope.object_type, True,
+            )
         record = _strict_mapping(
             record, field=field,
             allowed=frozenset({
@@ -413,7 +459,7 @@ def _unwrap(
                 "schema", "object_type", "object_id", "object_version", "payload",
                 "semantic_sha256", "job_source_of_truth", "authorizes_execution",
             }))
-        if record.get("schema") != DOMAIN_ENVELOPE_SCHEMA:
+        if record.get("schema") != LEGACY_DOMAIN_ENVELOPE_SCHEMA:
             raise ReactionWorkbenchError(f"{field} envelope schema is unsupported")
         if record.get("job_source_of_truth") != "job.yaml":
             raise ReactionWorkbenchError(f"{field} envelope must bind job.yaml authority")
@@ -429,7 +475,7 @@ def _unwrap(
         object_type = _safe_text(record.get("object_type"), field=f"{field}.object_type")
         _validate_payload_schema(
             payload, object_type=object_type, field=f"{field}.payload", strict=False)
-        return payload, str(digest), object_type, True
+        return payload, str(digest), object_type, False
     record.pop("semantic_sha256", None)
     object_type = _payload_type_from_schema(record.get("schema"), field=field)
     _validate_payload_schema(record, object_type=object_type, field=field, strict=True)
@@ -449,8 +495,43 @@ def _binding_for(bindings: Mapping[str, Any], object_id: str) -> dict[str, Any]:
         value, field=f"bindings.{object_id}",
         allowed=frozenset({
             "label", "structure_sha256", "evidence_sha256", "scientific_status",
-            "origin", "thermochemistry", "edge_evidence",
+            "origin", "thermochemistry", "edge_evidence", "saddle",
+            "step_semantic_sha256", "transition_side_sha256",
         }))
+
+
+def _saddle_binding_for(
+    step_binding: Mapping[str, Any], *, step_id: str, step_sha256: str,
+    transition_state: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Return one explicit step-scoped saddle binding, never an ID guess."""
+    raw = step_binding.get("saddle")
+    if not isinstance(raw, Mapping):
+        return {}
+    data = _strict_mapping(
+        raw, field=f"bindings.{step_id}.saddle",
+        allowed=frozenset({
+            "step_semantic_sha256", "transition_side_sha256", "label",
+            "structure_sha256", "evidence_sha256", "scientific_status",
+            "origin", "thermochemistry",
+        }),
+        required=frozenset({"step_semantic_sha256", "transition_side_sha256"}),
+    )
+    bound_step = _digest(
+        data.get("step_semantic_sha256"),
+        field=f"bindings.{step_id}.saddle.step_semantic_sha256",
+    )
+    if bound_step != step_sha256:
+        raise ReactionWorkbenchError(
+            f"bindings.{step_id}.saddle step semantic hash mismatch")
+    bound_side = _digest(
+        data.get("transition_side_sha256"),
+        field=f"bindings.{step_id}.saddle.transition_side_sha256",
+    )
+    if bound_side != semantic_sha256(list(transition_state)):
+        raise ReactionWorkbenchError(
+            f"bindings.{step_id}.saddle transition side hash mismatch")
+    return data
 
 
 def _status(value: Any) -> str:
@@ -1036,7 +1117,9 @@ def _normalise_condition_response(
         canonical_value = (
             canonical_condition.get(parameter)
             if isinstance(canonical_condition, Mapping) else None)
-        if (base is not None
+        canonical_coverage_extension = (
+            parameter == "coverage" and canonical_value is None)
+        if (base is not None and not canonical_coverage_extension
                 and (canonical_value is None or base != float(canonical_value))):
             missing.append(
                 f"{parameter} response base does not match canonical condition set")
@@ -1361,6 +1444,35 @@ def _node(
     }
 
 
+def _derived_saddle_node(
+    *, step_id: str, step_payload: Mapping[str, Any], step_sha256: str,
+    transition_state: Sequence[Mapping[str, Any]], binding: Mapping[str, Any],
+    precision: int, canonical_envelope: bool,
+) -> dict[str, Any]:
+    """Create a UI saddle from an explicitly hash-bound v3 step side."""
+    side = copy.deepcopy(list(transition_state))
+    side_sha256 = semantic_sha256(side)
+    node_id = f"saddle-{semantic_sha256({'step': step_sha256, 'side': side_sha256})[:24]}"
+    node = _node(
+        node_id, step_payload, step_sha256, binding,
+        entity_type="transition_state", precision=precision,
+        canonical_envelope=canonical_envelope,
+    )
+    if not binding:
+        node["missing"].append("explicit_step_scoped_saddle_binding")
+        node["artifact_status"] = "missing"
+    node.update({
+        "derived": True,
+        "source_step_id": step_id,
+        "source_step_semantic_sha256": step_sha256,
+        "transition_state": side,
+        "transition_side_sha256": side_sha256,
+        "saddle_binding_status": "available" if binding else "unavailable",
+    })
+    node["missing"] = list(dict.fromkeys(node["missing"]))
+    return node
+
+
 def _normalise_participants(
     value: Any, *, field: str,
 ) -> list[dict[str, Any]]:
@@ -1370,17 +1482,34 @@ def _normalise_participants(
     result = []
     seen = set()
     for index, raw in enumerate(raw_items):
+        item = _mapping(raw, field=f"{field}[{index}]")
+        canonical_shape = any(
+            key in item for key in ("phase", "charge", "site_stoichiometry"))
+        allowed = (
+            frozenset({
+                "state_id", "coefficient", "phase", "charge",
+                "site_stoichiometry",
+            }) if canonical_shape else frozenset({"state_id", "coefficient"})
+        )
         item = _strict_mapping(
-            raw, field=f"{field}[{index}]",
-            allowed=frozenset({"state_id", "coefficient"}),
-            required=frozenset({"state_id", "coefficient"}))
+            item, field=f"{field}[{index}]", allowed=allowed, required=allowed)
         state_id = _opaque(item.get("state_id"), field=f"{field}[{index}].state_id")
         if state_id in seen:
             raise ReactionWorkbenchError(f"{field} contains duplicate state_id {state_id}")
         seen.add(state_id)
-        coefficient = _rational(
-            item.get("coefficient"), field=f"{field}[{index}].coefficient")
-        result.append({"state_id": state_id, "coefficient": _rational_dto(coefficient)})
+        if canonical_shape:
+            try:
+                participant = CanonicalReactionParticipant.from_dict(item)
+            except CatalysisContractError as exc:
+                raise ReactionWorkbenchError(
+                    f"{field}[{index}] is not a canonical v3 participant: {exc}") from exc
+            result.append(participant.to_dict())
+        else:
+            coefficient = _rational(
+                item.get("coefficient"), field=f"{field}[{index}].coefficient")
+            result.append({
+                "state_id": state_id, "coefficient": _rational_dto(coefficient),
+            })
     return result
 
 
@@ -1428,6 +1557,11 @@ def _normalise_state_chemistry(
     occupancies = []
     seen_sites = set()
     raw_occupancy = payload.get("site_occupancy")
+    if raw_occupancy is None and payload.get("geometric_site_id") is not None:
+        raw_occupancy = [{
+            "site_id": payload.get("geometric_site_id"),
+            "count": {"numerator": 1, "denominator": 1},
+        }]
     if not isinstance(raw_occupancy, Sequence) or isinstance(raw_occupancy, (str, bytes)):
         missing.append("explicit_site_occupancy")
     else:
@@ -1458,15 +1592,42 @@ def _normalise_state_chemistry(
     }
 
 
+def _normalise_fluid_chemistry(
+    payload: Mapping[str, Any], *, field: str,
+) -> dict[str, Any]:
+    """Expose only chemistry declared by one canonical ``FluidState`` DTO."""
+    try:
+        state = FluidState.from_dict(payload)
+    except CatalysisContractError as exc:
+        raise ReactionWorkbenchError(f"{field} is not a canonical FluidState: {exc}") from exc
+    from vcstudio.project.structure_identity import formula_composition
+
+    composition = formula_composition(state.chemical_formula)
+    if composition is None:  # Defensive: FluidState already rejects this shape.
+        raise ReactionWorkbenchError(f"{field}.chemical_formula is not resolvable")
+    return {
+        "status": "available",
+        "elemental_composition": dict(sorted(composition.items())),
+        "chemical_formula": state.chemical_formula,
+        "charge": state.charge,
+        "multiplicity": state.multiplicity,
+        "phase": state.phase,
+        "standard_state": state.standard_state.to_dict(),
+        "surface_id": None,
+        "site_occupancy": [],
+        "missing": [],
+    }
+
+
 def _normalise_condition_set(
     payload: Mapping[str, Any], *, field: str,
 ) -> dict[str, Any]:
     """Validate the condition values that enter compatibility arithmetic."""
     normalized = copy.deepcopy(dict(payload))
     normalized["temperature_k"] = _bounded_condition(
-        payload.get("temperature_k"), key=f"{field}.temperature_k")
+        payload.get("temperature_k"), key=f"{field}.temperature_k", optional=True)
     normalized["pressure_pa"] = _bounded_condition(
-        payload.get("pressure_pa"), key=f"{field}.pressure_pa")
+        payload.get("pressure_pa"), key=f"{field}.pressure_pa", optional=True)
     for key in ("ph", "electrode_potential_v", "coverage"):
         normalized[key] = _bounded_condition(
             payload.get(key), key=f"{field}.{key}", optional=True)
@@ -1594,6 +1755,207 @@ def _reaction_conservation(
             "available" if transition_state_id and not missing and not ts_checks
             else "unavailable" if missing or not transition_state_id else "failed"),
         "missing": list(dict.fromkeys([*missing, *failed])),
+    }
+
+
+def _canonical_v3_conservation(
+    *, step_payload: Mapping[str, Any],
+    state_payloads: Mapping[str, Mapping[str, Any]],
+    state_types: Mapping[str, str],
+    surface_sites: Mapping[str, set[str]],
+) -> dict[str, Any]:
+    """Validate v3 participants against state DTOs and all three sides exactly."""
+    try:
+        step = ElementaryStep.from_dict(step_payload)
+    except CatalysisContractError as exc:
+        raise ReactionWorkbenchError(f"canonical ElementaryStep/v3 is invalid: {exc}") from exc
+
+    authoritative: dict[str, AuthoritativeParticipantState] = {}
+    state_surfaces: dict[str, str | None] = {}
+    authoritative_missing: list[str] = []
+    for side_name, side in (
+        ("reactants", step.reactants),
+        ("transition_state", step.transition_state),
+        ("products", step.products),
+    ):
+        for participant in side:
+            payload = state_payloads.get(participant.state_id)
+            if payload is None:
+                raise ReactionWorkbenchError(
+                    f"steps.{step.step_id}.{side_name} state {participant.state_id} "
+                    "has no authoritative participant-state envelope")
+            state_type = state_types.get(participant.state_id)
+            if state_type not in {"AdsorbateState", "FluidState"}:
+                raise ReactionWorkbenchError(
+                    f"state {participant.state_id} has no supported authoritative type")
+            charge = payload.get("charge")
+            if charge is None:
+                authoritative_missing.append(
+                    f"authoritative_state_charge:{participant.state_id}")
+            elif (isinstance(charge, bool) or not isinstance(charge, int)
+                  or charge != participant.charge):
+                authoritative_missing.append(
+                    f"participant_state_charge_disagrees:{participant.state_id}")
+            site_keys = set(participant.site_stoichiometry)
+            if state_type == "FluidState":
+                try:
+                    fluid = FluidState.from_dict(payload)
+                except CatalysisContractError as exc:
+                    raise ReactionWorkbenchError(
+                        f"state {participant.state_id} is not a canonical FluidState: {exc}"
+                    ) from exc
+                expected_sites = {}
+                surface_id = None
+                if participant.phase != fluid.phase:
+                    authoritative_missing.append(
+                        f"participant_fluid_phase_disagrees:{participant.state_id}")
+                if site_keys:
+                    authoritative_missing.append(
+                        "participant_fluid_site_stoichiometry_disagrees:"
+                        f"{participant.state_id}")
+                authoritative_charge = fluid.charge
+                authoritative_phase = fluid.phase
+                chemical_formula = fluid.chemical_formula
+            else:
+                surface_id = _opaque(
+                    payload.get("surface_id"),
+                    field=f"states.{participant.state_id}.surface_id",
+                )
+                if surface_id not in surface_sites:
+                    raise ReactionWorkbenchError(
+                        f"state {participant.state_id} surface is outside the network")
+                geometric_site_id = payload.get("geometric_site_id")
+                if geometric_site_id is not None:
+                    geometric_site_id = _opaque(
+                        geometric_site_id,
+                        field=f"states.{participant.state_id}.geometric_site_id",
+                    )
+                    expected_sites = {geometric_site_id: 1}
+                    if participant.phase != "adsorbed":
+                        authoritative_missing.append(
+                            f"participant_state_phase_disagrees:{participant.state_id}")
+                    if (site_keys != {geometric_site_id}
+                            or participant.site_stoichiometry[
+                                geometric_site_id].to_fraction() != Fraction(1)):
+                        authoritative_missing.append(
+                            "participant_state_site_stoichiometry_disagrees:"
+                            f"{participant.state_id}")
+                else:
+                    # AdsorbateState/v1 has no occupancy field.  A non-empty
+                    # geometric_site_id authorizes exactly one site of that type;
+                    # without it, a participant declaration cannot create site
+                    # authority in reverse.
+                    expected_sites = {}
+                    authoritative_missing.append(
+                        f"authoritative_state_site_unavailable:{participant.state_id}")
+                    if participant.phase != "adsorbed" or site_keys:
+                        authoritative_missing.append(
+                            "participant_state_site_stoichiometry_disagrees:"
+                            f"{participant.state_id}")
+                unknown_sites = site_keys - surface_sites[surface_id]
+                if unknown_sites:
+                    authoritative_missing.append(
+                        f"participant_state_site_unknown:{participant.state_id}")
+                authoritative_charge = (
+                    charge if isinstance(charge, int) and not isinstance(charge, bool)
+                    else participant.charge)
+                authoritative_phase = "adsorbed"
+                chemical_formula = payload.get("chemical_formula")
+            candidate = AuthoritativeParticipantState(
+                state_id=participant.state_id,
+                chemical_formula=chemical_formula,
+                phase=authoritative_phase,
+                charge=authoritative_charge,
+                site_stoichiometry=expected_sites,
+                surface_id=surface_id,
+            )
+            previous = authoritative.get(participant.state_id)
+            if previous is not None and previous != candidate:
+                raise ReactionWorkbenchError(
+                    f"state {participant.state_id} has conflicting authoritative "
+                    "participant declarations")
+            authoritative[participant.state_id] = candidate
+            state_surfaces[participant.state_id] = surface_id
+
+    conservation_error = None
+    try:
+        validate_elementary_step_conservation(step, authoritative)
+    except CatalysisContractError as exc:
+        conservation_error = str(exc)
+
+    def totals(side: Sequence[CanonicalReactionParticipant]):
+        elements: dict[str, Fraction] = {}
+        charge = Fraction(0)
+        sites: dict[tuple[str, str], Fraction] = {}
+        for participant in side:
+            state = authoritative[participant.state_id]
+            from vcstudio.project.structure_identity import formula_composition
+
+            formula = state.chemical_formula.replace("*", "")
+            composition = {} if not formula else formula_composition(formula)
+            if composition is None:
+                raise ReactionWorkbenchError(
+                    f"state {participant.state_id} chemical formula is not resolvable")
+            coefficient = participant.coefficient.to_fraction()
+            for element, count in composition.items():
+                elements[element] = elements.get(element, Fraction()) + coefficient * count
+            charge += coefficient * state.charge
+            surface_id = state_surfaces[participant.state_id]
+            for site_id, amount in state.site_stoichiometry.items():
+                if surface_id is None:
+                    raise ReactionWorkbenchError(
+                        f"fluid state {participant.state_id} declared surface sites")
+                key = (surface_id, site_id)
+                sites[key] = sites.get(key, Fraction()) + coefficient * amount.to_fraction()
+        return elements, charge, sites
+
+    reactant = totals(step.reactants)
+    transition = totals(step.transition_state)
+    product = totals(step.products)
+    failures = []
+    if reactant[0] != transition[0] or transition[0] != product[0]:
+        failures.append("elemental_conservation")
+    if reactant[1] != transition[1] or transition[1] != product[1]:
+        failures.append("charge_conservation")
+    if reactant[2] != transition[2] or transition[2] != product[2]:
+        failures.append("surface_site_occupancy_conservation")
+    if conservation_error and not failures:
+        failures.append("canonical_conservation_validation")
+    status = (
+        "unavailable" if authoritative_missing else
+        "failed" if failures else "available")
+    detail_status = "unavailable" if authoritative_missing else None
+    return {
+        "schema": "vcstudio.elementary-step-conservation/v2",
+        "status": status,
+        "elemental": {
+            "reactants": _fraction_map_dto(reactant[0]),
+            "transition_state": _fraction_map_dto(transition[0]),
+            "products": _fraction_map_dto(product[0]),
+            "status": detail_status or (
+                "available" if "elemental_conservation" not in failures else "failed"),
+        },
+        "charge": {
+            "reactants": _rational_dto(reactant[1]),
+            "transition_state": _rational_dto(transition[1]),
+            "products": _rational_dto(product[1]),
+            "status": detail_status or (
+                "available" if "charge_conservation" not in failures else "failed"),
+        },
+        "surface_site_occupancy": {
+            "key_schema": "(surface_id, site_id)",
+            "reactants": _site_occupancy_map_dto(reactant[2]),
+            "transition_state": _site_occupancy_map_dto(transition[2]),
+            "products": _site_occupancy_map_dto(product[2]),
+            "status": detail_status or (
+                "available" if "surface_site_occupancy_conservation" not in failures
+                else "failed"),
+        },
+        "transition_state_status": (
+            "unavailable" if authoritative_missing else
+            "available" if not failures else "failed"),
+        "canonical_validator_error": conservation_error,
+        "missing": list(dict.fromkeys([*authoritative_missing, *failures])),
     }
 
 
@@ -1965,6 +2327,10 @@ def _edge_thermochemistry(
         for row in available_rows:
             compatibility = row.get("compatibility") or {}
             for key, expected in expected_values.items():
+                if key == "coverage" and expected is None:
+                    # Coverage is an evidence-bound workbench extension; the
+                    # canonical ConditionSet/v1 DTO has no coverage member.
+                    continue
                 if compatibility.get(key) != expected:
                     thermodynamic_missing.append(
                         f"condition_mismatch:{row.get('entity_id')}:{key}")
@@ -2073,16 +2439,19 @@ def _normalise_projection(
     projection: Mapping[str, Any], *, project_id: str,
 ) -> dict[str, Any]:
     data = _mapping(projection, field="reaction projection")
-    unknown = set(data) - {
-        "schema", "project_id", "network", "surfaces", "states",
-        "transition_states", "steps", "conditions", "bindings", "applicability",
+    schema = str(data.get("schema") or PROJECTION_SCHEMA)
+    if schema not in {PROJECTION_SCHEMA, LEGACY_PROJECTION_SCHEMA}:
+        raise ReactionWorkbenchError("reaction projection schema is unsupported")
+    allowed = {
+        "schema", "project_id", "network", "surfaces", "states", "steps",
+        "conditions", "bindings", "applicability", "authority",
     }
+    if schema == LEGACY_PROJECTION_SCHEMA:
+        allowed.add("transition_states")
+    unknown = set(data) - allowed
     if unknown:
         raise ReactionWorkbenchError(
             "reaction projection contains unknown fields: " + ", ".join(sorted(unknown)))
-    schema = str(data.get("schema") or PROJECTION_SCHEMA)
-    if schema != PROJECTION_SCHEMA:
-        raise ReactionWorkbenchError("reaction projection schema is unsupported")
     supplied_project = data.get("project_id")
     if supplied_project is None:
         raise ReactionWorkbenchError("reaction projection requires an explicit project_id")
@@ -2094,6 +2463,47 @@ def _normalise_projection(
         data[key] = _sequence(data.get(key) or [], field=key)
     data["transition_states"] = _sequence(
         data.get("transition_states") or [], field="transition_states")
+    data["migration_only"] = schema == LEGACY_PROJECTION_SCHEMA
+    raw_authority = data.get("authority")
+    if raw_authority is None:
+        if schema == PROJECTION_SCHEMA:
+            raise ReactionWorkbenchError(
+                "canonical reaction projection requires authority identity facts")
+        data["authority"] = None
+    else:
+        authority = _strict_mapping(
+            raw_authority, field="projection.authority",
+            allowed=frozenset({
+                "domain_authority_id", "domain_generation",
+                "domain_snapshot_sha256", "network_revision_id",
+                "network_semantic_sha256",
+            }),
+            required=frozenset({
+                "domain_authority_id", "domain_generation",
+                "domain_snapshot_sha256", "network_revision_id",
+                "network_semantic_sha256",
+            }),
+        )
+        generation = authority["domain_generation"]
+        if (isinstance(generation, bool) or not isinstance(generation, int)
+                or generation < 1):
+            raise ReactionWorkbenchError(
+                "projection.authority.domain_generation must be a positive integer")
+        data["authority"] = {
+            "domain_authority_id": _authority_id(
+                authority["domain_authority_id"],
+                field="projection.authority.domain_authority_id"),
+            "domain_generation": generation,
+            "domain_snapshot_sha256": _digest(
+                authority["domain_snapshot_sha256"],
+                field="projection.authority.domain_snapshot_sha256"),
+            "network_revision_id": _opaque(
+                authority["network_revision_id"],
+                field="projection.authority.network_revision_id"),
+            "network_semantic_sha256": _digest(
+                authority["network_semantic_sha256"],
+                field="projection.authority.network_semantic_sha256"),
+        }
     data["bindings"] = _mapping(data.get("bindings") or {}, field="bindings")
     data["applicability"] = _normalise_applicability(data.get("applicability"))
     if not isinstance(data.get("network"), Mapping):
@@ -2109,6 +2519,7 @@ def _projection_hash_material(data: Mapping[str, Any]) -> dict[str, Any]:
     """
     material = {
         "schema": data["schema"], "project_id": data["project_id"],
+        "authority": copy.deepcopy(data["authority"]),
         "bindings": copy.deepcopy(data["bindings"]),
         "applicability": copy.deepcopy(data["applicability"]),
     }
@@ -2121,11 +2532,81 @@ def _projection_hash_material(data: Mapping[str, Any]) -> dict[str, Any]:
         }
 
     material["network"] = reference(data["network"], field="network")
-    for key in ("surfaces", "states", "transition_states", "steps", "conditions"):
+    keys = ["surfaces", "states", "steps", "conditions"]
+    if data["schema"] == LEGACY_PROJECTION_SCHEMA:
+        keys.insert(2, "transition_states")
+    for key in keys:
         material[key] = [
             reference(value, field=f"{key}[{index}]")
             for index, value in enumerate(data[key])]
     return material
+
+
+def _validate_native_network_closure(
+    *, network_surface_ids: Sequence[str], network_state_ids: Sequence[str],
+    network_step_ids: Sequence[str], network_condition_ids: Sequence[str],
+    surfaces: Mapping[str, tuple[Mapping[str, Any], str, bool]],
+    states: Mapping[str, tuple[Mapping[str, Any], str, bool]],
+    state_types: Mapping[str, str],
+    steps: Mapping[str, tuple[Mapping[str, Any], str, bool]],
+    condition_sets: Mapping[str, tuple[Mapping[str, Any], str, bool]],
+) -> set[str]:
+    """Reject an open or ambiguously over-complete canonical v2 projection."""
+    expected = {
+        "surface": set(network_surface_ids),
+        "step": set(network_step_ids),
+        "condition": set(network_condition_ids),
+    }
+    actual = {
+        "surface": set(surfaces),
+        "step": set(steps),
+        "condition": set(condition_sets),
+    }
+    for kind in expected:
+        if expected[kind] != actual[kind]:
+            raise ReactionWorkbenchError(
+                f"canonical reaction network {kind} closure mismatch")
+
+    ground_ids: set[str] = set()
+    participant_ids: set[str] = set()
+    for step_id in network_step_ids:
+        payload = steps[step_id][0]
+        try:
+            step = ElementaryStep.from_dict(payload)
+        except CatalysisContractError as exc:
+            raise ReactionWorkbenchError(
+                f"steps.{step_id} must be canonical ElementaryStep/v3: {exc}") from exc
+        reactant_ids = {item.state_id for item in step.reactants}
+        product_ids = {item.state_id for item in step.products}
+        overlap = reactant_ids & product_ids
+        if overlap:
+            raise ReactionWorkbenchError(
+                f"steps.{step_id} contains state identifiers on both sides: "
+                + ", ".join(sorted(overlap)))
+        ground_ids.update(reactant_ids | product_ids)
+        participant_ids.update(
+            reactant_ids | product_ids
+            | {item.state_id for item in step.transition_state})
+        if (step.condition_set_id is not None
+                and step.condition_set_id not in expected["condition"]):
+            raise ReactionWorkbenchError(
+                f"steps.{step_id} condition set is outside the reaction network")
+    if set(network_state_ids) != participant_ids:
+        raise ReactionWorkbenchError(
+            "canonical reaction network state closure mismatch")
+    if set(states) != participant_ids:
+        raise ReactionWorkbenchError(
+            "canonical projection authoritative participant-state closure mismatch")
+    for state_id, (payload, _digest_value, _canonical) in states.items():
+        state_type = state_types.get(state_id)
+        if state_type not in {"AdsorbateState", "FluidState"}:
+            raise ReactionWorkbenchError(
+                f"state {state_id} has no supported authoritative type")
+        if (state_type == "AdsorbateState"
+                and payload.get("surface_id") not in expected["surface"]):
+            raise ReactionWorkbenchError(
+                f"state {state_id} surface is outside the reaction network")
+    return ground_ids
 
 
 def _condition_response_delta(
@@ -2479,7 +2960,7 @@ def _report_binding(
 
 
 def _frozen_network(
-    *, graph: Mapping[str, Any], revision: Mapping[str, Any],
+    *, graph: Mapping[str, Any], revision: Mapping[str, Any], scientific_status: str,
 ) -> dict[str, Any]:
     """Freeze the only supported downstream microkinetics consumer payload."""
     derived_by_id = {
@@ -2487,9 +2968,48 @@ def _frozen_network(
     edges = []
     for edge in graph.get("edges") or []:
         derived = derived_by_id.get(str(edge.get("edge_id"))) or {}
+        evidence_refs = [{
+            "role": "elementary_step",
+            "object_type": "ElementaryStep",
+            "object_id": edge.get("object_id"),
+            "object_revision_id": edge.get("object_revision_id"),
+            "semantic_sha256": edge.get("object_semantic_sha256"),
+            "resolver_refs": copy.deepcopy(edge.get("domain_evidence_refs") or []),
+        }]
+        evidence_refs.extend(copy.deepcopy(
+            edge.get("participant_evidence_refs") or []))
+        if edge.get("condition_evidence_ref") is not None:
+            evidence_refs.append(copy.deepcopy(edge["condition_evidence_ref"]))
+        for role, digest in (
+            ("edge_evidence", edge.get("evidence_sha256")),
+            ("edge_compatibility", (edge.get("edge_evidence") or {}).get(
+                "compatibility_sha256")),
+            ("transition_state_structure", edge.get("structure_sha256")),
+            ("transition_state_evidence", edge.get(
+                "transition_state_evidence_sha256")),
+            ("transition_state_binding", edge.get(
+                "transition_state_binding_sha256")),
+        ):
+            if digest is not None:
+                evidence_refs.append({"role": role, "sha256": digest})
+        evidence_missing = []
+        for item in evidence_refs:
+            if item.get("object_type") and not item.get("resolver_refs"):
+                evidence_missing.append(
+                    f"evidence_resolver:{item.get('object_type')}:{item.get('object_id')}")
+            if item.get("object_type") and not item.get("semantic_sha256"):
+                evidence_missing.append(
+                    f"semantic_evidence_hash:{item.get('object_type')}:{item.get('object_id')}")
+        for role in (
+            "edge_evidence", "edge_compatibility", "transition_state_structure",
+            "transition_state_evidence", "transition_state_binding",
+        ):
+            if not any(item.get("role") == role for item in evidence_refs):
+                evidence_missing.append(f"hash_bound_evidence_ref:{role}")
         edges.append({
             "edge_id": edge.get("edge_id"),
             "reactants": copy.deepcopy(edge.get("reactants") or []),
+            "transition_state": copy.deepcopy(edge.get("transition_state") or []),
             "products": copy.deepcopy(edge.get("products") or []),
             "reactant_state_ids": list(edge.get("reactant_node_ids") or []),
             "product_state_ids": list(edge.get("product_node_ids") or []),
@@ -2501,6 +3021,7 @@ def _frozen_network(
             "evidence_sha256": edge.get("evidence_sha256"),
             "edge_compatibility_sha256": (
                 edge.get("edge_evidence") or {}).get("compatibility_sha256"),
+            "evidence_refs": evidence_refs,
             "conservation": copy.deepcopy(edge.get("conservation") or {}),
             "reaction_delta_g_eV": derived.get("reaction_delta_g_eV"),
             "observed_activation_delta_e_eV": derived.get(
@@ -2515,6 +3036,7 @@ def _frozen_network(
             "kinetic_status": derived.get("kinetic_status", "unavailable"),
             "missing": list(dict.fromkeys([
                 *(edge.get("missing") or []), *(derived.get("missing") or []),
+                *evidence_missing,
             ])),
         })
     ready = bool(
@@ -2525,7 +3047,11 @@ def _frozen_network(
                 and not edge["missing"] for edge in edges))
     body = {
         "schema": FROZEN_NETWORK_SCHEMA,
+        "version": "2",
         "network_id": graph.get("network_id"),
+        "domain_authority": copy.deepcopy(graph.get("domain_authority")),
+        "network_identity": copy.deepcopy(graph.get("network_identity") or {}),
+        "state_catalog": copy.deepcopy(graph.get("state_catalog") or []),
         "source_projection_sha256": graph.get("source_projection_sha256"),
         "reaction_graph_sha256": graph.get("graph_sha256"),
         "condition_revision_id": revision.get("revision_id"),
@@ -2535,7 +3061,7 @@ def _frozen_network(
         "canonical_envelope_authority": graph.get("canonical_envelope_authority") is True,
         "binding_status_gate": copy.deepcopy(
             graph.get("binding_status_gate") or {}),
-        "scientific_status": graph.get("scientific_status", "unknown"),
+        "scientific_status": scientific_status,
         "readiness": "ready" if ready else "blocked",
         "microkinetics_ready": ready,
         "authorizes_execution": False,
@@ -2632,7 +3158,8 @@ def build_reaction_workbench_view(
     project_id = _opaque(project_id, field="project_id")
     data = _normalise_projection(projection, project_id=project_id)
     projection_hash = semantic_sha256(_projection_hash_material(data))
-    bindings = data["bindings"]
+    bindings = copy.deepcopy(data["bindings"])
+    native_projection = data["schema"] == PROJECTION_SCHEMA
 
     network, network_hash, network_type, network_canonical = _unwrap(
         data["network"], field="network")
@@ -2645,6 +3172,12 @@ def build_reaction_workbench_view(
     if network_envelope_id is not None and _opaque(
             network_envelope_id, field="network.object_id") != network_id:
         raise ReactionWorkbenchError("network envelope identity mismatch")
+    authority = data["authority"]
+    if authority is not None and (
+            authority["network_revision_id"] != network.get("object_revision_id")
+            or authority["network_semantic_sha256"] != network_hash):
+        raise ReactionWorkbenchError(
+            "projection authority does not match the canonical network revision")
     network_surface_ids = _unique_opaque_ids(
         network.get("surface_ids") or [], field="network.surface_ids")
     network_state_ids = _unique_opaque_ids(
@@ -2655,6 +3188,7 @@ def build_reaction_workbench_view(
         network.get("condition_set_ids") or [], field="network.condition_set_ids")
 
     surfaces, states, transition_states, steps, condition_sets = {}, {}, {}, {}, {}
+    state_types: dict[str, str] = {}
     for index, raw in enumerate(data["surfaces"]):
         identity, payload, digest, _kind, canonical = _projection_record(
             raw, identity_field="surface_id", field=f"surfaces[{index}]")
@@ -2666,11 +3200,14 @@ def build_reaction_workbench_view(
     for index, raw in enumerate(data["states"]):
         identity, payload, digest, _kind, canonical = _projection_record(
             raw, identity_field="state_id", field=f"states[{index}]")
-        if _kind and _kind != "AdsorbateState":
-            raise ReactionWorkbenchError("state envelope object_type must be AdsorbateState")
+        if _kind not in {"AdsorbateState", "FluidState"}:
+            raise ReactionWorkbenchError(
+                "state envelope object_type must be AdsorbateState or FluidState")
         if identity in states:
-            raise ReactionWorkbenchError(f"duplicate state_id: {identity}")
+            raise ReactionWorkbenchError(
+                f"state_id {identity} resolves to more than one authoritative state")
         states[identity] = (payload, digest, canonical)
+        state_types[identity] = _kind
     for index, raw in enumerate(data["transition_states"]):
         payload, digest, kind, canonical = _unwrap(
             raw, field=f"transition_states[{index}]")
@@ -2706,24 +3243,42 @@ def build_reaction_workbench_view(
             _normalise_condition_set(payload, field=f"conditions[{index}]"),
             digest, canonical)
 
+    native_step_contract = bool(
+        native_projection and steps
+        and all(record[0].get("schema") == ElementaryStep.schema
+                for record in steps.values()))
+
     surface_sites = {}
     for surface_id, (payload, _digest_value, _canonical) in surfaces.items():
         surface_sites[surface_id] = set(_unique_opaque_ids(
             payload.get("geometric_site_ids") or [],
             field=f"surfaces.{surface_id}.geometric_site_ids"))
 
+    visible_state_ids = set(network_state_ids)
+    if native_step_contract:
+        visible_state_ids = _validate_native_network_closure(
+            network_surface_ids=network_surface_ids,
+            network_state_ids=network_state_ids,
+            network_step_ids=network_step_ids,
+            network_condition_ids=network_condition_ids,
+            surfaces=surfaces, states=states, state_types=state_types, steps=steps,
+            condition_sets=condition_sets,
+        )
+
     canonical_envelope_authority = bool(
-        network_canonical
+        native_projection and authority is not None and network_canonical
         and all(record[2] for records in (
-            surfaces, states, transition_states, steps, condition_sets)
+            surfaces, states, steps, condition_sets)
                 for record in records.values()))
+    data["migration_only"] = not canonical_envelope_authority
     network_observed_origin_chain = _source_origins_observed(
         network, _binding_for(bindings, network_id), field=network_id)
 
     referenced_ts_ids = {
         str(payload.get("transition_state_id"))
         for step_id, (payload, _digest_value, _canonical) in steps.items()
-        if step_id in network_step_ids and payload.get("transition_state_id")
+        if (not native_step_contract and step_id in network_step_ids
+            and payload.get("transition_state_id"))
     }
     nodes = []
     node_by_id = {}
@@ -2743,16 +3298,20 @@ def build_reaction_workbench_view(
         nodes.append(node)
         node_by_id[surface_id] = node
     for state_id in network_state_ids:
+        if state_id not in visible_state_ids:
+            continue
         if state_id in referenced_ts_ids:
             if state_id in states:
                 raise ReactionWorkbenchError(
-                    f"{state_id} is bound as both AdsorbateState and TransitionState")
-            # Some canonical network revisions include TS identities in the
-            # broad state_ids set.  The explicit transition_states projection
-            # below remains authoritative for the object type.
+                    f"{state_id} is bound as both an authoritative state and TransitionState")
+            # Legacy v1 projections sometimes included a standalone TS ID in
+            # state_ids.  Only the legacy transition_states collection can
+            # render that historical shape; it never gains formal authority.
             continue
         record = states.get(state_id)
-        entity_type = "adsorbate_state"
+        state_type = state_types.get(state_id)
+        entity_type = (
+            "fluid_state" if state_type == "FluidState" else "adsorbate_state")
         if record is None:
             missing_nodes.append({
                 "node_id": state_id, "entity_type": entity_type,
@@ -2763,13 +3322,25 @@ def build_reaction_workbench_view(
             state_id, payload, digest, _binding_for(bindings, state_id),
             entity_type=entity_type, precision=precision,
             canonical_envelope=canonical)
-        node["chemistry"] = _normalise_state_chemistry(
-            payload, surface_sites=surface_sites, field=f"states.{state_id}")
+        node["object_type"] = state_type
+        node["object_revision_id"] = payload.get("object_revision_id")
+        node["chemistry"] = (
+            _normalise_fluid_chemistry(payload, field=f"states.{state_id}")
+            if state_type == "FluidState" else _normalise_state_chemistry(
+                payload, surface_sites=surface_sites, field=f"states.{state_id}"))
+        node["phase"] = (
+            payload.get("phase") if state_type == "FluidState" else "adsorbed")
+        node["standard_state"] = (
+            copy.deepcopy(payload.get("standard_state"))
+            if state_type == "FluidState" else None)
+        node["chemical_formula"] = payload.get("chemical_formula")
+        node["charge"] = payload.get("charge")
+        node["multiplicity"] = payload.get("multiplicity")
         if node["chemistry"]["status"] != "available":
             node["missing"].extend(node["chemistry"]["missing"])
             node["artifact_status"] = "missing"
         surface_id = str(payload.get("surface_id") or "")
-        if surface_id not in surfaces:
+        if state_type == "AdsorbateState" and surface_id not in surfaces:
             node["missing"].append("surface_binding")
             node["artifact_status"] = "missing"
         nodes.append(node)
@@ -2800,6 +3371,29 @@ def build_reaction_workbench_view(
         nodes.append(node)
         node_by_id[ts_id] = node
 
+    saddle_by_step: dict[str, str] = {}
+    if native_step_contract:
+        for step_id in network_step_ids:
+            payload, digest, canonical = steps[step_id]
+            transition_side = _normalise_participants(
+                payload.get("transition_state"),
+                field=f"steps.{step_id}.transition_state",
+            )
+            step_binding = _binding_for(bindings, step_id)
+            saddle_binding = _saddle_binding_for(
+                step_binding, step_id=step_id, step_sha256=digest,
+                transition_state=transition_side,
+            )
+            node = _derived_saddle_node(
+                step_id=step_id, step_payload=payload, step_sha256=digest,
+                transition_state=transition_side, binding=saddle_binding,
+                precision=precision, canonical_envelope=canonical,
+            )
+            bindings[node["node_id"]] = saddle_binding
+            saddle_by_step[step_id] = node["node_id"]
+            nodes.append(node)
+            node_by_id[node["node_id"]] = node
+
     edges, missing_edges = [], []
     for step_id in network_step_ids:
         record = steps.get(step_id)
@@ -2813,6 +3407,11 @@ def build_reaction_workbench_view(
             payload.get("reactants"), field=f"steps.{step_id}.reactants")
         products = _normalise_participants(
             payload.get("products"), field=f"steps.{step_id}.products")
+        transition_side = (
+            _normalise_participants(
+                payload.get("transition_state"),
+                field=f"steps.{step_id}.transition_state")
+            if native_step_contract else [])
         reactant_ids = [str(item["state_id"]) for item in reactants]
         product_ids = [str(item["state_id"]) for item in products]
         overlap = set(reactant_ids) & set(product_ids)
@@ -2820,7 +3419,9 @@ def build_reaction_workbench_view(
             raise ReactionWorkbenchError(
                 f"steps.{step_id} contains state identifiers on both sides: "
                 + ", ".join(sorted(overlap)))
-        ts_id = payload.get("transition_state_id")
+        ts_id = (
+            saddle_by_step.get(step_id) if native_step_contract
+            else payload.get("transition_state_id"))
         ts_id = _opaque(ts_id, field=f"steps.{step_id}.transition_state_id") if ts_id else None
         condition_set_id = payload.get("condition_set_id")
         condition_set_id = (
@@ -2871,31 +3472,98 @@ def build_reaction_workbench_view(
         }
         step_source_observed = _source_origins_observed(
             payload, binding, field=step_id)
+        if native_step_contract:
+            step_source_observed = bool(
+                step_source_observed
+                and all(
+                    state_id in states
+                    and _source_origins_observed(
+                        states[state_id][0], _binding_for(bindings, state_id),
+                        field=state_id)
+                    for state_id in {
+                        *(item["state_id"] for item in reactants),
+                        *(item["state_id"] for item in transition_side),
+                        *(item["state_id"] for item in products),
+                    }))
         edge_evidence = _normalise_edge_evidence(
             binding.get("edge_evidence"), edge_method_sha256=method_hash,
             binding_evidence_sha256=evidence_hash,
             reactant_ids=reactant_ids, product_ids=product_ids,
             transition_state_id=ts_id, node_by_id=node_by_id,
             edge_source_observed=step_source_observed)
-        conservation = _reaction_conservation(
-            reactants=reactants, products=products,
-            transition_state_id=ts_id, node_by_id=node_by_id)
+        conservation = (
+            _canonical_v3_conservation(
+                step_payload=payload,
+                state_payloads={key: record[0] for key, record in states.items()},
+                state_types=state_types,
+                surface_sites=surface_sites,
+            ) if native_step_contract else _reaction_conservation(
+                reactants=reactants, products=products,
+                transition_state_id=ts_id, node_by_id=node_by_id))
         if conservation["status"] != "available":
             missing.extend(conservation["missing"] or ["reaction_conservation"])
+        saddle_node = node_by_id.get(ts_id) if ts_id else None
+        saddle_binding_sha256 = (
+            semantic_sha256({
+                "step_semantic_sha256": (saddle_node or {}).get(
+                    "source_step_semantic_sha256"),
+                "transition_side_sha256": (saddle_node or {}).get(
+                    "transition_side_sha256"),
+                "structure_sha256": (saddle_node or {}).get("structure_sha256"),
+                "evidence_sha256": (saddle_node or {}).get("evidence_sha256"),
+            }) if native_step_contract and saddle_node is not None
+            and saddle_node.get("saddle_binding_status") == "available" else None)
+        participant_evidence_refs = []
+        for participant_role, participants in (
+            ("reactant", reactants), ("transition_state", transition_side),
+            ("product", products),
+        ):
+            for participant in participants:
+                state_id = str(participant["state_id"])
+                state_record = states.get(state_id)
+                state_payload = state_record[0] if state_record is not None else {}
+                participant_evidence_refs.append({
+                    "role": participant_role,
+                    "object_type": state_types.get(state_id),
+                    "object_id": state_id,
+                    "object_revision_id": state_payload.get("object_revision_id"),
+                    "semantic_sha256": (
+                        state_record[1] if state_record is not None else None),
+                    "resolver_refs": copy.deepcopy(
+                        state_payload.get("evidence_refs") or []),
+                })
+        condition_evidence_ref = ({
+            "role": "condition_set",
+            "object_type": "ConditionSet",
+            "object_id": condition_set_id,
+            "object_revision_id": condition_record[0].get("object_revision_id"),
+            "semantic_sha256": condition_record[1],
+            "resolver_refs": copy.deepcopy(
+                condition_record[0].get("evidence_refs") or []),
+        } if condition_record is not None else None)
         edge = {
             "edge_id": step_id, "object_id": step_id,
             "reactants": reactants, "products": products,
+            "transition_state": transition_side,
             "reactant_node_ids": reactant_ids, "product_node_ids": product_ids,
             "transition_state_id": ts_id,
+            "transition_state_node_id": ts_id,
             "condition_set_id": condition_set_id,
             "condition_set_sha256": (
                 condition_record[1] if condition_record is not None else None),
             "stoichiometry": stoichiometry,
             "structure_sha256": (
                 node_by_id.get(ts_id, {}).get("structure_sha256") if ts_id else None),
+            "transition_state_evidence_sha256": (
+                node_by_id.get(ts_id, {}).get("evidence_sha256") if ts_id else None),
+            "transition_state_binding_sha256": saddle_binding_sha256,
             "method_sha256": method_hash, "evidence_sha256": evidence_hash,
             "canonical_envelope": canonical,
             "object_semantic_sha256": digest,
+            "object_revision_id": payload.get("object_revision_id"),
+            "domain_evidence_refs": copy.deepcopy(payload.get("evidence_refs") or []),
+            "participant_evidence_refs": participant_evidence_refs,
+            "condition_evidence_ref": condition_evidence_ref,
             "edge_evidence": edge_evidence,
             "conservation": conservation,
             "observed_origin_chain": bool(
@@ -2999,6 +3667,10 @@ def build_reaction_workbench_view(
         "object_id": node["node_id"], "entity_type": node["entity_type"],
         "scientific_status": node["binding_scientific_status"],
     } for node in nodes], *[{
+        "object_id": state_id, "entity_type": "authoritative_participant_state",
+        "scientific_status": _status(
+            _binding_for(bindings, state_id).get("scientific_status")),
+    } for state_id in sorted(set(states) - visible_state_ids)], *[{
         "object_id": edge["edge_id"], "entity_type": "elementary_step",
         "scientific_status": edge["binding_scientific_status"],
     } for edge in edges], *[{
@@ -3019,10 +3691,54 @@ def build_reaction_workbench_view(
         "blocking": binding_status_blockers,
     }
 
+    state_catalog = []
+    for state_id in network_state_ids:
+        record = states.get(state_id)
+        if record is None:
+            continue
+        payload, digest, _canonical = record
+        state_type = state_types[state_id]
+        catalog_item = {
+            "state_id": state_id,
+            "object_type": state_type,
+            "object_revision_id": payload.get("object_revision_id"),
+            "semantic_sha256": digest,
+            "phase": payload.get("phase") if state_type == "FluidState" else "adsorbed",
+            "chemical_formula": payload.get("chemical_formula"),
+            "charge": payload.get("charge"),
+            "multiplicity": payload.get("multiplicity"),
+        }
+        if state_type == "FluidState":
+            catalog_item["standard_state"] = copy.deepcopy(
+                payload.get("standard_state"))
+        else:
+            geometric_site_id = payload.get("geometric_site_id")
+            catalog_item["surface_id"] = payload.get("surface_id")
+            catalog_item["site_stoichiometry"] = (
+                {str(geometric_site_id): {"numerator": 1, "denominator": 1}}
+                if geometric_site_id else {})
+        state_catalog.append(catalog_item)
+
+    domain_authority = (None if authority is None else {
+        "authority_id": authority["domain_authority_id"],
+        "generation": authority["domain_generation"],
+        "snapshot_sha256": authority["domain_snapshot_sha256"],
+    })
+    network_identity = {
+        "network_id": network_id,
+        "object_revision_id": network.get("object_revision_id"),
+        "semantic_sha256": network_hash,
+    }
+
     graph_body = {
         "schema": GRAPH_SCHEMA, "network_id": network_id,
         "network_semantic_sha256": network_hash,
+        "domain_authority": domain_authority,
+        "network_identity": network_identity,
+        "state_catalog": state_catalog,
         "source_projection_sha256": projection_hash,
+        "source_projection_schema": data["schema"],
+        "migration_only": data["migration_only"],
         "canonical_envelope_authority": canonical_envelope_authority,
         "observed_origin_chain": projection_observed_origin_chain,
         "binding_status_gate": binding_status_gate,
@@ -3088,11 +3804,12 @@ def build_reaction_workbench_view(
         projection_sha256=projection_hash, graph=graph, ledger=ledger,
         conditions=requested_conditions, applicability=data["applicability"],
         precision=precision)
-    frozen_network = _frozen_network(graph=graph, revision=revision)
     scientific_status = _combined_status([
         graph["scientific_status"], ledger["scientific_status"],
         revision["scientific_status"],
     ])
+    frozen_network = _frozen_network(
+        graph=graph, revision=revision, scientific_status=scientific_status)
     report_binding = _report_binding(
         graph=graph, ledger=ledger, revision=revision,
         scientific_status=scientific_status)
@@ -3102,8 +3819,9 @@ def build_reaction_workbench_view(
     ]))
     body = {
         "schema": VIEW_SCHEMA, "analysis_id": "free-energy-path",
-        "project_id": project_id, "source_projection_schema": PROJECTION_SCHEMA,
+        "project_id": project_id, "source_projection_schema": data["schema"],
         "source_projection_sha256": projection_hash,
+        "migration_only": data["migration_only"],
         "scientific_status": scientific_status,
         "artifact_status": (
             "available" if graph["artifact_status"] == "available"
@@ -3132,7 +3850,9 @@ def build_reaction_workbench_view(
         "denominator": {
             "network_nodes": (
                 len(set(network_surface_ids))
-                + len(set(network_state_ids) | set(referenced_ts_ids))),
+                + len(visible_state_ids)
+                + (len(saddle_by_step) if native_step_contract
+                   else len(set(referenced_ts_ids)))),
             "bound_nodes": len(nodes), "missing_nodes": len(missing_nodes),
             "network_edges": len(network_step_ids), "bound_edges": len(edges),
             "missing_edges": len(missing_edges), "ledger_rows": len(ledger_rows),
@@ -3177,6 +3897,7 @@ __all__ = [
     "ENERGY_OBSERVATION_SCHEMA", "FREQUENCY_EVIDENCE_SCHEMA",
     "FROZEN_NETWORK_SCHEMA", "GRAPH_SCHEMA", "LEDGER_SCHEMA",
     "JOINT_RESPONSE_MODEL_SCHEMA", "LOW_FREQUENCY_SCHEMA", "NEB_EVIDENCE_SCHEMA",
+    "LEGACY_DOMAIN_ENVELOPE_SCHEMA", "LEGACY_PROJECTION_SCHEMA",
     "PARAMETER_RESPONSE_MODEL_SCHEMA", "PROJECTION_SCHEMA",
     "REPORT_BINDING_SCHEMA", "STANDARD_STATE_SCHEMA",
     "THERMOCHEMISTRY_BINDING_SCHEMA", "THERMOCHEMISTRY_TERM_SCHEMA", "VIEW_SCHEMA",

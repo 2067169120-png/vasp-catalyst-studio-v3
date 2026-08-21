@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 
 import pytest
 
@@ -13,6 +14,8 @@ from vcstudio.project.catalysis_contracts import (
     ElementaryStep,
     EvidenceRef,
     ExactRational,
+    FluidStandardState,
+    FluidState,
     MethodFingerprint,
     AuthoritativeParticipantState,
     ReactionParticipant,
@@ -49,10 +52,14 @@ def _participant(state_id, coefficient=1, phase="gas", charge=0, sites=None):
     )
 
 
-def _state(state_id, formula, phase="gas", charge=0, sites=None):
+def _state(
+        state_id, formula, phase="gas", charge=0, sites=None, surface_id=None):
+    site_stoichiometry = {} if sites is None else sites
     return AuthoritativeParticipantState(
         state_id=state_id, chemical_formula=formula, phase=phase, charge=charge,
-        site_stoichiometry={} if sites is None else sites,
+        site_stoichiometry=site_stoichiometry,
+        surface_id=(surface_id if surface_id is not None else
+                    "surface-1" if site_stoichiometry else None),
     )
 
 
@@ -63,6 +70,24 @@ def _step(reactants, transition_state, products, step_id="step-conservation"):
         condition_set_id=None, reversible=False, provenance="observed",
         evidence_refs=_refs(), method_fingerprint=_method(),
         object_revision_id="revision-1",
+    )
+
+
+def _fluid(
+        state_id="fluid-co", *, phase="gas", formula="CO", charge=0,
+        multiplicity=1, standard_state=None):
+    if standard_state is None:
+        standard_state = FluidStandardState(
+            phase=phase,
+            kind="1-bar" if phase == "gas" else "1-molar",
+            value=100000.0 if phase == "gas" else 1.0,
+            unit="Pa" if phase == "gas" else "mol/L",
+        )
+    return FluidState(
+        state_id=state_id, phase=phase, chemical_formula=formula,
+        charge=charge, multiplicity=multiplicity, standard_state=standard_state,
+        provenance="observed", evidence_refs=_refs(),
+        method_fingerprint=_method(), object_revision_id="fluid-revision-1",
     )
 
 
@@ -149,6 +174,79 @@ def test_storage_envelope_rehashes_payload_and_keeps_job_yaml_authoritative():
         mismatched[field] = replacement
         with pytest.raises(CatalysisContractError):
             DomainEnvelope.from_dict(mismatched)
+
+
+def test_adsorbate_envelope_identity_does_not_guess_shared_surface(tmp_path):
+    from vcstudio.project.catalysis_domain_store import DomainEnvelopeStore
+
+    first_state = _objects()[1]
+    second_state = replace(
+        first_state, state_id="state-o-top", adsorbate_id="ads-o",
+        chemical_formula="O", object_revision_id="state-o-revision-1",
+    )
+    first = DomainEnvelope.wrap(first_state)
+    second = DomainEnvelope.wrap(second_state)
+    assert first.object_id == "state-co-top"
+    assert second.object_id == "state-o-top"
+    assert first.payload["surface_id"] == second.payload["surface_id"]
+
+    store = DomainEnvelopeStore(tmp_path / "domain.json")
+    assert store.put(first).action == "created"
+    assert store.put(second).action == "created"
+    assert store.head("AdsorbateState", "state-co-top") == first
+    assert store.head("AdsorbateState", "state-o-top") == second
+
+
+def test_fluid_state_and_standard_state_are_strict_frozen_envelope_contracts():
+    gas = _fluid()
+    restored = FluidState.from_dict(gas.to_dict())
+    assert restored == gas
+    assert restored.standard_state == FluidStandardState.from_dict(
+        gas.standard_state.to_dict())
+    envelope = DomainEnvelope.wrap(gas)
+    assert envelope.object_type == "FluidState"
+    assert envelope.object_id == "fluid-co"
+    assert DomainEnvelope.from_dict(envelope.to_dict()) == envelope
+    assert set(gas.to_dict()) == {
+        "schema", "schema_version", "object_revision_id", "parent_revision",
+        "expected_current_hash", "state_id", "phase", "chemical_formula",
+        "charge", "multiplicity", "standard_state", "provenance",
+        "evidence_refs", "method_fingerprint",
+    }
+
+
+@pytest.mark.parametrize(("phase", "kind", "value", "unit"), [
+    ("solution", "1-molar", 1.0, "mol/L"),
+    ("gas", "1-molar", 1.0, "mol/L"),
+    ("gas", "1-bar", 101325.0, "Pa"),
+    ("liquid", "1-bar", 100000.0, "Pa"),
+    ("liquid", "pure-liquid", 1.0, "dimensionless"),
+    ("aqueous", "1-molar", 1.0, "M"),
+])
+def test_fluid_standard_state_rejects_aliases_defaults_and_wrong_dimensions(
+        phase, kind, value, unit):
+    with pytest.raises(CatalysisContractError, match="standard-state|unsupported"):
+        FluidStandardState(
+            phase=phase, kind=kind, value=value, unit=unit)
+
+
+@pytest.mark.parametrize("formula", ["(CH3)2O", "Xx2", "H0", "H2O!", "*"])
+def test_fluid_formula_requires_current_exact_plain_formula_parser(formula):
+    with pytest.raises(CatalysisContractError, match="chemical_formula"):
+        _fluid(formula=formula)
+
+
+def test_fluid_state_rejects_phase_mismatch_nullable_charge_and_unknown_fields():
+    molar = FluidStandardState(
+        phase="liquid", kind="1-molar", value=1.0, unit="mol/L")
+    with pytest.raises(CatalysisContractError, match="phase"):
+        _fluid(phase="aqueous", standard_state=molar)
+    with pytest.raises(CatalysisContractError, match="charge"):
+        _fluid(charge=None)
+    wire = _fluid().to_dict()
+    wire["activity"] = 1.0
+    with pytest.raises(CatalysisContractError, match="unknown fields"):
+        FluidState.from_dict(wire)
 
 
 def test_revision_parent_and_expected_hash_are_an_atomic_pair():
@@ -376,8 +474,11 @@ def test_half_o2_uses_fraction_exactly_across_reactants_ts_and_products():
     })
     assert result["elements"] == {"O": {"numerator": 1, "denominator": 1}}
     assert result["charge"] == {"numerator": 1, "denominator": 1}
+    assert result["site_key_schema"] == "surface_id -> site_id"
     assert result["site_stoichiometry"] == {
-        "bridge": {"numerator": 1, "denominator": 1},
+        "surface-1": {
+            "bridge": {"numerator": 1, "denominator": 1},
+        },
     }
     assert result["authorizes_execution"] is False
     assert canonical_json_bytes(result)
@@ -427,6 +528,28 @@ def test_a_site_to_b_site_is_rejected_per_site_type_not_scalar_total():
             "reactant": _state("reactant", "H", "adsorbed", sites={"A-site": 1}),
             "ts": _state("ts", "H", "adsorbed", sites={"A-site": 1}),
             "product": _state("product", "H", "adsorbed", sites={"B-site": 1}),
+        })
+
+
+def test_same_site_name_on_different_surfaces_is_not_conserved():
+    step = _step(
+        [_participant("reactant", 1, "adsorbed", sites={"top": 1})],
+        [_participant("ts", 1, "adsorbed", sites={"top": 1})],
+        [_participant("product", 1, "adsorbed", sites={"top": 1})],
+        "step-cross-surface",
+    )
+    with pytest.raises(
+            CatalysisContractError, match="site-type conservation across surfaces"):
+        validate_elementary_step_conservation(step, {
+            "reactant": _state(
+                "reactant", "H", "adsorbed", sites={"top": 1},
+                surface_id="surface-a"),
+            "ts": _state(
+                "ts", "H", "adsorbed", sites={"top": 1},
+                surface_id="surface-a"),
+            "product": _state(
+                "product", "H", "adsorbed", sites={"top": 1},
+                surface_id="surface-b"),
         })
 
 

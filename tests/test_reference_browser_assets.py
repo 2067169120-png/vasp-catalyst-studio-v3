@@ -53,7 +53,7 @@ def test_reference_route_is_project_bound_and_has_no_query_extension_surface():
     assert "`/projects/${projectToken(c)}/analysis/references`" in route
     assert "focus: '#rb-title'" in route
     assert "references: 'analyze-references'" in workspace
-    assert "analysis\\/(adsorption|thermo|electronic|charge|comparison|custom|properties|references)" in workspace
+    assert "analysis\\/(adsorption|thermo|kinetics|electronic|charge|comparison|custom|properties|references)" in workspace
     query_keys = workspace.split("const ROUTE_QUERY_KEYS", 1)[1].split(
         "function tr", 1)[0]
     assert "analyze-references" not in query_keys

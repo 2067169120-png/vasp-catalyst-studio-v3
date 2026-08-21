@@ -7,6 +7,7 @@ import hashlib
 import pytest
 
 from vcstudio.project import kinetics
+from vcstudio.project.kinetics_model_spec import KineticsModelSpec
 
 
 _EVIDENCE = {
@@ -19,6 +20,12 @@ _EVIDENCE = {
 class FrozenNetwork(dict):
     """Test-only stand-in for the server-injected canonical provider DTO."""
 
+    def __init__(self, *args, **kwargs):
+        source = args[0] if args else None
+        super().__init__(*args, **kwargs)
+        if isinstance(source, FrozenNetwork) and hasattr(source, "_spec_snapshot"):
+            self._spec_snapshot = copy.deepcopy(source._spec_snapshot)
+
     def kinetics_input(self):
         return copy.deepcopy(dict(self))
 
@@ -29,13 +36,23 @@ class FrozenNetwork(dict):
         value = copy.deepcopy(dict(self))
         value.pop("input_sha256", None)
         metadata = value.pop("source_projection")
+        for key in (
+                "model_spec", "rate_law_policy", "assumptions", "feed_species",
+                "target_products", "site_population_totals"):
+            value.pop(key, None)
+        for record in value.get("species") or []:
+            record.pop("activity", None)
+        for record in value.get("elementary_steps") or []:
+            for key in ("prefactors", "bep", "scaling", "uncertainty_eV", "evidence"):
+                record.pop(key, None)
         value["schema"] = metadata["schema"]
         value["version"] = metadata["version"]
         value["evidence_refs"] = copy.deepcopy(metadata["evidence_refs"])
-        hash_field = (
-            "frozen_network_sha256"
-            if metadata["schema"] == "vcstudio.frozen-reaction-network/v1"
-            else "projection_sha256")
+        value["project_id"] = "test-project"
+        value["domain_authority_id"] = "d" * 32
+        value["domain_generation"] = 7
+        value["network_revision"] = value["revision"]
+        hash_field = "projection_sha256"
         value[hash_field] = ""
         if (metadata["schema"], metadata["version"]) in (
                 kinetics.SOURCE_PROJECTION_PROTOCOLS):
@@ -44,10 +61,146 @@ class FrozenNetwork(dict):
             value[hash_field] = "f" * 64
         return value
 
+    def kinetics_model_spec(self):
+        return copy.deepcopy(self._spec_snapshot)
+
 
 def _freeze(network):
+    network["assumptions"].setdefault("evidence", [_source("model-assumption")])
+    for step in network.get("elementary_steps") or []:
+        step.setdefault("evidence", [_source("model-step")])
+    network.setdefault("rate_law_policy", {
+        "activity": "ideal",
+        "reversibility": "explicit_reverse",
+        "detailed_balance": "enforced",
+        "prefactor": "explicit_per_step",
+        "electrochemical": "none",
+        "reactor": "mean_field_steady_state",
+    })
+    if network.get("methodology", {}).get("potential_model") != "none":
+        network["rate_law_policy"]["electrochemical"] = "explicit_potential"
+    site_types = sorted({
+        site for record in network.get("species") or []
+        for site in (record.get("sites") or {})
+    })
+    existing_totals = {
+        item["site_type"]: copy.deepcopy(item)
+        for item in network.get("site_population_totals") or []
+        if isinstance(item, dict) and "site_type" in item
+    }
+    network["site_population_totals"] = [
+        existing_totals.get(site_type, {
+            "site_type": site_type,
+            "value": 1.0,
+            "unit": "sites",
+            "basis": "surface_unit_cell",
+            "evidence": [_source("site-policy")],
+        })
+        for site_type in site_types
+    ]
+    network.setdefault("model_spec", {})
     network["source_projection"]["projection_sha256"] = (
         kinetics.compute_projection_sha256(network))
+    previous = getattr(network, "_spec_snapshot", None)
+    species_by_id = {record["id"]: record for record in network["species"]}
+    reservoir_ids = list(network["feed_species"])
+    reservoir_ids.extend(
+        record["id"] for record in network["species"]
+        if "activity" in record and record["id"] not in reservoir_ids)
+    feed_reservoirs = []
+    for species_id in reservoir_ids:
+        record = species_by_id.get(species_id)
+        if record is None:
+            feed_reservoirs = None
+            break
+        activity = record.get("activity")
+        if activity is None:
+            evidence = _source("initial-state")
+            feed_reservoirs.append({
+                "species_id": species_id, "activity": 1.0,
+                "unit": "dimensionless", "source": evidence["reference"],
+                "evidence_sha256": evidence["evidence_sha256"],
+            })
+        else:
+            feed_reservoirs.append({
+                "species_id": species_id,
+                "activity": activity["value"], "unit": activity["unit"],
+                "source": activity["source"]["reference"],
+                "evidence_sha256": activity["source"]["evidence_sha256"],
+            })
+    if previous is None:
+        assert feed_reservoirs is not None
+        choices = {
+            "rate_law_policy": copy.deepcopy(network["rate_law_policy"]),
+            "assumptions": copy.deepcopy(network["assumptions"]),
+            "feed_reservoirs": feed_reservoirs,
+            "target_products": list(network["target_products"]),
+            "steps": [
+                {
+                    "step_id": step["id"],
+                    "prefactors": copy.deepcopy(step["prefactors"]),
+                    "bep": copy.deepcopy(step["bep"]),
+                    "scaling": copy.deepcopy(step["scaling"]),
+                    "uncertainty_eV": step["uncertainty_eV"],
+                    "evidence": copy.deepcopy(step["evidence"]),
+                }
+                for step in network["elementary_steps"]
+            ],
+            "site_population_totals": copy.deepcopy(
+                network["site_population_totals"]),
+            "saddle_selector": None,
+        }
+    else:
+        choices = copy.deepcopy(previous)
+        choices["site_population_totals"] = copy.deepcopy(
+            network["site_population_totals"])
+        choices["rate_law_policy"] = copy.deepcopy(network["rate_law_policy"])
+        choices["assumptions"] = copy.deepcopy(network["assumptions"])
+        if feed_reservoirs is not None:
+            choices["feed_reservoirs"] = feed_reservoirs
+        choices["target_products"] = list(network["target_products"])
+        if all({
+                "prefactors", "bep", "scaling", "uncertainty_eV", "evidence",
+        } <= set(step) and set(step.get("prefactors") or {}) == {"forward", "reverse"}
+               for step in network["elementary_steps"]):
+            choices["steps"] = [
+                {
+                    "step_id": step["id"],
+                    "prefactors": copy.deepcopy(step["prefactors"]),
+                    "bep": copy.deepcopy(step["bep"]),
+                    "scaling": copy.deepcopy(step["scaling"]),
+                    "uncertainty_eV": step["uncertainty_eV"],
+                    "evidence": copy.deepcopy(step["evidence"]),
+                }
+                for step in network["elementary_steps"]
+            ]
+    choices.update({
+        "schema": KineticsModelSpec.schema,
+        "project_id": "test-project",
+        "spec_id": "default-kinetics",
+        "revision": "model-spec-rev-1",
+        "parent_revision": None,
+        "expected_current_hash": None,
+        "source_binding": {
+            "domain_authority_id": "d" * 32,
+            "domain_generation": 7,
+            "network_revision": network["revision"],
+            "source_projection_sha256": network["source_projection"][
+                "projection_sha256"],
+        },
+    })
+    spec = KineticsModelSpec.from_dict(choices)
+    network._spec_snapshot = spec.to_dict()
+    network["model_spec"] = {
+        "schema": spec.schema,
+        "project_id": spec.project_id,
+        "spec_id": spec.spec_id,
+        "revision": spec.revision,
+        "spec_sha256": spec.semantic_sha256,
+        "source_projection_sha256": network["source_projection"][
+            "projection_sha256"],
+        "evidence_refs": spec.evidence_bindings(),
+    }
     network["input_sha256"] = kinetics.compute_input_sha256(network)
     return network
 
@@ -77,7 +230,7 @@ def frozen_network():
         "network_id": "co-oxidation-111",
         "revision": "rev-7",
         "source_projection": {
-            "schema": "vcstudio.frozen-reaction-network/v1",
+            "schema": "vcstudio.reaction-domain-projection/v1",
             "version": "1",
             "projection_sha256": "",
             "evidence_refs": [
@@ -122,13 +275,13 @@ def frozen_network():
                 "id": "CO_g", "phase": "gas", "composition": {"C": 1, "O": 1},
                 "charge": 0, "sites": {}, "formation_energy": _energy(0.0),
                 "frequencies_cm1": [2143.0],
-                "activity": {"value": 0.5, "unit": "bar", "source": _source("condition")},
+                "activity": {"value": 1.0, "unit": "bar", "source": _source("condition")},
             },
             {
                 "id": "O2_g", "phase": "gas", "composition": {"O": 2},
                 "charge": 0, "sites": {}, "formation_energy": _energy(0.0),
                 "frequencies_cm1": [1556.0],
-                "activity": {"value": 0.5, "unit": "bar", "source": _source("condition")},
+                "activity": {"value": 0.0, "unit": "bar", "source": _source("condition")},
             },
             {
                 "id": "CO2_g", "phase": "gas", "composition": {"C": 1, "O": 2},
@@ -186,6 +339,8 @@ def catmap_ready_network():
     """A small adsorption mechanism with participating, independent gas reservoirs."""
     base = frozen_network()
     records = {record["id"]: copy.deepcopy(record) for record in base["species"]}
+    records["CO_g"]["activity"]["value"] = 0.5
+    records["O2_g"]["activity"]["value"] = 0.5
     o2_adsorbed = copy.deepcopy(records["O_s"])
     o2_adsorbed.update({
         "id": "O2_s", "composition": {"O": 2},
@@ -415,7 +570,7 @@ def test_valid_frozen_projection_passes_all_machine_audits():
     assert audit["export_ready"] is True
     assert audit["scientific_status"] == "diagnostic"
     assert audit["eligible_final"] is False
-    assert audit["denominator"] == {"species": 7, "elementary_steps": 1, "checks": 12}
+    assert audit["denominator"] == {"species": 7, "elementary_steps": 1, "checks": 15}
     assert not [item for item in audit["issues"] if item["severity"] == "error"]
 
 
@@ -481,6 +636,9 @@ def test_protocol_provider_is_consumed_without_owning_upstream_dto():
         def canonical_source_projection(self):
             return frozen_network().canonical_source_projection()
 
+        def kinetics_model_spec(self):
+            return frozen_network().kinetics_model_spec()
+
     assert kinetics.audit_network(Provider())["machine_pass"] is True
 
 
@@ -503,6 +661,55 @@ def test_projection_schema_and_real_artifact_hash_are_provider_verified():
     network["input_sha256"] = kinetics.compute_input_sha256(network)
     assert "INVALID_INPUT" in _codes(kinetics.audit_network(network))
 
+
+def test_canonicalizer_rejects_duplicate_same_hash_evidence_before_resolving():
+    class DuplicateEvidence(FrozenNetwork):
+        def __init__(self, source):
+            super().__init__(source)
+            self.resolver_calls = 0
+
+        def kinetics_input(self):
+            value = super().kinetics_input()
+            refs = value["source_projection"]["evidence_refs"]
+            refs.append(copy.deepcopy(refs[0]))
+            value["input_sha256"] = kinetics.compute_input_sha256(value)
+            return value
+
+        def kinetics_evidence(self, reference):
+            self.resolver_calls += 1
+            return super().kinetics_evidence(reference)
+
+    network = DuplicateEvidence(frozen_network())
+
+    audit = kinetics.audit_network(network)
+    assert "INVALID_INPUT" in _codes(audit)
+    assert network.resolver_calls == 0
+
+
+@pytest.mark.parametrize(("field", "forged"), [
+    ("project_id", "forged-project"),
+    ("domain_authority_id", "e" * 32),
+    ("domain_generation", 8),
+    ("network_revision", "forged-revision"),
+    ("network_id", "forged-network"),
+])
+def test_canonicalizer_rejects_forged_authoritative_source_identity(field, forged):
+    class ForgedSource(FrozenNetwork):
+        def canonical_source_projection(self):
+            value = super().canonical_source_projection()
+            hash_field = "projection_sha256"
+            value[field] = forged
+            value[hash_field] = ""
+            value[hash_field] = kinetics.compute_source_projection_sha256(value)
+            return value
+
+    source = frozen_network()
+    network = ForgedSource(source)
+
+    audit = kinetics.audit_network(network)
+    assert audit["machine_pass"] is False
+    assert "INVALID_INPUT" in _codes(audit)
+
     class BadEvidence(FrozenNetwork):
         def kinetics_evidence(self, reference):
             if reference == "manifest:job-1":
@@ -511,6 +718,23 @@ def test_projection_schema_and_real_artifact_hash_are_provider_verified():
 
     network = BadEvidence(frozen_network())
     assert "INVALID_INPUT" in _codes(kinetics.audit_network(network))
+
+
+def test_legacy_frozen_v1_is_never_a_formal_kinetics_source():
+    class LegacyFrozenSource(FrozenNetwork):
+        def canonical_source_projection(self):
+            value = super().canonical_source_projection()
+            value.update({
+                "schema": "vcstudio.frozen-reaction-network/v1",
+                "version": "1", "frozen_network_sha256": "f" * 64,
+            })
+            value.pop("projection_sha256")
+            return value
+
+    audit = kinetics.audit_network(LegacyFrozenSource(frozen_network()))
+
+    assert audit["machine_pass"] is False
+    assert "INVALID_INPUT" in _codes(audit)
 
 
 def test_nested_energy_source_cannot_fabricate_artifact_sha():

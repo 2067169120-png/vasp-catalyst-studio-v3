@@ -19,18 +19,26 @@ from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
+from vcstudio.project.kinetics_model_spec import (
+    MAX_EVIDENCE_BINDINGS,
+    KineticsModelSpec,
+    classify_sensitive_text,
+)
 
-NETWORK_SCHEMA = "vcstudio.kinetics-network/v2"
+
+NETWORK_SCHEMA = "vcstudio.kinetics-network/v3"
 AUDIT_SCHEMA = "vcstudio.kinetics-audit/v2"
 RESULT_SCHEMA = "vcstudio.kinetics-result/v2"
 NORMALIZED_RESULT_SCHEMA = "vcstudio.kinetics-normalized-result/v2"
 SOURCE_PROJECTION_PROTOCOLS = frozenset({
-    ("vcstudio.frozen-reaction-network/v1", "1"),
+    ("vcstudio.frozen-reaction-network/v2", "2"),
     ("vcstudio.reaction-domain-projection/v1", "1"),
 })
 _SOURCE_PROJECTION_HASH_FIELDS = {
-    ("vcstudio.frozen-reaction-network/v1", "1"): "frozen_network_sha256",
+    ("vcstudio.frozen-reaction-network/v2", "2"): "frozen_network_sha256",
     ("vcstudio.reaction-domain-projection/v1", "1"): "projection_sha256",
+    ("vcstudio.kinetics-adapted-reaction-source/v1", "1"):
+        "adapter_projection_sha256",
 }
 CONVERGENCE_RESIDUAL_MAX = 1.0e-8
 CONVERGENCE_ITERATIONS_MAX = 1_000_000
@@ -54,34 +62,42 @@ RESULT_UNITS = {
 
 _TOP_LEVEL_KEYS = frozenset({
     "schema", "input_sha256", "network_id", "revision", "source_projection",
-    "assumptions", "standard_state", "operating_range", "methodology",
-    "feed_species", "target_products", "species", "elementary_steps", "extensions",
+    "model_spec", "rate_law_policy", "assumptions", "standard_state",
+    "operating_range", "methodology", "feed_species", "target_products",
+    "species", "elementary_steps", "site_population_totals", "extensions",
 })
 _SPECIES_KEYS = frozenset({
     "id", "phase", "composition", "charge", "sites", "formation_energy",
-    "frequencies_cm1", "activity",
+    "frequencies_cm1", "activity", "standard_state",
 })
 _STEP_KEYS = frozenset({
     "id", "reactants", "transition_state", "products", "reversible", "delta_g",
     "forward_barrier", "reverse_barrier", "prefactors", "bep", "scaling",
-    "uncertainty_eV",
+    "uncertainty_eV", "evidence",
 })
 _ENERGY_KEYS = frozenset({
     "value", "unit", "method_id", "source", "uncertainty_eV",
 })
 _SOURCE_KEYS = frozenset({"kind", "reference", "evidence_sha256"})
+_MODEL_SPEC_KEYS = frozenset({
+    "schema", "project_id", "spec_id", "revision", "spec_sha256",
+    "source_projection_sha256", "evidence_refs",
+})
+_RATE_LAW_POLICY_KEYS = frozenset({
+    "activity", "reversibility", "detailed_balance", "prefactor",
+    "electrochemical", "reactor",
+})
+_SITE_TOTAL_KEYS = frozenset({
+    "site_type", "value", "unit", "basis", "evidence",
+})
 _SAFE_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
 _ELEMENT_RE = re.compile(r"^[A-Z][a-z]?$|^e-$")
 _HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
-_SECRET_RE = re.compile(
-    r"(?i)(?:github_pat_|gh[opusr]_|sk-|bearer\s+|private key|"
-    r"(?:password|passwd|secret|token|api[_-]?key)\s*[:=])")
-_PATH_RE = re.compile(r"(?i)(?:^[A-Z]:[\\/]|^\\\\|^/|^~[\\/]|\.\.[\\/]|file:)")
 _BARRIER_TOL_EV = 1.0e-3
 _BALANCE_TOL = 1.0e-8
-_MAX_EVIDENCE_BYTES = 64 * 1024 * 1024
+_MAX_TOTAL_EVIDENCE_BYTES = 64 * 1024 * 1024
 _CANONICAL_INPUT_SEAL = object()
 
 
@@ -101,6 +117,9 @@ class KineticsInputProvider(Protocol):
 
     def canonical_source_projection(self) -> Mapping[str, Any]:
         """Return the authoritative upstream frozen projection before adaptation."""
+
+    def kinetics_model_spec(self) -> Mapping[str, Any]:
+        """Return the exact immutable model-spec snapshot used by the projection."""
 
 
 class CanonicalKineticsInput(Mapping[str, Any]):
@@ -166,13 +185,38 @@ def compute_source_projection_sha256(source: Mapping[str, Any]) -> str:
             "projection must be canonical JSON without non-finite numbers") from exc
 
 
+def _authoritative_source_identity(
+        upstream: Mapping[str, Any], adapter_hash: str,
+        ) -> tuple[tuple[str, str], str]:
+    identity = (upstream.get("schema"), upstream.get("version"))
+    if identity != ("vcstudio.kinetics-adapted-reaction-source/v1", "1"):
+        return (str(identity[0]), str(identity[1])), adapter_hash
+    authority = upstream.get("authoritative_source")
+    if (not isinstance(authority, Mapping)
+            or set(authority) != {
+                "schema", "version", "frozen_network_sha256"}
+            or authority.get("schema") != "vcstudio.frozen-reaction-network/v2"
+            or authority.get("version") != "2"
+            or not isinstance(authority.get("frozen_network_sha256"), str)
+            or not _HEX_RE.fullmatch(authority["frozen_network_sha256"])):
+        raise KineticsContractError(
+            "adapted source does not bind an exact frozen reaction v2 authority")
+    return (
+        ("vcstudio.frozen-reaction-network/v2", "2"),
+        authority["frozen_network_sha256"],
+    )
+
+
 def compute_projection_sha256(source: KineticsInputProvider) -> str:
     """Compatibility name for hashing a provider's authoritative projection."""
     loader = getattr(source, "canonical_source_projection", None)
     if not callable(loader):
         raise KineticsContractError(
             "projection hash requires a trusted KineticsInputProvider")
-    return compute_source_projection_sha256(loader())
+    upstream = loader()
+    computed = compute_source_projection_sha256(upstream)
+    _, authority_hash = _authoritative_source_identity(upstream, computed)
+    return authority_hash
 
 
 def compute_condition_sha256(conditions: Mapping[str, Any]) -> str:
@@ -189,19 +233,21 @@ def compute_condition_sha256(conditions: Mapping[str, Any]) -> str:
 def canonicalize_kinetics_input(
         source: CanonicalKineticsInput | KineticsInputProvider,
         ) -> CanonicalKineticsInput:
-    """Rebuild hashes and evidence bindings through a trusted provider seam."""
+    """Verify one source/spec/evidence snapshot through the trusted seam."""
     if isinstance(source, CanonicalKineticsInput):
         return source
     input_loader = getattr(source, "kinetics_input", None)
     evidence_loader = getattr(source, "kinetics_evidence", None)
     source_loader = getattr(source, "canonical_source_projection", None)
+    spec_loader = getattr(source, "kinetics_model_spec", None)
     if (not callable(input_loader) or not callable(evidence_loader)
-            or not callable(source_loader)):
+            or not callable(source_loader) or not callable(spec_loader)):
         if isinstance(source, Mapping):
             raise KineticsContractError(
                 "raw kinetics mappings are untrusted; a KineticsInputProvider is required")
         raise KineticsContractError(
-            "trusted KineticsInputProvider must supply source, input, and evidence resolvers")
+            "trusted KineticsInputProvider must supply exact source, spec, input, "
+            "and evidence snapshots")
     try:
         upstream_raw = source_loader()
     except Exception as exc:  # noqa: BLE001 trusted seam must fail closed
@@ -220,6 +266,44 @@ def canonicalize_kinetics_input(
     if upstream_declared_hash != upstream_computed_hash:
         raise KineticsContractError(
             "authoritative source projection hash does not match its canonical bytes")
+    source_projection_identity, source_authority_hash = (
+        _authoritative_source_identity(upstream, upstream_computed_hash))
+    try:
+        spec_raw = spec_loader()
+    except Exception as exc:  # noqa: BLE001 trusted seam must fail closed
+        raise KineticsContractError("kinetics model spec could not be resolved") from exc
+    if not isinstance(spec_raw, Mapping):
+        raise KineticsContractError("kinetics_model_spec must return a mapping")
+    try:
+        spec = KineticsModelSpec.from_dict(spec_raw)
+        spec_evidence_refs = spec.evidence_bindings()
+    except Exception as exc:  # noqa: BLE001 translate the strict DTO boundary
+        raise KineticsContractError("kinetics model spec snapshot is invalid") from exc
+    source_binding_checks = {
+        "project_id": (upstream.get("project_id"), spec.project_id),
+        "domain_authority_id": (
+            upstream.get("domain_authority_id"),
+            spec.source_binding["domain_authority_id"]),
+        "domain_generation": (
+            upstream.get("domain_generation"),
+            spec.source_binding["domain_generation"]),
+        "network_revision": (
+            upstream.get("network_revision"),
+            spec.source_binding["network_revision"]),
+        "source_projection_sha256": (
+            source_authority_hash,
+            spec.source_binding["source_projection_sha256"]),
+    }
+    if upstream_identity == ("vcstudio.kinetics-adapted-reaction-source/v1", "1"):
+        source_binding_checks["network_id"] = (
+            upstream.get("network_id"), spec.source_binding.get("network_id"))
+    elif "network_id" in spec.source_binding:
+        source_binding_checks["network_id"] = (
+            upstream.get("network_id"), spec.source_binding["network_id"])
+    for field, (authoritative, declared) in source_binding_checks.items():
+        if authoritative != declared:
+            raise KineticsContractError(
+                f"kinetics model spec {field} binding is stale or forged")
     try:
         raw = input_loader()
     except Exception as exc:  # noqa: BLE001 trusted seam must fail closed
@@ -227,6 +311,10 @@ def canonicalize_kinetics_input(
     if not isinstance(raw, Mapping):
         raise KineticsContractError("KineticsInputProvider must return a mapping")
     value = copy.deepcopy(dict(raw))
+    if ("network_id" in upstream
+            and value.get("network_id") != upstream.get("network_id")):
+        raise KineticsContractError(
+            "kinetics network_id does not match the authoritative source projection")
     projection = value.get("source_projection")
     if not isinstance(projection, Mapping):
         raise KineticsContractError("source_projection must be an object")
@@ -237,18 +325,23 @@ def canonicalize_kinetics_input(
     identity = (projection.get("schema"), projection.get("version"))
     if identity not in SOURCE_PROJECTION_PROTOCOLS:
         raise KineticsContractError("source projection schema/version is not trusted")
-    if identity != upstream_identity:
+    if identity != source_projection_identity:
         raise KineticsContractError(
             "adapted source projection identity does not match the provider source")
     refs = projection.get("evidence_refs")
     if (isinstance(refs, (str, bytes)) or not isinstance(refs, Sequence)
-            or not 1 <= len(refs) <= 256):
+            or not 1 <= len(refs) <= MAX_EVIDENCE_BINDINGS):
         raise KineticsContractError(
             "source projection requires bounded artifact evidence references")
-    seen = set()
+    seen: set[str] = set()
+    source_seen: set[str] = set()
+    model_seen: set[str] = set()
+    declared: dict[str, str] = {}
     resolved_artifacts: dict[str, str] = {}
+    resolved_total_bytes = 0
 
     def resolve(reference: str, digest: str) -> None:
+        nonlocal resolved_total_bytes
         prior = resolved_artifacts.get(reference)
         if prior is not None:
             if prior != digest:
@@ -264,45 +357,187 @@ def canonicalize_kinetics_input(
             raise KineticsContractError(
                 "trusted evidence resolver must return artifact bytes")
         artifact_bytes = bytes(artifact)
-        if not artifact_bytes or len(artifact_bytes) > _MAX_EVIDENCE_BYTES:
+        if not artifact_bytes or len(artifact_bytes) > _MAX_TOTAL_EVIDENCE_BYTES:
             raise KineticsContractError("resolved evidence artifact has an invalid size")
+        resolved_total_bytes += len(artifact_bytes)
+        if resolved_total_bytes > _MAX_TOTAL_EVIDENCE_BYTES:
+            raise KineticsContractError(
+                "resolved evidence artifacts exceed the total byte limit")
         actual = hashlib.sha256(artifact_bytes).hexdigest()
         if actual != digest:
             raise KineticsContractError(
                 f"resolved evidence artifact hash mismatch for {reference}")
         resolved_artifacts[reference] = actual
 
-    for index, item in enumerate(refs):
+    def declare(item: Any, path: str, scope_seen: set[str]) -> None:
         if not isinstance(item, Mapping) or set(item) != {
                 "reference", "artifact_sha256"}:
-            raise KineticsContractError(
-                f"source_projection.evidence_refs[{index}] is invalid")
+            raise KineticsContractError(f"{path} is invalid")
         reference = item.get("reference")
         digest = item.get("artifact_sha256")
         local_issues: list[dict[str, str]] = []
-        if _safe_text(reference, f"source_projection.evidence_refs[{index}].reference",
-                      local_issues) is None:
+        if _safe_text(reference, f"{path}.reference", local_issues) is None:
+            raise KineticsContractError(f"{path}.reference is unsafe")
+        if reference in scope_seen:
             raise KineticsContractError(
-                f"source_projection.evidence_refs[{index}].reference is unsafe")
+                f"{path}.reference duplicates an evidence declaration")
+        scope_seen.add(reference)
         if reference in seen:
-            raise KineticsContractError("source projection evidence references must be unique")
+            if declared.get(reference) != digest:
+                raise KineticsContractError(
+                    f"evidence reference {reference} has conflicting declared hashes")
+            return
         seen.add(reference)
-        if not isinstance(digest, str) or not _HEX_RE.fullmatch(digest):
+        if len(seen) > MAX_EVIDENCE_BINDINGS:
             raise KineticsContractError(
-                f"source_projection.evidence_refs[{index}].artifact_sha256 is invalid")
-        resolve(reference, digest)
+                "source/spec evidence chain exceeds the binding limit")
+        if not isinstance(digest, str) or not _HEX_RE.fullmatch(digest):
+            raise KineticsContractError(f"{path}.artifact_sha256 is invalid")
+        declared[reference] = digest
+
+    for index, item in enumerate(refs):
+        declare(
+            item, f"source_projection.evidence_refs[{index}]", source_seen)
+
+    model_spec = value.get("model_spec")
+    if not isinstance(model_spec, Mapping) or set(model_spec) != _MODEL_SPEC_KEYS:
+        raise KineticsContractError("model_spec fields do not match the protocol")
+    model_refs = model_spec.get("evidence_refs")
+    if (isinstance(model_refs, (str, bytes)) or not isinstance(model_refs, Sequence)
+            or not model_refs or len(model_refs) > MAX_EVIDENCE_BINDINGS):
+        raise KineticsContractError("model_spec requires bounded evidence references")
+    for index, item in enumerate(model_refs):
+        declare(item, f"model_spec.evidence_refs[{index}]", model_seen)
+    if copy.deepcopy(list(model_refs)) != copy.deepcopy(spec_evidence_refs):
+        raise KineticsContractError(
+            "adapted model-spec evidence references do not match the exact spec")
+    expected_metadata = {
+        "schema": spec.schema,
+        "project_id": spec.project_id,
+        "spec_id": spec.spec_id,
+        "revision": spec.revision,
+        "spec_sha256": spec.semantic_sha256,
+        "source_projection_sha256": source_authority_hash,
+        "evidence_refs": copy.deepcopy(spec_evidence_refs),
+    }
+    if copy.deepcopy(dict(model_spec)) != expected_metadata:
+        raise KineticsContractError(
+            "adapted model_spec does not match the exact provider spec snapshot")
+    if spec.source_binding["source_projection_sha256"] != source_authority_hash:
+        raise KineticsContractError(
+            "kinetics model spec is stale for the authoritative source projection")
+
+    def exact(left: Any, right: Any, message: str) -> None:
+        try:
+            matches = _canonical_bytes(copy.deepcopy(left)) == _canonical_bytes(
+                copy.deepcopy(right))
+        except (TypeError, ValueError) as exc:
+            raise KineticsContractError(message) from exc
+        if not matches:
+            raise KineticsContractError(message)
+
+    exact(value.get("rate_law_policy"), spec.rate_law_policy,
+          "rate_law_policy does not match the exact model spec")
+    exact(value.get("assumptions"), spec.assumptions,
+          "assumptions do not match the exact model spec")
+    exact(value.get("target_products"), spec.target_products,
+          "target_products do not match the exact model spec")
+    exact(value.get("site_population_totals"), spec.site_population_totals,
+          "site_population_totals do not match the exact model spec")
+    species_records = value.get("species")
+    if (isinstance(species_records, (str, bytes))
+            or not isinstance(species_records, Sequence)):
+        raise KineticsContractError("species must be an array")
+    species_by_id = {
+        item.get("id"): item for item in species_records if isinstance(item, Mapping)
+    }
+    if len(species_by_id) != len(species_records):
+        raise KineticsContractError("species ids must be unique")
+    expected_feeds = []
+    for reservoir in spec.feed_reservoirs:
+        species_record = species_by_id.get(reservoir["species_id"])
+        if species_record is None:
+            raise KineticsContractError(
+                "model-spec feed reservoir species is absent from the projection")
+        if float(reservoir["activity"]) > 0.0:
+            expected_feeds.append(reservoir["species_id"])
+        if species_record.get("phase") in {"surface", "adsorbate"}:
+            if species_record.get("activity") is not None:
+                raise KineticsContractError(
+                    "surface-state reservoirs must not become fluid activity records")
+            continue
+        expected_activity = {
+            "value": reservoir["activity"],
+            "unit": reservoir["unit"],
+            "source": {
+                "kind": "condition",
+                "reference": reservoir["source"],
+                "evidence_sha256": reservoir["evidence_sha256"],
+            },
+        }
+        exact(species_record.get("activity"), expected_activity,
+              "species activity does not match the exact model spec")
+    exact(value.get("feed_species"), expected_feeds,
+          "feed_species do not match the exact model spec reservoirs")
+    step_records = value.get("elementary_steps")
+    if (isinstance(step_records, (str, bytes))
+            or not isinstance(step_records, Sequence)):
+        raise KineticsContractError("elementary_steps must be an array")
+    steps_by_id = {
+        item.get("id"): item for item in step_records if isinstance(item, Mapping)
+    }
+    if len(steps_by_id) != len(step_records):
+        raise KineticsContractError("elementary step ids must be unique")
+    for decision in spec.steps:
+        step = steps_by_id.get(decision["step_id"])
+        if step is None:
+            raise KineticsContractError(
+                "model-spec step is absent from the reaction projection")
+        for field in ("prefactors", "bep", "scaling", "uncertainty_eV", "evidence"):
+            exact(step.get(field), decision[field],
+                  f"elementary step {field} does not match the exact model spec")
+
+    source_revision = upstream.get("network_revision", upstream.get("revision"))
+    if (value.get("network_id") != upstream.get("network_id")
+            or value.get("revision") != source_revision):
+        raise KineticsContractError(
+            "network identity does not match the authoritative source projection")
+    for field in ("standard_state", "operating_range", "methodology", "extensions"):
+        exact(value.get(field), upstream.get(field),
+              f"{field} does not match the authoritative source projection")
+    source_species = upstream.get("species")
+    if isinstance(source_species, Sequence) and not isinstance(source_species, (str, bytes)):
+        stripped_species = []
+        for record in species_records:
+            copied = copy.deepcopy(dict(record))
+            copied.pop("activity", None)
+            stripped_species.append(copied)
+        exact(stripped_species, source_species,
+              "species facts do not match the authoritative source projection")
+    source_steps = upstream.get("elementary_steps")
+    if isinstance(source_steps, Sequence) and not isinstance(source_steps, (str, bytes)):
+        stripped_steps = []
+        for record in step_records:
+            copied = copy.deepcopy(dict(record))
+            for field in ("prefactors", "bep", "scaling", "uncertainty_eV", "evidence"):
+                copied.pop(field, None)
+            stripped_steps.append(copied)
+        exact(stripped_steps, source_steps,
+              "reaction step facts do not match the authoritative source projection")
 
     def verify_source_records(node: Any, path: str = "$") -> None:
         if isinstance(node, Mapping):
             if set(node) == _SOURCE_KEYS:
                 reference = node.get("reference")
                 digest = node.get("evidence_sha256")
-                if not isinstance(reference, str) or reference not in seen:
+                if not isinstance(reference, str) or reference not in declared:
                     raise KineticsContractError(
-                        f"{path}.reference is not declared by source_projection")
+                        f"{path}.reference is not declared by the source/spec evidence chain")
                 if not isinstance(digest, str) or not _HEX_RE.fullmatch(digest):
                     raise KineticsContractError(f"{path}.evidence_sha256 is invalid")
-                resolve(reference, digest)
+                if declared[reference] != digest:
+                    raise KineticsContractError(
+                        f"{path}.evidence_sha256 conflicts with its declared hash")
             for key, item in node.items():
                 verify_source_records(item, f"{path}.{key}")
         elif isinstance(node, Sequence) and not isinstance(node, (str, bytes)):
@@ -310,7 +545,9 @@ def canonicalize_kinetics_input(
                 verify_source_records(item, f"{path}[{index}]")
 
     verify_source_records(value)
-    if projection.get("projection_sha256") != upstream_computed_hash:
+    for reference, digest in sorted(declared.items()):
+        resolve(reference, digest)
+    if projection.get("projection_sha256") != source_authority_hash:
         raise KineticsContractError(
             "source projection hash does not match the canonical provider projection")
     if copy.deepcopy(list(refs)) != copy.deepcopy(upstream.get("evidence_refs")):
@@ -340,16 +577,22 @@ def _unknown_fields(value: Any, allowed: frozenset[str], path: str,
     if not isinstance(value, Mapping):
         _issue(issues, "INVALID_OBJECT", path, f"{path} must be an object")
         return False
-    for key in sorted(set(value) - allowed):
-        _issue(issues, "UNKNOWN_FIELD", f"{path}.{key}",
-               f"unknown field {path}.{key}")
+    for key in sorted(set(value) - allowed, key=lambda item: (type(item).__name__, str(item))):
+        if (not isinstance(key, str) or not key or len(key) > 128
+                or _CONTROL_RE.search(key)
+                or classify_sensitive_text(key) is not None):
+            _issue(issues, "UNKNOWN_FIELD", path,
+                   f"{path} contains an unknown or unsafe field")
+        else:
+            _issue(issues, "UNKNOWN_FIELD", f"{path}.{key}",
+                   f"unknown field {path}.{key}")
     return True
 
 
 def _safe_identifier(value: Any, path: str, issues: list[dict[str, str]]) -> str | None:
     if (not isinstance(value, str) or not _SAFE_ID_RE.fullmatch(value)
-            or _CONTROL_RE.search(value) or _PATH_RE.search(value)
-            or _SECRET_RE.search(value)):
+            or _CONTROL_RE.search(value)
+            or classify_sensitive_text(value) is not None):
         _issue(issues, "UNSAFE_IDENTIFIER", path,
                f"{path} must be a safe opaque identifier")
         return None
@@ -359,8 +602,8 @@ def _safe_identifier(value: Any, path: str, issues: list[dict[str, str]]) -> str
 def _safe_text(value: Any, path: str, issues: list[dict[str, str]],
                *, maximum: int = 512) -> str | None:
     if (not isinstance(value, str) or not value.strip() or len(value) > maximum
-            or _CONTROL_RE.search(value) or _SECRET_RE.search(value)
-            or _PATH_RE.search(value)):
+            or _CONTROL_RE.search(value)
+            or classify_sensitive_text(value) is not None):
         _issue(issues, "UNSAFE_TEXT", path, f"{path} must be bounded safe text")
         return None
     return value.strip()
@@ -402,8 +645,104 @@ def _audit_source(value: Any, path: str, issues: list[dict[str, str]]) -> None:
     _sha(value.get("evidence_sha256"), f"{path}.evidence_sha256", issues)
 
 
+def _audit_evidence_list(value: Any, path: str,
+                         issues: list[dict[str, str]]) -> None:
+    if (isinstance(value, (str, bytes)) or not isinstance(value, Sequence)
+            or not value or len(value) > 256):
+        _issue(issues, "MODEL_EVIDENCE_REQUIRED", path,
+               f"{path} must be a non-empty bounded evidence array")
+        return
+    seen = set()
+    for index, item in enumerate(value):
+        item_path = f"{path}[{index}]"
+        _audit_source(item, item_path, issues)
+        if isinstance(item, Mapping):
+            identity = (item.get("reference"), item.get("evidence_sha256"))
+            if identity in seen:
+                _issue(issues, "DUPLICATE_EVIDENCE", item_path,
+                       "evidence records must be unique")
+            seen.add(identity)
+
+
+def _audit_rate_law_policy(value: Any,
+                           issues: list[dict[str, str]]) -> dict[str, str]:
+    if not _unknown_fields(value, _RATE_LAW_POLICY_KEYS, "rate_law_policy", issues):
+        return {}
+    policy = {}
+    supported = {
+        "activity": "ideal",
+        "reversibility": "explicit_reverse",
+        "detailed_balance": "enforced",
+        "prefactor": "explicit_per_step",
+        "reactor": "mean_field_steady_state",
+    }
+    for key, expected in supported.items():
+        current = _safe_identifier(
+            value.get(key), f"rate_law_policy.{key}", issues)
+        if current is not None:
+            policy[key] = current
+            if current != expected:
+                code = ("NONIDEAL_ACTIVITY_UNSUPPORTED" if key == "activity"
+                        else "RATE_LAW_POLICY_UNSUPPORTED")
+                _issue(issues, code, f"rate_law_policy.{key}",
+                       f"rate_law_policy.{key} must be {expected}")
+    electrochemical = _safe_identifier(
+        value.get("electrochemical"), "rate_law_policy.electrochemical", issues)
+    if electrochemical is not None:
+        policy["electrochemical"] = electrochemical
+        if electrochemical not in {"none", "explicit_potential"}:
+            _issue(issues, "RATE_LAW_POLICY_UNSUPPORTED",
+                   "rate_law_policy.electrochemical",
+                   "electrochemical policy must be none or explicit_potential")
+    return policy
+
+
+def _audit_site_population_totals(
+        value: Any, species: Mapping[str, Mapping[str, Any]],
+        issues: list[dict[str, str]]) -> dict[str, float]:
+    if (isinstance(value, (str, bytes)) or not isinstance(value, Sequence)
+            or not value or len(value) > 256):
+        _issue(issues, "SITE_POPULATION_TOTALS_REQUIRED", "site_population_totals",
+               "site_population_totals must be a non-empty bounded array")
+        return {}
+    totals = {}
+    for index, raw in enumerate(value):
+        path = f"site_population_totals[{index}]"
+        if not _unknown_fields(raw, _SITE_TOTAL_KEYS, path, issues):
+            continue
+        site_type = _safe_identifier(raw.get("site_type"), f"{path}.site_type", issues)
+        number = _number(raw.get("value"), f"{path}.value", issues,
+                         minimum=0.0, code="SITE_POPULATION_TOTALS_REQUIRED")
+        if number is not None and number <= 0.0:
+            _issue(issues, "SITE_POPULATION_TOTALS_REQUIRED", f"{path}.value",
+                   "site population total must be strictly positive")
+        if raw.get("unit") not in {"sites", "dimensionless"}:
+            _issue(issues, "SITE_POPULATION_UNIT_UNSUPPORTED", f"{path}.unit",
+                   "site population unit must be sites or dimensionless")
+        if raw.get("basis") not in {
+                "surface_unit_cell", "normalized_site_population"}:
+            _issue(issues, "SITE_POPULATION_BASIS_UNSUPPORTED", f"{path}.basis",
+                   "site population basis is unsupported")
+        _audit_evidence_list(raw.get("evidence"), f"{path}.evidence", issues)
+        if site_type in totals:
+            _issue(issues, "DUPLICATE_SITE_POPULATION_TOTAL", f"{path}.site_type",
+                   f"duplicate population total for site type {site_type}")
+        elif site_type and number is not None:
+            totals[site_type] = number
+    used_sites = {
+        site_type for record in species.values()
+        if record.get("phase") in {"surface", "adsorbate", "transition_state"}
+        for site_type in (record.get("_sites") or {})
+    }
+    if set(totals) != used_sites:
+        _issue(issues, "SITE_POPULATION_TOTALS_INCOMPLETE", "site_population_totals",
+               "site_population_totals must cover every frozen site type exactly")
+    return totals
+
+
 def _audit_energy(value: Any, path: str, issues: list[dict[str, str]],
-                  *, method_id: str | None) -> float | None:
+                  *, method_id: str | None,
+                  require_uncertainty: bool = True) -> float | None:
     if not _unknown_fields(value, _ENERGY_KEYS, path, issues):
         return None
     number = _number(value.get("value"), f"{path}.value", issues)
@@ -416,12 +755,17 @@ def _audit_energy(value: Any, path: str, issues: list[dict[str, str]],
         _issue(issues, "METHOD_ID_MISMATCH", f"{path}.method_id",
                "energy record method_id does not match methodology.method_id")
     _audit_source(value.get("source"), f"{path}.source", issues)
-    uncertainty = _number(
-        value.get("uncertainty_eV"), f"{path}.uncertainty_eV", issues,
-        minimum=0.0, code="ENERGY_UNCERTAINTY_REQUIRED")
-    if uncertainty is None:
-        _issue(issues, "ENERGY_UNCERTAINTY_REQUIRED", f"{path}.uncertainty_eV",
-               "every energy requires a finite non-negative uncertainty_eV")
+    if require_uncertainty:
+        uncertainty = _number(
+            value.get("uncertainty_eV"), f"{path}.uncertainty_eV", issues,
+            minimum=0.0, code="ENERGY_UNCERTAINTY_REQUIRED")
+        if uncertainty is None:
+            _issue(issues, "ENERGY_UNCERTAINTY_REQUIRED", f"{path}.uncertainty_eV",
+                   "every energy requires a finite non-negative uncertainty_eV")
+    elif "uncertainty_eV" in value:
+        _number(
+            value.get("uncertainty_eV"), f"{path}.uncertainty_eV", issues,
+            minimum=0.0, code="ENERGY_UNCERTAINTY_REQUIRED")
     return number
 
 
@@ -459,8 +803,10 @@ def _state(value: Any, path: str, issues: list[dict[str, str]],
                    "stoichiometric coefficients must be positive")
             continue
         if coef is not None and abs(coef - round(coef)) > _BALANCE_TOL:
-            _issue(issues, "CATMAP_STOICHIOMETRY_UNSUPPORTED", f"{path}.{raw_id}",
-                   "phase-1 CatMAP export requires integer elementary-step coefficients")
+            _issue(
+                issues, "CATMAP_STOICHIOMETRY_UNSUPPORTED", f"{path}.{raw_id}",
+                "phase-1 CatMAP export requires integer elementary-step coefficients",
+                severity="warning")
         if species_id and species_id not in species:
             _issue(issues, "UNKNOWN_STEP_SPECIES", f"{path}.{raw_id}",
                    f"step references unknown species {raw_id}")
@@ -516,7 +862,7 @@ def _same_mapping(left: Any, right: Any) -> bool:
 def _audit_assumptions(value: Any, issues: list[dict[str, str]]) -> None:
     allowed = frozenset({
         "mean_field", "steady_state", "site_uniformity",
-        "lateral_interactions", "mechanism_completeness",
+        "lateral_interactions", "mechanism_completeness", "evidence",
     })
     if not _unknown_fields(value, allowed, "assumptions", issues):
         return
@@ -552,20 +898,26 @@ def _audit_assumptions(value: Any, issues: list[dict[str, str]]) -> None:
         _issue(issues, "MECHANISM_COMPLETENESS_UNRESOLVED",
                "assumptions.mechanism_completeness",
                "an incomplete or unknown mechanism cannot be exported for solving")
+    _audit_evidence_list(value.get("evidence"), "assumptions.evidence", issues)
 
 
-def _audit_standard_state(value: Any, issues: list[dict[str, str]]) -> None:
+def _audit_standard_state(
+        value: Any, issues: list[dict[str, str]], *, phases: set[str]) -> None:
     allowed = frozenset({"temperature", "pressure", "concentration", "potential"})
     if not _unknown_fields(value, allowed, "standard_state", issues):
         return
-    required = {
-        "temperature": ("K", 1.0, 5000.0),
-        "pressure": ("bar", 0.0, 1.0e6),
-        "concentration": ("mol/L", 0.0, 1.0e4),
+    dimensions = {
+        "temperature": ("K", 1.0, 5000.0, True),
+        "pressure": ("bar", 0.0, 1.0e6, "gas" in phases),
+        "concentration": (
+            "mol/L", 0.0, 1.0e4,
+            bool({"liquid", "solution"} & phases)),
     }
-    for key, (unit, minimum, maximum) in required.items():
+    for key, (unit, minimum, maximum, required) in dimensions.items():
         record = value.get(key)
         path = f"standard_state.{key}"
+        if record is None and not required:
+            continue
         if not isinstance(record, Mapping) or set(record) != {"value", "unit"}:
             _issue(issues, "STANDARD_STATE_REQUIRED", path,
                    f"{path} requires exactly value and unit")
@@ -595,6 +947,51 @@ def _audit_standard_state(value: Any, issues: list[dict[str, str]]) -> None:
                              "standard_state.potential.reference", issues)
 
 
+def _audit_species_standard_state(
+        value: Any, phase: Any, path: str, issues: list[dict[str, str]], *,
+        required: bool) -> None:
+    if phase not in {"gas", "liquid", "solution"}:
+        if value is not None:
+            _issue(
+                issues, "FLUID_STANDARD_STATE_FORBIDDEN", path,
+                "surface and transition states must not carry fluid standard state")
+        return
+    if value is None and not required:
+        return
+    fields = frozenset({"schema", "phase", "kind", "value", "unit"})
+    if not _unknown_fields(value, fields, path, issues):
+        return
+    domain_phase = "aqueous" if phase == "solution" else phase
+    accepted = (
+        {
+            ("1-bar", "Pa", 100000.0),
+            ("1-atm", "Pa", 101325.0),
+        }
+        if phase == "gas"
+        else {("1-molar", "mol/L", 1.0)}
+    )
+    if value.get("schema") != "vcstudio.fluid-standard-state/v1":
+        _issue(issues, "FLUID_STANDARD_STATE_INVALID", f"{path}.schema",
+               "fluid standard state schema is unsupported")
+    if value.get("phase") != domain_phase:
+        _issue(issues, "FLUID_STANDARD_STATE_INVALID", f"{path}.phase",
+               "fluid standard state phase disagrees with the canonical phase")
+    matching = [
+        candidate for candidate in accepted
+        if (value.get("kind"), value.get("unit")) == candidate[:2]
+    ]
+    if not matching:
+        _issue(issues, "FLUID_STANDARD_STATE_INVALID", path,
+               "fluid standard state kind/unit is inconsistent")
+    number = _number(
+        value.get("value"), f"{path}.value", issues, minimum=0.0,
+        code="FLUID_STANDARD_STATE_INVALID")
+    if (number is not None and matching
+            and abs(number - matching[0][2]) > _BALANCE_TOL):
+        _issue(issues, "FLUID_STANDARD_STATE_INVALID", f"{path}.value",
+               "fluid standard state value is inconsistent")
+
+
 def _audit_methodology(value: Any, issues: list[dict[str, str]]) -> str | None:
     allowed = frozenset({
         "method_id", "energy_basis", "thermochemistry", "solvation",
@@ -616,8 +1013,12 @@ def _audit_methodology(value: Any, issues: list[dict[str, str]]) -> str | None:
     return method_id
 
 
-def _audit_species(value: Any, method_id: str | None,
-                   issues: list[dict[str, str]]) -> dict[str, dict[str, Any]]:
+def _audit_species(
+        value: Any, method_id: str | None,
+        issues: list[dict[str, str]], *, direct_energy_authority: bool = False,
+        qualified_stationary_points: bool = False,
+        require_fluid_standard_state: bool = False,
+        ) -> dict[str, dict[str, Any]]:
     if (isinstance(value, (str, bytes)) or not isinstance(value, Sequence)
             or not value):
         _issue(issues, "SPECIES_REQUIRED", "species",
@@ -698,9 +1099,16 @@ def _audit_species(value: Any, method_id: str | None,
         elif activity is not None:
             _issue(issues, "SPECIES_ACTIVITY_FORBIDDEN", f"{path}.activity",
                    f"{phase} species must not carry a gas/solution activity")
-        energy = _audit_energy(raw.get("formation_energy"),
-                               f"{path}.formation_energy", issues,
-                               method_id=method_id)
+        _audit_species_standard_state(
+            raw.get("standard_state"), phase, f"{path}.standard_state", issues,
+            required=require_fluid_standard_state)
+        if raw.get("formation_energy") is None and direct_energy_authority:
+            energy = None
+        else:
+            energy = _audit_energy(
+                raw.get("formation_energy"), f"{path}.formation_energy", issues,
+                method_id=method_id,
+                require_uncertainty=not direct_energy_authority)
         frequencies = raw.get("frequencies_cm1")
         normalized_frequencies = []
         if (isinstance(frequencies, (str, bytes))
@@ -719,7 +1127,9 @@ def _audit_species(value: Any, method_id: str | None,
             frequency for frequency in normalized_frequencies
             if frequency < -SIGNIFICANT_IMAGINARY_FREQUENCY_CM1
         ]
-        if phase == "transition_state" and len(significant_imaginary) != 1:
+        if (phase == "transition_state" and not (
+                qualified_stationary_points and not normalized_frequencies)
+                and len(significant_imaginary) != 1):
             _issue(
                 issues, "TRANSITION_STATE_IMAGINARY_MODE_REQUIRED",
                 f"{path}.frequencies_cm1",
@@ -795,7 +1205,9 @@ def _audit_empirical_model(value: Any, path: str, issues: list[dict[str, str]]) 
 
 def _audit_steps(value: Any, method_id: str | None,
                  species: Mapping[str, dict[str, Any]],
-                 issues: list[dict[str, str]]) -> list[dict[str, Any]]:
+                 issues: list[dict[str, str]], *,
+                 direct_energy_authority: bool = False,
+                 ) -> list[dict[str, Any]]:
     if (isinstance(value, (str, bytes)) or not isinstance(value, Sequence)
             or not value):
         _issue(issues, "ELEMENTARY_STEPS_REQUIRED", "elementary_steps",
@@ -856,18 +1268,22 @@ def _audit_steps(value: Any, method_id: str | None,
             _issue(issues, "REVERSE_BARRIER_REQUIRED", f"{path}.reversible",
                    "phase-1 detailed-balance audit requires reversible=true")
         delta_g = _audit_energy(raw.get("delta_g"), f"{path}.delta_g", issues,
-                                method_id=method_id)
+                                method_id=method_id,
+                                require_uncertainty=not direct_energy_authority)
         barrier_f = _audit_energy(
             raw.get("forward_barrier"), f"{path}.forward_barrier", issues,
-            method_id=method_id)
+            method_id=method_id,
+            require_uncertainty=not direct_energy_authority)
         barrier_r = _audit_energy(
             raw.get("reverse_barrier"), f"{path}.reverse_barrier", issues,
-            method_id=method_id)
+            method_id=method_id,
+            require_uncertainty=not direct_energy_authority)
         _audit_prefactors(raw.get("prefactors"), f"{path}.prefactors", issues)
         _audit_empirical_model(raw.get("bep"), f"{path}.bep", issues)
         _audit_empirical_model(raw.get("scaling"), f"{path}.scaling", issues)
         _number(raw.get("uncertainty_eV"), f"{path}.uncertainty_eV", issues,
                 minimum=0.0, code="STEP_UNCERTAINTY_REQUIRED")
+        _audit_evidence_list(raw.get("evidence"), f"{path}.evidence", issues)
 
         for field, code in (
                 ("composition", "ELEMENT_NOT_CONSERVED"),
@@ -968,6 +1384,86 @@ def _audit_connectivity(feeds: Sequence[str], targets: Sequence[str],
                severity="warning")
 
 
+def _frozen_v2_authority(
+        network: Mapping[str, Any], projection: Any,
+        issues: list[dict[str, str]],
+        ) -> tuple[bool, bool, Mapping[str, Any] | None]:
+    if (not isinstance(projection, Mapping)
+            or (projection.get("schema"), projection.get("version"))
+            != ("vcstudio.frozen-reaction-network/v2", "2")):
+        return False, False, None
+    extensions = network.get("extensions")
+    authority = (
+        extensions.get("frozen_reaction_v2")
+        if isinstance(extensions, Mapping) else None)
+    fields = frozenset({
+        "schema", "frozen_network_sha256", "source_projection_sha256",
+        "reaction_graph_sha256", "condition_revision_id",
+        "condition_revision_sha256", "conditions", "direct_step_energies",
+        "qualified_stationary_points",
+    })
+    if not isinstance(authority, Mapping) or set(authority) != fields:
+        _issue(
+            issues, "FROZEN_REACTION_AUTHORITY_REQUIRED",
+            "extensions.frozen_reaction_v2",
+            "frozen reaction v2 requires its exact source/condition authority ledger")
+        return False, False, None
+    if authority.get("schema") != "vcstudio.kinetics-frozen-reaction-authority/v1":
+        _issue(
+            issues, "FROZEN_REACTION_AUTHORITY_REQUIRED",
+            "extensions.frozen_reaction_v2.schema",
+            "frozen reaction authority schema is unsupported")
+    frozen_hash = _sha(
+        authority.get("frozen_network_sha256"),
+        "extensions.frozen_reaction_v2.frozen_network_sha256", issues)
+    _sha(
+        authority.get("source_projection_sha256"),
+        "extensions.frozen_reaction_v2.source_projection_sha256", issues)
+    _sha(
+        authority.get("reaction_graph_sha256"),
+        "extensions.frozen_reaction_v2.reaction_graph_sha256", issues)
+    _safe_identifier(
+        authority.get("condition_revision_id"),
+        "extensions.frozen_reaction_v2.condition_revision_id", issues)
+    _sha(
+        authority.get("condition_revision_sha256"),
+        "extensions.frozen_reaction_v2.condition_revision_sha256", issues)
+    conditions = authority.get("conditions")
+    if not isinstance(conditions, Mapping) or not conditions:
+        _issue(
+            issues, "FROZEN_REACTION_CONDITIONS_REQUIRED",
+            "extensions.frozen_reaction_v2.conditions",
+            "frozen reaction v2 requires an exact condition snapshot")
+        conditions = None
+    else:
+        for key, raw in conditions.items():
+            if key not in {
+                    "temperature_k", "pressure_pa", "ph",
+                    "electrode_potential_v", "coverage"}:
+                _issue(
+                    issues, "FROZEN_REACTION_CONDITIONS_INVALID",
+                    "extensions.frozen_reaction_v2.conditions",
+                    "frozen reaction v2 condition field is unsupported")
+                continue
+            _number(
+                raw, f"extensions.frozen_reaction_v2.conditions.{key}", issues,
+                minimum=-1.0e12, maximum=1.0e12,
+                code="FROZEN_REACTION_CONDITIONS_INVALID")
+    if frozen_hash != projection.get("projection_sha256"):
+        _issue(
+            issues, "FROZEN_REACTION_AUTHORITY_MISMATCH",
+            "extensions.frozen_reaction_v2.frozen_network_sha256",
+            "frozen reaction ledger disagrees with source_projection")
+    direct = authority.get("direct_step_energies") is True
+    qualified = authority.get("qualified_stationary_points") is True
+    if not direct or not qualified:
+        _issue(
+            issues, "FROZEN_REACTION_AUTHORITY_REQUIRED",
+            "extensions.frozen_reaction_v2",
+            "frozen reaction v2 lacks direct energy/stationary-point authority")
+    return direct, qualified, conditions
+
+
 def audit_network(
         source: CanonicalKineticsInput | KineticsInputProvider) -> dict[str, Any]:
     """Audit a frozen reaction/thermochemistry projection without solving it."""
@@ -976,7 +1472,15 @@ def audit_network(
         network = _as_mapping(source)
     except KineticsContractError as exc:
         _issue(issues, "INVALID_INPUT", "$", str(exc))
-        network = {}
+        # Preserve a provider's already-frozen in-memory input for diagnostic
+        # issue enumeration only.  INVALID_INPUT remains blocking and the raw
+        # mapping can never become canonical or exportable.
+        loader = getattr(source, "kinetics_input", None)
+        try:
+            raw = loader() if callable(loader) else None
+        except Exception:  # noqa: BLE001 diagnostic fallback must remain inert
+            raw = None
+        network = copy.deepcopy(dict(raw)) if isinstance(raw, Mapping) else {}
     _unknown_fields(network, _TOP_LEVEL_KEYS, "$", issues)
     if network.get("schema") != NETWORK_SCHEMA:
         _issue(issues, "UNSUPPORTED_SCHEMA", "schema",
@@ -1027,8 +1531,29 @@ def audit_network(
                     _sha(reference.get("artifact_sha256"),
                          f"{path}.artifact_sha256", issues)
 
+    model_spec = network.get("model_spec")
+    if _unknown_fields(model_spec, _MODEL_SPEC_KEYS, "model_spec", issues):
+        if model_spec.get("schema") != "vcstudio.kinetics-model-spec/v1":
+            _issue(issues, "UNSUPPORTED_MODEL_SPEC", "model_spec.schema",
+                   "model_spec.schema must be vcstudio.kinetics-model-spec/v1")
+        for key in ("project_id", "spec_id", "revision"):
+            _safe_text(model_spec.get(key), f"model_spec.{key}", issues,
+                       maximum=128)
+        _sha(model_spec.get("spec_sha256"), "model_spec.spec_sha256", issues)
+        _sha(model_spec.get("source_projection_sha256"),
+             "model_spec.source_projection_sha256", issues)
+    rate_policy = _audit_rate_law_policy(network.get("rate_law_policy"), issues)
     _audit_assumptions(network.get("assumptions"), issues)
-    _audit_standard_state(network.get("standard_state"), issues)
+    raw_species = network.get("species")
+    phases = {
+        item.get("phase") for item in raw_species
+        if isinstance(item, Mapping)
+    } if (isinstance(raw_species, Sequence)
+          and not isinstance(raw_species, (str, bytes))) else set()
+    direct_energy, qualified_points, frozen_conditions = _frozen_v2_authority(
+        network, projection, issues)
+    _audit_standard_state(
+        network.get("standard_state"), issues, phases=phases)
     operating = network.get("operating_range")
     ranges = {}
     if _unknown_fields(
@@ -1037,19 +1562,53 @@ def audit_network(
         ranges["temperature_K"] = _audit_range(
             operating.get("temperature_K"), "operating_range.temperature_K", issues,
             minimum=1.0, maximum=5000.0)
-        ranges["pressure_bar"] = _audit_range(
-            operating.get("pressure_bar"), "operating_range.pressure_bar", issues,
-            minimum=0.0, maximum=1.0e6)
+        pressure_range = operating.get("pressure_bar")
+        ranges["pressure_bar"] = (
+            None if pressure_range is None and "gas" not in phases else _audit_range(
+                pressure_range, "operating_range.pressure_bar", issues,
+                minimum=0.0, maximum=1.0e6))
         potential = operating.get("potential_V")
         ranges["potential_V"] = (None if potential is None else _audit_range(
             potential, "operating_range.potential_V", issues,
             minimum=-10.0, maximum=10.0))
 
     method_id = _audit_methodology(network.get("methodology"), issues)
-    species = _audit_species(network.get("species"), method_id, issues)
+    species = _audit_species(
+        network.get("species"), method_id, issues,
+        direct_energy_authority=direct_energy,
+        qualified_stationary_points=qualified_points,
+        require_fluid_standard_state=(
+            isinstance(projection, Mapping)
+            and (projection.get("schema"), projection.get("version"))
+            == ("vcstudio.frozen-reaction-network/v2", "2")))
+    _audit_site_population_totals(
+        network.get("site_population_totals"), species, issues)
     standard = network.get("standard_state") or {}
     standard_temperature = (standard.get("temperature") or {}).get("value")
     standard_pressure = (standard.get("pressure") or {}).get("value")
+    if isinstance(frozen_conditions, Mapping):
+        condition_temperature = frozen_conditions.get("temperature_k")
+        if (isinstance(condition_temperature, (int, float))
+                and not isinstance(condition_temperature, bool)
+                and isinstance(standard_temperature, (int, float))
+                and not isinstance(standard_temperature, bool)
+                and abs(float(condition_temperature)
+                        - float(standard_temperature)) > _BALANCE_TOL):
+            _issue(
+                issues, "FROZEN_REACTION_CONDITION_MISMATCH",
+                "standard_state.temperature",
+                "kinetics temperature disagrees with the frozen condition revision")
+        condition_pressure = frozen_conditions.get("pressure_pa")
+        if ("gas" in phases and isinstance(condition_pressure, (int, float))
+                and not isinstance(condition_pressure, bool)
+                and isinstance(standard_pressure, (int, float))
+                and not isinstance(standard_pressure, bool)
+                and abs(float(condition_pressure) / 100000.0
+                        - float(standard_pressure)) > _BALANCE_TOL):
+            _issue(
+                issues, "FROZEN_REACTION_CONDITION_MISMATCH",
+                "standard_state.pressure",
+                "kinetics pressure disagrees with the frozen condition revision")
     if (isinstance(standard_temperature, (int, float))
             and not isinstance(standard_temperature, bool)
             and math.isfinite(float(standard_temperature))
@@ -1070,6 +1629,12 @@ def audit_network(
                "standard-state pressure is outside operating_range.pressure_bar")
     methodology = network.get("methodology") or {}
     uses_potential = methodology.get("potential_model") != "none"
+    expected_electrochemical = "explicit_potential" if uses_potential else "none"
+    if (rate_policy.get("electrochemical") is not None
+            and rate_policy["electrochemical"] != expected_electrochemical):
+        _issue(issues, "ELECTROCHEMICAL_POLICY_MISMATCH",
+               "rate_law_policy.electrochemical",
+               "rate-law electrochemical policy disagrees with methodology")
     if uses_potential and (
             standard.get("potential") is None or ranges.get("potential_V") is None):
         _issue(issues, "POTENTIAL_RANGE_REQUIRED", "operating_range.potential_V",
@@ -1088,7 +1653,9 @@ def audit_network(
             and abs(sum(gas_activities) - float(standard_pressure)) > 1.0e-8):
         _issue(issues, "PARTIAL_PRESSURE_SUM_MISMATCH", "species.activity",
                "gas partial pressures must sum to standard_state.pressure")
-    steps = _audit_steps(network.get("elementary_steps"), method_id, species, issues)
+    steps = _audit_steps(
+        network.get("elementary_steps"), method_id, species, issues,
+        direct_energy_authority=direct_energy)
     feeds = _identifier_array(network.get("feed_species"), "feed_species", issues, species)
     targets = _identifier_array(
         network.get("target_products"), "target_products", issues, species)
@@ -1117,7 +1684,7 @@ def audit_network(
             if isinstance(network.get("species"), Sequence) else 0,
             "elementary_steps": len(network.get("elementary_steps") or [])
             if isinstance(network.get("elementary_steps"), Sequence) else 0,
-            "checks": 12,
+            "checks": 15,
         },
         "model_boundaries": {
             "mean_field": True,
@@ -1147,15 +1714,16 @@ def _strict_object(value: Any, allowed: set[str] | frozenset[str], path: str) ->
 
 def _result_identifier(value: Any, path: str) -> str:
     if (not isinstance(value, str) or not _SAFE_ID_RE.fullmatch(value)
-            or _CONTROL_RE.search(value) or _PATH_RE.search(value)
-            or _SECRET_RE.search(value)):
+            or _CONTROL_RE.search(value)
+            or classify_sensitive_text(value) is not None):
         raise KineticsContractError(f"{path} must be a safe identifier")
     return value
 
 
 def _result_version(value: Any, path: str) -> str:
     if (not isinstance(value, str) or not _VERSION_RE.fullmatch(value)
-            or _CONTROL_RE.search(value) or _SECRET_RE.search(value)):
+            or _CONTROL_RE.search(value)
+            or classify_sensitive_text(value) is not None):
         raise KineticsContractError(f"{path} must be a safe version token")
     return value
 
