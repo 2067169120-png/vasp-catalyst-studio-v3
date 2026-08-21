@@ -194,9 +194,20 @@ JavaScript 文件的 `node --check`、变更 Python 文件的 `py_compile` 与 `
 通过。本轮未重建 EXE、未重跑 actionlint，也未执行真实集群/VASP 作业；上段冻结二进制
 哈希仍仅对应 2026-08-13 产物。
 
-该最终冻结 EXE 内的 `full` 和 `journey` healthcheck 都以退出码 0 完成，并各自报告 `ok=true`、`frozen=true`。`journey` 完成 10/10 个阶段，网络尝试为 0、集群操作为 0，且服务重建后的重启持久化检查通过。上述新增工作流也保留聚焦 Python 合同测试和/或真实 Node 生产 IIFE 回归；冻结 journey 保持 `blocked`/`diagnostic` 科学状态的诚实边界。
+2026-08-21 的整合树再次完成最终本地门禁：免缓存全量 pytest 为
+**5185 passed、12 skipped**（540.97 秒；15 条上游弃用警告）；全仓 Ruff、28 个第一方
+JavaScript 文件的 `node --check`、`pip check` 与 `git diff --check` 通过。本机未安装
+actionlint，工作流静态检查仍等待推送后的远端 CI。`vcstudio-4.0.0` wheel 构建成功并包含
+52 个 Web 资源和中英文 locale。基于整合提交 `6cfe082` 的 `--full` 单文件 EXE 为
+**115,177,760 bytes（109.84 MiB）**，SHA-256 为
+`17b8d1927dfb1f99a1bd41249574113edb6dc680eb78d0e9239c67eb1408e874`。
 
-这些是本地软件门禁，不替代 GitHub-hosted 远端 CI；推送后的具体提交仍必须通过远端矩阵。`v4.0.0` 标签尚未创建，CHANGELOG 仍保持 Unreleased；5 个 skip 不等于对应功能通过。也未执行真实远程集群作业或真实科学/实验验证，不能从这些自动化检查、离线 journey 或 EXE 产物推断科学有效性或发布就绪。
+2026-08-21 冻结 EXE 内的 `full` 和 `journey` healthcheck 都以退出码 0 完成，并各自报告
+`ok=true`、`frozen=true`。`full` 为 6/6，`journey` 完成 10/10 个阶段，网络尝试为 0、
+集群操作为 0，且服务重建后的重启持久化检查通过。上述新增工作流也保留聚焦 Python
+合同测试和/或真实 Node 生产 IIFE 回归；冻结 journey 保持 `blocked`/`diagnostic` 科学状态的诚实边界。
+
+这些是本地软件门禁，不替代 GitHub-hosted 远端 CI；推送后的具体提交仍必须通过远端矩阵。`v4.0.0` 标签尚未创建，CHANGELOG 仍保持 Unreleased；12 个 skip 不等于对应功能通过。也未执行真实远程集群作业或真实科学/实验验证，不能从这些自动化检查、离线 journey 或 EXE 产物推断科学有效性或发布就绪。
 
 CI 矩阵覆盖 Ubuntu/Windows × Python 3.10、3.11、3.12。Windows package-smoke 会构建真实 EXE，并要求最终二进制的 `full` 与 `journey` 两个 profile 都成功后才上传 EXE 和 JSON 健康检查证据。
 

@@ -49,6 +49,29 @@ Focused tests passed with **182 passed and 1 skipped**, builder/manifest/submiss
 changed-file `py_compile`, and `git diff --check` passed. No real-cluster VASP run, release rebuild, or remote
 CI was performed.
 
+2026-08-21 完成本轮研究工作台整合后的最终本地门禁：免缓存全量 pytest 为
+**5185 passed、12 skipped**（540.97 秒；15 条 ASE/NumPy 上游弃用警告）；全仓 Ruff、
+28 个第一方 JavaScript 文件的 `node --check`、`pip check` 与 `git diff --check` 通过。
+本机未安装 actionlint，因此工作流静态检查仍由推送后的远端 CI 执行。`vcstudio-4.0.0`
+wheel 构建成功（9,876,237 bytes，SHA-256
+`953aae4be88defc684e98eeef10e3df16c8ed4a875762fd01b83d544a74efa20`），并包含 52 个 Web
+资源与 2 个 locale。基于整合提交 `6cfe082` 的 PyInstaller `--full` 单文件 EXE 为
+**115,177,760 bytes（109.84 MiB）**，SHA-256
+`17b8d1927dfb1f99a1bd41249574113edb6dc680eb78d0e9239c67eb1408e874`；冻结进程内 `full`
+检查 6/6、`journey` 10/10 阶段均以退出码 0 完成，且网络尝试与集群操作均为 0。
+
+On 2026-08-21 the integrated research-workbench tree completed its final local gates: cache-free full
+pytest passed with **5185 passed and 12 skipped** in 540.97 seconds, with 15 upstream ASE/NumPy
+deprecation warnings; full-repository Ruff, `node --check` for 28 first-party JavaScript files,
+`pip check`, and `git diff --check` passed. Actionlint was not installed locally, so workflow linting
+remains a hosted-CI gate after push. The `vcstudio-4.0.0` wheel built successfully (9,876,237 bytes,
+SHA-256 `953aae4be88defc684e98eeef10e3df16c8ed4a875762fd01b83d544a74efa20`) with 52 Web assets
+and both locales. The PyInstaller `--full` one-file EXE built from integration commit `6cfe082` is
+**115,177,760 bytes (109.84 MiB)** with SHA-256
+`17b8d1927dfb1f99a1bd41249574113edb6dc680eb78d0e9239c67eb1408e874`; inside that frozen
+process, the 6/6 `full` checks and all 10/10 `journey` phases exited 0 with zero network attempts and
+zero cluster operations.
+
 ### 报告、状态与项目工作区（Phase A–B）
 - 建立报告与状态合同，明确稳定项目身份、服务端快照、门禁结论、产物状态和 revision
   之间的绑定关系；未通过门禁或缺少证据时保留诊断状态，不冒充最终发布结果。
