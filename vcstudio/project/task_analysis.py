@@ -111,6 +111,13 @@ def _read(path: Path) -> str:
         return ''
 
 
+def _correction_compatibility(job_dir) -> dict:
+    """Expose validated repair lineage without making it a scientific PASS."""
+    from vcstudio.project.trajectory_review import correction_method_compatibility
+
+    return correction_method_compatibility(job_dir)
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open('rb') as handle:
@@ -558,7 +565,8 @@ def analyze_vasp_outputs(job_dir, task_key: str) -> dict:
     result = {'n_steps': len(energies), 'final_energy_e0_ev': energies[-1],
               'final_fmax_ev_a': fmax[-1] if fmax else None,
               'clean_exit': clean_exit, 'ionic_converged_marker': ionic_mark,
-              'series': series}
+              'series': series,
+              'correction_method_compatibility': _correction_compatibility(root)}
     force_text = (f'，末步 |F|max={fmax[-1]:.4f} eV/Å' if fmax else '')
     summary = f'共 {len(energies)} 个离子/单点步，末步 E0={energies[-1]:.6f} eV{force_text}。'
     return {'ok': True, 'kind': normalize_task_key(task_key), 'result': result,
@@ -628,7 +636,8 @@ def analyze_aimd(job_dir) -> dict:
               'energy_drift_total_ev': energies[-1] - energies[0],
               'temperature_samples_k': temperatures,
               'temperature_mean_k': (sum(temperatures) / len(temperatures)
-                                     if temperatures else None)}
+                                     if temperatures else None),
+              'correction_method_compatibility': _correction_compatibility(root)}
     temp_text = (f'，平均温度={result["temperature_mean_k"]:.1f} K'
                  if result['temperature_mean_k'] is not None else '')
     summary = (f'解析 {len(steps)} 步，首末能量漂移='
@@ -656,6 +665,7 @@ def analyze_neb(job_dir) -> dict:
     gate = neb.neb_quality_gate(data)
     result = dict(data)
     result['quality_gate'] = gate
+    result['correction_method_compatibility'] = _correction_compatibility(job_dir)
     fig = None
     try:
         paths = neb.neb_profile_plot(data, str(Path(job_dir) / 'neb_profile'))
@@ -691,6 +701,7 @@ def _manifest_summary(job_dir) -> dict:
             'fetched_missing', 'fetched_at') if results.get(key) is not None}
         if selected:
             summary['results'] = selected
+    summary['correction_method_compatibility'] = _correction_compatibility(job_dir)
     return summary
 
 

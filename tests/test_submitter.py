@@ -1,4 +1,6 @@
 """提交编排测试:注入假 client/sftp,验证 preflight/上传/提交/状态刷新与 manifest 回写。"""
+import hashlib
+import json
 import os
 import posixpath
 import threading
@@ -713,6 +715,128 @@ def test_continue_from_contcar_happy(tmp_path):
                 'fetched_job_id', 'fetched_remote_dir'):
         assert key not in m['results']                           # 新轮尚未下载，旧证据清零
     assert os.path.isfile(os.path.join(d, 'OUTCAR'))             # 旧文件保留作审计，不算新轮证据
+
+
+def test_continue_rechecks_content_cas_before_any_remote_command(tmp_path):
+    d = _restartable_job(tmp_path)
+    value = manifest.load_manifest(d)
+    incar = os.path.join(d, 'INCAR')
+    contcar = os.path.join(d, 'CONTCAR')
+    with open(contcar, 'w', encoding='utf-8') as handle:
+        handle.write(_VALID_CONTCAR)
+    files = {}
+    for name in ('job.yaml', 'INCAR', 'CONTCAR'):
+        files[name], _size = submitter._file_sha256_size(os.path.join(d, name))
+    diagnosis = (value.get('results') or {}).get('diagnosis') or {}
+    diagnosis_digest = hashlib.sha256(json.dumps(
+        diagnosis, ensure_ascii=False, sort_keys=True,
+        separators=(',', ':')).encode('utf-8')).hexdigest()
+    expected = {
+        'schema': 'vcstudio.repair-cas/v1', 'ledger_job_id': value['job_id'],
+        'manifest_job_id': value['job_id'], 'manifest_state': value['state'],
+        'scheduler_job_id': value['scheduler_job_id'],
+        'diagnosis_sha256': diagnosis_digest,
+        'diagnosis_evidence_file': None, 'source_hash': 's' * 64,
+        'files': files,
+    }
+    before = os.stat(incar)
+    data = open(incar, 'rb').read()
+    assert b'400' in data
+    with open(incar, 'wb') as handle:
+        handle.write(data.replace(b'400', b'401', 1))
+    os.utime(incar, ns=(before.st_atime_ns, before.st_mtime_ns))
+    client = FakeClient()
+
+    with pytest.raises(ValueError, match='内容已变化'):
+        submitter.continue_from_contcar(
+            client, _profile(), d, idempotency_key='trajectory-repair:cas',
+            expected_cas=expected)
+    assert client.commands == []
+
+
+def test_correction_linked_continue_replays_before_preview_cas_after_crash(tmp_path):
+    d = _restartable_job(tmp_path, rounds=submitter.CONTINUE_MAX_ROUNDS)
+    value = manifest.load_manifest(d)
+    contcar = os.path.join(d, 'CONTCAR')
+    with open(contcar, 'w', encoding='utf-8') as handle:
+        handle.write(_VALID_CONTCAR)
+    files = {}
+    for name in ('job.yaml', 'INCAR', 'CONTCAR'):
+        files[name], _size = submitter._file_sha256_size(os.path.join(d, name))
+    diagnosis = (value.get('results') or {}).get('diagnosis') or {}
+    diagnosis_digest = hashlib.sha256(json.dumps(
+        diagnosis, ensure_ascii=False, sort_keys=True,
+        separators=(',', ':')).encode('utf-8')).hexdigest()
+    expected = {
+        'schema': 'vcstudio.repair-cas/v1', 'ledger_job_id': value['job_id'],
+        'manifest_job_id': value['job_id'], 'manifest_state': value['state'],
+        'scheduler_job_id': value['scheduler_job_id'],
+        'diagnosis_sha256': diagnosis_digest,
+        'diagnosis_evidence_file': None, 'source_hash': 's' * 64,
+        'files': files,
+    }
+    operation_key = 'trajectory-repair:journal-replay'
+    correction = {
+        'schema': 'vcstudio.correction-journal-link/v1',
+        'correction_id': 'a' * 24, 'intent_record_hash': 'b' * 64,
+        'plan_id': 'c' * 64, 'plan_token_sha256': 'd' * 64,
+        'job_id': value['job_id'], 'ledger_job_id': value['job_id'],
+        'manifest_job_id': value['job_id'],
+        'cas_anchor_sha256': submitter._job_action_request_sha256(expected),
+        'idempotency_key': operation_key,
+    }
+    first = FakeClient(script=[('cat', _VALID_CONTCAR), ('qsub', '201.c\n')])
+    submitted = submitter.continue_from_contcar(
+        first, _profile(), d, max_rounds=None, idempotency_key=operation_key,
+        expected_cas=expected, correction_binding=correction)
+    assert submitted['scheduler_job_id'] == '201'
+    assert submitted['results']['continue_rounds'] == \
+        submitter.CONTINUE_MAX_ROUNDS + 1
+    assert submitted['attempts'][-1]['round_limit_override'] == 'manual-explicit'
+    assert submitted['attempts'][-1]['correction'] == correction
+
+    restarted = FakeClient()
+    replay = submitter.continue_from_contcar(
+        restarted, _profile(), d, max_rounds=None, idempotency_key=operation_key,
+        expected_cas=expected, correction_binding=correction)
+    assert replay['_continue_replayed'] is True
+    assert replay['scheduler_job_id'] == '201'
+    assert restarted.commands == []
+
+    wrong_profile = FakeClient()
+    with pytest.raises(ValueError, match='属于服务器'):
+        submitter.continue_from_contcar(
+            wrong_profile, _profile(name='other'), d, max_rounds=None,
+            idempotency_key=operation_key,
+            expected_cas=expected, correction_binding=correction)
+    assert wrong_profile.commands == []
+
+    mismatched = dict(correction, intent_record_hash='f' * 64)
+    rejected = FakeClient()
+    with pytest.raises(submitter.UnknownRemoteJobOperation,
+                       match='correction intent'):
+        submitter.continue_from_contcar(
+            rejected, _profile(), d, max_rounds=None,
+            idempotency_key=operation_key,
+            expected_cas=expected, correction_binding=mismatched)
+    assert rejected.commands == []
+
+    changed_request = FakeClient()
+    with pytest.raises(ValueError, match='不同的续算授权内容'):
+        submitter.continue_from_contcar(
+            changed_request, _profile(), d,
+            idempotency_key=operation_key,
+            expected_cas=expected, correction_binding=correction)
+    assert changed_request.commands == []
+
+    changed_cas = dict(expected, source_hash='changed-source-hash')
+    changed_anchor = FakeClient()
+    with pytest.raises(ValueError, match='CAS 锚点不一致'):
+        submitter.continue_from_contcar(
+            changed_anchor, _profile(), d, max_rounds=None,
+            idempotency_key=operation_key,
+            expected_cas=changed_cas, correction_binding=correction)
+    assert changed_anchor.commands == []
 
 
 def test_continue_from_contcar_qsub_without_job_id_fails_closed(tmp_path):

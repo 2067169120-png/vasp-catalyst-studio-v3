@@ -1,6 +1,8 @@
 """batch_ops 后台批量函数测试(不建 Tk 窗口,只测线程体):连接关闭责任与单作业失败隔离。"""
 import types
 
+import pytest
+
 from vcstudio.cluster import batch_ops
 from vcstudio.shared import manifest as mm
 
@@ -343,3 +345,91 @@ def test_manual_continue_batch_disables_only_the_round_cap(monkeypatch):
     assert payload['results'][0][1] is True
     assert calls == [('capped', None)]
     assert client.closed and jump.closed
+
+
+def test_continue_batch_rejects_cas_before_opening_connection(monkeypatch):
+    opened = []
+    monkeypatch.setattr(
+        batch_ops, 'open_client',
+        lambda *_args, **_kwargs: opened.append(True) or (_ for _ in ()).throw(
+            AssertionError('connection seam must not be reached')))
+    monkeypatch.setattr(
+        batch_ops.submitter, 'assert_repair_content_cas',
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError('same-size replacement')))
+    payload = batch_ops.continue_batch(
+        object(), None, ['d1'], False,
+        idempotency_key='trajectory-repair:cas-preflight',
+        expected_cas_by_job={'d1': {'schema': 'vcstudio.repair-cas/v1'}})
+    assert payload['ok'] is False
+    assert '未建立远程连接' in payload['error']
+    assert opened == []
+
+
+@pytest.mark.parametrize('guard_name', [
+    'expected_cas_by_job',
+    'expected_correction_by_job',
+])
+def test_continue_batch_old_adapter_cannot_drop_repair_guards(
+        monkeypatch, guard_name):
+    opened = []
+
+    def legacy_adapter(_client, _profile, _job_dir, *, idempotency_key=None):
+        raise AssertionError('legacy adapter must not be called')
+
+    monkeypatch.setattr(batch_ops.submitter, 'continue_from_contcar', legacy_adapter)
+    monkeypatch.setattr(
+        batch_ops, 'open_client',
+        lambda *_args, **_kwargs: opened.append(True) or (_ for _ in ()).throw(
+            AssertionError('connection seam must not be reached')))
+    payload = batch_ops.continue_batch(
+        object(), None, ['d1'], False,
+        idempotency_key='trajectory-repair:legacy-adapter',
+        **{guard_name: {'d1': {'schema': 'guard'}}})
+
+    assert payload['ok'] is False
+    assert '适配器不支持' in payload['error']
+    assert opened == []
+
+
+def test_continue_batch_forwards_exact_correction_journal_binding(monkeypatch):
+    client, jump = _patch_open(monkeypatch)
+    monkeypatch.setattr(
+        batch_ops.submitter, 'assert_repair_content_cas', lambda *_args: None)
+    monkeypatch.setattr(
+        batch_ops.submitter, 'assert_repair_correction_binding',
+        lambda *_args: None)
+    captured = {}
+
+    def continued(_client, _profile, directory, **kwargs):
+        captured.update(directory=directory, **kwargs)
+        return {'scheduler_job_id': '101', '_continue_replayed': True}
+
+    monkeypatch.setattr(batch_ops.submitter, 'continue_from_contcar', continued)
+    correction = {'schema': 'vcstudio.correction-journal-link/v1'}
+    payload = batch_ops.continue_batch(
+        object(), None, ['d1'], False,
+        idempotency_key='trajectory-repair:batch-binding',
+        allow_round_limit_override=True,
+        expected_cas_by_job={'d1': {'schema': 'vcstudio.repair-cas/v1'}},
+        expected_correction_by_job={'d1': correction})
+    assert payload['results'] == [('d1', True, '已确认续算,新作业号 101')]
+    assert captured['correction_binding'] is correction
+    assert captured['idempotency_key'] == 'trajectory-repair:batch-binding'
+    assert captured['max_rounds'] is None
+    assert client.closed and jump.closed
+
+
+def test_continue_batch_rejects_correction_binding_before_connection(monkeypatch):
+    opened = []
+    monkeypatch.setattr(
+        batch_ops, 'open_client',
+        lambda *_args, **_kwargs: opened.append(True) or (_ for _ in ()).throw(
+            AssertionError('connection seam must not be reached')))
+    payload = batch_ops.continue_batch(
+        object(), None, ['d1'], False,
+        idempotency_key='trajectory-repair:bad-binding',
+        expected_correction_by_job={'d1': {'schema': 'invalid'}})
+    assert payload['ok'] is False
+    assert '未建立远程连接' in payload['error']
+    assert opened == []

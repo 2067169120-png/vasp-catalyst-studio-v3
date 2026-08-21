@@ -44,6 +44,7 @@
     reuseAdvisoryResult: null,
     reuseAdvisoryGeneration: 0,
     reuseAdvisorySelection: '',
+    trajectoryOwners: new Map(),
   };
 
   // 目录 → 末段名(本地日志用,兼容 \ 与 /)
@@ -57,6 +58,51 @@
     const value = [row.job_uuid, row.id, row.job_id]
       .find(item => item !== null && item !== undefined && String(item).trim());
     return String(value === undefined ? '' : value).trim();
+  }
+
+  function issueTrajectoryOwner(row) {
+    const jobId = stableJobId(row);
+    if (!jobId) return null;
+    const ownerId = newOperationKey().replace(/^jobop-/, 'trajectory-owner-');
+    const stored = Object.freeze({
+      ownerId,
+      jobId,
+      dir: String(row.dir || ''),
+      projectId: String(row.project_id || ''),
+      selectionGeneration: State.selectionGeneration,
+    });
+    State.trajectoryOwners.set(ownerId, stored);
+    while (State.trajectoryOwners.size > 64) {
+      State.trajectoryOwners.delete(State.trajectoryOwners.keys().next().value);
+    }
+    return Object.freeze({
+      owner_id: ownerId,
+      job_id: jobId,
+      project_id: stored.projectId,
+      selection_generation: stored.selectionGeneration,
+    });
+  }
+
+  function trajectoryOwnerRow(receipt, jobId) {
+    if (!receipt || typeof receipt !== 'object') return null;
+    const ownerId = String(receipt.owner_id || '');
+    const stored = State.trajectoryOwners.get(ownerId);
+    const requested = String(jobId || '');
+    if (!stored || stored.jobId !== requested ||
+        String(receipt.job_id || '') !== stored.jobId ||
+        String(receipt.project_id || '') !== stored.projectId ||
+        Number(receipt.selection_generation) !== stored.selectionGeneration ||
+        State.selectionGeneration !== stored.selectionGeneration) return null;
+    const row = State.rows.find(item => stableJobId(item) === stored.jobId &&
+      String(item.dir || '') === stored.dir) || null;
+    if (!row || String(row.project_id || '') !== stored.projectId ||
+        !jobBelongsToWorkspaceProject(row)) return null;
+    return row;
+  }
+
+  function releaseTrajectoryOwner(receipt) {
+    const ownerId = String(receipt && receipt.owner_id || '');
+    if (ownerId) State.trajectoryOwners.delete(ownerId);
   }
 
   function publishJobContext(row) {
@@ -326,6 +372,12 @@
         '3D 结构预览(CONTCAR 优先,自动检查分子-衬底距离)',
         '3D structure preview (prefer CONTCAR and automatically check molecule-surface distance)'))}">${VCS.esc(tr(
         'runtime.jobs.action.structure', {}, '结构', 'Structure'))}</button>` +
+      (String(r.engine || 'vasp').toLowerCase() === 'vasp'
+        ? `<button class="lnk trajectory" title="${VCS.esc(tr(
+          'runtime.jobs.action.trajectory_title', {},
+          '分页联动结构帧、能量/力/温度与透明恢复审阅',
+          'Page through synchronized structure, energy/force/temperature, and transparent recovery review'))}">${VCS.esc(tr(
+          'runtime.jobs.action.trajectory', {}, '轨迹诊断', 'Trajectory'))}</button>` : '') +
       `<button class="lnk meth" title="${VCS.esc(tr('runtime.jobs.action.methods_title', {},
         '生成中英双语 Methods 段 + BibTeX(读真实 INCAR/KPOINTS/POTCAR)',
         'Generate bilingual Methods text and BibTeX from the actual INCAR/KPOINTS/POTCAR'))}">${VCS.esc(tr(
@@ -1310,6 +1362,24 @@
         VCS.showStructure(tr.dataset.dir, 'AUTO', tr.dataset.name || tr.dataset.dir);
         return;
       }
+      if (e.target.closest('.trajectory')) {
+        e.stopPropagation();
+        const jobId = String(tr.dataset.jobId || '');
+        if (!jobId || typeof VCS.showTrajectory !== 'function') {
+          VCS.toast(tr('runtime.jobs.trajectory.unavailable', {},
+            '轨迹播放器当前不可用', 'The trajectory player is unavailable'), 'fail');
+          return;
+        }
+        const row = State.rows.find(item => stableJobId(item) === jobId) || null;
+        const routeOwner = issueTrajectoryOwner(row);
+        if (!routeOwner) {
+          VCS.toast(tr('runtime.jobs.trajectory.unavailable', {},
+            '轨迹播放器当前不可用', 'The trajectory player is unavailable'), 'fail');
+          return;
+        }
+        VCS.showTrajectory(jobId, tr.dataset.name || jobId, routeOwner);
+        return;
+      }
       if (e.target.closest('.meth')) {
         e.stopPropagation();
         VCS.showMethods(tr.dataset.dir, tr.dataset.name || tr.dataset.dir);
@@ -1995,6 +2065,74 @@
       logResults(res.results, true);
       await reload();
       return { status: 'succeeded', value: res };
+    });
+  }
+
+  async function confirmTrajectoryRepair(jobId, planToken, title,
+                                         requestFingerprint, ownerReceipt) {
+    const row = trajectoryOwnerRow(ownerReceipt, jobId);
+    if (!row) {
+      VCS.toast(tr('runtime.jobs.trajectory.job_stale', {},
+        '作业台账已变化，请刷新播放器', 'The job ledger changed; refresh the player'), 'fail');
+      return null;
+    }
+    const name = requireProfile();
+    if (!name) return null;
+    if (row.cluster && row.cluster !== name) {
+      VCS.toast(tr('runtime.jobs.trajectory.profile_mismatch', {
+        bound: row.cluster, selected: name,
+      }, '该作业绑定到 {bound}，当前选择的是 {selected}',
+      'This job is bound to {bound}, but {selected} is selected'), 'fail');
+      return null;
+    }
+    const label = tr('runtime.jobs.trajectory.repair_action', {},
+      '确认冻结 INCAR 续算', 'Confirm frozen-INCAR continuation');
+    return withExclusiveOperation('trajectory-repair', label, [row.dir], name, async op => {
+      const confirmed = await VCS.confirm(tr('runtime.jobs.trajectory.repair_confirm', {
+        job: title || row.name, server: name,
+      }, '将对“{job}”执行一次明确人工续算并重投到“{server}”。\n\nINCAR 逐字冻结；只使用已验证 CONTCAR；自动路径仍最多 3 轮，若当前正好是第 3 轮，本次指纹绑定的人工确认可仅授权第 4 轮；unknown 保持暂停。\n确认执行？',
+      'Run one explicitly confirmed manual continuation for “{job}” and resubmit it to “{server}”?\n\nINCAR remains byte-for-byte frozen and only a validated CONTCAR is used. Automatic paths remain capped at three rounds. If the job is exactly at round 3, this fingerprint-bound confirmation may authorize only round 4. Unknown remains paused.'));
+      if (!confirmed) return { status: 'cancelled' };
+      const currentRow = trajectoryOwnerRow(ownerReceipt, jobId);
+      if (!currentRow || currentRow.dir !== row.dir) {
+        return {
+          status: 'failed',
+          error: tr('runtime.jobs.trajectory.owner_stale', {},
+            '作业、项目或页面所有者已变化，未发送修复请求',
+            'The job, project, or page owner changed; no repair request was sent'),
+        };
+      }
+      updateOperation(op, 'running');
+      const response = await remote(name, (pw, trust) => {
+        const retryRow = trajectoryOwnerRow(ownerReceipt, jobId);
+        if (!retryRow || retryRow.dir !== row.dir) return Promise.resolve({
+          ok: false,
+          error: tr('runtime.jobs.trajectory.owner_stale', {},
+            '作业、项目或页面所有者已变化，未发送修复请求',
+            'The job, project, or page owner changed; no repair request was sent'),
+        });
+        return VCS.call(
+          'trajectory_confirm_repair', planToken, 'continue_frozen_incar',
+          name, pw, trust, op.id, jobId, requestFingerprint);
+      });
+      if (!response) return { status: 'cancelled' };
+      (response.results || []).forEach(item => VCS.log(
+        tr('runtime.jobs.common.job_message', {
+          name: row.name, message: item.message || '',
+        }, '{name}:{message}', '{name}: {message}'), item.ok ? 'okc' : 'failc'));
+      const failed = !!response.error || !!response.requires_manual_recovery ||
+        (response.results || []).some(item => !item.ok);
+      if (failed) {
+        const message = response.error || tr('runtime.jobs.trajectory.repair_unknown', {},
+          '恢复结果未知或失败，已停止自动重试',
+          'The recovery failed or is unknown; automatic retry is stopped');
+        VCS.log(message, 'failc');
+        await reload();
+        return { status: 'failed', error: message, value: response };
+      }
+      await reload();
+      releaseTrajectoryOwner(ownerReceipt);
+      return { status: 'succeeded', value: response };
     });
   }
 
@@ -3114,11 +3252,14 @@
   // 供集群页保存与项目导入流程调用。测试 seam 仅在显式 __VCS_TEST__ 环境暴露，
   // 让 Node fake-DOM 回归执行真实状态机而不扩大生产桥接口。
   const publicJobs = { reload, selectCreatedProject, selectById, clearSelection };
+  publicJobs.confirmTrajectoryRepair = confirmTrajectoryRepair;
+  publicJobs.releaseTrajectoryOwner = releaseTrajectoryOwner;
   if (window.__VCS_TEST__) {
     publicJobs.__test = {
       State, performReload, renderSelectionTray, renderOperationQueue,
       renderResourceForecast, estimateSelectedResources, invalidateResourceForecast,
       withExclusiveOperation, operationTargetRows, operationTargetText,
+      issueTrajectoryOwner, trajectoryOwnerRow, releaseTrajectoryOwner,
     };
   }
   window.Jobs = publicJobs;

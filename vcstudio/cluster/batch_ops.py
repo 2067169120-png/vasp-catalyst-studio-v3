@@ -8,6 +8,7 @@ needs_trust=True 时透传 fingerprint/algorithm/host,供界面展示并精确 p
 """
 from __future__ import annotations
 
+import inspect
 import os
 import posixpath
 import re
@@ -186,11 +187,70 @@ def filter_continuable(dirs, *, allow_round_limit_override=False):
 
 
 def continue_batch(prof, pw, dirs, trust_new, *, idempotency_key=None,
-                   allow_round_limit_override=False):
+                   allow_round_limit_override=False,
+                   expected_cas_by_job=None,
+                   expected_correction_by_job=None):
     """CONTCAR 续算批量线程体。
 
     自动调用保留三轮上限；显式人工确认入口可仅放宽该上限，其他科学/状态门不变。
+    带 trajectory 修复证据时，CAS/correction 必须在连接前逐作业复证，且底层
+    adapter 必须显式支持相应参数；旧 adapter 不能静默降级为无门禁续算。
     """
+    guarded_parameters = []
+    if expected_cas_by_job is not None:
+        guarded_parameters.append('expected_cas')
+    if expected_correction_by_job is not None:
+        guarded_parameters.append('correction_binding')
+    if guarded_parameters:
+        try:
+            parameters = inspect.signature(
+                submitter.continue_from_contcar).parameters
+            accepts_kwargs = any(
+                item.kind is inspect.Parameter.VAR_KEYWORD
+                for item in parameters.values())
+            missing = [name for name in guarded_parameters
+                       if name not in parameters and not accepts_kwargs]
+        except (TypeError, ValueError):
+            missing = guarded_parameters
+        if missing:
+            message = (
+                '续算适配器不支持修复 CAS/correction 门禁，已在连接前拒绝；'
+                '请升级适配器后重试')
+            return {
+                'ok': False,
+                'needs_trust': False,
+                'results': [(d, False, message) for d in dirs],
+                'error': message,
+            }
+    if expected_cas_by_job is not None:
+        rejected = []
+        for d in dirs:
+            expected = (expected_cas_by_job.get(os.path.realpath(d))
+                        or expected_cas_by_job.get(str(d))
+                        if isinstance(expected_cas_by_job, dict) else None)
+            try:
+                if expected is None:
+                    raise ValueError('续算修复 CAS 未绑定当前作业，未建立远程连接')
+                submitter.assert_repair_content_cas(d, expected)
+            except (OSError, ValueError, RuntimeError) as exc:
+                rejected.append((d, False, str(exc)))
+        if rejected:
+            return {'ok': False, 'needs_trust': False, 'results': rejected,
+                    'error': '续算修复 CAS 预检失败，未建立远程连接'}
+    if expected_correction_by_job is not None:
+        rejected = []
+        for d in dirs:
+            expected = (expected_correction_by_job.get(os.path.realpath(d))
+                        or expected_correction_by_job.get(str(d))
+                        if isinstance(expected_correction_by_job, dict) else None)
+            try:
+                submitter.assert_repair_correction_binding(
+                    expected, idempotency_key)
+            except (OSError, ValueError, RuntimeError) as exc:
+                rejected.append((d, False, str(exc)))
+        if rejected:
+            return {'ok': False, 'needs_trust': False, 'results': rejected,
+                    'error': '续算 correction 预检失败，未建立远程连接'}
     try:
         client, jump = open_client(prof, pw, trust_new=trust_new)
     except ConnectError as e:
@@ -204,12 +264,28 @@ def continue_batch(prof, pw, dirs, trust_new, *, idempotency_key=None,
     try:
         for d in dirs:
             try:
-                if idempotency_key:
+                expected_cas = None
+                if isinstance(expected_cas_by_job, dict):
+                    expected_cas = (expected_cas_by_job.get(os.path.realpath(d))
+                                    or expected_cas_by_job.get(str(d)))
+                correction_binding = None
+                if isinstance(expected_correction_by_job, dict):
+                    correction_binding = (
+                        expected_correction_by_job.get(os.path.realpath(d))
+                        or expected_correction_by_job.get(str(d)))
+                if (expected_correction_by_job is not None
+                        and correction_binding is None):
+                    raise ValueError(
+                        '续算 correction intent 未绑定当前作业，未执行远程操作')
+                if (idempotency_key or expected_cas is not None
+                        or correction_binding is not None):
                     m = submitter.continue_from_contcar(
                         client, prof, d,
                         max_rounds=(None if allow_round_limit_override
                                     else submitter.CONTINUE_MAX_ROUNDS),
-                        idempotency_key=idempotency_key)
+                        idempotency_key=idempotency_key,
+                        expected_cas=expected_cas,
+                        correction_binding=correction_binding)
                 else:
                     # Preserve the historical injectable three-argument seam.
                     if allow_round_limit_override:

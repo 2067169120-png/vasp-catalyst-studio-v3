@@ -298,10 +298,11 @@ class Api:
                  workspace_context_store=None, method_recipe_service=None,
                  method_recipe_publisher=None, structure_sources_mod=None,
                  structure_source_session=None, external_structure_gateway=None,
-                  surface_workbench_mod=None, external_reference_gateway=None,
-                  reaction_domain_source=None, kinetics_projection_provider=None,
-                  catalysis_authoring_service_factory=None,
-                  kinetics_authoring_service_factory=None):
+                 surface_workbench_mod=None, external_reference_gateway=None,
+                 reaction_domain_source=None, kinetics_projection_provider=None,
+                 catalysis_authoring_service_factory=None,
+                 kinetics_authoring_service_factory=None,
+                 trajectory_review_service=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -471,6 +472,9 @@ class Api:
         # cross the pywebview bridge.
         self._external_reference_gateway_instance = external_reference_gateway
         self._external_reference_lock = threading.RLock()
+        # The trajectory player receives only ledger-owned opaque job IDs;
+        # paths, frame indexes and repair plans remain server-owned.
+        self._trajectory_review_service = trajectory_review_service
         self._project_lifecycle_lock = threading.RLock()
         self._project_lifecycle_selections = {}
         self._project_lifecycle_plans = {}
@@ -991,6 +995,23 @@ class Api:
             os.path.expanduser(str(job_dir or '')))))
         digest = hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:24]
         return f'job-{digest}'
+
+    def _resolve_workspace_job_id(self, job_id):
+        """Resolve exactly one ledger-owned opaque job identity, never a path."""
+        identifier = str(job_id or '').strip()
+        if (not identifier or len(identifier) > 160
+                or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:~-]{0,159}', identifier)):
+            raise ValueError('job_id is not a registered opaque identity')
+        matches = []
+        for job_dir, manifest in self._ledger.load_all():
+            if not isinstance(manifest, dict):
+                continue
+            if self._workspace_job_id(job_dir, manifest) == identifier:
+                matches.append((job_dir, manifest))
+        if len(matches) != 1:
+            raise LookupError('job identity is missing or ambiguous')
+        return {'job_id': identifier, 'job_dir': matches[0][0],
+                'manifest': matches[0][1]}
 
     @staticmethod
     def _workspace_public_text(value, limit=400):
@@ -1749,6 +1770,14 @@ class Api:
             from vcstudio.project import task_analysis
             self._task_analysis = task_analysis
         return self._task_analysis
+
+    def _trj(self):
+        """服务端轨迹索引/修复审阅；不向浏览器暴露路径。"""
+        if self._trajectory_review_service is None:
+            from vcstudio.project.trajectory_review import TrajectoryReviewService
+            self._trajectory_review_service = TrajectoryReviewService(
+                task_analysis_mod=self._ta(), manifest_mod=self._manifest)
+        return self._trajectory_review_service
 
     def _ul(self):
         """DFT+U 建议库延迟加载。"""
@@ -2908,18 +2937,20 @@ class Api:
             return {'error': str(e)}
 
     @staticmethod
-    def _job_operation_fingerprint(action, profile, dirs):
+    def _job_operation_fingerprint(action, profile, dirs, binding=None):
         payload = {
             'action': str(action or ''),
             'profile': str(profile or ''),
             'dirs': sorted({str(item) for item in (dirs or [])}),
+            'binding': copy.deepcopy(binding) if binding else None,
         }
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True,
                          separators=(',', ':')).encode('utf-8')
         return hashlib.sha256(raw).hexdigest()
 
     @staticmethod
-    def _job_batch_with_idempotency(function, *args, idempotency_key=None, **kwargs):
+    def _job_batch_with_idempotency(function, *args, idempotency_key=None,
+                                    required_kwargs=(), **kwargs):
         """Pass supported optional batch keywords without retrying a mutation.
 
         Production adapters accept the durable operation id and, for manual
@@ -2934,6 +2965,19 @@ class Api:
         supports_kwargs = any(
             parameter.kind == inspect.Parameter.VAR_KEYWORD
             for parameter in parameters.values())
+        missing = [
+            name for name in required_kwargs
+            if not supports_kwargs and name not in parameters
+        ]
+        if missing:
+            return {
+                'ok': False,
+                'code': 'incompatible_continuation_adapter',
+                'results': [],
+                'error': (
+                    'Continuation adapter does not support the required '
+                    'server-owned repair bindings.'),
+            }
         call_kwargs = {
             name: value for name, value in kwargs.items()
             if supports_kwargs or name in parameters
@@ -2957,7 +3001,8 @@ class Api:
             submit_batch, profile, password, list(dirs), trust_new,
             idempotency_key=idempotency_key)
 
-    def _run_job_operation_once(self, idempotency_key, *, action, profile, dirs, invoke):
+    def _run_job_operation_once(self, idempotency_key, *, action, profile, dirs, invoke,
+                                binding=None):
         """Run one mutating remote batch exactly once per client operation key.
 
         Password discovery and host-key confirmation deliberately happen before this seam.  Their
@@ -2971,7 +3016,7 @@ class Api:
         if len(key) > 128 or not re.fullmatch(r'[A-Za-z0-9_.:-]{12,128}', key):
             return {'ok': False, 'busy': False, 'duplicate': False,
                     'error': '无效的作业操作请求标识'}
-        fingerprint = self._job_operation_fingerprint(action, profile, dirs)
+        fingerprint = self._job_operation_fingerprint(action, profile, dirs, binding)
         now = time.monotonic()
         with self._job_operation_lock:
             # 有界缓存避免长期开机时无限增长；正在执行的记录绝不逐出。
@@ -3066,15 +3111,34 @@ class Api:
             return self._bo().fetch_batch(prof, pw, list(dirs), trust_new, files)
         return self._delegate(name, password, _fetch)
 
-    def continue_jobs(self, dirs, name, password, trust_new=False, idempotency_key=None):
+    def continue_jobs(self, dirs, name, password, trust_new=False, idempotency_key=None,
+                      expected_cas_by_job=None, expected_correction_by_job=None,
+                      allow_round_limit_override=True):
+        repair_bound = (expected_cas_by_job is not None
+                        or expected_correction_by_job is not None)
+        operation_binding = {
+            'cas': expected_cas_by_job,
+            'correction': expected_correction_by_job,
+            'allow_round_limit_override': bool(allow_round_limit_override),
+        }
         return self._delegate(name, password,
                               lambda prof, pw: self._run_job_operation_once(
                                   idempotency_key, action='continue', profile=prof.name,
-                                  dirs=dirs, invoke=lambda: self._job_batch_with_idempotency(
+                                  dirs=dirs, binding=operation_binding,
+                                  invoke=lambda: self._job_batch_with_idempotency(
                                       self._bo().continue_batch,
                                       prof, pw, list(dirs), trust_new,
                                       idempotency_key=idempotency_key,
-                                      allow_round_limit_override=True)))
+                                      required_kwargs=(
+                                          ('expected_cas_by_job',
+                                           'expected_correction_by_job',
+                                           'allow_round_limit_override')
+                                          if repair_bound else ()),
+                                      allow_round_limit_override=(
+                                          allow_round_limit_override),
+                                      expected_cas_by_job=expected_cas_by_job,
+                                      expected_correction_by_job=(
+                                          expected_correction_by_job))))
 
     def refresh_status(self, name, password, trust_new=False):
         """Refresh one profile without racing the background supervisor."""
@@ -21569,6 +21633,294 @@ class Api:
         out['report_supported'] = bool(cap.get('report_supported'))
         out['next_action'] = cap.get('next_action', '')
         return out
+
+    # ── 结构—轨迹—诊断播放器（opaque job/frame token only）──────────────
+    _TRAJECTORY_DENIED_FIELDS = frozenset({
+        'path', 'paths', 'local_path', 'source_path', 'job_dir', 'remote_dir',
+        'directory', 'directories', 'command', 'command_line', 'shell_command',
+        'argv', 'stdout', 'stderr', 'password', 'passwd', 'secret', 'secrets',
+        'credential', 'credentials', 'authorization', 'api_key', 'access_key',
+        'private_key', 'ssh_private_key', 'token', 'api_token', 'access_token',
+        'refresh_token', 'auth_token', 'environment', 'env',
+    })
+
+    @classmethod
+    def _trajectory_denied_field(cls, field):
+        normalized = str(field or '').strip().lower().replace('-', '_')
+        if normalized in cls._TRAJECTORY_DENIED_FIELDS:
+            return True
+        if (normalized.endswith('_token')
+                and normalized not in {
+                    'session_token', 'frame_token', 'plan_token'}):
+            return True
+        compact = re.sub(r'[^a-z0-9]', '', normalized)
+        if compact in {
+                'path', 'paths', 'jobdir', 'remotedir', 'command', 'commandline',
+                'shellcommand', 'password', 'passwd', 'secret', 'secrets',
+                'credential', 'credentials', 'authorization', 'apikey',
+                'accesskey', 'privatekey', 'sshprivatekey', 'token', 'apitoken',
+                'accesstoken', 'refreshtoken', 'authtoken', 'environment', 'env'}:
+            return True
+        return normalized.endswith((
+            '_path', '_paths', '_dir', '_dirs', '_directory', '_directories',
+            '_command', '_password', '_passwd', '_secret', '_private_key',
+            '_credential', '_credentials',
+        ))
+
+    @classmethod
+    def _trajectory_public_text(cls, value, *, field=''):
+        text = cls._workspace_public_text(value, limit=8000)
+        text = re.sub(
+            r'-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----.*?'
+            r'(?:-----END(?: [A-Z0-9]+)* PRIVATE KEY-----|$)',
+            '<redacted-private-key>', text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(
+            r'(?i)\b([a-z][a-z0-9+.-]*://)[^\s/@:]+:[^\s/@]+@',
+            r'\1<redacted-credentials>@', text)
+        text = re.sub(
+            r'(?i)\b(?:bearer\s+|sk-|ghp_|github_pat_|xox[baprs]-)'
+            r'[A-Za-z0-9._~+\-/=]+', '<redacted-secret>', text)
+        text = re.sub(
+            r'(?i)\b(?:password|passwd|secret|credential|authorization|token|'
+            r'api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|'
+            r'private[\s_-]?key)'
+            r'\s*[:=]\s*(?:"[^"]*"|\'[^\']*\'|\S+)',
+            '<redacted-secret>', text)
+        if str(field or '').lower() != 'xyz' and re.search(
+                r'(?i)(?<![A-Za-z0-9_])(?:qsub|sbatch|srun|ssh|scp|rsync|'
+                r'mpirun|mpiexec|vasp_std|vasp_gam|vasp_ncl|rm|cp|mv|cd)'
+                r'(?:\s|$)', text):
+            return '<redacted-command>'
+        return text
+
+    @classmethod
+    def _trajectory_public_value(cls, value, *, field='', _seen=None, _depth=0):
+        """Recursively project every trajectory success/failure DTO to public data."""
+        if _depth > 32:
+            return '<redacted-overdeep-value>'
+        if _seen is None:
+            _seen = set()
+        if isinstance(value, dict):
+            identity = id(value)
+            if identity in _seen:
+                return '<redacted-recursive-value>'
+            _seen.add(identity)
+            projected = {}
+            try:
+                for key, item in value.items():
+                    if cls._trajectory_denied_field(key):
+                        continue
+                    safe_key = cls._trajectory_public_text(key, field='field_name')
+                    projected[str(safe_key)] = cls._trajectory_public_value(
+                        item, field=str(key), _seen=_seen, _depth=_depth + 1)
+            finally:
+                _seen.remove(identity)
+            return projected
+        if isinstance(value, (list, tuple, set, frozenset)):
+            identity = id(value)
+            if identity in _seen:
+                return '<redacted-recursive-value>'
+            _seen.add(identity)
+            try:
+                return [
+                    cls._trajectory_public_value(
+                        item, field=field, _seen=_seen, _depth=_depth + 1)
+                    for item in value
+                ]
+            finally:
+                _seen.remove(identity)
+        if value is None or isinstance(value, (bool, int, float)):
+            return copy.deepcopy(value)
+        if field == 'xyz':
+            # XYZ is generated from a server-selected allow-listed frame, never
+            # copied from a diagnostic message or path-bearing source field.
+            return str(value)
+        return cls._trajectory_public_text(value, field=field)
+
+    @classmethod
+    def _trajectory_failure(cls, error, **fields):
+        payload = {'ok': False, 'stale': False, **fields, 'error': error}
+        return cls._trajectory_public_value(payload)
+
+    def trajectory_open(self, job_id, kind=None):
+        try:
+            record = self._resolve_workspace_job_id(job_id)
+            result = self._trj().open(
+                record['job_dir'], record['job_id'], kind=(str(kind).strip() if kind else None))
+            return self._trajectory_public_value(result)
+        except Exception as exc:                          # noqa: BLE001 public boundary
+            return self._trajectory_failure(exc)
+
+    def trajectory_steps(self, session_token, offset=0, limit=50, stride=1):
+        try:
+            result = self._trj().steps(
+                str(session_token or ''), offset=offset, limit=limit, stride=stride)
+            return self._trajectory_public_value(result)
+        except Exception as exc:                          # noqa: BLE001 public boundary
+            return self._trajectory_failure(exc)
+
+    def trajectory_frame(self, frame_token):
+        try:
+            return self._trajectory_public_value(
+                self._trj().frame(str(frame_token or '')))
+        except Exception as exc:                          # noqa: BLE001 public boundary
+            return self._trajectory_failure(exc)
+
+    def trajectory_repair_preview(self, session_token):
+        try:
+            preview = self._trj().repair_preview
+            try:
+                parameters = inspect.signature(preview).parameters
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    'Trajectory repair service cannot prove manual override binding.') from exc
+            supports_kwargs = any(
+                item.kind == inspect.Parameter.VAR_KEYWORD
+                for item in parameters.values())
+            if not supports_kwargs and 'allow_round_limit_override' not in parameters:
+                raise RuntimeError(
+                    'Trajectory repair service does not support manual override binding.')
+            return self._trajectory_public_value(
+                preview(str(session_token or ''), allow_round_limit_override=True))
+        except Exception as exc:                          # noqa: BLE001 public boundary
+            return self._trajectory_failure(exc)
+
+    @classmethod
+    def _public_repair_operation(cls, result, job_id):
+        """Strip job directories from the existing batch-operation response."""
+        result = result if isinstance(result, dict) else {}
+        public = {key: copy.deepcopy(result.get(key)) for key in (
+            'ok', 'needs_trust', 'needPassword', 'cancelled', 'busy', 'code',
+            'requires_manual_recovery', 'idempotency_key', 'duplicate', 'replayed',
+            'fingerprint', 'algorithm', 'host', 'scheduler_job_ids',
+        ) if result.get(key) is not None}
+        rows = []
+        for row in result.get('results') or []:
+            if not isinstance(row, (list, tuple)) or len(row) < 3:
+                continue
+            rows.append({'job_id': job_id, 'ok': bool(row[1]),
+                         'message': cls._workspace_public_text(row[2])})
+        public['results'] = rows
+        if result.get('error'):
+            public['error'] = cls._workspace_public_text(result.get('error'))
+        return public
+
+    @staticmethod
+    def _trajectory_require_keywords(function, names, *, label):
+        try:
+            parameters = inspect.signature(function).parameters
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f'{label} cannot prove required repair bindings.') from exc
+        supports_kwargs = any(
+            item.kind == inspect.Parameter.VAR_KEYWORD
+            for item in parameters.values())
+        missing = [name for name in names
+                   if not supports_kwargs and name not in parameters]
+        if missing:
+            raise RuntimeError(
+                f'{label} does not support required server-owned repair bindings.')
+
+    def _trajectory_assert_continue_adapter(self):
+        required = (
+            'expected_cas_by_job', 'expected_correction_by_job',
+            'allow_round_limit_override',
+        )
+        continuation = self.continue_jobs
+        self._trajectory_require_keywords(
+            continuation, required, label='Continuation API adapter')
+        if (inspect.ismethod(continuation)
+                and continuation.__self__ is self
+                and continuation.__func__ is Api.continue_jobs):
+            self._trajectory_require_keywords(
+                self._bo().continue_batch, required,
+                label='Continuation batch adapter')
+
+    def trajectory_confirm_repair(self, plan_token, decision, name, password,
+                                  trust_new=False, idempotency_key=None,
+                                  job_id=None, request_fingerprint=None):
+        """Confirm only the existing bounded, idempotent, INCAR-frozen recovery seam."""
+        try:
+            decision_value = str(decision or '')
+            operation_key = str(idempotency_key or '')
+            fingerprint = str(request_fingerprint or '').strip().lower()
+            if not re.fullmatch(r'[0-9a-f]{64}', fingerprint):
+                raise ValueError(
+                    'repair confirmation request fingerprint is missing or invalid')
+            current = None
+            if job_id is not None:
+                if decision_value != 'continue_frozen_incar':
+                    raise ValueError('repair remains paused; replay decision is invalid')
+                current = self._resolve_workspace_job_id(str(job_id or ''))
+                reconcile = getattr(self._trj(), 'reconcile_repair_outcome', None)
+                if callable(reconcile):
+                    durable = reconcile(
+                        current['job_dir'], current['job_id'],
+                        str(plan_token or ''), operation_key)
+                    if durable is not None:
+                        prepared = durable['prepared']
+                        if prepared.get('request_fingerprint') != fingerprint:
+                            raise RuntimeError(
+                                'durable repair intent does not match this confirmation request')
+                        public = self._public_repair_operation(
+                            durable['operation'], prepared['job_id'])
+                        public['correction_intent'] = {
+                            'record_hash': prepared['intent_record_hash'],
+                            'status': 'prepared',
+                        }
+                        public['correction_outcome'] = durable['correction_outcome']
+                        return self._trajectory_public_value(public)
+            self._trajectory_assert_continue_adapter()
+            prepare = self._trj().prepare_repair
+            self._trajectory_require_keywords(
+                prepare, ('allow_round_limit_override', 'request_fingerprint'),
+                label='Trajectory repair service')
+            prepared = prepare(
+                str(plan_token or ''), decision_value, operation_key,
+                allow_round_limit_override=True,
+                request_fingerprint=fingerprint)
+            if prepared.get('request_fingerprint') != fingerprint:
+                raise RuntimeError(
+                    'trajectory repair service returned a mismatched request fingerprint')
+            current = current or self._resolve_workspace_job_id(prepared['job_id'])
+            if current['job_id'] != prepared['job_id']:
+                raise RuntimeError('job registry identity changed; repair remains paused')
+            if (os.path.realpath(current['job_dir'])
+                    != os.path.realpath(str(prepared['job_dir']))):
+                raise RuntimeError('job registry binding changed; repair remains paused')
+            expected_cas = self._trj().assert_repair_cas(
+                prepared, ledger_job_id=current['job_id'], manifest=current['manifest'])
+            correction_binding = prepared.get('journal_binding')
+            if not isinstance(expected_cas, dict):
+                raise RuntimeError('repair CAS binding is unavailable')
+            if not isinstance(correction_binding, dict):
+                raise RuntimeError('repair correction binding is unavailable')
+            continue_kwargs = {
+                'idempotency_key': prepared['operation_key'],
+                'expected_cas_by_job': {
+                    os.path.realpath(current['job_dir']): expected_cas,
+                },
+                'expected_correction_by_job': {
+                    os.path.realpath(current['job_dir']): correction_binding,
+                },
+                'allow_round_limit_override': True,
+            }
+            result = self.continue_jobs(
+                [current['job_dir']], name, password, trust_new, **continue_kwargs)
+            public = self._public_repair_operation(result, prepared['job_id'])
+            provisional = (bool(result.get('needs_trust'))
+                           or result.get('error') == 'NEED_PASSWORD'
+                           or bool(result.get('busy')))
+            public['correction_intent'] = {
+                'record_hash': prepared['intent_record_hash'],
+                'status': 'prepared',
+            }
+            if not provisional:
+                public['correction_outcome'] = self._trj().record_repair_outcome(
+                    prepared, result)
+            return self._trajectory_public_value(public)
+        except Exception as exc:                          # noqa: BLE001 public boundary
+            return self._trajectory_failure(exc)
 
     def analyze_task(self, job_dir, kind=None):
         """统一任务解析：按 23 类能力矩阵分发；未接解析器时返回明确下一步，不编结果。"""
