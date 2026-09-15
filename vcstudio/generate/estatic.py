@@ -12,13 +12,13 @@ INCAR 派生原则:**保留电子学**(ENCUT/ISPIN/MAGMOM/LDAU/GGA/…原样透�
 from __future__ import annotations
 
 import os
+import time
 from collections import OrderedDict
-
-import yaml
 
 from vcstudio.generate.incar_builder import incar_dict_to_str, parse_incar
 from vcstudio.generate.kpoints import kpoints_str, recommend_kpoints
 from vcstudio.generate.poscar import read_cell_vectors
+from vcstudio.shared import manifest as manifest_mod
 
 _PURPOSES = ('pdos', 'bader', 'chgdiff', 'esp', 'elf')
 
@@ -30,6 +30,16 @@ _PURPOSE_KEYS = {
     'esp': OrderedDict([('LVTOT', True)]),
     # elf:电子局域函数,LELF=.TRUE. → 产出 ELFCAR(VESTA 可视化共价/孤对/金属键)
     'elf': OrderedDict([('LELF', True)]),
+}
+
+# 派生用途→GUI/manifest 的规范任务 key。esp 是一个带 LOCPOT
+# 输出的静态单点；功函数封装器会在其后写成 workfunction manifest。
+_PURPOSE_TASK_TYPES = {
+    'pdos': 'dos_pdos',
+    'bader': 'bader',
+    'chgdiff': 'chgdiff',
+    'esp': 'static',
+    'elf': 'elf',
 }
 
 
@@ -150,8 +160,19 @@ def build_static_job(relax_dir, out_dir, *, purpose: str = 'pdos',
         derived[key] = val
         changes.append(f'{key}: {old} → {val}({note})')
 
+    # 派生目录只复制四件套，不复制母作业的 WAVECAR/CHGCAR。若把弛豫续算留下的
+    # ISTART=1 / ICHARG=11 原样带过来，远端会在启动时缺文件，或更隐蔽地把本应自洽的
+    # PDOS/Bader/功函数算成固定电荷非自洽结果。派生性质作业统一从原子叠加电荷自洽启动。
+    _set('ISTART', 0, '派生目录不依赖母作业 WAVECAR')
+    _set('ICHARG', 2, '性质静态作业必须自洽，且派生目录不依赖母作业 CHGCAR')
     _set('NSW', 0, '静态单点')
     _set('IBRION', -1, '不做离子步')
+    for key, note in (
+            ('ISIF', '静态性质作业不做应力/变胞'),
+            ('EDIFFG', '静态性质作业无离子收敛判据')):
+        if key in derived:
+            old = derived.pop(key)
+            changes.append(f'{key}: {old} → 移除({note})')
     nk_prod = new_grid[0] * new_grid[1] * new_grid[2]
     if nk_prod >= 4:
         _set('ISMEAR', -5, '四面体+Blöchl 校正,DOS/能量精度最佳')
@@ -207,15 +228,77 @@ def build_static_job(relax_dir, out_dir, *, purpose: str = 'pdos',
     else:
         warnings.append('未找到 POTCAR(母目录无);静态作业需自行补 POTCAR 后提交')
 
-    meta = OrderedDict([
-        ('parent', str(relax_dir)), ('purpose', purpose),
-        ('kpts_multiplier', float(kpts_multiplier)), ('kpoints', list(new_grid)),
-        ('changes', list(changes)), ('warnings', list(warnings)),
-    ])
-    if extra_meta:
-        for k, v in extra_meta.items():
-            meta[k] = v
-    with open(os.path.join(out_dir, 'job.yaml'), 'w', encoding='utf-8') as f:
-        yaml.safe_dump(dict(meta), f, allow_unicode=True, sort_keys=False)
+    # 与所有其他作业一样写统一 manifest：不再只写 purpose/changes
+    # 的 ad-hoc YAML。这样生成后可直接进入提交、监控、续算与报告状态机。
+    out_path = os.path.abspath(str(out_dir))
+    parent_path = os.path.abspath(str(relax_dir))
+    files = [name for name in ('INCAR', 'POSCAR', 'KPOINTS', 'POTCAR')
+             if os.path.isfile(os.path.join(out_path, name))]
+    hashes = {name: manifest_mod.sha256_file(os.path.join(out_path, name))
+              for name in files}
+    derived_meta = dict(extra_meta or {})
+    # Inherit the parent's actual calculation class before issuing the recipe
+    # identity; the recipe must describe the final job, not a placeholder.
+    parent_manifest = manifest_mod.load_manifest(relax_dir)
+    calc_type = str((parent_manifest or {}).get('calc_type') or 'slab')
+    inputs = {
+        'engine': 'vasp',
+        'files': files,
+        'sha256': hashes,
+        'poscar': os.path.join(out_path, 'POSCAR'),
+        'poscar_sha256': hashes['POSCAR'],
+        'parent_job': parent_path,
+        'purpose': purpose,
+        'kpts_multiplier': float(kpts_multiplier),
+        'kpoints': list(new_grid),
+        'incar_changes': list(changes),
+    }
+    from vcstudio.generate.method_recipe import builder_recipe
+    inputs['method_recipe'] = builder_recipe(
+        builder='vcstudio.generate.estatic/v1',
+        task_type=_PURPOSE_TASK_TYPES[purpose], calc_type=calc_type,
+        validate=True, completions={'incar_changes': list(changes)},
+        kpoints_source='parent-density-multiplier',
+        extra={'purpose': purpose, 'kpts_multiplier': float(kpts_multiplier),
+               'kpoints': list(new_grid)})
+    if derived_meta:
+        inputs['derived_metadata'] = derived_meta
+
+    # 继承母作业的 calc_type（分子/体相/表面）；无母 manifest 时按本
+    # 生成器的 slab KPOINTS 口径明确降级。
+    system = (poscar_text.splitlines()[0].strip()
+              if poscar_text.strip() else os.path.basename(out_path))
+    manifest = manifest_mod.new_manifest(
+        job_id=f'{os.path.basename(out_path)}-{time.strftime("%Y%m%d-%H%M%S")}',
+        system=system,
+        task_type=_PURPOSE_TASK_TYPES[purpose],
+        calc_type=calc_type,
+        inputs=inputs,
+        warnings=warnings,
+    )
+    manifest['parent_job'] = parent_path
+    manifest['derivation'] = {
+        'purpose': purpose,
+        'kpts_multiplier': float(kpts_multiplier),
+        'kpoints': list(new_grid),
+        'changes': list(changes),
+        **derived_meta,
+    }
+
+    # 暂保留旧版解析器使用的顶层扩展键；核心事实已落在标准 inputs
+    # 与 derivation 命名空间。扩展不得覆盖 schema/state/inputs 等核心键。
+    legacy = {
+        'parent': str(relax_dir),
+        'purpose': purpose,
+        'kpts_multiplier': float(kpts_multiplier),
+        'kpoints': list(new_grid),
+        'changes': list(changes),
+    }
+    for key, value in {**legacy, **derived_meta}.items():
+        if key not in manifest:
+            manifest[key] = value
+    from vcstudio.shared.scientific_inputs import record_input_closure
+    record_input_closure(out_path, manifest)
+    manifest_mod.save_manifest(out_path, manifest)
 
     return {'out_dir': str(out_dir), 'changes': changes, 'warnings': warnings}

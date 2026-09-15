@@ -5,6 +5,7 @@ import pytest
 
 from vcstudio.generate import estatic
 from vcstudio.generate.incar_builder import parse_incar
+from vcstudio.shared import manifest as manifest_mod
 
 _CONTCAR = """\
 slab Cu
@@ -62,6 +63,8 @@ def test_pdos_job_incar_keys_and_files(tmp_path):
     inc = parse_incar((out / 'INCAR').read_text(encoding='utf-8'))
     assert inc['NSW'] == 0
     assert inc['IBRION'] == -1
+    assert inc['ISTART'] == 0 and inc['ICHARG'] == 2
+    assert 'ISIF' not in inc and 'EDIFFG' not in inc
     assert inc['ISMEAR'] == -5                    # 3x3x1 ×2 → 7x7x1,积=49≥4
     assert inc['LORBIT'] == 11
     assert inc['NEDOS'] == 2000
@@ -136,16 +139,67 @@ def test_ediff_already_tight_preserved(tmp_path):
     assert float(inc['EDIFF']) == pytest.approx(1e-7)   # 已 ≤1e-6,不放松
 
 
+def test_static_job_resets_parent_restart_state(tmp_path):
+    incar = _INCAR + 'ISTART = 1\nICHARG = 11\n'
+    relax = _make_relax(tmp_path, incar=incar)
+    out = tmp_path / 's_restart_parent'
+    estatic.build_static_job(relax, out, purpose='bader')
+    inc = parse_incar((out / 'INCAR').read_text(encoding='utf-8'))
+    assert inc['ISTART'] == 0
+    assert inc['ICHARG'] == 2
+
+
 def test_job_yaml_records_provenance(tmp_path):
     relax = _make_relax(tmp_path)
     out = tmp_path / 's_yaml'
     estatic.build_static_job(relax, out, purpose='pdos')
     meta = yaml.safe_load((out / 'job.yaml').read_text(encoding='utf-8'))
+    # 标准 manifest 核心字段：可直接进入提交/监控/报告状态机。
+    assert meta['schema'] == manifest_mod.SCHEMA_VERSION
+    assert meta['state'] == 'CREATED'
+    assert meta['task_type'] == 'dos_pdos'
+    assert meta['calc_type'] == 'slab'
+    assert meta['state_history'][0]['state'] == 'CREATED'
+    assert meta['inputs']['engine'] == 'vasp'
+    assert meta['inputs']['parent_job'] == str(relax.resolve())
+    assert meta['inputs']['purpose'] == 'pdos'
+    assert set(meta['inputs']['files']) == {'INCAR', 'POSCAR', 'KPOINTS', 'POTCAR'}
+    assert set(meta['inputs']['sha256']) == {'INCAR', 'POSCAR', 'KPOINTS', 'POTCAR'}
+    assert meta['inputs']['poscar_sha256'] == manifest_mod.sha256_file(out / 'POSCAR')
+    # 旧扩展键仍可读，但同一事实以 inputs/derivation 为规范位置。
     assert meta['parent'] == str(relax)
     assert meta['purpose'] == 'pdos'
     assert meta['kpoints'] == [7, 7, 1]
     assert any('NSW' in c for c in meta['changes'])
     assert any('LORBIT' in c for c in meta['changes'])
+    assert meta['derivation']['changes'] == meta['changes']
+
+
+@pytest.mark.parametrize(('purpose', 'task_type'), [
+    ('pdos', 'dos_pdos'), ('bader', 'bader'), ('chgdiff', 'chgdiff'),
+    ('esp', 'static'), ('elf', 'elf'),
+])
+def test_purpose_maps_to_canonical_manifest_task_type(tmp_path, purpose, task_type):
+    relax = _make_relax(tmp_path)
+    out = tmp_path / f's_{purpose}'
+    estatic.build_static_job(relax, out, purpose=purpose)
+    assert manifest_mod.load_manifest(out)['task_type'] == task_type
+
+
+def test_static_manifest_inherits_parent_calc_type_and_extra_metadata(tmp_path):
+    relax = _make_relax(tmp_path)
+    parent = manifest_mod.new_manifest(
+        job_id='parent', system='Cu cluster', task_type='relax', calc_type='molecule',
+        inputs={})
+    manifest_mod.save_manifest(relax, parent)
+    out = tmp_path / 'derived'
+    estatic.build_static_job(
+        relax, out, purpose='bader', extra_meta={'member_role': 'reference'})
+    meta = manifest_mod.load_manifest(out)
+    assert meta['calc_type'] == 'molecule'
+    assert meta['inputs']['derived_metadata'] == {'member_role': 'reference'}
+    assert meta['derivation']['member_role'] == 'reference'
+    assert meta['member_role'] == 'reference'       # 旧扩展读取兼容
 
 
 def test_bad_purpose_rejected(tmp_path):

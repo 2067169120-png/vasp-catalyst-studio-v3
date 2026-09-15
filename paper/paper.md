@@ -1,6 +1,6 @@
 ---
-title: 'VASP Catalyst Studio: a zero-install desktop platform for bounded,
-  auditable VASP catalysis workflows on HPC clusters'
+title: 'VASP Catalyst Studio: a project-centered, evidence-bound desktop
+  workbench for catalysis calculations on HPC clusters'
 tags:
   - Python
   - density functional theory
@@ -10,107 +10,125 @@ tags:
   - workflow automation
 authors:
   - name: Yuhao Chen
-    # AUTHOR-TODO:投稿前补填 ORCID(勿编造);拿到后取消下一行注释并填入真实 ID。
-    # orcid: 0000-0000-0000-0000
-    affiliation: 1
-affiliations:
-  # AUTHOR-TODO:投稿前补填单位(机构 / 城市 / 国家)。
-  - name: <AUTHOR-TODO institution, city, country>
-    index: 1
 date: 2026-07-15
 bibliography: paper.bib
 ---
 
-<!-- AUTHOR-TODO:作者名已填 Yuhao Chen;ORCID 与单位仍为占位,投稿前必须补填真实
-     信息(勿编造)。ORCID 见上方注释行。 -->
+> **Draft metadata boundary.** The date above is the original manuscript date,
+> not a V4 release date. The repository does not contain author-confirmed
+> affiliation, ORCID, funding or acknowledgement data, so those fields are
+> intentionally omitted and must be supplied by the author before submission.
 
 # Summary
 
-VASP Catalyst Studio (`vcstudio`) is a lightweight desktop platform that
-automates the full loop of a catalysis screening campaign with the Vienna
-Ab initio Simulation Package (VASP) [@Kresse1996]: validated input generation
-from a user's POSCAR and INCAR, submission to PBS/Slurm clusters over
-double-hop SSH, monitoring with a 15-class job diagnosis backed by 15 VASP
-internal-error signatures (`docs/failure-taxonomy.md`), bounded
-CONTCAR-based recovery, adsorption-energy and Li--S discharge-path analysis,
-and publication-ready reports (convergence charts, 3D structure previews with
-molecule--slab clash interception, bilingual Methods paragraphs with BibTeX
-generated from the *actual* input files, and total-DOS figures). The tool
-ships as a single Windows executable requiring no installation, database or
-server; the core is fully deterministic and offline, with an optional
-LLM-based analysis layer kept strictly outside the decision loop. Provenance is
-per-job manifest-level: every job directory carries a `job.yaml` recording
-input hashes (sha256 of POSCAR/POTCAR), a nine-state lifecycle and an audit
-history, so a result can be traced to the exact inputs that produced it. This
-is deliberately lighter than a queryable full-provenance DAG (e.g. AiiDA); the
-trade-off is discussed in `docs/comparison.md`.
+VASP Catalyst Studio (`vcstudio`) is a Windows-first desktop research
+workbench for project-centered, auditable density-functional-theory workflows.
+Its deepest scientific path targets the Vienna *Ab initio* Simulation Package
+(VASP) [@Kresse1996]: input generation from user-owned POSCAR and INCAR files,
+PBS/Slurm submission over SSH/ProxyJump, monitoring with 18 job outcomes and
+16 VASP internal-error signatures mapped to four target states, bounded
+CONTCAR recovery, adsorption/free-energy analysis and evidence-bound report
+publishing. CP2K, Gaussian and CASTEP expose bounded file-level adapters, but
+their capability depth is asymmetric and the software does not assume
+cross-engine numerical equivalence.
+
+The V4 interface maintains a current project, mode, engine, task and stage
+across preparation, running, analysis and publication routes. Per-job
+`job.yaml` manifests record input hashes, a nine-state lifecycle and history;
+file-backed campaign DAGs add task gates and ledgers; reports freeze a
+ReportSpec, ReportSnapshot, ValidationResult and canonical model before a
+revisioned manifest is published. This evidence chain is lighter than AiiDA's
+queryable database provenance [@Huber2020AiiDA], but it makes the boundaries of
+each local artifact explicit.
+
+The deterministic generation, parsing, analysis and reporting core does not
+require a cloud model. Network paths remain visible: remote cluster operations
+require SSH, optional external-LLM analysis/paper extraction/chat defaults off,
+and first-time DECIMER model acquisition may require a download. Model text is
+never a numerical fact and cannot advance scientific or publication gates.
 
 # Statement of need
 
-Existing VASP tooling clusters at two poles. Terminal pre/post-processors
-such as VASPKIT [@Wang2021VASPKIT] and qvasp [@Yi2020qvasp] accelerate input
-preparation and analysis but leave cluster orchestration to hand-written
-shell scripts. Workflow infrastructures such as AiiDA [@Huber2020AiiDA],
-atomate2 [@Ganose2025Atomate2] and pyiron [@Pyiron2024] provide robust
-provenance and multi-code support, but assume a Python-first user operating a
-daemon/database stack. GUI platforms exist (e.g. ALKEMIE [@Wang2021ALKEMIE]),
-and recent LLM-agent frameworks such as VASPilot [@Liu2025VASPilot] automate
-error recovery with online model inference in the loop.
+Terminal pre/post-processors such as VASPKIT [@Wang2021VASPKIT] and qvasp
+[@Yi2020qvasp] accelerate VASP preparation and analysis but generally leave
+cluster orchestration to scripts. Workflow infrastructures such as AiiDA
+[@Huber2020AiiDA], atomate2 [@Ganose2025Atomate2] and pyiron [@Pyiron2024]
+provide stronger database-backed provenance and broader calculator support,
+but assume a Python-first user and additional services. GUI platforms also
+exist (for example ALKEMIE [@Wang2021ALKEMIE]), while recent LLM-agent
+frameworks such as VASPilot [@Liu2025VASPilot] place online model inference
+inside more of the operational loop.
 
-For the graduate-student catalysis workflow — screening tens to hundreds of
-adsorption systems on a shared university cluster — none of these fits: data
-often may not leave the local machine, cluster time is too scarce for
-avoidable resubmissions, and silent automated edits to a calculation's
-methodology are unacceptable in work that must survive peer review.
-`vcstudio` addresses this niche with three design invariants: (i)
-*methodology sovereignty* — the user's INCAR keys are never overwritten, and
-recovery never edits INCAR; (ii) a *deterministic, zero-token core* — LLMs
-appear only in an optional analysis layer; (iii) *explicit state, never
-silent* — recovery is bounded (three rounds), and anything outside the rule
-set halts as NEEDS_HUMAN with evidence. To our knowledge, no published tool
-packages this combination (see `docs/comparison.md`): it also intercepts
-geometry errors before submission (covalent-radius clash scan of the
-molecule--slab gap) and generates Methods paragraphs guaranteed consistent with
-the actual INCAR/KPOINTS/POTCAR, including the subtle case where the GGA tag
-overrides the POTCAR flavor.
+For a researcher screening many adsorption systems on a shared cluster, three
+requirements are easy to lose between those poles: methodology sovereignty,
+bounded recovery and evidence that survives publication review. `vcstudio`
+therefore keeps user INCAR keys immutable during generation/recovery, limits
+automatic continuation to supported failure classes and three rounds, and
+stops outside the rule set as `NEEDS_HUMAN`. It also intercepts molecule-slab
+geometry clashes before submission and generates Methods/BibTeX text from the
+frozen real inputs rather than from an unconstrained narrative.
+
+The single-file Windows build removes the need for a separate Python
+installation; it does **not** grant or bundle scientific software licenses,
+POTCAR/BASIS/POTENTIAL data, every optional renderer, or system WebView2.
 
 # Functionality
 
-- **Generate**: POSCAR + user INCAR → validated four-file input set;
-  KPOINTS policy by calculation type; POTCAR concatenation from a licensed
-  PAW library with ENMAX/ENCUT cross-checks; sha256 provenance in `job.yaml`.
-- **Submit**: PBS and Slurm dialects as pure functions; jump-host SSH with
-  host-key gating; preflight checks; user job-script templates passed through
-  verbatim.
-- **Monitor & diagnose**: scheduler terminal reasons, output integrity, log
-  error signatures and convergence traces → four terminal states.
-- **Bounded recovery**: CONTCAR continuation for recoverable classes only,
-  INCAR frozen, maximum three rounds.
-- **Analyze & report**: gated adsorption energies (all members DONE), Li--S
-  discharge path (ΔG staircase, rate-determining step, limiting potential),
-  OriginLab/SVG dual chart engines, POV-Ray structure figures, and a
-  validation pipeline that computes MAE against independent reference data
-  when such data are supplied (protocol in `docs/validation.md`, following
-  @Montoya2017).
+- **Project workspace:** seven top-level regions and semantic routes preserve
+  project/engine/task/stage context, activity state, dirty guards and
+  restart-safe preferences.
+- **Prepare:** VASP four-file generation, calculation-specific KPOINTS,
+  licensed PAW-library concatenation, ENMAX/ENCUT checks, structure tooling and
+  preflight; bounded CP2K/Gaussian/CASTEP adapters expose only declared fields.
+- **Run:** PBS/Slurm script models, SSH and host-key gates, local runner,
+  monitoring, 18+16 failure taxonomy, output integrity and bounded recovery.
+- **Analyze:** registry-driven adsorption, multi-project comparison,
+  electronic/charge/task-result views, and Li--S free-energy paths. Raw DFT
+  totals and uncorrected adsorption values use `E0`; ZPE/thermal/entropy
+  corrections require explicit qualified frequency evidence, temperature,
+  low-frequency policy, imaginary-mode gates and a correction fingerprint.
+- **Publish:** figures plus revisioned ReportSpec → ReportSnapshot →
+  ValidationResult → ReportModel/manifest bundles. Artifact availability,
+  scientific qualification and publication eligibility remain separate.
+- **Optional AI:** bounded result interpretation, paper method/data extraction
+  and assistant chat behind an explicit external-data gate. AI output cannot
+  write `accepted`, alter numerical facts or bypass budget/method/report gates.
+
+# Report accessibility boundary
+
+HTML emits language, metadata, heading/table/figure structure and alternative
+text. DOCX emits core metadata, document/run language, Word heading/caption
+styles, repeating table headers and image descriptions. Both remain
+**conditional** on meaningful authored descriptions and browser/Word
+Accessibility Checker plus human review. The current ReportLab PDF is visual
+and searchable and records `/Lang` and metadata, but it is untagged, has no
+structure tree or image alternative text, and explicitly reports
+`tagged=false` and `pdf_ua=false`. Format generation is not a WCAG, scientific
+review or PDF/UA certificate; the precise contract is documented in
+`docs/report-state-contract.md`.
 
 # Validation
 
-The repository ships a validation protocol (`docs/validation.md`) and a tested
-comparison pipeline (`vcstudio/project/benchmark.py`) that computes per-system
-errors and the mean absolute error (MAE) of adsorption energies against
-independently published reference values, following the methodology of
-@Montoya2017. We report the protocol and pipeline here rather than a headline
-MAE number: a like-for-like benchmark requires cluster runs whose functional,
-dispersion correction and ENCUT are matched to the reference set, and those
-runs are pending cluster access (see `docs/validation.md`). Once back-filled,
-the pipeline emits a publication-ready comparison table for this section.
-<!-- AUTHOR-TODO:集群数据回填后,把 benchmark.render_markdown 生成的对比表贴入
-     此节,并声明泛函/色散修正/ENCUT 对齐口径。 -->
-The test suite comprises 525 automated tests (2 skipped when OriginLab and
-POV-Ray are absent) run in CI on Linux and Windows.
+The repository includes a fail-closed comparison pipeline
+(`vcstudio/project/benchmark.py`) and a Li--S adsorption validation protocol
+(`docs/validation.md`) following the comparison form of @Montoya2017. It can
+report per-system errors, MAE, effective sample size, uncovered entries and
+method differences when independently published reference values are supplied.
+No headline vcstudio MAE is reported here: like-for-like V4 cluster runs and a
+method-aligned, provenance-recorded reference table are still pending. A report
+contract or unit-test pass cannot substitute for that scientific benchmark.
+
+For software regression evidence, the V4 working tree was run locally on
+Windows on 2026-08-11: **3336 tests passed and 5 environment- or
+platform-specific tests were skipped**, with no failures. The maintained CI
+matrix covers Ubuntu and Windows
+on Python 3.10, 3.11 and 3.12. These counts are a dated snapshot; the latest
+pytest/CI output is the authority for the current branch.
 
 # Acknowledgements
 
-<!-- AUTHOR-TODO:资助号/致谢。 -->
+Funding and acknowledgement text have not been supplied in the repository and
+must be provided by the author before submission. No source of support is
+inferred here.
 
 # References

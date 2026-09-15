@@ -4,6 +4,8 @@
 'use strict';
 (function () {
   const $ = id => document.getElementById(id);
+  const tr = (key, fallback, params) => typeof VCS.t === 'function'
+    ? VCS.t(key, params || {}, fallback) : fallback;
 
   // 图表预设 key → 场景图型短键(供场景 figure_preset_order 白名单过滤);无映射者恒显示
   const PRESET_TO_SCENE = {
@@ -14,13 +16,31 @@
   };
   const LADDER_KEYS = ['free_energy_ladder', 'free_energy_ladder_multi'];
 
-  const State = { presets: [], categories: [], projects: [], reactions: [], current: null };
+  const State = {
+    presets: [], categories: [], categoriesEn: [], projects: [], reactions: [], current: null,
+  };
+
+  function localized(record, field) {
+    const item = record || {};
+    if (VCS.i18n && VCS.i18n.lang === 'en') {
+      return String(item[field + '_en'] || item.key || '');
+    }
+    return String(item[field] || item.key || '');
+  }
 
   // ── 项目下拉(数据来源) ──
   async function loadProjects() {
     const sel = $('fig-project');
     const r = await VCS.call('proj_list');
-    State.projects = (r && r.projects) || [];
+    State.projects = ((r && r.projects) || [])
+      .filter(project => String(project.project_id || '').trim())
+      .map(project => ({
+        project_id: String(project.project_id),
+        name: String(project.name || ''),
+        counts: project.counts && typeof project.counts === 'object'
+          ? Object.assign({}, project.counts) : {},
+        n_members: Number(project.n_members || 0),
+      }));
     if (!sel) return;
     const prev = sel.value;
     sel.innerHTML = '';
@@ -32,11 +52,14 @@
     }
     State.projects.forEach(p => {
       const o = document.createElement('option');
-      o.value = p.path;
-      o.textContent = (p.name || '(未命名)') + '(' + p.n_members + ' 成员)';
+      o.value = p.project_id;
+      o.textContent = tr('figures.project.option', '{name}（{count} 成员）', {
+        name: p.name || tr('common.unnamed', '(未命名)'),
+        count: p.counts && p.counts.members != null ? p.counts.members : p.n_members,
+      });
       sel.appendChild(o);
     });
-    if (State.projects.some(p => p.path === prev)) sel.value = prev;
+    if (State.projects.some(p => p.project_id === prev)) sel.value = prev;
   }
 
   async function loadReactions() {
@@ -60,6 +83,7 @@
       if (!r || r.ok === false) { box.innerHTML = '<div class="db-empty">读取预设失败</div>'; return; }
       State.presets = r.presets || [];
       State.categories = r.categories || [];
+      State.categoriesEn = r.categories_en || [];
     }
     renderGallery();
   }
@@ -71,16 +95,18 @@
     State.categories.forEach(cat => {
       const items = State.presets.filter(p => p.category === cat && sceneAllows(p.key));
       if (!items.length) return;
-      h += `<div class="fig-cat"><div class="fig-cat-h">${VCS.esc(cat)}</div><div class="fig-grid">`;
+      const category = VCS.i18n && VCS.i18n.lang === 'en'
+        ? (localized(items[0], 'category') || cat) : cat;
+      h += `<div class="fig-cat"><div class="fig-cat-h">${VCS.esc(category)}</div><div class="fig-grid">`;
       items.forEach(p => {
         h += `<div class="fig-card" data-key="${VCS.esc(p.key)}">` +
           `<div class="fig-thumb">${p.thumbnail_svg || ''}</div>` +
-          `<b>${VCS.esc(p.name)}</b>` +
-          `<div class="fig-desc">${VCS.esc(p.description || '')}</div></div>`;
+          `<b>${VCS.esc(localized(p, 'name'))}</b>` +
+          `<div class="fig-desc">${VCS.esc(localized(p, 'description'))}</div></div>`;
       });
       h += '</div></div>';
     });
-    box.innerHTML = h || '<div class="db-empty">当前研究场景未启用任何图型</div>';
+    box.innerHTML = h || '<div class="db-empty">当前工作模式未启用任何图型</div>';
     box.querySelectorAll('.fig-card').forEach(c =>
       c.addEventListener('click', () => openDrawer(c.dataset.key)));
   }
@@ -90,16 +116,19 @@
     const preset = State.presets.find(p => p.key === key);
     if (!preset) return;
     State.current = preset;
-    $('fig-drawer-title').textContent = preset.name;
+    $('fig-drawer-title').textContent = localized(preset, 'name');
     const body = $('fig-drawer-body');
-    let h = `<div class="fig-need"><b>该图需要:</b>${VCS.esc(preset.required_data || '—')}</div>`;
-    h += `<div class="fig-desc" style="margin-bottom:14px">${VCS.esc(preset.description || '')}</div>`;
+    let h = `<div class="fig-need"><b>该图需要:</b>${VCS.esc(
+      localized(preset, 'required_data') || '—')}</div>`;
+    h += `<div class="fig-desc" style="margin-bottom:14px">${VCS.esc(
+      localized(preset, 'description'))}</div>`;
     // 台阶图额外提供反应预设选择(数据来源之一)
     if (LADDER_KEYS.indexOf(key) >= 0) {
       h += '<div class="fig-param"><label>反应预设(空 = Li-S 放电默认)</label>' +
         '<select class="ipt" data-ctl="reaction_preset"><option value="">Li-S 放电(默认)</option>' +
         State.reactions.map(rp =>
-          `<option value="${VCS.esc(rp.key)}">${VCS.esc(rp.description || rp.name || rp.key)}</option>`
+          `<option value="${VCS.esc(rp.key)}">${VCS.esc(
+            localized(rp, 'description') || localized(rp, 'name'))}</option>`
         ).join('') + '</select></div>';
     }
     // params_schema → 表单
@@ -114,8 +143,9 @@
 
   function paramInput(k, def) {
     if (typeof def === 'boolean') {
+      const enabled = tr('figures.parameter.enabled', '启用');
       return `<label style="flex-direction:row;gap:6px"><input type="checkbox" data-p="${VCS.esc(k)}"` +
-        (def ? ' checked' : '') + '> 启用</label>';
+        (def ? ' checked' : '') + `> ${VCS.esc(enabled)}</label>`;
     }
     if (typeof def === 'number') {
       return `<input class="ipt" type="text" inputmode="decimal" data-p="${VCS.esc(k)}" data-t="number" value="${VCS.esc(String(def))}">`;
@@ -154,10 +184,12 @@
     const params = collectParams();
     const btn = $('fig-drawer-gen');
     if (btn) btn.disabled = true;
-    VCS.log('出图中(' + State.current.name + ')…');
+    VCS.log(tr('figures.generating', '出图中（{name}）…', {
+      name: localized(State.current, 'name'),
+    }));
     try {
       const r = await VCS.call('render_figure_preset', State.current.key, proj, params);
-      logFig(r, State.current.name);
+      logFig(r, localized(State.current, 'name'));
       if (r && (r.files || []).length) closeDrawer();
     } finally {
       if (btn) btn.disabled = false;
@@ -166,14 +198,20 @@
 
   function logFig(r, what) {
     if (!r || r.ok === false || r.error) {
-      VCS.log(what + '失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+      VCS.log(tr('figures.failed', '{name}失败：{error}', {
+        name: what, error: (r && r.error) || tr('common.unknown_error', '未知错误'),
+      }), 'failc'); return;
     }
-    (r.files || []).forEach(f => VCS.log('已生成:' + f, 'okc'));
-    (r.skipped || []).forEach(s => VCS.log('跳过 ' + (s.kind || '') + ':' + s.reason, 'warnc'));
+    (r.files || []).forEach(f => VCS.log(tr('figures.file_generated',
+      '已生成：{file}', { file: f }), 'okc'));
+    (r.skipped || []).forEach(s => VCS.log(tr('figures.skipped',
+      '跳过 {kind}：{reason}', { kind: s.kind || '', reason: s.reason }), 'warnc'));
     if ((r.files || []).length) {
-      VCS.log('图已输出到:' + r.out_dir, 'okc');
+      VCS.log(tr('figures.output_dir', '图已输出到：{path}', { path: r.out_dir }), 'okc');
       VCS.call('open_dir', r.out_dir);
-      VCS.toast('已生成 ' + r.files.length + ' 个文件');
+      VCS.toast(tr('figures.files_generated', '已生成 {count} 个文件', {
+        count: r.files.length,
+      }));
     } else if ((r.skipped || []).length) {
       VCS.toast('该图缺数据(原因见日志)', 'fail');
     }
@@ -197,6 +235,12 @@
   });
   // 场景切换时重渲画廊(图型白名单变化)
   document.addEventListener('vcs:scenario', () => { if (State.presets.length) renderGallery(); });
+  document.addEventListener('vcs:language', () => {
+    if (State.presets.length) renderGallery();
+    if (State.current && !$('fig-drawer').hidden) openDrawer(State.current.key);
+    loadProjects();
+  });
 
   window.Figures = { reload: loadProjects };
+  if (window.__VCS_TEST__) window.Figures.__test = { State, loadProjects, generate };
 })();

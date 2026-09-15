@@ -83,6 +83,48 @@ def test_cp2k_periodic_xyz(tmp_path):
     assert 'PERIODIC XYZ' in text
 
 
+def test_cp2k_periodic_kmesh_is_not_silently_dropped(tmp_path):
+    text, _ = _gen(tmp_path, kpoints=(4, 3, 1))
+    assert '&KPOINTS' in text
+    assert 'SCHEME MONKHORST-PACK 4 3 1' in text
+
+
+def test_cp2k_rpbe_uses_explicit_exchange_and_correlation_sections(tmp_path):
+    text, _ = _gen(tmp_path, functional='RPBE')
+    assert '&XC_FUNCTIONAL RPBE' not in text
+    assert '&GGA_X_RPBE' in text and '&GGA_C_PBE' in text
+
+
+def test_cp2k_pbesol_uses_native_parametrization(tmp_path):
+    text, _ = _gen(tmp_path, functional='PBEsol')
+    assert '&PBE' in text and 'PARAMETRIZATION PBESOL' in text
+
+
+@pytest.mark.parametrize('kwargs', [
+    {'functional': 'made-up-xc'},
+    {'dispersion': 'mystery'},
+    {'extras': {'cutoff_ry': float('nan')}},
+    {'extras': {'cutoff_ry': -400}},
+    {'extras': {'cutoff_ry': 400, 'rel_cutoff_ry': 0}},
+    {'extras': {'cutoff_ry': 400, 'max_scf': 2.5}},
+    {'kpoints': (2, 1.5, 1)},
+])
+def test_cp2k_invalid_engine_parameters_fail_closed(tmp_path, kwargs):
+    with pytest.raises(ValueError):
+        _gen(tmp_path, **kwargs)
+
+
+def test_cp2k_selective_constraints_are_translated(tmp_path):
+    frozen = make_poscar(
+        'frozen', [[5, 0, 0], [0, 5, 0], [0, 0, 10]], ['H'], [2],
+        [[0, 0, 1], [0, 0, 2]], sd=['F F F', 'T T F'])
+    text, result = _gen(tmp_path, structure=frozen, task='relax')
+    assert '&FIXED_ATOMS' in text
+    assert 'COMPONENTS_TO_FIX XYZ' in text and 'LIST 1' in text
+    assert 'COMPONENTS_TO_FIX Z' in text and 'LIST 2' in text
+    assert any('Selective dynamics' in warning for warning in result['warnings'])
+
+
 def test_cp2k_multiplicity_uks(tmp_path):
     text, _ = _gen(tmp_path, spin=True, multiplicity=3)
     assert 'MULTIPLICITY 3' in text and 'UKS .TRUE.' in text
@@ -120,7 +162,8 @@ def _out(tmp_path, text):
 def test_cp2k_parse_hartree_to_ev(tmp_path):
     r = _out(tmp_path,
              ' SCF run converged in 10 steps\n'
-             ' ENERGY| Total FORCE_EVAL ( QS ) energy [a.u.]:      -17.000000000000\n')
+             ' ENERGY| Total FORCE_EVAL ( QS ) energy [a.u.]:      -17.000000000000\n'
+             ' PROGRAM ENDED AT 2026-07-20 12:00:00\n')
     assert r['energy_ev'] == pytest.approx(-17.0 * HARTREE_TO_EV)
     assert r['converged'] is True and r['error'] is None
 
@@ -137,7 +180,8 @@ def test_cp2k_parse_geoopt_completed(tmp_path):
     r = _out(tmp_path,
              ' SCF run converged in 5 steps\n'
              ' ENERGY| Total FORCE_EVAL ( QS ) energy [a.u.]:      -5.0\n'
-             ' *** GEOMETRY OPTIMIZATION COMPLETED ***\n')
+             ' *** GEOMETRY OPTIMIZATION COMPLETED ***\n'
+             ' PROGRAM ENDED AT 2026-07-20 12:00:00\n')
     assert r['converged'] is True
 
 
@@ -146,6 +190,43 @@ def test_cp2k_parse_not_converged(tmp_path):
              ' *** SCF run NOT converged ***\n'
              ' ENERGY| Total FORCE_EVAL ( QS ) energy [a.u.]:      -1.0\n')
     assert r['converged'] is False
+
+
+def test_cp2k_truncated_output_with_energy_is_not_complete(tmp_path):
+    r = _out(tmp_path,
+             ' SCF run converged in 5 steps\n'
+             ' ENERGY| Total FORCE_EVAL ( QS ) energy [a.u.]: -1.0\n')
+    assert r['energy_ev'] is not None
+    assert r['converged'] is False and 'PROGRAM ENDED AT' in r['error']
+
+
+def test_cp2k_freq_requires_frequency_rows_and_parses_them(tmp_path):
+    (tmp_path / 'cp2k.inp').write_text(
+        '&GLOBAL\n RUN_TYPE VIBRATIONAL_ANALYSIS\n&END GLOBAL\n', encoding='utf-8')
+    r = _out(tmp_path,
+             ' ENERGY| Total FORCE_EVAL ( QS ) energy [a.u.]: -1.0\n'
+             ' VIB|Frequency (cm^-1) -25.0 100.0 250.0\n'
+             ' PROGRAM ENDED AT 2026-07-20\n')
+    assert r['converged'] is True
+    assert r['frequencies_cm1'] == [-25.0, 100.0, 250.0]
+    assert r['n_imaginary'] == 1
+
+
+def test_cp2k_final_xyz_structure_is_extracted(tmp_path):
+    (tmp_path / 'probe-pos-1.xyz').write_text(
+        '1\nstep 1\nH 0 0 0\n1\nstep 2\nH 1.0 2.0 3.0\n', encoding='utf-8')
+    r = _out(tmp_path,
+             ' ENERGY| Total FORCE_EVAL ( QS ) energy [a.u.]: -1.0\n'
+             ' PROGRAM ENDED AT 2026-07-20\n')
+    assert r['final_structure']['atoms'][0]['xyz_angstrom'] == [1.0, 2.0, 3.0]
+
+
+def test_cp2k_multiple_nonstandard_outputs_are_ambiguous(tmp_path):
+    for name in ('old.out', 'new.out'):
+        (tmp_path / name).write_text(
+            ' ENERGY| Total FORCE_EVAL ( QS ) energy [a.u.]: -1.0\n', encoding='utf-8')
+    r = get_backend('cp2k').parse_energy(str(tmp_path))
+    assert r['energy_ev'] is None and '多个' in r['error']
 
 
 def test_cp2k_parse_missing_output(tmp_path):
@@ -160,7 +241,7 @@ def test_cp2k_check_ok(tmp_path):
 
 
 def test_cp2k_check_missing_file(tmp_path):
-    assert any('cp2k.inp' in s for s in get_backend('cp2k').check_inputs(str(tmp_path)))
+    assert any('.inp' in s for s in get_backend('cp2k').check_inputs(str(tmp_path)))
 
 
 def test_cp2k_check_missing_cutoff_section(tmp_path):

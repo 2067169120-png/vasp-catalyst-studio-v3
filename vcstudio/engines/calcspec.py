@@ -15,6 +15,8 @@ Backend 负责把它翻成自家输入文件、再把自家输出解析回统一
 """
 from __future__ import annotations
 
+import math
+import os
 from dataclasses import dataclass, field
 
 from vcstudio.generate.poscar import parse_poscar_species, read_cell_vectors
@@ -29,6 +31,89 @@ VALID_TASKS = ('relax', 'static', 'freq')
 
 # 已注册引擎名(get_backend 的键;castep 即 Materials Studio 文件级适配)。
 KNOWN_ENGINES = ('vasp', 'cp2k', 'gaussian', 'castep')
+
+
+@dataclass(frozen=True)
+class EngineRunContract:
+    """One engine's cluster-facing file/command contract.
+
+    Keeping this beside :class:`CalcSpec` gives input generation, submission and
+    result fetching one source of truth.  ``result_files`` contains only names
+    whose stem is deterministically derived from the primary input; engines may
+    create additional scratch/restart files, but those must never be guessed as
+    required scientific evidence.
+    """
+
+    name: str
+    input_suffixes: tuple[str, ...]
+    command_example: str
+    result_suffixes: tuple[str, ...]
+    restart_supported: bool = False
+    restart_note: str = ''
+
+    def primary_input(self, input_files) -> str:
+        names = [str(item or '').strip() for item in (input_files or ())]
+        for suffix in self.input_suffixes:
+            for name in names:
+                if name.lower().endswith(suffix):
+                    return name
+        return names[0] if names else ''
+
+    def result_files(self, input_files, *, task: str | None = None) -> tuple[str, ...]:
+        primary = self.primary_input(input_files)
+        stem = os.path.splitext(primary)[0] if primary else {
+            'gaussian': 'input', 'cp2k': 'cp2k', 'castep': 'case',
+        }.get(self.name, 'calc')
+        suffixes = list(self.result_suffixes)
+        task_key = str(task or '').strip().lower()
+        if self.name == 'castep':
+            if task_key in ('relax', 'geometryoptimization', 'geometry_optimization'):
+                suffixes.append('.geom')
+            elif task_key in ('freq', 'phonon'):
+                suffixes.append('.phonon')
+        return tuple(dict.fromkeys(stem + suffix for suffix in suffixes))
+
+
+ENGINE_RUN_CONTRACTS = {
+    'vasp': EngineRunContract(
+        name='vasp', input_suffixes=(), command_example='vasp_std',
+        result_suffixes=(), restart_supported=True,
+        restart_note='VASP 结构任务可在严格诊断通过后从 CONTCAR 有界续算。'),
+    'gaussian': EngineRunContract(
+        name='gaussian', input_suffixes=('.gjf', '.com'),
+        command_example='g16 < {input} > {stem}.log',
+        result_suffixes=('.log', '.chk'), restart_supported=False,
+        restart_note=('Gaussian 检查点续算依赖任务专用 Route/Chk/几何语义；当前不自动改写，'
+                      '请从已核对的 .chk 新建作业。')),
+    'cp2k': EngineRunContract(
+        name='cp2k', input_suffixes=('.inp',),
+        command_example='cp2k.psmp -i {input} -o {stem}.out',
+        result_suffixes=('.out',), restart_supported=False,
+        restart_note=('CP2K restart 文件名由 PROJECT/RUN_TYPE 决定；当前不自动选择旧 restart，'
+                      '请核对波函数与结构后新建作业。')),
+    'castep': EngineRunContract(
+        name='castep', input_suffixes=('.cell', '.param'),
+        command_example='mpirun -np {cores} castep.mpi {stem}',
+        result_suffixes=('.castep', '.check'), restart_supported=False,
+        restart_note=('CASTEP .check 续算需与任务、许可版本和参数一致；当前不自动改写 reuse，'
+                      '请核对后新建作业。')),
+}
+
+
+def get_run_contract(engine: str) -> EngineRunContract:
+    """Return the canonical cluster contract; unknown engines fail closed."""
+    aliases = {
+        'g16': 'gaussian', 'g09': 'gaussian', 'gaussian16': 'gaussian',
+        'materials_studio': 'castep', 'materials studio': 'castep',
+        'ms': 'castep', 'castep/ms': 'castep',
+    }
+    key = str(engine or '').strip().lower()
+    key = aliases.get(key, key)
+    try:
+        return ENGINE_RUN_CONTRACTS[key]
+    except KeyError as exc:
+        raise ValueError(
+            f'未知引擎 {engine!r};无运行/结果文件契约，拒绝猜测。') from exc
 
 
 @dataclass
@@ -99,23 +184,40 @@ def validate(spec: CalcSpec) -> list[str]:
             f'任务类型非法:{spec.task!r};合法值:{", ".join(VALID_TASKS)}。')
 
     if spec.periodic:
-        if spec.cutoff_ev is None or float(spec.cutoff_ev) <= 0:
+        try:
+            cutoff_ev = float(spec.cutoff_ev)
+        except (TypeError, ValueError):
+            cutoff_ev = float('nan')
+        if not math.isfinite(cutoff_ev) or cutoff_ev <= 0:
+            # CalcSpec 是引擎无关 IR；CP2K cutoff_ry 是引擎私有的密度网格
+            # 截断，不能在此冒充 VASP/CASTEP 的 cutoff_ev。CP2K API/Backend
+            # 会单独校验 Ry 参数并过滤这条平面波提示。
             issues.append(
-                '周期性计算必须指定 cutoff_ev(平面波截断能,eV);缺失或非正值。')
+                '周期性计算必须指定 cutoff_ev(平面波截断能,eV)；'
+                'CP2K 请由引擎适配层单独校验 extras.cutoff_ry。')
     else:
         if spec.kpoints is not None:
             issues.append(
                 '分子(非周期)计算不应指定 kpoints;非周期体系无 k 点采样,请置 None。')
 
-    if int(spec.multiplicity) < 1:
+    try:
+        multiplicity = int(spec.multiplicity)
+        if isinstance(spec.multiplicity, bool) or float(spec.multiplicity) != multiplicity:
+            raise ValueError
+    except (TypeError, ValueError, OverflowError):
+        multiplicity = 0
+        issues.append(
+            f'自旋多重度须为正整数(2S+1),收到 multiplicity={spec.multiplicity!r}。')
+
+    if multiplicity < 1 and not any('自旋多重度须为正整数' in item for item in issues):
         issues.append(
             f'自旋多重度须为正整数(2S+1),收到 multiplicity={spec.multiplicity}。')
-    elif int(spec.multiplicity) > 1 and not spec.spin:
+    elif multiplicity > 1 and not spec.spin:
         issues.append(
             f'多重度 {spec.multiplicity}(开壳)但 spin=False(未开自旋极化);'
             f'开壳/磁性态将丢失,请置 spin=True。')
 
-    if spec.periodic and int(spec.multiplicity) > 1:
+    if spec.periodic and multiplicity > 1:
         issues.append(
             f'周期性计算通常不使用分子多重度(multiplicity={spec.multiplicity});'
             f'周期 DFT 请用 spin/NUPDOWN 表达净磁矩,此多重度将被忽略。')
@@ -124,10 +226,29 @@ def validate(spec: CalcSpec) -> list[str]:
     for key, label in (('energy_ev', '能量收敛阈值'), ('force_ev_a', '力收敛阈值')):
         if key in conv and conv[key] is not None:
             try:
-                if float(conv[key]) <= 0:
+                value = float(conv[key])
+                if not math.isfinite(value) or value <= 0:
                     issues.append(f'{label} convergence[{key!r}] 须 > 0。')
             except (TypeError, ValueError):
                 issues.append(f'{label} convergence[{key!r}] 非数值:{conv[key]!r}。')
+
+    if spec.kpoints is not None:
+        try:
+            if len(spec.kpoints) != 3:
+                raise ValueError
+            if any(isinstance(v, bool) or float(v) != int(v) or int(v) <= 0
+                   for v in spec.kpoints):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            issues.append(
+                f'kpoints 必须是 3 个正整数网格,收到 {spec.kpoints!r}。')
+
+    try:
+        charge_value = int(spec.charge)
+        if isinstance(spec.charge, bool) or float(spec.charge) != charge_value:
+            raise ValueError
+    except (TypeError, ValueError, OverflowError):
+        issues.append(f'体系净电荷 charge 必须为整数,收到 {spec.charge!r}。')
 
     return issues
 
@@ -159,6 +280,23 @@ class EngineBackend:
 
     def check_inputs(self, out_dir: str) -> list:
         raise NotImplementedError
+
+    def parse_output_text(self, text: str, *, task: str | None = None) -> dict:
+        """Parse one engine output string into the standard result contract.
+
+        Backends supporting cluster lifecycle classification override this.
+        The method is deliberately separate from ``parse_energy(out_dir)`` so a
+        remote tail can be classified without pretending it was downloaded.
+        """
+        raise NotImplementedError
+
+    def infer_task(self, out_dir: str) -> str | None:
+        """Infer the task from this engine's local input, or return ``None``."""
+        return None
+
+    @property
+    def run_contract(self) -> EngineRunContract:
+        return get_run_contract(self.name)
 
 
 # ── 结构解析(POSCAR → 各引擎共用的结构字典;纯 python) ────────────────────────
@@ -207,7 +345,7 @@ def parse_structure(poscar_text: str) -> dict:
     返回 {'elements'(逐原子)、'cart'(笛卡尔 Å)、'frac'(分数)、'cell'(3×3 Å)、
           'sd'(每原子 SD 标志串 或 None)、'comment'(首行)}。
 
-    复用 structure_view.parse_positions(已处理 Direct/Cartesian/负缩放拒绝/VASP4
+    复用 structure_view.parse_positions(已处理 Direct/Cartesian/负值目标体积/三个分量缩放/VASP4
     报错),再补分数坐标与 SD 标志。VASP4/畸形 POSCAR → ValueError(冒泡)。
     """
     p = parse_positions(poscar_text)                 # cart + cell + 逐原子 elements
@@ -228,7 +366,7 @@ def structure_species(poscar_text: str) -> tuple[list, list]:
 
 
 def _ensure_cell(poscar_text: str) -> list:
-    """POSCAR → 3×3 晶格矢量(已乘缩放因子)。薄封装,负缩放沿用其显式拒绝。"""
+    """POSCAR → 3×3 晶格矢量(支持正标量、负值目标体积与三个分量缩放)。"""
     return read_cell_vectors(poscar_text)
 
 

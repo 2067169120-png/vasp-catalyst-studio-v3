@@ -67,16 +67,34 @@ def build_workfunction_job(src_dir, out_root, *, add_dipole: str = 'auto') -> di
     warnings.append('LVTOT=.TRUE. 产出 LOCPOT;φ = 真空能级 − E_F,真空能级取 LOCPOT 沿 z 面平均'
                     '在真空平台处的值(见 parse_locpot_planar / work_function)。')
 
-    # 重写 job.yaml 为规范 manifest(task_type='workfunction')
+    # estatic 已落标准 manifest；在原清单上改任务语义，保留四件套文件表、
+    # SHA256、状态历史和父任务溯源。重新 new_manifest 会丢掉这些提交前证据。
     system = poscar_text.splitlines()[0].strip() if poscar_text.strip() else Path(out_root).name
     parent = str(Path(src_dir).resolve())
-    m = manifest_mod.new_manifest(
+    m = manifest_mod.load_manifest(out_root) or manifest_mod.new_manifest(
         job_id=f'{Path(out_root).name}-workfunction', system=system,
-        task_type='workfunction', calc_type='slab',
-        inputs={'parent_job': parent, 'derived_from': source_name, 'purpose': 'esp',
-                'dipole': bool(dipole), 'incar_changes': res['changes']},
-        warnings=warnings)
+        task_type='workfunction', calc_type='slab', inputs={}, warnings=warnings)
+    m['task_type'] = 'workfunction'
+    m['calc_type'] = 'slab'
+    m['warnings'] = warnings
+    m.setdefault('inputs', {}).update({
+        'parent_job': parent, 'derived_from': source_name, 'purpose': 'esp',
+        'dipole': bool(dipole), 'incar_changes': res['changes'],
+    })
+    from vcstudio.generate.method_recipe import builder_recipe
+    m['inputs']['method_recipe'] = builder_recipe(
+        builder='vcstudio.project.workfunction/v1', task_type='workfunction',
+        calc_type='slab', validate=True,
+        completions={'incar_changes': res['changes']},
+        kpoints_source='parent-density-multiplier',
+        extra={'purpose': 'workfunction', 'dipole_correction': bool(dipole)})
     m['parent_job'] = parent
+    m.setdefault('derivation', {}).update({
+        'purpose': 'workfunction', 'derived_from': source_name,
+        'dipole': bool(dipole), 'changes': list(res['changes']),
+    })
+    from vcstudio.shared.scientific_inputs import record_input_closure
+    record_input_closure(out_root, m)
     manifest_mod.save_manifest(out_root, m)
     return {'out_dir': str(out_root), 'changes': res['changes'], 'warnings': warnings,
             'dipole': bool(dipole)}
@@ -107,7 +125,8 @@ def parse_locpot_planar(locpot_text, axis: str = 'z') -> dict:
         k = key(i)
         sums[k] += v
         cnts[k] += 1
-    axis_vec = [c['scale'] * x for x in c['lattice'][_AXIS_IDX[axis]]]
+    cell = c.get('cell') or [[c['scale'] * x for x in vec] for vec in c['lattice']]
+    axis_vec = cell[_AXIS_IDX[axis]]
     length = math.sqrt(sum(x * x for x in axis_vec))
     zs = [(k / na) * length for k in range(na)]
     v_planar = [(sums[k] / cnts[k]) if cnts[k] else 0.0 for k in range(na)]   # 不除体积

@@ -22,7 +22,7 @@
     const onResize = function () { if (chart) chart.resize(); };
 
     const m = VCS.modal({
-      title: '收敛过程 — ' + name,
+      title: VCS.t('convergence.title', { name }, '收敛过程 — {name}'),
       body: wrap,
       actions: [{ label: '关闭', quiet: true, onClick: h => h.close() }],
     });
@@ -61,7 +61,9 @@
       note.textContent = s.notes.join(';');
     } else {
       note.className = 'conv-note';
-      note.textContent = s.steps.length + ' 个离子步';
+      note.textContent = VCS.t('convergence.ionic_steps', {
+        count: s.steps.length,
+      }, '{count} 个离子步');
     }
 
     chart = window.echarts.init(chartEl);
@@ -70,7 +72,8 @@
       tooltip: { trigger: 'axis' },
       legend: { data: ['E0 (eV)', '|ΔE| (eV)', '|F|max (eV/Å)'], bottom: 0 },
       grid: { left: 66, right: 66, top: 24, bottom: 44 },
-      xAxis: { type: 'category', name: '离子步', nameLocation: 'middle',
+      xAxis: { type: 'category', name: VCS.t(
+        'convergence.axis.ionic_step', {}, '离子步'), nameLocation: 'middle',
         nameGap: 26, data: s.steps },
       yAxis: [
         { type: 'value', name: 'E0 (eV)', scale: true },

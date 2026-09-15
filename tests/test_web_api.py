@@ -3,12 +3,24 @@
 每个公开方法至少一个 happy + 一个错误路径;所有返回一律 JSON-safe dict,
 异常绝不穿透到 JS(错误落 'error' 字段)。中文注释允许,英文标识符。
 """
+import copy
+import json
 import os
+import re
+import subprocess
 import sys
+import threading
 import types
+from pathlib import Path
 
-from vcstudio.gui_web.api import Api
+import pytest
+
+from vcstudio.gui_web.api import Api, _sha256_file
+from vcstudio.gui_web.workspace_context import WorkspaceContextStore
 from vcstudio.cluster.profiles import ClusterProfile
+from vcstudio.cluster import submitter as cluster_submitter
+from vcstudio.project import paper_report as canonical_paper_report
+from vcstudio.shared import config as shared_config
 
 
 # ── 假件工厂 ────────────────────────────────────────────────────────────────
@@ -20,12 +32,49 @@ def _fake_profiles(store):
     return m
 
 
+def _isolate_submit_reuse_gate(api):
+    """Keep legacy adapter/resource tests focused on their original seam."""
+    api._bind_reuse_execution_environment = lambda _dirs, _profile: None
+    api._reuse_submission_guard = lambda _dirs: None
+    return api
+
+
 def _fake_ledger(entries, removed):
     """entries: [(job_dir, manifest|None)];removed 收集 unregister 调用。"""
     m = types.SimpleNamespace()
     m.load_all = lambda: list(entries)
     m.unregister = lambda d: removed.append(d) or True
     return m
+
+
+def _attach_final_fetch_evidence(job_dir, data, names=None):
+    """Populate the same generation/hash contract written by final SFTP fetch."""
+    names = list(names or ('CONTCAR', 'OSZICAR', 'OUTCAR'))
+    token = cluster_submitter.current_attempt_token(data)
+    hashes, sizes = {}, {}
+    for name in names:
+        path = os.path.join(job_dir, *name.split('/'))
+        hashes[name] = _sha256_file(path)
+        sizes[name] = os.path.getsize(path)
+    data.setdefault('results', {}).update({
+        'fetched_at': 'now',
+        'fetched_state': 'DONE',
+        'fetched_job_id': str(data.get('scheduler_job_id') or ''),
+        'fetched_remote_dir': str(data.get('remote_dir') or ''),
+        'fetched_attempt_token': token,
+        'fetched': names,
+        'fetched_missing': [],
+        'fetch_requested': names,
+        'fetched_sha256': hashes,
+        'fetched_sizes': sizes,
+        'fetch_contract': {
+            'schema': 1, 'mode': 'final', 'state': 'DONE',
+            'scheduler_job_id': str(data.get('scheduler_job_id') or ''),
+            'remote_dir': str(data.get('remote_dir') or ''),
+            'attempt_token': token, 'requested': names,
+        },
+    })
+    return data
 
 
 # ── list_profiles ────────────────────────────────────────────────────────────
@@ -57,6 +106,49 @@ def test_save_profile_roundtrip_only_known_fields():
     assert not hasattr(store['c9'], 'bogus')
 
 
+def test_save_profile_roundtrips_engine_commands_and_normalizes_keys():
+    store = {}
+    api = Api(profiles_mod=_fake_profiles(store))
+
+    out = api.save_profile({
+        'name': 'multi',
+        'engine_commands': {
+            ' CP2K ': '  cp2k.psmp -i {input} -o {stem}.out  ',
+            'Gaussian': 'g16 < {input} > {stem}.log',
+        },
+    })
+
+    assert out['ok'] is True
+    assert store['multi'].engine_commands == {
+        'cp2k': 'cp2k.psmp -i {input} -o {stem}.out',
+        'gaussian': 'g16 < {input} > {stem}.log',
+    }
+    listed = api.list_profiles()['profiles'][0]
+    assert listed['engine_commands'] == store['multi'].engine_commands
+
+
+def test_save_profile_rejects_malformed_engine_commands():
+    store = {}
+    api = Api(profiles_mod=_fake_profiles(store))
+
+    out = api.save_profile({'name': 'bad', 'engine_commands': ['srun cp2k']})
+
+    assert out['ok'] is False and 'engine_commands' in out['error']
+    assert store == {}
+
+
+def test_legacy_profile_form_does_not_erase_engine_commands():
+    store = {'multi': ClusterProfile(
+        name='multi', hostname='old',
+        engine_commands={'cp2k': 'cp2k.psmp -i {input}'})}
+    api = Api(profiles_mod=_fake_profiles(store))
+
+    out = api.save_profile({'name': 'multi', 'hostname': 'new'})
+
+    assert out['ok'] is True and store['multi'].hostname == 'new'
+    assert store['multi'].engine_commands == {'cp2k': 'cp2k.psmp -i {input}'}
+
+
 def test_save_profile_rejects_blank_name():
     api = Api(profiles_mod=_fake_profiles({}))
     out = api.save_profile({'name': '  '})
@@ -77,11 +169,21 @@ def test_delete_profile_missing_is_ok_false():
     assert out['ok'] is False
 
 
+def test_save_profile_rejects_scheduler_without_execution_dialect():
+    store = {}
+    api = Api(profiles_mod=_fake_profiles(store))
+
+    out = api.save_profile({'name': 'lsf', 'scheduler': 'LSF'})
+
+    assert out['ok'] is False and 'Slurm / PBS' in out['error']
+    assert store == {}
+
+
 # ── test_connection ──────────────────────────────────────────────────────────
 def test_test_connection_saves_password_on_success():
     saved = {}
     secrets = types.SimpleNamespace(
-        get_password=lambda n: None,
+        get_password=lambda n: saved.get(n),
         set_password=lambda n, pw: saved.update({n: pw}))
     ssh = types.SimpleNamespace(check_connection=lambda prof, password, trust_new=False:
         types.SimpleNamespace(ok=True, message='ok', scheduler='PBS', needs_trust=False))
@@ -90,6 +192,20 @@ def test_test_connection_saves_password_on_success():
     out = api.test_connection('c1', 'pw123', False)
     assert out['ok'] is True and saved == {'c1': 'pw123'}
     assert out['scheduler'] == 'PBS' and out['needs_trust'] is False
+
+
+def test_test_connection_rejects_keyring_write_without_matching_readback():
+    secrets = types.SimpleNamespace(
+        get_password=lambda _n: None,
+        set_password=lambda _n, _pw: None)
+    ssh = types.SimpleNamespace(check_connection=lambda prof, password, trust_new=False:
+        types.SimpleNamespace(ok=True, message='ok', scheduler='PBS', needs_trust=False))
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='password')}
+    api = Api(profiles_mod=_fake_profiles(store), secrets_mod=secrets, ssh_test_mod=ssh)
+
+    out = api.test_connection('c1', 'pw123', False)
+
+    assert out['ok'] is False and '回读不一致' in out['message']
 
 
 def test_test_connection_failure_does_not_save():
@@ -132,6 +248,28 @@ def test_test_connection_unknown_profile_error():
     assert out['ok'] is False and '集群' in out['message']
 
 
+def test_test_connection_round_trips_exact_sha256_host_pin():
+    seen = {}
+    pin = {'host': 'bastion', 'fingerprint': 'SHA256:abc',
+           'algorithm': 'ssh-ed25519'}
+
+    def _check(_prof, _password, trust_new=False):
+        seen['trust_new'] = trust_new
+        return types.SimpleNamespace(
+            ok=False, message='请核对', scheduler='', needs_trust=True,
+            host='target', fingerprint='SHA256:def', algorithm='ssh-rsa')
+
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              ssh_test_mod=types.SimpleNamespace(check_connection=_check))
+    out = api.test_connection('c1', None, pin)
+
+    assert seen['trust_new'] is pin
+    assert out['needs_trust'] is True
+    assert (out['host'], out['fingerprint'], out['algorithm']) == (
+        'target', 'SHA256:def', 'ssh-rsa')
+
+
 # ── has_saved_password ───────────────────────────────────────────────────────
 def test_has_saved_password_true_and_false():
     secrets = types.SimpleNamespace(
@@ -171,6 +309,7 @@ def test_preview_script_build_failure_caught():
 def test_list_jobs_row_assembly_and_stale():
     m_done = {
         'state': 'DONE', 'task_type': 'relax', 'calc_type': 'slab',
+        'job_uuid': 'manifest-job-a',
         'cluster': 'c1', 'scheduler_job_id': '12345',
         'state_history': [{'at': '2026-07-14T10:00:00'}],
         'results': {'energy_e0_eV': -12.3456},
@@ -188,6 +327,8 @@ def test_list_jobs_row_assembly_and_stale():
     rows = {r['dir']: r for r in out['jobs']}
     a = rows['/jobs/a']
     assert a['name'] == 'a' and a['state'] == 'DONE' and a['task'] == 'relax/slab'
+    assert a['id'] == 'manifest-job-a' and a['job_uuid'] == 'manifest-job-a'
+    assert a['task_type'] == 'relax' and a['calc_type'] == 'slab' and a['engine'] == 'vasp'
     assert a['cluster'] == 'c1' and a['job_id'] == '12345'
     assert a['energy'] == '-12.3456' and a['updated'] == '2026-07-14T10:00:00'
     b = rows['/jobs/b']
@@ -270,8 +411,23 @@ def test_submit_jobs_delegates_to_batch_ops():
                                     'results': [(d, True, 'ok') for d in dirs]})
     store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key', key_path='/k')}
     api = Api(profiles_mod=_fake_profiles(store), batch_ops_mod=bo)
+    _isolate_submit_reuse_gate(api)
     out = api.submit_jobs(['/a', '/b'], 'c1', None, False)
     assert calls['dirs'] == ['/a', '/b'] and out['results'][0][1] is True
+
+
+def test_submit_jobs_passes_exact_host_pin_without_boolean_coercion():
+    seen = {}
+    pin = {'host': 'h', 'fingerprint': 'SHA256:abc', 'algorithm': 'ssh-ed25519'}
+    bo = types.SimpleNamespace(submit_batch=lambda _prof, _pw, _dirs, trust:
+        seen.update(trust=trust) or {'needs_trust': False, 'results': []})
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store), batch_ops_mod=bo)
+    _isolate_submit_reuse_gate(api)
+
+    api.submit_jobs(['/a'], 'c1', None, pin)
+
+    assert seen['trust'] is pin
 
 
 def test_unknown_profile_is_error_not_crash():
@@ -295,6 +451,7 @@ def test_submit_jobs_uses_saved_password():
     secrets = types.SimpleNamespace(get_password=lambda n: 'kr-pw', set_password=lambda n, pw: None)
     store = {'c1': ClusterProfile(name='c1', hostname='h', auth='password')}
     api = Api(profiles_mod=_fake_profiles(store), secrets_mod=secrets, batch_ops_mod=bo)
+    _isolate_submit_reuse_gate(api)
     out = api.submit_jobs(['/a'], 'c1', None, False)
     assert got['pw'] == 'kr-pw' and 'error' not in out
 
@@ -313,8 +470,112 @@ def test_submit_jobs_batch_ops_exception_caught():
         submit_batch=lambda prof, pw, dirs, tn: (_ for _ in ()).throw(RuntimeError('连不上')))
     store = {'c1': ClusterProfile(name='c1', auth='key', key_path='/k')}
     api = Api(profiles_mod=_fake_profiles(store), batch_ops_mod=bo)
+    _isolate_submit_reuse_gate(api)
     out = api.submit_jobs(['/a'], 'c1', None, False)
     assert '连不上' in out['error']
+
+
+def test_submit_jobs_idempotency_key_replays_without_second_remote_mutation():
+    calls = []
+    bo = types.SimpleNamespace(submit_batch=lambda _prof, _pw, dirs, _trust:
+        calls.append(list(dirs)) or {'needs_trust': False,
+                                     'results': [(dirs[0], True, 'ok')]})
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store), batch_ops_mod=bo)
+    _isolate_submit_reuse_gate(api)
+    key = 'jobop-fixed-submit-001'
+
+    first = api.submit_jobs(['/a'], 'c1', None, False, key)
+    replay = api.submit_jobs(['/a'], 'c1', None, False, key)
+
+    assert calls == [['/a']]
+    assert first['replayed'] is False and first['idempotency_key'] == key
+    assert replay['duplicate'] is True and replay['replayed'] is True
+    assert replay['results'] == first['results']
+
+
+def test_submit_jobs_idempotency_blocks_inflight_duplicate_and_payload_reuse():
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def _submit(_prof, _pw, dirs, _trust):
+        calls.append(list(dirs))
+        started.set()
+        assert release.wait(timeout=3)
+        return {'needs_trust': False, 'results': [(dirs[0], True, 'ok')]}
+
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              batch_ops_mod=types.SimpleNamespace(submit_batch=_submit))
+    _isolate_submit_reuse_gate(api)
+    key = 'jobop-inflight-submit-001'
+    result = {}
+    worker = threading.Thread(target=lambda: result.update(
+        api.submit_jobs(['/a'], 'c1', None, False, key)))
+    worker.start()
+    assert started.wait(timeout=3)
+
+    duplicate = api.submit_jobs(['/a'], 'c1', None, False, key)
+    conflict = api.submit_jobs(['/different'], 'c1', None, False, key)
+    release.set()
+    worker.join(timeout=3)
+
+    assert not worker.is_alive() and calls == [['/a']]
+    assert duplicate['busy'] is True and duplicate['duplicate'] is True
+    assert conflict['busy'] is False and conflict['duplicate'] is True
+    assert '不同' in conflict['error']
+    assert result['replayed'] is False
+
+
+def test_submit_jobs_host_trust_challenge_does_not_consume_idempotency_key():
+    calls = []
+
+    def _submit(_prof, _pw, dirs, trust):
+        calls.append(trust)
+        if not trust:
+            return {'needs_trust': True, 'results': [], 'host': 'h'}
+        return {'needs_trust': False, 'results': [(dirs[0], True, 'ok')]}
+
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              batch_ops_mod=types.SimpleNamespace(submit_batch=_submit))
+    _isolate_submit_reuse_gate(api)
+    key = 'jobop-trust-submit-001'
+
+    challenge = api.submit_jobs(['/a'], 'c1', None, False, key)
+    success = api.submit_jobs(['/a'], 'c1', None, {'fingerprint': 'SHA256:x'}, key)
+
+    assert challenge['needs_trust'] is True
+    assert calls == [False, {'fingerprint': 'SHA256:x'}]
+    assert success['replayed'] is False
+
+
+def test_submit_jobs_cross_process_busy_does_not_consume_idempotency_key():
+    calls = []
+
+    def _submit(_prof, _pw, dirs, _trust, *, idempotency_key=None):
+        calls.append((list(dirs), idempotency_key))
+        return {
+            'ok': False,
+            'needs_trust': False,
+            'busy': True,
+            'code': 'job_busy',
+            'busy_count': 1,
+            'results': [(dirs[0], False, 'busy')],
+        }
+
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              batch_ops_mod=types.SimpleNamespace(submit_batch=_submit))
+    _isolate_submit_reuse_gate(api)
+    key = 'jobop-cross-process-busy-001'
+
+    first = api.submit_jobs(['/a'], 'c1', None, False, key)
+    retry = api.submit_jobs(['/a'], 'c1', None, False, key)
+
+    assert first['busy'] is True and retry['busy'] is True
+    assert calls == [(['/a'], key), (['/a'], key)]
 
 
 # ── fetch_jobs / continue_jobs / queue_detail ────────────────────────────────
@@ -354,6 +615,29 @@ def test_continue_jobs_delegates():
     api = Api(profiles_mod=_fake_profiles(store), batch_ops_mod=bo)
     api.continue_jobs(['/a', '/b'], 'c1', None, False)
     assert calls['dirs'] == ['/a', '/b']
+
+
+def test_continue_jobs_sinks_operation_id_into_durable_batch_seam():
+    calls = {}
+
+    def _continue(_prof, _pw, dirs, _trust, *, idempotency_key=None,
+                  allow_round_limit_override=False):
+        calls.update(
+            dirs=list(dirs), idempotency_key=idempotency_key,
+            allow_round_limit_override=allow_round_limit_override)
+        return {'needs_trust': False, 'results': []}
+
+    store = {'c1': ClusterProfile(name='c1', auth='key', key_path='/k')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              batch_ops_mod=types.SimpleNamespace(continue_batch=_continue))
+    key = 'jobop-continue-api-contract-001'
+
+    api.continue_jobs(['/a'], 'c1', None, False, key)
+
+    assert calls == {
+        'dirs': ['/a'], 'idempotency_key': key,
+        'allow_round_limit_override': True,
+    }
 
 
 def test_continue_jobs_unknown_profile_error():
@@ -413,6 +697,78 @@ def test_refresh_status_unknown_profile_error():
     assert out.get('error') and '集群' in out['error']
 
 
+def test_manual_refresh_does_not_race_background_pipeline():
+    api = Api(profiles_mod=_fake_profiles({}), ledger_mod=_fake_ledger([], []))
+    assert api._pipeline_lock.acquire(blocking=False)
+    try:
+        one = api.refresh_status('c1', None, False)
+        all_profiles = api.refresh_all_status()
+    finally:
+        api._pipeline_lock.release()
+
+    assert one['busy'] is True and '后台自动托管' in one['error']
+    assert all_profiles['busy'] is True and '后台自动托管' in all_profiles['error']
+
+
+def test_refresh_all_status_monitors_all_active_servers_and_isolates_failure():
+    entries = [
+        ('/a', {'scheduler_job_id': '1', 'cluster': 'c1', 'state': 'RUNNING'}),
+        ('/b', {'scheduler_job_id': '2', 'cluster': 'c2', 'state': 'QUEUED'}),
+        ('/done', {'scheduler_job_id': '3', 'cluster': 'c3', 'state': 'DONE'}),
+    ]
+
+    def _refresh(prof, _pw, dirs, _trust):
+        if prof.name == 'c2':
+            raise RuntimeError('c2 暂时断线')
+        return {'needs_trust': False, 'results': [(dirs[0], 'RUNNING')]}
+
+    store = {name: ClusterProfile(name=name, auth='key', key_path='/k')
+             for name in ('c1', 'c2', 'c3')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              batch_ops_mod=types.SimpleNamespace(refresh_batch=_refresh),
+              ledger_mod=_fake_ledger(entries, []))
+
+    out = api.refresh_all_status()
+
+    assert [row['name'] for row in out['profiles']] == ['c1', 'c2']
+    assert out['profiles'][0]['results'] == [('/a', 'RUNNING')]
+    assert '断线' in out['profiles'][1]['error']
+    assert out['results'] == [{'cluster': 'c1', 'result': ('/a', 'RUNNING')}]
+    assert out['ok'] is False and len(out['errors']) == 1
+
+
+def test_refresh_all_status_exposes_host_key_confirmation_instead_of_silence():
+    entries = [('/a', {'scheduler_job_id': '1', 'cluster': 'c1', 'state': 'RUNNING'})]
+    bo = types.SimpleNamespace(refresh_batch=lambda *a, **k: {
+        'needs_trust': True, 'results': [], 'fingerprint': 'SHA256:abc',
+        'algorithm': 'ssh-ed25519', 'host': 'h:22',
+    })
+    store = {'c1': ClusterProfile(name='c1', auth='key', key_path='/k')}
+    api = Api(profiles_mod=_fake_profiles(store), batch_ops_mod=bo,
+              ledger_mod=_fake_ledger(entries, []))
+
+    out = api.refresh_all_status()
+
+    row = out['profiles'][0]
+    assert row['ok'] is False and row['needs_trust'] is True
+    assert row['error'] == 'HOST_KEY_CONFIRMATION_REQUIRED'
+    assert row['fingerprint'] == 'SHA256:abc'
+    assert out['ok'] is False and out['errors']
+
+
+def test_refresh_all_status_reports_active_job_whose_profile_was_deleted():
+    entries = [('/lost', {
+        'scheduler_job_id': '7', 'cluster': 'old-server', 'state': 'QUEUED'})]
+    api = Api(profiles_mod=_fake_profiles({}),
+              ledger_mod=_fake_ledger(entries, []))
+
+    out = api.refresh_all_status()
+
+    assert out['ok'] is False
+    assert out['profiles'][0]['name'] == 'old-server'
+    assert '删除或改名' in out['profiles'][0]['error']
+
+
 # ── adopt_job ────────────────────────────────────────────────────────────────
 def test_adopt_job_delegates():
     calls = {}
@@ -423,6 +779,17 @@ def test_adopt_job_delegates():
     out = api.adopt_job('/local', 'c1', '777', '/remote/dir', 'myjob')
     assert out['ok'] is True
     assert calls == {'local': '/local', 'jid': '777', 'remote': '/remote/dir', 'name': 'myjob'}
+
+
+def test_adopt_job_passes_explicit_task_type():
+    calls = {}
+    sub = types.SimpleNamespace(adopt_external_job=lambda *args, **kwargs:
+                                calls.update(kwargs) or {'state': 'SUBMITTED'})
+    api = Api(profiles_mod=_fake_profiles({'c1': ClusterProfile(name='c1')}),
+              submitter_mod=sub)
+    out = api.adopt_job('/local', 'c1', '778', '/remote/dir', 'dosjob', 'dos')
+    assert out['ok'] is True
+    assert calls['name'] == 'dosjob' and calls['task_type'] == 'dos'
 
 
 def test_adopt_job_unknown_profile_error():
@@ -705,6 +1072,172 @@ def _fake_report_full(*, member_dirs=None, report_ret='/out/报告.html', calls=
     return m
 
 
+def _fake_result_import(*, scan_ret=None, commit_ret=None, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _scan(root):
+        calls['scan'] = root
+        return dict(scan_ret or {'ok': True, 'source_root': root, 'candidates': [],
+                                 'summary': {'total': 0}, 'suggested_name': 'demo'})
+
+    def _commit(source, target, name, selections, **kwargs):
+        calls['commit'] = {'source': source, 'target': target, 'name': name,
+                           'selections': selections, **kwargs}
+        return dict(commit_ret or {'ok': True, 'project_path': '/managed/project.yaml',
+                                   'imported': [], 'summary': {'total': 0}})
+
+    m.scan_folder = _scan
+    m.commit_import = _commit
+    return m
+
+
+# ── 本地已算结果导入（扫描只读 / 提交重新校验）────────────────
+def test_proj_import_scan_forwards_structured_preview():
+    calls = {}
+    candidate = {'path': '/raw/Li2S8', 'state_suggestion': 'DONE'}
+    ri = _fake_result_import(
+        scan_ret={'ok': True, 'source_root': '/raw', 'candidates': [candidate],
+                  'summary': {'total': 1, 'done': 1}, 'suggested_name': 'LiS'}, calls=calls)
+    api = Api(result_import_mod=ri)
+
+    out = api.proj_import_scan(' /raw ')
+
+    assert out['ok'] is True and out['candidates'] == [candidate]
+    assert out['summary']['done'] == 1 and out['error'] is None
+    assert calls['scan'] == '/raw'
+
+
+def test_proj_import_scan_validation_and_exception_are_json_safe():
+    api = Api(result_import_mod=_fake_result_import())
+    assert api.proj_import_scan('')['ok'] is False
+    boom = types.SimpleNamespace(
+        scan_folder=lambda _root: (_ for _ in ()).throw(RuntimeError('输出损坏')))
+    out = Api(result_import_mod=boom).proj_import_scan('/raw')
+    assert out['ok'] is False and '输出损坏' in out['error']
+
+
+def test_proj_import_commit_passes_full_selection_and_injected_modules():
+    calls = {}
+    selections = [
+        {'path': '/raw/slab', 'selected': True, 'role': 'clean_slab',
+         'task_type': 'relax', 'manual_confirm': False},
+        {'path': '/raw/skip', 'selected': False, 'role': 'config',
+         'task_type': 'static', 'manual_confirm': False},
+    ]
+    ri = _fake_result_import(calls=calls)
+    ads = _fake_adsorption()
+    ledger = _fake_ledger([], [])
+    manifest = types.SimpleNamespace()
+    api = Api(result_import_mod=ri, adsorption_mod=ads,
+              ledger_mod=ledger, manifest_mod=manifest)
+
+    out = api.proj_import_commit('/raw', '/managed', 'demo', selections)
+
+    assert out['ok'] is True and out['error'] is None
+    got = calls['commit']
+    assert got['selections'] == selections
+    assert got['adsorption_mod'] is ads and got['ledger_mod'] is ledger
+    assert got['manifest_mod'] is manifest
+
+
+def test_proj_import_commit_uses_actual_bundle_reason_after_preflight_changes(tmp_path):
+    members = [str(tmp_path / name) for name in ('clean', 'config')]
+    project_path = str(tmp_path / 'project.yaml')
+    project = {
+        'name': 'imported', 'root': str(tmp_path),
+        'members': {'clean_slab': members[0], 'gas_ref': None,
+                    'configs': [members[1]]},
+    }
+    result_import = types.SimpleNamespace(commit_import=lambda *_args, **_kwargs: {
+        'ok': True, 'project': project, 'project_path': project_path,
+        'imported': [], 'summary': {},
+    })
+    adsorption = _fake_adsorption(delta_ret={'rows': []})
+    adsorption.save_project = lambda *_args: None
+    manifests = {path: {'state': 'DONE', 'results': {}} for path in members}
+    api = Api(
+        result_import_mod=result_import,
+        adsorption_mod=adsorption,
+        manifest_mod=_fake_manifest_mod(manifests),
+        ledger_mod=_fake_ledger([], []),
+    )
+    api._final_report_gate = lambda *_args: (True, '')
+    marker = {'kind': 'diagnostic'}
+    api._proj_report_bundle_for_path = lambda *_args, **_kwargs: {
+        'ok': True,
+        'kind': 'diagnostic',
+        'scientific_status': 'diagnostic',
+        'gate_reason': '实际 bundle 发现参考态已变化',
+        'marker': marker,
+        'files': {'html': str(tmp_path / 'diagnostic.html')},
+        'error': None,
+    }
+
+    out = api.proj_import_commit(
+        '/raw', str(tmp_path), 'imported',
+        [{'path': '/raw/config', 'selected': True, 'role': 'config'}])
+
+    assert out['ok'] is True
+    assert out['auto_report_reason'] == '实际 bundle 发现参考态已变化'
+    assert out['auto_report_blocked'] == marker
+
+
+def test_proj_import_auto_report_uses_only_proven_available_formats(tmp_path):
+    members = [str(tmp_path / name) for name in ('clean', 'config')]
+    project_path = str(tmp_path / 'project.yaml')
+    project = {
+        'name': 'imported', 'root': str(tmp_path),
+        'members': {'clean_slab': members[0], 'gas_ref': None,
+                    'configs': [members[1]]},
+    }
+    result_import = types.SimpleNamespace(commit_import=lambda *_args, **_kwargs: {
+        'ok': True, 'project': project, 'project_path': project_path,
+        'imported': [], 'summary': {},
+    })
+    paper = types.SimpleNamespace(report_capabilities=lambda: {
+        'formats': {
+            'html': {'available': True, 'reason': ''},
+            'docx': {'available': False, 'reason': 'python-docx unavailable'},
+            'pdf': {'available': False, 'reason': 'PDF backend unavailable'},
+        },
+    })
+    adsorption = _fake_adsorption(delta_ret={'rows': []})
+    adsorption.save_project = lambda *_args: None
+    api = Api(
+        result_import_mod=result_import,
+        adsorption_mod=adsorption,
+        manifest_mod=_fake_manifest_mod({
+            path: {'state': 'DONE', 'results': {}} for path in members}),
+        ledger_mod=_fake_ledger([], []),
+        paper_report_mod=paper,
+    )
+    captured = {}
+    api._proj_report_bundle_for_path = lambda _path, _out, formats=None, **_kwargs: (
+        captured.update(formats=tuple(formats or ())) or {
+            'ok': True, 'kind': 'diagnostic',
+            'scientific_status': 'diagnostic', 'gate_reason': '参考态缺失',
+            'marker': {'kind': 'diagnostic'}, 'files': {'html': 'report.html'},
+            'error': None,
+        })
+
+    out = api.proj_import_commit(
+        '/raw', str(tmp_path), 'imported',
+        [{'path': '/raw/config', 'selected': True, 'role': 'config'}])
+
+    assert out['ok'] is True
+    assert captured['formats'] == ('html',)
+    assert out['auto_report']['ok'] is True
+
+
+def test_proj_import_commit_requires_selected_nonignored_item():
+    api = Api(result_import_mod=_fake_result_import())
+    out = api.proj_import_commit('/raw', '/managed', 'demo', [
+        {'path': '/raw/x', 'selected': False, 'role': 'config'},
+    ])
+    assert out['ok'] is False and '至少选择' in out['error']
+
+
 # ── proj_list ────────────────────────────────────────────────────────────────
 def test_proj_list_assembles_path_name_members():
     proj = {'name': 'demo', 'members': {'clean_slab': '/s', 'gas_ref': None,
@@ -715,8 +1248,12 @@ def test_proj_list_assembles_path_name_members():
     api = Api(adsorption_mod=ads, report_full_mod=rf)
     out = api.proj_list()
     assert out['error'] is None
-    assert out['projects'] == [{'path': '/p/project.yaml', 'name': 'demo',
-                                'n_members': 3}]
+    assert out['projects'] == [{
+        'project_id': out['projects'][0]['project_id'],
+        'name': 'demo', 'n_members': 3, 'n_done': 0,
+        'reference_mode': 'none', 'reference_species': [], 'n_species_refs': 0,
+    }]
+    assert out['projects'][0]['project_id'].startswith('registry-')
 
 
 def test_proj_list_counts_members_inline_without_report_full():
@@ -732,8 +1269,24 @@ def test_proj_list_counts_members_inline_without_report_full():
     api = Api(adsorption_mod=ads, report_full_mod=boom_rf)
     out = api.proj_list()
     assert out['error'] is None
-    assert out['projects'] == [{'path': '/p/project.yaml', 'name': 'demo',
-                                'n_members': 3}]
+    assert out['projects'] == [{
+        'project_id': out['projects'][0]['project_id'],
+        'name': 'demo', 'n_members': 3, 'n_done': 0,
+        'reference_mode': 'none', 'reference_species': [], 'n_species_refs': 0,
+    }]
+    assert out['projects'][0]['project_id'].startswith('registry-')
+
+
+def test_proj_list_exposes_reference_species_for_lis_builder():
+    proj = {'name': 'refs', 'members': {'clean_slab': None, 'configs': []},
+            'species_ref_jobs': {'S8': '/m/S8', 'Li2S8': '/m/Li2S8'}}
+    api = Api(adsorption_mod=_fake_adsorption(
+        projects=['/refs/project.yaml'], proj_map={'/refs/project.yaml': proj}))
+
+    row = api.proj_list()['projects'][0]
+
+    assert row['reference_species'] == ['Li2S8', 'S8']
+    assert row['n_species_refs'] == 2
 
 
 def test_proj_list_skips_unloadable_and_catches_error():
@@ -741,7 +1294,8 @@ def test_proj_list_skips_unloadable_and_catches_error():
         list_projects=lambda *a, **k: (_ for _ in ()).throw(RuntimeError('注册表坏了')))
     api = Api(adsorption_mod=boom, report_full_mod=_fake_report_full())
     out = api.proj_list()
-    assert out['projects'] == [] and '注册表坏了' in out['error']
+    assert out['projects'] == []
+    assert out['error'] == 'The registered project list is unavailable.'
 
 
 # ── proj_create ──────────────────────────────────────────────────────────────
@@ -753,17 +1307,21 @@ def test_proj_create_mirrors_on_generate_params_and_transforms(tmp_path):
     calls = {}
     create_ret = {
         'ok': True, 'project_path': str(tmp_path / 'demo' / 'project.yaml'),
+        'project': {'name': 'demo', 'members': {
+            'clean_slab': '/s', 'gas_ref': None, 'configs': ['/c1', '/c2']}},
         'generated': [('demo_ads_x', '/o/x', ['偶极建议'])],
         'errors': [('demo_ads_bad', 'POTCAR 缺 Ta')],       # 坏构型 → warnings,不整体失败
         'advisories': [('P1', 'ENCUT', '建议统一 ENCUT=400')],
     }
     ads = _fake_adsorption(create_ret=create_ret, calls=calls)
+    ads.save_project = lambda *_args: None
     api = Api(adsorption_mod=ads, report_full_mod=_fake_report_full(),
               config_mod=_fake_config(cfg={'potcar_lib_root': '/lib'}))
     out = api.proj_create('demo', str(slab), ['/c1', '/c2'], str(incar), '',
                           str(tmp_path))
     assert out['ok'] is True
-    assert out['project_path'] == str(tmp_path / 'demo' / 'project.yaml')
+    assert out['project_id'].startswith('registry-') and out['name'] == 'demo'
+    assert 'project_path' not in out
     assert out['error'] is None
     # 参数顺序/键忠实镜像 _on_generate → create_project
     c = calls['create']
@@ -790,7 +1348,8 @@ def test_proj_create_validation_error_short_circuits(tmp_path):
         AssertionError('不应生成'))
     out = api.proj_create('demo', '/no/such/slab', ['/c1'], str(incar), '',
                           str(tmp_path))
-    assert out['ok'] is False and out['project_path'] is None
+    assert out['ok'] is False and out['project_id'] is None
+    assert 'project_path' not in out
     assert '清洁表面' in out['error']
 
 
@@ -804,27 +1363,37 @@ def test_proj_create_exception_is_caught(tmp_path):
         RuntimeError('赝势缺失'))
     api = Api(adsorption_mod=ads, config_mod=_fake_config())
     out = api.proj_create('demo', str(slab), ['/c1'], str(incar), '', str(tmp_path))
-    assert out['ok'] is False and out['project_path'] is None
+    assert out['ok'] is False and out['project_id'] is None
+    assert 'project_path' not in out
     assert '赝势缺失' in out['error']
 
 
 # ── proj_delta ───────────────────────────────────────────────────────────────
-def test_proj_delta_passes_through_rows_and_gating():
+def test_proj_delta_passes_through_rows_and_gating(tmp_path):
     proj = {'name': 'demo', 'members': {}}
+    reference_job = tmp_path / 'private-reference-job'
+    reference_job.mkdir()
     delta_ret = {
         'slab': ('DONE', -12.5), 'ref': ('无', None), 'has_ref': False,
         'rows': [
             {'name': 'demo_ads_a', 'state': 'DONE', 'e_config': -20.0,
-             'delta_e': -2.5, 'note': ''},
+             'delta_e': -2.5, 'note': '', 'reference_state': 'DONE',
+             'reference_job': str(reference_job),
+             'reference_valid': True, 'reference_note': '清单与作业能量一致'},
             {'name': 'demo_ads_b', 'state': 'RUNNING', 'e_config': None,
              'delta_e': None, 'note': '构型未完成'},
         ],
     }
     ads = _fake_adsorption(proj_map={'/p': proj}, delta_ret=delta_ret)
     api = Api(adsorption_mod=ads, report_full_mod=_fake_report_full())
-    out = api.proj_delta('/p')
+    out = api._proj_delta_for_path('/p')
     assert out['ok'] is True and out['error'] is None
     assert out['rows'][0]['delta_e'] == -2.5
+    assert out['rows'][0]['reference_state'] == 'DONE'
+    assert out['rows'][0]['reference_valid'] is True
+    assert out['rows'][0]['reference_job'].startswith('job-')
+    assert str(tmp_path) not in json.dumps(out)
+    assert '一致' in out['rows'][0]['reference_note']
     assert out['rows'][1]['delta_e'] is None and '构型未完成' in out['rows'][1]['note']
     assert '清洁表面' in out['note']
 
@@ -832,7 +1401,7 @@ def test_proj_delta_passes_through_rows_and_gating():
 def test_proj_delta_missing_project_error():
     ads = _fake_adsorption(proj_map={})
     api = Api(adsorption_mod=ads, report_full_mod=_fake_report_full())
-    out = api.proj_delta('/gone')
+    out = api._proj_delta_for_path('/gone')
     assert out['ok'] is False and out['rows'] == []
     assert '项目' in out['error']
 
@@ -844,7 +1413,7 @@ def test_proj_export_csv_delegates():
     ads = _fake_adsorption(proj_map={'/p': proj}, delta_ret={'rows': []},
                            csv_ret='/save/demo.csv', calls=calls)
     api = Api(adsorption_mod=ads, report_full_mod=_fake_report_full())
-    out = api.proj_export_csv('/p', '/save/demo.csv')
+    out = api._proj_export_csv_for_path('/p', '/save/demo.csv')
     assert out['ok'] is True and out['file'] == '/save/demo.csv'
     assert out['error'] is None and calls['export']['out'] == '/save/demo.csv'
 
@@ -852,32 +1421,56 @@ def test_proj_export_csv_delegates():
 def test_proj_export_csv_missing_project_error():
     ads = _fake_adsorption(proj_map={})
     api = Api(adsorption_mod=ads, report_full_mod=_fake_report_full())
-    out = api.proj_export_csv('/gone', '/save/x.csv')
+    out = api._proj_export_csv_for_path('/gone', '/save/x.csv')
     assert out['ok'] is False and out['file'] is None and '项目' in out['error']
 
 
 # ── proj_report ──────────────────────────────────────────────────────────────
-def test_proj_report_generates_via_report_full():
-    proj = {'name': 'demo', 'members': {}}
+def test_proj_report_is_legacy_shape_adapter_for_canonical_bundle(tmp_path):
     calls = {}
-    ads = _fake_adsorption(proj_map={'/p': proj})
-    rf = _fake_report_full(member_dirs=['/s', '/c1'],
-                           report_ret='/save/报告.html', calls=calls)
-    api = Api(adsorption_mod=ads, report_full_mod=rf,
-              config_mod=_fake_config(cfg={'k': 'v'}))
-    out = api.proj_report('/p', '/save/报告.html')
-    assert out['ok'] is True and out['file'] == '/save/报告.html'
-    assert calls['report']['out'] == '/save/报告.html'
-    assert calls['report']['config'] == {'k': 'v'} and calls['report']['proj'] is proj
+    legacy = types.SimpleNamespace(
+        generate_project_report=lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError('legacy report_full renderer must not be called')))
+    api = Api(report_full_mod=legacy)
+
+    def _bundle(path, out_dir, formats=None, final=True, stem=None):
+        calls.update(path=path, out_dir=out_dir, formats=formats,
+                     final=final, stem=stem)
+        html = os.path.join(out_dir, f'{stem}.html')
+        return {
+            'ok': True, 'kind': 'diagnostic',
+            'scientific_status': 'diagnostic',
+            'scientific_qualification': 'diagnostic',
+            'artifact_status': 'complete', 'gate_reason': 'manual draft',
+            'marker': {'kind': 'diagnostic'}, 'files': {'html': html},
+            'error': None,
+        }
+
+    api._proj_report_bundle_for_path = _bundle
+    requested = tmp_path / '报告.html'
+    out = api._proj_report_for_path('/p', str(requested), final=False)
+
+    assert out['ok'] is True and out['file'] == str(requested)
+    assert out['files'] == [str(requested)]
+    assert calls == {
+        'path': '/p', 'out_dir': str(tmp_path), 'formats': ('html',),
+        'final': False, 'stem': '报告',
+    }
+    assert out['kind'] == out['scientific_status'] == 'diagnostic'
+    assert out['gate_reason'] == 'manual draft'
 
 
-def test_proj_report_no_members_error():
-    proj = {'name': 'demo', 'members': {}}
-    ads = _fake_adsorption(proj_map={'/p': proj})
-    rf = _fake_report_full(member_dirs=[])       # 无成员作业
-    api = Api(adsorption_mod=ads, report_full_mod=rf, config_mod=_fake_config())
-    out = api.proj_report('/p', '/save/x.html')
-    assert out['ok'] is False and out['file'] is None and '成员' in out['error']
+def test_proj_report_maps_canonical_bundle_failure_to_legacy_shape(tmp_path):
+    api = Api()
+    api._proj_report_bundle_for_path = lambda *_a, **_k: {
+        'ok': False, 'kind': None, 'files': {}, 'marker': None,
+        'error': '项目无成员作业',
+    }
+
+    out = api._proj_report_for_path('/p', str(tmp_path / 'x.html'))
+
+    assert out['ok'] is False and out['file'] is None and out['files'] == []
+    assert '成员' in out['error']
 
 
 # ── adopt_root_get / adopt_root_set(认领本地根目录配置) ──────────────────────
@@ -930,9 +1523,10 @@ def test_adopt_all_delegates_with_known_ids_and_root():
         calls.update(known=known, root=root, tn=tn) or
         {'needs_trust': False, 'results': [['200', True, '已认领 → X']]})
     entries = [
-        ('/a', {'scheduler_job_id': '100'}),
-        ('/b', {'scheduler_job_id': '200'}),
-        ('/c', {'state': 'DONE'}),                       # 无作业号 → 不入 known
+        ('/a', {'scheduler_job_id': '100', 'cluster': 'c1'}),
+        ('/b', {'scheduler_job_id': '200', 'cluster': 'c1'}),
+        ('/other-server', {'scheduler_job_id': '200', 'cluster': 'c2'}),
+        ('/c', {'state': 'DONE', 'cluster': 'c1'}),      # 无作业号 → 不入 known
         ('/gone', None),                                 # 失效条目 → 不入 known
     ]
     store = {'c1': ClusterProfile(name='c1', auth='key', key_path='/k')}
@@ -1266,6 +1860,168 @@ def _delta(names_to_de, slab=('DONE', -100.0)):
     return {'slab': slab, 'ref': ('无', None), 'has_ref': False, 'rows': rows}
 
 
+def _science_delta(name, *, method='verified', has_ref=True, values=None):
+    """Candidate/comparison summary with explicit method and reference evidence."""
+    values = values or {
+        'Li2S8': [-1.04],
+        'Li2S6': [-1.14],
+        'Li2S4': [-1.23],
+        'Li2S2': [-2.09],
+        'Li2S': [-2.81],
+    }
+    rows = []
+    for species, energies in values.items():
+        for index, value in enumerate(energies):
+            rows.append({
+                'name': f'{name}_{species}_{index}',
+                'species': species,
+                'state': 'DONE',
+                'e_config': -110.0 + value,
+                'delta_e': value,
+                'note': '',
+                'reference_valid': has_ref,
+                'method_check': {'status': method},
+            })
+    return {
+        'slab': ('DONE', -100.0),
+        'ref': (('DONE', -10.0) if has_ref else ('无', None)),
+        'has_ref': has_ref,
+        'reference_mode': 'species' if has_ref else 'none',
+        'method_consistency': {
+            'status': method,
+            'issues': [],
+            'warnings': ['方法证据待核验'] if method == 'unverified' else [],
+        },
+        'rows': rows,
+    }
+
+
+def _fake_paper_report(calls):
+    """Capture the semantic model without invoking DOCX/PDF/HTML renderers."""
+    def _render(model, out_dir, *, stem, formats):
+        calls.append({
+            'model': copy.deepcopy(model),
+            'out_dir': str(out_dir),
+            'stem': stem,
+            'formats': tuple(formats),
+        })
+        return {
+            'ok': True,
+            'files': {'html': os.path.join(str(out_dir), f'{stem}.html')},
+            'assets': [],
+        }
+
+    return types.SimpleNamespace(
+        render_report_bundle=_render,
+        report_content_sha256=lambda _model, **_kwargs: 'd' * 64,
+    )
+
+
+def _fake_lis_freeenergy():
+    """Return one comparable Li-S path per project with an authoritative U_L."""
+    def _path(_rows, *, e_slab, molecules_dir, project=None, **_kwargs):
+        del e_slab, molecules_dir
+        name = str((project or {}).get('name') or 'M0')
+        index = int(name.removeprefix('M')) if name.removeprefix('M').isdigit() else 0
+        return {
+            'steps': [
+                {'label': 'S8*', 'G': 0.0},
+                {'label': 'Li2S4*', 'G': -0.5 - 0.01 * index},
+                {'label': 'Li2S*', 'G': -1.0 - 0.02 * index},
+            ],
+            'pds_index': 1,
+            'u_l': round(1.20 + 0.05 * index, 3),
+            'thermo_corrected': True,
+            'solvation_corrected': True,
+            'reference': 'Li/Li+',
+        }
+
+    return types.SimpleNamespace(path_from_project_and_molecules=_path)
+
+
+def test_proj_evaluate_candidate_returns_advance_and_blocked_json():
+    projects = {
+        '/advance': {
+            'name': 'Fe@B1N3', 'root': '/data/advance',
+            'project_uuid': 'advance-id',
+        },
+        '/blocked': {
+            'name': 'missing-reference', 'root': '/data/blocked',
+            'project_uuid': 'blocked-id',
+        },
+    }
+    summaries = {
+        'Fe@B1N3': _science_delta('Fe'),
+        'missing-reference': _science_delta('blocked', has_ref=False),
+    }
+    ads = _fake_adsorption(proj_map=projects)
+    ads.delta_e_rows = lambda project: summaries[project['name']]
+    api = Api(adsorption_mod=ads, config_mod=_fake_config())
+
+    advance = api._proj_evaluate_candidate_for_path('/advance')
+    blocked = api._proj_evaluate_candidate_for_path('/blocked')
+
+    assert advance['ok'] is True and advance['error'] is None
+    assert advance['evaluation']['decision']['priority'] == 'advance'
+    assert advance['evaluation']['candidate']['name'] == 'Fe@B1N3'
+    assert blocked['ok'] is True and blocked['error'] is None
+    assert blocked['evaluation']['decision']['priority'] == 'blocked'
+    assert 'ADSORBATE_REFERENCE_MISSING' in (
+        blocked['evaluation']['audit']['reason_codes'])
+    # pywebview 返回值必须能直接进入 JSON，不能泄漏 Path/集合等 Python 对象。
+    json.dumps({'advance': advance, 'blocked': blocked}, ensure_ascii=False)
+
+
+def test_proj_compare_preview_keeps_moved_project_and_canonical_stable_matrix():
+    projects = {
+        '/a': {
+            'name': 'A', 'root': '/data/a', 'project_uuid': 'a-id',
+            'comparison_method_fingerprint': 'same-method',
+        },
+        '/b': {
+            'name': 'B', 'root': '/data/b', 'project_uuid': 'b-id',
+            'comparison_method_fingerprint': 'same-method',
+        },
+    }
+    summaries = {
+        'A': _science_delta('A', values={
+            'Li₂S₈': [-1.10, -1.20],
+            'Li₂S': [-2.10],
+        }),
+        'B': _science_delta('B', values={
+            'Li2S8': [-0.90],
+            'Li₂S': [-2.40],
+        }),
+    }
+    ads = _fake_adsorption(proj_map=projects)
+    ads.delta_e_rows = lambda project: summaries[project['name']]
+    api = Api(adsorption_mod=ads, config_mod=_fake_config())
+
+    out = api._proj_compare_preview_for_paths(['/a', '/moved/project.yaml', '/b'])
+
+    assert out['ok'] is True and out['selected_count'] == 3
+    assert out['ready_count'] == 2
+    assert [project['path'] for project in out['projects']] == [
+        '/a', '/moved/project.yaml', '/b',
+    ]
+    moved = out['projects'][1]
+    assert moved['status'] == 'blocked'
+    assert '已被移动' in moved['block_reasons'][0]
+    assert out['adsorption_matrix'] == {
+        'rows': ['A', 'B'],
+        'cols': ['Li2S8', 'Li2S'],
+        'values': [[-1.2, -2.1], [-0.9, -2.4]],
+    }
+    selected_a = {row['species']: row for row in out['projects'][0]['species']}
+    assert selected_a['Li2S8']['name'] == 'A_Li₂S₈_1'
+    assert selected_a['Li2S8']['co_minima'] == [{
+        'name': 'A_Li₂S₈_0',
+        'job': '',
+        'delta_e': -1.1,
+        'dd_e': 0.1,
+    }]
+
+
 def test_proj_figures_bar_table_with_short_names(tmp_path):
     calls = {}
     proj = _proj('liS', str(tmp_path))
@@ -1274,7 +2030,7 @@ def test_proj_figures_bar_table_with_short_names(tmp_path):
                                              'liS_ads_Li2S2': None}))
     api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
               config_mod=_fake_config())
-    out = api.proj_figures('/p/project.yaml', ['bar', 'table'])
+    out = api._proj_figures_for_path('/p/project.yaml', ['bar', 'table'])
     assert out['ok'] is True and len(out['files']) == 2
     # 短名剥前缀 + 只收已完成 ΔE
     data = calls['bar'][0]['data']
@@ -1284,13 +2040,88 @@ def test_proj_figures_bar_table_with_short_names(tmp_path):
     assert out['out_dir'] == str(tmp_path / 'figures')
 
 
+def test_default_and_preset_ladders_share_filtered_thermo_corrections(
+        tmp_path, monkeypatch):
+    from vcstudio.project import thermo
+
+    molecules = tmp_path / 'molecules'
+    molecules.mkdir()
+    freq_dirs = {
+        'Li2S8': str(tmp_path / 'freq-Li2S8'),
+        'Li2S': str(tmp_path / 'freq-Li2S'),
+        'missing': str(tmp_path / 'freq-missing'),
+    }
+    monkeypatch.setattr(thermo, 'load_corrections', lambda _dirs: {
+        'Li2S8': {'g_corr': 0.123, 'excluded': False},
+        'Li2S': {
+            'g_corr': 0.456,
+            'excluded': True,
+            'exclude_reason': '存在大虚频',
+        },
+    })
+    calls = {}
+
+    def _lis_path(_rows, **kwargs):
+        calls['default'] = kwargs.get('g_corr')
+        return {
+            'steps': [{'label': 'S8*', 'G': 0.0}, {'label': 'Li2S8*', 'G': -0.1}],
+            'thermo_corrected': bool(kwargs.get('g_corr')),
+        }
+
+    def _preset_path(_spec, _energies, **kwargs):
+        calls['preset'] = kwargs.get('g_corr')
+        return {
+            'steps': [{'label': '*', 'G': 0.0}, {'label': 'Li2S8*', 'G': -0.2}],
+            'thermo_corrected': bool(kwargs.get('g_corr')),
+        }
+
+    freeenergy = types.SimpleNamespace(
+        path_from_project_and_molecules=_lis_path,
+        load_molecule_energies=lambda _path: {},
+        free_energy_path=_preset_path,
+    )
+    reactions = types.SimpleNamespace(get_preset=lambda _key: {
+        'name': 'test',
+        'description': 'test path',
+        'electrode': 'none',
+        'steps': [{'species': '*'}, {'species': 'Li2S8*'}],
+    })
+    api = Api(
+        freeenergy_mod=freeenergy,
+        reactions_mod=reactions,
+        config_mod=_fake_config(cfg={'freq_dirs': freq_dirs}),
+    )
+    project = {'name': 'P', 'molecules_dir': str(molecules)}
+    summary = {
+        'slab': ('DONE', -100.0),
+        'rows': [{
+            'name': 'P_ads_Li2S8_top',
+            'state': 'DONE',
+            'e_config': -110.0,
+        }],
+    }
+
+    default, default_reason = api._proj_fed(project, summary)
+    preset, preset_reason, _title = api._proj_fed_preset(project, summary, 'test')
+
+    assert default_reason is None and preset_reason is None
+    assert calls['default'] == {'Li2S8': 0.123}
+    assert calls['preset'] == {'Li2S8*': 0.123}
+    assert default['thermo_correction_fingerprint']
+    assert preset['thermo_correction_fingerprint']
+    assert default['temperature_K'] == thermo.DEFAULT_T
+    assert preset['temperature_K'] == thermo.DEFAULT_T
+    assert any('大虚频' in warning for warning in preset['warnings'])
+    assert any('没有可用振动证据' in warning for warning in default['warnings'])
+
+
 def test_proj_figures_no_done_rows_all_skipped(tmp_path):
     calls = {}
     ads = _fake_adsorption(proj_map={'/p': _proj('x', str(tmp_path))},
                            delta_ret=_delta({'x_ads_a': None}))
     api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
               config_mod=_fake_config())
-    out = api.proj_figures('/p', ['bar', 'table'])
+    out = api._proj_figures_for_path('/p', ['bar', 'table'])
     assert out['ok'] is True and out['files'] == []
     assert {s['kind'] for s in out['skipped']} == {'bar', 'table'}
     assert 'bar' not in calls
@@ -1304,18 +2135,48 @@ def test_proj_figures_ladder_uses_fed_pds_index(tmp_path):
            'pds_index': 0, 'u_l': 1.5, 'mu_li': -1.65, 'per_electron': [0.5],
            'thermo_corrected': False}
     fe = types.SimpleNamespace(
-        path_from_project_and_molecules=lambda rows, e_slab, molecules_dir: fed)
+        path_from_project_and_molecules=lambda rows, e_slab, molecules_dir, **kw: fed)
     ads = _fake_adsorption(proj_map={'/p': _proj('liS', str(tmp_path))},
                            delta_ret=_delta({'liS_ads_Li2S4': -1.2}))
     api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
               freeenergy_mod=fe,
               config_mod=_fake_config(cfg={'lis_molecules_dir': str(mol_dir)}))
-    out = api.proj_figures('/p', ['ladder'])
+    out = api._proj_figures_for_path('/p', ['ladder'])
     assert out['ok'] is True and len(out['files']) == 1
     lad = calls['ladder'][0]
     assert lad['pds_index'] == 0                      # 逐电子权威口径透传
     assert lad['step_labels'] == ['S8*', 'Li2S*']
-    assert lad['data'] == [{'name': 'liS', 'G': [0.0, -1.0]}]
+    assert lad['show_ul'] is True
+    assert lad['data'] == [{
+        'name': 'liS', 'G': [0.0, -1.0], 'pds_index': 0, 'u_l': 1.5,
+    }]
+
+
+def test_proj_figures_prefers_imported_project_molecules(tmp_path):
+    calls, seen = {}, {}
+    project_mols = tmp_path / 'imported-molecules'
+    configured_mols = tmp_path / 'configured-molecules'
+    project_mols.mkdir()
+    configured_mols.mkdir()
+    proj = _proj('liS', str(tmp_path))
+    proj['molecules_dir'] = str(project_mols)
+    fed = {'steps': [{'label': 'S8*', 'G': 0.0}, {'label': 'Li2S*', 'G': -1.0}],
+           'pds_index': 0, 'u_l': 1.5}
+
+    def _path(rows, e_slab, molecules_dir, **_context):
+        seen['molecules_dir'] = molecules_dir
+        return fed
+
+    ads = _fake_adsorption(proj_map={'/p': proj},
+                           delta_ret=_delta({'liS_ads_Li2S4': -1.2}))
+    api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
+              freeenergy_mod=types.SimpleNamespace(path_from_project_and_molecules=_path),
+              config_mod=_fake_config(cfg={'lis_molecules_dir': str(configured_mols)}))
+
+    out = api._proj_figures_for_path('/p', ['ladder'])
+
+    assert out['ok'] is True and len(out['files']) == 1
+    assert seen['molecules_dir'] == str(project_mols)
 
 
 def test_proj_figures_ladder_skipped_without_molecules_dir(tmp_path):
@@ -1324,7 +2185,7 @@ def test_proj_figures_ladder_skipped_without_molecules_dir(tmp_path):
                            delta_ret=_delta({'liS_ads_a': -1.0}))
     api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
               config_mod=_fake_config())          # 无 lis_molecules_dir
-    out = api.proj_figures('/p', ['ladder'])
+    out = api._proj_figures_for_path('/p', ['ladder'])
     assert out['ok'] is True and out['files'] == []
     assert out['skipped'][0]['kind'] == 'ladder'
     assert 'lis_molecules_dir' in out['skipped'][0]['reason']
@@ -1335,11 +2196,22 @@ def test_proj_compare_figures_heatmap_union_cols(tmp_path):
     p1, p2 = _proj('A', str(tmp_path / 'a')), _proj('B', str(tmp_path / 'b'))
     deltas = {'/a': _delta({'A_ads_S8': -0.5, 'A_ads_Li2S': -2.0}),
               '/b': _delta({'B_ads_S8': -0.8})}
+    for summary in deltas.values():
+        summary.update({
+            'has_ref': True,
+            'reference_mode': 'single',
+            'ref': ('DONE', -10.0),
+            'method_consistency': {
+                'status': 'verified', 'issues': [], 'warnings': [],
+            },
+        })
+        for row in summary['rows']:
+            row['reference_valid'] = True
     ads = _fake_adsorption(proj_map={'/a': p1, '/b': p2})
     ads.delta_e_rows = lambda proj: deltas['/a' if proj['name'] == 'A' else '/b']
     api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
               config_mod=_fake_config())
-    out = api.proj_compare_figures(['/a', '/b'], ['heatmap'])
+    out = api._proj_compare_figures_for_paths(['/a', '/b'], ['heatmap'])
     assert out['ok'] is True and len(out['files']) == 1
     data = calls['heatmap'][0]['data']
     assert data['rows'] == ['A', 'B']
@@ -1350,7 +2222,7 @@ def test_proj_compare_figures_heatmap_union_cols(tmp_path):
 def test_proj_compare_figures_needs_two_projects():
     api = Api(adsorption_mod=_fake_adsorption(proj_map={}),
               native_charts_mod=_fake_ncharts({}), config_mod=_fake_config())
-    out = api.proj_compare_figures(['/only'], ['heatmap'])
+    out = api._proj_compare_figures_for_paths(['/only'], ['heatmap'])
     assert out['ok'] is False and '2 个' in out['error']
 
 
@@ -1364,12 +2236,182 @@ def test_proj_compare_scaling_pair_and_volcano_skip(tmp_path):
     ads.delta_e_rows = lambda proj: _delta(des[proj['name']])
     api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
               config_mod=_fake_config())          # 无分子库 → volcano 应 skip
-    out = api.proj_compare_figures(list(projs), ['scaling', 'volcano'])
+    out = api._proj_compare_figures_for_paths(list(projs), ['scaling', 'volcano'])
     assert out['ok'] is True
     sc = calls['scaling'][0]
     assert sc['xs'] == [-1.0, -1.5, -2.0] and sc['ys'] == [-2.0, -2.6, -3.1]
     assert [s['kind'] for s in out['skipped']] == ['volcano']
     assert 'U_L' in out['skipped'][0]['reason']
+
+
+def test_proj_compare_eight_projects_share_one_ladder_with_explicit_ul(tmp_path):
+    calls = {}
+    molecules = tmp_path / 'molecules'
+    molecules.mkdir()
+    projects = {}
+    summaries = {}
+    for index in range(8):
+        name = f'M{index}'
+        path = f'/project/{index}'
+        projects[path] = {
+            'name': name,
+            'root': str(tmp_path / name),
+            'project_uuid': f'project-{index}',
+            'comparison_method_fingerprint': 'same-method',
+            'molecules_dir': str(molecules),
+        }
+        summaries[name] = _science_delta(name)
+    ads = _fake_adsorption(proj_map=projects)
+    ads.delta_e_rows = lambda project: summaries[project['name']]
+    api = Api(
+        adsorption_mod=ads,
+        native_charts_mod=_fake_ncharts(calls),
+        freeenergy_mod=_fake_lis_freeenergy(),
+        config_mod=_fake_config(),
+    )
+
+    out = api._proj_compare_figures_for_paths(
+        list(projects), ['ladder'], save_to=str(tmp_path / 'figures'))
+
+    assert out['ok'] is True and out['skipped'] == []
+    assert len(calls['ladder']) == 1
+    call = calls['ladder'][0]
+    assert call['show_ul'] is True and call['mark_pds'] is False
+    assert call['step_labels'] == ['S8*', 'Li2S4*', 'Li2S*']
+    assert len(call['data']) == 8
+    assert [path['name'] for path in call['data']] == [
+        f'M{index}' for index in range(8)
+    ]
+    assert [path['u_l'] for path in call['data']] == [
+        round(1.20 + 0.05 * index, 3) for index in range(8)
+    ]
+    assert all('u_l' in path and path['u_l'] is not None for path in call['data'])
+
+
+def test_proj_batch_report_unverified_method_is_diagnostic(tmp_path):
+    render_calls = []
+    chart_calls = {}
+    project_paths = [
+        str(tmp_path / name / 'project.yaml') for name in ('a', 'b')]
+    for path in project_paths:
+        Path(path).parent.mkdir()
+        Path(path).write_text('schema: vcstudio.project/v1\n', encoding='utf-8')
+    projects = {
+        project_paths[0]: {
+            'name': 'A', 'root': str(tmp_path / 'a'), 'project_uuid': 'a' * 32,
+            'comparison_method_fingerprint': 'same-method',
+        },
+        project_paths[1]: {
+            'name': 'B', 'root': str(tmp_path / 'b'), 'project_uuid': 'b' * 32,
+            'comparison_method_fingerprint': 'same-method',
+        },
+    }
+    summaries = {
+        name: _science_delta(name, method='unverified')
+        for name in ('A', 'B')
+    }
+    ads = _fake_adsorption(projects=project_paths, proj_map=projects)
+    ads.delta_e_rows = lambda project: summaries[project['name']]
+    ads.save_project = lambda root, project: projects.__setitem__(
+        next(path for path, value in projects.items()
+             if os.path.normcase(value['root']) == os.path.normcase(str(root))),
+        copy.deepcopy(project))
+    renderer = _contract_bundle_renderer()
+
+    def capture_renderer(model, out_dir, *, stem, formats):
+        render_calls.append({
+            'model': copy.deepcopy(model), 'out_dir': str(out_dir),
+            'stem': stem, 'formats': tuple(formats),
+        })
+        return renderer(model, out_dir, stem=stem, formats=formats)
+
+    api = Api(
+        adsorption_mod=ads,
+        native_charts_mod=_fake_ncharts(chart_calls),
+        paper_report_mod=types.SimpleNamespace(
+            render_report_bundle=capture_renderer,
+            report_content_sha256=canonical_paper_report.report_content_sha256),
+        config_mod=_fake_config(),
+    )
+    api._comparison_figures = lambda *_args, **_kwargs: ([], [], [])
+
+    out = api._proj_batch_report_for_paths(
+        project_paths, str(tmp_path / 'reports'),
+        formats=['html'], include_individual=False, final=True)
+
+    assert out['ok'] is True
+    assert out['kind'] == 'diagnostic'
+    assert out['snapshot']['comparison_gate']['status'] == 'unverified'
+    assert out['snapshot']['can_final_report'] is False
+    assert len(render_calls) == 1
+    model = render_calls[0]['model']
+    assert model['report_kind'] == 'diagnostic'
+    assert '诊断' in model['subtitle']
+    assert model['report_spec']['preset_id'] == 'multi-catalyst-comparison'
+    assert model['validation']['effective_kind'] == 'diagnostic'
+    assert model['validation']['final_allowed'] is False
+    assert model['contract_refs']['snapshot']['schema'] == 'vcstudio.report-snapshot/v1'
+    assert model['metadata']['比较门禁'] == 'unverified'
+    assert model['candidate_evaluations']['rows']
+    assert all(row[1] == 'hold_for_evidence'
+               for row in model['candidate_evaluations']['rows'])
+    assert out['files']['individual'] == []
+    assert api._reports()._previews == {}
+    json.dumps(out, ensure_ascii=False)
+
+
+def test_proj_compare_volcano_requires_path_delta_g_and_labels_success(tmp_path):
+    calls = {}
+    molecules = tmp_path / 'molecules'
+    molecules.mkdir()
+    projects = {}
+    summaries = {}
+    for index in range(3):
+        name = f'M{index}'
+        path = f'/project/{index}'
+        projects[path] = {
+            'name': name,
+            'root': str(tmp_path / name),
+            'project_uuid': f'project-{index}',
+            'comparison_method_fingerprint': 'same-method',
+            'molecules_dir': str(molecules),
+        }
+        summaries[name] = _science_delta(name)
+    ads = _fake_adsorption(proj_map=projects)
+    ads.delta_e_rows = lambda project: summaries[project['name']]
+    api = Api(
+        adsorption_mod=ads,
+        native_charts_mod=_fake_ncharts(calls),
+        freeenergy_mod=_fake_lis_freeenergy(),
+        config_mod=_fake_config(),
+    )
+
+    skipped = api._proj_compare_figures_for_paths(
+        list(projects), ['volcano'], save_to=str(tmp_path / 'missing'))
+
+    assert skipped['ok'] is True and skipped['files'] == []
+    assert skipped['skipped'][0]['kind'] == 'volcano'
+    assert 'ΔG_ads(*LiS2)' in skipped['skipped'][0]['reason']
+    assert 'volcano' not in calls
+
+    for index, project in enumerate(projects.values()):
+        project['volcano_descriptor'] = {
+            'quantity': 'delta_G_ads',
+            'species': '*LiS₂',
+            'reaction_path_id': 'LIS_ASSOC_LIS2',
+            'sign_convention': 'negative_is_stronger',
+            'value_eV': -1.60 - 0.10 * index,
+        }
+    rendered = api._proj_compare_figures_for_paths(
+        list(projects), ['volcano'], save_to=str(tmp_path / 'ready'))
+
+    assert rendered['ok'] is True and rendered['skipped'] == []
+    assert len(calls['volcano']) == 1
+    volcano = calls['volcano'][0]
+    assert [point['name'] for point in volcano['data']] == ['M0', 'M1', 'M2']
+    assert [round(point['x'], 2) for point in volcano['data']] == [-1.6, -1.7, -1.8]
+    assert r'\Delta G_{\mathrm{ads}}' in volcano['descriptor_label']
+    assert r'\Delta E' not in volcano['descriptor_label']
 
 
 # ── 设置页 / 自动驾驶 假件 ────────────────────────────────────────────────────
@@ -1424,7 +2466,8 @@ def test_settings_get_aggregates_and_masks_key():
     backing = {'potcar_lib_root': '/lib', 'lis_molecules_dir': '/mols',
                'ideal_window': [-1.0, 0.5],
                'llm': {'base_url': 'u', 'model': 'm', 'allow_external': True},
-               'ui': {'theme': 'paper', 'poll_interval': 5, 'autopilot_fetch': False}}
+               'ui': {'theme': 'paper', 'density': 'comfortable',
+                      'poll_interval': 5, 'autopilot_fetch': False}}
     api = Api(config_mod=_fake_config_rw(backing), ai_analysis_mod=_fake_ai(key_saved=True))
     out = api.settings_get()
     assert out['ok'] is True
@@ -1434,16 +2477,23 @@ def test_settings_get_aggregates_and_masks_key():
     assert out['paths']['lis_molecules_dir'] == '/mols'
     assert out['paths']['ideal_window'] == [-1.0, 0.5]
     assert out['ui']['theme'] == 'paper' and out['ui']['poll_interval'] == 5
-    assert out['ui']['autopilot_fetch'] is False and out['ui']['autopilot'] is True
+    assert out['ui']['density'] == 'comfortable'
+    assert out['ui']['autopilot_fetch'] is False and out['ui']['autopilot'] is False
     assert out['prompt']['is_default'] is True and 'DEFAULT_PRESET_TEXT' in out['prompt']['text']
 
 
 def test_settings_get_defaults_when_unset():
     api = Api(config_mod=_fake_config_rw({}), ai_analysis_mod=_fake_ai(key_saved=False))
     out = api.settings_get()
-    assert out['ui'] == {'theme': 'classic', 'autopilot': True, 'poll_interval': 10,
+    assert out['ui'] == {'theme': 'classic', 'density': 'standard',
+                         'autopilot': False, 'poll_interval': 10,
                          'autopilot_continue': True, 'autopilot_fetch': True,
-                         'autopilot_report': True}
+                         'autopilot_report': True, 'autopilot_campaigns': False,
+                         'scenario': 'full', 'active_engine': 'vasp',
+                         'active_calculation': 'relax'}
+    assert out['workspace_context']['revision'] == 0
+    assert out['workspace_context']['configured'] == {
+        'scenario': False, 'engine': False, 'calculation': False}
     assert out['llm']['key_saved'] is False and out['llm']['base_url'] == ''
 
 
@@ -1533,44 +2583,1318 @@ def test_theme_set_persists_and_validates():
     assert api.theme_set('bogus')['theme'] == 'classic'   # 非法 → classic
 
 
+def test_density_set_persists_only_whitelisted_values():
+    backing = {}
+    api = Api(config_mod=_fake_config_rw(backing))
+    assert api.density_set('compact') == {
+        'ok': True, 'density': 'compact', 'error': None}
+    assert backing['ui']['density'] == 'compact'
+
+    rejected = api.density_set('spacious')
+    assert rejected['ok'] is False
+    assert rejected['density'] == 'standard'
+    assert rejected['error']
+    assert backing['ui']['density'] == 'compact'  # 非法值不得覆盖已保存设置
+
+
+def test_settings_get_rejects_invalid_stored_density_to_safe_default():
+    api = Api(config_mod=_fake_config_rw({'ui': {'density': '../compact'}}),
+              ai_analysis_mod=_fake_ai(key_saved=False))
+    assert api.settings_get()['ui']['density'] == 'standard'
+
+
 def test_autopilot_save_persists_subswitches():
     backing = {}
     api = Api(config_mod=_fake_config_rw(backing))
-    api.autopilot_save(True, 15, True, False, True)
+    api.autopilot_save(True, 15, True, False, True, True)
     ui = backing['ui']
     assert ui['autopilot'] is True and ui['poll_interval'] == 15
     assert ui['autopilot_continue'] is True and ui['autopilot_fetch'] is False
     assert ui['autopilot_report'] is True
+    assert ui['autopilot_campaigns'] is True
     # 非法间隔回落 10
     api.autopilot_save(poll_interval=999)
     assert backing['ui']['poll_interval'] == 10
 
 
 # ── pipeline_tick(幂等:首拍 report_done + 写标记,次拍无重复) ──────────────────
+def _install_fake_report_bundle(api, calls, *, order=None):
+    """Replace the bundle entry point while preserving final/diagnostic gating."""
+    def _bundle(path, out_dir, formats=None, final=True, stem=None,
+                record_artifact=True):
+        calls['reports'] = calls.get('reports', 0) + 1
+        if order is not None:
+            order.append('report')
+        project = api._adsorption.load_project(path)
+        summary = api._adsorption.delta_e_rows(project)
+        eligible, reason = api._final_report_gate(project, summary)
+        kind = 'final' if final and eligible else 'diagnostic'
+        wanted = tuple(formats or ('html', 'docx', 'pdf'))
+        calls.setdefault('formats', []).append(wanted)
+        report_stem = stem or 'report'
+        content_model = {
+            'locale': 'zh-CN',
+            'report_kind': kind,
+            'scientific_qualification': (
+                'adsorption_result_verified' if kind == 'final' else 'diagnostic'),
+            'claim_ceiling': 'electronic_adsorption_screen',
+            'executive_summary': ['Bound test summary.'],
+            'adsorption_table': {
+                'columns': [{'key': 'species', 'label': 'Species'}],
+                'rows': [{'species': 'Li2S8'}],
+            },
+            'methods': ['Bound method evidence.'],
+            'limitations': ['Bound test limitation.'],
+        }
+        report_model_sha256 = canonical_paper_report.report_content_sha256(
+            content_model)
+        contracts = api._project_report_contracts(
+            project, path, summary, None,
+            requested_kind='final' if final else 'diagnostic',
+            report_kind=kind,
+            formats=wanted,
+            eligible_final=eligible,
+            gate_reason=reason,
+            report_model_sha256=report_model_sha256,
+        )
+        rendered = _contract_bundle_renderer()(
+            {**content_model, **contracts}, out_dir,
+            stem=report_stem, formats=wanted)
+        calls.setdefault('kinds', []).append(kind)
+        rendered.update({
+            'ok': True, 'artifact_status': 'complete',
+            'kind': kind,
+            'scientific_status': kind,
+            'scientific_qualification': contracts['scientific_qualification'],
+            'gate_reason': reason,
+            'figures': [],
+            'error': None,
+        })
+        return rendered
+
+    api._proj_report_bundle_for_path = _bundle
+
+
+def _report_gate_fixture(tmp_path, *, has_ref=True, method_status='verified',
+                         save_project=None):
+    """构造一个无远程依赖的最终报告门禁项目。"""
+    project_path = str(tmp_path / 'project.yaml')
+    Path(project_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(project_path).write_text(
+        'schema: vcstudio.project/v1\n', encoding='utf-8')
+    clean = str(tmp_path / 'clean')
+    config = str(tmp_path / 'config')
+    reference = str(tmp_path / 'reference') if has_ref else None
+    members = {'clean_slab': clean, 'gas_ref': reference, 'configs': [config]}
+    project = {
+        'name': 'report-gate', 'root': str(tmp_path),
+        'autopilot_managed': True, 'members': members,
+    }
+    manifests = {
+        clean: {'state': 'DONE', 'scheduler_job_id': 'clean-1', 'attempts': [],
+                'results': {'energy_e0_eV': -100.0}},
+        config: {'state': 'DONE', 'scheduler_job_id': 'config-1', 'attempts': [],
+                 'results': {'energy_e0_eV': -115.0}},
+    }
+    if reference:
+        manifests[reference] = {
+            'state': 'DONE', 'scheduler_job_id': 'reference-1', 'attempts': [],
+            'results': {'energy_e0_eV': -10.0},
+        }
+    summary = {
+        'slab': ('DONE', -100.0),
+        'ref': ('DONE', -10.0) if has_ref else ('无', None),
+        'has_ref': has_ref,
+        'reference_mode': 'single' if has_ref else 'none',
+        'method_consistency': {
+            'status': method_status, 'issues': [],
+            'warnings': ([] if method_status == 'verified'
+                         else ['ISPIN 不一致：分子参考、吸附构型']),
+        },
+        'rows': [{
+            # Match the production adsorption.delta_e_rows contract: ``name``
+            # is the managed configuration-directory basename.
+            'name': Path(config).name, 'species': 'Li2S8',
+            'state': 'DONE', 'e_config': -115.0, 'delta_e': -5.0,
+            'dd_e': 0.0, 'reference_valid': has_ref,
+            'reference_job': reference, 'note': '',
+        }],
+    }
+    calls = {'reports': 0, 'saved': 0}
+    adsorption = _fake_adsorption(
+        projects=[project_path],
+        proj_map={project_path: project}, delta_ret=summary)
+
+    def _save(root, saved_project):
+        calls['saved'] += 1
+        if save_project is not None:
+            return save_project(root, saved_project)
+        return None
+
+    adsorption.save_project = _save
+    report_full = _fake_report_full(
+        member_dirs=[path for path in (clean, config, reference) if path])
+
+    def _generate(_project, out, config=None):
+        calls['reports'] += 1
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, 'w', encoding='utf-8') as handle:
+            handle.write(f'<html>generation {calls["reports"]}</html>')
+        return out
+
+    report_full.generate_project_report = _generate
+    manifest_mod = _fake_manifest_mod(manifests)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifest_mod,
+              report_full_mod=report_full, config_mod=_fake_config())
+    _install_fake_report_bundle(api, calls)
+    return api, project, manifests, summary, calls
+
+
+def _contract_bundle_renderer(*, captured=None, on_render=None):
+    """Small valid renderer double with manifest and portable contract sidecars."""
+    def _render(model, out_dir, *, stem, formats):
+        if captured is not None:
+            captured['model'] = copy.deepcopy(model)
+        if on_render is not None:
+            on_render()
+        files = {}
+        os.makedirs(out_dir, exist_ok=True)
+        for fmt in formats:
+            path = Path(out_dir) / f'{stem}.{fmt}'
+            path.write_text(f'{fmt} report', encoding='utf-8')
+            files[fmt] = path
+        contract_files = {}
+        contract_records = copy.deepcopy(model['contract_refs'])
+        for key, model_key in (
+                ('spec', 'report_spec'), ('snapshot', 'report_snapshot'),
+                ('validation', 'validation')):
+            contract_path = Path(out_dir) / f'{stem}.{key}.json'
+            contract_path.write_text(
+                json.dumps(model[model_key], ensure_ascii=False, sort_keys=True),
+                encoding='utf-8')
+            contract_files[key] = contract_path
+            contract_records[key].update({
+                'path': contract_path.name,
+                'file_sha256': _sha256_file(contract_path),
+                'size': contract_path.stat().st_size,
+            })
+        model_file = Path(out_dir) / f'{stem}.model.json'
+        # Mirror the production renderer's normalized, staged-model sidecar.
+        # These API fixtures deliberately use no figures, so no asset staging is
+        # required before the semantic model projection is frozen.
+        normalized_model = canonical_paper_report._normalize_model(
+            model, requested_formats=formats)
+        frozen_model = canonical_paper_report._fingerprint_model(normalized_model)
+        model_file.write_bytes(
+            canonical_paper_report._canonical_json_bytes(frozen_model))
+        model_sha256 = _sha256_file(model_file)
+        manifest = Path(out_dir) / f'{stem}.manifest.json'
+        manifest.write_text(json.dumps({
+            'schema': 'vcstudio.paper-report.bundle/v2',
+            'artifact_status': 'complete',
+            'report_kind': model['report_kind'],
+            'scientific_status': model['report_kind'],
+            'scientific_qualification': model['scientific_qualification'],
+            'model_sha256': model_sha256,
+            'report_model_sha256': model['validation']['report_model_sha256'],
+            'input_fingerprint': model['input_fingerprint'],
+            'revision': copy.deepcopy(model.get('revision') or {}),
+            'contracts': contract_records,
+            'model_file': {
+                'path': model_file.name,
+                'sha256': model_sha256,
+                'size': model_file.stat().st_size,
+            },
+            'formats': list(formats),
+            'files': {
+                fmt: {
+                    'path': path.name,
+                    'sha256': _sha256_file(path),
+                    'size': path.stat().st_size,
+                }
+                for fmt, path in files.items()
+            },
+        }, ensure_ascii=False), encoding='utf-8')
+        return {
+            'schema': 'vcstudio.paper-report.bundle/v2',
+            'artifact_status': 'complete',
+            'model_sha256': model_sha256,
+            'report_model_sha256': model['validation']['report_model_sha256'],
+            'report_kind': model['report_kind'],
+            'scientific_status': model['report_kind'],
+            'scientific_qualification': model['scientific_qualification'],
+            'input_fingerprint': model['input_fingerprint'],
+            'revision': copy.deepcopy(model.get('revision') or {}),
+            'contracts': contract_records,
+            'contract_files': contract_files,
+            'model_file': model_file,
+            'manifest': manifest,
+            'files': files,
+            'assets': [],
+        }
+
+    return _render
+
+
+def _persist_contract_marker(api, project, project_path, summary, out_dir, *,
+                             kind='final', eligible=True, reason=''):
+    """Persist a fully bound test marker through the production validation seam."""
+    content_model = {
+        'locale': 'zh-CN',
+        'report_kind': kind,
+        'scientific_qualification': (
+            'adsorption_result_verified' if kind == 'final' else 'diagnostic'),
+        'claim_ceiling': 'electronic_adsorption_screen',
+        'executive_summary': ['Bound test summary.'],
+        'adsorption_table': {
+            'columns': [{'key': 'species', 'label': 'Species'}],
+            'rows': [{'species': 'Li2S8'}],
+        },
+        'methods': ['Bound method evidence.'],
+        'limitations': ['Bound test limitation.'],
+    }
+    report_model_sha256 = canonical_paper_report.report_content_sha256(
+        content_model)
+    contracts = api._project_report_contracts(
+        project, project_path, summary, None,
+        requested_kind='final' if kind == 'final' else kind,
+        report_kind=kind,
+        formats=('html',),
+        eligible_final=eligible,
+        gate_reason=reason,
+        report_model_sha256=report_model_sha256,
+    )
+    rendered = _contract_bundle_renderer()(
+        {**content_model, **contracts}, str(out_dir),
+        stem='bound-report', formats=('html',))
+    marker_files = dict(rendered['files'])
+    marker_files['manifest'] = rendered['manifest']
+    marker_files['model'] = rendered['model_file']
+    marker_files.update({
+        f'contract_{key}': value
+        for key, value in rendered['contract_files'].items()
+    })
+    marker = api._persist_report_marker(
+        project, summary, marker_files, kind=kind, reason=reason,
+        model_sha256=rendered['model_sha256'],
+        report_model_sha256=rendered['report_model_sha256'],
+        contracts=rendered['contracts'],
+        scientific_qualification=contracts['scientific_qualification'],
+        manifest=rendered['manifest'],
+    )
+    return marker, rendered
+
+
+def test_manual_bundle_persists_contract_bound_canonical_marker(tmp_path):
+    clean = str(tmp_path / 'clean')
+    config = str(tmp_path / 'config')
+    reference = str(tmp_path / 'reference')
+    project_path = str(tmp_path / 'project.yaml')
+    Path(project_path).write_text('schema: vcstudio.project/v1\n', encoding='utf-8')
+    project = {
+        'name': 'manual-report', 'project_uuid': 'project-manual-1',
+        'root': str(tmp_path),
+        'members': {'clean_slab': clean, 'gas_ref': reference, 'configs': [config]},
+    }
+    summary = _science_delta(
+        'manual-report', values={'Li2S8': [-1.04]})
+    summary['rows'][0]['name'] = Path(config).name
+    manifests = {
+        clean: {'state': 'DONE', 'results': {'energy_e0_eV': -100.0}},
+        reference: {'state': 'DONE', 'results': {'energy_e0_eV': -10.0}},
+        config: {'state': 'DONE', 'results': {'energy_e0_eV': -111.04}},
+    }
+    saved = []
+    adsorption = _fake_adsorption(
+        projects=[project_path], proj_map={project_path: project}, delta_ret=summary)
+    adsorption.save_project = lambda root, value: saved.append((root, copy.deepcopy(value)))
+    captured = {}
+
+    api = Api(
+        adsorption_mod=adsorption,
+        manifest_mod=_fake_manifest_mod(manifests),
+        paper_report_mod=types.SimpleNamespace(
+            render_report_bundle=_contract_bundle_renderer(captured=captured)),
+        config_mod=_fake_config(),
+    )
+    api._project_report_figures = lambda *_args, **_kwargs: ([], [])
+    api._proj_fed = lambda *_args, **_kwargs: (None, '缺少完整自由能台阶')
+
+    out = api._proj_report_bundle_for_path(
+        project_path, str(tmp_path / 'report'), formats=['html'], final=True)
+
+    assert out['ok'] is True
+    assert out['kind'] == 'final'
+    assert out['artifact_status'] == 'complete'
+    assert saved and project['autopilot_report'] == out['marker']
+    marker = out['marker']
+    assert marker['artifact_status'] == 'ready'
+    assert marker['kind'] == marker['scientific_status'] == 'final'
+    assert marker['scientific_qualification'] == 'adsorption_result_verified'
+    assert set(marker['files']) == {
+        'html', 'manifest', 'contract_spec', 'contract_snapshot',
+        'contract_validation', 'model'}
+    assert marker['sha256'] == marker['report_hashes']
+    assert marker['model_sha256'] == out['model_sha256']
+    assert marker['model_sha256'] == _sha256_file(out['model_file'])
+    assert marker['contracts']['spec']['schema'] == 'vcstudio.report-spec/v1'
+    assert marker['contracts']['snapshot']['schema'] == 'vcstudio.report-snapshot/v1'
+    assert marker['contracts']['validation']['schema'] == 'vcstudio.report-validation/v1'
+    model = captured['model']
+    assert model['report_spec']['requested_kind'] == 'final'
+    assert model['validation']['effective_kind'] == 'final'
+    assert model['validation']['final_allowed'] is True
+    assert model['report_snapshot']['input_fingerprint'] == model['input_fingerprint']
+
+
+def test_bundle_never_records_failed_or_partial_renderer_output(tmp_path):
+    def _case(case_name, renderer):
+        root = tmp_path / case_name
+        root.mkdir()
+        project_path = str(root / 'project.yaml')
+        Path(project_path).write_text('schema: vcstudio.project/v1\n', encoding='utf-8')
+        summary = _science_delta(case_name)
+        config_dirs = [str(root / row['name']) for row in summary['rows']]
+        members = [str(root / name) for name in ('clean', 'reference')]
+        members.extend(config_dirs)
+        project = {
+            'name': case_name, 'project_uuid': f'{case_name}-id', 'root': str(root),
+            'members': {'clean_slab': members[0], 'gas_ref': members[1],
+                        'configs': config_dirs},
+        }
+        manifests = {
+            path: {'state': 'DONE', 'scheduler_job_id': f'job-{index}',
+                   'results': {'energy_e0_eV': -100.0 - index}}
+            for index, path in enumerate(members)
+        }
+        saved = []
+        adsorption = _fake_adsorption(
+            projects=[project_path], proj_map={project_path: project},
+            delta_ret=summary)
+        adsorption.save_project = lambda root, value: saved.append(
+            (root, copy.deepcopy(value)))
+        api = Api(
+            adsorption_mod=adsorption,
+            manifest_mod=_fake_manifest_mod(manifests),
+            paper_report_mod=types.SimpleNamespace(render_report_bundle=renderer),
+            config_mod=_fake_config(),
+        )
+        api._project_report_figures = lambda *_args, **_kwargs: ([], [])
+        api._proj_fed = lambda *_args, **_kwargs: (None, 'not available')
+        return api, project, saved, project_path, root
+
+    def _failed(_model, out_dir, *, stem, formats):
+        os.makedirs(out_dir, exist_ok=True)
+        files = {}
+        for fmt in formats:
+            path = Path(out_dir) / f'{stem}.{fmt}'
+            path.write_text('partial bytes', encoding='utf-8')
+            files[fmt] = path
+        return {'ok': False, 'error': 'renderer failed', 'files': files}
+
+    api, project, saved, project_path, root = _case('failed-render', _failed)
+    failed = api._proj_report_bundle_for_path(
+        project_path, str(root / 'report'), formats=['html'], final=True)
+    assert failed['ok'] is False and 'renderer failed' in failed['error']
+    assert saved == [] and 'autopilot_report' not in project
+
+    def _partial(_model, out_dir, *, stem, formats):
+        os.makedirs(out_dir, exist_ok=True)
+        html = Path(out_dir) / f'{stem}.html'
+        html.write_text('html only', encoding='utf-8')
+        return {'ok': True, 'files': {'html': html}}
+
+    api, project, saved, project_path, root = _case('partial-render', _partial)
+    partial = api._proj_report_bundle_for_path(
+        project_path, str(root / 'report'), formats=['html', 'pdf'], final=True)
+    assert partial['ok'] is False and 'pdf' in partial['error']
+    assert saved == [] and 'autopilot_report' not in project
+
+    api, project, saved, project_path, root = _case(
+        'partial-individual-render', _partial)
+    individual = api._report_bundle_unrecorded(
+        project_path, str(root / 'report'), formats=['html', 'pdf'], final=True,
+    )
+    assert individual['ok'] is False and 'pdf' in individual['error']
+    assert individual.get('marker') is None
+    assert saved == [] and 'autopilot_report' not in project
+
+
+def test_bundle_marker_cas_preserves_concurrent_fields_and_rejects_changed_inputs(tmp_path):
+    def _case(case_name, on_render):
+        root = tmp_path / case_name
+        root.mkdir()
+        project_path = str(root / 'project.yaml')
+        Path(project_path).write_text('schema: vcstudio.project/v1\n', encoding='utf-8')
+        members = [str(root / name) for name in ('clean', 'reference', 'config')]
+        initial = {
+            'name': case_name, 'project_uuid': f'{case_name}-id', 'root': str(root),
+            'members': {'clean_slab': members[0], 'gas_ref': members[1],
+                        'configs': [members[2]]},
+        }
+        store = {'project': copy.deepcopy(initial), 'saved': 0}
+        manifests = {
+            path: {'state': 'DONE', 'scheduler_job_id': f'job-{index}',
+                   'attempts': [{'n': 1, 'job_id': f'job-{index}'}],
+                   'results': {'energy_e0_eV': -100.0 - index}}
+            for index, path in enumerate(members)
+        }
+        summary = _science_delta(case_name, values={'Li2S8': [-1.04]})
+        summary['rows'][0]['name'] = Path(members[2]).name
+        adsorption = _fake_adsorption(
+            projects=[project_path], proj_map={}, delta_ret=summary)
+        adsorption.load_project = lambda _path: copy.deepcopy(store['project'])
+
+        def _save(_root, value):
+            store['saved'] += 1
+            store['project'] = copy.deepcopy(value)
+
+        adsorption.save_project = _save
+        api = Api(
+            adsorption_mod=adsorption,
+            manifest_mod=_fake_manifest_mod(manifests),
+            paper_report_mod=types.SimpleNamespace(
+                render_report_bundle=_contract_bundle_renderer(on_render=on_render)),
+            config_mod=_fake_config(),
+        )
+        api._project_report_figures = lambda *_args, **_kwargs: ([], [])
+        api._proj_fed = lambda *_args, **_kwargs: (None, 'not available')
+        return api, store, manifests, members, project_path, root
+
+    holder = {}
+
+    def _add_unrelated_field():
+        holder['store']['project']['concurrent_note'] = 'must survive marker commit'
+
+    api, store, _manifests, _members, project_path, root = _case(
+        'merge-current-project', _add_unrelated_field)
+    holder['store'] = store
+    merged = api._proj_report_bundle_for_path(
+        project_path, str(root / 'report'), formats=['html'], final=True)
+    assert merged['ok'] is True and store['saved'] == 1
+    assert store['project']['concurrent_note'] == 'must survive marker commit'
+    assert store['project']['autopilot_report']['scientific_fingerprint']
+
+    changed = {}
+
+    def _change_attempt():
+        changed['manifests'][changed['members'][2]]['scheduler_job_id'] = 'new-attempt'
+
+    api, store, manifests, members, project_path, root = _case(
+        'reject-changed-input', _change_attempt)
+    changed.update(manifests=manifests, members=members)
+    stale = api._proj_report_bundle_for_path(
+        project_path, str(root / 'report'), formats=['html'], final=True)
+    assert stale['ok'] is False and stale['stale_input'] is True
+    assert '变化' in stale['error']
+    assert store['saved'] == 0 and 'autopilot_report' not in store['project']
+
+
+def test_proj_report_capabilities_is_json_safe_and_keeps_format_reasons():
+    paper = types.SimpleNamespace(report_capabilities=lambda: {
+        'schema': 'vcstudio.paper-report.capabilities/v1',
+        'formats': {
+            'html': {'available': True, 'reason': ''},
+            'docx': {'available': False, 'reason': 'python-docx 未安装'},
+            'pdf': {'available': True, 'reason': ''},
+        },
+    })
+
+    out = Api(paper_report_mod=paper).proj_report_capabilities()
+
+    assert out['ok'] is True and out['error'] is None
+    assert out['formats']['docx']['available'] is False
+    assert 'python-docx' in out['formats']['docx']['reason']
+    json.dumps(out, ensure_ascii=False)
+
+
+def test_report_capabilities_fail_closed_when_probe_is_missing_or_raises():
+    missing = Api(paper_report_mod=types.SimpleNamespace()).proj_report_capabilities()
+    assert missing['ok'] is True and missing['probe_ok'] is False
+    assert missing['formats']['html']['available'] is True
+    assert missing['formats']['docx']['available'] is False
+    assert missing['formats']['pdf']['available'] is False
+    assert missing['formats']['docx']['reason']
+    assert Api(paper_report_mod=types.SimpleNamespace())._available_report_formats() == (
+        'html',)
+
+    broken = Api(paper_report_mod=types.SimpleNamespace(
+        report_capabilities=lambda: (_ for _ in ()).throw(
+            RuntimeError('dependency probe crashed'))))
+    status = broken.proj_report_capabilities()
+    assert status['ok'] is True and status['probe_ok'] is False
+    assert status['formats']['html']['available'] is True
+    assert all(not status['formats'][fmt]['available'] for fmt in ('docx', 'pdf'))
+    assert 'probe crashed' in status['formats']['pdf']['reason']
+    assert broken._available_report_formats() == ('html',)
+
+
+def test_explicit_empty_report_formats_fail_with_stable_two_axis_envelope(tmp_path):
+    api = Api()
+
+    project = api._proj_report_bundle_for_path('/missing', str(tmp_path), formats=[])
+    batch = api._proj_batch_report_for_paths([], str(tmp_path), formats=[])
+
+    for result in (project, batch):
+        assert result['ok'] is False
+        assert result['artifact_status'] == 'failed'
+        assert result['scientific_status'] is None
+        assert result['scientific_qualification'] is None
+        assert result['marker'] is None and result['files'] == {}
+        assert result['publication_gate_status'] == 'unknown'
+        assert '至少选择一种报告格式' in result['error']
+
+
+def test_post_gate_renderer_failure_preserves_gate_axis_not_attempted_kind(tmp_path):
+    api, _project, _manifests, _summary, _calls = _report_gate_fixture(tmp_path)
+    del api._proj_report_bundle_for_path
+    api._project_report_figures = lambda *_args, **_kwargs: ([], [])
+    api._proj_fed = lambda *_args, **_kwargs: (None, 'not available')
+
+    def _raise_renderer(*_args, **_kwargs):
+        raise RuntimeError('renderer crashed after gate evaluation')
+
+    api._paper_report = types.SimpleNamespace(
+        report_content_sha256=canonical_paper_report.report_content_sha256,
+        render_report_bundle=_raise_renderer,
+    )
+
+    result = api._proj_report_bundle_for_path(
+        str(tmp_path / 'project.yaml'), str(tmp_path / 'failed-draft'),
+        formats=['html'], requested_kind='draft')
+
+    assert result['ok'] is False
+    assert result['artifact_status'] == 'failed'
+    assert result['scientific_status'] is None
+    assert result['kind'] is None
+    assert result['requested_kind'] == 'draft'
+    assert result['publication_gate_status'] == 'eligible'
+    assert result['desired_report_kind'] == 'final'
+    assert 'renderer crashed' in result['error']
+
+
+def test_real_html_bundle_accepts_api_contract_chain(tmp_path):
+    api, project, _manifests, _summary, calls = _report_gate_fixture(tmp_path)
+    del api._proj_report_bundle_for_path  # remove the lightweight fixture override
+    api._project_report_figures = lambda *_args, **_kwargs: ([], [])
+    api._proj_fed = lambda *_args, **_kwargs: (None, '缺少完整自由能台阶')
+
+    out = api._proj_report_bundle_for_path(
+        str(tmp_path / 'project.yaml'), str(tmp_path / 'real-html'),
+        formats=['html'], final=True)
+
+    assert out['ok'] is True
+    assert out['kind'] == 'final'
+    assert Path(out['files']['html']).is_file()
+    manifest = json.loads(Path(out['manifest']).read_text(encoding='utf-8'))
+    assert manifest['report_kind'] == 'final'
+    assert manifest['contracts']['spec']['sha256'] == (
+        out['marker']['contracts']['spec']['sha256'])
+    assert manifest['contracts']['validation']['final_allowed'] is True
+    assert project['autopilot_report']['model_sha256'] == manifest['model_sha256']
+    assert calls['saved'] == 1
+
+
+def test_real_draft_bundle_is_current_but_never_closes_automatic_pipeline(tmp_path):
+    api, project, _manifests, _summary, _calls = _report_gate_fixture(tmp_path)
+    del api._proj_report_bundle_for_path
+    api._project_report_figures = lambda *_args, **_kwargs: ([], [])
+    api._proj_fed = lambda *_args, **_kwargs: (None, '缺少完整自由能台阶')
+
+    out = api._proj_report_bundle_for_path(
+        str(tmp_path / 'project.yaml'), str(tmp_path / 'draft'), formats=['html'],
+        final=True, requested_kind='draft')
+
+    assert out['ok'] is True
+    assert out['requested_kind'] == out['kind'] == 'draft'
+    assert out['scientific_status'] == 'draft'
+    assert out['scientific_qualification'] == 'diagnostic'
+    assert out['marker']['schema'] == 'vcstudio.report-marker/v2'
+    assert out['marker']['kind'] == 'draft'
+    assert Path(out['marker']['files']['model']).is_file()
+    assert 'autopilot_report_done' not in project
+    manifest = json.loads(Path(out['manifest']).read_text(encoding='utf-8'))
+    validation = json.loads(Path(out['contract_files']['validation']).read_text(
+        encoding='utf-8'))
+    assert manifest['report_kind'] == 'draft'
+    assert validation['effective_kind'] == 'draft'
+    assert validation['final_allowed'] is False
+
+    canonical = api._proj_report_status_for_path(str(tmp_path / 'project.yaml'))
+    assert canonical['artifact_status'] == 'ready'
+    assert canonical['artifact_current'] is True
+    assert canonical['scientific_status'] == 'draft'
+    assert canonical['desired_report_kind'] == 'final'
+    pipeline = api.pipeline_status()['projects'][0]
+    assert pipeline['artifact_status'] == 'ready'
+    assert pipeline['scientific_status'] == 'draft'
+    assert pipeline['publication_gate_status'] == 'eligible'
+    assert pipeline['desired_report_kind'] == 'final'
+    assert pipeline['stage'] == 'analysis'
+
+
+def test_manual_and_automatic_real_bundle_seams_commit_equivalent_markers(tmp_path):
+    from vcstudio.project import paper_report as real_paper_report
+
+    api, project, _manifests, summary, _calls = _report_gate_fixture(tmp_path)
+    del api._proj_report_bundle_for_path
+    api._paper_report = types.SimpleNamespace(
+        render_report_bundle=real_paper_report.render_report_bundle,
+        report_content_sha256=real_paper_report.report_content_sha256,
+        report_capabilities=lambda: {
+            'formats': {
+                'html': {'available': True, 'reason': ''},
+                'docx': {'available': False, 'reason': 'not requested in seam test'},
+                'pdf': {'available': False, 'reason': 'not requested in seam test'},
+            },
+        },
+    )
+    api._project_report_figures = lambda *_args, **_kwargs: ([], [])
+    api._proj_fed = lambda *_args, **_kwargs: (None, '缺少完整自由能台阶')
+    formats = api._available_report_formats()
+
+    manual_result = api._proj_report_bundle_for_path(
+        str(tmp_path / 'project.yaml'), str(tmp_path / 'manual-real'),
+        formats=formats, requested_kind='final')
+    assert manual_result['ok'] is True
+    manual = copy.deepcopy(manual_result['marker'])
+    assert api._report_marker_current(project, summary) is True
+
+    project.pop('autopilot_report', None)
+    project.pop('autopilot_report_done', None)
+    events, errors = [], []
+    api._tick_reports(events, errors)
+    assert errors == [] and [event['kind'] for event in events] == ['report_done']
+    automatic = copy.deepcopy(project['autopilot_report'])
+    assert api._report_marker_current(project, summary) is True
+
+    assert manual['schema'] == automatic['schema'] == 'vcstudio.report-marker/v2'
+    assert manual['kind'] == automatic['kind'] == 'final'
+    assert manual['scientific_qualification'] == (
+        automatic['scientific_qualification'])
+    # Visible/scientific content stays equivalent, while immutable revision
+    # identity intentionally changes the full frozen-model hash.
+    assert manual['model_sha256'] != automatic['model_sha256']
+    assert manual['report_model_sha256'] == automatic['report_model_sha256']
+    assert manual['revision']['sequence'] == 1
+    assert automatic['revision']['sequence'] == 2
+    assert (automatic['revision']['parent_manifest_sha256']
+            == manual['sha256']['manifest'])
+    assert set(manual['files']) == set(automatic['files'])
+    for key in ('spec', 'snapshot', 'validation'):
+        assert manual['contracts'][key]['schema'] == automatic['contracts'][key]['schema']
+        assert manual['contracts'][key]['sha256'] == automatic['contracts'][key]['sha256']
+    assert manual['contracts']['validation']['final_allowed'] is True
+    assert automatic['contracts']['validation']['final_allowed'] is True
+
+
+def test_pipeline_status_uses_gate_axis_when_no_report_artifact_exists(tmp_path):
+    eligible_api, _project, _manifests, _summary, _calls = _report_gate_fixture(
+        tmp_path / 'eligible')
+    eligible = eligible_api.pipeline_status()['projects'][0]
+    assert eligible['artifact_status'] == 'missing'
+    assert eligible['scientific_status'] is None
+    assert eligible['scientific_qualification'] is None
+    assert eligible['report_kind'] is None and eligible['report_status'] is None
+    assert eligible['publication_gate_status'] == 'eligible'
+    assert eligible['desired_report_kind'] == 'final'
+
+    blocked_api, _project, _manifests, _summary, _calls = _report_gate_fixture(
+        tmp_path / 'blocked', has_ref=False)
+    blocked = blocked_api.pipeline_status()['projects'][0]
+    assert blocked['artifact_status'] == 'missing'
+    assert blocked['scientific_status'] is None
+    assert blocked['scientific_qualification'] is None
+    assert blocked['publication_gate_status'] == 'blocked'
+    assert blocked['desired_report_kind'] == 'diagnostic'
+    assert '参考态' in blocked['report_reason']
+
+
+def test_manual_diagnostic_bundle_records_artifact_without_final_claim(tmp_path):
+    api, project, _manifests, _summary, calls = _report_gate_fixture(
+        tmp_path, has_ref=False)
+    # Exercise the shared marker seam used by a real bundle while keeping this
+    # fixture's renderer intentionally light-weight.
+    report_dir = tmp_path / 'manual-diagnostic'
+    report_dir.mkdir()
+    files = {}
+    for fmt in ('html', 'docx', 'pdf'):
+        path = report_dir / f'report.{fmt}'
+        path.write_text(f'diagnostic {fmt}', encoding='utf-8')
+        files[fmt] = str(path)
+    summary = api._adsorption.delta_e_rows(project)
+    marker = api._persist_report_marker(
+        project, summary, files, kind='diagnostic',
+        reason='未设置有效参考态', scientific_qualification='diagnostic')
+
+    status = api.pipeline_status()['projects'][0]
+    assert marker['kind'] == 'diagnostic'
+    assert calls['saved'] == 1
+    assert status['artifact_status'] == 'ready'
+    assert status['scientific_status'] == 'diagnostic'
+    assert '未设置有效气相/逐物种参考态' in status['report_reason']
+    assert status['report_status'] != 'final'
+    project['autopilot_report']['kind'] = 'final'  # 手工篡改标签也必须重新过门禁
+    assert api.pipeline_status()['projects'][0]['scientific_status'] == 'diagnostic'
+
+
+def test_report_scientific_fingerprint_is_independent_of_workspace_location(tmp_path):
+    summary = _science_delta('portable')
+    left_root = tmp_path / 'left' / 'portable'
+    right_root = tmp_path / 'moved' / 'portable'
+    left_members = [str(left_root / name) for name in ('clean', 'reference', 'config')]
+    right_members = [str(right_root / name) for name in ('clean', 'reference', 'config')]
+    left = {
+        'name': 'portable', 'project_uuid': 'portable-id', 'root': str(left_root),
+        'members': {'clean_slab': left_members[0], 'gas_ref': left_members[1],
+                    'configs': [left_members[2]]},
+    }
+    right = {
+        'name': 'portable', 'project_uuid': 'portable-id', 'root': str(right_root),
+        'members': {'clean_slab': right_members[0], 'gas_ref': right_members[1],
+                    'configs': [right_members[2]]},
+    }
+    manifests = {
+        path: {'state': 'DONE', 'scheduler_job_id': f'job-{index}',
+               'results': {'energy_e0_eV': -100.0 - index,
+                           'fetched_sha256': {'OUTCAR': str(index) * 64}}}
+        for index, path in enumerate(left_members)
+    }
+    manifests.update({
+        path: copy.deepcopy(manifests[left_members[index]])
+        for index, path in enumerate(right_members)
+    })
+    adsorption = _fake_adsorption(delta_ret=summary)
+    adsorption.save_project = lambda *_args: None
+    api = Api(adsorption_mod=adsorption, manifest_mod=_fake_manifest_mod(manifests))
+
+    assert (api._report_scientific_fingerprint(left, summary)
+            == api._report_scientific_fingerprint(right, summary))
+    marker, _rendered = _persist_contract_marker(
+        api, left, str(left_root / 'project.yaml'), summary,
+        tmp_path / 'portable-report')
+    right['autopilot_report'] = copy.deepcopy(marker)
+    assert marker['scientific_fingerprint']
+    assert api._report_marker_current(right, summary) is True
+
+
+def test_report_member_ids_and_comparison_contracts_ignore_machine_paths(monkeypatch):
+    def _cross_drive(*_args, **_kwargs):
+        raise ValueError("path is on mount 'D:', start on mount 'C:'")
+
+    monkeypatch.setattr(os.path, 'relpath', _cross_drive)
+    member_id = Api._portable_member_id(
+        r'D:\jobs\config', r'C:\project', 3, manifest={})
+    assert member_id == 'config:3'
+
+    def _snapshot(source_job, display_name):
+        return {
+            'schema': 'vcstudio.comparison-snapshot/v1',
+            'ranking_deadband_eV': 0.15,
+            'projects': [
+                {
+                    'project_id': 'project-a', 'name': 'Catalyst A',
+                    'display_name': display_name, 'status': 'blocked',
+                    'block_reasons': ['缺少路径'], 'warnings': [],
+                    'method_status': 'verified', 'method_signature': 'same',
+                    'method_evidence': {
+                        'status': 'verified', 'fingerprint': 'method-fp',
+                        'source_job': source_job,
+                    },
+                    'species': [], 'ladder': {},
+                },
+                {
+                    'project_id': 'project-b', 'name': 'Catalyst B',
+                    'display_name': 'Catalyst B', 'status': 'blocked',
+                    'block_reasons': ['缺少路径'], 'warnings': [],
+                    'method_status': 'verified', 'method_signature': 'same',
+                    'method_evidence': {
+                        'status': 'verified', 'fingerprint': 'method-fp-b',
+                    },
+                    'species': [], 'ladder': {},
+                },
+            ],
+            'comparison_gate': {'status': 'blocked', 'blocking': ['缺少路径']},
+            'adsorption_matrix': {}, 'ladder': {}, 'can_final_report': False,
+        }
+
+    api = Api()
+    left = api._comparison_report_contracts(
+        _snapshot(r'C:\workspace\job', 'Catalyst A · left'),
+        formats=('html',), requested_kind='final', report_kind='diagnostic',
+        report_model_sha256='d' * 64)
+    right = api._comparison_report_contracts(
+        _snapshot(r'D:\moved\job', 'Catalyst A · right'),
+        formats=('html',), requested_kind='final', report_kind='diagnostic',
+        report_model_sha256='d' * 64)
+    assert left['input_fingerprint'] == right['input_fingerprint']
+    assert (left['contract_refs']['snapshot']['sha256']
+            == right['contract_refs']['snapshot']['sha256'])
+
+
+def test_portable_member_ids_parse_windows_posix_and_unc_without_host_paths():
+    """Foreign-style locators must be lexical, not host-OS filesystem paths."""
+    cases = [
+        (r'D:\PROJECT\configs\Config', r'd:/project', 'configs/config'),
+        (r'\\server\share\project\configs\config',
+         r'//server/share/project', 'configs/config'),
+        ('/srv/project/configs/config', '/srv/project', 'configs/config'),
+    ]
+    for job_dir, project_root, expected in cases:
+        assert (Api._portable_member_id(job_dir, project_root, 3, manifest={})
+                == expected)
+
+    # Separate roots cannot emit their absolute drive/UNC locators.  The index
+    # makes same-basename members deterministic rather than silently colliding.
+    assert Api._portable_member_id(
+        r'D:\jobs\config', r'C:\project', 3, manifest={}) == 'config:3'
+    assert Api._portable_member_id(
+        r'\\server\share-a\config', r'\\server\share-b\project', 1,
+        manifest={}) == 'config:1'
+    assert Api._portable_member_id(
+        r'\\server\share-a\config', r'\\server\share-b\project', 2,
+        manifest={}) == 'config:2'
+
+
 def test_pipeline_tick_report_done_idempotent(tmp_path):
     calls, saved = {}, []
     proj = {'name': 'liS', 'root': str(tmp_path),
+            'autopilot_managed': True,
             'members': {'clean_slab': '/s', 'gas_ref': None, 'configs': ['/c1']}}
+    delta = _delta({'liS_ads_Li2S4': -1.2})
+    delta.update({'has_ref': True, 'reference_mode': 'single',
+                  'ref': ('DONE', -10.0),
+                  'method_consistency': {'status': 'verified', 'issues': [], 'warnings': []}})
+    delta['rows'][0]['reference_valid'] = True
     ads = _fake_adsorption(projects=['/p/project.yaml'],
-                           proj_map={'/p/project.yaml': proj},
-                           delta_ret=_delta({'liS_ads_Li2S4': -1.2}))
+                           proj_map={'/p/project.yaml': proj}, delta_ret=delta)
     ads.save_project = lambda root, p: saved.append(root)
     manifest = _fake_manifest_mod({'/s': {'state': 'DONE', 'results': {}},
                                    '/c1': {'state': 'DONE', 'results': {}}})
     rf = _fake_report_full(member_dirs=['/s', '/c1'],
                            report_ret=str(tmp_path / 'report' / 'liS_report.html'))
+    def _write_report(_project, out, config=None):
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, 'w', encoding='utf-8') as handle:
+            handle.write('<html>validated adsorption report</html>')
+        return out
+    rf.generate_project_report = _write_report
     api = Api(profiles_mod=_fake_profiles({}), adsorption_mod=ads, manifest_mod=manifest,
               native_charts_mod=_fake_ncharts(calls), report_full_mod=rf,
-              config_mod=_fake_config())
+              config_mod=_fake_config(ui={'autopilot': True}))
+    _install_fake_report_bundle(api, calls)
     out1 = api.pipeline_tick()
     assert out1['ok'] is True and out1['last_sync']
     rd = [e for e in out1['events'] if e['kind'] == 'report_done']
     assert len(rd) == 1 and rd[0]['project'] == 'liS'
-    assert rd[0]['report'].endswith('liS_report.html')
+    assert rd[0]['report_kind'] == 'final'
+    assert rd[0]['formats'] == ['docx', 'html', 'pdf']
+    assert {'report', 'files', 'figures_dir'}.isdisjoint(rd[0])
+    assert set(proj['autopilot_report']['files']) == {
+        'html', 'docx', 'pdf', 'manifest',
+        'contract_spec', 'contract_snapshot', 'contract_validation', 'model'}
     assert proj.get('autopilot_report_done') and saved == [str(tmp_path)]   # 标记已写
+    status = {item['name']: item for item in api.pipeline_status()['projects']}['liS']
+    assert status['stage'] == 'report_done'
+    assert status['artifact_status'] == 'ready'
+    assert status['scientific_status'] == 'final'
+    assert status['report_status'] == 'final'
     # 次拍:标记已在 → 不再重复出报告
     out2 = api.pipeline_tick()
     assert [e for e in out2['events'] if e['kind'] == 'report_done'] == []
+
+
+def test_pipeline_auto_report_degrades_to_html_when_optional_formats_unavailable(tmp_path):
+    api, project, _manifests, _summary, calls = _report_gate_fixture(tmp_path)
+    api._paper_report = types.SimpleNamespace(report_capabilities=lambda: {
+        'formats': {
+            'html': {'available': True, 'reason': ''},
+            'docx': {'available': False, 'reason': 'python-docx unavailable'},
+            'pdf': {'available': False, 'reason': 'PDF backend unavailable'},
+        },
+    })
+
+    events, errors = [], []
+    api._tick_reports(events, errors)
+
+    assert errors == []
+    assert calls['formats'] == [('html',)]
+    assert [event['report_kind'] for event in events] == ['final']
+    marker = project['autopilot_report']
+    assert 'html' in marker['files']
+    assert 'docx' not in marker['files'] and 'pdf' not in marker['files']
+    assert api._report_marker_current(project, _summary) is True
+
+
+def test_final_report_rejects_numeric_difference_without_reference_state(tmp_path):
+    """E(config)-E(slab) 可供诊断，但不能冒充最终吸附能报告。"""
+    api, project, _manifests, _summary, calls = _report_gate_fixture(
+        tmp_path, has_ref=False)
+    events, errors = [], []
+
+    api._tick_reports(events, errors)
+
+    assert errors == []
+    assert [event['kind'] for event in events] == ['report_done']
+    assert events[0]['report_kind'] == 'diagnostic'
+    assert calls['reports'] == 1 and calls['saved'] == 1
+    assert project['autopilot_report']['kind'] == 'diagnostic'
+    assert set(project['autopilot_report']['files']) == {
+        'html', 'docx', 'pdf', 'manifest',
+        'contract_spec', 'contract_snapshot', 'contract_validation', 'model'}
+    status = api.pipeline_status()['projects'][0]
+    assert status['stage'] == 'report_done'
+    assert status['artifact_status'] == 'ready'
+    assert status['scientific_status'] == 'diagnostic'
+    assert status['report_status'] == 'diagnostic'
+    assert status['scientific_qualification'] == 'diagnostic'
+    final = api._proj_report_for_path(
+        str(tmp_path / 'project.yaml'), str(tmp_path / 'manual.html'), final=True)
+    assert final['ok'] is True and final['kind'] == 'diagnostic'
+    assert '未设置有效气相/逐物种参考态' in final['gate_reason']
+
+
+def test_unverified_method_requires_persisted_reason_before_final_report(tmp_path):
+    api, project, _manifests, _summary, calls = _report_gate_fixture(
+        tmp_path, method_status='unverified')
+    events, errors = [], []
+
+    api._tick_reports(events, errors)
+
+    assert errors == [] and calls['reports'] == 1 and calls['saved'] == 1
+    assert [event['report_kind'] for event in events] == ['diagnostic']
+    assert project['autopilot_report']['kind'] == 'diagnostic'
+    project['preparation'] = {'method_check': {'confirmation': {
+        'confirmed': True,
+        'reason': '已核对 Li2S8 非磁基态 ISPIN=1，周期吸附体系 ISPIN=2',
+    }}}
+
+    confirmed_events, confirmed_errors = [], []
+    api._tick_reports(confirmed_events, confirmed_errors)
+
+    assert confirmed_errors == [] and calls['reports'] == 2 and calls['saved'] == 2
+    assert [event['kind'] for event in confirmed_events] == ['report_done']
+    assert confirmed_events[0]['report_kind'] == 'final'
+    assert project['autopilot_report']['kind'] == 'final'
+    assert project['autopilot_report']['input_fingerprint']
+
+
+def test_stale_final_marker_is_not_terminal_after_current_gate_downgrades(tmp_path):
+    api, project, _manifests, _summary, calls = _report_gate_fixture(tmp_path)
+    first_events, first_errors = [], []
+    api._tick_reports(first_events, first_errors)
+    assert first_errors == [] and project['autopilot_report']['kind'] == 'final'
+    assert calls['reports'] == 1
+
+    api._final_report_gate = lambda _project, _summary: (
+        False, '当前报告政策已收紧，需要重新生成诊断报告')
+    status = api.pipeline_status()['projects'][0]
+    assert status['stage'] == 'analysis'
+    assert status['artifact_status'] == 'stale'
+    assert status['scientific_status'] == 'final'
+    assert status['scientific_qualification'] == 'adsorption_result_verified'
+    assert status['publication_gate_status'] == 'blocked'
+    assert status['desired_report_kind'] == 'diagnostic'
+    assert '政策已收紧' in status['report_reason']
+
+    events, errors = [], []
+    api._tick_reports(events, errors)
+    assert errors == [] and calls['reports'] == 2
+    assert [event['report_kind'] for event in events] == ['diagnostic']
+    assert project['autopilot_report']['kind'] == 'diagnostic'
+    assert api.pipeline_status()['projects'][0]['artifact_status'] == 'ready'
+
+
+def test_explicit_invalid_marker_kind_never_uses_legacy_final_compatibility(tmp_path):
+    api, project, _manifests, _summary, _calls = _report_gate_fixture(tmp_path)
+    events, errors = [], []
+    api._tick_reports(events, errors)
+    project['autopilot_report']['kind'] = 'garbage-kind'
+    project['autopilot_report']['scientific_qualification'] = 'human_scientific_reviewed'
+
+    status = api.pipeline_status()['projects'][0]
+
+    assert status['stage'] == 'analysis'
+    assert status['artifact_status'] == 'stale'
+    assert status['scientific_status'] == 'diagnostic'
+    assert status['scientific_qualification'] == 'diagnostic'
+    assert 'kind 无效' in status['report_reason']
+
+
+def test_new_final_marker_requires_contract_chain_but_kindless_legacy_is_readable(tmp_path):
+    api, project, _manifests, summary, _calls = _report_gate_fixture(tmp_path)
+    report = tmp_path / 'legacy-report.html'
+    report.write_text('historical report', encoding='utf-8')
+
+    with pytest.raises(ValueError, match='完整 contract'):
+        api._persist_report_marker(
+            project, summary, {'html': str(report)}, kind='final')
+
+    digest = _sha256_file(report)
+    project['autopilot_report'] = {
+        'input_fingerprint': api._report_input_fingerprint(project, summary),
+        'file': str(report), 'report_sha256': digest,
+        'files': {'html': str(report)}, 'sha256': {'html': digest},
+    }
+    assert api._report_marker_current(project, summary) is True
+    status = api._proj_report_status_for_path(str(tmp_path / 'project.yaml'))
+    assert status['ok'] is True and status['artifact_current'] is True
+    assert status['marker_kind'] == 'legacy-final'
+    assert status['scientific_status'] == 'final'
+
+    project['autopilot_report'].update({
+        'kind': 'final', 'scientific_status': 'final',
+        'scientific_qualification': 'adsorption_result_verified',
+        'artifact_status': 'ready',
+    })
+    explicit = api._proj_report_status_for_path(str(tmp_path / 'project.yaml'))
+    assert explicit['artifact_status'] == 'stale'
+    assert explicit['artifact_current'] is False
+    assert '指纹' in explicit['report_reason'] or 'contract' in explicit['report_reason']
+
+
+def test_public_report_status_routes_through_report_service_recovery_adapter():
+    calls = []
+    service = types.SimpleNamespace(status=lambda path: calls.append(path) or {
+        'schema': 'vcstudio.report-status/v1',
+        'ok': True,
+        'artifact_status': 'ready',
+        'artifact_current': True,
+        'has_marker': True,
+        'scientific_status': 'final',
+        'scientific_qualification': 'adsorption_result_verified',
+        'scientific_stale': False,
+        'eligible_final': True,
+        'publication_gate_status': 'eligible',
+        'desired_report_kind': 'final',
+        'report_reason': '',
+        'files': {},
+        'error': None,
+    })
+    api = Api(report_service=service)
+    project_id = 'project-' + 'a' * 32
+    api._resolve_project_id = lambda candidate: {
+        'project_id': candidate, 'path': 'project.yaml',
+    }
+    api._call_with_project_bindings = lambda _records, callback, **_kwargs: callback()
+    api._proj_report_status_for_path = lambda _path: (_ for _ in ()).throw(
+        AssertionError('public status bypassed ReportService.status recovery')
+    )
+
+    result = api.proj_report_status(project_id)
+
+    assert result['ok'] is True
+    assert result['project_id'] == project_id
+    assert result['artifact_status'] == 'ready'
+    assert calls == ['project.yaml']
+
+
+def test_proj_report_status_ignores_mtime_and_rejects_tampered_marker_metadata(tmp_path):
+    api, project, _manifests, _summary, _calls = _report_gate_fixture(tmp_path)
+    events, errors = [], []
+    api._tick_reports(events, errors)
+    assert errors == [] and events
+    marker = copy.deepcopy(project['autopilot_report'])
+
+    html = marker['files']['html']
+    os.utime(html, (1, 1))
+    current = api._proj_report_status_for_path(str(tmp_path / 'project.yaml'))
+    assert current['schema'] == 'vcstudio.report-status/v1'
+    assert current['artifact_status'] == 'ready'
+    assert current['artifact_current'] is True
+    assert current['scientific_status'] == 'final'
+    assert current['scientific_qualification'] == 'adsorption_result_verified'
+
+    project['autopilot_report']['scientific_qualification'] = 'human_scientific_reviewed'
+    tampered_qualification = api._proj_report_status_for_path(str(tmp_path / 'project.yaml'))
+    assert tampered_qualification['artifact_status'] == 'stale'
+    assert tampered_qualification['artifact_current'] is False
+    assert 'validation' in tampered_qualification['report_reason']
+
+    project['autopilot_report'] = copy.deepcopy(marker)
+    project['autopilot_report']['contracts']['validation']['sha256'] = '0' * 64
+    tampered_contract = api._proj_report_status_for_path(str(tmp_path / 'project.yaml'))
+    assert tampered_contract['artifact_status'] == 'stale'
+    assert 'contract' in tampered_contract['report_reason']
+
+    project['autopilot_report'] = copy.deepcopy(marker)
+    project['autopilot_report']['report_model_sha256'] = 'e' * 64
+    tampered_content_binding = api._proj_report_status_for_path(str(tmp_path / 'project.yaml'))
+    assert tampered_content_binding['artifact_status'] == 'stale'
+    assert '正文指纹' in tampered_content_binding['report_reason']
+
+    project['autopilot_report'] = copy.deepcopy(marker)
+    model_path = Path(marker['files']['model'])
+    original_model = model_path.read_bytes()
+    model_path.write_text('{}', encoding='utf-8')
+    try:
+        tampered_model = api._proj_report_status_for_path(str(tmp_path / 'project.yaml'))
+        assert tampered_model['artifact_status'] == 'stale'
+        assert tampered_model['artifact_current'] is False
+    finally:
+        model_path.write_bytes(original_model)
+
+    model_path.unlink()
+    try:
+        missing_model = api._proj_report_status_for_path(str(tmp_path / 'project.yaml'))
+        assert missing_model['artifact_status'] == 'stale'
+        assert missing_model['artifact_current'] is False
+    finally:
+        model_path.write_bytes(original_model)
+
+    project['autopilot_report'] = copy.deepcopy(marker)
+    manifest_path = Path(marker['manifest'])
+    original_manifest = manifest_path.read_text(encoding='utf-8')
+    manifest_payload = json.loads(original_manifest)
+    manifest_payload['scientific_qualification'] = 'human_scientific_reviewed'
+    manifest_path.write_text(json.dumps(manifest_payload), encoding='utf-8')
+    try:
+        tampered_manifest = api._proj_report_status_for_path(str(tmp_path / 'project.yaml'))
+        assert tampered_manifest['artifact_status'] == 'stale'
+        assert tampered_manifest['artifact_current'] is False
+    finally:
+        manifest_path.write_text(original_manifest, encoding='utf-8')
+
+
+def test_report_status_rejects_consistently_rehashed_model_content_tamper(tmp_path):
+    """Ordinary file/model hashes cannot replace the validation content binding."""
+    api, project, _manifests, _summary, _calls = _report_gate_fixture(tmp_path)
+    events, errors = [], []
+    api._tick_reports(events, errors)
+    assert errors == [] and events
+
+    marker = project['autopilot_report']
+    model_path = Path(marker['files']['model'])
+    frozen = json.loads(model_path.read_text(encoding='utf-8'))
+    frozen['title'] = 'tampered title with internally consistent ordinary hashes'
+    model_bytes = json.dumps(
+        frozen, ensure_ascii=False, sort_keys=True,
+        separators=(',', ':'), allow_nan=False).encode('utf-8')
+    model_path.write_bytes(model_bytes)
+    model_sha256 = _sha256_file(model_path)
+
+    manifest_path = Path(marker['files']['manifest'])
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    manifest['model_sha256'] = model_sha256
+    manifest['model_file'].update({
+        'sha256': model_sha256,
+        'size': model_path.stat().st_size,
+    })
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False), encoding='utf-8')
+
+    marker['model_sha256'] = model_sha256
+    for hashes in (marker['sha256'], marker['report_hashes']):
+        hashes['model'] = model_sha256
+        hashes['manifest'] = _sha256_file(manifest_path)
+
+    status = api._proj_report_status_for_path(str(tmp_path / 'project.yaml'))
+
+    assert status['artifact_status'] == 'stale'
+    assert status['artifact_current'] is False
+    assert status['scientific_status'] == 'final'
+    assert '正文指纹' in status['report_reason']
+
+
+def test_current_diagnostic_marker_is_regenerated_when_gate_now_allows_final(tmp_path):
+    api, project, _manifests, _summary, calls = _report_gate_fixture(
+        tmp_path, has_ref=False)
+    first_events, first_errors = [], []
+    api._tick_reports(first_events, first_errors)
+    assert first_errors == [] and project['autopilot_report']['kind'] == 'diagnostic'
+
+    api._final_report_gate = lambda _project, _summary: (True, '')
+    status = api.pipeline_status()['projects'][0]
+    assert status['stage'] == 'analysis'
+    assert status['artifact_status'] == 'stale'
+    assert status['scientific_status'] == 'diagnostic'
+    assert status['scientific_qualification'] == 'diagnostic'
+    assert status['publication_gate_status'] == 'eligible'
+    assert status['desired_report_kind'] == 'final'
+    assert '升级' in status['report_reason']
+
+    events, errors = [], []
+    api._tick_reports(events, errors)
+    assert errors == [] and calls['reports'] == 2
+    assert [event['report_kind'] for event in events] == ['final']
+    assert project['autopilot_report']['kind'] == 'final'
+
+
+def test_report_marker_invalidates_on_file_and_member_generation_changes(tmp_path):
+    api, project, manifests, _summary, calls = _report_gate_fixture(tmp_path)
+
+    def _tick_once():
+        events, errors = [], []
+        api._tick_reports(events, errors)
+        assert errors == []
+        assert [event['kind'] for event in events] == ['report_done']
+
+    _tick_once()
+    report_path = project['autopilot_report']['file']
+    assert calls['reports'] == 1
+    os.unlink(report_path)
+    _tick_once()  # 报告文件被删，marker 不得继续有效
+    assert calls['reports'] == 2
+
+    config = project['members']['configs'][0]
+    manifests[config]['results']['energy_e0_eV'] = -115.2
+    _tick_once()
+    assert calls['reports'] == 3
+
+    manifests[config]['scheduler_job_id'] = 'config-2'
+    _tick_once()
+    assert calls['reports'] == 4
+
+    manifests[config]['attempts'].append({'round': 2, 'reason': 'continued'})
+    _tick_once()
+    assert calls['reports'] == 5
+
+
+def test_report_marker_save_failure_never_emits_report_done(tmp_path):
+    def _fail_save(_root, _project):
+        raise OSError('disk full')
+
+    api, project, _manifests, _summary, calls = _report_gate_fixture(
+        tmp_path, save_project=_fail_save)
+    events, errors = [], []
+
+    api._tick_reports(events, errors)
+
+    assert events == []
+    assert calls['reports'] == 1 and calls['saved'] == 1
+    assert errors == ['项目「report-gate」报告标记落盘失败']
+    assert 'disk full' not in json.dumps(errors, ensure_ascii=False)
+    assert str(tmp_path) not in json.dumps(errors, ensure_ascii=False)
+    assert 'autopilot_report' not in project
+    assert 'autopilot_report_done' not in project
+
+
+def test_generated_unrecorded_response_preserves_real_artifact_and_science(tmp_path):
+    def _fail_save(_root, _project):
+        raise OSError('disk full')
+
+    api, project, _manifests, _summary, _calls = _report_gate_fixture(
+        tmp_path, save_project=_fail_save)
+    del api._proj_report_bundle_for_path  # reveal the production class method behind the tick fake
+    api._project_report_figures = lambda *_args, **_kwargs: ([], [])
+    api._proj_fed = lambda *_args, **_kwargs: (None, 'not available')
+
+    result = api._proj_report_bundle_for_path(
+        str(tmp_path / 'project.yaml'), str(tmp_path / 'unrecorded'),
+        formats=['html'], requested_kind='final')
+
+    assert result['ok'] is False
+    assert result['artifact_status'] == 'generated_unrecorded'
+    assert result['kind'] == result['scientific_status'] == 'final'
+    assert result['scientific_qualification'] == 'adsorption_result_verified'
+    assert result['marker'] is None
+    assert Path(result['files']['html']).is_file()
+    assert Path(result['files']['manifest']).is_file()
+    assert Path(result['model_file']).is_file()
+    assert set(result['contract_files']) == {'spec', 'snapshot', 'validation'}
+    assert 'disk full' in result['error']
+    assert 'autopilot_report' not in project
+    assert 'autopilot_report_done' not in project
 
 
 def test_pipeline_tick_no_profiles_no_errors():
@@ -1582,12 +3906,156 @@ def test_pipeline_tick_no_profiles_no_errors():
     assert out['synced'] == 0
 
 
+def test_pipeline_tick_backend_lock_skips_overlapping_tick():
+    api = Api(profiles_mod=_fake_profiles({}),
+              adsorption_mod=_fake_adsorption(projects=[]),
+              config_mod=_fake_config(ui={'autopilot': True}))
+    assert api._pipeline_lock.acquire(blocking=False)
+    try:
+        out = api.pipeline_tick()
+    finally:
+        api._pipeline_lock.release()
+    assert out['ok'] is True and out['busy'] is True and out['synced'] == 0
+    assert '仍在执行' in out['events'][0]['text']
+
+
+def test_pipeline_tick_reports_deleted_managed_profile():
+    project = {
+        'name': 'lost-cluster', 'autopilot_managed': True,
+        'launch': {'resources': {'profile': 'deleted-server'},
+                   'submitted_job_dirs': ['/job']},
+        'members': {'clean_slab': '/job', 'gas_ref': None, 'configs': []},
+    }
+    api = Api(
+        profiles_mod=_fake_profiles({}),
+        adsorption_mod=_fake_adsorption(
+            projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project}),
+        config_mod=_fake_config(ui={'autopilot': True}))
+
+    out = api.pipeline_tick()
+
+    assert any('deleted-server' in error and '已不存在' in error
+               for error in out['errors'])
+
+
+def test_pipeline_tick_configured_but_idle_profile_is_not_counted_as_synced():
+    api = Api(
+        profiles_mod=_fake_profiles({'idle': ClusterProfile(name='idle', auth='key')}),
+        adsorption_mod=_fake_adsorption(projects=[]),
+        ledger_mod=_fake_ledger([], []),
+        config_mod=_fake_config(ui={
+            'autopilot': True, 'autopilot_report': False,
+            'autopilot_campaigns': False,
+        }))
+
+    out = api.pipeline_tick()
+
+    assert out['ok'] is True
+    assert out['synced'] == 0
+
+
+def test_pipeline_tick_monitors_multiple_servers_and_isolates_one_failure():
+    profiles = {
+        'server-a': ClusterProfile(name='server-a', auth='key'),
+        'server-b': ClusterProfile(name='server-b', auth='key'),
+    }
+    api = Api(
+        profiles_mod=_fake_profiles(profiles),
+        config_mod=_fake_config(ui={
+            'autopilot': True, 'autopilot_report': False,
+            'autopilot_campaigns': False,
+        }))
+    seen = []
+
+    def _tick(name, *_args):
+        seen.append(name)
+        if name == 'server-a':
+            raise RuntimeError('network down')
+        return True
+
+    api._tick_cluster = _tick
+    out = api.pipeline_tick()
+
+    assert seen == ['server-a', 'server-b']
+    assert out['synced'] == 1
+    assert any('server-a' in error for error in out['errors'])
+
+
+def test_pipeline_tick_disabled_has_no_cluster_campaign_or_report_side_effects():
+    calls = []
+    profiles = types.SimpleNamespace(load_profiles=lambda: calls.append('profiles') or {})
+    adsorption = types.SimpleNamespace(
+        list_projects=lambda: calls.append('projects') or [], load_project=lambda _p: None)
+    secrets = types.SimpleNamespace(
+        get_password=lambda _n: calls.append('password'), set_password=lambda *_a: None)
+    api = Api(profiles_mod=profiles, adsorption_mod=adsorption, secrets_mod=secrets,
+              config_mod=_fake_config(ui={'autopilot': False,
+                                          'autopilot_report': False,
+                                          'autopilot_campaigns': True}))
+    api._tick_campaigns = lambda *_a: calls.append('campaigns')
+
+    out = api.pipeline_tick()
+
+    assert out['ok'] is True and out['events'] == [] and out['synced'] == 0
+    assert calls == []
+
+
+def test_pipeline_report_only_mode_never_loads_remote_automation():
+    calls = []
+    profiles = types.SimpleNamespace(
+        load_profiles=lambda: (_ for _ in ()).throw(
+            AssertionError('report-only path must not load profiles')))
+    secrets = types.SimpleNamespace(
+        get_password=lambda _n: (_ for _ in ()).throw(
+            AssertionError('report-only path must not load credentials')),
+        set_password=lambda *_a: None,
+    )
+    api = Api(
+        profiles_mod=profiles,
+        secrets_mod=secrets,
+        config_mod=_fake_config(ui={
+            'autopilot': False,
+            'autopilot_report': True,
+            'autopilot_campaigns': True,
+        }),
+    )
+    api._tick_reports = lambda events, _errors: (
+        calls.append('reports'),
+        events.append({'kind': 'report_done', 'text': 'local report'}),
+    )
+    api._tick_campaigns = lambda *_a: (_ for _ in ()).throw(
+        AssertionError('report-only path must not advance campaigns'))
+
+    out = api.pipeline_tick()
+
+    assert calls == ['reports']
+    assert out['synced'] == 0
+    assert [event['kind'] for event in out['events']] == ['report_done']
+
+
+def test_pipeline_campaigns_require_independent_explicit_switch():
+    calls = []
+    api = Api(profiles_mod=_fake_profiles({}),
+              config_mod=_fake_config(ui={'autopilot': True,
+                                          'autopilot_continue': True,
+                                          'autopilot_fetch': True}))
+    api._tick_campaigns = lambda *_a: calls.append('campaign')
+    api.pipeline_tick()
+    assert calls == []
+
+    api._config = _fake_config(ui={'autopilot': True,
+                                   'autopilot_campaigns': True})
+    api.pipeline_tick()
+    assert calls == ['campaign']
+
+
 def test_pipeline_tick_skips_profile_without_credentials():
     store = {'c1': ClusterProfile(name='c1', hostname='h', auth='password')}
     secrets = types.SimpleNamespace(get_password=lambda n: None, set_password=lambda n, pw: None)
     api = Api(profiles_mod=_fake_profiles(store), secrets_mod=secrets,
               adsorption_mod=_fake_adsorption(projects=[]),
-              ledger_mod=_fake_ledger([], []), config_mod=_fake_config())
+              ledger_mod=_fake_ledger([], []),
+              config_mod=_fake_config(ui={'autopilot': True}))
     out = api.pipeline_tick()
     assert any(e['kind'] == 'skip' and 'c1' in e['text'] for e in out['events'])
     assert out['synced'] == 0
@@ -1596,7 +4064,8 @@ def test_pipeline_tick_skips_profile_without_credentials():
 # ── pipeline_status(阶段判定) ───────────────────────────────────────────────
 def test_pipeline_status_stage_detection():
     projA = {'name': 'A', 'members': {'clean_slab': '/a/s', 'gas_ref': None,
-                                      'configs': ['/a/c1', '/a/c2']}}
+                                      'configs': ['/a/c1', '/a/c2']},
+             'launch': {'resources': {'profile': 'gpu-a'}}}
     projB = {'name': 'B', 'members': {'clean_slab': '/b/s', 'gas_ref': None,
                                       'configs': ['/b/c1']},
              'autopilot_report_done': '2026-07-16T00:00:00'}
@@ -1613,9 +4082,11 @@ def test_pipeline_status_stage_detection():
     out = api.pipeline_status()
     by = {p['name']: p for p in out['projects']}
     assert by['A']['stage'] == 'submit' and by['A']['needs_human'] is False
-    assert by['B']['stage'] == 'report_done'
+    assert by['A']['profile'] == 'gpu-a'
+    # 旧时间字符串不绑定成员/能量/报告文件，必须失效并等待重建。
+    assert by['B']['stage'] == 'analysis'
     assert by['B']['done'] == 2 and by['B']['total'] == 2
-    assert by['B']['stage_index'] == 5 and by['B']['stages'][5] == 'report_done'
+    assert by['B']['stage_index'] == 4 and by['B']['stages'][5] == 'report_done'
 
 
 def test_pipeline_status_monitor_recover_and_needs_human():
@@ -1639,6 +4110,72 @@ def test_pipeline_status_monitor_recover_and_needs_human():
     assert by['M']['stage'] == 'monitor'
     assert by['R']['stage'] == 'recover' and by['R']['recover_round'] == 2
     assert by['R']['needs_human'] is True
+
+
+def test_pipeline_status_partial_failure_is_degraded_with_registered_denominator():
+    good_path = '/managed/good/project.yaml'
+    bad_path = r'C:\private\customer\broken\project.yaml'
+    good = {'name': 'good', 'members': {'clean_slab': '/good/slab',
+                                        'gas_ref': None, 'configs': []}}
+    ads = _fake_adsorption(projects=[good_path, bad_path],
+                           proj_map={good_path: good})
+
+    def _load(path):
+        if path == bad_path:
+            raise OSError(f'cannot read {path} or /home/alice/private/project.yaml')
+        return good
+
+    ads.load_project = _load
+    api = Api(adsorption_mod=ads, manifest_mod=_fake_manifest_mod({
+        '/good/slab': {'state': 'DONE', 'results': {}},
+    }))
+
+    out = api.pipeline_status()
+
+    assert out['ok'] is True and out['status'] == 'degraded'
+    assert out['registered_total'] == 2
+    assert out['successful_count'] == 1 and out['failed_count'] == 1
+    assert len(out['projects']) == 1 and out['projects'][0]['name'] == 'good'
+    assert out['projects'][0]['artifact_current'] is False
+    assert out['projects'][0]['scientific_stale'] is False
+    assert out['error']
+    public_failure = json.dumps(
+        {'error': out['error'], 'failures': out['failures']}, ensure_ascii=False)
+    assert bad_path not in public_failure
+    assert '/home/alice/private' not in public_failure
+    assert 'cannot read' not in public_failure
+    assert out['failures'] == [{
+        'project_ref': 'registered-project-2',
+        'code': 'project_unreadable',
+        'message': 'Registered project could not be read.',
+    }]
+
+
+def test_pipeline_status_all_failures_and_registry_failure_are_unavailable_and_redacted():
+    secret_path = r'C:\private\all-broken\project.yaml'
+    ads = _fake_adsorption(projects=[secret_path])
+    ads.load_project = lambda _path: (_ for _ in ()).throw(
+        OSError(f'failed at {secret_path}'))
+
+    out = Api(adsorption_mod=ads).pipeline_status()
+
+    assert out['ok'] is False and out['status'] == 'unavailable'
+    assert out['registered_total'] == 1
+    assert out['successful_count'] == 0 and out['failed_count'] == 1
+    assert out['projects'] == [] and out['error']
+    assert secret_path not in json.dumps(out, ensure_ascii=False)
+
+    registry = _fake_adsorption(projects=[])
+    registry.list_projects = lambda: (_ for _ in ()).throw(
+        OSError(r'registry C:\private\registry.json is unreadable'))
+    registry_out = Api(adsorption_mod=registry).pipeline_status()
+    assert registry_out['ok'] is False
+    assert registry_out['status'] == 'unavailable'
+    assert registry_out['registered_total'] is None
+    assert registry_out['successful_count'] == 0
+    assert registry_out['failed_count'] is None
+    assert registry_out['projects'] == [] and registry_out['error']
+    assert 'private' not in json.dumps(registry_out, ensure_ascii=False)
 
 
 # ── open_dir 文件路径 → 打开所在目录 ─────────────────────────────────────────
@@ -1990,7 +4527,8 @@ def test_sac_matrix_generate_creates_jobs_project_and_campaign(tmp_path):
     assert out['created'] == 2                        # 1 清洁面 + 1 构型
     assert len(registered) == 2                       # 全部入台账
     # 每 slab 一个吸附能项目(清洁面 + 构型族)
-    assert len(out['project_paths']) == 1 and len(saved) == 1
+    assert len(out['projects']) == 1 and len(saved) == 1
+    assert out['projects'][0]['project_id'].startswith('registry-')
     assert saved[0][1]['members']['clean_slab'].endswith('_clean')
     assert len(saved[0][1]['members']['configs']) == 1
     # 同步注册 campaign(2 任务节点 + 逐任务记预估机时)
@@ -2010,7 +4548,7 @@ def test_sac_matrix_generate_place_rejection_skipped(tmp_path):
                                   str(incar), str(tmp_path))
     assert out['ok'] is True and out['created'] == 1          # 仅清洁面
     assert any('拒绝' in s['reason'] for s in out['skipped'])
-    assert out['project_paths'] == []                         # 无构型 → 不建项目
+    assert out['projects'] == []                              # 无构型 → 不建项目
 
 
 def test_sac_matrix_generate_clean_only_no_project(tmp_path):
@@ -2024,7 +4562,7 @@ def test_sac_matrix_generate_clean_only_no_project(tmp_path):
     out = api.sac_matrix_generate(['Fe'], ['MN4'], [], 'all', 1,
                                   str(incar), str(tmp_path))
     assert out['ok'] is True and out['created'] == 1
-    assert out['project_paths'] == [] and saved == []
+    assert out['projects'] == [] and saved == []
 
 
 def test_sac_matrix_generate_missing_incar_error(tmp_path):
@@ -2103,6 +4641,7 @@ def test_spin_family_compare_ground_and_audit(tmp_path):
     # audit_magmom 收到 OUTCAR 文本 + 各自初猜磁矩(从 manifest 溯源)
     assert any(a['init'] == '4 0' for a in calls['audits'])
     assert any('3.9' in a['outcar'] for a in calls['audits'])
+    assert out['report_file'] and os.path.isfile(out['report_file'])
 
 
 def test_spin_family_compare_pending_passthrough_and_missing_outcar(tmp_path):
@@ -2138,6 +4677,8 @@ def test_reaction_presets_shape():
     assert {p['key'] for p in out['presets']} == {'ORR_4E', 'HER'}
     orr = next(p for p in out['presets'] if p['key'] == 'ORR_4E')
     assert orr['name'] == 'ORR_4E' and '氧还原' in orr['description']
+    assert orr['name_en'] == 'ORR_4E'
+    assert orr['description_en'] == ''  # compatibility fake has no bilingual field
 
 
 def test_reaction_presets_error_caught():
@@ -2166,7 +4707,7 @@ def test_proj_figures_preset_ladder_maps_species(tmp_path):
               freeenergy_mod=_fake_fe_preset(
                   mol_e={'O2': -9.8, 'H2O': -14.2, 'H2': -6.8}, path_calls=path_calls),
               config_mod=_fake_config(cfg={'lis_molecules_dir': str(mol)}))
-    out = api.proj_figures('/p', ['ladder'], str(tmp_path), 'ORR_4E')
+    out = api._proj_figures_for_path('/p', ['ladder'], str(tmp_path), 'ORR_4E')
     assert out['ok'] is True and len(out['files']) == 1
     e = path_calls['energies']
     assert e['*'] == -100.0                            # 干净基底 '*' → 清洁表面能量
@@ -2187,7 +4728,7 @@ def test_proj_figures_preset_ladder_missing_species_skipped(tmp_path):
               reactions_mod=_fake_reactions_orr(),
               freeenergy_mod=_fake_fe_preset(mol_e={'O2': -9.8, 'H2O': -14.2, 'H2': -6.8}),
               config_mod=_fake_config(cfg={'lis_molecules_dir': str(mol)}))
-    out = api.proj_figures('/p', ['ladder'], str(tmp_path), 'ORR_4E')
+    out = api._proj_figures_for_path('/p', ['ladder'], str(tmp_path), 'ORR_4E')
     assert out['ok'] is True and out['files'] == []
     assert out['skipped'][0]['kind'] == 'ladder'
     assert 'OOH*' in out['skipped'][0]['reason'] and '缺' in out['skipped'][0]['reason']
@@ -2202,7 +4743,7 @@ def test_proj_figures_default_ladder_unchanged_when_no_preset(tmp_path):
            'pds_index': 0, 'u_l': 1.5}
     seen = {}
 
-    def _path(rows, e_slab, molecules_dir):
+    def _path(rows, e_slab, molecules_dir, **_context):
         seen['called'] = True
         return fed
     fe = types.SimpleNamespace(path_from_project_and_molecules=_path)
@@ -2211,7 +4752,7 @@ def test_proj_figures_default_ladder_unchanged_when_no_preset(tmp_path):
     api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
               freeenergy_mod=fe,
               config_mod=_fake_config(cfg={'lis_molecules_dir': str(mol_dir)}))
-    out = api.proj_figures('/p', ['ladder'])          # 无 preset_key
+    out = api._proj_figures_for_path('/p', ['ladder'])          # 无 preset_key
     assert out['ok'] is True and len(out['files']) == 1
     assert seen.get('called') is True                 # 仍走 Li-S 便捷入口
     assert 'Li-S discharge path' in calls['ladder'][0]['title']
@@ -2285,16 +4826,22 @@ def test_campaign_list_bad_campaign_does_not_break():
 def _fake_scenarios(calls=None, reg=None, active=None):
     """scenarios 假件:list/get/active/set 全可注入;set 落 calls 便于断言持久化。"""
     calls = calls if calls is not None else {}
-    full = {'key': 'full', 'name': '通用', 'description': '兜底',
+    full = {'key': 'full', 'name': '通用', 'name_en': 'General',
+            'description': '兜底', 'description_en': 'General-purpose fallback mode.',
             'pages': ['dashboard', 'generate', 'project', 'jobs', 'cluster', 'settings'],
             'cards': {}, 'figure_preset_order': ['bar', 'ladder'],
             'reaction_presets': [], 'engines': ['vasp'],
-            'defaults': {'calc_type': 'slab'}, 'ai_context': 'x'}
-    lis = {'key': 'lis', 'name': '锂硫', 'description': 'Li-S',
+            'defaults': {'calc_type': 'slab', 'engine': 'vasp',
+                         'active_calculation': 'relax'},
+            'task_keys': ['relax', 'static', 'bands'], 'ai_context': 'x'}
+    lis = {'key': 'lis', 'name': '锂硫', 'name_en': 'Lithium-sulfur batteries',
+           'description': 'Li-S', 'description_en': 'Lithium-sulfur reaction workflows.',
            'pages': ['dashboard', 'generate', 'project', 'jobs', 'cluster', 'settings'],
            'cards': {}, 'figure_preset_order': ['ladder', 'volcano'],
            'reaction_presets': ['LIS_16E'], 'engines': ['vasp'],
-           'defaults': {'calc_type': 'slab'}, 'ai_context': 'y'}
+           'defaults': {'calc_type': 'slab', 'engine': 'vasp',
+                        'active_calculation': 'relax'},
+           'task_keys': ['relax', 'static'], 'ai_context': 'y'}
     reg = reg if reg is not None else {'full': full, 'lis': lis}
     m = types.SimpleNamespace()
     m.list_scenarios = lambda: [dict(v) for v in reg.values()]
@@ -2319,8 +4866,11 @@ def _fake_figpresets(calls=None, reg=None):
     calls = calls if calls is not None else {}
     reg = reg if reg is not None else {
         'adsorption_bar': {'key': 'adsorption_bar', 'name': '吸附能柱状图',
-                           'category': '能量学', 'description': '柱状',
+                           'name_en': 'Adsorption-energy bar chart',
+                           'category': '能量学', 'category_en': 'Energetics',
+                           'description': '柱状', 'description_en': 'Grouped bars.',
                            'required_data': 'adsorbates+substrates',
+                           'required_data_en': 'adsorbates+substrates',
                            'thumbnail_svg': '<svg id="bar"/>',
                            'params_schema': {'negative_up': False, 'title': ''}},
         'delta_e_heatmap': {'key': 'delta_e_heatmap', 'name': 'ΔE 热图',
@@ -2341,6 +4891,10 @@ def _fake_figpresets(calls=None, reg=None):
                     'thumbnail_svg': '<svg id="vo"/>', 'params_schema': {}},
     }
     m = types.SimpleNamespace()
+    m.CATEGORY_EN = {
+        '能量学': 'Energetics', '电池': 'Electrochemistry',
+        '电子结构': 'Electronic structure', '结构': 'Structure',
+    }
     m.list_presets = lambda category=None: [
         {k: v for k, v in p.items() if k != 'thumbnail_svg'}
         for p in reg.values() if category is None or p['category'] == category]
@@ -2444,14 +4998,12 @@ def test_scenario_list_shape():
     assert {s['key'] for s in out['scenarios']} == {'full', 'lis'}
     lis = next(s for s in out['scenarios'] if s['key'] == 'lis')
     assert 'project' in lis['pages'] and lis['reaction_presets'] == ['LIS_16E']
+    assert lis['name_en'] == 'Lithium-sulfur batteries'
+    assert lis['description_en'] == 'Lithium-sulfur reaction workflows.'
 
 
 def test_scenario_get_configured_true_reads_active():
-    calls = {}
-    api = Api(scenarios_mod=_fake_scenarios(active={'key': 'lis', 'name': '锂硫',
-              'pages': ['dashboard'], 'cards': {}, 'figure_preset_order': [],
-              'reaction_presets': [], 'engines': ['vasp'], 'defaults': {},
-              'ai_context': ''}, calls=calls),
+    api = Api(scenarios_mod=_fake_scenarios(),
               config_mod=_fake_config(ui={'scenario': 'lis'}))
     out = api.scenario_get()
     assert out['ok'] is True and out['configured'] is True
@@ -2466,19 +5018,235 @@ def test_scenario_get_unconfigured_first_launch():
 
 
 def test_scenario_set_persists_and_returns_view():
-    calls = {}
-    api = Api(scenarios_mod=_fake_scenarios(calls=calls))
+    backing = {'ui': {}}
+    api = Api(scenarios_mod=_fake_scenarios(), config_mod=_fake_config_rw(backing))
     out = api.scenario_set('lis')
-    assert out['ok'] is True and out['key'] == 'lis' and calls['set'] == 'lis'
+    assert out['ok'] is True and out['key'] == 'lis'
+    assert backing['ui']['scenario'] == 'lis'
+    assert backing['ui']['workspace_context_revision'] == 1
+    assert backing['ui']['active_engine'] == 'vasp'
+    assert backing['ui']['active_calculation'] == 'relax'
     assert out['scenario']['reaction_presets'] == ['LIS_16E']
+
+
+def test_scenario_set_rejects_unknown_before_persisting():
+    backing = {'ui': {}}
+    api = Api(scenarios_mod=_fake_scenarios(), config_mod=_fake_config_rw(backing))
+    out = api.scenario_set('typo-mode')
+    assert out['ok'] is False and '未知工作模式' in out['error']
+    assert backing == {'ui': {}}
+
+
+def test_calculation_get_falls_back_to_mode_default_and_set_validates():
+    backing = {'ui': {'scenario': 'vasp', 'active_calculation': 'not-a-task'}}
+    api = Api(config_mod=_fake_config_rw(backing))
+    got = api.calculation_get()
+    assert got['ok'] is True and got['configured'] is False
+    assert got['active_calculation'] == 'relax'
+    bad = api.calculation_set('gaussian_fake')
+    assert bad['ok'] is False
+    good = api.calculation_set('bands')
+    assert good['ok'] is True and backing['ui']['active_calculation'] == 'bands'
+
+
+def test_engine_selection_is_persistent_and_filters_calculation_contract():
+    backing = {'ui': {'scenario': 'full', 'active_calculation': 'bands'}}
+    api = Api(config_mod=_fake_config_rw(backing), engines_mod=_fake_engines())
+
+    changed = api.engine_set('cp2k')
+    assert changed['ok'] is True and changed['engine'] == 'cp2k'
+    assert changed['active_calculation'] == 'relax'
+    assert backing['ui']['active_engine'] == 'cp2k'
+    assert backing['ui']['active_calculation'] == 'relax'
+
+    current = api.engine_get()
+    assert current['engine'] == 'cp2k' and current['configured'] is True
+    assert current['capability']['task_keys'] == ['relax', 'static', 'freq']
+    assert api.calculation_set('bands')['ok'] is False
+    assert api.calculation_set('freq')['ok'] is True
+
+
+def test_engine_selection_rejects_mode_incompatible_engine():
+    backing = {'ui': {'scenario': 'molecular'}}
+    api = Api(config_mod=_fake_config_rw(backing), engines_mod=_fake_engines())
+    out = api.engine_set('castep')
+    assert out['ok'] is False and '分子化学' in out['error']
 
 
 def test_scenario_get_error_caught():
     boom = _fake_scenarios()
-    boom.active_scenario = lambda cfg=None: (_ for _ in ()).throw(RuntimeError('场景坏'))
+    boom.list_scenarios = lambda: (_ for _ in ()).throw(RuntimeError('场景坏'))
     api = Api(scenarios_mod=boom, config_mod=_fake_config())
     out = api.scenario_get()
     assert out['ok'] is False and '场景坏' in out['error']
+
+
+def test_workspace_context_store_migrates_legacy_config_and_two_instances_conflict(
+        tmp_path):
+    config_path = tmp_path / 'config.yaml'
+    shared_config.save_config({
+        'potcar_lib_root': '/preserved',
+        'ui': {'scenario': 'full', 'active_engine': 'vasp',
+               'active_calculation': 'relax', 'theme': 'paper'},
+    }, config_path)
+    original_config = config_path.read_bytes()
+    first = WorkspaceContextStore(shared_config, config_path)
+    second = WorkspaceContextStore(shared_config, config_path)
+
+    legacy = first.read()
+    assert legacy['revision'] == 0
+    assert legacy['last_intent_id'] is None
+    winner = second.compare_and_swap(
+        {'scenario': 'full', 'engine': 'cp2k', 'calculation': 'relax'},
+        expected_revision=0, intent_id='window-b:1')
+    loser = first.compare_and_swap(
+        {'scenario': 'lis', 'engine': 'vasp', 'calculation': 'relax'},
+        expected_revision=0, intent_id='window-a:1')
+
+    assert winner['ok'] is True and winner['context']['revision'] == 1
+    assert loser['ok'] is False and loser['conflict'] is True
+    assert loser['context']['engine'] == 'cp2k'
+    assert loser['context']['last_intent_id'] == 'window-b:1'
+    persisted = shared_config.load_config(config_path)
+    assert persisted['potcar_lib_root'] == '/preserved'
+    assert persisted['ui'] == {
+        'scenario': 'full', 'active_engine': 'vasp',
+        'active_calculation': 'relax', 'theme': 'paper'}
+    assert config_path.read_bytes() == original_config
+    state_path = tmp_path / 'workspace-context.json'
+    assert state_path.is_file()
+    assert not list(tmp_path.glob('.config.yaml.*.tmp'))
+    assert not list(tmp_path.glob('.workspace-context.json.*.tmp'))
+
+    # An unrelated Settings writer owns config.yaml.  Its new value must be
+    # preserved, and it cannot roll the server-owned snapshot back to rev 0.
+    shared_config.save_config({
+        'potcar_lib_root': '/changed-elsewhere',
+        'ui': {'scenario': 'lis', 'active_engine': 'vasp',
+               'active_calculation': 'static', 'theme': 'classic'},
+    }, config_path)
+    fresh = WorkspaceContextStore(shared_config, config_path).read()
+    assert fresh['revision'] == 1
+    assert fresh['last_intent_id'] == 'window-b:1'
+    assert {key: fresh[key] for key in ('scenario', 'engine', 'calculation')} == {
+        'scenario': 'full', 'engine': 'cp2k', 'calculation': 'relax'}
+    assert shared_config.load_config(config_path)['ui']['theme'] == 'classic'
+
+
+def test_workspace_context_store_without_path_keeps_revisioned_adapter_authority():
+    backing = {
+        'ui': {'scenario': 'full', 'active_engine': 'vasp',
+               'active_calculation': 'relax'},
+    }
+    store = WorkspaceContextStore(_fake_config_rw(backing))
+
+    first = store.compare_and_swap(
+        {'scenario': 'full', 'engine': 'cp2k', 'calculation': 'relax'},
+        expected_revision=0, intent_id='adapter:1')
+    after_first = store.read()
+    second = store.compare_and_swap(
+        {'scenario': 'lis', 'engine': 'vasp', 'calculation': 'static'},
+        expected_revision=1, intent_id='adapter:2')
+
+    assert first['ok'] is True and after_first['revision'] == 1
+    assert after_first['last_intent_id'] == 'adapter:1'
+    assert second['ok'] is True and second['context']['revision'] == 2
+    assert store.read()['last_intent_id'] == 'adapter:2'
+
+
+def test_workspace_context_store_cross_process_cas_has_one_winner(tmp_path):
+    config_path = tmp_path / 'config.yaml'
+    start_path = tmp_path / 'start.signal'
+    shared_config.save_config({
+        'ui': {'scenario': 'full', 'active_engine': 'vasp',
+               'active_calculation': 'relax'},
+    }, config_path)
+    script = r'''import json, sys, time
+from pathlib import Path
+from vcstudio.gui_web.workspace_context import WorkspaceContextStore
+from vcstudio.shared import config
+path, start, intent, engine = sys.argv[1:]
+while not Path(start).exists():
+    time.sleep(0.005)
+store = WorkspaceContextStore(config, path, lock_timeout=10)
+result = store.compare_and_swap(
+    {"scenario": "full", "engine": engine, "calculation": "relax"},
+    expected_revision=0, intent_id=intent)
+print(json.dumps(result, sort_keys=True))
+'''
+    processes = [
+        subprocess.Popen(
+            [sys.executable, '-c', script, str(config_path), str(start_path),
+             f'process-{index}:1', engine],
+            cwd=Path(__file__).resolve().parents[1], stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, encoding='utf-8')
+        for index, engine in enumerate(('vasp', 'cp2k'))
+    ]
+    start_path.write_text('go', encoding='utf-8')
+    outputs = []
+    for process in processes:
+        stdout, stderr = process.communicate(timeout=20)
+        assert process.returncode == 0, stderr
+        outputs.append(json.loads(stdout))
+
+    assert sum(bool(item['ok']) for item in outputs) == 1
+    assert sum(bool(item['conflict']) for item in outputs) == 1
+    assert {item['context']['revision'] for item in outputs} == {1}
+    final = WorkspaceContextStore(shared_config, config_path).read()
+    assert final['revision'] == 1
+    assert final['last_intent_id'] in {'process-0:1', 'process-1:1'}
+
+
+def test_two_api_instances_reverse_arrival_keeps_committed_latest_context(tmp_path):
+    config_path = tmp_path / 'config.yaml'
+    shared_config.save_config({
+        'ui': {'scenario': 'full', 'active_engine': 'vasp',
+               'active_calculation': 'relax'},
+    }, config_path)
+    slow_store = WorkspaceContextStore(shared_config, config_path)
+    fast_store = WorkspaceContextStore(shared_config, config_path)
+    slow_entered_cas = threading.Event()
+    fast_committed = threading.Event()
+
+    class DelayedStore:
+        def read(self):
+            return slow_store.read()
+
+        def compare_and_swap(self, context, *, expected_revision, intent_id):
+            slow_entered_cas.set()
+            assert fast_committed.wait(timeout=5)
+            return slow_store.compare_and_swap(
+                context, expected_revision=expected_revision, intent_id=intent_id)
+
+    slow_api = Api(workspace_context_store=DelayedStore())
+    fast_api = Api(workspace_context_store=fast_store)
+    results = {}
+
+    thread = threading.Thread(target=lambda: results.setdefault(
+        'a', slow_api.settings_context_update(
+            {'scenario': 'lis'}, 0, 'old-window-a:1')))
+    thread.start()
+    assert slow_entered_cas.wait(timeout=5)
+    results['b'] = fast_api.settings_context_update(
+        {'engine': 'cp2k'}, 0, 'latest-window-b:1')
+    fast_committed.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+    assert results['b']['ok'] is True
+    assert results['b']['context']['engine'] == 'cp2k'
+    assert results['a']['ok'] is False and results['a']['conflict'] is True
+    assert results['a']['context']['revision'] == results['b']['context']['revision'] == 1
+    # A lost response can be retried with the same intent and original
+    # expected revision without creating another commit.
+    replay = fast_api.settings_context_update(
+        {'engine': 'cp2k'}, 0, 'latest-window-b:1')
+    assert replay['ok'] is True and replay['replayed'] is True
+    assert replay['revision'] == 1
+    authoritative = fast_api.settings_context_get()
+    assert authoritative['context']['scenario']['key'] == 'full'
+    assert authoritative['context']['engine'] == 'cp2k'
+    assert authoritative['context']['intent_id'] == 'latest-window-b:1'
 
 
 # ── lang_* / i18n_dict ───────────────────────────────────────────────────────
@@ -2502,6 +5270,7 @@ def test_i18n_dict_returns_full_table():
     out = api.i18n_dict('en')
     assert out['ok'] is True and out['lang'] == 'en'
     assert out['dict']['nav.dashboard'] == 'Dashboard'
+    assert out['source']['nav.dashboard'] == '仪表盘'
 
 
 def test_lang_get_error_caught():
@@ -2520,7 +5289,26 @@ def test_figure_presets_gallery_with_thumbnails():
     bar = next(p for p in out['presets'] if p['key'] == 'adsorption_bar')
     assert bar['thumbnail_svg'] == '<svg id="bar"/>'
     assert bar['params_schema'] == {'negative_up': False, 'title': ''}
+    assert bar['name_en'] == 'Adsorption-energy bar chart'
+    assert bar['category_en'] == 'Energetics'
+    assert bar['description_en'] == 'Grouped bars.'
+    assert bar['required_data_en'] == 'adsorbates+substrates'
     assert '能量学' in out['categories']
+    assert out['categories_en'][0] == 'Energetics'
+
+
+def test_real_figure_preset_catalog_exposes_complete_english_metadata():
+    out = Api().figure_presets()
+    assert out['ok'] is True and out['presets']
+    for preset in out['presets']:
+        for field in ('name_en', 'category_en', 'description_en', 'required_data_en'):
+            assert preset[field].strip(), (preset['key'], field)
+            assert not re.search(r'[\u3400-\u9fff]', preset[field]), (preset['key'], field)
+    assert out['categories_en'] == [
+        'Energetics', 'Electrochemistry', 'Electronic structure', 'Structure',
+    ] or set(out['categories_en']) == {
+        'Energetics', 'Electrochemistry', 'Electronic structure', 'Structure',
+    }
 
 
 def test_render_figure_preset_bar_assembles_from_delta(tmp_path):
@@ -2528,7 +5316,7 @@ def test_render_figure_preset_bar_assembles_from_delta(tmp_path):
     ads = _fake_adsorption(proj_map={'/p': _proj('demo', str(tmp_path))},
                            delta_ret=_delta({'O': -1.0, 'OH': -2.0}))
     api = Api(figure_presets_mod=_fake_figpresets(calls=calls), adsorption_mod=ads)
-    out = api.render_figure_preset('adsorption_bar', '/p', {'save_to': str(tmp_path)})
+    out = api._render_figure_preset_for_path('adsorption_bar', '/p', {'save_to': str(tmp_path)})
     assert out['ok'] is True and len(out['files']) == 1 and out['skipped'] == []
     data = calls['render'][0]['data']
     assert data['adsorbates'] == ['O', 'OH']
@@ -2541,7 +5329,7 @@ def test_render_figure_preset_heatmap_rows_cols_values(tmp_path):
     ads = _fake_adsorption(proj_map={'/p': _proj('demo', str(tmp_path))},
                            delta_ret=_delta({'O': -1.0, 'OH': -2.0}))
     api = Api(figure_presets_mod=_fake_figpresets(calls=calls), adsorption_mod=ads)
-    out = api.render_figure_preset('delta_e_heatmap', '/p', {'save_to': str(tmp_path)})
+    out = api._render_figure_preset_for_path('delta_e_heatmap', '/p', {'save_to': str(tmp_path)})
     assert out['ok'] is True
     data = calls['render'][0]['data']
     assert data['rows'] == ['demo'] and data['cols'] == ['O', 'OH']
@@ -2555,13 +5343,13 @@ def test_render_figure_preset_ladder_lis_default(tmp_path):
     fed = {'steps': [{'label': 'S8*', 'G': 0.0}, {'label': 'Li2S*', 'G': -1.0}],
            'pds_index': 0, 'u_l': 1.5}
     fe = types.SimpleNamespace(
-        path_from_project_and_molecules=lambda rows, e_slab, molecules_dir: fed)
+        path_from_project_and_molecules=lambda rows, e_slab, molecules_dir, **kw: fed)
     ads = _fake_adsorption(proj_map={'/p': _proj('liS', str(tmp_path))},
                            delta_ret=_delta({'liS_ads_Li2S4': -1.2}))
     api = Api(figure_presets_mod=_fake_figpresets(calls=calls), adsorption_mod=ads,
               freeenergy_mod=fe,
               config_mod=_fake_config(cfg={'lis_molecules_dir': str(mol)}))
-    out = api.render_figure_preset('free_energy_ladder', '/p', {'save_to': str(tmp_path)})
+    out = api._render_figure_preset_for_path('free_energy_ladder', '/p', {'save_to': str(tmp_path)})
     assert out['ok'] is True and len(out['files']) == 1
     data = calls['render'][0]['data']
     assert data['paths'][0]['G'] == [0.0, -1.0] and data['pds_index'] == 0
@@ -2570,14 +5358,14 @@ def test_render_figure_preset_ladder_lis_default(tmp_path):
 
 def test_render_figure_preset_pdos_skipped_needs_parse(tmp_path):
     api = Api(figure_presets_mod=_fake_figpresets(), adsorption_mod=_fake_adsorption())
-    out = api.render_figure_preset('pdos', '/p', {})
+    out = api._render_figure_preset_for_path('pdos', '/p', {})
     assert out['ok'] is True and out['files'] == []
     assert out['skipped'][0]['kind'] == 'pdos' and 'PDOS' in out['skipped'][0]['reason']
 
 
 def test_render_figure_preset_volcano_skipped_multi(tmp_path):
     api = Api(figure_presets_mod=_fake_figpresets(), adsorption_mod=_fake_adsorption())
-    out = api.render_figure_preset('volcano', '/p', {})
+    out = api._render_figure_preset_for_path('volcano', '/p', {})
     assert out['ok'] is True and out['files'] == []
     assert '多催化剂' in out['skipped'][0]['reason']
 
@@ -2590,14 +5378,14 @@ def test_render_figure_preset_no_done_skipped(tmp_path):
                                                 'e_config': None, 'delta_e': None,
                                                 'note': ''}]})
     api = Api(figure_presets_mod=_fake_figpresets(), adsorption_mod=ads)
-    out = api.render_figure_preset('adsorption_bar', '/p', {})
+    out = api._render_figure_preset_for_path('adsorption_bar', '/p', {})
     assert out['ok'] is True and out['files'] == []
     assert 'ΔE' in out['skipped'][0]['reason']
 
 
 def test_render_figure_preset_unknown_key_error():
     api = Api(figure_presets_mod=_fake_figpresets(), adsorption_mod=_fake_adsorption())
-    out = api.render_figure_preset('nope', '/p', {})
+    out = api._render_figure_preset_for_path('nope', '/p', {})
     assert out['ok'] is False and '未知图表预设' in out['error']
 
 
@@ -2606,7 +5394,7 @@ def test_draft_ready_aggregates_products(tmp_path):
     calls = {}
     ads = _fake_adsorption(proj_map={'/p': _proj('demo', str(tmp_path))})
     api = Api(adsorption_mod=ads, draftpack_mod=_fake_draftpack(calls=calls))
-    out = api.draft_ready('/p', str(tmp_path))
+    out = api._draft_ready_for_path('/p', str(tmp_path))
     assert out['ok'] is True and out['error'] is None
     assert out['out_dir'] == str(tmp_path)
     # products 汇总 SI + 表格 + 方法学 + 总结
@@ -2623,14 +5411,14 @@ def test_draft_ready_not_ok_passthrough(tmp_path):
                       'tables': {'files': []}, 'methods': {'files': []}}}
     ads = _fake_adsorption(proj_map={'/p': _proj('demo', str(tmp_path))})
     api = Api(adsorption_mod=ads, draftpack_mod=_fake_draftpack(ret=ret))
-    out = api.draft_ready('/p', str(tmp_path))
+    out = api._draft_ready_for_path('/p', str(tmp_path))
     assert out['ok'] is False and out['issues_total'] == 1
     assert out['issues'] == ['[待确认:X 无 ΔE]']
 
 
 def test_draft_ready_missing_project_error():
     api = Api(adsorption_mod=_fake_adsorption(), draftpack_mod=_fake_draftpack())
-    out = api.draft_ready('/nope', '/out')
+    out = api._draft_ready_for_path('/nope', '/out')
     assert out['ok'] is False and '项目不存在' in out['error']
 
 
@@ -2686,11 +5474,18 @@ def test_engine_list_all_and_scenario_visibility():
     assert {e['key'] for e in out['engines']} == {'vasp', 'cp2k', 'gaussian', 'castep'}
     vasp = next(e for e in out['engines'] if e['key'] == 'vasp')
     assert vasp['experimental'] is False and vasp['visible'] is True
+    assert vasp['support_level'] == 'full' and 'bands' in vasp['task_keys']
+    cp2k = next(e for e in out['engines'] if e['key'] == 'cp2k')
+    assert cp2k['task_keys'] == ['relax', 'static', 'freq']
+    assert 'cutoff_ry' in cp2k['fields'] and 'cutoff_ev' not in cp2k['fields']
+    castep = next(e for e in out['engines'] if e['key'] == 'castep')
+    assert castep['boundaries'] == ['periodic']
     # 分子化学场景:Gaussian 可见,CP2K/CASTEP 不在场景引擎白名单
     out2 = api.engine_list('molecular')
     vis = {e['key']: e['visible'] for e in out2['engines']}
     assert vis['vasp'] is True and vis['gaussian'] is True
     assert vis['cp2k'] is False and vis['castep'] is False
+    assert out2['default'] == 'gaussian'
 
 
 def test_engine_generate_builds_calcspec_and_writes(tmp_path):
@@ -2700,11 +5495,13 @@ def test_engine_generate_builds_calcspec_and_writes(tmp_path):
     api = Api(engines_mod=_fake_engines(calls=calls))
     out = api.engine_generate('cp2k', {
         'poscar': str(poscar), 'task': 'relax', 'functional': 'PBE',
-        'cutoff_ev': 500, 'kpoints': [3, 3, 1], 'spin': True, 'charge': 0,
+        'cutoff_ry': 500, 'rel_cutoff_ry': 70, 'spin': True, 'charge': 0,
         'periodic': True}, str(tmp_path / 'cp2k_out'))
     assert out['ok'] is True and out['files'] == [str(tmp_path / 'cp2k_out') + '/cp2k.inp']
     assert calls['engine'] == 'cp2k'
-    assert calls['spec']['cutoff_ev'] == 500.0 and calls['spec']['kpoints'] == (3, 3, 1)
+    assert calls['spec']['cutoff_ev'] is None and calls['spec']['kpoints'] is None
+    assert calls['spec']['extras']['cutoff_ry'] == 500
+    assert calls['spec']['extras']['rel_cutoff_ry'] == 70
     assert calls['spec']['spin'] is True
 
 
@@ -2715,13 +5512,41 @@ def test_engine_generate_surfaces_validate_issues(tmp_path):
         validate_issues=['周期性计算必须指定 cutoff_ev(平面波截断能,eV);缺失或非正值。']))
     out = api.engine_generate('cp2k', {'poscar': str(poscar), 'periodic': True},
                               str(tmp_path / 'o'))
-    assert out['ok'] is True and out['issues'] and 'cutoff_ev' in out['issues'][0]
+    assert out['ok'] is True and out['issues']
+    assert 'CUTOFF（Ry）' in out['issues'][0] and 'cutoff_ev' not in str(out['issues'])
 
 
 def test_engine_generate_missing_poscar_error(tmp_path):
     api = Api(engines_mod=_fake_engines())
     out = api.engine_generate('cp2k', {'poscar': '/nope/POSCAR'}, str(tmp_path))
     assert out['ok'] is False and '结构文件' in out['error']
+
+
+def test_engine_generate_rejects_unadvertised_task_and_castep_molecule(tmp_path):
+    poscar = tmp_path / 'POSCAR'
+    poscar.write_text(_EDITOR_POSCAR, encoding='utf-8')
+    api = Api(engines_mod=_fake_engines())
+    unsupported = api.engine_generate(
+        'cp2k', {'poscar': str(poscar), 'task': 'bands', 'periodic': True},
+        str(tmp_path / 'cp2k'))
+    assert unsupported['ok'] is False and '不支持任务' in unsupported['error']
+    molecule = api.engine_generate(
+        'castep', {'poscar': str(poscar), 'task': 'static', 'periodic': False},
+        str(tmp_path / 'castep'))
+    assert molecule['ok'] is False and '孤立分子' in molecule['error']
+
+
+def test_engine_generate_rejects_duplicate_vasp_adapter_path(tmp_path):
+    poscar = tmp_path / 'POSCAR'
+    poscar.write_text(_EDITOR_POSCAR, encoding='utf-8')
+    api = Api(engines_mod=_fake_engines())
+    generated = api.engine_generate(
+        'vasp', {'poscar': str(poscar), 'task': 'relax', 'cutoff_ev': 500},
+        str(tmp_path / 'out'))
+    preview = api.engine_preview(
+        'vasp', {'poscar': str(poscar), 'task': 'relax', 'cutoff_ev': 500})
+    assert generated['ok'] is False and '主工作流' in generated['error']
+    assert preview['ok'] is False and '四件套预览' in preview['error']
 
 
 def test_engine_nonequiv_report():
@@ -3132,19 +5957,42 @@ def test_engine_generate_passes_extras(tmp_path):
 
 
 # ── quick_submit_build ───────────────────────────────────────────────────────
-def _fake_quick_submit(*, jobs=None, skipped=None, ok=True, error=None, calls=None):
+def _fake_quick_submit(*, jobs=None, skipped=None, ok=True, error=None, calls=None,
+                       scan_items=None):
     calls = calls if calls is not None else {}
     m = types.SimpleNamespace()
 
-    def _build(files, out_root, job_prefix=''):
-        calls['build'] = {'files': list(files), 'out_root': out_root, 'prefix': job_prefix}
+    def _scan(paths, *, shared_incar=''):
+        calls['scan'] = {'paths': list(paths), 'shared_incar': shared_incar}
+        items = list(scan_items or [])
+        return {'ok': True, 'items': items,
+                'summary': {'total': len(items),
+                            'ready': sum(bool(x.get('can_build')) for x in items)},
+                'error': None}
+
+    def _build(files, out_root, job_prefix='', **kwargs):
+        calls['build'] = {'files': list(files), 'out_root': out_root,
+                          'prefix': job_prefix, **kwargs}
         return {'ok': ok, 'jobs': list(jobs if jobs is not None else
                 [{'dir': out_root + '/benzene', 'name': 'benzene', 'engine': 'gaussian',
                   'files': ['benzene.gjf']}]),
-                'skipped': list(skipped or []), 'error': error}
+                'skipped': list(skipped or []), 'preflight': {'summary': {'total': 1}},
+                'error': error}
+    m.scan_inputs = _scan
     m.build_quick_jobs = _build
     m.submit_hint = lambda engine: f'{engine}-cmd-hint'
     return m
+
+
+def test_quick_submit_scan_forwards_shared_incar():
+    calls = {}
+    item = {'path': '/batch/a', 'can_build': True}
+    api = Api(quick_submit_mod=_fake_quick_submit(scan_items=[item], calls=calls))
+
+    out = api.quick_submit_scan(['/batch'], '/common/INCAR')
+
+    assert out['ok'] is True and out['items'] == [item]
+    assert calls['scan'] == {'paths': ['/batch'], 'shared_incar': '/common/INCAR'}
 
 
 def test_quick_submit_build_registers_and_hints(tmp_path):
@@ -3156,6 +6004,22 @@ def test_quick_submit_build_registers_and_hints(tmp_path):
     j = out['jobs'][0]
     assert j['engine'] == 'gaussian' and j['hint'] == 'gaussian-cmd-hint'
     assert j['registered'] is True and registered == [j['dir']]
+
+
+def test_quick_submit_build_forwards_shared_generation_options(tmp_path):
+    calls = {}
+    api = Api(quick_submit_mod=_fake_quick_submit(calls=calls),
+              ledger_mod=_fake_ledger_register([]),
+              config_mod=_fake_config(cfg={'potcar_lib_root': '/configured/paw'}))
+
+    out = api.quick_submit_build(
+        ['/batch'], str(tmp_path), 'p_', '/common/INCAR', '', 'molecule')
+
+    assert out['ok'] is True and out['preflight']['summary']['total'] == 1
+    built = calls['build']
+    assert built['shared_incar'] == '/common/INCAR'
+    assert built['lib_root'] == '/configured/paw'
+    assert built['calc_type'] == 'molecule' and built['prefix'] == 'p_'
 
 
 def test_quick_submit_build_reports_skipped(tmp_path):
@@ -3201,6 +6065,29 @@ def test_jobs_cancel_batch_ok():
     out = api.jobs_cancel_batch(['/j/a', '/j/b'], 'c1', None, False)
     assert out['ok'] is True and out['cancelled'] == ['12345']
     assert calls['cancel']['jobs'] == ['/j/a', '/j/b']
+
+
+def test_jobs_cancel_batch_sinks_operation_id_and_preserves_recovery_contract():
+    calls = {}
+
+    def _cancel(_profile, jobs, *, password=None, trust_new=False,
+                idempotency_key=None):
+        calls.update(jobs=list(jobs), password=password, trust_new=trust_new,
+                     idempotency_key=idempotency_key)
+        return {
+            'ok': False, 'cancelled': [], 'failed': [], 'needs_trust': False,
+            'busy': True, 'code': 'job_busy', 'busy_count': 1, 'error': None,
+        }
+
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              batch_ops_mod=types.SimpleNamespace(cancel_batch=_cancel))
+    key = 'jobop-cancel-api-contract-001'
+
+    out = api.jobs_cancel_batch(['/j/a'], 'c1', None, False, key)
+
+    assert calls['idempotency_key'] == key
+    assert out['busy'] is True and out['code'] == 'job_busy'
 
 
 def test_jobs_cancel_batch_no_dirs_error():
@@ -3293,9 +6180,12 @@ def test_local_run_cancel_missing_dir_error():
 
 # ── remote_ls / remote_fetch_file ────────────────────────────────────────────
 class _FakeConnectError(Exception):
-    def __init__(self, message, needs_trust=False):
+    def __init__(self, message, needs_trust=False, *, fingerprint='', algorithm='', host=''):
         super().__init__(message)
         self.needs_trust = needs_trust
+        self.fingerprint = fingerprint
+        self.algorithm = algorithm
+        self.host = host
 
 
 def _fake_connection(*, entries=None, connect_boom=None, calls=None, exec_ret=None):
@@ -3387,9 +6277,13 @@ def test_remote_ls_connect_error_needs_trust():
     store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
     api = Api(profiles_mod=_fake_profiles(store),
               connection_mod=_fake_connection(
-                  connect_boom=_FakeConnectError('未知指纹', needs_trust=True)))
+                  connect_boom=_FakeConnectError(
+                      '未知指纹', needs_trust=True, fingerprint='SHA256:abc',
+                      algorithm='ssh-ed25519', host='h')))
     out = api.remote_ls('c1', None, '.')
     assert out['ok'] is False and out['needs_trust'] is True and '指纹' in out['error']
+    assert (out['host'], out['fingerprint'], out['algorithm']) == (
+        'h', 'SHA256:abc', 'ssh-ed25519')
 
 
 def test_remote_ls_needs_password():
@@ -3707,10 +6601,20 @@ def _fake_task_catalog():
     m = types.SimpleNamespace()
     m.CATEGORIES = ('基础', '电子结构', '热力学与动力学', '性质', '收敛与校验')
     m.list_catalog = lambda category=None: [
-        {'key': 'relax', 'name_zh': '结构优化', 'category': '基础',
-         'description': '弛豫', 'requires': 'POSCAR', 'outputs': 'CONTCAR', 'figure': None},
-        {'key': 'eos', 'name_zh': '状态方程', 'category': '性质',
-         'description': 'BM3', 'requires': '平衡结构', 'outputs': 'E-V', 'figure': 'eos'},
+        {'key': 'relax', 'name_zh': '结构优化', 'name_en': 'Geometry optimization',
+         'category': '基础', 'category_en': 'Fundamentals',
+         'description': '弛豫', 'description_en': 'Relax the geometry.',
+         'requires': 'POSCAR', 'requires_en': 'POSCAR',
+         'outputs': 'CONTCAR', 'outputs_en': 'CONTCAR',
+         'next_action_en': 'Verify force convergence before using CONTCAR.',
+         'figure': None},
+        {'key': 'eos', 'name_zh': '状态方程', 'name_en': 'Equation of state',
+         'category': '性质', 'category_en': 'Properties',
+         'description': 'BM3', 'description_en': 'Fit an equation of state.',
+         'requires': '平衡结构', 'requires_en': 'Equilibrium structure',
+         'outputs': 'E-V', 'outputs_en': 'Energy-volume series',
+         'next_action_en': 'Inspect the fitted minimum and residuals.',
+         'figure': 'eos'},
     ]
     return m
 
@@ -3812,7 +6716,9 @@ def _fake_surface_energy(*, area=100.0, gamma=1.23, calls=None):
     m = types.SimpleNamespace()
     m.area_from_poscar = lambda text: area
     m.surface_energy = lambda e_slab, n_slab, e_bpa, a, **kw: (
-        calls.__setitem__('se', {'e_slab': e_slab, 'n_slab': n_slab, 'e_bpa': e_bpa, 'a': a}) or gamma)
+        calls.__setitem__('se', {'e_slab': e_slab, 'n_slab': n_slab, 'e_bpa': e_bpa, 'a': a}) or
+        {'gamma_jm2': gamma, 'gamma_evA2': gamma / 16.02176634,
+         'note': '真实字典返回', 'warnings': []})
     return m
 
 
@@ -3844,7 +6750,8 @@ def _fake_auto_figures(*, ret=None, calls=None):
 
     def _run(proj, scenario, out_dir, *, journal='nature', **kw):
         calls['run'] = {'scenario': scenario, 'journal': journal,
-                        'compose_panel': kw.get('compose_panel')}
+                        'compose_panel': kw.get('compose_panel'),
+                        'molecules_dir': kw.get('molecules_dir')}
         return ret if ret is not None else {
             'ok': True, 'out_dir': os.path.join(out_dir, 'figures'),
             'files': [os.path.join(out_dir, 'figures', 'adsorption_bar.png')],
@@ -3962,6 +6869,36 @@ def test_task_catalog_shape():
     keys = {t['key'] for t in out['tasks']}
     assert 'relax' in keys and 'eos' in keys
     assert out['tasks'][0]['name_zh'] == '结构优化'
+    assert out['categories_en'] == ['Fundamentals', 'Properties']
+    relax = next(row for row in out['tasks'] if row['key'] == 'relax')
+    assert relax['name_en'] == 'Geometry optimization'
+    assert relax['description_en'] == 'Relax the geometry.'
+    assert relax['requires_en'] == 'POSCAR' and relax['outputs_en'] == 'CONTCAR'
+    assert relax['kind_badge_en'] == 'Job generator'
+    assert relax['next_action_en'] == 'Verify force convergence before using CONTCAR.'
+
+
+def test_task_catalog_filters_by_work_mode_and_active_calculation():
+    api = Api()
+    battery = api.task_catalog('battery_bulk')
+    keys = {t['key'] for t in battery['tasks']}
+    assert 'cellopt' in keys and 'bands' in keys
+    assert 'adsorption_project' not in keys and 'neb' not in keys
+    one = api.task_catalog('vasp', 'workfunction')
+    assert [t['key'] for t in one['tasks']] == ['workfunction']
+
+
+def test_task_catalog_filters_non_vasp_to_closed_loop_tasks():
+    api = Api()
+    out = api.task_catalog('full', None, 'cp2k')
+    assert out['ok'] is True and out['engine'] == 'cp2k'
+    assert [row['key'] for row in out['tasks']] == ['relax', 'static', 'freq']
+    assert all(row['kind_badge'] == '引擎输入生成' for row in out['tasks'])
+    assert all('CP2K' in row['next_action'] for row in out['tasks'])
+    assert all(row['kind_badge_en'] == 'Engine input generator' for row in out['tasks'])
+    assert all('cp2k.inp' in row['requires_en'] for row in out['tasks'])
+    assert all('cp2k.out' in row['outputs_en'] for row in out['tasks'])
+    assert all('CP2K' in row['next_action_en'] for row in out['tasks'])
 
 
 def test_task_catalog_error_caught():
@@ -4173,16 +7110,58 @@ def test_surface_energy_calc_auto_area_and_bulk(tmp_path):
     slab.mkdir()
     _write_poscar(slab, natoms=6)
     (slab / 'OSZICAR').write_text('1 F= x E0= -60.0E+00 dE=0\n', encoding='utf-8')
+    _mark_done_energy_job(slab, -60.0, ['Si'])
     bulk = tmp_path / 'bulk'
     bulk.mkdir()
     _write_poscar(bulk, natoms=2)
     (bulk / 'OSZICAR').write_text('1 F= x E0= -20.0E+00 dE=0\n', encoding='utf-8')
+    _mark_done_energy_job(bulk, -20.0, ['Si'])
     calls = {}
     api = Api(surface_energy_mod=_fake_surface_energy(calls=calls))
     out = api.surface_energy_calc(str(slab), str(bulk))
     assert out['ok'] is True and out['gamma_jm2'] == 1.23
     assert out['area_a2'] == 100.0 and out['n_slab'] == 6
     assert calls['se']['e_bpa'] == -10.0    # -20/2
+    assert out['method_check']['status'] == 'verified'
+    assert out['report_file'] and os.path.isfile(out['report_file'])
+
+
+def test_surface_energy_rejects_unfinished_and_known_method_conflict(tmp_path):
+    slab = tmp_path / 'slab'
+    slab.mkdir()
+    _write_poscar(slab, natoms=6)
+    (slab / 'OSZICAR').write_text(_osz(-60.0), encoding='utf-8')
+    _mark_done_energy_job(slab, -60.0, ['Si'])
+    bulk = tmp_path / 'bulk'
+    bulk.mkdir()
+    _write_poscar(bulk, natoms=2)
+    (bulk / 'OSZICAR').write_text(_osz(-20.0), encoding='utf-8')
+    _mark_done_energy_job(bulk, -20.0, ['Si'], titel_suffix='different')
+    api = Api(surface_energy_mod=_fake_surface_energy())
+    mismatch = api.surface_energy_calc(str(slab), str(bulk))
+    assert mismatch['ok'] is False
+    assert mismatch['method_check']['status'] == 'incompatible'
+    assert 'POTCAR' in mismatch['error']
+
+    os.remove(slab / 'OUTCAR')
+    from vcstudio.shared import manifest as real_manifest
+    manifest_value = real_manifest.load_manifest(slab)
+    manifest_value['results']['diagnosis']['clean_exit'] = False
+    real_manifest.save_manifest(slab, manifest_value)
+    unfinished = api.surface_energy_calc(str(slab), str(bulk))
+    assert unfinished['ok'] is False and 'timing 页脚' in unfinished['error']
+
+
+def test_surface_energy_manual_bulk_energy_is_explicitly_unverified(tmp_path):
+    slab = tmp_path / 'slab'
+    slab.mkdir()
+    _write_poscar(slab, natoms=6)
+    (slab / 'OSZICAR').write_text(_osz(-60.0), encoding='utf-8')
+    _mark_done_energy_job(slab, -60.0, ['Si'])
+    api = Api(surface_energy_mod=_fake_surface_energy())
+    out = api.surface_energy_calc(str(slab), '', -10.0)
+    assert out['ok'] is True and out['method_check']['status'] == 'unverified'
+    assert any('手工输入' in warning for warning in out['warnings'])
 
 
 def test_surface_energy_calc_missing_slab():
@@ -4302,14 +7281,14 @@ def test_ai_compare_project_vs_reference(tmp_path):
     api = Api(adsorption_mod=ads, paper_data_mod=_fake_paper_data())
     tables = [{'label': 'T1', 'kind': 'E_ads',
                'rows': [{'system': 'Fe@N4', 'species': 'Li2S4', 'value_ev': -1.5}]}]
-    out = api.ai_compare(str(tmp_path), tables)
+    out = api._ai_compare_for_path(str(tmp_path), tables)
     assert out['ok'] is True and out['n'] == 1 and out['mae'] == 0.1
     assert 'MAE' in out['summary']
 
 
 def test_ai_compare_missing_project():
     api = Api(adsorption_mod=_fake_adsorption(proj_map={}), paper_data_mod=_fake_paper_data())
-    out = api.ai_compare('/no/proj', [])
+    out = api._ai_compare_for_path('/no/proj', [])
     assert out['ok'] is False and '项目' in out['error']
 
 
@@ -4319,7 +7298,7 @@ def test_ai_write_validation_writes_md(tmp_path):
                            delta_ret={'rows': [{'species': 'Li2S4', 'delta_e': -1.4,
                                                  'is_most_stable': True, 'name': 'c1'}]})
     api = Api(adsorption_mod=ads, paper_data_mod=_fake_paper_data(md_ret='## 文献对照\n表格\n'))
-    out = api.ai_write_validation(str(tmp_path), [{'kind': 'E_ads', 'rows': []}])
+    out = api._ai_write_validation_for_path(str(tmp_path), [{'kind': 'E_ads', 'rows': []}])
     assert out['ok'] is True and out['path'].endswith('validation.md')
     assert os.path.isfile(out['path'])
     assert '文献对照' in open(out['path'], encoding='utf-8').read()
@@ -4327,7 +7306,7 @@ def test_ai_write_validation_writes_md(tmp_path):
 
 def test_ai_write_validation_missing_project():
     api = Api(adsorption_mod=_fake_adsorption(proj_map={}), paper_data_mod=_fake_paper_data())
-    out = api.ai_write_validation('/no/proj', [])
+    out = api._ai_write_validation_for_path('/no/proj', [])
     assert out['ok'] is False and '项目' in out['error']
 
 
@@ -4355,7 +7334,7 @@ def test_ai_manuscript_returns_stats(tmp_path):
     ads = _fake_adsorption(proj_map={str(tmp_path): proj})
     calls = {}
     api = Api(adsorption_mod=ads, manuscript_draft_mod=_fake_manuscript(calls=calls))
-    out = api.ai_manuscript(str(tmp_path), fmt='markdown')
+    out = api._ai_manuscript_for_path(str(tmp_path), fmt='markdown')
     assert out['ok'] is True and out['stats']['auto'] == 10
     assert out['placeholders_count'] == 5 and out['docx_available'] is False
     assert calls['build']['fmt'] == 'markdown'
@@ -4364,7 +7343,7 @@ def test_ai_manuscript_returns_stats(tmp_path):
 def test_ai_manuscript_missing_project():
     api = Api(adsorption_mod=_fake_adsorption(proj_map={}),
               manuscript_draft_mod=_fake_manuscript())
-    out = api.ai_manuscript('/no/proj')
+    out = api._ai_manuscript_for_path('/no/proj')
     assert out['ok'] is False and '项目' in out['error']
 
 
@@ -4695,6 +7674,36 @@ def _vasp5_poscar(species, counts):
     return head + '0.0 0.0 0.0\n' * sum(counts)
 
 
+def _mark_done_energy_job(folder, energy, species, *, encut=500, kmesh=(3, 3, 1),
+                          exit_code=0, clean=True, titel_suffix='standard'):
+    """为能量计算器测试构造可追溯 DONE 作业，不依赖集群。"""
+    from vcstudio.shared import manifest as real_manifest
+
+    (folder / 'INCAR').write_text(
+        f'GGA=PE\nENCUT={encut}\nISPIN=2\nIVDW=12\nLDAU=F\n', encoding='utf-8')
+    (folder / 'KPOINTS').write_text(
+        f'Gamma\n0\nGamma\n{kmesh[0]} {kmesh[1]} {kmesh[2]}\n0 0 0\n',
+        encoding='utf-8')
+    (folder / 'POTCAR').write_text(''.join(
+        f'TITEL = PAW_PBE {element} {titel_suffix}\n' for element in species),
+        encoding='utf-8')
+    if clean:
+        (folder / 'OUTCAR').write_text(
+            'General timing and accounting informations for this job:\n', encoding='utf-8')
+    m = real_manifest.new_manifest(
+        job_id=folder.name, system=folder.name, task_type='static', calc_type='slab',
+        inputs={'potcar': [
+            {'element': element, 'titel': f'PAW_PBE {element} {titel_suffix}'}
+            for element in species]})
+    real_manifest.set_state(m, 'DONE')
+    m['results'] = {
+        'energy_e0_eV': float(energy),
+        'diagnosis': {'failure_class': 'CONVERGED', 'clean_exit': bool(clean),
+                      'exit_code': exit_code},
+    }
+    real_manifest.save_manifest(folder, m)
+
+
 def _fake_neb_builder(*, calls=None, boom=None):
     calls = calls if calls is not None else {}
     m = types.SimpleNamespace()
@@ -4867,12 +7876,14 @@ def _mk_fb_dirs(tmp_path, *, e_sac=-300.0, e_sub=-295.0, with_sub=True):
     sac.mkdir()
     (sac / 'CONTCAR').write_text(_vasp5_poscar(['Fe', 'N', 'C'], [1, 4, 22]), encoding='utf-8')
     (sac / 'OSZICAR').write_text(_osz(e_sac), encoding='utf-8')
+    _mark_done_energy_job(sac, e_sac, ['Fe', 'N', 'C'])
     sub = None
     if with_sub:
         sub = tmp_path / 'sub'
         sub.mkdir()
         (sub / 'CONTCAR').write_text(_vasp5_poscar(['N', 'C'], [4, 22]), encoding='utf-8')
         (sub / 'OSZICAR').write_text(_osz(e_sub), encoding='utf-8')
+        _mark_done_energy_job(sub, e_sub, ['N', 'C'])
     return str(sac), (str(sub) if sub else None)
 
 
@@ -4885,6 +7896,9 @@ def test_formation_binding_eb_and_sigma(tmp_path):
     assert out['binding_energy'] == -2.0                     # -300 -(-295) -(-3)
     assert out['sigma'] == round(2.0 / 4.28, 4) and out['stable'] is False
     assert calls['be'] == (-300.0, -295.0, -3.0)             # 真调 references.binding_energy
+    assert out['method_check']['status'] == 'verified'
+    assert any('孤立原子能量' in warning for warning in out['warnings'])
+    assert out['report_file'] and os.path.isfile(out['report_file'])
 
 
 def test_formation_binding_ef_with_chem_pots(tmp_path):
@@ -4928,12 +7942,39 @@ def test_formation_binding_ef_missing_mu_caught(tmp_path):
 
 
 def test_formation_binding_missing_sac_energy(tmp_path):
+    from vcstudio.shared import manifest as real_manifest
+
     sac = tmp_path / 'sac'
     sac.mkdir()
-    (sac / 'CONTCAR').write_text(_vasp5_poscar(['Fe'], [1]), encoding='utf-8')  # 无 OSZICAR
+    (sac / 'CONTCAR').write_text(_vasp5_poscar(['Fe'], [1]), encoding='utf-8')
+    _mark_done_energy_job(sac, -1.0, ['Fe'])
+    m = real_manifest.load_manifest(sac)
+    m['results'].pop('energy_e0_eV')
+    real_manifest.save_manifest(sac, m)
     api = Api(references_mod=_fake_references())
     out = api.formation_binding_calc(str(sac))
-    assert out['ok'] is False and 'E_sac' in out['error']
+    assert out['ok'] is False and 'energy_e0_eV' in out['error']
+
+
+def test_formation_binding_rejects_non_done_or_method_mismatch(tmp_path):
+    from vcstudio.shared import manifest as real_manifest
+
+    sac, sub = _mk_fb_dirs(tmp_path)
+    m = real_manifest.load_manifest(sac)
+    m['state'] = 'RUNNING'
+    real_manifest.save_manifest(sac, m)
+    api = Api(references_mod=_fake_references())
+    blocked = api.formation_binding_calc(sac, sub, {'Fe': -3.0})
+    assert blocked['ok'] is False and 'DONE' in blocked['error']
+
+    m['state'] = 'DONE'
+    real_manifest.save_manifest(sac, m)
+    with open(os.path.join(sub, 'INCAR'), 'a', encoding='utf-8') as handle:
+        handle.write('ENCUT=400\n')
+    mismatch = api.formation_binding_calc(sac, sub, {'Fe': -3.0})
+    assert mismatch['ok'] is False
+    assert mismatch['method_check']['status'] == 'incompatible'
+    assert 'ENCUT' in mismatch['error']
 
 
 def test_formation_binding_missing_dir():
@@ -4983,6 +8024,9 @@ def test_compute_chgdiff_happy_with_profile(tmp_path):
         d = tmp_path / tag
         d.mkdir()
         (d / 'CHGCAR').write_text('grid', encoding='utf-8')
+        (d / 'CONTCAR').write_text(_vasp5_poscar(['Si'], [1]), encoding='utf-8')
+        (d / 'OSZICAR').write_text(_osz(-10.0), encoding='utf-8')
+        _mark_done_energy_job(d, -10.0, ['Si'])
         dirs[tag] = str(d)
     calls = {}
     api = Api(chgdiff_mod=_fake_chgdiff(calls=calls))
@@ -4991,6 +8035,26 @@ def test_compute_chgdiff_happy_with_profile(tmp_path):
     assert out['out'].endswith('CHGDIFF.vasp')
     assert out['profile']['z'] == [0.0, 1.0]                 # 面平均 charge_profile
     assert os.path.basename(calls['compute']['ab']) == 'CHGCAR'
+    assert out['report_file'] and os.path.isfile(out['report_file'])
+
+
+def test_compute_chgdiff_rejects_method_mismatch_before_grid_subtraction(tmp_path):
+    dirs = {}
+    for tag in ('AB', 'A', 'B'):
+        d = tmp_path / tag
+        d.mkdir()
+        (d / 'CHGCAR').write_text('grid', encoding='utf-8')
+        (d / 'CONTCAR').write_text(_vasp5_poscar(['Si'], [1]), encoding='utf-8')
+        (d / 'OSZICAR').write_text(_osz(-10.0), encoding='utf-8')
+        _mark_done_energy_job(d, -10.0, ['Si'], encut=600 if tag == 'B' else 500)
+        dirs[tag] = str(d)
+    calls = {}
+    api = Api(chgdiff_mod=_fake_chgdiff(calls=calls))
+
+    out = api.compute_chgdiff(dirs['AB'], dirs['A'], dirs['B'])
+
+    assert out['ok'] is False and out['method_check']['status'] == 'incompatible'
+    assert 'ENCUT' in out['error'] and 'compute' not in calls
 
 
 def test_compute_chgdiff_missing_chgcar(tmp_path):
@@ -5019,6 +8083,9 @@ def test_compute_chgdiff_engine_error_caught(tmp_path):
         d = tmp_path / tag
         d.mkdir()
         (d / 'CHGCAR').write_text('x', encoding='utf-8')
+        (d / 'CONTCAR').write_text(_vasp5_poscar(['Si'], [1]), encoding='utf-8')
+        (d / 'OSZICAR').write_text(_osz(-10.0), encoding='utf-8')
+        _mark_done_energy_job(d, -10.0, ['Si'])
         dirs[tag] = str(d)
     api = Api(chgdiff_mod=_fake_chgdiff(compute_boom=ValueError('AB 与 A 网格不一致')))
     out = api.compute_chgdiff(dirs['AB'], dirs['A'], dirs['B'])
@@ -5031,6 +8098,9 @@ def test_compute_chgdiff_profile_failure_does_not_block(tmp_path):
         d = tmp_path / tag
         d.mkdir()
         (d / 'CHGCAR').write_text('x', encoding='utf-8')
+        (d / 'CONTCAR').write_text(_vasp5_poscar(['Si'], [1]), encoding='utf-8')
+        (d / 'OSZICAR').write_text(_osz(-10.0), encoding='utf-8')
+        _mark_done_energy_job(d, -10.0, ['Si'])
         dirs[tag] = str(d)
     api = Api(chgdiff_mod=_fake_chgdiff(profile='boom'))
     out = api.compute_chgdiff(dirs['AB'], dirs['A'], dirs['B'])
@@ -5229,6 +8299,10 @@ def test_derive_conv_thickness_regenerates_from_recipe(tmp_path):
     src.mkdir()
     (src / 'CONTCAR').write_text('x\n', encoding='utf-8')
     (src / 'INCAR').write_text('ENCUT = 500\n', encoding='utf-8')
+    (src / 'KPOINTS').write_text(
+        'mesh\n0\nGamma\n3 3 1\n0 0 0\n', encoding='utf-8')
+    (src / 'POTCAR').write_text(
+        'TITEL = PAW_PBE Pt\nENMAX = 230.000 eV\n', encoding='utf-8')
     man = real_manifest.new_manifest(
         job_id='base', system='Pt slab', task_type='relax', calc_type='slab',
         inputs={'recipe': {'kind': 'metal_slab', 'element': 'Pt', 'structure': 'fcc',
@@ -5287,7 +8361,7 @@ def test_task_catalog_kind_badges():
     api = Api()                                             # 真 task_catalog
     out = api.task_catalog()
     badges = {t['key']: t['kind_badge'] for t in out['tasks']}
-    assert badges['vaspsol'] == 'INCAR 顾问'
+    assert badges['vaspsol'] == '作业生成'
     assert badges['formation_binding'] == '结果计算器'
     assert badges['surface_energy'] == '结果计算器'
     assert badges['relax'] == '作业生成' and badges['chgdiff'] == '作业生成'
@@ -5374,7 +8448,7 @@ def test_job_live_energy_remote_via_manifest(tmp_path):
     m['remote_dir'] = '/work/j'
     m['cluster'] = 'hpc'
     real_manifest.save_manifest(str(tmp_path), m)
-    api = Api(profiles_mod=_fake_profiles({'hpc': types.SimpleNamespace(auth='key')}),
+    api = Api(profiles_mod=_fake_profiles({'hpc': ClusterProfile(name='hpc', auth='key')}),
               connection_mod=_fake_conn_read(_OSZ_TEXT.encode('utf-8')))
     out = api.job_live_energy(str(tmp_path))
     assert out['ok'] is True and out['source'] == 'remote' and len(out['steps']) == 2
@@ -5387,7 +8461,7 @@ def test_job_live_energy_remote_not_started_yet(tmp_path):
     m['remote_dir'] = '/work/j'
     m['cluster'] = 'hpc'
     real_manifest.save_manifest(str(tmp_path), m)
-    api = Api(profiles_mod=_fake_profiles({'hpc': types.SimpleNamespace(auth='key')}),
+    api = Api(profiles_mod=_fake_profiles({'hpc': ClusterProfile(name='hpc', auth='key')}),
               connection_mod=_fake_conn_read(missing=True))
     out = api.job_live_energy(str(tmp_path))
     assert out['ok'] is False and '远端尚无 OSZICAR' in out['error']
@@ -5399,6 +8473,40 @@ def test_job_live_energy_unsubmitted_honest(tmp_path):
     assert out['ok'] is False and '尚未提交' in out['error']
 
 
+def test_job_live_energy_legacy_remote_dir_requires_explicit_cluster_binding(tmp_path):
+    from vcstudio.shared import manifest as real_manifest
+
+    m = real_manifest.new_manifest(job_id='legacy', system='s', task_type='relax',
+                                   calc_type='slab', inputs={})
+    m['remote_dir'] = '/work/legacy'
+    real_manifest.save_manifest(str(tmp_path), m)
+    connection = types.SimpleNamespace(
+        open_client=lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError('未绑定时不得联网')))
+    api = Api(profiles_mod=_fake_profiles({'hpc': ClusterProfile(name='hpc')}),
+              connection_mod=connection)
+
+    out = api.job_live_energy(str(tmp_path), name='hpc')
+
+    assert out['ok'] is False
+    assert '未记录所属服务器' in out['error']
+
+
+def test_api_poscar_volume_honors_negative_and_three_component_scaling(tmp_path):
+    negative = tmp_path / 'negative'
+    negative.mkdir()
+    (negative / 'POSCAR').write_text(
+        'target volume\n-125\n1 0 0\n0 1 0\n0 0 1\nH\n1\nDirect\n0 0 0\n',
+        encoding='utf-8')
+    anisotropic = tmp_path / 'anisotropic'
+    anisotropic.mkdir()
+    (anisotropic / 'POSCAR').write_text(
+        'three scales\n2 3 4\n1 0 0\n0 1 0\n0 0 1\nH\n1\nDirect\n0 0 0\n',
+        encoding='utf-8')
+    assert abs(Api._poscar_volume(str(negative)) - 125.0) < 1e-9
+    assert abs(Api._poscar_volume(str(anisotropic)) - 24.0) < 1e-9
+
+
 def test_job_live_energy_needs_trust_passthrough(tmp_path):
     from vcstudio.shared import manifest as real_manifest
     m = real_manifest.new_manifest(job_id='j', system='s', task_type='relax',
@@ -5406,7 +8514,7 @@ def test_job_live_energy_needs_trust_passthrough(tmp_path):
     m['remote_dir'] = '/work/j'
     m['cluster'] = 'hpc'
     real_manifest.save_manifest(str(tmp_path), m)
-    api = Api(profiles_mod=_fake_profiles({'hpc': types.SimpleNamespace(auth='key')}),
+    api = Api(profiles_mod=_fake_profiles({'hpc': ClusterProfile(name='hpc', auth='key')}),
               connection_mod=_fake_conn_read(connect_boom=True))
     out = api.job_live_energy(str(tmp_path))
     assert out['ok'] is False and out['needs_trust'] is True
@@ -5488,3 +8596,1601 @@ def test_wavefn_bcp_old_engine_honest(tmp_path):
     api = Api(multiwfn_mod=_fake_multiwfn(), config_mod=_fake_config(cfg={}))
     out = api.wavefn_bcp(str(tmp_path / 'mol.fchk'))
     assert out['ok'] is False and '引擎待扩展' in out['error']
+
+
+# ── Li-S 一站式项目后端 ─────────────────────────────────────────────────────
+def test_proj_scan_structures_api_uses_recursive_read_only_scanner(tmp_path):
+    folder = tmp_path / 'Li2S8_top'
+    folder.mkdir()
+    structure = folder / 'POSCAR'
+    structure.write_text('x', encoding='utf-8')
+
+    out = Api().proj_scan_structures(str(tmp_path))
+
+    assert out['ok'] is True and out['error'] is None
+    assert len(out['items']) == 1
+    assert {key: out['items'][0][key] for key in ('path', 'name', 'species')} == {
+        'path': str(structure.resolve()), 'name': 'POSCAR', 'species': 'Li2S8'}
+    assert out['items'][0]['species_source'] == 'path_name'
+
+
+def test_proj_scan_lis_inputs_api_returns_one_folder_bundle(tmp_path):
+    payload = {
+        'root': str(tmp_path), 'incar': str(tmp_path / 'INCAR'),
+        'incar_candidates': [str(tmp_path / 'INCAR')],
+        'clean_slab': str(tmp_path / 'clean' / 'POSCAR'),
+        'clean_candidates': [], 'configs': [{'path': '/ads/POSCAR'}],
+        'structures': [], 'warnings': [], 'source_read_only': True,
+    }
+    adsorption = types.SimpleNamespace(scan_lis_input_bundle=lambda root: {
+        **payload, 'root': str(root)})
+
+    out = Api(adsorption_mod=adsorption).proj_scan_lis_inputs(str(tmp_path))
+
+    assert out['ok'] is True and out['incar'] == str(tmp_path / 'INCAR')
+    assert out['clean_slab'].endswith(os.path.join('clean', 'POSCAR'))
+    assert out['configs'] == [{'path': '/ads/POSCAR'}]
+
+
+def _lis_reference_fake(tmp_path, states, create_calls):
+    project_path = str(tmp_path / 'reference' / 'project.yaml')
+    ref_jobs = {species: str(tmp_path / 'reference' / 'molecules' / f'mol_{species}')
+                for species in states}
+    reference = {'root': str(tmp_path / 'reference'),
+                 'molecules_dir': str(tmp_path / 'reference' / 'molecules'),
+                 'species_ref_jobs': ref_jobs, 'members': {'configs': []}}
+    adsorption = types.SimpleNamespace()
+    adsorption.load_project = lambda path: reference if path == project_path else None
+
+    def create(root, name, **kwargs):
+        create_calls.update(root=root, name=name, **kwargs)
+        generated = [('lis_slab_clean', os.path.join(root, 'lis_slab_clean'), []),
+                     ('lis_ads_Li2S8_top', os.path.join(root, 'lis_ads_Li2S8_top'), [])]
+        return {'ok': True, 'project_path': os.path.join(root, 'project.yaml'),
+                'generated': generated, 'errors': [], 'advisories': []}
+
+    adsorption.create_project = create
+    manifest_states = {
+        ref_jobs[species]: {'state': state,
+                            'results': {
+                                'energy_e0_eV': -30.0 - index,
+                                'reference_method_signature': {
+                                    'functional': 'RPBE', 'ivdw': 0, 'ispin': 1,
+                                    'ldau': 'F', 'encut': 400.0,
+                                    'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+                                }}}
+        for index, (species, state) in enumerate(states.items())
+    }
+    for job_dir, item in manifest_states.items():
+        os.makedirs(job_dir, exist_ok=True)
+        energy = item['results']['energy_e0_eV']
+        with open(os.path.join(job_dir, 'OSZICAR'), 'w', encoding='utf-8') as handle:
+            handle.write(f' 1 F= {energy:.12f} E0= {energy:.12f} d E =0\n')
+        with open(os.path.join(job_dir, 'OUTCAR'), 'w', encoding='utf-8') as handle:
+            handle.write('General timing and accounting information for this job\n')
+    manifests = types.SimpleNamespace(load_manifest=lambda path: manifest_states.get(path))
+    return project_path, adsorption, manifests
+
+
+def _write_lis_prepare_inputs(slab, config, incar):
+    header = '1.0\n10 0 0\n0 10 0\n0 0 20\n'
+    slab.write_text('slab\n' + header + 'C\n1\nDirect\n0 0 0\n', encoding='utf-8')
+    config.write_text(
+        'ads\n' + header + 'C Li S\n1 2 8\nDirect\n' + '0 0 0\n' * 11,
+        encoding='utf-8')
+    incar.write_text('ENCUT = 400\nGGA = RP\nISPIN = 1\nIVDW = 0\n', encoding='utf-8')
+
+
+def _write_lis_potcar_library(root):
+    for element, enmax in {'C': 300.0, 'Li': 250.0, 'S': 400.0}.items():
+        folder = root / element
+        folder.mkdir(parents=True)
+        (folder / 'POTCAR').write_text(
+            f'TITEL = PAW_PBE {element}\nENMAX = {enmax}; ENMIN = 100\n',
+            encoding='utf-8')
+
+
+def test_proj_prepare_lis_reuses_only_required_done_reference_jobs_and_persists_mapping(
+        tmp_path):
+    slab = tmp_path / 'slab.vasp'
+    config = tmp_path / 'Li2S8_top.vasp'
+    incar = tmp_path / 'INCAR'
+    _write_lis_prepare_inputs(slab, config, incar)
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE', 'S8': 'DONE'}, calls)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config(cfg={'potcar_lib_root': '/potentials'}))
+
+    out = api._proj_prepare_lis_for_reference_path(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path,
+        {'confirmed': True, 'reason': '单测假赝势库无法核对 TITEL'})
+
+    assert out['ok'] is True and out['reference_species'] == ['Li2S8']
+    assert len(out['job_dirs']) == 2
+    assert calls['root'] == str(tmp_path / 'out' / 'lis')
+    assert calls['config_species'] == {str(config.resolve()): 'Li2S8'}
+    assert calls['species_refs'] == {'Li2S8': -30.0}
+    assert set(calls['species_ref_jobs']) == {'Li2S8'}
+    assert calls['species_ref_jobs']['Li2S8'].endswith('mol_Li2S8')
+    assert calls['reference_project'] == reference_path
+    assert calls['lib_root'] == '/potentials'
+
+
+def test_proj_prepare_lis_binds_each_member_incar_and_keeps_runtime_controls_independent(
+        tmp_path):
+    clean_dir = tmp_path / 'inputs' / 'clean'
+    config_dir = tmp_path / 'inputs' / 'Li2S8_top'
+    clean_dir.mkdir(parents=True)
+    config_dir.mkdir(parents=True)
+    slab, config = clean_dir / 'POSCAR', config_dir / 'POSCAR'
+    header = '1.0\n10 0 0\n0 10 0\n0 0 20\n'
+    slab.write_text('slab\n' + header + 'C\n1\nDirect\n0 0 0\n', encoding='utf-8')
+    config.write_text(
+        'ads\n' + header + 'C Li S\n1 2 8\nDirect\n' + '0 0 0\n' * 11,
+        encoding='utf-8')
+    clean_incar = clean_dir / 'INCAR'
+    config_incar = config_dir / 'incar'
+    common = 'ENCUT=400\nGGA=RP\nISPIN=1\nIVDW=0\nLDAU=F\nMETAGGA=F\nLHFCALC=F\n'
+    clean_incar.write_text(common + 'NSW=40\nIBRION=2\n', encoding='utf-8')
+    config_incar.write_text(common + 'NSW=120\nIBRION=1\n', encoding='utf-8')
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config())
+    evidence = {
+        'clean_slab': {'path': str(clean_incar), 'sha256': _sha256_file(clean_incar)},
+        'configs': [{'path': str(config), 'incar_path': str(config_incar),
+                     'incar_sha256': _sha256_file(config_incar)}],
+    }
+
+    out = api._proj_prepare_lis_for_reference_path(
+        'per-member', str(slab),
+        [{'path': str(config), 'species': 'Li2S8',
+          'incar_path': str(config_incar), 'incar_sha256': _sha256_file(config_incar)}],
+        '', str(tmp_path / 'out'), reference_path,
+        {'confirmed': True, 'reason': '逐成员只调整 NSW/IBRION；硬方法已核对一致'},
+        evidence)
+
+    assert out['ok'] is True
+    assert calls['member_incars'] == {
+        str(slab.resolve()): str(clean_incar.resolve()),
+        str(config.resolve()): str(config_incar.resolve()),
+    }
+    assert calls['member_source_evidence'] == {
+        str(slab.resolve()): {
+            'poscar': {'path': str(slab.resolve()), 'sha256': _sha256_file(slab)},
+            'incar': {'path': str(clean_incar.resolve()),
+                      'sha256': _sha256_file(clean_incar)},
+        },
+        str(config.resolve()): {
+            'poscar': {'path': str(config.resolve()), 'sha256': _sha256_file(config)},
+            'incar': {'path': str(config_incar.resolve()),
+                      'sha256': _sha256_file(config_incar)},
+        },
+    }
+    prepared_members = calls['preparation']['inputs']['members']
+    assert [row['incar']['sha256'] for row in prepared_members] == [
+        _sha256_file(clean_incar), _sha256_file(config_incar)]
+    assert calls['preparation']['schema'] == 2
+    assert not out['method_check']['issues']
+
+
+def test_proj_prepare_lis_rejects_quartet_changed_after_browser_scan(tmp_path):
+    from vcstudio.project import adsorption as real_adsorption
+
+    clean_dir = tmp_path / 'inputs' / 'clean'
+    config_dir = tmp_path / 'inputs' / 'Li2S8_top'
+    clean_dir.mkdir(parents=True)
+    config_dir.mkdir(parents=True)
+    slab, config = clean_dir / 'POSCAR', config_dir / 'POSCAR'
+    header = '1.0\n10 0 0\n0 10 0\n0 0 20\n'
+    slab.write_text('slab\n' + header + 'C\n1\nDirect\n0 0 0\n', encoding='utf-8')
+    config.write_text(
+        'ads\n' + header + 'C Li S\n1 2 8\nDirect\n' + '0 0 0\n' * 11,
+        encoding='utf-8')
+    common = 'ENCUT=400\nGGA=RP\nISPIN=1\nIVDW=0\nLDAU=F\n'
+    for folder, elements in ((clean_dir, ('C',)), (config_dir, ('C', 'Li', 'S'))):
+        (folder / 'INCAR').write_text(common, encoding='utf-8')
+        (folder / 'KPOINTS').write_text(
+            'reviewed mesh\n0\nGamma\n3 3 1\n0 0 0\n', encoding='utf-8')
+        (folder / 'POTCAR').write_text(''.join(
+            f'TITEL = PAW_PBE {element}\nENMAX = 400\n' for element in elements),
+            encoding='utf-8')
+    scanned_clean = real_adsorption.resolve_structure_quartet(slab)
+    scanned_config = real_adsorption.resolve_structure_quartet(config)
+    (clean_dir / 'KPOINTS').write_text(
+        'changed after review\n0\nGamma\n5 5 1\n0 0 0\n', encoding='utf-8')
+
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    adsorption.resolve_structure_quartet = real_adsorption.resolve_structure_quartet
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config())
+    evidence = {
+        'clean_slab': {
+            'path': str(clean_dir / 'INCAR'),
+            'sha256': _sha256_file(clean_dir / 'INCAR'),
+            'quartet': scanned_clean,
+        },
+        'configs': [{
+            'path': str(config), 'incar_path': str(config_dir / 'INCAR'),
+            'incar_sha256': _sha256_file(config_dir / 'INCAR'),
+            'quartet': scanned_config,
+        }],
+    }
+
+    out = api._proj_prepare_lis_for_reference_path(
+        'changed-after-scan', str(slab),
+        [{'path': str(config), 'species': 'Li2S8'}], '',
+        str(tmp_path / 'out'), reference_path, member_incars=evidence)
+
+    assert out['ok'] is False
+    assert 'KPOINTS' in out['error'] and '扫描后已变化' in out['error']
+    assert not calls
+
+
+def test_proj_prepare_lis_allows_clean_config_ispin_difference_as_advisory(tmp_path):
+    clean_dir = tmp_path / 'clean'
+    config_dir = tmp_path / 'Li2S8_top'
+    clean_dir.mkdir()
+    config_dir.mkdir()
+    slab, config = clean_dir / 'POSCAR', config_dir / 'POSCAR'
+    header = '1.0\n10 0 0\n0 10 0\n0 0 20\n'
+    slab.write_text('slab\n' + header + 'C\n1\nDirect\n0 0 0\n', encoding='utf-8')
+    config.write_text(
+        'ads\n' + header + 'C Li S\n1 2 8\nDirect\n' + '0 0 0\n' * 11,
+        encoding='utf-8')
+    clean_incar, config_incar = clean_dir / 'INCAR', config_dir / 'INCAR'
+    base = 'ENCUT=400\nGGA=RP\nIVDW=0\nLDAU=F\nMETAGGA=F\nLHFCALC=F\nNSW=40\n'
+    clean_incar.write_text(base + 'ISPIN=1\n', encoding='utf-8')
+    config_incar.write_text(base + 'ISPIN=2\n', encoding='utf-8')
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    potcars = tmp_path / 'potcars'
+    _write_lis_potcar_library(potcars)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config(cfg={'potcar_lib_root': str(potcars)}))
+
+    out = api._proj_prepare_lis_for_reference_path(
+        'spin-mismatch', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        '', str(tmp_path / 'out'), reference_path)
+
+    assert out['ok'] is True and calls
+    assert out['method_check']['status'] == 'advisory'
+    assert out['method_check']['submission_allowed'] is True
+    assert out['method_check']['analysis_ready'] is True
+    assert not out['method_check']['issues']
+    assert any('clean slab' in advisory and 'ISPIN' in advisory
+               and '吸附诱导磁性' in advisory
+               for advisory in out['method_check']['advisories'])
+
+
+def test_proj_prepare_lis_previews_and_applies_only_managed_copy_encut_repair(
+        tmp_path):
+    clean_dir = tmp_path / 'clean'
+    config_dir = tmp_path / 'Li2S8_top'
+    clean_dir.mkdir()
+    config_dir.mkdir()
+    slab, config = clean_dir / 'POSCAR', config_dir / 'POSCAR'
+    clean_incar, config_incar = clean_dir / 'INCAR', config_dir / 'INCAR'
+    header = '1.0\n10 0 0\n0 10 0\n0 0 20\n'
+    slab.write_text('slab\n' + header + 'C\n1\nDirect\n0 0 0\n', encoding='utf-8')
+    config.write_text(
+        'ads\n' + header + 'C Li S\n1 2 8\nDirect\n' + '0 0 0\n' * 11,
+        encoding='utf-8')
+    common = 'GGA=RP\nISPIN=1\nIVDW=0\nLDAU=F\nMETAGGA=F\nLHFCALC=F\n'
+    clean_incar.write_text('ENCUT=400\n' + common, encoding='utf-8')
+    config_incar.write_text('ENCUT=450\n' + common, encoding='utf-8')
+    before = {clean_incar: clean_incar.read_bytes(), config_incar: config_incar.read_bytes()}
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    ref_job = str(tmp_path / 'reference' / 'molecules' / 'mol_Li2S8')
+    ref_manifest = manifests.load_manifest(ref_job)
+    ref_manifest['results']['reference_method_signature']['encut'] = 450.0
+    potcars = tmp_path / 'potcars'
+    _write_lis_potcar_library(potcars)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config(cfg={'potcar_lib_root': str(potcars)}))
+
+    preview = api._proj_prepare_lis_for_reference_path(
+        'repair-preview', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        '', str(tmp_path / 'out'), reference_path)
+
+    assert preview['ok'] is False and preview['needs_repair_decision'] is True
+    assert not calls
+    actions = preview['repair_plan']['actions']
+    assert [(item['key'], item['old'], item['new'], item['risk']) for item in actions] == [
+        ('ENCUT', 400.0, 450, 'low')]
+
+    applied = api._proj_prepare_lis_for_reference_path(
+        'repair-preview', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        '', str(tmp_path / 'out'), reference_path,
+        repair_request={'plan_id': preview['repair_plan']['plan_id'], 'mode': 'apply'})
+
+    assert applied['ok'] is True and calls
+    assert calls['member_incar_patches'] == {str(slab.resolve()): {'ENCUT': 450}}
+    assert applied['method_check']['analysis_ready'] is True
+    assert applied['method_check']['comparability_status'] == 'verified'
+    assert not applied['method_check']['issues']
+    assert calls['preparation']['inputs']['planned_methods']['clean_slab']['encut'] == 450.0
+    assert before == {clean_incar: clean_incar.read_bytes(),
+                      config_incar: config_incar.read_bytes()}
+
+
+def test_lis_repair_plan_id_binds_the_entire_member_input_evidence():
+    clean = '/inputs/clean/POSCAR'
+    config = '/inputs/Li2S8_top/POSCAR'
+    paths = [clean, config]
+    plans = {clean: {'encut': 400.0}, config: {'encut': 450.0}}
+    parsed = {clean: {'ENCUT': 400}, config: {'ENCUT': 450}}
+    compositions = {clean: {'C': 1}, config: {'C': 1, 'Li': 2, 'S': 8}}
+    incars = {
+        clean: {'path': '/inputs/clean/INCAR', 'sha256': '1' * 64},
+        config: {'path': '/inputs/Li2S8_top/INCAR', 'sha256': '2' * 64},
+    }
+
+    def evidence(kpoints_hash):
+        return {
+            clean: {
+                'poscar': {'path': clean, 'sha256': '3' * 64},
+                'incar': incars[clean],
+                'kpoints': {'path': '/inputs/clean/KPOINTS',
+                            'sha256': kpoints_hash},
+                'potcar': {'path': '/inputs/clean/POTCAR', 'sha256': '5' * 64},
+            },
+            config: {
+                'poscar': {'path': config, 'sha256': '6' * 64},
+                'incar': incars[config],
+                'kpoints': {'path': '/inputs/Li2S8_top/KPOINTS',
+                            'sha256': '7' * 64},
+                'potcar': {'path': '/inputs/Li2S8_top/POTCAR',
+                           'sha256': '8' * 64},
+            },
+        }
+
+    first = Api._lis_repair_plan(
+        paths, plans, parsed, compositions, incars, evidence('4' * 64))
+    second = Api._lis_repair_plan(
+        paths, plans, parsed, compositions, incars, evidence('9' * 64))
+
+    assert first['plan_id'] != second['plan_id']
+    assert set(first['evidence'][clean]['files']) == {
+        'POSCAR', 'INCAR', 'KPOINTS', 'POTCAR'}
+
+
+def test_proj_prepare_lis_generates_with_reference_encut_analysis_blocked(tmp_path):
+    slab, config, incar = (tmp_path / name for name in
+                           ('slab.vasp', 'Li2S8_top.vasp', 'INCAR'))
+    _write_lis_prepare_inputs(slab, config, incar)
+    incar.write_text(
+        'GGA = RP\nISPIN = 1\nIVDW = 0\nLDAU = F\nMETAGGA = F\nLHFCALC = F\n',
+        encoding='utf-8')
+    potcars = tmp_path / 'potcars'
+    _write_lis_potcar_library(potcars)
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config(cfg={'potcar_lib_root': str(potcars)}))
+
+    out = api._proj_prepare_lis_for_reference_path(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path)
+
+    assert out['ok'] is True and out['method_check']['status'] == 'analysis_blocked'
+    assert out['method_check']['submission_allowed'] is True
+    assert out['method_check']['analysis_ready'] is False
+    assert out['method_check']['planned']['encut'] == 550
+    assert out['method_check']['planned']['encut_source'] == (
+        'potcar_enmax_1.3_round_up_50')
+    assert any('ENCUT' in issue for issue in out['method_check']['issues'])
+    assert calls
+
+
+def test_proj_prepare_lis_auto_effective_encut_can_be_fully_verified(tmp_path):
+    slab, config, incar = (tmp_path / name for name in
+                           ('slab.vasp', 'Li2S8_top.vasp', 'INCAR'))
+    _write_lis_prepare_inputs(slab, config, incar)
+    incar.write_text(
+        'GGA = RP\nISPIN = 1\nIVDW = 0\nLDAU = F\nMETAGGA = F\nLHFCALC = F\n',
+        encoding='utf-8')
+    potcars = tmp_path / 'potcars'
+    _write_lis_potcar_library(potcars)
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    reference = adsorption.load_project(reference_path)
+    signature = manifests.load_manifest(
+        reference['species_ref_jobs']['Li2S8'])['results']['reference_method_signature']
+    signature.update({'encut': 550.0, 'metagga': 'F', 'lhfcalc': 'F'})
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config(cfg={'potcar_lib_root': str(potcars)}))
+
+    out = api._proj_prepare_lis_for_reference_path(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path)
+
+    assert out['ok'] is True and out['method_check']['status'] == 'verified'
+    planned = calls['preparation']['method_check']['planned']
+    assert planned['encut'] == 550
+    assert planned['encut_source'] == 'potcar_enmax_1.3_round_up_50'
+    assert calls['preparation']['inputs']['planned_method']['encut'] == 550
+
+
+def test_proj_prepare_lis_molecular_ispin_difference_is_advisory_without_confirmation(
+        tmp_path):
+    slab, config, incar = (tmp_path / name for name in
+                           ('slab.vasp', 'Li2S8_top.vasp', 'INCAR'))
+    _write_lis_prepare_inputs(slab, config, incar)
+    incar.write_text(
+        'ENCUT=400\nGGA=RP\nISPIN=2\nIVDW=0\nLDAU=F\nMETAGGA=F\nLHFCALC=F\n',
+        encoding='utf-8')
+    potcars = tmp_path / 'potcars'
+    _write_lis_potcar_library(potcars)
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    reference = adsorption.load_project(reference_path)
+    signature = manifests.load_manifest(
+        reference['species_ref_jobs']['Li2S8'])['results']['reference_method_signature']
+    signature.update({'metagga': 'F', 'lhfcalc': 'F'})
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config(cfg={'potcar_lib_root': str(potcars)}))
+
+    out = api._proj_prepare_lis_for_reference_path(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path)
+
+    assert out['ok'] is True and calls
+    assert out['needs_method_confirmation'] is False
+    assert out['method_check']['status'] == 'advisory'
+    assert out['method_check']['submission_allowed'] is True
+    assert out['method_check']['analysis_ready'] is True
+    assert not out['method_check']['issues']
+    assert not out['method_check']['warnings']
+    assert any('参考分子 ISPIN=1' in advisory and '不是自动不兼容' in advisory
+               for advisory in out['method_check']['advisories'])
+    assert 'confirmation' not in calls['preparation']['method_check']
+
+
+def test_proj_prepare_lis_shared_element_dft_u_mismatch_allows_generation_but_blocks_analysis(
+        tmp_path):
+    slab, config, incar = (tmp_path / name for name in
+                           ('slab.vasp', 'Li2S8_top.vasp', 'INCAR'))
+    _write_lis_prepare_inputs(slab, config, incar)
+    incar.write_text(
+        'ENCUT = 400\nGGA = RP\nISPIN = 1\nIVDW = 0\nLDAU = T\n'
+        'LDAUTYPE = 2\nLDAUL = -1 0 -1\nLDAUU = 0 5 0\nLDAUJ = 0 0 0\n',
+        encoding='utf-8')
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    reference = adsorption.load_project(reference_path)
+    signature = manifests.load_manifest(
+        reference['species_ref_jobs']['Li2S8'])['results']['reference_method_signature']
+    signature.update({
+        'ldau': 'T', 'ldautype': 2, 'ldaul': [0, -1],
+        'ldauu': [3.0, 0.0], 'ldauj': [0.0, 0.0],
+        'potcar_elements': ['Li', 'S'],
+    })
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config())
+
+    out = api._proj_prepare_lis_for_reference_path(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path)
+
+    assert out['ok'] is True and out['method_check']['status'] == 'analysis_blocked'
+    assert out['method_check']['submission_allowed'] is True
+    assert out['method_check']['analysis_ready'] is False
+    assert any('Li DFT+U' in issue and '3.0' in issue and '5.0' in issue
+               for issue in out['method_check']['issues'])
+    assert calls
+
+
+def test_reference_method_check_uses_vasp_defaults_for_omitted_dft_u_vectors(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT = 400\nGGA = RP\nISPIN = 1\nIVDW = 0\nLDAU = T\n'
+        'LDAUTYPE = 2\nLDAUL = 0 -1\nLDAUU = 5 0\nLDAUJ = 0 0\n',
+        encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'T',
+        'ldautype': 2, 'encut': 400.0,
+        'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+        'potcar_elements': ['Li', 'S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'],
+        planned_element_orders=[['Li', 'S']])
+
+    assert check['status'] == 'incompatible'
+    assert any('Li DFT+U' in issue for issue in check['issues'])
+    assert not any('DFT+U' in warning for warning in check['warnings'])
+
+
+def test_reference_method_check_allows_molecular_ispin_1_with_magnetic_adsorption(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=RP\nISPIN=2\nIVDW=0\nLDAU=F\nMETAGGA=F\nLHFCALC=F\n',
+        encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'metagga': 'F', 'lhfcalc': 'F', 'encut': 400.0,
+        'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+        'potcar_elements': ['Li', 'S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'],
+        planned_element_orders=[['Li', 'S']])
+
+    assert check['status'] == 'verified' and not check['issues'] and not check['warnings']
+    assert any('参考分子 ISPIN=1' in advisory and '不是自动不兼容' in advisory
+               for advisory in check['advisories'])
+
+
+def test_reference_method_check_records_generated_magnetic_spin_completion(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=RP\nIVDW=0\nLDAU=F\n', encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'encut': 400.0, 'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+        'potcar_elements': ['Li', 'S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'],
+        planned_element_orders=[['Li', 'S']], effective_ispin=2)
+
+    assert check['planned']['ispin'] == 2
+    assert check['planned']['ispin_source'] == 'generated_completion'
+    assert check['status'] == 'verified'
+    assert not check['issues'] and not check['warnings']
+    assert any('ISPIN=1' in item and 'ISPIN=2' in item
+               for item in check['advisories'])
+
+
+def test_reference_method_check_keeps_hard_conflicts_with_soft_ispin_warning(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=PE\nISPIN=2\nIVDW=0\nLDAU=F\nMETAGGA=F\nLHFCALC=F\n',
+        encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'metagga': 'F', 'lhfcalc': 'F', 'encut': 400.0,
+        'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'])
+
+    assert check['status'] == 'incompatible'
+    assert any('functional' in issue for issue in check['issues'])
+    assert any('ISPIN=1' in advisory for advisory in check['advisories'])
+
+
+def test_reference_method_check_rejects_invalid_ispin_value(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=RP\nISPIN=3\nIVDW=0\nLDAU=F\nMETAGGA=F\nLHFCALC=F\n',
+        encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'metagga': 'F', 'lhfcalc': 'F', 'encut': 400.0,
+        'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'])
+
+    assert check['status'] == 'incompatible'
+    assert any('新任务 ISPIN=3' in issue and '无效' in issue
+               for issue in check['issues'])
+
+
+def test_reference_method_check_hse_aexx_difference_is_incompatible(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=RP\nISPIN=1\nIVDW=0\nLDAU=F\nMETAGGA=F\n'
+        'LHFCALC=T\nAEXX=0.30\nHFSCREEN=0.2\n', encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'metagga': 'F', 'lhfcalc': 'T', 'aexx': 0.25, 'hfscreen': 0.2,
+        'encut': 400.0, 'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'])
+
+    assert check['status'] == 'incompatible'
+    assert any('AEXX' in issue and '0.25' in issue and '0.3' in issue
+               for issue in check['issues'])
+
+
+def test_reference_method_check_hybrid_omitted_aexx_uses_vasp_default(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=RP\nISPIN=1\nIVDW=0\nLDAU=F\nMETAGGA=F\n'
+        'LHFCALC=T\nAEXX=0.25\nHFSCREEN=0.2\n', encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'metagga': 'F', 'lhfcalc': 'T', 'hfscreen': 0.2,
+        'encut': 400.0, 'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+        'potcar_elements': ['Li', 'S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'],
+        planned_element_orders=[['Li', 'S']])
+
+    assert check['status'] == 'verified' and not check['issues']
+    assert not any('AEXX' in warning for warning in check['warnings'])
+
+
+def test_reference_method_check_rejects_malformed_planned_hybrid_number(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=PE\nISPIN=1\nLDAU=F\n'
+        'LHFCALC=T\nAEXX=bad\n', encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'PBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'encut': 400.0, 'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'])
+
+    assert check['status'] == 'incompatible'
+    assert any('AEXX' in issue and '有限数值' in issue for issue in check['issues'])
+
+
+def test_reference_method_check_legacy_hse_label_is_not_plain_pbe(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=PE\nISPIN=1\nIVDW=0\nLDAU=F\n',
+        encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'HSE06', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'encut': 400.0, 'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'])
+
+    assert check['status'] == 'incompatible'
+    assert any('functional' in issue and 'hybrid:base=PBE' in issue
+               for issue in check['issues'])
+
+
+def test_reference_method_check_planned_hybrid_defaults_equal_explicit_signature(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=RP\nISPIN=1\nIVDW=0\nLDAU=F\nLHFCALC=T\n',
+        encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'metagga': 'F', 'lhfcalc': 'T', 'aexx': 0.25, 'hfscreen': 0.0,
+        'encut': 400.0, 'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+        'potcar_elements': ['Li', 'S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'],
+        planned_element_orders=[['Li', 'S']])
+
+    assert check['status'] == 'verified'
+    assert check['planned']['aexx'] == 0.25
+    assert check['planned']['hfscreen'] == 0.0
+
+
+def test_reference_method_check_accepts_real_imported_hse_signature(tmp_path):
+    from vcstudio.project import result_import
+
+    incar = tmp_path / 'INCAR'
+    kpoints = tmp_path / 'KPOINTS'
+    potcar = tmp_path / 'POTCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=PE\nISPIN=1\nIVDW=0\nLDAU=F\nMETAGGA=F\n'
+        'LHFCALC=T\nHFSCREEN=0.2\n', encoding='utf-8')
+    kpoints.write_text('Gamma\n0\nGamma\n1 1 1\n0 0 0\n', encoding='utf-8')
+    potcar.write_text(
+        'TITEL = PAW_PBE Li\nENMAX=250\nTITEL = PAW_PBE S\nENMAX=400\n',
+        encoding='utf-8')
+    signature = result_import._input_method_signature({
+        'INCAR': incar, 'KPOINTS': kpoints, 'POTCAR': potcar})
+
+    check = Api._reference_method_check(
+        {'Li2S8': signature}, str(incar),
+        planned_potcar=['PAW_PBE Li', 'PAW_PBE S'],
+        planned_element_orders=[['Li', 'S']])
+
+    assert signature['functional'] == 'HSE06'
+    assert signature['base_functional'] == 'PBE'
+    assert check['status'] == 'verified'
+
+
+def test_reference_method_check_accepts_real_imported_metagga_signature(tmp_path):
+    from vcstudio.project import result_import
+
+    incar = tmp_path / 'INCAR'
+    kpoints = tmp_path / 'KPOINTS'
+    potcar = tmp_path / 'POTCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=PE\nISPIN=1\nIVDW=0\nLDAU=F\n'
+        'METAGGA=R2SCAN\nLASPH=T\nLHFCALC=F\n', encoding='utf-8')
+    kpoints.write_text('Gamma\n0\nGamma\n1 1 1\n0 0 0\n', encoding='utf-8')
+    potcar.write_text(
+        'TITEL = PAW_PBE Li\nENMAX=250\nTITEL = PAW_PBE S\nENMAX=400\n',
+        encoding='utf-8')
+    signature = result_import._input_method_signature({
+        'INCAR': incar, 'KPOINTS': kpoints, 'POTCAR': potcar})
+
+    check = Api._reference_method_check(
+        {'Li2S8': signature}, str(incar),
+        planned_potcar=['PAW_PBE Li', 'PAW_PBE S'],
+        planned_element_orders=[['Li', 'S']])
+
+    assert signature['functional'] == 'r2SCAN'
+    assert check['status'] == 'verified'
+
+
+def test_proj_prepare_lis_ignores_unfinished_reference_species_not_used_by_batch(tmp_path):
+    slab, config, incar = (tmp_path / name for name in ('slab.vasp', 'Li2S8.vasp', 'INCAR'))
+    _write_lis_prepare_inputs(slab, config, incar)
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE', 'S8': 'NEEDS_HUMAN'}, calls)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config())
+
+    out = api._proj_prepare_lis_for_reference_path(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path)
+
+    assert out['ok'] is True and out['reference_species'] == ['Li2S8']
+    assert calls['species_refs'] == {'Li2S8': -30.0}
+    assert set(calls['species_ref_jobs']) == {'Li2S8'}
+
+
+def test_proj_prepare_lis_rejects_missing_species_and_existing_target(tmp_path):
+    slab, config, incar = (tmp_path / name for name in ('slab.vasp', 'Li2S6.vasp', 'INCAR'))
+    _write_lis_prepare_inputs(slab, config, incar)
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config())
+    missing = api._proj_prepare_lis_for_reference_path(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S6'}],
+        str(incar), str(tmp_path / 'out'), reference_path)
+    assert missing['ok'] is False and 'Li2S6' in missing['error']
+
+    target = tmp_path / 'out' / 'lis'
+    target.mkdir(parents=True)
+    existing = api._proj_prepare_lis_for_reference_path(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path,
+        {'confirmed': True, 'reason': '单测假赝势库无法核对 TITEL'})
+    assert existing['ok'] is False and '不会覆盖' in existing['error']
+
+
+def test_submit_project_resources_are_ephemeral_retry_safe_and_enable_autopilot(tmp_path):
+    dirs = {name: str(tmp_path / name)
+            for name in ('clean', 'running', 'done', 'owned', 'retry')}
+    states = {
+        dirs['clean']: {'state': 'CREATED', 'scheduler_job_id': None},
+        dirs['running']: {'state': 'RUNNING', 'scheduler_job_id': None},
+        dirs['done']: {'state': 'DONE', 'scheduler_job_id': None},
+        dirs['owned']: {'state': 'FAILED', 'scheduler_job_id': '99'},
+        dirs['retry']: {'state': 'CREATED', 'scheduler_job_id': None},
+    }
+    project = {'name': 'lis', 'root': str(tmp_path), 'members': {
+        'clean_slab': dirs['clean'], 'gas_ref': None,
+        'configs': [dirs['running'], dirs['done'], dirs['owned'], dirs['retry']]}}
+    saved = []
+    adsorption = types.SimpleNamespace(
+        load_project=lambda path: project if path == '/p/project.yaml' else None,
+        save_project=lambda root, data: saved.append((root, dict(data))))
+    manifests = types.SimpleNamespace(load_manifest=lambda path: states.get(path))
+    captured = []
+
+    def submit_batch(profile, _password, eligible, _trust):
+        captured.append((profile, list(eligible)))
+        results = []
+        for job_dir in eligible:
+            success = job_dir == dirs['clean'] or len(captured) > 1
+            if success:
+                states[job_dir]['scheduler_job_id'] = str(100 + len(captured))
+                states[job_dir]['state'] = 'SUBMITTED'
+            results.append((job_dir, success, 'ok' if success else 'network blip'))
+        return {'needs_trust': False, 'results': results}
+
+    original = ClusterProfile(name='hpc', auth='password', nodes=2, ppn=96,
+                              walltime='72:00:00')
+    config_backing = {}
+    passwords = {}
+    secrets = types.SimpleNamespace(
+        get_password=lambda name: passwords.get(name),
+        set_password=lambda name, value: passwords.__setitem__(name, value))
+    api = Api(profiles_mod=_fake_profiles({'hpc': original}), adsorption_mod=adsorption,
+              manifest_mod=manifests,
+              batch_ops_mod=types.SimpleNamespace(submit_batch=submit_batch),
+              config_mod=_fake_config_rw(config_backing), secrets_mod=secrets)
+    _isolate_submit_reuse_gate(api)
+
+    first = api._submit_project_with_resources_for_path(
+        '/p/project.yaml', 'hpc', 32, '48:00:00', password='cluster-secret')
+    assert first['ok'] is False
+    assert first['submitted'] == [dirs['clean']]
+    assert captured[0][1] == [dirs['clean'], dirs['retry']]
+    assert (captured[0][0].nodes, captured[0][0].ppn,
+            captured[0][0].walltime) == (1, 32, '48:00:00')
+    assert (original.nodes, original.ppn, original.walltime) == (2, 96, '72:00:00')
+    assert {row['dir'] for row in first['skipped']} == {
+        dirs['running'], dirs['done'], dirs['owned']}
+    assert project['launch']['resources']['cores'] == 32 and saved
+    ui = config_backing['ui']
+    assert all(ui[key] for key in ('autopilot', 'autopilot_continue',
+                                   'autopilot_fetch', 'autopilot_report'))
+    assert passwords == {'hpc': 'cluster-secret'}
+
+    second = api._submit_project_with_resources_for_path('/p/project.yaml', 'hpc', 32, '48:00:00')
+    assert second['ok'] is True and second['submitted'] == [dirs['retry']]
+    assert captured[1][1] == [dirs['retry']]
+    assert project['launch']['submitted_job_dirs'] == [dirs['clean'], dirs['retry']]
+
+
+def test_submit_project_same_basename_members_are_not_rejected(tmp_path):
+    first = str(tmp_path / 'left' / 'calc')
+    second = str(tmp_path / 'right' / 'calc')
+    project = {'root': str(tmp_path), 'members': {
+        'clean_slab': first, 'gas_ref': None, 'configs': [second]}}
+    states = {path: {'state': 'CREATED', 'scheduler_job_id': None}
+              for path in (first, second)}
+    submitted = []
+    adsorption = types.SimpleNamespace(
+        load_project=lambda _path: project,
+        save_project=lambda _root, _project: None)
+    batch = types.SimpleNamespace(submit_batch=lambda _profile, _pw, dirs, _trust:
+        submitted.extend(dirs) or {'needs_trust': False,
+                                   'results': [(d, True, 'ok') for d in dirs]})
+    api = Api(profiles_mod=_fake_profiles({'hpc': ClusterProfile(
+                  name='hpc', remote_root='/work', queue='q', ppn=16,
+                  vasp_cmd='mpirun -np {cores} vasp_std')}),
+              adsorption_mod=adsorption,
+              manifest_mod=types.SimpleNamespace(load_manifest=lambda path: states[path]),
+              batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+    _isolate_submit_reuse_gate(api)
+
+    out = api._submit_project_with_resources_for_path('/p/project.yaml', 'hpc', 16, '10:00:00')
+
+    assert out['ok'] is True
+    assert submitted == [first, second]
+
+
+def test_submit_project_includes_created_species_refs_and_skips_done_refs(tmp_path):
+    clean = str(tmp_path / 'clean')
+    config = str(tmp_path / 'config')
+    created_ref = str(tmp_path / 'Li2S4')
+    done_ref = str(tmp_path / 'S8')
+    project = {'root': str(tmp_path),
+               'members': {'clean_slab': clean, 'gas_ref': None, 'configs': [config]},
+               'species_ref_jobs': {'Li2S4': created_ref, 'S8': done_ref}}
+    states = {
+        clean: {'state': 'CREATED', 'scheduler_job_id': None},
+        config: {'state': 'CREATED', 'scheduler_job_id': None},
+        created_ref: {'state': 'CREATED', 'scheduler_job_id': None},
+        # 已完成只读参考可来自另一服务器；不能把其旧 job_id 当成本项目串服。
+        done_ref: {'state': 'DONE', 'scheduler_job_id': '778',
+                   'cluster': 'reference-server'},
+    }
+    submitted = []
+    adsorption = types.SimpleNamespace(
+        load_project=lambda _path: project,
+        save_project=lambda _root, _project: None)
+    batch = types.SimpleNamespace(submit_batch=lambda _profile, _pw, dirs, _trust:
+        submitted.extend(dirs) or {'needs_trust': False,
+                                   'results': [(d, True, 'ok') for d in dirs]})
+    api = Api(profiles_mod=_fake_profiles({'hpc': ClusterProfile(
+                  name='hpc', remote_root='/work', queue='q', ppn=16,
+                  vasp_cmd='mpirun -np {cores} vasp_std')}),
+              adsorption_mod=adsorption,
+              manifest_mod=types.SimpleNamespace(load_manifest=lambda path: states[path]),
+              batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+    _isolate_submit_reuse_gate(api)
+
+    out = api._submit_project_with_resources_for_path('/p/project.yaml', 'hpc', 16, '10:00:00')
+
+    assert out['ok'] is True
+    assert submitted == [clean, config, created_ref]
+    assert any(row['dir'] == done_ref and 'DONE' in row['reason'] for row in out['skipped'])
+
+
+def test_submit_project_rejects_switching_managed_project_to_other_profile(tmp_path):
+    job = str(tmp_path / 'clean')
+    project = {
+        'root': str(tmp_path), 'autopilot_managed': True,
+        'members': {'clean_slab': job, 'gas_ref': None, 'configs': []},
+        'launch': {'resources': {'profile': 'server-a'},
+                   'submitted_job_dirs': [job]},
+    }
+    manifest = {'state': 'SUBMITTED', 'scheduler_job_id': '42',
+                'cluster': 'server-a'}
+    batch = types.SimpleNamespace(submit_batch=lambda *_a, **_k:
+        (_ for _ in ()).throw(AssertionError('跨服务器护栏必须在联网前生效')))
+    api = Api(
+        profiles_mod=_fake_profiles({'server-b': ClusterProfile(
+            name='server-b', remote_root='/work', queue='q', ppn=16,
+            vasp_cmd='mpirun -np {cores} vasp_std')}),
+        adsorption_mod=types.SimpleNamespace(load_project=lambda _path: project),
+        manifest_mod=types.SimpleNamespace(load_manifest=lambda _path: manifest),
+        batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+    _isolate_submit_reuse_gate(api)
+
+    out = api._submit_project_with_resources_for_path(
+        '/p/project.yaml', 'server-b', 16, '10:00:00')
+
+    assert out['ok'] is False
+    assert 'server-a' in out['error'] and 'server-b' in out['error']
+
+
+def test_submit_project_retry_repairs_launch_after_persistence_failure(tmp_path):
+    job = str(tmp_path / 'clean')
+    disk = {'project': {'root': str(tmp_path), 'members': {
+        'clean_slab': job, 'gas_ref': None, 'configs': []}}}
+    manifest = {'state': 'CREATED', 'scheduler_job_id': None,
+                'cluster': None, 'remote_dir': None}
+    saves = {'count': 0}
+
+    def _load(_path):
+        return copy.deepcopy(disk['project'])
+
+    def _save(_root, project):
+        saves['count'] += 1
+        if saves['count'] == 1:
+            raise OSError('disk temporarily unavailable')
+        disk['project'] = copy.deepcopy(project)
+
+    def _submit(profile, _pw, dirs, _trust):
+        assert dirs == [job]
+        manifest.update({'state': 'SUBMITTED', 'scheduler_job_id': '900',
+                         'cluster': profile.name, 'remote_dir': '/work/clean',
+                         'cluster_binding': cluster_submitter.profile_binding(
+                             profile)})
+        return {'needs_trust': False, 'results': [(job, True, 'ok')]}
+
+    submissions = []
+    batch = types.SimpleNamespace(submit_batch=lambda *args:
+        submissions.append(args[2]) or _submit(*args))
+    api = Api(
+        profiles_mod=_fake_profiles({'hpc': ClusterProfile(
+            name='hpc', remote_root='/work', queue='q', ppn=16,
+            vasp_cmd='mpirun -np {cores} vasp_std')}),
+        adsorption_mod=types.SimpleNamespace(load_project=_load, save_project=_save),
+        manifest_mod=types.SimpleNamespace(load_manifest=lambda _path: manifest),
+        batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+    _isolate_submit_reuse_gate(api)
+
+    first = api._submit_project_with_resources_for_path('/p/project.yaml', 'hpc', 16, '10:00:00')
+    second = api._submit_project_with_resources_for_path('/p/project.yaml', 'hpc', 16, '10:00:00')
+
+    assert first['ok'] is False and 'launch' in first['error']
+    assert second['ok'] is True and second['submitted'] == []
+    assert submissions == [[job]]
+    assert disk['project']['autopilot_managed'] is True
+    assert disk['project']['launch']['submitted_job_dirs'] == [job]
+
+
+def test_submit_project_round_trips_host_key_evidence_and_exact_pin(tmp_path):
+    job = str(tmp_path / 'clean')
+    project = {'root': str(tmp_path), 'members': {
+        'clean_slab': job, 'gas_ref': None, 'configs': []}}
+    seen = {}
+    evidence = {'host': 'target', 'fingerprint': 'SHA256:def',
+                'algorithm': 'ssh-ed25519'}
+
+    def _submit(_profile, _password, _dirs, trust):
+        seen['trust'] = trust
+        return {'needs_trust': True, 'message': '请核对', 'results': [], **evidence}
+
+    pin = {'host': 'bastion', 'fingerprint': 'SHA256:abc',
+           'algorithm': 'ssh-rsa'}
+    profile = ClusterProfile(
+        name='hpc', auth='key', remote_root='/work', queue='q', ppn=32,
+        vasp_cmd='mpirun -np {cores} vasp_std')
+    api = Api(
+        profiles_mod=_fake_profiles({'hpc': profile}),
+        adsorption_mod=types.SimpleNamespace(load_project=lambda _path: project),
+        manifest_mod=types.SimpleNamespace(load_manifest=lambda _path: {
+            'state': 'CREATED', 'scheduler_job_id': None}),
+        batch_ops_mod=types.SimpleNamespace(submit_batch=_submit),
+        config_mod=_fake_config_rw({}))
+    _isolate_submit_reuse_gate(api)
+
+    out = api._submit_project_with_resources_for_path(
+        '/p/project.yaml', 'hpc', 32, '24:00:00', trust_new=pin)
+
+    assert seen['trust'] is pin
+    assert out['needs_trust'] is True
+    assert {key: out[key] for key in evidence} == evidence
+
+
+def test_submit_blocks_literal_mpi_count_and_renders_cores_placeholder(tmp_path):
+    job = str(tmp_path / 'job')
+    project = {'root': str(tmp_path), 'members': {
+        'clean_slab': job, 'gas_ref': None, 'configs': []}}
+    state = {'state': 'CREATED', 'scheduler_job_id': None}
+    adsorption = types.SimpleNamespace(
+        load_project=lambda _path: project,
+        save_project=lambda _root, _project: None)
+    manifests = types.SimpleNamespace(load_manifest=lambda _path: state)
+    for command in ('mpirun -np96 vasp_std', 'mpirun -np=96 vasp_std',
+                    'srun -n96 vasp_std', 'srun --ntasks=96 vasp_std',
+                    'srun --ntasks 96 vasp_std'):
+        hardcoded = ClusterProfile(name='hpc', remote_root='/work', queue='q', ppn=16,
+                                   vasp_cmd=command)
+        api = Api(profiles_mod=_fake_profiles({'hpc': hardcoded}),
+                  adsorption_mod=adsorption, manifest_mod=manifests,
+                  config_mod=_fake_config_rw({}))
+        blocked = api._submit_project_with_resources_for_path(
+            '/p/project.yaml', 'hpc', 32, '24:00:00')
+        assert blocked['ok'] is False and '不一致' in blocked['error']
+
+    captured = []
+    template = ClusterProfile(name='hpc', remote_root='/work', queue='q', ppn=16,
+                              vasp_cmd='mpirun -np {cores} vasp_std')
+    batch = types.SimpleNamespace(submit_batch=lambda profile, _pw, dirs, _trust:
+        captured.append((profile.vasp_cmd, dirs)) or
+        {'needs_trust': False, 'results': [(job, True, 'ok')]})
+    api = Api(profiles_mod=_fake_profiles({'hpc': template}), adsorption_mod=adsorption,
+              manifest_mod=manifests, batch_ops_mod=batch,
+              config_mod=_fake_config_rw({}))
+    _isolate_submit_reuse_gate(api)
+    submitted = api._submit_project_with_resources_for_path('/p/project.yaml', 'hpc', 32, '24:00:00')
+    assert submitted['ok'] and captured[0][0] == 'mpirun -np 32 vasp_std'
+
+
+def test_submit_project_renders_mapped_vasp_command_without_mutating_profile(tmp_path):
+    job = str(tmp_path / 'job')
+    project = {'root': str(tmp_path), 'members': {
+        'clean_slab': job, 'gas_ref': None, 'configs': []}}
+    adsorption = types.SimpleNamespace(
+        load_project=lambda _path: project,
+        save_project=lambda _root, _project: None)
+    manifests = types.SimpleNamespace(load_manifest=lambda _path: {
+        'state': 'CREATED', 'scheduler_job_id': None})
+    original = ClusterProfile(
+        name='hpc', remote_root='/work', queue='q', ppn=16,
+        vasp_cmd='legacy vasp_std',
+        engine_commands={'vasp': 'srun -n {cores} vasp_std'})
+    captured = []
+    batch = types.SimpleNamespace(submit_batch=lambda profile, _pw, dirs, _trust:
+        captured.append((profile, dirs)) or
+        {'needs_trust': False, 'results': [(job, True, 'ok')]})
+    api = Api(profiles_mod=_fake_profiles({'hpc': original}),
+              adsorption_mod=adsorption, manifest_mod=manifests,
+              batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+    _isolate_submit_reuse_gate(api)
+
+    out = api._submit_project_with_resources_for_path('/p/project.yaml', 'hpc', 24, '12:00:00')
+
+    assert out['ok'] is True
+    assert captured[0][0].engine_commands['vasp'] == 'srun -n 24 vasp_std'
+    assert original.engine_commands['vasp'] == 'srun -n {cores} vasp_std'
+
+
+def test_submit_template_requires_effective_resource_placeholders_and_no_conflicts(tmp_path):
+    job = str(tmp_path / 'job')
+    project = {'root': str(tmp_path), 'members': {
+        'clean_slab': job, 'gas_ref': None, 'configs': []}}
+    state = {'state': 'CREATED', 'scheduler_job_id': None}
+    adsorption = types.SimpleNamespace(
+        load_project=lambda _path: project,
+        save_project=lambda _root, _project: None)
+    manifests = types.SimpleNamespace(load_manifest=lambda _path: state)
+    submitted = []
+    batch = types.SimpleNamespace(submit_batch=lambda profile, _pw, dirs, _trust:
+        submitted.append((profile, list(dirs))) or
+        {'needs_trust': False, 'results': [(job, True, 'ok')]})
+
+    def _run(text):
+        template_path = tmp_path / 'submit.sh'
+        template_path.write_text(text, encoding='utf-8')
+        profile = ClusterProfile(
+            name='hpc', remote_root='/work', scheduler='Slurm',
+            script_mode='template', template_path=str(template_path))
+        api = Api(profiles_mod=_fake_profiles({'hpc': profile}),
+                  adsorption_mod=adsorption, manifest_mod=manifests,
+                  batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+        _isolate_submit_reuse_gate(api)
+        return api._submit_project_with_resources_for_path(
+            '/p/project.yaml', 'hpc', 32, '24:00:00')
+
+    valid = _run(
+        '#!/bin/bash\n#SBATCH --nodes=1\n#SBATCH --ntasks={cores}\n'
+        '#SBATCH --time={walltime}\nsrun --ntasks={cores} vasp_std\n')
+    assert valid['ok'] is True and submitted
+
+    missing_wall_placeholder = _run(
+        '#!/bin/bash\n#SBATCH --ntasks={cores}\n#SBATCH --time=24:00:00\n')
+    assert missing_wall_placeholder['ok'] is False
+    assert '{walltime}' in missing_wall_placeholder['error']
+
+    ineffective = _run(
+        '# selected {cores} / {walltime}\n#SBATCH --ntasks=32\n'
+        '#SBATCH --time=24:00:00\n')
+    assert ineffective['ok'] is False and '有效' in ineffective['error']
+
+    conflicting = _run(
+        '#!/bin/bash\n#SBATCH --ntasks={cores}\n#SBATCH --time={walltime}\n'
+        'mpirun -np=16 vasp_std\n')
+    assert conflicting['ok'] is False and '冲突' in conflicting['error']
+
+    conflicting_wall = _run(
+        '#!/bin/bash\n#SBATCH --ntasks={cores}\n#SBATCH --time={walltime}\n'
+        '#SBATCH -t 01:00:00\n')
+    assert conflicting_wall['ok'] is False and '墙时' in conflicting_wall['error']
+
+
+def test_submit_reports_keyring_setter_success_without_readback_as_failure(tmp_path):
+    job = str(tmp_path / 'job')
+    project = {'root': str(tmp_path), 'members': {
+        'clean_slab': job, 'gas_ref': None, 'configs': []}}
+    adsorption = types.SimpleNamespace(
+        load_project=lambda _path: project,
+        save_project=lambda _root, _project: None)
+    manifests = types.SimpleNamespace(load_manifest=lambda _path: {
+        'state': 'CREATED', 'scheduler_job_id': None})
+    batch = types.SimpleNamespace(submit_batch=lambda *_a:
+        {'needs_trust': False, 'results': [(job, True, 'ok')]})
+    secrets = types.SimpleNamespace(
+        set_password=lambda _name, _password: None,
+        get_password=lambda _name: None)
+    profile = ClusterProfile(
+        name='hpc', auth='password', remote_root='/work', queue='q', ppn=32,
+        vasp_cmd='mpirun -np {cores} vasp_std')
+    api = Api(profiles_mod=_fake_profiles({'hpc': profile}),
+              adsorption_mod=adsorption, manifest_mod=manifests,
+              batch_ops_mod=batch, secrets_mod=secrets,
+              config_mod=_fake_config_rw({}))
+    _isolate_submit_reuse_gate(api)
+
+    out = api._submit_project_with_resources_for_path(
+        '/p/project.yaml', 'hpc', 32, '24:00:00', password='secret')
+
+    assert out['submitted'] == [job] and out['ok'] is False
+    assert '回读不一致' in out['error']
+
+
+def test_exhausted_restartable_project_moves_to_human_analysis():
+    api = Api()
+    stage, needs_human, rounds = api._project_stage([
+        {'state': 'UNCONVERGED', 'restartable': True, 'rounds': 3}], False)
+    assert stage == 'analysis' and needs_human is True and rounds == 3
+
+
+def test_missing_reference_method_evidence_allows_generation_in_review_state(tmp_path):
+    slab, config, incar = (tmp_path / name for name in
+                           ('slab.vasp', 'Li2S8_top.vasp', 'INCAR'))
+    _write_lis_prepare_inputs(slab, config, incar)
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    reference = adsorption.load_project(reference_path)
+    ref_manifest = manifests.load_manifest(reference['species_ref_jobs']['Li2S8'])
+    ref_manifest['results']['reference_method_signature'] = {}
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config())
+    out = api._proj_prepare_lis_for_reference_path(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path)
+    assert out['ok'] is True and calls
+    assert out['needs_method_confirmation'] is False
+    assert out['method_check']['status'] == 'review'
+    assert out['method_check']['submission_allowed'] is True
+    assert out['method_check']['analysis_ready'] is False
+    assert not out['method_check']['issues']
+    assert any('缺方法签名' in warning for warning in out['method_check']['warnings'])
+
+
+def test_pipeline_done_jobs_backfill_missing_local_results_after_restart(tmp_path):
+    complete = tmp_path / 'complete'
+    missing_timestamp = tmp_path / 'missing_timestamp'
+    missing_file = tmp_path / 'missing_file'
+    for folder in (complete, missing_timestamp, missing_file):
+        folder.mkdir()
+        for filename in ('CONTCAR', 'OSZICAR', 'OUTCAR'):
+            (folder / filename).write_text('x', encoding='utf-8')
+    (missing_file / 'OUTCAR').unlink()
+    entries = [
+        (str(complete), {'cluster': 'hpc', 'state': 'DONE', 'remote_dir': '/r/a',
+                         'scheduler_job_id': '101', 'task_type': 'relax',
+                         'results': {'fetched_at': 'now', 'fetched_job_id': '101',
+                                     'fetched_remote_dir': '/r/a',
+                                     'fetched': ['CONTCAR', 'OSZICAR', 'OUTCAR'],
+                                     'fetched_missing': []}}),
+        (str(missing_timestamp), {'cluster': 'hpc', 'state': 'DONE',
+                                  'remote_dir': '/r/b', 'scheduler_job_id': '102',
+                                  'task_type': 'relax', 'results': {}}),
+        (str(missing_file), {'cluster': 'hpc', 'state': 'DONE', 'remote_dir': '/r/c',
+                             'scheduler_job_id': '103', 'task_type': 'relax',
+                             'results': {'fetched_at': 'old', 'fetched_job_id': '103',
+                                         'fetched_remote_dir': '/r/c',
+                                         'fetched': ['CONTCAR', 'OSZICAR', 'OUTCAR'],
+                                         'fetched_missing': []}}),
+    ]
+    _attach_final_fetch_evidence(str(complete), entries[0][1])
+    fetched = []
+    batch = types.SimpleNamespace(fetch_batch=lambda _p, _pw, dirs, _trust:
+        fetched.extend(dirs) or {'needs_trust': False,
+                                 'results': [(d, True, 'fetched') for d in dirs]})
+    managed = [str(complete), str(missing_timestamp), str(missing_file)]
+    project = {'autopilot_managed': True,
+               'launch': {'resources': {'profile': 'hpc'},
+                          'submitted_job_dirs': managed},
+               'members': {'clean_slab': managed[0], 'gas_ref': None,
+                           'configs': managed[1:]}}
+    adsorption = _fake_adsorption(
+        projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project})
+    api = Api(ledger_mod=_fake_ledger(entries, []), batch_ops_mod=batch,
+              adsorption_mod=adsorption,
+              manifest_mod=_fake_manifest_mod(dict(entries)))
+
+    events, errors = [], []
+    ok = api._tick_cluster('hpc', ClusterProfile(name='hpc'), None,
+                           {'cont': False, 'fetch': True}, events, errors)
+
+    assert ok is True and errors == []
+    assert fetched == [str(missing_timestamp), str(missing_file)]
+    assert len([event for event in events if event['kind'] == 'fetch']) == 2
+
+
+def test_pipeline_monitors_project_allowlist_even_when_ledger_entry_is_missing(tmp_path):
+    job = str(tmp_path / 'active')
+    manifest = {
+        'cluster': 'hpc', 'state': 'RUNNING', 'remote_dir': '/r/active',
+        'scheduler_job_id': '501', 'results': {},
+    }
+    project = {
+        'autopilot_managed': True,
+        'launch': {'resources': {'profile': 'hpc'}, 'submitted_job_dirs': [job]},
+        'members': {'clean_slab': job, 'gas_ref': None, 'configs': []},
+    }
+    refreshed = []
+    batch = types.SimpleNamespace(
+        refresh_batch=lambda _p, _pw, dirs, _trust:
+            refreshed.extend(dirs) or {'needs_trust': False,
+                                        'results': [(d, 'RUNNING') for d in dirs]})
+    api = Api(
+        ledger_mod=_fake_ledger([], []),
+        manifest_mod=_fake_manifest_mod({job: manifest}),
+        batch_ops_mod=batch,
+        adsorption_mod=_fake_adsorption(
+            projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project}))
+
+    synced = api._tick_cluster(
+        'hpc', ClusterProfile(name='hpc'), None,
+        {'cont': False, 'fetch': False}, [], [])
+
+    assert synced is True and refreshed == [job]
+
+
+def test_pipeline_continue_needs_trust_marks_cluster_unsynced(tmp_path):
+    job = str(tmp_path / 'restartable')
+    manifest = {
+        'cluster': 'hpc', 'state': 'UNCONVERGED', 'remote_dir': '/r/restartable',
+        'scheduler_job_id': '101',
+        'results': {'diagnosis': {'restartable': True}, 'continue_rounds': 0},
+    }
+    project = {
+        'autopilot_managed': True,
+        'launch': {'resources': {'profile': 'hpc'}, 'submitted_job_dirs': [job]},
+        'members': {'clean_slab': job, 'gas_ref': None, 'configs': []},
+    }
+    batch = types.SimpleNamespace(
+        filter_continuable=lambda dirs: (list(dirs), 0),
+        continue_batch=lambda *_a: {'needs_trust': True, 'results': [],
+                                    'fingerprint': 'SHA256:abc'},
+    )
+    api = Api(
+        ledger_mod=_fake_ledger([(job, manifest)], []), batch_ops_mod=batch,
+        manifest_mod=_fake_manifest_mod({job: manifest}),
+        adsorption_mod=_fake_adsorption(
+            projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project}))
+    events, errors = [], []
+
+    synced = api._tick_cluster(
+        'hpc', ClusterProfile(name='hpc'), None,
+        {'cont': True, 'fetch': False}, events, errors)
+
+    assert synced is False
+    assert errors == ['集群「hpc」同步失败(续算)']
+    assert any(event['kind'] == 'continue' for event in events)
+    public = json.dumps({'events': events, 'errors': errors}, ensure_ascii=False)
+    assert 'SHA256:abc' not in public
+    assert str(tmp_path) not in public
+
+
+def test_pipeline_fetch_exception_marks_cluster_unsynced(tmp_path):
+    job_dir = tmp_path / 'done'
+    job_dir.mkdir()
+    job = str(job_dir)
+    manifest = {
+        'cluster': 'hpc', 'state': 'DONE', 'remote_dir': '/r/done',
+        'scheduler_job_id': '102', 'task_type': 'relax', 'results': {},
+    }
+    project = {
+        'autopilot_managed': True,
+        'launch': {'resources': {'profile': 'hpc'}, 'submitted_job_dirs': [job]},
+        'members': {'clean_slab': job, 'gas_ref': None, 'configs': []},
+    }
+    batch = types.SimpleNamespace(fetch_batch=lambda *_a:
+        (_ for _ in ()).throw(RuntimeError('network down')))
+    api = Api(
+        ledger_mod=_fake_ledger([(job, manifest)], []), batch_ops_mod=batch,
+        manifest_mod=_fake_manifest_mod({job: manifest}),
+        adsorption_mod=_fake_adsorption(
+            projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project}))
+    events, errors = [], []
+
+    synced = api._tick_cluster(
+        'hpc', ClusterProfile(name='hpc'), None,
+        {'cont': False, 'fetch': True}, events, errors)
+
+    assert synced is False
+    assert errors == ['集群「hpc」同步失败(下载)']
+    assert any(event['kind'] == 'fetch' for event in events)
+    public = json.dumps({'events': events, 'errors': errors}, ensure_ascii=False)
+    assert 'network down' not in public
+    assert str(tmp_path) not in public
+
+
+def test_pipeline_fetch_needs_trust_marks_cluster_unsynced(tmp_path):
+    job_dir = tmp_path / 'done_trust'
+    job_dir.mkdir()
+    job = str(job_dir)
+    manifest = {
+        'cluster': 'hpc', 'state': 'DONE', 'remote_dir': '/r/done-trust',
+        'scheduler_job_id': '103', 'task_type': 'relax', 'results': {},
+    }
+    project = {
+        'autopilot_managed': True,
+        'launch': {'resources': {'profile': 'hpc'}, 'submitted_job_dirs': [job]},
+        'members': {'clean_slab': job, 'gas_ref': None, 'configs': []},
+    }
+    batch = types.SimpleNamespace(fetch_batch=lambda *_a: {
+        'needs_trust': True, 'results': [], 'fingerprint': 'SHA256:def'})
+    api = Api(
+        ledger_mod=_fake_ledger([(job, manifest)], []), batch_ops_mod=batch,
+        manifest_mod=_fake_manifest_mod({job: manifest}),
+        adsorption_mod=_fake_adsorption(
+            projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project}))
+    events, errors = [], []
+
+    synced = api._tick_cluster(
+        'hpc', ClusterProfile(name='hpc'), None,
+        {'cont': False, 'fetch': True}, events, errors)
+
+    assert synced is False
+    assert errors == ['集群「hpc」同步失败(下载)']
+    assert any(event['kind'] == 'fetch' for event in events)
+    public = json.dumps({'events': events, 'errors': errors}, ensure_ascii=False)
+    assert 'SHA256:def' not in public
+    assert str(tmp_path) not in public
+
+
+def test_pipeline_cluster_empty_or_nonmember_allowlist_fails_closed(tmp_path):
+    active = str(tmp_path / 'active')
+    done = str(tmp_path / 'done')
+    outsider = str(tmp_path / 'outsider')
+    entries = [
+        (active, {'cluster': 'hpc', 'state': 'RUNNING',
+                  'scheduler_job_id': '1', 'remote_dir': '/r/active'}),
+        (done, {'cluster': 'hpc', 'state': 'DONE', 'scheduler_job_id': '2',
+                'remote_dir': '/r/done', 'results': {}}),
+    ]
+    calls = []
+    batch = types.SimpleNamespace(
+        refresh_batch=lambda *_a: calls.append('refresh') or {'results': []},
+        filter_continuable=lambda dirs: (list(dirs), []),
+        continue_batch=lambda *_a: calls.append('continue') or {'results': []},
+        fetch_batch=lambda *_a: calls.append('fetch') or {'results': []})
+    project = {'autopilot_managed': True,
+               'launch': {'resources': {'profile': 'hpc'},
+                          # outsider 被写入也不是该项目成员，不能扩大自动托管范围。
+                          'submitted_job_dirs': [outsider]},
+               'members': {'clean_slab': active, 'gas_ref': None, 'configs': [done]}}
+    ads = _fake_adsorption(
+        projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project})
+    api = Api(ledger_mod=_fake_ledger(entries, []), batch_ops_mod=batch,
+              adsorption_mod=ads)
+
+    api._tick_cluster('hpc', ClusterProfile(name='hpc'), None,
+                      {'cont': True, 'fetch': True}, [], [])
+
+    assert calls == []
+
+
+def test_local_results_ready_requires_current_job_remote_and_complete_file_evidence(tmp_path):
+    for filename in ('CONTCAR', 'OSZICAR', 'OUTCAR'):
+        (tmp_path / filename).write_text('result', encoding='utf-8')
+    manifest = {
+        'state': 'DONE', 'scheduler_job_id': '42',
+        'remote_dir': '/remote/job', 'task_type': 'relax', 'results': {},
+    }
+    _attach_final_fetch_evidence(str(tmp_path), manifest)
+    assert Api._local_results_ready(str(tmp_path), manifest) is True
+
+    for key, bad_value in (('fetched_job_id', 'old-job'),
+                           ('fetched_remote_dir', '/remote/old')):
+        changed = {**manifest, 'results': {**manifest['results'], key: bad_value}}
+        assert Api._local_results_ready(str(tmp_path), changed) is False
+    missing = {**manifest, 'results': {**manifest['results'],
+                                      'fetched_missing': ['OUTCAR']}}
+    assert Api._local_results_ready(str(tmp_path), missing) is False
+    no_timestamp = {**manifest, 'results': {**manifest['results'], 'fetched_at': ''}}
+    assert Api._local_results_ready(str(tmp_path), no_timestamp) is False
+    (tmp_path / 'OUTCAR').write_text('mutated after fetch', encoding='utf-8')
+    assert Api._local_results_ready(str(tmp_path), manifest) is False
+
+
+def test_pipeline_reports_skip_unmanaged_or_incomplete_delta_projects(tmp_path):
+    projects = {
+        '/unmanaged/project.yaml': {
+            'name': 'unmanaged', 'root': str(tmp_path / 'unmanaged'),
+            'members': {'clean_slab': '/u/s', 'gas_ref': None, 'configs': ['/u/c']}},
+        '/invalid/project.yaml': {
+            'name': 'invalid', 'root': str(tmp_path / 'invalid'),
+            'autopilot_managed': True,
+            'members': {'clean_slab': '/i/s', 'gas_ref': None, 'configs': ['/i/c']}},
+    }
+    manifests = {path: {'state': 'DONE', 'results': {}}
+                 for path in ('/u/s', '/u/c', '/i/s', '/i/c')}
+    adsorption = _fake_adsorption(
+        projects=list(projects), proj_map=projects,
+        delta_ret={'slab': ('DONE', -10.0), 'ref': ('无', None), 'has_ref': False,
+                   'rows': [{'name': 'invalid_ads', 'state': 'DONE',
+                             'delta_e': None, 'note': '参考态无效'}]})
+    saved, calls = [], {'reports': 0}
+    adsorption.save_project = lambda root, project: saved.append(
+        (root, project.get('name')))
+    report = _fake_report_full()
+    report.generate_project_report = lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError('诊断报告不能标记为最终报告'))
+    api = Api(adsorption_mod=adsorption,
+              manifest_mod=_fake_manifest_mod(manifests), report_full_mod=report)
+    _install_fake_report_bundle(api, calls)
+    events, errors = [], []
+
+    api._tick_reports(events, errors)
+
+    assert errors == []
+    assert len(events) == 1 and events[0]['project'] == 'invalid'
+    assert events[0]['report_kind'] == 'diagnostic'
+    assert calls['reports'] == 1
+    assert saved == [(str(tmp_path / 'invalid'), 'invalid')]
+    assert 'autopilot_report' not in projects['/unmanaged/project.yaml']
+    invalid_marker = projects['/invalid/project.yaml']['autopilot_report']
+    assert invalid_marker['kind'] == 'diagnostic'
+    assert set(invalid_marker['files']) == {
+        'html', 'docx', 'pdf', 'manifest',
+        'contract_spec', 'contract_snapshot', 'contract_validation', 'model'}
+
+
+def test_pipeline_reports_only_after_done_outputs_are_fetched_in_same_tick(tmp_path):
+    job_dirs = [str(tmp_path / 'clean'), str(tmp_path / 'config')]
+    for job_dir in job_dirs:
+        os.makedirs(job_dir)
+    manifests = {
+        job_dir: {'cluster': 'hpc', 'state': 'DONE', 'remote_dir': f'/remote/{index}',
+                  'scheduler_job_id': str(200 + index),
+                  'task_type': 'relax', 'results': {}}
+        for index, job_dir in enumerate(job_dirs)
+    }
+    project_path = str(tmp_path / 'project.yaml')
+    project = {'name': 'lis', 'root': str(tmp_path), 'autopilot_managed': True,
+               'launch': {'resources': {'profile': 'hpc'},
+                          'submitted_job_dirs': list(job_dirs)},
+               'members': {
+                   'clean_slab': job_dirs[0], 'gas_ref': None,
+                   'configs': [job_dirs[1]]}}
+    order, mode = [], {'fetch_ok': False}
+
+    def fetch_batch(_profile, _password, dirs, _trust):
+        order.append('fetch')
+        results = []
+        for job_dir in dirs:
+            if mode['fetch_ok']:
+                for filename in ('CONTCAR', 'OSZICAR', 'OUTCAR'):
+                    (tmp_path / os.path.basename(job_dir) / filename).write_text(
+                        'result', encoding='utf-8')
+                _attach_final_fetch_evidence(job_dir, manifests[job_dir])
+            results.append((job_dir, mode['fetch_ok'], 'ok' if mode['fetch_ok'] else 'offline'))
+        return {'needs_trust': False, 'results': results}
+
+    batch = types.SimpleNamespace(
+        fetch_batch=fetch_batch,
+        filter_continuable=lambda dirs: ([], len(dirs)),
+        continue_batch=lambda *_args: {'needs_trust': False, 'results': []})
+    adsorption = types.SimpleNamespace(
+        list_projects=lambda: [project_path],
+        load_project=lambda path: project if path == project_path else None,
+        save_project=lambda _root, _project: order.append('save-project'),
+        delta_e_rows=lambda _project: {
+            'slab': ('DONE', -10.0), 'ref': ('DONE', -5.0), 'has_ref': True,
+            'reference_mode': 'single',
+            'method_consistency': {'status': 'verified', 'issues': [], 'warnings': []},
+            'rows': [{'name': 'ads', 'state': 'DONE', 'delta_e': -1.0,
+                      'e_config': -16.0, 'reference_valid': True, 'note': ''}]})
+    manifest_mod = types.SimpleNamespace(load_manifest=lambda path: manifests.get(path))
+    def generate_report(_project, out, config=None):
+        order.append('report')
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, 'w', encoding='utf-8') as handle:
+            handle.write('<html>final adsorption report</html>')
+        return out
+
+    report_full = types.SimpleNamespace(
+        _member_dirs=lambda _project: list(job_dirs),
+        generate_project_report=generate_report)
+
+    def auto_figures(_project, _scenario, out_dir, **_kwargs):
+        order.append('figures')
+        return {'ok': True, 'out_dir': out_dir, 'files': [], 'panel': None,
+                'manifest': []}
+
+    api = Api(
+        profiles_mod=_fake_profiles({'hpc': ClusterProfile(name='hpc', auth='key')}),
+        ledger_mod=_fake_ledger([(job_dir, manifests[job_dir]) for job_dir in job_dirs], []),
+        batch_ops_mod=batch, adsorption_mod=adsorption, manifest_mod=manifest_mod,
+        report_full_mod=report_full,
+        auto_figures_mod=types.SimpleNamespace(run_auto_figures=auto_figures),
+        config_mod=_fake_config(ui={'autopilot': True,
+                                    'autopilot_continue': False,
+                                    'autopilot_fetch': True,
+                                    'autopilot_report': True}))
+    bundle_calls = {'reports': 0}
+    _install_fake_report_bundle(api, bundle_calls, order=order)
+
+    first = api.pipeline_tick()
+    assert not any(event['kind'] == 'report_done' for event in first['events'])
+    assert 'report' not in order
+
+    mode['fetch_ok'] = True
+    order.clear()
+    second = api.pipeline_tick()
+    assert any(event['kind'] == 'report_done' for event in second['events'])
+    assert order.index('fetch') < order.index('report') < order.index('save-project')
+    assert bundle_calls['reports'] == 1
+    assert project['autopilot_report']['kind'] == 'final'
+    assert set(project['autopilot_report']['files']) == {
+        'html', 'docx', 'pdf', 'manifest',
+        'contract_spec', 'contract_snapshot', 'contract_validation', 'model'}
+
+
+def test_auto_figures_prefers_project_molecules_dir_over_global(tmp_path):
+    project_molecules = tmp_path / 'project-molecules'
+    global_molecules = tmp_path / 'global-molecules'
+    project_molecules.mkdir()
+    global_molecules.mkdir()
+    calls = {}
+    api = Api(config_mod=_fake_config(
+                  cfg={'lis_molecules_dir': str(global_molecules)},
+                  ui={'auto_figures': True}),
+              auto_figures_mod=_fake_auto_figures(calls=calls),
+              adsorption_mod=_fake_adsorption())
+    project = {'name': 'lis', 'root': str(tmp_path),
+               'molecules_dir': str(project_molecules)}
+
+    api._auto_figures_for_project(project, '/p/project.yaml', str(tmp_path / 'figs'))
+
+    assert calls['run']['molecules_dir'] == str(project_molecules)

@@ -204,7 +204,9 @@ def _ladder_from_project(project, summary, scenario, molecules_dir):
     try:
         from vcstudio.project import freeenergy
         fed = freeenergy.path_from_project_and_molecules(
-            summary.get('rows') or [], e_slab=e_slab, molecules_dir=molecules_dir)
+            summary.get('rows') or [], e_slab=e_slab, molecules_dir=molecules_dir,
+            managed_dirs=((project or {}).get('species_ref_jobs') or {}).values(),
+            project=project)
     except Exception as e:                 # noqa: BLE001 缺中间体/分子能量
         return None, str(e)
     name = str(project.get('name') or '') or '项目'

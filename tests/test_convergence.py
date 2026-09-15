@@ -56,6 +56,58 @@ def test_parse_outcar_fmax():
     assert fmax[1] == pytest.approx(0.05)  # sqrt(0.03^2+0.04^2)
 
 
+def test_streaming_outcar_fmax_matches_text_parser():
+    streamed = convergence.parse_outcar_fmax_lines(
+        iter(OUTCAR_2STEP.splitlines(keepends=True)))
+    assert streamed == pytest.approx(convergence.parse_outcar_fmax(OUTCAR_2STEP))
+
+
+def test_streaming_outcar_force_blocks_fail_closed_at_caller_limit():
+    with pytest.raises(convergence.ForceBlockLimitError, match='force-block limit'):
+        convergence.parse_outcar_fmax_lines(
+            iter(OUTCAR_2STEP.splitlines(keepends=True)), max_blocks=1)
+
+
+def test_streaming_outcar_rejects_oversized_line_and_force_block():
+    with pytest.raises(convergence.ForceLineLimitError, match='line-byte limit'):
+        convergence.parse_outcar_fmax_lines(
+            ['x' * 17], max_line_bytes=16)
+
+    lines = [
+        ' POSITION TOTAL-FORCE (eV/Angst)\n',
+        ' ---------------------------------\n',
+        ' 0 0 0 0.1 0.0 0.0\n',
+        ' 1 1 1 0.2 0.0 0.0\n',
+    ]
+    with pytest.raises(convergence.ForceRowLimitError, match='atom-row limit'):
+        convergence.parse_outcar_fmax_lines(
+            lines, max_rows_per_block=1, require_terminated=True)
+
+
+def test_streaming_outcar_drops_unterminated_tail_in_same_bounded_pass():
+    first, second = OUTCAR_2STEP.split(' intermediate stuff\n', 1)
+    unterminated = second.rsplit(
+        ' -----------------------------------------------------------------------------------\n', 1)[0]
+
+    class OnePass:
+        def __init__(self, lines):
+            self.lines = lines
+            self.iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            if self.iterations > 1:
+                raise AssertionError('force source traversed more than once')
+            return iter(self.lines)
+
+    source = OnePass((first + ' intermediate stuff\n' + unterminated).splitlines(True))
+    parsed = convergence.parse_outcar_fmax_lines(
+        source, max_blocks=2, require_terminated=True, with_status=True)
+    assert parsed['values'] == pytest.approx([0.5])
+    assert parsed['trailing_block_complete'] is False
+    assert source.iterations == 1
+
+
 def test_convergence_series_full():
     s = convergence.convergence_series(OSZICAR_2STEP, OUTCAR_2STEP)
     assert s['steps'] == [1, 2]

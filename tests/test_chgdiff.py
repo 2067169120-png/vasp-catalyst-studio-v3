@@ -51,6 +51,23 @@ def test_read_chgcar_truncated_grid_raises():
         chgdiff.read_chgcar(txt)
 
 
+def test_read_chgcar_supports_negative_volume_and_three_scales():
+    grid = [1.0] * 8
+    neg = make_chgcar(_CUBE, ['Cu'], [1], _coords(1), (2, 2, 2), grid, scale=-216)
+    parsed = chgdiff.read_chgcar(neg)
+    # 原始体积 27；目标 216 → 统一尺度 2，实际边长 6 Å。
+    assert parsed['cell'][0] == pytest.approx([6.0, 0.0, 0.0])
+
+    anisotropic = make_chgcar(
+        _CUBE, ['Cu'], [1], _coords(1), (2, 2, 2), grid, scale='2 3 4')
+    parsed_anisotropic = chgdiff.read_chgcar(anisotropic)
+    assert parsed_anisotropic['cell'][2] == pytest.approx([0.0, 0.0, 12.0])
+    equivalent = make_chgcar(
+        [[6.0, 0, 0], [0, 9.0, 0], [0, 0, 12.0]],
+        ['Cu'], [1], _coords(1), (2, 2, 2), grid)
+    assert chgdiff.same_lattice(parsed_anisotropic, chgdiff.read_chgcar(equivalent))
+
+
 # ── Δρ = AB − A − B ──────────────────────────────────────────────────────────
 
 def test_compute_chgdiff_hand_computed(tmp_path):
@@ -115,6 +132,15 @@ def test_plane_averaged_axis_x():
     txt = make_chgcar(_CUBE, ['Cu'], [1], _coords(1), (3, 3, 3), grid)
     r = chgdiff.plane_averaged(txt, axis='x')
     assert r['rho'] == pytest.approx([0.0, 1.0, 2.0])
+
+
+def test_plane_averaged_uses_negative_target_volume_geometry():
+    # 原始立方胞体积 27，目标体积 216，实际边长 6；网格存储值除以 216。
+    grid = [216.0] * 8
+    txt = make_chgcar(_CUBE, ['Cu'], [1], _coords(1), (2, 2, 2), grid, scale=-216)
+    r = chgdiff.plane_averaged(txt, axis='z')
+    assert r['rho'] == pytest.approx([1.0, 1.0])
+    assert r['z'] == pytest.approx([0.0, 3.0])
 
 
 def test_plane_averaged_bad_axis():

@@ -129,7 +129,7 @@ def render_html(rows: list, summary: dict, *, title: str = 'VASP 批量运行报
     prob_rows = ''.join(
         f'<tr><td>{esc(r["name"])}</td><td>{chip(r["state"])}</td>'
         f'<td><code>{esc(r["failure_class"])}</code></td>'
-        f'<td>{"✅ 可续算" if r["restartable"] else "—"}</td>'
+        f'<td>{"是" if r["restartable"] else "否"}</td>'
         f'<td class="ev">{esc(r["evidence"])}</td></tr>'
         for r in summary['problems'])
     prob_section = (
@@ -147,13 +147,17 @@ def render_html(rows: list, summary: dict, *, title: str = 'VASP 批量运行报
         for r in rows)
 
     def de_color(v):
-        """ΔE 颜色语义(原版口径):< -3 强吸附(绿)、> 0 不利(红)、其余默认。"""
+        """ΔE 颜色语义:< -3 过强警戒(橙红)、> 0 不利(红)、其余默认。
+
+        更负的吸附能不等于更好的催化性能；把过强吸附画成“成功绿”会违背
+        Sabatier 初筛口径，并可能掩盖 Li2S 产物陷阱。
+        """
         if not isinstance(v, (int, float)):
             return ''
         if v > 0:
             return 'color:#b91c1c;font-weight:600'
         if v < -3:
-            return 'color:#15803d;font-weight:600'
+            return 'color:#c2410c;font-weight:600'
         return ''
 
     de_section = ''
@@ -181,26 +185,55 @@ def render_html(rows: list, summary: dict, *, title: str = 'VASP 批量运行报
 _HTML_SHELL = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title>
 <style>
-:root{{color-scheme:light}}
+:root{{color-scheme:light;--ink:#18212b;--muted:#637083;--rule:#cfd5dc;--accent:#244b73}}
 *{{box-sizing:border-box}}
-body{{margin:0;font:14px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
-color:#1f2937;background:#f8fafc;padding:24px}}
-h1{{font-size:20px;margin:0 0 2px}} h2{{font-size:15px;margin:26px 0 8px;color:#374151}}
-.meta{{color:#6b7280;font-size:12px;margin-bottom:18px}}
-.cards{{display:flex;flex-wrap:wrap;gap:10px}}
-.card{{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:12px 16px;min-width:96px}}
-.card .n{{font-size:24px;font-weight:700}}
-.chip{{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600}}
-table{{width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e7eb;
-border-radius:10px;overflow:hidden;font-size:13px}}
-th,td{{text-align:left;padding:7px 10px;border-bottom:1px solid #f1f5f9}}
-th{{background:#f8fafc;font-weight:600;color:#475569}}
+@page{{size:Letter portrait;margin:20mm 19mm 22mm}}
+body{{margin:0;color:var(--ink);background:#e9edf1;padding:28px;
+font:13.5px/1.62 "Times New Roman","Noto Serif CJK SC","SimSun",serif}}
+.paper{{max-width:960px;margin:0 auto;background:#fff;padding:54px 62px 58px;
+box-shadow:0 8px 28px #18212b18}}
+.doc-kicker{{font:600 10px/1.2 Arial,"Microsoft YaHei",sans-serif;letter-spacing:.16em;
+text-align:center;color:var(--accent);text-transform:uppercase;margin-bottom:14px}}
+h1{{font-size:27px;line-height:1.25;text-align:center;margin:0 0 8px;font-weight:600}}
+h2{{font-size:16px;line-height:1.35;margin:30px 0 10px;color:var(--accent);
+padding-bottom:5px;border-bottom:1px solid var(--rule);break-after:avoid}}
+p,ul{{orphans:3;widows:3}}
+.meta{{color:var(--muted);font:11.5px/1.4 Arial,"Microsoft YaHei",sans-serif;
+text-align:center;margin-bottom:27px}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:0;
+border-top:1.5px solid var(--ink);border-bottom:1px solid var(--rule);margin:0 0 20px}}
+.card{{padding:11px 12px;min-width:96px;border-right:1px solid #e2e6ea}}
+.card:last-child{{border-right:0}}
+.card .n{{font:600 22px/1.1 "Times New Roman",serif;margin-bottom:4px}}
+.chip{{display:inline-block;padding:1px 6px;border-radius:2px;
+font:600 10.5px/1.45 Arial,"Microsoft YaHei",sans-serif}}
+table{{width:100%;border-collapse:collapse;background:#fff;border-top:1.5px solid var(--ink);
+border-bottom:1.5px solid var(--ink);font-size:11.5px;margin:8px 0 18px;break-inside:auto}}
+thead{{display:table-header-group}}
+tr{{break-inside:avoid}}
+th,td{{text-align:left;padding:6px 7px;border-bottom:.5px solid #dfe3e7;vertical-align:top}}
+th{{font-family:Arial,"Microsoft YaHei",sans-serif;font-weight:600;color:#283849;
+border-bottom:1px solid #7c8792;background:#f6f7f8}}
 tr:last-child td{{border-bottom:none}}
 .num{{text-align:right;font-variant-numeric:tabular-nums}}
-.dim{{color:#94a3b8;font-size:12px}} .ev{{color:#475569;font-size:12px}}
-.ok{{color:#15803d}} code{{background:#f1f5f9;padding:1px 5px;border-radius:4px;font-size:12px}}
+.dim{{color:var(--muted);font-size:11.2px}} .ev{{color:#465363;font-size:11.2px}}
+.ok{{color:#24613f}} code{{background:#f2f4f6;padding:1px 4px;border-radius:2px;
+font:10.8px/1.4 "Cascadia Mono","Courier New",monospace}}
 .wrap{{overflow-x:auto}}
-</style></head><body>
+img,svg{{break-inside:avoid;max-width:100%;height:auto}}
+.doc-footer{{margin-top:34px;padding-top:8px;border-top:1px solid var(--rule);
+font:10px/1.4 Arial,"Microsoft YaHei",sans-serif;color:var(--muted);text-align:center}}
+@media print{{
+  body{{background:#fff;padding:0}}
+  .paper{{max-width:none;margin:0;padding:0;box-shadow:none}}
+  h2,table,img,svg{{break-inside:avoid}}
+}}
+@media(max-width:720px){{
+  body{{padding:0}} .paper{{padding:28px 20px;box-shadow:none}}
+  .cards{{grid-template-columns:repeat(2,1fr)}}
+}}
+</style></head><body><main class="paper">
+<div class="doc-kicker">Computational Materials Report</div>
 <h1>{title}</h1><div class="meta">{meta}</div>
 <div class="cards">{cards}</div>
 {problems}
@@ -208,7 +241,8 @@ tr:last-child td{{border-bottom:none}}
 <h2>全部作业</h2><div class="wrap"><table><thead><tr><th>作业</th><th>体系</th><th>类型</th>
 <th>状态</th><th>集群</th><th>作业号</th><th>E0 (eV)</th><th>更新</th></tr></thead>
 <tbody>{all_rows}</tbody></table></div>
-</body></html>"""
+<div class="doc-footer">Generated from hash-bound VASP inputs and results · VASP Catalyst Studio</div>
+</main></body></html>"""
 
 
 def write_report(job_dirs, out_path, *, title: str = 'VASP 批量运行报告',

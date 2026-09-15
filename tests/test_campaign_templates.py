@@ -17,7 +17,7 @@ def _validate(cdir, tid):
     t = {x['id']: x for x in camp['tasks']}[tid]
     states.mark_completed(t)
     states.promote_validated(t, {'converged': True})
-    schema.save_task(cdir, t)
+    schema.persist_task(cdir, t, expected_revision=t['revision'])
     return t
 
 
@@ -126,5 +126,5 @@ def test_next_derivations_ignores_merely_completed(tmp_path):
     camp = schema.load_campaign(cdir)
     t = {x['id']: x for x in camp['tasks']}['Fe_MN4__clean__relax']
     states.mark_completed(t)                          # 仅 completed,未 validated
-    schema.save_task(cdir, t)
+    schema.persist_task(cdir, t, expected_revision=t['revision'])
     assert ct.next_derivations(cdir) == []            # 不建在未验证结果上

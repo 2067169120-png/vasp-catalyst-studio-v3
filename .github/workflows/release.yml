@@ -1,7 +1,5 @@
 name: Release
 
-# 打 v* 标签自动出 Windows EXE 挂到 GitHub Release(在 windows-latest 云机器构建)。
-# EXE 含 web GUI + matplotlib 出图引擎;--legacy tkinter 版不随发行(需要者自行打包)。
 on:
   push:
     tags: ["v*"]
@@ -9,34 +7,171 @@ on:
 permissions:
   contents: write
 
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+  PYTHONDONTWRITEBYTECODE: "1"
+
 jobs:
   windows-exe:
+    name: Validate and publish Windows executable
     runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      MPLCONFIGDIR: ${{ github.workspace }}/.vcstudio-matplotlib-release
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Provenance validation needs integration-branch history, not a shallow tag.
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install (dev + gui + charts + PyInstaller)
+          cache: pip
+      - name: Verify tag identity and integration-branch provenance
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          TAGGED_SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          # Optional comma/space-separated repository variable.  Every non-default
+          # branch named here must also be reported protected by the GitHub API.
+          INTEGRATION_BRANCHES: ${{ vars.RELEASE_INTEGRATION_BRANCHES }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
         run: |
-          python -m pip install --upgrade pip
-          pip install -e .[dev,gui,charts]
-          pip install pyinstaller
-      - name: Test (fast gate)
-        run: python -m pytest -q
+          $ErrorActionPreference = 'Stop'
+
+          $version = (& python -X utf8 -c "import vcstudio; print(vcstudio.__version__)").Trim()
+          $expectedTag = "v$version"
+          if ($env:RELEASE_TAG -cne $expectedTag) {
+            throw "Release tag '$env:RELEASE_TAG' must exactly equal '$expectedTag'."
+          }
+
+          $tagRef = "refs/tags/$env:RELEASE_TAG^{commit}"
+          $tagCommit = (& git rev-parse $tagRef).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tag '$env:RELEASE_TAG' does not resolve to a commit."
+          }
+          $eventCommit = (& git rev-parse "$env:TAGGED_SHA^{commit}").Trim()
+          if ($LASTEXITCODE -ne 0 -or $tagCommit -cne $eventCommit) {
+            throw "Checked-out tag commit '$tagCommit' does not match event SHA '$eventCommit'."
+          }
+
+          $branches = @($env:DEFAULT_BRANCH)
+          if ($env:INTEGRATION_BRANCHES) {
+            $branches += @($env:INTEGRATION_BRANCHES -split '[,\s]+' | Where-Object { $_ })
+          }
+          $branches = @($branches | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique)
+          if (-not $branches.Count) {
+            throw 'Repository default branch is unavailable; release provenance cannot be established.'
+          }
+
+          $containedBy = @()
+          foreach ($branch in $branches) {
+            & git check-ref-format --branch $branch *> $null
+            if ($LASTEXITCODE -ne 0) {
+              throw "Invalid integration branch name '$branch'."
+            }
+            if ($branch -cne $env:DEFAULT_BRANCH) {
+              $encoded = [Uri]::EscapeDataString($branch)
+              $protected = (& gh api "repos/$env:GH_REPOSITORY/branches/$encoded" --jq '.protected').Trim()
+              if ($LASTEXITCODE -ne 0 -or $protected -cne 'true') {
+                throw "Configured integration branch '$branch' is not protected."
+              }
+            }
+
+            & git fetch --force --no-tags origin "+refs/heads/${branch}:refs/remotes/origin/${branch}"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Unable to fetch integration branch '$branch'."
+            }
+            & git merge-base --is-ancestor $tagCommit "refs/remotes/origin/$branch"
+            if ($LASTEXITCODE -eq 0) {
+              $containedBy += $branch
+            } elseif ($LASTEXITCODE -ne 1) {
+              throw "Unable to verify ancestry against '$branch'."
+            }
+          }
+          if (-not $containedBy.Count) {
+            throw "Tagged commit '$tagCommit' is not contained by the default/protected integration branch set."
+          }
+          "Validated $env:RELEASE_TAG -> $tagCommit; contained by: $($containedBy -join ', ')"
+
+      - name: Install full desktop and release dependencies
+        run: python -m pip install -e ".[dev,gui,charts,mol,docs,packaging]"
+      - name: Test release source
+        run: python -X utf8 -m pytest -q -p no:cacheprovider
       - name: Build EXE
-        run: python packaging/build_exe.py
-      - name: Rename artifact with version
+        run: python -X utf8 packaging/build_exe.py --full
+      - name: Run the frozen executable healthcheck
         shell: pwsh
         run: |
-          $v = "${{ github.ref_name }}"
-          Copy-Item "dist/VASP Catalyst Studio.exe" "dist/VASP-Catalyst-Studio-$v-windows.exe"
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path -LiteralPath 'dist/VASP Catalyst Studio.exe').Path
+          $dist = (Resolve-Path -LiteralPath 'dist').Path
+          function Invoke-FrozenHealthcheck([string]$Profile, [string[]]$Required) {
+            $report = Join-Path $dist "frozen-healthcheck-$Profile.json"
+            $process = Start-Process -FilePath $exe -WindowStyle Hidden -PassThru `
+              -ArgumentList @(
+                '--healthcheck',
+                '--healthcheck-profile', $Profile,
+                '--healthcheck-output', $report
+              )
+            try {
+              $process | Wait-Process -Timeout 300 -ErrorAction Stop
+            } catch {
+              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+              throw "Frozen $Profile healthcheck exceeded the 300 second timeout."
+            }
+            $process.Refresh()
+            if (-not (Test-Path -LiteralPath $report)) {
+              throw "Frozen $Profile healthcheck did not write its JSON report."
+            }
+            $health = Get-Content -LiteralPath $report -Raw -Encoding utf8 | ConvertFrom-Json
+            $present = @($health.checks.PSObject.Properties.Name)
+            $missing = @($Required | Where-Object { $_ -notin $present })
+            if ($process.ExitCode -ne 0 -or -not $health.ok -or -not $health.frozen `
+                -or $health.profile -cne $Profile -or $missing.Count) {
+              $health | ConvertTo-Json -Depth 12
+              throw "Frozen $Profile healthcheck failed (exit=$($process.ExitCode), missing=$($missing -join ','))."
+            }
+            if ($Profile -ceq 'journey') {
+              $journey = $health.checks.'bridge-journey'
+              if (-not $journey.ok -or -not $journey.detail.ok `
+                  -or $journey.detail.phase_count -lt 10) {
+                $health | ConvertTo-Json -Depth 12
+                throw 'Frozen journey did not complete every persistence phase.'
+              }
+            }
+            $health | ConvertTo-Json -Depth 12
+          }
+          Invoke-FrozenHealthcheck 'full' @(
+            'frozen-runtime', 'core-modules', 'web-assets', 'locales',
+            'numeric-and-charts', 'molecule-and-documents'
+          )
+          Invoke-FrozenHealthcheck 'journey' @(
+            'frozen-runtime', 'core-modules', 'web-assets', 'locales',
+            'bridge-journey'
+          )
+      - name: Name and checksum the release artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = '${{ github.ref_name }}'
+          $source = 'dist/VASP Catalyst Studio.exe'
+          $target = "dist/VASP-Catalyst-Studio-$tag-windows.exe"
+          Copy-Item -LiteralPath $source -Destination $target
+          $hash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash *$(Split-Path -Leaf $target)" | Set-Content -LiteralPath "$target.sha256" -Encoding ascii
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/VASP-Catalyst-Studio-*.exe
+            dist/VASP-Catalyst-Studio-*.exe.sha256
+          fail_on_unmatched_files: true
           generate_release_notes: true
           body: |
-            VASP Catalyst Studio ${{ github.ref_name }} — Windows 单文件 EXE(双击即用,无需安装 Python)。
-            更新内容见 CHANGELOG.md。首次启动若报 WebView2 缺失,请安装微软 Edge WebView2 运行时。
+            VASP Catalyst Studio ${{ github.ref_name }} — Windows single-file executable.
+            The artifact was built from a validated integration-branch commit and passed the frozen healthcheck before upload.
+            See CHANGELOG.md for release details. Microsoft Edge WebView2 Runtime is required.

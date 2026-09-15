@@ -2,6 +2,7 @@
 import pytest
 
 from vcstudio.generate.job_builder import build_job_dir
+from vcstudio.generate import task_catalog
 from vcstudio.shared import manifest
 
 
@@ -43,6 +44,46 @@ def test_create_from_build_writes_job_yaml(tmp_path):
     # 缺 ENCUT → 有补全项 → 来源标记 user+completion
     assert 'ENCUT' in loaded['inputs']['completions']
     assert loaded['inputs']['incar_source'] == 'user+completion'
+    # 旧调用方未传 incar_path 时保持兼容，不伪造源路径。
+    assert 'source_incar_path' not in loaded['inputs']
+    assert 'source_incar_sha256' not in loaded['inputs']
+
+
+def test_create_from_build_records_source_and_final_managed_input_hashes(tmp_path):
+    """源 INCAR 与受管目录最终输入分开溯源；自动补全会使两者哈希不同。"""
+    poscar, lib = _make_fixture(tmp_path)
+    source_incar = tmp_path / 'member-a' / 'INCAR'
+    source_incar.parent.mkdir()
+    source_incar.write_text('ISMEAR = 0\n', encoding='utf-8')
+    out = tmp_path / 'managed' / 'job-a'
+    res = build_job_dir(poscar, str(source_incar), str(out),
+                        calc_type='molecule', lib_root=lib)
+
+    manifest.create_from_build(
+        str(out), res, poscar_path=poscar, incar_path=source_incar, validate=True)
+    inputs = manifest.load_manifest(out)['inputs']
+
+    assert inputs['source_incar_path'] == str(source_incar.resolve())
+    assert inputs['source_incar_sha256'] == manifest.sha256_file(source_incar)
+    assert set(inputs['sha256']) == {'INCAR', 'POSCAR', 'KPOINTS', 'POTCAR'}
+    assert inputs['sha256'] == {
+        name: manifest.sha256_file(out / name)
+        for name in ('INCAR', 'POSCAR', 'KPOINTS', 'POTCAR')
+    }
+    assert inputs['sha256']['INCAR'] != inputs['source_incar_sha256']
+
+
+def test_create_from_build_hashes_only_existing_managed_inputs(tmp_path):
+    poscar, lib = _make_fixture(tmp_path)
+    out = tmp_path / 'partial-audit'
+    res = build_job_dir(poscar, 'ENCUT = 400\n', str(out),
+                        calc_type='molecule', lib_root=lib)
+    (out / 'KPOINTS').unlink()
+
+    manifest.create_from_build(str(out), res, poscar_path=poscar)
+
+    hashes = manifest.load_manifest(out)['inputs']['sha256']
+    assert set(hashes) == {'INCAR', 'POSCAR', 'POTCAR'}
 
 
 def test_manifest_records_potcar_provenance(tmp_path):
@@ -63,6 +104,33 @@ def test_incar_source_labels():
     assert manifest.incar_source_label(False, {}) == 'user_no_validate'
     assert manifest.incar_source_label(True, {}) == 'user_verbatim'
     assert manifest.incar_source_label(True, {'ENCUT': 400}) == 'user+completion'
+
+
+def test_manifest_task_types_cover_full_catalog_and_normalize_legacy_aliases():
+    catalog_keys = tuple(item['key'] for item in task_catalog.CATALOG)
+    assert len(catalog_keys) == 23
+    assert catalog_keys == manifest.CATALOG_TASK_TYPES
+    assert set(catalog_keys).issubset(manifest.KNOWN_TASK_TYPES)
+    assert manifest.normalize_task_type('band') == 'bands'
+    assert manifest.normalize_task_type('DOS') == 'dos_pdos'
+    m = manifest.new_manifest(
+        job_id='legacy-band', system='s', task_type='band', calc_type='bulk', inputs={})
+    assert m['task_type'] == 'bands'
+
+
+def test_unknown_task_type_is_rejected_instead_of_silently_becoming_relax(tmp_path):
+    with pytest.raises(ValueError, match='未知任务类型'):
+        manifest.new_manifest(
+            job_id='bad', system='s', task_type='statci', calc_type='bulk', inputs={})
+
+    poscar, lib = _make_fixture(tmp_path)
+    out = tmp_path / 'bad-build'
+    res = build_job_dir(poscar, 'ENCUT = 400\n', str(out),
+                        calc_type='molecule', lib_root=lib)
+    res['task_type'] = 'statci'
+    with pytest.raises(ValueError, match='未知任务类型'):
+        manifest.create_from_build(str(out), res, poscar_path=poscar)
+    assert not (out / 'job.yaml').exists()
 
 
 def test_set_state_appends_history_and_rejects_bogus(tmp_path):

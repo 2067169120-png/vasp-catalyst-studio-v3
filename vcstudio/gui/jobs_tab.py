@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import copy
 import os
 import sys
 import time
@@ -14,7 +15,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
 
 from vcstudio.gui.widgets import LogBox
-from vcstudio.gui import runner
+from vcstudio.gui import report_bridge, runner
 from vcstudio.cluster import ledger, submitter, batch_ops
 from vcstudio.cluster.profiles import load_profiles
 from vcstudio.project import report
@@ -306,11 +307,6 @@ class JobsTab(ttk.Frame):
     def _maybe_auto_reports(self):
         """项目成员全 DONE 且报告缺失/过期 → 后台生成完整报告(用户决策:全自动)。"""
         from vcstudio.project import adsorption, report_full
-        from vcstudio.shared.config import load_config
-        try:
-            cfg = load_config()
-        except Exception:                                # noqa: BLE001
-            cfg = {}
         for pth in adsorption.list_projects():
             proj = adsorption.load_project(pth)
             if not proj:
@@ -329,26 +325,56 @@ class JobsTab(ttk.Frame):
                     self.log.write(f"⚠ 项目「{proj['name']}」被卡:{', '.join(stuck[:5])} "
                                    f"未 DONE(修复/续算后才会自动出报告)")
                 continue
-            out = os.path.join(proj.get('root', ''), f"{proj['name']}_完整报告.html")
-            newest = max((os.path.getmtime(manifest_mod.manifest_path(d))
-                          for d in dirs if manifest_mod.manifest_path(d).is_file()),
-                         default=0)
-            if os.path.isfile(out) and os.path.getmtime(out) >= newest:
-                continue                                 # 报告已新鲜
-            self.log.write(f"📄 项目「{proj['name']}」全部 DONE,后台生成完整报告…")
-            q = runner.submit(report_full.generate_project_report, proj, out, config=cfg)
-            self.after(500, lambda qq=q, o=out: self._poll_report(qq, o))
+            out_dir = str(proj.get('root') or os.path.dirname(os.path.abspath(str(pth))))
+            stem = f"{proj['name']}_完整报告"
+            report_status = report_bridge.project_report_status(pth)
+            if (report_status.get('ok')
+                    and report_status.get('artifact_current')
+                    and not report_status.get('scientific_stale')):
+                continue                                 # canonical marker 已证明当前
+            if not report_status.get('ok'):
+                self.log.write(
+                    f"⚠ 项目「{proj['name']}」无法读取报告 marker，将尝试重建："
+                    f"{report_status.get('error') or '未知原因'}")
+            self.log.write(
+                f"📄 项目「{proj['name']}」全部 DONE，后台通过统一报告引擎生成 HTML…")
+            q = runner.submit(
+                report_bridge.generate_project_report_bundle,
+                pth,
+                out_dir,
+                formats=('html',),
+                final=True,
+                stem=stem,
+            )
+            self.after(
+                500,
+                lambda qq=q, name=proj['name']: self._poll_report(qq, name),
+            )
 
-    def _poll_report(self, q, out):
+    def _poll_report(self, q, project_name=''):
         item = runner.poll(q)
         if item is None:
-            self.after(500, lambda: self._poll_report(q, out))
+            self.after(500, lambda: self._poll_report(q, project_name))
             return
         kind, payload = item
         if kind == 'error':
             self.log.write(f'❌ 自动报告失败:{payload}')
-        else:
-            self.log.write(f'✅ 完整报告已生成:{out}(含图表/结构图/AI 分析)')
+            return
+        if not isinstance(payload, dict):
+            self.log.write('❌ 自动报告失败:报告桥返回了无效结果')
+            return
+        prefix = f'项目「{project_name}」' if project_name else '项目'
+        self.log.write(f'ℹ {prefix}{report_bridge.status_text(payload)}')
+        if payload.get('gate_reason'):
+            self.log.write(f"⚠ {prefix}科学门禁:{payload['gate_reason']}")
+        if not payload.get('artifact_ok'):
+            self.log.write(
+                f"❌ {prefix}报告产物不可用:{payload.get('error') or '生成未完成'}")
+            return
+        out = payload.get('primary_file')
+        science = str(payload.get('scientific_status') or 'pending').lower()
+        icon = '✅' if science == 'final' else '⚠'
+        self.log.write(f'{icon} {prefix}报告产物已生成:{out or "路径未返回"}')
 
     # ── 拉回结果(S3):预设可选(轻量默认 / DOS·Bader / 自定义) ──
     _FETCH_PRESETS = (
@@ -431,34 +457,51 @@ class JobsTab(ttk.Frame):
         self.reload()
 
     # ── 续算(有界恢复) ──
-    def _on_continue(self, trust_new=False):
-        sel = self._selected()
-        if not sel:
-            self.log.write('❌ 请先选中要续算的作业(仅未收敛/墙钟/ZBRENT 等可续算)')
-            return
-        prof = self._profile()
-        if prof is None:
-            return
-        dirs, skipped = batch_ops.filter_continuable(sel)
-        if not dirs:
-            self.log.write('❌ 选中作业均不可续算(需:已结束 + 诊断标可续算 + 未达 3 轮上限)')
-            return
-        tail = f'(跳过 {skipped} 个不可续算/仍在跑)' if skipped else ''
-        if not trust_new and not messagebox.askyesno(
-                '确认续算',
-                f'将对 {len(dirs)} 个可续算作业从 CONTCAR 续算并重投到「{prof.name}」{tail}\n'
-                f'INCAR 冻结;每作业上限 3 轮。\n\n继续?'):
-            return
-        pw = self._password_for(prof)
+    def _on_continue(self, trust_new=False, frozen=None):
+        if frozen is None:
+            if trust_new:
+                self.log.write('❌ 主机信任重试缺少已确认目标，请重新发起续算')
+                return
+            sel = self._selected()
+            if not sel:
+                self.log.write('❌ 请先选中要续算的作业(仅未收敛/墙钟/ZBRENT 等可续算)')
+                return
+            prof = self._profile()
+            if prof is None:
+                return
+            dirs, skipped = batch_ops.filter_continuable(
+                sel, allow_round_limit_override=True)
+            if not dirs:
+                self.log.write('❌ 选中作业均不可续算(需:已结束 + 诊断标可续算)')
+                return
+            tail = f'(跳过 {skipped} 个不可续算/仍在跑)' if skipped else ''
+            if not messagebox.askyesno(
+                    '确认续算',
+                    f'将对 {len(dirs)} 个可续算作业从 CONTCAR 续算并重投到「{prof.name}」{tail}\n'
+                    f'INCAR 冻结。自动托管最多 3 轮；这是人工确认，超过 3 轮仍可继续，'
+                    f'请自行判断机时与方法合理性。\n\n继续?'):
+                return
+            frozen = {
+                'dirs': tuple(dirs),
+                'profile': copy.deepcopy(prof),
+                'password': self._password_for(prof),
+                'idempotency_key': f'tk-continue-{os.urandom(16).hex()}',
+            }
+        prof = frozen['profile']
+        dirs = list(frozen['dirs'])
+        pw = frozen['password']
         self.continue_btn.configure(state='disabled')
         self.log.write(f'⏳ 连接并续算 {len(dirs)} 个作业…')
-        q = runner.submit(batch_ops.continue_batch, prof, pw, dirs, trust_new)
-        self.after(200, lambda: self._poll_continue(q))
+        q = runner.submit(
+            batch_ops.continue_batch, prof, pw, dirs, trust_new,
+            idempotency_key=frozen['idempotency_key'],
+            allow_round_limit_override=True)
+        self.after(200, lambda: self._poll_continue(q, frozen))
 
-    def _poll_continue(self, q):
+    def _poll_continue(self, q, frozen):
         item = runner.poll(q)
         if item is None:
-            self.after(200, lambda: self._poll_continue(q))
+            self.after(200, lambda: self._poll_continue(q, frozen))
             return
         kind, payload = item
         self.continue_btn.configure(state='normal')
@@ -467,7 +510,7 @@ class JobsTab(ttk.Frame):
             return
         if payload.get('needs_trust'):
             if messagebox.askyesno('未知主机', f"{payload['message']}\n\n是否信任该主机并重试?"):
-                self._on_continue(trust_new=True)
+                self._on_continue(trust_new=True, frozen=frozen)
             return
         for dir_, ok, msg in payload['results']:
             self.log.write(('✅' if ok else '❌') + f' {os.path.basename(dir_)}:{msg}')
@@ -562,36 +605,53 @@ class JobsTab(ttk.Frame):
             messagebox.showerror('认领失败', str(e), parent=win)
 
     # ── 改参续算(S6:诊断建议 → 白名单键受控修改重投) ──
-    def _on_tune_continue(self, trust_new=False):
-        sel = self._selected()
-        if len(sel) != 1:
-            self.log.write('❌ 改参续算一次处理一个作业:请只选中一个已结束的作业')
-            return
-        d = sel[0]
-        m = manifest_mod.load_manifest(d)
-        if m is None:
-            self.log.write('❌ 该条目缺 job.yaml')
-            return
-        if m.get('state') in ('UPLOADED', 'SUBMITTED', 'QUEUED', 'RUNNING'):
-            self.log.write(f"❌ 该作业仍在队列/运行中(状态 {m['state']}),不能改参重投")
-            return
-        prof = self._profile()
-        if prof is None:
-            return
-        dgn = (m.get('results') or {}).get('diagnosis') or {}
-        hint = ''
-        if dgn.get('failure_class'):
-            hint = f"诊断:{dgn['failure_class']} — {dgn.get('evidence', '')}"
-        changes = self._ask_incar_changes(os.path.basename(d), hint)
-        if not changes:
-            return
-        pw = self._password_for(prof)
+    def _on_tune_continue(self, trust_new=False, frozen=None):
+        if frozen is None:
+            if trust_new:
+                self.log.write('❌ 主机信任重试缺少已确认目标，请重新发起改参续算')
+                return
+            sel = self._selected()
+            if len(sel) != 1:
+                self.log.write('❌ 改参续算一次处理一个作业:请只选中一个已结束的作业')
+                return
+            d = sel[0]
+            m = manifest_mod.load_manifest(d)
+            if m is None:
+                self.log.write('❌ 该条目缺 job.yaml')
+                return
+            if m.get('state') not in submitter.CONTINUE_TERMINAL_STATES:
+                self.log.write(
+                    f"❌ 该作业不在可改参重投终态(状态 {m.get('state') or '<缺失>'})")
+                return
+            prof = self._profile()
+            if prof is None:
+                return
+            dgn = (m.get('results') or {}).get('diagnosis') or {}
+            hint = ''
+            if dgn.get('failure_class'):
+                hint = f"诊断:{dgn['failure_class']} — {dgn.get('evidence', '')}"
+            changes = self._ask_incar_changes(os.path.basename(d), hint)
+            if not changes:
+                return
+            frozen = {
+                'job_dir': d,
+                'changes': dict(changes),
+                'from_contcar': bool(getattr(self, '_tune_from_contcar', True)),
+                'profile': copy.deepcopy(prof),
+                'password': self._password_for(prof),
+                'idempotency_key': f'tk-tune-{os.urandom(16).hex()}',
+            }
+        d = frozen['job_dir']
+        changes = dict(frozen['changes'])
+        prof = frozen['profile']
+        pw = frozen['password']
         self.tune_btn.configure(state='disabled')
         self.log.write(f'⏳ 改参续算 {os.path.basename(d)}:' +
                        ', '.join(f'{k}={v}' for k, v in changes.items()))
         q = runner.submit(batch_ops.tune_batch, prof, pw, d, changes, trust_new,
-                          getattr(self, '_tune_from_contcar', True))
-        self.after(200, lambda: self._poll_tune(q))
+                          frozen['from_contcar'],
+                          idempotency_key=frozen['idempotency_key'])
+        self.after(200, lambda: self._poll_tune(q, frozen))
 
     def _ask_incar_changes(self, job_name, hint):
         """弹窗收集白名单 INCAR 修改(每行 KEY = VALUE)。返回 dict 或 None(取消)。"""
@@ -609,7 +669,8 @@ class JobsTab(ttk.Frame):
         ttk.Label(win, foreground='#64748B', wraplength=520, text=(
             '白名单(非方法学旋钮):' + ', '.join(sorted(submitter.INCAR_TUNE_WHITELIST)) +
             '。ENCUT/泛函/IVDW/ISPIN 不可改(保 ΔE 可比性)。'
-            '修改以追加块写入 INCAR 文末(原文保留,VASP 取末次出现值),并计入续算轮次(上限 3)。')).pack(
+            '修改以追加块写入 INCAR 文末(原文保留,VASP 取末次出现值),并计入续算轮次。'
+            '自动续算上限为 3 轮；人工确认的改参续算可超过该上限。')).pack(
             anchor='w', padx=10, pady=4)
         from_contcar = tk.BooleanVar(value=True)
         ttk.Checkbutton(win, text='同时从 CONTCAR 续算结构(推荐;取消则保持原 POSCAR 重跑)',
@@ -647,10 +708,10 @@ class JobsTab(ttk.Frame):
         self._tune_from_contcar = result['from_contcar']
         return result['changes']
 
-    def _poll_tune(self, q):
+    def _poll_tune(self, q, frozen):
         item = runner.poll(q)
         if item is None:
-            self.after(200, lambda: self._poll_tune(q))
+            self.after(200, lambda: self._poll_tune(q, frozen))
             return
         kind, payload = item
         self.tune_btn.configure(state='normal')
@@ -659,7 +720,7 @@ class JobsTab(ttk.Frame):
             return
         if payload.get('needs_trust'):
             if messagebox.askyesno('未知主机', f"{payload['message']}\n\n是否信任该主机并重试?"):
-                self._on_tune_continue(trust_new=True)
+                self._on_tune_continue(trust_new=True, frozen=frozen)
             return
         for dir_, ok, msg in payload['results']:
             self.log.write(('✅' if ok else '❌') + f' {os.path.basename(dir_)}:{msg}')

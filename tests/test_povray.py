@@ -1,5 +1,6 @@
 """POV-Ray 适配器测试:解析/成键/场景文本离线测;真机冒烟(本机有 POV-Ray 时)。"""
 import os
+import subprocess
 
 import pytest
 
@@ -48,10 +49,22 @@ def test_parse_cartesian_with_scale_and_seldyn():
 def test_parse_rejects_vasp4_and_truncated():
     with pytest.raises(ValueError, match='VASP4'):
         pr.parse_poscar_atoms(_POSCAR_D.replace('Li S\n', '9 9\n', 1).replace('2 1\n', 'Direct\n', 1))
-    with pytest.raises(ValueError, match='截断'):
+    with pytest.raises(ValueError, match='截断|不足'):
         pr.parse_poscar_atoms('\n'.join(_POSCAR_D.splitlines()[:-1]))
-    with pytest.raises(ValueError, match='scale|缩放'):
-        pr.parse_poscar_atoms(_POSCAR_D.replace('1.0\n', '-1.0\n', 1))
+    with pytest.raises(ValueError, match='缩放'):
+        pr.parse_poscar_atoms(_POSCAR_D.replace('1.0\n', '0\n', 1))
+
+
+def test_parse_supports_negative_volume_and_three_scales():
+    neg = _POSCAR_CART_SD.replace('2.0\n', '-6000\n', 1)
+    _syms, coords = pr.parse_poscar_atoms(neg)
+    # 原始晶胞 5*5*6=150；目标 6000 → factor=cuberoot(40)。
+    factor = 40 ** (1 / 3)
+    assert coords[1] == pytest.approx([0.6 * factor, 0.0, 0.0])
+
+    anisotropic = _POSCAR_CART_SD.replace('2.0\n', '2 3 4\n', 1)
+    _syms, coords = pr.parse_poscar_atoms(anisotropic)
+    assert coords[1] == pytest.approx([1.2, 0.0, 0.0])
 
 
 def test_build_bonds_heuristic():
@@ -123,13 +136,31 @@ def test_render_degrades_without_povray(tmp_path, monkeypatch):
     assert not out['ok'] and 'POV-Ray 未找到' in out['error']
 
 
+def test_render_reports_external_timeout_without_raising(tmp_path):
+    poscar = tmp_path / 'POSCAR'
+    poscar.write_text(_POSCAR_D, encoding='utf-8')
+
+    def timeout_run(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs['timeout'])
+
+    out = pr.render_poscar_views(
+        str(poscar), str(tmp_path / 'figs'), exe='fake.exe', run=timeout_run,
+        views=('top',), timeout=1,
+    )
+    assert not out['ok']
+    assert out['timed_out'] is True
+    assert 'timed out' in out['error']
+
+
 @pytest.mark.skipif(pr.find_povray() is None, reason='本机无 POV-Ray')
 def test_real_povray_smoke(tmp_path):
     """真机冒烟:真调 pvengine64 渲一张小图,验证产出非空 PNG。"""
     poscar = tmp_path / 'POSCAR'
     poscar.write_text(_POSCAR_D, encoding='utf-8')
     out = pr.render_poscar_views(str(poscar), str(tmp_path / 'figs'),
-                                 views=('top',), width=240, timeout=120)
+                                 views=('top',), width=240, timeout=20)
+    if out.get('timed_out'):
+        pytest.skip('已安装的 POV-Ray GUI 在非交互启动阶段超时')
     assert out['ok'], out['error']
     png = out['images']['top']
     assert os.path.getsize(png) > 1000                  # 真渲染的 PNG 至少 KB 级

@@ -12,8 +12,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog
 
 from vcstudio.gui.widgets import FileRow, LogBox
-from vcstudio.gui import runner
-from vcstudio.project import adsorption, report_full
+from vcstudio.gui import report_bridge, runner
+from vcstudio.project import adsorption
 from vcstudio.shared.config import load_config
 
 
@@ -206,10 +206,10 @@ class ProjectTab(ttk.Frame):
             self.log.write(f'❌ 导出失败:{e}')
 
     def _member_dirs(self, proj):
-        """项目全部成员作业目录(清洁表面 + 气相参考 + 构型族)。"""
-        mem = proj.get('members') or {}
-        return [d for d in ([mem.get('clean_slab'), mem.get('gas_ref')]
-                            + list(mem.get('configs') or [])) if d]
+        """项目全部成员作业目录（含导入的物种参考态）。"""
+        from vcstudio.project import report_full
+
+        return report_full._member_dirs(proj)
 
     def _on_report(self):
         proj = self._current_project()
@@ -224,24 +224,45 @@ class ProjectTab(ttk.Frame):
             filetypes=[('HTML 完整报告', '*.html')])
         if not out:
             return
-        try:
-            cfg = load_config()
-        except Exception:                               # noqa: BLE001
-            cfg = {}
-        self.log.write('⏳ 生成完整报告(Origin 图表 + 结构图 + AI 分析,可能需一两分钟)…')
-        q = runner.submit(report_full.generate_project_report, proj, out, config=cfg)
-        self.after(300, lambda: self._poll_report(q, out))
+        project_path = self.proj_var.get().strip()
+        out_dir = os.path.dirname(os.path.abspath(out))
+        stem = os.path.splitext(os.path.basename(out))[0]
+        self.log.write('⏳ 通过统一报告引擎生成 HTML；产物状态与科学状态将分别显示…')
+        q = runner.submit(
+            report_bridge.generate_project_report_bundle,
+            project_path,
+            out_dir,
+            formats=('html',),
+            final=True,
+            stem=stem,
+        )
+        self.after(300, lambda: self._poll_report(q))
 
-    def _poll_report(self, q, out):
+    def _poll_report(self, q):
         item = runner.poll(q)
         if item is None:
-            self.after(300, lambda: self._poll_report(q, out))
+            self.after(300, lambda: self._poll_report(q))
             return
         kind, payload = item
         if kind == 'error':
             self.log.write(f'❌ 生成报告失败:{payload}')
             return
-        self.log.write(f'✅ 完整报告已生成:{out}')
+        if not isinstance(payload, dict):
+            self.log.write('❌ 生成报告失败:报告桥返回了无效结果')
+            return
+        self.log.write('ℹ ' + report_bridge.status_text(payload))
+        if payload.get('gate_reason'):
+            self.log.write(f"⚠ 科学门禁:{payload['gate_reason']}")
+        if not payload.get('artifact_ok'):
+            self.log.write(f"❌ 报告产物不可用:{payload.get('error') or '生成未完成'}")
+            return
+        out = payload.get('primary_file')
+        if not out or not os.path.isfile(str(out)):
+            self.log.write('❌ 报告产物状态异常:没有可打开的实际文件')
+            return
+        science = str(payload.get('scientific_status') or 'pending').lower()
+        icon = '✅' if science == 'final' else '⚠'
+        self.log.write(f'{icon} 报告产物已生成:{out}')
         try:
             if sys.platform == 'win32':
                 os.startfile(str(out))  # noqa

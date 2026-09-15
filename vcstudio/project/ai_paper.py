@@ -14,6 +14,8 @@
 6. **contradicts-halt(科学停)**:全自动编排 `autopilot_step` 若计算值与文献锚点偏差超阈值,
    立刻 halt + 中文平铺,绝不自动判「复现成功」或掩盖;`accepted` 只能由确定性 validated +
    accept_gate 产生,**绝不由本模块直写**。
+7. **单 runner + CAS**:`autopilot_step` 在读取/claim 前获取 campaign run.lock；held 返回 busy，
+   每个 task claim/持久化再由 revision CAS 守卫，finally 只释放自己的锁。
 
 复用而不改动:ai_analysis 的 transport 注入 / 密钥 / _extract_json / 重试;campaign 的
 schema/states/gates/derive/ledger/budget/fingerprint;generate 的 molecules / reactions 库。
@@ -21,12 +23,15 @@ schema/states/gates/derive/ledger/budget/fingerprint;generate 的 molecules / re
 """
 from __future__ import annotations
 
+import copy
 import json
 import math
 import re
 import time
+import uuid
+from pathlib import Path
 
-from vcstudio.campaign import budget, derive, fingerprint, gates, ledger, schema, states
+from vcstudio.campaign import budget, derive, fingerprint, gates, ledger, lock, schema, states
 from vcstudio.project import ai_analysis
 
 # ── 常量 ─────────────────────────────────────────────────────────────────────
@@ -916,73 +921,156 @@ def autopilot_step(campaign_dir, *, runners, contradict_tol=None):
     平铺),当步立即停,不进 accept。runners['execute'](task) → {'completed','checks','energy_eV',
     'measured'{metric:val},'error'}(测试用假件)。
     """
-    camp = schema.load_campaign(campaign_dir)
-    if not camp:
+    cdir = Path(campaign_dir)
+    # 只做存在性探测，不在拿锁前解析 campaign/task 内容。不存在时也不创建孤儿 run.lock。
+    if not (cdir / schema.CAMPAIGN_YAML).is_file():
         return {'actions': [], 'halted': True,
+                'busy': False,
                 'reason': '未找到 campaign(campaign.yaml 缺失或损坏),无法推进'}
-    execute = (runners or {}).get('execute')
-    ready = derive.derive_ready(camp)['ready']
-    if ready and not callable(execute):
-        return {'actions': [], 'halted': True,
-                'reason': "runners 缺少可调用的 execute 执行器,无法推进(请注入 runners['execute'])"}
-    by_id = schema.tasks_by_id(camp)
-    meta = camp.get('meta') or {}
-    camp_fp = meta.get('fingerprint_hash')
-    expected = meta.get('expected') or {}
+
+    owner = f'autopilot:{uuid.uuid4().hex}'
+    if not lock.acquire(cdir, owner):
+        held = lock.read_lock(cdir) or {}
+        return {
+            'actions': [], 'halted': False, 'busy': True,
+            'reason': 'campaign run lock 已由另一调用持有,本次未读取/claim/执行任何任务',
+            'lock': {'owner': held.get('owner'), 'pid': held.get('pid'), 'ts': held.get('ts'),
+                     'stale_signal': lock.is_stale(held) if held else False},
+        }
+
     actions = []
+    try:
+        camp = schema.load_campaign(cdir)
+        if not camp:
+            return {'actions': [], 'halted': True, 'busy': False,
+                    'reason': '未找到 campaign(campaign.yaml 缺失或损坏),无法推进'}
+        execute = (runners or {}).get('execute')
+        ready = derive.derive_ready(camp)['ready']
+        if ready and not callable(execute):
+            return {'actions': [], 'halted': True, 'busy': False,
+                    'reason': "runners 缺少可调用的 execute 执行器,无法推进(请注入 runners['execute'])"}
+        by_id = schema.tasks_by_id(camp)
+        meta = camp.get('meta') or {}
+        campaign_id = str(meta.get('id') or '')
+        expected = meta.get('expected') or {}
 
-    for tid in ready:
-        task = by_id.get(tid)
-        if task is None:
-            continue
-        states.mark_running(task, by='autopilot', campaign_dir=campaign_dir)
-        schema.save_task(campaign_dir, task)
-        res = execute(task) or {}
+        for tid in ready:
+            snapshot = by_id.get(tid)
+            if snapshot is None:
+                continue
+            try:
+                task = schema.claim_task(
+                    cdir, tid, expected_revision=schema.task_revision(snapshot), owner=owner)
+            except (schema.RevisionConflictError, schema.TaskClaimError) as exc:
+                actions.append({'task': tid, 'action': 'busy', 'detail': str(exc)})
+                return {'actions': actions, 'halted': False, 'busy': True,
+                        'reason': f'任务 claim 发生并发冲突:{exc}'}
+            by_id[tid] = task
+            ledger.record_event(cdir, 'exec_state', tid, {
+                'rung': 'running', 'note': 'task claim',
+                'owner': owner, 'revision': task['revision']})
 
-        if not res.get('completed'):
-            reason = str(res.get('error') or 'execute 未报告完成')
-            states.mark_failed(task, reason=reason, by='autopilot', campaign_dir=campaign_dir)
-            schema.save_task(campaign_dir, task)
-            actions.append({'task': tid, 'action': 'failed', 'detail': reason})
-            continue
+            # runner 只拿快照；它不能通过修改传入 dict 绕过 campaign 状态机。
+            try:
+                res = execute(copy.deepcopy(task)) or {}
+            except Exception as exc:  # noqa: BLE001 - 执行器边界必须结构化沉降并释放锁
+                res = {'completed': False, 'error': f'execute 抛出异常:{exc}'}
 
-        states.mark_completed(task, by='autopilot', campaign_dir=campaign_dir)
-        schema.save_task(campaign_dir, task)
+            if not res.get('completed'):
+                reason = str(res.get('error') or 'execute 未报告完成')
+                failed = copy.deepcopy(task)
+                states.mark_failed(failed, reason=reason, by='autopilot')
+                failed.pop('claim', None)
+                try:
+                    schema.persist_task(cdir, failed, expected_revision=task['revision'])
+                except (schema.RevisionConflictError, schema.TaskClaimError) as exc:
+                    actions.append({'task': tid, 'action': 'revision-conflict',
+                                    'detail': str(exc)})
+                    return {'actions': actions, 'halted': True, 'busy': False,
+                            'reason': f'执行结果持久化冲突，已 fail-closed:{exc}'}
+                task = failed
+                by_id[tid] = task
+                ledger.record_event(cdir, 'exec_state', tid, {
+                    'rung': 'failed', 'note': reason, 'revision': task['revision']})
+                actions.append({'task': tid, 'action': 'failed', 'detail': reason})
+                continue
 
-        checks = res.get('checks') or []
-        try:
-            states.promote_validated(task, checks, by='autopilot', campaign_dir=campaign_dir)
-        except ValueError as e:
-            schema.save_task(campaign_dir, task)
-            actions.append({'task': tid, 'action': 'validate-blocked', 'detail': str(e)})
-            continue
-        schema.save_task(campaign_dir, task)
+            completed = copy.deepcopy(task)
+            states.mark_completed(completed, by='autopilot')
+            completed.pop('claim', None)
+            try:
+                schema.persist_task(cdir, completed, expected_revision=task['revision'])
+            except (schema.RevisionConflictError, schema.TaskClaimError) as exc:
+                actions.append({'task': tid, 'action': 'revision-conflict', 'detail': str(exc)})
+                return {'actions': actions, 'halted': True, 'busy': False,
+                        'reason': f'completed 持久化冲突，已 fail-closed:{exc}'}
+            task = completed
+            by_id[tid] = task
+            ledger.record_event(cdir, 'completed', tid, {'revision': task['revision']})
 
-        # contradicts-halt(科学停):测量值 vs 文献锚点,超差立即停,绝不 spin
-        halt = _contradiction(task, res.get('measured') or {}, expected, contradict_tol)
-        if halt:
-            ledger.record_event(campaign_dir, 'contradicts_halt', tid, halt)
-            ledger.record_decision(campaign_dir, 'contradicts-halt', halt['detail'], 'auto',
-                                   context={'origin': 'ai_paper', 'task': tid})
-            actions.append({'task': tid, 'action': 'halt', 'detail': halt['detail']})
-            return {'actions': actions, 'halted': True, 'reason': halt['detail']}
+            checks = res.get('checks') or []
+            validated = copy.deepcopy(task)
+            try:
+                states.promote_validated(validated, checks, by='autopilot')
+            except ValueError as exc:
+                actions.append({'task': tid, 'action': 'validate-blocked', 'detail': str(exc)})
+                continue
+            try:
+                schema.persist_task(cdir, validated, expected_revision=task['revision'])
+            except (schema.RevisionConflictError, schema.TaskClaimError) as exc:
+                actions.append({'task': tid, 'action': 'revision-conflict', 'detail': str(exc)})
+                return {'actions': actions, 'halted': True, 'busy': False,
+                        'reason': f'validated 持久化冲突，已 fail-closed:{exc}'}
+            task = validated
+            by_id[tid] = task
+            ledger.record_event(cdir, 'validated', tid, {
+                'checks': [str(c.get('name', '?')) for c in checks if isinstance(c, dict)],
+                'revision': task['revision']})
 
-        # accept_gate(确定性)→ promote_accepted(须出示门裁决,绝不直写 accepted)
-        verdict = gates.accept_gate({
-            'task_fingerprint_hash': task.get('fingerprint_hash'),
-            'campaign_fingerprint_hash': camp_fp,
-            'required_checks': checks,
-            'energy_eV': res.get('energy_eV'),
-        })
-        if verdict['status'] in ('pass', 'waived'):
-            states.promote_accepted(task, verdict, signed_by=None, campaign_dir=campaign_dir)
-            schema.save_task(campaign_dir, task)
-            actions.append({'task': tid, 'action': 'accepted'})
-        else:
-            actions.append({'task': tid, 'action': 'accept-blocked',
-                            'detail': verdict['blocking_issues']})
+            # contradicts-halt(科学停):测量值 vs 文献锚点,超差立即停,绝不 spin
+            halt = _contradiction(task, res.get('measured') or {}, expected, contradict_tol)
+            if halt:
+                ledger.record_event(cdir, 'contradicts_halt', tid, halt)
+                ledger.record_decision(cdir, 'contradicts-halt', halt['detail'], 'auto',
+                                       context={'origin': 'ai_paper', 'task': tid,
+                                                'task_revision': task['revision']})
+                actions.append({'task': tid, 'action': 'halt', 'detail': halt['detail']})
+                return {'actions': actions, 'halted': True, 'busy': False,
+                        'reason': halt['detail']}
 
-    return {'actions': actions, 'halted': False, 'reason': None}
+            # accept_gate 产出 task-bound/ledger-backed GateDecision；accepted 自己再重读账本
+            # 并以 GateDecision.task_revision 做最终 CAS，绝不信任自由字典。
+            verdict = gates.accept_gate({
+                'campaign_dir': str(cdir),
+                'campaign_id': campaign_id,
+                'task_id': tid,
+                'task_revision': task['revision'],
+                'input_fingerprints': gates.task_input_fingerprints(task, meta),
+                'task_fingerprint_hash': task.get('fingerprint_hash'),
+                'campaign_fingerprint_hash': meta.get('fingerprint_hash'),
+                'required_checks': checks,
+                'energy_eV': res.get('energy_eV'),
+                'actor': 'autopilot',
+            })
+            if verdict['status'] in ('pass', 'waived'):
+                try:
+                    states.promote_accepted(
+                        task, verdict, signed_by=None, campaign_dir=str(cdir))
+                except (ValueError, schema.RevisionConflictError,
+                        schema.TaskClaimError) as exc:
+                    actions.append({'task': tid, 'action': 'accept-conflict',
+                                    'detail': str(exc)})
+                    return {'actions': actions, 'halted': True, 'busy': False,
+                            'reason': f'accepted 权威提交冲突，已 fail-closed:{exc}'}
+                by_id[tid] = task
+                actions.append({'task': tid, 'action': 'accepted'})
+            else:
+                actions.append({'task': tid, 'action': 'accept-blocked',
+                                'detail': verdict['blocking_issues']})
+
+        return {'actions': actions, 'halted': False, 'busy': False, 'reason': None}
+    finally:
+        lock.release(cdir, owner=owner)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -9,6 +9,7 @@ Gaussian 软件本体用户自备,本适配只出输入(.gjf)、解析输出(.lo
 from __future__ import annotations
 
 import glob
+import math
 import os
 import re
 
@@ -24,6 +25,13 @@ _FUNC_MAP = {
 }
 _JOB_KW = {'relax': 'opt', 'static': 'sp', 'freq': 'freq'}
 _DEF_BASIS = 'def2-SVP'
+_DISPERSION_KW = {
+    'D3': 'EmpiricalDispersion=GD3',
+    'GD3': 'EmpiricalDispersion=GD3',
+    'D3(BJ)': 'EmpiricalDispersion=GD3BJ',
+    'D3BJ': 'EmpiricalDispersion=GD3BJ',
+    'GD3BJ': 'EmpiricalDispersion=GD3BJ',
+}
 
 # 已知 SCRF 溶剂模型(仅作拼写校验;非此集不拒绝,仅 warning 提示核对)。
 _SCRF_MODELS = ('SMD', 'PCM', 'CPCM', 'IEFPCM')
@@ -99,8 +107,18 @@ def suggest_basis(element: str) -> list:
     return []
 
 # 'SCF Done:  E(RPBE) =  -76.1234  A.U. ...' → 末次电子能(Hartree)。
-_SCF_DONE_RE = re.compile(r'SCF Done:\s*E\([^)]*\)\s*=\s*([-+]?\d+\.\d+(?:[Ee][-+]?\d+)?)')
+_NUMBER = r'[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][-+]?\d+)?'
+_SCF_DONE_RE = re.compile(rf'SCF Done:\s*E\([^)]*\)\s*=\s*({_NUMBER})')
 _FREQ_RE = re.compile(r'Frequencies\s*--\s*(.+)')
+_CORRELATED_ENERGY_PATTERNS = (
+    ('CCSD(T)', re.compile(rf'CCSD\(T\)\s*=\s*({_NUMBER})', re.I)),
+    ('CCSD', re.compile(rf'E\(CORR\)\s*=\s*({_NUMBER})', re.I)),
+    ('MP2', re.compile(rf'EUMP2\s*=\s*({_NUMBER})', re.I)),
+)
+_GAUSSIAN_FAILURE_MARKERS = (
+    'Error termination', 'Convergence failure', 'Optimization stopped',
+    'Number of steps exceeded', 'Erroneous write', 'galloc: could not allocate memory',
+)
 
 
 def _resource_lines(extras: dict, seed: str) -> list:
@@ -314,14 +332,20 @@ def _render(spec: CalcSpec) -> tuple[str, list]:
     else:
         job, modredundant_lines = _gaussian_task_route(gtask, spec.extras)
 
-    # 色散:按裁决口径写作功能后缀 '-D3'(路线行)。不同 Gaussian 版本可能需
-    # EmpiricalDispersion=GD3/GD3BJ 关键字,提示用户据版本调整。
-    disp = ''
+    # Gaussian D3 is a route keyword, not a functional-name suffix.  Writing
+    # ``PBEPBE-D3`` is accepted by neither many Gaussian releases nor all
+    # functionals and can turn a scientifically intended D3 run into a parse
+    # error.  Keep the mapping explicit and fail on unknown spellings.
+    disp_kw = ''
     if spec.dispersion:
-        disp = f'-{spec.dispersion}'
+        dkey = str(spec.dispersion).upper().replace(' ', '')
+        disp_kw = _DISPERSION_KW.get(dkey, '')
+        if not disp_kw:
+            raise ValueError(
+                f'Gaussian 色散 {spec.dispersion!r} 未登记；可选 D3/GD3 或 D3(BJ)/GD3BJ，'
+                '拒绝猜测路线关键字。')
         warnings.append(
-            f'色散以路线行后缀 {disp} 表达;若您的 Gaussian 版本需 '
-            f'EmpiricalDispersion=GD3/GD3BJ 关键字,请据版本改写。')
+            f'色散已显式写为 {disp_kw}；请确认所用 Gaussian 版本与该参数化兼容。')
 
     # 唯一元素(按结构首现序;供混合基组分组稳定)
     seen, unique_elements = set(), []
@@ -342,7 +366,9 @@ def _render(spec: CalcSpec) -> tuple[str, list]:
     scrf_kw, scrf_lines = _solvent_route_and_tail(spec.extras.get('solvent'), warnings)
 
     # 路线行:泛函(+色散后缀) 基组位 任务 [SCRF] [Pseudo=Read]
-    route_parts = [f'#P {func}{disp}', str(basis_token), job]
+    route_parts = [f'#P {func}', str(basis_token), job]
+    if disp_kw:
+        route_parts.append(disp_kw)
     if scrf_kw:
         route_parts.append(scrf_kw)
     if has_ecp:
@@ -383,13 +409,26 @@ def _seedname(title: str) -> str:
     return re.sub(r'[^A-Za-z0-9_.-]', '_', tok) or 'mol'
 
 
-def _log_path(out_dir: str) -> str | None:
-    """定位 Gaussian 输出:优先 *.log,否则 *.out。"""
+def _log_path(out_dir: str) -> tuple[str | None, str | None]:
+    """定位 Gaussian 输出；多个看似有效的日志时拒绝按字母序猜旧结果。"""
     for pat in ('*.log', '*.out'):
-        cands = sorted(glob.glob(os.path.join(out_dir, pat)))
-        if cands:
-            return cands[0]
-    return None
+        matching = []
+        for path in sorted(glob.glob(os.path.join(out_dir, pat))):
+            try:
+                with open(path, 'r', encoding='utf-8', errors='replace') as handle:
+                    probe = handle.read(256000)
+            except OSError:
+                continue
+            if any(mark in probe for mark in (
+                    'Entering Gaussian System', 'Gaussian, Inc.', 'SCF Done:',
+                    'Normal termination of Gaussian', 'Error termination')):
+                matching.append(path)
+        if len(matching) == 1:
+            return matching[0], None
+        if len(matching) > 1:
+            return None, ('发现多个 Gaussian 主输出，无法确定本轮日志：'
+                          + '、'.join(os.path.basename(path) for path in matching))
+    return None, None
 
 
 def _count_imaginary(text: str):
@@ -407,6 +446,179 @@ def _count_imaginary(text: str):
     return n_imag if seen else None
 
 
+def _frequencies(text: str) -> list[float]:
+    values = []
+    for match in _FREQ_RE.finditer(text or ''):
+        for token in match.group(1).split():
+            try:
+                value = float(token.replace('D', 'E').replace('d', 'e'))
+            except ValueError:
+                continue
+            if math.isfinite(value):
+                values.append(value)
+    return values
+
+
+def _last_electronic_energy(text: str) -> tuple[float | None, str | None]:
+    """Return the last SCF/MP2/CC electronic-energy record in file order."""
+    records = []
+    for match in _SCF_DONE_RE.finditer(text or ''):
+        records.append((match.start(), match.group(1), 'SCF Done'))
+    for source, pattern in _CORRELATED_ENERGY_PATTERNS:
+        for match in pattern.finditer(text or ''):
+            records.append((match.start(), match.group(1), source))
+    if not records:
+        return None, None
+    _position, token, source = max(records, key=lambda item: item[0])
+    try:
+        value = float(token.replace('D', 'E').replace('d', 'e'))
+    except ValueError:
+        return None, None
+    return (value * HARTREE_TO_EV, source) if math.isfinite(value) else (None, None)
+
+
+def _task_from_route(text: str) -> str | None:
+    route_lines = []
+    active = False
+    for line in (text or '').splitlines():
+        stripped = line.strip()
+        if stripped.startswith('#'):
+            active = True
+            route_lines.append(stripped)
+        elif active and stripped:
+            route_lines.append(stripped)
+        elif active:
+            break
+    route = ' '.join(route_lines).lower()
+    if not route:
+        return None
+    if 'opt=(' in route and 'ts' in route and 'freq' in route:
+        return 'opt_ts'
+    if 'opt' in route and 'freq' in route:
+        return 'opt_freq'
+    if 'opt=modredundant' in route:
+        return 'scan'
+    if 'irc' in route:
+        return 'irc'
+    if re.search(r'\bfreq\b', route):
+        return 'freq'
+    if re.search(r'\bopt\b', route):
+        return 'opt'
+    return 'static'
+
+
+def _last_orientation(text: str) -> dict | None:
+    """Extract the last complete Gaussian orientation table (Å)."""
+    lines = (text or '').splitlines()
+    last = None
+    row_re = re.compile(
+        rf'^\s*\d+\s+(\d+)\s+\d+\s+({_NUMBER})\s+({_NUMBER})\s+({_NUMBER})\s*$')
+    for start, line in enumerate(lines):
+        if 'Standard orientation:' not in line and 'Input orientation:' not in line:
+            continue
+        separators = []
+        for index in range(start + 1, min(len(lines), start + 12)):
+            if re.match(r'^\s*-{10,}\s*$', lines[index]):
+                separators.append(index)
+                if len(separators) == 2:
+                    break
+        if len(separators) < 2:
+            continue
+        atoms = []
+        for row in lines[separators[1] + 1:]:
+            if re.match(r'^\s*-{10,}\s*$', row):
+                break
+            match = row_re.match(row)
+            if not match:
+                atoms = []
+                break
+            atomic_number = int(match.group(1))
+            element = (_PT_SYMBOLS[atomic_number - 1]
+                       if 1 <= atomic_number <= len(_PT_SYMBOLS) else f'Z{atomic_number}')
+            xyz = [float(match.group(i).replace('D', 'E').replace('d', 'e'))
+                   for i in (2, 3, 4)]
+            atoms.append({'element': element, 'atomic_number': atomic_number,
+                          'xyz_angstrom': xyz})
+        if atoms:
+            last = {'atoms': atoms, 'coordinate_system': 'cartesian_angstrom'}
+    return last
+
+
+def _thermochemistry(text: str) -> dict:
+    result = {}
+    patterns = {
+        'zero_point_correction_ev': r'Zero-point correction=\s*(' + _NUMBER + r')',
+        'thermal_energy_correction_ev': r'Thermal correction to Energy=\s*(' + _NUMBER + r')',
+        'thermal_free_energy_correction_ev':
+            r'Thermal correction to Gibbs Free Energy=\s*(' + _NUMBER + r')',
+        'sum_electronic_thermal_free_energy_ev':
+            r'Sum of electronic and thermal Free Energies=\s*(' + _NUMBER + r')',
+    }
+    for key, pattern in patterns.items():
+        hits = re.findall(pattern, text or '', flags=re.I)
+        if hits:
+            result[key] = float(hits[-1].replace('D', 'E').replace('d', 'e')) * HARTREE_TO_EV
+    return result
+
+
+def parse_output_text(text: str, *, task: str | None = None) -> dict:
+    """Parse Gaussian output and require task-level evidence, not just a footer."""
+    task_key = str(task or '').strip().lower()
+    task_key = {'relax': 'opt', 'static': 'static'}.get(task_key, task_key)
+    if task_key not in set(GAUSSIAN_TASKS) | {'static'}:
+        task_key = 'static'
+    energy, source = _last_electronic_energy(text)
+    frequencies = _frequencies(text)
+    n_imag = sum(value < 0 for value in frequencies) if frequencies else None
+    normal_at = text.rfind('Normal termination of Gaussian')
+    error_at = max((text.rfind(marker) for marker in _GAUSSIAN_FAILURE_MARKERS), default=-1)
+    normal = normal_at >= 0 and normal_at > error_at
+    failures = [marker for marker in _GAUSSIAN_FAILURE_MARKERS
+                if marker.lower() in text.lower()]
+    # Failure text from an earlier Link is still relevant unless a later normal
+    # termination belongs to a fully completed multi-Link job.  Error
+    # termination is never recoverable inside the same output.
+    failed = 'Error termination' in text or (bool(failures) and not normal)
+    opt_done = ('Stationary point found.' in text
+                or 'Optimization completed.' in text)
+    if task_key in ('opt',):
+        task_done = opt_done
+    elif task_key == 'opt_freq':
+        task_done = opt_done and bool(frequencies)
+    elif task_key == 'opt_ts':
+        task_done = opt_done and bool(frequencies) and n_imag == 1
+    elif task_key == 'freq':
+        task_done = bool(frequencies)
+    elif task_key in ('scan', 'irc'):
+        task_done = energy is not None
+    else:
+        task_done = energy is not None
+    converged = bool(normal and task_done and energy is not None and not failed)
+    error = None
+    if failed:
+        error = 'Gaussian 输出含失败标志：' + '、'.join(failures or ['Error termination'])
+    elif energy is None:
+        error = 'Gaussian 输出未见可用电子能（SCF Done/EUMP2/CCSD）'
+    elif not normal:
+        error = 'Gaussian 输出缺最终 Normal termination 页脚，拒绝把截断日志判为完成'
+    elif not task_done:
+        error = f'Gaussian {task_key} 正常退出但缺任务级完成证据（优化/频率/TS 虚频门）'
+    result = {
+        'energy_ev': energy, 'energy_source': source,
+        'converged': converged, 'normal_termination': normal,
+        'task_converged': bool(task_done), 'failed': failed,
+        'failure_markers': failures, 'task': task_key,
+        'frequencies_cm1': frequencies, 'n_imaginary': n_imag,
+        'error': error,
+    }
+    structure = _last_orientation(text)
+    if structure:
+        result['final_structure'] = structure
+        result['structure_source'] = 'last Standard/Input orientation'
+    result.update(_thermochemistry(text))
+    return result
+
+
 class GaussianBackend(EngineBackend):
     """Gaussian 文件级适配(仅分子)。"""
 
@@ -422,38 +634,55 @@ class GaussianBackend(EngineBackend):
         with open(path, 'w', encoding='utf-8') as f:
             f.write(text)
         warnings.append('Gaussian 软件本体用户自备;本适配仅出 .gjf。')
-        return {'files': [path], 'warnings': warnings}
+        output_files = list(self.run_contract.result_files(
+            [os.path.basename(path)], task=spec.extras.get('gaussian_task') or spec.task))
+        chk_match = re.search(r'^%chk=(.+)$', text, flags=re.MULTILINE | re.IGNORECASE)
+        if chk_match:
+            chk_name = os.path.basename(chk_match.group(1).strip())
+            output_files = [name for name in output_files if not name.lower().endswith('.chk')]
+            output_files.append(chk_name)
+        return {
+            'files': [path], 'warnings': warnings, 'output_files': output_files,
+            'restart': {'supported': self.run_contract.restart_supported,
+                        'note': self.run_contract.restart_note},
+        }
 
     def parse_energy(self, out_dir: str) -> dict:
         """log → 'SCF Done' 末次(Hartree→eV)+ Normal termination 判定 + 虚频计数。"""
-        path = _log_path(out_dir)
+        path, select_error = _log_path(out_dir)
         if path is None:
             return {'energy_ev': None, 'converged': False, 'n_imaginary': None,
-                    'error': f'缺 Gaussian 输出(目录 {out_dir} 无 *.log / *.out)'}
+                    'error': select_error or
+                             f'缺 Gaussian 输出(目录 {out_dir} 无唯一可识别 *.log / *.out)'}
         with open(path, 'r', encoding='utf-8', errors='replace') as f:
             text = f.read()
 
-        hits = _SCF_DONE_RE.findall(text)
-        energy = float(hits[-1]) * HARTREE_TO_EV if hits else None
+        parsed = parse_output_text(text, task=self.infer_task(out_dir))
+        parsed['output_file'] = os.path.basename(path)
+        return parsed
 
-        normal = 'Normal termination of Gaussian' in text
-        error_term = 'Error termination' in text
-        converged = bool(normal and not error_term)
-        n_imag = _count_imaginary(text)
+    def parse_output_text(self, text: str, *, task: str | None = None) -> dict:
+        return parse_output_text(text, task=task)
 
-        error = None
-        if energy is None:
-            error = 'Gaussian 输出未见 "SCF Done"(计算可能未完成/发散)'
-        elif error_term:
-            error = 'Gaussian 出现 Error termination(计算异常终止)'
-        return {'energy_ev': energy, 'converged': converged,
-                'n_imaginary': n_imag, 'error': error}
+    def infer_task(self, out_dir: str) -> str | None:
+        cands = sorted(glob.glob(os.path.join(out_dir, '*.gjf'))
+                       + glob.glob(os.path.join(out_dir, '*.com')))
+        if len(cands) != 1:
+            return None
+        try:
+            with open(cands[0], 'r', encoding='utf-8', errors='replace') as handle:
+                return _task_from_route(handle.read())
+        except OSError:
+            return None
 
     def check_inputs(self, out_dir: str) -> list:
         """.gjf 存在性 + 路线行 / 电荷多重度行 / 坐标行齐全检查。"""
-        cands = sorted(glob.glob(os.path.join(out_dir, '*.gjf')))
+        cands = sorted(glob.glob(os.path.join(out_dir, '*.gjf'))
+                       + glob.glob(os.path.join(out_dir, '*.com')))
         if not cands:
-            return ['缺 .gjf(Gaussian 输入不存在)。']
+            return ['缺 .gjf/.com(Gaussian 输入不存在)。']
+        if len(cands) > 1:
+            return ['存在多个 Gaussian .gjf/.com，无法确定 {input}/{stem} 对应的主输入。']
         with open(cands[0], 'r', encoding='utf-8', errors='replace') as f:
             lines = [ln.rstrip('\n') for ln in f]
         issues: list = []
@@ -464,4 +693,11 @@ class GaussianBackend(EngineBackend):
             issues.append('.gjf 缺电荷/多重度行(如 "0 1")。')
         if not any(re.match(r'^[A-Za-z]{1,2}(\s+[-+]?\d)', ln.strip()) for ln in lines):
             issues.append('.gjf 缺笛卡尔坐标行(元素 + xyz)。')
+        for line in lines:
+            match = re.match(r'^\s*%chk\s*=\s*(\S+)\s*$', line, re.I)
+            if match:
+                name = match.group(1)
+                if os.path.basename(name) != name or '/' in name or '\\' in name:
+                    issues.append(
+                        '.gjf 的 %chk 必须是作业目录内单文件名；绝对/子目录路径无法由结果回收契约安全下载。')
         return issues

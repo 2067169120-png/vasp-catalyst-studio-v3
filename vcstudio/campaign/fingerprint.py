@@ -16,6 +16,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+
+from vcstudio.shared.vasp_identity import (
+    canonical_kpoints_effective_text, canonical_vasp_token,
+)
 
 FINGERPRINT_FIELDS = (
     'functional', 'dispersion', 'encut', 'kpoints_scheme', 'potcar_ids',
@@ -61,6 +66,19 @@ def _incar_bool(v) -> bool:
     return str(v).strip().strip('.').upper().startswith('T')
 
 
+def _incar_logical(v):
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return None
+    token = str(v).strip().strip('.').upper()
+    if token in {'T', 'TRUE', '1'}:
+        return True
+    if token in {'F', 'FALSE', '0'}:
+        return False
+    return None
+
+
 def _to_float(v):
     if v is None:
         return None
@@ -72,20 +90,87 @@ def _to_float(v):
 
 def _to_int(v, default=None):
     f = _to_float(v)
-    return int(f) if f is not None else default
+    return int(f) if f is not None and f == int(f) else default
+
+
+def canonical_functional(*, base=None, metagga=None, lhfcalc=None,
+                         aexx=None, hfscreen=None):
+    """Return one effective-functional identity shared by all method gates."""
+    raw_base = str(base or '').strip().strip('"').strip("'")
+    base_token = raw_base.upper()
+    legacy_hybrids = {
+        'HSE03': (0.25, 0.3),
+        'HSE06': (0.25, 0.2),
+        'PBE0': (0.25, 0.0),
+    }
+    canonical_bases = {
+        'PBE': 'PBE', 'RPBE': 'RPBE', 'PBESOL': 'PBEsol', 'PW91': 'PW91',
+        'REVPBE': 'revPBE', 'BEEF-VDW': 'BEEF-vdW', 'AM05': 'AM05',
+        'LDA': 'LDA',
+    }
+    if base_token in _GGA_MAP:
+        base_name = _GGA_MAP[base_token]
+    elif base_token in legacy_hybrids:
+        base_name = 'PBE'
+    else:
+        # Ordinary functional names are case-insensitive.  Unknown labels stay
+        # distinguishable but are normalized so pbe/PBE-style case changes do
+        # not invent a mismatch.
+        base_name = canonical_bases.get(base_token, base_token or None)
+    raw_meta = str(metagga or '').strip().strip('"').strip("'").strip('.').upper()
+    meta = None if raw_meta in {'', 'F', 'FALSE', 'NONE', '--', '0'} else raw_meta
+    hybrid_state = _incar_logical(lhfcalc)
+    if lhfcalc is not None and hybrid_state is None:
+        return None
+    if base_token in legacy_hybrids and hybrid_state is False:
+        # A legacy effective label and an explicit disabled hybrid switch are
+        # contradictory evidence; do not silently choose either interpretation.
+        return None
+    hybrid = hybrid_state is True or (
+        base_token in legacy_hybrids and hybrid_state is None)
+    if hybrid:
+        legacy_aexx, legacy_hfscreen = legacy_hybrids.get(
+            base_token, (0.25, 0.0))
+        try:
+            exact_exchange = legacy_aexx if aexx is None else float(aexx)
+            screening = legacy_hfscreen if hfscreen is None else float(hfscreen)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(exact_exchange) or not math.isfinite(screening):
+            return None
+        if exact_exchange == 0:
+            exact_exchange = 0.0
+        if screening == 0:
+            screening = 0.0
+        return (
+            f'hybrid:base={base_name or "unknown"};metagga={meta or "F"};'
+            f'AEXX={exact_exchange:g};HFSCREEN={screening:g}')
+    if meta:
+        return f'metagga:{meta}'
+    return base_name
 
 
 def _functional(incar: dict):
-    mgga = incar.get('METAGGA')
-    if mgga:
-        return 'metagga:' + str(mgga).strip().strip('"').strip("'").upper()
-    if _incar_bool(incar.get('LHFCALC')):
-        return 'hybrid:HSE' if incar.get('HFSCREEN') else 'hybrid:PBE0'
     gga = incar.get('GGA')
+    base = None
     if gga:
-        tok = str(gga).strip().strip('"').strip("'").upper()[:2]
-        return _GGA_MAP.get(tok, f'GGA:{str(gga).strip()}')
-    return None
+        token = str(gga).strip().strip('"').strip("'").upper()[:2]
+        base = _GGA_MAP.get(token, f'GGA:{str(gga).strip()}')
+    raw_hybrid = incar.get('LHFCALC')
+    hybrid_state = _incar_logical(raw_hybrid)
+    if 'LHFCALC' in incar and hybrid_state is None:
+        return None
+    hybrid = hybrid_state is True
+    aexx = _to_float(incar.get('AEXX'))
+    hfscreen = _to_float(incar.get('HFSCREEN'))
+    if hybrid and (('AEXX' in incar and aexx is None)
+                   or ('HFSCREEN' in incar and hfscreen is None)):
+        return None
+    if not hybrid and any(key in incar for key in ('AEXX', 'HFSCREEN')):
+        return None
+    return canonical_functional(
+        base=base, metagga=incar.get('METAGGA'), lhfcalc=hybrid,
+        aexx=aexx, hfscreen=hfscreen)
 
 
 def _dispersion(incar: dict):
@@ -120,14 +205,36 @@ def _kpoints_scheme(kpoints_text: str, incar: dict | None = None):
         nk = int(lines[1].split()[0])
     except (ValueError, IndexError):
         return None
+    effective = canonical_kpoints_effective_text(kpoints_text)
+    explicit_hash = hashlib.sha256(effective.encode('utf-8')).hexdigest()
     if nk > 0:
-        return f'explicit:{nk}'
+        return f'explicit:{nk}:sha256={explicit_hash}'
     char = (lines[2][:1] or '').upper()
     name = {'G': 'Gamma', 'M': 'Monkhorst', 'A': 'Auto'}.get(char, char or '?')
     if name == 'Auto':
-        return f'Auto({lines[3].strip()})' if len(lines) > 3 else 'Auto'
+        if len(lines) <= 3:
+            return 'Auto'
+        value = lines[3].split('!', 1)[0].split('#', 1)[0].split()
+        return f'Auto({canonical_vasp_token(value[0])})' if value else 'Auto'
+    if char not in {'G', 'M'}:
+        return f'explicit:{nk}:sha256={explicit_hash}'
     grid = lines[3].split()[:3] if len(lines) > 3 else []
-    return f'{name} {"x".join(grid)}' if grid else name
+    if len(grid) == 3:
+        try:
+            grid = [str(int(value)) for value in grid]
+        except ValueError:
+            return f'explicit:{nk}:sha256={explicit_hash}'
+    base = f'{name} {"x".join(grid)}' if grid else name
+    shift = lines[4].split()[:3] if len(lines) > 4 else []
+    if len(shift) == 3:
+        try:
+            numbers = tuple(float(value) for value in shift)
+        except ValueError:
+            return f'explicit:{nk}:sha256={explicit_hash}'
+        if any(abs(value) > 1e-14 for value in numbers):
+            rendered = ','.join(f'{value:g}' for value in numbers)
+            return f'{base} shift={rendered}'
+    return base
 
 
 def _potcar_ids(potcar_spec) -> dict:
@@ -150,6 +257,29 @@ def _potcar_ids(potcar_spec) -> dict:
     return out
 
 
+def _potcar_base_functional(potcar_spec):
+    titles = []
+    if isinstance(potcar_spec, dict):
+        titles = list(potcar_spec.values())
+    else:
+        for item in (potcar_spec or []):
+            if isinstance(item, dict):
+                titles.append(item.get('titel'))
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                titles.append(item[1])
+    flavors = {
+        str(title or '').split()[0].upper()
+        for title in titles if str(title or '').split()
+    }
+    if flavors == {'PAW_PBE'}:
+        return 'PBE'
+    if flavors == {'PAW_GGA'}:
+        return 'PW91'
+    if flavors in ({'PAW_LDA'}, {'PAW'}):
+        return 'LDA'
+    return None
+
+
 # ── 构造 / 抽取 ───────────────────────────────────────────────────────────────
 def new_fingerprint(**fields) -> dict:
     """全字段指纹 dict(未给的字段填 None)。"""
@@ -162,13 +292,35 @@ def extract_from_inputs(incar_text: str, kpoints_text: str, potcar_spec,
                         *, reference_convention: str | None = None) -> dict:
     """从 INCAR/KPOINTS 文本 + POTCAR 规格抽取方法指纹。参考态约定须由调用方给出。"""
     incar = _parse_incar(incar_text)
+    functional = _functional(incar)
+    if not incar.get('GGA'):
+        potcar_base = _potcar_base_functional(potcar_spec)
+        if potcar_base:
+            hybrid_state = _incar_logical(incar.get('LHFCALC'))
+            hybrid = hybrid_state is True
+            aexx = _to_float(incar.get('AEXX'))
+            hfscreen = _to_float(incar.get('HFSCREEN'))
+            invalid_hybrid = (
+                ('LHFCALC' in incar and hybrid_state is None)
+                or (hybrid and (
+                    ('AEXX' in incar and aexx is None)
+                    or ('HFSCREEN' in incar and hfscreen is None)))
+                or (not hybrid and any(
+                    key in incar for key in ('AEXX', 'HFSCREEN')))
+            )
+            if not invalid_hybrid:
+                functional = canonical_functional(
+                    base=potcar_base, metagga=incar.get('METAGGA'),
+                    lhfcalc=hybrid, aexx=aexx, hfscreen=hfscreen)
     return {
-        'functional': _functional(incar),
+        'functional': functional,
         'dispersion': _dispersion(incar),
         'encut': _to_float(incar.get('ENCUT')),
         'kpoints_scheme': _kpoints_scheme(kpoints_text, incar),
         'potcar_ids': _potcar_ids(potcar_spec),
-        'spin': _to_int(incar.get('ISPIN'), 1),
+        # Omission has VASP's default ISPIN=1; an explicitly non-integral value
+        # must remain invalid instead of being silently converted to that default.
+        'spin': (1 if 'ISPIN' not in incar else _to_int(incar.get('ISPIN'))),
         'u_values': _u_values(incar),
         'reference_convention': reference_convention,
         'ediff': _to_float(incar.get('EDIFF')),

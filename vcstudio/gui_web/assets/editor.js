@@ -7,6 +7,8 @@
 'use strict';
 (function () {
   const $ = id => document.getElementById(id);
+  const i18n = (key, fallback, params) => typeof VCS.t === 'function'
+    ? VCS.t(key, params || {}, fallback) : fallback;
   const COMMON_ELEMENTS = ['H', 'B', 'C', 'N', 'O', 'F', 'Na', 'Mg', 'Al', 'Si', 'P', 'S',
     'Cl', 'K', 'Ca', 'Ti', 'V', 'Cr', 'Mn', 'Fe', 'Co', 'Ni', 'Cu', 'Zn', 'Mo', 'Ru',
     'Rh', 'Pd', 'Ag', 'W', 'Ir', 'Pt', 'Au', 'Li'];
@@ -142,7 +144,8 @@
     const info = $('ed-selinfo');
     if (st && i != null && i < st.elements.length) {
       const c = st.coords[i];
-      const fx = (st.fixed || [])[i] ? ' · 已冻结' : '';
+      const fx = (st.fixed || [])[i]
+        ? i18n('editor.atom.frozen_suffix', ' · 已冻结') : '';
       if (info) info.textContent = `#${i} ${st.elements[i]}  (${(+c[0]).toFixed(3)}, ` +
         `${(+c[1]).toFixed(3)}, ${(+c[2]).toFixed(3)}) Å${fx}`;
       if ($('ed-edit')) $('ed-edit').hidden = false;
@@ -151,7 +154,9 @@
     } else {
       if (info) {
         info.textContent = State.selected.size > 1
-          ? `已选 ${State.selected.size} 个原子` : '未选中原子';
+          ? i18n('editor.selection.count', '已选 {count} 个原子', {
+            count: State.selected.size,
+          }) : '未选中原子';
       }
       if ($('ed-edit')) $('ed-edit').hidden = true;
     }
@@ -180,13 +185,17 @@
 
   function updateVacuum(v) {
     const el = $('ed-vacuum');
-    if (el) el.textContent = '真空:' + (v == null ? '—' : v + ' Å');
+    if (el) el.textContent = i18n('editor.vacuum.value', '真空：{value}', {
+      value: v == null ? '—' : v + ' Å',
+    });
   }
   function updateFixState() {
     const el = $('ed-fixstate');
     if (!el) return;
     const n = (State.struct && State.struct.fixed || []).filter(Boolean).length;
-    el.textContent = n ? '已冻结 ' + n + ' 个原子' : '';
+    el.textContent = n ? i18n('editor.frozen.count', '已冻结 {count} 个原子', {
+      count: n,
+    }) : '';
   }
 
   // ── 原子列表表格(右侧折叠面板;点行 = 选中联动) ──
@@ -209,15 +218,24 @@
   // ── 加载:pick_file → struct_load → 状态 ──
   async function load() {
     const r = await VCS.call('pick_file', 'poscar');
-    if (r && r.error) { VCS.log('选择结构失败:' + r.error, 'failc'); return; }
+    if (r && r.error) {
+      VCS.log(i18n('editor.structure.pick_failed', '选择结构失败：{error}', {
+        error: r.error,
+      }), 'failc'); return;
+    }
     if (!r || !r.path) return;
     const out = await VCS.call('struct_load', r.path);
     if (!out || out.ok === false || out.error) {
-      VCS.log('加载结构失败:' + ((out && out.error) || '未知错误'), 'failc'); return;
+      VCS.log(i18n('editor.structure.load_failed', '加载结构失败：{error}', {
+        error: (out && out.error) || i18n('common.unknown_error', '未知错误'),
+      }), 'failc'); return;
     }
     setStruct(out.struct, out.vacuum, r.path);
-    VCS.log('已加载结构:' + r.path + '(' + out.struct.formula + ',真空 ' +
-      (out.vacuum == null ? '—' : out.vacuum + ' Å') + ')', 'okc');
+    VCS.log(i18n('editor.structure.loaded',
+      '已加载结构：{path}（{formula}，真空 {vacuum}）', {
+        path: r.path, formula: out.struct.formula,
+        vacuum: out.vacuum == null ? '—' : out.vacuum + ' Å',
+      }), 'okc');
   }
 
   // ── 编辑:移动 / 删除 / 改元素(纯状态操作 + undo) ──
@@ -233,7 +251,7 @@
     if (State.struct == null || State.sel == null) return;
     const i = State.sel;
     removeAtoms([i]);
-    VCS.log('已删除原子 #' + i, 'okc');
+    VCS.log(i18n('editor.atom.deleted', '已删除原子 #{index}', { index: i }), 'okc');
   }
   function removeAtoms(indices) {
     if (!State.struct || !indices.length) return;
@@ -285,7 +303,9 @@
     if (!State.selected.size) { VCS.toast('未选中任何原子', 'fail'); return; }
     const n = State.selected.size;
     removeAtoms(Array.from(State.selected));
-    VCS.log('已删除选中的 ' + n + ' 个原子', 'okc');
+    VCS.log(i18n('editor.selection.deleted', '已删除选中的 {count} 个原子', {
+      count: n,
+    }), 'okc');
   }
 
   // ── 测量:2 原子键长 / 3 原子键角 ──
@@ -317,20 +337,30 @@
     const bar = $('ed-measbar');
     if (p.length === 2) {
       const d = norm(vec(p[0], p[1]));
-      if (bar) bar.textContent = `键长 #${p[0]}–#${p[1]} = ${d.toFixed(3)} Å(再点 1 个原子测键角)`;
+      if (bar) bar.textContent = i18n('editor.measure.distance',
+        '键长 #{first}–#{second} = {value} Å（再点 1 个原子测键角）', {
+          first: p[0], second: p[1], value: d.toFixed(3),
+        });
     } else if (p.length === 3) {
       const v1 = vec(p[1], p[0]), v2 = vec(p[1], p[2]);
       const cos = dot(v1, v2) / (norm(v1) * norm(v2) || 1);
       const ang = Math.acos(Math.max(-1, Math.min(1, cos))) * 180 / Math.PI;
-      if (bar) bar.textContent = `键角 #${p[0]}–#${p[1]}–#${p[2]} = ${ang.toFixed(2)}°(再点 1 个原子测二面角)`;
+      if (bar) bar.textContent = i18n('editor.measure.angle',
+        '键角 #{first}–#{second}–#{third} = {value}°（再点 1 个原子测二面角）', {
+          first: p[0], second: p[1], third: p[2], value: ang.toFixed(2),
+        });
     } else if (p.length === 4) {
       const b1 = vec(p[0], p[1]), b2 = vec(p[1], p[2]), b3 = vec(p[2], p[3]);
       const n1 = cross(b1, b2), n2 = cross(b2, b3);
       const m1 = cross(n1, [b2[0] / (norm(b2) || 1), b2[1] / (norm(b2) || 1), b2[2] / (norm(b2) || 1)]);
       const dih = Math.atan2(dot(m1, n2), dot(n1, n2)) * 180 / Math.PI;
-      if (bar) bar.textContent = `二面角 #${p[0]}–#${p[1]}–#${p[2]}–#${p[3]} = ${dih.toFixed(2)}°(点原子重新测量)`;
+      if (bar) bar.textContent = i18n('editor.measure.dihedral',
+        '二面角 #{first}–#{second}–#{third}–#{fourth} = {value}°（点原子重新测量）', {
+          first: p[0], second: p[1], third: p[2], fourth: p[3], value: dih.toFixed(2),
+        });
     } else if (bar) {
-      bar.textContent = `已选 #${i};再点 1 个原子测键长`;
+      bar.textContent = i18n('editor.measure.first_selected',
+        '已选 #{index}；再点 1 个原子测键长', { index: i });
     }
     render3D();
   }
@@ -365,7 +395,11 @@
       a.href = uri; a.download = 'structure.png';
       document.body.appendChild(a); a.click(); a.remove();
       VCS.toast('已保存结构图片');
-    } catch (e) { VCS.log('保存图片失败:' + e, 'failc'); }
+    } catch (e) {
+      VCS.log(i18n('editor.image.save_failed', '保存图片失败：{error}', {
+        error: e,
+      }), 'failc');
+    }
   }
   function toggleAtomList() {
     const box = $('ed-atomlist');
@@ -378,14 +412,18 @@
     const n = parseInt(($('ed-fixn') && $('ed-fixn').value) || '1', 10) || 1;
     const r = await VCS.call('struct_fix_layers', stateForApi(), n);
     if (!r || r.ok === false || r.error) {
-      VCS.log('固定底层失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+      VCS.log(i18n('editor.layers.fix_failed', '固定底层失败：{error}', {
+        error: (r && r.error) || i18n('common.unknown_error', '未知错误'),
+      }), 'failc'); return;
     }
     pushUndo();
     State.struct.fixed = r.fixed || [];
     updateVacuum(r.vacuum);
     updateFixState();
     render3D();
-    VCS.log('已固定底 ' + n + ' 层(冻结 ' + r.fixed_count + ' 个原子)', 'okc');
+    VCS.log(i18n('editor.layers.fixed', '已固定底 {layers} 层（冻结 {count} 个原子）', {
+      layers: n, count: r.fixed_count,
+    }), 'okc');
   }
   async function refreshVacuum() {
     if (!State.struct) return;
@@ -403,17 +441,23 @@
   async function save() {
     if (!State.struct) { VCS.log('请先加载结构', 'failc'); return; }
     const dr = await VCS.call('pick_dir');
-    if (dr && dr.error) { VCS.log('选择目录失败:' + dr.error, 'failc'); return; }
+    if (dr && dr.error) {
+      VCS.log(i18n('editor.directory.pick_failed', '选择目录失败：{error}', {
+        error: dr.error,
+      }), 'failc'); return;
+    }
     if (!dr || !dr.path) return;
     const d = String(dr.path).replace(/[\\/]+$/, '');
     const sep = d.indexOf('\\') >= 0 ? '\\' : '/';
     const dest = d + sep + 'POSCAR';
     const r = await VCS.call('struct_save', stateForApi(), dest);
     if (!r || r.ok === false || r.error) {
-      VCS.log('保存 POSCAR 失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+      VCS.log(i18n('editor.poscar.save_failed', '保存 POSCAR 失败：{error}', {
+        error: (r && r.error) || i18n('common.unknown_error', '未知错误'),
+      }), 'failc'); return;
     }
     State.path = r.path;
-    VCS.log('已保存 POSCAR:' + r.path, 'okc');
+    VCS.log(i18n('editor.poscar.saved', '已保存 POSCAR：{path}', { path: r.path }), 'okc');
     VCS.call('open_dir', r.path);
     VCS.toast('已保存 POSCAR');
   }
@@ -437,8 +481,9 @@
   // ── 输入原子坐标(粘贴 xyz 文本 → 载入编辑器)──
   function pasteXyz() {
     const box = document.createElement('div');
-    box.innerHTML = '<div class="sub" style="margin-bottom:6px">每行一个原子:元素 x y z(单位 Å);' +
-      '可含/不含 XYZ 头两行。</div>' +
+    box.innerHTML = '<div class="sub" style="margin-bottom:6px">' + VCS.esc(i18n(
+      'editor.xyz.instructions',
+      '每行一个原子：元素 x y z（单位 Å）；可含/不含 XYZ 头两行。')) + '</div>' +
       '<textarea id="ed-xyz-ta" class="ipt" rows="10" spellcheck="false" ' +
       'placeholder="O   0.000   0.000   0.000&#10;H   0.757   0.586   0.000&#10;H  -0.757   0.586   0.000"></textarea>';
     const m = VCS.modal({
@@ -470,8 +515,12 @@
     const formula = Object.keys(counts).map(e => e + (counts[e] > 1 ? counts[e] : '')).join('');
     setStruct({ elements: elements, coords: coords, fixed: elements.map(() => false), formula: formula },
       null, null);
-    VCS.log('已载入粘贴坐标:' + elements.length + ' 原子(' + formula + ')', 'okc');
-    VCS.toast('已载入 ' + elements.length + ' 原子');
+    VCS.log(i18n('editor.xyz.loaded', '已载入粘贴坐标：{count} 原子（{formula}）', {
+      count: elements.length, formula,
+    }), 'okc');
+    VCS.toast(i18n('editor.xyz.loaded_count', '已载入 {count} 原子', {
+      count: elements.length,
+    }));
     return true;
   }
 
@@ -485,8 +534,1102 @@
     box.innerHTML = mols.map(m =>
       `<div class="mol-card"><b>${VCS.esc(m.name)}</b>` +
       `<span>${VCS.esc(m.formula || m.name)}</span>` +
-      (m.spin_hint ? `<span class="spin-hint">自旋 ${VCS.esc(String(m.spin_hint))}</span>` : '') +
+      (m.spin_hint ? `<span class="spin-hint">${VCS.esc(i18n(
+        'editor.molecule.spin', '自旋 {spin}', { spin: String(m.spin_hint) }
+      ))}</span>` : '') +
       `</div>`).join('');
+  }
+
+  // ── Structure Source Hub + 通用 slab / 几何位点向导 ──
+  // 这个闭环只保存 opaque token。后端返回对象始终按白名单字段渲染，绝不把路径、
+  // 原始结构文本或凭据回填到页面。外部 provider 是可选 gateway capability；本地
+  // picker 与远程错误完全解耦。
+  const SourceHubState = {
+    providers: [],
+    results: { bulk: [], ads: [] },
+    previews: { bulk: null, ads: null },
+    sourceTokens: { bulk: null, ads: null },
+    viewers: { bulk: null, ads: null },
+    dryRun: null,
+    operationToken: null,
+    outputSelectionToken: null,
+    outputDisplayName: '',
+    created: false,
+    // Every asynchronous bridge request receives one monotonically increasing generation.
+    // The active slot, stable request fingerprint, and explicit role/token owner must all
+    // still match before a response is allowed to mutate UI state.
+    intentGeneration: 0,
+    activeRequests: {
+      search: null, local: { bulk: null, ads: null },
+      preview: { bulk: null, ads: null }, confirm: { bulk: null, ads: null },
+      dryRun: null, output: null, create: null,
+    },
+    previewOwners: { bulk: null, ads: null },
+    sourceTokenOwners: { bulk: null, ads: null },
+    resultOwners: { bulk: null, ads: null },
+    sourceIntentOwners: { bulk: null, ads: null },
+    operationOwner: null,
+    outputTokenOwner: null,
+  };
+
+  function stableIntentValue(value) {
+    if (Array.isArray(value)) return value.map(stableIntentValue);
+    if (!value || typeof value !== 'object') return value;
+    return Object.keys(value).sort().reduce((result, key) => {
+      result[key] = stableIntentValue(value[key]);
+      return result;
+    }, {});
+  }
+
+  function requestFingerprint(kind, role, payload) {
+    return `${kind}|${role || '-'}|${JSON.stringify(stableIntentValue(payload || {}))}`;
+  }
+
+  const roleRequestKinds = new Set(['local', 'preview', 'confirm']);
+
+  function requestSlot(kind, role) {
+    const slots = SourceHubState.activeRequests[kind];
+    return roleRequestKinds.has(kind) ? slots[role] : slots;
+  }
+
+  function setRequestSlot(kind, role, value) {
+    const slots = SourceHubState.activeRequests[kind];
+    if (roleRequestKinds.has(kind)) slots[role] = value;
+    else SourceHubState.activeRequests[kind] = value;
+  }
+
+  function beginIntentRequest(kind, role, payload) {
+    const request = {
+      kind, role: role || '', payload: stableIntentValue(payload || {}),
+      generation: ++SourceHubState.intentGeneration,
+      fingerprint: requestFingerprint(kind, role, payload),
+    };
+    setRequestSlot(kind, role, request);
+    return request;
+  }
+
+  function beginSourceIntentRequest(kind, role, payload) {
+    const request = beginIntentRequest(kind, role, payload);
+    SourceHubState.sourceIntentOwners[role] = request;
+    if (kind === 'search' || kind === 'local') SourceHubState.resultOwners[role] = null;
+    return request;
+  }
+
+  function invalidateIntentRequest(kind, role) {
+    if (requestSlot(kind, role)) {
+      ++SourceHubState.intentGeneration;
+      setRequestSlot(kind, role, null);
+    }
+  }
+
+  function requestIsCurrent(request, payload) {
+    return !!request && requestSlot(request.kind, request.role) === request &&
+      request.fingerprint === requestFingerprint(request.kind, request.role, payload);
+  }
+
+  function sourceRequestIsCurrent(request, payload) {
+    return requestIsCurrent(request, payload) &&
+      SourceHubState.sourceIntentOwners[request.role] === request;
+  }
+
+  function ownedSourceToken(role) {
+    const owner = SourceHubState.sourceTokenOwners[role];
+    return owner && owner.role === role && owner.token === SourceHubState.sourceTokens[role]
+      ? owner : null;
+  }
+
+  function currentOperationOwner() {
+    const owner = SourceHubState.operationOwner;
+    const bulkOwner = ownedSourceToken('bulk');
+    const adsOwner = ownedSourceToken('ads');
+    if ((SourceHubState.sourceTokens.bulk && !bulkOwner) ||
+        (SourceHubState.sourceTokens.ads && !adsOwner)) return null;
+    return owner && owner.token === SourceHubState.operationToken &&
+      owner.bulkOwner === bulkOwner && owner.adsOwner === adsOwner ? owner : null;
+  }
+
+  function currentOutputOwner() {
+    const owner = SourceHubState.outputTokenOwner;
+    const operation = currentOperationOwner();
+    return owner && operation && owner.token === SourceHubState.outputSelectionToken &&
+      owner.operationOwner === operation ? owner : null;
+  }
+
+  const sourceRoleIds = role => ({
+    results: `src-${role}-results`, preview: `src-${role}-preview`,
+    meta: `src-${role}-meta`, view3d: `src-${role}-view3d`,
+    top: `src-${role}-top`, provenance: `src-${role}-provenance`,
+    confirm: `src-${role}-confirm`, status: `src-${role}-status`,
+  });
+
+  function publicText(value) {
+    let text = String(value == null ? '' : value);
+    // Defensive redaction: DTOs are required to be path-free, but UI rendering still fails closed.
+    text = text.replace(/[A-Za-z]:\\(?:[^\\\s]+\\)*[^\\\s]*/g,
+      i18n('structure.hub.hidden_local_value', '[local value hidden]'));
+    text = text.replace(/(^|\s)\/(?:[^/\s]+\/)+[^/\s]*/g, (match, lead) =>
+      lead + i18n('structure.hub.hidden_local_value', '[local value hidden]'));
+    return text;
+  }
+
+  function setSourceStatus(role, message, failed) {
+    const el = $(sourceRoleIds(role).status);
+    if (!el) return;
+    el.textContent = publicText(message || '');
+    el.classList.toggle('fail', !!failed);
+  }
+
+  function setRemoteStatus(message, failed) {
+    const el = $('source-remote-status');
+    if (!el) return;
+    el.textContent = publicText(message || '');
+    el.classList.toggle('fail', !!failed);
+  }
+
+  function setCreateStatus(message, failed) {
+    const el = $('surface-create-status');
+    if (!el) return;
+    el.textContent = publicText(message || '');
+    el.classList.toggle('fail', !!failed);
+  }
+
+  function normalizeProviders(out) {
+    const raw = out && (out.providers || out.capabilities || out.provider_capabilities);
+    const rows = Array.isArray(raw) ? raw : ((raw && typeof raw === 'object')
+      ? Object.keys(raw).map(id => Object.assign({ id }, raw[id] || {})) : []);
+    return rows.map(row => {
+      const labels = row.label;
+      const lang = window.VCS && VCS.i18n && VCS.i18n.lang === 'en' ? 'en' : 'zh';
+      const localizedLabel = labels && typeof labels === 'object'
+        ? (labels[lang] || labels.en || labels.zh || '') : labels;
+      return {
+      id: String(row.id || row.provider || row.key || ''),
+      label: String(localizedLabel || row.name || row.id || row.provider || ''),
+      labels: labels && typeof labels === 'object' ? labels : null,
+      available: row.available !== false && row.enabled !== false && row.installed !== false,
+      reason: String(row.reason || row.error || ''),
+      remote: row.remote !== false && row.network !== false && row.kind !== 'local',
+      };
+    }).filter(row => row.id && row.remote);
+  }
+
+  function renderProviderOptions() {
+    const select = $('source-provider');
+    const search = $('source-search');
+    const capability = $('source-capability-status');
+    if (!select) return;
+    select.textContent = '';
+    SourceHubState.providers.forEach(provider => {
+      const option = document.createElement('option');
+      option.value = provider.id;
+      const lang = window.VCS && VCS.i18n && VCS.i18n.lang === 'en' ? 'en' : 'zh';
+      const label = provider.labels
+        ? (provider.labels[lang] || provider.labels.en || provider.labels.zh) : provider.label;
+      option.textContent = publicText(label || provider.id) +
+        (provider.available ? '' : ' · ' + i18n('structure.hub.gateway.unavailable_short', 'unavailable'));
+      option.disabled = !provider.available;
+      select.appendChild(option);
+    });
+    const available = SourceHubState.providers.filter(provider => provider.available);
+    if (available.length) select.value = available[0].id;
+    select.disabled = !available.length;
+    if (search) search.disabled = !available.length;
+    if (capability) capability.textContent = available.length
+      ? i18n('structure.hub.gateway.available_count', '{count} provider(s) available', {
+        count: available.length,
+      })
+      : i18n('structure.hub.gateway.unavailable', 'External reference gateway unavailable');
+  }
+
+  async function loadSourceCapabilities() {
+    const out = await VCS.call('structure_source_capabilities');
+    SourceHubState.providers = normalizeProviders(out);
+    renderProviderOptions();
+    if (!out || out.error || !SourceHubState.providers.some(provider => provider.available)) {
+      setRemoteStatus(i18n('structure.hub.gateway.local_still_available',
+        'External reference gateway unavailable. Local CIF/POSCAR selection is still available.'),
+      false);
+    } else {
+      setRemoteStatus('');
+    }
+    return SourceHubState.providers;
+  }
+
+  function methodSummary(row) {
+    const method = row && (row.method_metadata || row.method);
+    if (typeof method === 'string') return method;
+    if (!method || typeof method !== 'object') return '';
+    return [method.name, method.version, method.description, method.level_of_theory,
+      method.format, method.parser]
+      .filter(Boolean).map(publicText).join(' · ');
+  }
+
+  function metadataSummary(value, fields) {
+    if (typeof value === 'string') return publicText(value);
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
+    return fields.filter(field => value[field] != null)
+      .map(field => publicText(value[field])).filter(Boolean).join(' · ');
+  }
+
+  function normalizeSourceResult(row) {
+    if (!row || typeof row !== 'object') return null;
+    const token = row.token || row.result_token || row.source_token;
+    if (typeof token !== 'string' || !token) return null;
+    const method = row.method_metadata || row.method;
+    return {
+      token,
+      provider: publicText(method && typeof method === 'object' ? method.provider : ''),
+      sourceId: publicText(row.source_id || row.sourceId || row.database_id || row.material_id || ''),
+      declaredFormula: publicText(row.declared_formula || row.formula || ''),
+      computedFormula: publicText(row.computed_formula || ''),
+      license: metadataSummary(row.license, ['name', 'spdx_id', 'url']),
+      citation: metadataSummary(row.citation, ['text', 'doi', 'url']),
+      method: publicText(methodSummary(row)),
+      declaredRawHash: publicText(row.declared_raw_structure_sha256 ||
+        row.raw_structure_sha256 || row.raw_structure_hash || ''),
+      computedHash: publicText(row.computed_structure_sha256 || row.structure_sha256 ||
+        row.structure_hash || row.structureHash || ''),
+    };
+  }
+
+  function sourceResultHtml(row, role) {
+    const pieces = [row.provider, row.sourceId, row.declaredFormula].filter(Boolean);
+    const evidence = [];
+    if (row.license) evidence.push(i18n('structure.hub.result.license', 'License: {value}', {
+      value: row.license,
+    }));
+    if (row.citation) evidence.push(i18n('structure.hub.result.citation', 'Citation: {value}', {
+      value: row.citation,
+    }));
+    if (row.method) evidence.push(i18n('structure.hub.result.method', 'Method: {value}', {
+      value: row.method,
+    }));
+    if (row.computedFormula) evidence.push(i18n('structure.hub.result.computed_formula',
+      'Server-computed formula: {value}', { value: row.computedFormula }));
+    if (row.declaredRawHash) evidence.push(i18n('structure.hub.result.declared_raw_hash',
+      'Declared raw-source SHA-256: {value}', { value: row.declaredRawHash }));
+    if (row.computedHash) evidence.push(i18n('structure.hub.result.computed_hash',
+      'Server-computed canonical SHA-256: {value}', {
+      value: row.computedHash,
+    }));
+    return '<article class="source-result" role="listitem">' +
+      `<div><b>${VCS.esc(pieces.join(' · ') || i18n('structure.hub.result.unnamed', 'Structure result'))}</b>` +
+      evidence.map(item => `<span>${VCS.esc(item)}</span>`).join('') + '</div>' +
+      `<button type="button" class="btn" data-source-preview="${VCS.esc(role)}" ` +
+      `data-source-token="${VCS.esc(row.token)}">${VCS.esc(i18n(
+        'structure.hub.result.preview', 'Preview'))}</button></article>`;
+  }
+
+  function showSourceResults(role, rows, owner) {
+    const normalized = (Array.isArray(rows) ? rows : []).map(normalizeSourceResult).filter(Boolean);
+    SourceHubState.results[role] = normalized;
+    const tokens = normalized.map(row => row.token);
+    const existingOwner = SourceHubState.resultOwners[role];
+    if (owner && owner.role === role) {
+      SourceHubState.resultOwners[role] = {
+        role, generation: owner.generation, requestFingerprint: owner.fingerprint, tokens,
+      };
+    } else if (!existingOwner ||
+        requestFingerprint('results', role, existingOwner.tokens) !==
+          requestFingerprint('results', role, tokens)) {
+      SourceHubState.resultOwners[role] = null;
+    }
+    const box = $(sourceRoleIds(role).results);
+    if (!box) return normalized;
+    box.innerHTML = normalized.length
+      ? normalized.map(row => sourceResultHtml(row, role)).join('')
+      : `<p class="source-empty">${VCS.esc(i18n('structure.hub.result.empty', 'No path-free results returned.'))}</p>`;
+    return normalized;
+  }
+
+  function invalidateOutputSelection() {
+    SourceHubState.outputSelectionToken = null;
+    SourceHubState.outputTokenOwner = null;
+    SourceHubState.outputDisplayName = '';
+    SourceHubState.created = false;
+    invalidateIntentRequest('output', '');
+    invalidateIntentRequest('create', '');
+    const outputName = $('surface-output-name');
+    const ack = $('surface-candidate-ack');
+    const create = $('surface-create-candidates');
+    if (outputName) outputName.textContent = '';
+    if (ack) { ack.checked = false; ack.disabled = true; }
+    if (create) create.disabled = true;
+  }
+
+  function invalidateDryRun(message) {
+    SourceHubState.dryRun = null;
+    SourceHubState.operationToken = null;
+    SourceHubState.operationOwner = null;
+    invalidateIntentRequest('dryRun', '');
+    invalidateOutputSelection();
+    const result = $('surface-dry-result');
+    if (result) result.textContent = message || '';
+    const output = $('surface-output-select');
+    if (output) output.disabled = true;
+    setCreateStatus('');
+  }
+
+  function resetSourceConfirmation(role) {
+    SourceHubState.sourceTokens[role] = null;
+    SourceHubState.sourceTokenOwners[role] = null;
+    invalidateIntentRequest('confirm', role);
+    const confirm = $(sourceRoleIds(role).confirm);
+    if (confirm) confirm.disabled = !SourceHubState.previews[role];
+    if (role === 'bulk') {
+      const dry = $('surface-dry-run');
+      if (dry) dry.disabled = true;
+    }
+    invalidateDryRun('');
+  }
+
+  function render3DPreview(role, preview) {
+    const box = $(sourceRoleIds(role).view3d);
+    if (!box) return;
+    if (SourceHubState.viewers[role]) {
+      try { SourceHubState.viewers[role].clear(); } catch (e) { /* no-op */ }
+      SourceHubState.viewers[role] = null;
+    }
+    box.textContent = '';
+    const view = preview && preview.view;
+    if (!view || typeof view.xyz !== 'string' || !view.xyz.trim()) {
+      box.textContent = i18n('structure.hub.preview.no_3d', 'No 3D preview data');
+      return;
+    }
+    if (typeof window.$3Dmol === 'undefined') {
+      box.textContent = i18n('structure.hub.preview.no_webgl',
+        '3D renderer unavailable; metadata and top view remain usable.');
+      return;
+    }
+    try {
+      const sourceViewer = window.$3Dmol.createViewer(box, { backgroundColor: '#FFFFFF' });
+      sourceViewer.addModel(view.xyz, 'xyz');
+      sourceViewer.setStyle({}, { sphere: { scale: 0.3 }, stick: { radius: 0.15 } });
+      sourceViewer.zoomTo();
+      sourceViewer.render();
+      SourceHubState.viewers[role] = sourceViewer;
+      setTimeout(() => {
+        try { sourceViewer.resize(); sourceViewer.render(); } catch (e) { /* no-op */ }
+      }, 30);
+    } catch (error) {
+      box.textContent = i18n('structure.hub.preview.render_failed',
+        '3D preview failed; metadata and top view remain usable.');
+    }
+  }
+
+  function xyzTopPoints(xyz) {
+    if (typeof xyz !== 'string') return [];
+    return xyz.split(/\r?\n/).slice(2).map(line => {
+      const parts = line.trim().split(/\s+/);
+      return parts.length >= 4 ? { element: parts[0], x: +parts[1], y: +parts[2] } : null;
+    }).filter(point => point && Number.isFinite(point.x) && Number.isFinite(point.y));
+  }
+
+  function topViewGeometry(preview) {
+    const top = (preview && preview.top_view) || {};
+    if (top.projection != null && top.projection !== 'xy') {
+      return { points: [], cell: null, truncated: top.truncated === true };
+    }
+    const cell = Array.isArray(top.cell) ? top.cell : [];
+    const a = Array.isArray(cell[0]) ? cell[0].slice(0, 2).map(Number) : [];
+    const b = Array.isArray(cell[1]) ? cell[1].slice(0, 2).map(Number) : [];
+    if (a.length !== 2 || b.length !== 2 || !a.concat(b).every(Number.isFinite)) {
+      return { points: [], cell: null, truncated: top.truncated === true };
+    }
+    const determinant = a[0] * b[1] - a[1] * b[0];
+    const scale = Math.max(1, Math.hypot(a[0], a[1]) * Math.hypot(b[0], b[1]));
+    if (!Number.isFinite(determinant) || Math.abs(determinant) <= 1e-10 * scale) {
+      return { points: [], cell: null, truncated: top.truncated === true };
+    }
+    let raw = Array.isArray(top.points) ? top.points : (Array.isArray(top.atoms) ? top.atoms : []);
+    if (!raw.length) raw = xyzTopPoints(top.xyz || (preview && preview.view && preview.view.xyz));
+    const points = raw.map(point => {
+      const coords = point.coords || point.position || [];
+      const fractional = point.fractional || point.fractional_coords || point.frac || [];
+      let u = +(point.u != null ? point.u : fractional[0]);
+      let v = +(point.v != null ? point.v : fractional[1]);
+      if (!Number.isFinite(u) || !Number.isFinite(v)) {
+        const x = +(point.x != null ? point.x : coords[0]);
+        const y = +(point.y != null ? point.y : coords[1]);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+        u = (x * b[1] - y * b[0]) / determinant;
+        v = (a[0] * y - a[1] * x) / determinant;
+      }
+      // Draw the periodic representative inside the exact projected a/b unit cell.
+      u -= Math.floor(u);
+      v -= Math.floor(v);
+      return {
+        element: publicText(point.element || point.symbol || point.label || ''),
+        u, v, x: u * a[0] + v * b[0], y: u * a[1] + v * b[1],
+        group: publicText(point.equivalence_group || point.group || ''),
+      };
+    }).filter(point => Number.isFinite(point.x) && Number.isFinite(point.y));
+    return { points, cell: { a, b }, truncated: top.truncated === true };
+  }
+
+  function renderTopView(role, preview) {
+    const box = $(sourceRoleIds(role).top);
+    if (!box) return;
+    box.textContent = '';
+    const geometry = topViewGeometry(preview);
+    if (geometry.truncated) {
+      const warning = document.createElement('p');
+      warning.className = 'source-warning';
+      warning.setAttribute('role', 'status');
+      warning.textContent = i18n('structure.hub.preview.top_truncated',
+        'Top view is truncated; not all atoms are shown.');
+      box.appendChild(warning);
+    }
+    if (!geometry.cell || !geometry.points.length || typeof document.createElementNS !== 'function') {
+      const unavailable = document.createElement('p');
+      unavailable.textContent = i18n('structure.hub.preview.top_cell_required',
+        'Exact top view unavailable: a non-degenerate projected unit cell and coordinates are required.');
+      box.appendChild(unavailable);
+      return;
+    }
+    const a = geometry.cell.a, b = geometry.cell.b;
+    const corners = [
+      { x: 0, y: 0 }, { x: a[0], y: a[1] },
+      { x: a[0] + b[0], y: a[1] + b[1] }, { x: b[0], y: b[1] },
+    ];
+    const xs = corners.map(point => point.x), ys = corners.map(point => point.y);
+    const minX = Math.min.apply(null, xs), maxX = Math.max.apply(null, xs);
+    const minY = Math.min.apply(null, ys), maxY = Math.max.apply(null, ys);
+    const dx = maxX - minX, dy = maxY - minY;
+    const scale = Math.min(276 / dx, 176 / dy);
+    const centerX = (minX + maxX) / 2, centerY = (minY + maxY) / 2;
+    // A single scale factor preserves lengths/angles in the xy projection.
+    const projectX = x => 160 + (x - centerX) * scale;
+    const projectY = y => 110 - (y - centerY) * scale;
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 320 220');
+    svg.setAttribute('aria-hidden', 'true');
+    svg.setAttribute('data-top-view-projection', 'exact-cell-fractional');
+    const polygon = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
+    polygon.setAttribute('points', corners.map(point =>
+      `${projectX(point.x)},${projectY(point.y)}`).join(' '));
+    polygon.setAttribute('fill', 'none');
+    polygon.setAttribute('stroke', 'currentColor');
+    polygon.setAttribute('data-projected-unit-cell', 'true');
+    svg.appendChild(polygon);
+    geometry.points.forEach((point, index) => {
+      const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      circle.setAttribute('cx', String(projectX(point.x)));
+      circle.setAttribute('cy', String(projectY(point.y)));
+      circle.setAttribute('r', '7');
+      circle.setAttribute('data-fractional-u', String(point.u));
+      circle.setAttribute('data-fractional-v', String(point.v));
+      circle.setAttribute('data-equivalence-group', point.group || '');
+      const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+      title.textContent = `${point.element || '?'} ${index}`;
+      circle.appendChild(title);
+      svg.appendChild(circle);
+    });
+    box.appendChild(svg);
+  }
+
+  function builderParametersText(parameters) {
+    if (!parameters || typeof parameters !== 'object') return '';
+    const keys = ['miller', 'termination', 'layers', 'vacuum', 'vacuum_angstrom',
+      'fixed_layers', 'surface_sides', 'symmetry_deduplicate'];
+    return keys.filter(key => parameters[key] != null)
+      .map(key => `${key}=${publicText(Array.isArray(parameters[key])
+        ? parameters[key].join(',') : parameters[key])}`).join('; ');
+  }
+
+  function renderProvenance(role, preview) {
+    const list = $(sourceRoleIds(role).provenance);
+    if (!list) return;
+    list.textContent = '';
+    const provenance = (preview && preview.provenance) || {};
+    const builder = provenance.builder || {};
+    const fields = [
+      ['structure.hub.prov.provider', 'Provider', provenance.provider],
+      ['structure.hub.prov.database_id', 'Database ID / query',
+        provenance.database_id || provenance.source_id],
+      ['structure.hub.prov.query', 'Query', provenance.query],
+      ['structure.hub.prov.retrieved_at', 'Retrieved', provenance.retrieved_at],
+      ['structure.hub.prov.license', 'License', metadataSummary(
+        provenance.license || preview.license, ['name', 'spdx_id', 'url'])],
+      ['structure.hub.prov.citation', 'Citation', metadataSummary(
+        provenance.citation || preview.citation, ['text', 'doi', 'url'])],
+      ['structure.hub.prov.method', 'Method metadata', methodSummary({
+        method: provenance.method || preview.method,
+      })],
+      ['structure.hub.prov.declared_formula', 'Declared formula',
+        provenance.declared_formula || preview.declared_formula || preview.formula],
+      ['structure.hub.prov.computed_formula', 'Server-computed formula',
+        provenance.computed_formula || preview.computed_formula],
+      ['structure.hub.prov.declared_raw_hash', 'Declared raw-source SHA-256',
+        provenance.declared_raw_structure_sha256 || provenance.raw_structure_hash ||
+          preview.declared_raw_structure_sha256 || preview.raw_structure_sha256],
+      ['structure.hub.prov.computed_hash', 'Server-computed canonical SHA-256',
+        provenance.computed_structure_sha256 || preview.computed_structure_sha256 ||
+          preview.structure_sha256],
+      ['structure.hub.prov.builder', 'Builder / version',
+        [builder.name || provenance.builder_name, builder.version || provenance.builder_version]
+          .filter(Boolean).join(' · ')],
+      ['structure.hub.prov.parameters', 'Builder parameters',
+        builderParametersText(builder.parameters || provenance.builder_parameters)],
+    ];
+    fields.filter(field => field[2] != null && String(field[2]).trim()).forEach(field => {
+      const term = document.createElement('dt');
+      const value = document.createElement('dd');
+      term.textContent = i18n(field[0], field[1]);
+      value.textContent = publicText(field[2]);
+      list.appendChild(term); list.appendChild(value);
+    });
+  }
+
+  function renderSourcePreview(role, preview) {
+    const ids = sourceRoleIds(role);
+    const panel = $(ids.preview);
+    const meta = $(ids.meta);
+    if (panel) panel.hidden = false;
+    if (meta) meta.textContent = i18n('structure.hub.preview.summary',
+      '{formula} · {count} atoms · hash {hash}', {
+        formula: publicText(preview.computed_formula || preview.declared_formula ||
+          preview.formula || '—'),
+        count: preview.natoms == null ? '—' : preview.natoms,
+        hash: publicText(preview.computed_structure_sha256 || preview.structure_sha256 || '—'),
+      });
+    render3DPreview(role, preview);
+    renderTopView(role, preview);
+    renderProvenance(role, preview);
+    const confirm = $(ids.confirm);
+    if (confirm) confirm.disabled = false;
+  }
+
+  async function previewSource(role, token) {
+    if ((role !== 'bulk' && role !== 'ads') || typeof token !== 'string' || !token) return false;
+    const payload = { role, token };
+    const request = beginSourceIntentRequest('preview', role, payload);
+    setSourceStatus(role, i18n('structure.hub.preview.loading', 'Loading source preview…'), false);
+    SourceHubState.previews[role] = null;
+    SourceHubState.previewOwners[role] = null;
+    resetSourceConfirmation(role);
+    const out = await VCS.call('structure_source_preview', token);
+    if (!sourceRequestIsCurrent(request, payload)) return false;
+    const preview = out && out.preview;
+    if (!out || out.error || out.ok === false || !preview || typeof preview !== 'object') {
+      setSourceStatus(role, i18n('structure.hub.preview.failed', 'Preview failed: {error}', {
+        error: (out && out.error) || i18n('common.unknown_error', 'Unknown error'),
+      }), true);
+      return false;
+    }
+    if (preview.token != null && preview.token !== token) {
+      setSourceStatus(role, i18n('structure.hub.preview.failed', 'Preview failed: {error}', {
+        error: i18n('structure.hub.preview.invalid_token',
+          'server returned a preview token owned by another request'),
+      }), true);
+      return false;
+    }
+    SourceHubState.previews[role] = Object.assign({}, preview, {
+      token: preview.token || token,
+    });
+    SourceHubState.previewOwners[role] = {
+      role, token: SourceHubState.previews[role].token,
+      requestToken: token, generation: request.generation,
+      requestFingerprint: request.fingerprint,
+    };
+    renderSourcePreview(role, SourceHubState.previews[role]);
+    setSourceStatus(role, i18n('structure.hub.preview.ready',
+      'Preview ready. Confirm this source before using it.'), false);
+    const confirm = $(sourceRoleIds(role).confirm);
+    if (confirm) confirm.focus();
+    return true;
+  }
+
+  async function confirmSource(role) {
+    const preview = SourceHubState.previews[role];
+    const previewOwner = SourceHubState.previewOwners[role];
+    if (!preview || typeof preview.token !== 'string' || !previewOwner ||
+        previewOwner.role !== role || previewOwner.token !== preview.token) return false;
+    const payload = {
+      role, previewToken: preview.token,
+      previewGeneration: previewOwner.generation,
+      previewFingerprint: previewOwner.requestFingerprint,
+    };
+    const request = beginIntentRequest('confirm', role, payload);
+    const button = $(sourceRoleIds(role).confirm);
+    if (button) button.disabled = true;
+    const out = await VCS.call('structure_source_confirm', preview.token);
+    if (!requestIsCurrent(request, payload) ||
+        SourceHubState.previewOwners[role] !== previewOwner ||
+        SourceHubState.previews[role] !== preview) return false;
+    if (!out || out.error || out.ok === false || out.confirmed !== true ||
+        typeof out.source_token !== 'string' || !out.source_token) {
+      if (button) button.disabled = false;
+      setSourceStatus(role, i18n('structure.hub.confirm.failed',
+        'Source confirmation failed: {error}', {
+          error: (out && out.error) || i18n('structure.hub.confirm.invalid',
+            'server did not return a confirmed opaque token'),
+        }), true);
+      return false;
+    }
+    SourceHubState.sourceTokens[role] = out.source_token;
+    SourceHubState.sourceTokenOwners[role] = {
+      role, token: out.source_token, previewToken: preview.token,
+      previewOwner, generation: request.generation,
+      requestFingerprint: request.fingerprint,
+    };
+    invalidateDryRun('');
+    if (role === 'bulk') {
+      const dry = $('surface-dry-run');
+      if (dry) dry.disabled = false;
+    }
+    setSourceStatus(role, role === 'bulk'
+      ? i18n('structure.hub.bulk.confirmed', 'Bulk/substrate source confirmed.')
+      : i18n('structure.hub.ads.confirmed', 'Adsorbate source confirmed.'), false);
+    return true;
+  }
+
+  async function selectLocalSource(role) {
+    if (role !== 'bulk' && role !== 'ads') return false;
+    const payload = { role, picker: 'system' };
+    const request = beginSourceIntentRequest('local', role, payload);
+    setSourceStatus(role, i18n('structure.hub.local.selecting', 'Waiting for system file picker…'), false);
+    const out = await VCS.call('structure_source_select_local');
+    if (!sourceRequestIsCurrent(request, payload)) return false;
+    if (!out || out.cancelled) {
+      setSourceStatus(role, i18n('structure.hub.local.cancelled', 'Selection cancelled.'), false);
+      return false;
+    }
+    if (out.error || out.ok === false) {
+      setSourceStatus(role, i18n('structure.hub.local.failed', 'Local selection failed: {error}', {
+        error: out.error || i18n('common.unknown_error', 'Unknown error'),
+      }), true);
+      return false;
+    }
+    const rows = showSourceResults(role, out.results || [], request);
+    setSourceStatus(role, rows.length
+      ? i18n('structure.hub.result.count', '{count} result(s); preview one to continue.', {
+        count: rows.length,
+      }) : i18n('structure.hub.result.empty', 'No path-free results returned.'), !rows.length);
+    const results = $(sourceRoleIds(role).results);
+    if (results) results.focus && results.focus();
+    return !!rows.length;
+  }
+
+  async function searchSourceGateway() {
+    const provider = $('source-provider');
+    const query = $('source-query');
+    const target = $('source-target');
+    const providerId = provider ? provider.value : '';
+    const queryText = query ? query.value.trim() : '';
+    const role = target && target.value === 'ads' ? 'ads' : 'bulk';
+    const payload = { providerId, queryText, role };
+    if (!providerId || !queryText) {
+      invalidateIntentRequest('search', '');
+      setRemoteStatus(i18n('structure.hub.gateway.query_required',
+        'Choose an available provider and enter a query.'), true);
+      return false;
+    }
+    const request = beginSourceIntentRequest('search', role, payload);
+    setRemoteStatus(i18n('structure.hub.gateway.searching', 'Searching external reference gateway…'), false);
+    const out = await VCS.call('structure_source_search', providerId, queryText);
+    const currentPayload = {
+      providerId: provider ? provider.value : '',
+      queryText: query ? query.value.trim() : '',
+      role: target && target.value === 'ads' ? 'ads' : 'bulk',
+    };
+    if (!sourceRequestIsCurrent(request, currentPayload)) return false;
+    if (!out || out.error || out.ok === false) {
+      setRemoteStatus(i18n('structure.hub.gateway.search_failed',
+        'External reference gateway unavailable: {error}', {
+          error: (out && out.error) || i18n('common.unknown_error', 'Unknown error'),
+        }), true);
+      return false;
+    }
+    const rows = showSourceResults(role, out.results || [], request);
+    setRemoteStatus(rows.length
+      ? i18n('structure.hub.gateway.result_count', '{count} result(s) sent to {target}.', {
+        count: rows.length,
+        target: role === 'bulk' ? i18n('structure.hub.gateway.target_bulk', 'bulk/substrate')
+          : i18n('structure.hub.gateway.target_ads', 'adsorbate'),
+      }) : i18n('structure.hub.result.empty', 'No path-free results returned.'), !rows.length);
+    return !!rows.length;
+  }
+
+  function clearAdsorbateSource() {
+    invalidateIntentRequest('local', 'ads');
+    invalidateIntentRequest('preview', 'ads');
+    invalidateIntentRequest('confirm', 'ads');
+    const search = requestSlot('search', '');
+    if (search && search.role === 'ads') invalidateIntentRequest('search', '');
+    SourceHubState.sourceIntentOwners.ads = {
+      kind: 'clear', role: 'ads', generation: ++SourceHubState.intentGeneration,
+      fingerprint: requestFingerprint('clear', 'ads', {}),
+    };
+    SourceHubState.previews.ads = null;
+    SourceHubState.previewOwners.ads = null;
+    SourceHubState.sourceTokens.ads = null;
+    SourceHubState.sourceTokenOwners.ads = null;
+    SourceHubState.results.ads = [];
+    SourceHubState.resultOwners.ads = null;
+    const ids = sourceRoleIds('ads');
+    if ($(ids.results)) $(ids.results).textContent = '';
+    if ($(ids.preview)) $(ids.preview).hidden = true;
+    if ($(ids.confirm)) $(ids.confirm).disabled = true;
+    if (SourceHubState.viewers.ads) {
+      try { SourceHubState.viewers.ads.clear(); } catch (e) { /* no-op */ }
+      SourceHubState.viewers.ads = null;
+    }
+    invalidateDryRun('');
+    setSourceStatus('ads', i18n('structure.hub.ads.cleared',
+      'Adsorbate cleared; dry-run will enumerate clean-slab geometric sites.'), false);
+  }
+
+  function finiteNumber(id, label, options) {
+    const el = $(id);
+    const value = el ? Number(el.value) : NaN;
+    const opts = options || {};
+    if (!Number.isFinite(value) || (opts.integer && !Number.isInteger(value)) ||
+        (opts.min != null && value < opts.min) || (opts.max != null && value > opts.max)) {
+      throw new Error(i18n('structure.hub.validation.number',
+        '{label} has an invalid value.', { label }));
+    }
+    return value;
+  }
+
+  function buildSurfaceRequests() {
+    const miller = [
+      finiteNumber('surface-h', 'Miller h', { integer: true }),
+      finiteNumber('surface-k', 'Miller k', { integer: true }),
+      finiteNumber('surface-l', 'Miller l', { integer: true }),
+    ];
+    if (miller.every(value => value === 0)) {
+      throw new Error(i18n('structure.hub.validation.miller_zero',
+        'Miller indices cannot all be zero.'));
+    }
+    const selectedSites = Array.from(document.querySelectorAll(
+      'input[name="surface-site-family"]:checked')).map(input => input.value);
+    if (!selectedSites.length) {
+      throw new Error(i18n('structure.hub.validation.site_required',
+        'Select at least one geometric site family.'));
+    }
+    const bindingEl = $('surface-binding-atom');
+    const bindingValue = bindingEl && bindingEl.value !== ''
+      ? finiteNumber('surface-binding-atom', i18n('structure.hub.site.binding_atom',
+        'Binding atom index'), { integer: true, min: 0 }) : null;
+    if (!$('surface-dedup') || !$('surface-dedup').checked) {
+      throw new Error(i18n('structure.hub.validation.dedup_required',
+        'Symmetry deduplication is required for this deterministic workflow.'));
+    }
+    const sides = ($('surface-sides') && $('surface-sides').value) || 'top';
+    const rotations = (($('surface-rotations') && $('surface-rotations').value) || '0')
+      .split(',').map(value => Number(value));
+    const termination = ($('surface-termination') && $('surface-termination').value.trim()) || '';
+    const slabRequest = {
+      miller,
+      layers: finiteNumber('surface-layers', i18n('structure.hub.slab.layers', 'Layers'),
+        { integer: true, min: 1 }),
+      vacuum: finiteNumber('surface-vacuum',
+        i18n('structure.hub.slab.vacuum', 'Vacuum'), { min: 5 }),
+      fixed_layers: finiteNumber('surface-fixed',
+        i18n('structure.hub.slab.fixed', 'Fixed bottom layers'), { integer: true, min: 0 }),
+      surface_sides: sides,
+    };
+    // Empty/"auto" means enumerate server-authoritative terminations. The core intentionally
+    // rejects the literal "auto", so never put that sentinel on the bridge.
+    if (termination && termination.toLowerCase() !== 'auto') {
+      slabRequest.termination = termination;
+    }
+    const siteRequest = {
+      site_kinds: selectedSites,
+      binding_atom: bindingValue,
+      orientation: ($('surface-orientation') && $('surface-orientation').value) || 'normal',
+      rotations,
+      coverage: finiteNumber('surface-coverage',
+        i18n('structure.hub.site.coverage', 'Coverage'), { min: 0.01, max: 1 }),
+      sides,
+      min_distance: finiteNumber('surface-min-distance',
+        i18n('structure.hub.site.min_distance', 'Minimum allowed distance'), { min: 1 }),
+    };
+    if (ownedSourceToken('ads')) {
+      siteRequest.adsorbate_source_token = SourceHubState.sourceTokens.ads;
+    }
+    return { slabRequest, siteRequest };
+  }
+
+  function surfaceIntentPayload(requests) {
+    const bulkOwner = ownedSourceToken('bulk');
+    const adsOwner = ownedSourceToken('ads');
+    return {
+      bulk: bulkOwner ? {
+        role: bulkOwner.role, token: bulkOwner.token,
+        generation: bulkOwner.generation, fingerprint: bulkOwner.requestFingerprint,
+      } : null,
+      ads: adsOwner ? {
+        role: adsOwner.role, token: adsOwner.token,
+        generation: adsOwner.generation, fingerprint: adsOwner.requestFingerprint,
+      } : null,
+      slabRequest: requests.slabRequest,
+      siteRequest: requests.siteRequest,
+    };
+  }
+
+  function dryCandidateHtml(row, index) {
+    const parameters = (row.parameters && typeof row.parameters === 'object')
+      ? row.parameters : {};
+    const miller = row.miller || parameters.miller || parameters.miller_requested;
+    const termination = row.termination && typeof row.termination === 'object'
+      ? (row.termination.termination_id || row.termination.id) : row.termination;
+    const layers = row.layers == null ? parameters.layers : row.layers;
+    const summary = [row.formula, miller && `(${miller.join(' ')})`, termination,
+      layers != null ? i18n('structure.hub.dry.layers', '{count} layers', {
+        count: layers,
+      }) : '', row.structure_hash].filter(Boolean).map(publicText).join(' · ');
+    const sites = row.site_counts || row.sites || {};
+    const siteCounts = Array.isArray(sites) ? sites.reduce((counts, site) => {
+      const kind = publicText((site && site.kind) || 'other');
+      counts[kind] = (counts[kind] || 0) + 1;
+      return counts;
+    }, {}) : sites;
+    const siteText = (siteCounts && typeof siteCounts === 'object' && !Array.isArray(siteCounts))
+      ? Object.keys(siteCounts).sort().map(key => `${publicText(key)}=${publicText(siteCounts[key])}`).join(', ')
+      : publicText(siteCounts || '');
+    const rejections = Array.isArray(row.rejections) ? row.rejections : [];
+    const equivalenceCount = Array.isArray(row.equivalence_groups)
+      ? row.equivalence_groups.length : row.equivalence_groups;
+    const builder = row.provenance || row.builder || {};
+    const builderText = [builder.builder, builder.name,
+      builder.builder_version || builder.version]
+      .filter(Boolean).map(publicText).join(' · ');
+    const parameterText = builderParametersText(row.parameters || builder.parameters);
+    return '<article class="surface-candidate">' +
+      `<b>${VCS.esc(summary || i18n('structure.hub.dry.candidate', 'Candidate {index}', {
+        index: index + 1,
+      }))}</b>` +
+      (siteText ? `<span>${VCS.esc(i18n('structure.hub.dry.site_counts',
+        'Geometric sites: {value}', { value: siteText }))}</span>` : '') +
+      (equivalenceCount != null ? `<span>${VCS.esc(i18n(
+        'structure.hub.dry.equivalence_groups', 'Geometric symmetry-candidate groups: {count}', {
+          count: equivalenceCount,
+        }))}</span>` : '') +
+      (row.minimum_distance != null ? `<span>${VCS.esc(i18n(
+        'structure.hub.dry.minimum_distance', 'Minimum distance: {value} Å', {
+          value: publicText(row.minimum_distance),
+        }))}</span>` : '') +
+      (builderText ? `<span>${VCS.esc(i18n('structure.hub.dry.builder',
+        'Builder / version: {value}', { value: builderText }))}</span>` : '') +
+      (parameterText ? `<span>${VCS.esc(i18n('structure.hub.dry.parameters',
+        'Builder parameters: {value}', { value: parameterText }))}</span>` : '') +
+      (rejections.length ? '<ul class="surface-rejections">' + rejections.map(rejection => {
+        const text = (rejection && typeof rejection === 'object')
+          ? [rejection.code, rejection.reason, rejection.count].filter(value => value != null).join(' · ')
+          : rejection;
+        return `<li>${VCS.esc(publicText(text))}</li>`;
+      }).join('') + '</ul>' : '') + '</article>';
+  }
+
+  function renderDryRun(dryRun) {
+    const box = $('surface-dry-result');
+    if (!box) return;
+    const slabs = Array.isArray(dryRun.slabs) ? dryRun.slabs : [];
+    const warnings = Array.isArray(dryRun.warnings) ? dryRun.warnings : [];
+    const mode = SourceHubState.sourceTokens.ads
+      ? i18n('structure.hub.dry.mode_ads', 'Adsorption-configuration candidates')
+      : i18n('structure.hub.dry.mode_clean', 'Clean-slab candidates; geometric sites only');
+    box.innerHTML = `<div class="surface-dry-summary"><b>${VCS.esc(i18n(
+      'structure.hub.dry.ready', 'Dry-run ready: {count} slab candidate(s)', {
+        count: slabs.length,
+      }))}</b><span>${VCS.esc(mode)}</span><span>${VCS.esc(i18n(
+        'structure.hub.site.boundary', 'Geometric sites are not active sites.'))}</span></div>` +
+      warnings.map(warning => `<div class="source-warning">${VCS.esc(publicText(warning))}</div>`).join('') +
+      slabs.map(dryCandidateHtml).join('');
+    box.focus();
+  }
+
+  async function runSurfaceDryRun() {
+    const bulkOwner = ownedSourceToken('bulk');
+    if (!bulkOwner) {
+      setCreateStatus(i18n('structure.hub.dry.bulk_required',
+        'Preview and confirm a bulk/substrate source first.'), true);
+      return false;
+    }
+    let requests;
+    try { requests = buildSurfaceRequests(); } catch (error) {
+      setCreateStatus(error.message || String(error), true);
+      return false;
+    }
+    const adsOwner = ownedSourceToken('ads');
+    if (SourceHubState.sourceTokens.ads && !adsOwner) {
+      setCreateStatus(i18n('structure.hub.dry.source_owner_invalid',
+        'A selected source token is not owned by the current source role.'), true);
+      return false;
+    }
+    const payload = surfaceIntentPayload(requests);
+    invalidateDryRun(i18n('structure.hub.dry.running', 'Generating dry-run…'));
+    const request = beginIntentRequest('dryRun', '', payload);
+    const out = await VCS.call('surface_dry_run', SourceHubState.sourceTokens.bulk,
+      requests.slabRequest, requests.siteRequest);
+    let currentPayload = null;
+    try { currentPayload = surfaceIntentPayload(buildSurfaceRequests()); } catch (error) { /* stale */ }
+    if (!currentPayload || !requestIsCurrent(request, currentPayload) ||
+        ownedSourceToken('bulk') !== bulkOwner || ownedSourceToken('ads') !== adsOwner) return false;
+    const dryRun = out && out.dry_run;
+    const operationToken = dryRun && dryRun.operation_token
+      ? dryRun.operation_token : (out && out.operation_token);
+    if (!out || out.error || out.ok === false || !dryRun ||
+        dryRun.scientific_status !== 'candidate' || typeof operationToken !== 'string') {
+      invalidateDryRun('');
+      if (dryRun && dryRun.scientific_status === 'candidate') renderDryRun(dryRun);
+      setCreateStatus(i18n('structure.hub.dry.failed', 'Dry-run failed closed: {error}', {
+        error: (out && out.error) || i18n('structure.hub.dry.invalid_contract',
+          'server did not return a candidate-bound operation token'),
+      }), true);
+      return false;
+    }
+    SourceHubState.dryRun = dryRun;
+    SourceHubState.operationToken = operationToken;
+    SourceHubState.operationOwner = {
+      token: operationToken, generation: request.generation,
+      requestFingerprint: request.fingerprint,
+      bulkOwner, adsOwner,
+    };
+    renderDryRun(dryRun);
+    const output = $('surface-output-select');
+    if (output) output.disabled = false;
+    setCreateStatus(i18n('structure.hub.dry.review',
+      'Review the dry-run, then choose a destination and explicitly confirm candidate creation.'), false);
+    return true;
+  }
+
+  async function selectSurfaceOutput() {
+    const operationOwner = currentOperationOwner();
+    if (!operationOwner) return false;
+    const payload = {
+      operationToken: operationOwner.token,
+      operationGeneration: operationOwner.generation,
+      operationFingerprint: operationOwner.requestFingerprint,
+    };
+    invalidateOutputSelection();
+    const request = beginIntentRequest('output', '', payload);
+    const out = await VCS.call('structure_output_select');
+    if (!requestIsCurrent(request, payload) || currentOperationOwner() !== operationOwner) return false;
+    const token = out && (out.output_selection_token || out.output_token || out.token);
+    if (!out || out.cancelled) return false;
+    if (out.error || out.ok === false || typeof token !== 'string' || !token) {
+      setCreateStatus(i18n('structure.hub.output.failed',
+        'Destination selection failed: {error}', {
+          error: (out && out.error) || i18n('structure.hub.output.invalid_token',
+            'server did not return an opaque output token'),
+        }), true);
+      return false;
+    }
+    SourceHubState.outputSelectionToken = token;
+    SourceHubState.outputTokenOwner = {
+      token, operationOwner, generation: request.generation,
+      requestFingerprint: request.fingerprint,
+    };
+    SourceHubState.outputDisplayName = publicText(out.display_name ||
+      (out.selection && out.selection.label) ||
+      i18n('structure.hub.output.selected', 'Destination selected'));
+    const name = $('surface-output-name');
+    const ack = $('surface-candidate-ack');
+    if (name) name.textContent = SourceHubState.outputDisplayName;
+    if (ack) { ack.disabled = false; ack.focus(); }
+    setCreateStatus(i18n('structure.hub.output.ready',
+      'Destination token bound. Check the confirmation box to enable candidate creation.'), false);
+    return true;
+  }
+
+  function syncCandidateCreateButton() {
+    const ack = $('surface-candidate-ack');
+    const create = $('surface-create-candidates');
+    if (create) create.disabled = !(ack && ack.checked && currentOperationOwner() &&
+      currentOutputOwner() && !SourceHubState.created);
+  }
+
+  async function createSurfaceCandidates() {
+    const ack = $('surface-candidate-ack');
+    const operationOwner = currentOperationOwner();
+    const outputOwner = currentOutputOwner();
+    if (!operationOwner || !outputOwner ||
+        !ack || !ack.checked || SourceHubState.created) return false;
+    const payload = {
+      operationToken: operationOwner.token,
+      operationGeneration: operationOwner.generation,
+      operationFingerprint: operationOwner.requestFingerprint,
+      outputToken: outputOwner.token,
+      outputGeneration: outputOwner.generation,
+      outputFingerprint: outputOwner.requestFingerprint,
+    };
+    const request = beginIntentRequest('create', '', payload);
+    const button = $('surface-create-candidates');
+    if (button) button.disabled = true;
+    const out = await VCS.call('surface_create_candidates', SourceHubState.operationToken,
+      SourceHubState.outputSelectionToken);
+    if (!requestIsCurrent(request, payload) || currentOperationOwner() !== operationOwner ||
+        currentOutputOwner() !== outputOwner || !ack.checked) return false;
+    if (!out || out.error || out.ok === false ||
+        (out.scientific_status && out.scientific_status !== 'candidate')) {
+      syncCandidateCreateButton();
+      setCreateStatus(i18n('structure.hub.create.failed',
+        'Candidate creation failed: {error}', {
+          error: (out && out.error) || i18n('structure.hub.create.invalid_status',
+            'server returned a non-candidate scientific status'),
+        }), true);
+      return false;
+    }
+    SourceHubState.created = true;
+    ack.disabled = true;
+    const count = Array.isArray(out.candidate_ids) ? out.candidate_ids.length
+      : (Array.isArray(out.jobs) ? out.jobs.length
+        : (out.created_count == null ? '—' : out.created_count));
+    setCreateStatus(i18n('structure.hub.create.done',
+      'Created {count} candidate job(s). Nothing was submitted; scientific status remains candidate.', {
+        count,
+      }), false);
+    return true;
+  }
+
+  function onSourceResultClick(event) {
+    const button = event.target.closest('[data-source-preview][data-source-token]');
+    if (!button) return;
+    const role = button.dataset.sourcePreview;
+    const token = button.dataset.sourceToken;
+    const owner = SourceHubState.resultOwners[role];
+    if (!owner || owner.role !== role || !owner.tokens.includes(token)) return;
+    previewSource(role, token);
+  }
+
+  function initSourceHub() {
+    if (!$('structure-source-hub')) return;
+    wire('src-bulk-local', () => selectLocalSource('bulk'));
+    wire('src-ads-local', () => selectLocalSource('ads'));
+    wire('src-ads-clear', clearAdsorbateSource);
+    wire('src-bulk-confirm', () => confirmSource('bulk'));
+    wire('src-ads-confirm', () => confirmSource('ads'));
+    wire('source-search', searchSourceGateway);
+    wire('surface-dry-run', runSurfaceDryRun);
+    wire('surface-output-select', selectSurfaceOutput);
+    wire('surface-create-candidates', createSurfaceCandidates);
+    const ack = $('surface-candidate-ack');
+    if (ack) ack.addEventListener('change', () => {
+      invalidateIntentRequest('create', '');
+      syncCandidateCreateButton();
+    });
+    ['source-provider', 'source-query', 'source-target'].forEach(id => {
+      const control = $(id);
+      if (!control) return;
+      const invalidateSearch = () => invalidateIntentRequest('search', '');
+      control.addEventListener('change', invalidateSearch);
+      if (id === 'source-query') control.addEventListener('input', invalidateSearch);
+    });
+    ['bulk', 'ads'].forEach(role => {
+      const box = $(sourceRoleIds(role).results);
+      if (box) box.addEventListener('click', onSourceResultClick);
+    });
+    document.querySelectorAll('#surface-wizard input, #surface-wizard select').forEach(control => {
+      if (control.id === 'surface-candidate-ack') return;
+      control.addEventListener('change', () => {
+        if (SourceHubState.operationToken || requestSlot('dryRun', '')) invalidateDryRun(i18n(
+          'structure.hub.dry.stale', 'Parameters changed; generate a new dry-run.'));
+      });
+    });
+    loadSourceCapabilities();
   }
 
   // ── 初始化 ──
@@ -531,6 +1674,7 @@
       selectAtom(i);
     });
     loadMolecules();
+    initSourceHub();
   }
 
   // 首次进入结构页时初始化(3Dmol 容器需可见才能正确测量)
@@ -539,6 +1683,37 @@
   });
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
+
+  document.addEventListener('vcs:language', () => {
+    renderProviderOptions();
+    ['bulk', 'ads'].forEach(role => {
+      showSourceResults(role, SourceHubState.results[role]);
+      if (SourceHubState.previews[role]) renderSourcePreview(role, SourceHubState.previews[role]);
+    });
+    if (SourceHubState.dryRun) renderDryRun(SourceHubState.dryRun);
+  });
+
+  if (window.__VCS_TEST__) {
+    window.__VCS_STRUCTURE_SOURCE_HUB_TEST__ = {
+      state: SourceHubState,
+      normalizeProviders,
+      showSourceResults,
+      requestFingerprint,
+      topViewGeometry,
+      renderTopView,
+      previewSource,
+      confirmSource,
+      selectLocalSource,
+      searchSourceGateway,
+      clearAdsorbateSource,
+      buildSurfaceRequests,
+      runSurfaceDryRun,
+      selectSurfaceOutput,
+      createSurfaceCandidates,
+      syncCandidateCreateButton,
+      initSourceHub,
+    };
+  }
 
   // 供 molbuild.js(分子建模区)载入 3D 结构 / 取当前状态 / 清空 / 撤回
   window.Editor = {

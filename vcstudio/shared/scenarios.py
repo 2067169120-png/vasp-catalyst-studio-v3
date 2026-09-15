@@ -11,7 +11,9 @@ VASP Catalyst Studio 覆盖锂硫电池、电催化、热催化、体相/电解�
     {
       'key':                 str,   # 唯一标识(英文小写)
       'name':                str,   # 中文显示名
+      'name_en':             str,   # 英文显示名
       'description':          str,   # 一句话说明
+      'description_en':       str,   # 英文一句话说明
       'pages':               [str], # 显示哪些 data-page,顺序即导航序(PAGES 子集)
       'cards':               dict,  # 页内卡片显隐细粒度覆盖表(嵌套 bool;缺省即可见)
       'figure_preset_order': [str], # 图型 key 排序(即可见图型白名单 + 顺序,FIGURE_KEYS 子集)
@@ -34,8 +36,12 @@ from pathlib import Path
 import yaml
 
 # ── 合法取值域(自包含,不 import project/*;由 tests 断言与 advisor/reactions 真实同步) ──
-# 导航页(与 gui_web/assets/index.html 的 data-page 清单一致;顺序为默认导航序)
-PAGES = ('dashboard', 'generate', 'project', 'jobs', 'cluster', 'settings')
+# 导航页(与 gui_web/assets/index.html 的 data-page 清单严格一致;顺序为默认导航序)
+PAGES = (
+    'dashboard', 'structure', 'generate', 'jobs', 'project', 'analysis-workbench',
+    'reference-browser', 'report-workbench', 'wavefunction', 'figures', 'ai',
+    'cluster', 'settings',
+)
 
 # 图型 key(对齐 external/native_charts.py 出图函数:bar=adsorption_bar、table=energy_matrix_table、
 # ladder=free_energy_ladder、heatmap=heatmap_matrix、scaling=scaling_relation、volcano=volcano_plot、
@@ -55,16 +61,33 @@ ADVISOR_RULES = frozenset({
     'VACUUM_TOO_THIN', 'NO_EDIFFG', 'NO_DISPERSION', 'LDIPOL_WITHOUT_DIPOL', 'O2_NUPDOWN',
 })
 
-# 可见计算引擎:vasp 为核心引擎;gaussian 供分子化学场景(前瞻,分子单点/反应能)
-ENGINES = ('vasp', 'gaussian')
+# 可见计算引擎。非 VASP 引擎均为文件级适配，提交时仍须服务器显式配置对应命令。
+ENGINES = ('vasp', 'gaussian', 'cp2k', 'castep')
 
 # 默认计算类型(对齐 index.html gen-calc 下拉:slab/bulk/molecule)
 CALC_TYPES = ('slab', 'bulk', 'molecule')
 
+# 与 generate.task_catalog 同步。放在 shared 层避免场景模块反向依赖生成器。
+TASK_KEYS = (
+    'relax', 'cellopt', 'static', 'adsorption_project', 'spin_scan',
+    'dos_pdos', 'bands', 'bader', 'chgdiff', 'elf',
+    'freq', 'aimd', 'neb', 'dimer', 'eos', 'surface_energy',
+    'workfunction', 'formation_binding', 'vaspsol',
+    'conv_encut', 'conv_kmesh', 'conv_vacuum', 'conv_thickness',
+)
+
+HOME_ACTIONS = (
+    'lis_new', 'import_adsorption_results', 'submit_inputs', 'continue_jobs',
+    'new_structure', 'choose_vasp_task', 'analyze_vasp_result',
+    'build_molecule', 'gaussian_input', 'wavefunction',
+)
+
 # 场景 schema 必备键
 _REQUIRED_KEYS = (
-    'key', 'name', 'description', 'pages', 'cards', 'figure_preset_order',
+    'key', 'name', 'name_en', 'description', 'description_en',
+    'pages', 'cards', 'figure_preset_order',
     'reaction_presets', 'advisor_profile', 'defaults', 'engines', 'ai_context',
+    'primary', 'task_keys', 'home_actions',
 )
 
 DEFAULT_KEY = 'full'          # 兜底默认场景 key
@@ -96,27 +119,52 @@ ALL_RULES = _AllRules(ADVISOR_RULES)
 # full:不预设方向,开放一切——新手与跨方向研究的兜底默认。
 _FULL = {
     'key': 'full',
-    'name': '通用 / 全功能',
-    'description': '不预设研究方向,开放全部页面、图型与方法学告警——新用户与跨方向研究的兜底默认。',
+    'name': '专家模式（全部功能）',
+    'name_en': 'Expert mode (all features)',
+    'description': '开放全部页面、引擎和计算类型，适合熟悉软件或跨方向工作；新手建议选具体模式。',
+    'description_en': (
+        'Opens every page, engine, and calculation type for experienced or '
+        'cross-domain work; newcomers should choose a focused workflow.'),
+    'primary': True,
     'pages': list(PAGES),
     'cards': {},                                   # 无任何隐藏
     'figure_preset_order': list(FIGURE_KEYS),      # 全部图型,默认顺序
     'reaction_presets': list(REACTION_PRESETS),    # 全部反应预设
     'advisor_profile': 'all',
-    'defaults': {'calc_type': 'slab', 'precision': 'standard'},
-    'engines': ['vasp'],
+    'defaults': {'calc_type': 'slab', 'precision': 'standard',
+                 'landing_page': 'dashboard', 'engine': 'vasp',
+                 'analysis_type': 'adsorption', 'structure_source': 'periodic',
+                 'active_calculation': 'relax'},
+    'engines': list(ENGINES),
+    'task_keys': list(TASK_KEYS),
+    'home_actions': ['new_structure', 'choose_vasp_task', 'submit_inputs',
+                     'analyze_vasp_result'],
     'ai_context': '通用 VASP 催化 / 材料计算,无特定领域先验。',
 }
 
 # lis:锂硫电池正极催化全流程——本软件的起家方向,全功能 + Li–S 反应组置顶、台阶图前置。
 _LIS = {
     'key': 'lis',
-    'name': '锂硫电池(Li–S)',
+    'name': 'Li–S 吸附能全流程',
+    'name_en': 'Li–S adsorption-energy workflow',
     'description': (
         '锂硫正极催化全流程:清洁表面 + 多硫化物构型族 + 气相参考,'
         'Li–S 放电台阶图与 SAC 批量筛选一应俱全。'),
-    'pages': list(PAGES),
-    'cards': {},                                   # Li–S 用到全部功能,不隐藏
+    'description_en': (
+        'End-to-end Li–S cathode-catalysis workflow with clean surfaces, '
+        'polysulfide configuration families, gas-phase references, discharge '
+        'free-energy ladders, and SAC batch screening.'),
+    'primary': True,
+    'pages': ['dashboard', 'structure', 'jobs', 'project', 'analysis-workbench',
+              'reference-browser',
+              'report-workbench', 'figures',
+              'cluster', 'settings'],
+    'cards': {
+        'project': {'adsorption': True, 'task_analysis': False,
+                    'spin': False, 'figures': True, 'draft': True},
+        'structure': {'molecular': True, 'editor': True, 'molecule_library': True,
+                      'metal_slab': True, 'sac_matrix': True, 'spin_scan': True},
+    },
     # 台阶图(ladder)是 Li–S 的核心产出,火山图次之,故置前
     'figure_preset_order': ['ladder', 'volcano', 'bar', 'table',
                             'heatmap', 'scaling', 'pdos', 'charge_profile'],
@@ -124,29 +172,91 @@ _LIS = {
     'reaction_presets': ['LIS_16E', 'LIS_ASSOC_LIS', 'LIS_ASSOC_LIS2', 'LIS_DISSOC',
                          'ORR_4E', 'OER_4E', 'HER', 'CO2RR_TO_CO'],
     'advisor_profile': 'all',
-    'defaults': {'calc_type': 'slab', 'precision': 'standard'},
+    'defaults': {'calc_type': 'slab', 'precision': 'standard',
+                 'landing_page': 'project', 'engine': 'vasp',
+                 'analysis_type': 'adsorption', 'structure_source': 'periodic',
+                 'active_calculation': 'adsorption_project'},
     'engines': ['vasp'],
+    'task_keys': ['relax', 'static', 'adsorption_project', 'spin_scan',
+                  'dos_pdos', 'bader', 'chgdiff', 'elf', 'freq', 'aimd',
+                  'neb', 'workfunction', 'formation_binding', 'vaspsol',
+                  'conv_encut', 'conv_kmesh', 'conv_vacuum', 'conv_thickness'],
+    'home_actions': ['import_adsorption_results', 'lis_new', 'submit_inputs',
+                     'continue_jobs'],
     'ai_context': (
         '锂硫电池正极单原子催化剂对多硫化物(LiPS)的吸附与转化,参比电对 Li/Li⁺,'
         '关注穿梭效应抑制与放电台阶自由能。'),
+}
+
+# vasp:不预设研究反应，只展示周期性 VASP 从输入、提交到任务分析所需页面。
+_VASP = {
+    'key': 'vasp',
+    'name': '通用 VASP 计算',
+    'name_en': 'General VASP calculations',
+    'description': '从 23 类 VASP 任务中选择本次计算，只展示建模、输入、提交和对应结果工具。',
+    'description_en': (
+        'Choose from 23 VASP tasks and show only the required modeling, input, '
+        'submission, and result tools.'),
+    'primary': True,
+    'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project', 'analysis-workbench',
+              'reference-browser',
+              'report-workbench', 'figures', 'cluster', 'settings'],
+    'cards': {
+        'structure': {'molecular': False},
+        'generate': {'task_catalog': True, 'neb': True, 'vasp_inputs': True,
+                     'preview': True, 'engine_adapter': False},
+        # 专用面板仍由 active_calculation 二次裁剪；这里必须允许用户在
+        # “通用 VASP”模式选择 adsorption_project 后真正进入吸附能流程。
+        'project': {'adsorption': True, 'task_analysis': True,
+                    'spin': True, 'figures': True, 'draft': True},
+    },
+    'figure_preset_order': list(FIGURE_KEYS),
+    'reaction_presets': list(REACTION_PRESETS),
+    'advisor_profile': 'all',
+    'defaults': {'calc_type': 'bulk', 'precision': 'standard',
+                 'landing_page': 'generate', 'engine': 'vasp',
+                 'analysis_type': 'taskana', 'structure_source': 'periodic',
+                 'active_calculation': 'relax'},
+    'engines': ['vasp'],
+    'task_keys': list(TASK_KEYS),
+    'home_actions': ['choose_vasp_task', 'new_structure', 'submit_inputs',
+                     'analyze_vasp_result'],
+    'ai_context': '通用周期性 VASP 计算，按任务类型执行前置检查、提交、回收和结果分析。',
 }
 
 # electrocat:水系电催化——火山图前置、CHE 反应组(ORR/HER/OER/CO₂RR)置顶,不含 Li–S。
 _ELECTROCAT = {
     'key': 'electrocat',
     'name': '电催化(ORR / HER / OER / CO₂RR)',
+    'name_en': 'Electrocatalysis (ORR / HER / OER / CO₂RR)',
     'description': (
         '水系电催化:CHE 计算氢电极台阶图与 Sabatier 火山图前置,'
         'ORR / HER / OER / CO₂RR 反应组默认置顶。'),
-    'pages': list(PAGES),
+    'description_en': (
+        'Aqueous electrocatalysis with CHE free-energy ladders and Sabatier '
+        'volcano plots prioritized, followed by ORR, HER, OER, and CO₂RR '
+        'reaction presets.'),
+    'primary': False,
+    'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project', 'analysis-workbench',
+              'reference-browser',
+              'report-workbench', 'figures', 'cluster', 'settings'],
     'cards': {},
     # 火山图(Sabatier 峰顶)是电催化筛选的招牌图,置最前;标度关系次之
     'figure_preset_order': ['volcano', 'ladder', 'scaling', 'heatmap',
                             'bar', 'table', 'pdos', 'charge_profile'],
     'reaction_presets': ['ORR_4E', 'HER', 'OER_4E', 'CO2RR_TO_CO'],   # 电化学四组,排除 Li–S
     'advisor_profile': 'all',
-    'defaults': {'calc_type': 'slab', 'precision': 'standard'},
+    'defaults': {'calc_type': 'slab', 'precision': 'standard',
+                 'landing_page': 'generate', 'engine': 'vasp',
+                 'analysis_type': 'taskana', 'structure_source': 'periodic',
+                 'active_calculation': 'adsorption_project'},
     'engines': ['vasp'],
+    'task_keys': ['relax', 'static', 'adsorption_project', 'spin_scan',
+                  'dos_pdos', 'bader', 'chgdiff', 'elf', 'freq', 'aimd', 'neb',
+                  'workfunction', 'formation_binding', 'vaspsol',
+                  'conv_encut', 'conv_kmesh', 'conv_vacuum', 'conv_thickness'],
+    'home_actions': ['new_structure', 'choose_vasp_task', 'submit_inputs',
+                     'analyze_vasp_result'],
     'ai_context': (
         '水相电催化(ORR / HER / OER / CO₂RR),RHE 氢标 + 计算氢电极(CHE),'
         '关注极限电位 U_L、过电位 η 与标度关系。'),
@@ -156,10 +266,18 @@ _ELECTROCAT = {
 _THERMOCAT = {
     'key': 'thermocat',
     'name': '热催化(表面反应)',
+    'name_en': 'Thermocatalysis (surface reactions)',
     'description': (
         '气固热催化表面反应:NEB 过渡态与频率(ZPE / 热校正)前置,'
         '电位类图型(火山图 / 台阶图)后置。'),
-    'pages': list(PAGES),
+    'description_en': (
+        'Gas–solid thermocatalytic surface reactions with NEB transition '
+        'states and frequency-based ZPE/thermal corrections prioritized; '
+        'potential-dependent plots are de-emphasized.'),
+    'primary': False,
+    'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project', 'analysis-workbench',
+              'reference-browser',
+              'report-workbench', 'figures', 'cluster', 'settings'],
     # 热催化非电化学:隐藏项目页的反应(台阶图)预设卡片
     'cards': {'project': {'reactions': False}},
     # 能量学/热图/标度前置,电位类(台阶图、火山图)后置
@@ -167,8 +285,18 @@ _THERMOCAT = {
                             'pdos', 'charge_profile', 'ladder', 'volcano'],
     'reaction_presets': [],                        # 无外加电位,不默认任何电化学反应组
     'advisor_profile': 'all',                      # 仍是 slab 吸附,全部方法学告警适用
-    'defaults': {'calc_type': 'slab', 'precision': 'standard'},
+    'defaults': {'calc_type': 'slab', 'precision': 'standard',
+                 'landing_page': 'generate', 'engine': 'vasp',
+                 'analysis_type': 'taskana', 'structure_source': 'periodic',
+                 'active_calculation': 'neb'},
     'engines': ['vasp'],
+    'task_keys': ['relax', 'static', 'adsorption_project', 'spin_scan',
+                  'dos_pdos', 'bader', 'chgdiff', 'elf', 'freq', 'aimd',
+                  'neb', 'dimer', 'surface_energy', 'workfunction',
+                  'formation_binding', 'conv_encut', 'conv_kmesh',
+                  'conv_vacuum', 'conv_thickness'],
+    'home_actions': ['new_structure', 'choose_vasp_task', 'submit_inputs',
+                     'analyze_vasp_result'],
     'ai_context': (
         '气固多相热催化表面基元反应,关注吸附能、过渡态(NEB)与反应能垒,'
         '频率计算给 ZPE 与吉布斯热校正,无外加电位。'),
@@ -178,14 +306,23 @@ _THERMOCAT = {
 _BATTERY_BULK = {
     'key': 'battery_bulk',
     'name': '电池体相 / 电解液',
+    'name_en': 'Battery bulk phases / electrolytes',
     'description': (
         '电极体相与电解液:以 bulk 与分子为主,吸附 / 表面卡片弱化,'
         '方法学告警按体相口径裁剪(无真空 / 偶极项)。'),
-    'pages': list(PAGES),
+    'description_en': (
+        'Bulk-electrode and electrolyte workflows centered on periodic solids '
+        'and molecules, with adsorption/surface tools de-emphasized and '
+        'method checks tailored to calculations without vacuum or dipole terms.'),
+    'primary': False,
+    'pages': ['dashboard', 'structure', 'generate', 'jobs', 'project', 'analysis-workbench',
+              'reference-browser',
+              'report-workbench', 'figures', 'cluster', 'settings'],
     # 吸附卡片弱化:隐藏 SAC 表面批量建模;隐藏火山图/标度(吸附质筛选专用)
     'cards': {
-        'generate': {'sac_matrix': False},
-        'project': {'figures': {'volcano': False, 'scaling': False}},
+        'structure': {'sac_matrix': False, 'metal_slab': False},
+        'project': {'adsorption': False, 'task_analysis': True,
+                    'figures': {'volcano': False, 'scaling': False}},
     },
     # 体相/电解液:态密度(pdos)、电荷密度剖面(charge_profile)、台阶图靠前;去掉火山图/标度
     'figure_preset_order': ['pdos', 'charge_profile', 'ladder', 'bar', 'table', 'heatmap'],
@@ -193,8 +330,16 @@ _BATTERY_BULK = {
     # 体相无真空层/表面偶极:剔除 slab/偶极/四面体弛豫等 slab 专属规则
     'advisor_profile': ['ENCUT_UNIFY', 'NO_EDIFFG', 'NO_DISPERSION',
                         'GAS_REF_SMEARING', 'GAS_REF_OPEN_SHELL_SPIN'],
-    'defaults': {'calc_type': 'bulk', 'precision': 'standard'},
+    'defaults': {'calc_type': 'bulk', 'precision': 'standard',
+                 'landing_page': 'generate', 'engine': 'vasp',
+                 'analysis_type': 'taskana', 'structure_source': 'periodic',
+                 'active_calculation': 'cellopt'},
     'engines': ['vasp'],
+    'task_keys': ['relax', 'cellopt', 'static', 'spin_scan', 'dos_pdos',
+                  'bands', 'bader', 'elf', 'freq', 'aimd', 'eos',
+                  'formation_binding', 'conv_encut', 'conv_kmesh'],
+    'home_actions': ['choose_vasp_task', 'new_structure', 'submit_inputs',
+                     'analyze_vasp_result'],
     'ai_context': (
         '锂电池电极体相结构与电解液分子,关注体相能量学、脱嵌电位与电解液分解,'
         '一般不含真空层与表面偶极。'),
@@ -204,21 +349,42 @@ _BATTERY_BULK = {
 _MOLECULAR = {
     'key': 'molecular',
     'name': '分子化学',
+    'name_en': 'Molecular chemistry',
     'description': (
         '分子体系(团簇 / 自由基 / 反应能):可见 Gaussian 引擎,'
         '隐藏周期性(slab / 真空)相关卡片,以分子单点与反应能为主。'),
+    'description_en': (
+        'Molecular systems (clusters, radicals, and reaction energies) with '
+        'the Gaussian engine available, periodic slab/vacuum tools hidden, and '
+        'molecular single-point and reaction-energy work prioritized.'),
+    'primary': True,
     # 分子化学不走"吸附能项目"(表面 slab 工作流),隐藏该页
-    'pages': ['dashboard', 'generate', 'jobs', 'cluster', 'settings'],
+    'pages': ['dashboard', 'structure', 'generate', 'jobs', 'analysis-workbench', 'wavefunction',
+              'figures', 'cluster', 'settings'],
     # SAC 批量建模是周期 slab 建模,隐藏;多自旋家族对自由基仍有用,保留
-    'cards': {'generate': {'sac_matrix': False}},
+    'cards': {'structure': {'molecular': True, 'metal_slab': False,
+                            'sac_matrix': False},
+              # 分子模式默认走 Gaussian 专属表单；不并排展示 VASP 23 类目录和
+              # 四件套，避免用户误以为两个任务下拉会同时生效。
+              'generate': {'task_catalog': False, 'neb': False,
+                           'vasp_inputs': False, 'preview': False,
+                           'engine_adapter': True}},
     # 分子:反应能台阶图 + 能量柱状;无火山图/热图/标度/态密度
     'figure_preset_order': ['ladder', 'bar', 'table'],
     'reaction_presets': [],                        # 分子化学默认不走 CHE 电化学反应组
     # 气相/分子相关规则,剔除 slab/偶极规则
     'advisor_profile': ['ENCUT_UNIFY', 'GAS_REF_SMEARING', 'GAS_REF_OPEN_SHELL_SPIN',
                         'GAS_BOX_TOO_SMALL', 'NO_DISPERSION', 'NSW_ZERO', 'NO_EDIFFG'],
-    'defaults': {'calc_type': 'molecule', 'precision': 'standard'},
+    'defaults': {'calc_type': 'molecule', 'precision': 'standard',
+                 'landing_page': 'structure', 'engine': 'gaussian',
+                 'analysis_type': 'taskana', 'structure_source': 'molecular',
+                 'active_calculation': 'relax'},
     'engines': ['vasp', 'gaussian'],               # Gaussian 引擎可见
+    # 设置页的三种通用意图会同步到 Gaussian opt/sp/freq；其余 Gaussian
+    # 专项（TD/IRC/扫描/NMR 等）继续在专属面板内选择。
+    'task_keys': ['relax', 'static', 'freq'],
+    'home_actions': ['build_molecule', 'gaussian_input', 'submit_inputs',
+                     'wavefunction'],
     'ai_context': (
         '孤立分子 / 团簇 / 自由基化学,关注构型、反应能与前线轨道;'
         '开壳层体系需 ISPIN=2 与大盒真空,可选 Gaussian 引擎。'),
@@ -227,7 +393,8 @@ _MOLECULAR = {
 # 注册表(顺序即场景选择器展示序:通用兜底在前,5 个方向在后)
 _BUILTIN = {
     s['key']: s for s in (
-        _FULL, _LIS, _ELECTROCAT, _THERMOCAT, _BATTERY_BULK, _MOLECULAR,
+        _LIS, _VASP, _MOLECULAR, _FULL,
+        _ELECTROCAT, _THERMOCAT, _BATTERY_BULK,
     )
 }
 
@@ -374,6 +541,12 @@ def validate_scenario(scenario) -> list:
         if k not in scenario:
             issues.append(f'缺少必备键 {k!r}')
 
+    for field in ('key', 'name', 'name_en', 'description', 'description_en'):
+        if field in scenario and (
+                not isinstance(scenario.get(field), str)
+                or not scenario.get(field).strip()):
+            issues.append(f'{field} 必须是非空字符串')
+
     for page in scenario.get('pages') or []:
         if page not in PAGES:
             issues.append(f'未知页面 {page!r}(可选:{", ".join(PAGES)})')
@@ -391,6 +564,16 @@ def validate_scenario(scenario) -> list:
     for eng in scenario.get('engines') or []:
         if eng not in ENGINES:
             issues.append(f'未知引擎 {eng!r}(可选:{", ".join(ENGINES)})')
+
+    if 'primary' in scenario and not isinstance(scenario.get('primary'), bool):
+        issues.append('primary 必须是 bool')
+
+    for task in scenario.get('task_keys') or []:
+        if task not in TASK_KEYS:
+            issues.append(f'未知计算任务 {task!r}')
+    for action in scenario.get('home_actions') or []:
+        if action not in HOME_ACTIONS:
+            issues.append(f'未知首页操作 {action!r}')
 
     prof = scenario.get('advisor_profile')
     if prof != 'all':
@@ -412,6 +595,15 @@ def validate_scenario(scenario) -> list:
             ct = defaults.get('calc_type')
             if ct is not None and ct not in CALC_TYPES:
                 issues.append(f'defaults.calc_type {ct!r} 非法(可选:{", ".join(CALC_TYPES)})')
+            landing = defaults.get('landing_page')
+            if landing is not None and landing not in (scenario.get('pages') or []):
+                issues.append(f'defaults.landing_page {landing!r} 不在本模式 pages 中')
+            engine = defaults.get('engine')
+            if engine is not None and engine not in (scenario.get('engines') or []):
+                issues.append(f'defaults.engine {engine!r} 不在本模式 engines 中')
+            active = defaults.get('active_calculation')
+            if active is not None and active not in (scenario.get('task_keys') or []):
+                issues.append(f'defaults.active_calculation {active!r} 不在本模式 task_keys 中')
 
     return issues
 

@@ -1,5 +1,5 @@
 """campaign.derive 测试:纯函数派生就绪/阶段/进度(永不落盘)。"""
-from vcstudio.campaign import derive, schema, states
+from vcstudio.campaign import derive, gates, schema, states
 
 
 def _campaign_with(rungs):
@@ -79,11 +79,22 @@ def test_derive_accepts_composite_and_list():
 def test_stage_matches_state_machine_end_to_end(tmp_path):
     """经真实三态推进后,stage 从 提交 → 分析 → 报告。"""
     camp = schema.init_campaign(str(tmp_path), 'demo',
-                                tasks=[schema.new_task('a', 'relax')])
+                                tasks=[schema.new_task('a', 'relax', fingerprint_hash='fp')],
+                                fingerprint_hash='fp')
     assert derive.campaign_stage(camp) == '提交'
     t = camp['tasks'][0]
     states.mark_completed(t)
+    schema.persist_task(camp['dir'], t, expected_revision=0)
     states.promote_validated(t, [{'name': 'x', 'ok': True}])
+    schema.persist_task(camp['dir'], t, expected_revision=1)
     assert derive.campaign_stage(camp) == '分析'
-    states.promote_accepted(t, {'gate': 'accept_gate', 'status': 'pass'})
+    decision = gates.accept_gate({
+        'campaign_dir': camp['dir'], 'campaign_id': 'demo', 'task_id': 'a',
+        'task_revision': t['revision'],
+        'input_fingerprints': gates.task_input_fingerprints(t, camp['meta']),
+        'task_fingerprint_hash': 'fp', 'campaign_fingerprint_hash': 'fp',
+        'required_checks': [{'name': 'x', 'ok': True}], 'energy_eV': -1.0,
+        'actor': 'checker',
+    })
+    states.promote_accepted(t, decision, campaign_dir=camp['dir'])
     assert derive.campaign_stage(camp) == '报告'

@@ -5,22 +5,23 @@ from vcstudio.cluster.diagnose import classify
 
 # ── 收敛 + 物理合理性闸 ──
 def test_converged_sane_energy_is_done():
-    d = classify(converged=True, energy=-435.6, outcar_size=120000, oszicar_size=4000)
+    d = classify(converged=True, clean_exit=True, energy=-435.6,
+                 outcar_size=120000, oszicar_size=4000)
     assert d.failure_class == dg.CONVERGED and d.state == 'DONE' and not d.restartable
 
 
 def test_converged_but_energy_missing_is_bad_energy():
-    d = classify(converged=True, energy=None, outcar_size=120000)
+    d = classify(converged=True, clean_exit=True, energy=None, outcar_size=120000)
     assert d.failure_class == dg.BAD_ENERGY and d.state == 'NEEDS_HUMAN'
 
 
 def test_converged_but_positive_energy_is_bad_energy():
-    d = classify(converged=True, energy=3.2, outcar_size=120000)
+    d = classify(converged=True, clean_exit=True, energy=3.2, outcar_size=120000)
     assert d.failure_class == dg.BAD_ENERGY and d.state == 'NEEDS_HUMAN'
 
 
 def test_converged_but_absurd_magnitude_is_bad_energy():
-    d = classify(converged=True, energy=-50000.0, outcar_size=120000)
+    d = classify(converged=True, clean_exit=True, energy=-50000.0, outcar_size=120000)
     assert d.failure_class == dg.BAD_ENERGY
 
 
@@ -130,7 +131,7 @@ def test_scan_log_oom_text_evidence():
 def test_energy_zero_is_implausible():
     """E0 恰为 0.0 只能是解析垃圾(真实束缚体系总能恒负)→ 不可信。"""
     assert dg.energy_implausible(0.0)
-    d = classify(converged=True, energy=0.0, outcar_size=90000)
+    d = classify(converged=True, clean_exit=True, energy=0.0, outcar_size=90000)
     assert d.failure_class == dg.BAD_ENERGY
 
 
@@ -154,7 +155,7 @@ def test_classify_zbrent_still_restartable_over_error_table():
 
 def test_converged_ignores_benign_error_text_in_log():
     """收敛成功的作业即便日志里有可自恢复告警,也不被误判(收敛短路在前)。"""
-    d = classify(converged=True, energy=-100.0,
+    d = classify(converged=True, clean_exit=True, energy=-100.0,
                  log_tail='WARNING: Sub-Space-Matrix is not hermitian in DAV\n')
     assert d.failure_class == dg.CONVERGED and d.state == 'DONE'
 
@@ -193,7 +194,7 @@ def test_disk_full_is_needs_human_not_restartable():
 
 def test_disk_full_not_flagged_when_converged():
     """已收敛+能量合理:计算其实已完成,末尾写盘噪声不改判(收敛短路在前)。"""
-    d = classify(converged=True, energy=-123.4, outcar_size=90000,
+    d = classify(converged=True, clean_exit=True, energy=-123.4, outcar_size=90000,
                  log_tail='No space left on device\n')
     assert d.failure_class == dg.CONVERGED and d.state == 'DONE'
 
@@ -214,10 +215,14 @@ def test_has_output_not_converged_is_nonconverged_restartable():
 
 # ── SCF 震荡(原版 healer/lis_sac_status 生产口径移植) ──
 def _oszicar_block(n_iters, last_de):
-    lines = ['   1 F= -.38712683E+03 E0= -.38712683E+03  d E =-.387127E+03']
+    # Real OSZICAR order: electronic DAV/RMM iterations first, then the ionic
+    # ``F= ... E0= ...`` summary.  Keeping the fixture realistic protects the
+    # VASP5 NELM false-positive guard from silently parsing an empty block.
+    lines = []
     for i in range(1, n_iters + 1):
         de = last_de if i == n_iters else '-0.5E+00'
         lines.append(f'DAV:  {i}    -0.385031793E+03   {de}   -0.129E+02  4696   0.1E+00')
+    lines.append('   1 F= -.38712683E+03 E0= -.38712683E+03  d E =-.387127E+03')
     return '\n'.join(lines) + '\n'
 
 
@@ -242,9 +247,10 @@ def test_sloshing_scans_all_blocks_worst_wins():
     """原版标定经验:扫尾部全部块取最坏块——历史块震荡、末块刚起步也要报
     (只看末块会在新离子步起步时漏判)。"""
     bad = _oszicar_block(85, '0.8E-01')
-    new_step_started = bad + '   2 F= -.38800000E+03 E0= -.38800000E+03  d E =-.87E+00\n' \
+    new_step_started = bad \
         + 'DAV:   1    -0.388E+03   -0.5E+00   -0.1E+02  4696   0.1E+00\n' \
-        + 'DAV:   2    -0.388E+03   -0.1E-03   -0.1E+02  4696   0.1E-02\n'
+        + 'DAV:   2    -0.388E+03   -0.1E-03   -0.1E+02  4696   0.1E-02\n' \
+        + '   2 F= -.38800000E+03 E0= -.38800000E+03  d E =-.87E+00\n'
     assert dg.scan_oszicar_sloshing(new_step_started) is not None
     # 原版 EDDAV 等算法前缀同样被识别
     eddav = '\n'.join(f'EDDAV:  {i}   -0.38E+03   0.5E-01   x  x  x' for i in range(1, 86))
@@ -262,13 +268,29 @@ def test_vasp5_nelm_trap_converged_flag_is_false_positive():
     """VASP5 陷阱:NELM 耗尽同样打印 EDIFF-reached——收敛标志+末块打满 NELM → 不可信。"""
     tail = _oszicar_block(60, '0.5E-01')            # 60 步(默认 NELM)打满
     assert dg.nelm_saturated(tail, 60)
-    d = classify(converged=True, energy=-100.0, oszicar_tail=tail, nelm=60,
+    d = classify(converged=True, clean_exit=True, energy=-100.0, oszicar_tail=tail, nelm=60,
                  outcar_size=90000)
     assert d.failure_class == dg.SCF_SLOSHING and d.state == 'NEEDS_HUMAN'
     # 真收敛(末块 12 步远未打满)不受影响
-    ok = classify(converged=True, energy=-100.0, oszicar_tail=_oszicar_block(12, '0.1E-04'),
+    ok = classify(converged=True, clean_exit=True, energy=-100.0,
+                  oszicar_tail=_oszicar_block(12, '0.1E-04'),
                   nelm=60, outcar_size=90000)
     assert ok.failure_class == dg.CONVERGED
+
+
+def test_convergence_marker_without_clean_footer_needs_human_not_restartable():
+    """旧 OUTCAR 收敛串或截断输出不得 DONE，也不得被自动续算。"""
+    d = classify(converged=True, clean_exit=False, energy=-100.0,
+                 outcar_size=90000, oszicar_size=3000)
+    assert d.failure_class == dg.UNKNOWN and d.state == 'NEEDS_HUMAN'
+    assert d.restartable is False and 'timing 页脚' in d.evidence
+
+
+def test_convergence_marker_with_nonzero_exit_is_never_done():
+    d = classify(converged=True, clean_exit=True, exit_code=1, energy=-100.0,
+                 outcar_size=90000, oszicar_size=3000)
+    assert d.failure_class == dg.UNKNOWN and d.state == 'NEEDS_HUMAN'
+    assert d.restartable is False and '非零' in d.evidence
 
 
 def test_clean_exit_refines_nonconverged_evidence():

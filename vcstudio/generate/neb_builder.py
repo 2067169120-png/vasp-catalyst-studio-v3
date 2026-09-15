@@ -91,7 +91,7 @@ def _read_sd_flags(lines: list, natoms: int):
 def _endpoint(text: str) -> dict:
     """解析一个端点 POSCAR → 物种/计数/晶格/分数坐标/SD 标志/头部行。
 
-    复用 parse_positions(笛卡尔坐标 + 晶格,已处理 Direct/Cartesian/负缩放拒绝),
+    复用 parse_positions(笛卡尔坐标 + 晶格，已处理 Direct/Cartesian/完整缩放语义),
     再转分数坐标。VASP4/畸形 → ValueError(冒泡)。
     """
     syms, counts = parse_poscar_species(text)
@@ -340,7 +340,8 @@ _README = """NEB 作业目录(vcstudio 生成)
 def build_neb_dir(out_dir, poscar_ini: str, poscar_fin: str, incar_text: str, *,
                   n_images: int = DEFAULT_N_IMAGES, climbing: bool = True,
                   spring: float = DEFAULT_SPRING, kpoints=None,
-                  potcar_fn=None) -> dict:
+                  potcar_fn=None, execution_environment: dict | None = None,
+                  method_recipe: dict | None = None) -> dict:
     """生成标准 VASP NEB 目录树 + 根 INCAR/POTCAR/KPOINTS + job.yaml。
 
     布局:``00/POSCAR``(初)、``01..N/POSCAR``(插值)、``(N+1)/POSCAR``(末),根目录
@@ -359,6 +360,10 @@ def build_neb_dir(out_dir, poscar_ini: str, poscar_fin: str, incar_text: str, *,
     Returns:
         ``{'job_dir','n_images','warnings'}``。端点不一致/插值重叠 → ValueError(冒泡)。
     """
+    if execution_environment is not None:
+        raise ValueError(
+            'execution_environment 只能由服务端在选定可核验集群 profile '
+            '后绑定；builder 不接受计划运行环境')
     out_dir = Path(out_dir)
     # 插值(顺带完成端点一致性 + 重叠校验,失败在此冒泡)
     images = interpolate_images(poscar_ini, poscar_fin, n_images)
@@ -398,6 +403,7 @@ def build_neb_dir(out_dir, poscar_ini: str, poscar_fin: str, incar_text: str, *,
 
     # job.yaml(task_type='neb';记 n_images/climbing/两端来源哈希 溯源)
     inputs = {
+        'engine': 'vasp',
         'n_images': n_images,
         'climbing': bool(climbing),
         'spring': spring,
@@ -407,10 +413,33 @@ def build_neb_dir(out_dir, poscar_ini: str, poscar_fin: str, incar_text: str, *,
         'poscar_fin_sha256': _sha256_text(poscar_fin),
         'incar_source': 'user+neb_completion' if completion_block else 'user_verbatim',
     }
+    inputs['sha256'] = {
+        name: manifest_mod.sha256_file(out_dir / name)
+        for name in ('INCAR', 'KPOINTS', 'POTCAR')
+        if (out_dir / name).is_file()
+    }
+    inputs['image_poscar_sha256'] = {
+        _frame_name(i): manifest_mod.sha256_file(
+            out_dir / _frame_name(i) / 'POSCAR')
+        for i in range(len(frames_text))
+    }
+    from vcstudio.generate.method_recipe import builder_recipe, validate_method_recipe
+    inputs['method_recipe'] = (
+        validate_method_recipe(method_recipe) if method_recipe is not None else
+        builder_recipe(
+            builder='vcstudio.generate.neb_builder/v1', task_type='neb',
+            calc_type='slab', validate=True,
+            completions={
+                'IMAGES': n_images, 'SPRING': spring, 'LCLIMB': bool(climbing)},
+            kpoints_source=('explicit' if kpoints is not None else 'recommended'),
+            extra={'n_images': n_images, 'climbing': bool(climbing), 'spring': spring},
+        ))
     system = ini_ep['header'][0].strip() or out_dir.name
     m = manifest_mod.new_manifest(
         job_id=f'{out_dir.resolve().name}-neb', system=system, task_type='neb',
         calc_type='slab', inputs=inputs, warnings=warnings)
+    from vcstudio.shared.scientific_inputs import record_input_closure
+    record_input_closure(out_dir, m)
     manifest_mod.save_manifest(out_dir, m)
 
     return {'job_dir': str(out_dir), 'n_images': n_images, 'warnings': warnings}

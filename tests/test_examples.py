@@ -12,8 +12,9 @@ EX = os.path.join(ROOT, 'examples', 'quickstart')
 def test_demo_potcar_lib_script_builds_fake_library(tmp_path):
     lib = tmp_path / 'demo_lib'
     r = subprocess.run(
-        [sys.executable, os.path.join(ROOT, 'examples', 'make_demo_potcar_lib.py'),
-         str(lib)], capture_output=True, text=True)
+        [sys.executable, '-X', 'utf8',
+         os.path.join(ROOT, 'examples', 'make_demo_potcar_lib.py'),
+         str(lib)], capture_output=True, text=True, encoding='utf-8')
     assert r.returncode == 0, r.stderr
     text = (lib / 'C' / 'POTCAR').read_text(encoding='utf-8')
     assert 'fake PAW_PBE C' in text and 'ENMAX' in text
@@ -22,7 +23,8 @@ def test_demo_potcar_lib_script_builds_fake_library(tmp_path):
 def test_quickstart_example_generates_four_files(tmp_path):
     lib = tmp_path / 'demo_lib'
     subprocess.run(
-        [sys.executable, os.path.join(ROOT, 'examples', 'make_demo_potcar_lib.py'),
+        [sys.executable, '-X', 'utf8',
+         os.path.join(ROOT, 'examples', 'make_demo_potcar_lib.py'),
          str(lib)], check=True)
     out = tmp_path / 'job'
     res = build_job_dir(os.path.join(EX, 'POSCAR'), os.path.join(EX, 'INCAR'),

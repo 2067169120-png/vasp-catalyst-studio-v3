@@ -47,16 +47,20 @@ def _message_box(text: str) -> None:
 
 
 def main() -> int:
+    api = None
     try:
         import webview
 
         from vcstudio.gui_web import resources
-        from vcstudio.gui_web.api import Api
+        from vcstudio.gui_web.composition import create_api
 
-        api = Api()
+        api = create_api()
         webview.create_window(
             'VASP Catalyst Studio', resources.index_html(), js_api=api,
             width=1180, height=800, min_size=(960, 640))
+        service = api.start_background_services()
+        if not service.get('ok'):
+            raise RuntimeError('自动托管后台服务启动失败：' + str(service.get('error') or '未知错误'))
         webview.start()  # 默认 EdgeChromium(WebView2)
         return 0
     except Exception as e:                                # noqa: BLE001
@@ -68,6 +72,12 @@ def main() -> int:
                     'Evergreen 运行时后重试)。')
         _message_box(f'程序未能启动:{s}{hint}\n\n详细日志:{log}')
         return 1
+    finally:
+        if api is not None:
+            try:
+                api.stop_background_services()
+            except Exception:                             # noqa: BLE001
+                pass
 
 
 if __name__ == '__main__':

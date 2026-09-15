@@ -128,13 +128,23 @@ def build_cellopt_job(src_dir, out_dir, *, bump_encut: bool = False,
     syms, _counts = parse_poscar_species(poscar_text)
     system = poscar_text.splitlines()[0].strip() if poscar_text.strip() else Path(out_dir).name
     parent = str(Path(src_dir).resolve())
+    from vcstudio.generate.method_recipe import builder_recipe
+    inputs = {
+        'engine': 'vasp', 'parent_job': parent, 'derived_from': source_name,
+        'isif': 3, 'bump_encut': bool(bump_encut),
+        'incar_changes': changes, 'elements': list(syms),
+        'method_recipe': builder_recipe(
+            builder='vcstudio.generate.cell_opt/v1', task_type='cellopt',
+            calc_type='bulk', validate=True,
+            completions={'incar_changes': changes}, kpoints_source='parent-copy',
+            extra={'bump_encut': bool(bump_encut),
+                   'encut_scale': float(encut_scale)}),
+    }
     m = manifest_mod.new_manifest(
         job_id=f'{Path(out_dir).name}-cellopt', system=system, task_type='cellopt',
-        calc_type='bulk',
-        inputs={'parent_job': parent, 'derived_from': source_name,
-                'isif': 3, 'bump_encut': bool(bump_encut),
-                'incar_changes': changes, 'elements': list(syms)},
-        warnings=warnings)
+        calc_type='bulk', inputs=inputs, warnings=warnings)
     m['parent_job'] = parent
+    from vcstudio.shared.scientific_inputs import record_input_closure
+    record_input_closure(out_dir, m)
     manifest_mod.save_manifest(out_dir, m)
     return {'out_dir': str(out_dir), 'changes': changes, 'warnings': warnings}

@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 from pathlib import Path
@@ -46,31 +47,291 @@ def _frame_dirs(job_dir) -> list:
     return sorted(names, key=lambda s: int(s))
 
 
-def _frame_energy(frame_dir) -> float | None:
-    """单 image 能量(eV):OSZICAR 末行 E0 优先,退 OUTCAR 末个 energy(sigma->0)。缺 → None。"""
+def _frame_energy_evidence(frame_dir) -> tuple[float | None, str | None]:
+    """单 image 能量与实际证据文件；不从 POSCAR/目录名推断。"""
     osz = _read_text(os.path.join(frame_dir, 'OSZICAR'))
     if osz:
         steps = convergence.parse_oszicar(osz)
         if steps and steps[-1].get('E0') is not None:
-            return float(steps[-1]['E0'])
+            return float(steps[-1]['E0']), 'OSZICAR:E0'
     out = _read_text(os.path.join(frame_dir, 'OUTCAR'))
     if out:
         hits = _SIGMA0_RE.findall(out)
         if hits:
             try:
-                return float(hits[-1])
+                return float(hits[-1]), 'OUTCAR:energy(sigma->0)'
             except ValueError:
-                return None
+                return None, None
+    return None, None
+
+
+def _frame_energy(frame_dir) -> float | None:
+    """向后兼容的单值入口。"""
+    return _frame_energy_evidence(frame_dir)[0]
+
+
+_NIONS_RE = re.compile(r'\bNIONS\s*=\s*(\d+)')
+_ELECTRONIC_NOT_REACHED = (
+    'electronic convergence not reached',
+    'ediff was not reached',
+    'did not converge',
+)
+_SCF_ACTIVITY_RE = re.compile(r'^\s*(?:DAV|RMM|CG|DIA)\s*:', re.I)
+
+
+def parse_last_complete_image_step(outcar_text: str, expected_natoms: int) -> dict:
+    """Return the final complete force/SCF step, failing closed on bad rows.
+
+    The last ``TOTAL-FORCE`` occurrence is authoritative. Earlier EDIFF success
+    cannot cover a later non-converged step, and any starred, missing, extra or
+    non-numeric force row makes the final force unavailable.
+    """
+    if isinstance(expected_natoms, bool) or not isinstance(expected_natoms, int) \
+            or expected_natoms <= 0:
+        return {'status': 'unavailable', 'fmax': None,
+                'electronic_status': 'unavailable',
+                'issues': ['expected atom count is unavailable']}
+    lines = str(outcar_text or '').splitlines()
+    nions_values = {int(value) for value in _NIONS_RE.findall(outcar_text or '')}
+    issues = []
+    if len(nions_values) != 1 or next(iter(nions_values), None) != expected_natoms:
+        issues.append('OUTCAR NIONS does not match the frozen structure atom count')
+
+    electronic = 'unavailable'
+    electronic_position = None
+    pending_scf_after_force = False
+    outcar_energies = []
+    events = []
+    for index, line in enumerate(lines):
+        lowered = line.lower()
+        if events and _SCF_ACTIVITY_RE.match(line):
+            pending_scf_after_force = True
+        if 'aborting loop because ediff is reached' in lowered:
+            electronic = 'converged'
+            electronic_position = index
+            if events:
+                pending_scf_after_force = True
+        elif any(marker in lowered for marker in _ELECTRONIC_NOT_REACHED):
+            electronic = 'not_converged'
+            electronic_position = index
+            if events:
+                pending_scf_after_force = True
+        energy_match = _SIGMA0_RE.search(line)
+        if energy_match:
+            try:
+                candidate = float(energy_match.group(1))
+            except ValueError:
+                candidate = None
+            if candidate is not None and math.isfinite(candidate):
+                if events:
+                    latest = events[-1]
+                    if (latest.get('_energy_seen_before_force')
+                            or latest.get('_trailing_energy_events')):
+                        pending_scf_after_force = True
+                    latest['_trailing_energy_events'] = (
+                        int(latest.get('_trailing_energy_events') or 0) + 1)
+                outcar_energies.append((index, candidate))
+        if 'TOTAL-FORCE' not in line:
+            continue
+        cursor = index + 1
+        while cursor < len(lines) and (
+                not lines[cursor].strip()
+                or set(lines[cursor].strip()) <= {'-'}):
+            cursor += 1
+        row_forces = []
+        block_issues = []
+        for atom_index in range(expected_natoms):
+            if cursor >= len(lines):
+                block_issues.append(
+                    f'force block ended before atom {atom_index + 1}/{expected_natoms}')
+                break
+            tokens = lines[cursor].split()
+            if len(tokens) != 6 or any('*' in token for token in tokens):
+                block_issues.append(
+                    f'force row {atom_index + 1}/{expected_natoms} is not fully numeric')
+                break
+            try:
+                fx, fy, fz = (float(tokens[3]), float(tokens[4]), float(tokens[5]))
+            except ValueError:
+                block_issues.append(
+                    f'force row {atom_index + 1}/{expected_natoms} is not parseable')
+                break
+            if not all(math.isfinite(value) for value in (fx, fy, fz)):
+                block_issues.append(
+                    f'force row {atom_index + 1}/{expected_natoms} is not finite')
+                break
+            row_forces.append(math.sqrt(fx * fx + fy * fy + fz * fz))
+            cursor += 1
+        if len(row_forces) == expected_natoms and cursor < len(lines):
+            extra = lines[cursor].split()
+            if len(extra) == 6:
+                try:
+                    [float(value) for value in extra]
+                except ValueError:
+                    pass
+                else:
+                    block_issues.append('force block contains more rows than expected')
+        events.append({
+            'status': 'complete' if not block_issues else 'unavailable',
+            'fmax': max(row_forces) if not block_issues else None,
+            'electronic_status': electronic,
+            'ionic_event_index': len(events) + 1,
+            'issues': block_issues,
+            '_electronic_position': electronic_position,
+            '_force_start': index,
+            '_force_end': cursor,
+            '_energy_seen_before_force': bool(
+                isinstance(electronic_position, int)
+                and any(electronic_position < position < index
+                        for position, _energy in outcar_energies)),
+            '_trailing_energy_events': 0,
+        })
+        electronic = 'unavailable'
+        electronic_position = None
+        pending_scf_after_force = False
+
+    if not events:
+        issues.append('OUTCAR contains no force block')
+        return {'status': 'unavailable', 'fmax': None,
+                'electronic_status': 'unavailable', 'issues': issues}
+    # Bind each energy to its force block by local order, not global ordinal.
+    # VASP normally writes EDIFF -> energy -> force; a few outputs put the
+    # energy immediately after the force block, which is accepted only before
+    # the next electronic marker.  Ambiguous/orphan energies remain blockers.
+    used_energy_positions = set()
+    pairing_issues = []
+    for event_index, event in enumerate(events):
+        ordinal = event_index + 1
+        status_position = event.get('_electronic_position')
+        force_start = int(event['_force_start'])
+        force_end = int(event['_force_end'])
+        next_event = events[event_index + 1] if event_index + 1 < len(events) else None
+        next_boundary = len(lines)
+        if next_event is not None:
+            next_status = next_event.get('_electronic_position')
+            next_boundary = (
+                int(next_status) if isinstance(next_status, int)
+                else int(next_event['_force_start'])
+            )
+        before = [] if not isinstance(status_position, int) else [
+            item for item in outcar_energies
+            if status_position < item[0] < force_start
+        ]
+        after = [
+            item for item in outcar_energies
+            if force_end <= item[0] < next_boundary
+        ]
+        candidates = before if before else after
+        if not isinstance(status_position, int):
+            pairing_issues.append(
+                f'OUTCAR ionic event {ordinal} lacks a local EDIFF marker')
+            event['outcar_energy'] = None
+        elif len(candidates) != 1 or (before and after):
+            pairing_issues.append(
+                f'OUTCAR ionic event {ordinal} has missing or ambiguous '
+                'energy/force ordering')
+            event['outcar_energy'] = None
+        else:
+            position, energy = candidates[0]
+            used_energy_positions.add(position)
+            event['outcar_energy'] = energy
+    if any(position not in used_energy_positions for position, _energy in outcar_energies):
+        pairing_issues.append(
+            'OUTCAR contains an unbound or out-of-order energy(sigma->0) event')
+
+    final = dict(events[-1])
+    final['outcar_energy_event_count'] = len(outcar_energies)
+    final['energy_pairing_issues'] = list(dict.fromkeys(pairing_issues))
+    for private_key in (
+            '_electronic_position', '_force_start', '_force_end',
+            '_energy_seen_before_force', '_trailing_energy_events'):
+        final.pop(private_key, None)
+    issues.extend(final.get('issues') or [])
+    if pending_scf_after_force:
+        issues.append('OUTCAR ends with an SCF step that has no complete final force block')
+    if final.get('electronic_status') != 'converged':
+        issues.append('final complete ionic step lacks EDIFF convergence evidence')
+    final['issues'] = list(dict.fromkeys(issues))
+    final['status'] = 'complete' if not final['issues'] else 'unavailable'
+    if final['status'] != 'complete':
+        final['fmax'] = None
+    return final
+
+
+def parse_final_neb_image_event(
+        oszicar_text: str, outcar_text: str, expected_natoms: int,
+        *, energy_tolerance: float = 1e-3) -> dict:
+    """Bind final OSZICAR energy and OUTCAR force/EDIFF to one ionic event.
+
+    Sequence length, final ionic index and energy must agree.  This prevents an
+    early or foreign OSZICAR ``E0`` from being combined with a later complete
+    OUTCAR force block merely because both files are independently parseable.
+    """
+    final = parse_last_complete_image_step(outcar_text, expected_natoms)
+    issues = list(final.get('issues') or [])
+    issues.extend(final.get('energy_pairing_issues') or [])
+    oszicar_steps = convergence.parse_oszicar(oszicar_text or '')
+    event_count = int(final.get('ionic_event_index') or 0)
+    if not oszicar_steps:
+        issues.append('OSZICAR contains no complete ionic energy event')
+    elif len(oszicar_steps) != event_count:
+        issues.append('OSZICAR and OUTCAR ionic event counts differ')
+    else:
+        oszicar_indices = [step.get('step') for step in oszicar_steps]
+        if oszicar_indices != list(range(1, event_count + 1)):
+            issues.append(
+                'OSZICAR ionic indices are missing, duplicated, or out of order')
+    oszicar_energy = (
+        float(oszicar_steps[-1]['E0'])
+        if oszicar_steps and isinstance(oszicar_steps[-1].get('E0'), (int, float))
+        and not isinstance(oszicar_steps[-1].get('E0'), bool)
+        and math.isfinite(float(oszicar_steps[-1]['E0'])) else None
+    )
+    outcar_energy = final.get('outcar_energy')
+    if final.get('outcar_energy_event_count') != event_count:
+        issues.append('OUTCAR energy and force event counts differ')
+    if outcar_energy is None:
+        issues.append('final OUTCAR force event lacks a finite energy(sigma->0)')
+    if (oszicar_energy is not None and outcar_energy is not None
+            and abs(oszicar_energy - outcar_energy) > energy_tolerance):
+        issues.append('OSZICAR E0 and OUTCAR final-event energy disagree')
+    issues = list(dict.fromkeys(issues))
+    complete = final.get('status') == 'complete' and not issues
+    return {
+        'status': 'complete' if complete else 'unavailable',
+        'energy': oszicar_energy if complete else None,
+        'fmax': final.get('fmax') if complete else None,
+        'electronic_status': final.get('electronic_status') or 'unavailable',
+        'ionic_event_index': event_count or None,
+        'outcar_energy': outcar_energy,
+        'issues': issues,
+    }
+
+
+def _frame_expected_natoms(frame_dir) -> int | None:
+    from vcstudio.generate.poscar import parse_poscar_species
+
+    for name in ('CONTCAR', 'POSCAR'):
+        text = _read_text(os.path.join(frame_dir, name))
+        if not text:
+            continue
+        try:
+            _symbols, counts = parse_poscar_species(text)
+        except (IndexError, TypeError, ValueError):
+            continue
+        if counts:
+            return int(sum(counts))
     return None
 
 
 def _frame_fmax(frame_dir) -> float | None:
-    """单 image 末离子步 |F|max(eV/Å);缺 OUTCAR/无力块 → None。"""
+    """单 image 最后完整收敛步 |F|max；任何坏力行均 fail closed。"""
     out = _read_text(os.path.join(frame_dir, 'OUTCAR'))
     if not out:
         return None
-    f = convergence.parse_outcar_fmax(out)
-    return f[-1] if f else None
+    expected = _frame_expected_natoms(frame_dir)
+    result = parse_last_complete_image_step(out, expected)
+    return result.get('fmax') if result.get('status') == 'complete' else None
 
 
 def parse_neb_energies(job_dir) -> dict:
@@ -98,7 +359,9 @@ def parse_neb_energies(job_dir) -> dict:
             f'请确认目录为标准 NEB 布局:{job_dir}')
 
     root = Path(job_dir)
-    energies = [_frame_energy(root / fr) for fr in frames]
+    pairs = [_frame_energy_evidence(root / fr) for fr in frames]
+    energies = [item[0] for item in pairs]
+    energy_sources = [item[1] for item in pairs]
     forces = [_frame_fmax(root / fr) for fr in frames]
 
     if energies[0] is None:
@@ -135,6 +398,7 @@ def parse_neb_energies(job_dir) -> dict:
         'barrier_f': barrier_f, 'barrier_r': barrier_r,
         'ts_index': ts_index, 'climbing_converged': climbing_converged,
         'per_image_forces': forces, 'n_frames': n_frames, 'warnings': warnings,
+        'energy_sources': energy_sources,
     }
 
 

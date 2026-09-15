@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vcstudio"
 dynamic = ["version"]
-description = "VASP Catalyst Studio — 轻量化 DFT 自动化:POSCAR+用户INCAR → 输入四件套 / 多集群提交 / 零token监控 / LLM分析"
+description = "VASP-primary, evidence-driven catalysis workbench with limited multi-engine adapters and optional gated AI"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -31,8 +31,12 @@ gui = ["pywebview>=4"]
 packaging = ["pyinstaller>=6"]
 # 原生论文级出图引擎(external/native_charts.py;函数内延迟 import,core 零重依赖)
 charts = ["matplotlib>=3.6", "numpy>=1.23"]
+# 不含 matplotlib 的数值生成能力，供 --no-charts 打包配置使用
+numeric = ["numpy>=1.23"]
 # 分子建模引擎链(molbuild/smiles3d:SMILES→3D、2D SVG 预览;函数内延迟 import,core 零重依赖)
 mol = ["rdkit"]
+# 论文文档能力：Word 写出、PDF 写出/读取；完整版 EXE 会显式收录
+docs = ["python-docx", "pypdf", "reportlab>=4", "openpyxl>=3.1"]
 # 图片识别 OCSR(molbuild/ocsr:图片→SMILES);体积大,含 TensorFlow 模型,不进默认依赖
 ocsr = ["decimer"]
 # 开发:测试 + 覆盖率 + lint + ASE(解析器交叉校验对拍,可选;缺失则相关测试 skip)

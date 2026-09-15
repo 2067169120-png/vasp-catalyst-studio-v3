@@ -11,8 +11,9 @@ from vcstudio.project import advisor as advisor_mod
 from vcstudio.project import reactions as reactions_mod
 from vcstudio.shared import scenarios as S
 
-# 官方要求的 5 个方向 + full 兜底
-_EXPECTED_KEYS = {'lis', 'electrocat', 'thermocat', 'battery_bulk', 'molecular', 'full'}
+# 四个主模式 + 三个专业预设
+_EXPECTED_KEYS = {'lis', 'vasp', 'electrocat', 'thermocat',
+                  'battery_bulk', 'molecular', 'full'}
 
 
 def _real_advisor_rules() -> set:
@@ -23,7 +24,7 @@ def _real_advisor_rules() -> set:
 
 # ── 注册表与 schema 完备性 ────────────────────────────────────────────────────
 
-def test_builtin_has_five_directions_plus_full():
+def test_builtin_has_primary_modes_and_professional_presets():
     keys = {s['key'] for s in S.list_scenarios()}
     assert keys == _EXPECTED_KEYS
     assert set(S.BUILTIN_KEYS) == _EXPECTED_KEYS
@@ -41,17 +42,62 @@ def test_every_builtin_has_all_required_keys():
         assert sc['ai_context'].strip()          # 领域上下文非空
 
 
+def test_every_builtin_exposes_complete_english_display_fields():
+    for sc in S.list_scenarios():
+        assert sc['name_en'].strip(), sc['key']
+        assert sc['description_en'].strip(), sc['key']
+        assert not re.search(r'[\u3400-\u9fff]', sc['name_en']), sc['key']
+        assert not re.search(r'[\u3400-\u9fff]', sc['description_en']), sc['key']
+
+    assert 'Li–S' in S.get_scenario('lis')['name_en']
+    assert 'Gaussian' in S.get_scenario('molecular')['description_en']
+    assert 'CO₂RR' in S.get_scenario('electrocat')['description_en']
+
+
 def test_pages_are_subset_of_valid_pages():
     for sc in S.list_scenarios():
         assert sc['pages'], sc['key']
         assert set(sc['pages']) <= set(S.PAGES), sc['key']
 
 
+def test_page_registry_matches_real_html_pages():
+    html = (Path(__file__).parents[1] / 'vcstudio/gui_web/assets/index.html').read_text(
+        encoding='utf-8')
+    assert set(re.findall(r'<section[^>]+data-page="([^"]+)"', html)) == set(S.PAGES)
+    nav = set(re.findall(r'<a[^>]+data-page="([^"]+)"[^>]+data-scene="pages\.([^"]+)"', html))
+    # AI 已从一级页导航改为右侧上下文助手；其余物理页仍需有
+    # data-page -> pages.<page> 能力适配，不得绕过工作模式白名单。
+    assert {a for a, b in nav if a == b and a != 'ai'} == set(S.PAGES) - {'ai'}
+    assert re.search(
+        r'id="assistant-toggle"[^>]*data-scene="pages\.ai"[^>]*aria-controls="page-ai"',
+        html)
+    assert re.search(
+        r'<section[^>]+data-page="ai"[^>]+id="page-ai"[^>]+data-shell-assistant',
+        html)
+
+
+def test_four_primary_modes_have_safe_defaults():
+    primary = {s['key']: s for s in S.list_scenarios() if s['primary']}
+    assert set(primary) == {'lis', 'vasp', 'molecular', 'full'}
+    assert primary['lis']['defaults']['landing_page'] == 'project'
+    assert primary['vasp']['defaults']['landing_page'] == 'generate'
+    assert primary['molecular']['defaults']['engine'] == 'gaussian'
+    assert set(primary['full']['pages']) == set(S.PAGES)
+    assert set(primary['full']['engines']) == set(S.ENGINES)
+
+
 def test_molecular_drops_project_page():
     # 分子化学不走表面吸附项目页(pages 子集)
     mol = S.get_scenario('molecular')
     assert 'project' not in mol['pages']
+    assert 'report-workbench' not in mol['pages']
     assert 'project' in S.get_scenario('full')['pages']
+
+
+def test_project_scenarios_expose_the_report_workbench_page():
+    for scenario in S.list_scenarios():
+        if 'project' in scenario['pages']:
+            assert 'report-workbench' in scenario['pages'], scenario['key']
 
 
 def test_engines_are_valid():
@@ -108,7 +154,7 @@ def test_get_scenario_returns_independent_copy():
     a['cards']['generate'] = {'sac_matrix': False}
     b = S.get_scenario('lis')
     assert 'HACKED' not in b['pages']
-    assert b['cards'] == {}
+    assert 'generate' not in b['cards']
 
 
 # ── is_visible 各层级 ─────────────────────────────────────────────────────────
@@ -128,7 +174,7 @@ def test_is_visible_cards_default_true_when_unspecified():
 
 def test_is_visible_cards_override_false():
     mol = S.get_scenario('molecular')
-    assert S.is_visible(mol, 'cards.generate.sac_matrix') is False
+    assert S.is_visible(mol, 'cards.structure.sac_matrix') is False
     # 未被覆盖的卡片仍默认可见
     assert S.is_visible(mol, 'cards.generate.spin_family') is True
 
@@ -147,7 +193,24 @@ def test_is_visible_engines_reactions_figures():
     thermo = S.get_scenario('thermocat')
     assert S.is_visible(thermo, 'reactions.ORR_4E') is False     # 热催化无电化学预设
     assert S.is_visible(S.get_scenario('molecular'), 'engines.gaussian') is True
-    assert S.is_visible(S.get_scenario('full'), 'engines.gaussian') is False
+    assert S.is_visible(S.get_scenario('full'), 'engines.gaussian') is True
+
+
+def test_task_keys_are_in_sync_with_catalog_and_defaults_are_allowed():
+    from vcstudio.generate import task_catalog
+    assert set(S.TASK_KEYS) == {t['key'] for t in task_catalog.CATALOG}
+    for sc in S.list_scenarios():
+        assert set(sc['task_keys']) <= set(S.TASK_KEYS)
+        assert sc['defaults']['active_calculation'] in sc['task_keys']
+        assert set(sc['home_actions']) <= set(S.HOME_ACTIONS)
+
+
+def test_lis_neb_needs_an_explicit_page_allowance_without_broadening_the_mode():
+    """Li-S 的 NEB 只应临时放行生成页，不能把其他裁剪页面一并开放。"""
+    lis = S.get_scenario('lis')
+    assert 'neb' in lis['task_keys']
+    assert 'generate' not in lis['pages']
+    assert 'wavefunction' not in lis['pages']
 
 
 def test_is_visible_unknown_path_fails_open():
@@ -193,7 +256,8 @@ def test_export_import_roundtrip(tmp_path):
 
 def test_import_bad_file_reports_issues(tmp_path):
     bad = {
-        'key': 'x', 'name': 'x', 'description': 'x',
+        'key': 'x', 'name': 'x', 'name_en': 'x',
+        'description': 'x', 'description_en': 'x',
         'pages': ['dashboard', 'nonsense_page'],            # 未知页面
         'cards': {'weird_page': {'a': True}},               # 未知页面卡片组
         'figure_preset_order': ['volcano', 'no_such_fig'],  # 未知图型
@@ -232,7 +296,18 @@ def test_import_non_mapping_is_not_ok(tmp_path):
 def test_missing_required_keys_flagged():
     issues = S.validate_scenario({'key': 'x'})
     assert any('name' in i for i in issues)
+    assert any('name_en' in i for i in issues)
+    assert any('description_en' in i for i in issues)
     assert any('pages' in i for i in issues)
+
+
+def test_empty_bilingual_display_fields_are_rejected():
+    scenario = S.get_scenario('vasp')
+    scenario['name_en'] = '  '
+    scenario['description'] = None
+    issues = S.validate_scenario(scenario)
+    assert any('name_en' in issue for issue in issues)
+    assert any('description' in issue for issue in issues)
 
 
 # ── config 读写(假 config 路径) ─────────────────────────────────────────────

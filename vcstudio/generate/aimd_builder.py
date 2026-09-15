@@ -20,9 +20,14 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
+import math
+import stat
+import tempfile
 from collections import OrderedDict
+from collections.abc import Mapping
 from pathlib import Path
+
+import yaml
 
 from vcstudio.generate.incar_builder import parse_incar
 from vcstudio.generate.kpoints import kpoints_str
@@ -30,12 +35,16 @@ from vcstudio.generate.poscar import parse_poscar_species
 from vcstudio.shared import manifest as manifest_mod
 
 ENSEMBLES = ('nvt', 'nve')
+_AIMD_MAX_TEXT_BYTES = 128 * 1024 * 1024
+_AIMD_MAX_METADATA_BYTES = 4 * 1024 * 1024
+_AIMD_MAX_COPY_BYTES = 512 * 1024 * 1024
+_WINDOWS_REPARSE_POINT = 0x400
 
 # 与 MD 冲突的键 → 剥离(IBRION 走 replace,不在此):
 #   EDIFFG 是离子弛豫力/能收敛判据,MD 跑满 NSW 步与它无关,留着误导;
 #   ISIF(应力/晶胞优化)对固定胞的 NVT/NVE AIMD 无意义(IBRION=0 下 VASP 忽略),
 #   留 ISIF=3 会让人误以为在变胞。与 freq_builder 剥离集同口径。
-_AIMD_STRIP = ('ISIF', 'EDIFFG')
+_AIMD_STRIP = ('ISIF', 'EDIFFG', 'LANGEVIN_GAMMA', 'LANGEVIN_GAMMA_L', 'PMASS')
 
 _AIMD_REASON = {
     'IBRION': 'IBRION=0 开启分子动力学',
@@ -48,30 +57,222 @@ _AIMD_REASON = {
     'TEEND': '终止温度(K;等温 MD 取与 TEBEG 同值,升/降温取不同值)',
     'ISYM': 'MD 轨迹破缺对称性,ISYM=0 必需(否则对称约束会污染动力学)',
     'NELMIN': '每 MD 步最少电子自洽步数,保证力平滑/能量守恒',
+    'ISTART': '未复制 WAVECAR，强制从头构造波函数',
+    'ICHARG': '未复制 CHGCAR，强制从原子电荷叠加开始',
     'EDIFFG': 'MD 无离子弛豫收敛判据,剥离',
     'ISIF': '固定胞 NVT/NVE 无需应力/晶胞优化,剥离',
+    'LANGEVIN_GAMMA': '当前派生的是 Nose-Hoover/Andersen，不保留旧 Langevin 摩擦参数',
+    'LANGEVIN_GAMMA_L': '固定胞作业不保留旧 Langevin 晶格摩擦参数',
+    'PMASS': '固定胞 NVT/NVE 不使用旧 Parrinello-Rahman 晶格质量',
     'ENCUT': 'AIMD 截断能(显式传 encut 时才改)',
 }
 
 
-def _read_text(path: str):
+def _source_signature(value) -> tuple[int, int, int, int, int]:
+    return (
+        int(getattr(value, 'st_dev', 0)),
+        int(getattr(value, 'st_ino', 0)),
+        int(value.st_mode), int(value.st_size), int(value.st_mtime_ns),
+    )
+
+
+def _source_metadata(src_dir: str, name: str, *, byte_limit: int):
+    path = Path(src_dir) / name
     try:
-        with open(path, 'r', encoding='utf-8', errors='replace') as f:
-            return f.read()
+        value = path.lstat()
     except OSError:
         return None
+    if (not stat.S_ISREG(value.st_mode)
+            or int(getattr(value, 'st_file_attributes', 0))
+            & _WINDOWS_REPARSE_POINT):
+        raise ValueError(f'源输入 {name} 必须是 no-follow 普通文件')
+    if value.st_size < 0 or value.st_size > byte_limit:
+        raise ValueError(f'源输入 {name} 超过有界复制上限 {byte_limit} bytes')
+    return path, value
+
+
+def _open_source(src_dir: str, name: str, *, byte_limit: int):
+    resolved = _source_metadata(src_dir, name, byte_limit=byte_limit)
+    if resolved is None:
+        return None
+    path, before_path = resolved
+    flags = os.O_RDONLY | int(getattr(os, 'O_BINARY', 0))
+    flags |= int(getattr(os, 'O_NOFOLLOW', 0))
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError(f'源输入 {name} 无法以 no-follow 方式打开') from exc
+    before_fd = os.fstat(descriptor)
+    if (not stat.S_ISREG(before_fd.st_mode)
+            or _source_signature(before_fd) != _source_signature(before_path)):
+        os.close(descriptor)
+        raise ValueError(f'源输入 {name} 在打开前发生替换')
+    return path, before_path, descriptor
+
+
+def _read_source_text(
+        src_dir: str, name: str, *, byte_limit: int = _AIMD_MAX_TEXT_BYTES):
+    opened = _open_source(
+        src_dir, name, byte_limit=byte_limit)
+    if opened is None:
+        return None
+    path, before_path, descriptor = opened
+    data = bytearray()
+    with os.fdopen(descriptor, 'rb', closefd=True) as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > byte_limit:
+                raise ValueError(
+                    f'源输入 {name} 超过有界读取上限 '
+                    f'{byte_limit} bytes')
+        after_fd = os.fstat(handle.fileno())
+    try:
+        after_path = path.lstat()
+    except OSError as exc:
+        raise ValueError(f'源输入 {name} 在读取期间消失') from exc
+    if (_source_signature(after_fd) != _source_signature(before_path)
+            or _source_signature(after_path) != _source_signature(before_path)
+            or len(data) != before_path.st_size):
+        raise ValueError(f'源输入 {name} 在有界读取期间发生变化')
+    return bytes(data).decode('utf-8', errors='replace')
+
+
+def _copy_source_file(src_dir: str, name: str, out_dir: str) -> None:
+    opened = _open_source(src_dir, name, byte_limit=_AIMD_MAX_COPY_BYTES)
+    if opened is None:
+        raise ValueError(f'源目录缺少 {name}')
+    path, before_path, descriptor = opened
+    temporary_descriptor, temporary_name = tempfile.mkstemp(
+        prefix='.vcstudio-aimd-', dir=out_dir)
+    published = False
+    total = 0
+    try:
+        with os.fdopen(descriptor, 'rb', closefd=True) as source, \
+                os.fdopen(temporary_descriptor, 'wb', closefd=True) as target:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _AIMD_MAX_COPY_BYTES:
+                    raise ValueError(
+                        f'源输入 {name} 超过有界复制上限 '
+                        f'{_AIMD_MAX_COPY_BYTES} bytes')
+                target.write(chunk)
+            target.flush()
+            after_fd = os.fstat(source.fileno())
+        try:
+            after_path = path.lstat()
+        except OSError as exc:
+            raise ValueError(f'源输入 {name} 在复制期间消失') from exc
+        if (_source_signature(after_fd) != _source_signature(before_path)
+                or _source_signature(after_path) != _source_signature(before_path)
+                or total != before_path.st_size):
+            raise ValueError(f'源输入 {name} 在有界复制期间发生变化')
+        os.replace(temporary_name, os.path.join(out_dir, name))
+        published = True
+    finally:
+        if not published:
+            try:
+                os.remove(temporary_name)
+            except OSError:
+                pass
 
 
 def _structure_source(src_dir: str):
     """取弛豫末构型 → (来源名, 文本)。优先**非空** CONTCAR(避免 VASP 空 CONTCAR 陷阱),
     否则退 POSCAR;都无 → (None, None)。"""
-    contcar = _read_text(os.path.join(src_dir, 'CONTCAR'))
+    contcar = _read_source_text(src_dir, 'CONTCAR')
     if contcar is not None and contcar.strip():
         return 'CONTCAR', contcar
-    poscar = _read_text(os.path.join(src_dir, 'POSCAR'))
+    poscar = _read_source_text(src_dir, 'POSCAR')
     if poscar is not None and poscar.strip():
         return 'POSCAR', poscar
     return None, None
+
+
+def _incar_truthy(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or '').strip().strip('.').upper() in {'T', 'TRUE', '1', 'YES'}
+
+
+def _manifest_flag(inputs: Mapping, key: str) -> bool:
+    if key not in inputs:
+        return False
+    value = inputs.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().strip('.').upper()
+        if normalized in {'T', 'TRUE', 'YES'}:
+            return True
+        if normalized in {'F', 'FALSE', 'NO'}:
+            return False
+    raise ValueError(f'源 job.yaml inputs.{key} 必须是布尔值')
+
+
+def _source_manifest_inputs(src_dir: str) -> Mapping:
+    text = _read_source_text(
+        src_dir, 'job.yaml', byte_limit=_AIMD_MAX_METADATA_BYTES)
+    if text is None:
+        return {}
+    try:
+        manifest = yaml.safe_load(text) or {}
+    except yaml.YAMLError as exc:
+        raise ValueError('源 job.yaml 不是可读的安全 YAML mapping') from exc
+    if not isinstance(manifest, Mapping):
+        raise ValueError('源 job.yaml 必须是 mapping')
+    inputs = manifest.get('inputs', {})
+    if inputs is None:
+        inputs = {}
+    if not isinstance(inputs, Mapping):
+        raise ValueError('源 job.yaml inputs 必须是 mapping')
+    return inputs
+
+
+def _aimd_dependency_plan(
+        src_dir: str, aimd_incar: str, *, uses_iconst: bool = False) -> list[str]:
+    """Resolve every auxiliary file that the final AIMD INCAR can make VASP read."""
+    incar = parse_incar(aimd_incar)
+    plan: list[str] = []
+
+    def require(name: str, reason: str) -> None:
+        if _source_metadata(
+                src_dir, name, byte_limit=_AIMD_MAX_COPY_BYTES) is None:
+            raise ValueError(f'源 INCAR {reason}，但源目录缺少 {name}')
+        plan.append(name)
+
+    if _incar_truthy(incar.get('LUSE_VDW')):
+        for candidate in ('vdw_kernel.bindat', 'vdw_kernel'):
+            if _source_metadata(
+                    src_dir, candidate, byte_limit=_AIMD_MAX_COPY_BYTES) is not None:
+                plan.append(candidate)
+                break
+        else:
+            raise ValueError(
+                '源 INCAR 启用 LUSE_VDW，但源目录缺少 '
+                'vdw_kernel.bindat/vdw_kernel')
+    if uses_iconst or any(key in incar for key in ('SHAKEMAXITER', 'SHAKETOL')):
+        require('ICONST', '启用 SHAKE 约束')
+
+    ml_mode = str(incar.get('ML_MODE') or '').strip().lower()
+    try:
+        raw_ml_start = incar.get('ML_ISTART')
+        ml_start = (
+            None if isinstance(raw_ml_start, bool) or raw_ml_start is None
+            else int(float(raw_ml_start))
+        )
+    except (TypeError, ValueError, OverflowError):
+        ml_start = None
+    if (ml_start is not None and ml_start > 0) \
+            or ml_mode in {'run', 'select', 'refit'}:
+        require('ML_FF', '启用需要现有模型的机器学习力场')
+
+    return plan
 
 
 def _fmt(x) -> str:
@@ -99,22 +300,55 @@ def _aimd_targets(ensemble, temp_k, temp_end_k, steps, potim_fs, encut):
     ens = str(ensemble).lower()
     if ens not in ENSEMBLES:
         raise ValueError(f"未知系综 ensemble={ensemble!r};可选:{' / '.join(ENSEMBLES)}。")
+
+    def _finite(name, value, *, positive=False):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f'{name} 必须是有限数值,收到 {value!r}') from None
+        if not math.isfinite(number):
+            raise ValueError(f'{name} 必须是有限数值,收到 {value!r}')
+        if positive and number <= 0:
+            raise ValueError(f'{name} 必须大于 0,收到 {value!r}')
+        return number
+
+    try:
+        steps_float = float(steps)
+        steps_int = int(steps_float)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'steps 必须是正整数,收到 {steps!r}') from None
+    if (isinstance(steps, bool) or not math.isfinite(steps_float)
+            or steps_int <= 0 or steps_float != steps_int):
+        raise ValueError(f'steps 必须是正整数,收到 {steps!r}')
+    temp = _finite('temp_k', temp_k)
+    if temp < 0:
+        raise ValueError(f'temp_k 不能为负,收到 {temp_k!r}')
+    temp_end = temp if temp_end_k is None else _finite('temp_end_k', temp_end_k)
+    if temp_end < 0:
+        raise ValueError(f'temp_end_k 不能为负,收到 {temp_end_k!r}')
+    potim = _finite('potim_fs', potim_fs, positive=True)
+    cutoff = None if encut is None else _finite('encut', encut, positive=True)
+
     t: OrderedDict = OrderedDict()
     t['IBRION'] = '0'
-    t['NSW'] = str(int(steps))
-    t['POTIM'] = _fmt(potim_fs)
+    t['NSW'] = str(steps_int)
+    t['POTIM'] = _fmt(potim)
     t['ISYM'] = '0'
     t['NELMIN'] = '4'
-    t['TEBEG'] = _fmt(temp_k)
+    # The builder copies neither WAVECAR nor CHGCAR.  Bind the generated job
+    # to a dependency-free electronic start before its recipe/closure is made.
+    t['ISTART'] = '0'
+    t['ICHARG'] = '2'
+    t['TEBEG'] = _fmt(temp)
     if ens == 'nvt':
         t['MDALGO'] = '2'
         t['SMASS'] = '0'
-        t['TEEND'] = _fmt(temp_end_k if temp_end_k is not None else temp_k)
+        t['TEEND'] = _fmt(temp_end)
     else:  # nve:Andersen 碰撞概率0 → 微正则
         t['MDALGO'] = '1'
         t['ANDERSEN_PROB'] = '0.0'
-    if encut is not None:
-        t['ENCUT'] = str(int(encut))
+    if cutoff is not None:
+        t['ENCUT'] = str(int(cutoff))
     return t, ens
 
 
@@ -141,6 +375,13 @@ def _derive_aimd_incar(base_incar_text: str, target: OrderedDict):
     子句级处理 ';' 多赋值,保留行内注释(与 _derive_freq_incar 同口径)。
     """
     parsed = parse_incar(base_incar_text)
+    # target 之外的旧恒温器键不能残留。否则例如 NVT→NVE 派生仍带 SMASS/TEEND，
+    # 或 Andersen→Nose 仍带 ANDERSEN_PROB，INCAR 表面显示新系综却混入旧控制参数。
+    strip_keys = set(_AIMD_STRIP)
+    if str(target.get('MDALGO')) == '1':
+        strip_keys.update(('SMASS', 'TEEND'))
+    else:
+        strip_keys.add('ANDERSEN_PROB')
     changes: list = []
     handled: set = set()
     new_lines: list = []
@@ -157,7 +398,7 @@ def _derive_aimd_incar(base_incar_text: str, target: OrderedDict):
                     kept.append(clause.strip())
                 continue
             key = clause.split('=', 1)[0].strip().upper()
-            if key in _AIMD_STRIP:
+            if key in strip_keys:
                 changes.append({'key': key, 'action': 'strip', 'old': parsed.get(key),
                                 'new': None, 'reason': _AIMD_REASON.get(key, '')})
                 continue                    # 丢弃该子句
@@ -194,12 +435,14 @@ def build_aimd_incar(base_incar_text: str, *, ensemble='nvt', temp_k=300.0,
 
 # ── 一键派生 AIMD 作业目录 ─────────────────────────────────────────────────────
 def _save_aimd_manifest(out_dir, src_dir, poscar_text, source_name, changes, warnings,
-                        ens, temp_k, temp_end_k, steps, potim_fs):
+                        ens, temp_k, temp_end_k, steps, potim_fs,
+                        *, uses_iconst=False):
     """写 job.yaml:task_type='aimd',记 parent_job / 系综·温度·步长 / incar_changes 溯源。"""
     syms, _counts = parse_poscar_species(poscar_text)
     system = poscar_text.splitlines()[0].strip() if poscar_text.strip() else Path(out_dir).name
     parent = str(Path(src_dir).resolve())
     inputs = {
+        'engine': 'vasp',
         'parent_job': parent,
         'derived_from': source_name,                 # CONTCAR / POSCAR
         'ensemble': ens,
@@ -210,10 +453,26 @@ def _save_aimd_manifest(out_dir, src_dir, poscar_text, source_name, changes, war
         'incar_changes': changes,
         'elements': list(syms),
     }
+    if uses_iconst:
+        inputs['uses_iconst'] = True
+    from vcstudio.generate.method_recipe import builder_recipe
+    inputs['method_recipe'] = builder_recipe(
+        builder='vcstudio.generate.aimd_builder/v1', task_type='aimd',
+        calc_type='aimd', validate=True,
+        completions={'incar_changes': changes}, kpoints_source='gamma-1x1x1',
+        extra={
+            'ensemble': ens, 'temp_k': float(temp_k),
+            'temp_end_k': (float(temp_end_k) if temp_end_k is not None
+                           else float(temp_k)),
+            'steps': int(steps), 'potim_fs': float(potim_fs),
+            'uses_iconst': bool(uses_iconst),
+        })
     m = manifest_mod.new_manifest(
         job_id=f'{Path(out_dir).name}-aimd', system=system, task_type='aimd',
         calc_type='aimd', inputs=inputs, warnings=warnings)
     m['parent_job'] = parent                         # 顶层冗余一份,便于快速溯源
+    from vcstudio.shared.scientific_inputs import record_input_closure
+    record_input_closure(out_dir, m)
     manifest_mod.save_manifest(out_dir, m)
     return m
 
@@ -244,11 +503,19 @@ def build_aimd_job(src_dir, out_dir, *, ensemble='nvt', temp_k=300.0, temp_end_k
         return {'ok': False, 'job_dir': None, 'changes': [], 'warnings': [], 'error': str(e)}
 
     # 2) 取初始构型 + 源 INCAR
-    source_name, poscar_text = _structure_source(src_dir)
+    try:
+        source_name, poscar_text = _structure_source(src_dir)
+    except ValueError as exc:
+        return {'ok': False, 'job_dir': None, 'changes': [], 'warnings': [],
+                'error': str(exc)}
     if poscar_text is None:
         return {'ok': False, 'job_dir': None, 'changes': [], 'warnings': [],
                 'error': f'源目录缺 CONTCAR/POSCAR(或均为空),无法派生 AIMD 作业:{src_dir}'}
-    base_incar = _read_text(os.path.join(src_dir, 'INCAR'))
+    try:
+        base_incar = _read_source_text(src_dir, 'INCAR')
+    except ValueError as exc:
+        return {'ok': False, 'job_dir': None, 'changes': [], 'warnings': [],
+                'error': str(exc)}
     if base_incar is None:
         return {'ok': False, 'job_dir': None, 'changes': [], 'warnings': [],
                 'error': f'源目录缺 INCAR,无法派生 AIMD 作业:{src_dir}'}
@@ -259,13 +526,22 @@ def build_aimd_job(src_dir, out_dir, *, ensemble='nvt', temp_k=300.0, temp_end_k
                         '(建议用弛豫末态 CONTCAR 起 AIMD)。')
 
     aimd_incar, changes = _derive_aimd_incar(base_incar, target)
+    try:
+        source_inputs = _source_manifest_inputs(src_dir)
+        uses_iconst = _manifest_flag(source_inputs, 'uses_iconst')
+        dependency_plan = _aimd_dependency_plan(
+            src_dir, aimd_incar, uses_iconst=uses_iconst)
+        potcar_available = _source_metadata(
+            src_dir, 'POTCAR', byte_limit=_AIMD_MAX_COPY_BYTES) is not None
+    except ValueError as exc:
+        return {'ok': False, 'job_dir': None, 'changes': changes,
+                'warnings': warnings, 'error': str(exc)}
     if encut is None:
         warnings.append('论文口径 AIMD 常用 350 eV;当前继承源 INCAR 的 ENCUT 未自动下调,'
                         '如需降算力可显式传 encut(如 encut=350)。')
     if ens == 'nve':
         warnings.append('NVE 系综:以 MDALGO=1 + ANDERSEN_PROB=0.0(碰撞概率0)实现微正则'
                         '(等价关闭恒温器),初速由 TEBEG 温度生成。')
-
     # 3) 落盘四件套 + manifest
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, 'POSCAR'), 'w', encoding='utf-8') as f:
@@ -277,14 +553,31 @@ def build_aimd_job(src_dir, out_dir, *, ensemble='nvt', temp_k=300.0, temp_end_k
     warnings.append('AIMD 按惯例用 Γ 点单点(1×1×1)KPOINTS(大超胞下 Γ 足够);'
                     '若体系较小请自行加密 k 点并做收敛测试。')
 
-    src_potcar = os.path.join(src_dir, 'POTCAR')
-    if os.path.isfile(src_potcar):
-        shutil.copyfile(src_potcar, os.path.join(out_dir, 'POTCAR'))
+    if potcar_available:
+        _copy_source_file(src_dir, 'POTCAR', out_dir)
     else:
         warnings.append('源目录缺 POTCAR,未复制;提交前须补齐与源计算同一套赝势。')
 
-    _save_aimd_manifest(out_dir, src_dir, poscar_text, source_name, changes, warnings,
-                        ens, temp_k, temp_end_k, steps, potim_fs)
+    for name in dependency_plan:
+        _copy_source_file(src_dir, name, out_dir)
+
+    manifest = _save_aimd_manifest(
+        out_dir, src_dir, poscar_text, source_name, changes, warnings,
+        ens, temp_k, temp_end_k, steps, potim_fs,
+        uses_iconst=uses_iconst)
+    closure = manifest['inputs']['input_closure']
+    closure_files = closure.get('files') or {}
+    closure_requirements = closure.get('requirements') or {}
+    unbound = [
+        name for name in dependency_plan
+        if name not in closure_files or name not in closure_requirements
+    ]
+    if unbound:
+        return {
+            'ok': False, 'job_dir': None, 'changes': changes,
+            'warnings': warnings,
+            'error': '附加科学输入未进入最终闭包:' + ', '.join(unbound),
+        }
     return {'ok': True, 'job_dir': str(out_dir), 'changes': changes,
             'warnings': warnings, 'error': None}
 
@@ -298,7 +591,7 @@ _OSZ_MD_RE = re.compile(rf'^\s*(\d+)\s+T=\s*({_NUM})\s+E=\s*({_NUM})')
 
 
 def parse_aimd_energy(oszicar_text, *, potim_fs: float = 1.0) -> dict:
-    """解析 OSZICAR 的 MD 步行 → ``{'steps':[{'t_fs','e_tot','temp_k'}, ...], 'n'}``。
+    """解析 OSZICAR 的 MD 步行 → ``{'steps':[{'step','t_fs',...}], 'n'}``。
 
     每步取:步号(×potim_fs → 时间 t_fs)、T=温度(K)、E=总能(eV,含动能)。供能量-时间/
     温度-时间曲线(出图接线后续)。potim_fs 默认 1.0(论文口径),即 t_fs=步号;传入实际步长
@@ -310,7 +603,7 @@ def parse_aimd_energy(oszicar_text, *, potim_fs: float = 1.0) -> dict:
         if not m:
             continue
         n = int(m.group(1))
-        steps.append({'t_fs': n * float(potim_fs),
+        steps.append({'step': n, 't_fs': n * float(potim_fs),
                       'e_tot': float(m.group(3)),
                       'temp_k': float(m.group(2))})
     return {'steps': steps, 'n': len(steps)}

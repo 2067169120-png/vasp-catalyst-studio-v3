@@ -3,6 +3,7 @@
 TDD 口径:每个预设 validate 通过、字段齐全;故意破坏守恒/单调/电极须中文报错并点名。
 """
 import copy
+import re
 
 import pytest
 
@@ -16,6 +17,13 @@ def test_list_presets_has_all_families():
     assert set(R.list_presets()) == {
         'LIS_16E', 'LIS_ASSOC_LIS', 'LIS_ASSOC_LIS2', 'LIS_DISSOC',
         'ORR_4E', 'OER_4E', 'HER', 'CO2RR_TO_CO'}
+
+
+def test_every_reaction_preset_has_non_cjk_english_display_metadata():
+    for key, preset in R.list_presets().items():
+        assert preset['name_en'] == key
+        assert preset['description_en'].strip()
+        assert not re.search(r'[\u3400-\u9fff]', preset['description_en']), key
 
 
 def test_list_presets_returns_copy():

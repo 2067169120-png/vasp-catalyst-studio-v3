@@ -1,6 +1,8 @@
-"""VASP Catalyst Studio — 轻量化 DFT 自动化包 (vcstudio)。
+"""VASP Catalyst Studio — project-centered, evidence-driven DFT workbench.
 
-四区:generate(生成) / cluster(集群) / monitor(监控) / analyze(分析)。
-全流程:generate 生成 / cluster 提交监控诊断恢复 / project 分析报告 / external 外部软件适配 / gui 四页界面。
+VASP is the primary scientific path. Bounded adapters cover selected CP2K,
+Gaussian, and CASTEP file workflows without implying numerical equivalence.
+The default Web workspace connects preparation, execution, analysis, and
+revisioned publishing; the four-tab Tk interface remains a legacy adapter.
 """
-__version__ = "3.3.0"
+__version__ = "4.0.0"

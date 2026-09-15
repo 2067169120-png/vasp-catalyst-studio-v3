@@ -9,7 +9,7 @@ from vcstudio.generate.job_builder import build_job_dir, _infer_task_type
 from vcstudio.shared import manifest
 
 from tests.test_submitter import (          # 复用假件与工装
-    FakeClient, FakeSFTP, _profile, _job_dir,
+    FakeClient, FakeSFTP, _profile, _job_dir, _OVERLAP_CONTCAR,
 )
 
 
@@ -104,6 +104,65 @@ def test_adopt_rejects_relative_remote_and_double_adopt(tmp_path):
         ledger_mod.default_ledger_path = orig
 
 
+def test_adopt_preserves_existing_manifest_task_type(tmp_path):
+    local = tmp_path / 'existing_static'
+    local.mkdir()
+    original = manifest.new_manifest(
+        job_id='existing', system='surface', task_type='static', calc_type='slab', inputs={})
+    manifest.save_manifest(local, original)
+    import vcstudio.cluster.ledger as ledger_mod
+    orig = ledger_mod.default_ledger_path
+    ledger_mod.default_ledger_path = lambda: tmp_path / 'jobs.json'
+    try:
+        adopted = submitter.adopt_external_job(
+            str(local), _profile(), '55', '/work/static')
+    finally:
+        ledger_mod.default_ledger_path = orig
+    assert adopted['task_type'] == 'static'
+    assert manifest.load_manifest(local)['task_type'] == 'static'
+
+
+def test_adopt_explicit_task_is_strictly_normalized_and_conflicts_rejected(tmp_path):
+    import vcstudio.cluster.ledger as ledger_mod
+    orig = ledger_mod.default_ledger_path
+    ledger_mod.default_ledger_path = lambda: tmp_path / 'jobs.json'
+    try:
+        fresh = submitter.adopt_external_job(
+            str(tmp_path / 'band'), _profile(), '56', '/work/band', task_type='band')
+        assert fresh['task_type'] == 'bands'
+        with pytest.raises(ValueError, match='未知任务类型'):
+            submitter.adopt_external_job(
+                str(tmp_path / 'bad'), _profile(), '57', '/work/bad', task_type='statci')
+        assert not (tmp_path / 'bad').exists()
+
+        # A new-target lock creates the target directory, so every malformed
+        # request must fail before the lock is acquired or written.
+        invalid_requests = (
+            ('empty_job_id', _profile(), '', '/work/invalid', ''),
+            ('relative_remote', _profile(), '59', 'work/invalid', ''),
+            ('empty_profile', _profile(name=''), '60', '/work/invalid', ''),
+            ('non_text_name', _profile(), '61', '/work/invalid', object()),
+        )
+        for label, profile, job_id, remote_dir, name in invalid_requests:
+            target = tmp_path / label
+            with pytest.raises(ValueError):
+                submitter.adopt_external_job(
+                    str(target), profile, job_id, remote_dir, name=name)
+            assert not target.exists()
+            assert not (target / '.vcstudio-job-operation.lock').exists()
+
+        existing = tmp_path / 'existing_dos'
+        existing.mkdir()
+        manifest.save_manifest(existing, manifest.new_manifest(
+            job_id='dos', system='s', task_type='dos_pdos', calc_type='slab', inputs={}))
+        with pytest.raises(ValueError, match='冲突'):
+            submitter.adopt_external_job(
+                str(existing), _profile(), '58', '/work/dos', task_type='relax')
+        assert manifest.load_manifest(existing)['task_type'] == 'dos_pdos'
+    finally:
+        ledger_mod.default_ledger_path = orig
+
+
 # ── 队列全量明细解析 ─────────────────────────────────────────────────────────
 def test_slurm_parse_detail_with_workdir():
     d = SlurmDialect()
@@ -141,6 +200,7 @@ def _terminal_job(tmp_path, state='NEEDS_HUMAN', fclass='SCF_SLOSHING'):
     d = _job_dir(tmp_path)
     m = manifest.load_manifest(d)
     m['cluster'] = '1w'
+    m['cluster_binding'] = submitter.profile_binding(_profile())
     m['remote_dir'] = '/work/sk2067/jobs/zn_job'
     m['scheduler_job_id'] = '900'
     m.setdefault('results', {})['diagnosis'] = {
@@ -202,6 +262,211 @@ def test_tune_continue_respects_round_cap(tmp_path):
     with pytest.raises(RuntimeError):
         submitter.continue_with_incar_changes(
             FakeClient(), FakeSFTP(), _profile(), d, {'ALGO': 'Normal'})
+
+
+def test_explicit_manual_tune_can_exceed_automatic_round_cap(tmp_path):
+    d = _terminal_job(tmp_path)
+    m = manifest.load_manifest(d)
+    m['results']['continue_rounds'] = submitter.CONTINUE_MAX_ROUNDS
+    manifest.save_manifest(d, m)
+    client = FakeClient(script=[('cat', _CONTCAR), ('qsub', '904.cluster\n')])
+
+    updated = submitter.continue_with_incar_changes(
+        client, FakeSFTP(), _profile(), d, {'ALGO': 'Normal'}, max_rounds=None)
+
+    assert updated['results']['continue_rounds'] == submitter.CONTINUE_MAX_ROUNDS + 1
+    assert updated['attempts'][-1]['round_limit_override'] == 'manual-explicit'
+    assert '人工确认超出自动上限' in updated['state_history'][-1]['note']
+
+
+@pytest.mark.parametrize('contcar', ['garbage\n', _OVERLAP_CONTCAR])
+def test_tune_requested_contcar_is_validated_before_any_mutation(tmp_path, contcar):
+    d = _terminal_job(tmp_path)
+    incar = os.path.join(d, 'INCAR')
+    poscar = os.path.join(d, 'POSCAR')
+    before = (open(incar, encoding='utf-8').read(),
+              open(poscar, encoding='utf-8').read(),
+              manifest.load_manifest(d))
+    client = FakeClient(script=[('cat', contcar), ('qsub', 'must-not-run\n')])
+
+    with pytest.raises(RuntimeError, match='CONTCAR|原子重叠'):
+        submitter.continue_with_incar_changes(
+            client, FakeSFTP(), _profile(), d, {'ALGO': 'Normal'},
+            max_rounds=None, restart_from_contcar=True,
+            idempotency_key='manual-tune-geometry-001')
+
+    assert open(incar, encoding='utf-8').read() == before[0]
+    assert open(poscar, encoding='utf-8').read() == before[1]
+    assert manifest.load_manifest(d) == before[2]
+    assert not os.path.exists(os.path.join(d, '.vcstudio-job-actions.json'))
+    assert not any('qsub' in command for command in client.commands)
+
+
+def test_tune_operation_key_replays_exact_request_and_rejects_changed_request(tmp_path):
+    d = _terminal_job(tmp_path)
+    key = 'manual-tune-replay-001'
+    first = submitter.continue_with_incar_changes(
+        FakeClient(script=[('cat', _CONTCAR), ('qsub', '905.cluster\n')]),
+        FakeSFTP(), _profile(), d, {'ALGO': 'Normal'}, max_rounds=None,
+        idempotency_key=key)
+    assert first['scheduler_job_id'] == '905'
+
+    replay_client = FakeClient()
+    replay = submitter.continue_with_incar_changes(
+        replay_client, FakeSFTP(), _profile(), d, {'ALGO': 'Normal'},
+        max_rounds=None, idempotency_key=key)
+    assert replay['_tune_continue_replayed'] is True
+    assert replay_client.commands == []
+
+    changed_client = FakeClient()
+    with pytest.raises(ValueError, match='不同的改参续算内容'):
+        submitter.continue_with_incar_changes(
+            changed_client, FakeSFTP(), _profile(), d, {'ALGO': 'Fast'},
+            max_rounds=None, idempotency_key=key)
+    assert changed_client.commands == []
+
+
+def test_tune_manifest_failure_retains_durable_manual_gate(tmp_path, monkeypatch):
+    d = _terminal_job(tmp_path)
+    data = manifest.load_manifest(d)
+    data['results']['continue_rounds'] = submitter.CONTINUE_MAX_ROUNDS
+    manifest.save_manifest(d, data)
+    key = 'manual-tune-crash-001'
+    real_save = submitter.manifest_mod.save_manifest
+
+    def fail_final(path, payload):
+        if (payload.get('state') == 'SUBMITTED'
+                and str(payload.get('scheduler_job_id') or '') == '906'):
+            raise OSError('disk full')
+        return real_save(path, payload)
+
+    monkeypatch.setattr(submitter.manifest_mod, 'save_manifest', fail_final)
+    with pytest.raises(submitter.UnknownRemoteJobOperation,
+                       match='job.yaml') as failure:
+        submitter.continue_with_incar_changes(
+            FakeClient(script=[('cat', _CONTCAR), ('qsub', '906.cluster\n')]),
+            FakeSFTP(), _profile(), d, {'ALGO': 'Normal'}, max_rounds=None,
+            idempotency_key=key)
+    assert failure.value.scheduler_job_id == '906'
+
+    journal = submitter._read_job_action_journal(d)
+    record = journal['operations'][-1]
+    assert record['status'] == 'remote_accepted'
+    assert record['request']['round_limit_override'] == 'manual-explicit'
+    assert record['request']['intent']['changes'] == {'ALGO': 'Normal'}
+    assert record['request']['source_scheduler_job_id'] == '900'
+
+    monkeypatch.setattr(submitter.manifest_mod, 'save_manifest', real_save)
+    restarted = FakeClient()
+    with pytest.raises(submitter.UnknownRemoteJobOperation):
+        submitter.continue_with_incar_changes(
+            restarted, FakeSFTP(), _profile(), d, {'ALGO': 'Normal'},
+            max_rounds=None, idempotency_key=key)
+    assert restarted.commands == []
+
+
+def test_tune_submit_is_guarded_by_frozen_incar_and_promoted_poscar_hashes(
+        tmp_path):
+    d = _terminal_job(tmp_path)
+    key = 'manual-tune-hash-guard-001'
+    client = FakeClient(script=[('cat', _CONTCAR), ('qsub', '907.cluster\n')])
+
+    submitter.continue_with_incar_changes(
+        client, FakeSFTP(), _profile(), d, {'ALGO': 'Normal'},
+        max_rounds=None, idempotency_key=key)
+
+    request = submitter._read_job_action_journal(d)['operations'][-1]['request']
+    pre_archive = next(item for item in client.commands
+                       if 'sha256sum -c -' in item and 'qsub' not in item)
+    submit_command = next(item for item in client.commands if 'qsub' in item)
+    assert request['contcar_source_sha256'] in pre_archive
+    assert request['incar_target_sha256'] in submit_command
+    assert request['poscar_target_sha256'] in submit_command
+    assert submit_command.count('sha256sum -c -') == 2
+    assert submit_command.rindex('sha256sum -c -') < submit_command.index('qsub')
+
+
+def test_authorized_tune_advances_incar_generation_for_later_plain_continue(
+        tmp_path):
+    d = _terminal_job(tmp_path)
+    tuned = submitter.continue_with_incar_changes(
+        FakeClient(script=[('cat', _CONTCAR), ('qsub', '908.cluster\n')]),
+        FakeSFTP(), _profile(), d, {'ALGO': 'Normal'}, max_rounds=None,
+        idempotency_key='tune-authority-advance-001')
+    authority = tuned['execution_authority']
+    assert authority['scheduler_job_id'] == '908'
+    assert authority['current_incar_sha256'] == tuned['attempts'][-1]['incar_sha256']
+
+    manifest.set_state(tuned, 'UNCONVERGED')
+    tuned.setdefault('results', {})['diagnosis'] = {
+        'failure_class': 'NONCONVERGED', 'restartable': True,
+    }
+    manifest.save_manifest(d, tuned)
+    continued = submitter.continue_from_contcar(
+        FakeClient(script=[('cat', _CONTCAR), ('qsub', '909.cluster\n')]),
+        _profile(), d, max_rounds=None,
+        idempotency_key='plain-after-tune-authority-001')
+
+    assert continued['scheduler_job_id'] == '909'
+    assert continued['execution_authority']['current_incar_sha256'] == \
+        authority['current_incar_sha256']
+    assert continued['attempts'][-1]['incar_sha256'] == \
+        authority['current_incar_sha256']
+
+
+def test_continue_and_tune_require_explicit_terminal_state(tmp_path):
+    d = _terminal_job(tmp_path)
+    data = manifest.load_manifest(d)
+    data['state'] = 'CREATED'
+    data['results']['diagnosis']['restartable'] = True
+    manifest.save_manifest(d, data)
+
+    continue_client = FakeClient()
+    with pytest.raises(ValueError, match='不是可续算的终态'):
+        submitter.continue_from_contcar(continue_client, _profile(), d)
+    tune_client = FakeClient()
+    with pytest.raises(ValueError, match='不是可改参重投的终态'):
+        submitter.continue_with_incar_changes(
+            tune_client, FakeSFTP(), _profile(), d, {'ALGO': 'Normal'},
+            max_rounds=None)
+    assert continue_client.commands == []
+    assert tune_client.commands == []
+
+
+def test_tune_rejects_multiline_value_before_any_mutation(tmp_path):
+    d = _terminal_job(tmp_path)
+    client = FakeClient()
+
+    with pytest.raises(ValueError, match='非空单值文本'):
+        submitter.continue_with_incar_changes(
+            client, FakeSFTP(), _profile(), d,
+            {'NELM': '120\nISPIN = 2'}, max_rounds=None,
+            restart_from_contcar=False,
+            idempotency_key='tune-value-injection-0001')
+
+    assert client.commands == []
+    assert not os.path.exists(os.path.join(d, '.vcstudio-job-actions.json'))
+    with open(os.path.join(d, 'INCAR'), encoding='utf-8') as handle:
+        assert 'ISPIN = 2' not in handle.read()
+
+
+@pytest.mark.parametrize('value', [
+    '120 ; ISPIN = 2',
+    '120 # ISPIN = 2',
+    '120 ! ISPIN = 2',
+])
+def test_tune_rejects_single_line_tag_or_comment_injection(tmp_path, value):
+    d = _terminal_job(tmp_path)
+    client = FakeClient()
+
+    with pytest.raises(ValueError, match='标签分隔符|注释符'):
+        submitter.continue_with_incar_changes(
+            client, FakeSFTP(), _profile(), d, {'NELM': value},
+            max_rounds=None, restart_from_contcar=False,
+            idempotency_key='tune-separator-injection-001')
+
+    assert client.commands == []
+    assert not os.path.exists(os.path.join(d, '.vcstudio-job-actions.json'))
 
 
 def test_tune_continue_empty_changes_rejected(tmp_path):

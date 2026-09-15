@@ -1,5 +1,221 @@
 # 更新日志 / Changelog
 
+## [Unreleased] — V4.0.0
+
+V4.0.0 尚未发布，`v4.0.0` 标签也尚未创建。本节汇总当前 Unreleased 工作树中已实现的工作。2026-08-13 已完成本地最终门禁：免缓存完整 pytest 为 **3658 passed、5 skipped**（330.80 秒；15 条 ASE/NumPy 上游弃用警告），全仓 Ruff、actionlint 和 23 个第一方 JavaScript 文件的 `node --check` 均通过；PyInstaller `--full` 单文件构建成功。最终 EXE 为 **113,586,017 bytes（108.32 MiB）**，SHA-256 为 `bcadc9046685c62cf1a9157d0ceba49b131190184dbe30073ce4189ec6817e2d`。
+
+V4.0.0 is not released, and the `v4.0.0` tag has not been created. This section records implemented work in the current Unreleased tree. The final local gates ran on 2026-08-13: cache-free full pytest completed with **3658 passed and 5 skipped** (330.80 s; 15 upstream ASE/NumPy deprecation warnings); full-repository Ruff, actionlint, and `node --check` for 23 first-party JavaScript files passed; and the PyInstaller `--full` one-file build succeeded. The final EXE is **113,586,017 bytes (108.32 MiB)**, SHA-256 `bcadc9046685c62cf1a9157d0ceba49b131190184dbe30073ce4189ec6817e2d`.
+
+2026-08-15 在隔离 worktree 对下述严格指纹/复用变更重新执行了免缓存完整 pytest：
+**3693 passed、5 skipped**（226.23 秒；15 条 ASE/NumPy 上游弃用警告）；全仓 Ruff、
+25 个第一方 JavaScript 文件的 `node --check`、变更 Python 文件的 `py_compile` 和
+`git diff --check` 通过。本轮没有重建 PyInstaller EXE 或重跑 actionlint，因此上面的
+2026-08-13 冻结产物哈希仍是历史产物证据，不能被本轮软件测试自动升级。
+
+On 2026-08-15 the strict-fingerprint/reuse change below was revalidated in an isolated worktree:
+cache-free full pytest completed with **3693 passed and 5 skipped** (226.23 s; 15 upstream ASE/NumPy
+deprecation warnings); full-repository Ruff, `node --check` for 25 first-party JavaScript files,
+`py_compile` for the changed Python files, and `git diff --check` passed. PyInstaller and actionlint
+were not rerun, so the 2026-08-13 frozen binary hash above remains historical artifact evidence and
+is not upgraded by this software-only validation.
+
+2026-08-20 在隔离 worktree 完成严格复用 P1 加固后，全量 pytest 为 **3735 passed、5 skipped**
+（199.15 秒；15 条 ASE/NumPy 上游弃用警告）；全仓 Ruff、25 个第一方 JavaScript 文件的
+`node --check`、25 个变更 Python 文件的 `py_compile` 与 `git diff --check` 通过。未连接真实
+集群执行 VASP，也未重建发行包，因此这些门只证明软件合同，不升级科学结论或冻结发行资格。
+
+After the P1 strict-reuse hardening on 2026-08-20, the isolated worktree passed the full test suite:
+**3735 passed and 5 skipped** in 199.15 s, with 15 upstream ASE/NumPy deprecation warnings. Full-repository
+Ruff, `node --check` for 25 first-party JavaScript files, `py_compile` for 25 changed Python files, and
+`git diff --check` also passed. No real-cluster VASP run or release rebuild was performed, so these gates
+prove software contracts only and do not upgrade scientific or frozen-release qualification.
+
+2026-08-21 继续闭合严格复用复核发现的 4 组 P1：source fingerprint 每次从同一权威快照重建；
+输出哈希、解析和 VASP 版本使用同一 no-follow 文件实体；复用事务以持久目录 handle/file-id 锚定，
+根目录漂移时恢复到 prepared；EOS、spin scan 等派生 builder 在最终输入落定后重签 recipe/closure，
+且运行环境只允许服务端可信 profile 绑定。聚焦回归为 **182 passed、1 skipped**，builder/manifest/
+submit 接缝为 **341 passed**；免缓存全量 pytest 为 **3748 passed、6 skipped**（332.37 秒；15 条
+ASE/NumPy 上游弃用警告）。全仓 Ruff、全部第一方 JavaScript 的 `node --check`、变更 Python 文件的
+`py_compile` 与 `git diff --check` 通过。未运行真实集群 VASP、未重建发行包，也未执行远端 CI。
+
+On 2026-08-21 four additional strict-reuse P1 groups were closed: source fingerprints are rebuilt from
+the same authoritative snapshot; output hashing, parsing, and VASP-version evidence share one no-follow
+file entity; reuse transactions are anchored to persistent directory handles/file identities and roll back
+to prepared on root drift; and derived builders such as EOS and spin scan rebind recipe/input closure only
+after final input bytes exist, while execution environments remain server-bound from trusted profiles.
+Focused tests passed with **182 passed and 1 skipped**, builder/manifest/submission seams passed with
+**341 passed**, and cache-free full pytest completed with **3748 passed and 6 skipped** in 332.37 s, with
+15 upstream ASE/NumPy deprecation warnings. Full-repository Ruff, all first-party JavaScript `node --check`,
+changed-file `py_compile`, and `git diff --check` passed. No real-cluster VASP run, release rebuild, or remote
+CI was performed.
+
+2026-08-21 完成本轮研究工作台整合后的最终本地门禁：免缓存全量 pytest 为
+**5191 passed、12 skipped**（670.53 秒；15 条 ASE/NumPy 上游弃用警告）；全仓 Ruff、
+30 个第一方 JavaScript 文件的 `node --check`、`pip check` 与 `git diff --check` 通过。
+本机未安装 actionlint，因此工作流静态检查仍由推送后的远端 CI 执行。`vcstudio-4.0.0`
+wheel 构建成功（9,877,749 bytes，SHA-256
+`44b769e7f7f3aeaaa10421e84b54d3592e45d7bae262ec3bf6fe9baf64686109`），并包含 52 个 Web
+资源与 2 个 locale。基于目录整理提交 `9bb6a0d` 的 PyInstaller `--full` 单文件 EXE 为
+**115,183,481 bytes（109.85 MiB）**，SHA-256
+`2bf048797fac3299732730e7699e31424d169039668729d1acea1f81f471b34b`；冻结进程内 `full`
+检查 6/6、`journey` 10/10 阶段均以退出码 0 完成，且网络尝试与集群操作均为 0。
+
+On 2026-08-21 the integrated research-workbench tree completed its final local gates: cache-free full
+pytest passed with **5191 passed and 12 skipped** in 670.53 seconds, with 15 upstream ASE/NumPy
+deprecation warnings; full-repository Ruff, `node --check` for 30 first-party JavaScript files,
+`pip check`, and `git diff --check` passed. Actionlint was not installed locally, so workflow linting
+remains a hosted-CI gate after push. The `vcstudio-4.0.0` wheel built successfully (9,877,749 bytes,
+SHA-256 `44b769e7f7f3aeaaa10421e84b54d3592e45d7bae262ec3bf6fe9baf64686109`) with 52 Web assets
+and both locales. The PyInstaller `--full` one-file EXE built from repository-layout commit `9bb6a0d` is
+**115,183,481 bytes (109.85 MiB)** with SHA-256
+`2bf048797fac3299732730e7699e31424d169039668729d1acea1f81f471b34b`; inside that frozen
+process, the 6/6 `full` checks and all 10/10 `journey` phases exited 0 with zero network attempts and
+zero cluster operations.
+
+同日完成仓库布局收口：原根目录 `_待处理归档/` 迁入 `docs/archive/legacy-process/`，Windows
+打包与清理入口分别归入 `packaging/windows/` 和 `tools/windows/`；根目录只保留标准项目入口。
+新增布局合同测试，防止平台脚本重新散落到根目录，并锁定清理入口不得删除 `dist/` 发布产物或
+`results/` 研究输出。本地生成目录统一由 `.gitignore` 管理，不进入版本库。
+
+The same-day repository-layout cleanup moved legacy process material under
+`docs/archive/legacy-process/` and placed Windows packaging/cleanup entry points under their owning
+`packaging/windows/` and `tools/windows/` directories. A repository-layout contract now prevents
+platform scripts from drifting back to the root and ensures generated cleanup preserves both `dist/`
+artifacts and `results/` research outputs.
+
+### 报告、状态与项目工作区（Phase A–B）
+- 建立报告与状态合同，明确稳定项目身份、服务端快照、门禁结论、产物状态和 revision
+  之间的绑定关系；未通过门禁或缺少证据时保留诊断状态，不冒充最终发布结果。
+- 引入项目工作区壳，统一项目上下文、路由、选择恢复和跨页面入口，使分析与报告围绕同一
+  项目身份工作，而不是由各页面各自维护易漂移的副本。
+- 新增严格、版本化的催化领域 DTO 与五条内置研究配方；Prepare → Templates 可用 typed evidence
+  和显式参数覆盖生成零副作用 DAG 预览及 semantic hash。配方 ready 不代表科学 validated/accepted，
+  `job.yaml` 仍是作业事实源。Versioned catalysis DTOs and five built-in research recipes now provide
+  typed-evidence, parameter-source-aware, side-effect-free DAG previews without granting execution authority.
+- 催化 DTO 进一步分离 schema version 与不可变 object revision，并新增独立 create-only/CAS envelope
+  store；ElementaryStep v3 以精确有理系数、phase、charge、逐类型 site stoichiometry 和非空 TS participant
+  tuple 表达反应，并通过 authoritative resolver 分别检查 reactants/TS/products 的精确守恒。配方 UI 以 ID+version 复合身份隔离逆序响应，
+  API 输入拒绝与输出脱敏统一使用全项目凭据分类器。
+
+### Revisioned 工作台与适配器（Phase C–D）
+- 新增 revisioned report workbench，将配置草稿、绑定预览、发布 revision、产物清单及
+  HTML / DOCX / PDF 格式能力纳入同一流程，并保留诊断报告与最终报告的边界。
+- 新增 analysis workbench、preferences 与 batch adapters；旧项目页、批次入口和分析入口
+  通过适配器进入统一合同，不旁路现有科学门禁、格式能力检查或项目身份约束。
+- 新增项目级本地优先 Research Notebook 与 Human Review Ledger：journal 采用项目身份绑定的外部
+  head/sequence anchor、跨进程锁、revision+head+project CAS、完整状态机重放、链式 digest、
+  append-only supersedes/tombstone；路径与 blob no-follow/reparse fail-closed。关联的 project/job/source/report revision
+  在读取时重新校验并显示 current/stale/missing。正文和附件不进入 workspace localStorage；Resume
+  Center 只保存 opaque marker。人工 reviewer attribution 是本地自声明，不是认证或密码学签名，
+  且不会提升 ValidationResult、claims、final、accepted 或 `human_scientific_reviewed`。
+  Project-local Research Notebook and Human Review Ledger records are append-only, revision/head/project CAS-bound,
+  externally head-anchored, digest-chained, evidence/blob-revalidated, and excluded from workspace body storage.
+  Human attribution remains self-asserted and
+  cannot bypass or elevate the existing scientific/report gates.
+- Publish → Export 新增本地 DOI-ready `vcs-archive`：从重新校验的 report revision 生成
+  path-free dry-run、许可/风险/排除清单和 submission-readiness gaps，确认后原子写出绑定
+  revision/manifest/plan hash 的确定性 ZIP；不会上传、申请 DOI 或把 archive integrity 冒充科学发布。
+
+### 密度、键盘、双语与可访问性边界（Phase E）
+- 提供舒展、标准、紧凑三档界面密度，补齐键盘导航、焦点可见性、动态 ARIA / title /
+  placeholder 和空态；语言切换只重绘界面，不改变科学配置。
+- 收口中英双语动态文案，英文模式不以中文作为静默 fallback；公式、文件名、原始科研数据
+  和后端原始载荷仍按数据合同保留。
+- 分离“可生成”与“可访问性”能力：HTML、DOCX、PDF 分别记录视觉、可搜索、语义结构、
+  文档语言、元数据、图片替代文本、tagged / PDF-UA 和人工复核要求；未验证的能力不作过度声明。
+
+### 项目身份、批处理与恢复 / Project identity, batch operations, and recovery
+- Project 新增 Clone、Move 与 Adopt Copy 的服务端预检/确认流程。Clone 铸造新身份，Move 保留身份，
+  Adopt Copy 默认重铸身份；只重定位项目内 locator，不覆盖已存在目标。注册表/台账失败触发回滚，
+  无法完整回滚时保留 partial-rollback 恢复证据，不报告假成功。
+  Project now provides server-preflighted, explicitly confirmed Clone, Move, and Adopt Copy flows. Clone
+  mints a new identity, Move preserves identity, and Adopt Copy remints by default. Existing destinations
+  are never overwritten; failed registry/ledger updates roll back or retain explicit partial-recovery evidence.
+- Jobs 新增 Selection Tray 与 Batch Review，完整显示跨筛选选择和隐藏项；提交、续算、取消采用服务端
+  幂等键，页面互斥锁阻止重复并发副作用。Jobs、Project、Analysis 与 Publish 的长操作汇入统一
+  Operation Queue。Home 新增 Resume Center，只恢复有界草稿引用并重新读取权威状态。
+  Jobs now includes a Selection Tray and Batch Review, including filter-hidden selections. Server
+  idempotency and a UI mutex prevent duplicate remote effects. Long Project/Jobs/Analysis/Publish operations
+  share one Operation Queue, while Resume Center restores bounded draft references without promoting them.
+- Jobs 新增版本化 strict scientific fingerprint 和提交前重复计算提示。只有规范化结构、完整
+  INCAR/KPOINTS、POTCAR 内容身份、Method Recipe 语义哈希、任务/版本和 VASP 构建环境均完整时，
+  才可能显示 exact match；near match 只列差异且不声明等价。索引从权威 manifest/文件重建、容量
+  有界且不是事实源。复用默认关闭；显式引用会新建 provenance/decision，重验并物化 hash-bound
+  结果，支持 prepared→succeeded 崩溃恢复，且从不继承 accepted/final。旧 Recipe 缺失作业保持
+  `incomplete / explicit_legacy`。Jobs 与 Project 一键提交共用联网前门禁和幂等操作标识。
+  Jobs now provides a versioned strict scientific fingerprint and pre-submission duplicate advisory. Exact
+  matches require complete canonical inputs, recipe semantics, task/version, and VASP build evidence; near
+  matches report differences only. The bounded index is rebuildable and non-authoritative. Reuse remains
+  opt-in, creates fresh provenance and a durable decision, revalidates hash-bound results, recovers from a
+  prepared transaction, and never inherits accepted/final qualification. Legacy recipe-less jobs remain
+  explicitly incomplete, and both Jobs and Project submission apply the same pre-network guard.
+- 严格复用门进一步绑定 VASP 实际输入闭包（包括 restart/VDW/ICONST/ML/KPOINTS_OPT 与 NEB 全 image）、
+  当前输出重新解析的 task-aware 收敛证据、registry/manifest 双重项目身份和物化事务 CAS。浏览器提示继续
+  使用有界非权威索引，而提交放行只接受完整权威扫描；任何超限、篡改、未知身份或显式失败证据均失败闭合。
+  The strict reuse gate now binds VASP's actual input closure, task-aware convergence reparsed from current
+  hash-bound outputs, cross-checked project identity, and materialization CAS. Browser advice remains bounded
+  and non-authoritative; submission relies on a complete authoritative scan and fails closed on limits,
+  tampering, unknown identity, or explicit contradictory result evidence.
+
+### 分析、资源与治理 / Analysis, resources, and governance
+- Home 与 Project 新增共享的跨项目 Research Explorer：从 registry/project/job/manifest/validation
+  派生可重建只读索引，支持方法兼容默认过滤、稳定分页、服务端表格/histogram/scatter/元素周期表
+  DTO、opaque ID drill-down 和 data/logical live provenance。保存视图只含 filters/sort/axes，并以
+  authority_id + revision CAS 更新；partial/stale/unavailable 时 fail closed，且 frozen report graph
+  保持独立。没有引入数据库、远程副作用或 accepted/publication gate 旁路。
+- Analysis capability cards 以服务端证据区分 available、missing prerequisite、mode mismatch、
+  not implemented 与 unavailable。Task Results、DOS/PDOS、Bands/带隙、功函数、Bader、差分电荷和
+  Property calculators 使用真实 parser、来源 hash、opaque ID 与分母；浏览器不复算数值。
+  Capability cards expose server-owned availability and evidence. Task Results, DOS/PDOS, bands/gaps,
+  work function, Bader, charge-density difference, and property calculators use real parsers, opaque sources,
+  hashes, and denominators rather than browser-computed values.
+- **ELF 分布摘要解析已接入**：严格校验 ELFCAR 主网格、有限数和物理范围，并输出确定性统计、
+  分位点、直方图与来源哈希；它不宣称成键、盆、临界点或拓扑结论。The read-only ELF parser
+  reports a validated distribution summary only, never a bonding or topology conclusion.
+- 新增只读资源预测和实验室建议策略。预测缺历史/输入时保持低置信度或 unavailable，不授权提交；
+  策略必须显式确认、带 revision/hash，且不改写旧作业。治理后的下一步计算建议只从绑定当前数据指纹、
+  经人工科学复核且允许 final 的 ValidationResult 生成；确认只产生不含命令、绝不自动提交的 draft intent。
+  Read-only resource forecasts and laboratory recommendation policies never authorize submission or rewrite
+  existing jobs. Governed next-calculation recommendations require a human-reviewed, final-allowing validation
+  bound to the current fingerprint; confirmation creates a non-executable draft intent only.
+
+### 报告洞察与可复现性 / Report insights and reproducibility
+- Publish → Versions 新增 scientific diff：从权威 history 选择两个 revision，分别重新校验 bundle，
+  比较 scope、输入/快照 hash、validation、科学资格、模型/表格数值、图表及 manifest/file hash，
+  不以日期差异代替科学差异。Scientific diff revalidates both authoritative revisions and compares frozen
+  scientific content and hashes, never dates alone.
+- 新增 Evidence/Claim Graph，只从冻结 model/spec/snapshot/validation/claim 记录建立 conclusion/table/
+  figure/check/source/job/file-hash 关系，缺边显式标记且不泄漏本地路径。
+  Evidence/Claim Graph derives only from frozen records, marks missing links, and omits local paths.
+- 新增确定性 SI capsule：包含规范化合同、输入 manifest、模型/图表元数据、Methods、BibTeX、环境/版本、
+  validation、capsule manifest 与 `SHA256SUMS`；排除密钥、绝对路径、缓存和 mutable live files，
+  使用有 TTL/上限的单次目录 token，并以 no-overwrite 写入。Diagnostic/blocked capsule 仍不是 scientific final。
+  Deterministic SI capsules are redacted, self-checksummed, destination-token bounded, and no-overwrite.
+  Export success does not upgrade a diagnostic/blocked revision to scientific final.
+
+### 冻结发行门 / Frozen release gate
+- Windows package-smoke 现配置为构建真实最终 EXE，并在冻结进程内强制运行 `full` 与 `journey`。
+  Journey 隔离 HOME/config、禁用网络、运行真实 Api/ReportService、离线作业、Analysis preview 和
+  diagnostic HTML 报告，然后重建服务并验证项目/作业/report history/status 持久化。
+  Windows package-smoke is configured to run both `full` and `journey` inside the real frozen executable.
+  The journey is offline and isolated, exercises the real bridge and diagnostic report path, then verifies
+  persistence after service reconstruction.
+
+### 验证
+- 上述新增能力已执行聚焦 Python 合同测试和/或真实 Node 生产 IIFE 回归；最终冻结 EXE 中的 `full` 与
+  `journey` 都以退出码 0 完成，并各自报告 `ok=true`、`frozen=true`。`journey` 完成 10/10 阶段、网络尝试
+  为 0、集群操作为 0，且服务重建后的重启持久化检查通过；它仍保持 Analysis `unverified/blocked`、report
+  `diagnostic/blocked`，没有伪造科学验证。
+  The features above have focused Python and/or executable-Node production-script coverage. In the final frozen EXE,
+  both `full` and `journey` exited 0 and reported `ok=true` and `frozen=true`; journey completed 10/10 phases with
+  0 network attempts, 0 cluster operations, and passed restart persistence after service reconstruction, while
+  preserving honest Analysis `unverified/blocked` and report `diagnostic/blocked` scientific states.
+- 推送后的具体提交仍须通过 GitHub-hosted 远端 CI，不能由本地门禁替代；5 个 skip 不等于功能通过。未执行真实远程集群
+  作业或真实科学/实验验证，因此 Unreleased 不能据此描述为科学有效或正式 release-ready。
+  The exact pushed commit must still pass GitHub-hosted CI, which is not replaced by local gates; the 5 skips are
+  not functionality passes. No real remote-cluster work or scientific/experimental validation was performed, so
+  Unreleased must not be described as scientifically validated or formally release-ready.
+
 ## v3.3.0 — 2026-07-18 · 对齐 starpivot 体验四缺口:实时曲线 / 贴图识别 / 实耗核时 / VMD 场景补齐
 
 2109 项测试。对照 starpivot-DFT 全部页面逐项对齐后落地四件:

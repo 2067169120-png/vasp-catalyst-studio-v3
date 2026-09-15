@@ -164,11 +164,173 @@ def test_free_energy_ladder_single_dict(tmp_path):
     _assert_pdf(out[1])
 
 
+def test_free_energy_ladder_keeps_eight_catalysts_on_one_axes_and_own_ul(
+        monkeypatch, tmp_path):
+    captured = {}
+
+    def capture_figure(fig, out_path, formats=('png', 'pdf')):
+        captured['fig'] = fig
+        captured['out_path'] = out_path
+        captured['formats'] = formats
+        return [str(out_path)]
+
+    monkeypatch.setattr(nc, '_save_dual', capture_figure)
+    catalyst_names = [
+        f'Catalyst {letter} supported cobalt nitrogen long screening project'
+        for letter in 'ABCDEFGH'
+    ]
+    paths = [
+        {
+            'name': name,
+            'G': [0.0, 0.35, -0.10],
+            'pds_index': 0,
+            # 与从台阶高度回算的 -0.35 V 刻意不同，证明逐路径权威值生效。
+            'u_l': (i + 1) * 0.11,
+        }
+        for i, name in enumerate(catalyst_names)
+    ]
+
+    nc.free_energy_ladder(
+        paths, tmp_path / 'eight-catalysts',
+        step_labels=['S8', 'Li2S8', 'Li2S'],
+        show_ul=True)
+
+    fig = captured['fig']
+    assert len(fig.axes) == 1
+    assert fig.get_figwidth() >= nc.DOUBLE_COL
+    legend = fig.axes[0].get_legend()
+    labels = [text.get_text() for text in legend.get_texts()]
+    assert len(labels) == 8
+    for i, (name, label) in enumerate(zip(catalyst_names, labels), start=1):
+        assert name in label.replace('\n', ' ')
+        assert f'= {i * 0.11:.2f} V' in label
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    xlabel_box = fig.axes[0].xaxis.label.get_window_extent(renderer)
+    legend_box = legend.get_window_extent(renderer)
+    assert not xlabel_box.overlaps(legend_box)
+    assert xlabel_box.y0 - legend_box.y1 >= 2.0
+    assert legend_box.x0 >= fig.bbox.x0 and legend_box.x1 <= fig.bbox.x1
+    assert legend_box.y0 >= fig.bbox.y0 and legend_box.y1 <= fig.bbox.y1
+
+
 def test_free_energy_ladder_bad_data():
     with pytest.raises(ValueError):
         nc.free_energy_ladder([], 'x')
     with pytest.raises(ValueError):
         nc.free_energy_ladder({'name': 'p', 'G': [0.0]}, 'x')
+    with pytest.raises(ValueError, match='u_l'):
+        nc.free_energy_ladder(
+            {'name': 'p', 'G': [0.0, 1.0], 'u_l': float('nan')}, 'x')
+
+
+def test_ladder_series_styles_are_unique_for_twelve_paths():
+    styles = [nc.ladder_series_style(index) for index in range(12)]
+    signatures = {
+        (style['color'], repr(style['linestyle']), style['marker'])
+        for style in styles
+    }
+    assert len(signatures) == 12
+    # 第九条开始复用颜色，但必须由线型继续区分。
+    assert styles[0]['color'] == styles[8]['color']
+    assert styles[0]['linestyle'] != styles[8]['linestyle']
+
+
+def test_ladder_layout_reserves_footer_for_long_multicolumn_legend():
+    names = [
+        f'催化剂项目_{index:02d}_具有非常长的双原子位点描述_Fe-Co@B1N3'
+        for index in range(12)
+    ]
+    layout = nc.ladder_layout_metadata(
+        12, 6, names=names,
+        step_labels=['S8*', 'Li2S8*', 'Li2S6*', 'Li2S4*', 'Li2S2*', 'Li2S*'])
+    assert layout['legend_ncols'] >= 2
+    assert layout['legend_rows'] >= 3
+    assert layout['bottom_fraction'] > 0.30
+    assert layout['figure_width'] >= nc.ONE_HALF_COL
+    assert layout['figure_height'] > layout['figure_width'] * 0.70
+    assert all('\n' in label for label in layout['wrapped_names'])
+
+
+def test_free_energy_ladder_show_ul_uses_only_authoritative_path_value(monkeypatch):
+    captured = {}
+
+    def _capture(fig, _out_path, _formats):
+        captured['fig'] = fig
+        return ['captured.png']
+
+    monkeypatch.setattr(nc, '_save_dual', _capture)
+    nc.free_energy_ladder([
+        {'name': 'authoritative', 'G': [0.0, 4.0], 'pds_index': 0, 'u_l': 0.13},
+        # No u_l: the large climb must never be converted to a displayed U_L.
+        {'name': 'missing-ul', 'G': [0.0, 9.0], 'pds_index': 0},
+    ], 'unused', show_ul=True)
+
+    legend_text = '\n'.join(
+        text.get_text() for text in captured['fig'].axes[0].get_legend().get_texts())
+    assert '0.13 V' in legend_text
+    assert '-4.00 V' not in legend_text
+    assert '-9.00 V' not in legend_text
+    missing_label = next(line for line in legend_text.splitlines() if 'missing-ul' in line)
+    assert 'U_' not in missing_label
+
+
+def test_free_energy_ladder_twelve_paths_one_axis_and_safe_legend_gap(monkeypatch):
+    captured = {}
+
+    def _capture(fig, _out_path, _formats):
+        captured['fig'] = fig
+        return ['captured.png']
+
+    monkeypatch.setattr(nc, '_save_dual', _capture)
+    paths = [
+        {
+            'name': f'project_{index:02d}_long_catalyst_name_Fe-Co@B1N3_variant',
+            'G': [0.0, -0.2 - index * 0.01, -0.6, -0.4, -1.0, -1.2],
+            'pds_index': 2,
+            'u_l': 0.10 + index * 0.01,
+        }
+        for index in range(12)
+    ]
+    nc.free_energy_ladder(
+        paths, 'unused',
+        step_labels=['S8*', 'Li2S8*', 'Li2S6*', 'Li2S4*', 'Li2S2*', 'Li2S*'],
+        show_ul=True)
+
+    fig = captured['fig']
+    assert len(fig.axes) == 1
+    ax = fig.axes[0]
+    legend = ax.get_legend()
+    assert legend is not None and len(legend.get_texts()) == 12
+    assert getattr(fig, '_vcstudio_ladder_layout')['legend_ncols'] >= 2
+    # Multi-path default suppresses twelve overlapping PDS numeric annotations.
+    assert not any(text.get_text().startswith('+') for text in ax.texts)
+
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    xlabel_box = ax.xaxis.label.get_window_extent(renderer)
+    legend_box = legend.get_window_extent(renderer)
+    figure_box = fig.bbox
+    assert legend_box.y1 <= xlabel_box.y0 - 2.0
+    assert legend_box.x0 >= figure_box.x0 - 1.0
+    assert legend_box.x1 <= figure_box.x1 + 1.0
+    assert legend_box.y0 >= figure_box.y0 - 1.0
+
+
+def test_free_energy_ladder_multi_pds_annotations_can_be_requested(monkeypatch):
+    captured = {}
+
+    def _capture(fig, _out_path, _formats):
+        captured['fig'] = fig
+        return ['captured.png']
+
+    monkeypatch.setattr(nc, '_save_dual', _capture)
+    nc.free_energy_ladder([
+        {'name': 'A', 'G': [0.0, 0.4, -0.2], 'pds_index': 0},
+        {'name': 'B', 'G': [0.0, 0.3, -0.4], 'pds_index': 0},
+    ], 'unused', annotate_pds=True)
+    labels = [text.get_text() for text in captured['fig'].axes[0].texts]
+    assert '+0.40' in labels and '+0.30' in labels
 
 
 # ── 矩阵热图 ────────────────────────────────────────────────────────────────
@@ -327,3 +489,18 @@ def test_svg_export(tmp_path):
     assert svg.endswith('.svg') and os.path.getsize(svg) > 500
     head = open(svg, encoding='utf-8').read(300)
     assert '<svg' in head or '<?xml' in head
+
+
+def test_submission_bundle_has_two_vectors_and_600_dpi_tiff(tmp_path):
+    from PIL import Image
+
+    assert nc.submission_formats() == ('pdf', 'svg', 'tiff')
+    out = nc.adsorption_bar(
+        BAR_DATA, tmp_path / 'submission',
+        formats=nc.submission_formats())
+    assert [os.path.splitext(path)[1] for path in out] == ['.pdf', '.svg', '.tiff']
+    _assert_pdf(out[0])
+    assert os.path.getsize(out[1]) > 500
+    with Image.open(out[2]) as image:
+        dpi = image.info.get('dpi') or (0, 0)
+    assert dpi[0] == pytest.approx(nc.SUBMISSION_RASTER_DPI, abs=1)

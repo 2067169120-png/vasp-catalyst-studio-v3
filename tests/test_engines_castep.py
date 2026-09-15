@@ -115,7 +115,37 @@ def test_castep_spin():
 
 def test_castep_dispersion_sedc():
     param, _ = build_param(_spec(dispersion='D3'))
-    assert 'sedc_apply           : true' in param and 'sedc_scheme' in param
+    assert 'sedc_apply           : true' in param and 'sedc_scheme          : D3' in param
+
+
+def test_castep_d3bj_and_unknown_dispersion():
+    assert 'sedc_scheme          : D3-BJ' in build_param(_spec(dispersion='D3(BJ)'))[0]
+    with pytest.raises(ValueError, match='拒绝静默'):
+        build_param(_spec(dispersion='unknown'))
+
+
+def test_castep_unknown_xc_and_invalid_numeric_parameters_fail_closed():
+    with pytest.raises(ValueError, match='xc_functional'):
+        build_param(_spec(functional='made-up-xc'))
+    with pytest.raises(ValueError, match='cut_off_energy'):
+        build_param(_spec(cutoff_ev=float('nan')))
+    with pytest.raises(ValueError, match='geom_max_iter'):
+        build_param(_spec(task='relax', extras={'geom_max_iter': 1.5}))
+
+
+def test_castep_d3_requires_registered_functional_parameters():
+    with pytest.raises(ValueError, match='D3'):
+        build_param(_spec(functional='RPBE', dispersion='D3'))
+
+
+def test_castep_nonperiodic_is_explicitly_rejected():
+    with pytest.raises(ValueError, match='periodic=False'):
+        build_cell(_spec(periodic=False, kpoints=None))
+
+
+def test_castep_param_passthrough_cannot_duplicate_scientific_keys():
+    with pytest.raises(ValueError, match='重复键'):
+        build_param(_spec(extras={'param': {'task': 'SinglePoint'}}))
 
 
 def test_castep_generate_writes_cell_param(tmp_path):
@@ -139,7 +169,8 @@ def _castep_out(tmp_path, text):
 def test_castep_parse_final_energy(tmp_path):
     r = _castep_out(tmp_path,
                     'Final energy, E             =  -1234.5678901234     eV\n'
-                    'Geometry optimization completed successfully\n')
+                    'Geometry optimization completed successfully\n'
+                    'Total time = 12.3 s\n')
     assert r['energy_ev'] == pytest.approx(-1234.5678901234)   # 已是 eV,不换算
     assert r['converged'] is True and r['error'] is None
 
@@ -157,6 +188,60 @@ def test_castep_parse_last_energy(tmp_path):
                     'Final energy, E             =  -120.0     eV\n'
                     'Geometry optimization completed successfully\n')
     assert r['energy_ev'] == pytest.approx(-120.0)
+
+
+def test_castep_energy_convention_prefers_zero_k_estimate(tmp_path):
+    r = _castep_out(tmp_path,
+                    'Final energy, E = -100.0 eV\n'
+                    'Final free energy (E-TS) = -101.0 eV\n'
+                    'NB est. 0K energy (E-0.5TS) = -100.5 eV\n'
+                    'Total time = 1.0 s\n')
+    assert r['energy_ev'] == pytest.approx(-100.5)
+    assert r['energy_source'] == 'NB est. 0K energy'
+
+
+def test_castep_relax_total_time_without_geo_convergence_is_not_done(tmp_path):
+    (tmp_path / 'case.param').write_text(
+        'task : GeometryOptimization\n', encoding='utf-8')
+    r = _castep_out(tmp_path,
+                    'Final energy, E = -100.0 eV\nTotal time = 1.0 s\n')
+    assert r['converged'] is False and r['task_converged'] is False
+
+
+def test_castep_phonon_file_and_geom_structure_are_parsed(tmp_path):
+    (tmp_path / 'case.param').write_text('task : Phonon\n', encoding='utf-8')
+    (tmp_path / 'case.phonon').write_text(
+        'q-pt= 1 0.0 0.0 0.0\n1 -15.0\n2 100.0\n', encoding='utf-8')
+    (tmp_path / 'case.geom').write_text(
+        '-1.0 <-- E\n10 0 0 <-- h\n0 10 0 <-- h\n0 0 10 <-- h\n'
+        'H 1 1.0 2.0 3.0 <-- R\n', encoding='utf-8')
+    r = _castep_out(tmp_path,
+                    'Final energy, E = -100.0 eV\nTotal time = 1.0 s\n')
+    assert r['converged'] is True and r['n_imaginary'] == 1
+    xyz = r['final_structure']['atoms'][0]['xyz_angstrom']
+    assert xyz == pytest.approx([0.529177210903, 1.058354421806, 1.587531632709])
+
+
+def test_castep_phonon_file_does_not_double_count_castep_echo(tmp_path):
+    (tmp_path / 'case.param').write_text('task : Phonon\n', encoding='utf-8')
+    (tmp_path / 'case.phonon').write_text(
+        'q-pt= 1 0.0 0.0 0.0\n1 -15.0\n2 100.0\n', encoding='utf-8')
+    r = _castep_out(tmp_path,
+                    'Final energy, E = -100.0 eV\n'
+                    'q-pt= 1 0.0 0.0 0.0\n1 -15.0\n2 100.0\n'
+                    'Total time = 1.0 s\n')
+    assert r['frequencies_cm1'] == [-15.0, 100.0]
+    assert r['n_imaginary'] == 1 and r['converged'] is True
+
+
+def test_castep_check_rejects_mismatched_seed_pair(tmp_path):
+    (tmp_path / 'a.cell').write_text(
+        '%BLOCK LATTICE_CART\n%ENDBLOCK LATTICE_CART\n'
+        '%BLOCK POSITIONS_FRAC\n%ENDBLOCK POSITIONS_FRAC\nKPOINTS_MP_GRID 1 1 1\n',
+        encoding='utf-8')
+    (tmp_path / 'b.param').write_text(
+        'task: SinglePoint\nxc_functional: PBE\ncut_off_energy: 500 eV\n', encoding='utf-8')
+    assert any('同名' in issue for issue in get_backend('castep').check_inputs(str(tmp_path)))
 
 
 def test_castep_parse_missing(tmp_path):

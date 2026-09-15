@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import importlib
+import math
 
 # ── 渲染函数落点(renderer 名 → 模块.函数);延迟 import,注册表零重依赖 ──────────
 _RENDERER_TARGETS = {
@@ -25,6 +26,8 @@ _RENDERER_TARGETS = {
     'free_energy_ladder':  ('vcstudio.external.native_charts', 'free_energy_ladder'),
     'pdos_plot':           ('vcstudio.external.native_charts', 'pdos_plot'),
     'charge_profile_plot': ('vcstudio.external.native_charts', 'charge_profile_plot'),
+    'convergence_plot':    ('vcstudio.generate.conv_scan', 'conv_plot'),
+    'energy_time_plot':    ('vcstudio.external.native_charts', 'energy_time_plot'),
     'cohp_plot':           ('vcstudio.external.lobster', 'cohp_plot'),
     'neb_profile_plot':    ('vcstudio.project.neb', 'neb_profile_plot'),
 }
@@ -55,6 +58,15 @@ def _need(data, keys: list, human: str) -> None:
             pass
     if miss:
         raise ValueError(f'{human}:数据契约不满足,缺少 {miss}(需要:{keys})')
+
+
+def _finite(value) -> bool:
+    if isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
 
 
 # ── 各 renderer 的入参适配器:(fn, data, out_path, params) → 路径列表 ─────────────
@@ -110,12 +122,51 @@ def _a_cohp(fn, data, out_path, params):
 
 def _a_neb(fn, data, out_path, params):
     _need(data, ['rel'], 'NEB 剖面图')
+    rel = list(data['rel'])
+    if (sum(_finite(value) for value in rel) < 2
+            or any(value is not None and not _finite(value) for value in rel)):
+        raise ValueError('NEB 剖面图:至少需要 2 个有限相对能量点')
     return fn(data, out_path, **params)
 
 
 def _a_charge(fn, data, out_path, params):
     _need(data, ['z', 'rho'], '差分电荷面平均图')
     return fn(data['z'], data['rho'], out_path, regions=data.get('regions'), **params)
+
+
+def _a_convergence(fn, data, out_path, params):
+    _need(data, ['points'], '收敛测试曲线')
+    points = [
+        item for item in data['points']
+        if isinstance(item, dict) and _finite(item.get('x'))
+        and _finite(item.get('energy'))
+    ]
+    if len(points) < 2:
+        raise ValueError('收敛测试曲线:至少需要 2 个有限坐标/能量点')
+    kw = dict(params)
+    for key in ('converged_at', 'threshold_mev', 'natoms', 'xlabel'):
+        if data.get(key) is not None:
+            kw.setdefault(key, data[key])
+    return fn(points, out_path, **kw)
+
+
+def _a_aimd(fn, data, out_path, params):
+    _need(data, ['steps'], 'AIMD 能量-温度诊断图')
+    steps = [
+        item for item in data['steps']
+        if isinstance(item, dict)
+        and _finite(item.get('energy'))
+        and _finite(item.get('temperature'))
+        and _finite(item.get('time', item.get('step')))
+    ]
+    if len(steps) < 2:
+        raise ValueError('AIMD 能量-温度诊断图:至少需要 2 个有限 MD 步')
+    # A frozen server view may already carry an explicit time coordinate.  In
+    # that case dt_fs is provenance, not another scaling instruction.
+    has_time = any(isinstance(item, dict) and item.get('time') is not None
+                   for item in steps)
+    dt_fs = None if has_time else data.get('dt_fs')
+    return fn(steps, out_path, dt_fs=dt_fs, **params)
 
 
 _ADAPTERS = {
@@ -129,6 +180,8 @@ _ADAPTERS = {
     'cohp_plot': _a_cohp,
     'neb_profile_plot': _a_neb,
     'charge_profile_plot': _a_charge,
+    'convergence_plot': _a_convergence,
+    'energy_time_plot': _a_aimd,
 }
 
 
@@ -238,7 +291,15 @@ _SVG_CONVERGE = ('<svg xmlns="http://www.w3.org/2000/svg" width="80" height="60"
                  '<line x1="12" y1="24" x2="70" y2="24" stroke="#bbb" stroke-dasharray="3,2"/>'
                  '<polyline points="16,12 24,34 32,20 40,28 48,23 56,25 64,24 70,24" '
                  'fill="none" stroke="#4477AA" stroke-width="1.3"/>'
-                 '<text x="44" y="46" font-size="8" fill="#bbb" text-anchor="middle">TODO</text></svg>')
+                 '<circle cx="48" cy="23" r="3" fill="#DDAA33" stroke="#333"/>'
+                 '</svg>')
+
+_SVG_AIMD = ('<svg xmlns="http://www.w3.org/2000/svg" width="80" height="60" viewBox="0 0 80 60">'
+             '<line x1="10" y1="50" x2="72" y2="50" stroke="#888"/>'
+             '<path d="M12,31 L18,27 L24,34 L30,25 L36,29 L42,26 L48,31 L54,27 L60,30 L68,28" '
+             'fill="none" stroke="#4477AA" stroke-width="1.3"/>'
+             '<path d="M12,40 L18,38 L24,42 L30,35 L36,39 L42,34 L48,37 L54,33 L60,36 L68,32" '
+             'fill="none" stroke="#EE6677" stroke-width="1.1"/></svg>')
 
 
 # ── 预设注册表(≥12;renderer 名须为 _RENDERER_TARGETS 键或 'todo')──────────────
@@ -328,12 +389,152 @@ PRESETS = [
     },
     {
         'key': 'convergence_curve', 'name': '收敛测试曲线', 'category': '结构',
-        'description': '截断能/K 点/离子步收敛曲线(能量或力对参数收敛)。该图型将在后续版本提供。',
-        'required_data': "各测试点的真实参数与对应能量/力(如 ENCUT 序列 vs E0);零编造,须真实历史值。",
-        'thumbnail_svg': _SVG_CONVERGE, 'renderer': 'todo',
-        'params_schema': {'metric': 'energy', 'xlabel': 'ENCUT (eV)', 'title': ''},
+        'description': '截断能/K 点/真空/层厚的服务器冻结收敛点、阈值带与推荐点。',
+        'required_data': "points=[{x,energy}] + 显式 threshold_mev/natoms/converged_at;仅绑定真实扫描历史。",
+        'thumbnail_svg': _SVG_CONVERGE, 'renderer': 'convergence_plot',
+        'params_schema': {'xlabel': 'parameter', 'title': ''},
+    },
+    {
+        'key': 'aimd_diagnostic', 'name': 'AIMD 能量-温度诊断图', 'category': '结构',
+        'description': '服务器冻结的总能与温度时间线；仅作轨迹诊断，不宣称长期热稳定。',
+        'required_data': "steps=[{time,energy,temperature}]，可附 dt_fs；数值须来自权威 AIMD 解析视图。",
+        'thumbnail_svg': _SVG_AIMD, 'renderer': 'energy_time_plot',
+        'params_schema': {'title': ''},
     },
 ]
+
+
+CATEGORY_EN = {
+    '能量学': 'Energetics',
+    '电子结构': 'Electronic structure',
+    '结构': 'Structure',
+    '电池': 'Electrochemistry',
+}
+
+_PRESET_EN = {
+    'adsorption_bar': {
+        'name_en': 'Grouped adsorption-energy bar chart',
+        'description_en': (
+            'Grouped adsorption energies for multiple adsorbates and substrates, '
+            'with value labels above the bars.'),
+        'required_data_en': (
+            'adsorbates (list) + substrates ({substrate: [ΔE for each adsorbate]}; '
+            'use None for missing values); each substrate list must match the '
+            'adsorbates length.'),
+    },
+    'delta_e_heatmap': {
+        'name_en': 'ΔE/ΔG matrix heatmap',
+        'description_en': (
+            'A catalyst-by-adsorbate energy heatmap with cell annotations and a '
+            'color scale for cross-catalyst comparison.'),
+        'required_data_en': (
+            'rows (substrates or catalysts) + cols (adsorbates) + values (row-wise '
+            'ΔE matrix); use None for a blank cell.'),
+    },
+    'scaling_relation': {
+        'name_en': 'Scaling-relation plot',
+        'description_en': (
+            'Scatter plot for two adsorption descriptors with a least-squares line, '
+            'fitted equation, and R² diagnostic.'),
+        'required_data_en': (
+            'xs and ys (equal-length descriptor series, such as ΔE for two '
+            'adsorbates); labels is optional and names each point.'),
+    },
+    'volcano': {
+        'name_en': 'Two-leg volcano plot',
+        'description_en': (
+            'Sabatier activity versus an adsorption descriptor; when two fitted '
+            'legs are provided, their intersection defines the volcano peak.'),
+        'required_data_en': (
+            'points=[{name, x=descriptor, y=activity}]; optional legs contains two '
+            '[{slope, intercept}] records used to determine the peak.'),
+    },
+    'energy_matrix_table': {
+        'name_en': 'Three-line energy matrix table',
+        'description_en': (
+            'Publication-style adsorbate-by-substrate energy table in PNG, PDF, and '
+            'CSV, with ΔE and optional ΔG columns.'),
+        'required_data_en': (
+            'adsorbates + substrates (one ΔE column per substrate); optional dg maps '
+            'each substrate to one ΔG column.'),
+    },
+    'free_energy_ladder': {
+        'name_en': 'Single-path ΔG free-energy ladder',
+        'description_en': (
+            'Single-system free-energy ladder with solid plateaus, dashed '
+            'connections, and optional potential-determining-step annotation.'),
+        'required_data_en': (
+            'paths={name, G:[cumulative ΔG for each step]}; step_labels and '
+            'pds_index are optional.'),
+    },
+    'free_energy_ladder_multi': {
+        'name_en': 'Multi-potential or multi-system ΔG ladder',
+        'description_en': (
+            'Overlay of free-energy ladders for several systems or potentials, such '
+            'as U=0, U_eq, and U_L or a catalyst comparison.'),
+        'required_data_en': (
+            'paths=[{name, G:[...]}, ...] for different potentials or catalysts; '
+            'pds_index follows the per-electron convention.'),
+    },
+    'neb_profile': {
+        'name_en': 'NEB minimum-energy path profile',
+        'description_en': (
+            'CI-NEB relative energy along the reaction coordinate with the '
+            'transition-state point and forward/reverse barriers annotated.'),
+        'required_data_en': (
+            'The parse_neb_energies result, including rel energies, ts_index, '
+            'barrier_f, and barrier_r.'),
+    },
+    'pdos': {
+        'name_en': 'Spin-mirrored PDOS',
+        'description_en': (
+            'Overlay of projected densities of states with spin-down mirrored below '
+            'zero, the Fermi level marked, and optional d-band centers.'),
+        'required_data_en': (
+            'series=[{label, energies, dos_up, dos_down?}]; efermi and band_centers '
+            'are optional.'),
+    },
+    'cohp': {
+        'name_en': 'COHP bond-strength plot',
+        'description_en': (
+            'LOBSTER −pCOHP curves with bonding plotted positive, a Fermi zero line, '
+            'and ICOHP bond-strength annotations.'),
+        'required_data_en': (
+            'The parse_cohpcar result: energies plus pairs containing cohp_up, '
+            'optional cohp_down, and icohp.'),
+    },
+    'charge_profile': {
+        'name_en': 'Planar-averaged difference charge Δρ̄(z)',
+        'description_en': (
+            'Planar-averaged difference-charge profile with accumulation (>0) and '
+            'depletion (<0) filled separately and optional region shading.'),
+        'required_data_en': (
+            'z and rho planar-average series from chgdiff.plane_averaged; regions is '
+            'optional and defines shaded intervals.'),
+    },
+    'convergence_curve': {
+        'name_en': 'Convergence-test curve',
+        'description_en': (
+            'Server-frozen cutoff-energy, k-point, vacuum, or slab-thickness '
+            'points with an explicit threshold band and recommended point.'),
+        'required_data_en': (
+            'points=[{x, energy}] plus explicit threshold_mev, natoms, and '
+            'converged_at values bound to real scan history.'),
+    },
+    'aimd_diagnostic': {
+        'name_en': 'AIMD energy-temperature diagnostic',
+        'description_en': (
+            'Server-frozen total-energy and temperature timeline for trajectory '
+            'diagnostics only; it is not a long-time thermal-stability claim.'),
+        'required_data_en': (
+            'steps=[{time, energy, temperature}] with optional dt_fs, produced by '
+            'the authoritative AIMD analysis view.'),
+    },
+}
+
+for _preset in PRESETS:
+    _preset.update(_PRESET_EN[_preset['key']])
+    _preset['category_en'] = CATEGORY_EN[_preset['category']]
 
 
 # ── 公开 API ─────────────────────────────────────────────────────────────────

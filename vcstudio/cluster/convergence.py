@@ -18,6 +18,18 @@ _STEP_NO_RE = re.compile(r'^\s*(\d+)\s+F=')
 _E0_RE = re.compile(r'E0=\s*([-+]?[.\d]+(?:[eE][-+]?\d+)?)')
 
 
+class ForceBlockLimitError(ValueError):
+    """OUTCAR force blocks exceeded the caller's bounded service budget."""
+
+
+class ForceLineLimitError(ValueError):
+    """An OUTCAR line exceeded the caller's bounded parsing budget."""
+
+
+class ForceRowLimitError(ValueError):
+    """One OUTCAR force block exceeded the bounded atom-row budget."""
+
+
 def parse_oszicar(text: str) -> list[dict]:
     """OSZICAR 文本 → 逐离子步 ``[{step,E0,dE,scf_iters}, ...]``。
 
@@ -53,42 +65,109 @@ def parse_oszicar(text: str) -> list[dict]:
     return steps
 
 
+def parse_outcar_fmax_lines(lines, *, max_blocks: int | None = None,
+                            max_rows_per_block: int | None = None,
+                            max_line_bytes: int | None = None,
+                            require_terminated: bool = False,
+                            with_status: bool = False):
+    """OUTCAR 行迭代器 → 逐离子步 |F|max(eV/Å)。
+
+    这是 ``parse_outcar_fmax`` 的流式同源入口，供大型 OUTCAR 调用方直接传文件
+    句柄；力范数与块终止语义保持一致，不形成第二套数值口径。
+    """
+    if max_blocks is not None and (
+            isinstance(max_blocks, bool)
+            or not isinstance(max_blocks, int)
+            or max_blocks < 1):
+        raise ValueError('max_blocks must be a positive integer')
+    if max_rows_per_block is not None and (
+            isinstance(max_rows_per_block, bool)
+            or not isinstance(max_rows_per_block, int)
+            or max_rows_per_block < 1):
+        raise ValueError('max_rows_per_block must be a positive integer')
+    if max_line_bytes is not None and (
+            isinstance(max_line_bytes, bool)
+            or not isinstance(max_line_bytes, int)
+            or max_line_bytes < 1):
+        raise ValueError('max_line_bytes must be a positive integer')
+    fmax: list[float] = []
+    in_block = False
+    found = False
+    cur_max = 0.0
+    start_separator_pending = False
+    force_rows = 0
+
+    def commit(value: float) -> None:
+        if max_blocks is not None and len(fmax) >= max_blocks:
+            raise ForceBlockLimitError('OUTCAR exceeds the force-block limit')
+        fmax.append(value)
+
+    for raw_line in lines:
+        if isinstance(raw_line, bytes):
+            line_bytes = len(raw_line)
+            line = raw_line.decode('utf-8', errors='replace').rstrip('\r\n')
+        else:
+            line = str(raw_line).rstrip('\r\n')
+            line_bytes = len(str(raw_line).encode('utf-8', errors='replace'))
+        if max_line_bytes is not None and line_bytes > max_line_bytes:
+            raise ForceLineLimitError('OUTCAR exceeds the line-byte limit')
+        if 'TOTAL-FORCE' in line:
+            if in_block and found:
+                commit(cur_max)
+            in_block = True
+            found = False
+            cur_max = 0.0
+            start_separator_pending = True
+            force_rows = 0
+            continue
+        if not in_block:
+            continue
+        if start_separator_pending:
+            start_separator_pending = False
+            stripped = line.strip()
+            if stripped and set(stripped) <= set('-'):
+                continue
+        row = line.split()
+        if len(row) != 6:
+            # 有原子力后遇到终止虚线/total drift 才提交该块。
+            if found:
+                commit(cur_max)
+            in_block = False
+            found = False
+            cur_max = 0.0
+            force_rows = 0
+            continue
+        force_rows += 1
+        if (max_rows_per_block is not None
+                and force_rows > max_rows_per_block):
+            raise ForceRowLimitError(
+                'OUTCAR force block exceeds the atom-row limit')
+        try:
+            fx, fy, fz = float(row[3]), float(row[4]), float(row[5])
+        except ValueError:
+            # 6 列但非数值:Fortran F13 字段打满成 ****(力过大),跳过该
+            # 原子行(其真值不可恢复,|F|max 取余下原子)而非终止整块。
+            continue
+        mag = math.sqrt(fx * fx + fy * fy + fz * fz)
+        if mag > cur_max:
+            cur_max = mag
+        found = True
+    trailing_block_complete = not in_block
+    if in_block and found and not require_terminated:
+        commit(cur_max)
+    if with_status:
+        return {
+            'values': fmax,
+            'trailing_block_complete': trailing_block_complete,
+        }
+    return fmax
+
+
 def parse_outcar_fmax(text: str) -> list[float]:
     """OUTCAR 文本 → 逐离子步 |F|max(eV/Å)。逐行流式,只在力块内累加。"""
     if not text:
         return []
-    fmax: list[float] = []
-    lines = text.splitlines()
-    i, n = 0, len(lines)
-    while i < n:
-        if 'TOTAL-FORCE' not in lines[i]:
-            i += 1
-            continue
-        i += 1
-        # 跳过力块起始的分隔虚线行。
-        if i < n and lines[i].strip() and set(lines[i].strip()) <= set('-'):
-            i += 1
-        cur_max = 0.0
-        found = False
-        while i < n:
-            row = lines[i].split()
-            if len(row) != 6:
-                break               # 结构终止(分隔虚线/total drift 行),块结束
-            try:
-                fx, fy, fz = float(row[3]), float(row[4]), float(row[5])
-            except ValueError:
-                # 6 列但非数值:Fortran F13 字段打满成 ****(力过大),跳过该
-                # 原子行(其真值不可恢复,|F|max 取余下原子)而非终止整块。
-                i += 1
-                continue
-            mag = math.sqrt(fx * fx + fy * fy + fz * fz)
-            if mag > cur_max:
-                cur_max = mag
-            found = True
-            i += 1
-        if found:
-            fmax.append(cur_max)
-    return fmax
+    return parse_outcar_fmax_lines(text.splitlines())
 
 
 def convergence_series(oszicar_text: str,

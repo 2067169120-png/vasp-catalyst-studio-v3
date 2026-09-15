@@ -8,34 +8,35 @@
 `sanitize`——正则扫描所有字符串(含 dict 键),命中 password/token/api_key/ghp_ 等即抛
 ValueError,拒绝落盘。密钥只走 keyring,状态文件只存路径+版本。
 
-JSONL 追加即写(单机 append 原子性足够);文件不存在自动创建。中文注释允许,英文标识符。
+JSONL 每条记录以单次 O_APPEND write + fsync 追加；文件不存在自动创建。
 """
 from __future__ import annotations
 
+import hashlib
+import errno
 import json
-import re
+import os
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
+
+from vcstudio.shared.secrets import classify_credential
 
 DECISIONS_NAME = 'decisions.jsonl'
 EVENTS_NAME = 'events.jsonl'
 
 MADE_BY_VALUES = ('user', 'auto', 'ai-proposal')
+WAIVER_KIND = 'gate-waiver'
+GATE_DECISION_KIND = 'gate-decision'
+REVOCATION_KIND = 'decision-revoked'
+COORDINATION_LOCK_NAME = '.ledger-acceptance.lock'
 
-# 敏感串正则:命中即拒写。宁可误伤(deny-by-default)也不让密钥进入可分享的账本。
-_SECRET_PATTERNS = (
-    ('口令字段', re.compile(r'pass(word|wd|phrase)', re.I)),
-    ('密钥字段', re.compile(r'secret', re.I)),
-    ('令牌字段', re.compile(r'\btoken\b', re.I)),
-    ('API Key', re.compile(r'api[_-]?key', re.I)),
-    ('GitHub PAT', re.compile(r'gh[pousr]_[A-Za-z0-9]{16,}')),
-    ('AWS AccessKey', re.compile(r'AKIA[0-9A-Z]{16}')),
-    ('Slack Token', re.compile(r'xox[baprs]-[A-Za-z0-9-]+')),
-    ('私钥 PEM', re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----')),
-    ('Bearer 凭据', re.compile(r'\bbearer\s+[A-Za-z0-9._\-]{8,}', re.I)),
-)
-
+# See acceptance_guard: the persistent OS-lock inode is campaign-scoped.  This process lock
+# prevents separate thread-owned file handles from bypassing each other on platforms where byte
+# lock semantics are process-oriented.
+_COORDINATION_THREAD_LOCK = threading.Lock()
 
 def _now() -> str:
     return time.strftime('%Y-%m-%dT%H:%M:%S')
@@ -57,10 +58,7 @@ def _iter_strings(obj):
 
 def is_sensitive(text: str):
     """返回命中的敏感类别描述;无命中返回 None。"""
-    for desc, pat in _SECRET_PATTERNS:
-        if pat.search(text or ''):
-            return desc
-    return None
+    return classify_credential(text, include_field_names=True)
 
 
 def sanitize(record: dict) -> dict:
@@ -73,13 +71,63 @@ def sanitize(record: dict) -> dict:
     return record
 
 
+@contextmanager
+def acceptance_guard(campaign_dir):
+    """Serialize ledger append/revoke with the final accepted task transaction.
+
+    The lock file is never unlinked: all processes must continue to address the same stable inode,
+    while the OS automatically releases the byte lock if a writer exits or crashes.
+    """
+    lock_path = Path(campaign_dir) / COORDINATION_LOCK_NAME
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _COORDINATION_THREAD_LOCK, lock_path.open('a+b') as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b'\0')
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name == 'nt':
+            import msvcrt
+
+            while True:
+                handle.seek(0)
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                        raise
+                    time.sleep(0.025)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:  # pragma: no cover - exercised by the Linux CI matrix
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _append_jsonl(path: Path, record: dict) -> dict:
-    """校验(sanitize)通过后追加一行 JSON;目录/文件不存在自动创建。"""
+    """校验后以单次 ``O_APPEND`` write 追加完整 JSON 行。"""
     sanitize(record)
     path.parent.mkdir(parents=True, exist_ok=True)
-    line = json.dumps(record, ensure_ascii=False, sort_keys=True)
-    with open(path, 'a', encoding='utf-8') as f:
-        f.write(line + '\n')
+    payload = (json.dumps(record, ensure_ascii=False, sort_keys=True,
+                          separators=(',', ':'), allow_nan=False) + '\n').encode('utf-8')
+    with acceptance_guard(path.parent):
+        fd = os.open(str(path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
+        try:
+            written = os.write(fd, payload)
+            if written != len(payload):
+                raise OSError(f'账本短写:{written}/{len(payload)} bytes')
+            os.fsync(fd)
+        finally:
+            os.close(fd)
     return record
 
 
@@ -140,6 +188,168 @@ def find_decision(campaign_dir, decision_id: str):
         if r.get('id') == decision_id:
             return r
     return None
+
+
+def _canonical_json(value) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                      separators=(',', ':'), allow_nan=False)
+
+
+def decision_digest(record: dict) -> str:
+    """账本决策整行的稳定 SHA-256；GateDecision 用它检测替换/篡改。"""
+    if not isinstance(record, dict):
+        raise ValueError('decision record 必须是 dict')
+    return hashlib.sha256(_canonical_json(record).encode('utf-8')).hexdigest()
+
+
+def value_digest(value) -> str:
+    """任意 JSON-compatible 绑定值的稳定 SHA-256。"""
+    return hashlib.sha256(_canonical_json(value).encode('utf-8')).hexdigest()
+
+
+def _campaign_id(campaign_dir) -> str:
+    """从 named campaign 的 campaign.yaml 读取 id；缺失/损坏拒绝授权。"""
+    from vcstudio.campaign import schema
+    campaign = schema.load_campaign(campaign_dir)
+    cid = ((campaign or {}).get('meta') or {}).get('id')
+    if not cid:
+        raise ValueError('named campaign 缺失或损坏，不能解析权威决策账本')
+    return str(cid)
+
+
+def record_waiver_decision(campaign_dir, *, campaign_id: str, task_id: str,
+                           gate: str, task_revision: int,
+                           input_fingerprints: dict, detail,
+                           actor: str) -> str:
+    """记录只对指定 campaign/task/revision/gate/fingerprints 生效的人工豁免。"""
+    named = _campaign_id(campaign_dir)
+    if named != str(campaign_id):
+        raise ValueError(f'waiver campaign 不匹配:named={named}, supplied={campaign_id}')
+    if not task_id or not gate or not actor:
+        raise ValueError('waiver task_id/gate/actor 均不能为空')
+    if isinstance(task_revision, bool) or not isinstance(task_revision, int) \
+            or task_revision < 0:
+        raise ValueError('waiver task_revision 必须是非负整数')
+    if not isinstance(input_fingerprints, dict):
+        raise ValueError('waiver input_fingerprints 必须是 dict')
+    context = {
+        'authority_schema': 'vcstudio.gate-waiver/v1',
+        'scope': 'task',
+        'campaign_id': named,
+        'task_id': str(task_id),
+        'gate': str(gate),
+        'task_revision': int(task_revision),
+        'input_fingerprints': dict(input_fingerprints or {}),
+        'input_fingerprints_digest': value_digest(dict(input_fingerprints or {})),
+        'actor': str(actor),
+    }
+    return record_decision(campaign_dir, WAIVER_KIND, detail, 'user', context=context)
+
+
+def revoke_decision(campaign_dir, decision_id: str, *, actor: str, reason: str) -> str:
+    """append-only 撤销；不修改原决策，后续校验只要看见有效撤销就 fail-closed。"""
+    if not actor or not reason:
+        raise ValueError('撤销决策必须给 actor 与 reason')
+    campaign_id = _campaign_id(campaign_dir)
+    if find_decision(campaign_dir, decision_id) is None:
+        raise ValueError(f'待撤销 decision_id 不存在:{decision_id}')
+    return record_decision(
+        campaign_dir, REVOCATION_KIND, reason, 'user',
+        context={'authority_schema': 'vcstudio.decision-revocation/v1',
+                 'campaign_id': campaign_id, 'decision_id': str(decision_id),
+                 'actor': str(actor)})
+
+
+def is_decision_revoked(campaign_dir, decision_id: str, *, campaign_id: str | None = None) -> bool:
+    """是否存在同一 named campaign 中有效的人工撤销记录。"""
+    named = _campaign_id(campaign_dir)
+    if campaign_id is not None and named != str(campaign_id):
+        return True
+    for row in read_decisions(campaign_dir, kind=REVOCATION_KIND, made_by='user'):
+        ctx = row.get('context') or {}
+        if (ctx.get('authority_schema') == 'vcstudio.decision-revocation/v1'
+                and str(ctx.get('campaign_id')) == named
+                and str(ctx.get('decision_id')) == str(decision_id)):
+            return True
+    return False
+
+
+def validate_waiver_decision(campaign_dir, decision_id: str, *, campaign_id: str,
+                             task_id: str, gate: str, task_revision: int,
+                             input_fingerprints: dict) -> tuple[dict, str]:
+    """从 named campaign ledger 解析并验证 task-bound waiver；任一漂移即拒绝。"""
+    named = _campaign_id(campaign_dir)
+    if named != str(campaign_id):
+        raise ValueError(f'waiver campaign 不匹配:named={named}, expected={campaign_id}')
+    record = find_decision(campaign_dir, decision_id)
+    if record is None:
+        raise ValueError(f'waiver decision_id 在 named campaign ledger 中不存在:{decision_id}')
+    if record.get('kind') != WAIVER_KIND:
+        raise ValueError(f'waiver kind 非法:{record.get("kind")!r};必须为 {WAIVER_KIND}')
+    if record.get('made_by') != 'user':
+        raise ValueError('waiver 必须是 made_by=user 的人工决策')
+    ctx = record.get('context') or {}
+    if type(ctx.get('task_revision')) is not int:  # bool 也不得冒充 revision
+        raise ValueError('waiver task_revision 类型非法')
+    expected_fps = dict(input_fingerprints or {})
+    checks = (
+        ('authority_schema', ctx.get('authority_schema'), 'vcstudio.gate-waiver/v1'),
+        ('scope', ctx.get('scope'), 'task'),
+        ('campaign_id', str(ctx.get('campaign_id')), named),
+        ('task_id', str(ctx.get('task_id')), str(task_id)),
+        ('gate', str(ctx.get('gate')), str(gate)),
+        ('task_revision', ctx.get('task_revision'), int(task_revision)),
+        ('input_fingerprints_digest', ctx.get('input_fingerprints_digest'),
+         value_digest(expected_fps)),
+    )
+    for name, actual, expected in checks:
+        if actual != expected:
+            raise ValueError(
+                f'waiver scope 绑定不匹配:{name} actual={actual!r}, expected={expected!r}')
+    if ctx.get('input_fingerprints') != expected_fps:
+        raise ValueError('waiver input_fingerprints 与当前任务输入不一致')
+    if is_decision_revoked(campaign_dir, decision_id, campaign_id=named):
+        raise ValueError(f'waiver decision 已撤销:{decision_id}')
+    return record, decision_digest(record)
+
+
+def record_gate_decision(campaign_dir, *, gate: str, status: str,
+                         campaign_id: str, task_id: str, task_revision: int,
+                         input_fingerprints: dict, checks_digest: str,
+                         actor: str, waiver: dict | None = None) -> tuple[dict, str]:
+    """把 gate 的 task-bound 最终裁决落到 named campaign ledger 并返回整行摘要。"""
+    named = _campaign_id(campaign_dir)
+    if named != str(campaign_id):
+        raise ValueError(f'gate decision campaign 不匹配:named={named}, expected={campaign_id}')
+    if not task_id or not gate or not actor:
+        raise ValueError('gate decision task_id/gate/actor 均不能为空')
+    if isinstance(task_revision, bool) or not isinstance(task_revision, int) \
+            or task_revision < 0:
+        raise ValueError('gate decision task_revision 必须是非负整数')
+    if not isinstance(input_fingerprints, dict):
+        raise ValueError('gate decision input_fingerprints 必须是 dict')
+    context = {
+        'authority_schema': 'vcstudio.gate-decision/v1',
+        'scope': 'task',
+        'campaign_id': named,
+        'task_id': str(task_id),
+        'gate': str(gate),
+        'status': str(status),
+        'task_revision': int(task_revision),
+        'input_fingerprints': dict(input_fingerprints or {}),
+        'input_fingerprints_digest': value_digest(dict(input_fingerprints or {})),
+        'checks_digest': str(checks_digest),
+        'actor': str(actor),
+        'waiver': dict(waiver or {}),
+    }
+    decision_id = record_decision(
+        campaign_dir, GATE_DECISION_KIND,
+        f'{gate} status={status} task={task_id} revision={task_revision}',
+        'user' if status == 'waived' else 'auto', context=context)
+    record = find_decision(campaign_dir, decision_id)
+    if record is None:  # pragma: no cover - append 成功后磁盘消失才可能发生
+        raise OSError('gate decision 写入后无法从账本读回')
+    return record, decision_digest(record)
 
 
 # ── 事件账本 ──────────────────────────────────────────────────────────────────

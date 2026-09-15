@@ -75,7 +75,9 @@ def advise(incar: dict, *, has_configs: bool = False,
                         f'当前 ISMEAR={ismear:g}、SIGMA={sigma:g}'
                         f'(VASP 默认 1/0.2 正好踩坑)会给孤立分子非物理部分占据,'
                         f'污染所有以它为参考的 ΔE。金属 slab 与分子的 ISMEAR/SIGMA 允许不同,'
-                        f'但 ENCUT/泛函/IVDW/ISPIN 必须三算一致。'))
+                        f'ENCUT/泛函/IVDW/POTCAR 等共享方法必须可比；'
+                        f'ISPIN 应分别取各体系的基态，分子参考与周期表面可不同，'
+                        f'但 clean slab 与 slab+ads 必须使用同一自旋口径。'))
         key = (tuple(sorted(gas.get('elements') or [])),
                tuple(c for _, c in sorted(zip(gas.get('elements') or [],
                                               gas.get('counts') or []))))

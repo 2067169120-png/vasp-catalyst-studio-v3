@@ -31,7 +31,7 @@
     }
     box.innerHTML = out.svg;   // 后端自产 SVG,受控内容
     const msgs = [].concat(out.warnings || []);
-    if (out.saved) msgs.unshift('已保存:' + out.saved);
+    if (out.saved) msgs.unshift(VCS.t('dos.saved', { path: out.saved }, '已保存：{path}'));
     if (msgs.length) {
       note.hidden = false;
       note.className = 'struct-note' + (out.warnings && out.warnings.length ? ' warn-banner' : '');

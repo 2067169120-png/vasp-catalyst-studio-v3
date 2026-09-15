@@ -1,5 +1,7 @@
 """发刊要件结构校验:LICENSE / pyproject 元数据。"""
+import json
 import os
+import re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -23,6 +25,18 @@ def test_pyproject_declares_license_and_metadata():
     assert 'MIT' in text
     assert 'classifiers' in text
     assert 'License :: OSI Approved :: MIT License' in text
+
+
+def test_docs_extra_declares_xlsx_backend_for_draftpack():
+    """Full CI's docs extra must provide the optional Draft-Ready XLSX writer."""
+    text = _read('pyproject.toml')
+    match = re.search(r'^docs\s*=\s*\[(?P<requirements>.*?)^\]', text,
+                      flags=re.MULTILINE | re.DOTALL)
+    assert match, 'pyproject.toml must define the docs optional-dependency extra'
+    requirements = match.group('requirements').lower()
+    assert re.search(r'"openpyxl(?:[<>=!~ ].*)?"', requirements), (
+        'the docs extra must declare openpyxl so Draft-Ready tables emit XLSX'
+    )
 
 
 def test_citation_cff_parses_with_required_keys():
@@ -51,6 +65,33 @@ def test_version_single_source_of_truth():
     assert str(cff['version']) == __version__, (
         f"CITATION.cff version={cff['version']!r} 与 "
         f"vcstudio.__version__={__version__!r} 不一致")
+
+
+def test_v4_identity_is_consistent_while_unreleased():
+    """V4 源码/CFF/UI 口径一致；未发布版本不得虚构发布日期。"""
+    import yaml
+
+    from vcstudio import __version__
+
+    assert __version__ == '4.0.0'
+
+    cff = yaml.safe_load(_read('CITATION.cff'))
+    assert str(cff['version']) == __version__
+    assert 'date-released' not in cff
+
+    zh = json.loads(_read('vcstudio', 'shared', 'locales', 'zh.json'))
+    en = json.loads(_read('vcstudio', 'shared', 'locales', 'en.json'))
+    assert zh['app.subtitle'] == 'v4.0 · 证据驱动催化研究工作台'
+    assert en['app.subtitle'] == 'v4.0 · Evidence-driven Catalysis Workbench'
+    assert (
+        'data-i18n="app.subtitle">v4.0 · 证据驱动催化研究工作台</span>'
+        in _read('vcstudio', 'gui_web', 'assets', 'index.html')
+    )
+
+    changelog = _read('CHANGELOG.md')
+    unreleased = '## [Unreleased] — V4.0.0'
+    assert changelog.count(unreleased) == 1
+    assert changelog.index(unreleased) < changelog.index('## v3.3.0')
 
 
 def test_contributing_covers_tests_and_issues():

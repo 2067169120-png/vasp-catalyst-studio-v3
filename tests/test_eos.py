@@ -96,7 +96,7 @@ def test_build_eos_series_scales_lattice(tmp_path):
     res = eos.build_eos_series(str(src), str(tmp_path / 'eos'), scales=[0.98, 1.0, 1.02])
     assert set(round(s, 2) for s in res['dirs']) == {0.98, 1.0, 1.02}
     # 缩放因子写在 POSCAR 第2行
-    txt = (tmp_path / 'eos' / 'eos_0.98' / 'POSCAR').read_text()
+    txt = (tmp_path / 'eos' / 'eos_0.98' / 'POSCAR').read_text(encoding='utf-8')
     assert float(txt.splitlines()[1].split()[0]) == pytest.approx(0.98)
     # 体积 ∝ 因子³:基础体积 3.6³=46.656
     v98 = next(s['volume'] for s in res['series'] if s['scale'] == 0.98)
@@ -106,7 +106,8 @@ def test_build_eos_series_scales_lattice(tmp_path):
 def test_build_eos_series_single_point_incar(tmp_path):
     src = _make_src(tmp_path)
     eos.build_eos_series(str(src), str(tmp_path / 'eos'), scales=[1.0])
-    d = parse_incar((tmp_path / 'eos' / 'eos_1' / 'INCAR').read_text())
+    d = parse_incar(
+        (tmp_path / 'eos' / 'eos_1' / 'INCAR').read_text(encoding='utf-8'))
     assert d['NSW'] == 0 and d['IBRION'] == -1
     assert 'ISIF' not in d and 'EDIFFG' not in d
     assert d['ENCUT'] == 400 and d['GGA'] == 'PE'           # 电子学保留
@@ -118,7 +119,8 @@ def test_build_eos_series_manifest_and_kpoints(tmp_path):
     m = manifest_mod.load_manifest(tmp_path / 'eos' / 'eos_1.02')
     assert m['task_type'] == 'eos' and m['inputs']['scale'] == 1.02
     # KPOINTS 复制(各体积同 k 网格)
-    assert '9 9 9' in (tmp_path / 'eos' / 'eos_1.02' / 'KPOINTS').read_text()
+    assert '9 9 9' in (tmp_path / 'eos' / 'eos_1.02' / 'KPOINTS').read_text(
+        encoding='utf-8')
 
 
 def test_build_eos_series_default_seven_points(tmp_path):
@@ -127,10 +129,27 @@ def test_build_eos_series_default_seven_points(tmp_path):
     assert len(res['series']) == 7                          # 0.94..1.06 七点
 
 
-def test_scale_poscar_negative_scale_raises():
-    neg = _BULK.replace('1.0\n3.6', '-46.0\n3.6')
-    with pytest.raises(ValueError, match='缩放因子'):
-        eos._scale_poscar(neg, 1.02)
+def test_scale_poscar_negative_volume_mode_supported():
+    neg = _BULK.replace('1.0\n3.6', f'-{3.6 ** 3}\n3.6')
+    scaled = eos._scale_poscar(neg, 1.02)
+    # 负值仍表示目标体积，EOS 的线性 1.02 应把目标体积放大 1.02³。
+    assert float(scaled.splitlines()[1]) == pytest.approx(
+        -(3.6 ** 3) * 1.02 ** 3)
+    assert abs(eos._det3(eos.read_cell_vectors(scaled))) == pytest.approx(
+        3.6 ** 3 * 1.02 ** 3)
+
+
+def test_scale_poscar_three_component_scales_supported():
+    anisotropic = _BULK.replace('1.0\n3.6', '1 2 3\n3.6')
+    scaled = eos._scale_poscar(anisotropic, 0.98)
+    assert [float(value) for value in scaled.splitlines()[1].split()] == pytest.approx(
+        [0.98, 1.96, 2.94])
+
+
+@pytest.mark.parametrize('factor', [0, -1, float('nan')])
+def test_scale_poscar_rejects_invalid_eos_factor(factor):
+    with pytest.raises(ValueError, match='线性缩放因子'):
+        eos._scale_poscar(_BULK, factor)
 
 
 # ── eos_plot 出图 ───────────────────────────────────────────────────────────────

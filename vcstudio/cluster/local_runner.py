@@ -5,8 +5,8 @@
 经 monkeypatch 替身,缺进程/坏记录一律结构化返回不抛。
 
 跨平台两处关键设计:
-1. 退出码持久化:Popen 句柄活不过本进程(GUI 刷新状态是另开进程读文件),故用 shell 把
-   作业包一层,在其结束时把退出码写进 cwd/.exit_code(见 _wrap_cmd);status() 读该文件
+1. 退出码持久化:Popen 句柄活不过本进程(GUI 刷新状态是另开进程读文件),故用平台
+   等待器包一层,在其结束时把退出码写进 cwd/.exit_code(见 _wrap_cmd);status() 读该文件
    判 DONE/FAILED,不依赖 Popen 句柄。
 2. 存活探测:不引入 psutil。POSIX 用 os.kill(pid,0)(0 号信号只探测不投递);Windows 上
    os.kill(pid,0) 会被 CPython 映射成 GenerateConsoleCtrlEvent(CTRL_C_EVENT)——等于每次
@@ -17,18 +17,74 @@
 """
 from __future__ import annotations
 
+import base64
+import json
 import os
 import shlex
 import signal
 import subprocess
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import yaml
 
 RUNINFO_NAME = 'local_run.yaml'   # 落 cwd:pid/cmd/started_at,供 status/cancel 读
-EXITCODE_NAME = '.exit_code'      # 落 cwd:作业结束后由 shell 包装写入的退出码
+EXITCODE_NAME = '.exit_code'      # 落 cwd:作业结束后由平台包装器写入的退出码
+
+
+_WINDOWS_WRAPPER_TEMPLATE = r"""
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$payloadJson = [System.Text.Encoding]::UTF8.GetString(
+    [System.Convert]::FromBase64String('__PAYLOAD_BASE64__')
+)
+$payload = $payloadJson | ConvertFrom-Json
+$exitCode = 127
+$process = $null
+
+try {
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = [string]$payload.file_name
+    $startInfo.Arguments = [string]$payload.arguments
+    $startInfo.WorkingDirectory = [Environment]::CurrentDirectory
+    $startInfo.UseShellExecute = $false
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        throw 'Process.Start returned false'
+    }
+    $process.WaitForExit()
+    $exitCode = [int]$process.ExitCode
+}
+catch {
+    [Console]::Error.WriteLine(
+        ('local runner failed to start or wait for target: {0}' -f $_.Exception.Message)
+    )
+}
+finally {
+    if ($null -ne $process) {
+        $process.Dispose()
+    }
+
+    $targetPath = Join-Path ([Environment]::CurrentDirectory) '__EXITCODE_NAME__'
+    $tempPath = '{0}.{1}.tmp' -f $targetPath, $PID
+    [System.IO.File]::WriteAllText(
+        $tempPath,
+        ([string]$exitCode + [Environment]::NewLine),
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+    if ([System.IO.File]::Exists($targetPath)) {
+        [System.IO.File]::Replace($tempPath, $targetPath, $null)
+    }
+    else {
+        [System.IO.File]::Move($tempPath, $targetPath)
+    }
+}
+
+exit $exitCode
+"""
 
 
 @dataclass
@@ -47,21 +103,52 @@ def _is_windows() -> bool:
 
 
 # ── 命令包装(纯函数,跨平台) ────────────────────────────────────────────────────
+def _windows_powershell_executable() -> str:
+    """Windows PowerShell 系统绝对路径,避免作业目录/PATH 中的同名程序劫持。"""
+    system_root = os.environ.get('SystemRoot') or os.environ.get('WINDIR') or r'C:\Windows'
+    return str(PureWindowsPath(system_root) / 'System32' / 'WindowsPowerShell'
+               / 'v1.0' / 'powershell.exe')
+
+
+def _wrap_cmd_windows(tokens: list[str]) -> list[str]:
+    """Windows 包装器:用 PowerShell 等待目标,但不让用户 argv 进入 shell 语法。"""
+    payload = {
+        'file_name': tokens[0] if tokens else '',
+        # list2cmdline 只在这里负责 Win32/CRT argv 编码;结果不再交给 cmd.exe。
+        'arguments': subprocess.list2cmdline(tokens[1:]),
+    }
+    payload_b64 = base64.b64encode(
+        json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    ).decode('ascii')
+    script = _WINDOWS_WRAPPER_TEMPLATE.replace('__PAYLOAD_BASE64__', payload_b64)
+    script = script.replace('__EXITCODE_NAME__', EXITCODE_NAME)
+    encoded_script = base64.b64encode(script.encode('utf-16le')).decode('ascii')
+    return [
+        _windows_powershell_executable(),
+        '-NoLogo',
+        '-NoProfile',
+        '-NonInteractive',
+        '-OutputFormat',
+        'Text',
+        '-EncodedCommand',
+        encoded_script,
+    ]
+
+
 def _wrap_cmd(cmd: list, platform: str) -> list:
-    """把作业命令包一层 shell,使其结束后把退出码写入 cwd/.exit_code。
+    """把作业命令包一层平台等待器,使其结束后把退出码写入 cwd/.exit_code。
 
     platform:'nt'/'win32'/'windows'(或以 'win' 开头)视为 Windows,其余按 POSIX。
     - POSIX:sh -c '(cmd; echo $? > .exit_code)' —— $? 取前一条命令(即作业本体)的退出码。
-    - Windows:cmd /v:on /c '(cmd) & echo !ERRORLEVEL!> .exit_code' —— 必须开延迟展开
-      (/v:on + !ERRORLEVEL!),否则 %ERRORLEVEL% 在命令行解析期就被替换成旧值,拿不到
-      作业真正的退出码。argv 用 list2cmdline 做 Windows 规范加引号。
+    - Windows:固定 PowerShell supervisor 通过 .NET ProcessStartInfo 直接启动目标,
+      等待后原子落退出码。用户 argv 仅作为 Base64 JSON 数据传入,不会被
+      cmd.exe 或 PowerShell 当作括号/管道/环境变量语法再解析。
     """
     tokens = [str(c) for c in cmd]
     plat = str(platform).lower()
     is_win = plat in ('nt', 'win32', 'windows') or plat.startswith('win')
     if is_win:
-        inner = subprocess.list2cmdline(tokens)
-        return ['cmd', '/v:on', '/c', f'({inner}) & echo !ERRORLEVEL!> {EXITCODE_NAME}']
+        return _wrap_cmd_windows(tokens)
     inner = ' '.join(shlex.quote(t) for t in tokens)
     return ['sh', '-c', f'({inner}; echo $? > {EXITCODE_NAME})']
 

@@ -150,7 +150,14 @@ def build_spin_variants(job_dir, out_root, *, candidates=None,
     for cand in cands:
         name = cand['name']
         dest = out_root / f'{job_dir.name}_spin_{name}'
-        shutil.copytree(job_dir, dest, dirs_exist_ok=True)
+        dest.mkdir(parents=True, exist_ok=True)
+        # A spin variant is a new job generation, not a clone of the parent's
+        # scheduler/results identity.  Copy only scientific VASP inputs; the
+        # new authoritative manifest is written once after INCAR is final.
+        for filename in ('POSCAR', 'INCAR', 'KPOINTS', 'POTCAR'):
+            source = job_dir / filename
+            if source.is_file():
+                shutil.copy2(source, dest / filename)
 
         incar = base_incar
         changes, warnings = [], []
@@ -182,20 +189,67 @@ def build_spin_variants(job_dir, out_root, *, candidates=None,
 
 def _annotate_variant_manifest(dest, parent_manifest, parent_id, parent_dir,
                                name, magmom, changes, warnings):
-    """在变体目录写/改 job.yaml:记 spin_variant 名与 parent(继承父 manifest 或新建最小份)。"""
-    m = manifest_mod.load_manifest(dest)
-    if m is None:
-        m = dict(parent_manifest) if parent_manifest else {'schema': manifest_mod.SCHEMA_VERSION}
+    """Write a fresh spin-variant manifest after final INCAR bytes exist."""
+    parent = parent_manifest if isinstance(parent_manifest, dict) else {}
+    parent_inputs = parent.get('inputs') if isinstance(parent.get('inputs'), dict) else {}
+    inputs = {
+        key: value for key, value in parent_inputs.items()
+        if key not in {
+            'execution_environment', 'input_closure', 'sha256', 'potcar_sha256',
+            'method_recipe', 'method_recipe_status',
+        }
+    }
+    inputs['engine'] = 'vasp'
+    inputs['spin_magmom'] = magmom
+    inputs['spin_changes'] = changes
+    from vcstudio.generate.method_recipe import builder_recipe
+    inputs['method_recipe'] = builder_recipe(
+        builder='vcstudio.project.spin_scan/v1', task_type='spin_scan',
+        calc_type=str(parent.get('calc_type') or 'slab'), validate=True,
+        completions={'incar_changes': changes}, kpoints_source='parent-copy',
+        extra={'variant': name, 'magmom': magmom})
+    system = str(parent.get('system') or Path(dest).name)
+    m = manifest_mod.new_manifest(
+        job_id=Path(dest).name, system=system, task_type='spin_scan',
+        calc_type=str(parent.get('calc_type') or 'slab'), inputs=inputs,
+        warnings=list(parent.get('warnings') or []) + list(warnings or []))
     m['spin_variant'] = name
     m['parent_job'] = parent_id
     m['parent_job_dir'] = parent_dir
-    m['job_id'] = f'{Path(dest).name}'
-    m.setdefault('inputs', {})
-    m['inputs'] = dict(m['inputs'])
-    m['inputs']['spin_magmom'] = magmom
-    m['inputs']['spin_changes'] = changes
-    if warnings:
-        m['warnings'] = list(m.get('warnings') or []) + list(warnings)
+    # Resolve side inputs from the final spin-variant INCAR/task, then copy
+    # only those scientific dependencies from the parent.  This preserves
+    # restart/kernel/constraint inputs without cloning outputs or scheduler
+    # journals.  KPOINTS_OPT is presence-triggered, so carry that known input
+    # when it exists in the parent even for a legacy parent manifest.
+    from vcstudio.shared.scientific_inputs import (
+        record_input_closure, required_input_names,
+    )
+    required, _reasons, _invalid = required_input_names(dest, m)
+    if (Path(parent_dir) / 'KPOINTS_OPT').is_file():
+        required.append('KPOINTS_OPT')
+    parent_root = Path(parent_dir).resolve()
+    for filename in dict.fromkeys(required):
+        target = Path(dest).joinpath(*filename.split('/'))
+        if target.is_file():
+            continue
+        source = parent_root.joinpath(*filename.split('/'))
+        try:
+            resolved = source.resolve(strict=True)
+            inside = os.path.normcase(os.path.commonpath(
+                (str(parent_root), str(resolved)))) == os.path.normcase(str(parent_root))
+        except (OSError, ValueError):
+            continue
+        traversed = parent_root
+        has_link = False
+        for part in Path(filename).parts:
+            traversed /= part
+            if traversed.is_symlink():
+                has_link = True
+                break
+        if inside and not has_link and source.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+    record_input_closure(dest, m)
     manifest_mod.save_manifest(dest, m)
     return m
 

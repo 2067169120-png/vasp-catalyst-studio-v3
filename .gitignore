@@ -18,6 +18,9 @@ job*/
 # 离线演示产物(examples/offline_analysis/run_demo.py 默认输出)
 demo_out/
 
+# 本地临时/QA 工作区；正式研究结果使用 results/，发布产物使用 dist/
+/tmp/
+
 # results/ 建议输出目录:忽略生成内容,保留目录占位
 /results/*
 !/results/.gitkeep
@@ -37,3 +40,10 @@ config.yaml
 coverage.xml
 htmlcov/
 .ruff_cache/
+
+# GUI/测试运行时临时产物（不得进入功能分支）
+pytest-of-root/
+vcstudio_paste/
+vcs_solv_*_POSCAR
+vcstudio_deps_*.log
+qa_outputs/

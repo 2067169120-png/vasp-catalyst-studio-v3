@@ -26,7 +26,9 @@ def _osz(e0):
 
 def _force_block(fmax):
     """合成 OUTCAR 力块(单原子,|F|=fmax);TOTAL-FORCE 6 列格式。"""
-    return ('  POSITION          TOTAL-FORCE (eV/Angst)\n'
+    return (' NIONS =      1 ions\n'
+            ' aborting loop because EDIFF is reached\n'
+            '  POSITION          TOTAL-FORCE (eV/Angst)\n'
             ' -----------------------------------\n'
             f'  0.0 0.0 0.0   {fmax:.6f} 0.0 0.0\n'
             ' -----------------------------------\n')
@@ -39,6 +41,8 @@ def _make_neb(tmp_path, energies, forces=None):
     for i, e in enumerate(energies):
         sub = os.path.join(jd, f'{i:02d}')
         os.makedirs(sub, exist_ok=True)
+        open(os.path.join(sub, 'POSCAR'), 'w').write(
+            'H\n1\n1 0 0\n0 1 0\n0 0 1\nH\n1\nDirect\n0 0 0\n')
         if e is not None:
             open(os.path.join(sub, 'OSZICAR'), 'w').write(_osz(e))
         if forces is not None and forces[i] is not None:
@@ -124,6 +128,131 @@ def test_climbing_not_converged_when_no_forces(tmp_path):
     jd = _make_neb(tmp_path, _BARRIER)                         # 无 OUTCAR
     d = pneb.parse_neb_energies(jd)
     assert d['climbing_converged'] is False
+
+
+def test_last_complete_step_does_not_reuse_earlier_ediff_success():
+    text = (
+        _force_block(0.01)
+        + ' electronic convergence not reached\n'
+        + '  POSITION          TOTAL-FORCE (eV/Angst)\n'
+        + ' -----------------------------------\n'
+        + '  0.0 0.0 0.0   0.010000 0.0 0.0\n'
+        + ' -----------------------------------\n'
+    )
+
+    parsed = pneb.parse_last_complete_image_step(text, 1)
+
+    assert parsed['status'] == 'unavailable'
+    assert parsed['fmax'] is None
+    assert any('EDIFF' in issue for issue in parsed['issues'])
+
+
+def test_last_complete_step_rejects_starred_force_row():
+    text = (
+        ' NIONS = 1 ions\n'
+        ' aborting loop because EDIFF is reached\n'
+        ' POSITION TOTAL-FORCE (eV/Angst)\n'
+        ' -----------------------------------\n'
+        ' 0.0 0.0 0.0 ******** 0.0 0.0\n'
+    )
+
+    parsed = pneb.parse_last_complete_image_step(text, 1)
+
+    assert parsed['status'] == 'unavailable'
+    assert parsed['fmax'] is None
+    assert any('fully numeric' in issue for issue in parsed['issues'])
+
+
+def test_final_neb_event_binds_energy_by_ionic_ordinal_even_after_force():
+    outcar = _force_block(0.02) + ' energy(sigma->0) = -9.50000000\n'
+
+    parsed = pneb.parse_final_neb_image_event(
+        _osz(-9.5), outcar, expected_natoms=1)
+
+    assert parsed['status'] == 'complete'
+    assert parsed['energy'] == pytest.approx(-9.5)
+    assert parsed['fmax'] == pytest.approx(0.02)
+
+
+def test_final_neb_event_rejects_out_of_order_energy_force_pairing():
+    def force(value):
+        return (
+            ' POSITION TOTAL-FORCE (eV/Angst)\n'
+            ' -----------------------------------\n'
+            f' 0.0 0.0 0.0 {value:.6f} 0.0 0.0\n'
+            ' -----------------------------------\n'
+        )
+
+    outcar = (
+        ' NIONS = 1 ions\n'
+        ' energy(sigma->0) = -10.00000000\n'
+        ' energy(sigma->0) = -9.50000000\n'
+        + force(0.03)
+        + ' aborting loop because EDIFF is reached\n'
+        + force(0.02)
+    )
+    oszicar = (
+        ' 1 F= -10.0 E0= -10.0 d E=0\n'
+        ' 2 F= -9.5 E0= -9.5 d E=0\n'
+    )
+
+    parsed = pneb.parse_final_neb_image_event(
+        oszicar, outcar, expected_natoms=1)
+
+    assert parsed['status'] == 'unavailable'
+    assert parsed['energy'] is None
+    assert parsed['fmax'] is None
+    assert any('ordering' in issue or 'unbound' in issue
+               for issue in parsed['issues'])
+
+
+def test_final_neb_event_rejects_out_of_order_oszicar_indices():
+    outcar = (
+        ' NIONS = 1 ions\n'
+        ' aborting loop because EDIFF is reached\n'
+        ' energy(sigma->0) = -10.00000000\n'
+        ' POSITION TOTAL-FORCE (eV/Angst)\n'
+        ' -----------------------------------\n'
+        ' 0.0 0.0 0.0 0.020000 0.0 0.0\n'
+        ' -----------------------------------\n'
+    )
+
+    parsed = pneb.parse_final_neb_image_event(
+        ' 2 F= -10 E0= -10 d E=0\n', outcar, expected_natoms=1)
+
+    assert parsed['status'] == 'unavailable'
+    assert any('indices' in issue for issue in parsed['issues'])
+
+
+@pytest.mark.parametrize('activity', [
+    ' DAV: 1 -9.0 -0.1 0.01 4 0.1\n',
+    ' RMM: 1 -9.0 -0.1 0.01 4 0.1\n',
+    ' CG: 1 -9.0 -0.1 0.01 4 0.1\n',
+    ' DIA: 1 -9.0 -0.1 0.01 4 0.1\n',
+    ' energy(sigma->0) = -9.00000000\n',
+    ' electronic convergence not reached\n',
+    ' EDIFF was not reached\n',
+])
+def test_final_neb_event_rejects_unpaired_activity_after_complete_force(activity):
+    outcar = (
+        ' NIONS = 1 ions\n'
+        ' aborting loop because EDIFF is reached\n'
+        ' energy(sigma->0) = -10.00000000\n'
+        ' POSITION TOTAL-FORCE (eV/Angst)\n'
+        ' -----------------------------------\n'
+        ' 0.0 0.0 0.0 0.020000 0.0 0.0\n'
+        ' -----------------------------------\n'
+        + activity
+    )
+
+    parsed = pneb.parse_final_neb_image_event(
+        ' 1 F= -10 E0= -10 d E=0\n', outcar, expected_natoms=1)
+
+    assert parsed['status'] == 'unavailable'
+    assert parsed['energy'] is None
+    assert parsed['fmax'] is None
+    assert any('no complete final force block' in issue
+               for issue in parsed['issues'])
 
 
 # ── 质量闸各分支 ──

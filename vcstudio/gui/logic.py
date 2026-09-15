@@ -119,6 +119,10 @@ def profile_from_form(name: str, fields: dict) -> ClusterProfile:
         env_lines = [ln.strip() for ln in env_raw.splitlines() if ln.strip()]
     else:
         env_lines = [str(x).strip() for x in (env_raw or []) if str(x).strip()]
+    commands_raw = fields.get('engine_commands') or {}
+    engine_commands = ({str(key).strip().lower(): str(value or '').strip()
+                        for key, value in commands_raw.items() if str(key).strip()}
+                       if isinstance(commands_raw, dict) else {})
     return ClusterProfile(
         name=name,
         hostname=(fields.get('hostname') or '').strip(),
@@ -139,6 +143,7 @@ def profile_from_form(name: str, fields: dict) -> ClusterProfile:
         walltime=(fields.get('walltime') or '').strip() or '24:00:00',
         env_lines=env_lines,
         vasp_cmd=(fields.get('vasp_cmd') or '').strip(),
+        engine_commands=engine_commands,
         script_mode=fields.get('script_mode') or 'auto',
         template_path=(fields.get('template_path') or '').strip(),
     )

@@ -3,17 +3,32 @@
 从 gui/jobs_tab.py 搬出,Tk 与 gui_web 两个 GUI 共用。
 本模块绝不 import Tk/webview 等 GUI 框架;paramiko 延迟导入。
 返回统一 {'needs_trust': bool, 'message': str, 'results'|'jobs': list}。
+needs_trust=True 时透传 fingerprint/algorithm/host,供界面展示并精确 pin。
 中文注释允许,英文标识符。
 """
 from __future__ import annotations
 
+import inspect
 import os
+import posixpath
 import re
 
 from vcstudio.cluster import submitter
 from vcstudio.cluster.connection import open_client, close_quiet, ConnectError
 from vcstudio.cluster.schedulers import get_dialect
 from vcstudio.shared import manifest as manifest_mod
+
+
+def _trust_payload(error: ConnectError, **empty) -> dict:
+    """把连接层 missing_host_key 捕获的真实 key 证据原样透传。"""
+    empty.update({
+        'needs_trust': True,
+        'message': str(error),
+        'fingerprint': getattr(error, 'fingerprint', ''),
+        'algorithm': getattr(error, 'algorithm', ''),
+        'host': getattr(error, 'host', ''),
+    })
+    return empty
 
 
 # ── 后台线程体(不碰 Tk) ─────────────────────────────────────────────────────
@@ -24,41 +39,106 @@ def _job_errors():
     return (ValueError, RuntimeError, OSError, SSHException)
 
 
-def submit_batch(prof, pw, dirs, trust_new):
+def submit_batch(prof, pw, dirs, trust_new, *, idempotency_key=None):
+    dirs = list(dirs)
+    # 整批联网前解析远程目标。不同本地目录（或同一路径被重复选中）若映射到同一个
+    # remote_dir，后上传者会覆盖先上传者并产生两个同目录作业，必须整批 fail closed。
+    planned = {}
+    for d in dirs:
+        try:
+            remote = posixpath.normpath(submitter.planned_remote_dir(prof, d))
+        except (ValueError, TypeError, OSError, AttributeError):
+            continue                     # 单作业的详细输入错误仍由 submit_job/preflight 返回
+        planned.setdefault(remote, []).append(str(d))
+    conflicts = {remote: paths for remote, paths in planned.items() if len(paths) > 1}
+    if conflicts:
+        detail = '；'.join(
+            f'{remote} ← {", ".join(paths)}' for remote, paths in conflicts.items())
+        message = ('整批未提交：多个本地作业映射到同一远程目录，可能互相覆盖。'
+                   f'请重命名作业目录或设置不同 remote_namespace：{detail}')
+        return {'needs_trust': False,
+                'results': [(d, False, message) for d in dirs]}
     try:
         client, jump = open_client(prof, pw, trust_new=trust_new)
     except ConnectError as e:
         if e.needs_trust:
-            return {'needs_trust': True, 'message': str(e), 'results': []}
+            return _trust_payload(e, results=[])
         raise RuntimeError(str(e))
     results = []
+    busy_count = 0
+    recovery_count = 0
+    recovery_job_ids = []
     try:
         sftp = client.open_sftp()
         for d in dirs:
             try:
-                m = submitter.submit_job(client, sftp, prof, d)
-                results.append((d, True, f"已提交,作业号 {m['scheduler_job_id']}"))
+                if idempotency_key:
+                    m = submitter.submit_job(
+                        client, sftp, prof, d, idempotency_key=idempotency_key)
+                else:
+                    # Preserve the historical injectable four-argument seam;
+                    # production web calls always provide their operation id.
+                    m = submitter.submit_job(client, sftp, prof, d)
+                verb = '已确认提交' if m.get('_submission_replayed') else '已提交'
+                results.append((d, True, f"{verb},作业号 {m['scheduler_job_id']}"))
+            except submitter.JobOperationBusy as e:
+                busy_count += 1
+                results.append((d, False, str(e)))
+            except submitter.UnknownRemoteSubmission as e:
+                recovery_count += 1
+                if e.scheduler_job_id:
+                    recovery_job_ids.append(e.scheduler_job_id)
+                results.append((d, False, str(e)))
             except _job_errors() as e:
                 results.append((d, False, str(e)))
         sftp.close()
     finally:
         close_quiet(client, jump)
-    return {'needs_trust': False, 'results': results}
+    payload = {'needs_trust': False, 'results': results}
+    if busy_count:
+        payload.update({
+            'ok': False,
+            'busy': True,
+            'code': 'job_busy',
+            'busy_count': busy_count,
+        })
+    if recovery_count:
+        payload.update({
+            'ok': False,
+            'code': 'unknown_remote_submission',
+            'requires_manual_recovery': True,
+            'recovery_count': recovery_count,
+        })
+        if recovery_job_ids:
+            payload['scheduler_job_ids'] = recovery_job_ids
+    return payload
 
 
-def fetch_batch(prof, pw, dirs, trust_new, files=submitter.FETCH_FILES):
+def fetch_batch(prof, pw, dirs, trust_new, files=None):
+    """Fetch selected jobs in one SSH session.
+
+    ``files=None`` deliberately stays ``None`` for every job so submitter can
+    inspect that directory's manifest and choose DOS/能带/Bader/ELF/功函数/AIMD
+    outputs independently.  An explicit list remains the user's manual
+    override and is applied to every selected job.
+    """
     try:
         client, jump = open_client(prof, pw, trust_new=trust_new)
     except ConnectError as e:
         if e.needs_trust:
-            return {'needs_trust': True, 'message': str(e), 'results': []}
+            return _trust_payload(e, results=[])
         raise RuntimeError(str(e))
     results = []
     try:
         sftp = client.open_sftp()
         for d in dirs:
             try:
-                fetched, missing = submitter.fetch_results(client, sftp, d, files=files)
+                submitter.assert_profile_binding(
+                    prof, d, '拉回结果', allow_legacy_read=True)
+                # fetch_results 内再用同一 profile 对读到的 manifest 做硬校验，
+                # 避免外层检查与真正 SFTP 下载之间 job.yaml 被换代的 TOCTOU。
+                fetched, missing = submitter.fetch_results(
+                    client, sftp, d, files=files, profile=prof)
                 msg = '已拉回 ' + ('、'.join(fetched) if fetched else '(无)')
                 if missing:
                     msg += f'(远端缺 {"、".join(missing)})'
@@ -79,11 +159,13 @@ def fetch_batch(prof, pw, dirs, trust_new, files=submitter.FETCH_FILES):
     return {'needs_trust': False, 'results': results}
 
 
-def filter_continuable(dirs):
-    """本地预筛(证据都在 job.yaml):终态 + diagnosis.restartable + 未达轮次上限。
+def filter_continuable(dirs, *, allow_round_limit_override=False):
+    """本地预筛(证据都在 job.yaml):终态 + diagnosis.restartable。
 
     返回 (可续算 dirs, 跳过数)。避免把整批原样送去连接后逐个失败刷屏,且不对仍在跑的
-    作业出手(与 submitter.continue_from_contcar 的状态门一致)。纯函数,可离线测。
+    作业出手(与 submitter.continue_from_contcar 的状态门一致)。自动托管保持三轮硬上限；
+    只有已经经过本地显式确认的人工入口才可把 ``allow_round_limit_override`` 设为 True。
+    这只放宽轮次，不绕过终态、诊断、CONTCAR、几何、profile 或幂等门禁。
     """
     eligible, skipped = [], 0
     for d in dirs:
@@ -92,34 +174,154 @@ def filter_continuable(dirs):
         dgn = res.get('diagnosis') or {}
         rounds = int(res.get('continue_rounds', 0))
         if (m is not None
-                and m.get('state') not in ('UPLOADED', 'SUBMITTED', 'QUEUED', 'RUNNING')
+                and m.get('state') in submitter.CONTINUE_TERMINAL_STATES
+                and submitter.valid_scheduler_job_id(m.get('scheduler_job_id'))
+                and str(m.get('task_type') or '') != 'neb'
                 and dgn.get('restartable')
-                and rounds < submitter.CONTINUE_MAX_ROUNDS):
+                and (allow_round_limit_override
+                     or rounds < submitter.CONTINUE_MAX_ROUNDS)):
             eligible.append(d)
         else:
             skipped += 1
     return eligible, skipped
 
 
-def continue_batch(prof, pw, dirs, trust_new):
-    """CONTCAR 续算批量线程体:每作业调 submitter.continue_from_contcar(不可续算的自失败)。"""
+def continue_batch(prof, pw, dirs, trust_new, *, idempotency_key=None,
+                   allow_round_limit_override=False,
+                   expected_cas_by_job=None,
+                   expected_correction_by_job=None):
+    """CONTCAR 续算批量线程体。
+
+    自动调用保留三轮上限；显式人工确认入口可仅放宽该上限，其他科学/状态门不变。
+    带 trajectory 修复证据时，CAS/correction 必须在连接前逐作业复证，且底层
+    adapter 必须显式支持相应参数；旧 adapter 不能静默降级为无门禁续算。
+    """
+    guarded_parameters = []
+    if expected_cas_by_job is not None:
+        guarded_parameters.append('expected_cas')
+    if expected_correction_by_job is not None:
+        guarded_parameters.append('correction_binding')
+    if guarded_parameters:
+        try:
+            parameters = inspect.signature(
+                submitter.continue_from_contcar).parameters
+            accepts_kwargs = any(
+                item.kind is inspect.Parameter.VAR_KEYWORD
+                for item in parameters.values())
+            missing = [name for name in guarded_parameters
+                       if name not in parameters and not accepts_kwargs]
+        except (TypeError, ValueError):
+            missing = guarded_parameters
+        if missing:
+            message = (
+                '续算适配器不支持修复 CAS/correction 门禁，已在连接前拒绝；'
+                '请升级适配器后重试')
+            return {
+                'ok': False,
+                'needs_trust': False,
+                'results': [(d, False, message) for d in dirs],
+                'error': message,
+            }
+    if expected_cas_by_job is not None:
+        rejected = []
+        for d in dirs:
+            expected = (expected_cas_by_job.get(os.path.realpath(d))
+                        or expected_cas_by_job.get(str(d))
+                        if isinstance(expected_cas_by_job, dict) else None)
+            try:
+                if expected is None:
+                    raise ValueError('续算修复 CAS 未绑定当前作业，未建立远程连接')
+                submitter.assert_repair_content_cas(d, expected)
+            except (OSError, ValueError, RuntimeError) as exc:
+                rejected.append((d, False, str(exc)))
+        if rejected:
+            return {'ok': False, 'needs_trust': False, 'results': rejected,
+                    'error': '续算修复 CAS 预检失败，未建立远程连接'}
+    if expected_correction_by_job is not None:
+        rejected = []
+        for d in dirs:
+            expected = (expected_correction_by_job.get(os.path.realpath(d))
+                        or expected_correction_by_job.get(str(d))
+                        if isinstance(expected_correction_by_job, dict) else None)
+            try:
+                submitter.assert_repair_correction_binding(
+                    expected, idempotency_key)
+            except (OSError, ValueError, RuntimeError) as exc:
+                rejected.append((d, False, str(exc)))
+        if rejected:
+            return {'ok': False, 'needs_trust': False, 'results': rejected,
+                    'error': '续算 correction 预检失败，未建立远程连接'}
     try:
         client, jump = open_client(prof, pw, trust_new=trust_new)
     except ConnectError as e:
         if e.needs_trust:
-            return {'needs_trust': True, 'message': str(e), 'results': []}
+            return _trust_payload(e, results=[])
         raise RuntimeError(str(e))
     results = []
+    busy_count = 0
+    recovery_count = 0
+    recovery_job_ids = []
     try:
         for d in dirs:
             try:
-                m = submitter.continue_from_contcar(client, prof, d)
-                results.append((d, True, f"已续算重投,新作业号 {m['scheduler_job_id']}"))
+                expected_cas = None
+                if isinstance(expected_cas_by_job, dict):
+                    expected_cas = (expected_cas_by_job.get(os.path.realpath(d))
+                                    or expected_cas_by_job.get(str(d)))
+                correction_binding = None
+                if isinstance(expected_correction_by_job, dict):
+                    correction_binding = (
+                        expected_correction_by_job.get(os.path.realpath(d))
+                        or expected_correction_by_job.get(str(d)))
+                if (expected_correction_by_job is not None
+                        and correction_binding is None):
+                    raise ValueError(
+                        '续算 correction intent 未绑定当前作业，未执行远程操作')
+                if (idempotency_key or expected_cas is not None
+                        or correction_binding is not None):
+                    m = submitter.continue_from_contcar(
+                        client, prof, d,
+                        max_rounds=(None if allow_round_limit_override
+                                    else submitter.CONTINUE_MAX_ROUNDS),
+                        idempotency_key=idempotency_key,
+                        expected_cas=expected_cas,
+                        correction_binding=correction_binding)
+                else:
+                    # Preserve the historical injectable three-argument seam.
+                    if allow_round_limit_override:
+                        m = submitter.continue_from_contcar(
+                            client, prof, d, max_rounds=None)
+                    else:
+                        m = submitter.continue_from_contcar(client, prof, d)
+                verb = '已确认续算' if m.get('_continue_replayed') else '已续算重投'
+                results.append((d, True, f"{verb},新作业号 {m['scheduler_job_id']}"))
+            except submitter.JobOperationBusy as e:
+                busy_count += 1
+                results.append((d, False, str(e)))
+            except submitter.UnknownRemoteJobOperation as e:
+                recovery_count += 1
+                if e.scheduler_job_id:
+                    recovery_job_ids.append(e.scheduler_job_id)
+                results.append((d, False, str(e)))
             except _job_errors() as e:
                 results.append((d, False, str(e)))
     finally:
         close_quiet(client, jump)
-    return {'needs_trust': False, 'results': results}
+    payload = {'needs_trust': False, 'results': results}
+    if busy_count:
+        payload.update({
+            'ok': False, 'busy': True, 'code': 'job_busy',
+            'busy_count': busy_count,
+        })
+    if recovery_count:
+        payload.update({
+            'ok': False, 'code': 'unknown_remote_job_operation',
+            'requires_manual_recovery': True,
+            'recovery_count': recovery_count,
+        })
+        if recovery_job_ids:
+            payload['scheduler_job_ids'] = recovery_job_ids
+    return payload
 
 
 def workdir_lookup(prof, pw, job_id, trust_new):
@@ -128,7 +330,7 @@ def workdir_lookup(prof, pw, job_id, trust_new):
         client, jump = open_client(prof, pw, trust_new=trust_new)
     except ConnectError as e:
         if e.needs_trust:
-            return {'needs_trust': True, 'message': str(e), 'workdir': ''}
+            return _trust_payload(e, workdir='')
         raise RuntimeError(str(e))
     try:
         wd = submitter.query_workdir(client, prof, str(job_id))
@@ -143,7 +345,7 @@ def queue_detail(prof, pw, trust_new):
         client, jump = open_client(prof, pw, trust_new=trust_new)
     except ConnectError as e:
         if e.needs_trust:
-            return {'needs_trust': True, 'message': str(e), 'jobs': []}
+            return _trust_payload(e, jobs=[])
         raise RuntimeError(str(e))
     try:
         jobs = submitter.query_queue_detail(client, prof)
@@ -172,7 +374,7 @@ def adopt_scan(prof, pw, trust_new, known_ids, local_root):
         client, jump = open_client(prof, pw, trust_new=trust_new)
     except ConnectError as e:
         if e.needs_trust:
-            return {'needs_trust': True, 'message': str(e), 'results': []}
+            return _trust_payload(e, results=[])
         raise RuntimeError(str(e))
     known = {str(k) for k in (known_ids or [])}
     results = []
@@ -188,12 +390,52 @@ def adopt_scan(prof, pw, trust_new, known_ids, local_root):
                 continue
             seg = _sanitize_seg(j.get('name') or jid)
             local_dir = os.path.join(local_root, seg)
+            remote_key = posixpath.normpath(str(workdir))
             # 同名撞车(qstat 常截断作业名):目标目录已属于另一作业则追加 _<jid> 避让,
             # 否则第二个认领会落到第一个的目录并报第一个的作业号。已属本 jid 则复用(幂等)。
             if os.path.isdir(local_dir):
                 existing = manifest_mod.load_manifest(local_dir)
-                if not (existing and str(existing.get('scheduler_job_id')) == jid):
-                    local_dir = os.path.join(local_root, f'{seg}_{jid}')
+                same_binding = bool(
+                    existing
+                    and str(existing.get('scheduler_job_id') or '') == jid
+                    and str(existing.get('cluster') or '') == str(prof.name)
+                    and posixpath.normpath(str(existing.get('remote_dir') or ''))
+                    == remote_key)
+                if same_binding:
+                    # 台账丢失但本地绑定仍完整时，认领应幂等恢复登记，不能因为
+                    # adopt_external_job 拒绝覆盖已有作业号而制造一个假失败。
+                    try:
+                        from vcstudio.cluster import ledger
+                        ledger.register(local_dir)
+                        results.append([jid, True, f'已纳管（原绑定）→ {local_dir}'])
+                    except _job_errors() as e:
+                        results.append([jid, False, str(e)])
+                    continue
+                # 不同服务器可出现同名、同作业号；后缀必须含 profile，且目标若仍
+                # 被占用就继续编号，绝不能复用另一台服务器的本地目录。
+                profile_seg = _sanitize_seg(getattr(prof, 'name', '') or 'cluster')
+                base = os.path.join(local_root, f'{seg}_{profile_seg}_{jid}')
+                local_dir = base
+                serial = 2
+                while os.path.isdir(local_dir):
+                    bound = manifest_mod.load_manifest(local_dir)
+                    if (bound
+                            and str(bound.get('scheduler_job_id') or '') == jid
+                            and str(bound.get('cluster') or '') == str(prof.name)
+                            and posixpath.normpath(str(bound.get('remote_dir') or ''))
+                            == remote_key):
+                        try:
+                            from vcstudio.cluster import ledger
+                            ledger.register(local_dir)
+                            results.append([jid, True, f'已纳管（原绑定）→ {local_dir}'])
+                        except _job_errors() as e:
+                            results.append([jid, False, str(e)])
+                        local_dir = ''
+                        break
+                    local_dir = f'{base}_{serial}'
+                    serial += 1
+                if not local_dir:
+                    continue
             try:
                 os.makedirs(local_dir, exist_ok=True)
                 submitter.adopt_external_job(local_dir, prof, jid, workdir,
@@ -206,13 +448,14 @@ def adopt_scan(prof, pw, trust_new, known_ids, local_root):
     return {'needs_trust': False, 'results': results}
 
 
-def tune_batch(prof, pw, job_dir, changes, trust_new, from_contcar=True):
-    """改参续算线程体(单作业)。"""
+def tune_batch(prof, pw, job_dir, changes, trust_new, from_contcar=True, *,
+               idempotency_key=None):
+    """人工改参续算线程体(单作业；不受自动三轮上限约束)。"""
     try:
         client, jump = open_client(prof, pw, trust_new=trust_new)
     except ConnectError as e:
         if e.needs_trust:
-            return {'needs_trust': True, 'message': str(e), 'results': []}
+            return _trust_payload(e, results=[])
         raise RuntimeError(str(e))
     results = []
     try:
@@ -220,8 +463,12 @@ def tune_batch(prof, pw, job_dir, changes, trust_new, from_contcar=True):
         try:
             m = submitter.continue_with_incar_changes(
                 client, sftp, prof, job_dir, changes,
-                restart_from_contcar=from_contcar)
-            results.append((job_dir, True, f"已改参重投,新作业号 {m['scheduler_job_id']}"))
+                max_rounds=None,
+                restart_from_contcar=from_contcar,
+                idempotency_key=idempotency_key)
+            verb = ('已确认改参续算' if m.get('_tune_continue_replayed')
+                    else '已改参重投')
+            results.append((job_dir, True, f"{verb},新作业号 {m['scheduler_job_id']}"))
         except _job_errors() as e:
             results.append((job_dir, False, str(e)))
         sftp.close()
@@ -235,27 +482,30 @@ def refresh_batch(prof, pw, dirs, trust_new):
         client, jump = open_client(prof, pw, trust_new=trust_new)
     except ConnectError as e:
         if e.needs_trust:
-            return {'needs_trust': True, 'message': str(e), 'results': []}
+            return _trust_payload(e, results=[])
         raise RuntimeError(str(e))
     results = []
     try:
-        live, reasons = submitter.query_scheduler(client, prof)
+        scheduler_states, reasons = submitter.query_scheduler(client, prof)
         for d in dirs:
             try:
-                m = submitter.refresh_job(client, prof, d, live_states=live,
+                submitter.assert_profile_binding(
+                    prof, d, '刷新状态', allow_legacy_read=True)
+                m = submitter.refresh_job(client, prof, d, live_states=scheduler_states,
                                           terminal_reasons=reasons)
                 note = m['state']
                 res = m.get('results') or {}
                 dgn = res.get('diagnosis') or {}
                 if dgn.get('failure_class') and m['state'] in ('FAILED', 'UNCONVERGED', 'NEEDS_HUMAN'):
                     note += f" [{dgn['failure_class']}{'·可续算' if dgn.get('restartable') else ''}] {dgn.get('evidence', '')}"
-                live = res.get('live') or {}
+                live_result = res.get('live') or {}
                 if m['state'] == 'RUNNING':
-                    if live.get('warning'):
-                        note += f" ⚠{live['warning']}"
-                    elif live.get('ionic_steps') is not None:
-                        note += f"({live['ionic_steps']} 离子步" + (
-                            f",|F|max={live['fmax']}" if live.get('fmax') else '') + ')'
+                    if live_result.get('warning'):
+                        note += f" ⚠{live_result['warning']}"
+                    elif live_result.get('ionic_steps') is not None:
+                        note += f"({live_result['ionic_steps']} 离子步" + (
+                            f",|F|max={live_result['fmax']}"
+                            if live_result.get('fmax') else '') + ')'
                 e0 = res.get('energy_e0_eV')
                 if e0 is not None:
                     note += f'(E0={e0:.4f} eV)'
@@ -267,7 +517,8 @@ def refresh_batch(prof, pw, dirs, trust_new):
     return {'needs_trust': False, 'results': results}
 
 
-def cancel_batch(profile, jobs, *, password=None, trust_new=False):
+def cancel_batch(profile, jobs, *, password=None, trust_new=False,
+                 idempotency_key=None):
     """批量取消作业线程体:逐作业 qdel/scancel + 回写 manifest 状态。
 
     jobs:作业目录列表(每目录 job.yaml 的 scheduler_job_id 提供调度器作业号)。复用
@@ -284,7 +535,7 @@ def cancel_batch(profile, jobs, *, password=None, trust_new=False):
     out = {'ok': False, 'cancelled': [], 'failed': [], 'error': None,
            'needs_trust': False}
     try:
-        dialect = get_dialect(profile.scheduler)      # 不支持的调度器早失败(绝不静默)
+        get_dialect(profile.scheduler)                # 不支持的调度器早失败(绝不静默)
     except ValueError as e:
         out['error'] = str(e)
         return out
@@ -293,9 +544,17 @@ def cancel_batch(profile, jobs, *, password=None, trust_new=False):
     except ConnectError as e:
         out['error'] = str(e)
         out['needs_trust'] = e.needs_trust
+        if e.needs_trust:
+            out.update({
+                'fingerprint': getattr(e, 'fingerprint', ''),
+                'algorithm': getattr(e, 'algorithm', ''),
+                'host': getattr(e, 'host', ''),
+            })
         return out
 
-    bin_path = getattr(profile, 'scheduler_bin', '')
+    busy_count = 0
+    recovery_count = 0
+    recovery_job_ids = []
     try:
         for d in jobs:
             m = manifest_mod.load_manifest(d)
@@ -306,14 +565,40 @@ def cancel_batch(profile, jobs, *, password=None, trust_new=False):
                      'reason': '无 job.yaml 或缺 scheduler_job_id,无法取消'})
                 continue
             try:
-                submitter.run_cmd(client, dialect.cancel_cmd(jid, bin_path), check=True)
-                # CANCELLED 非 manifest 合法态 → FAILED + note '用户取消'(裁决口径)
-                manifest_mod.set_state(m, 'FAILED', note='用户取消')
-                manifest_mod.save_manifest(d, m)
-                out['cancelled'].append(jid)
+                if idempotency_key:
+                    result = submitter.cancel_job(
+                        client, profile, d, idempotency_key=idempotency_key,
+                        expected_job_id=jid)
+                else:
+                    result = submitter.cancel_job(
+                        client, profile, d, expected_job_id=jid)
+                cancelled_id = str(result.get('_cancelled_job_id') or jid)
+                out['cancelled'].append(cancelled_id)
+                if result.get('_cancel_replayed'):
+                    out.setdefault('replayed', []).append(cancelled_id)
+            except submitter.JobOperationBusy as e:
+                busy_count += 1
+                out['failed'].append({'job_id': jid, 'reason': str(e)})
+            except submitter.UnknownRemoteJobOperation as e:
+                recovery_count += 1
+                if e.scheduler_job_id:
+                    recovery_job_ids.append(e.scheduler_job_id)
+                out['failed'].append({'job_id': jid, 'reason': str(e)})
             except _job_errors() as e:
                 out['failed'].append({'job_id': jid, 'reason': str(e)})
     finally:
         close_quiet(client, jump)
-    out['ok'] = True
+    out['ok'] = not (busy_count or recovery_count)
+    if busy_count:
+        out.update({
+            'busy': True, 'code': 'job_busy', 'busy_count': busy_count,
+        })
+    if recovery_count:
+        out.update({
+            'code': 'unknown_remote_job_operation',
+            'requires_manual_recovery': True,
+            'recovery_count': recovery_count,
+        })
+        if recovery_job_ids:
+            out['scheduler_job_ids'] = recovery_job_ids
     return out

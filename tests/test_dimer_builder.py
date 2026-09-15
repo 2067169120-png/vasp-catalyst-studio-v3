@@ -48,14 +48,14 @@ def _make_src(tmp_path, incar=_INCAR, contcar=_POSCAR):
 def test_dimer_incar_vtst_keys(tmp_path):
     src = _make_src(tmp_path)
     db.build_dimer_job(str(src), str(tmp_path / 'dm'))
-    d = parse_incar((tmp_path / 'dm' / 'INCAR').read_text())
+    d = parse_incar((tmp_path / 'dm' / 'INCAR').read_text(encoding='utf-8'))
     assert d['ICHAIN'] == 2 and d['IBRION'] == 3 and d['POTIM'] == 0 and d['IOPT'] == 2
 
 
 def test_dimer_preserves_electronic(tmp_path):
     src = _make_src(tmp_path)
     db.build_dimer_job(str(src), str(tmp_path / 'dm'))
-    d = parse_incar((tmp_path / 'dm' / 'INCAR').read_text())
+    d = parse_incar((tmp_path / 'dm' / 'INCAR').read_text(encoding='utf-8'))
     assert d['ENCUT'] == 400 and d['GGA'] == 'PE'
 
 

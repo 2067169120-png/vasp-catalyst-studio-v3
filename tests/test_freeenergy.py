@@ -5,7 +5,9 @@ import copy
 import pytest
 
 from vcstudio.project import freeenergy as fe
+from vcstudio.project import energy_gate
 from vcstudio.project import reactions as R
+from vcstudio.shared import manifest as manifest_mod
 
 # 构造能量:让公式可手算。E(S8)=-32, E(Li2S)=-8 → μ_Li = (-8 - (-32/8))/2 = -2
 _MOL = {'S8': -32.0, 'Li2S': -8.0, 'Li2S2': -12.0}
@@ -79,6 +81,265 @@ def test_read_e0_and_scan(tmp_path):
     assert scanned == {'S8': pytest.approx(-32.0), 'Li2S': pytest.approx(-8.0)}
 
 
+def test_molecule_scan_rejects_managed_not_done_or_implausible_energy(tmp_path):
+    for species, state, energy in (
+            ('S8', 'DONE', -32.0),
+            ('Li2S', 'NEEDS_HUMAN', -8.0),
+            ('Li2S2', 'DONE', 4.0)):
+        d = tmp_path / f'mol_{species}'
+        d.mkdir()
+        (d / 'OSZICAR').write_text(f' 1 F= {energy} E0= {energy}\n', encoding='utf-8')
+        m = manifest_mod.new_manifest(
+            job_id=species, system=species, task_type='relax', calc_type='molecule', inputs={})
+        manifest_mod.set_state(m, state)
+        m['results'] = {'energy_e0_eV': energy}
+        manifest_mod.save_manifest(d, m)
+
+    assert fe.load_molecule_energies(tmp_path) == {'S8': pytest.approx(-32.0)}
+
+
+def test_molecule_scan_does_not_treat_corrupt_managed_manifest_as_legacy(tmp_path):
+    d = tmp_path / 'mol_Li2S'
+    d.mkdir()
+    (d / 'OSZICAR').write_text(
+        ' 1 F= -8.0 E0= -8.000000E+00\n', encoding='utf-8')
+    # Existing but malformed job.yaml identifies a managed result whose state
+    # cannot be audited.  Its otherwise valid E0 must not enter μLi/ΔG.
+    (d / 'job.yaml').write_text('state: [DONE\n', encoding='utf-8')
+
+    assert fe.load_molecule_energies(tmp_path) == {}
+
+
+def _write_method_job(path, *, elements=('S',), functional='PBE',
+                      input_functional='PBE', energy=-10.0):
+    path.mkdir(parents=True)
+    gga = 'RP' if input_functional == 'RPBE' else 'PE'
+    (path / 'INCAR').write_text(
+        f'GGA={gga}\nENCUT=500\nIVDW=11\nISPIN=2\nLDAU=F\n', encoding='utf-8')
+    counts = ' '.join('1' for _ in elements)
+    coords = '\n'.join(f'0 0 {index / 10:.1f}' for index, _ in enumerate(elements))
+    (path / 'POSCAR').write_text(
+        'method test\n1\n8 0 0\n0 8 0\n0 0 12\n'
+        + ' '.join(elements) + '\n' + counts + '\nDirect\n' + coords + '\n',
+        encoding='utf-8')
+    (path / 'KPOINTS').write_text(
+        'Automatic\n0\nGamma\n1 1 1\n0 0 0\n', encoding='utf-8')
+    titels = [f'PAW_PBE {element}' for element in elements]
+    (path / 'POTCAR').write_text(
+        ''.join(f'TITEL = {titel}\n' for titel in titels), encoding='utf-8')
+    (path / 'OSZICAR').write_text(f'1 F= {energy} E0= {energy}\n', encoding='utf-8')
+    item = manifest_mod.new_manifest(
+        job_id=path.name, system=path.name, task_type='relax',
+        calc_type='molecule', inputs={})
+    manifest_mod.set_state(item, 'DONE')
+    signature = {
+        'functional': functional, 'ivdw': 11, 'encut': 500.0, 'ispin': 2,
+        'ldau': 'F', 'potcar_titel': titels, 'potcar_elements': list(elements),
+    }
+    item['results'] = {'energy_e0_eV': energy,
+                       'reference_method_signature': signature}
+    manifest_mod.save_manifest(path, item)
+    return path
+
+
+def test_method_record_prefers_actual_output_signature_over_edited_incar(tmp_path):
+    job = _write_method_job(
+        tmp_path / 'edited-after-run', functional='RPBE', input_functional='PBE')
+    record = energy_gate.method_record(
+        job, manifest_mod.load_manifest(job), 'edited')
+
+    assert record['fingerprint']['functional'] == 'RPBE'
+    assert record['known']['functional'] is True
+
+
+def test_legacy_hse_label_never_collapses_to_plain_pbe(tmp_path):
+    legacy = _write_method_job(
+        tmp_path / 'legacy-hse06', functional='HSE06', input_functional='PBE')
+    pbe = _write_method_job(
+        tmp_path / 'plain-pbe', functional='PBE', input_functional='PBE')
+    legacy_record = energy_gate.method_record(
+        legacy, manifest_mod.load_manifest(legacy), 'legacy HSE06')
+    pbe_record = energy_gate.method_record(
+        pbe, manifest_mod.load_manifest(pbe), 'PBE')
+    result = energy_gate.compare_methods(
+        [legacy_record, pbe_record], require_same_kpoints=True)
+
+    assert legacy_record['fingerprint']['functional'] == \
+        'hybrid:base=PBE;metagga=F;AEXX=0.25;HFSCREEN=0.2'
+    assert any('泛函 不一致' in issue for issue in result['issues'])
+
+
+def test_contradictory_hse_label_and_disabled_lhfcalc_is_unverified(tmp_path):
+    job = _write_method_job(tmp_path / 'contradictory-hse', functional='HSE06')
+    item = manifest_mod.load_manifest(job)
+    item['results']['reference_method_signature']['lhfcalc'] = 'F'
+    manifest_mod.save_manifest(job, item)
+
+    record = energy_gate.method_record(job, item, 'contradictory HSE')
+
+    assert record['known']['functional'] is False
+
+
+def test_malformed_hybrid_parameters_are_unverified_not_plain_pbe(tmp_path):
+    job = _write_method_job(tmp_path / 'bad-hybrid')
+    (job / 'INCAR').write_text(
+        'GGA=PE\nLHFCALC=T\nAEXX=bad\nENCUT=500\nISPIN=1\nLDAU=F\n',
+        encoding='utf-8')
+    item = manifest_mod.load_manifest(job)
+    item['results'].pop('reference_method_signature', None)
+    manifest_mod.save_manifest(job, item)
+
+    record = energy_gate.method_record(job, item, 'bad hybrid')
+
+    assert record['known']['functional'] is False
+    assert record['fingerprint']['functional'] is None
+
+
+def test_partial_potcar_identity_is_missing_evidence_not_a_conflict(tmp_path):
+    job = tmp_path / 'partial-potcar'
+    job.mkdir()
+    (job / 'INCAR').write_text('GGA=PE\nENCUT=500\nISPIN=1\nLDAU=F\n', encoding='utf-8')
+    (job / 'KPOINTS').write_text(
+        'Automatic\n0\nGamma\n1 1 1\n0 0 0\n', encoding='utf-8')
+    (job / 'POSCAR').write_text(
+        'C\n1\n8 0 0\n0 8 0\n0 0 8\nC\n1\nDirect\n0 0 0\n',
+        encoding='utf-8')
+    partial = energy_gate.method_record(
+        job, {'inputs': {'potcar_provenance': [{'element': 'C', 'titel': None}]}},
+        'partial')
+    known = copy.deepcopy(partial)
+    known['label'] = 'known'
+    known['fingerprint']['potcar_ids'] = {'C': 'known-id'}
+    known['known']['potcar_ids'] = True
+
+    result = energy_gate.compare_methods([partial, known], require_same_kpoints=True)
+
+    assert partial['known']['potcar_ids'] is False
+    assert not any('POTCAR' in issue for issue in result['issues'])
+    assert any('POTCAR 身份证据不完整' in warning
+               for warning in result['warnings'])
+
+
+def _write_unsigned_method_job(path, *, incar, enmax=400.0):
+    path.mkdir(parents=True)
+    (path / 'INCAR').write_text(incar, encoding='utf-8')
+    (path / 'KPOINTS').write_text(
+        'Automatic\n0\nGamma\n1 1 1\n0 0 0\n', encoding='utf-8')
+    (path / 'POSCAR').write_text(
+        'C\n1\n8 0 0\n0 8 0\n0 0 8\nC\n1\nDirect\n0 0 0\n',
+        encoding='utf-8')
+    (path / 'POTCAR').write_text(
+        f'TITEL = PAW_PBE C\nENMAX = {enmax}\n', encoding='utf-8')
+    return path
+
+
+def test_result_method_gate_uses_effective_encut_default_from_potcar(tmp_path):
+    common = 'GGA=PE\nISPIN=1\nIVDW=0\nLDAU=F\n'
+    left_dir = _write_unsigned_method_job(tmp_path / 'left-default', incar=common)
+    right_dir = _write_unsigned_method_job(tmp_path / 'right-default', incar=common)
+    changed_dir = _write_unsigned_method_job(
+        tmp_path / 'changed-default', incar=common, enmax=450.0)
+    left = energy_gate.method_record(left_dir, {}, 'left')
+    right = energy_gate.method_record(right_dir, {}, 'right')
+    changed = energy_gate.method_record(changed_dir, {}, 'changed')
+
+    same = energy_gate.compare_methods([left, right], require_same_kpoints=True)
+    different = energy_gate.compare_methods([left, changed], require_same_kpoints=True)
+
+    assert same['status'] == 'verified'
+    assert left['fingerprint']['encut'] == 400.0
+    assert any('ENCUT 不一致' in issue for issue in different['issues'])
+
+
+def test_result_method_gate_normalises_metagga_false_and_hybrid_base(tmp_path):
+    omitted = _write_unsigned_method_job(
+        tmp_path / 'meta-omitted',
+        incar='GGA=PE\nENCUT=500\nISPIN=1\nIVDW=0\nLDAU=F\n')
+    disabled = _write_unsigned_method_job(
+        tmp_path / 'meta-disabled',
+        incar='GGA=PE\nMETAGGA=F\nENCUT=500\nISPIN=1\nIVDW=0\nLDAU=F\n')
+    pbe_hybrid = _write_unsigned_method_job(
+        tmp_path / 'pbe-hybrid',
+        incar=('GGA=PE\nLHFCALC=T\nAEXX=0.25\nHFSCREEN=0.2\n'
+               'ENCUT=500\nISPIN=1\nIVDW=0\nLDAU=F\n'))
+    implicit_pbe_hybrid = _write_unsigned_method_job(
+        tmp_path / 'implicit-pbe-hybrid',
+        incar=('LHFCALC=T\nAEXX=0.25\nHFSCREEN=0.2\n'
+               'ENCUT=500\nISPIN=1\nIVDW=0\nLDAU=F\n'))
+    rpbe_hybrid = _write_unsigned_method_job(
+        tmp_path / 'rpbe-hybrid',
+        incar=('GGA=RP\nLHFCALC=T\nAEXX=0.25\nHFSCREEN=0.2\n'
+               'ENCUT=500\nISPIN=1\nIVDW=0\nLDAU=F\n'))
+
+    meta = energy_gate.compare_methods([
+        energy_gate.method_record(omitted, {}, 'omitted'),
+        energy_gate.method_record(disabled, {}, 'disabled'),
+    ], require_same_kpoints=True)
+    hybrid = energy_gate.compare_methods([
+        energy_gate.method_record(pbe_hybrid, {}, 'PBE hybrid'),
+        energy_gate.method_record(rpbe_hybrid, {}, 'RPBE hybrid'),
+    ], require_same_kpoints=True)
+    implicit_base = energy_gate.compare_methods([
+        energy_gate.method_record(pbe_hybrid, {}, 'explicit PBE hybrid'),
+        energy_gate.method_record(implicit_pbe_hybrid, {}, 'PAW_PBE default hybrid'),
+    ], require_same_kpoints=True)
+
+    assert meta['status'] == 'verified'
+    assert any('泛函' in issue for issue in hybrid['issues'])
+    assert implicit_base['status'] == 'verified'
+
+
+def test_result_method_gate_detects_managed_input_hash_drift(tmp_path):
+    job = _write_unsigned_method_job(
+        tmp_path / 'drifted',
+        incar='GGA=PE\nENCUT=500\nISPIN=1\nIVDW=0\nLDAU=F\n')
+    frozen = {name: manifest_mod.sha256_file(job / name)
+              for name in ('INCAR', 'KPOINTS', 'POTCAR')}
+    (job / 'INCAR').write_text(
+        'GGA=RP\nENCUT=500\nISPIN=1\nIVDW=0\nLDAU=F\n', encoding='utf-8')
+
+    record = energy_gate.method_record(job, {'inputs': {'sha256': frozen}}, 'drifted')
+
+    assert record['known']['functional'] is False
+    assert any('INCAR' in warning and '哈希不一致' in warning
+               for warning in record['evidence_warnings'])
+
+
+def test_managed_lis_method_audit_blocks_pbe_rpbe_mix(tmp_path):
+    clean = _write_method_job(tmp_path / 'ads' / 'clean', elements=('S',), functional='PBE')
+    config = _write_method_job(tmp_path / 'ads' / 'config', elements=('S',), functional='PBE')
+    molecules = tmp_path / 'molecules'
+    refs = [
+        _write_method_job(molecules / 'mol_S8', elements=('S',), functional='RPBE'),
+        _write_method_job(molecules / 'mol_Li2S', elements=('Li', 'S'), functional='RPBE'),
+        _write_method_job(molecules / 'mol_Li2S2', elements=('Li', 'S'), functional='RPBE'),
+    ]
+    project = {'members': {'clean_slab': str(clean), 'configs': [str(config)]}}
+
+    audit = fe.audit_molecule_method_compatibility(
+        project, molecules, managed_dirs=[str(path) for path in refs])
+
+    assert audit['ok'] is False and audit['status'] == 'incompatible'
+    assert any('跨项目泛函不一致' in issue for issue in audit['errors'])
+
+
+def test_explicit_managed_molecule_missing_manifest_fails_closed(tmp_path):
+    molecule = tmp_path / 'molecules' / 'mol_S8'
+    molecule.mkdir(parents=True)
+    (molecule / 'OSZICAR').write_text('1 F= -32 E0= -32\n', encoding='utf-8')
+    clean = _write_method_job(tmp_path / 'ads' / 'clean')
+    config = _write_method_job(tmp_path / 'ads' / 'config')
+    project = {'members': {'clean_slab': str(clean), 'configs': [str(config)]}}
+
+    audit = fe.audit_molecule_method_compatibility(
+        project, molecule.parent, managed_dirs=[str(molecule)])
+
+    assert audit['ok'] is False
+    assert any('job.yaml' in issue for issue in audit['errors'])
+    assert fe.load_molecule_energies(
+        molecule.parent, managed_dirs=[str(molecule)]) == {}
+
+
 def test_species_matching_no_prefix_collision():
     assert fe._species_in_name('Li2S', 'ads_Li2S_on_slab')
     assert not fe._species_in_name('Li2S', 'ads_Li2S8_on_slab')   # Li2S 不误配 Li2S8(前缀)
@@ -102,6 +363,25 @@ def test_path_from_project_picks_lowest_energy(tmp_path):
     out = fe.path_from_project_and_molecules(rows, e_slab=-90.0,
                                              molecules_dir=tmp_path)
     assert out['steps'][1]['G'] == pytest.approx(-1.0)            # 取了 -105(DONE 里最稳)
+
+
+def test_path_from_project_prefers_explicit_species_for_generic_folder_names(tmp_path):
+    for name, e0 in (('mol_S8', -32.0), ('mol_Li2S', -8.0), ('mol_Li2S2', -12.0)):
+        folder = tmp_path / name
+        folder.mkdir()
+        (folder / 'OSZICAR').write_text(
+            f' 1 F= {e0} E0= {e0:.5E}\n', encoding='utf-8')
+    values = (('S8', -100.0), ('Li2S8', -105.0), ('Li2S6', -95.0),
+              ('Li2S4', -100.0), ('Li2S2', -103.0), ('Li2S', -104.0))
+    rows = [{'name': f'{index:03d}', 'species': species,
+             'e_config': energy, 'state': 'DONE'}
+            for index, (species, energy) in enumerate(values, 1)]
+
+    out = fe.path_from_project_and_molecules(
+        rows, e_slab=-90.0, molecules_dir=tmp_path)
+
+    assert [step['label'] for step in out['steps']] == [
+        'S8*', 'Li2S8*', 'Li2S6*', 'Li2S4*', 'Li2S2*', 'Li2S*']
 
 
 # ═════════════════════════════════════════════════════════════════════════════

@@ -45,6 +45,28 @@ def test_parse_kpoints_scheme():
     assert k['grid'] == [3, 3, 1]
 
 
+def test_explicit_kpoints_identity_covers_all_effective_lines_but_not_comment():
+    first = mt.parse_kpoints_scheme(
+        'comment one\n2\nReciprocal\n0 0 0 1\n0.5 0 0 1\n')
+    same = mt.parse_kpoints_scheme(
+        'different comment\n2\nReciprocal\n0 0 0 1\n0.5 0 0 1\n')
+    changed = mt.parse_kpoints_scheme(
+        'comment one\n2\nReciprocal\n0 0 0 1\n0.25 0 0 1\n')
+
+    assert first['raw_sha256'] == same['raw_sha256']
+    assert first['raw_sha256'] != changed['raw_sha256']
+
+
+def test_explicit_kpoints_identity_normalises_case_numbers_and_signed_zero():
+    first = mt.parse_kpoints_scheme(
+        'comment\n2\nReciprocal\n0 0 0 1\n0.5 -0 0 1\n')
+    same = mt.parse_kpoints_scheme(
+        'other\n2\nreciprocal\n0.0 0.000 0 1.0\n0.500000 0 0.0 1\n')
+
+    assert first['raw'] == same['raw']
+    assert first['raw_sha256'] == same['raw_sha256']
+
+
 def test_extract_facts_rpbe_overrides_potcar_flavor():
     r = mt.extract_facts(_INCAR_RPBE, _KPOINTS_GAMMA, _POTCAR_HEAD)
     f = r['facts']
@@ -64,6 +86,45 @@ def test_extract_facts_no_gga_falls_back_to_flavor():
     incar = 'ENCUT = 450\nISMEAR = 0\nSIGMA = 0.05\n'
     r = mt.extract_facts(incar, _KPOINTS_GAMMA, _POTCAR_HEAD)
     assert r['facts']['functional'] == 'PBE'  # PAW_PBE 味缺 GGA → PBE
+
+
+def test_extract_facts_hse06_is_not_mislabelled_as_pbe():
+    incar = (
+        'GGA = PE\nENCUT = 500\nLHFCALC = .TRUE.\n'
+        'AEXX = 0.25\nHFSCREEN = 0.2\nLASPH = .TRUE.\n'
+    )
+    result = mt.extract_facts(incar, _KPOINTS_GAMMA, _POTCAR_HEAD)
+    facts = result['facts']
+    assert facts['functional'] == 'HSE06'
+    assert facts['functional_class'] == 'screened hybrid'
+    assert facts['base_functional'] == 'PBE'
+    assert facts['lhfcalc'] is True
+    assert facts['aexx'] == 0.25 and facts['hfscreen'] == 0.2
+    assert 'HSE06' in mt.render_zh(facts)
+    assert 'HSE06' in mt.render_en(facts)
+    assert 'Heyd2003' in mt.render_bibtex(facts)
+
+
+def test_extract_facts_r2scan_is_not_mislabelled_as_pbe():
+    incar = 'METAGGA = R2SCAN\nLASPH = .TRUE.\nENCUT = 500\n'
+    result = mt.extract_facts(incar, _KPOINTS_GAMMA, _POTCAR_HEAD)
+    facts = result['facts']
+    assert facts['functional'] == 'r2SCAN'
+    assert facts['functional_class'] == 'meta-GGA'
+    assert facts['metagga'] == 'R2SCAN'
+    assert facts['functional_known'] is True
+    assert 'meta-GGA r2SCAN' in mt.render_zh(facts)
+    assert 'meta-GGA r2SCAN' in mt.render_en(facts)
+    assert 'Furness2020' in mt.render_bibtex(facts)
+
+
+def test_malformed_hybrid_settings_are_not_reported_as_verified_pbe():
+    result = mt.extract_facts(
+        'GGA = PE\nLHFCALC = .TRUE.\nAEXX = not-a-number\nHFSCREEN = 0.2\n',
+        _KPOINTS_GAMMA, _POTCAR_HEAD)
+    assert result['facts']['functional_known'] is False
+    assert result['facts']['lhfcalc'] is True
+    assert any('AEXX' in warning for warning in result['warnings'])
 
 
 def test_extract_facts_missing_pieces_degrade():

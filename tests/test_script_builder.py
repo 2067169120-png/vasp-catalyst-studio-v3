@@ -66,6 +66,13 @@ def test_template_unknown_braces_untouched():
     assert find_placeholders('{job_name} {UNKNOWN}') == ['job_name']
 
 
+def test_template_command_placeholder_uses_selected_engine_command():
+    spec = _spec(vasp_cmd='cp2k.psmp -i water.inp -o water.out')
+    out = render_template('#!/bin/bash\ncd {remote_dir}\n{command}\n', spec)
+    assert 'cp2k.psmp -i water.inp -o water.out' in out
+    assert '{command}' not in out
+
+
 def test_build_script_dispatch_and_auto_missing():
     with pytest.raises(ValueError, match='资源参数'):
         build_script('auto', PBSDialect(), _spec(queue='', vasp_cmd=''))

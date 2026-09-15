@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 
@@ -150,7 +151,7 @@ def energy_implausible(e) -> bool:
         v = float(e)
     except (TypeError, ValueError):
         return True
-    return v >= 0 or abs(v) > _ENERGY_ABSURD
+    return not math.isfinite(v) or v >= 0 or abs(v) > _ENERGY_ABSURD
 
 
 def scan_log(log_tail: str) -> str | None:
@@ -188,7 +189,18 @@ def last_block_scf_iters(oszicar_tail: str) -> int:
     """OSZICAR 尾部最后一个离子步块的电子步数(解析不出 → 0)。"""
     if not oszicar_tail:
         return 0
-    last_block = oszicar_tail.rsplit('F=', 1)[-1] if 'F=' in oszicar_tail else oszicar_tail
+    # Real VASP ordering is DAV/RMM electronic lines followed by the ionic
+    # ``F= ... E0= ...`` summary.  Therefore the final electronic block lies
+    # *before* the last F= line and after the previous summary.  The old rsplit
+    # selected text after F= and returned zero for the real NELM trap.
+    lines = oszicar_tail.splitlines()
+    summaries = [index for index, line in enumerate(lines) if 'F=' in line]
+    if summaries:
+        end = summaries[-1]
+        start = summaries[-2] + 1 if len(summaries) > 1 else 0
+        last_block = '\n'.join(lines[start:end])
+    else:
+        last_block = oszicar_tail
     matches = _SCF_LINE_RE.findall(last_block)
     return int(matches[-1][0]) if matches else 0
 
@@ -303,11 +315,21 @@ def classify(*, scheduler_reason: str | None = None, exit_code: int | None = Non
              stopped: bool = False) -> Diagnosis:
     """单一决策点:所有取证证据 → Diagnosis。
 
-    优先级:①收敛串在场 → 判能量合理性(CONVERGED / BAD_ENERGY);②零输出 →
+    优先级:①收敛串 + 干净页脚 + 无非零退出证据 → 判能量合理性
+    (CONVERGED / BAD_ENERGY);②零输出 →
     区分调度器杀 / 静默退出 / 启动即死;③有输出未收敛 → 调度器具体原因 > 日志硬崩
     签名 > 退出码 137(OOM) > 未收敛(可续算);④都不覆盖 → UNKNOWN 交人工。
     """
     rcls = _reason_to_class(scheduler_reason)
+
+    # 调度器明确报 CANCELLED/OOM/TIMEOUT/NODE_FAIL 时，失败证据必须压过
+    # OUTCAR 中可能来自旧轮、或在后处理前留下的收敛串。若两者冲突，
+    # 停在人工取证；不自动 DONE，也不盲目续算一份看似收敛的结构。
+    if converged and (rcls is not None or scheduler_reason == R_FAILED):
+        return Diagnosis(
+            rcls or UNKNOWN, 'NEEDS_HUMAN', False,
+            f'收敛证据与调度器终态 {scheduler_reason} 冲突；'
+            '需核对当前作业号的 EXIT=0 与本轮输出世代，禁止自动判 DONE')
 
     # ⓪ STOPCAR 人工叫停:不是失败,人决定下一步(防被误判 NONCONVERGED 而盲目续算)
     if stopped and not converged:
@@ -321,8 +343,15 @@ def classify(*, scheduler_reason: str | None = None, exit_code: int | None = Non
                          '日志命中磁盘满/IO 错误(No space / quota / I-O error)——'
                          '不可续算,请先清理磁盘或换配额目录再重跑')
 
-    # ① 收敛串在场:成功当且仅当 能量物理合理 且 末离子步电子真收敛
+    # ① 收敛串在场仍不等于完成：OUTCAR 可能是旧轮残留或在收尾时截断。
+    # DONE 必须同时有 timing 页脚，且作业包装无非零退出证据。None 表示未取到
+    # 退出码，不当作失败；显式非零则一定不能 DONE。
     if converged:
+        if clean_exit is not True:
+            return Diagnosis(
+                UNKNOWN, FAILURE_TO_STATE[UNKNOWN], False,
+                '收敛串在场但无 timing 页脚——可能是旧 OUTCAR 残留或中途截断；'
+                '不能判 DONE，也不能自动续算，需人工核对当轮作业日志')
         if nelm_saturated(oszicar_tail, nelm):
             # VASP5 陷阱:NELM 耗尽同样打印 EDIFF-reached 串——收敛标志是假阳性
             return Diagnosis(SCF_SLOSHING, FAILURE_TO_STATE[SCF_SLOSHING], False,
@@ -331,9 +360,9 @@ def classify(*, scheduler_reason: str | None = None, exit_code: int | None = Non
         if energy_implausible(energy):
             return Diagnosis(BAD_ENERGY, FAILURE_TO_STATE[BAD_ENERGY], False,
                              f'OUTCAR 报收敛但能量不合理(E={energy});疑结构重叠/SCF 发散,需人工核对')
-        tail_note = '' if clean_exit in (True, None) else '(注:未见 timing 页脚,收尾非干净退出)'
-        return Diagnosis(CONVERGED, 'DONE', False,
-                         f'OUTCAR 达到要求精度,E0={energy} eV{tail_note}')
+        if clean_exit is True and exit_code in (None, 0):
+            return Diagnosis(CONVERGED, 'DONE', False,
+                             f'OUTCAR 达到要求精度且见干净页脚,E0={energy} eV')
 
     # ② 零输出:OUTCAR 与 OSZICAR 都空/缺
     if _empty(outcar_size) and _empty(oszicar_size):
@@ -370,6 +399,11 @@ def classify(*, scheduler_reason: str | None = None, exit_code: int | None = Non
     if scheduler_reason == R_FAILED:               # 泛化失败无更具体信号 → 交人工
         return Diagnosis(UNKNOWN, FAILURE_TO_STATE[UNKNOWN], False,
                          '调度器报失败但无具体原因/日志签名,需人工')
+    if exit_code not in (None, 0):
+        return Diagnosis(
+            UNKNOWN, FAILURE_TO_STATE[UNKNOWN], False,
+            f'退出码 {exit_code} 为非零；即使 OUTCAR 留有收敛串也不能证明作业完整完成，'
+            '需核对作业日志和输出完整性')
     slosh = scan_oszicar_sloshing(oszicar_tail)     # 电子震荡:盲目续算必复现 → 交人工
     if slosh is not None:
         return Diagnosis(SCF_SLOSHING, FAILURE_TO_STATE[SCF_SLOSHING], False, slosh)
@@ -396,8 +430,9 @@ def classify_neb(*, images_expected=None, images_found=None, image_status=None,
       ① IMAGES 与实际 image 子目录数不符 → 输入错误(NEB_IMAGES_MISMATCH,交人工);
       ② 某 image 无有效输出 → NEB_IMAGE_MISSING(点名 image,交人工);
       ③ 某 image SCF 崩/震荡 → NEB_IMAGE_SCF(点名 image,交人工);
-      ④ 收敛串在场 → CONVERGED;
-      ⑤ 调度器具体原因(WALLTIME 等)> stdout 硬崩签名 > VASP 已知错误 > 未收敛(可续算)。
+      ④ 调度器/退出码/stdout 显式失败证据;
+      ⑤ 收敛串在场 → CONVERGED;
+      ⑥ 未收敛。当前没有安全的 image 级自动续算实现，因此不冒充 restartable。
 
     Args:
         images_expected: INCAR 的 IMAGES(中间 image 数);None 表示未知(跳过①)。
@@ -417,7 +452,7 @@ def classify_neb(*, images_expected=None, images_found=None, image_status=None,
 
     # ② 某 image 无有效输出(缺失/启动即死)
     missing = [s['index'] for s in status if s.get('empty')]
-    if missing and not converged:
+    if missing:
         names = ', '.join(f'{int(i):02d}' for i in missing)
         return Diagnosis(
             NEB_IMAGE_MISSING, FAILURE_TO_STATE[NEB_IMAGE_MISSING], False,
@@ -425,35 +460,41 @@ def classify_neb(*, images_expected=None, images_found=None, image_status=None,
 
     # ③ 某 image SCF 崩/震荡(点名 image)
     crashed = [s['index'] for s in status if s.get('scf_fail')]
-    if crashed and not converged:
+    if crashed:
         names = ', '.join(f'{int(i):02d}' for i in crashed)
         return Diagnosis(
             NEB_IMAGE_SCF, FAILURE_TO_STATE[NEB_IMAGE_SCF], False,
             f'image {names} SCF 崩/震荡——同 INCAR 续算必复现,建议人工调 ALGO/AMIX 或查该 image 结构')
 
-    # ④ 收敛(各 image 力收敛)
-    if converged:
-        return Diagnosis(CONVERGED, 'DONE', False,
-                         'NEB 各 image 力收敛(stdout 出现 reached required accuracy)')
-
-    # ⑤ 未收敛:调度器原因 > stdout 硬崩签名 > VASP 已知错误 > 未收敛(可续算)
+    # ④ 显式失败证据必须压过 stdout 中可能来自旧轮次的收敛串。
     rcls = _reason_to_class(scheduler_reason)
     if rcls is not None:
-        return Diagnosis(rcls, FAILURE_TO_STATE[rcls], rcls in RESTARTABLE,
-                         f'调度器报 {scheduler_reason};NEB 有部分输出但未收敛')
+        return Diagnosis(rcls, FAILURE_TO_STATE[rcls], False,
+                         f'调度器报 {scheduler_reason};NEB image 级自动续算尚未实现,需人工重提')
     sig = scan_log(log_tail)
     if sig is not None:
-        return Diagnosis(sig, FAILURE_TO_STATE[sig], sig in RESTARTABLE,
+        return Diagnosis(sig, FAILURE_TO_STATE[sig], False,
                          f'NEB stdout 命中 {sig} 签名')
     if exit_code == _OOM_EXIT:
-        return Diagnosis(WALLTIME, FAILURE_TO_STATE[WALLTIME], True,
-                         f'退出码 {exit_code}(SIGKILL)但无 OOM 证据,且有部分输出——疑超墙钟,按可续算处理')
+        return Diagnosis(WALLTIME, FAILURE_TO_STATE[WALLTIME], False,
+                         f'退出码 {exit_code}(SIGKILL)但无 OOM 证据;NEB image 级自动续算尚未实现')
     ve = scan_vasp_error(log_tail)
     if ve is not None:
         label, hint = ve
         return Diagnosis(label, 'NEEDS_HUMAN', False, f'NEB 命中 VASP 已知错误 {label}:{hint}')
-    return Diagnosis(NONCONVERGED, 'UNCONVERGED', True,
-                     'NEB 未见收敛标志(reached required accuracy)——力未收敛/墙钟,可从各 image CONTCAR 续算')
+    if exit_code not in (None, 0):
+        return Diagnosis(
+            UNKNOWN, FAILURE_TO_STATE[UNKNOWN], False,
+            f'NEB 包装脚本退出码 {exit_code} 为非零;即使 stdout 留有收敛串也不能判 DONE')
+
+    # ⑤ 收敛(各 image 输出完整、无硬失败且力收敛)
+    if converged:
+        return Diagnosis(CONVERGED, 'DONE', False,
+                         'NEB 各 image 输出完整且力收敛(stdout 出现 reached required accuracy)')
+
+    return Diagnosis(
+        NONCONVERGED, 'UNCONVERGED', False,
+        'NEB 未见收敛标志；当前尚无安全的 image 级自动续算实现，请保留各 image 后人工重提')
 
 
 # ── CONTCAR 续算前校验(valid_poscar 移植) ─────────────────────────────────────

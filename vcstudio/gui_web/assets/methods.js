@@ -58,7 +58,7 @@
     wrap.appendChild(body);
 
     const m = VCS.modal({
-      title: '计算方法段 — ' + name,
+      title: VCS.t('methods.title', { name }, '计算方法段 — {name}'),
       body: wrap,
       actions: [{ label: '关闭', quiet: true, onClick: h => h.close() }],
     });

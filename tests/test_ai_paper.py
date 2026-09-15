@@ -6,8 +6,10 @@
 contradicts-halt。硬护栏落到断言:LLM 只抽文本、每格带出处、spec 过校验、accepted 只由门产生。
 """
 import json
+import multiprocessing
+import threading
 
-from vcstudio.campaign import derive, ledger, schema
+from vcstudio.campaign import derive, ledger, lock, schema
 from vcstudio.project import ai_paper as ap
 
 # 含方法学关键词的假论文文本(命中窗口喂 LLM);第二页无关键词(应被 locate 跳过)。
@@ -41,6 +43,25 @@ def _good_spec():
         'outputs': [cell('volcano plot')],
         'mode': cell('reproduce'),
     }
+
+
+def _process_autopilot_with_blocking_runner(
+        campaign_dir, entered, release_runner, calls, output):
+    """Spawn-safe contender used to prove the campaign run lock is process-wide."""
+    def blocking_runner(task):
+        with calls.get_lock():
+            calls.value += 1
+        entered.set()
+        if not release_runner.wait(20):
+            raise TimeoutError('spawn runner release timed out')
+        return _good_runner(task)
+
+    try:
+        result = ap.autopilot_step(
+            campaign_dir, runners={'execute': blocking_runner})
+        output.put(('result', result))
+    except BaseException as exc:  # pragma: no cover - surfaced to parent assertion
+        output.put(('error', type(exc).__name__, str(exc)))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -445,3 +466,107 @@ def test_autopilot_validate_blocked_when_checks_fail(tmp_path):
     camp = schema.load_campaign(r['campaign_dir'])
     # 校验未过 → 绝不 validated/accepted,停在 completed
     assert camp['tasks'][0]['rung'] == 'completed'
+
+
+def test_two_autopilot_calls_execute_exactly_one_runner_and_other_is_busy(tmp_path):
+    r = _single_slab_campaign(tmp_path)
+    entered = threading.Event()
+    release_runner = threading.Event()
+    calls = []
+    first_result = []
+
+    def blocking_runner(task):
+        calls.append(task['id'])
+        entered.set()
+        assert release_runner.wait(timeout=5)
+        return _good_runner(task)
+
+    thread = threading.Thread(target=lambda: first_result.append(
+        ap.autopilot_step(r['campaign_dir'], runners={'execute': blocking_runner})))
+    thread.start()
+    assert entered.wait(timeout=5)
+    second = ap.autopilot_step(r['campaign_dir'], runners={'execute': blocking_runner})
+    assert second['busy'] is True and second['actions'] == []
+    assert '未读取/claim/执行任何任务' in second['reason']
+    release_runner.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert calls == ['relax__Fe@MN4']
+    assert first_result[0]['actions'] == [
+        {'task': 'relax__Fe@MN4', 'action': 'accepted'}]
+    assert lock.is_held(r['campaign_dir']) is False
+    task = schema.load_task(r['campaign_dir'], 'relax__Fe@MN4')
+    assert task is not None and task['rung'] == 'accepted' and task['revision'] == 4
+    assert schema.load_campaign(r['campaign_dir']) is not None
+
+
+def test_two_spawned_autopilots_execute_exactly_one_ready_task(tmp_path):
+    """Two desktop processes cannot both claim/execute the same ready task."""
+    campaign = _single_slab_campaign(tmp_path)
+    context = multiprocessing.get_context('spawn')
+    entered = context.Event()
+    release_runner = context.Event()
+    calls = context.Value('i', 0)
+    output = context.Queue()
+
+    first = context.Process(
+        target=_process_autopilot_with_blocking_runner,
+        args=(campaign['campaign_dir'], entered, release_runner, calls, output),
+    )
+    first.start()
+    assert entered.wait(20), 'first spawned autopilot never entered its runner'
+
+    second = context.Process(
+        target=_process_autopilot_with_blocking_runner,
+        args=(campaign['campaign_dir'], entered, release_runner, calls, output),
+    )
+    second.start()
+    second_row = output.get(timeout=20)
+    assert second_row[0] == 'result', second_row
+    assert second_row[1]['busy'] is True
+    assert second_row[1]['actions'] == []
+    assert '未读取/claim/执行任何任务' in second_row[1]['reason']
+
+    release_runner.set()
+    first_row = output.get(timeout=30)
+    assert first_row[0] == 'result', first_row
+    assert first_row[1]['actions'] == [
+        {'task': 'relax__Fe@MN4', 'action': 'accepted'}]
+
+    for process in (first, second):
+        process.join(30)
+        if process.is_alive():  # pragma: no cover - cleanup for failed synchronization
+            process.terminate()
+            process.join(5)
+    assert first.exitcode == 0 and second.exitcode == 0
+    assert calls.value == 1
+    disk = schema.load_task(campaign['campaign_dir'], 'relax__Fe@MN4')
+    assert disk is not None and disk['rung'] == 'accepted' and disk['revision'] == 4
+    assert lock.is_held(campaign['campaign_dir']) is False
+
+
+def test_autopilot_held_lock_returns_before_campaign_read(tmp_path, monkeypatch):
+    r = _single_slab_campaign(tmp_path)
+    assert lock.acquire(r['campaign_dir'], 'manual-owner') is True
+
+    def forbidden_read(*_args, **_kwargs):
+        raise AssertionError('held lock 时不应读取 campaign')
+
+    monkeypatch.setattr(schema, 'load_campaign', forbidden_read)
+    result = ap.autopilot_step(r['campaign_dir'], runners={'execute': _good_runner})
+    assert result['busy'] is True and result['lock']['owner'] == 'manual-owner'
+    assert lock.release(r['campaign_dir'], owner='manual-owner') is True
+
+
+def test_autopilot_runner_exception_structures_failure_and_finally_releases_lock(tmp_path):
+    r = _single_slab_campaign(tmp_path)
+
+    def boom(_task):
+        raise RuntimeError('runner exploded')
+
+    result = ap.autopilot_step(r['campaign_dir'], runners={'execute': boom})
+    assert result['actions'][0]['action'] == 'failed'
+    assert 'runner exploded' in result['actions'][0]['detail']
+    assert lock.is_held(r['campaign_dir']) is False
+    disk = schema.load_task(r['campaign_dir'], 'relax__Fe@MN4')
+    assert disk['rung'] == 'failed' and disk['revision'] == 2

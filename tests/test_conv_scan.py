@@ -15,6 +15,10 @@ import pytest  # noqa: E402
 from vcstudio.generate import conv_scan as cs  # noqa: E402
 from vcstudio.generate.incar_builder import parse_incar  # noqa: E402
 from vcstudio.shared import manifest as manifest_mod  # noqa: E402
+from vcstudio.shared.scientific_inputs import (  # noqa: E402
+    closure_record_matches,
+    resolve_input_closure,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -60,15 +64,20 @@ def _write_oszicar(job_dir, e0):
 
 
 # ── ENCUT 系列 ──────────────────────────────────────────────────────────────────
-def test_encut_series_only_changes_encut(tmp_path):
+def test_encut_series_uses_fixed_geometry_static_baseline(tmp_path):
     src = _make_src(tmp_path)
     res = cs.build_encut_series(str(src), str(tmp_path / 'enc'), values=[400, 500, 600])
     assert set(res['dirs']) == {400, 500, 600}
-    inc = parse_incar((tmp_path / 'enc' / 'encut_400' / 'INCAR').read_text())
+    inc = parse_incar(
+        (tmp_path / 'enc' / 'encut_400' / 'INCAR').read_text(encoding='utf-8'))
     assert inc['ENCUT'] == 400
-    assert inc['GGA'] == 'PE' and inc['IBRION'] == 2         # 其余键原样
+    assert inc['GGA'] == 'PE'
+    assert inc['IBRION'] == -1 and inc['NSW'] == 0
+    assert inc['ISTART'] == 0 and inc['ICHARG'] == 2
+    assert 'ISIF' not in inc and 'EDIFFG' not in inc
     # KPOINTS/POTCAR 逐字复制
-    assert (tmp_path / 'enc' / 'encut_400' / 'KPOINTS').read_text() == _KP
+    assert (tmp_path / 'enc' / 'encut_400' / 'KPOINTS').read_text(
+        encoding='utf-8') == _KP
 
 
 def test_encut_series_manifest_and_changes(tmp_path):
@@ -78,18 +87,137 @@ def test_encut_series_manifest_and_changes(tmp_path):
     assert m['task_type'] == 'conv_scan'
     assert m['inputs']['series'] == 'encut' and m['inputs']['series_value'] == 450
     assert m['inputs']['natoms'] == 2
+    assert m['inputs']['sha256']['POSCAR'] == manifest_mod.sha256_file(
+        tmp_path / 'enc' / 'encut_450' / 'POSCAR')
     assert any(c['key'] == 'ENCUT' and c['new'] == 450 for c in m['inputs']['incar_changes'])
 
 
+@pytest.mark.parametrize(('builder', 'incar_suffix', 'dependency_name', 'payload'), [
+    ('encut', 'LUSE_VDW = .TRUE.\n', 'vdw_kernel.bindat', b'vdw-kernel-bytes'),
+    ('kmesh', 'SHAKEMAXITER = 100\n', 'ICONST', b'1 2 3\n'),
+    ('vacuum', 'ML_MODE = run\n', 'ML_FF', b'ml-force-field'),
+])
+def test_real_builder_copies_active_managed_dependency_and_closes_inputs(
+        tmp_path, builder, incar_suffix, dependency_name, payload):
+    src = _make_src(tmp_path, incar=_INCAR + incar_suffix)
+    (src / dependency_name).write_bytes(payload)
+
+    if builder == 'encut':
+        built = cs.build_encut_series(
+            str(src), str(tmp_path / 'out'), values=[450])
+    elif builder == 'kmesh':
+        built = cs.build_kmesh_series(
+            str(src), str(tmp_path / 'out'), meshes=[[3, 3, 1]])
+    else:
+        built = cs.build_vacuum_series(
+            str(src), str(tmp_path / 'out'), vacuums=[12])
+
+    job = __import__('pathlib').Path(next(iter(built['dirs'].values())))
+    assert (job / dependency_name).read_bytes() == payload
+    manifest = manifest_mod.load_manifest(job)
+    recorded = manifest['inputs']['input_closure']
+    current = resolve_input_closure(job, manifest)
+    assert recorded['status'] == 'complete'
+    assert current['status'] == 'complete'
+    assert closure_record_matches(recorded, current)
+    assert manifest['inputs']['sha256'] == recorded['files']
+
+
+@pytest.mark.parametrize(('incar_suffix', 'missing_name'), [
+    ('LUSE_VDW = .TRUE.\n', 'vdw_kernel.bindat/vdw_kernel'),
+    ('SHAKEMAXITER = 100\n', 'ICONST'),
+    ('ML_MODE = run\n', 'ML_FF'),
+])
+def test_builder_fails_explicitly_when_active_dependency_is_missing(
+        tmp_path, incar_suffix, missing_name):
+    src = _make_src(tmp_path, incar=_INCAR + incar_suffix)
+
+    with pytest.raises(ValueError, match=missing_name):
+        cs.build_encut_series(str(src), str(tmp_path / 'enc'), values=[450])
+
+
+def test_incidental_kpoints_opt_is_not_copied_or_added_to_closure(tmp_path):
+    src = _make_src(tmp_path)
+    (src / 'KPOINTS_OPT').write_text('incidental\n', encoding='utf-8')
+
+    built = cs.build_encut_series(
+        str(src), str(tmp_path / 'enc'), values=[450])
+
+    job = __import__('pathlib').Path(built['dirs'][450])
+    manifest = manifest_mod.load_manifest(job)
+    assert not (job / 'KPOINTS_OPT').exists()
+    assert 'KPOINTS_OPT' not in manifest['inputs']['input_closure']['files']
+    assert manifest['inputs']['input_closure']['status'] == 'complete'
+
+
+def test_fixed_structure_scan_preserves_manifest_declared_iconst(tmp_path):
+    src = _make_src(tmp_path)
+    (src / 'ICONST').write_text('R 1 2 0\n', encoding='utf-8')
+    (src / 'job.yaml').write_text(
+        'state: DONE\ninputs:\n  uses_iconst: true\n', encoding='utf-8')
+
+    built = cs.build_encut_series(
+        str(src), str(tmp_path / 'enc'), values=[450])
+
+    job = __import__('pathlib').Path(built['dirs'][450])
+    assert (job / 'ICONST').read_text(encoding='utf-8') == 'R 1 2 0\n'
+    manifest = manifest_mod.load_manifest(job)
+    assert manifest['inputs']['uses_iconst'] is True
+    assert manifest['inputs']['method_recipe']['decisions']['extra'][
+        'uses_iconst'] is True
+    closure = manifest['inputs']['input_closure']
+    assert closure['status'] == 'complete'
+    assert 'ICONST' in closure['files']
+    assert 'ICONST' in closure['requirements']
+
+
+@pytest.mark.parametrize('manifest_text', [
+    None,
+    'state: DONE\ninputs:\n  uses_iconst: false\n',
+])
+def test_fixed_structure_scan_ignores_incidental_iconst_without_true_declaration(
+        tmp_path, manifest_text):
+    src = _make_src(tmp_path)
+    (src / 'ICONST').write_text('incidental\n', encoding='utf-8')
+    if manifest_text is not None:
+        (src / 'job.yaml').write_text(manifest_text, encoding='utf-8')
+
+    built = cs.build_encut_series(
+        str(src), str(tmp_path / 'enc'), values=[450])
+
+    job = __import__('pathlib').Path(built['dirs'][450])
+    manifest = manifest_mod.load_manifest(job)
+    assert not (job / 'ICONST').exists()
+    assert 'uses_iconst' not in manifest['inputs']
+    assert 'ICONST' not in manifest['inputs']['input_closure']['requirements']
+
+
+@pytest.mark.parametrize('invalid_yaml', [
+    'inputs:\n  uses_iconst: 1\n',
+    'inputs:\n  uses_iconst: [true]\n',
+    'inputs:\n  uses_iconst: maybe\n',
+])
+def test_fixed_structure_scan_rejects_invalid_manifest_uses_iconst(
+        tmp_path, invalid_yaml):
+    src = _make_src(tmp_path)
+    (src / 'ICONST').write_text('R 1 2 0\n', encoding='utf-8')
+    (src / 'job.yaml').write_text(invalid_yaml, encoding='utf-8')
+
+    with pytest.raises(ValueError, match='uses_iconst'):
+        cs.build_encut_series(str(src), str(tmp_path / 'enc'), values=[450])
+
+
 # ── k 网格系列 ──────────────────────────────────────────────────────────────────
-def test_kmesh_series_changes_kpoints_only(tmp_path):
+def test_kmesh_series_changes_kpoints_on_fixed_static_baseline(tmp_path):
     src = _make_src(tmp_path)
     res = cs.build_kmesh_series(str(src), str(tmp_path / 'km'), meshes=[[3, 3, 1], [7, 7, 1]])
     assert set(res['dirs']) == {9, 49}                       # series_value = k 点积
-    kp = (tmp_path / 'km' / 'kmesh_7x7x1' / 'KPOINTS').read_text()
+    kp = (tmp_path / 'km' / 'kmesh_7x7x1' / 'KPOINTS').read_text(
+        encoding='utf-8')
     assert '7 7 1' in kp and 'Gamma' in kp
-    # INCAR 未动
-    assert (tmp_path / 'km' / 'kmesh_7x7x1' / 'INCAR').read_text() == _INCAR
+    inc = parse_incar(
+        (tmp_path / 'km' / 'kmesh_7x7x1' / 'INCAR').read_text(encoding='utf-8'))
+    assert inc['IBRION'] == -1 and inc['NSW'] == 0 and inc['ICHARG'] == 2
 
 
 def test_kmesh_series_manifest(tmp_path):
@@ -104,12 +232,14 @@ def test_kmesh_series_manifest(tmp_path):
 def test_vacuum_series_rebuilds_poscar(tmp_path):
     src = _make_src(tmp_path)
     cs.build_vacuum_series(str(src), str(tmp_path / 'vac'), vacuums=[12, 18])
-    txt = (tmp_path / 'vac' / 'vac_12' / 'POSCAR').read_text()
+    txt = (tmp_path / 'vac' / 'vac_12' / 'POSCAR').read_text(encoding='utf-8')
     # slab z 跨度 = 2 Å(8→10),真空 12 → |c| = 14
     c_line = txt.splitlines()[4].split()
     assert float(c_line[2]) == pytest.approx(14.0)
-    # INCAR/KPOINTS 复制
-    assert (tmp_path / 'vac' / 'vac_12' / 'INCAR').read_text() == _INCAR
+    # 所有点共享固定几何静态 INCAR；KPOINTS 复制
+    inc = parse_incar(
+        (tmp_path / 'vac' / 'vac_12' / 'INCAR').read_text(encoding='utf-8'))
+    assert inc['IBRION'] == -1 and inc['NSW'] == 0 and inc['ICHARG'] == 2
 
 
 def test_set_vacuum_centers_and_sets_c(tmp_path):
@@ -145,9 +275,26 @@ def test_slab_thickness_with_builder_fn(tmp_path):
     res = cs.build_slab_thickness_series(str(src), str(tmp_path / 'th'),
                                          layers=[3, 4], slab_builder_fn=_fake_slab)
     assert set(res['dirs']) == {3, 4}
-    assert '3 layers' in (tmp_path / 'th' / 'nlayers_3' / 'POSCAR').read_text()
+    assert '3 layers' in (tmp_path / 'th' / 'nlayers_3' / 'POSCAR').read_text(
+        encoding='utf-8')
+    inc = parse_incar(
+        (tmp_path / 'th' / 'nlayers_3' / 'INCAR').read_text(encoding='utf-8'))
+    assert inc['IBRION'] == -1 and inc['NSW'] == 0 and inc['ICHARG'] == 2
     m = manifest_mod.load_manifest(tmp_path / 'th' / 'nlayers_4')
     assert m['inputs']['series'] == 'slab_thickness' and m['inputs']['series_value'] == 4
+
+
+def test_slab_thickness_explicitly_rejects_inherited_iconst_constraint(tmp_path):
+    src = _make_src(tmp_path)
+    (src / 'ICONST').write_text('R 1 2 0\n', encoding='utf-8')
+    (src / 'job.yaml').write_text(
+        'state: DONE\ninputs:\n  uses_iconst: true\n', encoding='utf-8')
+
+    with pytest.raises(ValueError, match='不支持继承 ICONST'):
+        cs.build_slab_thickness_series(
+            str(src), str(tmp_path / 'th'), layers=[3],
+            slab_builder_fn=lambda _layers: _SLAB,
+        )
 
 
 # ── derive_incar 通用助手 ────────────────────────────────────────────────────────
@@ -208,11 +355,23 @@ def test_analyze_series_missing_oszicar_energy_none(tmp_path):
     assert '无任一' in res['note']
 
 
+def test_analyze_series_ignores_partial_energy_from_created_job(tmp_path):
+    src = _make_src(tmp_path)
+    built = cs.build_encut_series(str(src), str(tmp_path / 'enc'), values=[400])
+    job = __import__('pathlib').Path(built['dirs'][400])
+    _write_oszicar(job, -10.0)
+    res = cs.analyze_series(built['dirs'], natoms=2)
+    assert res['points'][0]['energy'] is None
+
+
 def test_analyze_series_from_dir_list_reads_manifest(tmp_path):
     src = _make_src(tmp_path)
     r = cs.build_encut_series(str(src), str(tmp_path / 'enc'), values=[400, 500])
     for x, d in r['dirs'].items():
         _write_oszicar(__import__('pathlib').Path(d), -10.0 - 0.0001 * x)
+        m = manifest_mod.load_manifest(d)
+        manifest_mod.set_state(m, 'DONE')
+        manifest_mod.save_manifest(d, m)
     res = cs.analyze_series(list(r['dirs'].values()))        # 列表 → 从 manifest 取 x
     assert [p['x'] for p in res['points']] == [400, 500]
 

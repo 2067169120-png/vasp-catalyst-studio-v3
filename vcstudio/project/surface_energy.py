@@ -34,7 +34,7 @@ def _cross(a, b):
 def area_from_poscar(poscar_text: str) -> float:
     """POSCAR 表面积(Å²)= |a₁ × a₂|(前两个晶格矢量叉积模,slab 惯例真空沿 c)。
 
-    复用 read_cell_vectors(已乘缩放因子;负缩放沿用其显式拒绝语义)。斜胞也正确
+    复用 read_cell_vectors(含负值目标体积与三个分量缩放因子)。斜胞也正确
     (叉积模 = 平行四边形面积,不等于 |a₁|·|a₂|)。
     """
     cell = read_cell_vectors(poscar_text)

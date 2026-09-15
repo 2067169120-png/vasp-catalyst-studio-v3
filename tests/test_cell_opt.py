@@ -34,14 +34,14 @@ def _make_src(tmp_path, incar=_INCAR, contcar=_BULK):
 def test_cellopt_sets_isif3(tmp_path):
     src = _make_src(tmp_path)
     cell_opt.build_cellopt_job(str(src), str(tmp_path / 'co'))
-    d = parse_incar((tmp_path / 'co' / 'INCAR').read_text())
+    d = parse_incar((tmp_path / 'co' / 'INCAR').read_text(encoding='utf-8'))
     assert d['ISIF'] == 3
 
 
 def test_cellopt_preserves_electronic_keys(tmp_path):
     src = _make_src(tmp_path)
     cell_opt.build_cellopt_job(str(src), str(tmp_path / 'co'))
-    d = parse_incar((tmp_path / 'co' / 'INCAR').read_text())
+    d = parse_incar((tmp_path / 'co' / 'INCAR').read_text(encoding='utf-8'))
     assert d['ENCUT'] == 400 and d['GGA'] == 'PE' and d['ISPIN'] == 2 and d['MAGMOM'] == '1*0'
 
 
@@ -50,13 +50,14 @@ def test_cellopt_pulay_warning_default(tmp_path):
     res = cell_opt.build_cellopt_job(str(src), str(tmp_path / 'co'))
     assert any('Pulay' in w for w in res['warnings'])
     # 默认不改 ENCUT
-    assert parse_incar((tmp_path / 'co' / 'INCAR').read_text())['ENCUT'] == 400
+    assert parse_incar(
+        (tmp_path / 'co' / 'INCAR').read_text(encoding='utf-8'))['ENCUT'] == 400
 
 
 def test_cellopt_bump_encut(tmp_path):
     src = _make_src(tmp_path)
     cell_opt.build_cellopt_job(str(src), str(tmp_path / 'co'), bump_encut=True, encut_scale=1.3)
-    d = parse_incar((tmp_path / 'co' / 'INCAR').read_text())
+    d = parse_incar((tmp_path / 'co' / 'INCAR').read_text(encoding='utf-8'))
     assert d['ENCUT'] == 520                              # ceil(400*1.3/10)*10 = 520
 
 
@@ -64,7 +65,7 @@ def test_cellopt_static_source_gets_positive_nsw(tmp_path):
     # 源为静态(NSW=0/IBRION=-1)→ 补正 NSW 且 IBRION 改 2
     src = _make_src(tmp_path, incar="ENCUT = 400\nNSW = 0\nIBRION = -1\n")
     cell_opt.build_cellopt_job(str(src), str(tmp_path / 'co'))
-    d = parse_incar((tmp_path / 'co' / 'INCAR').read_text())
+    d = parse_incar((tmp_path / 'co' / 'INCAR').read_text(encoding='utf-8'))
     assert d['NSW'] > 0 and d['IBRION'] == 2 and d['ISIF'] == 3
 
 

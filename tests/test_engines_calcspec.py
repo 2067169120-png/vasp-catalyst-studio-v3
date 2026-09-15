@@ -6,7 +6,8 @@ import pytest
 
 from vcstudio.engines import calcspec
 from vcstudio.engines.calcspec import (
-    NONEQUIV_MAP, CalcSpec, nonequivalence_report, parse_structure, validate,
+    NONEQUIV_MAP, CalcSpec, get_run_contract, nonequivalence_report,
+    parse_structure, validate,
 )
 
 
@@ -66,6 +67,27 @@ def test_validate_bad_task():
 def test_validate_periodic_missing_cutoff():
     issues = validate(_periodic_spec(cutoff_ev=None))
     assert any('cutoff_ev' in s and '周期' in s for s in issues)
+
+
+def test_engine_private_cp2k_cutoff_does_not_weaken_engine_neutral_validation():
+    spec = _periodic_spec(cutoff_ev=None, extras={'cutoff_ry': 500})
+    assert any('cutoff_ev' in issue for issue in validate(spec))
+
+
+def test_validate_rejects_noninteger_kmesh_and_charge():
+    issues = validate(_periodic_spec(kpoints=(3, 2.5, 1), charge=0.5))
+    assert any('kpoints' in issue for issue in issues)
+    assert any('charge' in issue for issue in issues)
+
+
+def test_run_contracts_define_command_outputs_and_explicit_restart_policy():
+    gaussian = get_run_contract('g16')
+    assert gaussian.primary_input(['mol.gjf']) == 'mol.gjf'
+    assert gaussian.result_files(['mol.gjf']) == ('mol.log', 'mol.chk')
+    assert gaussian.restart_supported is False and gaussian.restart_note
+    assert get_run_contract('castep').result_files(
+        ['seed.cell', 'seed.param'], task='freq') == (
+            'seed.castep', 'seed.check', 'seed.phonon')
 
 
 def test_validate_periodic_nonpositive_cutoff():

@@ -1,228 +1,238 @@
-# VASP Catalyst Studio (vcstudio)
+# VASP Catalyst Studio 4.0
 
-Desktop **full-DFT computing platform** with an autopilot pipeline — from
-structure to paper in one place. Two workflow lines: a **periodic catalysis
-main line** (SAC batch modeling → 23-type task catalog → multi-cluster
-submission → failure diagnosis → bounded self-healing → ΔE/ΔG/electronic
-structure/NEB analysis → one-click publication figure sets → reports & draft
-manuscripts) and a **molecular line** (image→SMILES→3D→Gaussian→Multiwfn 16
-analyses→VMD rendering), both running on a file-based campaign control plane
-(task DAG, completed/validated/accepted three-state gates, method-fingerprint
-consistency, compute-budget caps). Packaged as a single Windows EXE with a
-deterministic zero-token core (LLM only in the optional assistant layer, never
-in the numeric chain) and fully offline operation.
+VASP Catalyst Studio 4.0 是一个以项目为中心、证据驱动、可配置的材料与催化研究工作台。它把结构与输入准备、作业提交、状态监控、失败诊断、有界恢复、分析、出图和报告组织在同一个桌面应用中，同时把“文件生成成功”和“科学结论可发布”严格分开。
 
-> 📂 Repository map: **[STRUCTURE.md](STRUCTURE.md)** ·
-> 中文完整用法: **[使用说明.md](使用说明.md)** ·
-> English guide: **[docs/user-guide-en.md](docs/user-guide-en.md)** ·
-> 开发进度/待办: **[docs/planning/progress-2026-07-16.md](docs/planning/progress-2026-07-16.md)**
+The deterministic core runs locally and over user-configured SSH connections. External LLM use is optional, disabled by default, and outside the numerical decision chain.
 
-## 软件流程图 · Workflow
+> 用户文档：[中文使用说明](使用说明.md) · [English user guide](docs/user-guide-en.md)
+>
+> 工程地图：[STRUCTURE.md](STRUCTURE.md) · 历史发布记录：[CHANGELOG.md](CHANGELOG.md)
+>
+> 科学边界：[验证说明](docs/validation.md) · [失败分类](docs/failure-taxonomy.md) · [报告状态与证据合同](docs/report-state-contract.md) · [Research Notebook 合同](docs/research-notebook-contract.md)
+>
+> 产品对标与路线：[计算材料与催化工作台对标（2026-08）](docs/research-workbench-landscape-2026-08.md)
 
-双线工作流:**周期性催化主线**(①结构建模 → ②生成输入(23 种任务目录)→ ③提交计算 →
-自动驾驶环(监控→诊断→自愈≤3轮)→ ④结果分析 → ⑥论文出图 → 产出)与
-**分子计算线**(图片识别 → 3D 建模 → Gaussian → ⑤波函数分析 → VMD 渲染),
-共同跑在 **campaign 控制面**(任务 DAG/三态/三门禁)上,⑦AI 助手横贯全程但绝不进数值链路:
+## 当前工作台
 
-![vcstudio 流程图](docs/vcstudio-flowchart.png)
+默认 Web 工作台有 7 个一级区域、32 个语义路由。实现上复用 11 个普通物理页面，并将 AI Assistant 作为 drawer 打开；“路由数”不等于“HTML 页面数”。
 
-### 代码区块图(按流程分块,方便按需求查代码)
+| 一级区域 | 当前用途 |
+|---|---|
+| Home | 全局概览、项目管线、活动与阻断项 |
+| Project | 项目概览、成员、工作流、运行记录与项目活动 |
+| Prepare | 结构、输入、批量准备、任务模板与 preflight |
+| Run | 本地/远程作业台账、提交、监控、续算、下载 |
+| Analyze | 吸附、热力学、电子结构、电荷、比较与自定义分析 |
+| Publish | 图表、报告、SI、草稿包、revision 与导出 |
+| Environment | 集群、本机运行器、依赖、数据路径、模板与设置 |
 
-| 流程区块 | 代码包 | 负责什么 | 关键文件 |
-|---|---|---|---|
-| ① 生成 Generate | `vcstudio/generate/` | POSCAR+用户INCAR → 校验补全四件套(缺项才补,不改用户键) | `job_builder.py` `incar_builder.py` `kpoints.py`(倒格矢) `potcar.py` `poscar.py` |
-| ② 提交 Submit | `vcstudio/cluster/` | PBS/Slurm 双方言、preflight、SSH 上传+提交 | `schedulers.py` `script_builder.py` `submitter.py` `connection.py` |
-| ③ 监控+诊断 Monitor | `vcstudio/cluster/` | 查队列判排队/运行/终态 → 取证 → 15 类作业分类 + 15 条 VASP 错误签名([失败分类表](docs/failure-taxonomy.md));**续算沉降护栏** | `submitter.refresh_job` `diagnose.py` `convergence.py` |
-| ④ 有界恢复 Recovery | `vcstudio/cluster/` | CONTCAR/改参续算(≤3轮,INCAR 冻结),否则交人工 | `submitter.continue_from_contcar` `batch_ops.py` |
-| ⑤ 分析+报告 Analyze | `vcstudio/project/` + `external/` | ΔE 门控、吸附能/ΔG台阶/d带中心/Bader、论文级出图、报告 | `adsorption.py` `freeenergy.py` `thermo.py` `dosparse.py` `bader.py` `charts.py` `external/native_charts.py` |
-| ⑥ 结构生成 StructGen (v3.1) | `vcstudio/generate/` | SAC 模板库(六类配位×金属矩阵)、LiPS 分子库、吸附位点枚举与摆放、参考态注册 | `sac_builder.py` `molecules.py` `sites.py` `project/references.py` |
-| ⑦ 派生计算 Derived (v3.1) | `vcstudio/generate/` + `project/` | 弛豫→频率(ZPE/熵)/电子结构静态(PDOS/Bader/差分电荷)一键派生;多自旋并跑;虚频质量闸 | `freq_builder.py` `estatic.py` `spin_scan.py` `chgdiff.py` |
-| ⑧ 通用 CHE 引擎 (v3.1) | `vcstudio/project/` | 反应网络预设(Li-S 16e/缔合解离/ORR/HER/OER/CO2RR),U_eq/U_L/η,多电位台阶 | `reactions.py` `freeenergy.free_energy_path` |
-| ⑨ campaign 控制面 (v3.1) | `vcstudio/campaign/` | 文件式任务 DAG:三态(completed/validated/accepted)、三门禁(提交/验收/报告)、方法指纹、决策账本、机时预算闸 | `schema.py` `states.py` `gates.py` `fingerprint.py` `ledger.py` `budget.py` `derive.py` |
-| 跨层基础 Shared | `vcstudio/shared/` | 配置、清单(job.yaml状态机)、凭据(keyring) | `config.py` `manifest.py` `secrets.py` |
-| ⑩ 分子线 Molecular (v3.1.1) | `vcstudio/molbuild/` + `external/` | 图片识别(DECIMER)/SMILES→3D(RDKit)/外部编辑器联动;Multiwfn 16 种分析/VMD Tachyon 渲染/本机运行器 | `ocsr.py` `smiles3d.py` `multiwfn_driver.py` `vmd_driver.py` `cluster/local_runner.py` |
-| ⑪ 全 DFT 目录 TaskCatalog (v3.2) | `vcstudio/generate/` + `project/` | 23 种计算类型五分类:收敛扫描/能带/EOS/功函数/表面能/Dimer/VASPsol/DFT+U 值库 | `task_catalog.py` `conv_scan.py` `bands_builder.py` `eos.py` `workfunction.py` `u_library.py` |
-| ⑫ 一键出图与 AI Pipeline (v3.2) | `vcstudio/project/` | 场景感知整套图+多面板拼版+图表溯源;计算活动模板全链推进;论文数据抽取→MAE 对照→变体推荐→论文草稿骨架 | `auto_figures.py` `panel_composer.py` `campaign_templates.py` `paper_data.py` `variant_advisor.py` `manuscript_draft.py` |
-| 多引擎 Engines (v3.1.1) | `vcstudio/engines/` | CalcSpec IR + VASP/CP2K/Gaussian/CASTEP 文件级后端;跨引擎不等价清单+参考态一致性闸 | `calcspec.py` `gaussian.py` `cp2k.py` `castep.py` `equivalence.py` |
-| 界面 GUI | `vcstudio/gui_web/`(默认 Web)+ `gui/`(旧 tkinter) | pywebview 前端 + `api.py` 薄门面;工作流式九页:概览/①结构建模/②生成输入/③提交计算/④结果分析/⑤论文出图/⑥AI助手/集群/设置 | `gui_web/api.py` `assets/*.js` |
+全局项目上下文贯穿 Prepare、Run、Analyze 和 Publish。深链接、未保存状态与当前工作模式均显式处理；界面切换不会把显示层状态写成科学事实。
 
-## Statement of need
+### 已实现的 Web 工作流与边界
 
-Graduate-student catalysis screening lives between two worlds that existing
-tools serve poorly: terminal pre/post-processors (VASPKIT, qvasp) leave
-cluster orchestration to hand-written bash, while workflow infrastructures
-(AiiDA, atomate2, pyiron) assume a server/database mindset and a Python-first
-user. LLM-agent frameworks (VASPilot, AutoDFT) automate decisions but require
-online inference in the loop. vcstudio targets the gap: a zero-install desktop
-tool that drives double-hop PBS/Slurm clusters, refuses to guess (explicit
-state machine, bounded self-healing, NEEDS_HUMAN stops), intercepts geometry
-errors *before* they burn cluster time, and generates Methods paragraphs
-guaranteed consistent with the actual INCAR/KPOINTS/POTCAR. See the full
-[feature comparison with published tools](docs/comparison.md).
+当前 Web 工作台已实现下列用户流程，并为后端合同或生产 JavaScript 状态机提供了聚焦自动化测试。这里的“已实现”只表示相应软件合同已落地，不表示当前工作树已经完成 root 全量回归、重建最终 EXE 或通过远端 CI，更不表示 diagnostic/blocked 数据通过了科学验证。
 
-## Features
-
-| Layer | Module | What it does |
+| 区域 | 已实现能力 | 必须保留的边界 |
 |---|---|---|
-| Generate | `vcstudio/generate/` | POSCAR + your INCAR → validated 4-file input set; completes only missing keys, **never overwrites yours**; `job.yaml` records sha256 provenance |
-| Submit | `cluster/{schedulers,script_builder,submitter,connection}` | PBS/Slurm dialects (pure functions); preflight gates; dual-track scripts (auto / your template passed through verbatim) |
-| Monitor + diagnose | `submitter.refresh_job` + `cluster/diagnose.py` | scheduler exit reason + output integrity + log signatures + convergence + energy sanity → 15 job-classification outcomes + 15 VASP internal-error signatures → 4 terminal states ([taxonomy](docs/failure-taxonomy.md)) |
-| Bounded recovery | `submitter.continue_from_contcar` | only for recoverable classes; CONTCAR validated; INCAR frozen; **max 3 rounds**; anything else → NEEDS_HUMAN |
-| Analyze + report | `project/` + `external/` | ΔE gating (all-DONE before numbers), Li–S discharge path (ΔG/PDS/U_L), Origin/SVG dual chart engines, POV-Ray structure figures, bilingual LLM analysis (real INCAR injected, no fabricated citations) |
-| Publication aids | `cluster/convergence.py`, `generate/structure_view.py`, `generate/methods_text.py`, `project/dosparse.py` | per-ionic-step convergence charts; 3D structure preview with molecule–slab clash interception; bilingual Methods + BibTeX from real inputs; total-DOS SVG from vasprun.xml |
+| Project | Clone、Move、Adopt Copy；操作前预检、显式确认、注册表/台账更新和失败回滚 | Clone 铸造新项目身份；Move 保留原身份；Adopt Copy 默认重新铸造身份。目标已存在时不覆盖；部分回滚会留下明确恢复证据，不报告假成功 |
+| Run / Jobs | Selection Tray、Batch Review、严格科学指纹重复计算提示、统一 Operation Queue、提交/续算/取消幂等键 | exact 只在完整版本化指纹一致时出现；near 只显示差异且不称等价；默认不复用，显式引用产生新 provenance，强制重算保留理由 |
+| Analyze | capability cards；Task Results；DOS/PDOS、Bands、功函数、Bader、差分电荷、ELF 分布摘要；Property calculators | 只显示服务端解析器给出的数值、来源 hash 和分母。ELF 解析严格校验 ELFCAR 主网格并仅给分布统计，不据此宣称成键、盆、临界点或拓扑结论 |
+| Analyze / Governance | 下一步计算建议与确认后的只读 draft intent | 只从绑定当前数据指纹、经人工科学复核的 ValidationResult 和冻结分析信号派生；不含命令，不授权或自动提交作业 |
+| Home / Project · Research Explorer | 跨项目元素/化学式、facet、adsorbate、任务、状态、方法、证据、能量/能垒筛选；表格、histogram、scatter、元素周期表聚合和 live provenance | 索引只读派生且可重建，不是事实源；默认只保留一个方法兼容 cohort，散点不静默混方法；partial/stale/unavailable 时扣留科学 DTO；保存视图只写 filters/sort/axes，并受 authority_id + revision CAS 约束 |
+| Publish | revision scientific diff、Evidence/Claim Graph、确定性 SI capsule | 每次从权威历史重新校验冻结 revision；缺失证据边显式标记。capsule 去除密钥/绝对路径、不覆盖已有文件；生成 diagnostic capsule 不等于科学 final |
+| Project / Publish | 本地优先 Research Notebook、append-only 决策时间线与 Human Review Ledger | 正文/附件不进入 workspace localStorage；编辑追加 supersedes、删除追加 tombstone；actor 是本地自声明而非认证/电子签名，审阅记录不提升 ValidationResult、claims、final 或 accepted |
+| Home / Resume Center | 恢复当前会话的设置、导入流程和报告配置草稿入口 | 恢复的是有界草稿引用和权威持久状态，不把浏览器草稿提升为项目事实或已发布报告 |
+| Environment / Jobs | 实验室策略模板和基于台账/manifest 的资源预测 | 都是建议；策略必须显式确认且不改写旧作业，预测缺证据时保持 unavailable/低置信度，二者都不能旁路提交确认和幂等门禁 |
 
-Three invariants: ① methodology sovereignty (your INCAR/template is passed
-through verbatim) ② deterministic core is zero-token ③ explicit state, never
-silent (job.yaml state machine + audit history).
+这些新工作台能力属于默认 Web 界面。`vcs gui --legacy` / `vcs-gui` 的 Tk 四页界面仅用于兼容，不提供当前 Web shell、Project lifecycle、Selection Tray、Resume Center、report insights 或治理建议合同。
 
-## 2026-07-16 更新(本轮进展)
+## 启动
 
-- **修复续算状态误识别**:续算重投后新作业尚未进调度器队列时,不再拿上一轮旧
-  OUTCAR 误判为"已完成/需续算/SCF 震荡",而是保持 SUBMITTED 视作仍在排队
-  (续算沉降护栏,PBS/Slurm 均覆盖,含回归测试)。
-- **原生论文级出图引擎** `external/native_charts.py`:纯 matplotlib 达论文质量
-  (serif/矢量 PDF/多面板/色盲安全色板),不依赖 Origin/POV-Ray。吸附能分组柱状图、
-  数据矩阵表、ΔG 自由能台阶图、**多催化剂热图**、**火山图**(自动求 Sabatier 峰顶)、
-  标度关系图。**已接入 GUI**:项目页「论文级出图」卡片,勾选图类型一键生成
-  (单项目:柱状图/表/台阶图;多项目对比:热图/标度关系/火山图),生成后自动打开
-  图目录。打包默认收录 matplotlib(`--no-charts` 可关)。
-- **结果分析增强**:PDOS 投影 + d 带中心、Bader 电荷解析、可选 ΔG 口径
-  (默认 ZPE−TS 对齐文献 / 可切 ASE 严格式含振动内能项)、PDS/U_L 图数一致性。
-- **输入正确性**:KPOINTS 改用倒格矢(修六方/hcp slab 欠采样)、项目内 ENCUT 强制
-  统一(保吸附能 ΔE 各成员基组一致)、计算类型下拉(修 web 硬编码 slab)。
-- **诊断扩展**:磁盘满/IO 错误、裸退出码 137 降级为疑墙钟(可续算,不再困死)、
-  ZBRENT 扩展签名。
-- **界面**:任务页按吸附能项目组归并折叠(整组进度)、dashboard 首页落地。
-- **工程化**:config 脱敏(移除内网 IP)、版本号单一事实来源、依赖分组声明、
-  CI 加 lint+覆盖率+打包冒烟。
+Windows 打包版可直接启动 `dist\VASP Catalyst Studio.exe`。从源码启动默认 Web 工作台：
 
-全套 525 测试通过(2 项在无 OriginLab/POV-Ray 时跳过)。下一步待办见 **[docs/planning/progress-2026-07-16.md](docs/planning/progress-2026-07-16.md)**。
-
-## 2026-07-17 更新:v3.1 Phase A —— DFT 全通量管线地基(引擎层)
-
-依据 **[v3.1 总体方案](docs/planning/v3.1-总体方案.md)**(68 个调研 Agent 合成,验收基准=完整复现一篇 SAC 锂硫论文的 32 图 6 表,设计宪法:科学正确 > 超越对标 > 论文级出图 > 大通量 > 一平台),本轮落地 Phase A 引擎层(+363 测试):
-
-- **campaign 文件式控制面** `vcstudio/campaign/`:任务 DAG(YAML/JSONL 即事实源,零数据库)、
-  **completed/validated/accepted 三态分离**(只有 accepted 进图表报告;AI/外部无权直写 accepted)、
-  三门禁(提交门=机时硬上限+单点先行;验收门=方法指纹一致性;报告门=图表溯源完备)、
-  方法指纹对象(一次 ΔE 比较所有能量必须同指纹→可复现包"一致性证书")、
-  append-only 决策/事件账本(写入前拦密钥)、机时预算账本、单机锁(过期只报不抢占)
-- **频率生成端 + 虚频质量闸** `generate/freq_builder.py` + `thermo.classify_imaginary`:
-  从完成弛豫一键派生 IBRION=5 频率作业(只放开吸附质+近邻,派生改动逐条留痕);
-  虚频四象限分类(噪声/坏极小点/合法TS/非法TS),不可用者绝不静默进 ΔG——
-  纯 ΔE 升级为**论文级 ΔG** 的最后一块拼图
-- **多自旋并跑 + 磁矩守卫** `project/spin_scan.py`:非磁/低自旋/高自旋初猜族并行弛豫取基态
-  (自旋误判可致 ΔE 偏差 >0.5 eV),末态磁矩审计(塌零/翻转告警),电子熵超标守卫
-- **电子结构分析链**:vasprun **partial DOS 流式解析** + 自旋分辨 **d 带中心**(积分窗口显式)
-  + d-p 杂化重叠;**Bader 全链**(AECCAR 合参考→bader 调用→ΔQ+守恒校验,未装则降级说明);
-  **差分电荷工作流**(吸附态自动拆 AB/A/B 冻结几何三单点→网格代数→VESTA 可读 CHGDIFF.vasp
-  +面平均 Δρ(z));`generate/estatic.py` 从弛豫一键派生 PDOS/Bader/差分电荷静态作业;
-  出版级 `pdos_plot`(自旋镜像+εd 标线)与 `charge_profile_plot`
-- **SAC 结构生成入口** `generate/{sac_builder,molecules,sites}.py` + `project/references.py`:
-  石墨烯超胞+六类配位模板(MN4/MN3/MP1N3/MS1N3/MB1N3/MN4+B)×任意金属矩阵批量建模;
-  15 种分子库(S8/Li2Sn/LiS 开壳/DOL/DME/参考小分子)+大盒装箱;SAC 语义位点枚举
-  +吸附质双端启发摆放+取向采样(过近拒绝);参考态注册缓存(口径指纹守卫)
-  +Eb/Ecoh 稳定性红绿灯
-- **通用 CHE/ΔG 台阶引擎** `project/reactions.py` + `freeenergy.free_energy_path`:
-  Li-S 硬编码抽象为"物种链+电子数+参比电对"通用引擎,8 组预设
-  (Li-S 16e/论文缔合×2/解离/ORR/HER/OER/CO2RR),逐步质量-电荷守恒校验,
-  U_eq/U_L/η,多电位台阶(U=0/U_eq/U_L 三线),U_eq 与实验区间对照告警
-- **术语统一**(中文文案审查落地):组态→构型(58 处)、任务→作业、需人工统一、
-  限制电位步口径说明等,为 i18n 中英双语铺路
-
-933 测试通过(2 跳过)。
-
-## v3.1.0 正式发布(2026-07-17)· Phase B+C 全部落地
-
-**下载**:[Releases 页](https://github.com/2067169120-png/vasp-catalyst-studio-v3/releases) 提供 Windows 单文件 EXE(标签推送后由 CI 自动构建)。
-
-**界面重构(starpivot 式工作流)**:编号步进侧栏 概览 → ①结构建模 → ②生成输入 → ③提交计算 → ④结果分析 → ⑤论文出图 → ⑥AI 助手;研究场景系统按方向裁剪界面;三主题;中英双语基础;结构查看/编辑器(3Dmol 交互:选中/移动/删除/改元素/固定底层/真空检查/导出 POSCAR);图表预设画廊(12 图型点选出图);AI 助手页(论文→规格表→计划→实例化,全自动开关受机时闸/单点先行/三态门禁约束)。
-
-**Phase B**:GUI 派生按钮(频率/PDOS/Bader/差分电荷)、SAC 候选矩阵页(chips 选金属×模板×吸附质,预估机时,自动建项目+campaign)、多自旋并跑与对比、通用反应预设下拉;**CI-NEB 全流程**(插值→多 image 作业→逐 image 监控→能垒+MEP 图);**COHP/LOBSTER 链**(lobsterin 生成/解析/spilling 质量闸);筛选引擎(描述符汇总+火山图双支自动拟合)。
-
-**Phase C**:收尾流水线(Methods 成段/SI 装订/三线表/口径稽核,只组织真实数据);AI 论文入口(逐格出处的规格表,LLM 不进数值链路);**多引擎适配层**(CalcSpec IR + CP2K/Gaussian/CASTEP 文件级后端 + 跨引擎不等价清单 + 参考态一致性先行闸;引擎软件用户自备);场景系统与 i18n。
-
-**1401 测试通过(3 跳过)**。完整清单见 [CHANGELOG.md](CHANGELOG.md);路线图与验证计划见 [v3.1 总体方案](docs/planning/v3.1-总体方案.md)(端到端复现文献 MAE 表为下一步验证项)。
-
-### v3.1.1(2026-07-18):分子计算全流程
-
-对齐 starpivot-DFT 全部功能与选项并超越:图片识别(DECIMER)→SMILES→RDKit 3D 建模→Gaussian 输入(九种任务/溶剂模型/周期表混合基组 Gen-GenECP/资源行)→批量提交(任意输入文件/筛选排序/勾选批量取消/**本机运行**)→**波函数分析八件套**(ESP/ALIE/HOMO-LUMO/IGMH/NCI-RDG/IRI/AIM,Multiwfn 本机/远程)→**VMD 一键可视化**(Tachyon 渲染/极值点标注);编辑器样式视角测量原子表;AIMD 派生;远端文件管理。工作流侧栏更新为 ①结构建模→②生成输入→③提交计算→④结果分析→⑤波函数分析→⑥论文出图→⑦AI助手。**1704 测试通过(6 跳过)**。
-
-### v3.2.0(2026-07-18):全 DFT 计算平台
-
-**23 种计算类型目录**(收敛扫描/能带/EOS/功函数/表面能/Dimer/VASPsol/DFT+U 值库等全补齐,选类型→派生→解析→出图闭环);**一键出图管线**(自动驾驶终点场景感知整套图+多面板拼版+图表溯源,计算活动模板全链自动推进);**AI 数据闭环**(论文数据表抽取→复现 MAE 自动对照→变体矩阵推荐→论文草稿骨架);starpivot 细节对齐(一键依赖安装/核时四卡/波函数 16 种/Fukui·ELF-LOL·散点图)。**2051 测试通过(6 跳过)**。
-
-## Install & quickstart
-
-**GUI (Windows)**: double-click `dist\VASP Catalyst Studio.exe`
-(web UI default; `--legacy` starts the Tkinter fallback).
-
-**Library + CLI**:
-
-```bash
-pip install -e .[dev]
-vcs gen --poscar POSCAR --incar my.incar --calc-type slab -o results/job1/
+```powershell
+pip install -e ".[dev]"
+vcs gui
+# 等价的模块入口
+python -m vcstudio.gui_web
 ```
 
-**Try it offline in 5 minutes** (no cluster, no licensed POTCARs needed):
-[examples/quickstart](examples/quickstart/README.md) — includes a fake demo
-POTCAR library generator (real pseudopotentials are licensed material and are
-never distributed with this repository).
+入口边界：
 
-**Verify the analysis chain offline** (diagnose → gated ΔE → chart → HTML
-report, no VASP or cluster): [examples/offline_analysis](examples/offline_analysis/README.md)
-— `python examples/offline_analysis/run_demo.py` drives a synthetic completed
-job set end-to-end so a reviewer can confirm the analysis half of the pipeline.
+- `vcs gui`：当前默认 Web 工作台；
+- `python -m vcstudio.gui_web`：当前默认 Web 工作台的直接模块入口；
+- `vcs gui --legacy`：legacy Tkinter；
+- `vcs-gui`：仍指向 legacy Tkinter 四页界面，不是默认 Web 工作台。
 
-**Tests**: `python -m pytest` — 2051 tests, 6 skipped (optional OriginLab smoke
-behind `VCS_ORIGIN_SMOKE=1`, and a POV-Ray real-render smoke). Parser
-cross-checks against ASE run when `ase` is installed (in the `dev` extra).
-CI runs the suite on ubuntu/windows × Python 3.10/3.12.
+最小 CLI 输入生成示例：
 
-## Scientific conventions
-
-- `E_ads = E(slab+ads) − E(slab) − E(ref)`; negative = favorable adsorption
-- `μ_Li = (E(Li₂S) − E(S₈)/8) / 2`; discharge path ΔG referenced to S8* = 0;
-  `U_L = −max(ΔG/Δn_e)` (computational hydrogen electrode)
-- All energies are DFT electronic energies (no ZPE/entropy) — stated
-  explicitly in reports and in AI prompts
-- Validation protocol (Montoya-style MAE vs independent references):
-  [docs/validation.md](docs/validation.md)
-- Credentials (cluster passwords / LLM keys) go to the Windows Credential
-  Manager only — never to plain text
-
-## Contributing & citing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md). If you use this software, please cite
-via [CITATION.cff](CITATION.cff). Licensed under [MIT](LICENSE).
-
----
-
-## 中文速览
-
-全 DFT 计算桌面自动驾驶平台:从结构到论文一站式。周期性催化主线(SAC 批量建模 →
-23 种计算类型 → 多集群提交 → 诊断自愈 → ΔE/ΔG/电子结构/NEB → 一键整套论文图 →
-报告与论文骨架)+ 分子线(图片识别 → 3D 建模 → Gaussian → Multiwfn 波函数 16 种 →
-VMD 渲染),跑在 campaign 控制面上(任务 DAG/三态门禁/方法指纹/机时闸)。
-Windows 单文件 EXE,确定性核心零 token,AI 只做助手绝不进数值链路,全离线运行。
-
-- **快速开始**:从 [Releases](https://github.com/2067169120-png/vasp-catalyst-studio-v3/releases)
-  下载 EXE 双击即用(工作流九页:概览/①结构建模/②生成输入/③提交计算/④结果分析/
-  ⑤波函数分析/⑥论文出图/⑦AI助手/集群/设置;命令行 `vcs gui`,`--legacy` 旧 tkinter);
-  改完代码双击 `重新打包EXE.bat` 重打包
-- **离线体验**:[examples/quickstart](examples/quickstart/README.md)
-  (石墨烯示例+假赝势库,五分钟跑通全链);
-  [examples/offline_analysis](examples/offline_analysis/README.md)
-  (合成的已完成作业 → 诊断/ΔE/出图/报告,审稿人无 VASP/集群即可验证分析链路)
-- **完整用法**:[使用说明.md](使用说明.md);目录结构:[STRUCTURE.md](STRUCTURE.md)
-- **测试**:`python -m pytest`(2009 用例,6 项在无 OriginLab/POV-Ray/rdkit 时跳过)
-- **科学约定/发刊工具链**:同上英文节;竞品对比见
-  [docs/comparison.md](docs/comparison.md),验证协议见
-  [docs/validation.md](docs/validation.md)
-
+```powershell
+vcs gen --poscar POSCAR --incar my.incar --calc-type slab -o results/job1
 ```
-vcstudio/       核心包(generate/cluster/project/external/engines/molbuild/campaign/gui_web/shared/cli)
-tests/          2009 测试   docs/superpowers/specs/  设计文档
-config.example.yaml  配置模板(复制为 config.yaml 填写;config.yaml 已 gitignore)
-dist/           打包产物 EXE(gitignore)   results/  作业输出(不入 git)
+
+POTCAR/PAW 数据受许可证约束，本仓库不分发。无集群、无 VASP 时可使用 [离线快速示例](examples/quickstart/README.md) 和 [合成分析链示例](examples/offline_analysis/README.md) 验证结构与软件流程；合成示例不构成真实科学验证。
+
+## 证据与状态模型
+
+每个作业目录中的 `job.yaml` 是作业事实源。九态生命周期用于记录 CREATED、SUBMITTED、RUNNING 等运行过程；终态诊断是另一条轴，不能混为一谈。
+
+提交前的重复计算提示使用版本化 strict scientific fingerprint，覆盖规范化结构、完整
+INCAR/KPOINTS、POTCAR 内容 SHA-256、Method Recipe semantic hash、任务类型与可得的
+VASP/build 环境。缺少任一必需证据时保持 `incomplete`；旧作业缺 Recipe 时明确为
+`explicit_legacy`，不会产生 exact/等价或复用资格。本地索引容量有界、可重建且不是事实源。
+引用既有结果必须由用户显式选择，并在新作业中写新的 decision/provenance node/link；来源
+会在提交时再次重验，accepted/final 从不继承。完整合同见
+[docs/calculation-reuse.md](docs/calculation-reuse.md)。
+
+当前诊断实现包含：
+
+- 18 个 job-classification outcomes；
+- 16 个 VASP internal-error signatures；
+- 归并到 4 个处理状态：`DONE`、`UNCONVERGED`、`FAILED`、`NEEDS_HUMAN`。
+
+诊断结合调度器终态、输出完整性、收敛证据和日志签名。只有明确可恢复的类别才能从已验证的 CONTCAR 续算，INCAR 保持冻结，最多 3 轮；其余情况停止并交给人工判断。
+
+Campaign 控制面进一步分离 `completed → validated → accepted`。完成计算不等于验证通过，验证通过也不等于已被接受进入最终比较、图表或报告。
+
+## 引擎与分析能力
+
+VASP 是主引擎，覆盖完整的输入、提交、监控、诊断、派生、分析和报告链。CP2K、Gaussian 与 CASTEP 是有边界的文件级适配器，只对各自能力清单内的任务提供输入生成、登记、提交、状态处理和引擎原生解析。
+
+这些适配器不承诺：
+
+- 跨引擎方法或绝对能量等价；
+- VASP ENCUT 与 CP2K/CASTEP 截断量的直接换算；
+- 平面波/PAW 与 Gaussian 基组能量的直接比较；
+- 缺少方法指纹、参考态或单位证据时仍给出可信比较。
+
+Multiwfn 的当前注册表包含 14 个分析入口；UI 菜单以该注册表为单一事实源。VMD、POV-Ray、Origin、RDKit、Multiwfn 等外部工具均通过适配器调用，缺失时必须明确降级或阻止相应功能。
+
+## 数值与自由能边界
+
+- `E_ads = E(slab+ads) − E(slab) − E(reference)`；负值表示该参考口径下吸附更有利。
+- `E0` 表示电子能。缺少校正证据时，系统不得把 E0 描述成完整自由能。
+- ZPE、热校正和熵项只有在显式提供、通过适用性检查并写入证据模型时才进入 ΔG；系统不会猜测缺失项。
+- 报告和图表必须注明采用的是 E0、E0+ZPE，还是包含热/熵校正的口径。
+- 不同结构、参考态、计算方法、赝势、k 点、单位或引擎之间的比较需要相应一致性证据。
+
+真实 MAE、真实文献复现完成度和投稿/接收状态目前保持 `UNKNOWN`，不得从自动化测试、合成示例或文件生成成功推断。验证计划见 [docs/validation.md](docs/validation.md)。
+
+## 跨项目 Research Explorer
+
+Home 与 Project 复用同一个 Research Explorer 组件，不新增第 33 个语义路由。后端从项目注册表、
+`project.yaml`、每个成员的 `job.yaml`、manifest 结果与 validation 记录构建内存索引；索引可随时
+重建，不会回写上述文件，也不会替代它们成为第二事实源。
+
+- 支持元素/化学式、facet、adsorbate、任务、状态、方法指纹、证据等级以及能量/能垒范围筛选；
+- 服务端完成稳定排序、分页 cursor、单位/缺失值/样本分母、histogram bins、scatter 坐标和
+  periodic-table 聚合，浏览器只渲染 DTO；
+- 默认只选择一个方法兼容 cohort。用户显式关闭兼容过滤后可以查看混合表格，但多方法散点会
+  `blocked_mixed_or_unverified_methods`，不会把不同或未验证的方法静默画在一起；
+- 索引 freshness、注册项目分母、成功/失败来源数均公开；`partial`、`stale`、`unavailable` 时
+  fail closed，扣留科学表格与聚合，直到成功重建；
+- drill-down 只使用 opaque project/job/source ID。live provenance 将 input、job、repair/resume、
+  parser、analysis、validation、report 分成 data/logical 两层，并标注
+  `observed/imported/inferred/missing`；Publish 的 frozen Evidence Graph 仍是单独的 revision 工具；
+- 保存的 research view 仅含有界名称、filters、sort、axes，通过 `authority_id + revision` CAS
+  更新；不保存路径、密钥、结果行或任意正文。
+
+## 报告合同
+
+当前报告链为：
+
+```text
+ReportSpec → ReportSnapshot → ValidationResult → revision + manifest
 ```
+
+语义 SHA-256 把规格、冻结快照、验证结果与最终可见模型绑定。报告采用两条独立状态轴：
+
+1. **Artifact axis**：格式是否可生成、文件是否写入、hash/size 是否核对、manifest 是否登记；
+2. **Scientific axis**：证据级别、claim ceiling、publication gate 与报告用途是否满足。
+
+文件生成成功不证明科学结论为 final。输入在渲染期间变化时，产物可以保留为未登记文件，但不能写 ready marker 或冒充当前 revision。
+
+Publish → Versions 还提供三种只读/导出工具：
+
+- **Scientific diff**：选择两个权威 history revision，分别重新校验 bundle，再比较 ReportSpec scope、输入/快照 hash、validation 状态与 checks、科学资格、模型数值、图表以及文件/manifest hash；不会用日期差异冒充科学差异；
+- **Evidence/Claim Graph**：只从冻结 spec、snapshot、validation、model 和 claim 记录构建 conclusion/table/figure/check/source/job/file-hash 关系；缺边明确显示为 missing，不读取可变 live 文件，也不公开本地路径；
+- **SI capsule**：通过服务端目录选择与冻结 preview→confirm receipt 生成确定性 ZIP，包含规范化合同、输入 manifest、模型/图表元数据、Methods、BibTeX、环境/版本、validation 记录、Research Notebook ledger/限制、capsule manifest 和 `SHA256SUMS`；排除秘密、绝对路径、附件正文、缓存和可变 live 文件，且绝不覆盖同名文件；
+- **DOI-ready local archive**：在 Publish → Export 中先从一个 current、重新校验的 report revision 生成 path-free dry-run，逐项显示逻辑角色、大小、SHA-256、license/attribution、敏感风险、包含/排除决定和理由；服务端验证显式 confirmation 后生成绑定 revision、source manifest、plan 与目标目录实体的确定性 ZIP。归档包含实际报告和权威图表、冻结合同/model/input manifest、Methods、环境与 parser version、provenance graph、README/CITATION、archive manifest 和 `SHA256SUMS`。原始 POTCAR、密钥、绝对路径、缓存、临时/可变 live 文件及许可不完整的资源保持排除。成功结果仅表示本地 archive 自校验通过并给出可提交准备度/缺口；应用不会上传、申请 DOI 或宣称已发布。
+
+Project 与 Publish 还提供项目级 Research Notebook。journal 使用项目身份绑定的外部 head/sequence anchor 与跨进程锁、revision+head+project CAS、链式 record digest、append-only supersedes/tombstone；完整状态机与附件 blob 在读取/归档时重验，symlink/junction/reparse 路径 fail-closed。关联证据只从当前权威源重验并显示 `current`、`stale` 或 `missing`；缺失/损坏 `job.yaml` 不会靠目录推断为当前。人工审阅只记录本机明确输入的自声明 actor、角色、决定、requested changes 与署名说明，不是认证或密码学签名，也不会自动产生 `human_scientific_reviewed`。完整边界见 [Research Notebook 合同](docs/research-notebook-contract.md)。
+
+格式边界：
+
+- HTML：具备语义结构、语言和图像描述基础；可访问性为 conditional，仍需浏览器、屏幕阅读器和人工复核；
+- DOCX：具备语言、Heading/Caption、重复表头和图片描述基础；可访问性为 conditional，仍需 Word Accessibility Checker 与人工复核；
+- ReportLab PDF：可视、可搜索，但未标记，无结构树和图片替代文本；始终 `tagged=false`、`pdf_ua=false`，不能称为 PDF/UA 或 HTML/DOCX 的无障碍替代品。
+
+详细合同见 [docs/report-state-contract.md](docs/report-state-contract.md)。
+
+## 网络、隐私与可选 AI
+
+| 能力 | 默认边界 |
+|---|---|
+| 本地生成、解析、门禁、hash、报告模型 | 确定性、本地运行，不调用 LLM |
+| SSH 提交与监控 | 仅连接用户明确配置的集群；known_hosts/指纹门控 |
+| External LLM | 默认关闭；只有用户显式开启项目数据外发并配置凭据后才可调用 |
+| DECIMER | 默认 Windows 单文件 EXE 不包含；本地没有缓存模型时，首次模型准备可能联网 |
+| 密钥 | 集群密码和 LLM key 使用系统凭据库，不写入普通配置文件 |
+
+LLM 可用于结果解读、论文方法段抽取和对话辅助。它不能修改作业科学状态、绕过 `completed/validated/accepted`、写入 accepted、替代 ValidationResult、提交或取消 HPC 作业。对话中的“停止回复”只停止当前模型响应。
+
+## 测试与当前证据
+
+```powershell
+python -m pytest
+```
+
+2026-08-13 的本地最终门禁已实际运行：免缓存完整 `python -m pytest` 为 **3658 passed、5 skipped**，330.80 秒内出现 **15 条 ASE/NumPy 上游弃用警告**；全仓 Ruff、actionlint 与 23 个第一方 JavaScript 文件的 `node --check` 均通过。PyInstaller `--full` 单文件构建成功，最终 EXE 为 **113,586,017 bytes（108.32 MiB）**，SHA-256 为 `bcadc9046685c62cf1a9157d0ceba49b131190184dbe30073ce4189ec6817e2d`。
+
+2026-08-15 的严格科学指纹/复用变更在隔离 worktree 重新运行免缓存全量测试，结果为
+**3693 passed、5 skipped**（226.23 秒，15 条同类上游弃用警告）；全仓 Ruff、25 个第一方
+JavaScript 文件的 `node --check`、变更 Python 文件的 `py_compile` 与 `git diff --check`
+通过。本轮未重建 EXE、未重跑 actionlint，也未执行真实集群/VASP 作业；上段冻结二进制
+哈希仍仅对应 2026-08-13 产物。
+
+2026-08-21 的整合树再次完成最终本地门禁：免缓存全量 pytest 为
+**5191 passed、12 skipped**（670.53 秒；15 条上游弃用警告）；全仓 Ruff、30 个第一方
+JavaScript 文件的 `node --check`、`pip check` 与 `git diff --check` 通过。本机未安装
+actionlint，工作流静态检查仍等待推送后的远端 CI。`vcstudio-4.0.0` wheel 构建成功并包含
+52 个 Web 资源和中英文 locale。基于目录整理提交 `9bb6a0d` 的 `--full` 单文件 EXE 为
+**115,183,481 bytes（109.85 MiB）**，SHA-256 为
+`2bf048797fac3299732730e7699e31424d169039668729d1acea1f81f471b34b`。
+
+2026-08-21 冻结 EXE 内的 `full` 和 `journey` healthcheck 都以退出码 0 完成，并各自报告
+`ok=true`、`frozen=true`。`full` 为 6/6，`journey` 完成 10/10 个阶段，网络尝试为 0、
+集群操作为 0，且服务重建后的重启持久化检查通过。上述新增工作流也保留聚焦 Python
+合同测试和/或真实 Node 生产 IIFE 回归；冻结 journey 保持 `blocked`/`diagnostic` 科学状态的诚实边界。
+
+这些是本地软件门禁，不替代 GitHub-hosted 远端 CI；推送后的具体提交仍必须通过远端矩阵。`v4.0.0` 标签尚未创建，CHANGELOG 仍保持 Unreleased；12 个 skip 不等于对应功能通过。也未执行真实远程集群作业或真实科学/实验验证，不能从这些自动化检查、离线 journey 或 EXE 产物推断科学有效性或发布就绪。
+
+CI 矩阵覆盖 Ubuntu/Windows × Python 3.10、3.11、3.12。Windows package-smoke 会构建真实 EXE，并要求最终二进制的 `full` 与 `journey` 两个 profile 都成功后才上传 EXE 和 JSON 健康检查证据。
+
+## 仓库地图
+
+```text
+vcstudio/
+  generate/       结构、VASP 输入、TaskCatalog 与派生作业
+  cluster/        SSH、调度器、台账、诊断与有界恢复
+  project/        项目分析、证据模型、图表与报告
+  campaign/       DAG、三态、门禁、指纹、账本与预算
+  engines/        VASP 主引擎与受限 CP2K/Gaussian/CASTEP 适配器
+  external/       Multiwfn、VMD、Origin、POV-Ray 等适配器
+  molbuild/       分子输入、RDKit/DECIMER 边界
+  gui_web/        当前默认 Web 工作台
+  gui/            legacy Tkinter 四页界面
+  shared/         manifest、配置、凭据与 i18n
+tests/             自动化测试
+docs/              合同、验证、设计与历史记录
+```
+
+## 历史说明
+
+[2026-07-16 progress](docs/planning/progress-2026-07-16.md) 是历史快照，不是当前 4.0 能力表或测试基线。README 不再重复逐版本日志；历史功能、当时的测试数字和发布日期保留在 [CHANGELOG.md](CHANGELOG.md)，不应机械替换为当前数字。
+
+## 贡献与引用
+
+参见 [CONTRIBUTING.md](CONTRIBUTING.md) 与 [CITATION.cff](CITATION.cff)。许可证见 [MIT LICENSE](LICENSE)。

@@ -78,14 +78,57 @@ def test_group_single_is_trivially_consistent():
 
 def test_kpoints_schemes_variants():
     assert fp._kpoints_scheme('c\n0\nMonkhorst\n5 5 5\n') == 'Monkhorst 5x5x5'
-    assert fp._kpoints_scheme('c\n4\nCartesian\n...') == 'explicit:4'
+    explicit = fp._kpoints_scheme('c\n4\nCartesian\n0 0 0 1\n')
+    assert explicit.startswith('explicit:4:sha256=')
     assert fp._kpoints_scheme('', {'KSPACING': '0.25'}) == 'KSPACING 0.25'
     assert fp._kpoints_scheme('') is None
+
+
+def test_kpoints_fingerprint_tracks_shift_and_explicit_coordinates_not_comment():
+    gamma = 'first comment\n0\nGamma\n3 3 1\n0 0 0\n'
+    shifted = 'first comment\n0\nGamma\n3 3 1\n0.5 0 0\n'
+    explicit_a = 'comment A\n2\nReciprocal\n0 0 0 1\n0.5 0 0 1\n'
+    explicit_b = 'comment B\n2\nReciprocal\n0 0 0 1\n0.25 0 0 1\n'
+    explicit_same = explicit_a.replace('comment A', 'irrelevant comment')
+
+    assert fp._kpoints_scheme(gamma) != fp._kpoints_scheme(shifted)
+    assert fp._kpoints_scheme(explicit_a) != fp._kpoints_scheme(explicit_b)
+    assert fp._kpoints_scheme(explicit_a) == fp._kpoints_scheme(explicit_same)
+
+
+def test_explicit_kpoints_fingerprint_ignores_equivalent_numeric_formatting():
+    first = 'comment\n2\nReciprocal\n0 0 0 1\n0.5 -0.0 0 1\n'
+    same = ('different comment\n2\nreciprocal\n0.000 0 0.0 1.0\n'
+            '0.500000 0 0.000 1\n')
+
+    assert fp._kpoints_scheme(first) == fp._kpoints_scheme(same)
+
+
+def test_automatic_kpoints_identity_ignores_equivalent_formatting_and_comments():
+    assert fp._kpoints_scheme('c\n0\nAuto\n20\n') == \
+        fp._kpoints_scheme('other\n0\nauto\n20.0 ! length\n')
+    assert fp._kpoints_scheme('c\n0\nGamma\n03 03 01\n-0 0.0 0\n') == \
+        fp._kpoints_scheme('other\n0\ngamma\n3 3 1\n0 0 0\n')
 
 
 def test_dispersion_and_functional_variants():
     assert fp.extract_from_inputs('GGA=RP\n', '', [])['functional'] == 'RPBE'
     assert fp.extract_from_inputs('METAGGA=R2SCAN\n', '', [])['functional'] == 'metagga:R2SCAN'
+    assert fp.extract_from_inputs('GGA=PE\nMETAGGA=F\n', '', [])['functional'] == 'PBE'
+    assert fp.extract_from_inputs(
+        'GGA=PE\nLHFCALC=T\n', '', []
+    )['functional'] == 'hybrid:base=PBE;metagga=F;AEXX=0.25;HFSCREEN=0'
+    assert fp.extract_from_inputs(
+        'GGA=RP\nLHFCALC=T\nAEXX=0.30\nHFSCREEN=0.2\n', '', []
+    )['functional'] == 'hybrid:base=RPBE;metagga=F;AEXX=0.3;HFSCREEN=0.2'
+    assert fp.canonical_functional(base='hse06') == \
+        'hybrid:base=PBE;metagga=F;AEXX=0.25;HFSCREEN=0.2'
+    assert fp.canonical_functional(base='HSE06', lhfcalc=False) is None
+    assert fp.canonical_functional(base='pbe') == 'PBE'
+    assert fp.extract_from_inputs(
+        'LHFCALC=T\nAEXX=not-a-number\n', '',
+        [{'element': 'C', 'titel': 'PAW_PBE C 08Apr2002'}]
+    )['functional'] is None
     assert fp.extract_from_inputs('IVDW=11\n', '', [])['dispersion'] == 'DFT-D3(zero)'
     assert fp.extract_from_inputs('ENCUT=400\n', '', [])['dispersion'] is None
     # ISPIN 缺省为 1

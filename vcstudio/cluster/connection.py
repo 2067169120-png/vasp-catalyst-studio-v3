@@ -1,7 +1,8 @@
 """可复用 SSH 连接:提交/查状态用的活连接(区别于 ssh_test 的一次性测连)。
 
-安全语义与 ssh_test 完全一致(同一套 known_hosts 门控,跳板机复用
-ssh_test._open_jump_channel,不重复实现 MITM 防线)。paramiko 延迟导入,
+安全语义与 ssh_test 完全一致:仅 missing_host_key 捕获的真实
+SHA256 指纹可进入确认流程,且后续必须传 host+指纹精确 pin。跳板机复用
+ssh_test._open_jump_channel,不重复实现 MITM 防线。paramiko 延迟导入,
 纯逻辑层(schedulers/script_builder/ledger)在无 paramiko 环境下仍可测试。
 中文注释允许,英文标识符。
 """
@@ -14,18 +15,23 @@ from pathlib import Path
 class ConnectError(Exception):
     """连接失败。needs_trust=True 表示未知主机指纹,界面确认后可 trust_new 重试。"""
 
-    def __init__(self, message: str, needs_trust: bool = False):
+    def __init__(self, message: str, needs_trust: bool = False, *,
+                 fingerprint: str = '', algorithm: str = '', host: str = ''):
         super().__init__(message)
         self.needs_trust = needs_trust
+        self.fingerprint = fingerprint
+        self.algorithm = algorithm
+        self.host = host
 
 
 def open_client(profile, password: str | None = None, *,
-                trust_new: bool = False,
+                trust_new=False,
                 known_hosts_path: str | os.PathLike | None = None,
                 client_factory=None):
     """连上集群,返回 (client, jump_client|None)。调用方负责两个都 close。
 
-    失败抛 ConnectError(中文文案;未知指纹时 needs_trust=True)。
+    失败抛 ConnectError(中文文案;未知指纹时 needs_trust=True 且
+    附 fingerprint/algorithm/host)。trust_new 必须是这些字段的原样 pin 映射。
     """
     import paramiko                                    # 延迟导入
     from vcstudio.cluster import ssh_test              # 复用其 known_hosts/跳板逻辑
@@ -44,9 +50,6 @@ def open_client(profile, password: str | None = None, *,
             client.load_host_keys(str(kh))
         except Exception:
             pass
-    client.set_missing_host_key_policy(
-        paramiko.AutoAddPolicy() if trust_new else paramiko.RejectPolicy())
-
     # 超时口径借自 V2.0.0 layer1_hpc(1w 跳板 sshd 实测慢,banner 可拖过 15s):
     # timeout=30 + banner/auth 显式给足,防"能 ping 通但握手超时"的假性连接失败
     kwargs = dict(hostname=profile.hostname, port=int(profile.port),
@@ -60,17 +63,31 @@ def open_client(profile, password: str | None = None, *,
 
     jump = None
     try:
+        trust = ssh_test.HostKeyTrust(trust_new)
+        policy = ssh_test.PinnedHostKeyPolicy(trust)
+        client.set_missing_host_key_policy(policy)
         if profile.use_jump and profile.jump_host:
             kwargs['sock'], jump = ssh_test._open_jump_channel(
-                profile, password, factory, trust_new=trust_new, known_hosts_path=kh)
+                profile, password, factory, known_hosts_path=kh, _trust=trust)
         client.connect(**kwargs)
+        ssh_test._persist_accepted_key(client, policy, kh)
+    except ssh_test.UnknownHostKey as e:
+        close_quiet(client, jump)
+        raise ConnectError(
+            str(e), needs_trust=True, fingerprint=e.fingerprint,
+            algorithm=e.algorithm, host=e.host) from None
+    except ssh_test.HostKeyPinMismatch as e:
+        close_quiet(client, jump)
+        raise ConnectError(str(e)) from None
     except paramiko.AuthenticationException:
         close_quiet(client, jump)
         raise ConnectError('认证失败:用户名/密钥/密码不正确') from None
+    except paramiko.BadHostKeyException as e:
+        close_quiet(client, jump)
+        raise ConnectError(f'主机密钥已变化,已阻止连接:{e}') from None
     except paramiko.ssh_exception.SSHException as e:
         close_quiet(client, jump)
-        raise ConnectError(f'无法确认主机指纹或 SSH 错误:{e};确认后可信任重试',
-                           needs_trust=not trust_new) from None
+        raise ConnectError(f'SSH 协议错误:{e}') from None
     except (OSError, EOFError) as e:
         close_quiet(client, jump)
         raise ConnectError(f'连接失败:{e}') from None
@@ -86,12 +103,6 @@ def open_client(profile, password: str | None = None, *,
         except Exception:
             pass
 
-    if trust_new:
-        try:
-            kh.parent.mkdir(parents=True, exist_ok=True)
-            client.save_host_keys(str(kh))
-        except Exception:
-            pass
     return client, jump
 
 

@@ -5,6 +5,28 @@ from vcstudio.project import report_full
 from vcstudio.shared import manifest as mm
 
 
+def _write_done_files(job_dir, energy):
+    (job_dir / 'OSZICAR').write_text(
+        f' 1 F= {energy:.12f} E0= {energy:.12f} d E =0\n', encoding='utf-8')
+    (job_dir / 'OUTCAR').write_text(
+        'General timing and accounting information for this job\n', encoding='utf-8')
+
+
+def _write_method_files(job_dir):
+    """Write a complete, mutually comparable single-element VASP input set."""
+    (job_dir / 'POSCAR').write_text(
+        'C\n1.0\n10 0 0\n0 10 0\n0 0 10\nC\n1\nCartesian\n0 0 0\n',
+        encoding='utf-8')
+    (job_dir / 'INCAR').write_text(
+        'ENCUT = 500\nEDIFF = 1E-5\nISPIN = 1\nLDAU = F\n',
+        encoding='utf-8')
+    (job_dir / 'KPOINTS').write_text(
+        'mesh\n0\nGamma\n3 3 1\n0 0 0\n', encoding='utf-8')
+    (job_dir / 'POTCAR').write_text(
+        'TITEL = PAW_PBE C 08Apr2002\nENMAX = 400.0; ENMIN = 300.0\n',
+        encoding='utf-8')
+
+
 def _proj(tmp_path, n_done=2):
     dirs = []
     for i in range(n_done):
@@ -15,7 +37,8 @@ def _proj(tmp_path, n_done=2):
         mm.set_state(m, 'DONE')
         m['results'] = {'energy_e0_eV': -100.0 - i}
         mm.save_manifest(d, m)
-        (d / 'INCAR').write_text('ENCUT = 500\nEDIFF = 1E-5\n', encoding='utf-8')
+        _write_done_files(d, -100.0 - i)
+        _write_method_files(d)
         dirs.append(str(d))
     slab = tmp_path / 'slab'
     slab.mkdir()
@@ -24,6 +47,8 @@ def _proj(tmp_path, n_done=2):
     mm.set_state(ms, 'DONE')
     ms['results'] = {'energy_e0_eV': -90.0}
     mm.save_manifest(slab, ms)
+    _write_done_files(slab, -90.0)
+    _write_method_files(slab)
     return {'name': 'proj1', 'root': str(tmp_path),
             'members': {'clean_slab': str(slab), 'gas_ref': None, 'configs': dirs}}
 
@@ -31,7 +56,7 @@ def _proj(tmp_path, n_done=2):
 def test_incar_summary_reads_real_keys(tmp_path):
     p = _proj(tmp_path)
     s = report_full.incar_summary_from_dir(p['members']['configs'][0])
-    assert s == {'ENCUT': 500, 'EDIFF': 1e-05}
+    assert s == {'ENCUT': 500, 'EDIFF': 1e-05, 'ISPIN': 1}
     assert report_full.incar_summary_from_dir(tmp_path / 'nope') == {}
 
 
@@ -45,7 +70,8 @@ def test_generate_report_origin_ok_and_ai_ok(tmp_path):
         return {'ok': True, 'images': {'ads_bar': png}, 'error': ''}
 
     def fake_ai(payload):
-        assert payload['computational_parameters'] == {'ENCUT': 500, 'EDIFF': 1e-05}
+        assert payload['computational_parameters'] == {
+            'ENCUT': 500, 'EDIFF': 1e-05, 'ISPIN': 1}
         return {'ok': True, 'analysis_zh': '中文解读OK', 'paragraph_en': 'English para.',
                 'caveats': ['no ZPE'], 'confidence': 'high', 'error': ''}
 
@@ -59,10 +85,51 @@ def test_generate_report_origin_ok_and_ai_ok(tmp_path):
     assert 'ΔE 汇总统计' in h and '最强吸附' in h
     assert '计算参数' in h and 'ENCUT' in h
     assert '方法学约定' in h and '未含 ZPE/熵' in h
+    assert '诊断报告 · 非最终科学结论' in h
+
+
+def test_legacy_status_never_claims_final_without_bound_validation():
+    delta = {'rows': [{'delta_e': -1.234}]}
+
+    assert report_full._effective_report_status('auto', delta) == 'diagnostic'
+    assert report_full._effective_report_status(None, delta) == 'diagnostic'
+    assert report_full._effective_report_status('final', delta) == 'diagnostic'
+
+
+def test_fig_html_stages_cross_drive_asset_before_relpath(monkeypatch, tmp_path):
+    """Windows 跨盘报告必须先把外部图收进报告包，再计算相对路径。"""
+    source_dir = tmp_path / 'E_drive' / 'calculation-results'
+    source_dir.mkdir(parents=True)
+    source = source_dir / 'external-result.png'
+    source.write_bytes(b'\x89PNG\r\n\x1a\nexternal figure bytes')
+
+    report_dir = tmp_path / 'C_drive' / 'paper-report'
+    report_dir.mkdir(parents=True)
+    real_relpath = report_full.os.path.relpath
+
+    def windows_like_relpath(path, start):
+        # 在 Windows 上 E: → C: 会直接 ValueError。若生产代码先完成暂存，
+        # relpath 收到的 source 应已经位于 report_dir 内，不会进入该分支。
+        candidate = os.path.abspath(os.fspath(path))
+        report_root = os.path.abspath(os.fspath(start))
+        if os.path.commonpath((candidate, report_root)) != report_root:
+            raise ValueError("path is on mount 'E:', start on mount 'C:'")
+        return real_relpath(path, start)
+
+    monkeypatch.setattr(report_full.os.path, 'relpath', windows_like_relpath)
+
+    html = report_full._fig_html(source, report_dir, 'external result')
+
+    staged = list((report_dir / 'report_assets').glob('external-result-*.png'))
+    assert len(staged) == 1
+    assert staged[0].read_bytes() == source.read_bytes()
+    assert "src='report_assets/external-result-" in html
+    assert source.as_posix() not in html
+    assert 'file:' not in html
 
 
 def test_delta_e_color_semantics(tmp_path):
-    """ΔE 颜色语义(原版口径):>0 红、<-3 绿。"""
+    """ΔE 颜色语义:>0 不利红、<-3 过强警戒橙红，绝不显示成优秀绿。"""
     from vcstudio.project import report
     rows = report.collect_jobs([])
     de = {'rows': [
@@ -71,8 +138,70 @@ def test_delta_e_color_semantics(tmp_path):
         {'name': 'mid', 'state': 'DONE', 'e_config': -5.0, 'delta_e': -1.5, 'note': ''},
     ]}
     h = report.render_html(rows, report.summarize(rows), delta_e=de)
-    assert h.count('#15803d;font-weight:600') == 1      # 仅 strong 绿
-    assert h.count('#b91c1c;font-weight:600') == 1      # 仅 bad 红
+    assert h.count('#c2410c;font-weight:600') == 1      # 仅 strong 过强警戒
+    assert h.count('#b91c1c;font-weight:600') == 1      # 仅 bad 不利
+
+
+def test_figure_html_stages_asset_when_relative_path_crosses_drive(tmp_path, monkeypatch):
+    """Windows C:/E: 不能 relpath 时，报告只复制图片资源而不改计算源文件。"""
+    source = tmp_path / 'source' / 'profile.png'
+    report_dir = tmp_path / 'report'
+    source.parent.mkdir()
+    report_dir.mkdir()
+    source.write_bytes(b'figure-bytes')
+    real_relpath = report_full.os.path.relpath
+
+    def fake_relpath(path, start):
+        if report_full.os.path.normpath(path) == report_full.os.path.normpath(source):
+            raise ValueError('path is on mount E:, start on mount C:')
+        return real_relpath(path, start)
+
+    monkeypatch.setattr(report_full.os.path, 'relpath', fake_relpath)
+    rendered = report_full._fig_html(source, report_dir, 'caption')
+
+    staged = list((report_dir / 'report_assets').iterdir())
+    assert len(staged) == 1 and staged[0].read_bytes() == b'figure-bytes'
+    assert 'report_assets/' in rendered and 'caption' in rendered
+    assert source.read_bytes() == b'figure-bytes'
+
+    source.write_bytes(b'new-figure-bytes')
+    rendered_after_change = report_full._fig_html(source, report_dir, 'caption')
+    staged = list((report_dir / 'report_assets').iterdir())
+    assert len(staged) == 2
+    assert {item.read_bytes() for item in staged} == {
+        b'figure-bytes', b'new-figure-bytes'}
+    assert rendered_after_change != rendered
+
+
+def test_excluded_thermochemistry_never_enters_free_energy_path(tmp_path, monkeypatch):
+    molecules = tmp_path / 'molecules'
+    molecules.mkdir()
+    captured = {}
+
+    from vcstudio.project import thermo
+
+    monkeypatch.setattr(thermo, 'load_corrections', lambda _dirs: {
+        'good': {'g_corr': 0.12, 'n_imag': 0, 'imag_cm1': []},
+        'bad': {'g_corr': 9.99, 'n_imag': 1, 'imag_cm1': [-250.0], 'excluded': True},
+    })
+
+    def fake_path(_rows, *, g_corr=None, **_kwargs):
+        captured['g_corr'] = g_corr
+        return {'warnings': []}
+
+    monkeypatch.setattr(
+        report_full.freeenergy, 'path_from_project_and_molecules', fake_path)
+    messages = []
+    fed = report_full._try_fed(
+        {'slab': ('DONE', -100.0), 'rows': []},
+        {'lis_molecules_dir': str(molecules), 'freq_dirs': {'good': '/g', 'bad': '/b'}},
+        messages.append)
+
+    assert captured['g_corr'] == {'good': 0.12}
+    assert fed['thermo_meta'] == {
+        'good': {'g_corr': 0.12, 'n_imag': 0, 'imag_cm1': []},
+    }
+    assert any('bad' in message and 'excluded' in message for message in messages)
 
 
 def test_generate_report_falls_back_to_svg_and_degrades_ai(tmp_path):
@@ -113,6 +242,7 @@ def _proj_repro(tmp_path):
             m['attempts'] = [{'n': 1, 'result': 'submitted'},
                              {'n': 2, 'result': 'continued'}]
         mm.save_manifest(d, m)
+        _write_done_files(d, -100.0 - i)
         (d / 'INCAR').write_text('ENCUT = 450\nEDIFF = 1E-5\n', encoding='utf-8')
         dirs.append(str(d))
     slab = tmp_path / 'slab'
@@ -123,6 +253,7 @@ def _proj_repro(tmp_path):
     mm.set_state(ms, 'DONE')
     ms['results'] = {'energy_e0_eV': -90.0}
     mm.save_manifest(slab, ms)
+    _write_done_files(slab, -90.0)
     return {'name': 'reproj', 'root': str(tmp_path),
             'members': {'clean_slab': str(slab), 'gas_ref': None, 'configs': dirs}}
 
@@ -151,8 +282,41 @@ def test_report_annotates_continuation_rounds(tmp_path):
 def test_report_methodology_fixed_sentences(tmp_path):
     h = _gen_repro(tmp_path)
     assert 'BSSE' in h                                    # 平面波基组无 BSSE
-    assert 'ENCUT' in h and '基组一致' in h                # 项目内 ENCUT 一致
+    assert '真实 INCAR' in h and 'ENCUT' in h and '方法门禁' in h  # 逐成员真实输入 + 可比性门
     assert '真空盒尺寸' in h                               # 气相参考盒尺寸见输入文件
+
+
+def test_imported_report_does_not_claim_parameters_were_unified(tmp_path):
+    p = _proj(tmp_path)
+    p['import_source'] = '/user/already-computed'
+    sources = ('OUTCAR:TOTEN', 'vasprun.xml:derived_sigma0')
+    for d, source in zip(p['members']['configs'], sources):
+        m = mm.load_manifest(d)
+        m['results']['energy_source'] = source
+        mm.save_manifest(d, m)
+    out = report_full.generate_project_report(
+        p, tmp_path / 'imported.html',
+        origin_render=lambda *a, **k: {'ok': False, 'images': {}, 'error': ''},
+        ai_analyze=lambda payload: {'ok': False, 'error': 'skip'})
+
+    h = out.read_text(encoding='utf-8')
+    assert '不默认其 INCAR/ENCUT/K 点一致' in h
+    assert '项目内各作业 ENCUT 统一' not in h
+    assert '成员共享 INCAR' not in h
+    assert '首个可读成员的 INCAR 关键键' in h
+    assert 'OUTCAR:TOTEN' in h and 'vasprun.xml:derived_sigma0' in h
+    assert '全部能量为 DFT 电子能(OSZICAR E0)' not in h
+
+
+def test_report_without_delta_is_explicitly_diagnostic(tmp_path):
+    p = _proj(tmp_path, n_done=0)
+    out = report_full.generate_project_report(
+        p, tmp_path / 'diagnostic.html',
+        origin_render=lambda *a, **k: {'ok': False, 'images': {}, 'error': ''},
+        ai_analyze=lambda payload: {'ok': False, 'error': 'skip'})
+
+    h = out.read_text(encoding='utf-8')
+    assert '当前报告为诊断版' in h and '尚无可用 ΔE' in h
 
 
 def test_structure_gallery_embeds_existing_renders(tmp_path):
@@ -166,3 +330,116 @@ def test_structure_gallery_embeds_existing_renders(tmp_path):
         ai_analyze=lambda payload: {'ok': False, 'error': 'skip'})
     h = out.read_text(encoding='utf-8')
     assert '结构图(POV-Ray)' in h and 'x_top.png' in h
+
+
+def _generate_with_molecule_source(monkeypatch, tmp_path, project_dir, config_dir):
+    """生成报告并捕获 freeenergy 真正收到的分子库目录。"""
+    p = _proj(tmp_path)
+    if project_dir is not None:
+        p['molecules_dir'] = str(project_dir)
+    called = {}
+
+    def fake_path(rows, e_slab, molecules_dir, *, g_corr=None, mu_li=None, **_context):
+        called['molecules_dir'] = molecules_dir
+        return None
+
+    monkeypatch.setattr(report_full.freeenergy, 'path_from_project_and_molecules', fake_path)
+    logs = []
+    report_full.generate_project_report(
+        p, tmp_path / 'molecule-source.html',
+        config={'lis_molecules_dir': str(config_dir) if config_dir is not None else ''},
+        origin_render=lambda *a, **k: {'ok': False, 'images': {}, 'error': ''},
+        ai_analyze=lambda payload: {'ok': False, 'error': 'skip'}, log=logs.append)
+    return called.get('molecules_dir'), logs
+
+
+def test_report_prefers_imported_project_molecules_dir(monkeypatch, tmp_path):
+    project_dir = tmp_path / 'imported-molecules'
+    config_dir = tmp_path / 'configured-molecules'
+    project_dir.mkdir()
+    config_dir.mkdir()
+
+    used, logs = _generate_with_molecule_source(
+        monkeypatch, tmp_path, project_dir, config_dir)
+
+    assert used == str(project_dir)
+    assert not any('回退全局配置' in line for line in logs)
+
+
+def test_report_falls_back_when_project_molecules_dir_missing(monkeypatch, tmp_path):
+    missing_project_dir = tmp_path / 'moved-imported-molecules'
+    config_dir = tmp_path / 'configured-molecules'
+    config_dir.mkdir()
+
+    used, logs = _generate_with_molecule_source(
+        monkeypatch, tmp_path, missing_project_dir, config_dir)
+
+    assert used == str(config_dir)
+    assert any('回退全局配置' in line for line in logs)
+
+
+def test_species_reference_report_contains_energy_source_provenance_and_formula(tmp_path):
+    project = _proj(tmp_path, n_done=1)
+    config = project['members']['configs'][0]
+    ref_job = tmp_path / 'molecules' / 'mol_Li2S8'
+    ref_job.mkdir(parents=True)
+    ref = mm.new_manifest(
+        job_id='ref', system='Li2S8', task_type='relax', calc_type='molecule',
+        inputs={'imported_from': '/original/Li2S8',
+                'source_sha256': {'OUTCAR': 'a' * 64, 'OSZICAR': 'b' * 64}})
+    mm.set_state(ref, 'DONE')
+    ref['results'].update(
+        energy_e0_eV=-38.072771, energy_source='OSZICAR:E0',
+        import_confirmation={'manual': False},
+        reference_method_signature={
+            'functional': 'PBE', 'ivdw': 0, 'encut': 500.0, 'ispin': 1,
+            'ldau': 'F', 'potcar_titel': ['PAW_PBE C 08Apr2002'],
+            'potcar_elements': ['C'],
+        })
+    mm.save_manifest(ref_job, ref)
+    _write_done_files(ref_job, -38.072771)
+    project['config_species'] = {config: 'Li2S8'}
+    project['species_refs'] = {'Li2S8': -38.072771}
+    project['species_ref_jobs'] = {'Li2S8': str(ref_job)}
+
+    out = report_full.generate_project_report(
+        project, tmp_path / 'species-report.html',
+        origin_render=lambda *args, **kwargs: {'ok': False, 'images': {}, 'error': ''},
+        ai_analyze=lambda payload: {'ok': False, 'error': 'skip'})
+    html = out.read_text(encoding='utf-8')
+    assert '逐物种参考能与溯源' in html
+    assert 'Li2S8' in html and '-38.072771' in html and 'OSZICAR:E0' in html
+    assert '/original/Li2S8' in html and 'aaaaaaaaaaaa…' in html
+    assert '吸附能逐项核算' in html
+    assert '参考状态' in html and 'DONE' in html
+    assert html.count('-38.072771') >= 2 and '-38.0727710000' in html
+    assert 'E(slab+ads) − E(slab) − E(ref)' in html
+
+
+def test_species_reference_report_uses_manifest_truth_and_blocks_cache_drift(tmp_path):
+    project = _proj(tmp_path, n_done=1)
+    config = project['members']['configs'][0]
+    ref_job = tmp_path / 'molecules' / 'mol_Li2S8-drift'
+    ref_job.mkdir(parents=True)
+    ref = mm.new_manifest(
+        job_id='ref-drift', system='Li2S8', task_type='relax',
+        calc_type='molecule', inputs={})
+    mm.set_state(ref, 'DONE')
+    ref['results'].update(energy_e0_eV=-38.072771, energy_source='OSZICAR:E0')
+    mm.save_manifest(ref_job, ref)
+    _write_done_files(ref_job, -38.072771)
+    project['config_species'] = {config: 'Li2S8'}
+    project['species_refs'] = {'Li2S8': -38.0}  # stale project.yaml cache
+    project['species_ref_jobs'] = {'Li2S8': str(ref_job)}
+
+    out = report_full.generate_project_report(
+        project, tmp_path / 'species-drift-report.html',
+        origin_render=lambda *args, **kwargs: {'ok': False, 'images': {}, 'error': ''},
+        ai_analyze=lambda payload: {'ok': False, 'error': 'skip'})
+    html = out.read_text(encoding='utf-8')
+
+    assert '逐物种参考能与溯源' in html
+    assert '-38.072771' in html and 'OSZICAR:E0' in html and 'DONE' in html
+    assert '参考能缓存与 job.yaml 不一致' in html and '容差 1e-06 eV' in html
+    assert '吸附能逐项核算' not in html
+    assert '当前报告为诊断版' in html

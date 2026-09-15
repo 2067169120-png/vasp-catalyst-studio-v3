@@ -16,8 +16,13 @@ from __future__ import annotations
 
 import os
 import re
+import math
+from pathlib import Path
+
+import yaml
 
 from vcstudio.project import reactions
+from vcstudio.shared import manifest as manifest_mod
 
 _E0_RE = re.compile(r'E0=\s*([-+.\dEe]+)')
 
@@ -48,9 +53,286 @@ def read_e0(job_dir) -> float | None:
         return None
 
 
-def load_molecule_energies(folder) -> dict:
-    """扫描目录下 mol_<X>/molecule_<X> 子目录 → {X: E0}(旧版 results/done 兼容)。"""
+def _normal_path(path) -> str:
+    return os.path.normcase(os.path.abspath(os.path.normpath(str(path))))
+
+
+def _molecule_job_dirs(folder) -> list[str]:
+    """Return deterministic Li-S reference directories from one library."""
+    root = Path(folder)
+    try:
+        entries = sorted(root.iterdir(), key=lambda path: path.name.casefold())
+    except OSError:
+        return []
+    return [str(path) for path in entries
+            if path.is_dir() and path.name.casefold().startswith(('mol_', 'molecule_'))]
+
+
+def _library_context(folder) -> dict:
+    """Recover managed reference members from the adjacent project.yaml.
+
+    Imported projects store ``project.yaml`` next to ``molecules/``.  Resolving
+    this marker prevents a deleted/corrupt job.yaml from silently falling back
+    to an unaudited legacy OSZICAR after a project has been moved.
+    """
+    root = Path(folder).expanduser().resolve()
+    project_file = root.parent / 'project.yaml'
+    empty = {'managed': False, 'dirs': set(), 'project': None,
+             'error': None, 'warnings': []}
+    if not project_file.is_file():
+        return empty
+    try:
+        with project_file.open('r', encoding='utf-8') as handle:
+            project = yaml.safe_load(handle)
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        return {**empty, 'managed': True,
+                'error': f'分子参考库 project.yaml 损坏，无法审计：{exc}'}
+    if not isinstance(project, dict):
+        return {**empty, 'managed': True,
+                'error': '分子参考库 project.yaml 不是合法项目对象'}
+
+    configured = str(project.get('molecules_dir') or '').strip()
+    if configured:
+        configured_path = Path(configured).expanduser()
+        if not configured_path.is_absolute():
+            configured_path = project_file.parent / configured_path
+        exact = _normal_path(configured_path) == _normal_path(root)
+        moved = configured_path.name == root.name and root.parent == project_file.parent
+        if not (exact or moved):
+            # An unrelated project.yaml happens to share the parent directory.
+            return empty
+        warnings = ([] if exact else [
+            '分子参考库已移动；按相邻 project.yaml 与目录名恢复成员路径'])
+    else:
+        refs_probe = project.get('species_ref_jobs') or {}
+        if not refs_probe:
+            return empty
+        warnings = ['project.yaml 未记录 molecules_dir；按相邻目录恢复受管成员']
+
+    refs = []
+    members = project.get('members') or {}
+    for mapping in (members.get('molecules'), project.get('species_ref_jobs')):
+        if isinstance(mapping, dict):
+            refs.extend(mapping.values())
+        elif isinstance(mapping, (list, tuple)):
+            refs.extend(mapping)
+    managed = set()
+    for raw in refs:
+        if not raw:
+            continue
+        path = Path(str(raw)).expanduser()
+        candidate = path if path.parent == root else root / path.name
+        managed.add(_normal_path(candidate))
+    return {'managed': True, 'dirs': managed, 'project': project,
+            'error': None, 'warnings': warnings}
+
+
+def _method_records(paths, label_prefix):
+    from vcstudio.project import energy_gate
+
+    records = []
+    for path in paths:
+        item = manifest_mod.load_manifest(path)
+        records.append(energy_gate.method_record(
+            path, item, f'{label_prefix}:{Path(path).name}'))
+    return records
+
+
+def _audit_record_group(records, *, label, require_same_kpoints, strict_spin):
+    """Compare known facts while keeping missing historical evidence explicit."""
+    import json
+
+    issues, warnings = [], []
+    display = {'functional': '泛函', 'dispersion': '色散校正', 'encut': 'ENCUT'}
+    for field, title in display.items():
+        missing = [row['label'] for row in records if not row['known'].get(field)]
+        if missing:
+            warnings.append(f'{label}{title}证据不完整：{"、".join(missing)}')
+        values = [(row['label'], row['fingerprint'].get(field)) for row in records
+                  if row['known'].get(field)]
+        canonical = {
+            json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+            for _name, value in values
+        }
+        if len(canonical) > 1:
+            issues.append(f'{label}{title}不一致：' + '、'.join(
+                f'{name}={value!r}' for name, value in values))
+
+    spin_values = [(row['label'], row['fingerprint'].get('spin')) for row in records
+                   if row['known'].get('spin')]
+    if len({value for _name, value in spin_values}) > 1:
+        detail = f'{label}ISPIN 不同：' + '、'.join(
+            f'{name}={value}' for name, value in spin_values)
+        (issues if strict_spin else warnings).append(detail)
+
+    kpoint_values = [row['fingerprint'].get('kpoints_scheme') for row in records
+                     if row['known'].get('kpoints_scheme')]
+    if len(kpoint_values) != len(records):
+        warnings.append(f'{label}K 点证据不完整')
+    elif len(set(kpoint_values)) > 1:
+        detail = f'{label}K 点方案不同：' + '、'.join(str(value) for value in kpoint_values)
+        (issues if require_same_kpoints else warnings).append(detail)
+
+    # POTCAR sets differ naturally between clean slabs and adsorbates.  Compare
+    # only shared elements pairwise, never require identical element sets.
+    compared = 0
+    for index, left in enumerate(records):
+        left_ids = left['fingerprint'].get('potcar_ids') or {}
+        for right in records[index + 1:]:
+            right_ids = right['fingerprint'].get('potcar_ids') or {}
+            for element in sorted(set(left_ids) & set(right_ids)):
+                compared += 1
+                if left_ids[element] != right_ids[element]:
+                    issues.append(
+                        f'{label}{element} 的 POTCAR 不一致：'
+                        f'{left["label"]}/{right["label"]}')
+    if not compared:
+        warnings.append(f'{label}缺少可交叉核对的共同元素 POTCAR 身份')
+    if any(not row['known'].get('potcar_ids') for row in records):
+        warnings.append(f'{label}POTCAR 身份证据不完整')
+
+    u_values = [row['fingerprint'].get('u_values') for row in records
+                if row['known'].get('u_values')]
+    if len(u_values) != len(records):
+        warnings.append(f'{label}DFT+U 证据不完整')
+    elif len({json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+              for value in u_values}) > 1:
+        warnings.append(f'{label}DFT+U 向量不同；请按各自 POSCAR 元素顺序复核')
+    return list(dict.fromkeys(issues)), list(dict.fromkeys(warnings))
+
+
+def audit_molecule_method_compatibility(project: dict | None, molecules_dir,
+                                        *, managed_dirs=None) -> dict:
+    """Audit whether adsorption and Li-S molecular energies may be combined."""
+    context = _library_context(molecules_dir)
+    if context['error']:
+        return {'ok': False, 'verified': False, 'managed': True,
+                'errors': [context['error']], 'warnings': []}
+
+    root = Path(molecules_dir).expanduser().resolve()
+    explicit = set()
+    for raw in (managed_dirs or []):
+        if not raw:
+            continue
+        path = Path(str(raw)).expanduser()
+        candidate = path if path.parent == root else root / path.name
+        explicit.add(_normal_path(candidate))
+    molecule_dirs = _molecule_job_dirs(root)
+    has_manifest = any(manifest_mod.manifest_path(path).is_file() for path in molecule_dirs)
+    managed = bool(context['managed'] or explicit or has_manifest)
+    if not managed:
+        return {
+            'ok': True, 'verified': False, 'managed': False, 'errors': [],
+            'warnings': [
+                '旧式分子目录没有项目/作业方法证据；为兼容历史数据继续计算，'
+                '但结果不可视为已核验方法一致性'],
+        }
+    if not isinstance(project, dict):
+        return {'ok': False, 'verified': False, 'managed': True,
+                'errors': ['受管分子库需要当前吸附项目上下文以核验方法一致性'],
+                'warnings': list(context['warnings'])}
+
+    required_species = {'s8', 'li2s', 'li2s2'}
+    relevant_molecules = []
+    for path in molecule_dirs:
+        low = Path(path).name.casefold()
+        prefix = 'molecule_' if low.startswith('molecule_') else 'mol_'
+        species = Path(path).name[len(prefix):].casefold()
+        if species in required_species:
+            relevant_molecules.append(path)
+    if not relevant_molecules:
+        return {'ok': False, 'verified': False, 'managed': True,
+                'errors': ['分子参考库没有 Li-S 路径所需的 S8/Li2S/Li2S2 作业'],
+                'warnings': list(context['warnings'])}
+
+    errors, warnings = [], list(context['warnings'])
+    known_managed = set(context['dirs']) | explicit
+    if context['managed']:
+        known_managed.update(_normal_path(path) for path in relevant_molecules)
+    for path in relevant_molecules:
+        item = manifest_mod.load_manifest(path)
+        if _normal_path(path) in known_managed and item is None:
+            errors.append(f'受管分子作业 {Path(path).name} 缺少或损坏 job.yaml')
+        elif item is not None and item.get('state') != 'DONE':
+            errors.append(
+                f'分子作业 {Path(path).name} 未通过 DONE 门（{item.get("state") or "未知"}）')
+
+    members = project.get('members') or {}
+    adsorption_dirs = [members.get('clean_slab'), *(members.get('configs') or [])]
+    adsorption_dirs = [str(path) for path in adsorption_dirs if path]
+    if not adsorption_dirs:
+        errors.append('吸附项目没有 clean_slab/config 成员，无法核验 ΔG 方法')
+    for path in adsorption_dirs:
+        if manifest_mod.load_manifest(path) is None:
+            errors.append(f'吸附成员 {Path(path).name} 缺少或损坏 job.yaml')
+    if errors:
+        return {'ok': False, 'verified': False, 'managed': True,
+                'errors': list(dict.fromkeys(errors)),
+                'warnings': list(dict.fromkeys(warnings))}
+
+    ads_records = _method_records(adsorption_dirs, '吸附')
+    mol_records = _method_records(relevant_molecules, '分子')
+    group_issues, group_warnings = _audit_record_group(
+        ads_records, label='吸附项目', require_same_kpoints=True, strict_spin=True)
+    errors.extend(group_issues)
+    warnings.extend(group_warnings)
+    group_issues, group_warnings = _audit_record_group(
+        mol_records, label='分子参考', require_same_kpoints=False, strict_spin=False)
+    errors.extend(group_issues)
+    warnings.extend(group_warnings)
+
+    # Across different cells, compare only invariants that must be identical.
+    for field, title in (('functional', '泛函'), ('dispersion', '色散校正'),
+                         ('encut', 'ENCUT')):
+        ads_values = {row['fingerprint'].get(field) for row in ads_records
+                      if row['known'].get(field)}
+        mol_values = {row['fingerprint'].get(field) for row in mol_records
+                      if row['known'].get(field)}
+        if not ads_values or not mol_values:
+            warnings.append(f'跨项目{title}证据不完整')
+        elif ads_values != mol_values:
+            errors.append(
+                f'跨项目{title}不一致：吸附项目={sorted(map(str, ads_values))}，'
+                f'分子参考={sorted(map(str, mol_values))}')
+
+    cross_potcars = 0
+    for ads_record in ads_records:
+        ads_ids = ads_record['fingerprint'].get('potcar_ids') or {}
+        for mol_record in mol_records:
+            mol_ids = mol_record['fingerprint'].get('potcar_ids') or {}
+            for element in sorted(set(ads_ids) & set(mol_ids)):
+                cross_potcars += 1
+                if ads_ids[element] != mol_ids[element]:
+                    errors.append(f'跨项目共享元素 {element} 的 POTCAR 身份不一致')
+    if not cross_potcars:
+        warnings.append('吸附项目与分子参考没有可交叉核对的共同元素 POTCAR 身份')
+
+    errors = list(dict.fromkeys(errors))
+    warnings = list(dict.fromkeys(warnings))
+    return {'ok': not errors, 'verified': not errors and not warnings,
+            'managed': True, 'errors': errors, 'warnings': warnings,
+            'status': ('incompatible' if errors else ('verified' if not warnings else 'unverified'))}
+
+
+def load_molecule_energies(folder, *, managed_dirs=None) -> dict:
+    """扫描 ``mol_<X>``/``molecule_<X>`` 子目录 → ``{X: E0}``。
+
+    受管导入目录若存在 ``job.yaml``，只接受 ``DONE`` 且能量合理的
+    参考态；``NEEDS_HUMAN``/未收敛分子不得静默进入 μLi/ΔG。没有 manifest
+    的旧版 ``results/done`` 目录仍按 OSZICAR 兼容读取。
+    """
     out = {}
+    context = _library_context(folder)
+    if context['error']:
+        return out
+    known_managed = set(context['dirs'])
+    root = Path(folder).expanduser().resolve()
+    for raw in (managed_dirs or []):
+        if not raw:
+            continue
+        path = Path(str(raw)).expanduser()
+        candidate = path if path.parent == root else root / path.name
+        known_managed.add(_normal_path(candidate))
     try:
         entries = sorted(os.listdir(folder))
     except OSError:
@@ -59,8 +341,28 @@ def load_molecule_energies(folder) -> dict:
         low = name.lower()
         for prefix in ('mol_', 'molecule_'):
             if low.startswith(prefix):
-                e = read_e0(os.path.join(str(folder), name))
-                if e is not None:
+                job_dir = os.path.join(str(folder), name)
+                manifest_file = manifest_mod.manifest_path(job_dir)
+                manifest = manifest_mod.load_manifest(job_dir)
+                # ``None`` means either legacy/no manifest or an unreadable
+                # manifest.  Those cases must not be conflated: once job.yaml
+                # exists this is a managed result, and corruption must fail
+                # closed instead of silently bypassing the DONE gate via OSZICAR.
+                if ((context['managed'] or _normal_path(job_dir) in known_managed)
+                        and manifest is None):
+                    break
+                if manifest_file.is_file() and manifest is None:
+                    break
+                if manifest is not None and manifest.get('state') != 'DONE':
+                    break
+                e = ((manifest or {}).get('results') or {}).get('energy_e0_eV')
+                if not isinstance(e, (int, float)):
+                    e = read_e0(job_dir)
+                try:
+                    e = float(e)
+                except (TypeError, ValueError):
+                    e = None
+                if e is not None and math.isfinite(e) and e < 0 and abs(e) <= 10000.0:
                     out[name[len(prefix):]] = e
                 break
     return out
@@ -127,23 +429,34 @@ def discharge_path(system_energies: dict, mol_energies: dict, *,
 
 def path_from_project_and_molecules(delta_rows: list, e_slab: float,
                                     molecules_dir, *, mu_li=None,
-                                    g_corr: dict | None = None) -> dict:
+                                    g_corr: dict | None = None,
+                                    managed_dirs=None,
+                                    project: dict | None = None) -> dict:
     """便捷入口:项目 ΔE 行(带 e_config)+ 旧分子目录 → 放电路径。
 
-    构型名需含物种名(如 ads_Li2S4_on_slab / Li2S6_top):按物种子串匹配唯一构型;
-    多个匹配取 E 最低(最稳构型,常规口径)。
+    新项目优先使用每行显式 ``species``（由 POSCAR 组成差与用户确认得到）；
+    旧项目才回退到构型名子串。多个匹配取 E 最低(最稳构型,常规口径)。
     g_corr 透传 discharge_path(逐物种 ZPE−TS 校正,见 project.thermo)。
     """
-    mol_e = load_molecule_energies(molecules_dir)
+    audit = audit_molecule_method_compatibility(
+        project, molecules_dir, managed_dirs=managed_dirs)
+    if not audit['ok']:
+        raise ValueError('ΔG 方法一致性门控未通过：' + '；'.join(audit['errors']))
+    mol_e = load_molecule_energies(molecules_dir, managed_dirs=managed_dirs)
     system_e = {}
     for sp, _, _ in LIS_PRESET:
         # 只取 DONE 成员(审查#3):NEEDS_HUMAN/BAD_ENERGY 的能量不得漏进 ΔG/U_L
         cands = [r['e_config'] for r in delta_rows
                  if r.get('e_config') is not None and r.get('state') == 'DONE'
-                 and _species_in_name(sp, r.get('name', ''))]
+                 and (str(r.get('species') or '').strip() == sp
+                      or (not str(r.get('species') or '').strip()
+                          and _species_in_name(sp, r.get('name', ''))))]
         if cands:
             system_e[sp] = min(cands)
-    return discharge_path(system_e, mol_e, mu_li=mu_li, g_corr=g_corr)
+    result = discharge_path(system_e, mol_e, mu_li=mu_li, g_corr=g_corr)
+    result['method_consistency'] = audit
+    result.setdefault('warnings', []).extend(audit.get('warnings') or [])
+    return result
 
 
 def _species_in_name(species: str, name: str) -> bool:

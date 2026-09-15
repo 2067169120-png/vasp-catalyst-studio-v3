@@ -5,49 +5,171 @@ on:
     branches: ["**"]
   pull_request:
 
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+  PYTHONDONTWRITEBYTECODE: "1"
+
 jobs:
   lint:
+    name: Python and first-party JavaScript lint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-      - name: Install
-        run: pip install -e .[dev]
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install lint dependencies
+        run: python -m pip install -e ".[dev]"
       - name: Ruff lint
-        run: ruff check vcstudio tests
+        run: python -m ruff check vcstudio tests packaging
+      - name: Check every first-party JavaScript file
+        shell: bash
+        run: |
+          count=0
+          while IFS= read -r -d '' file; do
+            node --check "$file"
+            count=$((count + 1))
+          done < <(git ls-files -z -- \
+            ':(glob)vcstudio/gui_web/assets/**/*.js' \
+            ':(exclude,glob)vcstudio/gui_web/assets/vendor/**')
+          test "$count" -gt 0
+          echo "Checked $count first-party JavaScript files."
 
-  test:
+  core-contract:
+    name: Core dependency contract (${{ matrix.os }} / Python ${{ matrix.python-version }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.12"]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      MPLCONFIGDIR: ${{ github.workspace }}/.vcstudio-matplotlib-core
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - name: Install
-        run: pip install -e .[dev]
+      - name: Install only declared core dependencies
+        run: python -m pip install -e .
+      - name: Validate the core dependency contract
+        run: |
+          python -X utf8 -m pip check
+          python -X utf8 -c "import keyring, paramiko, yaml; import vcstudio; import vcstudio.cli.main; print('core contract ok', vcstudio.__version__)"
+
+  test:
+    name: Full test (${{ matrix.os }} / Python ${{ matrix.python-version }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      # Keep matplotlib deterministic and writable on Windows runners.  PYTHONUTF8
+      # above is the process-wide contract; -X utf8 below makes it explicit in logs.
+      MPLCONFIGDIR: ${{ github.workspace }}/.vcstudio-matplotlib-full
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install the full tested feature contract
+        run: python -m pip install -e ".[dev,gui,charts,mol,docs]"
+      - name: Validate installed dependencies
+        run: python -X utf8 -m pip check
       - name: Test
-        run: python -m pytest -q --cov=vcstudio --cov-report=term-missing --cov-fail-under=60
+        run: >-
+          python -X utf8 -m pytest -q -p no:cacheprovider
+          --cov=vcstudio --cov-report=term-missing --cov-fail-under=60
 
   package-smoke:
-    # 打包冒烟:确保 PyInstaller 与入口 import 链不坏(不产出 EXE 上传,只验证可打包)
+    name: Frozen Windows package smoke
     runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      MPLCONFIGDIR: ${{ github.workspace }}/.vcstudio-matplotlib-package
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-      - name: Install
-        run: pip install -e .[dev,gui,packaging]
-      - name: Import entry points
+      - name: Install the full release build contract
+        run: python -m pip install -e ".[dev,gui,charts,mol,docs,packaging]"
+      - name: Build the real windowed PyInstaller executable
+        run: python -X utf8 packaging/build_exe.py --full
+      - name: Run the frozen executable healthcheck without opening a window
+        shell: pwsh
         run: |
-          python -c "import vcstudio; import vcstudio.gui_web.api; import vcstudio.cli.main; print('entry imports ok', vcstudio.__version__)"
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path -LiteralPath 'dist/VASP Catalyst Studio.exe').Path
+          $dist = (Resolve-Path -LiteralPath 'dist').Path
+          function Invoke-FrozenHealthcheck([string]$Profile, [string[]]$Required) {
+            $report = Join-Path $dist "frozen-healthcheck-$Profile.json"
+            $process = Start-Process -FilePath $exe -WindowStyle Hidden -PassThru `
+              -ArgumentList @(
+                '--healthcheck',
+                '--healthcheck-profile', $Profile,
+                '--healthcheck-output', $report
+              )
+            try {
+              $process | Wait-Process -Timeout 300 -ErrorAction Stop
+            } catch {
+              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+              throw "Frozen $Profile healthcheck exceeded the 300 second timeout."
+            }
+            $process.Refresh()
+            if (-not (Test-Path -LiteralPath $report)) {
+              throw "Frozen $Profile healthcheck did not write its JSON report."
+            }
+            $health = Get-Content -LiteralPath $report -Raw -Encoding utf8 | ConvertFrom-Json
+            $present = @($health.checks.PSObject.Properties.Name)
+            $missing = @($Required | Where-Object { $_ -notin $present })
+            if ($process.ExitCode -ne 0 -or -not $health.ok -or -not $health.frozen `
+                -or $health.profile -cne $Profile -or $missing.Count) {
+              $health | ConvertTo-Json -Depth 12
+              throw "Frozen $Profile healthcheck failed (exit=$($process.ExitCode), missing=$($missing -join ','))."
+            }
+            if ($Profile -ceq 'journey') {
+              $journey = $health.checks.'bridge-journey'
+              if (-not $journey.ok -or -not $journey.detail.ok `
+                  -or $journey.detail.phase_count -lt 10) {
+                $health | ConvertTo-Json -Depth 12
+                throw 'Frozen journey did not complete every persistence phase.'
+              }
+            }
+            $health | ConvertTo-Json -Depth 12
+          }
+          Invoke-FrozenHealthcheck 'full' @(
+            'frozen-runtime', 'core-modules', 'web-assets', 'locales',
+            'numeric-and-charts', 'molecule-and-documents'
+          )
+          Invoke-FrozenHealthcheck 'journey' @(
+            'frozen-runtime', 'core-modules', 'web-assets', 'locales',
+            'bridge-journey'
+          )
+      - name: Upload frozen executable and healthcheck evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: frozen-windows-package-smoke
+          path: |
+            dist/VASP Catalyst Studio.exe
+            dist/frozen-healthcheck-full.json
+            dist/frozen-healthcheck-journey.json
+          if-no-files-found: error
+          retention-days: 7

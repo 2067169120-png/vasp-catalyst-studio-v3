@@ -3,7 +3,10 @@ import os
 import sys
 import types
 
+import pytest
+
 from vcstudio.cluster import batch_ops
+from vcstudio.cluster.connection import ConnectError
 from vcstudio.shared import manifest as manifest_mod
 
 
@@ -23,6 +26,32 @@ def test_public_surface():
     for name in ('submit_batch', 'fetch_batch', 'continue_batch',
                  'refresh_batch', 'queue_detail', 'tune_batch', 'adopt_scan'):
         assert callable(getattr(batch_ops, name))
+
+
+@pytest.mark.parametrize('invoke,empty_key', [
+    (lambda p: batch_ops.submit_batch(p, 'pw', [], False), 'results'),
+    (lambda p: batch_ops.fetch_batch(p, 'pw', [], False), 'results'),
+    (lambda p: batch_ops.continue_batch(p, 'pw', [], False), 'results'),
+    (lambda p: batch_ops.refresh_batch(p, 'pw', [], False), 'results'),
+    (lambda p: batch_ops.tune_batch(p, 'pw', '/job', {}, False), 'results'),
+    (lambda p: batch_ops.adopt_scan(p, 'pw', False, set(), '/tmp'), 'results'),
+    (lambda p: batch_ops.queue_detail(p, 'pw', False), 'jobs'),
+    (lambda p: batch_ops.workdir_lookup(p, 'pw', '1', False), 'workdir'),
+])
+def test_needs_trust_passthrough_has_real_key_evidence(
+        monkeypatch, invoke, empty_key):
+    def _unknown(*_args, **_kwargs):
+        raise ConnectError(
+            '请核对指纹', needs_trust=True,
+            fingerprint='SHA256:abc', algorithm='ssh-ed25519', host='bastion')
+
+    monkeypatch.setattr(batch_ops, 'open_client', _unknown)
+    out = invoke(types.SimpleNamespace(name='c'))
+    assert out['needs_trust'] is True
+    assert out['fingerprint'] == 'SHA256:abc'
+    assert out['algorithm'] == 'ssh-ed25519'
+    assert out['host'] == 'bastion'
+    assert empty_key in out
 
 
 # ── adopt_scan:一次连接完成 明细 → 补目录 → 落认领 ────────────────────────────
@@ -71,8 +100,8 @@ def test_adopt_scan_skips_known_adopts_and_flags_missing(tmp_path, monkeypatch):
     assert os.path.isdir(expected)
 
 
-def test_adopt_scan_name_collision_appends_jid(tmp_path, monkeypatch):
-    """两个未纳管作业同名 'Nb_S8'(qstat 截断易撞名):第二个本地目录撞名 → 追加 _<jid2>,
+def test_adopt_scan_name_collision_appends_profile_and_jid(tmp_path, monkeypatch):
+    """两个未纳管作业同名 'Nb_S8':第二个目录追加 profile + jid 避让，
     两个都认领成功且落到不同目录(不再第二个失败还引用第一个的作业号)。"""
     monkeypatch.setattr(batch_ops, 'open_client',
                         lambda prof, pw, trust_new=False: ('C', 'J'))
@@ -101,8 +130,64 @@ def test_adopt_scan_name_collision_appends_jid(tmp_path, monkeypatch):
     assert rows['501'][1] is True and rows['502'][1] is True   # 两个都认领成功
     assert len(adopted) == 2 and adopted[0] != adopted[1]      # 落到不同目录
     assert adopted[0] == os.path.join(str(tmp_path), 'Nb_S8')
-    assert adopted[1] == os.path.join(str(tmp_path), 'Nb_S8_502')
+    assert adopted[1] == os.path.join(str(tmp_path), 'Nb_S8_c1_502')
     assert os.path.isdir(adopted[1])
+
+
+def test_adopt_scan_same_job_id_on_other_cluster_never_reuses_local_dir(tmp_path, monkeypatch):
+    local = tmp_path / 'same_name'
+    local.mkdir()
+    existing = manifest_mod.new_manifest(
+        job_id='old', system='old', task_type='relax', calc_type='slab', inputs={})
+    existing.update({'cluster': 'server-a', 'remote_dir': '/work/a',
+                     'scheduler_job_id': '777'})
+    manifest_mod.set_state(existing, 'SUBMITTED')
+    manifest_mod.save_manifest(local, existing)
+    monkeypatch.setattr(batch_ops, 'open_client', lambda *a, **k: ('C', 'J'))
+    monkeypatch.setattr(batch_ops, 'close_quiet', lambda *a: None)
+    monkeypatch.setattr(batch_ops.submitter, 'query_queue_detail', lambda *_a: [
+        {'job_id': '777', 'name': 'same_name', 'workdir': '/work/b'}])
+    adopted = []
+    monkeypatch.setattr(
+        batch_ops.submitter, 'adopt_external_job',
+        lambda local_dir, *_a, **_k: adopted.append(local_dir) or {'state': 'SUBMITTED'})
+
+    out = batch_ops.adopt_scan(
+        types.SimpleNamespace(name='server-b'), None, False, set(), str(tmp_path))
+
+    target = os.path.join(str(tmp_path), 'same_name_server-b_777')
+    assert out['results'][0][1] is True
+    assert adopted == [target]
+    assert target != str(local)
+
+
+def test_adopt_scan_exact_existing_binding_is_idempotent(tmp_path, monkeypatch):
+    from vcstudio.cluster import ledger
+
+    local = tmp_path / 'same_name'
+    local.mkdir()
+    existing = manifest_mod.new_manifest(
+        job_id='old', system='old', task_type='relax', calc_type='slab', inputs={})
+    existing.update({'cluster': 'server-b', 'remote_dir': '/work/b',
+                     'scheduler_job_id': '777'})
+    manifest_mod.set_state(existing, 'SUBMITTED')
+    manifest_mod.save_manifest(local, existing)
+    monkeypatch.setattr(batch_ops, 'open_client', lambda *a, **k: ('C', 'J'))
+    monkeypatch.setattr(batch_ops, 'close_quiet', lambda *a: None)
+    monkeypatch.setattr(batch_ops.submitter, 'query_queue_detail', lambda *_a: [
+        {'job_id': '777', 'name': 'same_name', 'workdir': '/work/b'}])
+    registered = []
+    monkeypatch.setattr(ledger, 'register', lambda path: registered.append(path) or True)
+    monkeypatch.setattr(
+        batch_ops.submitter, 'adopt_external_job',
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError('原绑定不得重复认领')))
+
+    out = batch_ops.adopt_scan(
+        types.SimpleNamespace(name='server-b'), None, False, set(), str(tmp_path))
+
+    assert out['results'][0][1] is True
+    assert '原绑定' in out['results'][0][2]
+    assert registered == [str(local)]
 
 
 def test_adopt_scan_needs_trust_branch(monkeypatch):
@@ -141,13 +226,16 @@ def _prof(scheduler='Slurm'):
                                  scheduler_bin='', username='u')
 
 
-def _make_job(tmp_path, name, job_id, state='RUNNING'):
+def _make_job(tmp_path, name, job_id, state='RUNNING', scheduler='Slurm'):
     """建一个带 scheduler_job_id 的作业目录(job.yaml),返回目录路径。"""
     d = tmp_path / name
     d.mkdir()
     m = manifest_mod.new_manifest(job_id=f'{name}-x', system=name,
                                   task_type='relax', calc_type='', inputs={})
     m['scheduler_job_id'] = job_id
+    m['cluster'] = 'c1'
+    m['cluster_binding'] = batch_ops.submitter.profile_binding(
+        _prof(scheduler))
     manifest_mod.set_state(m, state)
     manifest_mod.save_manifest(str(d), m)
     return str(d)
@@ -224,10 +312,55 @@ def test_cancel_batch_pbs_uses_qdel(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(batch_ops.submitter, 'run_cmd',
                         lambda client, cmd, check=False: calls.append(cmd) or ('', ''))
-    d1 = _make_job(tmp_path, 'j1', '888')
+    d1 = _make_job(tmp_path, 'j1', '888', scheduler='PBS')
     out = batch_ops.cancel_batch(_prof('PBS'), [d1], password='pw')
     assert out['cancelled'] == ['888']
     assert any('qdel' in c and '888' in c for c in calls)
+
+
+def test_cancel_batch_wrong_cluster_never_calls_scheduler(tmp_path, monkeypatch):
+    _fake_conn(monkeypatch)
+    d = _make_job(tmp_path, 'foreign', '777')
+    data = manifest_mod.load_manifest(d)
+    data['cluster'] = 'server-a'
+    manifest_mod.save_manifest(d, data)
+    monkeypatch.setattr(
+        batch_ops.submitter, 'run_cmd',
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError('不得取消错误服务器作业')))
+
+    out = batch_ops.cancel_batch(
+        types.SimpleNamespace(name='server-b', scheduler='Slurm', scheduler_bin=''),
+        [d], password='pw')
+
+    assert out['cancelled'] == []
+    assert out['failed'][0]['job_id'] == '777'
+    assert '属于服务器「server-a」' in out['failed'][0]['reason']
+    assert manifest_mod.load_manifest(d)['state'] == 'RUNNING'
+
+
+def test_cancel_batch_rejects_scheduler_generation_changed_after_target_snapshot(
+        tmp_path, monkeypatch):
+    _fake_conn(monkeypatch)
+    d = _make_job(tmp_path, 'race', '777')
+    real_cancel = batch_ops.submitter.cancel_job
+    commands = []
+
+    def change_generation_then_cancel(client, profile, job_dir, **kwargs):
+        data = manifest_mod.load_manifest(job_dir)
+        data['scheduler_job_id'] = '888'
+        manifest_mod.save_manifest(job_dir, data)
+        return real_cancel(client, profile, job_dir, **kwargs)
+
+    monkeypatch.setattr(batch_ops.submitter, 'cancel_job', change_generation_then_cancel)
+    monkeypatch.setattr(
+        batch_ops.submitter, 'run_cmd',
+        lambda _client, command, **_kwargs: commands.append(command) or ('', ''))
+
+    out = batch_ops.cancel_batch(_prof('Slurm'), [d], password='pw')
+
+    assert out['cancelled'] == []
+    assert '代次已变化' in out['failed'][0]['reason']
+    assert commands == []
 
 
 def test_cancel_batch_needs_trust(monkeypatch):
@@ -240,6 +373,20 @@ def test_cancel_batch_needs_trust(monkeypatch):
     monkeypatch.setattr(batch_ops, 'open_client', _boom)
     out = batch_ops.cancel_batch(_prof('Slurm'), ['/x'], password='pw')
     assert out['ok'] is False and out['needs_trust'] is True and out['cancelled'] == []
+
+
+def test_cancel_batch_needs_trust_passthrough_has_key_evidence(monkeypatch):
+    def _boom(*_args, **_kwargs):
+        raise ConnectError(
+            '未知主机', needs_trust=True, fingerprint='SHA256:def',
+            algorithm='ssh-rsa', host='target')
+
+    monkeypatch.setattr(batch_ops, 'open_client', _boom)
+    out = batch_ops.cancel_batch(_prof('Slurm'), ['/x'], password='pw')
+    assert out['needs_trust'] is True
+    assert out['fingerprint'] == 'SHA256:def'
+    assert out['algorithm'] == 'ssh-rsa'
+    assert out['host'] == 'target'
 
 
 def test_cancel_batch_unsupported_scheduler_errors():

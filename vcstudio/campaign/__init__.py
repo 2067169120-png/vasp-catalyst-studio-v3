@@ -42,6 +42,8 @@ from vcstudio.campaign.schema import (
     SCHEMA_VERSION,
     TASK_KINDS,
     DEFAULT_ENGINE,
+    RevisionConflictError,
+    TaskClaimError,
     campaign_dir,
     campaign_root,
     new_campaign,
@@ -52,6 +54,11 @@ from vcstudio.campaign.schema import (
     load_fingerprint,
     save_campaign_meta,
     save_task,
+    persist_task,
+    claim_task,
+    load_task,
+    task_path,
+    task_revision,
     save_fingerprint,
     tasks_by_id,
     validate_campaign,
@@ -87,7 +94,15 @@ from vcstudio.campaign.fingerprint import (
 )
 
 # ── gates:三门 ───────────────────────────────────────────────────────────────
-from vcstudio.campaign.gates import submit_gate, accept_gate, report_gate
+from vcstudio.campaign.gates import (
+    GateDecision,
+    submit_gate,
+    accept_gate,
+    report_gate,
+    checks_digest,
+    task_input_fingerprints,
+    verify_gate_decision,
+)
 
 # ── ledger:决策/事件账本 ─────────────────────────────────────────────────────
 from vcstudio.campaign.ledger import (
@@ -98,6 +113,12 @@ from vcstudio.campaign.ledger import (
     read_events,
     sanitize,
     is_sensitive,
+    decision_digest,
+    value_digest,
+    record_waiver_decision,
+    validate_waiver_decision,
+    revoke_decision,
+    is_decision_revoked,
 )
 
 # ── budget:机时账本 ──────────────────────────────────────────────────────────
@@ -121,9 +142,11 @@ __all__ = [
     # 子模块
     'schema', 'states', 'fingerprint', 'gates', 'ledger', 'budget', 'lock', 'derive',
     # schema
-    'SCHEMA_VERSION', 'TASK_KINDS', 'DEFAULT_ENGINE', 'campaign_dir', 'campaign_root',
+    'SCHEMA_VERSION', 'TASK_KINDS', 'DEFAULT_ENGINE', 'RevisionConflictError',
+    'TaskClaimError', 'campaign_dir', 'campaign_root',
     'new_campaign', 'new_task', 'init_campaign', 'add_task', 'load_campaign',
-    'load_fingerprint', 'save_campaign_meta', 'save_task', 'save_fingerprint',
+    'load_fingerprint', 'save_campaign_meta', 'save_task', 'persist_task', 'claim_task',
+    'load_task', 'task_path', 'task_revision', 'save_fingerprint',
     'tasks_by_id', 'validate_campaign', 'validate_campaign_meta', 'validate_task',
     'validate_graph',
     # states
@@ -134,10 +157,13 @@ __all__ = [
     'FINGERPRINT_FIELDS', 'new_fingerprint', 'extract_from_inputs', 'fingerprint_hash',
     'check_group_consistency',
     # gates
-    'submit_gate', 'accept_gate', 'report_gate',
+    'GateDecision', 'submit_gate', 'accept_gate', 'report_gate', 'checks_digest',
+    'task_input_fingerprints', 'verify_gate_decision',
     # ledger
     'record_decision', 'read_decisions', 'find_decision', 'record_event',
-    'read_events', 'sanitize', 'is_sensitive',
+    'read_events', 'sanitize', 'is_sensitive', 'decision_digest', 'value_digest',
+    'record_waiver_decision', 'validate_waiver_decision', 'revoke_decision',
+    'is_decision_revoked',
     # budget
     'estimate_job', 'record_estimate', 'record_actual', 'consumed', 'remaining',
     'over_budget', 'load_budget',
