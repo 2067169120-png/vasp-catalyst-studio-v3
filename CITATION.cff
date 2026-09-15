@@ -5,8 +5,10 @@ version: 4.0.0
 license: MIT
 repository-code: "https://github.com/2067169120-png/vasp-catalyst-studio-v3"
 authors:
-  - given-names: Yuhao
-    family-names: Chen
+  - given-names: Sheng
+    family-names: Zhu
+    affiliation: "School of Chemistry and Molecular Engineering, East China Normal University"
+    email: 10234810401@stu.ecnu.edu.cn
 keywords:
   - VASP
   - density functional theory

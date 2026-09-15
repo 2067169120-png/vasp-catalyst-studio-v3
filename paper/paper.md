@@ -9,15 +9,20 @@ tags:
   - catalysis
   - workflow automation
 authors:
-  - name: Yuhao Chen
+  - name: Sheng Zhu
+    affiliation: "1"
+    email: 10234810401@stu.ecnu.edu.cn
+affiliations:
+  - name: School of Chemistry and Molecular Engineering, East China Normal University
+    index: 1
 date: 2026-07-15
 bibliography: paper.bib
 ---
 
 > **Draft metadata boundary.** The date above is the original manuscript date,
-> not a V4 release date. The repository does not contain author-confirmed
-> affiliation, ORCID, funding or acknowledgement data, so those fields are
-> intentionally omitted and must be supplied by the author before submission.
+> not a V4 release date. Author name, affiliation and contact email are supplied.
+> ORCID, funding and acknowledgement data remain unconfirmed and must be
+> completed by the author before submission.
 
 # Summary
 
